@@ -1,0 +1,399 @@
+fs/dcache: Track & report number of negative dentries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [fs] dcache: Track & report number of negative dentries (Waiman Long) [1466038]
+Rebuild_FUZZ: 97.09%
+commit-author Waiman Long <longman@redhat.com>
+commit af0c9af1b3f66052c369d08be3f60fa9a9559e48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/af0c9af1.failed
+
+The current dentry number tracking code doesn't distinguish between
+positive & negative dentries.  It just reports the total number of
+dentries in the LRU lists.
+
+As excessive number of negative dentries can have an impact on system
+performance, it will be wise to track the number of positive and
+negative dentries separately.
+
+This patch adds tracking for the total number of negative dentries in
+the system LRU lists and reports it in the 5th field in the
+/proc/sys/fs/dentry-state file.  The number, however, does not include
+negative dentries that are in flight but not in the LRU yet as well as
+those in the shrinker lists which are on the way out anyway.
+
+The number of positive dentries in the LRU lists can be roughly found by
+subtracting the number of negative dentries from the unused count.
+
+Matthew Wilcox had confirmed that since the introduction of the
+dentry_stat structure in 2.1.60, the dummy array was there, probably for
+future extension.  They were not replacements of pre-existing fields.
+So no sane applications that read the value of /proc/sys/fs/dentry-state
+will do dummy thing if the last 2 fields of the sysctl parameter are not
+zero.  IOW, it will be safe to use one of the dummy array entry for
+negative dentry count.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit af0c9af1b3f66052c369d08be3f60fa9a9559e48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index f8f0822c6dd1,aac41adf4743..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -152,7 -153,17 +153,21 @@@ static long get_nr_dentry_unused(void
+  	return sum < 0 ? 0 : sum;
+  }
+  
+++<<<<<<< HEAD
+ +int proc_nr_dentry(ctl_table *table, int write, void __user *buffer,
+++=======
++ static long get_nr_dentry_negative(void)
++ {
++ 	int i;
++ 	long sum = 0;
++ 
++ 	for_each_possible_cpu(i)
++ 		sum += per_cpu(nr_dentry_negative, i);
++ 	return sum < 0 ? 0 : sum;
++ }
++ 
++ int proc_nr_dentry(struct ctl_table *table, int write, void __user *buffer,
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+  		   size_t *lenp, loff_t *ppos)
+  {
+  	dentry_stat.nr_dentry = get_nr_dentry();
+@@@ -279,46 -309,45 +295,66 @@@ void release_dentry_name_snapshot(struc
+  }
+  EXPORT_SYMBOL(release_dentry_name_snapshot);
+  
+ -static inline void __d_set_inode_and_type(struct dentry *dentry,
+ -					  struct inode *inode,
+ -					  unsigned type_flags)
+ +static void __d_free(struct rcu_head *head)
+  {
+ -	unsigned flags;
+ +	struct dentry *dentry = container_of(
+ +		(struct hlist_node *)head, struct dentry, d_alias);
+  
+ -	dentry->d_inode = inode;
+ -	flags = READ_ONCE(dentry->d_flags);
+ -	flags &= ~(DCACHE_ENTRY_TYPE | DCACHE_FALLTHRU);
+ -	flags |= type_flags;
+ -	WRITE_ONCE(dentry->d_flags, flags);
+ +	if (dname_external(dentry))
+ +		kfree(dentry->d_name.name);
+ +	kmem_cache_free(dentry_cache, dentry); 
+  }
+  
+ -static inline void __d_clear_type_and_inode(struct dentry *dentry)
+ +/*
+ + * no locks, please.
+ + */
+ +static void d_free(struct dentry *dentry)
+  {
+ -	unsigned flags = READ_ONCE(dentry->d_flags);
+ +	struct rcu_head *p = (struct rcu_head *)&dentry->d_alias;
+ +	BUG_ON((int)dentry->d_lockref.count > 0);
+ +	this_cpu_dec(nr_dentry);
+ +	if (dentry->d_op && dentry->d_op->d_release)
+ +		dentry->d_op->d_release(dentry);
+  
+++<<<<<<< HEAD
+++=======
++ 	flags &= ~(DCACHE_ENTRY_TYPE | DCACHE_FALLTHRU);
++ 	WRITE_ONCE(dentry->d_flags, flags);
++ 	dentry->d_inode = NULL;
++ 	if (dentry->d_flags & DCACHE_LRU_LIST)
++ 		this_cpu_inc(nr_dentry_negative);
++ }
++ 
++ static void dentry_free(struct dentry *dentry)
++ {
++ 	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
++ 	if (unlikely(dname_external(dentry))) {
++ 		struct external_name *p = external_name(dentry);
++ 		if (likely(atomic_dec_and_test(&p->u.count))) {
++ 			call_rcu(&dentry->d_u.d_rcu, __d_free_external);
++ 			return;
++ 		}
++ 	}
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+  	/* if dentry was never visible to RCU, immediate free is OK */
+  	if (!(dentry->d_flags & DCACHE_RCUACCESS))
+ -		__d_free(&dentry->d_u.d_rcu);
+ +		__d_free(p);
+  	else
+ -		call_rcu(&dentry->d_u.d_rcu, __d_free);
+ +		call_rcu(p, __d_free);
+ +}
+ +
+ +/**
+ + * dentry_rcuwalk_barrier - invalidate in-progress rcu-walk lookups
+ + * @dentry: the target dentry
+ + * After this call, in-progress rcu-walk path lookup will fail. This
+ + * should be called after unhashing, and after changing d_inode (if
+ + * the dentry has not already been unhashed).
+ + */
+ +static inline void dentry_rcuwalk_barrier(struct dentry *dentry)
+ +{
+ +	assert_spin_locked(&dentry->d_lock);
+ +	/* Go through a barrier */
+ +	write_seqcount_barrier(&dentry->d_seq);
+  }
+  
+  /*
+@@@ -371,73 -375,85 +407,133 @@@ static void dentry_unlink_inode(struct 
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * dentry_lru_(add|del|prune|move_tail) must be called with d_lock held.
+++=======
++  * The DCACHE_LRU_LIST bit is set whenever the 'd_lru' entry
++  * is in use - which includes both the "real" per-superblock
++  * LRU list _and_ the DCACHE_SHRINK_LIST use.
++  *
++  * The DCACHE_SHRINK_LIST bit is set whenever the dentry is
++  * on the shrink list (ie not on the superblock LRU list).
++  *
++  * The per-cpu "nr_dentry_unused" counters are updated with
++  * the DCACHE_LRU_LIST bit.
++  *
++  * The per-cpu "nr_dentry_negative" counters are only updated
++  * when deleted from or added to the per-superblock LRU list, not
++  * from/to the shrink list. That is to avoid an unneeded dec/inc
++  * pair when moving from LRU to shrink list in select_collect().
++  *
++  * These helper functions make sure we always follow the
++  * rules. d_lock must be held by the caller.
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+   */
+ -#define D_FLAG_VERIFY(dentry,x) WARN_ON_ONCE(((dentry)->d_flags & (DCACHE_LRU_LIST | DCACHE_SHRINK_LIST)) != (x))
+ -static void d_lru_add(struct dentry *dentry)
+ -{
+ +static void dentry_lru_add(struct dentry *dentry)
+ +{
+++<<<<<<< HEAD
+ +	if (unlikely(!(dentry->d_flags & DCACHE_LRU_LIST))) {
+ +		spin_lock(&dcache_lru_lock);
+ +		dentry->d_flags |= DCACHE_LRU_LIST;
+ +		list_add(&dentry->d_lru, &dentry->d_sb->s_dentry_lru);
+ +		dentry->d_sb->s_nr_dentry_unused++;
+ +		this_cpu_inc(nr_dentry_unused);
+ +		spin_unlock(&dcache_lru_lock);
+ +	}
+++=======
++ 	D_FLAG_VERIFY(dentry, 0);
++ 	dentry->d_flags |= DCACHE_LRU_LIST;
++ 	this_cpu_inc(nr_dentry_unused);
++ 	if (d_is_negative(dentry))
++ 		this_cpu_inc(nr_dentry_negative);
++ 	WARN_ON_ONCE(!list_lru_add(&dentry->d_sb->s_dentry_lru, &dentry->d_lru));
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+  }
+  
+ -static void d_lru_del(struct dentry *dentry)
+ +static void __dentry_lru_del(struct dentry *dentry)
+  {
+++<<<<<<< HEAD
+++=======
++ 	D_FLAG_VERIFY(dentry, DCACHE_LRU_LIST);
++ 	dentry->d_flags &= ~DCACHE_LRU_LIST;
++ 	this_cpu_dec(nr_dentry_unused);
++ 	if (d_is_negative(dentry))
++ 		this_cpu_dec(nr_dentry_negative);
++ 	WARN_ON_ONCE(!list_lru_del(&dentry->d_sb->s_dentry_lru, &dentry->d_lru));
++ }
++ 
++ static void d_shrink_del(struct dentry *dentry)
++ {
++ 	D_FLAG_VERIFY(dentry, DCACHE_SHRINK_LIST | DCACHE_LRU_LIST);
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+  	list_del_init(&dentry->d_lru);
+  	dentry->d_flags &= ~(DCACHE_SHRINK_LIST | DCACHE_LRU_LIST);
+ +	dentry->d_sb->s_nr_dentry_unused--;
+  	this_cpu_dec(nr_dentry_unused);
+  }
+  
+ -static void d_shrink_add(struct dentry *dentry, struct list_head *list)
+ -{
+ -	D_FLAG_VERIFY(dentry, 0);
+ -	list_add(&dentry->d_lru, list);
+ -	dentry->d_flags |= DCACHE_SHRINK_LIST | DCACHE_LRU_LIST;
+ -	this_cpu_inc(nr_dentry_unused);
+ -}
+ -
+  /*
+ - * These can only be called under the global LRU lock, ie during the
+ - * callback for freeing the LRU list. "isolate" removes it from the
+ - * LRU lists entirely, while shrink_move moves it to the indicated
+ - * private list.
+ + * Remove a dentry with references from the LRU.
+   */
+ -static void d_lru_isolate(struct list_lru_one *lru, struct dentry *dentry)
+ +static void dentry_lru_del(struct dentry *dentry)
+  {
+++<<<<<<< HEAD
+ +	if (!list_empty(&dentry->d_lru)) {
+ +		spin_lock(&dcache_lru_lock);
+ +		__dentry_lru_del(dentry);
+ +		spin_unlock(&dcache_lru_lock);
+ +	}
+++=======
++ 	D_FLAG_VERIFY(dentry, DCACHE_LRU_LIST);
++ 	dentry->d_flags &= ~DCACHE_LRU_LIST;
++ 	this_cpu_dec(nr_dentry_unused);
++ 	if (d_is_negative(dentry))
++ 		this_cpu_dec(nr_dentry_negative);
++ 	list_lru_isolate(lru, &dentry->d_lru);
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+ +}
+ +
+ +static void dentry_lru_move_list(struct dentry *dentry, struct list_head *list)
+ +{
+++<<<<<<< HEAD
+ +	spin_lock(&dcache_lru_lock);
+ +	if (list_empty(&dentry->d_lru)) {
+ +		dentry->d_flags |= DCACHE_LRU_LIST;
+ +		list_add_tail(&dentry->d_lru, list);
+ +		dentry->d_sb->s_nr_dentry_unused++;
+ +		this_cpu_inc(nr_dentry_unused);
+ +	} else {
+ +		list_move_tail(&dentry->d_lru, list);
+ +	}
+ +	spin_unlock(&dcache_lru_lock);
+  }
+  
+ -static void d_lru_shrink_move(struct list_lru_one *lru, struct dentry *dentry,
+ -			      struct list_head *list)
+ +/*
+ + * Unhash a dentry without inserting an RCU walk barrier or checking that
+ + * dentry->d_lock is locked.  The caller must take care of that, if
+ + * appropriate.
+ + */
+ +static void __d_shrink(struct dentry *dentry)
+  {
+ +	if (!d_unhashed(dentry)) {
+ +		struct hlist_bl_head *b;
+ +		if (unlikely(dentry->d_flags & DCACHE_DISCONNECTED))
+ +			b = &dentry->d_sb->s_anon;
+ +		else
+ +			b = d_hash(dentry->d_parent, dentry->d_name.hash);
+ +
+ +		hlist_bl_lock(b);
+ +		__hlist_bl_del(&dentry->d_hash);
+ +		dentry->d_hash.pprev = NULL;
+ +		hlist_bl_unlock(b);
+ +	}
+++=======
++ 	D_FLAG_VERIFY(dentry, DCACHE_LRU_LIST);
++ 	dentry->d_flags |= DCACHE_SHRINK_LIST;
++ 	if (d_is_negative(dentry))
++ 		this_cpu_dec(nr_dentry_negative);
++ 	list_lru_isolate_move(lru, &dentry->d_lru, list);
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+  }
+  
+  /**
+@@@ -1644,15 -1840,19 +1740,28 @@@ static unsigned d_flags_for_inode(struc
+  static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+  {
+  	unsigned add_flags = d_flags_for_inode(inode);
+ -	WARN_ON(d_in_lookup(dentry));
+  
+  	spin_lock(&dentry->d_lock);
+++<<<<<<< HEAD
+ +	__d_set_type(dentry, add_flags);
+ +	if (inode)
+ +		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+ +	dentry->d_inode = inode;
+ +	dentry_rcuwalk_barrier(dentry);
+ +	if (inode)
+ +		fsnotify_update_flags(dentry);
+++=======
++ 	/*
++ 	 * Decrement negative dentry count if it was in the LRU list.
++ 	 */
++ 	if (dentry->d_flags & DCACHE_LRU_LIST)
++ 		this_cpu_dec(nr_dentry_negative);
++ 	hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
++ 	raw_write_seqcount_begin(&dentry->d_seq);
++ 	__d_set_inode_and_type(dentry, inode, add_flags);
++ 	raw_write_seqcount_end(&dentry->d_seq);
++ 	fsnotify_update_flags(dentry);
+++>>>>>>> af0c9af1b3f6 (fs/dcache: Track & report number of negative dentries)
+  	spin_unlock(&dentry->d_lock);
+  }
+  
+diff --git a/Documentation/sysctl/fs.txt b/Documentation/sysctl/fs.txt
+index 35e17f748ca7..eed7efab2b42 100644
+--- a/Documentation/sysctl/fs.txt
++++ b/Documentation/sysctl/fs.txt
+@@ -54,26 +54,32 @@ of any kernel data structures.
+ 
+ dentry-state:
+ 
+-From linux/fs/dentry.c:
++From linux/include/linux/dcache.h:
+ --------------------------------------------------------------
+-struct {
++struct dentry_stat_t dentry_stat {
+         int nr_dentry;
+         int nr_unused;
+         int age_limit;         /* age in seconds */
+         int want_pages;        /* pages requested by system */
+-        int dummy[2];
+-} dentry_stat = {0, 0, 45, 0,};
+--------------------------------------------------------------- 
+-
+-Dentries are dynamically allocated and deallocated, and
+-nr_dentry seems to be 0 all the time. Hence it's safe to
+-assume that only nr_unused, age_limit and want_pages are
+-used. Nr_unused seems to be exactly what its name says.
++        int nr_negative;       /* # of unused negative dentries */
++        int dummy;             /* Reserved for future use */
++};
++--------------------------------------------------------------
++
++Dentries are dynamically allocated and deallocated.
++
++nr_dentry shows the total number of dentries allocated (active
+++ unused). nr_unused shows the number of dentries that are not
++actively used, but are saved in the LRU list for future reuse.
++
+ Age_limit is the age in seconds after which dcache entries
+ can be reclaimed when memory is short and want_pages is
+ nonzero when shrink_dcache_pages() has been called and the
+ dcache isn't pruned yet.
+ 
++nr_negative shows the number of unused dentries that are also
++negative dentries which do not mapped to actual files.
++
+ ==============================================================
+ 
+ dquot-max & dquot-nr:
+* Unmerged path fs/dcache.c
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index d021d2f76e5c..2f84121d1e41 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -57,9 +57,10 @@ struct qstr {
+ struct dentry_stat_t {
+ 	long nr_dentry;
+ 	long nr_unused;
+-	long age_limit;          /* age in seconds */
+-	long want_pages;         /* pages requested by system */
+-	long dummy[2];
++	long age_limit;		/* age in seconds */
++	long want_pages;	/* pages requested by system */
++	long nr_negative;	/* # of unused negative dentries */
++	long dummy;		/* Reserved for future use */
+ };
+ extern struct dentry_stat_t dentry_stat;
+ 
