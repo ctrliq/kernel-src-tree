@@ -1,0 +1,172 @@
+perf symbols: Mark if a symbol is idle in the library
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 608c34de0b3d7bd15340a95ef758b4d8b81ebfc6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/608c34de.failed
+
+This was being done just in 'perf top', but grouping idle symbols should
+be useful in other places as well, so remove one more symbol_filter_t
+user by moving this to the symbol library.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/n/tip-5r7xitjkzjr9jak1zy3d8u5l@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 608c34de0b3d7bd15340a95ef758b4d8b81ebfc6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-top.c
+diff --cc tools/perf/builtin-top.c
+index 9e624c5eb663,6f48df14e277..000000000000
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@@ -679,9 -679,6 +679,12 @@@ static int symbol_filter(struct map *ma
+  	    strstr(name, "_text_end"))
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	if (symbol__is_idle(sym))
+ +		sym->ignore = true;
+ +
+++=======
+++>>>>>>> 608c34de0b3d (perf symbols: Mark if a symbol is idle in the library)
+  	return 0;
+  }
+  
+* Unmerged path tools/perf/builtin-top.c
+diff --git a/tools/perf/util/symbol-elf.c b/tools/perf/util/symbol-elf.c
+index 295d3147a803..bd91a4f67080 100644
+--- a/tools/perf/util/symbol-elf.c
++++ b/tools/perf/util/symbol-elf.c
+@@ -1127,7 +1127,7 @@ new_symbol:
+ 		if (filter && filter(curr_map, f))
+ 			symbol__delete(f);
+ 		else {
+-			symbols__insert(&curr_dso->symbols[curr_map->type], f);
++			__symbols__insert(&curr_dso->symbols[curr_map->type], f, dso->kernel);
+ 			nr++;
+ 		}
+ 	}
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 2ccaa239f3a1..a613356448b0 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -28,6 +28,8 @@ static int dso__load_kernel_sym(struct dso *dso, struct map *map,
+ 				symbol_filter_t filter);
+ static int dso__load_guest_kernel_sym(struct dso *dso, struct map *map,
+ 			symbol_filter_t filter);
++static bool symbol__is_idle(const char *name);
++
+ int vmlinux_path__nr_entries;
+ char **vmlinux_path;
+ 
+@@ -311,13 +313,24 @@ void symbols__delete(struct rb_root *symbols)
+ 	}
+ }
+ 
+-void symbols__insert(struct rb_root *symbols, struct symbol *sym)
++void __symbols__insert(struct rb_root *symbols, struct symbol *sym, bool kernel)
+ {
+ 	struct rb_node **p = &symbols->rb_node;
+ 	struct rb_node *parent = NULL;
+ 	const u64 ip = sym->start;
+ 	struct symbol *s;
+ 
++	if (kernel) {
++		const char *name = sym->name;
++		/*
++		 * ppc64 uses function descriptors and appends a '.' to the
++		 * start of every instruction address. Remove it.
++		 */
++		if (name[0] == '.')
++			name++;
++		sym->idle = symbol__is_idle(name);
++	}
++
+ 	while (*p != NULL) {
+ 		parent = *p;
+ 		s = rb_entry(parent, struct symbol, rb_node);
+@@ -330,6 +343,11 @@ void symbols__insert(struct rb_root *symbols, struct symbol *sym)
+ 	rb_insert_color(&sym->rb_node, symbols);
+ }
+ 
++void symbols__insert(struct rb_root *symbols, struct symbol *sym)
++{
++	__symbols__insert(symbols, sym, false);
++}
++
+ static struct symbol *symbols__find(struct rb_root *symbols, u64 ip)
+ {
+ 	struct rb_node *n;
+@@ -463,7 +481,7 @@ void dso__reset_find_symbol_cache(struct dso *dso)
+ 
+ void dso__insert_symbol(struct dso *dso, enum map_type type, struct symbol *sym)
+ {
+-	symbols__insert(&dso->symbols[type], sym);
++	__symbols__insert(&dso->symbols[type], sym, dso->kernel);
+ 
+ 	/* update the symbol cache if necessary */
+ 	if (dso->last_find_result[type].addr >= sym->start &&
+@@ -600,7 +618,7 @@ struct process_kallsyms_args {
+  * These are symbols in the kernel image, so make sure that
+  * sym is from a kernel DSO.
+  */
+-bool symbol__is_idle(struct symbol *sym)
++static bool symbol__is_idle(const char *name)
+ {
+ 	const char * const idle_symbols[] = {
+ 		"cpu_idle",
+@@ -617,14 +635,10 @@ bool symbol__is_idle(struct symbol *sym)
+ 		"pseries_dedicated_idle_sleep",
+ 		NULL
+ 	};
+-
+ 	int i;
+ 
+-	if (!sym)
+-		return false;
+-
+ 	for (i = 0; idle_symbols[i]; i++) {
+-		if (!strcmp(idle_symbols[i], sym->name))
++		if (!strcmp(idle_symbols[i], name))
+ 			return true;
+ 	}
+ 
+@@ -653,7 +667,7 @@ static int map__process_kallsym_symbol(void *arg, const char *name,
+ 	 * We will pass the symbols to the filter later, in
+ 	 * map__split_kallsyms, when we have split the maps per module
+ 	 */
+-	symbols__insert(root, sym);
++	__symbols__insert(root, sym, !strchr(name, '['));
+ 
+ 	return 0;
+ }
+diff --git a/tools/perf/util/symbol.h b/tools/perf/util/symbol.h
+index 12b1ca0f6960..6dc8c96a068d 100644
+--- a/tools/perf/util/symbol.h
++++ b/tools/perf/util/symbol.h
+@@ -283,7 +283,6 @@ size_t symbol__fprintf(struct symbol *sym, FILE *fp);
+ bool symbol_type__is_a(char symbol_type, enum map_type map_type);
+ bool symbol__restricted_filename(const char *filename,
+ 				 const char *restricted_filename);
+-bool symbol__is_idle(struct symbol *sym);
+ int symbol__config_symfs(const struct option *opt __maybe_unused,
+ 			 const char *dir, int unset __maybe_unused);
+ 
+@@ -293,6 +292,7 @@ int dso__load_sym(struct dso *dso, struct map *map, struct symsrc *syms_ss,
+ int dso__synthesize_plt_symbols(struct dso *dso, struct symsrc *ss,
+ 				struct map *map, symbol_filter_t filter);
+ 
++void __symbols__insert(struct rb_root *symbols, struct symbol *sym, bool kernel);
+ void symbols__insert(struct rb_root *symbols, struct symbol *sym);
+ void symbols__fixup_duplicate(struct rb_root *symbols);
+ void symbols__fixup_end(struct rb_root *symbols);
