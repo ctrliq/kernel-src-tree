@@ -696,7 +696,7 @@ static void vmd_remove(struct pci_dev *dev)
 	vmd_teardown_dma_ops(vmd);
 }
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int vmd_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
