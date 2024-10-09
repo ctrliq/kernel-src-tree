@@ -182,6 +182,7 @@ struct ena_stats_tx {
 	u64 tx_poll;
 	u64 doorbells;
 	u64 bad_req_id;
+	u64 missed_tx;
 };
 
 struct ena_stats_rx {
