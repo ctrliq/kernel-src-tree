@@ -1,0 +1,100 @@
+xfs: open code end_buffer_async_write in xfs_finish_page_writeback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8353a814f2518dcfa79a5bb77afd0e7dfa391bb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8353a814.failed
+
+Our loop in xfs_finish_page_writeback, which iterates over all buffer
+heads in a page and then calls end_buffer_async_write, which also
+iterates over all buffers in the page to check if any I/O is in flight
+is not only inefficient, but also potentially dangerous as
+end_buffer_async_write can cause the page and all buffers to be freed.
+
+Replace it with a single loop that does the work of end_buffer_async_write
+on a per-page basis.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 8353a814f2518dcfa79a5bb77afd0e7dfa391bb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index c7e277f1d00a,f9efd67f6fa1..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -114,29 -97,44 +114,50 @@@ xfs_finish_page_writeback
+  	struct bio_vec		*bvec,
+  	int			error)
+  {
+- 	unsigned int		end = bvec->bv_offset + bvec->bv_len - 1;
+- 	struct buffer_head	*head, *bh, *next;
++ 	struct buffer_head	*head = page_buffers(bvec->bv_page), *bh = head;
++ 	bool			busy = false;
+  	unsigned int		off = 0;
+- 	unsigned int		bsize;
++ 	unsigned long		flags;
+  
+  	ASSERT(bvec->bv_offset < PAGE_SIZE);
+++<<<<<<< HEAD
+ +	ASSERT((bvec->bv_offset & ((1 << inode->i_blkbits) - 1)) == 0);
+ +	ASSERT(end < PAGE_SIZE);
+ +	ASSERT((bvec->bv_len & ((1 << inode->i_blkbits) - 1)) == 0);
+- 
+- 	bh = head = page_buffers(bvec->bv_page);
+- 
+- 	bsize = bh->b_size;
+++=======
++ 	ASSERT((bvec->bv_offset & (i_blocksize(inode) - 1)) == 0);
++ 	ASSERT(bvec->bv_offset + bvec->bv_len <= PAGE_SIZE);
++ 	ASSERT((bvec->bv_len & (i_blocksize(inode) - 1)) == 0);
+++>>>>>>> 8353a814f251 (xfs: open code end_buffer_async_write in xfs_finish_page_writeback)
++ 
++ 	local_irq_save(flags);
++ 	bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
+  	do {
+- 		if (off > end)
+- 			break;
+- 		next = bh->b_this_page;
+- 		if (off < bvec->bv_offset)
+- 			goto next_bh;
+- 		bh->b_end_io(bh, !error);
+- next_bh:
+- 		off += bsize;
+- 	} while ((bh = next) != head);
++ 		if (off >= bvec->bv_offset &&
++ 		    off < bvec->bv_offset + bvec->bv_len) {
++ 			ASSERT(buffer_async_write(bh));
++ 			ASSERT(bh->b_end_io == NULL);
++ 
++ 			if (error) {
++ 				mark_buffer_write_io_error(bh);
++ 				clear_buffer_uptodate(bh);
++ 				SetPageError(bvec->bv_page);
++ 			} else {
++ 				set_buffer_uptodate(bh);
++ 			}
++ 			clear_buffer_async_write(bh);
++ 			unlock_buffer(bh);
++ 		} else if (buffer_async_write(bh)) {
++ 			ASSERT(buffer_locked(bh));
++ 			busy = true;
++ 		}
++ 		off += bh->b_size;
++ 	} while ((bh = bh->b_this_page) != head);
++ 	bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
++ 	local_irq_restore(flags);
++ 
++ 	if (!busy)
++ 		end_page_writeback(bvec->bv_page);
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_aops.c
