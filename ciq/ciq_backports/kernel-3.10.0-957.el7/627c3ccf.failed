@@ -1,0 +1,262 @@
+mmc: debugfs: Move block debugfs into block module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] debugfs: Move block debugfs into block module (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.74%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 627c3ccfb46ada2583eac434127ad5d75e1ac33c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/627c3ccf.failed
+
+If we don't have the block layer enabled, we do not present card
+status and extcsd in the debugfs.
+
+Debugfs is not ABI, and maintaining files of no relevance for
+non-block devices comes at a high maintenance cost if we shall
+support it with the block layer compiled out.
+
+The debugfs entries suffer from all the same starvation
+issues as the other userspace things, under e.g. a heavy
+dd operation.
+
+The expected number of debugfs users utilizing these two
+debugfs files is already low as there is an ioctl() to get the
+same information using the mmc-tools, and of these few users
+the expected number of people using it on SDIO or combo cards
+are expected to be zero.
+
+It is therefore logical to move this over to the block layer
+when it is enabled, using the new custom requests and issue
+it using the block request queue.
+
+On the other hand it moves some debugfs code from debugfs.c
+and into block.c.
+
+Tested during heavy dd load by cat:in the status file.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 627c3ccfb46ada2583eac434127ad5d75e1ac33c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.h
+diff --cc drivers/mmc/core/block.c
+index 781c489f21d5,274c1ed2646e..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1150,7 -1167,68 +1151,72 @@@ int mmc_access_rpmb(struct mmc_queue *m
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++=======
++ /*
++  * The non-block commands come back from the block layer after it queued it and
++  * processed it with all other requests and then they get issued in this
++  * function.
++  */
++ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	struct mmc_blk_ioc_data **idata;
++ 	u8 **ext_csd;
++ 	u32 status;
++ 	int ret;
++ 	int i;
++ 
++ 	mq_rq = req_to_mmc_queue_req(req);
++ 
++ 	switch (mq_rq->drv_op) {
++ 	case MMC_DRV_OP_IOCTL:
++ 		idata = mq_rq->drv_op_data;
++ 		for (i = 0, ret = 0; i < mq_rq->ioc_count; i++) {
++ 			ret = __mmc_blk_ioctl_cmd(card, md, idata[i]);
++ 			if (ret)
++ 				break;
++ 		}
++ 		/* Always switch back to main area after RPMB access */
++ 		if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
++ 			mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
++ 		break;
++ 	case MMC_DRV_OP_BOOT_WP:
++ 		ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BOOT_WP,
++ 				 card->ext_csd.boot_ro_lock |
++ 				 EXT_CSD_BOOT_WP_B_PWR_WP_EN,
++ 				 card->ext_csd.part_time);
++ 		if (ret)
++ 			pr_err("%s: Locking boot partition ro until next power on failed: %d\n",
++ 			       md->disk->disk_name, ret);
++ 		else
++ 			card->ext_csd.boot_ro_lock |=
++ 				EXT_CSD_BOOT_WP_B_PWR_WP_EN;
++ 		break;
++ 	case MMC_DRV_OP_GET_CARD_STATUS:
++ 		ret = mmc_send_status(card, &status);
++ 		if (!ret)
++ 			ret = status;
++ 		break;
++ 	case MMC_DRV_OP_GET_EXT_CSD:
++ 		ext_csd = mq_rq->drv_op_data;
++ 		ret = mmc_get_ext_csd(card, ext_csd);
++ 		break;
++ 	default:
++ 		pr_err("%s: unknown driver specific operation\n",
++ 		       md->disk->disk_name);
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	mq_rq->drv_op_result = ret;
++ 	blk_end_request_all(req, ret);
++ }
++ 
++ static void mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++>>>>>>> 627c3ccfb46a (mmc: debugfs: Move block debugfs into block module)
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,04fc89360a7a..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -16,8 -32,21 +16,25 @@@ struct mmc_blk_request 
+  	int			retune_retry_done;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * enum mmc_drv_op - enumerates the operations in the mmc_queue_req
++  * @MMC_DRV_OP_IOCTL: ioctl operation
++  * @MMC_DRV_OP_BOOT_WP: write protect boot partitions
++  * @MMC_DRV_OP_GET_CARD_STATUS: get card status
++  * @MMC_DRV_OP_GET_EXT_CSD: get the EXT CSD from an eMMC card
++  */
++ enum mmc_drv_op {
++ 	MMC_DRV_OP_IOCTL,
++ 	MMC_DRV_OP_BOOT_WP,
++ 	MMC_DRV_OP_GET_CARD_STATUS,
++ 	MMC_DRV_OP_GET_EXT_CSD,
++ };
++ 
+++>>>>>>> 627c3ccfb46a (mmc: debugfs: Move block debugfs into block module)
+  struct mmc_queue_req {
+ +	struct request		*req;
+  	struct mmc_blk_request	brq;
+  	struct scatterlist	*sg;
+  	char			*bounce_buf;
+* Unmerged path drivers/mmc/core/block.c
+diff --git a/drivers/mmc/core/debugfs.c b/drivers/mmc/core/debugfs.c
+index 30623b8b86a4..70d04f7e32be 100644
+--- a/drivers/mmc/core/debugfs.c
++++ b/drivers/mmc/core/debugfs.c
+@@ -279,85 +279,6 @@ void mmc_remove_host_debugfs(struct mmc_host *host)
+ 	debugfs_remove_recursive(host->debugfs_root);
+ }
+ 
+-static int mmc_dbg_card_status_get(void *data, u64 *val)
+-{
+-	struct mmc_card	*card = data;
+-	u32		status;
+-	int		ret;
+-
+-	mmc_get_card(card);
+-
+-	ret = mmc_send_status(data, &status);
+-	if (!ret)
+-		*val = status;
+-
+-	mmc_put_card(card);
+-
+-	return ret;
+-}
+-DEFINE_SIMPLE_ATTRIBUTE(mmc_dbg_card_status_fops, mmc_dbg_card_status_get,
+-		NULL, "%08llx\n");
+-
+-#define EXT_CSD_STR_LEN 1025
+-
+-static int mmc_ext_csd_open(struct inode *inode, struct file *filp)
+-{
+-	struct mmc_card *card = inode->i_private;
+-	char *buf;
+-	ssize_t n = 0;
+-	u8 *ext_csd;
+-	int err, i;
+-
+-	buf = kmalloc(EXT_CSD_STR_LEN + 1, GFP_KERNEL);
+-	if (!buf)
+-		return -ENOMEM;
+-
+-	mmc_get_card(card);
+-	err = mmc_get_ext_csd(card, &ext_csd);
+-	mmc_put_card(card);
+-	if (err)
+-		goto out_free;
+-
+-	for (i = 0; i < 512; i++)
+-		n += sprintf(buf + n, "%02x", ext_csd[i]);
+-	n += sprintf(buf + n, "\n");
+-
+-	if (n != EXT_CSD_STR_LEN) {
+-		err = -EINVAL;
+-		goto out_free;
+-	}
+-
+-	filp->private_data = buf;
+-	kfree(ext_csd);
+-	return 0;
+-
+-out_free:
+-	kfree(buf);
+-	return err;
+-}
+-
+-static ssize_t mmc_ext_csd_read(struct file *filp, char __user *ubuf,
+-				size_t cnt, loff_t *ppos)
+-{
+-	char *buf = filp->private_data;
+-
+-	return simple_read_from_buffer(ubuf, cnt, ppos,
+-				       buf, EXT_CSD_STR_LEN);
+-}
+-
+-static int mmc_ext_csd_release(struct inode *inode, struct file *file)
+-{
+-	kfree(file->private_data);
+-	return 0;
+-}
+-
+-static const struct file_operations mmc_dbg_ext_csd_fops = {
+-	.open		= mmc_ext_csd_open,
+-	.read		= mmc_ext_csd_read,
+-	.release	= mmc_ext_csd_release,
+-	.llseek		= default_llseek,
+-};
+-
+ void mmc_add_card_debugfs(struct mmc_card *card)
+ {
+ 	struct mmc_host	*host = card->host;
+@@ -380,16 +301,6 @@ void mmc_add_card_debugfs(struct mmc_card *card)
+ 	if (!debugfs_create_x32("state", S_IRUSR, root, &card->state))
+ 		goto err;
+ 
+-	if (mmc_card_mmc(card) || mmc_card_sd(card))
+-		if (!debugfs_create_file("status", S_IRUSR, root, card,
+-					&mmc_dbg_card_status_fops))
+-			goto err;
+-
+-	if (mmc_card_mmc(card))
+-		if (!debugfs_create_file("ext_csd", S_IRUSR, root, card,
+-					&mmc_dbg_ext_csd_fops))
+-			goto err;
+-
+ 	return;
+ 
+ err:
+* Unmerged path drivers/mmc/core/queue.h
