@@ -1,0 +1,350 @@
+x86/hyperv: Clear vCPU banks between calls to avoid flushing unneeded vCPUs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] hyperv: Clear vCPU banks between calls to avoid flushing unneeded vCPUs (Vitaly Kuznetsov) [1465471]
+Rebuild_FUZZ: 97.26%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit a3b7424392924e778b608e30ee321f7b10cc94b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a3b74243.failed
+
+hv_flush_pcpu_ex structures are not cleared between calls for performance
+reasons (they're variable size up to PAGE_SIZE each) but we must clear
+hv_vp_set.bank_contents part of it to avoid flushing unneeded vCPUs. The
+rest of the structure is formed correctly.
+
+To do the clearing in an efficient way stash the maximum possible vCPU
+number (this may differ from Linux CPU id).
+
+	Reported-by: Jork Loeser <Jork.Loeser@microsoft.com>
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Dexuan Cui <decui@microsoft.com>
+	Cc: Haiyang Zhang <haiyangz@microsoft.com>
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephen Hemminger <sthemmin@microsoft.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: devel@linuxdriverproject.org
+Link: http://lkml.kernel.org/r/20171006154854.18092-1-vkuznets@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a3b7424392924e778b608e30ee321f7b10cc94b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+#	arch/x86/hyperv/mmu.c
+#	arch/x86/include/asm/mshyperv.h
+diff --cc arch/x86/hyperv/hv_init.c
+index 18e3d3f26a37,a5db63f728a2..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -24,8 -24,83 +24,87 @@@
+  #include <linux/version.h>
+  #include <linux/vmalloc.h>
+  #include <linux/mm.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/clockchips.h>
++ #include <linux/hyperv.h>
++ #include <linux/slab.h>
++ #include <linux/cpuhotplug.h>
++ 
++ #ifdef CONFIG_HYPERV_TSCPAGE
++ 
++ static struct ms_hyperv_tsc_page *tsc_pg;
++ 
++ struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
++ {
++ 	return tsc_pg;
++ }
++ 
++ static u64 read_hv_clock_tsc(struct clocksource *arg)
++ {
++ 	u64 current_tick = hv_read_tsc_page(tsc_pg);
++ 
++ 	if (current_tick == U64_MAX)
++ 		rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
++ 
++ 	return current_tick;
++ }
++ 
++ static struct clocksource hyperv_cs_tsc = {
++ 		.name		= "hyperv_clocksource_tsc_page",
++ 		.rating		= 400,
++ 		.read		= read_hv_clock_tsc,
++ 		.mask		= CLOCKSOURCE_MASK(64),
++ 		.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++ };
++ #endif
++ 
++ static u64 read_hv_clock_msr(struct clocksource *arg)
++ {
++ 	u64 current_tick;
++ 	/*
++ 	 * Read the partition counter to get the current tick count. This count
++ 	 * is set to 0 when the partition is created and is incremented in
++ 	 * 100 nanosecond units.
++ 	 */
++ 	rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
++ 	return current_tick;
++ }
++ 
++ static struct clocksource hyperv_cs_msr = {
++ 	.name		= "hyperv_clocksource_msr",
++ 	.rating		= 400,
++ 	.read		= read_hv_clock_msr,
++ 	.mask		= CLOCKSOURCE_MASK(64),
++ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++ };
++ 
++ void *hv_hypercall_pg;
++ EXPORT_SYMBOL_GPL(hv_hypercall_pg);
++ struct clocksource *hyperv_cs;
++ EXPORT_SYMBOL_GPL(hyperv_cs);
++ 
++ u32 *hv_vp_index;
++ EXPORT_SYMBOL_GPL(hv_vp_index);
++ 
++ u32 hv_max_vp_index;
++ 
++ static int hv_cpu_init(unsigned int cpu)
++ {
++ 	u64 msr_vp_index;
++ 
++ 	hv_get_vp_index(msr_vp_index);
++ 
++ 	hv_vp_index[smp_processor_id()] = msr_vp_index;
++ 
++ 	if (msr_vp_index > hv_max_vp_index)
++ 		hv_max_vp_index = msr_vp_index;
++ 
++ 	return 0;
++ }
+++>>>>>>> a3b742439292 (x86/hyperv: Clear vCPU banks between calls to avoid flushing unneeded vCPUs)
+  
+ +static void *hypercall_pg;
+  /*
+   * This function is to be invoked early in the boot sequence after the
+   * hypervisor has been detected.
+diff --cc arch/x86/include/asm/mshyperv.h
+index c86331fdc4b0,530f448fddaf..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -83,6 -171,207 +83,145 @@@ void hv_setup_crash_handler(void (*hand
+  void hv_remove_crash_handler(void);
+  
+  #if IS_ENABLED(CONFIG_HYPERV)
+++<<<<<<< HEAD
+++=======
++ extern struct clocksource *hyperv_cs;
++ extern void *hv_hypercall_pg;
++ 
++ static inline u64 hv_do_hypercall(u64 control, void *input, void *output)
++ {
++ 	u64 input_address = input ? virt_to_phys(input) : 0;
++ 	u64 output_address = output ? virt_to_phys(output) : 0;
++ 	u64 hv_status;
++ 
++ #ifdef CONFIG_X86_64
++ 	if (!hv_hypercall_pg)
++ 		return U64_MAX;
++ 
++ 	__asm__ __volatile__("mov %4, %%r8\n"
++ 			     "call *%5"
++ 			     : "=a" (hv_status), ASM_CALL_CONSTRAINT,
++ 			       "+c" (control), "+d" (input_address)
++ 			     :  "r" (output_address), "m" (hv_hypercall_pg)
++ 			     : "cc", "memory", "r8", "r9", "r10", "r11");
++ #else
++ 	u32 input_address_hi = upper_32_bits(input_address);
++ 	u32 input_address_lo = lower_32_bits(input_address);
++ 	u32 output_address_hi = upper_32_bits(output_address);
++ 	u32 output_address_lo = lower_32_bits(output_address);
++ 
++ 	if (!hv_hypercall_pg)
++ 		return U64_MAX;
++ 
++ 	__asm__ __volatile__("call *%7"
++ 			     : "=A" (hv_status),
++ 			       "+c" (input_address_lo), ASM_CALL_CONSTRAINT
++ 			     : "A" (control),
++ 			       "b" (input_address_hi),
++ 			       "D"(output_address_hi), "S"(output_address_lo),
++ 			       "m" (hv_hypercall_pg)
++ 			     : "cc", "memory");
++ #endif /* !x86_64 */
++ 	return hv_status;
++ }
++ 
++ #define HV_HYPERCALL_RESULT_MASK	GENMASK_ULL(15, 0)
++ #define HV_HYPERCALL_FAST_BIT		BIT(16)
++ #define HV_HYPERCALL_VARHEAD_OFFSET	17
++ #define HV_HYPERCALL_REP_COMP_OFFSET	32
++ #define HV_HYPERCALL_REP_COMP_MASK	GENMASK_ULL(43, 32)
++ #define HV_HYPERCALL_REP_START_OFFSET	48
++ #define HV_HYPERCALL_REP_START_MASK	GENMASK_ULL(59, 48)
++ 
++ /* Fast hypercall with 8 bytes of input and no output */
++ static inline u64 hv_do_fast_hypercall8(u16 code, u64 input1)
++ {
++ 	u64 hv_status, control = (u64)code | HV_HYPERCALL_FAST_BIT;
++ 
++ #ifdef CONFIG_X86_64
++ 	{
++ 		__asm__ __volatile__("call *%4"
++ 				     : "=a" (hv_status), ASM_CALL_CONSTRAINT,
++ 				       "+c" (control), "+d" (input1)
++ 				     : "m" (hv_hypercall_pg)
++ 				     : "cc", "r8", "r9", "r10", "r11");
++ 	}
++ #else
++ 	{
++ 		u32 input1_hi = upper_32_bits(input1);
++ 		u32 input1_lo = lower_32_bits(input1);
++ 
++ 		__asm__ __volatile__ ("call *%5"
++ 				      : "=A"(hv_status),
++ 					"+c"(input1_lo),
++ 					ASM_CALL_CONSTRAINT
++ 				      :	"A" (control),
++ 					"b" (input1_hi),
++ 					"m" (hv_hypercall_pg)
++ 				      : "cc", "edi", "esi");
++ 	}
++ #endif
++ 		return hv_status;
++ }
++ 
++ /*
++  * Rep hypercalls. Callers of this functions are supposed to ensure that
++  * rep_count and varhead_size comply with Hyper-V hypercall definition.
++  */
++ static inline u64 hv_do_rep_hypercall(u16 code, u16 rep_count, u16 varhead_size,
++ 				      void *input, void *output)
++ {
++ 	u64 control = code;
++ 	u64 status;
++ 	u16 rep_comp;
++ 
++ 	control |= (u64)varhead_size << HV_HYPERCALL_VARHEAD_OFFSET;
++ 	control |= (u64)rep_count << HV_HYPERCALL_REP_COMP_OFFSET;
++ 
++ 	do {
++ 		status = hv_do_hypercall(control, input, output);
++ 		if ((status & HV_HYPERCALL_RESULT_MASK) != HV_STATUS_SUCCESS)
++ 			return status;
++ 
++ 		/* Bits 32-43 of status have 'Reps completed' data. */
++ 		rep_comp = (status & HV_HYPERCALL_REP_COMP_MASK) >>
++ 			HV_HYPERCALL_REP_COMP_OFFSET;
++ 
++ 		control &= ~HV_HYPERCALL_REP_START_MASK;
++ 		control |= (u64)rep_comp << HV_HYPERCALL_REP_START_OFFSET;
++ 
++ 		touch_nmi_watchdog();
++ 	} while (rep_comp < rep_count);
++ 
++ 	return status;
++ }
++ 
++ /*
++  * Hypervisor's notion of virtual processor ID is different from
++  * Linux' notion of CPU ID. This information can only be retrieved
++  * in the context of the calling CPU. Setup a map for easy access
++  * to this information.
++  */
++ extern u32 *hv_vp_index;
++ extern u32 hv_max_vp_index;
++ 
++ /**
++  * hv_cpu_number_to_vp_number() - Map CPU to VP.
++  * @cpu_number: CPU number in Linux terms
++  *
++  * This function returns the mapping between the Linux processor
++  * number and the hypervisor's virtual processor number, useful
++  * in making hypercalls and such that talk about specific
++  * processors.
++  *
++  * Return: Virtual processor number in Hyper-V terms
++  */
++ static inline int hv_cpu_number_to_vp_number(int cpu_number)
++ {
++ 	return hv_vp_index[cpu_number];
++ }
++ 
+++>>>>>>> a3b742439292 (x86/hyperv: Clear vCPU banks between calls to avoid flushing unneeded vCPUs)
+  void hyperv_init(void);
+ -void hyperv_setup_mmu_ops(void);
+ -void hyper_alloc_mmu(void);
+ -void hyperv_report_panic(struct pt_regs *regs);
+ -bool hv_is_hypercall_page_setup(void);
+ -void hyperv_cleanup(void);
+ -#else /* CONFIG_HYPERV */
+ -static inline void hyperv_init(void) {}
+ -static inline bool hv_is_hypercall_page_setup(void) { return false; }
+ -static inline void hyperv_cleanup(void) {}
+ -static inline void hyperv_setup_mmu_ops(void) {}
+ -#endif /* CONFIG_HYPERV */
+ -
+ -#ifdef CONFIG_HYPERV_TSCPAGE
+ -struct ms_hyperv_tsc_page *hv_get_tsc_page(void);
+ -static inline u64 hv_read_tsc_page(const struct ms_hyperv_tsc_page *tsc_pg)
+ -{
+ -	u64 scale, offset, cur_tsc;
+ -	u32 sequence;
+ -
+ -	/*
+ -	 * The protocol for reading Hyper-V TSC page is specified in Hypervisor
+ -	 * Top-Level Functional Specification ver. 3.0 and above. To get the
+ -	 * reference time we must do the following:
+ -	 * - READ ReferenceTscSequence
+ -	 *   A special '0' value indicates the time source is unreliable and we
+ -	 *   need to use something else. The currently published specification
+ -	 *   versions (up to 4.0b) contain a mistake and wrongly claim '-1'
+ -	 *   instead of '0' as the special value, see commit c35b82ef0294.
+ -	 * - ReferenceTime =
+ -	 *        ((RDTSC() * ReferenceTscScale) >> 64) + ReferenceTscOffset
+ -	 * - READ ReferenceTscSequence again. In case its value has changed
+ -	 *   since our first reading we need to discard ReferenceTime and repeat
+ -	 *   the whole sequence as the hypervisor was updating the page in
+ -	 *   between.
+ -	 */
+ -	do {
+ -		sequence = READ_ONCE(tsc_pg->tsc_sequence);
+ -		if (!sequence)
+ -			return U64_MAX;
+ -		/*
+ -		 * Make sure we read sequence before we read other values from
+ -		 * TSC page.
+ -		 */
+ -		smp_rmb();
+ -
+ -		scale = READ_ONCE(tsc_pg->tsc_scale);
+ -		offset = READ_ONCE(tsc_pg->tsc_offset);
+ -		cur_tsc = rdtsc_ordered();
+ -
+ -		/*
+ -		 * Make sure we read sequence after we read all other values
+ -		 * from TSC page.
+ -		 */
+ -		smp_rmb();
+ -
+ -	} while (READ_ONCE(tsc_pg->tsc_sequence) != sequence);
+ -
+ -	return mul_u64_u64_shr(cur_tsc, scale, 64) + offset;
+ -}
+ -
+ -#else
+ -static inline struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
+ -{
+ -	return NULL;
+ -}
+  #endif
+  #endif
+* Unmerged path arch/x86/hyperv/mmu.c
+* Unmerged path arch/x86/hyperv/hv_init.c
+* Unmerged path arch/x86/hyperv/mmu.c
+* Unmerged path arch/x86/include/asm/mshyperv.h
