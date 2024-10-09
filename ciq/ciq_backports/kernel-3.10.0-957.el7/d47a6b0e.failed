@@ -1,0 +1,226 @@
+net: sched: introduce ingress/egress block index attributes for qdisc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: introduce ingress/egress block index attributes for qdisc (Ivan Vecera) [1584592]
+Rebuild_FUZZ: 96.24%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit d47a6b0e7c492a4ba4524d557db388e34fd0a47a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d47a6b0e.failed
+
+Introduce two new attributes to be used for qdisc creation and dumping.
+One for ingress block, one for egress block. Introduce a set of ops that
+qdisc which supports block sharing would implement.
+
+Passing block indexes in qdisc change is not supported yet and it is
+checked and forbidded.
+
+In future, these attributes are to be reused for specifying block
+indexes for classes as well. As of this moment however, it is not
+supported so a check is in place to forbid it.
+
+	Suggested-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d47a6b0e7c492a4ba4524d557db388e34fd0a47a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_api.c
+diff --cc net/sched/sch_api.c
+index 41e15228d21d,d512f49ee83c..000000000000
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@@ -806,14 -805,26 +807,31 @@@ static int tc_fill_qdisc(struct sk_buf
+  	tcm->tcm_ifindex = qdisc_dev(q)->ifindex;
+  	tcm->tcm_parent = clid;
+  	tcm->tcm_handle = q->handle;
+ -	tcm->tcm_info = refcount_read(&q->refcnt);
+ +	tcm->tcm_info = atomic_read(&q->refcnt);
+  	if (nla_put_string(skb, TCA_KIND, q->ops->id))
+  		goto nla_put_failure;
+++<<<<<<< HEAD
+++=======
++ 	if (q->ops->ingress_block_get) {
++ 		block_index = q->ops->ingress_block_get(q);
++ 		if (block_index &&
++ 		    nla_put_u32(skb, TCA_INGRESS_BLOCK, block_index))
++ 			goto nla_put_failure;
++ 	}
++ 	if (q->ops->egress_block_get) {
++ 		block_index = q->ops->egress_block_get(q);
++ 		if (block_index &&
++ 		    nla_put_u32(skb, TCA_EGRESS_BLOCK, block_index))
++ 			goto nla_put_failure;
++ 	}
++ 	if (q->ops->dump && q->ops->dump(q, skb) < 0)
++ 		goto nla_put_failure;
+++>>>>>>> d47a6b0e7c49 (net: sched: introduce ingress/egress block index attributes for qdisc)
+  	if (nla_put_u8(skb, TCA_HW_OFFLOAD, !!(q->flags & TCQ_F_OFFLOADED)))
+  		goto nla_put_failure;
+ -	qlen = qdisc_qlen_sum(q);
+ +	if (q->ops->dump && q->ops->dump(q, skb) < 0)
+ +		goto nla_put_failure;
+ +	qlen = q->q.qlen;
+  
+  	stab = rtnl_dereference(q->stab);
+  	if (stab && qdisc_dump_stab(skb, stab) < 0)
+@@@ -1076,54 -1135,57 +1128,66 @@@ static struct Qdisc *qdisc_create(struc
+  		netdev_info(dev, "Caught tx_queue_len zero misconfig\n");
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!ops->init || (err = ops->init(sch, tca[TCA_OPTIONS])) == 0) {
+ +		if (qdisc_is_percpu_stats(sch)) {
+ +			sch->cpu_bstats =
+ +				netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
+ +			if (!sch->cpu_bstats)
+ +				goto err_out4;
+++=======
++ 	err = qdisc_block_indexes_set(sch, tca, extack);
++ 	if (err)
++ 		goto err_out3;
++ 
++ 	if (ops->init) {
++ 		err = ops->init(sch, tca[TCA_OPTIONS], extack);
++ 		if (err != 0)
++ 			goto err_out5;
++ 	}
+++>>>>>>> d47a6b0e7c49 (net: sched: introduce ingress/egress block index attributes for qdisc)
+  
+ -	if (tca[TCA_STAB]) {
+ -		stab = qdisc_get_stab(tca[TCA_STAB], extack);
+ -		if (IS_ERR(stab)) {
+ -			err = PTR_ERR(stab);
+ -			goto err_out4;
+ +			sch->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
+ +			if (!sch->cpu_qstats)
+ +				goto err_out4;
+  		}
+ -		rcu_assign_pointer(sch->stab, stab);
+ -	}
+ -	if (tca[TCA_RATE]) {
+ -		seqcount_t *running;
+  
+ -		err = -EOPNOTSUPP;
+ -		if (sch->flags & TCQ_F_MQROOT) {
+ -			NL_SET_ERR_MSG(extack, "Cannot attach rate estimator to a multi-queue root qdisc");
+ -			goto err_out4;
+ +		if (tca[TCA_STAB]) {
+ +			stab = qdisc_get_stab(tca[TCA_STAB]);
+ +			if (IS_ERR(stab)) {
+ +				err = PTR_ERR(stab);
+ +				goto err_out4;
+ +			}
+ +			rcu_assign_pointer(sch->stab, stab);
+  		}
+ -
+ -		if (sch->parent != TC_H_ROOT &&
+ -		    !(sch->flags & TCQ_F_INGRESS) &&
+ -		    (!p || !(p->flags & TCQ_F_MQROOT)))
+ -			running = qdisc_root_sleeping_running(sch);
+ -		else
+ -			running = &sch->running;
+ -
+ -		err = gen_new_estimator(&sch->bstats,
+ -					sch->cpu_bstats,
+ -					&sch->rate_est,
+ -					NULL,
+ -					running,
+ -					tca[TCA_RATE]);
+ -		if (err) {
+ -			NL_SET_ERR_MSG(extack, "Failed to generate new estimator");
+ -			goto err_out4;
+ +		if (tca[TCA_RATE]) {
+ +			seqcount_t *running;
+ +
+ +			err = -EOPNOTSUPP;
+ +			if (sch->flags & TCQ_F_MQROOT)
+ +				goto err_out4;
+ +
+ +			if ((sch->parent != TC_H_ROOT) &&
+ +			    !(sch->flags & TCQ_F_INGRESS) &&
+ +			    (!p || !(p->flags & TCQ_F_MQROOT)))
+ +				running = qdisc_root_sleeping_running(sch);
+ +			else
+ +				running = &sch->running;
+ +
+ +			err = gen_new_estimator(&sch->bstats,
+ +						sch->cpu_bstats,
+ +						&sch->rate_est,
+ +						NULL,
+ +						running,
+ +						tca[TCA_RATE]);
+ +			if (err)
+ +				goto err_out4;
+  		}
+ -	}
+ -
+ -	qdisc_hash_add(sch, false);
+  
+ -	return sch;
+ +		qdisc_hash_add(sch, false);
+  
+ -err_out5:
+ +		return sch;
+ +	}
+  	/* ops->init() failed, we call ->destroy() like qdisc_create_dflt() */
+  	if (ops->destroy)
+  		ops->destroy(sch);
+@@@ -1155,9 -1216,15 +1219,18 @@@ static int qdisc_change(struct Qdisc *s
+  	int err = 0;
+  
+  	if (tca[TCA_OPTIONS]) {
+ -		if (!sch->ops->change) {
+ -			NL_SET_ERR_MSG(extack, "Change operation not supported by specified qdisc");
+ +		if (sch->ops->change == NULL)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		err = sch->ops->change(sch, tca[TCA_OPTIONS]);
+++=======
++ 		}
++ 		if (tca[TCA_INGRESS_BLOCK] || tca[TCA_EGRESS_BLOCK]) {
++ 			NL_SET_ERR_MSG(extack, "Change of blocks is not supported");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		err = sch->ops->change(sch, tca[TCA_OPTIONS], extack);
+++>>>>>>> d47a6b0e7c49 (net: sched: introduce ingress/egress block index attributes for qdisc)
+  		if (err)
+  			return err;
+  	}
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index f3bdb46c430b..6da14f75498b 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -208,6 +208,13 @@ struct Qdisc_ops {
+ 	int			(*dump)(struct Qdisc *, struct sk_buff *);
+ 	int			(*dump_stats)(struct Qdisc *, struct gnet_dump *);
+ 
++	void			(*ingress_block_set)(struct Qdisc *sch,
++						     u32 block_index);
++	void			(*egress_block_set)(struct Qdisc *sch,
++						    u32 block_index);
++	u32			(*ingress_block_get)(struct Qdisc *sch);
++	u32			(*egress_block_get)(struct Qdisc *sch);
++
+ 	struct module		*owner;
+ };
+ 
+diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
+index 05d76fbc2010..10f62dafc9dc 100644
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@ -542,6 +542,8 @@ enum {
+ 	TCA_DUMP_INVISIBLE,
+ 	TCA_CHAIN,
+ 	TCA_HW_OFFLOAD,
++	TCA_INGRESS_BLOCK,
++	TCA_EGRESS_BLOCK,
+ 	__TCA_MAX
+ };
+ 
+* Unmerged path net/sched/sch_api.c
