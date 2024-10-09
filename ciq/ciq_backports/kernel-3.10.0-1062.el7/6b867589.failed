@@ -1,0 +1,1196 @@
+xdp: don't make drivers report attachment mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 6b8675897338f874c41612655a85d8e10cdb23d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6b867589.failed
+
+prog_attached of struct netdev_bpf should have been superseded
+by simply setting prog_id long time ago, but we kept it around
+to allow offloading drivers to communicate attachment mode (drv
+vs hw).  Subsequently drivers were also allowed to report back
+attachment flags (prog_flags), and since nowadays only programs
+attached will XDP_FLAGS_HW_MODE can get offloaded, we can tell
+the attachment mode from the flags driver reports.  Remove
+prog_attached member.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 6b8675897338f874c41612655a85d8e10cdb23d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/thunder/nicvf_main.c
+#	drivers/net/ethernet/qlogic/qede/qede_filter.c
+#	drivers/net/netdevsim/bpf.c
+#	drivers/net/tun.c
+#	drivers/net/virtio_net.c
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/core/rtnetlink.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_filter.c
+index eab48e829077,f9a327c821eb..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_filter.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_filter.c
+@@@ -1049,6 -1086,43 +1049,46 @@@ void qede_udp_tunnel_del(struct net_dev
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qede_xdp_reload_func(struct qede_dev *edev,
++ 				 struct qede_reload_args *args)
++ {
++ 	struct bpf_prog *old;
++ 
++ 	old = xchg(&edev->xdp_prog, args->u.new_prog);
++ 	if (old)
++ 		bpf_prog_put(old);
++ }
++ 
++ static int qede_xdp_set(struct qede_dev *edev, struct bpf_prog *prog)
++ {
++ 	struct qede_reload_args args;
++ 
++ 	/* If we're called, there was already a bpf reference increment */
++ 	args.func = &qede_xdp_reload_func;
++ 	args.u.new_prog = prog;
++ 	qede_reload(edev, &args, false);
++ 
++ 	return 0;
++ }
++ 
++ int qede_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct qede_dev *edev = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return qede_xdp_set(edev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = edev->xdp_prog ? edev->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  static int qede_set_mcast_rx_mac(struct qede_dev *edev,
+  				 enum qed_filter_xcast_params_type opcode,
+  				 unsigned char *mac, int num_macs)
+diff --cc drivers/net/tun.c
+index 35cc09f13a24,49a50219d0da..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -955,32 -1235,43 +955,61 @@@ tun_net_get_stats64(struct net_device *
+  	stats->tx_dropped = tx_dropped;
+  }
+  
+ -static int tun_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+ -		       struct netlink_ext_ack *extack)
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +static void tun_poll_controller(struct net_device *dev)
+ +{
+ +	/*
+ +	 * Tun only receives frames when:
+ +	 * 1) the char device endpoint gets data from user space
+ +	 * 2) the tun socket gets a sendmsg call from user space
+ +	 * Since both of those are syncronous operations, we are guaranteed
+ +	 * never to have pending data when we poll for it
+ +	 * so theres nothing to do here but return.
+ +	 * We need this though so netpoll recognizes us as an interface that
+ +	 * supports polling, which enables bridge devices in virt setups to
+ +	 * still use netconsole
+ +	 */
+ +	return;
+ +}
+ +#endif
+ +
+ +static void tun_set_headroom(struct net_device *dev, int new_hr)
+  {
+  	struct tun_struct *tun = netdev_priv(dev);
+ -	struct bpf_prog *old_prog;
+  
+ -	old_prog = rtnl_dereference(tun->xdp_prog);
+ -	rcu_assign_pointer(tun->xdp_prog, prog);
+ -	if (old_prog)
+ -		bpf_prog_put(old_prog);
+ +	if (new_hr < NET_SKB_PAD)
+ +		new_hr = NET_SKB_PAD;
+  
+++<<<<<<< HEAD
+ +	tun->align = new_hr;
+++=======
++ 	return 0;
++ }
++ 
++ static u32 tun_xdp_query(struct net_device *dev)
++ {
++ 	struct tun_struct *tun = netdev_priv(dev);
++ 	const struct bpf_prog *xdp_prog;
++ 
++ 	xdp_prog = rtnl_dereference(tun->xdp_prog);
++ 	if (xdp_prog)
++ 		return xdp_prog->aux->id;
++ 
++ 	return 0;
++ }
++ 
++ static int tun_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return tun_xdp_set(dev, xdp->prog, xdp->extack);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = tun_xdp_query(dev);
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  }
+  
+  static const struct net_device_ops tun_netdev_ops = {
+diff --cc drivers/net/virtio_net.c
+index da63bcba4f5b,2ff08bc103a9..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -1158,130 -1846,523 +1158,234 @@@ static void virtnet_set_affinity(struc
+  	for_each_online_cpu(cpu) {
+  		virtqueue_set_affinity(vi->rq[i].vq, cpu);
+  		virtqueue_set_affinity(vi->sq[i].vq, cpu);
+ -		netif_set_xps_queue(vi->dev, cpumask_of(cpu), i);
+ -		i++;
+ -	}
+ -
+ -	vi->affinity_hint_set = true;
+ -}
+ -
+ -static int virtnet_cpu_online(unsigned int cpu, struct hlist_node *node)
+ -{
+ -	struct virtnet_info *vi = hlist_entry_safe(node, struct virtnet_info,
+ -						   node);
+ -	virtnet_set_affinity(vi);
+ -	return 0;
+ -}
+ -
+ -static int virtnet_cpu_dead(unsigned int cpu, struct hlist_node *node)
+ -{
+ -	struct virtnet_info *vi = hlist_entry_safe(node, struct virtnet_info,
+ -						   node_dead);
+ -	virtnet_set_affinity(vi);
+ -	return 0;
+ -}
+ -
+ -static int virtnet_cpu_down_prep(unsigned int cpu, struct hlist_node *node)
+ -{
+ -	struct virtnet_info *vi = hlist_entry_safe(node, struct virtnet_info,
+ -						   node);
+ -
+ -	virtnet_clean_affinity(vi, cpu);
+ -	return 0;
+ -}
+ -
+ -static enum cpuhp_state virtionet_online;
+ -
+ -static int virtnet_cpu_notif_add(struct virtnet_info *vi)
+ -{
+ -	int ret;
+ -
+ -	ret = cpuhp_state_add_instance_nocalls(virtionet_online, &vi->node);
+ -	if (ret)
+ -		return ret;
+ -	ret = cpuhp_state_add_instance_nocalls(CPUHP_VIRT_NET_DEAD,
+ -					       &vi->node_dead);
+ -	if (!ret)
+ -		return ret;
+ -	cpuhp_state_remove_instance_nocalls(virtionet_online, &vi->node);
+ -	return ret;
+ -}
+ -
+ -static void virtnet_cpu_notif_remove(struct virtnet_info *vi)
+ -{
+ -	cpuhp_state_remove_instance_nocalls(virtionet_online, &vi->node);
+ -	cpuhp_state_remove_instance_nocalls(CPUHP_VIRT_NET_DEAD,
+ -					    &vi->node_dead);
+ -}
+ -
+ -static void virtnet_get_ringparam(struct net_device *dev,
+ -				struct ethtool_ringparam *ring)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -
+ -	ring->rx_max_pending = virtqueue_get_vring_size(vi->rq[0].vq);
+ -	ring->tx_max_pending = virtqueue_get_vring_size(vi->sq[0].vq);
+ -	ring->rx_pending = ring->rx_max_pending;
+ -	ring->tx_pending = ring->tx_max_pending;
+ -}
+ -
+ -
+ -static void virtnet_get_drvinfo(struct net_device *dev,
+ -				struct ethtool_drvinfo *info)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	struct virtio_device *vdev = vi->vdev;
+ -
+ -	strlcpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
+ -	strlcpy(info->version, VIRTNET_DRIVER_VERSION, sizeof(info->version));
+ -	strlcpy(info->bus_info, virtio_bus_name(vdev), sizeof(info->bus_info));
+ -
+ -}
+ -
+ -/* TODO: Eliminate OOO packets during switching */
+ -static int virtnet_set_channels(struct net_device *dev,
+ -				struct ethtool_channels *channels)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	u16 queue_pairs = channels->combined_count;
+ -	int err;
+ -
+ -	/* We don't support separate rx/tx channels.
+ -	 * We don't allow setting 'other' channels.
+ -	 */
+ -	if (channels->rx_count || channels->tx_count || channels->other_count)
+ -		return -EINVAL;
+ -
+ -	if (queue_pairs > vi->max_queue_pairs || queue_pairs == 0)
+ -		return -EINVAL;
+ -
+ -	/* For now we don't support modifying channels while XDP is loaded
+ -	 * also when XDP is loaded all RX queues have XDP programs so we only
+ -	 * need to check a single RX queue.
+ -	 */
+ -	if (vi->rq[0].xdp_prog)
+ -		return -EINVAL;
+ -
+ -	get_online_cpus();
+ -	err = _virtnet_set_queues(vi, queue_pairs);
+ -	if (!err) {
+ -		netif_set_real_num_tx_queues(dev, queue_pairs);
+ -		netif_set_real_num_rx_queues(dev, queue_pairs);
+ -
+ -		virtnet_set_affinity(vi);
+ -	}
+ -	put_online_cpus();
+ -
+ -	return err;
+ -}
+ -
+ -static void virtnet_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	char *p = (char *)data;
+ -	unsigned int i, j;
+ -
+ -	switch (stringset) {
+ -	case ETH_SS_STATS:
+ -		for (i = 0; i < vi->curr_queue_pairs; i++) {
+ -			for (j = 0; j < VIRTNET_RQ_STATS_LEN; j++) {
+ -				snprintf(p, ETH_GSTRING_LEN, "rx_queue_%u_%s",
+ -					 i, virtnet_rq_stats_desc[j].desc);
+ -				p += ETH_GSTRING_LEN;
+ -			}
+ -		}
+ -
+ -		for (i = 0; i < vi->curr_queue_pairs; i++) {
+ -			for (j = 0; j < VIRTNET_SQ_STATS_LEN; j++) {
+ -				snprintf(p, ETH_GSTRING_LEN, "tx_queue_%u_%s",
+ -					 i, virtnet_sq_stats_desc[j].desc);
+ -				p += ETH_GSTRING_LEN;
+ -			}
+ -		}
+ -		break;
+ -	}
+ -}
+ -
+ -static int virtnet_get_sset_count(struct net_device *dev, int sset)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -
+ -	switch (sset) {
+ -	case ETH_SS_STATS:
+ -		return vi->curr_queue_pairs * (VIRTNET_RQ_STATS_LEN +
+ -					       VIRTNET_SQ_STATS_LEN);
+ -	default:
+ -		return -EOPNOTSUPP;
+ -	}
+ -}
+ -
+ -static void virtnet_get_ethtool_stats(struct net_device *dev,
+ -				      struct ethtool_stats *stats, u64 *data)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	unsigned int idx = 0, start, i, j;
+ -	const u8 *stats_base;
+ -	size_t offset;
+ -
+ -	for (i = 0; i < vi->curr_queue_pairs; i++) {
+ -		struct receive_queue *rq = &vi->rq[i];
+ -
+ -		stats_base = (u8 *)&rq->stats;
+ -		do {
+ -			start = u64_stats_fetch_begin_irq(&rq->stats.syncp);
+ -			for (j = 0; j < VIRTNET_RQ_STATS_LEN; j++) {
+ -				offset = virtnet_rq_stats_desc[j].offset;
+ -				data[idx + j] = *(u64 *)(stats_base + offset);
+ -			}
+ -		} while (u64_stats_fetch_retry_irq(&rq->stats.syncp, start));
+ -		idx += VIRTNET_RQ_STATS_LEN;
+ -	}
+ -
+ -	for (i = 0; i < vi->curr_queue_pairs; i++) {
+ -		struct send_queue *sq = &vi->sq[i];
+ -
+ -		stats_base = (u8 *)&sq->stats;
+ -		do {
+ -			start = u64_stats_fetch_begin_irq(&sq->stats.syncp);
+ -			for (j = 0; j < VIRTNET_SQ_STATS_LEN; j++) {
+ -				offset = virtnet_sq_stats_desc[j].offset;
+ -				data[idx + j] = *(u64 *)(stats_base + offset);
+ -			}
+ -		} while (u64_stats_fetch_retry_irq(&sq->stats.syncp, start));
+ -		idx += VIRTNET_SQ_STATS_LEN;
+ -	}
+ -}
+ -
+ -static void virtnet_get_channels(struct net_device *dev,
+ -				 struct ethtool_channels *channels)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -
+ -	channels->combined_count = vi->curr_queue_pairs;
+ -	channels->max_combined = vi->max_queue_pairs;
+ -	channels->max_other = 0;
+ -	channels->rx_count = 0;
+ -	channels->tx_count = 0;
+ -	channels->other_count = 0;
+ -}
+ -
+ -/* Check if the user is trying to change anything besides speed/duplex */
+ -static bool
+ -virtnet_validate_ethtool_cmd(const struct ethtool_link_ksettings *cmd)
+ -{
+ -	struct ethtool_link_ksettings diff1 = *cmd;
+ -	struct ethtool_link_ksettings diff2 = {};
+ -
+ -	/* cmd is always set so we need to clear it, validate the port type
+ -	 * and also without autonegotiation we can ignore advertising
+ -	 */
+ -	diff1.base.speed = 0;
+ -	diff2.base.port = PORT_OTHER;
+ -	ethtool_link_ksettings_zero_link_mode(&diff1, advertising);
+ -	diff1.base.duplex = 0;
+ -	diff1.base.cmd = 0;
+ -	diff1.base.link_mode_masks_nwords = 0;
+ -
+ -	return !memcmp(&diff1.base, &diff2.base, sizeof(diff1.base)) &&
+ -		bitmap_empty(diff1.link_modes.supported,
+ -			     __ETHTOOL_LINK_MODE_MASK_NBITS) &&
+ -		bitmap_empty(diff1.link_modes.advertising,
+ -			     __ETHTOOL_LINK_MODE_MASK_NBITS) &&
+ -		bitmap_empty(diff1.link_modes.lp_advertising,
+ -			     __ETHTOOL_LINK_MODE_MASK_NBITS);
+ -}
+ -
+ -static int virtnet_set_link_ksettings(struct net_device *dev,
+ -				      const struct ethtool_link_ksettings *cmd)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	u32 speed;
+ -
+ -	speed = cmd->base.speed;
+ -	/* don't allow custom speed and duplex */
+ -	if (!ethtool_validate_speed(speed) ||
+ -	    !ethtool_validate_duplex(cmd->base.duplex) ||
+ -	    !virtnet_validate_ethtool_cmd(cmd))
+ -		return -EINVAL;
+ -	vi->speed = speed;
+ -	vi->duplex = cmd->base.duplex;
+ -
+ -	return 0;
+ -}
+ -
+ -static int virtnet_get_link_ksettings(struct net_device *dev,
+ -				      struct ethtool_link_ksettings *cmd)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -
+ -	cmd->base.speed = vi->speed;
+ -	cmd->base.duplex = vi->duplex;
+ -	cmd->base.port = PORT_OTHER;
+ -
+ -	return 0;
+ -}
+ -
+ -static void virtnet_init_settings(struct net_device *dev)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -
+ -	vi->speed = SPEED_UNKNOWN;
+ -	vi->duplex = DUPLEX_UNKNOWN;
+ -}
+ -
+ -static void virtnet_update_settings(struct virtnet_info *vi)
+ -{
+ -	u32 speed;
+ -	u8 duplex;
+ -
+ -	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_SPEED_DUPLEX))
+ -		return;
+ -
+ -	speed = virtio_cread32(vi->vdev, offsetof(struct virtio_net_config,
+ -						  speed));
+ -	if (ethtool_validate_speed(speed))
+ -		vi->speed = speed;
+ -	duplex = virtio_cread8(vi->vdev, offsetof(struct virtio_net_config,
+ -						  duplex));
+ -	if (ethtool_validate_duplex(duplex))
+ -		vi->duplex = duplex;
+ -}
+ -
+ -static const struct ethtool_ops virtnet_ethtool_ops = {
+ -	.get_drvinfo = virtnet_get_drvinfo,
+ -	.get_link = ethtool_op_get_link,
+ -	.get_ringparam = virtnet_get_ringparam,
+ -	.get_strings = virtnet_get_strings,
+ -	.get_sset_count = virtnet_get_sset_count,
+ -	.get_ethtool_stats = virtnet_get_ethtool_stats,
+ -	.set_channels = virtnet_set_channels,
+ -	.get_channels = virtnet_get_channels,
+ -	.get_ts_info = ethtool_op_get_ts_info,
+ -	.get_link_ksettings = virtnet_get_link_ksettings,
+ -	.set_link_ksettings = virtnet_set_link_ksettings,
+ -};
+ -
+ -static void virtnet_freeze_down(struct virtio_device *vdev)
+ -{
+ -	struct virtnet_info *vi = vdev->priv;
+ -	int i;
+ -
+ -	/* Make sure no work handler is accessing the device */
+ -	flush_work(&vi->config_work);
+ -
+ -	netif_device_detach(vi->dev);
+ -	netif_tx_disable(vi->dev);
+ -	cancel_delayed_work_sync(&vi->refill);
+ -
+ -	if (netif_running(vi->dev)) {
+ -		for (i = 0; i < vi->max_queue_pairs; i++) {
+ -			napi_disable(&vi->rq[i].napi);
+ -			virtnet_napi_tx_disable(&vi->sq[i].napi);
+ -		}
+ +		*per_cpu_ptr(vi->vq_index, cpu) = i;
+ +		i++;
+  	}
+ -}
+  
+ -static int init_vqs(struct virtnet_info *vi);
+ +	vi->affinity_hint_set = true;
+ +}
+  
+ -static int virtnet_restore_up(struct virtio_device *vdev)
+ +static int virtnet_cpu_callback(struct notifier_block *nfb,
+ +			        unsigned long action, void *hcpu)
+  {
+ -	struct virtnet_info *vi = vdev->priv;
+ -	int err, i;
+ -
+ -	err = init_vqs(vi);
+ -	if (err)
+ -		return err;
+ -
+ -	virtio_device_ready(vdev);
+ -
+ -	if (netif_running(vi->dev)) {
+ -		for (i = 0; i < vi->curr_queue_pairs; i++)
+ -			if (!try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+ -				schedule_delayed_work(&vi->refill, 0);
+ +	struct virtnet_info *vi = container_of(nfb, struct virtnet_info, nb);
+  
+ -		for (i = 0; i < vi->max_queue_pairs; i++) {
+ -			virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
+ -			virtnet_napi_tx_enable(vi, vi->sq[i].vq,
+ -					       &vi->sq[i].napi);
+ -		}
+ +	switch(action & ~CPU_TASKS_FROZEN) {
+ +	case CPU_ONLINE:
+ +	case CPU_DOWN_FAILED:
+ +	case CPU_DEAD:
+ +		virtnet_set_affinity(vi);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +		virtnet_clean_affinity(vi, (long)hcpu);
+ +		break;
+ +	default:
+ +		break;
+  	}
+  
+ -	netif_device_attach(vi->dev);
+ -	return err;
+ +	return NOTIFY_OK;
+  }
+  
+ -static int virtnet_set_guest_offloads(struct virtnet_info *vi, u64 offloads)
+ +static void virtnet_get_ringparam(struct net_device *dev,
+ +				struct ethtool_ringparam *ring)
+  {
+ -	struct scatterlist sg;
+ -	vi->ctrl->offloads = cpu_to_virtio64(vi->vdev, offloads);
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +
+ +	ring->rx_max_pending = virtqueue_get_vring_size(vi->rq[0].vq);
+ +	ring->tx_max_pending = virtqueue_get_vring_size(vi->sq[0].vq);
+ +	ring->rx_pending = ring->rx_max_pending;
+ +	ring->tx_pending = ring->tx_max_pending;
+ +}
+  
+ -	sg_init_one(&sg, &vi->ctrl->offloads, sizeof(vi->ctrl->offloads));
+  
+ -	if (!virtnet_send_command(vi, VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+ -				  VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET, &sg)) {
+ -		dev_warn(&vi->dev->dev, "Fail to set guest offload. \n");
+ -		return -EINVAL;
+ -	}
+ +static void virtnet_get_drvinfo(struct net_device *dev,
+ +				struct ethtool_drvinfo *info)
+ +{
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +	struct virtio_device *vdev = vi->vdev;
+ +
+ +	strlcpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
+ +	strlcpy(info->version, VIRTNET_DRIVER_VERSION, sizeof(info->version));
+ +	strlcpy(info->bus_info, virtio_bus_name(vdev), sizeof(info->bus_info));
+  
+ -	return 0;
+  }
+  
+ -static int virtnet_clear_guest_offloads(struct virtnet_info *vi)
+ +/* TODO: Eliminate OOO packets during switching */
+ +static int virtnet_set_channels(struct net_device *dev,
+ +				struct ethtool_channels *channels)
+  {
+ -	u64 offloads = 0;
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +	u16 queue_pairs = channels->combined_count;
+ +	int err;
+  
+ -	if (!vi->guest_offloads)
+ -		return 0;
+ +	/* We don't support separate rx/tx channels.
+ +	 * We don't allow setting 'other' channels.
+ +	 */
+ +	if (channels->rx_count || channels->tx_count || channels->other_count)
+ +		return -EINVAL;
+ +
+ +	if (queue_pairs > vi->max_queue_pairs)
+ +		return -EINVAL;
+ +
+ +	get_online_cpus();
+ +	err = virtnet_set_queues(vi, queue_pairs);
+ +	if (!err) {
+ +		netif_set_real_num_tx_queues(dev, queue_pairs);
+ +		netif_set_real_num_rx_queues(dev, queue_pairs);
+  
+ -	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_CSUM))
+ -		offloads = 1ULL << VIRTIO_NET_F_GUEST_CSUM;
+ +		virtnet_set_affinity(vi);
+ +	}
+ +	put_online_cpus();
+  
+ -	return virtnet_set_guest_offloads(vi, offloads);
+ +	return err;
+  }
+  
+ -static int virtnet_restore_guest_offloads(struct virtnet_info *vi)
+ +static void virtnet_get_channels(struct net_device *dev,
+ +				 struct ethtool_channels *channels)
+  {
+ -	u64 offloads = vi->guest_offloads;
+ -
+ -	if (!vi->guest_offloads)
+ -		return 0;
+ -	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_CSUM))
+ -		offloads |= 1ULL << VIRTIO_NET_F_GUEST_CSUM;
+ +	struct virtnet_info *vi = netdev_priv(dev);
+  
+ -	return virtnet_set_guest_offloads(vi, offloads);
+ +	channels->combined_count = vi->curr_queue_pairs;
+ +	channels->max_combined = vi->max_queue_pairs;
+ +	channels->max_other = 0;
+ +	channels->rx_count = 0;
+ +	channels->tx_count = 0;
+ +	channels->other_count = 0;
+  }
+  
+ -static int virtnet_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+ -			   struct netlink_ext_ack *extack)
+ +static const struct ethtool_ops virtnet_ethtool_ops = {
+ +	.get_drvinfo = virtnet_get_drvinfo,
+ +	.get_link = ethtool_op_get_link,
+ +	.get_ringparam = virtnet_get_ringparam,
+ +	.set_channels = virtnet_set_channels,
+ +	.get_channels = virtnet_get_channels,
+ +};
+ +
+ +/* To avoid contending a lock hold by a vcpu who would exit to host, select the
+ + * txq based on the processor id.
+ + */
+ +static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
+ +			void *accel_priv, select_queue_fallback_t fallback)
+  {
+ -	unsigned long int max_sz = PAGE_SIZE - sizeof(struct padded_vnet_hdr);
+ +	int txq;
+  	struct virtnet_info *vi = netdev_priv(dev);
+ -	struct bpf_prog *old_prog;
+ -	u16 xdp_qp = 0, curr_qp;
+ -	int i, err;
+  
+ -	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_CTRL_GUEST_OFFLOADS)
+ -	    && (virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_TSO4) ||
+ -	        virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_TSO6) ||
+ -	        virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_ECN) ||
+ -		virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_UFO))) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Can't set XDP while host is implementing LRO, disable LRO first");
+ -		return -EOPNOTSUPP;
+ +	if (skb_rx_queue_recorded(skb)) {
+ +		txq = skb_get_rx_queue(skb);
+ +	} else {
+ +		txq = *__this_cpu_ptr(vi->vq_index);
+ +		if (txq == -1)
+ +			txq = 0;
+  	}
+  
+ -	if (vi->mergeable_rx_bufs && !vi->any_header_sg) {
+ -		NL_SET_ERR_MSG_MOD(extack, "XDP expects header/data in single page, any_header_sg required");
+ -		return -EINVAL;
+ -	}
+ +	while (unlikely(txq >= dev->real_num_tx_queues))
+ +		txq -= dev->real_num_tx_queues;
+  
+++<<<<<<< HEAD
+ +	return txq;
+++=======
++ 	if (dev->mtu > max_sz) {
++ 		NL_SET_ERR_MSG_MOD(extack, "MTU too large to enable XDP");
++ 		netdev_warn(dev, "XDP requires MTU less than %lu\n", max_sz);
++ 		return -EINVAL;
++ 	}
++ 
++ 	curr_qp = vi->curr_queue_pairs - vi->xdp_queue_pairs;
++ 	if (prog)
++ 		xdp_qp = nr_cpu_ids;
++ 
++ 	/* XDP requires extra queues for XDP_TX */
++ 	if (curr_qp + xdp_qp > vi->max_queue_pairs) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Too few free TX rings available");
++ 		netdev_warn(dev, "request %i queues but max is %i\n",
++ 			    curr_qp + xdp_qp, vi->max_queue_pairs);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, vi->max_queue_pairs - 1);
++ 		if (IS_ERR(prog))
++ 			return PTR_ERR(prog);
++ 	}
++ 
++ 	/* Make sure NAPI is not using any XDP TX queues for RX. */
++ 	if (netif_running(dev))
++ 		for (i = 0; i < vi->max_queue_pairs; i++)
++ 			napi_disable(&vi->rq[i].napi);
++ 
++ 	netif_set_real_num_rx_queues(dev, curr_qp + xdp_qp);
++ 	err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++ 	if (err)
++ 		goto err;
++ 	vi->xdp_queue_pairs = xdp_qp;
++ 
++ 	for (i = 0; i < vi->max_queue_pairs; i++) {
++ 		old_prog = rtnl_dereference(vi->rq[i].xdp_prog);
++ 		rcu_assign_pointer(vi->rq[i].xdp_prog, prog);
++ 		if (i == 0) {
++ 			if (!old_prog)
++ 				virtnet_clear_guest_offloads(vi);
++ 			if (!prog)
++ 				virtnet_restore_guest_offloads(vi);
++ 		}
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 		if (netif_running(dev))
++ 			virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ 	}
++ 
++ 	return 0;
++ 
++ err:
++ 	for (i = 0; i < vi->max_queue_pairs; i++)
++ 		virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ 	if (prog)
++ 		bpf_prog_sub(prog, vi->max_queue_pairs - 1);
++ 	return err;
++ }
++ 
++ static u32 virtnet_xdp_query(struct net_device *dev)
++ {
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	const struct bpf_prog *xdp_prog;
++ 	int i;
++ 
++ 	for (i = 0; i < vi->max_queue_pairs; i++) {
++ 		xdp_prog = rtnl_dereference(vi->rq[i].xdp_prog);
++ 		if (xdp_prog)
++ 			return xdp_prog->aux->id;
++ 	}
++ 	return 0;
++ }
++ 
++ static int virtnet_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return virtnet_xdp_set(dev, xdp->prog, xdp->extack);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = virtnet_xdp_query(dev);
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int virtnet_get_phys_port_name(struct net_device *dev, char *buf,
++ 				      size_t len)
++ {
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	int ret;
++ 
++ 	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_STANDBY))
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = snprintf(buf, len, "sby");
++ 	if (ret >= len)
++ 		return -EOPNOTSUPP;
++ 
++ 	return 0;
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  }
+  
+  static const struct net_device_ops virtnet_netdev = {
+diff --cc include/linux/netdevice.h
+index 63a3866ea81e,69a664789b33..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1000,22 -818,55 +1000,29 @@@ enum xdp_netdev_command 
+  	 * when it is no longer used.
+  	 */
+  	XDP_SETUP_PROG,
+++<<<<<<< HEAD
+ +	/* Check if a bpf program is set on the device.  The callee should
+ +	 * return true if a program is currently attached and running.
+ +	 */
+++=======
++ 	XDP_SETUP_PROG_HW,
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  	XDP_QUERY_PROG,
+ -	/* BPF program for offload callbacks, invoked at program load time. */
+ -	BPF_OFFLOAD_VERIFIER_PREP,
+ -	BPF_OFFLOAD_TRANSLATE,
+ -	BPF_OFFLOAD_DESTROY,
+ -	BPF_OFFLOAD_MAP_ALLOC,
+ -	BPF_OFFLOAD_MAP_FREE,
+ -	XDP_QUERY_XSK_UMEM,
+ -	XDP_SETUP_XSK_UMEM,
+  };
+  
+ -struct bpf_prog_offload_ops;
+ -struct netlink_ext_ack;
+ -struct xdp_umem;
+ -
+ -struct netdev_bpf {
+ -	enum bpf_netdev_command command;
+ +struct netdev_xdp {
+ +	enum xdp_netdev_command command;
+  	union {
+  		/* XDP_SETUP_PROG */
+ -		struct {
+ -			u32 flags;
+ -			struct bpf_prog *prog;
+ -			struct netlink_ext_ack *extack;
+ -		};
+ +		struct bpf_prog *prog;
+  		/* XDP_QUERY_PROG */
+  		struct {
+++<<<<<<< HEAD
+ +			bool prog_attached;
+++=======
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  			u32 prog_id;
+ -			/* flags with which program was installed */
+ -			u32 prog_flags;
+  		};
+ -		/* BPF_OFFLOAD_VERIFIER_PREP */
+ -		struct {
+ -			struct bpf_prog *prog;
+ -			const struct bpf_prog_offload_ops *ops; /* callee set */
+ -		} verifier;
+ -		/* BPF_OFFLOAD_TRANSLATE, BPF_OFFLOAD_DESTROY */
+ -		struct {
+ -			struct bpf_prog *prog;
+ -		} offload;
+ -		/* BPF_OFFLOAD_MAP_ALLOC, BPF_OFFLOAD_MAP_FREE */
+ -		struct {
+ -			struct bpf_offloaded_map *offmap;
+ -		};
+ -		/* XDP_SETUP_XSK_UMEM */
+ -		struct {
+ -			struct xdp_umem *umem;
+ -			u16 queue_id;
+ -		} xsk;
+  	};
+  };
+  
+diff --cc net/core/dev.c
+index 8e4fb78a977c,9fa3b3705a8e..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4275,11 -4865,74 +4275,78 @@@ static int __netif_receive_skb(struct s
+  		 * Use PF_MEMALLOC as this saves us from propagating the allocation
+  		 * context down to all allocation sites.
+  		 */
+ -		noreclaim_flag = memalloc_noreclaim_save();
+ -		ret = __netif_receive_skb_one_core(skb, true);
+ -		memalloc_noreclaim_restore(noreclaim_flag);
+ +		current->flags |= PF_MEMALLOC;
+ +		ret = __netif_receive_skb_core(skb, true);
+ +		tsk_restore_flags(current, pflags, PF_MEMALLOC);
+  	} else
+++<<<<<<< HEAD
+ +		ret = __netif_receive_skb_core(skb, false);
+++=======
++ 		ret = __netif_receive_skb_one_core(skb, false);
++ 
++ 	return ret;
++ }
++ 
++ static void __netif_receive_skb_list(struct list_head *head)
++ {
++ 	unsigned long noreclaim_flag = 0;
++ 	struct sk_buff *skb, *next;
++ 	bool pfmemalloc = false; /* Is current sublist PF_MEMALLOC? */
++ 
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		if ((sk_memalloc_socks() && skb_pfmemalloc(skb)) != pfmemalloc) {
++ 			struct list_head sublist;
++ 
++ 			/* Handle the previous sublist */
++ 			list_cut_before(&sublist, head, &skb->list);
++ 			if (!list_empty(&sublist))
++ 				__netif_receive_skb_list_core(&sublist, pfmemalloc);
++ 			pfmemalloc = !pfmemalloc;
++ 			/* See comments in __netif_receive_skb */
++ 			if (pfmemalloc)
++ 				noreclaim_flag = memalloc_noreclaim_save();
++ 			else
++ 				memalloc_noreclaim_restore(noreclaim_flag);
++ 		}
++ 	}
++ 	/* Handle the remaining sublist */
++ 	if (!list_empty(head))
++ 		__netif_receive_skb_list_core(head, pfmemalloc);
++ 	/* Restore pflags */
++ 	if (pfmemalloc)
++ 		memalloc_noreclaim_restore(noreclaim_flag);
++ }
++ 
++ static int generic_xdp_install(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct bpf_prog *old = rtnl_dereference(dev->xdp_prog);
++ 	struct bpf_prog *new = xdp->prog;
++ 	int ret = 0;
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		rcu_assign_pointer(dev->xdp_prog, new);
++ 		if (old)
++ 			bpf_prog_put(old);
++ 
++ 		if (old && !new) {
++ 			static_branch_dec(&generic_xdp_needed_key);
++ 		} else if (new && !old) {
++ 			static_branch_inc(&generic_xdp_needed_key);
++ 			dev_disable_lro(dev);
++ 			dev_disable_gro_hw(dev);
++ 		}
++ 		break;
++ 
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = old ? old->aux->id : 0;
++ 		break;
++ 
++ 	default:
++ 		ret = -EINVAL;
++ 		break;
++ 	}
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  
+  	return ret;
+  }
+@@@ -7069,6 -7582,64 +7136,67 @@@ int dev_change_proto_down(struct net_de
+  }
+  EXPORT_SYMBOL(dev_change_proto_down);
+  
+++<<<<<<< HEAD
+++=======
++ void __dev_xdp_query(struct net_device *dev, bpf_op_t bpf_op,
++ 		     struct netdev_bpf *xdp)
++ {
++ 	memset(xdp, 0, sizeof(*xdp));
++ 	xdp->command = XDP_QUERY_PROG;
++ 
++ 	/* Query must always succeed. */
++ 	WARN_ON(bpf_op(dev, xdp) < 0);
++ }
++ 
++ static bool __dev_xdp_attached(struct net_device *dev, bpf_op_t bpf_op)
++ {
++ 	struct netdev_bpf xdp;
++ 
++ 	__dev_xdp_query(dev, bpf_op, &xdp);
++ 
++ 	return xdp.prog_id;
++ }
++ 
++ static int dev_xdp_install(struct net_device *dev, bpf_op_t bpf_op,
++ 			   struct netlink_ext_ack *extack, u32 flags,
++ 			   struct bpf_prog *prog)
++ {
++ 	struct netdev_bpf xdp;
++ 
++ 	memset(&xdp, 0, sizeof(xdp));
++ 	if (flags & XDP_FLAGS_HW_MODE)
++ 		xdp.command = XDP_SETUP_PROG_HW;
++ 	else
++ 		xdp.command = XDP_SETUP_PROG;
++ 	xdp.extack = extack;
++ 	xdp.flags = flags;
++ 	xdp.prog = prog;
++ 
++ 	return bpf_op(dev, &xdp);
++ }
++ 
++ static void dev_xdp_uninstall(struct net_device *dev)
++ {
++ 	struct netdev_bpf xdp;
++ 	bpf_op_t ndo_bpf;
++ 
++ 	/* Remove generic XDP */
++ 	WARN_ON(dev_xdp_install(dev, generic_xdp_install, NULL, 0, NULL));
++ 
++ 	/* Remove from the driver */
++ 	ndo_bpf = dev->netdev_ops->ndo_bpf;
++ 	if (!ndo_bpf)
++ 		return;
++ 
++ 	__dev_xdp_query(dev, ndo_bpf, &xdp);
++ 	if (!xdp.prog_id)
++ 		return;
++ 
++ 	/* Program removal should always succeed */
++ 	WARN_ON(dev_xdp_install(dev, ndo_bpf, NULL, xdp.prog_flags, NULL));
++ }
++ 
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  /**
+   *	dev_change_xdp_fd - set or clear a bpf program for a device rx path
+   *	@dev: device
+diff --cc net/core/rtnetlink.c
+index c70e7cdc57f8,02ebc056a688..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1335,6 -1354,83 +1335,86 @@@ static int rtnl_fill_link_ifmap(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u8 rtnl_xdp_attached_mode(struct net_device *dev, u32 *prog_id)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	const struct bpf_prog *generic_xdp_prog;
++ 	struct netdev_bpf xdp;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	*prog_id = 0;
++ 	generic_xdp_prog = rtnl_dereference(dev->xdp_prog);
++ 	if (generic_xdp_prog) {
++ 		*prog_id = generic_xdp_prog->aux->id;
++ 		return XDP_ATTACHED_SKB;
++ 	}
++ 	if (!ops->ndo_bpf)
++ 		return XDP_ATTACHED_NONE;
++ 
++ 	__dev_xdp_query(dev, ops->ndo_bpf, &xdp);
++ 	if (!xdp.prog_id)
++ 		return XDP_ATTACHED_NONE;
++ 
++ 	*prog_id = xdp.prog_id;
++ 	if (xdp.prog_flags & XDP_FLAGS_HW_MODE)
++ 		return XDP_ATTACHED_HW;
++ 	return XDP_ATTACHED_DRV;
++ }
++ 
++ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	u32 prog_attr, prog_id;
++ 	struct nlattr *xdp;
++ 	int err;
++ 	u8 mode;
++ 
++ 	xdp = nla_nest_start(skb, IFLA_XDP);
++ 	if (!xdp)
++ 		return -EMSGSIZE;
++ 
++ 	mode = rtnl_xdp_attached_mode(dev, &prog_id);
++ 	err = nla_put_u8(skb, IFLA_XDP_ATTACHED, mode);
++ 	if (err)
++ 		goto err_cancel;
++ 
++ 	if (prog_id) {
++ 		err = nla_put_u32(skb, IFLA_XDP_PROG_ID, prog_id);
++ 		if (err)
++ 			goto err_cancel;
++ 
++ 		switch (mode) {
++ 		case XDP_ATTACHED_DRV:
++ 			prog_attr = IFLA_XDP_DRV_PROG_ID;
++ 			break;
++ 		case XDP_ATTACHED_SKB:
++ 			prog_attr = IFLA_XDP_SKB_PROG_ID;
++ 			break;
++ 		case XDP_ATTACHED_HW:
++ 			prog_attr = IFLA_XDP_HW_PROG_ID;
++ 			break;
++ 		case XDP_ATTACHED_NONE:
++ 		default:
++ 			err = -EINVAL;
++ 			goto err_cancel;
++ 		}
++ 
++ 		err = nla_put_u32(skb, prog_attr, prog_id);
++ 		if (err)
++ 			goto err_cancel;
++ 	}
++ 
++ 	nla_nest_end(skb, xdp);
++ 	return 0;
++ 
++ err_cancel:
++ 	nla_nest_cancel(skb, xdp);
++ 	return err;
++ }
++ 
+++>>>>>>> 6b8675897338 (xdp: don't make drivers report attachment mode)
+  static u32 rtnl_get_event(unsigned long event)
+  {
+  	u32 rtnl_event_type = IFLA_EVENT_NONE;
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_main.c
+* Unmerged path drivers/net/netdevsim/bpf.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 8a8a4915e6d9..6b8d52337dff 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -220,7 +220,6 @@ int bnxt_xdp(struct net_device *dev, struct netdev_xdp *xdp)
+ 		rc = bnxt_xdp_set(bp, xdp->prog);
+ 		break;
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_attached = !!bp->xdp_prog;
+ 		xdp->prog_id = bp->xdp_prog ? bp->xdp_prog->aux->id : 0;
+ 		rc = 0;
+ 		break;
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_main.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
+index 32248f22b8ed..333b5b2b2d0e 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -11845,7 +11845,6 @@ static int __maybe_unused i40e_xdp(struct net_device *dev,
+ 	case XDP_SETUP_PROG:
+ 		return i40e_xdp_setup(vsi, xdp->prog);
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_attached = i40e_enabled_xdp_vsi(vsi);
+ 		xdp->prog_id = vsi->xdp_prog ? vsi->xdp_prog->aux->id : 0;
+ 		return 0;
+ 	default:
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 615fd6aa3ef9..a175fb12ce92 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -9936,7 +9936,6 @@ static int ixgbe_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+ 	case XDP_SETUP_PROG:
+ 		return ixgbe_xdp_setup(dev, xdp->prog);
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_attached = !!(adapter->xdp_prog);
+ 		xdp->prog_id = adapter->xdp_prog ?
+ 			adapter->xdp_prog->aux->id : 0;
+ 		return 0;
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index 1865066629a4..f2eb050b24aa 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -4448,7 +4448,6 @@ static int ixgbevf_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+ 	case XDP_SETUP_PROG:
+ 		return ixgbevf_xdp_setup(dev, xdp->prog);
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_attached = !!(adapter->xdp_prog);
+ 		xdp->prog_id = adapter->xdp_prog ?
+ 			       adapter->xdp_prog->aux->id : 0;
+ 		return 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index aee268d02e12..eb5b19948427 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -2925,7 +2925,6 @@ static int mlx4_xdp(struct net_device *dev, struct netdev_xdp *xdp)
+ 		return mlx4_xdp_set(dev, xdp->prog);
+ 	case XDP_QUERY_PROG:
+ 		xdp->prog_id = mlx4_xdp_query(dev);
+-		xdp->prog_attached = !!xdp->prog_id;
+ 		return 0;
+ 	default:
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 1548bb7d3381..25e05b7606a8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3788,7 +3788,6 @@ static int mlx5e_xdp(struct net_device *dev, struct netdev_xdp *xdp)
+ 		return mlx5e_xdp_set(dev, xdp->prog);
+ 	case XDP_QUERY_PROG:
+ 		xdp->prog_id = mlx5e_xdp_query(dev);
+-		xdp->prog_attached = !!xdp->prog_id;
+ 		return 0;
+ 	default:
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 1b191a368eb3..6762bd0c4a4e 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -3435,9 +3435,6 @@ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
+ 		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
+ 					 xdp->extack);
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_attached = !!nn->xdp_prog;
+-		if (nn->dp.bpf_offload_xdp)
+-			xdp->prog_attached = XDP_ATTACHED_HW;
+ 		xdp->prog_id = nn->xdp_prog ? nn->xdp_prog->aux->id : 0;
+ 		xdp->prog_flags = nn->xdp_prog ? nn->xdp_flags : 0;
+ 		return 0;
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_filter.c
+* Unmerged path drivers/net/netdevsim/bpf.c
+* Unmerged path drivers/net/tun.c
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/rtnetlink.c
