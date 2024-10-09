@@ -1,0 +1,142 @@
+locks: new locks_mandatory_area calling convention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit acc15575e78e534c12549d8057a692f490a50f61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/acc15575.failed
+
+Pass a loff_t end for the last byte instead of the 32-bit count
+parameter to allow full file clones even on 32-bit architectures.
+While we're at it also simplify the read/write selection.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: J. Bruce Fields <bfields@fieldses.org>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit acc15575e78e534c12549d8057a692f490a50f61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/read_write.c
+#	include/linux/fs.h
+diff --cc fs/read_write.c
+index b7e6d43449bd,6cfad4761fd8..000000000000
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@@ -411,10 -395,9 +411,16 @@@ int rw_verify_area(int read_write, stru
+  			return retval;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(inode->i_flock && mandatory_lock(inode))) {
+ +		retval = locks_mandatory_area(
+ +			read_write == READ ? FLOCK_VERIFY_READ : FLOCK_VERIFY_WRITE,
+ +			inode, file, pos, count);
+++=======
++ 	if (unlikely(inode->i_flctx && mandatory_lock(inode))) {
++ 		retval = locks_mandatory_area(inode, file, pos, pos + count - 1,
++ 				read_write == READ ? F_RDLCK : F_WRLCK);
+++>>>>>>> acc15575e78e (locks: new locks_mandatory_area calling convention)
+  		if (retval < 0)
+  			return retval;
+  	}
+diff --cc include/linux/fs.h
+index 98b7caca3399,4377b2df991d..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2192,14 -2029,10 +2192,11 @@@ static inline struct inode *file_inode(
+  extern struct kobject *fs_kobj;
+  
+  #define MAX_RW_COUNT (INT_MAX & PAGE_CACHE_MASK)
+ +extern int rw_verify_area(int, struct file *, loff_t *, size_t);
+  
+- #define FLOCK_VERIFY_READ  1
+- #define FLOCK_VERIFY_WRITE 2
+- 
+  #ifdef CONFIG_FILE_LOCKING
+  extern int locks_mandatory_locked(struct file *);
+- extern int locks_mandatory_area(int, struct inode *, struct file *, loff_t, size_t);
++ extern int locks_mandatory_area(struct inode *, struct file *, loff_t, loff_t, unsigned char);
+  
+  /*
+   * Candidates for mandatory locking have the setgid bit set
+@@@ -2229,17 -2062,19 +2226,30 @@@ static inline int locks_verify_locked(s
+  }
+  
+  static inline int locks_verify_truncate(struct inode *inode,
+- 				    struct file *filp,
++ 				    struct file *f,
+  				    loff_t size)
+  {
+++<<<<<<< HEAD
+ +	if (inode->i_flock && mandatory_lock(inode))
+ +		return locks_mandatory_area(
+ +			FLOCK_VERIFY_WRITE, inode, filp,
+ +			size < inode->i_size ? size : inode->i_size,
+ +			(size < inode->i_size ? inode->i_size - size
+ +			 : size - inode->i_size)
+ +		);
+ +	return 0;
+++=======
++ 	if (!inode->i_flctx || !mandatory_lock(inode))
++ 		return 0;
++ 
++ 	if (size < inode->i_size) {
++ 		return locks_mandatory_area(inode, f, size, inode->i_size - 1,
++ 				F_WRLCK);
++ 	} else {
++ 		return locks_mandatory_area(inode, f, inode->i_size, size - 1,
++ 				F_WRLCK);
++ 	}
+++>>>>>>> acc15575e78e (locks: new locks_mandatory_area calling convention)
+  }
+  
+  static inline int break_lease(struct inode *inode, unsigned int mode)
+diff --git a/fs/locks.c b/fs/locks.c
+index 1f99358bf86e..57ceb314591d 100644
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@ -1195,20 +1195,16 @@ int locks_mandatory_locked(struct file *file)
+ 
+ /**
+  * locks_mandatory_area - Check for a conflicting lock
+- * @read_write: %FLOCK_VERIFY_WRITE for exclusive access, %FLOCK_VERIFY_READ
+- *		for shared
+- * @inode:      the file to check
++ * @inode:	the file to check
+  * @filp:       how the file was opened (if it was)
+- * @offset:     start of area to check
+- * @count:      length of area to check
++ * @start:	first byte in the file to check
++ * @end:	lastbyte in the file to check
++ * @type:	%F_WRLCK for a write lock, else %F_RDLCK
+  *
+  * Searches the inode's list of locks to find any POSIX locks which conflict.
+- * This function is called from rw_verify_area() and
+- * locks_verify_truncate().
+  */
+-int locks_mandatory_area(int read_write, struct inode *inode,
+-			 struct file *filp, loff_t offset,
+-			 size_t count)
++int locks_mandatory_area(struct inode *inode, struct file *filp, loff_t start,
++			 loff_t end, unsigned char type)
+ {
+ 	struct file_lock fl;
+ 	int error;
+@@ -1220,9 +1216,9 @@ int locks_mandatory_area(int read_write, struct inode *inode,
+ 	fl.fl_flags = FL_POSIX | FL_ACCESS;
+ 	if (filp && !(filp->f_flags & O_NONBLOCK))
+ 		sleep = true;
+-	fl.fl_type = (read_write == FLOCK_VERIFY_WRITE) ? F_WRLCK : F_RDLCK;
+-	fl.fl_start = offset;
+-	fl.fl_end = offset + count - 1;
++	fl.fl_type = type;
++	fl.fl_start = start;
++	fl.fl_end = end;
+ 
+ 	for (;;) {
+ 		if (filp) {
+* Unmerged path fs/read_write.c
+* Unmerged path include/linux/fs.h
