@@ -1,0 +1,169 @@
+Drivers: hv: ring_buffer: count on wrap around mappings in get_next_pkt_raw() (v2)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hv] ring_buffer: count on wrap around mappings in get_next_pkt_raw() (v2) (Vitaly Kuznetsov) [1406404 1418889]
+Rebuild_FUZZ: 91.39%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit fa32ff6576623616c1751562edaed8c164ca5199
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fa32ff65.failed
+
+With wrap around mappings in place we can always provide drivers with
+direct links to packets on the ring buffer, even when they wrap around.
+Do the required updates to get_next_pkt_raw()/put_pkt_raw()
+
+The first version of this commit was reverted (65a532f3d50a) to deal with
+cross-tree merge issues which are (hopefully) resolved now.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Tested-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit fa32ff6576623616c1751562edaed8c164ca5199)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hyperv.h
+diff --cc include/linux/hyperv.h
+index b44df892a232,42ae6a5a2538..000000000000
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@@ -1436,4 -1463,132 +1436,135 @@@ extern __u32 vmbus_proto_version
+  int vmbus_send_tl_connect_request(const uuid_le *shv_guest_servie_id,
+  				  const uuid_le *shv_host_servie_id);
+  void vmbus_set_event(struct vmbus_channel *channel);
+++<<<<<<< HEAD
+++=======
++ 
++ /* Get the start of the ring buffer. */
++ static inline void *
++ hv_get_ring_buffer(struct hv_ring_buffer_info *ring_info)
++ {
++ 	return (void *)ring_info->ring_buffer->buffer;
++ }
++ 
++ /*
++  * To optimize the flow management on the send-side,
++  * when the sender is blocked because of lack of
++  * sufficient space in the ring buffer, potential the
++  * consumer of the ring buffer can signal the producer.
++  * This is controlled by the following parameters:
++  *
++  * 1. pending_send_sz: This is the size in bytes that the
++  *    producer is trying to send.
++  * 2. The feature bit feat_pending_send_sz set to indicate if
++  *    the consumer of the ring will signal when the ring
++  *    state transitions from being full to a state where
++  *    there is room for the producer to send the pending packet.
++  */
++ 
++ static inline  bool hv_need_to_signal_on_read(struct hv_ring_buffer_info *rbi)
++ {
++ 	u32 cur_write_sz;
++ 	u32 pending_sz;
++ 
++ 	/*
++ 	 * Issue a full memory barrier before making the signaling decision.
++ 	 * Here is the reason for having this barrier:
++ 	 * If the reading of the pend_sz (in this function)
++ 	 * were to be reordered and read before we commit the new read
++ 	 * index (in the calling function)  we could
++ 	 * have a problem. If the host were to set the pending_sz after we
++ 	 * have sampled pending_sz and go to sleep before we commit the
++ 	 * read index, we could miss sending the interrupt. Issue a full
++ 	 * memory barrier to address this.
++ 	 */
++ 	virt_mb();
++ 
++ 	pending_sz = READ_ONCE(rbi->ring_buffer->pending_send_sz);
++ 	/* If the other end is not blocked on write don't bother. */
++ 	if (pending_sz == 0)
++ 		return false;
++ 
++ 	cur_write_sz = hv_get_bytes_to_write(rbi);
++ 
++ 	if (cur_write_sz >= pending_sz)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /*
++  * An API to support in-place processing of incoming VMBUS packets.
++  */
++ #define VMBUS_PKT_TRAILER	8
++ 
++ static inline struct vmpacket_descriptor *
++ get_next_pkt_raw(struct vmbus_channel *channel)
++ {
++ 	struct hv_ring_buffer_info *ring_info = &channel->inbound;
++ 	u32 priv_read_loc = ring_info->priv_read_index;
++ 	void *ring_buffer = hv_get_ring_buffer(ring_info);
++ 	u32 dsize = ring_info->ring_datasize;
++ 	/*
++ 	 * delta is the difference between what is available to read and
++ 	 * what was already consumed in place. We commit read index after
++ 	 * the whole batch is processed.
++ 	 */
++ 	u32 delta = priv_read_loc >= ring_info->ring_buffer->read_index ?
++ 		priv_read_loc - ring_info->ring_buffer->read_index :
++ 		(dsize - ring_info->ring_buffer->read_index) + priv_read_loc;
++ 	u32 bytes_avail_toread = (hv_get_bytes_to_read(ring_info) - delta);
++ 
++ 	if (bytes_avail_toread < sizeof(struct vmpacket_descriptor))
++ 		return NULL;
++ 
++ 	return ring_buffer + priv_read_loc;
++ }
++ 
++ /*
++  * A helper function to step through packets "in-place"
++  * This API is to be called after each successful call
++  * get_next_pkt_raw().
++  */
++ static inline void put_pkt_raw(struct vmbus_channel *channel,
++ 				struct vmpacket_descriptor *desc)
++ {
++ 	struct hv_ring_buffer_info *ring_info = &channel->inbound;
++ 	u32 packetlen = desc->len8 << 3;
++ 	u32 dsize = ring_info->ring_datasize;
++ 
++ 	/*
++ 	 * Include the packet trailer.
++ 	 */
++ 	ring_info->priv_read_index += packetlen + VMBUS_PKT_TRAILER;
++ 	ring_info->priv_read_index %= dsize;
++ }
++ 
++ /*
++  * This call commits the read index and potentially signals the host.
++  * Here is the pattern for using the "in-place" consumption APIs:
++  *
++  * while (get_next_pkt_raw() {
++  *	process the packet "in-place";
++  *	put_pkt_raw();
++  * }
++  * if (packets processed in place)
++  *	commit_rd_index();
++  */
++ static inline void commit_rd_index(struct vmbus_channel *channel)
++ {
++ 	struct hv_ring_buffer_info *ring_info = &channel->inbound;
++ 	/*
++ 	 * Make sure all reads are done before we update the read index since
++ 	 * the writer may start writing to the read area once the read index
++ 	 * is updated.
++ 	 */
++ 	virt_rmb();
++ 	ring_info->ring_buffer->read_index = ring_info->priv_read_index;
++ 
++ 	if (hv_need_to_signal_on_read(ring_info))
++ 		vmbus_set_event(channel);
++ }
++ 
++ 
+++>>>>>>> fa32ff657662 (Drivers: hv: ring_buffer: count on wrap around mappings in get_next_pkt_raw() (v2))
+  #endif /* _HYPERV_H */
+* Unmerged path include/linux/hyperv.h
