@@ -1,0 +1,366 @@
+iio: Add reference counting for buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] Add reference counting for buffers (Tony Camuso) [1559170]
+Rebuild_FUZZ: 93.15%
+commit-author Lars-Peter Clausen <lars@metafoo.de>
+commit 9e69c935fad9fd5f0550c51e3bd251cd30033136
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9e69c935.failed
+
+Since the buffer is accessed by userspace we can not just free the buffers
+memory once we are done with it in kernel space. There might still be open file
+descriptors and userspace still might be accessing the buffer. This patch adds
+support for reference counting to the IIO buffers. When a buffer is created and
+initialized its initial reference count is set to 1. Instead of freeing the
+memory of the buffer the buffer's _free() function will drop that reference
+again. But only after the last reference to the buffer has been dropped the
+buffer the buffer's memory will be freed. The IIO device will take a reference
+to its primary buffer. The patch adds a small helper function for this called
+iio_device_attach_buffer() which will get a reference to the buffer and assign
+the buffer to the IIO device. This function must be used instead of assigning
+the buffer to the device by hand. The reference is only dropped once the IIO
+device is freed and we can be sure that there are no more open file handles. A
+reference to a buffer will also be taken whenever the buffer is active to avoid
+the buffer being freed while data is still being send to it.
+
+	Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 9e69c935fad9fd5f0550c51e3bd251cd30033136)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/buffer_cb.c
+#	drivers/iio/industrialio-buffer.c
+diff --cc drivers/iio/buffer_cb.c
+index 0578f74fa23c,2d9c6f8c06db..000000000000
+--- a/drivers/iio/buffer_cb.c
++++ b/drivers/iio/buffer_cb.c
+@@@ -12,12 -12,14 +12,18 @@@ struct iio_cb_buffer 
+  	struct iio_channel *channels;
+  };
+  
+++<<<<<<< HEAD
+ +static int iio_buffer_cb_store_to(struct iio_buffer *buffer, u8 *data)
+++=======
++ static struct iio_cb_buffer *buffer_to_cb_buffer(struct iio_buffer *buffer)
+  {
+- 	struct iio_cb_buffer *cb_buff = container_of(buffer,
+- 						     struct iio_cb_buffer,
+- 						     buffer);
++ 	return container_of(buffer, struct iio_cb_buffer, buffer);
++ }
+  
++ static int iio_buffer_cb_store_to(struct iio_buffer *buffer, const void *data)
+++>>>>>>> 9e69c935fad9 (iio: Add reference counting for buffers)
++ {
++ 	struct iio_cb_buffer *cb_buff = buffer_to_cb_buffer(buffer);
+  	return cb_buff->cb(data, cb_buff->private);
+  }
+  
+diff --cc drivers/iio/industrialio-buffer.c
+index b5f278b395a0,36c39dcad850..000000000000
+--- a/drivers/iio/industrialio-buffer.c
++++ b/drivers/iio/industrialio-buffer.c
+@@@ -540,9 -554,16 +554,22 @@@ int iio_update_buffers(struct iio_dev *
+  			 * Roll back.
+  			 * Note can only occur when adding a buffer.
+  			 */
+++<<<<<<< HEAD
+ +			list_del_init(&insert_buffer->buffer_list);
+ +			indio_dev->active_scan_mask = old_mask;
+ +			success = -EINVAL;
+++=======
++ 			iio_buffer_deactivate(insert_buffer);
++ 			if (old_mask) {
++ 				indio_dev->active_scan_mask = old_mask;
++ 				success = -EINVAL;
++ 			}
++ 			else {
++ 				kfree(compound_mask);
++ 				ret = -EINVAL;
++ 				goto error_ret;
++ 			}
+++>>>>>>> 9e69c935fad9 (iio: Add reference counting for buffers)
+  		}
+  	} else {
+  		indio_dev->active_scan_mask = compound_mask;
+* Unmerged path drivers/iio/buffer_cb.c
+* Unmerged path drivers/iio/industrialio-buffer.c
+diff --git a/drivers/iio/industrialio-core.c b/drivers/iio/industrialio-core.c
+index cabd76a2803c..0324ffe65f85 100644
+--- a/drivers/iio/industrialio-core.c
++++ b/drivers/iio/industrialio-core.c
+@@ -28,6 +28,7 @@
+ #include "iio_core_trigger.h"
+ #include <linux/iio/sysfs.h>
+ #include <linux/iio/events.h>
++#include <linux/iio/buffer.h>
+ 
+ /* IDA to assign each registered device a unique id */
+ static DEFINE_IDA(iio_ida);
+@@ -853,6 +854,8 @@ static void iio_dev_release(struct device *device)
+ 	iio_device_unregister_eventset(indio_dev);
+ 	iio_device_unregister_sysfs(indio_dev);
+ 
++	iio_buffer_put(indio_dev->buffer);
++
+ 	ida_simple_remove(&iio_ida, indio_dev->id);
+ 	kfree(indio_dev);
+ }
+diff --git a/drivers/iio/industrialio-triggered-buffer.c b/drivers/iio/industrialio-triggered-buffer.c
+index 46c619b0d8c5..c1cb1f94fe2e 100644
+--- a/drivers/iio/industrialio-triggered-buffer.c
++++ b/drivers/iio/industrialio-triggered-buffer.c
+@@ -47,14 +47,17 @@ int iio_triggered_buffer_setup(struct iio_dev *indio_dev,
+ 	irqreturn_t (*pollfunc_th)(int irq, void *p),
+ 	const struct iio_buffer_setup_ops *setup_ops)
+ {
++	struct iio_buffer *buffer;
+ 	int ret;
+ 
+-	indio_dev->buffer = iio_kfifo_allocate(indio_dev);
+-	if (!indio_dev->buffer) {
++	buffer = iio_kfifo_allocate(indio_dev);
++	if (!buffer) {
+ 		ret = -ENOMEM;
+ 		goto error_ret;
+ 	}
+ 
++	iio_device_attach_buffer(indio_dev, buffer);
++
+ 	indio_dev->pollfunc = iio_alloc_pollfunc(pollfunc_bh,
+ 						 pollfunc_th,
+ 						 IRQF_ONESHOT,
+diff --git a/drivers/iio/kfifo_buf.c b/drivers/iio/kfifo_buf.c
+index 1bea41bcbdc6..11645885e057 100644
+--- a/drivers/iio/kfifo_buf.c
++++ b/drivers/iio/kfifo_buf.c
+@@ -130,6 +130,11 @@ static int iio_read_first_n_kfifo(struct iio_buffer *r,
+ 	return copied;
+ }
+ 
++static void iio_kfifo_buffer_release(struct iio_buffer *buffer)
++{
++	kfree(iio_to_kfifo(buffer));
++}
++
+ static const struct iio_buffer_access_funcs kfifo_access_funcs = {
+ 	.store_to = &iio_store_to_kfifo,
+ 	.read_first_n = &iio_read_first_n_kfifo,
+@@ -138,6 +143,7 @@ static const struct iio_buffer_access_funcs kfifo_access_funcs = {
+ 	.set_bytes_per_datum = &iio_set_bytes_per_datum_kfifo,
+ 	.get_length = &iio_get_length_kfifo,
+ 	.set_length = &iio_set_length_kfifo,
++	.release = &iio_kfifo_buffer_release,
+ };
+ 
+ struct iio_buffer *iio_kfifo_allocate(struct iio_dev *indio_dev)
+@@ -158,7 +164,7 @@ EXPORT_SYMBOL(iio_kfifo_allocate);
+ 
+ void iio_kfifo_free(struct iio_buffer *r)
+ {
+-	kfree(iio_to_kfifo(r));
++	iio_buffer_put(r);
+ }
+ EXPORT_SYMBOL(iio_kfifo_free);
+ 
+diff --git a/drivers/staging/iio/accel/lis3l02dq_ring.c b/drivers/staging/iio/accel/lis3l02dq_ring.c
+index 5b8f0f6c9938..2a0d0127d1ea 100644
+--- a/drivers/staging/iio/accel/lis3l02dq_ring.c
++++ b/drivers/staging/iio/accel/lis3l02dq_ring.c
+@@ -401,7 +401,7 @@ int lis3l02dq_configure_buffer(struct iio_dev *indio_dev)
+ 	if (!buffer)
+ 		return -ENOMEM;
+ 
+-	indio_dev->buffer = buffer;
++	iio_device_attach_buffer(indio_dev, buffer);
+ 
+ 	buffer->scan_timestamp = true;
+ 	indio_dev->setup_ops = &lis3l02dq_buffer_setup_ops;
+diff --git a/drivers/staging/iio/accel/sca3000_ring.c b/drivers/staging/iio/accel/sca3000_ring.c
+index 3e5e860aa38e..5ca80b3c99a4 100644
+--- a/drivers/staging/iio/accel/sca3000_ring.c
++++ b/drivers/staging/iio/accel/sca3000_ring.c
+@@ -265,7 +265,7 @@ static struct iio_buffer *sca3000_rb_allocate(struct iio_dev *indio_dev)
+ 	return buf;
+ }
+ 
+-static inline void sca3000_rb_free(struct iio_buffer *r)
++static void sca3000_ring_release(struct iio_buffer *r)
+ {
+ 	kfree(iio_to_hw_buf(r));
+ }
+@@ -274,23 +274,28 @@ static const struct iio_buffer_access_funcs sca3000_ring_access_funcs = {
+ 	.read_first_n = &sca3000_read_first_n_hw_rb,
+ 	.get_length = &sca3000_ring_get_length,
+ 	.get_bytes_per_datum = &sca3000_ring_get_bytes_per_datum,
++	.release = sca3000_ring_release,
+ };
+ 
+ int sca3000_configure_ring(struct iio_dev *indio_dev)
+ {
+-	indio_dev->buffer = sca3000_rb_allocate(indio_dev);
+-	if (indio_dev->buffer == NULL)
++	struct iio_buffer *buffer;
++
++	buffer = sca3000_rb_allocate(indio_dev);
++	if (buffer == NULL)
+ 		return -ENOMEM;
+ 	indio_dev->modes |= INDIO_BUFFER_HARDWARE;
+ 
+ 	indio_dev->buffer->access = &sca3000_ring_access_funcs;
+ 
++	iio_device_attach_buffer(indio_dev, buffer);
++
+ 	return 0;
+ }
+ 
+ void sca3000_unconfigure_ring(struct iio_dev *indio_dev)
+ {
+-	sca3000_rb_free(indio_dev->buffer);
++	iio_buffer_put(indio_dev->buffer);
+ }
+ 
+ static inline
+diff --git a/drivers/staging/iio/iio_simple_dummy_buffer.c b/drivers/staging/iio/iio_simple_dummy_buffer.c
+index 72f400c3cbcb..272eaaca6003 100644
+--- a/drivers/staging/iio/iio_simple_dummy_buffer.c
++++ b/drivers/staging/iio/iio_simple_dummy_buffer.c
+@@ -138,7 +138,7 @@ int iio_simple_dummy_configure_buffer(struct iio_dev *indio_dev,
+ 		goto error_ret;
+ 	}
+ 
+-	indio_dev->buffer = buffer;
++	iio_device_attach_buffer(indio_dev, buffer);
+ 
+ 	/* Enable timestamps by default */
+ 	buffer->scan_timestamp = true;
+diff --git a/drivers/staging/iio/impedance-analyzer/ad5933.c b/drivers/staging/iio/impedance-analyzer/ad5933.c
+index 6330af656a0f..f282b34d9f82 100644
+--- a/drivers/staging/iio/impedance-analyzer/ad5933.c
++++ b/drivers/staging/iio/impedance-analyzer/ad5933.c
+@@ -630,10 +630,14 @@ static const struct iio_buffer_setup_ops ad5933_ring_setup_ops = {
+ 
+ static int ad5933_register_ring_funcs_and_init(struct iio_dev *indio_dev)
+ {
+-	indio_dev->buffer = iio_kfifo_allocate(indio_dev);
+-	if (!indio_dev->buffer)
++	struct iio_buffer *buffer;
++
++	buffer = iio_kfifo_allocate(indio_dev);
++	if (buffer)
+ 		return -ENOMEM;
+ 
++	iio_device_attach_buffer(indio_dev, buffer);
++
+ 	/* Ring buffer functions - here trigger setup related */
+ 	indio_dev->setup_ops = &ad5933_ring_setup_ops;
+ 
+diff --git a/drivers/staging/iio/meter/ade7758_ring.c b/drivers/staging/iio/meter/ade7758_ring.c
+index b29e2d5d9937..422518f930f3 100644
+--- a/drivers/staging/iio/meter/ade7758_ring.c
++++ b/drivers/staging/iio/meter/ade7758_ring.c
+@@ -125,14 +125,17 @@ void ade7758_unconfigure_ring(struct iio_dev *indio_dev)
+ int ade7758_configure_ring(struct iio_dev *indio_dev)
+ {
+ 	struct ade7758_state *st = iio_priv(indio_dev);
++	struct iio_buffer *buffer;
+ 	int ret = 0;
+ 
+-	indio_dev->buffer = iio_kfifo_allocate(indio_dev);
+-	if (!indio_dev->buffer) {
++	buffer = iio_kfifo_allocate(indio_dev);
++	if (!buffer) {
+ 		ret = -ENOMEM;
+ 		return ret;
+ 	}
+ 
++	iio_device_attach_buffer(indio_dev, buffer);
++
+ 	indio_dev->setup_ops = &ade7758_ring_setup_ops;
+ 
+ 	indio_dev->pollfunc = iio_alloc_pollfunc(&iio_pollfunc_store_time,
+diff --git a/include/linux/iio/buffer.h b/include/linux/iio/buffer.h
+index 7f24226e4f8a..1e6b6968ff83 100644
+--- a/include/linux/iio/buffer.h
++++ b/include/linux/iio/buffer.h
+@@ -11,6 +11,7 @@
+ #define _IIO_BUFFER_GENERIC_H_
+ #include <linux/sysfs.h>
+ #include <linux/iio/iio.h>
++#include <linux/kref.h>
+ 
+ #ifdef CONFIG_IIO_BUFFER
+ 
+@@ -26,6 +27,8 @@ struct iio_buffer;
+  * @set_bytes_per_datum:set number of bytes per datum
+  * @get_length:		get number of datums in buffer
+  * @set_length:		set number of datums in buffer
++ * @release:		called when the last reference to the buffer is dropped,
++ *			should free all resources allocated by the buffer.
+  *
+  * The purpose of this structure is to make the buffer element
+  * modular as event for a given driver, different usecases may require
+@@ -47,6 +50,8 @@ struct iio_buffer_access_funcs {
+ 	int (*set_bytes_per_datum)(struct iio_buffer *buffer, size_t bpd);
+ 	int (*get_length)(struct iio_buffer *buffer);
+ 	int (*set_length)(struct iio_buffer *buffer, int length);
++
++	void (*release)(struct iio_buffer *buffer);
+ };
+ 
+ /**
+@@ -67,6 +72,7 @@ struct iio_buffer_access_funcs {
+  * @demux_list:		[INTERN] list of operations required to demux the scan.
+  * @demux_bounce:	[INTERN] buffer for doing gather from incoming scan.
+  * @buffer_list:	[INTERN] entry in the devices list of current buffers.
++ * @ref:		[INTERN] reference count of the buffer.
+  */
+ struct iio_buffer {
+ 	int					length;
+@@ -83,6 +89,7 @@ struct iio_buffer {
+ 	struct list_head			demux_list;
+ 	unsigned char				*demux_bounce;
+ 	struct list_head			buffer_list;
++	struct kref				ref;
+ };
+ 
+ /**
+@@ -204,6 +211,24 @@ int iio_sw_buffer_preenable(struct iio_dev *indio_dev);
+ bool iio_validate_scan_mask_onehot(struct iio_dev *indio_dev,
+ 	const unsigned long *mask);
+ 
++struct iio_buffer *iio_buffer_get(struct iio_buffer *buffer);
++void iio_buffer_put(struct iio_buffer *buffer);
++
++/**
++ * iio_device_attach_buffer - Attach a buffer to a IIO device
++ * @indio_dev: The device the buffer should be attached to
++ * @buffer: The buffer to attach to the device
++ *
++ * This function attaches a buffer to a IIO device. The buffer stays attached to
++ * the device until the device is freed. The function should only be called at
++ * most once per device.
++ */
++static inline void iio_device_attach_buffer(struct iio_dev *indio_dev,
++	struct iio_buffer *buffer)
++{
++	indio_dev->buffer = iio_buffer_get(buffer);
++}
++
+ #else /* CONFIG_IIO_BUFFER */
+ 
+ static inline int iio_buffer_register(struct iio_dev *indio_dev,
+@@ -216,6 +241,9 @@ static inline int iio_buffer_register(struct iio_dev *indio_dev,
+ static inline void iio_buffer_unregister(struct iio_dev *indio_dev)
+ {}
+ 
++static inline void iio_buffer_get(struct iio_buffer *buffer) {}
++static inline void iio_buffer_put(struct iio_buffer *buffer) {}
++
+ #endif /* CONFIG_IIO_BUFFER */
+ 
+ #endif /* _IIO_BUFFER_GENERIC_H_ */
