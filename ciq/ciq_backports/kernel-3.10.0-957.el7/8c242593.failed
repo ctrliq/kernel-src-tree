@@ -1,0 +1,90 @@
+md/raid1: exit sync request if MD_RECOVERY_INTR is set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid1: exit sync request if MD_RECOVERY_INTR is set (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 97.14%
+commit-author Yufen Yu <yuyufen@huawei.com>
+commit 8c2425932398a160f687534efe71f0ec4b92833e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8c242593.failed
+
+We met a sync thread stuck as follows:
+
+ raid1_sync_request+0x2c9/0xb50
+ md_do_sync+0x983/0xfa0
+ md_thread+0x11c/0x160
+ kthread+0x111/0x130
+ ret_from_fork+0x35/0x40
+ 0xffffffffffffffff
+
+At the same time, there is a stuck mdadm thread (mdadm --manage
+/dev/md2 --add /dev/sda). It is trying to stop the sync thread:
+
+ kthread_stop+0x42/0xf0
+ md_unregister_thread+0x3a/0x70
+ md_reap_sync_thread+0x15/0x160
+ action_store+0x142/0x2a0
+ md_attr_store+0x6c/0xb0
+ kernfs_fop_write+0x102/0x180
+ __vfs_write+0x33/0x170
+ vfs_write+0xad/0x1a0
+ SyS_write+0x52/0xc0
+ do_syscall_64+0x6e/0x190
+ entry_SYSCALL_64_after_hwframe+0x3d/0xa2
+
+Debug tools show that the sync thread is waiting in raise_barrier(),
+until raid1d() end all normal IO bios into bio_end_io_list(introduced
+in commit 55ce74d4bfe1). But, raid1d() cannot end these bios if
+MD_CHANGE_PENDING bit is set. It needs to get mddev->reconfig_mutex lock
+and then clear the bit in md_check_recovery().
+However, the lock is holding by mdadm in action_store().
+
+Thus, there is a loop:
+mdadm waiting for sync thread to stop, sync thread waiting for
+raid1d() to end bios, raid1d() waiting for mdadm to release
+mddev->reconfig_mutex lock and then it can end bios.
+
+Fix this by checking MD_RECOVERY_INTR while waiting in raise_barrier(),
+so that sync thread can exit while mdadm is stoping the sync thread.
+
+Fixes: 55ce74d4bfe1 ("md/raid1: ensure device failure recorded before write request returns.")
+	Signed-off-by: Jason Yan <yanaijie@huawei.com>
+	Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 8c2425932398a160f687534efe71f0ec4b92833e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+diff --cc drivers/md/raid1.c
+index 2542330a5911,6f624311cec2..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -2678,10 -2666,18 +2688,23 @@@ static sector_t raid1_sync_request(stru
+  	if (atomic_read(&conf->nr_waiting[idx]))
+  		schedule_timeout_uninterruptible(1);
+  
+++<<<<<<< HEAD
+ +	bitmap_cond_end_sync(mddev->bitmap, sector_nr);
+ +	r1_bio = mempool_alloc(conf->r1buf_pool, GFP_NOIO);
+++=======
++ 	/* we are incrementing sector_nr below. To be safe, we check against
++ 	 * sector_nr + two times RESYNC_SECTORS
++ 	 */
++ 
++ 	bitmap_cond_end_sync(mddev->bitmap, sector_nr,
++ 		mddev_is_clustered(mddev) && (sector_nr + 2 * RESYNC_SECTORS > conf->cluster_sync_high));
+++>>>>>>> 8c2425932398 (md/raid1: exit sync request if MD_RECOVERY_INTR is set)
++ 
++ 
++ 	if (raise_barrier(conf, sector_nr))
++ 		return 0;
+  
+- 	raise_barrier(conf, sector_nr);
++ 	r1_bio = raid1_alloc_init_r1buf(conf);
+  
+  	rcu_read_lock();
+  	/*
+* Unmerged path drivers/md/raid1.c
