@@ -1,0 +1,2074 @@
+configfs: switch ->default groups to a linked list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 1ae1602de028acaa42a0f6ff18d19756f8e825c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1ae1602d.failed
+
+Replace the current NULL-terminated array of default groups with a linked
+list.  This gets rid of lots of nasty code to size and/or dynamically
+allocate the array.
+
+While we're at it also provide a conveniant helper to remove the default
+groups.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Felipe Balbi <balbi@kernel.org>		[drivers/usb/gadget]
+	Acked-by: Joel Becker <jlbec@evilplan.org>
+	Acked-by: Nicholas Bellinger <nab@linux-iscsi.org>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+(cherry picked from commit 1ae1602de028acaa42a0f6ff18d19756f8e825c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target_configfs.c
+#	drivers/target/target_core_configfs.c
+#	drivers/target/target_core_fabric_configfs.c
+#	drivers/target/target_core_internal.h
+#	drivers/usb/gadget/configfs.c
+#	drivers/usb/gadget/f_mass_storage.c
+#	drivers/usb/gadget/f_rndis.c
+#	drivers/usb/gadget/function/uvc_configfs.c
+#	include/linux/configfs.h
+diff --cc drivers/target/iscsi/iscsi_target_configfs.c
+index e2d54cb51e06,a24443ba59ea..000000000000
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@@ -948,87 -766,25 +948,99 @@@ static struct configfs_attribute *lio_t
+  	NULL,
+  };
+  
+ -static int lio_target_init_nodeacl(struct se_node_acl *se_nacl,
+ -		const char *name)
+ +static struct se_node_acl *lio_tpg_alloc_fabric_acl(
+ +	struct se_portal_group *se_tpg)
+ +{
+++<<<<<<< HEAD
+ +	struct iscsi_node_acl *acl;
+ +
+ +	acl = kzalloc(sizeof(struct iscsi_node_acl), GFP_KERNEL);
+ +	if (!acl) {
+ +		pr_err("Unable to allocate memory for struct iscsi_node_acl\n");
+ +		return NULL;
+ +	}
+ +
+ +	return &acl->se_node_acl;
+ +}
+ +
+ +static struct se_node_acl *lio_target_make_nodeacl(
+ +	struct se_portal_group *se_tpg,
+ +	struct config_group *group,
+ +	const char *name)
+  {
+ +	struct config_group *stats_cg;
+ +	struct iscsi_node_acl *acl;
+ +	struct se_node_acl *se_nacl_new, *se_nacl;
+ +	struct iscsi_portal_group *tpg = container_of(se_tpg,
+ +			struct iscsi_portal_group, tpg_se_tpg);
+ +	u32 cmdsn_depth;
+ +
+ +	se_nacl_new = lio_tpg_alloc_fabric_acl(se_tpg);
+ +	if (!se_nacl_new)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	cmdsn_depth = tpg->tpg_attrib.default_cmdsn_depth;
+ +	/*
+ +	 * se_nacl_new may be released by core_tpg_add_initiator_node_acl()
+ +	 * when converting a NdoeACL from demo mode -> explict
+ +	 */
+ +	se_nacl = core_tpg_add_initiator_node_acl(se_tpg, se_nacl_new,
+ +				name, cmdsn_depth);
+ +	if (IS_ERR(se_nacl))
+ +		return se_nacl;
+ +
+ +	acl = container_of(se_nacl, struct iscsi_node_acl, se_node_acl);
+ +	stats_cg = &se_nacl->acl_fabric_stat_group;
+ +
+ +	stats_cg->default_groups = kmalloc(sizeof(struct config_group *) * 2,
+ +				GFP_KERNEL);
+ +	if (!stats_cg->default_groups) {
+ +		pr_err("Unable to allocate memory for"
+ +				" stats_cg->default_groups\n");
+ +		core_tpg_del_initiator_node_acl(se_tpg, se_nacl, 1);
+ +		kfree(acl);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +
+ +	stats_cg->default_groups[0] = &acl->node_stat_grps.iscsi_sess_stats_group;
+ +	stats_cg->default_groups[1] = NULL;
+ +	config_group_init_type_name(&acl->node_stat_grps.iscsi_sess_stats_group,
+ +			"iscsi_sess_stats", &iscsi_stat_sess_cit);
+ +
+ +	return se_nacl;
+++=======
++ 	struct iscsi_node_acl *acl =
++ 		container_of(se_nacl, struct iscsi_node_acl, se_node_acl);
++ 
++ 	config_group_init_type_name(&acl->node_stat_grps.iscsi_sess_stats_group,
++ 			"iscsi_sess_stats", &iscsi_stat_sess_cit);
++ 	configfs_add_default_group(&acl->node_stat_grps.iscsi_sess_stats_group,
++ 			&se_nacl->acl_fabric_stat_group);
++ 	return 0;
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  }
+  
+ -static void lio_target_cleanup_nodeacl( struct se_node_acl *se_nacl)
+ +static void lio_target_drop_nodeacl(
+ +	struct se_node_acl *se_nacl)
+  {
+ +	struct se_portal_group *se_tpg = se_nacl->se_tpg;
+  	struct iscsi_node_acl *acl = container_of(se_nacl,
+  			struct iscsi_node_acl, se_node_acl);
+- 	struct config_item *df_item;
+- 	struct config_group *stats_cg;
+- 	int i;
+  
+++<<<<<<< HEAD
+ +	stats_cg = &acl->se_node_acl.acl_fabric_stat_group;
+ +	for (i = 0; stats_cg->default_groups[i]; i++) {
+ +		df_item = &stats_cg->default_groups[i]->cg_item;
+ +		stats_cg->default_groups[i] = NULL;
+ +		config_item_put(df_item);
+ +	}
+ +	kfree(stats_cg->default_groups);
+ +
+ +	core_tpg_del_initiator_node_acl(se_tpg, se_nacl, 1);
+ +	kfree(acl);
+++=======
++ 	configfs_remove_default_groups(&acl->se_node_acl.acl_fabric_stat_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  }
+  
+  /* End items for lio_target_acl_cit */
+diff --cc drivers/target/target_core_configfs.c
+index 75d89adfccc0,d498533f09ee..000000000000
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@@ -199,16 -192,13 +199,24 @@@ static struct config_group *target_core
+  	 * struct target_fabric_configfs *tf will contain a usage reference.
+  	 */
+  	pr_debug("Target_Core_ConfigFS: REGISTER tfc_wwn_cit -> %p\n",
+ -			&tf->tf_wwn_cit);
+ +			&tf->tf_cit_tmpl.tfc_wwn_cit);
+ +
+++<<<<<<< HEAD
+ +	tf->tf_group.default_groups = tf->tf_default_groups;
+ +	tf->tf_group.default_groups[0] = &tf->tf_disc_group;
+ +	tf->tf_group.default_groups[1] = NULL;
+  
+ +	config_group_init_type_name(&tf->tf_group, name,
+ +			&tf->tf_cit_tmpl.tfc_wwn_cit);
+ +	config_group_init_type_name(&tf->tf_disc_group, "discovery_auth",
+ +			&tf->tf_cit_tmpl.tfc_discovery_cit);
+++=======
++ 	config_group_init_type_name(&tf->tf_group, name, &tf->tf_wwn_cit);
++ 
++ 	config_group_init_type_name(&tf->tf_disc_group, "discovery_auth",
++ 			&tf->tf_discovery_cit);
++ 	configfs_add_default_group(&tf->tf_disc_group, &tf->tf_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	pr_debug("Target_Core_ConfigFS: REGISTER -> Allocated Fabric:"
+  			" %s\n", tf->tf_group.cg_item.ci_name);
+@@@ -2606,12 -2804,10 +2605,10 @@@ static struct config_group *target_core
+  	const char *name)
+  {
+  	struct t10_alua_tg_pt_gp *tg_pt_gp;
+ +	struct se_subsystem_api *t;
+  	struct config_item *hba_ci = &group->cg_item;
+  	struct se_hba *hba = item_to_hba(hba_ci);
+ -	struct target_backend *tb = hba->backend;
+  	struct se_device *dev;
+- 	struct config_group *dev_cg = NULL, *tg_pt_gp_cg = NULL;
+- 	struct config_group *dev_stat_grp = NULL;
+  	int errno = -ENOMEM, ret;
+  
+  	ret = mutex_lock_interruptible(&hba->hba_access_mutex);
+@@@ -2626,31 -2818,31 +2623,50 @@@
+  	if (!dev)
+  		goto out_unlock;
+  
+- 	dev_cg = &dev->dev_group;
++ 	config_group_init_type_name(&dev->dev_group, name, &tb->tb_dev_cit);
+  
+++<<<<<<< HEAD
+ +	dev_cg->default_groups = kmalloc(sizeof(struct config_group *) * 6,
+ +			GFP_KERNEL);
+ +	if (!dev_cg->default_groups)
+ +		goto out_free_device;
+ +
+ +	config_group_init_type_name(dev_cg, name, &t->tb_cits.tb_dev_cit);
+ +	config_group_init_type_name(&dev->dev_attrib.da_group, "attrib",
+ +			&t->tb_cits.tb_dev_attrib_cit);
+ +	config_group_init_type_name(&dev->dev_pr_group, "pr",
+ +			&t->tb_cits.tb_dev_pr_cit);
+ +	config_group_init_type_name(&dev->t10_wwn.t10_wwn_group, "wwn",
+ +			&t->tb_cits.tb_dev_wwn_cit);
+ +	config_group_init_type_name(&dev->t10_alua.alua_tg_pt_gps_group,
+ +			"alua", &t->tb_cits.tb_dev_alua_tg_pt_gps_cit);
+ +	config_group_init_type_name(&dev->dev_stat_grps.stat_group,
+ +			"statistics", &t->tb_cits.tb_dev_stat_cit);
+++=======
++ 	config_group_init_type_name(&dev->dev_attrib.da_group, "attrib",
++ 			&tb->tb_dev_attrib_cit);
++ 	configfs_add_default_group(&dev->dev_attrib.da_group, &dev->dev_group);
++ 
++ 	config_group_init_type_name(&dev->dev_pr_group, "pr",
++ 			&tb->tb_dev_pr_cit);
++ 	configfs_add_default_group(&dev->dev_pr_group, &dev->dev_group);
++ 
++ 	config_group_init_type_name(&dev->t10_wwn.t10_wwn_group, "wwn",
++ 			&tb->tb_dev_wwn_cit);
++ 	configfs_add_default_group(&dev->t10_wwn.t10_wwn_group,
++ 			&dev->dev_group);
++ 
++ 	config_group_init_type_name(&dev->t10_alua.alua_tg_pt_gps_group,
++ 			"alua", &tb->tb_dev_alua_tg_pt_gps_cit);
++ 	configfs_add_default_group(&dev->t10_alua.alua_tg_pt_gps_group,
++ 			&dev->dev_group);
++ 
++ 	config_group_init_type_name(&dev->dev_stat_grps.stat_group,
++ 			"statistics", &tb->tb_dev_stat_cit);
++ 	configfs_add_default_group(&dev->dev_stat_grps.stat_group,
++ 			&dev->dev_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+- 	dev_cg->default_groups[0] = &dev->dev_attrib.da_group;
+- 	dev_cg->default_groups[1] = &dev->dev_pr_group;
+- 	dev_cg->default_groups[2] = &dev->t10_wwn.t10_wwn_group;
+- 	dev_cg->default_groups[3] = &dev->t10_alua.alua_tg_pt_gps_group;
+- 	dev_cg->default_groups[4] = &dev->dev_stat_grps.stat_group;
+- 	dev_cg->default_groups[5] = NULL;
+  	/*
+  	 * Add core/$HBA/$DEV/alua/default_tg_pt_gp
+  	 */
+@@@ -2950,9 -3089,7 +2927,13 @@@ EXPORT_SYMBOL(target_core_setup_sub_cit
+  
+  static int __init target_core_init_configfs(void)
+  {
+++<<<<<<< HEAD
+ +	struct config_group *target_cg, *hba_cg = NULL, *alua_cg = NULL;
+ +	struct config_group *lu_gp_cg = NULL;
+ +	struct configfs_subsystem *subsys;
+++=======
++ 	struct configfs_subsystem *subsys = &target_core_fabrics;
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  	struct t10_alua_lu_gp *lu_gp;
+  	int ret;
+  
+@@@ -3090,45 -3184,15 +3029,56 @@@ out_global
+  
+  static void __exit target_core_exit_configfs(void)
+  {
+++<<<<<<< HEAD
+ +	struct configfs_subsystem *subsys;
+ +	struct config_group *hba_cg, *alua_cg, *lu_gp_cg;
+ +	struct config_item *item;
+ +	int i;
+ +
+ +	subsys = target_core_subsystem[0];
+ +
+ +	lu_gp_cg = &alua_lu_gps_group;
+ +	for (i = 0; lu_gp_cg->default_groups[i]; i++) {
+ +		item = &lu_gp_cg->default_groups[i]->cg_item;
+ +		lu_gp_cg->default_groups[i] = NULL;
+ +		config_item_put(item);
+ +	}
+ +	kfree(lu_gp_cg->default_groups);
+ +	lu_gp_cg->default_groups = NULL;
+ +
+ +	alua_cg = &alua_group;
+ +	for (i = 0; alua_cg->default_groups[i]; i++) {
+ +		item = &alua_cg->default_groups[i]->cg_item;
+ +		alua_cg->default_groups[i] = NULL;
+ +		config_item_put(item);
+ +	}
+ +	kfree(alua_cg->default_groups);
+ +	alua_cg->default_groups = NULL;
+ +
+ +	hba_cg = &target_core_hbagroup;
+ +	for (i = 0; hba_cg->default_groups[i]; i++) {
+ +		item = &hba_cg->default_groups[i]->cg_item;
+ +		hba_cg->default_groups[i] = NULL;
+ +		config_item_put(item);
+ +	}
+ +	kfree(hba_cg->default_groups);
+ +	hba_cg->default_groups = NULL;
+++=======
++ 	configfs_remove_default_groups(&alua_lu_gps_group);
++ 	configfs_remove_default_groups(&alua_group);
++ 	configfs_remove_default_groups(&target_core_hbagroup);
++ 
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  	/*
+  	 * We expect subsys->su_group.default_groups to be released
+  	 * by configfs subsystem provider logic..
+  	 */
+++<<<<<<< HEAD
+ +	configfs_unregister_subsystem(subsys);
+ +	kfree(subsys->su_group.default_groups);
+++=======
++ 	configfs_unregister_subsystem(&target_core_fabrics);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	core_alua_free_lu_gp(default_lu_gp);
+  	default_lu_gp = NULL;
+diff --cc drivers/target/target_core_fabric_configfs.c
+index 0c3f90130b7d,8caef31da415..000000000000
+--- a/drivers/target/target_core_fabric_configfs.c
++++ b/drivers/target/target_core_fabric_configfs.c
+@@@ -321,18 -273,10 +321,10 @@@ static struct config_group *target_fabr
+  	struct se_portal_group *se_tpg = se_nacl->se_tpg;
+  	struct target_fabric_configfs *tf = se_tpg->se_tpg_wwn->wwn_tf;
+  	struct se_lun_acl *lacl = NULL;
+- 	struct config_item *acl_ci;
+- 	struct config_group *lacl_cg = NULL, *ml_stat_grp = NULL;
+  	char *buf;
+ -	unsigned long long mapped_lun;
+ +	unsigned long mapped_lun;
+  	int ret = 0;
+  
+- 	acl_ci = &group->cg_item;
+- 	if (!acl_ci) {
+- 		pr_err("Unable to locatel acl_ci\n");
+- 		return NULL;
+- 	}
+- 
+  	buf = kzalloc(strlen(name) + 1, GFP_KERNEL);
+  	if (!buf) {
+  		pr_err("Unable to allocate memory for name buf\n");
+@@@ -375,30 -307,14 +367,22 @@@
+  		goto out;
+  	}
+  
+- 	lacl_cg = &lacl->se_lun_group;
+- 	lacl_cg->default_groups = kmalloc(sizeof(struct config_group *) * 2,
+- 				GFP_KERNEL);
+- 	if (!lacl_cg->default_groups) {
+- 		pr_err("Unable to allocate lacl_cg->default_groups\n");
+- 		ret = -ENOMEM;
+- 		goto out;
+- 	}
+- 
+  	config_group_init_type_name(&lacl->se_lun_group, name,
+++<<<<<<< HEAD
+ +			&tf->tf_cit_tmpl.tfc_tpg_mappedlun_cit);
+ +	config_group_init_type_name(&lacl->ml_stat_grps.stat_group,
+ +			"statistics", &tf->tf_cit_tmpl.tfc_tpg_mappedlun_stat_cit);
+ +	lacl_cg->default_groups[0] = &lacl->ml_stat_grps.stat_group;
+ +	lacl_cg->default_groups[1] = NULL;
+++=======
++ 			&tf->tf_tpg_mappedlun_cit);
++ 
++ 	config_group_init_type_name(&lacl->ml_stat_grps.stat_group,
++ 			"statistics", &tf->tf_tpg_mappedlun_stat_cit);
++ 	configfs_add_default_group(&lacl->ml_stat_grps.stat_group,
++ 			&lacl->se_lun_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+- 	ml_stat_grp = &lacl->ml_stat_grps.stat_group;
+- 	ml_stat_grp->default_groups = kmalloc(sizeof(struct config_group *) * 3,
+- 				GFP_KERNEL);
+- 	if (!ml_stat_grp->default_groups) {
+- 		pr_err("Unable to allocate ml_stat_grp->default_groups\n");
+- 		ret = -ENOMEM;
+- 		goto out;
+- 	}
+  	target_stat_setup_mappedlun_default_groups(lacl);
+  
+  	kfree(buf);
+@@@ -485,36 -382,41 +451,68 @@@ static struct config_group *target_fabr
+  			struct se_portal_group, tpg_acl_group);
+  	struct target_fabric_configfs *tf = se_tpg->se_tpg_wwn->wwn_tf;
+  	struct se_node_acl *se_nacl;
+- 	struct config_group *nacl_cg;
+  
+ -	se_nacl = core_tpg_add_initiator_node_acl(se_tpg, name);
+ +	if (!tf->tf_ops.fabric_make_nodeacl) {
+ +		pr_err("tf->tf_ops.fabric_make_nodeacl is NULL\n");
+ +		return ERR_PTR(-ENOSYS);
+ +	}
+ +
+ +	se_nacl = tf->tf_ops.fabric_make_nodeacl(se_tpg, group, name);
+  	if (IS_ERR(se_nacl))
+  		return ERR_CAST(se_nacl);
+  
+++<<<<<<< HEAD
+ +	nacl_cg = &se_nacl->acl_group;
+ +	nacl_cg->default_groups = se_nacl->acl_default_groups;
+ +	nacl_cg->default_groups[0] = &se_nacl->acl_attrib_group;
+ +	nacl_cg->default_groups[1] = &se_nacl->acl_auth_group;
+ +	nacl_cg->default_groups[2] = &se_nacl->acl_param_group;
+ +	nacl_cg->default_groups[3] = &se_nacl->acl_fabric_stat_group;
+ +	nacl_cg->default_groups[4] = NULL;
+ +
+ +	config_group_init_type_name(&se_nacl->acl_group, name,
+ +			&tf->tf_cit_tmpl.tfc_tpg_nacl_base_cit);
+ +	config_group_init_type_name(&se_nacl->acl_attrib_group, "attrib",
+ +			&tf->tf_cit_tmpl.tfc_tpg_nacl_attrib_cit);
+ +	config_group_init_type_name(&se_nacl->acl_auth_group, "auth",
+ +			&tf->tf_cit_tmpl.tfc_tpg_nacl_auth_cit);
+ +	config_group_init_type_name(&se_nacl->acl_param_group, "param",
+ +			&tf->tf_cit_tmpl.tfc_tpg_nacl_param_cit);
+ +	config_group_init_type_name(&se_nacl->acl_fabric_stat_group,
+ +			"fabric_statistics",
+ +			&tf->tf_cit_tmpl.tfc_tpg_nacl_stat_cit);
+++=======
++ 	if (tf->tf_ops->fabric_init_nodeacl) {
++ 		int ret = tf->tf_ops->fabric_init_nodeacl(se_nacl, name);
++ 		if (ret) {
++ 			core_tpg_del_initiator_node_acl(se_nacl);
++ 			return ERR_PTR(ret);
++ 		}
++ 	}
++ 
++ 	config_group_init_type_name(&se_nacl->acl_group, name,
++ 			&tf->tf_tpg_nacl_base_cit);
++ 
++ 	config_group_init_type_name(&se_nacl->acl_attrib_group, "attrib",
++ 			&tf->tf_tpg_nacl_attrib_cit);
++ 	configfs_add_default_group(&se_nacl->acl_attrib_group,
++ 			&se_nacl->acl_group);
++ 
++ 	config_group_init_type_name(&se_nacl->acl_auth_group, "auth",
++ 			&tf->tf_tpg_nacl_auth_cit);
++ 	configfs_add_default_group(&se_nacl->acl_auth_group,
++ 			&se_nacl->acl_group);
++ 
++ 	config_group_init_type_name(&se_nacl->acl_param_group, "param",
++ 			&tf->tf_tpg_nacl_param_cit);
++ 	configfs_add_default_group(&se_nacl->acl_param_group,
++ 			&se_nacl->acl_group);
++ 
++ 	config_group_init_type_name(&se_nacl->acl_fabric_stat_group,
++ 			"fabric_statistics", &tf->tf_tpg_nacl_stat_cit);
++ 	configfs_add_default_group(&se_nacl->acl_fabric_stat_group,
++ 			&se_nacl->acl_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	return &se_nacl->acl_group;
+  }
+@@@ -872,8 -749,7 +863,12 @@@ static struct config_group *target_fabr
+  	struct se_portal_group *se_tpg = container_of(group,
+  			struct se_portal_group, tpg_lun_group);
+  	struct target_fabric_configfs *tf = se_tpg->se_tpg_wwn->wwn_tf;
+++<<<<<<< HEAD
+ +	struct config_group *lun_cg = NULL, *port_stat_grp = NULL;
+ +	unsigned long unpacked_lun;
+++=======
++ 	unsigned long long unpacked_lun;
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  	int errno;
+  
+  	if (strstr(name, "lun_") != name) {
+@@@ -881,39 -757,22 +876,50 @@@
+  				" \"lun_$LUN_NUMBER\"\n");
+  		return ERR_PTR(-EINVAL);
+  	}
+ -	errno = kstrtoull(name + 4, 0, &unpacked_lun);
+ +	errno = kstrtoul(name + 4, 0, &unpacked_lun);
+  	if (errno)
+  		return ERR_PTR(errno);
+ +	if (unpacked_lun > UINT_MAX)
+ +		return ERR_PTR(-EINVAL);
+  
+ -	lun = core_tpg_alloc_lun(se_tpg, unpacked_lun);
+ -	if (IS_ERR(lun))
+ -		return ERR_CAST(lun);
+ +	lun = core_get_lun_from_tpg(se_tpg, unpacked_lun);
+ +	if (!lun)
+ +		return ERR_PTR(-EINVAL);
+  
+++<<<<<<< HEAD
+ +	lun_cg = &lun->lun_group;
+ +	lun_cg->default_groups = kmalloc(sizeof(struct config_group *) * 2,
+ +				GFP_KERNEL);
+ +	if (!lun_cg->default_groups) {
+ +		pr_err("Unable to allocate lun_cg->default_groups\n");
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +
+ +	config_group_init_type_name(&lun->lun_group, name,
+ +			&tf->tf_cit_tmpl.tfc_tpg_port_cit);
+ +	config_group_init_type_name(&lun->port_stat_grps.stat_group,
+ +			"statistics", &tf->tf_cit_tmpl.tfc_tpg_port_stat_cit);
+ +	lun_cg->default_groups[0] = &lun->port_stat_grps.stat_group;
+ +	lun_cg->default_groups[1] = NULL;
+ +
+ +	port_stat_grp = &lun->port_stat_grps.stat_group;
+ +	port_stat_grp->default_groups =  kzalloc(sizeof(struct config_group *) * 4,
+ +				GFP_KERNEL);
+ +	if (!port_stat_grp->default_groups) {
+ +		pr_err("Unable to allocate port_stat_grp->default_groups\n");
+ +		kfree(lun_cg->default_groups);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+++=======
++ 	config_group_init_type_name(&lun->lun_group, name,
++ 			&tf->tf_tpg_port_cit);
++ 
++ 	config_group_init_type_name(&lun->port_stat_grps.stat_group,
++ 			"statistics", &tf->tf_tpg_port_stat_cit);
++ 	configfs_add_default_group(&lun->port_stat_grps.stat_group,
++ 			&lun->lun_group);
++ 
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  	target_stat_setup_port_default_groups(lun);
+  
+  	return &lun->lun_group;
+@@@ -1037,35 -839,42 +1027,58 @@@ static struct config_group *target_fabr
+  		return ERR_PTR(-ENOSYS);
+  	}
+  
+ -	se_tpg = tf->tf_ops->fabric_make_tpg(wwn, group, name);
+ +	se_tpg = tf->tf_ops.fabric_make_tpg(wwn, group, name);
+  	if (!se_tpg || IS_ERR(se_tpg))
+  		return ERR_PTR(-EINVAL);
+- 	/*
+- 	 * Setup default groups from pre-allocated se_tpg->tpg_default_groups
+- 	 */
+- 	se_tpg->tpg_group.default_groups = se_tpg->tpg_default_groups;
+- 	se_tpg->tpg_group.default_groups[0] = &se_tpg->tpg_lun_group;
+- 	se_tpg->tpg_group.default_groups[1] = &se_tpg->tpg_np_group;
+- 	se_tpg->tpg_group.default_groups[2] = &se_tpg->tpg_acl_group;
+- 	se_tpg->tpg_group.default_groups[3] = &se_tpg->tpg_attrib_group;
+- 	se_tpg->tpg_group.default_groups[4] = &se_tpg->tpg_auth_group;
+- 	se_tpg->tpg_group.default_groups[5] = &se_tpg->tpg_param_group;
+- 	se_tpg->tpg_group.default_groups[6] = NULL;
+  
+  	config_group_init_type_name(&se_tpg->tpg_group, name,
+++<<<<<<< HEAD
+ +			&tf->tf_cit_tmpl.tfc_tpg_base_cit);
+ +	config_group_init_type_name(&se_tpg->tpg_lun_group, "lun",
+ +			&tf->tf_cit_tmpl.tfc_tpg_lun_cit);
+ +	config_group_init_type_name(&se_tpg->tpg_np_group, "np",
+ +			&tf->tf_cit_tmpl.tfc_tpg_np_cit);
+ +	config_group_init_type_name(&se_tpg->tpg_acl_group, "acls",
+ +			&tf->tf_cit_tmpl.tfc_tpg_nacl_cit);
+ +	config_group_init_type_name(&se_tpg->tpg_attrib_group, "attrib",
+ +			&tf->tf_cit_tmpl.tfc_tpg_attrib_cit);
+ +	config_group_init_type_name(&se_tpg->tpg_auth_group, "auth",
+ +			&tf->tf_cit_tmpl.tfc_tpg_auth_cit);
+ +	config_group_init_type_name(&se_tpg->tpg_param_group, "param",
+ +			&tf->tf_cit_tmpl.tfc_tpg_param_cit);
+++=======
++ 			&tf->tf_tpg_base_cit);
++ 
++ 	config_group_init_type_name(&se_tpg->tpg_lun_group, "lun",
++ 			&tf->tf_tpg_lun_cit);
++ 	configfs_add_default_group(&se_tpg->tpg_lun_group,
++ 			&se_tpg->tpg_group);
++ 
++ 	config_group_init_type_name(&se_tpg->tpg_np_group, "np",
++ 			&tf->tf_tpg_np_cit);
++ 	configfs_add_default_group(&se_tpg->tpg_np_group,
++ 			&se_tpg->tpg_group);
++ 
++ 	config_group_init_type_name(&se_tpg->tpg_acl_group, "acls",
++ 			&tf->tf_tpg_nacl_cit);
++ 	configfs_add_default_group(&se_tpg->tpg_acl_group,
++ 			&se_tpg->tpg_group);
++ 
++ 	config_group_init_type_name(&se_tpg->tpg_attrib_group, "attrib",
++ 			&tf->tf_tpg_attrib_cit);
++ 	configfs_add_default_group(&se_tpg->tpg_attrib_group,
++ 			&se_tpg->tpg_group);
++ 
++ 	config_group_init_type_name(&se_tpg->tpg_auth_group, "auth",
++ 			&tf->tf_tpg_auth_cit);
++ 	configfs_add_default_group(&se_tpg->tpg_auth_group,
++ 			&se_tpg->tpg_group);
++ 
++ 	config_group_init_type_name(&se_tpg->tpg_param_group, "param",
++ 			&tf->tf_tpg_param_cit);
++ 	configfs_add_default_group(&se_tpg->tpg_param_group,
++ 			&se_tpg->tpg_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	return &se_tpg->tpg_group;
+  }
+@@@ -1144,17 -942,12 +1146,19 @@@ static struct config_group *target_fabr
+  		return ERR_PTR(-EINVAL);
+  
+  	wwn->wwn_tf = tf;
+- 	/*
+- 	 * Setup default groups from pre-allocated wwn->wwn_default_groups
+- 	 */
+- 	wwn->wwn_group.default_groups = wwn->wwn_default_groups;
+- 	wwn->wwn_group.default_groups[0] = &wwn->fabric_stat_group;
+- 	wwn->wwn_group.default_groups[1] = NULL;
+  
+++<<<<<<< HEAD
+ +	config_group_init_type_name(&wwn->wwn_group, name,
+ +			&tf->tf_cit_tmpl.tfc_tpg_cit);
+ +	config_group_init_type_name(&wwn->fabric_stat_group, "fabric_statistics",
+ +			&tf->tf_cit_tmpl.tfc_wwn_fabric_stats_cit);
+++=======
++ 	config_group_init_type_name(&wwn->wwn_group, name, &tf->tf_tpg_cit);
++ 
++ 	config_group_init_type_name(&wwn->fabric_stat_group, "fabric_statistics",
++ 			&tf->tf_wwn_fabric_stats_cit);
++ 	configfs_add_default_group(&wwn->fabric_stat_group, &wwn->wwn_group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	return &wwn->wwn_group;
+  }
+diff --cc drivers/target/target_core_internal.h
+index 60381db90026,4a7cf499cdfa..000000000000
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@@ -1,6 -1,52 +1,55 @@@
+  #ifndef TARGET_CORE_INTERNAL_H
+  #define TARGET_CORE_INTERNAL_H
+  
+++<<<<<<< HEAD
+++=======
++ #define TARGET_CORE_NAME_MAX_LEN	64
++ #define TARGET_FABRIC_NAME_SIZE		32
++ 
++ struct target_backend {
++ 	struct list_head list;
++ 
++ 	const struct target_backend_ops *ops;
++ 
++ 	struct config_item_type tb_dev_cit;
++ 	struct config_item_type tb_dev_attrib_cit;
++ 	struct config_item_type tb_dev_pr_cit;
++ 	struct config_item_type tb_dev_wwn_cit;
++ 	struct config_item_type tb_dev_alua_tg_pt_gps_cit;
++ 	struct config_item_type tb_dev_stat_cit;
++ };
++ 
++ struct target_fabric_configfs {
++ 	atomic_t		tf_access_cnt;
++ 	struct list_head	tf_list;
++ 	struct config_group	tf_group;
++ 	struct config_group	tf_disc_group;
++ 	const struct target_core_fabric_ops *tf_ops;
++ 
++ 	struct config_item_type tf_discovery_cit;
++ 	struct config_item_type	tf_wwn_cit;
++ 	struct config_item_type tf_wwn_fabric_stats_cit;
++ 	struct config_item_type tf_tpg_cit;
++ 	struct config_item_type tf_tpg_base_cit;
++ 	struct config_item_type tf_tpg_lun_cit;
++ 	struct config_item_type tf_tpg_port_cit;
++ 	struct config_item_type tf_tpg_port_stat_cit;
++ 	struct config_item_type tf_tpg_np_cit;
++ 	struct config_item_type tf_tpg_np_base_cit;
++ 	struct config_item_type tf_tpg_attrib_cit;
++ 	struct config_item_type tf_tpg_auth_cit;
++ 	struct config_item_type tf_tpg_param_cit;
++ 	struct config_item_type tf_tpg_nacl_cit;
++ 	struct config_item_type tf_tpg_nacl_base_cit;
++ 	struct config_item_type tf_tpg_nacl_attrib_cit;
++ 	struct config_item_type tf_tpg_nacl_auth_cit;
++ 	struct config_item_type tf_tpg_nacl_param_cit;
++ 	struct config_item_type tf_tpg_nacl_stat_cit;
++ 	struct config_item_type tf_tpg_mappedlun_cit;
++ 	struct config_item_type tf_tpg_mappedlun_stat_cit;
++ };
++ 
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  /* target_core_alua.c */
+  extern struct t10_alua_lu_gp *default_lu_gp;
+  
+diff --cc drivers/usb/gadget/configfs.c
+index 80e7f75a56c7,2f8081f0f795..000000000000
+--- a/drivers/usb/gadget/configfs.c
++++ b/drivers/usb/gadget/configfs.c
+@@@ -42,7 -48,7 +42,11 @@@ struct gadget_info 
+  	struct config_group functions_group;
+  	struct config_group configs_group;
+  	struct config_group strings_group;
+++<<<<<<< HEAD
+ +	struct config_group *default_groups[4];
+++=======
++ 	struct config_group os_desc_group;
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	struct mutex lock;
+  	struct usb_gadget_strings *gstrings[MAX_USB_STRING_LANGS + 1];
+@@@ -728,6 -725,466 +730,469 @@@ static void gadget_strings_attr_release
+  USB_CONFIG_STRING_RW_OPS(gadget_strings);
+  USB_CONFIG_STRINGS_LANG(gadget_strings, gadget_info);
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct os_desc *to_os_desc(struct config_item *item)
++ {
++ 	return container_of(to_config_group(item), struct os_desc, group);
++ }
++ 
++ static inline struct gadget_info *os_desc_item_to_gadget_info(
++ 		struct config_item *item)
++ {
++ 	return to_gadget_info(to_os_desc(item)->group.cg_item.ci_parent);
++ }
++ 
++ static ssize_t os_desc_use_show(struct config_item *item, char *page)
++ {
++ 	return sprintf(page, "%d",
++ 			os_desc_item_to_gadget_info(item)->use_os_desc);
++ }
++ 
++ static ssize_t os_desc_use_store(struct config_item *item, const char *page,
++ 				 size_t len)
++ {
++ 	struct gadget_info *gi = os_desc_item_to_gadget_info(item);
++ 	int ret;
++ 	bool use;
++ 
++ 	mutex_lock(&gi->lock);
++ 	ret = strtobool(page, &use);
++ 	if (!ret) {
++ 		gi->use_os_desc = use;
++ 		ret = len;
++ 	}
++ 	mutex_unlock(&gi->lock);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t os_desc_b_vendor_code_show(struct config_item *item, char *page)
++ {
++ 	return sprintf(page, "%d",
++ 			os_desc_item_to_gadget_info(item)->b_vendor_code);
++ }
++ 
++ static ssize_t os_desc_b_vendor_code_store(struct config_item *item,
++ 					   const char *page, size_t len)
++ {
++ 	struct gadget_info *gi = os_desc_item_to_gadget_info(item);
++ 	int ret;
++ 	u8 b_vendor_code;
++ 
++ 	mutex_lock(&gi->lock);
++ 	ret = kstrtou8(page, 0, &b_vendor_code);
++ 	if (!ret) {
++ 		gi->b_vendor_code = b_vendor_code;
++ 		ret = len;
++ 	}
++ 	mutex_unlock(&gi->lock);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t os_desc_qw_sign_show(struct config_item *item, char *page)
++ {
++ 	struct gadget_info *gi = os_desc_item_to_gadget_info(item);
++ 
++ 	memcpy(page, gi->qw_sign, OS_STRING_QW_SIGN_LEN);
++ 	return OS_STRING_QW_SIGN_LEN;
++ }
++ 
++ static ssize_t os_desc_qw_sign_store(struct config_item *item, const char *page,
++ 				     size_t len)
++ {
++ 	struct gadget_info *gi = os_desc_item_to_gadget_info(item);
++ 	int res, l;
++ 
++ 	l = min((int)len, OS_STRING_QW_SIGN_LEN >> 1);
++ 	if (page[l - 1] == '\n')
++ 		--l;
++ 
++ 	mutex_lock(&gi->lock);
++ 	res = utf8s_to_utf16s(page, l,
++ 			      UTF16_LITTLE_ENDIAN, (wchar_t *) gi->qw_sign,
++ 			      OS_STRING_QW_SIGN_LEN);
++ 	if (res > 0)
++ 		res = len;
++ 	mutex_unlock(&gi->lock);
++ 
++ 	return res;
++ }
++ 
++ CONFIGFS_ATTR(os_desc_, use);
++ CONFIGFS_ATTR(os_desc_, b_vendor_code);
++ CONFIGFS_ATTR(os_desc_, qw_sign);
++ 
++ static struct configfs_attribute *os_desc_attrs[] = {
++ 	&os_desc_attr_use,
++ 	&os_desc_attr_b_vendor_code,
++ 	&os_desc_attr_qw_sign,
++ 	NULL,
++ };
++ 
++ static void os_desc_attr_release(struct config_item *item)
++ {
++ 	struct os_desc *os_desc = to_os_desc(item);
++ 	kfree(os_desc);
++ }
++ 
++ static int os_desc_link(struct config_item *os_desc_ci,
++ 			struct config_item *usb_cfg_ci)
++ {
++ 	struct gadget_info *gi = container_of(to_config_group(os_desc_ci),
++ 					struct gadget_info, os_desc_group);
++ 	struct usb_composite_dev *cdev = &gi->cdev;
++ 	struct config_usb_cfg *c_target =
++ 		container_of(to_config_group(usb_cfg_ci),
++ 			     struct config_usb_cfg, group);
++ 	struct usb_configuration *c;
++ 	int ret;
++ 
++ 	mutex_lock(&gi->lock);
++ 	list_for_each_entry(c, &cdev->configs, list) {
++ 		if (c == &c_target->c)
++ 			break;
++ 	}
++ 	if (c != &c_target->c) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (cdev->os_desc_config) {
++ 		ret = -EBUSY;
++ 		goto out;
++ 	}
++ 
++ 	cdev->os_desc_config = &c_target->c;
++ 	ret = 0;
++ 
++ out:
++ 	mutex_unlock(&gi->lock);
++ 	return ret;
++ }
++ 
++ static int os_desc_unlink(struct config_item *os_desc_ci,
++ 			  struct config_item *usb_cfg_ci)
++ {
++ 	struct gadget_info *gi = container_of(to_config_group(os_desc_ci),
++ 					struct gadget_info, os_desc_group);
++ 	struct usb_composite_dev *cdev = &gi->cdev;
++ 
++ 	mutex_lock(&gi->lock);
++ 	if (gi->composite.gadget_driver.udc_name)
++ 		unregister_gadget(gi);
++ 	cdev->os_desc_config = NULL;
++ 	WARN_ON(gi->composite.gadget_driver.udc_name);
++ 	mutex_unlock(&gi->lock);
++ 	return 0;
++ }
++ 
++ static struct configfs_item_operations os_desc_ops = {
++ 	.release                = os_desc_attr_release,
++ 	.allow_link		= os_desc_link,
++ 	.drop_link		= os_desc_unlink,
++ };
++ 
++ static struct config_item_type os_desc_type = {
++ 	.ct_item_ops	= &os_desc_ops,
++ 	.ct_attrs	= os_desc_attrs,
++ 	.ct_owner	= THIS_MODULE,
++ };
++ 
++ static inline struct usb_os_desc_ext_prop
++ *to_usb_os_desc_ext_prop(struct config_item *item)
++ {
++ 	return container_of(item, struct usb_os_desc_ext_prop, item);
++ }
++ 
++ static ssize_t ext_prop_type_show(struct config_item *item, char *page)
++ {
++ 	return sprintf(page, "%d", to_usb_os_desc_ext_prop(item)->type);
++ }
++ 
++ static ssize_t ext_prop_type_store(struct config_item *item,
++ 				   const char *page, size_t len)
++ {
++ 	struct usb_os_desc_ext_prop *ext_prop = to_usb_os_desc_ext_prop(item);
++ 	struct usb_os_desc *desc = to_usb_os_desc(ext_prop->item.ci_parent);
++ 	u8 type;
++ 	int ret;
++ 
++ 	if (desc->opts_mutex)
++ 		mutex_lock(desc->opts_mutex);
++ 	ret = kstrtou8(page, 0, &type);
++ 	if (ret)
++ 		goto end;
++ 	if (type < USB_EXT_PROP_UNICODE || type > USB_EXT_PROP_UNICODE_MULTI) {
++ 		ret = -EINVAL;
++ 		goto end;
++ 	}
++ 
++ 	if ((ext_prop->type == USB_EXT_PROP_BINARY ||
++ 	    ext_prop->type == USB_EXT_PROP_LE32 ||
++ 	    ext_prop->type == USB_EXT_PROP_BE32) &&
++ 	    (type == USB_EXT_PROP_UNICODE ||
++ 	    type == USB_EXT_PROP_UNICODE_ENV ||
++ 	    type == USB_EXT_PROP_UNICODE_LINK))
++ 		ext_prop->data_len <<= 1;
++ 	else if ((ext_prop->type == USB_EXT_PROP_UNICODE ||
++ 		   ext_prop->type == USB_EXT_PROP_UNICODE_ENV ||
++ 		   ext_prop->type == USB_EXT_PROP_UNICODE_LINK) &&
++ 		   (type == USB_EXT_PROP_BINARY ||
++ 		   type == USB_EXT_PROP_LE32 ||
++ 		   type == USB_EXT_PROP_BE32))
++ 		ext_prop->data_len >>= 1;
++ 	ext_prop->type = type;
++ 	ret = len;
++ 
++ end:
++ 	if (desc->opts_mutex)
++ 		mutex_unlock(desc->opts_mutex);
++ 	return ret;
++ }
++ 
++ static ssize_t ext_prop_data_show(struct config_item *item, char *page)
++ {
++ 	struct usb_os_desc_ext_prop *ext_prop = to_usb_os_desc_ext_prop(item);
++ 	int len = ext_prop->data_len;
++ 
++ 	if (ext_prop->type == USB_EXT_PROP_UNICODE ||
++ 	    ext_prop->type == USB_EXT_PROP_UNICODE_ENV ||
++ 	    ext_prop->type == USB_EXT_PROP_UNICODE_LINK)
++ 		len >>= 1;
++ 	memcpy(page, ext_prop->data, len);
++ 
++ 	return len;
++ }
++ 
++ static ssize_t ext_prop_data_store(struct config_item *item,
++ 				   const char *page, size_t len)
++ {
++ 	struct usb_os_desc_ext_prop *ext_prop = to_usb_os_desc_ext_prop(item);
++ 	struct usb_os_desc *desc = to_usb_os_desc(ext_prop->item.ci_parent);
++ 	char *new_data;
++ 	size_t ret_len = len;
++ 
++ 	if (page[len - 1] == '\n' || page[len - 1] == '\0')
++ 		--len;
++ 	new_data = kmemdup(page, len, GFP_KERNEL);
++ 	if (!new_data)
++ 		return -ENOMEM;
++ 
++ 	if (desc->opts_mutex)
++ 		mutex_lock(desc->opts_mutex);
++ 	kfree(ext_prop->data);
++ 	ext_prop->data = new_data;
++ 	desc->ext_prop_len -= ext_prop->data_len;
++ 	ext_prop->data_len = len;
++ 	desc->ext_prop_len += ext_prop->data_len;
++ 	if (ext_prop->type == USB_EXT_PROP_UNICODE ||
++ 	    ext_prop->type == USB_EXT_PROP_UNICODE_ENV ||
++ 	    ext_prop->type == USB_EXT_PROP_UNICODE_LINK) {
++ 		desc->ext_prop_len -= ext_prop->data_len;
++ 		ext_prop->data_len <<= 1;
++ 		ext_prop->data_len += 2;
++ 		desc->ext_prop_len += ext_prop->data_len;
++ 	}
++ 	if (desc->opts_mutex)
++ 		mutex_unlock(desc->opts_mutex);
++ 	return ret_len;
++ }
++ 
++ CONFIGFS_ATTR(ext_prop_, type);
++ CONFIGFS_ATTR(ext_prop_, data);
++ 
++ static struct configfs_attribute *ext_prop_attrs[] = {
++ 	&ext_prop_attr_type,
++ 	&ext_prop_attr_data,
++ 	NULL,
++ };
++ 
++ static void usb_os_desc_ext_prop_release(struct config_item *item)
++ {
++ 	struct usb_os_desc_ext_prop *ext_prop = to_usb_os_desc_ext_prop(item);
++ 
++ 	kfree(ext_prop); /* frees a whole chunk */
++ }
++ 
++ static struct configfs_item_operations ext_prop_ops = {
++ 	.release		= usb_os_desc_ext_prop_release,
++ };
++ 
++ static struct config_item *ext_prop_make(
++ 		struct config_group *group,
++ 		const char *name)
++ {
++ 	struct usb_os_desc_ext_prop *ext_prop;
++ 	struct config_item_type *ext_prop_type;
++ 	struct usb_os_desc *desc;
++ 	char *vlabuf;
++ 
++ 	vla_group(data_chunk);
++ 	vla_item(data_chunk, struct usb_os_desc_ext_prop, ext_prop, 1);
++ 	vla_item(data_chunk, struct config_item_type, ext_prop_type, 1);
++ 
++ 	vlabuf = kzalloc(vla_group_size(data_chunk), GFP_KERNEL);
++ 	if (!vlabuf)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	ext_prop = vla_ptr(vlabuf, data_chunk, ext_prop);
++ 	ext_prop_type = vla_ptr(vlabuf, data_chunk, ext_prop_type);
++ 
++ 	desc = container_of(group, struct usb_os_desc, group);
++ 	ext_prop_type->ct_item_ops = &ext_prop_ops;
++ 	ext_prop_type->ct_attrs = ext_prop_attrs;
++ 	ext_prop_type->ct_owner = desc->owner;
++ 
++ 	config_item_init_type_name(&ext_prop->item, name, ext_prop_type);
++ 
++ 	ext_prop->name = kstrdup(name, GFP_KERNEL);
++ 	if (!ext_prop->name) {
++ 		kfree(vlabuf);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 	desc->ext_prop_len += 14;
++ 	ext_prop->name_len = 2 * strlen(ext_prop->name) + 2;
++ 	if (desc->opts_mutex)
++ 		mutex_lock(desc->opts_mutex);
++ 	desc->ext_prop_len += ext_prop->name_len;
++ 	list_add_tail(&ext_prop->entry, &desc->ext_prop);
++ 	++desc->ext_prop_count;
++ 	if (desc->opts_mutex)
++ 		mutex_unlock(desc->opts_mutex);
++ 
++ 	return &ext_prop->item;
++ }
++ 
++ static void ext_prop_drop(struct config_group *group, struct config_item *item)
++ {
++ 	struct usb_os_desc_ext_prop *ext_prop = to_usb_os_desc_ext_prop(item);
++ 	struct usb_os_desc *desc = to_usb_os_desc(&group->cg_item);
++ 
++ 	if (desc->opts_mutex)
++ 		mutex_lock(desc->opts_mutex);
++ 	list_del(&ext_prop->entry);
++ 	--desc->ext_prop_count;
++ 	kfree(ext_prop->name);
++ 	desc->ext_prop_len -= (ext_prop->name_len + ext_prop->data_len + 14);
++ 	if (desc->opts_mutex)
++ 		mutex_unlock(desc->opts_mutex);
++ 	config_item_put(item);
++ }
++ 
++ static struct configfs_group_operations interf_grp_ops = {
++ 	.make_item	= &ext_prop_make,
++ 	.drop_item	= &ext_prop_drop,
++ };
++ 
++ static ssize_t interf_grp_compatible_id_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	memcpy(page, to_usb_os_desc(item)->ext_compat_id, 8);
++ 	return 8;
++ }
++ 
++ static ssize_t interf_grp_compatible_id_store(struct config_item *item,
++ 					      const char *page, size_t len)
++ {
++ 	struct usb_os_desc *desc = to_usb_os_desc(item);
++ 	int l;
++ 
++ 	l = min_t(int, 8, len);
++ 	if (page[l - 1] == '\n')
++ 		--l;
++ 	if (desc->opts_mutex)
++ 		mutex_lock(desc->opts_mutex);
++ 	memcpy(desc->ext_compat_id, page, l);
++ 
++ 	if (desc->opts_mutex)
++ 		mutex_unlock(desc->opts_mutex);
++ 
++ 	return len;
++ }
++ 
++ static ssize_t interf_grp_sub_compatible_id_show(struct config_item *item,
++ 						 char *page)
++ {
++ 	memcpy(page, to_usb_os_desc(item)->ext_compat_id + 8, 8);
++ 	return 8;
++ }
++ 
++ static ssize_t interf_grp_sub_compatible_id_store(struct config_item *item,
++ 						  const char *page, size_t len)
++ {
++ 	struct usb_os_desc *desc = to_usb_os_desc(item);
++ 	int l;
++ 
++ 	l = min_t(int, 8, len);
++ 	if (page[l - 1] == '\n')
++ 		--l;
++ 	if (desc->opts_mutex)
++ 		mutex_lock(desc->opts_mutex);
++ 	memcpy(desc->ext_compat_id + 8, page, l);
++ 
++ 	if (desc->opts_mutex)
++ 		mutex_unlock(desc->opts_mutex);
++ 
++ 	return len;
++ }
++ 
++ CONFIGFS_ATTR(interf_grp_, compatible_id);
++ CONFIGFS_ATTR(interf_grp_, sub_compatible_id);
++ 
++ static struct configfs_attribute *interf_grp_attrs[] = {
++ 	&interf_grp_attr_compatible_id,
++ 	&interf_grp_attr_sub_compatible_id,
++ 	NULL
++ };
++ 
++ int usb_os_desc_prepare_interf_dir(struct config_group *parent,
++ 				   int n_interf,
++ 				   struct usb_os_desc **desc,
++ 				   char **names,
++ 				   struct module *owner)
++ {
++ 	struct config_group *os_desc_group;
++ 	struct config_item_type *os_desc_type, *interface_type;
++ 
++ 	vla_group(data_chunk);
++ 	vla_item(data_chunk, struct config_group, os_desc_group, 1);
++ 	vla_item(data_chunk, struct config_item_type, os_desc_type, 1);
++ 	vla_item(data_chunk, struct config_item_type, interface_type, 1);
++ 
++ 	char *vlabuf = kzalloc(vla_group_size(data_chunk), GFP_KERNEL);
++ 	if (!vlabuf)
++ 		return -ENOMEM;
++ 
++ 	os_desc_group = vla_ptr(vlabuf, data_chunk, os_desc_group);
++ 	os_desc_type = vla_ptr(vlabuf, data_chunk, os_desc_type);
++ 	interface_type = vla_ptr(vlabuf, data_chunk, interface_type);
++ 
++ 	os_desc_type->ct_owner = owner;
++ 	config_group_init_type_name(os_desc_group, "os_desc", os_desc_type);
++ 	configfs_add_default_group(os_desc_group, parent);
++ 
++ 	interface_type->ct_group_ops = &interf_grp_ops;
++ 	interface_type->ct_attrs = interf_grp_attrs;
++ 	interface_type->ct_owner = owner;
++ 
++ 	while (n_interf--) {
++ 		struct usb_os_desc *d;
++ 
++ 		d = desc[n_interf];
++ 		d->owner = owner;
++ 		config_group_init_type_name(&d->group, "", interface_type);
++ 		config_item_set_name(&d->group.cg_item, "interface.%s",
++ 				     names[n_interf]);
++ 		configfs_add_default_group(&d->group, os_desc_group);
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(usb_os_desc_prepare_interf_dir);
++ 
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  static int configfs_do_nothing(struct usb_composite_dev *cdev)
+  {
+  	WARN_ON(1);
+@@@ -915,17 -1412,23 +1380,33 @@@ static struct config_group *gadgets_mak
+  	if (!gi)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	gi->group.default_groups = gi->default_groups;
+ +	gi->group.default_groups[0] = &gi->functions_group;
+ +	gi->group.default_groups[1] = &gi->configs_group;
+ +	gi->group.default_groups[2] = &gi->strings_group;
+++=======
++ 	config_group_init_type_name(&gi->group, name, &gadget_root_type);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	config_group_init_type_name(&gi->functions_group, "functions",
+  			&functions_type);
++ 	configfs_add_default_group(&gi->functions_group, &gi->group);
++ 
+  	config_group_init_type_name(&gi->configs_group, "configs",
+  			&config_desc_type);
++ 	configfs_add_default_group(&gi->configs_group, &gi->group);
++ 
+  	config_group_init_type_name(&gi->strings_group, "strings",
+  			&gadget_strings_strings_type);
+++<<<<<<< HEAD
+++=======
++ 	configfs_add_default_group(&gi->strings_group, &gi->group);
++ 
++ 	config_group_init_type_name(&gi->os_desc_group, "os_desc",
++ 			&os_desc_type);
++ 	configfs_add_default_group(&gi->os_desc_group, &gi->group);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  
+  	gi->composite.bind = configfs_do_nothing;
+  	gi->composite.unbind = configfs_do_nothing;
+@@@ -950,14 -1453,6 +1431,17 @@@
+  	if (!gi->composite.gadget_driver.function)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_USB_OTG
+ +	gi->otg.bLength = sizeof(struct usb_otg_descriptor);
+ +	gi->otg.bDescriptorType = USB_DT_OTG;
+ +	gi->otg.bmAttributes = USB_OTG_SRP | USB_OTG_HNP;
+ +#endif
+ +
+ +	config_group_init_type_name(&gi->group, name,
+ +				&gadget_root_type);
+++=======
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  	return &gi->group;
+  err:
+  	kfree(gi);
+diff --cc drivers/usb/gadget/f_mass_storage.c
+index c35a9ecc576b,142bb7763f2a..000000000000
+--- a/drivers/usb/gadget/f_mass_storage.c
++++ b/drivers/usb/gadget/f_mass_storage.c
+@@@ -2946,42 -3430,120 +2946,109 @@@ static struct usb_gadget_strings *fsg_s
+  	NULL,
+  };
+  
+ -static struct configfs_group_operations fsg_group_ops = {
+ -	.make_group	= fsg_lun_make,
+ -	.drop_item	= fsg_lun_drop,
+ -};
+ -
+ -static struct config_item_type fsg_func_type = {
+ -	.ct_item_ops	= &fsg_item_ops,
+ -	.ct_group_ops	= &fsg_group_ops,
+ -	.ct_attrs	= fsg_attrs,
+ -	.ct_owner	= THIS_MODULE,
+ -};
+ -
+ -static void fsg_free_inst(struct usb_function_instance *fi)
+ +static int fsg_bind_config(struct usb_composite_dev *cdev,
+ +			   struct usb_configuration *c,
+ +			   struct fsg_common *common)
+  {
+ -	struct fsg_opts *opts;
+ -
+ -	opts = fsg_opts_from_func_inst(fi);
+ -	fsg_common_put(opts->common);
+ -	kfree(opts);
+ -}
+ -
+ -static struct usb_function_instance *fsg_alloc_inst(void)
+ -{
+ -	struct fsg_opts *opts;
+ -	struct fsg_lun_config config;
+ +	struct fsg_dev *fsg;
+  	int rc;
+  
+++<<<<<<< HEAD:drivers/usb/gadget/f_mass_storage.c
+ +	fsg = kzalloc(sizeof *fsg, GFP_KERNEL);
+++=======
++ 	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
++ 	if (!opts)
++ 		return ERR_PTR(-ENOMEM);
++ 	mutex_init(&opts->lock);
++ 	opts->func_inst.free_func_inst = fsg_free_inst;
++ 	opts->common = fsg_common_setup(opts->common);
++ 	if (IS_ERR(opts->common)) {
++ 		rc = PTR_ERR(opts->common);
++ 		goto release_opts;
++ 	}
++ 
++ 	rc = fsg_common_set_num_buffers(opts->common,
++ 					CONFIG_USB_GADGET_STORAGE_NUM_BUFFERS);
++ 	if (rc)
++ 		goto release_opts;
++ 
++ 	pr_info(FSG_DRIVER_DESC ", version: " FSG_DRIVER_VERSION "\n");
++ 
++ 	memset(&config, 0, sizeof(config));
++ 	config.removable = true;
++ 	rc = fsg_common_create_lun(opts->common, &config, 0, "lun.0",
++ 			(const char **)&opts->func_inst.group.cg_item.ci_name);
++ 	if (rc)
++ 		goto release_buffers;
++ 
++ 	opts->lun0.lun = opts->common->luns[0];
++ 	opts->lun0.lun_id = 0;
++ 
++ 	config_group_init_type_name(&opts->func_inst.group, "", &fsg_func_type);
++ 
++ 	config_group_init_type_name(&opts->lun0.group, "lun.0", &fsg_lun_type);
++ 	configfs_add_default_group(&opts->lun0.group, &opts->func_inst.group);
++ 
++ 	return &opts->func_inst;
++ 
++ release_buffers:
++ 	fsg_common_free_buffers(opts->common);
++ release_opts:
++ 	kfree(opts);
++ 	return ERR_PTR(rc);
++ }
++ 
++ static void fsg_free(struct usb_function *f)
++ {
++ 	struct fsg_dev *fsg;
++ 	struct fsg_opts *opts;
++ 
++ 	fsg = container_of(f, struct fsg_dev, function);
++ 	opts = container_of(f->fi, struct fsg_opts, func_inst);
++ 
++ 	mutex_lock(&opts->lock);
++ 	opts->refcnt--;
++ 	mutex_unlock(&opts->lock);
++ 
++ 	kfree(fsg);
++ }
++ 
++ static struct usb_function *fsg_alloc(struct usb_function_instance *fi)
++ {
++ 	struct fsg_opts *opts = fsg_opts_from_func_inst(fi);
++ 	struct fsg_common *common = opts->common;
++ 	struct fsg_dev *fsg;
++ 
++ 	fsg = kzalloc(sizeof(*fsg), GFP_KERNEL);
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list):drivers/usb/gadget/function/f_mass_storage.c
+  	if (unlikely(!fsg))
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	mutex_lock(&opts->lock);
+ -	opts->refcnt++;
+ -	mutex_unlock(&opts->lock);
+ +		return -ENOMEM;
+  
+ -	fsg->function.name	= FSG_DRIVER_DESC;
+ -	fsg->function.bind	= fsg_bind;
+ -	fsg->function.unbind	= fsg_unbind;
+ -	fsg->function.setup	= fsg_setup;
+ -	fsg->function.set_alt	= fsg_set_alt;
+ -	fsg->function.disable	= fsg_disable;
+ -	fsg->function.free_func	= fsg_free;
+ +	fsg->function.name        = FSG_DRIVER_DESC;
+ +	fsg->function.strings     = fsg_strings_array;
+ +	fsg->function.bind        = fsg_bind;
+ +	fsg->function.unbind      = fsg_unbind;
+ +	fsg->function.setup       = fsg_setup;
+ +	fsg->function.set_alt     = fsg_set_alt;
+ +	fsg->function.disable     = fsg_disable;
+  
+  	fsg->common               = common;
+ +	/*
+ +	 * Our caller holds a reference to common structure so we
+ +	 * don't have to be worry about it being freed until we return
+ +	 * from this function.  So instead of incrementing counter now
+ +	 * and decrement in error recovery we increment it only when
+ +	 * call to usb_add_function() was successful.
+ +	 */
+  
+ -	return &fsg->function;
+ +	rc = usb_add_function(c, &fsg->function);
+ +	if (unlikely(rc))
+ +		kfree(fsg);
+ +	else
+ +		fsg_common_get(fsg->common);
+ +	return rc;
+  }
+  
+ -DECLARE_USB_FUNCTION_INIT(mass_storage, fsg_alloc_inst, fsg_alloc);
+ -MODULE_LICENSE("GPL");
+ -MODULE_AUTHOR("Michal Nazarewicz");
+  
+  /************************* Module parameters *************************/
+  
+diff --cc drivers/usb/gadget/f_rndis.c
+index 36e8c44d8e5e,f577eec88f8c..000000000000
+--- a/drivers/usb/gadget/f_rndis.c
++++ b/drivers/usb/gadget/f_rndis.c
+@@@ -787,8 -828,116 +787,121 @@@ fail
+  	return status;
+  }
+  
+++<<<<<<< HEAD:drivers/usb/gadget/f_rndis.c
+ +static void
+ +rndis_unbind(struct usb_configuration *c, struct usb_function *f)
+++=======
++ void rndis_borrow_net(struct usb_function_instance *f, struct net_device *net)
++ {
++ 	struct f_rndis_opts *opts;
++ 
++ 	opts = container_of(f, struct f_rndis_opts, func_inst);
++ 	if (opts->bound)
++ 		gether_cleanup(netdev_priv(opts->net));
++ 	else
++ 		free_netdev(opts->net);
++ 	opts->borrowed_net = opts->bound = true;
++ 	opts->net = net;
++ }
++ EXPORT_SYMBOL_GPL(rndis_borrow_net);
++ 
++ static inline struct f_rndis_opts *to_f_rndis_opts(struct config_item *item)
++ {
++ 	return container_of(to_config_group(item), struct f_rndis_opts,
++ 			    func_inst.group);
++ }
++ 
++ /* f_rndis_item_ops */
++ USB_ETHERNET_CONFIGFS_ITEM(rndis);
++ 
++ /* f_rndis_opts_dev_addr */
++ USB_ETHERNET_CONFIGFS_ITEM_ATTR_DEV_ADDR(rndis);
++ 
++ /* f_rndis_opts_host_addr */
++ USB_ETHERNET_CONFIGFS_ITEM_ATTR_HOST_ADDR(rndis);
++ 
++ /* f_rndis_opts_qmult */
++ USB_ETHERNET_CONFIGFS_ITEM_ATTR_QMULT(rndis);
++ 
++ /* f_rndis_opts_ifname */
++ USB_ETHERNET_CONFIGFS_ITEM_ATTR_IFNAME(rndis);
++ 
++ static struct configfs_attribute *rndis_attrs[] = {
++ 	&rndis_opts_attr_dev_addr,
++ 	&rndis_opts_attr_host_addr,
++ 	&rndis_opts_attr_qmult,
++ 	&rndis_opts_attr_ifname,
++ 	NULL,
++ };
++ 
++ static struct config_item_type rndis_func_type = {
++ 	.ct_item_ops	= &rndis_item_ops,
++ 	.ct_attrs	= rndis_attrs,
++ 	.ct_owner	= THIS_MODULE,
++ };
++ 
++ static void rndis_free_inst(struct usb_function_instance *f)
++ {
++ 	struct f_rndis_opts *opts;
++ 
++ 	opts = container_of(f, struct f_rndis_opts, func_inst);
++ 	if (!opts->borrowed_net) {
++ 		if (opts->bound)
++ 			gether_cleanup(netdev_priv(opts->net));
++ 		else
++ 			free_netdev(opts->net);
++ 	}
++ 
++ 	kfree(opts);
++ }
++ 
++ static struct usb_function_instance *rndis_alloc_inst(void)
++ {
++ 	struct f_rndis_opts *opts;
++ 	struct usb_os_desc *descs[1];
++ 	char *names[1];
++ 
++ 	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
++ 	if (!opts)
++ 		return ERR_PTR(-ENOMEM);
++ 	opts->rndis_os_desc.ext_compat_id = opts->rndis_ext_compat_id;
++ 
++ 	mutex_init(&opts->lock);
++ 	opts->func_inst.free_func_inst = rndis_free_inst;
++ 	opts->net = gether_setup_default();
++ 	if (IS_ERR(opts->net)) {
++ 		struct net_device *net = opts->net;
++ 		kfree(opts);
++ 		return ERR_CAST(net);
++ 	}
++ 	INIT_LIST_HEAD(&opts->rndis_os_desc.ext_prop);
++ 
++ 	descs[0] = &opts->rndis_os_desc;
++ 	names[0] = "rndis";
++ 	config_group_init_type_name(&opts->func_inst.group, "",
++ 				    &rndis_func_type);
++ 	usb_os_desc_prepare_interf_dir(&opts->func_inst.group, 1, descs,
++ 				       names, THIS_MODULE);
++ 
++ 	return &opts->func_inst;
++ }
++ 
++ static void rndis_free(struct usb_function *f)
++ {
++ 	struct f_rndis *rndis;
++ 	struct f_rndis_opts *opts;
++ 
++ 	rndis = func_to_rndis(f);
++ 	rndis_deregister(rndis->params);
++ 	opts = container_of(f->fi, struct f_rndis_opts, func_inst);
++ 	kfree(rndis);
++ 	mutex_lock(&opts->lock);
++ 	opts->refcnt--;
++ 	mutex_unlock(&opts->lock);
++ }
++ 
++ static void rndis_unbind(struct usb_configuration *c, struct usb_function *f)
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list):drivers/usb/gadget/function/f_rndis.c
+  {
+  	struct f_rndis		*rndis = func_to_rndis(f);
+  
+diff --cc include/linux/configfs.h
+index b6ca2c105004,485fe5519448..000000000000
+--- a/include/linux/configfs.h
++++ b/include/linux/configfs.h
+@@@ -279,9 -254,38 +286,24 @@@ static inline struct configfs_subsyste
+  int configfs_register_subsystem(struct configfs_subsystem *subsys);
+  void configfs_unregister_subsystem(struct configfs_subsystem *subsys);
+  
+++<<<<<<< HEAD
+++=======
++ int configfs_register_group(struct config_group *parent_group,
++ 			    struct config_group *group);
++ void configfs_unregister_group(struct config_group *group);
++ 
++ void configfs_remove_default_groups(struct config_group *group);
++ 
++ struct config_group *
++ configfs_register_default_group(struct config_group *parent_group,
++ 				const char *name,
++ 				struct config_item_type *item_type);
++ void configfs_unregister_default_group(struct config_group *group);
++ 
+++>>>>>>> 1ae1602de028 (configfs: switch ->default groups to a linked list)
+  /* These functions can sleep and can alloc with GFP_KERNEL */
+  /* WARNING: These cannot be called underneath configfs callbacks!! */
+ -int configfs_depend_item(struct configfs_subsystem *subsys,
+ -			 struct config_item *target);
+ -void configfs_undepend_item(struct config_item *target);
+ -
+ -/*
+ - * These functions can sleep and can alloc with GFP_KERNEL
+ - * NOTE: These should be called only underneath configfs callbacks.
+ - * NOTE: First parameter is a caller's subsystem, not target's.
+ - * WARNING: These cannot be called on newly created item
+ - *        (in make_group()/make_item() callback)
+ - */
+ -int configfs_depend_item_unlocked(struct configfs_subsystem *caller_subsys,
+ -				  struct config_item *target);
+ -
+ -
+ -static inline void configfs_undepend_item_unlocked(struct config_item *target)
+ -{
+ -	configfs_undepend_item(target);
+ -}
+ +int configfs_depend_item(struct configfs_subsystem *subsys, struct config_item *target);
+ +void configfs_undepend_item(struct configfs_subsystem *subsys, struct config_item *target);
+  
+  #endif /* _CONFIGFS_H_ */
+* Unmerged path drivers/usb/gadget/function/uvc_configfs.c
+diff --git a/Documentation/filesystems/configfs/configfs.txt b/Documentation/filesystems/configfs/configfs.txt
+index b40fec9d3f53..cb5e9c135ce9 100644
+--- a/Documentation/filesystems/configfs/configfs.txt
++++ b/Documentation/filesystems/configfs/configfs.txt
+@@ -217,7 +217,8 @@ child item.
+ 		struct config_item		cg_item;
+ 		struct list_head		cg_children;
+ 		struct configfs_subsystem 	*cg_subsys;
+-		struct config_group		**default_groups;
++		struct list_head		default_groups;
++		struct list_head		group_entry;
+ 	};
+ 
+ 	void config_group_init(struct config_group *group);
+@@ -397,15 +398,15 @@ These automatic subgroups, or default groups, do not preclude other
+ children of the parent group.  If ct_group_ops->make_group() exists,
+ other child groups can be created on the parent group directly.
+ 
+-A configfs subsystem specifies default groups by filling in the
+-NULL-terminated array default_groups on the config_group structure.
+-Each group in that array is populated in the configfs tree at the same
++A configfs subsystem specifies default groups by adding them using the
++configfs_add_default_group() function to the parent config_group
++structure.  Each added group is populated in the configfs tree at the same
+ time as the parent group.  Similarly, they are removed at the same time
+ as the parent.  No extra notification is provided.  When a ->drop_item()
+ method call notifies the subsystem the parent group is going away, it
+ also means every default group child associated with that parent group.
+ 
+-As a consequence of this, default_groups cannot be removed directly via
++As a consequence of this, default groups cannot be removed directly via
+ rmdir(2).  They also are not considered when rmdir(2) on the parent
+ group is checking for children.
+ 
+diff --git a/drivers/infiniband/core/cma_configfs.c b/drivers/infiniband/core/cma_configfs.c
+index 533477c27cde..8ef5536b04b7 100644
+--- a/drivers/infiniband/core/cma_configfs.c
++++ b/drivers/infiniband/core/cma_configfs.c
+@@ -49,8 +49,6 @@ struct cma_dev_group {
+ 	char				name[IB_DEVICE_NAME_MAX];
+ 	struct config_group		device_group;
+ 	struct config_group		ports_group;
+-	struct config_group		*default_dev_group[2];
+-	struct config_group		**default_ports_group;
+ 	struct cma_dev_port_group	*ports;
+ };
+ 
+@@ -162,7 +160,6 @@ static int make_cma_ports(struct cma_dev_group *cma_dev_group,
+ 	unsigned int i;
+ 	unsigned int ports_num;
+ 	struct cma_dev_port_group *ports;
+-	struct config_group **ports_group;
+ 	int err;
+ 
+ 	ibdev = cma_get_ib_dev(cma_dev);
+@@ -173,9 +170,8 @@ static int make_cma_ports(struct cma_dev_group *cma_dev_group,
+ 	ports_num = ibdev->phys_port_cnt;
+ 	ports = kcalloc(ports_num, sizeof(*cma_dev_group->ports),
+ 			GFP_KERNEL);
+-	ports_group = kcalloc(ports_num + 1, sizeof(*ports_group), GFP_KERNEL);
+ 
+-	if (!ports || !ports_group) {
++	if (!ports) {
+ 		err = -ENOMEM;
+ 		goto free;
+ 	}
+@@ -189,18 +185,16 @@ static int make_cma_ports(struct cma_dev_group *cma_dev_group,
+ 		config_group_init_type_name(&ports[i].group,
+ 					    port_str,
+ 					    &cma_port_group_type);
+-		ports_group[i] = &ports[i].group;
++		configfs_add_default_group(&ports[i].group,
++				&cma_dev_group->ports_group);
++
+ 	}
+-	ports_group[i] = NULL;
+-	cma_dev_group->default_ports_group = ports_group;
+ 	cma_dev_group->ports = ports;
+ 
+ 	return 0;
+ free:
+ 	kfree(ports);
+-	kfree(ports_group);
+ 	cma_dev_group->ports = NULL;
+-	cma_dev_group->default_ports_group = NULL;
+ 	return err;
+ }
+ 
+@@ -224,9 +218,7 @@ static void release_cma_ports_group(struct config_item  *item)
+ 							   ports_group);
+ 
+ 	kfree(cma_dev_group->ports);
+-	kfree(cma_dev_group->default_ports_group);
+ 	cma_dev_group->ports = NULL;
+-	cma_dev_group->default_ports_group = NULL;
+ };
+ 
+ static struct configfs_item_operations cma_ports_item_ops = {
+@@ -267,22 +259,17 @@ static struct config_group *make_cma_dev(struct config_group *group,
+ 
+ 	strncpy(cma_dev_group->name, name, sizeof(cma_dev_group->name));
+ 
+-	err = make_cma_ports(cma_dev_group, cma_dev);
+-	if (err)
+-		goto fail;
+-
+-	cma_dev_group->ports_group.default_groups =
+-		cma_dev_group->default_ports_group;
+ 	config_group_init_type_name(&cma_dev_group->ports_group, "ports",
+ 				    &cma_ports_group_type);
+ 
+-	cma_dev_group->device_group.default_groups
+-		= cma_dev_group->default_dev_group;
+-	cma_dev_group->default_dev_group[0] = &cma_dev_group->ports_group;
+-	cma_dev_group->default_dev_group[1] = NULL;
++	err = make_cma_ports(cma_dev_group, cma_dev);
++	if (err)
++		goto fail;
+ 
+ 	config_group_init_type_name(&cma_dev_group->device_group, name,
+ 				    &cma_device_group_type);
++	configfs_add_default_group(&cma_dev_group->ports_group,
++			&cma_dev_group->device_group);
+ 
+ 	cma_deref_dev(cma_dev);
+ 	return &cma_dev_group->device_group;
+* Unmerged path drivers/target/iscsi/iscsi_target_configfs.c
+* Unmerged path drivers/target/target_core_configfs.c
+* Unmerged path drivers/target/target_core_fabric_configfs.c
+* Unmerged path drivers/target/target_core_internal.h
+diff --git a/drivers/target/target_core_stat.c b/drivers/target/target_core_stat.c
+index 8e968ef8824f..8b93dd4cac30 100644
+--- a/drivers/target/target_core_stat.c
++++ b/drivers/target/target_core_stat.c
+@@ -506,19 +506,20 @@ static struct config_item_type target_stat_scsi_lu_cit = {
+  */
+ void target_stat_setup_dev_default_groups(struct se_device *dev)
+ {
+-	struct config_group *dev_stat_grp = &dev->dev_stat_grps.stat_group;
+-
+ 	config_group_init_type_name(&dev->dev_stat_grps.scsi_dev_group,
+ 			"scsi_dev", &target_stat_scsi_dev_cit);
++	configfs_add_default_group(&dev->dev_stat_grps.scsi_dev_group,
++			&dev->dev_stat_grps.stat_group);
++
+ 	config_group_init_type_name(&dev->dev_stat_grps.scsi_tgt_dev_group,
+ 			"scsi_tgt_dev", &target_stat_scsi_tgt_dev_cit);
++	configfs_add_default_group(&dev->dev_stat_grps.scsi_tgt_dev_group,
++			&dev->dev_stat_grps.stat_group);
++
+ 	config_group_init_type_name(&dev->dev_stat_grps.scsi_lu_group,
+ 			"scsi_lu", &target_stat_scsi_lu_cit);
+-
+-	dev_stat_grp->default_groups[0] = &dev->dev_stat_grps.scsi_dev_group;
+-	dev_stat_grp->default_groups[1] = &dev->dev_stat_grps.scsi_tgt_dev_group;
+-	dev_stat_grp->default_groups[2] = &dev->dev_stat_grps.scsi_lu_group;
+-	dev_stat_grp->default_groups[3] = NULL;
++	configfs_add_default_group(&dev->dev_stat_grps.scsi_lu_group,
++			&dev->dev_stat_grps.stat_group);
+ }
+ 
+ /*
+@@ -1042,19 +1043,20 @@ static struct config_item_type target_stat_scsi_transport_cit = {
+  */
+ void target_stat_setup_port_default_groups(struct se_lun *lun)
+ {
+-	struct config_group *port_stat_grp = &lun->port_stat_grps.stat_group;
+-
+ 	config_group_init_type_name(&lun->port_stat_grps.scsi_port_group,
+ 			"scsi_port", &target_stat_scsi_port_cit);
++	configfs_add_default_group(&lun->port_stat_grps.scsi_port_group,
++			&lun->port_stat_grps.stat_group);
++
+ 	config_group_init_type_name(&lun->port_stat_grps.scsi_tgt_port_group,
+ 			"scsi_tgt_port", &target_stat_scsi_tgt_port_cit);
++	configfs_add_default_group(&lun->port_stat_grps.scsi_tgt_port_group,
++			&lun->port_stat_grps.stat_group);
++
+ 	config_group_init_type_name(&lun->port_stat_grps.scsi_transport_group,
+ 			"scsi_transport", &target_stat_scsi_transport_cit);
+-
+-	port_stat_grp->default_groups[0] = &lun->port_stat_grps.scsi_port_group;
+-	port_stat_grp->default_groups[1] = &lun->port_stat_grps.scsi_tgt_port_group;
+-	port_stat_grp->default_groups[2] = &lun->port_stat_grps.scsi_transport_group;
+-	port_stat_grp->default_groups[3] = NULL;
++	configfs_add_default_group(&lun->port_stat_grps.scsi_transport_group,
++			&lun->port_stat_grps.stat_group);
+ }
+ 
+ /*
+@@ -1622,14 +1624,13 @@ static struct config_item_type target_stat_scsi_att_intr_port_cit = {
+  */
+ void target_stat_setup_mappedlun_default_groups(struct se_lun_acl *lacl)
+ {
+-	struct config_group *ml_stat_grp = &lacl->ml_stat_grps.stat_group;
+-
+ 	config_group_init_type_name(&lacl->ml_stat_grps.scsi_auth_intr_group,
+ 			"scsi_auth_intr", &target_stat_scsi_auth_intr_cit);
++	configfs_add_default_group(&lacl->ml_stat_grps.scsi_auth_intr_group,
++			&lacl->ml_stat_grps.stat_group);
++
+ 	config_group_init_type_name(&lacl->ml_stat_grps.scsi_att_intr_port_group,
+ 			"scsi_att_intr_port", &target_stat_scsi_att_intr_port_cit);
+-
+-	ml_stat_grp->default_groups[0] = &lacl->ml_stat_grps.scsi_auth_intr_group;
+-	ml_stat_grp->default_groups[1] = &lacl->ml_stat_grps.scsi_att_intr_port_group;
+-	ml_stat_grp->default_groups[2] = NULL;
++	configfs_add_default_group(&lacl->ml_stat_grps.scsi_att_intr_port_group,
++			&lacl->ml_stat_grps.stat_group);
+ }
+* Unmerged path drivers/usb/gadget/configfs.c
+* Unmerged path drivers/usb/gadget/f_mass_storage.c
+* Unmerged path drivers/usb/gadget/f_rndis.c
+* Unmerged path drivers/usb/gadget/function/uvc_configfs.c
+diff --git a/fs/configfs/dir.c b/fs/configfs/dir.c
+index 8e466317b895..0475a50495ea 100644
+--- a/fs/configfs/dir.c
++++ b/fs/configfs/dir.c
+@@ -707,23 +707,29 @@ static int populate_groups(struct config_group *group)
+ {
+ 	struct config_group *new_group;
+ 	int ret = 0;
+-	int i;
+-
+-	if (group->default_groups) {
+-		for (i = 0; group->default_groups[i]; i++) {
+-			new_group = group->default_groups[i];
+ 
+-			ret = create_default_group(group, new_group);
+-			if (ret) {
+-				detach_groups(group);
+-				break;
+-			}
++	list_for_each_entry(new_group, &group->default_groups, group_entry) {
++		ret = create_default_group(group, new_group);
++		if (ret) {
++			detach_groups(group);
++			break;
+ 		}
+ 	}
+ 
+ 	return ret;
+ }
+ 
++void configfs_remove_default_groups(struct config_group *group)
++{
++	struct config_group *g, *n;
++
++	list_for_each_entry_safe(g, n, &group->default_groups, group_entry) {
++		list_del(&g->group_entry);
++		config_item_put(&g->cg_item);
++	}
++}
++EXPORT_SYMBOL(configfs_remove_default_groups);
++
+ /*
+  * All of link_obj/unlink_obj/link_group/unlink_group require that
+  * subsys->su_mutex is held.
+@@ -772,15 +778,10 @@ static void link_obj(struct config_item *parent_item, struct config_item *item)
+ 
+ static void unlink_group(struct config_group *group)
+ {
+-	int i;
+ 	struct config_group *new_group;
+ 
+-	if (group->default_groups) {
+-		for (i = 0; group->default_groups[i]; i++) {
+-			new_group = group->default_groups[i];
+-			unlink_group(new_group);
+-		}
+-	}
++	list_for_each_entry(new_group, &group->default_groups, group_entry)
++		unlink_group(new_group);
+ 
+ 	group->cg_subsys = NULL;
+ 	unlink_obj(&group->cg_item);
+@@ -788,7 +789,6 @@ static void unlink_group(struct config_group *group)
+ 
+ static void link_group(struct config_group *parent_group, struct config_group *group)
+ {
+-	int i;
+ 	struct config_group *new_group;
+ 	struct configfs_subsystem *subsys = NULL; /* gcc is a turd */
+ 
+@@ -802,12 +802,8 @@ static void link_group(struct config_group *parent_group, struct config_group *g
+ 		BUG();
+ 	group->cg_subsys = subsys;
+ 
+-	if (group->default_groups) {
+-		for (i = 0; group->default_groups[i]; i++) {
+-			new_group = group->default_groups[i];
+-			link_group(group, new_group);
+-		}
+-	}
++	list_for_each_entry(new_group, &group->default_groups, group_entry)
++		link_group(group, new_group);
+ }
+ 
+ /*
+diff --git a/fs/configfs/item.c b/fs/configfs/item.c
+index 8238ebdf66f4..9d47a1f387b5 100644
+--- a/fs/configfs/item.c
++++ b/fs/configfs/item.c
+@@ -181,6 +181,7 @@ void config_group_init(struct config_group *group)
+ {
+ 	config_item_init(&group->cg_item);
+ 	INIT_LIST_HEAD(&group->cg_children);
++	INIT_LIST_HEAD(&group->default_groups);
+ }
+ 
+ /**
+diff --git a/fs/dlm/config.c b/fs/dlm/config.c
+index 7d58d5b112b5..f88327351c7a 100644
+--- a/fs/dlm/config.c
++++ b/fs/dlm/config.c
+@@ -455,7 +455,6 @@ static struct config_group *make_cluster(struct config_group *g,
+ 	void *gps = NULL;
+ 
+ 	cl = kzalloc(sizeof(struct dlm_cluster), GFP_NOFS);
+-	gps = kcalloc(3, sizeof(struct config_group *), GFP_NOFS);
+ 	sps = kzalloc(sizeof(struct dlm_spaces), GFP_NOFS);
+ 	cms = kzalloc(sizeof(struct dlm_comms), GFP_NOFS);
+ 
+@@ -466,10 +465,8 @@ static struct config_group *make_cluster(struct config_group *g,
+ 	config_group_init_type_name(&sps->ss_group, "spaces", &spaces_type);
+ 	config_group_init_type_name(&cms->cs_group, "comms", &comms_type);
+ 
+-	cl->group.default_groups = gps;
+-	cl->group.default_groups[0] = &sps->ss_group;
+-	cl->group.default_groups[1] = &cms->cs_group;
+-	cl->group.default_groups[2] = NULL;
++	configfs_add_default_group(&sps->ss_group, &cl->group);
++	configfs_add_default_group(&cms->cs_group, &cl->group);
+ 
+ 	cl->cl_tcp_port = dlm_config.ci_tcp_port;
+ 	cl->cl_buffer_size = dlm_config.ci_buffer_size;
+@@ -492,7 +489,6 @@ static struct config_group *make_cluster(struct config_group *g,
+ 
+  fail:
+ 	kfree(cl);
+-	kfree(gps);
+ 	kfree(sps);
+ 	kfree(cms);
+ 	return ERR_PTR(-ENOMEM);
+@@ -501,14 +497,8 @@ static struct config_group *make_cluster(struct config_group *g,
+ static void drop_cluster(struct config_group *g, struct config_item *i)
+ {
+ 	struct dlm_cluster *cl = config_item_to_cluster(i);
+-	struct config_item *tmp;
+-	int j;
+ 
+-	for (j = 0; cl->group.default_groups[j]; j++) {
+-		tmp = &cl->group.default_groups[j]->cg_item;
+-		cl->group.default_groups[j] = NULL;
+-		config_item_put(tmp);
+-	}
++	configfs_remove_default_groups(&cl->group);
+ 
+ 	space_list = NULL;
+ 	comm_list = NULL;
+@@ -519,7 +509,6 @@ static void drop_cluster(struct config_group *g, struct config_item *i)
+ static void release_cluster(struct config_item *i)
+ {
+ 	struct dlm_cluster *cl = config_item_to_cluster(i);
+-	kfree(cl->group.default_groups);
+ 	kfree(cl);
+ }
+ 
+@@ -527,21 +516,17 @@ static struct config_group *make_space(struct config_group *g, const char *name)
+ {
+ 	struct dlm_space *sp = NULL;
+ 	struct dlm_nodes *nds = NULL;
+-	void *gps = NULL;
+ 
+ 	sp = kzalloc(sizeof(struct dlm_space), GFP_NOFS);
+-	gps = kcalloc(2, sizeof(struct config_group *), GFP_NOFS);
+ 	nds = kzalloc(sizeof(struct dlm_nodes), GFP_NOFS);
+ 
+-	if (!sp || !gps || !nds)
++	if (!sp || !nds)
+ 		goto fail;
+ 
+ 	config_group_init_type_name(&sp->group, name, &space_type);
+-	config_group_init_type_name(&nds->ns_group, "nodes", &nodes_type);
+ 
+-	sp->group.default_groups = gps;
+-	sp->group.default_groups[0] = &nds->ns_group;
+-	sp->group.default_groups[1] = NULL;
++	config_group_init_type_name(&nds->ns_group, "nodes", &nodes_type);
++	configfs_add_default_group(&nds->ns_group, &sp->group);
+ 
+ 	INIT_LIST_HEAD(&sp->members);
+ 	mutex_init(&sp->members_lock);
+@@ -550,7 +535,6 @@ static struct config_group *make_space(struct config_group *g, const char *name)
+ 
+  fail:
+ 	kfree(sp);
+-	kfree(gps);
+ 	kfree(nds);
+ 	return ERR_PTR(-ENOMEM);
+ }
+@@ -558,24 +542,16 @@ static struct config_group *make_space(struct config_group *g, const char *name)
+ static void drop_space(struct config_group *g, struct config_item *i)
+ {
+ 	struct dlm_space *sp = config_item_to_space(i);
+-	struct config_item *tmp;
+-	int j;
+ 
+ 	/* assert list_empty(&sp->members) */
+ 
+-	for (j = 0; sp->group.default_groups[j]; j++) {
+-		tmp = &sp->group.default_groups[j]->cg_item;
+-		sp->group.default_groups[j] = NULL;
+-		config_item_put(tmp);
+-	}
+-
++	configfs_remove_default_groups(&sp->group);
+ 	config_item_put(i);
+ }
+ 
+ static void release_space(struct config_item *i)
+ {
+ 	struct dlm_space *sp = config_item_to_space(i);
+-	kfree(sp->group.default_groups);
+ 	kfree(sp);
+ }
+ 
+diff --git a/fs/ocfs2/cluster/nodemanager.c b/fs/ocfs2/cluster/nodemanager.c
+index bb240647ca5f..73605bdf0c90 100644
+--- a/fs/ocfs2/cluster/nodemanager.c
++++ b/fs/ocfs2/cluster/nodemanager.c
+@@ -768,7 +768,6 @@ static void o2nm_cluster_release(struct config_item *item)
+ {
+ 	struct o2nm_cluster *cluster = to_o2nm_cluster(item);
+ 
+-	kfree(cluster->cl_group.default_groups);
+ 	kfree(cluster);
+ }
+ 
+@@ -806,7 +805,6 @@ static struct config_group *o2nm_cluster_group_make_group(struct config_group *g
+ 	struct o2nm_cluster *cluster = NULL;
+ 	struct o2nm_node_group *ns = NULL;
+ 	struct config_group *o2hb_group = NULL, *ret = NULL;
+-	void *defs = NULL;
+ 
+ 	/* this runs under the parent dir's i_mutex; there can be only
+ 	 * one caller in here at a time */
+@@ -815,20 +813,18 @@ static struct config_group *o2nm_cluster_group_make_group(struct config_group *g
+ 
+ 	cluster = kzalloc(sizeof(struct o2nm_cluster), GFP_KERNEL);
+ 	ns = kzalloc(sizeof(struct o2nm_node_group), GFP_KERNEL);
+-	defs = kcalloc(3, sizeof(struct config_group *), GFP_KERNEL);
+ 	o2hb_group = o2hb_alloc_hb_set();
+-	if (cluster == NULL || ns == NULL || o2hb_group == NULL || defs == NULL)
++	if (cluster == NULL || ns == NULL || o2hb_group == NULL)
+ 		goto out;
+ 
+ 	config_group_init_type_name(&cluster->cl_group, name,
+ 				    &o2nm_cluster_type);
++	configfs_add_default_group(&ns->ns_group, &cluster->cl_group);
++
+ 	config_group_init_type_name(&ns->ns_group, "node",
+ 				    &o2nm_node_group_type);
++	configfs_add_default_group(o2hb_group, &cluster->cl_group);
+ 
+-	cluster->cl_group.default_groups = defs;
+-	cluster->cl_group.default_groups[0] = &ns->ns_group;
+-	cluster->cl_group.default_groups[1] = o2hb_group;
+-	cluster->cl_group.default_groups[2] = NULL;
+ 	rwlock_init(&cluster->cl_nodes_lock);
+ 	cluster->cl_node_ip_tree = RB_ROOT;
+ 	cluster->cl_reconnect_delay_ms = O2NET_RECONNECT_DELAY_MS_DEFAULT;
+@@ -844,7 +840,6 @@ out:
+ 		kfree(cluster);
+ 		kfree(ns);
+ 		o2hb_free_hb_set(o2hb_group);
+-		kfree(defs);
+ 		ret = ERR_PTR(-ENOMEM);
+ 	}
+ 
+@@ -854,18 +849,11 @@ out:
+ static void o2nm_cluster_group_drop_item(struct config_group *group, struct config_item *item)
+ {
+ 	struct o2nm_cluster *cluster = to_o2nm_cluster(item);
+-	int i;
+-	struct config_item *killme;
+ 
+ 	BUG_ON(o2nm_single_cluster != cluster);
+ 	o2nm_single_cluster = NULL;
+ 
+-	for (i = 0; cluster->cl_group.default_groups[i]; i++) {
+-		killme = &cluster->cl_group.default_groups[i]->cg_item;
+-		cluster->cl_group.default_groups[i] = NULL;
+-		config_item_put(killme);
+-	}
+-
++	configfs_remove_default_groups(&cluster->cl_group);
+ 	config_item_put(item);
+ }
+ 
+* Unmerged path include/linux/configfs.h
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 985ca4c907fe..ed50864d30ad 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -605,7 +605,6 @@ struct se_node_acl {
+ 	struct config_group	acl_auth_group;
+ 	struct config_group	acl_param_group;
+ 	struct config_group	acl_fabric_stat_group;
+-	struct config_group	*acl_default_groups[5];
+ 	struct list_head	acl_list;
+ 	struct list_head	acl_sess_list;
+ 	struct completion	acl_free_comp;
+@@ -893,7 +892,6 @@ struct se_portal_group {
+ 	struct target_core_fabric_ops *se_tpg_tfo;
+ 	struct se_wwn		*se_tpg_wwn;
+ 	struct config_group	tpg_group;
+-	struct config_group	*tpg_default_groups[7];
+ 	struct config_group	tpg_lun_group;
+ 	struct config_group	tpg_np_group;
+ 	struct config_group	tpg_acl_group;
+@@ -905,7 +903,6 @@ struct se_portal_group {
+ struct se_wwn {
+ 	struct target_fabric_configfs *wwn_tf;
+ 	struct config_group	wwn_group;
+-	struct config_group	*wwn_default_groups[2];
+ 	struct config_group	fabric_stat_group;
+ };
+ 
