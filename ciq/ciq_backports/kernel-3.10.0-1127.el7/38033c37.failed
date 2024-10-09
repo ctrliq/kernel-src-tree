@@ -1,0 +1,303 @@
+sched: Push down pre_schedule() and idle_balance()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 38033c37faab850ed5d33bb675c4de6c66be84d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/38033c37.failed
+
+This patch both merged idle_balance() and pre_schedule() and pushes
+both of them into pick_next_task().
+
+Conceptually pre_schedule() and idle_balance() are rather similar,
+both are used to pull more work onto the current CPU.
+
+We cannot however first move idle_balance() into pre_schedule_fair()
+since there is no guarantee the last runnable task is a fair task, and
+thus we would miss newidle balances.
+
+Similarly, the dl and rt pre_schedule calls must be ran before
+idle_balance() since their respective tasks have higher priority and
+it would not do to delay their execution searching for less important
+tasks first.
+
+However, by noticing that pick_next_tasks() already traverses the
+sched_class hierarchy in the right order, we can get the right
+behaviour and do away with both calls.
+
+We must however change the special case optimization to also require
+that prev is of sched_class_fair, otherwise we can miss doing a dl or
+rt pull where we needed one.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/n/tip-a8k6vvaebtn64nie345kx1je@git.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 38033c37faab850ed5d33bb675c4de6c66be84d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/idle_task.c
+#	kernel/sched/rt.c
+diff --cc kernel/sched/core.c
+index 9474c46ea21e,3068f37f7c5f..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -3472,16 -2581,11 +3461,22 @@@ pick_next_task(struct rq *rq
+  	 * Optimization: we know that if all tasks are in
+  	 * the fair class we can call that function directly:
+  	 */
+++<<<<<<< HEAD
+ +	if (likely(rq->nr_running == rq->cfs.h_nr_running)) {
+ +		p = fair_sched_class.pick_next_task(rq);
+++=======
++ 	if (likely(prev->sched_class == &fair_sched_class &&
++ 		   rq->nr_running == rq->cfs.h_nr_running)) {
++ 		p = fair_sched_class.pick_next_task(rq, prev);
+++>>>>>>> 38033c37faab (sched: Push down pre_schedule() and idle_balance())
+  		if (likely(p))
+  			return p;
+ +
+ +		/* assumes fair_sched_class->next == idle_sched_class */
+ +		else
+ +			p = idle_sched_class.pick_next_task(rq);
+ +
+ +		return p;
+  	}
+  
+  	for_each_class(class) {
+@@@ -3584,14 -2685,12 +3579,21 @@@ need_resched
+  		switch_count = &prev->nvcsw;
+  	}
+  
+++<<<<<<< HEAD
+ +	pre_schedule(rq, prev);
+ +
+ +	if (unlikely(!rq->nr_running))
+ +		idle_balance(cpu, rq);
+ +
+ +	put_prev_task(rq, prev);
+ +	next = pick_next_task(rq);
+++=======
++ 	if (prev->on_rq || rq->skip_clock_update < 0)
++ 		update_rq_clock(rq);
++ 
++ 	next = pick_next_task(rq, prev);
+++>>>>>>> 38033c37faab (sched: Push down pre_schedule() and idle_balance())
+  	clear_tsk_need_resched(prev);
+ -	clear_preempt_need_resched();
+  	rq->skip_clock_update = 0;
+  
+  	if (likely(prev != next)) {
+diff --cc kernel/sched/idle_task.c
+index 59cc67dc571a,f7d03af79a5b..000000000000
+--- a/kernel/sched/idle_task.c
++++ b/kernel/sched/idle_task.c
+@@@ -13,18 -13,8 +13,22 @@@ select_task_rq_idle(struct task_struct 
+  {
+  	return task_cpu(p); /* IDLE tasks as never migrated */
+  }
+++<<<<<<< HEAD
+ +
+ +static void pre_schedule_idle(struct rq *rq, struct task_struct *prev)
+ +{
+ +	idle_exit_fair(rq);
+ +	rq_last_tick_reset(rq);
+ +}
+ +
+ +static void post_schedule_idle(struct rq *rq)
+ +{
+ +	idle_enter_fair(rq);
+ +}
+++=======
+++>>>>>>> 38033c37faab (sched: Push down pre_schedule() and idle_balance())
+  #endif /* CONFIG_SMP */
++ 
+  /*
+   * Idle tasks are unconditionally rescheduled:
+   */
+@@@ -105,8 -98,6 +113,11 @@@ const struct sched_class idle_sched_cla
+  
+  #ifdef CONFIG_SMP
+  	.select_task_rq		= select_task_rq_idle,
+++<<<<<<< HEAD
+ +	.pre_schedule		= pre_schedule_idle,
+ +	.post_schedule		= post_schedule_idle,
+++=======
+++>>>>>>> 38033c37faab (sched: Push down pre_schedule() and idle_balance())
+  #endif
+  
+  	.set_curr_task          = set_curr_task_idle,
+diff --cc kernel/sched/rt.c
+index 6b68ceb9a68d,72f9ec759972..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -1370,9 -1326,28 +1372,31 @@@ static struct task_struct *_pick_next_t
+  	return p;
+  }
+  
+ -static struct task_struct *
+ -pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ +static struct task_struct *pick_next_task_rt(struct rq *rq)
+  {
+++<<<<<<< HEAD
+ +	struct task_struct *p = _pick_next_task_rt(rq);
+++=======
++ 	struct task_struct *p;
++ 	struct rt_rq *rt_rq = &rq->rt;
++ 
++ #ifdef CONFIG_SMP
++ 	/* Try to pull RT tasks here if we lower this rq's prio */
++ 	if (rq->rt.highest_prio.curr > prev->prio)
++ 		pull_rt_task(rq);
++ #endif
++ 
++ 	if (!rt_rq->rt_nr_running)
++ 		return NULL;
++ 
++ 	if (rt_rq_throttled(rt_rq))
++ 		return NULL;
++ 
++ 	if (prev)
++ 		prev->sched_class->put_prev_task(rq, prev);
++ 
++ 	p = _pick_next_task_rt(rq);
+++>>>>>>> 38033c37faab (sched: Push down pre_schedule() and idle_balance())
+  
+  	/* The running task is never eligible for pushing */
+  	if (p)
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 75f9634980d1..27e397cad882 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1534,6 +1534,8 @@ static void check_preempt_equal_dl(struct rq *rq, struct task_struct *p)
+ 	resched_curr(rq);
+ }
+ 
++static int pull_dl_task(struct rq *this_rq);
++
+ #endif /* CONFIG_SMP */
+ 
+ /*
+@@ -1589,6 +1591,11 @@ struct task_struct *pick_next_task_dl(struct rq *rq)
+ 
+ 	dl_rq = &rq->dl;
+ 
++#ifdef CONFIG_SMP
++	if (dl_task(prev))
++		pull_dl_task(rq);
++#endif
++
+ 	if (unlikely(!dl_rq->dl_nr_running))
+ 		return NULL;
+ 
+@@ -2032,13 +2039,6 @@ skip:
+ 	return ret;
+ }
+ 
+-static void pre_schedule_dl(struct rq *rq, struct task_struct *prev)
+-{
+-	/* Try to pull other tasks here */
+-	if (dl_task(prev))
+-		pull_dl_task(rq);
+-}
+-
+ static void post_schedule_dl(struct rq *rq)
+ {
+ 	push_dl_tasks(rq);
+@@ -2287,7 +2287,6 @@ const struct sched_class dl_sched_class = {
+ 	.set_cpus_allowed       = set_cpus_allowed_dl,
+ 	.rq_online              = rq_online_dl,
+ 	.rq_offline             = rq_offline_dl,
+-	.pre_schedule		= pre_schedule_dl,
+ 	.post_schedule		= post_schedule_dl,
+ 	.task_woken		= task_woken_dl,
+ #endif
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index c5d4b4242380..e71c095338c9 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2659,7 +2659,8 @@ void idle_exit_fair(struct rq *this_rq)
+ 	update_rq_runnable_avg(this_rq, 0);
+ }
+ 
+-#else
++#else /* CONFIG_SMP */
++
+ static inline void update_entity_load_avg(struct sched_entity *se,
+ 					  int update_cfs_rq) {}
+ static inline void update_rq_runnable_avg(struct rq *rq, int runnable) {}
+@@ -2671,7 +2672,7 @@ static inline void dequeue_entity_load_avg(struct cfs_rq *cfs_rq,
+ 					   int sleep) {}
+ static inline void update_cfs_rq_blocked_load(struct cfs_rq *cfs_rq,
+ 					      int force_update) {}
+-#endif
++#endif /* CONFIG_SMP */
+ 
+ static void enqueue_sleeper(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+@@ -4906,9 +4907,10 @@ static struct task_struct *pick_next_task_fair(struct rq *rq)
+ 	struct sched_entity *se;
+ 	struct task_struct *p;
+ 
++again: __maybe_unused
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	if (!cfs_rq->nr_running)
+-		return NULL;
++		goto idle;
+ 
+ 	if (!prev || prev->sched_class != &fair_sched_class)
+ 		goto simple;
+@@ -4984,7 +4986,7 @@ simple:
+ #endif
+ 
+ 	if (!cfs_rq->nr_running)
+-		return NULL;
++		goto idle;
+ 
+ 	do {
+ 		se = pick_next_entity(cfs_rq, NULL);
+@@ -4998,6 +5000,22 @@ simple:
+ 		hrtick_start_fair(rq, p);
+ 
+ 	return p;
++
++idle:
++#ifdef CONFIG_SMP
++	idle_enter_fair(rq);
++	/*
++	 * We must set idle_stamp _before_ calling idle_balance(), such that we
++	 * measure the duration of idle_balance() as idle time.
++	 */
++	rq->idle_stamp = rq_clock(rq);
++	if (idle_balance(rq)) { /* drops rq->lock */
++		rq->idle_stamp = 0;
++		goto again;
++	}
++#endif
++
++	return NULL;
+ }
+ 
+ /*
+* Unmerged path kernel/sched/idle_task.c
+* Unmerged path kernel/sched/rt.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 38c9ae998b34..849f3b0db10a 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1262,7 +1262,6 @@ struct sched_class {
+ 	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+ 	void (*migrate_task_rq)(struct task_struct *p, int next_cpu);
+ 
+-	void (*pre_schedule) (struct rq *this_rq, struct task_struct *task);
+ 	void (*post_schedule) (struct rq *this_rq);
+ 	RH_KABI_DEPRECATE_FN(void, task_waking, struct task_struct *task)
+ 	void (*task_woken) (struct rq *this_rq, struct task_struct *task);
