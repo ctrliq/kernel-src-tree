@@ -1,0 +1,218 @@
+libnl: add more helpers to align attributes on 64-bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 089bf1a6a924b97a7e9f920bae6253a8ad581cf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/089bf1a6.failed
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 089bf1a6a924b97a7e9f920bae6253a8ad581cf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netlink.h
+diff --cc include/net/netlink.h
+index a6619d807a58,6f51a8a06498..000000000000
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@@ -1229,6 -1239,61 +1237,64 @@@ static inline int nla_validate_nested(c
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * nla_need_padding_for_64bit - test 64-bit alignment of the next attribute
++  * @skb: socket buffer the message is stored in
++  *
++  * Return true if padding is needed to align the next attribute (nla_data()) to
++  * a 64-bit aligned area.
++  */
++ static inline bool nla_need_padding_for_64bit(struct sk_buff *skb)
++ {
++ #ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
++ 	/* The nlattr header is 4 bytes in size, that's why we test
++ 	 * if the skb->data _is_ aligned.  A NOP attribute, plus
++ 	 * nlattr header for next attribute, will make nla_data()
++ 	 * 8-byte aligned.
++ 	 */
++ 	if (IS_ALIGNED((unsigned long)skb_tail_pointer(skb), 8))
++ 		return true;
++ #endif
++ 	return false;
++ }
++ 
++ /**
++  * nla_align_64bit - 64-bit align the nla_data() of next attribute
++  * @skb: socket buffer the message is stored in
++  * @padattr: attribute type for the padding
++  *
++  * Conditionally emit a padding netlink attribute in order to make
++  * the next attribute we emit have a 64-bit aligned nla_data() area.
++  * This will only be done in architectures which do not have
++  * CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS defined.
++  *
++  * Returns zero on success or a negative error code.
++  */
++ static inline int nla_align_64bit(struct sk_buff *skb, int padattr)
++ {
++ 	if (nla_need_padding_for_64bit(skb) &&
++ 	    !nla_reserve(skb, padattr, 0))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * nla_total_size_64bit - total length of attribute including padding
++  * @payload: length of payload
++  */
++ static inline int nla_total_size_64bit(int payload)
++ {
++ 	return NLA_ALIGN(nla_attr_size(payload))
++ #ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
++ 		+ NLA_ALIGN(nla_attr_size(0))
++ #endif
++ 		;
++ }
++ 
++ /**
+++>>>>>>> 089bf1a6a924 (libnl: add more helpers to align attributes on 64-bit)
+   * nla_for_each_attr - iterate over a stream of attributes
+   * @pos: loop counter, set to current attribute
+   * @head: head of attribute stream
+* Unmerged path include/net/netlink.h
+diff --git a/lib/nlattr.c b/lib/nlattr.c
+index d6f970f3c800..b1bb47430463 100644
+--- a/lib/nlattr.c
++++ b/lib/nlattr.c
+@@ -339,6 +339,29 @@ struct nlattr *__nla_reserve(struct sk_buff *skb, int attrtype, int attrlen)
+ }
+ EXPORT_SYMBOL(__nla_reserve);
+ 
++/**
++ * __nla_reserve_64bit - reserve room for attribute on the skb and align it
++ * @skb: socket buffer to reserve room on
++ * @attrtype: attribute type
++ * @attrlen: length of attribute payload
++ *
++ * Adds a netlink attribute header to a socket buffer and reserves
++ * room for the payload but does not copy it. It also ensure that this
++ * attribute will be 64-bit aign.
++ *
++ * The caller is responsible to ensure that the skb provides enough
++ * tailroom for the attribute header and payload.
++ */
++struct nlattr *__nla_reserve_64bit(struct sk_buff *skb, int attrtype,
++				   int attrlen, int padattr)
++{
++	if (nla_need_padding_for_64bit(skb))
++		nla_align_64bit(skb, padattr);
++
++	return __nla_reserve(skb, attrtype, attrlen);
++}
++EXPORT_SYMBOL(__nla_reserve_64bit);
++
+ /**
+  * __nla_reserve_nohdr - reserve room for attribute without header
+  * @skb: socket buffer to reserve room on
+@@ -381,6 +404,35 @@ struct nlattr *nla_reserve(struct sk_buff *skb, int attrtype, int attrlen)
+ }
+ EXPORT_SYMBOL(nla_reserve);
+ 
++/**
++ * nla_reserve_64bit - reserve room for attribute on the skb and align it
++ * @skb: socket buffer to reserve room on
++ * @attrtype: attribute type
++ * @attrlen: length of attribute payload
++ *
++ * Adds a netlink attribute header to a socket buffer and reserves
++ * room for the payload but does not copy it. It also ensure that this
++ * attribute will be 64-bit aign.
++ *
++ * Returns NULL if the tailroom of the skb is insufficient to store
++ * the attribute header and payload.
++ */
++struct nlattr *nla_reserve_64bit(struct sk_buff *skb, int attrtype, int attrlen,
++				 int padattr)
++{
++	size_t len;
++
++	if (nla_need_padding_for_64bit(skb))
++		len = nla_total_size_64bit(attrlen);
++	else
++		len = nla_total_size(attrlen);
++	if (unlikely(skb_tailroom(skb) < len))
++		return NULL;
++
++	return __nla_reserve_64bit(skb, attrtype, attrlen, padattr);
++}
++EXPORT_SYMBOL(nla_reserve_64bit);
++
+ /**
+  * nla_reserve_nohdr - reserve room for attribute without header
+  * @skb: socket buffer to reserve room on
+@@ -420,6 +472,26 @@ void __nla_put(struct sk_buff *skb, int attrtype, int attrlen,
+ }
+ EXPORT_SYMBOL(__nla_put);
+ 
++/**
++ * __nla_put_64bit - Add a netlink attribute to a socket buffer and align it
++ * @skb: socket buffer to add attribute to
++ * @attrtype: attribute type
++ * @attrlen: length of attribute payload
++ * @data: head of attribute payload
++ *
++ * The caller is responsible to ensure that the skb provides enough
++ * tailroom for the attribute header and payload.
++ */
++void __nla_put_64bit(struct sk_buff *skb, int attrtype, int attrlen,
++		     const void *data, int padattr)
++{
++	struct nlattr *nla;
++
++	nla = __nla_reserve_64bit(skb, attrtype, attrlen, padattr);
++	memcpy(nla_data(nla), data, attrlen);
++}
++EXPORT_SYMBOL(__nla_put_64bit);
++
+ /**
+  * __nla_put_nohdr - Add a netlink attribute without header
+  * @skb: socket buffer to add attribute to
+@@ -458,6 +530,33 @@ int nla_put(struct sk_buff *skb, int attrtype, int attrlen, const void *data)
+ }
+ EXPORT_SYMBOL(nla_put);
+ 
++/**
++ * nla_put_64bit - Add a netlink attribute to a socket buffer and align it
++ * @skb: socket buffer to add attribute to
++ * @attrtype: attribute type
++ * @attrlen: length of attribute payload
++ * @data: head of attribute payload
++ *
++ * Returns -EMSGSIZE if the tailroom of the skb is insufficient to store
++ * the attribute header and payload.
++ */
++int nla_put_64bit(struct sk_buff *skb, int attrtype, int attrlen,
++		  const void *data, int padattr)
++{
++	size_t len;
++
++	if (nla_need_padding_for_64bit(skb))
++		len = nla_total_size_64bit(attrlen);
++	else
++		len = nla_total_size(attrlen);
++	if (unlikely(skb_tailroom(skb) < len))
++		return -EMSGSIZE;
++
++	__nla_put_64bit(skb, attrtype, attrlen, data, padattr);
++	return 0;
++}
++EXPORT_SYMBOL(nla_put_64bit);
++
+ /**
+  * nla_put_nohdr - Add a netlink attribute without header
+  * @skb: socket buffer to add attribute to
