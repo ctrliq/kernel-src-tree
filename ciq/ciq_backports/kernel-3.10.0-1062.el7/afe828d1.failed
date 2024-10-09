@@ -1,0 +1,188 @@
+kvm: x86: Add ability to skip TLB flush when switching CR3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit afe828d1de4047d26eb0cd0c0154f5ac3722bf63
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/afe828d1.failed
+
+Remove the implicit flush from the set_cr3 handlers, so that the
+callers are able to decide whether to flush the TLB or not.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit afe828d1de4047d26eb0cd0c0154f5ac3722bf63)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/mmu.h
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/mmu.c
+index db86a346eaea,d3a04cf6514b..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3914,11 -4036,64 +3914,54 @@@ static void nonpaging_init_context(stru
+  	context->nx = false;
+  }
+  
+ -static bool fast_cr3_switch(struct kvm_vcpu *vcpu, gpa_t new_cr3,
+ -			    union kvm_mmu_page_role new_role)
+ +void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	mmu_free_roots(vcpu);
+++=======
++ 	struct kvm_mmu *mmu = &vcpu->arch.mmu;
++ 
++ 	/*
++ 	 * For now, limit the fast switch to 64-bit hosts+VMs in order to avoid
++ 	 * having to deal with PDPTEs. We may add support for 32-bit hosts/VMs
++ 	 * later if necessary.
++ 	 */
++ 	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
++ 	    mmu->root_level >= PT64_ROOT_4LEVEL) {
++ 		gpa_t prev_cr3 = mmu->prev_root.cr3;
++ 
++ 		if (mmu_check_root(vcpu, new_cr3 >> PAGE_SHIFT))
++ 			return false;
++ 
++ 		swap(mmu->root_hpa, mmu->prev_root.hpa);
++ 		mmu->prev_root.cr3 = mmu->get_cr3(vcpu);
++ 
++ 		if (new_cr3 == prev_cr3 &&
++ 		    VALID_PAGE(mmu->root_hpa) &&
++ 		    page_header(mmu->root_hpa) != NULL &&
++ 		    new_role.word == page_header(mmu->root_hpa)->role.word) {
++ 			/*
++ 			 * It is possible that the cached previous root page is
++ 			 * obsolete because of a change in the MMU
++ 			 * generation number. However, that is accompanied by
++ 			 * KVM_REQ_MMU_RELOAD, which will free the root that we
++ 			 * have set here and allocate a new one.
++ 			 */
++ 
++ 			kvm_make_request(KVM_REQ_LOAD_CR3, vcpu);
++ 			kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
++ 			kvm_x86_ops->tlb_flush(vcpu, true);
++ 			__clear_sp_write_flooding_count(
++ 				page_header(mmu->root_hpa));
++ 
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  }
+  
+ -static void __kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3,
+ -			      union kvm_mmu_page_role new_role)
+ -{
+ -	if (!fast_cr3_switch(vcpu, new_cr3, new_role))
+ -		kvm_mmu_free_roots(vcpu, false);
+ -}
+ -
+ -void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3)
+ -{
+ -	__kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu));
+ -}
+ -EXPORT_SYMBOL_GPL(kvm_mmu_new_cr3);
+ -
+  static unsigned long get_cr3(struct kvm_vcpu *vcpu)
+  {
+  	return kvm_read_cr3(vcpu);
+@@@ -4605,8 -4851,8 +4648,13 @@@ int kvm_mmu_load(struct kvm_vcpu *vcpu
+  	kvm_mmu_sync_roots(vcpu);
+  	if (r)
+  		goto out;
+++<<<<<<< HEAD
+ +	/* set_cr3() should ensure TLB has been flushed */
+ +	vcpu->arch.mmu.set_cr3(vcpu, vcpu->arch.mmu.root_hpa);
+++=======
++ 	kvm_mmu_load_cr3(vcpu);
++ 	kvm_x86_ops->tlb_flush(vcpu, true);
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  out:
+  	return r;
+  }
+diff --cc arch/x86/kvm/mmu.h
+index 3d1af6f75377,6a2a97d8015b..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -78,6 -86,12 +78,15 @@@ static inline int kvm_mmu_reload(struc
+  	return kvm_mmu_load(vcpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void kvm_mmu_load_cr3(struct kvm_vcpu *vcpu)
++ {
++ 	if (VALID_PAGE(vcpu->arch.mmu.root_hpa))
++ 		vcpu->arch.mmu.set_cr3(vcpu, vcpu->arch.mmu.root_hpa);
++ }
++ 
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  /*
+   * Currently, we have two sorts of write-protection, a) the first one
+   * write-protects guest page to sync the guest modification, b) another one is
+diff --cc arch/x86/kvm/svm.c
+index 2abd6b8af3db,be9931cad409..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -2549,7 -2884,6 +2549,10 @@@ static void nested_svm_set_tdp_cr3(stru
+  
+  	svm->vmcb->control.nested_cr3 = __sme_set(root);
+  	mark_dirty(svm->vmcb, VMCB_NPT);
+++<<<<<<< HEAD
+ +	svm_flush_tlb(vcpu);
+++=======
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  }
+  
+  static void nested_svm_inject_npf_exit(struct kvm_vcpu *vcpu,
+@@@ -5290,7 -5765,6 +5293,10 @@@ static void svm_set_cr3(struct kvm_vcp
+  
+  	svm->vmcb->save.cr3 = __sme_set(root);
+  	mark_dirty(svm->vmcb, VMCB_CR);
+++<<<<<<< HEAD
+ +	svm_flush_tlb(vcpu);
+++=======
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  }
+  
+  static void set_tdp_cr3(struct kvm_vcpu *vcpu, unsigned long root)
+@@@ -5303,8 -5777,6 +5309,11 @@@
+  	/* Also sync guest cr3 here in case we live migrate */
+  	svm->vmcb->save.cr3 = kvm_read_cr3(vcpu);
+  	mark_dirty(svm->vmcb, VMCB_CR);
+++<<<<<<< HEAD
+ +
+ +	svm_flush_tlb(vcpu);
+++=======
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  }
+  
+  static int is_disabled(void)
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,903c130bb811..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -4262,7 -5029,6 +4262,10 @@@ static void vmx_set_cr3(struct kvm_vcp
+  		ept_load_pdptrs(vcpu);
+  	}
+  
+++<<<<<<< HEAD
+ +	vmx_flush_tlb(vcpu);
+++=======
+++>>>>>>> afe828d1de40 (kvm: x86: Add ability to skip TLB flush when switching CR3)
+  	vmcs_writel(GUEST_CR3, guest_cr3);
+  }
+  
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/mmu.h
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
