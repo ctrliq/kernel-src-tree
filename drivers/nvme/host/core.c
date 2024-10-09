@@ -782,7 +782,7 @@ static int nvme_identify_ns_descs(struct nvme_ns *ns, unsigned nsid)
 			memcpy(ns->uuid, data + pos + sizeof(*cur), len);
 			break;
 		default:
-			/* Skip unnkown types */
+			/* Skip unknown types */
 			len = cur->nidl;
 			break;
 		}
