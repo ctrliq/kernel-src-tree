@@ -1,0 +1,212 @@
+xsk: add Rx receive functions and poll support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit c497176cb2e478f0a5713b0e05f242276e3194b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c497176c.failed
+
+Here the actual receive functions of AF_XDP are implemented, that in a
+later commit, will be called from the XDP layers.
+
+There's one set of functions for the XDP_DRV side and another for
+XDP_SKB (generic).
+
+A new XDP API, xdp_return_buff, is also introduced.
+
+Adding xdp_return_buff, which is analogous to xdp_return_frame, but
+acts upon an struct xdp_buff. The API will be used by AF_XDP in future
+commits.
+
+Support for the poll syscall is also implemented.
+
+v2: xskq_validate_id did not update cons_tail.
+    The entries variable was calculated twice in xskq_nb_avail.
+    Squashed xdp_return_buff commit.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit c497176cb2e478f0a5713b0e05f242276e3194b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xdp.h
+#	include/net/xdp_sock.h
+#	net/core/xdp.c
+#	net/xdp/xdp_umem.h
+#	net/xdp/xsk.c
+#	net/xdp/xsk_queue.h
+diff --cc include/net/xdp.h
+index 6ac69520ed7c,0b689cf561c7..000000000000
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@@ -73,14 -78,33 +73,19 @@@ struct xdp_frame 
+  static inline
+  struct xdp_frame *convert_to_xdp_frame(struct xdp_buff *xdp)
+  {
+ -	struct xdp_frame *xdp_frame;
+ -	int metasize;
+ -	int headroom;
+ -
+ -	/* Assure headroom is available for storing info */
+ -	headroom = xdp->data - xdp->data_hard_start;
+ -	metasize = xdp->data - xdp->data_meta;
+ -	metasize = metasize > 0 ? metasize : 0;
+ -	if (unlikely((headroom - metasize) < sizeof(*xdp_frame)))
+ -		return NULL;
+ -
+ -	/* Store info in top of packet */
+ -	xdp_frame = xdp->data_hard_start;
+ -
+ -	xdp_frame->data = xdp->data;
+ -	xdp_frame->len  = xdp->data_end - xdp->data;
+ -	xdp_frame->headroom = headroom - sizeof(*xdp_frame);
+ -	xdp_frame->metasize = metasize;
+ -
+ -	/* rxq only valid until napi_schedule ends, convert to xdp_mem_info */
+ -	xdp_frame->mem = xdp->rxq->mem;
+ -
+ -	return xdp_frame;
+ +	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +void xdp_return_frame(struct xdp_frame *xdpf)
+ +{
+ +	return;
+ +}
+++=======
++ void xdp_return_frame(struct xdp_frame *xdpf);
++ void xdp_return_buff(struct xdp_buff *xdp);
+++>>>>>>> c497176cb2e4 (xsk: add Rx receive functions and poll support)
+  
+  int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+  		     struct net_device *dev, u32 queue_index);
+diff --cc net/core/xdp.c
+index e553510efc2e,bf6758f74339..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -42,6 -245,107 +42,51 @@@ EXPORT_SYMBOL_GPL(xdp_rxq_info_is_reg)
+  int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
+  			       enum xdp_mem_type type, void *allocator)
+  {
+ -	struct xdp_mem_allocator *xdp_alloc;
+ -	gfp_t gfp = GFP_KERNEL;
+ -	int id, errno, ret;
+ -	void *ptr;
+ -
+ -	if (xdp_rxq->reg_state != REG_STATE_REGISTERED) {
+ -		WARN(1, "Missing register, driver bug");
+ -		return -EFAULT;
+ -	}
+ -
+ -	if (!__is_supported_mem_type(type))
+ -		return -EOPNOTSUPP;
+ -
+ -	xdp_rxq->mem.type = type;
+ -
+ -	if (!allocator) {
+ -		if (type == MEM_TYPE_PAGE_POOL)
+ -			return -EINVAL; /* Setup time check page_pool req */
+ -		return 0;
+ -	}
+ -
+ -	/* Delay init of rhashtable to save memory if feature isn't used */
+ -	if (!mem_id_init) {
+ -		mutex_lock(&mem_id_lock);
+ -		ret = __mem_id_init_hash_table();
+ -		mutex_unlock(&mem_id_lock);
+ -		if (ret < 0) {
+ -			WARN_ON(1);
+ -			return ret;
+ -		}
+ -	}
+ -
+ -	xdp_alloc = kzalloc(sizeof(*xdp_alloc), gfp);
+ -	if (!xdp_alloc)
+ -		return -ENOMEM;
+ -
+ -	mutex_lock(&mem_id_lock);
+ -	id = __mem_id_cyclic_get(gfp);
+ -	if (id < 0) {
+ -		errno = id;
+ -		goto err;
+ -	}
+ -	xdp_rxq->mem.id = id;
+ -	xdp_alloc->mem  = xdp_rxq->mem;
+ -	xdp_alloc->allocator = allocator;
+ -
+ -	/* Insert allocator into ID lookup table */
+ -	ptr = rhashtable_insert_slow(mem_id_ht, &id, &xdp_alloc->node);
+ -	if (IS_ERR(ptr)) {
+ -		errno = PTR_ERR(ptr);
+ -		goto err;
+ -	}
+ -
+ -	mutex_unlock(&mem_id_lock);
+ -
+  	return 0;
+ -err:
+ -	mutex_unlock(&mem_id_lock);
+ -	kfree(xdp_alloc);
+ -	return errno;
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
+++<<<<<<< HEAD
+++=======
++ 
++ static void xdp_return(void *data, struct xdp_mem_info *mem)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	struct page *page;
++ 
++ 	switch (mem->type) {
++ 	case MEM_TYPE_PAGE_POOL:
++ 		rcu_read_lock();
++ 		/* mem->id is valid, checked in xdp_rxq_info_reg_mem_model() */
++ 		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
++ 		page = virt_to_head_page(data);
++ 		if (xa)
++ 			page_pool_put_page(xa->page_pool, page);
++ 		else
++ 			put_page(page);
++ 		rcu_read_unlock();
++ 		break;
++ 	case MEM_TYPE_PAGE_SHARED:
++ 		page_frag_free(data);
++ 		break;
++ 	case MEM_TYPE_PAGE_ORDER0:
++ 		page = virt_to_page(data); /* Assumes order0 page*/
++ 		put_page(page);
++ 		break;
++ 	default:
++ 		/* Not possible, checked in xdp_rxq_info_reg_mem_model() */
++ 		break;
++ 	}
++ }
++ 
++ void xdp_return_frame(struct xdp_frame *xdpf)
++ {
++ 	xdp_return(xdpf->data, &xdpf->mem);
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_frame);
++ 
++ void xdp_return_buff(struct xdp_buff *xdp)
++ {
++ 	xdp_return(xdp->data, &xdp->rxq->mem);
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_buff);
+++>>>>>>> c497176cb2e4 (xsk: add Rx receive functions and poll support)
+* Unmerged path include/net/xdp_sock.h
+* Unmerged path net/xdp/xdp_umem.h
+* Unmerged path net/xdp/xsk.c
+* Unmerged path net/xdp/xsk_queue.h
+* Unmerged path include/net/xdp.h
+* Unmerged path include/net/xdp_sock.h
+* Unmerged path net/core/xdp.c
+* Unmerged path net/xdp/xdp_umem.h
+* Unmerged path net/xdp/xsk.c
+* Unmerged path net/xdp/xsk_queue.h
