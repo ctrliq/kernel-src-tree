@@ -227,6 +227,9 @@ static int mce_severity_amd(struct mce *m, int tolerant, char **msg, bool is_exc
 
 	if (m->status & MCI_STATUS_UC) {
 
+		if (ctx == IN_KERNEL)
+			return MCE_PANIC_SEVERITY;
+
 		/*
 		 * On older systems where overflow_recov flag is not present, we
 		 * should simply panic if an error overflow occurs. If
@@ -236,10 +239,6 @@ static int mce_severity_amd(struct mce *m, int tolerant, char **msg, bool is_exc
 		if (mce_flags.overflow_recov) {
 			if (mce_flags.smca)
 				return mce_severity_amd_smca(m, ctx);
-
-			/* software can try to contain */
-			if (!(m->mcgstatus & MCG_STATUS_RIPV) && (ctx == IN_KERNEL))
-				return MCE_PANIC_SEVERITY;
 
 			/* kill current process */
 			return MCE_AR_SEVERITY;
