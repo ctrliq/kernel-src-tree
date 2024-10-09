@@ -1,0 +1,702 @@
+tracing, perf: Implement BPF programs attached to uprobes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 04a22fae4cbc1f7d3f7471e9b36359f98bd3f043
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/04a22fae.failed
+
+By copying BPF related operation to uprobe processing path, this patch
+allow users attach BPF programs to uprobes like what they are already
+doing on kprobes.
+
+After this patch, users are allowed to use PERF_EVENT_IOC_SET_BPF on a
+uprobe perf event. Which make it possible to profile user space programs
+and kernel events together using BPF.
+
+Because of this patch, CONFIG_BPF_EVENTS should be selected by
+CONFIG_UPROBE_EVENT to ensure trace_call_bpf() is compiled even if
+KPROBE_EVENT is not set.
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Kaixu Xia <xiakaixu@huawei.com>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1435716878-189507-3-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 04a22fae4cbc1f7d3f7471e9b36359f98bd3f043)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/trace_events.h
+#	kernel/events/core.c
+#	kernel/trace/Kconfig
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/events/core.c
+index e490cd411934,77f9e5d0e2d1..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -7654,452 -6733,101 +7654,498 @@@ void perf_tp_event(u64 addr, u64 count
+  		.data = record,
+  	};
+  
+ -	perf_sample_data_init(&data, addr, 0);
+ -	data.raw = &raw;
+ +	perf_sample_data_init(&data, addr, 0);
+ +	data.raw = &raw;
+ +
+ +	hlist_for_each_entry_rcu(event, head, hlist_entry) {
+ +		if (perf_tp_event_match(event, &data, regs))
+ +			perf_swevent_event(event, count, &data, regs);
+ +	}
+ +
+ +	/*
+ +	 * If we got specified a target task, also iterate its context and
+ +	 * deliver this event there too.
+ +	 */
+ +	if (task && task != current) {
+ +		struct perf_event_context *ctx;
+ +		struct trace_entry *entry = record;
+ +
+ +		rcu_read_lock();
+ +		ctx = rcu_dereference(task->perf_event_ctxp[perf_sw_context]);
+ +		if (!ctx)
+ +			goto unlock;
+ +
+ +		list_for_each_entry_rcu(event, &ctx->event_list, event_entry) {
+ +			if (event->attr.type != PERF_TYPE_TRACEPOINT)
+ +				continue;
+ +			if (event->attr.config != entry->type)
+ +				continue;
+ +			if (perf_tp_event_match(event, &data, regs))
+ +				perf_swevent_event(event, count, &data, regs);
+ +		}
+ +unlock:
+ +		rcu_read_unlock();
+ +	}
+ +
+ +	perf_swevent_put_recursion_context(rctx);
+ +}
+ +EXPORT_SYMBOL_GPL(perf_tp_event);
+ +
+ +static void tp_perf_event_destroy(struct perf_event *event)
+ +{
+ +	perf_trace_destroy(event);
+ +}
+ +
+ +static int perf_tp_event_init(struct perf_event *event)
+ +{
+ +	int err;
+ +
+ +	if (event->attr.type != PERF_TYPE_TRACEPOINT)
+ +		return -ENOENT;
+ +
+ +	/*
+ +	 * no branch sampling for tracepoint events
+ +	 */
+ +	if (has_branch_stack(event))
+ +		return -EOPNOTSUPP;
+ +
+ +	err = perf_trace_init(event);
+ +	if (err)
+ +		return err;
+ +
+ +	event->destroy = tp_perf_event_destroy;
+ +
+ +	return 0;
+ +}
+ +
+ +static struct pmu perf_tracepoint = {
+ +	.task_ctx_nr	= perf_sw_context,
+ +
+ +	.event_init	= perf_tp_event_init,
+ +	.add		= perf_trace_add,
+ +	.del		= perf_trace_del,
+ +	.start		= perf_swevent_start,
+ +	.stop		= perf_swevent_stop,
+ +	.read		= perf_swevent_read,
+ +};
+ +
+ +static inline void perf_tp_register(void)
+ +{
+ +	perf_pmu_register(&perf_tracepoint, "tracepoint", PERF_TYPE_TRACEPOINT);
+ +}
+ +
+ +static void perf_event_free_filter(struct perf_event *event)
+ +{
+ +	ftrace_profile_free_filter(event);
+ +}
+ +
+++<<<<<<< HEAD
+++=======
+++static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
+++{
+++	struct bpf_prog *prog;
+++
+++	if (event->attr.type != PERF_TYPE_TRACEPOINT)
+++		return -EINVAL;
+++
+++	if (event->tp_event->prog)
+++		return -EEXIST;
+++
+++	if (!(event->tp_event->flags & TRACE_EVENT_FL_UKPROBE))
+++		/* bpf programs can only be attached to u/kprobes */
+++		return -EINVAL;
+++
+++	prog = bpf_prog_get(prog_fd);
+++	if (IS_ERR(prog))
+++		return PTR_ERR(prog);
+++
+++	if (prog->type != BPF_PROG_TYPE_KPROBE) {
+++		/* valid fd, but invalid bpf program type */
+++		bpf_prog_put(prog);
+++		return -EINVAL;
+++	}
+++
+++	event->tp_event->prog = prog;
+++
+++	return 0;
+++}
+++
+++static void perf_event_free_bpf_prog(struct perf_event *event)
+++{
+++	struct bpf_prog *prog;
+++
+++	if (!event->tp_event)
+++		return;
+++
+++	prog = event->tp_event->prog;
+++	if (prog) {
+++		event->tp_event->prog = NULL;
+++		bpf_prog_put(prog);
+++	}
+++}
+++
+++>>>>>>> 04a22fae4cbc (tracing, perf: Implement BPF programs attached to uprobes)
+ +#else
+ +
+ +static inline void perf_tp_register(void)
+ +{
+ +}
+ +
+ +static void perf_event_free_filter(struct perf_event *event)
+ +{
+ +}
+ +
+ +#endif /* CONFIG_EVENT_TRACING */
+ +
+ +#ifdef CONFIG_HAVE_HW_BREAKPOINT
+ +void perf_bp_event(struct perf_event *bp, void *data)
+ +{
+ +	struct perf_sample_data sample;
+ +	struct pt_regs *regs = data;
+ +
+ +	perf_sample_data_init(&sample, bp->attr.bp_addr, 0);
+ +
+ +	if (!bp->hw.state && !perf_exclude_event(bp, regs))
+ +		perf_swevent_event(bp, 1, &sample, regs);
+ +}
+ +#endif
+ +
+ +/*
+ + * Allocate a new address filter
+ + */
+ +static struct perf_addr_filter *
+ +perf_addr_filter_new(struct perf_event *event, struct list_head *filters)
+ +{
+ +	int node = cpu_to_node(event->cpu == -1 ? 0 : event->cpu);
+ +	struct perf_addr_filter *filter;
+ +
+ +	filter = kzalloc_node(sizeof(*filter), GFP_KERNEL, node);
+ +	if (!filter)
+ +		return NULL;
+ +
+ +	INIT_LIST_HEAD(&filter->entry);
+ +	list_add_tail(&filter->entry, filters);
+ +
+ +	return filter;
+ +}
+ +
+ +static void free_filters_list(struct list_head *filters)
+ +{
+ +	struct perf_addr_filter *filter, *iter;
+ +
+ +	list_for_each_entry_safe(filter, iter, filters, entry) {
+ +		if (filter->inode)
+ +			iput(filter->inode);
+ +		list_del(&filter->entry);
+ +		kfree(filter);
+ +	}
+ +}
+ +
+ +/*
+ + * Free existing address filters and optionally install new ones
+ + */
+ +static void perf_addr_filters_splice(struct perf_event *event,
+ +				     struct list_head *head)
+ +{
+ +	unsigned long flags;
+ +	LIST_HEAD(list);
+ +
+ +	if (!has_addr_filter(event))
+ +		return;
+ +
+ +	/* don't bother with children, they don't have their own filters */
+ +	if (event->parent)
+ +		return;
+ +
+ +	raw_spin_lock_irqsave(&event->addr_filters.lock, flags);
+ +
+ +	list_splice_init(&event->addr_filters.list, &list);
+ +	if (head)
+ +		list_splice(head, &event->addr_filters.list);
+ +
+ +	raw_spin_unlock_irqrestore(&event->addr_filters.lock, flags);
+ +
+ +	free_filters_list(&list);
+ +}
+ +
+ +/*
+ + * Scan through mm's vmas and see if one of them matches the
+ + * @filter; if so, adjust filter's address range.
+ + * Called with mm::mmap_sem down for reading.
+ + */
+ +static unsigned long perf_addr_filter_apply(struct perf_addr_filter *filter,
+ +					    struct mm_struct *mm)
+ +{
+ +	struct vm_area_struct *vma;
+ +
+ +	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+ +		struct file *file = vma->vm_file;
+ +		unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
+ +		unsigned long vma_size = vma->vm_end - vma->vm_start;
+ +
+ +		if (!file)
+ +			continue;
+ +
+ +		if (!perf_addr_filter_match(filter, file, off, vma_size))
+ +			continue;
+ +
+ +		return vma->vm_start;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Update event's address range filters based on the
+ + * task's existing mappings, if any.
+ + */
+ +static void perf_event_addr_filters_apply(struct perf_event *event)
+ +{
+ +	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
+ +	struct task_struct *task = READ_ONCE(event->ctx->task);
+ +	struct perf_addr_filter *filter;
+ +	struct mm_struct *mm = NULL;
+ +	unsigned int count = 0;
+ +	unsigned long flags;
+ +
+ +	/*
+ +	 * We may observe TASK_TOMBSTONE, which means that the event tear-down
+ +	 * will stop on the parent's child_mutex that our caller is also holding
+ +	 */
+ +	if (task == TASK_TOMBSTONE)
+ +		return;
+ +
+ +	if (!ifh->nr_file_filters)
+ +		return;
+ +
+ +	mm = get_task_mm(event->ctx->task);
+ +	if (!mm)
+ +		goto restart;
+ +
+ +	down_read(&mm->mmap_sem);
+ +
+ +	raw_spin_lock_irqsave(&ifh->lock, flags);
+ +	list_for_each_entry(filter, &ifh->list, entry) {
+ +		event->addr_filters_offs[count] = 0;
+ +
+ +		/*
+ +		 * Adjust base offset if the filter is associated to a binary
+ +		 * that needs to be mapped:
+ +		 */
+ +		if (filter->inode)
+ +			event->addr_filters_offs[count] =
+ +				perf_addr_filter_apply(filter, mm);
+ +
+ +		count++;
+ +	}
+ +
+ +	event->addr_filters_gen++;
+ +	raw_spin_unlock_irqrestore(&ifh->lock, flags);
+ +
+ +	up_read(&mm->mmap_sem);
+ +
+ +	mmput(mm);
+ +
+ +restart:
+ +	perf_event_restart(event);
+ +}
+ +
+ +/*
+ + * Address range filtering: limiting the data to certain
+ + * instruction address ranges. Filters are ioctl()ed to us from
+ + * userspace as ascii strings.
+ + *
+ + * Filter string format:
+ + *
+ + * ACTION RANGE_SPEC
+ + * where ACTION is one of the
+ + *  * "filter": limit the trace to this region
+ + *  * "start": start tracing from this address
+ + *  * "stop": stop tracing at this address/region;
+ + * RANGE_SPEC is
+ + *  * for kernel addresses: <start address>[/<size>]
+ + *  * for object files:     <start address>[/<size>]@</path/to/object/file>
+ + *
+ + * if <size> is not specified, the range is treated as a single address.
+ + */
+ +enum {
+ +	IF_ACT_NONE = -1,
+ +	IF_ACT_FILTER,
+ +	IF_ACT_START,
+ +	IF_ACT_STOP,
+ +	IF_SRC_FILE,
+ +	IF_SRC_KERNEL,
+ +	IF_SRC_FILEADDR,
+ +	IF_SRC_KERNELADDR,
+ +};
+ +
+ +enum {
+ +	IF_STATE_ACTION = 0,
+ +	IF_STATE_SOURCE,
+ +	IF_STATE_END,
+ +};
+ +
+ +static const match_table_t if_tokens = {
+ +	{ IF_ACT_FILTER,	"filter" },
+ +	{ IF_ACT_START,		"start" },
+ +	{ IF_ACT_STOP,		"stop" },
+ +	{ IF_SRC_FILE,		"%u/%u@%s" },
+ +	{ IF_SRC_KERNEL,	"%u/%u" },
+ +	{ IF_SRC_FILEADDR,	"%u@%s" },
+ +	{ IF_SRC_KERNELADDR,	"%u" },
+ +	{ IF_ACT_NONE,		NULL },
+ +};
+ +
+ +/*
+ + * Address filter string parser
+ + */
+ +static int
+ +perf_event_parse_addr_filter(struct perf_event *event, char *fstr,
+ +			     struct list_head *filters)
+ +{
+ +	struct perf_addr_filter *filter = NULL;
+ +	char *start, *orig, *filename = NULL;
+ +	struct path path;
+ +	substring_t args[MAX_OPT_ARGS];
+ +	int state = IF_STATE_ACTION, token;
+ +	unsigned int kernel = 0;
+ +	int ret = -EINVAL;
+ +
+ +	orig = fstr = kstrdup(fstr, GFP_KERNEL);
+ +	if (!fstr)
+ +		return -ENOMEM;
+ +
+ +	while ((start = strsep(&fstr, " ,\n")) != NULL) {
+ +		ret = -EINVAL;
+ +
+ +		if (!*start)
+ +			continue;
+ +
+ +		/* filter definition begins */
+ +		if (state == IF_STATE_ACTION) {
+ +			filter = perf_addr_filter_new(event, filters);
+ +			if (!filter)
+ +				goto fail;
+ +		}
+  
+ -	hlist_for_each_entry_rcu(event, head, hlist_entry) {
+ -		if (perf_tp_event_match(event, &data, regs))
+ -			perf_swevent_event(event, count, &data, regs);
+ -	}
+ +		token = match_token(start, if_tokens, args);
+ +		switch (token) {
+ +		case IF_ACT_FILTER:
+ +		case IF_ACT_START:
+ +			filter->filter = 1;
+  
+ -	/*
+ -	 * If we got specified a target task, also iterate its context and
+ -	 * deliver this event there too.
+ -	 */
+ -	if (task && task != current) {
+ -		struct perf_event_context *ctx;
+ -		struct trace_entry *entry = record;
+ +		case IF_ACT_STOP:
+ +			if (state != IF_STATE_ACTION)
+ +				goto fail;
+  
+ -		rcu_read_lock();
+ -		ctx = rcu_dereference(task->perf_event_ctxp[perf_sw_context]);
+ -		if (!ctx)
+ -			goto unlock;
+ +			state = IF_STATE_SOURCE;
+ +			break;
+  
+ -		list_for_each_entry_rcu(event, &ctx->event_list, event_entry) {
+ -			if (event->attr.type != PERF_TYPE_TRACEPOINT)
+ -				continue;
+ -			if (event->attr.config != entry->type)
+ -				continue;
+ -			if (perf_tp_event_match(event, &data, regs))
+ -				perf_swevent_event(event, count, &data, regs);
+ -		}
+ -unlock:
+ -		rcu_read_unlock();
+ -	}
+ +		case IF_SRC_KERNELADDR:
+ +		case IF_SRC_KERNEL:
+ +			kernel = 1;
+  
+ -	perf_swevent_put_recursion_context(rctx);
+ -}
+ -EXPORT_SYMBOL_GPL(perf_tp_event);
+ +		case IF_SRC_FILEADDR:
+ +		case IF_SRC_FILE:
+ +			if (state != IF_STATE_SOURCE)
+ +				goto fail;
+  
+ -static void tp_perf_event_destroy(struct perf_event *event)
+ -{
+ -	perf_trace_destroy(event);
+ -}
+ +			if (token == IF_SRC_FILE || token == IF_SRC_KERNEL)
+ +				filter->range = 1;
+  
+ -static int perf_tp_event_init(struct perf_event *event)
+ -{
+ -	int err;
+ +			*args[0].to = 0;
+ +			ret = kstrtoul(args[0].from, 0, &filter->offset);
+ +			if (ret)
+ +				goto fail;
+  
+ -	if (event->attr.type != PERF_TYPE_TRACEPOINT)
+ -		return -ENOENT;
+ +			if (filter->range) {
+ +				*args[1].to = 0;
+ +				ret = kstrtoul(args[1].from, 0, &filter->size);
+ +				if (ret)
+ +					goto fail;
+ +			}
+  
+ -	/*
+ -	 * no branch sampling for tracepoint events
+ -	 */
+ -	if (has_branch_stack(event))
+ -		return -EOPNOTSUPP;
+ +			if (token == IF_SRC_FILE || token == IF_SRC_FILEADDR) {
+ +				int fpos = filter->range ? 2 : 1;
+  
+ -	err = perf_trace_init(event);
+ -	if (err)
+ -		return err;
+ +				filename = match_strdup(&args[fpos]);
+ +				if (!filename) {
+ +					ret = -ENOMEM;
+ +					goto fail;
+ +				}
+ +			}
+  
+ -	event->destroy = tp_perf_event_destroy;
+ +			state = IF_STATE_END;
+ +			break;
+  
+ -	return 0;
+ -}
+ +		default:
+ +			goto fail;
+ +		}
+  
+ -static struct pmu perf_tracepoint = {
+ -	.task_ctx_nr	= perf_sw_context,
+ +		/*
+ +		 * Filter definition is fully parsed, validate and install it.
+ +		 * Make sure that it doesn't contradict itself or the event's
+ +		 * attribute.
+ +		 */
+ +		if (state == IF_STATE_END) {
+ +			ret = -EINVAL;
+ +			if (kernel && event->attr.exclude_kernel)
+ +				goto fail;
+  
+ -	.event_init	= perf_tp_event_init,
+ -	.add		= perf_trace_add,
+ -	.del		= perf_trace_del,
+ -	.start		= perf_swevent_start,
+ -	.stop		= perf_swevent_stop,
+ -	.read		= perf_swevent_read,
+ -};
+ +			if (!kernel) {
+ +				if (!filename)
+ +					goto fail;
+  
+ -static inline void perf_tp_register(void)
+ -{
+ -	perf_pmu_register(&perf_tracepoint, "tracepoint", PERF_TYPE_TRACEPOINT);
+ -}
+ +				/*
+ +				 * For now, we only support file-based filters
+ +				 * in per-task events; doing so for CPU-wide
+ +				 * events requires additional context switching
+ +				 * trickery, since same object code will be
+ +				 * mapped at different virtual addresses in
+ +				 * different processes.
+ +				 */
+ +				ret = -EOPNOTSUPP;
+ +				if (!event->ctx->task)
+ +					goto fail_free_name;
+ +
+ +				/* look up the path and grab its inode */
+ +				ret = kern_path(filename, LOOKUP_FOLLOW, &path);
+ +				if (ret)
+ +					goto fail_free_name;
+ +
+ +				filter->inode = igrab(d_inode(path.dentry));
+ +				path_put(&path);
+ +				kfree(filename);
+ +				filename = NULL;
+ +
+ +				ret = -EINVAL;
+ +				if (!filter->inode ||
+ +				    !S_ISREG(filter->inode->i_mode))
+ +					/* free_filters_list() will iput() */
+ +					goto fail;
+ +
+ +				event->addr_filters.nr_file_filters++;
+ +			}
+  
+ -static int perf_event_set_filter(struct perf_event *event, void __user *arg)
+ -{
+ -	char *filter_str;
+ -	int ret;
+ +			/* ready to consume more filters */
+ +			state = IF_STATE_ACTION;
+ +			filter = NULL;
+ +		}
+ +	}
+  
+ -	if (event->attr.type != PERF_TYPE_TRACEPOINT)
+ -		return -EINVAL;
+ +	if (state != IF_STATE_ACTION)
+ +		goto fail;
+  
+ -	filter_str = strndup_user(arg, PAGE_SIZE);
+ -	if (IS_ERR(filter_str))
+ -		return PTR_ERR(filter_str);
+ +	kfree(orig);
+  
+ -	ret = ftrace_profile_set_filter(event, event->attr.config, filter_str);
+ +	return 0;
+ +
+ +fail_free_name:
+ +	kfree(filename);
+ +fail:
+ +	free_filters_list(filters);
+ +	kfree(orig);
+  
+ -	kfree(filter_str);
+  	return ret;
+  }
+  
+diff --cc kernel/trace/Kconfig
+index 9acb79c35834,1153c43428f3..000000000000
+--- a/kernel/trace/Kconfig
++++ b/kernel/trace/Kconfig
+@@@ -461,6 -432,14 +461,17 @@@ config UPROBE_EVEN
+  	  This option is required if you plan to use perf-probe subcommand
+  	  of perf tools on user space applications.
+  
+++<<<<<<< HEAD
+++=======
++ config BPF_EVENTS
++ 	depends on BPF_SYSCALL
++ 	depends on KPROBE_EVENT || UPROBE_EVENT
++ 	bool
++ 	default y
++ 	help
++ 	  This allows the user to attach BPF programs to kprobe events.
++ 
+++>>>>>>> 04a22fae4cbc (tracing, perf: Implement BPF programs attached to uprobes)
+  config PROBE_EVENTS
+  	def_bool n
+  
+diff --cc kernel/trace/trace_uprobe.c
+index 84f228258d8e,f97479f1ce35..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -976,17 -1089,25 +976,28 @@@ static bool uprobe_perf_filter(struct u
+  	return ret;
+  }
+  
+ -static void __uprobe_perf_func(struct trace_uprobe *tu,
+ -			       unsigned long func, struct pt_regs *regs,
+ -			       struct uprobe_cpu_buffer *ucb, int dsize)
+ +static void uprobe_perf_print(struct trace_uprobe *tu,
+ +				unsigned long func, struct pt_regs *regs)
+  {
+ -	struct trace_event_call *call = &tu->tp.call;
+ +	struct ftrace_event_call *call = &tu->call;
+  	struct uprobe_trace_entry_head *entry;
++ 	struct bpf_prog *prog = call->prog;
+  	struct hlist_head *head;
+  	void *data;
+ -	int size, esize;
+ -	int rctx;
+ +	int size, rctx, i;
+  
+++<<<<<<< HEAD
+ +	size = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+ +	size = ALIGN(size + tu->size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+++=======
++ 	if (prog && !trace_call_bpf(prog, regs))
++ 		return;
++ 
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 
++ 	size = esize + tu->tp.size + dsize;
++ 	size = ALIGN(size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+++>>>>>>> 04a22fae4cbc (tracing, perf: Implement BPF programs attached to uprobes)
+  	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE, "profile buffer not large enough"))
+  		return;
+  
+@@@ -1137,7 -1292,8 +1148,12 @@@ static int register_uprobe_event(struc
+  		kfree(call->print_fmt);
+  		return -ENODEV;
+  	}
+++<<<<<<< HEAD
+ +	call->flags = 0;
+++=======
++ 
++ 	call->flags = TRACE_EVENT_FL_UPROBE;
+++>>>>>>> 04a22fae4cbc (tracing, perf: Implement BPF programs attached to uprobes)
+  	call->class->reg = trace_uprobe_register;
+  	call->data = tu;
+  	ret = trace_add_event_call(call);
+* Unmerged path include/linux/trace_events.h
+* Unmerged path include/linux/trace_events.h
+* Unmerged path kernel/events/core.c
+* Unmerged path kernel/trace/Kconfig
+* Unmerged path kernel/trace/trace_uprobe.c
