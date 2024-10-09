@@ -1,0 +1,146 @@
+drm/amdgpu: Make struct amdgpu_atif private to amdgpu_acpi.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Lyude Paul <lyude@redhat.com>
+commit 2cd5fe22d9a45cdf11c62bbe8db3ce9101207510
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2cd5fe22.failed
+
+Currently, there is nothing in amdgpu that actually uses these structs
+other than amdgpu_acpi.c. Additionally, since we're about to start
+saving the correct ACPI handle to use for calling ATIF in this struct
+this saves us from having to handle making sure that the acpi_handle
+(and by proxy, the type definition for acpi_handle and all of the other
+acpi headers) doesn't need to be included within the amdgpu_drv struct
+itself. This follows the example set by amdgpu_atpx_handler.c.
+
+	Signed-off-by: Lyude Paul <lyude@redhat.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 2cd5fe22d9a45cdf11c62bbe8db3ce9101207510)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu.h
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 712ad8c2bdc5,7df5d3d11aff..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@@ -178,6 -189,8 +178,11 @@@ struct amdgpu_cs_parser
+  struct amdgpu_job;
+  struct amdgpu_irq_src;
+  struct amdgpu_fpriv;
+++<<<<<<< HEAD
+++=======
++ struct amdgpu_bo_va_mapping;
++ struct amdgpu_atif;
+++>>>>>>> 2cd5fe22d9a4 (drm/amdgpu: Make struct amdgpu_atif private to amdgpu_acpi.c)
+  
+  enum amdgpu_cp_irq {
+  	AMDGPU_CP_IRQ_GFX_EOP = 0,
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu.h
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+index 57afad79f55d..fcdd2a5fe6eb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+@@ -34,6 +34,43 @@
+ #include "amd_acpi.h"
+ #include "atom.h"
+ 
++struct amdgpu_atif_notification_cfg {
++	bool enabled;
++	int command_code;
++};
++
++struct amdgpu_atif_notifications {
++	bool display_switch;
++	bool expansion_mode_change;
++	bool thermal_state;
++	bool forced_power_state;
++	bool system_power_state;
++	bool display_conf_change;
++	bool px_gfx_switch;
++	bool brightness_change;
++	bool dgpu_display_event;
++};
++
++struct amdgpu_atif_functions {
++	bool system_params;
++	bool sbios_requests;
++	bool select_active_disp;
++	bool lid_state;
++	bool get_tv_standard;
++	bool set_tv_standard;
++	bool get_panel_expansion_mode;
++	bool set_panel_expansion_mode;
++	bool temperature_change;
++	bool graphics_device_types;
++};
++
++struct amdgpu_atif {
++	struct amdgpu_atif_notifications notifications;
++	struct amdgpu_atif_functions functions;
++	struct amdgpu_atif_notification_cfg notification_cfg;
++	struct amdgpu_encoder *encoder_for_bl;
++};
++
+ /* Call the ATIF method
+  */
+ /**
+@@ -292,7 +329,7 @@ out:
+ static int amdgpu_atif_handler(struct amdgpu_device *adev,
+ 			struct acpi_bus_event *event)
+ {
+-	struct amdgpu_atif *atif = &adev->atif;
++	struct amdgpu_atif *atif = adev->atif;
+ 	struct atif_sbios_requests req;
+ 	acpi_handle handle;
+ 	int count;
+@@ -303,7 +340,8 @@ static int amdgpu_atif_handler(struct amdgpu_device *adev,
+ 	if (strcmp(event->device_class, ACPI_VIDEO_CLASS) != 0)
+ 		return NOTIFY_DONE;
+ 
+-	if (!atif->notification_cfg.enabled ||
++	if (!atif ||
++	    !atif->notification_cfg.enabled ||
+ 	    event->type != atif->notification_cfg.command_code)
+ 		/* Not our event */
+ 		return NOTIFY_DONE;
+@@ -639,7 +677,7 @@ static int amdgpu_acpi_event(struct notifier_block *nb,
+ int amdgpu_acpi_init(struct amdgpu_device *adev)
+ {
+ 	acpi_handle handle;
+-	struct amdgpu_atif *atif = &adev->atif;
++	struct amdgpu_atif *atif;
+ 	struct amdgpu_atcs *atcs = &adev->atcs;
+ 	int ret;
+ 
+@@ -656,11 +694,19 @@ int amdgpu_acpi_init(struct amdgpu_device *adev)
+ 	}
+ 
+ 	/* Call the ATIF method */
++	atif = kzalloc(sizeof(*atif), GFP_KERNEL);
++	if (!atif) {
++		DRM_WARN("Not enough memory to initialize ATIF\n");
++		goto out;
++	}
++
+ 	ret = amdgpu_atif_verify_interface(handle, atif);
+ 	if (ret) {
+ 		DRM_DEBUG_DRIVER("Call to ATIF verify_interface failed: %d\n", ret);
++		kfree(atif);
+ 		goto out;
+ 	}
++	adev->atif = atif;
+ 
+ 	if (atif->notifications.brightness_change) {
+ 		struct drm_encoder *tmp;
+@@ -717,4 +763,6 @@ out:
+ void amdgpu_acpi_fini(struct amdgpu_device *adev)
+ {
+ 	unregister_acpi_notifier(&adev->acpi_nb);
++	if (adev->atif)
++		kfree(adev->atif);
+ }
