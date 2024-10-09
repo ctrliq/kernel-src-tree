@@ -81,8 +81,7 @@ struct mod_arch_specific {
 #    endif	/* MODULE */
 #endif
 
-bool is_module_trampoline(u32 *insns);
-int module_trampoline_target(struct module *mod, u32 *trampoline,
+int module_trampoline_target(struct module *mod, unsigned long trampoline,
 			     unsigned long *target);
 
 struct exception_table_entry;
