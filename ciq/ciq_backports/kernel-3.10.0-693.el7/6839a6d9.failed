@@ -1,0 +1,204 @@
+nfit: do an ARS scrub on hitting a latent media error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Vishal Verma <vishal.l.verma@intel.com>
+commit 6839a6d96f4ea0254266d60208c1fbbd53ade546
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6839a6d9.failed
+
+When a latent (unknown to 'badblocks') error is encountered, it will
+trigger a machine check exception. On a system with machine check
+recovery, this will only SIGBUS the process(es) which had the bad page
+mapped (as opposed to a kernel panic on platforms without machine
+check recovery features). In the former case, we want to trigger a full
+rescan of that nvdimm bus. This will allow any additional, new errors
+to be captured in the block devices' badblocks lists, and offending
+operations on them can be trapped early, avoiding machine checks.
+
+This is done by registering a callback function with the
+x86_mce_decoder_chain and calling the new ars_rescan functionality with
+the address in the mce notificatiion.
+
+	Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 6839a6d96f4ea0254266d60208c1fbbd53ade546)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/mce.c
+#	drivers/acpi/nfit/Makefile
+#	tools/testing/nvdimm/Kbuild
+diff --cc tools/testing/nvdimm/Kbuild
+index 06718718bdc0,ad6dd0543019..000000000000
+--- a/tools/testing/nvdimm/Kbuild
++++ b/tools/testing/nvdimm/Kbuild
+@@@ -25,8 -26,11 +25,13 @@@ obj-$(CONFIG_ND_BTT) += nd_btt.
+  obj-$(CONFIG_ND_BLK) += nd_blk.o
+  obj-$(CONFIG_X86_PMEM_LEGACY) += nd_e820.o
+  obj-$(CONFIG_ACPI_NFIT) += nfit.o
+ -obj-$(CONFIG_DEV_DAX) += dax.o
+ -obj-$(CONFIG_DEV_DAX_PMEM) += dax_pmem.o
+  
+++<<<<<<< HEAD
+ +nfit-y := $(ACPI_SRC)/nfit.o
+++=======
++ nfit-y := $(ACPI_SRC)/core.o
++ nfit-$(CONFIG_X86_MCE) += $(ACPI_SRC)/mce.o
+++>>>>>>> 6839a6d96f4e (nfit: do an ARS scrub on hitting a latent media error)
+  nfit-y += config_check.o
+  
+  nd_pmem-y := $(NVDIMM_SRC)/pmem.o
+* Unmerged path drivers/acpi/mce.c
+* Unmerged path drivers/acpi/nfit/Makefile
+* Unmerged path drivers/acpi/mce.c
+diff --git a/drivers/acpi/nfit.c b/drivers/acpi/nfit.c
+index 5d0ec979a323..f8818cf8676f 100644
+--- a/drivers/acpi/nfit.c
++++ b/drivers/acpi/nfit.c
+@@ -51,6 +51,9 @@ module_param(disable_vendor_specific, bool, S_IRUGO);
+ MODULE_PARM_DESC(disable_vendor_specific,
+ 		"Limit commands to the publicly specified set\n");
+ 
++LIST_HEAD(acpi_descs);
++DEFINE_MUTEX(acpi_desc_lock);
++
+ static struct workqueue_struct *nfit_wq;
+ 
+ struct nfit_table_prev {
+@@ -361,7 +364,7 @@ static const char *spa_type_name(u16 type)
+ 	return to_name[type];
+ }
+ 
+-static int nfit_spa_type(struct acpi_nfit_system_address *spa)
++int nfit_spa_type(struct acpi_nfit_system_address *spa)
+ {
+ 	int i;
+ 
+@@ -898,8 +901,6 @@ static ssize_t scrub_show(struct device *dev,
+ 	return rc;
+ }
+ 
+-static int acpi_nfit_ars_rescan(struct acpi_nfit_desc *acpi_desc);
+-
+ static ssize_t scrub_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t size)
+ {
+@@ -2397,6 +2398,11 @@ static void acpi_nfit_destruct(void *data)
+ 	struct acpi_nfit_desc *acpi_desc = data;
+ 	struct device *bus_dev = to_nvdimm_bus_dev(acpi_desc->nvdimm_bus);
+ 
++	/*
++	 * Destruct under acpi_desc_lock so that nfit_handle_mce does not
++	 * race teardown
++	 */
++	mutex_lock(&acpi_desc_lock);
+ 	acpi_desc->cancel = 1;
+ 	/*
+ 	 * Bounce the nvdimm bus lock to make sure any in-flight
+@@ -2411,6 +2417,8 @@ static void acpi_nfit_destruct(void *data)
+ 		sysfs_put(acpi_desc->scrub_count_state);
+ 	nvdimm_bus_unregister(acpi_desc->nvdimm_bus);
+ 	acpi_desc->nvdimm_bus = NULL;
++	list_del(&acpi_desc->list);
++	mutex_unlock(&acpi_desc_lock);
+ }
+ 
+ int acpi_nfit_init(struct acpi_nfit_desc *acpi_desc, void *data, acpi_size sz)
+@@ -2436,6 +2444,11 @@ int acpi_nfit_init(struct acpi_nfit_desc *acpi_desc, void *data, acpi_size sz)
+ 		rc = acpi_nfit_desc_init_scrub_attr(acpi_desc);
+ 		if (rc)
+ 			return rc;
++
++		/* register this acpi_desc for mce notifications */
++		mutex_lock(&acpi_desc_lock);
++		list_add_tail(&acpi_desc->list, &acpi_descs);
++		mutex_unlock(&acpi_desc_lock);
+ 	}
+ 
+ 	mutex_lock(&acpi_desc->init_mutex);
+@@ -2546,7 +2559,7 @@ static int acpi_nfit_clear_to_send(struct nvdimm_bus_descriptor *nd_desc,
+ 	return 0;
+ }
+ 
+-static int acpi_nfit_ars_rescan(struct acpi_nfit_desc *acpi_desc)
++int acpi_nfit_ars_rescan(struct acpi_nfit_desc *acpi_desc)
+ {
+ 	struct device *dev = acpi_desc->dev;
+ 	struct nfit_spa *nfit_spa;
+@@ -2595,6 +2608,7 @@ void acpi_nfit_desc_init(struct acpi_nfit_desc *acpi_desc, struct device *dev)
+ 	INIT_LIST_HEAD(&acpi_desc->flushes);
+ 	INIT_LIST_HEAD(&acpi_desc->memdevs);
+ 	INIT_LIST_HEAD(&acpi_desc->dimms);
++	INIT_LIST_HEAD(&acpi_desc->list);
+ 	mutex_init(&acpi_desc->init_mutex);
+ 	INIT_WORK(&acpi_desc->work, acpi_nfit_scrub);
+ }
+@@ -2747,13 +2761,17 @@ static __init int nfit_init(void)
+ 	if (!nfit_wq)
+ 		return -ENOMEM;
+ 
++	nfit_mce_register();
++
+ 	return acpi_bus_register_driver(&acpi_nfit_driver);
+ }
+ 
+ static __exit void nfit_exit(void)
+ {
++	nfit_mce_unregister();
+ 	acpi_bus_unregister_driver(&acpi_nfit_driver);
+ 	destroy_workqueue(nfit_wq);
++	WARN_ON(!list_empty(&acpi_descs));
+ }
+ 
+ module_init(nfit_init);
+diff --git a/drivers/acpi/nfit.h b/drivers/acpi/nfit.h
+index 33fc2e92ca9e..e894ded24d99 100644
+--- a/drivers/acpi/nfit.h
++++ b/drivers/acpi/nfit.h
+@@ -16,6 +16,7 @@
+ #define __NFIT_H__
+ #include <linux/workqueue.h>
+ #include <linux/libnvdimm.h>
++#include <linux/ndctl.h>
+ #include <linux/types.h>
+ #include <linux/uuid.h>
+ #include <linux/acpi.h>
+@@ -148,6 +149,7 @@ struct acpi_nfit_desc {
+ 	struct nd_cmd_ars_status *ars_status;
+ 	size_t ars_status_size;
+ 	struct work_struct work;
++	struct list_head list;
+ 	struct kernfs_node *scrub_count_state;
+ 	unsigned int scrub_count;
+ 	unsigned int cancel:1;
+@@ -187,6 +189,24 @@ struct nfit_blk {
+ 	u32 dimm_flags;
+ };
+ 
++extern struct list_head acpi_descs;
++extern struct mutex acpi_desc_lock;
++int acpi_nfit_ars_rescan(struct acpi_nfit_desc *acpi_desc);
++
++#ifdef CONFIG_X86_MCE
++void nfit_mce_register(void);
++void nfit_mce_unregister(void);
++#else
++static inline void nfit_mce_register(void)
++{
++}
++static inline void nfit_mce_unregister(void)
++{
++}
++#endif
++
++int nfit_spa_type(struct acpi_nfit_system_address *spa);
++
+ static inline struct acpi_nfit_memory_map *__to_nfit_memdev(
+ 		struct nfit_mem *nfit_mem)
+ {
+* Unmerged path drivers/acpi/nfit/Makefile
+* Unmerged path tools/testing/nvdimm/Kbuild
