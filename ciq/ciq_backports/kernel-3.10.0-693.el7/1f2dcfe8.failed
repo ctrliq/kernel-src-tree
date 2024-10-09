@@ -1,0 +1,84 @@
+xfs: xfs_inode_free() isn't RCU safe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 1f2dcfe89edac4e3bf5b76c56f745191f921fd2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1f2dcfe8.failed
+
+The xfs_inode freed in xfs_inode_free() has multiple allocated
+structures attached to it. We free these in xfs_inode_free() before
+we mark the inode as invalid, and before we run call_rcu() to queue
+the structure for freeing.
+
+Unfortunately, this freeing can race with other accesses that are in
+the RCU current grace period that have found the inode in the radix
+tree with a valid state.  This includes xfs_iflush_cluster(), which
+calls xfs_inode_clean(), and that accesses the inode log item on the
+xfs_inode.
+
+The log item structure is freed in xfs_inode_free(), so there is the
+possibility we can be accessing freed memory in xfs_iflush_cluster()
+after validating the xfs_inode structure as being valid for this RCU
+context. Hence we can get spuriously incorrect clean state returned
+from such checks. This can lead to use thinking the inode is dirty
+when it is, in fact, clean, and so incorrectly attaching it to the
+buffer for IO and completion processing.
+
+This then leads to use-after-free situations on the xfs_inode itself
+if the IO completes after the current RCU grace period expires. The
+buffer callbacks will access the xfs_inode and try to do all sorts
+of things it shouldn't with freed memory.
+
+IOWs, xfs_iflush_cluster() only works correctly when racing with
+inode reclaim if the inode log item is present and correctly stating
+the inode is clean. If the inode is being freed, then reclaim has
+already made sure the inode is clean, and hence xfs_iflush_cluster
+can skip it. However, we are accessing the inode inode under RCU
+read lock protection and so also must ensure that all dynamically
+allocated memory we reference in this context is not freed until the
+RCU grace period expires.
+
+To fix this, move all the potential memory freeing into
+xfs_inode_free_callback() so that we are guarantee RCU protected
+lookup code will always have the memory structures it needs
+available during the RCU grace period that lookup races can occur
+in.
+
+Discovered-by: Brain Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 1f2dcfe89edac4e3bf5b76c56f745191f921fd2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_icache.c
+index 68b891ef61bd,0c94cde41016..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -91,14 -94,7 +91,18 @@@ xfs_inode_free_callback
+  	struct inode		*inode = container_of(head, struct inode, i_rcu);
+  	struct xfs_inode	*ip = XFS_I(inode);
+  
+++<<<<<<< HEAD
+ +	kmem_zone_free(xfs_inode_zone, ip);
+ +}
+ +
+ +void
+ +xfs_inode_free(
+ +	struct xfs_inode	*ip)
+ +{
+ +	switch (ip->i_d.di_mode & S_IFMT) {
+++=======
++ 	switch (VFS_I(ip)->i_mode & S_IFMT) {
+++>>>>>>> 1f2dcfe89eda (xfs: xfs_inode_free() isn't RCU safe)
+  	case S_IFREG:
+  	case S_IFDIR:
+  	case S_IFLNK:
+* Unmerged path fs/xfs/xfs_icache.c
