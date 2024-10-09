@@ -1,0 +1,527 @@
+lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [lib] scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 96.24%
+commit-author Ming Lin <ming.l@ssi.samsung.com>
+commit 9b1d6c8950021ab007608d455fc9c398ecd25476
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9b1d6c89.failed
+
+Now it's ready to move the mempool based SG chained allocator code from
+SCSI driver to lib/sg_pool.c, which will be compiled only based on a Kconfig
+symbol CONFIG_SG_POOL.
+
+SCSI selects CONFIG_SG_POOL.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Ming Lin <ming.l@ssi.samsung.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9b1d6c8950021ab007608d455fc9c398ecd25476)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+#	include/scsi/scsi.h
+#	lib/Kconfig
+#	lib/Makefile
+diff --cc drivers/scsi/scsi_lib.c
+index f484f378d9a4,b920c5dabf60..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -40,39 -38,6 +38,42 @@@
+  #include "scsi_logging.h"
+  
+  
+++<<<<<<< HEAD
+ +#define SG_MEMPOOL_NR		ARRAY_SIZE(scsi_sg_pools)
+ +#define SG_MEMPOOL_SIZE		2
+ +
+ +struct scsi_host_sg_pool {
+ +	size_t		size;
+ +	char		*name;
+ +	struct kmem_cache	*slab;
+ +	mempool_t	*pool;
+ +};
+ +
+ +#define SP(x) { .size = x, "sgpool-" __stringify(x) }
+ +#if (SCSI_MAX_SG_SEGMENTS < 32)
+ +#error SCSI_MAX_SG_SEGMENTS is too small (must be 32 or greater)
+ +#endif
+ +static struct scsi_host_sg_pool scsi_sg_pools[] = {
+ +	SP(8),
+ +	SP(16),
+ +#if (SCSI_MAX_SG_SEGMENTS > 32)
+ +	SP(32),
+ +#if (SCSI_MAX_SG_SEGMENTS > 64)
+ +	SP(64),
+ +#if (SCSI_MAX_SG_SEGMENTS > 128)
+ +	SP(128),
+ +#if (SCSI_MAX_SG_SEGMENTS > 256)
+ +#error SCSI_MAX_SG_SEGMENTS is too large (256 MAX)
+ +#endif
+ +#endif
+ +#endif
+ +#endif
+ +	SP(SCSI_MAX_SG_SEGMENTS)
+ +};
+ +#undef SP
+ +
+++=======
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+  struct kmem_cache *scsi_sdb_cache;
+  
+  /*
+@@@ -564,67 -518,6 +565,70 @@@ void scsi_run_host_queues(struct Scsi_H
+  		scsi_run_queue(sdev->request_queue);
+  }
+  
+++<<<<<<< HEAD
+ +static inline unsigned int scsi_sgtable_index(unsigned short nents)
+ +{
+ +	unsigned int index;
+ +
+ +	BUG_ON(nents > SCSI_MAX_SG_SEGMENTS);
+ +
+ +	if (nents <= 8)
+ +		index = 0;
+ +	else
+ +		index = get_count_order(nents) - 3;
+ +
+ +	return index;
+ +}
+ +
+ +static void scsi_sg_free(struct scatterlist *sgl, unsigned int nents)
+ +{
+ +	struct scsi_host_sg_pool *sgp;
+ +
+ +	sgp = scsi_sg_pools + scsi_sgtable_index(nents);
+ +	mempool_free(sgl, sgp->pool);
+ +}
+ +
+ +static struct scatterlist *scsi_sg_alloc(unsigned int nents, gfp_t gfp_mask)
+ +{
+ +	struct scsi_host_sg_pool *sgp;
+ +
+ +	sgp = scsi_sg_pools + scsi_sgtable_index(nents);
+ +	return mempool_alloc(sgp->pool, gfp_mask);
+ +}
+ +
+ +static void scsi_free_sgtable(struct scsi_data_buffer *sdb, bool mq)
+ +{
+ +	if (mq && sdb->table.orig_nents <= SCSI_MAX_SG_SEGMENTS)
+ +		return;
+ +	__sg_free_table(&sdb->table, SCSI_MAX_SG_SEGMENTS, mq, scsi_sg_free);
+ +}
+ +
+ +static int scsi_alloc_sgtable(struct scsi_data_buffer *sdb, int nents,
+ +			      gfp_t gfp_mask, bool mq)
+ +{
+ +	struct scatterlist *first_chunk = NULL;
+ +	int ret;
+ +
+ +	BUG_ON(!nents);
+ +
+ +	if (mq) {
+ +		if (nents <= SCSI_MAX_SG_SEGMENTS) {
+ +			sdb->table.nents = sdb->table.orig_nents = nents;
+ +			sg_init_table(sdb->table.sgl, nents);
+ +			return 0;
+ +		}
+ +		first_chunk = sdb->table.sgl;
+ +	}
+ +
+ +	ret = __sg_alloc_table(&sdb->table, nents, SCSI_MAX_SG_SEGMENTS,
+ +			       first_chunk, gfp_mask, scsi_sg_alloc);
+ +	if (unlikely(ret))
+ +		scsi_free_sgtable(sdb, mq);
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+  static void scsi_uninit_cmd(struct scsi_cmnd *cmd)
+  {
+  	if (cmd->request->cmd_type == REQ_TYPE_FS) {
+@@@ -2208,53 -2183,12 +2210,58 @@@ int __init scsi_init_queue(void
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < SG_MEMPOOL_NR; i++) {
+ +		struct scsi_host_sg_pool *sgp = scsi_sg_pools + i;
+ +		int size = sgp->size * sizeof(struct scatterlist);
+ +
+ +		sgp->slab = kmem_cache_create(sgp->name, size, 0,
+ +				SLAB_HWCACHE_ALIGN, NULL);
+ +		if (!sgp->slab) {
+ +			printk(KERN_ERR "SCSI: can't init sg slab %s\n",
+ +					sgp->name);
+ +			goto cleanup_sdb;
+ +		}
+ +
+ +		sgp->pool = mempool_create_slab_pool(SG_MEMPOOL_SIZE,
+ +						     sgp->slab);
+ +		if (!sgp->pool) {
+ +			printk(KERN_ERR "SCSI: can't init sg mempool %s\n",
+ +					sgp->name);
+ +			goto cleanup_sdb;
+ +		}
+ +	}
+ +
+ +	return 0;
+ +
+ +cleanup_sdb:
+ +	for (i = 0; i < SG_MEMPOOL_NR; i++) {
+ +		struct scsi_host_sg_pool *sgp = scsi_sg_pools + i;
+ +		if (sgp->pool)
+ +			mempool_destroy(sgp->pool);
+ +		if (sgp->slab)
+ +			kmem_cache_destroy(sgp->slab);
+ +	}
+ +	kmem_cache_destroy(scsi_sdb_cache);
+ +
+ +	return -ENOMEM;
+++=======
++ 	return 0;
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+  }
+  
+  void scsi_exit_queue(void)
+  {
+- 	int i;
+- 
+  	kmem_cache_destroy(scsi_sdb_cache);
+++<<<<<<< HEAD
+ +
+ +	for (i = 0; i < SG_MEMPOOL_NR; i++) {
+ +		struct scsi_host_sg_pool *sgp = scsi_sg_pools + i;
+ +		mempool_destroy(sgp->pool);
+ +		kmem_cache_destroy(sgp->slab);
+ +	}
+++=======
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+  }
+  
+  /**
+diff --cc include/scsi/scsi.h
+index b351ddee7cb0,8ec7c30e35af..000000000000
+--- a/include/scsi/scsi.h
++++ b/include/scsi/scsi.h
+@@@ -19,25 -18,6 +19,28 @@@ enum scsi_timeouts 
+  };
+  
+  /*
+++<<<<<<< HEAD
+ + * The maximum number of SG segments that we will put inside a
+ + * scatterlist (unless chaining is used). Should ideally fit inside a
+ + * single page, to avoid a higher order allocation.  We could define this
+ + * to SG_MAX_SINGLE_ALLOC to pack correctly at the highest order.  The
+ + * minimum value is 32
+ + */
+ +#define SCSI_MAX_SG_SEGMENTS	128
+ +
+ +/*
+ + * Like SCSI_MAX_SG_SEGMENTS, but for archs that have sg chaining. This limit
+ + * is totally arbitrary, a setting of 2048 will get you at least 8mb ios.
+ + */
+ +#ifdef ARCH_HAS_SG_CHAIN
+ +#define SCSI_MAX_SG_CHAIN_SEGMENTS	2048
+ +#else
+ +#define SCSI_MAX_SG_CHAIN_SEGMENTS	SCSI_MAX_SG_SEGMENTS
+ +#endif
+ +
+ +/*
+++=======
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+   * DIX-capable adapters effectively support infinite chaining for the
+   * protection information scatterlist
+   */
+diff --cc lib/Kconfig
+index 0816c2d36af0,61d55bd0ed89..000000000000
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@@ -468,6 -514,29 +468,32 @@@ config OID_REGISTR
+  config UCS2_STRING
+          tristate
+  
+++<<<<<<< HEAD
+++=======
++ source "lib/fonts/Kconfig"
++ 
++ config SG_SPLIT
++ 	def_bool n
++ 	help
++ 	 Provides a helper to split scatterlists into chunks, each chunk being
++ 	 a scatterlist. This should be selected by a driver or an API which
++ 	 whishes to split a scatterlist amongst multiple DMA channels.
++ 
++ config SG_POOL
++ 	def_bool n
++ 	help
++ 	 Provides a helper to allocate chained scatterlists. This should be
++ 	 selected by a driver or an API which whishes to allocate chained
++ 	 scatterlist.
++ 
++ #
++ # sg chaining option
++ #
++ 
++ config ARCH_HAS_SG_CHAIN
++ 	def_bool n
++ 
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+  config ARCH_HAS_PMEM_API
+  	bool
+  
+diff --cc lib/Makefile
+index d13989fc6bb1,bf01c2673423..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -145,6 -175,10 +145,13 @@@ obj-$(CONFIG_DDR) += jedec_ddr_data.
+  obj-$(CONFIG_GENERIC_STRNCPY_FROM_USER) += strncpy_from_user.o
+  obj-$(CONFIG_GENERIC_STRNLEN_USER) += strnlen_user.o
+  
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_GENERIC_NET_UTILS) += net_utils.o
++ 
++ obj-$(CONFIG_SG_SPLIT) += sg_split.o
++ obj-$(CONFIG_SG_POOL) += sg_pool.o
+++>>>>>>> 9b1d6c895002 (lib: scatterlist: move SG pool code from SCSI driver to lib/sg_pool.c)
+  obj-$(CONFIG_STMP_DEVICE) += stmp_device.o
+  obj-$(CONFIG_IRQ_POLL) += irq_poll.o
+  
+diff --git a/drivers/scsi/Kconfig b/drivers/scsi/Kconfig
+index 41566af3fa97..ee4d64412424 100644
+--- a/drivers/scsi/Kconfig
++++ b/drivers/scsi/Kconfig
+@@ -17,6 +17,7 @@ config SCSI
+ 	tristate "SCSI device support"
+ 	depends on BLOCK
+ 	select SCSI_DMA if HAS_DMA
++	select SG_POOL
+ 	---help---
+ 	  If you want to use a SCSI hard disk, SCSI tape drive, SCSI CD-ROM or
+ 	  any other SCSI device under Linux, say Y and make sure that you know
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/include/linux/scatterlist.h b/include/linux/scatterlist.h
+index 677fd27818d9..9a2108aa2571 100644
+--- a/include/linux/scatterlist.h
++++ b/include/linux/scatterlist.h
+@@ -259,6 +259,31 @@ size_t sg_pcopy_to_buffer(struct scatterlist *sgl, unsigned int nents,
+  */
+ #define SG_MAX_SINGLE_ALLOC		(PAGE_SIZE / sizeof(struct scatterlist))
+ 
++/*
++ * The maximum number of SG segments that we will put inside a
++ * scatterlist (unless chaining is used). Should ideally fit inside a
++ * single page, to avoid a higher order allocation.  We could define this
++ * to SG_MAX_SINGLE_ALLOC to pack correctly at the highest order.  The
++ * minimum value is 32
++ */
++#define SG_CHUNK_SIZE	128
++
++/*
++ * Like SG_CHUNK_SIZE, but for archs that have sg chaining. This limit
++ * is totally arbitrary, a setting of 2048 will get you at least 8mb ios.
++ */
++#ifdef CONFIG_ARCH_HAS_SG_CHAIN
++#define SG_MAX_SEGMENTS	2048
++#else
++#define SG_MAX_SEGMENTS	SG_CHUNK_SIZE
++#endif
++
++#ifdef CONFIG_SG_POOL
++void sg_free_table_chained(struct sg_table *table, bool first_chunk);
++int sg_alloc_table_chained(struct sg_table *table, int nents,
++			   struct scatterlist *first_chunk);
++#endif
++
+ /*
+  * sg page iterator
+  *
+* Unmerged path include/scsi/scsi.h
+* Unmerged path lib/Kconfig
+* Unmerged path lib/Makefile
+diff --git a/lib/sg_pool.c b/lib/sg_pool.c
+new file mode 100644
+index 000000000000..6dd30615a201
+--- /dev/null
++++ b/lib/sg_pool.c
+@@ -0,0 +1,172 @@
++#include <linux/module.h>
++#include <linux/scatterlist.h>
++#include <linux/mempool.h>
++#include <linux/slab.h>
++
++#define SG_MEMPOOL_NR		ARRAY_SIZE(sg_pools)
++#define SG_MEMPOOL_SIZE		2
++
++struct sg_pool {
++	size_t		size;
++	char		*name;
++	struct kmem_cache	*slab;
++	mempool_t	*pool;
++};
++
++#define SP(x) { .size = x, "sgpool-" __stringify(x) }
++#if (SG_CHUNK_SIZE < 32)
++#error SG_CHUNK_SIZE is too small (must be 32 or greater)
++#endif
++static struct sg_pool sg_pools[] = {
++	SP(8),
++	SP(16),
++#if (SG_CHUNK_SIZE > 32)
++	SP(32),
++#if (SG_CHUNK_SIZE > 64)
++	SP(64),
++#if (SG_CHUNK_SIZE > 128)
++	SP(128),
++#if (SG_CHUNK_SIZE > 256)
++#error SG_CHUNK_SIZE is too large (256 MAX)
++#endif
++#endif
++#endif
++#endif
++	SP(SG_CHUNK_SIZE)
++};
++#undef SP
++
++static inline unsigned int sg_pool_index(unsigned short nents)
++{
++	unsigned int index;
++
++	BUG_ON(nents > SG_CHUNK_SIZE);
++
++	if (nents <= 8)
++		index = 0;
++	else
++		index = get_count_order(nents) - 3;
++
++	return index;
++}
++
++static void sg_pool_free(struct scatterlist *sgl, unsigned int nents)
++{
++	struct sg_pool *sgp;
++
++	sgp = sg_pools + sg_pool_index(nents);
++	mempool_free(sgl, sgp->pool);
++}
++
++static struct scatterlist *sg_pool_alloc(unsigned int nents, gfp_t gfp_mask)
++{
++	struct sg_pool *sgp;
++
++	sgp = sg_pools + sg_pool_index(nents);
++	return mempool_alloc(sgp->pool, gfp_mask);
++}
++
++/**
++ * sg_free_table_chained - Free a previously mapped sg table
++ * @table:	The sg table header to use
++ * @first_chunk: was first_chunk not NULL in sg_alloc_table_chained?
++ *
++ *  Description:
++ *    Free an sg table previously allocated and setup with
++ *    sg_alloc_table_chained().
++ *
++ **/
++void sg_free_table_chained(struct sg_table *table, bool first_chunk)
++{
++	if (first_chunk && table->orig_nents <= SG_CHUNK_SIZE)
++		return;
++	__sg_free_table(table, SG_CHUNK_SIZE, first_chunk, sg_pool_free);
++}
++EXPORT_SYMBOL_GPL(sg_free_table_chained);
++
++/**
++ * sg_alloc_table_chained - Allocate and chain SGLs in an sg table
++ * @table:	The sg table header to use
++ * @nents:	Number of entries in sg list
++ * @first_chunk: first SGL
++ *
++ *  Description:
++ *    Allocate and chain SGLs in an sg table. If @nents@ is larger than
++ *    SG_CHUNK_SIZE a chained sg table will be setup.
++ *
++ **/
++int sg_alloc_table_chained(struct sg_table *table, int nents,
++		struct scatterlist *first_chunk)
++{
++	int ret;
++
++	BUG_ON(!nents);
++
++	if (first_chunk) {
++		if (nents <= SG_CHUNK_SIZE) {
++			table->nents = table->orig_nents = nents;
++			sg_init_table(table->sgl, nents);
++			return 0;
++		}
++	}
++
++	ret = __sg_alloc_table(table, nents, SG_CHUNK_SIZE,
++			       first_chunk, GFP_ATOMIC, sg_pool_alloc);
++	if (unlikely(ret))
++		sg_free_table_chained(table, (bool)first_chunk);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sg_alloc_table_chained);
++
++static __init int sg_pool_init(void)
++{
++	int i;
++
++	for (i = 0; i < SG_MEMPOOL_NR; i++) {
++		struct sg_pool *sgp = sg_pools + i;
++		int size = sgp->size * sizeof(struct scatterlist);
++
++		sgp->slab = kmem_cache_create(sgp->name, size, 0,
++				SLAB_HWCACHE_ALIGN, NULL);
++		if (!sgp->slab) {
++			printk(KERN_ERR "SG_POOL: can't init sg slab %s\n",
++					sgp->name);
++			goto cleanup_sdb;
++		}
++
++		sgp->pool = mempool_create_slab_pool(SG_MEMPOOL_SIZE,
++						     sgp->slab);
++		if (!sgp->pool) {
++			printk(KERN_ERR "SG_POOL: can't init sg mempool %s\n",
++					sgp->name);
++			goto cleanup_sdb;
++		}
++	}
++
++	return 0;
++
++cleanup_sdb:
++	for (i = 0; i < SG_MEMPOOL_NR; i++) {
++		struct sg_pool *sgp = sg_pools + i;
++		if (sgp->pool)
++			mempool_destroy(sgp->pool);
++		if (sgp->slab)
++			kmem_cache_destroy(sgp->slab);
++	}
++
++	return -ENOMEM;
++}
++
++static __exit void sg_pool_exit(void)
++{
++	int i;
++
++	for (i = 0; i < SG_MEMPOOL_NR; i++) {
++		struct sg_pool *sgp = sg_pools + i;
++		mempool_destroy(sgp->pool);
++		kmem_cache_destroy(sgp->slab);
++	}
++}
++
++module_init(sg_pool_init);
++module_exit(sg_pool_exit);
