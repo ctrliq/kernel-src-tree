@@ -1,0 +1,269 @@
+vmbus: use kernel bitops for traversing interrupt mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit 5c1bec61fdfcd056df909a712e2a86bbaeb0f942
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5c1bec61.failed
+
+Use standard kernel operations for find first set bit to traverse
+the channel bit array. This has added benefit of speeding up
+lookup on 64 bit and because it uses find first set instruction.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5c1bec61fdfcd056df909a712e2a86bbaeb0f942)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hyperv_vmbus.h
+diff --cc drivers/hv/hyperv_vmbus.h
+index 0a18ee8b2bc8,2749a4142889..000000000000
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@@ -40,95 -40,9 +40,101 @@@
+   */
+  #define HV_UTIL_NEGO_TIMEOUT 55
+  
+++<<<<<<< HEAD
+ +/*
+ + * The below CPUID leaves are present if VersionAndFeatures.HypervisorPresent
+ + * is set by CPUID(HVCPUID_VERSION_FEATURES).
+ + */
+ +enum hv_cpuid_function {
+ +	HVCPUID_VERSION_FEATURES		= 0x00000001,
+ +	HVCPUID_VENDOR_MAXFUNCTION		= 0x40000000,
+ +	HVCPUID_INTERFACE			= 0x40000001,
+ +
+ +	/*
+ +	 * The remaining functions depend on the value of
+ +	 * HVCPUID_INTERFACE
+ +	 */
+ +	HVCPUID_VERSION			= 0x40000002,
+ +	HVCPUID_FEATURES			= 0x40000003,
+ +	HVCPUID_ENLIGHTENMENT_INFO	= 0x40000004,
+ +	HVCPUID_IMPLEMENTATION_LIMITS		= 0x40000005,
+ +};
+ +
+ +#define  HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE   0x400
+ +
+ +#define HV_X64_MSR_CRASH_P0   0x40000100
+ +#define HV_X64_MSR_CRASH_P1   0x40000101
+ +#define HV_X64_MSR_CRASH_P2   0x40000102
+ +#define HV_X64_MSR_CRASH_P3   0x40000103
+ +#define HV_X64_MSR_CRASH_P4   0x40000104
+ +#define HV_X64_MSR_CRASH_CTL  0x40000105
+ +
+ +#define HV_CRASH_CTL_CRASH_NOTIFY (1ULL << 63)
+ +
+ +/* Define version of the synthetic interrupt controller. */
+ +#define HV_SYNIC_VERSION		(1)
+ +
+ +#define HV_ANY_VP			(0xFFFFFFFF)
+ +
+ +/* Define synthetic interrupt controller flag constants. */
+ +#define HV_EVENT_FLAGS_COUNT		(256 * 8)
+ +#define HV_EVENT_FLAGS_BYTE_COUNT	(256)
+ +#define HV_EVENT_FLAGS_DWORD_COUNT	(256 / sizeof(u32))
+++=======
++ /* Define synthetic interrupt controller flag constants. */
++ #define HV_EVENT_FLAGS_COUNT		(256 * 8)
++ #define HV_EVENT_FLAGS_LONG_COUNT	(256 / sizeof(unsigned long))
+++>>>>>>> 5c1bec61fdfc (vmbus: use kernel bitops for traversing interrupt mask)
+ +
+ +/* Define invalid partition identifier. */
+ +#define HV_PARTITION_ID_INVALID		((u64)0x0)
+ +
+ +/* Define port type. */
+ +enum hv_port_type {
+ +	HVPORT_MSG	= 1,
+ +	HVPORT_EVENT		= 2,
+ +	HVPORT_MONITOR	= 3
+ +};
+ +
+ +/* Define port information structure. */
+ +struct hv_port_info {
+ +	enum hv_port_type port_type;
+ +	u32 padding;
+ +	union {
+ +		struct {
+ +			u32 target_sint;
+ +			u32 target_vp;
+ +			u64 rsvdz;
+ +		} message_port_info;
+ +		struct {
+ +			u32 target_sint;
+ +			u32 target_vp;
+ +			u16 base_flag_number;
+ +			u16 flag_count;
+ +			u32 rsvdz;
+ +		} event_port_info;
+ +		struct {
+ +			u64 monitor_address;
+ +			u64 rsvdz;
+ +		} monitor_port_info;
+ +	};
+ +};
+ +
+ +struct hv_connection_info {
+ +	enum hv_port_type port_type;
+ +	u32 padding;
+ +	union {
+ +		struct {
+ +			u64 rsvdz;
+ +		} message_connection_info;
+ +		struct {
+ +			u64 rsvdz;
+ +		} event_connection_info;
+ +		struct {
+ +			u64 monitor_address;
+ +		} monitor_connection_info;
+ +	};
+ +};
+  
+  /*
+   * Timer configuration register.
+@@@ -151,15 -63,9 +157,14 @@@ union hv_timer_config 
+  
+  /* Define the synthetic interrupt controller event flags format. */
+  union hv_synic_event_flags {
+- 	u8 flags8[HV_EVENT_FLAGS_BYTE_COUNT];
+- 	u32 flags32[HV_EVENT_FLAGS_DWORD_COUNT];
++ 	unsigned long flags[HV_EVENT_FLAGS_LONG_COUNT];
+  };
+  
+ +/* Define the synthetic interrupt flags page layout. */
+ +struct hv_synic_event_flags_page {
+ +	union hv_synic_event_flags sintevent_flags[HV_SYNIC_SINT_COUNT];
+ +};
+ +
+  /* Define SynIC control register. */
+  union hv_synic_scontrol {
+  	u64 as_uint64;
+diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
+index d5b8d9fd50bb..32e698781319 100644
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -47,12 +47,8 @@ void vmbus_setevent(struct vmbus_channel *channel)
+ 	 * For channels marked as in "low latency" mode
+ 	 * bypass the monitor page mechanism.
+ 	 */
+-	if ((channel->offermsg.monitor_allocated) &&
+-	    (!channel->low_latency)) {
+-		/* Each u32 represents 32 channels */
+-		sync_set_bit(channel->offermsg.child_relid & 31,
+-			(unsigned long *) vmbus_connection.send_int_page +
+-			(channel->offermsg.child_relid >> 5));
++	if (channel->offermsg.monitor_allocated && !channel->low_latency) {
++		vmbus_send_interrupt(channel->offermsg.child_relid);
+ 
+ 		/* Get the child to parent monitor page */
+ 		monitorpage = vmbus_connection.monitor_pages[1];
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+index 9b72ebcd37bc..fd5bd89f0dfe 100644
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -382,17 +382,11 @@ static void process_chn_event(u32 relid)
+  */
+ void vmbus_on_event(unsigned long data)
+ {
+-	u32 dword;
+-	u32 maxdword;
+-	int bit;
+-	u32 relid;
+-	u32 *recv_int_page = NULL;
+-	void *page_addr;
+-	int cpu = smp_processor_id();
+-	union hv_synic_event_flags *event;
++	unsigned long *recv_int_page;
++	u32 maxbits, relid;
+ 
+ 	if (vmbus_proto_version < VERSION_WIN8) {
+-		maxdword = MAX_NUM_CHANNELS_SUPPORTED >> 5;
++		maxbits = MAX_NUM_CHANNELS_SUPPORTED;
+ 		recv_int_page = vmbus_connection.recv_int_page;
+ 	} else {
+ 		/*
+@@ -400,35 +394,24 @@ void vmbus_on_event(unsigned long data)
+ 		 * can be directly checked to get the id of the channel
+ 		 * that has the interrupt pending.
+ 		 */
+-		maxdword = HV_EVENT_FLAGS_DWORD_COUNT;
+-		page_addr = hv_context.synic_event_page[cpu];
+-		event = (union hv_synic_event_flags *)page_addr +
++		int cpu = smp_processor_id();
++		void *page_addr = hv_context.synic_event_page[cpu];
++		union hv_synic_event_flags *event
++			= (union hv_synic_event_flags *)page_addr +
+ 						 VMBUS_MESSAGE_SINT;
+-		recv_int_page = event->flags32;
+-	}
+-
+ 
++		maxbits = HV_EVENT_FLAGS_COUNT;
++		recv_int_page = event->flags;
++	}
+ 
+-	/* Check events */
+-	if (!recv_int_page)
++	if (unlikely(!recv_int_page))
+ 		return;
+-	for (dword = 0; dword < maxdword; dword++) {
+-		if (!recv_int_page[dword])
+-			continue;
+-		for (bit = 0; bit < 32; bit++) {
+-			if (sync_test_and_clear_bit(bit,
+-				(unsigned long *)&recv_int_page[dword])) {
+-				relid = (dword << 5) + bit;
+-
+-				if (relid == 0)
+-					/*
+-					 * Special case - vmbus
+-					 * channel protocol msg
+-					 */
+-					continue;
+ 
++	for_each_set_bit(relid, recv_int_page, maxbits) {
++		if (sync_test_and_clear_bit(relid, recv_int_page)) {
++			/* Special case - vmbus channel protocol msg */
++			if (relid != 0)
+ 				process_chn_event(relid);
+-			}
+ 		}
+ 	}
+ }
+@@ -494,12 +477,8 @@ void vmbus_set_event(struct vmbus_channel *channel)
+ {
+ 	u32 child_relid = channel->offermsg.child_relid;
+ 
+-	if (!channel->is_dedicated_interrupt) {
+-		/* Each u32 represents 32 channels */
+-		sync_set_bit(child_relid & 31,
+-			(unsigned long *)vmbus_connection.send_int_page +
+-			(child_relid >> 5));
+-	}
++	if (!channel->is_dedicated_interrupt)
++		vmbus_send_interrupt(child_relid);
+ 
+ 	hv_do_hypercall(HVCALL_SIGNAL_EVENT, channel->sig_event, NULL);
+ }
+* Unmerged path drivers/hv/hyperv_vmbus.h
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 4aa498db4703..b3813ee39a7a 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -939,10 +939,8 @@ static void vmbus_isr(void)
+ 		(vmbus_proto_version == VERSION_WIN7)) {
+ 
+ 		/* Since we are a child, we only need to check bit 0 */
+-		if (sync_test_and_clear_bit(0,
+-			(unsigned long *) &event->flags32[0])) {
++		if (sync_test_and_clear_bit(0, event->flags))
+ 			handled = true;
+-		}
+ 	} else {
+ 		/*
+ 		 * Our host is win8 or above. The signaling mechanism
