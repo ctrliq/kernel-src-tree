@@ -1,0 +1,133 @@
+nvmet_fc: support target port removal with nvmet layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit ea96d6496ff59b2b26dc9e13dc8f57d77731eb37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ea96d649.failed
+
+Currently, if a targetport has been connected to via the nvmet config
+(in other words, the add_port() transport routine called, and the nvmet
+port pointer stored for using in upcalls on new io), and if the
+targetport is then removed (say the lldd driver decides to unload or
+fully reset its hardware) and then re-added (the lldd driver reloads or
+reinits its hardware), the port pointer has been lost so there's no way
+to continue to post commands up to nvmet via the transport port.
+
+Correct by allocating a small "port context" structure that will be
+linked to by the targetport. The context will save the targetport WWN's
+and the nvmet port pointer to use for it.  Initial allocation will occur
+when the targetport is bound to via add_port.  The context will be
+deallocated when remove_port() is called.  If a targetport is removed
+while nvmet has the active port context, the targetport will be unlinked
+from the port context before removal.  If a new targetport is registered,
+the port contexts without a binding are looked through and if the WWN's
+match (so it's the same as nvmet's port context) the port context is
+linked to the new target port.  Thus new io can be received on the new
+targetport and operation resumes with nvmet.
+
+Additionally, this also resolves nvmet configuration changing out from
+underneath of the nvme-fc target port (for example: a nvmetcli clear).
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit ea96d6496ff59b2b26dc9e13dc8f57d77731eb37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/fc.c
+diff --cc drivers/nvme/target/fc.c
+index 60b018439173,ef286b72d958..000000000000
+--- a/drivers/nvme/target/fc.c
++++ b/drivers/nvme/target/fc.c
+@@@ -957,7 -964,83 +964,87 @@@ nvmet_fc_find_target_assoc(struct nvmet
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +bool tech_preview_warning_issued = false;
+++=======
++ static void
++ nvmet_fc_portentry_bind(struct nvmet_fc_tgtport *tgtport,
++ 			struct nvmet_fc_port_entry *pe,
++ 			struct nvmet_port *port)
++ {
++ 	lockdep_assert_held(&nvmet_fc_tgtlock);
++ 
++ 	pe->tgtport = tgtport;
++ 	tgtport->pe = pe;
++ 
++ 	pe->port = port;
++ 	port->priv = pe;
++ 
++ 	pe->node_name = tgtport->fc_target_port.node_name;
++ 	pe->port_name = tgtport->fc_target_port.port_name;
++ 	INIT_LIST_HEAD(&pe->pe_list);
++ 
++ 	list_add_tail(&pe->pe_list, &nvmet_fc_portentry_list);
++ }
++ 
++ static void
++ nvmet_fc_portentry_unbind(struct nvmet_fc_port_entry *pe)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&nvmet_fc_tgtlock, flags);
++ 	if (pe->tgtport)
++ 		pe->tgtport->pe = NULL;
++ 	list_del(&pe->pe_list);
++ 	spin_unlock_irqrestore(&nvmet_fc_tgtlock, flags);
++ }
++ 
++ /*
++  * called when a targetport deregisters. Breaks the relationship
++  * with the nvmet port, but leaves the port_entry in place so that
++  * re-registration can resume operation.
++  */
++ static void
++ nvmet_fc_portentry_unbind_tgt(struct nvmet_fc_tgtport *tgtport)
++ {
++ 	struct nvmet_fc_port_entry *pe;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&nvmet_fc_tgtlock, flags);
++ 	pe = tgtport->pe;
++ 	if (pe)
++ 		pe->tgtport = NULL;
++ 	tgtport->pe = NULL;
++ 	spin_unlock_irqrestore(&nvmet_fc_tgtlock, flags);
++ }
++ 
++ /*
++  * called when a new targetport is registered. Looks in the
++  * existing nvmet port_entries to see if the nvmet layer is
++  * configured for the targetport's wwn's. (the targetport existed,
++  * nvmet configured, the lldd unregistered the tgtport, and is now
++  * reregistering the same targetport).  If so, set the nvmet port
++  * port entry on the targetport.
++  */
++ static void
++ nvmet_fc_portentry_rebind_tgt(struct nvmet_fc_tgtport *tgtport)
++ {
++ 	struct nvmet_fc_port_entry *pe;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&nvmet_fc_tgtlock, flags);
++ 	list_for_each_entry(pe, &nvmet_fc_portentry_list, pe_list) {
++ 		if (tgtport->fc_target_port.node_name == pe->node_name &&
++ 		    tgtport->fc_target_port.port_name == pe->port_name) {
++ 			WARN_ON(pe->tgtport);
++ 			tgtport->pe = pe;
++ 			pe->tgtport = tgtport;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&nvmet_fc_tgtlock, flags);
++ }
+++>>>>>>> ea96d6496ff5 (nvmet_fc: support target port removal with nvmet layer)
+  
+  /**
+   * nvme_fc_register_targetport - transport entry point called by an
+* Unmerged path drivers/nvme/target/fc.c
