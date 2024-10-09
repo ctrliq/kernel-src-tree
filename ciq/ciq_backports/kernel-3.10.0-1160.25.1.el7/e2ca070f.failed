@@ -1,0 +1,122 @@
+net: sched: protect against stack overflow in TC act_mirred
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.25.1.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit e2ca070f89ecd983bd98e05d936a678a4151f2fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.25.1.el7/e2ca070f.failed
+
+TC hooks allow the application of filters and actions to packets at both
+ingress and egress of the network stack. It is possible, with poor
+configuration, that this can produce loops whereby an ingress hook calls
+a mirred egress action that has an egress hook that redirects back to
+the first ingress etc. The TC core classifier protects against loops when
+doing reclassifies but there is no protection against a packet looping
+between multiple hooks and recursively calling act_mirred. This can lead
+to stack overflow panics.
+
+Add a per CPU counter to act_mirred that is incremented for each recursive
+call of the action function when processing a packet. If a limit is passed
+then the packet is dropped and CPU counter reset.
+
+Note that this patch does not protect against loops in TC datapaths. Its
+aim is to prevent stack overflow kernel panics that can be a consequence
+of such loops.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e2ca070f89ecd983bd98e05d936a678a4151f2fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_mirred.c
+diff --cc net/sched/act_mirred.c
+index a9fbe0aab3ce,c3fce36633b2..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -153,16 -198,26 +156,20 @@@ static int tcf_mirred_init(struct net *
+  	}
+  
+  	return ret;
+ -put_chain:
+ -	if (goto_ch)
+ -		tcf_chain_put_by_act(goto_ch);
+ -release_idr:
+ -	tcf_idr_release(*a, bind);
+ -	return err;
+  }
+  
+ -static int tcf_mirred_act(struct sk_buff *skb, const struct tc_action *a,
+ -			  struct tcf_result *res)
+ +static int tcf_mirred(struct sk_buff *skb, const struct tc_action *a,
+ +		      struct tcf_result *res)
+  {
+  	struct tcf_mirred *m = to_mirred(a);
+ -	struct sk_buff *skb2 = skb;
+  	bool m_mac_header_xmit;
+  	struct net_device *dev;
+++<<<<<<< HEAD
+ +	struct sk_buff *skb2;
+++=======
++ 	unsigned int rec_level;
+++>>>>>>> e2ca070f89ec (net: sched: protect against stack overflow in TC act_mirred)
+  	int retval, err = 0;
+ -	bool use_reinsert;
+ -	bool want_ingress;
+ -	bool is_redirect;
+  	int m_eaction;
+  	int mac_len;
+  
+@@@ -205,15 -276,26 +220,36 @@@
+  		}
+  	}
+  
+ +	/* mirror is always swallowed */
+ +	if (tcf_mirred_is_act_redirect(m_eaction))
+ +		skb2->tc_verd = SET_TC_FROM(skb2->tc_verd,
+ +					    skb_at_tc_ingress(skb) ?
+ +					    AT_INGRESS : AT_EGRESS);
+ +
+  	skb2->skb_iif = skb->dev->ifindex;
+  	skb2->dev = dev;
+++<<<<<<< HEAD
+ +	if (!tcf_mirred_act_wants_ingress(m_eaction))
+++=======
++ 
++ 	/* mirror is always swallowed */
++ 	if (is_redirect) {
++ 		skb2->tc_redirected = 1;
++ 		skb2->tc_from_ingress = skb2->tc_at_ingress;
++ 		if (skb2->tc_from_ingress)
++ 			skb2->tstamp = 0;
++ 		/* let's the caller reinsert the packet, if possible */
++ 		if (use_reinsert) {
++ 			res->ingress = want_ingress;
++ 			res->qstats = this_cpu_ptr(m->common.cpu_qstats);
++ 			skb_tc_reinsert(skb, res);
++ 			__this_cpu_dec(mirred_rec_level);
++ 			return TC_ACT_CONSUMED;
++ 		}
++ 	}
++ 
++ 	if (!want_ingress)
+++>>>>>>> e2ca070f89ec (net: sched: protect against stack overflow in TC act_mirred)
+  		err = dev_queue_xmit(skb2);
+  	else
+  		err = netif_receive_skb(skb2);
+@@@ -224,7 -306,7 +260,11 @@@ out
+  		if (tcf_mirred_is_act_redirect(m_eaction))
+  			retval = TC_ACT_SHOT;
+  	}
+++<<<<<<< HEAD
+ +	rcu_read_unlock();
+++=======
++ 	__this_cpu_dec(mirred_rec_level);
+++>>>>>>> e2ca070f89ec (net: sched: protect against stack overflow in TC act_mirred)
+  
+  	return retval;
+  }
+* Unmerged path net/sched/act_mirred.c
