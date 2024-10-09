@@ -1,0 +1,341 @@
+xfs: pull up iolock from xfs_free_eofblocks()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit a36b926180cda375ac2ec89e1748b47137cfc51c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a36b9261.failed
+
+xfs_free_eofblocks() requires the IOLOCK_EXCL lock, but is called from
+different contexts where the lock may or may not be held. The
+need_iolock parameter exists for this reason, to indicate whether
+xfs_free_eofblocks() must acquire the iolock itself before it can
+proceed.
+
+This is ugly and confusing. Simplify the semantics of
+xfs_free_eofblocks() to require the caller to acquire the iolock
+appropriately and kill the need_iolock parameter. While here, the mp
+param can be removed as well as the xfs_mount is accessible from the
+xfs_inode structure. This patch does not change behavior.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit a36b926180cda375ac2ec89e1748b47137cfc51c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/xfs_bmap_util.c
+index 935fc7ad67c0,9319ee9759d4..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -895,26 -959,10 +900,33 @@@ xfs_free_eofblocks
+  		if (error)
+  			return error;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * There are blocks after the end of file.
+ +		 * Free them up now by truncating the file to
+ +		 * its current size.
+ +		 */
+ +		tp = xfs_trans_alloc(mp, XFS_TRANS_INACTIVE);
+ +
+ +		if (need_iolock) {
+ +			if (!xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
+ +				xfs_trans_cancel(tp);
+ +				return -EAGAIN;
+ +			}
+ +		}
+ +
+ +		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
+ +		if (error) {
+ +			ASSERT(XFS_FORCED_SHUTDOWN(mp));
+ +			xfs_trans_cancel(tp);
+ +			if (need_iolock)
+ +				xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+++=======
++ 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate, 0, 0, 0,
++ 				&tp);
++ 		if (error) {
++ 			ASSERT(XFS_FORCED_SHUTDOWN(mp));
+++>>>>>>> a36b926180cd (xfs: pull up iolock from xfs_free_eofblocks())
+  			return error;
+  		}
+  
+@@@ -1407,6 -1361,131 +1417,134 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * @next_fsb will keep track of the extent currently undergoing shift.
++  * @stop_fsb will keep track of the extent at which we have to stop.
++  * If we are shifting left, we will start with block (offset + len) and
++  * shift each extent till last extent.
++  * If we are shifting right, we will start with last extent inside file space
++  * and continue until we reach the block corresponding to offset.
++  */
++ static int
++ xfs_shift_file_space(
++ 	struct xfs_inode        *ip,
++ 	xfs_off_t               offset,
++ 	xfs_off_t               len,
++ 	enum shift_direction	direction)
++ {
++ 	int			done = 0;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	struct xfs_defer_ops	dfops;
++ 	xfs_fsblock_t		first_block;
++ 	xfs_fileoff_t		stop_fsb;
++ 	xfs_fileoff_t		next_fsb;
++ 	xfs_fileoff_t		shift_fsb;
++ 
++ 	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
++ 
++ 	if (direction == SHIFT_LEFT) {
++ 		next_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 		stop_fsb = XFS_B_TO_FSB(mp, VFS_I(ip)->i_size);
++ 	} else {
++ 		/*
++ 		 * If right shift, delegate the work of initialization of
++ 		 * next_fsb to xfs_bmap_shift_extent as it has ilock held.
++ 		 */
++ 		next_fsb = NULLFSBLOCK;
++ 		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	}
++ 
++ 	shift_fsb = XFS_B_TO_FSB(mp, len);
++ 
++ 	/*
++ 	 * Trim eofblocks to avoid shifting uninitialized post-eof preallocation
++ 	 * into the accessible region of the file.
++ 	 */
++ 	if (xfs_can_free_eofblocks(ip, true)) {
++ 		error = xfs_free_eofblocks(ip);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * Writeback and invalidate cache for the remainder of the file as we're
++ 	 * about to shift down every extent from offset to EOF.
++ 	 */
++ 	error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++ 					     offset, -1);
++ 	if (error)
++ 		return error;
++ 	error = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
++ 					offset >> PAGE_SHIFT, -1);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * The extent shiting code works on extent granularity. So, if
++ 	 * stop_fsb is not the starting block of extent, we need to split
++ 	 * the extent at stop_fsb.
++ 	 */
++ 	if (direction == SHIFT_RIGHT) {
++ 		error = xfs_bmap_split_extent(ip, stop_fsb);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	while (!error && !done) {
++ 		/*
++ 		 * We would need to reserve permanent block for transaction.
++ 		 * This will come into picture when after shifting extent into
++ 		 * hole we found that adjacent extents can be merged which
++ 		 * may lead to freeing of a block during record update.
++ 		 */
++ 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0, 0, &tp);
++ 		if (error)
++ 			break;
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		error = xfs_trans_reserve_quota(tp, mp, ip->i_udquot,
++ 				ip->i_gdquot, ip->i_pdquot,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
++ 				XFS_QMOPT_RES_REGBLKS);
++ 		if (error)
++ 			goto out_trans_cancel;
++ 
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 		xfs_defer_init(&dfops, &first_block);
++ 
++ 		/*
++ 		 * We are using the write transaction in which max 2 bmbt
++ 		 * updates are allowed
++ 		 */
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &dfops,
++ 				direction, XFS_BMAP_MAX_SHIFT_EXTENTS);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_defer_finish(&tp, &dfops, NULL);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_trans_commit(tp);
++ 	}
++ 
++ 	return error;
++ 
++ out_bmap_cancel:
++ 	xfs_defer_cancel(&dfops);
++ out_trans_cancel:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> a36b926180cd (xfs: pull up iolock from xfs_free_eofblocks())
+   * xfs_collapse_file_space()
+   *	This routine frees disk space and shift extent for the given file.
+   *	The first thing we do is to free data blocks in the specified range
+* Unmerged path fs/xfs/xfs_bmap_util.c
+diff --git a/fs/xfs/xfs_bmap_util.h b/fs/xfs/xfs_bmap_util.h
+index 736429a72a12..cad5d2d77af9 100644
+--- a/fs/xfs/xfs_bmap_util.h
++++ b/fs/xfs/xfs_bmap_util.h
+@@ -66,8 +66,7 @@ int	xfs_collapse_file_space(struct xfs_inode *, xfs_off_t offset,
+ 
+ /* EOF block manipulation functions */
+ bool	xfs_can_free_eofblocks(struct xfs_inode *ip, bool force);
+-int	xfs_free_eofblocks(struct xfs_mount *mp, struct xfs_inode *ip,
+-			   bool need_iolock);
++int	xfs_free_eofblocks(struct xfs_inode *ip);
+ 
+ int	xfs_swap_extents(struct xfs_inode *ip, struct xfs_inode *tip,
+ 			 struct xfs_swapext *sx);
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 68b891ef61bd..d757703021de 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1263,7 +1263,7 @@ xfs_inode_free_eofblocks(
+ 	int			flags,
+ 	void			*args)
+ {
+-	int ret;
++	int ret = 0;
+ 	struct xfs_eofblocks *eofb = args;
+ 	bool need_iolock = true;
+ 	int match;
+@@ -1299,19 +1299,25 @@ xfs_inode_free_eofblocks(
+ 			return 0;
+ 
+ 		/*
+-		 * A scan owner implies we already hold the iolock. Skip it in
+-		 * xfs_free_eofblocks() to avoid deadlock. This also eliminates
+-		 * the possibility of EAGAIN being returned.
++		 * A scan owner implies we already hold the iolock. Skip it here
++		 * to avoid deadlock.
+ 		 */
+ 		if (eofb->eof_scan_owner == ip->i_ino)
+ 			need_iolock = false;
+ 	}
+ 
+-	ret = xfs_free_eofblocks(ip->i_mount, ip, need_iolock);
+-
+-	/* don't revisit the inode if we're not waiting */
+-	if (ret == -EAGAIN && !(flags & SYNC_WAIT))
+-		ret = 0;
++	/*
++	 * If the caller is waiting, return -EAGAIN to keep the background
++	 * scanner moving and revisit the inode in a subsequent pass.
++	 */
++	if (need_iolock && !xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
++		if (flags & SYNC_WAIT)
++			ret = -EAGAIN;
++		return ret;
++	}
++	ret = xfs_free_eofblocks(ip);
++	if (need_iolock)
++		xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+ 
+ 	return ret;
+ }
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 634985fc3aa9..9be3d0c12270 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1665,33 +1665,35 @@ xfs_release(
+ 
+ 	if (xfs_can_free_eofblocks(ip, false)) {
+ 
++		/*
++		 * Check if the inode is being opened, written and closed
++		 * frequently and we have delayed allocation blocks outstanding
++		 * (e.g. streaming writes from the NFS server), truncating the
++		 * blocks past EOF will cause fragmentation to occur.
++		 *
++		 * In this case don't do the truncation, but we have to be
++		 * careful how we detect this case. Blocks beyond EOF show up as
++		 * i_delayed_blks even when the inode is clean, so we need to
++		 * truncate them away first before checking for a dirty release.
++		 * Hence on the first dirty close we will still remove the
++		 * speculative allocation, but after that we will leave it in
++		 * place.
++		 */
++		if (xfs_iflags_test(ip, XFS_IDIRTY_RELEASE))
++			return 0;
+ 		/*
+ 		 * If we can't get the iolock just skip truncating the blocks
+ 		 * past EOF because we could deadlock with the mmap_sem
+-		 * otherwise.  We'll get another chance to drop them once the
++		 * otherwise. We'll get another chance to drop them once the
+ 		 * last reference to the inode is dropped, so we'll never leak
+ 		 * blocks permanently.
+-		 *
+-		 * Further, check if the inode is being opened, written and
+-		 * closed frequently and we have delayed allocation blocks
+-		 * outstanding (e.g. streaming writes from the NFS server),
+-		 * truncating the blocks past EOF will cause fragmentation to
+-		 * occur.
+-		 *
+-		 * In this case don't do the truncation, either, but we have to
+-		 * be careful how we detect this case. Blocks beyond EOF show
+-		 * up as i_delayed_blks even when the inode is clean, so we
+-		 * need to truncate them away first before checking for a dirty
+-		 * release. Hence on the first dirty close we will still remove
+-		 * the speculative allocation, but after that we will leave it
+-		 * in place.
+ 		 */
+-		if (xfs_iflags_test(ip, XFS_IDIRTY_RELEASE))
+-			return 0;
+-
+-		error = xfs_free_eofblocks(mp, ip, true);
+-		if (error && error != -EAGAIN)
+-			return error;
++		if (xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
++			error = xfs_free_eofblocks(ip);
++			xfs_iunlock(ip, XFS_IOLOCK_EXCL);
++			if (error)
++				return error;
++		}
+ 
+ 		/* delalloc blocks after truncation means it really is dirty */
+ 		if (ip->i_delayed_blks)
+@@ -1882,8 +1884,11 @@ xfs_inactive(
+ 		 * cache. Post-eof blocks must be freed, lest we end up with
+ 		 * broken free space accounting.
+ 		 */
+-		if (xfs_can_free_eofblocks(ip, true))
+-			xfs_free_eofblocks(mp, ip, false);
++		if (xfs_can_free_eofblocks(ip, true)) {
++			xfs_ilock(ip, XFS_IOLOCK_EXCL);
++			xfs_free_eofblocks(ip);
++			xfs_iunlock(ip, XFS_IOLOCK_EXCL);
++		}
+ 
+ 		return;
+ 	}
