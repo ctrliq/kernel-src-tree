@@ -1,0 +1,148 @@
+ceph: update the 'approaching max_size' code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit efb0ca765ac6f4985b57ef215e8d55e746b083f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/efb0ca76.failed
+
+The old 'approaching max_size' code expects MDS set max_size to
+'2 * reported_size'. This is no longer true. The new code reports
+file size when half of previous max_size increment has been used.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit efb0ca765ac6f4985b57ef215e8d55e746b083f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/file.c
+diff --cc fs/ceph/addr.c
+index f26258b3562b,82220e9aaf7d..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -1253,8 -1318,7 +1253,12 @@@ static int ceph_write_end(struct file *
+  			  struct page *page, void *fsdata)
+  {
+  	struct inode *inode = file_inode(file);
+++<<<<<<< HEAD
+ +	unsigned from = pos & (PAGE_CACHE_SIZE - 1);
+ +	int check_cap = 0;
+++=======
++ 	bool check_cap = false;
+++>>>>>>> efb0ca765ac6 (ceph: update the 'approaching max_size' code)
+  
+  	dout("write_end file %p inode %p page %p %d~%d (%d)\n", file,
+  	     inode, page, (int)pos, (int)copied, (int)len);
+diff --cc fs/ceph/file.c
+index e5cb3c326d43,3d48c415f3cb..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -1015,11 -1040,10 +1015,16 @@@ static ssize_t ceph_sync_write(struct k
+  	int num_pages;
+  	int written = 0;
+  	int flags;
+- 	int check_caps = 0;
+  	int ret;
+++<<<<<<< HEAD
+ +	struct timespec mtime = current_fs_time(inode->i_sb);
+ +	loff_t pos = iocb->ki_pos;
+ +	size_t count = iov_iter_count(i);
+++=======
++ 	bool check_caps = false;
++ 	struct timespec mtime = current_time(inode);
++ 	size_t count = iov_iter_count(from);
+++>>>>>>> efb0ca765ac6 (ceph: update the 'approaching max_size' code)
+  
+  	if (ceph_snap(file_inode(file)) != CEPH_NOSNAP)
+  		return -EROFS;
+* Unmerged path fs/ceph/addr.c
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index d558f8424aae..ac428779fe4f 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -1643,6 +1643,21 @@ static int try_nonblocking_invalidate(struct inode *inode)
+ 	return -1;
+ }
+ 
++bool __ceph_should_report_size(struct ceph_inode_info *ci)
++{
++	loff_t size = ci->vfs_inode.i_size;
++	/* mds will adjust max size according to the reported size */
++	if (ci->i_flushing_caps & CEPH_CAP_FILE_WR)
++		return false;
++	if (size >= ci->i_max_size)
++		return true;
++	/* half of previous max_size increment has been used */
++	if (ci->i_max_size > ci->i_reported_size &&
++	    (size << 1) >= ci->i_max_size + ci->i_reported_size)
++		return true;
++	return false;
++}
++
+ /*
+  * Swiss army knife function to examine currently used and wanted
+  * versus held caps.  Release, flush, ack revoked caps to mds as
+@@ -1796,8 +1811,7 @@ retry_locked:
+ 			}
+ 
+ 			/* approaching file_max? */
+-			if ((inode->i_size << 1) >= ci->i_max_size &&
+-			    (ci->i_reported_size << 1) < ci->i_max_size) {
++			if (__ceph_should_report_size(ci)) {
+ 				dout("i_size approaching max_size\n");
+ 				goto ack;
+ 			}
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 9d67b9b0f077..5a018e8430e9 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1601,20 +1601,17 @@ out:
+ 	return err;
+ }
+ 
+-int ceph_inode_set_size(struct inode *inode, loff_t size)
++bool ceph_inode_set_size(struct inode *inode, loff_t size)
+ {
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+-	int ret = 0;
++	bool ret;
+ 
+ 	spin_lock(&ci->i_ceph_lock);
+ 	dout("set_size %p %llu -> %llu\n", inode, inode->i_size, size);
+ 	i_size_write(inode, size);
+ 	inode->i_blocks = calc_inode_blocks(size);
+ 
+-	/* tell the MDS if we are approaching max_size */
+-	if ((size << 1) >= ci->i_max_size &&
+-	    (ci->i_reported_size << 1) < ci->i_max_size)
+-		ret = 1;
++	ret = __ceph_should_report_size(ci);
+ 
+ 	spin_unlock(&ci->i_ceph_lock);
+ 	return ret;
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index a69e922ad375..8793c4cc9c13 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -762,7 +762,7 @@ extern int ceph_readdir_prepopulate(struct ceph_mds_request *req,
+ 
+ extern int ceph_inode_holds_cap(struct inode *inode, int mask);
+ 
+-extern int ceph_inode_set_size(struct inode *inode, loff_t size);
++extern bool ceph_inode_set_size(struct inode *inode, loff_t size);
+ extern void __ceph_do_pending_vmtruncate(struct inode *inode);
+ extern void ceph_queue_vmtruncate(struct inode *inode);
+ 
+@@ -893,6 +893,7 @@ extern void ceph_put_wrbuffer_cap_refs(struct ceph_inode_info *ci, int nr,
+ 				       struct ceph_snap_context *snapc);
+ extern void ceph_flush_snaps(struct ceph_inode_info *ci,
+ 			     struct ceph_mds_session **psession);
++extern bool __ceph_should_report_size(struct ceph_inode_info *ci);
+ extern void ceph_check_caps(struct ceph_inode_info *ci, int flags,
+ 			    struct ceph_mds_session *session);
+ extern void ceph_check_delayed_caps(struct ceph_mds_client *mdsc);
