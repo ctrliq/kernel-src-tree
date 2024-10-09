@@ -1,0 +1,164 @@
+nfp: turn NSP port entry into a union
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit e890ae8e497a535a8ab692a66f7fc2aee4361728
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e890ae8e.failed
+
+Make NSP port structure a union to simplify accessing the fields
+from generic macros.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e890ae8e497a535a8ab692a66f7fc2aee4361728)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index f94361014b87,ca5c041e64a4..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@@ -110,8 -126,8 +122,13 @@@ static void nfp_eth_copy_mac_reverse(u
+  }
+  
+  static void
+++<<<<<<< HEAD
+ +nfp_eth_port_translate(const struct eth_table_entry *src, unsigned int index,
+ +		       struct nfp_eth_table_port *dst)
+++=======
++ nfp_eth_port_translate(struct nfp_nsp *nsp, const union eth_table_entry *src,
++ 		       unsigned int index, struct nfp_eth_table_port *dst)
+++>>>>>>> e890ae8e497a (nfp: turn NSP port entry into a union)
+  {
+  	unsigned int rate;
+  	u64 port, state;
+@@@ -214,6 -280,82 +231,85 @@@ err
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct nfp_nsp *nfp_eth_config_start(struct nfp_cpp *cpp, unsigned int idx)
++ {
++ 	union eth_table_entry *entries;
++ 	struct nfp_nsp *nsp;
++ 	int ret;
++ 
++ 	entries = kzalloc(NSP_ETH_TABLE_SIZE, GFP_KERNEL);
++ 	if (!entries)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	nsp = nfp_nsp_open(cpp);
++ 	if (IS_ERR(nsp)) {
++ 		kfree(entries);
++ 		return nsp;
++ 	}
++ 
++ 	ret = nfp_nsp_read_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
++ 	if (ret < 0) {
++ 		nfp_err(cpp, "reading port table failed %d\n", ret);
++ 		goto err;
++ 	}
++ 
++ 	if (!(entries[idx].port & NSP_ETH_PORT_LANES_MASK)) {
++ 		nfp_warn(cpp, "trying to set port state on disabled port %d\n",
++ 			 idx);
++ 		goto err;
++ 	}
++ 
++ 	nfp_nsp_config_set_state(nsp, entries, idx);
++ 	return nsp;
++ 
++ err:
++ 	nfp_nsp_close(nsp);
++ 	kfree(entries);
++ 	return ERR_PTR(-EIO);
++ }
++ 
++ void nfp_eth_config_cleanup_end(struct nfp_nsp *nsp)
++ {
++ 	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
++ 
++ 	nfp_nsp_config_set_modified(nsp, false);
++ 	nfp_nsp_config_clear_state(nsp);
++ 	nfp_nsp_close(nsp);
++ 	kfree(entries);
++ }
++ 
++ /**
++  * nfp_eth_config_commit_end() - perform recorded configuration changes
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  *
++  * Perform the configuration which was requested with __nfp_eth_set_*()
++  * helpers and recorded in @nsp state.  If device was already configured
++  * as requested or no __nfp_eth_set_*() operations were made no NSP command
++  * will be performed.
++  *
++  * Return:
++  * 0 - configuration successful;
++  * 1 - no changes were needed;
++  * -ERRNO - configuration failed.
++  */
++ int nfp_eth_config_commit_end(struct nfp_nsp *nsp)
++ {
++ 	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
++ 	int ret = 1;
++ 
++ 	if (nfp_nsp_config_modified(nsp)) {
++ 		ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
++ 		ret = ret < 0 ? ret : 0;
++ 	}
++ 
++ 	nfp_eth_config_cleanup_end(nsp);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> e890ae8e497a (nfp: turn NSP port entry into a union)
+  /**
+   * nfp_eth_set_mod_enable() - set PHY module enable control bit
+   * @cpp:	NFP CPP handle
+@@@ -227,33 -369,15 +323,33 @@@
+   */
+  int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable)
+  {
+- 	struct eth_table_entry *entries;
++ 	union eth_table_entry *entries;
+  	struct nfp_nsp *nsp;
+  	u64 reg;
+ +	int ret;
+  
+ -	nsp = nfp_eth_config_start(cpp, idx);
+ -	if (IS_ERR(nsp))
+ +	entries = kzalloc(NSP_ETH_TABLE_SIZE, GFP_KERNEL);
+ +	if (!entries)
+ +		return -ENOMEM;
+ +
+ +	nsp = nfp_nsp_open(cpp);
+ +	if (IS_ERR(nsp)) {
+ +		kfree(entries);
+  		return PTR_ERR(nsp);
+ +	}
+ +
+ +	ret = nfp_nsp_read_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+ +	if (ret < 0) {
+ +		nfp_err(cpp, "reading port table failed %d\n", ret);
+ +		goto exit_close_nsp;
+ +	}
+  
+ -	entries = nfp_nsp_config_entries(nsp);
+ +	if (!(entries[idx].port & NSP_ETH_PORT_LANES_MASK)) {
+ +		nfp_warn(cpp, "trying to set port state on disabled port %d\n",
+ +			 idx);
+ +		ret = -EINVAL;
+ +		goto exit_close_nsp;
+ +	}
+  
+  	/* Check if we are already in requested state */
+  	reg = le64_to_cpu(entries[idx].state);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
