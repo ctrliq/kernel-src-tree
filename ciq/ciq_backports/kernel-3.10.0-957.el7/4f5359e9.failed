@@ -1,0 +1,174 @@
+s390/pci_dma: make lazy flush independent from the tlb_refresh bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] pci_dma: make lazy flush independent from the tlb_refresh bit (Hendrik Brueckner) [1539025]
+Rebuild_FUZZ: 96.06%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 4f5359e94bbfbe349fd1ae00516dfe749d53fe22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4f5359e9.failed
+
+We have 2 strategies to reduce the number of RPCIT instructions:
+* A HW feature indicated via the tlb_refresh bit allows us to omit RPCIT for
+  invalid -> valid translation-table entry updates.
+* With "lazy flush" we omit RPCIT for valid -> invalid updates until we run
+  out of dma addresses. When we have to reuse dma addresses we issue a global
+  tlb flush using only one RPCIT instruction.
+
+Currently lazy flushing depends on tlb_refresh. Since there is no technical
+reason for this remove this dependency.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 4f5359e94bbfbe349fd1ae00516dfe749d53fe22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_dma.c
+diff --cc arch/s390/pci/pci_dma.c
+index 0a25a0fb6217,0c626c1303cb..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -191,7 -175,45 +191,49 @@@ no_refresh
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static void dma_free_seg_table(unsigned long entry)
+++=======
++ static int __dma_purge_tlb(struct zpci_dev *zdev, dma_addr_t dma_addr,
++ 			   size_t size, int flags)
++ {
++ 	/*
++ 	 * With zdev->tlb_refresh == 0, rpcit is not required to establish new
++ 	 * translations when previously invalid translation-table entries are
++ 	 * validated. With lazy unmap, rpcit is skipped for previously valid
++ 	 * entries, but a global rpcit is then required before any address can
++ 	 * be re-used, i.e. after each iommu bitmap wrap-around.
++ 	 */
++ 	if ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID) {
++ 		if (!zdev->tlb_refresh)
++ 			return 0;
++ 	} else {
++ 		if (!s390_iommu_strict)
++ 			return 0;
++ 	}
++ 
++ 	return zpci_refresh_trans((u64) zdev->fh << 32, dma_addr,
++ 				  PAGE_ALIGN(size));
++ }
++ 
++ static int dma_update_trans(struct zpci_dev *zdev, unsigned long pa,
++ 			    dma_addr_t dma_addr, size_t size, int flags)
++ {
++ 	int rc;
++ 
++ 	rc = __dma_update_trans(zdev, pa, dma_addr, size, flags);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = __dma_purge_tlb(zdev, dma_addr, size, flags);
++ 	if (rc && ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID))
++ 		__dma_update_trans(zdev, pa, dma_addr, size, ZPCI_PTE_INVALID);
++ 
++ 	return rc;
++ }
++ 
++ void dma_free_seg_table(unsigned long entry)
+++>>>>>>> 4f5359e94bbf (s390/pci_dma: make lazy flush independent from the tlb_refresh bit)
+  {
+  	unsigned long *sto = get_rt_sto(entry);
+  	int sx;
+@@@ -241,36 -260,46 +283,57 @@@ static unsigned long dma_alloc_iommu(st
+  	spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
+  	offset = __dma_alloc_iommu(dev, zdev->next_bit, size);
+  	if (offset == -1) {
+++<<<<<<< HEAD
+++=======
++ 		if (!s390_iommu_strict) {
++ 			/* global flush before DMA addresses are reused */
++ 			if (zpci_refresh_global(zdev))
++ 				goto out_error;
++ 
++ 			bitmap_andnot(zdev->iommu_bitmap, zdev->iommu_bitmap,
++ 				      zdev->lazy_bitmap, zdev->iommu_pages);
++ 			bitmap_zero(zdev->lazy_bitmap, zdev->iommu_pages);
++ 		}
+++>>>>>>> 4f5359e94bbf (s390/pci_dma: make lazy flush independent from the tlb_refresh bit)
+  		/* wrap-around */
+  		offset = __dma_alloc_iommu(dev, 0, size);
+ -		if (offset == -1)
+ -			goto out_error;
+ +		wrap = 1;
+  	}
+ -	zdev->next_bit = offset + size;
+ -	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
+ -
+ -	return zdev->start_dma + offset * PAGE_SIZE;
+  
+ -out_error:
+ +	if (offset != -1) {
+ +		zdev->next_bit = offset + size;
+ +		if (!zdev->tlb_refresh && !s390_iommu_strict && wrap)
+ +			/* global flush after wrap-around with lazy unmap */
+ +			zpci_refresh_global(zdev);
+ +	}
+  	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
+ -	return DMA_ERROR_CODE;
+ +	return offset;
+  }
+  
+ -static void dma_free_address(struct device *dev, dma_addr_t dma_addr, int size)
+ +static void dma_free_iommu(struct device *dev, unsigned long offset, int size)
+  {
+ -	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
+ -	unsigned long flags, offset;
+ -
+ -	offset = (dma_addr - zdev->start_dma) >> PAGE_SHIFT;
+ +	struct zpci_dev *zdev = get_zdev(to_pci_dev(dev));
+ +	unsigned long flags;
+  
+  	spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
+  	if (!zdev->iommu_bitmap)
+  		goto out;
+++<<<<<<< HEAD
+ +	bitmap_clear(zdev->iommu_bitmap, offset, size);
+ +	/*
+ +	 * Lazy flush for unmap: need to move next_bit to avoid address re-use
+ +	 * until wrap-around.
+ +	 */
+ +	if (!s390_iommu_strict && offset >= zdev->next_bit)
+ +		zdev->next_bit = offset + size;
+++=======
++ 
++ 	if (s390_iommu_strict)
++ 		bitmap_clear(zdev->iommu_bitmap, offset, size);
++ 	else
++ 		bitmap_set(zdev->lazy_bitmap, offset, size);
++ 
+++>>>>>>> 4f5359e94bbf (s390/pci_dma: make lazy flush independent from the tlb_refresh bit)
+  out:
+  	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
+  }
+@@@ -481,7 -568,14 +544,16 @@@ int zpci_dma_init_device(struct zpci_de
+  		rc = -ENOMEM;
+  		goto free_dma_table;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (!s390_iommu_strict) {
++ 		zdev->lazy_bitmap = vzalloc(zdev->iommu_pages / 8);
++ 		if (!zdev->lazy_bitmap) {
++ 			rc = -ENOMEM;
++ 			goto free_bitmap;
++ 		}
+++>>>>>>> 4f5359e94bbf (s390/pci_dma: make lazy flush independent from the tlb_refresh bit)
+  
+ -	}
+  	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+  				(u64) zdev->dma_table);
+  	if (rc)
+* Unmerged path arch/s390/pci/pci_dma.c
