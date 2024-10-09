@@ -1,0 +1,156 @@
+ceph: quota: report root dir quota usage in statfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Luis Henriques <lhenriques@suse.com>
+commit 9122eed5281e89bdb02162a8ecb3cc13ffc8985e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9122eed5.failed
+
+This commit changes statfs default behaviour when reporting usage
+statistics.  Instead of using the overall filesystem usage, statfs now
+reports the quota for the filesystem root, if ceph.quota.max_bytes has
+been set for this inode.  If quota hasn't been set, it falls back to the
+old statfs behaviour.
+
+A new mount option is also added ('noquotadf') to disable this behaviour.
+
+	Signed-off-by: Luis Henriques <lhenriques@suse.com>
+	Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 9122eed5281e89bdb02162a8ecb3cc13ffc8985e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/quota.c
+#	fs/ceph/super.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/super.c
+index 536dc1096e03,b33082e6878f..000000000000
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@@ -157,7 -159,9 +166,13 @@@ enum 
+  #ifdef CONFIG_CEPH_FS_POSIX_ACL
+  	Opt_acl,
+  #endif
+++<<<<<<< HEAD
+ +	Opt_noacl
+++=======
++ 	Opt_noacl,
++ 	Opt_quotadf,
++ 	Opt_noquotadf,
+++>>>>>>> 9122eed5281e (ceph: quota: report root dir quota usage in statfs)
+  };
+  
+  static match_table_t fsopt_tokens = {
+@@@ -318,9 -347,15 +335,15 @@@ static int parse_fsopt_token(char *c, v
+  	case Opt_norequire_active_mds:
+  		fsopt->flags |= CEPH_MOUNT_OPT_MOUNTWAIT;
+  		break;
++ 	case Opt_quotadf:
++ 		fsopt->flags &= ~CEPH_MOUNT_OPT_NOQUOTADF;
++ 		break;
++ 	case Opt_noquotadf:
++ 		fsopt->flags |= CEPH_MOUNT_OPT_NOQUOTADF;
++ 		break;
+  #ifdef CONFIG_CEPH_FS_POSIX_ACL
+  	case Opt_acl:
+ -		fsopt->sb_flags |= SB_POSIXACL;
+ +		fsopt->sb_flags |= MS_POSIXACL;
+  		break;
+  #endif
+  	case Opt_noacl:
+@@@ -496,11 -534,16 +519,13 @@@ static int ceph_show_options(struct seq
+  		seq_puts(m, ",noasyncreaddir");
+  	if ((fsopt->flags & CEPH_MOUNT_OPT_DCACHE) == 0)
+  		seq_puts(m, ",nodcache");
+ -	if (fsopt->flags & CEPH_MOUNT_OPT_FSCACHE) {
+ -		seq_show_option(m, "fsc", fsopt->fscache_uniq);
+ -	}
+  	if (fsopt->flags & CEPH_MOUNT_OPT_NOPOOLPERM)
+  		seq_puts(m, ",nopoolperm");
++ 	if (fsopt->flags & CEPH_MOUNT_OPT_NOQUOTADF)
++ 		seq_puts(m, ",noquotadf");
+  
+  #ifdef CONFIG_CEPH_FS_POSIX_ACL
+ -	if (fsopt->sb_flags & SB_POSIXACL)
+ +	if (fsopt->sb_flags & MS_POSIXACL)
+  		seq_puts(m, ",acl");
+  	else
+  		seq_puts(m, ",noacl");
+diff --cc fs/ceph/super.h
+index 2ea6359d8d08,a7077a0c989f..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -30,8 -36,10 +30,9 @@@
+  #define CEPH_MOUNT_OPT_NOASYNCREADDIR  (1<<7) /* no dcache readdir */
+  #define CEPH_MOUNT_OPT_INO32           (1<<8) /* 32 bit inos */
+  #define CEPH_MOUNT_OPT_DCACHE          (1<<9) /* use dcache for readdir etc */
+ -#define CEPH_MOUNT_OPT_FSCACHE         (1<<10) /* use fscache */
+  #define CEPH_MOUNT_OPT_NOPOOLPERM      (1<<11) /* no pool permission check */
+  #define CEPH_MOUNT_OPT_MOUNTWAIT       (1<<12) /* mount waits if no mds is up */
++ #define CEPH_MOUNT_OPT_NOQUOTADF       (1<<13) /* no root dir quota in statfs */
+  
+  #define CEPH_MOUNT_OPT_DEFAULT    CEPH_MOUNT_OPT_DCACHE
+  
+@@@ -1022,4 -1075,37 +1023,40 @@@ extern int lock_to_ceph_filelock(struc
+  extern int ceph_fs_debugfs_init(struct ceph_fs_client *client);
+  extern void ceph_fs_debugfs_cleanup(struct ceph_fs_client *client);
+  
+++<<<<<<< HEAD
+++=======
++ /* quota.c */
++ static inline bool __ceph_has_any_quota(struct ceph_inode_info *ci)
++ {
++ 	return ci->i_max_files || ci->i_max_bytes;
++ }
++ 
++ extern void ceph_adjust_quota_realms_count(struct inode *inode, bool inc);
++ 
++ static inline void __ceph_update_quota(struct ceph_inode_info *ci,
++ 				       u64 max_bytes, u64 max_files)
++ {
++ 	bool had_quota, has_quota;
++ 	had_quota = __ceph_has_any_quota(ci);
++ 	ci->i_max_bytes = max_bytes;
++ 	ci->i_max_files = max_files;
++ 	has_quota = __ceph_has_any_quota(ci);
++ 
++ 	if (had_quota != has_quota)
++ 		ceph_adjust_quota_realms_count(&ci->vfs_inode, has_quota);
++ }
++ 
++ extern void ceph_handle_quota(struct ceph_mds_client *mdsc,
++ 			      struct ceph_mds_session *session,
++ 			      struct ceph_msg *msg);
++ extern bool ceph_quota_is_max_files_exceeded(struct inode *inode);
++ extern bool ceph_quota_is_same_realm(struct inode *old, struct inode *new);
++ extern bool ceph_quota_is_max_bytes_exceeded(struct inode *inode,
++ 					     loff_t newlen);
++ extern bool ceph_quota_is_max_bytes_approaching(struct inode *inode,
++ 						loff_t newlen);
++ extern bool ceph_quota_update_statfs(struct ceph_fs_client *fsc,
++ 				     struct kstatfs *buf);
++ 
+++>>>>>>> 9122eed5281e (ceph: quota: report root dir quota usage in statfs)
+  #endif /* _FS_CEPH_SUPER_H */
+* Unmerged path fs/ceph/quota.c
+diff --git a/Documentation/filesystems/ceph.txt b/Documentation/filesystems/ceph.txt
+index d6030aa33376..06caf5745bca 100644
+--- a/Documentation/filesystems/ceph.txt
++++ b/Documentation/filesystems/ceph.txt
+@@ -134,6 +134,10 @@ Mount Options
+   noasyncreaddir
+ 	Do not use the dcache as above for readdir.
+ 
++  noquotadf
++        Report overall filesystem usage in statfs instead of using the root
++        directory quota.
++
+ More Information
+ ================
+ 
+* Unmerged path fs/ceph/quota.c
+* Unmerged path fs/ceph/super.c
+* Unmerged path fs/ceph/super.h
