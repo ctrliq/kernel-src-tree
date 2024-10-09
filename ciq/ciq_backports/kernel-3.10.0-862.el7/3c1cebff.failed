@@ -1,0 +1,219 @@
+dax, pmem: introduce an optional 'flush' dax_operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 3c1cebff23cdca01c421411e953a9e239f2b9ef9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3c1cebff.failed
+
+Filesystem-DAX flushes caches whenever it writes to the address returned
+through dax_direct_access() and when writing back dirty radix entries.
+That flushing is only required in the pmem case, so add a dax operation
+to allow pmem to take this extra action, but skip it for other dax
+capable devices that do not provide a flush routine.
+
+An example for this differentiation might be a volatile ram disk where
+there is no expectation of persistence. In fact the pmem driver itself might
+front such an address range specified by the NFIT. So, this "no flush"
+property might be something passed down by the bus / libnvdimm.
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 3c1cebff23cdca01c421411e953a9e239f2b9ef9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/pmem.c
+#	include/linux/dax.h
+diff --cc drivers/nvdimm/pmem.c
+index 0a54cd24934c,823b07774244..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -222,6 -228,32 +222,35 @@@ static const struct block_device_operat
+  	.revalidate_disk =	nvdimm_revalidate_disk,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static long pmem_dax_direct_access(struct dax_device *dax_dev,
++ 		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	struct pmem_device *pmem = dax_get_private(dax_dev);
++ 
++ 	return __pmem_direct_access(pmem, pgoff, nr_pages, kaddr, pfn);
++ }
++ 
++ static size_t pmem_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	return copy_from_iter_flushcache(addr, bytes, i);
++ }
++ 
++ static void pmem_dax_flush(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		void *addr, size_t size)
++ {
++ 	wb_cache_pmem(addr, size);
++ }
++ 
++ static const struct dax_operations pmem_dax_ops = {
++ 	.direct_access = pmem_dax_direct_access,
++ 	.copy_from_iter = pmem_copy_from_iter,
++ 	.flush = pmem_dax_flush,
++ };
++ 
+++>>>>>>> 3c1cebff23cd (dax, pmem: introduce an optional 'flush' dax_operation)
+  static void pmem_release_queue(void *q)
+  {
+  	blk_cleanup_queue(q);
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,407dd3ff6e54..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,118 +6,109 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ 	/* copy_from_iter: dax-driver override for default copy_from_iter */
++ 	size_t (*copy_from_iter)(struct dax_device *, pgoff_t, void *, size_t,
++ 			struct iov_iter *);
++ 	/* flush: optional driver-specific cache management after writes */
++ 	void (*flush)(struct dax_device *, pgoff_t, void *, size_t);
++ };
++ 
++ #if IS_ENABLED(CONFIG_DAX)
++ struct dax_device *dax_get_by_host(const char *host);
++ void put_dax(struct dax_device *dax_dev);
++ #else
++ static inline struct dax_device *dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
++ #if IS_ENABLED(CONFIG_FS_DAX)
++ int __bdev_dax_supported(struct super_block *sb, int blocksize);
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return __bdev_dax_supported(sb, blocksize);
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return dax_get_by_host(host);
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ 	put_dax(dax_dev);
++ }
++ 
++ #else
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
++ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
++ 		void **kaddr, pfn_t *pfn);
++ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i);
++ 
+++>>>>>>> 3c1cebff23cd (dax, pmem: introduce an optional 'flush' dax_operation)
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ -
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+ -
+ -static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ -{
+ -	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ -			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ -			RADIX_DAX_ENTRY_LOCK);
+ -}
+ -
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ -int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+ +
+ +
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ -				      pgoff_t index);
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path include/linux/dax.h
