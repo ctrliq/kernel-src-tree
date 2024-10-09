@@ -151,6 +151,28 @@ static int rtl8211f_config_intr(struct phy_device *phydev)
 	return rtl8211x_page_write(phydev, 0xa42, RTL821x_INER, val);
 }
 
+static int rtl8211_config_aneg(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = genphy_config_aneg(phydev);
+	if (ret < 0)
+		return ret;
+
+	/* Quirk was copied from vendor driver. Unfortunately it includes no
+	 * description of the magic numbers.
+	 */
+	if (phydev->speed == SPEED_100 && phydev->autoneg == AUTONEG_DISABLE) {
+		phy_write(phydev, 0x17, 0x2138);
+		phy_write(phydev, 0x0e, 0x0260);
+	} else {
+		phy_write(phydev, 0x17, 0x2108);
+		phy_write(phydev, 0x0e, 0x0000);
+	}
+
+	return 0;
+}
+
 static int rtl8211f_config_init(struct phy_device *phydev)
 {
 	int ret;
@@ -202,6 +224,14 @@ static struct phy_driver realtek_drvs[] = {
 		.config_intr	= &rtl8201_config_intr,
 		.suspend	= genphy_suspend,
 		.resume		= genphy_resume,
+	}, {
+		.phy_id		= 0x001cc910,
+		.name		= "RTL8211 Gigabit Ethernet",
+		.phy_id_mask	= 0x001fffff,
+		.features	= PHY_GBIT_FEATURES,
+		.config_aneg	= rtl8211_config_aneg,
+		.read_mmd	= &genphy_read_mmd_unsupported,
+		.write_mmd	= &genphy_write_mmd_unsupported,
 	}, {
 		.phy_id		= 0x001cc912,
 		.name		= "RTL8211B Gigabit Ethernet",
