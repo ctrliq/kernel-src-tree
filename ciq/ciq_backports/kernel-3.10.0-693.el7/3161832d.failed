@@ -1,0 +1,168 @@
+x86/PCI: VMD: Request userspace control of PCIe hotplug indicators
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] pci: vmd: Request userspace control of PCIe hotplug indicators (Myron Stowe) [1380181]
+Rebuild_FUZZ: 96.88%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 3161832d58c7f3bf8b190a2887086be0932d8dd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3161832d.failed
+
+Add set_dev_domain_options() to set PCI domain-specific options as devices
+are added.  The first usage is to request exclusive userspace control of
+PCIe hotplug indicators in VMD domains.
+
+Devices in a VMD domain use PCIe hotplug Attention and Power Indicators in
+a non-standard way; tell pciehp to ignore the indicators so userspace can
+control them via the sysfs "attention" file.
+
+To determine whether a bus is within a VMD domain, add a bool to the
+pci_sysdata structure that the VMD driver sets during initialization.
+
+[bhelgaas: changelog]
+Requested-by: Kapil Karkra <kapil.karkra@intel.com>
+	Tested-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 3161832d58c7f3bf8b190a2887086be0932d8dd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pci.h
+#	arch/x86/pci/common.c
+diff --cc arch/x86/include/asm/pci.h
+index 6616505cb944,1411dbed5e5e..000000000000
+--- a/arch/x86/include/asm/pci.h
++++ b/arch/x86/include/asm/pci.h
+@@@ -20,9 -20,12 +20,12 @@@ struct pci_sysdata 
+  #ifdef CONFIG_X86_64
+  	void		*iommu;		/* IOMMU private data */
+  #endif
+ -#ifdef CONFIG_PCI_MSI_IRQ_DOMAIN
+ -	void		*fwnode;	/* IRQ domain for MSI assignment */
+ +#ifdef CONFIG_PCI_MSI
+ +	struct x86_msi_ops *msi_ops;
+  #endif
++ #if IS_ENABLED(CONFIG_VMD)
++ 	bool vmd_domain;		/* True if in Intel VMD domain */
++ #endif
+  };
+  
+  extern int pci_routeirq;
+@@@ -44,6 -48,28 +47,31 @@@ static inline int pci_proc_domain(struc
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PCI_MSI_IRQ_DOMAIN
++ static inline void *_pci_root_bus_fwnode(struct pci_bus *bus)
++ {
++ 	struct pci_sysdata *sd = bus->sysdata;
++ 
++ 	return sd->fwnode;
++ }
++ 
++ #define pci_root_bus_fwnode	_pci_root_bus_fwnode
++ #endif
++ 
++ static inline bool is_vmd(struct pci_bus *bus)
++ {
++ #if IS_ENABLED(CONFIG_VMD)
++ 	struct pci_sysdata *sd = bus->sysdata;
++ 
++ 	return sd->vmd_domain;
++ #else
++ 	return false;
++ #endif
++ }
++ 
+++>>>>>>> 3161832d58c7 (x86/PCI: VMD: Request userspace control of PCIe hotplug indicators)
+  /* Can be used to override the logic in pci_scan_bus for skipping
+     already-configured bus numbers - to be used for buggy BIOSes
+     or architectures with incomplete PCI setup by the loader */
+diff --cc arch/x86/pci/common.c
+index 15e0a2a551b9,a4fdfa7dcc1b..000000000000
+--- a/arch/x86/pci/common.c
++++ b/arch/x86/pci/common.c
+@@@ -644,6 -640,49 +644,52 @@@ unsigned int pcibios_assign_all_busses(
+  	return (pci_probe & PCI_ASSIGN_ALL_BUSSES) ? 1 : 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_X86_DEV_DMA_OPS) && defined(CONFIG_PCI_DOMAINS)
++ static LIST_HEAD(dma_domain_list);
++ static DEFINE_SPINLOCK(dma_domain_list_lock);
++ 
++ void add_dma_domain(struct dma_domain *domain)
++ {
++ 	spin_lock(&dma_domain_list_lock);
++ 	list_add(&domain->node, &dma_domain_list);
++ 	spin_unlock(&dma_domain_list_lock);
++ }
++ EXPORT_SYMBOL_GPL(add_dma_domain);
++ 
++ void del_dma_domain(struct dma_domain *domain)
++ {
++ 	spin_lock(&dma_domain_list_lock);
++ 	list_del(&domain->node);
++ 	spin_unlock(&dma_domain_list_lock);
++ }
++ EXPORT_SYMBOL_GPL(del_dma_domain);
++ 
++ static void set_dma_domain_ops(struct pci_dev *pdev)
++ {
++ 	struct dma_domain *domain;
++ 
++ 	spin_lock(&dma_domain_list_lock);
++ 	list_for_each_entry(domain, &dma_domain_list, node) {
++ 		if (pci_domain_nr(pdev->bus) == domain->domain_nr) {
++ 			pdev->dev.archdata.dma_ops = domain->dma_ops;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock(&dma_domain_list_lock);
++ }
++ #else
++ static void set_dma_domain_ops(struct pci_dev *pdev) {}
++ #endif
++ 
++ static void set_dev_domain_options(struct pci_dev *pdev)
++ {
++ 	if (is_vmd(pdev->bus))
++ 		pdev->hotplug_user_indicators = 1;
++ }
++ 
+++>>>>>>> 3161832d58c7 (x86/PCI: VMD: Request userspace control of PCIe hotplug indicators)
+  int pcibios_add_device(struct pci_dev *dev)
+  {
+  	struct setup_data *data;
+@@@ -673,6 -712,8 +719,11 @@@
+  		pa_data = data->next;
+  		iounmap(data);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	set_dma_domain_ops(dev);
++ 	set_dev_domain_options(dev);
+++>>>>>>> 3161832d58c7 (x86/PCI: VMD: Request userspace control of PCIe hotplug indicators)
+  	return 0;
+  }
+  
+* Unmerged path arch/x86/include/asm/pci.h
+* Unmerged path arch/x86/pci/common.c
+diff --git a/arch/x86/pci/vmd.c b/arch/x86/pci/vmd.c
+index c06f45a0a147..a0a3678b294f 100644
+--- a/arch/x86/pci/vmd.c
++++ b/arch/x86/pci/vmd.c
+@@ -568,6 +568,7 @@ static int vmd_enable_domain(struct vmd_dev *vmd)
+ 		.parent = res,
+ 	};
+ 
++	sd->vmd_domain = true;
+ 	sd->domain = vmd_find_free_domain();
+ 	if (sd->domain < 0)
+ 		return sd->domain;
