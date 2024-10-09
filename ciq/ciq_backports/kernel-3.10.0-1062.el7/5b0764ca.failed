@@ -1,0 +1,131 @@
+PCI: Probe for device reset support during enumeration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [pci] Probe for device reset support during enumeration (Lyude Paul) [1628644]
+Rebuild_FUZZ: 95.15%
+commit-author Bjorn Helgaas <bhelgaas@google.com>
+commit 5b0764cac9f1b70a6704b0e546be67c24cc05517
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5b0764ca.failed
+
+Previously we called pci_probe_reset_function() in this path:
+
+  pci_sysfs_init                              # late_initcall
+    for_each_pci_dev(dev)
+      pci_create_sysfs_dev_files(dev)
+        pci_create_capabilities_sysfs(dev)
+          pci_probe_reset_function
+            pci_dev_specific_reset
+            pcie_has_flr
+              pcie_capability_read_dword
+
+pci_sysfs_init() is a late_initcall, and a driver may have already claimed
+one of these devices and enabled runtime power management for it, so the
+device could already be in D3 by the time we get to pci_sysfs_init().
+
+The device itself should respond to the config read even while it's in
+D3hot, but if an upstream bridge is also in D3hot, the read won't even
+reach the device because the bridge won't forward it downstream to the
+device.  If the bridge is a PCIe port, it should complete the read as an
+Unsupported Request, which may be reported to the CPU as an exception or as
+invalid data.
+
+Avoid this case by probing for reset support from pci_init_capabilities(),
+before a driver can claim the device.  The device may be in D3hot, but any
+bridges leading to it should be in D0, so the device's config space should
+be fully accessible at that point.
+
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 5b0764cac9f1b70a6704b0e546be67c24cc05517)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/probe.c
+diff --cc drivers/pci/probe.c
+index 59a917b162c7,489660d0d384..000000000000
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@@ -1832,7 -2116,58 +1832,62 @@@ static void pci_init_capabilities(struc
+  	/* Enable ACS P2P upstream forwarding */
+  	pci_enable_acs(dev);
+  
+++<<<<<<< HEAD
+ +	pci_cleanup_aer_error_status_regs(dev);
+++=======
++ 	/* Precision Time Measurement */
++ 	pci_ptm_init(dev);
++ 
++ 	/* Advanced Error Reporting */
++ 	pci_aer_init(dev);
++ 
++ 	if (pci_probe_reset_function(dev) == 0)
++ 		dev->reset_fn = 1;
++ }
++ 
++ /*
++  * This is the equivalent of pci_host_bridge_msi_domain() that acts on
++  * devices. Firmware interfaces that can select the MSI domain on a
++  * per-device basis should be called from here.
++  */
++ static struct irq_domain *pci_dev_msi_domain(struct pci_dev *dev)
++ {
++ 	struct irq_domain *d;
++ 
++ 	/*
++ 	 * If a domain has been set through the pcibios_add_device()
++ 	 * callback, then this is the one (platform code knows best).
++ 	 */
++ 	d = dev_get_msi_domain(&dev->dev);
++ 	if (d)
++ 		return d;
++ 
++ 	/*
++ 	 * Let's see if we have a firmware interface able to provide
++ 	 * the domain.
++ 	 */
++ 	d = pci_msi_get_device_domain(dev);
++ 	if (d)
++ 		return d;
++ 
++ 	return NULL;
++ }
++ 
++ static void pci_set_msi_domain(struct pci_dev *dev)
++ {
++ 	struct irq_domain *d;
++ 
++ 	/*
++ 	 * If the platform or firmware interfaces cannot supply a
++ 	 * device-specific MSI domain, then inherit the default domain
++ 	 * from the host bridge itself.
++ 	 */
++ 	d = pci_dev_msi_domain(dev);
++ 	if (!d)
++ 		d = dev_get_msi_domain(&dev->bus->dev);
++ 
++ 	dev_set_msi_domain(&dev->dev, d);
+++>>>>>>> 5b0764cac9f1 (PCI: Probe for device reset support during enumeration)
+  }
+  
+  void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index 8b7b99b7e9dc..c25af50542e3 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -1490,11 +1490,10 @@ static int pci_create_capabilities_sysfs(struct pci_dev *dev)
+ 	/* Active State Power Management */
+ 	pcie_aspm_create_sysfs_dev_files(dev);
+ 
+-	if (!pci_probe_reset_function(dev)) {
++	if (dev->reset_fn) {
+ 		retval = device_create_file(&dev->dev, &reset_attr);
+ 		if (retval)
+ 			goto error;
+-		dev->reset_fn = 1;
+ 	}
+ 	return 0;
+ 
+* Unmerged path drivers/pci/probe.c
