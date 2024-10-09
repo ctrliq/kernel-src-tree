@@ -1,0 +1,214 @@
+nfp: flower: support fallback packets from internal ports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit f41dd0595d0668e0197eaacc66ac18703a1be758
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f41dd059.failed
+
+FW may receive a packet with its ingress port marked as an internal port.
+If a rule does not exist to match on this port, the packet will be sent to
+the NFP driver. Modify the flower app to detect packets from such internal
+ports and convert the ingress port to the correct kernel space netdev.
+
+At this point, it is assumed that fallback packets from internal ports are
+to be sent out said port. Therefore, set the redir_egress bool to true on
+detection of these ports.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f41dd0595d0668e0197eaacc66ac18703a1be758)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.c
+index 6689c5777770,d476917c8f7d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@@ -62,6 -35,178 +62,181 @@@ static enum devlink_eswitch_mode eswitc
+  	return DEVLINK_ESWITCH_MODE_SWITCHDEV;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nfp_flower_lookup_internal_port_id(struct nfp_flower_priv *priv,
++ 				   struct net_device *netdev)
++ {
++ 	struct net_device *entry;
++ 	int i, id = 0;
++ 
++ 	rcu_read_lock();
++ 	idr_for_each_entry(&priv->internal_ports.port_ids, entry, i)
++ 		if (entry == netdev) {
++ 			id = i;
++ 			break;
++ 		}
++ 	rcu_read_unlock();
++ 
++ 	return id;
++ }
++ 
++ static int
++ nfp_flower_get_internal_port_id(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int id;
++ 
++ 	id = nfp_flower_lookup_internal_port_id(priv, netdev);
++ 	if (id > 0)
++ 		return id;
++ 
++ 	idr_preload(GFP_ATOMIC);
++ 	spin_lock_bh(&priv->internal_ports.lock);
++ 	id = idr_alloc(&priv->internal_ports.port_ids, netdev,
++ 		       NFP_MIN_INT_PORT_ID, NFP_MAX_INT_PORT_ID, GFP_ATOMIC);
++ 	spin_unlock_bh(&priv->internal_ports.lock);
++ 	idr_preload_end();
++ 
++ 	return id;
++ }
++ 
++ u32 nfp_flower_get_port_id_from_netdev(struct nfp_app *app,
++ 				       struct net_device *netdev)
++ {
++ 	int ext_port;
++ 
++ 	if (nfp_netdev_is_nfp_repr(netdev)) {
++ 		return nfp_repr_get_port_id(netdev);
++ 	} else if (nfp_flower_internal_port_can_offload(app, netdev)) {
++ 		ext_port = nfp_flower_get_internal_port_id(app, netdev);
++ 		if (ext_port < 0)
++ 			return 0;
++ 
++ 		return nfp_flower_internal_port_get_port_id(ext_port);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct net_device *
++ nfp_flower_get_netdev_from_internal_port_id(struct nfp_app *app, int port_id)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	struct net_device *netdev;
++ 
++ 	rcu_read_lock();
++ 	netdev = idr_find(&priv->internal_ports.port_ids, port_id);
++ 	rcu_read_unlock();
++ 
++ 	return netdev;
++ }
++ 
++ static void
++ nfp_flower_free_internal_port_id(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int id;
++ 
++ 	id = nfp_flower_lookup_internal_port_id(priv, netdev);
++ 	if (!id)
++ 		return;
++ 
++ 	spin_lock_bh(&priv->internal_ports.lock);
++ 	idr_remove(&priv->internal_ports.port_ids, id);
++ 	spin_unlock_bh(&priv->internal_ports.lock);
++ }
++ 
++ static int
++ nfp_flower_internal_port_event_handler(struct nfp_app *app,
++ 				       struct net_device *netdev,
++ 				       unsigned long event)
++ {
++ 	if (event == NETDEV_UNREGISTER &&
++ 	    nfp_flower_internal_port_can_offload(app, netdev))
++ 		nfp_flower_free_internal_port_id(app, netdev);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ static void nfp_flower_internal_port_init(struct nfp_flower_priv *priv)
++ {
++ 	spin_lock_init(&priv->internal_ports.lock);
++ 	idr_init(&priv->internal_ports.port_ids);
++ }
++ 
++ static void nfp_flower_internal_port_cleanup(struct nfp_flower_priv *priv)
++ {
++ 	idr_destroy(&priv->internal_ports.port_ids);
++ }
++ 
++ static struct nfp_flower_non_repr_priv *
++ nfp_flower_non_repr_priv_lookup(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	struct nfp_flower_non_repr_priv *entry;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	list_for_each_entry(entry, &priv->non_repr_priv, list)
++ 		if (entry->netdev == netdev)
++ 			return entry;
++ 
++ 	return NULL;
++ }
++ 
++ void
++ __nfp_flower_non_repr_priv_get(struct nfp_flower_non_repr_priv *non_repr_priv)
++ {
++ 	non_repr_priv->ref_count++;
++ }
++ 
++ struct nfp_flower_non_repr_priv *
++ nfp_flower_non_repr_priv_get(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	struct nfp_flower_non_repr_priv *entry;
++ 
++ 	entry = nfp_flower_non_repr_priv_lookup(app, netdev);
++ 	if (entry)
++ 		goto inc_ref;
++ 
++ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		return NULL;
++ 
++ 	entry->netdev = netdev;
++ 	list_add(&entry->list, &priv->non_repr_priv);
++ 
++ inc_ref:
++ 	__nfp_flower_non_repr_priv_get(entry);
++ 	return entry;
++ }
++ 
++ void
++ __nfp_flower_non_repr_priv_put(struct nfp_flower_non_repr_priv *non_repr_priv)
++ {
++ 	if (--non_repr_priv->ref_count)
++ 		return;
++ 
++ 	list_del(&non_repr_priv->list);
++ 	kfree(non_repr_priv);
++ }
++ 
++ void
++ nfp_flower_non_repr_priv_put(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_non_repr_priv *entry;
++ 
++ 	entry = nfp_flower_non_repr_priv_lookup(app, netdev);
++ 	if (!entry)
++ 		return;
++ 
++ 	__nfp_flower_non_repr_priv_put(entry);
++ }
++ 
+++>>>>>>> f41dd0595d06 (nfp: flower: support fallback packets from internal ports)
+  static enum nfp_repr_type
+  nfp_flower_repr_get_type_and_port(struct nfp_app *app, u32 port_id, u8 *port)
+  {
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
