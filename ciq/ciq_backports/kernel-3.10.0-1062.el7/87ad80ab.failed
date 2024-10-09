@@ -1,0 +1,891 @@
+IB/uverbs: Consolidate uobject destruction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 87ad80abc70d2d5a4e383bc7e63867c9bc660838
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/87ad80ab.failed
+
+There are several flows that can destroy a uobject and each one is
+minimized and sprinkled throughout the code base, making it difficult to
+understand and very hard to modify the destroy path.
+
+Consolidate all of these into uverbs_destroy_uobject() and call it in all
+cases where a uobject has to be destroyed.
+
+This makes one change to the lifecycle, during any abort (eg when
+alloc_commit is not called) we always call out to alloc_abort, even if
+remove_commit needs to be called to delete a HW object.
+
+This also renames RDMA_REMOVE_DURING_CLEANUP to RDMA_REMOVE_ABORT to
+clarify its actual usage and revises some of the comments to reflect what
+the life cycle is for the type implementation.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 87ad80abc70d2d5a4e383bc7e63867c9bc660838)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+#	include/rdma/uverbs_types.h
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,aa1d16d87746..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -128,12 -129,125 +128,101 @@@ static int uverbs_try_lock_object(struc
+  	return atomic_cmpxchg(&uobj->usecnt, 0, -1) == 0 ? 0 : -EBUSY;
+  }
+  
++ static void assert_uverbs_usecnt(struct ib_uobject *uobj, bool exclusive)
++ {
++ #ifdef CONFIG_LOCKDEP
++ 	if (exclusive)
++ 		WARN_ON(atomic_read(&uobj->usecnt) != -1);
++ 	else
++ 		WARN_ON(atomic_read(&uobj->usecnt) <= 0);
++ #endif
++ }
++ 
++ /*
++  * This must be called with the hw_destroy_rwsem locked (except for
++  * RDMA_REMOVE_ABORT) for read or write, also The uobject itself must be
++  * locked for write.
++  *
++  * Upon return the HW object is guaranteed to be destroyed.
++  *
++  * For RDMA_REMOVE_ABORT, the hw_destroy_rwsem is not required to be held,
++  * however the type's allocat_commit function cannot have been called and the
++  * uobject cannot be on the uobjects_lists
++  *
++  * For RDMA_REMOVE_DESTROY the caller shold be holding a kref (eg via
++  * rdma_lookup_get_uobject) and the object is left in a state where the caller
++  * needs to call rdma_lookup_put_uobject.
++  *
++  * For all other destroy modes this function internally unlocks the uobject
++  * and consumes the kref on the uobj.
++  */
++ static int uverbs_destroy_uobject(struct ib_uobject *uobj,
++ 				  enum rdma_remove_reason reason)
++ {
++ 	struct ib_uverbs_file *ufile = uobj->ufile;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	assert_uverbs_usecnt(uobj, true);
++ 
++ 	if (uobj->object) {
++ 		ret = uobj->type->type_class->remove_commit(uobj, reason);
++ 		if (ret) {
++ 			if (ib_is_destroy_retryable(ret, reason, uobj))
++ 				return ret;
++ 
++ 			/* Nothing to be done, dangle the memory and move on */
++ 			WARN(true,
++ 			     "ib_uverbs: failed to remove uobject id %d, driver err=%d",
++ 			     uobj->id, ret);
++ 		}
++ 
++ 		uobj->object = NULL;
++ 	}
++ 
++ 	if (reason == RDMA_REMOVE_ABORT) {
++ 		WARN_ON(!list_empty(&uobj->list));
++ 		WARN_ON(!uobj->context);
++ 		uobj->type->type_class->alloc_abort(uobj);
++ 	}
++ 
++ 	uobj->context = NULL;
++ 
++ 	/*
++ 	 * For DESTROY the usecnt is held write locked, the caller is expected
++ 	 * to put it unlock and put the object when done with it.
++ 	 */
++ 	if (reason != RDMA_REMOVE_DESTROY)
++ 		atomic_set(&uobj->usecnt, 0);
++ 
++ 	if (!list_empty(&uobj->list)) {
++ 		spin_lock_irqsave(&ufile->uobjects_lock, flags);
++ 		list_del_init(&uobj->list);
++ 		spin_unlock_irqrestore(&ufile->uobjects_lock, flags);
++ 
++ 		/*
++ 		 * Pairs with the get in rdma_alloc_commit_uobject(), could
++ 		 * destroy uobj.
++ 		 */
++ 		uverbs_uobject_put(uobj);
++ 	}
++ 
++ 	/*
++ 	 * When aborting the stack kref remains owned by the core code, and is
++ 	 * not transferred into the type. Pairs with the get in alloc_uobj
++ 	 */
++ 	if (reason == RDMA_REMOVE_ABORT)
++ 		uverbs_uobject_put(uobj);
++ 
++ 	return 0;
++ }
++ 
+  /*
+ - * uobj_get_destroy destroys the HW object and returns a handle to the uobj
+ - * with a NULL object pointer. The caller must pair this with
+ - * uverbs_put_destroy.
+ + * Does both rdma_lookup_get_uobject() and rdma_remove_commit_uobject(), then
+ + * returns success_res on success (negative errno on failure). For use by
+ + * callers that do not need the uobj.
+   */
+ -struct ib_uobject *__uobj_get_destroy(const struct uverbs_obj_type *type,
+ -				      u32 id, struct ib_uverbs_file *ufile)
+ -{
+ -	struct ib_uobject *uobj;
+ -	int ret;
+ -
+ -	uobj = rdma_lookup_get_uobject(type, ufile, id, true);
+ -	if (IS_ERR(uobj))
+ -		return uobj;
+ -
+ -	ret = rdma_explicit_destroy(uobj);
+ -	if (ret) {
+ -		rdma_lookup_put_uobject(uobj, true);
+ -		return ERR_PTR(ret);
+ -	}
+ -
+ -	return uobj;
+ -}
+ -
+ -/*
+ - * Does both uobj_get_destroy() and uobj_put_destroy().  Returns success_res
+ - * on success (negative errno on failure). For use by callers that do not need
+ - * the uobj.
+ - */
+ -int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
+ +int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
+  			   struct ib_uverbs_file *ufile, int success_res)
+  {
+  	struct ib_uobject *uobj;
+@@@ -150,11 -260,18 +239,16 @@@
+  	return success_res;
+  }
+  
+++<<<<<<< HEAD
+ +static struct ib_uobject *alloc_uobj(struct ib_ucontext *context,
+++=======
++ /* alloc_uobj must be undone by uverbs_destroy_uobject() */
++ static struct ib_uobject *alloc_uobj(struct ib_uverbs_file *ufile,
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  				     const struct uverbs_obj_type *type)
+  {
+ -	struct ib_uobject *uobj;
+ -	struct ib_ucontext *ucontext;
+ -
+ -	ucontext = ib_uverbs_get_ucontext(ufile);
+ -	if (IS_ERR(ucontext))
+ -		return ERR_CAST(ucontext);
+ +	struct ib_uobject *uobj = kzalloc(type->obj_size, GFP_KERNEL);
+  
+ -	uobj = kzalloc(type->obj_size, GFP_KERNEL);
+  	if (!uobj)
+  		return ERR_PTR(-ENOMEM);
+  	/*
+@@@ -361,11 -464,21 +455,21 @@@ static struct ib_uobject *alloc_begin_f
+  }
+  
+  struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ -					    struct ib_uverbs_file *ufile)
+ +					    struct ib_ucontext *ucontext)
+  {
+ -	return type->type_class->alloc_begin(type, ufile);
+ +	return type->type_class->alloc_begin(type, ucontext);
+  }
+  
++ static void alloc_abort_idr_uobject(struct ib_uobject *uobj)
++ {
++ 	ib_rdmacg_uncharge(&uobj->cg_obj, uobj->context->device,
++ 			   RDMACG_RESOURCE_HCA_OBJECT);
++ 
++ 	spin_lock(&uobj->ufile->idr_lock);
++ 	idr_remove(&uobj->ufile->idr, uobj->id);
++ 	spin_unlock(&uobj->ufile->idr_lock);
++ }
++ 
+  static int __must_check remove_commit_idr_uobject(struct ib_uobject *uobj,
+  						  enum rdma_remove_reason why)
+  {
+@@@ -376,26 -489,25 +480,39 @@@
+  
+  	/*
+  	 * We can only fail gracefully if the user requested to destroy the
+ -	 * object or when a retry may be called upon an error.
+ -	 * In the rest of the cases, just remove whatever you can.
+ +	 * object. In the rest of the cases, just remove whatever you can.
+  	 */
+ -	if (ib_is_destroy_retryable(ret, why, uobj))
+ +	if (why == RDMA_REMOVE_DESTROY && ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	uverbs_idr_remove_uobj(uobj);
+++=======
++ 	if (why == RDMA_REMOVE_ABORT)
++ 		return 0;
+  
+- 	return ret;
++ 	alloc_abort_idr_uobject(uobj);
++ 	/* Matches the kref in alloc_commit_idr_uobject */
++ 	uverbs_uobject_put(uobj);
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
++ 
++ 	return 0;
+  }
+  
+  static void alloc_abort_fd_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+ +	struct file *filp = uobj->object;
+ +	int id = uobj_file->uobj.id;
+ +
+ +	/* Unsuccessful NEW */
+ +	fput(filp);
+ +	put_unused_fd(id);
+++=======
++ 	put_unused_fd(uobj->id);
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  }
+  
+  static int __must_check remove_commit_fd_uobject(struct ib_uobject *uobj,
+@@@ -403,64 -515,21 +520,68 @@@
+  {
+  	const struct uverbs_obj_fd_type *fd_type =
+  		container_of(uobj->type, struct uverbs_obj_fd_type, type);
+ -	int ret = fd_type->context_closed(uobj, why);
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+ +	int ret = fd_type->context_closed(uobj_file, why);
+  
+ -	if (ib_is_destroy_retryable(ret, why, uobj))
+ +	if (why == RDMA_REMOVE_DESTROY && ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (why == RDMA_REMOVE_DURING_CLEANUP) {
+ +		alloc_abort_fd_uobject(uobj);
+ +		return ret;
+ +	}
+ +
+ +	uobj_file->uobj.context = NULL;
+ +	return ret;
+ +}
+ +
+ +static void assert_uverbs_usecnt(struct ib_uobject *uobj, bool exclusive)
+ +{
+ +#ifdef CONFIG_LOCKDEP
+ +	if (exclusive)
+ +		WARN_ON(atomic_read(&uobj->usecnt) != -1);
+ +	else
+ +		WARN_ON(atomic_read(&uobj->usecnt) <= 0);
+ +#endif
+ +}
+ +
+ +static int __must_check _rdma_remove_commit_uobject(struct ib_uobject *uobj,
+ +						    enum rdma_remove_reason why)
+ +{
+ +	int ret;
+ +	struct ib_ucontext *ucontext = uobj->context;
+ +
+ +	ret = uobj->type->type_class->remove_commit(uobj, why);
+ +	if (ret && why == RDMA_REMOVE_DESTROY) {
+ +		/* We couldn't remove the object, so just unlock the uobject */
+ +		atomic_set(&uobj->usecnt, 0);
+ +		uobj->type->type_class->lookup_put(uobj, true);
+ +	} else {
+ +		mutex_lock(&ucontext->uobjects_lock);
+ +		list_del(&uobj->list);
+ +		mutex_unlock(&ucontext->uobjects_lock);
+ +		/* put the ref we took when we created the object */
+ +		uverbs_uobject_put(uobj);
+ +	}
+ +
+ +	return ret;
+++=======
++ 	return 0;
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  }
+  
+ -int rdma_explicit_destroy(struct ib_uobject *uobject)
+ +/* This is called only for user requested DESTROY reasons */
+ +int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj)
+  {
+  	int ret;
+ -	struct ib_uverbs_file *ufile = uobject->ufile;
+ +	struct ib_ucontext *ucontext = uobj->context;
+  
+ +	/* put the ref count we took at lookup_get */
+ +	uverbs_uobject_put(uobj);
+  	/* Cleanup is running. Calling this should have been impossible */
+ -	if (!down_read_trylock(&ufile->hw_destroy_rwsem)) {
+ +	if (!down_read_trylock(&ucontext->cleanup_rwsem)) {
+  		WARN(true, "ib_uverbs: Cleanup is running while removing an uobject\n");
+  		return 0;
+  	}
+@@@ -477,98 -545,102 +598,123 @@@ static int null_obj_type_class_remove_c
+  	return 0;
+  }
+  
+ -static int alloc_commit_fd_uobject(struct ib_uobject *uobj)
+ +static const struct uverbs_obj_type null_obj_type = {
+ +	.type_class = &((const struct uverbs_obj_type_class){
+ +			.remove_commit = null_obj_type_class_remove_commit,
+ +			/* be cautious */
+ +			.needs_kfree_rcu = true}),
+ +};
+ +
+ +int rdma_explicit_destroy(struct ib_uobject *uobject)
+  {
+ -	const struct uverbs_obj_fd_type *fd_type =
+ -		container_of(uobj->type, struct uverbs_obj_fd_type, type);
+ -	int fd = uobj->id;
+ -	struct file *filp;
+ +	int ret;
+ +	struct ib_ucontext *ucontext = uobject->context;
+  
+ -	/*
+ -	 * The kref for uobj is moved into filp->private data and put in
+ -	 * uverbs_close_fd(). Once alloc_commit() succeeds uverbs_close_fd()
+ -	 * must be guaranteed to be called from the provided fops release
+ -	 * callback.
+ -	 */
+ -	filp = anon_inode_getfile(fd_type->name,
+ -				  fd_type->fops,
+ -				  uobj,
+ -				  fd_type->flags);
+ -	if (IS_ERR(filp))
+ -		return PTR_ERR(filp);
+ +	/* Cleanup is running. Calling this should have been impossible */
+ +	if (!down_read_trylock(&ucontext->cleanup_rwsem)) {
+ +		WARN(true, "ib_uverbs: Cleanup is running while removing an uobject\n");
+ +		return 0;
+ +	}
+++<<<<<<< HEAD
+ +	assert_uverbs_usecnt(uobject, true);
+ +	ret = uobject->type->type_class->remove_commit(uobject,
+ +						       RDMA_REMOVE_DESTROY);
+ +	if (ret)
+ +		goto out;
+++=======
++ 
+ -	uobj->object = filp;
+++	ret = uverbs_destroy_uobject(uobject, RDMA_REMOVE_DESTROY);
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  
+ -	/* Matching put will be done in uverbs_close_fd() */
+ -	kref_get(&uobj->ufile->ref);
+ +	uobject->type = &null_obj_type;
+  
+ -	/* This shouldn't be used anymore. Use the file object instead */
+ -	uobj->id = 0;
+ +out:
+ +	up_read(&ucontext->cleanup_rwsem);
+ +	return ret;
+ +}
+  
+ +static void alloc_commit_idr_uobject(struct ib_uobject *uobj)
+ +{
+ +	spin_lock(&uobj->context->ufile->idr_lock);
+  	/*
+ -	 * NOTE: Once we install the file we loose ownership of our kref on
+ -	 * uobj. It will be put by uverbs_close_fd()
+ +	 * We already allocated this IDR with a NULL object, so
+ +	 * this shouldn't fail.
+  	 */
+ -	fd_install(fd, filp);
+ -
+ -	return 0;
+ +	WARN_ON(idr_replace(&uobj->context->ufile->idr,
+ +			    uobj, uobj->id));
+ +	spin_unlock(&uobj->context->ufile->idr_lock);
+  }
+  
+ -/*
+ - * In all cases rdma_alloc_commit_uobject() consumes the kref to uobj and the
+ - * caller can no longer assume uobj is valid. If this function fails it
+ - * destroys the uboject, including the attached HW object.
+ - */
+ -int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+ +static void alloc_commit_fd_uobject(struct ib_uobject *uobj)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+ -	int ret;
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+  
+ +	fd_install(uobj_file->uobj.id, uobj->object);
+ +	/* This shouldn't be used anymore. Use the file object instead */
+ +	uobj_file->uobj.id = 0;
+ +	/* Get another reference as we export this to the fops */
+ +	uverbs_uobject_get(&uobj_file->uobj);
+ +}
+ +
+ +int rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+ +{
+  	/* Cleanup is running. Calling this should have been impossible */
+ -	if (!down_read_trylock(&ufile->hw_destroy_rwsem)) {
+ +	if (!down_read_trylock(&uobj->context->cleanup_rwsem)) {
+ +		int ret;
+ +
+  		WARN(true, "ib_uverbs: Cleanup is running while allocating an uobject\n");
+- 		ret = uobj->type->type_class->remove_commit(uobj,
+- 							    RDMA_REMOVE_DURING_CLEANUP);
+- 		if (ret)
+- 			pr_warn("ib_uverbs: cleanup of idr object %d failed\n",
+- 				uobj->id);
++ 		uverbs_destroy_uobject(uobj, RDMA_REMOVE_ABORT);
++ 		return -EINVAL;
++ 	}
++ 
+++<<<<<<< HEAD
+++=======
++ 	/* alloc_commit consumes the uobj kref */
++ 	ret = uobj->type->type_class->alloc_commit(uobj);
++ 	if (ret) {
++ 		uverbs_destroy_uobject(uobj, RDMA_REMOVE_ABORT);
+  		return ret;
+  	}
+  
++ 	/* kref is held so long as the uobj is on the uobj list. */
++ 	uverbs_uobject_get(uobj);
++ 	spin_lock_irq(&ufile->uobjects_lock);
++ 	list_add(&uobj->list, &ufile->uobjects);
++ 	spin_unlock_irq(&ufile->uobjects_lock);
++ 
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  	/* matches atomic_set(-1) in alloc_uobj */
+ +	assert_uverbs_usecnt(uobj, true);
+  	atomic_set(&uobj->usecnt, 0);
+  
+ -	up_read(&ufile->hw_destroy_rwsem);
+ +	mutex_lock(&uobj->context->uobjects_lock);
+ +	list_add(&uobj->list, &uobj->context->uobjects);
+ +	mutex_unlock(&uobj->context->uobjects_lock);
+ +
+ +	uobj->type->type_class->alloc_commit(uobj);
+ +	up_read(&uobj->context->cleanup_rwsem);
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void alloc_abort_idr_uobject(struct ib_uobject *uobj)
+ +{
+ +	uverbs_idr_remove_uobj(uobj);
+ +	uverbs_uobject_put(uobj);
+ +}
+ +
+++=======
++ /*
++  * This consumes the kref for uobj. It is up to the caller to unwind the HW
++  * object and anything else connected to uobj before calling this.
++  */
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  void rdma_alloc_abort_uobject(struct ib_uobject *uobj)
+  {
+- 	uobj->type->type_class->alloc_abort(uobj);
++ 	uobj->object = NULL;
++ 	uverbs_destroy_uobject(uobj, RDMA_REMOVE_ABORT);
+  }
+  
+  static void lookup_put_idr_uobject(struct ib_uobject *uobj, bool exclusive)
+@@@ -623,105 -696,182 +769,217 @@@ const struct uverbs_obj_type_class uver
+  	 */
+  	.needs_kfree_rcu = true,
+  };
+ -EXPORT_SYMBOL(uverbs_idr_class);
+  
+ -void uverbs_close_fd(struct file *f)
+++<<<<<<< HEAD
+ +static void _uverbs_close_fd(struct ib_uobject_file *uobj_file)
+  {
+ -	struct ib_uobject *uobj = f->private_data;
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+ +	struct ib_ucontext *ucontext;
+ +	struct ib_uverbs_file *ufile = uobj_file->ufile;
+ +	int ret;
+ +
+ +	mutex_lock(&uobj_file->ufile->cleanup_mutex);
+ +
+ +	/* uobject was either already cleaned up or is cleaned up right now anyway */
+ +	if (!uobj_file->uobj.context ||
+ +	    !down_read_trylock(&uobj_file->uobj.context->cleanup_rwsem))
+ +		goto unlock;
+ +
+ +	ucontext = uobj_file->uobj.context;
+ +	ret = _rdma_remove_commit_uobject(&uobj_file->uobj, RDMA_REMOVE_CLOSE);
+ +	up_read(&ucontext->cleanup_rwsem);
+ +	if (ret)
+ +		pr_warn("uverbs: unable to clean up uobject file in uverbs_close_fd.\n");
+ +unlock:
+ +	mutex_unlock(&ufile->cleanup_mutex);
+ +}
+  
+++=======
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+ +void uverbs_close_fd(struct file *f)
+ +{
+ +	struct ib_uobject_file *uobj_file = f->private_data;
+ +	struct kref *uverbs_file_ref = &uobj_file->ufile->ref;
+ +
+++<<<<<<< HEAD
+ +	_uverbs_close_fd(uobj_file);
+ +	uverbs_uobject_put(&uobj_file->uobj);
+ +	kref_put(uverbs_file_ref, ib_uverbs_release_file);
+++=======
++ 	if (down_read_trylock(&ufile->hw_destroy_rwsem)) {
++ 		/*
++ 		 * lookup_get_fd_uobject holds the kref on the struct file any
++ 		 * time a FD uobj is locked, which prevents this release
++ 		 * method from being invoked. Meaning we can always get the
++ 		 * write lock here, or we have a kernel bug.
++ 		 */
++ 		WARN_ON(uverbs_try_lock_object(uobj, true));
++ 		uverbs_destroy_uobject(uobj, RDMA_REMOVE_CLOSE);
++ 		up_read(&ufile->hw_destroy_rwsem);
++ 	}
++ 
++ 	/* Matches the get in alloc_begin_fd_uobject */
++ 	kref_put(&ufile->ref, ib_uverbs_release_file);
++ 
++ 	/* Pairs with filp->private_data in alloc_begin_fd_uobject */
++ 	uverbs_uobject_put(uobj);
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  }
+  
+ -static void ufile_disassociate_ucontext(struct ib_ucontext *ibcontext)
+ -{
+ -	struct ib_device *ib_dev = ibcontext->device;
+ -	struct task_struct *owning_process  = NULL;
+ -	struct mm_struct   *owning_mm       = NULL;
+ -
+ -	owning_process = get_pid_task(ibcontext->tgid, PIDTYPE_PID);
+ -	if (!owning_process)
+ -		return;
+ -
+ -	owning_mm = get_task_mm(owning_process);
+ -	if (!owning_mm) {
+ -		pr_info("no mm, disassociate ucontext is pending task termination\n");
+ -		while (1) {
+ -			put_task_struct(owning_process);
+ -			usleep_range(1000, 2000);
+ -			owning_process = get_pid_task(ibcontext->tgid,
+ -						      PIDTYPE_PID);
+ -			if (!owning_process ||
+ -			    owning_process->state == TASK_DEAD) {
+ -				pr_info("disassociate ucontext done, task was terminated\n");
+ -				/* in case task was dead need to release the
+ -				 * task struct.
+ +void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed)
+ +{
+ +	enum rdma_remove_reason reason = device_removed ?
+ +		RDMA_REMOVE_DRIVER_REMOVE : RDMA_REMOVE_CLOSE;
+ +	unsigned int cur_order = 0;
+ +
+ +	ucontext->cleanup_reason = reason;
+ +	/*
+ +	 * Waits for all remove_commit and alloc_commit to finish. Logically, We
+ +	 * want to hold this forever as the context is going to be destroyed,
+ +	 * but we'll release it since it causes a "held lock freed" BUG message.
+ +	 */
+ +	down_write(&ucontext->cleanup_rwsem);
+ +
+ +	while (!list_empty(&ucontext->uobjects)) {
+ +		struct ib_uobject *obj, *next_obj;
+ +		unsigned int next_order = UINT_MAX;
+ +
+ +		/*
+ +		 * This shouldn't run while executing other commands on this
+ +		 * context. Thus, the only thing we should take care of is
+ +		 * releasing a FD while traversing this list. The FD could be
+ +		 * closed and released from the _release fop of this FD.
+ +		 * In order to mitigate this, we add a lock.
+ +		 * We take and release the lock per order traversal in order
+ +		 * to let other threads (which might still use the FDs) chance
+ +		 * to run.
+ +		 */
+ +		mutex_lock(&ucontext->uobjects_lock);
+ +		list_for_each_entry_safe(obj, next_obj, &ucontext->uobjects,
+ +					 list) {
+ +			if (obj->type->destroy_order == cur_order) {
+ +				int ret;
+ +
+ +				/*
+ +				 * if we hit this WARN_ON, that means we are
+ +				 * racing with a lookup_get.
+  				 */
+ -				if (owning_process)
+ -					put_task_struct(owning_process);
+ -				return;
+ +				WARN_ON(uverbs_try_lock_object(obj, true));
+ +				ret = obj->type->type_class->remove_commit(obj,
+ +									   reason);
+ +				list_del(&obj->list);
+ +				if (ret)
+ +					pr_warn("ib_uverbs: failed to remove uobject id %d order %u\n",
+ +						obj->id, cur_order);
+ +				/* put the ref we took when we created the object */
+ +				uverbs_uobject_put(obj);
+ +			} else {
+ +				next_order = min(next_order,
+ +						 obj->type->destroy_order);
+  			}
+  		}
+ +		mutex_unlock(&ucontext->uobjects_lock);
+ +		cur_order = next_order;
+  	}
+ -
+ -	down_write(&owning_mm->mmap_sem);
+ -	ib_dev->disassociate_ucontext(ibcontext);
+ -	up_write(&owning_mm->mmap_sem);
+ -	mmput(owning_mm);
+ -	put_task_struct(owning_process);
+ +	up_write(&ucontext->cleanup_rwsem);
+  }
+  
+ -/*
+ - * Drop the ucontext off the ufile and completely disconnect it from the
+ - * ib_device
+ - */
+ -static void ufile_destroy_ucontext(struct ib_uverbs_file *ufile,
+ -				   enum rdma_remove_reason reason)
+ +void uverbs_initialize_ucontext(struct ib_ucontext *ucontext)
+  {
+ -	struct ib_ucontext *ucontext = ufile->ucontext;
+ -	int ret;
+ -
+ -	if (reason == RDMA_REMOVE_DRIVER_REMOVE)
+ -		ufile_disassociate_ucontext(ucontext);
+ -
+ -	put_pid(ucontext->tgid);
+ -	ib_rdmacg_uncharge(&ucontext->cg_obj, ucontext->device,
+ -			   RDMACG_RESOURCE_HCA_HANDLE);
+ -
+ -	/*
+ -	 * FIXME: Drivers are not permitted to fail dealloc_ucontext, remove
+ -	 * the error return.
+ -	 */
+ -	ret = ucontext->device->dealloc_ucontext(ucontext);
+ -	WARN_ON(ret);
+ -
+ -	ufile->ucontext = NULL;
+ +	ucontext->cleanup_reason = 0;
+ +	mutex_init(&ucontext->uobjects_lock);
+ +	INIT_LIST_HEAD(&ucontext->uobjects);
+ +	init_rwsem(&ucontext->cleanup_rwsem);
+  }
+++<<<<<<< HEAD
+ + 
+++=======
++ 
++ static int __uverbs_cleanup_ufile(struct ib_uverbs_file *ufile,
++ 				  enum rdma_remove_reason reason)
++ {
++ 	struct ib_uobject *obj, *next_obj;
++ 	int ret = -EINVAL;
++ 
++ 	/*
++ 	 * This shouldn't run while executing other commands on this
++ 	 * context. Thus, the only thing we should take care of is
++ 	 * releasing a FD while traversing this list. The FD could be
++ 	 * closed and released from the _release fop of this FD.
++ 	 * In order to mitigate this, we add a lock.
++ 	 * We take and release the lock per traversal in order to let
++ 	 * other threads (which might still use the FDs) chance to run.
++ 	 */
++ 	list_for_each_entry_safe(obj, next_obj, &ufile->uobjects, list) {
++ 		/*
++ 		 * if we hit this WARN_ON, that means we are
++ 		 * racing with a lookup_get.
++ 		 */
++ 		WARN_ON(uverbs_try_lock_object(obj, true));
++ 		if (!uverbs_destroy_uobject(obj, reason))
++ 			ret = 0;
++ 	}
++ 	return ret;
++ }
++ 
++ /*
++  * Destroy the uncontext and every uobject associated with it. If called with
++  * reason != RDMA_REMOVE_CLOSE this will not return until the destruction has
++  * been completed and ufile->ucontext is NULL.
++  *
++  * This is internally locked and can be called in parallel from multiple
++  * contexts.
++  */
++ void uverbs_destroy_ufile_hw(struct ib_uverbs_file *ufile,
++ 			     enum rdma_remove_reason reason)
++ {
++ 	if (reason == RDMA_REMOVE_CLOSE) {
++ 		/*
++ 		 * During destruction we might trigger something that
++ 		 * synchronously calls release on any file descriptor. For
++ 		 * this reason all paths that come from file_operations
++ 		 * release must use try_lock. They can progress knowing that
++ 		 * there is an ongoing uverbs_destroy_ufile_hw that will clean
++ 		 * up the driver resources.
++ 		 */
++ 		if (!mutex_trylock(&ufile->ucontext_lock))
++ 			return;
++ 
++ 	} else {
++ 		mutex_lock(&ufile->ucontext_lock);
++ 	}
++ 
++ 	down_write(&ufile->hw_destroy_rwsem);
++ 
++ 	/*
++ 	 * If a ucontext was never created then we can't have any uobjects to
++ 	 * cleanup, nothing to do.
++ 	 */
++ 	if (!ufile->ucontext)
++ 		goto done;
++ 
++ 	ufile->ucontext->closing = true;
++ 	ufile->ucontext->cleanup_retryable = true;
++ 	while (!list_empty(&ufile->uobjects))
++ 		if (__uverbs_cleanup_ufile(ufile, reason)) {
++ 			/*
++ 			 * No entry was cleaned-up successfully during this
++ 			 * iteration
++ 			 */
++ 			break;
++ 		}
++ 
++ 	ufile->ucontext->cleanup_retryable = false;
++ 	if (!list_empty(&ufile->uobjects))
++ 		__uverbs_cleanup_ufile(ufile, reason);
++ 
++ 	ufile_destroy_ucontext(ufile, reason);
++ 
++ done:
++ 	up_write(&ufile->hw_destroy_rwsem);
++ 	mutex_unlock(&ufile->ucontext_lock);
++ }
++ 
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  const struct uverbs_obj_type_class uverbs_fd_class = {
+  	.alloc_begin = alloc_begin_fd_uobject,
+  	.lookup_get = lookup_get_fd_uobject,
+diff --cc include/rdma/uverbs_types.h
+index cc04ec65588d,875dd8c16ba3..000000000000
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@@ -38,53 -38,49 +38,54 @@@
+  
+  struct uverbs_obj_type;
+  
++ /*
++  * The following sequences are valid:
++  * Success flow:
++  *   alloc_begin
++  *   alloc_commit
++  *    [..]
++  * Access flow:
++  *   lookup_get(exclusive=false) & uverbs_try_lock_object
++  *   lookup_put(exclusive=false) via rdma_lookup_put_uobject
++  * Destruction flow:
++  *   lookup_get(exclusive=true) & uverbs_try_lock_object
++  *   remove_commit
++  *   lookup_put(exclusive=true) via rdma_lookup_put_uobject
++  *
++  * Allocate Error flow #1
++  *   alloc_begin
++  *   alloc_abort
++  * Allocate Error flow #2
++  *   alloc_begin
++  *   remove_commit
++  *   alloc_abort
++  * Allocate Error flow #3
++  *   alloc_begin
++  *   alloc_commit (fails)
++  *   remove_commit
++  *   alloc_abort
++  *
++  * In all cases the caller must hold the ufile kref until alloc_commit or
++  * alloc_abort returns.
++  */
+  struct uverbs_obj_type_class {
+- 	/*
+- 	 * Get an ib_uobject that corresponds to the given id from ucontext,
+- 	 * These functions could create or destroy objects if required.
+- 	 * The action will be finalized only when commit, abort or put fops are
+- 	 * called.
+- 	 * The flow of the different actions is:
+- 	 * [alloc]:	 Starts with alloc_begin. The handlers logic is than
+- 	 *		 executed. If the handler is successful, alloc_commit
+- 	 *		 is called and the object is inserted to the repository.
+- 	 *		 Once alloc_commit completes the object is visible to
+- 	 *		 other threads and userspace.
+- 	 e		 Otherwise, alloc_abort is called and the object is
+- 	 *		 destroyed.
+- 	 * [lookup]:	 Starts with lookup_get which fetches and locks the
+- 	 *		 object. After the handler finished using the object, it
+- 	 *		 needs to call lookup_put to unlock it. The exclusive
+- 	 *		 flag indicates if the object is locked for exclusive
+- 	 *		 access.
+- 	 * [remove]:	 Starts with lookup_get with exclusive flag set. This
+- 	 *		 locks the object for exclusive access. If the handler
+- 	 *		 code completed successfully, remove_commit is called
+- 	 *		 and the ib_uobject is removed from the context's
+- 	 *		 uobjects repository and put. The object itself is
+- 	 *		 destroyed as well. Once remove succeeds new krefs to
+- 	 *		 the object cannot be acquired by other threads or
+- 	 *		 userspace and the hardware driver is removed from the
+- 	 *		 object. Other krefs on the object may still exist.
+- 	 *		 If the handler code failed, lookup_put should be
+- 	 *		 called. This callback is used when the context
+- 	 *		 is destroyed as well (process termination,
+- 	 *		 reset flow).
+- 	 */
+  	struct ib_uobject *(*alloc_begin)(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +					  struct ib_ucontext *ucontext);
+ +	void (*alloc_commit)(struct ib_uobject *uobj);
+++=======
++ 					  struct ib_uverbs_file *ufile);
++ 	/* This consumes the kref on uobj */
++ 	int (*alloc_commit)(struct ib_uobject *uobj);
++ 	/* This does not consume the kref on uobj */
+++>>>>>>> 87ad80abc70d (IB/uverbs: Consolidate uobject destruction)
+  	void (*alloc_abort)(struct ib_uobject *uobj);
+  
+  	struct ib_uobject *(*lookup_get)(const struct uverbs_obj_type *type,
+ -					 struct ib_uverbs_file *ufile, s64 id,
+ +					 struct ib_ucontext *ucontext, int id,
+  					 bool exclusive);
+  	void (*lookup_put)(struct ib_uobject *uobj, bool exclusive);
+- 	/*
+- 	 * Must be called with the exclusive lock held. If successful uobj is
+- 	 * invalid on return. On failure uobject is left completely
+- 	 * unchanged
+- 	 */
++ 	/* This does not consume the kref on uobj */
+  	int __must_check (*remove_commit)(struct ib_uobject *uobj,
+  					  enum rdma_remove_reason why);
+  	u8    needs_kfree_rcu;
+* Unmerged path drivers/infiniband/core/rdma_core.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index f069d7abc349..3706c5bb3cbd 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1449,8 +1449,8 @@ enum rdma_remove_reason {
+ 	RDMA_REMOVE_CLOSE,
+ 	/* Driver is being hot-unplugged. This call should delete the actual object itself */
+ 	RDMA_REMOVE_DRIVER_REMOVE,
+-	/* Context is being cleaned-up, but commit was just completed */
+-	RDMA_REMOVE_DURING_CLEANUP,
++	/* uobj is being cleaned-up before being committed */
++	RDMA_REMOVE_ABORT,
+ };
+ 
+ struct ib_ucontext {
+* Unmerged path include/rdma/uverbs_types.h
