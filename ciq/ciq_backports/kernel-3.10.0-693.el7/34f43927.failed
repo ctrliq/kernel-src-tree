@@ -1,0 +1,201 @@
+perf: Add per event clockid support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 34f439278cef7b1177f8ce24f9fc81dfc6221d3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/34f43927.failed
+
+While thinking on the whole clock discussion it occurred to me we have
+two distinct uses of time:
+
+ 1) the tracking of event/ctx/cgroup enabled/running/stopped times
+    which includes the self-monitoring support in struct
+    perf_event_mmap_page.
+
+ 2) the actual timestamps visible in the data records.
+
+And we've been conflating them.
+
+The first is all about tracking time deltas, nobody should really care
+in what time base that happens, its all relative information, as long
+as its internally consistent it works.
+
+The second however is what people are worried about when having to
+merge their data with external sources. And here we have the
+discussion on MONOTONIC vs MONOTONIC_RAW etc..
+
+Where MONOTONIC is good for correlating between machines (static
+offset), MONOTNIC_RAW is required for correlating against a fixed rate
+hardware clock.
+
+This means configurability; now 1) makes that hard because it needs to
+be internally consistent across groups of unrelated events; which is
+why we had to have a global perf_clock().
+
+However, for 2) it doesn't really matter, perf itself doesn't care
+what it writes into the buffer.
+
+The below patch makes the distinction between these two cases by
+adding perf_event_clock() which is used for the second case. It
+further makes this configurable on a per-event basis, but adds a few
+sanity checks such that we cannot combine events with different clocks
+in confusing ways.
+
+And since we then have per-event configurability we might as well
+retain the 'legacy' behaviour as a default.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 34f439278cef7b1177f8ce24f9fc81dfc6221d3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	include/uapi/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index 5cc9c95e9e00,401554074de9..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -186,10 -173,7 +186,14 @@@ struct perf_event
+   * pmu::capabilities flags
+   */
+  #define PERF_PMU_CAP_NO_INTERRUPT		0x01
+++<<<<<<< HEAD
+ +#define PERF_PMU_CAP_AUX_NO_SG			0x04
+ +#define PERF_PMU_CAP_AUX_SW_DOUBLEBUF		0x08
+ +#define PERF_PMU_CAP_EXCLUSIVE			0x10
+ +#define PERF_PMU_CAP_ITRACE			0x20
+++=======
++ #define PERF_PMU_CAP_NO_NMI			0x02
+++>>>>>>> 34f439278cef (perf: Add per event clockid support)
+  
+  /**
+   * struct pmu - generic performance monitoring unit
+diff --cc include/uapi/linux/perf_event.h
+index f2a1c58ccd91,3bb40ddadbe5..000000000000
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@@ -336,14 -325,9 +336,19 @@@ struct perf_event_attr 
+  				exclude_callchain_kernel : 1, /* exclude kernel callchains */
+  				exclude_callchain_user   : 1, /* exclude user callchains */
+  				mmap2          :  1, /* include mmap with inode data     */
+ +
+ +#ifdef __GENKSYMS__
+ +				__reserved_1   : 40;
+ +#else
+  				comm_exec      :  1, /* flag comm events that are due to an exec */
+++<<<<<<< HEAD
+ +				context_switch :  1, /* context switch data */
+ +				__reserved_1   : 38;
+ +#endif
+++=======
++ 				use_clockid    :  1, /* use @clockid for time fields */
++ 				__reserved_1   : 38;
+++>>>>>>> 34f439278cef (perf: Add per event clockid support)
+  
+  	union {
+  		__u32		wakeup_events;	  /* wakeup every n events */
+diff --cc kernel/events/core.c
+index 11d74ee5dbf9,c40c2cac2d8e..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -558,6 -327,33 +558,36 @@@ static inline u64 perf_clock(void
+  	return local_clock();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 perf_event_clock(struct perf_event *event)
++ {
++ 	return event->clock();
++ }
++ 
++ static inline struct perf_cpu_context *
++ __get_cpu_context(struct perf_event_context *ctx)
++ {
++ 	return this_cpu_ptr(ctx->pmu->pmu_cpu_context);
++ }
++ 
++ static void perf_ctx_lock(struct perf_cpu_context *cpuctx,
++ 			  struct perf_event_context *ctx)
++ {
++ 	raw_spin_lock(&cpuctx->ctx.lock);
++ 	if (ctx)
++ 		raw_spin_lock(&ctx->lock);
++ }
++ 
++ static void perf_ctx_unlock(struct perf_cpu_context *cpuctx,
++ 			    struct perf_event_context *ctx)
++ {
++ 	if (ctx)
++ 		raw_spin_unlock(&ctx->lock);
++ 	raw_spin_unlock(&cpuctx->ctx.lock);
++ }
++ 
+++>>>>>>> 34f439278cef (perf: Add per event clockid support)
+  #ifdef CONFIG_CGROUP_PERF
+  
+  static inline bool
+@@@ -8298,10 -7440,9 +8340,16 @@@ perf_event_set_output(struct perf_even
+  		goto out;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * If both events generate aux data, they must be on the same PMU
+ +	 */
+ +	if (has_aux(event) && has_aux(output_event) &&
+ +	    event->pmu != output_event->pmu)
+++=======
++ 	 * Mixing clocks in the same buffer is trouble you don't need.
++ 	 */
++ 	if (output_event->clock != event->clock)
+++>>>>>>> 34f439278cef (perf: Add per event clockid support)
+  		goto out;
+  
+  set:
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 6a6078e4d0d5..59d1c3df0d3f 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -2143,13 +2143,23 @@ void arch_perf_update_userpage(struct perf_event *event,
+ 
+ 	data = cyc2ns_read_begin();
+ 
++	/*
++	 * Internal timekeeping for enabled/running/stopped times
++	 * is always in the local_clock domain.
++	 */
+ 	userpg->cap_user_time = 1;
+ 	userpg->time_mult = data->cyc2ns_mul;
+ 	userpg->time_shift = data->cyc2ns_shift;
+ 	userpg->time_offset = data->cyc2ns_offset - now;
+ 
+-	userpg->cap_user_time_zero = 1;
+-	userpg->time_zero = data->cyc2ns_offset;
++	/*
++	 * cap_user_time_zero doesn't make sense when we're using a different
++	 * time base for the records.
++	 */
++	if (event->clock == &local_clock) {
++		userpg->cap_user_time_zero = 1;
++		userpg->time_zero = data->cyc2ns_offset;
++	}
+ 
+ 	cyc2ns_read_end(data);
+ }
+* Unmerged path include/linux/perf_event.h
+* Unmerged path include/uapi/linux/perf_event.h
+* Unmerged path kernel/events/core.c
