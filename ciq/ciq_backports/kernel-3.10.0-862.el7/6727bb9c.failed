@@ -1,0 +1,309 @@
+kernel/module.c: avoid ifdefs for sig_enforce declaration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [kernel] module: avoid ifdefs for sig_enforce declaration (Bruno Eduardo de Oliveira Meneguele) [1531454]
+Rebuild_FUZZ: 91.43%
+commit-author Luis R. Rodriguez <mcgrof@suse.com>
+commit 6727bb9c6abe836d88191ce13bfdd7a53c245e15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6727bb9c.failed
+
+There's no need to require an ifdef over the declaration
+of sig_enforce as IS_ENABLED() can be used. While at it,
+there's no harm in exposing this kernel parameter outside of
+CONFIG_MODULE_SIG as it'd be a no-op on non module sig
+kernels.
+
+Now, technically we should in theory be able to remove
+the #ifdef'ery over the declaration of the module parameter
+as we are also trusting the bool_enable_only code for
+CONFIG_MODULE_SIG kernels but for now remain paranoid
+and keep it.
+
+With time if no one can put a bullet through bool_enable_only
+and if there are no technical requirements over not exposing
+CONFIG_MODULE_SIG_FORCE with the measures in place by
+bool_enable_only we could remove this last ifdef.
+
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: linux-kernel@vger.kernel.org
+	Cc: cocci@systeme.lip6.fr
+	Signed-off-by: Luis R. Rodriguez <mcgrof@suse.com>
+	Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+(cherry picked from commit 6727bb9c6abe836d88191ce13bfdd7a53c245e15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/module.c
+diff --cc kernel/module.c
+index 5c3841c62b3f,427b99f1a4b3..000000000000
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@@ -105,85 -101,201 +105,89 @@@
+  DEFINE_MUTEX(module_mutex);
+  EXPORT_SYMBOL_GPL(module_mutex);
+  static LIST_HEAD(modules);
+ +#ifdef CONFIG_KGDB_KDB
+ +struct list_head *kdb_modules = &modules; /* kdb needs the list of modules */
+ +#endif /* CONFIG_KGDB_KDB */
+  
+ -#ifdef CONFIG_MODULES_TREE_LOOKUP
+ +DEFINE_MUTEX(module_ext_mutex);
+ +LIST_HEAD(modules_ext);
+  
+ -/*
+ - * Use a latched RB-tree for __module_address(); this allows us to use
+ - * RCU-sched lookups of the address from any context.
+ - *
+ - * Because modules have two address ranges: init and core, we need two
+ - * latch_tree_nodes entries. Therefore we need the back-pointer from
+ - * mod_tree_node.
+ - *
+ - * Because init ranges are short lived we mark them unlikely and have placed
+ - * them outside the critical cacheline in struct module.
+ - *
+ - * This is conditional on PERF_EVENTS || TRACING because those can really hit
+ - * __module_address() hard by doing a lot of stack unwinding; potentially from
+ - * NMI context.
+ - */
+ -
+ -static __always_inline unsigned long __mod_tree_val(struct latch_tree_node *n)
+ +/* needs to take module_ext_mutex */
+ +struct module_ext *find_module_ext(struct module *mod)
+  {
+ -	struct mod_tree_node *mtn = container_of(n, struct mod_tree_node, node);
+ -	struct module *mod = mtn->mod;
+ +	struct module_ext *mod_ext;
+  
+ -	if (unlikely(mtn == &mod->mtn_init))
+ -		return (unsigned long)mod->module_init;
+ -
+ -	return (unsigned long)mod->module_core;
+ +	list_for_each_entry(mod_ext, &modules_ext, next)
+ +		if (mod == mod_ext->module)
+ +			return mod_ext;
+ +	BUG_ON(1); /* this can't happen */
+  }
+  
+ -static __always_inline unsigned long __mod_tree_size(struct latch_tree_node *n)
+ +bool check_module_rhelversion(struct module *mod, char *version)
+  {
+ -	struct mod_tree_node *mtn = container_of(n, struct mod_tree_node, node);
+ -	struct module *mod = mtn->mod;
+ -
+ -	if (unlikely(mtn == &mod->mtn_init))
+ -		return (unsigned long)mod->init_size;
+ +	struct module_ext *mod_ext;
+ +	bool ret;
+  
+ -	return (unsigned long)mod->core_size;
+ +	ret = false;
+ +	mutex_lock(&module_ext_mutex);
+ +	mod_ext = find_module_ext(mod);
+ +	if (!strncmp(mod_ext->rhelversion, version, strlen(version)))
+ +		ret = true;
+ +	mutex_unlock(&module_ext_mutex);
+ +	return ret;
+  }
+  
+ -static __always_inline bool
+ -mod_tree_less(struct latch_tree_node *a, struct latch_tree_node *b)
+ -{
+ -	return __mod_tree_val(a) < __mod_tree_val(b);
+ -}
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MODULE_SIG
+ +#ifdef CONFIG_MODULE_SIG_FORCE
+ +static bool sig_enforce = true;
+ +#else
+ +static bool sig_enforce = false;
+  
+ -static __always_inline int
+ -mod_tree_comp(void *key, struct latch_tree_node *n)
+ +static int param_set_bool_enable_only(const char *val,
+ +				      const struct kernel_param *kp)
+  {
+ -	unsigned long val = (unsigned long)key;
+ -	unsigned long start, end;
+ +	int err;
+ +	bool test;
+ +	struct kernel_param dummy_kp = *kp;
+  
+ -	start = __mod_tree_val(n);
+ -	if (val < start)
+ -		return -1;
+ +	dummy_kp.arg = &test;
+  
+ -	end = start + __mod_tree_size(n);
+ -	if (val >= end)
+ -		return 1;
+ +	err = param_set_bool(val, &dummy_kp);
+ +	if (err)
+ +		return err;
+  
+ +	/* Don't let them unset it once it's set! */
+ +	if (!test && sig_enforce)
+ +		return -EROFS;
+ +
+ +	if (test)
+ +		sig_enforce = true;
+  	return 0;
+  }
+  
+ -static const struct latch_tree_ops mod_tree_ops = {
+ -	.less = mod_tree_less,
+ -	.comp = mod_tree_comp,
+ -};
+ -
+ -static struct mod_tree_root {
+ -	struct latch_tree_root root;
+ -	unsigned long addr_min;
+ -	unsigned long addr_max;
+ -} mod_tree __cacheline_aligned = {
+ -	.addr_min = -1UL,
+ +static const struct kernel_param_ops param_ops_bool_enable_only = {
+ +	.set = param_set_bool_enable_only,
+ +	.get = param_get_bool,
+  };
+ +#define param_check_bool_enable_only param_check_bool
+  
+ -#define module_addr_min mod_tree.addr_min
+ -#define module_addr_max mod_tree.addr_max
+ -
+ -static noinline void __mod_tree_insert(struct mod_tree_node *node)
+ -{
+ -	latch_tree_insert(&node->node, &mod_tree.root, &mod_tree_ops);
+ -}
+ -
+ -static void __mod_tree_remove(struct mod_tree_node *node)
+ -{
+ -	latch_tree_erase(&node->node, &mod_tree.root, &mod_tree_ops);
+ -}
+ -
+ -/*
+ - * These modifications: insert, remove_init and remove; are serialized by the
+ - * module_mutex.
+ - */
+ -static void mod_tree_insert(struct module *mod)
+ -{
+ -	mod->mtn_core.mod = mod;
+ -	mod->mtn_init.mod = mod;
+ -
+ -	__mod_tree_insert(&mod->mtn_core);
+ -	if (mod->init_size)
+ -		__mod_tree_insert(&mod->mtn_init);
+ -}
+ -
+ -static void mod_tree_remove_init(struct module *mod)
+ -{
+ -	if (mod->init_size)
+ -		__mod_tree_remove(&mod->mtn_init);
+ -}
+ -
+ -static void mod_tree_remove(struct module *mod)
+ -{
+ -	__mod_tree_remove(&mod->mtn_core);
+ -	mod_tree_remove_init(mod);
+ -}
+ -
+ -static struct module *mod_find(unsigned long addr)
+ -{
+ -	struct latch_tree_node *ltn;
+ -
+ -	ltn = latch_tree_find((void *)addr, &mod_tree.root, &mod_tree_ops);
+ -	if (!ltn)
+ -		return NULL;
+ -
+ -	return container_of(ltn, struct mod_tree_node, node)->mod;
+ -}
+ -
+ -#else /* MODULES_TREE_LOOKUP */
+ -
+ -static unsigned long module_addr_min = -1UL, module_addr_max = 0;
+ -
+ -static void mod_tree_insert(struct module *mod) { }
+ -static void mod_tree_remove_init(struct module *mod) { }
+ -static void mod_tree_remove(struct module *mod) { }
+ -
+ -static struct module *mod_find(unsigned long addr)
+ -{
+ -	struct module *mod;
+ -
+ -	list_for_each_entry_rcu(mod, &modules, list) {
+ -		if (within_module(addr, mod))
+ -			return mod;
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+ -#endif /* MODULES_TREE_LOOKUP */
+++=======
+++static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);
+++#ifndef CONFIG_MODULE_SIG_FORCE
+++>>>>>>> 6727bb9c6abe (kernel/module.c: avoid ifdefs for sig_enforce declaration)
+ +module_param(sig_enforce, bool_enable_only, 0644);
+ +#endif /* !CONFIG_MODULE_SIG_FORCE */
+- #endif /* CONFIG_MODULE_SIG */
+  
+  /*
+ - * Bounds of module text, for speeding up __module_address.
+ - * Protected by module_mutex.
+ + * Export sig_enforce kernel cmdline parameter to allow other subsystems rely
+ + * on that instead of directly to CONFIG_MODULE_SIG_FORCE config.
+   */
+ -static void __mod_update_bounds(void *base, unsigned int size)
+ -{
+ -	unsigned long min = (unsigned long)base;
+ -	unsigned long max = min + size;
+ -
+ -	if (min < module_addr_min)
+ -		module_addr_min = min;
+ -	if (max > module_addr_max)
+ -		module_addr_max = max;
+ -}
+ -
+ -static void mod_update_bounds(struct module *mod)
+ -{
+ -	__mod_update_bounds(mod->module_core, mod->core_size);
+ -	if (mod->init_size)
+ -		__mod_update_bounds(mod->module_init, mod->init_size);
+ -}
+ -
+ -#ifdef CONFIG_KGDB_KDB
+ -struct list_head *kdb_modules = &modules; /* kdb needs the list of modules */
+ -#endif /* CONFIG_KGDB_KDB */
+ -
+ -static void module_assert_mutex(void)
+ +bool is_module_sig_enforced(void)
+  {
+ -	lockdep_assert_held(&module_mutex);
+ +	return sig_enforce;
+  }
+ -
+ -static void module_assert_mutex_or_preempt(void)
+ -{
+ -#ifdef CONFIG_LOCKDEP
+ -	if (unlikely(!debug_locks))
+ -		return;
+ -
+ -	WARN_ON(!rcu_read_lock_sched_held() &&
+ -		!lockdep_is_held(&module_mutex));
+ -#endif
+ -}
+ -
+ -static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);
+ -#ifndef CONFIG_MODULE_SIG_FORCE
+ -module_param(sig_enforce, bool_enable_only, 0644);
+ -#endif /* !CONFIG_MODULE_SIG_FORCE */
+ +EXPORT_SYMBOL(is_module_sig_enforced);
+  
+  /* Block module loading/unloading? */
+  int modules_disabled = 0;
+* Unmerged path kernel/module.c
