@@ -1,0 +1,314 @@
+new primitive: discard_new_inode()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit c2b6d621c4ffe9936adf7a55c8b1c769672c306f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c2b6d621.failed
+
+	We don't want open-by-handle picking half-set-up in-core
+struct inode from e.g. mkdir() having failed halfway through.
+In other words, we don't want such inodes returned by iget_locked()
+on their way to extinction.  However, we can't just have them
+unhashed - otherwise open-by-handle immediately *after* that would've
+ended up creating a new in-core inode over the on-disk one that
+is in process of being freed right under us.
+
+	Solution: new flag (I_CREATING) set by insert_inode_locked() and
+removed by unlock_new_inode() and a new primitive (discard_new_inode())
+to be used by such halfway-through-setup failure exits instead of
+unlock_new_inode() / iput() combinations.  That primitive unlocks new
+inode, but leaves I_CREATING in place.
+
+	iget_locked() treats finding an I_CREATING inode as failure
+(-ESTALE, once we sort out the error propagation).
+	insert_inode_locked() treats the same as instant -EBUSY.
+	ilookup() treats those as icache miss.
+
+[Fix by Dan Carpenter <dan.carpenter@oracle.com> folded in]
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit c2b6d621c4ffe9936adf7a55c8b1c769672c306f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	include/linux/fs.h
+diff --cc fs/dcache.c
+index f8f0822c6dd1,11b753d29409..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1683,80 -1877,27 +1683,88 @@@ void d_instantiate(struct dentry *entry
+  }
+  EXPORT_SYMBOL(d_instantiate);
+  
+ -/*
+ - * This should be equivalent to d_instantiate() + unlock_new_inode(),
+ - * with lockdep-related part of unlock_new_inode() done before
+ - * anything else.  Use that instead of open-coding d_instantiate()/
+ - * unlock_new_inode() combinations.
+ +/**
+ + * d_instantiate_unique - instantiate a non-aliased dentry
+ + * @entry: dentry to instantiate
+ + * @inode: inode to attach to this dentry
+ + *
+ + * Fill in inode information in the entry. On success, it returns NULL.
+ + * If an unhashed alias of "entry" already exists, then we return the
+ + * aliased dentry instead and drop one reference to inode.
+ + *
+ + * Note that in order to avoid conflicts with rename() etc, the caller
+ + * had better be holding the parent directory semaphore.
+ + *
+ + * This also assumes that the inode count has been incremented
+ + * (or otherwise set) by the caller to indicate that it is now
+ + * in use by the dcache.
+   */
+ -void d_instantiate_new(struct dentry *entry, struct inode *inode)
+ +static struct dentry *__d_instantiate_unique(struct dentry *entry,
+ +					     struct inode *inode)
+  {
+ -	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+ -	BUG_ON(!inode);
+ -	lockdep_annotate_inode_mutex_key(inode);
+ -	security_d_instantiate(entry, inode);
+ -	spin_lock(&inode->i_lock);
+ +	struct dentry *alias;
+ +	int len = entry->d_name.len;
+ +	const char *name = entry->d_name.name;
+ +	unsigned int hash = entry->d_name.hash;
+ +
+ +	if (!inode) {
+ +		__d_instantiate(entry, NULL);
+ +		return NULL;
+ +	}
+ +
+ +	hlist_for_each_entry(alias, &inode->i_dentry, d_alias) {
+ +		/*
+ +		 * Don't need alias->d_lock here, because aliases with
+ +		 * d_parent == entry->d_parent are not subject to name or
+ +		 * parent changes, because the parent inode i_mutex is held.
+ +		 */
+ +		if (alias->d_name.hash != hash)
+ +			continue;
+ +		if (alias->d_parent != entry->d_parent)
+ +			continue;
+ +		if (alias->d_name.len != len)
+ +			continue;
+ +		if (dentry_cmp(alias, name, len))
+ +			continue;
+ +		__dget(alias);
+ +		return alias;
+ +	}
+ +
+  	__d_instantiate(entry, inode);
+++<<<<<<< HEAD
+ +	return NULL;
+++=======
++ 	WARN_ON(!(inode->i_state & I_NEW));
++ 	inode->i_state &= ~I_NEW & ~I_CREATING;
++ 	smp_mb();
++ 	wake_up_bit(&inode->i_state, __I_NEW);
++ 	spin_unlock(&inode->i_lock);
+++>>>>>>> c2b6d621c4ff (new primitive: discard_new_inode())
+ +}
+ +
+ +struct dentry *d_instantiate_unique(struct dentry *entry, struct inode *inode)
+ +{
+ +	struct dentry *result;
+ +
+ +	BUG_ON(!hlist_unhashed(&entry->d_alias));
+ +
+ +	if (inode)
+ +		spin_lock(&inode->i_lock);
+ +	result = __d_instantiate_unique(entry, inode);
+ +	if (inode)
+ +		spin_unlock(&inode->i_lock);
+ +
+ +	if (!result) {
+ +		security_d_instantiate(entry, inode);
+ +		return NULL;
+ +	}
+ +
+ +	BUG_ON(!d_unhashed(result));
+ +	iput(inode);
+ +	return result;
+  }
+ -EXPORT_SYMBOL(d_instantiate_new);
+ +
+ +EXPORT_SYMBOL(d_instantiate_unique);
+  
+  struct dentry *d_make_root(struct inode *root_inode)
+  {
+diff --cc include/linux/fs.h
+index d09dc5f8f70c,a42600565925..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2073,11 -2032,18 +2075,20 @@@ struct super_operations 
+  #define I_SYNC			(1 << __I_SYNC)
+  #define I_REFERENCED		(1 << 8)
+  #define __I_DIO_WAKEUP		9
+ -#define I_DIO_WAKEUP		(1 << __I_DIO_WAKEUP)
+ +#define I_DIO_WAKEUP		(1 << I_DIO_WAKEUP)
+  #define I_LINKABLE		(1 << 10)
+++<<<<<<< HEAD
+ +#define I_OVL_INUSE		(1 << 11)
+++=======
++ #define I_DIRTY_TIME		(1 << 11)
++ #define __I_DIRTY_TIME_EXPIRED	12
++ #define I_DIRTY_TIME_EXPIRED	(1 << __I_DIRTY_TIME_EXPIRED)
++ #define I_WB_SWITCH		(1 << 13)
++ #define I_OVL_INUSE		(1 << 14)
++ #define I_CREATING		(1 << 15)
+++>>>>>>> c2b6d621c4ff (new primitive: discard_new_inode())
+  
+ -#define I_DIRTY_INODE (I_DIRTY_SYNC | I_DIRTY_DATASYNC)
+ -#define I_DIRTY (I_DIRTY_INODE | I_DIRTY_PAGES)
+ -#define I_DIRTY_ALL (I_DIRTY | I_DIRTY_TIME)
+ +#define I_DIRTY (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES)
+  
+  extern void __mark_inode_dirty(struct inode *, int);
+  static inline void mark_inode_dirty(struct inode *inode)
+@@@ -2906,7 -2922,9 +2917,8 @@@ extern void lockdep_annotate_inode_mute
+  static inline void lockdep_annotate_inode_mutex_key(struct inode *inode) { };
+  #endif
+  extern void unlock_new_inode(struct inode *);
++ extern void discard_new_inode(struct inode *);
+  extern unsigned int get_next_ino(void);
+ -extern void evict_inodes(struct super_block *sb);
+  
+  extern void __iget(struct inode * inode);
+  extern void iget_failed(struct inode *);
+* Unmerged path fs/dcache.c
+diff --git a/fs/inode.c b/fs/inode.c
+index 89047790df5e..627c3684be3a 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -822,6 +822,10 @@ repeat:
+ 			__wait_on_freeing_inode(inode);
+ 			goto repeat;
+ 		}
++		if (unlikely(inode->i_state & I_CREATING)) {
++			spin_unlock(&inode->i_lock);
++			return ERR_PTR(-ESTALE);
++		}
+ 		__iget(inode);
+ 		spin_unlock(&inode->i_lock);
+ 		return inode;
+@@ -853,6 +857,10 @@ repeat:
+ 			__wait_on_freeing_inode(inode);
+ 			goto repeat;
+ 		}
++		if (unlikely(inode->i_state & I_CREATING)) {
++			spin_unlock(&inode->i_lock);
++			return ERR_PTR(-ESTALE);
++		}
+ 		__iget(inode);
+ 		spin_unlock(&inode->i_lock);
+ 		return inode;
+@@ -983,13 +991,26 @@ void unlock_new_inode(struct inode *inode)
+ 	lockdep_annotate_inode_mutex_key(inode);
+ 	spin_lock(&inode->i_lock);
+ 	WARN_ON(!(inode->i_state & I_NEW));
+-	inode->i_state &= ~I_NEW;
++	inode->i_state &= ~I_NEW & ~I_CREATING;
+ 	smp_mb();
+ 	wake_up_bit(&inode->i_state, __I_NEW);
+ 	spin_unlock(&inode->i_lock);
+ }
+ EXPORT_SYMBOL(unlock_new_inode);
+ 
++void discard_new_inode(struct inode *inode)
++{
++	lockdep_annotate_inode_mutex_key(inode);
++	spin_lock(&inode->i_lock);
++	WARN_ON(!(inode->i_state & I_NEW));
++	inode->i_state &= ~I_NEW;
++	smp_mb();
++	wake_up_bit(&inode->i_state, __I_NEW);
++	spin_unlock(&inode->i_lock);
++	iput(inode);
++}
++EXPORT_SYMBOL(discard_new_inode);
++
+ /**
+  * lock_two_nondirectories - take two i_mutexes on non-directory objects
+  *
+@@ -1061,6 +1082,8 @@ again:
+ 		 * Use the old inode instead of the preallocated one.
+ 		 */
+ 		spin_unlock(&inode_hash_lock);
++		if (IS_ERR(old))
++			return NULL;
+ 		wait_on_inode(old);
+ 		if (unlikely(inode_unhashed(old))) {
+ 			iput(old);
+@@ -1150,6 +1173,8 @@ again:
+ 	inode = find_inode_fast(sb, head, ino);
+ 	spin_unlock(&inode_hash_lock);
+ 	if (inode) {
++		if (IS_ERR(inode))
++			return NULL;
+ 		wait_on_inode(inode);
+ 		if (unlikely(inode_unhashed(inode))) {
+ 			iput(inode);
+@@ -1187,6 +1212,8 @@ again:
+ 		 */
+ 		spin_unlock(&inode_hash_lock);
+ 		destroy_inode(inode);
++		if (IS_ERR(old))
++			return NULL;
+ 		inode = old;
+ 		wait_on_inode(inode);
+ 		if (unlikely(inode_unhashed(inode))) {
+@@ -1304,7 +1331,7 @@ struct inode *ilookup5_nowait(struct super_block *sb, unsigned long hashval,
+ 	inode = find_inode(sb, head, test, data);
+ 	spin_unlock(&inode_hash_lock);
+ 
+-	return inode;
++	return IS_ERR(inode) ? NULL : inode;
+ }
+ EXPORT_SYMBOL(ilookup5_nowait);
+ 
+@@ -1360,6 +1387,8 @@ again:
+ 	spin_unlock(&inode_hash_lock);
+ 
+ 	if (inode) {
++		if (IS_ERR(inode))
++			return NULL;
+ 		wait_on_inode(inode);
+ 		if (unlikely(inode_unhashed(inode))) {
+ 			iput(inode);
+@@ -1393,12 +1422,17 @@ int insert_inode_locked(struct inode *inode)
+ 		}
+ 		if (likely(!old)) {
+ 			spin_lock(&inode->i_lock);
+-			inode->i_state |= I_NEW;
++			inode->i_state |= I_NEW | I_CREATING;
+ 			hlist_add_head(&inode->i_hash, head);
+ 			spin_unlock(&inode->i_lock);
+ 			spin_unlock(&inode_hash_lock);
+ 			return 0;
+ 		}
++		if (unlikely(old->i_state & I_CREATING)) {
++			spin_unlock(&old->i_lock);
++			spin_unlock(&inode_hash_lock);
++			return -EBUSY;
++		}
+ 		__iget(old);
+ 		spin_unlock(&old->i_lock);
+ 		spin_unlock(&inode_hash_lock);
+@@ -1415,7 +1449,10 @@ EXPORT_SYMBOL(insert_inode_locked);
+ int insert_inode_locked4(struct inode *inode, unsigned long hashval,
+ 		int (*test)(struct inode *, void *), void *data)
+ {
+-	struct inode *old = inode_insert5(inode, hashval, test, NULL, data);
++	struct inode *old;
++
++	inode->i_state |= I_CREATING;
++	old = inode_insert5(inode, hashval, test, NULL, data);
+ 
+ 	if (old != inode) {
+ 		iput(old);
+* Unmerged path include/linux/fs.h
