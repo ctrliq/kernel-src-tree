@@ -1,0 +1,194 @@
+d_invalidate(): unhash immediately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [fs] revert "[fs] d_invalidate(): unhash immediately" (Benjamin Coddington) [1696374]
+Rebuild_FUZZ: 88.31%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit ff17fa561a04b5fdb25997fda98a2313bb471be6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ff17fa56.failed
+
+Once that is done, we can just hunt mountpoints down one by one;
+no new mountpoints can be added from now on, so we don't need
+anything tricky in finish() callback, etc.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit ff17fa561a04b5fdb25997fda98a2313bb471be6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index f8f0822c6dd1,449d0f895e6f..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1381,84 -1492,98 +1381,153 @@@ void shrink_dcache_parent(struct dentr
+  }
+  EXPORT_SYMBOL(shrink_dcache_parent);
+  
+++<<<<<<< HEAD
+ +struct detach_data {
+ +	struct select_data select;
+ +	struct dentry *mountpoint;
+ +};
+ +static enum d_walk_ret detach_and_collect(void *_data, struct dentry *dentry)
+++=======
++ static enum d_walk_ret umount_check(void *_data, struct dentry *dentry)
+  {
+- 	struct detach_data *data = _data;
++ 	/* it has busy descendents; complain about those instead */
++ 	if (!list_empty(&dentry->d_subdirs))
++ 		return D_WALK_CONTINUE;
++ 
++ 	/* root with refcount 1 is fine */
++ 	if (dentry == _data && dentry->d_lockref.count == 1)
++ 		return D_WALK_CONTINUE;
++ 
++ 	printk(KERN_ERR "BUG: Dentry %p{i=%lx,n=%pd} "
++ 			" still in use (%d) [unmount of %s %s]\n",
++ 		       dentry,
++ 		       dentry->d_inode ?
++ 		       dentry->d_inode->i_ino : 0UL,
++ 		       dentry,
++ 		       dentry->d_lockref.count,
++ 		       dentry->d_sb->s_type->name,
++ 		       dentry->d_sb->s_id);
++ 	WARN_ON(1);
++ 	return D_WALK_CONTINUE;
++ }
++ 
++ static void do_one_tree(struct dentry *dentry)
++ {
++ 	shrink_dcache_parent(dentry);
++ 	d_walk(dentry, dentry, umount_check, NULL);
++ 	d_drop(dentry);
++ 	dput(dentry);
++ }
++ 
++ /*
++  * destroy the dentries attached to a superblock on unmounting
++  */
++ void shrink_dcache_for_umount(struct super_block *sb)
++ {
++ 	struct dentry *dentry;
+  
++ 	WARN(down_read_trylock(&sb->s_umount), "s_umount should've been locked");
++ 
++ 	dentry = sb->s_root;
++ 	sb->s_root = NULL;
++ 	do_one_tree(dentry);
++ 
++ 	while (!hlist_bl_empty(&sb->s_roots)) {
++ 		dentry = dget(hlist_bl_entry(hlist_bl_first(&sb->s_roots), struct dentry, d_hash));
++ 		do_one_tree(dentry);
++ 	}
++ }
++ 
++ static enum d_walk_ret find_submount(void *_data, struct dentry *dentry)
+++>>>>>>> ff17fa561a04 (d_invalidate(): unhash immediately)
++ {
++ 	struct dentry **victim = _data;
+  	if (d_mountpoint(dentry)) {
+  		__dget_dlock(dentry);
+- 		data->mountpoint = dentry;
++ 		*victim = dentry;
+  		return D_WALK_QUIT;
+  	}
+++<<<<<<< HEAD
+ +
+ +	return select_collect(&data->select, dentry);
+ +}
+ +
+ +static void check_and_drop(void *_data)
+ +{
+ +	struct detach_data *data = _data;
+ +
+ +	if (!data->mountpoint && !data->select.found)
+ +		__d_drop(data->select.start);
+++=======
++ 	return D_WALK_CONTINUE;
+++>>>>>>> ff17fa561a04 (d_invalidate(): unhash immediately)
+  }
+  
+  /**
+   * d_invalidate - detach submounts, prune dcache, and drop
+   * @dentry: dentry to invalidate (aka detach, prune and drop)
+-  *
+-  * no dcache lock.
+-  *
+-  * The final d_drop is done as an atomic operation relative to
+-  * rename_lock ensuring there are no races with d_set_mounted.  This
+-  * ensures there are no unhashed dentries on the path to a mountpoint.
+   */
+ -void d_invalidate(struct dentry *dentry)
+ +int d_invalidate(struct dentry *dentry)
+  {
+- 	/*
+- 	 * If it's already been dropped, return OK.
+- 	 */
++ 	bool had_submounts = false;
+  	spin_lock(&dentry->d_lock);
+  	if (d_unhashed(dentry)) {
+  		spin_unlock(&dentry->d_lock);
+ -		return;
+ +		return 0;
+  	}
++ 	__d_drop(dentry);
+  	spin_unlock(&dentry->d_lock);
+  
+  	/* Negative dentries can be dropped without further checks */
+++<<<<<<< HEAD
+ +	if (!dentry->d_inode) {
+ +		d_drop(dentry);
+ +		return 0;
+ +	}
+++=======
++ 	if (!dentry->d_inode)
++ 		return;
+++>>>>>>> ff17fa561a04 (d_invalidate(): unhash immediately)
+  
++ 	shrink_dcache_parent(dentry);
+  	for (;;) {
+++<<<<<<< HEAD
+ +		struct detach_data data;
+ +
+ +		data.mountpoint = NULL;
+ +		INIT_LIST_HEAD(&data.select.dispose);
+ +		data.select.start = dentry;
+ +		data.select.found = 0;
+ +
+ +		d_walk(dentry, &data, detach_and_collect, check_and_drop);
+ +
+ +		if (data.select.found)
+ +			shrink_dentry_list(&data.select.dispose);
+ +
+ +		if (data.mountpoint) {
+ +			if (may_detach_mounts) {
+ +				detach_mounts(data.mountpoint);
+ +				dput(data.mountpoint);
+ +			} else {
+ +				dput(data.mountpoint);
+ +				return -EBUSY;
+ +			}
+ +		}
+ +
+ +		if (!data.mountpoint && !data.select.found)
+ +			return 0;
+++=======
++ 		struct dentry *victim = NULL;
++ 		d_walk(dentry, &victim, find_submount, NULL);
++ 		if (!victim) {
++ 			if (had_submounts)
++ 				shrink_dcache_parent(dentry);
++ 			return;
++ 		}
++ 		had_submounts = true;
++ 		detach_mounts(victim);
++ 		dput(victim);
+++>>>>>>> ff17fa561a04 (d_invalidate(): unhash immediately)
+  	}
+  }
+  EXPORT_SYMBOL(d_invalidate);
+* Unmerged path fs/dcache.c
