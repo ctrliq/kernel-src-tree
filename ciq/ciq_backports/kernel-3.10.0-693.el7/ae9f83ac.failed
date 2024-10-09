@@ -1,0 +1,219 @@
+net/mlx5: Move alloc/dealloc encap commands declarations to common header file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Move alloc/dealloc encap commands declarations to common header file (Don Dutile) [1385330 1417286]
+Rebuild_FUZZ: 97.37%
+commit-author Hadar Hen Zion <hadarh@mellanox.com>
+commit ae9f83ac24569e4bfc7c174be362d1835233c28f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ae9f83ac.failed
+
+The alloc and dealloc encap commands will be used in the mlx5e driver,
+as such, declare them in a common header file.
+
+Also, rename the functions: mlx5_cmd_{de}alloc_encap is replaced with
+mlx5_encap_{de}alloc.
+
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ae9f83ac24569e4bfc7c174be362d1835233c28f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+index 9255fb6f5d9d,6c9d99aaf07b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+@@@ -353,6 -387,116 +353,120 @@@ int mlx5_cmd_fc_query(struct mlx5_core_
+  	stats = MLX5_ADDR_OF(query_flow_counter_out, out, flow_statistics);
+  	*packets = MLX5_GET64(traffic_counter, stats, packets);
+  	*bytes = MLX5_GET64(traffic_counter, stats, octets);
+ +
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct mlx5_cmd_fc_bulk {
++ 	u16 id;
++ 	int num;
++ 	int outlen;
++ 	u32 out[0];
++ };
++ 
++ struct mlx5_cmd_fc_bulk *
++ mlx5_cmd_fc_bulk_alloc(struct mlx5_core_dev *dev, u16 id, int num)
++ {
++ 	struct mlx5_cmd_fc_bulk *b;
++ 	int outlen =
++ 		MLX5_ST_SZ_BYTES(query_flow_counter_out) +
++ 		MLX5_ST_SZ_BYTES(traffic_counter) * num;
++ 
++ 	b = kzalloc(sizeof(*b) + outlen, GFP_KERNEL);
++ 	if (!b)
++ 		return NULL;
++ 
++ 	b->id = id;
++ 	b->num = num;
++ 	b->outlen = outlen;
++ 
++ 	return b;
++ }
++ 
++ void mlx5_cmd_fc_bulk_free(struct mlx5_cmd_fc_bulk *b)
++ {
++ 	kfree(b);
++ }
++ 
++ int
++ mlx5_cmd_fc_bulk_query(struct mlx5_core_dev *dev, struct mlx5_cmd_fc_bulk *b)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(query_flow_counter_in)] = {0};
++ 
++ 	MLX5_SET(query_flow_counter_in, in, opcode,
++ 		 MLX5_CMD_OP_QUERY_FLOW_COUNTER);
++ 	MLX5_SET(query_flow_counter_in, in, op_mod, 0);
++ 	MLX5_SET(query_flow_counter_in, in, flow_counter_id, b->id);
++ 	MLX5_SET(query_flow_counter_in, in, num_of_counters, b->num);
++ 	return mlx5_cmd_exec(dev, in, sizeof(in), b->out, b->outlen);
++ }
++ 
++ void mlx5_cmd_fc_bulk_get(struct mlx5_core_dev *dev,
++ 			  struct mlx5_cmd_fc_bulk *b, u16 id,
++ 			  u64 *packets, u64 *bytes)
++ {
++ 	int index = id - b->id;
++ 	void *stats;
++ 
++ 	if (index < 0 || index >= b->num) {
++ 		mlx5_core_warn(dev, "Flow counter id (0x%x) out of range (0x%x..0x%x). Counter ignored.\n",
++ 			       id, b->id, b->id + b->num - 1);
++ 		return;
++ 	}
++ 
++ 	stats = MLX5_ADDR_OF(query_flow_counter_out, b->out,
++ 			     flow_statistics[index]);
++ 	*packets = MLX5_GET64(traffic_counter, stats, packets);
++ 	*bytes = MLX5_GET64(traffic_counter, stats, octets);
++ }
++ 
++ #define MAX_ENCAP_SIZE (128)
++ 
++ int mlx5_encap_alloc(struct mlx5_core_dev *dev,
++ 		     int header_type,
++ 		     size_t size,
++ 		     void *encap_header,
++ 		     u32 *encap_id)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(alloc_encap_header_out)];
++ 	u32 in[MLX5_ST_SZ_DW(alloc_encap_header_in) +
++ 	      (MAX_ENCAP_SIZE / sizeof(u32))];
++ 	void *encap_header_in = MLX5_ADDR_OF(alloc_encap_header_in, in,
++ 					     encap_header);
++ 	void *header = MLX5_ADDR_OF(encap_header_in, encap_header_in,
++ 				    encap_header);
++ 	int inlen = header - (void *)in  + size;
++ 	int err;
++ 
++ 	if (size > MAX_ENCAP_SIZE)
++ 		return -EINVAL;
++ 
++ 	memset(in, 0, inlen);
++ 	MLX5_SET(alloc_encap_header_in, in, opcode,
++ 		 MLX5_CMD_OP_ALLOC_ENCAP_HEADER);
++ 	MLX5_SET(encap_header_in, encap_header_in, encap_header_size, size);
++ 	MLX5_SET(encap_header_in, encap_header_in, header_type, header_type);
++ 	memcpy(header, encap_header, size);
++ 
++ 	memset(out, 0, sizeof(out));
++ 	err = mlx5_cmd_exec(dev, in, inlen, out, sizeof(out));
++ 
++ 	*encap_id = MLX5_GET(alloc_encap_header_out, out, encap_id);
++ 	return err;
++ }
++ 
++ void mlx5_encap_dealloc(struct mlx5_core_dev *dev, u32 encap_id)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(dealloc_encap_header_in)];
++ 	u32 out[MLX5_ST_SZ_DW(dealloc_encap_header_out)];
++ 
++ 	memset(in, 0, sizeof(in));
++ 	MLX5_SET(dealloc_encap_header_in, in, opcode,
++ 		 MLX5_CMD_OP_DEALLOC_ENCAP_HEADER);
++ 	MLX5_SET(dealloc_encap_header_in, in, encap_id, encap_id);
++ 
++ 	mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ }
+++>>>>>>> ae9f83ac2456 (net/mlx5: Move alloc/dealloc encap commands declarations to common header file)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+index ef9e0168938b,86bead1748a7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+@@@ -74,4 -77,16 +74,19 @@@ int mlx5_cmd_fc_alloc(struct mlx5_core_
+  int mlx5_cmd_fc_free(struct mlx5_core_dev *dev, u16 id);
+  int mlx5_cmd_fc_query(struct mlx5_core_dev *dev, u16 id,
+  		      u64 *packets, u64 *bytes);
+++<<<<<<< HEAD
+++=======
++ 
++ struct mlx5_cmd_fc_bulk;
++ 
++ struct mlx5_cmd_fc_bulk *
++ mlx5_cmd_fc_bulk_alloc(struct mlx5_core_dev *dev, u16 id, int num);
++ void mlx5_cmd_fc_bulk_free(struct mlx5_cmd_fc_bulk *b);
++ int
++ mlx5_cmd_fc_bulk_query(struct mlx5_core_dev *dev, struct mlx5_cmd_fc_bulk *b);
++ void mlx5_cmd_fc_bulk_get(struct mlx5_core_dev *dev,
++ 			  struct mlx5_cmd_fc_bulk *b, u16 id,
++ 			  u64 *packets, u64 *bytes);
++ 
+++>>>>>>> ae9f83ac2456 (net/mlx5: Move alloc/dealloc encap commands declarations to common header file)
+  #endif
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 1f3289b370d9,4762bb9d013c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -103,6 -105,31 +103,34 @@@ u32 mlx5_get_msix_vec(struct mlx5_core_
+  struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn);
+  void mlx5_cq_tasklet_cb(unsigned long data);
+  
+++<<<<<<< HEAD
+++=======
++ void mlx5_lag_add(struct mlx5_core_dev *dev, struct net_device *netdev);
++ void mlx5_lag_remove(struct mlx5_core_dev *dev);
++ 
++ void mlx5_add_device(struct mlx5_interface *intf, struct mlx5_priv *priv);
++ void mlx5_remove_device(struct mlx5_interface *intf, struct mlx5_priv *priv);
++ void mlx5_attach_device(struct mlx5_core_dev *dev);
++ void mlx5_detach_device(struct mlx5_core_dev *dev);
++ bool mlx5_device_registered(struct mlx5_core_dev *dev);
++ int mlx5_register_device(struct mlx5_core_dev *dev);
++ void mlx5_unregister_device(struct mlx5_core_dev *dev);
++ void mlx5_add_dev_by_protocol(struct mlx5_core_dev *dev, int protocol);
++ void mlx5_remove_dev_by_protocol(struct mlx5_core_dev *dev, int protocol);
++ struct mlx5_core_dev *mlx5_get_next_phys_dev(struct mlx5_core_dev *dev);
++ void mlx5_dev_list_lock(void);
++ void mlx5_dev_list_unlock(void);
++ int mlx5_dev_list_trylock(void);
++ int mlx5_encap_alloc(struct mlx5_core_dev *dev,
++ 		     int header_type,
++ 		     size_t size,
++ 		     void *encap_header,
++ 		     u32 *encap_id);
++ void mlx5_encap_dealloc(struct mlx5_core_dev *dev, u32 encap_id);
++ 
++ bool mlx5_lag_intf_add(struct mlx5_interface *intf, struct mlx5_priv *priv);
++ 
+++>>>>>>> ae9f83ac2456 (net/mlx5: Move alloc/dealloc encap commands declarations to common header file)
+  void mlx5e_init(void);
+  void mlx5e_cleanup(void);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
