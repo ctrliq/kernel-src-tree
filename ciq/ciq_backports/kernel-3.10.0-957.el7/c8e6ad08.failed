@@ -1,0 +1,124 @@
+ipv6: honor IPV6_PKTINFO with v4 mapped addresses on sendmsg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit c8e6ad0829a723a74cd2fea9996a3392d2579a18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c8e6ad08.failed
+
+In case we decide in udp6_sendmsg to send the packet down the ipv4
+udp_sendmsg path because the destination is either of family AF_INET or
+the destination is an ipv4 mapped ipv6 address, we don't honor the
+maybe specified ipv4 mapped ipv6 address in IPV6_PKTINFO.
+
+We simply can check for this option in ip_cmsg_send because no calls to
+ipv6 module functions are needed to do so.
+
+	Reported-by: Gert Doering <gert@space.net>
+	Cc: Tore Anderson <tore@fud.no>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c8e6ad0829a723a74cd2fea9996a3392d2579a18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+diff --cc include/net/ip.h
+index 511918beec0b,4aa781b7f609..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -534,8 -488,9 +534,14 @@@ int ip_options_rcv_srr(struct sk_buff *
+   */
+  
+  void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb);
+++<<<<<<< HEAD
+ +void ip_cmsg_recv_sk(struct msghdr *msg, struct sock *sk, struct sk_buff *skb);
+ +int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc);
+++=======
++ void ip_cmsg_recv(struct msghdr *msg, struct sk_buff *skb);
++ int ip_cmsg_send(struct net *net, struct msghdr *msg,
++ 		 struct ipcm_cookie *ipc, bool allow_ipv6);
+++>>>>>>> c8e6ad0829a7 (ipv6: honor IPV6_PKTINFO with v4 mapped addresses on sendmsg)
+  int ip_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
+  		  unsigned int optlen);
+  int ip_getsockopt(struct sock *sk, int level, int optname, char __user *optval,
+* Unmerged path include/net/ip.h
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index ac07084c45ef..ee63223e8e2f 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -186,7 +186,8 @@ void ip_cmsg_recv_sk(struct msghdr *msg, struct sock *sk, struct sk_buff *skb)
+ }
+ EXPORT_SYMBOL(ip_cmsg_recv_sk);
+ 
+-int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc)
++int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc,
++		 bool allow_ipv6)
+ {
+ 	int err, val;
+ 	struct cmsghdr *cmsg;
+@@ -194,6 +195,22 @@ int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc)
+ 	for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+ 		if (!CMSG_OK(msg, cmsg))
+ 			return -EINVAL;
++#if defined(CONFIG_IPV6)
++		if (allow_ipv6 &&
++		    cmsg->cmsg_level == SOL_IPV6 &&
++		    cmsg->cmsg_type == IPV6_PKTINFO) {
++			struct in6_pktinfo *src_info;
++
++			if (cmsg->cmsg_len < CMSG_LEN(sizeof(*src_info)))
++				return -EINVAL;
++			src_info = (struct in6_pktinfo *)CMSG_DATA(cmsg);
++			if (!ipv6_addr_v4mapped(&src_info->ipi6_addr))
++				return -EINVAL;
++			ipc->oif = src_info->ipi6_ifindex;
++			ipc->addr = src_info->ipi6_addr.s6_addr32[3];
++			continue;
++		}
++#endif
+ 		if (cmsg->cmsg_level != SOL_IP)
+ 			continue;
+ 		switch (cmsg->cmsg_type) {
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 002bf910b3cb..51ce23303b24 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -534,7 +534,7 @@ static int ping_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 	sock_tx_timestamp(sk, &ipc.tx_flags);
+ 
+ 	if (msg->msg_controllen) {
+-		err = ip_cmsg_send(sock_net(sk), msg, &ipc);
++		err = ip_cmsg_send(sock_net(sk), msg, &ipc, false);
+ 		if (err)
+ 			return err;
+ 		if (ipc.opt)
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index 7702b815cb23..0cd045b9d560 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -525,7 +525,7 @@ static int raw_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 	ipc.oif = sk->sk_bound_dev_if;
+ 
+ 	if (msg->msg_controllen) {
+-		err = ip_cmsg_send(sock_net(sk), msg, &ipc);
++		err = ip_cmsg_send(sock_net(sk), msg, &ipc, false);
+ 		if (err)
+ 			goto out;
+ 		if (ipc.opt)
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 46564863ba64..9a9ad5b95505 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -963,7 +963,8 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 	sock_tx_timestamp(sk, &ipc.tx_flags);
+ 
+ 	if (msg->msg_controllen) {
+-		err = ip_cmsg_send(sock_net(sk), msg, &ipc);
++		err = ip_cmsg_send(sock_net(sk), msg, &ipc,
++				   sk->sk_family == AF_INET6);
+ 		if (err)
+ 			return err;
+ 		if (ipc.opt)
