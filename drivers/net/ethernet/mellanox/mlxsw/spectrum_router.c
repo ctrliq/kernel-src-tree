@@ -3342,7 +3342,7 @@ static int __mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp)
 	if (!mlxsw_sp->rifs)
 		return -ENOMEM;
 
-	mlxsw_reg_rgcr_pack(rgcr_pl, true);
+	mlxsw_reg_rgcr_pack(rgcr_pl, true, true);
 	mlxsw_reg_rgcr_max_router_interfaces_set(rgcr_pl, max_rifs);
 	err = mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rgcr), rgcr_pl);
 	if (err)
@@ -3360,7 +3360,7 @@ static void __mlxsw_sp_router_fini(struct mlxsw_sp *mlxsw_sp)
 	char rgcr_pl[MLXSW_REG_RGCR_LEN];
 	int i;
 
-	mlxsw_reg_rgcr_pack(rgcr_pl, false);
+	mlxsw_reg_rgcr_pack(rgcr_pl, false, false);
 	mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rgcr), rgcr_pl);
 
 	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++)
