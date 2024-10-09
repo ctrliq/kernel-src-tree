@@ -1,0 +1,175 @@
+net/mlx5: Implement SRIOV attach/detach flows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Implement SRIOV attach/detach flows (Don Dutile) [1385214 1385330 1417285]
+Rebuild_FUZZ: 95.35%
+commit-author Mohamad Haj Yahia <mohamad@mellanox.com>
+commit acab721b5d8d9431cc80acc827973eeeda4dec24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/acab721b.failed
+
+Needed for lightweight and modular internal/pci error handling.
+Implement sriov attach function which enables pre-saved number of vfs on
+the device side.
+Implement sriov detach function which disable the current vfs on the
+device side.
+Init/cleanup function only handles sriov software context allocation and
+destruction.
+
+	Signed-off-by: Mohamad Haj Yahia <mohamad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit acab721b5d8d9431cc80acc827973eeeda4dec24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+#	drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index f0d87046af8e,04b719a53313..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -94,7 -89,12 +94,14 @@@ void mlx5_core_event(struct mlx5_core_d
+  		     unsigned long param);
+  void mlx5_enter_error_state(struct mlx5_core_dev *dev);
+  void mlx5_disable_device(struct mlx5_core_dev *dev);
+++<<<<<<< HEAD
+++=======
++ int mlx5_sriov_init(struct mlx5_core_dev *dev);
++ void mlx5_sriov_cleanup(struct mlx5_core_dev *dev);
++ int mlx5_sriov_attach(struct mlx5_core_dev *dev);
++ void mlx5_sriov_detach(struct mlx5_core_dev *dev);
+++>>>>>>> acab721b5d8d (net/mlx5: Implement SRIOV attach/detach flows)
+  int mlx5_core_sriov_configure(struct pci_dev *dev, int num_vfs);
+ -bool mlx5_sriov_is_enabled(struct mlx5_core_dev *dev);
+  int mlx5_core_enable_hca(struct mlx5_core_dev *dev, u16 func_id);
+  int mlx5_core_disable_hca(struct mlx5_core_dev *dev, u16 func_id);
+  int mlx5_wait_for_vf_pages(struct mlx5_core_dev *dev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+index d6a3f412ba9f,f4f02b64f552..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+@@@ -144,49 -175,38 +144,68 @@@ int mlx5_core_sriov_configure(struct pc
+  	if (!mlx5_core_is_pf(dev))
+  		return -EPERM;
+  
+ -	if (num_vfs && mlx5_lag_is_active(dev)) {
+ -		mlx5_core_warn(dev, "can't turn sriov on while LAG is active");
+ -		return -EINVAL;
+ +	mlx5_core_cleanup_vfs(dev);
+ +
+ +	if (!num_vfs) {
+ +#ifdef CONFIG_MLX5_CORE_EN
+ +		mlx5_eswitch_disable_sriov(dev->priv.eswitch);
+ +#endif
+ +		kfree(sriov->vfs_ctx);
+ +		sriov->vfs_ctx = NULL;
+ +		if (!pci_vfs_assigned(pdev))
+ +			pci_disable_sriov(pdev);
+ +		else
+ +			pr_info("unloading PF driver while leaving orphan VFs\n");
+ +		return 0;
+ +	}
+ +
+ +	err = mlx5_core_sriov_enable(pdev, num_vfs);
+ +	if (err) {
+ +		dev_warn(&pdev->dev, "mlx5_core_sriov_enable failed %d\n", err);
+ +		return err;
+  	}
+  
+ -	if (num_vfs)
+ -		err = mlx5_sriov_enable(pdev, num_vfs);
+ -	else
+ -		mlx5_sriov_disable(pdev);
+ +	mlx5_core_init_vfs(dev, num_vfs);
+ +#ifdef CONFIG_MLX5_CORE_EN
+ +	mlx5_eswitch_enable_sriov(dev->priv.eswitch, num_vfs);
+ +#endif
+ +
+ +	return num_vfs;
+ +}
+ +
+ +static int sync_required(struct pci_dev *pdev)
+ +{
+ +	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
+ +	struct mlx5_core_sriov *sriov = &dev->priv.sriov;
+ +	int cur_vfs = pci_num_vf(pdev);
+  
+ -	return err ? err : num_vfs;
+ +	if (cur_vfs != sriov->num_vfs) {
+ +		pr_info("current VFs %d, registered %d - sync needed\n", cur_vfs, sriov->num_vfs);
+ +		return 1;
+ +	}
+ +
+ +	return 0;
+  }
+  
++ int mlx5_sriov_attach(struct mlx5_core_dev *dev)
++ {
++ 	struct mlx5_core_sriov *sriov = &dev->priv.sriov;
++ 
++ 	if (!mlx5_core_is_pf(dev) || !sriov->num_vfs)
++ 		return 0;
++ 
++ 	/* If sriov VFs exist in PCI level, enable them in device level */
++ 	return mlx5_device_enable_sriov(dev, sriov->num_vfs);
++ }
++ 
++ void mlx5_sriov_detach(struct mlx5_core_dev *dev)
++ {
++ 	if (!mlx5_core_is_pf(dev))
++ 		return;
++ 
++ 	mlx5_device_disable_sriov(dev);
++ }
++ 
+  int mlx5_sriov_init(struct mlx5_core_dev *dev)
+  {
+  	struct mlx5_core_sriov *sriov = &dev->priv.sriov;
+@@@ -204,30 -222,15 +223,40 @@@
+  	if (!sriov->vfs_ctx)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	sriov->enabled_vfs = cur_vfs;
+ +
+ +	mlx5_core_init_vfs(dev, cur_vfs);
+ +#ifdef CONFIG_MLX5_CORE_EN
+ +	if (cur_vfs)
+ +		mlx5_eswitch_enable_sriov(dev->priv.eswitch, cur_vfs);
+ +#endif
+ +
+ +	enable_vfs(dev, cur_vfs);
+ +
+ +	return 0;
+++=======
++ 	return mlx5_sriov_attach(dev);
+++>>>>>>> acab721b5d8d (net/mlx5: Implement SRIOV attach/detach flows)
+  }
+  
+ -void mlx5_sriov_cleanup(struct mlx5_core_dev *dev)
+ +int mlx5_sriov_cleanup(struct mlx5_core_dev *dev)
+  {
+ -	struct mlx5_core_sriov *sriov = &dev->priv.sriov;
+ +	struct pci_dev *pdev = dev->pdev;
+ +	int err;
+  
+  	if (!mlx5_core_is_pf(dev))
+++<<<<<<< HEAD
+ +		return 0;
+ +
+ +	err = mlx5_core_sriov_configure(pdev, 0);
+ +	if (err)
+ +		return err;
+ +
+ +	return 0;
+++=======
++ 		return;
++ 	mlx5_sriov_detach(dev);
++ 	kfree(sriov->vfs_ctx);
+++>>>>>>> acab721b5d8d (net/mlx5: Implement SRIOV attach/detach flows)
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/sriov.c
