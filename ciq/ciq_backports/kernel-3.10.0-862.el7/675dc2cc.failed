@@ -1,0 +1,154 @@
+raid5-ppl: Recovery support for multiple partial parity logs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] raid5-ppl: Recovery support for multiple partial partiy logs (Nigel Croxon) [1455932]
+Rebuild_FUZZ: 98.33%
+commit-author Pawel Baldysiak <pawel.baldysiak@intel.com>
+commit 675dc2ccc27c02449da45e1a03234104c2449f68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/675dc2cc.failed
+
+Search PPL buffer in order to find out the latest PPL header (the one
+with largest generation number) and use it for recovery. The PPL entry
+format and recovery algorithm are the same as for single PPL approach.
+
+	Signed-off-by: Pawel Baldysiak <pawel.baldysiak@intel.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 675dc2ccc27c02449da45e1a03234104c2449f68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-ppl.c
+diff --cc drivers/md/raid5-ppl.c
+index fd4455879af2,a98ef172f8e8..000000000000
+--- a/drivers/md/raid5-ppl.c
++++ b/drivers/md/raid5-ppl.c
+@@@ -941,45 -958,91 +946,99 @@@ static int ppl_load_distributed(struct 
+  	if (!page)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (!sync_page_io(rdev, rdev->ppl.sector - rdev->data_offset,
+ +			  PAGE_SIZE, page, READ, false)) {
+ +		md_error(mddev, rdev);
+ +		ret = -EIO;
+ +		goto out;
+++=======
++ 	page2 = alloc_page(GFP_KERNEL);
++ 	if (!page2) {
++ 		__free_page(page);
++ 		return -ENOMEM;
+++>>>>>>> 675dc2ccc27c (raid5-ppl: Recovery support for multiple partial parity logs)
+  	}
+- 	pplhdr = page_address(page);
+  
+- 	/* check header validity */
+- 	crc_stored = le32_to_cpu(pplhdr->checksum);
+- 	pplhdr->checksum = 0;
+- 	crc = ~crc32c_le(~0, pplhdr, PAGE_SIZE);
++ 	/* searching ppl area for latest ppl */
++ 	while (pplhdr_offset < rdev->ppl.size - (PPL_HEADER_SIZE >> 9)) {
++ 		if (!sync_page_io(rdev,
++ 				  rdev->ppl.sector - rdev->data_offset +
++ 				  pplhdr_offset, PAGE_SIZE, page, REQ_OP_READ,
++ 				  0, false)) {
++ 			md_error(mddev, rdev);
++ 			ret = -EIO;
++ 			/* if not able to read - don't recover any PPL */
++ 			pplhdr = NULL;
++ 			break;
++ 		}
++ 		pplhdr = page_address(page);
++ 
++ 		/* check header validity */
++ 		crc_stored = le32_to_cpu(pplhdr->checksum);
++ 		pplhdr->checksum = 0;
++ 		crc = ~crc32c_le(~0, pplhdr, PAGE_SIZE);
++ 
++ 		if (crc_stored != crc) {
++ 			pr_debug("%s: ppl header crc does not match: stored: 0x%x calculated: 0x%x (offset: %llu)\n",
++ 				 __func__, crc_stored, crc,
++ 				 (unsigned long long)pplhdr_offset);
++ 			pplhdr = prev_pplhdr;
++ 			pplhdr_offset = prev_pplhdr_offset;
++ 			break;
++ 		}
+  
+- 	if (crc_stored != crc) {
+- 		pr_debug("%s: ppl header crc does not match: stored: 0x%x calculated: 0x%x\n",
+- 			 __func__, crc_stored, crc);
+- 		ppl_conf->mismatch_count++;
+- 		goto out;
+- 	}
++ 		signature = le32_to_cpu(pplhdr->signature);
+  
+- 	signature = le32_to_cpu(pplhdr->signature);
++ 		if (mddev->external) {
++ 			/*
++ 			 * For external metadata the header signature is set and
++ 			 * validated in userspace.
++ 			 */
++ 			ppl_conf->signature = signature;
++ 		} else if (ppl_conf->signature != signature) {
++ 			pr_debug("%s: ppl header signature does not match: stored: 0x%x configured: 0x%x (offset: %llu)\n",
++ 				 __func__, signature, ppl_conf->signature,
++ 				 (unsigned long long)pplhdr_offset);
++ 			pplhdr = prev_pplhdr;
++ 			pplhdr_offset = prev_pplhdr_offset;
++ 			break;
++ 		}
+  
+- 	if (mddev->external) {
+- 		/*
+- 		 * For external metadata the header signature is set and
+- 		 * validated in userspace.
+- 		 */
+- 		ppl_conf->signature = signature;
+- 	} else if (ppl_conf->signature != signature) {
+- 		pr_debug("%s: ppl header signature does not match: stored: 0x%x configured: 0x%x\n",
+- 			 __func__, signature, ppl_conf->signature);
+- 		ppl_conf->mismatch_count++;
+- 		goto out;
++ 		if (prev_pplhdr && le64_to_cpu(prev_pplhdr->generation) >
++ 		    le64_to_cpu(pplhdr->generation)) {
++ 			/* previous was newest */
++ 			pplhdr = prev_pplhdr;
++ 			pplhdr_offset = prev_pplhdr_offset;
++ 			break;
++ 		}
++ 
++ 		prev_pplhdr_offset = pplhdr_offset;
++ 		prev_pplhdr = pplhdr;
++ 
++ 		tmp = page;
++ 		page = page2;
++ 		page2 = tmp;
++ 
++ 		/* calculate next potential ppl offset */
++ 		for (i = 0; i < le32_to_cpu(pplhdr->entries_count); i++)
++ 			pplhdr_offset +=
++ 			    le32_to_cpu(pplhdr->entries[i].pp_size) >> 9;
++ 		pplhdr_offset += PPL_HEADER_SIZE >> 9;
+  	}
+  
++ 	/* no valid ppl found */
++ 	if (!pplhdr)
++ 		ppl_conf->mismatch_count++;
++ 	else
++ 		pr_debug("%s: latest PPL found at offset: %llu, with generation: %llu\n",
++ 		    __func__, (unsigned long long)pplhdr_offset,
++ 		    le64_to_cpu(pplhdr->generation));
++ 
+  	/* attempt to recover from log if we are starting a dirty array */
+- 	if (!mddev->pers && mddev->recovery_cp != MaxSector)
+- 		ret = ppl_recover(log, pplhdr);
+- out:
++ 	if (pplhdr && !mddev->pers && mddev->recovery_cp != MaxSector)
++ 		ret = ppl_recover(log, pplhdr, pplhdr_offset);
++ 
+  	/* write empty header if we are starting the array */
+  	if (!ret && !mddev->pers)
+  		ret = ppl_write_empty_header(log);
+* Unmerged path drivers/md/raid5-ppl.c
