@@ -1,0 +1,242 @@
+gfs2: Clean up glock work enqueuing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 6b0c7440bcb4b7e5a64836132caf56bf19a33f6e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6b0c7440.failed
+
+This patch adds a standardized queueing mechanism for glock work
+with spin_lock protection to prevent races.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 6b0c7440bcb4b7e5a64836132caf56bf19a33f6e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 11b05fe84e1a,6cd71c50b8bd..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -166,14 -180,9 +183,11 @@@ static void __gfs2_glock_put(struct gfs
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  	struct address_space *mapping = gfs2_glock2aspace(gl);
+  
+- 	if (lockref_put_or_lock(&gl->gl_lockref))
+- 		return;
+- 
+  	lockref_mark_dead(&gl->gl_lockref);
+  
+ -	gfs2_glock_remove_from_lru(gl);
+ +	spin_lock(&lru_lock);
+ +	__gfs2_glock_remove_from_lru(gl);
+ +	spin_unlock(&lru_lock);
+  	spin_unlock(&gl->gl_lockref.lock);
+  	rhashtable_remove_fast(&gl_hash_table, &gl->gl_node, ht_parms);
+  	GLOCK_BUG_ON(gl, !list_empty(&gl->gl_holders));
+@@@ -487,21 -510,19 +515,19 @@@ __acquires(&gl->gl_spin
+  		    target == LM_ST_UNLOCKED &&
+  		    test_bit(SDF_SKIP_DLM_UNLOCK, &sdp->sd_flags)) {
+  			finish_xmote(gl, target);
+- 			if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+- 				gfs2_glock_put(gl);
++ 			gfs2_glock_queue_work(gl, 0);
+  		}
+  		else if (ret) {
+ -			pr_err("lm_lock ret %d\n", ret);
+ +			printk(KERN_ERR "GFS2: lm_lock ret %d\n", ret);
+  			GLOCK_BUG_ON(gl, !test_bit(SDF_SHUTDOWN,
+  						   &sdp->sd_flags));
+  		}
+  	} else { /* lock_nolock */
+  		finish_xmote(gl, target);
+- 		if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+- 			gfs2_glock_put(gl);
++ 		gfs2_glock_queue_work(gl, 0);
+  	}
+  
+ -	spin_lock(&gl->gl_lockref.lock);
+ +	spin_lock(&gl->gl_spin);
+  }
+  
+  /**
+@@@ -568,10 -589,9 +594,9 @@@ out
+  
+  out_sched:
+  	clear_bit(GLF_LOCK, &gl->gl_flags);
+ -	smp_mb__after_atomic();
+ +	smp_mb__after_clear_bit();
+  	gl->gl_lockref.count++;
+- 	if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+- 		gl->gl_lockref.count--;
++ 	__gfs2_glock_queue_work(gl, 0);
+  	return;
+  
+  out_unlock:
+@@@ -610,9 -630,9 +635,9 @@@ static void glock_work_func(struct work
+  
+  	if (test_and_clear_bit(GLF_REPLY_PENDING, &gl->gl_flags)) {
+  		finish_xmote(gl, gl->gl_reply);
+- 		drop_ref = 1;
++ 		drop_refs++;
+  	}
+ -	spin_lock(&gl->gl_lockref.lock);
+ +	spin_lock(&gl->gl_spin);
+  	if (test_bit(GLF_PENDING_DEMOTE, &gl->gl_flags) &&
+  	    gl->gl_state != LM_ST_UNLOCKED &&
+  	    gl->gl_demote_state != LM_ST_EXCLUSIVE) {
+@@@ -628,17 -648,25 +653,32 @@@
+  		}
+  	}
+  	run_queue(gl, 0);
+++<<<<<<< HEAD
+ +	spin_unlock(&gl->gl_spin);
+ +	if (!delay)
+ +		gfs2_glock_put(gl);
+ +	else {
+++=======
++ 	if (delay) {
++ 		/* Keep one glock reference for the work we requeue. */
++ 		drop_refs--;
+++>>>>>>> 6b0c7440bcb4 (gfs2: Clean up glock work enqueuing)
+  		if (gl->gl_name.ln_type != LM_TYPE_INODE)
+  			delay = 0;
+- 		if (queue_delayed_work(glock_workqueue, &gl->gl_work, delay) == 0)
+- 			gfs2_glock_put(gl);
++ 		__gfs2_glock_queue_work(gl, delay);
+  	}
+- 	if (drop_ref)
+- 		gfs2_glock_put(gl);
++ 
++ 	/*
++ 	 * Drop the remaining glock references manually here. (Mind that
++ 	 * __gfs2_glock_queue_work depends on the lockref spinlock begin held
++ 	 * here as well.)
++ 	 */
++ 	gl->gl_lockref.count -= drop_refs;
++ 	if (!gl->gl_lockref.count) {
++ 		__gfs2_glock_put(gl);
++ 		return;
++ 	}
++ 	spin_unlock(&gl->gl_lockref.lock);
+  }
+  
+  /**
+@@@ -993,11 -1019,10 +1033,10 @@@ int gfs2_glock_nq(struct gfs2_holder *g
+  		     test_and_clear_bit(GLF_FROZEN, &gl->gl_flags))) {
+  		set_bit(GLF_REPLY_PENDING, &gl->gl_flags);
+  		gl->gl_lockref.count++;
+- 		if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+- 			gl->gl_lockref.count--;
++ 		__gfs2_glock_queue_work(gl, 0);
+  	}
+  	run_queue(gl, 1);
+ -	spin_unlock(&gl->gl_lockref.lock);
+ +	spin_unlock(&gl->gl_spin);
+  
+  	if (!(gh->gh_flags & GL_ASYNC))
+  		error = gfs2_glock_wait(gh);
+@@@ -1054,17 -1079,15 +1093,29 @@@ void gfs2_glock_dq(struct gfs2_holder *
+  		gfs2_glock_add_to_lru(gl);
+  
+  	trace_gfs2_glock_queue(gh, 0);
+++<<<<<<< HEAD
+ +	spin_unlock(&gl->gl_spin);
+ +	if (likely(fast_path))
+ +		return;
+ +
+ +	gfs2_glock_hold(gl);
+ +	if (test_bit(GLF_PENDING_DEMOTE, &gl->gl_flags) &&
+ +	    !test_bit(GLF_DEMOTE, &gl->gl_flags) &&
+ +	    gl->gl_name.ln_type == LM_TYPE_INODE)
+ +		delay = gl->gl_hold_time;
+ +	if (queue_delayed_work(glock_workqueue, &gl->gl_work, delay) == 0)
+ +		gfs2_glock_put(gl);
+++=======
++ 	if (unlikely(!fast_path)) {
++ 		gl->gl_lockref.count++;
++ 		if (test_bit(GLF_PENDING_DEMOTE, &gl->gl_flags) &&
++ 		    !test_bit(GLF_DEMOTE, &gl->gl_flags) &&
++ 		    gl->gl_name.ln_type == LM_TYPE_INODE)
++ 			delay = gl->gl_hold_time;
++ 		__gfs2_glock_queue_work(gl, delay);
++ 	}
++ 	spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> 6b0c7440bcb4 (gfs2: Clean up glock work enqueuing)
+  }
+  
+  void gfs2_glock_dq_wait(struct gfs2_holder *gh)
+@@@ -1238,11 -1261,10 +1289,16 @@@ void gfs2_glock_cb(struct gfs2_glock *g
+  			delay = gl->gl_hold_time;
+  	}
+  
+ -	spin_lock(&gl->gl_lockref.lock);
+ +	spin_lock(&gl->gl_spin);
+  	handle_callback(gl, state, delay, true);
+++<<<<<<< HEAD
+ +	spin_unlock(&gl->gl_spin);
+ +	if (queue_delayed_work(glock_workqueue, &gl->gl_work, delay) == 0)
+ +		gfs2_glock_put(gl);
+++=======
++ 	__gfs2_glock_queue_work(gl, delay);
++ 	spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> 6b0c7440bcb4 (gfs2: Clean up glock work enqueuing)
+  }
+  
+  /**
+@@@ -1301,10 -1323,8 +1357,15 @@@ void gfs2_glock_complete(struct gfs2_gl
+  
+  	gl->gl_lockref.count++;
+  	set_bit(GLF_REPLY_PENDING, &gl->gl_flags);
+++<<<<<<< HEAD
+ +	spin_unlock(&gl->gl_spin);
+ +
+ +	if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+ +		gfs2_glock_put(gl);
+++=======
++ 	__gfs2_glock_queue_work(gl, 0);
++ 	spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> 6b0c7440bcb4 (gfs2: Clean up glock work enqueuing)
+  }
+  
+  static int glock_cmp(void *priv, struct list_head *a, struct list_head *b)
+@@@ -1362,10 -1382,8 +1423,15 @@@ add_back_to_lru
+  		if (demote_ok(gl))
+  			handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+  		WARN_ON(!test_and_clear_bit(GLF_LOCK, &gl->gl_flags));
+++<<<<<<< HEAD
+ +		smp_mb__after_clear_bit();
+ +		if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+ +			gl->gl_lockref.count--;
+ +		spin_unlock(&gl->gl_spin);
+++=======
++ 		__gfs2_glock_queue_work(gl, 0);
++ 		spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> 6b0c7440bcb4 (gfs2: Clean up glock work enqueuing)
+  		cond_resched_lock(&lru_lock);
+  	}
+  }
+@@@ -1477,12 -1506,11 +1542,17 @@@ static void clear_glock(struct gfs2_glo
+  {
+  	gfs2_glock_remove_from_lru(gl);
+  
+ -	spin_lock(&gl->gl_lockref.lock);
+ +	spin_lock(&gl->gl_spin);
+  	if (gl->gl_state != LM_ST_UNLOCKED)
+  		handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+++<<<<<<< HEAD
+ +	spin_unlock(&gl->gl_spin);
+ +	if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+ +		gfs2_glock_put(gl);
+++=======
++ 	__gfs2_glock_queue_work(gl, 0);
++ 	spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> 6b0c7440bcb4 (gfs2: Clean up glock work enqueuing)
+  }
+  
+  /**
+* Unmerged path fs/gfs2/glock.c
