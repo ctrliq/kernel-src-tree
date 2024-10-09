@@ -1,0 +1,225 @@
+nl80211: fix dumpit error path RTNL deadlocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit ea90e0dc8cecba6359b481e24d9c37160f6f524f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ea90e0dc.failed
+
+Sowmini pointed out Dmitry's RTNL deadlock report to me, and it turns out
+to be perfectly accurate - there are various error paths that miss unlock
+of the RTNL.
+
+To fix those, change the locking a bit to not be conditional in all those
+nl80211_prepare_*_dump() functions, but make those require the RTNL to
+start with, and fix the buggy error paths. This also let me use sparse
+(by appropriately overriding the rtnl_lock/rtnl_unlock functions) to
+validate the changes.
+
+	Cc: stable@vger.kernel.org
+	Reported-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit ea90e0dc8cecba6359b481e24d9c37160f6f524f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/wireless/nl80211.c
+diff --cc net/wireless/nl80211.c
+index d6c35d1c99b6,2312dc2ffdb9..000000000000
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@@ -504,21 -545,18 +504,27 @@@ static int nl80211_prepare_wdev_dump(st
+  {
+  	int err;
+  
+- 	rtnl_lock();
+- 
+  	if (!cb->args[0]) {
+  		err = nlmsg_parse(cb->nlh, GENL_HDRLEN + nl80211_fam.hdrsize,
+ -				  genl_family_attrbuf(&nl80211_fam),
+ -				  nl80211_fam.maxattr, nl80211_policy);
+ +				  nl80211_fam.attrbuf, nl80211_fam.maxattr,
+ +				  nl80211_policy);
+  		if (err)
+- 			goto out_unlock;
++ 			return err;
+  
+++<<<<<<< HEAD
+ +		*wdev = __cfg80211_wdev_from_attrs(sock_net(skb->sk),
+ +						   nl80211_fam.attrbuf);
+ +		if (IS_ERR(*wdev)) {
+ +			err = PTR_ERR(*wdev);
+ +			goto out_unlock;
+ +		}
+++=======
++ 		*wdev = __cfg80211_wdev_from_attrs(
++ 					sock_net(skb->sk),
++ 					genl_family_attrbuf(&nl80211_fam));
++ 		if (IS_ERR(*wdev))
++ 			return PTR_ERR(*wdev);
+++>>>>>>> ea90e0dc8cec (nl80211: fix dumpit error path RTNL deadlocks)
+  		*rdev = wiphy_to_rdev((*wdev)->wiphy);
+  		/* 0 is the first index - add 1 to parse only once */
+  		cb->args[0] = (*rdev)->wiphy_idx + 1;
+@@@ -2476,10 -2589,35 +2470,37 @@@ static int nl80211_dump_interface(struc
+  	int if_idx = 0;
+  	int wp_start = cb->args[0];
+  	int if_start = cb->args[1];
+ -	int filter_wiphy = -1;
+  	struct cfg80211_registered_device *rdev;
+  	struct wireless_dev *wdev;
++ 	int ret;
+  
+  	rtnl_lock();
+++<<<<<<< HEAD
+++=======
++ 	if (!cb->args[2]) {
++ 		struct nl80211_dump_wiphy_state state = {
++ 			.filter_wiphy = -1,
++ 		};
++ 
++ 		ret = nl80211_dump_wiphy_parse(skb, cb, &state);
++ 		if (ret)
++ 			goto out_unlock;
++ 
++ 		filter_wiphy = state.filter_wiphy;
++ 
++ 		/*
++ 		 * if filtering, set cb->args[2] to +1 since 0 is the default
++ 		 * value needed to determine that parsing is necessary.
++ 		 */
++ 		if (filter_wiphy >= 0)
++ 			cb->args[2] = filter_wiphy + 1;
++ 		else
++ 			cb->args[2] = -1;
++ 	} else if (cb->args[2] > 0) {
++ 		filter_wiphy = cb->args[2] - 1;
++ 	}
++ 
+++>>>>>>> ea90e0dc8cec (nl80211: fix dumpit error path RTNL deadlocks)
+  	list_for_each_entry(rdev, &cfg80211_rdev_list, list) {
+  		if (!net_eq(wiphy_net(&rdev->wiphy), sock_net(skb->sk)))
+  			continue;
+@@@ -7101,12 -7776,13 +7130,13 @@@ static int nl80211_dump_survey(struct s
+  	int res;
+  	bool radio_stats;
+  
++ 	rtnl_lock();
+  	res = nl80211_prepare_wdev_dump(skb, cb, &rdev, &wdev);
+  	if (res)
+- 		return res;
++ 		goto out_err;
+  
+  	/* prepare_wdev_dump parsed the attributes */
+ -	radio_stats = attrbuf[NL80211_ATTR_SURVEY_RADIO_STATS];
+ +	radio_stats = nl80211_fam.attrbuf[NL80211_ATTR_SURVEY_RADIO_STATS];
+  
+  	if (!wdev->netdev) {
+  		res = -EINVAL;
+@@@ -10412,31 -11525,24 +10438,43 @@@ static int nl80211_prepare_vendor_dump(
+  	}
+  
+  	err = nlmsg_parse(cb->nlh, GENL_HDRLEN + nl80211_fam.hdrsize,
+ -			  attrbuf, nl80211_fam.maxattr, nl80211_policy);
+ +			  nl80211_fam.attrbuf, nl80211_fam.maxattr,
+ +			  nl80211_policy);
+  	if (err)
+- 		goto out_unlock;
++ 		return err;
+  
+++<<<<<<< HEAD
+ +	if (!nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_ID] ||
+ +	    !nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_SUBCMD]) {
+ +		err = -EINVAL;
+ +		goto out_unlock;
+ +	}
+++=======
++ 	if (!attrbuf[NL80211_ATTR_VENDOR_ID] ||
++ 	    !attrbuf[NL80211_ATTR_VENDOR_SUBCMD])
++ 		return -EINVAL;
+++>>>>>>> ea90e0dc8cec (nl80211: fix dumpit error path RTNL deadlocks)
+  
+ -	*wdev = __cfg80211_wdev_from_attrs(sock_net(skb->sk), attrbuf);
+ +	*wdev = __cfg80211_wdev_from_attrs(sock_net(skb->sk),
+ +					   nl80211_fam.attrbuf);
+  	if (IS_ERR(*wdev))
+  		*wdev = NULL;
+  
+++<<<<<<< HEAD
+ +	*rdev = __cfg80211_rdev_from_attrs(sock_net(skb->sk),
+ +					   nl80211_fam.attrbuf);
+ +	if (IS_ERR(*rdev)) {
+ +		err = PTR_ERR(*rdev);
+ +		goto out_unlock;
+ +	}
+++=======
++ 	*rdev = __cfg80211_rdev_from_attrs(sock_net(skb->sk), attrbuf);
++ 	if (IS_ERR(*rdev))
++ 		return PTR_ERR(*rdev);
+++>>>>>>> ea90e0dc8cec (nl80211: fix dumpit error path RTNL deadlocks)
+  
+ -	vid = nla_get_u32(attrbuf[NL80211_ATTR_VENDOR_ID]);
+ -	subcmd = nla_get_u32(attrbuf[NL80211_ATTR_VENDOR_SUBCMD]);
+ +	vid = nla_get_u32(nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_ID]);
+ +	subcmd = nla_get_u32(nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_SUBCMD]);
+  
+  	for (i = 0; i < (*rdev)->wiphy.n_vendor_commands; i++) {
+  		const struct wiphy_vendor_command *vcmd;
+@@@ -10455,14 -11559,12 +10491,12 @@@
+  		break;
+  	}
+  
+- 	if (vcmd_idx < 0) {
+- 		err = -EOPNOTSUPP;
+- 		goto out_unlock;
+- 	}
++ 	if (vcmd_idx < 0)
++ 		return -EOPNOTSUPP;
+  
+ -	if (attrbuf[NL80211_ATTR_VENDOR_DATA]) {
+ -		data = nla_data(attrbuf[NL80211_ATTR_VENDOR_DATA]);
+ -		data_len = nla_len(attrbuf[NL80211_ATTR_VENDOR_DATA]);
+ +	if (nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_DATA]) {
+ +		data = nla_data(nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_DATA]);
+ +		data_len = nla_len(nl80211_fam.attrbuf[NL80211_ATTR_VENDOR_DATA]);
+  	}
+  
+  	/* 0 is the first index - add 1 to parse only once */
+@@@ -10503,18 -11603,21 +10535,29 @@@ static int nl80211_vendor_cmd_dump(stru
+  
+  	if (vcmd->flags & (WIPHY_VENDOR_CMD_NEED_WDEV |
+  			   WIPHY_VENDOR_CMD_NEED_NETDEV)) {
+- 		if (!wdev)
+- 			return -EINVAL;
++ 		if (!wdev) {
++ 			err = -EINVAL;
++ 			goto out;
++ 		}
+  		if (vcmd->flags & WIPHY_VENDOR_CMD_NEED_NETDEV &&
+- 		    !wdev->netdev)
+- 			return -EINVAL;
++ 		    !wdev->netdev) {
++ 			err = -EINVAL;
++ 			goto out;
++ 		}
+  
+  		if (vcmd->flags & WIPHY_VENDOR_CMD_NEED_RUNNING) {
+++<<<<<<< HEAD
+ +			if (wdev->netdev &&
+ +			    !netif_running(wdev->netdev))
+ +				return -ENETDOWN;
+ +			if (!wdev->netdev && !wdev->p2p_started)
+ +				return -ENETDOWN;
+++=======
++ 			if (!wdev_running(wdev)) {
++ 				err = -ENETDOWN;
++ 				goto out;
++ 			}
+++>>>>>>> ea90e0dc8cec (nl80211: fix dumpit error path RTNL deadlocks)
+  		}
+  	}
+  
+* Unmerged path net/wireless/nl80211.c
