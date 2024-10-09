@@ -1,0 +1,106 @@
+acpi/nfit, x86/mce: Validate a MCE's address before using it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [acpi] nfit, x86/mce: Validate a MCE's address before using it (Jeff Moyer) [1662229]
+Rebuild_FUZZ: 95.65%
+commit-author Vishal Verma <vishal.l.verma@intel.com>
+commit e8a308e5f47e545e0d41d0686c00f5f5217c5f61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e8a308e5.failed
+
+The NFIT machine check handler uses the physical address from the mce
+structure, and compares it against information in the ACPI NFIT table
+to determine whether that location lies on an NVDIMM. The mce->addr
+field however may not always be valid, and this is indicated by the
+MCI_STATUS_ADDRV bit in the status field.
+
+Export mce_usable_address() which already performs validation for the
+address, and use it in the NFIT handler.
+
+Fixes: 6839a6d96f4e ("nfit: do an ARS scrub on hitting a latent media error")
+	Reported-by: Robert Elliott <elliott@hpe.com>
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+CC: Arnd Bergmann <arnd@arndb.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+CC: Dave Jiang <dave.jiang@intel.com>
+CC: elliott@hpe.com
+CC: "H. Peter Anvin" <hpa@zytor.com>
+CC: Ingo Molnar <mingo@redhat.com>
+CC: Len Brown <lenb@kernel.org>
+CC: linux-acpi@vger.kernel.org
+CC: linux-edac <linux-edac@vger.kernel.org>
+CC: linux-nvdimm@lists.01.org
+CC: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+CC: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+CC: Ross Zwisler <zwisler@kernel.org>
+CC: stable <stable@vger.kernel.org>
+CC: Thomas Gleixner <tglx@linutronix.de>
+CC: Tony Luck <tony.luck@intel.com>
+CC: x86-ml <x86@kernel.org>
+CC: Yazen Ghannam <yazen.ghannam@amd.com>
+Link: http://lkml.kernel.org/r/20181026003729.8420-2-vishal.l.verma@intel.com
+(cherry picked from commit e8a308e5f47e545e0d41d0686c00f5f5217c5f61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mce.h
+diff --cc arch/x86/include/asm/mce.h
+index 24cc5fd74543,c1a812bd5a27..000000000000
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@@ -267,8 -217,12 +267,13 @@@ static inline void mce_amd_feature_init
+  static inline int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr) { return -EINVAL; };
+  #endif
+  
+ -static inline void mce_hygon_feature_init(struct cpuinfo_x86 *c) { return mce_amd_feature_init(c); }
+ -
+  int mce_available(struct cpuinfo_x86 *c);
+  bool mce_is_memory_error(struct mce *m);
+++<<<<<<< HEAD
+++=======
++ bool mce_is_correctable(struct mce *m);
++ int mce_usable_address(struct mce *m);
+++>>>>>>> e8a308e5f47e (acpi/nfit, x86/mce: Validate a MCE's address before using it)
+  
+  DECLARE_PER_CPU(unsigned, mce_exception_count);
+  DECLARE_PER_CPU(unsigned, mce_poll_count);
+* Unmerged path arch/x86/include/asm/mce.h
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index f4e26139f488..bb6846c77b09 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -537,7 +537,7 @@ static void mce_report_event(struct pt_regs *regs)
+  * be somewhat complicated (e.g. segment offset would require an instruction
+  * parser). So only support physical addresses up to page granuality for now.
+  */
+-static int mce_usable_address(struct mce *m)
++int mce_usable_address(struct mce *m)
+ {
+ 	if (!(m->status & MCI_STATUS_MISCV) || !(m->status & MCI_STATUS_ADDRV))
+ 		return 0;
+@@ -552,6 +552,7 @@ static int mce_usable_address(struct mce *m)
+ 		return 0;
+ 	return 1;
+ }
++EXPORT_SYMBOL_GPL(mce_usable_address);
+ 
+ static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
+ 				void *data)
+diff --git a/drivers/acpi/nfit/mce.c b/drivers/acpi/nfit/mce.c
+index e9626bf6ca29..6f847a546d3c 100644
+--- a/drivers/acpi/nfit/mce.c
++++ b/drivers/acpi/nfit/mce.c
+@@ -29,6 +29,10 @@ static int nfit_handle_mce(struct notifier_block *nb, unsigned long val,
+ 	if (!mce_is_memory_error(mce))
+ 		return NOTIFY_DONE;
+ 
++	/* Verify the address reported in the MCE is valid. */
++	if (!mce_usable_address(mce))
++		return NOTIFY_DONE;
++
+ 	/*
+ 	 * mce->addr contains the physical addr accessed that caused the
+ 	 * machine check. We need to walk through the list of NFITs, and see
