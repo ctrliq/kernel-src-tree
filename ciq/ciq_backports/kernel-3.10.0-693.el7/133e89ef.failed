@@ -1,0 +1,164 @@
+locking/rwsem: Enable lockless waiter wakeup(s)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 133e89ef5ef338e1358b16246521ba17d935c396
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/133e89ef.failed
+
+As wake_qs gain users, we can teach rwsems about them such that
+waiters can be awoken without the wait_lock. This is for both
+readers and writer, the former being the most ideal candidate
+as we can batch the wakeups shortening the critical region that
+much more -- ie writer task blocking a bunch of tasks waiting to
+service page-faults (mmap_sem readers).
+
+In general applying wake_qs to rwsem (xadd) is not difficult as
+the wait_lock is intended to be released soon _anyways_, with
+the exception of when a writer slowpath will proactively wakeup
+any queued readers if it sees that the lock is owned by a reader,
+in which we simply do the wakeups with the lock held (see comment
+in __rwsem_down_write_failed_common()).
+
+Similar to other locking primitives, delaying the waiter being
+awoken does allow, at least in theory, the lock to be stolen in
+the case of writers, however no harm was seen in this (in fact
+lock stealing tends to be a _good_ thing in most workloads), and
+this is a tiny window anyways.
+
+Some page-fault (pft) and mmap_sem intensive benchmarks show some
+pretty constant reduction in systime (by up to ~8 and ~10%) on a
+2-socket, 12 core AMD box. In addition, on an 8-core Westmere doing
+page allocations (page_test)
+
+aim9:
+	 4.6-rc6				4.6-rc6
+						rwsemv2
+Min      page_test   378167.89 (  0.00%)   382613.33 (  1.18%)
+Min      exec_test      499.00 (  0.00%)      502.67 (  0.74%)
+Min      fork_test     3395.47 (  0.00%)     3537.64 (  4.19%)
+Hmean    page_test   395433.06 (  0.00%)   414693.68 (  4.87%)
+Hmean    exec_test      499.67 (  0.00%)      505.30 (  1.13%)
+Hmean    fork_test     3504.22 (  0.00%)     3594.95 (  2.59%)
+Stddev   page_test    17426.57 (  0.00%)    26649.92 (-52.93%)
+Stddev   exec_test        0.47 (  0.00%)        1.41 (-199.05%)
+Stddev   fork_test       63.74 (  0.00%)       32.59 ( 48.86%)
+Max      page_test   429873.33 (  0.00%)   456960.00 (  6.30%)
+Max      exec_test      500.33 (  0.00%)      507.66 (  1.47%)
+Max      fork_test     3653.33 (  0.00%)     3650.90 ( -0.07%)
+
+	     4.6-rc6     4.6-rc6
+			 rwsemv2
+User            1.12        0.04
+System          0.23        0.04
+Elapsed       727.27      721.98
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Waiman.Long@hpe.com
+	Cc: dave@stgolabs.net
+	Cc: jason.low2@hp.com
+	Cc: peter@hurleysoftware.com
+Link: http://lkml.kernel.org/r/1463165787-25937-2-git-send-email-dave@stgolabs.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 133e89ef5ef338e1358b16246521ba17d935c396)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rwsem.c
+diff --cc lib/rwsem.c
+index 09d8c2da4ff3,80b05ac0f015..000000000000
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@@ -421,6 -448,8 +430,11 @@@ struct rw_semaphore __sched *rwsem_down
+  	long count;
+  	bool waiting = true; /* any queued threads before us */
+  	struct rwsem_waiter waiter;
+++<<<<<<< HEAD:lib/rwsem.c
+++=======
++ 	struct rw_semaphore *ret = sem;
++ 	WAKE_Q(wake_q);
+++>>>>>>> 133e89ef5ef3 (locking/rwsem: Enable lockless waiter wakeup(s)):kernel/locking/rwsem-xadd.c
+  
+  	/* undo write bias from down_write operation, stop active locking */
+  	count = rwsem_atomic_update(-RWSEM_ACTIVE_WRITE_BIAS, sem);
+@@@ -479,7 -521,26 +504,30 @@@
+  	list_del(&waiter.list);
+  	raw_spin_unlock_irq(&sem->wait_lock);
+  
+++<<<<<<< HEAD:lib/rwsem.c
+ +	return sem;
+++=======
++ 	return ret;
++ 
++ out_nolock:
++ 	__set_current_state(TASK_RUNNING);
++ 	raw_spin_lock_irq(&sem->wait_lock);
++ 	list_del(&waiter.list);
++ 	if (list_empty(&sem->wait_list))
++ 		rwsem_atomic_update(-RWSEM_WAITING_BIAS, sem);
++ 	else
++ 		__rwsem_mark_wake(sem, RWSEM_WAKE_ANY, &wake_q);
++ 	raw_spin_unlock_irq(&sem->wait_lock);
++ 	wake_up_q(&wake_q);
++ 
++ 	return ERR_PTR(-EINTR);
++ }
++ 
++ __visible struct rw_semaphore * __sched
++ rwsem_down_write_failed(struct rw_semaphore *sem)
++ {
++ 	return __rwsem_down_write_failed_common(sem, TASK_UNINTERRUPTIBLE);
+++>>>>>>> 133e89ef5ef3 (locking/rwsem: Enable lockless waiter wakeup(s)):kernel/locking/rwsem-xadd.c
+  }
+  EXPORT_SYMBOL(rwsem_down_write_failed);
+  
+@@@ -491,8 -559,40 +539,9 @@@ __visibl
+  struct rw_semaphore *rwsem_wake(struct rw_semaphore *sem)
+  {
+  	unsigned long flags;
++ 	WAKE_Q(wake_q);
+  
+ -	/*
+ -	 * If a spinner is present, it is not necessary to do the wakeup.
+ -	 * Try to do wakeup only if the trylock succeeds to minimize
+ -	 * spinlock contention which may introduce too much delay in the
+ -	 * unlock operation.
+ -	 *
+ -	 *    spinning writer		up_write/up_read caller
+ -	 *    ---------------		-----------------------
+ -	 * [S]   osq_unlock()		[L]   osq
+ -	 *	 MB			      RMB
+ -	 * [RmW] rwsem_try_write_lock() [RmW] spin_trylock(wait_lock)
+ -	 *
+ -	 * Here, it is important to make sure that there won't be a missed
+ -	 * wakeup while the rwsem is free and the only spinning writer goes
+ -	 * to sleep without taking the rwsem. Even when the spinning writer
+ -	 * is just going to break out of the waiting loop, it will still do
+ -	 * a trylock in rwsem_down_write_failed() before sleeping. IOW, if
+ -	 * rwsem_has_spinner() is true, it will guarantee at least one
+ -	 * trylock attempt on the rwsem later on.
+ -	 */
+ -	if (rwsem_has_spinner(sem)) {
+ -		/*
+ -		 * The smp_rmb() here is to make sure that the spinner
+ -		 * state is consulted before reading the wait_lock.
+ -		 */
+ -		smp_rmb();
+ -		if (!raw_spin_trylock_irqsave(&sem->wait_lock, flags))
+ -			return sem;
+ -		goto locked;
+ -	}
+  	raw_spin_lock_irqsave(&sem->wait_lock, flags);
+ -locked:
+  
+  	/* do nothing if list empty */
+  	if (!list_empty(&sem->wait_list))
+* Unmerged path lib/rwsem.c
