@@ -36,7 +36,6 @@
 #include <linux/uaccess.h>
 #include <linux/vfio.h>
 #include <linux/workqueue.h>
-#include <linux/pid_namespace.h>
 #include <linux/mdev.h>
 
 #define DRIVER_VERSION  "0.2"
