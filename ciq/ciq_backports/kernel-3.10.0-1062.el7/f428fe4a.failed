@@ -1,0 +1,163 @@
+rtnetlink: give a user socket to get_target_net()
+
+jira LE-1907
+cve CVE-2018-14646
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andrei Vagin <avagin@openvz.org>
+commit f428fe4a04cc339166c8bbd489789760de3a0cee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f428fe4a.failed
+
+This function is used from two places: rtnl_dump_ifinfo and
+rtnl_getlink. In rtnl_getlink(), we give a request skb into
+get_target_net(), but in rtnl_dump_ifinfo, we give a response skb
+into get_target_net().
+The problem here is that NETLINK_CB() isn't initialized for the response
+skb. In both cases we can get a user socket and give it instead of skb
+into get_target_net().
+
+This bug was found by syzkaller with this call-trace:
+
+kasan: GPF could be caused by NULL-ptr deref or user memory access
+general protection fault: 0000 [#1] SMP KASAN
+Modules linked in:
+CPU: 1 PID: 3149 Comm: syzkaller140561 Not tainted 4.15.0-rc4-mm1+ #47
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+Google 01/01/2011
+RIP: 0010:__netlink_ns_capable+0x8b/0x120 net/netlink/af_netlink.c:868
+RSP: 0018:ffff8801c880f348 EFLAGS: 00010206
+RAX: dffffc0000000000 RBX: 0000000000000000 RCX: ffffffff8443f900
+RDX: 000000000000007b RSI: ffffffff86510f40 RDI: 00000000000003d8
+RBP: ffff8801c880f360 R08: 0000000000000000 R09: 1ffff10039101e4f
+R10: 0000000000000000 R11: 0000000000000001 R12: ffffffff86510f40
+R13: 000000000000000c R14: 0000000000000004 R15: 0000000000000011
+FS:  0000000001a1a880(0000) GS:ffff8801db300000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000020151000 CR3: 00000001c9511005 CR4: 00000000001606e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Call Trace:
+  netlink_ns_capable+0x26/0x30 net/netlink/af_netlink.c:886
+  get_target_net+0x9d/0x120 net/core/rtnetlink.c:1765
+  rtnl_dump_ifinfo+0x2e5/0xee0 net/core/rtnetlink.c:1806
+  netlink_dump+0x48c/0xce0 net/netlink/af_netlink.c:2222
+  __netlink_dump_start+0x4f0/0x6d0 net/netlink/af_netlink.c:2319
+  netlink_dump_start include/linux/netlink.h:214 [inline]
+  rtnetlink_rcv_msg+0x7f0/0xb10 net/core/rtnetlink.c:4485
+  netlink_rcv_skb+0x21e/0x460 net/netlink/af_netlink.c:2441
+  rtnetlink_rcv+0x1c/0x20 net/core/rtnetlink.c:4540
+  netlink_unicast_kernel net/netlink/af_netlink.c:1308 [inline]
+  netlink_unicast+0x4be/0x6a0 net/netlink/af_netlink.c:1334
+  netlink_sendmsg+0xa4a/0xe60 net/netlink/af_netlink.c:1897
+
+	Cc: Jiri Benc <jbenc@redhat.com>
+Fixes: 79e1ad148c84 ("rtnetlink: use netnsid to query interface")
+	Signed-off-by: Andrei Vagin <avagin@openvz.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f428fe4a04cc339166c8bbd489789760de3a0cee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/rtnetlink.c
+diff --cc net/core/rtnetlink.c
+index c70e7cdc57f8,778d7f03404a..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1612,9 -1612,76 +1612,73 @@@ static const struct nla_policy ifla_por
+  				    .len = PORT_UUID_MAX },
+  	[IFLA_PORT_REQUEST]	= { .type = NLA_U8, },
+  	[IFLA_PORT_RESPONSE]	= { .type = NLA_U16, },
+ -
+ -	/* Unused, but we need to keep it here since user space could
+ -	 * fill it. It's also broken with regard to NLA_BINARY use in
+ -	 * combination with structs.
+ -	 */
+ -	[IFLA_PORT_VSI_TYPE]	= { .type = NLA_BINARY,
+ -				    .len = sizeof(struct ifla_port_vsi) },
+  };
+  
+++<<<<<<< HEAD
+ +static struct net *get_target_net(struct sk_buff *skb, int netnsid)
+++=======
++ static const struct nla_policy ifla_xdp_policy[IFLA_XDP_MAX + 1] = {
++ 	[IFLA_XDP_FD]		= { .type = NLA_S32 },
++ 	[IFLA_XDP_ATTACHED]	= { .type = NLA_U8 },
++ 	[IFLA_XDP_FLAGS]	= { .type = NLA_U32 },
++ 	[IFLA_XDP_PROG_ID]	= { .type = NLA_U32 },
++ };
++ 
++ static const struct rtnl_link_ops *linkinfo_to_kind_ops(const struct nlattr *nla)
++ {
++ 	const struct rtnl_link_ops *ops = NULL;
++ 	struct nlattr *linfo[IFLA_INFO_MAX + 1];
++ 
++ 	if (nla_parse_nested(linfo, IFLA_INFO_MAX, nla,
++ 			     ifla_info_policy, NULL) < 0)
++ 		return NULL;
++ 
++ 	if (linfo[IFLA_INFO_KIND]) {
++ 		char kind[MODULE_NAME_LEN];
++ 
++ 		nla_strlcpy(kind, linfo[IFLA_INFO_KIND], sizeof(kind));
++ 		ops = rtnl_link_ops_get(kind);
++ 	}
++ 
++ 	return ops;
++ }
++ 
++ static bool link_master_filtered(struct net_device *dev, int master_idx)
++ {
++ 	struct net_device *master;
++ 
++ 	if (!master_idx)
++ 		return false;
++ 
++ 	master = netdev_master_upper_dev_get(dev);
++ 	if (!master || master->ifindex != master_idx)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool link_kind_filtered(const struct net_device *dev,
++ 			       const struct rtnl_link_ops *kind_ops)
++ {
++ 	if (kind_ops && dev->rtnl_link_ops != kind_ops)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool link_dump_filtered(struct net_device *dev,
++ 			       int master_idx,
++ 			       const struct rtnl_link_ops *kind_ops)
++ {
++ 	if (link_master_filtered(dev, master_idx) ||
++ 	    link_kind_filtered(dev, kind_ops))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static struct net *get_target_net(struct sock *sk, int netnsid)
+++>>>>>>> f428fe4a04cc (rtnetlink: give a user socket to get_target_net())
+  {
+  	struct net *net;
+  
+@@@ -1659,11 -1729,11 +1723,11 @@@ static int rtnl_dump_ifinfo(struct sk_b
+  	hdrlen = nlmsg_len(cb->nlh) < sizeof(struct ifinfomsg) ?
+  		 sizeof(struct rtgenmsg) : sizeof(struct ifinfomsg);
+  
+ -	if (nlmsg_parse(cb->nlh, hdrlen, tb, IFLA_MAX,
+ -			ifla_policy, NULL) >= 0) {
+ +	if (nlmsg_parse(cb->nlh, hdrlen, tb, IFLA_MAX, ifla_policy) >= 0) {
+ +
+  		if (tb[IFLA_IF_NETNSID]) {
+  			netnsid = nla_get_s32(tb[IFLA_IF_NETNSID]);
+- 			tgt_net = get_target_net(skb, netnsid);
++ 			tgt_net = get_target_net(skb->sk, netnsid);
+  			if (IS_ERR(tgt_net)) {
+  				tgt_net = net;
+  				netnsid = -1;
+* Unmerged path net/core/rtnetlink.c
