@@ -1,0 +1,126 @@
+bridge: fix bridge netlink RCU usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 2f56f6be47dbc6883e28107edfe2f9f98f4d5a24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2f56f6be.failed
+
+When the STP timer fires, it can call br_ifinfo_notify(),
+which in turn ends up in the new br_get_link_af_size().
+This function is annotated to be using RTNL locking, which
+clearly isn't the case here, and thus lockdep warns:
+
+  ===============================
+  [ INFO: suspicious RCU usage. ]
+  3.19.0+ #569 Not tainted
+  -------------------------------
+  net/bridge/br_private.h:204 suspicious rcu_dereference_protected() usage!
+
+Fix this by doing RCU locking here.
+
+Fixes: b7853d73e39b ("bridge: add vlan info to bridge setlink and dellink notification messages")
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Acked-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f56f6be47dbc6883e28107edfe2f9f98f4d5a24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netlink.c
+diff --cc net/bridge/br_netlink.c
+index 389930889e03,c72083968768..000000000000
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@@ -22,6 -22,85 +22,88 @@@
+  #include "br_private.h"
+  #include "br_private_stp.h"
+  
+++<<<<<<< HEAD
+++=======
++ static int br_get_num_vlan_infos(const struct net_port_vlans *pv,
++ 				 u32 filter_mask)
++ {
++ 	u16 vid_range_start = 0, vid_range_end = 0;
++ 	u16 vid_range_flags = 0;
++ 	u16 pvid, vid, flags;
++ 	int num_vlans = 0;
++ 
++ 	if (filter_mask & RTEXT_FILTER_BRVLAN)
++ 		return pv->num_vlans;
++ 
++ 	if (!(filter_mask & RTEXT_FILTER_BRVLAN_COMPRESSED))
++ 		return 0;
++ 
++ 	/* Count number of vlan info's
++ 	 */
++ 	pvid = br_get_pvid(pv);
++ 	for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID) {
++ 		flags = 0;
++ 		if (vid == pvid)
++ 			flags |= BRIDGE_VLAN_INFO_PVID;
++ 
++ 		if (test_bit(vid, pv->untagged_bitmap))
++ 			flags |= BRIDGE_VLAN_INFO_UNTAGGED;
++ 
++ 		if (vid_range_start == 0) {
++ 			goto initvars;
++ 		} else if ((vid - vid_range_end) == 1 &&
++ 			flags == vid_range_flags) {
++ 			vid_range_end = vid;
++ 			continue;
++ 		} else {
++ 			if ((vid_range_end - vid_range_start) > 0)
++ 				num_vlans += 2;
++ 			else
++ 				num_vlans += 1;
++ 		}
++ initvars:
++ 		vid_range_start = vid;
++ 		vid_range_end = vid;
++ 		vid_range_flags = flags;
++ 	}
++ 
++ 	if (vid_range_start != 0) {
++ 		if ((vid_range_end - vid_range_start) > 0)
++ 			num_vlans += 2;
++ 		else
++ 			num_vlans += 1;
++ 	}
++ 
++ 	return num_vlans;
++ }
++ 
++ static size_t br_get_link_af_size_filtered(const struct net_device *dev,
++ 					   u32 filter_mask)
++ {
++ 	struct net_port_vlans *pv;
++ 	int num_vlan_infos;
++ 
++ 	rcu_read_lock();
++ 	if (br_port_exists(dev))
++ 		pv = nbp_get_vlan_info(br_port_get_rcu(dev));
++ 	else if (dev->priv_flags & IFF_EBRIDGE)
++ 		pv = br_get_vlan_info((struct net_bridge *)netdev_priv(dev));
++ 	else
++ 		pv = NULL;
++ 	if (pv)
++ 		num_vlan_infos = br_get_num_vlan_infos(pv, filter_mask);
++ 	else
++ 		num_vlan_infos = 0;
++ 	rcu_read_unlock();
++ 
++ 	if (!num_vlan_infos)
++ 		return 0;
++ 
++ 	/* Each VLAN is returned in bridge_vlan_info along with flags */
++ 	return num_vlan_infos * nla_total_size(sizeof(struct bridge_vlan_info));
++ }
++ 
+++>>>>>>> 2f56f6be47db (bridge: fix bridge netlink RCU usage)
+  static inline size_t br_port_info_size(void)
+  {
+  	return nla_total_size(1)	/* IFLA_BRPORT_STATE  */
+* Unmerged path net/bridge/br_netlink.c
