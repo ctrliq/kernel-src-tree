@@ -1,0 +1,273 @@
+sysvipc: unteach ids->next_id for !CHECKPOINT_RESTORE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit b8fd99838435f9b420c3e848192bd43abc648b7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/b8fd9983.failed
+
+Patch series "sysvipc: ipc-key management improvements".
+
+Here are a few improvements I spotted while eyeballing Guillaume's
+rhashtable implementation for ipc keys.  The first and fourth patches
+are the interesting ones, the middle two are trivial.
+
+This patch (of 4):
+
+The next_id object-allocation functionality was introduced in commit
+03f595668017 ("ipc: add sysctl to specify desired next object id").
+
+Given that these new entries are _only_ exported under the
+CONFIG_CHECKPOINT_RESTORE option, there is no point for the common case
+to even know about ->next_id.  As such rewrite ipc_buildid() such that
+it can do away with the field as well as unnecessary branches when
+adding a new identifier.  The end result also better differentiates both
+cases, so the code ends up being cleaner; albeit the small duplications
+regarding the default case.
+
+[akpm@linux-foundation.org: coding-style fixes]
+Link: http://lkml.kernel.org/r/20170831172049.14576-2-dave@stgolabs.net
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b8fd99838435f9b420c3e848192bd43abc648b7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ipc_namespace.h
+#	ipc/util.c
+#	ipc/util.h
+diff --cc include/linux/ipc_namespace.h
+index 3077f12384f0,d7cf3a850853..000000000000
+--- a/include/linux/ipc_namespace.h
++++ b/include/linux/ipc_namespace.h
+@@@ -21,10 -16,13 +21,16 @@@ struct user_namespace
+  struct ipc_ids {
+  	int in_use;
+  	unsigned short seq;
+ -	bool tables_initialized;
+ +	unsigned short seq_max;
+  	struct rw_semaphore rwsem;
+  	struct idr ipcs_idr;
++ #ifdef CONFIG_CHECKPOINT_RESTORE
+  	int next_id;
+++<<<<<<< HEAD
+++=======
++ #endif
++ 	struct rhashtable key_ht;
+++>>>>>>> b8fd99838435 (sysvipc: unteach ids->next_id for !CHECKPOINT_RESTORE)
+  };
+  
+  struct ipc_namespace {
+diff --cc ipc/util.c
+index 1df75a61612b,429c06bdb8ef..000000000000
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@@ -130,30 -96,36 +130,43 @@@ static int __init ipc_init(void
+  }
+  device_initcall(ipc_init);
+  
+ -static const struct rhashtable_params ipc_kht_params = {
+ -	.head_offset		= offsetof(struct kern_ipc_perm, khtnode),
+ -	.key_offset		= offsetof(struct kern_ipc_perm, key),
+ -	.key_len		= FIELD_SIZEOF(struct kern_ipc_perm, key),
+ -	.locks_mul		= 1,
+ -	.automatic_shrinking	= true,
+ -};
+ -
+  /**
+ - * ipc_init_ids	- initialise ipc identifiers
+ - * @ids: ipc identifier set
+ + *	ipc_init_ids		-	initialise IPC identifiers
+ + *	@ids: Identifier set
+   *
+ - * Set up the sequence range to use for the ipc identifier range (limited
+ - * below IPCMNI) then initialise the keys hashtable and ids idr.
+ + *	Set up the sequence range to use for the ipc identifier range (limited
+ + *	below IPCMNI) then initialise the ids idr.
+   */
+ -int ipc_init_ids(struct ipc_ids *ids)
+ + 
+ +void ipc_init_ids(struct ipc_ids *ids)
+  {
+ -	int err;
+ +	init_rwsem(&ids->rwsem);
+ +
+  	ids->in_use = 0;
+  	ids->seq = 0;
+++<<<<<<< HEAD
+ +	ids->next_id = -1;
+ +	{
+ +		int seq_limit = INT_MAX/SEQ_MULTIPLIER;
+ +		if (seq_limit > USHRT_MAX)
+ +			ids->seq_max = USHRT_MAX;
+ +		 else
+ +		 	ids->seq_max = seq_limit;
+ +	}
+ +
+ +	idr_init(&ids->ipcs_idr);
+++=======
++ 	init_rwsem(&ids->rwsem);
++ 	err = rhashtable_init(&ids->key_ht, &ipc_kht_params);
++ 	if (err)
++ 		return err;
++ 	idr_init(&ids->ipcs_idr);
++ 	ids->tables_initialized = true;
++ #ifdef CONFIG_CHECKPOINT_RESTORE
++ 	ids->next_id = -1;
++ #endif
++ 	return 0;
+++>>>>>>> b8fd99838435 (sysvipc: unteach ids->next_id for !CHECKPOINT_RESTORE)
+  }
+  
+  #ifdef CONFIG_PROC_FS
+@@@ -257,25 -218,64 +270,69 @@@ int ipc_get_maxid(struct ipc_ids *ids
+  	return max_id;
+  }
+  
++ #ifdef CONFIG_CHECKPOINT_RESTORE
++ /*
++  * Specify desired id for next allocated IPC object.
++  */
++ #define ipc_idr_alloc(ids, new)						\
++ 	idr_alloc(&(ids)->ipcs_idr, (new),				\
++ 		  (ids)->next_id < 0 ? 0 : ipcid_to_idx((ids)->next_id),\
++ 		  0, GFP_NOWAIT)
++ 
++ static inline int ipc_buildid(int id, struct ipc_ids *ids,
++ 			      struct kern_ipc_perm *new)
++ {
++ 	if (ids->next_id < 0) { /* default, behave as !CHECKPOINT_RESTORE */
++ 		new->seq = ids->seq++;
++ 		if (ids->seq > IPCID_SEQ_MAX)
++ 			ids->seq = 0;
++ 	} else {
++ 		new->seq = ipcid_to_seqx(ids->next_id);
++ 		ids->next_id = -1;
++ 	}
++ 
++ 	return SEQ_MULTIPLIER * new->seq + id;
++ }
++ 
++ #else
++ #define ipc_idr_alloc(ids, new)					\
++ 	idr_alloc(&(ids)->ipcs_idr, (new), 0, 0, GFP_NOWAIT)
++ 
++ static inline int ipc_buildid(int id, struct ipc_ids *ids,
++ 			      struct kern_ipc_perm *new)
++ {
++ 	new->seq = ids->seq++;
++ 	if (ids->seq > IPCID_SEQ_MAX)
++ 		ids->seq = 0;
++ 
++ 	return SEQ_MULTIPLIER * new->seq + id;
++ }
++ 
++ #endif /* CONFIG_CHECKPOINT_RESTORE */
++ 
+  /**
+ - * ipc_addid - add an ipc identifier
+ - * @ids: ipc identifier set
+ - * @new: new ipc permission set
+ - * @size: limit for the number of used ids
+ + *	ipc_addid 	-	add an IPC identifier
+ + *	@ids: IPC identifier set
+ + *	@new: new IPC permission set
+ + *	@size: limit for the number of used ids
+   *
+ - * Add an entry 'new' to the ipc ids idr. The permissions object is
+ - * initialised and the first free entry is set up and the id assigned
+ - * is returned. The 'new' entry is returned in a locked state on success.
+ - * On failure the entry is not locked and a negative err-code is returned.
+ + *	Add an entry 'new' to the IPC ids idr. The permissions object is
+ + *	initialised and the first free entry is set up and the id assigned
+ + *	is returned. The 'new' entry is returned in a locked state on success.
+ + *	On failure the entry is not locked and a negative err-code is returned.
+   *
+ - * Called with writer ipc_ids.rwsem held.
+ + *	Called with writer ipc_ids.rwsem held.
+   */
+ -int ipc_addid(struct ipc_ids *ids, struct kern_ipc_perm *new, int size)
+ +int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+  {
+  	kuid_t euid;
+  	kgid_t egid;
+++<<<<<<< HEAD
+ +	int id;
+ +	int next_id = ids->next_id;
+++=======
++ 	int id, err;
+++>>>>>>> b8fd99838435 (sysvipc: unteach ids->next_id for !CHECKPOINT_RESTORE)
+  
+  	if (size > IPCMNI)
+  		size = IPCMNI;
+@@@ -294,10 -295,17 +351,8 @@@
+  	new->cuid = new->uid = euid;
+  	new->gid = new->cgid = egid;
+  
+- 	id = idr_alloc(&ids->ipcs_idr, new,
+- 		       (next_id < 0) ? 0 : ipcid_to_idx(next_id), 0,
+- 		       GFP_NOWAIT);
++ 	id = ipc_idr_alloc(ids, new);
+  	idr_preload_end();
+ -
+ -	if (id >= 0 && new->key != IPC_PRIVATE) {
+ -		err = rhashtable_insert_fast(&ids->key_ht, &new->khtnode,
+ -					     ipc_kht_params);
+ -		if (err < 0) {
+ -			idr_remove(&ids->ipcs_idr, id);
+ -			id = err;
+ -		}
+ -	}
+  	if (id < 0) {
+  		spin_unlock(&new->lock);
+  		rcu_read_unlock();
+@@@ -305,17 -313,8 +360,21 @@@
+  	}
+  
+  	ids->in_use++;
++ 	new->id = ipc_buildid(id, ids, new);
+  
+++<<<<<<< HEAD
+ +	if (next_id < 0) {
+ +		new->seq = ids->seq++;
+ +		if (ids->seq > ids->seq_max)
+ +			ids->seq = 0;
+ +	} else {
+ +		new->seq = ipcid_to_seqx(next_id);
+ +		ids->next_id = -1;
+ +	}
+ +
+ +	new->id = ipc_buildid(id, new->seq);
+++=======
+++>>>>>>> b8fd99838435 (sysvipc: unteach ids->next_id for !CHECKPOINT_RESTORE)
+  	return id;
+  }
+  
+diff --cc ipc/util.h
+index a1cbc3aaf25a,0cd6201fe63a..000000000000
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@@ -152,13 -146,6 +152,16 @@@ extern struct msg_msg *load_msg(const v
+  extern struct msg_msg *copy_msg(struct msg_msg *src, struct msg_msg *dst);
+  extern int store_msg(void __user *dest, struct msg_msg *msg, size_t len);
+  
+++<<<<<<< HEAD
+ +extern void recompute_msgmni(struct ipc_namespace *);
+ +
+ +static inline int ipc_buildid(int id, int seq)
+ +{
+ +	return SEQ_MULTIPLIER * seq + id;
+ +}
+ +
+++=======
+++>>>>>>> b8fd99838435 (sysvipc: unteach ids->next_id for !CHECKPOINT_RESTORE)
+  static inline int ipc_checkid(struct kern_ipc_perm *ipcp, int uid)
+  {
+  	return uid / SEQ_MULTIPLIER != ipcp->seq;
+* Unmerged path include/linux/ipc_namespace.h
+* Unmerged path ipc/util.c
+* Unmerged path ipc/util.h
