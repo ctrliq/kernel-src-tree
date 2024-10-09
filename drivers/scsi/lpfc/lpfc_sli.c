@@ -6836,6 +6836,18 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 	/* Save information as VPD data */
 	phba->vpd.rev.biuRev = mqe->un.read_rev.first_hw_rev;
 	phba->vpd.rev.smRev = mqe->un.read_rev.second_hw_rev;
+
+	/*
+	 * This is because first G7 ASIC doesn't support the standard
+	 * 0x5a NVME cmd descriptor type/subtype
+	 */
+	if ((bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) ==
+			LPFC_SLI_INTF_IF_TYPE_6) &&
+	    (phba->vpd.rev.biuRev == LPFC_G7_ASIC_1) &&
+	    (phba->vpd.rev.smRev == 0) &&
+	    (phba->cfg_nvme_embed_cmd == 1))
+		phba->cfg_nvme_embed_cmd = 0;
+
 	phba->vpd.rev.endecRev = mqe->un.read_rev.third_hw_rev;
 	phba->vpd.rev.fcphHigh = bf_get(lpfc_mbx_rd_rev_fcph_high,
 					 &mqe->un.read_rev);
@@ -9047,6 +9059,7 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 			wqe128->generic.bde.addrLow =  88;  /* Word 22 */
 
 			bf_set(wqe_wqes, &wqe128->fcp_iwrite.wqe_com, 1);
+			bf_set(wqe_dbde, &wqe128->fcp_iwrite.wqe_com, 0);
 
 			/* Word 22-29  FCP CMND Payload */
 			ptr = &wqe128->words[22];
@@ -9112,6 +9125,7 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 			wqe128->generic.bde.addrLow =  88;  /* Word 22 */
 
 			bf_set(wqe_wqes, &wqe128->fcp_iread.wqe_com, 1);
+			bf_set(wqe_dbde, &wqe128->fcp_iread.wqe_com, 0);
 
 			/* Word 22-29  FCP CMND Payload */
 			ptr = &wqe128->words[22];
@@ -9170,6 +9184,7 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 			wqe128->generic.bde.addrLow =  88;  /* Word 22 */
 
 			bf_set(wqe_wqes, &wqe128->fcp_icmd.wqe_com, 1);
+			bf_set(wqe_dbde, &wqe128->fcp_icmd.wqe_com, 0);
 
 			/* Word 22-29  FCP CMND Payload */
 			ptr = &wqe128->words[22];
