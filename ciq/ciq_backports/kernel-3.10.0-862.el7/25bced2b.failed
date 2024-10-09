@@ -1,0 +1,150 @@
+scsi: cxlflash: Remove private command pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Remove private command pool (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 92.50%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 25bced2b61b43b6372a73008dafa2183c5d53c39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/25bced2b.failed
+
+Clean up and remove the remaining private command pool infrastructure
+that is no longer required.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Acked-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 25bced2b61b43b6372a73008dafa2183c5d53c39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index d8aaf45b8306,19156adb0b69..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -36,65 -35,6 +36,68 @@@ MODULE_AUTHOR("Matthew R. Ochs <mrochs@
+  MODULE_LICENSE("GPL");
+  
+  /**
+++<<<<<<< HEAD
+ + * cmd_checkout() - checks out an AFU command
+ + * @afu:	AFU to checkout from.
+ + *
+ + * Commands are checked out in a round-robin fashion. Note that since
+ + * the command pool is larger than the hardware queue, the majority of
+ + * times we will only loop once or twice before getting a command. The
+ + * CDB within the command is initialized (zeroed) prior to returning.
+ + *
+ + * Return: The checked out command or NULL when command pool is empty.
+ + */
+ +static struct afu_cmd *cmd_checkout(struct afu *afu)
+ +{
+ +	int k, dec = CXLFLASH_NUM_CMDS;
+ +	struct afu_cmd *cmd;
+ +
+ +	while (dec--) {
+ +		k = (afu->cmd_couts++ & (CXLFLASH_NUM_CMDS - 1));
+ +
+ +		cmd = &afu->cmd[k];
+ +
+ +		if (!atomic_dec_if_positive(&cmd->free)) {
+ +			pr_devel("%s: returning found index=%d cmd=%p\n",
+ +				 __func__, cmd->slot, cmd);
+ +			memset(cmd->rcb.cdb, 0, sizeof(cmd->rcb.cdb));
+ +			return cmd;
+ +		}
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +/**
+ + * cmd_checkin() - checks in an AFU command
+ + * @cmd:	AFU command to checkin.
+ + *
+ + * Safe to pass commands that have already been checked in. Several
+ + * internal tracking fields are reset as part of the checkin. Note
+ + * that these are intentionally reset prior to toggling the free bit
+ + * to avoid clobbering values in the event that the command is checked
+ + * out right away.
+ + */
+ +static void cmd_checkin(struct afu_cmd *cmd)
+ +{
+ +	cmd->rcb.scp = NULL;
+ +	cmd->rcb.timeout = 0;
+ +	cmd->sa.ioasc = 0;
+ +	cmd->cmd_tmf = false;
+ +	cmd->sa.host_use[0] = 0; /* clears both completion and retry bytes */
+ +
+ +	if (unlikely(atomic_inc_return(&cmd->free) != 1)) {
+ +		pr_err("%s: Freeing cmd (%d) that is not in use!\n",
+ +		       __func__, cmd->slot);
+ +		return;
+ +	}
+ +
+ +	pr_devel("%s: released cmd %p index=%d\n", __func__, cmd, cmd->slot);
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 25bced2b61b4 (scsi: cxlflash: Remove private command pool)
+   * process_cmd_err() - command error handler
+   * @cmd:	AFU command that experienced the error.
+   * @scp:	SCSI command associated with the AFU command in error.
+@@@ -592,27 -536,9 +595,11 @@@ static void free_mem(struct cxlflash_cf
+   */
+  static void stop_afu(struct cxlflash_cfg *cfg)
+  {
+- 	int i;
+  	struct afu *afu = cfg->afu;
+- 	struct afu_cmd *cmd;
+  
+ +	cancel_work_sync(&cfg->work_q);
+ +
+  	if (likely(afu)) {
+- 		for (i = 0; i < CXLFLASH_NUM_CMDS; i++) {
+- 			cmd = &afu->cmd[i];
+- 			complete(&cmd->cevent);
+- 			if (!atomic_read(&cmd->free))
+- 				cmd_checkin(cmd);
+- 		}
+- 
+  		if (likely(afu->afu_map)) {
+  			cxl_psa_unmap((void __iomem *)afu->afu_map);
+  			afu->afu_map = NULL;
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index 811927d91c5c..84657c4cac0f 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -135,8 +135,6 @@ struct afu_cmd {
+ 	spinlock_t slock;
+ 	struct completion cevent;
+ 	struct afu *parent;
+-	int slot;
+-	atomic_t free;
+ 
+ 	u8 cmd_tmf:1;
+ 
+@@ -150,10 +148,6 @@ struct afu {
+ 	/* Stuff requiring alignment go first. */
+ 
+ 	u64 rrq_entry[NUM_RRQ_ENTRY];	/* 2K RRQ */
+-	/*
+-	 * Command & data for AFU commands.
+-	 */
+-	struct afu_cmd cmd[CXLFLASH_NUM_CMDS];
+ 
+ 	/* Beware of alignment till here. Preferably introduce new
+ 	 * fields after this point
+@@ -173,7 +167,6 @@ struct afu {
+ 	s64 room;
+ 	spinlock_t rrin_slock; /* Lock to rrin queuing and cmd_room updates */
+ 	u64 hb;
+-	u32 cmd_couts;		/* Number of command checkouts */
+ 	u32 internal_lun;	/* User-desired LUN mode for this AFU */
+ 
+ 	char version[16];
+* Unmerged path drivers/scsi/cxlflash/main.c
