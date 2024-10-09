@@ -1,0 +1,222 @@
+IB/hfi1: Remove lstate from hfi1_pportdata
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Byczkowski, Jakub <jakub.byczkowski@intel.com>
+commit 02a222c7f6c8d17b5fb6803ca453fcd9d5a3853d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/02a222c7.failed
+
+Do not track logical state separately from host_link_state. Deduce
+logical state from host_link_state when required. Transitions in
+set_link_state and goto_offline already make sure host_link_state
+reflects hardware's logical state properly.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Jakub Byczkowski <jakub.byczkowski@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 02a222c7f6c8d17b5fb6803ca453fcd9d5a3853d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/chip.h
+#	drivers/infiniband/hw/hfi1/hfi.h
+diff --cc drivers/infiniband/hw/hfi1/chip.h
+index 8a7b218d745f,f7083025fb04..000000000000
+--- a/drivers/infiniband/hw/hfi1/chip.h
++++ b/drivers/infiniband/hw/hfi1/chip.h
+@@@ -741,7 -748,7 +741,11 @@@ int is_ax(struct hfi1_devdata *dd)
+  int is_bx(struct hfi1_devdata *dd);
+  u32 read_physical_state(struct hfi1_devdata *dd);
+  u32 chip_to_opa_pstate(struct hfi1_devdata *dd, u32 chip_pstate);
+++<<<<<<< HEAD
+ +u32 get_logical_state(struct hfi1_pportdata *ppd);
+++=======
++ void cache_physical_state(struct hfi1_pportdata *ppd);
+++>>>>>>> 02a222c7f6c8 (IB/hfi1: Remove lstate from hfi1_pportdata)
+  const char *opa_lstate_name(u32 lstate);
+  const char *opa_pstate_name(u32 pstate);
+  u32 driver_physical_state(struct hfi1_pportdata *ppd);
+diff --cc drivers/infiniband/hw/hfi1/hfi.h
+index 9719cf207532,e66e8f96ceab..000000000000
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@@ -1314,19 -1294,20 +1312,36 @@@ static inline __le32 *get_rhf_addr(stru
+  
+  int hfi1_reset_device(int);
+  
+++<<<<<<< HEAD
+ +/* return the driver's idea of the logical OPA port state */
+ +static inline u32 driver_lstate(struct hfi1_pportdata *ppd)
+ +{
+ +	/*
+ +	 * The driver does some processing from the time the logical
+ +	 * link state is at INIT to the time the SM can be notified
+ +	 * as such. Return IB_PORT_DOWN until the software state
+ +	 * is ready.
+ +	 */
+ +	if (ppd->lstate == IB_PORT_INIT && !(ppd->host_link_state & HLS_UP))
+ +		return IB_PORT_DOWN;
+ +	else
+ +		return ppd->lstate;
+++=======
++ /* return the driver's idea of the physical OPA port state */
++ static inline u32 driver_pstate(struct hfi1_pportdata *ppd)
++ {
++ 	/*
++ 	 * The driver does some processing from the time the physical
++ 	 * link state is at LINKUP to the time the SM can be notified
++ 	 * as such. Return IB_PORTPHYSSTATE_TRAINING until the software
++ 	 * state is ready.
++ 	 */
++ 	if (ppd->pstate == PLS_LINKUP &&
++ 	    !(ppd->host_link_state & HLS_UP))
++ 		return IB_PORTPHYSSTATE_TRAINING;
++ 	else
++ 		return chip_to_opa_pstate(ppd->dd, ppd->pstate);
+++>>>>>>> 02a222c7f6c8 (IB/hfi1: Remove lstate from hfi1_pportdata)
+  }
+  
+  void receive_interrupt_work(struct work_struct *work);
+diff --git a/drivers/infiniband/hw/hfi1/chip.c b/drivers/infiniband/hw/hfi1/chip.c
+index 7ed61dba0ba4..324dad339b1f 100644
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -1065,6 +1065,7 @@ static int do_8051_command(struct hfi1_devdata *dd, u32 type, u64 in_data,
+ static int read_idle_sma(struct hfi1_devdata *dd, u64 *data);
+ static int thermal_init(struct hfi1_devdata *dd);
+ 
++static void update_statusp(struct hfi1_pportdata *ppd, u32 state);
+ static int wait_logical_linkstate(struct hfi1_pportdata *ppd, u32 state,
+ 				  int msecs);
+ static void read_planned_down_reason_code(struct hfi1_devdata *dd, u8 *pdrrc);
+@@ -10230,8 +10231,10 @@ static void force_logical_link_state_down(struct hfi1_pportdata *ppd)
+ 	write_csr(dd, DC_LCB_CFG_ALLOW_LINK_UP, 0);
+ 	write_csr(dd, DC_LCB_CFG_IGNORE_LOST_RCLK, 0);
+ 
+-	/* call again to adjust ppd->statusp, if needed */
+-	get_logical_state(ppd);
++	/* adjust ppd->statusp, if needed */
++	update_statusp(ppd, IB_PORT_DOWN);
++
++	dd_dev_info(ppd->dd, "logical state forced to LINK_DOWN\n");
+ }
+ 
+ /*
+@@ -10441,11 +10444,11 @@ u32 driver_physical_state(struct hfi1_pportdata *ppd)
+ }
+ 
+ /*
+- * driver_logical_state - convert the driver's notion of a port's
++ * driver_lstate - convert the driver's notion of a port's
+  * state (an HLS_*) into a logical state (a IB_PORT_*). Return -1
+  * (converted to a u32) to indicate error.
+  */
+-u32 driver_logical_state(struct hfi1_pportdata *ppd)
++u32 driver_lstate(struct hfi1_pportdata *ppd)
+ {
+ 	if (ppd->host_link_state && (ppd->host_link_state & HLS_DOWN))
+ 		return IB_PORT_DOWN;
+@@ -12609,20 +12612,8 @@ const char *opa_pstate_name(u32 pstate)
+ 	return "unknown";
+ }
+ 
+-/*
+- * Read the hardware link state and set the driver's cached value of it.
+- * Return the (new) current value.
+- */
+-u32 get_logical_state(struct hfi1_pportdata *ppd)
++static void update_statusp(struct hfi1_pportdata *ppd, u32 state)
+ {
+-	u32 new_state;
+-
+-	new_state = chip_to_opa_lstate(ppd->dd, read_logical_state(ppd->dd));
+-	if (new_state != ppd->lstate) {
+-		dd_dev_info(ppd->dd, "logical state changed to %s (0x%x)\n",
+-			    opa_lstate_name(new_state), new_state);
+-		ppd->lstate = new_state;
+-	}
+ 	/*
+ 	 * Set port status flags in the page mapped into userspace
+ 	 * memory. Do it here to ensure a reliable state - this is
+@@ -12632,7 +12623,7 @@ u32 get_logical_state(struct hfi1_pportdata *ppd)
+ 	 * function.
+ 	 */
+ 	if (ppd->statusp) {
+-		switch (ppd->lstate) {
++		switch (state) {
+ 		case IB_PORT_DOWN:
+ 		case IB_PORT_INIT:
+ 			*ppd->statusp &= ~(HFI1_STATUS_IB_CONF |
+@@ -12646,10 +12637,9 @@ u32 get_logical_state(struct hfi1_pportdata *ppd)
+ 			break;
+ 		}
+ 	}
+-	return ppd->lstate;
+ }
+ 
+-/**
++/*
+  * wait_logical_linkstate - wait for an IB link state change to occur
+  * @ppd: port device
+  * @state: the state to wait for
+@@ -12663,18 +12653,29 @@ static int wait_logical_linkstate(struct hfi1_pportdata *ppd, u32 state,
+ 				  int msecs)
+ {
+ 	unsigned long timeout;
++	u32 new_state;
+ 
+ 	timeout = jiffies + msecs_to_jiffies(msecs);
+ 	while (1) {
+-		if (get_logical_state(ppd) == state)
+-			return 0;
+-		if (time_after(jiffies, timeout))
++		new_state = chip_to_opa_lstate(ppd->dd,
++					       read_logical_state(ppd->dd));
++		if (new_state == state)
+ 			break;
++		if (time_after(jiffies, timeout)) {
++			dd_dev_err(ppd->dd,
++				   "timeout waiting for link state 0x%x\n",
++				   state);
++			return -ETIMEDOUT;
++		}
+ 		msleep(20);
+ 	}
+-	dd_dev_err(ppd->dd, "timeout waiting for link state 0x%x\n", state);
+ 
+-	return -ETIMEDOUT;
++	update_statusp(ppd, state);
++	dd_dev_info(ppd->dd,
++		    "logical state changed to %s (0x%x)\n",
++		    opa_lstate_name(state),
++		    state);
++	return 0;
+ }
+ 
+ u8 hfi1_ibphys_portstate(struct hfi1_pportdata *ppd)
+@@ -14787,7 +14788,6 @@ struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
+ 		 * Set the initial values to reasonable default, will be set
+ 		 * for real when link is up.
+ 		 */
+-		ppd->lstate = IB_PORT_DOWN;
+ 		ppd->overrun_threshold = 0x4;
+ 		ppd->phy_error_threshold = 0xf;
+ 		ppd->port_crc_mode_enabled = link_crc_mask;
+* Unmerged path drivers/infiniband/hw/hfi1/chip.h
+* Unmerged path drivers/infiniband/hw/hfi1/hfi.h
+diff --git a/drivers/infiniband/hw/hfi1/mad.c b/drivers/infiniband/hw/hfi1/mad.c
+index d59426fb9866..19b93c3796ac 100644
+--- a/drivers/infiniband/hw/hfi1/mad.c
++++ b/drivers/infiniband/hw/hfi1/mad.c
+@@ -927,7 +927,7 @@ static int port_states_transition_allowed(struct hfi1_pportdata *ppd,
+ 					  u32 logical_new, u32 physical_new)
+ {
+ 	u32 physical_old = driver_physical_state(ppd);
+-	u32 logical_old = driver_logical_state(ppd);
++	u32 logical_old = driver_lstate(ppd);
+ 	int ret, logical_allowed, physical_allowed;
+ 
+ 	ret = logical_transition_allowed(logical_old, logical_new);
