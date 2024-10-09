@@ -1,0 +1,181 @@
+x86/mm, mm/hwpoison: Clear PRESENT bit for kernel 1:1 mappings of poison pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Tony Luck <tony.luck@intel.com>
+commit ce0fa3e56ad20f04d8252353dcd24e924abdafca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ce0fa3e5.failed
+
+Speculative processor accesses may reference any memory that has a
+valid page table entry.  While a speculative access won't generate
+a machine check, it will log the error in a machine check bank. That
+could cause escalation of a subsequent error since the overflow bit
+will be then set in the machine check bank status register.
+
+Code has to be double-plus-tricky to avoid mentioning the 1:1 virtual
+address of the page we want to map out otherwise we may trigger the
+very problem we are trying to avoid.  We use a non-canonical address
+that passes through the usual Linux table walking code to get to the
+same "pte".
+
+Thanks to Dave Hansen for reviewing several iterations of this.
+
+Also see:
+
+  http://marc.info/?l=linux-mm&m=149860136413338&w=2
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Elliott, Robert (Persistent Memory) <elliott@hpe.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: linux-mm@kvack.org
+	Cc: stable@vger.kernel.org
+Link: http://lkml.kernel.org/r/20170816171803.28342-1-tony.luck@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ce0fa3e56ad20f04d8252353dcd24e924abdafca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm_inline.h
+#	mm/memory-failure.c
+diff --cc include/linux/mm_inline.h
+index cf55945c83fb,25438b2b6f22..000000000000
+--- a/include/linux/mm_inline.h
++++ b/include/linux/mm_inline.h
+@@@ -100,4 -124,12 +100,15 @@@ static __always_inline enum lru_list pa
+  	return lru;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define lru_to_page(head) (list_entry((head)->prev, struct page, lru))
++ 
++ #ifdef arch_unmap_kpfn
++ extern void arch_unmap_kpfn(unsigned long pfn);
++ #else
++ static __always_inline void arch_unmap_kpfn(unsigned long pfn) { }
++ #endif
++ 
+++>>>>>>> ce0fa3e56ad2 (x86/mm, mm/hwpoison: Clear PRESENT bit for kernel 1:1 mappings of poison pages)
+  #endif
+diff --cc mm/memory-failure.c
+index 2d6d813952ef,88366626c0b7..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1083,18 -1146,10 +1083,25 @@@ int memory_failure(unsigned long pfn, i
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Currently errors on hugetlbfs pages are measured in hugepage units,
+ +	 * so nr_pages should be 1 << compound_order.  OTOH when errors are on
+ +	 * transparent hugepages, they are supposed to be split and error
+ +	 * measurement is done in normal page units.  So nr_pages should be one
+ +	 * in this case.
+ +	 */
+ +	if (PageHuge(p))
+ +		nr_pages = 1 << compound_order(hpage);
+ +	else /* normal page or thp */
+ +		nr_pages = 1;
+ +	atomic_long_add(nr_pages, &num_poisoned_pages);
+++=======
++ 	arch_unmap_kpfn(pfn);
++ 
++ 	orig_head = hpage = compound_head(p);
++ 	num_poisoned_pages_inc();
+++>>>>>>> ce0fa3e56ad2 (x86/mm, mm/hwpoison: Clear PRESENT bit for kernel 1:1 mappings of poison pages)
+  
+  	/*
+  	 * We need/can do nothing about count=0 pages.
+diff --git a/arch/x86/include/asm/page_64.h b/arch/x86/include/asm/page_64.h
+index 0f1ddee6a0ce..ef3ce854d139 100644
+--- a/arch/x86/include/asm/page_64.h
++++ b/arch/x86/include/asm/page_64.h
+@@ -37,6 +37,10 @@ extern unsigned long __phys_addr_symbol(unsigned long);
+ void clear_page(void *page);
+ void copy_page(void *to, void *from);
+ 
++#ifdef CONFIG_X86_MCE
++#define arch_unmap_kpfn arch_unmap_kpfn
++#endif
++
+ #endif	/* !__ASSEMBLY__ */
+ 
+ #endif /* _ASM_X86_PAGE_64_H */
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index f77fd7cdb99d..d7390b665392 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -48,6 +48,7 @@
+ #include <asm/mce.h>
+ #include <asm/msr.h>
+ #include <asm/reboot.h>
++#include <asm/set_memory.h>
+ 
+ #include "mce-internal.h"
+ 
+@@ -1088,6 +1089,48 @@ static int do_memory_failure(struct mce *m)
+ 	return ret;
+ }
+ 
++#if defined(arch_unmap_kpfn) && defined(CONFIG_MEMORY_FAILURE)
++
++void arch_unmap_kpfn(unsigned long pfn)
++{
++	unsigned long decoy_addr;
++
++	/*
++	 * Unmap this page from the kernel 1:1 mappings to make sure
++	 * we don't log more errors because of speculative access to
++	 * the page.
++	 * We would like to just call:
++	 *	set_memory_np((unsigned long)pfn_to_kaddr(pfn), 1);
++	 * but doing that would radically increase the odds of a
++	 * speculative access to the posion page because we'd have
++	 * the virtual address of the kernel 1:1 mapping sitting
++	 * around in registers.
++	 * Instead we get tricky.  We create a non-canonical address
++	 * that looks just like the one we want, but has bit 63 flipped.
++	 * This relies on set_memory_np() not checking whether we passed
++	 * a legal address.
++	 */
++
++/*
++ * Build time check to see if we have a spare virtual bit. Don't want
++ * to leave this until run time because most developers don't have a
++ * system that can exercise this code path. This will only become a
++ * problem if/when we move beyond 5-level page tables.
++ *
++ * Hard code "9" here because cpp doesn't grok ilog2(PTRS_PER_PGD)
++ */
++#if PGDIR_SHIFT + 9 < 63
++	decoy_addr = (pfn << PAGE_SHIFT) + (PAGE_OFFSET ^ BIT(63));
++#else
++#error "no unused virtual bit available"
++#endif
++
++	if (set_memory_np(decoy_addr, 1))
++		pr_warn("Could not invalidate pfn=0x%lx from 1:1 map\n", pfn);
++
++}
++#endif
++
+ /*
+  * The actual machine check handler. This only handles real
+  * exceptions when something got corrupted coming in through int 18.
+* Unmerged path include/linux/mm_inline.h
+* Unmerged path mm/memory-failure.c
