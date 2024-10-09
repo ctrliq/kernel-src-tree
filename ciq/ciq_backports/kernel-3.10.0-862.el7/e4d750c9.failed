@@ -1,0 +1,142 @@
+block: free merged request in the caller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] free merged request in the caller (Ming Lei) [1458104]
+Rebuild_FUZZ: 90.41%
+commit-author Jens Axboe <axboe@fb.com>
+commit e4d750c97794ea2bab793d4c518b1f4006364588
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e4d750c9.failed
+
+If we end up doing a request-to-request merge when we have completed
+a bio-to-request merge, we free the request from deep down in that
+path. For blk-mq-sched, the merge path has to hold the appropriate
+lock, but we don't need it for freeing the request. And in fact
+holding the lock is problematic, since we are now calling the
+mq sched put_rq_private() hook with the lock held. Other call paths
+do not hold this lock.
+
+Fix this inconsistency by ensuring that the caller frees a merged
+request. Then we can do it outside of the lock, making it both more
+efficient and fixing the blk-mq-sched problem of invoking parts of
+the scheduler with an unknown lock state.
+
+	Reported-by: Paolo Valente <paolo.valente@linaro.org>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+(cherry picked from commit e4d750c97794ea2bab793d4c518b1f4006364588)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-merge.c
+#	block/blk-mq-sched.c
+#	block/blk-mq-sched.h
+diff --cc block/blk-core.c
+index 9db4ccd0b9a5,1d263311353a..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -1668,13 -1592,13 +1668,18 @@@ void init_request_from_bio(struct reque
+  	blk_rq_bio_prep(req->q, req, bio);
+  }
+  
+ -static blk_qc_t blk_queue_bio(struct request_queue *q, struct bio *bio)
+ +void blk_queue_bio(struct request_queue *q, struct bio *bio)
+  {
+ +	const bool sync = !!(bio->bi_rw & REQ_SYNC);
+  	struct blk_plug *plug;
+++<<<<<<< HEAD
+ +	int el_ret, rw_flags, where = ELEVATOR_INSERT_SORT;
+ +	struct request *req;
+++=======
++ 	int el_ret, where = ELEVATOR_INSERT_SORT;
++ 	struct request *req, *free;
+++>>>>>>> e4d750c97794 (block: free merged request in the caller)
+  	unsigned int request_count = 0;
+ -	unsigned int wb_acct;
+  
+  	/*
+  	 * low level driver can indicate that it wants pages above a
+diff --cc block/blk-merge.c
+index 0e8b7f203168,a373416dbc9a..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -507,13 -733,15 +507,20 @@@ static int attempt_merge(struct request
+  	if (blk_rq_cpu_valid(next))
+  		req->cpu = next->cpu;
+  
+- 	/* owner-ship of bio passed from next to req */
++ 	/*
++ 	 * ownership of bio passed from next to req, return 'next' for
++ 	 * the caller to free
++ 	 */
+  	next->bio = NULL;
+++<<<<<<< HEAD
+ +	__blk_put_request(q, next);
+ +	return 1;
+++=======
++ 	return next;
+++>>>>>>> e4d750c97794 (block: free merged request in the caller)
+  }
+  
+ -struct request *attempt_back_merge(struct request_queue *q, struct request *rq)
+ +int attempt_back_merge(struct request_queue *q, struct request *rq)
+  {
+  	struct request *next = elv_latter_request(q, rq);
+  
+@@@ -536,7 -764,20 +543,24 @@@ int attempt_front_merge(struct request_
+  int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+  			  struct request *next)
+  {
+++<<<<<<< HEAD
+ +	return attempt_merge(q, rq, next);
+++=======
++ 	struct elevator_queue *e = q->elevator;
++ 	struct request *free;
++ 
++ 	if (!e->uses_mq && e->type->ops.sq.elevator_allow_rq_merge_fn)
++ 		if (!e->type->ops.sq.elevator_allow_rq_merge_fn(q, rq, next))
++ 			return 0;
++ 
++ 	free = attempt_merge(q, rq, next);
++ 	if (free) {
++ 		__blk_put_request(q, free);
++ 		return 1;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> e4d750c97794 (block: free merged request in the caller)
+  }
+  
+  bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-merge.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index a01986d7b6fb..a17e5130f74b 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -369,12 +369,16 @@ static bool dd_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+ {
+ 	struct request_queue *q = hctx->queue;
+ 	struct deadline_data *dd = q->elevator->elevator_data;
+-	int ret;
++	struct request *free = NULL;
++	bool ret;
+ 
+ 	spin_lock(&dd->lock);
+-	ret = blk_mq_sched_try_merge(q, bio);
++	ret = blk_mq_sched_try_merge(q, bio, &free);
+ 	spin_unlock(&dd->lock);
+ 
++	if (free)
++		blk_mq_free_request(free);
++
+ 	return ret;
+ }
+ 
