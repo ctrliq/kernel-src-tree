@@ -1,0 +1,274 @@
+blk-mq: issue directly if hw queue isn't busy in case of 'none'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 6ce3dd6eec114930cf2035a8bcb1e80477ed79a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6ce3dd6e.failed
+
+In case of 'none' io scheduler, when hw queue isn't busy, it isn't
+necessary to enqueue request to sw queue and dequeue it from
+sw queue because request may be submitted to hw queue asap without
+extra cost, meantime there shouldn't be much request in sw queue,
+and we don't need to worry about effect on IO merge.
+
+There are still some single hw queue SCSI HBAs(HPSA, megaraid_sas, ...)
+which may connect high performance devices, so 'none' is often required
+for obtaining good performance.
+
+This patch improves IOPS and decreases CPU unilization on megaraid_sas,
+per Kashyap's test.
+
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Laurence Oberman <loberman@redhat.com>
+	Cc: Omar Sandoval <osandov@fb.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Bart Van Assche <bart.vanassche@wdc.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Reported-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Tested-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 6ce3dd6eec114930cf2035a8bcb1e80477ed79a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq-sched.c
+index e1ac9f3d0935,cf9c66c6d35a..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -514,10 -403,21 +514,27 @@@ void blk_mq_sched_insert_requests(struc
+  	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
+  	struct elevator_queue *e = hctx->queue->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e && e->aux->ops.mq.insert_requests)
+ +		e->aux->ops.mq.insert_requests(hctx, list, false);
+ +	else
+++=======
++ 	if (e && e->type->ops.mq.insert_requests)
++ 		e->type->ops.mq.insert_requests(hctx, list, false);
++ 	else {
++ 		/*
++ 		 * try to issue requests directly if the hw queue isn't
++ 		 * busy in case of 'none' scheduler, and this way may save
++ 		 * us one extra enqueue & dequeue to sw queue.
++ 		 */
++ 		if (!hctx->dispatch_busy && !e && !run_queue_async) {
++ 			blk_mq_try_issue_list_directly(hctx, list);
++ 			if (list_empty(list))
++ 				return;
++ 		}
+++>>>>>>> 6ce3dd6eec11 (blk-mq: issue directly if hw queue isn't busy in case of 'none')
+  		blk_mq_insert_requests(hctx, ctx, list);
++ 	}
+  
+  	blk_mq_run_hw_queue(hctx, run_queue_async);
+  }
+diff --cc block/blk-mq.c
+index a8e551c0c631,21f3eda98431..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1534,14 -1676,56 +1534,53 @@@ static void __blk_mq_try_issue_directly
+  	struct request_queue *q = rq->q;
+  	struct blk_mq_queue_data bd = {
+  		.rq = rq,
+ +		.list = NULL,
+  		.last = true,
+  	};
+++<<<<<<< HEAD
+ +	int ret;
+++=======
++ 	blk_qc_t new_cookie;
++ 	blk_status_t ret;
++ 
++ 	new_cookie = request_to_qc_t(hctx, rq);
++ 
++ 	/*
++ 	 * For OK queue, we are done. For error, caller may kill it.
++ 	 * Any other error (busy), just add it to our list as we
++ 	 * previously would have done.
++ 	 */
++ 	ret = q->mq_ops->queue_rq(hctx, &bd);
++ 	switch (ret) {
++ 	case BLK_STS_OK:
++ 		blk_mq_update_dispatch_busy(hctx, false);
++ 		*cookie = new_cookie;
++ 		break;
++ 	case BLK_STS_RESOURCE:
++ 	case BLK_STS_DEV_RESOURCE:
++ 		blk_mq_update_dispatch_busy(hctx, true);
++ 		__blk_mq_requeue_request(rq);
++ 		break;
++ 	default:
++ 		blk_mq_update_dispatch_busy(hctx, false);
++ 		*cookie = BLK_QC_T_NONE;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
++ 						struct request *rq,
++ 						blk_qc_t *cookie,
++ 						bool bypass_insert)
++ {
++ 	struct request_queue *q = rq->q;
+++>>>>>>> 6ce3dd6eec11 (blk-mq: issue directly if hw queue isn't busy in case of 'none')
+  	bool run_queue = true;
+  
+ -	/*
+ -	 * RCU or SRCU read lock is needed before checking quiesced flag.
+ -	 *
+ -	 * When queue is stopped or quiesced, ignore 'bypass_insert' from
+ -	 * blk_mq_request_issue_directly(), and return BLK_STS_OK to caller,
+ -	 * and avoid driver to try to dispatch again.
+ -	 */
+ -	if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(q)) {
+ +	if (blk_mq_hctx_stopped(hctx)) {
+  		run_queue = false;
+ -		bypass_insert = false;
+  		goto insert;
+  	}
+  
+@@@ -1577,27 -1750,60 +1616,64 @@@ insert
+  }
+  
+  static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, blk_qc_t *cookie)
+ +				      struct request *rq)
+  {
+ -	blk_status_t ret;
+ -	int srcu_idx;
+ -
+ -	might_sleep_if(hctx->flags & BLK_MQ_F_BLOCKING);
+ -
+ -	hctx_lock(hctx, &srcu_idx);
+ +	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +		rcu_read_lock();
+ +		__blk_mq_try_issue_directly(hctx, rq, false);
+ +		rcu_read_unlock();
+ +	} else {
+ +		unsigned int srcu_idx;
+  
+ -	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
+ -	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
+ -		blk_mq_sched_insert_request(rq, false, true, false);
+ -	else if (ret != BLK_STS_OK)
+ -		blk_mq_end_request(rq, ret);
+ +		might_sleep();
+  
+ -	hctx_unlock(hctx, srcu_idx);
+ +		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
+ +		__blk_mq_try_issue_directly(hctx, rq, true);
+ +		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
+ +	}
+  }
+  
+ -blk_status_t blk_mq_request_issue_directly(struct request *rq)
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+++=======
++ 	blk_status_t ret;
++ 	int srcu_idx;
++ 	blk_qc_t unused_cookie;
++ 	struct blk_mq_ctx *ctx = rq->mq_ctx;
++ 	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(rq->q, ctx->cpu);
++ 
++ 	hctx_lock(hctx, &srcu_idx);
++ 	ret = __blk_mq_try_issue_directly(hctx, rq, &unused_cookie, true);
++ 	hctx_unlock(hctx, srcu_idx);
++ 
++ 	return ret;
++ }
++ 
++ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
++ 		struct list_head *list)
++ {
++ 	while (!list_empty(list)) {
++ 		blk_status_t ret;
++ 		struct request *rq = list_first_entry(list, struct request,
++ 				queuelist);
++ 
++ 		list_del_init(&rq->queuelist);
++ 		ret = blk_mq_request_issue_directly(rq);
++ 		if (ret != BLK_STS_OK) {
++ 			list_add(&rq->queuelist, list);
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
++ {
++ 	const int is_sync = op_is_sync(bio->bi_opf);
++ 	const int is_flush_fua = op_is_flush(bio->bi_opf);
+++>>>>>>> 6ce3dd6eec11 (blk-mq: issue directly if hw queue isn't busy in case of 'none')
+  	struct blk_mq_alloc_data data = { .flags = 0 };
+  	struct request *rq;
+  	unsigned int request_count = 0;
+@@@ -1683,16 -1897,14 +1759,17 @@@
+  		if (same_queue_rq) {
+  			data.hctx = blk_mq_map_queue(q,
+  					same_queue_rq->mq_ctx->cpu);
+ -			blk_mq_try_issue_directly(data.hctx, same_queue_rq,
+ -					&cookie);
+ +			blk_mq_try_issue_directly(data.hctx, same_queue_rq);
+  		}
+- 	} else if (q->nr_hw_queues > 1 && is_sync) {
++ 	} else if ((q->nr_hw_queues > 1 && is_sync) || (!q->elevator &&
++ 			!data.hctx->dispatch_busy)) {
+  		blk_mq_put_ctx(data.ctx);
+  		blk_mq_bio_to_request(rq, bio);
+ -		blk_mq_try_issue_directly(data.hctx, rq, &cookie);
+ +		blk_mq_try_issue_directly(data.hctx, rq);
+ +	} else if (q->elevator) {
+ +		blk_mq_put_ctx(data.ctx);
+ +		blk_mq_bio_to_request(rq, bio);
+ +		blk_mq_sched_insert_request(rq, false, true, true, true);
+  	} else {
+  		blk_mq_put_ctx(data.ctx);
+  		blk_mq_bio_to_request(rq, bio);
+diff --cc block/blk-mq.h
+index a1edc1df16f2,9497b47e2526..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -62,18 -61,11 +62,26 @@@ void __blk_mq_insert_request(struct blk
+  void blk_mq_request_bypass_insert(struct request *rq, bool run_queue);
+  void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+  				struct list_head *list);
+++<<<<<<< HEAD
+ +/*
+ + * CPU hotplug helpers
+ + */
+ +struct blk_mq_cpu_notifier;
+ +void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+ +			      int (*fn)(void *, unsigned long, unsigned int),
+ +			      void *data);
+ +void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_cpu_init(void);
+ +void blk_mq_enable_hotplug(void);
+ +void blk_mq_disable_hotplug(void);
+++=======
++ 
++ /* Used by blk_insert_cloned_request() to issue request directly */
++ blk_status_t blk_mq_request_issue_directly(struct request *rq);
++ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
++ 				    struct list_head *list);
+++>>>>>>> 6ce3dd6eec11 (blk-mq: issue directly if hw queue isn't busy in case of 'none')
+  
+  /*
+   * CPU -> queue mappings
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
