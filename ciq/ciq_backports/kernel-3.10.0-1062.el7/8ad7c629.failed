@@ -1,0 +1,1127 @@
+xfs: remove the ip argument to xfs_defer_finish
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8ad7c629b18695ec1ee8654fb27599864049862b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8ad7c629.failed
+
+And instead require callers to explicitly join the inode using
+xfs_defer_ijoin.  Also consolidate the defer error handling in
+a few places using a goto label.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 8ad7c629b18695ec1ee8654fb27599864049862b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_defer.c
+#	fs/xfs/libxfs/xfs_refcount.c
+#	fs/xfs/xfs_bmap_item.c
+#	fs/xfs/xfs_bmap_util.c
+#	fs/xfs/xfs_refcount_item.c
+#	fs/xfs/xfs_reflink.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index a821827ec13e,28ac796abe45..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5688,3 -6231,321 +5688,324 @@@ del_cursor
+  
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Splits an extent into two extents at split_fsb block such that it is
++  * the first block of the current_ext. @current_ext is a target extent
++  * to be split. @split_fsb is a block where the extents is split.
++  * If split_fsb lies in a hole or the first block of extents, just return 0.
++  */
++ STATIC int
++ xfs_bmap_split_extent_at(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		split_fsb,
++ 	xfs_fsblock_t		*firstfsb,
++ 	struct xfs_defer_ops	*dfops)
++ {
++ 	int				whichfork = XFS_DATA_FORK;
++ 	struct xfs_btree_cur		*cur = NULL;
++ 	struct xfs_bmbt_rec_host	*gotp;
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		new; /* split extent */
++ 	struct xfs_mount		*mp = ip->i_mount;
++ 	struct xfs_ifork		*ifp;
++ 	xfs_fsblock_t			gotblkcnt; /* new block count for got */
++ 	xfs_extnum_t			current_ext;
++ 	int				error = 0;
++ 	int				logflags = 0;
++ 	int				i = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT("xfs_bmap_split_extent_at",
++ 				 XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		/* Read in all the extents */
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * gotp can be null in 2 cases: 1) if there are no extents
++ 	 * or 2) split_fsb lies in a hole beyond which there are
++ 	 * no extents. Either way, we are done.
++ 	 */
++ 	gotp = xfs_iext_bno_to_ext(ifp, split_fsb, &current_ext);
++ 	if (!gotp)
++ 		return 0;
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 
++ 	/*
++ 	 * Check split_fsb lies in a hole or the start boundary offset
++ 	 * of the extent.
++ 	 */
++ 	if (got.br_startoff >= split_fsb)
++ 		return 0;
++ 
++ 	gotblkcnt = split_fsb - got.br_startoff;
++ 	new.br_startoff = split_fsb;
++ 	new.br_startblock = got.br_startblock + gotblkcnt;
++ 	new.br_blockcount = got.br_blockcount - gotblkcnt;
++ 	new.br_state = got.br_state;
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstfsb;
++ 		cur->bc_private.b.dfops = dfops;
++ 		cur->bc_private.b.flags = 0;
++ 		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	xfs_bmbt_set_blockcount(gotp, gotblkcnt);
++ 	got.br_blockcount = gotblkcnt;
++ 
++ 	logflags = XFS_ILOG_CORE;
++ 	if (cur) {
++ 		error = xfs_bmbt_update(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				got.br_state);
++ 		if (error)
++ 			goto del_cursor;
++ 	} else
++ 		logflags |= XFS_ILOG_DEXT;
++ 
++ 	/* Add new extent */
++ 	current_ext++;
++ 	xfs_iext_insert(ip, current_ext, 1, &new, 0);
++ 	XFS_IFORK_NEXT_SET(ip, whichfork,
++ 			   XFS_IFORK_NEXTENTS(ip, whichfork) + 1);
++ 
++ 	if (cur) {
++ 		error = xfs_bmbt_lookup_eq(cur, new.br_startoff,
++ 				new.br_startblock, new.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 0, del_cursor);
++ 		cur->bc_rec.b.br_state = new.br_state;
++ 
++ 		error = xfs_btree_insert(cur, &i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	/*
++ 	 * Convert to a btree if necessary.
++ 	 */
++ 	if (xfs_bmap_needs_btree(ip, whichfork)) {
++ 		int tmp_logflags; /* partial log flag return val */
++ 
++ 		ASSERT(cur == NULL);
++ 		error = xfs_bmap_extents_to_btree(tp, ip, firstfsb, dfops,
++ 				&cur, 0, &tmp_logflags, whichfork);
++ 		logflags |= tmp_logflags;
++ 	}
++ 
++ del_cursor:
++ 	if (cur) {
++ 		cur->bc_private.b.allocated = 0;
++ 		xfs_btree_del_cursor(cur,
++ 				error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	}
++ 
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
++ }
++ 
++ int
++ xfs_bmap_split_extent(
++ 	struct xfs_inode        *ip,
++ 	xfs_fileoff_t           split_fsb)
++ {
++ 	struct xfs_mount        *mp = ip->i_mount;
++ 	struct xfs_trans        *tp;
++ 	struct xfs_defer_ops    dfops;
++ 	xfs_fsblock_t           firstfsb;
++ 	int                     error;
++ 
++ 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write,
++ 			XFS_DIOSTRAT_SPACE_RES(mp, 0), 0, 0, &tp);
++ 	if (error)
++ 		return error;
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 	xfs_defer_init(&dfops, &firstfsb);
++ 
++ 	error = xfs_bmap_split_extent_at(tp, ip, split_fsb,
++ 			&firstfsb, &dfops);
++ 	if (error)
++ 		goto out;
++ 
++ 	error = xfs_defer_finish(&tp, &dfops);
++ 	if (error)
++ 		goto out;
++ 
++ 	return xfs_trans_commit(tp);
++ 
++ out:
++ 	xfs_defer_cancel(&dfops);
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ /* Deferred mapping is only for real extents in the data fork. */
++ static bool
++ xfs_bmap_is_update_needed(
++ 	struct xfs_bmbt_irec	*bmap)
++ {
++ 	return  bmap->br_startblock != HOLESTARTBLOCK &&
++ 		bmap->br_startblock != DELAYSTARTBLOCK;
++ }
++ 
++ /* Record a bmap intent. */
++ static int
++ __xfs_bmap_add(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_defer_ops		*dfops,
++ 	enum xfs_bmap_intent_type	type,
++ 	struct xfs_inode		*ip,
++ 	int				whichfork,
++ 	struct xfs_bmbt_irec		*bmap)
++ {
++ 	int				error;
++ 	struct xfs_bmap_intent		*bi;
++ 
++ 	trace_xfs_bmap_defer(mp,
++ 			XFS_FSB_TO_AGNO(mp, bmap->br_startblock),
++ 			type,
++ 			XFS_FSB_TO_AGBNO(mp, bmap->br_startblock),
++ 			ip->i_ino, whichfork,
++ 			bmap->br_startoff,
++ 			bmap->br_blockcount,
++ 			bmap->br_state);
++ 
++ 	bi = kmem_alloc(sizeof(struct xfs_bmap_intent), KM_SLEEP | KM_NOFS);
++ 	INIT_LIST_HEAD(&bi->bi_list);
++ 	bi->bi_type = type;
++ 	bi->bi_owner = ip;
++ 	bi->bi_whichfork = whichfork;
++ 	bi->bi_bmap = *bmap;
++ 
++ 	error = xfs_defer_ijoin(dfops, bi->bi_owner);
++ 	if (error) {
++ 		kmem_free(bi);
++ 		return error;
++ 	}
++ 
++ 	xfs_defer_add(dfops, XFS_DEFER_OPS_TYPE_BMAP, &bi->bi_list);
++ 	return 0;
++ }
++ 
++ /* Map an extent into a file. */
++ int
++ xfs_bmap_map_extent(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_defer_ops	*dfops,
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*PREV)
++ {
++ 	if (!xfs_bmap_is_update_needed(PREV))
++ 		return 0;
++ 
++ 	return __xfs_bmap_add(mp, dfops, XFS_BMAP_MAP, ip,
++ 			XFS_DATA_FORK, PREV);
++ }
++ 
++ /* Unmap an extent out of a file. */
++ int
++ xfs_bmap_unmap_extent(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_defer_ops	*dfops,
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*PREV)
++ {
++ 	if (!xfs_bmap_is_update_needed(PREV))
++ 		return 0;
++ 
++ 	return __xfs_bmap_add(mp, dfops, XFS_BMAP_UNMAP, ip,
++ 			XFS_DATA_FORK, PREV);
++ }
++ 
++ /*
++  * Process one of the deferred bmap operations.  We pass back the
++  * btree cursor to maintain our lock on the bmapbt between calls.
++  */
++ int
++ xfs_bmap_finish_one(
++ 	struct xfs_trans		*tp,
++ 	struct xfs_defer_ops		*dfops,
++ 	struct xfs_inode		*ip,
++ 	enum xfs_bmap_intent_type	type,
++ 	int				whichfork,
++ 	xfs_fileoff_t			startoff,
++ 	xfs_fsblock_t			startblock,
++ 	xfs_filblks_t			*blockcount,
++ 	xfs_exntst_t			state)
++ {
++ 	xfs_fsblock_t			firstfsb;
++ 	int				error = 0;
++ 
++ 	/*
++ 	 * firstfsb is tied to the transaction lifetime and is used to
++ 	 * ensure correct AG locking order and schedule work item
++ 	 * continuations.  XFS_BUI_MAX_FAST_EXTENTS (== 1) restricts us
++ 	 * to only making one bmap call per transaction, so it should
++ 	 * be safe to have it as a local variable here.
++ 	 */
++ 	firstfsb = NULLFSBLOCK;
++ 
++ 	trace_xfs_bmap_deferred(tp->t_mountp,
++ 			XFS_FSB_TO_AGNO(tp->t_mountp, startblock), type,
++ 			XFS_FSB_TO_AGBNO(tp->t_mountp, startblock),
++ 			ip->i_ino, whichfork, startoff, *blockcount, state);
++ 
++ 	if (WARN_ON_ONCE(whichfork != XFS_DATA_FORK))
++ 		return -EFSCORRUPTED;
++ 
++ 	if (XFS_TEST_ERROR(false, tp->t_mountp,
++ 			XFS_ERRTAG_BMAP_FINISH_ONE))
++ 		return -EIO;
++ 
++ 	switch (type) {
++ 	case XFS_BMAP_MAP:
++ 		error = xfs_bmapi_remap(tp, ip, startoff, *blockcount,
++ 				startblock, dfops);
++ 		*blockcount = 0;
++ 		break;
++ 	case XFS_BMAP_UNMAP:
++ 		error = __xfs_bunmapi(tp, ip, startoff, blockcount,
++ 				XFS_BMAPI_REMAP, 1, &firstfsb, dfops);
++ 		break;
++ 	default:
++ 		ASSERT(0);
++ 		error = -EFSCORRUPTED;
++ 	}
++ 
++ 	return error;
++ }
+++>>>>>>> 8ad7c629b186 (xfs: remove the ip argument to xfs_defer_finish)
+diff --cc fs/xfs/libxfs/xfs_defer.c
+index 4ea2f068d95c,072ebfe1d6ae..000000000000
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@@ -277,11 -277,10 +277,10 @@@ xfs_defer_has_unfinished_work
+  
+  /*
+   * Add this inode to the deferred op.  Each joined inode is relogged
+-  * each time we roll the transaction, in addition to any inode passed
+-  * to xfs_defer_finish().
++  * each time we roll the transaction.
+   */
+  int
+ -xfs_defer_ijoin(
+ +xfs_defer_join(
+  	struct xfs_defer_ops		*dop,
+  	struct xfs_inode		*ip)
+  {
+@@@ -324,8 -322,6 +322,11 @@@ xfs_defer_finish
+  
+  	trace_xfs_defer_finish((*tp)->t_mountp, dop);
+  
+++<<<<<<< HEAD
+ +	xfs_defer_join(dop, ip);
+ +
+++=======
+++>>>>>>> 8ad7c629b186 (xfs: remove the ip argument to xfs_defer_finish)
+  	/* Until we run out of pending work to finish... */
+  	while (xfs_defer_has_unfinished_work(dop)) {
+  		/* Log intents for work items sitting in the intake. */
+diff --cc fs/xfs/xfs_bmap_util.c
+index b512c688c5f3,f7f04aebcade..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1249,6 -1389,131 +1250,134 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * @next_fsb will keep track of the extent currently undergoing shift.
++  * @stop_fsb will keep track of the extent at which we have to stop.
++  * If we are shifting left, we will start with block (offset + len) and
++  * shift each extent till last extent.
++  * If we are shifting right, we will start with last extent inside file space
++  * and continue until we reach the block corresponding to offset.
++  */
++ static int
++ xfs_shift_file_space(
++ 	struct xfs_inode        *ip,
++ 	xfs_off_t               offset,
++ 	xfs_off_t               len,
++ 	enum shift_direction	direction)
++ {
++ 	int			done = 0;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	struct xfs_defer_ops	dfops;
++ 	xfs_fsblock_t		first_block;
++ 	xfs_fileoff_t		stop_fsb;
++ 	xfs_fileoff_t		next_fsb;
++ 	xfs_fileoff_t		shift_fsb;
++ 	uint			resblks;
++ 
++ 	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
++ 
++ 	if (direction == SHIFT_LEFT) {
++ 		/*
++ 		 * Reserve blocks to cover potential extent merges after left
++ 		 * shift operations.
++ 		 */
++ 		resblks = XFS_DIOSTRAT_SPACE_RES(mp, 0);
++ 		next_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 		stop_fsb = XFS_B_TO_FSB(mp, VFS_I(ip)->i_size);
++ 	} else {
++ 		/*
++ 		 * If right shift, delegate the work of initialization of
++ 		 * next_fsb to xfs_bmap_shift_extent as it has ilock held.
++ 		 */
++ 		resblks = 0;
++ 		next_fsb = NULLFSBLOCK;
++ 		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	}
++ 
++ 	shift_fsb = XFS_B_TO_FSB(mp, len);
++ 
++ 	/*
++ 	 * Trim eofblocks to avoid shifting uninitialized post-eof preallocation
++ 	 * into the accessible region of the file.
++ 	 */
++ 	if (xfs_can_free_eofblocks(ip, true)) {
++ 		error = xfs_free_eofblocks(ip);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * Writeback and invalidate cache for the remainder of the file as we're
++ 	 * about to shift down every extent from offset to EOF.
++ 	 */
++ 	error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++ 					     offset, -1);
++ 	if (error)
++ 		return error;
++ 	error = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
++ 					offset >> PAGE_SHIFT, -1);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * The extent shiting code works on extent granularity. So, if
++ 	 * stop_fsb is not the starting block of extent, we need to split
++ 	 * the extent at stop_fsb.
++ 	 */
++ 	if (direction == SHIFT_RIGHT) {
++ 		error = xfs_bmap_split_extent(ip, stop_fsb);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	while (!error && !done) {
++ 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, 0,
++ 					&tp);
++ 		if (error)
++ 			break;
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		error = xfs_trans_reserve_quota(tp, mp, ip->i_udquot,
++ 				ip->i_gdquot, ip->i_pdquot, resblks, 0,
++ 				XFS_QMOPT_RES_REGBLKS);
++ 		if (error)
++ 			goto out_trans_cancel;
++ 
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 		xfs_defer_init(&dfops, &first_block);
++ 
++ 		/*
++ 		 * We are using the write transaction in which max 2 bmbt
++ 		 * updates are allowed
++ 		 */
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &dfops,
++ 				direction, XFS_BMAP_MAX_SHIFT_EXTENTS);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_defer_finish(&tp, &dfops);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_trans_commit(tp);
++ 	}
++ 
++ 	return error;
++ 
++ out_bmap_cancel:
++ 	xfs_defer_cancel(&dfops);
++ out_trans_cancel:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 8ad7c629b186 (xfs: remove the ip argument to xfs_defer_finish)
+   * xfs_collapse_file_space()
+   *	This routine frees disk space and shift extent for the given file.
+   *	The first thing we do is to free data blocks in the specified range
+@@@ -1473,6 -1681,131 +1602,134 @@@ xfs_swap_extent_flush
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Move extents from one file to another, when rmap is enabled.
++  */
++ STATIC int
++ xfs_swap_extent_rmap(
++ 	struct xfs_trans		**tpp,
++ 	struct xfs_inode		*ip,
++ 	struct xfs_inode		*tip)
++ {
++ 	struct xfs_bmbt_irec		irec;
++ 	struct xfs_bmbt_irec		uirec;
++ 	struct xfs_bmbt_irec		tirec;
++ 	xfs_fileoff_t			offset_fsb;
++ 	xfs_fileoff_t			end_fsb;
++ 	xfs_filblks_t			count_fsb;
++ 	xfs_fsblock_t			firstfsb;
++ 	struct xfs_defer_ops		dfops;
++ 	int				error;
++ 	xfs_filblks_t			ilen;
++ 	xfs_filblks_t			rlen;
++ 	int				nimaps;
++ 	uint64_t			tip_flags2;
++ 
++ 	/*
++ 	 * If the source file has shared blocks, we must flag the donor
++ 	 * file as having shared blocks so that we get the shared-block
++ 	 * rmap functions when we go to fix up the rmaps.  The flags
++ 	 * will be switch for reals later.
++ 	 */
++ 	tip_flags2 = tip->i_d.di_flags2;
++ 	if (ip->i_d.di_flags2 & XFS_DIFLAG2_REFLINK)
++ 		tip->i_d.di_flags2 |= XFS_DIFLAG2_REFLINK;
++ 
++ 	offset_fsb = 0;
++ 	end_fsb = XFS_B_TO_FSB(ip->i_mount, i_size_read(VFS_I(ip)));
++ 	count_fsb = (xfs_filblks_t)(end_fsb - offset_fsb);
++ 
++ 	while (count_fsb) {
++ 		/* Read extent from the donor file */
++ 		nimaps = 1;
++ 		error = xfs_bmapi_read(tip, offset_fsb, count_fsb, &tirec,
++ 				&nimaps, 0);
++ 		if (error)
++ 			goto out;
++ 		ASSERT(nimaps == 1);
++ 		ASSERT(tirec.br_startblock != DELAYSTARTBLOCK);
++ 
++ 		trace_xfs_swap_extent_rmap_remap(tip, &tirec);
++ 		ilen = tirec.br_blockcount;
++ 
++ 		/* Unmap the old blocks in the source file. */
++ 		while (tirec.br_blockcount) {
++ 			xfs_defer_init(&dfops, &firstfsb);
++ 			trace_xfs_swap_extent_rmap_remap_piece(tip, &tirec);
++ 
++ 			/* Read extent from the source file */
++ 			nimaps = 1;
++ 			error = xfs_bmapi_read(ip, tirec.br_startoff,
++ 					tirec.br_blockcount, &irec,
++ 					&nimaps, 0);
++ 			if (error)
++ 				goto out_defer;
++ 			ASSERT(nimaps == 1);
++ 			ASSERT(tirec.br_startoff == irec.br_startoff);
++ 			trace_xfs_swap_extent_rmap_remap_piece(ip, &irec);
++ 
++ 			/* Trim the extent. */
++ 			uirec = tirec;
++ 			uirec.br_blockcount = rlen = min_t(xfs_filblks_t,
++ 					tirec.br_blockcount,
++ 					irec.br_blockcount);
++ 			trace_xfs_swap_extent_rmap_remap_piece(tip, &uirec);
++ 
++ 			/* Remove the mapping from the donor file. */
++ 			error = xfs_bmap_unmap_extent((*tpp)->t_mountp, &dfops,
++ 					tip, &uirec);
++ 			if (error)
++ 				goto out_defer;
++ 
++ 			/* Remove the mapping from the source file. */
++ 			error = xfs_bmap_unmap_extent((*tpp)->t_mountp, &dfops,
++ 					ip, &irec);
++ 			if (error)
++ 				goto out_defer;
++ 
++ 			/* Map the donor file's blocks into the source file. */
++ 			error = xfs_bmap_map_extent((*tpp)->t_mountp, &dfops,
++ 					ip, &uirec);
++ 			if (error)
++ 				goto out_defer;
++ 
++ 			/* Map the source file's blocks into the donor file. */
++ 			error = xfs_bmap_map_extent((*tpp)->t_mountp, &dfops,
++ 					tip, &irec);
++ 			if (error)
++ 				goto out_defer;
++ 
++ 			xfs_defer_ijoin(&dfops, ip);
++ 			error = xfs_defer_finish(tpp, &dfops);
++ 			if (error)
++ 				goto out_defer;
++ 
++ 			tirec.br_startoff += rlen;
++ 			if (tirec.br_startblock != HOLESTARTBLOCK &&
++ 			    tirec.br_startblock != DELAYSTARTBLOCK)
++ 				tirec.br_startblock += rlen;
++ 			tirec.br_blockcount -= rlen;
++ 		}
++ 
++ 		/* Roll on... */
++ 		count_fsb -= ilen;
++ 		offset_fsb += ilen;
++ 	}
++ 
++ 	tip->i_d.di_flags2 = tip_flags2;
++ 	return 0;
++ 
++ out_defer:
++ 	xfs_defer_cancel(&dfops);
++ out:
++ 	trace_xfs_swap_extent_rmap_error(ip, error, _RET_IP_);
++ 	tip->i_d.di_flags2 = tip_flags2;
++ 	return error;
++ }
++ 
+++>>>>>>> 8ad7c629b186 (xfs: remove the ip argument to xfs_defer_finish)
+  /* Swap the extents of two files by swapping data forks. */
+  STATIC int
+  xfs_swap_extent_forks(
+* Unmerged path fs/xfs/libxfs/xfs_refcount.c
+* Unmerged path fs/xfs/xfs_bmap_item.c
+* Unmerged path fs/xfs/xfs_refcount_item.c
+* Unmerged path fs/xfs/xfs_reflink.c
+diff --git a/fs/xfs/libxfs/xfs_attr.c b/fs/xfs/libxfs/xfs_attr.c
+index 3e8597157ebe..ea66f04f46f7 100644
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -328,13 +328,12 @@ xfs_attr_set(
+ 		 */
+ 		xfs_defer_init(args.dfops, args.firstblock);
+ 		error = xfs_attr_shortform_to_leaf(&args);
+-		if (!error)
+-			error = xfs_defer_finish(&args.trans, args.dfops, dp);
+-		if (error) {
+-			args.trans = NULL;
+-			xfs_defer_cancel(&dfops);
+-			goto out;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args.dfops, dp);
++		error = xfs_defer_finish(&args.trans, args.dfops);
++		if (error)
++			goto out_defer_cancel;
+ 
+ 		/*
+ 		 * Commit the leaf transformation.  We'll need another (linked)
+@@ -373,6 +372,9 @@ xfs_attr_set(
+ 
+ 	return error;
+ 
++out_defer_cancel:
++	xfs_defer_cancel(&dfops);
++	args.trans = NULL;
+ out:
+ 	if (args.trans)
+ 		xfs_trans_cancel(args.trans);
+@@ -600,13 +602,12 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
+ 		 */
+ 		xfs_defer_init(args->dfops, args->firstblock);
+ 		error = xfs_attr3_leaf_to_node(args);
+-		if (!error)
+-			error = xfs_defer_finish(&args->trans, args->dfops, dp);
+-		if (error) {
+-			args->trans = NULL;
+-			xfs_defer_cancel(args->dfops);
+-			return error;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args->dfops, dp);
++		error = xfs_defer_finish(&args->trans, args->dfops);
++		if (error)
++			goto out_defer_cancel;
+ 
+ 		/*
+ 		 * Commit the current trans (including the inode) and start
+@@ -691,14 +692,12 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
+ 			xfs_defer_init(args->dfops, args->firstblock);
+ 			error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
+ 			/* bp is gone due to xfs_da_shrink_inode */
+-			if (!error)
+-				error = xfs_defer_finish(&args->trans,
+-							args->dfops, dp);
+-			if (error) {
+-				args->trans = NULL;
+-				xfs_defer_cancel(args->dfops);
+-				return error;
+-			}
++			if (error)
++				goto out_defer_cancel;
++			xfs_defer_ijoin(args->dfops, dp);
++			error = xfs_defer_finish(&args->trans, args->dfops);
++			if (error)
++				goto out_defer_cancel;
+ 		}
+ 
+ 		/*
+@@ -713,6 +712,10 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
+ 		error = xfs_attr3_leaf_clearflag(args);
+ 	}
+ 	return error;
++out_defer_cancel:
++	xfs_defer_cancel(args->dfops);
++	args->trans = NULL;
++	return error;
+ }
+ 
+ /*
+@@ -754,15 +757,18 @@ xfs_attr_leaf_removename(xfs_da_args_t *args)
+ 		xfs_defer_init(args->dfops, args->firstblock);
+ 		error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
+ 		/* bp is gone due to xfs_da_shrink_inode */
+-		if (!error)
+-			error = xfs_defer_finish(&args->trans, args->dfops, dp);
+-		if (error) {
+-			args->trans = NULL;
+-			xfs_defer_cancel(args->dfops);
+-			return error;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args->dfops, dp);
++		error = xfs_defer_finish(&args->trans, args->dfops);
++		if (error)
++			goto out_defer_cancel;
+ 	}
+ 	return 0;
++out_defer_cancel:
++	xfs_defer_cancel(args->dfops);
++	args->trans = NULL;
++	return error;
+ }
+ 
+ /*
+@@ -879,14 +885,12 @@ restart:
+ 			state = NULL;
+ 			xfs_defer_init(args->dfops, args->firstblock);
+ 			error = xfs_attr3_leaf_to_node(args);
+-			if (!error)
+-				error = xfs_defer_finish(&args->trans,
+-							args->dfops, dp);
+-			if (error) {
+-				args->trans = NULL;
+-				xfs_defer_cancel(args->dfops);
+-				goto out;
+-			}
++			if (error)
++				goto out_defer_cancel;
++			xfs_defer_ijoin(args->dfops, dp);
++			error = xfs_defer_finish(&args->trans, args->dfops);
++			if (error)
++				goto out_defer_cancel;
+ 
+ 			/*
+ 			 * Commit the node conversion and start the next
+@@ -907,13 +911,12 @@ restart:
+ 		 */
+ 		xfs_defer_init(args->dfops, args->firstblock);
+ 		error = xfs_da3_split(state);
+-		if (!error)
+-			error = xfs_defer_finish(&args->trans, args->dfops, dp);
+-		if (error) {
+-			args->trans = NULL;
+-			xfs_defer_cancel(args->dfops);
+-			goto out;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args->dfops, dp);
++		error = xfs_defer_finish(&args->trans, args->dfops);
++		if (error)
++			goto out_defer_cancel;
+ 	} else {
+ 		/*
+ 		 * Addition succeeded, update Btree hashvals.
+@@ -1006,14 +1009,12 @@ restart:
+ 		if (retval && (state->path.active > 1)) {
+ 			xfs_defer_init(args->dfops, args->firstblock);
+ 			error = xfs_da3_join(state);
+-			if (!error)
+-				error = xfs_defer_finish(&args->trans,
+-							args->dfops, dp);
+-			if (error) {
+-				args->trans = NULL;
+-				xfs_defer_cancel(args->dfops);
+-				goto out;
+-			}
++			if (error)
++				goto out_defer_cancel;
++			xfs_defer_ijoin(args->dfops, dp);
++			error = xfs_defer_finish(&args->trans, args->dfops);
++			if (error)
++				goto out_defer_cancel;
+ 		}
+ 
+ 		/*
+@@ -1039,6 +1040,10 @@ out:
+ 	if (error)
+ 		return error;
+ 	return retval;
++out_defer_cancel:
++	xfs_defer_cancel(args->dfops);
++	args->trans = NULL;
++	goto out;
+ }
+ 
+ /*
+@@ -1129,13 +1134,12 @@ xfs_attr_node_removename(xfs_da_args_t *args)
+ 	if (retval && (state->path.active > 1)) {
+ 		xfs_defer_init(args->dfops, args->firstblock);
+ 		error = xfs_da3_join(state);
+-		if (!error)
+-			error = xfs_defer_finish(&args->trans, args->dfops, dp);
+-		if (error) {
+-			args->trans = NULL;
+-			xfs_defer_cancel(args->dfops);
+-			goto out;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args->dfops, dp);
++		error = xfs_defer_finish(&args->trans, args->dfops);
++		if (error)
++			goto out_defer_cancel;
+ 		/*
+ 		 * Commit the Btree join operation and start a new trans.
+ 		 */
+@@ -1163,14 +1167,12 @@ xfs_attr_node_removename(xfs_da_args_t *args)
+ 			xfs_defer_init(args->dfops, args->firstblock);
+ 			error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
+ 			/* bp is gone due to xfs_da_shrink_inode */
+-			if (!error)
+-				error = xfs_defer_finish(&args->trans,
+-							args->dfops, dp);
+-			if (error) {
+-				args->trans = NULL;
+-				xfs_defer_cancel(args->dfops);
+-				goto out;
+-			}
++			if (error)
++				goto out_defer_cancel;
++			xfs_defer_ijoin(args->dfops, dp);
++			error = xfs_defer_finish(&args->trans, args->dfops);
++			if (error)
++				goto out_defer_cancel;
+ 		} else
+ 			xfs_trans_brelse(args->trans, bp);
+ 	}
+@@ -1179,6 +1181,10 @@ xfs_attr_node_removename(xfs_da_args_t *args)
+ out:
+ 	xfs_da_state_free(state);
+ 	return error;
++out_defer_cancel:
++	xfs_defer_cancel(args->dfops);
++	args->trans = NULL;
++	goto out;
+ }
+ 
+ /*
+diff --git a/fs/xfs/libxfs/xfs_attr_remote.c b/fs/xfs/libxfs/xfs_attr_remote.c
+index 433c36714e40..d56caf037ca0 100644
+--- a/fs/xfs/libxfs/xfs_attr_remote.c
++++ b/fs/xfs/libxfs/xfs_attr_remote.c
+@@ -467,13 +467,12 @@ xfs_attr_rmtval_set(
+ 		error = xfs_bmapi_write(args->trans, dp, (xfs_fileoff_t)lblkno,
+ 				  blkcnt, XFS_BMAPI_ATTRFORK, args->firstblock,
+ 				  args->total, &map, &nmap, args->dfops);
+-		if (!error)
+-			error = xfs_defer_finish(&args->trans, args->dfops, dp);
+-		if (error) {
+-			args->trans = NULL;
+-			xfs_defer_cancel(args->dfops);
+-			return error;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args->dfops, dp);
++		error = xfs_defer_finish(&args->trans, args->dfops);
++		if (error)
++			goto out_defer_cancel;
+ 
+ 		ASSERT(nmap == 1);
+ 		ASSERT((map.br_startblock != DELAYSTARTBLOCK) &&
+@@ -539,6 +538,10 @@ xfs_attr_rmtval_set(
+ 	}
+ 	ASSERT(valuelen == 0);
+ 	return 0;
++out_defer_cancel:
++	xfs_defer_cancel(args->dfops);
++	args->trans = NULL;
++	return error;
+ }
+ 
+ /*
+@@ -609,14 +612,12 @@ xfs_attr_rmtval_remove(
+ 		error = xfs_bunmapi(args->trans, args->dp, lblkno, blkcnt,
+ 				    XFS_BMAPI_ATTRFORK, 1, args->firstblock,
+ 				    args->dfops, &done);
+-		if (!error)
+-			error = xfs_defer_finish(&args->trans, args->dfops,
+-						args->dp);
+-		if (error) {
+-			args->trans = NULL;
+-			xfs_defer_cancel(args->dfops);
+-			return error;
+-		}
++		if (error)
++			goto out_defer_cancel;
++		xfs_defer_ijoin(args->dfops, args->dp);
++		error = xfs_defer_finish(&args->trans, args->dfops);
++		if (error)
++			goto out_defer_cancel;
+ 
+ 		/*
+ 		 * Close out trans and start the next one in the chain.
+@@ -626,4 +627,8 @@ xfs_attr_rmtval_remove(
+ 			return error;
+ 	}
+ 	return 0;
++out_defer_cancel:
++	xfs_defer_cancel(args->dfops);
++	args->trans = NULL;
++	return error;
+ }
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_defer.c
+diff --git a/fs/xfs/libxfs/xfs_defer.h b/fs/xfs/libxfs/xfs_defer.h
+index 9319f67487ea..986e158ea031 100644
+--- a/fs/xfs/libxfs/xfs_defer.h
++++ b/fs/xfs/libxfs/xfs_defer.h
+@@ -69,8 +69,7 @@ struct xfs_defer_ops {
+ 
+ void xfs_defer_add(struct xfs_defer_ops *dop, enum xfs_defer_ops_type type,
+ 		struct list_head *h);
+-int xfs_defer_finish(struct xfs_trans **tp, struct xfs_defer_ops *dop,
+-		struct xfs_inode *ip);
++int xfs_defer_finish(struct xfs_trans **tp, struct xfs_defer_ops *dop);
+ void xfs_defer_cancel(struct xfs_defer_ops *dop);
+ void xfs_defer_init(struct xfs_defer_ops *dop, xfs_fsblock_t *fbp);
+ bool xfs_defer_has_unfinished_work(struct xfs_defer_ops *dop);
+* Unmerged path fs/xfs/libxfs/xfs_refcount.c
+* Unmerged path fs/xfs/xfs_bmap_item.c
+* Unmerged path fs/xfs/xfs_bmap_util.c
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index e751deb3fa78..1cdb577e8aa7 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -383,7 +383,7 @@ xfs_qm_dqalloc(
+ 
+ 	xfs_trans_bhold(tp, bp);
+ 
+-	error = xfs_defer_finish(tpp, &dfops, NULL);
++	error = xfs_defer_finish(tpp, &dfops);
+ 	if (error)
+ 		goto error1;
+ 
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 9c6a8d2625e6..127ca61efad3 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1246,7 +1246,7 @@ xfs_create(
+ 	 */
+ 	xfs_qm_vop_create_dqattach(tp, ip, udqp, gdqp, pdqp);
+ 
+-	error = xfs_defer_finish(&tp, &dfops, NULL);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+@@ -1475,7 +1475,7 @@ xfs_link(
+ 	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+ 		xfs_trans_set_sync(tp);
+ 
+-	error = xfs_defer_finish(&tp, &dfops, NULL);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error) {
+ 		xfs_defer_cancel(&dfops);
+ 		goto error_return;
+@@ -1569,7 +1569,8 @@ xfs_itruncate_extents(
+ 		 * Duplicate the transaction that has the permanent
+ 		 * reservation and commit the old transaction.
+ 		 */
+-		error = xfs_defer_finish(&tp, &dfops, ip);
++		xfs_defer_ijoin(&dfops, ip);
++		error = xfs_defer_finish(&tp, &dfops);
+ 		if (error)
+ 			goto out_bmap_cancel;
+ 
+@@ -1802,7 +1803,7 @@ xfs_inactive_ifree(
+ 	 * Just ignore errors at this point.  There is nothing we can do except
+ 	 * to try to keep going. Make sure it's not a silent error.
+ 	 */
+-	error = xfs_defer_finish(&tp, &dfops, NULL);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error) {
+ 		xfs_notice(mp, "%s: xfs_defer_finish returned error %d",
+ 			__func__, error);
+@@ -2597,7 +2598,7 @@ xfs_remove(
+ 	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+ 		xfs_trans_set_sync(tp);
+ 
+-	error = xfs_defer_finish(&tp, &dfops, NULL);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+@@ -2683,7 +2684,7 @@ xfs_finish_rename(
+ 	if (tp->t_mountp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
+ 		xfs_trans_set_sync(tp);
+ 
+-	error = xfs_defer_finish(&tp, dfops, NULL);
++	error = xfs_defer_finish(&tp, dfops);
+ 	if (error) {
+ 		xfs_defer_cancel(dfops);
+ 		xfs_trans_cancel(tp);
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index ed8041673da9..031c2947f17c 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -275,7 +275,7 @@ xfs_iomap_write_direct(
+ 	/*
+ 	 * Complete the transaction
+ 	 */
+-	error = xfs_defer_finish(&tp, &dfops, NULL);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+@@ -790,7 +790,7 @@ xfs_iomap_write_allocate(
+ 			if (error)
+ 				goto trans_cancel;
+ 
+-			error = xfs_defer_finish(&tp, &dfops, NULL);
++			error = xfs_defer_finish(&tp, &dfops);
+ 			if (error)
+ 				goto trans_cancel;
+ 
+@@ -912,7 +912,7 @@ xfs_iomap_write_unwritten(
+ 			xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ 		}
+ 
+-		error = xfs_defer_finish(&tp, &dfops, NULL);
++		error = xfs_defer_finish(&tp, &dfops);
+ 		if (error)
+ 			goto error_on_bmapi_transaction;
+ 
+* Unmerged path fs/xfs/xfs_refcount_item.c
+* Unmerged path fs/xfs/xfs_reflink.c
+diff --git a/fs/xfs/xfs_rtalloc.c b/fs/xfs/xfs_rtalloc.c
+index 91472193643b..488719d43ca8 100644
+--- a/fs/xfs/xfs_rtalloc.c
++++ b/fs/xfs/xfs_rtalloc.c
+@@ -810,7 +810,7 @@ xfs_growfs_rt_alloc(
+ 		/*
+ 		 * Free any blocks freed up in the transaction, then commit.
+ 		 */
+-		error = xfs_defer_finish(&tp, &dfops, NULL);
++		error = xfs_defer_finish(&tp, &dfops);
+ 		if (error)
+ 			goto out_bmap_cancel;
+ 		error = xfs_trans_commit(tp);
+diff --git a/fs/xfs/xfs_symlink.c b/fs/xfs/xfs_symlink.c
+index 6610cde35f9c..0fc9f1b5d464 100644
+--- a/fs/xfs/xfs_symlink.c
++++ b/fs/xfs/xfs_symlink.c
+@@ -382,7 +382,7 @@ xfs_symlink(
+ 		xfs_trans_set_sync(tp);
+ 	}
+ 
+-	error = xfs_defer_finish(&tp, &dfops, NULL);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error)
+ 		goto out_bmap_cancel;
+ 
+@@ -501,7 +501,8 @@ xfs_inactive_symlink_rmt(
+ 	/*
+ 	 * Commit the first transaction.  This logs the EFI and the inode.
+ 	 */
+-	error = xfs_defer_finish(&tp, &dfops, ip);
++	xfs_defer_ijoin(&dfops, ip);
++	error = xfs_defer_finish(&tp, &dfops);
+ 	if (error)
+ 		goto error_bmap_cancel;
+ 	/*
