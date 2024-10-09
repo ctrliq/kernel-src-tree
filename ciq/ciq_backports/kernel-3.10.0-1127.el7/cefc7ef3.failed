@@ -1,0 +1,168 @@
+mm, oom: fix use-after-free in oom_kill_process
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Shakeel Butt <shakeelb@google.com>
+commit cefc7ef3c87d02fc9307835868ff721ea12cc597
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/cefc7ef3.failed
+
+Syzbot instance running on upstream kernel found a use-after-free bug in
+oom_kill_process.  On further inspection it seems like the process
+selected to be oom-killed has exited even before reaching
+read_lock(&tasklist_lock) in oom_kill_process().  More specifically the
+tsk->usage is 1 which is due to get_task_struct() in oom_evaluate_task()
+and the put_task_struct within for_each_thread() frees the tsk and
+for_each_thread() tries to access the tsk.  The easiest fix is to do
+get/put across the for_each_thread() on the selected task.
+
+Now the next question is should we continue with the oom-kill as the
+previously selected task has exited? However before adding more
+complexity and heuristics, let's answer why we even look at the children
+of oom-kill selected task? The select_bad_process() has already selected
+the worst process in the system/memcg.  Due to race, the selected
+process might not be the worst at the kill time but does that matter?
+The userspace can use the oom_score_adj interface to prefer children to
+be killed before the parent.  I looked at the history but it seems like
+this is there before git history.
+
+Link: http://lkml.kernel.org/r/20190121215850.221745-1-shakeelb@google.com
+	Reported-by: syzbot+7fbbfa368521945f0e3d@syzkaller.appspotmail.com
+Fixes: 6b0c81b3be11 ("mm, oom: reduce dependency on tasklist_lock")
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Reviewed-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cefc7ef3c87d02fc9307835868ff721ea12cc597)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/oom_kill.c
+diff --cc mm/oom_kill.c
+index 9079d092d30f,26ea8636758f..000000000000
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@@ -534,10 -923,111 +534,114 @@@ void oom_kill_process(struct task_struc
+  #undef K
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Kill provided task unless it's secured by setting
++  * oom_score_adj to OOM_SCORE_ADJ_MIN.
++  */
++ static int oom_kill_memcg_member(struct task_struct *task, void *unused)
++ {
++ 	if (task->signal->oom_score_adj != OOM_SCORE_ADJ_MIN) {
++ 		get_task_struct(task);
++ 		__oom_kill_process(task);
++ 	}
++ 	return 0;
++ }
++ 
++ static void oom_kill_process(struct oom_control *oc, const char *message)
++ {
++ 	struct task_struct *p = oc->chosen;
++ 	unsigned int points = oc->chosen_points;
++ 	struct task_struct *victim = p;
++ 	struct task_struct *child;
++ 	struct task_struct *t;
++ 	struct mem_cgroup *oom_group;
++ 	unsigned int victim_points = 0;
++ 	static DEFINE_RATELIMIT_STATE(oom_rs, DEFAULT_RATELIMIT_INTERVAL,
++ 					      DEFAULT_RATELIMIT_BURST);
++ 
++ 	/*
++ 	 * If the task is already exiting, don't alarm the sysadmin or kill
++ 	 * its children or threads, just give it access to memory reserves
++ 	 * so it can die quickly
++ 	 */
++ 	task_lock(p);
++ 	if (task_will_free_mem(p)) {
++ 		mark_oom_victim(p);
++ 		wake_oom_reaper(p);
++ 		task_unlock(p);
++ 		put_task_struct(p);
++ 		return;
++ 	}
++ 	task_unlock(p);
++ 
++ 	if (__ratelimit(&oom_rs))
++ 		dump_header(oc, p);
++ 
++ 	pr_err("%s: Kill process %d (%s) score %u or sacrifice child\n",
++ 		message, task_pid_nr(p), p->comm, points);
++ 
++ 	/*
++ 	 * If any of p's children has a different mm and is eligible for kill,
++ 	 * the one with the highest oom_badness() score is sacrificed for its
++ 	 * parent.  This attempts to lose the minimal amount of work done while
++ 	 * still freeing memory.
++ 	 */
++ 	read_lock(&tasklist_lock);
++ 
++ 	/*
++ 	 * The task 'p' might have already exited before reaching here. The
++ 	 * put_task_struct() will free task_struct 'p' while the loop still try
++ 	 * to access the field of 'p', so, get an extra reference.
++ 	 */
++ 	get_task_struct(p);
++ 	for_each_thread(p, t) {
++ 		list_for_each_entry(child, &t->children, sibling) {
++ 			unsigned int child_points;
++ 
++ 			if (process_shares_mm(child, p->mm))
++ 				continue;
++ 			/*
++ 			 * oom_badness() returns 0 if the thread is unkillable
++ 			 */
++ 			child_points = oom_badness(child,
++ 				oc->memcg, oc->nodemask, oc->totalpages);
++ 			if (child_points > victim_points) {
++ 				put_task_struct(victim);
++ 				victim = child;
++ 				victim_points = child_points;
++ 				get_task_struct(victim);
++ 			}
++ 		}
++ 	}
++ 	put_task_struct(p);
++ 	read_unlock(&tasklist_lock);
++ 
++ 	/*
++ 	 * Do we need to kill the entire memory cgroup?
++ 	 * Or even one of the ancestor memory cgroups?
++ 	 * Check this out before killing the victim task.
++ 	 */
++ 	oom_group = mem_cgroup_get_oom_group(victim, oc->memcg);
++ 
++ 	__oom_kill_process(victim);
++ 
++ 	/*
++ 	 * If necessary, kill all tasks in the selected memory cgroup.
++ 	 */
++ 	if (oom_group) {
++ 		mem_cgroup_print_oom_group(oom_group);
++ 		mem_cgroup_scan_tasks(oom_group, oom_kill_memcg_member, NULL);
++ 		mem_cgroup_put(oom_group);
++ 	}
++ }
++ 
++ /*
+++>>>>>>> cefc7ef3c87d (mm, oom: fix use-after-free in oom_kill_process)
+   * Determines whether the kernel must panic because of the panic_on_oom sysctl.
+   */
+ -static void check_panic_on_oom(struct oom_control *oc,
+ -			       enum oom_constraint constraint)
+ +void check_panic_on_oom(enum oom_constraint constraint, gfp_t gfp_mask,
+ +			int order, const nodemask_t *nodemask)
+  {
+  	if (likely(!sysctl_panic_on_oom))
+  		return;
+* Unmerged path mm/oom_kill.c
