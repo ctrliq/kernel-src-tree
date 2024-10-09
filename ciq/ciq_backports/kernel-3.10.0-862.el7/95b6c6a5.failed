@@ -1,0 +1,308 @@
+net/mlx5e: Reuse alloc cq code for all CQs allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Reuse alloc cq code for all CQs allocation (Don Dutile) [1456694 1499362]
+Rebuild_FUZZ: 96.08%
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit 95b6c6a519a300dc667960740ebd43b960b32883
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/95b6c6a5.failed
+
+Reuse the code for mlx5e_alloc_cq and mlx5e_alloc_drop_cq, as they
+have a similar flow.
+
+Prior to this patch, the CQEs in the "drop CQ" were not initialized,
+fixed
+it with the shared flow of alloc CQ.  This is not a critical bug as the
+RQ connected to this CQ never moved to RTS, but still better to have
+this right.
+
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 95b6c6a519a300dc667960740ebd43b960b32883)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index fc92406a15c4,57844ffca37f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1151,33 -1282,147 +1151,50 @@@ static inline void netif_tx_disable_que
+  	__netif_tx_unlock_bh(txq);
+  }
+  
+ -static void mlx5e_deactivate_txqsq(struct mlx5e_txqsq *sq)
+ +static void mlx5e_close_sq(struct mlx5e_sq *sq)
+  {
+ -	struct mlx5e_channel *c = sq->channel;
+ -
+  	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+  	/* prevent netif_tx_wake_queue */
+ -	napi_synchronize(&c->napi);
+ -
+ -	netif_tx_disable_queue(sq->txq);
+ -
+ -	/* last doorbell out, godspeed .. */
+ -	if (mlx5e_wqc_has_room_for(&sq->wq, sq->cc, sq->pc, 1)) {
+ -		struct mlx5e_tx_wqe *nop;
+ -
+ -		sq->db.skb[(sq->pc & sq->wq.sz_m1)] = NULL;
+ -		nop = mlx5e_post_nop(&sq->wq, sq->sqn, &sq->pc);
+ -		mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &nop->ctrl);
+ -	}
+ -}
+ -
+ -static void mlx5e_close_txqsq(struct mlx5e_txqsq *sq)
+ -{
+ -	struct mlx5e_channel *c = sq->channel;
+ -	struct mlx5_core_dev *mdev = c->mdev;
+ -
+ -	mlx5e_destroy_sq(mdev, sq->sqn);
+ -	if (sq->rate_limit)
+ -		mlx5_rl_remove_rate(mdev, sq->rate_limit);
+ -	mlx5e_free_txqsq_descs(sq);
+ -	mlx5e_free_txqsq(sq);
+ -}
+ -
+ -static int mlx5e_open_icosq(struct mlx5e_channel *c,
+ -			    struct mlx5e_params *params,
+ -			    struct mlx5e_sq_param *param,
+ -			    struct mlx5e_icosq *sq)
+ -{
+ -	struct mlx5e_create_sq_param csp = {};
+ -	int err;
+ -
+ -	err = mlx5e_alloc_icosq(c, param, sq);
+ -	if (err)
+ -		return err;
+ -
+ -	csp.cqn             = sq->cq.mcq.cqn;
+ -	csp.wq_ctrl         = &sq->wq_ctrl;
+ -	csp.min_inline_mode = params->tx_min_inline_mode;
+ -	set_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, &sq->sqn);
+ -	if (err)
+ -		goto err_free_icosq;
+ -
+ -	return 0;
+ -
+ -err_free_icosq:
+ -	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	mlx5e_free_icosq(sq);
+ -
+ -	return err;
+ -}
+ -
+ -static void mlx5e_close_icosq(struct mlx5e_icosq *sq)
+ -{
+ -	struct mlx5e_channel *c = sq->channel;
+ -
+ -	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	napi_synchronize(&c->napi);
+ -
+ -	mlx5e_destroy_sq(c->mdev, sq->sqn);
+ -	mlx5e_free_icosq(sq);
+ -}
+ -
+ -static int mlx5e_open_xdpsq(struct mlx5e_channel *c,
+ -			    struct mlx5e_params *params,
+ -			    struct mlx5e_sq_param *param,
+ -			    struct mlx5e_xdpsq *sq)
+ -{
+ -	unsigned int ds_cnt = MLX5E_XDP_TX_DS_COUNT;
+ -	struct mlx5e_create_sq_param csp = {};
+ -	unsigned int inline_hdr_sz = 0;
+ -	int err;
+ -	int i;
+ -
+ -	err = mlx5e_alloc_xdpsq(c, params, param, sq);
+ -	if (err)
+ -		return err;
+ -
+ -	csp.tis_lst_sz      = 1;
+ -	csp.tisn            = c->priv->tisn[0]; /* tc = 0 */
+ -	csp.cqn             = sq->cq.mcq.cqn;
+ -	csp.wq_ctrl         = &sq->wq_ctrl;
+ -	csp.min_inline_mode = sq->min_inline_mode;
+ -	set_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, &sq->sqn);
+ -	if (err)
+ -		goto err_free_xdpsq;
+ -
+ -	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
+ -		inline_hdr_sz = MLX5E_XDP_MIN_INLINE;
+ -		ds_cnt++;
+ -	}
+ -
+ -	/* Pre initialize fixed WQE fields */
+ -	for (i = 0; i < mlx5_wq_cyc_get_size(&sq->wq); i++) {
+ -		struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(&sq->wq, i);
+ -		struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
+ -		struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
+ -		struct mlx5_wqe_data_seg *dseg;
+ +	napi_synchronize(&sq->channel->napi);
+  
+ -		cseg->qpn_ds = cpu_to_be32((sq->sqn << 8) | ds_cnt);
+ -		eseg->inline_hdr.sz = cpu_to_be16(inline_hdr_sz);
+ +	if (sq->txq) {
+ +		netif_tx_disable_queue(sq->txq);
+  
+ -		dseg = (struct mlx5_wqe_data_seg *)cseg + (ds_cnt - 1);
+ -		dseg->lkey = sq->mkey_be;
+ +		/* last doorbell out, godspeed .. */
+ +		if (mlx5e_sq_has_room_for(sq, 1)) {
+ +			sq->db.txq.skb[(sq->pc & sq->wq.sz_m1)] = NULL;
+ +			mlx5e_send_nop(sq, true);
+ +		}
+  	}
+  
+ -	return 0;
+ -
+ -err_free_xdpsq:
+ -	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	mlx5e_free_xdpsq(sq);
+ -
+ -	return err;
+ +	mlx5e_disable_sq(sq);
+ +	mlx5e_free_tx_descs(sq);
+ +	mlx5e_destroy_sq(sq);
+  }
+  
+ -static void mlx5e_close_xdpsq(struct mlx5e_xdpsq *sq)
+ +static int mlx5e_create_cq(struct mlx5e_channel *c,
+ +			   struct mlx5e_cq_param *param,
+ +			   struct mlx5e_cq *cq)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5e_priv *priv = c->priv;
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+++=======
++ 	struct mlx5e_channel *c = sq->channel;
++ 
++ 	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
++ 	napi_synchronize(&c->napi);
++ 
++ 	mlx5e_destroy_sq(c->mdev, sq->sqn);
++ 	mlx5e_free_xdpsq_descs(sq);
++ 	mlx5e_free_xdpsq(sq);
++ }
++ 
++ static int mlx5e_alloc_cq_common(struct mlx5_core_dev *mdev,
++ 				 struct mlx5e_cq_param *param,
++ 				 struct mlx5e_cq *cq)
++ {
+++>>>>>>> 95b6c6a519a3 (net/mlx5e: Reuse alloc cq code for all CQs allocation)
+  	struct mlx5_core_cq *mcq = &cq->mcq;
+  	int eqn_not_used;
+  	unsigned int irqn;
+@@@ -1214,13 -1452,31 +1225,40 @@@
+  		cqe->op_own = 0xf1;
+  	}
+  
+++<<<<<<< HEAD
+ +	cq->channel = c;
+ +	cq->priv = priv;
+++=======
++ 	cq->mdev = mdev;
+++>>>>>>> 95b6c6a519a3 (net/mlx5e: Reuse alloc cq code for all CQs allocation)
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5e_destroy_cq(struct mlx5e_cq *cq)
+++=======
++ static int mlx5e_alloc_cq(struct mlx5e_channel *c,
++ 			  struct mlx5e_cq_param *param,
++ 			  struct mlx5e_cq *cq)
++ {
++ 	struct mlx5_core_dev *mdev = c->priv->mdev;
++ 	int err;
++ 
++ 	param->wq.buf_numa_node = cpu_to_node(c->cpu);
++ 	param->wq.db_numa_node  = cpu_to_node(c->cpu);
++ 	param->eq_ix   = c->ix;
++ 
++ 	err = mlx5e_alloc_cq_common(mdev, param, cq);
++ 
++ 	cq->napi    = &c->napi;
++ 	cq->channel = c;
++ 
++ 	return err;
++ }
++ 
++ static void mlx5e_free_cq(struct mlx5e_cq *cq)
+++>>>>>>> 95b6c6a519a3 (net/mlx5e: Reuse alloc cq code for all CQs allocation)
+  {
+  	mlx5_cqwq_destroy(&cq->wq_ctrl);
+  }
+@@@ -2317,52 -2704,24 +2355,56 @@@ static int mlx5e_create_drop_rq(struct 
+  	return 0;
+  }
+  
+ -static int mlx5e_alloc_drop_cq(struct mlx5_core_dev *mdev,
+ -			       struct mlx5e_cq *cq,
+ -			       struct mlx5e_cq_param *param)
+ +static int mlx5e_create_drop_cq(struct mlx5e_priv *priv,
+ +				struct mlx5e_cq *cq,
+ +				struct mlx5e_cq_param *param)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+ +	struct mlx5_core_cq *mcq = &cq->mcq;
+ +	int eqn_not_used;
+ +	unsigned int irqn;
+ +	int err;
+ +
+ +	err = mlx5_cqwq_create(mdev, &param->wq, param->cqc, &cq->wq,
+ +			       &cq->wq_ctrl);
+ +	if (err)
+ +		return err;
+ +
+ +	mlx5_vector2eqn(mdev, param->eq_ix, &eqn_not_used, &irqn);
+ +
+ +	mcq->cqe_sz     = 64;
+ +	mcq->set_ci_db  = cq->wq_ctrl.db.db;
+ +	mcq->arm_db     = cq->wq_ctrl.db.db + 1;
+ +	*mcq->set_ci_db = 0;
+ +	*mcq->arm_db    = 0;
+ +	mcq->vector     = param->eq_ix;
+ +	mcq->comp       = mlx5e_completion_event;
+ +	mcq->event      = mlx5e_cq_error_event;
+ +	mcq->irqn       = irqn;
+ +	mcq->uar        = &mdev->mlx5e_res.cq_uar;
+ +
+ +	cq->priv = priv;
+ +
+ +	return 0;
+++=======
++ 	return mlx5e_alloc_cq_common(mdev, param, cq);
+++>>>>>>> 95b6c6a519a3 (net/mlx5e: Reuse alloc cq code for all CQs allocation)
+  }
+  
+ -static int mlx5e_open_drop_rq(struct mlx5_core_dev *mdev,
+ -			      struct mlx5e_rq *drop_rq)
+ +static int mlx5e_open_drop_rq(struct mlx5e_priv *priv)
+  {
+ -	struct mlx5e_cq_param cq_param = {};
+ -	struct mlx5e_rq_param rq_param = {};
+ -	struct mlx5e_cq *cq = &drop_rq->cq;
+ +	struct mlx5e_cq_param cq_param;
+ +	struct mlx5e_rq_param rq_param;
+ +	struct mlx5e_rq *rq = &priv->drop_rq;
+ +	struct mlx5e_cq *cq = &priv->drop_rq.cq;
+  	int err;
+  
+ +	memset(&cq_param, 0, sizeof(cq_param));
+ +	memset(&rq_param, 0, sizeof(rq_param));
+  	mlx5e_build_drop_rq_param(&rq_param);
+  
+ -	err = mlx5e_alloc_drop_cq(mdev, cq, &cq_param);
+ +	err = mlx5e_create_drop_cq(priv, cq, &cq_param);
+  	if (err)
+  		return err;
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
