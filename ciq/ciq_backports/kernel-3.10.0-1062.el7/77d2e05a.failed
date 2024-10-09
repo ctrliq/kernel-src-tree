@@ -1,0 +1,147 @@
+bpf: Add bpf_verifier_vlog() and bpf_verifier_log_needed()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 77d2e05abd45886dcad2b632c738cf46b9f7c19e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/77d2e05a.failed
+
+The BTF (BPF Type Format) verifier needs to reuse the current
+BPF verifier log.  Hence, it requires the following changes:
+
+(1) Expose log_write() in verifier.c for other users.
+    Its name is renamed to bpf_verifier_vlog().
+
+(2) The BTF verifier also needs to check
+'log->level && log->ubuf && !bpf_verifier_log_full(log);'
+independently outside of the current log_write().  It is
+because the BTF verifier will do one-check before
+making multiple calls to btf_verifier_vlog to log
+the details of a type.
+
+Hence, this check is also re-factored to a new function
+bpf_verifier_log_needed().  Since it is re-factored,
+we can check it before va_start() in the current
+bpf_verifier_log_write() and verbose().
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Alexei Starovoitov <ast@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 77d2e05abd45886dcad2b632c738cf46b9f7c19e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf_verifier.h
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf_verifier.h
+index 30a64bcc7a7d,7e61c395fddf..000000000000
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@@ -167,11 -166,10 +167,18 @@@ static inline bool bpf_verifier_log_ful
+  	return log->len_used >= log->len_total - 1;
+  }
+  
+++<<<<<<< HEAD
+ +struct bpf_verifier_env;
+ +struct bpf_ext_analyzer_ops {
+ +	int (*insn_hook)(struct bpf_verifier_env *env,
+ +			 int insn_idx, int prev_insn_idx);
+ +};
+++=======
++ static inline bool bpf_verifier_log_needed(const struct bpf_verifier_log *log)
++ {
++ 	return log->level && log->ubuf && !bpf_verifier_log_full(log);
++ }
+++>>>>>>> 77d2e05abd45 (bpf: Add bpf_verifier_vlog() and bpf_verifier_log_needed())
+  
+  #define BPF_MAX_SUBPROGS 256
+  
+diff --cc kernel/bpf/verifier.c
+index 5cb5e92d5f64,8acd2207e412..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -190,23 -168,12 +190,30 @@@ struct bpf_call_arg_meta 
+  
+  static DEFINE_MUTEX(bpf_verifier_lock);
+  
+++<<<<<<< HEAD
+ +/* log_level controls verbosity level of eBPF verifier.
+ + * bpf_verifier_log_write() is used to dump the verification trace to the log,
+ + * so the user can figure out what's wrong with the program
+ + */
+ +__printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
+ +					   const char *fmt, ...)
+++=======
++ void bpf_verifier_vlog(struct bpf_verifier_log *log, const char *fmt,
++ 		       va_list args)
+++>>>>>>> 77d2e05abd45 (bpf: Add bpf_verifier_vlog() and bpf_verifier_log_needed())
+  {
+- 	struct bpf_verifier_log *log = &env->log;
+  	unsigned int n;
+ +	va_list args;
+  
+++<<<<<<< HEAD
+ +	if (!log->level || !log->ubuf || bpf_verifier_log_full(log))
+ +		return;
+ +
+ +	va_start(args, fmt);
+++=======
+++>>>>>>> 77d2e05abd45 (bpf: Add bpf_verifier_vlog() and bpf_verifier_log_needed())
+  	n = vscnprintf(log->kbuf, BPF_VERIFIER_TMP_LOG_SIZE, fmt, args);
+ +	va_end(args);
+  
+  	WARN_ONCE(n >= BPF_VERIFIER_TMP_LOG_SIZE - 1,
+  		  "verifier log line truncated - local buffer too short\n");
+@@@ -219,14 -186,37 +226,48 @@@
+  	else
+  		log->ubuf = NULL;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(bpf_verifier_log_write);
+ +/* Historically bpf_verifier_log_write was called verbose, but the name was too
+ + * generic for symbol export. The function was renamed, but not the calls in
+ + * the verifier to avoid complicating backports. Hence the alias below.
+ + */
+ +static __printf(2, 3) void verbose(struct bpf_verifier_env *env,
+ +				   const char *fmt, ...)
+ +	__attribute__((alias("bpf_verifier_log_write")));
+++=======
++ 
++ /* log_level controls verbosity level of eBPF verifier.
++  * bpf_verifier_log_write() is used to dump the verification trace to the log,
++  * so the user can figure out what's wrong with the program
++  */
++ __printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
++ 					   const char *fmt, ...)
++ {
++ 	va_list args;
++ 
++ 	if (!bpf_verifier_log_needed(&env->log))
++ 		return;
++ 
++ 	va_start(args, fmt);
++ 	bpf_verifier_vlog(&env->log, fmt, args);
++ 	va_end(args);
++ }
++ EXPORT_SYMBOL_GPL(bpf_verifier_log_write);
++ 
++ __printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
++ {
++ 	struct bpf_verifier_env *env = private_data;
++ 	va_list args;
++ 
++ 	if (!bpf_verifier_log_needed(&env->log))
++ 		return;
++ 
++ 	va_start(args, fmt);
++ 	bpf_verifier_vlog(&env->log, fmt, args);
++ 	va_end(args);
++ }
+++>>>>>>> 77d2e05abd45 (bpf: Add bpf_verifier_vlog() and bpf_verifier_log_needed())
+  
+  static bool type_is_pkt_pointer(enum bpf_reg_type type)
+  {
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/verifier.c
