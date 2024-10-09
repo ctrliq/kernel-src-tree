@@ -1,0 +1,176 @@
+GFS2: Fix recovery issues for spectators
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 4a7727725dc7d73769c5ab24c566df454093285f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4a772772.failed
+
+This patch fixes a couple problems dealing with spectators who
+remain with gfs2 mounts after the last non-spectator node fails.
+
+Before this patch, spectator mounts would try to acquire the dlm's
+mounted lock EX as part of its normal recovery sequence.
+The mounted lock is only used to determine whether the node is
+the first mounter, the first node to mount the file system, for
+the purposes of file system recovery and journal replay.
+
+It's not necessary for spectators: they should never do journal
+recovery. If they acquire the lock it will prevent another "real"
+first-mounter from acquiring the lock in EX mode, which means it
+also cannot do journal recovery because it doesn't think it's the
+first node to mount the file system.
+
+This patch checks if the mounter is a spectator, and if so, avoids
+grabbing the mounted lock. This allows a secondary mounter who is
+really the first non-spectator mounter, to do journal recovery:
+since the spectator doesn't acquire the lock, it can grab it in
+EX mode, and therefore consider itself to be the first mounter
+both as a "real" first mount, and as a first-real-after-spectator.
+
+Note that the control lock still needs to be taken in PR mode
+in order to fetch the lvb value so it has the current status of
+all journal's recovery. This is used as it is today by a first
+mounter to replay the journals. For spectators, it's merely
+used to fetch the status bits. All recovery is bypassed and the
+node waits until recovery is completed by a non-spectator node.
+
+I also improved the cryptic message given by control_mount when
+a spectator is waiting for a non-spectator to perform recovery.
+
+It also fixes a problem in gfs2_recover_set whereby spectators
+were never queueing recovery work for their own journal.
+They cannot do recovery themselves, but they still need to queue
+the work so they can check the recovery bits and clear the
+DFL_BLOCK_LOCKS bit once the recovery happens on another node.
+
+When the work queue runs on a spectator, it bypasses most of the
+work so it won't print a bunch of annoying messages. All it will
+print is a bunch of messages that look like this until recovery
+completes on the non-spectator node:
+
+GFS2: fsid=mycluster:scratch.s: recover generation 3 jid 0
+GFS2: fsid=mycluster:scratch.s: recover jid 0 result busy
+
+These continue every 1.5 seconds until the recovery is done by
+the non-spectator, at which time it says:
+
+GFS2: fsid=mycluster:scratch.s: recover generation 4 done
+
+Then it proceeds with its mount.
+
+If the file system is mounted in spectator node and the last
+remaining non-spectator is fenced, any IO to the file system is
+blocked by dlm and the spectator waits until recovery is
+performed by a non-spectator.
+
+If a spectator tries to mount the file system before any
+non-spectators, it blocks and repeatedly gives this kernel
+message:
+
+GFS2: fsid=mycluster:scratch: Recovery is required. Waiting for a non-spectator to mount.
+GFS2: fsid=mycluster:scratch: Recovery is required. Waiting for a non-spectator to mount.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 4a7727725dc7d73769c5ab24c566df454093285f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/recovery.c
+diff --cc fs/gfs2/recovery.c
+index 56dea445d7fa,0f501f938d1c..000000000000
+--- a/fs/gfs2/recovery.c
++++ b/fs/gfs2/recovery.c
+@@@ -454,15 -409,17 +454,22 @@@ void gfs2_recover_func(struct work_stru
+  	struct gfs2_inode *ip = GFS2_I(jd->jd_inode);
+  	struct gfs2_sbd *sdp = GFS2_SB(jd->jd_inode);
+  	struct gfs2_log_header_host head;
+ -	struct gfs2_holder j_gh, ji_gh, thaw_gh;
+ -	ktime_t t_start, t_jlck, t_jhd, t_tlck, t_rep;
+ +	struct gfs2_holder j_gh, ji_gh, t_gh;
+ +	unsigned long t;
+  	int ro = 0;
+  	unsigned int pass;
+- 	int error;
++ 	int error = 0;
+  	int jlocked = 0;
+  
+++<<<<<<< HEAD
+ +	if (sdp->sd_args.ar_spectator ||
+ +	    (jd->jd_jid != sdp->sd_lockstruct.ls_jid)) {
+++=======
++ 	t_start = ktime_get();
++ 	if (sdp->sd_args.ar_spectator)
++ 		goto fail;
++ 	if (jd->jd_jid != sdp->sd_lockstruct.ls_jid) {
+++>>>>>>> 4a7727725dc7 (GFS2: Fix recovery issues for spectators)
+  		fs_info(sdp, "jid=%u: Trying to acquire journal lock...\n",
+  			jd->jd_jid);
+  		jlocked = 1;
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 5cb6cfd247a0..6baae5087837 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -820,6 +820,13 @@ restart:
+ 		goto fail;
+ 	}
+ 
++	/**
++	 * If we're a spectator, we don't want to take the lock in EX because
++	 * we cannot do the first-mount responsibility it implies: recovery.
++	 */
++	if (sdp->sd_args.ar_spectator)
++		goto locks_done;
++
+ 	error = mounted_lock(sdp, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE);
+ 	if (!error) {
+ 		mounted_mode = DLM_LOCK_EX;
+@@ -895,9 +902,16 @@ locks_done:
+ 	if (lvb_gen < mount_gen) {
+ 		/* wait for mounted nodes to update control_lock lvb to our
+ 		   generation, which might include new recovery bits set */
+-		fs_info(sdp, "control_mount wait1 block %u start %u mount %u "
+-			"lvb %u flags %lx\n", block_gen, start_gen, mount_gen,
+-			lvb_gen, ls->ls_recover_flags);
++		if (sdp->sd_args.ar_spectator) {
++			fs_info(sdp, "Recovery is required. Waiting for a "
++				"non-spectator to mount.\n");
++			msleep_interruptible(1000);
++		} else {
++			fs_info(sdp, "control_mount wait1 block %u start %u "
++				"mount %u lvb %u flags %lx\n", block_gen,
++				start_gen, mount_gen, lvb_gen,
++				ls->ls_recover_flags);
++		}
+ 		spin_unlock(&ls->ls_recover_spin);
+ 		goto restart;
+ 	}
+* Unmerged path fs/gfs2/recovery.c
+diff --git a/fs/gfs2/sys.c b/fs/gfs2/sys.c
+index 351fd3d5b059..0c2a60fa66d7 100644
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@ -411,11 +411,18 @@ int gfs2_recover_set(struct gfs2_sbd *sdp, unsigned jid)
+ 
+ 	spin_lock(&sdp->sd_jindex_spin);
+ 	rv = -EBUSY;
+-	if (sdp->sd_jdesc->jd_jid == jid)
++	/**
++	 * If we're a spectator, we use journal0, but it's not really ours.
++	 * So we need to wait for its recovery too. If we skip it we'd never
++	 * queue work to the recovery workqueue, and so its completion would
++	 * never clear the DFL_BLOCK_LOCKS flag, so all our locks would
++	 * permanently stop working.
++	 */
++	if (sdp->sd_jdesc->jd_jid == jid && !sdp->sd_args.ar_spectator)
+ 		goto out;
+ 	rv = -ENOENT;
+ 	list_for_each_entry(jd, &sdp->sd_jindex_list, jd_list) {
+-		if (jd->jd_jid != jid)
++		if (jd->jd_jid != jid && !sdp->sd_args.ar_spectator)
+ 			continue;
+ 		rv = gfs2_recover_journal(jd, false);
+ 		break;
