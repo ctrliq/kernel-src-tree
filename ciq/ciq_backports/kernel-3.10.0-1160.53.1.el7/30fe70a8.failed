@@ -1,0 +1,98 @@
+gfs2: clear ail1 list when gfs2 withdraws
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 30fe70a85a909a23dcbc2c628ca6655b2c85e7a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/30fe70a8.failed
+
+This patch fixes a bug in which function gfs2_log_flush can get into
+an infinite loop when a gfs2 file system is withdrawn. The problem
+is the infinite loop "for (;;)" in gfs2_log_flush which would never
+finish because the io error and subsequent withdraw prevented the
+items from being taken off the ail list.
+
+This patch tries to clean up the mess by allowing withdraw situations
+to move not-in-flight buffer_heads to the ail2 list, where they will
+be dealt with later.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 30fe70a85a909a23dcbc2c628ca6655b2c85e7a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,9ebec6f93fa3..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -105,12 -103,22 +105,29 @@@ __acquires(&sdp->sd_ail_lock
+  		gfs2_assert(sdp, bd->bd_tr == tr);
+  
+  		if (!buffer_busy(bh)) {
+++<<<<<<< HEAD
+ +			if (!buffer_uptodate(bh))
+ +				gfs2_io_error_bh(sdp, bh);
+ +			list_move(&bd->bd_ail_st_list, &tr->tr_ail2_list);
+ +			continue;
+++=======
++ 			if (buffer_uptodate(bh)) {
++ 				list_move(&bd->bd_ail_st_list,
++ 					  &tr->tr_ail2_list);
++ 				continue;
++ 			}
++ 			if (!test_and_set_bit(SDF_AIL1_IO_ERROR,
++ 					      &sdp->sd_flags)) {
++ 				gfs2_io_error_bh(sdp, bh);
++ 				gfs2_withdraw_delayed(sdp);
++ 			}
+++>>>>>>> 30fe70a85a90 (gfs2: clear ail1 list when gfs2 withdraws)
+  		}
+  
++ 		if (gfs2_withdrawn(sdp)) {
++ 			gfs2_remove_from_ail(bd);
++ 			continue;
++ 		}
+  		if (!buffer_dirty(bh))
+  			continue;
+  		if (gl == bd->bd_gl)
+@@@ -725,7 -856,31 +742,35 @@@ void gfs2_log_flush(struct gfs2_sbd *sd
+  	}
+  	spin_unlock(&sdp->sd_ail_lock);
+  	gfs2_log_unlock(sdp);
+++<<<<<<< HEAD
+ +	trace_gfs2_log_flush(sdp, 0);
+++=======
++ 
++ 	if (!(flags & GFS2_LOG_HEAD_FLUSH_NORMAL)) {
++ 		if (!sdp->sd_log_idle) {
++ 			for (;;) {
++ 				gfs2_ail1_start(sdp);
++ 				gfs2_ail1_wait(sdp);
++ 				if (gfs2_ail1_empty(sdp))
++ 					break;
++ 			}
++ 			if (gfs2_withdrawn(sdp))
++ 				goto out;
++ 			atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
++ 			trace_gfs2_log_blocks(sdp, -1);
++ 			log_write_header(sdp, flags);
++ 			sdp->sd_log_head = sdp->sd_log_flush_head;
++ 		}
++ 		if (flags & (GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
++ 			     GFS2_LOG_HEAD_FLUSH_FREEZE))
++ 			gfs2_log_shutdown(sdp);
++ 		if (flags & GFS2_LOG_HEAD_FLUSH_FREEZE)
++ 			atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 	}
++ 
++ out:
++ 	trace_gfs2_log_flush(sdp, 0, flags);
+++>>>>>>> 30fe70a85a90 (gfs2: clear ail1 list when gfs2 withdraws)
+  	up_write(&sdp->sd_log_flush_lock);
+  
+  	kfree(tr);
+* Unmerged path fs/gfs2/log.c
