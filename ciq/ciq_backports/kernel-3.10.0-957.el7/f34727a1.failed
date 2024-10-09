@@ -1,0 +1,246 @@
+RDMA/nldev: missing error code in nldev_res_get_doit()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit f34727a1351362c8f349d29efcd0e72702571e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f34727a1.failed
+
+We should return -ENOMEM if the allocation fails.  The current code
+accidentally returns success.
+
+Fixes: bf3c5a93c523 ("RDMA/nldev: Provide global resource utilization")
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit f34727a1351362c8f349d29efcd0e72702571e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+diff --cc drivers/infiniband/core/nldev.c
+index 45af760cbdbe,5326a684555f..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -327,6 -479,215 +327,218 @@@ out
+  	return skb->len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nldev_res_get_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct ib_device *device;
++ 	struct sk_buff *msg;
++ 	u32 index;
++ 	int ret;
++ 
++ 	ret = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (ret || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg) {
++ 		ret = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	nlh = nlmsg_put(msg, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_RES_GET),
++ 			0, 0);
++ 
++ 	ret = fill_res_info(msg, device);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	nlmsg_end(msg, nlh);
++ 	put_device(&device->dev);
++ 	return rdma_nl_unicast(msg, NETLINK_CB(skb).portid);
++ 
++ err_free:
++ 	nlmsg_free(msg);
++ err:
++ 	put_device(&device->dev);
++ 	return ret;
++ }
++ 
++ static int _nldev_res_get_dumpit(struct ib_device *device,
++ 				 struct sk_buff *skb,
++ 				 struct netlink_callback *cb,
++ 				 unsigned int idx)
++ {
++ 	int start = cb->args[0];
++ 	struct nlmsghdr *nlh;
++ 
++ 	if (idx < start)
++ 		return 0;
++ 
++ 	nlh = nlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_RES_GET),
++ 			0, NLM_F_MULTI);
++ 
++ 	if (fill_res_info(skb, device)) {
++ 		nlmsg_cancel(skb, nlh);
++ 		goto out;
++ 	}
++ 
++ 	nlmsg_end(skb, nlh);
++ 
++ 	idx++;
++ 
++ out:
++ 	cb->args[0] = idx;
++ 	return skb->len;
++ }
++ 
++ static int nldev_res_get_dumpit(struct sk_buff *skb,
++ 				struct netlink_callback *cb)
++ {
++ 	return ib_enum_all_devs(_nldev_res_get_dumpit, skb, cb);
++ }
++ 
++ static int nldev_res_get_qp_dumpit(struct sk_buff *skb,
++ 				   struct netlink_callback *cb)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct rdma_restrack_entry *res;
++ 	int err, ret = 0, idx = 0;
++ 	struct nlattr *table_attr;
++ 	struct ib_device *device;
++ 	int start = cb->args[0];
++ 	struct ib_qp *qp = NULL;
++ 	struct nlmsghdr *nlh;
++ 	u32 index, port = 0;
++ 
++ 	err = nlmsg_parse(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, NULL);
++ 	/*
++ 	 * Right now, we are expecting the device index to get QP information,
++ 	 * but it is possible to extend this code to return all devices in
++ 	 * one shot by checking the existence of RDMA_NLDEV_ATTR_DEV_INDEX.
++ 	 * if it doesn't exist, we will iterate over all devices.
++ 	 *
++ 	 * But it is not needed for now.
++ 	 */
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * If no PORT_INDEX is supplied, we will return all QPs from that device
++ 	 */
++ 	if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
++ 		port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
++ 		if (!rdma_is_port_valid(device, port)) {
++ 			ret = -EINVAL;
++ 			goto err_index;
++ 		}
++ 	}
++ 
++ 	nlh = nlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_RES_QP_GET),
++ 			0, NLM_F_MULTI);
++ 
++ 	if (fill_nldev_handle(skb, device)) {
++ 		ret = -EMSGSIZE;
++ 		goto err;
++ 	}
++ 
++ 	table_attr = nla_nest_start(skb, RDMA_NLDEV_ATTR_RES_QP);
++ 	if (!table_attr) {
++ 		ret = -EMSGSIZE;
++ 		goto err;
++ 	}
++ 
++ 	down_read(&device->res.rwsem);
++ 	hash_for_each_possible(device->res.hash, res, node, RDMA_RESTRACK_QP) {
++ 		if (idx < start)
++ 			goto next;
++ 
++ 		if ((rdma_is_kernel_res(res) &&
++ 		     task_active_pid_ns(current) != &init_pid_ns) ||
++ 		    (!rdma_is_kernel_res(res) &&
++ 		     task_active_pid_ns(current) != task_active_pid_ns(res->task)))
++ 			/*
++ 			 * 1. Kernel QPs should be visible in init namspace only
++ 			 * 2. Present only QPs visible in the current namespace
++ 			 */
++ 			goto next;
++ 
++ 		if (!rdma_restrack_get(res))
++ 			/*
++ 			 * Resource is under release now, but we are not
++ 			 * relesing lock now, so it will be released in
++ 			 * our next pass, once we will get ->next pointer.
++ 			 */
++ 			goto next;
++ 
++ 		qp = container_of(res, struct ib_qp, res);
++ 
++ 		up_read(&device->res.rwsem);
++ 		ret = fill_res_qp_entry(skb, qp, port);
++ 		down_read(&device->res.rwsem);
++ 		/*
++ 		 * Return resource back, but it won't be released till
++ 		 * the &device->res.rwsem will be released for write.
++ 		 */
++ 		rdma_restrack_put(res);
++ 
++ 		if (ret == -EMSGSIZE)
++ 			/*
++ 			 * There is a chance to optimize here.
++ 			 * It can be done by using list_prepare_entry
++ 			 * and list_for_each_entry_continue afterwards.
++ 			 */
++ 			break;
++ 		if (ret)
++ 			goto res_err;
++ next:		idx++;
++ 	}
++ 	up_read(&device->res.rwsem);
++ 
++ 	nla_nest_end(skb, table_attr);
++ 	nlmsg_end(skb, nlh);
++ 	cb->args[0] = idx;
++ 
++ 	/*
++ 	 * No more QPs to fill, cancel the message and
++ 	 * return 0 to mark end of dumpit.
++ 	 */
++ 	if (!qp)
++ 		goto err;
++ 
++ 	put_device(&device->dev);
++ 	return skb->len;
++ 
++ res_err:
++ 	nla_nest_cancel(skb, table_attr);
++ 	up_read(&device->res.rwsem);
++ 
++ err:
++ 	nlmsg_cancel(skb, nlh);
++ 
++ err_index:
++ 	put_device(&device->dev);
++ 	return ret;
++ }
++ 
+++>>>>>>> f34727a13513 (RDMA/nldev: missing error code in nldev_res_get_doit())
+  static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+  	[RDMA_NLDEV_CMD_GET] = {
+  		.doit = nldev_get_doit,
+* Unmerged path drivers/infiniband/core/nldev.c
