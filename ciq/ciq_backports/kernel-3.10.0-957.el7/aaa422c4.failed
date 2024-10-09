@@ -1,0 +1,196 @@
+fs, dax: unify IOMAP_F_DIRTY read vs write handling policy in the dax core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit aaa422c4c3f6ee958ea9d6c9260ac40f90a3f4e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/aaa422c4.failed
+
+While reviewing whether MAP_SYNC should strengthen its current guarantee
+of syncing writes from the initiating process to also include
+third-party readers observing dirty metadata, Dave pointed out that the
+check of IOMAP_WRITE is misplaced.
+
+The policy of what to with IOMAP_F_DIRTY should be separated from the
+generic filesystem mechanism of reporting dirty metadata. Move this
+policy to the fs-dax core to simplify the per-filesystem iomap handlers,
+and further centralize code that implements the MAP_SYNC policy. This
+otherwise should not change behavior, it just makes it easier to change
+behavior in the future.
+
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reported-by: Dave Chinner <david@fromorbit.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit aaa422c4c3f6ee958ea9d6c9260ac40f90a3f4e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/ext4/inode.c
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/dax.c
+index c0fc2e59d86f,27ba300660ff..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -1181,14 -1079,25 +1181,30 @@@ static int dax_fault_return(int error
+  	return VM_FAULT_SIGBUS;
+  }
+  
+++<<<<<<< HEAD
+ +static int dax_iomap_pte_fault(struct vm_fault *vmf,
+ +			const struct iomap_ops *ops)
+++=======
++ /*
++  * MAP_SYNC on a dax mapping guarantees dirty metadata is
++  * flushed on write-faults (non-cow), but not read-faults.
++  */
++ static bool dax_fault_is_synchronous(unsigned long flags,
++ 		struct vm_area_struct *vma, struct iomap *iomap)
++ {
++ 	return (flags & IOMAP_WRITE) && (vma->vm_flags & VM_SYNC)
++ 		&& (iomap->flags & IOMAP_F_DIRTY);
++ }
++ 
++ static int dax_iomap_pte_fault(struct vm_fault *vmf, pfn_t *pfnp,
++ 			       const struct iomap_ops *ops)
+++>>>>>>> aaa422c4c3f6 (fs, dax: unify IOMAP_F_DIRTY read vs write handling policy in the dax core)
+  {
+ -	struct vm_area_struct *vma = vmf->vma;
+ -	struct address_space *mapping = vma->vm_file->f_mapping;
+ +	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+  	struct inode *inode = mapping->host;
+ -	unsigned long vaddr = vmf->address;
+ +	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+  	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
+ +	sector_t sector;
+  	struct iomap iomap = { 0 };
+  	unsigned flags = IOMAP_FAULT;
+  	int error, major = 0;
+@@@ -1269,6 -1181,8 +1285,11 @@@
+  		goto finish_iomap;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	sync = dax_fault_is_synchronous(flags, vma, &iomap);
++ 
+++>>>>>>> aaa422c4c3f6 (fs, dax: unify IOMAP_F_DIRTY read vs write handling policy in the dax core)
+  	switch (iomap.type) {
+  	case IOMAP_MAPPED:
+  		if (iomap.flags & IOMAP_F_NEW) {
+@@@ -1502,9 -1401,37 +1523,14 @@@ static int dax_iomap_pmd_fault(struct v
+  	if (iomap.offset + iomap.length < pos + PMD_SIZE)
+  		goto finish_iomap;
+  
+++<<<<<<< HEAD
+++=======
++ 	sync = dax_fault_is_synchronous(iomap_flags, vma, &iomap);
++ 
+++>>>>>>> aaa422c4c3f6 (fs, dax: unify IOMAP_F_DIRTY read vs write handling policy in the dax core)
+  	switch (iomap.type) {
+  	case IOMAP_MAPPED:
+ -		error = dax_iomap_pfn(&iomap, pos, PMD_SIZE, &pfn);
+ -		if (error < 0)
+ -			goto finish_iomap;
+ -
+ -		entry = dax_insert_mapping_entry(mapping, vmf, entry,
+ -						dax_iomap_sector(&iomap, pos),
+ -						RADIX_DAX_PMD, write && !sync);
+ -		if (IS_ERR(entry))
+ -			goto finish_iomap;
+ -
+ -		/*
+ -		 * If we are doing synchronous page fault and inode needs fsync,
+ -		 * we can insert PMD into page tables only after that happens.
+ -		 * Skip insertion for now and return the pfn so that caller can
+ -		 * insert it after fsync is done.
+ -		 */
+ -		if (sync) {
+ -			if (WARN_ON_ONCE(!pfnp))
+ -				goto finish_iomap;
+ -			*pfnp = pfn;
+ -			result = VM_FAULT_NEEDDSYNC;
+ -			goto finish_iomap;
+ -		}
+ -
+ -		trace_dax_pmd_insert_mapping(inode, vmf, PMD_SIZE, pfn, entry);
+ -		result = vmf_insert_pfn_pmd(vma, vmf->address, vmf->pmd, pfn,
+ -					    write);
+ +		result = dax_pmd_insert_mapping(vmf, &iomap, pos, &entry);
+  		break;
+  	case IOMAP_UNWRITTEN:
+  	case IOMAP_HOLE:
+diff --cc fs/ext4/inode.c
+index a2d511ecf734,ee4d907a4251..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3159,18 -3479,16 +3159,25 @@@ retry
+  	}
+  
+  	iomap->flags = 0;
+++<<<<<<< HEAD
+ +	bdev = inode->i_sb->s_bdev;
+ +	iomap->bdev = bdev;
+ +	if (blk_queue_dax(bdev->bd_queue))
+ +		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
+ +	else
+ +		iomap->dax_dev = NULL;
+++=======
++ 	if (ext4_inode_datasync_dirty(inode))
++ 		iomap->flags |= IOMAP_F_DIRTY;
++ 	iomap->bdev = inode->i_sb->s_bdev;
++ 	iomap->dax_dev = sbi->s_daxdev;
+++>>>>>>> aaa422c4c3f6 (fs, dax: unify IOMAP_F_DIRTY read vs write handling policy in the dax core)
+  	iomap->offset = first_block << blkbits;
+ +	iomap->length = (u64)map.m_len << blkbits;
+  
+  	if (ret == 0) {
+ -		iomap->type = IOMAP_HOLE;
+ -		iomap->blkno = IOMAP_NULL_BLOCK;
+ -		iomap->length = (u64)map.m_len << blkbits;
+ +		iomap->type = delalloc ? IOMAP_DELALLOC : IOMAP_HOLE;
+ +		iomap->addr = IOMAP_NULL_ADDR;
+  	} else {
+  		if (map.m_flags & EXT4_MAP_MAPPED) {
+  			iomap->type = IOMAP_MAPPED;
+diff --cc fs/xfs/xfs_iomap.c
+index dee0317e2022,3c0e4cf72d2b..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -1031,16 -1087,18 +1031,23 @@@ xfs_file_iomap_begin
+  		trace_xfs_iomap_found(ip, offset, length, 0, &imap);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (xfs_ipincount(ip) && (ip->i_itemp->ili_fsync_fields
++ 				& ~XFS_ILOG_TIMESTAMP))
++ 		iomap->flags |= IOMAP_F_DIRTY;
++ 
+++>>>>>>> aaa422c4c3f6 (fs, dax: unify IOMAP_F_DIRTY read vs write handling policy in the dax core)
+  	xfs_bmbt_to_iomap(ip, iomap, &imap);
+  
+ -	if (shared)
+ -		iomap->flags |= IOMAP_F_SHARED;
+ +	/* optionally associate a dax device with the iomap bdev */
+ +	bdev = iomap->bdev;
+ +	if (blk_queue_dax(bdev->bd_queue))
+ +		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
+ +	else
+ +		iomap->dax_dev = NULL;
+ +
+  	return 0;
+ -out_unlock:
+ -	xfs_iunlock(ip, lockmode);
+ -	return error;
+  }
+  
+  static int
+* Unmerged path fs/dax.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/xfs/xfs_iomap.c
