@@ -1,0 +1,284 @@
+IB/uverbs: Add a simple allocator to uverbs_attr_bundle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 461bb2eee4e162617e790c74d9b4ab10056cad7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/461bb2ee.failed
+
+This is similar in spirit to devm, it keeps track of any allocations
+linked to this method call and ensures they are all freed when the method
+exits. Further, if there is space in the internal/onstack buffer then the
+allocator will hand out that memory and avoid an expensive call to
+kalloc/kfree in the syscall path.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 461bb2eee4e162617e790c74d9b4ab10056cad7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	include/rdma/uverbs_ioctl.h
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index ec7b453e622b,7b330cc5ff76..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -35,6 -35,74 +35,77 @@@
+  #include "rdma_core.h"
+  #include "uverbs.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct bundle_alloc_head {
++ 	struct bundle_alloc_head *next;
++ 	u8 data[];
++ };
++ 
++ struct bundle_priv {
++ 	/* Must be first */
++ 	struct bundle_alloc_head alloc_head;
++ 	struct bundle_alloc_head *allocated_mem;
++ 	size_t internal_avail;
++ 	size_t internal_used;
++ 
++ 	struct ib_uverbs_attr __user *user_attrs;
++ 	struct ib_uverbs_attr *uattrs;
++ 	struct uverbs_obj_attr *destroy_attr;
++ 
++ 	/*
++ 	 * Must be last. bundle ends in a flex array which overlaps
++ 	 * internal_buffer.
++ 	 */
++ 	struct uverbs_attr_bundle bundle;
++ 	u64 internal_buffer[32];
++ };
++ 
++ /**
++  * uverbs_alloc() - Quickly allocate memory for use with a bundle
++  * @bundle: The bundle
++  * @size: Number of bytes to allocate
++  * @flags: Allocator flags
++  *
++  * The bundle allocator is intended for allocations that are connected with
++  * processing the system call related to the bundle. The allocated memory is
++  * always freed once the system call completes, and cannot be freed any other
++  * way.
++  *
++  * This tries to use a small pool of pre-allocated memory for performance.
++  */
++ __malloc void *_uverbs_alloc(struct uverbs_attr_bundle *bundle, size_t size,
++ 			     gfp_t flags)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	size_t new_used;
++ 	void *res;
++ 
++ 	if (check_add_overflow(size, pbundle->internal_used, &new_used))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (new_used > pbundle->internal_avail) {
++ 		struct bundle_alloc_head *buf;
++ 
++ 		buf = kvmalloc(struct_size(buf, data, size), flags);
++ 		if (!buf)
++ 			return ERR_PTR(-ENOMEM);
++ 		buf->next = pbundle->allocated_mem;
++ 		pbundle->allocated_mem = buf;
++ 		return buf->data;
++ 	}
++ 
++ 	res = (void *)pbundle->internal_buffer + pbundle->internal_used;
++ 	pbundle->internal_used =
++ 		ALIGN(new_used, sizeof(*pbundle->internal_buffer));
++ 	if (flags & __GFP_ZERO)
++ 		memset(res, 0, size);
++ 	return res;
++ }
++ EXPORT_SYMBOL(_uverbs_alloc);
++ 
+++>>>>>>> 461bb2eee4e1 (IB/uverbs: Add a simple allocator to uverbs_attr_bundle)
+  static bool uverbs_is_attr_cleared(const struct ib_uverbs_attr *uattr,
+  				   u16 len)
+  {
+@@@ -114,9 -179,24 +185,28 @@@ static int uverbs_process_attr(struct i
+  		    uattr->attr_data.reserved)
+  			return -EINVAL;
+  
+ -		e->ptr_attr.uattr_idx = uattr - pbundle->uattrs;
+ +		e->ptr_attr.data = uattr->data;
+  		e->ptr_attr.len = uattr->len;
+++<<<<<<< HEAD
+ +		e->ptr_attr.flags = uattr->flags;
+++=======
++ 
++ 		if (val_spec->alloc_and_copy && !uverbs_attr_ptr_is_inline(e)) {
++ 			void *p;
++ 
++ 			p = uverbs_alloc(&pbundle->bundle, uattr->len);
++ 			if (IS_ERR(p))
++ 				return PTR_ERR(p);
++ 
++ 			e->ptr_attr.ptr = p;
++ 
++ 			if (copy_from_user(p, u64_to_user_ptr(uattr->data),
++ 					   uattr->len))
++ 				return -EFAULT;
++ 		} else {
++ 			e->ptr_attr.data = uattr->data;
++ 		}
+++>>>>>>> 461bb2eee4e1 (IB/uverbs: Add a simple allocator to uverbs_attr_bundle)
+  		break;
+  
+  	case UVERBS_ATTR_TYPE_IDR:
+@@@ -332,16 -443,16 +433,20 @@@ static long ib_uverbs_cmd_verbs(struct 
+  	const struct uverbs_method_spec *method_spec;
+  	long err = 0;
+  	unsigned int i;
+++<<<<<<< HEAD
+ +	struct {
+ +		struct ib_uverbs_attr		*uattrs;
+ +		struct uverbs_attr_bundle	*uverbs_attr_bundle;
+ +	} *ctx = NULL;
+++=======
++ 	struct bundle_priv onstack_pbundle;
++ 	struct bundle_priv *ctx;
+++>>>>>>> 461bb2eee4e1 (IB/uverbs: Add a simple allocator to uverbs_attr_bundle)
+  	struct uverbs_attr *curr_attr;
+  	unsigned long *curr_bitmap;
+  	size_t ctx_size;
+- 	uintptr_t data[UVERBS_OPTIMIZE_USING_STACK_SZ / sizeof(uintptr_t)];
+  
+ -	if (hdr->driver_id != ib_dev->driver_id)
+ -		return -EINVAL;
+ -
+ -	object_spec = uverbs_get_object(file, hdr->object_id);
+ +	object_spec = uverbs_get_object(ib_dev, hdr->object_id);
+  	if (!object_spec)
+  		return -EPROTONOSUPPORT;
+  
+@@@ -349,32 -460,35 +454,45 @@@
+  	if (!method_spec)
+  		return -EPROTONOSUPPORT;
+  
+++<<<<<<< HEAD
+ +	if ((method_spec->flags & UVERBS_ACTION_FLAG_CREATE_ROOT) ^ !file->ucontext)
+ +		return -EINVAL;
+ +
+ +	ctx_size = sizeof(*ctx) +
+ +		   sizeof(struct uverbs_attr_bundle) +
+++=======
++ 	ctx_size = sizeof(*ctx) - sizeof(ctx->internal_buffer) +
+++>>>>>>> 461bb2eee4e1 (IB/uverbs: Add a simple allocator to uverbs_attr_bundle)
+  		   sizeof(struct uverbs_attr_bundle_hash) * method_spec->num_buckets +
+  		   sizeof(*ctx->uattrs) * hdr->num_attrs +
+ -		   sizeof(*ctx->bundle.hash[0].attrs) *
+ +		   sizeof(*ctx->uverbs_attr_bundle->hash[0].attrs) *
+  		   method_spec->num_child_attrs +
+ -		   sizeof(*ctx->bundle.hash[0].valid_bitmap) *
+ +		   sizeof(*ctx->uverbs_attr_bundle->hash[0].valid_bitmap) *
+  			(method_spec->num_child_attrs / BITS_PER_LONG +
+  			 method_spec->num_buckets);
+  
+- 	if (ctx_size <= UVERBS_OPTIMIZE_USING_STACK_SZ)
+- 		ctx = (void *)data;
+- 	if (!ctx)
++ 	if (ctx_size <= sizeof(onstack_pbundle)) {
++ 		ctx = &onstack_pbundle;
++ 		ctx->internal_avail =
++ 			sizeof(onstack_pbundle) -
++ 			offsetof(struct bundle_priv, internal_buffer);
++ 		ctx->allocated_mem = NULL;
++ 	} else {
+  		ctx = kmalloc(ctx_size, GFP_KERNEL);
+- 	if (!ctx)
+- 		return -ENOMEM;
++ 		if (!ctx)
++ 			return -ENOMEM;
++ 		ctx->internal_avail = 0;
++ 		ctx->alloc_head.next = NULL;
++ 		ctx->allocated_mem = &ctx->alloc_head;
++ 	}
+  
+ -	ctx->uattrs = (void *)(ctx + 1) +
+ -		      (sizeof(ctx->bundle.hash[0]) * method_spec->num_buckets);
+ +	ctx->uverbs_attr_bundle = (void *)ctx + sizeof(*ctx);
+ +	ctx->uattrs = (void *)(ctx->uverbs_attr_bundle + 1) +
+ +			      (sizeof(ctx->uverbs_attr_bundle->hash[0]) *
+ +			       method_spec->num_buckets);
+  	curr_attr = (void *)(ctx->uattrs + hdr->num_attrs);
+  	curr_bitmap = (void *)(curr_attr + method_spec->num_child_attrs);
++ 	ctx->internal_used = ALIGN(ctx_size, sizeof(*ctx->internal_buffer));
+  
+  	/*
+  	 * We just fill the pointers and num_attrs here. The data itself will be
+diff --cc include/rdma/uverbs_ioctl.h
+index 2cc45699a237,1dbf663f7f43..000000000000
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@@ -490,6 -644,57 +490,60 @@@ static inline int _uverbs_copy_from_or_
+  #define uverbs_copy_from_or_zero(to, attrs_bundle, idx)			      \
+  	_uverbs_copy_from_or_zero(to, attrs_bundle, idx, sizeof(*to))
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits);
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits);
++ int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle, size_t idx,
++ 		   const void *from, size_t size);
++ __malloc void *_uverbs_alloc(struct uverbs_attr_bundle *bundle, size_t size,
++ 			     gfp_t flags);
++ 
++ static inline __malloc void *uverbs_alloc(struct uverbs_attr_bundle *bundle,
++ 					  size_t size)
++ {
++ 	return _uverbs_alloc(bundle, size, GFP_KERNEL);
++ }
++ 
++ static inline __malloc void *uverbs_zalloc(struct uverbs_attr_bundle *bundle,
++ 					   size_t size)
++ {
++ 	return _uverbs_alloc(bundle, size, GFP_KERNEL | __GFP_ZERO);
++ }
++ #else
++ static inline int
++ uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		   size_t idx, u64 allowed_bits)
++ {
++ 	return -EINVAL;
++ }
++ static inline int
++ uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		   size_t idx, u64 allowed_bits)
++ {
++ 	return -EINVAL;
++ }
++ static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
++ 				 size_t idx, const void *from, size_t size)
++ {
++ 	return -EINVAL;
++ }
++ static inline __malloc void *uverbs_alloc(struct uverbs_attr_bundle *bundle,
++ 					  size_t size)
++ {
++ 	return ERR_PTR(-EINVAL);
++ }
++ static inline __malloc void *uverbs_zalloc(struct uverbs_attr_bundle *bundle,
++ 					   size_t size)
++ {
++ 	return ERR_PTR(-EINVAL);
++ }
++ #endif
++ 
+++>>>>>>> 461bb2eee4e1 (IB/uverbs: Add a simple allocator to uverbs_attr_bundle)
+  /* =================================================
+   *	 Definitions -> Specs infrastructure
+   * =================================================
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+* Unmerged path include/rdma/uverbs_ioctl.h
