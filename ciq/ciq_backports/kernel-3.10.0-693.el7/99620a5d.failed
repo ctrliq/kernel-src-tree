@@ -1,0 +1,159 @@
+perf tools: Introduce timestamp__scnprintf_usec()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit 99620a5d0cc8e2dd9aedb629a6e81825f0db020e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/99620a5d.failed
+
+Joonwoo reported that there's a mismatch between timestamps in script
+and sched commands.  This was because of difference in printing the
+timestamp.  Factor out the code and share it so that they can be in
+sync.  Also I found that sched map has similar problem, fix it too.
+
+Committer notes:
+
+Fixed the max_lat_at bug introduced by Namhyung's original patch, as
+pointed out by Joonwoo, and made it a function following the scnprintf()
+model, i.e. returning the number of bytes formatted, and receiving as
+the first parameter the object from where the data to the formatting is
+obtained, renaming it from:
+
+   char *timestamp_in_usec(char *bf, size_t size, u64 timestamp)
+
+to
+
+   int timestamp__scnprintf_usec(u64 timestamp, char *bf, size_t size)
+
+	Reported-by: Joonwoo Park <joonwoop@codeaurora.org>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/20161024020246.14928-3-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 99620a5d0cc8e2dd9aedb629a6e81825f0db020e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-script.c
+#	tools/perf/util/util.h
+diff --cc tools/perf/builtin-script.c
+index 877b738767ba,e1daff36d070..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -457,13 -468,16 +456,22 @@@ static void print_sample_start(struct p
+  
+  	if (PRINT_FIELD(TIME)) {
+  		nsecs = sample->time;
+++<<<<<<< HEAD
+ +		secs = nsecs / NSECS_PER_SEC;
+ +		nsecs -= secs * NSECS_PER_SEC;
+ +		usecs = nsecs / NSECS_PER_USEC;
+++=======
++ 		secs = nsecs / NSEC_PER_SEC;
++ 		nsecs -= secs * NSEC_PER_SEC;
++ 
+++>>>>>>> 99620a5d0cc8 (perf tools: Introduce timestamp__scnprintf_usec())
+  		if (nanosecs)
+  			printf("%5lu.%09llu: ", secs, nsecs);
+- 		else
+- 			printf("%5lu.%06lu: ", secs, usecs);
++ 		else {
++ 			char sample_time[32];
++ 			timestamp__scnprintf_usec(sample->time, sample_time, sizeof(sample_time));
++ 			printf("%12s: ", sample_time);
++ 		}
+  	}
+  }
+  
+diff --cc tools/perf/util/util.h
+index f09e9397b5e7,79662d67891e..000000000000
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@@ -350,4 -356,13 +350,16 @@@ typedef void (*print_binary_t)(enum bin
+  void print_binary(unsigned char *data, size_t len,
+  		  size_t bytes_per_line, print_binary_t printer,
+  		  void *extra);
+++<<<<<<< HEAD
+++=======
++ 
++ #if !defined(__GLIBC__) && !defined(__ANDROID__)
++ extern int sched_getcpu(void);
++ #endif
++ 
++ int is_printable_array(char *p, unsigned int len);
++ 
++ int timestamp__scnprintf_usec(u64 timestamp, char *buf, size_t sz);
++ 
+++>>>>>>> 99620a5d0cc8 (perf tools: Introduce timestamp__scnprintf_usec())
+  #endif /* GIT_COMPAT_UTIL_H */
+diff --git a/tools/perf/builtin-sched.c b/tools/perf/builtin-sched.c
+index 4c893b718329..ca1ce704ea9d 100644
+--- a/tools/perf/builtin-sched.c
++++ b/tools/perf/builtin-sched.c
+@@ -1191,6 +1191,7 @@ static void output_lat_thread(struct perf_sched *sched, struct work_atoms *work_
+ 	int i;
+ 	int ret;
+ 	u64 avg;
++	char max_lat_at[32];
+ 
+ 	if (!work_list->nb_atoms)
+ 		return;
+@@ -1212,12 +1213,13 @@ static void output_lat_thread(struct perf_sched *sched, struct work_atoms *work_
+ 		printf(" ");
+ 
+ 	avg = work_list->total_lat / work_list->nb_atoms;
++	timestamp__scnprintf_usec(work_list->max_lat_at, max_lat_at, sizeof(max_lat_at));
+ 
+-	printf("|%11.3f ms |%9" PRIu64 " | avg:%9.3f ms | max:%9.3f ms | max at: %13.6f s\n",
++	printf("|%11.3f ms |%9" PRIu64 " | avg:%9.3f ms | max:%9.3f ms | max at: %13s s\n",
+ 	      (double)work_list->total_runtime / NSEC_PER_MSEC,
+ 		 work_list->nb_atoms, (double)avg / NSEC_PER_MSEC,
+ 		 (double)work_list->max_lat / NSEC_PER_MSEC,
+-		 (double)work_list->max_lat_at / NSEC_PER_SEC);
++		 max_lat_at);
+ }
+ 
+ static int pid_cmp(struct work_atoms *l, struct work_atoms *r)
+@@ -1402,6 +1404,7 @@ static int map_switch_event(struct perf_sched *sched, struct perf_evsel *evsel,
+ 	int cpus_nr;
+ 	bool new_cpu = false;
+ 	const char *color = PERF_COLOR_NORMAL;
++	char stimestamp[32];
+ 
+ 	BUG_ON(this_cpu >= MAX_CPUS || this_cpu < 0);
+ 
+@@ -1492,7 +1495,8 @@ static int map_switch_event(struct perf_sched *sched, struct perf_evsel *evsel,
+ 	if (sched->map.cpus && !cpu_map__has(sched->map.cpus, this_cpu))
+ 		goto out;
+ 
+-	color_fprintf(stdout, color, "  %12.6f secs ", (double)timestamp / NSEC_PER_SEC);
++	timestamp__scnprintf_usec(timestamp, stimestamp, sizeof(stimestamp));
++	color_fprintf(stdout, color, "  %12s secs ", stimestamp);
+ 	if (new_shortname || (verbose && sched_in->tid)) {
+ 		const char *pid_color = color;
+ 
+* Unmerged path tools/perf/builtin-script.c
+diff --git a/tools/perf/util/util.c b/tools/perf/util/util.c
+index 6282ead1eed1..b192220cbe46 100644
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@ -428,6 +428,14 @@ int parse_nsec_time(const char *str, u64 *ptime)
+ 	return 0;
+ }
+ 
++int timestamp__scnprintf_usec(u64 timestamp, char *buf, size_t sz)
++{
++	u64  sec = timestamp / NSEC_PER_SEC;
++	u64 usec = (timestamp % NSEC_PER_SEC) / NSEC_PER_USEC;
++
++	return scnprintf(buf, sz, "%"PRIu64".%06"PRIu64, sec, usec);
++}
++
+ unsigned long parse_tag_value(const char *str, struct parse_tag *tags)
+ {
+ 	struct parse_tag *i = tags;
+* Unmerged path tools/perf/util/util.h
