@@ -1,0 +1,106 @@
+libnvdimm, pmem: Restore page attributes when clearing errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit c953cc987ab87d180e1d5de2f1c217abe33aac77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/c953cc98.failed
+
+Use clear_mce_nospec() to restore WB mode for the kernel linear mapping
+of a pmem page that was marked 'HWPoison'. A page with 'HWPoison' set
+has also been marked UC in PAT (page attribute table) via
+set_mce_nospec() to prevent speculative retrievals of poison.
+
+The 'HWPoison' flag is only cleared when overwriting an entire page.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit c953cc987ab87d180e1d5de2f1c217abe33aac77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/pmem.c
+diff --cc drivers/nvdimm/pmem.c
+index 1ad523d1cd98,55c7a69751d3..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -49,8 -52,32 +50,37 @@@ static struct nd_region *to_region(stru
+  	return to_nd_region(to_dev(pmem)->parent);
+  }
+  
+++<<<<<<< HEAD
+ +static int pmem_clear_poison(struct pmem_device *pmem, phys_addr_t offset,
+ +		unsigned int len)
+++=======
++ static void hwpoison_clear(struct pmem_device *pmem,
++ 		phys_addr_t phys, unsigned int len)
++ {
++ 	unsigned long pfn_start, pfn_end, pfn;
++ 
++ 	/* only pmem in the linear map supports HWPoison */
++ 	if (is_vmalloc_addr(pmem->virt_addr))
++ 		return;
++ 
++ 	pfn_start = PHYS_PFN(phys);
++ 	pfn_end = pfn_start + PHYS_PFN(len);
++ 	for (pfn = pfn_start; pfn < pfn_end; pfn++) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		/*
++ 		 * Note, no need to hold a get_dev_pagemap() reference
++ 		 * here since we're in the driver I/O path and
++ 		 * outstanding I/O requests pin the dev_pagemap.
++ 		 */
++ 		if (test_and_clear_pmem_poison(page))
++ 			clear_mce_nospec(pfn);
++ 	}
++ }
++ 
++ static blk_status_t pmem_clear_poison(struct pmem_device *pmem,
++ 		phys_addr_t offset, unsigned int len)
+++>>>>>>> c953cc987ab8 (libnvdimm, pmem: Restore page attributes when clearing errors)
+  {
+  	struct device *dev = to_dev(pmem);
+  	sector_t sector;
+@@@ -61,8 -88,9 +91,9 @@@
+  
+  	cleared = nvdimm_clear_poison(dev, pmem->phys_addr + offset, len);
+  	if (cleared < len)
+ -		rc = BLK_STS_IOERR;
+ +		rc = -EIO;
+  	if (cleared > 0 && cleared / 512) {
++ 		hwpoison_clear(pmem, pmem->phys_addr + offset, cleared);
+  		cleared /= 512;
+  		dev_dbg(dev, "%#llx clear %ld sector%s\n",
+  				(unsigned long long) sector, cleared,
+* Unmerged path drivers/nvdimm/pmem.c
+diff --git a/drivers/nvdimm/pmem.h b/drivers/nvdimm/pmem.h
+index 76f80e144979..0b97d7cda50e 100644
+--- a/drivers/nvdimm/pmem.h
++++ b/drivers/nvdimm/pmem.h
+@@ -1,5 +1,6 @@
+ #ifndef __NVDIMM_PMEM_H__
+ #define __NVDIMM_PMEM_H__
++#include <linux/page-flags.h>
+ #include <linux/badblocks.h>
+ #include <linux/types.h>
+ #include <linux/pfn_t.h>
+@@ -41,4 +42,16 @@ struct pmem_device {
+ 
+ long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
+ 		long nr_pages, void **kaddr, pfn_t *pfn);
++
++#ifdef CONFIG_MEMORY_FAILURE
++static inline bool test_and_clear_pmem_poison(struct page *page)
++{
++	return TestClearPageHWPoison(page);
++}
++#else
++static inline bool test_and_clear_pmem_poison(struct page *page)
++{
++	return false;
++}
++#endif
+ #endif /* __NVDIMM_PMEM_H__ */
