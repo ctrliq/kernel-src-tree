@@ -1,0 +1,303 @@
+amd-xgbe: Add support for new DMA interrupt mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 4c70dd8ac9ef88a1902b4d63dda987746a34ebc4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4c70dd8a.failed
+
+The current per channel DMA interrupt support is based on an edge
+triggered interrupt that is not maskable. This results in having to call
+the disable_irq/enable_irq functions in order to prevent interrupts
+during napi processing. The hardware now has a way to configure the per
+channel DMA interrupt that will allow for masking the interrupt which
+prevents calling disable_irq/enable_irq now. This patch makes use of
+this support.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4c70dd8ac9ef88a1902b4d63dda987746a34ebc4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-pci.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-platform.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index de7b81d8b4ee,ff7f5ab4d5fb..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -456,17 -671,23 +461,36 @@@ static void xgbe_enable_dma_interrupts(
+  
+  		if (channel->tx_ring) {
+  			/* Enable the following Tx interrupts
+++<<<<<<< HEAD
+ +			 *   TIE  - Transmit Interrupt Enable (unless polling)
+ +			 */
+ +			XGMAC_SET_BITS(dma_ch_ier, DMA_CH_IER, TIE, 1);
+++=======
++ 			 *   TIE  - Transmit Interrupt Enable (unless using
++ 			 *          per channel interrupts in edge triggered
++ 			 *          mode)
++ 			 */
++ 			if (!pdata->per_channel_irq || pdata->channel_irq_mode)
++ 				XGMAC_SET_BITS(dma_ch_ier, DMA_CH_IER, TIE, 1);
+++>>>>>>> 4c70dd8ac9ef (amd-xgbe: Add support for new DMA interrupt mode)
+  		}
+  		if (channel->rx_ring) {
+  			/* Enable following Rx interrupts
+  			 *   RBUE - Receive Buffer Unavailable Enable
+++<<<<<<< HEAD
+ +			 *   RIE  - Receive Interrupt Enable
+ +			 */
+ +			XGMAC_SET_BITS(dma_ch_ier, DMA_CH_IER, RBUE, 1);
+ +			XGMAC_SET_BITS(dma_ch_ier, DMA_CH_IER, RIE, 1);
+++=======
++ 			 *   RIE  - Receive Interrupt Enable (unless using
++ 			 *          per channel interrupts in edge triggered
++ 			 *          mode)
++ 			 */
++ 			XGMAC_SET_BITS(dma_ch_ier, DMA_CH_IER, RBUE, 1);
++ 			if (!pdata->per_channel_irq || pdata->channel_irq_mode)
++ 				XGMAC_SET_BITS(dma_ch_ier, DMA_CH_IER, RIE, 1);
+++>>>>>>> 4c70dd8ac9ef (amd-xgbe: Add support for new DMA interrupt mode)
+  		}
+  
+  		XGMAC_DMA_IOWRITE(channel, DMA_CH_IER, dma_ch_ier);
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index d58e85811bc9,490fdb5cb63a..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -234,10 -349,20 +246,17 @@@ static irqreturn_t xgbe_isr(int irq, vo
+  				xgbe_disable_rx_tx_ints(pdata);
+  
+  				/* Turn on polling */
+ -				__napi_schedule_irqoff(&pdata->napi);
+ +				__napi_schedule(&pdata->napi);
+  			}
++ 		} else {
++ 			/* Don't clear Rx/Tx status if doing per channel DMA
++ 			 * interrupts, these will be cleared by the ISR for
++ 			 * per channel DMA interrupts.
++ 			 */
++ 			XGMAC_SET_BITS(dma_ch_isr, DMA_CH_SR, TI, 0);
++ 			XGMAC_SET_BITS(dma_ch_isr, DMA_CH_SR, RI, 0);
+  		}
+  
+ -		if (XGMAC_GET_BITS(dma_ch_isr, DMA_CH_SR, RBU))
+ -			pdata->ext_stats.rx_buffer_unavailable++;
+ -
+  		/* Restart the device on a Fatal Bus Error */
+  		if (XGMAC_GET_BITS(dma_ch_isr, DMA_CH_SR, FBE))
+  			schedule_work(&pdata->restart_work);
+@@@ -264,25 -401,57 +283,68 @@@ isr_done
+  	return IRQ_HANDLED;
+  }
+  
+ -static irqreturn_t xgbe_dma_isr(int irq, void *data)
+ +static enum hrtimer_restart xgbe_tx_timer(struct hrtimer *timer)
+  {
+++<<<<<<< HEAD
+ +	struct xgbe_channel *channel = container_of(timer,
+ +						    struct xgbe_channel,
+ +						    tx_timer);
+ +	struct xgbe_ring *ring = channel->tx_ring;
+++=======
++ 	struct xgbe_channel *channel = data;
++ 	struct xgbe_prv_data *pdata = channel->pdata;
++ 	unsigned int dma_status;
++ 
++ 	/* Per channel DMA interrupts are enabled, so we use the per
++ 	 * channel napi structure and not the private data napi structure
++ 	 */
++ 	if (napi_schedule_prep(&channel->napi)) {
++ 		/* Disable Tx and Rx interrupts */
++ 		if (pdata->channel_irq_mode)
++ 			xgbe_disable_rx_tx_int(pdata, channel);
++ 		else
++ 			disable_irq_nosync(channel->dma_irq);
++ 
++ 		/* Turn on polling */
++ 		__napi_schedule_irqoff(&channel->napi);
++ 	}
++ 
++ 	/* Clear Tx/Rx signals */
++ 	dma_status = 0;
++ 	XGMAC_SET_BITS(dma_status, DMA_CH_SR, TI, 1);
++ 	XGMAC_SET_BITS(dma_status, DMA_CH_SR, RI, 1);
++ 	XGMAC_DMA_IOWRITE(channel, DMA_CH_SR, dma_status);
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static void xgbe_tx_timer(unsigned long data)
++ {
++ 	struct xgbe_channel *channel = (struct xgbe_channel *)data;
+++>>>>>>> 4c70dd8ac9ef (amd-xgbe: Add support for new DMA interrupt mode)
+  	struct xgbe_prv_data *pdata = channel->pdata;
+ -	struct napi_struct *napi;
+ +	unsigned long flags;
+  
+  	DBGPR("-->xgbe_tx_timer\n");
+  
+ -	napi = (pdata->per_channel_irq) ? &channel->napi : &pdata->napi;
+ +	spin_lock_irqsave(&ring->lock, flags);
+  
+ -	if (napi_schedule_prep(napi)) {
+ +	if (napi_schedule_prep(&pdata->napi)) {
+  		/* Disable Tx and Rx interrupts */
+++<<<<<<< HEAD
+ +		xgbe_disable_rx_tx_ints(pdata);
+++=======
++ 		if (pdata->per_channel_irq)
++ 			if (pdata->channel_irq_mode)
++ 				xgbe_disable_rx_tx_int(pdata, channel);
++ 			else
++ 				disable_irq_nosync(channel->dma_irq);
++ 		else
++ 			xgbe_disable_rx_tx_ints(pdata);
+++>>>>>>> 4c70dd8ac9ef (amd-xgbe: Add support for new DMA interrupt mode)
+  
+  		/* Turn on polling */
+ -		__napi_schedule(napi);
+ +		__napi_schedule(&pdata->napi);
+  	}
+  
+  	channel->tx_timer_active = 0;
+@@@ -1269,18 -2023,75 +1331,54 @@@ read_again
+  		skb->dev = netdev;
+  		skb->protocol = eth_type_trans(skb, netdev);
+  		skb_record_rx_queue(skb, channel->queue_index);
+ +		skb_mark_napi_id(skb, &pdata->napi);
+  
+ -		napi_gro_receive(napi, skb);
+ -
+ -next_packet:
+ -		packet_count++;
+ -	}
+ -
+ -	/* Check if we need to save state before leaving */
+ -	if (received && (incomplete || context_next)) {
+ -		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ -		rdata->state_saved = 1;
+ -		rdata->state.skb = skb;
+ -		rdata->state.len = len;
+ -		rdata->state.error = error;
+ +		netdev->last_rx = jiffies;
+ +		napi_gro_receive(&pdata->napi, skb);
+  	}
+  
+ -	DBGPR("<--xgbe_rx_poll: packet_count = %d\n", packet_count);
+ +	DBGPR("<--xgbe_rx_poll: received = %d\n", received);
+  
+ -	return packet_count;
+ +	return received;
+  }
+  
+++<<<<<<< HEAD
+ +static int xgbe_poll(struct napi_struct *napi, int budget)
+++=======
++ static int xgbe_one_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct xgbe_channel *channel = container_of(napi, struct xgbe_channel,
++ 						    napi);
++ 	struct xgbe_prv_data *pdata = channel->pdata;
++ 	int processed = 0;
++ 
++ 	DBGPR("-->xgbe_one_poll: budget=%d\n", budget);
++ 
++ 	/* Cleanup Tx ring first */
++ 	xgbe_tx_poll(channel);
++ 
++ 	/* Process Rx ring next */
++ 	processed = xgbe_rx_poll(channel, budget);
++ 
++ 	/* If we processed everything, we are done */
++ 	if (processed < budget) {
++ 		/* Turn off polling */
++ 		napi_complete_done(napi, processed);
++ 
++ 		/* Enable Tx and Rx interrupts */
++ 		if (pdata->channel_irq_mode)
++ 			xgbe_enable_rx_tx_int(pdata, channel);
++ 		else
++ 			enable_irq(channel->dma_irq);
++ 	}
++ 
++ 	DBGPR("<--xgbe_one_poll: received = %d\n", processed);
++ 
++ 	return processed;
++ }
++ 
++ static int xgbe_all_poll(struct napi_struct *napi, int budget)
+++>>>>>>> 4c70dd8ac9ef (amd-xgbe: Add support for new DMA interrupt mode)
+  {
+  	struct xgbe_prv_data *pdata = container_of(napi, struct xgbe_prv_data,
+  						   napi);
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1903f878545a,381144b83947..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -526,12 -856,32 +530,32 @@@ struct xgbe_prv_data 
+  	/* Overall device lock */
+  	spinlock_t lock;
+  
+ -	/* XPCS indirect addressing lock */
+ -	spinlock_t xpcs_lock;
+ -	unsigned int xpcs_window;
+ -	unsigned int xpcs_window_size;
+ -	unsigned int xpcs_window_mask;
+ +	/* XPCS indirect addressing mutex */
+ +	struct mutex xpcs_mutex;
+  
+++<<<<<<< HEAD
+ +	int irq_number;
+++=======
++ 	/* RSS addressing mutex */
++ 	struct mutex rss_mutex;
++ 
++ 	/* Flags representing xgbe_state */
++ 	unsigned long dev_state;
++ 
++ 	struct msix_entry *msix_entries;
++ 	int dev_irq;
++ 	int ecc_irq;
++ 	int i2c_irq;
++ 	int channel_irq[XGBE_MAX_DMA_CHANNELS];
++ 
++ 	unsigned int per_channel_irq;
++ 	unsigned int irq_shared;
++ 	unsigned int irq_count;
++ 	unsigned int channel_irq_count;
++ 	unsigned int channel_irq_mode;
+++>>>>>>> 4c70dd8ac9ef (amd-xgbe: Add support for new DMA interrupt mode)
+  
+  	struct xgbe_hw_if hw_if;
+ -	struct xgbe_phy_if phy_if;
+  	struct xgbe_desc_if desc_if;
+  
+  	/* AXI DMA settings */
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-pci.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-platform.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-common.h b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index 3373e9ef2003..70bb75d9dd72 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@ -166,6 +166,8 @@
+ #define DMA_ISR_MACIS_WIDTH		1
+ #define DMA_ISR_MTLIS_INDEX		16
+ #define DMA_ISR_MTLIS_WIDTH		1
++#define DMA_MR_INTM_INDEX		12
++#define DMA_MR_INTM_WIDTH		2
+ #define DMA_MR_SWR_INDEX		0
+ #define DMA_MR_SWR_WIDTH		1
+ #define DMA_SBMR_EAME_INDEX		11
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-pci.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-platform.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
