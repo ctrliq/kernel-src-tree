@@ -1,0 +1,142 @@
+r8169: improve WoL handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit fa6821cbf1d9724284ef0906c9a01a5fbf13a35c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/fa6821cb.failed
+
+WoL handling for the RTL8168 family is a little bit tricky because of
+different types of broken BIOS and/or chip quirks.
+
+Two known issues:
+1. Network properly resumes from suspend only if WoL is enabled in the chip.
+2. Some notebooks wake up immediately if system is suspended and network
+   device is wakeup-enabled.
+
+Few patches tried to deal with this:
+7edf6d314cd0 ("r8169: disable WOL per default")
+18041b523692 ("r8169: restore previous behavior to accept BIOS WoL
+settings")
+
+Currently we have the situation that the chip WoL settings as set by
+the BIOS are respected (to prevent issue 1), but the device doesn't get
+wakeup-enabled (to prevent issue 2).
+
+This leads to another issue:
+If systemd is told to set WoL it first checks whether the requested
+settings are active already (and does nothing if yes). Due to the chip
+WoL flags being set properly systemd assumes that WoL is configured
+properly in our case. Result is that device doesn't get wakeup-enabled
+and WoL doesn't work (until it's set e.g. by ethtool).
+
+This patch now:
+- leaves the chip WoL settings as is (to prevent issue 1)
+- keeps the behavior to not wakeup-enable the device initially
+  (to prevent issue 2)
+- In addition we report WoL as being disabled in get_wol, matching
+  that device isn't wakeup-enabled. If systemd is told to enable WoL,
+  it will therefore detect that it has to do something and will
+  call set_wol.
+
+Of course the user still has the option to override this with
+e.g. ethtool.
+
+v2:
+- Don't just exclude __rtl8169_get_wol() from compiling, remove it.
+v3:
+- adjust commit message
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fa6821cbf1d9724284ef0906c9a01a5fbf13a35c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/realtek/r8169.c
+diff --cc drivers/net/ethernet/realtek/r8169.c
+index f80daa5053d5,9dc68981751b..000000000000
+--- a/drivers/net/ethernet/realtek/r8169.c
++++ b/drivers/net/ethernet/realtek/r8169.c
+@@@ -1469,62 -1369,8 +1469,27 @@@ static void rtl_link_chg_patch(struct r
+  	}
+  }
+  
+ +static void rtl8169_check_link_status(struct net_device *dev,
+ +				      struct rtl8169_private *tp)
+ +{
+ +	struct device *d = tp_to_dev(tp);
+ +
+ +	if (rtl8169_xmii_link_ok(tp)) {
+ +		rtl_link_chg_patch(tp);
+ +		/* This is to cancel a scheduled suspend if there's one. */
+ +		pm_request_resume(d);
+ +		netif_carrier_on(dev);
+ +		if (net_ratelimit())
+ +			netif_info(tp, ifup, dev, "link up\n");
+ +	} else {
+ +		netif_carrier_off(dev);
+ +		netif_info(tp, ifdown, dev, "link down\n");
+ +		pm_runtime_idle(d);
+ +	}
+ +}
+ +
+  #define WAKE_ANY (WAKE_PHY | WAKE_MAGIC | WAKE_UCAST | WAKE_BCAST | WAKE_MCAST)
+  
+- static u32 __rtl8169_get_wol(struct rtl8169_private *tp)
+- {
+- 	u8 options;
+- 	u32 wolopts = 0;
+- 
+- 	options = RTL_R8(tp, Config1);
+- 	if (!(options & PMEnable))
+- 		return 0;
+- 
+- 	options = RTL_R8(tp, Config3);
+- 	if (options & LinkUp)
+- 		wolopts |= WAKE_PHY;
+- 	switch (tp->mac_version) {
+- 	case RTL_GIGA_MAC_VER_34 ... RTL_GIGA_MAC_VER_38:
+- 	case RTL_GIGA_MAC_VER_40 ... RTL_GIGA_MAC_VER_51:
+- 		if (rtl_eri_read(tp, 0xdc, ERIAR_EXGMAC) & MagicPacket_v2)
+- 			wolopts |= WAKE_MAGIC;
+- 		break;
+- 	default:
+- 		if (options & MagicPacket)
+- 			wolopts |= WAKE_MAGIC;
+- 		break;
+- 	}
+- 
+- 	options = RTL_R8(tp, Config5);
+- 	if (options & UWF)
+- 		wolopts |= WAKE_UCAST;
+- 	if (options & BWF)
+- 		wolopts |= WAKE_BCAST;
+- 	if (options & MWF)
+- 		wolopts |= WAKE_MCAST;
+- 
+- 	return wolopts;
+- }
+- 
+  static void rtl8169_get_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+  {
+  	struct rtl8169_private *tp = netdev_priv(dev);
+@@@ -4335,10 -4249,10 +4300,14 @@@ static void rtl_wol_suspend_quirk(struc
+  
+  static bool rtl_wol_pll_power_down(struct rtl8169_private *tp)
+  {
+++<<<<<<< HEAD
+ +	if (!netif_running(tp->dev) || !__rtl8169_get_wol(tp))
+++=======
++ 	if (!device_may_wakeup(tp_to_dev(tp)))
+++>>>>>>> fa6821cbf1d9 (r8169: improve WoL handling)
+  		return false;
+  
+ -	phy_speed_down(tp->phydev, false);
+ +	rtl_speed_down(tp);
+  	rtl_wol_suspend_quirk(tp);
+  
+  	return true;
+* Unmerged path drivers/net/ethernet/realtek/r8169.c
