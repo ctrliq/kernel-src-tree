@@ -1,0 +1,243 @@
+ovl: clean up kstat usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Al Viro <viro@ZenIV.linux.org.uk>
+commit 32a3d848eb91a298334991f1891e12e0362f91db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/32a3d848.failed
+
+FWIW, there's a bit of abuse of struct kstat in overlayfs object
+creation paths - for one thing, it ends up with a very small subset
+of struct kstat (mode + rdev), for another it also needs link in
+case of symlinks and ends up passing it separately.
+
+IMO it would be better to introduce a separate object for that.
+
+In principle, we might even lift that thing into general API and switch
+ ->mkdir()/->mknod()/->symlink() to identical calling conventions.  Hell
+knows, perhaps ->create() as well...
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 32a3d848eb91a298334991f1891e12e0362f91db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/dir.c
+diff --cc fs/overlayfs/dir.c
+index c82fdefe6d3b,16e06dd89457..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -171,9 -183,13 +170,8 @@@ static void ovl_instantiate(struct dent
+  	d_instantiate(dentry, inode);
+  }
+  
+ -static bool ovl_type_merge(struct dentry *dentry)
+ -{
+ -	return OVL_TYPE_MERGE(ovl_path_type(dentry));
+ -}
+ -
+  static int ovl_create_upper(struct dentry *dentry, struct inode *inode,
+- 			    struct kstat *stat, const char *link,
+- 			    struct dentry *hardlink)
++ 			    struct cattr *attr, struct dentry *hardlink)
+  {
+  	struct dentry *upperdir = ovl_dentry_upper(dentry->d_parent);
+  	struct inode *udir = upperdir->d_inode;
+@@@ -181,9 -197,9 +179,9 @@@
+  	int err;
+  
+  	if (!hardlink && !IS_POSIXACL(udir))
+- 		stat->mode &= ~current_umask();
++ 		attr->mode &= ~current_umask();
+  
+ -	inode_lock_nested(udir, I_MUTEX_PARENT);
+ +	mutex_lock_nested(&udir->i_mutex, I_MUTEX_PARENT);
+  	newdentry = lookup_one_len(dentry->d_name.name, upperdir,
+  				   dentry->d_name.len);
+  	err = PTR_ERR(newdentry);
+@@@ -358,52 -380,8 +357,52 @@@ out_free
+  	return err;
+  }
+  
+ +static int ovl_posix_acl_create(struct inode *dir, umode_t *mode,
+ +				struct posix_acl **default_acl,
+ +				struct posix_acl **acl)
+ +{
+ +	struct posix_acl *p;
+ +	struct posix_acl *clone;
+ +	int ret;
+ +
+ +	*acl = NULL;
+ +	*default_acl = NULL;
+ +
+ +	if (S_ISLNK(*mode) || !IS_POSIXACL(dir))
+ +		return 0;
+ +
+ +	p = ovl_get_acl(dir, ACL_TYPE_DEFAULT);
+ +	if (!p || p == ERR_PTR(-EOPNOTSUPP)) {
+ +		*mode &= ~current_umask();
+ +		return 0;
+ +	}
+ +	if (IS_ERR(p))
+ +		return PTR_ERR(p);
+ +
+ +	clone = posix_acl_dup(p);
+ +	ret = posix_acl_create(&clone, GFP_NOFS, mode);
+ +	if (ret)
+ +		goto err_release;
+ +
+ +	if (ret == 0)
+ +		posix_acl_release(clone);
+ +	else
+ +		*acl = clone;
+ +
+ +	if (!S_ISDIR(*mode))
+ +		posix_acl_release(p);
+ +	else
+ +		*default_acl = p;
+ +
+ +	return 0;
+ +
+ +err_release:
+ +	posix_acl_release(p);
+ +	return ret;
+ +}
+ +
+  static int ovl_create_over_whiteout(struct dentry *dentry, struct inode *inode,
+- 				    struct kstat *stat, const char *link,
++ 				    struct cattr *cattr,
+  				    struct dentry *hardlink)
+  {
+  	struct dentry *workdir = ovl_workdir(dentry);
+@@@ -419,8 -397,8 +418,13 @@@
+  		return -EROFS;
+  
+  	if (!hardlink) {
+++<<<<<<< HEAD
+ +		err = ovl_posix_acl_create(dentry->d_parent->d_inode,
+ +					   &stat->mode, &default_acl, &acl);
+++=======
++ 		err = posix_acl_create(dentry->d_parent->d_inode,
++ 				       &cattr->mode, &default_acl, &acl);
+++>>>>>>> 32a3d848eb91 (ovl: clean up kstat usage)
+  		if (err)
+  			return err;
+  	}
+@@@ -448,14 -426,15 +452,15 @@@
+  	 * mode could have been mutilated due to umask (e.g. sgid directory)
+  	 */
+  	if (!hardlink &&
+- 	    !S_ISLNK(stat->mode) && newdentry->d_inode->i_mode != stat->mode) {
++ 	    !S_ISLNK(cattr->mode) &&
++ 	    newdentry->d_inode->i_mode != cattr->mode) {
+  		struct iattr attr = {
+  			.ia_valid = ATTR_MODE,
+- 			.ia_mode = stat->mode,
++ 			.ia_mode = cattr->mode,
+  		};
+ -		inode_lock(newdentry->d_inode);
+ +		mutex_lock(&newdentry->d_inode->i_mutex);
+  		err = notify_change(newdentry, &attr, NULL);
+ -		inode_unlock(newdentry->d_inode);
+ +		mutex_unlock(&newdentry->d_inode->i_mutex);
+  		if (err)
+  			goto out_cleanup;
+  	}
+@@@ -471,8 -450,8 +476,13 @@@
+  			goto out_cleanup;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!hardlink && S_ISDIR(stat->mode)) {
+ +		err = ovl_set_opaque(newdentry);
+++=======
++ 	if (!hardlink && S_ISDIR(cattr->mode)) {
++ 		err = ovl_set_opaque(dentry, newdentry);
+++>>>>>>> 32a3d848eb91 (ovl: clean up kstat usage)
+  		if (err)
+  			goto out_cleanup;
+  
+diff --git a/fs/overlayfs/copy_up.c b/fs/overlayfs/copy_up.c
+index 6e96b99a973d..78f9c5e2a54b 100644
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@ -272,10 +272,15 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+ 	struct inode *udir = upperdir->d_inode;
+ 	struct dentry *newdentry = NULL;
+ 	struct dentry *upper = NULL;
+-	umode_t mode = stat->mode;
+ 	int err;
+ 	const struct cred *old_creds = NULL;
+ 	struct cred *new_creds = NULL;
++	struct cattr cattr = {
++		/* Can't properly set mode on creation because of the umask */
++		.mode = stat->mode & S_IFMT,
++		.rdev = stat->rdev,
++		.link = link
++	};
+ 
+ 	newdentry = ovl_lookup_temp(workdir, dentry);
+ 	err = PTR_ERR(newdentry);
+@@ -295,10 +300,7 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+ 	if (new_creds)
+ 		old_creds = override_creds(new_creds);
+ 
+-	/* Can't properly set mode on creation because of the umask */
+-	stat->mode &= S_IFMT;
+-	err = ovl_create_real(wdir, newdentry, stat, link, NULL, true);
+-	stat->mode = mode;
++	err = ovl_create_real(wdir, newdentry, &cattr, NULL, true);
+ 
+ 	if (new_creds) {
+ 		revert_creds(old_creds);
+* Unmerged path fs/overlayfs/dir.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 952ccab31629..c9e11c07fd12 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -210,8 +210,13 @@ static inline void ovl_copyattr(struct inode *from, struct inode *to)
+ /* dir.c */
+ extern const struct inode_operations_wrapper ovl_dir_inode_operations;
+ struct dentry *ovl_lookup_temp(struct dentry *workdir, struct dentry *dentry);
++struct cattr {
++	dev_t rdev;
++	umode_t mode;
++	const char *link;
++};
+ int ovl_create_real(struct inode *dir, struct dentry *newdentry,
+-		    struct kstat *stat, const char *link,
++		    struct cattr *attr,
+ 		    struct dentry *hardlink, bool debug);
+ void ovl_cleanup(struct inode *dir, struct dentry *dentry);
+ 
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 5f9d4797d2e3..a7046e832b21 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -871,12 +871,9 @@ retry:
+ 			      strlen(OVL_WORKDIR_NAME));
+ 
+ 	if (!IS_ERR(work)) {
+-		struct kstat stat = {
+-			.mode = S_IFDIR | 0,
+-		};
+ 		struct iattr attr = {
+ 			.ia_valid = ATTR_MODE,
+-			.ia_mode = stat.mode,
++			.ia_mode = S_IFDIR | 0,
+ 		};
+ 
+ 		if (work->d_inode) {
+@@ -890,7 +887,9 @@ retry:
+ 			goto retry;
+ 		}
+ 
+-		err = ovl_create_real(dir, work, &stat, NULL, NULL, true);
++		err = ovl_create_real(dir, work,
++				      &(struct cattr){.mode = S_IFDIR | 0},
++				      NULL, true);
+ 		if (err)
+ 			goto out_dput;
+ 
