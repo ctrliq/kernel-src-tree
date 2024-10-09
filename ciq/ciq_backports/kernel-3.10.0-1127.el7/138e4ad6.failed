@@ -1,0 +1,76 @@
+epoll: fix race between ep_poll_callback(POLLFREE) and ep_free()/ep_remove()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 138e4ad67afd5c6c318b056b4d17c17f2c0ca5c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/138e4ad6.failed
+
+The race was introduced by me in commit 971316f0503a ("epoll:
+ep_unregister_pollwait() can use the freed pwq->whead").  I did not
+realize that nothing can protect eventpoll after ep_poll_callback() sets
+->whead = NULL, only whead->lock can save us from the race with
+ep_free() or ep_remove().
+
+Move ->whead = NULL to the end of ep_poll_callback() and add the
+necessary barriers.
+
+TODO: cleanup the ewake/EPOLLEXCLUSIVE logic, it was confusing even
+before this patch.
+
+Hopefully this explains use-after-free reported by syzcaller:
+
+	BUG: KASAN: use-after-free in debug_spin_lock_before
+	...
+	 _raw_spin_lock_irqsave+0x4a/0x60 kernel/locking/spinlock.c:159
+	 ep_poll_callback+0x29f/0xff0 fs/eventpoll.c:1148
+
+this is spin_lock(eventpoll->lock),
+
+	...
+	Freed by task 17774:
+	...
+	 kfree+0xe8/0x2c0 mm/slub.c:3883
+	 ep_free+0x22c/0x2a0 fs/eventpoll.c:865
+
+Fixes: 971316f0503a ("epoll: ep_unregister_pollwait() can use the freed pwq->whead")
+	Reported-by: 范龙飞 <long7573@126.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 138e4ad67afd5c6c318b056b4d17c17f2c0ca5c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/eventpoll.c
+diff --cc fs/eventpoll.c
+index 6cbac2876889,adbe328b957c..000000000000
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@@ -1012,18 -1139,9 +1017,21 @@@ static int ep_poll_callback(wait_queue_
+  	struct eventpoll *ep = epi->ep;
+  	int ewake = 0;
+  
+ -	spin_lock_irqsave(&ep->lock, flags);
+++<<<<<<< HEAD
+ +	if ((unsigned long)key & POLLFREE) {
+ +		ep_pwq_from_wait(wait)->whead = NULL;
+ +		/*
+ +		 * whead = NULL above can race with ep_remove_wait_queue()
+ +		 * which can do another remove_wait_queue() after us, so we
+ +		 * can't use __remove_wait_queue(). whead->lock is held by
+ +		 * the caller.
+ +		 */
+ +		list_del_init(&wait->task_list);
+ +	}
+  
+ -	ep_set_busy_poll_napi_id(epi);
+++=======
+++>>>>>>> 138e4ad67afd (epoll: fix race between ep_poll_callback(POLLFREE) and ep_free()/ep_remove())
+ +	spin_lock_irqsave(&ep->lock, flags);
+  
+  	/*
+  	 * If the event mask does not contain any poll(2) event, we consider the
+* Unmerged path fs/eventpoll.c
