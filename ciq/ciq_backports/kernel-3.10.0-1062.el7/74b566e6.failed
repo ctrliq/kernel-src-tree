@@ -1,0 +1,126 @@
+kvm: x86: Refactor mmu_free_roots()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit 74b566e6cf21f07df385d593a7fcf8bbfc5d3f0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/74b566e6.failed
+
+Extract the logic to free a root page in a separate function to avoid code
+duplication in mmu_free_roots(). Also, change it to an exported function
+i.e. kvm_mmu_free_roots().
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 74b566e6cf21f07df385d593a7fcf8bbfc5d3f0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 7ce89b13ce35,98717cafdbcb..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3319,54 -3338,51 +3318,71 @@@ static int nonpaging_map(struct kvm_vcp
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+  	kvm_release_pfn_clean(pfn);
+ -	return RET_PF_RETRY;
+ +	return 0;
+  }
+  
++ static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
++ 			       struct list_head *invalid_list)
++ {
++ 	struct kvm_mmu_page *sp;
++ 
++ 	if (!VALID_PAGE(*root_hpa))
++ 		return;
+  
+- static void mmu_free_roots(struct kvm_vcpu *vcpu)
++ 	sp = page_header(*root_hpa & PT64_BASE_ADDR_MASK);
++ 	--sp->root_count;
++ 	if (!sp->root_count && sp->role.invalid)
++ 		kvm_mmu_prepare_zap_page(kvm, sp, invalid_list);
++ 
++ 	*root_hpa = INVALID_PAGE;
++ }
++ 
++ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu)
+  {
+  	int i;
+- 	struct kvm_mmu_page *sp;
+  	LIST_HEAD(invalid_list);
++ 	struct kvm_mmu *mmu = &vcpu->arch.mmu;
+  
+- 	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
++ 	if (!VALID_PAGE(mmu->root_hpa))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (vcpu->arch.mmu.shadow_root_level == PT64_ROOT_LEVEL &&
+ +	    (vcpu->arch.mmu.root_level == PT64_ROOT_LEVEL ||
+ +	     vcpu->arch.mmu.direct_map)) {
+ +		hpa_t root = vcpu->arch.mmu.root_hpa;
+ +
+ +		spin_lock(&vcpu->kvm->mmu_lock);
+ +		sp = page_header(root);
+ +		--sp->root_count;
+ +		if (!sp->root_count && sp->role.invalid) {
+ +			kvm_mmu_prepare_zap_page(vcpu->kvm, sp, &invalid_list);
+ +			kvm_mmu_commit_zap_page(vcpu->kvm, &invalid_list);
+ +		}
+ +		spin_unlock(&vcpu->kvm->mmu_lock);
+ +		vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+ +		return;
+ +	}
+ +
+++=======
+++>>>>>>> 74b566e6cf21 (kvm: x86: Refactor mmu_free_roots())
+  	spin_lock(&vcpu->kvm->mmu_lock);
+- 	for (i = 0; i < 4; ++i) {
+- 		hpa_t root = vcpu->arch.mmu.pae_root[i];
+  
+- 		if (root) {
+- 			root &= PT64_BASE_ADDR_MASK;
+- 			sp = page_header(root);
+- 			--sp->root_count;
+- 			if (!sp->root_count && sp->role.invalid)
+- 				kvm_mmu_prepare_zap_page(vcpu->kvm, sp,
+- 							 &invalid_list);
+- 		}
+- 		vcpu->arch.mmu.pae_root[i] = INVALID_PAGE;
++ 	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
++ 	    (mmu->root_level >= PT64_ROOT_4LEVEL || mmu->direct_map)) {
++ 		mmu_free_root_page(vcpu->kvm, &mmu->root_hpa, &invalid_list);
++ 	} else {
++ 		for (i = 0; i < 4; ++i)
++ 			if (mmu->pae_root[i] != 0)
++ 				mmu_free_root_page(vcpu->kvm, &mmu->pae_root[i],
++ 						   &invalid_list);
++ 		mmu->root_hpa = INVALID_PAGE;
+  	}
++ 
+  	kvm_mmu_commit_zap_page(vcpu->kvm, &invalid_list);
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+- 	vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+  }
++ EXPORT_SYMBOL_GPL(kvm_mmu_free_roots);
+  
+  static int mmu_check_root(struct kvm_vcpu *vcpu, gfn_t root_gfn)
+  {
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4091026435c1..74163152dc2b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1167,6 +1167,7 @@ void __kvm_mmu_free_some_pages(struct kvm_vcpu *vcpu);
+ int kvm_mmu_load(struct kvm_vcpu *vcpu);
+ void kvm_mmu_unload(struct kvm_vcpu *vcpu);
+ void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu);
++void kvm_mmu_free_roots(struct kvm_vcpu *vcpu);
+ gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+ 			   struct x86_exception *exception);
+ gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
+* Unmerged path arch/x86/kvm/mmu.c
