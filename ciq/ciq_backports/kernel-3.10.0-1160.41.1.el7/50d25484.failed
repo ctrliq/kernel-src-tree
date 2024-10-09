@@ -1,0 +1,347 @@
+xfs: sync lazy sb accounting on quiesce of read-only mounts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.41.1.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 50d25484bebe94320c49dd1347d3330c7063bbdb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.41.1.el7/50d25484.failed
+
+xfs_log_sbcount() syncs the superblock specifically to accumulate
+the in-core percpu superblock counters and commit them to disk. This
+is required to maintain filesystem consistency across quiesce
+(freeze, read-only mount/remount) or unmount when lazy superblock
+accounting is enabled because individual transactions do not update
+the superblock directly.
+
+This mechanism works as expected for writable mounts, but
+xfs_log_sbcount() skips the update for read-only mounts. Read-only
+mounts otherwise still allow log recovery and write out an unmount
+record during log quiesce. If a read-only mount performs log
+recovery, it can modify the in-core superblock counters and write an
+unmount record when the filesystem unmounts without ever syncing the
+in-core counters. This leaves the filesystem with a clean log but in
+an inconsistent state with regard to lazy sb counters.
+
+Update xfs_log_sbcount() to use the same logic
+xfs_log_unmount_write() uses to determine when to write an unmount
+record. This ensures that lazy accounting is always synced before
+the log is cleaned. Refactor this logic into a new helper to
+distinguish between a writable filesystem and a writable log.
+Specifically, the log is writable unless the filesystem is mounted
+with the norecovery mount option, the underlying log device is
+read-only, or the filesystem is shutdown. Drop the freeze state
+check because the update is already allowed during the freezing
+process and no context calls this function on an already frozen fs.
+Also, retain the shutdown check in xfs_log_unmount_write() to catch
+the case where the preceding log force might have triggered a
+shutdown.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Gao Xiang <hsiangkao@redhat.com>
+	Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 50d25484bebe94320c49dd1347d3330c7063bbdb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log.c
+diff --cc fs/xfs/xfs_log.c
+index d1e48532afc3,62bcdaa07dc9..000000000000
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@@ -809,154 -806,129 +828,159 @@@ xfs_log_mount_cancel
+  }
+  
+  /*
+ - * Write out an unmount record using the ticket provided. We have to account for
+ - * the data space used in the unmount ticket as this write is not done from a
+ - * transaction context that has already done the accounting for us.
+ + * Final log writes as part of unmount.
+ + *
+ + * Mark the filesystem clean as unmount happens.  Note that during relocation
+ + * this routine needs to be executed as part of source-bag while the
+ + * deallocation must not be done until source-end.
+   */
+ -static int
+ -xlog_write_unmount_record(
+ -	struct xlog		*log,
+ -	struct xlog_ticket	*ticket,
+ -	xfs_lsn_t		*lsn,
+ -	uint			flags)
+ -{
+ -	struct xfs_unmount_log_format ulf = {
+ -		.magic = XLOG_UNMOUNT_TYPE,
+ -	};
+ -	struct xfs_log_iovec reg = {
+ -		.i_addr = &ulf,
+ -		.i_len = sizeof(ulf),
+ -		.i_type = XLOG_REG_TYPE_UNMOUNT,
+ -	};
+ -	struct xfs_log_vec vec = {
+ -		.lv_niovecs = 1,
+ -		.lv_iovecp = &reg,
+ -	};
+ -
+ -	/* account for space used by record data */
+ -	ticket->t_curr_res -= sizeof(ulf);
+ -	return xlog_write(log, &vec, ticket, lsn, NULL, flags, false);
+ -}
+  
+  /*
+ - * Mark the filesystem clean by writing an unmount record to the head of the
+ - * log.
+ + * Unmount record used to have a string "Unmount filesystem--" in the
+ + * data section where the "Un" was really a magic number (XLOG_UNMOUNT_TYPE).
+ + * We just write the magic number now since that particular field isn't
+ + * currently architecture converted and "Unmount" is a bit foo.
+ + * As far as I know, there weren't any dependencies on the old behaviour.
+   */
+ -static void
+ -xlog_unmount_write(
+ -	struct xlog		*log)
+ -{
+ -	struct xfs_mount	*mp = log->l_mp;
+ -	struct xlog_in_core	*iclog;
+ -	struct xlog_ticket	*tic = NULL;
+ -	xfs_lsn_t		lsn;
+ -	uint			flags = XLOG_UNMOUNT_TRANS;
+ -	int			error;
+  
+ -	error = xfs_log_reserve(mp, 600, 1, &tic, XFS_LOG, 0);
+ -	if (error)
+ -		goto out_err;
+ +static int
+ +xfs_log_unmount_write(xfs_mount_t *mp)
+ +{
+ +	struct xlog	 *log = mp->m_log;
+ +	xlog_in_core_t	 *iclog;
+ +#ifdef DEBUG
+ +	xlog_in_core_t	 *first_iclog;
+ +#endif
+ +	xlog_ticket_t	*tic = NULL;
+ +	xfs_lsn_t	 lsn;
+ +	int		 error;
+  
+ -	error = xlog_write_unmount_record(log, tic, &lsn, flags);
+++<<<<<<< HEAD
+  	/*
+ -	 * At this point, we're umounting anyway, so there's no point in
+ -	 * transitioning log state to IOERROR. Just continue...
+ +	 * Don't write out unmount record on norecovery mounts or ro devices.
+ +	 * Or, if we are doing a forced umount (typically because of IO errors).
+  	 */
+ -out_err:
+ -	if (error)
+ -		xfs_alert(mp, "%s: unmount record failed", __func__);
+ -
+ -	spin_lock(&log->l_icloglock);
+ -	iclog = log->l_iclog;
+ -	atomic_inc(&iclog->ic_refcnt);
+ -	if (iclog->ic_state == XLOG_STATE_ACTIVE)
+ -		xlog_state_switch_iclogs(log, iclog, 0);
+ -	else
+ -		ASSERT(iclog->ic_state == XLOG_STATE_WANT_SYNC ||
+ -		       iclog->ic_state == XLOG_STATE_IOERROR);
+ -	error = xlog_state_release_iclog(log, iclog);
+ -	xlog_wait_on_iclog(iclog);
+ -
+ -	if (tic) {
+ -		trace_xfs_log_umount_write(log, tic);
+ -		xfs_log_ticket_ungrant(log, tic);
+ +	if (mp->m_flags & XFS_MOUNT_NORECOVERY ||
+ +	    xfs_readonly_buftarg(log->l_mp->m_logdev_targp)) {
+ +		ASSERT(mp->m_flags & XFS_MOUNT_RDONLY);
+ +		return 0;
+  	}
+ -}
+++=======
+++	if (!xfs_log_writable(mp))
+++		return;
+++>>>>>>> 50d25484bebe (xfs: sync lazy sb accounting on quiesce of read-only mounts)
+  
+ -static void
+ -xfs_log_unmount_verify_iclog(
+ -	struct xlog		*log)
+ -{
+ -	struct xlog_in_core	*iclog = log->l_iclog;
+ +	error = xfs_log_force(mp, XFS_LOG_SYNC);
+ +	ASSERT(error || !(XLOG_FORCED_SHUTDOWN(log)));
+  
+ +#ifdef DEBUG
+ +	first_iclog = iclog = log->l_iclog;
+  	do {
+ -		ASSERT(iclog->ic_state == XLOG_STATE_ACTIVE);
+ -		ASSERT(iclog->ic_offset == 0);
+ -	} while ((iclog = iclog->ic_next) != log->l_iclog);
+ -}
+ +		if (!(iclog->ic_state & XLOG_STATE_IOERROR)) {
+ +			ASSERT(iclog->ic_state & XLOG_STATE_ACTIVE);
+ +			ASSERT(iclog->ic_offset == 0);
+ +		}
+ +		iclog = iclog->ic_next;
+ +	} while (iclog != first_iclog);
+ +#endif
+ +	if (! (XLOG_FORCED_SHUTDOWN(log))) {
+ +		error = xfs_log_reserve(mp, 600, 1, &tic, XFS_LOG, 0);
+ +		if (!error) {
+ +			/* the data section must be 32 bit size aligned */
+ +			struct {
+ +			    uint16_t magic;
+ +			    uint16_t pad1;
+ +			    uint32_t pad2; /* may as well make it 64 bits */
+ +			} magic = {
+ +				.magic = XLOG_UNMOUNT_TYPE,
+ +			};
+ +			struct xfs_log_iovec reg = {
+ +				.i_addr = &magic,
+ +				.i_len = sizeof(magic),
+ +				.i_type = XLOG_REG_TYPE_UNMOUNT,
+ +			};
+ +			struct xfs_log_vec vec = {
+ +				.lv_niovecs = 1,
+ +				.lv_iovecp = &reg,
+ +			};
+ +
+ +			/* remove inited flag, and account for space used */
+ +			tic->t_flags = 0;
+ +			tic->t_curr_res -= sizeof(magic);
+ +			error = xlog_write(log, &vec, tic, &lsn,
+ +					   NULL, XLOG_UNMOUNT_TRANS);
+ +			/*
+ +			 * At this point, we're umounting anyway,
+ +			 * so there's no point in transitioning log state
+ +			 * to IOERROR. Just continue...
+ +			 */
+ +		}
+  
+ -/*
+ - * Unmount record used to have a string "Unmount filesystem--" in the
+ - * data section where the "Un" was really a magic number (XLOG_UNMOUNT_TYPE).
+ - * We just write the magic number now since that particular field isn't
+ - * currently architecture converted and "Unmount" is a bit foo.
+ - * As far as I know, there weren't any dependencies on the old behaviour.
+ - */
+ -static void
+ -xfs_log_unmount_write(
+ -	struct xfs_mount	*mp)
+ -{
+ -	struct xlog		*log = mp->m_log;
+ +		if (error)
+ +			xfs_alert(mp, "%s: unmount record failed", __func__);
+  
+ -	if (!xfs_log_writable(mp))
+ -		return;
+  
+ -	xfs_log_force(mp, XFS_LOG_SYNC);
+ +		spin_lock(&log->l_icloglock);
+ +		iclog = log->l_iclog;
+ +		atomic_inc(&iclog->ic_refcnt);
+ +		xlog_state_want_sync(log, iclog);
+ +		spin_unlock(&log->l_icloglock);
+ +		error = xlog_state_release_iclog(log, iclog);
+  
+ -	if (XLOG_FORCED_SHUTDOWN(log))
+ -		return;
+ +		spin_lock(&log->l_icloglock);
+ +		if (!(iclog->ic_state == XLOG_STATE_ACTIVE ||
+ +		      iclog->ic_state == XLOG_STATE_DIRTY)) {
+ +			if (!XLOG_FORCED_SHUTDOWN(log)) {
+ +				xlog_wait(&iclog->ic_force_wait,
+ +							&log->l_icloglock);
+ +			} else {
+ +				spin_unlock(&log->l_icloglock);
+ +			}
+ +		} else {
+ +			spin_unlock(&log->l_icloglock);
+ +		}
+ +		if (tic) {
+ +			trace_xfs_log_umount_write(log, tic);
+ +			xlog_ungrant_log_space(log, tic);
+ +			xfs_log_ticket_put(tic);
+ +		}
+ +	} else {
+ +		/*
+ +		 * We're already in forced_shutdown mode, couldn't
+ +		 * even attempt to write out the unmount transaction.
+ +		 *
+ +		 * Go through the motions of sync'ing and releasing
+ +		 * the iclog, even though no I/O will actually happen,
+ +		 * we need to wait for other log I/Os that may already
+ +		 * be in progress.  Do this as a separate section of
+ +		 * code so we'll know if we ever get stuck here that
+ +		 * we're in this odd situation of trying to unmount
+ +		 * a file system that went into forced_shutdown as
+ +		 * the result of an unmount..
+ +		 */
+ +		spin_lock(&log->l_icloglock);
+ +		iclog = log->l_iclog;
+ +		atomic_inc(&iclog->ic_refcnt);
+  
+ -	/*
+ -	 * If we think the summary counters are bad, avoid writing the unmount
+ -	 * record to force log recovery at next mount, after which the summary
+ -	 * counters will be recalculated.  Refer to xlog_check_unmount_rec for
+ -	 * more details.
+ -	 */
+ -	if (XFS_TEST_ERROR(xfs_fs_has_sickness(mp, XFS_SICK_FS_COUNTERS), mp,
+ -			XFS_ERRTAG_FORCE_SUMMARY_RECALC)) {
+ -		xfs_alert(mp, "%s: will fix summary counters at next mount",
+ -				__func__);
+ -		return;
+ +		xlog_state_want_sync(log, iclog);
+ +		spin_unlock(&log->l_icloglock);
+ +		error =  xlog_state_release_iclog(log, iclog);
+ +
+ +		spin_lock(&log->l_icloglock);
+ +
+ +		if ( ! (   iclog->ic_state == XLOG_STATE_ACTIVE
+ +			|| iclog->ic_state == XLOG_STATE_DIRTY
+ +			|| iclog->ic_state == XLOG_STATE_IOERROR) ) {
+ +
+ +				xlog_wait(&iclog->ic_force_wait,
+ +							&log->l_icloglock);
+ +		} else {
+ +			spin_unlock(&log->l_icloglock);
+ +		}
+  	}
+  
+ -	xfs_log_unmount_verify_iclog(log);
+ -	xlog_unmount_write(log);
+ -}
+ +	return error;
+ +}	/* xfs_log_unmount_write */
+  
+  /*
+   * Empty the log for unmount/freeze.
+* Unmerged path fs/xfs/xfs_log.c
+diff --git a/fs/xfs/xfs_log.h b/fs/xfs/xfs_log.h
+index 7e2d62922a16..3b5c66a02088 100644
+--- a/fs/xfs/xfs_log.h
++++ b/fs/xfs/xfs_log.h
+@@ -155,6 +155,7 @@ int	  xfs_log_reserve(struct xfs_mount *mp,
+ int	  xfs_log_regrant(struct xfs_mount *mp, struct xlog_ticket *tic);
+ void      xfs_log_unmount(struct xfs_mount *mp);
+ int	  xfs_log_force_umount(struct xfs_mount *mp, int logerror);
++bool	xfs_log_writable(struct xfs_mount *mp);
+ 
+ struct xlog_ticket *xfs_log_ticket_get(struct xlog_ticket *ticket);
+ void	  xfs_log_ticket_put(struct xlog_ticket *ticket);
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index 6dca3bb3316b..847c137ab7ec 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -1169,8 +1169,7 @@ xfs_fs_writable(
+ int
+ xfs_log_sbcount(xfs_mount_t *mp)
+ {
+-	/* allow this to proceed during the freeze sequence... */
+-	if (!xfs_fs_writable(mp, SB_FREEZE_COMPLETE))
++	if (!xfs_log_writable(mp))
+ 		return 0;
+ 
+ 	/*
