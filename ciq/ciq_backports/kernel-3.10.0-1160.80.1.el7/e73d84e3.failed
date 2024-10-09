@@ -1,0 +1,293 @@
+posix-timers: Remove remaining uses of tasklist_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit e73d84e33f15c099ed1df60437700093cb14e46e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/e73d84e3.failed
+
+The remaining uses of tasklist_lock were mostly about synchronizing
+against sighand modifications, getting coherent and safe group samples
+and also thread/process wide timers list handling.
+
+All of this is already safely synchronizable with the target's
+sighand lock. Let's use it on these places instead.
+
+Also update the comments about locking.
+
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Kosaki Motohiro <kosaki.motohiro@jp.fujitsu.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit e73d84e33f15c099ed1df60437700093cb14e46e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/posix-cpu-timers.c
+diff --cc kernel/posix-cpu-timers.c
+index 9aab0941718b,d9dc5edc318c..000000000000
+--- a/kernel/posix-cpu-timers.c
++++ b/kernel/posix-cpu-timers.c
+@@@ -689,32 -611,29 +690,45 @@@ static inline void posix_cpu_timer_kick
+   * If we return TIMER_RETRY, it's necessary to release the timer's lock
+   * and try again.  (This happens when the timer is in the middle of firing.)
+   */
+- static int posix_cpu_timer_set(struct k_itimer *timer, int flags,
++ static int posix_cpu_timer_set(struct k_itimer *timer, int timer_flags,
+  			       struct itimerspec *new, struct itimerspec *old)
+  {
++ 	unsigned long flags;
++ 	struct sighand_struct *sighand;
+  	struct task_struct *p = timer->it.cpu.task;
+ -	unsigned long long old_expires, new_expires, old_incr, val;
+ +	union cpu_time_count old_expires, new_expires, old_incr, val;
+  	int ret;
+  
+ -	WARN_ON_ONCE(p == NULL);
+ +	if (unlikely(p == NULL)) {
+ +		/*
+ +		 * Timer refers to a dead task's clock.
+ +		 */
+ +		return -ESRCH;
+ +	}
+  
+  	new_expires = timespec_to_sample(timer->it_clock, &new->it_value);
+  
+++<<<<<<< HEAD
+ +	qread_lock(&tasklist_lock);
+++=======
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
++ 	/*
++ 	 * Protect against sighand release/switch in exit/exec and p->cpu_timers
++ 	 * and p->signal->cpu_timers read/write in arm_timer()
++ 	 */
++ 	sighand = lock_task_sighand(p, &flags);
+  	/*
+- 	 * We need the tasklist_lock to protect against reaping that
+- 	 * clears p->sighand.  If p has just been reaped, we can no
++ 	 * If p has just been reaped, we can no
+  	 * longer get any information about it at all.
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(p->sighand == NULL)) {
+ +		qread_unlock(&tasklist_lock);
+ +		put_task_struct(p);
+ +		timer->it.cpu.task = NULL;
+++=======
++ 	if (unlikely(sighand == NULL)) {
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  		return -ESRCH;
+  	}
+  
+@@@ -785,13 -700,12 +798,22 @@@
+  		 * disable this firing since we are already reporting
+  		 * it as an overrun (thanks to bump_cpu_timer above).
+  		 */
+++<<<<<<< HEAD
+ +		spin_unlock(&p->sighand->siglock);
+ +		qread_unlock(&tasklist_lock);
+ +		goto out;
+ +	}
+ +
+ +	if (new_expires.sched != 0 && !(flags & TIMER_ABSTIME)) {
+ +		cpu_time_add(timer->it_clock, &new_expires, val);
+++=======
++ 		unlock_task_sighand(p, &flags);
++ 		goto out;
++ 	}
++ 
++ 	if (new_expires != 0 && !(timer_flags & TIMER_ABSTIME)) {
++ 		new_expires += val;
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  	}
+  
+  	/*
+@@@ -805,9 -718,7 +827,13 @@@
+  		arm_timer(timer);
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_unlock(&p->sighand->siglock);
+ +	qread_unlock(&tasklist_lock);
+ +
+++=======
++ 	unlock_task_sighand(p, &flags);
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  	/*
+  	 * Install the new reload setting, and
+  	 * set up the signal and overrun bookkeeping.
+@@@ -879,42 -779,34 +905,65 @@@ static void posix_cpu_timer_get(struct 
+  	 */
+  	if (CPUCLOCK_PERTHREAD(timer->it_clock)) {
+  		cpu_clock_sample(timer->it_clock, p, &now);
+ +		clear_dead = p->exit_state;
+  	} else {
+++<<<<<<< HEAD
+ +		qread_lock(&tasklist_lock);
+ +		if (unlikely(p->sighand == NULL)) {
+++=======
++ 		struct sighand_struct *sighand;
++ 		unsigned long flags;
++ 
++ 		/*
++ 		 * Protect against sighand release/switch in exit/exec and
++ 		 * also make timer sampling safe if it ends up calling
++ 		 * thread_group_cputime().
++ 		 */
++ 		sighand = lock_task_sighand(p, &flags);
++ 		if (unlikely(sighand == NULL)) {
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  			/*
+  			 * The process has been reaped.
+  			 * We can't even collect a sample any more.
+  			 * Call the timer disarmed, nothing else to do.
+  			 */
+++<<<<<<< HEAD
+ +			put_task_struct(p);
+ +			timer->it.cpu.task = NULL;
+ +			timer->it.cpu.expires.sched = 0;
+ +			qread_unlock(&tasklist_lock);
+ +			goto dead;
+ +		} else {
+ +			cpu_timer_sample_group(timer->it_clock, p, &now);
+ +			clear_dead = (unlikely(p->exit_state) &&
+ +				      thread_group_empty(p));
+ +		}
+ +		qread_unlock(&tasklist_lock);
+++=======
++ 			timer->it.cpu.expires = 0;
++ 			sample_to_timespec(timer->it_clock, timer->it.cpu.expires,
++ 					   &itp->it_value);
++ 		} else {
++ 			cpu_timer_sample_group(timer->it_clock, p, &now);
++ 			unlock_task_sighand(p, &flags);
++ 		}
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+ +	}
+ +
+ +	if (unlikely(clear_dead)) {
+ +		/*
+ +		 * We've noticed that the thread is dead, but
+ +		 * not yet reaped.  Take this opportunity to
+ +		 * drop our task ref.
+ +		 */
+ +		clear_dead_task(timer, now);
+ +		goto dead;
+  	}
+  
+ -	if (now < timer->it.cpu.expires) {
+ +	if (cpu_time_before(timer->it_clock, now, timer->it.cpu.expires)) {
+  		sample_to_timespec(timer->it_clock,
+ -				   timer->it.cpu.expires - now,
+ +				   cpu_time_sub(timer->it_clock,
+ +						timer->it.cpu.expires, now),
+  				   &itp->it_value);
+  	} else {
+  		/*
+@@@ -1174,14 -1015,12 +1223,16 @@@ static void check_process_timers(struc
+   */
+  void posix_cpu_timer_schedule(struct k_itimer *timer)
+  {
++ 	struct sighand_struct *sighand;
++ 	unsigned long flags;
+  	struct task_struct *p = timer->it.cpu.task;
+ -	unsigned long long now;
+ +	union cpu_time_count now;
+  
+ -	WARN_ON_ONCE(p == NULL);
+ +	if (unlikely(p == NULL))
+ +		/*
+ +		 * The task was cleaned up already, no future firings.
+ +		 */
+ +		goto out;
+  
+  	/*
+  	 * Fetch the current sample and update the timer's expiry time.
+@@@ -1189,36 -1028,34 +1240,59 @@@
+  	if (CPUCLOCK_PERTHREAD(timer->it_clock)) {
+  		cpu_clock_sample(timer->it_clock, p, &now);
+  		bump_cpu_timer(timer, now);
+ -		if (unlikely(p->exit_state))
+ +		if (unlikely(p->exit_state)) {
+ +			clear_dead_task(timer, now);
+  			goto out;
+++<<<<<<< HEAD
+ +		}
+ +		qread_lock(&tasklist_lock); /* arm_timer needs it.  */
+ +		spin_lock(&p->sighand->siglock);
+ +	} else {
+ +		qread_lock(&tasklist_lock);
+ +		if (unlikely(p->sighand == NULL)) {
+++=======
++ 
++ 		/* Protect timer list r/w in arm_timer() */
++ 		sighand = lock_task_sighand(p, &flags);
++ 		if (!sighand)
++ 			goto out;
++ 	} else {
++ 		/*
++ 		 * Protect arm_timer() and timer sampling in case of call to
++ 		 * thread_group_cputime().
++ 		 */
++ 		sighand = lock_task_sighand(p, &flags);
++ 		if (unlikely(sighand == NULL)) {
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  			/*
+  			 * The process has been reaped.
+  			 * We can't even collect a sample any more.
+  			 */
+++<<<<<<< HEAD
+ +			put_task_struct(p);
+ +			timer->it.cpu.task = p = NULL;
+ +			timer->it.cpu.expires.sched = 0;
+ +			goto out_unlock;
+ +		} else if (unlikely(p->exit_state) && thread_group_empty(p)) {
+ +			/*
+ +			 * We've noticed that the thread is dead, but
+ +			 * not yet reaped.  Take this opportunity to
+ +			 * drop our task ref.
+ +			 */
+ +			clear_dead_task(timer, now);
+ +			goto out_unlock;
+++=======
++ 			timer->it.cpu.expires = 0;
++ 			goto out;
++ 		} else if (unlikely(p->exit_state) && thread_group_empty(p)) {
++ 			unlock_task_sighand(p, &flags);
++ 			/* Optimizations: if the process is dying, no need to rearm */
++ 			goto out;
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  		}
+- 		spin_lock(&p->sighand->siglock);
+  		cpu_timer_sample_group(timer->it_clock, p, &now);
+  		bump_cpu_timer(timer, now);
+- 		/* Leave the tasklist_lock locked for the call below.  */
++ 		/* Leave the sighand locked for the call below.  */
+  	}
+  
+  	/*
+@@@ -1226,11 -1063,10 +1300,18 @@@
+  	 */
+  	BUG_ON(!irqs_disabled());
+  	arm_timer(timer);
+++<<<<<<< HEAD
+ +	spin_unlock(&p->sighand->siglock);
+ +
+ +out_unlock:
+ +	qread_unlock(&tasklist_lock);
+ +
+++=======
++ 	unlock_task_sighand(p, &flags);
++ 
++ 	/* Kick full dynticks CPUs in case they need to tick on the new timer */
++ 	posix_cpu_timer_kick_nohz();
+++>>>>>>> e73d84e33f15 (posix-timers: Remove remaining uses of tasklist_lock)
+  out:
+  	timer->it_overrun_last = timer->it_overrun;
+  	timer->it_overrun = -1;
+* Unmerged path kernel/posix-cpu-timers.c
