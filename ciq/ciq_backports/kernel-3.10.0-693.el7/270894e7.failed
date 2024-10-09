@@ -1,0 +1,257 @@
+amd-xgbe: Simplify the Rx desciptor ring tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 270894e7dc7afad8fb79592fe02aa05e604ddfc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/270894e7.failed
+
+Make the Rx descriptor ring processing similar to the Tx descriptor
+ring processing.  Remove the realloc_index and realloc_threshold
+variables and base everything on the current index counter and the
+dirty index counter.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 270894e7dc7afad8fb79592fe02aa05e604ddfc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index 28954354521f,d81fc6bd4759..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -326,8 -422,6 +326,11 @@@ static void xgbe_wrapper_rx_descriptor_
+  
+  		ring->cur = 0;
+  		ring->dirty = 0;
+++<<<<<<< HEAD
+ +		ring->rx.realloc_index = 0;
+ +		ring->rx.realloc_threshold = 0;
+++=======
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  
+  		hw_if->rx_desc_init(channel);
+  	}
+@@@ -497,53 -620,6 +500,56 @@@ err_out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void xgbe_realloc_skb(struct xgbe_channel *channel)
+ +{
+ +	struct xgbe_prv_data *pdata = channel->pdata;
+ +	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ +	struct xgbe_ring *ring = channel->rx_ring;
+ +	struct xgbe_ring_data *rdata;
+ +	struct sk_buff *skb = NULL;
+ +	dma_addr_t skb_dma;
+ +	int i;
+ +
+ +	DBGPR("-->xgbe_realloc_skb: rx_ring->rx.realloc_index = %u\n",
+ +	      ring->rx.realloc_index);
+ +
+ +	for (i = 0; i < ring->dirty; i++) {
+ +		rdata = XGBE_GET_DESC_DATA(ring, ring->rx.realloc_index);
+ +
+ +		/* Reset rdata values */
+ +		xgbe_unmap_skb(pdata, rdata);
+ +
+ +		/* Allocate skb & assign to each rdesc */
+ +		skb = dev_alloc_skb(pdata->rx_buf_size);
+ +		if (skb == NULL) {
+ +			netdev_alert(pdata->netdev,
+ +				     "failed to allocate skb\n");
+ +			break;
+ +		}
+ +		skb_dma = dma_map_single(pdata->dev, skb->data,
+ +					 pdata->rx_buf_size, DMA_FROM_DEVICE);
+ +		if (dma_mapping_error(pdata->dev, skb_dma)) {
+ +			netdev_alert(pdata->netdev,
+ +				     "failed to do the dma map\n");
+ +			dev_kfree_skb_any(skb);
+ +			break;
+ +		}
+ +		rdata->skb = skb;
+ +		rdata->skb_dma = skb_dma;
+ +		rdata->skb_dma_len = pdata->rx_buf_size;
+ +
+ +		hw_if->rx_desc_reset(rdata);
+ +
+ +		ring->rx.realloc_index++;
+ +	}
+ +	ring->dirty = 0;
+ +
+ +	DBGPR("<--xgbe_realloc_skb\n");
+ +}
+ +
+++=======
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  void xgbe_init_function_ptrs_desc(struct xgbe_desc_if *desc_if)
+  {
+  	DBGPR("-->xgbe_init_function_ptrs_desc\n");
+@@@ -551,8 -627,8 +557,13 @@@
+  	desc_if->alloc_ring_resources = xgbe_alloc_ring_resources;
+  	desc_if->free_ring_resources = xgbe_free_ring_resources;
+  	desc_if->map_tx_skb = xgbe_map_tx_skb;
+++<<<<<<< HEAD
+ +	desc_if->realloc_skb = xgbe_realloc_skb;
+ +	desc_if->unmap_skb = xgbe_unmap_skb;
+++=======
++ 	desc_if->map_rx_buffer = xgbe_map_rx_buffer;
++ 	desc_if->unmap_rdata = xgbe_unmap_rdata;
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  	desc_if->wrapper_tx_desc_init = xgbe_wrapper_tx_descriptor_init;
+  	desc_if->wrapper_rx_desc_init = xgbe_wrapper_rx_descriptor_init;
+  
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index add1b5ac7b5d,e2f560ff5104..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -133,6 -225,33 +133,36 @@@ static inline unsigned int xgbe_tx_avai
+  	return (ring->rdesc_count - (ring->cur - ring->dirty));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned int xgbe_rx_dirty_desc(struct xgbe_ring *ring)
++ {
++ 	return (ring->cur - ring->dirty);
++ }
++ 
++ static int xgbe_maybe_stop_tx_queue(struct xgbe_channel *channel,
++ 				    struct xgbe_ring *ring, unsigned int count)
++ {
++ 	struct xgbe_prv_data *pdata = channel->pdata;
++ 
++ 	if (count > xgbe_tx_avail_desc(ring)) {
++ 		DBGPR("  Tx queue stopped, not enough descriptors available\n");
++ 		netif_stop_subqueue(pdata->netdev, channel->queue_index);
++ 		ring->tx.queue_stopped = 1;
++ 
++ 		/* If we haven't notified the hardware because of xmit_more
++ 		 * support, tell it now
++ 		 */
++ 		if (ring->tx.xmit_more)
++ 			pdata->hw_if.tx_start_xmit(channel, ring);
++ 
++ 		return NETDEV_TX_BUSY;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  static int xgbe_calc_rx_buf_size(struct net_device *netdev, unsigned int mtu)
+  {
+  	unsigned int rx_buf_size;
+@@@ -1088,7 -1785,19 +1119,23 @@@ static void xgbe_rx_refresh(struct xgbe
+  	struct xgbe_ring *ring = channel->rx_ring;
+  	struct xgbe_ring_data *rdata;
+  
+++<<<<<<< HEAD
+ +	desc_if->realloc_skb(channel);
+++=======
++ 	while (ring->dirty != ring->cur) {
++ 		rdata = XGBE_GET_DESC_DATA(ring, ring->dirty);
++ 
++ 		/* Reset rdata values */
++ 		desc_if->unmap_rdata(pdata, rdata);
++ 
++ 		if (desc_if->map_rx_buffer(pdata, ring, rdata))
++ 			break;
++ 
++ 		hw_if->rx_desc_reset(rdata);
++ 
++ 		ring->dirty++;
++ 	}
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  
+  	/* Update the Rx Tail Pointer Register with address of
+  	 * the last cleaned entry */
+@@@ -1173,33 -1925,41 +1220,38 @@@ static int xgbe_rx_poll(struct xgbe_cha
+  	if (!ring)
+  		return 0;
+  
+ -	napi = (pdata->per_channel_irq) ? &channel->napi : &pdata->napi;
+ -
+ -	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+  	packet = &ring->packet_data;
+ -	while (packet_count < budget) {
+ +	while (received < budget) {
+  		DBGPR("  cur = %d\n", ring->cur);
+  
+ -		/* First time in loop see if we need to restore state */
+ -		if (!received && rdata->state_saved) {
+ -			incomplete = rdata->state.incomplete;
+ -			context_next = rdata->state.context_next;
+ -			skb = rdata->state.skb;
+ -			error = rdata->state.error;
+ -			len = rdata->state.len;
+ -		} else {
+ -			memset(packet, 0, sizeof(*packet));
+ -			incomplete = 0;
+ -			context_next = 0;
+ -			skb = NULL;
+ -			error = 0;
+ -			len = 0;
+ -		}
+ +		/* Clear the packet data information */
+ +		memset(packet, 0, sizeof(*packet));
+ +		skb = NULL;
+ +		error = 0;
+ +		cur_len = 0;
+  
+  read_again:
+++<<<<<<< HEAD
+ +		if (ring->dirty > (XGBE_RX_DESC_CNT >> 3))
+++=======
++ 		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
++ 
++ 		if (xgbe_rx_dirty_desc(ring) > (XGBE_RX_DESC_CNT >> 3))
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  			xgbe_rx_refresh(channel);
+  
+ +		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ +
+  		if (hw_if->dev_read(channel))
+  			break;
+  
+  		received++;
+  		ring->cur++;
+- 		ring->dirty++;
+  
+ +		dma_unmap_single(pdata->dev, rdata->skb_dma,
+ +				 rdata->skb_dma_len, DMA_FROM_DEVICE);
+ +		rdata->skb_dma = 0;
+ +
+  		incomplete = XGMAC_GET_BITS(packet->attributes,
+  					    RX_PACKET_ATTRIBUTES,
+  					    INCOMPLETE);
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1d8899bca25d,e6ee64e1d6ec..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -467,8 -590,9 +461,14 @@@ struct xgbe_desc_if 
+  	int (*alloc_ring_resources)(struct xgbe_prv_data *);
+  	void (*free_ring_resources)(struct xgbe_prv_data *);
+  	int (*map_tx_skb)(struct xgbe_channel *, struct sk_buff *);
+++<<<<<<< HEAD
+ +	void (*realloc_skb)(struct xgbe_channel *);
+ +	void (*unmap_skb)(struct xgbe_prv_data *, struct xgbe_ring_data *);
+++=======
++ 	int (*map_rx_buffer)(struct xgbe_prv_data *, struct xgbe_ring *,
++ 			     struct xgbe_ring_data *);
++ 	void (*unmap_rdata)(struct xgbe_prv_data *, struct xgbe_ring_data *);
+++>>>>>>> 270894e7dc7a (amd-xgbe: Simplify the Rx desciptor ring tracking)
+  	void (*wrapper_tx_desc_init)(struct xgbe_prv_data *);
+  	void (*wrapper_rx_desc_init)(struct xgbe_prv_data *);
+  };
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
