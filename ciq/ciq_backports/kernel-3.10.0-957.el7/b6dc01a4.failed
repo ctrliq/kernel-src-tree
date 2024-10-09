@@ -1,0 +1,115 @@
+l2tp: do data sequence number handling in a separate func
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author James Chapman <jchapman@katalix.com>
+commit b6dc01a43aaca24e6e6928e24d9b37ba599f1e3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b6dc01a4.failed
+
+This change moves some code handling data sequence numbers into a
+separate function to avoid too much indentation. This is to prepare
+for some changes to data sequence number handling in subsequent
+patches.
+
+	Signed-off-by: James Chapman <jchapman@katalix.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b6dc01a43aaca24e6e6928e24d9b37ba599f1e3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/l2tp/l2tp_core.c
+diff --cc net/l2tp/l2tp_core.c
+index c352516afaa2,5ca29659171d..000000000000
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@@ -609,6 -496,84 +609,87 @@@ out
+  	spin_unlock_bh(&session->reorder_q.lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int l2tp_verify_udp_checksum(struct sock *sk,
++ 					   struct sk_buff *skb)
++ {
++ 	struct udphdr *uh = udp_hdr(skb);
++ 	u16 ulen = ntohs(uh->len);
++ 	__wsum psum;
++ 
++ 	if (sk->sk_no_check || skb_csum_unnecessary(skb))
++ 		return 0;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if (sk->sk_family == PF_INET6) {
++ 		if (!uh->check) {
++ 			LIMIT_NETDEBUG(KERN_INFO "L2TP: IPv6: checksum is 0\n");
++ 			return 1;
++ 		}
++ 		if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
++ 		    !csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
++ 				     &ipv6_hdr(skb)->daddr, ulen,
++ 				     IPPROTO_UDP, skb->csum)) {
++ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 			return 0;
++ 		}
++ 		skb->csum = ~csum_unfold(csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
++ 							 &ipv6_hdr(skb)->daddr,
++ 							 skb->len, IPPROTO_UDP,
++ 							 0));
++ 	} else
++ #endif
++ 	{
++ 		struct inet_sock *inet;
++ 		if (!uh->check)
++ 			return 0;
++ 		inet = inet_sk(sk);
++ 		psum = csum_tcpudp_nofold(inet->inet_saddr, inet->inet_daddr,
++ 					  ulen, IPPROTO_UDP, 0);
++ 
++ 		if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
++ 		    !csum_fold(csum_add(psum, skb->csum)))
++ 			return 0;
++ 		skb->csum = psum;
++ 	}
++ 
++ 	return __skb_checksum_complete(skb);
++ }
++ 
++ /* If packet has sequence numbers, queue it if acceptable. Returns 0 if
++  * acceptable, else non-zero.
++  */
++ static int l2tp_recv_data_seq(struct l2tp_session *session, struct sk_buff *skb)
++ {
++ 	if (session->reorder_timeout != 0) {
++ 		/* Packet reordering enabled. Add skb to session's
++ 		 * reorder queue, in order of ns.
++ 		 */
++ 		l2tp_recv_queue_skb(session, skb);
++ 	} else {
++ 		/* Packet reordering disabled. Discard out-of-sequence
++ 		 * packets
++ 		 */
++ 		if (L2TP_SKB_CB(skb)->ns != session->nr) {
++ 			atomic_long_inc(&session->stats.rx_seq_discards);
++ 			l2tp_dbg(session, L2TP_MSG_SEQ,
++ 				 "%s: oos pkt %u len %d discarded, waiting for %u, reorder_q_len=%d\n",
++ 				 session->name, L2TP_SKB_CB(skb)->ns,
++ 				 L2TP_SKB_CB(skb)->length, session->nr,
++ 				 skb_queue_len(&session->reorder_q));
++ 			goto discard;
++ 		}
++ 		skb_queue_tail(&session->reorder_q, skb);
++ 	}
++ 
++ 	return 0;
++ 
++ discard:
++ 	return 1;
++ }
++ 
+++>>>>>>> b6dc01a43aac (l2tp: do data sequence number handling in a separate func)
+  /* Do receive processing of L2TP data frames. We handle both L2TPv2
+   * and L2TPv3 data frames here.
+   *
+* Unmerged path net/l2tp/l2tp_core.c
