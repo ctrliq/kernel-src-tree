@@ -1,0 +1,468 @@
+qed: Use the doorbell overflow recovery mechanism in case of doorbell overflow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Ariel Elior <Ariel.Elior@cavium.com>
+commit a1b469b8b17f1573741eb0272349eca47d32462a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a1b469b8.failed
+
+In case of an attention from the doorbell queue block, analyze the HW
+indications. In case of a doorbell overflow, execute a doorbell recovery.
+Since there can be spurious indications (race conditions between multiple PFs),
+schedule a periodic task for checking whether a doorbell overflow may have been
+missed. After a set time with no indications, terminate the periodic task.
+
+	Signed-off-by: Ariel Elior <Ariel.Elior@cavium.com>
+	Signed-off-by: Michal Kalderon <Michal.Kalderon@cavium.com>
+	Signed-off-by: Tomer Tayar <Tomer.Tayar@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a1b469b8b17f1573741eb0272349eca47d32462a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_int.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_int.c
+index 7e27b333bb7b,92340919d852..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_int.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_int.c
+@@@ -361,29 -361,147 +361,157 @@@ static int qed_pglub_rbc_attn_cb(struc
+  	return 0;
+  }
+  
+- #define QED_DORQ_ATTENTION_REASON_MASK	(0xfffff)
+- #define QED_DORQ_ATTENTION_OPAQUE_MASK (0xffff)
+- #define QED_DORQ_ATTENTION_SIZE_MASK	(0x7f)
+- #define QED_DORQ_ATTENTION_SIZE_SHIFT	(16)
++ #define QED_DORQ_ATTENTION_REASON_MASK  (0xfffff)
++ #define QED_DORQ_ATTENTION_OPAQUE_MASK  (0xffff)
++ #define QED_DORQ_ATTENTION_OPAQUE_SHIFT (0x0)
++ #define QED_DORQ_ATTENTION_SIZE_MASK            (0x7f)
++ #define QED_DORQ_ATTENTION_SIZE_SHIFT           (16)
++ 
++ #define QED_DB_REC_COUNT                        1000
++ #define QED_DB_REC_INTERVAL                     100
++ 
++ static int qed_db_rec_flush_queue(struct qed_hwfn *p_hwfn,
++ 				  struct qed_ptt *p_ptt)
++ {
++ 	u32 count = QED_DB_REC_COUNT;
++ 	u32 usage = 1;
++ 
++ 	/* wait for usage to zero or count to run out. This is necessary since
++ 	 * EDPM doorbell transactions can take multiple 64b cycles, and as such
++ 	 * can "split" over the pci. Possibly, the doorbell drop can happen with
++ 	 * half an EDPM in the queue and other half dropped. Another EDPM
++ 	 * doorbell to the same address (from doorbell recovery mechanism or
++ 	 * from the doorbelling entity) could have first half dropped and second
++ 	 * half interpreted as continuation of the first. To prevent such
++ 	 * malformed doorbells from reaching the device, flush the queue before
++ 	 * releasing the overflow sticky indication.
++ 	 */
++ 	while (count-- && usage) {
++ 		usage = qed_rd(p_hwfn, p_ptt, DORQ_REG_PF_USAGE_CNT);
++ 		udelay(QED_DB_REC_INTERVAL);
++ 	}
++ 
++ 	/* should have been depleted by now */
++ 	if (usage) {
++ 		DP_NOTICE(p_hwfn->cdev,
++ 			  "DB recovery: doorbell usage failed to zero after %d usec. usage was %x\n",
++ 			  QED_DB_REC_INTERVAL * QED_DB_REC_COUNT, usage);
++ 		return -EBUSY;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int qed_db_rec_handler(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++ {
++ 	u32 overflow;
++ 	int rc;
++ 
++ 	overflow = qed_rd(p_hwfn, p_ptt, DORQ_REG_PF_OVFL_STICKY);
++ 	DP_NOTICE(p_hwfn, "PF Overflow sticky 0x%x\n", overflow);
++ 	if (!overflow) {
++ 		qed_db_recovery_execute(p_hwfn, DB_REC_ONCE);
++ 		return 0;
++ 	}
++ 
++ 	if (qed_edpm_enabled(p_hwfn)) {
++ 		rc = qed_db_rec_flush_queue(p_hwfn, p_ptt);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	/* Flush any pending (e)dpm as they may never arrive */
++ 	qed_wr(p_hwfn, p_ptt, DORQ_REG_DPM_FORCE_ABORT, 0x1);
++ 
++ 	/* Release overflow sticky indication (stop silently dropping everything) */
++ 	qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_OVFL_STICKY, 0x0);
++ 
++ 	/* Repeat all last doorbells (doorbell drop recovery) */
++ 	qed_db_recovery_execute(p_hwfn, DB_REC_REAL_DEAL);
++ 
++ 	return 0;
++ }
++ 
+  static int qed_dorq_attn_cb(struct qed_hwfn *p_hwfn)
+  {
+- 	u32 reason;
++ 	u32 int_sts, first_drop_reason, details, address, all_drops_reason;
++ 	struct qed_ptt *p_ptt = p_hwfn->p_dpc_ptt;
++ 	int rc;
+  
+- 	reason = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt, DORQ_REG_DB_DROP_REASON) &
+- 			QED_DORQ_ATTENTION_REASON_MASK;
+- 	if (reason) {
+- 		u32 details = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+- 				     DORQ_REG_DB_DROP_DETAILS);
++ 	int_sts = qed_rd(p_hwfn, p_ptt, DORQ_REG_INT_STS);
++ 	DP_NOTICE(p_hwfn->cdev, "DORQ attention. int_sts was %x\n", int_sts);
+  
+++<<<<<<< HEAD
+ +		DP_INFO(p_hwfn->cdev,
+ +			"DORQ db_drop: adress 0x%08x Opaque FID 0x%04x Size [bytes] 0x%08x Reason: 0x%08x\n",
+ +			qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+ +			       DORQ_REG_DB_DROP_DETAILS_ADDRESS),
+ +			(u16)(details & QED_DORQ_ATTENTION_OPAQUE_MASK),
+ +			GET_FIELD(details, QED_DORQ_ATTENTION_SIZE) * 4,
+ +			reason);
+++=======
++ 	/* int_sts may be zero since all PFs were interrupted for doorbell
++ 	 * overflow but another one already handled it. Can abort here. If
++ 	 * This PF also requires overflow recovery we will be interrupted again.
++ 	 * The masked almost full indication may also be set. Ignoring.
++ 	 */
++ 	if (!(int_sts & ~DORQ_REG_INT_STS_DORQ_FIFO_AFULL))
++ 		return 0;
++ 
++ 	/* check if db_drop or overflow happened */
++ 	if (int_sts & (DORQ_REG_INT_STS_DB_DROP |
++ 		       DORQ_REG_INT_STS_DORQ_FIFO_OVFL_ERR)) {
++ 		/* Obtain data about db drop/overflow */
++ 		first_drop_reason = qed_rd(p_hwfn, p_ptt,
++ 					   DORQ_REG_DB_DROP_REASON) &
++ 		    QED_DORQ_ATTENTION_REASON_MASK;
++ 		details = qed_rd(p_hwfn, p_ptt, DORQ_REG_DB_DROP_DETAILS);
++ 		address = qed_rd(p_hwfn, p_ptt,
++ 				 DORQ_REG_DB_DROP_DETAILS_ADDRESS);
++ 		all_drops_reason = qed_rd(p_hwfn, p_ptt,
++ 					  DORQ_REG_DB_DROP_DETAILS_REASON);
++ 
++ 		/* Log info */
++ 		DP_NOTICE(p_hwfn->cdev,
++ 			  "Doorbell drop occurred\n"
++ 			  "Address\t\t0x%08x\t(second BAR address)\n"
++ 			  "FID\t\t0x%04x\t\t(Opaque FID)\n"
++ 			  "Size\t\t0x%04x\t\t(in bytes)\n"
++ 			  "1st drop reason\t0x%08x\t(details on first drop since last handling)\n"
++ 			  "Sticky reasons\t0x%08x\t(all drop reasons since last handling)\n",
++ 			  address,
++ 			  GET_FIELD(details, QED_DORQ_ATTENTION_OPAQUE),
++ 			  GET_FIELD(details, QED_DORQ_ATTENTION_SIZE) * 4,
++ 			  first_drop_reason, all_drops_reason);
++ 
++ 		rc = qed_db_rec_handler(p_hwfn, p_ptt);
++ 		qed_periodic_db_rec_start(p_hwfn);
++ 		if (rc)
++ 			return rc;
++ 
++ 		/* Clear the doorbell drop details and prepare for next drop */
++ 		qed_wr(p_hwfn, p_ptt, DORQ_REG_DB_DROP_DETAILS_REL, 0);
++ 
++ 		/* Mark interrupt as handled (note: even if drop was due to a different
++ 		 * reason than overflow we mark as handled)
++ 		 */
++ 		qed_wr(p_hwfn,
++ 		       p_ptt,
++ 		       DORQ_REG_INT_STS_WR,
++ 		       DORQ_REG_INT_STS_DB_DROP |
++ 		       DORQ_REG_INT_STS_DORQ_FIFO_OVFL_ERR);
++ 
++ 		/* If there are no indications other than drop indications, success */
++ 		if ((int_sts & ~(DORQ_REG_INT_STS_DB_DROP |
++ 				 DORQ_REG_INT_STS_DORQ_FIFO_OVFL_ERR |
++ 				 DORQ_REG_INT_STS_DORQ_FIFO_AFULL)) == 0)
++ 			return 0;
+++>>>>>>> a1b469b8b17f (qed: Use the doorbell overflow recovery mechanism in case of doorbell overflow)
+  	}
+  
++ 	/* Some other indication was present - non recoverable */
++ 	DP_INFO(p_hwfn, "DORQ fatal attention\n");
++ 
+  	return -EINVAL;
+  }
+  
+diff --git a/drivers/net/ethernet/qlogic/qed/qed.h b/drivers/net/ethernet/qlogic/qed/qed.h
+index fb399ee681d3..24a90163775e 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -536,6 +536,7 @@ struct qed_simd_fp_handler {
+ 
+ enum qed_slowpath_wq_flag {
+ 	QED_SLOWPATH_MFW_TLV_REQ,
++	QED_SLOWPATH_PERIODIC_DB_REC,
+ };
+ 
+ struct qed_hwfn {
+@@ -669,11 +670,12 @@ struct qed_hwfn {
+ 	struct delayed_work iov_task;
+ 	unsigned long iov_task_flags;
+ #endif
+-
+-	struct z_stream_s		*stream;
++	struct z_stream_s *stream;
++	bool slowpath_wq_active;
+ 	struct workqueue_struct *slowpath_wq;
+ 	struct delayed_work slowpath_task;
+ 	unsigned long slowpath_task_flags;
++	u32 periodic_db_rec_count;
+ };
+ 
+ struct pci_params {
+@@ -914,6 +916,12 @@ u16 qed_get_cm_pq_idx_llt_mtc(struct qed_hwfn *p_hwfn, u8 tc);
+ 
+ #define QED_LEADING_HWFN(dev)   (&dev->hwfns[0])
+ 
++/* doorbell recovery mechanism */
++void qed_db_recovery_dp(struct qed_hwfn *p_hwfn);
++void qed_db_recovery_execute(struct qed_hwfn *p_hwfn,
++			     enum qed_db_rec_exec db_exec);
++bool qed_edpm_enabled(struct qed_hwfn *p_hwfn);
++
+ /* Other Linux specific common definitions */
+ #define DP_NAME(cdev) ((cdev)->name)
+ 
+@@ -948,4 +956,6 @@ int qed_mfw_fill_tlv_data(struct qed_hwfn *hwfn,
+ 			  union qed_mfw_tlv_data *tlv_data);
+ 
+ void qed_hw_info_set_offload_tc(struct qed_hw_info *p_info, u8 tc);
++
++void qed_periodic_db_rec_start(struct qed_hwfn *p_hwfn);
+ #endif /* _QED_H */
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev.c b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 631b799e5a1a..aedf22ada272 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -1788,6 +1788,14 @@ enum QED_ROCE_EDPM_MODE {
+ 	QED_ROCE_EDPM_MODE_DISABLE = 2,
+ };
+ 
++bool qed_edpm_enabled(struct qed_hwfn *p_hwfn)
++{
++	if (p_hwfn->dcbx_no_edpm || p_hwfn->db_bar_no_edpm)
++		return false;
++
++	return true;
++}
++
+ static int
+ qed_hw_init_pf_doorbell_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ {
+@@ -1857,13 +1865,13 @@ qed_hw_init_pf_doorbell_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ 	p_hwfn->wid_count = (u16) n_cpus;
+ 
+ 	DP_INFO(p_hwfn,
+-		"doorbell bar: normal_region_size=%d, pwm_region_size=%d, dpi_size=%d, dpi_count=%d, roce_edpm=%s\n",
++		"doorbell bar: normal_region_size=%d, pwm_region_size=%d, dpi_size=%d, dpi_count=%d, roce_edpm=%s, page_size=%lu\n",
+ 		norm_regsize,
+ 		pwm_regsize,
+ 		p_hwfn->dpi_size,
+ 		p_hwfn->dpi_count,
+-		((p_hwfn->dcbx_no_edpm) || (p_hwfn->db_bar_no_edpm)) ?
+-		"disabled" : "enabled");
++		(!qed_edpm_enabled(p_hwfn)) ?
++		"disabled" : "enabled", PAGE_SIZE);
+ 
+ 	if (rc) {
+ 		DP_ERR(p_hwfn,
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_int.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_int.h b/drivers/net/ethernet/qlogic/qed/qed_int.h
+index 54b4ee0acfd7..d81a62ebd524 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_int.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_int.h
+@@ -190,6 +190,16 @@ void qed_int_get_num_sbs(struct qed_hwfn	*p_hwfn,
+  */
+ void qed_int_disable_post_isr_release(struct qed_dev *cdev);
+ 
++/**
++ * @brief - Doorbell Recovery handler.
++ *          Run DB_REAL_DEAL doorbell recovery in case of PF overflow
++ *          (and flush DORQ if needed), otherwise run DB_REC_ONCE.
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ */
++int qed_db_rec_handler(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
++
+ #define QED_CAU_DEF_RX_TIMER_RES 0
+ #define QED_CAU_DEF_TX_TIMER_RES 0
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_main.c b/drivers/net/ethernet/qlogic/qed/qed_main.c
+index 0cd9562cf578..b3b95fb94c2d 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -965,9 +965,47 @@ static void qed_update_pf_params(struct qed_dev *cdev,
+ 	}
+ }
+ 
++#define QED_PERIODIC_DB_REC_COUNT		100
++#define QED_PERIODIC_DB_REC_INTERVAL_MS		100
++#define QED_PERIODIC_DB_REC_INTERVAL \
++	msecs_to_jiffies(QED_PERIODIC_DB_REC_INTERVAL_MS)
++#define QED_PERIODIC_DB_REC_WAIT_COUNT		10
++#define QED_PERIODIC_DB_REC_WAIT_INTERVAL \
++	(QED_PERIODIC_DB_REC_INTERVAL_MS / QED_PERIODIC_DB_REC_WAIT_COUNT)
++
++static int qed_slowpath_delayed_work(struct qed_hwfn *hwfn,
++				     enum qed_slowpath_wq_flag wq_flag,
++				     unsigned long delay)
++{
++	if (!hwfn->slowpath_wq_active)
++		return -EINVAL;
++
++	/* Memory barrier for setting atomic bit */
++	smp_mb__before_atomic();
++	set_bit(wq_flag, &hwfn->slowpath_task_flags);
++	smp_mb__after_atomic();
++	queue_delayed_work(hwfn->slowpath_wq, &hwfn->slowpath_task, delay);
++
++	return 0;
++}
++
++void qed_periodic_db_rec_start(struct qed_hwfn *p_hwfn)
++{
++	/* Reset periodic Doorbell Recovery counter */
++	p_hwfn->periodic_db_rec_count = QED_PERIODIC_DB_REC_COUNT;
++
++	/* Don't schedule periodic Doorbell Recovery if already scheduled */
++	if (test_bit(QED_SLOWPATH_PERIODIC_DB_REC,
++		     &p_hwfn->slowpath_task_flags))
++		return;
++
++	qed_slowpath_delayed_work(p_hwfn, QED_SLOWPATH_PERIODIC_DB_REC,
++				  QED_PERIODIC_DB_REC_INTERVAL);
++}
++
+ static void qed_slowpath_wq_stop(struct qed_dev *cdev)
+ {
+-	int i;
++	int i, sleep_count = QED_PERIODIC_DB_REC_WAIT_COUNT;
+ 
+ 	if (IS_VF(cdev))
+ 		return;
+@@ -976,6 +1014,15 @@ static void qed_slowpath_wq_stop(struct qed_dev *cdev)
+ 		if (!cdev->hwfns[i].slowpath_wq)
+ 			continue;
+ 
++		/* Stop queuing new delayed works */
++		cdev->hwfns[i].slowpath_wq_active = false;
++
++		/* Wait until the last periodic doorbell recovery is executed */
++		while (test_bit(QED_SLOWPATH_PERIODIC_DB_REC,
++				&cdev->hwfns[i].slowpath_task_flags) &&
++		       sleep_count--)
++			msleep(QED_PERIODIC_DB_REC_WAIT_INTERVAL);
++
+ 		flush_workqueue(cdev->hwfns[i].slowpath_wq);
+ 		destroy_workqueue(cdev->hwfns[i].slowpath_wq);
+ 	}
+@@ -988,7 +1035,10 @@ static void qed_slowpath_task(struct work_struct *work)
+ 	struct qed_ptt *ptt = qed_ptt_acquire(hwfn);
+ 
+ 	if (!ptt) {
+-		queue_delayed_work(hwfn->slowpath_wq, &hwfn->slowpath_task, 0);
++		if (hwfn->slowpath_wq_active)
++			queue_delayed_work(hwfn->slowpath_wq,
++					   &hwfn->slowpath_task, 0);
++
+ 		return;
+ 	}
+ 
+@@ -996,6 +1046,15 @@ static void qed_slowpath_task(struct work_struct *work)
+ 			       &hwfn->slowpath_task_flags))
+ 		qed_mfw_process_tlv_req(hwfn, ptt);
+ 
++	if (test_and_clear_bit(QED_SLOWPATH_PERIODIC_DB_REC,
++			       &hwfn->slowpath_task_flags)) {
++		qed_db_rec_handler(hwfn, ptt);
++		if (hwfn->periodic_db_rec_count--)
++			qed_slowpath_delayed_work(hwfn,
++						  QED_SLOWPATH_PERIODIC_DB_REC,
++						  QED_PERIODIC_DB_REC_INTERVAL);
++	}
++
+ 	qed_ptt_release(hwfn, ptt);
+ }
+ 
+@@ -1022,6 +1081,7 @@ static int qed_slowpath_wq_start(struct qed_dev *cdev)
+ 		}
+ 
+ 		INIT_DELAYED_WORK(&hwfn->slowpath_task, qed_slowpath_task);
++		hwfn->slowpath_wq_active = true;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+index f736f70956fd..7073eb8c237e 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+@@ -1237,6 +1237,56 @@
+ 	0x1701534UL
+ #define TSEM_REG_DBG_FORCE_FRAME \
+ 	0x1701538UL
++#define DORQ_REG_PF_USAGE_CNT \
++	0x1009c0UL
++#define DORQ_REG_PF_OVFL_STICKY	\
++	0x1009d0UL
++#define DORQ_REG_DPM_FORCE_ABORT \
++	0x1009d8UL
++#define DORQ_REG_INT_STS \
++	0x100180UL
++#define DORQ_REG_INT_STS_ADDRESS_ERROR \
++	(0x1UL << 0)
++#define DORQ_REG_INT_STS_WR \
++	0x100188UL
++#define DORQ_REG_DB_DROP_DETAILS_REL \
++	0x100a28UL
++#define DORQ_REG_INT_STS_ADDRESS_ERROR_SHIFT \
++	0
++#define DORQ_REG_INT_STS_DB_DROP \
++		(0x1UL << 1)
++#define DORQ_REG_INT_STS_DB_DROP_SHIFT \
++	1
++#define DORQ_REG_INT_STS_DORQ_FIFO_OVFL_ERR \
++		(0x1UL << 2)
++#define DORQ_REG_INT_STS_DORQ_FIFO_OVFL_ERR_SHIFT \
++	2
++#define DORQ_REG_INT_STS_DORQ_FIFO_AFULL\
++		(0x1UL << 3)
++#define DORQ_REG_INT_STS_DORQ_FIFO_AFULL_SHIFT \
++	3
++#define DORQ_REG_INT_STS_CFC_BYP_VALIDATION_ERR \
++		(0x1UL << 4)
++#define DORQ_REG_INT_STS_CFC_BYP_VALIDATION_ERR_SHIFT \
++	4
++#define DORQ_REG_INT_STS_CFC_LD_RESP_ERR \
++		(0x1UL << 5)
++#define DORQ_REG_INT_STS_CFC_LD_RESP_ERR_SHIFT \
++	5
++#define DORQ_REG_INT_STS_XCM_DONE_CNT_ERR \
++		(0x1UL << 6)
++#define DORQ_REG_INT_STS_XCM_DONE_CNT_ERR_SHIFT	\
++	6
++#define DORQ_REG_INT_STS_CFC_LD_REQ_FIFO_OVFL_ERR \
++		(0x1UL << 7)
++#define DORQ_REG_INT_STS_CFC_LD_REQ_FIFO_OVFL_ERR_SHIFT	\
++	7
++#define DORQ_REG_INT_STS_CFC_LD_REQ_FIFO_UNDER_ERR \
++		(0x1UL << 8)
++#define DORQ_REG_INT_STS_CFC_LD_REQ_FIFO_UNDER_ERR_SHIFT \
++	8
++#define DORQ_REG_DB_DROP_DETAILS_REASON	\
++	0x100a20UL
+ #define MSEM_REG_DBG_SELECT \
+ 	0x1801528UL
+ #define MSEM_REG_DBG_DWORD_ENABLE \
