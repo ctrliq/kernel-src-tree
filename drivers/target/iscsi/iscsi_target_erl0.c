@@ -768,21 +768,8 @@ static void iscsit_handle_time2retain_timeout(unsigned long data)
 
 	pr_err("Time2Retain timer expired for SID: %u, cleaning up"
 			" iSCSI session.\n", sess->sid);
-	{
-	struct iscsi_tiqn *tiqn = tpg->tpg_tiqn;
 
-	if (tiqn) {
-		spin_lock(&tiqn->sess_err_stats.lock);
-		strcpy(tiqn->sess_err_stats.last_sess_fail_rem_name,
-			(void *)sess->sess_ops->InitiatorName);
-		tiqn->sess_err_stats.last_sess_failure_type =
-				ISCSI_SESS_ERR_CXN_TIMEOUT;
-		tiqn->sess_err_stats.cxn_timeout_errors++;
-		atomic_long_inc(&sess->conn_timeout_errors);
-		spin_unlock(&tiqn->sess_err_stats.lock);
-	}
-	}
-
+	iscsit_fill_cxn_timeout_err_stats(sess);
 	spin_unlock_bh(&se_tpg->session_lock);
 	target_put_session(sess->se_sess);
 }
