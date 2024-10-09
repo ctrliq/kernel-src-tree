@@ -1,0 +1,149 @@
+mnt: Refactor the logic for mounting sysfs and proc in a user namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 1b852bceb0d111e510d1a15826ecc4a19358d512
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1b852bce.failed
+
+Fresh mounts of proc and sysfs are a very special case that works very
+much like a bind mount.  Unfortunately the current structure can not
+preserve the MNT_LOCK... mount flags.  Therefore refactor the logic
+into a form that can be modified to preserve those lock bits.
+
+Add a new filesystem flag FS_USERNS_VISIBLE that requires some mount
+of the filesystem be fully visible in the current mount namespace,
+before the filesystem may be mounted.
+
+Move the logic for calling fs_fully_visible from proc and sysfs into
+fs/namespace.c where it has greater access to mount namespace state.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 1b852bceb0d111e510d1a15826ecc4a19358d512)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	fs/proc/root.c
+#	fs/sysfs/mount.c
+#	include/linux/fs.h
+diff --cc fs/namespace.c
+index c3276b690896,8e7edaf60fe1..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -3294,7 -3170,7 +3300,11 @@@ bool current_chrooted(void
+  	return chrooted;
+  }
+  
+++<<<<<<< HEAD
+ +void update_mnt_policy(struct user_namespace *userns)
+++=======
++ static bool fs_fully_visible(struct file_system_type *type)
+++>>>>>>> 1b852bceb0d1 (mnt: Refactor the logic for mounting sysfs and proc in a user namespace)
+  {
+  	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+  	struct mount *mnt;
+diff --cc fs/proc/root.c
+index 3a48c1b05b1a,64e1ab64bde6..000000000000
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@@ -110,8 -112,8 +110,13 @@@ static struct dentry *proc_mount(struc
+  		ns = task_active_pid_ns(current);
+  		options = data;
+  
+++<<<<<<< HEAD
+ +		if (!current_user_ns()->may_mount_proc ||
+ +		    !ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+++=======
++ 		/* Does the mounter have privilege over the pid namespace? */
++ 		if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+++>>>>>>> 1b852bceb0d1 (mnt: Refactor the logic for mounting sysfs and proc in a user namespace)
+  			return ERR_PTR(-EPERM);
+  	}
+  
+diff --cc fs/sysfs/mount.c
+index 59ee03fe48e1,1c6ac6fcee9f..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -108,36 -26,21 +108,42 @@@ static void free_sysfs_super_info(struc
+  static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+  	int flags, const char *dev_name, void *data)
+  {
+ -	struct dentry *root;
+ -	void *ns;
+ -	bool new_sb;
+ +	struct sysfs_super_info *info;
+ +	enum kobj_ns_type type;
+ +	struct super_block *sb;
+ +	int error;
+ +
+++<<<<<<< HEAD
+ +	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
+ +		return ERR_PTR(-EPERM);
+ +
+ +	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ +	if (!info)
+ +		return ERR_PTR(-ENOMEM);
+  
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		info->ns[type] = kobj_ns_grab_current(type);
+ +
+ +	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
+ +	if (IS_ERR(sb) || sb->s_fs_info != info)
+ +		free_sysfs_super_info(info);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +	if (!sb->s_root) {
+ +		error = sysfs_fill_super(sb);
+ +		if (error) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(error);
+ +		}
+ +		sb->s_flags |= MS_ACTIVE;
+++=======
++ 	if (!(flags & MS_KERNMOUNT)) {
++ 		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
++ 			return ERR_PTR(-EPERM);
+++>>>>>>> 1b852bceb0d1 (mnt: Refactor the logic for mounting sysfs and proc in a user namespace)
+  	}
+  
+ -	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
+ -	root = kernfs_mount_ns(fs_type, flags, sysfs_root,
+ -				SYSFS_MAGIC, &new_sb, ns);
+ -	if (IS_ERR(root) || !new_sb)
+ -		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
+ -	return root;
+ +	return dget(sb->s_root);
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+diff --cc include/linux/fs.h
+index 71972a22a27a,2d24eeb8e59c..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2094,14 -1897,8 +2094,18 @@@ struct file_system_type 
+  #define FS_HAS_SUBTYPE		4
+  #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+  #define FS_USERNS_DEV_MOUNT	16 /* A userns mount does not imply MNT_NODEV */
+++<<<<<<< HEAD
+ +#define FS_HAS_RM_XQUOTA	256	/* KABI: fs has the rm_xquota quota op */
+ +#define FS_HAS_INVALIDATE_RANGE	512	/* FS has new ->invalidatepage with length arg */
+ +#define FS_HAS_DIO_IODONE2	1024	/* KABI: fs supports new iodone */
+ +#define FS_HAS_NEXTDQBLK	2048	/* KABI: fs has the ->get_nextdqblk op */
+ +#define FS_HAS_DOPS_WRAPPER	4096	/* kabi: fs is using dentry_operations_wrapper. sb->s_d_op points to
+ +dentry_operations_wrapper */
+++=======
++ #define FS_USERNS_VISIBLE	32	/* FS must already be visible */
+++>>>>>>> 1b852bceb0d1 (mnt: Refactor the logic for mounting sysfs and proc in a user namespace)
+  #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+ +#define FS_HAS_FO_EXTEND	65536 	/* fs is using the file_operations_extend struture */
+  	struct dentry *(*mount) (struct file_system_type *, int,
+  		       const char *, void *);
+  	void (*kill_sb) (struct super_block *);
+* Unmerged path fs/namespace.c
+* Unmerged path fs/proc/root.c
+* Unmerged path fs/sysfs/mount.c
+* Unmerged path include/linux/fs.h
