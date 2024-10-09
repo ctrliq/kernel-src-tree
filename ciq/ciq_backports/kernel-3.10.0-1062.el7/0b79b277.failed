@@ -1,0 +1,199 @@
+IB/{hfi1, qib, rdmavt}: Schedule multi RC/UC packets instead of posting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 0b79b27748cbec221e1ceabf63578198602bf01d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0b79b277.failed
+
+The post_send() path determines if it should post directly or, schedule
+the post for later.  The current logic is:
+
+  if the swqe ring is empty or (for hfi1) wqe->length <= piothreshold
+    post the send
+  else
+    schedule
+
+This can allow large requests to call the send engine directly.  Large
+requests can potentially produce a large number of packets prior to
+returning to the caller, blocking the caller from posting more requests,
+and allowing better parallel processing.
+
+Allow the driver(s) more say in this logic (pass call_send to the driver,
+rather than examining a return value).
+
+Update hfi1/qib logic to schedule the send engine if an RC or UC message
+is larger than the QP MTU size.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0b79b27748cbec221e1ceabf63578198602bf01d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/qp.c
+diff --cc drivers/infiniband/sw/rdmavt/qp.c
+index bc0e332ee6a2,a9b7d7ff32ee..000000000000
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@@ -1717,8 -1717,8 +1717,13 @@@ static inline int rvt_qp_is_avail
+   * @wr: the work request to send
+   */
+  static int rvt_post_one_wr(struct rvt_qp *qp,
+++<<<<<<< HEAD
+ +			   struct ib_send_wr *wr,
+ +			   int *call_send)
+++=======
++ 			   const struct ib_send_wr *wr,
++ 			   bool *call_send)
+++>>>>>>> 0b79b27748cb (IB/{hfi1, qib, rdmavt}: Schedule multi RC/UC packets instead of posting)
+  {
+  	struct rvt_swqe *wqe;
+  	u32 next;
+diff --git a/drivers/infiniband/hw/hfi1/qp.c b/drivers/infiniband/hw/hfi1/qp.c
+index 545bda6f1364..9b212b81f403 100644
+--- a/drivers/infiniband/hw/hfi1/qp.c
++++ b/drivers/infiniband/hw/hfi1/qp.c
+@@ -285,17 +285,13 @@ void hfi1_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
+  * hfi1_check_send_wqe - validate wqe
+  * @qp - The qp
+  * @wqe - The built wqe
+- *
+- * validate wqe.  This is called
+- * prior to inserting the wqe into
+- * the ring but after the wqe has been
+- * setup.
++ * @call_send - Determine if the send should be posted or scheduled.
+  *
+  * Returns 0 on success, -EINVAL on failure
+  *
+  */
+ int hfi1_check_send_wqe(struct rvt_qp *qp,
+-			struct rvt_swqe *wqe)
++			struct rvt_swqe *wqe, bool *call_send)
+ {
+ 	struct hfi1_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	struct rvt_ah *ah;
+@@ -305,6 +301,8 @@ int hfi1_check_send_wqe(struct rvt_qp *qp,
+ 	case IB_QPT_UC:
+ 		if (wqe->length > 0x80000000U)
+ 			return -EINVAL;
++		if (wqe->length > qp->pmtu)
++			*call_send = false;
+ 		break;
+ 	case IB_QPT_SMI:
+ 		ah = ibah_to_rvtah(wqe->ud_wr.ah);
+@@ -321,7 +319,7 @@ int hfi1_check_send_wqe(struct rvt_qp *qp,
+ 	default:
+ 		break;
+ 	}
+-	return wqe->length <= piothreshold;
++	return 0;
+ }
+ 
+ /**
+diff --git a/drivers/infiniband/hw/hfi1/verbs.h b/drivers/infiniband/hw/hfi1/verbs.h
+index e7f727ca9212..0e8869d3a97e 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.h
++++ b/drivers/infiniband/hw/hfi1/verbs.h
+@@ -345,7 +345,8 @@ int hfi1_check_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
+ void hfi1_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
+ 		    int attr_mask, struct ib_udata *udata);
+ void hfi1_restart_rc(struct rvt_qp *qp, u32 psn, int wait);
+-int hfi1_check_send_wqe(struct rvt_qp *qp, struct rvt_swqe *wqe);
++int hfi1_check_send_wqe(struct rvt_qp *qp, struct rvt_swqe *wqe,
++			bool *call_send);
+ 
+ extern const u32 rc_only_opcode;
+ extern const u32 uc_only_opcode;
+diff --git a/drivers/infiniband/hw/qib/qib_qp.c b/drivers/infiniband/hw/qib/qib_qp.c
+index 344e401915f7..a81905df2d0f 100644
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@ -378,25 +378,22 @@ void qib_flush_qp_waiters(struct rvt_qp *qp)
+  * qib_check_send_wqe - validate wr/wqe
+  * @qp - The qp
+  * @wqe - The built wqe
++ * @call_send - Determine if the send should be posted or scheduled
+  *
+- * validate wr/wqe.  This is called
+- * prior to inserting the wqe into
+- * the ring but after the wqe has been
+- * setup.
+- *
+- * Returns 1 to force direct progress, 0 otherwise, -EINVAL on failure
++ * Returns 0 on success, -EINVAL on failure
+  */
+ int qib_check_send_wqe(struct rvt_qp *qp,
+-		       struct rvt_swqe *wqe)
++		       struct rvt_swqe *wqe, bool *call_send)
+ {
+ 	struct rvt_ah *ah;
+-	int ret = 0;
+ 
+ 	switch (qp->ibqp.qp_type) {
+ 	case IB_QPT_RC:
+ 	case IB_QPT_UC:
+ 		if (wqe->length > 0x80000000U)
+ 			return -EINVAL;
++		if (wqe->length > qp->pmtu)
++			*call_send = false;
+ 		break;
+ 	case IB_QPT_SMI:
+ 	case IB_QPT_GSI:
+@@ -405,12 +402,12 @@ int qib_check_send_wqe(struct rvt_qp *qp,
+ 		if (wqe->length > (1 << ah->log_pmtu))
+ 			return -EINVAL;
+ 		/* progress hint */
+-		ret = 1;
++		*call_send = true;
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-	return ret;
++	return 0;
+ }
+ 
+ #ifdef CONFIG_DEBUG_FS
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.h b/drivers/infiniband/hw/qib/qib_verbs.h
+index f9a46768a19a..4f1dadde3d6b 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@ -306,7 +306,8 @@ void qib_rc_rcv(struct qib_ctxtdata *rcd, struct ib_header *hdr,
+ 
+ int qib_check_ah(struct ib_device *ibdev, struct rdma_ah_attr *ah_attr);
+ 
+-int qib_check_send_wqe(struct rvt_qp *qp, struct rvt_swqe *wqe);
++int qib_check_send_wqe(struct rvt_qp *qp, struct rvt_swqe *wqe,
++		       bool *call_send);
+ 
+ struct ib_ah *qib_create_qp0_ah(struct qib_ibport *ibp, u16 dlid);
+ 
+* Unmerged path drivers/infiniband/sw/rdmavt/qp.c
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index d0e9083f9b9e..72b40fa0f641 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -215,8 +215,14 @@ struct rvt_driver_provided {
+ 	void (*schedule_send)(struct rvt_qp *qp);
+ 	void (*schedule_send_no_lock)(struct rvt_qp *qp);
+ 
+-	/* Driver specific work request checking */
+-	int (*check_send_wqe)(struct rvt_qp *qp, struct rvt_swqe *wqe);
++	/*
++	 * Validate the wqe.  This needs to be done prior to inserting the
++	 * wqe into the ring, but after the wqe has been set up.  Allow for
++	 * driver specific work request checking by providing a callback.
++	 * call_send indicates if the wqe should be posted or scheduled.
++	 */
++	int (*check_send_wqe)(struct rvt_qp *qp, struct rvt_swqe *wqe,
++			      bool *call_send);
+ 
+ 	/*
+ 	 * Sometimes rdmavt needs to kick the driver's send progress. That is
