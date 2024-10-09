@@ -1,0 +1,667 @@
+qla2xxx: terminate exchange when command is aborted by LIO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexei Potashnik <alexei@purestorage.com>
+commit 7359df25a53386dd33c223672bbd12cb49d0ce4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7359df25.failed
+
+The newly introduced aborted_task TFO callback has to terminate
+exchange with QLogic driver, since command is being deleted and
+no status will be queued to the driver at a later point.
+
+This patch also moves the burden of releasing one cmd refcount to
+the aborted_task handler.
+
+Changed iSCSI aborted_task logic to satisfy the above requirement.
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Acked-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7359df25a53386dd33c223672bbd12cb49d0ce4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,58651ecbd88c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1761,23 -1924,6 +1761,26 @@@ static int qlt_pre_xmit_response(struc
+  	struct qla_hw_data *ha = vha->hw;
+  	struct se_cmd *se_cmd = &cmd->se_cmd;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(cmd->aborted)) {
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf014,
+ +		    "qla_target(%d): terminating exchange "
+ +		    "for aborted cmd=%p (se_cmd=%p, tag=%d)", vha->vp_idx, cmd,
+ +		    se_cmd, cmd->tag);
+ +
+ +		cmd->state = QLA_TGT_STATE_ABORTED;
+ +
+ +		qlt_send_term_exchange(vha, cmd, &cmd->atio, 0);
+ +
+ +		/* !! At this point cmd could be already freed !! */
+ +		return QLA_TGT_PRE_XMIT_RESP_CMD_ABORTED;
+ +	}
+ +
+ +	ql_dbg(ql_dbg_tgt, vha, 0xe011, "qla_target(%d): tag=%u\n",
+ +	    vha->vp_idx, cmd->tag);
+ +
+++=======
+++>>>>>>> 7359df25a533 (qla2xxx: terminate exchange when command is aborted by LIO)
+  	prm->cmd = cmd;
+  	prm->tgt = tgt;
+  	prm->rq_result = scsi_status;
+@@@ -2012,39 -2149,386 +2015,36 @@@ skip_explict_conf
+  }
+  
+  
+ -
+ -/* diff  */
+ -static inline int
+ -qlt_hba_err_chk_enabled(struct se_cmd *se_cmd)
+ -{
+ -	/*
+ -	 * Uncomment when corresponding SCSI changes are done.
+ -	 *
+ -	 if (!sp->cmd->prot_chk)
+ -	 return 0;
+ -	 *
+ -	 */
+ -	switch (se_cmd->prot_op) {
+ -	case TARGET_PROT_DOUT_INSERT:
+ -	case TARGET_PROT_DIN_STRIP:
+ -		if (ql2xenablehba_err_chk >= 1)
+ -			return 1;
+ -		break;
+ -	case TARGET_PROT_DOUT_PASS:
+ -	case TARGET_PROT_DIN_PASS:
+ -		if (ql2xenablehba_err_chk >= 2)
+ -			return 1;
+ -		break;
+ -	case TARGET_PROT_DIN_INSERT:
+ -	case TARGET_PROT_DOUT_STRIP:
+ -		return 1;
+ -	default:
+ -		break;
+ -	}
+ -	return 0;
+ -}
+ -
+  /*
+ - * qla24xx_set_t10dif_tags_from_cmd - Extract Ref and App tags from SCSI command
+ - *
+ + * Callback to setup response of xmit_type of QLA_TGT_XMIT_DATA and *
+ + * QLA_TGT_XMIT_STATUS for >= 24xx silicon
+   */
+ -static inline void
+ -qlt_set_t10dif_tags(struct se_cmd *se_cmd, struct crc_context *ctx)
+ +int qlt_xmit_response(struct qla_tgt_cmd *cmd, int xmit_type,
+ +	uint8_t scsi_status)
+  {
+ -	uint32_t lba = 0xffffffff & se_cmd->t_task_lba;
+ -
+ -	/* wait til Mode Sense/Select cmd, modepage Ah, subpage 2
+ -	 * have been immplemented by TCM, before AppTag is avail.
+ -	 * Look for modesense_handlers[]
+ -	 */
+ -	ctx->app_tag = 0;
+ -	ctx->app_tag_mask[0] = 0x0;
+ -	ctx->app_tag_mask[1] = 0x0;
+ +	struct scsi_qla_host *vha = cmd->vha;
+ +	struct qla_hw_data *ha = vha->hw;
+ +	struct ctio7_to_24xx *pkt;
+ +	struct qla_tgt_prm prm;
+ +	uint32_t full_req_cnt = 0;
+ +	unsigned long flags = 0;
+ +	int res;
+  
+ -	switch (se_cmd->prot_type) {
+ -	case TARGET_DIF_TYPE0_PROT:
+ -		/*
+ -		 * No check for ql2xenablehba_err_chk, as it would be an
+ -		 * I/O error if hba tag generation is not done.
+ -		 */
+ -		ctx->ref_tag = cpu_to_le32(lba);
+ +	memset(&prm, 0, sizeof(prm));
+ +	qlt_check_srr_debug(cmd, &xmit_type);
+  
+ -		if (!qlt_hba_err_chk_enabled(se_cmd))
+ -			break;
+ +	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe018,
+ +	    "is_send_status=%d, cmd->bufflen=%d, cmd->sg_cnt=%d, "
+ +	    "cmd->dma_data_direction=%d\n", (xmit_type & QLA_TGT_XMIT_STATUS) ?
+ +	    1 : 0, cmd->bufflen, cmd->sg_cnt, cmd->dma_data_direction);
+  
+ -		/* enable ALL bytes of the ref tag */
+ -		ctx->ref_tag_mask[0] = 0xff;
+ -		ctx->ref_tag_mask[1] = 0xff;
+ -		ctx->ref_tag_mask[2] = 0xff;
+ -		ctx->ref_tag_mask[3] = 0xff;
+ -		break;
+ -	/*
+ -	 * For TYpe 1 protection: 16 bit GUARD tag, 32 bit REF tag, and
+ -	 * 16 bit app tag.
+ -	 */
+ -	case TARGET_DIF_TYPE1_PROT:
+ -		ctx->ref_tag = cpu_to_le32(lba);
+ +	res = qlt_pre_xmit_response(cmd, &prm, xmit_type, scsi_status,
+ +	    &full_req_cnt);
+ +	if (unlikely(res != 0)) {
+- 		if (res == QLA_TGT_PRE_XMIT_RESP_CMD_ABORTED)
+- 			return 0;
+- 
+ +		return res;
+ +	}
+  
+ -		if (!qlt_hba_err_chk_enabled(se_cmd))
+ -			break;
+ -
+ -		/* enable ALL bytes of the ref tag */
+ -		ctx->ref_tag_mask[0] = 0xff;
+ -		ctx->ref_tag_mask[1] = 0xff;
+ -		ctx->ref_tag_mask[2] = 0xff;
+ -		ctx->ref_tag_mask[3] = 0xff;
+ -		break;
+ -	/*
+ -	 * For TYPE 2 protection: 16 bit GUARD + 32 bit REF tag has to
+ -	 * match LBA in CDB + N
+ -	 */
+ -	case TARGET_DIF_TYPE2_PROT:
+ -		ctx->ref_tag = cpu_to_le32(lba);
+ -
+ -		if (!qlt_hba_err_chk_enabled(se_cmd))
+ -			break;
+ -
+ -		/* enable ALL bytes of the ref tag */
+ -		ctx->ref_tag_mask[0] = 0xff;
+ -		ctx->ref_tag_mask[1] = 0xff;
+ -		ctx->ref_tag_mask[2] = 0xff;
+ -		ctx->ref_tag_mask[3] = 0xff;
+ -		break;
+ -
+ -	/* For Type 3 protection: 16 bit GUARD only */
+ -	case TARGET_DIF_TYPE3_PROT:
+ -		ctx->ref_tag_mask[0] = ctx->ref_tag_mask[1] =
+ -			ctx->ref_tag_mask[2] = ctx->ref_tag_mask[3] = 0x00;
+ -		break;
+ -	}
+ -}
+ -
+ -
+ -static inline int
+ -qlt_build_ctio_crc2_pkt(struct qla_tgt_prm *prm, scsi_qla_host_t *vha)
+ -{
+ -	uint32_t		*cur_dsd;
+ -	int			sgc;
+ -	uint32_t		transfer_length = 0;
+ -	uint32_t		data_bytes;
+ -	uint32_t		dif_bytes;
+ -	uint8_t			bundling = 1;
+ -	uint8_t			*clr_ptr;
+ -	struct crc_context	*crc_ctx_pkt = NULL;
+ -	struct qla_hw_data	*ha;
+ -	struct ctio_crc2_to_fw	*pkt;
+ -	dma_addr_t		crc_ctx_dma;
+ -	uint16_t		fw_prot_opts = 0;
+ -	struct qla_tgt_cmd	*cmd = prm->cmd;
+ -	struct se_cmd		*se_cmd = &cmd->se_cmd;
+ -	uint32_t h;
+ -	struct atio_from_isp *atio = &prm->cmd->atio;
+ -	uint16_t t16;
+ -
+ -	sgc = 0;
+ -	ha = vha->hw;
+ -
+ -	pkt = (struct ctio_crc2_to_fw *)vha->req->ring_ptr;
+ -	prm->pkt = pkt;
+ -	memset(pkt, 0, sizeof(*pkt));
+ -
+ -	ql_dbg(ql_dbg_tgt, vha, 0xe071,
+ -		"qla_target(%d):%s: se_cmd[%p] CRC2 prot_op[0x%x] cmd prot sg:cnt[%p:%x] lba[%llu]\n",
+ -		vha->vp_idx, __func__, se_cmd, se_cmd->prot_op,
+ -		prm->prot_sg, prm->prot_seg_cnt, se_cmd->t_task_lba);
+ -
+ -	if ((se_cmd->prot_op == TARGET_PROT_DIN_INSERT) ||
+ -	    (se_cmd->prot_op == TARGET_PROT_DOUT_STRIP))
+ -		bundling = 0;
+ -
+ -	/* Compute dif len and adjust data len to incude protection */
+ -	data_bytes = cmd->bufflen;
+ -	dif_bytes  = (data_bytes / cmd->blk_sz) * 8;
+ -
+ -	switch (se_cmd->prot_op) {
+ -	case TARGET_PROT_DIN_INSERT:
+ -	case TARGET_PROT_DOUT_STRIP:
+ -		transfer_length = data_bytes;
+ -		data_bytes += dif_bytes;
+ -		break;
+ -
+ -	case TARGET_PROT_DIN_STRIP:
+ -	case TARGET_PROT_DOUT_INSERT:
+ -	case TARGET_PROT_DIN_PASS:
+ -	case TARGET_PROT_DOUT_PASS:
+ -		transfer_length = data_bytes + dif_bytes;
+ -		break;
+ -
+ -	default:
+ -		BUG();
+ -		break;
+ -	}
+ -
+ -	if (!qlt_hba_err_chk_enabled(se_cmd))
+ -		fw_prot_opts |= 0x10; /* Disable Guard tag checking */
+ -	/* HBA error checking enabled */
+ -	else if (IS_PI_UNINIT_CAPABLE(ha)) {
+ -		if ((se_cmd->prot_type == TARGET_DIF_TYPE1_PROT) ||
+ -		    (se_cmd->prot_type == TARGET_DIF_TYPE2_PROT))
+ -			fw_prot_opts |= PO_DIS_VALD_APP_ESC;
+ -		else if (se_cmd->prot_type == TARGET_DIF_TYPE3_PROT)
+ -			fw_prot_opts |= PO_DIS_VALD_APP_REF_ESC;
+ -	}
+ -
+ -	switch (se_cmd->prot_op) {
+ -	case TARGET_PROT_DIN_INSERT:
+ -	case TARGET_PROT_DOUT_INSERT:
+ -		fw_prot_opts |= PO_MODE_DIF_INSERT;
+ -		break;
+ -	case TARGET_PROT_DIN_STRIP:
+ -	case TARGET_PROT_DOUT_STRIP:
+ -		fw_prot_opts |= PO_MODE_DIF_REMOVE;
+ -		break;
+ -	case TARGET_PROT_DIN_PASS:
+ -	case TARGET_PROT_DOUT_PASS:
+ -		fw_prot_opts |= PO_MODE_DIF_PASS;
+ -		/* FUTURE: does tcm require T10CRC<->IPCKSUM conversion? */
+ -		break;
+ -	default:/* Normal Request */
+ -		fw_prot_opts |= PO_MODE_DIF_PASS;
+ -		break;
+ -	}
+ -
+ -
+ -	/* ---- PKT ---- */
+ -	/* Update entry type to indicate Command Type CRC_2 IOCB */
+ -	pkt->entry_type  = CTIO_CRC2;
+ -	pkt->entry_count = 1;
+ -	pkt->vp_index = vha->vp_idx;
+ -
+ -	h = qlt_make_handle(vha);
+ -	if (unlikely(h == QLA_TGT_NULL_HANDLE)) {
+ -		/*
+ -		 * CTIO type 7 from the firmware doesn't provide a way to
+ -		 * know the initiator's LOOP ID, hence we can't find
+ -		 * the session and, so, the command.
+ -		 */
+ -		return -EAGAIN;
+ -	} else
+ -		ha->tgt.cmds[h-1] = prm->cmd;
+ -
+ -
+ -	pkt->handle  = h | CTIO_COMPLETION_HANDLE_MARK;
+ -	pkt->nport_handle = prm->cmd->loop_id;
+ -	pkt->timeout = __constant_cpu_to_le16(QLA_TGT_TIMEOUT);
+ -	pkt->initiator_id[0] = atio->u.isp24.fcp_hdr.s_id[2];
+ -	pkt->initiator_id[1] = atio->u.isp24.fcp_hdr.s_id[1];
+ -	pkt->initiator_id[2] = atio->u.isp24.fcp_hdr.s_id[0];
+ -	pkt->exchange_addr   = atio->u.isp24.exchange_addr;
+ -
+ -	/* silence compile warning */
+ -	t16 = be16_to_cpu(atio->u.isp24.fcp_hdr.ox_id);
+ -	pkt->ox_id  = cpu_to_le16(t16);
+ -
+ -	t16 = (atio->u.isp24.attr << 9);
+ -	pkt->flags |= cpu_to_le16(t16);
+ -	pkt->relative_offset = cpu_to_le32(prm->cmd->offset);
+ -
+ -	/* Set transfer direction */
+ -	if (cmd->dma_data_direction == DMA_TO_DEVICE)
+ -		pkt->flags = __constant_cpu_to_le16(CTIO7_FLAGS_DATA_IN);
+ -	else if (cmd->dma_data_direction == DMA_FROM_DEVICE)
+ -		pkt->flags = __constant_cpu_to_le16(CTIO7_FLAGS_DATA_OUT);
+ -
+ -
+ -	pkt->dseg_count = prm->tot_dsds;
+ -	/* Fibre channel byte count */
+ -	pkt->transfer_length = cpu_to_le32(transfer_length);
+ -
+ -
+ -	/* ----- CRC context -------- */
+ -
+ -	/* Allocate CRC context from global pool */
+ -	crc_ctx_pkt = cmd->ctx =
+ -	    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC, &crc_ctx_dma);
+ -
+ -	if (!crc_ctx_pkt)
+ -		goto crc_queuing_error;
+ -
+ -	/* Zero out CTX area. */
+ -	clr_ptr = (uint8_t *)crc_ctx_pkt;
+ -	memset(clr_ptr, 0, sizeof(*crc_ctx_pkt));
+ -
+ -	crc_ctx_pkt->crc_ctx_dma = crc_ctx_dma;
+ -	INIT_LIST_HEAD(&crc_ctx_pkt->dsd_list);
+ -
+ -	/* Set handle */
+ -	crc_ctx_pkt->handle = pkt->handle;
+ -
+ -	qlt_set_t10dif_tags(se_cmd, crc_ctx_pkt);
+ -
+ -	pkt->crc_context_address[0] = cpu_to_le32(LSD(crc_ctx_dma));
+ -	pkt->crc_context_address[1] = cpu_to_le32(MSD(crc_ctx_dma));
+ -	pkt->crc_context_len = CRC_CONTEXT_LEN_FW;
+ -
+ -
+ -	if (!bundling) {
+ -		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.nobundling.data_address;
+ -	} else {
+ -		/*
+ -		 * Configure Bundling if we need to fetch interlaving
+ -		 * protection PCI accesses
+ -		 */
+ -		fw_prot_opts |= PO_ENABLE_DIF_BUNDLING;
+ -		crc_ctx_pkt->u.bundling.dif_byte_count = cpu_to_le32(dif_bytes);
+ -		crc_ctx_pkt->u.bundling.dseg_count =
+ -			cpu_to_le16(prm->tot_dsds - prm->prot_seg_cnt);
+ -		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.data_address;
+ -	}
+ -
+ -	/* Finish the common fields of CRC pkt */
+ -	crc_ctx_pkt->blk_size   = cpu_to_le16(cmd->blk_sz);
+ -	crc_ctx_pkt->prot_opts  = cpu_to_le16(fw_prot_opts);
+ -	crc_ctx_pkt->byte_count = cpu_to_le32(data_bytes);
+ -	crc_ctx_pkt->guard_seed = __constant_cpu_to_le16(0);
+ -
+ -
+ -	/* Walks data segments */
+ -	pkt->flags |= __constant_cpu_to_le16(CTIO7_FLAGS_DSD_PTR);
+ -
+ -	if (!bundling && prm->prot_seg_cnt) {
+ -		if (qla24xx_walk_and_build_sglist_no_difb(ha, NULL, cur_dsd,
+ -			prm->tot_dsds, cmd))
+ -			goto crc_queuing_error;
+ -	} else if (qla24xx_walk_and_build_sglist(ha, NULL, cur_dsd,
+ -		(prm->tot_dsds - prm->prot_seg_cnt), cmd))
+ -		goto crc_queuing_error;
+ -
+ -	if (bundling && prm->prot_seg_cnt) {
+ -		/* Walks dif segments */
+ -		pkt->add_flags |= CTIO_CRC2_AF_DIF_DSD_ENA;
+ -
+ -		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.dif_address;
+ -		if (qla24xx_walk_and_build_prot_sglist(ha, NULL, cur_dsd,
+ -			prm->prot_seg_cnt, cmd))
+ -			goto crc_queuing_error;
+ -	}
+ -	return QLA_SUCCESS;
+ -
+ -crc_queuing_error:
+ -	/* Cleanup will be performed by the caller */
+ -
+ -	return QLA_FUNCTION_FAILED;
+ -}
+ -
+ -
+ -/*
+ - * Callback to setup response of xmit_type of QLA_TGT_XMIT_DATA and *
+ - * QLA_TGT_XMIT_STATUS for >= 24xx silicon
+ - */
+ -int qlt_xmit_response(struct qla_tgt_cmd *cmd, int xmit_type,
+ -	uint8_t scsi_status)
+ -{
+ -	struct scsi_qla_host *vha = cmd->vha;
+ -	struct qla_hw_data *ha = vha->hw;
+ -	struct ctio7_to_24xx *pkt;
+ -	struct qla_tgt_prm prm;
+ -	uint32_t full_req_cnt = 0;
+ -	unsigned long flags = 0;
+ -	int res;
+ -
+ -	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -	if (cmd->sess && cmd->sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
+ -		cmd->state = QLA_TGT_STATE_PROCESSED;
+ -		if (cmd->sess->logout_completed)
+ -			/* no need to terminate. FW already freed exchange. */
+ -			qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
+ -		else
+ -			qlt_send_term_exchange(vha, cmd, &cmd->atio, 1);
+ -		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -		return 0;
+ -	}
+ -	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -
+ -	memset(&prm, 0, sizeof(prm));
+ -	qlt_check_srr_debug(cmd, &xmit_type);
+ -
+ -	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe018,
+ -	    "is_send_status=%d, cmd->bufflen=%d, cmd->sg_cnt=%d, cmd->dma_data_direction=%d se_cmd[%p]\n",
+ -	    (xmit_type & QLA_TGT_XMIT_STATUS) ?
+ -	    1 : 0, cmd->bufflen, cmd->sg_cnt, cmd->dma_data_direction,
+ -	    &cmd->se_cmd);
+ -
+ -	res = qlt_pre_xmit_response(cmd, &prm, xmit_type, scsi_status,
+ -	    &full_req_cnt);
+ -	if (unlikely(res != 0)) {
+ -		return res;
+ -	}
+ -
+ -	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -
+ -	if (qla2x00_reset_active(vha) || cmd->reset_count != ha->chip_reset) {
+ -		/*
+ -		 * Either a chip reset is active or this request was from
+ -		 * previous life, just abort the processing.
+ -		 */
+ -		cmd->state = QLA_TGT_STATE_PROCESSED;
+ -		qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
+ -		ql_dbg(ql_dbg_async, vha, 0xe101,
+ -			"RESET-RSP active/old-count/new-count = %d/%d/%d.\n",
+ -			qla2x00_reset_active(vha), cmd->reset_count,
+ -			ha->chip_reset);
+ -		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -		return 0;
+ -	}
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+  
+  	/* Does F/W have an IOCBs for this request */
+  	res = qlt_check_reserve_free_req(vha, full_req_cnt);
+@@@ -2292,13 -3024,100 +2292,81 @@@ done
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qlt_init_term_exchange(struct scsi_qla_host *vha)
++ {
++ 	struct list_head free_list;
++ 	struct qla_tgt_cmd *cmd, *tcmd;
++ 
++ 	vha->hw->tgt.leak_exchg_thresh_hold =
++ 	    (vha->hw->fw_xcb_count/100) * LEAK_EXCHG_THRESH_HOLD_PERCENT;
++ 
++ 	cmd = tcmd = NULL;
++ 	if (!list_empty(&vha->hw->tgt.q_full_list)) {
++ 		INIT_LIST_HEAD(&free_list);
++ 		list_splice_init(&vha->hw->tgt.q_full_list, &free_list);
++ 
++ 		list_for_each_entry_safe(cmd, tcmd, &free_list, cmd_list) {
++ 			list_del(&cmd->cmd_list);
++ 			/* This cmd was never sent to TCM.  There is no need
++ 			 * to schedule free or call free_cmd
++ 			 */
++ 			qlt_free_cmd(cmd);
++ 			vha->hw->tgt.num_qfull_cmds_alloc--;
++ 		}
++ 	}
++ 	vha->hw->tgt.num_qfull_cmds_dropped = 0;
++ }
++ 
++ static void qlt_chk_exch_leak_thresh_hold(struct scsi_qla_host *vha)
++ {
++ 	uint32_t total_leaked;
++ 
++ 	total_leaked = vha->hw->tgt.num_qfull_cmds_dropped;
++ 
++ 	if (vha->hw->tgt.leak_exchg_thresh_hold &&
++ 	    (total_leaked > vha->hw->tgt.leak_exchg_thresh_hold)) {
++ 
++ 		ql_dbg(ql_dbg_tgt, vha, 0xe079,
++ 		    "Chip reset due to exchange starvation: %d/%d.\n",
++ 		    total_leaked, vha->hw->fw_xcb_count);
++ 
++ 		if (IS_P3P_TYPE(vha->hw))
++ 			set_bit(FCOE_CTX_RESET_NEEDED, &vha->dpc_flags);
++ 		else
++ 			set_bit(ISP_ABORT_NEEDED, &vha->dpc_flags);
++ 		qla2xxx_wake_dpc(vha);
++ 	}
++ 
++ }
++ 
++ void qlt_abort_cmd(struct qla_tgt_cmd *cmd)
++ {
++ 	struct qla_tgt *tgt = cmd->tgt;
++ 	struct scsi_qla_host *vha = tgt->vha;
++ 	struct se_cmd *se_cmd = &cmd->se_cmd;
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf014,
++ 	    "qla_target(%d): terminating exchange for aborted cmd=%p "
++ 	    "(se_cmd=%p, tag=%llu)", vha->vp_idx, cmd, &cmd->se_cmd,
++ 	    se_cmd->tag);
++ 
++ 	cmd->state = QLA_TGT_STATE_ABORTED;
++ 	cmd->cmd_flags |= BIT_6;
++ 
++ 	qlt_send_term_exchange(vha, cmd, &cmd->atio, 0);
++ }
++ EXPORT_SYMBOL(qlt_abort_cmd);
++ 
+++>>>>>>> 7359df25a533 (qla2xxx: terminate exchange when command is aborted by LIO)
+  void qlt_free_cmd(struct qla_tgt_cmd *cmd)
+  {
+ -	struct qla_tgt_sess *sess = cmd->sess;
+ -
+ -	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe074,
+ -	    "%s: se_cmd[%p] ox_id %04x\n",
+ -	    __func__, &cmd->se_cmd,
+ -	    be16_to_cpu(cmd->atio.u.isp24.fcp_hdr.ox_id));
+ -
+ -	BUG_ON(cmd->cmd_in_wq);
+ -
+ -	if (!cmd->q_full)
+ -		qlt_decr_num_pend_cmds(cmd->vha);
+ -
+  	BUG_ON(cmd->sg_mapped);
+ -	cmd->jiffies_at_free = get_jiffies_64();
+ +
+  	if (unlikely(cmd->free_sg))
+  		kfree(cmd->sg);
+ -
+ -	if (!sess || !sess->se_sess) {
+ -		WARN_ON(1);
+ -		return;
+ -	}
+ -	cmd->jiffies_at_free = get_jiffies_64();
+ -	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+  }
+  EXPORT_SYMBOL(qlt_free_cmd);
+  
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 8e939971fec1,9224a06646e6..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -650,9 -538,9 +650,13 @@@ static int tcm_qla2xxx_queue_data_in(st
+  	struct qla_tgt_cmd *cmd = container_of(se_cmd,
+  				struct qla_tgt_cmd, se_cmd);
+  
+ -	cmd->cmd_flags |= BIT_4;
+  	cmd->bufflen = se_cmd->data_length;
+++<<<<<<< HEAD
+ +	cmd->dma_data_direction = tcm_qla2xxx_mapping_dir(se_cmd);
+ +	cmd->aborted = (se_cmd->transport_state & CMD_T_ABORTED);
+++=======
++ 	cmd->dma_data_direction = target_reverse_dma_direction(se_cmd);
+++>>>>>>> 7359df25a533 (qla2xxx: terminate exchange when command is aborted by LIO)
+  
+  	cmd->sg_cnt = se_cmd->t_data_nents;
+  	cmd->sg = se_cmd->t_data_sg;
+@@@ -675,8 -568,12 +679,17 @@@ static int tcm_qla2xxx_queue_status(str
+  	cmd->sg = NULL;
+  	cmd->sg_cnt = 0;
+  	cmd->offset = 0;
+++<<<<<<< HEAD
+ +	cmd->dma_data_direction = tcm_qla2xxx_mapping_dir(se_cmd);
+ +	cmd->aborted = (se_cmd->transport_state & CMD_T_ABORTED);
+++=======
++ 	cmd->dma_data_direction = target_reverse_dma_direction(se_cmd);
++ 	if (cmd->cmd_flags &  BIT_5) {
++ 		pr_crit("Bit_5 already set for cmd = %p.\n", cmd);
++ 		dump_stack();
++ 	}
++ 	cmd->cmd_flags |= BIT_5;
+++>>>>>>> 7359df25a533 (qla2xxx: terminate exchange when command is aborted by LIO)
+  
+  	if (se_cmd->data_direction == DMA_FROM_DEVICE) {
+  		/*
+@@@ -730,8 -627,13 +743,16 @@@ static int tcm_qla2xxx_queue_tm_rsp(str
+  	 * CTIO response packet.
+  	 */
+  	qlt_xmit_tm_rsp(mcmd);
+ -}
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ static void tcm_qla2xxx_aborted_task(struct se_cmd *se_cmd)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(se_cmd,
++ 				struct qla_tgt_cmd, se_cmd);
++ 	qlt_abort_cmd(cmd);
+++>>>>>>> 7359df25a533 (qla2xxx: terminate exchange when command is aborted by LIO)
+  }
+  
+  static void tcm_qla2xxx_clear_sess_lookup(struct tcm_qla2xxx_lport *,
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0..96cb012ff161 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -725,13 +725,6 @@ int qla2x00_wait_for_hba_online(struct scsi_qla_host *);
+ #define	FC_TM_REJECT                4
+ #define FC_TM_FAILED                5
+ 
+-/*
+- * Error code of qlt_pre_xmit_response() meaning that cmd's exchange was
+- * terminated, so no more actions is needed and success should be returned
+- * to target.
+- */
+-#define QLA_TGT_PRE_XMIT_RESP_CMD_ABORTED	0x1717
+-
+ #if (BITS_PER_LONG > 32) || defined(CONFIG_HIGHMEM64G)
+ #define pci_dma_lo32(a) (a & 0xffffffff)
+ #define pci_dma_hi32(a) ((((a) >> 16)>>16) & 0xffffffff)
+@@ -841,7 +834,6 @@ struct qla_tgt_cmd {
+ 	unsigned int conf_compl_supported:1;
+ 	unsigned int sg_mapped:1;
+ 	unsigned int free_sg:1;
+-	unsigned int aborted:1; /* Needed in case of SRR */
+ 	unsigned int write_data_transferred:1;
+ 
+ 	struct scatterlist *sg;	/* cmd data buffer SG vector */
+@@ -977,6 +969,7 @@ extern void qlt_24xx_atio_pkt_all_vps(struct scsi_qla_host *,
+ extern void qlt_response_pkt_all_vps(struct scsi_qla_host *, response_t *);
+ extern int qlt_rdy_to_xfer(struct qla_tgt_cmd *);
+ extern int qlt_xmit_response(struct qla_tgt_cmd *, int, uint8_t);
++extern void qlt_abort_cmd(struct qla_tgt_cmd *);
+ extern void qlt_xmit_tm_rsp(struct qla_tgt_mgmt_cmd *);
+ extern void qlt_free_mcmd(struct qla_tgt_mgmt_cmd *);
+ extern void qlt_free_cmd(struct qla_tgt_cmd *cmd);
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
