@@ -1,0 +1,411 @@
+x86/speculation: Prevent stale SPEC_CTRL msr content
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] speculation: Prevent stale SPEC_CTRL msr content (Waiman Long) [1671826]
+Rebuild_FUZZ: 96.00%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6d991ba509ebcfcc908e009d1db51972a4f7a064
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6d991ba5.failed
+
+The seccomp speculation control operates on all tasks of a process, but
+only the current task of a process can update the MSR immediately. For the
+other threads the update is deferred to the next context switch.
+
+This creates the following situation with Process A and B:
+
+Process A task 2 and Process B task 1 are pinned on CPU1. Process A task 2
+does not have the speculation control TIF bit set. Process B task 1 has the
+speculation control TIF bit set.
+
+CPU0					CPU1
+					MSR bit is set
+					ProcB.T1 schedules out
+					ProcA.T2 schedules in
+					MSR bit is cleared
+ProcA.T1
+  seccomp_update()
+  set TIF bit on ProcA.T2
+					ProcB.T1 schedules in
+					MSR is not updated  <-- FAIL
+
+This happens because the context switch code tries to avoid the MSR update
+if the speculation control TIF bits of the incoming and the outgoing task
+are the same. In the worst case ProcB.T1 and ProcA.T2 are the only tasks
+scheduling back and forth on CPU1, which keeps the MSR stale forever.
+
+In theory this could be remedied by IPIs, but chasing the remote task which
+could be migrated is complex and full of races.
+
+The straight forward solution is to avoid the asychronous update of the TIF
+bit and defer it to the next context switch. The speculation control state
+is stored in task_struct::atomic_flags by the prctl and seccomp updates
+already.
+
+Add a new TIF_SPEC_FORCE_UPDATE bit and set this after updating the
+atomic_flags. Check the bit on context switch and force a synchronous
+update of the speculation control if set. Use the same mechanism for
+updating the current task.
+
+	Reported-by: Tim Chen <tim.c.chen@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Jiri Kosina <jkosina@suse.cz>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: David Woodhouse <dwmw@amazon.co.uk>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Casey Schaufler <casey.schaufler@intel.com>
+	Cc: Asit Mallick <asit.k.mallick@intel.com>
+	Cc: Arjan van de Ven <arjan@linux.intel.com>
+	Cc: Jon Masters <jcm@redhat.com>
+	Cc: Waiman Long <longman9394@gmail.com>
+	Cc: Greg KH <gregkh@linuxfoundation.org>
+	Cc: Dave Stewart <david.c.stewart@intel.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1811272247140.1875@nanos.tec.linutronix.de
+
+(cherry picked from commit 6d991ba509ebcfcc908e009d1db51972a4f7a064)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/spec-ctrl.h
+#	arch/x86/include/asm/thread_info.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kernel/process.c
+diff --cc arch/x86/include/asm/thread_info.h
+index d21b4db8c02f,82b73b75d67c..000000000000
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@@ -79,6 -83,8 +79,11 @@@ struct thread_info 
+  #define TIF_SYSCALL_EMU		6	/* syscall emulation active */
+  #define TIF_SYSCALL_AUDIT	7	/* syscall auditing active */
+  #define TIF_SECCOMP		8	/* secure computing */
+++<<<<<<< HEAD
+++=======
++ #define TIF_SPEC_IB		9	/* Indirect branch speculation mitigation */
++ #define TIF_SPEC_FORCE_UPDATE	10	/* Force speculation MSR update in context switch */
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  #define TIF_USER_RETURN_NOTIFY	11	/* notify kernel of userspace return */
+  #define TIF_UPROBE		12	/* breakpointed or singlestepping */
+  #define TIF_PATCH_PENDING	13	/* pending live patching update */
+@@@ -106,6 -112,8 +111,11 @@@
+  #define _TIF_SYSCALL_EMU	(1 << TIF_SYSCALL_EMU)
+  #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+  #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+++<<<<<<< HEAD
+++=======
++ #define _TIF_SPEC_IB		(1 << TIF_SPEC_IB)
++ #define _TIF_SPEC_FORCE_UPDATE	(1 << TIF_SPEC_FORCE_UPDATE)
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  #define _TIF_USER_RETURN_NOTIFY	(1 << TIF_USER_RETURN_NOTIFY)
+  #define _TIF_UPROBE		(1 << TIF_UPROBE)
+  #define _TIF_PATCH_PENDING	(1 << TIF_PATCH_PENDING)
+@@@ -145,25 -145,28 +155,40 @@@
+  	(_TIF_SYSCALL_TRACE | _TIF_NOTIFY_RESUME | _TIF_SIGPENDING |	\
+  	 _TIF_NEED_RESCHED | _TIF_SINGLESTEP | _TIF_SYSCALL_EMU |	\
+  	 _TIF_SYSCALL_AUDIT | _TIF_USER_RETURN_NOTIFY | _TIF_UPROBE |	\
+ -	 _TIF_PATCH_PENDING | _TIF_NOHZ | _TIF_SYSCALL_TRACEPOINT |	\
+ -	 _TIF_FSCHECK)
+ +	 _TIF_PATCH_PENDING | _TIF_NOHZ | _TIF_SYSCALL_TRACEPOINT)
+ +
+ +/* Only used for 64 bit */
+ +#define _TIF_DO_NOTIFY_MASK						\
+ +	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME |				\
+ +	 _TIF_USER_RETURN_NOTIFY | _TIF_PATCH_PENDING | _TIF_UPROBE)
+  
+  /* flags to check in __switch_to() */
+++<<<<<<< HEAD
+ +#define _TIF_WORK_CTXSW							\
+ +	(_TIF_IO_BITMAP|_TIF_NOTSC|_TIF_BLOCKSTEP|_TIF_SSBD)
+++=======
++ #define _TIF_WORK_CTXSW_BASE						\
++ 	(_TIF_IO_BITMAP|_TIF_NOCPUID|_TIF_NOTSC|_TIF_BLOCKSTEP|		\
++ 	 _TIF_SSBD | _TIF_SPEC_FORCE_UPDATE)
++ 
++ /*
++  * Avoid calls to __switch_to_xtra() on UP as STIBP is not evaluated.
++  */
++ #ifdef CONFIG_SMP
++ # define _TIF_WORK_CTXSW	(_TIF_WORK_CTXSW_BASE | _TIF_SPEC_IB)
++ #else
++ # define _TIF_WORK_CTXSW	(_TIF_WORK_CTXSW_BASE)
++ #endif
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  
+  #define _TIF_WORK_CTXSW_PREV (_TIF_WORK_CTXSW|_TIF_USER_RETURN_NOTIFY)
+ -#define _TIF_WORK_CTXSW_NEXT (_TIF_WORK_CTXSW)
+ +#define _TIF_WORK_CTXSW_NEXT (_TIF_WORK_CTXSW|_TIF_DEBUG)
+  
+ -#define STACK_WARN		(THREAD_SIZE/8)
+ +#define PREEMPT_ACTIVE		0x10000000
+  
+ +#ifdef CONFIG_X86_32
+ +
+ +#define STACK_WARN	(THREAD_SIZE/8)
+  /*
+   * macros/functions for gaining access to the thread information structure
+   *
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 12a489be7869,29f40a92f5a8..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -408,10 -702,25 +408,32 @@@ void ssb_select_mitigation(
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Speculation prctl: " fmt
+  
+++<<<<<<< HEAD
+ +static int ssb_prctl_set(struct task_struct *task, unsigned long ctrl)
+ +{
+ +	bool update;
+ +
+++=======
++ static void task_update_spec_tif(struct task_struct *tsk)
++ {
++ 	/* Force the update of the real TIF bits */
++ 	set_tsk_thread_flag(tsk, TIF_SPEC_FORCE_UPDATE);
++ 
++ 	/*
++ 	 * Immediately update the speculation control MSRs for the current
++ 	 * task, but for a non-current task delay setting the CPU
++ 	 * mitigation until it is scheduled next.
++ 	 *
++ 	 * This can only happen for SECCOMP mitigation. For PRCTL it's
++ 	 * always the current task.
++ 	 */
++ 	if (tsk == current)
++ 		speculation_ctrl_update_current();
++ }
++ 
++ static int ssb_prctl_set(struct task_struct *task, unsigned long ctrl)
++ {
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  	if (ssb_mode != SPEC_STORE_BYPASS_PRCTL &&
+  	    ssb_mode != SPEC_STORE_BYPASS_SECCOMP)
+  		return -ENXIO;
+@@@ -422,16 -731,16 +444,28 @@@
+  		if (task_spec_ssb_force_disable(task))
+  			return -EPERM;
+  		task_clear_spec_ssb_disable(task);
+++<<<<<<< HEAD
+ +		update = test_and_clear_tsk_thread_flag(task, TIF_SSBD);
+ +		break;
+ +	case PR_SPEC_DISABLE:
+ +		task_set_spec_ssb_disable(task);
+ +		update = !test_and_set_tsk_thread_flag(task, TIF_SSBD);
+++=======
++ 		task_update_spec_tif(task);
++ 		break;
++ 	case PR_SPEC_DISABLE:
++ 		task_set_spec_ssb_disable(task);
++ 		task_update_spec_tif(task);
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  		break;
+  	case PR_SPEC_FORCE_DISABLE:
+  		task_set_spec_ssb_disable(task);
+  		task_set_spec_ssb_force_disable(task);
+++<<<<<<< HEAD
+ +		update = !test_and_set_tsk_thread_flag(task, TIF_SSBD);
+++=======
++ 		task_update_spec_tif(task);
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  		break;
+  	default:
+  		return -ERANGE;
+diff --cc arch/x86/kernel/process.c
+index 5ad9710f0312,afbe2eb4a1c6..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -315,79 -398,119 +315,119 @@@ static __always_inline void amd_set_ssb
+  	wrmsrl(MSR_AMD64_VIRT_SPEC_CTRL, ssbd_tif_to_spec_ctrl(tifn));
+  }
+  
+ -/*
+ - * Update the MSRs managing speculation control, during context switch.
+ - *
+ - * tifp: Previous task's thread flags
+ - * tifn: Next task's thread flags
+ - */
+ -static __always_inline void __speculation_ctrl_update(unsigned long tifp,
+ -						      unsigned long tifn)
+ +static __always_inline void intel_set_ssb_state(unsigned long tifn)
+  {
+ -	unsigned long tif_diff = tifp ^ tifn;
+ -	u64 msr = x86_spec_ctrl_base;
+ -	bool updmsr = false;
+ -
+ -	/*
+ -	 * If TIF_SSBD is different, select the proper mitigation
+ -	 * method. Note that if SSBD mitigation is disabled or permanentely
+ -	 * enabled this branch can't be taken because nothing can set
+ -	 * TIF_SSBD.
+ -	 */
+ -	if (tif_diff & _TIF_SSBD) {
+ -		if (static_cpu_has(X86_FEATURE_VIRT_SSBD)) {
+ -			amd_set_ssb_virt_state(tifn);
+ -		} else if (static_cpu_has(X86_FEATURE_LS_CFG_SSBD)) {
+ -			amd_set_core_ssb_state(tifn);
+ -		} else if (static_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD) ||
+ -			   static_cpu_has(X86_FEATURE_AMD_SSBD)) {
+ -			msr |= ssbd_tif_to_spec_ctrl(tifn);
+ -			updmsr  = true;
+ -		}
+ -	}
+ +	spec_ctrl_set_ssbd(ssbd_tif_to_spec_ctrl(tifn));
+ +	wrmsrl(MSR_IA32_SPEC_CTRL, this_cpu_read(spec_ctrl_pcp.entry64));
+ +}
+  
+ -	/*
+ -	 * Only evaluate TIF_SPEC_IB if conditional STIBP is enabled,
+ -	 * otherwise avoid the MSR write.
+ -	 */
+ -	if (IS_ENABLED(CONFIG_SMP) &&
+ -	    static_branch_unlikely(&switch_to_cond_stibp)) {
+ -		updmsr |= !!(tif_diff & _TIF_SPEC_IB);
+ -		msr |= stibp_tif_to_spec_ctrl(tifn);
+ -	}
+++<<<<<<< HEAD
+ +static __always_inline void __speculative_store_bypass_update(unsigned long tifn)
+ +{
+ +	if (!static_key_false(&ssbd_userset_key))
+ +		return;	/* Don't do anything if not user settable */
+  
+ -	if (updmsr)
+ -		wrmsrl(MSR_IA32_SPEC_CTRL, msr);
+ +	if (static_cpu_has(X86_FEATURE_VIRT_SSBD))
+ +		amd_set_ssb_virt_state(tifn);
+ +	else if (static_cpu_has(X86_FEATURE_LS_CFG_SSBD))
+ +		amd_set_core_ssb_state(tifn);
+ +	else
+ +		intel_set_ssb_state(tifn);
+  }
+  
+ +void speculative_store_bypass_update(unsigned long tif)
+++=======
++ static unsigned long speculation_ctrl_update_tif(struct task_struct *tsk)
++ {
++ 	if (test_and_clear_tsk_thread_flag(tsk, TIF_SPEC_FORCE_UPDATE)) {
++ 		if (task_spec_ssb_disable(tsk))
++ 			set_tsk_thread_flag(tsk, TIF_SSBD);
++ 		else
++ 			clear_tsk_thread_flag(tsk, TIF_SSBD);
++ 	}
++ 	/* Return the updated threadinfo flags*/
++ 	return task_thread_info(tsk)->flags;
++ }
++ 
++ void speculation_ctrl_update(unsigned long tif)
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  {
+ -	/* Forced update. Make sure all relevant TIF flags are different */
+  	preempt_disable();
+ -	__speculation_ctrl_update(~tif, tif);
+ +	__speculative_store_bypass_update(tif);
+  	preempt_enable();
+  }
+ +EXPORT_SYMBOL_GPL(speculative_store_bypass_update);
+  
+++<<<<<<< HEAD
+ +void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p,
+ +		      struct tss_struct *tss)
+++=======
++ /* Called from seccomp/prctl update */
++ void speculation_ctrl_update_current(void)
++ {
++ 	preempt_disable();
++ 	speculation_ctrl_update(speculation_ctrl_update_tif(current));
++ 	preempt_enable();
++ }
++ 
++ void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p)
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  {
+  	struct thread_struct *prev, *next;
+ -	unsigned long tifp, tifn;
+  
+  	prev = &prev_p->thread;
+  	next = &next_p->thread;
+  
+ -	tifn = READ_ONCE(task_thread_info(next_p)->flags);
+ -	tifp = READ_ONCE(task_thread_info(prev_p)->flags);
+ -	switch_to_bitmap(prev, next, tifp, tifn);
+ -
+ -	propagate_user_return_notify(prev_p, next_p);
+ +	if (test_tsk_thread_flag(prev_p, TIF_BLOCKSTEP) ^
+ +	    test_tsk_thread_flag(next_p, TIF_BLOCKSTEP)) {
+ +		unsigned long debugctl = get_debugctlmsr();
+  
+ -	if ((tifp & _TIF_BLOCKSTEP || tifn & _TIF_BLOCKSTEP) &&
+ -	    arch_has_block_step()) {
+ -		unsigned long debugctl, msk;
+ -
+ -		rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
+  		debugctl &= ~DEBUGCTLMSR_BTF;
+ -		msk = tifn & _TIF_BLOCKSTEP;
+ -		debugctl |= (msk >> TIF_BLOCKSTEP) << DEBUGCTLMSR_BTF_SHIFT;
+ -		wrmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
+ +		if (test_tsk_thread_flag(next_p, TIF_BLOCKSTEP))
+ +			debugctl |= DEBUGCTLMSR_BTF;
+ +
+ +		update_debugctlmsr(debugctl);
+  	}
+  
+ -	if ((tifp ^ tifn) & _TIF_NOTSC)
+ -		cr4_toggle_bits_irqsoff(X86_CR4_TSD);
+ +	if (test_tsk_thread_flag(prev_p, TIF_NOTSC) ^
+ +	    test_tsk_thread_flag(next_p, TIF_NOTSC)) {
+ +		/* prev and next are different */
+ +		if (test_tsk_thread_flag(next_p, TIF_NOTSC))
+ +			hard_disable_TSC();
+ +		else
+ +			hard_enable_TSC();
+ +	}
+  
+ -	if ((tifp ^ tifn) & _TIF_NOCPUID)
+ -		set_cpuid_faulting(!!(tifn & _TIF_NOCPUID));
+ +	if (test_tsk_thread_flag(next_p, TIF_IO_BITMAP)) {
+ +		/*
+ +		 * Copy the relevant range of the IO bitmap.
+ +		 * Normally this is 128 bytes or less:
+ +		 */
+ +		memcpy(tss->io_bitmap, next->io_bitmap_ptr,
+ +		       max(prev->io_bitmap_max, next->io_bitmap_max));
+ +	} else if (test_tsk_thread_flag(prev_p, TIF_IO_BITMAP)) {
+ +		/*
+ +		 * Clear any possible leftover bits:
+ +		 */
+ +		memset(tss->io_bitmap, 0xff, prev->io_bitmap_max);
+ +	}
+ +	propagate_user_return_notify(prev_p, next_p);
+  
+++<<<<<<< HEAD
+ +	if (test_tsk_thread_flag(prev_p, TIF_SSBD) ^
+ +	    test_tsk_thread_flag(next_p, TIF_SSBD))
+ +		__speculative_store_bypass_update(task_thread_info(next_p)->flags);
+++=======
++ 	if (likely(!((tifp | tifn) & _TIF_SPEC_FORCE_UPDATE))) {
++ 		__speculation_ctrl_update(tifp, tifn);
++ 	} else {
++ 		speculation_ctrl_update_tif(prev_p);
++ 		tifn = speculation_ctrl_update_tif(next_p);
++ 
++ 		/* Enforce MSR update to ensure consistent state */
++ 		__speculation_ctrl_update(~tifn, tifn);
++ 	}
+++>>>>>>> 6d991ba509eb (x86/speculation: Prevent stale SPEC_CTRL msr content)
+  }
+  
+  /*
+* Unmerged path arch/x86/include/asm/spec-ctrl.h
+* Unmerged path arch/x86/include/asm/spec-ctrl.h
+* Unmerged path arch/x86/include/asm/thread_info.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kernel/process.c
