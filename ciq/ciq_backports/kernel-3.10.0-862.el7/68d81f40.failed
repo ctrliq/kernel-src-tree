@@ -1,0 +1,306 @@
+scsi: remove MSG_*_TAG defines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [qla2_target] remove MSG_*_TAG defines (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 88.89%
+commit-author Christoph Hellwig <hch@infradead.org>
+commit 68d81f40047cc4f99e86807e1160fb07a7b856c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/68d81f40.failed
+
+For SPI drivers use the message definitions from scsi.h, and for target
+drivers introduce a new TCM_*_TAG namespace.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com
+(cherry picked from commit 68d81f40047cc4f99e86807e1160fb07a7b856c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+#	drivers/scsi/scsi_transport_spi.c
+#	drivers/xen/xen-scsiback.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 72146d165e84,3a0ca61b02c8..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -1364,31 -1722,68 +1364,92 @@@ static void srpt_handle_cmd(struct srpt
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	rc = srpt_get_desc_tbl(send_ioctx, srp_cmd, &dir, &sg, &sg_cnt,
+ +			&data_len);
+ +	if (rc) {
+ +		if (rc != -EAGAIN) {
+ +			pr_err("0x%llx: parsing SRP descriptor table failed.\n",
+ +			       srp_cmd->tag);
+++=======
++ 	if (srpt_get_desc_tbl(send_ioctx, srp_cmd, &dir, &data_len)) {
++ 		printk(KERN_ERR "0x%llx: parsing SRP descriptor table failed.\n",
++ 		       srp_cmd->tag);
++ 		ret = TCM_INVALID_CDB_FIELD;
++ 		goto send_sense;
++ 	}
++ 
++ 	unpacked_lun = srpt_unpack_lun((uint8_t *)&srp_cmd->lun,
++ 				       sizeof(srp_cmd->lun));
++ 	rc = target_submit_cmd(cmd, ch->sess, srp_cmd->cdb,
++ 			&send_ioctx->sense_data[0], unpacked_lun, data_len,
++ 			TCM_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF);
++ 	if (rc != 0) {
++ 		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 		goto send_sense;
++ 	}
++ 	return 0;
++ 
++ send_sense:
++ 	transport_send_check_condition_and_sense(cmd, ret, 0);
++ 	return -1;
++ }
++ 
++ /**
++  * srpt_rx_mgmt_fn_tag() - Process a task management function by tag.
++  * @ch: RDMA channel of the task management request.
++  * @fn: Task management function to perform.
++  * @req_tag: Tag of the SRP task management request.
++  * @mgmt_ioctx: I/O context of the task management request.
++  *
++  * Returns zero if the target core will process the task management
++  * request asynchronously.
++  *
++  * Note: It is assumed that the initiator serializes tag-based task management
++  * requests.
++  */
++ static int srpt_rx_mgmt_fn_tag(struct srpt_send_ioctx *ioctx, u64 tag)
++ {
++ 	struct srpt_device *sdev;
++ 	struct srpt_rdma_ch *ch;
++ 	struct srpt_send_ioctx *target;
++ 	int ret, i;
++ 
++ 	ret = -EINVAL;
++ 	ch = ioctx->ch;
++ 	BUG_ON(!ch);
++ 	BUG_ON(!ch->sport);
++ 	sdev = ch->sport->sdev;
++ 	BUG_ON(!sdev);
++ 	spin_lock_irq(&sdev->spinlock);
++ 	for (i = 0; i < ch->rq_size; ++i) {
++ 		target = ch->ioctx_ring[i];
++ 		if (target->cmd.se_lun == ioctx->cmd.se_lun &&
++ 		    target->tag == tag &&
++ 		    srpt_get_cmd_state(target) != SRPT_STATE_DONE) {
++ 			ret = 0;
++ 			/* now let the target core abort &target->cmd; */
++ 			break;
+++>>>>>>> 68d81f40047c (scsi: remove MSG_*_TAG defines)
+  		}
+ +		goto release_ioctx;
+  	}
+ -	spin_unlock_irq(&sdev->spinlock);
+ -	return ret;
+ +
+ +	rc = target_submit_cmd_map_sgls(cmd, ch->sess, srp_cmd->cdb,
+ +			       &send_ioctx->sense_data[0],
+ +			       scsilun_to_int(&srp_cmd->lun), data_len,
+ +			       TCM_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF,
+ +			       sg, sg_cnt, NULL, 0, NULL, 0);
+ +	if (rc != 0) {
+ +		pr_debug("target_submit_cmd() returned %d for tag %#llx\n", rc,
+ +			 srp_cmd->tag);
+ +		goto release_ioctx;
+ +	}
+ +	return;
+ +
+ +release_ioctx:
+ +	send_ioctx->state = SRPT_STATE_DONE;
+ +	srpt_release_cmd(cmd);
+  }
+  
+  static int srp_tmr_to_tcm(int fn)
+diff --cc drivers/scsi/scsi_transport_spi.c
+index 2c58415beac6,31bbb0da3397..000000000000
+--- a/drivers/scsi/scsi_transport_spi.c
++++ b/drivers/scsi/scsi_transport_spi.c
+@@@ -1207,6 -1208,28 +1207,31 @@@ int spi_populate_ppr_msg(unsigned char 
+  }
+  EXPORT_SYMBOL_GPL(spi_populate_ppr_msg);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * spi_populate_tag_msg - place a tag message in a buffer
++  * @msg:	pointer to the area to place the tag
++  * @cmd:	pointer to the scsi command for the tag
++  *
++  * Notes:
++  *	designed to create the correct type of tag message for the 
++  *	particular request.  Returns the size of the tag message.
++  *	May return 0 if TCQ is disabled for this device.
++  **/
++ int spi_populate_tag_msg(unsigned char *msg, struct scsi_cmnd *cmd)
++ {
++         if (cmd->flags & SCMD_TAGGED) {
++ 		*msg++ = SIMPLE_QUEUE_TAG;
++         	*msg++ = cmd->request->tag;
++         	return 2;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(spi_populate_tag_msg);
++ 
+++>>>>>>> 68d81f40047c (scsi: remove MSG_*_TAG defines)
+  #ifdef CONFIG_SCSI_CONSTANTS
+  static const char * const one_byte_msgs[] = {
+  /* 0x00 */ "Task Complete", NULL /* Extended Message */, "Save Pointers",
+* Unmerged path drivers/xen/xen-scsiback.c
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --git a/drivers/scsi/advansys.c b/drivers/scsi/advansys.c
+index 0a6ecbd229b8..9062c5450f9d 100644
+--- a/drivers/scsi/advansys.c
++++ b/drivers/scsi/advansys.c
+@@ -7926,9 +7926,9 @@ static int asc_build_req(struct asc_board *boardp, struct scsi_cmnd *scp,
+ 	 */
+ 	if ((asc_dvc->cur_dvc_qng[scp->device->id] > 0) &&
+ 	    (boardp->reqcnt[scp->device->id] % 255) == 0) {
+-		asc_scsi_q->q2.tag_code = MSG_ORDERED_TAG;
++		asc_scsi_q->q2.tag_code = ORDERED_QUEUE_TAG;
+ 	} else {
+-		asc_scsi_q->q2.tag_code = MSG_SIMPLE_TAG;
++		asc_scsi_q->q2.tag_code = SIMPLE_QUEUE_TAG;
+ 	}
+ 
+ 	/* Build ASC_SCSI_Q */
+@@ -8356,7 +8356,7 @@ static int AscPutReadyQueue(ASC_DVC_VAR *asc_dvc, ASC_SCSI_Q *scsiq, uchar q_no)
+ 	}
+ 	q_addr = ASC_QNO_TO_QADDR(q_no);
+ 	if ((scsiq->q1.target_id & asc_dvc->use_tagged_qng) == 0) {
+-		scsiq->q2.tag_code &= ~MSG_SIMPLE_TAG;
++		scsiq->q2.tag_code &= ~SIMPLE_QUEUE_TAG;
+ 	}
+ 	scsiq->q1.status = QS_FREE;
+ 	AscMemWordCopyPtrToLram(iop_base,
+@@ -8674,7 +8674,7 @@ static int AscExeScsiQueue(ASC_DVC_VAR *asc_dvc, ASC_SCSI_Q *scsiq)
+ 		}
+ 	}
+ 	if (disable_syn_offset_one_fix) {
+-		scsiq->q2.tag_code &= ~MSG_SIMPLE_TAG;
++		scsiq->q2.tag_code &= ~SIMPLE_QUEUE_TAG;
+ 		scsiq->q2.tag_code |= (ASC_TAG_FLAG_DISABLE_ASYN_USE_SYN_FIX |
+ 				       ASC_TAG_FLAG_DISABLE_DISCONNECT);
+ 	} else {
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 34388aa2cf90..9ef12a58cbc7 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -2592,25 +2592,25 @@ static inline int qlt_get_fcp_task_attr(struct scsi_qla_host *vha,
+ 
+ 	switch (task_codes) {
+ 	case ATIO_SIMPLE_QUEUE:
+-		fcp_task_attr = MSG_SIMPLE_TAG;
++		fcp_task_attr = TCM_SIMPLE_TAG;
+ 		break;
+ 	case ATIO_HEAD_OF_QUEUE:
+-		fcp_task_attr = MSG_HEAD_TAG;
++		fcp_task_attr = TCM_HEAD_TAG;
+ 		break;
+ 	case ATIO_ORDERED_QUEUE:
+-		fcp_task_attr = MSG_ORDERED_TAG;
++		fcp_task_attr = TCM_ORDERED_TAG;
+ 		break;
+ 	case ATIO_ACA_QUEUE:
+-		fcp_task_attr = MSG_ACA_TAG;
++		fcp_task_attr = TCM_ACA_TAG;
+ 		break;
+ 	case ATIO_UNTAGGED:
+-		fcp_task_attr = MSG_SIMPLE_TAG;
++		fcp_task_attr = TCM_SIMPLE_TAG;
+ 		break;
+ 	default:
+ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05d,
+ 		    "qla_target: unknown task code %x, use ORDERED instead\n",
+ 		    task_codes);
+-		fcp_task_attr = MSG_ORDERED_TAG;
++		fcp_task_attr = TCM_ORDERED_TAG;
+ 		break;
+ 	}
+ 
+* Unmerged path drivers/scsi/scsi_transport_spi.c
+diff --git a/drivers/usb/gadget/tcm_usb_gadget.c b/drivers/usb/gadget/tcm_usb_gadget.c
+index 7cacd6ae818e..6fd47af5113a 100644
+--- a/drivers/usb/gadget/tcm_usb_gadget.c
++++ b/drivers/usb/gadget/tcm_usb_gadget.c
+@@ -1131,19 +1131,19 @@ static int usbg_submit_command(struct f_uas *fu,
+ 
+ 	switch (cmd_iu->prio_attr & 0x7) {
+ 	case UAS_HEAD_TAG:
+-		cmd->prio_attr = MSG_HEAD_TAG;
++		cmd->prio_attr = TCM_HEAD_TAG;
+ 		break;
+ 	case UAS_ORDERED_TAG:
+-		cmd->prio_attr = MSG_ORDERED_TAG;
++		cmd->prio_attr = TCM_ORDERED_TAG;
+ 		break;
+ 	case UAS_ACA:
+-		cmd->prio_attr = MSG_ACA_TAG;
++		cmd->prio_attr = TCM_ACA_TAG;
+ 		break;
+ 	default:
+ 		pr_debug_once("Unsupported prio_attr: %02x.\n",
+ 				cmd_iu->prio_attr);
+ 	case UAS_SIMPLE_TAG:
+-		cmd->prio_attr = MSG_SIMPLE_TAG;
++		cmd->prio_attr = TCM_SIMPLE_TAG;
+ 		break;
+ 	}
+ 
+@@ -1240,7 +1240,7 @@ static int bot_submit_command(struct f_uas *fu,
+ 		goto err;
+ 	}
+ 
+-	cmd->prio_attr = MSG_SIMPLE_TAG;
++	cmd->prio_attr = TCM_SIMPLE_TAG;
+ 	se_cmd = &cmd->se_cmd;
+ 	cmd->unpacked_lun = cbw->Lun;
+ 	cmd->is_read = cbw->Flags & US_BULK_FLAG_IN ? 1 : 0;
+* Unmerged path drivers/xen/xen-scsiback.c
+diff --git a/include/scsi/scsi_tcq.h b/include/scsi/scsi_tcq.h
+index e2d135387d39..0ff573ad9d44 100644
+--- a/include/scsi/scsi_tcq.h
++++ b/include/scsi/scsi_tcq.h
+@@ -6,11 +6,6 @@
+ #include <scsi/scsi_device.h>
+ #include <scsi/scsi_host.h>
+ 
+-#define MSG_SIMPLE_TAG	0x20
+-#define MSG_HEAD_TAG	0x21
+-#define MSG_ORDERED_TAG	0x22
+-#define MSG_ACA_TAG	0x24	/* unsupported */
+-
+ #define SCSI_NO_TAG	(-1)    /* identify no tag in use */
+ 
+ 
+diff --git a/include/trace/events/target.h b/include/trace/events/target.h
+index 45403443dd82..04c3c6efdcc2 100644
+--- a/include/trace/events/target.h
++++ b/include/trace/events/target.h
+@@ -109,10 +109,10 @@
+ 
+ #define show_task_attribute_name(val)				\
+ 	__print_symbolic(val,					\
+-		{ MSG_SIMPLE_TAG,	"SIMPLE"	},	\
+-		{ MSG_HEAD_TAG,		"HEAD"		},	\
+-		{ MSG_ORDERED_TAG,	"ORDERED"	},	\
+-		{ MSG_ACA_TAG,		"ACA"		} )
++		{ TCM_SIMPLE_TAG,	"SIMPLE"	},	\
++		{ TCM_HEAD_TAG,		"HEAD"		},	\
++		{ TCM_ORDERED_TAG,	"ORDERED"	},	\
++		{ TCM_ACA_TAG,		"ACA"		} )
+ 
+ #define show_scsi_status_name(val)				\
+ 	__print_symbolic(val,					\
