@@ -1455,11 +1455,10 @@ add_lease_context(struct TCP_Server_Info *server, struct kvec *iov,
 	req->RequestedOplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
 	if (!req->CreateContextsOffset)
 		req->CreateContextsOffset = cpu_to_le32(
-				sizeof(struct smb2_create_req) - 4 +
+				sizeof(struct smb2_create_req) +
 				iov[num - 1].iov_len);
 	le32_add_cpu(&req->CreateContextsLength,
 		     server->vals->create_lease_size);
-	inc_rfc1001_len(&req->hdr, server->vals->create_lease_size);
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -1539,10 +1538,9 @@ add_durable_v2_context(struct kvec *iov, unsigned int *num_iovec,
 	iov[num].iov_len = sizeof(struct create_durable_v2);
 	if (!req->CreateContextsOffset)
 		req->CreateContextsOffset =
-			cpu_to_le32(sizeof(struct smb2_create_req) - 4 +
+			cpu_to_le32(sizeof(struct smb2_create_req) +
 								iov[1].iov_len);
 	le32_add_cpu(&req->CreateContextsLength, sizeof(struct create_durable_v2));
-	inc_rfc1001_len(&req->hdr, sizeof(struct create_durable_v2));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -1563,11 +1561,9 @@ add_durable_reconnect_v2_context(struct kvec *iov, unsigned int *num_iovec,
 	iov[num].iov_len = sizeof(struct create_durable_handle_reconnect_v2);
 	if (!req->CreateContextsOffset)
 		req->CreateContextsOffset =
-			cpu_to_le32(sizeof(struct smb2_create_req) - 4 +
+			cpu_to_le32(sizeof(struct smb2_create_req) +
 								iov[1].iov_len);
 	le32_add_cpu(&req->CreateContextsLength,
-			sizeof(struct create_durable_handle_reconnect_v2));
-	inc_rfc1001_len(&req->hdr,
 			sizeof(struct create_durable_handle_reconnect_v2));
 	*num_iovec = num + 1;
 	return 0;
@@ -1599,10 +1595,9 @@ add_durable_context(struct kvec *iov, unsigned int *num_iovec,
 	iov[num].iov_len = sizeof(struct create_durable);
 	if (!req->CreateContextsOffset)
 		req->CreateContextsOffset =
-			cpu_to_le32(sizeof(struct smb2_create_req) - 4 +
+			cpu_to_le32(sizeof(struct smb2_create_req) +
 								iov[1].iov_len);
 	le32_add_cpu(&req->CreateContextsLength, sizeof(struct create_durable));
-	inc_rfc1001_len(&req->hdr, sizeof(struct create_durable));
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -1673,6 +1668,7 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 	__u32 file_attributes = 0;
 	char *dhc_buf = NULL, *lc_buf = NULL;
 	int flags = 0;
+	unsigned int total_len;
 
 	cifs_dbg(FYI, "create/open\n");
 
@@ -1681,7 +1677,8 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 	else
 		return -EIO;
 
-	rc = small_smb2_init(SMB2_CREATE, tcon, (void **) &req);
+	rc = smb2_plain_req_init(SMB2_CREATE, tcon, (void **) &req, &total_len);
+
 	if (rc)
 		return rc;
 
@@ -1702,12 +1699,10 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 	req->CreateOptions = cpu_to_le32(oparms->create_options & CREATE_OPTIONS_MASK);
 
 	iov[0].iov_base = (char *)req;
-	/* 4 for rfc1002 length field */
-	iov[0].iov_len = get_rfc1002_length(req) + 4;
 	/* -1 since last byte is buf[0] which is sent below (path) */
-	iov[0].iov_len--;
+	iov[0].iov_len = total_len - 1;
 
-	req->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req) - 4);
+	req->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
 
 	/* [MS-SMB2] 2.2.13 NameOffset:
 	 * If SMB2_FLAGS_DFS_OPERATIONS is set in the Flags field of
@@ -1720,7 +1715,7 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 	if (tcon->share_flags & SHI1005_FLAGS_DFS) {
 		int name_len;
 
-		req->hdr.sync_hdr.Flags |= SMB2_FLAGS_DFS_OPERATIONS;
+		req->sync_hdr.Flags |= SMB2_FLAGS_DFS_OPERATIONS;
 		rc = alloc_path_with_tree_prefix(&copy_path, &copy_size,
 						 &name_len,
 						 tcon->treeName, path);
@@ -1747,8 +1742,6 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 
 	iov[1].iov_len = uni_path_len;
 	iov[1].iov_base = path;
-	/* -1 since last byte is buf[0] which was counted in smb2_buf_len */
-	inc_rfc1001_len(req, uni_path_len - 1);
 
 	if (!server->oplocks)
 		*oplock = SMB2_OPLOCK_LEVEL_NONE;
@@ -1786,7 +1779,8 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
 		dhc_buf = iov[n_iov-1].iov_base;
 	}
 
-	rc = SendReceive2(xid, ses, iov, n_iov, &resp_buftype, flags, &rsp_iov);
+	rc = smb2_send_recv(xid, ses, iov, n_iov, &resp_buftype, flags,
+			    &rsp_iov);
 	cifs_small_buf_release(req);
 	rsp = (struct smb2_create_rsp *)rsp_iov.iov_base;
 
