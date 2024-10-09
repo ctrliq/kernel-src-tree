@@ -1,0 +1,143 @@
+KVM: x86: fix singlestepping over syscall
+
+jira LE-1907
+cve CVE-2017-7518
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] kvm: fix singlestepping over syscall (Paolo Bonzini) [1464481] {CVE-2017-7518}
+Rebuild_FUZZ: 93.51%
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit c8401dda2f0a00cd25c0af6a95ed50e478d25de4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c8401dda.failed
+
+TF is handled a bit differently for syscall and sysret, compared
+to the other instructions: TF is checked after the instruction completes,
+so that the OS can disable #DB at a syscall by adding TF to FMASK.
+When the sysret is executed the #DB is taken "as if" the syscall insn
+just completed.
+
+KVM emulates syscall so that it can trap 32-bit syscall on Intel processors.
+Fix the behavior, otherwise you could get #DB on a user stack which is not
+nice.  This does not affect Linux guests, as they use an IST or task gate
+for #DB.
+
+This fixes CVE-2017-7518.
+
+	Cc: stable@vger.kernel.org
+	Reported-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit c8401dda2f0a00cd25c0af6a95ed50e478d25de4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 99e230533b87,0e846f0cb83b..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -5385,36 -5534,45 +5387,78 @@@ static void kvm_vcpu_do_singlestep(stru
+  {
+  	struct kvm_run *kvm_run = vcpu->run;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * rflags is the old, "raw" value of the flags.  The new value has
+ +	 * not been saved yet.
+ +	 *
+ +	 * This is correct even for TF set by the guest, because "the
+ +	 * processor will not generate this exception after the instruction
+ +	 * that sets the TF flag".
+ +	 */
+ +	if (unlikely(rflags & X86_EFLAGS_TF)) {
+ +		if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+ +			kvm_run->debug.arch.dr6 = DR6_BS | DR6_FIXED_1 |
+ +						  DR6_RTM;
+ +			kvm_run->debug.arch.pc = vcpu->arch.singlestep_rip;
+ +			kvm_run->debug.arch.exception = DB_VECTOR;
+ +			kvm_run->exit_reason = KVM_EXIT_DEBUG;
+ +			*r = EMULATE_USER_EXIT;
+ +		} else {
+ +			vcpu->arch.emulate_ctxt.eflags &= ~X86_EFLAGS_TF;
+ +			/*
+ +			 * "Certain debug exceptions may clear bit 0-3.  The
+ +			 * remaining contents of the DR6 register are never
+ +			 * cleared by the processor".
+ +			 */
+ +			vcpu->arch.dr6 &= ~15;
+ +			vcpu->arch.dr6 |= DR6_BS | DR6_RTM;
+ +			kvm_queue_exception(vcpu, DB_VECTOR);
+ +		}
+ +	}
+ +}
+ +
+++=======
++ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
++ 		kvm_run->debug.arch.dr6 = DR6_BS | DR6_FIXED_1 | DR6_RTM;
++ 		kvm_run->debug.arch.pc = vcpu->arch.singlestep_rip;
++ 		kvm_run->debug.arch.exception = DB_VECTOR;
++ 		kvm_run->exit_reason = KVM_EXIT_DEBUG;
++ 		*r = EMULATE_USER_EXIT;
++ 	} else {
++ 		/*
++ 		 * "Certain debug exceptions may clear bit 0-3.  The
++ 		 * remaining contents of the DR6 register are never
++ 		 * cleared by the processor".
++ 		 */
++ 		vcpu->arch.dr6 &= ~15;
++ 		vcpu->arch.dr6 |= DR6_BS | DR6_RTM;
++ 		kvm_queue_exception(vcpu, DB_VECTOR);
++ 	}
++ }
++ 
++ int kvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
++ {
++ 	unsigned long rflags = kvm_x86_ops->get_rflags(vcpu);
++ 	int r = EMULATE_DONE;
++ 
++ 	kvm_x86_ops->skip_emulated_instruction(vcpu);
++ 
++ 	/*
++ 	 * rflags is the old, "raw" value of the flags.  The new value has
++ 	 * not been saved yet.
++ 	 *
++ 	 * This is correct even for TF set by the guest, because "the
++ 	 * processor will not generate this exception after the instruction
++ 	 * that sets the TF flag".
++ 	 */
++ 	if (unlikely(rflags & X86_EFLAGS_TF))
++ 		kvm_vcpu_do_singlestep(vcpu, &r);
++ 	return r == EMULATE_DONE;
++ }
++ EXPORT_SYMBOL_GPL(kvm_skip_emulated_instruction);
++ 
+++>>>>>>> c8401dda2f0a (KVM: x86: fix singlestepping over syscall)
+  static bool kvm_vcpu_check_breakpoint(struct kvm_vcpu *vcpu, int *r)
+  {
+  	if (unlikely(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP) &&
+diff --git a/arch/x86/include/asm/kvm_emulate.h b/arch/x86/include/asm/kvm_emulate.h
+index 19d14ac23ef9..fc3c7e49c8e4 100644
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -296,6 +296,7 @@ struct x86_emulate_ctxt {
+ 
+ 	bool perm_ok; /* do not check permissions if true */
+ 	bool ud;	/* inject an #UD if host doesn't support insn */
++	bool tf;	/* TF value before instruction (after for syscall/sysret) */
+ 
+ 	bool have_exception;
+ 	struct x86_exception exception;
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index ecc0be5cf438..daf2a99f238b 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -2780,6 +2780,7 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
+ 		ctxt->eflags &= ~(X86_EFLAGS_VM | X86_EFLAGS_IF);
+ 	}
+ 
++	ctxt->tf = (ctxt->eflags & X86_EFLAGS_TF) != 0;
+ 	return X86EMUL_CONTINUE;
+ }
+ 
+* Unmerged path arch/x86/kvm/x86.c
