@@ -1,0 +1,254 @@
+userns: Add per user namespace sysctls.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [kernel] userns: Add per user namespace sysctls ("Eric W. Biederman") [1340238]
+Rebuild_FUZZ: 98.70%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit dbec28460a89aa7c02c3301e9e108d98272549d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dbec2846.failed
+
+Limit per userns sysctls to only be opened for write by a holder
+of CAP_SYS_RESOURCE.
+
+Add all of the necessary boilerplate for having per user namespace
+sysctls.
+
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit dbec28460a89aa7c02c3301e9e108d98272549d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	kernel/Makefile
+#	kernel/user_namespace.c
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,e5697eaf6bf9..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -39,8 -39,11 +39,16 @@@ struct user_namespace 
+  	struct key		*persistent_keyring_register;
+  	struct rw_semaphore	persistent_keyring_register_sem;
+  #endif
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(int level)
+ +	RH_KABI_EXTEND(unsigned long flags)
+++=======
++ 	struct work_struct	work;
++ #ifdef CONFIG_SYSCTL
++ 	struct ctl_table_set	set;
++ 	struct ctl_table_header *sysctls;
++ #endif
+++>>>>>>> dbec28460a89 (userns: Add per user namespace sysctls.)
+  };
+  
+  extern struct user_namespace init_user_ns;
+diff --cc kernel/Makefile
+index c7912dcc7638,eb26e12c6c2a..000000000000
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@@ -2,30 -2,43 +2,39 @@@
+  # Makefile for the linux kernel.
+  #
+  
+ -obj-y     = fork.o exec_domain.o panic.o \
+ -	    cpu.o exit.o softirq.o resource.o \
+ -	    sysctl.o sysctl_binary.o capability.o ptrace.o user.o \
+ +obj-y     = fork.o exec_domain.o panic.o printk.o \
+ +	    cpu.o exit.o itimer.o time.o softirq.o resource.o \
+ +	    sysctl.o sysctl_binary.o capability.o ptrace.o timer.o user.o \
+  	    signal.o sys.o kmod.o workqueue.o pid.o task_work.o \
+++<<<<<<< HEAD
+ +	    rcupdate.o extable.o params.o posix-timers.o \
+ +	    kthread.o wait.o sys_ni.o posix-cpu-timers.o mutex.o \
+ +	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
+ +	    notifier.o ksysfs.o cred.o \
+ +	    async.o range.o groups.o lglock.o smpboot.o \
+ +	    rh_taint.o rh_kabi.o rh_shadowman.o mcs_spinlock.o
+++=======
++ 	    extable.o params.o \
++ 	    kthread.o sys_ni.o nsproxy.o \
++ 	    notifier.o ksysfs.o cred.o reboot.o \
++ 	    async.o range.o smpboot.o ucount.o
++ 
++ obj-$(CONFIG_MULTIUSER) += groups.o
+++>>>>>>> dbec28460a89 (userns: Add per user namespace sysctls.)
+  
+  ifdef CONFIG_FUNCTION_TRACER
+ -# Do not trace internal ftrace files
+ -CFLAGS_REMOVE_irq_work.o = $(CC_FLAGS_FTRACE)
+ +# Do not trace debug files and internal ftrace files
+ +CFLAGS_REMOVE_lockdep.o = -pg
+ +CFLAGS_REMOVE_lockdep_proc.o = -pg
+ +CFLAGS_REMOVE_mutex-debug.o = -pg
+ +CFLAGS_REMOVE_rtmutex-debug.o = -pg
+ +CFLAGS_REMOVE_cgroup-debug.o = -pg
+ +CFLAGS_REMOVE_irq_work.o = -pg
+  endif
+  
+ -# Prevents flicker of uninteresting __do_softirq()/__local_bh_disable_ip()
+ -# in coverage traces.
+ -KCOV_INSTRUMENT_softirq.o := n
+ -# These are called from save_stack_trace() on slub debug path,
+ -# and produce insane amounts of uninteresting coverage.
+ -KCOV_INSTRUMENT_module.o := n
+ -KCOV_INSTRUMENT_extable.o := n
+ -# Don't self-instrument.
+ -KCOV_INSTRUMENT_kcov.o := n
+ -KASAN_SANITIZE_kcov.o := n
+ -
+ -# cond_syscall is currently not LTO compatible
+ -CFLAGS_sys_ni.o = $(DISABLE_LTO)
+ -
+  obj-y += sched/
+ -obj-y += locking/
+  obj-y += power/
+ -obj-y += printk/
+ -obj-y += irq/
+ -obj-y += rcu/
+ -obj-y += livepatch/
+ +obj-y += cpu/
+  
+  obj-$(CONFIG_CHECKPOINT_RESTORE) += kcmp.o
+  obj-$(CONFIG_FREEZER) += freezer.o
+diff --cc kernel/user_namespace.c
+index 57f036cb8f03,a63332253c7e..000000000000
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@@ -22,8 -22,10 +22,11 @@@
+  #include <linux/ctype.h>
+  #include <linux/projid.h>
+  #include <linux/fs_struct.h>
+ +#include <linux/moduleparam.h>
+  
++ extern bool setup_userns_sysctls(struct user_namespace *ns);
++ extern void retire_userns_sysctls(struct user_namespace *ns);
++ 
+  static struct kmem_cache *user_ns_cachep __read_mostly;
+  static DEFINE_MUTEX(userns_state_mutex);
+  
+@@@ -119,10 -112,6 +122,13 @@@ int create_user_ns(struct cred *new
+  	ns->flags = parent_ns->flags;
+  	mutex_unlock(&userns_state_mutex);
+  
+++<<<<<<< HEAD
+ +	set_cred_user_ns(new, ns);
+ +
+ +	update_mnt_policy(ns);
+ +
+++=======
+++>>>>>>> dbec28460a89 (userns: Add per user namespace sysctls.)
+  #ifdef CONFIG_PERSISTENT_KEYRINGS
+  	init_rwsem(&ns->persistent_keyring_register_sem);
+  #endif
+* Unmerged path include/linux/user_namespace.h
+* Unmerged path kernel/Makefile
+diff --git a/kernel/ucount.c b/kernel/ucount.c
+new file mode 100644
+index 000000000000..cbde1dc87851
+--- /dev/null
++++ b/kernel/ucount.c
+@@ -0,0 +1,99 @@
++/*
++ *  This program is free software; you can redistribute it and/or
++ *  modify it under the terms of the GNU General Public License as
++ *  published by the Free Software Foundation, version 2 of the
++ *  License.
++ */
++
++#include <linux/stat.h>
++#include <linux/sysctl.h>
++#include <linux/slab.h>
++#include <linux/user_namespace.h>
++
++#ifdef CONFIG_SYSCTL
++static struct ctl_table_set *
++set_lookup(struct ctl_table_root *root)
++{
++	return &current_user_ns()->set;
++}
++
++static int set_is_seen(struct ctl_table_set *set)
++{
++	return &current_user_ns()->set == set;
++}
++
++static int set_permissions(struct ctl_table_header *head,
++				  struct ctl_table *table)
++{
++	struct user_namespace *user_ns =
++		container_of(head->set, struct user_namespace, set);
++	int mode;
++
++	/* Allow users with CAP_SYS_RESOURCE unrestrained access */
++	if (ns_capable(user_ns, CAP_SYS_RESOURCE))
++		mode = (table->mode & S_IRWXU) >> 6;
++	else
++	/* Allow all others at most read-only access */
++		mode = table->mode & S_IROTH;
++	return (mode << 6) | (mode << 3) | mode;
++}
++
++static struct ctl_table_root set_root = {
++	.lookup = set_lookup,
++	.permissions = set_permissions,
++};
++
++static struct ctl_table userns_table[] = {
++	{ }
++};
++#endif /* CONFIG_SYSCTL */
++
++bool setup_userns_sysctls(struct user_namespace *ns)
++{
++#ifdef CONFIG_SYSCTL
++	struct ctl_table *tbl;
++	setup_sysctl_set(&ns->set, &set_root, set_is_seen);
++	tbl = kmemdup(userns_table, sizeof(userns_table), GFP_KERNEL);
++	if (tbl) {
++		ns->sysctls = __register_sysctl_table(&ns->set, "userns", tbl);
++	}
++	if (!ns->sysctls) {
++		kfree(tbl);
++		retire_sysctl_set(&ns->set);
++		return false;
++	}
++#endif
++	return true;
++}
++
++void retire_userns_sysctls(struct user_namespace *ns)
++{
++#ifdef CONFIG_SYSCTL
++	struct ctl_table *tbl;
++
++	tbl = ns->sysctls->ctl_table_arg;
++	unregister_sysctl_table(ns->sysctls);
++	retire_sysctl_set(&ns->set);
++	kfree(tbl);
++#endif
++}
++
++static __init int user_namespace_sysctl_init(void)
++{
++#ifdef CONFIG_SYSCTL
++	static struct ctl_table_header *userns_header;
++	static struct ctl_table empty[1];
++	/*
++	 * It is necessary to register the userns directory in the
++	 * default set so that registrations in the child sets work
++	 * properly.
++	 */
++	userns_header = register_sysctl("userns", empty);
++	BUG_ON(!userns_header);
++	BUG_ON(!setup_userns_sysctls(&init_user_ns));
++#endif
++	return 0;
++}
++subsys_initcall(user_namespace_sysctl_init);
++
++
+* Unmerged path kernel/user_namespace.c
