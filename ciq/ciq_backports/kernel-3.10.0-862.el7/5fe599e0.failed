@@ -1,0 +1,386 @@
+x86/dumpstack: Add support for unwinding empty IRQ stacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 5fe599e02e41550c59831613a11c8ae057897c29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5fe599e0.failed
+
+When an interrupt happens in entry code while running on a software IRQ
+stack, and the IRQ stack was empty, regs->sp will contain the stack end
+address (e.g., irq_stack_ptr).  If the regs are passed to dump_trace(),
+get_stack_info() will report STACK_TYPE_UNKNOWN, causing dump_trace() to
+return prematurely without trying to go to the next stack.
+
+Update the bounds checking for software interrupt stacks so that the
+ending address is now considered part of the stack.
+
+This means that it's now possible for the 'walk_stack' callbacks --
+print_context_stack() and print_context_stack_bp() -- to be called with
+an empty stack.  But that's fine; they're already prepared to deal with
+that due to their on_stack() checks.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Byungchul Park <byungchul.park@lge.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Nilay Vaish <nilayvaish@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/5a5e5de92dcf11e8dc6b6e8e50ad7639d067830b.1473905218.git.jpoimboe@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5fe599e02e41550c59831613a11c8ae057897c29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/dumpstack_32.c
+#	arch/x86/kernel/dumpstack_64.c
+diff --cc arch/x86/kernel/dumpstack_32.c
+index c90b53d2857e,50076d4366c4..000000000000
+--- a/arch/x86/kernel/dumpstack_32.c
++++ b/arch/x86/kernel/dumpstack_32.c
+@@@ -16,6 -16,94 +16,97 @@@
+  
+  #include <asm/stacktrace.h>
+  
+++<<<<<<< HEAD
+++=======
++ void stack_type_str(enum stack_type type, const char **begin, const char **end)
++ {
++ 	switch (type) {
++ 	case STACK_TYPE_IRQ:
++ 	case STACK_TYPE_SOFTIRQ:
++ 		*begin = "IRQ";
++ 		*end   = "EOI";
++ 		break;
++ 	default:
++ 		*begin = NULL;
++ 		*end   = NULL;
++ 	}
++ }
++ 
++ static bool in_hardirq_stack(unsigned long *stack, struct stack_info *info)
++ {
++ 	unsigned long *begin = (unsigned long *)this_cpu_read(hardirq_stack);
++ 	unsigned long *end   = begin + (THREAD_SIZE / sizeof(long));
++ 
++ 	/*
++ 	 * This is a software stack, so 'end' can be a valid stack pointer.
++ 	 * It just means the stack is empty.
++ 	 */
++ 	if (stack < begin || stack > end)
++ 		return false;
++ 
++ 	info->type	= STACK_TYPE_IRQ;
++ 	info->begin	= begin;
++ 	info->end	= end;
++ 
++ 	/*
++ 	 * See irq_32.c -- the next stack pointer is stored at the beginning of
++ 	 * the stack.
++ 	 */
++ 	info->next_sp	= (unsigned long *)*begin;
++ 
++ 	return true;
++ }
++ 
++ static bool in_softirq_stack(unsigned long *stack, struct stack_info *info)
++ {
++ 	unsigned long *begin = (unsigned long *)this_cpu_read(softirq_stack);
++ 	unsigned long *end   = begin + (THREAD_SIZE / sizeof(long));
++ 
++ 	/*
++ 	 * This is a software stack, so 'end' can be a valid stack pointer.
++ 	 * It just means the stack is empty.
++ 	 */
++ 	if (stack < begin || stack > end)
++ 		return false;
++ 
++ 	info->type	= STACK_TYPE_SOFTIRQ;
++ 	info->begin	= begin;
++ 	info->end	= end;
++ 
++ 	/*
++ 	 * The next stack pointer is stored at the beginning of the stack.
++ 	 * See irq_32.c.
++ 	 */
++ 	info->next_sp	= (unsigned long *)*begin;
++ 
++ 	return true;
++ }
++ 
++ int get_stack_info(unsigned long *stack, struct task_struct *task,
++ 		   struct stack_info *info, unsigned long *visit_mask)
++ {
++ 	if (!stack)
++ 		goto unknown;
++ 
++ 	task = task ? : current;
++ 
++ 	if (in_task_stack(stack, task, info))
++ 		return 0;
++ 
++ 	if (task != current)
++ 		goto unknown;
++ 
++ 	if (in_hardirq_stack(stack, info))
++ 		return 0;
++ 
++ 	if (in_softirq_stack(stack, info))
++ 		return 0;
++ 
++ unknown:
++ 	info->type = STACK_TYPE_UNKNOWN;
++ 	return -EINVAL;
++ }
+++>>>>>>> 5fe599e02e41 (x86/dumpstack: Add support for unwinding empty IRQ stacks)
+  
+  void dump_trace(struct task_struct *task, struct pt_regs *regs,
+  		unsigned long *stack, unsigned long bp,
+diff --cc arch/x86/kernel/dumpstack_64.c
+index 101e30243d5b,2e708afe146d..000000000000
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@@ -16,126 -16,125 +16,176 @@@
+  
+  #include <asm/stacktrace.h>
+  
+ -static char *exception_stack_names[N_EXCEPTION_STACKS] = {
+ -		[ DOUBLEFAULT_STACK-1	]	= "#DF",
+ -		[ NMI_STACK-1		]	= "NMI",
+ -		[ DEBUG_STACK-1		]	= "#DB",
+ -		[ MCE_STACK-1		]	= "#MC",
+ -};
+ -
+ -static unsigned long exception_stack_sizes[N_EXCEPTION_STACKS] = {
+ -	[0 ... N_EXCEPTION_STACKS - 1]		= EXCEPTION_STKSZ,
+ -	[DEBUG_STACK - 1]			= DEBUG_STKSZ
+ -};
+  
+ -void stack_type_str(enum stack_type type, const char **begin, const char **end)
+ -{
+ -	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
+ +#define N_EXCEPTION_STACKS_END \
+ +		(N_EXCEPTION_STACKS + DEBUG_STKSZ/EXCEPTION_STKSZ - 2)
+  
+ -	switch (type) {
+ -	case STACK_TYPE_IRQ:
+ -		*begin = "IRQ";
+ -		*end   = "EOI";
+ -		break;
+ -	case STACK_TYPE_EXCEPTION ... STACK_TYPE_EXCEPTION_LAST:
+ -		*begin = exception_stack_names[type - STACK_TYPE_EXCEPTION];
+ -		*end   = "EOE";
+ -		break;
+ -	default:
+ -		*begin = NULL;
+ -		*end   = NULL;
+ -	}
+ -}
+ +static char x86_stack_ids[][8] = {
+ +		[ DEBUG_STACK-1			]	= "#DB",
+ +		[ NMI_STACK-1			]	= "NMI",
+ +		[ DOUBLEFAULT_STACK-1		]	= "#DF",
+ +		[ MCE_STACK-1			]	= "#MC",
+ +#if DEBUG_STKSZ > EXCEPTION_STKSZ
+ +		[ N_EXCEPTION_STACKS ...
+ +		  N_EXCEPTION_STACKS_END	]	= "#DB[?]"
+ +#endif
+ +};
+  
+ -static bool in_exception_stack(unsigned long *stack, struct stack_info *info,
+ -			       unsigned long *visit_mask)
+ +static unsigned long *in_exception_stack(unsigned cpu, unsigned long stack,
+ +					 unsigned *usedp, char **idp)
+  {
+ -	unsigned long *begin, *end;
+ -	struct pt_regs *regs;
+  	unsigned k;
+  
+++<<<<<<< HEAD
+++=======
++ 	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
++ 
++ 	for (k = 0; k < N_EXCEPTION_STACKS; k++) {
++ 		end   = (unsigned long *)raw_cpu_ptr(&orig_ist)->ist[k];
++ 		begin = end - (exception_stack_sizes[k] / sizeof(long));
++ 		regs  = (struct pt_regs *)end - 1;
++ 
++ 		if (stack < begin || stack >= end)
++ 			continue;
++ 
++ 		/*
++ 		 * Make sure we don't iterate through an exception stack more
++ 		 * than once.  If it comes up a second time then there's
++ 		 * something wrong going on - just break out and report an
++ 		 * unknown stack type.
++ 		 */
++ 		if (*visit_mask & (1U << k))
++ 			break;
++ 		*visit_mask |= 1U << k;
++ 
++ 		info->type	= STACK_TYPE_EXCEPTION + k;
++ 		info->begin	= begin;
++ 		info->end	= end;
++ 		info->next_sp	= (unsigned long *)regs->sp;
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool in_irq_stack(unsigned long *stack, struct stack_info *info)
++ {
++ 	unsigned long *end   = (unsigned long *)this_cpu_read(irq_stack_ptr);
++ 	unsigned long *begin = end - (IRQ_STACK_SIZE / sizeof(long));
++ 
++ 	/*
++ 	 * This is a software stack, so 'end' can be a valid stack pointer.
++ 	 * It just means the stack is empty.
++ 	 */
++ 	if (stack < begin || stack > end)
++ 		return false;
++ 
++ 	info->type	= STACK_TYPE_IRQ;
++ 	info->begin	= begin;
++ 	info->end	= end;
++ 
+++>>>>>>> 5fe599e02e41 (x86/dumpstack: Add support for unwinding empty IRQ stacks)
+  	/*
+ -	 * The next stack pointer is the first thing pushed by the entry code
+ -	 * after switching to the irq stack.
+ +	 * Iterate over all exception stacks, and figure out whether
+ +	 * 'stack' is in one of them:
+  	 */
+ -	info->next_sp = (unsigned long *)*(end - 1);
+ -
+ -	return true;
+ +	for (k = 0; k < N_EXCEPTION_STACKS; k++) {
+ +		unsigned long end = per_cpu(orig_ist, cpu).ist[k];
+ +		/*
+ +		 * Is 'stack' above this exception frame's end?
+ +		 * If yes then skip to the next frame.
+ +		 */
+ +		if (stack >= end)
+ +			continue;
+ +		/*
+ +		 * Is 'stack' above this exception frame's start address?
+ +		 * If yes then we found the right frame.
+ +		 */
+ +		if (stack >= end - EXCEPTION_STKSZ) {
+ +			/*
+ +			 * Make sure we only iterate through an exception
+ +			 * stack once. If it comes up for the second time
+ +			 * then there's something wrong going on - just
+ +			 * break out and return NULL:
+ +			 */
+ +			if (*usedp & (1U << k))
+ +				break;
+ +			*usedp |= 1U << k;
+ +			*idp = x86_stack_ids[k];
+ +			return (unsigned long *)end;
+ +		}
+ +		/*
+ +		 * If this is a debug stack, and if it has a larger size than
+ +		 * the usual exception stacks, then 'stack' might still
+ +		 * be within the lower portion of the debug stack:
+ +		 */
+ +#if DEBUG_STKSZ > EXCEPTION_STKSZ
+ +		if (k == DEBUG_STACK - 1 && stack >= end - DEBUG_STKSZ) {
+ +			unsigned j = N_EXCEPTION_STACKS - 1;
+ +
+ +			/*
+ +			 * Black magic. A large debug stack is composed of
+ +			 * multiple exception stack entries, which we
+ +			 * iterate through now. Dont look:
+ +			 */
+ +			do {
+ +				++j;
+ +				end -= EXCEPTION_STKSZ;
+ +				x86_stack_ids[j][4] = '1' +
+ +						(j - N_EXCEPTION_STACKS);
+ +			} while (stack < end - EXCEPTION_STKSZ);
+ +			if (*usedp & (1U << j))
+ +				break;
+ +			*usedp |= 1U << j;
+ +			*idp = x86_stack_ids[j];
+ +			return (unsigned long *)end;
+ +		}
+ +#endif
+ +	}
+ +	return NULL;
+  }
+  
+ -int get_stack_info(unsigned long *stack, struct task_struct *task,
+ -		   struct stack_info *info, unsigned long *visit_mask)
+ +static inline int
+ +in_irq_stack(unsigned long *stack, unsigned long *irq_stack,
+ +	     unsigned long *irq_stack_end)
+  {
+ -	if (!stack)
+ -		goto unknown;
+ +	return (stack >= irq_stack && stack < irq_stack_end);
+ +}
+  
+ -	task = task ? : current;
+ +enum stack_type {
+ +	STACK_IS_UNKNOWN,
+ +	STACK_IS_NORMAL,
+ +	STACK_IS_EXCEPTION,
+ +	STACK_IS_IRQ,
+ +};
+  
+ -	if (in_task_stack(stack, task, info))
+ -		return 0;
+ +static enum stack_type
+ +analyze_stack(int cpu, struct task_struct *task, unsigned long *stack,
+ +	      unsigned long **stack_end, unsigned long *irq_stack,
+ +	      unsigned *used, char **id)
+ +{
+ +	unsigned long addr;
+  
+ -	if (task != current)
+ -		goto unknown;
+ +	addr = ((unsigned long)stack & (~(THREAD_SIZE - 1)));
+ +	if ((unsigned long)task_stack_page(task) == addr)
+ +		return STACK_IS_NORMAL;
+  
+ -	if (in_exception_stack(stack, info, visit_mask))
+ -		return 0;
+ +	*stack_end = in_exception_stack(cpu, (unsigned long)stack,
+ +					used, id);
+ +	if (*stack_end)
+ +		return STACK_IS_EXCEPTION;
+  
+ -	if (in_irq_stack(stack, info))
+ -		return 0;
+ +	if (!irq_stack)
+ +		return STACK_IS_NORMAL;
+  
+ -	return 0;
+ +	*stack_end = irq_stack;
+ +	irq_stack -= (IRQ_STACK_SIZE / sizeof(long));
+  
+ -unknown:
+ -	info->type = STACK_TYPE_UNKNOWN;
+ -	return -EINVAL;
+ +	if (in_irq_stack(stack, irq_stack, *stack_end))
+ +		return STACK_IS_IRQ;
+ +
+ +	return STACK_IS_UNKNOWN;
+  }
+  
+  /*
+* Unmerged path arch/x86/kernel/dumpstack_32.c
+* Unmerged path arch/x86/kernel/dumpstack_64.c
