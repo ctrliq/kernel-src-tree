@@ -1,0 +1,146 @@
+KVM: X86: Fix loss of exception which has not yet been injected
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit 664f8e26b00c7673a8303b0d40853a0c24ca93e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/664f8e26.failed
+
+vmx_complete_interrupts() assumes that the exception is always injected,
+so it can be dropped by kvm_clear_exception_queue().  However,
+an exception cannot be injected immediately if it is: 1) originally
+destined to a nested guest; 2) trapped to cause a vmexit; 3) happening
+right after VMLAUNCH/VMRESUME, i.e. when nested_run_pending is true.
+
+This patch applies to exceptions the same algorithm that is used for
+NMIs, replacing exception.reinject with "exception.injected" (equivalent
+to nmi_injected).
+
+exception.pending now represents an exception that is queued and whose
+side effects (e.g., update RFLAGS.RF or DR7) have not been applied yet.
+If exception.pending is true, the exception might result in a nested
+vmexit instead, too (in which case the side effects must not be applied).
+
+exception.injected instead represents an exception that is going to be
+injected into the guest at the next vmentry.
+
+	Reported-by: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 664f8e26b00c7673a8303b0d40853a0c24ca93e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index f751a44d4548,3abaff61829d..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -6182,27 -6416,7 +6238,31 @@@ static int inject_pending_event(struct 
+  		}
+  
+  		kvm_x86_ops->queue_exception(vcpu);
+++<<<<<<< HEAD
+ +		return 0;
+ +	}
+ +
+ +	if (vcpu->arch.nmi_injected) {
+ +		kvm_x86_ops->set_nmi(vcpu);
+ +		return 0;
+ +	}
+ +
+ +	if (vcpu->arch.interrupt.pending) {
+ +		kvm_x86_ops->set_irq(vcpu);
+ +		return 0;
+ +	}
+ +
+ +	if (is_guest_mode(vcpu) && kvm_x86_ops->check_nested_events) {
+ +		r = kvm_x86_ops->check_nested_events(vcpu, req_int_win);
+ +		if (r != 0)
+ +			return r;
+ +	}
+ +
+ +	/* try to inject new event if pending */
+ +	if (vcpu->arch.smi_pending && !is_smm(vcpu) && kvm_x86_ops->smi_allowed(vcpu)) {
+++=======
++ 	} else if (vcpu->arch.smi_pending && !is_smm(vcpu)) {
+++>>>>>>> 664f8e26b00c (KVM: X86: Fix loss of exception which has not yet been injected)
+  		vcpu->arch.smi_pending = false;
+  		enter_smm(vcpu);
+  	} else if (vcpu->arch.nmi_pending && kvm_x86_ops->nmi_allowed(vcpu)) {
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4091026435c1..1c848e448a29 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -492,8 +492,8 @@ struct kvm_vcpu_arch {
+ 
+ 	struct kvm_queued_exception {
+ 		bool pending;
++		bool injected;
+ 		bool has_error_code;
+-		bool reinject;
+ 		u8 nr;
+ 		u32 error_code;
+ 	} exception;
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 41bd682455e1..6cd483822fe6 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -719,7 +719,7 @@ static void svm_queue_exception(struct kvm_vcpu *vcpu)
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	unsigned nr = vcpu->arch.exception.nr;
+ 	bool has_error_code = vcpu->arch.exception.has_error_code;
+-	bool reinject = vcpu->arch.exception.reinject;
++	bool reinject = vcpu->arch.exception.injected;
+ 	u32 error_code = vcpu->arch.exception.error_code;
+ 
+ 	/*
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 9c3cd8d4ac90..144bb23f8e2e 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2658,7 +2658,7 @@ static void vmx_queue_exception(struct kvm_vcpu *vcpu)
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	unsigned nr = vcpu->arch.exception.nr;
+ 	bool has_error_code = vcpu->arch.exception.has_error_code;
+-	bool reinject = vcpu->arch.exception.reinject;
++	bool reinject = vcpu->arch.exception.injected;
+ 	u32 error_code = vcpu->arch.exception.error_code;
+ 	u32 intr_info = nr | INTR_INFO_VALID_MASK;
+ 
+@@ -10863,7 +10863,7 @@ static void vmcs12_save_pending_event(struct kvm_vcpu *vcpu,
+ 	u32 idt_vectoring;
+ 	unsigned int nr;
+ 
+-	if (vcpu->arch.exception.pending && vcpu->arch.exception.reinject) {
++	if (vcpu->arch.exception.injected) {
+ 		nr = vcpu->arch.exception.nr;
+ 		idt_vectoring = nr | VECTORING_INFO_VALID_MASK;
+ 
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index a9c89e9553f5..ffb123769c82 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -47,7 +47,7 @@ static inline unsigned int __shrink_ple_window(unsigned int val,
+ 
+ static inline void kvm_clear_exception_queue(struct kvm_vcpu *vcpu)
+ {
+-	vcpu->arch.exception.pending = false;
++	vcpu->arch.exception.injected = false;
+ }
+ 
+ static inline void kvm_queue_interrupt(struct kvm_vcpu *vcpu, u8 vector,
+@@ -65,7 +65,7 @@ static inline void kvm_clear_interrupt_queue(struct kvm_vcpu *vcpu)
+ 
+ static inline bool kvm_event_needs_reinjection(struct kvm_vcpu *vcpu)
+ {
+-	return vcpu->arch.exception.pending || vcpu->arch.interrupt.pending ||
++	return vcpu->arch.exception.injected || vcpu->arch.interrupt.pending ||
+ 		vcpu->arch.nmi_injected;
+ }
+ 
