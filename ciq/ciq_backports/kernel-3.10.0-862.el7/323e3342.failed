@@ -1,0 +1,119 @@
+scsi: cxlflash: Fence EEH during probe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Fence EEH during probe (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 91.43%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 323e33428ea23bfb1ae5010b18b4540048b2ad51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/323e3342.failed
+
+An EEH during probe can lead to a crash as the recovery thread races with the
+probe thread. To avoid this issue, introduce new states to fence out EEH
+recovery until probe has completed. Also ensure the reset wait queue is
+flushed during device removal to avoid orphaned threads.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 323e33428ea23bfb1ae5010b18b4540048b2ad51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,ebba3c90a242..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -488,8 -470,10 +488,10 @@@ static int cxlflash_queuecommand(struc
+  	spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+  
+  	switch (cfg->state) {
++ 	case STATE_PROBING:
++ 	case STATE_PROBED:
+  	case STATE_RESET:
+ -		dev_dbg_ratelimited(dev, "%s: device is in reset\n", __func__);
+ +		dev_dbg_ratelimited(dev, "%s: device is in reset!\n", __func__);
+  		rc = SCSI_MLQUEUE_HOST_BUSY;
+  		goto out;
+  	case STATE_FAILTERM:
+@@@ -2469,9 -2718,8 +2480,14 @@@ static int cxlflash_probe(struct pci_de
+  	cfg->init_state = INIT_STATE_PCI;
+  
+  	rc = init_afu(cfg);
+++<<<<<<< HEAD
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "%s: call to init_afu "
+ +			"failed rc=%d!\n", __func__, rc);
+++=======
++ 	if (rc && !wq_has_sleeper(&cfg->reset_waitq)) {
++ 		dev_err(dev, "%s: init_afu failed rc=%d\n", __func__, rc);
+++>>>>>>> 323e33428ea2 (scsi: cxlflash: Fence EEH during probe)
+  		goto out_remove;
+  	}
+  	cfg->init_state = INIT_STATE_AFU;
+@@@ -2484,8 -2731,13 +2500,13 @@@
+  	}
+  	cfg->init_state = INIT_STATE_SCSI;
+  
++ 	if (wq_has_sleeper(&cfg->reset_waitq)) {
++ 		cfg->state = STATE_PROBED;
++ 		wake_up_all(&cfg->reset_waitq);
++ 	} else
++ 		cfg->state = STATE_NORMAL;
+  out:
+ -	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  
+  out_remove:
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index 811927d91c5c..bbecfe85743e 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -81,6 +81,8 @@ enum cxlflash_init_state {
+ };
+ 
+ enum cxlflash_state {
++	STATE_PROBING,	/* Initial state during probe */
++	STATE_PROBED,	/* Temporary state, probe completed but EEH occurred */
+ 	STATE_NORMAL,	/* Normal running state, everything good */
+ 	STATE_RESET,	/* Reset state, trying to reset/recover */
+ 	STATE_FAILTERM	/* Failed/terminating state, error out users/threads */
+* Unmerged path drivers/scsi/cxlflash/main.c
+diff --git a/drivers/scsi/cxlflash/superpipe.c b/drivers/scsi/cxlflash/superpipe.c
+index a4dd3ca7c750..57852e89eb9a 100644
+--- a/drivers/scsi/cxlflash/superpipe.c
++++ b/drivers/scsi/cxlflash/superpipe.c
+@@ -78,17 +78,18 @@ void cxlflash_free_errpage(void)
+  * memory freed. This is accomplished by putting the contexts in error
+  * state which will notify the user and let them 'drive' the tear down.
+  * Meanwhile, this routine camps until all user contexts have been removed.
++ *
++ * Note that the main loop in this routine will always execute at least once
++ * to flush the reset_waitq.
+  */
+ void cxlflash_stop_term_user_contexts(struct cxlflash_cfg *cfg)
+ {
+ 	struct device *dev = &cfg->dev->dev;
+-	int i, found;
++	int i, found = true;
+ 
+ 	cxlflash_mark_contexts_error(cfg);
+ 
+ 	while (true) {
+-		found = false;
+-
+ 		for (i = 0; i < MAX_CONTEXT; i++)
+ 			if (cfg->ctx_tbl[i]) {
+ 				found = true;
+@@ -102,6 +103,7 @@ void cxlflash_stop_term_user_contexts(struct cxlflash_cfg *cfg)
+ 			__func__);
+ 		wake_up_all(&cfg->reset_waitq);
+ 		ssleep(1);
++		found = false;
+ 	}
+ }
+ 
