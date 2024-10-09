@@ -1,0 +1,132 @@
+MD: Memory leak when flush bio size is zero
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [md] Memory leak when flush bio size is zero (Nigel Croxon) [1636944 1527943 1576466 1599780]
+Rebuild_FUZZ: 95.12%
+commit-author Xiao Ni <xni@redhat.com>
+commit af9b926de9c5986ab009e64917de87c9758bab10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/af9b926d.failed
+
+flush_pool is leaked when flush bio size is zero
+
+Fixes: 5a409b4f56d5 ("MD: fix lock contention for flush bios")
+	Signed-off-by: David Jeffery <djeffery@redhat.com>
+	Signed-off-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit af9b926de9c5986ab009e64917de87c9758bab10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index c487b2c6f765,fc488cb30a94..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -438,22 -451,32 +438,34 @@@ static void md_end_flush(struct bio *bi
+  
+  	rdev_dec_pending(rdev, mddev);
+  
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&mddev->flush_pending)) {
+ +		/* The pre-request flush has finished */
+ +		queue_work(md_wq, &mddev->flush_work);
+++=======
++ 	if (atomic_dec_and_test(&fi->flush_pending)) {
++ 		if (bio->bi_iter.bi_size == 0) {
++ 			/* an empty barrier - all done */
++ 			bio_endio(bio);
++ 			mempool_free(fi, mddev->flush_pool);
++ 		} else {
++ 			INIT_WORK(&fi->flush_work, submit_flushes);
++ 			queue_work(md_wq, &fi->flush_work);
++ 		}
+++>>>>>>> af9b926de9c5 (MD: Memory leak when flush bio size is zero)
+  	}
+ -
+ -	mempool_free(fb, mddev->flush_bio_pool);
+ -	bio_put(fbio);
+ +	bio_put(bio);
+  }
+  
+ -void md_flush_request(struct mddev *mddev, struct bio *bio)
+ +static void md_submit_flush_data(struct work_struct *ws);
+ +
+ +static void submit_flushes(struct work_struct *ws)
+  {
+ +	struct mddev *mddev = container_of(ws, struct mddev, flush_work);
+  	struct md_rdev *rdev;
+ -	struct flush_info *fi;
+ -
+ -	fi = mempool_alloc(mddev->flush_pool, GFP_NOIO);
+ -
+ -	fi->bio = bio;
+ -	fi->mddev = mddev;
+ -	atomic_set(&fi->flush_pending, 1);
+  
+ +	INIT_WORK(&mddev->flush_work, md_submit_flush_data);
+ +	atomic_set(&mddev->flush_pending, 1);
+  	rcu_read_lock();
+  	rdev_for_each_rcu(rdev, mddev)
+  		if (rdev->raid_disk >= 0 &&
+@@@ -476,45 -508,18 +488,57 @@@
+  			rdev_dec_pending(rdev, mddev);
+  		}
+  	rcu_read_unlock();
+ +	if (atomic_dec_and_test(&mddev->flush_pending))
+ +		queue_work(md_wq, &mddev->flush_work);
+ +}
+ +
+++<<<<<<< HEAD
+ +static void md_submit_flush_data(struct work_struct *ws)
+ +{
+ +	struct mddev *mddev = container_of(ws, struct mddev, flush_work);
+ +	struct bio *bio = mddev->flush_bio;
+  
+ +	/*
+ +	 * must reset flush_bio before calling into md_handle_request to avoid a
+ +	 * deadlock, because other bios passed md_handle_request suspend check
+ +	 * could wait for this and below md_handle_request could wait for those
+ +	 * bios because of suspend check
+ +	 */
+ +	mddev->flush_bio = NULL;
+ +	wake_up(&mddev->sb_wait);
+ +
+ +	if (bio->bi_size == 0)
+ +		/* an empty barrier - all done */
+ +		bio_endio(bio, 0);
+ +	else {
+ +		bio->bi_rw &= ~REQ_FLUSH;
+ +		md_handle_request(mddev, bio);
+++=======
++ 	if (atomic_dec_and_test(&fi->flush_pending)) {
++ 		if (bio->bi_iter.bi_size == 0) {
++ 			/* an empty barrier - all done */
++ 			bio_endio(bio);
++ 			mempool_free(fi, mddev->flush_pool);
++ 		} else {
++ 			INIT_WORK(&fi->flush_work, submit_flushes);
++ 			queue_work(md_wq, &fi->flush_work);
++ 		}
+++>>>>>>> af9b926de9c5 (MD: Memory leak when flush bio size is zero)
+  	}
+  }
+ +
+ +void md_flush_request(struct mddev *mddev, struct bio *bio)
+ +{
+ +	spin_lock_irq(&mddev->lock);
+ +	wait_event_lock_irq(mddev->sb_wait,
+ +			    !mddev->flush_bio,
+ +			    mddev->lock);
+ +	mddev->flush_bio = bio;
+ +	spin_unlock_irq(&mddev->lock);
+ +
+ +	INIT_WORK(&mddev->flush_work, submit_flushes);
+ +	queue_work(md_wq, &mddev->flush_work);
+ +}
+  EXPORT_SYMBOL(md_flush_request);
+  
+  static inline struct mddev *mddev_get(struct mddev *mddev)
+* Unmerged path drivers/md/md.c
