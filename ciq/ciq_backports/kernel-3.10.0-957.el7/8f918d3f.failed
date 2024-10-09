@@ -1,0 +1,193 @@
+net_sched: check NULL in tcf_block_put()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: check NULL in tcf_block_put() (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 94.74%
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 8f918d3ff4a1283a1693afe2b4c8e1844674ca15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8f918d3f.failed
+
+Callers of tcf_block_put() could pass NULL so
+we can't use block->q before checking if block is
+NULL or not.
+
+tcf_block_put_ext() callers are fine, it is always
+non-NULL.
+
+Fixes: 8c4083b30e56 ("net: sched: add block bind/unbind notif. and extended block_get/put")
+	Reported-by: Dave Taht <dave.taht@gmail.com>
+	Cc: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8f918d3ff4a1283a1693afe2b4c8e1844674ca15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index 0e9c21220742,8d1885abee83..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -287,28 -340,135 +287,46 @@@ void tcf_block_put(struct tcf_block *bl
+  {
+  	struct tcf_chain *chain, *tmp;
+  
+++<<<<<<< HEAD
+ +	if (!block)
+ +		return;
+ +
+ +	/* Hold a refcnt for all chains, so that they don't disappear
+ +	 * while we are iterating.
+ +	 */
+ +	list_for_each_entry(chain, &block->chain_list, list)
+ +		tcf_chain_hold(chain);
+ +
+ +	list_for_each_entry(chain, &block->chain_list, list)
+++=======
++ 	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+++>>>>>>> 8f918d3ff4a1 (net_sched: check NULL in tcf_block_put())
+  		tcf_chain_flush(chain);
+  
+ -	tcf_block_offload_unbind(block, q, ei);
+ +	/* At this point, all the chains should have refcnt >= 1. */
+ +	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+ +		tcf_chain_put(chain);
+  
+ -	INIT_WORK(&block->work, tcf_block_put_final);
+ -	/* Wait for existing RCU callbacks to cool down, make sure their works
+ -	 * have been queued before this. We can not flush pending works here
+ -	 * because we are holding the RTNL lock.
+ -	 */
+ -	rcu_barrier();
+ -	tcf_queue_work(&block->work);
+ +	/* Finally, put chain 0 and allow block to be freed. */
+ +	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
+ +	tcf_chain_put(chain);
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(tcf_block_put_ext);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	struct tcf_block_ext_info ei = {0, };
++ 
++ 	if (!block)
++ 		return;
++ 	tcf_block_put_ext(block, NULL, block->q, &ei);
++ }
++ 
+++>>>>>>> 8f918d3ff4a1 (net_sched: check NULL in tcf_block_put())
+  EXPORT_SYMBOL(tcf_block_put);
+  
+ -struct tcf_block_cb {
+ -	struct list_head list;
+ -	tc_setup_cb_t *cb;
+ -	void *cb_ident;
+ -	void *cb_priv;
+ -	unsigned int refcnt;
+ -};
+ -
+ -void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
+ -{
+ -	return block_cb->cb_priv;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_priv);
+ -
+ -struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
+ -					 tc_setup_cb_t *cb, void *cb_ident)
+ -{	struct tcf_block_cb *block_cb;
+ -
+ -	list_for_each_entry(block_cb, &block->cb_list, list)
+ -		if (block_cb->cb == cb && block_cb->cb_ident == cb_ident)
+ -			return block_cb;
+ -	return NULL;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_lookup);
+ -
+ -void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
+ -{
+ -	block_cb->refcnt++;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_incref);
+ -
+ -unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
+ -{
+ -	return --block_cb->refcnt;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_decref);
+ -
+ -struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
+ -					     tc_setup_cb_t *cb, void *cb_ident,
+ -					     void *cb_priv)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
+ -	if (!block_cb)
+ -		return NULL;
+ -	block_cb->cb = cb;
+ -	block_cb->cb_ident = cb_ident;
+ -	block_cb->cb_priv = cb_priv;
+ -	list_add(&block_cb->list, &block->cb_list);
+ -	return block_cb;
+ -}
+ -EXPORT_SYMBOL(__tcf_block_cb_register);
+ -
+ -int tcf_block_cb_register(struct tcf_block *block,
+ -			  tc_setup_cb_t *cb, void *cb_ident,
+ -			  void *cb_priv)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = __tcf_block_cb_register(block, cb, cb_ident, cb_priv);
+ -	return block_cb ? 0 : -ENOMEM;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_register);
+ -
+ -void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
+ -{
+ -	list_del(&block_cb->list);
+ -	kfree(block_cb);
+ -}
+ -EXPORT_SYMBOL(__tcf_block_cb_unregister);
+ -
+ -void tcf_block_cb_unregister(struct tcf_block *block,
+ -			     tc_setup_cb_t *cb, void *cb_ident)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = tcf_block_cb_lookup(block, cb, cb_ident);
+ -	if (!block_cb)
+ -		return;
+ -	__tcf_block_cb_unregister(block_cb);
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_unregister);
+ -
+ -static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ -			     void *type_data, bool err_stop)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -	int ok_count = 0;
+ -	int err;
+ -
+ -	list_for_each_entry(block_cb, &block->cb_list, list) {
+ -		err = block_cb->cb(type, type_data, block_cb->cb_priv);
+ -		if (err) {
+ -			if (err_stop)
+ -				return err;
+ -		} else {
+ -			ok_count++;
+ -		}
+ -	}
+ -	return ok_count;
+ -}
+ -
+  /* Main classifier routine: scans classifier chain attached
+   * to this qdisc, (optionally) tests for protocol and asks
+   * specific classifiers.
+* Unmerged path net/sched/cls_api.c
