@@ -1,0 +1,285 @@
+iio: Add support for indicating fixed watermarks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] Add support for indicating fixed watermarks (Tony Camuso) [1559170]
+Rebuild_FUZZ: 94.51%
+commit-author Lars-Peter Clausen <lars@metafoo.de>
+commit b440655b896b2d5a2fb5f918801fb0e281a537cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b440655b.failed
+
+For buffers which have a fixed wake-up watermark the watermark attribute
+should be read-only. Add a new FIXED_WATERMARK flag to the
+struct iio_buffer_access_funcs, which can be set by a buffer
+implementation.
+
+	Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit b440655b896b2d5a2fb5f918801fb0e281a537cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/industrialio-buffer.c
+#	include/linux/iio/buffer.h
+diff --cc drivers/iio/industrialio-buffer.c
+index f0b219d32278,98a6447a61d3..000000000000
+--- a/drivers/iio/industrialio-buffer.c
++++ b/drivers/iio/industrialio-buffer.c
+@@@ -399,128 -461,31 +399,197 @@@ error_ret
+  	return ret;
+  }
+  
+ -static ssize_t iio_buffer_read_length(struct device *dev,
+ -				      struct device_attribute *attr,
+ -				      char *buf)
+ +static const char * const iio_scan_elements_group_name = "scan_elements";
+ +
+++<<<<<<< HEAD
+ +int iio_buffer_register(struct iio_dev *indio_dev,
+ +			const struct iio_chan_spec *channels,
+ +			int num_channels)
+++=======
+++static ssize_t iio_buffer_show_watermark(struct device *dev,
+++					 struct device_attribute *attr,
+++					 char *buf)
++ {
++ 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
++ 	struct iio_buffer *buffer = indio_dev->buffer;
++ 
+ -	return sprintf(buf, "%d\n", buffer->length);
+++	return sprintf(buf, "%u\n", buffer->watermark);
++ }
++ 
+ -static ssize_t iio_buffer_write_length(struct device *dev,
+ -				       struct device_attribute *attr,
+ -				       const char *buf, size_t len)
+++static ssize_t iio_buffer_store_watermark(struct device *dev,
+++					  struct device_attribute *attr,
+++					  const char *buf,
+++					  size_t len)
++ {
++ 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
++ 	struct iio_buffer *buffer = indio_dev->buffer;
++ 	unsigned int val;
++ 	int ret;
++ 
++ 	ret = kstrtouint(buf, 10, &val);
++ 	if (ret)
++ 		return ret;
+++	if (!val)
+++		return -EINVAL;
+++
+++	mutex_lock(&indio_dev->mlock);
+++
+++	if (val > buffer->length) {
+++		ret = -EINVAL;
+++		goto out;
+++	}
+++
+++	if (iio_buffer_is_active(indio_dev->buffer)) {
+++		ret = -EBUSY;
+++		goto out;
+++	}
+++
+++	buffer->watermark = val;
+++out:
+++	mutex_unlock(&indio_dev->mlock);
+++
+++	return ret ? ret : len;
+++}
+++
+++static DEVICE_ATTR(length, S_IRUGO | S_IWUSR, iio_buffer_read_length,
+++		   iio_buffer_write_length);
+++static struct device_attribute dev_attr_length_ro = __ATTR(length,
+++	S_IRUGO, iio_buffer_read_length, NULL);
+++static DEVICE_ATTR(enable, S_IRUGO | S_IWUSR,
+++		   iio_buffer_show_enable, iio_buffer_store_enable);
+++static DEVICE_ATTR(watermark, S_IRUGO | S_IWUSR,
+++		   iio_buffer_show_watermark, iio_buffer_store_watermark);
+++static struct device_attribute dev_attr_watermark_ro = __ATTR(watermark,
+++	S_IRUGO, iio_buffer_show_watermark, NULL);
+++
+++static struct attribute *iio_buffer_attrs[] = {
+++	&dev_attr_length.attr,
+++	&dev_attr_enable.attr,
+++	&dev_attr_watermark.attr,
+++};
+++
+++int iio_buffer_alloc_sysfs_and_mask(struct iio_dev *indio_dev)
+++>>>>>>> b440655b896b (iio: Add support for indicating fixed watermarks)
+ +{
+ +	struct iio_dev_attr *p;
+ +	struct attribute **attr;
+ +	struct iio_buffer *buffer = indio_dev->buffer;
+ +	int ret, i, attrn, attrcount, attrcount_orig = 0;
+  
+ -	if (val == buffer->length)
+ -		return len;
+++	if (buffer->access->flags & INDIO_BUFFER_FLAG_FIXED_WATERMARK)
+++		attr[2] = &dev_attr_watermark_ro.attr;
+++
+ +	if (buffer->attrs)
+ +		indio_dev->groups[indio_dev->groupcounter++] = buffer->attrs;
+ +
+ +	if (buffer->scan_el_attrs != NULL) {
+ +		attr = buffer->scan_el_attrs->attrs;
+ +		while (*attr++ != NULL)
+ +			attrcount_orig++;
+ +	}
+ +	attrcount = attrcount_orig;
+ +	INIT_LIST_HEAD(&buffer->scan_el_dev_attr_list);
+ +	if (channels) {
+ +		/* new magic */
+ +		for (i = 0; i < num_channels; i++) {
+ +			if (channels[i].scan_index < 0)
+ +				continue;
+ +
+ +			/* Establish necessary mask length */
+ +			if (channels[i].scan_index >
+ +			    (int)indio_dev->masklength - 1)
+ +				indio_dev->masklength
+ +					= channels[i].scan_index + 1;
+ +
+ +			ret = iio_buffer_add_channel_sysfs(indio_dev,
+ +							 &channels[i]);
+ +			if (ret < 0)
+ +				goto error_cleanup_dynamic;
+ +			attrcount += ret;
+ +			if (channels[i].type == IIO_TIMESTAMP)
+ +				indio_dev->scan_index_timestamp =
+ +					channels[i].scan_index;
+ +		}
+ +		if (indio_dev->masklength && buffer->scan_mask == NULL) {
+ +			buffer->scan_mask = kcalloc(BITS_TO_LONGS(indio_dev->masklength),
+ +						    sizeof(*buffer->scan_mask),
+ +						    GFP_KERNEL);
+ +			if (buffer->scan_mask == NULL) {
+ +				ret = -ENOMEM;
+ +				goto error_cleanup_dynamic;
+ +			}
+ +		}
+ +	}
+ +
+ +	buffer->scan_el_group.name = iio_scan_elements_group_name;
+ +
+ +	buffer->scan_el_group.attrs = kcalloc(attrcount + 1,
+ +					      sizeof(buffer->scan_el_group.attrs[0]),
+ +					      GFP_KERNEL);
+ +	if (buffer->scan_el_group.attrs == NULL) {
+ +		ret = -ENOMEM;
+ +		goto error_free_scan_mask;
+ +	}
+ +	if (buffer->scan_el_attrs)
+ +		memcpy(buffer->scan_el_group.attrs, buffer->scan_el_attrs,
+ +		       sizeof(buffer->scan_el_group.attrs[0])*attrcount_orig);
+ +	attrn = attrcount_orig;
+ +
+ +	list_for_each_entry(p, &buffer->scan_el_dev_attr_list, l)
+ +		buffer->scan_el_group.attrs[attrn++] = &p->dev_attr.attr;
+ +	indio_dev->groups[indio_dev->groupcounter++] = &buffer->scan_el_group;
+ +
+ +	return 0;
+ +
+ +error_free_scan_mask:
+ +	kfree(buffer->scan_mask);
+ +error_cleanup_dynamic:
+ +	iio_free_chan_devattr_list(&buffer->scan_el_dev_attr_list);
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL(iio_buffer_register);
+ +
+ +void iio_buffer_unregister(struct iio_dev *indio_dev)
+ +{
+ +	kfree(indio_dev->buffer->scan_mask);
+ +	kfree(indio_dev->buffer->scan_el_group.attrs);
+ +	iio_free_chan_devattr_list(&indio_dev->buffer->scan_el_dev_attr_list);
+ +}
+ +EXPORT_SYMBOL(iio_buffer_unregister);
+ +
+ +ssize_t iio_buffer_read_length(struct device *dev,
+ +			       struct device_attribute *attr,
+ +			       char *buf)
+ +{
+ +	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+ +	struct iio_buffer *buffer = indio_dev->buffer;
+ +
+ +	if (buffer->access->get_length)
+ +		return sprintf(buf, "%d\n",
+ +			       buffer->access->get_length(buffer));
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(iio_buffer_read_length);
+ +
+ +ssize_t iio_buffer_write_length(struct device *dev,
+ +				struct device_attribute *attr,
+ +				const char *buf,
+ +				size_t len)
+ +{
+ +	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+ +	struct iio_buffer *buffer = indio_dev->buffer;
+ +	unsigned int val;
+ +	int ret;
+ +
+ +	ret = kstrtouint(buf, 10, &val);
+ +	if (ret)
+ +		return ret;
+ +
+ +	if (buffer->access->get_length)
+ +		if (val == buffer->access->get_length(buffer))
+ +			return len;
+  
+  	mutex_lock(&indio_dev->mlock);
+  	if (iio_buffer_is_active(indio_dev->buffer)) {
+diff --cc include/linux/iio/buffer.h
+index 26890e4a025c,4d99a53d1fe7..000000000000
+--- a/include/linux/iio/buffer.h
++++ b/include/linux/iio/buffer.h
+@@@ -20,14 -27,16 +26,21 @@@ struct iio_buffer
+   * struct iio_buffer_access_funcs - access functions for buffers.
+   * @store_to:		actually store stuff to the buffer
+   * @read_first_n:	try to get a specified number of bytes (must exist)
+ - * @data_available:	indicates how much data is available for reading from
+ - *			the buffer.
+ + * @data_available:	indicates whether data for reading from the buffer is
+ + *			available.
+   * @request_update:	if a parameter change has been marked, update underlying
+   *			storage.
+ + * @get_bytes_per_datum:get current bytes per datum
+   * @set_bytes_per_datum:set number of bytes per datum
+ + * @get_length:		get number of datums in buffer
+   * @set_length:		set number of datums in buffer
+++<<<<<<< HEAD
+++=======
++  * @release:		called when the last reference to the buffer is dropped,
++  *			should free all resources allocated by the buffer.
++  * @modes:		Supported operating modes by this buffer type
++  * @flags:		A bitmask combination of INDIO_BUFFER_FLAG_*
+++>>>>>>> b440655b896b (iio: Add support for indicating fixed watermarks)
+   *
+   * The purpose of this structure is to make the buffer element
+   * modular as event for a given driver, different usecases may require
+@@@ -46,10 -55,13 +59,18 @@@ struct iio_buffer_access_funcs 
+  
+  	int (*request_update)(struct iio_buffer *buffer);
+  
+ +	int (*get_bytes_per_datum)(struct iio_buffer *buffer);
+  	int (*set_bytes_per_datum)(struct iio_buffer *buffer, size_t bpd);
+ +	int (*get_length)(struct iio_buffer *buffer);
+  	int (*set_length)(struct iio_buffer *buffer, int length);
+++<<<<<<< HEAD
+++=======
++ 
++ 	void (*release)(struct iio_buffer *buffer);
++ 
++ 	unsigned int modes;
++ 	unsigned int flags;
+++>>>>>>> b440655b896b (iio: Add support for indicating fixed watermarks)
+  };
+  
+  /**
+* Unmerged path drivers/iio/industrialio-buffer.c
+* Unmerged path include/linux/iio/buffer.h
