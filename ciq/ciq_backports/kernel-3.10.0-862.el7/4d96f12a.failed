@@ -1,0 +1,252 @@
+ibmvnic: Initialize SCRQ's during login renegotiation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+commit 4d96f12a072c669d48dc3a2c6b539a9faeca138d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4d96f12a.failed
+
+SCRQ resources are freed during renegotiation, but they are not
+re-allocated afterwards due to some changes in the initialization
+process. Fix that by re-allocating the memory after renegotation.
+
+SCRQ's can also be freed if a server capabilities request fails.
+If this were encountered during a device reset for example,
+SCRQ's may not be re-allocated. This operation is not necessary
+anymore so remove it.
+
+	Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4d96f12a072c669d48dc3a2c6b539a9faeca138d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index e2daa771f3cf,c45e8e3b82d3..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -111,6 -109,12 +111,15 @@@ static int ibmvnic_poll(struct napi_str
+  static void send_map_query(struct ibmvnic_adapter *adapter);
+  static void send_request_map(struct ibmvnic_adapter *, dma_addr_t, __be32, u8);
+  static void send_request_unmap(struct ibmvnic_adapter *, u8);
+++<<<<<<< HEAD
+++=======
++ static void send_login(struct ibmvnic_adapter *adapter);
++ static void send_cap_queries(struct ibmvnic_adapter *adapter);
++ static int init_sub_crqs(struct ibmvnic_adapter *);
++ static int init_sub_crq_irqs(struct ibmvnic_adapter *adapter);
++ static int ibmvnic_init(struct ibmvnic_adapter *);
++ static void release_crq_queue(struct ibmvnic_adapter *);
+++>>>>>>> 4d96f12a072c (ibmvnic: Initialize SCRQ's during login renegotiation)
+  
+  struct ibmvnic_stat {
+  	char name[ETH_GSTRING_LEN];
+@@@ -374,40 -625,162 +383,121 @@@ static void free_rx_pool(struct ibmvnic
+  {
+  	int i;
+  
+ -	if (adapter->napi_enabled)
+ +	kfree(pool->free_map);
+ +	pool->free_map = NULL;
+ +
+ +	if (!pool->rx_buff)
+  		return;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < pool->size; i++) {
+ +		if (pool->rx_buff[i].skb) {
+ +			dev_kfree_skb_any(pool->rx_buff[i].skb);
+ +			pool->rx_buff[i].skb = NULL;
+++=======
++ 	for (i = 0; i < adapter->req_rx_queues; i++)
++ 		napi_enable(&adapter->napi[i]);
++ 
++ 	adapter->napi_enabled = true;
++ }
++ 
++ static void ibmvnic_napi_disable(struct ibmvnic_adapter *adapter)
++ {
++ 	int i;
++ 
++ 	if (!adapter->napi_enabled)
++ 		return;
++ 
++ 	for (i = 0; i < adapter->req_rx_queues; i++)
++ 		napi_disable(&adapter->napi[i]);
++ 
++ 	adapter->napi_enabled = false;
++ }
++ 
++ static int ibmvnic_login(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	struct device *dev = &adapter->vdev->dev;
++ 	int rc;
++ 
++ 	do {
++ 		if (adapter->renegotiate) {
++ 			adapter->renegotiate = false;
++ 			release_sub_crqs(adapter);
++ 
++ 			reinit_completion(&adapter->init_done);
++ 			send_cap_queries(adapter);
++ 			if (!wait_for_completion_timeout(&adapter->init_done,
++ 							 timeout)) {
++ 				dev_err(dev, "Capabilities query timeout\n");
++ 				return -1;
++ 			}
++ 			rc = init_sub_crqs(adapter);
++ 			if (rc) {
++ 				dev_err(dev,
++ 					"Initialization of SCRQ's failed\n");
++ 				return -1;
++ 			}
++ 			rc = init_sub_crq_irqs(adapter);
++ 			if (rc) {
++ 				dev_err(dev,
++ 					"Initialization of SCRQ's irqs failed\n");
++ 				return -1;
++ 			}
++ 		}
++ 
++ 		reinit_completion(&adapter->init_done);
++ 		send_login(adapter);
++ 		if (!wait_for_completion_timeout(&adapter->init_done,
++ 						 timeout)) {
++ 			dev_err(dev, "Login timeout\n");
++ 			return -1;
++ 		}
++ 	} while (adapter->renegotiate);
++ 
++ 	return 0;
++ }
++ 
++ static void release_resources(struct ibmvnic_adapter *adapter)
++ {
++ 	int i;
++ 
++ 	release_tx_pools(adapter);
++ 	release_rx_pools(adapter);
++ 
++ 	release_stats_token(adapter);
++ 	release_error_buffers(adapter);
++ 
++ 	if (adapter->napi) {
++ 		for (i = 0; i < adapter->req_rx_queues; i++) {
++ 			if (&adapter->napi[i])
++ 				netif_napi_del(&adapter->napi[i]);
+++>>>>>>> 4d96f12a072c (ibmvnic: Initialize SCRQ's during login renegotiation)
+  		}
+  	}
+ +	kfree(pool->rx_buff);
+ +	pool->rx_buff = NULL;
+  }
+  
+ -static int set_link_state(struct ibmvnic_adapter *adapter, u8 link_state)
+ -{
+ -	struct net_device *netdev = adapter->netdev;
+ -	unsigned long timeout = msecs_to_jiffies(30000);
+ -	union ibmvnic_crq crq;
+ -	bool resend;
+ -	int rc;
+ -
+ -	netdev_err(netdev, "setting link state %d\n", link_state);
+ -	memset(&crq, 0, sizeof(crq));
+ -	crq.logical_link_state.first = IBMVNIC_CRQ_CMD;
+ -	crq.logical_link_state.cmd = LOGICAL_LINK_STATE;
+ -	crq.logical_link_state.link_state = link_state;
+ -
+ -	do {
+ -		resend = false;
+ -
+ -		reinit_completion(&adapter->init_done);
+ -		rc = ibmvnic_send_crq(adapter, &crq);
+ -		if (rc) {
+ -			netdev_err(netdev, "Failed to set link state\n");
+ -			return rc;
+ -		}
+ -
+ -		if (!wait_for_completion_timeout(&adapter->init_done,
+ -						 timeout)) {
+ -			netdev_err(netdev, "timeout setting link state\n");
+ -			return -1;
+ -		}
+ -
+ -		if (adapter->init_done_rc == 1) {
+ -			/* Partuial success, delay and re-send */
+ -			mdelay(1000);
+ -			resend = true;
+ -		}
+ -	} while (resend);
+ -
+ -	return 0;
+ -}
+ -
+ -static int set_real_num_queues(struct net_device *netdev)
+ +static int ibmvnic_open(struct net_device *netdev)
+  {
+  	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ -	int rc;
+ -
+ -	rc = netif_set_real_num_tx_queues(netdev, adapter->req_tx_queues);
+ -	if (rc) {
+ -		netdev_err(netdev, "failed to set the number of tx queues\n");
+ -		return rc;
+ -	}
+ -
+ -	rc = netif_set_real_num_rx_queues(netdev, adapter->req_rx_queues);
+ -	if (rc)
+ -		netdev_err(netdev, "failed to set the number of rx queues\n");
+ -
+ -	return rc;
+ -}
+ -
+ -static int init_resources(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct net_device *netdev = adapter->netdev;
+ -	int i, rc;
+ -
+ -	rc = set_real_num_queues(netdev);
+ -	if (rc)
+ -		return rc;
+ -
+ -	rc = init_stats_token(adapter);
+ -	if (rc)
+ -		return rc;
+ +	struct device *dev = &adapter->vdev->dev;
+ +	struct ibmvnic_tx_pool *tx_pool;
+ +	union ibmvnic_crq crq;
+ +	int rxadd_subcrqs;
+ +	u64 *size_array;
+ +	int tx_subcrqs;
+ +	int i, j;
+  
+ +	rxadd_subcrqs =
+ +	    be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
+ +	tx_subcrqs =
+ +	    be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
+ +	size_array = (u64 *)((u8 *)(adapter->login_rsp_buf) +
+ +				  be32_to_cpu(adapter->login_rsp_buf->
+ +					      off_rxadd_buff_size));
+  	adapter->map_id = 1;
+  	adapter->napi = kcalloc(adapter->req_rx_queues,
+  				sizeof(struct napi_struct), GFP_KERNEL);
+@@@ -2522,9 -3018,8 +2612,12 @@@ static void handle_request_cap_rsp(unio
+  			 *req_value,
+  			 (long int)be64_to_cpu(crq->request_capability_rsp.
+  					       number), name);
+++<<<<<<< HEAD
+ +		release_sub_crqs_no_irqs(adapter);
+++=======
+++>>>>>>> 4d96f12a072c (ibmvnic: Initialize SCRQ's during login renegotiation)
+  		*req_value = be64_to_cpu(crq->request_capability_rsp.number);
+ -		ibmvnic_send_req_caps(adapter, 1);
+ +		init_sub_crqs(adapter, 1);
+  		return;
+  	default:
+  		dev_err(dev, "Error %d in request cap rsp\n",
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
