@@ -1,0 +1,184 @@
+exec: cleanup the CONFIG_MODULES logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit cb7b6b1cbc20a970c7124efae1c2478155604b54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cb7b6b1c.failed
+
+search_binary_handler() uses "for (try=0; try<2; try++)" to avoid "goto"
+but the code looks too complicated and horrible imho.  We still need to
+check "try == 0" before request_module() and add the additional "break"
+for !CONFIG_MODULES case.
+
+Kill this loop and use a simple "bool need_retry" + "goto retry".  The
+code looks much simpler and we do not even need ifdef's, gcc can optimize
+out the "if (need_retry)" block if !IS_ENABLED().
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Cc: Evgeniy Polyakov <zbr@ioremap.net>
+	Cc: Zach Levis <zml@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cb7b6b1cbc20a970c7124efae1c2478155604b54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+diff --cc fs/exec.c
+index c4d5468e9129,ba357e6aea98..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -1423,9 -1373,9 +1424,13 @@@ EXPORT_SYMBOL(remove_arg_zero)
+   */
+  int search_binary_handler(struct linux_binprm *bprm)
+  {
+- 	int try, retval;
++ 	bool need_retry = IS_ENABLED(CONFIG_MODULES);
+  	struct linux_binfmt *fmt;
+++<<<<<<< HEAD
+ +	pid_t old_pid, old_vpid;
+++=======
++ 	int retval;
+++>>>>>>> cb7b6b1cbc20 (exec: cleanup the CONFIG_MODULES logic)
+  
+  	/* This allows 4 levels of binfmt rewrites before failing hard. */
+  	if (bprm->recursion_depth > 5)
+@@@ -1435,69 -1385,75 +1440,86 @@@
+  	if (retval)
+  		return retval;
+  
+ -	retval = audit_bprm(bprm);
+ -	if (retval)
+ -		return retval;
+ +	/* Need to fetch pid before load_binary changes it */
+ +	old_pid = current->pid;
+ +	rcu_read_lock();
+ +	old_vpid = task_pid_nr_ns(current, task_active_pid_ns(current->parent));
+ +	rcu_read_unlock();
+  
+  	retval = -ENOENT;
+++<<<<<<< HEAD
+ +	for (try=0; try<2; try++) {
+ +		read_lock(&binfmt_lock);
+ +		list_for_each_entry(fmt, &formats, lh) {
+ +			if (!try_module_get(fmt->module))
+ +				continue;
+ +			read_unlock(&binfmt_lock);
+ +			bprm->recursion_depth++;
+ +			retval = fmt->load_binary(bprm);
+ +			bprm->recursion_depth--;
+ +			if (retval >= 0) {
+ +				audit_bprm(bprm);
+ +				if (depth == 0) {
+ +					trace_sched_process_exec(current, old_pid, bprm);
+ +					ptrace_event(PTRACE_EVENT_EXEC, old_vpid);
+ +				}
+ +				put_binfmt(fmt);
+ +				allow_write_access(bprm->file);
+ +				if (bprm->file)
+ +					fput(bprm->file);
+ +				bprm->file = NULL;
+ +				current->did_exec = 1;
+ +				proc_exec_connector(current);
+ +				return retval;
+ +			}
+ +			read_lock(&binfmt_lock);
+ +			put_binfmt(fmt);
+ +			if (retval != -ENOEXEC || bprm->mm == NULL)
+ +				break;
+ +			if (!bprm->file) {
+ +				read_unlock(&binfmt_lock);
+ +				return retval;
+ +			}
+ +		}
+++=======
++  retry:
++ 	read_lock(&binfmt_lock);
++ 	list_for_each_entry(fmt, &formats, lh) {
++ 		if (!try_module_get(fmt->module))
++ 			continue;
+++>>>>>>> cb7b6b1cbc20 (exec: cleanup the CONFIG_MODULES logic)
+  		read_unlock(&binfmt_lock);
+- #ifdef CONFIG_MODULES
+- 		if (retval != -ENOEXEC || bprm->mm == NULL) {
++ 		bprm->recursion_depth++;
++ 		retval = fmt->load_binary(bprm);
++ 		bprm->recursion_depth--;
++ 		if (retval >= 0) {
++ 			put_binfmt(fmt);
++ 			return retval;
++ 		}
++ 		read_lock(&binfmt_lock);
++ 		put_binfmt(fmt);
++ 		if (retval != -ENOEXEC || bprm->mm == NULL)
+  			break;
+- 		} else {
+- #define printable(c) (((c)=='\t') || ((c)=='\n') || (0x20<=(c) && (c)<=0x7e))
+- 			if (printable(bprm->buf[0]) &&
+- 			    printable(bprm->buf[1]) &&
+- 			    printable(bprm->buf[2]) &&
+- 			    printable(bprm->buf[3]))
+- 				break; /* -ENOEXEC */
+- 			if (try)
+- 				break; /* -ENOEXEC */
+- 			request_module("binfmt-%04x", *(unsigned short *)(&bprm->buf[2]));
++ 		if (!bprm->file) {
++ 			read_unlock(&binfmt_lock);
++ 			return retval;
+  		}
+- #else
+- 		break;
+- #endif
+  	}
++ 	read_unlock(&binfmt_lock);
++ 
++ 	if (need_retry && retval == -ENOEXEC && bprm->mm) {
++ 		if (printable(bprm->buf[0]) && printable(bprm->buf[1]) &&
++ 		    printable(bprm->buf[2]) && printable(bprm->buf[3]))
++ 			return retval;
++ 		request_module("binfmt-%04x", *(ushort *)(bprm->buf + 2));
++ 		need_retry = false;
++ 		goto retry;
++ 	}
++ 
+  	return retval;
+  }
+ -EXPORT_SYMBOL(search_binary_handler);
+ -
+ -static int exec_binprm(struct linux_binprm *bprm)
+ -{
+ -	pid_t old_pid, old_vpid;
+ -	int ret;
+ -
+ -	/* Need to fetch pid before load_binary changes it */
+ -	old_pid = current->pid;
+ -	rcu_read_lock();
+ -	old_vpid = task_pid_nr_ns(current, task_active_pid_ns(current->parent));
+ -	rcu_read_unlock();
+  
+ -	ret = search_binary_handler(bprm);
+ -	if (ret >= 0) {
+ -		trace_sched_process_exec(current, old_pid, bprm);
+ -		ptrace_event(PTRACE_EVENT_EXEC, old_vpid);
+ -		current->did_exec = 1;
+ -		proc_exec_connector(current);
+ -
+ -		if (bprm->file) {
+ -			allow_write_access(bprm->file);
+ -			fput(bprm->file);
+ -			bprm->file = NULL; /* to catch use-after-free */
+ -		}
+ -	}
+ -
+ -	return ret;
+ -}
+ +EXPORT_SYMBOL(search_binary_handler);
+  
+  /*
+   * sys_execve() executes a new program.
+* Unmerged path fs/exec.c
