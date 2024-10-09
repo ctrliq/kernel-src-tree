@@ -1,0 +1,1476 @@
+tun, bpf: fix suspicious RCU usage in tun_{attach, detach}_filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 5a5abb1fa3b05dd6aa821525832644c1e7d2905f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5a5abb1f.failed
+
+Sasha Levin reported a suspicious rcu_dereference_protected() warning
+found while fuzzing with trinity that is similar to this one:
+
+  [   52.765684] net/core/filter.c:2262 suspicious rcu_dereference_protected() usage!
+  [   52.765688] other info that might help us debug this:
+  [   52.765695] rcu_scheduler_active = 1, debug_locks = 1
+  [   52.765701] 1 lock held by a.out/1525:
+  [   52.765704]  #0:  (rtnl_mutex){+.+.+.}, at: [<ffffffff816a64b7>] rtnl_lock+0x17/0x20
+  [   52.765721] stack backtrace:
+  [   52.765728] CPU: 1 PID: 1525 Comm: a.out Not tainted 4.5.0+ #264
+  [...]
+  [   52.765768] Call Trace:
+  [   52.765775]  [<ffffffff813e488d>] dump_stack+0x85/0xc8
+  [   52.765784]  [<ffffffff810f2fa5>] lockdep_rcu_suspicious+0xd5/0x110
+  [   52.765792]  [<ffffffff816afdc2>] sk_detach_filter+0x82/0x90
+  [   52.765801]  [<ffffffffa0883425>] tun_detach_filter+0x35/0x90 [tun]
+  [   52.765810]  [<ffffffffa0884ed4>] __tun_chr_ioctl+0x354/0x1130 [tun]
+  [   52.765818]  [<ffffffff8136fed0>] ? selinux_file_ioctl+0x130/0x210
+  [   52.765827]  [<ffffffffa0885ce3>] tun_chr_ioctl+0x13/0x20 [tun]
+  [   52.765834]  [<ffffffff81260ea6>] do_vfs_ioctl+0x96/0x690
+  [   52.765843]  [<ffffffff81364af3>] ? security_file_ioctl+0x43/0x60
+  [   52.765850]  [<ffffffff81261519>] SyS_ioctl+0x79/0x90
+  [   52.765858]  [<ffffffff81003ba2>] do_syscall_64+0x62/0x140
+  [   52.765866]  [<ffffffff817d563f>] entry_SYSCALL64_slow_path+0x25/0x25
+
+Same can be triggered with PROVE_RCU (+ PROVE_RCU_REPEATEDLY) enabled
+from tun_attach_filter() when user space calls ioctl(tun_fd, TUN{ATTACH,
+DETACH}FILTER, ...) for adding/removing a BPF filter on tap devices.
+
+Since the fix in f91ff5b9ff52 ("net: sk_{detach|attach}_filter() rcu
+fixes") sk_attach_filter()/sk_detach_filter() now dereferences the
+filter with rcu_dereference_protected(), checking whether socket lock
+is held in control path.
+
+Since its introduction in 994051625981 ("tun: socket filter support"),
+tap filters are managed under RTNL lock from __tun_chr_ioctl(). Thus the
+sock_owned_by_user(sk) doesn't apply in this specific case and therefore
+triggers the false positive.
+
+Extend the BPF API with __sk_attach_filter()/__sk_detach_filter() pair
+that is used by tap filters and pass in lockdep_rtnl_is_held() for the
+rcu_dereference_protected() checks instead.
+
+	Reported-by: Sasha Levin <sasha.levin@oracle.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5a5abb1fa3b05dd6aa821525832644c1e7d2905f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	net/core/filter.c
+diff --cc include/linux/filter.h
+index 9f8aa2fe7f2f,a51a5361695f..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -642,17 -456,34 +642,40 @@@ static inline void bpf_prog_unlock_free
+  	__bpf_prog_free(fp);
+  }
+  
+ -typedef int (*bpf_aux_classic_check_t)(struct sock_filter *filter,
+ -				       unsigned int flen);
+ +static inline bool bpf_dump_raw_ok(void)
+ +{
+ +	/* Reconstruction of call-sites is dependent on kallsyms,
+ +	 * thus make dump the same restriction.
+ +	 */
+ +	return kallsyms_show_value() == 1;
+ +}
+  
+ -int bpf_prog_create(struct bpf_prog **pfp, struct sock_fprog_kern *fprog);
+ -int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
+ -			      bpf_aux_classic_check_t trans, bool save_orig);
+ -void bpf_prog_destroy(struct bpf_prog *fp);
+ +struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+ +				       const struct bpf_insn *patch, u32 len);
+  
+++<<<<<<< HEAD
+++=======
++ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
++ int __sk_attach_filter(struct sock_fprog *fprog, struct sock *sk,
++ 		       bool locked);
++ int sk_attach_bpf(u32 ufd, struct sock *sk);
++ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);
++ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk);
++ int sk_detach_filter(struct sock *sk);
++ int __sk_detach_filter(struct sock *sk, bool locked);
++ 
++ int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
++ 		  unsigned int len);
++ 
++ bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
++ void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
++ 
++ u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ void bpf_int_jit_compile(struct bpf_prog *fp);
++ bool bpf_helper_changes_skb_data(void *func);
++ 
++ #ifdef CONFIG_BPF_JIT
+++>>>>>>> 5a5abb1fa3b0 (tun, bpf: fix suspicious RCU usage in tun_{attach, detach}_filter)
+  typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+  
+  struct bpf_binary_header *
+diff --cc net/core/filter.c
+index f6032a8d359a,ca7f832b2980..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -703,17 -1086,155 +703,151 @@@ int sk_unattached_filter_create(struct 
+  
+  	*pfp = fp;
+  	return 0;
+ +free_mem:
+ +	kfree(fp);
+ +	return err;
+  }
+ -EXPORT_SYMBOL_GPL(bpf_prog_create);
+ +EXPORT_SYMBOL_GPL(sk_unattached_filter_create);
+  
+ -/**
+ - *	bpf_prog_create_from_user - create an unattached filter from user buffer
+ - *	@pfp: the unattached filter that is created
+ - *	@fprog: the filter program
+ - *	@trans: post-classic verifier transformation handler
+ - *	@save_orig: save classic BPF program
+ - *
+ - * This function effectively does the same as bpf_prog_create(), only
+ - * that it builds up its insns buffer from user space provided buffer.
+ - * It also allows for passing a bpf_aux_classic_check_t handler.
+ - */
+ -int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
+ -			      bpf_aux_classic_check_t trans, bool save_orig)
+ +void sk_unattached_filter_destroy(struct sk_filter *fp)
+  {
+++<<<<<<< HEAD
+ +	sk_filter_release(fp);
+++=======
++ 	unsigned int fsize = bpf_classic_proglen(fprog);
++ 	struct bpf_prog *fp;
++ 	int err;
++ 
++ 	/* Make sure new filter is there and in the right amounts. */
++ 	if (fprog->filter == NULL)
++ 		return -EINVAL;
++ 
++ 	fp = bpf_prog_alloc(bpf_prog_size(fprog->len), 0);
++ 	if (!fp)
++ 		return -ENOMEM;
++ 
++ 	if (copy_from_user(fp->insns, fprog->filter, fsize)) {
++ 		__bpf_prog_free(fp);
++ 		return -EFAULT;
++ 	}
++ 
++ 	fp->len = fprog->len;
++ 	fp->orig_prog = NULL;
++ 
++ 	if (save_orig) {
++ 		err = bpf_prog_store_orig_filter(fp, fprog);
++ 		if (err) {
++ 			__bpf_prog_free(fp);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	/* bpf_prepare_filter() already takes care of freeing
++ 	 * memory in case something goes wrong.
++ 	 */
++ 	fp = bpf_prepare_filter(fp, trans);
++ 	if (IS_ERR(fp))
++ 		return PTR_ERR(fp);
++ 
++ 	*pfp = fp;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(bpf_prog_create_from_user);
++ 
++ void bpf_prog_destroy(struct bpf_prog *fp)
++ {
++ 	__bpf_prog_release(fp);
++ }
++ EXPORT_SYMBOL_GPL(bpf_prog_destroy);
++ 
++ static int __sk_attach_prog(struct bpf_prog *prog, struct sock *sk,
++ 			    bool locked)
++ {
++ 	struct sk_filter *fp, *old_fp;
++ 
++ 	fp = kmalloc(sizeof(*fp), GFP_KERNEL);
++ 	if (!fp)
++ 		return -ENOMEM;
++ 
++ 	fp->prog = prog;
++ 	atomic_set(&fp->refcnt, 0);
++ 
++ 	if (!sk_filter_charge(sk, fp)) {
++ 		kfree(fp);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	old_fp = rcu_dereference_protected(sk->sk_filter, locked);
++ 	rcu_assign_pointer(sk->sk_filter, fp);
++ 	if (old_fp)
++ 		sk_filter_uncharge(sk, old_fp);
++ 
++ 	return 0;
++ }
++ 
++ static int __reuseport_attach_prog(struct bpf_prog *prog, struct sock *sk)
++ {
++ 	struct bpf_prog *old_prog;
++ 	int err;
++ 
++ 	if (bpf_prog_size(prog->len) > sysctl_optmem_max)
++ 		return -ENOMEM;
++ 
++ 	if (sk_unhashed(sk) && sk->sk_reuseport) {
++ 		err = reuseport_alloc(sk);
++ 		if (err)
++ 			return err;
++ 	} else if (!rcu_access_pointer(sk->sk_reuseport_cb)) {
++ 		/* The socket wasn't bound with SO_REUSEPORT */
++ 		return -EINVAL;
++ 	}
++ 
++ 	old_prog = reuseport_attach_prog(sk, prog);
++ 	if (old_prog)
++ 		bpf_prog_destroy(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ static
++ struct bpf_prog *__get_filter(struct sock_fprog *fprog, struct sock *sk)
++ {
++ 	unsigned int fsize = bpf_classic_proglen(fprog);
++ 	unsigned int bpf_fsize = bpf_prog_size(fprog->len);
++ 	struct bpf_prog *prog;
++ 	int err;
++ 
++ 	if (sock_flag(sk, SOCK_FILTER_LOCKED))
++ 		return ERR_PTR(-EPERM);
++ 
++ 	/* Make sure new filter is there and in the right amounts. */
++ 	if (fprog->filter == NULL)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	prog = bpf_prog_alloc(bpf_fsize, 0);
++ 	if (!prog)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (copy_from_user(prog->insns, fprog->filter, fsize)) {
++ 		__bpf_prog_free(prog);
++ 		return ERR_PTR(-EFAULT);
++ 	}
++ 
++ 	prog->len = fprog->len;
++ 
++ 	err = bpf_prog_store_orig_filter(prog, fprog);
++ 	if (err) {
++ 		__bpf_prog_free(prog);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	/* bpf_prepare_filter() already takes care of freeing
++ 	 * memory in case something goes wrong.
++ 	 */
++ 	return bpf_prepare_filter(prog, NULL);
+++>>>>>>> 5a5abb1fa3b0 (tun, bpf: fix suspicious RCU usage in tun_{attach, detach}_filter)
+  }
+ +EXPORT_SYMBOL_GPL(sk_unattached_filter_destroy);
+  
+  /**
+   *	sk_attach_filter - attach a socket filter
+@@@ -725,47 -1246,1016 +859,1048 @@@
+   * occurs or there is insufficient memory for the filter a negative
+   * errno code is returned. On success the return is zero.
+   */
+- int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk)
++ int __sk_attach_filter(struct sock_fprog *fprog, struct sock *sk,
++ 		       bool locked)
+  {
+ -	struct bpf_prog *prog = __get_filter(fprog, sk);
+ +	struct sk_filter *fp, *old_fp;
+ +	unsigned int fsize = sizeof(struct sock_filter) * fprog->len;
+  	int err;
+  
+ -	if (IS_ERR(prog))
+ -		return PTR_ERR(prog);
+ +	if (sock_flag(sk, SOCK_FILTER_LOCKED))
+ +		return -EPERM;
+ +
+++<<<<<<< HEAD
+ +	/* Make sure new filter is there and in the right amounts. */
+ +	if (fprog->filter == NULL)
+ +		return -EINVAL;
+ +
+ +	fp = sock_kmalloc(sk, fsize+sizeof(*fp), GFP_KERNEL);
+ +	if (!fp)
+ +		return -ENOMEM;
+ +	if (copy_from_user(fp->insns, fprog->filter, fsize)) {
+ +		sock_kfree_s(sk, fp, fsize+sizeof(*fp));
+ +		return -EFAULT;
+ +	}
+ +
+ +	atomic_set(&fp->refcnt, 1);
+ +	fp->len = fprog->len;
+  
+ +	err = __sk_prepare_filter(fp);
+ +	if (err) {
+ +		sk_filter_uncharge(sk, fp);
+++=======
++ 	err = __sk_attach_prog(prog, sk, locked);
++ 	if (err < 0) {
++ 		__bpf_prog_release(prog);
+++>>>>>>> 5a5abb1fa3b0 (tun, bpf: fix suspicious RCU usage in tun_{attach, detach}_filter)
+  		return err;
+  	}
+  
+ +	old_fp = rcu_dereference_protected(sk->sk_filter,
+ +					   sock_owned_by_user(sk));
+ +	rcu_assign_pointer(sk->sk_filter, fp);
+ +
+ +	if (old_fp)
+ +		sk_filter_uncharge(sk, old_fp);
+  	return 0;
+  }
+- EXPORT_SYMBOL_GPL(sk_attach_filter);
++ EXPORT_SYMBOL_GPL(__sk_attach_filter);
+  
++ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk)
++ {
++ 	return __sk_attach_filter(fprog, sk, sock_owned_by_user(sk));
++ }
++ 
+++<<<<<<< HEAD
+ +int sk_detach_filter(struct sock *sk)
+++=======
++ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk)
++ {
++ 	struct bpf_prog *prog = __get_filter(fprog, sk);
++ 	int err;
++ 
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	err = __reuseport_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		__bpf_prog_release(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct bpf_prog *__get_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	if (sock_flag(sk, SOCK_FILTER_LOCKED))
++ 		return ERR_PTR(-EPERM);
++ 
++ 	prog = bpf_prog_get(ufd);
++ 	if (IS_ERR(prog))
++ 		return prog;
++ 
++ 	if (prog->type != BPF_PROG_TYPE_SOCKET_FILTER) {
++ 		bpf_prog_put(prog);
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	return prog;
++ }
++ 
++ int sk_attach_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog = __get_bpf(ufd, sk);
++ 	int err;
++ 
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	err = __sk_attach_prog(prog, sk, sock_owned_by_user(sk));
++ 	if (err < 0) {
++ 		bpf_prog_put(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog = __get_bpf(ufd, sk);
++ 	int err;
++ 
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	err = __reuseport_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		bpf_prog_put(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ struct bpf_scratchpad {
++ 	union {
++ 		__be32 diff[MAX_BPF_STACK / sizeof(__be32)];
++ 		u8     buff[MAX_BPF_STACK];
++ 	};
++ };
++ 
++ static DEFINE_PER_CPU(struct bpf_scratchpad, bpf_sp);
++ 
++ static u64 bpf_skb_store_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
++ {
++ 	struct bpf_scratchpad *sp = this_cpu_ptr(&bpf_sp);
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	int offset = (int) r2;
++ 	void *from = (void *) (long) r3;
++ 	unsigned int len = (unsigned int) r4;
++ 	void *ptr;
++ 
++ 	if (unlikely(flags & ~(BPF_F_RECOMPUTE_CSUM | BPF_F_INVALIDATE_HASH)))
++ 		return -EINVAL;
++ 
++ 	/* bpf verifier guarantees that:
++ 	 * 'from' pointer points to bpf program stack
++ 	 * 'len' bytes of it were initialized
++ 	 * 'len' > 0
++ 	 * 'skb' is a valid pointer to 'struct sk_buff'
++ 	 *
++ 	 * so check for invalid 'offset' and too large 'len'
++ 	 */
++ 	if (unlikely((u32) offset > 0xffff || len > sizeof(sp->buff)))
++ 		return -EFAULT;
++ 	if (unlikely(skb_try_make_writable(skb, offset + len)))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, len, sp->buff);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	if (flags & BPF_F_RECOMPUTE_CSUM)
++ 		skb_postpull_rcsum(skb, ptr, len);
++ 
++ 	memcpy(ptr, from, len);
++ 
++ 	if (ptr == sp->buff)
++ 		/* skb_store_bits cannot return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, len);
++ 
++ 	if (flags & BPF_F_RECOMPUTE_CSUM)
++ 		skb_postpush_rcsum(skb, ptr, len);
++ 	if (flags & BPF_F_INVALIDATE_HASH)
++ 		skb_clear_hash(skb);
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_store_bytes_proto = {
++ 	.func		= bpf_skb_store_bytes,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_PTR_TO_STACK,
++ 	.arg4_type	= ARG_CONST_STACK_SIZE,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_skb_load_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++ {
++ 	const struct sk_buff *skb = (const struct sk_buff *)(unsigned long) r1;
++ 	int offset = (int) r2;
++ 	void *to = (void *)(unsigned long) r3;
++ 	unsigned int len = (unsigned int) r4;
++ 	void *ptr;
++ 
++ 	if (unlikely((u32) offset > 0xffff || len > MAX_BPF_STACK))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, len, to);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 	if (ptr != to)
++ 		memcpy(to, ptr, len);
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_load_bytes_proto = {
++ 	.func		= bpf_skb_load_bytes,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_PTR_TO_STACK,
++ 	.arg4_type	= ARG_CONST_STACK_SIZE,
++ };
++ 
++ static u64 bpf_l3_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	int offset = (int) r2;
++ 	__sum16 sum, *ptr;
++ 
++ 	if (unlikely(flags & ~(BPF_F_HDR_FIELD_MASK)))
++ 		return -EINVAL;
++ 	if (unlikely((u32) offset > 0xffff))
++ 		return -EFAULT;
++ 	if (unlikely(skb_try_make_writable(skb, offset + sizeof(sum))))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	switch (flags & BPF_F_HDR_FIELD_MASK) {
++ 	case 0:
++ 		if (unlikely(from != 0))
++ 			return -EINVAL;
++ 
++ 		csum_replace_by_diff(ptr, to);
++ 		break;
++ 	case 2:
++ 		csum_replace2(ptr, from, to);
++ 		break;
++ 	case 4:
++ 		csum_replace4(ptr, from, to);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ptr == &sum)
++ 		/* skb_store_bits guaranteed to not return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, sizeof(sum));
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_l3_csum_replace_proto = {
++ 	.func		= bpf_l3_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_l4_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	bool is_pseudo = flags & BPF_F_PSEUDO_HDR;
++ 	bool is_mmzero = flags & BPF_F_MARK_MANGLED_0;
++ 	int offset = (int) r2;
++ 	__sum16 sum, *ptr;
++ 
++ 	if (unlikely(flags & ~(BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |
++ 			       BPF_F_HDR_FIELD_MASK)))
++ 		return -EINVAL;
++ 	if (unlikely((u32) offset > 0xffff))
++ 		return -EFAULT;
++ 	if (unlikely(skb_try_make_writable(skb, offset + sizeof(sum))))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 	if (is_mmzero && !*ptr)
++ 		return 0;
++ 
++ 	switch (flags & BPF_F_HDR_FIELD_MASK) {
++ 	case 0:
++ 		if (unlikely(from != 0))
++ 			return -EINVAL;
++ 
++ 		inet_proto_csum_replace_by_diff(ptr, skb, to, is_pseudo);
++ 		break;
++ 	case 2:
++ 		inet_proto_csum_replace2(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	case 4:
++ 		inet_proto_csum_replace4(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (is_mmzero && !*ptr)
++ 		*ptr = CSUM_MANGLED_0;
++ 	if (ptr == &sum)
++ 		/* skb_store_bits guaranteed to not return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, sizeof(sum));
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_l4_csum_replace_proto = {
++ 	.func		= bpf_l4_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_csum_diff(u64 r1, u64 from_size, u64 r3, u64 to_size, u64 seed)
++ {
++ 	struct bpf_scratchpad *sp = this_cpu_ptr(&bpf_sp);
++ 	u64 diff_size = from_size + to_size;
++ 	__be32 *from = (__be32 *) (long) r1;
++ 	__be32 *to   = (__be32 *) (long) r3;
++ 	int i, j = 0;
++ 
++ 	/* This is quite flexible, some examples:
++ 	 *
++ 	 * from_size == 0, to_size > 0,  seed := csum --> pushing data
++ 	 * from_size > 0,  to_size == 0, seed := csum --> pulling data
++ 	 * from_size > 0,  to_size > 0,  seed := 0    --> diffing data
++ 	 *
++ 	 * Even for diffing, from_size and to_size don't need to be equal.
++ 	 */
++ 	if (unlikely(((from_size | to_size) & (sizeof(__be32) - 1)) ||
++ 		     diff_size > sizeof(sp->diff)))
++ 		return -EINVAL;
++ 
++ 	for (i = 0; i < from_size / sizeof(__be32); i++, j++)
++ 		sp->diff[j] = ~from[i];
++ 	for (i = 0; i <   to_size / sizeof(__be32); i++, j++)
++ 		sp->diff[j] = to[i];
++ 
++ 	return csum_partial(sp->diff, diff_size, seed);
++ }
++ 
++ static const struct bpf_func_proto bpf_csum_diff_proto = {
++ 	.func		= bpf_csum_diff,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_STACK,
++ 	.arg2_type	= ARG_CONST_STACK_SIZE_OR_ZERO,
++ 	.arg3_type	= ARG_PTR_TO_STACK,
++ 	.arg4_type	= ARG_CONST_STACK_SIZE_OR_ZERO,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_clone_redirect(u64 r1, u64 ifindex, u64 flags, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1, *skb2;
++ 	struct net_device *dev;
++ 
++ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
++ 		return -EINVAL;
++ 
++ 	dev = dev_get_by_index_rcu(dev_net(skb->dev), ifindex);
++ 	if (unlikely(!dev))
++ 		return -EINVAL;
++ 
++ 	skb2 = skb_clone(skb, GFP_ATOMIC);
++ 	if (unlikely(!skb2))
++ 		return -ENOMEM;
++ 
++ 	if (flags & BPF_F_INGRESS) {
++ 		if (skb_at_tc_ingress(skb2))
++ 			skb_postpush_rcsum(skb2, skb_mac_header(skb2),
++ 					   skb2->mac_len);
++ 		return dev_forward_skb(dev, skb2);
++ 	}
++ 
++ 	skb2->dev = dev;
++ 	return dev_queue_xmit(skb2);
++ }
++ 
++ static const struct bpf_func_proto bpf_clone_redirect_proto = {
++ 	.func           = bpf_clone_redirect,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ 
++ struct redirect_info {
++ 	u32 ifindex;
++ 	u32 flags;
++ };
++ 
++ static DEFINE_PER_CPU(struct redirect_info, redirect_info);
++ 
++ static u64 bpf_redirect(u64 ifindex, u64 flags, u64 r3, u64 r4, u64 r5)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 
++ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
++ 		return TC_ACT_SHOT;
++ 
++ 	ri->ifindex = ifindex;
++ 	ri->flags = flags;
++ 
++ 	return TC_ACT_REDIRECT;
++ }
++ 
++ int skb_do_redirect(struct sk_buff *skb)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	struct net_device *dev;
++ 
++ 	dev = dev_get_by_index_rcu(dev_net(skb->dev), ri->ifindex);
++ 	ri->ifindex = 0;
++ 	if (unlikely(!dev)) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ri->flags & BPF_F_INGRESS) {
++ 		if (skb_at_tc_ingress(skb))
++ 			skb_postpush_rcsum(skb, skb_mac_header(skb),
++ 					   skb->mac_len);
++ 		return dev_forward_skb(dev, skb);
++ 	}
++ 
++ 	skb->dev = dev;
++ 	return dev_queue_xmit(skb);
++ }
++ 
++ static const struct bpf_func_proto bpf_redirect_proto = {
++ 	.func           = bpf_redirect,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_ANYTHING,
++ 	.arg2_type      = ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_get_cgroup_classid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++ {
++ 	return task_get_classid((struct sk_buff *) (unsigned long) r1);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_cgroup_classid_proto = {
++ 	.func           = bpf_get_cgroup_classid,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ static u64 bpf_get_route_realm(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++ {
++ 	return dst_tclassid((struct sk_buff *) (unsigned long) r1);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_route_realm_proto = {
++ 	.func           = bpf_get_route_realm,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ static u64 bpf_skb_vlan_push(u64 r1, u64 r2, u64 vlan_tci, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	__be16 vlan_proto = (__force __be16) r2;
++ 
++ 	if (unlikely(vlan_proto != htons(ETH_P_8021Q) &&
++ 		     vlan_proto != htons(ETH_P_8021AD)))
++ 		vlan_proto = htons(ETH_P_8021Q);
++ 
++ 	return skb_vlan_push(skb, vlan_proto, vlan_tci);
++ }
++ 
++ const struct bpf_func_proto bpf_skb_vlan_push_proto = {
++ 	.func           = bpf_skb_vlan_push,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ EXPORT_SYMBOL_GPL(bpf_skb_vlan_push_proto);
++ 
++ static u64 bpf_skb_vlan_pop(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 
++ 	return skb_vlan_pop(skb);
++ }
++ 
++ const struct bpf_func_proto bpf_skb_vlan_pop_proto = {
++ 	.func           = bpf_skb_vlan_pop,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ EXPORT_SYMBOL_GPL(bpf_skb_vlan_pop_proto);
++ 
++ bool bpf_helper_changes_skb_data(void *func)
++ {
++ 	if (func == bpf_skb_vlan_push)
++ 		return true;
++ 	if (func == bpf_skb_vlan_pop)
++ 		return true;
++ 	if (func == bpf_skb_store_bytes)
++ 		return true;
++ 	if (func == bpf_l3_csum_replace)
++ 		return true;
++ 	if (func == bpf_l4_csum_replace)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static unsigned short bpf_tunnel_key_af(u64 flags)
++ {
++ 	return flags & BPF_F_TUNINFO_IPV6 ? AF_INET6 : AF_INET;
++ }
++ 
++ static u64 bpf_skb_get_tunnel_key(u64 r1, u64 r2, u64 size, u64 flags, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	struct bpf_tunnel_key *to = (struct bpf_tunnel_key *) (long) r2;
++ 	const struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	u8 compat[sizeof(struct bpf_tunnel_key)];
++ 
++ 	if (unlikely(!info || (flags & ~(BPF_F_TUNINFO_IPV6))))
++ 		return -EINVAL;
++ 	if (ip_tunnel_info_af(info) != bpf_tunnel_key_af(flags))
++ 		return -EPROTO;
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key))) {
++ 		switch (size) {
++ 		case offsetof(struct bpf_tunnel_key, tunnel_label):
++ 		case offsetof(struct bpf_tunnel_key, tunnel_ext):
++ 			goto set_compat;
++ 		case offsetof(struct bpf_tunnel_key, remote_ipv6[1]):
++ 			/* Fixup deprecated structure layouts here, so we have
++ 			 * a common path later on.
++ 			 */
++ 			if (ip_tunnel_info_af(info) != AF_INET)
++ 				return -EINVAL;
++ set_compat:
++ 			to = (struct bpf_tunnel_key *)compat;
++ 			break;
++ 		default:
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	to->tunnel_id = be64_to_cpu(info->key.tun_id);
++ 	to->tunnel_tos = info->key.tos;
++ 	to->tunnel_ttl = info->key.ttl;
++ 
++ 	if (flags & BPF_F_TUNINFO_IPV6) {
++ 		memcpy(to->remote_ipv6, &info->key.u.ipv6.src,
++ 		       sizeof(to->remote_ipv6));
++ 		to->tunnel_label = be32_to_cpu(info->key.label);
++ 	} else {
++ 		to->remote_ipv4 = be32_to_cpu(info->key.u.ipv4.src);
++ 	}
++ 
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key)))
++ 		memcpy((void *)(long) r2, to, size);
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_get_tunnel_key_proto = {
++ 	.func		= bpf_skb_get_tunnel_key,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_STACK,
++ 	.arg3_type	= ARG_CONST_STACK_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_skb_get_tunnel_opt(u64 r1, u64 r2, u64 size, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	u8 *to = (u8 *) (long) r2;
++ 	const struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 
++ 	if (unlikely(!info ||
++ 		     !(info->key.tun_flags & TUNNEL_OPTIONS_PRESENT)))
++ 		return -ENOENT;
++ 	if (unlikely(size < info->options_len))
++ 		return -ENOMEM;
++ 
++ 	ip_tunnel_info_opts_get(to, info);
++ 
++ 	return info->options_len;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_get_tunnel_opt_proto = {
++ 	.func		= bpf_skb_get_tunnel_opt,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_STACK,
++ 	.arg3_type	= ARG_CONST_STACK_SIZE,
++ };
++ 
++ static struct metadata_dst __percpu *md_dst;
++ 
++ static u64 bpf_skb_set_tunnel_key(u64 r1, u64 r2, u64 size, u64 flags, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	struct bpf_tunnel_key *from = (struct bpf_tunnel_key *) (long) r2;
++ 	struct metadata_dst *md = this_cpu_ptr(md_dst);
++ 	u8 compat[sizeof(struct bpf_tunnel_key)];
++ 	struct ip_tunnel_info *info;
++ 
++ 	if (unlikely(flags & ~(BPF_F_TUNINFO_IPV6 | BPF_F_ZERO_CSUM_TX |
++ 			       BPF_F_DONT_FRAGMENT)))
++ 		return -EINVAL;
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key))) {
++ 		switch (size) {
++ 		case offsetof(struct bpf_tunnel_key, tunnel_label):
++ 		case offsetof(struct bpf_tunnel_key, tunnel_ext):
++ 		case offsetof(struct bpf_tunnel_key, remote_ipv6[1]):
++ 			/* Fixup deprecated structure layouts here, so we have
++ 			 * a common path later on.
++ 			 */
++ 			memcpy(compat, from, size);
++ 			memset(compat + size, 0, sizeof(compat) - size);
++ 			from = (struct bpf_tunnel_key *)compat;
++ 			break;
++ 		default:
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	if (unlikely((!(flags & BPF_F_TUNINFO_IPV6) && from->tunnel_label) ||
++ 		     from->tunnel_ext))
++ 		return -EINVAL;
++ 
++ 	skb_dst_drop(skb);
++ 	dst_hold((struct dst_entry *) md);
++ 	skb_dst_set(skb, (struct dst_entry *) md);
++ 
++ 	info = &md->u.tun_info;
++ 	info->mode = IP_TUNNEL_INFO_TX;
++ 
++ 	info->key.tun_flags = TUNNEL_KEY | TUNNEL_CSUM | TUNNEL_NOCACHE;
++ 	if (flags & BPF_F_DONT_FRAGMENT)
++ 		info->key.tun_flags |= TUNNEL_DONT_FRAGMENT;
++ 
++ 	info->key.tun_id = cpu_to_be64(from->tunnel_id);
++ 	info->key.tos = from->tunnel_tos;
++ 	info->key.ttl = from->tunnel_ttl;
++ 
++ 	if (flags & BPF_F_TUNINFO_IPV6) {
++ 		info->mode |= IP_TUNNEL_INFO_IPV6;
++ 		memcpy(&info->key.u.ipv6.dst, from->remote_ipv6,
++ 		       sizeof(from->remote_ipv6));
++ 		info->key.label = cpu_to_be32(from->tunnel_label) &
++ 				  IPV6_FLOWLABEL_MASK;
++ 	} else {
++ 		info->key.u.ipv4.dst = cpu_to_be32(from->remote_ipv4);
++ 		if (flags & BPF_F_ZERO_CSUM_TX)
++ 			info->key.tun_flags &= ~TUNNEL_CSUM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_set_tunnel_key_proto = {
++ 	.func		= bpf_skb_set_tunnel_key,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_STACK,
++ 	.arg3_type	= ARG_CONST_STACK_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_skb_set_tunnel_opt(u64 r1, u64 r2, u64 size, u64 r4, u64 r5)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	u8 *from = (u8 *) (long) r2;
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	const struct metadata_dst *md = this_cpu_ptr(md_dst);
++ 
++ 	if (unlikely(info != &md->u.tun_info || (size & (sizeof(u32) - 1))))
++ 		return -EINVAL;
++ 	if (unlikely(size > IP_TUNNEL_OPTS_MAX))
++ 		return -ENOMEM;
++ 
++ 	ip_tunnel_info_opts_set(info, from, size);
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_set_tunnel_opt_proto = {
++ 	.func		= bpf_skb_set_tunnel_opt,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_STACK,
++ 	.arg3_type	= ARG_CONST_STACK_SIZE,
++ };
++ 
++ static const struct bpf_func_proto *
++ bpf_get_skb_set_tunnel_proto(enum bpf_func_id which)
++ {
++ 	if (!md_dst) {
++ 		/* Race is not possible, since it's called from verifier
++ 		 * that is holding verifier mutex.
++ 		 */
++ 		md_dst = metadata_dst_alloc_percpu(IP_TUNNEL_OPTS_MAX,
++ 						   GFP_KERNEL);
++ 		if (!md_dst)
++ 			return NULL;
++ 	}
++ 
++ 	switch (which) {
++ 	case BPF_FUNC_skb_set_tunnel_key:
++ 		return &bpf_skb_set_tunnel_key_proto;
++ 	case BPF_FUNC_skb_set_tunnel_opt:
++ 		return &bpf_skb_set_tunnel_opt_proto;
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ sk_filter_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_map_lookup_elem:
++ 		return &bpf_map_lookup_elem_proto;
++ 	case BPF_FUNC_map_update_elem:
++ 		return &bpf_map_update_elem_proto;
++ 	case BPF_FUNC_map_delete_elem:
++ 		return &bpf_map_delete_elem_proto;
++ 	case BPF_FUNC_get_prandom_u32:
++ 		return &bpf_get_prandom_u32_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_smp_processor_id_proto;
++ 	case BPF_FUNC_tail_call:
++ 		return &bpf_tail_call_proto;
++ 	case BPF_FUNC_ktime_get_ns:
++ 		return &bpf_ktime_get_ns_proto;
++ 	case BPF_FUNC_trace_printk:
++ 		if (capable(CAP_SYS_ADMIN))
++ 			return bpf_get_trace_printk_proto();
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ tc_cls_act_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_store_bytes:
++ 		return &bpf_skb_store_bytes_proto;
++ 	case BPF_FUNC_skb_load_bytes:
++ 		return &bpf_skb_load_bytes_proto;
++ 	case BPF_FUNC_csum_diff:
++ 		return &bpf_csum_diff_proto;
++ 	case BPF_FUNC_l3_csum_replace:
++ 		return &bpf_l3_csum_replace_proto;
++ 	case BPF_FUNC_l4_csum_replace:
++ 		return &bpf_l4_csum_replace_proto;
++ 	case BPF_FUNC_clone_redirect:
++ 		return &bpf_clone_redirect_proto;
++ 	case BPF_FUNC_get_cgroup_classid:
++ 		return &bpf_get_cgroup_classid_proto;
++ 	case BPF_FUNC_skb_vlan_push:
++ 		return &bpf_skb_vlan_push_proto;
++ 	case BPF_FUNC_skb_vlan_pop:
++ 		return &bpf_skb_vlan_pop_proto;
++ 	case BPF_FUNC_skb_get_tunnel_key:
++ 		return &bpf_skb_get_tunnel_key_proto;
++ 	case BPF_FUNC_skb_set_tunnel_key:
++ 		return bpf_get_skb_set_tunnel_proto(func_id);
++ 	case BPF_FUNC_skb_get_tunnel_opt:
++ 		return &bpf_skb_get_tunnel_opt_proto;
++ 	case BPF_FUNC_skb_set_tunnel_opt:
++ 		return bpf_get_skb_set_tunnel_proto(func_id);
++ 	case BPF_FUNC_redirect:
++ 		return &bpf_redirect_proto;
++ 	case BPF_FUNC_get_route_realm:
++ 		return &bpf_get_route_realm_proto;
++ 	default:
++ 		return sk_filter_func_proto(func_id);
++ 	}
++ }
++ 
++ static bool __is_valid_access(int off, int size, enum bpf_access_type type)
++ {
++ 	/* check bounds */
++ 	if (off < 0 || off >= sizeof(struct __sk_buff))
++ 		return false;
++ 
++ 	/* disallow misaligned access */
++ 	if (off % size != 0)
++ 		return false;
++ 
++ 	/* all __sk_buff fields are __u32 */
++ 	if (size != 4)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool sk_filter_is_valid_access(int off, int size,
++ 				      enum bpf_access_type type)
++ {
++ 	if (off == offsetof(struct __sk_buff, tc_classid))
++ 		return false;
++ 
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct __sk_buff, cb[0]) ...
++ 			offsetof(struct __sk_buff, cb[4]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return __is_valid_access(off, size, type);
++ }
++ 
++ static bool tc_cls_act_is_valid_access(int off, int size,
++ 				       enum bpf_access_type type)
++ {
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct __sk_buff, mark):
++ 		case offsetof(struct __sk_buff, tc_index):
++ 		case offsetof(struct __sk_buff, priority):
++ 		case offsetof(struct __sk_buff, cb[0]) ...
++ 		     offsetof(struct __sk_buff, cb[4]):
++ 		case offsetof(struct __sk_buff, tc_classid):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 	return __is_valid_access(off, size, type);
++ }
++ 
++ static u32 bpf_net_convert_ctx_access(enum bpf_access_type type, int dst_reg,
++ 				      int src_reg, int ctx_off,
++ 				      struct bpf_insn *insn_buf,
++ 				      struct bpf_prog *prog)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (ctx_off) {
++ 	case offsetof(struct __sk_buff, len):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, len) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, len));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, protocol):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, protocol) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, protocol));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, vlan_proto):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, vlan_proto) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, vlan_proto));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, priority):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, priority) != 4);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, priority));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, priority));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, ingress_ifindex):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, skb_iif) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, skb_iif));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, ifindex):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct net_device, ifindex) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(bytes_to_bpf_size(FIELD_SIZEOF(struct sk_buff, dev)),
++ 				      dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, dev));
++ 		*insn++ = BPF_JMP_IMM(BPF_JEQ, dst_reg, 0, 1);
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, dst_reg,
++ 				      offsetof(struct net_device, ifindex));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, hash):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, hash) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, hash));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, mark):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, mark) != 4);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, mark));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, mark));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, pkt_type):
++ 		return convert_skb_access(SKF_AD_PKTTYPE, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, queue_mapping):
++ 		return convert_skb_access(SKF_AD_QUEUE, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, vlan_present):
++ 		return convert_skb_access(SKF_AD_VLAN_TAG_PRESENT,
++ 					  dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, vlan_tci):
++ 		return convert_skb_access(SKF_AD_VLAN_TAG,
++ 					  dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, cb[0]) ...
++ 		offsetof(struct __sk_buff, cb[4]):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct qdisc_skb_cb, data) < 20);
++ 
++ 		prog->cb_access = 1;
++ 		ctx_off -= offsetof(struct __sk_buff, cb[0]);
++ 		ctx_off += offsetof(struct sk_buff, cb);
++ 		ctx_off += offsetof(struct qdisc_skb_cb, data);
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, dst_reg, src_reg, ctx_off);
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg, ctx_off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, tc_classid):
++ 		ctx_off -= offsetof(struct __sk_buff, tc_classid);
++ 		ctx_off += offsetof(struct sk_buff, cb);
++ 		ctx_off += offsetof(struct qdisc_skb_cb, tc_classid);
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_H, dst_reg, src_reg, ctx_off);
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg, ctx_off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, tc_index):
++ #ifdef CONFIG_NET_SCHED
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, tc_index) != 2);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_H, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, tc_index));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 					      offsetof(struct sk_buff, tc_index));
++ 		break;
++ #else
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_MOV64_REG(dst_reg, dst_reg);
++ 		else
++ 			*insn++ = BPF_MOV64_IMM(dst_reg, 0);
++ 		break;
++ #endif
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static const struct bpf_verifier_ops sk_filter_ops = {
++ 	.get_func_proto = sk_filter_func_proto,
++ 	.is_valid_access = sk_filter_is_valid_access,
++ 	.convert_ctx_access = bpf_net_convert_ctx_access,
++ };
++ 
++ static const struct bpf_verifier_ops tc_cls_act_ops = {
++ 	.get_func_proto = tc_cls_act_func_proto,
++ 	.is_valid_access = tc_cls_act_is_valid_access,
++ 	.convert_ctx_access = bpf_net_convert_ctx_access,
++ };
++ 
++ static struct bpf_prog_type_list sk_filter_type __read_mostly = {
++ 	.ops = &sk_filter_ops,
++ 	.type = BPF_PROG_TYPE_SOCKET_FILTER,
++ };
++ 
++ static struct bpf_prog_type_list sched_cls_type __read_mostly = {
++ 	.ops = &tc_cls_act_ops,
++ 	.type = BPF_PROG_TYPE_SCHED_CLS,
++ };
++ 
++ static struct bpf_prog_type_list sched_act_type __read_mostly = {
++ 	.ops = &tc_cls_act_ops,
++ 	.type = BPF_PROG_TYPE_SCHED_ACT,
++ };
++ 
++ static int __init register_sk_filter_ops(void)
++ {
++ 	bpf_register_prog_type(&sk_filter_type);
++ 	bpf_register_prog_type(&sched_cls_type);
++ 	bpf_register_prog_type(&sched_act_type);
++ 
++ 	return 0;
++ }
++ late_initcall(register_sk_filter_ops);
++ 
++ int __sk_detach_filter(struct sock *sk, bool locked)
+++>>>>>>> 5a5abb1fa3b0 (tun, bpf: fix suspicious RCU usage in tun_{attach, detach}_filter)
+  {
+  	int ret = -ENOENT;
+  	struct sk_filter *filter;
+@@@ -780,92 -2269,22 +1914,97 @@@
+  		sk_filter_uncharge(sk, filter);
+  		ret = 0;
+  	}
+ -
+  	return ret;
+  }
+- EXPORT_SYMBOL_GPL(sk_detach_filter);
++ EXPORT_SYMBOL_GPL(__sk_detach_filter);
++ 
++ int sk_detach_filter(struct sock *sk)
++ {
++ 	return __sk_detach_filter(sk, sock_owned_by_user(sk));
++ }
+  
+ -int sk_get_filter(struct sock *sk, struct sock_filter __user *ubuf,
+ -		  unsigned int len)
+ +void sk_decode_filter(struct sock_filter *filt, struct sock_filter *to)
+ +{
+ +	static const u16 decodes[] = {
+ +		[BPF_S_ALU_ADD_K]	= BPF_ALU|BPF_ADD|BPF_K,
+ +		[BPF_S_ALU_ADD_X]	= BPF_ALU|BPF_ADD|BPF_X,
+ +		[BPF_S_ALU_SUB_K]	= BPF_ALU|BPF_SUB|BPF_K,
+ +		[BPF_S_ALU_SUB_X]	= BPF_ALU|BPF_SUB|BPF_X,
+ +		[BPF_S_ALU_MUL_K]	= BPF_ALU|BPF_MUL|BPF_K,
+ +		[BPF_S_ALU_MUL_X]	= BPF_ALU|BPF_MUL|BPF_X,
+ +		[BPF_S_ALU_DIV_X]	= BPF_ALU|BPF_DIV|BPF_X,
+ +		[BPF_S_ALU_MOD_K]	= BPF_ALU|BPF_MOD|BPF_K,
+ +		[BPF_S_ALU_MOD_X]	= BPF_ALU|BPF_MOD|BPF_X,
+ +		[BPF_S_ALU_AND_K]	= BPF_ALU|BPF_AND|BPF_K,
+ +		[BPF_S_ALU_AND_X]	= BPF_ALU|BPF_AND|BPF_X,
+ +		[BPF_S_ALU_OR_K]	= BPF_ALU|BPF_OR|BPF_K,
+ +		[BPF_S_ALU_OR_X]	= BPF_ALU|BPF_OR|BPF_X,
+ +		[BPF_S_ALU_XOR_K]	= BPF_ALU|BPF_XOR|BPF_K,
+ +		[BPF_S_ALU_XOR_X]	= BPF_ALU|BPF_XOR|BPF_X,
+ +		[BPF_S_ALU_LSH_K]	= BPF_ALU|BPF_LSH|BPF_K,
+ +		[BPF_S_ALU_LSH_X]	= BPF_ALU|BPF_LSH|BPF_X,
+ +		[BPF_S_ALU_RSH_K]	= BPF_ALU|BPF_RSH|BPF_K,
+ +		[BPF_S_ALU_RSH_X]	= BPF_ALU|BPF_RSH|BPF_X,
+ +		[BPF_S_ALU_NEG]		= BPF_ALU|BPF_NEG,
+ +		[BPF_S_LD_W_ABS]	= BPF_LD|BPF_W|BPF_ABS,
+ +		[BPF_S_LD_H_ABS]	= BPF_LD|BPF_H|BPF_ABS,
+ +		[BPF_S_LD_B_ABS]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_PROTOCOL]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_PKTTYPE]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_IFINDEX]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_NLATTR]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_NLATTR_NEST]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_MARK]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_QUEUE]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_HATYPE]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_RXHASH]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_CPU]		= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_ALU_XOR_X]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_SECCOMP_LD_W] = BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_VLAN_TAG]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_VLAN_TAG_PRESENT] = BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_ANC_PAY_OFFSET]	= BPF_LD|BPF_B|BPF_ABS,
+ +		[BPF_S_LD_W_LEN]	= BPF_LD|BPF_W|BPF_LEN,
+ +		[BPF_S_LD_W_IND]	= BPF_LD|BPF_W|BPF_IND,
+ +		[BPF_S_LD_H_IND]	= BPF_LD|BPF_H|BPF_IND,
+ +		[BPF_S_LD_B_IND]	= BPF_LD|BPF_B|BPF_IND,
+ +		[BPF_S_LD_IMM]		= BPF_LD|BPF_IMM,
+ +		[BPF_S_LDX_W_LEN]	= BPF_LDX|BPF_W|BPF_LEN,
+ +		[BPF_S_LDX_B_MSH]	= BPF_LDX|BPF_B|BPF_MSH,
+ +		[BPF_S_LDX_IMM]		= BPF_LDX|BPF_IMM,
+ +		[BPF_S_MISC_TAX]	= BPF_MISC|BPF_TAX,
+ +		[BPF_S_MISC_TXA]	= BPF_MISC|BPF_TXA,
+ +		[BPF_S_RET_K]		= BPF_RET|BPF_K,
+ +		[BPF_S_RET_A]		= BPF_RET|BPF_A,
+ +		[BPF_S_ALU_DIV_K]	= BPF_ALU|BPF_DIV|BPF_K,
+ +		[BPF_S_LD_MEM]		= BPF_LD|BPF_MEM,
+ +		[BPF_S_LDX_MEM]		= BPF_LDX|BPF_MEM,
+ +		[BPF_S_ST]		= BPF_ST,
+ +		[BPF_S_STX]		= BPF_STX,
+ +		[BPF_S_JMP_JA]		= BPF_JMP|BPF_JA,
+ +		[BPF_S_JMP_JEQ_K]	= BPF_JMP|BPF_JEQ|BPF_K,
+ +		[BPF_S_JMP_JEQ_X]	= BPF_JMP|BPF_JEQ|BPF_X,
+ +		[BPF_S_JMP_JGE_K]	= BPF_JMP|BPF_JGE|BPF_K,
+ +		[BPF_S_JMP_JGE_X]	= BPF_JMP|BPF_JGE|BPF_X,
+ +		[BPF_S_JMP_JGT_K]	= BPF_JMP|BPF_JGT|BPF_K,
+ +		[BPF_S_JMP_JGT_X]	= BPF_JMP|BPF_JGT|BPF_X,
+ +		[BPF_S_JMP_JSET_K]	= BPF_JMP|BPF_JSET|BPF_K,
+ +		[BPF_S_JMP_JSET_X]	= BPF_JMP|BPF_JSET|BPF_X,
+ +	};
+ +	u16 code;
+ +
+ +	code = filt->code;
+ +
+ +	to->code = decodes[code];
+ +	to->jt = filt->jt;
+ +	to->jf = filt->jf;
+ +	to->k = filt->k;
+ +}
+ +
+ +int sk_get_filter(struct sock *sk, struct sock_filter __user *ubuf, unsigned int len)
+  {
+ -	struct sock_fprog_kern *fprog;
+  	struct sk_filter *filter;
+ -	int ret = 0;
+ +	int i, ret;
+  
+  	lock_sock(sk);
+  	filter = rcu_dereference_protected(sk->sk_filter,
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index 4cdb9597f760..805ad83ed179 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -644,7 +644,8 @@ static int tun_attach(struct tun_struct *tun, struct file *file, bool skip_filte
+ 
+ 	/* Re-attach the filter to presist device */
+ 	if (!skip_filter && (tun->filter_attached == true)) {
+-		err = sk_attach_filter(&tun->fprog, tfile->socket.sk);
++		err = __sk_attach_filter(&tun->fprog, tfile->socket.sk,
++					 lockdep_rtnl_is_held());
+ 		if (!err)
+ 			goto out;
+ 	}
+@@ -2188,7 +2189,7 @@ static void tun_detach_filter(struct tun_struct *tun, int n)
+ 
+ 	for (i = 0; i < n; i++) {
+ 		tfile = rtnl_dereference(tun->tfiles[i]);
+-		sk_detach_filter(tfile->socket.sk);
++		__sk_detach_filter(tfile->socket.sk, lockdep_rtnl_is_held());
+ 	}
+ 
+ 	tun->filter_attached = false;
+@@ -2201,7 +2202,8 @@ static int tun_attach_filter(struct tun_struct *tun)
+ 
+ 	for (i = 0; i < tun->numqueues; i++) {
+ 		tfile = rtnl_dereference(tun->tfiles[i]);
+-		ret = sk_attach_filter(&tun->fprog, tfile->socket.sk);
++		ret = __sk_attach_filter(&tun->fprog, tfile->socket.sk,
++					 lockdep_rtnl_is_held());
+ 		if (ret) {
+ 			tun_detach_filter(tun, i);
+ 			return ret;
+* Unmerged path include/linux/filter.h
+* Unmerged path net/core/filter.c
