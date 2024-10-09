@@ -1,0 +1,199 @@
+IB/mlx5: Decouple MR allocation and population flows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ilya Lesokhin <ilyal@mellanox.com>
+commit ff740aefecb98da4605df1cada7904c44eaee161
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ff740aef.failed
+
+mlx5 compatible devices have two ways of populating the MTT
+table of an MKEY: using a FW command and using a UMR WQE.
+
+A UMR is much faster, so it should be used whenever possible.
+Unfortunately the code today uses UMR only if the MKEY was allocated
+from the MR cache.
+
+Fix the code to use UMR even for MKEYs that were allocated using
+a FW command.
+
+	Signed-off-by: Ilya Lesokhin <ilyal@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ff740aefecb98da4605df1cada7904c44eaee161)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 41cc30b2cbb2,aa6f71570b77..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -907,7 -871,35 +907,39 @@@ static inline void mlx5_ib_init_umr_con
+  	init_completion(&context->done);
+  }
+  
+++<<<<<<< HEAD
+ +static struct mlx5_ib_mr *reg_umr(struct ib_pd *pd, struct ib_umem *umem,
+++=======
++ static int mlx5_ib_post_send_wait(struct mlx5_ib_dev *dev,
++ 				  struct mlx5_umr_wr *umrwr)
++ {
++ 	struct umr_common *umrc = &dev->umrc;
++ 	struct ib_send_wr *bad;
++ 	int err;
++ 	struct mlx5_ib_umr_context umr_context;
++ 
++ 	mlx5_ib_init_umr_context(&umr_context);
++ 	umrwr->wr.wr_cqe = &umr_context.cqe;
++ 
++ 	down(&umrc->sem);
++ 	err = ib_post_send(umrc->qp, &umrwr->wr, &bad);
++ 	if (err) {
++ 		mlx5_ib_warn(dev, "UMR post send failed, err %d\n", err);
++ 	} else {
++ 		wait_for_completion(&umr_context.done);
++ 		if (umr_context.status != IB_WC_SUCCESS) {
++ 			mlx5_ib_warn(dev, "reg umr failed (%u)\n",
++ 				     umr_context.status);
++ 			err = -EFAULT;
++ 		}
++ 	}
++ 	up(&umrc->sem);
++ 	return err;
++ }
++ 
++ static struct mlx5_ib_mr *alloc_mr_from_cache(
++ 				  struct ib_pd *pd, struct ib_umem *umem,
+++>>>>>>> ff740aefecb9 (IB/mlx5: Decouple MR allocation and population flows)
+  				  u64 virt_addr, u64 len, int npages,
+  				  int page_shift, int order, int access_flags)
+  {
+@@@ -968,26 -931,42 +1000,29 @@@
+  	mr->mmkey.size = len;
+  	mr->mmkey.pd = to_mpd(pd)->pdn;
+  
+ -	return mr;
+ -}
+++<<<<<<< HEAD
+ +	mr->live = 1;
+  
+ -static inline int populate_xlt(struct mlx5_ib_mr *mr, int idx, int npages,
+ -			       void *xlt, int page_shift, size_t size,
+ -			       int flags)
+ -{
+ -	struct mlx5_ib_dev *dev = mr->dev;
+ -	struct ib_umem *umem = mr->umem;
+ -	if (flags & MLX5_IB_UPD_XLT_INDIRECT) {
+ -		mlx5_odp_populate_klm(xlt, idx, npages, mr, flags);
+ -		return npages;
+ -	}
+ +unmap_dma:
+ +	up(&umrc->sem);
+ +	dma_unmap_single(ddev, dma, size, DMA_TO_DEVICE);
+  
+ -	npages = min_t(size_t, npages, ib_umem_num_pages(umem) - idx);
+ +	kfree(mr_pas);
+  
+ -	if (!(flags & MLX5_IB_UPD_XLT_ZAP)) {
+ -		__mlx5_ib_populate_pas(dev, umem, page_shift,
+ -				       idx, npages, xlt,
+ -				       MLX5_IB_MTT_PRESENT);
+ -		/* Clear padding after the pages
+ -		 * brought from the umem.
+ -		 */
+ -		memset(xlt + (npages * sizeof(struct mlx5_mtt)), 0,
+ -		       size - npages * sizeof(struct mlx5_mtt));
+ +free_mr:
+ +	if (err) {
+ +		free_cached_mr(dev, mr);
+ +		return ERR_PTR(err);
+  	}
+  
+ -	return npages;
+++=======
+++>>>>>>> ff740aefecb9 (IB/mlx5: Decouple MR allocation and population flows)
+ +	return mr;
+  }
+  
+ -#define MLX5_MAX_UMR_CHUNK ((1 << (MLX5_MAX_UMR_SHIFT + 4)) - \
+ -			    MLX5_UMR_MTT_ALIGNMENT)
+ -#define MLX5_SPARE_UMR_CHUNK 0x10000
+ -
+ -int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
+ -		       int page_shift, int flags)
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +int mlx5_ib_update_mtt(struct mlx5_ib_mr *mr, u64 start_page_index, int npages,
+ +		       int zap)
+  {
+  	struct mlx5_ib_dev *dev = mr->dev;
+  	struct device *ddev = dev->ib_dev.dev.parent;
+@@@ -1132,9 -1112,13 +1168,19 @@@ static struct mlx5_ib_mr *reg_create(st
+  	if (!mr)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	inlen = MLX5_ST_SZ_BYTES(create_mkey_in) +
+ +		sizeof(*pas) * ((npages + 1) / 2) * 2;
+ +	in = mlx5_vzalloc(inlen);
+++=======
++ 	mr->ibmr.pd = pd;
++ 	mr->access_flags = access_flags;
++ 
++ 	inlen = MLX5_ST_SZ_BYTES(create_mkey_in);
++ 	if (populate)
++ 		inlen += sizeof(*pas) * roundup(npages, 2);
++ 	in = kvzalloc(inlen, GFP_KERNEL);
+++>>>>>>> ff740aefecb9 (IB/mlx5: Decouple MR allocation and population flows)
+  	if (!in) {
+  		err = -ENOMEM;
+  		goto err_1;
+@@@ -1173,9 -1161,8 +1222,12 @@@
+  		goto err_2;
+  	}
+  	mr->mmkey.type = MLX5_MKEY_MR;
+++<<<<<<< HEAD
+ +	mr->umem = umem;
+++=======
++ 	mr->desc_size = sizeof(struct mlx5_mtt);
+++>>>>>>> ff740aefecb9 (IB/mlx5: Decouple MR allocation and population flows)
+  	mr->dev = dev;
+- 	mr->live = 1;
+  	kvfree(in);
+  
+  	mlx5_ib_dbg(dev, "mkey = 0x%x\n", mr->mmkey.key);
+@@@ -1221,12 -1209,24 +1274,18 @@@ struct ib_mr *mlx5_ib_reg_user_mr(struc
+  	err = mr_umem_get(pd, start, length, access_flags, &umem, &npages,
+  			   &page_shift, &ncont, &order);
+  
+-         if (err < 0)
++ 	if (err < 0)
+  		return ERR_PTR(err);
+  
+++<<<<<<< HEAD
+ +	if (use_umr(order)) {
+ +		mr = reg_umr(pd, umem, virt_addr, length, ncont, page_shift,
+ +			     order, access_flags);
+++=======
++ 	if (order <= mr_cache_max_order(dev)) {
++ 		mr = alloc_mr_from_cache(pd, umem, virt_addr, length, ncont,
++ 					 page_shift, order, access_flags);
+++>>>>>>> ff740aefecb9 (IB/mlx5: Decouple MR allocation and population flows)
+  		if (PTR_ERR(mr) == -EAGAIN) {
+  			mlx5_ib_dbg(dev, "cache empty for order %d", order);
+  			mr = NULL;
+@@@ -1426,7 -1382,8 +1501,12 @@@ int mlx5_ib_rereg_user_mr(struct ib_mr 
+  		if (IS_ERR(mr))
+  			return PTR_ERR(mr);
+  
+++<<<<<<< HEAD
+ +		mr->umred = 0;
+++=======
++ 		mr->allocated_from_cache = 0;
++ 		mr->live = 1;
+++>>>>>>> ff740aefecb9 (IB/mlx5: Decouple MR allocation and population flows)
+  	} else {
+  		/*
+  		 * Send a UMR WQE
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
