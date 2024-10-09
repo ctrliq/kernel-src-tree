@@ -1,0 +1,195 @@
+gfs2: flesh out delayed withdraw for gfs2_log_flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit ca399c96e96e3f372f901a698a6fd17796b8ed32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/ca399c96.failed
+
+Function gfs2_log_flush() had a few places where it tried to withdraw
+from the file system when errors were encountered. The problem is,
+it should delay those withdraws until the log flush lock is no longer
+held.
+
+This patch creates a new function just for delayed withdraws for
+situations like this. If errors=panic was specified on mount, we
+still want to do it the old fashioned way because the panic it does
+not help to delay in that situation.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit ca399c96e96e3f372f901a698a6fd17796b8ed32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/util.c
+#	fs/gfs2/util.h
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,67465a34954e..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -689,19 -870,29 +689,35 @@@ void gfs2_log_flush(struct gfs2_sbd *sd
+  		sdp->sd_log_tr = NULL;
+  		INIT_LIST_HEAD(&tr->tr_ail1_list);
+  		INIT_LIST_HEAD(&tr->tr_ail2_list);
+++<<<<<<< HEAD
+ +	}
+ +
+ +	gfs2_assert_withdraw(sdp,
+ +			sdp->sd_log_num_revoke == sdp->sd_log_commited_revoke);
+ +
+ +	sdp->sd_log_flush_head = sdp->sd_log_head;
+ +	sdp->sd_log_flush_wrapped = 0;
+ +	if (tr)
+ +		tr->tr_first = sdp->sd_log_flush_head;
+++=======
++ 		tr->tr_first = sdp->sd_log_flush_head;
++ 		if (unlikely (state == SFS_FROZEN))
++ 			if (gfs2_assert_withdraw_delayed(sdp,
++ 			       !tr->tr_num_buf_new && !tr->tr_num_databuf_new))
++ 				goto out;
++ 	}
++ 
++ 	if (unlikely(state == SFS_FROZEN))
++ 		if (gfs2_assert_withdraw_delayed(sdp, !sdp->sd_log_num_revoke))
++ 			goto out;
++ 	if (gfs2_assert_withdraw_delayed(sdp,
++ 			sdp->sd_log_num_revoke == sdp->sd_log_committed_revoke))
++ 		goto out;
+++>>>>>>> ca399c96e96e (gfs2: flesh out delayed withdraw for gfs2_log_flush)
+  
+  	gfs2_ordered_write(sdp);
+ -	if (gfs2_withdrawn(sdp))
+ -		goto out;
+  	lops_before_commit(sdp, tr);
+ -	if (gfs2_withdrawn(sdp))
+ -		goto out;
+ -	gfs2_log_submit_bio(&sdp->sd_log_bio, REQ_OP_WRITE);
+ -	if (gfs2_withdrawn(sdp))
+ -		goto out;
+ +	gfs2_log_submit_bio(&sdp->sd_log_bio, WRITE);
+  
+  	if (sdp->sd_log_head != sdp->sd_log_flush_head) {
+  		log_flush_wait(sdp);
+diff --cc fs/gfs2/util.c
+index 33a5f6d866e6,9b64d40ab379..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -75,21 -315,32 +75,47 @@@ int gfs2_lm_withdraw(struct gfs2_sbd *s
+  
+  /**
+   * gfs2_assert_withdraw_i - Cause the machine to withdraw if @assertion is false
+ + * Returns: -1 if this call withdrew the machine,
+ + *          -2 if it was already withdrawn
+   */
+  
+++<<<<<<< HEAD
+ +int gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
+ +			   const char *function, char *file, unsigned int line)
+ +{
+ +	int me;
+ +	me = gfs2_lm_withdraw(sdp,
+ +		"GFS2: fsid=%s: fatal: assertion \"%s\" failed\n"
+ +		"GFS2: fsid=%s:   function = %s, file = %s, line = %u\n",
+ +		sdp->sd_fsname, assertion,
+ +		sdp->sd_fsname, function, file, line);
+++=======
++ void gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
++ 			    const char *function, char *file, unsigned int line,
++ 			    bool delayed)
++ {
++ 	if (gfs2_withdrawn(sdp))
++ 		return;
++ 
++ 	fs_err(sdp,
++ 	       "fatal: assertion \"%s\" failed\n"
++ 	       "   function = %s, file = %s, line = %u\n",
++ 	       assertion, function, file, line);
++ 
++ 	/*
++ 	 * If errors=panic was specified on mount, it won't help to delay the
++ 	 * withdraw.
++ 	 */
++ 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_PANIC)
++ 		delayed = false;
++ 
++ 	if (delayed)
++ 		gfs2_withdraw_delayed(sdp);
++ 	else
++ 		gfs2_withdraw(sdp);
+++>>>>>>> ca399c96e96e (gfs2: flesh out delayed withdraw for gfs2_log_flush)
+  	dump_stack();
+ +	return (me) ? -1 : -2;
+  }
+  
+  /**
+diff --cc fs/gfs2/util.h
+index 44242f56811a,a3542560da6f..000000000000
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@@ -38,24 -36,42 +38,48 @@@ do { 
+  } while (0)
+  
+  
+++<<<<<<< HEAD
+ +int gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
+ +			   const char *function, char *file, unsigned int line);
+ +
+ +#define gfs2_assert_withdraw(sdp, assertion) \
+ +((likely(assertion)) ? 0 : gfs2_assert_withdraw_i((sdp), #assertion, \
+ +					__func__, __FILE__, __LINE__))
+++=======
++ void gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
++ 			    const char *function, char *file, unsigned int line,
++ 			    bool delayed);
++ 
++ #define gfs2_assert_withdraw(sdp, assertion) \
++ 	({ \
++ 		bool _bool = (assertion); \
++ 		if (unlikely(!_bool)) \
++ 			gfs2_assert_withdraw_i((sdp), #assertion, \
++ 					__func__, __FILE__, __LINE__, false); \
++ 		!_bool; \
++ 	})
++ 
++ #define gfs2_assert_withdraw_delayed(sdp, assertion) \
++ 	({ \
++ 		bool _bool = (assertion); \
++ 		if (unlikely(!_bool)) \
++ 			gfs2_assert_withdraw_i((sdp), #assertion, \
++ 					__func__, __FILE__, __LINE__, true); \
++ 		!_bool; \
++ 	})
+++>>>>>>> ca399c96e96e (gfs2: flesh out delayed withdraw for gfs2_log_flush)
+  
+ -void gfs2_assert_warn_i(struct gfs2_sbd *sdp, char *assertion,
+ -			const char *function, char *file, unsigned int line);
+ +
+ +int gfs2_assert_warn_i(struct gfs2_sbd *sdp, char *assertion,
+ +		       const char *function, char *file, unsigned int line);
+  
+  #define gfs2_assert_warn(sdp, assertion) \
+ -	({ \
+ -		bool _bool = (assertion); \
+ -		if (unlikely(!_bool)) \
+ -			gfs2_assert_warn_i((sdp), #assertion, \
+ -					__func__, __FILE__, __LINE__); \
+ -		!_bool; \
+ -	})
+ +((likely(assertion)) ? 0 : gfs2_assert_warn_i((sdp), #assertion, \
+ +					__func__, __FILE__, __LINE__))
+  
+ -void gfs2_consist_i(struct gfs2_sbd *sdp,
+ -		    const char *function, char *file, unsigned int line);
+ +
+ +int gfs2_consist_i(struct gfs2_sbd *sdp,
+ +		   const char *function, char *file, unsigned int line);
+  
+  #define gfs2_consist(sdp) \
+  gfs2_consist_i((sdp), __func__, __FILE__, __LINE__)
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/util.c
+* Unmerged path fs/gfs2/util.h
