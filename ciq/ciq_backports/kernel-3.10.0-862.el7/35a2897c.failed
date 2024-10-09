@@ -1,0 +1,84 @@
+sched/wait: Remove the lockless swait_active() check in swake_up*()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit 35a2897c2a306cca344ca5c0b43416707018f434
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/35a2897c.failed
+
+Steven Rostedt reported a potential race in RCU core because of
+swake_up():
+
+        CPU0                            CPU1
+        ----                            ----
+                                __call_rcu_core() {
+
+                                 spin_lock(rnp_root)
+                                 need_wake = __rcu_start_gp() {
+                                  rcu_start_gp_advanced() {
+                                   gp_flags = FLAG_INIT
+                                  }
+                                 }
+
+ rcu_gp_kthread() {
+   swait_event_interruptible(wq,
+        gp_flags & FLAG_INIT) {
+   spin_lock(q->lock)
+
+                                *fetch wq->task_list here! *
+
+   list_add(wq->task_list, q->task_list)
+   spin_unlock(q->lock);
+
+   *fetch old value of gp_flags here *
+
+                                 spin_unlock(rnp_root)
+
+                                 rcu_gp_kthread_wake() {
+                                  swake_up(wq) {
+                                   swait_active(wq) {
+                                    list_empty(wq->task_list)
+
+                                   } * return false *
+
+  if (condition) * false *
+    schedule();
+
+In this case, a wakeup is missed, which could cause the rcu_gp_kthread
+waits for a long time.
+
+The reason of this is that we do a lockless swait_active() check in
+swake_up(). To fix this, we can either 1) add a smp_mb() in swake_up()
+before swait_active() to provide the proper order or 2) simply remove
+the swait_active() in swake_up().
+
+The solution 2 not only fixes this problem but also keeps the swait and
+wait API as close as possible, as wake_up() doesn't provide a full
+barrier and doesn't do a lockless check of the wait queue either.
+Moreover, there are users already using swait_active() to do their quick
+checks for the wait queues, so it make less sense that swake_up() and
+swake_up_all() do this on their own.
+
+This patch then removes the lockless swait_active() check in swake_up()
+and swake_up_all().
+
+	Reported-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Krister Johansen <kjlx@templeofstupid.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170615041828.zk3a3sfyudm5p6nl@tardis
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 35a2897c2a306cca344ca5c0b43416707018f434)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/swait.c
+* Unmerged path kernel/sched/swait.c
+* Unmerged path kernel/sched/swait.c
