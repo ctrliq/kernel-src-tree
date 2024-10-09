@@ -1,0 +1,329 @@
+x86, nfit_test: Add unit test for memcpy_mcsafe()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 5d8beee20d89e34ff1dcb0da84adf7607858c59d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5d8beee2.failed
+
+Given the fact that the ACPI "EINJ" (error injection) facility is not
+universally available, implement software infrastructure to validate the
+memcpy_mcsafe() exception handling implementation.
+
+For each potential read exception point in memcpy_mcsafe(), inject a
+emulated exception point at the address identified by 'mcsafe_inject'
+variable. With this infrastructure implement a test to validate that the
+'bytes remaining' calculation is correct for a range of various source
+buffer alignments.
+
+This code is compiled out by default. The CONFIG_MCSAFE_DEBUG
+configuration symbol needs to be manually enabled by editing
+Kconfig.debug. I.e. this functionality can not be accidentally enabled
+by a user / distro, it's only for development.
+
+	Cc: <x86@kernel.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Reported-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 5d8beee20d89e34ff1dcb0da84adf7607858c59d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig.debug
+#	arch/x86/lib/memcpy_64.S
+#	tools/testing/nvdimm/test/nfit.c
+diff --cc arch/x86/Kconfig.debug
+index a259990d82e1,c6dd1d980081..000000000000
+--- a/arch/x86/Kconfig.debug
++++ b/arch/x86/Kconfig.debug
+@@@ -79,10 -53,36 +79,38 @@@ config EARLY_PRINTK_EF
+  	  This is useful for kernel debugging when your machine crashes very
+  	  early before the console code is initialized.
+  
+++<<<<<<< HEAD
+++=======
++ config EARLY_PRINTK_USB_XDBC
++ 	bool "Early printk via the xHCI debug port"
++ 	depends on EARLY_PRINTK && PCI
++ 	select EARLY_PRINTK_USB
++ 	---help---
++ 	  Write kernel log output directly into the xHCI debug port.
++ 
++ 	  One use for this feature is kernel debugging, for example when your
++ 	  machine crashes very early before the regular console code is
++ 	  initialized. Other uses include simpler, lockless logging instead of
++ 	  a full-blown printk console driver + klogd.
++ 
++ 	  For normal production environments this is normally not recommended,
++ 	  because it doesn't feed events into klogd/syslogd and doesn't try to
++ 	  print anything on the screen.
++ 
++ 	  You should normally say N here, unless you want to debug early
++ 	  crashes or need a very simple printk logging facility.
++ 
++ config MCSAFE_TEST
++ 	def_bool n
++ 
++ config X86_PTDUMP_CORE
++ 	def_bool n
++ 
+++>>>>>>> 5d8beee20d89 (x86, nfit_test: Add unit test for memcpy_mcsafe())
+  config X86_PTDUMP
+ -	tristate "Export kernel pagetable layout to userspace via debugfs"
+ +	bool "Export kernel pagetable layout to userspace via debugfs"
+  	depends on DEBUG_KERNEL
+  	select DEBUG_FS
+ -	select X86_PTDUMP_CORE
+  	---help---
+  	  Say Y here if you want to show the kernel pagetable layout in a
+  	  debugfs file. This information is only useful for kernel developers
+diff --cc arch/x86/lib/memcpy_64.S
+index 36b962df086c,298ef1479240..000000000000
+--- a/arch/x86/lib/memcpy_64.S
++++ b/arch/x86/lib/memcpy_64.S
+@@@ -3,8 -3,18 +3,12 @@@
+  #include <linux/linkage.h>
+  #include <asm/errno.h>
+  #include <asm/cpufeatures.h>
+++<<<<<<< HEAD
+ +#include <asm/dwarf2.h>
+++=======
++ #include <asm/mcsafe_test.h>
+++>>>>>>> 5d8beee20d89 (x86, nfit_test: Add unit test for memcpy_mcsafe())
+  #include <asm/alternative-asm.h>
+ -#include <asm/export.h>
+ -
+ -/*
+ - * We build a jump to memcpy_orig by default which gets NOPped out on
+ - * the majority of x86 CPUs which set REP_GOOD. In addition, CPUs which
+ - * have the enhanced REP MOVSB/STOSB feature (ERMS), change those NOPs
+ - * to a jmp to memcpy_erms which does the REP; MOVSB mem copy.
+ - */
+ -
+ -.weak memcpy
+  
+  /*
+   * memcpy - Copy a memory block.
+@@@ -180,34 -181,14 +184,37 @@@ ENTRY(memcpy
+  
+  .Lend:
+  	retq
+ -ENDPROC(memcpy_orig)
+ +	CFI_ENDPROC
+ +ENDPROC(memcpy)
+ +ENDPROC(__memcpy)
+ +
+ +	/*
+ +	 * Some CPUs are adding enhanced REP MOVSB/STOSB feature
+ +	 * If the feature is supported, memcpy_c_e() is the first choice.
+ +	 * If enhanced rep movsb copy is not available, use fast string copy
+ +	 * memcpy_c() when possible. This is faster and code is simpler than
+ +	 * original memcpy().
+ +	 * Otherwise, original memcpy() is used.
+ +	 * In .altinstructions section, ERMS feature is placed after REG_GOOD
+ +         * feature to implement the right patch order.
+ +	 *
+ +	 * Replace only beginning, memcpy is used to apply alternatives,
+ +	 * so it is silly to overwrite itself with nops - reboot is the
+ +	 * only outcome...
+ +	 */
+ +	.section .altinstructions, "a"
+ +	altinstruction_entry memcpy,.Lmemcpy_c,X86_FEATURE_REP_GOOD,\
+ +			     .Lmemcpy_e-.Lmemcpy_c,.Lmemcpy_e-.Lmemcpy_c
+ +	altinstruction_entry memcpy,.Lmemcpy_c_e,X86_FEATURE_ERMS, \
+ +			     .Lmemcpy_e_e-.Lmemcpy_c_e,.Lmemcpy_e_e-.Lmemcpy_c_e
+ +	.previous
+  
+  #ifndef CONFIG_UML
++ 
++ MCSAFE_TEST_CTL
++ 
+  /*
+ - * __memcpy_mcsafe - memory copy with machine check exception handling
+ + * memcpy_mcsafe_unrolled - memory copy with machine check exception handling
+   * Note that we only catch machine checks when reading the source addresses.
+   * Writes to target are posted and don't generate machine checks.
+   */
+@@@ -227,8 -208,11 +234,14 @@@ ENTRY(memcpy_mcsafe_unrolled
+  	subl $8, %ecx
+  	negl %ecx
+  	subl %ecx, %edx
+ -.L_read_leading_bytes:
+ +.L_copy_leading_bytes:
+  	movb (%rsi), %al
+++<<<<<<< HEAD
+++=======
++ 	MCSAFE_TEST_SRC %rsi 1 .E_leading_bytes
++ 	MCSAFE_TEST_DST %rdi 1 .E_leading_bytes
++ .L_write_leading_bytes:
+++>>>>>>> 5d8beee20d89 (x86, nfit_test: Add unit test for memcpy_mcsafe())
+  	movb %al, (%rdi)
+  	incq %rsi
+  	incq %rdi
+@@@ -271,14 -225,16 +284,23 @@@
+  	shrl $3, %ecx
+  	jz .L_no_whole_words
+  
+ -.L_read_words:
+ +	/* Copy trailing words */
+ +.L_copy_trailing_words:
+  	movq (%rsi), %r8
+++<<<<<<< HEAD
+ +	mov %r8, (%rdi)
+ +	leaq 8(%rsi), %rsi
+ +	leaq 8(%rdi), %rdi
+++=======
++ 	MCSAFE_TEST_SRC %rsi 8 .E_read_words
++ 	MCSAFE_TEST_DST %rdi 8 .E_write_words
++ .L_write_words:
++ 	movq %r8, (%rdi)
++ 	addq $8, %rsi
++ 	addq $8, %rdi
+++>>>>>>> 5d8beee20d89 (x86, nfit_test: Add unit test for memcpy_mcsafe())
+  	decl %ecx
+ -	jnz .L_read_words
+ +	jnz .L_copy_trailing_words
+  
+  	/* Any trailing bytes? */
+  .L_no_whole_words:
+@@@ -287,8 -243,11 +309,14 @@@
+  
+  	/* Copy trailing bytes */
+  	movl %edx, %ecx
+ -.L_read_trailing_bytes:
+ +.L_copy_trailing_bytes:
+  	movb (%rsi), %al
+++<<<<<<< HEAD
+++=======
++ 	MCSAFE_TEST_SRC %rsi 1 .E_trailing_bytes
++ 	MCSAFE_TEST_DST %rdi 1 .E_trailing_bytes
++ .L_write_trailing_bytes:
+++>>>>>>> 5d8beee20d89 (x86, nfit_test: Add unit test for memcpy_mcsafe())
+  	movb %al, (%rdi)
+  	incq %rsi
+  	incq %rdi
+diff --cc tools/testing/nvdimm/test/nfit.c
+index b58df0c7b3ab,a8fb63edcf89..000000000000
+--- a/tools/testing/nvdimm/test/nfit.c
++++ b/tools/testing/nvdimm/test/nfit.c
+@@@ -27,7 -27,10 +27,9 @@@
+  #include <nfit.h>
+  #include <nd.h>
+  #include "nfit_test.h"
+ -#include "../watermark.h"
+  
++ #include <asm/mcsafe_test.h>
++ 
+  /*
+   * Generate an NFIT table to describe the following topology:
+   *
+@@@ -2650,6 -2788,12 +2753,15 @@@ static __init int nfit_test_init(void
+  {
+  	int rc, i;
+  
+++<<<<<<< HEAD
+++=======
++ 	pmem_test();
++ 	libnvdimm_test();
++ 	acpi_nfit_test();
++ 	device_dax_test();
++ 	mcsafe_test();
++ 
+++>>>>>>> 5d8beee20d89 (x86, nfit_test: Add unit test for memcpy_mcsafe())
+  	nfit_test_setup(nfit_test_lookup, nfit_test_evaluate_dsm);
+  
+  	nfit_wq = create_singlethread_workqueue("nfit");
+* Unmerged path arch/x86/Kconfig.debug
+diff --git a/arch/x86/include/asm/mcsafe_test.h b/arch/x86/include/asm/mcsafe_test.h
+new file mode 100644
+index 000000000000..eb59804b6201
+--- /dev/null
++++ b/arch/x86/include/asm/mcsafe_test.h
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _MCSAFE_TEST_H_
++#define _MCSAFE_TEST_H_
++
++#ifndef __ASSEMBLY__
++#ifdef CONFIG_MCSAFE_TEST
++extern unsigned long mcsafe_test_src;
++extern unsigned long mcsafe_test_dst;
++
++static inline void mcsafe_inject_src(void *addr)
++{
++	if (addr)
++		mcsafe_test_src = (unsigned long) addr;
++	else
++		mcsafe_test_src = ~0UL;
++}
++
++static inline void mcsafe_inject_dst(void *addr)
++{
++	if (addr)
++		mcsafe_test_dst = (unsigned long) addr;
++	else
++		mcsafe_test_dst = ~0UL;
++}
++#else /* CONFIG_MCSAFE_TEST */
++static inline void mcsafe_inject_src(void *addr)
++{
++}
++
++static inline void mcsafe_inject_dst(void *addr)
++{
++}
++#endif /* CONFIG_MCSAFE_TEST */
++
++#else /* __ASSEMBLY__ */
++#include <asm/export.h>
++
++#ifdef CONFIG_MCSAFE_TEST
++.macro MCSAFE_TEST_CTL
++	.pushsection .data
++	.align 8
++	.globl mcsafe_test_src
++	mcsafe_test_src:
++		.quad 0
++	EXPORT_SYMBOL_GPL(mcsafe_test_src)
++	.globl mcsafe_test_dst
++	mcsafe_test_dst:
++		.quad 0
++	EXPORT_SYMBOL_GPL(mcsafe_test_dst)
++	.popsection
++.endm
++
++.macro MCSAFE_TEST_SRC reg count target
++	leaq \count(\reg), %r9
++	cmp mcsafe_test_src, %r9
++	ja \target
++.endm
++
++.macro MCSAFE_TEST_DST reg count target
++	leaq \count(\reg), %r9
++	cmp mcsafe_test_dst, %r9
++	ja \target
++.endm
++#else
++.macro MCSAFE_TEST_CTL
++.endm
++
++.macro MCSAFE_TEST_SRC reg count target
++.endm
++
++.macro MCSAFE_TEST_DST reg count target
++.endm
++#endif /* CONFIG_MCSAFE_TEST */
++#endif /* __ASSEMBLY__ */
++#endif /* _MCSAFE_TEST_H_ */
+* Unmerged path arch/x86/lib/memcpy_64.S
+* Unmerged path tools/testing/nvdimm/test/nfit.c
