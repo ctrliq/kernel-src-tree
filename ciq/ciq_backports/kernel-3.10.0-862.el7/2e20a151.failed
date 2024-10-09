@@ -1,0 +1,527 @@
+net/mlx5e: Fail safe mtu and lro setting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Fail safe mtu and lro setting (Don Dutile) [1499362 1456659]
+Rebuild_FUZZ: 94.74%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 2e20a151205be8e7efa9644cdb942381e7bec787
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2e20a151.failed
+
+Use the new fail-safe channels switch mechanism to set new
+netdev mtu and lro settings.
+
+MTU and lro settings demand some HW configuration changes after new
+channels are created and ready for action. In order to unify switch
+channels routine for LRO and MTU changes, and maybe future configuration
+features, we now pass to it a modify HW function pointer to be
+invoked directly after old channels are de-activated and before new
+channels are activated.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+(cherry picked from commit 2e20a151205be8e7efa9644cdb942381e7bec787)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 16c2c2d53ebb,150fb52a0737..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -785,6 -863,19 +785,22 @@@ void mlx5e_build_indir_tir_ctx_hash(str
+  
+  int mlx5e_open_locked(struct net_device *netdev);
+  int mlx5e_close_locked(struct net_device *netdev);
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5e_open_channels(struct mlx5e_priv *priv,
++ 			struct mlx5e_channels *chs);
++ void mlx5e_close_channels(struct mlx5e_channels *chs);
++ 
++ /* Function pointer to be used to modify WH settings while
++  * switching channels
++  */
++ typedef int (*mlx5e_fp_hw_modify)(struct mlx5e_priv *priv);
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify);
++ 
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  void mlx5e_build_default_indir_rqt(struct mlx5_core_dev *mdev,
+  				   u32 *indirection_rqt, int len,
+  				   int num_channels);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 35c9cc1953cf,40912937d211..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -531,17 -527,22 +531,23 @@@ static int mlx5e_set_ringparam(struct n
+  
+  	mutex_lock(&priv->state_lock);
+  
+ -	new_channels.params = priv->channels.params;
+ -	new_channels.params.log_rq_size = log_rq_size;
+ -	new_channels.params.log_sq_size = log_sq_size;
+ +	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	if (was_opened)
+ +		mlx5e_close_locked(dev);
+  
+ -	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ -		priv->channels.params = new_channels.params;
+ -		goto unlock;
+ -	}
+ +	priv->params.log_rq_size = log_rq_size;
+ +	priv->params.log_sq_size = log_sq_size;
+ +	priv->params.min_rx_wqes = min_rx_wqes;
+  
+ -	err = mlx5e_open_channels(priv, &new_channels);
+ -	if (err)
+ -		goto unlock;
+ +	if (was_opened)
+ +		err = mlx5e_open_locked(dev);
+  
+++<<<<<<< HEAD
+++=======
++ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
++ 
++ unlock:
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  	mutex_unlock(&priv->state_lock);
+  
+  	return err;
+@@@ -584,14 -596,8 +590,19 @@@ static int mlx5e_set_channels(struct ne
+  	if (arfs_enabled)
+  		mlx5e_arfs_disable(priv);
+  
+++<<<<<<< HEAD
+ +	priv->params.num_channels = count;
+ +	mlx5e_build_default_indir_rqt(priv->mdev, priv->params.indirection_rqt,
+ +				      MLX5E_INDIR_RQT_SIZE, count);
+ +
+ +	if (was_opened)
+ +		err = mlx5e_open_locked(dev);
+ +	if (err)
+ +		goto out;
+++=======
++ 	/* Switch to new channels, set new parameters and close old ones */
++ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  
+  	if (arfs_enabled) {
+  		err = mlx5e_arfs_enable(priv);
+@@@ -669,11 -650,50 +680,56 @@@ static int mlx5e_set_coalesce(struct ne
+  					       coal->rx_coalesce_usecs,
+  					       coal->rx_max_coalesced_frames);
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static int mlx5e_set_coalesce(struct net_device *netdev,
++ 			      struct ethtool_coalesce *coal)
++ {
++ 	struct mlx5e_priv *priv    = netdev_priv(netdev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5e_channels new_channels = {};
++ 	int err = 0;
++ 	bool reset;
++ 
++ 	if (!MLX5_CAP_GEN(mdev, cq_moderation))
++ 		return -EOPNOTSUPP;
++ 
++ 	mutex_lock(&priv->state_lock);
++ 	new_channels.params = priv->channels.params;
++ 
++ 	new_channels.params.tx_cq_moderation.usec = coal->tx_coalesce_usecs;
++ 	new_channels.params.tx_cq_moderation.pkts = coal->tx_max_coalesced_frames;
++ 	new_channels.params.rx_cq_moderation.usec = coal->rx_coalesce_usecs;
++ 	new_channels.params.rx_cq_moderation.pkts = coal->rx_max_coalesced_frames;
++ 	new_channels.params.rx_am_enabled         = !!coal->use_adaptive_rx_coalesce;
++ 
++ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
++ 		priv->channels.params = new_channels.params;
++ 		goto out;
++ 	}
++ 	/* we are opened */
++ 
++ 	reset = !!coal->use_adaptive_rx_coalesce != priv->channels.params.rx_am_enabled;
++ 	if (!reset) {
++ 		mlx5e_set_priv_channels_coalesce(priv, coal);
++ 		priv->channels.params = new_channels.params;
++ 		goto out;
++ 	}
++ 
++ 	/* open fresh channels with new coal parameters */
++ 	err = mlx5e_open_channels(priv, &new_channels);
++ 	if (err)
++ 		goto out;
++ 
++ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  
+  out:
+ +	if (was_opened && restart)
+ +		err = mlx5e_open_locked(netdev);
+ +
+  	mutex_unlock(&priv->state_lock);
+  	return err;
+  }
+@@@ -1125,18 -1155,19 +1181,25 @@@ static int mlx5e_set_tunable(struct net
+  			break;
+  		}
+  
+ -		new_channels.params = priv->channels.params;
+ -		new_channels.params.tx_max_inline = val;
+ +		mutex_lock(&priv->state_lock);
+  
+ -		if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ -			priv->channels.params = new_channels.params;
+ -			break;
+ -		}
+ +		was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +		if (was_opened)
+ +			mlx5e_close_locked(dev);
+  
+++<<<<<<< HEAD
+ +		priv->params.tx_max_inline = val;
+++=======
++ 		err = mlx5e_open_channels(priv, &new_channels);
++ 		if (err)
++ 			break;
++ 		mlx5e_switch_priv_channels(priv, &new_channels, NULL);
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+ +
+ +		if (was_opened)
+ +			err = mlx5e_open_locked(dev);
+  
+ +		mutex_unlock(&priv->state_lock);
+  		break;
+  	default:
+  		err = -EINVAL;
+@@@ -1459,16 -1491,51 +1522,52 @@@ static int set_pflag_rx_cqe_based_moder
+  	if (!rx_mode_changed)
+  		return 0;
+  
+ -	new_channels.params = priv->channels.params;
+ -	mlx5e_set_rx_cq_mode_params(&new_channels.params, rx_cq_period_mode);
+ +	reset = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	if (reset)
+ +		mlx5e_close_locked(netdev);
+  
+ -	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ -		priv->channels.params = new_channels.params;
+ -		return 0;
+ -	}
+ +	mlx5e_set_rx_cq_mode_params(&priv->params, rx_cq_period_mode);
+  
+ -	err = mlx5e_open_channels(priv, &new_channels);
+ -	if (err)
+ -		return err;
+ +	if (reset)
+ +		err = mlx5e_open_locked(netdev);
+  
+++<<<<<<< HEAD
+ +	return err;
+++=======
++ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
++ 	return 0;
++ }
++ 
++ int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool new_val)
++ {
++ 	bool curr_val = MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS);
++ 	struct mlx5e_channels new_channels = {};
++ 	int err = 0;
++ 
++ 	if (!MLX5_CAP_GEN(priv->mdev, cqe_compression))
++ 		return new_val ? -EOPNOTSUPP : 0;
++ 
++ 	if (curr_val == new_val)
++ 		return 0;
++ 
++ 	new_channels.params = priv->channels.params;
++ 	MLX5E_SET_PFLAG(&new_channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS, new_val);
++ 
++ 	mlx5e_set_rq_type_params(priv->mdev, &new_channels.params,
++ 				 new_channels.params.rq_wq_type);
++ 
++ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
++ 		priv->channels.params = new_channels.params;
++ 		return 0;
++ 	}
++ 
++ 	err = mlx5e_open_channels(priv, &new_channels);
++ 	if (err)
++ 		return err;
++ 
++ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
++ 	return 0;
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  }
+  
+  static int set_pflag_rx_cqe_compress(struct net_device *netdev,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index fc92406a15c4,68d6c3c58ba7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2195,6 -2477,91 +2195,94 @@@ static void mlx5e_netdev_set_tcs(struc
+  		netdev_set_tc_queue(netdev, tc, nch, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_build_channels_tx_maps(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_channel *c;
++ 	struct mlx5e_txqsq *sq;
++ 	int i, tc;
++ 
++ 	for (i = 0; i < priv->channels.num; i++)
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++)
++ 			priv->channel_tc2txq[i][tc] = i + tc * priv->channels.num;
++ 
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		c = priv->channels.c[i];
++ 		for (tc = 0; tc < c->num_tc; tc++) {
++ 			sq = &c->sq[tc];
++ 			priv->txq2sq[sq->txq_ix] = sq;
++ 		}
++ 	}
++ }
++ 
++ static void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	int num_txqs = priv->channels.num * priv->channels.params.num_tc;
++ 	struct net_device *netdev = priv->netdev;
++ 
++ 	mlx5e_netdev_set_tcs(netdev);
++ 	if (netdev->real_num_tx_queues != num_txqs)
++ 		netif_set_real_num_tx_queues(netdev, num_txqs);
++ 	if (netdev->real_num_rx_queues != priv->channels.num)
++ 		netif_set_real_num_rx_queues(netdev, priv->channels.num);
++ 
++ 	mlx5e_build_channels_tx_maps(priv);
++ 	mlx5e_activate_channels(&priv->channels);
++ 	netif_tx_start_all_queues(priv->netdev);
++ 
++ 	if (MLX5_CAP_GEN(priv->mdev, vport_group_manager))
++ 		mlx5e_add_sqs_fwd_rules(priv);
++ 
++ 	mlx5e_wait_channels_min_rx_wqes(&priv->channels);
++ 	mlx5e_redirect_rqts_to_channels(priv, &priv->channels);
++ }
++ 
++ static void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_redirect_rqts_to_drop(priv);
++ 
++ 	if (MLX5_CAP_GEN(priv->mdev, vport_group_manager))
++ 		mlx5e_remove_sqs_fwd_rules(priv);
++ 
++ 	/* FIXME: This is a W/A only for tx timeout watch dog false alarm when
++ 	 * polling for inactive tx queues.
++ 	 */
++ 	netif_tx_stop_all_queues(priv->netdev);
++ 	netif_tx_disable(priv->netdev);
++ 	mlx5e_deactivate_channels(&priv->channels);
++ }
++ 
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	int new_num_txqs;
++ 
++ 	new_num_txqs = new_chs->num * new_chs->params.num_tc;
++ 
++ 	netif_carrier_off(netdev);
++ 
++ 	if (new_num_txqs < netdev->real_num_tx_queues)
++ 		netif_set_real_num_tx_queues(netdev, new_num_txqs);
++ 
++ 	mlx5e_deactivate_priv_channels(priv);
++ 	mlx5e_close_channels(&priv->channels);
++ 
++ 	priv->channels = *new_chs;
++ 
++ 	/* New channels are ready to roll, modify HW settings if needed */
++ 	if (hw_modify)
++ 		hw_modify(priv);
++ 
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 
++ 	mlx5e_update_carrier(priv);
++ }
++ 
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  int mlx5e_open_locked(struct net_device *netdev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+@@@ -2593,17 -2923,21 +2681,22 @@@ static int mlx5e_setup_tc(struct net_de
+  
+  	mutex_lock(&priv->state_lock);
+  
+ -	new_channels.params = priv->channels.params;
+ -	new_channels.params.num_tc = tc ? tc : 1;
+ +	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	if (was_opened)
+ +		mlx5e_close_locked(priv->netdev);
+  
+ -	if (test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ -		priv->channels.params = new_channels.params;
+ -		goto out;
+ -	}
+ +	priv->params.num_tc = tc ? tc : 1;
+  
+ -	err = mlx5e_open_channels(priv, &new_channels);
+ -	if (err)
+ -		goto out;
+ +	if (was_opened)
+ +		err = mlx5e_open_locked(priv->netdev);
+  
+++<<<<<<< HEAD
+++=======
++ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
++ out:
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  	mutex_unlock(&priv->state_lock);
+ +
+  	return err;
+  }
+  
+@@@ -2724,21 -3060,25 +2818,40 @@@ static int set_feature_lro(struct net_d
+  
+  	mutex_lock(&priv->state_lock);
+  
+++<<<<<<< HEAD
+ +	if (was_opened && (priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST))
+ +		mlx5e_close_locked(priv->netdev);
+ +
+ +	priv->params.lro_en = enable;
+ +	err = mlx5e_modify_tirs_lro(priv);
+ +	if (err) {
+ +		netdev_err(netdev, "lro modify failed, %d\n", err);
+ +		priv->params.lro_en = !enable;
+ +	}
+ +
+ +	if (was_opened && (priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST))
+ +		mlx5e_open_locked(priv->netdev);
+++=======
++ 	reset = (priv->channels.params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST);
++ 	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+  
+- 	mutex_unlock(&priv->state_lock);
++ 	new_channels.params = priv->channels.params;
++ 	new_channels.params.lro_en = enable;
++ 
++ 	if (!reset) {
++ 		priv->channels.params = new_channels.params;
++ 		err = mlx5e_modify_tirs_lro(priv);
++ 		goto out;
++ 	}
+  
++ 	err = mlx5e_open_channels(priv, &new_channels);
++ 	if (err)
++ 		goto out;
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
++ 
++ 	mlx5e_switch_priv_channels(priv, &new_channels, mlx5e_modify_tirs_lro);
++ out:
++ 	mutex_unlock(&priv->state_lock);
+  	return err;
+  }
+  
+@@@ -2860,43 -3201,38 +2973,57 @@@ static int mlx5e_set_features(struct ne
+  static int mlx5e_change_mtu(struct net_device *netdev, int new_mtu)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+++<<<<<<< HEAD
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+ +	bool was_opened;
+ +	u16 max_mtu;
+ +	u16 min_mtu;
+++=======
++ 	struct mlx5e_channels new_channels = {};
++ 	int curr_mtu;
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  	int err = 0;
+  	bool reset;
+  
+ +	mlx5_query_port_max_mtu(mdev, &max_mtu, 1);
+ +
+ +	max_mtu = MLX5E_HW2SW_MTU(max_mtu);
+ +	min_mtu = MLX5E_HW2SW_MTU(MXL5E_MIN_MTU);
+ +
+ +	if (new_mtu > max_mtu || new_mtu < min_mtu) {
+ +		netdev_err(netdev,
+ +			   "%s: Bad MTU (%d), valid range is: [%d..%d]\n",
+ +			   __func__, new_mtu, min_mtu, max_mtu);
+ +		return -EINVAL;
+ +	}
+ +
+  	mutex_lock(&priv->state_lock);
+  
+ -	reset = !priv->channels.params.lro_en &&
+ -		(priv->channels.params.rq_wq_type !=
+ +	reset = !priv->params.lro_en &&
+ +		(priv->params.rq_wq_type !=
+  		 MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ);
+  
+- 	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+- 	if (was_opened && reset)
+- 		mlx5e_close_locked(netdev);
++ 	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+  
++ 	curr_mtu    = netdev->mtu;
+  	netdev->mtu = new_mtu;
+- 	mlx5e_set_dev_port_mtu(netdev);
+  
+- 	if (was_opened && reset)
+- 		err = mlx5e_open_locked(netdev);
++ 	if (!reset) {
++ 		mlx5e_set_dev_port_mtu(priv);
++ 		goto out;
++ 	}
++ 
++ 	new_channels.params = priv->channels.params;
++ 	err = mlx5e_open_channels(priv, &new_channels);
++ 	if (err) {
++ 		netdev->mtu = curr_mtu;
++ 		goto out;
++ 	}
++ 
++ 	mlx5e_switch_priv_channels(priv, &new_channels, mlx5e_set_dev_port_mtu);
+  
++ out:
+  	mutex_unlock(&priv->state_lock);
+- 
+  	return err;
+  }
+  
+@@@ -3735,7 -4184,12 +3862,16 @@@ int mlx5e_attach_netdev(struct mlx5_cor
+  
+  	mlx5e_init_l2_addr(priv);
+  
+++<<<<<<< HEAD
+ +	mlx5e_set_dev_port_mtu(netdev);
+++=======
++ 	/* MTU range: 68 - hw-specific max */
++ 	netdev->min_mtu = ETH_MIN_MTU;
++ 	mlx5_query_port_max_mtu(priv->mdev, &max_mtu, 1);
++ 	netdev->max_mtu = MLX5E_HW2SW_MTU(max_mtu);
++ 
++ 	mlx5e_set_dev_port_mtu(priv);
+++>>>>>>> 2e20a151205b (net/mlx5e: Fail safe mtu and lro setting)
+  
+  	if (profile->enable)
+  		profile->enable(priv);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
