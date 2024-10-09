@@ -2381,6 +2381,7 @@ static const struct alg_test_desc alg_test_descs[] = {
 	}, {
 		.alg = "ctr(des3_ede)",
 		.test = alg_test_skcipher,
+		.fips_allowed = 1,
 		.suite = {
 			.cipher = {
 				.enc = {
