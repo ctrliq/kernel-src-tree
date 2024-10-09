@@ -2164,7 +2164,7 @@ int __init amd_iommu_detect(void)
 	iommu_detected = 1;
 	x86_init.iommu.iommu_init = amd_iommu_init;
 
-	return 0;
+	return 1;
 }
 
 /****************************************************************************
