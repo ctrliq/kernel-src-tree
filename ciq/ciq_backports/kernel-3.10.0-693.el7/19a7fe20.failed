@@ -1,0 +1,685 @@
+tracing: Add trace_seq_has_overflowed() and trace_handle_return()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Steven Rostedt (Red Hat) <rostedt@goodmis.org>
+commit 19a7fe206232cc875a3083211e0a21c08edd756e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/19a7fe20.failed
+
+Adding a trace_seq_has_overflowed() which returns true if the trace_seq
+had too much written into it allows us to simplify the code.
+
+Instead of checking the return value of every call to trace_seq_printf()
+and friends, they can all be called normally, and at the end we can
+return !trace_seq_has_overflowed() instead.
+
+Several functions also return TRACE_TYPE_PARTIAL_LINE when the trace_seq
+overflowed and TRACE_TYPE_HANDLED otherwise. Another helper function
+was created called trace_handle_return() which takes a trace_seq and
+returns these enums. Using this helper function also simplifies the
+code.
+
+This change also makes it possible to remove the return values of
+trace_seq_printf() and friends. They should instead just be
+void functions.
+
+Link: http://lkml.kernel.org/r/20141114011410.365183157@goodmis.org
+
+	Reviewed-by: Petr Mladek <pmladek@suse.cz>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit 19a7fe206232cc875a3083211e0a21c08edd756e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace.h
+#	kernel/trace/trace_output.c
+#	kernel/trace/trace_output.h
+diff --cc kernel/trace/trace.h
+index aa0e736b72ac,19418221b302..000000000000
+--- a/kernel/trace/trace.h
++++ b/kernel/trace/trace.h
+@@@ -12,6 -13,8 +12,11 @@@
+  #include <linux/hw_breakpoint.h>
+  #include <linux/trace_seq.h>
+  #include <linux/ftrace_event.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/compiler.h>
++ #include <linux/trace_seq.h>
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  
+  #ifdef CONFIG_FTRACE_SYSCALLS
+  #include <asm/unistd.h>		/* For NR_SYSCALLS	     */
+diff --cc kernel/trace/trace_output.c
+index 9cf812c3bd25,163c11b6b8ff..000000000000
+--- a/kernel/trace/trace_output.c
++++ b/kernel/trace/trace_output.c
+@@@ -77,237 -54,11 +71,240 @@@ enum print_line_t trace_print_printk_ms
+  
+  	trace_assign_type(field, entry);
+  
+++<<<<<<< HEAD
+ +	ret = trace_seq_printf(s, "%s", field->buf);
+ +	if (!ret)
+ +		return TRACE_TYPE_PARTIAL_LINE;
+++=======
++ 	trace_seq_puts(s, field->buf);
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  
+- 	return TRACE_TYPE_HANDLED;
++ 	return trace_handle_return(s);
+  }
+  
+ +/**
+ + * trace_seq_printf - sequence printing of trace information
+ + * @s: trace sequence descriptor
+ + * @fmt: printf format string
+ + *
+ + * It returns 0 if the trace oversizes the buffer's free
+ + * space, 1 otherwise.
+ + *
+ + * The tracer may use either sequence operations or its own
+ + * copy to user routines. To simplify formating of a trace
+ + * trace_seq_printf is used to store strings into a special
+ + * buffer (@s). Then the output may be either used by
+ + * the sequencer or pulled into another buffer.
+ + */
+ +int
+ +trace_seq_printf(struct trace_seq *s, const char *fmt, ...)
+ +{
+ +	int len = (PAGE_SIZE - 1) - s->len;
+ +	va_list ap;
+ +	int ret;
+ +
+ +	if (s->full || !len)
+ +		return 0;
+ +
+ +	va_start(ap, fmt);
+ +	ret = vsnprintf(s->buffer + s->len, len, fmt, ap);
+ +	va_end(ap);
+ +
+ +	/* If we can't write it all, don't bother writing anything */
+ +	if (ret >= len) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	s->len += ret;
+ +
+ +	return 1;
+ +}
+ +EXPORT_SYMBOL_GPL(trace_seq_printf);
+ +
+ +/**
+ + * trace_seq_vprintf - sequence printing of trace information
+ + * @s: trace sequence descriptor
+ + * @fmt: printf format string
+ + *
+ + * The tracer may use either sequence operations or its own
+ + * copy to user routines. To simplify formating of a trace
+ + * trace_seq_printf is used to store strings into a special
+ + * buffer (@s). Then the output may be either used by
+ + * the sequencer or pulled into another buffer.
+ + */
+ +int
+ +trace_seq_vprintf(struct trace_seq *s, const char *fmt, va_list args)
+ +{
+ +	int len = (PAGE_SIZE - 1) - s->len;
+ +	int ret;
+ +
+ +	if (s->full || !len)
+ +		return 0;
+ +
+ +	ret = vsnprintf(s->buffer + s->len, len, fmt, args);
+ +
+ +	/* If we can't write it all, don't bother writing anything */
+ +	if (ret >= len) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	s->len += ret;
+ +
+ +	return len;
+ +}
+ +EXPORT_SYMBOL_GPL(trace_seq_vprintf);
+ +
+ +int trace_seq_bprintf(struct trace_seq *s, const char *fmt, const u32 *binary)
+ +{
+ +	int len = (PAGE_SIZE - 1) - s->len;
+ +	int ret;
+ +
+ +	if (s->full || !len)
+ +		return 0;
+ +
+ +	ret = bstr_printf(s->buffer + s->len, len, fmt, binary);
+ +
+ +	/* If we can't write it all, don't bother writing anything */
+ +	if (ret >= len) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	s->len += ret;
+ +
+ +	return len;
+ +}
+ +
+ +/**
+ + * trace_seq_puts - trace sequence printing of simple string
+ + * @s: trace sequence descriptor
+ + * @str: simple string to record
+ + *
+ + * The tracer may use either the sequence operations or its own
+ + * copy to user routines. This function records a simple string
+ + * into a special buffer (@s) for later retrieval by a sequencer
+ + * or other mechanism.
+ + */
+ +int trace_seq_puts(struct trace_seq *s, const char *str)
+ +{
+ +	int len = strlen(str);
+ +
+ +	if (s->full)
+ +		return 0;
+ +
+ +	if (len > ((PAGE_SIZE - 1) - s->len)) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	memcpy(s->buffer + s->len, str, len);
+ +	s->len += len;
+ +
+ +	return len;
+ +}
+ +
+ +int trace_seq_putc(struct trace_seq *s, unsigned char c)
+ +{
+ +	if (s->full)
+ +		return 0;
+ +
+ +	if (s->len >= (PAGE_SIZE - 1)) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	s->buffer[s->len++] = c;
+ +
+ +	return 1;
+ +}
+ +EXPORT_SYMBOL(trace_seq_putc);
+ +
+ +int trace_seq_putmem(struct trace_seq *s, const void *mem, size_t len)
+ +{
+ +	if (s->full)
+ +		return 0;
+ +
+ +	if (len > ((PAGE_SIZE - 1) - s->len)) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	memcpy(s->buffer + s->len, mem, len);
+ +	s->len += len;
+ +
+ +	return len;
+ +}
+ +
+ +int trace_seq_putmem_hex(struct trace_seq *s, const void *mem, size_t len)
+ +{
+ +	unsigned char hex[HEX_CHARS];
+ +	const unsigned char *data = mem;
+ +	int i, j;
+ +
+ +	if (s->full)
+ +		return 0;
+ +
+ +#ifdef __BIG_ENDIAN
+ +	for (i = 0, j = 0; i < len; i++) {
+ +#else
+ +	for (i = len-1, j = 0; i >= 0; i--) {
+ +#endif
+ +		hex[j++] = hex_asc_hi(data[i]);
+ +		hex[j++] = hex_asc_lo(data[i]);
+ +	}
+ +	hex[j++] = ' ';
+ +
+ +	return trace_seq_putmem(s, hex, j);
+ +}
+ +
+ +void *trace_seq_reserve(struct trace_seq *s, size_t len)
+ +{
+ +	void *ret;
+ +
+ +	if (s->full)
+ +		return NULL;
+ +
+ +	if (len > ((PAGE_SIZE - 1) - s->len)) {
+ +		s->full = 1;
+ +		return NULL;
+ +	}
+ +
+ +	ret = s->buffer + s->len;
+ +	s->len += len;
+ +
+ +	return ret;
+ +}
+ +
+ +int trace_seq_path(struct trace_seq *s, const struct path *path)
+ +{
+ +	unsigned char *p;
+ +
+ +	if (s->full)
+ +		return 0;
+ +
+ +	if (s->len >= (PAGE_SIZE - 1)) {
+ +		s->full = 1;
+ +		return 0;
+ +	}
+ +
+ +	p = d_path(path, s->buffer + s->len, PAGE_SIZE - s->len);
+ +	if (!IS_ERR(p)) {
+ +		p = mangle_path(s->buffer + s->len, p, "\n");
+ +		if (p) {
+ +			s->len = p - s->buffer;
+ +			return 1;
+ +		}
+ +	} else {
+ +		s->buffer[s->len++] = '?';
+ +		return 1;
+ +	}
+ +
+ +	s->full = 1;
+ +	return 0;
+ +}
+ +
+  const char *
+  ftrace_print_flags_seq(struct trace_seq *p, const char *delim,
+  		       unsigned long flags,
+@@@ -431,8 -194,9 +427,14 @@@ int ftrace_raw_output_prep(struct trace
+  	}
+  
+  	trace_seq_init(p);
+++<<<<<<< HEAD
+ +	ret = trace_seq_printf(s, "%s: ", event->name);
+ +	if (!ret)
+++=======
++ 	trace_seq_printf(s, "%s: ", ftrace_event_name(event));
++ 
++ 	if (trace_seq_has_overflowed(s))
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  		return TRACE_TYPE_PARTIAL_LINE;
+  
+  	return 0;
+@@@ -581,22 -335,19 +573,33 @@@ seq_print_userip_objs(const struct user
+  	for (i = 0; i < FTRACE_STACK_ENTRIES; i++) {
+  		unsigned long ip = entry->caller[i];
+  
+- 		if (ip == ULONG_MAX || !ret)
++ 		if (ip == ULONG_MAX || trace_seq_has_overflowed(s))
+  			break;
+- 		if (ret)
+- 			ret = trace_seq_puts(s, " => ");
++ 
++ 		trace_seq_puts(s, " => ");
++ 
+  		if (!ip) {
+++<<<<<<< HEAD
+ +			if (ret)
+ +				ret = trace_seq_puts(s, "??");
+ +			if (ret)
+ +				ret = trace_seq_puts(s, "\n");
+ +			continue;
+ +		}
+ +		if (!ret)
+ +			break;
+ +		if (ret)
+ +			ret = seq_print_user_ip(s, mm, ip, sym_flags);
+ +		ret = trace_seq_puts(s, "\n");
+++=======
++ 			trace_seq_puts(s, "??");
++ 			trace_seq_putc(s, '\n');
++ 			continue;
++ 		}
++ 
++ 		seq_print_user_ip(s, mm, ip, sym_flags);
++ 		trace_seq_putc(s, '\n');
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  	}
+  
+  	if (mm)
+@@@ -607,22 -359,21 +611,28 @@@
+  int
+  seq_print_ip_sym(struct trace_seq *s, unsigned long ip, unsigned long sym_flags)
+  {
+++<<<<<<< HEAD
+ +	int ret;
+ +
+ +	if (!ip)
+ +		return trace_seq_printf(s, "0");
+++=======
++ 	if (!ip) {
++ 		trace_seq_putc(s, '0');
++ 		goto out;
++ 	}
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  
+  	if (sym_flags & TRACE_ITER_SYM_OFFSET)
+- 		ret = seq_print_sym_offset(s, "%s", ip);
++ 		seq_print_sym_offset(s, "%s", ip);
+  	else
+- 		ret = seq_print_sym_short(s, "%s", ip);
+- 
+- 	if (!ret)
+- 		return 0;
++ 		seq_print_sym_short(s, "%s", ip);
+  
+  	if (sym_flags & TRACE_ITER_SYM_ADDR)
+- 		ret = trace_seq_printf(s, " <" IP_FMT ">", ip);
+- 	return ret;
++ 		trace_seq_printf(s, " <" IP_FMT ">", ip);
++ 
++  out:
++ 	return !trace_seq_has_overflowed(s);
+  }
+  
+  /**
+@@@ -991,24 -752,16 +996,28 @@@ static enum print_line_t trace_fn_trace
+  
+  	trace_assign_type(field, iter->ent);
+  
+- 	if (!seq_print_ip_sym(s, field->ip, flags))
+- 		goto partial;
++ 	seq_print_ip_sym(s, field->ip, flags);
+  
+  	if ((flags & TRACE_ITER_PRINT_PARENT) && field->parent_ip) {
+++<<<<<<< HEAD
+ +		if (!trace_seq_printf(s, " <-"))
+ +			goto partial;
+ +		if (!seq_print_ip_sym(s,
+ +				      field->parent_ip,
+ +				      flags))
+ +			goto partial;
+ +	}
+ +	if (!trace_seq_printf(s, "\n"))
+ +		goto partial;
+++=======
++ 		trace_seq_puts(s, " <-");
++ 		seq_print_ip_sym(s, field->parent_ip, flags);
++ 	}
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  
+- 	return TRACE_TYPE_HANDLED;
++ 	trace_seq_putc(s, '\n');
+  
+-  partial:
+- 	return TRACE_TYPE_PARTIAL_LINE;
++ 	return trace_handle_return(s);
+  }
+  
+  static enum print_line_t trace_fn_raw(struct trace_iterator *iter, int flags,
+@@@ -1233,23 -983,19 +1239,26 @@@ static enum print_line_t trace_stack_pr
+  	trace_assign_type(field, iter->ent);
+  	end = (unsigned long *)((long)iter->ent + iter->ent_size);
+  
+- 	if (!trace_seq_puts(s, "<stack trace>\n"))
+- 		goto partial;
++ 	trace_seq_puts(s, "<stack trace>\n");
+  
+  	for (p = field->caller; p && *p != ULONG_MAX && p < end; p++) {
+- 		if (!trace_seq_puts(s, " => "))
+- 			goto partial;
+  
+++<<<<<<< HEAD
+ +		if (!seq_print_ip_sym(s, *p, flags))
+ +			goto partial;
+ +		if (!trace_seq_puts(s, "\n"))
+ +			goto partial;
+- 	}
+++=======
++ 		if (trace_seq_has_overflowed(s))
++ 			break;
+  
+- 	return TRACE_TYPE_HANDLED;
++ 		trace_seq_puts(s, " => ");
++ 		seq_print_ip_sym(s, *p, flags);
++ 		trace_seq_putc(s, '\n');
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
++ 	}
+  
+-  partial:
+- 	return TRACE_TYPE_PARTIAL_LINE;
++ 	return trace_handle_return(s);
+  }
+  
+  static struct trace_event_functions trace_stack_funcs = {
+diff --cc kernel/trace/trace_output.h
+index 127a9d8c8357,8ef2c40efb3c..000000000000
+--- a/kernel/trace/trace_output.h
++++ b/kernel/trace/trace_output.h
+@@@ -35,21 -35,11 +35,29 @@@ trace_print_lat_fmt(struct trace_seq *s
+  extern int __unregister_ftrace_event(struct trace_event *event);
+  extern struct rw_semaphore trace_event_sem;
+  
+++<<<<<<< HEAD
+ +#define MAX_MEMHEX_BYTES	8
+ +#define HEX_CHARS		(MAX_MEMHEX_BYTES*2 + 1)
+ +
+ +#define SEQ_PUT_FIELD_RET(s, x)				\
+ +do {							\
+ +	if (!trace_seq_putmem(s, &(x), sizeof(x)))	\
+ +		return TRACE_TYPE_PARTIAL_LINE;		\
+ +} while (0)
+ +
+ +#define SEQ_PUT_HEX_FIELD_RET(s, x)			\
+ +do {							\
+ +	BUILD_BUG_ON(sizeof(x) > MAX_MEMHEX_BYTES);	\
+ +	if (!trace_seq_putmem_hex(s, &(x), sizeof(x)))	\
+ +		return TRACE_TYPE_PARTIAL_LINE;		\
+ +} while (0)
+++=======
++ #define SEQ_PUT_FIELD(s, x)				\
++ 	trace_seq_putmem(s, &(x), sizeof(x))
++ 
++ #define SEQ_PUT_HEX_FIELD(s, x)				\
++ 	trace_seq_putmem_hex(s, &(x), sizeof(x))
+++>>>>>>> 19a7fe206232 (tracing: Add trace_seq_has_overflowed() and trace_handle_return())
+  
+  #endif
+  
+diff --git a/include/linux/ftrace_event.h b/include/linux/ftrace_event.h
+index b81b6a27675e..361f11e9036c 100644
+--- a/include/linux/ftrace_event.h
++++ b/include/linux/ftrace_event.h
+@@ -133,6 +133,17 @@ enum print_line_t {
+ 	TRACE_TYPE_NO_CONSUME	= 3	/* Handled but ask to not consume */
+ };
+ 
++/*
++ * Several functions return TRACE_TYPE_PARTIAL_LINE if the trace_seq
++ * overflowed, and TRACE_TYPE_HANDLED otherwise. This helper function
++ * simplifies those functions and keeps them in sync.
++ */
++static inline enum print_line_t trace_handle_return(struct trace_seq *s)
++{
++	return trace_seq_has_overflowed(s) ?
++		TRACE_TYPE_PARTIAL_LINE : TRACE_TYPE_HANDLED;
++}
++
+ void tracing_generic_entry_update(struct trace_entry *entry,
+ 				  unsigned long flags,
+ 				  int pc);
+diff --git a/include/linux/trace_seq.h b/include/linux/trace_seq.h
+index 762fe273e084..eb3912148112 100644
+--- a/include/linux/trace_seq.h
++++ b/include/linux/trace_seq.h
+@@ -40,6 +40,18 @@ trace_seq_buffer_ptr(struct trace_seq *s)
+ 	return s->buffer + s->len;
+ }
+ 
++/**
++ * trace_seq_has_overflowed - return true if the trace_seq took too much
++ * @s: trace sequence descriptor
++ *
++ * Returns true if too much data was added to the trace_seq and it is
++ * now full and will not take anymore.
++ */
++static inline bool trace_seq_has_overflowed(struct trace_seq *s)
++{
++	return s->full || s->len > PAGE_SIZE - 1;
++}
++
+ /*
+  * Currently only defined when tracing is enabled.
+  */
+diff --git a/include/trace/ftrace.h b/include/trace/ftrace.h
+index 737e331757aa..a0c4316456ec 100644
+--- a/include/trace/ftrace.h
++++ b/include/trace/ftrace.h
+@@ -254,11 +254,9 @@ ftrace_raw_output_##call(struct trace_iterator *iter, int flags,	\
+ 	if (ret)							\
+ 		return ret;						\
+ 									\
+-	ret = trace_seq_printf(s, print);				\
+-	if (!ret)							\
+-		return TRACE_TYPE_PARTIAL_LINE;				\
++	trace_seq_printf(s, print);					\
+ 									\
+-	return TRACE_TYPE_HANDLED;					\
++	return trace_handle_return(s);					\
+ }									\
+ static struct trace_event_functions ftrace_event_type_funcs_##call = {	\
+ 	.trace			= ftrace_raw_output_##call,		\
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 1f83e1977a5d..18fd99301140 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -2597,24 +2597,21 @@ static enum print_line_t print_trace_fmt(struct trace_iterator *iter)
+ 	event = ftrace_find_event(entry->type);
+ 
+ 	if (trace_flags & TRACE_ITER_CONTEXT_INFO) {
+-		if (iter->iter_flags & TRACE_FILE_LAT_FMT) {
+-			if (!trace_print_lat_context(iter))
+-				goto partial;
+-		} else {
+-			if (!trace_print_context(iter))
+-				goto partial;
+-		}
++		if (iter->iter_flags & TRACE_FILE_LAT_FMT)
++			trace_print_lat_context(iter);
++		else
++			trace_print_context(iter);
+ 	}
+ 
++	if (trace_seq_has_overflowed(s))
++		return TRACE_TYPE_PARTIAL_LINE;
++
+ 	if (event)
+ 		return event->funcs->trace(iter, sym_flags, event);
+ 
+-	if (!trace_seq_printf(s, "Unknown type %d\n", entry->type))
+-		goto partial;
++	trace_seq_printf(s, "Unknown type %d\n", entry->type);
+ 
+-	return TRACE_TYPE_HANDLED;
+-partial:
+-	return TRACE_TYPE_PARTIAL_LINE;
++	return trace_handle_return(s);
+ }
+ 
+ static enum print_line_t print_raw_fmt(struct trace_iterator *iter)
+@@ -2625,22 +2622,20 @@ static enum print_line_t print_raw_fmt(struct trace_iterator *iter)
+ 
+ 	entry = iter->ent;
+ 
+-	if (trace_flags & TRACE_ITER_CONTEXT_INFO) {
+-		if (!trace_seq_printf(s, "%d %d %llu ",
+-				      entry->pid, iter->cpu, iter->ts))
+-			goto partial;
+-	}
++	if (trace_flags & TRACE_ITER_CONTEXT_INFO)
++		trace_seq_printf(s, "%d %d %llu ",
++				 entry->pid, iter->cpu, iter->ts);
++
++	if (trace_seq_has_overflowed(s))
++		return TRACE_TYPE_PARTIAL_LINE;
+ 
+ 	event = ftrace_find_event(entry->type);
+ 	if (event)
+ 		return event->funcs->raw(iter, 0, event);
+ 
+-	if (!trace_seq_printf(s, "%d ?\n", entry->type))
+-		goto partial;
++	trace_seq_printf(s, "%d ?\n", entry->type);
+ 
+-	return TRACE_TYPE_HANDLED;
+-partial:
+-	return TRACE_TYPE_PARTIAL_LINE;
++	return trace_handle_return(s);
+ }
+ 
+ static enum print_line_t print_hex_fmt(struct trace_iterator *iter)
+@@ -2653,9 +2648,11 @@ static enum print_line_t print_hex_fmt(struct trace_iterator *iter)
+ 	entry = iter->ent;
+ 
+ 	if (trace_flags & TRACE_ITER_CONTEXT_INFO) {
+-		SEQ_PUT_HEX_FIELD_RET(s, entry->pid);
+-		SEQ_PUT_HEX_FIELD_RET(s, iter->cpu);
+-		SEQ_PUT_HEX_FIELD_RET(s, iter->ts);
++		SEQ_PUT_HEX_FIELD(s, entry->pid);
++		SEQ_PUT_HEX_FIELD(s, iter->cpu);
++		SEQ_PUT_HEX_FIELD(s, iter->ts);
++		if (trace_seq_has_overflowed(s))
++			return TRACE_TYPE_PARTIAL_LINE;
+ 	}
+ 
+ 	event = ftrace_find_event(entry->type);
+@@ -2665,9 +2662,9 @@ static enum print_line_t print_hex_fmt(struct trace_iterator *iter)
+ 			return ret;
+ 	}
+ 
+-	SEQ_PUT_FIELD_RET(s, newline);
++	SEQ_PUT_FIELD(s, newline);
+ 
+-	return TRACE_TYPE_HANDLED;
++	return trace_handle_return(s);
+ }
+ 
+ static enum print_line_t print_bin_fmt(struct trace_iterator *iter)
+@@ -2679,9 +2676,11 @@ static enum print_line_t print_bin_fmt(struct trace_iterator *iter)
+ 	entry = iter->ent;
+ 
+ 	if (trace_flags & TRACE_ITER_CONTEXT_INFO) {
+-		SEQ_PUT_FIELD_RET(s, entry->pid);
+-		SEQ_PUT_FIELD_RET(s, iter->cpu);
+-		SEQ_PUT_FIELD_RET(s, iter->ts);
++		SEQ_PUT_FIELD(s, entry->pid);
++		SEQ_PUT_FIELD(s, iter->cpu);
++		SEQ_PUT_FIELD(s, iter->ts);
++		if (trace_seq_has_overflowed(s))
++			return TRACE_TYPE_PARTIAL_LINE;
+ 	}
+ 
+ 	event = ftrace_find_event(entry->type);
+@@ -2727,10 +2726,12 @@ enum print_line_t print_trace_line(struct trace_iterator *iter)
+ {
+ 	enum print_line_t ret;
+ 
+-	if (iter->lost_events &&
+-	    !trace_seq_printf(&iter->seq, "CPU:%d [LOST %lu EVENTS]\n",
+-				 iter->cpu, iter->lost_events))
+-		return TRACE_TYPE_PARTIAL_LINE;
++	if (iter->lost_events) {
++		trace_seq_printf(&iter->seq, "CPU:%d [LOST %lu EVENTS]\n",
++				 iter->cpu, iter->lost_events);
++		if (trace_seq_has_overflowed(&iter->seq))
++			return TRACE_TYPE_PARTIAL_LINE;
++	}
+ 
+ 	if (iter->trace && iter->trace->print_line) {
+ 		ret = iter->trace->print_line(iter);
+* Unmerged path kernel/trace/trace.h
+* Unmerged path kernel/trace/trace_output.c
+* Unmerged path kernel/trace/trace_output.h
