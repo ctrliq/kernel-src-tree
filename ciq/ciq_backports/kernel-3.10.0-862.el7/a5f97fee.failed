@@ -1,0 +1,179 @@
+net/mlx5e: Redirect RQT refactoring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Redirect RQT refactoring (Don Dutile) [1456659 1499362]
+Rebuild_FUZZ: 93.94%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit a5f97fee743cd7ee9932036583dbe05298ff2648
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a5f97fee.failed
+
+RQ Tables are always created once (on netdev creation) pointing to drop RQ
+and at that stage, RQ tables (indirection tables) are always directed to
+drop RQ.
+
+We don't need to use mlx5e_fill_{direct,indir}_rqt_rqns to fill the drop
+RQ in create RQT procedure.
+
+Instead of having separate flows to redirect direct and indirect RQ Tables
+to the current active channels Receive Queues (RQs), we unify the two
+flows by introducing mlx5e_redirect_rqt function and redirect_rqt_param
+struct. Combined, they provide one generic logic to fill the RQ table RQ
+numbers regardless of the RQ table purpose (direct/indirect).
+
+Demonstrated the usage with mlx5e_redirect_rqts_to_channels which will
+be called on mlx5e_open and with mlx5e_redirect_rqts_to_drop which will
+be called on mlx5e_close.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+(cherry picked from commit a5f97fee743cd7ee9932036583dbe05298ff2648)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index fc92406a15c4,aec77f075714..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1789,62 -2038,16 +1789,67 @@@ static void mlx5e_close_channels(struc
+  	netif_tx_stop_all_queues(priv->netdev);
+  	netif_tx_disable(priv->netdev);
+  
+ -	for (i = 0; i < chs->num; i++)
+ -		mlx5e_close_channel(chs->c[i]);
+ +	for (i = 0; i < priv->params.num_channels; i++)
+ +		mlx5e_close_channel(priv->channel[i]);
+  
+  	kfree(priv->txq_to_sq_map);
+ -	kfree(chs->c);
+ -	chs->num = 0;
+ +	kfree(priv->channel);
+ +}
+ +
+++<<<<<<< HEAD
+ +static int mlx5e_rx_hash_fn(int hfunc)
+ +{
+ +	return (hfunc == ETH_RSS_HASH_TOP) ?
+ +	       MLX5_RX_HASH_FN_TOEPLITZ :
+ +	       MLX5_RX_HASH_FN_INVERTED_XOR8;
+ +}
+ +
+ +static int mlx5e_bits_invert(unsigned long a, int size)
+ +{
+ +	int inv = 0;
+ +	int i;
+ +
+ +	for (i = 0; i < size; i++)
+ +		inv |= (test_bit(size - i - 1, &a) ? 1 : 0) << i;
+ +
+ +	return inv;
+  }
+  
+ +static void mlx5e_fill_indir_rqt_rqns(struct mlx5e_priv *priv, void *rqtc)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < MLX5E_INDIR_RQT_SIZE; i++) {
+ +		int ix = i;
+ +		u32 rqn;
+ +
+ +		if (priv->params.rss_hfunc == ETH_RSS_HASH_XOR)
+ +			ix = mlx5e_bits_invert(i, MLX5E_LOG_INDIR_RQT_SIZE);
+ +
+ +		ix = priv->params.indirection_rqt[ix];
+ +		rqn = test_bit(MLX5E_STATE_OPENED, &priv->state) ?
+ +				priv->channel[ix]->rq.rqn :
+ +				priv->drop_rq.rqn;
+ +		MLX5_SET(rqtc, rqtc, rq_num[i], rqn);
+ +	}
+ +}
+ +
+ +static void mlx5e_fill_direct_rqt_rqn(struct mlx5e_priv *priv, void *rqtc,
+ +				      int ix)
+ +{
+ +	u32 rqn = test_bit(MLX5E_STATE_OPENED, &priv->state) ?
+ +			priv->channel[ix]->rq.rqn :
+ +			priv->drop_rq.rqn;
+ +
+ +	MLX5_SET(rqtc, rqtc, rq_num[0], rqn);
+ +}
+ +
+ +static int mlx5e_create_rqt(struct mlx5e_priv *priv, int sz,
+ +			    int ix, struct mlx5e_rqt *rqt)
+++=======
++ static int
++ mlx5e_create_rqt(struct mlx5e_priv *priv, int sz, struct mlx5e_rqt *rqt)
+++>>>>>>> a5f97fee743c (net/mlx5e: Redirect RQT refactoring)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+  	void *rqtc;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 16c2c2d53ebb..b7ae6af0b5ab 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -779,7 +779,19 @@ void mlx5e_disable_vlan_filter(struct mlx5e_priv *priv);
+ 
+ int mlx5e_modify_rqs_vsd(struct mlx5e_priv *priv, bool vsd);
+ 
+-int mlx5e_redirect_rqt(struct mlx5e_priv *priv, u32 rqtn, int sz, int ix);
++struct mlx5e_redirect_rqt_param {
++	bool is_rss;
++	union {
++		u32 rqn; /* Direct RQN (Non-RSS) */
++		struct {
++			u8 hfunc;
++			struct mlx5e_channels *channels;
++		} rss; /* RSS data */
++	};
++};
++
++int mlx5e_redirect_rqt(struct mlx5e_priv *priv, u32 rqtn, int sz,
++		       struct mlx5e_redirect_rqt_param rrp);
+ void mlx5e_build_indir_tir_ctx_hash(struct mlx5e_priv *priv, void *tirc,
+ 				    enum mlx5e_traffic_types tt);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 35c9cc1953cf..1d8758d235ff 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -1030,20 +1030,28 @@ static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
+ 
+ 	mutex_lock(&priv->state_lock);
+ 
+-	if (indir) {
+-		u32 rqtn = priv->indir_rqt.rqtn;
+-
+-		memcpy(priv->params.indirection_rqt, indir,
+-		       sizeof(priv->params.indirection_rqt));
+-		mlx5e_redirect_rqt(priv, rqtn, MLX5E_INDIR_RQT_SIZE, 0);
+-	}
+-
+ 	if (hfunc != ETH_RSS_HASH_NO_CHANGE &&
+ 	    hfunc != priv->params.rss_hfunc) {
+ 		priv->params.rss_hfunc = hfunc;
+ 		hash_changed = true;
+ 	}
+ 
++	if (indir) {
++		memcpy(priv->params.indirection_rqt, indir,
++		       sizeof(priv->params.indirection_rqt));
++
++		if (test_bit(MLX5E_STATE_OPENED, &priv->state)) {
++			u32 rqtn = priv->indir_rqt.rqtn;
++			struct mlx5e_redirect_rqt_param rrp = {
++				.is_rss = true,
++				.rss.hfunc = priv->params.rss_hfunc,
++				.rss.channels  = &priv->channels
++			};
++
++			mlx5e_redirect_rqt(priv, rqtn, MLX5E_INDIR_RQT_SIZE, rrp);
++		}
++	}
++
+ 	if (key) {
+ 		memcpy(priv->params.toeplitz_hash_key, key,
+ 		       sizeof(priv->params.toeplitz_hash_key));
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
