@@ -1,0 +1,421 @@
+perf callchain: Start moving away from global per thread cursors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 91d7b2de318ff701451dfc7ede1c029b150ef0e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/91d7b2de.failed
+
+The recent perf_evsel__fprintf_callchain() move to evsel.c added several
+new symbol requirements to the python binding, for instance:
+
+  # perf test -v python
+  16: Try 'import perf' in python, checking link problems      :
+  --- start ---
+  test child forked, pid 18030
+  Traceback (most recent call last):
+    File "<stdin>", line 1, in <module>
+  ImportError: /tmp/build/perf/python/perf.so: undefined symbol:
+  callchain_cursor
+  test child finished with -1
+  ---- end ----
+  Try 'import perf' in python, checking link problems: FAILED!
+  #
+
+This would require linking against callchain.c to access to the global
+callchain_cursor variables.
+
+Since lots of functions already receive as a parameter a
+callchain_cursor struct pointer, make that be the case for some more
+function so that we can start phasing out usage of yet another global
+variable.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/n/tip-djko3097eyg2rn66v2qcqfvn@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 91d7b2de318ff701451dfc7ede1c029b150ef0e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+diff --cc tools/perf/util/evsel.c
+index e0478f1149c9,38f464a4fa04..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -2281,6 -2343,138 +2281,141 @@@ out
+  	return ++printed;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int perf_evsel__fprintf_callchain(struct perf_evsel *evsel, struct perf_sample *sample,
++ 				  struct addr_location *al, int left_alignment,
++ 				  unsigned int print_opts, unsigned int stack_depth,
++ 				  FILE *fp)
++ {
++ 	int printed = 0;
++ 	struct callchain_cursor cursor;
++ 	struct callchain_cursor_node *node;
++ 	int print_ip = print_opts & EVSEL__PRINT_IP;
++ 	int print_sym = print_opts & EVSEL__PRINT_SYM;
++ 	int print_dso = print_opts & EVSEL__PRINT_DSO;
++ 	int print_symoffset = print_opts & EVSEL__PRINT_SYMOFFSET;
++ 	int print_oneline = print_opts & EVSEL__PRINT_ONELINE;
++ 	int print_srcline = print_opts & EVSEL__PRINT_SRCLINE;
++ 	int print_unknown_as_addr = print_opts & EVSEL__PRINT_UNKNOWN_AS_ADDR;
++ 	char s = print_oneline ? ' ' : '\t';
++ 
++ 	if (sample->callchain) {
++ 		struct addr_location node_al;
++ 
++ 		if (thread__resolve_callchain(al->thread, &cursor, evsel,
++ 					      sample, NULL, NULL,
++ 					      stack_depth) != 0) {
++ 			if (verbose)
++ 				error("Failed to resolve callchain. Skipping\n");
++ 			return printed;
++ 		}
++ 		callchain_cursor_commit(&cursor);
++ 
++ 		if (print_symoffset)
++ 			node_al = *al;
++ 
++ 		while (stack_depth) {
++ 			u64 addr = 0;
++ 
++ 			node = callchain_cursor_current(&cursor);
++ 			if (!node)
++ 				break;
++ 
++ 			if (node->sym && node->sym->ignore)
++ 				goto next;
++ 
++ 			printed += fprintf(fp, "%-*.*s", left_alignment, left_alignment, " ");
++ 
++ 			if (print_ip)
++ 				printed += fprintf(fp, "%c%16" PRIx64, s, node->ip);
++ 
++ 			if (node->map)
++ 				addr = node->map->map_ip(node->map, node->ip);
++ 
++ 			if (print_sym) {
++ 				printed += fprintf(fp, " ");
++ 				node_al.addr = addr;
++ 				node_al.map  = node->map;
++ 
++ 				if (print_symoffset) {
++ 					printed += __symbol__fprintf_symname_offs(node->sym, &node_al,
++ 										  print_unknown_as_addr, fp);
++ 				} else {
++ 					printed += __symbol__fprintf_symname(node->sym, &node_al,
++ 									     print_unknown_as_addr, fp);
++ 				}
++ 			}
++ 
++ 			if (print_dso) {
++ 				printed += fprintf(fp, " (");
++ 				printed += map__fprintf_dsoname(node->map, fp);
++ 				printed += fprintf(fp, ")");
++ 			}
++ 
++ 			if (print_srcline)
++ 				printed += map__fprintf_srcline(node->map, addr, "\n  ", fp);
++ 
++ 			if (!print_oneline)
++ 				printed += fprintf(fp, "\n");
++ 
++ 			stack_depth--;
++ next:
++ 			callchain_cursor_advance(&cursor);
++ 		}
++ 	}
++ 
++ 	return printed;
++ }
++ 
++ int perf_evsel__fprintf_sym(struct perf_evsel *evsel, struct perf_sample *sample,
++ 			    struct addr_location *al, int left_alignment,
++ 			    unsigned int print_opts, unsigned int stack_depth,
++ 			    FILE *fp)
++ {
++ 	int printed = 0;
++ 	int print_ip = print_opts & EVSEL__PRINT_IP;
++ 	int print_sym = print_opts & EVSEL__PRINT_SYM;
++ 	int print_dso = print_opts & EVSEL__PRINT_DSO;
++ 	int print_symoffset = print_opts & EVSEL__PRINT_SYMOFFSET;
++ 	int print_srcline = print_opts & EVSEL__PRINT_SRCLINE;
++ 	int print_unknown_as_addr = print_opts & EVSEL__PRINT_UNKNOWN_AS_ADDR;
++ 
++ 	if (symbol_conf.use_callchain && sample->callchain) {
++ 		printed += perf_evsel__fprintf_callchain(evsel, sample, al, left_alignment,
++ 							 print_opts, stack_depth, fp);
++ 	} else if (!(al->sym && al->sym->ignore)) {
++ 		printed += fprintf(fp, "%-*.*s", left_alignment, left_alignment, " ");
++ 
++ 		if (print_ip)
++ 			printed += fprintf(fp, "%16" PRIx64, sample->ip);
++ 
++ 		if (print_sym) {
++ 			printed += fprintf(fp, " ");
++ 			if (print_symoffset) {
++ 				printed += __symbol__fprintf_symname_offs(al->sym, al,
++ 									  print_unknown_as_addr, fp);
++ 			} else {
++ 				printed += __symbol__fprintf_symname(al->sym, al,
++ 								     print_unknown_as_addr, fp);
++ 			}
++ 		}
++ 
++ 		if (print_dso) {
++ 			printed += fprintf(fp, " (");
++ 			printed += map__fprintf_dsoname(al->map, fp);
++ 			printed += fprintf(fp, ")");
++ 		}
++ 
++ 		if (print_srcline)
++ 			printed += map__fprintf_srcline(al->map, al->addr, "\n  ", fp);
++ 	}
++ 
++ 	return printed;
++ }
++ 
++ 
+++>>>>>>> 91d7b2de318f (perf callchain: Start moving away from global per thread cursors)
+  bool perf_evsel__fallback(struct perf_evsel *evsel, int err,
+  			  char *msg, size_t msgsize)
+  {
+diff --git a/tools/perf/builtin-kmem.c b/tools/perf/builtin-kmem.c
+index 83343ed30e8f..896782f59c83 100644
+--- a/tools/perf/builtin-kmem.c
++++ b/tools/perf/builtin-kmem.c
+@@ -375,7 +375,7 @@ static u64 find_callsite(struct perf_evsel *evsel, struct perf_sample *sample)
+ 	}
+ 
+ 	al.thread = machine__findnew_thread(machine, sample->pid, sample->tid);
+-	sample__resolve_callchain(sample, NULL, evsel, &al, 16);
++	sample__resolve_callchain(sample, &callchain_cursor, NULL, evsel, &al, 16);
+ 
+ 	callchain_cursor_commit(&callchain_cursor);
+ 	while (true) {
+diff --git a/tools/perf/util/callchain.c b/tools/perf/util/callchain.c
+index 24b4bd0d7754..2b4ceaf058bb 100644
+--- a/tools/perf/util/callchain.c
++++ b/tools/perf/util/callchain.c
+@@ -788,7 +788,8 @@ int callchain_cursor_append(struct callchain_cursor *cursor,
+ 	return 0;
+ }
+ 
+-int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
++int sample__resolve_callchain(struct perf_sample *sample,
++			      struct callchain_cursor *cursor, struct symbol **parent,
+ 			      struct perf_evsel *evsel, struct addr_location *al,
+ 			      int max_stack)
+ {
+@@ -797,7 +798,7 @@ int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent
+ 
+ 	if (symbol_conf.use_callchain || symbol_conf.cumulate_callchain ||
+ 	    sort__has_parent) {
+-		return thread__resolve_callchain(al->thread, evsel, sample,
++		return thread__resolve_callchain(al->thread, cursor, evsel, sample,
+ 						 parent, al, max_stack);
+ 	}
+ 	return 0;
+diff --git a/tools/perf/util/callchain.h b/tools/perf/util/callchain.h
+index d2a9e694810c..cae5a7b1f5c8 100644
+--- a/tools/perf/util/callchain.h
++++ b/tools/perf/util/callchain.h
+@@ -212,7 +212,8 @@ struct hist_entry;
+ int record_parse_callchain_opt(const struct option *opt, const char *arg, int unset);
+ int record_callchain_opt(const struct option *opt, const char *arg, int unset);
+ 
+-int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
++int sample__resolve_callchain(struct perf_sample *sample,
++			      struct callchain_cursor *cursor, struct symbol **parent,
+ 			      struct perf_evsel *evsel, struct addr_location *al,
+ 			      int max_stack);
+ int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample);
+* Unmerged path tools/perf/util/evsel.c
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 3d34c57dfbe2..991a351a8a41 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -953,7 +953,7 @@ int hist_entry_iter__add(struct hist_entry_iter *iter, struct addr_location *al,
+ {
+ 	int err, err2;
+ 
+-	err = sample__resolve_callchain(iter->sample, &iter->parent,
++	err = sample__resolve_callchain(iter->sample, &callchain_cursor, &iter->parent,
+ 					iter->evsel, al, max_stack_depth);
+ 	if (err)
+ 		return err;
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index 80b9b6a87990..0c4dabc69932 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -1599,6 +1599,7 @@ struct mem_info *sample__resolve_mem(struct perf_sample *sample,
+ }
+ 
+ static int add_callchain_ip(struct thread *thread,
++			    struct callchain_cursor *cursor,
+ 			    struct symbol **parent,
+ 			    struct addr_location *root_al,
+ 			    u8 *cpumode,
+@@ -1630,7 +1631,7 @@ static int add_callchain_ip(struct thread *thread,
+ 				 * It seems the callchain is corrupted.
+ 				 * Discard all.
+ 				 */
+-				callchain_cursor_reset(&callchain_cursor);
++				callchain_cursor_reset(cursor);
+ 				return 1;
+ 			}
+ 			return 0;
+@@ -1648,13 +1649,13 @@ static int add_callchain_ip(struct thread *thread,
+ 			/* Treat this symbol as the root,
+ 			   forgetting its callees. */
+ 			*root_al = al;
+-			callchain_cursor_reset(&callchain_cursor);
++			callchain_cursor_reset(cursor);
+ 		}
+ 	}
+ 
+ 	if (symbol_conf.hide_unresolved && al.sym == NULL)
+ 		return 0;
+-	return callchain_cursor_append(&callchain_cursor, al.addr, al.map, al.sym);
++	return callchain_cursor_append(cursor, al.addr, al.map, al.sym);
+ }
+ 
+ struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
+@@ -1724,6 +1725,7 @@ static int remove_loops(struct branch_entry *l, int nr)
+  * negative error code on other errors.
+  */
+ static int resolve_lbr_callchain_sample(struct thread *thread,
++					struct callchain_cursor *cursor,
+ 					struct perf_sample *sample,
+ 					struct symbol **parent,
+ 					struct addr_location *root_al,
+@@ -1778,7 +1780,7 @@ static int resolve_lbr_callchain_sample(struct thread *thread,
+ 					ip = lbr_stack->entries[0].to;
+ 			}
+ 
+-			err = add_callchain_ip(thread, parent, root_al, &cpumode, ip);
++			err = add_callchain_ip(thread, cursor, parent, root_al, &cpumode, ip);
+ 			if (err)
+ 				return (err < 0) ? err : 0;
+ 		}
+@@ -1789,6 +1791,7 @@ static int resolve_lbr_callchain_sample(struct thread *thread,
+ }
+ 
+ static int thread__resolve_callchain_sample(struct thread *thread,
++					    struct callchain_cursor *cursor,
+ 					    struct perf_evsel *evsel,
+ 					    struct perf_sample *sample,
+ 					    struct symbol **parent,
+@@ -1803,10 +1806,10 @@ static int thread__resolve_callchain_sample(struct thread *thread,
+ 	int skip_idx = -1;
+ 	int first_call = 0;
+ 
+-	callchain_cursor_reset(&callchain_cursor);
++	callchain_cursor_reset(cursor);
+ 
+ 	if (has_branch_callstack(evsel)) {
+-		err = resolve_lbr_callchain_sample(thread, sample, parent,
++		err = resolve_lbr_callchain_sample(thread, cursor, sample, parent,
+ 						   root_al, max_stack);
+ 		if (err)
+ 			return (err < 0) ? err : 0;
+@@ -1863,10 +1866,10 @@ static int thread__resolve_callchain_sample(struct thread *thread,
+ 		nr = remove_loops(be, nr);
+ 
+ 		for (i = 0; i < nr; i++) {
+-			err = add_callchain_ip(thread, parent, root_al,
++			err = add_callchain_ip(thread, cursor, parent, root_al,
+ 					       NULL, be[i].to);
+ 			if (!err)
+-				err = add_callchain_ip(thread, parent, root_al,
++				err = add_callchain_ip(thread, cursor, parent, root_al,
+ 						       NULL, be[i].from);
+ 			if (err == -EINVAL)
+ 				break;
+@@ -1896,7 +1899,7 @@ check_calls:
+ #endif
+ 		ip = chain->ips[j];
+ 
+-		err = add_callchain_ip(thread, parent, root_al, &cpumode, ip);
++		err = add_callchain_ip(thread, cursor, parent, root_al, &cpumode, ip);
+ 
+ 		if (err)
+ 			return (err < 0) ? err : 0;
+@@ -1916,13 +1919,14 @@ static int unwind_entry(struct unwind_entry *entry, void *arg)
+ }
+ 
+ int thread__resolve_callchain(struct thread *thread,
++			      struct callchain_cursor *cursor,
+ 			      struct perf_evsel *evsel,
+ 			      struct perf_sample *sample,
+ 			      struct symbol **parent,
+ 			      struct addr_location *root_al,
+ 			      int max_stack)
+ {
+-	int ret = thread__resolve_callchain_sample(thread, evsel,
++	int ret = thread__resolve_callchain_sample(thread, cursor, evsel,
+ 						   sample, parent,
+ 						   root_al, max_stack);
+ 	if (ret)
+@@ -1938,7 +1942,7 @@ int thread__resolve_callchain(struct thread *thread,
+ 	    (!sample->user_stack.size))
+ 		return 0;
+ 
+-	return unwind__get_entries(unwind_entry, &callchain_cursor,
++	return unwind__get_entries(unwind_entry, cursor,
+ 				   thread, sample, max_stack);
+ 
+ }
+diff --git a/tools/perf/util/machine.h b/tools/perf/util/machine.h
+index 8499db281158..382873bdc563 100644
+--- a/tools/perf/util/machine.h
++++ b/tools/perf/util/machine.h
+@@ -141,7 +141,11 @@ struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
+ 					   struct addr_location *al);
+ struct mem_info *sample__resolve_mem(struct perf_sample *sample,
+ 				     struct addr_location *al);
++
++struct callchain_cursor;
++
+ int thread__resolve_callchain(struct thread *thread,
++			      struct callchain_cursor *cursor,
+ 			      struct perf_evsel *evsel,
+ 			      struct perf_sample *sample,
+ 			      struct symbol **parent,
+diff --git a/tools/perf/util/scripting-engines/trace-event-perl.c b/tools/perf/util/scripting-engines/trace-event-perl.c
+index 2ce059a95b6d..cd4797379c29 100644
+--- a/tools/perf/util/scripting-engines/trace-event-perl.c
++++ b/tools/perf/util/scripting-engines/trace-event-perl.c
+@@ -263,7 +263,7 @@ static SV *perl_process_callchain(struct perf_sample *sample,
+ 	if (!symbol_conf.use_callchain || !sample->callchain)
+ 		goto exit;
+ 
+-	if (thread__resolve_callchain(al->thread, evsel,
++	if (thread__resolve_callchain(al->thread, &callchain_cursor, evsel,
+ 				      sample, NULL, NULL,
+ 				      PERF_MAX_STACK_DEPTH) != 0) {
+ 		pr_err("Failed to resolve callchain. Skipping\n");
+diff --git a/tools/perf/util/scripting-engines/trace-event-python.c b/tools/perf/util/scripting-engines/trace-event-python.c
+index 777d6385db81..16fb811ebffd 100644
+--- a/tools/perf/util/scripting-engines/trace-event-python.c
++++ b/tools/perf/util/scripting-engines/trace-event-python.c
+@@ -323,7 +323,7 @@ static PyObject *python_process_callchain(struct perf_sample *sample,
+ 	if (!symbol_conf.use_callchain || !sample->callchain)
+ 		goto exit;
+ 
+-	if (thread__resolve_callchain(al->thread, evsel,
++	if (thread__resolve_callchain(al->thread, &callchain_cursor, evsel,
+ 				      sample, NULL, NULL,
+ 				      scripting_max_stack) != 0) {
+ 		pr_err("Failed to resolve callchain. Skipping\n");
