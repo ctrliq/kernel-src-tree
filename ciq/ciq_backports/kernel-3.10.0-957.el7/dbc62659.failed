@@ -1,0 +1,92 @@
+dm: prevent DAX mounts if not supported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit dbc626597c39b24cefce09fbd8e9dea85869a801
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dbc62659.failed
+
+Currently device_supports_dax() just checks to see if the QUEUE_FLAG_DAX
+flag is set on the device's request queue to decide whether or not the
+device supports filesystem DAX.  Really we should be using
+bdev_dax_supported() like filesystems do at mount time.  This performs
+other tests like checking to make sure the dax_direct_access() path works.
+
+We also explicitly clear QUEUE_FLAG_DAX on the DM device's request queue if
+any of the underlying devices do not support DAX.  This makes the handling
+of QUEUE_FLAG_DAX consistent with the setting/clearing of most other flags
+in dm_table_set_restrictions().
+
+Now that bdev_dax_supported() explicitly checks for QUEUE_FLAG_DAX, this
+will ensure that filesystems built upon DM devices will only be able to
+mount with DAX if all underlying devices also support DAX.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+Fixes: commit 545ed20e6df6 ("dm: add infrastructure for DAX support")
+	Cc: stable@vger.kernel.org
+	Acked-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Toshi Kani <toshi.kani@hpe.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit dbc626597c39b24cefce09fbd8e9dea85869a801)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-table.c
+diff --cc drivers/md/dm-table.c
+index d9f3215786ed,3d0e2c198f06..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -1605,17 -1891,25 +1603,27 @@@ void dm_table_set_restrictions(struct d
+  		q->limits.discard_alignment = 0;
+  		q->limits.discard_misaligned = 0;
+  	} else
+ -		blk_queue_flag_set(QUEUE_FLAG_DISCARD, q);
+ -
+ -	if (dm_table_supports_secure_erase(t))
+ -		blk_queue_flag_set(QUEUE_FLAG_SECERASE, q);
+ +		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
+  
+ -	if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_WC))) {
+ -		wc = true;
+ -		if (dm_table_supports_flush(t, (1UL << QUEUE_FLAG_FUA)))
+ -			fua = true;
+ +	if (dm_table_supports_flush(t, REQ_FLUSH)) {
+ +		flush |= REQ_FLUSH;
+ +		if (dm_table_supports_flush(t, REQ_FUA))
+ +			flush |= REQ_FUA;
+  	}
+ -	blk_queue_write_cache(q, wc, fua);
+ +	blk_queue_flush(q, flush);
+  
+++<<<<<<< HEAD
+ +	if (!dm_table_discard_zeroes_data(t))
+ +		q->limits.discard_zeroes_data = 0;
+++=======
++ 	if (dm_table_supports_dax(t))
++ 		blk_queue_flag_set(QUEUE_FLAG_DAX, q);
++ 	else
++ 		blk_queue_flag_clear(QUEUE_FLAG_DAX, q);
++ 
++ 	if (dm_table_supports_dax_write_cache(t))
++ 		dax_write_cache(t->md->dax_dev, true);
+++>>>>>>> dbc626597c39 (dm: prevent DAX mounts if not supported)
+  
+  	/* Ensure that all underlying devices are non-rotational. */
+  	if (dm_table_all_devices_attribute(t, device_is_nonrot))
+* Unmerged path drivers/md/dm-table.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 14d7215727e9..d205f6bb04d8 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -954,8 +954,7 @@ static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+ 	if (len < 1)
+ 		goto out;
+ 	nr_pages = min(len, nr_pages);
+-	if (ti->type->direct_access)
+-		ret = ti->type->direct_access(ti, pgoff, nr_pages, kaddr, pfn);
++	ret = ti->type->direct_access(ti, pgoff, nr_pages, kaddr, pfn);
+ 
+  out:
+ 	dm_put_live_table(md, srcu_idx);
