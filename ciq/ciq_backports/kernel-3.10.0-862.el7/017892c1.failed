@@ -1,0 +1,215 @@
+ibmvnic: Handle failover after failed init crq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author John Allen <jallen@linux.vnet.ibm.com>
+commit 017892c1ec15d4efcb30edf9fb56a64c889540c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/017892c1.failed
+
+Handle case where phyp sends a failover after failing to send the
+init crq.
+
+	Signed-off-by: John Allen <jallen@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 017892c1ec15d4efcb30edf9fb56a64c889540c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+#	drivers/net/ethernet/ibm/ibmvnic.h
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 0a15141d22b3,1f7cf6fbe150..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -3357,12 -3167,8 +3357,17 @@@ static void ibmvnic_handle_crq(union ib
+  		switch (gen_crq->cmd) {
+  		case IBMVNIC_CRQ_INIT:
+  			dev_info(dev, "Partner initialized\n");
+++<<<<<<< HEAD
+ +			/* Send back a response */
+ +			rc = ibmvnic_send_crq_init_complete(adapter);
+ +			if (!rc)
+ +				schedule_work(&adapter->vnic_crq_init);
+ +			else
+ +				dev_err(dev, "Can't send initrsp rc=%ld\n", rc);
+++=======
++ 			adapter->from_passive_init = true;
++ 			complete(&adapter->init_done);
+++>>>>>>> 017892c1ec15 (ibmvnic: Handle failover after failed init crq)
+  			break;
+  		case IBMVNIC_CRQ_INIT_COMPLETE:
+  			dev_info(dev, "Partner initialization complete\n");
+@@@ -3680,121 -3470,41 +3685,137 @@@ map_failed
+  	return retrc;
+  }
+  
+ -static int ibmvnic_init(struct ibmvnic_adapter *adapter)
+ +/* debugfs for dump */
+ +static int ibmvnic_dump_show(struct seq_file *seq, void *v)
+ +{
+ +	struct net_device *netdev = seq->private;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ +	struct device *dev = &adapter->vdev->dev;
+ +	union ibmvnic_crq crq;
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.request_dump_size.first = IBMVNIC_CRQ_CMD;
+ +	crq.request_dump_size.cmd = REQUEST_DUMP_SIZE;
+ +
+ +	init_completion(&adapter->fw_done);
+ +	ibmvnic_send_crq(adapter, &crq);
+ +	wait_for_completion(&adapter->fw_done);
+ +
+ +	seq_write(seq, adapter->dump_data, adapter->dump_data_size);
+ +
+ +	dma_unmap_single(dev, adapter->dump_data_token, adapter->dump_data_size,
+ +			 DMA_BIDIRECTIONAL);
+ +
+ +	kfree(adapter->dump_data);
+ +
+ +	return 0;
+ +}
+ +
+ +static int ibmvnic_dump_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, ibmvnic_dump_show, inode->i_private);
+ +}
+ +
+ +static const struct file_operations ibmvnic_dump_ops = {
+ +	.owner          = THIS_MODULE,
+ +	.open           = ibmvnic_dump_open,
+ +	.read           = seq_read,
+ +	.llseek         = seq_lseek,
+ +	.release        = single_release,
+ +};
+ +
+ +static void handle_crq_init_rsp(struct work_struct *work)
+  {
+ +	struct ibmvnic_adapter *adapter = container_of(work,
+ +						       struct ibmvnic_adapter,
+ +						       vnic_crq_init);
+  	struct device *dev = &adapter->vdev->dev;
+ +	struct net_device *netdev = adapter->netdev;
+  	unsigned long timeout = msecs_to_jiffies(30000);
+ +	bool restart = false;
+  	int rc;
+  
+ -	rc = init_crq_queue(adapter);
+ -	if (rc) {
+ -		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
+ -		return rc;
+ +	if (adapter->failover) {
+ +		release_sub_crqs(adapter);
+ +		if (netif_running(netdev)) {
+ +			netif_tx_disable(netdev);
+ +			ibmvnic_close(netdev);
+ +			restart = true;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	reinit_completion(&adapter->init_done);
+ +	send_version_xchg(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ +		dev_err(dev, "Passive init timeout\n");
+ +		goto task_failed;
+++=======
++ 	adapter->from_passive_init = false;
++ 
++ 	init_completion(&adapter->init_done);
++ 	ibmvnic_send_crq_init(adapter);
++ 	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
++ 		dev_err(dev, "Initialization sequence timed out\n");
++ 		return -1;
++ 	}
++ 
++ 	if (adapter->from_passive_init) {
++ 		adapter->state = VNIC_OPEN;
++ 		adapter->from_passive_init = false;
++ 		return -1;
+++>>>>>>> 017892c1ec15 (ibmvnic: Handle failover after failed init crq)
+ +	}
+ +
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout)) {
+ +				dev_err(dev, "Passive init timeout\n");
+ +				goto task_failed;
+ +			}
+ +		}
+ +	} while (adapter->renegotiate);
+ +	rc = init_sub_crq_irqs(adapter);
+ +
+ +	if (rc)
+ +		goto task_failed;
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+ +
+ +	if (adapter->failover) {
+ +		adapter->failover = false;
+ +		if (restart) {
+ +			rc = ibmvnic_open(netdev);
+ +			if (rc)
+ +				goto restart_failed;
+ +		}
+ +		netif_carrier_on(netdev);
+ +		return;
+  	}
+  
+ -	rc = init_sub_crqs(adapter);
+ +	rc = register_netdev(netdev);
+  	if (rc) {
+ -		dev_err(dev, "Initialization of sub crqs failed\n");
+ -		release_crq_queue(adapter);
+ +		dev_err(dev,
+ +			"failed to register netdev rc=%d\n", rc);
+ +		goto register_failed;
+  	}
+ +	dev_info(dev, "ibmvnic registered\n");
+  
+ -	return rc;
+ +	return;
+ +
+ +restart_failed:
+ +	dev_err(dev, "Failed to restart ibmvnic, rc=%d\n", rc);
+ +register_failed:
+ +	release_sub_crqs(adapter);
+ +task_failed:
+ +	dev_err(dev, "Passive initialization was not successful\n");
+  }
+  
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+diff --cc drivers/net/ethernet/ibm/ibmvnic.h
+index 91a20189cdae,fa6ac4e4a16e..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@@ -1049,8 -1024,12 +1049,18 @@@ struct ibmvnic_adapter 
+  	__be64 tx_rx_desc_req;
+  	u8 map_id;
+  
+ +	struct work_struct vnic_crq_init;
+ +	struct work_struct ibmvnic_xport;
+  	struct tasklet_struct tasklet;
+++<<<<<<< HEAD
+ +	bool failover;
+++=======
++ 	enum vnic_state state;
++ 	enum ibmvnic_reset_reason reset_reason;
++ 	struct mutex reset_lock, rwi_lock;
++ 	struct list_head rwi_list;
++ 	struct work_struct ibmvnic_reset;
++ 	bool resetting;
++ 	bool napi_enabled, from_passive_init;
+++>>>>>>> 017892c1ec15 (ibmvnic: Handle failover after failed init crq)
+  };
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.h
