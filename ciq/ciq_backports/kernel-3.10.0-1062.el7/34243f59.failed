@@ -1,0 +1,132 @@
+nfp: add support for indirect HWinfo lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 34243f59095e2c50ecb5c217b9d439a31e0e049a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/34243f59.failed
+
+Management FW can adjust some of the information in the HWinfo table
+at runtime.  In some cases reading the table directly will not yield
+correct results.  Add a NSP command for looking up information.
+Up until now we weren't making use of any of the values which may
+get adjusted.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 34243f59095e2c50ecb5c217b9d439a31e0e049a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+index 5bdba6046915,bf593a6b26a1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+@@@ -87,6 -87,11 +87,14 @@@
+  #define NSP_CODE_MAJOR		GENMASK(15, 12)
+  #define NSP_CODE_MINOR		GENMASK(11, 0)
+  
+++<<<<<<< HEAD
+++=======
++ #define NFP_FW_LOAD_RET_MAJOR	GENMASK(15, 8)
++ #define NFP_FW_LOAD_RET_MINOR	GENMASK(23, 16)
++ 
++ #define NFP_HWINFO_LOOKUP_SIZE	GENMASK(11, 0)
++ 
+++>>>>>>> 34243f59095e (nfp: add support for indirect HWinfo lookup)
+  enum nfp_nsp_cmd {
+  	SPCODE_NOOP		= 0, /* No operation */
+  	SPCODE_SOFT_RESET	= 1, /* Soft reset the NFP */
+@@@ -98,8 -103,10 +106,9 @@@
+  	SPCODE_ETH_RESCAN	= 7, /* Rescan ETHs, write ETH_TABLE to buf */
+  	SPCODE_ETH_CONTROL	= 8, /* Update media config from buffer */
+  	SPCODE_NSP_WRITE_FLASH	= 11, /* Load and flash image from buffer */
+ -	SPCODE_NSP_SENSORS	= 12, /* Read NSP sensor(s) */
+  	SPCODE_NSP_IDENTIFY	= 13, /* Read NSP version */
+  	SPCODE_FW_STORED	= 16, /* If no FW loaded, load flash app FW */
++ 	SPCODE_HWINFO_LOOKUP	= 17, /* Lookup HWinfo with overwrites etc. */
+  };
+  
+  static const struct {
+@@@ -547,5 -693,51 +556,40 @@@ int nfp_nsp_read_identify(struct nfp_ns
+  
+  int nfp_nsp_load_stored_fw(struct nfp_nsp *state)
+  {
+ -	const struct nfp_nsp_command_arg arg = {
+ -		.code		= SPCODE_FW_STORED,
+ -		.error_cb	= nfp_nsp_load_fw_extended_msg,
+ -	};
+ -	int ret;
+ -
+ -	ret = __nfp_nsp_command(state, &arg);
+ -	if (ret < 0)
+ -		return ret;
+ -
+ -	nfp_nsp_load_fw_extended_msg(state, ret);
+ -	return 0;
+ +	return nfp_nsp_command(state, SPCODE_FW_STORED);
+  }
++ 
++ static int
++ __nfp_nsp_hwinfo_lookup(struct nfp_nsp *state, void *buf, unsigned int size)
++ {
++ 	struct nfp_nsp_command_buf_arg hwinfo_lookup = {
++ 		{
++ 			.code		= SPCODE_HWINFO_LOOKUP,
++ 			.option		= size,
++ 		},
++ 		.in_buf		= buf,
++ 		.in_size	= size,
++ 		.out_buf	= buf,
++ 		.out_size	= size,
++ 	};
++ 
++ 	return nfp_nsp_command_buf(state, &hwinfo_lookup);
++ }
++ 
++ int nfp_nsp_hwinfo_lookup(struct nfp_nsp *state, void *buf, unsigned int size)
++ {
++ 	int err;
++ 
++ 	size = min_t(u32, size, NFP_HWINFO_LOOKUP_SIZE);
++ 
++ 	err = __nfp_nsp_hwinfo_lookup(state, buf, size);
++ 	if (err)
++ 		return err;
++ 
++ 	if (strnlen(buf, size) == size) {
++ 		nfp_err(state->cpp, "NSP HWinfo value not NULL-terminated\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h
+index 447e2255a0f8..a828380f5a4f 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h
+@@ -51,6 +51,7 @@ int nfp_nsp_load_fw(struct nfp_nsp *state, const struct firmware *fw);
+ int nfp_nsp_write_flash(struct nfp_nsp *state, const struct firmware *fw);
+ int nfp_nsp_mac_reinit(struct nfp_nsp *state);
+ int nfp_nsp_load_stored_fw(struct nfp_nsp *state);
++int nfp_nsp_hwinfo_lookup(struct nfp_nsp *state, void *buf, unsigned int size);
+ 
+ static inline bool nfp_nsp_has_mac_reinit(struct nfp_nsp *state)
+ {
+@@ -62,6 +63,11 @@ static inline bool nfp_nsp_has_stored_fw_load(struct nfp_nsp *state)
+ 	return nfp_nsp_get_abi_ver_minor(state) > 23;
+ }
+ 
++static inline bool nfp_nsp_has_hwinfo_lookup(struct nfp_nsp *state)
++{
++	return nfp_nsp_get_abi_ver_minor(state) > 24;
++}
++
+ enum nfp_eth_interface {
+ 	NFP_INTERFACE_NONE	= 0,
+ 	NFP_INTERFACE_SFP	= 1,
