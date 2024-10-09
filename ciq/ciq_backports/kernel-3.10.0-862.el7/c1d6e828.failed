@@ -1,0 +1,281 @@
+pmem: add dax_operations support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit c1d6e828a35df524df2af277eedd1471d05e4f4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c1d6e828.failed
+
+Setup a dax_device to have the same lifetime as the pmem block device
+and add a ->direct_access() method that is equivalent to
+pmem_direct_access(). Once fs/dax.c has been converted to use
+dax_operations the old pmem_direct_access() will be removed.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit c1d6e828a35df524df2af277eedd1471d05e4f4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dax/dax.h
+#	drivers/nvdimm/pmem.c
+#	include/linux/dax.h
+#	tools/testing/nvdimm/pmem-dax.c
+diff --cc drivers/dax/dax.h
+index ddd829ab58c0,f9e5feea742c..000000000000
+--- a/drivers/dax/dax.h
++++ b/drivers/dax/dax.h
+@@@ -12,14 -12,7 +12,20 @@@
+   */
+  #ifndef __DAX_H__
+  #define __DAX_H__
+++<<<<<<< HEAD
+ +struct device;
+ +struct dax_dev;
+ +struct resource;
+ +struct dax_region;
+ +void dax_region_put(struct dax_region *dax_region);
+ +struct dax_region *alloc_dax_region(struct device *parent,
+ +		int region_id, struct resource *res, unsigned int align,
+ +		void *addr, unsigned long flags);
+ +struct dax_dev *devm_create_dax_dev(struct dax_region *dax_region,
+ +		struct resource *res, int count);
+++=======
++ struct dax_device;
++ struct dax_device *inode_dax(struct inode *inode);
++ struct inode *dax_inode(struct dax_device *dax_dev);
+++>>>>>>> c1d6e828a35d (pmem: add dax_operations support)
+  #endif /* __DAX_H__ */
+diff --cc drivers/nvdimm/pmem.c
+index a63d1c76771a,fbbcf8154eec..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -193,13 -200,13 +194,18 @@@ static int pmem_rw_page(struct block_de
+  }
+  
+  /* see "strong" declaration in tools/testing/nvdimm/pmem-dax.c */
+++<<<<<<< HEAD
+ +__weak long pmem_direct_access(struct block_device *bdev, sector_t sector,
+ +			void **kaddr, pfn_t *pfn, long size)
+++=======
++ __weak long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn)
+++>>>>>>> c1d6e828a35d (pmem: add dax_operations support)
+  {
+- 	struct pmem_device *pmem = bdev->bd_queue->queuedata;
+- 	resource_size_t offset = sector * 512 + pmem->data_offset;
++ 	resource_size_t offset = PFN_PHYS(pgoff) + pmem->data_offset;
+  
+- 	if (unlikely(is_bad_pmem(&pmem->bb, sector, size)))
++ 	if (unlikely(is_bad_pmem(&pmem->bb, PFN_PHYS(pgoff) / 512,
++ 					PFN_PHYS(nr_pages))))
+  		return -EIO;
+  	*kaddr = pmem->virt_addr + offset;
+  	*pfn = phys_to_pfn_t(pmem->phys_addr + offset, pmem->pfn_flags);
+@@@ -331,9 -364,16 +364,20 @@@ static int pmem_attach_disk(struct devi
+  		return -ENOMEM;
+  	nvdimm_badblocks_populate(nd_region, &pmem->bb, res);
+  	disk->bb = &pmem->bb;
+++<<<<<<< HEAD
+ +	add_disk(disk);
+++=======
+++>>>>>>> c1d6e828a35d (pmem: add dax_operations support)
++ 
++ 	dax_dev = alloc_dax(pmem, disk->disk_name, &pmem_dax_ops);
++ 	if (!dax_dev) {
++ 		put_disk(disk);
++ 		return -ENOMEM;
++ 	}
++ 	pmem->dax_dev = dax_dev;
+  
+- 	if (devm_add_action_or_reset(dev, pmem_release_disk, disk))
++ 	device_add_disk(dev, disk);
++ 	if (devm_add_action_or_reset(dev, pmem_release_disk, pmem))
+  		return -ENOMEM;
+  
+  	revalidate_disk(disk);
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,39a0312c45c3..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,64 +6,54 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ };
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *dax_get_by_host(const char *host);
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ void put_dax(struct dax_device *dax_dev);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
++ 
+++>>>>>>> c1d6e828a35d (pmem: add dax_operations support)
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+  
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+ -
+ -static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ -{
+ -	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ -			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ -			RADIX_DAX_ENTRY_LOCK);
+ -}
+  
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ -int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ -				      pgoff_t index);
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+diff --cc tools/testing/nvdimm/pmem-dax.c
+index fd65f8d0a652,b53596ad601b..000000000000
+--- a/tools/testing/nvdimm/pmem-dax.c
++++ b/tools/testing/nvdimm/pmem-dax.c
+@@@ -15,17 -15,13 +15,27 @@@
+  #include <pmem.h>
+  #include <nd.h>
+  
+++<<<<<<< HEAD
+ +long pmem_direct_access(struct block_device *bdev, sector_t sector,
+ +		void **kaddr, pfn_t *pfn)
+ +{
+ +	struct pmem_device *pmem = bdev->bd_queue->queuedata;
+ +	resource_size_t offset = sector * 512 + pmem->data_offset;
+ +	long max_len = pmem->size - pmem->pfn_pad - offset;
+ +	sector_t first_bad;
+ +	int num_bad;
+ +
+ +	/* If we can't even map the first page, return error */
+ +	if (unlikely(is_bad_pmem(&pmem->bb, sector, PAGE_SIZE)))
+++=======
++ long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	resource_size_t offset = PFN_PHYS(pgoff) + pmem->data_offset;
++ 
++ 	if (unlikely(is_bad_pmem(&pmem->bb, PFN_PHYS(pgoff) / 512,
++ 					PFN_PHYS(nr_pages))))
+++>>>>>>> c1d6e828a35d (pmem: add dax_operations support)
+  		return -EIO;
+  
+  	/*
+@@@ -49,14 -44,10 +58,20 @@@
+  	*pfn = phys_to_pfn_t(pmem->phys_addr + offset, pmem->pfn_flags);
+  
+  	/*
+ -	 * If badblocks are present, limit known good range to the
+ -	 * requested range.
+ +	 * If badblocks are present, limit range to the first known
+ +	 * bad block.
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(pmem->bb.count) &&
+ +	    badblocks_check(&pmem->bb, sector, max_len / 512,
+ +			    &first_bad, &num_bad)) {
+ +		return ((first_bad - sector) * 512) & ~(PAGE_SIZE-1);
+ +	}
+ +
+ +	return max_len;
+++=======
++ 	if (unlikely(pmem->bb.count))
++ 		return nr_pages;
++ 	return PHYS_PFN(pmem->size - pmem->pfn_pad - offset);
+++>>>>>>> c1d6e828a35d (pmem: add dax_operations support)
+  }
+* Unmerged path drivers/dax/dax.h
+diff --git a/drivers/nvdimm/Kconfig b/drivers/nvdimm/Kconfig
+index 124c2432ac9c..9dce59aa77e4 100644
+--- a/drivers/nvdimm/Kconfig
++++ b/drivers/nvdimm/Kconfig
+@@ -20,6 +20,7 @@ if LIBNVDIMM
+ config BLK_DEV_PMEM
+ 	tristate "PMEM: Persistent memory block device support"
+ 	default LIBNVDIMM
++	select DAX
+ 	select ND_BTT if BTT
+ 	select ND_PFN if NVDIMM_PFN
+ 	help
+* Unmerged path drivers/nvdimm/pmem.c
+diff --git a/drivers/nvdimm/pmem.h b/drivers/nvdimm/pmem.h
+index b4ee4f71b4a1..7f4dbd72a90a 100644
+--- a/drivers/nvdimm/pmem.h
++++ b/drivers/nvdimm/pmem.h
+@@ -5,8 +5,6 @@
+ #include <linux/pfn_t.h>
+ #include <linux/fs.h>
+ 
+-long pmem_direct_access(struct block_device *bdev, sector_t sector,
+-		      void **kaddr, pfn_t *pfn, long size);
+ /* this definition is in it's own header for tools/testing/nvdimm to consume */
+ struct pmem_device {
+ 	/* One contiguous memory region per device */
+@@ -20,5 +18,10 @@ struct pmem_device {
+ 	/* trim size when namespace capacity has been section aligned */
+ 	u32			pfn_pad;
+ 	struct badblocks	bb;
++	struct dax_device	*dax_dev;
++	struct gendisk		*disk;
+ };
++
++long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
++		long nr_pages, void **kaddr, pfn_t *pfn);
+ #endif /* __NVDIMM_PMEM_H__ */
+* Unmerged path include/linux/dax.h
+* Unmerged path tools/testing/nvdimm/pmem-dax.c
