@@ -1,0 +1,121 @@
+perf mmap: Fix perf backward recording
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 71f566a34986f4a86a8c546c7a36f70f0132b8a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/71f566a3.failed
+
+'perf record' backward recording doesn't work as we expected: it never
+overwrites when ring buffer gets full.
+
+Test:
+
+Run a busy python printing task background like this:
+
+ while True:
+     print 123
+
+send SIGUSR2 to perf to capture snapshot, then:
+
+ # ./perf record --overwrite -e raw_syscalls:sys_enter -e raw_syscalls:sys_exit --exclude-perf -a --switch-output
+ [ perf record: dump data: Woken up 1 times ]
+ [ perf record: Dump perf.data.2017110101520743 ]
+ [ perf record: dump data: Woken up 1 times ]
+ [ perf record: Dump perf.data.2017110101521251 ]
+ [ perf record: dump data: Woken up 1 times ]
+ [ perf record: Dump perf.data.2017110101521692 ]
+ ^C[ perf record: Woken up 1 times to write data ]
+ [ perf record: Dump perf.data.2017110101521936 ]
+ [ perf record: Captured and wrote 0.826 MB perf.data.<timestamp> ]
+
+ # ./perf script -i ./perf.data.2017110101520743 | head -n3
+             perf  2717 [000] 12449.310785: raw_syscalls:sys_enter: NR 16 (5, 2400, 0, 59, 100, 0)
+             perf  2717 [000] 12449.310790: raw_syscalls:sys_enter: NR 7 (4112340, 2, ffffffff, 3df, 100, 0)
+           python  2545 [000] 12449.310800:  raw_syscalls:sys_exit: NR 1 = 4
+ # ./perf script -i ./perf.data.2017110101521251 | head -n3
+             perf  2717 [000] 12449.310785: raw_syscalls:sys_enter: NR 16 (5, 2400, 0, 59, 100, 0)
+             perf  2717 [000] 12449.310790: raw_syscalls:sys_enter: NR 7 (4112340, 2, ffffffff, 3df, 100, 0)
+           python  2545 [000] 12449.310800:  raw_syscalls:sys_exit: NR 1 = 4
+ # ./perf script -i ./perf.data.2017110101521692 | head -n3
+             perf  2717 [000] 12449.310785: raw_syscalls:sys_enter: NR 16 (5, 2400, 0, 59, 100, 0)
+             perf  2717 [000] 12449.310790: raw_syscalls:sys_enter: NR 7 (4112340, 2, ffffffff, 3df, 100, 0)
+           python  2545 [000] 12449.310800:  raw_syscalls:sys_exit: NR 1 = 4
+
+Timestamps never change, but my background task is a dead loop, can
+easily overwhelm the ring buffer.
+
+This patch fixes it by forcing unsetting PROT_WRITE for a backward ring
+buffer, so all backward ring buffers become overwrite ring buffers.
+
+Test result:
+
+ # ./perf record --overwrite -e raw_syscalls:sys_enter -e raw_syscalls:sys_exit --exclude-perf -a --switch-output
+ [ perf record: dump data: Woken up 1 times ]
+ [ perf record: Dump perf.data.2017110101285323 ]
+ [ perf record: dump data: Woken up 1 times ]
+ [ perf record: Dump perf.data.2017110101290053 ]
+ [ perf record: dump data: Woken up 1 times ]
+ [ perf record: Dump perf.data.2017110101290446 ]
+ ^C[ perf record: Woken up 1 times to write data ]
+ [ perf record: Dump perf.data.2017110101290837 ]
+ [ perf record: Captured and wrote 0.826 MB perf.data.<timestamp> ]
+ # ./perf script -i ./perf.data.2017110101285323 | head -n3
+           python  2545 [000] 11064.268083:  raw_syscalls:sys_exit: NR 1 = 4
+           python  2545 [000] 11064.268084: raw_syscalls:sys_enter: NR 1 (1, 12cc330, 4, 7fc237280370, 7fc2373d0700, 2c7b0)
+           python  2545 [000] 11064.268086:  raw_syscalls:sys_exit: NR 1 = 4
+ # ./perf script -i ./perf.data.2017110101290 | head -n3
+ failed to open ./perf.data.2017110101290: No such file or directory
+ # ./perf script -i ./perf.data.2017110101290053 | head -n3
+           python  2545 [000] 11071.564062: raw_syscalls:sys_enter: NR 1 (1, 12cc330, 4, 7fc237280370, 7fc2373d0700, 2c7b0)
+           python  2545 [000] 11071.564064:  raw_syscalls:sys_exit: NR 1 = 4
+           python  2545 [000] 11071.564066: raw_syscalls:sys_enter: NR 1 (1, 12cc330, 4, 7fc237280370, 7fc2373d0700, 2c7b0)
+ # ./perf script -i ./perf.data.2017110101290 | head -n3
+ perf.data.2017110101290053  perf.data.2017110101290446  perf.data.2017110101290837
+ # ./perf script -i ./perf.data.2017110101290446 | head -n3
+             sshd  1321 [000] 11075.499473:  raw_syscalls:sys_exit: NR 14 = 0
+             sshd  1321 [000] 11075.499474: raw_syscalls:sys_enter: NR 14 (2, 7ffe98899490, 0, 8, 0, 3000)
+             sshd  1321 [000] 11075.499474:  raw_syscalls:sys_exit: NR 14 = 0
+ # ./perf script -i ./perf.data.2017110101290837 | head -n3
+           python  2545 [000] 11079.280844:  raw_syscalls:sys_exit: NR 1 = 4
+           python  2545 [000] 11079.280847: raw_syscalls:sys_enter: NR 1 (1, 12cc330, 4, 7fc237280370, 7fc2373d0700, 2c7b0)
+           python  2545 [000] 11079.280850:  raw_syscalls:sys_exit: NR 1 = 4
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Acked-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Mengting Zhang <zhangmengting@huawei.com>
+Link: http://lkml.kernel.org/r/20171204165107.95327-2-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 71f566a34986f4a86a8c546c7a36f70f0132b8a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evlist.c
+diff --cc tools/perf/util/evlist.c
+index 0abcf97f8546,b1cea711232b..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -1306,9 -1060,12 +1308,18 @@@ int perf_evlist__mmap_ex(struct perf_ev
+  	struct perf_evsel *evsel;
+  	const struct cpu_map *cpus = evlist->cpus;
+  	const struct thread_map *threads = evlist->threads;
+++<<<<<<< HEAD
+ +	struct mmap_params mp = {
+ +		.prot = PROT_READ | (overwrite ? 0 : PROT_WRITE),
+ +	};
+++=======
++ 	/*
++ 	 * Delay setting mp.prot: set it before calling perf_mmap__mmap.
++ 	 * Its value is decided by evsel's write_backward.
++ 	 * So &mp should not be passed through const pointer.
++ 	 */
++ 	struct mmap_params mp;
+++>>>>>>> 71f566a34986 (perf mmap: Fix perf backward recording)
+  
+  	if (!evlist->mmap)
+  		evlist->mmap = perf_evlist__alloc_mmap(evlist);
+* Unmerged path tools/perf/util/evlist.c
