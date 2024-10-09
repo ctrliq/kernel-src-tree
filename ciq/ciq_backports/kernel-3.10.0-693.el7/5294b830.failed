@@ -1,0 +1,184 @@
+macsec: dynamically allocate space for sglist
+
+jira LE-1907
+cve CVE-2017-7477
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jason A. Donenfeld <Jason@zx2c4.com>
+commit 5294b83086cc1c35b4efeca03644cf9d12282e5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5294b830.failed
+
+We call skb_cow_data, which is good anyway to ensure we can actually
+modify the skb as such (another error from prior). Now that we have the
+number of fragments required, we can safely allocate exactly that amount
+of memory.
+
+Fixes: c09440f7dcb3 ("macsec: introduce IEEE 802.1AE driver")
+	Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+	Acked-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5294b83086cc1c35b4efeca03644cf9d12282e5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macsec.c
+diff --cc drivers/net/macsec.c
+index 91e6618a6436,49ce4e9f4a0f..000000000000
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@@ -608,9 -618,9 +608,13 @@@ static void macsec_encrypt_done(struct 
+  static struct aead_request *macsec_alloc_req(struct crypto_aead *tfm,
+  					     unsigned char **iv,
+  					     struct scatterlist **sg,
+++<<<<<<< HEAD
+ +					     struct scatterlist **sg_ad)
+++=======
++ 					     int num_frags)
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  {
+ -	size_t size, iv_offset, sg_offset;
+ +	size_t size, iv_offset, sg_offset, sg_ad_offset;
+  	struct aead_request *req;
+  	void *tmp;
+  
+@@@ -620,12 -630,8 +624,12 @@@
+  
+  	size = ALIGN(size, __alignof__(struct scatterlist));
+  	sg_offset = size;
+- 	size += sizeof(struct scatterlist) * (MAX_SKB_FRAGS + 1);
++ 	size += sizeof(struct scatterlist) * num_frags;
+  
+ +	size = ALIGN(size, __alignof__(struct scatterlist));
+ +	sg_ad_offset = size;
+ +	size += sizeof(struct scatterlist) * (MAX_SKB_FRAGS + 1);
+ +
+  	tmp = kmalloc(size, GFP_ATOMIC);
+  	if (!tmp)
+  		return NULL;
+@@@ -645,7 -650,7 +649,11 @@@ static struct sk_buff *macsec_encrypt(s
+  {
+  	int ret;
+  	struct scatterlist *sg;
+++<<<<<<< HEAD
+ +	struct scatterlist *sg_ad;
+++=======
++ 	struct sk_buff *trailer;
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  	unsigned char *iv;
+  	struct ethhdr *eth;
+  	struct macsec_eth_header *hh;
+@@@ -718,7 -725,14 +726,18 @@@
+  		return ERR_PTR(-EINVAL);
+  	}
+  
+++<<<<<<< HEAD
+ +	req = macsec_alloc_req(tx_sa->key.tfm, &iv, &sg, &sg_ad);
+++=======
++ 	ret = skb_cow_data(skb, 0, &trailer);
++ 	if (unlikely(ret < 0)) {
++ 		macsec_txsa_put(tx_sa);
++ 		kfree_skb(skb);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	req = macsec_alloc_req(tx_sa->key.tfm, &iv, &sg, ret);
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  	if (!req) {
+  		macsec_txsa_put(tx_sa);
+  		kfree_skb(skb);
+@@@ -727,28 -741,17 +746,34 @@@
+  
+  	macsec_fill_iv(iv, secy->sci, pn);
+  
+++<<<<<<< HEAD
+++=======
++ 	sg_init_table(sg, ret);
++ 	skb_to_sgvec(skb, sg, 0, skb->len);
++ 
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  	if (tx_sc->encrypt) {
+ -		int len = skb->len - macsec_hdr_len(sci_present) -
+ -			  secy->icv_len;
+ -		aead_request_set_crypt(req, sg, sg, len, iv);
+ -		aead_request_set_ad(req, macsec_hdr_len(sci_present));
+ +		int assoc_len = macsec_hdr_len(tx_sc->send_sci);
+ +		int data_len = skb->len - secy->icv_len - assoc_len;
+ +
+ +		sg_init_table(sg_ad, MAX_SKB_FRAGS + 1);
+ +		skb_to_sgvec(skb, sg_ad, 0, assoc_len);
+ +		sg_init_table(sg, MAX_SKB_FRAGS + 1);
+ +		skb_to_sgvec(skb, sg, assoc_len, data_len + secy->icv_len);
+ +
+ +		aead_request_set_crypt(req, sg, sg, data_len, iv);
+ +		aead_request_set_assoc(req, sg_ad, assoc_len);
+  	} else {
+ +		int assoc_len = skb->len - secy->icv_len;
+ +		int data_len = secy->icv_len;
+ +
+ +		sg_init_table(sg_ad, MAX_SKB_FRAGS + 1);
+ +		skb_to_sgvec(skb, sg_ad, 0, assoc_len);
+ +		sg_init_table(sg, MAX_SKB_FRAGS + 1);
+ +		skb_to_sgvec(skb, sg, assoc_len, data_len);
+ +
+  		aead_request_set_crypt(req, sg, sg, 0, iv);
+ -		aead_request_set_ad(req, skb->len - secy->icv_len);
+ +		aead_request_set_assoc(req, sg_ad, assoc_len);
+  	}
+  
+  	macsec_skb_cb(skb)->req = req;
+@@@ -920,7 -926,7 +945,11 @@@ static struct sk_buff *macsec_decrypt(s
+  {
+  	int ret;
+  	struct scatterlist *sg;
+++<<<<<<< HEAD
+ +	struct scatterlist *sg_ad;
+++=======
++ 	struct sk_buff *trailer;
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  	unsigned char *iv;
+  	struct aead_request *req;
+  	struct macsec_eth_header *hdr;
+@@@ -931,7 -937,12 +960,16 @@@
+  	if (!skb)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	req = macsec_alloc_req(rx_sa->key.tfm, &iv, &sg, &sg_ad);
+++=======
++ 	ret = skb_cow_data(skb, 0, &trailer);
++ 	if (unlikely(ret < 0)) {
++ 		kfree_skb(skb);
++ 		return ERR_PTR(ret);
++ 	}
++ 	req = macsec_alloc_req(rx_sa->key.tfm, &iv, &sg, ret);
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  	if (!req) {
+  		kfree_skb(skb);
+  		return ERR_PTR(-ENOMEM);
+@@@ -940,6 -951,9 +978,12 @@@
+  	hdr = (struct macsec_eth_header *)skb->data;
+  	macsec_fill_iv(iv, sci, ntohl(hdr->packet_number));
+  
+++<<<<<<< HEAD
+++=======
++ 	sg_init_table(sg, ret);
++ 	skb_to_sgvec(skb, sg, 0, skb->len);
++ 
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  	if (hdr->tci_an & MACSEC_TCI_E) {
+  		/* confidentiality: ethernet + macsec header
+  		 * authenticated, encrypted payload
+@@@ -2677,6 -2732,8 +2721,11 @@@ static netdev_tx_t macsec_start_xmit(st
+  
+  #define MACSEC_FEATURES \
+  	(NETIF_F_SG | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST)
+++<<<<<<< HEAD
+++=======
++ static struct lock_class_key macsec_netdev_addr_lock_key;
++ 
+++>>>>>>> 5294b83086cc (macsec: dynamically allocate space for sglist)
+  static int macsec_dev_init(struct net_device *dev)
+  {
+  	struct macsec_dev *macsec = macsec_priv(dev);
+* Unmerged path drivers/net/macsec.c
