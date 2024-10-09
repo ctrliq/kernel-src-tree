@@ -1,0 +1,127 @@
+amd-xgbe: Use napi_alloc_skb when allocating skb in softirq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 385565a1f0d365793e1f90746237d508bfeef9af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/385565a1.failed
+
+Use the napi_alloc_skb function to allocate an skb when running within
+the softirq context to avoid calls to local_irq_save/restore.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 385565a1f0d365793e1f90746237d508bfeef9af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index d58e85811bc9,347fe2419a18..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1098,6 -1821,30 +1098,33 @@@ static void xgbe_rx_refresh(struct xgbe
+  			  lower_32_bits(rdata->rdesc_dma));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xgbe_create_skb(struct napi_struct *napi,
++ 				       struct xgbe_ring_data *rdata,
++ 				       unsigned int *len)
++ {
++ 	struct sk_buff *skb;
++ 	u8 *packet;
++ 	unsigned int copy_len;
++ 
++ 	skb = napi_alloc_skb(napi, rdata->rx.hdr.dma_len);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	packet = page_address(rdata->rx.hdr.pa.pages) +
++ 		 rdata->rx.hdr.pa.pages_offset;
++ 	copy_len = (rdata->rx.hdr_len) ? rdata->rx.hdr_len : *len;
++ 	copy_len = min(rdata->rx.hdr.dma_len, copy_len);
++ 	skb_copy_to_linear_data(skb, packet, copy_len);
++ 	skb_put(skb, copy_len);
++ 
++ 	*len -= copy_len;
++ 
++ 	return skb;
++ }
++ 
+++>>>>>>> 385565a1f0d3 (amd-xgbe: Use napi_alloc_skb when allocating skb in softirq)
+  static int xgbe_tx_poll(struct xgbe_channel *channel)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+@@@ -1213,33 -1986,47 +1240,48 @@@ read_again
+  			if (packet->errors)
+  				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+ -			goto next_packet;
+ +			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+++=======
++ 		if (!context) {
++ 			put_len = rdata->rx.len - len;
++ 			len += put_len;
++ 
++ 			if (!skb) {
++ 				dma_sync_single_for_cpu(pdata->dev,
++ 							rdata->rx.hdr.dma,
++ 							rdata->rx.hdr.dma_len,
++ 							DMA_FROM_DEVICE);
++ 
++ 				skb = xgbe_create_skb(napi, rdata, &put_len);
++ 				if (!skb) {
+++>>>>>>> 385565a1f0d3 (amd-xgbe: Use napi_alloc_skb when allocating skb in softirq)
+  					error = 1;
+ -					goto skip_data;
+ +					goto read_again;
+  				}
+ -			}
+  
+ -			if (put_len) {
+ -				dma_sync_single_for_cpu(pdata->dev,
+ -							rdata->rx.buf.dma,
+ -							rdata->rx.buf.dma_len,
+ -							DMA_FROM_DEVICE);
+ -
+ -				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+ -						rdata->rx.buf.pa.pages,
+ -						rdata->rx.buf.pa.pages_offset,
+ -						put_len, rdata->rx.buf.dma_len);
+ -				rdata->rx.buf.pa.pages = NULL;
+ +				dev_kfree_skb(skb);
+ +				continue;
+  			}
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+ -skip_data:
+ -		if (incomplete || context_next)
+ +		if (incomplete)
+  			goto read_again;
+  
+ -		if (!skb)
+ -			goto next_packet;
+ -
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
