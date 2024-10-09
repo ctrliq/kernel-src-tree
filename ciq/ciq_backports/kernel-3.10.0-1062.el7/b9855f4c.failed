@@ -1,0 +1,171 @@
+iw_cxgb4: RDMA write with immediate support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Potnuri Bharat Teja <bharat@chelsio.com>
+commit b9855f4ca0fe582aabfdbd08f0d856b22486e157
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b9855f4c.failed
+
+Adds iw_cxgb4 functionality to support RDMA_WRITE_WITH_IMMEDATE opcode.
+
+	Signed-off-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b9855f4ca0fe582aabfdbd08f0d856b22486e157)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/qp.c
+diff --cc drivers/infiniband/hw/cxgb4/qp.c
+index 4106eed1b8fb,5d30cd14f795..000000000000
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@@ -1945,8 -2116,9 +1964,14 @@@ struct ib_qp *c4iw_create_qp(struct ib_
+  				goto err_free_rq_db_key;
+  			}
+  			uresp.flags = C4IW_QPF_ONCHIP;
+++<<<<<<< HEAD
+ +		} else
+ +			uresp.flags = 0;
+++=======
++ 		}
++ 		if (rhp->rdev.lldi.write_w_imm_support)
++ 			uresp.flags |= C4IW_QPF_WRITE_W_IMM;
+++>>>>>>> b9855f4ca0fe (iw_cxgb4: RDMA write with immediate support)
+  		uresp.qid_mask = rhp->rdev.qpmask;
+  		uresp.sqid = qhp->wq.sq.qid;
+  		uresp.sq_size = qhp->wq.sq.size;
+diff --git a/drivers/infiniband/hw/cxgb4/cq.c b/drivers/infiniband/hw/cxgb4/cq.c
+index a055f9f08e76..4a311a291430 100644
+--- a/drivers/infiniband/hw/cxgb4/cq.c
++++ b/drivers/infiniband/hw/cxgb4/cq.c
+@@ -715,15 +715,32 @@ static int __c4iw_poll_cq_one(struct c4iw_cq *chp, struct c4iw_qp *qhp,
+ 			wc->byte_len = CQE_LEN(&cqe);
+ 		else
+ 			wc->byte_len = 0;
+-		wc->opcode = IB_WC_RECV;
+-		if (CQE_OPCODE(&cqe) == FW_RI_SEND_WITH_INV ||
+-		    CQE_OPCODE(&cqe) == FW_RI_SEND_WITH_SE_INV) {
++
++		switch (CQE_OPCODE(&cqe)) {
++		case FW_RI_SEND:
++			wc->opcode = IB_WC_RECV;
++			break;
++		case FW_RI_SEND_WITH_INV:
++		case FW_RI_SEND_WITH_SE_INV:
++			wc->opcode = IB_WC_RECV;
+ 			wc->ex.invalidate_rkey = CQE_WRID_STAG(&cqe);
+ 			wc->wc_flags |= IB_WC_WITH_INVALIDATE;
+ 			c4iw_invalidate_mr(qhp->rhp, wc->ex.invalidate_rkey);
++			break;
++		case FW_RI_WRITE_IMMEDIATE:
++			wc->opcode = IB_WC_RECV_RDMA_WITH_IMM;
++			wc->ex.imm_data = CQE_IMM_DATA(&cqe);
++			wc->wc_flags |= IB_WC_WITH_IMM;
++			break;
++		default:
++			pr_err("Unexpected opcode %d in the CQE received for QPID=0x%0x\n",
++			       CQE_OPCODE(&cqe), CQE_QPID(&cqe));
++			ret = -EINVAL;
++			goto out;
+ 		}
+ 	} else {
+ 		switch (CQE_OPCODE(&cqe)) {
++		case FW_RI_WRITE_IMMEDIATE:
+ 		case FW_RI_RDMA_WRITE:
+ 			wc->opcode = IB_WC_RDMA_WRITE;
+ 			break;
+* Unmerged path drivers/infiniband/hw/cxgb4/qp.c
+diff --git a/drivers/infiniband/hw/cxgb4/t4.h b/drivers/infiniband/hw/cxgb4/t4.h
+index 29a4dd5053f2..1afb1ebdad38 100644
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -190,7 +190,19 @@ struct t4_cqe {
+ 			__be32 abs_rqe_idx;
+ 		} srcqe;
+ 		struct {
+-			__be64 imm_data;
++			__be32 mo;
++			__be32 msn;
++			/*
++			 * Use union for immediate data to be consistent with
++			 * stack's 32 bit data and iWARP spec's 64 bit data.
++			 */
++			union {
++				struct {
++					__be32 imm_data32;
++					u32 reserved;
++				} ib_imm_data;
++				__be64 imm_data64;
++			} iw_imm_data;
+ 		} imm_data_rcqe;
+ 
+ 		u64 drain_cookie;
+@@ -253,6 +265,8 @@ struct t4_cqe {
+ #define CQE_WRID_STAG(x)  (be32_to_cpu((x)->u.rcqe.stag))
+ #define CQE_WRID_MSN(x)   (be32_to_cpu((x)->u.rcqe.msn))
+ #define CQE_ABS_RQE_IDX(x) (be32_to_cpu((x)->u.srcqe.abs_rqe_idx))
++#define CQE_IMM_DATA(x)( \
++	(x)->u.imm_data_rcqe.iw_imm_data.ib_imm_data.imm_data32)
+ 
+ /* used for SQ completion processing */
+ #define CQE_WRID_SQ_IDX(x)	((x)->u.scqe.cidx)
+diff --git a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+index 0f4f86b004d6..62606e66ba20 100644
+--- a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
++++ b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+@@ -50,7 +50,8 @@ enum fw_ri_wr_opcode {
+ 	FW_RI_BYPASS			= 0xd,
+ 	FW_RI_RECEIVE			= 0xe,
+ 
+-	FW_RI_SGE_EC_CR_RETURN		= 0xf
++	FW_RI_SGE_EC_CR_RETURN		= 0xf,
++	FW_RI_WRITE_IMMEDIATE           = FW_RI_RDMA_INIT
+ };
+ 
+ enum fw_ri_wr_flags {
+@@ -59,7 +60,8 @@ enum fw_ri_wr_flags {
+ 	FW_RI_SOLICITED_EVENT_FLAG	= 0x04,
+ 	FW_RI_READ_FENCE_FLAG		= 0x08,
+ 	FW_RI_LOCAL_FENCE_FLAG		= 0x10,
+-	FW_RI_RDMA_READ_INVALIDATE	= 0x20
++	FW_RI_RDMA_READ_INVALIDATE	= 0x20,
++	FW_RI_RDMA_WRITE_WITH_IMMEDIATE = 0x40
+ };
+ 
+ enum fw_ri_mpa_attrs {
+@@ -546,7 +548,17 @@ struct fw_ri_rdma_write_wr {
+ 	__u16  wrid;
+ 	__u8   r1[3];
+ 	__u8   len16;
+-	__be64 r2;
++	/*
++	 * Use union for immediate data to be consistent with stack's 32 bit
++	 * data and iWARP spec's 64 bit data.
++	 */
++	union {
++		struct {
++			__be32 imm_data32;
++			u32 reserved;
++		} ib_imm_data;
++		__be64 imm_data64;
++	} iw_imm_data;
+ 	__be32 plen;
+ 	__be32 stag_sink;
+ 	__be64 to_sink;
+diff --git a/include/uapi/rdma/cxgb4-abi.h b/include/uapi/rdma/cxgb4-abi.h
+index 0ee8428e2b85..fc2b29842f58 100644
+--- a/include/uapi/rdma/cxgb4-abi.h
++++ b/include/uapi/rdma/cxgb4-abi.h
+@@ -64,7 +64,8 @@ struct c4iw_create_cq_resp {
+ };
+ 
+ enum {
+-	C4IW_QPF_ONCHIP = (1 << 0)
++	C4IW_QPF_ONCHIP	= (1 << 0),
++	C4IW_QPF_WRITE_W_IMM = (1 << 1)
+ };
+ 
+ struct c4iw_create_qp_resp {
