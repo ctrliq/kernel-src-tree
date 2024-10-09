@@ -1,0 +1,454 @@
+sysfs: Create mountpoints with sysfs_create_mount_point
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit f9bb48825a6b5d02f4cabcc78967c75db903dcdc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f9bb4882.failed
+
+This allows for better documentation in the code and
+it allows for a simpler and fully correct version of
+fs_fully_visible to be written.
+
+The mount points converted and their filesystems are:
+/sys/hypervisor/s390/       s390_hypfs
+/sys/kernel/config/         configfs
+/sys/kernel/debug/          debugfs
+/sys/firmware/efi/efivars/  efivarfs
+/sys/fs/fuse/connections/   fusectl
+/sys/fs/pstore/             pstore
+/sys/kernel/tracing/        tracefs
+/sys/fs/cgroup/             cgroup
+/sys/kernel/security/       securityfs
+/sys/fs/selinux/            selinuxfs
+/sys/fs/smackfs/            smackfs
+
+	Cc: stable@vger.kernel.org
+	Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit f9bb48825a6b5d02f4cabcc78967c75db903dcdc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/efi.c
+#	fs/configfs/mount.c
+#	fs/tracefs/inode.c
+#	kernel/cgroup.c
+diff --cc drivers/firmware/efi/efi.c
+index 298ffe5c759a,e14363d12690..000000000000
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@@ -40,8 -42,29 +40,34 @@@ struct efi __read_mostly efi = 
+  };
+  EXPORT_SYMBOL(efi);
+  
+++<<<<<<< HEAD
+ +struct kobject *efi_kobj;
+ +static struct kobject *efivars_kobj;
+++=======
++ static bool disable_runtime;
++ static int __init setup_noefi(char *arg)
++ {
++ 	disable_runtime = true;
++ 	return 0;
++ }
++ early_param("noefi", setup_noefi);
++ 
++ bool efi_runtime_disabled(void)
++ {
++ 	return disable_runtime;
++ }
++ 
++ static int __init parse_efi_cmdline(char *str)
++ {
++ 	if (parse_option_str(str, "noruntime"))
++ 		disable_runtime = true;
++ 
++ 	return 0;
++ }
++ early_param("efi", parse_efi_cmdline);
++ 
++ static struct kobject *efi_kobj;
+++>>>>>>> f9bb48825a6b (sysfs: Create mountpoints with sysfs_create_mount_point)
+  
+  /*
+   * Let's not leave out systab information that snuck into
+diff --cc fs/configfs/mount.c
+index 7f26c3cf75ae,bca58da65e2b..000000000000
+--- a/fs/configfs/mount.c
++++ b/fs/configfs/mount.c
+@@@ -141,24 -139,18 +139,29 @@@ static int __init configfs_init(void
+  	if (!configfs_dir_cachep)
+  		goto out;
+  
+- 	config_kobj = kobject_create_and_add("config", kernel_kobj);
+- 	if (!config_kobj)
++ 	err = sysfs_create_mount_point(kernel_kobj, "config");
++ 	if (err)
+  		goto out2;
+  
+ -	err = register_filesystem(&configfs_fs_type);
+ +	err = configfs_inode_init();
+  	if (err)
+  		goto out3;
+  
+ +	err = register_filesystem(&configfs_fs_type);
+ +	if (err)
+ +		goto out4;
+ +
+  	return 0;
+ +out4:
+ +	printk(KERN_ERR "configfs: Unable to register filesystem!\n");
+ +	configfs_inode_exit();
+  out3:
+++<<<<<<< HEAD
+ +	kobject_put(config_kobj);
+++=======
++ 	pr_err("Unable to register filesystem!\n");
++ 	sysfs_remove_mount_point(kernel_kobj, "config");
+++>>>>>>> f9bb48825a6b (sysfs: Create mountpoints with sysfs_create_mount_point)
+  out2:
+  	kmem_cache_destroy(configfs_dir_cachep);
+  	configfs_dir_cachep = NULL;
+@@@ -169,10 -161,9 +172,10 @@@ out
+  static void __exit configfs_exit(void)
+  {
+  	unregister_filesystem(&configfs_fs_type);
+- 	kobject_put(config_kobj);
++ 	sysfs_remove_mount_point(kernel_kobj, "config");
+  	kmem_cache_destroy(configfs_dir_cachep);
+  	configfs_dir_cachep = NULL;
+ +	configfs_inode_exit();
+  }
+  
+  MODULE_AUTHOR("Oracle");
+diff --cc kernel/cgroup.c
+index 60085cf4072d,e8a5491be756..000000000000
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@@ -1783,11 -1924,9 +1783,9 @@@ static struct file_system_type cgroup_f
+  	.kill_sb = cgroup_kill_sb,
+  };
+  
+- static struct kobject *cgroup_kobj;
+- 
+  /**
+ - * task_cgroup_path - cgroup path of a task in the first cgroup hierarchy
+ - * @task: target task
+ + * cgroup_path - generate the path of a cgroup
+ + * @cgrp: the cgroup in question
+   * @buf: the buffer to write the path into
+   * @buflen: the length of the buffer
+   *
+@@@ -4679,18 -4995,61 +4677,29 @@@ int __init cgroup_init(void
+  	/* Add init_css_set to the hash table */
+  	key = css_set_hash(init_css_set.subsys);
+  	hash_add(css_set_table, &init_css_set.hlist, key);
+ +	BUG_ON(!init_root_id(&rootnode));
+  
+ -	BUG_ON(cgroup_setup_root(&cgrp_dfl_root, 0));
+ -
+ -	mutex_unlock(&cgroup_mutex);
+ -
+ -	for_each_subsys(ss, ssid) {
+ -		if (ss->early_init) {
+ -			struct cgroup_subsys_state *css =
+ -				init_css_set.subsys[ss->id];
+ -
+ -			css->id = cgroup_idr_alloc(&ss->css_idr, css, 1, 2,
+ -						   GFP_KERNEL);
+ -			BUG_ON(css->id < 0);
+ -		} else {
+ -			cgroup_init_subsys(ss, false);
+ -		}
+ -
+ -		list_add_tail(&init_css_set.e_cset_node[ssid],
+ -			      &cgrp_dfl_root.cgrp.e_csets[ssid]);
+ -
+ -		/*
+ -		 * Setting dfl_root subsys_mask needs to consider the
+ -		 * disabled flag and cftype registration needs kmalloc,
+ -		 * both of which aren't available during early_init.
+ -		 */
+ -		if (ss->disabled)
+ -			continue;
+ -
+ -		cgrp_dfl_root.subsys_mask |= 1 << ss->id;
+ -
+ -		if (cgroup_legacy_files_on_dfl && !ss->dfl_cftypes)
+ -			ss->dfl_cftypes = ss->legacy_cftypes;
+ -
+ -		if (!ss->dfl_cftypes)
+ -			cgrp_dfl_root_inhibit_ss_mask |= 1 << ss->id;
+ -
+ -		if (ss->dfl_cftypes == ss->legacy_cftypes) {
+ -			WARN_ON(cgroup_add_cftypes(ss, ss->dfl_cftypes));
+ -		} else {
+ -			WARN_ON(cgroup_add_dfl_cftypes(ss, ss->dfl_cftypes));
+ -			WARN_ON(cgroup_add_legacy_cftypes(ss, ss->legacy_cftypes));
+ -		}
+ -
+ -		if (ss->bind)
+ -			ss->bind(init_css_set.subsys[ssid]);
+++<<<<<<< HEAD
+ +	cgroup_kobj = kobject_create_and_add("cgroup", fs_kobj);
+ +	if (!cgroup_kobj) {
+ +		err = -ENOMEM;
+ +		goto out;
+  	}
+  
+ +	err = register_filesystem(&cgroup_fs_type);
+ +	if (err < 0) {
+ +		kobject_put(cgroup_kobj);
+ +		goto out;
+++=======
++ 	err = sysfs_create_mount_point(fs_kobj, "cgroup");
++ 	if (err)
++ 		return err;
++ 
++ 	err = register_filesystem(&cgroup_fs_type);
++ 	if (err < 0) {
++ 		sysfs_remove_mount_point(fs_kobj, "cgroup");
++ 		return err;
+++>>>>>>> f9bb48825a6b (sysfs: Create mountpoints with sysfs_create_mount_point)
+  	}
+  
+  	proc_create("cgroups", 0, NULL, &proc_cgroupstats_operations);
+* Unmerged path fs/tracefs/inode.c
+diff --git a/arch/s390/hypfs/inode.c b/arch/s390/hypfs/inode.c
+index b9e6cfb925ab..95382c23e762 100644
+--- a/arch/s390/hypfs/inode.c
++++ b/arch/s390/hypfs/inode.c
+@@ -465,8 +465,6 @@ static const struct super_operations hypfs_s_ops = {
+ 	.show_options	= hypfs_show_options,
+ };
+ 
+-static struct kobject *s390_kobj;
+-
+ static int __init hypfs_init(void)
+ {
+ 	int rc;
+@@ -486,18 +484,16 @@ static int __init hypfs_init(void)
+ 		rc = -ENODATA;
+ 		goto fail_hypfs_vm_exit;
+ 	}
+-	s390_kobj = kobject_create_and_add("s390", hypervisor_kobj);
+-	if (!s390_kobj) {
+-		rc = -ENOMEM;
++	rc = sysfs_create_mount_point(hypervisor_kobj, "s390");
++	if (rc)
+ 		goto fail_hypfs_diag0c_exit;
+-	}
+ 	rc = register_filesystem(&hypfs_type);
+ 	if (rc)
+ 		goto fail_filesystem;
+ 	return 0;
+ 
+ fail_filesystem:
+-	kobject_put(s390_kobj);
++	sysfs_remove_mount_point(hypervisor_kobj, "s390");
+ fail_hypfs_diag0c_exit:
+ 	hypfs_diag0c_exit();
+ fail_hypfs_vm_exit:
+@@ -513,7 +509,7 @@ fail_dbfs_exit:
+ static void __exit hypfs_exit(void)
+ {
+ 	unregister_filesystem(&hypfs_type);
+-	kobject_put(s390_kobj);
++	sysfs_remove_mount_point(hypervisor_kobj, "s390");
+ 	hypfs_diag0c_exit();
+ 	hypfs_vm_exit();
+ 	hypfs_diag_exit();
+* Unmerged path drivers/firmware/efi/efi.c
+* Unmerged path fs/configfs/mount.c
+diff --git a/fs/debugfs/inode.c b/fs/debugfs/inode.c
+index c7c83ff0f752..77d9e4b6f03c 100644
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@ -649,20 +649,17 @@ bool debugfs_initialized(void)
+ }
+ EXPORT_SYMBOL_GPL(debugfs_initialized);
+ 
+-
+-static struct kobject *debug_kobj;
+-
+ static int __init debugfs_init(void)
+ {
+ 	int retval;
+ 
+-	debug_kobj = kobject_create_and_add("debug", kernel_kobj);
+-	if (!debug_kobj)
+-		return -EINVAL;
++	retval = sysfs_create_mount_point(kernel_kobj, "debug");
++	if (retval)
++		return retval;
+ 
+ 	retval = register_filesystem(&debug_fs_type);
+ 	if (retval)
+-		kobject_put(debug_kobj);
++		sysfs_remove_mount_point(kernel_kobj, "debug");
+ 	else
+ 		debugfs_registered = true;
+ 
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 9a1a0ea97732..26523418881f 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1228,7 +1228,6 @@ static void fuse_fs_cleanup(void)
+ }
+ 
+ static struct kobject *fuse_kobj;
+-static struct kobject *connections_kobj;
+ 
+ static int fuse_sysfs_init(void)
+ {
+@@ -1240,11 +1239,9 @@ static int fuse_sysfs_init(void)
+ 		goto out_err;
+ 	}
+ 
+-	connections_kobj = kobject_create_and_add("connections", fuse_kobj);
+-	if (!connections_kobj) {
+-		err = -ENOMEM;
++	err = sysfs_create_mount_point(fuse_kobj, "connections");
++	if (err)
+ 		goto out_fuse_unregister;
+-	}
+ 
+ 	return 0;
+ 
+@@ -1256,7 +1253,7 @@ static int fuse_sysfs_init(void)
+ 
+ static void fuse_sysfs_cleanup(void)
+ {
+-	kobject_put(connections_kobj);
++	sysfs_remove_mount_point(fuse_kobj, "connections");
+ 	kobject_put(fuse_kobj);
+ }
+ 
+diff --git a/fs/pstore/inode.c b/fs/pstore/inode.c
+index 808c88d636e2..ca93c6cb6c6b 100644
+--- a/fs/pstore/inode.c
++++ b/fs/pstore/inode.c
+@@ -432,22 +432,18 @@ static struct file_system_type pstore_fs_type = {
+ 	.kill_sb	= pstore_kill_sb,
+ };
+ 
+-static struct kobject *pstore_kobj;
+-
+ static int __init init_pstore_fs(void)
+ {
+-	int err = 0;
++	int err;
+ 
+ 	/* Create a convenient mount point for people to access pstore */
+-	pstore_kobj = kobject_create_and_add("pstore", fs_kobj);
+-	if (!pstore_kobj) {
+-		err = -ENOMEM;
++	err = sysfs_create_mount_point(fs_kobj, "pstore");
++	if (err)
+ 		goto out;
+-	}
+ 
+ 	err = register_filesystem(&pstore_fs_type);
+ 	if (err < 0)
+-		kobject_put(pstore_kobj);
++		sysfs_remove_mount_point(fs_kobj, "pstore");
+ 
+ out:
+ 	return err;
+* Unmerged path fs/tracefs/inode.c
+* Unmerged path kernel/cgroup.c
+diff --git a/security/inode.c b/security/inode.c
+index 43ce6e19015f..617c7ce219e8 100644
+--- a/security/inode.c
++++ b/security/inode.c
+@@ -215,19 +215,17 @@ void securityfs_remove(struct dentry *dentry)
+ }
+ EXPORT_SYMBOL_GPL(securityfs_remove);
+ 
+-static struct kobject *security_kobj;
+-
+ static int __init securityfs_init(void)
+ {
+ 	int retval;
+ 
+-	security_kobj = kobject_create_and_add("security", kernel_kobj);
+-	if (!security_kobj)
+-		return -EINVAL;
++	retval = sysfs_create_mount_point(kernel_kobj, "security");
++	if (retval)
++		return retval;
+ 
+ 	retval = register_filesystem(&fs_type);
+ 	if (retval)
+-		kobject_put(security_kobj);
++		sysfs_remove_mount_point(kernel_kobj, "security");
+ 	return retval;
+ }
+ 
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index e89edc244e37..452938aca444 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -1889,7 +1889,6 @@ static struct file_system_type sel_fs_type = {
+ };
+ 
+ struct vfsmount *selinuxfs_mount;
+-static struct kobject *selinuxfs_kobj;
+ 
+ static int __init init_sel_fs(void)
+ {
+@@ -1898,13 +1897,13 @@ static int __init init_sel_fs(void)
+ 	if (!selinux_enabled)
+ 		return 0;
+ 
+-	selinuxfs_kobj = kobject_create_and_add("selinux", fs_kobj);
+-	if (!selinuxfs_kobj)
+-		return -ENOMEM;
++	err = sysfs_create_mount_point(fs_kobj, "selinux");
++	if (err)
++		return err;
+ 
+ 	err = register_filesystem(&sel_fs_type);
+ 	if (err) {
+-		kobject_put(selinuxfs_kobj);
++		sysfs_remove_mount_point(fs_kobj, "selinux");
+ 		return err;
+ 	}
+ 
+@@ -1923,7 +1922,7 @@ __initcall(init_sel_fs);
+ #ifdef CONFIG_SECURITY_SELINUX_DISABLE
+ void exit_sel_fs(void)
+ {
+-	kobject_put(selinuxfs_kobj);
++	sysfs_remove_mount_point(fs_kobj, "selinux");
+ 	kern_unmount(selinuxfs_mount);
+ 	unregister_filesystem(&sel_fs_type);
+ }
+diff --git a/security/smack/smackfs.c b/security/smack/smackfs.c
+index a3a55a253608..b6339e3b69d5 100644
+--- a/security/smack/smackfs.c
++++ b/security/smack/smackfs.c
+@@ -2124,16 +2124,16 @@ static const struct file_operations smk_revoke_subj_ops = {
+ 	.llseek		= generic_file_llseek,
+ };
+ 
+-static struct kset *smackfs_kset;
+ /**
+  * smk_init_sysfs - initialize /sys/fs/smackfs
+  *
+  */
+ static int smk_init_sysfs(void)
+ {
+-	smackfs_kset = kset_create_and_add("smackfs", NULL, fs_kobj);
+-	if (!smackfs_kset)
+-		return -ENOMEM;
++	int err;
++	err = sysfs_create_mount_point(fs_kobj, "smackfs");
++	if (err)
++		return err;
+ 	return 0;
+ }
+ 
