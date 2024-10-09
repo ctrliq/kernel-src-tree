@@ -1,0 +1,183 @@
+net: sched: don't use GFP_KERNEL under spin lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: don't use GFP_KERNEL under spin lock (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 94.51%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 2c8468dcf8303c68712f11c782d7d8724de07a73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2c8468dc.failed
+
+The new TC IDR code uses GFP_KERNEL under spin lock.  Which leads
+to:
+
+[  582.621091] BUG: sleeping function called from invalid context at ../mm/slab.h:416
+[  582.629721] in_atomic(): 1, irqs_disabled(): 0, pid: 3379, name: tc
+[  582.636939] 2 locks held by tc/3379:
+[  582.641049]  #0:  (rtnl_mutex){+.+.+.}, at: [<ffffffff910354ce>] rtnetlink_rcv_msg+0x92e/0x1400
+[  582.650958]  #1:  (&(&tn->idrinfo->lock)->rlock){+.-.+.}, at: [<ffffffff9110a5e0>] tcf_idr_create+0x2f0/0x8e0
+[  582.662217] Preemption disabled at:
+[  582.662222] [<ffffffff9110a5e0>] tcf_idr_create+0x2f0/0x8e0
+[  582.672592] CPU: 9 PID: 3379 Comm: tc Tainted: G        W       4.13.0-rc7-debug-00648-g43503a79b9f0 #287
+[  582.683432] Hardware name: Dell Inc. PowerEdge R730/072T6D, BIOS 2.3.4 11/08/2016
+[  582.691937] Call Trace:
+...
+[  582.742460]  kmem_cache_alloc+0x286/0x540
+[  582.747055]  radix_tree_node_alloc.constprop.6+0x4a/0x450
+[  582.753209]  idr_get_free_cmn+0x627/0xf80
+...
+[  582.815525]  idr_alloc_cmn+0x1a8/0x270
+...
+[  582.833804]  tcf_idr_create+0x31b/0x8e0
+...
+
+Try to preallocate the memory with idr_prealloc(GFP_KERNEL)
+(as suggested by Eric Dumazet), and change the allocation
+flags under spin lock.
+
+Fixes: 65a206c01e8e ("net/sched: Change act_api and act_xxx modules to use IDR")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2c8468dcf8303c68712f11c782d7d8724de07a73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index f6d266c05d33,a306974e2fb4..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -277,64 -293,81 +277,90 @@@ err2
+  			goto err1;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	spin_lock_init(&p->tcfc_lock);
+ +	INIT_HLIST_NODE(&p->tcfc_head);
+ +	p->tcfc_index = index ? index : tcf_hash_new_index(hinfo);
+ +	p->tcfc_tm.install = jiffies;
+ +	p->tcfc_tm.lastuse = jiffies;
+ +	p->tcfc_tm.firstuse = 0;
+ +	if (est) {
+ +		err = gen_new_estimator(&p->tcfc_bstats, p->cpu_bstats,
+ +					&p->tcfc_rate_est,
+ +					&p->tcfc_lock, NULL, est);
+++=======
++ 	spin_lock_init(&p->tcfa_lock);
++ 	/* user doesn't specify an index */
++ 	if (!index) {
++ 		idr_preload(GFP_KERNEL);
++ 		spin_lock_bh(&idrinfo->lock);
++ 		err = idr_alloc_ext(idr, NULL, &idr_index, 1, 0,
++ 				    GFP_ATOMIC);
++ 		spin_unlock_bh(&idrinfo->lock);
++ 		idr_preload_end();
+++>>>>>>> 2c8468dcf830 (net: sched: don't use GFP_KERNEL under spin lock)
+  		if (err) {
+ -err3:
+  			free_percpu(p->cpu_qstats);
+  			goto err2;
+  		}
+++<<<<<<< HEAD
+++=======
++ 		p->tcfa_index = idr_index;
++ 	} else {
++ 		idr_preload(GFP_KERNEL);
++ 		spin_lock_bh(&idrinfo->lock);
++ 		err = idr_alloc_ext(idr, NULL, NULL, index, index + 1,
++ 				    GFP_ATOMIC);
++ 		spin_unlock_bh(&idrinfo->lock);
++ 		idr_preload_end();
++ 		if (err)
++ 			goto err3;
++ 		p->tcfa_index = index;
+++>>>>>>> 2c8468dcf830 (net: sched: don't use GFP_KERNEL under spin lock)
+  	}
+  
+ -	p->tcfa_tm.install = jiffies;
+ -	p->tcfa_tm.lastuse = jiffies;
+ -	p->tcfa_tm.firstuse = 0;
+ -	if (est) {
+ -		err = gen_new_estimator(&p->tcfa_bstats, p->cpu_bstats,
+ -					&p->tcfa_rate_est,
+ -					&p->tcfa_lock, NULL, est);
+ -		if (err) {
+ -			goto err3;
+ -		}
+ -	}
+ -
+ -	p->idrinfo = idrinfo;
+ -	p->ops = ops;
+ -	INIT_LIST_HEAD(&p->list);
+ -	*a = p;
+ +	a->priv = (void *) p;
+  	return 0;
+  }
+ -EXPORT_SYMBOL(tcf_idr_create);
+ +EXPORT_SYMBOL(tcf_hash_create);
+  
+ -void tcf_idr_insert(struct tc_action_net *tn, struct tc_action *a)
+ +void tcf_hash_insert(struct tc_action *a)
+  {
+ -	struct tcf_idrinfo *idrinfo = tn->idrinfo;
+ +	struct tcf_common *p = a->priv;
+ +	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+ +	unsigned int h = tcf_hash(p->tcfc_index, hinfo->hmask);
+  
+ -	spin_lock_bh(&idrinfo->lock);
+ -	idr_replace_ext(&idrinfo->action_idr, a, a->tcfa_index);
+ -	spin_unlock_bh(&idrinfo->lock);
+ +	spin_lock_bh(&hinfo->lock);
+ +	hlist_add_head(&p->tcfc_head, &hinfo->htab[h]);
+ +	spin_unlock_bh(&hinfo->lock);
+  }
+ -EXPORT_SYMBOL(tcf_idr_insert);
+ +EXPORT_SYMBOL(tcf_hash_insert);
+  
+ -void tcf_idrinfo_destroy(const struct tc_action_ops *ops,
+ -			 struct tcf_idrinfo *idrinfo)
+ +static void tcf_hashinfo_destroy(const struct tc_action_ops *ops)
+  {
+ -	struct idr *idr = &idrinfo->action_idr;
+ -	struct tc_action *p;
+ -	int ret;
+ -	unsigned long id = 1;
+ +	struct tcf_hashinfo *hinfo = ops->hinfo;
+ +	struct tc_action a = {
+ +		.ops = ops,
+ +	};
+ +	int i;
+  
+ -	idr_for_each_entry_ext(idr, p, id) {
+ -		ret = __tcf_idr_release(p, false, true);
+ -		if (ret == ACT_P_DELETED)
+ -			module_put(ops->owner);
+ -		else if (ret < 0)
+ -			return;
+ +	for (i = 0; i < hinfo->hmask + 1; i++) {
+ +		struct tcf_common *p;
+ +		struct hlist_node *n;
+ +
+ +		hlist_for_each_entry_safe(p, n, &hinfo->htab[i], tcfc_head) {
+ +			int ret;
+ +
+ +			a.priv = p;
+ +			ret = __tcf_hash_release(&a, false, true);
+ +			if (ret == ACT_P_DELETED)
+ +				module_put(ops->owner);
+ +			else if (ret < 0)
+ +				return;
+ +		}
+  	}
+ -	idr_destroy(&idrinfo->action_idr);
+ +	kfree(hinfo->htab);
+  }
+ -EXPORT_SYMBOL(tcf_idrinfo_destroy);
+  
+  static LIST_HEAD(act_base);
+  static DEFINE_RWLOCK(act_mod_lock);
+* Unmerged path net/sched/act_api.c
