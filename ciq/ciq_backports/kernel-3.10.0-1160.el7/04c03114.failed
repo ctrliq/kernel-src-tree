@@ -1,0 +1,96 @@
+tcp: clear icsk_backoff in tcp_write_queue_purge()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 04c03114be82194d4a4858d41dba8e286ad1787c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/04c03114.failed
+
+soukjin bae reported a crash in tcp_v4_err() handling
+ICMP_DEST_UNREACH after tcp_write_queue_head(sk)
+returned a NULL pointer.
+
+Current logic should have prevented this :
+
+  if (seq != tp->snd_una  || !icsk->icsk_retransmits ||
+      !icsk->icsk_backoff || fastopen)
+      break;
+
+Problem is the write queue might have been purged
+and icsk_backoff has not been cleared.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: soukjin bae <soukjin.bae@samsung.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 04c03114be82194d4a4858d41dba8e286ad1787c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp.c
+diff --cc net/ipv4/tcp.c
+index 5538c769a216,cf3c5095c10e..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -2184,6 -2498,39 +2184,42 @@@ static inline bool tcp_need_reset(int s
+  		TCPF_FIN_WAIT2 | TCPF_SYN_RECV);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcp_rtx_queue_purge(struct sock *sk)
++ {
++ 	struct rb_node *p = rb_first(&sk->tcp_rtx_queue);
++ 
++ 	while (p) {
++ 		struct sk_buff *skb = rb_to_skb(p);
++ 
++ 		p = rb_next(p);
++ 		/* Since we are deleting whole queue, no need to
++ 		 * list_del(&skb->tcp_tsorted_anchor)
++ 		 */
++ 		tcp_rtx_queue_unlink(skb, sk);
++ 		sk_wmem_free_skb(sk, skb);
++ 	}
++ }
++ 
++ void tcp_write_queue_purge(struct sock *sk)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	tcp_chrono_stop(sk, TCP_CHRONO_BUSY);
++ 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL) {
++ 		tcp_skb_tsorted_anchor_cleanup(skb);
++ 		sk_wmem_free_skb(sk, skb);
++ 	}
++ 	tcp_rtx_queue_purge(sk);
++ 	INIT_LIST_HEAD(&tcp_sk(sk)->tsorted_sent_queue);
++ 	sk_mem_reclaim(sk);
++ 	tcp_clear_all_retrans_hints(tcp_sk(sk));
++ 	tcp_sk(sk)->packets_out = 0;
++ 	inet_csk(sk)->icsk_backoff = 0;
++ }
++ 
+++>>>>>>> 04c03114be82 (tcp: clear icsk_backoff in tcp_write_queue_purge())
+  int tcp_disconnect(struct sock *sk, int flags)
+  {
+  	struct inet_sock *inet = inet_sk(sk);
+@@@ -2224,12 -2573,12 +2260,11 @@@
+  	sk->sk_shutdown = 0;
+  	sock_reset_flag(sk, SOCK_DONE);
+  	tp->srtt_us = 0;
+ -	tp->rcv_rtt_last_tsecr = 0;
+ -	tp->write_seq += tp->max_window + 2;
+ -	if (tp->write_seq == 0)
+ +	if ((tp->write_seq += tp->max_window + 2) == 0)
+  		tp->write_seq = 1;
+- 	icsk->icsk_backoff = 0;
+  	tp->snd_cwnd = 2;
+  	icsk->icsk_probes_out = 0;
+ +	tp->packets_out = 0;
+  	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+  	tp->snd_cwnd_cnt = 0;
+  	tp->window_clamp = 0;
+* Unmerged path net/ipv4/tcp.c
