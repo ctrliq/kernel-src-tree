@@ -1,0 +1,458 @@
+target: Fix remote-port TMR ABORT + se_cmd fabric stop
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Fix remote-port TMR ABORT + se_cmd fabric stop (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.00%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 0f4a943168f31d29a1701908931acaba518b131a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0f4a9431.failed
+
+To address the bug where fabric driver level shutdown
+of se_cmd occurs at the same time when TMR CMD_T_ABORTED
+is happening resulting in a -1 ->cmd_kref, this patch
+adds a CMD_T_FABRIC_STOP bit that is used to determine
+when TMR + driver I_T nexus shutdown is happening
+concurrently.
+
+It changes target_sess_cmd_list_set_waiting() to obtain
+se_cmd->cmd_kref + set CMD_T_FABRIC_STOP, and drop local
+reference in target_wait_for_sess_cmds() and invoke extra
+target_put_sess_cmd() during Task Aborted Status (TAS)
+when necessary.
+
+Also, it adds a new target_wait_free_cmd() wrapper around
+transport_wait_for_tasks() for the special case within
+transport_generic_free_cmd() to set CMD_T_FABRIC_STOP,
+and is now aware of CMD_T_ABORTED + CMD_T_TAS status
+bits to know when an extra transport_put_cmd() during
+TAS is required.
+
+Note transport_generic_free_cmd() is expected to block on
+cmd->cmd_wait_comp in order to follow what iscsi-target
+expects during iscsi_conn context se_cmd shutdown.
+
+	Cc: Quinn Tran <quinn.tran@qlogic.com>
+	Cc: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Cc: Mike Christie <mchristi@redhat.com>
+	Cc: stable@vger.kernel.org # 3.10+
+	Signed-off-by: Nicholas Bellinger <nab@daterainc.com>
+(cherry picked from commit 0f4a943168f31d29a1701908931acaba518b131a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tmr.c
+#	drivers/target/target_core_transport.c
+diff --cc drivers/target/target_core_tmr.c
+index adb8016955c4,82a663ba9800..000000000000
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@@ -78,16 -75,18 +78,29 @@@ void core_tmr_release_req(struct se_tmr
+  	kfree(tmr);
+  }
+  
+++<<<<<<< HEAD
+ +static void core_tmr_handle_tas_abort(
+ +	struct se_node_acl *tmr_nacl,
+ +	struct se_cmd *cmd,
+ +	int tas)
+++=======
++ static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  {
+- 	bool remove = true;
++ 	unsigned long flags;
++ 	bool remove = true, send_tas;
+  	/*
+  	 * TASK ABORTED status (TAS) bit support
+  	 */
+++<<<<<<< HEAD
+ +	if ((tmr_nacl && (tmr_nacl != cmd->se_sess->se_node_acl)) && tas) {
+++=======
++ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
++ 	send_tas = (cmd->transport_state & CMD_T_TAS);
++ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
++ 
++ 	if (send_tas) {
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  		remove = false;
+  		transport_send_task_abort(cmd);
+  	}
+@@@ -110,6 -109,46 +123,49 @@@ static int target_check_cdb_and_preempt
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __target_check_io_state(struct se_cmd *se_cmd,
++ 				    struct se_session *tmr_sess, int tas)
++ {
++ 	struct se_session *sess = se_cmd->se_sess;
++ 
++ 	assert_spin_locked(&sess->sess_cmd_lock);
++ 	WARN_ON_ONCE(!irqs_disabled());
++ 	/*
++ 	 * If command already reached CMD_T_COMPLETE state within
++ 	 * target_complete_cmd() or CMD_T_FABRIC_STOP due to shutdown,
++ 	 * this se_cmd has been passed to fabric driver and will
++ 	 * not be aborted.
++ 	 *
++ 	 * Otherwise, obtain a local se_cmd->cmd_kref now for TMR
++ 	 * ABORT_TASK + LUN_RESET for CMD_T_ABORTED processing as
++ 	 * long as se_cmd->cmd_kref is still active unless zero.
++ 	 */
++ 	spin_lock(&se_cmd->t_state_lock);
++ 	if (se_cmd->transport_state & (CMD_T_COMPLETE | CMD_T_FABRIC_STOP)) {
++ 		pr_debug("Attempted to abort io tag: %llu already complete or"
++ 			" fabric stop, skipping\n", se_cmd->tag);
++ 		spin_unlock(&se_cmd->t_state_lock);
++ 		return false;
++ 	}
++ 	if (sess->sess_tearing_down || se_cmd->cmd_wait_set) {
++ 		pr_debug("Attempted to abort io tag: %llu already shutdown,"
++ 			" skipping\n", se_cmd->tag);
++ 		spin_unlock(&se_cmd->t_state_lock);
++ 		return false;
++ 	}
++ 	se_cmd->transport_state |= CMD_T_ABORTED;
++ 
++ 	if ((tmr_sess != se_cmd->se_sess) && tas)
++ 		se_cmd->transport_state |= CMD_T_TAS;
++ 
++ 	spin_unlock(&se_cmd->t_state_lock);
++ 
++ 	return kref_get_unless_zero(&se_cmd->cmd_kref);
++ }
++ 
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  void core_tmr_abort_task(
+  	struct se_device *dev,
+  	struct se_tmr_req *tmr,
+@@@ -133,21 -172,15 +189,25 @@@
+  		if (tmr->ref_task_tag != ref_tag)
+  			continue;
+  
+ -		printk("ABORT_TASK: Found referenced %s task_tag: %llu\n",
+ +		printk("ABORT_TASK: Found referenced %s task_tag: %u\n",
+  			se_cmd->se_tfo->get_fabric_name(), ref_tag);
+  
+++<<<<<<< HEAD
+ +		spin_lock(&se_cmd->t_state_lock);
+ +		if (se_cmd->transport_state & CMD_T_COMPLETE) {
+ +			printk("ABORT_TASK: ref_tag: %u already complete, skipping\n", ref_tag);
+ +			spin_unlock(&se_cmd->t_state_lock);
+++=======
++ 		if (!__target_check_io_state(se_cmd, se_sess, 0)) {
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  			spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ -			target_put_sess_cmd(se_cmd);
+  			goto out;
+  		}
+ +		se_cmd->transport_state |= CMD_T_ABORTED;
+ +		spin_unlock(&se_cmd->t_state_lock);
+ +
+  		list_del_init(&se_cmd->se_cmd_list);
+ +		kref_get(&se_cmd->cmd_kref);
+  		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+  
+  		cancel_work_sync(&se_cmd->work);
+@@@ -299,6 -342,16 +367,19 @@@ static void core_tmr_drain_state_list
+  		if (prout_cmd == cmd)
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		sess = cmd->se_sess;
++ 		if (WARN_ON_ONCE(!sess))
++ 			continue;
++ 
++ 		spin_lock(&sess->sess_cmd_lock);
++ 		rc = __target_check_io_state(cmd, tmr_sess, tas);
++ 		spin_unlock(&sess->sess_cmd_lock);
++ 		if (!rc)
++ 			continue;
++ 
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  		list_move_tail(&cmd->state_list, &drain_task_list);
+  		cmd->state_active = false;
+  	}
+@@@ -330,16 -383,11 +411,21 @@@
+  		 * loop above, but we do it down here given that
+  		 * cancel_work_sync may block.
+  		 */
+ -		cancel_work_sync(&cmd->work);
+ -		transport_wait_for_tasks(cmd);
+ +		if (cmd->t_state == TRANSPORT_COMPLETE)
+ +			cancel_work_sync(&cmd->work);
+ +
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(&cmd->t_state_lock, flags);
+ +		target_stop_cmd(cmd, &flags);
+ +
+ +		cmd->transport_state |= CMD_T_ABORTED;
+ +		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+  
+ +		core_tmr_handle_tas_abort(tmr_nacl, cmd, tas);
+++=======
++ 		core_tmr_handle_tas_abort(cmd, tas);
++ 		target_put_sess_cmd(cmd);
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  	}
+  }
+  
+diff --cc drivers/target/target_core_transport.c
+index 68bc47c2e404,3441b159e306..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -2474,19 -2431,33 +2474,40 @@@ static void transport_write_pending_qf(
+  	}
+  }
+  
++ static bool
++ __transport_wait_for_tasks(struct se_cmd *, bool, bool *, bool *,
++ 			   unsigned long *flags);
++ 
++ static void target_wait_free_cmd(struct se_cmd *cmd, bool *aborted, bool *tas)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
++ 	__transport_wait_for_tasks(cmd, true, aborted, tas, &flags);
++ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
++ }
++ 
+  int transport_generic_free_cmd(struct se_cmd *cmd, int wait_for_tasks)
+  {
+ +	unsigned long flags;
+  	int ret = 0;
++ 	bool aborted = false, tas = false;
+  
+  	if (!(cmd->se_cmd_flags & SCF_SE_LUN_CMD)) {
+  		if (wait_for_tasks && (cmd->se_cmd_flags & SCF_SCSI_TMR_CDB))
+++<<<<<<< HEAD
+ +			 transport_wait_for_tasks(cmd);
+ +
+ +		ret = transport_release_cmd(cmd);
+++=======
++ 			target_wait_free_cmd(cmd, &aborted, &tas);
++ 
++ 		if (!aborted || tas)
++ 			ret = transport_put_cmd(cmd);
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  	} else {
+  		if (wait_for_tasks)
+- 			transport_wait_for_tasks(cmd);
++ 			target_wait_free_cmd(cmd, &aborted, &tas);
+  		/*
+  		 * Handle WRITE failure case where transport_generic_new_cmd()
+  		 * has already added se_cmd to state_list, but fabric has
+@@@ -2546,20 -2536,32 +2580,42 @@@ static void target_release_cmd_kref(str
+  {
+  	struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
+  	struct se_session *se_sess = se_cmd->se_sess;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long flags;
++ 	bool fabric_stop;
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  
+ -	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+  	if (list_empty(&se_cmd->se_cmd_list)) {
+ -		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ -		target_free_cmd_mem(se_cmd);
+ +		spin_unlock(&se_sess->sess_cmd_lock);
+  		se_cmd->se_tfo->release_cmd(se_cmd);
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	if (se_sess->sess_tearing_down && se_cmd->cmd_wait_set) {
+ +		spin_unlock(&se_sess->sess_cmd_lock);
+ +		complete(&se_cmd->cmd_wait_comp);
+ +		return;
+ +	}
+ +	list_del(&se_cmd->se_cmd_list);
+ +	spin_unlock(&se_sess->sess_cmd_lock);
+++=======
++ 
++ 	spin_lock(&se_cmd->t_state_lock);
++ 	fabric_stop = (se_cmd->transport_state & CMD_T_FABRIC_STOP);
++ 	spin_unlock(&se_cmd->t_state_lock);
++ 
++ 	if (se_cmd->cmd_wait_set || fabric_stop) {
++ 		list_del_init(&se_cmd->se_cmd_list);
++ 		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++ 		target_free_cmd_mem(se_cmd);
++ 		complete(&se_cmd->cmd_wait_comp);
++ 		return;
++ 	}
++ 	list_del_init(&se_cmd->se_cmd_list);
++ 	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  
+ -	target_free_cmd_mem(se_cmd);
+  	se_cmd->se_tfo->release_cmd(se_cmd);
+  }
+  
+@@@ -2635,33 -2655,64 +2709,85 @@@ void target_wait_for_sess_cmds(struct s
+  }
+  EXPORT_SYMBOL(target_wait_for_sess_cmds);
+  
+ -void transport_clear_lun_ref(struct se_lun *lun)
+ +static int transport_clear_lun_ref_thread(void *p)
+  {
+ +	struct se_lun *lun = p;
+ +
+  	percpu_ref_kill(&lun->lun_ref);
+ +
+  	wait_for_completion(&lun->lun_ref_comp);
+ +	complete(&lun->lun_shutdown_comp);
+ +
+ +	return 0;
+ +}
+ +
+ +int transport_clear_lun_ref(struct se_lun *lun)
+ +{
+ +	struct task_struct *kt;
+ +
+ +	kt = kthread_run(transport_clear_lun_ref_thread, lun,
+ +			"tcm_cl_%u", lun->unpacked_lun);
+ +	if (IS_ERR(kt)) {
+ +		pr_err("Unable to start clear_lun thread\n");
+ +		return PTR_ERR(kt);
+ +	}
+ +	wait_for_completion(&lun->lun_shutdown_comp);
+ +
+ +	return 0;
+  }
+  
++ static bool
++ __transport_wait_for_tasks(struct se_cmd *cmd, bool fabric_stop,
++ 			   bool *aborted, bool *tas, unsigned long *flags)
++ 	__releases(&cmd->t_state_lock)
++ 	__acquires(&cmd->t_state_lock)
++ {
++ 
++ 	assert_spin_locked(&cmd->t_state_lock);
++ 	WARN_ON_ONCE(!irqs_disabled());
++ 
++ 	if (fabric_stop)
++ 		cmd->transport_state |= CMD_T_FABRIC_STOP;
++ 
++ 	if (cmd->transport_state & CMD_T_ABORTED)
++ 		*aborted = true;
++ 
++ 	if (cmd->transport_state & CMD_T_TAS)
++ 		*tas = true;
++ 
++ 	if (!(cmd->se_cmd_flags & SCF_SE_LUN_CMD) &&
++ 	    !(cmd->se_cmd_flags & SCF_SCSI_TMR_CDB))
++ 		return false;
++ 
++ 	if (!(cmd->se_cmd_flags & SCF_SUPPORTED_SAM_OPCODE) &&
++ 	    !(cmd->se_cmd_flags & SCF_SCSI_TMR_CDB))
++ 		return false;
++ 
++ 	if (!(cmd->transport_state & CMD_T_ACTIVE))
++ 		return false;
++ 
++ 	if (fabric_stop && *aborted)
++ 		return false;
++ 
++ 	cmd->transport_state |= CMD_T_STOP;
++ 
++ 	pr_debug("wait_for_tasks: Stopping %p ITT: 0x%08llx i_state: %d,"
++ 		 " t_state: %d, CMD_T_STOP\n", cmd, cmd->tag,
++ 		 cmd->se_tfo->get_cmd_state(cmd), cmd->t_state);
++ 
++ 	spin_unlock_irqrestore(&cmd->t_state_lock, *flags);
++ 
++ 	wait_for_completion(&cmd->t_transport_stop_comp);
++ 
++ 	spin_lock_irqsave(&cmd->t_state_lock, *flags);
++ 	cmd->transport_state &= ~(CMD_T_ACTIVE | CMD_T_STOP);
++ 
++ 	pr_debug("wait_for_tasks: Stopped wait_for_completion(&cmd->"
++ 		 "t_transport_stop_comp) for ITT: 0x%08llx\n", cmd->tag);
++ 
++ 	return true;
++ }
++ 
+  /**
+   * transport_wait_for_tasks - wait for completion to occur
+   * @cmd:	command to wait
+@@@ -2672,46 -2723,13 +2798,54 @@@
+  bool transport_wait_for_tasks(struct se_cmd *cmd)
+  {
+  	unsigned long flags;
++ 	bool ret, aborted = false, tas = false;
+  
+  	spin_lock_irqsave(&cmd->t_state_lock, flags);
+++<<<<<<< HEAD
+ +	if (!(cmd->se_cmd_flags & SCF_SE_LUN_CMD) &&
+ +	    !(cmd->se_cmd_flags & SCF_SCSI_TMR_CDB)) {
+ +		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +		return false;
+ +	}
+ +
+ +	if (!(cmd->se_cmd_flags & SCF_SUPPORTED_SAM_OPCODE) &&
+ +	    !(cmd->se_cmd_flags & SCF_SCSI_TMR_CDB)) {
+ +		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +		return false;
+ +	}
+ +
+ +	if (!(cmd->transport_state & CMD_T_ACTIVE)) {
+ +		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +		return false;
+ +	}
+ +
+ +	cmd->transport_state |= CMD_T_STOP;
+ +
+ +	pr_debug("wait_for_tasks: Stopping %p ITT: 0x%08x"
+ +		" i_state: %d, t_state: %d, CMD_T_STOP\n",
+ +		cmd, cmd->se_tfo->get_task_tag(cmd),
+ +		cmd->se_tfo->get_cmd_state(cmd), cmd->t_state);
+ +
+ +	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +
+ +	wait_for_completion(&cmd->t_transport_stop_comp);
+ +
+ +	spin_lock_irqsave(&cmd->t_state_lock, flags);
+ +	cmd->transport_state &= ~(CMD_T_ACTIVE | CMD_T_STOP);
+ +
+ +	pr_debug("wait_for_tasks: Stopped wait_for_completion("
+ +		"&cmd->t_transport_stop_comp) for ITT: 0x%08x\n",
+ +		cmd->se_tfo->get_task_tag(cmd));
+ +
+ +	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +
+ +	return true;
+++=======
++ 	ret = __transport_wait_for_tasks(cmd, false, &aborted, &tas, &flags);
++ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
++ 
++ 	return ret;
+++>>>>>>> 0f4a943168f3 (target: Fix remote-port TMR ABORT + se_cmd fabric stop)
+  }
+  EXPORT_SYMBOL(transport_wait_for_tasks);
+  
+* Unmerged path drivers/target/target_core_tmr.c
+* Unmerged path drivers/target/target_core_transport.c
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 6a27f0cf6579..2372f8dfcabb 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -534,6 +534,8 @@ struct se_cmd {
+ #define CMD_T_DEV_ACTIVE	(1 << 7)
+ #define CMD_T_REQUEST_STOP	(1 << 8)
+ #define CMD_T_BUSY		(1 << 9)
++#define CMD_T_TAS		(1 << 10)
++#define CMD_T_FABRIC_STOP	(1 << 11)
+ 	spinlock_t		t_state_lock;
+ 	struct completion	t_transport_stop_comp;
+ 
