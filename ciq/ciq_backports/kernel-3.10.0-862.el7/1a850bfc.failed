@@ -1,0 +1,353 @@
+qed: VFs to try utilizing the doorbell bar
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 1a850bfc9e71871599ddbc0d4d4cffa2dc409855
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1a850bfc.failed
+
+VFs are currently not mapping their doorbell bar, instead relying
+on the small doorbell window they have in their limited regview bar.
+
+In order to increase the number of possible Tx connections [queues]
+employeed by VF past 16, we need to start using the doorbell bar if
+one such is exposed - VF would communicate this fact to PF which would
+return the size-bar internally configured into chip, according to
+which the VF would decide whether to actually utilize the doorbell
+bar.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a850bfc9e71871599ddbc0d4d4cffa2dc409855)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed.h
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.c
+#	drivers/net/ethernet/qlogic/qed/qed_vf.c
+#	drivers/net/ethernet/qlogic/qed/qed_vf.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed.h
+index 848905e401aa,d7afc42f766c..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@@ -389,6 -412,17 +389,20 @@@ struct qed_fw_data 
+  	u32			init_ops_size;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum BAR_ID {
++ 	BAR_ID_0,		/* used for GRC */
++ 	BAR_ID_1		/* Used for doorbells */
++ };
++ 
++ #define DRV_MODULE_VERSION		      \
++ 	__stringify(QED_MAJOR_VERSION) "."    \
++ 	__stringify(QED_MINOR_VERSION) "."    \
++ 	__stringify(QED_REVISION_VERSION) "." \
++ 	__stringify(QED_ENGINEERING_VERSION)
++ 
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  struct qed_simd_fp_handler {
+  	void	*token;
+  	void	(*func)(void *);
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.c
+index c231e788de76,e39ad22947cf..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@@ -1419,6 -1471,8 +1473,11 @@@ static u8 qed_iov_vf_mbx_acquire_resc(s
+  	p_resp->num_vlan_filters = min_t(u8, p_vf->num_vlan_filters,
+  					 p_req->num_vlan_filters);
+  
+++<<<<<<< HEAD
+++=======
++ 	qed_iov_vf_mbx_acquire_resc_cids(p_hwfn, p_ptt, p_vf, p_req, p_resp);
++ 
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  	/* This isn't really needed/enforced, but some legacy VFs might depend
+  	 * on the correct filling of this field.
+  	 */
+@@@ -1561,6 -1618,15 +1620,18 @@@ static void qed_iov_vf_mbx_acquire(stru
+  	if (p_hwfn->cdev->num_hwfns > 1)
+  		pfdev_info->capabilities |= PFVF_ACQUIRE_CAP_100G;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Share our ability to use multiple queue-ids only with VFs
++ 	 * that request it.
++ 	 */
++ 	if (req->vfdev_info.capabilities & VFPF_ACQUIRE_CAP_QUEUE_QIDS)
++ 		pfdev_info->capabilities |= PFVF_ACQUIRE_CAP_QUEUE_QIDS;
++ 
++ 	/* Share the sizes of the bars with VF */
++ 	resp->pfdev_info.bar_size = qed_iov_vf_db_bar_size(p_hwfn, p_ptt);
++ 
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  	qed_iov_vf_mbx_acquire_stats(p_hwfn, &pfdev_info->stats_info);
+  
+  	memcpy(pfdev_info->port_mac, p_hwfn->hw_info.hw_mac_addr, ETH_ALEN);
+diff --cc drivers/net/ethernet/qlogic/qed/qed_vf.c
+index f2954eb03b41,cb81c357bf62..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@@ -153,6 -153,77 +153,80 @@@ static int qed_send_msg2pf(struct qed_h
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qed_vf_pf_add_qid(struct qed_hwfn *p_hwfn,
++ 			      struct qed_queue_cid *p_cid)
++ {
++ 	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
++ 	struct vfpf_qid_tlv *p_qid_tlv;
++ 
++ 	/* Only add QIDs for the queue if it was negotiated with PF */
++ 	if (!(p_iov->acquire_resp.pfdev_info.capabilities &
++ 	      PFVF_ACQUIRE_CAP_QUEUE_QIDS))
++ 		return;
++ 
++ 	p_qid_tlv = qed_add_tlv(p_hwfn, &p_iov->offset,
++ 				CHANNEL_TLV_QID, sizeof(*p_qid_tlv));
++ 	p_qid_tlv->qid = p_cid->qid_usage_idx;
++ }
++ 
++ int _qed_vf_pf_release(struct qed_hwfn *p_hwfn, bool b_final)
++ {
++ 	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
++ 	struct pfvf_def_resp_tlv *resp;
++ 	struct vfpf_first_tlv *req;
++ 	u32 size;
++ 	int rc;
++ 
++ 	/* clear mailbox and prep first tlv */
++ 	req = qed_vf_pf_prep(p_hwfn, CHANNEL_TLV_RELEASE, sizeof(*req));
++ 
++ 	/* add list termination tlv */
++ 	qed_add_tlv(p_hwfn, &p_iov->offset,
++ 		    CHANNEL_TLV_LIST_END, sizeof(struct channel_list_end_tlv));
++ 
++ 	resp = &p_iov->pf2vf_reply->default_resp;
++ 	rc = qed_send_msg2pf(p_hwfn, &resp->hdr.status, sizeof(*resp));
++ 
++ 	if (!rc && resp->hdr.status != PFVF_STATUS_SUCCESS)
++ 		rc = -EAGAIN;
++ 
++ 	qed_vf_pf_req_end(p_hwfn, rc);
++ 	if (!b_final)
++ 		return rc;
++ 
++ 	p_hwfn->b_int_enabled = 0;
++ 
++ 	if (p_iov->vf2pf_request)
++ 		dma_free_coherent(&p_hwfn->cdev->pdev->dev,
++ 				  sizeof(union vfpf_tlvs),
++ 				  p_iov->vf2pf_request,
++ 				  p_iov->vf2pf_request_phys);
++ 	if (p_iov->pf2vf_reply)
++ 		dma_free_coherent(&p_hwfn->cdev->pdev->dev,
++ 				  sizeof(union pfvf_tlvs),
++ 				  p_iov->pf2vf_reply, p_iov->pf2vf_reply_phys);
++ 
++ 	if (p_iov->bulletin.p_virt) {
++ 		size = sizeof(struct qed_bulletin_content);
++ 		dma_free_coherent(&p_hwfn->cdev->pdev->dev,
++ 				  size,
++ 				  p_iov->bulletin.p_virt, p_iov->bulletin.phys);
++ 	}
++ 
++ 	kfree(p_hwfn->vf_iov_info);
++ 	p_hwfn->vf_iov_info = NULL;
++ 
++ 	return rc;
++ }
++ 
++ int qed_vf_pf_release(struct qed_hwfn *p_hwfn)
++ {
++ 	return _qed_vf_pf_release(p_hwfn, true);
++ }
++ 
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  #define VF_ACQUIRE_THRESH 3
+  static void qed_vf_pf_acquire_reduce_resc(struct qed_hwfn *p_hwfn,
+  					  struct vf_pf_resc_request *p_req,
+diff --cc drivers/net/ethernet/qlogic/qed/qed_vf.h
+index 105c0edd2a01,b8ce4bef8c94..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+@@@ -113,6 -114,17 +113,20 @@@ struct vfpf_acquire_tlv 
+  	struct vf_pf_vfdev_info {
+  #define VFPF_ACQUIRE_CAP_PRE_FP_HSI     (1 << 0) /* VF pre-FP hsi version */
+  #define VFPF_ACQUIRE_CAP_100G		(1 << 1) /* VF can support 100g */
+++<<<<<<< HEAD
+++=======
++ 	/* A requirement for supporting multi-Tx queues on a single queue-zone,
++ 	 * VF would pass qids as additional information whenever passing queue
++ 	 * references.
++ 	 */
++ #define VFPF_ACQUIRE_CAP_QUEUE_QIDS     BIT(2)
++ 
++ 	/* The VF is using the physical bar. While this is mostly internal
++ 	 * to the VF, might affect the number of CIDs supported assuming
++ 	 * QUEUE_QIDS is set.
++ 	 */
++ #define VFPF_ACQUIRE_CAP_PHYSICAL_BAR   BIT(3)
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  		u64 capabilities;
+  		u8 fw_major;
+  		u8 fw_minor;
+@@@ -585,6 -662,19 +600,22 @@@ struct qed_vf_iov 
+  	 * this has to be propagated as it affects the fastpath.
+  	 */
+  	bool b_pre_fp_hsi;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Current day VFs are passing the SBs physical address on vport
++ 	 * start, and as they lack an IGU mapping they need to store the
++ 	 * addresses of previously registered SBs.
++ 	 * Even if we were to change configuration flow, due to backward
++ 	 * compatibility [with older PFs] we'd still need to store these.
++ 	 */
++ 	struct qed_sb_info *sbs_info[PFVF_MAX_SBS_PER_VF];
++ 
++ 	/* Determines whether VF utilizes doorbells via limited register
++ 	 * bar or via the doorbell bar.
++ 	 */
++ 	bool b_doorbell_bar;
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  };
+  
+  #ifdef CONFIG_QED_SRIOV
+@@@ -872,6 -980,11 +903,14 @@@ void __qed_vf_get_link_caps(struct qed_
+  			    struct qed_bulletin_content *p_bulletin);
+  
+  void qed_iov_vf_task(struct work_struct *work);
+++<<<<<<< HEAD
+++=======
++ void qed_vf_set_vf_start_tunn_update_param(struct qed_tunnel_info *p_tun);
++ int qed_vf_pf_tunnel_param_update(struct qed_hwfn *p_hwfn,
++ 				  struct qed_tunnel_info *p_tunn);
++ 
++ u32 qed_vf_hw_bar_size(struct qed_hwfn *p_hwfn, enum BAR_ID bar_id);
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  #else
+  static inline void qed_vf_get_link_params(struct qed_hwfn *p_hwfn,
+  					  struct qed_mcp_link_params *params)
+@@@ -1033,6 -1150,24 +1072,27 @@@ __qed_vf_get_link_caps(struct qed_hwfn 
+  static inline void qed_iov_vf_task(struct work_struct *work)
+  {
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void
++ qed_vf_set_vf_start_tunn_update_param(struct qed_tunnel_info *p_tun)
++ {
++ }
++ 
++ static inline int qed_vf_pf_tunnel_param_update(struct qed_hwfn *p_hwfn,
++ 						struct qed_tunnel_info *p_tunn)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static inline u32
++ qed_vf_hw_bar_size(struct qed_hwfn  *p_hwfn,
++ 		   enum BAR_ID bar_id)
++ {
++ 	return 0;
++ }
+++>>>>>>> 1a850bfc9e71 (qed: VFs to try utilizing the doorbell bar)
+  #endif
+  
+  #endif
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed.h
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev.c b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 1b5a3d62b9f3..c26458c42d68 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -69,12 +69,6 @@ static DEFINE_SPINLOCK(qm_lock);
+ #define QED_MIN_DPIS            (4)
+ #define QED_MIN_PWM_REGION      (QED_WID_SIZE * QED_MIN_DPIS)
+ 
+-/* API common to all protocols */
+-enum BAR_ID {
+-	BAR_ID_0,       /* used for GRC */
+-	BAR_ID_1        /* Used for doorbells */
+-};
+-
+ static u32 qed_hw_bar_size(struct qed_hwfn *p_hwfn,
+ 			   struct qed_ptt *p_ptt, enum BAR_ID bar_id)
+ {
+@@ -83,7 +77,7 @@ static u32 qed_hw_bar_size(struct qed_hwfn *p_hwfn,
+ 	u32 val;
+ 
+ 	if (IS_VF(p_hwfn->cdev))
+-		return 1 << 17;
++		return qed_vf_hw_bar_size(p_hwfn, bar_id);
+ 
+ 	val = qed_rd(p_hwfn, p_ptt, bar_reg);
+ 	if (val)
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_main.c b/drivers/net/ethernet/qlogic/qed/qed_main.c
+index 545e79f7504c..b632a339f428 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -121,7 +121,7 @@ static void qed_free_pci(struct qed_dev *cdev)
+ {
+ 	struct pci_dev *pdev = cdev->pdev;
+ 
+-	if (cdev->doorbells)
++	if (cdev->doorbells && cdev->db_size)
+ 		iounmap(cdev->doorbells);
+ 	if (cdev->regview)
+ 		iounmap(cdev->regview);
+@@ -205,16 +205,24 @@ static int qed_init_pci(struct qed_dev *cdev, struct pci_dev *pdev)
+ 		goto err2;
+ 	}
+ 
+-	if (IS_PF(cdev)) {
+-		cdev->db_phys_addr = pci_resource_start(cdev->pdev, 2);
+-		cdev->db_size = pci_resource_len(cdev->pdev, 2);
+-		cdev->doorbells = ioremap_wc(cdev->db_phys_addr, cdev->db_size);
+-		if (!cdev->doorbells) {
+-			DP_NOTICE(cdev, "Cannot map doorbell space\n");
+-			return -ENOMEM;
++	cdev->db_phys_addr = pci_resource_start(cdev->pdev, 2);
++	cdev->db_size = pci_resource_len(cdev->pdev, 2);
++	if (!cdev->db_size) {
++		if (IS_PF(cdev)) {
++			DP_NOTICE(cdev, "No Doorbell bar available\n");
++			return -EINVAL;
++		} else {
++			return 0;
+ 		}
+ 	}
+ 
++	cdev->doorbells = ioremap_wc(cdev->db_phys_addr, cdev->db_size);
++
++	if (!cdev->doorbells) {
++		DP_NOTICE(cdev, "Cannot map doorbell space\n");
++		return -ENOMEM;
++	}
++
+ 	return 0;
+ 
+ err2:
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+index 7292b031eba3..f495beaf6f78 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+@@ -558,6 +558,7 @@
+ 	0x2aae60UL
+ #define PGLUE_B_REG_PF_BAR1_SIZE \
+ 	0x2aae64UL
++#define PGLUE_B_REG_VF_BAR1_SIZE 0x2aae68UL
+ #define PRS_REG_ENCAPSULATION_TYPE_EN	0x1f0730UL
+ #define PRS_REG_GRE_PROTOCOL		0x1f0734UL
+ #define PRS_REG_VXLAN_PORT		0x1f0738UL
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_vf.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_vf.h
