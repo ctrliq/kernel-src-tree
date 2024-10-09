@@ -1,0 +1,108 @@
+locking/rwsem: Rework zeroing reader waiter->task
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit e38513905eeaae59056eac2c9ac55a43b1fc41b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e3851390.failed
+
+Readers that are awoken will expect a nil ->task indicating
+that a wakeup has occurred. Because of the way readers are
+implemented, there's a small chance that the waiter will never
+block in the slowpath (rwsem_down_read_failed), and therefore
+requires some form of reference counting to avoid the following
+scenario:
+
+rwsem_down_read_failed()		rwsem_wake()
+  get_task_struct();
+  spin_lock_irq(&wait_lock);
+  list_add_tail(&waiter.list)
+  spin_unlock_irq(&wait_lock);
+					  raw_spin_lock_irqsave(&wait_lock)
+					  __rwsem_do_wake()
+  while (1) {
+    set_task_state(TASK_UNINTERRUPTIBLE);
+					    waiter->task = NULL
+    if (!waiter.task) // true
+      break;
+    schedule() // never reached
+
+   __set_task_state(TASK_RUNNING);
+ do_exit();
+					    wake_up_process(tsk); // boom
+
+... and therefore race with do_exit() when the caller returns.
+
+There is also a mismatch between the smp_mb() and its documentation,
+in that the serialization is done between reading the task and the
+nil store. Furthermore, in addition to having the overlapping of
+loads and stores to waiter->task guaranteed to be ordered within
+that CPU, both wake_up_process() originally and now wake_q_add()
+already imply barriers upon successful calls, which serves the
+comment.
+
+Now, as an alternative to perhaps inverting the checks in the blocker
+side (which has its own penalty in that schedule is unavoidable),
+with lockless wakeups this situation is naturally addressed and we
+can just use the refcount held by wake_q_add(), instead doing so
+explicitly. Of course, we must guarantee that the nil store is done
+as the _last_ operation in that the task must already be marked for
+deletion to not fall into the race above. Spurious wakeups are also
+handled transparently in that the task's reference is only removed
+when wake_up_q() is actually called _after_ the nil store.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Waiman.Long@hpe.com
+	Cc: dave@stgolabs.net
+	Cc: jason.low2@hp.com
+	Cc: peter@hurleysoftware.com
+Link: http://lkml.kernel.org/r/1463165787-25937-3-git-send-email-dave@stgolabs.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e38513905eeaae59056eac2c9ac55a43b1fc41b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rwsem.c
+diff --cc lib/rwsem.c
+index 09d8c2da4ff3,fcbf75ac3dcb..000000000000
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@@ -186,17 -194,15 +186,29 @@@ __rwsem_do_wake(struct rw_semaphore *se
+  		waiter = list_entry(next, struct rwsem_waiter, list);
+  		next = waiter->list.next;
+  		tsk = waiter->task;
+++<<<<<<< HEAD:lib/rwsem.c
+ +		/*
+ +		 * Make sure we do not wakeup the next reader before
+ +		 * setting the nil condition to grant the next reader;
+ +		 * otherwise we could miss the wakeup on the other
+ +		 * side and end up sleeping again. See the pairing
+ +		 * in rwsem_down_read_failed().
+ +		 */
+ +		smp_mb();
+ +		waiter->task = NULL;
+ +		wake_up_process(tsk);
+ +		put_task_struct(tsk);
+++=======
++ 
++ 		wake_q_add(wake_q, tsk);
++ 		/*
++ 		 * Ensure that the last operation is setting the reader
++ 		 * waiter to nil such that rwsem_down_read_failed() cannot
++ 		 * race with do_exit() by always holding a reference count
++ 		 * to the task to wakeup.
++ 		 */
++ 		smp_store_release(&waiter->task, NULL);
+++>>>>>>> e38513905eea (locking/rwsem: Rework zeroing reader waiter->task):kernel/locking/rwsem-xadd.c
+  	} while (--loop);
+  
+  	sem->wait_list.next = next;
+* Unmerged path lib/rwsem.c
