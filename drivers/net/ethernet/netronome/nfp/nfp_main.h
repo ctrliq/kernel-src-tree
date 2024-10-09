@@ -42,6 +42,7 @@
 #include <linux/list.h>
 #include <linux/types.h>
 #include <linux/msi.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 
 struct dentry;
@@ -66,6 +67,7 @@ struct nfp_eth_table;
  * @ddir:		Per-device debugfs directory
  * @num_ports:		Number of adapter ports
  * @ports:		Linked list of port structures (struct nfp_net)
+ * @port_lock:		Protects @ports, @num_ports, @num_netdevs
  */
 struct nfp_pf {
 	struct pci_dev *pdev;
@@ -89,6 +91,7 @@ struct nfp_pf {
 
 	unsigned int num_ports;
 	struct list_head ports;
+	struct mutex port_lock;
 };
 
 extern struct pci_driver nfp_netvf_pci_driver;
