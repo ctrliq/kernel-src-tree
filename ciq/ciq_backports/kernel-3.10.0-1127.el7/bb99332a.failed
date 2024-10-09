@@ -1,0 +1,223 @@
+s390/cio: introduce DMA pools to cio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Halil Pasic <pasic@linux.ibm.com>
+commit bb99332a2b558e1f28b4c5011f9ea3b46f1c8806
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/bb99332a.failed
+
+To support protected virtualization cio will need to make sure the
+memory used for communication with the hypervisor is DMA memory.
+
+Let us introduce one global pool for cio.
+
+Our DMA pools are implemented as a gen_pool backed with DMA pages. The
+idea is to avoid each allocation effectively wasting a page, as we
+typically allocate much less than PAGE_SIZE.
+
+	Signed-off-by: Halil Pasic <pasic@linux.ibm.com>
+	Reviewed-by: Sebastian Ott <sebott@linux.ibm.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Reviewed-by: Michael Mueller <mimu@linux.ibm.com>
+	Tested-by: Michael Mueller <mimu@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+(cherry picked from commit bb99332a2b558e1f28b4c5011f9ea3b46f1c8806)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/Kconfig
+#	arch/s390/include/asm/cio.h
+#	drivers/s390/cio/css.c
+diff --cc arch/s390/Kconfig
+index ebaf45ac4e5d,fdb4246265a5..000000000000
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@@ -134,25 -155,43 +134,33 @@@ config S39
+  	select HAVE_KERNEL_XZ
+  	select HAVE_KPROBES
+  	select HAVE_KRETPROBES
+ -	select HAVE_KVM
+ +	select HAVE_KVM if 64BIT
+  	select HAVE_LIVEPATCH
+ -	select HAVE_PERF_REGS
+ -	select HAVE_PERF_USER_STACK_DUMP
+ +	select HAVE_MEMBLOCK
+  	select HAVE_MEMBLOCK_NODE_MAP
+ -	select HAVE_MEMBLOCK_PHYS_MAP
+ -	select HAVE_MMU_GATHER_NO_GATHER
+  	select HAVE_MOD_ARCH_SPECIFIC
+ -	select HAVE_NOP_MCOUNT
+  	select HAVE_OPROFILE
+ -	select HAVE_PCI
+  	select HAVE_PERF_EVENTS
+ -	select HAVE_RCU_TABLE_FREE
+  	select HAVE_REGS_AND_STACK_ACCESS_API
+ -	select HAVE_RSEQ
+  	select HAVE_SYSCALL_TRACEPOINTS
+ +	select HAVE_UID16 if 32BIT
+  	select HAVE_VIRT_CPU_ACCOUNTING
+ -	select IOMMU_HELPER		if PCI
+ -	select IOMMU_SUPPORT		if PCI
+ +	select VIRT_TO_BUS
+ +	select KTIME_SCALAR if 32BIT
+  	select MODULES_USE_ELF_RELA
+ -	select NEED_DMA_MAP_STATE	if PCI
+ -	select NEED_SG_DMA_LENGTH	if PCI
+ -	select OLD_SIGACTION
+  	select OLD_SIGSUSPEND3
+ -	select PCI_DOMAINS		if PCI
+ -	select PCI_MSI			if PCI
+ -	select SPARSE_IRQ
+ +	select OLD_SIGACTION
+  	select SYSCTL_EXCEPTION_TRACE
+ -	select THREAD_INFO_IN_TASK
+ -	select TTY
+ +	select USE_GENERIC_SMP_HELPERS if SMP
+  	select VIRT_CPU_ACCOUNTING
+++<<<<<<< HEAD
+++=======
++ 	select ARCH_HAS_SCALED_CPUTIME
++ 	select HAVE_NMI
++ 	select SWIOTLB
++ 	select GENERIC_ALLOCATOR
++ 
+++>>>>>>> bb99332a2b55 (s390/cio: introduce DMA pools to cio)
+  
+  config SCHED_OMIT_FRAME_POINTER
+  	def_bool y
+diff --cc arch/s390/include/asm/cio.h
+index 19a9a023cac7,58e7db912c30..000000000000
+--- a/arch/s390/include/asm/cio.h
++++ b/arch/s390/include/asm/cio.h
+@@@ -309,18 -329,19 +310,30 @@@ static inline u8 pathmask_to_pos(u8 mas
+  void channel_subsystem_reinit(void);
+  extern void css_schedule_reprobe(void);
+  
+++<<<<<<< HEAD
+ +extern void reipl_ccw_dev(struct ccw_dev_id *id);
+ +
+ +struct cio_iplinfo {
+ +	u8 ssid;
+ +	u16 devno;
+ +	int is_qdio;
+ +};
+ +
+ +extern int cio_get_iplinfo(struct cio_iplinfo *iplinfo);
+++=======
++ extern void *cio_dma_zalloc(size_t size);
++ extern void cio_dma_free(void *cpu_addr, size_t size);
++ extern struct device *cio_get_dma_css_dev(void);
++ 
++ void *cio_gp_dma_zalloc(struct gen_pool *gp_dma, struct device *dma_dev,
++ 			size_t size);
++ void cio_gp_dma_free(struct gen_pool *gp_dma, void *cpu_addr, size_t size);
++ void cio_gp_dma_destroy(struct gen_pool *gp_dma, struct device *dma_dev);
++ struct gen_pool *cio_gp_dma_create(struct device *dma_dev, int nr_pages);
+++>>>>>>> bb99332a2b55 (s390/cio: introduce DMA pools to cio)
+  
+  /* Function from drivers/s390/cio/chsc.c */
+ -int chsc_sstpc(void *page, unsigned int op, u16 ctrl, u64 *clock_delta);
+ +int chsc_sstpc(void *page, unsigned int op, u16 ctrl);
+  int chsc_sstpi(void *page, void *result, size_t size);
+ -int chsc_sgib(u32 origin);
+  
+  #endif
+diff --cc drivers/s390/cio/css.c
+index 6c907bb420c3,7b1a440a1f8e..000000000000
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@@ -776,19 -896,45 +784,53 @@@ static DEVICE_ATTR(cm_enable, 0644, css
+  
+  static int __init setup_css(int nr)
+  {
+ -	struct channel_subsystem *css;
+ +	u32 tod_high;
+  	int ret;
+ +	struct channel_subsystem *css;
+  
+ -	css = kzalloc(sizeof(*css), GFP_KERNEL);
+ -	if (!css)
+ +	css = channel_subsystems[nr];
+ +	memset(css, 0, sizeof(struct channel_subsystem));
+ +	css->pseudo_subchannel =
+ +		kzalloc(sizeof(*css->pseudo_subchannel), GFP_KERNEL);
+ +	if (!css->pseudo_subchannel)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+++=======
++ 
++ 	channel_subsystems[nr] = css;
++ 	dev_set_name(&css->device, "css%x", nr);
++ 	css->device.groups = cssdev_attr_groups;
++ 	css->device.release = channel_subsystem_release;
++ 	/*
++ 	 * We currently allocate notifier bits with this (using
++ 	 * css->device as the device argument with the DMA API)
++ 	 * and are fine with 64 bit addresses.
++ 	 */
++ 	css->device.coherent_dma_mask = DMA_BIT_MASK(64);
++ 	css->device.dma_mask = &css->device.coherent_dma_mask;
++ 
++ 	mutex_init(&css->mutex);
++ 	css->cssid = chsc_get_cssid(nr);
++ 	css_generate_pgid(css, (u32) (get_tod_clock() >> 32));
++ 
++ 	ret = device_register(&css->device);
++ 	if (ret) {
++ 		put_device(&css->device);
++ 		goto out_err;
++ 	}
++ 
++ 	css->pseudo_subchannel = kzalloc(sizeof(*css->pseudo_subchannel),
++ 					 GFP_KERNEL);
++ 	if (!css->pseudo_subchannel) {
++ 		device_unregister(&css->device);
++ 		ret = -ENOMEM;
++ 		goto out_err;
++ 	}
++ 
+++>>>>>>> bb99332a2b55 (s390/cio: introduce DMA pools to cio)
+  	css->pseudo_subchannel->dev.parent = &css->device;
+  	css->pseudo_subchannel->dev.release = css_subchannel_release;
+ +	dev_set_name(&css->pseudo_subchannel->dev, "defunct");
+  	mutex_init(&css->pseudo_subchannel->reg_mutex);
+  	ret = css_sch_create_locks(css->pseudo_subchannel);
+  	if (ret) {
+@@@ -965,23 -1190,14 +1113,30 @@@ static int __init css_bus_init(void
+  	isc_register(IO_SCH_ISC);
+  
+  	return 0;
+++<<<<<<< HEAD
+ +out_file:
+ +	if (css_chsc_characteristics.secm)
+ +		device_remove_file(&channel_subsystems[i]->device,
+ +				   &dev_attr_cm_enable);
+ +out_device:
+ +	device_unregister(&channel_subsystems[i]->device);
+++=======
++ out_unregister_pmn:
++ 	unregister_pm_notifier(&css_power_notifier);
++ out_unregister_rn:
++ 	unregister_reboot_notifier(&css_reboot_notifier);
+++>>>>>>> bb99332a2b55 (s390/cio: introduce DMA pools to cio)
+  out_unregister:
+ -	while (i-- > 0) {
+ -		struct channel_subsystem *css = channel_subsystems[i];
+ +	while (i > 0) {
+ +		struct channel_subsystem *css;
+ +
+ +		i--;
+ +		css = channel_subsystems[i];
+  		device_unregister(&css->pseudo_subchannel->dev);
+ +		css->pseudo_subchannel = NULL;
+ +		if (css_chsc_characteristics.secm)
+ +			device_remove_file(&css->device,
+ +					   &dev_attr_cm_enable);
+  		device_unregister(&css->device);
+  	}
+  	bus_unregister(&css_bus_type);
+* Unmerged path arch/s390/Kconfig
+* Unmerged path arch/s390/include/asm/cio.h
+* Unmerged path drivers/s390/cio/css.c
