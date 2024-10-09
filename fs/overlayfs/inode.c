@@ -129,7 +129,7 @@ int ovl_permission(struct inode *inode, int mask)
 	/* Careful in RCU walk mode */
 	if (!realinode) {
 		WARN_ON(!(mask & MAY_NOT_BLOCK));
-		return -ENOENT;
+		return -ECHILD;
 	}
 
 	/*
