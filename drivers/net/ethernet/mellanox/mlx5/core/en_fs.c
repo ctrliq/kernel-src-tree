@@ -1013,7 +1013,7 @@ err:
 	return err;
 }
 
-static int mlx5e_create_inner_ttc_table(struct mlx5e_priv *priv)
+int mlx5e_create_inner_ttc_table(struct mlx5e_priv *priv)
 {
 	struct mlx5e_ttc_table *ttc = &priv->fs.inner_ttc;
 	struct mlx5_flow_table_attr ft_attr = {};
@@ -1049,7 +1049,7 @@ err:
 	return err;
 }
 
-static void mlx5e_destroy_inner_ttc_table(struct mlx5e_priv *priv)
+void mlx5e_destroy_inner_ttc_table(struct mlx5e_priv *priv)
 {
 	struct mlx5e_ttc_table *ttc = &priv->fs.inner_ttc;
 
