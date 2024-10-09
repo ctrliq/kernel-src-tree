@@ -1,0 +1,163 @@
+locking/lockdep: Make class->ops a percpu counter and move it under CONFIG_DEBUG_LOCKDEP=y
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Waiman Long <longman@redhat.com>
+commit 8ca2b56cd7da98fc8f8d787bb706b9d6c8674a3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8ca2b56c.failed
+
+A sizable portion of the CPU cycles spent on the __lock_acquire() is used
+up by the atomic increment of the class->ops stat counter. By taking it out
+from the lock_class structure and changing it to a per-cpu per-lock-class
+counter, we can reduce the amount of cacheline contention on the class
+structure when multiple CPUs are trying to acquire locks of the same
+class simultaneously.
+
+To limit the increase in memory consumption because of the percpu nature
+of that counter, it is now put back under the CONFIG_DEBUG_LOCKDEP
+config option. So the memory consumption increase will only occur if
+CONFIG_DEBUG_LOCKDEP is defined. The lock_class structure, however,
+is reduced in size by 16 bytes on 64-bit archs after ops removal and
+a minor restructuring of the fields.
+
+This patch also fixes a bug in the increment code as the counter is of
+the 'unsigned long' type, but atomic_inc() was used to increment it.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Will Deacon <will.deacon@arm.com>
+Link: http://lkml.kernel.org/r/d66681f3-8781-9793-1dcf-2436a284550b@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8ca2b56cd7da98fc8f8d787bb706b9d6c8674a3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/lockdep.c
+diff --cc kernel/lockdep.c
+index afa5a3e0029b,a0f83058d6aa..000000000000
+--- a/kernel/lockdep.c
++++ b/kernel/lockdep.c
+@@@ -1365,8 -1393,10 +1366,15 @@@ static void print_lock_class_header(str
+  
+  	printk("%*s->", depth, "");
+  	print_lock_name(class);
+++<<<<<<< HEAD:kernel/lockdep.c
+ +	printk(" ops: %lu", class->ops);
+ +	printk(" {\n");
+++=======
++ #ifdef CONFIG_DEBUG_LOCKDEP
++ 	printk(KERN_CONT " ops: %lu", debug_class_ops_read(class));
++ #endif
++ 	printk(KERN_CONT " {\n");
+++>>>>>>> 8ca2b56cd7da (locking/lockdep: Make class->ops a percpu counter and move it under CONFIG_DEBUG_LOCKDEP=y):kernel/locking/lockdep.c
+  
+  	for (bit = 0; bit < LOCK_USAGE_STATES; bit++) {
+  		if (class->usage_mask & (1 << bit)) {
+@@@ -3087,12 -3230,14 +3095,14 @@@ static int __lock_acquire(struct lockde
+  		if (!class)
+  			return 0;
+  	}
+- 	atomic_inc((atomic_t *)&class->ops);
++ 
++ 	debug_class_ops_inc(class);
++ 
+  	if (very_verbose(class)) {
+ -		printk("\nacquire class [%px] %s", class->key, class->name);
+ +		printk("\nacquire class [%p] %s", class->key, class->name);
+  		if (class->name_version > 1)
+ -			printk(KERN_CONT "#%d", class->name_version);
+ -		printk(KERN_CONT "\n");
+ +			printk("#%d", class->name_version);
+ +		printk("\n");
+  		dump_stack();
+  	}
+  
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index 67c46470a4a2..1c120457dc64 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -96,13 +96,8 @@ struct lock_class {
+ 	 */
+ 	unsigned int			version;
+ 
+-	/*
+-	 * Statistics counter:
+-	 */
+-	unsigned long			ops;
+-
+-	const char			*name;
+ 	int				name_version;
++	const char			*name;
+ 
+ #ifdef CONFIG_LOCK_STAT
+ 	unsigned long			contention_point[LOCKSTAT_POINTS];
+* Unmerged path kernel/lockdep.c
+diff --git a/kernel/lockdep_internals.h b/kernel/lockdep_internals.h
+index fbba184fc713..80f3e6503406 100644
+--- a/kernel/lockdep_internals.h
++++ b/kernel/lockdep_internals.h
+@@ -137,9 +137,15 @@ struct lockdep_stats {
+ 	int	nr_find_usage_forwards_recursions;
+ 	int	nr_find_usage_backwards_checks;
+ 	int	nr_find_usage_backwards_recursions;
++
++	/*
++	 * Per lock class locking operation stat counts
++	 */
++	unsigned long lock_class_ops[MAX_LOCKDEP_KEYS];
+ };
+ 
+ DECLARE_PER_CPU(struct lockdep_stats, lockdep_stats);
++extern struct lock_class lock_classes[MAX_LOCKDEP_KEYS];
+ 
+ #define __debug_atomic_inc(ptr)					\
+ 	this_cpu_inc(lockdep_stats.ptr);
+@@ -164,9 +170,30 @@ DECLARE_PER_CPU(struct lockdep_stats, lockdep_stats);
+ 	}								\
+ 	__total;							\
+ })
++
++static inline void debug_class_ops_inc(struct lock_class *class)
++{
++	int idx;
++
++	idx = class - lock_classes;
++	__debug_atomic_inc(lock_class_ops[idx]);
++}
++
++static inline unsigned long debug_class_ops_read(struct lock_class *class)
++{
++	int idx, cpu;
++	unsigned long ops = 0;
++
++	idx = class - lock_classes;
++	for_each_possible_cpu(cpu)
++		ops += per_cpu(lockdep_stats.lock_class_ops[idx], cpu);
++	return ops;
++}
++
+ #else
+ # define __debug_atomic_inc(ptr)	do { } while (0)
+ # define debug_atomic_inc(ptr)		do { } while (0)
+ # define debug_atomic_dec(ptr)		do { } while (0)
+ # define debug_atomic_read(ptr)		0
++# define debug_class_ops_inc(ptr)	do { } while (0)
+ #endif
+diff --git a/kernel/lockdep_proc.c b/kernel/lockdep_proc.c
+index 7195cdf03789..07cb3cecd155 100644
+--- a/kernel/lockdep_proc.c
++++ b/kernel/lockdep_proc.c
+@@ -67,7 +67,7 @@ static int l_show(struct seq_file *m, void *v)
+ 
+ 	seq_printf(m, "%p", class->key);
+ #ifdef CONFIG_DEBUG_LOCKDEP
+-	seq_printf(m, " OPS:%8ld", class->ops);
++	seq_printf(m, " OPS:%8ld", debug_class_ops_read(class));
+ #endif
+ #ifdef CONFIG_PROVE_LOCKING
+ 	seq_printf(m, " FD:%5ld", lockdep_count_forward_deps(class));
