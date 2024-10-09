@@ -1,0 +1,368 @@
+new fs_pin killing logics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 59eda0e07f43c950d31756213b607af673e551f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/59eda0e0.failed
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 59eda0e07f43c950d31756213b607af673e551f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs_pin.c
+#	include/linux/fs_pin.h
+#	kernel/acct.c
+diff --cc kernel/acct.c
+index 7ffb48430dba,e6c10d1a4058..000000000000
+--- a/kernel/acct.c
++++ b/kernel/acct.c
+@@@ -75,20 -76,21 +75,23 @@@ int acct_parm[3] = {4, 2, 30}
+  /*
+   * External references and all of the globals.
+   */
+- static void do_acct_process(struct bsd_acct_struct *acct);
+  
+  struct bsd_acct_struct {
+ -	struct fs_pin		pin;
+ -	atomic_long_t		count;
+ -	struct rcu_head		rcu;
+ +	long			count;
+  	struct mutex		lock;
+  	int			active;
+  	unsigned long		needcheck;
+  	struct file		*file;
+  	struct pid_namespace	*ns;
+ -	struct work_struct	work;
+ -	struct completion	done;
+ +	struct list_head	list;
+  };
+  
+++<<<<<<< HEAD
+ +static DEFINE_SPINLOCK(acct_lock);
+ +static LIST_HEAD(acct_list);
+++=======
++ static void do_acct_process(struct bsd_acct_struct *acct);
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  
+  /*
+   * Check the amount of free space and suspend/resume accordingly.
+@@@ -155,66 -129,72 +158,126 @@@ out
+  
+  static void acct_put(struct bsd_acct_struct *p)
+  {
+ -	if (atomic_long_dec_and_test(&p->count))
+ -		kfree_rcu(p, rcu);
+ +	spin_lock(&acct_lock);
+ +	if (!--p->count)
+ +		kfree(p);
+ +	spin_unlock(&acct_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static struct bsd_acct_struct *acct_get(struct bsd_acct_struct **p)
+++=======
++ static inline struct bsd_acct_struct *to_acct(struct fs_pin *p)
++ {
++ 	return p ? container_of(p, struct bsd_acct_struct, pin) : NULL;
++ }
++ 
++ static struct bsd_acct_struct *acct_get(struct pid_namespace *ns)
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  {
+  	struct bsd_acct_struct *res;
+ +	spin_lock(&acct_lock);
+  again:
+++<<<<<<< HEAD
+ +	res = *p;
+ +	if (res)
+ +		res->count++;
+ +	spin_unlock(&acct_lock);
+ +	if (res) {
+ +		mutex_lock(&res->lock);
+ +		if (!res->ns) {
+ +			mutex_unlock(&res->lock);
+ +			spin_lock(&acct_lock);
+ +			if (!--res->count)
+ +				kfree(res);
+ +			goto again;
+ +		}
+++=======
++ 	smp_rmb();
++ 	rcu_read_lock();
++ 	res = to_acct(ACCESS_ONCE(ns->bacct));
++ 	if (!res) {
++ 		rcu_read_unlock();
++ 		return NULL;
++ 	}
++ 	if (!atomic_long_inc_not_zero(&res->count)) {
++ 		rcu_read_unlock();
++ 		cpu_relax();
++ 		goto again;
++ 	}
++ 	rcu_read_unlock();
++ 	mutex_lock(&res->lock);
++ 	if (res != to_acct(ACCESS_ONCE(ns->bacct))) {
++ 		mutex_unlock(&res->lock);
++ 		acct_put(res);
++ 		goto again;
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  	}
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+ +static void acct_kill(struct bsd_acct_struct *acct,
+ +		      struct bsd_acct_struct *new)
+ +{
+ +	if (acct) {
+ +		struct file *file = acct->file;
+ +		struct pid_namespace *ns = acct->ns;
+ +		spin_lock(&acct_lock);
+ +		list_del(&acct->list);
+ +		mnt_unpin(file->f_path.mnt);
+ +		spin_unlock(&acct_lock);
+ +		do_acct_process(acct);
+ +		filp_close(file, NULL);
+ +		spin_lock(&acct_lock);
+ +		ns->bacct = new;
+ +		if (new) {
+ +			mnt_pin(new->file->f_path.mnt);
+ +			list_add(&new->list, &acct_list);
+ +		}
+ +		acct->ns = NULL;
+ +		mutex_unlock(&acct->lock);
+ +		if (!(acct->count -= 2))
+ +			kfree(acct);
+ +		spin_unlock(&acct_lock);
+ +	}
+++=======
++ static void acct_pin_kill(struct fs_pin *pin)
++ {
++ 	struct bsd_acct_struct *acct = to_acct(pin);
++ 	mutex_lock(&acct->lock);
++ 	do_acct_process(acct);
++ 	schedule_work(&acct->work);
++ 	wait_for_completion(&acct->done);
++ 	cmpxchg(&acct->ns->bacct, pin, NULL);
++ 	mutex_unlock(&acct->lock);
++ 	pin_remove(pin);
++ 	acct_put(acct);
++ }
++ 
++ static void close_work(struct work_struct *work)
++ {
++ 	struct bsd_acct_struct *acct = container_of(work, struct bsd_acct_struct, work);
++ 	struct file *file = acct->file;
++ 	if (file->f_op->flush)
++ 		file->f_op->flush(file, NULL);
++ 	__fput_sync(file);
++ 	complete(&acct->done);
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  }
+  
+  static int acct_on(struct filename *pathname)
+  {
+  	struct file *file;
+ -	struct vfsmount *mnt, *internal;
+ +	struct vfsmount *mnt;
+  	struct pid_namespace *ns = task_active_pid_ns(current);
+++<<<<<<< HEAD
+ +	struct bsd_acct_struct *acct, *old;
+++=======
++ 	struct bsd_acct_struct *acct;
++ 	struct fs_pin *old;
++ 	int err;
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  
+  	acct = kzalloc(sizeof(struct bsd_acct_struct), GFP_KERNEL);
+  	if (!acct)
+@@@ -238,25 -218,39 +301,44 @@@
+  		filp_close(file, NULL);
+  		return -EIO;
+  	}
+ -	internal = mnt_clone_internal(&file->f_path);
+ -	if (IS_ERR(internal)) {
+ -		kfree(acct);
+ -		filp_close(file, NULL);
+ -		return PTR_ERR(internal);
+ -	}
+ -	err = mnt_want_write(internal);
+ -	if (err) {
+ -		mntput(internal);
+ -		kfree(acct);
+ -		filp_close(file, NULL);
+ -		return err;
+ -	}
+ -	mnt = file->f_path.mnt;
+ -	file->f_path.mnt = internal;
+  
+++<<<<<<< HEAD
+ +	acct->count = 1;
+++=======
++ 	atomic_long_set(&acct->count, 1);
++ 	init_fs_pin(&acct->pin, acct_pin_kill);
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  	acct->file = file;
+  	acct->needcheck = jiffies;
+  	acct->ns = ns;
+  	mutex_init(&acct->lock);
+++<<<<<<< HEAD
+ +	mnt = file->f_path.mnt;
+ +
+ +	old = acct_get(&ns->bacct);
+ +	if (old) {
+ +		acct_kill(old, acct);
+ +	} else {
+ +		spin_lock(&acct_lock);
+ +		ns->bacct = acct;
+ +		mnt_pin(mnt);
+ +		list_add(&acct->list, &acct_list);
+ +		spin_unlock(&acct_lock);
+ +	}
+ +	mntput(mnt); /* it's pinned, now give up active reference */
+++=======
++ 	INIT_WORK(&acct->work, close_work);
++ 	init_completion(&acct->done);
++ 	mutex_lock_nested(&acct->lock, 1);	/* nobody has seen it yet */
++ 	pin_insert(&acct->pin, mnt);
++ 
++ 	rcu_read_lock();
++ 	old = xchg(&ns->bacct, &acct->pin);
++ 	mutex_unlock(&acct->lock);
++ 	pin_kill(old);
++ 	mnt_drop_write(mnt);
++ 	mntput(mnt);
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  	return 0;
+  }
+  
+@@@ -280,84 -276,25 +362,94 @@@ SYSCALL_DEFINE1(acct, const char __use
+  
+  	if (name) {
+  		struct filename *tmp = getname(name);
+ -
+  		if (IS_ERR(tmp))
+ -			return PTR_ERR(tmp);
+ -		mutex_lock(&acct_on_mutex);
+ +			return (PTR_ERR(tmp));
+  		error = acct_on(tmp);
+ -		mutex_unlock(&acct_on_mutex);
+  		putname(tmp);
+  	} else {
+++<<<<<<< HEAD
+ +		acct_kill(acct_get(&task_active_pid_ns(current)->bacct), NULL);
+++=======
++ 		rcu_read_lock();
++ 		pin_kill(task_active_pid_ns(current)->bacct);
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  	}
+  
+  	return error;
+  }
+  
+ +/**
+ + * acct_auto_close - turn off a filesystem's accounting if it is on
+ + * @m: vfsmount being shut down
+ + *
+ + * If the accounting is turned on for a file in the subtree pointed to
+ + * to by m, turn accounting off.  Done when m is about to die.
+ + */
+ +void acct_auto_close_mnt(struct vfsmount *m)
+ +{
+ +	struct bsd_acct_struct *acct;
+ +
+ +	spin_lock(&acct_lock);
+ +restart:
+ +	list_for_each_entry(acct, &acct_list, list)
+ +		if (acct->file->f_path.mnt == m) {
+ +			acct->count++;
+ +			spin_unlock(&acct_lock);
+ +			mutex_lock(&acct->lock);
+ +			if (!acct->ns) {
+ +				mutex_unlock(&acct->lock);
+ +				spin_lock(&acct_lock);
+ +				if (!--acct->count)
+ +					kfree(acct);
+ +				goto restart;
+ +			}
+ +			acct_kill(acct, NULL);
+ +			spin_lock(&acct_lock);
+ +			goto restart;
+ +		}
+ +	spin_unlock(&acct_lock);
+ +}
+ +
+ +/**
+ + * acct_auto_close - turn off a filesystem's accounting if it is on
+ + * @sb: super block for the filesystem
+ + *
+ + * If the accounting is turned on for a file in the filesystem pointed
+ + * to by sb, turn accounting off.
+ + */
+ +void acct_auto_close(struct super_block *sb)
+ +{
+ +	struct bsd_acct_struct *acct;
+ +
+ +	spin_lock(&acct_lock);
+ +restart:
+ +	list_for_each_entry(acct, &acct_list, list)
+ +		if (acct->file->f_path.dentry->d_sb == sb) {
+ +			acct->count++;
+ +			spin_unlock(&acct_lock);
+ +			mutex_lock(&acct->lock);
+ +			if (!acct->ns) {
+ +				mutex_unlock(&acct->lock);
+ +				spin_lock(&acct_lock);
+ +				if (!--acct->count)
+ +					kfree(acct);
+ +				goto restart;
+ +			}
+ +			acct_kill(acct, NULL);
+ +			spin_lock(&acct_lock);
+ +			goto restart;
+ +		}
+ +	spin_unlock(&acct_lock);
+ +}
+ +
+  void acct_exit_ns(struct pid_namespace *ns)
+  {
+++<<<<<<< HEAD
+ +	acct_kill(acct_get(&ns->bacct), NULL);
+++=======
++ 	rcu_read_lock();
++ 	pin_kill(ns->bacct);
+++>>>>>>> 59eda0e07f43 (new fs_pin killing logics)
+  }
+  
+  /*
+* Unmerged path fs/fs_pin.c
+* Unmerged path include/linux/fs_pin.h
+* Unmerged path fs/fs_pin.c
+* Unmerged path include/linux/fs_pin.h
+diff --git a/include/linux/pid_namespace.h b/include/linux/pid_namespace.h
+index 7246ef3d4455..655e4ef4e0d6 100644
+--- a/include/linux/pid_namespace.h
++++ b/include/linux/pid_namespace.h
+@@ -18,7 +18,7 @@ struct pidmap {
+ #define BITS_PER_PAGE_MASK	(BITS_PER_PAGE-1)
+ #define PIDMAP_ENTRIES		((PID_MAX_LIMIT+BITS_PER_PAGE-1)/BITS_PER_PAGE)
+ 
+-struct bsd_acct_struct;
++struct fs_pin;
+ 
+ struct pid_namespace {
+ 	struct kref kref;
+@@ -35,7 +35,7 @@ struct pid_namespace {
+ 	struct dentry *proc_self;
+ #endif
+ #ifdef CONFIG_BSD_PROCESS_ACCT
+-	struct bsd_acct_struct *bacct;
++	struct fs_pin *bacct;
+ #endif
+ 	struct user_namespace *user_ns;
+ 	struct work_struct proc_work;
+* Unmerged path kernel/acct.c
