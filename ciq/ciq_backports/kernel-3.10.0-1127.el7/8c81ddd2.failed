@@ -1,0 +1,217 @@
+ipc: IPCMNI limit check for semmni
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [ipc] IPCMNI limit check for semmni (Waiman Long) [1373519]
+Rebuild_FUZZ: 92.06%
+commit-author Waiman Long <longman@redhat.com>
+commit 8c81ddd2acd2c10979f5a64f6784ce7c6717495e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8c81ddd2.failed
+
+For SysV semaphores, the semmni value is the last part of the 4-element
+sem number array.  To make semmni behave in a similar way to msgmni and
+shmmni, we can't directly use the _minmax handler.  Instead, a special sem
+specific handler is added to check the last argument to make sure that it
+is limited to the [0, IPCMNI] range.  An error will be returned if this is
+not the case.
+
+Link: http://lkml.kernel.org/r/1536352137-12003-3-git-send-email-longman@redhat.com
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Reviewed-by: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Luis R. Rodriguez <mcgrof@kernel.org>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8c81ddd2acd2c10979f5a64f6784ce7c6717495e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/ipc_sysctl.c
+#	ipc/util.h
+diff --cc ipc/ipc_sysctl.c
+index 68c60de19527,49f9bf4ffc7f..000000000000
+--- a/ipc/ipc_sysctl.c
++++ b/ipc/ipc_sysctl.c
+@@@ -123,36 -77,44 +123,61 @@@ static int proc_ipcauto_dointvec_minmax
+  	void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	struct ctl_table ipc_table;
+ -	int dummy = 0;
+ +	int oldval;
+ +	int rc;
+  
+  	memcpy(&ipc_table, table, sizeof(ipc_table));
+ -	ipc_table.data = &dummy;
+ +	ipc_table.data = get_ipc(table);
+ +	oldval = *((int *)(ipc_table.data));
+  
+ -	if (write)
+ -		pr_info_once("writing to auto_msgmni has no effect");
+ +	rc = proc_dointvec_minmax(&ipc_table, write, buffer, lenp, ppos);
+  
+ -	return proc_dointvec_minmax(&ipc_table, write, buffer, lenp, ppos);
+ +	if (write && !rc) {
+ +		int newval = *((int *)(ipc_table.data));
+ +		/*
+ +		 * The file "auto_msgmni" has correctly been set.
+ +		 * React by (un)registering the corresponding tunable, if the
+ +		 * value has changed.
+ +		 */
+ +		if (newval != oldval)
+ +			ipc_auto_callback(newval);
+ +	}
+ +
+ +	return rc;
+  }
+  
++ static int proc_ipc_sem_dointvec(struct ctl_table *table, int write,
++ 	void __user *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int ret, semmni;
++ 	struct ipc_namespace *ns = current->nsproxy->ipc_ns;
++ 
++ 	semmni = ns->sem_ctls[3];
++ 	ret = proc_ipc_dointvec(table, write, buffer, lenp, ppos);
++ 
++ 	if (!ret)
++ 		ret = sem_check_semmni(current->nsproxy->ipc_ns);
++ 
++ 	/*
++ 	 * Reset the semmni value if an error happens.
++ 	 */
++ 	if (ret)
++ 		ns->sem_ctls[3] = semmni;
++ 	return ret;
++ }
++ 
+  #else
+  #define proc_ipc_doulongvec_minmax NULL
+  #define proc_ipc_dointvec	   NULL
+  #define proc_ipc_dointvec_minmax   NULL
+  #define proc_ipc_dointvec_minmax_orphans   NULL
+++<<<<<<< HEAD
+ +#define proc_ipc_callback_dointvec_minmax  NULL
+ +#define proc_ipcauto_dointvec_minmax NULL
+++=======
++ #define proc_ipc_auto_msgmni	   NULL
++ #define proc_ipc_sem_dointvec	   NULL
+++>>>>>>> 8c81ddd2acd2 (ipc: IPCMNI limit check for semmni)
+  #endif
+  
+  static int zero;
+@@@ -223,19 -194,10 +248,19 @@@ static struct ctl_table ipc_kern_table[
+  	{
+  		.procname	= "sem",
+  		.data		= &init_ipc_ns.sem_ctls,
+ -		.maxlen		= 4*sizeof(int),
+ +		.maxlen		= 4*sizeof (int),
+  		.mode		= 0644,
+- 		.proc_handler	= proc_ipc_dointvec,
++ 		.proc_handler	= proc_ipc_sem_dointvec,
+  	},
+ +	{
+ +		.procname	= "auto_msgmni",
+ +		.data		= &init_ipc_ns.auto_msgmni,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_ipcauto_dointvec_minmax,
+ +		.extra1		= &zero,
+ +		.extra2		= &one,
+ +	},
+  #ifdef CONFIG_CHECKPOINT_RESTORE
+  	{
+  		.procname	= "sem_next_id",
+diff --cc ipc/util.h
+index 778c12c8c204,d768fdbed515..000000000000
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@@ -201,7 -213,77 +201,80 @@@ static inline bool ipc_valid_object(str
+  
+  struct kern_ipc_perm *ipc_obtain_object_check(struct ipc_ids *ids, int id);
+  int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
+ -			const struct ipc_ops *ops, struct ipc_params *params);
+ +			struct ipc_ops *ops, struct ipc_params *params);
+  void free_ipcs(struct ipc_namespace *ns, struct ipc_ids *ids,
+  		void (*free)(struct ipc_namespace *, struct kern_ipc_perm *));
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int sem_check_semmni(struct ipc_namespace *ns) {
++ 	/*
++ 	 * Check semmni range [0, IPCMNI]
++ 	 * semmni is the last element of sem_ctls[4] array
++ 	 */
++ 	return ((ns->sem_ctls[3] < 0) || (ns->sem_ctls[3] > IPCMNI))
++ 		? -ERANGE : 0;
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ #include <linux/compat.h>
++ struct compat_ipc_perm {
++ 	key_t key;
++ 	__compat_uid_t uid;
++ 	__compat_gid_t gid;
++ 	__compat_uid_t cuid;
++ 	__compat_gid_t cgid;
++ 	compat_mode_t mode;
++ 	unsigned short seq;
++ };
++ 
++ void to_compat_ipc_perm(struct compat_ipc_perm *, struct ipc64_perm *);
++ void to_compat_ipc64_perm(struct compat_ipc64_perm *, struct ipc64_perm *);
++ int get_compat_ipc_perm(struct ipc64_perm *, struct compat_ipc_perm __user *);
++ int get_compat_ipc64_perm(struct ipc64_perm *,
++ 			  struct compat_ipc64_perm __user *);
++ 
++ static inline int compat_ipc_parse_version(int *cmd)
++ {
++ #ifdef	CONFIG_ARCH_WANT_COMPAT_IPC_PARSE_VERSION
++ 	int version = *cmd & IPC_64;
++ 	*cmd &= ~IPC_64;
++ 	return version;
++ #else
++ 	return IPC_64;
++ #endif
++ }
++ #endif
++ 
++ /* for __ARCH_WANT_SYS_IPC */
++ long ksys_semtimedop(int semid, struct sembuf __user *tsops,
++ 		     unsigned int nsops,
++ 		     const struct __kernel_timespec __user *timeout);
++ long ksys_semget(key_t key, int nsems, int semflg);
++ long ksys_semctl(int semid, int semnum, int cmd, unsigned long arg);
++ long ksys_msgget(key_t key, int msgflg);
++ long ksys_msgctl(int msqid, int cmd, struct msqid_ds __user *buf);
++ long ksys_msgrcv(int msqid, struct msgbuf __user *msgp, size_t msgsz,
++ 		 long msgtyp, int msgflg);
++ long ksys_msgsnd(int msqid, struct msgbuf __user *msgp, size_t msgsz,
++ 		 int msgflg);
++ long ksys_shmget(key_t key, size_t size, int shmflg);
++ long ksys_shmdt(char __user *shmaddr);
++ long ksys_shmctl(int shmid, int cmd, struct shmid_ds __user *buf);
++ 
++ /* for CONFIG_ARCH_WANT_OLD_COMPAT_IPC */
++ long compat_ksys_semtimedop(int semid, struct sembuf __user *tsems,
++ 			    unsigned int nsops,
++ 			    const struct old_timespec32 __user *timeout);
++ #ifdef CONFIG_COMPAT
++ long compat_ksys_semctl(int semid, int semnum, int cmd, int arg);
++ long compat_ksys_msgctl(int msqid, int cmd, void __user *uptr);
++ long compat_ksys_msgrcv(int msqid, compat_uptr_t msgp, compat_ssize_t msgsz,
++ 			compat_long_t msgtyp, int msgflg);
++ long compat_ksys_msgsnd(int msqid, compat_uptr_t msgp,
++ 		       compat_ssize_t msgsz, int msgflg);
++ long compat_ksys_shmctl(int shmid, int cmd, void __user *uptr);
++ #endif /* CONFIG_COMPAT */
++ 
+++>>>>>>> 8c81ddd2acd2 (ipc: IPCMNI limit check for semmni)
+  #endif
+* Unmerged path ipc/ipc_sysctl.c
+* Unmerged path ipc/util.h
