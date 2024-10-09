@@ -1,0 +1,240 @@
+cpufreq: Initialize policy->kobj while allocating policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.118.1.el7
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 2fc3384dc75bf7333384c7a16d12c796f61c3f56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.118.1.el7/2fc3384d.failed
+
+policy->kobj is required to be initialized once in the lifetime of a
+policy.  Currently we are initializing it from __cpufreq_add_dev() and
+that doesn't look to be the best place for doing so as we have to do
+this on special cases (like: !recover_policy).
+
+We can initialize it from a more obvious place cpufreq_policy_alloc()
+and that will make code look cleaner, specially the error handling part.
+
+The error handling part of __cpufreq_add_dev() was doing almost the same
+thing while recover_policy is true or false. Fix that as well by always
+calling cpufreq_policy_put_kobj() with an additional parameter to skip
+notification part of it.
+
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 2fc3384dc75bf7333384c7a16d12c796f61c3f56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index dcf6d7fd60a2,dbb1bd6c57eb..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1085,9 -1134,10 +1085,14 @@@ static struct cpufreq_policy *cpufreq_p
+  	return policy;
+  }
+  
+++<<<<<<< HEAD
+ +static struct cpufreq_policy *cpufreq_policy_alloc(void)
+++=======
++ static struct cpufreq_policy *cpufreq_policy_alloc(struct device *dev)
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  {
+  	struct cpufreq_policy *policy;
++ 	int ret;
+  
+  	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
+  	if (!policy)
+@@@ -1103,6 -1160,13 +1115,16 @@@
+  	init_rwsem(&policy->rwsem);
+  	spin_lock_init(&policy->transition_lock);
+  	init_waitqueue_head(&policy->transition_wait);
+++<<<<<<< HEAD
+++=======
++ 	init_completion(&policy->kobj_unregister);
++ 	INIT_WORK(&policy->update, handle_update);
++ 
++ 	policy->cpu = dev->id;
++ 
++ 	/* Set this once on allocation */
++ 	policy->kobj_cpu = dev->id;
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  
+  	return policy;
+  
+@@@ -1119,13 -1185,15 +1143,14 @@@ static void cpufreq_policy_put_kobj(str
+  	struct kobject *kobj;
+  	struct completion *cmp;
+  
+- 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+- 			CPUFREQ_REMOVE_POLICY, policy);
++ 	if (notify)
++ 		blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
++ 					     CPUFREQ_REMOVE_POLICY, policy);
+  
+ -	down_write(&policy->rwsem);
+ -	cpufreq_remove_dev_symlink(policy);
+ +	down_read(&policy->rwsem);
+  	kobj = &policy->kobj;
+  	cmp = &policy->kobj_unregister;
+ -	up_write(&policy->rwsem);
+ +	up_read(&policy->rwsem);
+  	kobject_put(kobj);
+  
+  	/*
+@@@ -1223,7 -1281,7 +1248,11 @@@ static int __cpufreq_add_dev(struct dev
+  	policy = recover_policy ? cpufreq_policy_restore(cpu) : NULL;
+  	if (!policy) {
+  		recover_policy = false;
+++<<<<<<< HEAD
+ +		policy = cpufreq_policy_alloc();
+++=======
++ 		policy = cpufreq_policy_alloc(dev);
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  		if (!policy)
+  			goto nomem_out;
+  	}
+@@@ -1268,21 -1321,12 +1297,28 @@@
+  		policy->user_policy.min = policy->min;
+  		policy->user_policy.max = policy->max;
+  
+++<<<<<<< HEAD
+ +		/* prepare interface data */
+ +		ret = kobject_init_and_add(&policy->kobj, &ktype_cpufreq,
+ +					   &dev->kobj, "cpufreq");
+ +		if (ret) {
+ +			pr_err("%s: failed to init policy->kobj: %d\n",
+ +			       __func__, ret);
+ +			goto err_init_policy_kobj;
+ +		}
+++=======
++ 		write_lock_irqsave(&cpufreq_driver_lock, flags);
++ 		for_each_cpu(j, policy->related_cpus)
++ 			per_cpu(cpufreq_cpu_data, j) = policy;
++ 		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  	}
+  
+ +	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ +	for_each_cpu(j, policy->cpus)
+ +		per_cpu(cpufreq_cpu_data, j) = policy;
+ +	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +
+  	if (cpufreq_driver->get && !cpufreq_driver->setpolicy) {
+  		policy->cur = cpufreq_driver->get(policy->cpu);
+  		if (!policy->cur) {
+@@@ -1368,26 -1412,12 +1404,33 @@@
+  
+  err_out_unregister:
+  err_get_freq:
+++<<<<<<< HEAD
+ +	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ +	for_each_cpu(j, policy->cpus)
+ +		per_cpu(cpufreq_cpu_data, j) = NULL;
+ +	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +
+ +	if (!recover_policy) {
+ +		kobject_put(&policy->kobj);
+ +		wait_for_completion(&policy->kobj_unregister);
+ +	}
+ +err_init_policy_kobj:
+++=======
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  	up_write(&policy->rwsem);
+  
+  	if (cpufreq_driver->exit)
+  		cpufreq_driver->exit(policy);
+  err_set_policy_cpu:
+++<<<<<<< HEAD
+ +	if (recover_policy) {
+ +		/* Do not leave stale fallback data behind. */
+ +		per_cpu(cpufreq_cpu_data_fallback, cpu) = NULL;
+ +		cpufreq_policy_put_kobj(policy);
+ +	}
+++=======
++ 	cpufreq_policy_put_kobj(policy, recover_policy);
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  	cpufreq_policy_free(policy);
+  
+  nomem_out:
+@@@ -1538,8 -1498,34 +1581,35 @@@ static int __cpufreq_remove_dev_finish(
+  			pr_err("%s: Failed to start governor\n", __func__);
+  			return ret;
+  		}
+ -
+ -		return 0;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If cpu is last user of policy, free policy */
++ 	if (has_target()) {
++ 		ret = __cpufreq_governor(policy, CPUFREQ_GOV_POLICY_EXIT);
++ 		if (ret) {
++ 			pr_err("%s: Failed to exit governor\n", __func__);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	/* Free the policy kobjects only if the driver is getting removed. */
++ 	if (sif)
++ 		cpufreq_policy_put_kobj(policy, true);
++ 
++ 	/*
++ 	 * Perform the ->exit() even during light-weight tear-down,
++ 	 * since this is a core component, and is essential for the
++ 	 * subsequent light-weight ->init() to succeed.
++ 	 */
++ 	if (cpufreq_driver->exit)
++ 		cpufreq_driver->exit(policy);
++ 
++ 	if (sif)
++ 		cpufreq_policy_free(policy);
++ 
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  	return 0;
+  }
+  
+@@@ -1553,8 -1539,34 +1623,39 @@@ static void cpufreq_remove_dev(struct d
+  	unsigned int cpu = dev->id;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (cpu_is_offline(cpu))
+ +		return;
+++=======
++ 	/*
++ 	 * Only possible if 'cpu' is getting physically removed now. A hotplug
++ 	 * notifier should have already been called and we just need to remove
++ 	 * link or free policy here.
++ 	 */
++ 	if (cpu_is_offline(cpu)) {
++ 		struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);
++ 		struct cpumask mask;
++ 
++ 		if (!policy)
++ 			return 0;
++ 
++ 		cpumask_copy(&mask, policy->related_cpus);
++ 		cpumask_clear_cpu(cpu, &mask);
++ 
++ 		/*
++ 		 * Free policy only if all policy->related_cpus are removed
++ 		 * physically.
++ 		 */
++ 		if (cpumask_intersects(&mask, cpu_present_mask)) {
++ 			remove_cpu_dev_symlink(policy, cpu);
++ 			return 0;
++ 		}
++ 
++ 		cpufreq_policy_put_kobj(policy, true);
++ 		cpufreq_policy_free(policy);
++ 		return 0;
++ 	}
+++>>>>>>> 2fc3384dc75b (cpufreq: Initialize policy->kobj while allocating policy)
+  
+  	ret = __cpufreq_remove_dev_prepare(dev, sif);
+  
+* Unmerged path drivers/cpufreq/cpufreq.c
