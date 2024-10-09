@@ -1,0 +1,255 @@
+ipv6: addrconf: use stable address generator for ARPHRD_NONE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bjørn Mork <bjorn@mork.no>
+commit cc9da6cc4f56e05cc9e591459fe0192727ff58b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cc9da6cc.failed
+
+Add a new address generator mode, using the stable address generator
+with an automatically generated secret. This is intended as a default
+address generator mode for device types with no EUI64 implementation.
+The new generator is used for ARPHRD_NONE interfaces initially, adding
+default IPv6 autoconf support to e.g. tun interfaces.
+
+If the addrgenmode is set to 'random', either by default or manually,
+and no stable secret is available, then a random secret is used as
+input for the stable-privacy address generator.  The secret can be
+read and modified like manually configured secrets, using the proc
+interface.  Modifying the secret will change the addrgen mode to
+'stable-privacy' to indicate that it operates on a known secret.
+
+Existing behaviour of the 'stable-privacy' mode is kept unchanged. If
+a known secret is available when the device is created, then the mode
+will default to 'stable-privacy' as before.  The mode can be manually
+set to 'random' but it will behave exactly like 'stable-privacy' in
+this case. The secret will not change.
+
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Cc: 吉藤英明 <hideaki.yoshifuji@miraclelinux.com>
+	Signed-off-by: Bjørn Mork <bjorn@mork.no>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cc9da6cc4f56e05cc9e591459fe0192727ff58b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_link.h
+#	net/ipv6/addrconf.c
+diff --cc include/uapi/linux/if_link.h
+index 1b43f8aab560,a30b78090594..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -223,6 -217,8 +223,11 @@@ enum 
+  enum in6_addr_gen_mode {
+  	IN6_ADDR_GEN_MODE_EUI64,
+  	IN6_ADDR_GEN_MODE_NONE,
+++<<<<<<< HEAD
+++=======
++ 	IN6_ADDR_GEN_MODE_STABLE_PRIVACY,
++ 	IN6_ADDR_GEN_MODE_RANDOM,
+++>>>>>>> cc9da6cc4f56 (ipv6: addrconf: use stable address generator for ARPHRD_NONE)
+  };
+  
+  /* Bridge section */
+diff --cc net/ipv6/addrconf.c
+index ce6daf6ce3f6,819b7777f3cb..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -2260,6 -2438,11 +2266,14 @@@ void addrconf_prefix_rcv(struct net_dev
+  				       in6_dev->token.s6_addr + 8, 8);
+  				read_unlock_bh(&in6_dev->lock);
+  				tokenized = true;
+++<<<<<<< HEAD
+++=======
++ 			} else if (is_addr_mode_generate_stable(in6_dev) &&
++ 				   !ipv6_generate_stable_address(&addr, 0,
++ 								 in6_dev)) {
++ 				addr_flags |= IFA_F_STABLE_PRIVACY;
++ 				goto ok;
+++>>>>>>> cc9da6cc4f56 (ipv6: addrconf: use stable address generator for ARPHRD_NONE)
+  			} else if (ipv6_generate_eui64(addr.s6_addr + 8, dev) &&
+  				   ipv6_inherit_eui64(addr.s6_addr + 8, in6_dev)) {
+  				in6_dev_put(in6_dev);
+@@@ -2796,20 -2960,130 +2810,138 @@@ static void addrconf_add_linklocal(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool ipv6_reserved_interfaceid(struct in6_addr address)
++ {
++ 	if ((address.s6_addr32[2] | address.s6_addr32[3]) == 0)
++ 		return true;
++ 
++ 	if (address.s6_addr32[2] == htonl(0x02005eff) &&
++ 	    ((address.s6_addr32[3] & htonl(0xfe000000)) == htonl(0xfe000000)))
++ 		return true;
++ 
++ 	if (address.s6_addr32[2] == htonl(0xfdffffff) &&
++ 	    ((address.s6_addr32[3] & htonl(0xffffff80)) == htonl(0xffffff80)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int ipv6_generate_stable_address(struct in6_addr *address,
++ 					u8 dad_count,
++ 					const struct inet6_dev *idev)
++ {
++ 	static DEFINE_SPINLOCK(lock);
++ 	static __u32 digest[SHA_DIGEST_WORDS];
++ 	static __u32 workspace[SHA_WORKSPACE_WORDS];
++ 
++ 	static union {
++ 		char __data[SHA_MESSAGE_BYTES];
++ 		struct {
++ 			struct in6_addr secret;
++ 			__be32 prefix[2];
++ 			unsigned char hwaddr[MAX_ADDR_LEN];
++ 			u8 dad_count;
++ 		} __packed;
++ 	} data;
++ 
++ 	struct in6_addr secret;
++ 	struct in6_addr temp;
++ 	struct net *net = dev_net(idev->dev);
++ 
++ 	BUILD_BUG_ON(sizeof(data.__data) != sizeof(data));
++ 
++ 	if (idev->cnf.stable_secret.initialized)
++ 		secret = idev->cnf.stable_secret.secret;
++ 	else if (net->ipv6.devconf_dflt->stable_secret.initialized)
++ 		secret = net->ipv6.devconf_dflt->stable_secret.secret;
++ 	else
++ 		return -1;
++ 
++ retry:
++ 	spin_lock_bh(&lock);
++ 
++ 	sha_init(digest);
++ 	memset(&data, 0, sizeof(data));
++ 	memset(workspace, 0, sizeof(workspace));
++ 	memcpy(data.hwaddr, idev->dev->perm_addr, idev->dev->addr_len);
++ 	data.prefix[0] = address->s6_addr32[0];
++ 	data.prefix[1] = address->s6_addr32[1];
++ 	data.secret = secret;
++ 	data.dad_count = dad_count;
++ 
++ 	sha_transform(digest, data.__data, workspace);
++ 
++ 	temp = *address;
++ 	temp.s6_addr32[2] = (__force __be32)digest[0];
++ 	temp.s6_addr32[3] = (__force __be32)digest[1];
++ 
++ 	spin_unlock_bh(&lock);
++ 
++ 	if (ipv6_reserved_interfaceid(temp)) {
++ 		dad_count++;
++ 		if (dad_count > dev_net(idev->dev)->ipv6.sysctl.idgen_retries)
++ 			return -1;
++ 		goto retry;
++ 	}
++ 
++ 	*address = temp;
++ 	return 0;
++ }
++ 
++ static void ipv6_gen_mode_random_init(struct inet6_dev *idev)
++ {
++ 	struct ipv6_stable_secret *s = &idev->cnf.stable_secret;
++ 
++ 	if (s->initialized)
++ 		return;
++ 	s = &idev->cnf.stable_secret;
++ 	get_random_bytes(&s->secret, sizeof(s->secret));
++ 	s->initialized = true;
++ }
++ 
+++>>>>>>> cc9da6cc4f56 (ipv6: addrconf: use stable address generator for ARPHRD_NONE)
+  static void addrconf_addr_gen(struct inet6_dev *idev, bool prefix_route)
+  {
+ -	struct in6_addr addr;
+ +	if (idev->addr_gen_mode == IN6_ADDR_GEN_MODE_EUI64) {
+ +		struct in6_addr addr;
+  
+++<<<<<<< HEAD
+ +		ipv6_addr_set(&addr,  htonl(0xFE800000), 0, 0, 0);
+++=======
++ 	/* no link local addresses on L3 master devices */
++ 	if (netif_is_l3_master(idev->dev))
++ 		return;
++ 
++ 	ipv6_addr_set(&addr, htonl(0xFE800000), 0, 0, 0);
++ 
++ 	switch (idev->addr_gen_mode) {
++ 	case IN6_ADDR_GEN_MODE_RANDOM:
++ 		ipv6_gen_mode_random_init(idev);
++ 		/* fallthrough */
++ 	case IN6_ADDR_GEN_MODE_STABLE_PRIVACY:
++ 		if (!ipv6_generate_stable_address(&addr, 0, idev))
++ 			addrconf_add_linklocal(idev, &addr,
++ 					       IFA_F_STABLE_PRIVACY);
++ 		else if (prefix_route)
++ 			addrconf_prefix_route(&addr, 64, idev->dev, 0, 0);
++ 		break;
++ 	case IN6_ADDR_GEN_MODE_EUI64:
+++>>>>>>> cc9da6cc4f56 (ipv6: addrconf: use stable address generator for ARPHRD_NONE)
+  		/* addrconf_add_linklocal also adds a prefix_route and we
+  		 * only need to care about prefix routes if ipv6_generate_eui64
+  		 * couldn't generate one.
+  		 */
+  		if (ipv6_generate_eui64(addr.s6_addr + 8, idev->dev) == 0)
+ -			addrconf_add_linklocal(idev, &addr, 0);
+ +			addrconf_add_linklocal(idev, &addr);
+  		else if (prefix_route)
+  			addrconf_prefix_route(&addr, 64, idev->dev, 0, 0);
++ 		break;
++ 	case IN6_ADDR_GEN_MODE_NONE:
++ 	default:
++ 		/* will not add any link local address */
++ 		break;
+  	}
+  }
+  
+@@@ -2823,9 -3097,10 +2955,15 @@@ static void addrconf_dev_config(struct 
+  	    (dev->type != ARPHRD_FDDI) &&
+  	    (dev->type != ARPHRD_ARCNET) &&
+  	    (dev->type != ARPHRD_INFINIBAND) &&
+ +	    (dev->type != ARPHRD_IEEE802154) &&
+  	    (dev->type != ARPHRD_IEEE1394) &&
+++<<<<<<< HEAD
+ +	    (dev->type != ARPHRD_TUNNEL6)) {
+++=======
++ 	    (dev->type != ARPHRD_TUNNEL6) &&
++ 	    (dev->type != ARPHRD_6LOWPAN) &&
++ 	    (dev->type != ARPHRD_NONE)) {
+++>>>>>>> cc9da6cc4f56 (ipv6: addrconf: use stable address generator for ARPHRD_NONE)
+  		/* Alas, we support only Ethernet autoconfiguration. */
+  		return;
+  	}
+@@@ -4624,8 -4957,16 +4767,14 @@@ static int inet6_set_link_af(struct net
+  		u8 mode = nla_get_u8(tb[IFLA_INET6_ADDR_GEN_MODE]);
+  
+  		if (mode != IN6_ADDR_GEN_MODE_EUI64 &&
+++<<<<<<< HEAD
+ +		    mode != IN6_ADDR_GEN_MODE_NONE)
+++=======
++ 		    mode != IN6_ADDR_GEN_MODE_NONE &&
++ 		    mode != IN6_ADDR_GEN_MODE_STABLE_PRIVACY &&
++ 		    mode != IN6_ADDR_GEN_MODE_RANDOM)
+++>>>>>>> cc9da6cc4f56 (ipv6: addrconf: use stable address generator for ARPHRD_NONE)
+  			return -EINVAL;
+ -
+ -		if (mode == IN6_ADDR_GEN_MODE_STABLE_PRIVACY &&
+ -		    !idev->cnf.stable_secret.initialized &&
+ -		    !dev_net(dev)->ipv6.devconf_dflt->stable_secret.initialized)
+ -			return -EINVAL;
+ -
+  		idev->addr_gen_mode = mode;
+  		err = 0;
+  	}
+* Unmerged path include/uapi/linux/if_link.h
+* Unmerged path net/ipv6/addrconf.c
