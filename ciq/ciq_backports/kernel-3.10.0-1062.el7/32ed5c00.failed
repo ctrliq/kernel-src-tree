@@ -1,0 +1,339 @@
+IB/uverbs: Make the write path destroy methods use the same flow as ioctl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 32ed5c00ac5fdea49058fd49bf8707e101dc3dfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/32ed5c00.failed
+
+The ridiculous dance with uobj_remove_commit() is not needed, the write
+path can follow the same flow as ioctl - lock and destroy the HW object
+then use the data left over in the uobject to form the response to
+userspace.
+
+Two helpers are introduced to make this flow straightforward for the
+caller.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 32ed5c00ac5fdea49058fd49bf8707e101dc3dfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+#	drivers/infiniband/core/uverbs_cmd.c
+#	include/rdma/uverbs_std_types.h
+#	include/rdma/uverbs_types.h
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,7db75d784070..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -129,24 -130,44 +129,49 @@@ static int uverbs_try_lock_object(struc
+  }
+  
+  /*
+-  * Does both rdma_lookup_get_uobject() and rdma_remove_commit_uobject(), then
+-  * returns success_res on success (negative errno on failure). For use by
+-  * callers that do not need the uobj.
++  * uobj_get_destroy destroys the HW object and returns a handle to the uobj
++  * with a NULL object pointer. The caller must pair this with
++  * uverbs_put_destroy.
+   */
+++<<<<<<< HEAD
+ +int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
+ +			   struct ib_uverbs_file *ufile, int success_res)
+++=======
++ struct ib_uobject *__uobj_get_destroy(const struct uverbs_obj_type *type,
++ 				      u32 id, struct ib_uverbs_file *ufile)
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  {
+  	struct ib_uobject *uobj;
+  	int ret;
+  
+ -	uobj = rdma_lookup_get_uobject(type, ufile, id, true);
+ +	uobj = rdma_lookup_get_uobject(type, ufile->ucontext, id, true);
+  	if (IS_ERR(uobj))
+- 		return PTR_ERR(uobj);
++ 		return uobj;
+  
+- 	ret = rdma_remove_commit_uobject(uobj);
+- 	if (ret)
+- 		return ret;
++ 	ret = rdma_explicit_destroy(uobj);
++ 	if (ret) {
++ 		rdma_lookup_put_uobject(uobj, true);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	return uobj;
++ }
++ 
++ /*
++  * Does both uobj_get_destroy() and uobj_put_destroy().  Returns success_res
++  * on success (negative errno on failure). For use by callers that do not need
++  * the uobj.
++  */
++ int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
++ 			   struct ib_uverbs_file *ufile, int success_res)
++ {
++ 	struct ib_uobject *uobj;
++ 
++ 	uobj = __uobj_get_destroy(type, id, ufile);
++ 	if (IS_ERR(uobj))
++ 		return PTR_ERR(uobj);
+  
++ 	rdma_lookup_put_uobject(uobj, true);
+  	return success_res;
+  }
+  
+@@@ -432,58 -448,27 +457,61 @@@ static void assert_uverbs_usecnt(struc
+  static int __must_check _rdma_remove_commit_uobject(struct ib_uobject *uobj,
+  						    enum rdma_remove_reason why)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+  	int ret;
+ -
+ -	if (!uobj->object)
+ -		return 0;
+ +	struct ib_ucontext *ucontext = uobj->context;
+  
+  	ret = uobj->type->type_class->remove_commit(uobj, why);
+ -	if (ib_is_destroy_retryable(ret, why, uobj))
+ -		return ret;
+ +	if (ret && why == RDMA_REMOVE_DESTROY) {
+ +		/* We couldn't remove the object, so just unlock the uobject */
+ +		atomic_set(&uobj->usecnt, 0);
+ +		uobj->type->type_class->lookup_put(uobj, true);
+ +	} else {
+ +		mutex_lock(&ucontext->uobjects_lock);
+ +		list_del(&uobj->list);
+ +		mutex_unlock(&ucontext->uobjects_lock);
+ +		/* put the ref we took when we created the object */
+ +		uverbs_uobject_put(uobj);
+ +	}
+  
+ -	uobj->object = NULL;
+ +	return ret;
+ +}
+ +
+++<<<<<<< HEAD
+ +/* This is called only for user requested DESTROY reasons */
+ +int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj)
+ +{
+ +	int ret;
+ +	struct ib_ucontext *ucontext = uobj->context;
+  
+ -	spin_lock_irq(&ufile->uobjects_lock);
+ -	list_del(&uobj->list);
+ -	spin_unlock_irq(&ufile->uobjects_lock);
+ -	/* Pairs with the get in rdma_alloc_commit_uobject() */
+ +	/* put the ref count we took at lookup_get */
+  	uverbs_uobject_put(uobj);
+ +	/* Cleanup is running. Calling this should have been impossible */
+ +	if (!down_read_trylock(&ucontext->cleanup_rwsem)) {
+ +		WARN(true, "ib_uverbs: Cleanup is running while removing an uobject\n");
+ +		return 0;
+ +	}
+ +	assert_uverbs_usecnt(uobj, true);
+ +	ret = _rdma_remove_commit_uobject(uobj, RDMA_REMOVE_DESTROY);
+  
+ +	up_read(&ucontext->cleanup_rwsem);
+  	return ret;
+  }
+  
+ +static int null_obj_type_class_remove_commit(struct ib_uobject *uobj,
+ +					     enum rdma_remove_reason why)
+ +{
+ +	return 0;
+ +}
+ +
+ +static const struct uverbs_obj_type null_obj_type = {
+ +	.type_class = &((const struct uverbs_obj_type_class){
+ +			.remove_commit = null_obj_type_class_remove_commit,
+ +			/* be cautious */
+ +			.needs_kfree_rcu = true}),
+ +};
+ +
+++=======
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  int rdma_explicit_destroy(struct ib_uobject *uobject)
+  {
+  	int ret;
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index a027ca305b7e,fe96ceda6cd2..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -1279,8 -1309,7 +1277,12 @@@ ssize_t ib_uverbs_destroy_cq(struct ib_
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_CQ, cmd.cq_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_CQ, cmd.cq_handle, file);
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -2133,10 -2093,7 +2121,14 @@@ ssize_t ib_uverbs_destroy_qp(struct ib_
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	memset(&resp, 0, sizeof resp);
+ +
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_QP, cmd.qp_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_QP, cmd.qp_handle, file);
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -3224,8 -3170,7 +3206,12 @@@ int ib_uverbs_ex_destroy_wq(struct ib_u
+  		return -EOPNOTSUPP;
+  
+  	resp.response_length = required_resp_len;
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_WQ, cmd.wq_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_WQ, cmd.wq_handle, file);
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -3959,8 -3888,7 +3936,12 @@@ ssize_t ib_uverbs_destroy_srq(struct ib
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_get_write(UVERBS_OBJECT_SRQ, cmd.srq_handle,
+ +			       file->ucontext);
+++=======
++ 	uobj = uobj_get_destroy(UVERBS_OBJECT_SRQ, cmd.srq_handle, file);
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+diff --cc include/rdma/uverbs_std_types.h
+index 6e389a6b0382,c2f89e41cbd2..000000000000
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@@ -56,26 -56,45 +56,37 @@@ static inline struct ib_uobject *__uobj
+  
+  #define uobj_get_type(_object) UVERBS_OBJECT(_object).type_attrs
+  
+ -#define uobj_get_read(_type, _id, _ufile)                                      \
+ -	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
+ -				_uobj_check_id(_id), false)
+ -
+ -#define ufd_get_read(_type, _fdnum, _ufile)                                    \
+ -	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
+ -				(_fdnum)*typecheck(s32, _fdnum), false)
+ +#define uobj_get_read(_type, _id, _ucontext)				\
+ +	 __uobj_get(uobj_get_type(_type), false, _ucontext, _id)
+  
+ -static inline void *_uobj_get_obj_read(struct ib_uobject *uobj)
+ -{
+ -	if (IS_ERR(uobj))
+ -		return NULL;
+ -	return uobj->object;
+ -}
+ -#define uobj_get_obj_read(_object, _type, _id, _ufile)                         \
+ -	((struct ib_##_object *)_uobj_get_obj_read(                            \
+ -		uobj_get_read(_type, _id, _ufile)))
+ +#define uobj_get_obj_read(_object, _type, _id, _ucontext)		\
+ +({									\
+ +	struct ib_uobject *__uobj =					\
+ +		__uobj_get(uobj_get_type(_type),			\
+ +			   false, _ucontext, _id);			\
+ +									\
+ +	(struct ib_##_object *)(IS_ERR(__uobj) ? NULL : __uobj->object);\
+ +})
+  
+ -#define uobj_get_write(_type, _id, _ufile)                                     \
+ -	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
+ -				_uobj_check_id(_id), true)
+ +#define uobj_get_write(_type, _id, _ucontext)				\
+ +	 __uobj_get(uobj_get_type(_type), true, _ucontext, _id)
+  
+ -int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
+ +int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
+  			   struct ib_uverbs_file *ufile, int success_res);
+  #define uobj_perform_destroy(_type, _id, _ufile, _success_res)                 \
+ -	__uobj_perform_destroy(uobj_get_type(_type), _uobj_check_id(_id),      \
+ -			       _ufile, _success_res)
+ +	__uobj_perform_destroy(uobj_get_type(_type), _id, _ufile, _success_res)
+  
++ struct ib_uobject *__uobj_get_destroy(const struct uverbs_obj_type *type,
++ 				      u32 id, struct ib_uverbs_file *ufile);
++ 
++ #define uobj_get_destroy(_type, _id, _ufile)                                   \
++ 	__uobj_get_destroy(uobj_get_type(_type), _uobj_check_id(_id), _ufile)
++ 
++ static inline void uobj_put_destroy(struct ib_uobject *uobj)
++ {
++ 	rdma_lookup_put_uobject(uobj, true);
++ }
++ 
+  static inline void uobj_put_read(struct ib_uobject *uobj)
+  {
+  	rdma_lookup_put_uobject(uobj, false);
+@@@ -89,14 -108,14 +100,19 @@@ static inline void uobj_put_write(struc
+  	rdma_lookup_put_uobject(uobj, true);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int __must_check uobj_remove_commit(struct ib_uobject *uobj)
+ +{
+ +	return rdma_remove_commit_uobject(uobj);
+ +}
+ +
+ +static inline void uobj_alloc_commit(struct ib_uobject *uobj)
+++=======
++ static inline int __must_check uobj_alloc_commit(struct ib_uobject *uobj,
++ 						 int success_res)
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  {
+ -	int ret = rdma_alloc_commit_uobject(uobj);
+ -
+ -	if (ret)
+ -		return ret;
+ -	return success_res;
+ +	rdma_alloc_commit_uobject(uobj);
+  }
+  
+  static inline void uobj_alloc_abort(struct ib_uobject *uobj)
+diff --cc include/rdma/uverbs_types.h
+index cc04ec65588d,8bae28dd2e4f..000000000000
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@@ -121,14 -120,13 +121,18 @@@ struct uverbs_obj_idr_type 
+  };
+  
+  struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_obj_type *type,
+ -					   struct ib_uverbs_file *ufile,
+ -					   s64 id, bool exclusive);
+ +					   struct ib_ucontext *ucontext,
+ +					   int id, bool exclusive);
+  void rdma_lookup_put_uobject(struct ib_uobject *uobj, bool exclusive);
+  struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ -					    struct ib_uverbs_file *ufile);
+ +					    struct ib_ucontext *ucontext);
+  void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+++<<<<<<< HEAD
+ +int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj);
+ +int rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+++=======
++ int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+++>>>>>>> 32ed5c00ac5f (IB/uverbs: Make the write path destroy methods use the same flow as ioctl)
+  int rdma_explicit_destroy(struct ib_uobject *uobject);
+  
+  struct uverbs_obj_fd_type {
+* Unmerged path drivers/infiniband/core/rdma_core.c
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+* Unmerged path include/rdma/uverbs_std_types.h
+* Unmerged path include/rdma/uverbs_types.h
