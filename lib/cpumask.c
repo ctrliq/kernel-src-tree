@@ -62,6 +62,7 @@ int cpumask_any_but(const struct cpumask *mask, unsigned int cpu)
 			break;
 	return i;
 }
+EXPORT_SYMBOL(cpumask_any_but);
 
 /**
  * cpumask_next_wrap - helper to implement for_each_cpu_wrap
