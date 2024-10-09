@@ -1,0 +1,149 @@
+scsi: cxlflash: Remove unnecessary DMA mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Remove unnecessary DMA mapping (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 93.02%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 50b787f7235efbd074bbdf4315e0cc261d85b4d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/50b787f7.failed
+
+Devices supported by the cxlflash driver are fully coherent and do not require
+a bus address mapping. Avoid unnecessary path length by using the virtual
+address and length already present in the scatter-gather entry.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 50b787f7235efbd074bbdf4315e0cc261d85b4d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,3c4a83307e6e..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -233,13 -172,10 +233,12 @@@ static void cmd_complete(struct afu_cm
+  			scp->result = (DID_OK << 16);
+  
+  		cmd_is_tmf = cmd->cmd_tmf;
+ +		cmd_checkin(cmd); /* Don't use cmd after here */
+  
+ -		dev_dbg_ratelimited(dev, "%s:scp=%p result=%08x ioasc=%08x\n",
+ -				    __func__, scp, scp->result, cmd->sa.ioasc);
+ +		pr_debug_ratelimited("%s: calling scsi_done scp=%p result=%X "
+ +				     "ioasc=%d\n", __func__, scp, scp->result,
+ +				     cmd->sa.ioasc);
+  
+- 		scsi_dma_unmap(scp);
+  		scp->scsi_done(scp);
+  
+  		if (cmd_is_tmf) {
+@@@ -455,19 -437,17 +454,22 @@@ static const char *cxlflash_driver_info
+   */
+  static int cxlflash_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scp)
+  {
+ -	struct cxlflash_cfg *cfg = shost_priv(host);
+ +	struct cxlflash_cfg *cfg = (struct cxlflash_cfg *)host->hostdata;
+  	struct afu *afu = cfg->afu;
+  	struct device *dev = &cfg->dev->dev;
+ -	struct afu_cmd *cmd = sc_to_afucz(scp);
+ -	struct scatterlist *sg = scsi_sglist(scp);
+ -	u16 req_flags = SISL_REQ_FLAGS_SUP_UNDERRUN;
+ +	struct afu_cmd *cmd;
+ +	u32 port_sel = scp->device->channel + 1;
+ +	int nseg, i, ncount;
+ +	struct scatterlist *sg;
+  	ulong lock_flags;
+++<<<<<<< HEAD
+ +	short lflag = 0;
+++=======
+++>>>>>>> 50b787f7235e (scsi: cxlflash: Remove unnecessary DMA mapping)
+  	int rc = 0;
+  
+ -	dev_dbg_ratelimited(dev, "%s: (scp=%p) %d/%d/%d/%llu "
+ -			    "cdb=(%08x-%08x-%08x-%08x)\n",
+ +	dev_dbg_ratelimited(dev, "%s: (scp=%p) %d/%d/%d/%d "
+ +			    "cdb=(%08X-%08X-%08X-%08X)\n",
+  			    __func__, scp, host->host_no, scp->device->channel,
+  			    scp->device->id, scp->device->lun,
+  			    get_unaligned_be32(&((u32 *)scp->cmnd)[0]),
+@@@ -502,54 -484,27 +504,64 @@@
+  		break;
+  	}
+  
+ -	if (likely(sg)) {
+ -		cmd->rcb.data_len = sg->length;
+ -		cmd->rcb.data_ea = (uintptr_t)sg_virt(sg);
+++<<<<<<< HEAD
+ +	cmd = cmd_checkout(afu);
+ +	if (unlikely(!cmd)) {
+ +		dev_err(dev, "%s: could not get a free command\n", __func__);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+  	}
+  
+ -	cmd->scp = scp;
+ -	cmd->parent = afu;
+ -
+  	cmd->rcb.ctx_id = afu->ctx_hndl;
+ -	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
+ -	cmd->rcb.port_sel = CHAN2PORTMASK(scp->device->channel);
+ +	cmd->rcb.port_sel = port_sel;
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+  
+  	if (scp->sc_data_direction == DMA_TO_DEVICE)
+ -		req_flags |= SISL_REQ_FLAGS_HOST_WRITE;
+ +		lflag = SISL_REQ_FLAGS_HOST_WRITE;
+ +	else
+ +		lflag = SISL_REQ_FLAGS_HOST_READ;
+  
+ -	cmd->rcb.req_flags = req_flags;
+ +	cmd->rcb.req_flags = (SISL_REQ_FLAGS_PORT_LUN_ID |
+ +			      SISL_REQ_FLAGS_SUP_UNDERRUN | lflag);
+ +
+ +	/* Stash the scp in the reserved field, for reuse during interrupt */
+ +	cmd->rcb.scp = scp;
+ +
+ +	nseg = scsi_dma_map(scp);
+ +	if (unlikely(nseg < 0)) {
+ +		dev_err(dev, "%s: Fail DMA map! nseg=%d\n",
+ +			__func__, nseg);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+ +	}
+ +
+ +	ncount = scsi_sg_count(scp);
+ +	scsi_for_each_sg(scp, sg, ncount, i) {
+ +		cmd->rcb.data_len = sg_dma_len(sg);
+ +		cmd->rcb.data_ea = sg_dma_address(sg);
+++=======
+++	if (likely(sg)) {
+++		cmd->rcb.data_len = sg->length;
+++		cmd->rcb.data_ea = (uintptr_t)sg_virt(sg);
+++>>>>>>> 50b787f7235e (scsi: cxlflash: Remove unnecessary DMA mapping)
+ +	}
+ +
+ +	/* Copy the CDB from the scsi_cmnd passed in */
+  	memcpy(cmd->rcb.cdb, scp->cmnd, sizeof(cmd->rcb.cdb));
+  
+++<<<<<<< HEAD
+ +	/* Send the command */
+ +	rc = send_cmd(afu, cmd);
+ +	if (unlikely(rc)) {
+ +		cmd_checkin(cmd);
+ +		scsi_dma_unmap(scp);
+ +	}
+ +
+++=======
++ 	rc = afu->send_cmd(afu, cmd);
+++>>>>>>> 50b787f7235e (scsi: cxlflash: Remove unnecessary DMA mapping)
+  out:
+ +	pr_devel("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  }
+  
+* Unmerged path drivers/scsi/cxlflash/main.c
