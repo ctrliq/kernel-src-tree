@@ -120,6 +120,7 @@ tunable_strings[__ETHTOOL_TUNABLE_COUNT][ETH_GSTRING_LEN] = {
 	[ETHTOOL_ID_UNSPEC]     = "Unspec",
 	[ETHTOOL_RX_COPYBREAK]	= "rx-copybreak",
 	[ETHTOOL_TX_COPYBREAK]	= "tx-copybreak",
+	[ETHTOOL_PFC_PREVENTION_TOUT] = "pfc-prevention-tout",
 };
 
 static int ethtool_get_features(struct net_device *dev, void __user *useraddr)
@@ -2250,6 +2251,11 @@ static int ethtool_tunable_valid(const struct ethtool_tunable *tuna)
 	case ETHTOOL_TX_COPYBREAK:
 		if (tuna->len != sizeof(u32) ||
 		    tuna->type_id != ETHTOOL_TUNABLE_U32)
+			return -EINVAL;
+		break;
+	case ETHTOOL_PFC_PREVENTION_TOUT:
+		if (tuna->len != sizeof(u16) ||
+		    tuna->type_id != ETHTOOL_TUNABLE_U16)
 			return -EINVAL;
 		break;
 	default:
