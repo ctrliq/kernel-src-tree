@@ -1,0 +1,236 @@
+perf/core: Optimize side-band event delivery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit f2fb6bef92514432398a653df1c2f1041d79ac46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f2fb6bef.failed
+
+The perf_event_aux() function iterates all PMUs and all events in
+their respective per-CPU contexts to find the events to deliver
+side-band records to.
+
+For example, the brk test case in lkp triggers many mmap() operations,
+which, if we're also running perf, results in many perf_event_aux()
+invocations.
+
+If we enable uncore PMU support (even when uncore events are not used),
+dozens of uncore PMUs will be iterated, which can significantly
+decrease brk_test's throughput.
+
+For example, the brk throughput:
+
+  without uncore PMUs: 2647573 ops_per_sec
+  with    uncore PMUs: 1768444 ops_per_sec
+
+... a 33% reduction.
+
+To get at the per-CPU events that need side-band records, this patch
+puts these events on a per-CPU list, this avoids iterating the PMUs
+and any events that do not need side-band records.
+
+Per task events are unchanged to avoid extra overhead on the context
+switch paths.
+
+	Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reported-by: Huang, Ying <ying.huang@linux.intel.com>
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: http://lkml.kernel.org/r/1458757477-3781-1-git-send-email-kan.liang@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f2fb6bef92514432398a653df1c2f1041d79ac46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+diff --cc include/linux/perf_event.h
+index 5e596087b060,92e9ce737432..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -505,17 -680,7 +510,21 @@@ struct perf_event 
+  	int				cgrp_defer_enabled;
+  #endif
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We need storage to track the entries in perf_pmu_migrate_context; we
+ +	 * cannot use the event_entry because of RCU and we want to keep the
+ +	 * group in tact which avoids us using the other two entries.
+ +	 */
+ +	RH_KABI_EXTEND(struct list_head		migrate_entry)
+ +	RH_KABI_EXTEND(struct list_head		active_entry)
+ +	RH_KABI_EXTEND(void			*pmu_private)
+ +#if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_S390)
+ +	RH_KABI_EXTEND(struct ftrace_ops	 ftrace_ops)
+ +#endif
+++=======
++ 	struct list_head		sb_list;
+++>>>>>>> f2fb6bef9251 (perf/core: Optimize side-band event delivery)
+  #endif /* CONFIG_PERF_EVENTS */
+  };
+  
+* Unmerged path include/linux/perf_event.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 1e40002e26ef..6ddc11328ea5 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -325,6 +325,7 @@ enum event_type_t {
+ struct static_key_deferred perf_sched_events __read_mostly;
+ static DEFINE_PER_CPU(atomic_t, perf_cgroup_events);
+ static DEFINE_PER_CPU(int, perf_sched_cb_usages);
++static DEFINE_PER_CPU(struct pmu_event_list, pmu_sb_events);
+ 
+ static atomic_t nr_mmap_events __read_mostly;
+ static atomic_t nr_comm_events __read_mostly;
+@@ -3593,6 +3594,26 @@ static void free_event_rcu(struct rcu_head *head)
+ 
+ static void ring_buffer_detach(struct perf_event *event, struct ring_buffer *rb);
+ 
++static void detach_sb_event(struct perf_event *event)
++{
++	struct pmu_event_list *pel = per_cpu_ptr(&pmu_sb_events, event->cpu);
++
++	raw_spin_lock(&pel->lock);
++	list_del_rcu(&event->sb_list);
++	raw_spin_unlock(&pel->lock);
++}
++
++static void unaccount_pmu_sb_event(struct perf_event *event)
++{
++	if (event->parent)
++		return;
++
++	if (event->attach_state & PERF_ATTACH_TASK)
++		return;
++
++	detach_sb_event(event);
++}
++
+ static void unaccount_event_cpu(struct perf_event *event, int cpu)
+ {
+ 	if (event->parent)
+@@ -3632,6 +3653,8 @@ static void unaccount_event(struct perf_event *event)
+ 		static_key_slow_dec_deferred(&perf_sched_events);
+ 
+ 	unaccount_event_cpu(event, event->cpu);
++
++	unaccount_pmu_sb_event(event);
+ }
+ 
+ /*
+@@ -5714,13 +5737,25 @@ perf_event_aux_task_ctx(perf_event_aux_output_cb output, void *data,
+ 	rcu_read_unlock();
+ }
+ 
++static void perf_event_sb_iterate(perf_event_aux_output_cb output, void *data)
++{
++	struct pmu_event_list *pel = this_cpu_ptr(&pmu_sb_events);
++	struct perf_event *event;
++
++	list_for_each_entry_rcu(event, &pel->list, sb_list) {
++		if (event->state < PERF_EVENT_STATE_INACTIVE)
++			continue;
++		if (!event_filter_match(event))
++			continue;
++		output(event, data);
++	}
++}
++
+ static void
+ perf_event_aux(perf_event_aux_output_cb output, void *data,
+ 	       struct perf_event_context *task_ctx)
+ {
+-	struct perf_cpu_context *cpuctx;
+ 	struct perf_event_context *ctx;
+-	struct pmu *pmu;
+ 	int ctxn;
+ 
+ 	/*
+@@ -5735,20 +5770,15 @@ perf_event_aux(perf_event_aux_output_cb output, void *data,
+ 	}
+ 
+ 	rcu_read_lock();
+-	list_for_each_entry_rcu(pmu, &pmus, entry) {
+-		cpuctx = get_cpu_ptr(pmu->pmu_cpu_context);
+-		if (cpuctx->unique_pmu != pmu)
+-			goto next;
+-		perf_event_aux_ctx(&cpuctx->ctx, output, data, false);
+-		ctxn = pmu->task_ctx_nr;
+-		if (ctxn < 0)
+-			goto next;
++	preempt_disable();
++	perf_event_sb_iterate(output, data);
++
++	for_each_task_context_nr(ctxn) {
+ 		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
+ 		if (ctx)
+ 			perf_event_aux_ctx(ctx, output, data, false);
+-next:
+-		put_cpu_ptr(pmu->pmu_cpu_context);
+ 	}
++	preempt_enable();
+ 	rcu_read_unlock();
+ }
+ 
+@@ -7873,6 +7903,32 @@ unlock:
+ 	return pmu;
+ }
+ 
++static void attach_sb_event(struct perf_event *event)
++{
++	struct pmu_event_list *pel = per_cpu_ptr(&pmu_sb_events, event->cpu);
++
++	raw_spin_lock(&pel->lock);
++	list_add_rcu(&event->sb_list, &pel->list);
++	raw_spin_unlock(&pel->lock);
++}
++
++static void account_pmu_sb_event(struct perf_event *event)
++{
++	struct perf_event_attr *attr = &event->attr;
++
++	if (event->parent)
++		return;
++
++	if (event->attach_state & PERF_ATTACH_TASK)
++		return;
++
++	if (attr->mmap || attr->mmap_data || attr->mmap2 ||
++	    attr->comm || attr->comm_exec ||
++	    attr->task ||
++	    attr->context_switch)
++		attach_sb_event(event);
++}
++
+ static void account_event_cpu(struct perf_event *event, int cpu)
+ {
+ 	if (event->parent)
+@@ -7914,6 +7970,8 @@ static void account_event(struct perf_event *event)
+ 		static_key_slow_inc(&perf_sched_events.key);
+ 
+ 	account_event_cpu(event, event->cpu);
++
++	account_pmu_sb_event(event);
+ }
+ 
+ /*
+@@ -9324,6 +9382,9 @@ static void __init perf_event_init_all_cpus(void)
+ 		swhash = &per_cpu(swevent_htable, cpu);
+ 		mutex_init(&swhash->hlist_mutex);
+ 		INIT_LIST_HEAD(&per_cpu(active_ctx_list, cpu));
++
++		INIT_LIST_HEAD(&per_cpu(pmu_sb_events.list, cpu));
++		raw_spin_lock_init(&per_cpu(pmu_sb_events.lock, cpu));
+ 	}
+ }
+ 
