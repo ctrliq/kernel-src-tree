@@ -1,0 +1,534 @@
+net_sched: add reverse binding for tc class
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 07d79fc7d94e3f884b8b1c95aa615b202bb5e4c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/07d79fc7.failed
+
+TC filters when used as classifiers are bound to TC classes.
+However, there is a hidden difference when adding them in different
+orders:
+
+1. If we add tc classes before its filters, everything is fine.
+   Logically, the classes exist before we specify their ID's in
+   filters, it is easy to bind them together, just as in the current
+   code base.
+
+2. If we add tc filters before the tc classes they bind, we have to
+   do dynamic lookup in fast path. What's worse, this happens all
+   the time not just once, because on fast path tcf_result is passed
+   on stack, there is no way to propagate back to the one in tc filters.
+
+This hidden difference hurts performance silently if we have many tc
+classes in hierarchy.
+
+This patch intends to close this gap by doing the reverse binding when
+we create a new class, in this case we can actually search all the
+filters in its parent, match and fixup by classid. And because
+tcf_result is specific to each type of tc filter, we have to introduce
+a new ops for each filter to tell how to bind the class.
+
+Note, we still can NOT totally get rid of those class lookup in
+->enqueue() because cgroup and flow filters have no way to determine
+the classid at setup time, they still have to go through dynamic lookup.
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 07d79fc7d94e3f884b8b1c95aa615b202bb5e4c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_basic.c
+#	net/sched/cls_u32.c
+#	net/sched/sch_api.c
+diff --cc net/sched/cls_basic.c
+index 9d68a920c5a4,d89ebafd2239..000000000000
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@@ -241,10 -235,18 +241,22 @@@ skip
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int basic_dump(struct net *net, struct tcf_proto *tp, unsigned long fh,
+++=======
++ static void basic_bind_class(void *fh, u32 classid, unsigned long cl)
++ {
++ 	struct basic_filter *f = fh;
++ 
++ 	if (f && f->res.classid == classid)
++ 		f->res.class = cl;
++ }
++ 
++ static int basic_dump(struct net *net, struct tcf_proto *tp, void *fh,
+++>>>>>>> 07d79fc7d94e (net_sched: add reverse binding for tc class)
+  		      struct sk_buff *skb, struct tcmsg *t)
+  {
+ -	struct basic_filter *f = fh;
+ +	struct basic_filter *f = (struct basic_filter *) fh;
+  	struct nlattr *nest;
+  
+  	if (f == NULL)
+diff --cc net/sched/cls_u32.c
+index c8a2c6b5caaa,10b8d851fc6b..000000000000
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@@ -1115,10 -1112,18 +1115,22 @@@ static void u32_walk(struct tcf_proto *
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int u32_dump(struct net *net, struct tcf_proto *tp, unsigned long fh,
+++=======
++ static void u32_bind_class(void *fh, u32 classid, unsigned long cl)
++ {
++ 	struct tc_u_knode *n = fh;
++ 
++ 	if (n && n->res.classid == classid)
++ 		n->res.class = cl;
++ }
++ 
++ static int u32_dump(struct net *net, struct tcf_proto *tp, void *fh,
+++>>>>>>> 07d79fc7d94e (net_sched: add reverse binding for tc class)
+  		    struct sk_buff *skb, struct tcmsg *t)
+  {
+ -	struct tc_u_knode *n = fh;
+ +	struct tc_u_knode *n = (struct tc_u_knode *)fh;
+  	struct tc_u_hnode *ht_up, *ht_down;
+  	struct nlattr *nest;
+  
+diff --cc net/sched/sch_api.c
+index 0fd3de4f5fdb,929b024f41ba..000000000000
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@@ -34,14 -35,8 +34,15 @@@
+  #include <net/sock.h>
+  #include <net/netlink.h>
+  #include <net/pkt_sched.h>
++ #include <net/pkt_cls.h>
+  
+ +static int qdisc_notify(struct net *net, struct sk_buff *oskb,
+ +			struct nlmsghdr *n, u32 clid,
+ +			struct Qdisc *old, struct Qdisc *new);
+ +static int tclass_notify(struct net *net, struct sk_buff *oskb,
+ +			 struct nlmsghdr *n, struct Qdisc *q,
+ +			 unsigned long cl, int event);
+ +
+  /*
+  
+     Short review.
+@@@ -1529,9 -1551,164 +1530,143 @@@ done
+   *	Traffic classes manipulation.		*
+   ************************************************/
+  
+ -static int tc_fill_tclass(struct sk_buff *skb, struct Qdisc *q,
+ -			  unsigned long cl,
+ -			  u32 portid, u32 seq, u16 flags, int event)
+ -{
+ -	struct tcmsg *tcm;
+ -	struct nlmsghdr  *nlh;
+ -	unsigned char *b = skb_tail_pointer(skb);
+ -	struct gnet_dump d;
+ -	const struct Qdisc_class_ops *cl_ops = q->ops->cl_ops;
+  
+ -	cond_resched();
+ -	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*tcm), flags);
+ -	if (!nlh)
+ -		goto out_nlmsg_trim;
+ -	tcm = nlmsg_data(nlh);
+ -	tcm->tcm_family = AF_UNSPEC;
+ -	tcm->tcm__pad1 = 0;
+ -	tcm->tcm__pad2 = 0;
+ -	tcm->tcm_ifindex = qdisc_dev(q)->ifindex;
+ -	tcm->tcm_parent = q->handle;
+ -	tcm->tcm_handle = q->handle;
+ -	tcm->tcm_info = 0;
+ -	if (nla_put_string(skb, TCA_KIND, q->ops->id))
+ -		goto nla_put_failure;
+ -	if (cl_ops->dump && cl_ops->dump(q, cl, skb, tcm) < 0)
+ -		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n)
+++=======
++ 	if (gnet_stats_start_copy_compat(skb, TCA_STATS2, TCA_STATS, TCA_XSTATS,
++ 					 NULL, &d, TCA_PAD) < 0)
++ 		goto nla_put_failure;
++ 
++ 	if (cl_ops->dump_stats && cl_ops->dump_stats(q, cl, &d) < 0)
++ 		goto nla_put_failure;
++ 
++ 	if (gnet_stats_finish_copy(&d) < 0)
++ 		goto nla_put_failure;
++ 
++ 	nlh->nlmsg_len = skb_tail_pointer(skb) - b;
++ 	return skb->len;
++ 
++ out_nlmsg_trim:
++ nla_put_failure:
++ 	nlmsg_trim(skb, b);
++ 	return -1;
++ }
++ 
++ static int tclass_notify(struct net *net, struct sk_buff *oskb,
++ 			 struct nlmsghdr *n, struct Qdisc *q,
++ 			 unsigned long cl, int event)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tc_fill_tclass(skb, q, cl, portid, n->nlmsg_seq, 0, event) < 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static int tclass_del_notify(struct net *net,
++ 			     const struct Qdisc_class_ops *cops,
++ 			     struct sk_buff *oskb, struct nlmsghdr *n,
++ 			     struct Qdisc *q, unsigned long cl)
++ {
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 	struct sk_buff *skb;
++ 	int err = 0;
++ 
++ 	if (!cops->delete)
++ 		return -EOPNOTSUPP;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tc_fill_tclass(skb, q, cl, portid, n->nlmsg_seq, 0,
++ 			   RTM_DELTCLASS) < 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = cops->delete(q, cl);
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return err;
++ 	}
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ #ifdef CONFIG_NET_CLS
++ 
++ struct tcf_bind_args {
++ 	struct tcf_walker w;
++ 	u32 classid;
++ 	unsigned long cl;
++ };
++ 
++ static int tcf_node_bind(struct tcf_proto *tp, void *n, struct tcf_walker *arg)
++ {
++ 	struct tcf_bind_args *a = (void *)arg;
++ 
++ 	if (tp->ops->bind_class) {
++ 		tcf_tree_lock(tp);
++ 		tp->ops->bind_class(n, a->classid, a->cl);
++ 		tcf_tree_unlock(tp);
++ 	}
++ 	return 0;
++ }
++ 
++ static void tc_bind_tclass(struct Qdisc *q, u32 portid, u32 clid,
++ 			   unsigned long new_cl)
++ {
++ 	const struct Qdisc_class_ops *cops = q->ops->cl_ops;
++ 	struct tcf_block *block;
++ 	struct tcf_chain *chain;
++ 	unsigned long cl;
++ 
++ 	cl = cops->find(q, portid);
++ 	if (!cl)
++ 		return;
++ 	block = cops->tcf_block(q, cl);
++ 	if (!block)
++ 		return;
++ 	list_for_each_entry(chain, &block->chain_list, list) {
++ 		struct tcf_proto *tp;
++ 
++ 		for (tp = rtnl_dereference(chain->filter_chain);
++ 		     tp; tp = rtnl_dereference(tp->next)) {
++ 			struct tcf_bind_args arg = {};
++ 
++ 			arg.w.fn = tcf_node_bind;
++ 			arg.classid = clid;
++ 			arg.cl = new_cl;
++ 			tp->ops->walk(tp, &arg.w);
++ 		}
++ 	}
++ }
++ 
++ #else
++ 
++ static void tc_bind_tclass(struct Qdisc *q, u32 portid, u32 clid,
++ 			   unsigned long new_cl)
++ {
++ }
++ 
++ #endif
++ 
++ static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n,
++ 			 struct netlink_ext_ack *extack)
+++>>>>>>> 07d79fc7d94e (net_sched: add reverse binding for tc class)
+  {
+  	struct net *net = sock_net(skb->sk);
+  	struct tcmsg *tcm = nlmsg_data(n);
+@@@ -1633,12 -1811,9 +1768,18 @@@
+  				goto out;
+  			break;
+  		case RTM_DELTCLASS:
+++<<<<<<< HEAD
+ +			err = -EOPNOTSUPP;
+ +			if (cops->delete)
+ +				err = cops->delete(q, cl);
+ +			if (err == 0)
+ +				tclass_notify(net, skb, n, q, cl,
+ +					      RTM_DELTCLASS);
+++=======
++ 			err = tclass_del_notify(net, cops, skb, n, q, cl);
++ 			/* Unbind the class with flilters with 0 */
++ 			tc_bind_tclass(q, portid, clid, 0);
+++>>>>>>> 07d79fc7d94e (net_sched: add reverse binding for tc class)
+  			goto out;
+  		case RTM_GETTCLASS:
+  			err = tclass_notify(net, skb, n, q, cl, RTM_NEWTCLASS);
+@@@ -1653,13 -1828,13 +1794,16 @@@
+  	err = -EOPNOTSUPP;
+  	if (cops->change)
+  		err = cops->change(q, clid, portid, tca, &new_cl);
+- 	if (err == 0)
++ 	if (err == 0) {
+  		tclass_notify(net, skb, n, q, new_cl, RTM_NEWTCLASS);
+- 
++ 		/* We just create a new class, need to do reverse binding. */
++ 		if (cl != new_cl)
++ 			tc_bind_tclass(q, portid, clid, new_cl);
++ 	}
+  out:
+ +	if (cl)
+ +		cops->put(q, cl);
+ +
+  	return err;
+  }
+  
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 7b71e43efef9..46cae7585a54 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -210,6 +210,7 @@ struct tcf_proto_ops {
+ 					unsigned long *, bool))
+ 	int			(*delete)(struct tcf_proto*, unsigned long);
+ 	void			(*walk)(struct tcf_proto*, struct tcf_walker *arg);
++	void			(*bind_class)(void *, u32, unsigned long);
+ 
+ 	/* rtnetlink specific */
+ 	RH_KABI_REPLACE(
+* Unmerged path net/sched/cls_basic.c
+diff --git a/net/sched/cls_bpf.c b/net/sched/cls_bpf.c
+index c13fb5505297..1acd9c9ff3b4 100644
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -340,6 +340,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void cls_bpf_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct cls_bpf_prog *prog = fh;
++
++	if (prog && prog->res.classid == classid)
++		prog->res.class = cl;
++}
++
+ static void cls_bpf_walk(struct tcf_proto *tp, struct tcf_walker *arg)
+ {
+ 	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+@@ -368,6 +376,7 @@ static struct tcf_proto_ops cls_bpf_ops __read_mostly = {
+ 	.delete		=	cls_bpf_delete,
+ 	.walk		=	cls_bpf_walk,
+ 	.dump		=	cls_bpf_dump,
++	.bind_class	=	cls_bpf_bind_class,
+ };
+ 
+ static int __init cls_bpf_init_mod(void)
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index 2d81cc7499da..0f2209fff6dc 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -1378,6 +1378,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void fl_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct cls_fl_filter *f = fh;
++
++	if (f && f->res.classid == classid)
++		f->res.class = cl;
++}
++
+ static struct tcf_proto_ops cls_fl_ops __read_mostly = {
+ 	.kind		= "flower",
+ 	.classify	= fl_classify,
+@@ -1388,6 +1396,7 @@ static struct tcf_proto_ops cls_fl_ops __read_mostly = {
+ 	.delete		= fl_delete,
+ 	.walk		= fl_walk,
+ 	.dump		= fl_dump,
++	.bind_class	= fl_bind_class,
+ 	.owner		= THIS_MODULE,
+ };
+ 
+diff --git a/net/sched/cls_fw.c b/net/sched/cls_fw.c
+index f11733402ade..79d8b2f24b9a 100644
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@ -408,6 +408,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void fw_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct fw_filter *f = fh;
++
++	if (f && f->res.classid == classid)
++		f->res.class = cl;
++}
++
+ static struct tcf_proto_ops cls_fw_ops __read_mostly = {
+ 	.kind		=	"fw",
+ 	.classify	=	fw_classify,
+@@ -418,6 +426,7 @@ static struct tcf_proto_ops cls_fw_ops __read_mostly = {
+ 	.delete		=	fw_delete,
+ 	.walk		=	fw_walk,
+ 	.dump		=	fw_dump,
++	.bind_class	=	fw_bind_class,
+ 	.owner		=	THIS_MODULE,
+ };
+ 
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index f7bc58777169..eb0e263ed17c 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -271,6 +271,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void mall_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct cls_mall_head *head = fh;
++
++	if (head && head->res.classid == classid)
++		head->res.class = cl;
++}
++
+ static struct tcf_proto_ops cls_mall_ops __read_mostly = {
+ 	.kind		= "matchall",
+ 	.classify	= mall_classify,
+@@ -281,6 +289,7 @@ static struct tcf_proto_ops cls_mall_ops __read_mostly = {
+ 	.delete		= mall_delete,
+ 	.walk		= mall_walk,
+ 	.dump		= mall_dump,
++	.bind_class	= mall_bind_class,
+ 	.owner		= THIS_MODULE,
+ };
+ 
+diff --git a/net/sched/cls_route.c b/net/sched/cls_route.c
+index ddc332f8bc11..be9dc0d5d89d 100644
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -628,6 +628,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void route4_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct route4_filter *f = fh;
++
++	if (f && f->res.classid == classid)
++		f->res.class = cl;
++}
++
+ static struct tcf_proto_ops cls_route4_ops __read_mostly = {
+ 	.kind		=	"route",
+ 	.classify	=	route4_classify,
+@@ -638,6 +646,7 @@ static struct tcf_proto_ops cls_route4_ops __read_mostly = {
+ 	.delete		=	route4_delete,
+ 	.walk		=	route4_walk,
+ 	.dump		=	route4_dump,
++	.bind_class	=	route4_bind_class,
+ 	.owner		=	THIS_MODULE,
+ };
+ 
+diff --git a/net/sched/cls_rsvp.h b/net/sched/cls_rsvp.h
+index 29d6409252c7..1653242aebba 100644
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -712,6 +712,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void rsvp_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct rsvp_filter *f = fh;
++
++	if (f && f->res.classid == classid)
++		f->res.class = cl;
++}
++
+ static struct tcf_proto_ops RSVP_OPS __read_mostly = {
+ 	.kind		=	RSVP_ID,
+ 	.classify	=	rsvp_classify,
+@@ -722,6 +730,7 @@ static struct tcf_proto_ops RSVP_OPS __read_mostly = {
+ 	.delete		=	rsvp_delete,
+ 	.walk		=	rsvp_walk,
+ 	.dump		=	rsvp_dump,
++	.bind_class	=	rsvp_bind_class,
+ 	.owner		=	THIS_MODULE,
+ };
+ 
+diff --git a/net/sched/cls_tcindex.c b/net/sched/cls_tcindex.c
+index 5f0af005d12e..9c84a563ffe2 100644
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -569,6 +569,14 @@ nla_put_failure:
+ 	return -1;
+ }
+ 
++static void tcindex_bind_class(void *fh, u32 classid, unsigned long cl)
++{
++	struct tcindex_filter_result *r = fh;
++
++	if (r && r->res.classid == classid)
++		r->res.class = cl;
++}
++
+ static struct tcf_proto_ops cls_tcindex_ops __read_mostly = {
+ 	.kind		=	"tcindex",
+ 	.classify	=	tcindex_classify,
+@@ -579,6 +587,7 @@ static struct tcf_proto_ops cls_tcindex_ops __read_mostly = {
+ 	.delete		=	tcindex_delete,
+ 	.walk		=	tcindex_walk,
+ 	.dump		=	tcindex_dump,
++	.bind_class	=	tcindex_bind_class,
+ 	.owner		=	THIS_MODULE,
+ };
+ 
+* Unmerged path net/sched/cls_u32.c
+* Unmerged path net/sched/sch_api.c
