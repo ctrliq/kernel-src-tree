@@ -1,0 +1,119 @@
+mmc: block: Refactor mmc_blk_part_switch()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Refactor mmc_blk_part_switch() (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 93.67%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 1f797edc62da59ad9b319a6b3f7c73a58047c896
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1f797edc.failed
+
+Instead of passing a struct mmc_blk_data * to mmc_blk_part_switch()
+let's pass the actual partition type we want to switch to. This
+is necessary in order not to have a block device with a backing
+mmc_blk_data and request queue and all for every hardware partition,
+such as RPMB.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 1f797edc62da59ad9b319a6b3f7c73a58047c896)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index 02e8b44f3a1d,e3c3641e881a..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1154,7 -1171,69 +1154,73 @@@ int mmc_access_rpmb(struct mmc_queue *m
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++=======
++ /*
++  * The non-block commands come back from the block layer after it queued it and
++  * processed it with all other requests and then they get issued in this
++  * function.
++  */
++ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	struct mmc_blk_data *main_md = dev_get_drvdata(&card->dev);
++ 	struct mmc_blk_ioc_data **idata;
++ 	u8 **ext_csd;
++ 	u32 status;
++ 	int ret;
++ 	int i;
++ 
++ 	mq_rq = req_to_mmc_queue_req(req);
++ 
++ 	switch (mq_rq->drv_op) {
++ 	case MMC_DRV_OP_IOCTL:
++ 		idata = mq_rq->drv_op_data;
++ 		for (i = 0, ret = 0; i < mq_rq->ioc_count; i++) {
++ 			ret = __mmc_blk_ioctl_cmd(card, md, idata[i]);
++ 			if (ret)
++ 				break;
++ 		}
++ 		/* Always switch back to main area after RPMB access */
++ 		if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
++ 			mmc_blk_part_switch(card, main_md->part_type);
++ 		break;
++ 	case MMC_DRV_OP_BOOT_WP:
++ 		ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BOOT_WP,
++ 				 card->ext_csd.boot_ro_lock |
++ 				 EXT_CSD_BOOT_WP_B_PWR_WP_EN,
++ 				 card->ext_csd.part_time);
++ 		if (ret)
++ 			pr_err("%s: Locking boot partition ro until next power on failed: %d\n",
++ 			       md->disk->disk_name, ret);
++ 		else
++ 			card->ext_csd.boot_ro_lock |=
++ 				EXT_CSD_BOOT_WP_B_PWR_WP_EN;
++ 		break;
++ 	case MMC_DRV_OP_GET_CARD_STATUS:
++ 		ret = mmc_send_status(card, &status);
++ 		if (!ret)
++ 			ret = status;
++ 		break;
++ 	case MMC_DRV_OP_GET_EXT_CSD:
++ 		ext_csd = mq_rq->drv_op_data;
++ 		ret = mmc_get_ext_csd(card, ext_csd);
++ 		break;
++ 	default:
++ 		pr_err("%s: unknown driver specific operation\n",
++ 		       md->disk->disk_name);
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	mq_rq->drv_op_result = ret;
++ 	blk_end_request_all(req, ret);
++ }
++ 
++ static void mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++>>>>>>> 1f797edc62da (mmc: block: Refactor mmc_blk_part_switch())
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+@@@ -1831,12 -1960,11 +1897,12 @@@ int mmc_blk_issue_rq(struct mmc_queue *
+  		/* claim host only for the first request */
+  		mmc_get_card(card);
+  
+- 	ret = mmc_blk_part_switch(card, md);
++ 	ret = mmc_blk_part_switch(card, md->part_type);
+  	if (ret) {
+  		if (req) {
+ -			blk_end_request_all(req, BLK_STS_IOERR);
+ +			blk_end_request_all(req, -EIO);
+  		}
+ +		ret = 0;
+  		goto out;
+  	}
+  
+* Unmerged path drivers/mmc/core/block.c
