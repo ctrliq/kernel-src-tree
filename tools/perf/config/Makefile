@@ -343,6 +343,7 @@ ifndef NO_LIBUNWIND
     $(call detected,CONFIG_LIBUNWIND_X86)
     CFLAGS += -DHAVE_LIBUNWIND_X86_SUPPORT
     LDFLAGS += -lunwind-x86
+    EXTLIBS_LIBUNWIND += -lunwind-x86
     have_libunwind = 1
   endif
 
@@ -350,6 +351,7 @@ ifndef NO_LIBUNWIND
     $(call detected,CONFIG_LIBUNWIND_AARCH64)
     CFLAGS += -DHAVE_LIBUNWIND_AARCH64_SUPPORT
     LDFLAGS += -lunwind-aarch64
+    EXTLIBS_LIBUNWIND += -lunwind-aarch64
     have_libunwind = 1
     $(call feature_check,libunwind-debug-frame-aarch64)
     ifneq ($(feature-libunwind-debug-frame-aarch64), 1)
@@ -420,6 +422,7 @@ ifndef NO_LIBUNWIND
   CFLAGS  += -DHAVE_LIBUNWIND_SUPPORT
   CFLAGS  += $(LIBUNWIND_CFLAGS)
   LDFLAGS += $(LIBUNWIND_LDFLAGS)
+  EXTLIBS += $(EXTLIBS_LIBUNWIND)
 endif
 
 ifndef NO_LIBAUDIT
