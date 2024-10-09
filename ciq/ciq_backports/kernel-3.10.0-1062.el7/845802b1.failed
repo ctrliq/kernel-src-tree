@@ -1,0 +1,192 @@
+gfs2: Remove ordered write mode handling from gfs2_trans_add_data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 845802b112eeedfa32b2ebba694996a49677596e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/845802b1.failed
+
+In journaled data mode, we need to add each buffer head to the current
+transaction.  In ordered write mode, we only need to add the inode to
+the ordered inode list.  So far, both cases are handled in
+gfs2_trans_add_data.  This makes the code look misleading and is
+inefficient for small block sizes as well.  Handle both cases separately
+instead.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 845802b112eeedfa32b2ebba694996a49677596e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/aops.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/aops.c
+index cacd7512318a,35f5ee23566d..000000000000
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@@ -49,10 -50,11 +49,16 @@@ static void gfs2_page_add_databufs(stru
+  	for (bh = head, start = 0; bh != head || !start;
+  	     bh = bh->b_this_page, start = end) {
+  		end = start + bsize;
+ -		if (end <= from)
+ +		if (end <= from || start >= to)
+  			continue;
+++<<<<<<< HEAD
+ +		if (gfs2_is_jdata(ip))
+ +			set_buffer_uptodate(bh);
+++=======
++ 		if (start >= to)
++ 			break;
++ 		set_buffer_uptodate(bh);
+++>>>>>>> 845802b112ee (gfs2: Remove ordered write mode handling from gfs2_trans_add_data)
+  		gfs2_trans_add_data(ip->i_gl, bh);
+  	}
+  }
+@@@ -941,19 -884,22 +947,26 @@@ static int gfs2_write_end(struct file *
+  	BUG_ON(gfs2_glock_is_locked_by_me(ip->i_gl) == NULL);
+  
+  	ret = gfs2_meta_inode_buffer(ip, &dibh);
+ -	if (unlikely(ret))
+ -		goto out;
+ -
+ -	if (gfs2_is_stuffed(ip)) {
+ -		ret = gfs2_stuffed_write_end(inode, dibh, pos, copied, page);
+ -		page = NULL;
+ -		goto out2;
+ +	if (unlikely(ret)) {
+ +		unlock_page(page);
+ +		page_cache_release(page);
+ +		goto failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (gfs2_is_stuffed(ip))
+ +		return gfs2_stuffed_write_end(inode, dibh, pos, len, copied, page);
+ +
+ +	if (!gfs2_is_writeback(ip))
+ +		gfs2_page_add_databufs(ip, page, from, to);
+++=======
++ 	if (gfs2_is_jdata(ip))
++ 		gfs2_page_add_databufs(ip, page, pos & ~PAGE_MASK, len);
++ 	else
++ 		gfs2_ordered_add_inode(ip);
+++>>>>>>> 845802b112ee (gfs2: Remove ordered write mode handling from gfs2_trans_add_data)
+  
+  	ret = generic_write_end(file, mapping, pos, len, copied, page, fsdata);
+ -	page = NULL;
+  	if (tr->tr_num_buf_new)
+  		__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+  	else
+diff --cc fs/gfs2/trans.c
+index dd534982a08d,064c9a0ef046..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -170,18 -143,14 +170,29 @@@ static struct gfs2_bufdata *gfs2_alloc_
+   * @gl: The inode glock associated with the buffer
+   * @bh: The buffer to add
+   *
+++<<<<<<< HEAD
+ + * This is used in two distinct cases:
+ + * i) In ordered write mode
+ + *    We put the data buffer on a list so that we can ensure that its
+ + *    synced to disk at the right time
+ + * ii) In journaled data mode
+ + *    We need to journal the data block in the same way as metadata in
+ + *    the functions above. The difference is that here we have a tag
+ + *    which is two __be64's being the block number (as per meta data)
+ + *    and a flag which says whether the data block needs escaping or
+ + *    not. This means we need a new log entry for each 251 or so data
+ + *    blocks, which isn't an enormous overhead but twice as much as
+ + *    for normal metadata blocks.
+++=======
++  * This is used in journaled data mode.
++  * We need to journal the data block in the same way as metadata in
++  * the functions above. The difference is that here we have a tag
++  * which is two __be64's being the block number (as per meta data)
++  * and a flag which says whether the data block needs escaping or
++  * not. This means we need a new log entry for each 251 or so data
++  * blocks, which isn't an enormous overhead but twice as much as
++  * for normal metadata blocks.
+++>>>>>>> 845802b112ee (gfs2: Remove ordered write mode handling from gfs2_trans_add_data)
+   */
+  void gfs2_trans_add_data(struct gfs2_glock *gl, struct buffer_head *bh)
+  {
+* Unmerged path fs/gfs2/aops.c
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 2b54e62ca6f7..ab34ce13d1e7 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -89,10 +89,12 @@ static int gfs2_unstuffer_page(struct gfs2_inode *ip, struct buffer_head *dibh,
+ 		map_bh(bh, inode->i_sb, block);
+ 
+ 	set_buffer_uptodate(bh);
+-	if (!gfs2_is_jdata(ip))
+-		mark_buffer_dirty(bh);
+-	if (!gfs2_is_writeback(ip))
++	if (gfs2_is_jdata(ip))
+ 		gfs2_trans_add_data(ip->i_gl, bh);
++	else {
++		mark_buffer_dirty(bh);
++		gfs2_ordered_add_inode(ip);
++	}
+ 
+ 	if (release) {
+ 		unlock_page(page);
+@@ -935,8 +937,10 @@ static int gfs2_block_truncate_page(struct address_space *mapping, loff_t from)
+ 		err = 0;
+ 	}
+ 
+-	if (!gfs2_is_writeback(ip))
++	if (gfs2_is_jdata(ip))
+ 		gfs2_trans_add_data(ip->i_gl, bh);
++	else
++		gfs2_ordered_add_inode(ip);
+ 
+ 	zero_user(page, offset, length);
+ 	mark_buffer_dirty(bh);
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 92dcbe70730e..0f14bc655cc6 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -14,6 +14,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/writeback.h>
+ #include "incore.h"
++#include "inode.h"
+ 
+ /**
+  * gfs2_log_lock - acquire the right to mess with the log manager
+@@ -50,8 +51,12 @@ static inline void gfs2_log_pointers_init(struct gfs2_sbd *sdp,
+ 
+ static inline void gfs2_ordered_add_inode(struct gfs2_inode *ip)
+ {
+-	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
++	struct gfs2_sbd *sdp;
+ 
++	if (!gfs2_is_ordered(ip))
++		return;
++
++	sdp = GFS2_SB(&ip->i_inode);
+ 	if (!test_bit(GIF_ORDERED, &ip->i_flags)) {
+ 		spin_lock(&sdp->sd_ordered_lock);
+ 		if (!test_and_set_bit(GIF_ORDERED, &ip->i_flags))
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index 3d5f86897bc8..59f8789aa118 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -723,7 +723,10 @@ static int gfs2_write_buf_to_page(struct gfs2_inode *ip, unsigned long index,
+ 			if (!buffer_uptodate(bh))
+ 				goto unlock_out;
+ 		}
+-		gfs2_trans_add_data(ip->i_gl, bh);
++		if (gfs2_is_jdata(ip))
++			gfs2_trans_add_data(ip->i_gl, bh);
++		else
++			gfs2_ordered_add_inode(ip);
+ 
+ 		/* If we need to write to the next block as well */
+ 		if (to_write > (bsize - boff)) {
+* Unmerged path fs/gfs2/trans.c
