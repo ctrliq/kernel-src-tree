@@ -1,0 +1,165 @@
+cxgb4: Shutdown adapter if firmware times out or errors out
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 3be0679b4a91930ca8d0c8a66b39058a698e70fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3be0679b.failed
+
+Perform an emergency shutdown of the adapter and stop it from
+continuing any further communication on the ports or DMA to the
+host. This is typically used when the adapter and/or firmware
+have crashed and we want to prevent any further accidental
+communication with the rest of the world. This will also force
+the port Link Status to go down -- if register writes work --
+which should help our peers figure out that we're down.
+
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3be0679b4a91930ca8d0c8a66b39058a698e70fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index c7c0fe68ee40,87000cd39737..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@@ -312,6 -312,55 +312,58 @@@ int t4_wr_mbox_meat_timeout(struct adap
+  		timeout = -timeout;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Queue ourselves onto the mailbox access list.  When our entry is at
++ 	 * the front of the list, we have rights to access the mailbox.  So we
++ 	 * wait [for a while] till we're at the front [or bail out with an
++ 	 * EBUSY] ...
++ 	 */
++ 	spin_lock(&adap->mbox_lock);
++ 	list_add_tail(&entry.list, &adap->mlist.list);
++ 	spin_unlock(&adap->mbox_lock);
++ 
++ 	delay_idx = 0;
++ 	ms = delay[0];
++ 
++ 	for (i = 0; ; i += ms) {
++ 		/* If we've waited too long, return a busy indication.  This
++ 		 * really ought to be based on our initial position in the
++ 		 * mailbox access list but this is a start.  We very rearely
++ 		 * contend on access to the mailbox ...
++ 		 */
++ 		pcie_fw = t4_read_reg(adap, PCIE_FW_A);
++ 		if (i > FW_CMD_MAX_TIMEOUT || (pcie_fw & PCIE_FW_ERR_F)) {
++ 			spin_lock(&adap->mbox_lock);
++ 			list_del(&entry.list);
++ 			spin_unlock(&adap->mbox_lock);
++ 			ret = (pcie_fw & PCIE_FW_ERR_F) ? -ENXIO : -EBUSY;
++ 			t4_record_mbox(adap, cmd, size, access, ret);
++ 			return ret;
++ 		}
++ 
++ 		/* If we're at the head, break out and start the mailbox
++ 		 * protocol.
++ 		 */
++ 		if (list_first_entry(&adap->mlist.list, struct mbox_list,
++ 				     list) == &entry)
++ 			break;
++ 
++ 		/* Delay for a bit before checking again ... */
++ 		if (sleep_ok) {
++ 			ms = delay[delay_idx];  /* last element may repeat */
++ 			if (delay_idx < ARRAY_SIZE(delay) - 1)
++ 				delay_idx++;
++ 			msleep(ms);
++ 		} else {
++ 			mdelay(ms);
++ 		}
++ 	}
++ 
++ 	/* Loop trying to get ownership of the mailbox.  Return an error
++ 	 * if we can't gain ownership.
++ 	 */
+++>>>>>>> 3be0679b4a91 (cxgb4: Shutdown adapter if firmware times out or errors out)
+  	v = MBOWNER_G(t4_read_reg(adap, ctl_reg));
+  	for (i = 0; v == MBOX_OWNER_NONE && i < 3; i++)
+  		v = MBOWNER_G(t4_read_reg(adap, ctl_reg));
+@@@ -376,6 -430,10 +428,13 @@@
+  	dev_err(adap->pdev_dev, "command %#x in mailbox %d timed out\n",
+  		*(const u8 *)cmd, mbox);
+  	t4_report_fw_error(adap);
+++<<<<<<< HEAD
+++=======
++ 	spin_lock(&adap->mbox_lock);
++ 	list_del(&entry.list);
++ 	spin_unlock(&adap->mbox_lock);
++ 	t4_fatal_err(adap);
+++>>>>>>> 3be0679b4a91 (cxgb4: Shutdown adapter if firmware times out or errors out)
+  	return ret;
+  }
+  
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 3a2e99f48417..5aff50ac1ca8 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -1354,6 +1354,7 @@ int t4_prep_fw(struct adapter *adap, struct fw_info *fw_info,
+ 	       const u8 *fw_data, unsigned int fw_size,
+ 	       struct fw_hdr *card_fw, enum dev_state state, int *reset);
+ int t4_prep_adapter(struct adapter *adapter);
++int t4_shutdown_adapter(struct adapter *adapter);
+ 
+ enum t4_bar2_qtype { T4_BAR2_QTYPE_EGRESS, T4_BAR2_QTYPE_INGRESS };
+ int t4_bar2_sge_qregs(struct adapter *adapter,
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index b8553c425ce5..3074f8524a8d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -3152,8 +3152,24 @@ static const struct ethtool_ops cxgb4_mgmt_ethtool_ops = {
+ 
+ void t4_fatal_err(struct adapter *adap)
+ {
+-	t4_set_reg_field(adap, SGE_CONTROL_A, GLOBALENABLE_F, 0);
+-	t4_intr_disable(adap);
++	int port;
++
++	/* Disable the SGE since ULDs are going to free resources that
++	 * could be exposed to the adapter.  RDMA MWs for example...
++	 */
++	t4_shutdown_adapter(adap);
++	for_each_port(adap, port) {
++		struct net_device *dev = adap->port[port];
++
++		/* If we get here in very early initialization the network
++		 * devices may not have been set up yet.
++		 */
++		if (!dev)
++			continue;
++
++		netif_tx_stop_all_queues(dev);
++		netif_carrier_off(dev);
++	}
+ 	dev_alert(adap->pdev_dev, "encountered fatal error, adapter stopped\n");
+ }
+ 
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+index 9fea255c7e87..f4baf58e862b 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+@@ -855,6 +855,14 @@
+ #define PERR_INT_CAUSE_V(x) ((x) << PERR_INT_CAUSE_S)
+ #define PERR_INT_CAUSE_F    PERR_INT_CAUSE_V(1U)
+ 
++#define DBG_GPIO_EN_A		0x6010
++#define XGMAC_PORT_CFG_A	0x1000
++#define MAC_PORT_CFG_A		0x800
++
++#define SIGNAL_DET_S    14
++#define SIGNAL_DET_V(x) ((x) << SIGNAL_DET_S)
++#define SIGNAL_DET_F    SIGNAL_DET_V(1U)
++
+ #define MC_ECC_STATUS_A		0x751c
+ #define MC_P_ECC_STATUS_A	0x4131c
+ 
