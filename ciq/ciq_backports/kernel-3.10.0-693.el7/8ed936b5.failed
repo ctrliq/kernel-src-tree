@@ -1,0 +1,217 @@
+vfs: Lazily remove mounts on unlinked files and directories.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [fs] vfs: Lazily remove mounts on unlinked files and directories ("Eric W. Biederman") [1247935]
+Rebuild_FUZZ: 99.16%
+commit-author Eric W. Biederman <ebiederman@twitter.com>
+commit 8ed936b5671bfb33d89bc60bdcc7cf0470ba52fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8ed936b5.failed
+
+With the introduction of mount namespaces and bind mounts it became
+possible to access files and directories that on some paths are mount
+points but are not mount points on other paths.  It is very confusing
+when rm -rf somedir returns -EBUSY simply because somedir is mounted
+somewhere else.  With the addition of user namespaces allowing
+unprivileged mounts this condition has gone from annoying to allowing
+a DOS attack on other users in the system.
+
+The possibility for mischief is removed by updating the vfs to support
+rename, unlink and rmdir on a dentry that is a mountpoint and by
+lazily unmounting mountpoints on deleted dentries.
+
+In particular this change allows rename, unlink and rmdir system calls
+on a dentry without a mountpoint in the current mount namespace to
+succeed, and it allows rename, unlink, and rmdir performed on a
+distributed filesystem to update the vfs cache even if when there is a
+mount in some namespace on the original dentry.
+
+There are two common patterns of maintaining mounts: Mounts on trusted
+paths with the parent directory of the mount point and all ancestory
+directories up to / owned by root and modifiable only by root
+(i.e. /media/xxx, /dev, /dev/pts, /proc, /sys, /sys/fs/cgroup/{cpu,
+cpuacct, ...}, /usr, /usr/local).  Mounts on unprivileged directories
+maintained by fusermount.
+
+In the case of mounts in trusted directories owned by root and
+modifiable only by root the current parent directory permissions are
+sufficient to ensure a mount point on a trusted path is not removed
+or renamed by anyone other than root, even if there is a context
+where the there are no mount points to prevent this.
+
+In the case of mounts in directories owned by less privileged users
+races with users modifying the path of a mount point are already a
+danger.  fusermount already uses a combination of chdir,
+/proc/<pid>/fd/NNN, and UMOUNT_NOFOLLOW to prevent these races.  The
+removable of global rename, unlink, and rmdir protection really adds
+nothing new to consider only a widening of the attack window, and
+fusermount is already safe against unprivileged users modifying the
+directory simultaneously.
+
+In principle for perfect userspace programs returning -EBUSY for
+unlink, rmdir, and rename of dentires that have mounts in the local
+namespace is actually unnecessary.  Unfortunately not all userspace
+programs are perfect so retaining -EBUSY for unlink, rmdir and rename
+of dentries that have mounts in the current mount namespace plays an
+important role of maintaining consistency with historical behavior and
+making imperfect userspace applications hard to exploit.
+
+v2: Remove spurious old_dentry.
+v3: Optimized shrink_submounts_and_drop
+    Removed unsued afs label
+v4: Simplified the changes to check_submounts_and_drop
+    Do not rename check_submounts_and_drop shrink_submounts_and_drop
+    Document what why we need atomicity in check_submounts_and_drop
+    Rely on the parent inode mutex to make d_revalidate and d_invalidate
+    an atomic unit.
+v5: Refcount the mountpoint to detach in case of simultaneous
+    renames.
+
+	Reviewed-by: Miklos Szeredi <miklos@szeredi.hu>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 8ed936b5671bfb33d89bc60bdcc7cf0470ba52fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 396c17a096b6,484114a4db93..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1256,12 -1293,67 +1256,71 @@@ void shrink_dcache_parent(struct dentr
+  }
+  EXPORT_SYMBOL(shrink_dcache_parent);
+  
+++<<<<<<< HEAD
+ +static enum d_walk_ret check_and_collect(void *_data, struct dentry *dentry)
+++=======
++ static enum d_walk_ret umount_check(void *_data, struct dentry *dentry)
++ {
++ 	/* it has busy descendents; complain about those instead */
++ 	if (!list_empty(&dentry->d_subdirs))
++ 		return D_WALK_CONTINUE;
++ 
++ 	/* root with refcount 1 is fine */
++ 	if (dentry == _data && dentry->d_lockref.count == 1)
++ 		return D_WALK_CONTINUE;
++ 
++ 	printk(KERN_ERR "BUG: Dentry %p{i=%lx,n=%pd} "
++ 			" still in use (%d) [unmount of %s %s]\n",
++ 		       dentry,
++ 		       dentry->d_inode ?
++ 		       dentry->d_inode->i_ino : 0UL,
++ 		       dentry,
++ 		       dentry->d_lockref.count,
++ 		       dentry->d_sb->s_type->name,
++ 		       dentry->d_sb->s_id);
++ 	WARN_ON(1);
++ 	return D_WALK_CONTINUE;
++ }
++ 
++ static void do_one_tree(struct dentry *dentry)
+  {
+- 	struct select_data *data = _data;
++ 	shrink_dcache_parent(dentry);
++ 	d_walk(dentry, dentry, umount_check, NULL);
++ 	d_drop(dentry);
++ 	dput(dentry);
++ }
++ 
++ /*
++  * destroy the dentries attached to a superblock on unmounting
++  */
++ void shrink_dcache_for_umount(struct super_block *sb)
++ {
++ 	struct dentry *dentry;
++ 
++ 	WARN(down_read_trylock(&sb->s_umount), "s_umount should've been locked");
++ 
++ 	dentry = sb->s_root;
++ 	sb->s_root = NULL;
++ 	do_one_tree(dentry);
++ 
++ 	while (!hlist_bl_empty(&sb->s_anon)) {
++ 		dentry = dget(hlist_bl_entry(hlist_bl_first(&sb->s_anon), struct dentry, d_hash));
++ 		do_one_tree(dentry);
++ 	}
++ }
++ 
++ struct detach_data {
++ 	struct select_data select;
++ 	struct dentry *mountpoint;
++ };
++ static enum d_walk_ret detach_and_collect(void *_data, struct dentry *dentry)
+++>>>>>>> 8ed936b5671b (vfs: Lazily remove mounts on unlinked files and directories.)
++ {
++ 	struct detach_data *data = _data;
+  
+  	if (d_mountpoint(dentry)) {
+- 		data->found = -EBUSY;
++ 		__dget_dlock(dentry);
++ 		data->mountpoint = dentry;
+  		return D_WALK_QUIT;
+  	}
+  
+* Unmerged path fs/dcache.c
+diff --git a/fs/namei.c b/fs/namei.c
+index 94c3485a37f9..b711de883f2c 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3672,8 +3672,6 @@ int vfs_rmdir(struct inode *dir, struct dentry *dentry)
+ 	error = -EBUSY;
+ 	if (is_local_mountpoint(dentry))
+ 		goto out;
+-	if (d_mountpoint(dentry))
+-		goto out;
+ 
+ 	error = security_inode_rmdir(dir, dentry);
+ 	if (error)
+@@ -3686,6 +3684,7 @@ int vfs_rmdir(struct inode *dir, struct dentry *dentry)
+ 
+ 	dentry->d_inode->i_flags |= S_DEAD;
+ 	dont_mount(dentry);
++	detach_mounts(dentry);
+ 
+ out:
+ 	mutex_unlock(&dentry->d_inode->i_mutex);
+@@ -3787,7 +3786,7 @@ int vfs_unlink(struct inode *dir, struct dentry *dentry, struct inode **delegate
+ 		return -EPERM;
+ 
+ 	mutex_lock(&target->i_mutex);
+-	if (is_local_mountpoint(dentry) || d_mountpoint(dentry))
++	if (is_local_mountpoint(dentry))
+ 		error = -EBUSY;
+ 	else {
+ 		error = security_inode_unlink(dir, dentry);
+@@ -3796,8 +3795,10 @@ int vfs_unlink(struct inode *dir, struct dentry *dentry, struct inode **delegate
+ 			if (error)
+ 				goto out;
+ 			error = dir->i_op->unlink(dir, dentry);
+-			if (!error)
++			if (!error) {
+ 				dont_mount(dentry);
++				detach_mounts(dentry);
++			}
+ 		}
+ 	}
+ out:
+@@ -4237,8 +4238,6 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	error = -EBUSY;
+ 	if (is_local_mountpoint(old_dentry) || is_local_mountpoint(new_dentry))
+ 		goto out;
+-	if (d_mountpoint(old_dentry) || d_mountpoint(new_dentry))
+-		goto out;
+ 
+ 	if (max_links && new_dir != old_dir) {
+ 		error = -EMLINK;
+@@ -4275,6 +4274,7 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 		if (is_dir)
+ 			target->i_flags |= S_DEAD;
+ 		dont_mount(new_dentry);
++		detach_mounts(new_dentry);
+ 	}
+ 	if (!(old_dir->i_sb->s_type->fs_flags & FS_RENAME_DOES_D_MOVE)) {
+ 		if (!(flags & RENAME_EXCHANGE))
