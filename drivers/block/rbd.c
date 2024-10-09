@@ -4026,9 +4026,21 @@ static int rbd_obj_method_sync(struct rbd_device *rbd_dev,
 /*
  * lock_rwsem must be held for read
  */
-static void rbd_wait_state_locked(struct rbd_device *rbd_dev)
+static int rbd_wait_state_locked(struct rbd_device *rbd_dev, bool may_acquire)
 {
 	DEFINE_WAIT(wait);
+	int ret = 0;
+
+	if (test_bit(RBD_DEV_FLAG_BLACKLISTED, &rbd_dev->flags))
+		return -EBLACKLISTED;
+
+	if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED)
+		return 0;
+
+	if (!may_acquire) {
+		rbd_warn(rbd_dev, "exclusive lock required");
+		return -EROFS;
+	}
 
 	do {
 		/*
@@ -4042,10 +4054,14 @@ static void rbd_wait_state_locked(struct rbd_device *rbd_dev)
 		up_read(&rbd_dev->lock_rwsem);
 		schedule();
 		down_read(&rbd_dev->lock_rwsem);
-	} while (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED &&
-		 !test_bit(RBD_DEV_FLAG_BLACKLISTED, &rbd_dev->flags));
+		if (test_bit(RBD_DEV_FLAG_BLACKLISTED, &rbd_dev->flags)) {
+			ret = -EBLACKLISTED;
+			break;
+		}
+	} while (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED);
 
 	finish_wait(&rbd_dev->lock_waitq, &wait);
+	return ret;
 }
 
 static void rbd_queue_workfn(struct work_struct *work)
@@ -4128,19 +4144,10 @@ static void rbd_queue_workfn(struct work_struct *work)
 	    (op_type != OBJ_OP_READ || rbd_dev->opts->lock_on_read);
 	if (must_be_locked) {
 		down_read(&rbd_dev->lock_rwsem);
-		if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED &&
-		    !test_bit(RBD_DEV_FLAG_BLACKLISTED, &rbd_dev->flags)) {
-			if (rbd_dev->opts->exclusive) {
-				rbd_warn(rbd_dev, "exclusive lock required");
-				result = -EROFS;
-				goto err_unlock;
-			}
-			rbd_wait_state_locked(rbd_dev);
-		}
-		if (test_bit(RBD_DEV_FLAG_BLACKLISTED, &rbd_dev->flags)) {
-			result = -EBLACKLISTED;
+		result = rbd_wait_state_locked(rbd_dev,
+					       !rbd_dev->opts->exclusive);
+		if (result)
 			goto err_unlock;
-		}
 	}
 
 	img_request = rbd_img_request_create(rbd_dev, offset, length, op_type,
@@ -5785,6 +5792,8 @@ static void rbd_dev_image_unlock(struct rbd_device *rbd_dev)
 
 static int rbd_add_acquire_lock(struct rbd_device *rbd_dev)
 {
+	int ret;
+
 	if (!(rbd_dev->header.features & RBD_FEATURE_EXCLUSIVE_LOCK)) {
 		rbd_warn(rbd_dev, "exclusive-lock feature is not enabled");
 		return -EINVAL;
@@ -5792,9 +5801,9 @@ static int rbd_add_acquire_lock(struct rbd_device *rbd_dev)
 
 	/* FIXME: "rbd map --exclusive" should be in interruptible */
 	down_read(&rbd_dev->lock_rwsem);
-	rbd_wait_state_locked(rbd_dev);
+	ret = rbd_wait_state_locked(rbd_dev, true);
 	up_read(&rbd_dev->lock_rwsem);
-	if (test_bit(RBD_DEV_FLAG_BLACKLISTED, &rbd_dev->flags)) {
+	if (ret) {
 		rbd_warn(rbd_dev, "failed to acquire exclusive lock");
 		return -EROFS;
 	}
