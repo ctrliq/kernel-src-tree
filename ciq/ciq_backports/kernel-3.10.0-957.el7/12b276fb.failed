@@ -1,0 +1,358 @@
+cxgb4: add support to create hash filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kumar Sanghvi <kumaras@chelsio.com>
+commit 12b276fbf6e092adca08a8125afcc4e7f530a0b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/12b276fb.failed
+
+Add support to create hash (exact-match) filters based on the value
+of 'hash' field in ch_filter_specification.
+
+Allocate SMT/L2T entries if DMAC-rewrite/SMAC-rewrite is requested.
+
+Allocate CLIP entry in case of IPv6 filter.
+
+Use cpl_act_open_req[6] to send hash filter create request to hw.
+Also, the filter tuple is calculated as part of sending this request.
+
+Hash-filter reply is processed on getting cpl_act_open_rpl.
+In case of success, various bits/fields in filter-tcb are set per
+filter requirement, such as enabling filter hitcnts, and/or various
+header rewrite operations, such as VLAN-rewrite, NAT or
+(L3/L4)-rewrite, and SMAC/DMAC-rewrite. In case of failure, clear the
+filter entry and release any hw resources occupied by it.
+
+The patch also moves the functions set_tcb_field, set_tcb_tflag and
+configure_filter_smac towards beginning of file.
+
+	Signed-off-by: Kumar Sanghvi <kumaras@chelsio.com>
+	Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 12b276fbf6e092adca08a8125afcc4e7f530a0b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+diff --cc drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+index 1d7bd82a1fb1,c7201eb7b14c..000000000000
+--- a/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
++++ b/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+@@@ -30,33 -32,33 +30,56 @@@
+   * SOFTWARE.
+   */
+  
+ -#ifndef __T4_TCB_H
+ -#define __T4_TCB_H
+ +/*
+ + * This file is conditionally built on PowerPC only.  Otherwise weak symbol
+ + * versions of the functions exported from here are used.
+ + */
+  
+ -#define TCB_SMAC_SEL_W		0
+ -#define TCB_SMAC_SEL_S		24
+ -#define TCB_SMAC_SEL_M		0xffULL
+ -#define TCB_SMAC_SEL_V(x)	((x) << TCB_SMAC_SEL_S)
+ +#include "ipath_kernel.h"
+  
+ -#define TCB_T_FLAGS_W		1
+ +/**
+ + * ipath_enable_wc - enable write combining for MMIO writes to the device
+ + * @dd: infinipath device
+ + *
+ + * Nothing to do on PowerPC, so just return without error.
+ + */
+ +int ipath_enable_wc(struct ipath_devdata *dd)
+ +{
+ +	return 0;
+ +}
+  
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +/**
+ + * ipath_unordered_wc - indicate whether write combining is unordered
+ + *
+ + * Because our performance depends on our ability to do write
+ + * combining mmio writes in the most efficient way, we need to
+ + * know if we are on a processor that may reorder stores when
+ + * write combining.
+ + */
+ +int ipath_unordered_wc(void)
+ +{
+ +	return 1;
+ +}
+++=======
++ #define TF_CCTRL_ECE_S		60
++ #define TF_CCTRL_CWR_S		61
++ #define TF_CCTRL_RFR_S		62
++ 
++ #define TCB_TIMESTAMP_W		5
++ #define TCB_TIMESTAMP_S		0
++ #define TCB_TIMESTAMP_M		0xffffffffULL
++ #define TCB_TIMESTAMP_V(x)	((x) << TCB_TIMESTAMP_S)
++ 
++ #define TCB_RTT_TS_RECENT_AGE_W		6
++ #define TCB_RTT_TS_RECENT_AGE_S		0
++ #define TCB_RTT_TS_RECENT_AGE_M		0xffffffffULL
++ #define TCB_RTT_TS_RECENT_AGE_V(x)	((x) << TCB_RTT_TS_RECENT_AGE_S)
++ 
++ #define TCB_SND_UNA_RAW_W	10
++ #define TCB_RX_FRAG2_PTR_RAW_W	27
++ #define TCB_RX_FRAG3_LEN_RAW_W	29
++ #define TCB_RX_FRAG3_START_IDX_OFFSET_RAW_W	30
++ #define TCB_PDU_HDR_LEN_W	31
++ #endif /* __T4_TCB_H */
+++>>>>>>> 12b276fbf6e0 (cxgb4: add support to create hash filters):drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+index 7006326dc1ab,cf8ca695f27d..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+@@@ -34,7 -34,11 +34,13 @@@
+  
+  #include "cxgb4.h"
+  #include "t4_regs.h"
+++<<<<<<< HEAD
+++=======
++ #include "t4_tcb.h"
++ #include "t4_values.h"
++ #include "clip_tbl.h"
+++>>>>>>> 12b276fbf6e0 (cxgb4: add support to create hash filters)
+  #include "l2t.h"
+ -#include "smt.h"
+  #include "t4fw_api.h"
+  #include "cxgb4_filter.h"
+  
+@@@ -479,6 -627,12 +618,15 @@@ void clear_filter(struct adapter *adap
+  	if (f->l2t)
+  		cxgb4_l2t_release(f->l2t);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (f->smt)
++ 		cxgb4_smt_release(f->smt);
++ 
++ 	if (f->fs.hash && f->fs.type)
++ 		cxgb4_clip_release(f->dev, (const u32 *)&f->fs.val.lip, 1);
++ 
+++>>>>>>> 12b276fbf6e0 (cxgb4: add support to create hash filters)
+  	/* The zeroing of the filter rule below clears the filter valid,
+  	 * pending, locked flags, l2t pointer, etc. so it's all we need for
+  	 * this operation.
+@@@ -773,6 -1198,128 +1192,131 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int configure_filter_tcb(struct adapter *adap, unsigned int tid,
++ 				struct filter_entry *f)
++ {
++ 	if (f->fs.hitcnts)
++ 		set_tcb_field(adap, f, tid, TCB_TIMESTAMP_W,
++ 			      TCB_TIMESTAMP_V(TCB_TIMESTAMP_M) |
++ 			      TCB_RTT_TS_RECENT_AGE_V(TCB_RTT_TS_RECENT_AGE_M),
++ 			      TCB_TIMESTAMP_V(0ULL) |
++ 			      TCB_RTT_TS_RECENT_AGE_V(0ULL),
++ 			      1);
++ 
++ 	if (f->fs.newdmac)
++ 		set_tcb_tflag(adap, f, tid, TF_CCTRL_ECE_S, 1,
++ 			      1);
++ 
++ 	if (f->fs.newvlan == VLAN_INSERT ||
++ 	    f->fs.newvlan == VLAN_REWRITE)
++ 		set_tcb_tflag(adap, f, tid, TF_CCTRL_RFR_S, 1,
++ 			      1);
++ 	if (f->fs.newsmac)
++ 		configure_filter_smac(adap, f);
++ 
++ 	if (f->fs.nat_mode) {
++ 		switch (f->fs.nat_mode) {
++ 		case NAT_MODE_DIP:
++ 			set_nat_params(adap, f, tid, true, false, false, false);
++ 			break;
++ 
++ 		case NAT_MODE_DIP_DP:
++ 			set_nat_params(adap, f, tid, true, false, true, false);
++ 			break;
++ 
++ 		case NAT_MODE_DIP_DP_SIP:
++ 			set_nat_params(adap, f, tid, true, true, true, false);
++ 			break;
++ 		case NAT_MODE_DIP_DP_SP:
++ 			set_nat_params(adap, f, tid, true, false, true, true);
++ 			break;
++ 
++ 		case NAT_MODE_SIP_SP:
++ 			set_nat_params(adap, f, tid, false, true, false, true);
++ 			break;
++ 
++ 		case NAT_MODE_DIP_SIP_SP:
++ 			set_nat_params(adap, f, tid, true, true, false, true);
++ 			break;
++ 
++ 		case NAT_MODE_ALL:
++ 			set_nat_params(adap, f, tid, true, true, true, true);
++ 			break;
++ 
++ 		default:
++ 			pr_err("%s: Invalid NAT mode: %d\n",
++ 			       __func__, f->fs.nat_mode);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ void hash_filter_rpl(struct adapter *adap, const struct cpl_act_open_rpl *rpl)
++ {
++ 	unsigned int ftid = TID_TID_G(AOPEN_ATID_G(ntohl(rpl->atid_status)));
++ 	unsigned int status  = AOPEN_STATUS_G(ntohl(rpl->atid_status));
++ 	struct tid_info *t = &adap->tids;
++ 	unsigned int tid = GET_TID(rpl);
++ 	struct filter_ctx *ctx = NULL;
++ 	struct filter_entry *f;
++ 
++ 	dev_dbg(adap->pdev_dev, "%s: tid = %u; atid = %u; status = %u\n",
++ 		__func__, tid, ftid, status);
++ 
++ 	f = lookup_atid(t, ftid);
++ 	if (!f) {
++ 		dev_err(adap->pdev_dev, "%s:could not find filter entry",
++ 			__func__);
++ 		return;
++ 	}
++ 	ctx = f->ctx;
++ 	f->ctx = NULL;
++ 
++ 	switch (status) {
++ 	case CPL_ERR_NONE:
++ 		f->tid = tid;
++ 		f->pending = 0;
++ 		f->valid = 1;
++ 		cxgb4_insert_tid(t, f, f->tid, 0);
++ 		cxgb4_free_atid(t, ftid);
++ 		if (ctx) {
++ 			ctx->tid = f->tid;
++ 			ctx->result = 0;
++ 		}
++ 		if (configure_filter_tcb(adap, tid, f)) {
++ 			clear_filter(adap, f);
++ 			cxgb4_remove_tid(t, 0, tid, 0);
++ 			kfree(f);
++ 			if (ctx) {
++ 				ctx->result = -EINVAL;
++ 				complete(&ctx->completion);
++ 			}
++ 			return;
++ 		}
++ 		break;
++ 
++ 	default:
++ 		dev_err(adap->pdev_dev, "%s: filter creation PROBLEM; status = %u\n",
++ 			__func__, status);
++ 
++ 		if (ctx) {
++ 			if (status == CPL_ERR_TCAM_FULL)
++ 				ctx->result = -EAGAIN;
++ 			else
++ 				ctx->result = -EINVAL;
++ 		}
++ 		clear_filter(adap, f);
++ 		cxgb4_free_atid(t, ftid);
++ 		kfree(f);
++ 	}
++ 	if (ctx)
++ 		complete(&ctx->completion);
++ }
++ 
+++>>>>>>> 12b276fbf6e0 (cxgb4: add support to create hash filters)
+  /* Handle a filter write/deletion reply. */
+  void filter_rpl(struct adapter *adap, const struct cpl_set_tcb_rpl *rpl)
+  {
+* Unmerged path drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 3a18f80d621d..30d897078128 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -1039,6 +1039,7 @@ struct ch_filter_specification {
+ 	 * matching that doesn't exist as a (value, mask) tuple.
+ 	 */
+ 	uint32_t type:1;        /* 0 => IPv4, 1 => IPv6 */
++	u32 hash:1;		/* 0 => wild-card, 1 => exact-match */
+ 
+ 	/* Packet dispatch information.  Ingress packets which match the
+ 	 * filter rules will be dropped, passed to the host or switched back
+@@ -1096,7 +1097,14 @@ enum {
+ };
+ 
+ enum {
+-	NAT_MODE_ALL = 7,	/* NAT on entire 4-tuple */
++	NAT_MODE_NONE = 0,	/* No NAT performed */
++	NAT_MODE_DIP,		/* NAT on Dst IP */
++	NAT_MODE_DIP_DP,	/* NAT on Dst IP, Dst Port */
++	NAT_MODE_DIP_DP_SIP,	/* NAT on Dst IP, Dst Port and Src IP */
++	NAT_MODE_DIP_DP_SP,	/* NAT on Dst IP, Dst Port and Src Port */
++	NAT_MODE_SIP_SP,	/* NAT on Src IP and Src Port */
++	NAT_MODE_DIP_SIP_SP,	/* NAT on Dst IP, Src IP and Src Port */
++	NAT_MODE_ALL		/* NAT on entire 4-tuple */
+ };
+ 
+ /* Host shadow copy of ingress filter entry.  This is in host native format
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
+index d3c1a8fafd32..7480d65550a8 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
+@@ -37,7 +37,10 @@
+ 
+ #include "t4_msg.h"
+ 
++#define WORD_MASK	0xffffffff
++
+ void filter_rpl(struct adapter *adap, const struct cpl_set_tcb_rpl *rpl);
++void hash_filter_rpl(struct adapter *adap, const struct cpl_act_open_rpl *rpl);
+ void clear_filter(struct adapter *adap, struct filter_entry *f);
+ 
+ int set_filter_wr(struct adapter *adapter, int fidx);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 4992c0939d79..c72d8edf5d94 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -567,6 +567,10 @@ static int fwevtq_handler(struct sge_rspq *q, const __be64 *rsp,
+ 		const struct cpl_set_tcb_rpl *p = (void *)rsp;
+ 
+ 		filter_rpl(q->adap, p);
++	} else if (opcode == CPL_ACT_OPEN_RPL) {
++		const struct cpl_act_open_rpl *p = (void *)rsp;
++
++		hash_filter_rpl(q->adap, p);
+ 	} else
+ 		dev_err(q->adap->pdev_dev,
+ 			"unexpected CPL %#x on FW event queue\n", opcode);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+index 88a8d242cb4a..61f2848ed60c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+@@ -284,6 +284,7 @@ struct work_request_hdr {
+ 
+ #define RX_CHANNEL_S    26
+ #define RX_CHANNEL_V(x) ((x) << RX_CHANNEL_S)
++#define RX_CHANNEL_F	RX_CHANNEL_V(1U)
+ 
+ #define WND_SCALE_EN_S    28
+ #define WND_SCALE_EN_V(x) ((x) << WND_SCALE_EN_S)
+@@ -313,6 +314,10 @@ struct cpl_pass_open_req {
+ #define DELACK_V(x) ((x) << DELACK_S)
+ #define DELACK_F    DELACK_V(1U)
+ 
++#define NON_OFFLOAD_S		7
++#define NON_OFFLOAD_V(x)	((x) << NON_OFFLOAD_S)
++#define NON_OFFLOAD_F		NON_OFFLOAD_V(1U)
++
+ #define DSCP_S    22
+ #define DSCP_M    0x3F
+ #define DSCP_V(x) ((x) << DSCP_S)
