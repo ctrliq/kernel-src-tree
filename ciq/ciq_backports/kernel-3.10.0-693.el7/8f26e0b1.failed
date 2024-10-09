@@ -1,0 +1,131 @@
+mm: vma_merge: correct false positive from __vma_unlink->validate_mm_rb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] vma_merge: correct false positive from __vma_unlink->validate_mm_rb (Andrea Arcangeli) [1374548]
+Rebuild_FUZZ: 97.10%
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 8f26e0b176f3484c49d55d88fe6083a9cf9ff443
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8f26e0b1.failed
+
+The old code was always doing:
+
+   vma->vm_end = next->vm_end
+   vma_rb_erase(next) // in __vma_unlink
+   vma->vm_next = next->vm_next // in __vma_unlink
+   next = vma->vm_next
+   vma_gap_update(next)
+
+The new code still does the above for remove_next == 1 and 2, but for
+remove_next == 3 it has been changed and it does:
+
+   next->vm_start = vma->vm_start
+   vma_rb_erase(vma) // in __vma_unlink
+   vma_gap_update(next)
+
+In the latter case, while unlinking "vma", validate_mm_rb() is told to
+ignore "vma" that is being removed, but next->vm_start was reduced
+instead. So for the new case, to avoid the false positive from
+validate_mm_rb, it should be "next" that is ignored when "vma" is
+being unlinked.
+
+"vma" and "next" in the above comment, considered pre-swap().
+
+Link: http://lkml.kernel.org/r/1474492522-2261-4-git-send-email-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Tested-by: Shaun Tancheff <shaun.tancheff@seagate.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Jan Vorlicek <janvorli@microsoft.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8f26e0b176f3484c49d55d88fe6083a9cf9ff443)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mmap.c
+diff --cc mm/mmap.c
+index 2cc2556c0b9f,1af87c14183d..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -691,18 -621,37 +711,52 @@@ static void __insert_vm_struct(struct m
+  	mm->map_count++;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void
+ +__vma_unlink(struct mm_struct *mm, struct vm_area_struct *vma,
+ +		struct vm_area_struct *prev)
+ +{
+ +	struct vm_area_struct *next;
+ +
+ +	vma_rb_erase(vma, &mm->mm_rb);
+ +	prev->vm_next = next = vma->vm_next;
+ +	if (next)
+ +		next->vm_prev = prev;
+ +	if (mm->mmap_cache == vma)
+ +		mm->mmap_cache = prev;
+++=======
++ static __always_inline void __vma_unlink_common(struct mm_struct *mm,
++ 						struct vm_area_struct *vma,
++ 						struct vm_area_struct *prev,
++ 						bool has_prev,
++ 						struct vm_area_struct *ignore)
++ {
++ 	struct vm_area_struct *next;
++ 
++ 	vma_rb_erase_ignore(vma, &mm->mm_rb, ignore);
++ 	next = vma->vm_next;
++ 	if (has_prev)
++ 		prev->vm_next = next;
++ 	else {
++ 		prev = vma->vm_prev;
++ 		if (prev)
++ 			prev->vm_next = next;
++ 		else
++ 			mm->mmap = next;
++ 	}
++ 	if (next)
++ 		next->vm_prev = prev;
++ 
++ 	/* Kill the cache */
++ 	vmacache_invalidate(mm);
++ }
++ 
++ static inline void __vma_unlink_prev(struct mm_struct *mm,
++ 				     struct vm_area_struct *vma,
++ 				     struct vm_area_struct *prev)
++ {
++ 	__vma_unlink_common(mm, vma, prev, true, vma);
+++>>>>>>> 8f26e0b176f3 (mm: vma_merge: correct false positive from __vma_unlink->validate_mm_rb)
+  }
+  
+  /*
+@@@ -839,7 -827,19 +893,23 @@@ again:			remove_next = 1 + (end > next-
+  		 * vma_merge has merged next into vma, and needs
+  		 * us to remove next before dropping the locks.
+  		 */
+++<<<<<<< HEAD
+ +		__vma_unlink(mm, next, vma);
+++=======
++ 		if (remove_next != 3)
++ 			__vma_unlink_prev(mm, next, vma);
++ 		else
++ 			/*
++ 			 * vma is not before next if they've been
++ 			 * swapped.
++ 			 *
++ 			 * pre-swap() next->vm_start was reduced so
++ 			 * tell validate_mm_rb to ignore pre-swap()
++ 			 * "next" (which is stored in post-swap()
++ 			 * "vma").
++ 			 */
++ 			__vma_unlink_common(mm, next, NULL, false, vma);
+++>>>>>>> 8f26e0b176f3 (mm: vma_merge: correct false positive from __vma_unlink->validate_mm_rb)
+  		if (file)
+  			__remove_shared_vm_struct(next, file, mapping);
+  	} else if (insert) {
+* Unmerged path mm/mmap.c
