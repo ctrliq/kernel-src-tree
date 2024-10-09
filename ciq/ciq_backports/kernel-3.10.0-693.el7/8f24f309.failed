@@ -1,0 +1,418 @@
+switchdev: rename switchdev_obj_vlan to switchdev_obj_port_vlan
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 8f24f3095dcedaa4eb4719eee2bed738fe2ce4a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8f24f309.failed
+
+Make the struct name in sync with object id name.
+
+	Suggested-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Scott Feldman <sfeldma@gmail.com>
+	Reviewed-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8f24f3095dcedaa4eb4719eee2bed738fe2ce4a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/rocker/rocker.c
+#	include/net/switchdev.h
+#	net/bridge/br_vlan.c
+#	net/dsa/slave.c
+#	net/switchdev/switchdev.c
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,d4cb129557f4..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -20,45 -46,140 +20,136 @@@ static void __vlan_delete_pvid(struct n
+  		return;
+  
+  	smp_wmb();
+ -	vg->pvid = 0;
+ +	v->pvid = 0;
+  }
+  
+ -static void __vlan_add_flags(struct net_bridge_vlan *v, u16 flags)
+ +static void __vlan_add_flags(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ -
+ -	if (br_vlan_is_master(v))
+ -		vg = v->br->vlgrp;
+ -	else
+ -		vg = v->port->vlgrp;
+ -
+  	if (flags & BRIDGE_VLAN_INFO_PVID)
+ -		__vlan_add_pvid(vg, v->vid);
+ +		__vlan_add_pvid(v, vid);
+  	else
+ -		__vlan_delete_pvid(vg, v->vid);
+ +		__vlan_delete_pvid(v, vid);
+  
+  	if (flags & BRIDGE_VLAN_INFO_UNTAGGED)
+ -		v->flags |= BRIDGE_VLAN_INFO_UNTAGGED;
+ +		set_bit(vid, v->untagged_bitmap);
+  	else
+ -		v->flags &= ~BRIDGE_VLAN_INFO_UNTAGGED;
+ +		clear_bit(vid, v->untagged_bitmap);
+  }
+  
+ -static int __vlan_vid_add(struct net_device *dev, struct net_bridge *br,
+ -			  u16 vid, u16 flags)
+ +static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	int err;
++ 
++ 	/* If driver uses VLAN ndo ops, use 8021q to install vid
++ 	 * on device, otherwise try switchdev ops to install vid.
++ 	 */
++ 
++ 	if (ops->ndo_vlan_rx_add_vid) {
++ 		err = vlan_vid_add(dev, br->vlan_proto, vid);
++ 	} else {
++ 		struct switchdev_obj_port_vlan v = {
++ 			.flags = flags,
++ 			.vid_begin = vid,
++ 			.vid_end = vid,
++ 		};
++ 
++ 		err = switchdev_port_obj_add(dev, SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 					     &v);
++ 		if (err == -EOPNOTSUPP)
++ 			err = 0;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static void __vlan_add_list(struct net_bridge_vlan *v)
++ {
++ 	struct list_head *headp, *hpos;
++ 	struct net_bridge_vlan *vent;
++ 
++ 	headp = br_vlan_is_master(v) ? &v->br->vlgrp->vlan_list :
++ 				       &v->port->vlgrp->vlan_list;
++ 	list_for_each_prev(hpos, headp) {
++ 		vent = list_entry(hpos, struct net_bridge_vlan, vlist);
++ 		if (v->vid < vent->vid)
++ 			continue;
++ 		else
++ 			break;
++ 	}
++ 	list_add(&v->vlist, hpos);
++ }
++ 
++ static void __vlan_del_list(struct net_bridge_vlan *v)
++ {
++ 	list_del(&v->vlist);
++ }
++ 
++ static int __vlan_vid_del(struct net_device *dev, struct net_bridge *br,
++ 			  u16 vid)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	int err = 0;
++ 
++ 	/* If driver uses VLAN ndo ops, use 8021q to delete vid
++ 	 * on device, otherwise try switchdev ops to delete vid.
++ 	 */
++ 
++ 	if (ops->ndo_vlan_rx_kill_vid) {
++ 		vlan_vid_del(dev, br->vlan_proto, vid);
++ 	} else {
++ 		struct switchdev_obj_port_vlan v = {
++ 			.vid_begin = vid,
++ 			.vid_end = vid,
++ 		};
++ 
++ 		err = switchdev_port_obj_del(dev, SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 					     &v);
++ 		if (err == -EOPNOTSUPP)
++ 			err = 0;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ /* This is the shared VLAN add function which works for both ports and bridge
++  * devices. There are four possible calls to this function in terms of the
++  * vlan entry type:
++  * 1. vlan is being added on a port (no master flags, global entry exists)
++  * 2. vlan is being added on a bridge (both master and brvlan flags)
++  * 3. vlan is being added on a port, but a global entry didn't exist which
++  *    is being created right now (master flag set, brvlan flag unset), the
++  *    global entry is used for global per-vlan features, but not for filtering
++  * 4. same as 3 but with both master and brvlan flags set so the entry
++  *    will be used for filtering in both the port and the bridge
++  */
++ static int __vlan_add(struct net_bridge_vlan *v, u16 flags)
++ {
++ 	struct net_bridge_vlan *masterv = NULL;
+++>>>>>>> 8f24f3095dce (switchdev: rename switchdev_obj_vlan to switchdev_obj_port_vlan)
+  	struct net_bridge_port *p = NULL;
+ -	struct rhashtable *tbl;
+ -	struct net_device *dev;
+  	struct net_bridge *br;
+ +	struct net_device *dev;
+  	int err;
+  
+ -	if (br_vlan_is_master(v)) {
+ -		br = v->br;
+ -		dev = br->dev;
+ -		tbl = &br->vlgrp->vlan_hash;
+ -	} else {
+ -		p = v->port;
+ +	if (test_bit(vid, v->vlan_bitmap)) {
+ +		__vlan_add_flags(v, vid, flags);
+ +		return 0;
+ +	}
+ +
+ +	if (v->port_idx) {
+ +		p = v->parent.port;
+  		br = p->br;
+  		dev = p->dev;
+ -		tbl = &p->vlgrp->vlan_hash;
+ +	} else {
+ +		br = v->parent.br;
+ +		dev = br->dev;
+  	}
+  
+ -	if (p) {
+ -		u16 master_flags = flags;
+ -
+ +	/* Toggle HW filters when filtering is enabled */
+ +	if (p && p->br->vlan_enabled) {
+  		/* Add VLAN to the device filter if it is supported.
+  		 * This ensures tagged traffic enters the bridge when
+  		 * promiscuous mode is disabled by br_manage_promisc().
+diff --cc net/dsa/slave.c
+index 6ebd8fbd9285,baf34f222115..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -161,6 -200,208 +161,211 @@@ out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dsa_bridge_check_vlan_range(struct dsa_switch *ds,
++ 				       const struct net_device *bridge,
++ 				       u16 vid_begin, u16 vid_end)
++ {
++ 	struct dsa_slave_priv *p;
++ 	struct net_device *dev, *vlan_br;
++ 	DECLARE_BITMAP(members, DSA_MAX_PORTS);
++ 	DECLARE_BITMAP(untagged, DSA_MAX_PORTS);
++ 	u16 vid;
++ 	int member, err;
++ 
++ 	if (!ds->drv->vlan_getnext || !vid_begin)
++ 		return -EOPNOTSUPP;
++ 
++ 	vid = vid_begin - 1;
++ 
++ 	do {
++ 		err = ds->drv->vlan_getnext(ds, &vid, members, untagged);
++ 		if (err)
++ 			break;
++ 
++ 		if (vid > vid_end)
++ 			break;
++ 
++ 		member = find_first_bit(members, DSA_MAX_PORTS);
++ 		if (member == DSA_MAX_PORTS)
++ 			continue;
++ 
++ 		dev = ds->ports[member];
++ 		p = netdev_priv(dev);
++ 		vlan_br = p->bridge_dev;
++ 		if (vlan_br == bridge)
++ 			continue;
++ 
++ 		netdev_dbg(vlan_br, "hardware VLAN %d already in use\n", vid);
++ 		return -EOPNOTSUPP;
++ 	} while (vid < vid_end);
++ 
++ 	return err == -ENOENT ? 0 : err;
++ }
++ 
++ static int dsa_slave_port_vlan_add(struct net_device *dev,
++ 				   const struct switchdev_obj_port_vlan *vlan,
++ 				   struct switchdev_trans *trans)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	u16 vid;
++ 	int err;
++ 
++ 	if (switchdev_trans_ph_prepare(trans)) {
++ 		if (!ds->drv->port_vlan_add || !ds->drv->port_pvid_set)
++ 			return -EOPNOTSUPP;
++ 
++ 		/* If the requested port doesn't belong to the same bridge as
++ 		 * the VLAN members, fallback to software VLAN (hopefully).
++ 		 */
++ 		err = dsa_bridge_check_vlan_range(ds, p->bridge_dev,
++ 						  vlan->vid_begin,
++ 						  vlan->vid_end);
++ 		if (err)
++ 			return err;
++ 	} else {
++ 		for (vid = vlan->vid_begin; vid <= vlan->vid_end; ++vid) {
++ 			err = ds->drv->port_vlan_add(ds, p->port, vid,
++ 						     vlan->flags &
++ 						     BRIDGE_VLAN_INFO_UNTAGGED);
++ 			if (!err && vlan->flags & BRIDGE_VLAN_INFO_PVID)
++ 				err = ds->drv->port_pvid_set(ds, p->port, vid);
++ 			if (err)
++ 				return err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_port_vlan_del(struct net_device *dev,
++ 				   const struct switchdev_obj_port_vlan *vlan)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	u16 vid;
++ 	int err;
++ 
++ 	if (!ds->drv->port_vlan_del)
++ 		return -EOPNOTSUPP;
++ 
++ 	for (vid = vlan->vid_begin; vid <= vlan->vid_end; ++vid) {
++ 		err = ds->drv->port_vlan_del(ds, p->port, vid);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_port_vlan_dump(struct net_device *dev,
++ 				    struct switchdev_obj_port_vlan *vlan,
++ 				    int (*cb)(void *obj))
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	DECLARE_BITMAP(members, DSA_MAX_PORTS);
++ 	DECLARE_BITMAP(untagged, DSA_MAX_PORTS);
++ 	u16 pvid, vid = 0;
++ 	int err;
++ 
++ 	if (!ds->drv->vlan_getnext || !ds->drv->port_pvid_get)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = ds->drv->port_pvid_get(ds, p->port, &pvid);
++ 	if (err)
++ 		return err;
++ 
++ 	for (;;) {
++ 		err = ds->drv->vlan_getnext(ds, &vid, members, untagged);
++ 		if (err)
++ 			break;
++ 
++ 		if (!test_bit(p->port, members))
++ 			continue;
++ 
++ 		memset(vlan, 0, sizeof(*vlan));
++ 		vlan->vid_begin = vlan->vid_end = vid;
++ 
++ 		if (vid == pvid)
++ 			vlan->flags |= BRIDGE_VLAN_INFO_PVID;
++ 
++ 		if (test_bit(p->port, untagged))
++ 			vlan->flags |= BRIDGE_VLAN_INFO_UNTAGGED;
++ 
++ 		err = cb(vlan);
++ 		if (err)
++ 			break;
++ 	}
++ 
++ 	return err == -ENOENT ? 0 : err;
++ }
++ 
++ static int dsa_slave_port_fdb_add(struct net_device *dev,
++ 				  const struct switchdev_obj_fdb *fdb,
++ 				  struct switchdev_trans *trans)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (switchdev_trans_ph_prepare(trans))
++ 		ret = ds->drv->port_fdb_add ? 0 : -EOPNOTSUPP;
++ 	else
++ 		ret = ds->drv->port_fdb_add(ds, p->port, fdb->addr, fdb->vid);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_fdb_del(struct net_device *dev,
++ 				  const struct switchdev_obj_fdb *fdb)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->drv->port_fdb_del)
++ 		ret = ds->drv->port_fdb_del(ds, p->port, fdb->addr, fdb->vid);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_fdb_dump(struct net_device *dev,
++ 				   struct switchdev_obj_fdb *fdb,
++ 				   int (*cb)(void *obj))
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	unsigned char addr[ETH_ALEN] = { 0 };
++ 	u16 vid = 0;
++ 	int ret;
++ 
++ 	if (!ds->drv->port_fdb_getnext)
++ 		return -EOPNOTSUPP;
++ 
++ 	for (;;) {
++ 		bool is_static;
++ 
++ 		ret = ds->drv->port_fdb_getnext(ds, p->port, addr, &vid,
++ 						&is_static);
++ 		if (ret < 0)
++ 			break;
++ 
++ 		fdb->addr = addr;
++ 		fdb->vid = vid;
++ 		fdb->ndm_state = is_static ? NUD_NOARP : NUD_REACHABLE;
++ 
++ 		ret = cb(fdb);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 
++ 	return ret == -ENOENT ? 0 : ret;
++ }
++ 
+++>>>>>>> 8f24f3095dce (switchdev: rename switchdev_obj_vlan to switchdev_obj_port_vlan)
+  static int dsa_slave_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+  {
+  	struct dsa_slave_priv *p = netdev_priv(dev);
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/bridge/br_vlan.c
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/switchdev/switchdev.c
