@@ -1,0 +1,112 @@
+iommu/amd: Optimize map_sg and unmap_sg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Optimize map_sg and unmap_sg (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 91.67%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 80187fd39dcb30e3aa39e93a87b2d2f7fc8f4fd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/80187fd3.failed
+
+Optimize these functions so that they need only one call
+into the address alloctor. This also saves a couple of
+io-tlb flushes in the unmap_sg path.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 80187fd39dcb30e3aa39e93a87b2d2f7fc8f4fd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 3c777dd3adaa,acad37c3f0a1..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -2615,32 -2441,65 +2641,71 @@@ static int map_sg(struct device *dev, s
+  	if (IS_ERR(domain))
+  		return 0;
+  
++ 	dma_dom  = domain->priv;
+  	dma_mask = *dev->dma_mask;
+  
++ 	npages = sg_num_pages(dev, sglist, nelems);
++ 
++ 	address = dma_ops_alloc_iova(dev, dma_dom, npages, dma_mask);
++ 	if (address == DMA_ERROR_CODE)
++ 		goto out_err;
++ 
++ 	prot = dir2prot(direction);
++ 
++ 	/* Map all sg entries */
+  	for_each_sg(sglist, s, nelems, i) {
+- 		paddr = sg_phys(s);
++ 		int j, pages = iommu_num_pages(sg_phys(s), s->length, PAGE_SIZE);
+  
+++<<<<<<< HEAD
+ +		s->dma_address = __map_single(dev, domain->priv,
+ +					      paddr, s->length, dir, false,
+ +					      dma_mask);
+++=======
++ 		for (j = 0; j < pages; ++j) {
++ 			unsigned long bus_addr, phys_addr;
++ 			int ret;
+++>>>>>>> 80187fd39dcb (iommu/amd: Optimize map_sg and unmap_sg)
++ 
++ 			bus_addr  = address + s->dma_address + (j << PAGE_SHIFT);
++ 			phys_addr = (sg_phys(s) & PAGE_MASK) + (j << PAGE_SHIFT);
++ 			ret = iommu_map_page(domain, bus_addr, phys_addr, PAGE_SIZE, prot, GFP_ATOMIC);
++ 			if (ret)
++ 				goto out_unmap;
++ 
++ 			mapped_pages += 1;
++ 		}
++ 	}
+  
+- 		if (s->dma_address) {
+- 			s->dma_length = s->length;
+- 			mapped_elems++;
+- 		} else
+- 			goto unmap;
++ 	/* Everything is mapped - write the right values into s->dma_address */
++ 	for_each_sg(sglist, s, nelems, i) {
++ 		s->dma_address += address + s->offset;
++ 		s->dma_length   = s->length;
+  	}
+  
+- 	return mapped_elems;
++ 	return nelems;
++ 
++ out_unmap:
++ 	pr_err("%s: IOMMU mapping error in map_sg (io-pages: %d)\n",
++ 	       dev_name(dev), npages);
++ 
++ 	for_each_sg(sglist, s, nelems, i) {
++ 		int j, pages = iommu_num_pages(sg_phys(s), s->length, PAGE_SIZE);
++ 
++ 		for (j = 0; j < pages; ++j) {
++ 			unsigned long bus_addr;
++ 
++ 			bus_addr  = address + s->dma_address + (j << PAGE_SHIFT);
++ 			iommu_unmap_page(domain, bus_addr, PAGE_SIZE);
+  
+- unmap:
+- 	for_each_sg(sglist, s, mapped_elems, i) {
+- 		if (s->dma_address)
+- 			__unmap_single(domain->priv, s->dma_address,
+- 				       s->dma_length, dir);
+- 		s->dma_address = s->dma_length = 0;
++ 			if (--mapped_pages)
++ 				goto out_free_iova;
++ 		}
+  	}
+  
++ out_free_iova:
++ 	free_iova_fast(&dma_dom->iovad, address, npages);
++ 
++ out_err:
+  	return 0;
+  }
+  
+* Unmerged path drivers/iommu/amd_iommu.c
