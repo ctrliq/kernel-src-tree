@@ -257,13 +257,19 @@ static int route4_init(struct tcf_proto *tp)
 	return 0;
 }
 
+static void __route4_delete_filter(struct route4_filter *f)
+{
+	tcf_exts_destroy(&f->exts);
+	tcf_exts_put_net(&f->exts);
+	kfree(f);
+}
+
 static void route4_delete_filter_work(struct work_struct *work)
 {
 	struct route4_filter *f = container_of(work, struct route4_filter, work);
 
 	rtnl_lock();
-	tcf_exts_destroy(&f->exts);
-	kfree(f);
+	__route4_delete_filter(f);
 	rtnl_unlock();
 }
 
@@ -304,7 +310,10 @@ static bool route4_destroy(struct tcf_proto *tp, bool force)
 					next = rtnl_dereference(f->next);
 					RCU_INIT_POINTER(b->ht[h2], next);
 					tcf_unbind_filter(tp, &f->res);
-					call_rcu(&f->rcu, route4_delete_filter);
+					if (tcf_exts_get_net(&f->exts))
+						call_rcu(&f->rcu, route4_delete_filter);
+					else
+						__route4_delete_filter(f);
 				}
 			}
 			RCU_INIT_POINTER(head->table[h1], NULL);
@@ -346,6 +355,7 @@ static int route4_delete(struct tcf_proto *tp, unsigned long arg)
 
 			/* Delete it */
 			tcf_unbind_filter(tp, &f->res);
+			tcf_exts_get_net(&f->exts);
 			call_rcu(&f->rcu, route4_delete_filter);
 
 			/* Strip RTNL protected tree */
@@ -547,6 +557,7 @@ static int route4_change(struct net *net, struct sk_buff *in_skb,
 	*arg = (unsigned long)f;
 	if (fold) {
 		tcf_unbind_filter(tp, &fold->res);
+		tcf_exts_get_net(&fold->exts);
 		call_rcu(&fold->rcu, route4_delete_filter);
 	}
 	return 0;
