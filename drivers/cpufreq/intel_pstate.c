@@ -896,8 +896,6 @@ static inline void intel_pstate_sample(struct cpudata *cpu)
 	cpu->sample.mperf -= cpu->prev_mperf;
 	cpu->sample.tsc -= cpu->prev_tsc;
 
-	intel_pstate_calc_busy(cpu);
-
 	cpu->prev_aperf = aperf;
 	cpu->prev_mperf = mperf;
 	cpu->prev_tsc = tsc;
@@ -942,7 +940,6 @@ static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu)
 	mperf = cpu->sample.mperf + delta_iowait_mperf;
 	cpu->prev_cummulative_iowait = cummulative_iowait;
 
-
 	/*
 	 * The load can be estimated as the ratio of the mperf counter
 	 * running at a constant frequency during active periods
@@ -960,6 +957,8 @@ static inline int32_t get_target_pstate_use_performance(struct cpudata *cpu)
 	int32_t core_busy, max_pstate, current_pstate, sample_ratio;
 	s64 duration_us;
 	u32 sample_time;
+
+	intel_pstate_calc_busy(cpu);
 
 	/*
 	 * core_busy is the ratio of actual performance to max
