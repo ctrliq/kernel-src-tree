@@ -525,6 +525,7 @@ static struct arena_info *alloc_arena(struct btt *btt, size_t size,
 	if (!arena)
 		return NULL;
 	arena->nd_btt = btt->nd_btt;
+	arena->sector_size = btt->sector_size;
 
 	if (!size)
 		return arena;
