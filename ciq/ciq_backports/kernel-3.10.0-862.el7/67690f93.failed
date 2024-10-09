@@ -1,0 +1,131 @@
+userns: Remove implicit MNT_NODEV fragility.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] userns: Remove implicit MNT_NODEV fragility ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 98.85%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 67690f937c38bbab1d94cb45f6a32e61612834ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/67690f93.failed
+
+Replace the implict setting of MNT_NODEV on mounts that happen with
+just user namespace permissions with an implicit setting of SB_I_NODEV
+in s_iflags.  The visibility of the implicit MNT_NODEV has caused
+problems in the past.
+
+With this change the fragile case where an implicit MNT_NODEV needs to
+be preserved in do_remount is removed.  Using SB_I_NODEV is much less
+fragile as s_iflags are set during the original mount and never
+changed.
+
+In do_new_mount with the implicit setting of MNT_NODEV gone, the only
+code that can affect mnt_flags is fs_fully_visible so simplify the if
+statement and reduce the indentation of the code to make that clear.
+
+	Acked-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 67690f937c38bbab1d94cb45f6a32e61612834ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+diff --cc fs/super.c
+index 8a24c3f5ff79,25cdceed2ad3..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -142,26 -191,35 +142,32 @@@ static struct super_block *alloc_super(
+  	if (!s)
+  		return NULL;
+  
+ -	INIT_LIST_HEAD(&s->s_mounts);
+ -	s->s_user_ns = get_user_ns(user_ns);
+ -
+  	if (security_sb_alloc(s))
+  		goto fail;
+ -
+  	for (i = 0; i < SB_FREEZE_LEVELS; i++) {
+ -		if (__percpu_init_rwsem(&s->s_writers.rw_sem[i],
+ -					sb_writers_name[i],
+ -					&type->s_writers_key[i]))
+ +		if (percpu_counter_init(&s->s_writers.counter[i], 0,
+ +					GFP_KERNEL) < 0)
+  			goto fail;
+ +		lockdep_init_map(&s->s_writers.lock_map[i], sb_writers_name[i],
+ +				 &type->s_writers_key[i], 0);
+  	}
+ +	init_waitqueue_head(&s->s_writers.wait);
+  	init_waitqueue_head(&s->s_writers.wait_unfrozen);
+ -	s->s_bdi = &noop_backing_dev_info;
+  	s->s_flags = flags;
+++<<<<<<< HEAD
+ +	s->s_bdi = &default_backing_dev_info;
+++=======
++ 	if ((s->s_user_ns != &init_user_ns) &&
++ 	    !(type->fs_flags & FS_USERNS_DEV_MOUNT))
++ 		s->s_iflags |= SB_I_NODEV;
+++>>>>>>> 67690f937c38 (userns: Remove implicit MNT_NODEV fragility.)
+  	INIT_HLIST_NODE(&s->s_instances);
+  	INIT_HLIST_BL_HEAD(&s->s_anon);
+ -	mutex_init(&s->s_sync_lock);
+  	INIT_LIST_HEAD(&s->s_inodes);
+ -	spin_lock_init(&s->s_inode_list_lock);
+ -
+ -	if (list_lru_init_memcg(&s->s_dentry_lru))
+ -		goto fail;
+ -	if (list_lru_init_memcg(&s->s_inode_lru))
+ -		goto fail;
+ -
+ +	INIT_LIST_HEAD(&s->s_dentry_lru);
+ +	INIT_LIST_HEAD(&s->s_inode_lru);
+ +	spin_lock_init(&s->s_inode_lru_lock);
+ +	INIT_LIST_HEAD(&s->s_mounts);
+  	init_rwsem(&s->s_umount);
+  	lockdep_set_class(&s->s_umount, &type->s_umount_key);
+  	/*
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 84149742b9d6..58e73ad53b03 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2235,13 +2235,7 @@ static int do_remount(struct path *path, int flags, int mnt_flags,
+ 	}
+ 	if ((mnt->mnt.mnt_flags & MNT_LOCK_NODEV) &&
+ 	    !(mnt_flags & MNT_NODEV)) {
+-		/* Was the nodev implicitly added in mount? */
+-		if ((mnt->mnt_ns->user_ns != &init_user_ns) &&
+-		    !(sb->s_type->fs_flags & FS_USERNS_DEV_MOUNT)) {
+-			mnt_flags |= MNT_NODEV;
+-		} else {
+-			return -EPERM;
+-		}
++		return -EPERM;
+ 	}
+ 	if ((mnt->mnt.mnt_flags & MNT_LOCK_NOSUID) &&
+ 	    !(mnt_flags & MNT_NOSUID)) {
+@@ -2433,7 +2427,6 @@ static int do_new_mount(struct path *path, const char *fstype, int flags,
+ 			int mnt_flags, const char *name, void *data)
+ {
+ 	struct file_system_type *type;
+-	struct user_namespace *user_ns = current->nsproxy->mnt_ns->user_ns;
+ 	struct vfsmount *mnt;
+ 	int err;
+ 
+@@ -2444,16 +2437,6 @@ static int do_new_mount(struct path *path, const char *fstype, int flags,
+ 	if (!type)
+ 		return -ENODEV;
+ 
+-	if (user_ns != &init_user_ns) {
+-		/* Only in special cases allow devices from mounts
+-		 * created outside the initial user namespace.
+-		 */
+-		if (!(type->fs_flags & FS_USERNS_DEV_MOUNT)) {
+-			flags |= MS_NODEV;
+-			mnt_flags |= MNT_NODEV | MNT_LOCK_NODEV;
+-		}
+-	}
+-
+ 	mnt = vfs_kern_mount(type, flags, name, data);
+ 	if (!IS_ERR(mnt) && (type->fs_flags & FS_HAS_SUBTYPE) &&
+ 	    !mnt->mnt_sb->s_subtype)
+* Unmerged path fs/super.c
