@@ -1,0 +1,651 @@
+net/mlx5: Implement vports admin state backup/restore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Implement vports admin state backup/restore (Don Dutile) [1385214 1385330 1417285]
+Rebuild_FUZZ: 96.08%
+commit-author Mohamad Haj Yahia <mohamad@mellanox.com>
+commit 1ab2068a4c663cbb2e0e0cfea934bc4e163abed0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1ab2068a.failed
+
+Save the user configuration in the vport sturct.
+Restore saved old configuration upon vport enable.
+
+	Signed-off-by: Mohamad Haj Yahia <mohamad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1ab2068a4c663cbb2e0e0cfea934bc4e163abed0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 084178cfa483,654b76ff962f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -129,63 -116,6 +129,66 @@@ ex
+  }
+  
+  /* E-Switch vport context HW commands */
+++<<<<<<< HEAD
+ +static int query_esw_vport_context_cmd(struct mlx5_core_dev *mdev, u32 vport,
+ +				       u32 *out, int outlen)
+ +{
+ +	u32 in[MLX5_ST_SZ_DW(query_esw_vport_context_in)];
+ +
+ +	memset(in, 0, sizeof(in));
+ +
+ +	MLX5_SET(query_nic_vport_context_in, in, opcode,
+ +		 MLX5_CMD_OP_QUERY_ESW_VPORT_CONTEXT);
+ +
+ +	MLX5_SET(query_esw_vport_context_in, in, vport_number, vport);
+ +	if (vport)
+ +		MLX5_SET(query_esw_vport_context_in, in, other_vport, 1);
+ +
+ +	return mlx5_cmd_exec_check_status(mdev, in, sizeof(in), out, outlen);
+ +}
+ +
+ +static int query_esw_vport_cvlan(struct mlx5_core_dev *dev, u32 vport,
+ +				 u16 *vlan, u8 *qos)
+ +{
+ +	u32 out[MLX5_ST_SZ_DW(query_esw_vport_context_out)];
+ +	int err;
+ +	bool cvlan_strip;
+ +	bool cvlan_insert;
+ +
+ +	memset(out, 0, sizeof(out));
+ +
+ +	*vlan = 0;
+ +	*qos = 0;
+ +
+ +	if (!MLX5_CAP_ESW(dev, vport_cvlan_strip) ||
+ +	    !MLX5_CAP_ESW(dev, vport_cvlan_insert_if_not_exist))
+ +		return -ENOTSUPP;
+ +
+ +	err = query_esw_vport_context_cmd(dev, vport, out, sizeof(out));
+ +	if (err)
+ +		goto out;
+ +
+ +	cvlan_strip = MLX5_GET(query_esw_vport_context_out, out,
+ +			       esw_vport_context.vport_cvlan_strip);
+ +
+ +	cvlan_insert = MLX5_GET(query_esw_vport_context_out, out,
+ +				esw_vport_context.vport_cvlan_insert);
+ +
+ +	if (cvlan_strip || cvlan_insert) {
+ +		*vlan = MLX5_GET(query_esw_vport_context_out, out,
+ +				 esw_vport_context.cvlan_id);
+ +		*qos = MLX5_GET(query_esw_vport_context_out, out,
+ +				esw_vport_context.cvlan_pcp);
+ +	}
+ +
+ +	esw_debug(dev, "Query Vport[%d] cvlan: VLAN %d qos=%d\n",
+ +		  vport, *vlan, *qos);
+ +out:
+ +	return err;
+ +}
+ +
+++=======
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  static int modify_esw_vport_context_cmd(struct mlx5_core_dev *dev, u16 vport,
+  					void *in, int inlen)
+  {
+@@@ -744,10 -771,117 +747,123 @@@ out
+  	kfree(mac_list);
+  }
+  
+++<<<<<<< HEAD
+ +static void esw_vport_change_handler(struct work_struct *work)
+++=======
++ /* Sync vport UC/MC list from vport context
++  * Must be called after esw_update_vport_addr_list
++  */
++ static void esw_update_vport_mc_promisc(struct mlx5_eswitch *esw, u32 vport_num)
++ {
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	struct l2addr_node *node;
++ 	struct vport_addr *addr;
++ 	struct hlist_head *hash;
++ 	struct hlist_node *tmp;
++ 	int hi;
++ 
++ 	hash = vport->mc_list;
++ 
++ 	for_each_l2hash_node(node, tmp, esw->mc_table, hi) {
++ 		u8 *mac = node->addr;
++ 
++ 		addr = l2addr_hash_find(hash, mac, struct vport_addr);
++ 		if (addr) {
++ 			if (addr->action == MLX5_ACTION_DEL)
++ 				addr->action = MLX5_ACTION_NONE;
++ 			continue;
++ 		}
++ 		addr = l2addr_hash_add(hash, mac, struct vport_addr,
++ 				       GFP_KERNEL);
++ 		if (!addr) {
++ 			esw_warn(esw->dev,
++ 				 "Failed to add allmulti MAC(%pM) to vport[%d] DB\n",
++ 				 mac, vport_num);
++ 			continue;
++ 		}
++ 		addr->vport = vport_num;
++ 		addr->action = MLX5_ACTION_ADD;
++ 		addr->mc_promisc = true;
++ 	}
++ }
++ 
++ /* Apply vport rx mode to HW FDB table */
++ static void esw_apply_vport_rx_mode(struct mlx5_eswitch *esw, u32 vport_num,
++ 				    bool promisc, bool mc_promisc)
++ {
++ 	struct esw_mc_addr *allmulti_addr = esw->mc_promisc;
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 
++ 	if (IS_ERR_OR_NULL(vport->allmulti_rule) != mc_promisc)
++ 		goto promisc;
++ 
++ 	if (mc_promisc) {
++ 		vport->allmulti_rule =
++ 				esw_fdb_set_vport_allmulti_rule(esw, vport_num);
++ 		if (!allmulti_addr->uplink_rule)
++ 			allmulti_addr->uplink_rule =
++ 				esw_fdb_set_vport_allmulti_rule(esw,
++ 								UPLINK_VPORT);
++ 		allmulti_addr->refcnt++;
++ 	} else if (vport->allmulti_rule) {
++ 		mlx5_del_flow_rule(vport->allmulti_rule);
++ 		vport->allmulti_rule = NULL;
++ 
++ 		if (--allmulti_addr->refcnt > 0)
++ 			goto promisc;
++ 
++ 		if (allmulti_addr->uplink_rule)
++ 			mlx5_del_flow_rule(allmulti_addr->uplink_rule);
++ 		allmulti_addr->uplink_rule = NULL;
++ 	}
++ 
++ promisc:
++ 	if (IS_ERR_OR_NULL(vport->promisc_rule) != promisc)
++ 		return;
++ 
++ 	if (promisc) {
++ 		vport->promisc_rule = esw_fdb_set_vport_promisc_rule(esw,
++ 								     vport_num);
++ 	} else if (vport->promisc_rule) {
++ 		mlx5_del_flow_rule(vport->promisc_rule);
++ 		vport->promisc_rule = NULL;
++ 	}
++ }
++ 
++ /* Sync vport rx mode from vport context */
++ static void esw_update_vport_rx_mode(struct mlx5_eswitch *esw, u32 vport_num)
++ {
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	int promisc_all = 0;
++ 	int promisc_uc = 0;
++ 	int promisc_mc = 0;
++ 	int err;
++ 
++ 	err = mlx5_query_nic_vport_promisc(esw->dev,
++ 					   vport_num,
++ 					   &promisc_uc,
++ 					   &promisc_mc,
++ 					   &promisc_all);
++ 	if (err)
++ 		return;
++ 	esw_debug(esw->dev, "vport[%d] context update rx mode promisc_all=%d, all_multi=%d\n",
++ 		  vport_num, promisc_all, promisc_mc);
++ 
++ 	if (!vport->info.trusted || !vport->enabled) {
++ 		promisc_uc = 0;
++ 		promisc_mc = 0;
++ 		promisc_all = 0;
++ 	}
++ 
++ 	esw_apply_vport_rx_mode(esw, vport_num, promisc_all,
++ 				(promisc_all || promisc_mc));
++ }
++ 
++ static void esw_vport_change_handle_locked(struct mlx5_vport *vport)
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  {
+ +	struct mlx5_vport *vport =
+ +		container_of(work, struct mlx5_vport, vport_change_handler);
+  	struct mlx5_core_dev *dev = vport->dev;
+  	struct mlx5_eswitch *esw = dev->priv.eswitch;
+  	u8 mac[ETH_ALEN];
+@@@ -1044,81 -1205,107 +1160,134 @@@ static void esw_vport_disable_ingress_a
+  static int esw_vport_ingress_config(struct mlx5_eswitch *esw,
+  				    struct mlx5_vport *vport)
+  {
+++<<<<<<< HEAD
+ +	u32 *match_v;
+ +	u32 *match_c;
+++=======
++ 	struct mlx5_flow_spec *spec;
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  	int err = 0;
+ -	u8 *smac_v;
+  
+++<<<<<<< HEAD
+ +	if (IS_ERR_OR_NULL(vport->ingress.acl)) {
+ +		esw_warn(esw->dev,
+ +			 "vport[%d] configure ingress rules failed, ingress acl is not initialized!\n",
+ +			 vport->vport);
+ +		return -EPERM;
+++=======
++ 	if (vport->info.spoofchk && !is_valid_ether_addr(vport->info.mac)) {
++ 		mlx5_core_warn(esw->dev,
++ 			       "vport[%d] configure ingress rules failed, illegal mac with spoofchk\n",
++ 			       vport->vport);
++ 		return -EPERM;
++ 
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  	}
+  
+  	esw_vport_cleanup_ingress_rules(esw, vport);
+  
+++<<<<<<< HEAD
+ +	if (!vport->vlan && !vport->qos)
+++=======
++ 	if (!vport->info.vlan && !vport->info.qos && !vport->info.spoofchk) {
++ 		esw_vport_disable_ingress_acl(esw, vport);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  		return 0;
+ -	}
+ -
+ -	esw_vport_enable_ingress_acl(esw, vport);
+  
+  	esw_debug(esw->dev,
+  		  "vport[%d] configure ingress rules, vlan(%d) qos(%d)\n",
+- 		  vport->vport, vport->vlan, vport->qos);
++ 		  vport->vport, vport->info.vlan, vport->info.qos);
+  
+ -	spec = mlx5_vzalloc(sizeof(*spec));
+ -	if (!spec) {
+ +	match_v = kzalloc(MLX5_ST_SZ_BYTES(fte_match_param), GFP_KERNEL);
+ +	match_c = kzalloc(MLX5_ST_SZ_BYTES(fte_match_param), GFP_KERNEL);
+ +	if (!match_v || !match_c) {
+  		err = -ENOMEM;
+  		esw_warn(esw->dev, "vport[%d] configure ingress rules failed, err(%d)\n",
+  			 vport->vport, err);
+  		goto out;
+  	}
+ +	MLX5_SET_TO_ONES(fte_match_param, match_c, outer_headers.vlan_tag);
+ +	MLX5_SET_TO_ONES(fte_match_param, match_v, outer_headers.vlan_tag);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vport->info.vlan || vport->info.qos)
++ 		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.vlan_tag);
++ 
++ 	if (vport->info.spoofchk) {
++ 		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.smac_47_16);
++ 		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.smac_15_0);
++ 		smac_v = MLX5_ADDR_OF(fte_match_param,
++ 				      spec->match_value,
++ 				      outer_headers.smac_47_16);
++ 		ether_addr_copy(smac_v, vport->info.mac);
++ 	}
++ 
++ 	spec->match_criteria_enable = MLX5_MATCH_OUTER_HEADERS;
++ 	vport->ingress.allow_rule =
++ 		mlx5_add_flow_rule(vport->ingress.acl, spec,
++ 				   MLX5_FLOW_CONTEXT_ACTION_ALLOW,
++ 				   0, NULL);
++ 	if (IS_ERR(vport->ingress.allow_rule)) {
++ 		err = PTR_ERR(vport->ingress.allow_rule);
++ 		esw_warn(esw->dev,
++ 			 "vport[%d] configure ingress allow rule, err(%d)\n",
++ 			 vport->vport, err);
++ 		vport->ingress.allow_rule = NULL;
++ 		goto out;
++ 	}
++ 
++ 	memset(spec, 0, sizeof(*spec));
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  	vport->ingress.drop_rule =
+ -		mlx5_add_flow_rule(vport->ingress.acl, spec,
+ +		mlx5_add_flow_rule(vport->ingress.acl,
+ +				   MLX5_MATCH_OUTER_HEADERS,
+ +				   match_c,
+ +				   match_v,
+  				   MLX5_FLOW_CONTEXT_ACTION_DROP,
+  				   0, NULL);
+ -	if (IS_ERR(vport->ingress.drop_rule)) {
+ +	if (IS_ERR_OR_NULL(vport->ingress.drop_rule)) {
+  		err = PTR_ERR(vport->ingress.drop_rule);
+ -		esw_warn(esw->dev,
+ -			 "vport[%d] configure ingress drop rule, err(%d)\n",
+ -			 vport->vport, err);
+ +		pr_warn("vport[%d] configure ingress rules, err(%d)\n",
+ +			vport->vport, err);
+  		vport->ingress.drop_rule = NULL;
+ -		goto out;
+  	}
+ -
+  out:
+ -	if (err)
+ -		esw_vport_cleanup_ingress_rules(esw, vport);
+ -	kvfree(spec);
+ +	kfree(match_v);
+ +	kfree(match_c);
+  	return err;
+  }
+  
+  static int esw_vport_egress_config(struct mlx5_eswitch *esw,
+  				   struct mlx5_vport *vport)
+  {
+ -	struct mlx5_flow_spec *spec;
+ +	u32 *match_v;
+ +	u32 *match_c;
+  	int err = 0;
+  
+ +	if (IS_ERR_OR_NULL(vport->egress.acl)) {
+ +		esw_warn(esw->dev, "vport[%d] configure rgress rules failed, egress acl is not initialized!\n",
+ +			 vport->vport);
+ +		return -EPERM;
+ +	}
+ +
+  	esw_vport_cleanup_egress_rules(esw, vport);
+  
+++<<<<<<< HEAD
+ +	if (!vport->vlan && !vport->qos)
+++=======
++ 	if (!vport->info.vlan && !vport->info.qos) {
++ 		esw_vport_disable_egress_acl(esw, vport);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  		return 0;
+ -	}
+ -
+ -	esw_vport_enable_egress_acl(esw, vport);
+  
+  	esw_debug(esw->dev,
+  		  "vport[%d] configure egress rules, vlan(%d) qos(%d)\n",
+- 		  vport->vport, vport->vlan, vport->qos);
++ 		  vport->vport, vport->info.vlan, vport->info.qos);
+  
+ -	spec = mlx5_vzalloc(sizeof(*spec));
+ -	if (!spec) {
+ +	match_v = kzalloc(MLX5_ST_SZ_BYTES(fte_match_param), GFP_KERNEL);
+ +	match_c = kzalloc(MLX5_ST_SZ_BYTES(fte_match_param), GFP_KERNEL);
+ +	if (!match_v || !match_c) {
+  		err = -ENOMEM;
+  		esw_warn(esw->dev, "vport[%d] configure egress rules failed, err(%d)\n",
+  			 vport->vport, err);
+@@@ -1126,22 -1313,21 +1295,29 @@@
+  	}
+  
+  	/* Allowed vlan rule */
+++<<<<<<< HEAD
+ +	MLX5_SET_TO_ONES(fte_match_param, match_c, outer_headers.vlan_tag);
+ +	MLX5_SET_TO_ONES(fte_match_param, match_v, outer_headers.vlan_tag);
+ +	MLX5_SET_TO_ONES(fte_match_param, match_c, outer_headers.first_vid);
+ +	MLX5_SET(fte_match_param, match_v, outer_headers.first_vid, vport->vlan);
+++=======
++ 	MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.vlan_tag);
++ 	MLX5_SET_TO_ONES(fte_match_param, spec->match_value, outer_headers.vlan_tag);
++ 	MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.first_vid);
++ 	MLX5_SET(fte_match_param, spec->match_value, outer_headers.first_vid, vport->info.vlan);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  
+ -	spec->match_criteria_enable = MLX5_MATCH_OUTER_HEADERS;
+  	vport->egress.allowed_vlan =
+ -		mlx5_add_flow_rule(vport->egress.acl, spec,
+ +		mlx5_add_flow_rule(vport->egress.acl,
+ +				   MLX5_MATCH_OUTER_HEADERS,
+ +				   match_c,
+ +				   match_v,
+  				   MLX5_FLOW_CONTEXT_ACTION_ALLOW,
+  				   0, NULL);
+ -	if (IS_ERR(vport->egress.allowed_vlan)) {
+ +	if (IS_ERR_OR_NULL(vport->egress.allowed_vlan)) {
+  		err = PTR_ERR(vport->egress.allowed_vlan);
+ -		esw_warn(esw->dev,
+ -			 "vport[%d] configure egress allowed vlan rule failed, err(%d)\n",
+ -			 vport->vport, err);
+ +		pr_warn("vport[%d] configure egress allowed vlan rule failed, err(%d)\n",
+ +			vport->vport, err);
+  		vport->egress.allowed_vlan = NULL;
+  		goto out;
+  	}
+@@@ -1178,25 -1395,18 +1389,38 @@@ static void esw_enable_vport(struct mlx
+  
+  	esw_debug(esw->dev, "Enabling VPORT(%d)\n", vport_num);
+  
+++<<<<<<< HEAD
+ +	if (vport_num) { /* Only VFs need ACLs for VST and spoofchk filtering */
+ +		esw_vport_enable_ingress_acl(esw, vport);
+ +		esw_vport_enable_egress_acl(esw, vport);
+ +		esw_vport_ingress_config(esw, vport);
+ +		esw_vport_egress_config(esw, vport);
+ +	}
+ +
+ +	mlx5_modify_vport_admin_state(esw->dev,
+ +				      MLX5_QUERY_VPORT_STATE_IN_OP_MOD_ESW_VPORT,
+ +				      vport_num,
+ +				      MLX5_ESW_VPORT_ADMIN_STATE_AUTO);
+++=======
++ 	/* Restore old vport configuration */
++ 	esw_apply_vport_conf(esw, vport);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  
+  	/* Sync with current vport context */
+  	vport->enabled_events = enable_events;
+ +	esw_vport_change_handler(&vport->vport_change_handler);
+ +
+  	vport->enabled = true;
+  
+++<<<<<<< HEAD
+ +	arm_vport_context_events_cmd(esw->dev, vport_num, enable_events);
+++=======
++ 	/* only PF is trusted by default */
++ 	if (!vport_num)
++ 		vport->info.trusted = true;
++ 
++ 	esw_vport_change_handle_locked(vport);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  
+  	esw->enabled_vports++;
+  	esw_debug(esw->dev, "Enabled VPORT(%d)\n", vport_num);
+@@@ -1229,9 -1434,14 +1448,18 @@@ static void esw_disable_vport(struct ml
+  	 * Calling vport change handler while vport is disabled will cleanup
+  	 * the vport resources.
+  	 */
+ -	esw_vport_change_handle_locked(vport);
+ +	esw_vport_change_handler(&vport->vport_change_handler);
+  	vport->enabled_events = 0;
+++<<<<<<< HEAD
+ +	if (vport_num) {
+++=======
++ 
++ 	if (vport_num && esw->mode == SRIOV_LEGACY) {
++ 		mlx5_modify_vport_admin_state(esw->dev,
++ 					      MLX5_QUERY_VPORT_STATE_IN_OP_MOD_ESW_VPORT,
++ 					      vport_num,
++ 					      MLX5_ESW_VPORT_ADMIN_STATE_DOWN);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  		esw_vport_disable_egress_acl(esw, vport);
+  		esw_vport_disable_ingress_acl(esw, vport);
+  	}
+@@@ -1453,6 -1686,17 +1670,20 @@@ int mlx5_eswitch_set_vport_mac(struct m
+  	if (!LEGAL_VPORT(esw, vport))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&esw->state_lock);
++ 	evport = &esw->vports[vport];
++ 
++ 	if (evport->info.spoofchk && !is_valid_ether_addr(mac)) {
++ 		mlx5_core_warn(esw->dev,
++ 			       "MAC invalidation is not allowed when spoofchk is on, vport(%d)\n",
++ 			       vport);
++ 		err = -EPERM;
++ 		goto unlock;
++ 	}
++ 
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  	err = mlx5_modify_nic_vport_mac_address(esw->dev, vport, mac);
+  	if (err) {
+  		mlx5_core_warn(esw->dev,
+@@@ -1468,6 -1712,13 +1699,16 @@@
+  			       "Failed to set vport %d node guid, err = %d. RDMA_CM will not function properly for this VF.\n",
+  			       vport, err);
+  
+++<<<<<<< HEAD
+++=======
++ 	ether_addr_copy(evport->info.mac, mac);
++ 	evport->info.node_guid = node_guid;
++ 	if (evport->enabled && esw->mode == SRIOV_LEGACY)
++ 		err = esw_vport_ingress_config(esw, evport);
++ 
++ unlock:
++ 	mutex_unlock(&esw->state_lock);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  	return err;
+  }
+  
+@@@ -1487,8 -1756,7 +1746,12 @@@ unlock
+  int mlx5_eswitch_get_vport_config(struct mlx5_eswitch *esw,
+  				  int vport, struct ifla_vf_info *ivi)
+  {
+++<<<<<<< HEAD
+ +	u16 vlan;
+ +	u8 qos;
+++=======
++ 	struct mlx5_vport *evport;
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  
+  	if (!ESW_ALLOWED(esw))
+  		return -EPERM;
+@@@ -1498,14 -1766,16 +1761,25 @@@
+  	memset(ivi, 0, sizeof(*ivi));
+  	ivi->vf = vport - 1;
+  
+++<<<<<<< HEAD
+ +	mlx5_query_nic_vport_mac_address(esw->dev, vport, ivi->mac);
+ +	ivi->linkstate = mlx5_query_vport_admin_state(esw->dev,
+ +						      MLX5_QUERY_VPORT_STATE_IN_OP_MOD_ESW_VPORT,
+ +						      vport);
+ +	query_esw_vport_cvlan(esw->dev, vport, &vlan, &qos);
+ +	ivi->vlan = vlan;
+ +	ivi->qos = qos;
+ +	ivi->spoofchk = 0;
+++=======
++ 	mutex_lock(&esw->state_lock);
++ 	ether_addr_copy(ivi->mac, evport->info.mac);
++ 	ivi->linkstate = evport->info.link_state;
++ 	ivi->vlan = evport->info.vlan;
++ 	ivi->qos = evport->info.qos;
++ 	ivi->spoofchk = evport->info.spoofchk;
++ 	ivi->trusted = evport->info.trusted;
++ 	mutex_unlock(&esw->state_lock);
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  
+  	return 0;
+  }
+@@@ -1529,23 -1800,67 +1804,77 @@@ int mlx5_eswitch_set_vport_vlan(struct 
+  
+  	err = modify_esw_vport_cvlan(esw->dev, vport, vlan, qos, set);
+  	if (err)
+- 		return err;
++ 		goto unlock;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&esw->state_lock);
+ +	evport->vlan = vlan;
+ +	evport->qos = qos;
+ +	if (evport->enabled) {
+++=======
++ 	evport->info.vlan = vlan;
++ 	evport->info.qos = qos;
++ 	if (evport->enabled && esw->mode == SRIOV_LEGACY) {
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  		err = esw_vport_ingress_config(esw, evport);
+  		if (err)
+- 			goto out;
++ 			goto unlock;
+  		err = esw_vport_egress_config(esw, evport);
+  	}
+  
+- out:
++ unlock:
++ 	mutex_unlock(&esw->state_lock);
++ 	return err;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ int mlx5_eswitch_set_vport_spoofchk(struct mlx5_eswitch *esw,
++ 				    int vport, bool spoofchk)
++ {
++ 	struct mlx5_vport *evport;
++ 	bool pschk;
++ 	int err = 0;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	evport = &esw->vports[vport];
++ 	pschk = evport->info.spoofchk;
++ 	evport->info.spoofchk = spoofchk;
++ 	if (evport->enabled && esw->mode == SRIOV_LEGACY)
++ 		err = esw_vport_ingress_config(esw, evport);
++ 	if (err)
++ 		evport->info.spoofchk = pschk;
+  	mutex_unlock(&esw->state_lock);
++ 
+  	return err;
+  }
+  
++ int mlx5_eswitch_set_vport_trust(struct mlx5_eswitch *esw,
++ 				 int vport, bool setting)
++ {
++ 	struct mlx5_vport *evport;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	evport = &esw->vports[vport];
++ 	evport->info.trusted = setting;
++ 	if (evport->enabled)
++ 		esw_vport_change_handle_locked(evport);
++ 	mutex_unlock(&esw->state_lock);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+  				 int vport,
+  				 struct ifla_vf_stats *vf_stats)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 7b5e70f8cc22,6855783f3bb3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -116,8 -131,8 +126,13 @@@ struct mlx5_vport 
+  	struct vport_ingress    ingress;
+  	struct vport_egress     egress;
+  
+++<<<<<<< HEAD
+ +	u16                     vlan;
+ +	u8                      qos;
+++=======
++ 	struct mlx5_vport_info  info;
++ 
+++>>>>>>> 1ab2068a4c66 (net/mlx5: Implement vports admin state backup/restore)
+  	bool                    enabled;
+  	u16                     enabled_events;
+  };
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
