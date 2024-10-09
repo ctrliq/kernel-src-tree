@@ -1,0 +1,288 @@
+flow_dissector: Get vlan priority in addition to vlan id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hadar Hen Zion <hadarh@mellanox.com>
+commit f6a66927692e30bdc1792e7a1fc2107d4dfcf42d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f6a66927.failed
+
+Add vlan priority check to the flow dissector by adding new flow
+dissector struct, flow_dissector_key_vlan which includes vlan tag
+fields.
+
+vlan_id and flow_label fields were under the same struct
+(flow_dissector_key_tags). It was a convenient setting since struct
+flow_dissector_key_tags is used by struct flow_keys and by setting
+vlan_id and flow_label under the same struct, we get precisely 24 or 48
+bytes in flow_keys from flow_dissector_key_basic.
+
+Now, when adding vlan priority support, the code will be cleaner if
+flow_label and vlan tag won't be under the same struct anymore.
+
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f6a66927692e30bdc1792e7a1fc2107d4dfcf42d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_dissector.h
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index dae6e57d80c3,a2879c0f6c4c..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -116,13 -101,28 +116,26 @@@ EXPORT_SYMBOL(__skb_flow_get_ports)
+   * @nhoff: network header offset, if @data is NULL use skb_network_offset(skb)
+   * @hlen: packet header length, if @data is NULL use skb_headlen(skb)
+   *
+ - * The function will try to retrieve individual keys into target specified
+ - * by flow_dissector from either the skbuff or a raw buffer specified by the
+ - * rest parameters.
+ - *
+ - * Caller must take care of zeroing target container memory.
+ + * The function will try to retrieve the struct flow_keys from either the skbuff
+ + * or a raw buffer specified by the rest parameters
+   */
+ -bool __skb_flow_dissect(const struct sk_buff *skb,
+ -			struct flow_dissector *flow_dissector,
+ -			void *target_container,
+ -			void *data, __be16 proto, int nhoff, int hlen,
+ -			unsigned int flags)
+ +bool __skb_flow_dissect(const struct sk_buff *skb, struct flow_keys *flow,
+ +			void *data, __be16 proto, int nhoff, int hlen)
+  {
+++<<<<<<< HEAD
+ +	u8 ip_proto;
+++=======
++ 	struct flow_dissector_key_control *key_control;
++ 	struct flow_dissector_key_basic *key_basic;
++ 	struct flow_dissector_key_addrs *key_addrs;
++ 	struct flow_dissector_key_ports *key_ports;
++ 	struct flow_dissector_key_tags *key_tags;
++ 	struct flow_dissector_key_vlan *key_vlan;
++ 	struct flow_dissector_key_keyid *key_keyid;
++ 	bool skip_vlan = false;
++ 	u8 ip_proto = 0;
++ 	bool ret = false;
+++>>>>>>> f6a66927692e (flow_dissector: Get vlan priority in addition to vlan id)
+  
+  	if (!data) {
+  		data = skb->data;
+@@@ -173,20 -243,51 +186,60 @@@ ipv6
+  
+  		break;
+  	}
+ -	case htons(ETH_P_8021AD):
+ -	case htons(ETH_P_8021Q): {
+ +	case __constant_htons(ETH_P_8021AD):
+ +	case __constant_htons(ETH_P_8021Q): {
+  		const struct vlan_hdr *vlan;
+ +		struct vlan_hdr _vlan;
+  
+++<<<<<<< HEAD
+ +		vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan), data, hlen, &_vlan);
+ +		if (!vlan)
+ +			return false;
+++=======
++ 		if (skb_vlan_tag_present(skb))
++ 			proto = skb->protocol;
++ 
++ 		if (!skb_vlan_tag_present(skb) ||
++ 		    proto == cpu_to_be16(ETH_P_8021Q) ||
++ 		    proto == cpu_to_be16(ETH_P_8021AD)) {
++ 			struct vlan_hdr _vlan;
++ 
++ 			vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan),
++ 						    data, hlen, &_vlan);
++ 			if (!vlan)
++ 				goto out_bad;
++ 			proto = vlan->h_vlan_encapsulated_proto;
++ 			nhoff += sizeof(*vlan);
++ 			if (skip_vlan)
++ 				goto again;
++ 		}
++ 
++ 		skip_vlan = true;
++ 		if (dissector_uses_key(flow_dissector,
++ 				       FLOW_DISSECTOR_KEY_VLAN)) {
++ 			key_vlan = skb_flow_dissector_target(flow_dissector,
++ 							     FLOW_DISSECTOR_KEY_VLAN,
++ 							     target_container);
++ 
++ 			if (skb_vlan_tag_present(skb)) {
++ 				key_vlan->vlan_id = skb_vlan_tag_get_id(skb);
++ 				key_vlan->vlan_priority =
++ 					(skb_vlan_tag_get_prio(skb) >> VLAN_PRIO_SHIFT);
++ 			} else {
++ 				key_vlan->vlan_id = ntohs(vlan->h_vlan_TCI) &
++ 					VLAN_VID_MASK;
++ 				key_vlan->vlan_priority =
++ 					(ntohs(vlan->h_vlan_TCI) &
++ 					 VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
++ 			}
++ 		}
+++>>>>>>> f6a66927692e (flow_dissector: Get vlan priority in addition to vlan id)
+  
+ +		proto = vlan->h_vlan_encapsulated_proto;
+ +		nhoff += sizeof(*vlan);
+  		goto again;
+  	}
+ -	case htons(ETH_P_PPP_SES): {
+ +	case __constant_htons(ETH_P_PPP_SES): {
+  		struct {
+  			struct pppoe_hdr hdr;
+  			__be16 proto;
+@@@ -478,3 -880,132 +531,135 @@@ u32 skb_get_poff(const struct sk_buff *
+  
+  	return __skb_get_poff(skb, skb->data, &keys, skb_headlen(skb));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ __u32 __get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys)
++ {
++ 	memset(keys, 0, sizeof(*keys));
++ 
++ 	memcpy(&keys->addrs.v6addrs.src, &fl6->saddr,
++ 	    sizeof(keys->addrs.v6addrs.src));
++ 	memcpy(&keys->addrs.v6addrs.dst, &fl6->daddr,
++ 	    sizeof(keys->addrs.v6addrs.dst));
++ 	keys->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++ 	keys->ports.src = fl6->fl6_sport;
++ 	keys->ports.dst = fl6->fl6_dport;
++ 	keys->keyid.keyid = fl6->fl6_gre_key;
++ 	keys->tags.flow_label = (__force u32)fl6->flowlabel;
++ 	keys->basic.ip_proto = fl6->flowi6_proto;
++ 
++ 	return flow_hash_from_keys(keys);
++ }
++ EXPORT_SYMBOL(__get_hash_from_flowi6);
++ 
++ __u32 __get_hash_from_flowi4(const struct flowi4 *fl4, struct flow_keys *keys)
++ {
++ 	memset(keys, 0, sizeof(*keys));
++ 
++ 	keys->addrs.v4addrs.src = fl4->saddr;
++ 	keys->addrs.v4addrs.dst = fl4->daddr;
++ 	keys->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++ 	keys->ports.src = fl4->fl4_sport;
++ 	keys->ports.dst = fl4->fl4_dport;
++ 	keys->keyid.keyid = fl4->fl4_gre_key;
++ 	keys->basic.ip_proto = fl4->flowi4_proto;
++ 
++ 	return flow_hash_from_keys(keys);
++ }
++ EXPORT_SYMBOL(__get_hash_from_flowi4);
++ 
++ static const struct flow_dissector_key flow_keys_dissector_keys[] = {
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_CONTROL,
++ 		.offset = offsetof(struct flow_keys, control),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_BASIC,
++ 		.offset = offsetof(struct flow_keys, basic),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v4addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v6addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_TIPC_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.tipcaddrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_PORTS,
++ 		.offset = offsetof(struct flow_keys, ports),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_VLAN,
++ 		.offset = offsetof(struct flow_keys, vlan),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_FLOW_LABEL,
++ 		.offset = offsetof(struct flow_keys, tags),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_GRE_KEYID,
++ 		.offset = offsetof(struct flow_keys, keyid),
++ 	},
++ };
++ 
++ static const struct flow_dissector_key flow_keys_dissector_symmetric_keys[] = {
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_CONTROL,
++ 		.offset = offsetof(struct flow_keys, control),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_BASIC,
++ 		.offset = offsetof(struct flow_keys, basic),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v4addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v6addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_PORTS,
++ 		.offset = offsetof(struct flow_keys, ports),
++ 	},
++ };
++ 
++ static const struct flow_dissector_key flow_keys_buf_dissector_keys[] = {
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_CONTROL,
++ 		.offset = offsetof(struct flow_keys, control),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_BASIC,
++ 		.offset = offsetof(struct flow_keys, basic),
++ 	},
++ };
++ 
++ struct flow_dissector flow_keys_dissector __read_mostly;
++ EXPORT_SYMBOL(flow_keys_dissector);
++ 
++ struct flow_dissector flow_keys_buf_dissector __read_mostly;
++ 
++ static int __init init_default_flow_dissectors(void)
++ {
++ 	skb_flow_dissector_init(&flow_keys_dissector,
++ 				flow_keys_dissector_keys,
++ 				ARRAY_SIZE(flow_keys_dissector_keys));
++ 	skb_flow_dissector_init(&flow_keys_dissector_symmetric,
++ 				flow_keys_dissector_symmetric_keys,
++ 				ARRAY_SIZE(flow_keys_dissector_symmetric_keys));
++ 	skb_flow_dissector_init(&flow_keys_buf_dissector,
++ 				flow_keys_buf_dissector_keys,
++ 				ARRAY_SIZE(flow_keys_buf_dissector_keys));
++ 	return 0;
++ }
++ 
++ late_initcall_sync(init_default_flow_dissectors);
+++>>>>>>> f6a66927692e (flow_dissector: Get vlan priority in addition to vlan id)
+* Unmerged path include/net/flow_dissector.h
+diff --git a/include/linux/if_vlan.h b/include/linux/if_vlan.h
+index b555a22150ae..7006be7a047e 100644
+--- a/include/linux/if_vlan.h
++++ b/include/linux/if_vlan.h
+@@ -81,6 +81,7 @@ static inline int is_vlan_dev(struct net_device *dev)
+ #define skb_vlan_tag_present(__skb)	((__skb)->vlan_tci & VLAN_TAG_PRESENT)
+ #define skb_vlan_tag_get(__skb)		((__skb)->vlan_tci & ~VLAN_TAG_PRESENT)
+ #define skb_vlan_tag_get_id(__skb)	((__skb)->vlan_tci & VLAN_VID_MASK)
++#define skb_vlan_tag_get_prio(__skb)	((__skb)->vlan_tci & VLAN_PRIO_MASK)
+ 
+ #if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
+ 
+* Unmerged path include/net/flow_dissector.h
+* Unmerged path net/core/flow_dissector.c
