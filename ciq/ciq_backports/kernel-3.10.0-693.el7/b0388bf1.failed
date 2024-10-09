@@ -1,0 +1,279 @@
+xfs: remove XBF_DONE flag wrapper macros
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit b0388bf1088d992b45aa8af14d3151ae57848b17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b0388bf1.failed
+
+They only set/clear/check a flag, no need for obfuscating this
+with a macro.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit b0388bf1088d992b45aa8af14d3151ae57848b17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf_item.c
+diff --cc fs/xfs/xfs_buf_item.c
+index ebabf8d5e3f3,901e4d721958..000000000000
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@@ -1064,8 -1065,12 +1064,17 @@@ xfs_buf_iodone_callback_error
+  	 * If we've already decided to shutdown the filesystem because of
+  	 * I/O errors, there's no point in giving this a retry.
+  	 */
+++<<<<<<< HEAD
+ +	if (XFS_FORCED_SHUTDOWN(mp))
+ +		goto out_stale;
+++=======
++ 	if (XFS_FORCED_SHUTDOWN(mp)) {
++ 		xfs_buf_stale(bp);
++ 		bp->b_flags |= XBF_DONE;
++ 		trace_xfs_buf_item_iodone(bp, _RET_IP_);
++ 		goto do_callbacks;
++ 	}
+++>>>>>>> b0388bf1088d (xfs: remove XBF_DONE flag wrapper macros)
+  
+  	if (bp->b_target != lasttarg ||
+  	    time_after(jiffies, (lasttime + 5*HZ))) {
+@@@ -1074,93 -1079,45 +1083,98 @@@
+  	}
+  	lasttarg = bp->b_target;
+  
+ +	/* synchronous writes will have callers process the error */
+ +	if (!(bp->b_flags & XBF_ASYNC))
+ +		goto out_stale;
+ +
+ +	trace_xfs_buf_item_iodone_async(bp, _RET_IP_);
+ +	ASSERT(bp->b_iodone != NULL);
+ +
+ +	cfg = xfs_error_get_cfg(mp, XFS_ERR_METADATA, bp->b_error);
+ +
+  	/*
+  	 * If the write was asynchronous then no one will be looking for the
+ -	 * error.  Clear the error state and write the buffer out again.
+ -	 *
+ -	 * XXX: This helps against transient write errors, but we need to find
+ -	 * a way to shut the filesystem down if the writes keep failing.
+ -	 *
+ -	 * In practice we'll shut the filesystem down soon as non-transient
+ -	 * errors tend to affect the whole device and a failing log write
+ -	 * will make us give up.  But we really ought to do better here.
+ +	 * error.  If this is the first failure of this type, clear the error
+ +	 * state and write the buffer out again. This means we always retry an
+ +	 * async write failure at least once, but we also need to set the buffer
+ +	 * up to behave correctly now for repeated failures.
+  	 */
+ -	if (XFS_BUF_ISASYNC(bp)) {
+ -		ASSERT(bp->b_iodone != NULL);
+ +	if (!(bp->b_flags & (XBF_STALE | XBF_WRITE_FAIL)) ||
+ +	     bp->b_last_error != bp->b_error) {
+ +		bp->b_flags |= (XBF_WRITE | XBF_DONE | XBF_WRITE_FAIL);
+ +		bp->b_last_error = bp->b_error;
+ +		if (cfg->retry_timeout && !bp->b_first_retry_time)
+ +			bp->b_first_retry_time = jiffies;
+ +
+ +		xfs_buf_ioerror(bp, 0);
+ +		xfs_buf_submit(bp);
+ +		return true;
+ +	}
+  
+ -		trace_xfs_buf_item_iodone_async(bp, _RET_IP_);
+ +	/*
+ +	 * Repeated failure on an async write. Take action according to the
+ +	 * error configuration we have been set up to use.
+ +	 */
+  
+ -		xfs_buf_ioerror(bp, 0); /* errno of 0 unsets the flag */
+ +	if (cfg->max_retries != XFS_ERR_RETRY_FOREVER &&
+ +	    ++bp->b_retries > cfg->max_retries)
+ +			goto permanent_error;
+ +	if (cfg->retry_timeout &&
+ +	    time_after(jiffies, cfg->retry_timeout + bp->b_first_retry_time))
+ +			goto permanent_error;
+  
+ -		if (!(bp->b_flags & (XBF_STALE|XBF_WRITE_FAIL))) {
+ -			bp->b_flags |= XBF_WRITE | XBF_ASYNC |
+ -				       XBF_DONE | XBF_WRITE_FAIL;
+ -			xfs_buf_submit(bp);
+ -		} else {
+ -			xfs_buf_relse(bp);
+ -		}
+ +	/* At unmount we may treat errors differently */
+ +	if ((mp->m_flags & XFS_MOUNT_UNMOUNTING) && mp->m_fail_unmount)
+ +		goto permanent_error;
+  
+ -		return;
+ -	}
+ +	/* still a transient error, higher layers will retry */
+ +	xfs_buf_ioerror(bp, 0);
+ +	xfs_buf_relse(bp);
+ +	return true;
+  
+  	/*
+ -	 * If the write of the buffer was synchronous, we want to make
+ -	 * sure to return the error to the caller of xfs_bwrite().
+ +	 * Permanent error - we need to trigger a shutdown if we haven't already
+ +	 * to indicate that inconsistency will result from this action.
+  	 */
+ +permanent_error:
+ +	xfs_force_shutdown(mp, SHUTDOWN_META_IO_ERROR);
+ +out_stale:
+  	xfs_buf_stale(bp);
+++<<<<<<< HEAD
+ +	XFS_BUF_DONE(bp);
+++=======
++ 	bp->b_flags |= XBF_DONE;
++ 
+++>>>>>>> b0388bf1088d (xfs: remove XBF_DONE flag wrapper macros)
+  	trace_xfs_buf_error_relse(bp, _RET_IP_);
+ +	return false;
+ +}
+ +
+ +/*
+ + * This is the iodone() function for buffers which have had callbacks attached
+ + * to them by xfs_buf_attach_iodone(). We need to iterate the items on the
+ + * callback list, mark the buffer as having no more callbacks and then push the
+ + * buffer through IO completion processing.
+ + */
+ +void
+ +xfs_buf_iodone_callbacks(
+ +	struct xfs_buf		*bp)
+ +{
+ +	/*
+ +	 * If there is an error, process it. Some errors require us
+ +	 * to run callbacks after failure processing is done so we
+ +	 * detect that and take appropriate action.
+ +	 */
+ +	if (bp->b_error && xfs_buf_iodone_callback_error(bp))
+ +		return;
+ +
+ +	/*
+ +	 * Successful IO or permanent error. Either way, we can clear the
+ +	 * retry state here in preparation for the next error that may occur.
+ +	 */
+ +	bp->b_last_error = 0;
+ +	bp->b_retries = 0;
+  
+ -do_callbacks:
+  	xfs_buf_do_callbacks(bp);
+  	bp->b_fspriv = NULL;
+  	bp->b_iodone = NULL;
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index 52df2bc56800..92e84bc047cb 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -754,7 +754,7 @@ xfs_buf_read_map(
+ 	if (bp) {
+ 		trace_xfs_buf_read(bp, flags, _RET_IP_);
+ 
+-		if (!XFS_BUF_ISDONE(bp)) {
++		if (!(bp->b_flags & XBF_DONE)) {
+ 			XFS_STATS_INC(target->bt_mount, xb_get_read);
+ 			bp->b_ops = ops;
+ 			_xfs_buf_read(bp, flags);
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 648b20e00240..5edd587c87b3 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -346,10 +346,6 @@ void xfs_buf_stale(struct xfs_buf *bp);
+ #define XFS_BUF_UNSTALE(bp)	((bp)->b_flags &= ~XBF_STALE)
+ #define XFS_BUF_ISSTALE(bp)	((bp)->b_flags & XBF_STALE)
+ 
+-#define XFS_BUF_DONE(bp)	((bp)->b_flags |= XBF_DONE)
+-#define XFS_BUF_UNDONE(bp)	((bp)->b_flags &= ~XBF_DONE)
+-#define XFS_BUF_ISDONE(bp)	((bp)->b_flags & XBF_DONE)
+-
+ #define XFS_BUF_ASYNC(bp)	((bp)->b_flags |= XBF_ASYNC)
+ #define XFS_BUF_UNASYNC(bp)	((bp)->b_flags &= ~XBF_ASYNC)
+ #define XFS_BUF_ISASYNC(bp)	((bp)->b_flags & XBF_ASYNC)
+* Unmerged path fs/xfs/xfs_buf_item.c
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 2a5eecff8de3..e1607f98107d 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -3296,7 +3296,7 @@ cluster_corrupt_out:
+ 		 * mark it as stale and brelse.
+ 		 */
+ 		if (bp->b_iodone) {
+-			XFS_BUF_UNDONE(bp);
++			bp->b_flags &= ~XBF_DONE;
+ 			xfs_buf_stale(bp);
+ 			xfs_buf_ioerror(bp, -EIO);
+ 			xfs_buf_ioend(bp);
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 747a315eb12b..3351ace5a51e 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -3980,7 +3980,7 @@ xfs_log_force_umount(
+ 	    log->l_flags & XLOG_ACTIVE_RECOVERY) {
+ 		mp->m_flags |= XFS_MOUNT_FS_SHUTDOWN;
+ 		if (mp->m_sb_bp)
+-			XFS_BUF_DONE(mp->m_sb_bp);
++			mp->m_sb_bp->b_flags |= XBF_DONE;
+ 		return 0;
+ 	}
+ 
+@@ -4010,7 +4010,7 @@ xfs_log_force_umount(
+ 	spin_lock(&log->l_icloglock);
+ 	mp->m_flags |= XFS_MOUNT_FS_SHUTDOWN;
+ 	if (mp->m_sb_bp)
+-		XFS_BUF_DONE(mp->m_sb_bp);
++		mp->m_sb_bp->b_flags |= XBF_DONE;
+ 
+ 	/*
+ 	 * Mark the log and the iclogs with IO error flags to prevent any
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 67ded68898f9..2b06e1748f72 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -5077,7 +5077,7 @@ xlog_do_recover(
+ 	 * updates, re-read in the superblock and reverify it.
+ 	 */
+ 	bp = xfs_getsb(log->l_mp, 0);
+-	XFS_BUF_UNDONE(bp);
++	bp->b_flags &= ~XBF_DONE;
+ 	ASSERT(!(XFS_BUF_ISWRITE(bp)));
+ 	XFS_BUF_READ(bp);
+ 	XFS_BUF_UNASYNC(bp);
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index 4b6937b5fead..400263e5a752 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -1320,7 +1320,7 @@ xfs_getsb(
+ 	}
+ 
+ 	xfs_buf_hold(bp);
+-	ASSERT(XFS_BUF_ISDONE(bp));
++	ASSERT(bp->b_flags & XBF_DONE);
+ 	return bp;
+ }
+ 
+diff --git a/fs/xfs/xfs_trans_buf.c b/fs/xfs/xfs_trans_buf.c
+index d3d80bef59e1..960ae35d8176 100644
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@ -155,7 +155,7 @@ xfs_trans_get_buf_map(
+ 		ASSERT(xfs_buf_islocked(bp));
+ 		if (XFS_FORCED_SHUTDOWN(tp->t_mountp)) {
+ 			xfs_buf_stale(bp);
+-			XFS_BUF_DONE(bp);
++			bp->b_flags |= XBF_DONE;
+ 		}
+ 
+ 		ASSERT(bp->b_transp == tp);
+@@ -586,7 +586,7 @@ xfs_trans_log_buf(xfs_trans_t	*tp,
+ 	 * inside the b_bdstrat callback so that this won't get written to
+ 	 * disk.
+ 	 */
+-	XFS_BUF_DONE(bp);
++	bp->b_flags |= XBF_DONE;
+ 
+ 	ASSERT(atomic_read(&bip->bli_refcount) > 0);
+ 	bp->b_iodone = xfs_buf_iodone_callbacks;
