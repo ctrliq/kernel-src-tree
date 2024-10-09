@@ -1,0 +1,292 @@
+pinctrl: intel: Add support for variable size pad groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [pinctrl] intel: Add support for variable size pad groups (David Arcari) [1457654]
+Rebuild_FUZZ: 91.26%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 919eb4756ef41fd71b5eaae8a2a067fcde9d44d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/919eb475.failed
+
+The Intel GPIO hardware has a concept of pad groups, which means 1 to 32
+pads occupying their own GPI_IS, GPI_IE, PAD_OWN and so on registers. The
+existing hardware has the same amount of pads in each pad group (except the
+last one) so it is possible to use community->gpp_size to calculate start
+offset of each register.
+
+With the next generation SoCs the pad group size is not always the same
+anymore which means we cannot use community->gpp_size for register offset
+calculations directly.
+
+To support variable size pad groups we introduce struct intel_padgroup that
+can be filled in by the client drivers according the hardware pad group
+layout. The core driver will always use these when it performs calculations
+for pad register offsets. The core driver will automatically populate pad
+groups based on community->gpp_size if the driver does not provide any.
+This makes sure the existing drivers still work as expected.
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Chuah, Kim Tatt <kim.tatt.chuah@intel.com>
+	Signed-off-by: Tan Jui Nee <jui.nee.tan@intel.com>
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 919eb4756ef41fd71b5eaae8a2a067fcde9d44d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pinctrl/intel/pinctrl-intel.c
+#	drivers/pinctrl/intel/pinctrl-intel.h
+#	drivers/pinctrl/intel/pinctrl-sunrisepoint.c
+diff --cc drivers/pinctrl/intel/pinctrl-intel.c
+index 0e6847417515,78c48497c9e6..000000000000
+--- a/drivers/pinctrl/intel/pinctrl-intel.c
++++ b/drivers/pinctrl/intel/pinctrl-intel.c
+@@@ -118,10 -113,11 +118,11 @@@ struct intel_pinctrl 
+  	struct intel_community *communities;
+  	size_t ncommunities;
+  	struct intel_pinctrl_context context;
+ -	int irq;
+  };
+  
+ +#define gpiochip_to_pinctrl(c)	container_of(c, struct intel_pinctrl, chip)
+  #define pin_to_padno(c, p)	((p) - (c)->pin_base)
++ #define padgroup_offset(g, p)	((p) - (g)->base)
+  
+  static struct intel_community *intel_get_community(struct intel_pinctrl *pctrl,
+  						   unsigned pin)
+@@@ -193,12 -210,15 +215,24 @@@ static bool intel_pad_acpi_mode(struct 
+  	if (!community->hostown_offset)
+  		return false;
+  
+++<<<<<<< HEAD
+ +	padno = pin_to_padno(community, pin);
+ +	gpp = padno / NPADS_IN_GPP;
+ +	offset = community->hostown_offset + gpp * 4;
+ +	hostown = community->regs + offset;
+ +
+ +	return !(readl(hostown) & BIT(padno % NPADS_IN_GPP));
+++=======
++ 	padgrp = intel_community_get_padgroup(community, pin);
++ 	if (!padgrp)
++ 		return true;
++ 
++ 	gpp_offset = padgroup_offset(padgrp, pin);
++ 	offset = community->hostown_offset + padgrp->reg_num * 4;
++ 	hostown = community->regs + offset;
++ 
++ 	return !(readl(hostown) & BIT(gpp_offset));
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  }
+  
+  static bool intel_pad_locked(struct intel_pinctrl *pctrl, unsigned pin)
+@@@ -213,22 -234,25 +248,38 @@@
+  	if (!community->padcfglock_offset)
+  		return false;
+  
+++<<<<<<< HEAD
+ +	padno = pin_to_padno(community, pin);
+ +	gpp = padno / NPADS_IN_GPP;
+++=======
++ 	padgrp = intel_community_get_padgroup(community, pin);
++ 	if (!padgrp)
++ 		return true;
++ 
++ 	gpp_offset = padgroup_offset(padgrp, pin);
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  
+  	/*
+  	 * If PADCFGLOCK and PADCFGLOCKTX bits are both clear for this pad,
+  	 * the pad is considered unlocked. Any other case means that it is
+  	 * either fully or partially locked and we don't touch it.
+  	 */
+- 	offset = community->padcfglock_offset + gpp * 8;
++ 	offset = community->padcfglock_offset + padgrp->reg_num * 8;
+  	value = readl(community->regs + offset);
+++<<<<<<< HEAD
+ +	if (value & BIT(pin % NPADS_IN_GPP))
+++=======
++ 	if (value & BIT(gpp_offset))
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  		return true;
+  
+- 	offset = community->padcfglock_offset + 4 + gpp * 8;
++ 	offset = community->padcfglock_offset + 4 + padgrp->reg_num * 8;
+  	value = readl(community->regs + offset);
+++<<<<<<< HEAD
+ +	if (value & BIT(pin % NPADS_IN_GPP))
+++=======
++ 	if (value & BIT(gpp_offset))
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  		return true;
+  
+  	return false;
+@@@ -792,18 -806,22 +843,28 @@@ static void intel_gpio_irq_ack(struct i
+  	const struct intel_community *community;
+  	unsigned pin = irqd_to_hwirq(d);
+  
+- 	raw_spin_lock(&pctrl->lock);
+- 
+  	community = intel_get_community(pctrl, pin);
+  	if (community) {
+++<<<<<<< HEAD
+ +		unsigned padno = pin_to_padno(community, pin);
+ +		unsigned gpp_offset = padno % NPADS_IN_GPP;
+ +		unsigned gpp = padno / NPADS_IN_GPP;
+++=======
++ 		const struct intel_padgroup *padgrp;
++ 		unsigned gpp, gpp_offset;
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
++ 
++ 		padgrp = intel_community_get_padgroup(community, pin);
++ 		if (!padgrp)
++ 			return;
++ 
++ 		gpp = padgrp->reg_num;
++ 		gpp_offset = padgroup_offset(padgrp, pin);
+  
++ 		raw_spin_lock(&pctrl->lock);
+  		writel(BIT(gpp_offset), community->regs + GPI_IS + gpp * 4);
++ 		raw_spin_unlock(&pctrl->lock);
+  	}
+- 
+- 	raw_spin_unlock(&pctrl->lock);
+  }
+  
+  static void intel_gpio_irq_enable(struct irq_data *d)
+@@@ -838,18 -859,15 +902,21 @@@
+  static void intel_gpio_irq_mask_unmask(struct irq_data *d, bool mask)
+  {
+  	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+ -	struct intel_pinctrl *pctrl = gpiochip_get_data(gc);
+ +	struct intel_pinctrl *pctrl = gpiochip_to_pinctrl(gc);
+  	const struct intel_community *community;
+  	unsigned pin = irqd_to_hwirq(d);
+- 	unsigned long flags;
+- 
+- 	raw_spin_lock_irqsave(&pctrl->lock, flags);
+  
+  	community = intel_get_community(pctrl, pin);
+  	if (community) {
+++<<<<<<< HEAD
+ +		unsigned padno = pin_to_padno(community, pin);
+ +		unsigned gpp_offset = padno % NPADS_IN_GPP;
+ +		unsigned gpp = padno / NPADS_IN_GPP;
+++=======
++ 		const struct intel_padgroup *padgrp;
++ 		unsigned gpp, gpp_offset;
++ 		unsigned long flags;
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  		void __iomem *reg;
+  		u32 value;
+  
+@@@ -986,14 -989,10 +1062,21 @@@ static void intel_gpio_community_irq_ha
+  		/* Only interrupts that are enabled */
+  		pending &= enabled;
+  
+++<<<<<<< HEAD
+ +		for_each_set_bit(gpp_offset, &pending, NPADS_IN_GPP) {
+ +			unsigned padno, irq;
+ +
+ +			/*
+ +			 * The last group in community can have less pins
+ +			 * than NPADS_IN_GPP.
+ +			 */
+ +			padno = gpp_offset + gpp * NPADS_IN_GPP;
+++=======
++ 		for_each_set_bit(gpp_offset, &pending, padgrp->size) {
++ 			unsigned padno, irq;
++ 
++ 			padno = padgrp->base - community->pin_base + gpp_offset;
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  			if (padno >= community->npins)
+  				break;
+  
+@@@ -1185,7 -1230,10 +1318,14 @@@ int intel_pinctrl_probe(struct platform
+  
+  		community->regs = regs;
+  		community->pad_regs = regs + padbar;
+++<<<<<<< HEAD
+ +		community->ngpps = DIV_ROUND_UP(community->npins, NPADS_IN_GPP);
+++=======
++ 
++ 		ret = intel_pinctrl_add_padgroups(pctrl, community);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  	}
+  
+  	irq = platform_get_irq(pdev, 0);
+diff --cc drivers/pinctrl/intel/pinctrl-intel.h
+index 97f29925ced4,b251a9e86970..000000000000
+--- a/drivers/pinctrl/intel/pinctrl-intel.h
++++ b/drivers/pinctrl/intel/pinctrl-intel.h
+@@@ -55,12 -72,23 +72,26 @@@ struct intel_padgroup 
+   *                  ACPI).
+   * @ie_offset: Register offset of GPI_IE from @regs.
+   * @pin_base: Starting pin of pins in this community
+++<<<<<<< HEAD
+++=======
++  * @gpp_size: Maximum number of pads in each group, such as PADCFGLOCK,
++  *            HOSTSW_OWN,  GPI_IS, GPI_IE, etc. Used when @gpps is %NULL.
++  * @gpp_num_padown_regs: Number of pad registers each pad group consumes at
++  *			 minimum. Use %0 if the number of registers can be
++  *			 determined by the size of the group.
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+   * @npins: Number of pins in this community
+   * @features: Additional features supported by the hardware
++  * @gpps: Pad groups if the controller has variable size pad groups
++  * @ngpps: Number of pad groups in this community
+   * @regs: Community specific common registers (reserved for core driver)
+   * @pad_regs: Community specific pad registers (reserved for core driver)
+-  * @ngpps: Number of groups (hw groups) in this community (reserved for
+-  *         core driver)
++  *
++  * Most Intel GPIO host controllers this driver supports each pad group is
++  * of equal size (except the last one). In that case the driver can just
++  * fill in @gpp_size field and let the core driver to handle the rest. If
++  * the controller has pad groups of variable size the client driver can
++  * pass custom @gpps and @ngpps instead.
+   */
+  struct intel_community {
+  	unsigned barno;
+@@@ -69,11 -97,15 +100,18 @@@
+  	unsigned hostown_offset;
+  	unsigned ie_offset;
+  	unsigned pin_base;
+++<<<<<<< HEAD
+++=======
++ 	unsigned gpp_size;
++ 	unsigned gpp_num_padown_regs;
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  	size_t npins;
+  	unsigned features;
++ 	const struct intel_padgroup *gpps;
++ 	size_t ngpps;
++ 	/* Reserved for the core driver */
+  	void __iomem *regs;
+  	void __iomem *pad_regs;
+- 	size_t ngpps;
+  };
+  
+  /* Additional features supported by the hardware */
+diff --cc drivers/pinctrl/intel/pinctrl-sunrisepoint.c
+index 1de9ae5010db,8870a4100164..000000000000
+--- a/drivers/pinctrl/intel/pinctrl-sunrisepoint.c
++++ b/drivers/pinctrl/intel/pinctrl-sunrisepoint.c
+@@@ -30,6 -30,8 +30,11 @@@
+  		.padcfglock_offset = SPT_PADCFGLOCK,	\
+  		.hostown_offset = SPT_HOSTSW_OWN,	\
+  		.ie_offset = SPT_GPI_IE,		\
+++<<<<<<< HEAD
+++=======
++ 		.gpp_size = 24,				\
++ 		.gpp_num_padown_regs = 4,		\
+++>>>>>>> 919eb4756ef4 (pinctrl: intel: Add support for variable size pad groups)
+  		.pin_base = (s),			\
+  		.npins = ((e) - (s) + 1),		\
+  	}
+* Unmerged path drivers/pinctrl/intel/pinctrl-intel.c
+* Unmerged path drivers/pinctrl/intel/pinctrl-intel.h
+* Unmerged path drivers/pinctrl/intel/pinctrl-sunrisepoint.c
