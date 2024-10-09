@@ -1,0 +1,322 @@
+tracing/uprobes: Move argument fetching to uprobe_dispatcher()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit dd9fa555d7bbfcc7dbc63eb744806e9f6cb62e9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dd9fa555.failed
+
+A single uprobe event might serve different users like ftrace and
+perf.  And this is especially important for upcoming multi buffer
+support.  But in this case it'll fetch (same) data from userspace
+multiple times.  So move it to the beginning of the dispatcher
+function and reuse it for each users.
+
+Link: http://lkml.kernel.org/r/1389946120-19610-3-git-send-email-namhyung@kernel.org
+
+	Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: zhangwei(Jovi) <jovi.zhangwei@huawei.com>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit dd9fa555d7bbfcc7dbc63eb744806e9f6cb62e9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/trace/trace_uprobe.c
+index 84f228258d8e,d83155e0da78..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -681,19 -672,110 +681,122 @@@ static const struct file_operations upr
+  	.release	= seq_release,
+  };
+  
+++<<<<<<< HEAD
+ +static void uprobe_trace_print(struct trace_uprobe *tu,
+ +				unsigned long func, struct pt_regs *regs)
+++=======
++ struct uprobe_cpu_buffer {
++ 	struct mutex mutex;
++ 	void *buf;
++ };
++ static struct uprobe_cpu_buffer __percpu *uprobe_cpu_buffer;
++ static int uprobe_buffer_refcnt;
++ 
++ static int uprobe_buffer_init(void)
++ {
++ 	int cpu, err_cpu;
++ 
++ 	uprobe_cpu_buffer = alloc_percpu(struct uprobe_cpu_buffer);
++ 	if (uprobe_cpu_buffer == NULL)
++ 		return -ENOMEM;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct page *p = alloc_pages_node(cpu_to_node(cpu),
++ 						  GFP_KERNEL, 0);
++ 		if (p == NULL) {
++ 			err_cpu = cpu;
++ 			goto err;
++ 		}
++ 		per_cpu_ptr(uprobe_cpu_buffer, cpu)->buf = page_address(p);
++ 		mutex_init(&per_cpu_ptr(uprobe_cpu_buffer, cpu)->mutex);
++ 	}
++ 
++ 	return 0;
++ 
++ err:
++ 	for_each_possible_cpu(cpu) {
++ 		if (cpu == err_cpu)
++ 			break;
++ 		free_page((unsigned long)per_cpu_ptr(uprobe_cpu_buffer, cpu)->buf);
++ 	}
++ 
++ 	free_percpu(uprobe_cpu_buffer);
++ 	return -ENOMEM;
++ }
++ 
++ static int uprobe_buffer_enable(void)
++ {
++ 	int ret = 0;
++ 
++ 	BUG_ON(!mutex_is_locked(&event_mutex));
++ 
++ 	if (uprobe_buffer_refcnt++ == 0) {
++ 		ret = uprobe_buffer_init();
++ 		if (ret < 0)
++ 			uprobe_buffer_refcnt--;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void uprobe_buffer_disable(void)
++ {
++ 	BUG_ON(!mutex_is_locked(&event_mutex));
++ 
++ 	if (--uprobe_buffer_refcnt == 0) {
++ 		free_percpu(uprobe_cpu_buffer);
++ 		uprobe_cpu_buffer = NULL;
++ 	}
++ }
++ 
++ static struct uprobe_cpu_buffer *uprobe_buffer_get(void)
++ {
++ 	struct uprobe_cpu_buffer *ucb;
++ 	int cpu;
++ 
++ 	cpu = raw_smp_processor_id();
++ 	ucb = per_cpu_ptr(uprobe_cpu_buffer, cpu);
++ 
++ 	/*
++ 	 * Use per-cpu buffers for fastest access, but we might migrate
++ 	 * so the mutex makes sure we have sole access to it.
++ 	 */
++ 	mutex_lock(&ucb->mutex);
++ 
++ 	return ucb;
++ }
++ 
++ static void uprobe_buffer_put(struct uprobe_cpu_buffer *ucb)
++ {
++ 	mutex_unlock(&ucb->mutex);
++ }
++ 
++ static void __uprobe_trace_func(struct trace_uprobe *tu,
++ 				unsigned long func, struct pt_regs *regs,
++ 				struct uprobe_cpu_buffer *ucb, int dsize)
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  {
+  	struct uprobe_trace_entry_head *entry;
+  	struct ring_buffer_event *event;
+  	struct ring_buffer *buffer;
+  	void *data;
+++<<<<<<< HEAD
+ +	int size, i;
+ +	struct ftrace_event_call *call = &tu->call;
+ +
+ +	size = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+++=======
++ 	int size, esize;
++ 	struct ftrace_event_call *call = &tu->tp.call;
++ 
++ 	if (WARN_ON_ONCE(tu->tp.size + dsize > PAGE_SIZE))
++ 		return;
++ 
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 	size = esize + tu->tp.size + dsize;
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  	event = trace_current_buffer_lock_reserve(&buffer, call->event.type,
+ -						  size, 0, 0);
+ +						  size + tu->size, 0, 0);
+  	if (!event)
+  		return;
+  
+@@@ -715,17 -796,19 +818,27 @@@
+  }
+  
+  /* uprobe handler */
+- static int uprobe_trace_func(struct trace_uprobe *tu, struct pt_regs *regs)
++ static int uprobe_trace_func(struct trace_uprobe *tu, struct pt_regs *regs,
++ 			     struct uprobe_cpu_buffer *ucb, int dsize)
+  {
+  	if (!is_ret_probe(tu))
+++<<<<<<< HEAD
+ +		uprobe_trace_print(tu, 0, regs);
+++=======
++ 		__uprobe_trace_func(tu, 0, regs, ucb, dsize);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  	return 0;
+  }
+  
+  static void uretprobe_trace_func(struct trace_uprobe *tu, unsigned long func,
+- 				struct pt_regs *regs)
++ 				 struct pt_regs *regs,
++ 				 struct uprobe_cpu_buffer *ucb, int dsize)
+  {
+++<<<<<<< HEAD
+ +	uprobe_trace_print(tu, func, regs);
+++=======
++ 	__uprobe_trace_func(tu, func, regs, ucb, dsize);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  }
+  
+  /* Event entry printers */
+@@@ -976,17 -1008,21 +1089,33 @@@ static bool uprobe_perf_filter(struct u
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void uprobe_perf_print(struct trace_uprobe *tu,
+ +				unsigned long func, struct pt_regs *regs)
+++=======
++ static void __uprobe_perf_func(struct trace_uprobe *tu,
++ 			       unsigned long func, struct pt_regs *regs,
++ 			       struct uprobe_cpu_buffer *ucb, int dsize)
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  {
+ -	struct ftrace_event_call *call = &tu->tp.call;
+ +	struct ftrace_event_call *call = &tu->call;
+  	struct uprobe_trace_entry_head *entry;
+  	struct hlist_head *head;
+  	void *data;
+++<<<<<<< HEAD
+ +	int size, rctx, i;
+ +
+ +	size = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+ +	size = ALIGN(size + tu->size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+++=======
++ 	int size, esize;
++ 	int rctx;
++ 
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 
++ 	size = esize + tu->tp.size + dsize;
++ 	size = ALIGN(size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE, "profile buffer not large enough"))
+  		return;
+  
+@@@ -1023,14 -1065,15 +1153,23 @@@ static int uprobe_perf_func(struct trac
+  		return UPROBE_HANDLER_REMOVE;
+  
+  	if (!is_ret_probe(tu))
+++<<<<<<< HEAD
+ +		uprobe_perf_print(tu, 0, regs);
+++=======
++ 		__uprobe_perf_func(tu, 0, regs, ucb, dsize);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  	return 0;
+  }
+  
+  static void uretprobe_perf_func(struct trace_uprobe *tu, unsigned long func,
+- 				struct pt_regs *regs)
++ 				struct pt_regs *regs,
++ 				struct uprobe_cpu_buffer *ucb, int dsize)
+  {
+++<<<<<<< HEAD
+ +	uprobe_perf_print(tu, func, regs);
+++=======
++ 	__uprobe_perf_func(tu, func, regs, ucb, dsize);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  }
+  #endif	/* CONFIG_PERF_EVENTS */
+  
+@@@ -1082,13 -1128,29 +1224,38 @@@ static int uprobe_dispatcher(struct upr
+  
+  	current->utask->vaddr = (unsigned long) &udd;
+  
+++<<<<<<< HEAD
+ +	if (tu->flags & TP_FLAG_TRACE)
+ +		ret |= uprobe_trace_func(tu, regs);
+ +
+ +#ifdef CONFIG_PERF_EVENTS
+ +	if (tu->flags & TP_FLAG_PROFILE)
+ +		ret |= uprobe_perf_func(tu, regs);
+++=======
++ #ifdef CONFIG_PERF_EVENTS
++ 	if ((tu->tp.flags & TP_FLAG_TRACE) == 0 &&
++ 	    !uprobe_perf_filter(&tu->consumer, 0, current->mm))
++ 		return UPROBE_HANDLER_REMOVE;
+  #endif
++ 
++ 	if (WARN_ON_ONCE(!uprobe_cpu_buffer))
++ 		return 0;
++ 
++ 	dsize = __get_data_size(&tu->tp, regs);
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 
++ 	ucb = uprobe_buffer_get();
++ 	store_trace_args(esize, &tu->tp, regs, ucb->buf, dsize);
++ 
++ 	if (tu->tp.flags & TP_FLAG_TRACE)
++ 		ret |= uprobe_trace_func(tu, regs, ucb, dsize);
++ 
++ #ifdef CONFIG_PERF_EVENTS
++ 	if (tu->tp.flags & TP_FLAG_PROFILE)
++ 		ret |= uprobe_perf_func(tu, regs, ucb, dsize);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
++ #endif
++ 	uprobe_buffer_put(ucb);
+  	return ret;
+  }
+  
+@@@ -1105,13 -1169,23 +1274,32 @@@ static int uretprobe_dispatcher(struct 
+  
+  	current->utask->vaddr = (unsigned long) &udd;
+  
+++<<<<<<< HEAD
+ +	if (tu->flags & TP_FLAG_TRACE)
+ +		uretprobe_trace_func(tu, func, regs);
+ +
+ +#ifdef CONFIG_PERF_EVENTS
+ +	if (tu->flags & TP_FLAG_PROFILE)
+ +		uretprobe_perf_func(tu, func, regs);
+++=======
++ 	if (WARN_ON_ONCE(!uprobe_cpu_buffer))
++ 		return 0;
++ 
++ 	dsize = __get_data_size(&tu->tp, regs);
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 
++ 	ucb = uprobe_buffer_get();
++ 	store_trace_args(esize, &tu->tp, regs, ucb->buf, dsize);
++ 
++ 	if (tu->tp.flags & TP_FLAG_TRACE)
++ 		uretprobe_trace_func(tu, func, regs, ucb, dsize);
++ 
++ #ifdef CONFIG_PERF_EVENTS
++ 	if (tu->tp.flags & TP_FLAG_PROFILE)
++ 		uretprobe_perf_func(tu, func, regs, ucb, dsize);
+++>>>>>>> dd9fa555d7bb (tracing/uprobes: Move argument fetching to uprobe_dispatcher())
+  #endif
++ 	uprobe_buffer_put(ucb);
+  	return 0;
+  }
+  
+* Unmerged path kernel/trace/trace_uprobe.c
