@@ -3524,6 +3524,12 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	wake_up_all(&module_wq);
 	mutex_unlock(&module_mutex);
  free_module:
+	/*
+	 * Ftrace needs to clean up what it initialized.
+	 * This does nothing if ftrace_module_init() wasn't called,
+	 * but it must be called outside of module_mutex.
+	 */
+	ftrace_release_mod(mod);
 	/* Free lock-classes; relies on the preceding sync_rcu() */
 	lockdep_free_key_range(mod->module_core, mod->core_size);
 
