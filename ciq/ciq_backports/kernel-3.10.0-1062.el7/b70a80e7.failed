@@ -1,0 +1,175 @@
+vfs: introduce d_instantiate_no_diralias()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Miklos Szeredi <mszeredi@suse.cz>
+commit b70a80e7a133a0c86f2fa078e7c144597c516415
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b70a80e7.failed
+
+...which just returns -EBUSY if a directory alias would be created.
+
+This is to be used by fuse mkdir to make sure that a buggy or malicious
+userspace filesystem doesn't do anything nasty.  Previously fuse used a
+private mutex for this purpose, which can now go away.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+(cherry picked from commit b70a80e7a133a0c86f2fa078e7c144597c516415)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/inode.c
+diff --cc fs/fuse/inode.c
+index 164196e15af5,1c15613c64f8..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -598,8 -595,6 +597,11 @@@ void fuse_conn_put(struct fuse_conn *fc
+  	if (atomic_dec_and_test(&fc->count)) {
+  		if (fc->destroy_req)
+  			fuse_request_free(fc->destroy_req);
+++<<<<<<< HEAD
+ +		mutex_destroy(&fc->inst_mutex);
+ +		put_pid_ns(fc->pid_ns);
+++=======
+++>>>>>>> b70a80e7a133 (vfs: introduce d_instantiate_no_diralias())
+  		fc->release(fc);
+  	}
+  }
+diff --git a/fs/dcache.c b/fs/dcache.c
+index f8f0822c6dd1..c8a875e69bb6 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1758,6 +1758,33 @@ struct dentry *d_instantiate_unique(struct dentry *entry, struct inode *inode)
+ 
+ EXPORT_SYMBOL(d_instantiate_unique);
+ 
++/**
++ * d_instantiate_no_diralias - instantiate a non-aliased dentry
++ * @entry: dentry to complete
++ * @inode: inode to attach to this dentry
++ *
++ * Fill in inode information in the entry.  If a directory alias is found, then
++ * return an error (and drop inode).  Together with d_materialise_unique() this
++ * guarantees that a directory inode may never have more than one alias.
++ */
++int d_instantiate_no_diralias(struct dentry *entry, struct inode *inode)
++{
++	BUG_ON(!hlist_unhashed(&entry->d_alias));
++
++	spin_lock(&inode->i_lock);
++	if (S_ISDIR(inode->i_mode) && !hlist_empty(&inode->i_dentry)) {
++		spin_unlock(&inode->i_lock);
++		iput(inode);
++		return -EBUSY;
++	}
++	__d_instantiate(entry, inode);
++	spin_unlock(&inode->i_lock);
++	security_d_instantiate(entry, inode);
++
++	return 0;
++}
++EXPORT_SYMBOL(d_instantiate_no_diralias);
++
+ struct dentry *d_make_root(struct inode *root_inode)
+ {
+ 	struct dentry *res = NULL;
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index a687f8d2ed28..ea38457dcc27 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -350,24 +350,6 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, struct qstr *name,
+ 	return err;
+ }
+ 
+-static struct dentry *fuse_materialise_dentry(struct dentry *dentry,
+-					      struct inode *inode)
+-{
+-	struct dentry *newent;
+-
+-	if (inode && S_ISDIR(inode->i_mode)) {
+-		struct fuse_conn *fc = get_fuse_conn(inode);
+-
+-		mutex_lock(&fc->inst_mutex);
+-		newent = d_materialise_unique(dentry, inode);
+-		mutex_unlock(&fc->inst_mutex);
+-	} else {
+-		newent = d_materialise_unique(dentry, inode);
+-	}
+-
+-	return newent;
+-}
+-
+ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
+ 				  unsigned int flags)
+ {
+@@ -390,7 +372,7 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
+ 	if (inode && get_node_id(inode) == FUSE_ROOT_ID)
+ 		goto out_iput;
+ 
+-	newent = fuse_materialise_dentry(entry, inode);
++	newent = d_materialise_unique(entry, inode);
+ 	err = PTR_ERR(newent);
+ 	if (IS_ERR(newent))
+ 		goto out_err;
+@@ -609,21 +591,9 @@ static int create_new_entry(struct fuse_conn *fc, struct fuse_req *req,
+ 	}
+ 	kfree(forget);
+ 
+-	if (S_ISDIR(inode->i_mode)) {
+-		struct dentry *alias;
+-		mutex_lock(&fc->inst_mutex);
+-		alias = d_find_alias(inode);
+-		if (alias) {
+-			/* New directory must have moved since mkdir */
+-			mutex_unlock(&fc->inst_mutex);
+-			dput(alias);
+-			iput(inode);
+-			return -EBUSY;
+-		}
+-		d_instantiate(entry, inode);
+-		mutex_unlock(&fc->inst_mutex);
+-	} else
+-		d_instantiate(entry, inode);
++	err = d_instantiate_no_diralias(entry, inode);
++	if (err)
++		return err;
+ 
+ 	fuse_change_entry_timeout(entry, &outarg);
+ 	fuse_invalidate_attr(dir);
+@@ -1340,7 +1310,7 @@ static int fuse_direntplus_link(struct file *file,
+ 	if (!inode)
+ 		goto out;
+ 
+-	alias = fuse_materialise_dentry(dentry, inode);
++	alias = d_materialise_unique(dentry, inode);
+ 	err = PTR_ERR(alias);
+ 	if (IS_ERR(alias))
+ 		goto out;
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index e2ceb903f5a0..97908fed55ec 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -376,9 +376,6 @@ struct fuse_conn {
+ 	/** Lock protecting accessess to  members of this structure */
+ 	spinlock_t lock;
+ 
+-	/** Mutex protecting against directory alias creation */
+-	struct mutex inst_mutex;
+-
+ 	/** Refcount */
+ 	atomic_t count;
+ 
+* Unmerged path fs/fuse/inode.c
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index d021d2f76e5c..26b1a0634414 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -243,6 +243,7 @@ static inline int dname_external(struct dentry *dentry)
+ extern void d_instantiate(struct dentry *, struct inode *);
+ extern struct dentry * d_instantiate_unique(struct dentry *, struct inode *);
+ extern struct dentry * d_materialise_unique(struct dentry *, struct inode *);
++extern int d_instantiate_no_diralias(struct dentry *, struct inode *);
+ extern void __d_drop(struct dentry *dentry);
+ extern void d_drop(struct dentry *dentry);
+ extern void d_delete(struct dentry *);
