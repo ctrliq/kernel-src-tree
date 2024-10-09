@@ -1,0 +1,161 @@
+tracing/kprobes: Turn trace_probe->files into list_head
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit b04d52e368e2cf526abb2bab61f304eaea126af2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b04d52e3.failed
+
+I think that "ftrace_event_file *trace_probe[]" complicates the
+code for no reason, turn it into list_head to simplify the code.
+enable_trace_probe() no longer needs synchronize_sched().
+
+This needs the extra sizeof(list_head) memory for every attached
+ftrace_event_file, hopefully not a problem in this case.
+
+Link: http://lkml.kernel.org/r/20130620173814.GA13165@redhat.com
+
+	Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit b04d52e368e2cf526abb2bab61f304eaea126af2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_kprobe.c
+diff --cc kernel/trace/trace_kprobe.c
+index 963be2df4725,405b5b0f903e..000000000000
+--- a/kernel/trace/trace_kprobe.c
++++ b/kernel/trace/trace_kprobe.c
+@@@ -350,25 -189,6 +356,28 @@@ static struct trace_probe *find_trace_p
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static int trace_probe_nr_files(struct trace_probe *tp)
+ +{
+ +	struct ftrace_event_file **file;
+ +	int ret = 0;
+ +
+ +	/*
+ +	 * Since all tp->files updater is protected by probe_enable_lock,
+ +	 * we don't need to lock an rcu_read_lock.
+ +	 */
+ +	file = rcu_dereference_raw(tp->files);
+ +	if (file)
+ +		while (*(file++))
+ +			ret++;
+ +
+ +	return ret;
+ +}
+ +
+ +static DEFINE_MUTEX(probe_enable_lock);
+ +
+++=======
+++>>>>>>> b04d52e368e2 (tracing/kprobes: Turn trace_probe->files into list_head)
+  /*
+   * Enable trace_probe
+   * if the file is NULL, enable "perf" handler, or enable "trace" handler.
+@@@ -378,32 -198,19 +387,21 @@@ enable_trace_probe(struct trace_probe *
+  {
+  	int ret = 0;
+  
+ +	mutex_lock(&probe_enable_lock);
+ +
+  	if (file) {
+- 		struct ftrace_event_file **new, **old;
+- 		int n = trace_probe_nr_files(tp);
+- 
+- 		old = rcu_dereference_raw(tp->files);
+- 		/* 1 is for new one and 1 is for stopper */
+- 		new = kzalloc((n + 2) * sizeof(struct ftrace_event_file *),
+- 			      GFP_KERNEL);
+- 		if (!new) {
++ 		struct event_file_link *link;
++ 
++ 		link = kmalloc(sizeof(*link), GFP_KERNEL);
++ 		if (!link) {
+  			ret = -ENOMEM;
+ -			goto out;
+ +			goto out_unlock;
+  		}
+- 		memcpy(new, old, n * sizeof(struct ftrace_event_file *));
+- 		new[n] = file;
+- 		/* The last one keeps a NULL */
+  
+- 		rcu_assign_pointer(tp->files, new);
+- 		tp->flags |= TP_FLAG_TRACE;
++ 		link->file = file;
++ 		list_add_tail_rcu(&link->list, &tp->files);
+  
+- 		if (old) {
+- 			/* Make sure the probe is done with old files */
+- 			synchronize_sched();
+- 			kfree(old);
+- 		}
++ 		tp->flags |= TP_FLAG_TRACE;
+  	} else
+  		tp->flags |= TP_FLAG_PROFILE;
+  
+@@@ -448,42 -243,26 +438,52 @@@ find_event_file_link(struct trace_prob
+  static int
+  disable_trace_probe(struct trace_probe *tp, struct ftrace_event_file *file)
+  {
+ +	struct ftrace_event_file **old = NULL;
+ +	int wait = 0;
+  	int ret = 0;
+  
+ +	mutex_lock(&probe_enable_lock);
+ +
+  	if (file) {
+- 		struct ftrace_event_file **new, **old;
+- 		int n = trace_probe_nr_files(tp);
+- 		int i, j;
++ 		struct event_file_link *link;
+  
+- 		old = rcu_dereference_raw(tp->files);
+- 		if (n == 0 || trace_probe_file_index(tp, file) < 0) {
++ 		link = find_event_file_link(tp, file);
++ 		if (!link) {
+  			ret = -EINVAL;
+ -			goto out;
+ +			goto out_unlock;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		if (n == 1) {	/* Remove the last file */
+ +			tp->flags &= ~TP_FLAG_TRACE;
+ +			new = NULL;
+ +		} else {
+ +			new = kzalloc(n * sizeof(struct ftrace_event_file *),
+ +				      GFP_KERNEL);
+ +			if (!new) {
+ +				ret = -ENOMEM;
+ +				goto out_unlock;
+ +			}
+ +
+ +			/* This copy & check loop copies the NULL stopper too */
+ +			for (i = 0, j = 0; j < n && i < n + 1; i++)
+ +				if (old[i] != file)
+ +					new[j++] = old[i];
+  		}
+  
+ +		rcu_assign_pointer(tp->files, new);
+ +		wait = 1;
+++=======
++ 		list_del_rcu(&link->list);
++ 		/* synchronize with kprobe_trace_func/kretprobe_trace_func */
++ 		synchronize_sched();
++ 		kfree(link);
++ 
++ 		if (!list_empty(&tp->files))
++ 			goto out;
++ 
++ 		tp->flags &= ~TP_FLAG_TRACE;
+++>>>>>>> b04d52e368e2 (tracing/kprobes: Turn trace_probe->files into list_head)
+  	} else
+  		tp->flags &= ~TP_FLAG_PROFILE;
+  
+* Unmerged path kernel/trace/trace_kprobe.c
