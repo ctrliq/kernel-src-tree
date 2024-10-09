@@ -1,0 +1,160 @@
+tty: wipe buffer if not echoing data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [tty] wipe buffer if not echoing data (Artem Savkov) [1644050]
+Rebuild_FUZZ: 92.54%
+commit-author Greg Kroah-Hartman <greg@kroah.com>
+commit b97b3d9fb57860a60592859e332de7759fd54c2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b97b3d9f.failed
+
+If we are not echoing the data to userspace or the console is in icanon
+mode, then perhaps it is a "secret" so we should wipe it once we are
+done with it.
+
+This mirrors the logic that the audit code has.
+
+	Reported-by: aszlig <aszlig@nix.build>
+	Tested-by: Milan Broz <gmazyland@gmail.com>
+	Tested-by: Daniel Zatovic <daniel.zatovic@gmail.com>
+	Tested-by: aszlig <aszlig@nix.build>
+	Cc: Willy Tarreau <w@1wt.eu>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit b97b3d9fb57860a60592859e332de7759fd54c2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/n_tty.c
+diff --cc drivers/tty/n_tty.c
+index 4181bb27f72e,3ad460219fd6..000000000000
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@@ -108,17 -121,70 +108,81 @@@ struct n_tty_data 
+  
+  	struct mutex atomic_read_lock;
+  	struct mutex output_lock;
+ +	struct mutex echo_lock;
+ +	raw_spinlock_t read_lock;
+  };
+  
+++<<<<<<< HEAD
+ +static inline int tty_put_user(struct tty_struct *tty, unsigned char x,
+ +			       unsigned char __user *ptr)
+ +{
+ +	struct n_tty_data *ldata = tty->disc_data;
+ +
+ +	tty_audit_add_data(tty, &x, 1, ldata->icanon);
+ +	return put_user(x, ptr);
+++=======
++ #define MASK(x) ((x) & (N_TTY_BUF_SIZE - 1))
++ 
++ static inline size_t read_cnt(struct n_tty_data *ldata)
++ {
++ 	return ldata->read_head - ldata->read_tail;
++ }
++ 
++ static inline unsigned char read_buf(struct n_tty_data *ldata, size_t i)
++ {
++ 	return ldata->read_buf[i & (N_TTY_BUF_SIZE - 1)];
++ }
++ 
++ static inline unsigned char *read_buf_addr(struct n_tty_data *ldata, size_t i)
++ {
++ 	return &ldata->read_buf[i & (N_TTY_BUF_SIZE - 1)];
++ }
++ 
++ static inline unsigned char echo_buf(struct n_tty_data *ldata, size_t i)
++ {
++ 	smp_rmb(); /* Matches smp_wmb() in add_echo_byte(). */
++ 	return ldata->echo_buf[i & (N_TTY_BUF_SIZE - 1)];
++ }
++ 
++ static inline unsigned char *echo_buf_addr(struct n_tty_data *ldata, size_t i)
++ {
++ 	return &ldata->echo_buf[i & (N_TTY_BUF_SIZE - 1)];
++ }
++ 
++ /* If we are not echoing the data, perhaps this is a secret so erase it */
++ static void zero_buffer(struct tty_struct *tty, u8 *buffer, int size)
++ {
++ 	bool icanon = !!L_ICANON(tty);
++ 	bool no_echo = !L_ECHO(tty);
++ 
++ 	if (icanon && no_echo)
++ 		memset(buffer, 0x00, size);
++ }
++ 
++ static int tty_copy_to_user(struct tty_struct *tty, void __user *to,
++ 			    size_t tail, size_t n)
++ {
++ 	struct n_tty_data *ldata = tty->disc_data;
++ 	size_t size = N_TTY_BUF_SIZE - tail;
++ 	void *from = read_buf_addr(ldata, tail);
++ 	int uncopied;
++ 
++ 	if (n > size) {
++ 		tty_audit_add_data(tty, from, size);
++ 		uncopied = copy_to_user(to, from, size);
++ 		zero_buffer(tty, from, size - uncopied);
++ 		if (uncopied)
++ 			return uncopied;
++ 		to += size;
++ 		n -= size;
++ 		from = ldata->read_buf;
++ 	}
++ 
++ 	tty_audit_add_data(tty, from, n);
++ 	uncopied = copy_to_user(to, from, n);
++ 	zero_buffer(tty, from, n - uncopied);
++ 	return uncopied;
+++>>>>>>> b97b3d9fb578 (tty: wipe buffer if not echoing data)
+  }
+  
+  /**
+@@@ -1715,28 -1965,25 +1779,38 @@@ static int copy_from_read_buf(struct tt
+  	struct n_tty_data *ldata = tty->disc_data;
+  	int retval;
+  	size_t n;
+ +	unsigned long flags;
+  	bool is_eof;
+ -	size_t head = smp_load_acquire(&ldata->commit_head);
+ -	size_t tail = ldata->read_tail & (N_TTY_BUF_SIZE - 1);
+  
+  	retval = 0;
+ -	n = min(head - ldata->read_tail, N_TTY_BUF_SIZE - tail);
+ +	raw_spin_lock_irqsave(&ldata->read_lock, flags);
+ +	n = min(ldata->read_cnt, N_TTY_BUF_SIZE - ldata->read_tail);
+  	n = min(*nr, n);
+ +	raw_spin_unlock_irqrestore(&ldata->read_lock, flags);
+  	if (n) {
+++<<<<<<< HEAD
+ +		retval = copy_to_user(*b, &ldata->read_buf[ldata->read_tail], n);
+ +		n -= retval;
+ +		is_eof = n == 1 &&
+ +			ldata->read_buf[ldata->read_tail] == EOF_CHAR(tty);
+ +		tty_audit_add_data(tty, &ldata->read_buf[ldata->read_tail], n,
+ +				ldata->icanon);
+ +		raw_spin_lock_irqsave(&ldata->read_lock, flags);
+ +		ldata->read_tail = (ldata->read_tail + n) & (N_TTY_BUF_SIZE-1);
+ +		ldata->read_cnt -= n;
+++=======
++ 		unsigned char *from = read_buf_addr(ldata, tail);
++ 		retval = copy_to_user(*b, from, n);
++ 		n -= retval;
++ 		is_eof = n == 1 && *from == EOF_CHAR(tty);
++ 		tty_audit_add_data(tty, from, n);
++ 		zero_buffer(tty, from, n);
++ 		smp_store_release(&ldata->read_tail, ldata->read_tail + n);
+++>>>>>>> b97b3d9fb578 (tty: wipe buffer if not echoing data)
+  		/* Turn single EOF into zero-length read */
+ -		if (L_EXTPROC(tty) && ldata->icanon && is_eof &&
+ -		    (head == ldata->read_tail))
+ +		if (L_EXTPROC(tty) && ldata->icanon && is_eof && !ldata->read_cnt)
+  			n = 0;
+ +		raw_spin_unlock_irqrestore(&ldata->read_lock, flags);
+  		*b += n;
+  		*nr -= n;
+  	}
+* Unmerged path drivers/tty/n_tty.c
