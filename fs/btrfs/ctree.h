@@ -3173,14 +3173,17 @@ ssize_t btrfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
 int btrfs_parse_options(struct btrfs_root *root, char *options);
 int btrfs_sync_fs(struct super_block *sb, int wait);
 
+static inline __printf(2, 3)
+void btrfs_no_printk(const struct btrfs_fs_info *fs_info, const char *fmt, ...)
+{
+}
+
 #ifdef CONFIG_PRINTK
 __printf(2, 3)
 void btrfs_printk(const struct btrfs_fs_info *fs_info, const char *fmt, ...);
 #else
-static inline __printf(2, 3)
-void btrfs_printk(const struct btrfs_fs_info *fs_info, const char *fmt, ...)
-{
-}
+#define btrfs_printk(fs_info, fmt, args...) \
+	btrfs_no_printk(fs_info, fmt, ##args)
 #endif
 
 #define btrfs_emerg(fs_info, fmt, args...) \
