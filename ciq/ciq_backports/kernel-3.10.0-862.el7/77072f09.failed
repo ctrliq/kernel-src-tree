@@ -1,0 +1,242 @@
+x86/stacktrace: Avoid recording save_stack_trace() wrappers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] stacktrace: Avoid recording save_stack_trace() wrappers (Josh Poimboeuf) [1430637]
+Rebuild_FUZZ: 96.49%
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit 77072f09eab19326dd2424c8dad0a443341a228f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/77072f09.failed
+
+The save_stack_trace() and save_stack_trace_tsk() wrappers of
+__save_stack_trace() add themselves to the call stack, and thus appear in the
+recorded stacktraces. This is redundant and wasteful when we have limited space
+to record the useful part of the backtrace with e.g. page_owner functionality.
+
+Fix this by making sure __save_stack_trace() is noinline (which matches the
+current gcc decision) and bumping the skip in the wrappers
+(save_stack_trace_tsk() only when called for the current task). This is similar
+to what was done for arm in 3683f44c42e9 ("ARM: stacktrace: avoid listing
+stacktrace functions in stacktrace") and is pending for arm64.
+
+Also make sure that __save_stack_trace_reliable() doesn't get this problem in
+the future by marking it __always_inline (which matches current gcc decision),
+per Josh Poimboeuf.
+
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Miroslav Benes <mbenes@suse.cz>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170929092335.2744-1-vbabka@suse.cz
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 77072f09eab19326dd2424c8dad0a443341a228f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/stacktrace.c
+diff --cc arch/x86/kernel/stacktrace.c
+index 9ee98eefc44d,77835bc021c7..000000000000
+--- a/arch/x86/kernel/stacktrace.c
++++ b/arch/x86/kernel/stacktrace.c
+@@@ -28,45 -22,42 +28,76 @@@ __save_stack_address(void *data, unsign
+  		trace->skip--;
+  		return 0;
+  	}
+++<<<<<<< HEAD
+ +	if (trace->nr_entries < trace->max_entries) {
+ +		trace->entries[trace->nr_entries++] = addr;
+ +		return 0;
+ +	} else {
+ +		return -1; /* no more room, stop walking the stack */
+++=======
++ 
++ 	if (trace->nr_entries >= trace->max_entries)
++ 		return -1;
++ 
++ 	trace->entries[trace->nr_entries++] = addr;
++ 	return 0;
++ }
++ 
++ static void noinline __save_stack_trace(struct stack_trace *trace,
++ 			       struct task_struct *task, struct pt_regs *regs,
++ 			       bool nosched)
++ {
++ 	struct unwind_state state;
++ 	unsigned long addr;
++ 
++ 	if (regs)
++ 		save_stack_address(trace, regs->ip, nosched);
++ 
++ 	for (unwind_start(&state, task, regs, NULL); !unwind_done(&state);
++ 	     unwind_next_frame(&state)) {
++ 		addr = unwind_get_return_address(&state);
++ 		if (!addr || save_stack_address(trace, addr, nosched))
++ 			break;
+++>>>>>>> 77072f09eab1 (x86/stacktrace: Avoid recording save_stack_trace() wrappers)
+  	}
+ +}
+  
+ -	if (trace->nr_entries < trace->max_entries)
+ -		trace->entries[trace->nr_entries++] = ULONG_MAX;
+ +static int save_stack_address(void *data, unsigned long addr, int reliable)
+ +{
+ +	return __save_stack_address(data, addr, reliable, false);
+ +}
+ +
+ +static int
+ +save_stack_address_nosched(void *data, unsigned long addr, int reliable)
+ +{
+ +	return __save_stack_address(data, addr, reliable, true);
+  }
+  
+ +static const struct stacktrace_ops save_stack_ops = {
+ +	.stack		= save_stack_stack,
+ +	.address	= save_stack_address,
+ +	.walk_stack	= print_context_stack,
+ +};
+ +
+ +static const struct stacktrace_ops save_stack_ops_nosched = {
+ +	.stack		= save_stack_stack,
+ +	.address	= save_stack_address_nosched,
+ +	.walk_stack	= print_context_stack,
+ +};
+ +
+  /*
+   * Save stack-backtrace addresses into a stack_trace buffer.
+   */
+  void save_stack_trace(struct stack_trace *trace)
+  {
+++<<<<<<< HEAD
+ +	dump_trace(current, NULL, NULL, 0, &save_stack_ops, trace);
+ +	if (trace->nr_entries < trace->max_entries)
+ +		trace->entries[trace->nr_entries++] = ULONG_MAX;
+++=======
++ 	trace->skip++;
++ 	__save_stack_trace(trace, current, NULL, false);
+++>>>>>>> 77072f09eab1 (x86/stacktrace: Avoid recording save_stack_trace() wrappers)
+  }
+  EXPORT_SYMBOL_GPL(save_stack_trace);
+  
+@@@ -79,11 -68,112 +110,93 @@@ void save_stack_trace_regs(struct pt_re
+  
+  void save_stack_trace_tsk(struct task_struct *tsk, struct stack_trace *trace)
+  {
+++<<<<<<< HEAD
+ +	dump_trace(tsk, NULL, NULL, 0, &save_stack_ops_nosched, trace);
+++=======
++ 	if (!try_get_task_stack(tsk))
++ 		return;
++ 
++ 	if (tsk == current)
++ 		trace->skip++;
++ 	__save_stack_trace(trace, tsk, NULL, true);
++ 
++ 	put_task_stack(tsk);
++ }
++ EXPORT_SYMBOL_GPL(save_stack_trace_tsk);
++ 
++ #ifdef CONFIG_HAVE_RELIABLE_STACKTRACE
++ 
++ #define STACKTRACE_DUMP_ONCE(task) ({				\
++ 	static bool __section(.data.unlikely) __dumped;		\
++ 								\
++ 	if (!__dumped) {					\
++ 		__dumped = true;				\
++ 		WARN_ON(1);					\
++ 		show_stack(task, NULL);				\
++ 	}							\
++ })
++ 
++ static int __always_inline
++ __save_stack_trace_reliable(struct stack_trace *trace,
++ 			    struct task_struct *task)
++ {
++ 	struct unwind_state state;
++ 	struct pt_regs *regs;
++ 	unsigned long addr;
++ 
++ 	for (unwind_start(&state, task, NULL, NULL); !unwind_done(&state);
++ 	     unwind_next_frame(&state)) {
++ 
++ 		regs = unwind_get_entry_regs(&state);
++ 		if (regs) {
++ 			/*
++ 			 * Kernel mode registers on the stack indicate an
++ 			 * in-kernel interrupt or exception (e.g., preemption
++ 			 * or a page fault), which can make frame pointers
++ 			 * unreliable.
++ 			 */
++ 			if (!user_mode(regs))
++ 				return -EINVAL;
++ 
++ 			/*
++ 			 * The last frame contains the user mode syscall
++ 			 * pt_regs.  Skip it and finish the unwind.
++ 			 */
++ 			unwind_next_frame(&state);
++ 			if (!unwind_done(&state)) {
++ 				STACKTRACE_DUMP_ONCE(task);
++ 				return -EINVAL;
++ 			}
++ 			break;
++ 		}
++ 
++ 		addr = unwind_get_return_address(&state);
++ 
++ 		/*
++ 		 * A NULL or invalid return address probably means there's some
++ 		 * generated code which __kernel_text_address() doesn't know
++ 		 * about.
++ 		 */
++ 		if (!addr) {
++ 			STACKTRACE_DUMP_ONCE(task);
++ 			return -EINVAL;
++ 		}
++ 
++ 		if (save_stack_address(trace, addr, false))
++ 			return -EINVAL;
++ 	}
++ 
++ 	/* Check for stack corruption */
++ 	if (unwind_error(&state)) {
++ 		STACKTRACE_DUMP_ONCE(task);
++ 		return -EINVAL;
++ 	}
++ 
+++>>>>>>> 77072f09eab1 (x86/stacktrace: Avoid recording save_stack_trace() wrappers)
+  	if (trace->nr_entries < trace->max_entries)
+  		trace->entries[trace->nr_entries++] = ULONG_MAX;
+ -
+ -	return 0;
+  }
+ -
+ -/*
+ - * This function returns an error if it detects any unreliable features of the
+ - * stack.  Otherwise it guarantees that the stack trace is reliable.
+ - *
+ - * If the task is not 'current', the caller *must* ensure the task is inactive.
+ - */
+ -int save_stack_trace_tsk_reliable(struct task_struct *tsk,
+ -				  struct stack_trace *trace)
+ -{
+ -	int ret;
+ -
+ -	if (!try_get_task_stack(tsk))
+ -		return -EINVAL;
+ -
+ -	ret = __save_stack_trace_reliable(trace, tsk);
+ -
+ -	put_task_stack(tsk);
+ -
+ -	return ret;
+ -}
+ -#endif /* CONFIG_HAVE_RELIABLE_STACKTRACE */
+ +EXPORT_SYMBOL_GPL(save_stack_trace_tsk);
+  
+  /* Userspace stacktrace - based on kernel/trace/trace_sysprof.c */
+  
+* Unmerged path arch/x86/kernel/stacktrace.c
