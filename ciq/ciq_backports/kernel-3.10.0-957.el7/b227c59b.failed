@@ -1,0 +1,360 @@
+nvme: host delete_work and reset_work on separate workqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] host delete_work and reset_work on separate workqueues (David Milburn) [1515584]
+Rebuild_FUZZ: 94.74%
+commit-author Roy Shterman <roys@lightbitslabs.com>
+commit b227c59b9b5b8ae52639c8980af853d2f654f90a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b227c59b.failed
+
+We need to ensure that delete_work will be hosted on a different
+workqueue than all the works we flush or cancel from it.
+Otherwise we may hit a circular dependency warning [1].
+
+Also, given that delete_work flushes reset_work, host reset_work
+on nvme_reset_wq and delete_work on nvme_delete_wq. In addition,
+fix the flushing in the individual drivers to flush nvme_delete_wq
+when draining queued deletes.
+
+[1]:
+[  178.491942] =============================================
+[  178.492718] [ INFO: possible recursive locking detected ]
+[  178.493495] 4.9.0-rc4-c844263313a8-lb #3 Tainted: G           OE
+[  178.494382] ---------------------------------------------
+[  178.495160] kworker/5:1/135 is trying to acquire lock:
+[  178.495894]  (
+[  178.496120] "nvme-wq"
+[  178.496471] ){++++.+}
+[  178.496599] , at:
+[  178.496921] [<ffffffffa70ac206>] flush_work+0x1a6/0x2d0
+[  178.497670]
+               but task is already holding lock:
+[  178.498499]  (
+[  178.498724] "nvme-wq"
+[  178.499074] ){++++.+}
+[  178.499202] , at:
+[  178.499520] [<ffffffffa70ad6c2>] process_one_work+0x162/0x6a0
+[  178.500343]
+               other info that might help us debug this:
+[  178.501269]  Possible unsafe locking scenario:
+
+[  178.502113]        CPU0
+[  178.502472]        ----
+[  178.502829]   lock(
+[  178.503115] "nvme-wq"
+[  178.503467] );
+[  178.503716]   lock(
+[  178.504001] "nvme-wq"
+[  178.504353] );
+[  178.504601]
+                *** DEADLOCK ***
+
+[  178.505441]  May be due to missing lock nesting notation
+
+[  178.506453] 2 locks held by kworker/5:1/135:
+[  178.507068]  #0:
+[  178.507330]  (
+[  178.507598] "nvme-wq"
+[  178.507726] ){++++.+}
+[  178.508079] , at:
+[  178.508173] [<ffffffffa70ad6c2>] process_one_work+0x162/0x6a0
+[  178.509004]  #1:
+[  178.509265]  (
+[  178.509532] (&ctrl->delete_work)
+[  178.509795] ){+.+.+.}
+[  178.510145] , at:
+[  178.510239] [<ffffffffa70ad6c2>] process_one_work+0x162/0x6a0
+[  178.511070]
+               stack backtrace:
+:
+[  178.511693] CPU: 5 PID: 135 Comm: kworker/5:1 Tainted: G           OE   4.9.0-rc4-c844263313a8-lb #3
+[  178.512974] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.1-1ubuntu1 04/01/2014
+[  178.514247] Workqueue: nvme-wq nvme_del_ctrl_work [nvme_tcp]
+[  178.515071]  ffffc2668175bae0 ffffffffa7450823 ffffffffa88abd80 ffffffffa88abd80
+[  178.516195]  ffffc2668175bb98 ffffffffa70eb012 ffffffffa8d8d90d ffff9c472e9ea700
+[  178.517318]  ffff9c472e9ea700 ffff9c4700000000 ffff9c4700007200 ab83be61bec0d50e
+[  178.518443] Call Trace:
+[  178.518807]  [<ffffffffa7450823>] dump_stack+0x85/0xc2
+[  178.519542]  [<ffffffffa70eb012>] __lock_acquire+0x17d2/0x18f0
+[  178.520377]  [<ffffffffa75839a7>] ? serial8250_console_putchar+0x27/0x30
+[  178.521330]  [<ffffffffa7583980>] ? wait_for_xmitr+0xa0/0xa0
+[  178.522174]  [<ffffffffa70ac1eb>] ? flush_work+0x18b/0x2d0
+[  178.522975]  [<ffffffffa70eb7cb>] lock_acquire+0x11b/0x220
+[  178.523753]  [<ffffffffa70ac206>] ? flush_work+0x1a6/0x2d0
+[  178.524535]  [<ffffffffa70ac229>] flush_work+0x1c9/0x2d0
+[  178.525291]  [<ffffffffa70ac206>] ? flush_work+0x1a6/0x2d0
+[  178.526077]  [<ffffffffa70a9cf0>] ? flush_workqueue_prep_pwqs+0x220/0x220
+[  178.527040]  [<ffffffffa70ae7cf>] __cancel_work_timer+0x10f/0x1d0
+[  178.527907]  [<ffffffffa70fecb9>] ? vprintk_default+0x29/0x40
+[  178.528726]  [<ffffffffa71cb507>] ? printk+0x48/0x50
+[  178.529434]  [<ffffffffa70ae8c3>] cancel_delayed_work_sync+0x13/0x20
+[  178.530381]  [<ffffffffc042100b>] nvme_stop_ctrl+0x5b/0x70 [nvme_core]
+[  178.531314]  [<ffffffffc0403dcc>] nvme_del_ctrl_work+0x2c/0x50 [nvme_tcp]
+[  178.532271]  [<ffffffffa70ad741>] process_one_work+0x1e1/0x6a0
+[  178.533101]  [<ffffffffa70ad6c2>] ? process_one_work+0x162/0x6a0
+[  178.533954]  [<ffffffffa70adc4e>] worker_thread+0x4e/0x490
+[  178.534735]  [<ffffffffa70adc00>] ? process_one_work+0x6a0/0x6a0
+[  178.535588]  [<ffffffffa70adc00>] ? process_one_work+0x6a0/0x6a0
+[  178.536441]  [<ffffffffa70b48cf>] kthread+0xff/0x120
+[  178.537149]  [<ffffffffa70b47d0>] ? kthread_park+0x60/0x60
+[  178.538094]  [<ffffffffa70b47d0>] ? kthread_park+0x60/0x60
+[  178.538900]  [<ffffffffa78e332a>] ret_from_fork+0x2a/0x40
+
+	Signed-off-by: Roy Shterman <roys@lightbitslabs.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b227c59b9b5b8ae52639c8980af853d2f654f90a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 27174fd02aa2,fde6fd2e7eef..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -65,15 -61,41 +65,45 @@@ static bool force_apst
+  module_param(force_apst, bool, 0644);
+  MODULE_PARM_DESC(force_apst, "allow APST for newly enumerated devices even if quirked off");
+  
+++<<<<<<< HEAD
+ +struct workqueue_struct *nvme_wq;
+ +EXPORT_SYMBOL_GPL(nvme_wq);
+ +
+ +static LIST_HEAD(nvme_ctrl_list);
+ +static DEFINE_SPINLOCK(dev_list_lock);
+++=======
++ static bool streams;
++ module_param(streams, bool, 0644);
++ MODULE_PARM_DESC(streams, "turn on support for Streams write directives");
++ 
++ /*
++  * nvme_wq - hosts nvme related works that are not reset or delete
++  * nvme_reset_wq - hosts nvme reset works
++  * nvme_delete_wq - hosts nvme delete works
++  *
++  * nvme_wq will host works such are scan, aen handling, fw activation,
++  * keep-alive error recovery, periodic reconnects etc. nvme_reset_wq
++  * runs reset works which also flush works hosted on nvme_wq for
++  * serialization purposes. nvme_delete_wq host controller deletion
++  * works which flush reset works for serialization.
++  */
++ struct workqueue_struct *nvme_wq;
++ EXPORT_SYMBOL_GPL(nvme_wq);
++ 
++ struct workqueue_struct *nvme_reset_wq;
++ EXPORT_SYMBOL_GPL(nvme_reset_wq);
++ 
++ struct workqueue_struct *nvme_delete_wq;
++ EXPORT_SYMBOL_GPL(nvme_delete_wq);
++ 
++ static DEFINE_IDA(nvme_subsystems_ida);
++ static LIST_HEAD(nvme_subsystems);
++ static DEFINE_MUTEX(nvme_subsystems_lock);
+++>>>>>>> b227c59b9b5b (nvme: host delete_work and reset_work on separate workqueues)
+  
+  static DEFINE_IDA(nvme_instance_ida);
+ -static dev_t nvme_chr_devt;
+ -static struct class *nvme_class;
+ -static struct class *nvme_subsys_class;
+  
+ -static void nvme_ns_remove(struct nvme_ns *ns);
+ -static int nvme_revalidate_disk(struct gendisk *disk);
+ +static struct class *nvme_class;
+  
+  static __le32 nvme_get_log_dw10(u8 lid, size_t size)
+  {
+@@@ -99,8 -121,54 +129,57 @@@ static int nvme_reset_ctrl_sync(struct 
+  		flush_work(&ctrl->reset_work);
+  	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(nvme_reset_ctrl_sync);
+  
+++<<<<<<< HEAD
+ +static int nvme_error_status(struct request *req)
+++=======
++ static void nvme_delete_ctrl_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl =
++ 		container_of(work, struct nvme_ctrl, delete_work);
++ 
++ 	flush_work(&ctrl->reset_work);
++ 	nvme_stop_ctrl(ctrl);
++ 	nvme_remove_namespaces(ctrl);
++ 	ctrl->ops->delete_ctrl(ctrl);
++ 	nvme_uninit_ctrl(ctrl);
++ 	nvme_put_ctrl(ctrl);
++ }
++ 
++ int nvme_delete_ctrl(struct nvme_ctrl *ctrl)
++ {
++ 	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_DELETING))
++ 		return -EBUSY;
++ 	if (!queue_work(nvme_delete_wq, &ctrl->delete_work))
++ 		return -EBUSY;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nvme_delete_ctrl);
++ 
++ int nvme_delete_ctrl_sync(struct nvme_ctrl *ctrl)
++ {
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Keep a reference until the work is flushed since ->delete_ctrl
++ 	 * can free the controller.
++ 	 */
++ 	nvme_get_ctrl(ctrl);
++ 	ret = nvme_delete_ctrl(ctrl);
++ 	if (!ret)
++ 		flush_work(&ctrl->delete_work);
++ 	nvme_put_ctrl(ctrl);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nvme_delete_ctrl_sync);
++ 
++ static inline bool nvme_ns_has_pi(struct nvme_ns *ns)
++ {
++ 	return ns->pi_type && ns->ms == sizeof(struct t10_pi_tuple);
++ }
++ 
++ static blk_status_t nvme_error_status(struct request *req)
+++>>>>>>> b227c59b9b5b (nvme: host delete_work and reset_work on separate workqueues)
+  {
+  	switch (nvme_req(req)->status & 0x7ff) {
+  	case NVME_SC_SUCCESS:
+@@@ -2711,21 -3531,38 +2790,35 @@@ void nvme_start_queues(struct nvme_ctr
+  }
+  EXPORT_SYMBOL_GPL(nvme_start_queues);
+  
+ -int nvme_reinit_tagset(struct nvme_ctrl *ctrl, struct blk_mq_tag_set *set)
+ -{
+ -	if (!ctrl->ops->reinit_request)
+ -		return 0;
+ -
+ -	return blk_mq_tagset_iter(set, set->driver_data,
+ -			ctrl->ops->reinit_request);
+ -}
+ -EXPORT_SYMBOL_GPL(nvme_reinit_tagset);
+ -
+  int __init nvme_core_init(void)
+  {
+- 	int result;
++ 	int result = -ENOMEM;
+  
+  	nvme_wq = alloc_workqueue("nvme-wq",
+  			WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
+  	if (!nvme_wq)
+- 		return -ENOMEM;
++ 		goto out;
++ 
++ 	nvme_reset_wq = alloc_workqueue("nvme-reset-wq",
++ 			WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
++ 	if (!nvme_reset_wq)
++ 		goto destroy_wq;
++ 
++ 	nvme_delete_wq = alloc_workqueue("nvme-delete-wq",
++ 			WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
++ 	if (!nvme_delete_wq)
++ 		goto destroy_reset_wq;
+  
+ -	result = alloc_chrdev_region(&nvme_chr_devt, 0, NVME_MINORS, "nvme");
+ +	result = __register_chrdev(nvme_char_major, 0, NVME_MINORS, "nvme",
+ +							&nvme_dev_fops);
+  	if (result < 0)
+++<<<<<<< HEAD
+ +		goto destroy_wq;
+ +	else if (result > 0)
+ +		nvme_char_major = result;
+++=======
++ 		goto destroy_delete_wq;
+++>>>>>>> b227c59b9b5b (nvme: host delete_work and reset_work on separate workqueues)
+  
+  	nvme_class = class_create(THIS_MODULE, "nvme");
+  	if (IS_ERR(nvme_class)) {
+@@@ -2733,19 -3570,35 +2826,34 @@@
+  		goto unregister_chrdev;
+  	}
+  
+ -	nvme_subsys_class = class_create(THIS_MODULE, "nvme-subsystem");
+ -	if (IS_ERR(nvme_subsys_class)) {
+ -		result = PTR_ERR(nvme_subsys_class);
+ -		goto destroy_class;
+ -	}
+  	return 0;
+  
+ -destroy_class:
+ -	class_destroy(nvme_class);
+  unregister_chrdev:
+++<<<<<<< HEAD
+ +	__unregister_chrdev(nvme_char_major, 0, NVME_MINORS, "nvme");
+++=======
++ 	unregister_chrdev_region(nvme_chr_devt, NVME_MINORS);
++ destroy_delete_wq:
++ 	destroy_workqueue(nvme_delete_wq);
++ destroy_reset_wq:
++ 	destroy_workqueue(nvme_reset_wq);
+++>>>>>>> b227c59b9b5b (nvme: host delete_work and reset_work on separate workqueues)
+  destroy_wq:
+  	destroy_workqueue(nvme_wq);
++ out:
+  	return result;
+  }
+  
+  void nvme_core_exit(void)
+  {
+ -	ida_destroy(&nvme_subsystems_ida);
+ -	class_destroy(nvme_subsys_class);
+  	class_destroy(nvme_class);
+++<<<<<<< HEAD
+ +	__unregister_chrdev(nvme_char_major, 0, NVME_MINORS, "nvme");
+++=======
++ 	unregister_chrdev_region(nvme_chr_devt, NVME_MINORS);
++ 	destroy_workqueue(nvme_delete_wq);
++ 	destroy_workqueue(nvme_reset_wq);
+++>>>>>>> b227c59b9b5b (nvme: host delete_work and reset_work on separate workqueues)
+  	destroy_workqueue(nvme_wq);
+  }
+  
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 68f79634c978..4d2108d93e90 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -30,6 +30,8 @@ extern unsigned int admin_timeout;
+ #define NVME_KATO_GRACE		10
+ 
+ extern struct workqueue_struct *nvme_wq;
++extern struct workqueue_struct *nvme_reset_wq;
++extern struct workqueue_struct *nvme_delete_wq;
+ 
+ /*
+  * List of workarounds for devices that required behavior not specified in
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 2e9ce2cbb1eb..9ff1bfd6ade2 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -2125,7 +2125,7 @@ static void nvme_rdma_remove_one(struct ib_device *ib_device, void *client_data)
+ 	}
+ 	mutex_unlock(&nvme_rdma_ctrl_mutex);
+ 
+-	flush_workqueue(nvme_wq);
++	flush_workqueue(nvme_delete_wq);
+ }
+ 
+ static struct ib_client nvme_rdma_ib_client = {
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 21dcbdab74e4..57041ab71178 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -738,7 +738,7 @@ static void __exit nvme_loop_cleanup_module(void)
+ 		__nvme_loop_del_ctrl(ctrl);
+ 	mutex_unlock(&nvme_loop_ctrl_mutex);
+ 
+-	flush_workqueue(nvme_wq);
++	flush_workqueue(nvme_delete_wq);
+ }
+ 
+ module_init(nvme_loop_init_module);
