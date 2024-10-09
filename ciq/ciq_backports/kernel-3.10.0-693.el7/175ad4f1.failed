@@ -1,0 +1,135 @@
+mm: mprotect: use pmd_trans_unstable instead of taking the pmd_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] mprotect: use pmd_trans_unstable instead of taking the pmd_lock (Andrea Arcangeli) [1373606]
+Rebuild_FUZZ: 96.92%
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 175ad4f1e7a29c8f914254e2e6316c50671e027a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/175ad4f1.failed
+
+pmd_trans_unstable does an atomic read on the pmd so it doesn't require
+the pmd_lock for the same check.
+
+This also removes the special assumption that the mmap_sem is hold for
+writing if prot_numa is not set.  userfaultfd will hold the mmap_sem
+only for reading in change_pte_range like prot_numa, but it will not set
+prot_numa.
+
+This is always a valid micro-optimization regardless of userfaultfd.
+
+[kirill@shutemov.name: drop unneeded pmd_trans_unstable(pmd) check after __split_huge_pmd()]
+  Link: http://lkml.kernel.org/r/20170208120421.GE5578@node.shutemov.name
+Link: http://lkml.kernel.org/r/20161216144821.5183-43-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Michael Rapoport <RAPOPORT@il.ibm.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 175ad4f1e7a29c8f914254e2e6316c50671e027a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mprotect.c
+diff --cc mm/mprotect.c
+index 0dae9119c9ad,a45b4dc6a7f5..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -23,39 -23,15 +23,43 @@@
+  #include <linux/mmu_notifier.h>
+  #include <linux/migrate.h>
+  #include <linux/perf_event.h>
+ -#include <linux/pkeys.h>
+  #include <linux/ksm.h>
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  #include <asm/pgtable.h>
+  #include <asm/cacheflush.h>
+ -#include <asm/mmu_context.h>
+  #include <asm/tlbflush.h>
+  
+++<<<<<<< HEAD
+ +/*
+ + * For a prot_numa update we only hold mmap_sem for read so there is a
+ + * potential race with faulting where a pmd was temporarily none. This
+ + * function checks for a transhuge pmd under the appropriate lock. It
+ + * returns a pte if it was successfully locked or NULL if it raced with
+ + * a transhuge insertion.
+ + */
+ +static pte_t *lock_pte_protection(struct vm_area_struct *vma, pmd_t *pmd,
+ +			unsigned long addr, int prot_numa, spinlock_t **ptl)
+ +{
+ +	pte_t *pte;
+ +	spinlock_t *pmdl;
+ +
+ +	/* !prot_numa is protected by mmap_sem held for write */
+ +	if (!prot_numa)
+ +		return pte_offset_map_lock(vma->vm_mm, pmd, addr, ptl);
+ +
+ +	pmdl = pmd_lock(vma->vm_mm, pmd);
+ +	if (unlikely(pmd_trans_huge(*pmd) || pmd_none(*pmd))) {
+ +		spin_unlock(pmdl);
+ +		return NULL;
+ +	}
+ +
+ +	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, ptl);
+ +	spin_unlock(pmdl);
+ +	return pte;
+ +}
+++=======
++ #include "internal.h"
+++>>>>>>> 175ad4f1e7a2 (mm: mprotect: use pmd_trans_unstable instead of taking the pmd_lock)
+  
+  static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+  		unsigned long addr, unsigned long end, pgprot_t newprot,
+@@@ -65,8 -41,23 +69,22 @@@
+  	pte_t *pte, oldpte;
+  	spinlock_t *ptl;
+  	unsigned long pages = 0;
+ -	int target_node = NUMA_NO_NODE;
+  
+- 	pte = lock_pte_protection(vma, pmd, addr, prot_numa, &ptl);
++ 	/*
++ 	 * Can be called with only the mmap_sem for reading by
++ 	 * prot_numa so we must check the pmd isn't constantly
++ 	 * changing from under us from pmd_none to pmd_trans_huge
++ 	 * and/or the other way around.
++ 	 */
++ 	if (pmd_trans_unstable(pmd))
++ 		return 0;
++ 
++ 	/*
++ 	 * The pmd points to a regular pte so the pmd can't change
++ 	 * from under us even if the mmap_sem is only hold for
++ 	 * reading.
++ 	 */
++ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+  	if (!pte)
+  		return 0;
+  
+@@@ -155,10 -160,10 +173,17 @@@ static inline unsigned long change_pmd_
+  			mmu_notifier_invalidate_range_start(mm, mni_start, end);
+  		}
+  
+++<<<<<<< HEAD
+ +		if (pmd_trans_huge(*pmd)) {
+ +			if (next - addr != HPAGE_PMD_SIZE)
+ +				split_huge_page_pmd(vma, addr, pmd);
+ +			else {
+++=======
++ 		if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd)) {
++ 			if (next - addr != HPAGE_PMD_SIZE) {
++ 				__split_huge_pmd(vma, pmd, addr, false, NULL);
++ 			} else {
+++>>>>>>> 175ad4f1e7a2 (mm: mprotect: use pmd_trans_unstable instead of taking the pmd_lock)
+  				int nr_ptes = change_huge_pmd(vma, pmd, addr,
+  						newprot, prot_numa);
+  
+* Unmerged path mm/mprotect.c
