@@ -1,0 +1,227 @@
+selinux: Revalidate invalid inode security labels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 5d226df4edfa0eb1e689e7ac2741cf261ff7cbf1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5d226df4.failed
+
+When fetching an inode's security label, check if it is still valid, and
+try reloading it if it is not. Reloading will fail when we are in RCU
+context which doesn't allow sleeping, or when we can't find a dentry for
+the inode.  (Reloading happens via iop->getxattr which takes a dentry
+parameter.)  When reloading fails, continue using the old, invalid
+label.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Acked-by: Stephen Smalley <sds@tycho.nsa.gov>
+	Signed-off-by: Paul Moore <pmoore@redhat.com>
+(cherry picked from commit 5d226df4edfa0eb1e689e7ac2741cf261ff7cbf1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+diff --cc security/selinux/hooks.c
+index 47406b6a55bb,34e3351239d8..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -231,6 -242,77 +231,80 @@@ static int inode_alloc_security(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry);
++ 
++ /*
++  * Try reloading inode security labels that have been marked as invalid.  The
++  * @may_sleep parameter indicates when sleeping and thus reloading labels is
++  * allowed; when set to false, returns ERR_PTR(-ECHILD) when the label is
++  * invalid.  The @opt_dentry parameter should be set to a dentry of the inode;
++  * when no dentry is available, set it to NULL instead.
++  */
++ static int __inode_security_revalidate(struct inode *inode,
++ 				       struct dentry *opt_dentry,
++ 				       bool may_sleep)
++ {
++ 	struct inode_security_struct *isec = inode->i_security;
++ 
++ 	might_sleep_if(may_sleep);
++ 
++ 	if (isec->initialized == LABEL_INVALID) {
++ 		if (!may_sleep)
++ 			return -ECHILD;
++ 
++ 		/*
++ 		 * Try reloading the inode security label.  This will fail if
++ 		 * @opt_dentry is NULL and no dentry for this inode can be
++ 		 * found; in that case, continue using the old label.
++ 		 */
++ 		inode_doinit_with_dentry(inode, opt_dentry);
++ 	}
++ 	return 0;
++ }
++ 
++ static void inode_security_revalidate(struct inode *inode)
++ {
++ 	__inode_security_revalidate(inode, NULL, true);
++ }
++ 
++ static struct inode_security_struct *inode_security_novalidate(struct inode *inode)
++ {
++ 	return inode->i_security;
++ }
++ 
++ static struct inode_security_struct *inode_security_rcu(struct inode *inode, bool rcu)
++ {
++ 	int error;
++ 
++ 	error = __inode_security_revalidate(inode, NULL, !rcu);
++ 	if (error)
++ 		return ERR_PTR(error);
++ 	return inode->i_security;
++ }
++ 
++ /*
++  * Get the security label of an inode.
++  */
++ static struct inode_security_struct *inode_security(struct inode *inode)
++ {
++ 	__inode_security_revalidate(inode, NULL, true);
++ 	return inode->i_security;
++ }
++ 
++ /*
++  * Get the security label of a dentry's backing inode.
++  */
++ static struct inode_security_struct *backing_inode_security(struct dentry *dentry)
++ {
++ 	struct inode *inode = d_backing_inode(dentry);
++ 
++ 	__inode_security_revalidate(inode, dentry, true);
++ 	return inode->i_security;
++ }
++ 
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  static void inode_free_rcu(struct rcu_head *head)
+  {
+  	struct inode_security_struct *isec;
+@@@ -1596,7 -1706,8 +1668,12 @@@ static inline int dentry_has_perm(cons
+  
+  	ad.type = LSM_AUDIT_DATA_DENTRY;
+  	ad.u.dentry = dentry;
+++<<<<<<< HEAD
+ +	return inode_has_perm(cred, inode, av, &ad, 0);
+++=======
++ 	__inode_security_revalidate(inode, dentry, true);
++ 	return inode_has_perm(cred, inode, av, &ad);
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  }
+  
+  /* Same as inode_has_perm, but pass explicit audit data containing
+@@@ -1611,7 -1722,8 +1688,12 @@@ static inline int path_has_perm(const s
+  
+  	ad.type = LSM_AUDIT_DATA_PATH;
+  	ad.u.path = *path;
+++<<<<<<< HEAD
+ +	return inode_has_perm(cred, inode, av, &ad, 0);
+++=======
++ 	__inode_security_revalidate(inode, path->dentry, true);
++ 	return inode_has_perm(cred, inode, av, &ad);
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  }
+  
+  /* Same as path_has_perm, but uses the inode from the file struct. */
+@@@ -2776,11 -2911,25 +2858,25 @@@ static int selinux_inode_readlink(struc
+  	return dentry_has_perm(cred, dentry, FILE__READ);
+  }
+  
+ -static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
+ -				     bool rcu)
+ +static int selinux_inode_follow_link(struct dentry *dentry, struct nameidata *nameidata)
+  {
+  	const struct cred *cred = current_cred();
+ -	struct common_audit_data ad;
+ -	struct inode_security_struct *isec;
+ -	u32 sid;
+  
+++<<<<<<< HEAD
+ +	return dentry_has_perm(cred, dentry, FILE__READ);
+++=======
++ 	validate_creds(cred);
++ 
++ 	ad.type = LSM_AUDIT_DATA_DENTRY;
++ 	ad.u.dentry = dentry;
++ 	sid = cred_sid(cred);
++ 	isec = inode_security_rcu(inode, rcu);
++ 	if (IS_ERR(isec))
++ 		return PTR_ERR(isec);
++ 
++ 	return avc_has_perm_flags(sid, isec->sid, isec->sclass, FILE__READ, &ad,
++ 				  rcu ? MAY_NOT_BLOCK : 0);
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  }
+  
+  static noinline int audit_inode_permission(struct inode *inode,
+@@@ -2828,7 -2978,9 +2924,13 @@@ static int selinux_inode_permission(str
+  	perms = file_mask_to_av(inode->i_mode, mask);
+  
+  	sid = cred_sid(cred);
+++<<<<<<< HEAD
+ +	isec = inode->i_security;
+++=======
++ 	isec = inode_security_rcu(inode, flags & MAY_NOT_BLOCK);
++ 	if (IS_ERR(isec))
++ 		return PTR_ERR(isec);
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  
+  	rc = avc_has_perm_noaudit(sid, isec->sid, isec->sclass, perms, 0, &avd);
+  	audited = avc_audit_required(perms, &avd, rc,
+@@@ -3962,7 -4137,7 +4066,11 @@@ static int selinux_socket_post_create(s
+  				      int type, int protocol, int kern)
+  {
+  	const struct task_security_struct *tsec = current_security();
+++<<<<<<< HEAD
+ +	struct inode_security_struct *isec = SOCK_INODE(sock)->i_security;
+++=======
++ 	struct inode_security_struct *isec = inode_security_novalidate(SOCK_INODE(sock));
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  	struct sk_security_struct *sksec;
+  	int err = 0;
+  
+@@@ -4162,12 -4337,12 +4270,18 @@@ static int selinux_socket_accept(struc
+  	if (err)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	newisec = SOCK_INODE(newsock)->i_security;
+ +
+ +	isec = SOCK_INODE(sock)->i_security;
+++=======
++ 	newisec = inode_security_novalidate(SOCK_INODE(newsock));
++ 
++ 	isec = inode_security_novalidate(SOCK_INODE(sock));
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  	newisec->sclass = isec->sclass;
+  	newisec->sid = isec->sid;
+ -	newisec->initialized = LABEL_INITIALIZED;
+ +	newisec->initialized = 1;
+  
+  	return 0;
+  }
+@@@ -4501,7 -4677,8 +4615,12 @@@ static void selinux_sk_getsecid(struct 
+  
+  static void selinux_sock_graft(struct sock *sk, struct socket *parent)
+  {
+++<<<<<<< HEAD
+ +	struct inode_security_struct *isec = SOCK_INODE(parent)->i_security;
+++=======
++ 	struct inode_security_struct *isec =
++ 		inode_security_novalidate(SOCK_INODE(parent));
+++>>>>>>> 5d226df4edfa (selinux: Revalidate invalid inode security labels)
+  	struct sk_security_struct *sksec = sk->sk_security;
+  
+  	if (sk->sk_family == PF_INET || sk->sk_family == PF_INET6 ||
+* Unmerged path security/selinux/hooks.c
