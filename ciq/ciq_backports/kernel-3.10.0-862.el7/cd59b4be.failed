@@ -1,0 +1,195 @@
+cpufreq: intel_pstate: Fix global settings in active mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Fix global settings in active mode (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 91.43%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit cd59b4bed9d11a2aefc4bb44eed9de0e6c1eea06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cd59b4be.failed
+
+Commit 111b8b3fe4fa (cpufreq: intel_pstate: Always keep all
+limits settings in sync) changed intel_pstate to invoke
+cpufreq_update_policy() for every registered CPU on global sysfs
+attributes updates, but that led to undesirable effects in the
+active mode if the "performance" P-state selection algorithm is
+configufred for one CPU and the "powersave" one is chosen for
+all of the other CPUs.
+
+Namely, in that case, the following is possible:
+
+ # cd /sys/devices/system/cpu/
+ # cat intel_pstate/max_perf_pct
+ 100
+ # cat intel_pstate/min_perf_pct
+ 26
+ # echo performance > cpufreq/policy0/scaling_governor
+ # cat intel_pstate/max_perf_pct
+ 100
+ # cat intel_pstate/min_perf_pct
+ 100
+ # echo 94 > intel_pstate/min_perf_pct
+ # cat intel_pstate/min_perf_pct
+ 26
+
+The reason why this happens is because intel_pstate attempts to
+maintain two sets of global limits in the active mode, one for
+the "performance" P-state selection algorithm and one for the
+"powersave"  P-state selection algorithm, but the P-state selection
+algorithms are set per policy, so the global limits cannot reflect
+all of them at the same time if they are different for different
+policies.
+
+In the particular situation above, the attempt to change
+min_perf_pct to 94 caused cpufreq_update_policy() to be run
+for a CPU with the "powersave"  P-state selection algorithm
+and intel_pstate_set_policy() called by it silently switched the
+global limits to the "powersave" set which finally was reflected
+by the sysfs interface.
+
+To prevent that from happening, modify intel_pstate_update_policies()
+to always switch back to the set of limits that was used right before
+it has been invoked.
+
+Fixes: 111b8b3fe4fa (cpufreq: intel_pstate: Always keep all limits settings in sync)
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit cd59b4bed9d11a2aefc4bb44eed9de0e6c1eea06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index b681c02dda0f,436a4c5ba70d..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -580,11 -934,59 +580,65 @@@ static void intel_pstate_hwp_set(const 
+  	}
+  }
+  
+ -static int intel_pstate_hwp_set_policy(struct cpufreq_policy *policy)
+ +static void intel_pstate_hwp_set_online_cpus(void)
+  {
+++<<<<<<< HEAD
+ +	get_online_cpus();
+ +	intel_pstate_hwp_set(cpu_online_mask);
+ +	put_online_cpus();
+++=======
++ 	if (hwp_active)
++ 		intel_pstate_hwp_set(policy);
++ 
++ 	return 0;
++ }
++ 
++ static int intel_pstate_hwp_save_state(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu_data = all_cpu_data[policy->cpu];
++ 
++ 	if (!hwp_active)
++ 		return 0;
++ 
++ 	cpu_data->epp_saved = intel_pstate_get_epp(cpu_data, 0);
++ 
++ 	return 0;
++ }
++ 
++ static int intel_pstate_resume(struct cpufreq_policy *policy)
++ {
++ 	int ret;
++ 
++ 	if (!hwp_active)
++ 		return 0;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	all_cpu_data[policy->cpu]->epp_policy = 0;
++ 
++ 	ret = intel_pstate_hwp_set_policy(policy);
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	return ret;
++ }
++ 
++ static void intel_pstate_update_policies(void)
++ 	__releases(&intel_pstate_limits_lock)
++ 	__acquires(&intel_pstate_limits_lock)
++ {
++ 	struct perf_limits *saved_limits = limits;
++ 	int cpu;
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	for_each_possible_cpu(cpu)
++ 		cpufreq_update_policy(cpu);
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	limits = saved_limits;
+++>>>>>>> cd59b4bed9d1 (cpufreq: intel_pstate: Fix global settings in active mode)
+  }
+  
+  /************************** debugfs begin ************************/
+@@@ -702,8 -1194,11 +756,16 @@@ static ssize_t store_no_turbo(struct ko
+  
+  	limits->no_turbo = clamp_t(int, input, 0, 1);
+  
+++<<<<<<< HEAD
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set_online_cpus();
+++=======
++ 	intel_pstate_update_policies();
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	mutex_unlock(&intel_pstate_driver_lock);
+++>>>>>>> cd59b4bed9d1 (cpufreq: intel_pstate: Fix global settings in active mode)
+  
+  	return count;
+  }
+@@@ -725,11 -1229,14 +787,21 @@@ static ssize_t store_max_perf_pct(struc
+  				   limits->max_perf_pct);
+  	limits->max_perf_pct = max(limits->min_perf_pct,
+  				   limits->max_perf_pct);
+++<<<<<<< HEAD
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+++=======
++ 	limits->max_perf = div_ext_fp(limits->max_perf_pct, 100);
++ 
++ 	intel_pstate_update_policies();
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	mutex_unlock(&intel_pstate_driver_lock);
+++>>>>>>> cd59b4bed9d1 (cpufreq: intel_pstate: Fix global settings in active mode)
+  
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set_online_cpus();
+  	return count;
+  }
+  
+@@@ -750,11 -1266,14 +822,21 @@@ static ssize_t store_min_perf_pct(struc
+  				   limits->min_perf_pct);
+  	limits->min_perf_pct = min(limits->max_perf_pct,
+  				   limits->min_perf_pct);
+++<<<<<<< HEAD
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+++=======
++ 	limits->min_perf = div_ext_fp(limits->min_perf_pct, 100);
++ 
++ 	intel_pstate_update_policies();
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	mutex_unlock(&intel_pstate_driver_lock);
+++>>>>>>> cd59b4bed9d1 (cpufreq: intel_pstate: Fix global settings in active mode)
+  
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set_online_cpus();
+  	return count;
+  }
+  
+* Unmerged path drivers/cpufreq/intel_pstate.c
