@@ -1,0 +1,388 @@
+bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 047831a9b9c3e34410025df84f629c005f437e42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/047831a9.failed
+
+Now when we change the attributes of bridge or br_port by netlink,
+a relevant netlink notification will be sent, but if we change them
+by ioctl or sysfs, no notification will be sent.
+
+We should ensure that whenever those attributes change internally or from
+sysfs/ioctl, that a netlink notification is sent out to listeners.
+
+Also, NetworkManager will use this in the future to listen for out-of-band
+bridge master attribute updates and incorporate them into the runtime
+configuration.
+
+This patch is used for br_sysfs_br. and we also need to remove some
+rtnl_trylock in old functions so that we can call it in a common one.
+
+For group_addr_store, we cannot make it use store_bridge_parm, because
+it's not a string-to-long convert, we will add notification on it
+individually.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 047831a9b9c3e34410025df84f629c005f437e42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_sysfs_br.c
+#	net/bridge/br_vlan.c
+diff --cc net/bridge/br_sysfs_br.c
+index 1051708c10d4,70bddfd0f3e9..000000000000
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@@ -104,11 -108,10 +111,15 @@@ static ssize_t show_ageing_time(struct 
+  
+  static int set_ageing_time(struct net_bridge *br, unsigned long val)
+  {
+++<<<<<<< HEAD
+ +	br->ageing_time = clock_t_to_jiffies(val);
+ +	return 0;
+++=======
++ 	return br_set_ageing_time(br, val);
+++>>>>>>> 047831a9b9c3 (bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br)
+  }
+  
+ -static ssize_t ageing_time_store(struct device *d,
+ +static ssize_t store_ageing_time(struct device *d,
+  				 struct device_attribute *attr,
+  				 const char *buf, size_t len)
+  {
+@@@ -129,29 -138,13 +140,31 @@@ static ssize_t store_stp_state(struct d
+  			       struct device_attribute *attr, const char *buf,
+  			       size_t len)
+  {
+ -	return store_bridge_parm(d, buf, len, set_stp_state);
+++<<<<<<< HEAD
+ +	struct net_bridge *br = to_bridge(d);
+ +	char *endp;
+ +	unsigned long val;
+ +
+ +	if (!ns_capable(dev_net(br->dev)->user_ns, CAP_NET_ADMIN))
+ +		return -EPERM;
+ +
+ +	val = simple_strtoul(buf, &endp, 0);
+ +	if (endp == buf)
+ +		return -EINVAL;
+ +
+ +	if (!rtnl_trylock())
+ +		return restart_syscall();
+++=======
+++>>>>>>> 047831a9b9c3 (bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br)
+ +	br_stp_set_enabled(br, val);
+- 	rtnl_unlock();
+ +
+ +	return len;
+  }
+ -static DEVICE_ATTR_RW(stp_state);
+ +static DEVICE_ATTR(stp_state, S_IRUGO | S_IWUSR, show_stp_state,
+ +		   store_stp_state);
+  
+ -static ssize_t group_fwd_mask_show(struct device *d,
+ -				   struct device_attribute *attr,
+ -				   char *buf)
+ +static ssize_t show_group_fwd_mask(struct device *d,
+ +			      struct device_attribute *attr, char *buf)
+  {
+  	struct net_bridge *br = to_bridge(d);
+  	return sprintf(buf, "%#x\n", br->group_fwd_mask);
+@@@ -314,6 -308,13 +327,16 @@@ static ssize_t store_group_addr(struct 
+  	for (i = 0; i < 6; i++)
+  		br->group_addr[i] = new_addr[i];
+  	spin_unlock_bh(&br->lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	br->group_addr_set = true;
++ 	br_recalculate_fwd_mask(br);
++ 	netdev_state_change(br->dev);
++ 
++ 	rtnl_unlock();
++ 
+++>>>>>>> 047831a9b9c3 (bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br)
+  	return len;
+  }
+  
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,e001152d6ad1..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -355,121 -578,152 +355,183 @@@ int br_vlan_delete(struct net_bridge *b
+  
+  void br_vlan_flush(struct net_bridge *br)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ +	struct net_port_vlans *pv;
+  
+  	ASSERT_RTNL();
+ +	pv = rtnl_dereference(br->vlan_info);
+ +	if (!pv)
+ +		return;
+  
+ -	vg = br_vlan_group(br);
+ -	__vlan_flush(vg);
+ -	RCU_INIT_POINTER(br->vlgrp, NULL);
+ -	synchronize_rcu();
+ -	__vlan_group_free(vg);
+ +	__vlan_flush(pv);
+  }
+  
+ -struct net_bridge_vlan *br_vlan_find(struct net_bridge_vlan_group *vg, u16 vid)
+ +bool br_vlan_find(struct net_bridge *br, u16 vid)
+  {
+ -	if (!vg)
+ -		return NULL;
+ +	struct net_port_vlans *pv;
+ +	bool found = false;
+ +
+ +	rcu_read_lock();
+ +	pv = rcu_dereference(br->vlan_info);
+  
+ -	return br_vlan_lookup(&vg->vlan_hash, vid);
+ +	if (!pv)
+ +		goto out;
+ +
+ +	if (test_bit(vid, pv->vlan_bitmap))
+ +		found = true;
+ +
+ +out:
+ +	rcu_read_unlock();
+ +	return found;
+  }
+  
+ -/* Must be protected by RTNL. */
+ -static void recalculate_group_addr(struct net_bridge *br)
+ +static void br_set_hw_filters(struct net_bridge *br)
+  {
+ -	if (br->group_addr_set)
+ -		return;
+ +	struct net_bridge_port *p;
+ +	struct net_port_vlans *pv;
+ +	u16 vid, errvid;
+ +	int err;
+ +
+ +	/* For each port, walk the vlan bitmap and write the vlan
+ +	 * info to port driver.
+ +	 */
+ +	list_for_each_entry(p, &br->port_list, list) {
+ +		pv = rtnl_dereference(p->vlan_info);
+ +		if (!pv)
+ +			continue;
+ +
+ +		for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID) {
+ +			err = vlan_vid_add(p->dev, br->vlan_proto, vid);
+ +			if (err)
+ +				goto err_flt;
+ +		}
+ +	}
+ +
+ +	return;
+ +
+ +err_flt:
+ +	errvid = vid;
+ +	for_each_set_bit(vid, pv->vlan_bitmap, errvid)
+ +		vlan_vid_del(p->dev, br->vlan_proto, vid);
+  
+ -	spin_lock_bh(&br->lock);
+ -	if (!br->vlan_enabled || br->vlan_proto == htons(ETH_P_8021Q)) {
+ -		/* Bridge Group Address */
+ -		br->group_addr[5] = 0x00;
+ -	} else { /* vlan_enabled && ETH_P_8021AD */
+ -		/* Provider Bridge Group Address */
+ -		br->group_addr[5] = 0x08;
+ +	list_for_each_entry_continue_reverse(p, &br->port_list, list) {
+ +		pv = rtnl_dereference(p->vlan_info);
+ +		if (!pv)
+ +			continue;
+ +
+ +		for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
+ +			vlan_vid_del(p->dev, br->vlan_proto, vid);
+  	}
+ -	spin_unlock_bh(&br->lock);
+  }
+  
+ -/* Must be protected by RTNL. */
+ -void br_recalculate_fwd_mask(struct net_bridge *br)
+ +static void br_clear_hw_filters(struct net_bridge *br)
+  {
+ -	if (!br->vlan_enabled || br->vlan_proto == htons(ETH_P_8021Q))
+ -		br->group_fwd_mask_required = BR_GROUPFWD_DEFAULT;
+ -	else /* vlan_enabled && ETH_P_8021AD */
+ -		br->group_fwd_mask_required = BR_GROUPFWD_8021AD &
+ -					      ~(1u << br->group_addr[5]);
+ +	struct net_bridge_port *p;
+ +	struct net_port_vlans *pv;
+ +	u16 vid;
+ +
+ +	/* For each port, walk the vlan bitmap and clear
+ +	 * the vlan info from the port driver.
+ +	 */
+ +	list_for_each_entry(p, &br->port_list, list) {
+ +		pv = rtnl_dereference(p->vlan_info);
+ +		if (!pv)
+ +			continue;
+ +
+ +		for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
+ +			vlan_vid_del(p->dev, br->vlan_proto, vid);
+ +	}
+  }
+  
+ -int __br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ +static void br_manage_vlans(struct net_bridge *br)
+  {
+ -	struct switchdev_attr attr = {
+ -		.orig_dev = br->dev,
+ -		.id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING,
+ -		.flags = SWITCHDEV_F_SKIP_EOPNOTSUPP,
+ -		.u.vlan_filtering = val,
+ -	};
+ -	int err;
+ +	if (br->vlan_enabled)
+ +		br_set_hw_filters(br);
+ +	else
+ +		br_clear_hw_filters(br);
+ +}
+  
+ -	if (br->vlan_enabled == val)
+ -		return 0;
+ +int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ +{
+++<<<<<<< HEAD
+ +	if (!rtnl_trylock())
+ +		return restart_syscall();
+  
+ -	err = switchdev_port_attr_set(br->dev, &attr);
+ -	if (err && err != -EOPNOTSUPP)
+ -		return err;
+ +	if (br->vlan_enabled == val)
+ +		goto unlock;
+  
+  	br->vlan_enabled = val;
+ +	br_manage_vlans(br);
+  	br_manage_promisc(br);
+ -	recalculate_group_addr(br);
+ -	br_recalculate_fwd_mask(br);
+  
+ -	return 0;
+ -}
+ -
+ -int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ -{
+ +unlock:
+ +	rtnl_unlock();
+++=======
++ 	return __br_vlan_filter_toggle(br, val);
++ }
++ 
++ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto)
++ {
++ 	int err = 0;
++ 	struct net_bridge_port *p;
++ 	struct net_bridge_vlan *vlan;
++ 	struct net_bridge_vlan_group *vg;
++ 	__be16 oldproto;
++ 
++ 	if (br->vlan_proto == proto)
++ 		return 0;
++ 
++ 	/* Add VLANs for the new proto to the device filter. */
++ 	list_for_each_entry(p, &br->port_list, list) {
++ 		vg = nbp_vlan_group(p);
++ 		list_for_each_entry(vlan, &vg->vlan_list, vlist) {
++ 			err = vlan_vid_add(p->dev, proto, vlan->vid);
++ 			if (err)
++ 				goto err_filt;
++ 		}
++ 	}
++ 
++ 	oldproto = br->vlan_proto;
++ 	br->vlan_proto = proto;
++ 
++ 	recalculate_group_addr(br);
++ 	br_recalculate_fwd_mask(br);
++ 
++ 	/* Delete VLANs for the old proto from the device filter. */
++ 	list_for_each_entry(p, &br->port_list, list) {
++ 		vg = nbp_vlan_group(p);
++ 		list_for_each_entry(vlan, &vg->vlan_list, vlist)
++ 			vlan_vid_del(p->dev, oldproto, vlan->vid);
++ 	}
++ 
+++>>>>>>> 047831a9b9c3 (bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br)
+  	return 0;
+ -
+ -err_filt:
+ -	list_for_each_entry_continue_reverse(vlan, &vg->vlan_list, vlist)
+ -		vlan_vid_del(p->dev, proto, vlan->vid);
+ -
+ -	list_for_each_entry_continue_reverse(p, &br->port_list, list) {
+ -		vg = nbp_vlan_group(p);
+ -		list_for_each_entry(vlan, &vg->vlan_list, vlist)
+ -			vlan_vid_del(p->dev, proto, vlan->vid);
+ -	}
+ -
+ -	return err;
+  }
+  
+ -int br_vlan_set_proto(struct net_bridge *br, unsigned long val)
+ +static bool vlan_default_pvid(struct net_port_vlans *pv, u16 vid)
+  {
+++<<<<<<< HEAD
+ +	return pv && vid == pv->pvid && test_bit(vid, pv->untagged_bitmap);
+++=======
++ 	if (val != ETH_P_8021Q && val != ETH_P_8021AD)
++ 		return -EPROTONOSUPPORT;
++ 
++ 	return __br_vlan_set_proto(br, htons(val));
++ }
++ 
++ static bool vlan_default_pvid(struct net_bridge_vlan_group *vg, u16 vid)
++ {
++ 	struct net_bridge_vlan *v;
++ 
++ 	if (vid != vg->pvid)
++ 		return false;
++ 
++ 	v = br_vlan_lookup(&vg->vlan_hash, vid);
++ 	if (v && br_vlan_should_use(v) &&
++ 	    (v->flags & BRIDGE_VLAN_INFO_UNTAGGED))
++ 		return true;
++ 
++ 	return false;
+++>>>>>>> 047831a9b9c3 (bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br)
+  }
+  
+  static void br_vlan_disable_default_pvid(struct net_bridge *br)
+@@@ -583,16 -846,10 +642,21 @@@ int br_vlan_set_default_pvid(struct net
+  	if (br->vlan_enabled) {
+  		pr_info_once("Please disable vlan filtering to change default_pvid\n");
+  		err = -EPERM;
+- 		goto unlock;
++ 		goto out;
+  	}
+++<<<<<<< HEAD
+ +
+ +	if (!pvid)
+ +		br_vlan_disable_default_pvid(br);
+ +	else
+ +		err = __br_vlan_set_default_pvid(br, pvid);
+ +
+ +unlock:
+ +	rtnl_unlock();
+++=======
++ 	err = __br_vlan_set_default_pvid(br, pvid);
++ out:
+++>>>>>>> 047831a9b9c3 (bridge: a netlink notification should be sent when those attributes are changed by br_sysfs_br)
+  	return err;
+  }
+  
+* Unmerged path net/bridge/br_sysfs_br.c
+* Unmerged path net/bridge/br_vlan.c
