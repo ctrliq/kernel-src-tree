@@ -1,0 +1,184 @@
+uio_hv_generic: set callbacks on open
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit 5e3c420dcca53766dec57d5bf4df8eecdb953c03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5e3c420d.failed
+
+This fixes the problem where uio application was unable to
+use multple queues on restart. The root cause is that the callbacks
+are cleared on disconnect. Change to setting up callbacks
+everytime in open.
+
+Fixes: cdfa835c6e5e ("uio_hv_generic: defer opening vmbus until first use")
+	Reported-by: Mohammed Gamal <mgamal@redhat.com>
+	Signed-off-by: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5e3c420dcca53766dec57d5bf4df8eecdb953c03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/uio/uio_hv_generic.c
+diff --cc drivers/uio/uio_hv_generic.c
+index d608865b1e1e,3c5169eb23f5..000000000000
+--- a/drivers/uio/uio_hv_generic.c
++++ b/drivers/uio/uio_hv_generic.c
+@@@ -91,6 -102,136 +91,139 @@@ static void hv_uio_channel_cb(void *con
+  	uio_event_notify(&pdata->info);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Callback from vmbus_event when channel is rescinded.
++  */
++ static void hv_uio_rescind(struct vmbus_channel *channel)
++ {
++ 	struct hv_device *hv_dev = channel->primary_channel->device_obj;
++ 	struct hv_uio_private_data *pdata = hv_get_drvdata(hv_dev);
++ 
++ 	/*
++ 	 * Turn off the interrupt file handle
++ 	 * Next read for event will return -EIO
++ 	 */
++ 	pdata->info.irq = 0;
++ 
++ 	/* Wake up reader */
++ 	uio_event_notify(&pdata->info);
++ }
++ 
++ /* Sysfs API to allow mmap of the ring buffers
++  * The ring buffer is allocated as contiguous memory by vmbus_open
++  */
++ static int hv_uio_ring_mmap(struct file *filp, struct kobject *kobj,
++ 			    struct bin_attribute *attr,
++ 			    struct vm_area_struct *vma)
++ {
++ 	struct vmbus_channel *channel
++ 		= container_of(kobj, struct vmbus_channel, kobj);
++ 	void *ring_buffer = page_address(channel->ringbuffer_page);
++ 
++ 	if (channel->state != CHANNEL_OPENED_STATE)
++ 		return -ENODEV;
++ 
++ 	return vm_iomap_memory(vma, virt_to_phys(ring_buffer),
++ 			       channel->ringbuffer_pagecount << PAGE_SHIFT);
++ }
++ 
++ static const struct bin_attribute ring_buffer_bin_attr = {
++ 	.attr = {
++ 		.name = "ring",
++ 		.mode = 0600,
++ 	},
++ 	.size = 2 * HV_RING_SIZE * PAGE_SIZE,
++ 	.mmap = hv_uio_ring_mmap,
++ };
++ 
++ /* Callback from VMBUS subsystem when new channel created. */
++ static void
++ hv_uio_new_channel(struct vmbus_channel *new_sc)
++ {
++ 	struct hv_device *hv_dev = new_sc->primary_channel->device_obj;
++ 	struct device *device = &hv_dev->device;
++ 	const size_t ring_bytes = HV_RING_SIZE * PAGE_SIZE;
++ 	int ret;
++ 
++ 	/* Create host communication ring */
++ 	ret = vmbus_open(new_sc, ring_bytes, ring_bytes, NULL, 0,
++ 			 hv_uio_channel_cb, new_sc);
++ 	if (ret) {
++ 		dev_err(device, "vmbus_open subchannel failed: %d\n", ret);
++ 		return;
++ 	}
++ 
++ 	/* Disable interrupts on sub channel */
++ 	new_sc->inbound.ring_buffer->interrupt_mask = 1;
++ 	set_channel_read_mode(new_sc, HV_CALL_ISR);
++ 
++ 	ret = sysfs_create_bin_file(&new_sc->kobj, &ring_buffer_bin_attr);
++ 	if (ret) {
++ 		dev_err(device, "sysfs create ring bin file failed; %d\n", ret);
++ 		vmbus_close(new_sc);
++ 	}
++ }
++ 
++ /* free the reserved buffers for send and receive */
++ static void
++ hv_uio_cleanup(struct hv_device *dev, struct hv_uio_private_data *pdata)
++ {
++ 	if (pdata->send_gpadl) {
++ 		vmbus_teardown_gpadl(dev->channel, pdata->send_gpadl);
++ 		pdata->send_gpadl = 0;
++ 		vfree(pdata->send_buf);
++ 	}
++ 
++ 	if (pdata->recv_gpadl) {
++ 		vmbus_teardown_gpadl(dev->channel, pdata->recv_gpadl);
++ 		pdata->recv_gpadl = 0;
++ 		vfree(pdata->recv_buf);
++ 	}
++ }
++ 
++ /* VMBus primary channel is opened on first use */
++ static int
++ hv_uio_open(struct uio_info *info, struct inode *inode)
++ {
++ 	struct hv_uio_private_data *pdata
++ 		= container_of(info, struct hv_uio_private_data, info);
++ 	struct hv_device *dev = pdata->device;
++ 	int ret;
++ 
++ 	if (atomic_inc_return(&pdata->refcnt) != 1)
++ 		return 0;
++ 
++ 	vmbus_set_chn_rescind_callback(dev->channel, hv_uio_rescind);
++ 	vmbus_set_sc_create_callback(dev->channel, hv_uio_new_channel);
++ 
++ 	ret = vmbus_connect_ring(dev->channel,
++ 				 hv_uio_channel_cb, dev->channel);
++ 	if (ret == 0)
++ 		dev->channel->inbound.ring_buffer->interrupt_mask = 1;
++ 	else
++ 		atomic_dec(&pdata->refcnt);
++ 
++ 	return ret;
++ }
++ 
++ /* VMBus primary channel is closed on last close */
++ static int
++ hv_uio_release(struct uio_info *info, struct inode *inode)
++ {
++ 	struct hv_uio_private_data *pdata
++ 		= container_of(info, struct hv_uio_private_data, info);
++ 	struct hv_device *dev = pdata->device;
++ 	int ret = 0;
++ 
++ 	if (atomic_dec_and_test(&pdata->refcnt))
++ 		ret = vmbus_disconnect_ring(dev->channel);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 5e3c420dcca5 (uio_hv_generic: set callbacks on open)
+  static int
+  hv_uio_probe(struct hv_device *dev,
+  	     const struct hv_vmbus_device_id *dev_id)
+@@@ -153,6 -336,11 +286,14 @@@
+  		goto fail_close;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = sysfs_create_bin_file(&channel->kobj, &ring_buffer_bin_attr);
++ 	if (ret)
++ 		dev_notice(&dev->device,
++ 			   "sysfs create ring bin file failed; %d\n", ret);
++ 
+++>>>>>>> 5e3c420dcca5 (uio_hv_generic: set callbacks on open)
+  	hv_set_drvdata(dev, pdata);
+  
+  	return 0;
+* Unmerged path drivers/uio/uio_hv_generic.c
