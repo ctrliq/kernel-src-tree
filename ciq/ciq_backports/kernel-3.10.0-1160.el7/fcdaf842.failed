@@ -1,0 +1,118 @@
+mm, sparse: do not swamp log with huge vmemmap allocation failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Michal Hocko <mhocko@suse.com>
+commit fcdaf842bd8f538a88059ce0243bc2822ed1b0e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/fcdaf842.failed
+
+While doing memory hotplug tests under heavy memory pressure we have
+noticed too many page allocation failures when allocating vmemmap memmap
+backed by huge page
+
+  kworker/u3072:1: page allocation failure: order:9, mode:0x24084c0(GFP_KERNEL|__GFP_REPEAT|__GFP_ZERO)
+  [...]
+  Call Trace:
+    dump_trace+0x59/0x310
+    show_stack_log_lvl+0xea/0x170
+    show_stack+0x21/0x40
+    dump_stack+0x5c/0x7c
+    warn_alloc_failed+0xe2/0x150
+    __alloc_pages_nodemask+0x3ed/0xb20
+    alloc_pages_current+0x7f/0x100
+    vmemmap_alloc_block+0x79/0xb6
+    __vmemmap_alloc_block_buf+0x136/0x145
+    vmemmap_populate+0xd2/0x2b9
+    sparse_mem_map_populate+0x23/0x30
+    sparse_add_one_section+0x68/0x18e
+    __add_pages+0x10a/0x1d0
+    arch_add_memory+0x4a/0xc0
+    add_memory_resource+0x89/0x160
+    add_memory+0x6d/0xd0
+    acpi_memory_device_add+0x181/0x251
+    acpi_bus_attach+0xfd/0x19b
+    acpi_bus_scan+0x59/0x69
+    acpi_device_hotplug+0xd2/0x41f
+    acpi_hotplug_work_fn+0x1a/0x23
+    process_one_work+0x14e/0x410
+    worker_thread+0x116/0x490
+    kthread+0xbd/0xe0
+    ret_from_fork+0x3f/0x70
+
+and we do see many of those because essentially every allocation fails
+for each memory section.  This is an excessive way to tell the user that
+there is nothing to really worry about because we do have a fallback
+mechanism to use base pages.  The only downside might be a performance
+degradation due to TLB pressure.
+
+This patch changes vmemmap_alloc_block() to use __GFP_NOWARN and warn
+explicitly once on the first allocation failure.  This will reduce the
+noise in the kernel log considerably, while we still have an indication
+that a performance might be impacted.
+
+[mhocko@kernel.org: forgot to git add the follow up fix]
+  Link: http://lkml.kernel.org/r/20171107090635.c27thtse2lchjgvb@dhcp22.suse.cz
+Link: http://lkml.kernel.org/r/20171106092228.31098-1-mhocko@kernel.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Cc: Joe Perches <joe@perches.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Khalid Aziz <khalid.aziz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fcdaf842bd8f538a88059ce0243bc2822ed1b0e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/sparse-vmemmap.c
+diff --cc mm/sparse-vmemmap.c
+index 8ec6748e418b,17acf01791fa..000000000000
+--- a/mm/sparse-vmemmap.c
++++ b/mm/sparse-vmemmap.c
+@@@ -52,18 -53,20 +52,31 @@@ void * __meminit vmemmap_alloc_block(un
+  {
+  	/* If the main allocator is up use that, fallback to bootmem. */
+  	if (slab_is_available()) {
++ 		gfp_t gfp_mask = GFP_KERNEL|__GFP_RETRY_MAYFAIL|__GFP_NOWARN;
++ 		int order = get_order(size);
++ 		static bool warned;
+  		struct page *page;
+  
+++<<<<<<< HEAD
+ +		if (node_state(node, N_HIGH_MEMORY))
+ +			page = alloc_pages_node(
+ +				node, GFP_KERNEL | __GFP_ZERO | __GFP_REPEAT,
+ +				get_order(size));
+ +		else
+ +			page = alloc_pages(
+ +				GFP_KERNEL | __GFP_ZERO | __GFP_REPEAT,
+ +				get_order(size));
+++=======
++ 		page = alloc_pages_node(node, gfp_mask, order);
+++>>>>>>> fcdaf842bd8f (mm, sparse: do not swamp log with huge vmemmap allocation failures)
+  		if (page)
+  			return page_address(page);
++ 
++ 		if (!warned) {
++ 			warn_alloc(gfp_mask & ~__GFP_NOWARN, NULL,
++ 				   "vmemmap alloc failure: order:%u", order);
++ 			warned = true;
++ 		}
+  		return NULL;
+  	} else
+  		return __earlyonly_bootmem_alloc(node, size, size,
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index eacda07ef6c2..c40ea0ea66ea 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -1348,7 +1348,6 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+ 			vmemmap_verify((pte_t *)pmd, node, addr, next);
+ 			continue;
+ 		}
+-		pr_warn_once("vmemmap: falling back to regular page backing\n");
+ 		if (vmemmap_populate_basepages(addr, next, node))
+ 			return -ENOMEM;
+ 	}
+* Unmerged path mm/sparse-vmemmap.c
