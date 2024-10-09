@@ -1,0 +1,196 @@
+x86/mce: Check for faults tagged in EXTABLE_CLASS_FAULT exception table entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mce: Check for faults tagged in EXTABLE_CLASS_FAULT exception table entries (Jeff Moyer) [1437205]
+Rebuild_FUZZ: 97.40%
+commit-author Tony Luck <tony.luck@intel.com>
+commit b2f9d678e28ca71ce650eac82f26dd287b47e89a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b2f9d678.failed
+
+Extend the severity checking code to add a new context IN_KERN_RECOV
+which is used to indicate that the machine check was triggered by code
+in the kernel tagged with _ASM_EXTABLE_FAULT() so that the ex_handler_fault()
+handler will provide the fixup code with the trap number.
+
+Major re-work to the tail code in do_machine_check() to make all this
+readable/maintainable. One functional change is that tolerant=3 no longer
+stops recovery actions. Revert to only skipping sending SIGBUS to the
+current process.
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/89d243d05a7943bb187d1074bb30d9c4f482d5f5.1455732970.git.tony.luck@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b2f9d678e28ca71ce650eac82f26dd287b47e89a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce.c
+index 62de9881e444,524f2a8492d7..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@@ -1067,30 -1012,10 +1081,34 @@@ void do_machine_check(struct pt_regs *r
+  	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
+  	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
+  	char *msg = "Unknown";
+++<<<<<<< HEAD
+ +	u64 recover_paddr = ~0ull;
+ +	int flags = MF_ACTION_REQUIRED;
+++=======
++ 	int lmce = 0;
+++>>>>>>> b2f9d678e28c (x86/mce: Check for faults tagged in EXTABLE_CLASS_FAULT exception table entries)
+ +
+ +	/*
+ +	 * MCEs are always local on AMD. Same is determined by MCG_STATUS_LMCES
+ +	 * on Intel.
+ +	 */
+ +	int lmce = 1;
+ +	int cpu = smp_processor_id();
+  
+ -	/* If this CPU is offline, just bail out. */
+ -	if (cpu_is_offline(smp_processor_id())) {
+ +	/*
+ +	 * Cases where we avoid rendezvous handler timeout:
+ +	 * 1) If this CPU is offline.
+ +	 *
+ +	 * 2) If crashing_cpu was set, e.g. we're entering kdump and we need to
+ +	 *  skip those CPUs which remain looping in the 1st kernel - see
+ +	 *  crash_nmi_callback().
+ +	 *
+ +	 * Note: there still is a small window between kexec-ing and the new,
+ +	 * kdump kernel establishing a new #MC handler where a broadcasted MCE
+ +	 * might not get handled properly.
+ +	 */
+ +	if (cpu_is_offline(cpu) ||
+ +	    (crashing_cpu != -1 && crashing_cpu != cpu)) {
+  		u64 mcgstatus;
+  
+  		mcgstatus = mce_rdmsrl(MSR_IA32_MCG_STATUS);
+@@@ -1245,22 -1162,25 +1254,44 @@@
+  out:
+  	sync_core();
+  
+++<<<<<<< HEAD
+ +	if (recover_paddr == ~0ull)
+ +		return;
+ +
+ +	pr_err("Uncorrected hardware memory error in user-access at %llx",
+ +		 recover_paddr);
+ +	/*
+ +	 * We must call memory_failure() here even if the current process is
+ +	 * doomed. We still need to mark the page as poisoned and alert any
+ +	 * other users of the page.
+ +	 */
+ +	local_irq_enable();
+ +	if (memory_failure(recover_paddr >> PAGE_SHIFT, MCE_VECTOR, flags) < 0) {
+ +		pr_err("Memory error not recovered");
+ +		force_sig(SIGBUS, current);
+ +	}
+ +	local_irq_disable();
+++=======
++ 	if (worst != MCE_AR_SEVERITY && !kill_it)
++ 		goto out_ist;
++ 
++ 	/* Fault was in user mode and we need to take some action */
++ 	if ((m.cs & 3) == 3) {
++ 		ist_begin_non_atomic(regs);
++ 		local_irq_enable();
++ 
++ 		if (kill_it || do_memory_failure(&m))
++ 			force_sig(SIGBUS, current);
++ 		local_irq_disable();
++ 		ist_end_non_atomic();
++ 	} else {
++ 		if (!fixup_exception(regs, X86_TRAP_MC))
++ 			mce_panic("Failed kernel mode recovery", &m, NULL);
++ 	}
++ 
++ out_ist:
++ 	ist_exit(regs);
+++>>>>>>> b2f9d678e28c (x86/mce: Check for faults tagged in EXTABLE_CLASS_FAULT exception table entries)
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+diff --git a/arch/x86/kernel/cpu/mcheck/mce-severity.c b/arch/x86/kernel/cpu/mcheck/mce-severity.c
+index b2ac45a62106..631356c8cca4 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce-severity.c
++++ b/arch/x86/kernel/cpu/mcheck/mce-severity.c
+@@ -14,6 +14,7 @@
+ #include <linux/init.h>
+ #include <linux/debugfs.h>
+ #include <asm/mce.h>
++#include <asm/uaccess.h>
+ 
+ #include "mce-internal.h"
+ 
+@@ -29,7 +30,7 @@
+  * panic situations)
+  */
+ 
+-enum context { IN_KERNEL = 1, IN_USER = 2 };
++enum context { IN_KERNEL = 1, IN_USER = 2, IN_KERNEL_RECOV = 3 };
+ enum ser { SER_REQUIRED = 1, NO_SER = 2 };
+ enum exception { EXCP_CONTEXT = 1, NO_EXCP = 2 };
+ 
+@@ -48,6 +49,7 @@ static struct severity {
+ #define MCESEV(s, m, c...) { .sev = MCE_ ## s ## _SEVERITY, .msg = m, ## c }
+ #define  KERNEL		.context = IN_KERNEL
+ #define  USER		.context = IN_USER
++#define  KERNEL_RECOV	.context = IN_KERNEL_RECOV
+ #define  SER		.ser = SER_REQUIRED
+ #define  NOSER		.ser = NO_SER
+ #define  EXCP		.excp = EXCP_CONTEXT
+@@ -86,6 +88,10 @@ static struct severity {
+ 		PANIC, "In kernel and no restart IP",
+ 		EXCP, KERNEL, MCGMASK(MCG_STATUS_RIPV, 0)
+ 		),
++	MCESEV(
++		PANIC, "In kernel and no restart IP",
++		EXCP, KERNEL_RECOV, MCGMASK(MCG_STATUS_RIPV, 0)
++		),
+ 	MCESEV(
+ 		DEFERRED, "Deferred error",
+ 		NOSER, MASK(MCI_STATUS_UC|MCI_STATUS_DEFERRED|MCI_STATUS_POISON, MCI_STATUS_DEFERRED)
+@@ -122,6 +128,11 @@ static struct severity {
+ 		SER, MASK(MCI_STATUS_OVER|MCI_UC_SAR|MCI_ADDR, MCI_UC_SAR|MCI_ADDR),
+ 		MCGMASK(MCG_STATUS_RIPV|MCG_STATUS_EIPV, MCG_STATUS_RIPV)
+ 		),
++	MCESEV(
++		AR, "Action required: data load in error recoverable area of kernel",
++		SER, MASK(MCI_STATUS_OVER|MCI_UC_SAR|MCI_ADDR|MCACOD, MCI_UC_SAR|MCI_ADDR|MCACOD_DATA),
++		KERNEL_RECOV
++		),
+ 	MCESEV(
+ 		AR, "Action required: data load error in a user process",
+ 		SER, MASK(MCI_STATUS_OVER|MCI_UC_SAR|MCI_ADDR|MCACOD, MCI_UC_SAR|MCI_ADDR|MCACOD_DATA),
+@@ -170,6 +181,9 @@ static struct severity {
+ 		)	/* always matches. keep at end */
+ };
+ 
++#define mc_recoverable(mcg) (((mcg) & (MCG_STATUS_RIPV|MCG_STATUS_EIPV)) == \
++				(MCG_STATUS_RIPV|MCG_STATUS_EIPV))
++
+ /*
+  * If mcgstatus indicated that ip/cs on the stack were
+  * no good, then "m->cs" will be zero and we will have
+@@ -183,7 +197,11 @@ static struct severity {
+  */
+ static int error_context(struct mce *m)
+ {
+-	return ((m->cs & 3) == 3) ? IN_USER : IN_KERNEL;
++	if ((m->cs & 3) == 3)
++		return IN_USER;
++	if (mc_recoverable(m->mcgstatus) && ex_has_fault_handler(m->ip))
++		return IN_KERNEL_RECOV;
++	return IN_KERNEL;
+ }
+ 
+ static int mce_severity_amd_smca(struct mce *m, int err_ctx)
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce.c
