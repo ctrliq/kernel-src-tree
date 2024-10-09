@@ -813,7 +813,7 @@ pebs_update_state(bool needed_cb, struct cpu_hw_events *cpuc, struct pmu *pmu)
 	}
 }
 
-static void intel_pmu_pebs_add(struct perf_event *event)
+void intel_pmu_pebs_add(struct perf_event *event)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct hw_perf_event *hwc = &event->hw;
@@ -831,8 +831,6 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
 	struct hw_perf_event *hwc = &event->hw;
 	struct debug_store *ds = cpuc->ds;
-
-	intel_pmu_pebs_add(event);
 
 	hwc->config &= ~ARCH_PERFMON_EVENTSEL_INT;
 
@@ -853,7 +851,7 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	}
 }
 
-static void intel_pmu_pebs_del(struct perf_event *event)
+void intel_pmu_pebs_del(struct perf_event *event)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct hw_perf_event *hwc = &event->hw;
@@ -885,8 +883,6 @@ void intel_pmu_pebs_disable(struct perf_event *event)
 		wrmsrl(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
 
 	hwc->config |= ARCH_PERFMON_EVENTSEL_INT;
-
-	intel_pmu_pebs_del(event);
 }
 
 void intel_pmu_pebs_enable_all(void)
