@@ -1,0 +1,295 @@
+mm, swap: add sysfs interface for VMA based swap readahead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] swap: add sysfs interface for VMA based swap readahead (Rafael Aquini) [1485248]
+Rebuild_FUZZ: 96.43%
+commit-author Huang Ying <ying.huang@intel.com>
+commit d9bfcfdc41e8e5d80f7591f95a09ccce7cb8ad05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d9bfcfdc.failed
+
+The sysfs interface to control the VMA based swap readahead is added as
+follow,
+
+/sys/kernel/mm/swap/vma_ra_enabled
+
+Enable the VMA based swap readahead algorithm, or use the original
+global swap readahead algorithm.
+
+/sys/kernel/mm/swap/vma_ra_max_order
+
+Set the max order of the readahead window size for the VMA based swap
+readahead algorithm.
+
+The corresponding ABI documentation is added too.
+
+Link: http://lkml.kernel.org/r/20170807054038.1843-5-ying.huang@intel.com
+	Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Cc: Tim Chen <tim.c.chen@intel.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d9bfcfdc41e8e5d80f7591f95a09ccce7cb8ad05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap_state.c
+diff --cc mm/swap_state.c
+index bbce650716cb,71ce2d1ccbf7..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -527,3 -624,210 +527,213 @@@ void exit_swap_address_space(unsigned i
+  	synchronize_rcu();
+  	kvfree(spaces);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void swap_ra_clamp_pfn(struct vm_area_struct *vma,
++ 				     unsigned long faddr,
++ 				     unsigned long lpfn,
++ 				     unsigned long rpfn,
++ 				     unsigned long *start,
++ 				     unsigned long *end)
++ {
++ 	*start = max3(lpfn, PFN_DOWN(vma->vm_start),
++ 		      PFN_DOWN(faddr & PMD_MASK));
++ 	*end = min3(rpfn, PFN_DOWN(vma->vm_end),
++ 		    PFN_DOWN((faddr & PMD_MASK) + PMD_SIZE));
++ }
++ 
++ struct page *swap_readahead_detect(struct vm_fault *vmf,
++ 				   struct vma_swap_readahead *swap_ra)
++ {
++ 	struct vm_area_struct *vma = vmf->vma;
++ 	unsigned long swap_ra_info;
++ 	struct page *page;
++ 	swp_entry_t entry;
++ 	unsigned long faddr, pfn, fpfn;
++ 	unsigned long start, end;
++ 	pte_t *pte;
++ 	unsigned int max_win, hits, prev_win, win, left;
++ #ifndef CONFIG_64BIT
++ 	pte_t *tpte;
++ #endif
++ 
++ 	faddr = vmf->address;
++ 	entry = pte_to_swp_entry(vmf->orig_pte);
++ 	if ((unlikely(non_swap_entry(entry))))
++ 		return NULL;
++ 	page = lookup_swap_cache(entry, vma, faddr);
++ 	if (page)
++ 		return page;
++ 
++ 	max_win = 1 << READ_ONCE(swap_ra_max_order);
++ 	if (max_win == 1) {
++ 		swap_ra->win = 1;
++ 		return NULL;
++ 	}
++ 
++ 	fpfn = PFN_DOWN(faddr);
++ 	swap_ra_info = GET_SWAP_RA_VAL(vma);
++ 	pfn = PFN_DOWN(SWAP_RA_ADDR(swap_ra_info));
++ 	prev_win = SWAP_RA_WIN(swap_ra_info);
++ 	hits = SWAP_RA_HITS(swap_ra_info);
++ 	swap_ra->win = win = __swapin_nr_pages(pfn, fpfn, hits,
++ 					       max_win, prev_win);
++ 	atomic_long_set(&vma->swap_readahead_info,
++ 			SWAP_RA_VAL(faddr, win, 0));
++ 
++ 	if (win == 1)
++ 		return NULL;
++ 
++ 	/* Copy the PTEs because the page table may be unmapped */
++ 	if (fpfn == pfn + 1)
++ 		swap_ra_clamp_pfn(vma, faddr, fpfn, fpfn + win, &start, &end);
++ 	else if (pfn == fpfn + 1)
++ 		swap_ra_clamp_pfn(vma, faddr, fpfn - win + 1, fpfn + 1,
++ 				  &start, &end);
++ 	else {
++ 		left = (win - 1) / 2;
++ 		swap_ra_clamp_pfn(vma, faddr, fpfn - left, fpfn + win - left,
++ 				  &start, &end);
++ 	}
++ 	swap_ra->nr_pte = end - start;
++ 	swap_ra->offset = fpfn - start;
++ 	pte = vmf->pte - swap_ra->offset;
++ #ifdef CONFIG_64BIT
++ 	swap_ra->ptes = pte;
++ #else
++ 	tpte = swap_ra->ptes;
++ 	for (pfn = start; pfn != end; pfn++)
++ 		*tpte++ = *pte++;
++ #endif
++ 
++ 	return NULL;
++ }
++ 
++ struct page *do_swap_page_readahead(swp_entry_t fentry, gfp_t gfp_mask,
++ 				    struct vm_fault *vmf,
++ 				    struct vma_swap_readahead *swap_ra)
++ {
++ 	struct blk_plug plug;
++ 	struct vm_area_struct *vma = vmf->vma;
++ 	struct page *page;
++ 	pte_t *pte, pentry;
++ 	swp_entry_t entry;
++ 	unsigned int i;
++ 	bool page_allocated;
++ 
++ 	if (swap_ra->win == 1)
++ 		goto skip;
++ 
++ 	blk_start_plug(&plug);
++ 	for (i = 0, pte = swap_ra->ptes; i < swap_ra->nr_pte;
++ 	     i++, pte++) {
++ 		pentry = *pte;
++ 		if (pte_none(pentry))
++ 			continue;
++ 		if (pte_present(pentry))
++ 			continue;
++ 		entry = pte_to_swp_entry(pentry);
++ 		if (unlikely(non_swap_entry(entry)))
++ 			continue;
++ 		page = __read_swap_cache_async(entry, gfp_mask, vma,
++ 					       vmf->address, &page_allocated);
++ 		if (!page)
++ 			continue;
++ 		if (page_allocated) {
++ 			swap_readpage(page, false);
++ 			if (i != swap_ra->offset &&
++ 			    likely(!PageTransCompound(page))) {
++ 				SetPageReadahead(page);
++ 				count_vm_event(SWAP_RA);
++ 			}
++ 		}
++ 		put_page(page);
++ 	}
++ 	blk_finish_plug(&plug);
++ 	lru_add_drain();
++ skip:
++ 	return read_swap_cache_async(fentry, gfp_mask, vma, vmf->address,
++ 				     swap_ra->win == 1);
++ }
++ 
++ #ifdef CONFIG_SYSFS
++ static ssize_t vma_ra_enabled_show(struct kobject *kobj,
++ 				     struct kobj_attribute *attr, char *buf)
++ {
++ 	return sprintf(buf, "%s\n", swap_vma_readahead ? "true" : "false");
++ }
++ static ssize_t vma_ra_enabled_store(struct kobject *kobj,
++ 				      struct kobj_attribute *attr,
++ 				      const char *buf, size_t count)
++ {
++ 	if (!strncmp(buf, "true", 4) || !strncmp(buf, "1", 1))
++ 		swap_vma_readahead = true;
++ 	else if (!strncmp(buf, "false", 5) || !strncmp(buf, "0", 1))
++ 		swap_vma_readahead = false;
++ 	else
++ 		return -EINVAL;
++ 
++ 	return count;
++ }
++ static struct kobj_attribute vma_ra_enabled_attr =
++ 	__ATTR(vma_ra_enabled, 0644, vma_ra_enabled_show,
++ 	       vma_ra_enabled_store);
++ 
++ static ssize_t vma_ra_max_order_show(struct kobject *kobj,
++ 				     struct kobj_attribute *attr, char *buf)
++ {
++ 	return sprintf(buf, "%d\n", swap_ra_max_order);
++ }
++ static ssize_t vma_ra_max_order_store(struct kobject *kobj,
++ 				      struct kobj_attribute *attr,
++ 				      const char *buf, size_t count)
++ {
++ 	int err, v;
++ 
++ 	err = kstrtoint(buf, 10, &v);
++ 	if (err || v > SWAP_RA_ORDER_CEILING || v <= 0)
++ 		return -EINVAL;
++ 
++ 	swap_ra_max_order = v;
++ 
++ 	return count;
++ }
++ static struct kobj_attribute vma_ra_max_order_attr =
++ 	__ATTR(vma_ra_max_order, 0644, vma_ra_max_order_show,
++ 	       vma_ra_max_order_store);
++ 
++ static struct attribute *swap_attrs[] = {
++ 	&vma_ra_enabled_attr.attr,
++ 	&vma_ra_max_order_attr.attr,
++ 	NULL,
++ };
++ 
++ static struct attribute_group swap_attr_group = {
++ 	.attrs = swap_attrs,
++ };
++ 
++ static int __init swap_init_sysfs(void)
++ {
++ 	int err;
++ 	struct kobject *swap_kobj;
++ 
++ 	swap_kobj = kobject_create_and_add("swap", mm_kobj);
++ 	if (!swap_kobj) {
++ 		pr_err("failed to create swap kobject\n");
++ 		return -ENOMEM;
++ 	}
++ 	err = sysfs_create_group(swap_kobj, &swap_attr_group);
++ 	if (err) {
++ 		pr_err("failed to register swap group\n");
++ 		goto delete_obj;
++ 	}
++ 	return 0;
++ 
++ delete_obj:
++ 	kobject_put(swap_kobj);
++ 	return err;
++ }
++ subsys_initcall(swap_init_sysfs);
++ #endif
+++>>>>>>> d9bfcfdc41e8 (mm, swap: add sysfs interface for VMA based swap readahead)
+diff --git a/Documentation/ABI/testing/sysfs-kernel-mm-swap b/Documentation/ABI/testing/sysfs-kernel-mm-swap
+new file mode 100644
+index 000000000000..587db52084c7
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-kernel-mm-swap
+@@ -0,0 +1,26 @@
++What:		/sys/kernel/mm/swap/
++Date:		August 2017
++Contact:	Linux memory management mailing list <linux-mm@kvack.org>
++Description:	Interface for swapping
++
++What:		/sys/kernel/mm/swap/vma_ra_enabled
++Date:		August 2017
++Contact:	Linux memory management mailing list <linux-mm@kvack.org>
++Description:	Enable/disable VMA based swap readahead.
++
++		If set to true, the VMA based swap readahead algorithm
++		will be used for swappable anonymous pages mapped in a
++		VMA, and the global swap readahead algorithm will be
++		still used for tmpfs etc. other users.  If set to
++		false, the global swap readahead algorithm will be
++		used for all swappable pages.
++
++What:		/sys/kernel/mm/swap/vma_ra_max_order
++Date:		August 2017
++Contact:	Linux memory management mailing list <linux-mm@kvack.org>
++Description:	The max readahead size in order for VMA based swap readahead
++
++		VMA based swap readahead algorithm will readahead at
++		most 1 << max_order pages for each readahead.  The
++		real readahead size for each readahead will be scaled
++		according to the estimation algorithm.
+* Unmerged path mm/swap_state.c
