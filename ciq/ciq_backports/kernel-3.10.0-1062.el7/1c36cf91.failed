@@ -1,0 +1,150 @@
+IB/core: Store default GID property per-table instead of per-entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 1c36cf912ad19c99592c7d089aed5d1c321a678a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1c36cf91.failed
+
+There are at max one or two default GIDs for RoCE. Instead of storing
+a default GID property for all the GIDs, store default GID indices as
+individual bit per table.
+
+This allows a future simplification to get rid of the GID property field.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 1c36cf912ad19c99592c7d089aed5d1c321a678a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 235416ffd0cc,d4751f94a93a..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -70,18 -68,8 +70,17 @@@ enum gid_attr_find_mask 
+  
+  enum gid_table_entry_props {
+  	GID_TABLE_ENTRY_INVALID		= 1UL << 0,
+- 	GID_TABLE_ENTRY_DEFAULT		= 1UL << 1,
+  };
+  
+ +enum gid_table_write_action {
+ +	GID_TABLE_WRITE_ACTION_ADD,
+ +	GID_TABLE_WRITE_ACTION_DEL,
+ +	/* MODIFY only updates the GID table. Currently only used by
+ +	 * ib_cache_update.
+ +	 */
+ +	GID_TABLE_WRITE_ACTION_MODIFY
+ +};
+ +
+  struct ib_gid_table_entry {
+  	unsigned long	    props;
+  	union ib_gid        gid;
+@@@ -100,18 -88,17 +99,31 @@@ struct ib_gid_table 
+  	 * (a) Find the GID
+  	 * (b) Delete it.
+  	 *
+ +	 * Add/delete should be carried out atomically.
+ +	 * This is done by locking this mutex from multiple
+ +	 * writers. We don't need this lock for IB, as the MAD
+ +	 * layer replaces all entries. All data_vec entries
+ +	 * are locked by this lock.
+  	 **/
+++<<<<<<< HEAD
+ +	struct mutex         lock;
+ +	/* This lock protects the table entries from being
+ +	 * read and written simultaneously.
+ +	 */
+ +	rwlock_t	     rwlock;
+ +	struct ib_gid_table_entry *data_vec;
+++=======
++ 	/* Any writer to data_vec must hold this lock and the write side of
++ 	 * rwlock. readers must hold only rwlock. All writers must be in a
++ 	 * sleepable context.
++ 	 */
++ 	struct mutex			lock;
++ 	/* rwlock protects data_vec[ix]->props. */
++ 	rwlock_t			rwlock;
++ 	/* bit field, each bit indicates the index of default GID */
++ 	u32				default_gid_indices;
++ 	struct ib_gid_table_entry	*data_vec;
+++>>>>>>> 1c36cf912ad1 (IB/core: Store default GID property per-table instead of per-entry)
+  };
+  
+  static void dispatch_gid_change_event(struct ib_device *ib_dev, u8 port)
+@@@ -139,6 -126,29 +151,32 @@@ const char *ib_cache_gid_type_str(enum 
+  }
+  EXPORT_SYMBOL(ib_cache_gid_type_str);
+  
+++<<<<<<< HEAD
+++=======
++ /** rdma_is_zero_gid - Check if given GID is zero or not.
++  * @gid:	GID to check
++  * Returns true if given GID is zero, returns false otherwise.
++  */
++ bool rdma_is_zero_gid(const union ib_gid *gid)
++ {
++ 	return !memcmp(gid, &zgid, sizeof(*gid));
++ }
++ EXPORT_SYMBOL(rdma_is_zero_gid);
++ 
++ /** is_gid_index_default - Check if a given index belongs to
++  * reserved default GIDs or not.
++  * @table:	GID table pointer
++  * @index:	Index to check in GID table
++  * Returns true if index is one of the reserved default GID index otherwise
++  * returns false.
++  */
++ static bool is_gid_index_default(const struct ib_gid_table *table,
++ 				 unsigned int index)
++ {
++ 	return index < 32 && (BIT(index) & table->default_gid_indices);
++ }
++ 
+++>>>>>>> 1c36cf912ad1 (IB/core: Store default GID property per-table instead of per-entry)
+  int ib_cache_gid_parse_type_str(const char *buf)
+  {
+  	unsigned int i;
+@@@ -266,6 -314,33 +304,36 @@@ static int find_gid(struct ib_gid_tabl
+  
+  		i++;
+  
+++<<<<<<< HEAD
+++=======
++ 		/* find_gid() is used during GID addition where it is expected
++ 		 * to return a free entry slot which is not duplicate.
++ 		 * Free entry slot is requested and returned if pempty is set,
++ 		 * so lookup free slot only if requested.
++ 		 */
++ 		if (pempty && empty < 0) {
++ 			if (data->props & GID_TABLE_ENTRY_INVALID &&
++ 			    (default_gid ==
++ 				is_gid_index_default(table, curr_index))) {
++ 				/*
++ 				 * Found an invalid (free) entry; allocate it.
++ 				 * If default GID is requested, then our
++ 				 * found slot must be one of the DEFAULT
++ 				 * reserved slots or we fail.
++ 				 * This ensures that only DEFAULT reserved
++ 				 * slots are used for default property GIDs.
++ 				 */
++ 				empty = curr_index;
++ 			}
++ 		}
++ 
++ 		/*
++ 		 * Additionally find_gid() is used to find valid entry during
++ 		 * lookup operation, where validity needs to be checked. So
++ 		 * find the empty entry first to continue to search for a free
++ 		 * slot and ignore its INVALID flag.
++ 		 */
+++>>>>>>> 1c36cf912ad1 (IB/core: Store default GID property per-table instead of per-entry)
+  		if (data->props & GID_TABLE_ENTRY_INVALID)
+  			continue;
+  
+* Unmerged path drivers/infiniband/core/cache.c
