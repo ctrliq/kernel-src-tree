@@ -1,0 +1,159 @@
+tracing: Fix bad use of igrab in trace_uprobe.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.76.1.el7
+commit-author Song Liu <songliubraving@fb.com>
+commit 0c92c7a3c5d416f47b32c5f20a611dfeca5d5f2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.76.1.el7/0c92c7a3.failed
+
+As Miklos reported and suggested:
+
+  This pattern repeats two times in trace_uprobe.c and in
+  kernel/events/core.c as well:
+
+      ret = kern_path(filename, LOOKUP_FOLLOW, &path);
+      if (ret)
+          goto fail_address_parse;
+
+      inode = igrab(d_inode(path.dentry));
+      path_put(&path);
+
+  And it's wrong.  You can only hold a reference to the inode if you
+  have an active ref to the superblock as well (which is normally
+  through path.mnt) or holding s_umount.
+
+  This way unmounting the containing filesystem while the tracepoint is
+  active will give you the "VFS: Busy inodes after unmount..." message
+  and a crash when the inode is finally put.
+
+  Solution: store path instead of inode.
+
+This patch fixes two instances in trace_uprobe.c. struct path is added to
+struct trace_uprobe to keep the inode and containing mount point
+referenced.
+
+Link: http://lkml.kernel.org/r/20180423172135.4050588-1-songliubraving@fb.com
+
+Fixes: f3f096cfedf8 ("tracing: Provide trace events interface for uprobes")
+Fixes: 33ea4b24277b ("perf/core: Implement the 'perf_uprobe' PMU")
+	Cc: stable@vger.kernel.org
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Howard McLauchlan <hmclauchlan@fb.com>
+	Cc: Josef Bacik <jbacik@fb.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Acked-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reported-by: Miklos Szeredi <miklos@szeredi.hu>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit 0c92c7a3c5d416f47b32c5f20a611dfeca5d5f2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/trace/trace_uprobe.c
+index 517b5ab0621e,ac892878dbe6..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -433,26 -434,18 +432,37 @@@ static int create_trace_uprobe(int argc
+  		pr_info("Probe point is not specified.\n");
+  		return -EINVAL;
+  	}
+++<<<<<<< HEAD
+ +	if (isdigit(argv[1][0])) {
+ +		pr_info("probe point must be have a filename.\n");
+ +		return -EINVAL;
+ +	}
+ +	arg = strchr(argv[1], ':');
+ +	if (!arg) {
+ +		ret = -EINVAL;
+ +		goto fail_address_parse;
+ +	}
+++=======
++ 	/* Find the last occurrence, in case the path contains ':' too. */
++ 	arg = strrchr(argv[1], ':');
++ 	if (!arg)
++ 		return -EINVAL;
+++>>>>>>> 0c92c7a3c5d4 (tracing: Fix bad use of igrab in trace_uprobe.c)
+  
+  	*arg++ = '\0';
+  	filename = argv[1];
+  	ret = kern_path(filename, LOOKUP_FOLLOW, &path);
+  	if (ret)
+- 		goto fail_address_parse;
++ 		return ret;
+  
+++<<<<<<< HEAD
+ +	inode = igrab(path.dentry->d_inode);
+ +	path_put(&path);
+ +
+ +	if (!inode || !S_ISREG(inode->i_mode)) {
+++=======
++ 	if (!d_is_reg(path.dentry)) {
+++>>>>>>> 0c92c7a3c5d4 (tracing: Fix bad use of igrab in trace_uprobe.c)
+  		ret = -EINVAL;
+  		goto fail_address_parse;
+  	}
+@@@ -557,8 -552,7 +567,12 @@@ error
+  	return ret;
+  
+  fail_address_parse:
+++<<<<<<< HEAD
+ +	if (inode)
+ +		iput(inode);
+++=======
++ 	path_put(&path);
+++>>>>>>> 0c92c7a3c5d4 (tracing: Fix bad use of igrab in trace_uprobe.c)
+  
+  	pr_info("Failed to parse address or file.\n");
+  
+@@@ -874,12 -908,32 +888,13 @@@ probe_event_enable(struct trace_uprobe 
+  
+  	WARN_ON(!uprobe_filter_is_empty(&tu->filter));
+  
+ -	if (enabled)
+ -		return 0;
+ -
+ -	ret = uprobe_buffer_enable();
+ -	if (ret)
+ -		goto err_flags;
+ -
+ +	tu->tp.flags |= flag;
+  	tu->consumer.filter = filter;
++ 	tu->inode = d_real_inode(tu->path.dentry);
+  	ret = uprobe_register(tu->inode, tu->offset, &tu->consumer);
+  	if (ret)
+ -		goto err_buffer;
+ +		tu->tp.flags &= ~flag;
+  
+ -	return 0;
+ -
+ - err_buffer:
+ -	uprobe_buffer_disable();
+ -
+ - err_flags:
+ -	if (file) {
+ -		list_del(&link->list);
+ -		kfree(link);
+ -		tu->tp.flags &= ~TP_FLAG_TRACE;
+ -	} else {
+ -		tu->tp.flags &= ~TP_FLAG_PROFILE;
+ -	}
+  	return ret;
+  }
+  
+@@@ -891,7 -946,24 +906,12 @@@ static void probe_event_disable(struct 
+  	WARN_ON(!uprobe_filter_is_empty(&tu->filter));
+  
+  	uprobe_unregister(tu->inode, tu->offset, &tu->consumer);
+++<<<<<<< HEAD
+ +	tu->tp.flags &= ~flag;
+++=======
++ 	tu->inode = NULL;
++ 	tu->tp.flags &= file ? ~TP_FLAG_TRACE : ~TP_FLAG_PROFILE;
+++>>>>>>> 0c92c7a3c5d4 (tracing: Fix bad use of igrab in trace_uprobe.c)
+  
+  	uprobe_buffer_disable();
+  }
+* Unmerged path kernel/trace/trace_uprobe.c
