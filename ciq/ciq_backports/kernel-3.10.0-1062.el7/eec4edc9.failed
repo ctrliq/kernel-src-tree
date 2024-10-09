@@ -1,0 +1,155 @@
+net/mlx5: Use 2-factor allocator calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Use 2-factor allocator calls (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 94.44%
+commit-author Kees Cook <keescook@chromium.org>
+commit eec4edc9ee08fe5c2f219b4fab7aed71b409e196
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/eec4edc9.failed
+
+This restores the use of 2-factor allocation helpers that were already
+fixed treewide. Please do not use open-coded multiplication; prefer,
+instead, using 2-factor allocation helpers.
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eec4edc9ee08fe5c2f219b4fab7aed71b409e196)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a0bfa9c3ce47,c7791d036e9f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -289,66 -347,17 +289,72 @@@ static inline void mlx5e_build_umr_wqe(
+  static int mlx5e_rq_alloc_mpwqe_info(struct mlx5e_rq *rq,
+  				     struct mlx5e_channel *c)
+  {
+ -	int wq_sz = mlx5_wq_ll_get_size(&rq->mpwqe.wq);
+ +	int wq_sz = mlx5_wq_ll_get_size(&rq->wq);
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+ +	int mtt_alloc = mtt_sz + MLX5_UMR_ALIGN - 1;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	rq->mpwqe.info = kzalloc_node(wq_sz * sizeof(*rq->mpwqe.info),
+ +				      GFP_KERNEL, cpu_to_node(c->cpu));
+++=======
++ 	rq->mpwqe.info = kvzalloc_node(array_size(wq_sz,
++ 						  sizeof(*rq->mpwqe.info)),
++ 				       GFP_KERNEL, cpu_to_node(c->cpu));
+++>>>>>>> eec4edc9ee08 (net/mlx5: Use 2-factor allocator calls)
+  	if (!rq->mpwqe.info)
+ -		return -ENOMEM;
+ +		goto err_out;
+ +
+ +	/* We allocate more than mtt_sz as we will align the pointer */
+ +	rq->mpwqe.mtt_no_align = kzalloc_node(mtt_alloc * wq_sz, GFP_KERNEL,
+ +					cpu_to_node(c->cpu));
+ +	if (unlikely(!rq->mpwqe.mtt_no_align))
+ +		goto err_free_wqe_info;
+ +
+ +	for (i = 0; i < wq_sz; i++) {
+ +		struct mlx5e_mpw_info *wi = &rq->mpwqe.info[i];
+ +
+ +		wi->umr.mtt = PTR_ALIGN(rq->mpwqe.mtt_no_align + i * mtt_alloc,
+ +					MLX5_UMR_ALIGN);
+ +		wi->umr.mtt_addr = dma_map_single(c->pdev, wi->umr.mtt, mtt_sz,
+ +						  PCI_DMA_TODEVICE);
+ +		if (unlikely(dma_mapping_error(c->pdev, wi->umr.mtt_addr)))
+ +			goto err_unmap_mtts;
+  
+ -	mlx5e_build_umr_wqe(rq, &c->icosq, &rq->mpwqe.umr_wqe);
+ +		mlx5e_build_umr_wqe(rq, &c->icosq, &wi->umr.wqe, i);
+ +	}
+  
+  	return 0;
+ +
+ +err_unmap_mtts:
+ +	while (--i >= 0) {
+ +		struct mlx5e_mpw_info *wi = &rq->mpwqe.info[i];
+ +
+ +		dma_unmap_single(c->pdev, wi->umr.mtt_addr, mtt_sz,
+ +				 PCI_DMA_TODEVICE);
+ +	}
+ +	kfree(rq->mpwqe.mtt_no_align);
+ +err_free_wqe_info:
+ +	kfree(rq->mpwqe.info);
+ +
+ +err_out:
+ +	return -ENOMEM;
+ +}
+ +
+ +static void mlx5e_rq_free_mpwqe_info(struct mlx5e_rq *rq)
+ +{
+ +	int wq_sz = mlx5_wq_ll_get_size(&rq->wq);
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+ +	int i;
+ +
+ +	for (i = 0; i < wq_sz; i++) {
+ +		struct mlx5e_mpw_info *wi = &rq->mpwqe.info[i];
+ +
+ +		dma_unmap_single(rq->pdev, wi->umr.mtt_addr, mtt_sz,
+ +				 PCI_DMA_TODEVICE);
+ +	}
+ +	kfree(rq->mpwqe.mtt_no_align);
+ +	kfree(rq->mpwqe.info);
+  }
+  
+  static int mlx5e_create_umr_mkey(struct mlx5_core_dev *mdev,
+@@@ -840,8 -970,8 +846,13 @@@ static int mlx5e_alloc_xdpsq_db(struct 
+  {
+  	int wq_sz = mlx5_wq_cyc_get_size(&sq->wq);
+  
+++<<<<<<< HEAD
+ +	sq->db.di = kzalloc_node(sizeof(*sq->db.di) * wq_sz,
+ +				     GFP_KERNEL, numa);
+++=======
++ 	sq->db.di = kvzalloc_node(array_size(wq_sz, sizeof(*sq->db.di)),
++ 				  GFP_KERNEL, numa);
+++>>>>>>> eec4edc9ee08 (net/mlx5: Use 2-factor allocator calls)
+  	if (!sq->db.di) {
+  		mlx5e_free_xdpsq_db(sq);
+  		return -ENOMEM;
+@@@ -898,8 -1029,9 +909,14 @@@ static int mlx5e_alloc_icosq_db(struct 
+  {
+  	u8 wq_sz = mlx5_wq_cyc_get_size(&sq->wq);
+  
+++<<<<<<< HEAD
+ +	sq->db.ico_wqe = kzalloc_node(sizeof(*sq->db.ico_wqe) * wq_sz,
+ +				      GFP_KERNEL, numa);
+++=======
++ 	sq->db.ico_wqe = kvzalloc_node(array_size(wq_sz,
++ 						  sizeof(*sq->db.ico_wqe)),
++ 				       GFP_KERNEL, numa);
+++>>>>>>> eec4edc9ee08 (net/mlx5: Use 2-factor allocator calls)
+  	if (!sq->db.ico_wqe)
+  		return -ENOMEM;
+  
+@@@ -955,10 -1085,12 +972,19 @@@ static int mlx5e_alloc_txqsq_db(struct 
+  	int wq_sz = mlx5_wq_cyc_get_size(&sq->wq);
+  	int df_sz = wq_sz * MLX5_SEND_WQEBB_NUM_DS;
+  
+++<<<<<<< HEAD
+ +	sq->db.dma_fifo = kzalloc_node(df_sz * sizeof(*sq->db.dma_fifo),
+ +					   GFP_KERNEL, numa);
+ +	sq->db.wqe_info = kzalloc_node(wq_sz * sizeof(*sq->db.wqe_info),
+ +					   GFP_KERNEL, numa);
+++=======
++ 	sq->db.dma_fifo = kvzalloc_node(array_size(df_sz,
++ 						   sizeof(*sq->db.dma_fifo)),
++ 					GFP_KERNEL, numa);
++ 	sq->db.wqe_info = kvzalloc_node(array_size(wq_sz,
++ 						   sizeof(*sq->db.wqe_info)),
++ 					GFP_KERNEL, numa);
+++>>>>>>> eec4edc9ee08 (net/mlx5: Use 2-factor allocator calls)
+  	if (!sq->db.dma_fifo || !sq->db.wqe_info) {
+  		mlx5e_free_txqsq_db(sq);
+  		return -ENOMEM;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
