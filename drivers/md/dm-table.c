@@ -1599,9 +1599,15 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 	memcpy(limits_aux, limits->limits_aux, sizeof(struct queue_limits_aux));
 	q->limits.limits_aux = limits_aux;
 
-	if (!dm_table_supports_discards(t))
+	if (!dm_table_supports_discards(t)) {
 		queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, q);
-	else
+		/* Must also clear discard limits... */
+		q->limits.max_discard_sectors = 0;
+		q->limits.max_hw_discard_sectors = 0;
+		q->limits.discard_granularity = 0;
+		q->limits.discard_alignment = 0;
+		q->limits.discard_misaligned = 0;
+	} else
 		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
 
 	if (dm_table_supports_flush(t, REQ_FLUSH)) {
