@@ -1,0 +1,333 @@
+net/mlx5: Unify vport manager capability check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Unify vport manager capability check (Kamal Heib) [1456694]
+Rebuild_FUZZ: 95.45%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit a9f7705ffd663ff057222e91a86d9bc1d697fd58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a9f7705f.failed
+
+Expose MLX5_VPORT_MANAGER macro to check for strict vport manager
+E-switch and MPFS (Multi Physical Function Switch) abilities.
+
+VPORT manager must be a PF with an ethernet link and with FW advertised
+vport group manager capability
+
+Replace older checks with the new macro and use it where needed in
+eswitch.c and mlx5e netdev eswitch related flows.
+
+The same macro will be reused in MPFS separation downstream patch.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a9f7705ffd663ff057222e91a86d9bc1d697fd58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 5a367b6ed375,e3c858c44532..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2195,6 -2562,92 +2195,95 @@@ static void mlx5e_netdev_set_tcs(struc
+  		netdev_set_tc_queue(netdev, tc, nch, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_build_channels_tx_maps(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_channel *c;
++ 	struct mlx5e_txqsq *sq;
++ 	int i, tc;
++ 
++ 	for (i = 0; i < priv->channels.num; i++)
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++)
++ 			priv->channel_tc2txq[i][tc] = i + tc * priv->channels.num;
++ 
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		c = priv->channels.c[i];
++ 		for (tc = 0; tc < c->num_tc; tc++) {
++ 			sq = &c->sq[tc];
++ 			priv->txq2sq[sq->txq_ix] = sq;
++ 		}
++ 	}
++ }
++ 
++ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	int num_txqs = priv->channels.num * priv->channels.params.num_tc;
++ 	struct net_device *netdev = priv->netdev;
++ 
++ 	mlx5e_netdev_set_tcs(netdev);
++ 	netif_set_real_num_tx_queues(netdev, num_txqs);
++ 	netif_set_real_num_rx_queues(netdev, priv->channels.num);
++ 
++ 	mlx5e_build_channels_tx_maps(priv);
++ 	mlx5e_activate_channels(&priv->channels);
++ 	netif_tx_start_all_queues(priv->netdev);
++ 
++ 	if (MLX5_VPORT_MANAGER(priv->mdev))
++ 		mlx5e_add_sqs_fwd_rules(priv);
++ 
++ 	mlx5e_wait_channels_min_rx_wqes(&priv->channels);
++ 	mlx5e_redirect_rqts_to_channels(priv, &priv->channels);
++ }
++ 
++ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_redirect_rqts_to_drop(priv);
++ 
++ 	if (MLX5_VPORT_MANAGER(priv->mdev))
++ 		mlx5e_remove_sqs_fwd_rules(priv);
++ 
++ 	/* FIXME: This is a W/A only for tx timeout watch dog false alarm when
++ 	 * polling for inactive tx queues.
++ 	 */
++ 	netif_tx_stop_all_queues(priv->netdev);
++ 	netif_tx_disable(priv->netdev);
++ 	mlx5e_deactivate_channels(&priv->channels);
++ }
++ 
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	int new_num_txqs;
++ 	int carrier_ok;
++ 	new_num_txqs = new_chs->num * new_chs->params.num_tc;
++ 
++ 	carrier_ok = netif_carrier_ok(netdev);
++ 	netif_carrier_off(netdev);
++ 
++ 	if (new_num_txqs < netdev->real_num_tx_queues)
++ 		netif_set_real_num_tx_queues(netdev, new_num_txqs);
++ 
++ 	mlx5e_deactivate_priv_channels(priv);
++ 	mlx5e_close_channels(&priv->channels);
++ 
++ 	priv->channels = *new_chs;
++ 
++ 	/* New channels are ready to roll, modify HW settings if needed */
++ 	if (hw_modify)
++ 		hw_modify(priv);
++ 
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 
++ 	/* return carrier back if needed */
++ 	if (carrier_ok)
++ 		netif_carrier_on(netdev);
++ }
++ 
+++>>>>>>> a9f7705ffd66 (net/mlx5: Unify vport manager capability check)
+  int mlx5e_open_locked(struct net_device *netdev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+@@@ -3469,9 -4073,11 +3558,9 @@@ static void mlx5e_build_nic_netdev(stru
+  	mlx5e_set_netdev_dev_addr(netdev);
+  
+  #ifdef CONFIG_NET_SWITCHDEV
+- 	if (MLX5_CAP_GEN(mdev, vport_group_manager))
++ 	if (MLX5_VPORT_MANAGER(mdev))
+  		netdev->switchdev_ops = &mlx5e_switchdev_ops;
+  #endif
+ -
+ -	mlx5e_ipsec_build_netdev(priv);
+  }
+  
+  static void mlx5e_create_q_counter(struct mlx5e_priv *priv)
+@@@ -3608,14 -4215,8 +3697,19 @@@ static void mlx5e_nic_enable(struct mlx
+  
+  	mlx5e_enable_async_events(priv);
+  
+++<<<<<<< HEAD
+ +	if (MLX5_CAP_GEN(mdev, vport_group_manager)) {
+ +		mlx5_query_nic_vport_mac_address(mdev, 0, rep.hw_id);
+ +		rep.load = mlx5e_nic_rep_load;
+ +		rep.unload = mlx5e_nic_rep_unload;
+ +		rep.vport = FDB_UPLINK_VPORT;
+ +		rep.netdev = netdev;
+ +		mlx5_eswitch_register_vport_rep(esw, 0, &rep);
+ +	}
+++=======
++ 	if (MLX5_VPORT_MANAGER(priv->mdev))
++ 		mlx5e_register_vport_reps(priv);
+++>>>>>>> a9f7705ffd66 (net/mlx5: Unify vport manager capability check)
+  
+  	if (netdev->reg_state != NETREG_REGISTERED)
+  		return;
+@@@ -3633,11 -4240,18 +3727,18 @@@
+  static void mlx5e_nic_disable(struct mlx5e_priv *priv)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+ -
+ -	rtnl_lock();
+ -	if (netif_running(priv->netdev))
+ -		mlx5e_close(priv->netdev);
+ -	netif_device_detach(priv->netdev);
+ -	rtnl_unlock();
+ +	struct mlx5_eswitch *esw = mdev->priv.eswitch;
+  
+  	queue_work(priv->wq, &priv->set_rx_mode_work);
+++<<<<<<< HEAD
+ +	if (MLX5_CAP_GEN(mdev, vport_group_manager))
+ +		mlx5_eswitch_unregister_vport_rep(esw, 0);
+++=======
++ 
++ 	if (MLX5_VPORT_MANAGER(priv->mdev))
++ 		mlx5e_unregister_vport_reps(priv);
++ 
+++>>>>>>> a9f7705ffd66 (net/mlx5: Unify vport manager capability check)
+  	mlx5e_disable_async_events(priv);
+  	mlx5_lag_remove(mdev);
+  }
+@@@ -3860,13 -4431,18 +3961,23 @@@ static void *mlx5e_add(struct mlx5_core
+  	if (err)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	if (MLX5_CAP_GEN(mdev, vport_group_manager))
+ +		ppriv = &esw->offloads.vport_reps[0];
+++=======
++ 	if (MLX5_VPORT_MANAGER(mdev)) {
++ 		rpriv = mlx5e_alloc_nic_rep_priv(mdev);
++ 		if (!rpriv) {
++ 			mlx5_core_warn(mdev, "Failed to alloc NIC rep priv data\n");
++ 			return NULL;
++ 		}
++ 	}
+++>>>>>>> a9f7705ffd66 (net/mlx5: Unify vport manager capability check)
+  
+ -	netdev = mlx5e_create_netdev(mdev, &mlx5e_nic_profile, rpriv);
+ +	netdev = mlx5e_create_netdev(mdev, &mlx5e_nic_profile, ppriv);
+  	if (!netdev) {
+  		mlx5_core_err(mdev, "mlx5e_create_netdev failed\n");
+ -		goto err_free_rpriv;
+ +		goto err_unregister_reps;
+  	}
+  
+  	priv = netdev_priv(netdev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index 25afb9383ccb,24d2f707fdfc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@@ -485,12 -688,7 +485,16 @@@ int mlx5_start_eqs(struct mlx5_core_de
+  	u64 async_event_mask = MLX5_ASYNC_EVENT_MASK;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (MLX5_CAP_GEN(dev, pg))
+ +		async_event_mask |= (1ull << MLX5_EVENT_TYPE_PAGE_FAULT);
+ +
+ +	if (MLX5_CAP_GEN(dev, port_type) == MLX5_CAP_PORT_TYPE_ETH &&
+ +	    MLX5_CAP_GEN(dev, vport_group_manager) &&
+ +	    mlx5_core_is_pf(dev))
+++=======
++ 	if (MLX5_VPORT_MANAGER(dev))
+++>>>>>>> a9f7705ffd66 (net/mlx5: Unify vport manager capability check)
+  		async_event_mask |= (1ull << MLX5_EVENT_TYPE_NIC_VPORT_CHANGE);
+  
+  	if (MLX5_CAP_GEN(dev, port_module_event))
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eq.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 4205ef88982d..27c33677e714 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1618,13 +1618,14 @@ static void esw_disable_vport(struct mlx5_eswitch *esw, int vport_num)
+ }
+ 
+ /* Public E-Switch API */
++#define ESW_ALLOWED(esw) ((esw) && MLX5_VPORT_MANAGER((esw)->dev))
++
+ int mlx5_eswitch_enable_sriov(struct mlx5_eswitch *esw, int nvfs, int mode)
+ {
+ 	int err;
+ 	int i, enabled_events;
+ 
+-	if (!esw || !MLX5_CAP_GEN(esw->dev, vport_group_manager) ||
+-	    MLX5_CAP_GEN(esw->dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
++	if (!ESW_ALLOWED(esw))
+ 		return 0;
+ 
+ 	if (!MLX5_CAP_GEN(esw->dev, eswitch_flow_table) ||
+@@ -1674,9 +1675,7 @@ void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw)
+ 	int nvports;
+ 	int i;
+ 
+-	if (!esw || !MLX5_CAP_GEN(esw->dev, vport_group_manager) ||
+-	    MLX5_CAP_GEN(esw->dev, port_type) != MLX5_CAP_PORT_TYPE_ETH ||
+-	    esw->mode == SRIOV_NONE)
++	if (!ESW_ALLOWED(esw) || esw->mode == SRIOV_NONE)
+ 		return;
+ 
+ 	esw_info(esw->dev, "disable SRIOV: active vports(%d) mode(%d)\n",
+@@ -1705,8 +1704,7 @@ void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw)
+ 
+ void mlx5_eswitch_attach(struct mlx5_eswitch *esw)
+ {
+-	if (!esw || !MLX5_CAP_GEN(esw->dev, vport_group_manager) ||
+-	    MLX5_CAP_GEN(esw->dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
++	if (!ESW_ALLOWED(esw))
+ 		return;
+ 
+ 	esw_enable_vport(esw, 0, UC_ADDR_CHANGE);
+@@ -1715,8 +1713,7 @@ void mlx5_eswitch_attach(struct mlx5_eswitch *esw)
+ 
+ void mlx5_eswitch_detach(struct mlx5_eswitch *esw)
+ {
+-	if (!esw || !MLX5_CAP_GEN(esw->dev, vport_group_manager) ||
+-	    MLX5_CAP_GEN(esw->dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
++	if (!ESW_ALLOWED(esw))
+ 		return;
+ 
+ 	esw_disable_vport(esw, 0);
+@@ -1730,8 +1727,7 @@ int mlx5_eswitch_init(struct mlx5_core_dev *dev)
+ 	int vport_num;
+ 	int err;
+ 
+-	if (!MLX5_CAP_GEN(dev, vport_group_manager) ||
+-	    MLX5_CAP_GEN(dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
++	if (!MLX5_VPORT_MANAGER(dev))
+ 		return 0;
+ 
+ 	esw_info(dev,
+@@ -1813,8 +1809,7 @@ abort:
+ 
+ void mlx5_eswitch_cleanup(struct mlx5_eswitch *esw)
+ {
+-	if (!esw || !MLX5_CAP_GEN(esw->dev, vport_group_manager) ||
+-	    MLX5_CAP_GEN(esw->dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
++	if (!esw || !MLX5_VPORT_MANAGER(esw->dev))
+ 		return;
+ 
+ 	esw_info(esw->dev, "cleanup\n");
+@@ -1845,8 +1840,6 @@ void mlx5_eswitch_vport_event(struct mlx5_eswitch *esw, struct mlx5_eqe *eqe)
+ }
+ 
+ /* Vport Administration */
+-#define ESW_ALLOWED(esw) \
+-	(esw && MLX5_CAP_GEN(esw->dev, vport_group_manager) && mlx5_core_is_pf(esw->dev))
+ #define LEGAL_VPORT(esw, vport) (vport >= 0 && vport < esw->total_vports)
+ 
+ int mlx5_eswitch_set_vport_mac(struct mlx5_eswitch *esw,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 19ef644f882e..151682ff3eb9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -43,6 +43,10 @@
+ #define DRIVER_RELDATE  "January 2015"
+ 
+ #define MLX5_TOTAL_VPORTS(mdev) (1 + pci_sriov_get_totalvfs(mdev->pdev))
++#define MLX5_VPORT_MANAGER(mdev) \
++	(MLX5_CAP_GEN(mdev, vport_group_manager) && \
++	(MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) && \
++	 mlx5_core_is_pf(mdev))
+ 
+ extern uint mlx5_core_debug_mask;
+ 
