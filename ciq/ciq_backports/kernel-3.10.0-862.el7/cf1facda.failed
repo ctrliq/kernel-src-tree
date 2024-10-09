@@ -1,0 +1,277 @@
+sched: move tcf_proto_destroy and tcf_destroy_chain helpers into cls_api
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit cf1facda2f61bc3e9ffd985b6d624dec6ad3f279
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cf1facda.failed
+
+Creation is done in this file, move destruction to be at the same place.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf1facda2f61bc3e9ffd985b6d624dec6ad3f279)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+diff --cc include/net/sch_generic.h
+index 7b71681b10fc,aeec4086afb2..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -408,8 -405,34 +408,39 @@@ struct Qdisc *qdisc_create_dflt(struct 
+  				const struct Qdisc_ops *ops, u32 parentid);
+  void __qdisc_calculate_pkt_len(struct sk_buff *skb,
+  			       const struct qdisc_size_table *stab);
+++<<<<<<< HEAD
+ +bool tcf_proto_destroy(struct tcf_proto *tp, bool force);
+ +void tcf_destroy_chain(struct tcf_proto __rcu **fl);
+++=======
++ int skb_do_redirect(struct sk_buff *);
++ 
++ static inline void skb_reset_tc(struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	skb->tc_redirected = 0;
++ #endif
++ }
++ 
++ static inline bool skb_at_tc_ingress(const struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	return skb->tc_at_ingress;
++ #else
++ 	return false;
++ #endif
++ }
++ 
++ static inline bool skb_skip_tc_classify(struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	if (skb->tc_skip_classify) {
++ 		skb->tc_skip_classify = 0;
++ 		return true;
++ 	}
++ #endif
++ 	return false;
++ }
+++>>>>>>> cf1facda2f61 (sched: move tcf_proto_destroy and tcf_destroy_chain helpers into cls_api)
+  
+  /* Reset all TX qdiscs greater then index of a device.  */
+  static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index ddbf01b80b4c..87430eb75ad7 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -17,6 +17,8 @@ struct tcf_walker {
+ int register_tcf_proto_ops(struct tcf_proto_ops *ops);
+ int unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+ 
++void tcf_destroy_chain(struct tcf_proto __rcu **fl);
++
+ static inline unsigned long
+ __cls_set_class(unsigned long *clp, unsigned long cl)
+ {
+* Unmerged path include/net/sch_generic.h
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 610890f8531c..239991f61596 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -127,6 +127,27 @@ static inline u32 tcf_auto_prio(struct tcf_proto *tp)
+ 	return first;
+ }
+ 
++static bool tcf_proto_destroy(struct tcf_proto *tp, bool force)
++{
++	if (tp->ops->destroy(tp, force)) {
++		module_put(tp->ops->owner);
++		kfree_rcu(tp, rcu);
++		return true;
++	}
++	return false;
++}
++
++void tcf_destroy_chain(struct tcf_proto __rcu **fl)
++{
++	struct tcf_proto *tp;
++
++	while ((tp = rtnl_dereference(*fl)) != NULL) {
++		RCU_INIT_POINTER(*fl, tp->next);
++		tcf_proto_destroy(tp, true);
++	}
++}
++EXPORT_SYMBOL(tcf_destroy_chain);
++
+ /* Add/change/delete/get a filter node */
+ 
+ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index b5c860fe58f3..9f487bf7f949 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -1879,28 +1879,6 @@ reset:
+ }
+ EXPORT_SYMBOL(tc_classify);
+ 
+-bool tcf_proto_destroy(struct tcf_proto *tp, bool force)
+-{
+-	if (tp->ops->destroy(tp, force)) {
+-		module_put(tp->ops->owner);
+-		kfree_rcu(tp, rcu);
+-		return true;
+-	}
+-
+-	return false;
+-}
+-
+-void tcf_destroy_chain(struct tcf_proto __rcu **fl)
+-{
+-	struct tcf_proto *tp;
+-
+-	while ((tp = rtnl_dereference(*fl)) != NULL) {
+-		RCU_INIT_POINTER(*fl, tp->next);
+-		tcf_proto_destroy(tp, true);
+-	}
+-}
+-EXPORT_SYMBOL(tcf_destroy_chain);
+-
+ #ifdef CONFIG_PROC_FS
+ static int psched_show(struct seq_file *seq, void *v)
+ {
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index 74e837f9d79a..b27f79c0916d 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -15,6 +15,7 @@
+ #include <linux/file.h>		/* for fput */
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ 
+ /*
+  * The ATM queuing discipline provides a framework for invoking classifiers
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 24f30ccfced6..432baec37f8c 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -19,6 +19,7 @@
+ #include <linux/skbuff.h>
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ 
+ 
+ /*	Class-Based Queueing (CBQ) algorithm.
+diff --git a/net/sched/sch_choke.c b/net/sched/sch_choke.c
+index ef7e5f5166b5..2cb81c852bb9 100644
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@ -16,6 +16,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/vmalloc.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ #include <net/inet_ecn.h>
+ #include <net/red.h>
+ #include <net/flow_dissector.h>
+diff --git a/net/sched/sch_dsmark.c b/net/sched/sch_dsmark.c
+index 667dc2b20143..f23fdeef9e1b 100644
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -13,6 +13,7 @@
+ #include <linux/rtnetlink.h>
+ #include <linux/bitops.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ #include <net/dsfield.h>
+ #include <net/inet_ecn.h>
+ #include <asm/byteorder.h>
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index c8cbe944d0ea..83e2a5722cf7 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -23,6 +23,7 @@
+ #include <linux/vmalloc.h>
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ #include <net/codel.h>
+ #include <net/codel_impl.h>
+ #include <net/codel_qdisc.h>
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 2abcfb74a823..aa773b80d1ef 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -40,6 +40,7 @@
+ #include <net/netlink.h>
+ #include <net/sch_generic.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ 
+ /* HTB algorithm.
+     Author: devik@cdi.cz
+diff --git a/net/sched/sch_ingress.c b/net/sched/sch_ingress.c
+index e7c648fa9dc3..563348c5f508 100644
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@ -15,6 +15,7 @@
+ 
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ 
+ static struct Qdisc *ingress_leaf(struct Qdisc *sch, unsigned long arg)
+ {
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index 759faafd074d..59197e648e92 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -26,7 +26,7 @@
+ #include <linux/skbuff.h>
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
+-
++#include <net/pkt_cls.h>
+ 
+ struct multiq_sched_data {
+ 	u16 bands;
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index bda93ee4f685..4755e5a6bd1a 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -20,7 +20,7 @@
+ #include <linux/skbuff.h>
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
+-
++#include <net/pkt_cls.h>
+ 
+ struct prio_sched_data {
+ 	int bands;
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index ba31a5b026c4..e005cc8f3509 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -25,6 +25,7 @@
+ #include <linux/jhash.h>
+ #include <net/ip.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ #include <net/inet_ecn.h>
+ 
+ /*
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index c45edd7e3947..79708d5e5346 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -23,6 +23,7 @@
+ #include <linux/vmalloc.h>
+ #include <net/netlink.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ #include <net/red.h>
+ 
+ 
