@@ -1,0 +1,219 @@
+iommu/iova: Make dma_32bit_pfn implicit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [iommu] iova: Make dma_32bit_pfn implicit (Jerry Snitselaar) [1615865]
+Rebuild_FUZZ: 91.67%
+commit-author Zhen Lei <thunder.leizhen@huawei.com>
+commit aa3ac9469c1850ed00741955b975c3a19029763a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/aa3ac946.failed
+
+Now that the cached node optimisation can apply to all allocations, the
+couple of users which were playing tricks with dma_32bit_pfn in order to
+benefit from it can stop doing so. Conversely, there is also no need for
+all the other users to explicitly calculate a 'real' 32-bit PFN, when
+init_iova_domain() can happily do that itself from the page granularity.
+
+CC: Thierry Reding <thierry.reding@gmail.com>
+CC: Jonathan Hunter <jonathanh@nvidia.com>
+CC: David Airlie <airlied@linux.ie>
+CC: Sudeep Dutt <sudeep.dutt@intel.com>
+CC: Ashutosh Dixit <ashutosh.dixit@intel.com>
+	Signed-off-by: Zhen Lei <thunder.leizhen@huawei.com>
+	Tested-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Tested-by: Zhen Lei <thunder.leizhen@huawei.com>
+	Tested-by: Nate Watterson <nwatters@codeaurora.org>
+[rm: use iova_shift(), rewrote commit message]
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit aa3ac9469c1850ed00741955b975c3a19029763a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/tegra/drm.c
+#	drivers/gpu/host1x/dev.c
+#	drivers/iommu/dma-iommu.c
+#	drivers/misc/mic/scif/scif_rma.c
+diff --cc drivers/gpu/host1x/dev.c
+index 28e28a23d444,5267c62e8896..000000000000
+--- a/drivers/gpu/host1x/dev.c
++++ b/drivers/gpu/host1x/dev.c
+@@@ -137,10 -170,44 +137,48 @@@ static int host1x_probe(struct platform
+  		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = host1x_channel_list_init(host);
+++=======
++ 	host->rst = devm_reset_control_get(&pdev->dev, "host1x");
++ 	if (IS_ERR(host->rst)) {
++ 		err = PTR_ERR(host->rst);
++ 		dev_err(&pdev->dev, "failed to get reset: %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	if (iommu_present(&platform_bus_type)) {
++ 		struct iommu_domain_geometry *geometry;
++ 		unsigned long order;
++ 
++ 		host->domain = iommu_domain_alloc(&platform_bus_type);
++ 		if (!host->domain)
++ 			return -ENOMEM;
++ 
++ 		err = iommu_attach_device(host->domain, &pdev->dev);
++ 		if (err == -ENODEV) {
++ 			iommu_domain_free(host->domain);
++ 			host->domain = NULL;
++ 			goto skip_iommu;
++ 		} else if (err) {
++ 			goto fail_free_domain;
++ 		}
++ 
++ 		geometry = &host->domain->geometry;
++ 
++ 		order = __ffs(host->domain->pgsize_bitmap);
++ 		init_iova_domain(&host->iova, 1UL << order,
++ 				 geometry->aperture_start >> order);
++ 		host->iova_end = geometry->aperture_end;
++ 	}
++ 
++ skip_iommu:
++ 	err = host1x_channel_list_init(&host->channel_list,
++ 				       host->info->nb_channels);
+++>>>>>>> aa3ac9469c18 (iommu/iova: Make dma_32bit_pfn implicit)
+  	if (err) {
+  		dev_err(&pdev->dev, "failed to initialize channel list\n");
+ -		goto fail_detach_device;
+ +		return err;
+  	}
+  
+  	err = clk_prepare_enable(host->clk);
+* Unmerged path drivers/gpu/drm/tegra/drm.c
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/misc/mic/scif/scif_rma.c
+* Unmerged path drivers/gpu/drm/tegra/drm.c
+* Unmerged path drivers/gpu/host1x/dev.c
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index 3ed91bdea0ae..e9736fbbd278 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -60,7 +60,6 @@
+ /* IO virtual address start page frame number */
+ #define IOVA_START_PFN		(1)
+ #define IOVA_PFN(addr)		((addr) >> PAGE_SHIFT)
+-#define DMA_32BIT_PFN		IOVA_PFN(DMA_BIT_MASK(32))
+ 
+ /* Reserved IOVA ranges */
+ #define MSI_RANGE_START		(0xfee00000)
+@@ -1965,8 +1964,7 @@ static struct dma_ops_domain *dma_ops_domain_alloc(void)
+ 	if (!dma_dom->domain.pt_root)
+ 		goto free_dma_dom;
+ 
+-	init_iova_domain(&dma_dom->iovad, PAGE_SIZE,
+-			 IOVA_START_PFN, DMA_32BIT_PFN);
++	init_iova_domain(&dma_dom->iovad, PAGE_SIZE, IOVA_START_PFN);
+ 
+ 	/* Initialize reserved ranges */
+ 	copy_reserved_iova(&reserved_iova_ranges, &dma_dom->iovad);
+@@ -2870,8 +2868,7 @@ static int init_reserved_iova_ranges(void)
+ 	struct pci_dev *pdev = NULL;
+ 	struct iova *val;
+ 
+-	init_iova_domain(&reserved_iova_ranges, PAGE_SIZE,
+-			 IOVA_START_PFN, DMA_32BIT_PFN);
++	init_iova_domain(&reserved_iova_ranges, PAGE_SIZE, IOVA_START_PFN);
+ 
+ 	lockdep_set_class(&reserved_iova_ranges.iova_rbtree_lock,
+ 			  &reserved_rbtree_key);
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 600840490d25..273d244882e8 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -82,8 +82,6 @@
+ #define IOVA_START_PFN		(1)
+ 
+ #define IOVA_PFN(addr)		((addr) >> PAGE_SHIFT)
+-#define DMA_32BIT_PFN		IOVA_PFN(DMA_BIT_MASK(32))
+-#define DMA_64BIT_PFN		IOVA_PFN(DMA_BIT_MASK(64))
+ 
+ /* page table handling */
+ #define LEVEL_STRIDE		(9)
+@@ -1834,8 +1832,7 @@ static int dmar_init_reserved_ranges(void)
+ 	struct iova *iova;
+ 	int i;
+ 
+-	init_iova_domain(&reserved_iova_list, VTD_PAGE_SIZE, IOVA_START_PFN,
+-			DMA_32BIT_PFN);
++	init_iova_domain(&reserved_iova_list, VTD_PAGE_SIZE, IOVA_START_PFN);
+ 
+ 	lockdep_set_class(&reserved_iova_list.iova_rbtree_lock,
+ 		&reserved_rbtree_key);
+@@ -1894,8 +1891,7 @@ static int domain_init(struct dmar_domain *domain, struct intel_iommu *iommu,
+ 	unsigned long sagaw;
+ 	int err;
+ 
+-	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN,
+-			DMA_32BIT_PFN);
++	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN);
+ 
+ 	err = init_iova_flush_queue(&domain->iovad,
+ 				    iommu_flush_iova, iova_entry_free);
+@@ -4796,8 +4792,7 @@ static int md_domain_init(struct dmar_domain *domain, int guest_width)
+ {
+ 	int adjust_width;
+ 
+-	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN,
+-			DMA_32BIT_PFN);
++	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN);
+ 	domain_reserve_special_ranges(domain);
+ 
+ 	/* calculate AGAW */
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 1a0166896ba6..86bd8d7163dd 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -36,7 +36,7 @@ static void fq_flush_timeout(unsigned long data);
+ 
+ void
+ init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+-	unsigned long start_pfn, unsigned long pfn_32bit)
++	unsigned long start_pfn)
+ {
+ 	/*
+ 	 * IOVA granularity will normally be equal to the smallest
+@@ -50,7 +50,7 @@ init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+ 	iovad->cached32_node = NULL;
+ 	iovad->granule = granule;
+ 	iovad->start_pfn = start_pfn;
+-	iovad->dma_32bit_pfn = pfn_32bit + 1;
++	iovad->dma_32bit_pfn = 1UL << (32 - iova_shift(iovad));
+ 	iovad->flush_cb = NULL;
+ 	iovad->fq = NULL;
+ 	init_iova_rcaches(iovad);
+* Unmerged path drivers/misc/mic/scif/scif_rma.c
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index 09ce7dfe55b2..440825eda6b4 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -153,7 +153,7 @@ struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
+ 	unsigned long pfn_hi);
+ void copy_reserved_iova(struct iova_domain *from, struct iova_domain *to);
+ void init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+-	unsigned long start_pfn, unsigned long pfn_32bit);
++	unsigned long start_pfn);
+ int init_iova_flush_queue(struct iova_domain *iovad,
+ 			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor);
+ struct iova *find_iova(struct iova_domain *iovad, unsigned long pfn);
+@@ -223,8 +223,7 @@ static inline void copy_reserved_iova(struct iova_domain *from,
+ 
+ static inline void init_iova_domain(struct iova_domain *iovad,
+ 				    unsigned long granule,
+-				    unsigned long start_pfn,
+-				    unsigned long pfn_32bit)
++				    unsigned long start_pfn)
+ {
+ }
+ 
