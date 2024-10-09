@@ -1,0 +1,152 @@
+kvm/x86: Hyper-V HV_X64_MSR_VP_RUNTIME support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andrey Smetanin <asmetanin@virtuozzo.com>
+commit 9eec50b8bbe1535c440a1ee88c1958f78fc55957
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9eec50b8.failed
+
+HV_X64_MSR_VP_RUNTIME msr used by guest to get
+"the time the virtual processor consumes running guest code,
+and the time the associated logical processor spends running
+hypervisor code on behalf of that guest."
+
+Calculation of this time is performed by task_cputime_adjusted()
+for vcpu task.
+
+Necessary to support loading of winhv.sys in guest, which in turn is
+required to support Windows VMBus.
+
+	Signed-off-by: Andrey Smetanin <asmetanin@virtuozzo.com>
+	Reviewed-by: Roman Kagan <rkagan@virtuozzo.com>
+	Signed-off-by: Denis V. Lunev <den@openvz.org>
+CC: Paolo Bonzini <pbonzini@redhat.com>
+CC: Gleb Natapov <gleb@kernel.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9eec50b8bbe1535c440a1ee88c1958f78fc55957)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index ce477b69d194,d064cb2e19e8..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -401,6 -371,12 +401,15 @@@ struct kvm_mtrr 
+  	struct list_head head;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Hyper-V per vcpu emulation context */
++ struct kvm_vcpu_hv {
++ 	u64 hv_vapic;
++ 	s64 runtime_offset;
++ };
++ 
+++>>>>>>> 9eec50b8bbe1 (kvm/x86: Hyper-V HV_X64_MSR_VP_RUNTIME support)
+  struct kvm_vcpu_arch {
+  	/*
+  	 * rip and regs accesses must go through
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/include/uapi/asm/hyperv.h b/arch/x86/include/uapi/asm/hyperv.h
+index 9c13da9695bc..c4132df65177 100644
+--- a/arch/x86/include/uapi/asm/hyperv.h
++++ b/arch/x86/include/uapi/asm/hyperv.h
+@@ -154,6 +154,9 @@
+ /* MSR used to reset the guest OS. */
+ #define HV_X64_MSR_RESET			0x40000003
+ 
++/* MSR used to provide vcpu runtime in 100ns units */
++#define HV_X64_MSR_VP_RUNTIME			0x40000010
++
+ /* MSR used to read the per-partition time reference counter */
+ #define HV_X64_MSR_TIME_REF_COUNT		0x40000020
+ 
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index 5041730c0dbf..814bd04c7201 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -178,7 +178,16 @@ static int kvm_hv_set_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 data,
+ 	return 0;
+ }
+ 
+-static int kvm_hv_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
++/* Calculate cpu time spent by current task in 100ns units */
++static u64 current_task_runtime_100ns(void)
++{
++	cputime_t utime, stime;
++
++	task_cputime_adjusted(current, &utime, &stime);
++	return div_u64(cputime_to_nsecs(utime + stime), 100);
++}
++
++static int kvm_hv_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data, bool host)
+ {
+ 	struct kvm_vcpu_hv *hv = &vcpu->arch.hyperv;
+ 
+@@ -212,6 +221,11 @@ static int kvm_hv_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 		return kvm_hv_vapic_msr_write(vcpu, APIC_ICR, data);
+ 	case HV_X64_MSR_TPR:
+ 		return kvm_hv_vapic_msr_write(vcpu, APIC_TASKPRI, data);
++	case HV_X64_MSR_VP_RUNTIME:
++		if (!host)
++			return 1;
++		hv->runtime_offset = data - current_task_runtime_100ns();
++		break;
+ 	default:
+ 		vcpu_unimpl(vcpu, "Hyper-V uhandled wrmsr: 0x%x data 0x%llx\n",
+ 			    msr, data);
+@@ -287,6 +301,9 @@ static int kvm_hv_get_msr(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
+ 	case HV_X64_MSR_APIC_ASSIST_PAGE:
+ 		data = hv->hv_vapic;
+ 		break;
++	case HV_X64_MSR_VP_RUNTIME:
++		data = current_task_runtime_100ns() + hv->runtime_offset;
++		break;
+ 	default:
+ 		vcpu_unimpl(vcpu, "Hyper-V unhandled rdmsr: 0x%x\n", msr);
+ 		return 1;
+@@ -305,7 +322,7 @@ int kvm_hv_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data, bool host)
+ 		mutex_unlock(&vcpu->kvm->lock);
+ 		return r;
+ 	} else
+-		return kvm_hv_set_msr(vcpu, msr, data);
++		return kvm_hv_set_msr(vcpu, msr, data, host);
+ }
+ 
+ int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b7e57596f87c..3eb3d15bcaeb 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -981,6 +981,7 @@ static u32 emulated_msrs[] = {
+ 	HV_X64_MSR_CRASH_P3, HV_X64_MSR_CRASH_P4, HV_X64_MSR_CRASH_CTL,
+ 	HV_X64_MSR_RESET,
+ 	HV_X64_MSR_VP_INDEX,
++	HV_X64_MSR_VP_RUNTIME,
+ 	HV_X64_MSR_APIC_ASSIST_PAGE, MSR_KVM_ASYNC_PF_EN, MSR_KVM_STEAL_TIME,
+ 	MSR_KVM_PV_EOI_EN,
+ 
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index d175e346efcd..0b70f90bca4e 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -444,6 +444,7 @@ void task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
+ 	*ut = p->utime;
+ 	*st = p->stime;
+ }
++EXPORT_SYMBOL_GPL(task_cputime_adjusted);
+ 
+ void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
+ {
+@@ -656,6 +657,7 @@ void task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
+ 	task_cputime(p, &cputime.utime, &cputime.stime);
+ 	cputime_adjust(&cputime, &p->prev_cputime, ut, st);
+ }
++EXPORT_SYMBOL_GPL(task_cputime_adjusted);
+ 
+ void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
+ {
