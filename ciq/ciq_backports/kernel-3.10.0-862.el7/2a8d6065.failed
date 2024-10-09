@@ -1,0 +1,96 @@
+net/mlx5e: Fix napi poll with zero budget
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Fix napi poll with zero budget (Kamal Heib) [1456694]
+Rebuild_FUZZ: 94.87%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 2a8d6065e7b90ad9d5540650944d802b0f86bdfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2a8d6065.failed
+
+napi->poll can be called with budget 0, e.g. in netpoll scenarios
+where the caller only wants to poll TX rings
+(poll_one_napi@net/core/netpoll.c).
+
+The below commit changed RX polling from "while" loop to "do {} while",
+which caused to ignore the initial budget and handle at least one RX
+packet.
+
+This fixes the following warning:
+[ 2852.049194] mlx5e_napi_poll+0x0/0x260 [mlx5_core] exceeded budget in poll
+[ 2852.049195] ------------[ cut here ]------------
+[ 2852.049195] WARNING: CPU: 0 PID: 25691 at net/core/netpoll.c:171 netpoll_poll_dev+0x18a/0x1a0
+
+Fixes: 4b7dfc992514 ("net/mlx5e: Early-return on empty completion queues")
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Reported-by: Martin KaFai Lau <kafai@fb.com>
+	Tested-by: Martin KaFai Lau <kafai@fb.com>
+	Cc: kernel-team@fb.com
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 2a8d6065e7b90ad9d5540650944d802b0f86bdfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index a75c0268e502,ab92298eafc3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@@ -110,31 -49,31 +110,50 @@@ int mlx5e_napi_poll(struct napi_struct 
+  	struct mlx5e_channel *c = container_of(napi, struct mlx5e_channel,
+  					       napi);
+  	bool busy = false;
+- 	int work_done;
++ 	int work_done = 0;
+  	int i;
+  
+ +	clear_bit(MLX5E_CHANNEL_NAPI_SCHED, &c->flags);
+ +
+  	for (i = 0; i < c->num_tc; i++)
+  		busy |= mlx5e_poll_tx_cq(&c->sq[i].cq, budget);
+  
+++<<<<<<< HEAD
+ +	work_done = mlx5e_poll_rx_cq(&c->rq.cq, budget);
+ +	busy |= work_done == budget;
+++=======
++ 	if (c->xdp)
++ 		busy |= mlx5e_poll_xdpsq_cq(&c->rq.xdpsq.cq);
++ 
++ 	if (likely(budget)) { /* budget=0 means: don't poll rx rings */
++ 		work_done = mlx5e_poll_rx_cq(&c->rq.cq, budget);
++ 		busy |= work_done == budget;
++ 	}
+++>>>>>>> 2a8d6065e7b9 (net/mlx5e: Fix napi poll with zero budget)
+  
+ -	busy |= c->rq.post_wqes(&c->rq);
+ +	mlx5e_poll_ico_cq(&c->icosq.cq);
+  
+++<<<<<<< HEAD
+ +	busy |= mlx5e_post_rx_wqes(&c->rq);
+++=======
++ 	if (busy) {
++ 		if (likely(mlx5e_channel_no_affinity_change(c)))
++ 			return budget;
++ 		if (budget && work_done == budget)
++ 			work_done--;
++ 	}
+++>>>>>>> 2a8d6065e7b9 (net/mlx5e: Fix napi poll with zero budget)
+ +
+ +	if (busy)
+ +		return budget;
+  
+ -	if (unlikely(!napi_complete_done(napi, work_done)))
+ +	napi_complete_done(napi, work_done);
+ +
+ +	/* avoid losing completion event during/after polling cqs */
+ +	if (test_bit(MLX5E_CHANNEL_NAPI_SCHED, &c->flags)) {
+ +		napi_schedule(napi);
+  		return work_done;
+ +	}
+  
+  	for (i = 0; i < c->num_tc; i++)
+  		mlx5e_cq_arm(&c->sq[i].cq);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
