@@ -1,0 +1,308 @@
+scsi: tcmu: add module wide block/reset_netlink support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit bdaeedc1bea9e833196b5c7eb0ffd74edf9c863e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bdaeedc1.failed
+
+This patch based on Xiubo's patches adds 2 tcmu attr to block and reset the
+netlink interface. It's used during userspace daemon reinitialization after
+the daemon has crashed while there is outstanding nl requests. The daemon
+can block the nl interface, kill outstanding requests in the kernel and
+then reopen the netlink socket and unblock it to allow new requests.
+
+[mkp: typo]
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Tested-by: Xiubo Li <xiubli@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit bdaeedc1bea9e833196b5c7eb0ffd74edf9c863e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5534ef1b341c,95559811d6cc..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -71,9 -85,16 +71,10 @@@
+  #define TCMU_MBS_TO_BLOCKS(_mbs) (_mbs << (20 - DATA_BLOCK_SHIFT))
+  #define TCMU_BLOCKS_TO_MBS(_blocks) (_blocks >> (20 - DATA_BLOCK_SHIFT))
+  
+ -/*
+ - * Default number of global data blocks(512K * PAGE_SIZE)
+ - * when the unmap thread will be started.
+ - */
+ -#define TCMU_GLOBAL_MAX_BLOCKS_DEF (512 * 1024)
+ +#define CMDR_SIZE (16 * 4096)
+  
+  static u8 tcmu_kern_cmd_reply_supported;
++ static u8 tcmu_netlink_blocked;
+  
+  static struct device *tcmu_root_device;
+  
+@@@ -157,9 -197,151 +158,95 @@@ struct tcmu_cmd 
+  
+  static struct kmem_cache *tcmu_cmd_cache;
+  
+ -static atomic_t global_db_count = ATOMIC_INIT(0);
+ -static struct delayed_work tcmu_unmap_work;
+ -static int tcmu_global_max_blocks = TCMU_GLOBAL_MAX_BLOCKS_DEF;
+ -
+ -static int tcmu_set_global_max_data_area(const char *str,
+ -					 const struct kernel_param *kp)
+ -{
+ -	int ret, max_area_mb;
+ -
+ -	ret = kstrtoint(str, 10, &max_area_mb);
+ -	if (ret)
+ -		return -EINVAL;
+ -
+ -	if (max_area_mb <= 0) {
+ -		pr_err("global_max_data_area must be larger than 0.\n");
+ -		return -EINVAL;
+ -	}
+ -
+ -	tcmu_global_max_blocks = TCMU_MBS_TO_BLOCKS(max_area_mb);
+ -	if (atomic_read(&global_db_count) > tcmu_global_max_blocks)
+ -		schedule_delayed_work(&tcmu_unmap_work, 0);
+ -	else
+ -		cancel_delayed_work_sync(&tcmu_unmap_work);
+ -
+ -	return 0;
+ -}
+ -
+ -static int tcmu_get_global_max_data_area(char *buffer,
+ -					 const struct kernel_param *kp)
+ -{
+ -	return sprintf(buffer, "%d", TCMU_BLOCKS_TO_MBS(tcmu_global_max_blocks));
+ -}
+ -
+ -static const struct kernel_param_ops tcmu_global_max_data_area_op = {
+ -	.set = tcmu_set_global_max_data_area,
+ -	.get = tcmu_get_global_max_data_area,
+ -};
+ -
+ -module_param_cb(global_max_data_area_mb, &tcmu_global_max_data_area_op, NULL,
+ -		S_IWUSR | S_IRUGO);
+ -MODULE_PARM_DESC(global_max_data_area_mb,
+ -		 "Max MBs allowed to be allocated to all the tcmu device's "
+ -		 "data areas.");
+ +static DEFINE_IDR(devices_idr);
+ +static DEFINE_MUTEX(device_mutex);
+  
++ static int tcmu_get_block_netlink(char *buffer,
++ 				  const struct kernel_param *kp)
++ {
++ 	return sprintf(buffer, "%s\n", tcmu_netlink_blocked ?
++ 		       "blocked" : "unblocked");
++ }
++ 
++ static int tcmu_set_block_netlink(const char *str,
++ 				  const struct kernel_param *kp)
++ {
++ 	int ret;
++ 	u8 val;
++ 
++ 	ret = kstrtou8(str, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val > 1) {
++ 		pr_err("Invalid block netlink value %u\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	tcmu_netlink_blocked = val;
++ 	return 0;
++ }
++ 
++ static const struct kernel_param_ops tcmu_block_netlink_op = {
++ 	.set = tcmu_set_block_netlink,
++ 	.get = tcmu_get_block_netlink,
++ };
++ 
++ module_param_cb(block_netlink, &tcmu_block_netlink_op, NULL, S_IWUSR | S_IRUGO);
++ MODULE_PARM_DESC(block_netlink, "Block new netlink commands.");
++ 
++ static int tcmu_fail_netlink_cmd(struct tcmu_nl_cmd *nl_cmd)
++ {
++ 	struct tcmu_dev *udev = nl_cmd->udev;
++ 
++ 	if (!tcmu_netlink_blocked) {
++ 		pr_err("Could not reset device's netlink interface. Netlink is not blocked.\n");
++ 		return -EBUSY;
++ 	}
++ 
++ 	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
++ 		pr_debug("Aborting nl cmd %d on %s\n", nl_cmd->cmd, udev->name);
++ 		nl_cmd->status = -EINTR;
++ 		list_del(&nl_cmd->nl_list);
++ 		complete(&nl_cmd->complete);
++ 	}
++ 	return 0;
++ }
++ 
++ static int tcmu_set_reset_netlink(const char *str,
++ 				  const struct kernel_param *kp)
++ {
++ 	struct tcmu_nl_cmd *nl_cmd, *tmp_cmd;
++ 	int ret;
++ 	u8 val;
++ 
++ 	ret = kstrtou8(str, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val != 1) {
++ 		pr_err("Invalid reset netlink value %u\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	mutex_lock(&tcmu_nl_cmd_mutex);
++ 	list_for_each_entry_safe(nl_cmd, tmp_cmd, &tcmu_nl_cmd_list, nl_list) {
++ 		ret = tcmu_fail_netlink_cmd(nl_cmd);
++ 		if (ret)
++ 			break;
++ 	}
++ 	mutex_unlock(&tcmu_nl_cmd_mutex);
++ 
++ 	return ret;
++ }
++ 
++ static const struct kernel_param_ops tcmu_reset_netlink_op = {
++ 	.set = tcmu_set_reset_netlink,
++ };
++ 
++ module_param_cb(reset_netlink, &tcmu_reset_netlink_op, NULL, S_IWUSR);
++ MODULE_PARM_DESC(reset_netlink, "Reset netlink commands.");
++ 
+  /* multicast group */
+  enum tcmu_multicast_groups {
+  	TCMU_MCGRP_CONFIG,
+@@@ -193,33 -374,37 +280,39 @@@ static int tcmu_genl_cmd_done(struct ge
+  	dev_id = nla_get_u32(info->attrs[TCMU_ATTR_DEVICE_ID]);
+  	rc = nla_get_s32(info->attrs[TCMU_ATTR_CMD_STATUS]);
+  
+ -	mutex_lock(&tcmu_nl_cmd_mutex);
+ -	list_for_each_entry(nl_cmd, &tcmu_nl_cmd_list, nl_list) {
+ -		if (nl_cmd->udev->se_dev.dev_index == dev_id) {
+ -			udev = nl_cmd->udev;
+ -			break;
+ -		}
+ -	}
+ -
+ -	if (!udev) {
+ -		pr_err(KERN_ERR "tcmu nl cmd %u/%d completion could not find device with dev id %u.\n",
+ +	mutex_lock(&device_mutex);
+ +	dev = idr_find(&devices_idr, dev_id);
+ +	mutex_unlock(&device_mutex);
+ +	if (!dev) {
+ +		printk(KERN_ERR "tcmu nl cmd %u/%u completion could not find device with dev id %u.\n",
+  		       completed_cmd, rc, dev_id);
+ -		ret = -ENODEV;
+ -		goto unlock;
+ +		return -ENODEV;
+  	}
+ -	list_del(&nl_cmd->nl_list);
+ +	udev = TCMU_DEV(dev);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&udev->nl_cmd_lock);
+ +	nl_cmd = &udev->curr_nl_cmd;
+ +
+ +	pr_debug("genl cmd done got id %d curr %d done %d rc %d\n", dev_id,
+ +		 nl_cmd->cmd, completed_cmd, rc);
+++=======
++ 	pr_debug("%s genl cmd done got id %d curr %d done %d rc %d stat %d\n",
++ 		 udev->name, dev_id, nl_cmd->cmd, completed_cmd, rc,
++ 		 nl_cmd->status);
+++>>>>>>> bdaeedc1bea9 (scsi: tcmu: add module wide block/reset_netlink support)
+  
+  	if (nl_cmd->cmd != completed_cmd) {
+ -		pr_err("Mismatched commands on %s (Expecting reply for %d. Current %d).\n",
+ -		       udev->name, completed_cmd, nl_cmd->cmd);
+ +		printk(KERN_ERR "Mismatched commands (Expecting reply for %d. Current %d).\n",
+ +		       completed_cmd, nl_cmd->cmd);
+  		ret = -EINVAL;
+ -		goto unlock;
+ +	} else {
+ +		nl_cmd->status = rc;
+  	}
+  
+ -	nl_cmd->status = rc;
+ -	complete(&nl_cmd->complete);
+ -unlock:
+ -	mutex_unlock(&tcmu_nl_cmd_mutex);
+ +	spin_unlock(&udev->nl_cmd_lock);
+ +	if (!ret)
+ +		complete(&nl_cmd->complete);
+  	return ret;
+  }
+  
+@@@ -1076,15 -1628,25 +1169,22 @@@ static void tcmu_init_genl_cmd_reply(st
+  	struct tcmu_nl_cmd *nl_cmd = &udev->curr_nl_cmd;
+  
+  	if (!tcmu_kern_cmd_reply_supported)
+ -		return 0;
+ -
+ -	if (udev->nl_reply_supported <= 0)
+ -		return 0;
+ -
+ -	mutex_lock(&tcmu_nl_cmd_mutex);
+ +		return;
+ +relock:
+ +	spin_lock(&udev->nl_cmd_lock);
+  
++ 	if (tcmu_netlink_blocked) {
++ 		mutex_unlock(&tcmu_nl_cmd_mutex);
++ 		pr_warn("Failing nl cmd %d on %s. Interface is blocked.\n", cmd,
++ 			udev->name);
++ 		return -EAGAIN;
++ 	}
++ 
+  	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
+ -		mutex_unlock(&tcmu_nl_cmd_mutex);
+ -		pr_warn("netlink cmd %d already executing on %s\n",
+ -			 nl_cmd->cmd, udev->name);
+ -		return -EBUSY;
+ +		spin_unlock(&udev->nl_cmd_lock);
+ +		pr_debug("sleeping for open nl cmd\n");
+ +		wait_event(udev->nl_cmd_wq, (nl_cmd->cmd == TCMU_CMD_UNSPEC));
+ +		goto relock;
+  	}
+  
+  	memset(nl_cmd, 0, sizeof(*nl_cmd));
+@@@ -1105,19 -1672,20 +1205,23 @@@ static int tcmu_wait_genl_cmd_reply(str
+  	pr_debug("sleeping for nl reply\n");
+  	wait_for_completion(&nl_cmd->complete);
+  
+ -	mutex_lock(&tcmu_nl_cmd_mutex);
+ +	spin_lock(&udev->nl_cmd_lock);
+  	nl_cmd->cmd = TCMU_CMD_UNSPEC;
+  	ret = nl_cmd->status;
+++<<<<<<< HEAD
+ +	nl_cmd->status = 0;
+ +	spin_unlock(&udev->nl_cmd_lock);
+++=======
++ 	mutex_unlock(&tcmu_nl_cmd_mutex);
+++>>>>>>> bdaeedc1bea9 (scsi: tcmu: add module wide block/reset_netlink support)
+  
+ -	return ret;
+ +	wake_up_all(&udev->nl_cmd_wq);
+ +
+ +       return ret;;
+  }
+  
+ -static int tcmu_netlink_event_init(struct tcmu_dev *udev,
+ -				   enum tcmu_genl_cmd cmd,
+ -				   struct sk_buff **buf, void **hdr)
+ +static int tcmu_netlink_event(struct tcmu_dev *udev, enum tcmu_genl_cmd cmd,
+ +			      int reconfig_attr, const void *reconfig_data)
+  {
+  	struct sk_buff *skb;
+  	void *msg_header;
+* Unmerged path drivers/target/target_core_user.c
