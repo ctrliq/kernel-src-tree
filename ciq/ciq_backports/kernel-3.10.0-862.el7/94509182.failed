@@ -1,0 +1,246 @@
+target: Perform RCU callback barrier before backend/fabric unload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Perform RCU callback barrier before backend/fabric unload (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.44%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 9450918293b3c35f11883231a53da1aed2c78403
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/94509182.failed
+
+This patch addresses a v4.2-rc1 regression where backend driver
+module unload happening immediately after TBO->free_device()
+does internal call_rcu(), will currently result in IRQ context
+rcu_process_callbacks() use-after-free paging OOPsen.
+
+It adds the missing rcu_barrier() in target_backend_unregister()
+to perform an explicit RCU barrier waiting for all RCU callbacks
+to complete before releasing target_backend_ops memory, and
+allowing TBO->module exit to proceed.
+
+Also, do the same for fabric drivers in target_unregister_template()
+to ensure se_deve_entry->rcu_head -> kfree_rcu() callbacks have
+completed, before allowing target_core_fabric_ops->owner module
+exit to proceed.
+
+	Acked-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9450918293b3c35f11883231a53da1aed2c78403)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_configfs.c
+#	drivers/target/target_core_hba.c
+diff --cc drivers/target/target_core_configfs.c
+index 60cccf317ddb,860e84046177..000000000000
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@@ -508,77 -420,57 +508,95 @@@ static int target_fabric_tf_ops_check
+  	return 0;
+  }
+  
+ -int target_register_template(const struct target_core_fabric_ops *fo)
+ +/*
+ + * Called 2nd from fabric module with returned parameter of
+ + * struct target_fabric_configfs * from target_fabric_configfs_init().
+ + *
+ + * Upon a successful registration, the new fabric's struct config_item is
+ + * return.  Also, a pointer to this struct is set in the passed
+ + * struct target_fabric_configfs.
+ + */
+ +int target_fabric_configfs_register(
+ +	struct target_fabric_configfs *tf)
+  {
+ -	struct target_fabric_configfs *tf;
+  	int ret;
+  
+ -	ret = target_fabric_tf_ops_check(fo);
+ -	if (ret)
+ -		return ret;
+ -
+ -	tf = kzalloc(sizeof(struct target_fabric_configfs), GFP_KERNEL);
+  	if (!tf) {
+ -		pr_err("%s: could not allocate memory!\n", __func__);
+ -		return -ENOMEM;
+ +		pr_err("Unable to locate target_fabric_configfs"
+ +			" pointer\n");
+ +		return -EINVAL;
+  	}
+ +	if (!tf->tf_subsys) {
+ +		pr_err("Unable to target struct config_subsystem"
+ +			" pointer\n");
+ +		return -EINVAL;
+ +	}
+ +	ret = target_fabric_tf_ops_check(tf);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -	INIT_LIST_HEAD(&tf->tf_list);
+ -	atomic_set(&tf->tf_access_cnt, 0);
+ -	tf->tf_ops = fo;
+ -	target_fabric_setup_cits(tf);
+ -
+ -	mutex_lock(&g_tf_lock);
+ -	list_add_tail(&tf->tf_list, &g_tf_list);
+ -	mutex_unlock(&g_tf_lock);
+ -
+ +	pr_debug("<<<<<<<<<<<<<<<<<<<<<< END FABRIC API >>>>>>>>>>>>"
+ +		">>>>>>>>>>\n");
+  	return 0;
+  }
+ -EXPORT_SYMBOL(target_register_template);
+ +EXPORT_SYMBOL(target_fabric_configfs_register);
+  
+ -void target_unregister_template(const struct target_core_fabric_ops *fo)
+ +void target_fabric_configfs_deregister(
+ +	struct target_fabric_configfs *tf)
+  {
+ -	struct target_fabric_configfs *t;
+ +	struct configfs_subsystem *su;
+  
+++<<<<<<< HEAD
+ +	if (!tf) {
+ +		pr_err("Unable to locate passed target_fabric_"
+ +			"configfs\n");
+ +		return;
+++=======
++ 	mutex_lock(&g_tf_lock);
++ 	list_for_each_entry(t, &g_tf_list, tf_list) {
++ 		if (!strcmp(t->tf_ops->name, fo->name)) {
++ 			BUG_ON(atomic_read(&t->tf_access_cnt));
++ 			list_del(&t->tf_list);
++ 			mutex_unlock(&g_tf_lock);
++ 			/*
++ 			 * Wait for any outstanding fabric se_deve_entry->rcu_head
++ 			 * callbacks to complete post kfree_rcu(), before allowing
++ 			 * fabric driver unload of TFO->module to proceed.
++ 			 */
++ 			rcu_barrier();
++ 			kfree(t);
++ 			return;
++ 		}
+++>>>>>>> 9450918293b3 (target: Perform RCU callback barrier before backend/fabric unload)
+ +	}
+ +	su = tf->tf_subsys;
+ +	if (!su) {
+ +		pr_err("Unable to locate passed tf->tf_subsys"
+ +			" pointer\n");
+ +		return;
+ +	}
+ +	pr_debug("<<<<<<<<<<<<<<<<<<<<<< BEGIN FABRIC API >>>>>>>>>>"
+ +			">>>>>>>>>>>>\n");
+ +	mutex_lock(&g_tf_lock);
+ +	if (atomic_read(&tf->tf_access_cnt)) {
+ +		mutex_unlock(&g_tf_lock);
+ +		pr_err("Non zero tf->tf_access_cnt for fabric %s\n",
+ +			tf->tf_name);
+ +		BUG();
+  	}
+ +	list_del(&tf->tf_list);
+  	mutex_unlock(&g_tf_lock);
+ +
+ +	pr_debug("Target_Core_ConfigFS: DEREGISTER -> Releasing tf:"
+ +			" %s\n", tf->tf_name);
+ +	tf->tf_module = NULL;
+ +	tf->tf_subsys = NULL;
+ +	kfree(tf);
+ +
+ +	pr_debug("<<<<<<<<<<<<<<<<<<<<<< END FABRIC API >>>>>>>>>>>>>>>>>"
+ +			">>>>>\n");
+  }
+ -EXPORT_SYMBOL(target_unregister_template);
+ +EXPORT_SYMBOL(target_fabric_configfs_deregister);
+  
+  /*##############################################################################
+  // Stop functions called by external Target Fabrics Modules
+diff --cc drivers/target/target_core_hba.c
+index ff95f95dcd13,be9cefc07407..000000000000
+--- a/drivers/target/target_core_hba.c
++++ b/drivers/target/target_core_hba.c
+@@@ -64,39 -66,56 +64,61 @@@ int transport_subsystem_register(struc
+  			return -EEXIST;
+  		}
+  	}
+ -	target_setup_backend_cits(tb);
+ -	list_add_tail(&tb->list, &backend_list);
+ -	mutex_unlock(&backend_mutex);
+ +	list_add_tail(&sub_api->sub_api_list, &subsystem_list);
+ +	mutex_unlock(&subsystem_mutex);
+  
+ -	pr_debug("TCM: Registered subsystem plugin: %s struct module: %p\n",
+ -			ops->name, ops->owner);
+ +	pr_debug("TCM: Registered subsystem plugin: %s struct module:"
+ +			" %p\n", sub_api->name, sub_api->owner);
+  	return 0;
+  }
+ -EXPORT_SYMBOL(transport_backend_register);
+ +EXPORT_SYMBOL(transport_subsystem_register);
+  
+ -void target_backend_unregister(const struct target_backend_ops *ops)
+ +void transport_subsystem_release(struct se_subsystem_api *sub_api)
+  {
+++<<<<<<< HEAD
+ +	mutex_lock(&subsystem_mutex);
+ +	list_del(&sub_api->sub_api_list);
+ +	mutex_unlock(&subsystem_mutex);
+++=======
++ 	struct target_backend *tb;
++ 
++ 	mutex_lock(&backend_mutex);
++ 	list_for_each_entry(tb, &backend_list, list) {
++ 		if (tb->ops == ops) {
++ 			list_del(&tb->list);
++ 			mutex_unlock(&backend_mutex);
++ 			/*
++ 			 * Wait for any outstanding backend driver ->rcu_head
++ 			 * callbacks to complete post TBO->free_device() ->
++ 			 * call_rcu(), before allowing backend driver module
++ 			 * unload of target_backend_ops->owner to proceed.
++ 			 */
++ 			rcu_barrier();
++ 			kfree(tb);
++ 			return;
++ 		}
++ 	}
++ 	mutex_unlock(&backend_mutex);
+++>>>>>>> 9450918293b3 (target: Perform RCU callback barrier before backend/fabric unload)
+  }
+ -EXPORT_SYMBOL(target_backend_unregister);
+ +EXPORT_SYMBOL(transport_subsystem_release);
+  
+ -static struct target_backend *core_get_backend(const char *name)
+ +static struct se_subsystem_api *core_get_backend(const char *sub_name)
+  {
+ -	struct target_backend *tb;
+ +	struct se_subsystem_api *s;
+  
+ -	mutex_lock(&backend_mutex);
+ -	list_for_each_entry(tb, &backend_list, list) {
+ -		if (!strcmp(tb->ops->name, name))
+ +	mutex_lock(&subsystem_mutex);
+ +	list_for_each_entry(s, &subsystem_list, sub_api_list) {
+ +		if (!strcmp(s->name, sub_name))
+  			goto found;
+  	}
+ -	mutex_unlock(&backend_mutex);
+ +	mutex_unlock(&subsystem_mutex);
+  	return NULL;
+  found:
+ -	if (tb->ops->owner && !try_module_get(tb->ops->owner))
+ -		tb = NULL;
+ -	mutex_unlock(&backend_mutex);
+ -	return tb;
+ +	if (s->owner && !try_module_get(s->owner))
+ +		s = NULL;
+ +	mutex_unlock(&subsystem_mutex);
+ +	return s;
+  }
+  
+  struct se_hba *
+* Unmerged path drivers/target/target_core_configfs.c
+* Unmerged path drivers/target/target_core_hba.c
