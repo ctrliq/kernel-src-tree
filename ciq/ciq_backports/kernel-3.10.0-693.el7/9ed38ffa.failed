@@ -1,0 +1,92 @@
+KVM: nVMX: introduce nested_vmx_load_cr3 and call it on vmentry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ladi Prosek <lprosek@redhat.com>
+commit 9ed38ffad47316dbdc16de0de275868c7771754d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9ed38ffa.failed
+
+Loading CR3 as part of emulating vmentry is different from regular CR3 loads,
+as implemented in kvm_set_cr3, in several ways.
+
+* different rules are followed to check CR3 and it is desirable for the caller
+to distinguish between the possible failures
+* PDPTRs are not loaded if PAE paging and nested EPT are both enabled
+* many MMU operations are not necessary
+
+This patch introduces nested_vmx_load_cr3 suitable for CR3 loads as part of
+nested vmentry and vmexit, and makes use of it on the nested vmentry path.
+
+	Signed-off-by: Ladi Prosek <lprosek@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 9ed38ffad47316dbdc16de0de275868c7771754d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index c4ff252596cb,a0d6e59f4f34..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9695,8 -10329,20 +9733,25 @@@ static void prepare_vmcs02(struct kvm_v
+  	vmx_set_cr4(vcpu, vmcs12->guest_cr4);
+  	vmcs_writel(CR4_READ_SHADOW, nested_read_cr4(vmcs12));
+  
+++<<<<<<< HEAD
+ +	/* shadow page tables on either EPT or shadow page tables */
+ +	kvm_set_cr3(vcpu, vmcs12->guest_cr3);
+++=======
++ 	if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER)
++ 		vcpu->arch.efer = vmcs12->guest_ia32_efer;
++ 	else if (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE)
++ 		vcpu->arch.efer |= (EFER_LMA | EFER_LME);
++ 	else
++ 		vcpu->arch.efer &= ~(EFER_LMA | EFER_LME);
++ 	/* Note: modifies VM_ENTRY/EXIT_CONTROLS and GUEST/HOST_IA32_EFER */
++ 	vmx_set_efer(vcpu, vcpu->arch.efer);
++ 
++ 	/* Shadow page tables on either EPT or shadow page tables. */
++ 	if (nested_vmx_load_cr3(vcpu, vmcs12->guest_cr3, nested_ept_enabled,
++ 				entry_failure_code))
++ 		return 1;
++ 
+++>>>>>>> 9ed38ffad473 (KVM: nVMX: introduce nested_vmx_load_cr3 and call it on vmentry)
+  	kvm_mmu_reset_context(vcpu);
+  
+  	if (!enable_ept)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 38430109c621..6b288786505d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -937,6 +937,7 @@ unsigned int kvm_mmu_calculate_mmu_pages(struct kvm *kvm);
+ void kvm_mmu_change_mmu_pages(struct kvm *kvm, unsigned int kvm_nr_mmu_pages);
+ 
+ int load_pdptrs(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu, unsigned long cr3);
++bool pdptrs_changed(struct kvm_vcpu *vcpu);
+ 
+ int emulator_write_phys(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 			  const void *val, int bytes);
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 4d5a959967aa..1608e32a97c3 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -562,7 +562,7 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(load_pdptrs);
+ 
+-static bool pdptrs_changed(struct kvm_vcpu *vcpu)
++bool pdptrs_changed(struct kvm_vcpu *vcpu)
+ {
+ 	u64 pdpte[ARRAY_SIZE(vcpu->arch.walk_mmu->pdptrs)];
+ 	bool changed = true;
+@@ -588,6 +588,7 @@ out:
+ 
+ 	return changed;
+ }
++EXPORT_SYMBOL_GPL(pdptrs_changed);
+ 
+ int kvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
+ {
