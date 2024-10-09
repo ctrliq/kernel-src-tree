@@ -1,0 +1,138 @@
+nfp: rename l4_offset in struct nfp_net_tx_desc to lso_hdrlen
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Edwin Peer <edwin.peer@netronome.com>
+commit e53fc9fa0ce12df32004dd05b9735a00c4ac5d04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e53fc9fa.failed
+
+The l4_offset field referred to by NFD is confusingly named. It is not the
+offset of the L4 transport header, but rather the L4 payload.
+
+The LSO2 capability supported by alternative device firmware requires
+the actual L4 offset, thus the rename seems prudent.
+
+	Signed-off-by: Edwin Peer <edwin.peer@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e53fc9fa0ce12df32004dd05b9735a00c4ac5d04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 57f4d1370a10,0cebe9098451..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -794,13 -823,13 +794,13 @@@ static int nfp_net_tx(struct sk_buff *s
+  
+  	txd->flags = 0;
+  	txd->mss = 0;
+- 	txd->l4_offset = 0;
++ 	txd->lso_hdrlen = 0;
+  
+ -	nfp_net_tx_tso(r_vec, txbuf, txd, skb);
+ +	nfp_net_tx_tso(nn, r_vec, txbuf, txd, skb);
+  
+ -	nfp_net_tx_csum(dp, r_vec, txbuf, txd, skb);
+ +	nfp_net_tx_csum(nn, r_vec, txbuf, txd, skb);
+  
+ -	if (skb_vlan_tag_present(skb) && dp->ctrl & NFP_NET_CFG_CTRL_TXVLAN) {
+ +	if (skb_vlan_tag_present(skb) && nn->ctrl & NFP_NET_CFG_CTRL_TXVLAN) {
+  		txd->flags |= PCIE_DESC_TX_VLAN;
+  		txd->vlan = cpu_to_le16(skb_vlan_tag_get(skb));
+  	}
+@@@ -1365,6 -1475,73 +1365,76 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ nfp_net_tx_xdp_buf(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int dma_off,
++ 		   unsigned int pkt_len)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		nfp_net_rx_drop(dp, rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 
++ 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 
++ 	nfp_net_rx_give_one(dp, rx_ring, txbuf->frag, txbuf->dma_addr);
++ 
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(dp->dev, rxbuf->dma_addr + dma_off,
++ 				   pkt_len, DMA_BIDIRECTIONAL);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + dma_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->lso_hdrlen = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ 	return true;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, void *hard_start,
++ 			   unsigned int *off, unsigned int *len)
++ {
++ 	struct xdp_buff xdp;
++ 	void *orig_data;
++ 	int ret;
++ 
++ 	xdp.data_hard_start = hard_start;
++ 	xdp.data = data + *off;
++ 	xdp.data_end = data + *off + *len;
++ 
++ 	orig_data = xdp.data;
++ 	ret = bpf_prog_run_xdp(prog, &xdp);
++ 
++ 	*len -= xdp.data - orig_data;
++ 	*off += xdp.data - orig_data;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> e53fc9fa0ce1 (nfp: rename l4_offset in struct nfp_net_tx_desc to lso_hdrlen)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0..0b15053bb4ca 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -149,7 +149,7 @@ struct nfp_net_tx_desc {
+ 			__le32 dma_addr_lo; /* Low 32bit of host buf addr */
+ 
+ 			__le16 mss;	/* MSS to be used for LSO */
+-			u8 l4_offset;	/* LSO, where the L4 data starts */
++			u8 lso_hdrlen;	/* LSO, TCP payload offset */
+ 			u8 flags;	/* TX Flags, see @PCIE_DESC_TX_* */
+ 
+ 			__le16 vlan;	/* VLAN tag to add if indicated */
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
