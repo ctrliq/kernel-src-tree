@@ -1,0 +1,130 @@
+nfp: make vNIC ctrl memory mapping function reusable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit c24ca95ff648dd6477d488bb41b9282b67bd22e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c24ca95f.failed
+
+We will soon need to map control vNIC PCI memory as well as data vNIC
+memory.  Make the function for mapping areas pointed to by an RTsym
+reusable.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c24ca95ff648dd6477d488bb41b9282b67bd22e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index acc8cfe284f3,3644b12d93db..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -232,43 -248,48 +232,58 @@@ nfp_net_pf_total_qcs(struct nfp_pf *pf
+  	return max_qc - min_qc;
+  }
+  
+- static u8 __iomem *nfp_net_pf_map_ctrl_bar(struct nfp_pf *pf)
++ static u8 __iomem *
++ nfp_net_pf_map_rtsym(struct nfp_pf *pf, const char *name, const char *sym_fmt,
++ 		     unsigned int min_size, struct nfp_cpp_area **area)
+  {
+- 	const struct nfp_rtsym *ctrl_sym;
+- 	u8 __iomem *ctrl_bar;
++ 	const struct nfp_rtsym *sym;
+  	char pf_symbol[256];
++ 	u8 __iomem *mem;
+  
+- 	snprintf(pf_symbol, sizeof(pf_symbol), "_pf%u_net_bar0",
++ 	snprintf(pf_symbol, sizeof(pf_symbol), sym_fmt,
+  		 nfp_cppcore_pcie_unit(pf->cpp));
+  
+- 	ctrl_sym = nfp_rtsym_lookup(pf->cpp, pf_symbol);
+- 	if (!ctrl_sym) {
+- 		dev_err(&pf->pdev->dev,
+- 			"Failed to find PF BAR0 symbol %s\n", pf_symbol);
+- 		return NULL;
++ 	sym = nfp_rtsym_lookup(pf->cpp, pf_symbol);
++ 	if (!sym) {
++ 		nfp_err(pf->cpp, "Failed to find PF symbol %s\n", pf_symbol);
++ 		return (u8 __iomem *)ERR_PTR(-ENOENT);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ctrl_sym->size < pf->num_ports * NFP_PF_CSR_SLICE_SIZE) {
+ +		dev_err(&pf->pdev->dev,
+ +			"PF BAR0 too small to contain %d ports\n",
+ +			pf->num_ports);
+ +		return NULL;
+ +	}
+ +
+ +	ctrl_bar = nfp_net_map_area(pf->cpp, "net.ctrl",
+ +				    ctrl_sym->domain, ctrl_sym->target,
+ +				    ctrl_sym->addr, ctrl_sym->size,
+ +				    &pf->ctrl_area);
+ +	if (IS_ERR(ctrl_bar)) {
+ +		dev_err(&pf->pdev->dev, "Failed to map PF BAR0: %ld\n",
+ +			PTR_ERR(ctrl_bar));
+ +		return NULL;
+++=======
++ 	if (sym->size < min_size) {
++ 		nfp_err(pf->cpp, "PF symbol %s too small\n", pf_symbol);
++ 		return (u8 __iomem *)ERR_PTR(-EINVAL);
+  	}
+  
+- 	return ctrl_bar;
++ 	mem = nfp_net_map_area(pf->cpp, name, sym->domain, sym->target,
++ 			       sym->addr, sym->size, area);
++ 	if (IS_ERR(mem)) {
++ 		nfp_err(pf->cpp, "Failed to map PF symbol %s: %ld\n",
++ 			pf_symbol, PTR_ERR(mem));
++ 		return mem;
+++>>>>>>> c24ca95ff648 (nfp: make vNIC ctrl memory mapping function reusable)
++ 	}
++ 
++ 	return mem;
+  }
+  
+ -static void nfp_net_pf_free_vnic(struct nfp_pf *pf, struct nfp_net *nn)
+ -{
+ -	nfp_port_free(nn->port);
+ -	list_del(&nn->vnic_list);
+ -	pf->num_vnics--;
+ -	nfp_net_free(nn);
+ -}
+ -
+ -static void nfp_net_pf_free_vnics(struct nfp_pf *pf)
+ +static void nfp_net_pf_free_netdevs(struct nfp_pf *pf)
+  {
+  	struct nfp_net *nn;
+  
+@@@ -544,12 -675,20 +559,16 @@@ int nfp_net_pci_probe(struct nfp_pf *pf
+  		return -EINVAL;
+  	}
+  
+ -	mutex_lock(&pf->lock);
+ -	pf->max_data_vnics = nfp_net_pf_get_num_ports(pf);
+ -	if ((int)pf->max_data_vnics < 0) {
+ -		err = pf->max_data_vnics;
+ -		goto err_unlock;
+ -	}
+ +	mutex_lock(&pf->port_lock);
+ +	pf->num_ports = nfp_net_pf_get_num_ports(pf);
+  
+- 	ctrl_bar = nfp_net_pf_map_ctrl_bar(pf);
+- 	if (!ctrl_bar) {
+- 		err = pf->fw_loaded ? -EINVAL : -EPROBE_DEFER;
++ 	ctrl_bar_sz = pf->max_data_vnics * NFP_PF_CSR_SLICE_SIZE;
++ 	ctrl_bar = nfp_net_pf_map_rtsym(pf, "net.ctrl", "_pf%d_net_bar0",
++ 					ctrl_bar_sz, &pf->data_vnic_bar);
++ 	if (IS_ERR(ctrl_bar)) {
++ 		err = PTR_ERR(ctrl_bar);
++ 		if (!pf->fw_loaded && err == -ENOENT)
++ 			err = -EPROBE_DEFER;
+  		goto err_unlock;
+  	}
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
