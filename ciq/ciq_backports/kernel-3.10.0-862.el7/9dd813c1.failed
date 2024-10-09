@@ -1,0 +1,547 @@
+fsnotify: Move mark list head from object into dedicated structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 9dd813c15b2c101168808d4f5941a29985758973
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9dd813c1.failed
+
+Currently notification marks are attached to object (inode or vfsmnt) by
+a hlist_head in the object. The list is also protected by a spinlock in
+the object. So while there is any mark attached to the list of marks,
+the object must be pinned in memory (and thus e.g. last iput() deleting
+inode cannot happen). Also for list iteration in fsnotify() to work, we
+must hold fsnotify_mark_srcu lock so that mark itself and
+mark->obj_list.next cannot get freed. Thus we are required to wait for
+response to fanotify events from userspace process with
+fsnotify_mark_srcu lock held. That causes issues when userspace process
+is buggy and does not reply to some event - basically the whole
+notification subsystem gets eventually stuck.
+
+So to be able to drop fsnotify_mark_srcu lock while waiting for
+response, we have to pin the mark in memory and make sure it stays in
+the object list (as removing the mark waiting for response could lead to
+lost notification events for groups later in the list). However we don't
+want inode reclaim to block on such mark as that would lead to system
+just locking up elsewhere.
+
+This commit is the first in the series that paves way towards solving
+these conflicting lifetime needs. Instead of anchoring the list of marks
+directly in the object, we anchor it in a dedicated structure
+(fsnotify_mark_connector) and just point to that structure from the
+object. The following commits will also add spinlock protecting the list
+and object pointer to the structure.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 9dd813c15b2c101168808d4f5941a29985758973)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+#	kernel/auditsc.c
+diff --cc fs/inode.c
+index aaf9ae90702b,750e952d2918..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -237,8 -231,13 +237,15 @@@ EXPORT_SYMBOL(free_inode_nonrcu)
+  void __destroy_inode(struct inode *inode)
+  {
+  	BUG_ON(inode_has_buffers(inode));
+ -	inode_detach_wb(inode);
+  	security_inode_free(inode);
+  	fsnotify_inode_delete(inode);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FSNOTIFY
++ 	fsnotify_connector_free(&inode->i_fsnotify_marks);
++ #endif
++ 	locks_free_lock_context(inode);
+++>>>>>>> 9dd813c15b2c (fsnotify: Move mark list head from object into dedicated structure)
+  	if (!inode->i_nlink) {
+  		WARN_ON(atomic_long_read(&inode->i_sb->s_remove_count) == 0);
+  		atomic_long_dec(&inode->i_sb->s_remove_count);
+diff --cc kernel/auditsc.c
+index 44710450e168,bf7b7ca295d0..000000000000
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@@ -69,6 -71,10 +69,13 @@@
+  #include <linux/fs_struct.h>
+  #include <linux/compat.h>
+  #include <linux/ctype.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/string.h>
++ #include <linux/uaccess.h>
++ #include <linux/fsnotify_backend.h>
++ #include <uapi/linux/limits.h>
+++>>>>>>> 9dd813c15b2c (fsnotify: Move mark list head from object into dedicated structure)
+  
+  #include "audit.h"
+  
+@@@ -1645,8 -1640,9 +1653,14 @@@ retry
+  	rcu_read_lock();
+  	seq = read_seqbegin(&rename_lock);
+  	for(;;) {
+++<<<<<<< HEAD
+ +		struct inode *inode = d->d_inode;
+ +		if (inode && unlikely(!hlist_empty(&inode->i_fsnotify_marks))) {
+++=======
++ 		struct inode *inode = d_backing_inode(d);
++ 		if (inode && unlikely(inode->i_fsnotify_marks &&
++ 		    !hlist_empty(&inode->i_fsnotify_marks->list))) {
+++>>>>>>> 9dd813c15b2c (fsnotify: Move mark list head from object into dedicated structure)
+  			struct audit_chunk *chunk;
+  			chunk = audit_tree_lookup(inode);
+  			if (chunk) {
+* Unmerged path fs/inode.c
+diff --git a/fs/mount.h b/fs/mount.h
+index 2f04321d2531..13261344e96e 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -56,7 +56,7 @@ struct mount {
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+ #ifdef CONFIG_FSNOTIFY
+-	struct hlist_head mnt_fsnotify_marks;
++	struct fsnotify_mark_connector *mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+ #endif
+ 	int mnt_id;			/* mount identifier */
+diff --git a/fs/namespace.c b/fs/namespace.c
+index d21098c35db1..5b5bf67e4c79 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -232,9 +232,6 @@ static struct mount *alloc_vfsmnt(const char *name)
+ 		INIT_LIST_HEAD(&mnt->mnt_slave_list);
+ 		INIT_LIST_HEAD(&mnt->mnt_slave);
+ 		INIT_HLIST_NODE(&mnt->mnt_mp_list);
+-#ifdef CONFIG_FSNOTIFY
+-		INIT_HLIST_HEAD(&mnt->mnt_fsnotify_marks);
+-#endif
+ 		init_fs_pin(&mnt->mnt_umount, drop_mountpoint);
+ 	}
+ 	return mnt;
+@@ -1062,6 +1059,9 @@ static void cleanup_mnt(struct mount *mnt)
+ 	if (unlikely(mnt->mnt_pins.first))
+ 		mnt_pin_kill(mnt);
+ 	fsnotify_vfsmount_delete(&mnt->mnt);
++#ifdef CONFIG_FSNOTIFY
++	fsnotify_connector_free(&mnt->mnt_fsnotify_marks);
++#endif
+ 	dput(mnt->mnt.mnt_root);
+ 	deactivate_super(mnt->mnt.mnt_sb);
+ 	mnt_free_id(mnt);
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 0378955136d1..3ebf768c694d 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -193,6 +193,7 @@ int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+ 	struct hlist_node *inode_node = NULL, *vfsmount_node = NULL;
+ 	struct fsnotify_mark *inode_mark = NULL, *vfsmount_mark = NULL;
+ 	struct fsnotify_group *inode_group, *vfsmount_group;
++	struct fsnotify_mark_connector *inode_conn, *vfsmount_conn;
+ 	struct mount *mnt;
+ 	int idx, ret = 0;
+ 	/* global tests shouldn't care about events on child only the specific event */
+@@ -210,8 +211,8 @@ int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+ 	 * SRCU because we have no references to any objects and do not
+ 	 * need SRCU to keep them "alive".
+ 	 */
+-	if (hlist_empty(&to_tell->i_fsnotify_marks) &&
+-	    (!mnt || hlist_empty(&mnt->mnt_fsnotify_marks)))
++	if (!to_tell->i_fsnotify_marks &&
++	    (!mnt || !mnt->mnt_fsnotify_marks))
+ 		return 0;
+ 	/*
+ 	 * if this is a modify event we may need to clear the ignored masks
+@@ -226,16 +227,24 @@ int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+ 	idx = srcu_read_lock(&fsnotify_mark_srcu);
+ 
+ 	if ((mask & FS_MODIFY) ||
+-	    (test_mask & to_tell->i_fsnotify_mask))
+-		inode_node = srcu_dereference(to_tell->i_fsnotify_marks.first,
+-					      &fsnotify_mark_srcu);
++	    (test_mask & to_tell->i_fsnotify_mask)) {
++		inode_conn = lockless_dereference(to_tell->i_fsnotify_marks);
++		if (inode_conn)
++			inode_node = srcu_dereference(inode_conn->list.first,
++						      &fsnotify_mark_srcu);
++	}
+ 
+ 	if (mnt && ((mask & FS_MODIFY) ||
+ 		    (test_mask & mnt->mnt_fsnotify_mask))) {
+-		vfsmount_node = srcu_dereference(mnt->mnt_fsnotify_marks.first,
+-						 &fsnotify_mark_srcu);
+-		inode_node = srcu_dereference(to_tell->i_fsnotify_marks.first,
+-					      &fsnotify_mark_srcu);
++		inode_conn = lockless_dereference(to_tell->i_fsnotify_marks);
++		if (inode_conn)
++			inode_node = srcu_dereference(inode_conn->list.first,
++						      &fsnotify_mark_srcu);
++		vfsmount_conn = lockless_dereference(mnt->mnt_fsnotify_marks);
++		if (vfsmount_conn)
++			vfsmount_node = srcu_dereference(
++						vfsmount_conn->list.first,
++						&fsnotify_mark_srcu);
+ 	}
+ 
+ 	/*
+@@ -293,6 +302,8 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(fsnotify);
+ 
++extern struct kmem_cache *fsnotify_mark_connector_cachep;
++
+ static __init int fsnotify_init(void)
+ {
+ 	int ret;
+@@ -303,6 +314,9 @@ static __init int fsnotify_init(void)
+ 	if (ret)
+ 		panic("initializing fsnotify_mark_srcu");
+ 
++	fsnotify_mark_connector_cachep = KMEM_CACHE(fsnotify_mark_connector,
++						    SLAB_PANIC);
++
+ 	return 0;
+ }
+ core_initcall(fsnotify_init);
+diff --git a/fs/notify/fsnotify.h b/fs/notify/fsnotify.h
+index 0a3bc2cf192c..eb64c59c9ad1 100644
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@ -15,7 +15,7 @@ extern void fsnotify_flush_notify(struct fsnotify_group *group);
+ extern struct srcu_struct fsnotify_mark_srcu;
+ 
+ /* Calculate mask of events for a list of marks */
+-extern u32 fsnotify_recalc_mask(struct hlist_head *head);
++extern u32 fsnotify_recalc_mask(struct fsnotify_mark_connector *conn);
+ 
+ /* compare two groups for sorting of marks lists */
+ extern int fsnotify_compare_groups(struct fsnotify_group *a,
+@@ -24,7 +24,7 @@ extern int fsnotify_compare_groups(struct fsnotify_group *a,
+ extern void fsnotify_set_inode_mark_mask_locked(struct fsnotify_mark *fsn_mark,
+ 						__u32 mask);
+ /* Add mark to a proper place in mark list */
+-extern int fsnotify_add_mark_list(struct hlist_head *head,
++extern int fsnotify_add_mark_list(struct fsnotify_mark_connector **connp,
+ 				  struct fsnotify_mark *mark,
+ 				  int allow_dups);
+ /* add a mark to an inode */
+@@ -41,19 +41,21 @@ extern void fsnotify_destroy_vfsmount_mark(struct fsnotify_mark *mark);
+ /* inode specific destruction of a mark */
+ extern void fsnotify_destroy_inode_mark(struct fsnotify_mark *mark);
+ /* Find mark belonging to given group in the list of marks */
+-extern struct fsnotify_mark *fsnotify_find_mark(struct hlist_head *head,
+-						struct fsnotify_group *group);
++extern struct fsnotify_mark *fsnotify_find_mark(
++					struct fsnotify_mark_connector *conn,
++					struct fsnotify_group *group);
+ /* Destroy all marks in the given list protected by 'lock' */
+-extern void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock);
++extern void fsnotify_destroy_marks(struct fsnotify_mark_connector *conn,
++				   spinlock_t *lock);
+ /* run the list of all marks associated with inode and destroy them */
+ static inline void fsnotify_clear_marks_by_inode(struct inode *inode)
+ {
+-	fsnotify_destroy_marks(&inode->i_fsnotify_marks, &inode->i_lock);
++	fsnotify_destroy_marks(inode->i_fsnotify_marks, &inode->i_lock);
+ }
+ /* run the list of all marks associated with vfsmount and destroy them */
+ static inline void fsnotify_clear_marks_by_mount(struct vfsmount *mnt)
+ {
+-	fsnotify_destroy_marks(&real_mount(mnt)->mnt_fsnotify_marks,
++	fsnotify_destroy_marks(real_mount(mnt)->mnt_fsnotify_marks,
+ 			       &mnt->mnt_root->d_lock);
+ }
+ /* prepare for freeing all marks associated with given group */
+diff --git a/fs/notify/inode_mark.c b/fs/notify/inode_mark.c
+index 1168d71dbf85..15c0044e07ed 100644
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@ -37,7 +37,7 @@
+ void fsnotify_recalc_inode_mask(struct inode *inode)
+ {
+ 	spin_lock(&inode->i_lock);
+-	inode->i_fsnotify_mask = fsnotify_recalc_mask(&inode->i_fsnotify_marks);
++	inode->i_fsnotify_mask = fsnotify_recalc_mask(inode->i_fsnotify_marks);
+ 	spin_unlock(&inode->i_lock);
+ 
+ 	__fsnotify_update_child_dentry_flags(inode);
+@@ -60,7 +60,7 @@ void fsnotify_destroy_inode_mark(struct fsnotify_mark *mark)
+ 	 * hold the inode->i_lock, so this is the perfect time to update the
+ 	 * inode->i_fsnotify_mask
+ 	 */
+-	inode->i_fsnotify_mask = fsnotify_recalc_mask(&inode->i_fsnotify_marks);
++	inode->i_fsnotify_mask = fsnotify_recalc_mask(inode->i_fsnotify_marks);
+ 	spin_unlock(&inode->i_lock);
+ }
+ 
+@@ -82,7 +82,7 @@ struct fsnotify_mark *fsnotify_find_inode_mark(struct fsnotify_group *group,
+ 	struct fsnotify_mark *mark;
+ 
+ 	spin_lock(&inode->i_lock);
+-	mark = fsnotify_find_mark(&inode->i_fsnotify_marks, group);
++	mark = fsnotify_find_mark(inode->i_fsnotify_marks, group);
+ 	spin_unlock(&inode->i_lock);
+ 
+ 	return mark;
+@@ -135,7 +135,7 @@ int fsnotify_add_inode_mark(struct fsnotify_mark *mark,
+ 	mark->inode = inode;
+ 	ret = fsnotify_add_mark_list(&inode->i_fsnotify_marks, mark,
+ 				     allow_dups);
+-	inode->i_fsnotify_mask = fsnotify_recalc_mask(&inode->i_fsnotify_marks);
++	inode->i_fsnotify_mask = fsnotify_recalc_mask(inode->i_fsnotify_marks);
+ 	spin_unlock(&inode->i_lock);
+ 
+ 	return ret;
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index 44836e539169..24b6191bd6c6 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -83,6 +83,8 @@
+ #define FSNOTIFY_REAPER_DELAY	(1)	/* 1 jiffy */
+ 
+ struct srcu_struct fsnotify_mark_srcu;
++struct kmem_cache *fsnotify_mark_connector_cachep;
++
+ static DEFINE_SPINLOCK(destroy_lock);
+ static LIST_HEAD(destroy_list);
+ 
+@@ -104,12 +106,15 @@ void fsnotify_put_mark(struct fsnotify_mark *mark)
+ }
+ 
+ /* Calculate mask of events for a list of marks */
+-u32 fsnotify_recalc_mask(struct hlist_head *head)
++u32 fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ {
+ 	u32 new_mask = 0;
+ 	struct fsnotify_mark *mark;
+ 
+-	hlist_for_each_entry(mark, head, obj_list)
++	if (!conn)
++		return 0;
++
++	hlist_for_each_entry(mark, &conn->list, obj_list)
+ 		new_mask |= mark->mask;
+ 	return new_mask;
+ }
+@@ -220,10 +225,14 @@ void fsnotify_destroy_mark(struct fsnotify_mark *mark,
+ 	fsnotify_free_mark(mark);
+ }
+ 
+-void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock)
++void fsnotify_destroy_marks(struct fsnotify_mark_connector *conn,
++			    spinlock_t *lock)
+ {
+ 	struct fsnotify_mark *mark;
+ 
++	if (!conn)
++		return;
++
+ 	while (1) {
+ 		/*
+ 		 * We have to be careful since we can race with e.g.
+@@ -233,11 +242,12 @@ void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock)
+ 		 * calling fsnotify_destroy_mark() more than once is fine.
+ 		 */
+ 		spin_lock(lock);
+-		if (hlist_empty(head)) {
++		if (hlist_empty(&conn->list)) {
+ 			spin_unlock(lock);
+ 			break;
+ 		}
+-		mark = hlist_entry(head->first, struct fsnotify_mark, obj_list);
++		mark = hlist_entry(conn->list.first, struct fsnotify_mark,
++				   obj_list);
+ 		/*
+ 		 * We don't update i_fsnotify_mask / mnt_fsnotify_mask here
+ 		 * since inode / mount is going away anyway. So just remove
+@@ -251,6 +261,14 @@ void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock)
+ 	}
+ }
+ 
++void fsnotify_connector_free(struct fsnotify_mark_connector **connp)
++{
++	if (*connp) {
++		kmem_cache_free(fsnotify_mark_connector_cachep, *connp);
++		*connp = NULL;
++	}
++}
++
+ void fsnotify_set_mark_mask_locked(struct fsnotify_mark *mark, __u32 mask)
+ {
+ 	assert_spin_locked(&mark->lock);
+@@ -304,21 +322,54 @@ int fsnotify_compare_groups(struct fsnotify_group *a, struct fsnotify_group *b)
+ 	return -1;
+ }
+ 
+-/* Add mark into proper place in given list of marks */
+-int fsnotify_add_mark_list(struct hlist_head *head, struct fsnotify_mark *mark,
+-			   int allow_dups)
++static int fsnotify_attach_connector_to_object(
++					struct fsnotify_mark_connector **connp)
++{
++	struct fsnotify_mark_connector *conn;
++
++	conn = kmem_cache_alloc(fsnotify_mark_connector_cachep, GFP_ATOMIC);
++	if (!conn)
++		return -ENOMEM;
++	INIT_HLIST_HEAD(&conn->list);
++	/*
++	 * Make sure 'conn' initialization is visible. Matches
++	 * lockless_dereference() in fsnotify().
++	 */
++	smp_wmb();
++	*connp = conn;
++
++	return 0;
++}
++
++/*
++ * Add mark into proper place in given list of marks. These marks may be used
++ * for the fsnotify backend to determine which event types should be delivered
++ * to which group and for which inodes. These marks are ordered according to
++ * priority, highest number first, and then by the group's location in memory.
++ */
++int fsnotify_add_mark_list(struct fsnotify_mark_connector **connp,
++			   struct fsnotify_mark *mark, int allow_dups)
+ {
+ 	struct fsnotify_mark *lmark, *last = NULL;
++	struct fsnotify_mark_connector *conn;
+ 	int cmp;
++	int err;
++
++	if (!*connp) {
++		err = fsnotify_attach_connector_to_object(connp);
++		if (err)
++			return err;
++	}
++	conn = *connp;
+ 
+ 	/* is mark the first mark? */
+-	if (hlist_empty(head)) {
+-		hlist_add_head_rcu(&mark->obj_list, head);
++	if (hlist_empty(&conn->list)) {
++		hlist_add_head_rcu(&mark->obj_list, &conn->list);
+ 		return 0;
+ 	}
+ 
+ 	/* should mark be in the middle of the current list? */
+-	hlist_for_each_entry(lmark, head, obj_list) {
++	hlist_for_each_entry(lmark, &conn->list, obj_list) {
+ 		last = lmark;
+ 
+ 		if ((lmark->group == mark->group) && !allow_dups)
+@@ -419,12 +470,15 @@ int fsnotify_add_mark(struct fsnotify_mark *mark, struct fsnotify_group *group,
+  * Given a list of marks, find the mark associated with given group. If found
+  * take a reference to that mark and return it, else return NULL.
+  */
+-struct fsnotify_mark *fsnotify_find_mark(struct hlist_head *head,
++struct fsnotify_mark *fsnotify_find_mark(struct fsnotify_mark_connector *conn,
+ 					 struct fsnotify_group *group)
+ {
+ 	struct fsnotify_mark *mark;
+ 
+-	hlist_for_each_entry(mark, head, obj_list) {
++	if (!conn)
++		return NULL;
++
++	hlist_for_each_entry(mark, &conn->list, obj_list) {
+ 		if (mark->group == group) {
+ 			fsnotify_get_mark(mark);
+ 			return mark;
+diff --git a/fs/notify/vfsmount_mark.c b/fs/notify/vfsmount_mark.c
+index a8fcab68faef..28815d5cba7c 100644
+--- a/fs/notify/vfsmount_mark.c
++++ b/fs/notify/vfsmount_mark.c
+@@ -43,7 +43,7 @@ void fsnotify_recalc_vfsmount_mask(struct vfsmount *mnt)
+ 	struct mount *m = real_mount(mnt);
+ 
+ 	spin_lock(&mnt->mnt_root->d_lock);
+-	m->mnt_fsnotify_mask = fsnotify_recalc_mask(&m->mnt_fsnotify_marks);
++	m->mnt_fsnotify_mask = fsnotify_recalc_mask(m->mnt_fsnotify_marks);
+ 	spin_unlock(&mnt->mnt_root->d_lock);
+ }
+ 
+@@ -60,7 +60,7 @@ void fsnotify_destroy_vfsmount_mark(struct fsnotify_mark *mark)
+ 	hlist_del_init_rcu(&mark->obj_list);
+ 	mark->mnt = NULL;
+ 
+-	m->mnt_fsnotify_mask = fsnotify_recalc_mask(&m->mnt_fsnotify_marks);
++	m->mnt_fsnotify_mask = fsnotify_recalc_mask(m->mnt_fsnotify_marks);
+ 	spin_unlock(&mnt->mnt_root->d_lock);
+ }
+ 
+@@ -75,7 +75,7 @@ struct fsnotify_mark *fsnotify_find_vfsmount_mark(struct fsnotify_group *group,
+ 	struct fsnotify_mark *mark;
+ 
+ 	spin_lock(&mnt->mnt_root->d_lock);
+-	mark = fsnotify_find_mark(&m->mnt_fsnotify_marks, group);
++	mark = fsnotify_find_mark(m->mnt_fsnotify_marks, group);
+ 	spin_unlock(&mnt->mnt_root->d_lock);
+ 
+ 	return mark;
+@@ -101,7 +101,7 @@ int fsnotify_add_vfsmount_mark(struct fsnotify_mark *mark,
+ 	spin_lock(&mnt->mnt_root->d_lock);
+ 	mark->mnt = mnt;
+ 	ret = fsnotify_add_mark_list(&m->mnt_fsnotify_marks, mark, allow_dups);
+-	m->mnt_fsnotify_mask = fsnotify_recalc_mask(&m->mnt_fsnotify_marks);
++	m->mnt_fsnotify_mask = fsnotify_recalc_mask(m->mnt_fsnotify_marks);
+ 	spin_unlock(&mnt->mnt_root->d_lock);
+ 
+ 	return ret;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 4086333a0708..4f65805db4dc 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -576,6 +576,8 @@ struct posix_acl;
+ #define IOP_LOOKUP	0x0002
+ #define IOP_NOFOLLOW	0x0004
+ 
++struct fsnotify_mark_connector;
++
+ /*
+  * Keep mostly read-only and often accessed (especially for
+  * the RCU path lookup and 'stat' data) fields at the beginning
+@@ -663,7 +665,7 @@ struct inode {
+ 
+ #ifdef CONFIG_FSNOTIFY
+ 	__u32			i_fsnotify_mask; /* all events this inode cares about */
+-	struct hlist_head	i_fsnotify_marks;
++	struct fsnotify_mark_connector	*i_fsnotify_marks;
+ #endif
+ 
+ #ifdef CONFIG_IMA
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index 0256909191e5..56bc9d051050 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -194,6 +194,15 @@ struct fsnotify_group {
+ #define FSNOTIFY_EVENT_PATH	1
+ #define FSNOTIFY_EVENT_INODE	2
+ 
++/*
++ * Inode / vfsmount point to this structure which tracks all marks attached to
++ * the inode / vfsmount. The structure is freed only when inode / vfsmount gets
++ * freed.
++ */
++struct fsnotify_mark_connector {
++	struct hlist_head list;
++};
++
+ /*
+  * A mark is simply an object attached to an in core inode which allows an
+  * fsnotify listener to indicate they are either no longer interested in events
+@@ -362,6 +371,7 @@ extern void fsnotify_clear_vfsmount_marks_by_group(struct fsnotify_group *group)
+ extern void fsnotify_clear_inode_marks_by_group(struct fsnotify_group *group);
+ /* run all the marks in a group, and clear all of the marks where mark->flags & flags is true*/
+ extern void fsnotify_clear_marks_by_group_flags(struct fsnotify_group *group, unsigned int flags);
++extern void fsnotify_connector_free(struct fsnotify_mark_connector **connp);
+ extern void fsnotify_get_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_put_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_unmount_inodes(struct list_head *list);
+* Unmerged path kernel/auditsc.c
