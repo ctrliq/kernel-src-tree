@@ -1,0 +1,192 @@
+net/mlx5e: Fix erroneous freeing of encap header buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Fix erroneous freeing of encap header buffer (Kamal Heib) [1456694]
+Rebuild_FUZZ: 96.23%
+commit-author Paul Blakey <paulb@mellanox.com>
+commit ace743214ea205c7d433562c5fa24e33bdfda7ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ace74321.failed
+
+In case the neighbour for the tunnel destination isn't valid,
+we send a neighbour update request but we free the encap
+header buffer. This is wrong, because we still need it for
+allocating a HW encap entry once the neighbour is available.
+
+Fix that by skipping freeing it if we wait for neighbour.
+
+Fixes: 232c001398ae ('net/mlx5e: Add support to neighbour update flow')
+	Signed-off-by: Paul Blakey <paulb@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit ace743214ea205c7d433562c5fa24e33bdfda7ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 2a258dca3413,4e2fc016bdd6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -1374,25 -1564,38 +1374,36 @@@ static int mlx5e_create_encap_header_ip
+  		break;
+  	default:
+  		err = -EOPNOTSUPP;
+- 		goto out;
++ 		goto free_encap;
+  	}
+ -	fl4.flowi4_tos = tun_key->tos;
+  	fl4.daddr = tun_key->u.ipv4.dst;
+ -	fl4.saddr = tun_key->u.ipv4.src;
+  
+ -	err = mlx5e_route_lookup_ipv4(priv, mirred_dev, &out_dev,
+ -				      &fl4, &n, &ttl);
+ +	err = mlx5e_route_lookup_ipv4(priv, mirred_dev, out_dev,
+ +				      &fl4, &n, &saddr, &ttl);
+  	if (err)
+- 		goto out;
++ 		goto free_encap;
+  
+ -	/* used by mlx5e_detach_encap to lookup a neigh hash table
+ -	 * entry in the neigh hash table when a user deletes a rule
+ -	 */
+ -	e->m_neigh.dev = n->dev;
+ -	e->m_neigh.family = n->ops->family;
+ -	memcpy(&e->m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
+ -	e->out_dev = out_dev;
+ +	e->n = n;
+ +	e->out_dev = *out_dev;
+  
+++<<<<<<< HEAD
+ +	if (!(n->nud_state & NUD_VALID)) {
+ +		pr_warn("%s: can't offload, neighbour to %pI4 invalid\n", __func__, &fl4.daddr);
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+++=======
++ 	/* It's importent to add the neigh to the hash table before checking
++ 	 * the neigh validity state. So if we'll get a notification, in case the
++ 	 * neigh changes it's validity state, we would find the relevant neigh
++ 	 * in the hash.
++ 	 */
++ 	err = mlx5e_rep_encap_entry_attach(netdev_priv(out_dev), e);
++ 	if (err)
++ 		goto free_encap;
+++>>>>>>> ace743214ea2 (net/mlx5e: Fix erroneous freeing of encap header buffer)
+  
+ -	read_lock_bh(&n->lock);
+ -	nud_state = n->nud_state;
+ -	ether_addr_copy(e->h_dest, n->ha);
+ -	read_unlock_bh(&n->lock);
+ +	neigh_ha_snapshot(e->h_dest, n, *out_dev);
+  
+  	switch (e->tunnel_type) {
+  	case MLX5_HEADER_TYPE_VXLAN:
+@@@ -1408,11 -1619,22 +1419,29 @@@
+  	}
+  
+  	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
+++<<<<<<< HEAD
+ +			       encap_size, encap_header, &e->encap_id);
+ +out:
+ +	if (err && n)
+++=======
++ 			       ipv4_encap_size, encap_header, &e->encap_id);
++ 	if (err)
++ 		goto destroy_neigh_entry;
++ 
++ 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
++ 	mlx5e_rep_queue_neigh_stats_work(netdev_priv(out_dev));
++ 	neigh_release(n);
++ 	return err;
++ 
++ destroy_neigh_entry:
++ 	mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
++ free_encap:
++ 	kfree(encap_header);
++ out:
++ 	if (n)
+++>>>>>>> ace743214ea2 (net/mlx5e: Fix erroneous freeing of encap header buffer)
+  		neigh_release(n);
+ +	kfree(encap_header);
+  	return err;
+  }
+  
+@@@ -1454,21 -1676,32 +1483,40 @@@ static int mlx5e_create_encap_header_ip
+  	fl6.daddr = tun_key->u.ipv6.dst;
+  	fl6.saddr = tun_key->u.ipv6.src;
+  
+ -	err = mlx5e_route_lookup_ipv6(priv, mirred_dev, &out_dev,
+ +	err = mlx5e_route_lookup_ipv6(priv, mirred_dev, out_dev,
+  				      &fl6, &n, &ttl);
+  	if (err)
+- 		goto out;
++ 		goto free_encap;
+  
+++<<<<<<< HEAD
+ +	if (!(n->nud_state & NUD_VALID)) {
+ +		pr_warn("%s: can't offload, neighbour to %pI6 invalid\n", __func__, &fl6.daddr);
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+++=======
++ 	/* used by mlx5e_detach_encap to lookup a neigh hash table
++ 	 * entry in the neigh hash table when a user deletes a rule
++ 	 */
++ 	e->m_neigh.dev = n->dev;
++ 	e->m_neigh.family = n->ops->family;
++ 	memcpy(&e->m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
++ 	e->out_dev = out_dev;
++ 
++ 	/* It's importent to add the neigh to the hash table before checking
++ 	 * the neigh validity state. So if we'll get a notification, in case the
++ 	 * neigh changes it's validity state, we would find the relevant neigh
++ 	 * in the hash.
++ 	 */
++ 	err = mlx5e_rep_encap_entry_attach(netdev_priv(out_dev), e);
++ 	if (err)
++ 		goto free_encap;
+++>>>>>>> ace743214ea2 (net/mlx5e: Fix erroneous freeing of encap header buffer)
+ +
+ +	e->n = n;
+ +	e->out_dev = *out_dev;
+  
+ -	read_lock_bh(&n->lock);
+ -	nud_state = n->nud_state;
+ -	ether_addr_copy(e->h_dest, n->ha);
+ -	read_unlock_bh(&n->lock);
+ +	neigh_ha_snapshot(e->h_dest, n, *out_dev);
+  
+  	switch (e->tunnel_type) {
+  	case MLX5_HEADER_TYPE_VXLAN:
+@@@ -1485,10 -1727,21 +1533,27 @@@
+  
+  	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
+  			       ipv6_encap_size, encap_header, &e->encap_id);
+++<<<<<<< HEAD
+ +out:
+ +	if (err && n)
+++=======
++ 	if (err)
++ 		goto destroy_neigh_entry;
++ 
++ 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
++ 	mlx5e_rep_queue_neigh_stats_work(netdev_priv(out_dev));
++ 	neigh_release(n);
++ 	return err;
++ 
++ destroy_neigh_entry:
++ 	mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
++ free_encap:
++ 	kfree(encap_header);
++ out:
++ 	if (n)
+++>>>>>>> ace743214ea2 (net/mlx5e: Fix erroneous freeing of encap header buffer)
+  		neigh_release(n);
+ +	kfree(encap_header);
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
