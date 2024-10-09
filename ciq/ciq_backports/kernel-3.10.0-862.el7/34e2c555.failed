@@ -1,0 +1,836 @@
+cpufreq: Add mechanism for registering utilization update callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 34e2c555f3e13c90e9284e23d00f03be8a6e06c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/34e2c555.failed
+
+Introduce a mechanism by which parts of the cpufreq subsystem
+("setpolicy" drivers or the core) can register callbacks to be
+executed from cpufreq_update_util() which is invoked by the
+scheduler's update_load_avg() on CPU utilization changes.
+
+This allows the "setpolicy" drivers to dispense with their timers
+and do all of the computations they need and frequency/voltage
+adjustments in the update_load_avg() code path, among other things.
+
+The update_load_avg() changes were suggested by Peter Zijlstra.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 34e2c555f3e13c90e9284e23d00f03be8a6e06c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/cpufreq.h
+#	kernel/sched/fair.c
+diff --cc include/linux/cpufreq.h
+index 6c9a308dec37,704d85bf7242..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -162,96 -126,89 +162,157 @@@ struct cpufreq_policy 
+  #define CPUFREQ_SHARED_TYPE_ALL	 (2) /* All dependent CPUs should set freq */
+  #define CPUFREQ_SHARED_TYPE_ANY	 (3) /* Freq can be set from any dependent CPU*/
+  
+ -#ifdef CONFIG_CPU_FREQ
+ -struct cpufreq_policy *cpufreq_cpu_get_raw(unsigned int cpu);
+ -struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu);
+ -void cpufreq_cpu_put(struct cpufreq_policy *policy);
+ -#else
+ -static inline struct cpufreq_policy *cpufreq_cpu_get_raw(unsigned int cpu)
+ +static inline bool policy_is_shared(struct cpufreq_policy *policy)
+  {
+ -	return NULL;
+ +	return cpumask_weight(policy->cpus) > 1;
+  }
+ -static inline struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu)
+ +
+ +/******************** cpufreq transition notifiers *******************/
+ +
+ +#define CPUFREQ_PRECHANGE	(0)
+ +#define CPUFREQ_POSTCHANGE	(1)
+ +
+ +struct cpufreq_freqs {
+ +	unsigned int cpu;	/* cpu nr */
+ +	unsigned int old;
+ +	unsigned int new;
+ +	u8 flags;		/* flags of cpufreq_driver, see below. */
+ +};
+ +
+ +/**
+ + * cpufreq_scale - "old * mult / div" calculation for large values (32-bit-arch
+ + * safe)
+ + * @old:   old value
+ + * @div:   divisor
+ + * @mult:  multiplier
+ + *
+ + *
+ + * new = old * mult / div
+ + */
+ +static inline unsigned long cpufreq_scale(unsigned long old, u_int div,
+ +		u_int mult)
+  {
+ -	return NULL;
+ -}
+ -static inline void cpufreq_cpu_put(struct cpufreq_policy *policy) { }
+ +#if BITS_PER_LONG == 32
+ +
+ +	u64 result = ((u64) old) * ((u64) mult);
+ +	do_div(result, div);
+ +	return (unsigned long) result;
+ +
+ +#elif BITS_PER_LONG == 64
+ +
+ +	unsigned long result = old * ((u64) mult);
+ +	result /= div;
+ +	return result;
+ +
+  #endif
+ +};
+  
+ -static inline bool policy_is_shared(struct cpufreq_policy *policy)
+ -{
+ -	return cpumask_weight(policy->cpus) > 1;
+ -}
+ +/*********************************************************************
+ + *                          CPUFREQ GOVERNORS                        *
+ + *********************************************************************/
+  
+ -/* /sys/devices/system/cpu/cpufreq: entry point for global variables */
+ -extern struct kobject *cpufreq_global_kobject;
+ +#define CPUFREQ_GOV_START	1
+ +#define CPUFREQ_GOV_STOP	2
+ +#define CPUFREQ_GOV_LIMITS	3
+ +#define CPUFREQ_GOV_POLICY_INIT	4
+ +#define CPUFREQ_GOV_POLICY_EXIT	5
+ +
+ +struct cpufreq_governor {
+ +	char	name[CPUFREQ_NAME_LEN];
+ +	int	initialized;
+ +	int	(*governor)	(struct cpufreq_policy *policy,
+ +				 unsigned int event);
+ +	ssize_t	(*show_setspeed)	(struct cpufreq_policy *policy,
+ +					 char *buf);
+ +	int	(*store_setspeed)	(struct cpufreq_policy *policy,
+ +					 unsigned int freq);
+ +	unsigned int max_transition_latency; /* HW must be able to switch to
+ +			next freq faster than this value in nano secs or we
+ +			will fallback to performance governor */
+ +	struct list_head	governor_list;
+ +	struct module		*owner;
+ +};
+ +
+ +/*
+ + * Pass a target to the cpufreq driver.
+ + */
+ +extern int cpufreq_driver_target(struct cpufreq_policy *policy,
+ +				 unsigned int target_freq,
+ +				 unsigned int relation);
+ +extern int __cpufreq_driver_target(struct cpufreq_policy *policy,
+ +				   unsigned int target_freq,
+ +				   unsigned int relation);
+ +int cpufreq_register_governor(struct cpufreq_governor *governor);
+ +void cpufreq_unregister_governor(struct cpufreq_governor *governor);
+  
+  #ifdef CONFIG_CPU_FREQ
+++<<<<<<< HEAD
+ +void cpufreq_suspend(void);
+ +void cpufreq_resume(void);
+ +int cpufreq_generic_suspend(struct cpufreq_policy *policy);
+ +#else
+ +static inline void cpufreq_suspend(void) {}
+ +static inline void cpufreq_resume(void) {}
+++=======
++ void cpufreq_update_util(u64 time, unsigned long util, unsigned long max);
++ 
++ /**
++  * cpufreq_trigger_update - Trigger CPU performance state evaluation if needed.
++  * @time: Current time.
++  *
++  * The way cpufreq is currently arranged requires it to evaluate the CPU
++  * performance state (frequency/voltage) on a regular basis to prevent it from
++  * being stuck in a completely inadequate performance level for too long.
++  * That is not guaranteed to happen if the updates are only triggered from CFS,
++  * though, because they may not be coming in if RT or deadline tasks are active
++  * all the time (or there are RT and DL tasks only).
++  *
++  * As a workaround for that issue, this function is called by the RT and DL
++  * sched classes to trigger extra cpufreq updates to prevent it from stalling,
++  * but that really is a band-aid.  Going forward it should be replaced with
++  * solutions targeted more specifically at RT and DL tasks.
++  */
++ static inline void cpufreq_trigger_update(u64 time)
++ {
++ 	cpufreq_update_util(time, ULONG_MAX, 0);
++ }
++ 
++ struct update_util_data {
++ 	void (*func)(struct update_util_data *data,
++ 		     u64 time, unsigned long util, unsigned long max);
++ };
++ 
++ void cpufreq_set_update_util_data(int cpu, struct update_util_data *data);
++ 
++ unsigned int cpufreq_get(unsigned int cpu);
++ unsigned int cpufreq_quick_get(unsigned int cpu);
++ unsigned int cpufreq_quick_get_max(unsigned int cpu);
++ void disable_cpufreq(void);
++ 
++ u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy);
++ int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu);
++ int cpufreq_update_policy(unsigned int cpu);
++ bool have_governor_per_policy(void);
++ struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
++ #else
++ static inline void cpufreq_update_util(u64 time, unsigned long util,
++ 				       unsigned long max) {}
++ static inline void cpufreq_trigger_update(u64 time) {}
++ 
++ static inline unsigned int cpufreq_get(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ static inline unsigned int cpufreq_quick_get(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ static inline unsigned int cpufreq_quick_get_max(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ static inline void disable_cpufreq(void) { }
+++>>>>>>> 34e2c555f3e1 (cpufreq: Add mechanism for registering utilization update callbacks)
+  #endif
+  
+  /*********************************************************************
+diff --cc kernel/sched/fair.c
+index 38afc41c3538,e2987a7e489d..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -2383,282 -2738,284 +2383,431 @@@ static inline void __update_cfs_rq_tg_l
+  }
+  
+  /*
+ - * Called within set_task_rq() right before setting a task's cpu. The
+ - * caller only guarantees p->pi_lock is held; no other assumptions,
+ - * including the state of rq->lock, should be made.
+ + * Aggregate cfs_rq runnable averages into an equivalent task_group
+ + * representation for computing load contributions.
+   */
+ -void set_task_rq_fair(struct sched_entity *se,
+ -		      struct cfs_rq *prev, struct cfs_rq *next)
+ +static inline void __update_tg_runnable_avg(struct sched_avg *sa,
+ +						  struct cfs_rq *cfs_rq)
+  {
+ -	if (!sched_feat(ATTACH_AGE_LOAD))
+ -		return;
+ +	struct task_group *tg = cfs_rq->tg;
+ +	long contrib;
+  
+  	/*
+ -	 * We are supposed to update the task to "current" time, then its up to
+ -	 * date and ready to go to new CPU/cfs_rq. But we have difficulty in
+ -	 * getting what current time is, so simply throw away the out-of-date
+ -	 * time. This will result in the wakee task is less decayed, but giving
+ -	 * the wakee more load sounds not bad.
+ +	 * No need to update runnable_avg for root_task_group as it is not used.
+  	 */
+ -	if (se->avg.last_update_time && prev) {
+ -		u64 p_last_update_time;
+ -		u64 n_last_update_time;
+ +	if (tg == &root_task_group)
+ +		return;
+  
+ -#ifndef CONFIG_64BIT
+ -		u64 p_last_update_time_copy;
+ -		u64 n_last_update_time_copy;
+ +	/* The fraction of a cpu used by this cfs_rq */
+ +	contrib = div_u64(sa->runnable_avg_sum << NICE_0_SHIFT,
+ +			  sa->runnable_avg_period + 1);
+ +	contrib -= cfs_rq->tg_runnable_contrib;
+  
+ -		do {
+ -			p_last_update_time_copy = prev->load_last_update_time_copy;
+ -			n_last_update_time_copy = next->load_last_update_time_copy;
+ +	if (abs(contrib) > cfs_rq->tg_runnable_contrib / 64) {
+ +		atomic_add(contrib, &tg->runnable_avg);
+ +		cfs_rq->tg_runnable_contrib += contrib;
+ +	}
+ +}
+  
+ -			smp_rmb();
+ +static inline void __update_group_entity_contrib(struct sched_entity *se)
+ +{
+ +	struct cfs_rq *cfs_rq = group_cfs_rq(se);
+ +	struct task_group *tg = cfs_rq->tg;
+ +	int runnable_avg;
+  
+ -			p_last_update_time = prev->avg.last_update_time;
+ -			n_last_update_time = next->avg.last_update_time;
+ +	u64 contrib;
+  
+ -		} while (p_last_update_time != p_last_update_time_copy ||
+ -			 n_last_update_time != n_last_update_time_copy);
+ -#else
+ -		p_last_update_time = prev->avg.last_update_time;
+ -		n_last_update_time = next->avg.last_update_time;
+ -#endif
+ -		__update_load_avg(p_last_update_time, cpu_of(rq_of(prev)),
+ -				  &se->avg, 0, 0, NULL);
+ -		se->avg.last_update_time = n_last_update_time;
+ +	contrib = cfs_rq->tg_load_contrib * tg->shares;
+ +	se->avg.load_avg_contrib = div64_u64(contrib,
+ +					     atomic64_read(&tg->load_avg) + 1);
+ +
+ +	/*
+ +	 * For group entities we need to compute a correction term in the case
+ +	 * that they are consuming <1 cpu so that we would contribute the same
+ +	 * load as a task of equal weight.
+ +	 *
+ +	 * Explicitly co-ordinating this measurement would be expensive, but
+ +	 * fortunately the sum of each cpus contribution forms a usable
+ +	 * lower-bound on the true value.
+ +	 *
+ +	 * Consider the aggregate of 2 contributions.  Either they are disjoint
+ +	 * (and the sum represents true value) or they are disjoint and we are
+ +	 * understating by the aggregate of their overlap.
+ +	 *
+ +	 * Extending this to N cpus, for a given overlap, the maximum amount we
+ +	 * understand is then n_i(n_i+1)/2 * w_i where n_i is the number of
+ +	 * cpus that overlap for this interval and w_i is the interval width.
+ +	 *
+ +	 * On a small machine; the first term is well-bounded which bounds the
+ +	 * total error since w_i is a subset of the period.  Whereas on a
+ +	 * larger machine, while this first term can be larger, if w_i is the
+ +	 * of consequential size guaranteed to see n_i*w_i quickly converge to
+ +	 * our upper bound of 1-cpu.
+ +	 */
+ +	runnable_avg = atomic_read(&tg->runnable_avg);
+ +	if (runnable_avg < NICE_0_LOAD) {
+ +		se->avg.load_avg_contrib *= runnable_avg;
+ +		se->avg.load_avg_contrib >>= NICE_0_SHIFT;
+  	}
+  }
+ -#else /* CONFIG_FAIR_GROUP_SCHED */
+ -static inline void update_tg_load_avg(struct cfs_rq *cfs_rq, int force) {}
+ -#endif /* CONFIG_FAIR_GROUP_SCHED */
+ -
+ -static inline u64 cfs_rq_clock_task(struct cfs_rq *cfs_rq);
+ +#else
+ +static inline void __update_cfs_rq_tg_load_contrib(struct cfs_rq *cfs_rq,
+ +						 int force_update) {}
+ +static inline void __update_tg_runnable_avg(struct sched_avg *sa,
+ +						  struct cfs_rq *cfs_rq) {}
+ +static inline void __update_group_entity_contrib(struct sched_entity *se) {}
+ +#endif
+  
+ -/* Group cfs_rq's load_avg is used for task_h_load and update_cfs_share */
+ -static inline int update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
+ +static inline void __update_task_entity_contrib(struct sched_entity *se)
+  {
+ -	struct sched_avg *sa = &cfs_rq->avg;
+ -	int decayed, removed = 0;
+ +	u32 contrib;
+  
+ -	if (atomic_long_read(&cfs_rq->removed_load_avg)) {
+ -		s64 r = atomic_long_xchg(&cfs_rq->removed_load_avg, 0);
+ -		sa->load_avg = max_t(long, sa->load_avg - r, 0);
+ -		sa->load_sum = max_t(s64, sa->load_sum - r * LOAD_AVG_MAX, 0);
+ -		removed = 1;
+ -	}
+ +	/* avoid overflowing a 32-bit type w/ SCHED_LOAD_SCALE */
+ +	contrib = se->avg.runnable_avg_sum * scale_load_down(se->load.weight);
+ +	contrib /= (se->avg.runnable_avg_period + 1);
+ +	se->avg.load_avg_contrib = scale_load(contrib);
+ +}
+  
+ -	if (atomic_long_read(&cfs_rq->removed_util_avg)) {
+ -		long r = atomic_long_xchg(&cfs_rq->removed_util_avg, 0);
+ -		sa->util_avg = max_t(long, sa->util_avg - r, 0);
+ -		sa->util_sum = max_t(s32, sa->util_sum - r * LOAD_AVG_MAX, 0);
+ -	}
+ +/* Compute the current contribution to load_avg by se, return any delta */
+ +static long __update_entity_load_avg_contrib(struct sched_entity *se)
+ +{
+ +	long old_contrib = se->avg.load_avg_contrib;
+  
+ -	decayed = __update_load_avg(now, cpu_of(rq_of(cfs_rq)), sa,
+ -		scale_load_down(cfs_rq->load.weight), cfs_rq->curr != NULL, cfs_rq);
+ +	if (entity_is_task(se)) {
+ +		__update_task_entity_contrib(se);
+ +	} else {
+ +		__update_tg_runnable_avg(&se->avg, group_cfs_rq(se));
+ +		__update_group_entity_contrib(se);
+ +	}
+  
+ -#ifndef CONFIG_64BIT
+ -	smp_wmb();
+ -	cfs_rq->load_last_update_time_copy = sa->last_update_time;
+ -#endif
+ +	return se->avg.load_avg_contrib - old_contrib;
+ +}
+  
+ -	return decayed || removed;
+ +static inline void subtract_blocked_load_contrib(struct cfs_rq *cfs_rq,
+ +						 long load_contrib)
+ +{
+ +	if (likely(load_contrib < cfs_rq->blocked_load_avg))
+ +		cfs_rq->blocked_load_avg -= load_contrib;
+ +	else
+ +		cfs_rq->blocked_load_avg = 0;
+  }
+  
+ -/* Update task and its cfs_rq load average */
+ -static inline void update_load_avg(struct sched_entity *se, int update_tg)
+ +static inline u64 cfs_rq_clock_task(struct cfs_rq *cfs_rq);
+ +
+ +/* Update a sched_entity's runnable average */
+ +static inline void update_entity_load_avg(struct sched_entity *se,
+ +					  int update_cfs_rq)
+  {
+  	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+++<<<<<<< HEAD
+ +	long contrib_delta;
+ +	u64 now;
+++=======
++ 	u64 now = cfs_rq_clock_task(cfs_rq);
++ 	struct rq *rq = rq_of(cfs_rq);
++ 	int cpu = cpu_of(rq);
+++>>>>>>> 34e2c555f3e1 (cpufreq: Add mechanism for registering utilization update callbacks)
+  
+  	/*
+ -	 * Track task load average for carrying it to new CPU after migrated, and
+ -	 * track group sched_entity load average for task_h_load calc in migration
+ +	 * For a group entity we need to use their owned cfs_rq_clock_task() in
+ +	 * case they are the parent of a throttled hierarchy.
+  	 */
+ -	__update_load_avg(now, cpu, &se->avg,
+ -			  se->on_rq * scale_load_down(se->load.weight),
+ -			  cfs_rq->curr == se, NULL);
+ +	if (entity_is_task(se))
+ +		now = cfs_rq_clock_task(cfs_rq);
+ +	else
+ +		now = cfs_rq_clock_task(group_cfs_rq(se));
+  
+++<<<<<<< HEAD
+ +	if (!__update_entity_runnable_avg(now, &se->avg, se->on_rq))
+++=======
++ 	if (update_cfs_rq_load_avg(now, cfs_rq) && update_tg)
++ 		update_tg_load_avg(cfs_rq, 0);
++ 
++ 	if (cpu == smp_processor_id() && &rq->cfs == cfs_rq) {
++ 		unsigned long max = rq->cpu_capacity_orig;
++ 
++ 		/*
++ 		 * There are a few boundary cases this might miss but it should
++ 		 * get called often enough that that should (hopefully) not be
++ 		 * a real problem -- added to that it only calls on the local
++ 		 * CPU, so if we enqueue remotely we'll miss an update, but
++ 		 * the next tick/schedule should update.
++ 		 *
++ 		 * It will not get called when we go idle, because the idle
++ 		 * thread is a different class (!fair), nor will the utilization
++ 		 * number include things like RT tasks.
++ 		 *
++ 		 * As is, the util number is not freq-invariant (we'd have to
++ 		 * implement arch_scale_freq_capacity() for that).
++ 		 *
++ 		 * See cpu_util().
++ 		 */
++ 		cpufreq_update_util(rq_clock(rq),
++ 				    min(cfs_rq->avg.util_avg, max), max);
++ 	}
++ }
++ 
++ static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
++ {
++ 	if (!sched_feat(ATTACH_AGE_LOAD))
++ 		goto skip_aging;
++ 
++ 	/*
++ 	 * If we got migrated (either between CPUs or between cgroups) we'll
++ 	 * have aged the average right before clearing @last_update_time.
++ 	 */
++ 	if (se->avg.last_update_time) {
++ 		__update_load_avg(cfs_rq->avg.last_update_time, cpu_of(rq_of(cfs_rq)),
++ 				  &se->avg, 0, 0, NULL);
++ 
++ 		/*
++ 		 * XXX: we could have just aged the entire load away if we've been
++ 		 * absent from the fair class for too long.
++ 		 */
++ 	}
++ 
++ skip_aging:
++ 	se->avg.last_update_time = cfs_rq->avg.last_update_time;
++ 	cfs_rq->avg.load_avg += se->avg.load_avg;
++ 	cfs_rq->avg.load_sum += se->avg.load_sum;
++ 	cfs_rq->avg.util_avg += se->avg.util_avg;
++ 	cfs_rq->avg.util_sum += se->avg.util_sum;
++ }
++ 
++ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
++ {
++ 	__update_load_avg(cfs_rq->avg.last_update_time, cpu_of(rq_of(cfs_rq)),
++ 			  &se->avg, se->on_rq * scale_load_down(se->load.weight),
++ 			  cfs_rq->curr == se, NULL);
++ 
++ 	cfs_rq->avg.load_avg = max_t(long, cfs_rq->avg.load_avg - se->avg.load_avg, 0);
++ 	cfs_rq->avg.load_sum = max_t(s64,  cfs_rq->avg.load_sum - se->avg.load_sum, 0);
++ 	cfs_rq->avg.util_avg = max_t(long, cfs_rq->avg.util_avg - se->avg.util_avg, 0);
++ 	cfs_rq->avg.util_sum = max_t(s32,  cfs_rq->avg.util_sum - se->avg.util_sum, 0);
++ }
++ 
++ /* Add the load generated by se into cfs_rq's load average */
++ static inline void
++ enqueue_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
++ {
++ 	struct sched_avg *sa = &se->avg;
++ 	u64 now = cfs_rq_clock_task(cfs_rq);
++ 	int migrated, decayed;
++ 
++ 	migrated = !sa->last_update_time;
++ 	if (!migrated) {
++ 		__update_load_avg(now, cpu_of(rq_of(cfs_rq)), sa,
++ 			se->on_rq * scale_load_down(se->load.weight),
++ 			cfs_rq->curr == se, NULL);
++ 	}
++ 
++ 	decayed = update_cfs_rq_load_avg(now, cfs_rq);
++ 
++ 	cfs_rq->runnable_load_avg += sa->load_avg;
++ 	cfs_rq->runnable_load_sum += sa->load_sum;
++ 
++ 	if (migrated)
++ 		attach_entity_load_avg(cfs_rq, se);
++ 
++ 	if (decayed || migrated)
++ 		update_tg_load_avg(cfs_rq, 0);
++ }
++ 
++ /* Remove the runnable load generated by se from cfs_rq's runnable load average */
++ static inline void
++ dequeue_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
++ {
++ 	update_load_avg(se, 1);
++ 
++ 	cfs_rq->runnable_load_avg =
++ 		max_t(long, cfs_rq->runnable_load_avg - se->avg.load_avg, 0);
++ 	cfs_rq->runnable_load_sum =
++ 		max_t(s64,  cfs_rq->runnable_load_sum - se->avg.load_sum, 0);
++ }
++ 
++ #ifndef CONFIG_64BIT
++ static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
++ {
++ 	u64 last_update_time_copy;
++ 	u64 last_update_time;
++ 
++ 	do {
++ 		last_update_time_copy = cfs_rq->load_last_update_time_copy;
++ 		smp_rmb();
++ 		last_update_time = cfs_rq->avg.last_update_time;
++ 	} while (last_update_time != last_update_time_copy);
++ 
++ 	return last_update_time;
++ }
++ #else
++ static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
++ {
++ 	return cfs_rq->avg.last_update_time;
++ }
++ #endif
++ 
++ /*
++  * Task first catches up with cfs_rq, and then subtract
++  * itself from the cfs_rq (task must be off the queue now).
++  */
++ void remove_entity_load_avg(struct sched_entity *se)
++ {
++ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
++ 	u64 last_update_time;
++ 
++ 	/*
++ 	 * Newly created task or never used group entity should not be removed
++ 	 * from its (source) cfs_rq
++ 	 */
++ 	if (se->avg.last_update_time == 0)
+++>>>>>>> 34e2c555f3e1 (cpufreq: Add mechanism for registering utilization update callbacks)
+  		return;
+  
+ -	last_update_time = cfs_rq_last_update_time(cfs_rq);
+ +	contrib_delta = __update_entity_load_avg_contrib(se);
+ +
+ +	if (!update_cfs_rq)
+ +		return;
+  
+ -	__update_load_avg(last_update_time, cpu_of(rq_of(cfs_rq)), &se->avg, 0, 0, NULL);
+ -	atomic_long_add(se->avg.load_avg, &cfs_rq->removed_load_avg);
+ -	atomic_long_add(se->avg.util_avg, &cfs_rq->removed_util_avg);
+ +	if (se->on_rq)
+ +		cfs_rq->runnable_load_avg += contrib_delta;
+ +	else
+ +		subtract_blocked_load_contrib(cfs_rq, -contrib_delta);
+  }
+  
+ -static inline unsigned long cfs_rq_runnable_load_avg(struct cfs_rq *cfs_rq)
+ +/*
+ + * Decay the load contributed by all blocked children and account this so that
+ + * their contribution may appropriately discounted when they wake up.
+ + */
+ +static void update_cfs_rq_blocked_load(struct cfs_rq *cfs_rq, int force_update)
+  {
+ -	return cfs_rq->runnable_load_avg;
+ +	u64 now = cfs_rq_clock_task(cfs_rq) >> 20;
+ +	u64 decays;
+ +
+ +	decays = now - cfs_rq->last_decay;
+ +	if (!decays && !force_update)
+ +		return;
+ +
+ +	if (atomic64_read(&cfs_rq->removed_load)) {
+ +		u64 removed_load = atomic64_xchg(&cfs_rq->removed_load, 0);
+ +		subtract_blocked_load_contrib(cfs_rq, removed_load);
+ +	}
+ +
+ +	if (decays) {
+ +		cfs_rq->blocked_load_avg = decay_load(cfs_rq->blocked_load_avg,
+ +						      decays);
+ +		atomic64_add(decays, &cfs_rq->decay_counter);
+ +		cfs_rq->last_decay = now;
+ +	}
+ +
+ +	__update_cfs_rq_tg_load_contrib(cfs_rq, force_update);
+  }
+  
+ -static inline unsigned long cfs_rq_load_avg(struct cfs_rq *cfs_rq)
+ +static inline void update_rq_runnable_avg(struct rq *rq, int runnable)
+  {
+ -	return cfs_rq->avg.load_avg;
+ +	__update_entity_runnable_avg(rq_clock_task(rq), &rq->avg, runnable);
+ +	__update_tg_runnable_avg(&rq->avg, &rq->cfs);
+  }
+  
+ -static int idle_balance(struct rq *this_rq);
+ +/* Add the load generated by se into cfs_rq's child load-average */
+ +static inline void enqueue_entity_load_avg(struct cfs_rq *cfs_rq,
+ +						  struct sched_entity *se,
+ +						  int wakeup)
+ +{
+ +	/*
+ +	 * We track migrations using entity decay_count <= 0, on a wake-up
+ +	 * migration we use a negative decay count to track the remote decays
+ +	 * accumulated while sleeping.
+ +	 *
+ +	 * Newly forked tasks are enqueued with se->avg.decay_count == 0, they
+ +	 * are seen by enqueue_entity_load_avg() as a migration with an already
+ +	 * constructed load_avg_contrib.
+ +	 */
+ +	if (unlikely(se->avg.decay_count <= 0)) {
+ +		se->avg.last_runnable_update = rq_clock_task(rq_of(cfs_rq));
+ +		if (se->avg.decay_count) {
+ +			/*
+ +			 * In a wake-up migration we have to approximate the
+ +			 * time sleeping.  This is because we can't synchronize
+ +			 * clock_task between the two cpus, and it is not
+ +			 * guaranteed to be read-safe.  Instead, we can
+ +			 * approximate this using our carried decays, which are
+ +			 * explicitly atomically readable.
+ +			 */
+ +			se->avg.last_runnable_update -= (-se->avg.decay_count)
+ +							<< 20;
+ +			update_entity_load_avg(se, 0);
+ +			/* Indicate that we're now synchronized and on-rq */
+ +			se->avg.decay_count = 0;
+ +		}
+ +		wakeup = 0;
+ +	} else {
+ +		__synchronize_entity_decay(se);
+ +	}
+ +
+ +	/* migrated tasks did not contribute to our blocked load */
+ +	if (wakeup) {
+ +		subtract_blocked_load_contrib(cfs_rq, se->avg.load_avg_contrib);
+ +		update_entity_load_avg(se, 0);
+ +	}
+  
+ -#else /* CONFIG_SMP */
+ +	cfs_rq->runnable_load_avg += se->avg.load_avg_contrib;
+ +	/* we force update consideration on load-balancer moves */
+ +	update_cfs_rq_blocked_load(cfs_rq, !wakeup);
+ +}
+  
+ -static inline void update_load_avg(struct sched_entity *se, int update_tg) {}
+ -static inline void
+ -enqueue_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+ -static inline void
+ -dequeue_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+ -static inline void remove_entity_load_avg(struct sched_entity *se) {}
+ +/*
+ + * Remove se's load from this cfs_rq child load-average, if the entity is
+ + * transitioning to a blocked state we track its projected decay using
+ + * blocked_load_avg.
+ + */
+ +static inline void dequeue_entity_load_avg(struct cfs_rq *cfs_rq,
+ +						  struct sched_entity *se,
+ +						  int sleep)
+ +{
+ +	update_entity_load_avg(se, 1);
+ +	/* we force update consideration on load-balancer moves */
+ +	update_cfs_rq_blocked_load(cfs_rq, !sleep);
+  
+ -static inline void
+ -attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+ -static inline void
+ -detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+ +	cfs_rq->runnable_load_avg -= se->avg.load_avg_contrib;
+ +	if (sleep) {
+ +		cfs_rq->blocked_load_avg += se->avg.load_avg_contrib;
+ +		se->avg.decay_count = atomic64_read(&cfs_rq->decay_counter);
+ +	} /* migrations, e.g. sleep=0 leave decay_count == 0 */
+ +}
+  
+ -static inline int idle_balance(struct rq *rq)
+ +/*
+ + * Update the rq's load with the elapsed running time before entering
+ + * idle. if the last scheduled task is not a CFS task, idle_enter will
+ + * be the only way to update the runnable statistic.
+ + */
+ +void idle_enter_fair(struct rq *this_rq)
+  {
+ -	return 0;
+ +	update_rq_runnable_avg(this_rq, 1);
+  }
+  
+ -#endif /* CONFIG_SMP */
+ +/*
+ + * Update the rq's load with the elapsed idle time before a task is
+ + * scheduled. if the newly scheduled task is not a CFS task, idle_exit will
+ + * be the only way to update the runnable statistic.
+ + */
+ +void idle_exit_fair(struct rq *this_rq)
+ +{
+ +	update_rq_runnable_avg(this_rq, 0);
+ +}
+ +
+ +#else
+ +static inline void update_entity_load_avg(struct sched_entity *se,
+ +					  int update_cfs_rq) {}
+ +static inline void update_rq_runnable_avg(struct rq *rq, int runnable) {}
+ +static inline void enqueue_entity_load_avg(struct cfs_rq *cfs_rq,
+ +					   struct sched_entity *se,
+ +					   int wakeup) {}
+ +static inline void dequeue_entity_load_avg(struct cfs_rq *cfs_rq,
+ +					   struct sched_entity *se,
+ +					   int sleep) {}
+ +static inline void update_cfs_rq_blocked_load(struct cfs_rq *cfs_rq,
+ +					      int force_update) {}
+ +#endif
+  
+  static void enqueue_sleeper(struct cfs_rq *cfs_rq, struct sched_entity *se)
+  {
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 6ce63ca52d98..5b3815049d55 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -39,6 +39,51 @@ static struct cpufreq_driver *cpufreq_driver;
+ static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data);
+ static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data_fallback);
+ static DEFINE_RWLOCK(cpufreq_driver_lock);
++
++static DEFINE_PER_CPU(struct update_util_data *, cpufreq_update_util_data);
++
++/**
++ * cpufreq_set_update_util_data - Populate the CPU's update_util_data pointer.
++ * @cpu: The CPU to set the pointer for.
++ * @data: New pointer value.
++ *
++ * Set and publish the update_util_data pointer for the given CPU.  That pointer
++ * points to a struct update_util_data object containing a callback function
++ * to call from cpufreq_update_util().  That function will be called from an RCU
++ * read-side critical section, so it must not sleep.
++ *
++ * Callers must use RCU callbacks to free any memory that might be accessed
++ * via the old update_util_data pointer or invoke synchronize_rcu() right after
++ * this function to avoid use-after-free.
++ */
++void cpufreq_set_update_util_data(int cpu, struct update_util_data *data)
++{
++	rcu_assign_pointer(per_cpu(cpufreq_update_util_data, cpu), data);
++}
++EXPORT_SYMBOL_GPL(cpufreq_set_update_util_data);
++
++/**
++ * cpufreq_update_util - Take a note about CPU utilization changes.
++ * @time: Current time.
++ * @util: Current utilization.
++ * @max: Utilization ceiling.
++ *
++ * This function is called by the scheduler on every invocation of
++ * update_load_avg() on the CPU whose utilization is being updated.
++ */
++void cpufreq_update_util(u64 time, unsigned long util, unsigned long max)
++{
++	struct update_util_data *data;
++
++	rcu_read_lock();
++
++	data = rcu_dereference(*this_cpu_ptr(&cpufreq_update_util_data));
++	if (data && data->func)
++		data->func(data, time, util, max);
++
++	rcu_read_unlock();
++}
++
+ DEFINE_MUTEX(cpufreq_governor_lock);
+ static LIST_HEAD(cpufreq_policy_list);
+ 
+* Unmerged path include/linux/cpufreq.h
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 69d7fc8967e1..77a5fcf8fde2 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -788,6 +788,10 @@ static void update_curr_dl(struct rq *rq)
+ 	if (!dl_task(curr) || !on_dl_rq(dl_se))
+ 		return;
+ 
++	/* Kick cpufreq (see the comment in linux/cpufreq.h). */
++	if (cpu_of(rq) == smp_processor_id())
++		cpufreq_trigger_update(rq_clock(rq));
++
+ 	/*
+ 	 * Consumed budget is computed considering the time as
+ 	 * observed by schedulable tasks (excluding time spent
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index f4a11726ebff..bdcb285e7261 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -889,6 +889,10 @@ static void update_curr_rt(struct rq *rq)
+ 	if (curr->sched_class != &rt_sched_class)
+ 		return;
+ 
++	/* Kick cpufreq (see the comment in linux/cpufreq.h). */
++	if (cpu_of(rq) == smp_processor_id())
++		cpufreq_trigger_update(rq_clock(rq));
++
+ 	delta_exec = rq_clock_task(rq) - curr->se.exec_start;
+ 	if (unlikely((s64)delta_exec <= 0))
+ 		return;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 3e0ea93b25ef..e131191a6d5d 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -8,6 +8,7 @@
+ #include <linux/stop_machine.h>
+ #include <linux/tick.h>
+ #include <linux/slab.h>
++#include <linux/cpufreq.h>
+ 
+ #include <linux/rh_kabi.h>
+ 
