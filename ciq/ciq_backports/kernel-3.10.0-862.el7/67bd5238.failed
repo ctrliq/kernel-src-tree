@@ -1,0 +1,211 @@
+mac80211_hwsim: Fix memory leak in hwsim_new_radio_nl()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ben Hutchings <ben.hutchings@codethink.co.uk>
+commit 67bd52386125ce1159c0581cbcd2740addf33cd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/67bd5238.failed
+
+hwsim_new_radio_nl() now copies the name attribute in order to add a
+null-terminator.  mac80211_hwsim_new_radio() (indirectly) copies it
+again into the net_device structure, so the first copy is not used or
+freed later.  Free the first copy before returning.
+
+Fixes: ff4dd73dd2b4 ("mac80211_hwsim: check HWSIM_ATTR_RADIO_NAME length")
+	Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 67bd52386125ce1159c0581cbcd2740addf33cd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mac80211_hwsim.c
+diff --cc drivers/net/wireless/mac80211_hwsim.c
+index cb34c7895f2a,10b075a46b26..000000000000
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@@ -2069,9 -3102,176 +2069,182 @@@ static int hwsim_register_received_nl(s
+  	       "switching to wmediumd mode with pid %d\n", info->snd_portid);
+  
+  	return 0;
+++<<<<<<< HEAD
+ +out:
+ +	printk(KERN_DEBUG "mac80211_hwsim: error occurred in %s\n", __func__);
+ +	return -EINVAL;
+++=======
++ }
++ 
++ static int hwsim_new_radio_nl(struct sk_buff *msg, struct genl_info *info)
++ {
++ 	struct hwsim_new_radio_params param = { 0 };
++ 	const char *hwname = NULL;
++ 	int ret;
++ 
++ 	param.reg_strict = info->attrs[HWSIM_ATTR_REG_STRICT_REG];
++ 	param.p2p_device = info->attrs[HWSIM_ATTR_SUPPORT_P2P_DEVICE];
++ 	param.channels = channels;
++ 	param.destroy_on_close =
++ 		info->attrs[HWSIM_ATTR_DESTROY_RADIO_ON_CLOSE];
++ 
++ 	if (info->attrs[HWSIM_ATTR_CHANNELS])
++ 		param.channels = nla_get_u32(info->attrs[HWSIM_ATTR_CHANNELS]);
++ 
++ 	if (info->attrs[HWSIM_ATTR_NO_VIF])
++ 		param.no_vif = true;
++ 
++ 	if (info->attrs[HWSIM_ATTR_RADIO_NAME]) {
++ 		hwname = kasprintf(GFP_KERNEL, "%.*s",
++ 				   nla_len(info->attrs[HWSIM_ATTR_RADIO_NAME]),
++ 				   (char *)nla_data(info->attrs[HWSIM_ATTR_RADIO_NAME]));
++ 		if (!hwname)
++ 			return -ENOMEM;
++ 		param.hwname = hwname;
++ 	}
++ 
++ 	if (info->attrs[HWSIM_ATTR_USE_CHANCTX])
++ 		param.use_chanctx = true;
++ 	else
++ 		param.use_chanctx = (param.channels > 1);
++ 
++ 	if (info->attrs[HWSIM_ATTR_REG_HINT_ALPHA2])
++ 		param.reg_alpha2 =
++ 			nla_data(info->attrs[HWSIM_ATTR_REG_HINT_ALPHA2]);
++ 
++ 	if (info->attrs[HWSIM_ATTR_REG_CUSTOM_REG]) {
++ 		u32 idx = nla_get_u32(info->attrs[HWSIM_ATTR_REG_CUSTOM_REG]);
++ 
++ 		if (idx >= ARRAY_SIZE(hwsim_world_regdom_custom))
++ 			return -EINVAL;
++ 		param.regd = hwsim_world_regdom_custom[idx];
++ 	}
++ 
++ 	ret = mac80211_hwsim_new_radio(info, &param);
++ 	kfree(hwname);
++ 	return ret;
++ }
++ 
++ static int hwsim_del_radio_nl(struct sk_buff *msg, struct genl_info *info)
++ {
++ 	struct mac80211_hwsim_data *data;
++ 	s64 idx = -1;
++ 	const char *hwname = NULL;
++ 
++ 	if (info->attrs[HWSIM_ATTR_RADIO_ID]) {
++ 		idx = nla_get_u32(info->attrs[HWSIM_ATTR_RADIO_ID]);
++ 	} else if (info->attrs[HWSIM_ATTR_RADIO_NAME]) {
++ 		hwname = kasprintf(GFP_KERNEL, "%.*s",
++ 				   nla_len(info->attrs[HWSIM_ATTR_RADIO_NAME]),
++ 				   (char *)nla_data(info->attrs[HWSIM_ATTR_RADIO_NAME]));
++ 		if (!hwname)
++ 			return -ENOMEM;
++ 	} else
++ 		return -EINVAL;
++ 
++ 	spin_lock_bh(&hwsim_radio_lock);
++ 	list_for_each_entry(data, &hwsim_radios, list) {
++ 		if (idx >= 0) {
++ 			if (data->idx != idx)
++ 				continue;
++ 		} else {
++ 			if (!hwname ||
++ 			    strcmp(hwname, wiphy_name(data->hw->wiphy)))
++ 				continue;
++ 		}
++ 
++ 		if (!net_eq(wiphy_net(data->hw->wiphy), genl_info_net(info)))
++ 			continue;
++ 
++ 		list_del(&data->list);
++ 		spin_unlock_bh(&hwsim_radio_lock);
++ 		mac80211_hwsim_del_radio(data, wiphy_name(data->hw->wiphy),
++ 					 info);
++ 		kfree(hwname);
++ 		return 0;
++ 	}
++ 	spin_unlock_bh(&hwsim_radio_lock);
++ 
++ 	kfree(hwname);
++ 	return -ENODEV;
++ }
++ 
++ static int hwsim_get_radio_nl(struct sk_buff *msg, struct genl_info *info)
++ {
++ 	struct mac80211_hwsim_data *data;
++ 	struct sk_buff *skb;
++ 	int idx, res = -ENODEV;
++ 
++ 	if (!info->attrs[HWSIM_ATTR_RADIO_ID])
++ 		return -EINVAL;
++ 	idx = nla_get_u32(info->attrs[HWSIM_ATTR_RADIO_ID]);
++ 
++ 	spin_lock_bh(&hwsim_radio_lock);
++ 	list_for_each_entry(data, &hwsim_radios, list) {
++ 		if (data->idx != idx)
++ 			continue;
++ 
++ 		if (!net_eq(wiphy_net(data->hw->wiphy), genl_info_net(info)))
++ 			continue;
++ 
++ 		skb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 		if (!skb) {
++ 			res = -ENOMEM;
++ 			goto out_err;
++ 		}
++ 
++ 		res = mac80211_hwsim_get_radio(skb, data, info->snd_portid,
++ 					       info->snd_seq, NULL, 0);
++ 		if (res < 0) {
++ 			nlmsg_free(skb);
++ 			goto out_err;
++ 		}
++ 
++ 		genlmsg_reply(skb, info);
++ 		break;
++ 	}
++ 
++ out_err:
++ 	spin_unlock_bh(&hwsim_radio_lock);
++ 
++ 	return res;
++ }
++ 
++ static int hwsim_dump_radio_nl(struct sk_buff *skb,
++ 			       struct netlink_callback *cb)
++ {
++ 	int idx = cb->args[0];
++ 	struct mac80211_hwsim_data *data = NULL;
++ 	int res;
++ 
++ 	spin_lock_bh(&hwsim_radio_lock);
++ 
++ 	if (idx == hwsim_radio_idx)
++ 		goto done;
++ 
++ 	list_for_each_entry(data, &hwsim_radios, list) {
++ 		if (data->idx < idx)
++ 			continue;
++ 
++ 		if (!net_eq(wiphy_net(data->hw->wiphy), sock_net(skb->sk)))
++ 			continue;
++ 
++ 		res = mac80211_hwsim_get_radio(skb, data,
++ 					       NETLINK_CB(cb->skb).portid,
++ 					       cb->nlh->nlmsg_seq, cb,
++ 					       NLM_F_MULTI);
++ 		if (res < 0)
++ 			break;
++ 
++ 		idx = data->idx + 1;
++ 	}
++ 
++ 	cb->args[0] = idx;
++ 
++ done:
++ 	spin_unlock_bh(&hwsim_radio_lock);
++ 	return skb->len;
+++>>>>>>> 67bd52386125 (mac80211_hwsim: Fix memory leak in hwsim_new_radio_nl())
+  }
+  
+  /* Generic Netlink operations array */
+* Unmerged path drivers/net/wireless/mac80211_hwsim.c
