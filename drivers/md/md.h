@@ -132,7 +132,9 @@ enum flag_bits {
 	Faulty,			/* device is known to have a fault */
 	In_sync,		/* device is in_sync with rest of array */
 	Bitmap_sync,		/* ..actually, not quite In_sync.  Need a
-				 * bitmap-based recovery to get fully in sync
+				 * bitmap-based recovery to get fully in sync.
+				 * The bit is only meaningful before device
+				 * has been passed to pers->hot_add_disk.
 				 */
 	Unmerged,		/* device is being added to array and should
 				 * be considerred for bvec_merge_fn but not
