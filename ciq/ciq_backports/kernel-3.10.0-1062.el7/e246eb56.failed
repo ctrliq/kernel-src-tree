@@ -1,0 +1,208 @@
+efi: Add pstore variables to the deletion whitelist
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Matt Fleming <matt@codeblueprint.co.uk>
+commit e246eb568bc4cbbdd8a30a3c11151ff9b7ca7312
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e246eb56.failed
+
+Laszlo explains why this is a good idea,
+
+ 'This is because the pstore filesystem can be backed by UEFI variables,
+  and (for example) a crash might dump the last kilobytes of the dmesg
+  into a number of pstore entries, each entry backed by a separate UEFI
+  variable in the above GUID namespace, and with a variable name
+  according to the above pattern.
+
+  Please see "drivers/firmware/efi/efi-pstore.c".
+
+  While this patch series will not prevent the user from deleting those
+  UEFI variables via the pstore filesystem (i.e., deleting a pstore fs
+  entry will continue to delete the backing UEFI variable), I think it
+  would be nice to preserve the possibility for the sysadmin to delete
+  Linux-created UEFI variables that carry portions of the crash log,
+  *without* having to mount the pstore filesystem.'
+
+There's also no chance of causing machines to become bricked by
+deleting these variables, which is the whole purpose of excluding
+things from the whitelist.
+
+Use the LINUX_EFI_CRASH_GUID guid and a wildcard '*' for the match so
+that we don't have to update the string in the future if new variable
+name formats are created for crash dump variables.
+
+	Reported-by: Laszlo Ersek <lersek@redhat.com>
+	Acked-by: Peter Jones <pjones@redhat.com>
+	Tested-by: Peter Jones <pjones@redhat.com>
+	Cc: Matthew Garrett <mjg59@srcf.ucam.org>
+	Cc: "Lee, Chun-Yi" <jlee@suse.com>
+	Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+(cherry picked from commit e246eb568bc4cbbdd8a30a3c11151ff9b7ca7312)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/vars.c
+diff --cc drivers/firmware/efi/vars.c
+index caf5f9efc1c2,7f2ea21c730d..000000000000
+--- a/drivers/firmware/efi/vars.c
++++ b/drivers/firmware/efi/vars.c
+@@@ -170,55 -171,117 +170,75 @@@ struct variable_validate 
+  			 unsigned long len);
+  };
+  
+ -/*
+ - * This is the list of variables we need to validate, as well as the
+ - * whitelist for what we think is safe not to default to immutable.
+ - *
+ - * If it has a validate() method that's not NULL, it'll go into the
+ - * validation routine.  If not, it is assumed valid, but still used for
+ - * whitelisting.
+ - *
+ - * Note that it's sorted by {vendor,name}, but globbed names must come after
+ - * any other name with the same prefix.
+ - */
+  static const struct variable_validate variable_validate[] = {
+++<<<<<<< HEAD
+ +	{ "BootNext", validate_uint16 },
+ +	{ "BootOrder", validate_boot_order },
+ +	{ "DriverOrder", validate_boot_order },
+ +	{ "Boot*", validate_load_option },
+ +	{ "Driver*", validate_load_option },
+ +	{ "ConIn", validate_device_path },
+ +	{ "ConInDev", validate_device_path },
+ +	{ "ConOut", validate_device_path },
+ +	{ "ConOutDev", validate_device_path },
+ +	{ "ErrOut", validate_device_path },
+ +	{ "ErrOutDev", validate_device_path },
+ +	{ "Timeout", validate_uint16 },
+ +	{ "Lang", validate_ascii_string },
+ +	{ "PlatformLang", validate_ascii_string },
+ +	{ "", NULL },
+++=======
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "BootNext", validate_uint16 },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "BootOrder", validate_boot_order },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "Boot*", validate_load_option },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "DriverOrder", validate_boot_order },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "Driver*", validate_load_option },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "ConIn", validate_device_path },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "ConInDev", validate_device_path },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "ConOut", validate_device_path },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "ConOutDev", validate_device_path },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "ErrOut", validate_device_path },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "ErrOutDev", validate_device_path },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "Lang", validate_ascii_string },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "OsIndications", NULL },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "PlatformLang", validate_ascii_string },
++ 	{ EFI_GLOBAL_VARIABLE_GUID, "Timeout", validate_uint16 },
++ 	{ LINUX_EFI_CRASH_GUID, "*", NULL },
++ 	{ NULL_GUID, "", NULL },
+++>>>>>>> e246eb568bc4 (efi: Add pstore variables to the deletion whitelist)
+  };
+  
+ -static bool
+ -variable_matches(const char *var_name, size_t len, const char *match_name,
+ -		 int *match)
+ -{
+ -	for (*match = 0; ; (*match)++) {
+ -		char c = match_name[*match];
+ -		char u = var_name[*match];
+ -
+ -		/* Wildcard in the matching name means we've matched */
+ -		if (c == '*')
+ -			return true;
+ -
+ -		/* Case sensitive match */
+ -		if (!c && *match == len)
+ -			return true;
+ -
+ -		if (c != u)
+ -			return false;
+ -
+ -		if (!c)
+ -			return true;
+ -	}
+ -	return true;
+ -}
+ -
+  bool
+ -efivar_validate(efi_guid_t vendor, efi_char16_t *var_name, u8 *data,
+ -		unsigned long data_size)
+ +efivar_validate(struct efi_variable *var, u8 *data, unsigned long len)
+  {
+  	int i;
+ -	unsigned long utf8_size;
+ -	u8 *utf8_name;
+ -
+ -	utf8_size = ucs2_utf8size(var_name);
+ -	utf8_name = kmalloc(utf8_size + 1, GFP_KERNEL);
+ -	if (!utf8_name)
+ -		return false;
+ +	u16 *unicode_name = var->VariableName;
+  
+ -	ucs2_as_utf8(utf8_name, var_name, utf8_size);
+ -	utf8_name[utf8_size] = '\0';
+ -
+ -	for (i = 0; variable_validate[i].name[0] != '\0'; i++) {
+ +	for (i = 0; variable_validate[i].validate != NULL; i++) {
+  		const char *name = variable_validate[i].name;
+ -		int match = 0;
+ +		int match;
+  
+ -		if (efi_guidcmp(vendor, variable_validate[i].vendor))
+ -			continue;
+ +		for (match = 0; ; match++) {
+ +			char c = name[match];
+ +			u16 u = unicode_name[match];
+  
+ -		if (variable_matches(utf8_name, utf8_size+1, name, &match)) {
+ -			if (variable_validate[i].validate == NULL)
+ -				break;
+ -			kfree(utf8_name);
+ -			return variable_validate[i].validate(var_name, match,
+ -							     data, data_size);
+ -		}
+ -	}
+ -	kfree(utf8_name);
+ -	return true;
+ -}
+ -EXPORT_SYMBOL_GPL(efivar_validate);
+ +			/* All special variables are plain ascii */
+ +			if (u > 127)
+ +				return true;
+  
+ -bool
+ -efivar_variable_is_removable(efi_guid_t vendor, const char *var_name,
+ -			     size_t len)
+ -{
+ -	int i;
+ -	bool found = false;
+ -	int match = 0;
+ +			/* Wildcard in the matching name means we've matched */
+ +			if (c == '*')
+ +				return variable_validate[i].validate(var,
+ +							     match, data, len);
+  
+ -	/*
+ -	 * Check if our variable is in the validated variables list
+ -	 */
+ -	for (i = 0; variable_validate[i].name[0] != '\0'; i++) {
+ -		if (efi_guidcmp(variable_validate[i].vendor, vendor))
+ -			continue;
+ +			/* Case sensitive match */
+ +			if (c != u)
+ +				break;
+  
+ -		if (variable_matches(var_name, len,
+ -				     variable_validate[i].name, &match)) {
+ -			found = true;
+ -			break;
+ +			/* Reached the end of the string while matching */
+ +			if (!c)
+ +				return variable_validate[i].validate(var,
+ +							     match, data, len);
+  		}
+  	}
+  
+* Unmerged path drivers/firmware/efi/vars.c
