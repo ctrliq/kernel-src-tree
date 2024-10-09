@@ -718,7 +718,7 @@ qla2xxx_dump_post_process(scsi_qla_host_t *vha, int rval)
 
 /**
  * qla2300_fw_dump() - Dumps binary data from the 2300 firmware.
- * @ha: HA context
+ * @vha: HA context
  * @hardware_locked: Called with the hardware_lock
  */
 void
@@ -888,7 +888,7 @@ qla2300_fw_dump_failed:
 
 /**
  * qla2100_fw_dump() - Dumps binary data from the 2100/2200 firmware.
- * @ha: HA context
+ * @vha: HA context
  * @hardware_locked: Called with the hardware_lock
  */
 void

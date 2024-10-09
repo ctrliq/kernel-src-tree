@@ -1727,7 +1727,7 @@ iospace_error_exit:
 
 /**
  * qla82xx_pci_config() - Setup ISP82xx PCI configuration registers.
- * @ha: HA context
+ * @vha: HA context
  *
  * Returns 0 on success.
 */
@@ -1748,7 +1748,7 @@ qla82xx_pci_config(scsi_qla_host_t *vha)
 
 /**
  * qla82xx_reset_chip() - Setup ISP82xx PCI configuration registers.
- * @ha: HA context
+ * @vha: HA context
  *
  * Returns 0 on success.
  */
@@ -2003,11 +2003,10 @@ qla82xx_mbx_completion(scsi_qla_host_t *vha, uint16_t mb0)
 		    "MBX pointer ERROR.\n");
 }
 
-/*
+/**
  * qla82xx_intr_handler() - Process interrupts for the ISP23xx and ISP63xx.
  * @irq:
  * @dev_id: SCSI driver HA context
- * @regs:
  *
  * Called by system whenever the host adapter generates an interrupt.
  *
