@@ -1,0 +1,159 @@
+blk-mq-tag: check for NULL rq when iterating tags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 7f5562d5ecc44c757599b201df928ba52fa05047
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7f5562d5.failed
+
+Since we introduced blk-mq-sched, the tags->rqs[] array has been
+dynamically assigned. So we need to check for NULL when iterating,
+since there's a window of time where the bit is set, but we haven't
+dynamically assigned the tags->rqs[] array position yet.
+
+This is perfectly safe, since the memory backing of the request is
+never going away while the device is alive.
+
+	Reviewed-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 7f5562d5ecc44c757599b201df928ba52fa05047)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+diff --cc block/blk-mq-tag.c
+index 7e6885bccaac,dc9e6dac5a2a..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -413,49 -195,87 +413,75 @@@ void blk_mq_put_tag(struct blk_mq_hw_ct
+  	}
+  }
+  
+ -struct bt_iter_data {
+ -	struct blk_mq_hw_ctx *hctx;
+ -	busy_iter_fn *fn;
+ -	void *data;
+ -	bool reserved;
+ -};
+ -
+ -static bool bt_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
+ +static void bt_for_each(struct blk_mq_hw_ctx *hctx,
+ +		struct blk_mq_bitmap_tags *bt, unsigned int off,
+ +		busy_iter_fn *fn, void *data, bool reserved)
+  {
+ -	struct bt_iter_data *iter_data = data;
+ -	struct blk_mq_hw_ctx *hctx = iter_data->hctx;
+ -	struct blk_mq_tags *tags = hctx->tags;
+ -	bool reserved = iter_data->reserved;
+  	struct request *rq;
+ +	int bit, i;
+ +
+ +	for (i = 0; i < bt->map_nr; i++) {
+ +		struct blk_align_bitmap *bm = &bt->map[i];
+ +
+++<<<<<<< HEAD
+ +		for (bit = find_first_bit(&bm->word, bm->depth);
+ +		     bit < bm->depth;
+ +		     bit = find_next_bit(&bm->word, bm->depth, bit + 1)) {
+ +			rq = hctx->tags->rqs[off + bit];
+ +			if (rq->q == hctx->queue)
+ +				fn(hctx, rq, data, reserved);
+ +		}
+  
+ -	if (!reserved)
+ -		bitnr += tags->nr_reserved_tags;
+ -	rq = tags->rqs[bitnr];
+ -
+ +		off += (1 << bt->bits_per_word);
+ +	}
+++=======
++ 	/*
++ 	 * We can hit rq == NULL here, because the tagging functions
++ 	 * test and set the bit before assining ->rqs[].
++ 	 */
++ 	if (rq && rq->q == hctx->queue)
++ 		iter_data->fn(hctx, rq, iter_data->data, reserved);
++ 	return true;
+++>>>>>>> 7f5562d5ecc4 (blk-mq-tag: check for NULL rq when iterating tags)
+  }
+  
+ -static void bt_for_each(struct blk_mq_hw_ctx *hctx, struct sbitmap_queue *bt,
+ -			busy_iter_fn *fn, void *data, bool reserved)
+ -{
+ -	struct bt_iter_data iter_data = {
+ -		.hctx = hctx,
+ -		.fn = fn,
+ -		.data = data,
+ -		.reserved = reserved,
+ -	};
+ -
+ -	sbitmap_for_each_set(&bt->sb, bt_iter, &iter_data);
+ -}
+ -
+ -struct bt_tags_iter_data {
+ -	struct blk_mq_tags *tags;
+ -	busy_tag_iter_fn *fn;
+ -	void *data;
+ -	bool reserved;
+ -};
+ -
+ -static bool bt_tags_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
+ +static void bt_tags_for_each(struct blk_mq_tags *tags,
+ +		struct blk_mq_bitmap_tags *bt, unsigned int off,
+ +		busy_tag_iter_fn *fn, void *data, bool reserved)
+  {
+ -	struct bt_tags_iter_data *iter_data = data;
+ -	struct blk_mq_tags *tags = iter_data->tags;
+ -	bool reserved = iter_data->reserved;
+  	struct request *rq;
+ +	int bit, i;
+  
+++<<<<<<< HEAD
+ +	if (!tags->rqs)
+ +		return;
+ +	for (i = 0; i < bt->map_nr; i++) {
+ +		struct blk_align_bitmap *bm = &bt->map[i];
+ +
+ +		for (bit = find_first_bit(&bm->word, bm->depth);
+ +		     bit < bm->depth;
+ +		     bit = find_next_bit(&bm->word, bm->depth, bit + 1)) {
+ +			rq = tags->rqs[off + bit];
+ +			fn(rq, data, reserved);
+ +		}
+++=======
++ 	if (!reserved)
++ 		bitnr += tags->nr_reserved_tags;
++ 
++ 	/*
++ 	 * We can hit rq == NULL here, because the tagging functions
++ 	 * test and set the bit before assining ->rqs[].
++ 	 */
++ 	rq = tags->rqs[bitnr];
++ 	if (rq)
++ 		iter_data->fn(rq, iter_data->data, reserved);
++ 
++ 	return true;
++ }
+++>>>>>>> 7f5562d5ecc4 (blk-mq-tag: check for NULL rq when iterating tags)
+  
+ -static void bt_tags_for_each(struct blk_mq_tags *tags, struct sbitmap_queue *bt,
+ -			     busy_tag_iter_fn *fn, void *data, bool reserved)
+ -{
+ -	struct bt_tags_iter_data iter_data = {
+ -		.tags = tags,
+ -		.fn = fn,
+ -		.data = data,
+ -		.reserved = reserved,
+ -	};
+ -
+ -	if (tags->rqs)
+ -		sbitmap_for_each_set(&bt->sb, bt_tags_iter, &iter_data);
+ +		off += (1 << bt->bits_per_word);
+ +	}
+  }
+  
+  static void blk_mq_all_tag_busy_iter(struct blk_mq_tags *tags,
+* Unmerged path block/blk-mq-tag.c
