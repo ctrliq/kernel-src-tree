@@ -1,0 +1,116 @@
+bnxt_en: Report firmware DCBX agent.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Report firmware DCBX agent (Jonathan Toppins) [1459659]
+Rebuild_FUZZ: 98.59%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 9315edca9b1d0daf41f81e1f5d4fb995d3cbc634
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9315edca.failed
+
+Report DCB_CAP_DCBX_LLD_MANAGED only if the firmware DCBX agent is enabled
+and running for PF or VF.  Otherwise, if both LLDP and DCBX agents are
+disabled in firmware, we report DCB_CAP_DCBX_LLD_HOST and allow host
+IEEE DCB settings.  This patch refines the current logic in the driver.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9315edca9b1d0daf41f81e1f5d4fb995d3cbc634)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 93218af865c8,6b781be66722..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -997,8 -1022,12 +997,14 @@@ struct bnxt 
+  	#define BNXT_FLAG_ROCE_CAP	(BNXT_FLAG_ROCEV1_CAP |	\
+  					 BNXT_FLAG_ROCEV2_CAP)
+  	#define BNXT_FLAG_NO_AGG_RINGS	0x20000
+ -	#define BNXT_FLAG_RX_PAGE_MODE	0x40000
+  	#define BNXT_FLAG_FW_LLDP_AGENT	0x80000
+  	#define BNXT_FLAG_MULTI_HOST	0x100000
+++<<<<<<< HEAD
+++=======
++ 	#define BNXT_FLAG_SHORT_CMD	0x200000
++ 	#define BNXT_FLAG_DOUBLE_DB	0x400000
++ 	#define BNXT_FLAG_FW_DCBX_AGENT	0x800000
+++>>>>>>> 9315edca9b1d (bnxt_en: Report firmware DCBX agent.)
+  	#define BNXT_FLAG_CHIP_NITRO_A0	0x1000000
+  
+  	#define BNXT_FLAG_ALL_CONFIG_FEATS (BNXT_FLAG_TPA |		\
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 3556457e8605..db0859246257 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -4383,6 +4383,7 @@ static int bnxt_hwrm_func_qcfg(struct bnxt *bp)
+ {
+ 	struct hwrm_func_qcfg_input req = {0};
+ 	struct hwrm_func_qcfg_output *resp = bp->hwrm_cmd_resp_addr;
++	u16 flags;
+ 	int rc;
+ 
+ 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_QCFG, -1, -1);
+@@ -4399,15 +4400,15 @@ static int bnxt_hwrm_func_qcfg(struct bnxt *bp)
+ 		vf->vlan = le16_to_cpu(resp->vlan) & VLAN_VID_MASK;
+ 	}
+ #endif
+-	if (BNXT_PF(bp)) {
+-		u16 flags = le16_to_cpu(resp->flags);
+-
+-		if (flags & (FUNC_QCFG_RESP_FLAGS_FW_DCBX_AGENT_ENABLED |
+-			     FUNC_QCFG_RESP_FLAGS_FW_LLDP_AGENT_ENABLED))
+-			bp->flags |= BNXT_FLAG_FW_LLDP_AGENT;
+-		if (flags & FUNC_QCFG_RESP_FLAGS_MULTI_HOST)
+-			bp->flags |= BNXT_FLAG_MULTI_HOST;
+-	}
++	flags = le16_to_cpu(resp->flags);
++	if (flags & (FUNC_QCFG_RESP_FLAGS_FW_DCBX_AGENT_ENABLED |
++		     FUNC_QCFG_RESP_FLAGS_FW_LLDP_AGENT_ENABLED)) {
++		bp->flags |= BNXT_FLAG_FW_LLDP_AGENT;
++		if (flags & FUNC_QCFG_RESP_FLAGS_FW_DCBX_AGENT_ENABLED)
++			bp->flags |= BNXT_FLAG_FW_DCBX_AGENT;
++	}
++	if (BNXT_PF(bp) && (flags & FUNC_QCFG_RESP_FLAGS_MULTI_HOST))
++		bp->flags |= BNXT_FLAG_MULTI_HOST;
+ 
+ 	switch (resp->port_partition_type) {
+ 	case FUNC_QCFG_RESP_PORT_PARTITION_TYPE_NPAR1_0:
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c
+index 5c6dd0ce209f..c0145898f64c 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_dcb.c
+@@ -549,13 +549,18 @@ static u8 bnxt_dcbnl_setdcbx(struct net_device *dev, u8 mode)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 
+-	/* only support IEEE */
+-	if ((mode & DCB_CAP_DCBX_VER_CEE) || !(mode & DCB_CAP_DCBX_VER_IEEE))
++	/* All firmware DCBX settings are set in NVRAM */
++	if (bp->dcbx_cap & DCB_CAP_DCBX_LLD_MANAGED)
+ 		return 1;
+ 
+ 	if (mode & DCB_CAP_DCBX_HOST) {
+ 		if (BNXT_VF(bp) || (bp->flags & BNXT_FLAG_FW_LLDP_AGENT))
+ 			return 1;
++
++		/* only support IEEE */
++		if ((mode & DCB_CAP_DCBX_VER_CEE) ||
++		    !(mode & DCB_CAP_DCBX_VER_IEEE))
++			return 1;
+ 	}
+ 
+ 	if (mode == bp->dcbx_cap)
+@@ -584,7 +589,7 @@ void bnxt_dcb_init(struct bnxt *bp)
+ 	bp->dcbx_cap = DCB_CAP_DCBX_VER_IEEE;
+ 	if (BNXT_PF(bp) && !(bp->flags & BNXT_FLAG_FW_LLDP_AGENT))
+ 		bp->dcbx_cap |= DCB_CAP_DCBX_HOST;
+-	else
++	else if (bp->flags & BNXT_FLAG_FW_DCBX_AGENT)
+ 		bp->dcbx_cap |= DCB_CAP_DCBX_LLD_MANAGED;
+ 	bp->dev->dcbnl_ops = &dcbnl_ops;
+ }
