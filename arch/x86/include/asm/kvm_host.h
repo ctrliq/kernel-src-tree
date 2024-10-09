@@ -730,6 +730,7 @@ struct kvm_arch {
 	bool x2apic_broadcast_quirk_disabled;
 
 	/* Struct members for AVIC */
+	u32 avic_vm_id;
 	u32 ldr_mode;
 	struct page *avic_logical_id_table_page;
 	struct page *avic_physical_id_table_page;
