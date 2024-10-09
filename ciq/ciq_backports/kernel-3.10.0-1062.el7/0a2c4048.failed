@@ -1,0 +1,116 @@
+mm: migrate: fix barriers around tlb_flush_pending
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Nadav Amit <namit@vmware.com>
+commit 0a2c40487f3e4215c6ab46e7f837036badfb542b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0a2c4048.failed
+
+Reading tlb_flush_pending while the page-table lock is taken does not
+require a barrier, since the lock/unlock already acts as a barrier.
+Removing the barrier in mm_tlb_flush_pending() to address this issue.
+
+However, migrate_misplaced_transhuge_page() calls mm_tlb_flush_pending()
+while the page-table lock is already released, which may present a
+problem on architectures with weak memory model (PPC).  To deal with
+this case, a new parameter is added to mm_tlb_flush_pending() to
+indicate if it is read without the page-table lock taken, and calling
+smp_mb__after_unlock_lock() in this case.
+
+Link: http://lkml.kernel.org/r/20170802000818.4760-3-namit@vmware.com
+	Signed-off-by: Nadav Amit <namit@vmware.com>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jeff Dike <jdike@addtoit.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Nadav Amit <nadav.amit@gmail.com>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0a2c40487f3e4215c6ab46e7f837036badfb542b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm_types.h
+diff --cc include/linux/mm_types.h
+index ff35333d8d6c,0e478ebd2706..000000000000
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@@ -572,32 -526,45 +572,48 @@@ static inline cpumask_t *mm_cpumask(str
+  /*
+   * Memory barriers to keep this state in sync are graciously provided by
+   * the page table locks, outside of which no page table modifications happen.
+-  * The barriers below prevent the compiler from re-ordering the instructions
+-  * around the memory barriers that are already present in the code.
++  * The barriers are used to ensure the order between tlb_flush_pending updates,
++  * which happen while the lock is not taken, and the PTE updates, which happen
++  * while the lock is taken, are serialized.
+   */
+ -static inline bool mm_tlb_flush_pending(struct mm_struct *mm)
+ +static inline bool tlb_flush_pending(struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	barrier();
+ +	return mm->tlb_flush_pending;
+++=======
++ 	return atomic_read(&mm->tlb_flush_pending) > 0;
+++>>>>>>> 0a2c40487f3e (mm: migrate: fix barriers around tlb_flush_pending)
+  }
+ -
+ -static inline void init_tlb_flush_pending(struct mm_struct *mm)
+ +static inline void set_tlb_flush_pending(struct mm_struct *mm)
+  {
+ -	atomic_set(&mm->tlb_flush_pending, 0);
+ -}
+ -
+ -static inline void inc_tlb_flush_pending(struct mm_struct *mm)
+ -{
+ -	atomic_inc(&mm->tlb_flush_pending);
+ +	mm->tlb_flush_pending = true;
+  
+  	/*
+ -	 * Guarantee that the tlb_flush_pending increase does not leak into the
+ +	 * Guarantee that the tlb_flush_pending store does not leak into the
+  	 * critical section updating the page tables
+  	 */
+  	smp_mb__before_spinlock();
+  }
+ -
+  /* Clearing is done after a TLB flush, which also provides a barrier. */
+ -static inline void dec_tlb_flush_pending(struct mm_struct *mm)
+ +static inline void clear_tlb_flush_pending(struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	barrier();
+ +	mm->tlb_flush_pending = false;
+++=======
++ 	/*
++ 	 * Guarantee that the tlb_flush_pending does not not leak into the
++ 	 * critical section, since we must order the PTE change and changes to
++ 	 * the pending TLB flush indication. We could have relied on TLB flush
++ 	 * as a memory barrier, but this behavior is not clearly documented.
++ 	 */
++ 	smp_mb__before_atomic();
++ 	atomic_dec(&mm->tlb_flush_pending);
+++>>>>>>> 0a2c40487f3e (mm: migrate: fix barriers around tlb_flush_pending)
+  }
+  #else
+ -static inline bool mm_tlb_flush_pending(struct mm_struct *mm)
+ +static inline bool tlb_flush_pending(struct mm_struct *mm)
+  {
+  	return false;
+  }
+* Unmerged path include/linux/mm_types.h
