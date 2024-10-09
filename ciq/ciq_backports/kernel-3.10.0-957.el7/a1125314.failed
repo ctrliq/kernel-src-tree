@@ -1,0 +1,259 @@
+IB/srpt: Rework multi-channel support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit a11253142e6d317c25215ddb3029f9c754baefef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a1125314.failed
+
+Store initiator and target port ID's once per nexus instead of in each
+channel data structure. This change simplifies the duplicate connection
+check in srpt_cm_req_recv().
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit a11253142e6d317c25215ddb3029f9c754baefef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 70e5ec349271,de3e77df146e..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -1891,33 -1902,73 +1895,81 @@@ static void __srpt_close_all_ch(struct 
+  
+  	lockdep_assert_held(&sport->mutex);
+  
+- 	if (sport->enabled == enabled)
+- 		return;
+- 	sport->enabled = enabled;
+- 	if (sport->enabled)
+- 		return;
++ 	list_for_each_entry(nexus, &sport->nexus_list, entry) {
++ 		list_for_each_entry(ch, &nexus->ch_list, list) {
++ 			if (srpt_disconnect_ch(ch) >= 0)
++ 				pr_info("Closing channel %s-%d because target %s_%d has been disabled\n",
++ 					ch->sess_name, ch->qp->qp_num,
++ 					sport->sdev->device->name, sport->port);
++ 			srpt_close_ch(ch);
++ 		}
++ 	}
++ }
++ 
++ /*
++  * Look up (i_port_id, t_port_id) in sport->nexus_list. Create an entry if
++  * it does not yet exist.
++  */
++ static struct srpt_nexus *srpt_get_nexus(struct srpt_port *sport,
++ 					 const u8 i_port_id[16],
++ 					 const u8 t_port_id[16])
++ {
++ 	struct srpt_nexus *nexus = NULL, *tmp_nexus = NULL, *n;
+  
+- again:
+- 	list_for_each_entry(ch, &sport->rch_list, list) {
+- 		if (ch->sport == sport) {
+- 			pr_info("%s: closing channel %s-%d\n",
+- 				sport->sdev->device->name, ch->sess_name,
+- 				ch->qp->qp_num);
+- 			if (srpt_disconnect_ch_sync(ch))
+- 				goto again;
++ 	for (;;) {
++ 		mutex_lock(&sport->mutex);
++ 		list_for_each_entry(n, &sport->nexus_list, entry) {
++ 			if (memcmp(n->i_port_id, i_port_id, 16) == 0 &&
++ 			    memcmp(n->t_port_id, t_port_id, 16) == 0) {
++ 				nexus = n;
++ 				break;
++ 			}
++ 		}
++ 		if (!nexus && tmp_nexus) {
++ 			list_add_tail_rcu(&tmp_nexus->entry,
++ 					  &sport->nexus_list);
++ 			swap(nexus, tmp_nexus);
++ 		}
++ 		mutex_unlock(&sport->mutex);
++ 
++ 		if (nexus)
++ 			break;
++ 		tmp_nexus = kzalloc(sizeof(*nexus), GFP_KERNEL);
++ 		if (!tmp_nexus) {
++ 			nexus = ERR_PTR(-ENOMEM);
++ 			break;
+  		}
++ 		init_rcu_head(&tmp_nexus->rcu);
++ 		INIT_LIST_HEAD(&tmp_nexus->ch_list);
++ 		memcpy(tmp_nexus->i_port_id, i_port_id, 16);
++ 		memcpy(tmp_nexus->t_port_id, t_port_id, 16);
+  	}
+  
++ 	kfree(tmp_nexus);
++ 
++ 	return nexus;
++ }
++ 
++ static void srpt_set_enabled(struct srpt_port *sport, bool enabled)
++ 	__must_hold(&sport->mutex)
++ {
++ 	lockdep_assert_held(&sport->mutex);
++ 
++ 	if (sport->enabled == enabled)
++ 		return;
++ 	sport->enabled = enabled;
++ 	if (!enabled)
++ 		__srpt_close_all_ch(sport);
+  }
+  
+ +/**
+ + * srpt_shutdown_session() - Whether or not a session may be shut down.
+ + */
+ +static int srpt_shutdown_session(struct se_session *se_sess)
+ +{
+ +	return 1;
+ +}
+ +
+  static void srpt_free_ch(struct kref *kref)
+  {
+  	struct srpt_rdma_ch *ch = container_of(kref, struct srpt_rdma_ch, kref);
+@@@ -2003,10 -2055,18 +2056,17 @@@ static int srpt_cm_req_recv(struct ib_c
+  
+  	it_iu_len = be32_to_cpu(req->req_it_iu_len);
+  
+ -	pr_info("Received SRP_LOGIN_REQ with i_port_id %pI6, t_port_id %pI6 and it_iu_len %d on port %d (guid=%pI6); pkey %#04x\n",
+ +	pr_info("Received SRP_LOGIN_REQ with i_port_id %pI6, t_port_id %pI6 and it_iu_len %d on port %d (guid=%pI6)\n",
+  		req->initiator_port_id, req->target_port_id, it_iu_len,
+ -		param->port, &sport->gid,
+ -		be16_to_cpu(param->primary_path->pkey));
+ +		param->port, &sport->gid);
+  
++ 	nexus = srpt_get_nexus(sport, req->initiator_port_id,
++ 			       req->target_port_id);
++ 	if (IS_ERR(nexus)) {
++ 		ret = PTR_ERR(nexus);
++ 		goto out;
++ 	}
++ 
+  	rsp = kzalloc(sizeof(*rsp), GFP_KERNEL);
+  	rej = kzalloc(sizeof(*rej), GFP_KERNEL);
+  	rep_param = kzalloc(sizeof(*rep_param), GFP_KERNEL);
+@@@ -2082,10 -2135,10 +2135,13 @@@
+  
+  	init_rcu_head(&ch->rcu);
+  	kref_init(&ch->kref);
+++<<<<<<< HEAD
+++=======
++ 	ch->pkey = be16_to_cpu(param->primary_path->pkey);
++ 	ch->nexus = nexus;
+++>>>>>>> a11253142e6d (IB/srpt: Rework multi-channel support)
+  	ch->zw_cqe.done = srpt_zerolength_write_done;
+  	INIT_WORK(&ch->release_work, srpt_release_channel_work);
+- 	memcpy(ch->i_port_id, req->initiator_port_id, 16);
+- 	memcpy(ch->t_port_id, req->target_port_id, 16);
+  	ch->sport = &sdev->port[param->port - 1];
+  	ch->cm_id = cm_id;
+  	cm_id->context = ch;
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.h b/drivers/infiniband/ulp/srpt/ib_srpt.h
+index 26dbb4ea600d..6766e38b2118 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@ -54,6 +54,8 @@
+  */
+ #define SRP_SERVICE_NAME_PREFIX		"SRP.T10:"
+ 
++struct srpt_nexus;
++
+ enum {
+ 	/*
+ 	 * SRP IOControllerProfile attributes for SRP target ports that have
+@@ -240,6 +242,7 @@ enum rdma_ch_state {
+ 
+ /**
+  * struct srpt_rdma_ch - RDMA channel
++ * @nexus:         I_T nexus this channel is associated with.
+  * @cm_id:         IB CM ID associated with the channel.
+  * @qp:            IB queue pair used for communicating over this channel.
+  * @cq:            IB completion queue for this channel.
+@@ -251,8 +254,6 @@ enum rdma_ch_state {
+  * @sq_wr_avail:   number of work requests available in the send queue.
+  * @sport:         pointer to the information of the HCA port used by this
+  *                 channel.
+- * @i_port_id:     128-bit initiator port identifier copied from SRP_LOGIN_REQ.
+- * @t_port_id:     128-bit target port identifier copied from SRP_LOGIN_REQ.
+  * @max_ti_iu_len: maximum target-to-initiator information unit length.
+  * @req_lim:       request limit: maximum number of requests that may be sent
+  *                 by the initiator without having received a response.
+@@ -262,7 +263,7 @@ enum rdma_ch_state {
+  * @state:         channel state. See also enum rdma_ch_state.
+  * @ioctx_ring:    Send ring.
+  * @ioctx_recv_ring: Receive I/O context ring.
+- * @list:          Node in srpt_port.rch_list.
++ * @list:          Node in srpt_nexus.ch_list.
+  * @cmd_wait_list: List of SCSI commands that arrived before the RTU event. This
+  *                 list contains struct srpt_ioctx elements and is protected
+  *                 against concurrent modification by the cm_id spinlock.
+@@ -271,6 +272,7 @@ enum rdma_ch_state {
+  * @release_work:  Allows scheduling of srpt_release_channel().
+  */
+ struct srpt_rdma_ch {
++	struct srpt_nexus	*nexus;
+ 	struct ib_cm_id		*cm_id;
+ 	struct ib_qp		*qp;
+ 	struct ib_cq		*cq;
+@@ -281,8 +283,6 @@ struct srpt_rdma_ch {
+ 	u32			max_rsp_size;
+ 	atomic_t		sq_wr_avail;
+ 	struct srpt_port	*sport;
+-	u8			i_port_id[16];
+-	u8			t_port_id[16];
+ 	int			max_ti_iu_len;
+ 	atomic_t		req_lim;
+ 	atomic_t		req_lim_delta;
+@@ -298,6 +298,22 @@ struct srpt_rdma_ch {
+ 	struct work_struct	release_work;
+ };
+ 
++/**
++ * struct srpt_nexus - I_T nexus
++ * @rcu:       RCU head for this data structure.
++ * @entry:     srpt_port.nexus_list list node.
++ * @ch_list:   struct srpt_rdma_ch list. Protected by srpt_port.mutex.
++ * @i_port_id: 128-bit initiator port identifier copied from SRP_LOGIN_REQ.
++ * @t_port_id: 128-bit target port identifier copied from SRP_LOGIN_REQ.
++ */
++struct srpt_nexus {
++	struct rcu_head		rcu;
++	struct list_head	entry;
++	struct list_head	ch_list;
++	u8			i_port_id[16];
++	u8			t_port_id[16];
++};
++
+ /**
+  * struct srpt_port_attib - attributes for SRPT port
+  * @srp_max_rdma_size: Maximum size of SRP RDMA transfers for new connections.
+@@ -330,9 +346,9 @@ struct srpt_port_attrib {
+  * @port_gid_tpg:  TPG associated with target port GID.
+  * @port_gid_wwn:  WWN associated with target port GID.
+  * @port_attrib:   Port attributes that can be accessed through configfs.
+- * @ch_releaseQ:   Enables waiting for removal from rch_list.
+- * @mutex:	   Protects rch_list.
+- * @rch_list:	   Channel list. See also srpt_rdma_ch.list.
++ * @ch_releaseQ:   Enables waiting for removal from nexus_list.
++ * @mutex:	   Protects nexus_list.
++ * @nexus_list:	   Nexus list. See also srpt_nexus.entry.
+  */
+ struct srpt_port {
+ 	struct srpt_device	*sdev;
+@@ -352,7 +368,7 @@ struct srpt_port {
+ 	struct srpt_port_attrib port_attrib;
+ 	wait_queue_head_t	ch_releaseQ;
+ 	struct mutex		mutex;
+-	struct list_head	rch_list;
++	struct list_head	nexus_list;
+ };
+ 
+ /**
