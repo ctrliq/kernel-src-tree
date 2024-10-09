@@ -10237,8 +10237,12 @@ lpfc_sli_mbox_sys_flush(struct lpfc_hba *phba)
 	LPFC_MBOXQ_t *pmb;
 	unsigned long iflag;
 
+	/* Disable softirqs, including timers from obtaining phba->hbalock */
+	local_bh_disable();
+
 	/* Flush all the mailbox commands in the mbox system */
 	spin_lock_irqsave(&phba->hbalock, iflag);
+
 	/* The pending mailbox command queue */
 	list_splice_init(&phba->sli.mboxq, &completions);
 	/* The outstanding active mailbox command */
@@ -10250,6 +10254,9 @@ lpfc_sli_mbox_sys_flush(struct lpfc_hba *phba)
 	/* The completed mailbox command queue */
 	list_splice_init(&phba->sli.mboxq_cmpl, &completions);
 	spin_unlock_irqrestore(&phba->hbalock, iflag);
+
+	/* Enable softirqs again, done with phba->hbalock */
+	local_bh_enable();
 
 	/* Return all flushed mailbox commands with MBX_NOT_FINISHED status */
 	while (!list_empty(&completions)) {
@@ -10390,6 +10397,9 @@ lpfc_sli_hba_down(struct lpfc_hba *phba)
 
 	lpfc_hba_down_prep(phba);
 
+	/* Disable softirqs, including timers from obtaining phba->hbalock */
+	local_bh_disable();
+
 	lpfc_fabric_abort_hba(phba);
 
 	spin_lock_irqsave(&phba->hbalock, flags);
@@ -10442,6 +10452,9 @@ lpfc_sli_hba_down(struct lpfc_hba *phba)
 		lpfc_mbuf_free(phba, buf_ptr->virt, buf_ptr->phys);
 		kfree(buf_ptr);
 	}
+
+	/* Enable softirqs again, done with phba->hbalock */
+	local_bh_enable();
 
 	/* Return any active mbox cmds */
 	del_timer_sync(&psli->mbox_tmo);
@@ -11736,6 +11749,9 @@ lpfc_sli_mbox_sys_shutdown(struct lpfc_hba *phba, int mbx_action)
 	}
 	timeout = msecs_to_jiffies(LPFC_MBOX_TMO * 1000) + jiffies;
 
+	/* Disable softirqs, including timers from obtaining phba->hbalock */
+	local_bh_disable();
+
 	spin_lock_irq(&phba->hbalock);
 	psli->sli_flag |= LPFC_SLI_ASYNC_MBX_BLK;
 
@@ -11749,6 +11765,9 @@ lpfc_sli_mbox_sys_shutdown(struct lpfc_hba *phba, int mbx_action)
 						1000) + jiffies;
 		spin_unlock_irq(&phba->hbalock);
 
+		/* Enable softirqs again, done with phba->hbalock */
+		local_bh_enable();
+
 		while (phba->sli.mbox_active) {
 			/* Check active mailbox complete status every 2ms */
 			msleep(2);
@@ -11758,8 +11777,12 @@ lpfc_sli_mbox_sys_shutdown(struct lpfc_hba *phba, int mbx_action)
 				 */
 				break;
 		}
-	} else
+	} else {
 		spin_unlock_irq(&phba->hbalock);
+
+		/* Enable softirqs again, done with phba->hbalock */
+		local_bh_enable();
+	}
 
 	lpfc_sli_mbox_sys_flush(phba);
 }
