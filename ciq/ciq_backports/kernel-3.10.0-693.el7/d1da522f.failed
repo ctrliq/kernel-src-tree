@@ -1,0 +1,285 @@
+scsi: megaraid_sas: handle dma_addr_t right on 32-bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: handle dma_addr_t right on 32-bit (Tomas Henzl) [1417038]
+Rebuild_FUZZ: 94.00%
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit d1da522fb8a70b8c527d4ad15f9e62218cc00f2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d1da522f.failed
+
+When building with a dma_addr_t that is different from pointer size, we
+get this warning:
+
+drivers/scsi/megaraid/megaraid_sas_fusion.c: In function 'megasas_make_prp_nvme':
+drivers/scsi/megaraid/megaraid_sas_fusion.c:1654:17: error: cast to pointer from integer of different size [-Werror=int-to-pointer-cast]
+
+It's better to not pretend that the dma address is a pointer and instead
+use a dma_addr_t consistently.
+
+Fixes: 33203bc4d61b ("scsi: megaraid_sas: NVME fast path io support")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Sumit Saxena <sumit.saxena@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d1da522fb8a70b8c527d4ad15f9e62218cc00f2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 50ad36bc60c5,29650ba669da..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -1490,6 -1491,246 +1490,249 @@@ map_cmd_status(struct fusion_context *f
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * megasas_is_prp_possible -
++  * Checks if native NVMe PRPs can be built for the IO
++  *
++  * @instance:		Adapter soft state
++  * @scmd:		SCSI command from the mid-layer
++  * @sge_count:		scatter gather element count.
++  *
++  * Returns:		true: PRPs can be built
++  *			false: IEEE SGLs needs to be built
++  */
++ static bool
++ megasas_is_prp_possible(struct megasas_instance *instance,
++ 			struct scsi_cmnd *scmd, int sge_count)
++ {
++ 	struct fusion_context *fusion;
++ 	int i;
++ 	u32 data_length = 0;
++ 	struct scatterlist *sg_scmd;
++ 	bool build_prp = false;
++ 	u32 mr_nvme_pg_size;
++ 
++ 	mr_nvme_pg_size = max_t(u32, instance->nvme_page_size,
++ 				MR_DEFAULT_NVME_PAGE_SIZE);
++ 	fusion = instance->ctrl_context;
++ 	data_length = scsi_bufflen(scmd);
++ 	sg_scmd = scsi_sglist(scmd);
++ 
++ 	/*
++ 	 * NVMe uses one PRP for each page (or part of a page)
++ 	 * look at the data length - if 4 pages or less then IEEE is OK
++ 	 * if  > 5 pages then we need to build a native SGL
++ 	 * if > 4 and <= 5 pages, then check physical address of 1st SG entry
++ 	 * if this first size in the page is >= the residual beyond 4 pages
++ 	 * then use IEEE, otherwise use native SGL
++ 	 */
++ 
++ 	if (data_length > (mr_nvme_pg_size * 5)) {
++ 		build_prp = true;
++ 	} else if ((data_length > (mr_nvme_pg_size * 4)) &&
++ 			(data_length <= (mr_nvme_pg_size * 5)))  {
++ 		/* check if 1st SG entry size is < residual beyond 4 pages */
++ 		if (sg_dma_len(sg_scmd) < (data_length - (mr_nvme_pg_size * 4)))
++ 			build_prp = true;
++ 	}
++ 
++ /*
++  * Below code detects gaps/holes in IO data buffers.
++  * What does holes/gaps mean?
++  * Any SGE except first one in a SGL starts at non NVME page size
++  * aligned address OR Any SGE except last one in a SGL ends at
++  * non NVME page size boundary.
++  *
++  * Driver has already informed block layer by setting boundary rules for
++  * bio merging done at NVME page size boundary calling kernel API
++  * blk_queue_virt_boundary inside slave_config.
++  * Still there is possibility of IO coming with holes to driver because of
++  * IO merging done by IO scheduler.
++  *
++  * With SCSI BLK MQ enabled, there will be no IO with holes as there is no
++  * IO scheduling so no IO merging.
++  *
++  * With SCSI BLK MQ disabled, IO scheduler may attempt to merge IOs and
++  * then sending IOs with holes.
++  *
++  * Though driver can request block layer to disable IO merging by calling-
++  * queue_flag_set_unlocked(QUEUE_FLAG_NOMERGES, sdev->request_queue) but
++  * user may tune sysfs parameter- nomerges again to 0 or 1.
++  *
++  * If in future IO scheduling is enabled with SCSI BLK MQ,
++  * this algorithm to detect holes will be required in driver
++  * for SCSI BLK MQ enabled case as well.
++  *
++  *
++  */
++ 	scsi_for_each_sg(scmd, sg_scmd, sge_count, i) {
++ 		if ((i != 0) && (i != (sge_count - 1))) {
++ 			if (mega_mod64(sg_dma_len(sg_scmd), mr_nvme_pg_size) ||
++ 			    mega_mod64(sg_dma_address(sg_scmd),
++ 				       mr_nvme_pg_size)) {
++ 				build_prp = false;
++ 				atomic_inc(&instance->sge_holes_type1);
++ 				break;
++ 			}
++ 		}
++ 
++ 		if ((sge_count > 1) && (i == 0)) {
++ 			if ((mega_mod64((sg_dma_address(sg_scmd) +
++ 					sg_dma_len(sg_scmd)),
++ 					mr_nvme_pg_size))) {
++ 				build_prp = false;
++ 				atomic_inc(&instance->sge_holes_type2);
++ 				break;
++ 			}
++ 		}
++ 
++ 		if ((sge_count > 1) && (i == (sge_count - 1))) {
++ 			if (mega_mod64(sg_dma_address(sg_scmd),
++ 				       mr_nvme_pg_size)) {
++ 				build_prp = false;
++ 				atomic_inc(&instance->sge_holes_type3);
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	return build_prp;
++ }
++ 
++ /**
++  * megasas_make_prp_nvme -
++  * Prepare PRPs(Physical Region Page)- SGLs specific to NVMe drives only
++  *
++  * @instance:		Adapter soft state
++  * @scmd:		SCSI command from the mid-layer
++  * @sgl_ptr:		SGL to be filled in
++  * @cmd:		Fusion command frame
++  * @sge_count:		scatter gather element count.
++  *
++  * Returns:		true: PRPs are built
++  *			false: IEEE SGLs needs to be built
++  */
++ static bool
++ megasas_make_prp_nvme(struct megasas_instance *instance, struct scsi_cmnd *scmd,
++ 		      struct MPI25_IEEE_SGE_CHAIN64 *sgl_ptr,
++ 		      struct megasas_cmd_fusion *cmd, int sge_count)
++ {
++ 	int sge_len, offset, num_prp_in_chain = 0;
++ 	struct MPI25_IEEE_SGE_CHAIN64 *main_chain_element, *ptr_first_sgl;
++ 	u64 *ptr_sgl;
++ 	dma_addr_t ptr_sgl_phys;
++ 	u64 sge_addr;
++ 	u32 page_mask, page_mask_result;
++ 	struct scatterlist *sg_scmd;
++ 	u32 first_prp_len;
++ 	bool build_prp = false;
++ 	int data_len = scsi_bufflen(scmd);
++ 	struct fusion_context *fusion;
++ 	u32 mr_nvme_pg_size = max_t(u32, instance->nvme_page_size,
++ 					MR_DEFAULT_NVME_PAGE_SIZE);
++ 
++ 	fusion = instance->ctrl_context;
++ 
++ 	build_prp = megasas_is_prp_possible(instance, scmd, sge_count);
++ 
++ 	if (!build_prp)
++ 		return false;
++ 
++ 	/*
++ 	 * Nvme has a very convoluted prp format.  One prp is required
++ 	 * for each page or partial page. Driver need to split up OS sg_list
++ 	 * entries if it is longer than one page or cross a page
++ 	 * boundary.  Driver also have to insert a PRP list pointer entry as
++ 	 * the last entry in each physical page of the PRP list.
++ 	 *
++ 	 * NOTE: The first PRP "entry" is actually placed in the first
++ 	 * SGL entry in the main message as IEEE 64 format.  The 2nd
++ 	 * entry in the main message is the chain element, and the rest
++ 	 * of the PRP entries are built in the contiguous pcie buffer.
++ 	 */
++ 	page_mask = mr_nvme_pg_size - 1;
++ 	ptr_sgl = (u64 *)cmd->sg_frame;
++ 	ptr_sgl_phys = cmd->sg_frame_phys_addr;
++ 	memset(ptr_sgl, 0, instance->max_chain_frame_sz);
++ 
++ 	/* Build chain frame element which holds all prps except first*/
++ 	main_chain_element = (struct MPI25_IEEE_SGE_CHAIN64 *)
++ 	    ((u8 *)sgl_ptr + sizeof(struct MPI25_IEEE_SGE_CHAIN64));
++ 
++ 	main_chain_element->Address = cpu_to_le64(ptr_sgl_phys);
++ 	main_chain_element->NextChainOffset = 0;
++ 	main_chain_element->Flags = IEEE_SGE_FLAGS_CHAIN_ELEMENT |
++ 					IEEE_SGE_FLAGS_SYSTEM_ADDR |
++ 					MPI26_IEEE_SGE_FLAGS_NSF_NVME_PRP;
++ 
++ 	/* Build first prp, sge need not to be page aligned*/
++ 	ptr_first_sgl = sgl_ptr;
++ 	sg_scmd = scsi_sglist(scmd);
++ 	sge_addr = sg_dma_address(sg_scmd);
++ 	sge_len = sg_dma_len(sg_scmd);
++ 
++ 	offset = (u32)(sge_addr & page_mask);
++ 	first_prp_len = mr_nvme_pg_size - offset;
++ 
++ 	ptr_first_sgl->Address = cpu_to_le64(sge_addr);
++ 	ptr_first_sgl->Length = cpu_to_le32(first_prp_len);
++ 
++ 	data_len -= first_prp_len;
++ 
++ 	if (sge_len > first_prp_len) {
++ 		sge_addr += first_prp_len;
++ 		sge_len -= first_prp_len;
++ 	} else if (sge_len == first_prp_len) {
++ 		sg_scmd = sg_next(sg_scmd);
++ 		sge_addr = sg_dma_address(sg_scmd);
++ 		sge_len = sg_dma_len(sg_scmd);
++ 	}
++ 
++ 	for (;;) {
++ 		offset = (u32)(sge_addr & page_mask);
++ 
++ 		/* Put PRP pointer due to page boundary*/
++ 		page_mask_result = (uintptr_t)(ptr_sgl + 1) & page_mask;
++ 		if (unlikely(!page_mask_result)) {
++ 			scmd_printk(KERN_NOTICE,
++ 				    scmd, "page boundary ptr_sgl: 0x%p\n",
++ 				    ptr_sgl);
++ 			ptr_sgl_phys += 8;
++ 			*ptr_sgl = cpu_to_le64(ptr_sgl_phys);
++ 			ptr_sgl++;
++ 			num_prp_in_chain++;
++ 		}
++ 
++ 		*ptr_sgl = cpu_to_le64(sge_addr);
++ 		ptr_sgl++;
++ 		ptr_sgl_phys += 8;
++ 		num_prp_in_chain++;
++ 
++ 		sge_addr += mr_nvme_pg_size;
++ 		sge_len -= mr_nvme_pg_size;
++ 		data_len -= mr_nvme_pg_size;
++ 
++ 		if (data_len <= 0)
++ 			break;
++ 
++ 		if (sge_len > 0)
++ 			continue;
++ 
++ 		sg_scmd = sg_next(sg_scmd);
++ 		sge_addr = sg_dma_address(sg_scmd);
++ 		sge_len = sg_dma_len(sg_scmd);
++ 	}
++ 
++ 	main_chain_element->Length =
++ 			cpu_to_le32(num_prp_in_chain * sizeof(u64));
++ 
++ 	atomic_inc(&instance->prp_sgl);
++ 	return build_prp;
++ }
++ 
++ /**
+++>>>>>>> d1da522fb8a7 (scsi: megaraid_sas: handle dma_addr_t right on 32-bit)
+   * megasas_make_sgl_fusion -	Prepares 32-bit SGL
+   * @instance:		Adapter soft state
+   * @scp:		SCSI command from the mid-layer
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
