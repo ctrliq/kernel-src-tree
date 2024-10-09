@@ -1,0 +1,331 @@
+scsi: cxlflash: Update TMF command processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Update TMF command processing (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 92.86%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 8ba1ddb31f528cb45be39b7f3b600261afaa7920
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8ba1ddb3.failed
+
+Currently, the SCSI command presented to the device reset handler is used
+to send TMFs to the AFU for a device reset. This behavior is incorrect as
+the command presented is an actual command and not a special notification.
+As such, it should only be used for reference and not be acted upon.
+
+Additionally, the existing TMF transmission routine does not account for
+actual errors from the hardware, only reflecting failure when a timeout
+occurs. This can lead to a condition where the device reset handler is
+presented with a false 'success'.
+
+Update send_tmf() to dynamically allocate a private command for sending
+the TMF command and properly reflect failure when the completed command
+indicates an error or was aborted. Detect TMF commands during response
+processing and avoid scsi_done() for these types of commands. Lastly,
+update comments in the TMF processing paths to describe the new behavior.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8ba1ddb31f528cb45be39b7f3b600261afaa7920)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,7a787b6e21c4..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -209,9 -155,10 +209,16 @@@ static void process_cmd_err(struct afu_
+   * cmd_complete() - command completion handler
+   * @cmd:	AFU command that has completed.
+   *
+++<<<<<<< HEAD
+ + * Prepares and submits command that has either completed or timed out to
+ + * the SCSI stack. Checks AFU command back into command pool for non-internal
+ + * (rcb.scp populated) commands.
+++=======
++  * For SCSI commands this routine prepares and submits commands that have
++  * either completed or timed out to the SCSI stack. For internal commands
++  * (TMF or AFU), this routine simply notifies the originator that the
++  * command has completed.
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+   */
+  static void cmd_complete(struct afu_cmd *cmd)
+  {
+@@@ -219,72 -166,104 +226,130 @@@
+  	ulong lock_flags;
+  	struct afu *afu = cmd->parent;
+  	struct cxlflash_cfg *cfg = afu->parent;
+++<<<<<<< HEAD
+ +	bool cmd_is_tmf;
+++=======
++ 	struct device *dev = &cfg->dev->dev;
++ 	struct hwq *hwq = get_hwq(afu, cmd->hwq_index);
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  
+ -	spin_lock_irqsave(&hwq->hsq_slock, lock_flags);
+ -	list_del(&cmd->list);
+ -	spin_unlock_irqrestore(&hwq->hsq_slock, lock_flags);
+ +	spin_lock_irqsave(&cmd->slock, lock_flags);
+ +	cmd->sa.host_use_b[0] |= B_DONE;
+ +	spin_unlock_irqrestore(&cmd->slock, lock_flags);
+  
+ -	if (cmd->scp) {
+ -		scp = cmd->scp;
+ +	if (cmd->rcb.scp) {
+ +		scp = cmd->rcb.scp;
+  		if (unlikely(cmd->sa.ioasc))
+  			process_cmd_err(cmd, scp);
+  		else
+  			scp->result = (DID_OK << 16);
+  
+++<<<<<<< HEAD
+ +		cmd_is_tmf = cmd->cmd_tmf;
+ +		cmd_checkin(cmd); /* Don't use cmd after here */
+ +
+ +		pr_debug_ratelimited("%s: calling scsi_done scp=%p result=%X "
+ +				     "ioasc=%d\n", __func__, scp, scp->result,
+ +				     cmd->sa.ioasc);
+ +
+ +		scsi_dma_unmap(scp);
+++=======
++ 		dev_dbg_ratelimited(dev, "%s:scp=%p result=%08x ioasc=%08x\n",
++ 				    __func__, scp, scp->result, cmd->sa.ioasc);
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  		scp->scsi_done(scp);
+- 
+- 		if (cmd_is_tmf) {
+- 			spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
+- 			cfg->tmf_active = false;
+- 			wake_up_all_locked(&cfg->tmf_waitq);
+- 			spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+- 		}
++ 	} else if (cmd->cmd_tmf) {
++ 		spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
++ 		cfg->tmf_active = false;
++ 		wake_up_all_locked(&cfg->tmf_waitq);
++ 		spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+  	} else
+  		complete(&cmd->cevent);
+  }
+  
+  /**
+ - * flush_pending_cmds() - flush all pending commands on this hardware queue
+ - * @hwq:	Hardware queue to flush.
+ + * context_reset() - timeout handler for AFU commands
+ + * @cmd:	AFU command that timed out.
+   *
+ - * The hardware send queue lock associated with this hardware queue must be
+ - * held when calling this routine.
+ + * Sends a reset to the AFU.
+   */
+ -static void flush_pending_cmds(struct hwq *hwq)
+ +static void context_reset(struct afu_cmd *cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct cxlflash_cfg *cfg = hwq->afu->parent;
++ 	struct afu_cmd *cmd, *tmp;
++ 	struct scsi_cmnd *scp;
++ 	ulong lock_flags;
++ 
++ 	list_for_each_entry_safe(cmd, tmp, &hwq->pending_cmds, list) {
++ 		/* Bypass command when on a doneq, cmd_complete() will handle */
++ 		if (!list_empty(&cmd->queue))
++ 			continue;
++ 
++ 		list_del(&cmd->list);
++ 
++ 		if (cmd->scp) {
++ 			scp = cmd->scp;
++ 			scp->result = (DID_IMM_RETRY << 16);
++ 			scp->scsi_done(scp);
++ 		} else {
++ 			cmd->cmd_aborted = true;
++ 
++ 			if (cmd->cmd_tmf) {
++ 				spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
++ 				cfg->tmf_active = false;
++ 				wake_up_all_locked(&cfg->tmf_waitq);
++ 				spin_unlock_irqrestore(&cfg->tmf_slock,
++ 						       lock_flags);
++ 			} else
++ 				complete(&cmd->cevent);
++ 		}
++ 	}
++ }
++ 
++ /**
++  * context_reset() - reset context via specified register
++  * @hwq:	Hardware queue owning the context to be reset.
++  * @reset_reg:	MMIO register to perform reset.
++  *
++  * When the reset is successful, the SISLite specification guarantees that
++  * the AFU has aborted all currently pending I/O. Accordingly, these commands
++  * must be flushed.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ static int context_reset(struct hwq *hwq, __be64 __iomem *reset_reg)
++ {
++ 	struct cxlflash_cfg *cfg = hwq->afu->parent;
++ 	struct device *dev = &cfg->dev->dev;
++ 	int rc = -ETIMEDOUT;
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  	int nretry = 0;
+ -	u64 val = 0x1;
+ +	u64 rrin = 0x1;
+ +	struct afu *afu = cmd->parent;
+ +	struct cxlflash_cfg *cfg = afu->parent;
+ +	struct device *dev = &cfg->dev->dev;
+  	ulong lock_flags;
+  
+ -	dev_dbg(dev, "%s: hwq=%p\n", __func__, hwq);
+ +	pr_debug("%s: cmd=%p\n", __func__, cmd);
+  
+ -	spin_lock_irqsave(&hwq->hsq_slock, lock_flags);
+ +	spin_lock_irqsave(&cmd->slock, lock_flags);
+  
+ -	writeq_be(val, reset_reg);
+ +	/* Already completed? */
+ +	if (cmd->sa.host_use_b[0] & B_DONE) {
+ +		spin_unlock_irqrestore(&cmd->slock, lock_flags);
+ +		return;
+ +	}
+ +
+ +	cmd->sa.host_use_b[0] |= (B_DONE | B_ERROR | B_TIMEOUT);
+ +	spin_unlock_irqrestore(&cmd->slock, lock_flags);
+ +
+ +	writeq_be(rrin, &afu->host_map->ioarrin);
+  	do {
+ -		val = readq_be(reset_reg);
+ -		if ((val & 0x1) == 0x0) {
+ -			rc = 0;
+ +		rrin = readq_be(&afu->host_map->ioarrin);
+ +		if (rrin != 0x1)
+  			break;
+ -		}
+ -
+  		/* Double delay each time */
+  		udelay(1 << nretry);
+  	} while (nretry++ < MC_ROOM_RETRY_CNT);
+@@@ -366,24 -468,27 +431,46 @@@ static void wait_resp(struct afu *afu, 
+   */
+  static int send_tmf(struct afu *afu, struct scsi_cmnd *scp, u64 tmfcmd)
+  {
+ +	struct afu_cmd *cmd;
+ +
+ +	u32 port_sel = scp->device->channel + 1;
+ +	short lflag = 0;
+  	struct Scsi_Host *host = scp->device->host;
+++<<<<<<< HEAD
+ +	struct cxlflash_cfg *cfg = (struct cxlflash_cfg *)host->hostdata;
+ +	struct device *dev = &cfg->dev->dev;
+++=======
++ 	struct cxlflash_cfg *cfg = shost_priv(host);
++ 	struct afu_cmd *cmd = NULL;
++ 	struct device *dev = &cfg->dev->dev;
++ 	int hwq_index = cmd_to_target_hwq(host, scp, afu);
++ 	struct hwq *hwq = get_hwq(afu, hwq_index);
++ 	char *buf = NULL;
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  	ulong lock_flags;
+  	int rc = 0;
+  	ulong to;
+  
+++<<<<<<< HEAD
+ +	cmd = cmd_checkout(afu);
+ +	if (unlikely(!cmd)) {
+ +		dev_err(dev, "%s: could not get a free command\n", __func__);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+ +	}
+ +
+++=======
++ 	buf = kzalloc(sizeof(*cmd) + __alignof__(*cmd) - 1, GFP_KERNEL);
++ 	if (unlikely(!buf)) {
++ 		dev_err(dev, "%s: no memory for command\n", __func__);
++ 		rc = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	cmd = (struct afu_cmd *)PTR_ALIGN(buf, __alignof__(*cmd));
++ 	INIT_LIST_HEAD(&cmd->queue);
++ 
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  	/* When Task Management Function is active do not send another */
+  	spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
+  	if (cfg->tmf_active)
+@@@ -391,28 -496,23 +478,38 @@@
+  						  !cfg->tmf_active,
+  						  cfg->tmf_slock);
+  	cfg->tmf_active = true;
+ +	cmd->cmd_tmf = true;
+  	spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+  
+++<<<<<<< HEAD
+ +	cmd->rcb.ctx_id = afu->ctx_hndl;
+ +	cmd->rcb.port_sel = port_sel;
+++=======
++ 	cmd->parent = afu;
++ 	cmd->cmd_tmf = true;
++ 	cmd->hwq_index = hwq_index;
++ 
++ 	cmd->rcb.ctx_id = hwq->ctx_hndl;
++ 	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
++ 	cmd->rcb.port_sel = CHAN2PORTMASK(scp->device->channel);
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+ +
+ +	lflag = SISL_REQ_FLAGS_TMF_CMD;
+ +
+  	cmd->rcb.req_flags = (SISL_REQ_FLAGS_PORT_LUN_ID |
+ -			      SISL_REQ_FLAGS_SUP_UNDERRUN |
+ -			      SISL_REQ_FLAGS_TMF_CMD);
+ +			      SISL_REQ_FLAGS_SUP_UNDERRUN | lflag);
+ +
+ +	/* Stash the scp in the reserved field, for reuse during interrupt */
+ +	cmd->rcb.scp = scp;
+ +
+ +	/* Copy the CDB from the cmd passed in */
+  	memcpy(cmd->rcb.cdb, &tmfcmd, sizeof(tmfcmd));
+  
+ -	rc = afu->send_cmd(afu, cmd);
+ +	/* Send the command */
+ +	rc = send_cmd(afu, cmd);
+  	if (unlikely(rc)) {
+ +		cmd_checkin(cmd);
+  		spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
+  		cfg->tmf_active = false;
+  		spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+@@@ -426,12 -526,20 +523,26 @@@
+  						       cfg->tmf_slock,
+  						       to);
+  	if (!to) {
+++<<<<<<< HEAD
+ +		cfg->tmf_active = false;
+ +		dev_err(dev, "%s: TMF timed out!\n", __func__);
+ +		rc = -1;
+++=======
++ 		dev_err(dev, "%s: TMF timed out\n", __func__);
++ 		rc = -ETIMEDOUT;
++ 	} else if (cmd->cmd_aborted) {
++ 		dev_err(dev, "%s: TMF aborted\n", __func__);
++ 		rc = -EAGAIN;
++ 	} else if (cmd->sa.ioasc) {
++ 		dev_err(dev, "%s: TMF failed ioasc=%08x\n",
++ 			__func__, cmd->sa.ioasc);
++ 		rc = -EIO;
+++>>>>>>> 8ba1ddb31f52 (scsi: cxlflash: Update TMF command processing)
+  	}
++ 	cfg->tmf_active = false;
+  	spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+  out:
++ 	kfree(buf);
+  	return rc;
+  }
+  
+* Unmerged path drivers/scsi/cxlflash/main.c
