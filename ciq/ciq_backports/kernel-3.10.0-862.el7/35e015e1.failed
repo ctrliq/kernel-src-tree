@@ -1,0 +1,249 @@
+ipv6: fix net.ipv6.conf.all interface DAD handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matteo Croce <mcroce@redhat.com>
+commit 35e015e1f5773417952fe91ce8790baf9b4237a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/35e015e1.failed
+
+Currently, writing into
+net.ipv6.conf.all.{accept_dad,use_optimistic,optimistic_dad} has no effect.
+Fix handling of these flags by:
+
+- using the maximum of global and per-interface values for the
+  accept_dad flag. That is, if at least one of the two values is
+  non-zero, enable DAD on the interface. If at least one value is
+  set to 2, enable DAD and disable IPv6 operation on the interface if
+  MAC-based link-local address was found
+
+- using the logical OR of global and per-interface values for the
+  optimistic_dad flag. If at least one of them is set to one, optimistic
+  duplicate address detection (RFC 4429) is enabled on the interface
+
+- using the logical OR of global and per-interface values for the
+  use_optimistic flag. If at least one of them is set to one,
+  optimistic addresses won't be marked as deprecated during source address
+  selection on the interface.
+
+While at it, as we're modifying the prototype for ipv6_use_optimistic_addr(),
+drop inline, and let the compiler decide.
+
+Fixes: 7fd2561e4ebd ("net: ipv6: Add a sysctl to make optimistic addresses useful candidates")
+	Signed-off-by: Matteo Croce <mcroce@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 35e015e1f5773417952fe91ce8790baf9b4237a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ip-sysctl.txt
+#	net/ipv6/addrconf.c
+diff --cc Documentation/networking/ip-sysctl.txt
+index b429f2115de4,77f4de59dc9c..000000000000
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@@ -1473,6 -1722,32 +1476,35 @@@ force_mld_version - INTEGE
+  	1 - Enforce to use MLD version 1
+  	2 - Enforce to use MLD version 2
+  
+++<<<<<<< HEAD
+++=======
++ suppress_frag_ndisc - INTEGER
++ 	Control RFC 6980 (Security Implications of IPv6 Fragmentation
++ 	with IPv6 Neighbor Discovery) behavior:
++ 	1 - (default) discard fragmented neighbor discovery packets
++ 	0 - allow fragmented neighbor discovery packets
++ 
++ optimistic_dad - BOOLEAN
++ 	Whether to perform Optimistic Duplicate Address Detection (RFC 4429).
++ 	0: disabled (default)
++ 	1: enabled
++ 
++ 	Optimistic Duplicate Address Detection for the interface will be enabled
++ 	if at least one of conf/{all,interface}/optimistic_dad is set to 1,
++ 	it will be disabled otherwise.
++ 
++ use_optimistic - BOOLEAN
++ 	If enabled, do not classify optimistic addresses as deprecated during
++ 	source address selection.  Preferred addresses will still be chosen
++ 	before optimistic addresses, subject to other ranking in the source
++ 	address selection algorithm.
++ 	0: disabled (default)
++ 	1: enabled
++ 
++ 	This will be enabled if at least one of
++ 	conf/{all,interface}/use_optimistic is set to 1, disabled otherwise.
++ 
+++>>>>>>> 35e015e1f577 (ipv6: fix net.ipv6.conf.all interface DAD handlers)
+  stable_secret - IPv6 address
+  	This IPv6 address will be used as a secret to generate IPv6
+  	addresses for link-local addresses and autoconfigured
+diff --cc net/ipv6/addrconf.c
+index abaf198b4f92,96861c702c06..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -1196,6 -1399,23 +1196,26 @@@ static inline int ipv6_saddr_preferred(
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool ipv6_use_optimistic_addr(struct net *net,
++ 				     struct inet6_dev *idev)
++ {
++ #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
++ 	if (!idev)
++ 		return false;
++ 	if (!net->ipv6.devconf_all->optimistic_dad && !idev->cnf.optimistic_dad)
++ 		return false;
++ 	if (!net->ipv6.devconf_all->use_optimistic && !idev->cnf.use_optimistic)
++ 		return false;
++ 
++ 	return true;
++ #else
++ 	return false;
++ #endif
++ }
++ 
+++>>>>>>> 35e015e1f577 (ipv6: fix net.ipv6.conf.all interface DAD handlers)
+  static int ipv6_get_saddr_eval(struct net *net,
+  			       struct ipv6_saddr_score *score,
+  			       struct ipv6_saddr_dst *dst,
+@@@ -1256,10 -1476,16 +1276,17 @@@
+  		score->scopedist = ret;
+  		break;
+  	case IPV6_SADDR_RULE_PREFERRED:
+ -	    {
+  		/* Rule 3: Avoid deprecated and optimistic addresses */
+++<<<<<<< HEAD
+++=======
++ 		u8 avoid = IFA_F_DEPRECATED;
++ 
++ 		if (!ipv6_use_optimistic_addr(net, score->ifa->idev))
++ 			avoid |= IFA_F_OPTIMISTIC;
+++>>>>>>> 35e015e1f577 (ipv6: fix net.ipv6.conf.all interface DAD handlers)
+  		ret = ipv6_saddr_preferred(score->addr_type) ||
+ -		      !(score->ifa->flags & avoid);
+ +		      !(score->ifa->flags & (IFA_F_DEPRECATED|IFA_F_OPTIMISTIC));
+  		break;
+ -	    }
+  #ifdef CONFIG_IPV6_MIP6
+  	case IPV6_SADDR_RULE_HOA:
+  	    {
+@@@ -2762,55 -3051,17 +2790,56 @@@ static void init_loopback(struct net_de
+  	}
+  
+  	add_addr(idev, &in6addr_loopback, 128, IFA_HOST);
+ -}
+  
+ -void addrconf_add_linklocal(struct inet6_dev *idev,
+ -			    const struct in6_addr *addr, u32 flags)
+ -{
+ -	struct inet6_ifaddr *ifp;
+ -	u32 addr_flags = flags | IFA_F_PERMANENT;
+ +	/* Add routes to other interface's IPv6 addresses */
+ +	for_each_netdev(dev_net(dev), sp_dev) {
+ +		if (!strcmp(sp_dev->name, dev->name))
+ +			continue;
+ +
+ +		idev = __in6_dev_get(sp_dev);
+ +		if (!idev)
+ +			continue;
+ +
+ +		read_lock_bh(&idev->lock);
+ +		list_for_each_entry(sp_ifa, &idev->addr_list, if_list) {
+ +
+ +			if (sp_ifa->flags & (IFA_F_DADFAILED | IFA_F_TENTATIVE))
+ +				continue;
+ +
+ +			if (sp_ifa->rt) {
+ +				/* This dst has been added to garbage list when
+ +				 * lo device down, release this obsolete dst and
+ +				 * reallocate a new router for ifa.
+ +				 */
+ +				if (!atomic_read(&sp_ifa->rt->rt6i_ref)) {
+ +					ip6_rt_put(sp_ifa->rt);
+ +					sp_ifa->rt = NULL;
+ +				} else {
+ +					continue;
+ +				}
+ +			}
+ +
+ +			sp_rt = addrconf_dst_alloc(idev, &sp_ifa->addr, 0);
+ +
+ +			/* Failure cases are ignored */
+ +			if (!IS_ERR(sp_rt)) {
+ +				sp_ifa->rt = sp_rt;
+ +				ip6_ins_rt(sp_rt);
+ +			}
+ +		}
+ +		read_unlock_bh(&idev->lock);
+ +	}
+ +}
+ +
+ +void addrconf_add_linklocal(struct inet6_dev *idev,
+ +			    const struct in6_addr *addr, u32 flags)
+ +{
+ +	struct inet6_ifaddr *ifp;
+ +	u32 addr_flags = flags | IFA_F_PERMANENT;
+  
+  #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
+- 	if (idev->cnf.optimistic_dad &&
++ 	if ((dev_net(idev->dev)->ipv6.devconf_all->optimistic_dad ||
++ 	     idev->cnf.optimistic_dad) &&
+  	    !dev_net(idev->dev)->ipv6.devconf_all->forwarding)
+  		addr_flags |= IFA_F_OPTIMISTIC;
+  #endif
+@@@ -3437,8 -3850,15 +3467,18 @@@ static void addrconf_dad_begin(struct i
+  	 * Optimistic nodes can start receiving
+  	 * Frames right away
+  	 */
+ -	if (ifp->flags & IFA_F_OPTIMISTIC) {
+ +	if (ifp->flags & IFA_F_OPTIMISTIC)
+  		ip6_ins_rt(ifp->rt);
+++<<<<<<< HEAD
+++=======
++ 		if (ipv6_use_optimistic_addr(dev_net(dev), idev)) {
++ 			/* Because optimistic nodes can use this address,
++ 			 * notify listeners. If DAD fails, RTM_DELADDR is sent.
++ 			 */
++ 			notify = true;
++ 		}
++ 	}
+++>>>>>>> 35e015e1f577 (ipv6: fix net.ipv6.conf.all interface DAD handlers)
+  
+  	addrconf_dad_kick(ifp);
+  out:
+@@@ -3485,6 -3907,26 +3525,29 @@@ static void addrconf_dad_work(struct wo
+  	} else if (ifp->state == INET6_IFADDR_STATE_ERRDAD) {
+  		action = DAD_ABORT;
+  		ifp->state = INET6_IFADDR_STATE_POSTDAD;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if ((dev_net(idev->dev)->ipv6.devconf_all->accept_dad > 1 ||
++ 		     idev->cnf.accept_dad > 1) &&
++ 		    !idev->cnf.disable_ipv6 &&
++ 		    !(ifp->flags & IFA_F_STABLE_PRIVACY)) {
++ 			struct in6_addr addr;
++ 
++ 			addr.s6_addr32[0] = htonl(0xfe800000);
++ 			addr.s6_addr32[1] = 0;
++ 
++ 			if (!ipv6_generate_eui64(addr.s6_addr + 8, idev->dev) &&
++ 			    ipv6_addr_equal(&ifp->addr, &addr)) {
++ 				/* DAD failed for link-local based on MAC */
++ 				idev->cnf.disable_ipv6 = 1;
++ 
++ 				pr_info("%s: IPv6 being disabled!\n",
++ 					ifp->idev->dev->name);
++ 				disable_ipv6 = true;
++ 			}
++ 		}
+++>>>>>>> 35e015e1f577 (ipv6: fix net.ipv6.conf.all interface DAD handlers)
+  	}
+  	spin_unlock_bh(&ifp->lock);
+  
+* Unmerged path Documentation/networking/ip-sysctl.txt
+* Unmerged path net/ipv6/addrconf.c
