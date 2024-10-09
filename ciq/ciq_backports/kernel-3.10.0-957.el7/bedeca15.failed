@@ -1,0 +1,351 @@
+nfp: flower: compile Geneve match fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit bedeca15afd8f0a2d3ad3a76830b3f6525a2aeeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bedeca15.failed
+
+Compile Geneve match fields for offloading to the NFP. The addition of
+Geneve overflows the 8 bit key_layer field, so apply extended metadata to
+the match cmsg allowing up to 32 more key_layer fields.
+
+Rather than adding new Geneve blocks, move the vxlan code to generic ipv4
+udp tunnel structs and use these for both vxlan and Geneve.
+
+Matches are only supported when specifically mentioning well known port
+6081. Geneve tunnel options are not yet included in the match.
+
+Only offload Geneve if the fw supports it - include check for this.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bedeca15afd8f0a2d3ad3a76830b3f6525a2aeeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 4a2f6a2fef04,837134a9137c..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -130,8 -130,11 +130,16 @@@ static bool nfp_flower_check_higher_tha
+  }
+  
+  static int
+++<<<<<<< HEAD
+ +nfp_flower_calculate_key_layers(struct nfp_fl_key_ls *ret_key_ls,
+ +				struct tc_cls_flower_offload *flow)
+++=======
++ nfp_flower_calculate_key_layers(struct nfp_app *app,
++ 				struct nfp_fl_key_ls *ret_key_ls,
++ 				struct tc_cls_flower_offload *flow,
++ 				bool egress,
++ 				enum nfp_flower_tun_type *tun_type)
+++>>>>>>> bedeca15afd8 (nfp: flower: compile Geneve match fields)
+  {
+  	struct flow_dissector_key_basic *mask_basic = NULL;
+  	struct flow_dissector_key_basic *key_basic = NULL;
+@@@ -193,12 -200,30 +202,35 @@@
+  						  FLOW_DISSECTOR_KEY_ENC_PORTS,
+  						  flow->key);
+  
+- 		if (mask_enc_ports->dst != cpu_to_be16(~0) ||
+- 		    enc_ports->dst != htons(NFP_FL_VXLAN_PORT))
++ 		if (mask_enc_ports->dst != cpu_to_be16(~0))
+  			return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +		key_layer |= NFP_FLOWER_LAYER_VXLAN;
+ +		key_size += sizeof(struct nfp_flower_vxlan);
+++=======
++ 		switch (enc_ports->dst) {
++ 		case htons(NFP_FL_VXLAN_PORT):
++ 			*tun_type = NFP_FL_TUNNEL_VXLAN;
++ 			key_layer |= NFP_FLOWER_LAYER_VXLAN;
++ 			key_size += sizeof(struct nfp_flower_ipv4_udp_tun);
++ 			break;
++ 		case htons(NFP_FL_GENEVE_PORT):
++ 			if (!(priv->flower_ext_feats & NFP_FL_FEATS_GENEVE))
++ 				return -EOPNOTSUPP;
++ 			*tun_type = NFP_FL_TUNNEL_GENEVE;
++ 			key_layer |= NFP_FLOWER_LAYER_EXT_META;
++ 			key_size += sizeof(struct nfp_flower_ext_meta);
++ 			key_layer_two |= NFP_FLOWER_LAYER2_GENEVE;
++ 			key_size += sizeof(struct nfp_flower_ipv4_udp_tun);
++ 			break;
++ 		default:
++ 			return -EOPNOTSUPP;
++ 		}
++ 	} else if (egress) {
++ 		/* Reject non tunnel matches offloaded to egress repr. */
++ 		return -EOPNOTSUPP;
+++>>>>>>> bedeca15afd8 (nfp: flower: compile Geneve match fields)
+  	}
+  
+  	if (dissector_uses_key(flow->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
+@@@ -321,8 -346,9 +353,9 @@@ err_free_flow
+   */
+  static int
+  nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
+ -		       struct tc_cls_flower_offload *flow, bool egress)
+ +		       struct tc_cls_flower_offload *flow)
+  {
++ 	enum nfp_flower_tun_type tun_type = NFP_FL_TUNNEL_NONE;
+  	struct nfp_flower_priv *priv = app->priv;
+  	struct nfp_fl_payload *flow_pay;
+  	struct nfp_fl_key_ls *key_layer;
+@@@ -333,7 -358,8 +366,12 @@@
+  	if (!key_layer)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	err = nfp_flower_calculate_key_layers(key_layer, flow);
+++=======
++ 	err = nfp_flower_calculate_key_layers(app, key_layer, flow, egress,
++ 					      &tun_type);
+++>>>>>>> bedeca15afd8 (nfp: flower: compile Geneve match fields)
+  	if (err)
+  		goto err_free_key_ls;
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index d6b63c8f14da..2e71c32690e9 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -41,7 +41,7 @@
+ #include "../nfp_app.h"
+ #include "../nfpcore/nfp_cpp.h"
+ 
+-#define NFP_FLOWER_LAYER_META		BIT(0)
++#define NFP_FLOWER_LAYER_EXT_META	BIT(0)
+ #define NFP_FLOWER_LAYER_PORT		BIT(1)
+ #define NFP_FLOWER_LAYER_MAC		BIT(2)
+ #define NFP_FLOWER_LAYER_TP		BIT(3)
+@@ -50,6 +50,8 @@
+ #define NFP_FLOWER_LAYER_CT		BIT(6)
+ #define NFP_FLOWER_LAYER_VXLAN		BIT(7)
+ 
++#define NFP_FLOWER_LAYER2_GENEVE	BIT(5)
++
+ #define NFP_FLOWER_MASK_VLAN_PRIO	GENMASK(15, 13)
+ #define NFP_FLOWER_MASK_VLAN_CFI	BIT(12)
+ #define NFP_FLOWER_MASK_VLAN_VID	GENMASK(11, 0)
+@@ -105,6 +107,7 @@
+ enum nfp_flower_tun_type {
+ 	NFP_FL_TUNNEL_NONE =	0,
+ 	NFP_FL_TUNNEL_VXLAN =	2,
++	NFP_FL_TUNNEL_GENEVE =	4,
+ };
+ 
+ struct nfp_fl_act_head {
+@@ -198,6 +201,18 @@ struct nfp_flower_meta_tci {
+ 	__be16 tci;
+ };
+ 
++/* Extended metadata for additional key_layers (1W/4B)
++ * ----------------------------------------------------------------
++ *    3                   2                   1
++ *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                      nfp_flow_key_layer2                      |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ */
++struct nfp_flower_ext_meta {
++	__be32 nfp_flow_key_layer2;
++};
++
+ /* Port details (1W/4B)
+  * ----------------------------------------------------------------
+  *    3                   2                   1
+@@ -296,7 +311,7 @@ struct nfp_flower_ipv6 {
+ 	struct in6_addr ipv6_dst;
+ };
+ 
+-/* Flow Frame VXLAN --> Tunnel details (4W/16B)
++/* Flow Frame IPv4 UDP TUNNEL --> Tunnel details (4W/16B)
+  * -----------------------------------------------------------------
+  *    3                   2                   1
+  *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+@@ -305,22 +320,17 @@ struct nfp_flower_ipv6 {
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  * |                         ipv4_addr_dst                         |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+- * |           tun_flags           |       tos     |       ttl     |
++ * |                            Reserved                           |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+- * |   gpe_flags   |            Reserved           | Next Protocol |
++ * |                            Reserved                           |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  * |                     VNI                       |   Reserved    |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  */
+-struct nfp_flower_vxlan {
++struct nfp_flower_ipv4_udp_tun {
+ 	__be32 ip_src;
+ 	__be32 ip_dst;
+-	__be16 tun_flags;
+-	u8 tos;
+-	u8 ttl;
+-	u8 gpe_flags;
+-	u8 reserved[2];
+-	u8 nxt_proto;
++	__be32 reserved[2];
+ 	__be32 tun_id;
+ };
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 32991a7474ad..197dce4926c4 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -34,6 +34,8 @@
+ #ifndef __NFP_FLOWER_H__
+ #define __NFP_FLOWER_H__ 1
+ 
++#include "cmsg.h"
++
+ #include <linux/circ_buf.h>
+ #include <linux/hashtable.h>
+ #include <linux/time64.h>
+@@ -59,6 +61,10 @@ struct nfp_app;
+ #define NFP_FL_MASK_ID_LOCATION		1
+ 
+ #define NFP_FL_VXLAN_PORT		4789
++#define NFP_FL_GENEVE_PORT		6081
++
++/* Extra features bitmap. */
++#define NFP_FL_FEATS_GENEVE		BIT(0)
+ 
+ #define NFP_FLOWER_GOLDEN_RATIO_64	0x61C8864680B583EBull
+ #define NFP_FLOWER_GOLDEN_RATIO_32	0x61C88647
+@@ -187,7 +193,8 @@ int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+ int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+ 				  struct nfp_fl_key_ls *key_ls,
+ 				  struct net_device *netdev,
+-				  struct nfp_fl_payload *nfp_flow);
++				  struct nfp_fl_payload *nfp_flow,
++				  enum nfp_flower_tun_type tun_type);
+ int nfp_flower_compile_action(struct tc_cls_flower_offload *flow,
+ 			      struct net_device *netdev,
+ 			      struct nfp_fl_payload *nfp_flow);
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/match.c b/drivers/net/ethernet/netronome/nfp/flower/match.c
+index e3b10b34035b..37c2ecae2a7a 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/match.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/match.c
+@@ -67,6 +67,12 @@ nfp_flower_compile_meta_tci(struct nfp_flower_meta_tci *frame,
+ 	}
+ }
+ 
++static void
++nfp_flower_compile_ext_meta(struct nfp_flower_ext_meta *frame, u32 key_ext)
++{
++	frame->nfp_flow_key_layer2 = cpu_to_be32(key_ext);
++}
++
+ static int
+ nfp_flower_compile_port(struct nfp_flower_in_port *frame, u32 cmsg_port,
+ 			bool mask_version, enum nfp_flower_tun_type tun_type)
+@@ -216,16 +222,15 @@ nfp_flower_compile_ipv6(struct nfp_flower_ipv6 *frame,
+ }
+ 
+ static void
+-nfp_flower_compile_vxlan(struct nfp_flower_vxlan *frame,
+-			 struct tc_cls_flower_offload *flow,
+-			 bool mask_version)
++nfp_flower_compile_ipv4_udp_tun(struct nfp_flower_ipv4_udp_tun *frame,
++				struct tc_cls_flower_offload *flow,
++				bool mask_version)
+ {
+ 	struct fl_flow_key *target = mask_version ? flow->mask : flow->key;
+-	struct flow_dissector_key_ipv4_addrs *vxlan_ips;
++	struct flow_dissector_key_ipv4_addrs *tun_ips;
+ 	struct flow_dissector_key_keyid *vni;
+ 
+-	/* Wildcard TOS/TTL/GPE_FLAGS/NXT_PROTO for now. */
+-	memset(frame, 0, sizeof(struct nfp_flower_vxlan));
++	memset(frame, 0, sizeof(struct nfp_flower_ipv4_udp_tun));
+ 
+ 	if (dissector_uses_key(flow->dissector,
+ 			       FLOW_DISSECTOR_KEY_ENC_KEYID)) {
+@@ -240,29 +245,26 @@ nfp_flower_compile_vxlan(struct nfp_flower_vxlan *frame,
+ 
+ 	if (dissector_uses_key(flow->dissector,
+ 			       FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS)) {
+-		vxlan_ips =
++		tun_ips =
+ 		   skb_flow_dissector_target(flow->dissector,
+ 					     FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS,
+ 					     target);
+-		frame->ip_src = vxlan_ips->src;
+-		frame->ip_dst = vxlan_ips->dst;
++		frame->ip_src = tun_ips->src;
++		frame->ip_dst = tun_ips->dst;
+ 	}
+ }
+ 
+ int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+ 				  struct nfp_fl_key_ls *key_ls,
+ 				  struct net_device *netdev,
+-				  struct nfp_fl_payload *nfp_flow)
++				  struct nfp_fl_payload *nfp_flow,
++				  enum nfp_flower_tun_type tun_type)
+ {
+-	enum nfp_flower_tun_type tun_type = NFP_FL_TUNNEL_NONE;
+ 	struct nfp_repr *netdev_repr;
+ 	int err;
+ 	u8 *ext;
+ 	u8 *msk;
+ 
+-	if (key_ls->key_layer & NFP_FLOWER_LAYER_VXLAN)
+-		tun_type = NFP_FL_TUNNEL_VXLAN;
+-
+ 	memset(nfp_flow->unmasked_data, 0, key_ls->key_size);
+ 	memset(nfp_flow->mask_data, 0, key_ls->key_size);
+ 
+@@ -278,6 +280,16 @@ int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+ 	ext += sizeof(struct nfp_flower_meta_tci);
+ 	msk += sizeof(struct nfp_flower_meta_tci);
+ 
++	/* Populate Extended Metadata if Required. */
++	if (NFP_FLOWER_LAYER_EXT_META & key_ls->key_layer) {
++		nfp_flower_compile_ext_meta((struct nfp_flower_ext_meta *)ext,
++					    key_ls->key_layer_two);
++		nfp_flower_compile_ext_meta((struct nfp_flower_ext_meta *)msk,
++					    key_ls->key_layer_two);
++		ext += sizeof(struct nfp_flower_ext_meta);
++		msk += sizeof(struct nfp_flower_ext_meta);
++	}
++
+ 	/* Populate Exact Port data. */
+ 	err = nfp_flower_compile_port((struct nfp_flower_in_port *)ext,
+ 				      nfp_repr_get_port_id(netdev),
+@@ -339,18 +351,17 @@ int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+ 		msk += sizeof(struct nfp_flower_ipv6);
+ 	}
+ 
+-	if (key_ls->key_layer & NFP_FLOWER_LAYER_VXLAN) {
++	if (key_ls->key_layer & NFP_FLOWER_LAYER_VXLAN ||
++	    key_ls->key_layer_two & NFP_FLOWER_LAYER2_GENEVE) {
+ 		__be32 tun_dst;
+ 
+ 		/* Populate Exact VXLAN Data. */
+-		nfp_flower_compile_vxlan((struct nfp_flower_vxlan *)ext,
+-					 flow, false);
++		nfp_flower_compile_ipv4_udp_tun((void *)ext, flow, false);
+ 		/* Populate Mask VXLAN Data. */
+-		nfp_flower_compile_vxlan((struct nfp_flower_vxlan *)msk,
+-					 flow, true);
+-		tun_dst = ((struct nfp_flower_vxlan *)ext)->ip_dst;
+-		ext += sizeof(struct nfp_flower_vxlan);
+-		msk += sizeof(struct nfp_flower_vxlan);
++		nfp_flower_compile_ipv4_udp_tun((void *)msk, flow, true);
++		tun_dst = ((struct nfp_flower_ipv4_udp_tun *)ext)->ip_dst;
++		ext += sizeof(struct nfp_flower_ipv4_udp_tun);
++		msk += sizeof(struct nfp_flower_ipv4_udp_tun);
+ 
+ 		/* Configure tunnel end point MAC. */
+ 		if (nfp_netdev_is_nfp_repr(netdev)) {
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
