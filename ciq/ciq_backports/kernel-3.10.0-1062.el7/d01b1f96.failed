@@ -1,0 +1,165 @@
+perf/x86/intel: Make cpuc allocations consistent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra (Intel) <peterz@infradead.org>
+commit d01b1f96a82e5dd7841a1d39db3abfdaf95f70ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d01b1f96.failed
+
+The cpuc data structure allocation is different between fake and real
+cpuc's; use the same code to init/free both.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit d01b1f96a82e5dd7841a1d39db3abfdaf95f70ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/core.c
+diff --cc arch/x86/events/intel/core.c
+index b25f638e48e8,dc39f2482a4f..000000000000
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@@ -3283,9 -3464,14 +3282,14 @@@ err_shared_regs
+  	cpuc->shared_regs = NULL;
+  
+  err:
+ -	return -ENOMEM;
+ +	return NOTIFY_BAD;
+  }
+  
++ static int intel_pmu_cpu_prepare(int cpu)
++ {
++ 	return intel_cpuc_prepare(&per_cpu(cpu_hw_events, cpu), cpu);
++ }
++ 
+  static void flip_smm_bit(void *data)
+  {
+  	unsigned long set = *(unsigned long *)data;
+@@@ -3386,7 -3562,14 +3389,18 @@@ static void free_excl_cntrs(struct cpu_
+  
+  static void intel_pmu_cpu_dying(int cpu)
+  {
+++<<<<<<< HEAD
+ +	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
+++=======
++ 	fini_debug_store_on_cpu(cpu);
++ 
++ 	if (x86_pmu.counter_freezing)
++ 		disable_counter_freeze();
++ }
++ 
++ void intel_cpuc_finish(struct cpu_hw_events *cpuc)
++ {
+++>>>>>>> d01b1f96a82e (perf/x86/intel: Make cpuc allocations consistent)
+  	struct intel_shared_regs *pc;
+  
+  	pc = cpuc->shared_regs;
+@@@ -3396,9 -3579,12 +3410,18 @@@
+  		cpuc->shared_regs = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	free_excl_cntrs(cpu);
+ +
+ +	fini_debug_store_on_cpu(cpu);
+++=======
++ 	free_excl_cntrs(cpuc);
++ }
++ 
++ static void intel_pmu_cpu_dead(int cpu)
++ {
++ 	intel_cpuc_finish(&per_cpu(cpu_hw_events, cpu));
+++>>>>>>> d01b1f96a82e (perf/x86/intel: Make cpuc allocations consistent)
+  }
+  
+  static void intel_pmu_sched_task(struct perf_event_context *ctx,
+@@@ -4420,15 -4719,12 +4443,20 @@@ static __init int fixup_ht_bug(void
+  	x86_pmu.commit_scheduling = NULL;
+  	x86_pmu.stop_scheduling = NULL;
+  
+ -	hardlockup_detector_perf_restart();
+ +	lockup_detector_resume();
+ +
+++<<<<<<< HEAD
+ +	get_online_cpus();
+  
+ +	for_each_online_cpu(c) {
+ +		free_excl_cntrs(c);
+ +	}
+++=======
++ 	for_each_online_cpu(c)
++ 		free_excl_cntrs(&per_cpu(cpu_hw_events, c));
+++>>>>>>> d01b1f96a82e (perf/x86/intel: Make cpuc allocations consistent)
+  
+ -	cpus_read_unlock();
+ +	put_online_cpus();
+  	pr_info("PMU erratum BJ122, BV98, HSD29 workaround disabled, HT off\n");
+  	return 0;
+  }
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index a6b3b4f148ef..5b452302f4c3 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1904,7 +1904,7 @@ static int x86_pmu_commit_txn(struct pmu *pmu)
+  */
+ static void free_fake_cpuc(struct cpu_hw_events *cpuc)
+ {
+-	kfree(cpuc->shared_regs);
++	intel_cpuc_finish(cpuc);
+ 	kfree(cpuc);
+ }
+ 
+@@ -1916,14 +1916,11 @@ static struct cpu_hw_events *allocate_fake_cpuc(void)
+ 	cpuc = kzalloc(sizeof(*cpuc), GFP_KERNEL);
+ 	if (!cpuc)
+ 		return ERR_PTR(-ENOMEM);
+-
+-	/* only needed, if we have extra_regs */
+-	if (x86_pmu.extra_regs) {
+-		cpuc->shared_regs = allocate_shared_regs(cpu);
+-		if (!cpuc->shared_regs)
+-			goto error;
+-	}
+ 	cpuc->is_fake = 1;
++
++	if (intel_cpuc_prepare(cpuc, cpu))
++		goto error;
++
+ 	return cpuc;
+ error:
+ 	free_fake_cpuc(cpuc);
+* Unmerged path arch/x86/events/intel/core.c
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 35c6a27208b6..8710254a5fd9 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -870,7 +870,8 @@ struct event_constraint *
+ x86_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
+ 			  struct perf_event *event);
+ 
+-struct intel_shared_regs *allocate_shared_regs(int cpu);
++extern int intel_cpuc_prepare(struct cpu_hw_events *cpuc, int cpu);
++extern void intel_cpuc_finish(struct cpu_hw_events *cpuc);
+ 
+ int intel_pmu_init(void);
+ 
+@@ -1007,9 +1008,13 @@ static inline int intel_pmu_init(void)
+ 	return 0;
+ }
+ 
+-static inline struct intel_shared_regs *allocate_shared_regs(int cpu)
++static inline int intel_cpuc_prepare(struct cpu_hw_event *cpuc, int cpu)
++{
++	return 0;
++}
++
++static inline void intel_cpuc_finish(struct cpu_hw_event *cpuc)
+ {
+-	return NULL;
+ }
+ 
+ static inline int is_ht_workaround_enabled(void)
