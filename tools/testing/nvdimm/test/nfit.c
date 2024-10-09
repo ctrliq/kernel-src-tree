@@ -1958,6 +1958,7 @@ static __init int nfit_test_init(void)
 			put_device(&pdev->dev);
 			goto err_register;
 		}
+		get_device(&pdev->dev);
 
 		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
 		rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
@@ -1977,6 +1978,10 @@ static __init int nfit_test_init(void)
 		if (instances[i])
 			platform_device_unregister(&instances[i]->pdev);
 	nfit_test_teardown();
+	for (i = 0; i < NUM_NFITS; i++)
+		if (instances[i])
+			put_device(&instances[i]->pdev.dev);
+
 	return rc;
 }
 
@@ -1984,10 +1989,13 @@ static __exit void nfit_test_exit(void)
 {
 	int i;
 
-	platform_driver_unregister(&nfit_test_driver);
 	for (i = 0; i < NUM_NFITS; i++)
 		platform_device_unregister(&instances[i]->pdev);
+	platform_driver_unregister(&nfit_test_driver);
 	nfit_test_teardown();
+
+	for (i = 0; i < NUM_NFITS; i++)
+		put_device(&instances[i]->pdev.dev);
 	class_destroy(nfit_test_dimm);
 }
 
