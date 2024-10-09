@@ -1,0 +1,123 @@
+perf script: Fix --per-event-dump for auxtrace synth evsels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit fa48c892645dfd3159e5aa6eb9cefd00d5cb347a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fa48c892.failed
+
+When processing PERF_RECORD_AUXTRACE_INFO several perf_evsel entries
+will be synthesized and inserted into session->evlist, eventually ending
+in perf_script.tool.sample(), which ends up calling builtin-script.c's
+process_event(), that expects evsel->priv to be a perf_evsel_script
+object with a valid FILE pointer in fp.
+
+So we need to intercept the processing of PERF_RECORD_AUXTRACE_INFO and
+then setup evsel->priv for these newly created perf_evsel instances, do
+it to fix the segfault in process_event() trying to use a NULL for that
+FILE pointer.
+
+	Reported-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+	Cc: yuzhoujian <yuzhoujian@didichuxing.com>
+Fixes: a14390fde64e ("perf script: Allow creating per-event dump files")
+Link: http://lkml.kernel.org/n/tip-bthnur8r8de01gxvn2qayx6e@git.kernel.org
+[ Merge fix by Ravi Bangoria before pushing upstream to preserv bisectability ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit fa48c892645dfd3159e5aa6eb9cefd00d5cb347a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-script.c
+diff --cc tools/perf/builtin-script.c
+index d3f20cf9a358,9b43bda45a41..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -1487,6 -1937,75 +1487,78 @@@ static void sig_handler(int sig __maybe
+  	session_done = 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void perf_script__fclose_per_event_dump(struct perf_script *script)
++ {
++ 	struct perf_evlist *evlist = script->session->evlist;
++ 	struct perf_evsel *evsel;
++ 
++ 	evlist__for_each_entry(evlist, evsel) {
++ 		if (!evsel->priv)
++ 			break;
++ 		perf_evsel_script__delete(evsel->priv);
++ 		evsel->priv = NULL;
++ 	}
++ }
++ 
++ static int perf_script__fopen_per_event_dump(struct perf_script *script)
++ {
++ 	struct perf_evsel *evsel;
++ 
++ 	evlist__for_each_entry(script->session->evlist, evsel) {
++ 		/*
++ 		 * Already setup? I.e. we may be called twice in cases like
++ 		 * Intel PT, one for the intel_pt// and dummy events, then
++ 		 * for the evsels syntheized from the auxtrace info.
++ 		 *
++ 		 * Ses perf_script__process_auxtrace_info.
++ 		 */
++ 		if (evsel->priv != NULL)
++ 			continue;
++ 
++ 		evsel->priv = perf_evsel_script__new(evsel, script->session->data);
++ 		if (evsel->priv == NULL)
++ 			goto out_err_fclose;
++ 	}
++ 
++ 	return 0;
++ 
++ out_err_fclose:
++ 	perf_script__fclose_per_event_dump(script);
++ 	return -1;
++ }
++ 
++ static int perf_script__setup_per_event_dump(struct perf_script *script)
++ {
++ 	struct perf_evsel *evsel;
++ 	static struct perf_evsel_script es_stdout;
++ 
++ 	if (script->per_event_dump)
++ 		return perf_script__fopen_per_event_dump(script);
++ 
++ 	es_stdout.fp = stdout;
++ 
++ 	evlist__for_each_entry(script->session->evlist, evsel)
++ 		evsel->priv = &es_stdout;
++ 
++ 	return 0;
++ }
++ 
++ static void perf_script__exit_per_event_dump_stats(struct perf_script *script)
++ {
++ 	struct perf_evsel *evsel;
++ 
++ 	evlist__for_each_entry(script->session->evlist, evsel) {
++ 		struct perf_evsel_script *es = evsel->priv;
++ 
++ 		perf_evsel_script__fprintf(es, stdout);
++ 		perf_evsel_script__delete(es);
++ 		evsel->priv = NULL;
++ 	}
++ }
++ 
+++>>>>>>> fa48c892645d (perf script: Fix --per-event-dump for auxtrace synth evsels)
+  static int __cmd_script(struct perf_script *script)
+  {
+  	int ret;
+* Unmerged path tools/perf/builtin-script.c
