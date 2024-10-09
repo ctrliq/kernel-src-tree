@@ -1,0 +1,331 @@
+dax: Allow tuning whether dax_insert_mapping_entry() dirties entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [fs] dax: Allow tuning whether dax_insert_mapping_entry() (Eric Sandeen) [1471784]
+Rebuild_FUZZ: 88.14%
+commit-author Jan Kara <jack@suse.cz>
+commit f5b7b74876cff5664ea8b2ef7f002c54cd6e7c90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f5b7b748.failed
+
+Currently we dirty radix tree entry whenever dax_insert_mapping_entry()
+gets called for a write fault. With synchronous page faults we would
+like to insert clean radix tree entry and dirty it only once we call
+fdatasync() and update page tables to save some unnecessary cache
+flushing. Add 'dirty' argument to dax_insert_mapping_entry() for that.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit f5b7b74876cff5664ea8b2ef7f002c54cd6e7c90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 1e9b52eccd08,efc210ff6665..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -569,34 -526,24 +569,34 @@@ static int copy_user_dax(struct block_d
+  static void *dax_insert_mapping_entry(struct address_space *mapping,
+  				      struct vm_fault *vmf,
+  				      void *entry, sector_t sector,
+- 				      unsigned long flags)
++ 				      unsigned long flags, bool dirty)
+  {
+  	struct radix_tree_root *page_tree = &mapping->page_tree;
+ +	int error = 0;
+ +	bool hole_fill = false;
+  	void *new_entry;
+  	pgoff_t index = vmf->pgoff;
+  
+- 	if (vmf->flags & FAULT_FLAG_WRITE)
++ 	if (dirty)
+  		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+  
+ -	if (dax_is_zero_entry(entry) && !(flags & RADIX_DAX_ZERO_PAGE)) {
+ -		/* we are replacing a zero page with block mapping */
+ -		if (dax_is_pmd_entry(entry))
+ -			unmap_mapping_range(mapping,
+ -					(vmf->pgoff << PAGE_SHIFT) & PMD_MASK,
+ -					PMD_SIZE, 0);
+ -		else /* pte entry */
+ -			unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
+ -					PAGE_SIZE, 0);
+ +	/* Replacing hole page with block mapping? */
+ +	if (!radix_tree_exceptional_entry(entry)) {
+ +		hole_fill = true;
+ +		/*
+ +		 * Unmap the page now before we remove it from page cache below.
+ +		 * The page is locked so it cannot be faulted in again.
+ +		 */
+ +		unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
+ +				    PAGE_SIZE, 0);
+ +		error = radix_tree_preload(mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
+ +		if (error)
+ +			return ERR_PTR(error);
+ +	} else if (dax_is_zero_entry(entry) && !(flags & RADIX_DAX_HZP)) {
+ +		/* replacing huge zero page with PMD block mapping */
+ +		unmap_mapping_range(mapping,
+ +			(vmf->pgoff << PAGE_SHIFT) & PMD_MASK, PMD_SIZE, 0);
+ +
+  	}
+  
+  	spin_lock_irq(&mapping->tree_lock);
+@@@ -626,27 -561,19 +626,32 @@@
+  		void **slot;
+  		void *ret;
+  
+ -		ret = __radix_tree_lookup(page_tree, index, &node, &slot);
+ +		ret = __radix_tree_lookup(page_tree, index, NULL, &slot);
+  		WARN_ON_ONCE(ret != entry);
+ -		__radix_tree_replace(page_tree, node, slot,
+ -				     new_entry, NULL, NULL);
+ -		entry = new_entry;
+ +		radix_tree_replace_slot(slot, new_entry);
+  	}
+++<<<<<<< HEAD
+ +	if (vmf->flags & FAULT_FLAG_WRITE)
+++=======
++ 
++ 	if (dirty)
+++>>>>>>> f5b7b74876cf (dax: Allow tuning whether dax_insert_mapping_entry() dirties entry)
+  		radix_tree_tag_set(page_tree, index, PAGECACHE_TAG_DIRTY);
+ -
+ + unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+ -	return entry;
+ +	if (hole_fill) {
+ +		radix_tree_preload_end();
+ +		/*
+ +		 * We don't need hole page anymore, it has been replaced with
+ +		 * locked radix tree entry now.
+ +		 */
+ +		if (mapping->a_ops->freepage)
+ +			mapping->a_ops->freepage(entry);
+ +		unlock_page(entry);
+ +		page_cache_release(entry);
+ +	}
+ +	return new_entry;
+ +
+  }
+  
+  static inline unsigned long
+@@@ -896,75 -820,78 +901,90 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(dax_writeback_mapping_range);
+  
+ -static sector_t dax_iomap_sector(struct iomap *iomap, loff_t pos)
+ -{
+ -	return iomap->blkno + (((pos & PAGE_MASK) - iomap->offset) >> 9);
+ -}
+ -
+ -static int dax_iomap_pfn(struct iomap *iomap, loff_t pos, size_t size,
+ -			 pfn_t *pfnp)
+ +static int dax_insert_mapping(struct address_space *mapping,
+ +		struct block_device *bdev, struct dax_device *dax_dev,
+ +		sector_t sector, size_t size, void **entryp,
+ +		struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+ -	const sector_t sector = dax_iomap_sector(iomap, pos);
+ +	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+ +	void *entry = *entryp;
+ +	void *ret, *kaddr;
+  	pgoff_t pgoff;
+ -	void *kaddr;
+  	int id, rc;
+ -	long length;
+ +	pfn_t pfn;
+  
+ -	rc = bdev_dax_pgoff(iomap->bdev, sector, size, &pgoff);
+ +	rc = bdev_dax_pgoff(bdev, sector, size, &pgoff);
+  	if (rc)
+  		return rc;
+ +
+  	id = dax_read_lock();
+ -	length = dax_direct_access(iomap->dax_dev, pgoff, PHYS_PFN(size),
+ -				   &kaddr, pfnp);
+ -	if (length < 0) {
+ -		rc = length;
+ -		goto out;
+ +	rc = dax_direct_access(dax_dev, pgoff, PHYS_PFN(size), &kaddr, &pfn);
+ +	if (rc < 0) {
+ +		dax_read_unlock(id);
+ +		return rc;
+  	}
+ -	rc = -EINVAL;
+ -	if (PFN_PHYS(length) < size)
+ -		goto out;
+ -	if (pfn_t_to_pfn(*pfnp) & (PHYS_PFN(size)-1))
+ -		goto out;
+ -	/* For larger pages we need devmap */
+ -	if (length > 1 && !pfn_t_devmap(*pfnp))
+ -		goto out;
+ -	rc = 0;
+ -out:
+  	dax_read_unlock(id);
+ -	return rc;
+ +
+ +	ret = dax_insert_mapping_entry(mapping, vmf, entry, sector, 0);
+ +	if (IS_ERR(ret))
+ +		return PTR_ERR(ret);
+ +	*entryp = ret;
+ +
+ +	trace_dax_insert_mapping(mapping->host, vmf, ret);
+ +	return vm_insert_mixed(vma, vaddr, pfn);
+  }
+  
+ -/*
+ - * The user has performed a load from a hole in the file.  Allocating a new
+ - * page in the file would cause excessive storage usage for workloads with
+ - * sparse files.  Instead we insert a read-only mapping of the 4k zero page.
+ - * If this page is ever written to we will re-fault and change the mapping to
+ - * point to real DAX storage instead.
+ +/**
+ + * dax_pfn_mkwrite - handle first write to DAX page
+ + * @vma: The virtual memory area where the fault occurred
+ + * @vmf: The description of the fault
+   */
+ -static int dax_load_hole(struct address_space *mapping, void *entry,
+ -			 struct vm_fault *vmf)
+ +int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+ +	struct file *file = vma->vm_file;
+ +	struct address_space *mapping = file->f_mapping;
+  	struct inode *inode = mapping->host;
+ -	unsigned long vaddr = vmf->address;
+ -	int ret = VM_FAULT_NOPAGE;
+ -	struct page *zero_page;
+ -	void *entry2;
+ +	void *entry, **slot;
+ +	pgoff_t index = vmf->pgoff;
+  
+ -	zero_page = ZERO_PAGE(0);
+ -	if (unlikely(!zero_page)) {
+ -		ret = VM_FAULT_OOM;
+ -		goto out;
+ +	spin_lock_irq(&mapping->tree_lock);
+ +	entry = get_unlocked_mapping_entry(mapping, index, &slot);
+ +	if (!entry || !radix_tree_exceptional_entry(entry)) {
+ +		if (entry)
+ +			put_unlocked_mapping_entry(mapping, index, entry);
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		trace_dax_pfn_mkwrite_no_entry(inode, vmf, VM_FAULT_NOPAGE);
+ +		return VM_FAULT_NOPAGE;
+  	}
+++<<<<<<< HEAD
+ +	radix_tree_tag_set(&mapping->page_tree, index, PAGECACHE_TAG_DIRTY);
+ +	entry = lock_slot(mapping, slot);
+ +	spin_unlock_irq(&mapping->tree_lock);
+ +	/*
+ +	 * If we race with somebody updating the PTE and finish_mkwrite_fault()
+ +	 * fails, we don't care. We need to return VM_FAULT_NOPAGE and retry
+ +	 * the fault in either case.
+ +	 */
+ +	finish_mkwrite_fault(vmf);
+ +	put_locked_mapping_entry(mapping, index, entry);
+ +	trace_dax_pfn_mkwrite(inode, vmf, VM_FAULT_NOPAGE);
+ +	return VM_FAULT_NOPAGE;
+++=======
++ 
++ 	entry2 = dax_insert_mapping_entry(mapping, vmf, entry, 0,
++ 			RADIX_DAX_ZERO_PAGE, false);
++ 	if (IS_ERR(entry2)) {
++ 		ret = VM_FAULT_SIGBUS;
++ 		goto out;
++ 	}
++ 
++ 	vm_insert_mixed(vmf->vma, vaddr, page_to_pfn_t(zero_page));
++ out:
++ 	trace_dax_load_hole(inode, vmf, ret);
++ 	return ret;
+++>>>>>>> f5b7b74876cf (dax: Allow tuning whether dax_insert_mapping_entry() dirties entry)
+  }
+ +EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
+  
+  static bool dax_range_is_aligned(struct block_device *bdev,
+  				 unsigned int offset, unsigned int length)
+@@@ -1270,12 -1173,27 +1290,33 @@@ static int dax_iomap_pte_fault(struct v
+  	case IOMAP_MAPPED:
+  		if (iomap.flags & IOMAP_F_NEW) {
+  			count_vm_event(PGMAJFAULT);
+ -			count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
+ +			mem_cgroup_count_vm_event(vmf->vma->vm_mm,
+ +					PGMAJFAULT);
+  			major = VM_FAULT_MAJOR;
+  		}
+++<<<<<<< HEAD
+ +		error = dax_insert_mapping(mapping, iomap.bdev, iomap.dax_dev,
+ +				sector, PAGE_SIZE, &entry, vmf->vma, vmf);
+++=======
++ 		error = dax_iomap_pfn(&iomap, pos, PAGE_SIZE, &pfn);
++ 		if (error < 0)
++ 			goto error_finish_iomap;
++ 
++ 		entry = dax_insert_mapping_entry(mapping, vmf, entry,
++ 						 dax_iomap_sector(&iomap, pos),
++ 						 0, write);
++ 		if (IS_ERR(entry)) {
++ 			error = PTR_ERR(entry);
++ 			goto error_finish_iomap;
++ 		}
++ 
++ 		trace_dax_insert_mapping(inode, vmf, entry);
++ 		if (write)
++ 			error = vm_insert_mixed_mkwrite(vma, vaddr, pfn);
++ 		else
++ 			error = vm_insert_mixed(vma, vaddr, pfn);
++ 
+++>>>>>>> f5b7b74876cf (dax: Allow tuning whether dax_insert_mapping_entry() dirties entry)
+  		/* -EBUSY is fine, somebody else faulted on the same PTE */
+  		if (error == -EBUSY)
+  			error = 0;
+@@@ -1390,14 -1257,13 +1431,19 @@@ static int dax_pmd_load_hole(struct vm_
+  	if (unlikely(!zero_page))
+  		goto fallback;
+  
+++<<<<<<< HEAD
+ +	ret = dax_insert_mapping_entry(mapping, vmf, *entryp, 0,
+ +			RADIX_DAX_PMD | RADIX_DAX_HZP);
+++=======
++ 	ret = dax_insert_mapping_entry(mapping, vmf, entry, 0,
++ 			RADIX_DAX_PMD | RADIX_DAX_ZERO_PAGE, false);
+++>>>>>>> f5b7b74876cf (dax: Allow tuning whether dax_insert_mapping_entry() dirties entry)
+  	if (IS_ERR(ret))
+  		goto fallback;
+ +	*entryp = ret;
+  
+  	ptl = pmd_lock(vmf->vma->vm_mm, vmf->pmd);
+ -	if (!pmd_none(*(vmf->pmd))) {
+ +	if (!pmd_none(*vmf->pmd)) {
+  		spin_unlock(ptl);
+  		goto fallback;
+  	}
+@@@ -1507,7 -1373,19 +1553,23 @@@ static int dax_iomap_pmd_fault(struct v
+  
+  	switch (iomap.type) {
+  	case IOMAP_MAPPED:
+++<<<<<<< HEAD
+ +		result = dax_pmd_insert_mapping(vmf, &iomap, pos, &entry);
+++=======
++ 		error = dax_iomap_pfn(&iomap, pos, PMD_SIZE, &pfn);
++ 		if (error < 0)
++ 			goto finish_iomap;
++ 
++ 		entry = dax_insert_mapping_entry(mapping, vmf, entry,
++ 						dax_iomap_sector(&iomap, pos),
++ 						RADIX_DAX_PMD, write);
++ 		if (IS_ERR(entry))
++ 			goto finish_iomap;
++ 
++ 		trace_dax_pmd_insert_mapping(inode, vmf, PMD_SIZE, pfn, entry);
++ 		result = vmf_insert_pfn_pmd(vma, vmf->address, vmf->pmd, pfn,
++ 					    write);
+++>>>>>>> f5b7b74876cf (dax: Allow tuning whether dax_insert_mapping_entry() dirties entry)
+  		break;
+  	case IOMAP_UNWRITTEN:
+  	case IOMAP_HOLE:
+* Unmerged path fs/dax.c
