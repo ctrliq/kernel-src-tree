@@ -1,0 +1,93 @@
+bpf, verifier: fix rejection of unaligned access checks for map_value_adj
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 79adffcd6489ef43bda2dfded3d637d7fb4fac80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/79adffcd.failed
+
+Currently, the verifier doesn't reject unaligned access for map_value_adj
+register types. Commit 484611357c19 ("bpf: allow access into map value
+arrays") added logic to check_ptr_alignment() extending it from PTR_TO_PACKET
+to also PTR_TO_MAP_VALUE_ADJ, but for PTR_TO_MAP_VALUE_ADJ no enforcement
+is in place, because reg->id for PTR_TO_MAP_VALUE_ADJ reg types is never
+non-zero, meaning, we can cause BPF_H/_W/_DW-based unaligned access for
+architectures not supporting efficient unaligned access, and thus worst
+case could raise exceptions on some archs that are unable to correct the
+unaligned access or perform a different memory access to the actual
+requested one and such.
+
+i) Unaligned load with !CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+   on r0 (map_value_adj):
+
+   0: (bf) r2 = r10
+   1: (07) r2 += -8
+   2: (7a) *(u64 *)(r2 +0) = 0
+   3: (18) r1 = 0x42533a00
+   5: (85) call bpf_map_lookup_elem#1
+   6: (15) if r0 == 0x0 goto pc+11
+    R0=map_value(ks=8,vs=48,id=0),min_value=0,max_value=0 R10=fp
+   7: (61) r1 = *(u32 *)(r0 +0)
+   8: (35) if r1 >= 0xb goto pc+9
+    R0=map_value(ks=8,vs=48,id=0),min_value=0,max_value=0 R1=inv,min_value=0,max_value=10 R10=fp
+   9: (07) r0 += 3
+  10: (79) r7 = *(u64 *)(r0 +0)
+    R0=map_value_adj(ks=8,vs=48,id=0),min_value=3,max_value=3 R1=inv,min_value=0,max_value=10 R10=fp
+  11: (79) r7 = *(u64 *)(r0 +2)
+    R0=map_value_adj(ks=8,vs=48,id=0),min_value=3,max_value=3 R1=inv,min_value=0,max_value=10 R7=inv R10=fp
+  [...]
+
+ii) Unaligned store with !CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+    on r0 (map_value_adj):
+
+   0: (bf) r2 = r10
+   1: (07) r2 += -8
+   2: (7a) *(u64 *)(r2 +0) = 0
+   3: (18) r1 = 0x4df16a00
+   5: (85) call bpf_map_lookup_elem#1
+   6: (15) if r0 == 0x0 goto pc+19
+    R0=map_value(ks=8,vs=48,id=0),min_value=0,max_value=0 R10=fp
+   7: (07) r0 += 3
+   8: (7a) *(u64 *)(r0 +0) = 42
+    R0=map_value_adj(ks=8,vs=48,id=0),min_value=3,max_value=3 R10=fp
+   9: (7a) *(u64 *)(r0 +2) = 43
+    R0=map_value_adj(ks=8,vs=48,id=0),min_value=3,max_value=3 R10=fp
+  10: (7a) *(u64 *)(r0 -2) = 44
+    R0=map_value_adj(ks=8,vs=48,id=0),min_value=3,max_value=3 R10=fp
+  [...]
+
+For the PTR_TO_PACKET type, reg->id is initially zero when skb->data
+was fetched, it later receives a reg->id from env->id_gen generator
+once another register with UNKNOWN_VALUE type was added to it via
+check_packet_ptr_add(). The purpose of this reg->id is twofold: i) it
+is used in find_good_pkt_pointers() for setting the allowed access
+range for regs with PTR_TO_PACKET of same id once verifier matched
+on data/data_end tests, and ii) for check_ptr_alignment() to determine
+that when not having efficient unaligned access and register with
+UNKNOWN_VALUE was added to PTR_TO_PACKET, that we're only allowed
+to access the content bytewise due to unknown unalignment. reg->id
+was never intended for PTR_TO_MAP_VALUE{,_ADJ} types and thus is
+always zero, the only marking is in PTR_TO_MAP_VALUE_OR_NULL that
+was added after 484611357c19 via 57a09bf0a416 ("bpf: Detect identical
+PTR_TO_MAP_VALUE_OR_NULL registers"). Above tests will fail for
+non-root environment due to prohibited pointer arithmetic.
+
+The fix splits register-type specific checks into their own helper
+instead of keeping them combined, so we don't run into a similar
+issue in future once we extend check_ptr_alignment() further and
+forget to add reg->type checks for some of the checks.
+
+Fixes: 484611357c19 ("bpf: allow access into map value arrays")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 79adffcd6489ef43bda2dfded3d637d7fb4fac80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
