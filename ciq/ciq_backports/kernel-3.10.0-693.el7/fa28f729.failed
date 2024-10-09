@@ -1,0 +1,117 @@
+dax: move RADIX_DAX_* defines to dax.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit fa28f7296a7ce38ed15dc06bd2149e04c8db9d4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fa28f729.failed
+
+The RADIX_DAX_* defines currently mostly live in fs/dax.c, with just
+RADIX_DAX_ENTRY_LOCK being in include/linux/dax.h so it can be used in
+mm/filemap.c.  When we add PMD support, though, mm/filemap.c will also need
+access to the RADIX_DAX_PTE type so it can properly construct a 4k sized
+empty entry.
+
+Instead of shifting the defines between dax.c and dax.h as they are
+individually used in other code, just move them wholesale to dax.h so
+they'll be available when we need them.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit fa28f7296a7ce38ed15dc06bd2149e04c8db9d4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/dax.h
+diff --cc fs/dax.c
+index 3ad95e9ec809,c45cc4d8e996..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -32,6 -31,24 +32,27 @@@
+  #include <linux/vmstat.h>
+  #include <linux/pfn_t.h>
+  #include <linux/sizes.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/iomap.h>
++ #include "internal.h"
++ 
++ /* We choose 4096 entries - same as per-zone page wait tables */
++ #define DAX_WAIT_TABLE_BITS 12
++ #define DAX_WAIT_TABLE_ENTRIES (1 << DAX_WAIT_TABLE_BITS)
++ 
++ static wait_queue_head_t wait_table[DAX_WAIT_TABLE_ENTRIES];
++ 
++ static int __init init_dax_wait_table(void)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < DAX_WAIT_TABLE_ENTRIES; i++)
++ 		init_waitqueue_head(wait_table + i);
++ 	return 0;
++ }
++ fs_initcall(init_dax_wait_table);
+++>>>>>>> fa28f7296a7c (dax: move RADIX_DAX_* defines to dax.h)
+  
+  static long dax_map_atomic(struct block_device *bdev, struct blk_dax_ctl *dax)
+  {
+diff --cc include/linux/dax.h
+index 7ccafd8f7b0c,e9ea78c1cf98..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,16 -6,36 +6,41 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_clear_sectors(struct block_device *bdev, sector_t _sector, long _size);
+++=======
++ struct iomap_ops;
++ 
++ /*
++  * We use lowest available bit in exceptional entry for locking, other two
++  * bits to determine entry type. In total 3 special bits.
++  */
++ #define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
++ #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
++ #define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
++ #define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
++ #define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
++ #define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
++ #define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
++ #define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
++ 		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
++ 		RADIX_TREE_EXCEPTIONAL_ENTRY))
++ 
++ 
++ ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
++ 		struct iomap_ops *ops);
++ ssize_t dax_do_io(struct kiocb *, struct inode *, struct iov_iter *,
++ 		  get_block_t, dio_iodone_t, int flags);
+++>>>>>>> fa28f7296a7c (dax: move RADIX_DAX_* defines to dax.h)
+  int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+  int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ -int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
+ -			struct iomap_ops *ops);
+ -int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+ -int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+ -		pgoff_t index, void *entry, bool wake_all);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+ +int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+  
+  #ifdef CONFIG_FS_DAX
+  struct page *read_dax_sector(struct block_device *bdev, sector_t n);
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
