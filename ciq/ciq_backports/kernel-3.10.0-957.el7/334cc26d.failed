@@ -1,0 +1,163 @@
+drm/nouveau/fifo/gp100-: force individual channels into a channel group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 334cc26d4db10ae7d8f18de27869b95fe84c7d28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/334cc26d.failed
+
+RM does this for some reason, and is enforced in HW on Volta.
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 334cc26d4db10ae7d8f18de27869b95fe84c7d28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
+diff --cc drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
+index 3fac51116f05,60e7d72d6e46..000000000000
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
+@@@ -203,8 -214,7 +209,12 @@@ static void 
+  gk104_fifo_gpfifo_dtor(struct nvkm_fifo_chan *base)
+  {
+  	struct gk104_fifo_chan *chan = gk104_fifo_chan(base);
+++<<<<<<< HEAD
+ +	nvkm_vm_ref(NULL, &chan->vm, chan->pgd);
+ +	nvkm_gpuobj_del(&chan->pgd);
+++=======
++ 	kfree(chan->cgrp);
+++>>>>>>> 334cc26d4db1 (drm/nouveau/fifo/gp100-: force individual channels into a channel group)
+  	return chan;
+  }
+  
+@@@ -292,21 -272,17 +302,35 @@@ gk104_fifo_gpfifo_new_(const struct gk1
+  
+  	*chid = chan->base.chid;
+  
+++<<<<<<< HEAD
+ +	/* Page directory. */
+ +	ret = nvkm_gpuobj_new(device, 0x10000, 0x1000, false, NULL, &chan->pgd);
+ +	if (ret)
+ +		return ret;
+ +
+ +	nvkm_kmap(chan->base.inst);
+ +	nvkm_wo32(chan->base.inst, 0x0200, lower_32_bits(chan->pgd->addr));
+ +	nvkm_wo32(chan->base.inst, 0x0204, upper_32_bits(chan->pgd->addr));
+ +	nvkm_wo32(chan->base.inst, 0x0208, 0xffffffff);
+ +	nvkm_wo32(chan->base.inst, 0x020c, 0x000000ff);
+ +	nvkm_done(chan->base.inst);
+ +
+ +	ret = nvkm_vm_ref(chan->base.vm, &chan->vm, chan->pgd);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	/* Hack to support GPUs where even individual channels should be
++ 	 * part of a channel group.
++ 	 */
++ 	if (fifo->func->cgrp_force) {
++ 		if (!(chan->cgrp = kmalloc(sizeof(*chan->cgrp), GFP_KERNEL)))
++ 			return -ENOMEM;
++ 		chan->cgrp->id = chan->base.chid;
++ 		INIT_LIST_HEAD(&chan->cgrp->head);
++ 		INIT_LIST_HEAD(&chan->cgrp->chan);
++ 		chan->cgrp->chan_nr = 0;
++ 	}
+++>>>>>>> 334cc26d4db1 (drm/nouveau/fifo/gp100-: force individual channels into a channel group)
+  
+  	/* Clear channel control registers. */
+  	usermem = chan->base.chid * 0x200;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+index aa1b567bbe37..166844b53173 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+@@ -284,6 +284,32 @@ gk104_fifo_recover_runl(struct gk104_fifo *fifo, int runl)
+ 	schedule_work(&fifo->recover.work);
+ }
+ 
++static struct gk104_fifo_chan *
++gk104_fifo_recover_chid(struct gk104_fifo *fifo, int runl, int chid)
++{
++	struct gk104_fifo_chan *chan;
++	struct nvkm_fifo_cgrp *cgrp;
++
++	list_for_each_entry(chan, &fifo->runlist[runl].chan, head) {
++		if (chan->base.chid == chid) {
++			list_del_init(&chan->head);
++			return chan;
++		}
++	}
++
++	list_for_each_entry(cgrp, &fifo->runlist[runl].cgrp, head) {
++		if (cgrp->id == chid) {
++			chan = list_first_entry(&cgrp->chan, typeof(*chan), head);
++			list_del_init(&chan->head);
++			if (!--cgrp->chan_nr)
++				list_del_init(&cgrp->head);
++			return chan;
++		}
++	}
++
++	return NULL;
++}
++
+ static void
+ gk104_fifo_recover_chan(struct nvkm_fifo *base, int chid)
+ {
+@@ -301,13 +327,10 @@ gk104_fifo_recover_chan(struct nvkm_fifo *base, int chid)
+ 		return;
+ 
+ 	/* Lookup SW state for channel, and mark it as dead. */
+-	list_for_each_entry(chan, &fifo->runlist[runl].chan, head) {
+-		if (chan->base.chid == chid) {
+-			list_del_init(&chan->head);
+-			chan->killed = true;
+-			nvkm_fifo_kevent(&fifo->base, chid);
+-			break;
+-		}
++	chan = gk104_fifo_recover_chid(fifo, runl, chid);
++	if (chan) {
++		chan->killed = true;
++		nvkm_fifo_kevent(&fifo->base, chid);
+ 	}
+ 
+ 	/* Disable channel. */
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+index bafe934d3330..49ac128a814f 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.h
+@@ -67,6 +67,7 @@ struct gk104_fifo_func {
+ 		int (*ctor)(struct gk104_fifo *, const struct nvkm_oclass *,
+ 			    void *, u32, struct nvkm_object **);
+ 	} chan;
++	bool cgrp_force;
+ };
+ 
+ int gk104_fifo_new_(const struct gk104_fifo_func *, struct nvkm_device *,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+index f137baed7a61..e2f8f9087d7c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp100.c
+@@ -60,6 +60,7 @@ gp100_fifo = {
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gm107_fifo_runlist,
+ 	.chan = {{0,0,PASCAL_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
++	.cgrp_force = true,
+ };
+ 
+ int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp10b.c b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp10b.c
+index 787e911d9599..7733bf7c6545 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp10b.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gp10b.c
+@@ -34,6 +34,7 @@ gp10b_fifo = {
+ 	.fault.gpcclient = gk104_fifo_fault_gpcclient,
+ 	.runlist = &gm107_fifo_runlist,
+ 	.chan = {{0,0,PASCAL_CHANNEL_GPFIFO_A}, gk104_fifo_gpfifo_new },
++	.cgrp_force = true,
+ };
+ 
+ int
+* Unmerged path drivers/gpu/drm/nouveau/nvkm/engine/fifo/gpfifogk104.c
