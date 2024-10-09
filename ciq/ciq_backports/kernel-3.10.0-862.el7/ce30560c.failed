@@ -1,0 +1,94 @@
+drm/i915: Fix false-positive assert_rpm_wakelock_held in i915_pmic_bus_access_notifier v2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Hans de Goede <j.w.r.degoede@gmail.com>
+commit ce30560c80dead91e98a03d90fb8791e57a9b69d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ce30560c.failed
+
+assert_rpm_wakelock_held is triggered from i915_pmic_bus_access_notifier
+even though it gets unregistered on (runtime) suspend, this is caused
+by a race happening under the following circumstances:
+
+intel_runtime_pm_put does:
+
+   atomic_dec(&dev_priv->pm.wakeref_count);
+
+   pm_runtime_mark_last_busy(kdev);
+   pm_runtime_put_autosuspend(kdev);
+
+And pm_runtime_put_autosuspend calls intel_runtime_suspend from
+a workqueue, so there is ample of time between the atomic_dec() and
+intel_runtime_suspend() unregistering the notifier. If the notifier
+gets called in this windowd assert_rpm_wakelock_held falsely triggers
+(at this point we're not runtime-suspended yet).
+
+This commit adds disable_rpm_wakeref_asserts and
+enable_rpm_wakeref_asserts calls around the
+intel_uncore_forcewake_get(FORCEWAKE_ALL) call in
+i915_pmic_bus_access_notifier fixing the false-positive WARN_ON.
+
+Changes in v2:
+-Reword comment explaining why disabling the wakeref asserts is
+ ok and necessary
+
+	Cc: stable@vger.kernel.org
+	Reported-by: FKr <bugs-freedesktop@ubermail.me>
+	Reviewed-by: Imre Deak <imre.deak@intel.com>
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171110150301.9601-2-hdegoede@redhat.com
+(cherry picked from commit ce30560c80dead91e98a03d90fb8791e57a9b69d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_uncore.c
+diff --cc drivers/gpu/drm/i915/intel_uncore.c
+index 5115b17072df,6e01c1898aea..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@@ -1379,6 -1349,39 +1379,42 @@@ static void intel_uncore_fw_domains_ini
+  	dev_priv->uncore.fw_domains_table_entries = ARRAY_SIZE((d)); \
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int i915_pmic_bus_access_notifier(struct notifier_block *nb,
++ 					 unsigned long action, void *data)
++ {
++ 	struct drm_i915_private *dev_priv = container_of(nb,
++ 			struct drm_i915_private, uncore.pmic_bus_access_nb);
++ 
++ 	switch (action) {
++ 	case MBI_PMIC_BUS_ACCESS_BEGIN:
++ 		/*
++ 		 * forcewake all now to make sure that we don't need to do a
++ 		 * forcewake later which on systems where this notifier gets
++ 		 * called requires the punit to access to the shared pmic i2c
++ 		 * bus, which will be busy after this notification, leading to:
++ 		 * "render: timed out waiting for forcewake ack request."
++ 		 * errors.
++ 		 *
++ 		 * The notifier is unregistered during intel_runtime_suspend(),
++ 		 * so it's ok to access the HW here without holding a RPM
++ 		 * wake reference -> disable wakeref asserts for the time of
++ 		 * the access.
++ 		 */
++ 		disable_rpm_wakeref_asserts(dev_priv);
++ 		intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
++ 		enable_rpm_wakeref_asserts(dev_priv);
++ 		break;
++ 	case MBI_PMIC_BUS_ACCESS_END:
++ 		intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
++ 		break;
++ 	}
++ 
++ 	return NOTIFY_OK;
++ }
++ 
+++>>>>>>> ce30560c80de (drm/i915: Fix false-positive assert_rpm_wakelock_held in i915_pmic_bus_access_notifier v2)
+  void intel_uncore_init(struct drm_i915_private *dev_priv)
+  {
+  	i915_check_vgpu(dev_priv);
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.c
