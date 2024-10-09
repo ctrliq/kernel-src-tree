@@ -1,0 +1,187 @@
+gpio: acpi: Add managed variant of acpi_dev_add_driver_gpios()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [sound] alsa: gpio: acpi: Add managed variant of acpi_dev_add_driver_gpios() (Jaroslav Kysela) [1463624]
+Rebuild_FUZZ: 95.38%
+commit-author Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+commit 85c73d50e57eb8ad43955fe38714bc5fba1acd92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/85c73d50.failed
+
+Introduce device managed variant of acpi_dev_add_driver_gpios() and its
+counterpart acpi_dev_remove_driver_gpios().
+
+The functions in most cases are used in driver's ->probe() and
+->remove() callbacks, that's why it's useful to have managed variant of
+them.
+
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Acked-by: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 85c73d50e57eb8ad43955fe38714bc5fba1acd92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib-acpi.c
+#	include/linux/acpi.h
+diff --cc drivers/gpio/gpiolib-acpi.c
+index 76b6a9644a3a,108331de440b..000000000000
+--- a/drivers/gpio/gpiolib-acpi.c
++++ b/drivers/gpio/gpiolib-acpi.c
+@@@ -223,14 -336,85 +223,81 @@@ static void acpi_gpiochip_free_interrup
+  	if (ACPI_FAILURE(status))
+  		return;
+  
+ -	list_for_each_entry_safe_reverse(event, ep, &acpi_gpio->events, node) {
+ -		struct gpio_desc *desc;
+ -
+ -		free_irq(event->irq, event);
+ -		desc = event->desc;
+ -		if (WARN_ON(IS_ERR(desc)))
+ -			continue;
+ -		gpiochip_unlock_as_irq(chip, event->pin);
+ -		gpiochip_free_own_desc(desc);
+ -		list_del(&event->node);
+ -		kfree(event);
+ +	list_for_each_entry_safe_reverse(evt_pin, ep, evt_pins, node) {
+ +		devm_free_irq(chip->dev, evt_pin->irq, evt_pin);
+ +		list_del(&evt_pin->node);
+ +		kfree(evt_pin);
+  	}
+ -}
+ -EXPORT_SYMBOL_GPL(acpi_gpiochip_free_interrupts);
+  
+++<<<<<<< HEAD
+ +	acpi_detach_data(handle, acpi_gpio_evt_dh);
+ +	kfree(evt_pins);
+++=======
++ int acpi_dev_add_driver_gpios(struct acpi_device *adev,
++ 			      const struct acpi_gpio_mapping *gpios)
++ {
++ 	if (adev && gpios) {
++ 		adev->driver_gpios = gpios;
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL_GPL(acpi_dev_add_driver_gpios);
++ 
++ static void devm_acpi_dev_release_driver_gpios(struct device *dev, void *res)
++ {
++ 	acpi_dev_remove_driver_gpios(ACPI_COMPANION(dev));
++ }
++ 
++ int devm_acpi_dev_add_driver_gpios(struct device *dev,
++ 				   const struct acpi_gpio_mapping *gpios)
++ {
++ 	void *res;
++ 	int ret;
++ 
++ 	res = devres_alloc(devm_acpi_dev_release_driver_gpios, 0, GFP_KERNEL);
++ 	if (!res)
++ 		return -ENOMEM;
++ 
++ 	ret = acpi_dev_add_driver_gpios(ACPI_COMPANION(dev), gpios);
++ 	if (ret) {
++ 		devres_free(res);
++ 		return ret;
++ 	}
++ 	devres_add(dev, res);
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(devm_acpi_dev_add_driver_gpios);
++ 
++ void devm_acpi_dev_remove_driver_gpios(struct device *dev)
++ {
++ 	WARN_ON(devres_release(dev, devm_acpi_dev_release_driver_gpios, NULL, NULL));
++ }
++ EXPORT_SYMBOL_GPL(devm_acpi_dev_remove_driver_gpios);
++ 
++ static bool acpi_get_driver_gpio_data(struct acpi_device *adev,
++ 				      const char *name, int index,
++ 				      struct acpi_reference_args *args)
++ {
++ 	const struct acpi_gpio_mapping *gm;
++ 
++ 	if (!adev->driver_gpios)
++ 		return false;
++ 
++ 	for (gm = adev->driver_gpios; gm->name; gm++)
++ 		if (!strcmp(name, gm->name) && gm->data && index < gm->size) {
++ 			const struct acpi_gpio_params *par = gm->data + index;
++ 
++ 			args->adev = adev;
++ 			args->args[0] = par->crs_entry_index;
++ 			args->args[1] = par->line_index;
++ 			args->args[2] = par->active_low;
++ 			args->nargs = 3;
++ 			return true;
++ 		}
++ 
++ 	return false;
+++>>>>>>> 85c73d50e57e (gpio: acpi: Add managed variant of acpi_dev_add_driver_gpios())
+  }
+  
+  struct acpi_gpio_lookup {
+diff --cc include/linux/acpi.h
+index 0ab4b0e3a549,c8eaaad4a9ed..000000000000
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@@ -691,9 -930,48 +691,41 @@@ do {									
+  #endif
+  #endif
+  
+ -struct acpi_gpio_params {
+ -	unsigned int crs_entry_index;
+ -	unsigned int line_index;
+ -	bool active_low;
+ -};
+ -
+ -struct acpi_gpio_mapping {
+ -	const char *name;
+ -	const struct acpi_gpio_params *data;
+ -	unsigned int size;
+ -};
+ -
+  #if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)
+++<<<<<<< HEAD
+ +int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index);
+ +#else
+++=======
++ int acpi_dev_add_driver_gpios(struct acpi_device *adev,
++ 			      const struct acpi_gpio_mapping *gpios);
++ 
++ static inline void acpi_dev_remove_driver_gpios(struct acpi_device *adev)
++ {
++ 	if (adev)
++ 		adev->driver_gpios = NULL;
++ }
++ 
++ int devm_acpi_dev_add_driver_gpios(struct device *dev,
++ 				   const struct acpi_gpio_mapping *gpios);
++ void devm_acpi_dev_remove_driver_gpios(struct device *dev);
++ 
++ int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index);
++ #else
++ static inline int acpi_dev_add_driver_gpios(struct acpi_device *adev,
++ 			      const struct acpi_gpio_mapping *gpios)
++ {
++ 	return -ENXIO;
++ }
++ static inline void acpi_dev_remove_driver_gpios(struct acpi_device *adev) {}
++ 
++ static inline int devm_acpi_dev_add_driver_gpios(struct device *dev,
++ 			      const struct acpi_gpio_mapping *gpios)
++ {
++ 	return -ENXIO;
++ }
++ static inline void devm_acpi_dev_remove_driver_gpios(struct device *dev) {}
++ 
+++>>>>>>> 85c73d50e57e (gpio: acpi: Add managed variant of acpi_dev_add_driver_gpios())
+  static inline int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index)
+  {
+  	return -ENXIO;
+* Unmerged path drivers/gpio/gpiolib-acpi.c
+* Unmerged path include/linux/acpi.h
