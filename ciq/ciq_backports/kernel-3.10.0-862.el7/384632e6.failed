@@ -1,0 +1,148 @@
+userfaultfd: non-cooperative: fix fork use after free
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 384632e67e0829deb8015ee6ad916b180049d252
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/384632e6.failed
+
+When reading the event from the uffd, we put it on a temporary
+fork_event list to detect if we can still access it after releasing and
+retaking the event_wqh.lock.
+
+If fork aborts and removes the event from the fork_event all is fine as
+long as we're still in the userfault read context and fork_event head is
+still alive.
+
+We've to put the event allocated in the fork kernel stack, back from
+fork_event list-head to the event_wqh head, before returning from
+userfaultfd_ctx_read, because the fork_event head lifetime is limited to
+the userfaultfd_ctx_read stack lifetime.
+
+Forgetting to move the event back to its event_wqh place then results in
+__remove_wait_queue(&ctx->event_wqh, &ewq->wq); in
+userfaultfd_event_wait_completion to remove it from a head that has been
+already freed from the reader stack.
+
+This could only happen if resolve_userfault_fork failed (for example if
+there are no file descriptors available to allocate the fork uffd).  If
+it succeeded it was put back correctly.
+
+Furthermore, after find_userfault_evt receives a fork event, the forked
+userfault context in fork_nctx and uwq->msg.arg.reserved.reserved1 can
+be released by the fork thread as soon as the event_wqh.lock is
+released.  Taking a reference on the fork_nctx before dropping the lock
+prevents an use after free in resolve_userfault_fork().
+
+If the fork side aborted and it already released everything, we still
+try to succeed resolve_userfault_fork(), if possible.
+
+Fixes: 893e26e61d04eac9 ("userfaultfd: non-cooperative: Add fork() event")
+Link: http://lkml.kernel.org/r/20170920180413.26713-1-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Reported-by: Mark Rutland <mark.rutland@arm.com>
+	Tested-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Pavel Emelyanov <xemul@virtuozzo.com>
+	Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 384632e67e0829deb8015ee6ad916b180049d252)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+diff --cc fs/userfaultfd.c
+index 69c6fe3b2f1f,1c713fd5b3e6..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -1026,7 -1066,13 +1032,17 @@@ static ssize_t userfaultfd_ctx_read(str
+  				fork_nctx = (struct userfaultfd_ctx *)
+  					(unsigned long)
+  					uwq->msg.arg.reserved.reserved1;
+++<<<<<<< HEAD
+ +				list_move(&uwq->wq.task_list, &fork_event);
+++=======
++ 				list_move(&uwq->wq.entry, &fork_event);
++ 				/*
++ 				 * fork_nctx can be freed as soon as
++ 				 * we drop the lock, unless we take a
++ 				 * reference on it.
++ 				 */
++ 				userfaultfd_ctx_get(fork_nctx);
+++>>>>>>> 384632e67e08 (userfaultfd: non-cooperative: fix fork use after free)
+  				spin_unlock(&ctx->event_wqh.lock);
+  				ret = 0;
+  				break;
+@@@ -1057,19 -1103,53 +1073,64 @@@
+  
+  	if (!ret && msg->event == UFFD_EVENT_FORK) {
+  		ret = resolve_userfault_fork(ctx, fork_nctx, msg);
++ 		spin_lock(&ctx->event_wqh.lock);
++ 		if (!list_empty(&fork_event)) {
++ 			/*
++ 			 * The fork thread didn't abort, so we can
++ 			 * drop the temporary refcount.
++ 			 */
++ 			userfaultfd_ctx_put(fork_nctx);
+  
+++<<<<<<< HEAD
+ +		if (!ret) {
+ +			spin_lock(&ctx->event_wqh.lock);
+ +			if (!list_empty(&fork_event)) {
+ +				uwq = list_first_entry(&fork_event,
+ +						       typeof(*uwq),
+ +						       wq.task_list);
+ +				list_del(&uwq->wq.task_list);
+ +				__add_wait_queue(&ctx->event_wqh, &uwq->wq);
+++=======
++ 			uwq = list_first_entry(&fork_event,
++ 					       typeof(*uwq),
++ 					       wq.entry);
++ 			/*
++ 			 * If fork_event list wasn't empty and in turn
++ 			 * the event wasn't already released by fork
++ 			 * (the event is allocated on fork kernel
++ 			 * stack), put the event back to its place in
++ 			 * the event_wq. fork_event head will be freed
++ 			 * as soon as we return so the event cannot
++ 			 * stay queued there no matter the current
++ 			 * "ret" value.
++ 			 */
++ 			list_del(&uwq->wq.entry);
++ 			__add_wait_queue(&ctx->event_wqh, &uwq->wq);
++ 
++ 			/*
++ 			 * Leave the event in the waitqueue and report
++ 			 * error to userland if we failed to resolve
++ 			 * the userfault fork.
++ 			 */
++ 			if (likely(!ret))
+++>>>>>>> 384632e67e08 (userfaultfd: non-cooperative: fix fork use after free)
+  				userfaultfd_event_complete(ctx, uwq);
+- 			}
+- 			spin_unlock(&ctx->event_wqh.lock);
++ 		} else {
++ 			/*
++ 			 * Here the fork thread aborted and the
++ 			 * refcount from the fork thread on fork_nctx
++ 			 * has already been released. We still hold
++ 			 * the reference we took before releasing the
++ 			 * lock above. If resolve_userfault_fork
++ 			 * failed we've to drop it because the
++ 			 * fork_nctx has to be freed in such case. If
++ 			 * it succeeded we'll hold it because the new
++ 			 * uffd references it.
++ 			 */
++ 			if (ret)
++ 				userfaultfd_ctx_put(fork_nctx);
+  		}
++ 		spin_unlock(&ctx->event_wqh.lock);
+  	}
+  
+  	return ret;
+* Unmerged path fs/userfaultfd.c
