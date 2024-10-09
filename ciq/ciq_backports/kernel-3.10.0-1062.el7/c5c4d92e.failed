@@ -1,0 +1,187 @@
+RDMA/uverbs: Use cdev_device_add() instead of cdev_add()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit c5c4d92e70f37369b5bdca5e85f9fc55dc2c8a3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c5c4d92e.failed
+
+Instead of doing two step process to add char device and create underlying
+device, use cdev_device_add() which does both.
+
+Currently a kobject per uverbs_device is created to keep reference to its
+holding ib_uverbs_device in addition to its underlying device 'dev'.
+
+Instead just use uverbs_device->dev to keep a reference to.
+
+With this change there is single reference tracker for ib_uverbs_device
+structure.
+
+This allows for subsequent patch to registers group attribute as well
+using single API cdev_device_add().
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Daniel Jurgens <danielj@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c5c4d92e70f37369b5bdca5e85f9fc55dc2c8a3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_main.c
+diff --cc drivers/infiniband/core/uverbs_main.c
+index c6574da6ac18,1d2650f0f24c..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -155,11 -169,12 +155,11 @@@ int uverbs_dealloc_mw(struct ib_mw *mw
+  	return ret;
+  }
+  
+- static void ib_uverbs_release_dev(struct kobject *kobj)
++ static void ib_uverbs_release_dev(struct device *device)
+  {
+  	struct ib_uverbs_device *dev =
+- 		container_of(kobj, struct ib_uverbs_device, kobj);
++ 			container_of(device, struct ib_uverbs_device, dev);
+  
+ -	uverbs_destroy_api(dev->uapi);
+  	cleanup_srcu_struct(&dev->disassociate_srcu);
+  	kfree(dev);
+  }
+@@@ -883,16 -866,14 +880,15 @@@ static int ib_uverbs_open(struct inode 
+  	}
+  
+  	file->device	 = dev;
+ +	spin_lock_init(&file->idr_lock);
+ +	idr_init(&file->idr);
+ +	file->ucontext	 = NULL;
+ +	file->async_file = NULL;
+  	kref_init(&file->ref);
+ -	mutex_init(&file->ucontext_lock);
+ -
+ -	spin_lock_init(&file->uobjects_lock);
+ -	INIT_LIST_HEAD(&file->uobjects);
+ -	init_rwsem(&file->hw_destroy_rwsem);
+ +	mutex_init(&file->mutex);
+ +	mutex_init(&file->cleanup_mutex);
+  
+  	filp->private_data = file;
+- 	kobject_get(&dev->kobj);
+  	list_add_tail(&file->list, &dev->uverbs_file_list);
+  	mutex_unlock(&dev->lists_mutex);
+  	srcu_read_unlock(&dev->disassociate_srcu, srcu_key);
+@@@ -1052,48 -1042,40 +1045,65 @@@ static void ib_uverbs_add_one(struct ib
+  	rcu_assign_pointer(uverbs_dev->ib_dev, device);
+  	uverbs_dev->num_comp_vectors = device->num_comp_vectors;
+  
+++<<<<<<< HEAD
+ +	cdev_init(&uverbs_dev->cdev, NULL);
+++=======
++ 	if (ib_uverbs_create_uapi(device, uverbs_dev))
++ 		goto err_uapi;
++ 
++ 	device_initialize(&uverbs_dev->dev);
++ 	uverbs_dev->dev.class = uverbs_class;
++ 	uverbs_dev->dev.parent = device->dev.parent;
++ 	uverbs_dev->dev.devt = base;
++ 	uverbs_dev->dev.release = ib_uverbs_release_dev;
++ 	dev_set_name(&uverbs_dev->dev, "uverbs%d", uverbs_dev->devnum);
++ 
++ 	cdev_init(&uverbs_dev->cdev,
++ 		  device->mmap ? &uverbs_mmap_fops : &uverbs_fops);
+++>>>>>>> c5c4d92e70f3 (RDMA/uverbs: Use cdev_device_add() instead of cdev_add())
+  	uverbs_dev->cdev.owner = THIS_MODULE;
+- 	uverbs_dev->cdev.ops = device->mmap ? &uverbs_mmap_fops : &uverbs_fops;
+- 	cdev_set_parent(&uverbs_dev->cdev, &uverbs_dev->kobj);
+- 	kobject_set_name(&uverbs_dev->cdev.kobj, "uverbs%d", uverbs_dev->devnum);
+- 	if (cdev_add(&uverbs_dev->cdev, base, 1))
+- 		goto err_cdev;
+  
+- 	uverbs_dev->dev = device_create(uverbs_class, device->dev.parent,
+- 					uverbs_dev->cdev.dev, uverbs_dev,
+- 					"uverbs%d", uverbs_dev->devnum);
+- 	if (IS_ERR(uverbs_dev->dev))
++ 	ret = cdev_device_add(&uverbs_dev->cdev, &uverbs_dev->dev);
++ 	if (ret)
+  		goto err_cdev;
+  
+- 	if (device_create_file(uverbs_dev->dev, &dev_attr_ibdev))
+- 		goto err_class;
+- 	if (device_create_file(uverbs_dev->dev, &dev_attr_abi_version))
+- 		goto err_class;
++ 	if (device_create_file(&uverbs_dev->dev, &dev_attr_ibdev))
++ 		goto err_file;
++ 	if (device_create_file(&uverbs_dev->dev, &dev_attr_abi_version))
++ 		goto err_file;
+  
+ +	if (!device->specs_root) {
+ +		const struct uverbs_object_tree_def *default_root[] = {
+ +			uverbs_default_get_objects()};
+ +
+ +		uverbs_dev->specs_root = uverbs_alloc_spec_tree(1,
+ +								default_root);
+ +		if (IS_ERR(uverbs_dev->specs_root))
+ +			goto err_class;
+ +
+ +		device->specs_root = uverbs_dev->specs_root;
+ +	}
+ +
+  	ib_set_client_data(device, &uverbs_client, uverbs_dev);
+  
+  	return;
+  
+++<<<<<<< HEAD
+ +err_class:
+ +	device_destroy(uverbs_class, uverbs_dev->cdev.dev);
+ +
+ +err_cdev:
+ +	cdev_del(&uverbs_dev->cdev);
+++=======
++ err_file:
++ 	cdev_device_del(&uverbs_dev->cdev, &uverbs_dev->dev);
++ err_cdev:
++ 	cdev_del(&uverbs_dev->cdev);
++ 	put_device(&uverbs_dev->dev);
++ err_uapi:
+++>>>>>>> c5c4d92e70f3 (RDMA/uverbs: Use cdev_device_add() instead of cdev_add())
+  	clear_bit(devnum, dev_map);
+ +
+  err:
+  	if (atomic_dec_and_test(&uverbs_dev->refcount))
+  		ib_uverbs_comp_dev(uverbs_dev);
+@@@ -1245,12 -1172,8 +1252,12 @@@ static void ib_uverbs_remove_one(struc
+  		ib_uverbs_comp_dev(uverbs_dev);
+  	if (wait_clients)
+  		wait_for_completion(&uverbs_dev->comp);
+ +	if (uverbs_dev->specs_root) {
+ +		uverbs_free_spec_tree(uverbs_dev->specs_root);
+ +		device->specs_root = NULL;
+ +	}
+  
+- 	kobject_put(&uverbs_dev->kobj);
++ 	put_device(&uverbs_dev->dev);
+  }
+  
+  static char *uverbs_devnode(struct device *dev, umode_t *mode)
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index cbf36c75d546..599276144103 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -100,13 +100,12 @@ struct ib_uverbs_device {
+ 	atomic_t				refcount;
+ 	int					num_comp_vectors;
+ 	struct completion			comp;
+-	struct device			       *dev;
++	struct device				dev;
+ 	struct ib_device	__rcu	       *ib_dev;
+ 	int					devnum;
+ 	struct cdev			        cdev;
+ 	struct rb_root				xrcd_tree;
+ 	struct mutex				xrcd_tree_mutex;
+-	struct kobject				kobj;
+ 	struct srcu_struct			disassociate_srcu;
+ 	struct mutex				lists_mutex; /* protect lists */
+ 	struct list_head			uverbs_file_list;
+* Unmerged path drivers/infiniband/core/uverbs_main.c
