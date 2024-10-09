@@ -1,0 +1,79 @@
+gfs2: Fix glock rhashtable rcu bug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 961ae1d83d055a4b9ebbfb4cc8ca62ec1a7a3b74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/961ae1d8.failed
+
+Before commit 88ffbf3e03 "GFS2: Use resizable hash table for glocks",
+glocks were freed via call_rcu to allow reading the glock hashtable
+locklessly using rcu.  This was then changed to free glocks immediately,
+which made reading the glock hashtable unsafe.  Bring back the original
+code for freeing glocks via call_rcu.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Cc: stable@vger.kernel.org # 4.3+
+(cherry picked from commit 961ae1d83d055a4b9ebbfb4cc8ca62ec1a7a3b74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+diff --cc fs/gfs2/incore.h
+index fd519f9ec8bc,73fce76e67ee..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -355,7 -364,15 +355,19 @@@ struct gfs2_glock 
+  	atomic_t gl_ail_count;
+  	atomic_t gl_revokes;
+  	struct delayed_work gl_work;
+++<<<<<<< HEAD
+ +	struct work_struct gl_delete;
+++=======
++ 	union {
++ 		/* For inode and iopen glocks only */
++ 		struct work_struct gl_delete;
++ 		/* For rgrp glocks only */
++ 		struct {
++ 			loff_t start;
++ 			loff_t end;
++ 		} gl_vm;
++ 	};
+++>>>>>>> 961ae1d83d05 (gfs2: Fix glock rhashtable rcu bug)
+  	struct rcu_head gl_rcu;
+  	struct rhash_head gl_node;
+  };
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index edb49499a3c5..b2648af40a87 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -78,9 +78,9 @@ static struct rhashtable_params ht_parms = {
+ 
+ static struct rhashtable gl_hash_table;
+ 
+-void gfs2_glock_free(struct gfs2_glock *gl)
++static void gfs2_glock_dealloc(struct rcu_head *rcu)
+ {
+-	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++	struct gfs2_glock *gl = container_of(rcu, struct gfs2_glock, gl_rcu);
+ 
+ 	if (gl->gl_ops->go_flags & GLOF_ASPACE) {
+ 		kmem_cache_free(gfs2_glock_aspace_cachep, gl);
+@@ -88,6 +88,13 @@ void gfs2_glock_free(struct gfs2_glock *gl)
+ 		kfree(gl->gl_lksb.sb_lvbptr);
+ 		kmem_cache_free(gfs2_glock_cachep, gl);
+ 	}
++}
++
++void gfs2_glock_free(struct gfs2_glock *gl)
++{
++	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++
++	call_rcu(&gl->gl_rcu, gfs2_glock_dealloc);
+ 	if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+ 		wake_up(&sdp->sd_glock_wait);
+ }
+* Unmerged path fs/gfs2/incore.h
