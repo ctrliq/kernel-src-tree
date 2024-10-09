@@ -1,0 +1,220 @@
+perf callchain: Fix incorrect ordering of entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chris Phlipot <cphlipot0@gmail.com>
+commit 9919a65ec532799544dfdfd6df6f994b74c12b42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9919a65e.failed
+
+The existing implementation of thread__resolve_callchain, under certain
+circumstances, can assemble callchain entries in the incorrect order.
+
+The callchain entries are resolved incorrectly for a sample when all of
+the following conditions are met:
+
+1. callchain_param.order is set to ORDER_CALLER
+
+2. thread__resolve_callchain_sample is able to resolve callchain entries
+   for the sample.
+
+3. unwind__get_entries is also able to resolve callchain entries for the
+   sample.
+
+The fix is accomplished by reversing the order in which
+thread__resolve_callchain_sample and unwind__get_entries are called when
+callchain_param.order is set to ORDER_CALLER.
+
+Unwind specific code from thread__resolve_callchain is also moved into a
+new static function to improve readability of the fix.
+
+How to Reproduce the Existing Bug:
+
+Modifying perf script to print call trees in the opposite order or
+applying the remaining patches from this series and comparing the
+results output from export-to-postgtresql.py are the easiest ways to see
+the bug, however it can still be seen in current builds using perf
+report.
+
+Here is how i can reproduce the bug using perf report:
+
+  # perf record --call-graph=dwarf stress -c 1 -t 5
+
+when i run this command:
+
+  # perf report --call-graph=flat,0,0,callee
+
+This callchain, containing kernel (handle_irq_event, etc) and userspace
+samples (__libc_start_main, etc) is contained in the output, which looks
+correct (callee order):
+
+                gen8_irq_handler
+                handle_irq_event_percpu
+                handle_irq_event
+                handle_edge_irq
+                handle_irq
+                do_IRQ
+                ret_from_intr
+                __random
+                rand
+                0x558f2a04dded
+                0x558f2a04c774
+                __libc_start_main
+                0x558f2a04dcd9
+
+Now run this command using caller order:
+
+  # perf report --call-graph=flat,0,0,caller
+
+It is expected to see the exact reverse of the above when using caller
+order (with "0x558f2a04dcd9" at the top and "gen8_irq_handler" at the
+bottom) in the output, but it is nowhere to be found.
+
+instead you see this:
+
+                ret_from_intr
+                do_IRQ
+                handle_irq
+                handle_edge_irq
+                handle_irq_event
+                handle_irq_event_percpu
+                gen8_irq_handler
+                0x558f2a04dcd9
+                __libc_start_main
+                0x558f2a04c774
+                0x558f2a04dded
+                rand
+                __random
+
+Notice how internally the kernel symbols are reversed and the user space
+symbols are reversed, but the kernel symbols still appear above the user
+space symbols.
+
+if this patch is applied and perf script is re-run, you will see the
+expected output (with "0x558f2a04dcd9" at the top and "gen8_irq_handler"
+at the bottom):
+
+                0x558f2a04dcd9
+                __libc_start_main
+                0x558f2a04c774
+                0x558f2a04dded
+                rand
+                __random
+                ret_from_intr
+                do_IRQ
+                handle_irq
+                handle_edge_irq
+                handle_irq_event
+                handle_irq_event_percpu
+                gen8_irq_handler
+
+	Signed-off-by: Chris Phlipot <cphlipot0@gmail.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1461831551-12213-2-git-send-email-cphlipot0@gmail.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 9919a65ec532799544dfdfd6df6f994b74c12b42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/machine.c
+diff --cc tools/perf/util/machine.c
+index 45792d2161ac,639a2903065e..000000000000
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@@ -1814,10 -1817,8 +1814,15 @@@ static int thread__resolve_callchain_sa
+  	int skip_idx = -1;
+  	int first_call = 0;
+  
+++<<<<<<< HEAD
+ +	callchain_cursor_reset(&callchain_cursor);
+ +
+ +	if (has_branch_callstack(evsel)) {
+ +		err = resolve_lbr_callchain_sample(thread, sample, parent,
+++=======
++ 	if (perf_evsel__has_branch_callstack(evsel)) {
++ 		err = resolve_lbr_callchain_sample(thread, cursor, sample, parent,
+++>>>>>>> 9919a65ec532 (perf callchain: Fix incorrect ordering of entries)
+  						   root_al, max_stack);
+  		if (err)
+  			return (err < 0) ? err : 0;
+@@@ -1926,19 -1927,12 +1931,28 @@@ static int unwind_entry(struct unwind_e
+  				       entry->map, entry->sym);
+  }
+  
+++<<<<<<< HEAD
+ +int thread__resolve_callchain(struct thread *thread,
+ +			      struct perf_evsel *evsel,
+ +			      struct perf_sample *sample,
+ +			      struct symbol **parent,
+ +			      struct addr_location *root_al,
+ +			      int max_stack)
+ +{
+ +	int ret = thread__resolve_callchain_sample(thread, evsel,
+ +						   sample, parent,
+ +						   root_al, max_stack);
+ +	if (ret)
+ +		return ret;
+ +
+++=======
++ static int thread__resolve_callchain_unwind(struct thread *thread,
++ 					    struct callchain_cursor *cursor,
++ 					    struct perf_evsel *evsel,
++ 					    struct perf_sample *sample,
++ 					    int max_stack)
++ {
+++>>>>>>> 9919a65ec532 (perf callchain: Fix incorrect ordering of entries)
+  	/* Can we do dwarf post unwind? */
+  	if (!((evsel->attr.sample_type & PERF_SAMPLE_REGS_USER) &&
+  	      (evsel->attr.sample_type & PERF_SAMPLE_STACK_USER)))
+@@@ -1949,9 -1943,45 +1963,45 @@@
+  	    (!sample->user_stack.size))
+  		return 0;
+  
+ -	return unwind__get_entries(unwind_entry, cursor,
+ +	return unwind__get_entries(unwind_entry, &callchain_cursor,
+  				   thread, sample, max_stack);
++ }
++ 
++ int thread__resolve_callchain(struct thread *thread,
++ 			      struct callchain_cursor *cursor,
++ 			      struct perf_evsel *evsel,
++ 			      struct perf_sample *sample,
++ 			      struct symbol **parent,
++ 			      struct addr_location *root_al,
++ 			      int max_stack)
++ {
++ 	int ret = 0;
++ 
++ 	callchain_cursor_reset(&callchain_cursor);
+  
++ 	if (callchain_param.order == ORDER_CALLEE) {
++ 		ret = thread__resolve_callchain_sample(thread, cursor,
++ 						       evsel, sample,
++ 						       parent, root_al,
++ 						       max_stack);
++ 		if (ret)
++ 			return ret;
++ 		ret = thread__resolve_callchain_unwind(thread, cursor,
++ 						       evsel, sample,
++ 						       max_stack);
++ 	} else {
++ 		ret = thread__resolve_callchain_unwind(thread, cursor,
++ 						       evsel, sample,
++ 						       max_stack);
++ 		if (ret)
++ 			return ret;
++ 		ret = thread__resolve_callchain_sample(thread, cursor,
++ 						       evsel, sample,
++ 						       parent, root_al,
++ 						       max_stack);
++ 	}
++ 
++ 	return ret;
+  }
+  
+  int machine__for_each_thread(struct machine *machine,
+* Unmerged path tools/perf/util/machine.c
