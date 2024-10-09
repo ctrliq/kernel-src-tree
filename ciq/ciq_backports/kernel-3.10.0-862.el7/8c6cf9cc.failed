@@ -1,0 +1,149 @@
+mnt: Modify fs_fully_visible to deal with locked ro nodev and atime
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 8c6cf9cc829fcd0b179b59f7fe288941d0e31108
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8c6cf9cc.failed
+
+Ignore an existing mount if the locked readonly, nodev or atime
+attributes are less permissive than the desired attributes
+of the new mount.
+
+On success ensure the new mount locks all of the same readonly, nodev and
+atime attributes as the old mount.
+
+The nosuid and noexec attributes are not checked here as this change
+is destined for stable and enforcing those attributes causes a
+regression in lxc and libvirt-lxc where those applications will not
+start and there are no known executables on sysfs or proc and no known
+way to create exectuables without code modifications
+
+	Cc: stable@vger.kernel.org
+Fixes: e51db73532955 ("userns: Better restrictions on when proc and sysfs can be mounted")
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 8c6cf9cc829fcd0b179b59f7fe288941d0e31108)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+diff --cc fs/namespace.c
+index c3276b690896,63b9806235e6..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -2425,6 -2332,8 +2425,11 @@@ unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool fs_fully_visible(struct file_system_type *fs_type, int *new_mnt_flags);
++ 
+++>>>>>>> 8c6cf9cc829f (mnt: Modify fs_fully_visible to deal with locked ro nodev and atime)
+  /*
+   * create a new mount for userspace and request it to be added into the
+   * namespace's tree
+@@@ -2456,6 -2365,10 +2461,13 @@@ static int do_new_mount(struct path *pa
+  			flags |= MS_NODEV;
+  			mnt_flags |= MNT_NODEV | MNT_LOCK_NODEV;
+  		}
+++<<<<<<< HEAD
+++=======
++ 		if (type->fs_flags & FS_USERNS_VISIBLE) {
++ 			if (!fs_fully_visible(type, &mnt_flags))
++ 				return -EPERM;
++ 		}
+++>>>>>>> 8c6cf9cc829f (mnt: Modify fs_fully_visible to deal with locked ro nodev and atime)
+  	}
+  
+  	mnt = vfs_kern_mount(type, flags, name, data);
+@@@ -3294,30 -3170,67 +3306,78 @@@ bool current_chrooted(void
+  	return chrooted;
+  }
+  
+++<<<<<<< HEAD
+ +void update_mnt_policy(struct user_namespace *userns)
+++=======
++ static bool fs_fully_visible(struct file_system_type *type, int *new_mnt_flags)
+++>>>>>>> 8c6cf9cc829f (mnt: Modify fs_fully_visible to deal with locked ro nodev and atime)
+  {
+  	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
++ 	int new_flags = *new_mnt_flags;
+  	struct mount *mnt;
+ -	bool visible = false;
+ -
+ -	if (unlikely(!ns))
+ -		return false;
+  
+  	down_read(&namespace_sem);
+  	list_for_each_entry(mnt, &ns->list, mnt_list) {
+++<<<<<<< HEAD
+ +		switch (mnt->mnt.mnt_sb->s_magic) {
+ +		case SYSFS_MAGIC:
+ +			userns->may_mount_sysfs = true;
+ +			break;
+ +		case PROC_SUPER_MAGIC:
+ +			userns->may_mount_proc = true;
+ +			break;
+ +		}
+ +		if (userns->may_mount_sysfs && userns->may_mount_proc)
+ +			break;
+++=======
++ 		struct mount *child;
++ 		if (mnt->mnt.mnt_sb->s_type != type)
++ 			continue;
++ 
++ 		/* This mount is not fully visible if it's root directory
++ 		 * is not the root directory of the filesystem.
++ 		 */
++ 		if (mnt->mnt.mnt_root != mnt->mnt.mnt_sb->s_root)
++ 			continue;
++ 
++ 		/* Verify the mount flags are equal to or more permissive
++ 		 * than the proposed new mount.
++ 		 */
++ 		if ((mnt->mnt.mnt_flags & MNT_LOCK_READONLY) &&
++ 		    !(new_flags & MNT_READONLY))
++ 			continue;
++ 		if ((mnt->mnt.mnt_flags & MNT_LOCK_NODEV) &&
++ 		    !(new_flags & MNT_NODEV))
++ 			continue;
++ 		if ((mnt->mnt.mnt_flags & MNT_LOCK_ATIME) &&
++ 		    ((mnt->mnt.mnt_flags & MNT_ATIME_MASK) != (new_flags & MNT_ATIME_MASK)))
++ 			continue;
++ 
++ 		/* This mount is not fully visible if there are any child mounts
++ 		 * that cover anything except for empty directories.
++ 		 */
++ 		list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
++ 			struct inode *inode = child->mnt_mountpoint->d_inode;
++ 			if (!S_ISDIR(inode->i_mode))
++ 				goto next;
++ 			if (inode->i_nlink > 2)
++ 				goto next;
++ 		}
++ 		/* Preserve the locked attributes */
++ 		*new_mnt_flags |= mnt->mnt.mnt_flags & (MNT_LOCK_READONLY | \
++ 							MNT_LOCK_NODEV    | \
++ 							MNT_LOCK_ATIME);
++ 		visible = true;
++ 		goto found;
++ 	next:	;
+++>>>>>>> 8c6cf9cc829f (mnt: Modify fs_fully_visible to deal with locked ro nodev and atime)
+  	}
+ -found:
+  	up_read(&namespace_sem);
+ -	return visible;
+  }
+  
+ -static struct ns_common *mntns_get(struct task_struct *task)
+ +static void *mntns_get(struct task_struct *task)
+  {
+ -	struct ns_common *ns = NULL;
+ +	struct mnt_namespace *ns = NULL;
+  	struct nsproxy *nsproxy;
+  
+  	task_lock(task);
+* Unmerged path fs/namespace.c
