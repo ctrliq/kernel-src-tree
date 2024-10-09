@@ -1,0 +1,142 @@
+nfp: move RSS indirection table init into a separate function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 1e9e10d0c1365092972552d8c8f9d97517bcf581
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1e9e10d0.failed
+
+We will need to rerun the initialization of the RSS indirection table
+after the number of rings is changed.  Move the code to a separate
+function.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1e9e10d0c1365092972552d8c8f9d97517bcf581)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 2a625a67a222,09cec6e2c6cf..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -2207,71 -2229,48 +2207,115 @@@ static void nfp_net_set_rx_mode(struct 
+  	nn->ctrl = new_ctrl;
+  }
+  
+++<<<<<<< HEAD
+ +static int nfp_net_change_mtu(struct net_device *netdev, int new_mtu)
+++=======
++ static void nfp_net_rss_init_itbl(struct nfp_net *nn)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < sizeof(nn->rss_itbl); i++)
++ 		nn->rss_itbl[i] =
++ 			ethtool_rxfh_indir_default(i, nn->num_rx_rings);
++ }
++ 
++ static int
++ nfp_net_ring_swap_enable(struct nfp_net *nn,
++ 			 struct nfp_net_ring_set *rx,
++ 			 struct nfp_net_ring_set *tx)
++ {
++ 	unsigned int r;
++ 
++ 	if (rx)
++ 		nfp_net_rx_ring_set_swap(nn, rx);
++ 	if (tx)
++ 		nfp_net_tx_ring_set_swap(nn, tx);
++ 
++ 	for (r = 0; r <	nn->max_r_vecs; r++)
++ 		nfp_net_vector_assign_rings(nn, &nn->r_vecs[r], r);
++ 
++ 	return __nfp_net_set_config_and_enable(nn);
++ }
++ 
++ static void
++ nfp_net_ring_reconfig_down(struct nfp_net *nn,
++ 			   struct nfp_net_ring_set *rx,
++ 			   struct nfp_net_ring_set *tx)
++ {
++ 	nn->netdev->mtu = rx ? rx->mtu : nn->netdev->mtu;
++ 	nn->fl_bufsz = nfp_net_calc_fl_bufsz(nn, nn->netdev->mtu);
++ 	nn->rxd_cnt = rx ? rx->dcnt : nn->rxd_cnt;
++ 	nn->txd_cnt = tx ? tx->dcnt : nn->txd_cnt;
++ }
++ 
++ int
++ nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
++ 		      struct nfp_net_ring_set *tx)
+++>>>>>>> 1e9e10d0c136 (nfp: move RSS indirection table init into a separate function)
+  {
+ +	unsigned int old_mtu, old_fl_bufsz, new_fl_bufsz;
+ +	struct nfp_net *nn = netdev_priv(netdev);
+ +	struct nfp_net_rx_ring *tmp_rings;
+ +	int err;
+ +
+ +	if (new_mtu < 68 || new_mtu > nn->max_mtu) {
+ +		nn_err(nn, "New MTU (%d) is not valid\n", new_mtu);
+ +		return -EINVAL;
+ +	}
+ +
+ +	old_mtu = netdev->mtu;
+ +	old_fl_bufsz = nn->fl_bufsz;
+ +	new_fl_bufsz = NFP_NET_MAX_PREPEND + ETH_HLEN + VLAN_HLEN * 2 + new_mtu;
+ +
+ +	if (!netif_running(netdev)) {
+ +		netdev->mtu = new_mtu;
+ +		nn->fl_bufsz = new_fl_bufsz;
+ +		return 0;
+ +	}
+ +
+ +	/* Prepare new rings */
+ +	tmp_rings = nfp_net_shadow_rx_rings_prepare(nn, new_fl_bufsz,
+ +						    nn->rxd_cnt);
+ +	if (!tmp_rings)
+ +		return -ENOMEM;
+ +
+ +	/* Stop device, swap in new rings, try to start the firmware */
+ +	nfp_net_close_stack(nn);
+ +	nfp_net_clear_config_and_disable(nn);
+ +
+ +	tmp_rings = nfp_net_shadow_rx_rings_swap(nn, tmp_rings);
+ +
+ +	netdev->mtu = new_mtu;
+ +	nn->fl_bufsz = new_fl_bufsz;
+ +
+ +	err = nfp_net_set_config_and_enable(nn);
+ +	if (err) {
+ +		const int err_new = err;
+ +
+ +		/* Try with old configuration and old rings */
+ +		tmp_rings = nfp_net_shadow_rx_rings_swap(nn, tmp_rings);
+ +
+ +		netdev->mtu = old_mtu;
+ +		nn->fl_bufsz = old_fl_bufsz;
+ +
+ +		err = __nfp_net_set_config_and_enable(nn);
+ +		if (err)
+ +			nn_err(nn, "Can't restore MTU - FW communication failed (%d,%d)\n",
+ +			       err_new, err);
+ +	}
+ +
+ +	nfp_net_shadow_rx_rings_free(nn, tmp_rings);
+ +
+ +	nfp_net_open_stack(nn);
+ +
+ +	return err;
+ +}
+ +
+ +int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt)
+ +{
+ +	struct nfp_net_tx_ring *tx_rings = NULL;
+ +	struct nfp_net_rx_ring *rx_rings = NULL;
+ +	u32 old_rxd_cnt, old_txd_cnt;
+  	int err;
+  
+  	if (!netif_running(nn->netdev)) {
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
