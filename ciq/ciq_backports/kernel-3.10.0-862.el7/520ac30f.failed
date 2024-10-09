@@ -1,0 +1,991 @@
+net_sched: drop packets after root qdisc lock is released
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 520ac30f45519b0a82dd92117c181d1d6144677b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/520ac30f.failed
+
+Qdisc performance suffers when packets are dropped at enqueue()
+time because drops (kfree_skb()) are done while qdisc lock is held,
+delaying a dequeue() draining the queue.
+
+Nominal throughput can be reduced by 50 % when this happens,
+at a time we would like the dequeue() to proceed as fast as possible.
+
+Even FQ is vulnerable to this problem, while one of FQ goals was
+to provide some flow isolation.
+
+This patch adds a 'struct sk_buff **to_free' parameter to all
+qdisc->enqueue(), and in qdisc_drop() helper.
+
+I measured a performance increase of up to 12 %, but this patch
+is a prereq so that future batches in enqueue() can fly.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 520ac30f45519b0a82dd92117c181d1d6144677b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_fq_codel.c
+#	net/sched/sch_hhf.c
+#	net/sched/sch_netem.c
+#	net/sched/sch_tbf.c
+diff --cc net/sched/sch_fq_codel.c
+index d1079342abe0,f715195459c9..000000000000
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@@ -184,16 -185,8 +185,21 @@@ static unsigned int fq_codel_drop(struc
+  	return idx;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int fq_codel_qdisc_drop(struct Qdisc *sch)
+ +{
+ +	unsigned int prev_backlog;
+ +
+ +	prev_backlog = sch->qstats.backlog;
+ +	fq_codel_drop(sch, 1U);
+ +	return prev_backlog - sch->qstats.backlog;
+ +}
+ +
+ +static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+++=======
++ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++ 			    struct sk_buff **to_free)
+++>>>>>>> 520ac30f4551 (net_sched: drop packets after root qdisc lock is released)
+  {
+  	struct fq_codel_sched_data *q = qdisc_priv(sch);
+  	unsigned int idx, prev_backlog, prev_qlen;
+diff --cc net/sched/sch_hhf.c
+index 34723d9c0328,e3d0458af17b..000000000000
+--- a/net/sched/sch_hhf.c
++++ b/net/sched/sch_hhf.c
+@@@ -359,25 -359,16 +359,35 @@@ static unsigned int hhf_drop(struct Qdi
+  		struct sk_buff *skb = dequeue_head(bucket);
+  
+  		sch->q.qlen--;
+++<<<<<<< HEAD
+ +		sch->qstats.drops++;
+ +		sch->qstats.backlog -= qdisc_pkt_len(skb);
+ +		kfree_skb(skb);
+++=======
++ 		qdisc_qstats_backlog_dec(sch, skb);
++ 		qdisc_drop(skb, sch, to_free);
+++>>>>>>> 520ac30f4551 (net_sched: drop packets after root qdisc lock is released)
+  	}
+  
+  	/* Return id of the bucket from which the packet was dropped. */
+  	return bucket - q->buckets;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int hhf_qdisc_drop(struct Qdisc *sch)
+ +{
+ +	unsigned int prev_backlog;
+ +
+ +	prev_backlog = sch->qstats.backlog;
+ +	hhf_drop(sch);
+ +	return prev_backlog - sch->qstats.backlog;
+ +}
+ +
+ +static int hhf_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+++=======
++ static int hhf_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++ 		       struct sk_buff **to_free)
+++>>>>>>> 520ac30f4551 (net_sched: drop packets after root qdisc lock is released)
+  {
+  	struct hhf_sched_data *q = qdisc_priv(sch);
+  	enum wdrr_bucket_idx idx;
+diff --cc net/sched/sch_netem.c
+index 759dca493346,ccca8ca4c722..000000000000
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@@ -657,14 -617,17 +659,28 @@@ deliver
+  #endif
+  
+  			if (q->qdisc) {
+++<<<<<<< HEAD
+ +				unsigned int pkt_len = qdisc_pkt_len(skb);
+ +				int err = qdisc_enqueue(skb, q->qdisc);
+ +
+ +				if (err != NET_XMIT_SUCCESS &&
+ +				    net_xmit_drop_count(err)) {
+ +					qdisc_qstats_drop(sch);
+ +					qdisc_tree_reduce_backlog(sch, 1,
+ +								  pkt_len);
+++=======
++ 				struct sk_buff *to_free = NULL;
++ 				int err;
++ 
++ 				err = qdisc_enqueue(skb, q->qdisc, &to_free);
++ 				kfree_skb_list(to_free);
++ 				if (unlikely(err != NET_XMIT_SUCCESS)) {
++ 					if (net_xmit_drop_count(err)) {
++ 						qdisc_qstats_drop(sch);
++ 						qdisc_tree_reduce_backlog(sch, 1,
++ 									  qdisc_pkt_len(skb));
++ 					}
+++>>>>>>> 520ac30f4551 (net_sched: drop packets after root qdisc lock is released)
+  				}
+  				goto tfifo_dequeue;
+  			}
+diff --cc net/sched/sch_tbf.c
+index 63a8f2654e58,303355c449ab..000000000000
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@@ -203,11 -198,11 +205,17 @@@ static int tbf_enqueue(struct sk_buff *
+  	int ret;
+  
+  	if (qdisc_pkt_len(skb) > q->max_size) {
+++<<<<<<< HEAD
+ +		if (skb_is_gso(skb) && skb_gso_seglen(skb) <= q->max_size)
+ +			return tbf_segment(skb, sch);
+ +		return qdisc_drop(skb, sch);
+++=======
++ 		if (skb_is_gso(skb) && skb_gso_mac_seglen(skb) <= q->max_size)
++ 			return tbf_segment(skb, sch, to_free);
++ 		return qdisc_drop(skb, sch, to_free);
+++>>>>>>> 520ac30f4551 (net_sched: drop packets after root qdisc lock is released)
+  	}
+- 	ret = qdisc_enqueue(skb, q->qdisc);
++ 	ret = qdisc_enqueue(skb, q->qdisc, to_free);
+  	if (ret != NET_XMIT_SUCCESS) {
+  		if (net_xmit_drop_count(ret))
+  			qdisc_qstats_drop(sch);
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 71548842d47c..99c1b24630b0 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -44,8 +44,10 @@ struct qdisc_size_table {
+ };
+ 
+ struct Qdisc {
+-	int 			(*enqueue)(struct sk_buff *skb, struct Qdisc *dev);
+-	struct sk_buff *	(*dequeue)(struct Qdisc *dev);
++	int 			(*enqueue)(struct sk_buff *skb,
++					   struct Qdisc *sch,
++					   struct sk_buff **to_free);
++	struct sk_buff *	(*dequeue)(struct Qdisc *sch);
+ 	unsigned int		flags;
+ #define TCQ_F_BUILTIN		1
+ #define TCQ_F_INGRESS		2
+@@ -164,7 +166,9 @@ struct Qdisc_ops {
+ 	char			id[IFNAMSIZ];
+ 	int			priv_size;
+ 
+-	int 			(*enqueue)(struct sk_buff *, struct Qdisc *);
++	int 			(*enqueue)(struct sk_buff *skb,
++					   struct Qdisc *sch,
++					   struct sk_buff **to_free);
+ 	struct sk_buff *	(*dequeue)(struct Qdisc *);
+ 	struct sk_buff *	(*peek)(struct Qdisc *);
+ 	unsigned int		(*drop)(struct Qdisc *);
+@@ -504,10 +508,11 @@ static inline void qdisc_calculate_pkt_len(struct sk_buff *skb,
+ #endif
+ }
+ 
+-static inline int qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static inline int qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++				struct sk_buff **to_free)
+ {
+ 	qdisc_calculate_pkt_len(skb, sch);
+-	return sch->enqueue(skb, sch);
++	return sch->enqueue(skb, sch, to_free);
+ }
+ 
+ static inline bool qdisc_is_percpu_stats(const struct Qdisc *q)
+@@ -632,24 +637,36 @@ static inline struct sk_buff *qdisc_dequeue_head(struct Qdisc *sch)
+ 	return __qdisc_dequeue_head(sch, &sch->q);
+ }
+ 
++/* Instead of calling kfree_skb() while root qdisc lock is held,
++ * queue the skb for future freeing at end of __dev_xmit_skb()
++ */
++static inline void __qdisc_drop(struct sk_buff *skb, struct sk_buff **to_free)
++{
++	skb->next = *to_free;
++	*to_free = skb;
++}
++
+ static inline unsigned int __qdisc_queue_drop_head(struct Qdisc *sch,
+-					      struct sk_buff_head *list)
++						   struct sk_buff_head *list,
++						   struct sk_buff **to_free)
+ {
+ 	struct sk_buff *skb = __skb_dequeue(list);
+ 
+ 	if (likely(skb != NULL)) {
+ 		unsigned int len = qdisc_pkt_len(skb);
++
+ 		qdisc_qstats_backlog_dec(sch, skb);
+-		kfree_skb(skb);
++		__qdisc_drop(skb, to_free);
+ 		return len;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static inline unsigned int qdisc_queue_drop_head(struct Qdisc *sch)
++static inline unsigned int qdisc_queue_drop_head(struct Qdisc *sch,
++						 struct sk_buff **to_free)
+ {
+-	return __qdisc_queue_drop_head(sch, &sch->q);
++	return __qdisc_queue_drop_head(sch, &sch->q, to_free);
+ }
+ 
+ static inline struct sk_buff *__qdisc_dequeue_tail(struct Qdisc *sch,
+@@ -757,9 +774,11 @@ static inline unsigned int qdisc_queue_drop(struct Qdisc *sch)
+ 	return __qdisc_queue_drop(sch, &sch->q);
+ }
+ 
+-static inline int qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
++
++static inline int qdisc_drop(struct sk_buff *skb, struct Qdisc *sch,
++			     struct sk_buff **to_free)
+ {
+-	kfree_skb(skb);
++	__qdisc_drop(skb, to_free);
+ 	qdisc_qstats_drop(sch);
+ 
+ 	return NET_XMIT_DROP;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 75255cb2d9d9..08b130803bb1 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3042,6 +3042,7 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 				 struct netdev_queue *txq)
+ {
+ 	spinlock_t *root_lock = qdisc_lock(q);
++	struct sk_buff *to_free = NULL;
+ 	bool contended;
+ 	int rc;
+ 
+@@ -3059,7 +3060,7 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 
+ 	spin_lock(root_lock);
+ 	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
+-		kfree_skb(skb);
++		__qdisc_drop(skb, &to_free);
+ 		rc = NET_XMIT_DROP;
+ 	} else if ((q->flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
+ 		   qdisc_run_begin(q)) {
+@@ -3082,7 +3083,7 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 
+ 		rc = NET_XMIT_SUCCESS;
+ 	} else {
+-		rc = q->enqueue(skb, q) & NET_XMIT_MASK;
++		rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
+ 		if (qdisc_run_begin(q)) {
+ 			if (unlikely(contended)) {
+ 				spin_unlock(&q->busylock);
+@@ -3092,6 +3093,8 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 		}
+ 	}
+ 	spin_unlock(root_lock);
++	if (unlikely(to_free))
++		kfree_skb_list(to_free);
+ 	if (unlikely(contended))
+ 		spin_unlock(&q->busylock);
+ 	return rc;
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index 74e837f9d79a..0640cc27b726 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -357,7 +357,8 @@ static struct tcf_proto __rcu **atm_tc_find_tcf(struct Qdisc *sch,
+ 
+ /* --------------------------- Qdisc operations ---------------------------- */
+ 
+-static int atm_tc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int atm_tc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			  struct sk_buff **to_free)
+ {
+ 	struct atm_qdisc_data *p = qdisc_priv(sch);
+ 	struct atm_flow_data *flow;
+@@ -398,10 +399,10 @@ done:
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
+-			kfree_skb(skb);
++			__qdisc_drop(skb, to_free);
+ 			return NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+-			kfree_skb(skb);
++			__qdisc_drop(skb, to_free);
+ 			goto drop;
+ 		case TC_ACT_RECLASSIFY:
+ 			if (flow->excess)
+@@ -413,7 +414,7 @@ done:
+ #endif
+ 	}
+ 
+-	ret = qdisc_enqueue(skb, flow->q);
++	ret = qdisc_enqueue(skb, flow->q, to_free);
+ 	if (ret != NET_XMIT_SUCCESS) {
+ drop: __maybe_unused
+ 		if (net_xmit_drop_count(ret)) {
+diff --git a/net/sched/sch_blackhole.c b/net/sched/sch_blackhole.c
+index 3fee70d9814f..c98a61e980ba 100644
+--- a/net/sched/sch_blackhole.c
++++ b/net/sched/sch_blackhole.c
+@@ -17,9 +17,10 @@
+ #include <linux/skbuff.h>
+ #include <net/pkt_sched.h>
+ 
+-static int blackhole_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int blackhole_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			     struct sk_buff **to_free)
+ {
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	return NET_XMIT_SUCCESS;
+ }
+ 
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 24f30ccfced6..52ccd7055ec8 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -358,7 +358,8 @@ cbq_mark_toplevel(struct cbq_sched_data *q, struct cbq_class *cl)
+ }
+ 
+ static int
+-cbq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++cbq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++	    struct sk_buff **to_free)
+ {
+ 	struct cbq_sched_data *q = qdisc_priv(sch);
+ 	int uninitialized_var(ret);
+@@ -370,11 +371,11 @@ cbq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	if (cl == NULL) {
+ 		if (ret & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+-		kfree_skb(skb);
++		__qdisc_drop(skb, to_free);
+ 		return ret;
+ 	}
+ 
+-	ret = qdisc_enqueue(skb, cl->q);
++	ret = qdisc_enqueue(skb, cl->q, to_free);
+ 	if (ret == NET_XMIT_SUCCESS) {
+ 		sch->q.qlen++;
+ 		cbq_mark_toplevel(q, cl);
+diff --git a/net/sched/sch_choke.c b/net/sched/sch_choke.c
+index ef7e5f5166b5..b74455b023a7 100644
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@ -115,7 +115,8 @@ static void choke_zap_tail_holes(struct choke_sched_data *q)
+ }
+ 
+ /* Drop packet from queue array by creating a "hole" */
+-static void choke_drop_by_idx(struct Qdisc *sch, unsigned int idx)
++static void choke_drop_by_idx(struct Qdisc *sch, unsigned int idx,
++			      struct sk_buff **to_free)
+ {
+ 	struct choke_sched_data *q = qdisc_priv(sch);
+ 	struct sk_buff *skb = q->tab[idx];
+@@ -129,7 +130,7 @@ static void choke_drop_by_idx(struct Qdisc *sch, unsigned int idx)
+ 
+ 	qdisc_qstats_backlog_dec(sch, skb);
+ 	qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	--sch->q.qlen;
+ }
+ 
+@@ -261,7 +262,8 @@ static bool choke_match_random(const struct choke_sched_data *q,
+ 	return choke_match_flow(oskb, nskb);
+ }
+ 
+-static int choke_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int choke_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			 struct sk_buff **to_free)
+ {
+ 	int ret = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	struct choke_sched_data *q = qdisc_priv(sch);
+@@ -288,7 +290,7 @@ static int choke_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		/* Draw a packet at random from queue and compare flow */
+ 		if (choke_match_random(q, skb, &idx)) {
+ 			q->stats.matched++;
+-			choke_drop_by_idx(sch, idx);
++			choke_drop_by_idx(sch, idx, to_free);
+ 			goto congestion_drop;
+ 		}
+ 
+@@ -331,16 +333,16 @@ static int choke_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	}
+ 
+ 	q->stats.pdrop++;
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ 
+ congestion_drop:
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	return NET_XMIT_CN;
+ 
+ other_drop:
+ 	if (ret & __NET_XMIT_BYPASS)
+ 		qdisc_qstats_drop(sch);
+-	kfree_skb(skb);
++	__qdisc_drop(skb, to_free);
+ 	return ret;
+ }
+ 
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index c5bc424e3b3c..4002df3c7d9f 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -82,7 +82,8 @@ static void drop_func(struct sk_buff *skb, void *ctx)
+ {
+ 	struct Qdisc *sch = ctx;
+ 
+-	qdisc_drop(skb, sch);
++	kfree_skb(skb);
++	qdisc_qstats_drop(sch);
+ }
+ 
+ static struct sk_buff *codel_qdisc_dequeue(struct Qdisc *sch)
+@@ -107,7 +108,8 @@ static struct sk_buff *codel_qdisc_dequeue(struct Qdisc *sch)
+ 	return skb;
+ }
+ 
+-static int codel_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int codel_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			       struct sk_buff **to_free)
+ {
+ 	struct codel_sched_data *q;
+ 
+@@ -117,7 +119,7 @@ static int codel_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	}
+ 	q = qdisc_priv(sch);
+ 	q->drop_overlimit++;
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ }
+ 
+ static const struct nla_policy codel_policy[TCA_CODEL_MAX + 1] = {
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index c44f9d3bf69e..7e0ade2a5d21 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -350,7 +350,8 @@ static struct drr_class *drr_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 	return NULL;
+ }
+ 
+-static int drr_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int drr_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++		       struct sk_buff **to_free)
+ {
+ 	struct drr_sched *q = qdisc_priv(sch);
+ 	struct drr_class *cl;
+@@ -360,11 +361,11 @@ static int drr_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	if (cl == NULL) {
+ 		if (err & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+-		kfree_skb(skb);
++		__qdisc_drop(skb, to_free);
+ 		return err;
+ 	}
+ 
+-	err = qdisc_enqueue(skb, cl->qdisc);
++	err = qdisc_enqueue(skb, cl->qdisc, to_free);
+ 	if (unlikely(err != NET_XMIT_SUCCESS)) {
+ 		if (net_xmit_drop_count(err)) {
+ 			cl->qstats.drops++;
+diff --git a/net/sched/sch_dsmark.c b/net/sched/sch_dsmark.c
+index 667dc2b20143..b53ca1e2c0dd 100644
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -190,7 +190,8 @@ static inline struct tcf_proto __rcu **dsmark_find_tcf(struct Qdisc *sch,
+ 
+ /* --------------------------- Qdisc operations ---------------------------- */
+ 
+-static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			  struct sk_buff **to_free)
+ {
+ 	struct dsmark_qdisc_data *p = qdisc_priv(sch);
+ 	int err;
+@@ -233,7 +234,7 @@ static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ #ifdef CONFIG_NET_CLS_ACT
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
+-			kfree_skb(skb);
++			__qdisc_drop(skb, to_free);
+ 			return NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 
+ 		case TC_ACT_SHOT:
+@@ -250,7 +251,7 @@ static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		}
+ 	}
+ 
+-	err = qdisc_enqueue(skb, p->q);
++	err = qdisc_enqueue(skb, p->q, to_free);
+ 	if (err != NET_XMIT_SUCCESS) {
+ 		if (net_xmit_drop_count(err))
+ 			qdisc_qstats_drop(sch);
+@@ -263,7 +264,7 @@ static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	return NET_XMIT_SUCCESS;
+ 
+ drop:
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ }
+ 
+diff --git a/net/sched/sch_fifo.c b/net/sched/sch_fifo.c
+index 30a985400f73..f1d4c3699919 100644
+--- a/net/sched/sch_fifo.c
++++ b/net/sched/sch_fifo.c
+@@ -19,23 +19,26 @@
+ 
+ /* 1 band FIFO pseudo-"scheduler" */
+ 
+-static int bfifo_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int bfifo_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			 struct sk_buff **to_free)
+ {
+ 	if (likely(sch->qstats.backlog + qdisc_pkt_len(skb) <= sch->limit))
+ 		return qdisc_enqueue_tail(skb, sch);
+ 
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ }
+ 
+-static int pfifo_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int pfifo_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			 struct sk_buff **to_free)
+ {
+ 	if (likely(skb_queue_len(&sch->q) < sch->limit))
+ 		return qdisc_enqueue_tail(skb, sch);
+ 
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ }
+ 
+-static int pfifo_tail_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int pfifo_tail_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			      struct sk_buff **to_free)
+ {
+ 	unsigned int prev_backlog;
+ 
+@@ -44,7 +47,7 @@ static int pfifo_tail_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 
+ 	prev_backlog = sch->qstats.backlog;
+ 	/* queue full, remove one skb to fulfill the limit */
+-	__qdisc_queue_drop_head(sch, &sch->q);
++	__qdisc_queue_drop_head(sch, &sch->q, to_free);
+ 	qdisc_qstats_drop(sch);
+ 	qdisc_enqueue_tail(skb, sch);
+ 
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index 6ec54395cce5..6de9643b081c 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -365,18 +365,19 @@ static void flow_queue_add(struct fq_flow *flow, struct sk_buff *skb)
+ 	}
+ }
+ 
+-static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++		      struct sk_buff **to_free)
+ {
+ 	struct fq_sched_data *q = qdisc_priv(sch);
+ 	struct fq_flow *f;
+ 
+ 	if (unlikely(sch->q.qlen >= sch->limit))
+-		return qdisc_drop(skb, sch);
++		return qdisc_drop(skb, sch, to_free);
+ 
+ 	f = fq_classify(skb, q);
+ 	if (unlikely(f->qlen >= q->flow_plimit && f != &q->internal)) {
+ 		q->stat_flows_plimit++;
+-		return qdisc_drop(skb, sch);
++		return qdisc_drop(skb, sch, to_free);
+ 	}
+ 
+ 	f->qlen++;
+* Unmerged path net/sched/sch_fq_codel.c
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index e276704c5e88..c5a27ca8eb3e 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -382,9 +382,10 @@ EXPORT_SYMBOL(netif_carrier_off);
+    cheaper.
+  */
+ 
+-static int noop_enqueue(struct sk_buff *skb, struct Qdisc *qdisc)
++static int noop_enqueue(struct sk_buff *skb, struct Qdisc *qdisc,
++			struct sk_buff **to_free)
+ {
+-	kfree_skb(skb);
++	__qdisc_drop(skb, to_free);
+ 	return NET_XMIT_CN;
+ }
+ 
+@@ -472,7 +473,8 @@ static inline struct sk_buff_head *band2list(struct pfifo_fast_priv *priv,
+ 	return priv->q + band;
+ }
+ 
+-static int pfifo_fast_enqueue(struct sk_buff *skb, struct Qdisc *qdisc)
++static int pfifo_fast_enqueue(struct sk_buff *skb, struct Qdisc *qdisc,
++			      struct sk_buff **to_free)
+ {
+ 	if (skb_queue_len(&qdisc->q) < qdisc_dev(qdisc)->tx_queue_len) {
+ 		int band = prio2band[skb->priority & TC_PRIO_MAX];
+@@ -484,7 +486,7 @@ static int pfifo_fast_enqueue(struct sk_buff *skb, struct Qdisc *qdisc)
+ 		return __qdisc_enqueue_tail(skb, qdisc, list);
+ 	}
+ 
+-	return qdisc_drop(skb, qdisc);
++	return qdisc_drop(skb, qdisc, to_free);
+ }
+ 
+ static struct sk_buff *pfifo_fast_dequeue(struct Qdisc *qdisc)
+diff --git a/net/sched/sch_gred.c b/net/sched/sch_gred.c
+index 26fad8305703..b9c7b7a2e7a4 100644
+--- a/net/sched/sch_gred.c
++++ b/net/sched/sch_gred.c
+@@ -149,7 +149,8 @@ static inline int gred_use_harddrop(struct gred_sched *t)
+ 	return t->red_flags & TC_RED_HARDDROP;
+ }
+ 
+-static int gred_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int gred_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			struct sk_buff **to_free)
+ {
+ 	struct gred_sched_data *q = NULL;
+ 	struct gred_sched *t = qdisc_priv(sch);
+@@ -237,10 +238,10 @@ static int gred_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 
+ 	q->stats.pdrop++;
+ drop:
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ 
+ congestion_drop:
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	return NET_XMIT_CN;
+ }
+ 
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index 18c852dcc233..f019d08e2d8a 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1572,7 +1572,7 @@ hfsc_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
+ }
+ 
+ static int
+-hfsc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++hfsc_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
+ {
+ 	struct hfsc_class *cl;
+ 	int uninitialized_var(err);
+@@ -1581,11 +1581,11 @@ hfsc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	if (cl == NULL) {
+ 		if (err & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+-		kfree_skb(skb);
++		__qdisc_drop(skb, to_free);
+ 		return err;
+ 	}
+ 
+-	err = qdisc_enqueue(skb, cl->qdisc);
++	err = qdisc_enqueue(skb, cl->qdisc, to_free);
+ 	if (unlikely(err != NET_XMIT_SUCCESS)) {
+ 		if (net_xmit_drop_count(err)) {
+ 			cl->qstats.drops++;
+* Unmerged path net/sched/sch_hhf.c
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 151c98c0e51d..b7172df0a75c 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -569,7 +569,8 @@ static inline void htb_deactivate(struct htb_sched *q, struct htb_class *cl)
+ 	list_del_init(&cl->un.leaf.drop_list);
+ }
+ 
+-static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++		       struct sk_buff **to_free)
+ {
+ 	int uninitialized_var(ret);
+ 	struct htb_sched *q = qdisc_priv(sch);
+@@ -581,16 +582,17 @@ static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 			__skb_queue_tail(&q->direct_queue, skb);
+ 			q->direct_pkts++;
+ 		} else {
+-			return qdisc_drop(skb, sch);
++			return qdisc_drop(skb, sch, to_free);
+ 		}
+ #ifdef CONFIG_NET_CLS_ACT
+ 	} else if (!cl) {
+ 		if (ret & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+-		kfree_skb(skb);
++		__qdisc_drop(skb, to_free);
+ 		return ret;
+ #endif
+-	} else if ((ret = qdisc_enqueue(skb, cl->un.leaf.q)) != NET_XMIT_SUCCESS) {
++	} else if ((ret = qdisc_enqueue(skb, cl->un.leaf.q,
++					to_free)) != NET_XMIT_SUCCESS) {
+ 		if (net_xmit_drop_count(ret)) {
+ 			qdisc_qstats_drop(sch);
+ 			cl->qstats.drops++;
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index 759faafd074d..adb53c967775 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -66,7 +66,8 @@ multiq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ }
+ 
+ static int
+-multiq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++multiq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++	       struct sk_buff **to_free)
+ {
+ 	struct Qdisc *qdisc;
+ 	int ret;
+@@ -77,12 +78,12 @@ multiq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 
+ 		if (ret & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+-		kfree_skb(skb);
++		__qdisc_drop(skb, to_free);
+ 		return ret;
+ 	}
+ #endif
+ 
+-	ret = qdisc_enqueue(skb, qdisc);
++	ret = qdisc_enqueue(skb, qdisc, to_free);
+ 	if (ret == NET_XMIT_SUCCESS) {
+ 		sch->q.qlen++;
+ 		return NET_XMIT_SUCCESS;
+* Unmerged path net/sched/sch_netem.c
+diff --git a/net/sched/sch_pie.c b/net/sched/sch_pie.c
+index 3b7e44df5a47..1f73f5f750df 100644
+--- a/net/sched/sch_pie.c
++++ b/net/sched/sch_pie.c
+@@ -134,7 +134,8 @@ static bool drop_early(struct Qdisc *sch, u32 packet_size)
+ 	return false;
+ }
+ 
+-static int pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			     struct sk_buff **to_free)
+ {
+ 	struct pie_sched_data *q = qdisc_priv(sch);
+ 	bool enqueue = false;
+@@ -166,7 +167,7 @@ static int pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 
+ out:
+ 	q->stats.dropped++;
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ }
+ 
+ static const struct nla_policy pie_policy[TCA_PIE_MAX + 1] = {
+diff --git a/net/sched/sch_plug.c b/net/sched/sch_plug.c
+index a12cd37680f8..1c6cbab3e7b9 100644
+--- a/net/sched/sch_plug.c
++++ b/net/sched/sch_plug.c
+@@ -88,7 +88,8 @@ struct plug_sched_data {
+ 	u32 pkts_to_release;
+ };
+ 
+-static int plug_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int plug_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++			struct sk_buff **to_free)
+ {
+ 	struct plug_sched_data *q = qdisc_priv(sch);
+ 
+@@ -98,7 +99,7 @@ static int plug_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		return qdisc_enqueue_tail(skb, sch);
+ 	}
+ 
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ }
+ 
+ static struct sk_buff *plug_dequeue(struct Qdisc *sch)
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index bda93ee4f685..bcdd6684e088 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -67,7 +67,7 @@ prio_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ }
+ 
+ static int
+-prio_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++prio_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
+ {
+ 	struct Qdisc *qdisc;
+ 	int ret;
+@@ -83,7 +83,7 @@ prio_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	}
+ #endif
+ 
+-	ret = qdisc_enqueue(skb, qdisc);
++	ret = qdisc_enqueue(skb, qdisc, to_free);
+ 	if (ret == NET_XMIT_SUCCESS) {
+ 		qdisc_qstats_backlog_inc(sch, skb);
+ 		sch->q.qlen++;
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index c65d929a9687..d1149a209ea9 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -1218,7 +1218,8 @@ static struct qfq_aggregate *qfq_choose_next_agg(struct qfq_sched *q)
+ 	return agg;
+ }
+ 
+-static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++		       struct sk_buff **to_free)
+ {
+ 	struct qfq_sched *q = qdisc_priv(sch);
+ 	struct qfq_class *cl;
+@@ -1241,11 +1242,11 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 				     qdisc_pkt_len(skb));
+ 		if (err) {
+ 			cl->qstats.drops++;
+-			return qdisc_drop(skb, sch);
++			return qdisc_drop(skb, sch, to_free);
+ 		}
+ 	}
+ 
+-	err = qdisc_enqueue(skb, cl->qdisc);
++	err = qdisc_enqueue(skb, cl->qdisc, to_free);
+ 	if (unlikely(err != NET_XMIT_SUCCESS)) {
+ 		pr_debug("qfq_enqueue: enqueue failed %d\n", err);
+ 		if (net_xmit_drop_count(err)) {
+diff --git a/net/sched/sch_red.c b/net/sched/sch_red.c
+index 91578bdd378c..cb359bb12ccb 100644
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -56,7 +56,8 @@ static inline int red_use_harddrop(struct red_sched_data *q)
+ 	return q->flags & TC_RED_HARDDROP;
+ }
+ 
+-static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++		       struct sk_buff **to_free)
+ {
+ 	struct red_sched_data *q = qdisc_priv(sch);
+ 	struct Qdisc *child = q->qdisc;
+@@ -95,7 +96,7 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		break;
+ 	}
+ 
+-	ret = qdisc_enqueue(skb, child);
++	ret = qdisc_enqueue(skb, child, to_free);
+ 	if (likely(ret == NET_XMIT_SUCCESS)) {
+ 		qdisc_qstats_backlog_inc(sch, skb);
+ 		sch->q.qlen++;
+@@ -106,7 +107,7 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	return ret;
+ 
+ congestion_drop:
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	return NET_XMIT_CN;
+ }
+ 
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index ba31a5b026c4..20a350bd1b1d 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -275,7 +275,8 @@ static bool sfb_classify(struct sk_buff *skb, struct tcf_proto *fl,
+ 	return false;
+ }
+ 
+-static int sfb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++static int sfb_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++		       struct sk_buff **to_free)
+ {
+ 
+ 	struct sfb_sched_data *q = qdisc_priv(sch);
+@@ -397,7 +398,7 @@ static int sfb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	}
+ 
+ enqueue:
+-	ret = qdisc_enqueue(skb, child);
++	ret = qdisc_enqueue(skb, child, to_free);
+ 	if (likely(ret == NET_XMIT_SUCCESS)) {
+ 		qdisc_qstats_backlog_inc(sch, skb);
+ 		sch->q.qlen++;
+@@ -409,7 +410,7 @@ enqueue:
+ 	return ret;
+ 
+ drop:
+-	qdisc_drop(skb, sch);
++	qdisc_drop(skb, sch, to_free);
+ 	return NET_XMIT_CN;
+ other_drop:
+ 	if (ret & __NET_XMIT_BYPASS)
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index c45edd7e3947..a5f202d1b9e5 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -343,7 +343,7 @@ static int sfq_headdrop(const struct sfq_sched_data *q)
+ }
+ 
+ static int
+-sfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++sfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
+ {
+ 	struct sfq_sched_data *q = qdisc_priv(sch);
+ 	unsigned int hash, dropped;
+@@ -367,7 +367,7 @@ sfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	if (x == SFQ_EMPTY_SLOT) {
+ 		x = q->dep[0].next; /* get a free slot */
+ 		if (x >= SFQ_MAX_FLOWS)
+-			return qdisc_drop(skb, sch);
++			return qdisc_drop(skb, sch, to_free);
+ 		q->ht[hash] = x;
+ 		slot = &q->slots[x];
+ 		slot->hash = hash;
+@@ -424,14 +424,14 @@ sfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	if (slot->qlen >= q->maxdepth) {
+ congestion_drop:
+ 		if (!sfq_headdrop(q))
+-			return qdisc_drop(skb, sch);
++			return qdisc_drop(skb, sch, to_free);
+ 
+ 		/* We know we have at least one packet in queue */
+ 		head = slot_dequeue_head(slot);
+ 		delta = qdisc_pkt_len(head) - qdisc_pkt_len(skb);
+ 		sch->qstats.backlog -= delta;
+ 		slot->backlog -= delta;
+-		qdisc_drop(head, sch);
++		qdisc_drop(head, sch, to_free);
+ 
+ 		slot_queue_add(slot, skb);
+ 		return NET_XMIT_CN;
+* Unmerged path net/sched/sch_tbf.c
+diff --git a/net/sched/sch_teql.c b/net/sched/sch_teql.c
+index 87c62ecc9cd9..4600ebfa7e45 100644
+--- a/net/sched/sch_teql.c
++++ b/net/sched/sch_teql.c
+@@ -77,7 +77,7 @@ struct teql_sched_data {
+ /* "teql*" qdisc routines */
+ 
+ static int
+-teql_enqueue(struct sk_buff *skb, struct Qdisc *sch)
++teql_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
+ {
+ 	struct net_device *dev = qdisc_dev(sch);
+ 	struct teql_sched_data *q = qdisc_priv(sch);
+@@ -87,7 +87,7 @@ teql_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		return NET_XMIT_SUCCESS;
+ 	}
+ 
+-	return qdisc_drop(skb, sch);
++	return qdisc_drop(skb, sch, to_free);
+ }
+ 
+ static struct sk_buff *
