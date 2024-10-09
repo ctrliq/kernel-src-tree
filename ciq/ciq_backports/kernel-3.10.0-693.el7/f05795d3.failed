@@ -1,0 +1,114 @@
+scsi: Add intermediate STARGET_REMOVE state to scsi_target_state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] Add intermediate STARGET_REMOVE state to scsi_target_state (Ewan Milne) [1365651]
+Rebuild_FUZZ: 95.08%
+commit-author Johannes Thumshirn <jthumshirn@suse.de>
+commit f05795d3d771f30a7bdc3a138bf714b06d42aa95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f05795d3.failed
+
+Add intermediate STARGET_REMOVE state to scsi_target_state to avoid
+running into the BUG_ON() in scsi_target_reap(). The STARGET_REMOVE
+state is only valid in the path from scsi_remove_target() to
+scsi_target_destroy() indicating this target is going to be removed.
+
+This re-fixes the problem introduced in commits bc3f02a795d3 ("[SCSI]
+scsi_remove_target: fix softlockup regression on hot remove") and
+40998193560d ("scsi: restart list search after unlock in
+scsi_remove_target") in a more comprehensive way.
+
+[mkp: Included James' fix for scsi_target_destroy()]
+
+	Signed-off-by: Johannes Thumshirn <jthumshirn@suse.de>
+Fixes: 40998193560dab6c3ce8d25f4fa58a23e252ef38
+	Cc: stable@vger.kernel.org
+	Reported-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Tested-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Reviewed-by: Ewan D. Milne <emilne@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: James Bottomley <jejb@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f05795d3d771f30a7bdc3a138bf714b06d42aa95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_scan.c
+#	drivers/scsi/scsi_sysfs.c
+diff --cc drivers/scsi/scsi_scan.c
+index 174fec83cdc5,e0a78f53d809..000000000000
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@@ -336,6 -319,8 +336,11 @@@ static void scsi_target_destroy(struct 
+  	struct Scsi_Host *shost = dev_to_shost(dev->parent);
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+++=======
++ 	BUG_ON(starget->state == STARGET_DEL);
++ 	starget->state = STARGET_DEL;
+++>>>>>>> f05795d3d771 (scsi: Add intermediate STARGET_REMOVE state to scsi_target_state)
+  	transport_destroy_device(dev);
+  	spin_lock_irqsave(shost->host_lock, flags);
+  	if (shost->hostt->target_destroy)
+diff --cc drivers/scsi/scsi_sysfs.c
+index e652f3ba0738,f7da8a9d40b6..000000000000
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@@ -1251,25 -1367,24 +1251,36 @@@ static void __scsi_remove_target(struc
+  void scsi_remove_target(struct device *dev)
+  {
+  	struct Scsi_Host *shost = dev_to_shost(dev->parent);
+ -	struct scsi_target *starget, *last_target = NULL;
+ +	struct scsi_target *starget, *last = NULL;
+  	unsigned long flags;
+  
+ -restart:
+ +	/* remove targets being careful to lookup next entry before
+ +	 * deleting the last
+ +	 */
+  	spin_lock_irqsave(shost->host_lock, flags);
+  	list_for_each_entry(starget, &shost->__targets, siblings) {
+++<<<<<<< HEAD
+ +		if (starget->state == STARGET_DEL)
+ +			continue;
+ +		if (starget->dev.parent == dev || &starget->dev == dev) {
+ +			/* assuming new targets arrive at the end */
+ +			starget->reap_ref++;
+++=======
++ 		if (starget->state == STARGET_DEL ||
++ 		    starget->state == STARGET_REMOVE ||
++ 		    starget == last_target)
++ 			continue;
++ 		if (starget->dev.parent == dev || &starget->dev == dev) {
++ 			kref_get(&starget->reap_ref);
++ 			last_target = starget;
++ 			starget->state = STARGET_REMOVE;
+++>>>>>>> f05795d3d771 (scsi: Add intermediate STARGET_REMOVE state to scsi_target_state)
+  			spin_unlock_irqrestore(shost->host_lock, flags);
+ +			if (last)
+ +				scsi_target_reap(last);
+ +			last = starget;
+  			__scsi_remove_target(starget);
+ -			scsi_target_reap(starget);
+ -			goto restart;
+ +			spin_lock_irqsave(shost->host_lock, flags);
+  		}
+  	}
+  	spin_unlock_irqrestore(shost->host_lock, flags);
+* Unmerged path drivers/scsi/scsi_scan.c
+* Unmerged path drivers/scsi/scsi_sysfs.c
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 742e9be66654..c44f98d542f7 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -315,6 +315,7 @@ scmd_printk(const char *, const struct scsi_cmnd *, const char *, ...);
+ enum scsi_target_state {
+ 	STARGET_CREATED = 1,
+ 	STARGET_RUNNING,
++	STARGET_REMOVE,
+ 	STARGET_DEL,
+ };
+ 
