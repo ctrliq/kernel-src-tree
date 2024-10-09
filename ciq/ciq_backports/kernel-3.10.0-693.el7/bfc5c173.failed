@@ -1,0 +1,174 @@
+sysfs, kernfs: remove cross inclusions of internal headers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit bfc5c17337145955b31c22b96a6e07def048471b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bfc5c173.failed
+
+fs/kernfs/kernfs-internal.h needed to include fs/sysfs/sysfs.h because
+part of kernfs core implementation was living in sysfs.
+
+fs/sysfs/sysfs.h needed to include fs/kernfs/kernfs-internal.h because
+include/linux/kernfs.h didn't expose enough interface.
+
+The separation is complete and neither is true anymore.  Remove the
+cross inclusion and make sysfs a proper user of kernfs.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit bfc5c17337145955b31c22b96a6e07def048471b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/kernfs-internal.h
+#	fs/sysfs/sysfs.h
+diff --cc fs/sysfs/sysfs.h
+index d1e4043eb0c3,c8e395b49330..000000000000
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@@ -8,133 -8,10 +8,137 @@@
+   * This file is released under the GPLv2.
+   */
+  
+ -#ifndef __SYSFS_INTERNAL_H
+ -#define __SYSFS_INTERNAL_H
+ +#include <linux/lockdep.h>
+ +#include <linux/kobject_ns.h>
+ +#include <linux/fs.h>
+ +#include <linux/rbtree.h>
+  
+++<<<<<<< HEAD
+ +struct sysfs_open_dirent;
+ +
+ +/* type-specific structures for sysfs_dirent->s_* union members */
+ +struct sysfs_elem_dir {
+ +	struct kobject		*kobj;
+ +
+ +	unsigned long		subdirs;
+ +	/* children rbtree starts here and goes through sd->s_rb */
+ +	struct rb_root		children;
+ +};
+ +
+ +struct sysfs_elem_symlink {
+ +	struct sysfs_dirent	*target_sd;
+ +};
+ +
+ +struct sysfs_elem_attr {
+ +	struct attribute	*attr;
+ +	struct sysfs_open_dirent *open;
+ +};
+ +
+ +struct sysfs_elem_bin_attr {
+ +	struct bin_attribute	*bin_attr;
+ +	struct hlist_head	buffers;
+ +};
+ +
+ +struct sysfs_inode_attrs {
+ +	struct iattr	ia_iattr;
+ +	void		*ia_secdata;
+ +	u32		ia_secdata_len;
+ +};
+ +
+ +/*
+ + * sysfs_dirent - the building block of sysfs hierarchy.  Each and
+ + * every sysfs node is represented by single sysfs_dirent.
+ + *
+ + * As long as s_count reference is held, the sysfs_dirent itself is
+ + * accessible.  Dereferencing s_elem or any other outer entity
+ + * requires s_active reference.
+ + */
+ +struct sysfs_dirent {
+ +	atomic_t		s_count;
+ +	atomic_t		s_active;
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +	struct lockdep_map	dep_map;
+ +#endif
+ +	struct sysfs_dirent	*s_parent;
+ +	const char		*s_name;
+ +
+ +	struct rb_node		s_rb;
+ +
+ +	union {
+ +		struct completion	*completion;
+ +		struct sysfs_dirent	*removed_list;
+ +	} u;
+ +
+ +	const void		*s_ns; /* namespace tag */
+ +	unsigned int		s_hash; /* ns + name hash */
+ +	union {
+ +		struct sysfs_elem_dir		s_dir;
+ +		struct sysfs_elem_symlink	s_symlink;
+ +		struct sysfs_elem_attr		s_attr;
+ +		struct sysfs_elem_bin_attr	s_bin_attr;
+ +	};
+ +
+ +	unsigned short		s_flags;
+ +	umode_t 		s_mode;
+ +	unsigned int		s_ino;
+ +	struct sysfs_inode_attrs *s_iattr;
+ +};
+ +
+ +#define SD_DEACTIVATED_BIAS		INT_MIN
+ +
+ +#define SYSFS_TYPE_MASK			0x00ff
+ +#define SYSFS_DIR			0x0001
+ +#define SYSFS_KOBJ_ATTR			0x0002
+ +#define SYSFS_KOBJ_BIN_ATTR		0x0004
+ +#define SYSFS_KOBJ_LINK			0x0008
+ +#define SYSFS_COPY_NAME			(SYSFS_DIR | SYSFS_KOBJ_LINK)
+ +#define SYSFS_ACTIVE_REF		(SYSFS_KOBJ_ATTR | SYSFS_KOBJ_BIN_ATTR)
+ +
+ +/* identify any namespace tag on sysfs_dirents */
+ +#define SYSFS_NS_TYPE_MASK		0xf00
+ +#define SYSFS_NS_TYPE_SHIFT		8
+ +
+ +#define SYSFS_FLAG_MASK			~(SYSFS_NS_TYPE_MASK|SYSFS_TYPE_MASK)
+ +#define SYSFS_FLAG_REMOVED		0x02000
+ +
+ +static inline unsigned int sysfs_type(struct sysfs_dirent *sd)
+ +{
+ +	return sd->s_flags & SYSFS_TYPE_MASK;
+ +}
+ +
+ +/*
+ + * Return any namespace tags on this dirent.
+ + * enum kobj_ns_type is defined in linux/kobject.h
+ + */
+ +static inline enum kobj_ns_type sysfs_ns_type(struct sysfs_dirent *sd)
+ +{
+ +	return (sd->s_flags & SYSFS_NS_TYPE_MASK) >> SYSFS_NS_TYPE_SHIFT;
+ +}
+ +
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +#define sysfs_dirent_init_lockdep(sd)				\
+ +do {								\
+ +	struct attribute *attr = sd->s_attr.attr;		\
+ +	struct lock_class_key *key = attr->key;			\
+ +	if (!key)						\
+ +		key = &attr->skey;				\
+ +								\
+ +	lockdep_init_map(&sd->dep_map, "s_active", key, 0);	\
+ +} while(0)
+ +#else
+ +#define sysfs_dirent_init_lockdep(sd) do {} while(0)
+ +#endif
+ +
+ +/*
+ + * Context structure to be used while adding/removing nodes.
+ + */
+ +struct sysfs_addrm_cxt {
+ +	struct sysfs_dirent	*parent_sd;
+ +	struct sysfs_dirent	*removed;
+ +};
+++=======
++ #include <linux/sysfs.h>
+++>>>>>>> bfc5c1733714 (sysfs, kernfs: remove cross inclusions of internal headers)
+  
+  /*
+   * mount.c
+* Unmerged path fs/kernfs/kernfs-internal.h
+* Unmerged path fs/kernfs/kernfs-internal.h
+* Unmerged path fs/sysfs/sysfs.h
