@@ -3366,7 +3366,9 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
 
 	txq = skb_get_tx_queue(odev, pkt_dev->skb);
 
-	__netif_tx_lock_bh(txq);
+	local_bh_disable();
+
+	HARD_TX_LOCK(odev, txq, smp_processor_id());
 
 	if (unlikely(netif_xmit_frozen_or_drv_stopped(txq))) {
 		ret = NETDEV_TX_BUSY;
@@ -3406,7 +3408,9 @@ xmit_more:
 	if (unlikely(burst))
 		atomic_sub(burst, &pkt_dev->skb->users);
 unlock:
-	__netif_tx_unlock_bh(txq);
+	HARD_TX_UNLOCK(odev, txq);
+
+	local_bh_enable();
 
 	/* If pkt_dev->count is zero, then run forever */
 	if ((pkt_dev->count != 0) && (pkt_dev->sofar >= pkt_dev->count)) {
