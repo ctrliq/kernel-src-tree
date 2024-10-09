@@ -1,0 +1,153 @@
+net/mlx5: Fix QP fragmented buffer allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Fix QP fragmented buffer allocation (Alaa Hleihel) [1641354 1642498]
+Rebuild_FUZZ: 95.35%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit d7037ad73daa9598b8caa7d5fdf41e8ceee6ef73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d7037ad7.failed
+
+Fix bad alignment of SQ buffer in fragmented QP allocation.
+It should start directly after RQ buffer ends.
+
+Take special care of the end case where the RQ buffer does not occupy
+a whole page. RQ size is a power of two, so would be the case only for
+small RQ sizes (RQ size < PAGE_SIZE).
+
+Fix wrong assignments for sqb->size (mistakenly assigned RQ size),
+and for npages value of RQ and SQ.
+
+Fixes: 3a2f70331226 ("net/mlx5: Use order-0 allocations for all WQ types")
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d7037ad73daa9598b8caa7d5fdf41e8ceee6ef73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/wq.c
+#	include/linux/mlx5/driver.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/wq.c
+index ea66448ba365,86478a6b99c5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.c
+@@@ -105,17 -113,45 +105,56 @@@ err_db_free
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5_qp_set_frag_buf(struct mlx5_frag_buf *buf,
++ 				 struct mlx5_wq_qp *qp)
++ {
++ 	struct mlx5_frag_buf_ctrl *sq_fbc;
++ 	struct mlx5_frag_buf *rqb, *sqb;
++ 
++ 	rqb  = &qp->rq.fbc.frag_buf;
++ 	*rqb = *buf;
++ 	rqb->size   = mlx5_wq_cyc_get_byte_size(&qp->rq);
++ 	rqb->npages = DIV_ROUND_UP(rqb->size, PAGE_SIZE);
++ 
++ 	sq_fbc = &qp->sq.fbc;
++ 	sqb    = &sq_fbc->frag_buf;
++ 	*sqb   = *buf;
++ 	sqb->size   = mlx5_wq_cyc_get_byte_size(&qp->sq);
++ 	sqb->npages = DIV_ROUND_UP(sqb->size, PAGE_SIZE);
++ 	sqb->frags += rqb->npages; /* first part is for the rq */
++ 	if (sq_fbc->strides_offset)
++ 		sqb->frags--;
++ }
++ 
+++>>>>>>> d7037ad73daa (net/mlx5: Fix QP fragmented buffer allocation)
+  int mlx5_wq_qp_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+  		      void *qpc, struct mlx5_wq_qp *wq,
+  		      struct mlx5_wq_ctrl *wq_ctrl)
+  {
++ 	u32 sq_strides_offset;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	wq->rq.log_stride = MLX5_GET(qpc, qpc, log_rq_stride) + 4;
+ +	wq->rq.sz_m1 = (1 << MLX5_GET(qpc, qpc, log_rq_size)) - 1;
+ +
+ +	wq->sq.log_stride = ilog2(MLX5_SEND_WQE_BB);
+ +	wq->sq.sz_m1 = (1 << MLX5_GET(qpc, qpc, log_sq_size)) - 1;
+++=======
++ 	mlx5_fill_fbc(MLX5_GET(qpc, qpc, log_rq_stride) + 4,
++ 		      MLX5_GET(qpc, qpc, log_rq_size),
++ 		      &wq->rq.fbc);
++ 
++ 	sq_strides_offset =
++ 		((wq->rq.fbc.frag_sz_m1 + 1) % PAGE_SIZE) / MLX5_SEND_WQE_BB;
++ 
++ 	mlx5_fill_fbc_offset(ilog2(MLX5_SEND_WQE_BB),
++ 			     MLX5_GET(qpc, qpc, log_sq_size),
++ 			     sq_strides_offset,
++ 			     &wq->sq.fbc);
+++>>>>>>> d7037ad73daa (net/mlx5: Fix QP fragmented buffer allocation)
+  
+  	err = mlx5_db_alloc_node(mdev, &wq_ctrl->db, param->db_numa_node);
+  	if (err) {
+@@@ -130,8 -166,8 +169,13 @@@
+  		goto err_db_free;
+  	}
+  
+++<<<<<<< HEAD
+ +	wq->rq.buf = wq_ctrl->buf.frags->buf;
+ +	wq->sq.buf = wq->rq.buf + mlx5_wq_cyc_get_byte_size(&wq->rq);
+++=======
++ 	mlx5_qp_set_frag_buf(&wq_ctrl->buf, wq);
++ 
+++>>>>>>> d7037ad73daa (net/mlx5: Fix QP fragmented buffer allocation)
+  	wq->rq.db  = &wq_ctrl->db.db[MLX5_RCV_DBR];
+  	wq->sq.db  = &wq_ctrl->db.db[MLX5_SND_DBR];
+  
+diff --cc include/linux/mlx5/driver.h
+index 4e54981203eb,83957920653a..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -980,6 -984,24 +981,27 @@@ static inline u32 mlx5_base_mkey(const 
+  	return key & 0xffffff00u;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mlx5_fill_fbc_offset(u8 log_stride, u8 log_sz,
++ 					u32 strides_offset,
++ 					struct mlx5_frag_buf_ctrl *fbc)
++ {
++ 	fbc->log_stride = log_stride;
++ 	fbc->log_sz     = log_sz;
++ 	fbc->sz_m1	= (1 << fbc->log_sz) - 1;
++ 	fbc->log_frag_strides = PAGE_SHIFT - fbc->log_stride;
++ 	fbc->frag_sz_m1	= (1 << fbc->log_frag_strides) - 1;
++ 	fbc->strides_offset = strides_offset;
++ }
++ 
++ static inline void mlx5_fill_fbc(u8 log_stride, u8 log_sz,
++ 				 struct mlx5_frag_buf_ctrl *fbc)
++ {
++ 	mlx5_fill_fbc_offset(log_stride, log_sz, 0, fbc);
++ }
++ 
+++>>>>>>> d7037ad73daa (net/mlx5: Fix QP fragmented buffer allocation)
+  static inline void mlx5_core_init_cq_frag_buf(struct mlx5_frag_buf_ctrl *fbc,
+  					      void *cqc)
+  {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/alloc.c b/drivers/net/ethernet/mellanox/mlx5/core/alloc.c
+index 323ffe8bf7e4..456f30007ad6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/alloc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/alloc.c
+@@ -123,7 +123,7 @@ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
+ 	int i;
+ 
+ 	buf->size = size;
+-	buf->npages = 1 << get_order(size);
++	buf->npages = DIV_ROUND_UP(size, PAGE_SIZE);
+ 	buf->page_shift = PAGE_SHIFT;
+ 	buf->frags = kcalloc(buf->npages, sizeof(struct mlx5_buf_list),
+ 			     GFP_KERNEL);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/wq.c
+* Unmerged path include/linux/mlx5/driver.h
