@@ -1,0 +1,170 @@
+x86/cpu: Merge bugs.c and bugs_64.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] cpu: Merge bugs.c and bugs_64.c (Josh Poimboeuf) [1535644]
+Rebuild_FUZZ: 93.94%
+commit-author Borislav Petkov <bp@suse.de>
+commit 62a67e123e058a67db58bc6a14354dd037bafd0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/62a67e12.failed
+
+Should be easier when following boot paths. It probably is a left over
+from the x86 unification eons ago.
+
+No functionality change.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20161024173844.23038-3-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 62a67e123e058a67db58bc6a14354dd037bafd0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/Makefile
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kernel/cpu/bugs_64.c
+diff --cc arch/x86/kernel/cpu/Makefile
+index 21c1e451a160,33b63670bf09..000000000000
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@@ -13,12 -17,13 +13,18 @@@ nostackp := $(call cc-option, -fno-stac
+  CFLAGS_common.o		:= $(nostackp)
+  
+  obj-y			:= intel_cacheinfo.o scattered.o topology.o
+ -obj-y			+= common.o
+ +obj-y			+= proc.o capflags.o powerflags.o common.o
+  obj-y			+= rdrand.o
+  obj-y			+= match.o
++ obj-y			+= bugs.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_X86_32)	+= bugs.o
+ +obj-$(CONFIG_X86_64)	+= bugs_64.o
+++=======
++ obj-$(CONFIG_PROC_FS)	+= proc.o
++ obj-$(CONFIG_X86_FEATURE_NAMES) += capflags.o powerflags.o
+++>>>>>>> 62a67e123e05 (x86/cpu: Merge bugs.c and bugs_64.c)
+  
+  obj-$(CONFIG_CPU_SUP_INTEL)		+= intel.o
+  obj-$(CONFIG_CPU_SUP_AMD)		+= amd.o
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 4112be9a4659,a44ef52184df..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -16,71 -16,9 +16,73 @@@
+  #include <asm/msr.h>
+  #include <asm/paravirt.h>
+  #include <asm/alternative.h>
++ #include <asm/pgtable.h>
++ #include <asm/cacheflush.h>
+  
+ +static int __init no_387(char *s)
+ +{
+ +	boot_cpu_data.hard_math = 0;
+ +	write_cr0(X86_CR0_TS | X86_CR0_EM | X86_CR0_MP | read_cr0());
+ +	return 1;
+ +}
+ +
+ +__setup("no387", no_387);
+ +
+ +static double __initdata x = 4195835.0;
+ +static double __initdata y = 3145727.0;
+ +
+ +/*
+ + * This used to check for exceptions..
+ + * However, it turns out that to support that,
+ + * the XMM trap handlers basically had to
+ + * be buggy. So let's have a correct XMM trap
+ + * handler, and forget about printing out
+ + * some status at boot.
+ + *
+ + * We should really only care about bugs here
+ + * anyway. Not features.
+ + */
+ +static void __init check_fpu(void)
+ +{
+ +	s32 fdiv_bug;
+ +
+ +	if (!boot_cpu_data.hard_math) {
+ +#ifndef CONFIG_MATH_EMULATION
+ +		pr_emerg("No coprocessor found and no math emulation present\n");
+ +		pr_emerg("Giving up\n");
+ +		for (;;) ;
+ +#endif
+ +		return;
+ +	}
+ +
+ +	kernel_fpu_begin();
+ +
+ +	/*
+ +	 * trap_init() enabled FXSR and company _before_ testing for FP
+ +	 * problems here.
+ +	 *
+ +	 * Test for the divl bug: http://en.wikipedia.org/wiki/Fdiv_bug
+ +	 */
+ +	__asm__("fninit\n\t"
+ +		"fldl %1\n\t"
+ +		"fdivl %2\n\t"
+ +		"fmull %2\n\t"
+ +		"fldl %1\n\t"
+ +		"fsubp %%st,%%st(1)\n\t"
+ +		"fistpl %0\n\t"
+ +		"fwait\n\t"
+ +		"fninit"
+ +		: "=m" (*&fdiv_bug)
+ +		: "m" (*&x), "m" (*&y));
+ +
+ +	kernel_fpu_end();
+ +
+ +	if (fdiv_bug) {
+ +		set_cpu_bug(&boot_cpu_data, X86_BUG_FDIV);
+ +		pr_warn("Hmm, FPU with FDIV bug\n");
+ +	}
+ +}
+ +
+  void __init check_bugs(void)
+  {
+  	identify_boot_cpu();
+@@@ -103,9 -43,19 +107,27 @@@
+  		'0' + (boot_cpu_data.x86 > 6 ? 6 : boot_cpu_data.x86);
+  	alternative_instructions();
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * kernel_fpu_begin/end() in check_fpu() relies on the patched
+ +	 * alternative instructions.
+ +	 */
+ +	check_fpu();
+++=======
++ 	fpu__init_check_bugs();
++ #else /* CONFIG_X86_64 */
++ 	alternative_instructions();
++ 
++ 	/*
++ 	 * Make sure the first 2MB area is not mapped by huge pages
++ 	 * There are typically fixed size MTRRs in there and overlapping
++ 	 * MTRRs into large pages causes slow downs.
++ 	 *
++ 	 * Right now we don't do that with gbpages because there seems
++ 	 * very little benefit for that case.
++ 	 */
++ 	if (!direct_gbpages)
++ 		set_memory_4k((unsigned long)__va(0), 1);
++ #endif
+++>>>>>>> 62a67e123e05 (x86/cpu: Merge bugs.c and bugs_64.c)
+  }
+* Unmerged path arch/x86/kernel/cpu/bugs_64.c
+* Unmerged path arch/x86/kernel/cpu/Makefile
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kernel/cpu/bugs_64.c
