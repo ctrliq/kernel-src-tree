@@ -1,0 +1,155 @@
+md: Convert timers to use timer_setup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] amd: Convert timers to use timer_setup() (David Arcari) [1589397]
+Rebuild_FUZZ: 98.73%
+commit-author Kees Cook <keescook@chromium.org>
+commit 8376d3c1f98988ae7f9e9bc2d1eeeb7d61fd206c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8376d3c1.failed
+
+In preparation for unconditionally passing the struct timer_list pointer to
+all timer callbacks, switch to using the new timer_setup() and from_timer()
+to pass the timer pointer explicitly.
+
+	Cc: Kent Overstreet <kent.overstreet@gmail.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Alasdair Kergon <agk@redhat.com>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: dm-devel@redhat.com
+	Cc: linux-bcache@vger.kernel.org
+	Cc: linux-raid@vger.kernel.org
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Michael Lyle <mlyle@lyle.org>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8376d3c1f98988ae7f9e9bc2d1eeeb7d61fd206c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-integrity.c
+* Unmerged path drivers/md/dm-integrity.c
+diff --git a/drivers/md/bcache/stats.c b/drivers/md/bcache/stats.c
+index b8730e714d69..f1c2d14026e9 100644
+--- a/drivers/md/bcache/stats.c
++++ b/drivers/md/bcache/stats.c
+@@ -147,9 +147,9 @@ static void scale_stats(struct cache_stats *stats, unsigned long rescale_at)
+ 	}
+ }
+ 
+-static void scale_accounting(unsigned long data)
++static void scale_accounting(struct timer_list *t)
+ {
+-	struct cache_accounting *acc = (struct cache_accounting *) data;
++	struct cache_accounting *acc = from_timer(acc, t, timer);
+ 
+ #define move_stat(name) do {						\
+ 	unsigned t = atomic_xchg(&acc->collector.name, 0);		\
+@@ -236,9 +236,7 @@ void bch_cache_accounting_init(struct cache_accounting *acc,
+ 	kobject_init(&acc->day.kobj,		&bch_stats_ktype);
+ 
+ 	closure_init(&acc->cl, parent);
+-	init_timer(&acc->timer);
++	timer_setup(&acc->timer, scale_accounting, 0);
+ 	acc->timer.expires	= jiffies + accounting_delay;
+-	acc->timer.data		= (unsigned long) acc;
+-	acc->timer.function	= scale_accounting;
+ 	add_timer(&acc->timer);
+ }
+diff --git a/drivers/md/dm-delay.c b/drivers/md/dm-delay.c
+index d98a56468add..c94f45a23c8b 100644
+--- a/drivers/md/dm-delay.c
++++ b/drivers/md/dm-delay.c
+@@ -44,9 +44,9 @@ struct dm_delay_info {
+ 
+ static DEFINE_MUTEX(delayed_bios_lock);
+ 
+-static void handle_delayed_timer(unsigned long data)
++static void handle_delayed_timer(struct timer_list *t)
+ {
+-	struct delay_c *dc = (struct delay_c *)data;
++	struct delay_c *dc = from_timer(dc, t, delay_timer);
+ 
+ 	queue_work(dc->kdelayd_wq, &dc->flush_expired_bios);
+ }
+@@ -195,7 +195,7 @@ out:
+ 		goto bad_queue;
+ 	}
+ 
+-	setup_timer(&dc->delay_timer, handle_delayed_timer, (unsigned long)dc);
++	timer_setup(&dc->delay_timer, handle_delayed_timer, 0);
+ 
+ 	INIT_WORK(&dc->flush_expired_bios, flush_expired_bios);
+ 	INIT_LIST_HEAD(&dc->delayed_bios);
+* Unmerged path drivers/md/dm-integrity.c
+diff --git a/drivers/md/dm-raid1.c b/drivers/md/dm-raid1.c
+index c41cafbde60d..0a804883a2f2 100644
+--- a/drivers/md/dm-raid1.c
++++ b/drivers/md/dm-raid1.c
+@@ -92,9 +92,9 @@ static void wakeup_mirrord(void *context)
+ 	queue_work(ms->kmirrord_wq, &ms->kmirrord_work);
+ }
+ 
+-static void delayed_wake_fn(unsigned long data)
++static void delayed_wake_fn(struct timer_list *t)
+ {
+-	struct mirror_set *ms = (struct mirror_set *) data;
++	struct mirror_set *ms = from_timer(ms, t, timer);
+ 
+ 	clear_bit(0, &ms->timer_pending);
+ 	wakeup_mirrord(ms);
+@@ -106,8 +106,6 @@ static void delayed_wake(struct mirror_set *ms)
+ 		return;
+ 
+ 	ms->timer.expires = jiffies + HZ / 5;
+-	ms->timer.data = (unsigned long) ms;
+-	ms->timer.function = delayed_wake_fn;
+ 	add_timer(&ms->timer);
+ }
+ 
+@@ -1098,7 +1096,7 @@ static int mirror_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 		goto err_free_context;
+ 	}
+ 	INIT_WORK(&ms->kmirrord_work, do_mirror);
+-	init_timer(&ms->timer);
++	timer_setup(&ms->timer, delayed_wake_fn, 0);
+ 	ms->timer_pending = 0;
+ 	INIT_WORK(&ms->trigger_event, trigger_event);
+ 
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 9bf51228c85b..a2f6e314b4b3 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -543,7 +543,7 @@ static void mddev_put(struct mddev *mddev)
+ 		bioset_free(bs);
+ }
+ 
+-static void md_safemode_timeout(unsigned long data);
++static void md_safemode_timeout(struct timer_list *t);
+ 
+ void mddev_init(struct mddev *mddev)
+ {
+@@ -552,8 +552,7 @@ void mddev_init(struct mddev *mddev)
+ 	mutex_init(&mddev->bitmap_info.mutex);
+ 	INIT_LIST_HEAD(&mddev->disks);
+ 	INIT_LIST_HEAD(&mddev->all_mddevs);
+-	setup_timer(&mddev->safemode_timer, md_safemode_timeout,
+-		    (unsigned long) mddev);
++	timer_setup(&mddev->safemode_timer, md_safemode_timeout, 0);
+ 	atomic_set(&mddev->active, 1);
+ 	atomic_set(&mddev->openers, 0);
+ 	atomic_set(&mddev->active_io, 0);
+@@ -5297,9 +5296,9 @@ static int add_named_array(const char *val, struct kernel_param *kp)
+ 	return md_alloc(0, buf);
+ }
+ 
+-static void md_safemode_timeout(unsigned long data)
++static void md_safemode_timeout(struct timer_list *t)
+ {
+-	struct mddev *mddev = (struct mddev *) data;
++	struct mddev *mddev = from_timer(mddev, t, safemode_timer);
+ 
+ 	mddev->safemode = 1;
+ 	if (mddev->external)
