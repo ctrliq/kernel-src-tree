@@ -537,6 +537,7 @@ static inline void napi_enable(struct napi_struct *n)
 	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
 	smp_mb__before_clear_bit();
 	clear_bit(NAPI_STATE_SCHED, &n->state);
+	clear_bit(NAPI_STATE_NPSVC, &n->state);
 }
 
 #ifdef CONFIG_SMP
