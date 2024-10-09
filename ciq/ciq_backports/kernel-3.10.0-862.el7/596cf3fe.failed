@@ -1,0 +1,329 @@
+netfilter: ipset: fix race condition in ipset save, swap and delete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vishwanath Pai <vpai@akamai.com>
+commit 596cf3fe5854fe2b1703b0466ed6bf9cfb83c91e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/596cf3fe.failed
+
+This fix adds a new reference counter (ref_netlink) for the struct ip_set.
+The other reference counter (ref) can be swapped out by ip_set_swap and we
+need a separate counter to keep track of references for netlink events
+like dump. Using the same ref counter for dump causes a race condition
+which can be demonstrated by the following script:
+
+ipset create hash_ip1 hash:ip family inet hashsize 1024 maxelem 500000 \
+counters
+ipset create hash_ip2 hash:ip family inet hashsize 300000 maxelem 500000 \
+counters
+ipset create hash_ip3 hash:ip family inet hashsize 1024 maxelem 500000 \
+counters
+
+ipset save &
+
+ipset swap hash_ip3 hash_ip2
+ipset destroy hash_ip3 /* will crash the machine */
+
+Swap will exchange the values of ref so destroy will see ref = 0 instead of
+ref = 1. With this fix in place swap will not succeed because ipset save
+still has ref_netlink on the set (ip_set_swap doesn't swap ref_netlink).
+
+Both delete and swap will error out if ref_netlink != 0 on the set.
+
+Note: The changes to *_head functions is because previously we would
+increment ref whenever we called these functions, we don't do that
+anymore.
+
+	Reviewed-by: Joshua Hunt <johunt@akamai.com>
+	Signed-off-by: Vishwanath Pai <vpai@akamai.com>
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 596cf3fe5854fe2b1703b0466ed6bf9cfb83c91e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_bitmap_gen.h
+#	net/netfilter/ipset/ip_set_core.c
+#	net/netfilter/ipset/ip_set_hash_gen.h
+#	net/netfilter/ipset/ip_set_list_set.c
+diff --cc net/netfilter/ipset/ip_set_bitmap_gen.h
+index 25243379b887,2e8e7e5fb4a6..000000000000
+--- a/net/netfilter/ipset/ip_set_bitmap_gen.h
++++ b/net/netfilter/ipset/ip_set_bitmap_gen.h
+@@@ -87,16 -95,10 +87,23 @@@ mtype_head(struct ip_set *set, struct s
+  	if (!nested)
+  		goto nla_put_failure;
+  	if (mtype_do_head(skb, map) ||
+++<<<<<<< HEAD
+ +	    nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref - 1)) ||
+ +	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE,
+ +			  htonl(sizeof(*map) +
+ +				map->memsize +
+ +				map->dsize * map->elements)) ||
+ +	    (SET_WITH_TIMEOUT(set) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_TIMEOUT, htonl(map->timeout))) ||
+ +	    (SET_WITH_COUNTER(set) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_CADT_FLAGS,
+ +			   htonl(IPSET_FLAG_WITH_COUNTERS))))
+++=======
++ 	    nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref)) ||
++ 	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE, htonl(memsize)))
++ 		goto nla_put_failure;
++ 	if (unlikely(ip_set_put_flags(skb, set)))
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  		goto nla_put_failure;
+  	ipset_nest_end(skb, nested);
+  
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 98b197a78f1a,a748b0c2c981..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -366,8 -497,27 +366,32 @@@ __ip_set_put(struct ip_set *set
+  	write_unlock_bh(&ip_set_ref_lock);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Add, del and test set entries from kernel.
+++=======
++ /* set->ref can be swapped out by ip_set_swap, netlink events (like dump) need
++  * a separate reference counter
++  */
++ static inline void
++ __ip_set_get_netlink(struct ip_set *set)
++ {
++ 	write_lock_bh(&ip_set_ref_lock);
++ 	set->ref_netlink++;
++ 	write_unlock_bh(&ip_set_ref_lock);
++ }
++ 
++ static inline void
++ __ip_set_put_netlink(struct ip_set *set)
++ {
++ 	write_lock_bh(&ip_set_ref_lock);
++ 	BUG_ON(set->ref_netlink == 0);
++ 	set->ref_netlink--;
++ 	write_unlock_bh(&ip_set_ref_lock);
++ }
++ 
++ /* Add, del and test set entries from kernel.
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+   *
+   * The set behind the index must exist and must be referenced
+   * so it can't be destroyed (or changed) under our foot.
+@@@ -867,25 -1020,31 +891,31 @@@ ip_set_destroy(struct sock *ctnl, struc
+  	 */
+  	read_lock_bh(&ip_set_ref_lock);
+  	if (!attr[IPSET_ATTR_SETNAME]) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < ip_set_max; i++) {
+ +			s = ip_set(i);
+ +			if (s != NULL && s->ref) {
+++=======
++ 		for (i = 0; i < inst->ip_set_max; i++) {
++ 			s = ip_set(inst, i);
++ 			if (s && (s->ref || s->ref_netlink)) {
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  				ret = -IPSET_ERR_BUSY;
+  				goto out;
+  			}
+  		}
+ -		inst->is_destroyed = true;
+  		read_unlock_bh(&ip_set_ref_lock);
+ -		for (i = 0; i < inst->ip_set_max; i++) {
+ -			s = ip_set(inst, i);
+ -			if (s) {
+ -				ip_set(inst, i) = NULL;
+ -				ip_set_destroy_set(s);
+ -			}
+ +		for (i = 0; i < ip_set_max; i++) {
+ +			s = ip_set(i);
+ +			if (s != NULL)
+ +				ip_set_destroy_set(i);
+  		}
+ -		/* Modified by ip_set_destroy() only, which is serialized */
+ -		inst->is_destroyed = false;
+  	} else {
+ -		s = find_set_and_id(inst, nla_data(attr[IPSET_ATTR_SETNAME]),
+ -				    &i);
+ -		if (!s) {
+ +		s = find_set_and_id(nla_data(attr[IPSET_ATTR_SETNAME]), &i);
+ +		if (s == NULL) {
+  			ret = -ENOENT;
+  			goto out;
+- 		} else if (s->ref) {
++ 		} else if (s->ref || s->ref_netlink) {
+  			ret = -IPSET_ERR_BUSY;
+  			goto out;
+  		}
+@@@ -1022,12 -1184,16 +1052,15 @@@ ip_set_swap(struct sock *ctnl, struct s
+  		return -IPSET_ERR_EXIST_SETNAME2;
+  
+  	/* Features must not change.
+ -	 * Not an artifical restriction anymore, as we must prevent
+ -	 * possible loops created by swapping in setlist type of sets.
+ -	 */
+ +	 * Not an artificial restriction anymore, as we must prevent
+ +	 * possible loops created by swapping in setlist type of sets. */
+  	if (!(from->type->features == to->type->features &&
+ -	      from->family == to->family))
+ +	      from->type->family == to->type->family))
+  		return -IPSET_ERR_TYPE_MISMATCH;
+  
++ 	if (from->ref_netlink || to->ref_netlink)
++ 		return -EBUSY;
++ 
+  	strncpy(from_name, from->name, IPSET_MAXNAMELEN);
+  	strncpy(from->name, to->name, IPSET_MAXNAMELEN);
+  	strncpy(to->name, from_name, IPSET_MAXNAMELEN);
+@@@ -1054,9 -1220,16 +1087,22 @@@
+  static int
+  ip_set_dump_done(struct netlink_callback *cb)
+  {
+++<<<<<<< HEAD
+ +	if (cb->args[2]) {
+ +		pr_debug("release set %s\n", ip_set(cb->args[1])->name);
+ +		ip_set_put_byindex((ip_set_id_t) cb->args[1]);
+++=======
++ 	if (cb->args[IPSET_CB_ARG0]) {
++ 		struct ip_set_net *inst =
++ 			(struct ip_set_net *)cb->args[IPSET_CB_NET];
++ 		ip_set_id_t index = (ip_set_id_t)cb->args[IPSET_CB_INDEX];
++ 		struct ip_set *set = ip_set(inst, index);
++ 
++ 		if (set->variant->uref)
++ 			set->variant->uref(set, cb, false);
++ 		pr_debug("release set %s\n", set->name);
++ 		__ip_set_put_netlink(set);
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  	}
+  	return 0;
+  }
+@@@ -1160,14 -1343,17 +1206,18 @@@ dump_last
+  		 */
+  		if (dump_type != DUMP_ONE &&
+  		    ((dump_type == DUMP_ALL) ==
+ -		     !!(set->type->features & IPSET_DUMP_LAST))) {
+ -			write_unlock_bh(&ip_set_ref_lock);
+ +		     !!(set->type->features & IPSET_DUMP_LAST)))
+  			continue;
+ -		}
+  		pr_debug("List set: %s\n", set->name);
+ -		if (!cb->args[IPSET_CB_ARG0]) {
+ +		if (!cb->args[2]) {
+  			/* Start listing: make sure set won't be destroyed */
+  			pr_debug("reference set\n");
+++<<<<<<< HEAD
+ +			__ip_set_get(set);
+++=======
++ 			set->ref_netlink++;
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  		}
+ -		write_unlock_bh(&ip_set_ref_lock);
+  		nlh = start_msg(skb, NETLINK_CB(cb->skb).portid,
+  				cb->nlh->nlmsg_seq, flags,
+  				IPSET_CMD_LIST);
+@@@ -1219,15 -1409,18 +1269,25 @@@ nla_put_failure
+  	ret = -EFAULT;
+  next_set:
+  	if (dump_type == DUMP_ONE)
+ -		cb->args[IPSET_CB_INDEX] = IPSET_INVALID_ID;
+ +		cb->args[1] = IPSET_INVALID_ID;
+  	else
+ -		cb->args[IPSET_CB_INDEX]++;
+ +		cb->args[1]++;
+  release_refcount:
+  	/* If there was an error or set is done, release set */
+++<<<<<<< HEAD
+ +	if (ret || !cb->args[2]) {
+ +		pr_debug("release set %s\n", ip_set(index)->name);
+ +		ip_set_put_byindex(index);
+ +		cb->args[2] = 0;
+++=======
++ 	if (ret || !cb->args[IPSET_CB_ARG0]) {
++ 		set = ip_set(inst, index);
++ 		if (set->variant->uref)
++ 			set->variant->uref(set, cb, false);
++ 		pr_debug("release set %s\n", set->name);
++ 		__ip_set_put_netlink(set);
++ 		cb->args[IPSET_CB_ARG0] = 0;
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  	}
+  out:
+  	if (nlh) {
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index 707bc520d629,d32fd6b036bf..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -835,13 -1078,14 +835,24 @@@ mtype_head(struct ip_set *set, struct s
+  	    nla_put_u8(skb, IPSET_ATTR_NETMASK, h->netmask))
+  		goto nla_put_failure;
+  #endif
+++<<<<<<< HEAD
+ +	if (nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref - 1)) ||
+ +	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE, htonl(memsize)) ||
+ +	    ((set->extensions & IPSET_EXT_TIMEOUT) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_TIMEOUT, htonl(h->timeout))) ||
+ +	    ((set->extensions & IPSET_EXT_COUNTER) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_CADT_FLAGS,
+ +			   htonl(IPSET_FLAG_WITH_COUNTERS))))
+++=======
++ #ifdef IP_SET_HASH_WITH_MARKMASK
++ 	if (nla_put_u32(skb, IPSET_ATTR_MARKMASK, h->markmask))
++ 		goto nla_put_failure;
++ #endif
++ 	if (nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref)) ||
++ 	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE, htonl(memsize)))
++ 		goto nla_put_failure;
++ 	if (unlikely(ip_set_put_flags(skb, set)))
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  		goto nla_put_failure;
+  	ipset_nest_end(skb, nested);
+  
+diff --cc net/netfilter/ipset/ip_set_list_set.c
+index 979b8c90e422,a2a89e4e0a14..000000000000
+--- a/net/netfilter/ipset/ip_set_list_set.c
++++ b/net/netfilter/ipset/ip_set_list_set.c
+@@@ -485,14 -458,11 +485,18 @@@ list_set_head(struct ip_set *set, struc
+  	if (!nested)
+  		goto nla_put_failure;
+  	if (nla_put_net32(skb, IPSET_ATTR_SIZE, htonl(map->size)) ||
+++<<<<<<< HEAD
+ +	    (SET_WITH_TIMEOUT(set) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_TIMEOUT, htonl(map->timeout))) ||
+ +	    (SET_WITH_COUNTER(set) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_CADT_FLAGS,
+ +			   htonl(IPSET_FLAG_WITH_COUNTERS))) ||
+ +	    nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref - 1)) ||
+++=======
++ 	    nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref)) ||
+++>>>>>>> 596cf3fe5854 (netfilter: ipset: fix race condition in ipset save, swap and delete)
+  	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE,
+ -			  htonl(sizeof(*map) + n * set->dsize)))
+ -		goto nla_put_failure;
+ -	if (unlikely(ip_set_put_flags(skb, set)))
+ +			  htonl(sizeof(*map) + map->size * map->dsize)))
+  		goto nla_put_failure;
+  	ipset_nest_end(skb, nested);
+  
+diff --git a/include/linux/netfilter/ipset/ip_set.h b/include/linux/netfilter/ipset/ip_set.h
+index daeeab1af220..753da90c1bb9 100644
+--- a/include/linux/netfilter/ipset/ip_set.h
++++ b/include/linux/netfilter/ipset/ip_set.h
+@@ -169,6 +169,10 @@ struct ip_set {
+ 	rwlock_t lock;
+ 	/* References to the set */
+ 	u32 ref;
++	/* References to the set for netlink events like dump,
++	 * ref can be swapped out by ip_set_swap
++	 */
++	u32 ref_netlink;
+ 	/* The core set type */
+ 	struct ip_set_type *type;
+ 	/* The type variant doing the real job */
+* Unmerged path net/netfilter/ipset/ip_set_bitmap_gen.h
+* Unmerged path net/netfilter/ipset/ip_set_core.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
+* Unmerged path net/netfilter/ipset/ip_set_list_set.c
