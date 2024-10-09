@@ -437,10 +437,6 @@ struct net_device *ipmr_new_tunnel(struct net *net, struct vifctl *v)
 	return dev;
 
 failure:
-	/* allow the register to be completed before unregistering. */
-	rtnl_unlock();
-	rtnl_lock();
-
 	unregister_netdevice(dev);
 	return NULL;
 }
@@ -536,10 +532,6 @@ static struct net_device *ipmr_reg_vif(struct net *net, struct mr_table *mrt)
 	return dev;
 
 failure:
-	/* allow the register to be completed before unregistering. */
-	rtnl_unlock();
-	rtnl_lock();
-
 	unregister_netdevice(dev);
 	return NULL;
 }
