@@ -1,0 +1,204 @@
+nvme: untangle 0 and BLK_MQ_RQ_QUEUE_OK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] untangle 0 and BLK_MQ_RQ_QUEUE_OK (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 91.67%
+commit-author Omar Sandoval <osandov@fb.com>
+commit bac0000af5f8476a64ca7529a4243e23c016fc89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bac0000a.failed
+
+Let's not depend on any of the BLK_MQ_RQ_QUEUE_* constants having
+specific values. No functional change.
+
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit bac0000af5f8476a64ca7529a4243e23c016fc89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/pci.c
+#	drivers/nvme/host/rdma.c
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/host/core.c
+index 0588703d149f,e54bb10ead9c..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -131,6 -225,112 +131,115 @@@ struct request *nvme_alloc_request(stru
+  
+  	return req;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(nvme_alloc_request);
++ 
++ static inline void nvme_setup_flush(struct nvme_ns *ns,
++ 		struct nvme_command *cmnd)
++ {
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	cmnd->common.opcode = nvme_cmd_flush;
++ 	cmnd->common.nsid = cpu_to_le32(ns->ns_id);
++ }
++ 
++ static inline int nvme_setup_discard(struct nvme_ns *ns, struct request *req,
++ 		struct nvme_command *cmnd)
++ {
++ 	struct nvme_dsm_range *range;
++ 	struct page *page;
++ 	int offset;
++ 	unsigned int nr_bytes = blk_rq_bytes(req);
++ 
++ 	range = kmalloc(sizeof(*range), GFP_ATOMIC);
++ 	if (!range)
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	range->cattr = cpu_to_le32(0);
++ 	range->nlb = cpu_to_le32(nr_bytes >> ns->lba_shift);
++ 	range->slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	cmnd->dsm.opcode = nvme_cmd_dsm;
++ 	cmnd->dsm.nsid = cpu_to_le32(ns->ns_id);
++ 	cmnd->dsm.nr = 0;
++ 	cmnd->dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
++ 
++ 	req->completion_data = range;
++ 	page = virt_to_page(range);
++ 	offset = offset_in_page(range);
++ 	blk_add_request_payload(req, page, offset, sizeof(*range));
++ 
++ 	/*
++ 	 * we set __data_len back to the size of the area to be discarded
++ 	 * on disk. This allows us to report completion on the full amount
++ 	 * of blocks described by the request.
++ 	 */
++ 	req->__data_len = nr_bytes;
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ }
++ 
++ static inline void nvme_setup_rw(struct nvme_ns *ns, struct request *req,
++ 		struct nvme_command *cmnd)
++ {
++ 	u16 control = 0;
++ 	u32 dsmgmt = 0;
++ 
++ 	if (req->cmd_flags & REQ_FUA)
++ 		control |= NVME_RW_FUA;
++ 	if (req->cmd_flags & (REQ_FAILFAST_DEV | REQ_RAHEAD))
++ 		control |= NVME_RW_LR;
++ 
++ 	if (req->cmd_flags & REQ_RAHEAD)
++ 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
++ 
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
++ 	cmnd->rw.command_id = req->tag;
++ 	cmnd->rw.nsid = cpu_to_le32(ns->ns_id);
++ 	cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
++ 
++ 	if (ns->ms) {
++ 		switch (ns->pi_type) {
++ 		case NVME_NS_DPS_PI_TYPE3:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD;
++ 			break;
++ 		case NVME_NS_DPS_PI_TYPE1:
++ 		case NVME_NS_DPS_PI_TYPE2:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD |
++ 					NVME_RW_PRINFO_PRCHK_REF;
++ 			cmnd->rw.reftag = cpu_to_le32(
++ 					nvme_block_nr(ns, blk_rq_pos(req)));
++ 			break;
++ 		}
++ 		if (!blk_integrity_rq(req))
++ 			control |= NVME_RW_PRINFO_PRACT;
++ 	}
++ 
++ 	cmnd->rw.control = cpu_to_le16(control);
++ 	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
++ }
++ 
++ int nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
++ 		struct nvme_command *cmd)
++ {
++ 	int ret = BLK_MQ_RQ_QUEUE_OK;
++ 
++ 	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
++ 		memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
++ 	else if (req_op(req) == REQ_OP_FLUSH)
++ 		nvme_setup_flush(ns, cmd);
++ 	else if (req_op(req) == REQ_OP_DISCARD)
++ 		ret = nvme_setup_discard(ns, req, cmd);
++ 	else
++ 		nvme_setup_rw(ns, req, cmd);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+++>>>>>>> bac0000af5f8 (nvme: untangle 0 and BLK_MQ_RQ_QUEUE_OK)
+  
+  /*
+   * Returns 0 on success.  If the result is negative, it's a Linux error code;
+diff --cc drivers/nvme/host/pci.c
+index 82e66e32363e,d58f8e4e2c06..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -356,7 -323,12 +356,16 @@@ static int nvme_init_iod(struct reques
+  	iod->npages = -1;
+  	iod->nents = 0;
+  	iod->length = size;
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 
++ 	if (!(rq->rq_flags & RQF_DONTPREP)) {
++ 		rq->retries = 0;
++ 		rq->rq_flags |= RQF_DONTPREP;
++ 	}
++ 	return BLK_MQ_RQ_QUEUE_OK;
+++>>>>>>> bac0000af5f8 (nvme: untangle 0 and BLK_MQ_RQ_QUEUE_OK)
+  }
+  
+  static void nvme_free_iod(struct nvme_dev *dev, struct request *req)
+@@@ -587,20 -596,13 +596,30 @@@ static int nvme_queue_rq(struct blk_mq_
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = nvme_init_iod(req, dev);
+ +	if (ret)
+ +		return ret;
+ +
+ +	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
+ +		memcpy(&cmnd, req->cmd, sizeof(cmnd));
+ +	else if (req->cmd_flags & REQ_FLUSH)
+ +		nvme_setup_flush(ns, &cmnd);
+ +	else if (req->cmd_flags & REQ_DISCARD)
+ +		ret = nvme_setup_discard(ns, req, &cmnd);
+ +	else
+ +		nvme_setup_rw(ns, req, &cmnd);
+ +
+ +	if (ret)
+++=======
++ 	map_len = nvme_map_len(req);
++ 	ret = nvme_init_iod(req, map_len, dev);
++ 	if (ret != BLK_MQ_RQ_QUEUE_OK)
++ 		return ret;
++ 
++ 	ret = nvme_setup_cmd(ns, req, &cmnd);
++ 	if (ret != BLK_MQ_RQ_QUEUE_OK)
+++>>>>>>> bac0000af5f8 (nvme: untangle 0 and BLK_MQ_RQ_QUEUE_OK)
+  		goto out;
+  
+  	if (req->nr_phys_segments)
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/pci.c
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
