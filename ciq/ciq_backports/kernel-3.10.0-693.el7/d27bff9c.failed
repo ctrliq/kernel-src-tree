@@ -1,0 +1,174 @@
+ip6_gre: Set inner protocol correctly in __gre6_xmit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit d27bff9ca294ac76548ee97db5d92f39e4752a01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d27bff9c.failed
+
+Need to use adjusted protocol value for setting inner protocol.
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d27bff9ca294ac76548ee97db5d92f39e4752a01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_gre.c
+diff --cc net/ipv6/ip6_gre.c
+index e124f2eaed05,ec209f4d3312..000000000000
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@@ -538,137 -507,17 +538,141 @@@ static netdev_tx_t ip6gre_xmit2(struct 
+  	if (dev->type == ARPHRD_ETHER)
+  		IPCB(skb)->flags = 0;
+  
+ -	if (dev->header_ops && dev->type == ARPHRD_IP6GRE)
+ -		fl6->daddr = ((struct ipv6hdr *)skb->data)->daddr;
+ -	else
+ +	if (dev->header_ops && dev->type == ARPHRD_IP6GRE) {
+ +		gre_hlen = 0;
+ +		ipv6h = (struct ipv6hdr *)skb->data;
+ +		fl6->daddr = ipv6h->daddr;
+ +	} else {
+ +		gre_hlen = tunnel->hlen;
+  		fl6->daddr = tunnel->parms.raddr;
+ +	}
+ +
+ +	if (!fl6->flowi6_mark)
+ +		dst = dst_cache_get(&tunnel->dst_cache);
+ +
+ +	if (!dst) {
+ +		dst = ip6_route_output(net, NULL, fl6);
+ +
+++<<<<<<< HEAD
+ +		if (dst->error)
+ +			goto tx_err_link_failure;
+ +		dst = xfrm_lookup(net, dst, flowi6_to_flowi(fl6), NULL, 0);
+ +		if (IS_ERR(dst)) {
+ +			err = PTR_ERR(dst);
+ +			dst = NULL;
+ +			goto tx_err_link_failure;
+ +		}
+ +		ndst = dst;
+ +	}
+++=======
+++	skb_set_inner_protocol(skb, protocol);
+++>>>>>>> d27bff9ca294 (ip6_gre: Set inner protocol correctly in __gre6_xmit)
+ +
+ +	tdev = dst->dev;
+ +
+ +	if (tdev == dev) {
+ +		stats->collisions++;
+ +		net_warn_ratelimited("%s: Local routing loop detected!\n",
+ +				     tunnel->parms.name);
+ +		goto tx_err_dst_release;
+ +	}
+ +
+ +	mtu = dst_mtu(dst) - sizeof(*ipv6h);
+ +	if (encap_limit >= 0) {
+ +		min_headroom += 8;
+ +		mtu -= 8;
+ +	}
+ +	if (mtu < IPV6_MIN_MTU)
+ +		mtu = IPV6_MIN_MTU;
+ +	if (skb_dst(skb))
+ +		skb_dst(skb)->ops->update_pmtu(skb_dst(skb), NULL, skb, mtu);
+ +	if (skb->len > mtu && !skb_is_gso(skb)) {
+ +		*pmtu = mtu;
+ +		err = -EMSGSIZE;
+ +		goto tx_err_dst_release;
+ +	}
+ +
+ +	if (tunnel->err_count > 0) {
+ +		if (time_before(jiffies,
+ +				tunnel->err_time + IP6TUNNEL_ERR_TIMEO)) {
+ +			tunnel->err_count--;
+ +
+ +			dst_link_failure(skb);
+ +		} else
+ +			tunnel->err_count = 0;
+ +	}
+ +
+ +	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(dev)));
+ +
+ +	min_headroom += LL_RESERVED_SPACE(tdev) + gre_hlen + dst->header_len;
+ +
+ +	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
+ +		int head_delta = SKB_DATA_ALIGN(min_headroom -
+ +						skb_headroom(skb) +
+ +						16);
+ +
+ +		err = pskb_expand_head(skb, max_t(int, head_delta, 0),
+ +				       0, GFP_ATOMIC);
+ +		if (min_headroom > dev->needed_headroom)
+ +			dev->needed_headroom = min_headroom;
+ +		if (unlikely(err))
+ +			goto tx_err_dst_release;
+ +	}
+ +
+ +	if (!fl6->flowi6_mark && ndst)
+ +		dst_cache_set_ip6(&tunnel->dst_cache, ndst, &fl6->saddr);
+ +	skb_dst_set(skb, dst);
+ +
+ +	proto = NEXTHDR_GRE;
+ +	if (encap_limit >= 0) {
+ +		init_tel_txopt(&opt, encap_limit);
+ +		ipv6_push_nfrag_opts(skb, &opt.ops, &proto, NULL);
+ +	}
+ +
+ +	err = iptunnel_handle_offloads(skb,
+ +				       (tunnel->parms.o_flags & GRE_CSUM) ?
+ +				       SKB_GSO_GRE_CSUM : SKB_GSO_GRE);
+ +	if (err)
+ +		goto tx_err_dst_release;
+  
+ -	if (tunnel->parms.o_flags & TUNNEL_SEQ)
+ -		tunnel->o_seqno++;
+ +	skb_push(skb, gre_hlen);
+ +	skb_reset_network_header(skb);
+ +	skb_set_transport_header(skb, sizeof(*ipv6h));
+  
+ -	/* Push GRE header. */
+ -	gre_build_header(skb, tunnel->tun_hlen, tunnel->parms.o_flags,
+ -			 protocol, tunnel->parms.o_key, htonl(tunnel->o_seqno));
+ +	/*
+ +	 *	Push down and install the IP header.
+ +	 */
+ +	ipv6h = ipv6_hdr(skb);
+ +	ip6_flow_hdr(ipv6h, INET_ECN_encapsulate(0, dsfield), fl6->flowlabel);
+ +	ipv6h->hop_limit = tunnel->parms.hop_limit;
+ +	ipv6h->nexthdr = proto;
+ +	ipv6h->saddr = fl6->saddr;
+ +	ipv6h->daddr = fl6->daddr;
+ +
+ +	((__be16 *)(ipv6h + 1))[0] = tunnel->parms.o_flags;
+ +	protocol = (dev->type == ARPHRD_ETHER) ?
+ +		    htons(ETH_P_TEB) : skb->protocol;
+ +	((__be16 *)(ipv6h + 1))[1] = protocol;
+ +
+ +	if (tunnel->parms.o_flags&(GRE_KEY|GRE_CSUM|GRE_SEQ)) {
+ +		__be32 *ptr = (__be32 *)(((u8 *)ipv6h) + tunnel->hlen - 4);
+ +
+ +		if (tunnel->parms.o_flags&GRE_SEQ) {
+ +			++tunnel->o_seqno;
+ +			*ptr = htonl(tunnel->o_seqno);
+ +			ptr--;
+ +		}
+ +		if (tunnel->parms.o_flags&GRE_KEY) {
+ +			*ptr = tunnel->parms.o_key;
+ +			ptr--;
+ +		}
+ +		if ((tunnel->parms.o_flags & GRE_CSUM) &&
+ +		    !(skb_shinfo(skb)->gso_type &
+ +		      (SKB_GSO_GRE | SKB_GSO_GRE_CSUM))) {
+ +			*ptr = 0;
+ +			*(__sum16 *)ptr = gre6_checksum(skb);
+ +		}
+ +	}
+  
+  	skb_set_inner_protocol(skb, protocol);
+  
+* Unmerged path net/ipv6/ip6_gre.c
