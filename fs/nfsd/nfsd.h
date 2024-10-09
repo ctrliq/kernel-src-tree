@@ -381,7 +381,11 @@ static inline u32 nfsd_suppattrs2(u32 minorversion)
 #define NFSD_WRITEONLY_ATTRS_WORD1 \
 	(FATTR4_WORD1_TIME_ACCESS_SET   | FATTR4_WORD1_TIME_MODIFY_SET)
 
-/* These are the only attrs allowed in CREATE/OPEN/SETATTR. */
+/*
+ * These are the only attrs allowed in CREATE/OPEN/SETATTR. Don't add
+ * a writeable attribute here without also adding code to parse it to
+ * nfsd4_decode_fattr().
+ */
 #define NFSD_WRITEABLE_ATTRS_WORD0 \
 	(FATTR4_WORD0_SIZE | FATTR4_WORD0_ACL)
 #define NFSD_WRITEABLE_ATTRS_WORD1 \
