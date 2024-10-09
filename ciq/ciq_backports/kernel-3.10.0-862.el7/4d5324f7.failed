@@ -1,0 +1,231 @@
+md: always hold reconfig_mutex when calling mddev_suspend()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] always hold reconfig_mutex when calling mddev_suspend() (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 96.49%
+commit-author NeilBrown <neilb@suse.com>
+commit 4d5324f760aacaefeb721b172aa14bf66045c332
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4d5324f7.failed
+
+Most often mddev_suspend() is called with
+reconfig_mutex held.  Make this a requirement in
+preparation a subsequent patch.  Also require
+reconfig_mutex to be held for mddev_resume(),
+partly for symmetry and partly to guarantee
+no races with incr/decr of mddev->suspend.
+
+Taking the mutex in r5c_disable_writeback_async() is
+a little tricky as this is called from a work queue
+via log->disable_writeback_work, and flush_work()
+is called on that while holding ->reconfig_mutex.
+If the work item hasn't run before flush_work()
+is called, the work function will not be able to
+get the mutex.
+
+So we use mddev_trylock() inside the wait_event() call, and have that
+abort when conf->log is set to NULL, which happens before
+flush_work() is called.
+We wait in mddev->sb_wait and ensure this is woken
+when any of the conditions change.  This requires
+waking mddev->sb_wait in mddev_unlock().  This is only
+like to trigger extra wake_ups of threads that needn't
+be woken when metadata is being written, and that
+doesn't happen often enough that the cost would be
+noticeable.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 4d5324f760aacaefeb721b172aa14bf66045c332)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index 191ad03407b7,59af7cf35092..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -531,6 -612,106 +531,109 @@@ static void r5l_log_endio(struct bio *b
+  
+  	if (log->need_cache_flush)
+  		md_wakeup_thread(log->rdev->mddev->thread);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* finish flush only io_unit and PAYLOAD_FLUSH only io_unit */
++ 	if (has_null_flush) {
++ 		struct bio *bi;
++ 
++ 		WARN_ON(bio_list_empty(&io->flush_barriers));
++ 		while ((bi = bio_list_pop(&io->flush_barriers)) != NULL) {
++ 			bio_endio(bi);
++ 			if (atomic_dec_and_test(&io->pending_stripe)) {
++ 				__r5l_stripe_write_finished(io);
++ 				return;
++ 			}
++ 		}
++ 	}
++ 	/* decrease pending_stripe for flush payload */
++ 	if (has_flush_payload)
++ 		if (atomic_dec_and_test(&io->pending_stripe))
++ 			__r5l_stripe_write_finished(io);
++ }
++ 
++ static void r5l_do_submit_io(struct r5l_log *log, struct r5l_io_unit *io)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&log->io_list_lock, flags);
++ 	__r5l_set_io_unit_state(io, IO_UNIT_IO_START);
++ 	spin_unlock_irqrestore(&log->io_list_lock, flags);
++ 
++ 	/*
++ 	 * In case of journal device failures, submit_bio will get error
++ 	 * and calls endio, then active stripes will continue write
++ 	 * process. Therefore, it is not necessary to check Faulty bit
++ 	 * of journal device here.
++ 	 *
++ 	 * We can't check split_bio after current_bio is submitted. If
++ 	 * io->split_bio is null, after current_bio is submitted, current_bio
++ 	 * might already be completed and the io_unit is freed. We submit
++ 	 * split_bio first to avoid the issue.
++ 	 */
++ 	if (io->split_bio) {
++ 		if (io->has_flush)
++ 			io->split_bio->bi_opf |= REQ_PREFLUSH;
++ 		if (io->has_fua)
++ 			io->split_bio->bi_opf |= REQ_FUA;
++ 		submit_bio(io->split_bio);
++ 	}
++ 
++ 	if (io->has_flush)
++ 		io->current_bio->bi_opf |= REQ_PREFLUSH;
++ 	if (io->has_fua)
++ 		io->current_bio->bi_opf |= REQ_FUA;
++ 	submit_bio(io->current_bio);
++ }
++ 
++ /* deferred io_unit will be dispatched here */
++ static void r5l_submit_io_async(struct work_struct *work)
++ {
++ 	struct r5l_log *log = container_of(work, struct r5l_log,
++ 					   deferred_io_work);
++ 	struct r5l_io_unit *io = NULL;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&log->io_list_lock, flags);
++ 	if (!list_empty(&log->running_ios)) {
++ 		io = list_first_entry(&log->running_ios, struct r5l_io_unit,
++ 				      log_sibling);
++ 		if (!io->io_deferred)
++ 			io = NULL;
++ 		else
++ 			io->io_deferred = 0;
++ 	}
++ 	spin_unlock_irqrestore(&log->io_list_lock, flags);
++ 	if (io)
++ 		r5l_do_submit_io(log, io);
++ }
++ 
++ static void r5c_disable_writeback_async(struct work_struct *work)
++ {
++ 	struct r5l_log *log = container_of(work, struct r5l_log,
++ 					   disable_writeback_work);
++ 	struct mddev *mddev = log->rdev->mddev;
++ 	struct r5conf *conf = mddev->private;
++ 	int locked = 0;
++ 
++ 	if (log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_THROUGH)
++ 		return;
++ 	pr_info("md/raid:%s: Disabling writeback cache for degraded array.\n",
++ 		mdname(mddev));
++ 
++ 	/* wait superblock change before suspend */
++ 	wait_event(mddev->sb_wait,
++ 		   conf->log == NULL ||
++ 		   (!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags) &&
++ 		    (locked = mddev_trylock(mddev))));
++ 	if (locked) {
++ 		mddev_suspend(mddev);
++ 		log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_THROUGH;
++ 		mddev_resume(mddev);
++ 		mddev_unlock(mddev);
++ 	}
+++>>>>>>> 4d5324f760aa (md: always hold reconfig_mutex when calling mddev_suspend())
+  }
+  
+  static void r5l_submit_current_io(struct r5l_log *log)
+@@@ -2562,6 -3171,9 +2665,12 @@@ void r5l_exit_log(struct r5conf *conf
+  	conf->log = NULL;
+  	synchronize_rcu();
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Ensure disable_writeback_work wakes up and exits */
++ 	wake_up(&conf->mddev->sb_wait);
++ 	flush_work(&log->disable_writeback_work);
+++>>>>>>> 4d5324f760aa (md: always hold reconfig_mutex when calling mddev_suspend())
+  	md_unregister_thread(&log->reclaim_thread);
+  	mempool_destroy(log->meta_pool);
+  	bioset_free(log->bs);
+diff --git a/drivers/md/dm-raid.c b/drivers/md/dm-raid.c
+index 0f9829c0b282..df719ac1bbfd 100644
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@ -3549,8 +3549,11 @@ static void raid_postsuspend(struct dm_target *ti)
+ {
+ 	struct raid_set *rs = ti->private;
+ 
+-	if (!test_and_set_bit(RT_FLAG_RS_SUSPENDED, &rs->runtime_flags))
++	if (!test_and_set_bit(RT_FLAG_RS_SUSPENDED, &rs->runtime_flags)) {
++		mddev_lock_nointr(&rs->md);
+ 		mddev_suspend(&rs->md);
++		mddev_unlock(&rs->md);
++	}
+ 
+ 	rs->md.ro = 1;
+ }
+@@ -3807,8 +3810,11 @@ static void raid_resume(struct dm_target *ti)
+ 	if (!(rs->ctr_flags & RESUME_STAY_FROZEN_FLAGS))
+ 		clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 
+-	if (test_and_clear_bit(RT_FLAG_RS_SUSPENDED, &rs->runtime_flags))
++	if (test_and_clear_bit(RT_FLAG_RS_SUSPENDED, &rs->runtime_flags)) {
++		mddev_lock_nointr(mddev);
+ 		mddev_resume(mddev);
++		mddev_unlock(mddev);
++	}
+ }
+ 
+ static int raid_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 4c75b0e4a2a4..78429ec4f594 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -311,6 +311,7 @@ check_suspended:
+ void mddev_suspend(struct mddev *mddev)
+ {
+ 	WARN_ON_ONCE(mddev->thread && current == mddev->thread->tsk);
++	lockdep_assert_held(&mddev->reconfig_mutex);
+ 	if (mddev->suspended++)
+ 		return;
+ 	synchronize_rcu();
+@@ -324,6 +325,7 @@ EXPORT_SYMBOL_GPL(mddev_suspend);
+ 
+ void mddev_resume(struct mddev *mddev)
+ {
++	lockdep_assert_held(&mddev->reconfig_mutex);
+ 	if (--mddev->suspended)
+ 		return;
+ 	wake_up(&mddev->sb_wait);
+@@ -650,6 +652,7 @@ void mddev_unlock(struct mddev *mddev)
+ 	 */
+ 	spin_lock(&pers_lock);
+ 	md_wakeup_thread(mddev->thread);
++	wake_up(&mddev->sb_wait);
+ 	spin_unlock(&pers_lock);
+ }
+ EXPORT_SYMBOL_GPL(mddev_unlock);
+* Unmerged path drivers/md/raid5-cache.c
