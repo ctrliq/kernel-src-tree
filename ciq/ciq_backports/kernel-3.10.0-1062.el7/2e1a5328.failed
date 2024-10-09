@@ -1,0 +1,177 @@
+ovl: factor out ovl_check_origin_fh()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 2e1a532883cf77f01031bef4b83d864a46c1bed0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2e1a5328.failed
+
+Re-factor ovl_check_origin() and ovl_get_origin(), so origin fh xattr is
+read from upper inode only once during lookup with multiple lower layers
+and only once when verifying index entry origin.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 2e1a532883cf77f01031bef4b83d864a46c1bed0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/namei.c
+diff --cc fs/overlayfs/namei.c
+index 0afb8ae29e9b,a6b9bd2afca1..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -102,7 -129,7 +129,11 @@@ static struct ovl_fh *ovl_get_origin_fh
+  	if (res == 0)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	fh = kzalloc(res, GFP_TEMPORARY);
+++=======
++ 	fh = kzalloc(res, GFP_KERNEL);
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  	if (!fh)
+  		return ERR_PTR(-ENOMEM);
+  
+@@@ -153,8 -167,8 +171,13 @@@ static struct dentry *ovl_decode_fh(str
+  	 * Make sure that the stored uuid matches the uuid of the lower
+  	 * layer where file handle will be decoded.
+  	 */
+++<<<<<<< HEAD
+ +	if (uuid_be_cmp(fh->uuid, *(uuid_be *) &mnt->mnt_sb->s_uuid))
+ +		goto out;
+++=======
++ 	if (!uuid_equal(&fh->uuid, &mnt->mnt_sb->s_uuid))
++ 		return NULL;
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  
+  	bytes = (fh->len - offsetof(struct ovl_fh, fid));
+  	origin = exportfs_decode_fh(mnt, (struct fid *)fh->fid,
+@@@ -284,39 -291,72 +300,92 @@@ static int ovl_lookup_layer(struct dent
+  }
+  
+  
+++<<<<<<< HEAD
+ +static int ovl_check_origin(struct dentry *upperdentry,
+ +			    struct path *lowerstack, unsigned int numlower,
+ +			    struct path **stackp, unsigned int *ctrp)
+++=======
++ static int ovl_check_origin_fh(struct ovl_fh *fh, struct dentry *upperdentry,
++ 			       struct ovl_path *lower, unsigned int numlower,
++ 			       struct ovl_path **stackp)
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  {
+  	struct vfsmount *mnt;
+  	struct dentry *origin = NULL;
+  	int i;
+  
+ +
+  	for (i = 0; i < numlower; i++) {
+++<<<<<<< HEAD
+ +		mnt = lowerstack[i].mnt;
+ +		origin = ovl_get_origin(upperdentry, mnt);
+ +		if (IS_ERR(origin))
+ +			return PTR_ERR(origin);
+ +
+++=======
++ 		mnt = lower[i].layer->mnt;
++ 		origin = ovl_decode_fh(fh, mnt);
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  		if (origin)
+  			break;
+  	}
+  
+  	if (!origin)
+- 		return 0;
++ 		return -ESTALE;
++ 	else if (IS_ERR(origin))
++ 		return PTR_ERR(origin);
++ 
++ 	if (!ovl_is_whiteout(upperdentry) &&
++ 	    ((d_inode(origin)->i_mode ^ d_inode(upperdentry)->i_mode) & S_IFMT))
++ 		goto invalid;
+  
+- 	BUG_ON(*ctrp);
+  	if (!*stackp)
+ -		*stackp = kmalloc(sizeof(struct ovl_path), GFP_KERNEL);
+ +		*stackp = kmalloc(sizeof(struct path), GFP_TEMPORARY);
+  	if (!*stackp) {
+  		dput(origin);
+  		return -ENOMEM;
+  	}
+++<<<<<<< HEAD
+ +	**stackp = (struct path) { .dentry = origin, .mnt = mnt };
+ +	*ctrp = 1;
+++=======
++ 	**stackp = (struct ovl_path){.dentry = origin, .layer = lower[i].layer};
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  
+  	return 0;
++ 
++ invalid:
++ 	pr_warn_ratelimited("overlayfs: invalid origin (%pd2, ftype=%x, origin ftype=%x).\n",
++ 			    upperdentry, d_inode(upperdentry)->i_mode & S_IFMT,
++ 			    d_inode(origin)->i_mode & S_IFMT);
++ 	dput(origin);
++ 	return -EIO;
++ }
++ 
++ static int ovl_check_origin(struct dentry *upperdentry,
++ 			    struct ovl_path *lower, unsigned int numlower,
++ 			    struct ovl_path **stackp, unsigned int *ctrp)
++ {
++ 	struct ovl_fh *fh = ovl_get_origin_fh(upperdentry);
++ 	int err;
++ 
++ 	if (IS_ERR_OR_NULL(fh))
++ 		return PTR_ERR(fh);
++ 
++ 	err = ovl_check_origin_fh(fh, upperdentry, lower, numlower, stackp);
++ 	kfree(fh);
++ 
++ 	if (err) {
++ 		if (err == -ESTALE)
++ 			return 0;
++ 		return err;
++ 	}
++ 
++ 	if (WARN_ON(*ctrp))
++ 		return -EIO;
++ 
++ 	*ctrp = 1;
++ 	return 0;
+  }
+  
+  /*
+@@@ -388,9 -428,8 +457,14 @@@ int ovl_verify_index(struct dentry *ind
+  {
+  	struct ovl_fh *fh = NULL;
+  	size_t len;
+++<<<<<<< HEAD
+ +	struct path origin = { };
+ +	struct path *stack = &origin;
+ +	unsigned int ctr = 0;
+++=======
++ 	struct ovl_path origin = { };
++ 	struct ovl_path *stack = &origin;
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  	int err;
+  
+  	if (!d_inode(index))
+@@@ -428,9 -471,7 +506,13 @@@
+  	if (err)
+  		goto fail;
+  
+++<<<<<<< HEAD
+ +	err = ovl_check_origin(index, lowerstack, numlower, &stack, &ctr);
+ +	if (!err && !ctr)
+ +		err = -ESTALE;
+++=======
++ 	err = ovl_check_origin_fh(fh, index, lower, numlower, &stack);
+++>>>>>>> 2e1a532883cf (ovl: factor out ovl_check_origin_fh())
+  	if (err)
+  		goto fail;
+  
+* Unmerged path fs/overlayfs/namei.c
