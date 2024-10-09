@@ -1,0 +1,190 @@
+md/raid1: stop using bi_phys_segment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] raid1: stop using bi_phys_segment (Nigel Croxon) [1455932]
+Rebuild_FUZZ: 95.65%
+commit-author NeilBrown <neilb@suse.com>
+commit 37011e3afb0fdc462307dc006246358bddf61e92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/37011e3a.failed
+
+Change to use bio->__bi_remaining to count number of r1bio attached
+to a bio.
+See precious raid10 patch for more details.
+
+Like the raid10.c patch, this fixes a bug as nr_queued and nr_pending
+used to measure different things, but were being compared.
+
+This patch fixes another bug in that nr_pending previously did not
+could write-behind requests, so behind writes could continue while
+resync was happening.  How that nr_pending counts all r1_bio,
+the resync cannot commence until the behind writes have completed.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 37011e3afb0fdc462307dc006246358bddf61e92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+diff --cc drivers/md/raid1.c
+index 0e63e69d3bfb,941f81063891..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -236,34 -246,17 +236,46 @@@ static void reschedule_retry(struct r1b
+  static void call_bio_endio(struct r1bio *r1_bio)
+  {
+  	struct bio *bio = r1_bio->master_bio;
+- 	int done;
+  	struct r1conf *conf = r1_bio->mddev->private;
+++<<<<<<< HEAD
+ +	sector_t bi_sector = bio->bi_sector;
+ +
+ +	if (bio->bi_phys_segments) {
+ +		unsigned long flags;
+ +		spin_lock_irqsave(&conf->device_lock, flags);
+ +		bio->bi_phys_segments--;
+ +		done = (bio->bi_phys_segments == 0);
+ +		spin_unlock_irqrestore(&conf->device_lock, flags);
+ +		/*
+ +		 * make_request() might be waiting for
+ +		 * bi_phys_segments to decrease
+ +		 */
+ +		wake_up(&conf->wait_barrier);
+ +	} else
+ +		done = 1;
+ +
+ +	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
+ +		clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	if (done) {
+ +		bio_endio(bio, 0);
+ +		/*
+ +		 * Wake up any possible resync thread that waits for the device
+ +		 * to go idle.
+ +		 */
+ +		allow_barrier(conf, bi_sector);
+ +	}
+++=======
++ 
++ 	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
++ 		bio->bi_error = -EIO;
++ 
++ 	bio_endio(bio);
++ 	/*
++ 	 * Wake up any possible resync thread that waits for the device
++ 	 * to go idle.
++ 	 */
++ 	allow_barrier(conf, r1_bio->sector);
+++>>>>>>> 37011e3afb0f (md/raid1: stop using bi_phys_segment)
+  }
+  
+  static void raid_end_bio_io(struct r1bio *r1_bio)
+@@@ -1198,8 -1179,14 +1220,17 @@@ static void raid1_read_request(struct m
+  	 * Still need barrier for READ in case that whole
+  	 * array is frozen.
+  	 */
+ -	wait_read_barrier(conf, bio->bi_iter.bi_sector);
+ +	wait_read_barrier(conf, bio->bi_sector);
+  
+++<<<<<<< HEAD
+++=======
++ 	r1_bio = alloc_r1bio(mddev, bio, 0);
++ 
++ 	/*
++ 	 * make_request() can abort the operation when read-ahead is being
++ 	 * used and no empty request is available.
++ 	 */
+++>>>>>>> 37011e3afb0f (md/raid1: stop using bi_phys_segment)
+  read_again:
+  	rdisk = read_balance(conf, r1_bio, &max_sectors);
+  
+@@@ -1242,14 -1236,9 +1273,9 @@@
+  		 * r1_bio.
+  		 */
+  		sectors_handled = (r1_bio->sector + max_sectors
+ -				   - bio->bi_iter.bi_sector);
+ +				   - bio->bi_sector);
+  		r1_bio->sectors = max_sectors;
+- 		spin_lock_irq(&conf->device_lock);
+- 		if (bio->bi_phys_segments == 0)
+- 			bio->bi_phys_segments = 2;
+- 		else
+- 			bio->bi_phys_segments++;
+- 		spin_unlock_irq(&conf->device_lock);
++ 		bio_inc_remaining(bio);
+  
+  		/*
+  		 * Cannot call generic_make_request directly as that will be
+@@@ -1308,7 -1301,9 +1334,13 @@@ static void raid1_write_request(struct 
+  		}
+  		finish_wait(&conf->wait_barrier, &w);
+  	}
+++<<<<<<< HEAD
+ +	wait_barrier(conf, bio->bi_sector);
+++=======
++ 	wait_barrier(conf, bio->bi_iter.bi_sector);
++ 
++ 	r1_bio = alloc_r1bio(mddev, bio, 0);
+++>>>>>>> 37011e3afb0f (md/raid1: stop using bi_phys_segment)
+  
+  	if (conf->pending_count >= max_queued_requests) {
+  		md_wakeup_thread(mddev->thread);
+@@@ -1501,10 -1510,12 +1533,19 @@@
+  	 * as it could result in the bio being freed.
+  	 */
+  	if (sectors_handled < bio_sectors(bio)) {
+++<<<<<<< HEAD
+ +		r1_bio_write_done(r1_bio);
+ +		/* We need another r1_bio.  It has already been counted
+ +		 * in bio->bi_phys_segments
+ +		 */
+++=======
++ 		/* We need another r1_bio, which must be counted */
++ 		sector_t sect = bio->bi_iter.bi_sector + sectors_handled;
++ 
++ 		inc_pending(conf, sect);
++ 		bio_inc_remaining(bio);
++ 		r1_bio_write_done(r1_bio);
+++>>>>>>> 37011e3afb0f (md/raid1: stop using bi_phys_segment)
+  		r1_bio = alloc_r1bio(mddev, bio, sectors_handled);
+  		goto retry_write;
+  	}
+@@@ -2511,23 -2532,24 +2552,30 @@@ read_more
+  			/* Drat - have to split this up more */
+  			struct bio *mbio = r1_bio->master_bio;
+  			int sectors_handled = (r1_bio->sector + max_sectors
+ -					       - mbio->bi_iter.bi_sector);
+ +					       - mbio->bi_sector);
+  			r1_bio->sectors = max_sectors;
+++<<<<<<< HEAD
+ +			spin_lock_irq(&conf->device_lock);
+ +			if (mbio->bi_phys_segments == 0)
+ +				mbio->bi_phys_segments = 2;
+ +			else
+ +				mbio->bi_phys_segments++;
+ +			spin_unlock_irq(&conf->device_lock);
+++=======
++ 			bio_inc_remaining(mbio);
++ 			trace_block_bio_remap(bdev_get_queue(bio->bi_bdev),
++ 					      bio, bio_dev, bio_sector);
+++>>>>>>> 37011e3afb0f (md/raid1: stop using bi_phys_segment)
+  			generic_make_request(bio);
+  			bio = NULL;
+  
+  			r1_bio = alloc_r1bio(mddev, mbio, sectors_handled);
+  			set_bit(R1BIO_ReadError, &r1_bio->state);
++ 			inc_pending(conf, r1_bio->sector);
+  
+  			goto read_more;
+ -		} else {
+ -			trace_block_bio_remap(bdev_get_queue(bio->bi_bdev),
+ -					      bio, bio_dev, bio_sector);
+ +		} else
+  			generic_make_request(bio);
+ -		}
+  	}
+  }
+  
+* Unmerged path drivers/md/raid1.c
