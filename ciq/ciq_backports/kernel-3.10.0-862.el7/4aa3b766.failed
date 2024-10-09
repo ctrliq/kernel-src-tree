@@ -1,0 +1,261 @@
+nfp: add a helper for wrapping descriptor index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 4aa3b7660aa79bb030aaa887dc16a60e02fa4348
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4aa3b766.failed
+
+We have a number of places where we calculate the descriptor
+index based on a value which may have overflown.  Create a
+macro for masking with the ring size.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4aa3b7660aa79bb030aaa887dc16a60e02fa4348)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,c64514f8ee65..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -770,12 -804,12 +770,12 @@@ static int nfp_net_tx(struct sk_buff *s
+  	}
+  
+  	/* Start with the head skbuf */
+ -	dma_addr = dma_map_single(dp->dev, skb->data, skb_headlen(skb),
+ +	dma_addr = dma_map_single(&nn->pdev->dev, skb->data, skb_headlen(skb),
+  				  DMA_TO_DEVICE);
+ -	if (dma_mapping_error(dp->dev, dma_addr))
+ +	if (dma_mapping_error(&nn->pdev->dev, dma_addr))
+  		goto err_free;
+  
+- 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 	wr_idx = D_IDX(tx_ring, tx_ring->wr_p);
+  
+  	/* Stash the soft descriptor of the head then initialize it */
+  	txbuf = &tx_ring->txbufs[wr_idx];
+@@@ -814,12 -847,12 +814,12 @@@
+  			frag = &skb_shinfo(skb)->frags[f];
+  			fsize = skb_frag_size(frag);
+  
+ -			dma_addr = skb_frag_dma_map(dp->dev, frag, 0,
+ +			dma_addr = skb_frag_dma_map(&nn->pdev->dev, frag, 0,
+  						    fsize, DMA_TO_DEVICE);
+ -			if (dma_mapping_error(dp->dev, dma_addr))
+ +			if (dma_mapping_error(&nn->pdev->dev, dma_addr))
+  				goto err_unmap;
+  
+- 			wr_idx = (wr_idx + 1) & (tx_ring->cnt - 1);
++ 			wr_idx = D_IDX(tx_ring, wr_idx + 1);
+  			tx_ring->txbufs[wr_idx].skb = skb;
+  			tx_ring->txbufs[wr_idx].dma_addr = dma_addr;
+  			tx_ring->txbufs[wr_idx].fidx = f;
+@@@ -971,9 -1000,53 +970,56 @@@ static void nfp_net_tx_complete(struct 
+  		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool nfp_net_xdp_complete(struct nfp_net_tx_ring *tx_ring)
++ {
++ 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
++ 	u32 done_pkts = 0, done_bytes = 0;
++ 	bool done_all;
++ 	int idx, todo;
++ 	u32 qcp_rd_p;
++ 
++ 	/* Work out how many descriptors have been transmitted */
++ 	qcp_rd_p = nfp_qcp_rd_ptr_read(tx_ring->qcp_q);
++ 
++ 	if (qcp_rd_p == tx_ring->qcp_rd_p)
++ 		return true;
++ 
++ 	if (qcp_rd_p > tx_ring->qcp_rd_p)
++ 		todo = qcp_rd_p - tx_ring->qcp_rd_p;
++ 	else
++ 		todo = qcp_rd_p + tx_ring->cnt - tx_ring->qcp_rd_p;
++ 
++ 	done_all = todo <= NFP_NET_XDP_MAX_COMPLETE;
++ 	todo = min(todo, NFP_NET_XDP_MAX_COMPLETE);
++ 
++ 	tx_ring->qcp_rd_p = D_IDX(tx_ring, tx_ring->qcp_rd_p + todo);
++ 
++ 	done_pkts = todo;
++ 	while (todo--) {
++ 		idx = D_IDX(tx_ring, tx_ring->rd_p);
++ 		tx_ring->rd_p++;
++ 
++ 		done_bytes += tx_ring->txbufs[idx].real_len;
++ 	}
++ 
++ 	u64_stats_update_begin(&r_vec->tx_sync);
++ 	r_vec->tx_bytes += done_bytes;
++ 	r_vec->tx_pkts += done_pkts;
++ 	u64_stats_update_end(&r_vec->tx_sync);
++ 
++ 	WARN_ONCE(tx_ring->wr_p - tx_ring->rd_p > tx_ring->cnt,
++ 		  "XDP TX ring corruption rd_p=%u wr_p=%u cnt=%u\n",
++ 		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
++ 
++ 	return done_all;
++ }
++ 
+++>>>>>>> 4aa3b7660aa7 (nfp: add a helper for wrapping descriptor index)
+  /**
+   * nfp_net_tx_ring_reset() - Free any untransmitted buffers and reset pointers
+ - * @dp:		NFP Net data path struct
+ + * @nn:		NFP Net device
+   * @tx_ring:	TX ring structure
+   *
+   * Assumes that the device is stopped
+@@@ -983,21 -1056,21 +1029,27 @@@ nfp_net_tx_ring_reset(struct nfp_net *n
+  {
+  	const struct skb_frag_struct *frag;
+  	struct netdev_queue *nd_q;
+ +	struct pci_dev *pdev = nn->pdev;
+  
+ -	while (!tx_ring->is_xdp && tx_ring->rd_p != tx_ring->wr_p) {
+ -		struct nfp_net_tx_buf *tx_buf;
+ +	while (tx_ring->rd_p != tx_ring->wr_p) {
+ +		int nr_frags, fidx, idx;
+  		struct sk_buff *skb;
+ -		int idx, nr_frags;
+  
+++<<<<<<< HEAD
+ +		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
+++=======
++ 		idx = D_IDX(tx_ring, tx_ring->rd_p);
++ 		tx_buf = &tx_ring->txbufs[idx];
++ 
+++>>>>>>> 4aa3b7660aa7 (nfp: add a helper for wrapping descriptor index)
+  		skb = tx_ring->txbufs[idx].skb;
+  		nr_frags = skb_shinfo(skb)->nr_frags;
+ +		fidx = tx_ring->txbufs[idx].fidx;
+  
+ -		if (tx_buf->fidx == -1) {
+ +		if (fidx == -1) {
+  			/* unmap head */
+ -			dma_unmap_single(dp->dev, tx_buf->dma_addr,
+ +			dma_unmap_single(&pdev->dev,
+ +					 tx_ring->txbufs[idx].dma_addr,
+  					 skb_headlen(skb), DMA_TO_DEVICE);
+  		} else {
+  			/* unmap fragment */
+@@@ -1126,8 -1215,10 +1178,8 @@@ static void nfp_net_rx_give_one(struct 
+  {
+  	unsigned int wr_idx;
+  
+- 	wr_idx = rx_ring->wr_p & (rx_ring->cnt - 1);
++ 	wr_idx = D_IDX(rx_ring, rx_ring->wr_p);
+  
+ -	nfp_net_dma_sync_dev_rx(dp, dma_addr);
+ -
+  	/* Stash SKB and DMA address away */
+  	rx_ring->rxbufs[wr_idx].frag = frag;
+  	rx_ring->rxbufs[wr_idx].dma_addr = dma_addr;
+@@@ -1365,6 -1498,81 +1417,84 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ nfp_net_tx_xdp_buf(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int dma_off,
++ 		   unsigned int pkt_len, bool *completed)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		if (!*completed) {
++ 			nfp_net_xdp_complete(tx_ring);
++ 			*completed = true;
++ 		}
++ 
++ 		if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 			nfp_net_rx_drop(dp, rx_ring->r_vec, rx_ring, rxbuf,
++ 					NULL);
++ 			return false;
++ 		}
++ 	}
++ 
++ 	wr_idx = D_IDX(tx_ring, tx_ring->wr_p);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 
++ 	nfp_net_rx_give_one(dp, rx_ring, txbuf->frag, txbuf->dma_addr);
++ 
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(dp->dev, rxbuf->dma_addr + dma_off,
++ 				   pkt_len, DMA_BIDIRECTIONAL);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + dma_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->lso_hdrlen = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ 	return true;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, void *hard_start,
++ 			   unsigned int *off, unsigned int *len)
++ {
++ 	struct xdp_buff xdp;
++ 	void *orig_data;
++ 	int ret;
++ 
++ 	xdp.data_hard_start = hard_start;
++ 	xdp.data = data + *off;
++ 	xdp.data_end = data + *off + *len;
++ 
++ 	orig_data = xdp.data;
++ 	ret = bpf_prog_run_xdp(prog, &xdp);
++ 
++ 	*len -= xdp.data - orig_data;
++ 	*off += xdp.data - orig_data;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 4aa3b7660aa7 (nfp: add a helper for wrapping descriptor index)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0..ca4c185a087e 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -112,6 +112,9 @@ struct nfp_cpp;
+ struct nfp_net;
+ struct nfp_net_r_vector;
+ 
++/* Convenience macro for wrapping descriptor index on ring size */
++#define D_IDX(ring, idx)	((idx) & ((ring)->cnt - 1))
++
+ /* Convenience macro for writing dma address into RX/TX descriptors */
+ #define nfp_desc_set_dma_addr(desc, dma_addr)				\
+ 	do {								\
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
