@@ -1,0 +1,190 @@
+KVM: x86: drop TSC offsetting kvm_x86_ops to fix KVM_GET/SET_CLOCK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit ea26e4ec08d4727e3a9e48a6b74695861effcbd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ea26e4ec.failed
+
+Since commit a545ab6a0085 ("kvm: x86: add tsc_offset field to struct
+kvm_vcpu_arch", 2016-09-07) the offset between host and L1 TSC is
+cached and need not be fished out of the VMCS or VMCB.  This means
+that we can implement adjust_tsc_offset_guest and read_l1_tsc
+entirely in generic code.  The simplification is particularly
+significant for VMX code, where vmx->nested.vmcs01_tsc_offset
+was duplicating what is now in vcpu->arch.tsc_offset.  Therefore
+the vmcs01_tsc_offset can be dropped completely.
+
+More importantly, this fixes KVM_GET_CLOCK/KVM_SET_CLOCK
+which, after commit 108b249c453d ("KVM: x86: introduce get_kvmclock_ns",
+2016-09-01) called read_l1_tsc while the VMCS was not loaded.
+It thus returned bogus values on Intel CPUs.
+
+Fixes: 108b249c453dd7132599ab6dc7e435a7036c193f
+	Reported-by: Roman Kagan <rkagan@virtuozzo.com>
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ea26e4ec08d4727e3a9e48a6b74695861effcbd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/svm.c
+index 6f2d74ac8a7d,8ca1eca5038d..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -976,19 -1138,20 +976,36 @@@ static void svm_write_tsc_offset(struc
+  	mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
+  }
+  
+++<<<<<<< HEAD
+ +static void svm_adjust_tsc_offset_guest(struct kvm_vcpu *vcpu, s64 adjustment)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +
+ +	svm->vmcb->control.tsc_offset += adjustment;
+ +	if (is_guest_mode(vcpu))
+ +		svm->nested.hsave->control.tsc_offset += adjustment;
+ +	else
+ +		trace_kvm_write_tsc_offset(vcpu->vcpu_id,
+ +				     svm->vmcb->control.tsc_offset - adjustment,
+ +				     svm->vmcb->control.tsc_offset);
+ +
+ +	mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
+++=======
++ static void avic_init_vmcb(struct vcpu_svm *svm)
++ {
++ 	struct vmcb *vmcb = svm->vmcb;
++ 	struct kvm_arch *vm_data = &svm->vcpu.kvm->arch;
++ 	phys_addr_t bpa = page_to_phys(svm->avic_backing_page);
++ 	phys_addr_t lpa = page_to_phys(vm_data->avic_logical_id_table_page);
++ 	phys_addr_t ppa = page_to_phys(vm_data->avic_physical_id_table_page);
++ 
++ 	vmcb->control.avic_backing_page = bpa & AVIC_HPA_MASK;
++ 	vmcb->control.avic_logical_id = lpa & AVIC_HPA_MASK;
++ 	vmcb->control.avic_physical_id = ppa & AVIC_HPA_MASK;
++ 	vmcb->control.avic_physical_id |= AVIC_MAX_PHYSICAL_ID_COUNT;
++ 	vmcb->control.int_ctl |= AVIC_ENABLE_MASK;
++ 	svm->vcpu.arch.apicv_active = true;
+++>>>>>>> ea26e4ec08d4 (KVM: x86: drop TSC offsetting kvm_x86_ops to fix KVM_GET/SET_CLOCK)
+  }
+  
+  static void init_vmcb(struct vcpu_svm *svm)
+diff --cc arch/x86/kvm/vmx.c
+index cebaaac0b163,754c3a7f444a..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -404,7 -421,7 +404,11 @@@ struct nested_vmx 
+  	/* vmcs02_list cache of VMCSs recently used to run L2 guests */
+  	struct list_head vmcs02_pool;
+  	int vmcs02_num;
+++<<<<<<< HEAD
+ +	u64 vmcs01_tsc_offset;
+++=======
++ 	bool change_vmcs01_virtual_x2apic_mode;
+++>>>>>>> ea26e4ec08d4 (KVM: x86: drop TSC offsetting kvm_x86_ops to fix KVM_GET/SET_CLOCK)
+  	/* L2 must run next, and mustn't decide to exit to L1. */
+  	bool nested_run_pending;
+  	/*
+@@@ -9626,9 -10032,11 +9602,15 @@@ static void prepare_vmcs02(struct kvm_v
+  
+  	if (vmcs12->cpu_based_vm_exec_control & CPU_BASED_USE_TSC_OFFSETING)
+  		vmcs_write64(TSC_OFFSET,
+- 			vmx->nested.vmcs01_tsc_offset + vmcs12->tsc_offset);
++ 			vcpu->arch.tsc_offset + vmcs12->tsc_offset);
+  	else
+++<<<<<<< HEAD
+ +		vmcs_write64(TSC_OFFSET, vmx->nested.vmcs01_tsc_offset);
+++=======
++ 		vmcs_write64(TSC_OFFSET, vcpu->arch.tsc_offset);
++ 	if (kvm_has_tsc_control)
++ 		decache_tsc_multiplier(vmx);
+++>>>>>>> ea26e4ec08d4 (KVM: x86: drop TSC offsetting kvm_x86_ops to fix KVM_GET/SET_CLOCK)
+  
+  	if (enable_vpid) {
+  		/*
+@@@ -10375,8 -10786,22 +10355,27 @@@ static void nested_vmx_vmexit(struct kv
+  
+  	load_vmcs12_host_state(vcpu, vmcs12);
+  
+++<<<<<<< HEAD
+ +	/* Update TSC_OFFSET if TSC was changed while L2 ran */
+ +	vmcs_write64(TSC_OFFSET, vmx->nested.vmcs01_tsc_offset);
+++=======
++ 	/* Update any VMCS fields that might have changed while L2 ran */
++ 	vmcs_write64(TSC_OFFSET, vcpu->arch.tsc_offset);
++ 	if (vmx->hv_deadline_tsc == -1)
++ 		vmcs_clear_bits(PIN_BASED_VM_EXEC_CONTROL,
++ 				PIN_BASED_VMX_PREEMPTION_TIMER);
++ 	else
++ 		vmcs_set_bits(PIN_BASED_VM_EXEC_CONTROL,
++ 			      PIN_BASED_VMX_PREEMPTION_TIMER);
++ 	if (kvm_has_tsc_control)
++ 		decache_tsc_multiplier(vmx);
++ 
++ 	if (vmx->nested.change_vmcs01_virtual_x2apic_mode) {
++ 		vmx->nested.change_vmcs01_virtual_x2apic_mode = false;
++ 		vmx_set_virtual_x2apic_mode(vcpu,
++ 				vcpu->arch.apic_base & X2APIC_ENABLE);
++ 	}
+++>>>>>>> ea26e4ec08d4 (KVM: x86: drop TSC offsetting kvm_x86_ops to fix KVM_GET/SET_CLOCK)
+  
+  	/* This is needed for same reason as it was needed in prepare_vmcs02 */
+  	vmx->host_rsp = 0;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 38430109c621..4a17a4744514 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -833,7 +833,6 @@ struct kvm_x86_ops {
+ 	int (*get_lpage_level)(void);
+ 	bool (*rdtscp_supported)(void);
+ 	bool (*invpcid_supported)(void);
+-	void (*adjust_tsc_offset_guest)(struct kvm_vcpu *vcpu, s64 adjustment);
+ 
+ 	void (*set_tdp_cr3)(struct kvm_vcpu *vcpu, unsigned long cr3);
+ 
+@@ -843,8 +842,6 @@ struct kvm_x86_ops {
+ 
+ 	void (*write_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
+ 
+-	u64 (*read_l1_tsc)(struct kvm_vcpu *vcpu, u64 host_tsc);
+-
+ 	void (*get_exit_info)(struct kvm_vcpu *vcpu, u64 *info1, u64 *info2);
+ 
+ 	int (*check_intercept)(struct kvm_vcpu *vcpu,
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 4d5a959967aa..aacc0a9cc3c2 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1390,7 +1390,7 @@ static u64 kvm_compute_tsc_offset(struct kvm_vcpu *vcpu, u64 target_tsc)
+ 
+ u64 kvm_read_l1_tsc(struct kvm_vcpu *vcpu, u64 host_tsc)
+ {
+-	return kvm_x86_ops->read_l1_tsc(vcpu, kvm_scale_tsc(vcpu, host_tsc));
++	return vcpu->arch.tsc_offset + kvm_scale_tsc(vcpu, host_tsc);
+ }
+ EXPORT_SYMBOL_GPL(kvm_read_l1_tsc);
+ 
+@@ -1528,7 +1528,7 @@ EXPORT_SYMBOL_GPL(kvm_write_tsc);
+ static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
+ 					   s64 adjustment)
+ {
+-	kvm_x86_ops->adjust_tsc_offset_guest(vcpu, adjustment);
++	kvm_vcpu_write_tsc_offset(vcpu, vcpu->arch.tsc_offset + adjustment);
+ }
+ 
+ static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
+@@ -1536,7 +1536,7 @@ static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
+ 	if (vcpu->arch.tsc_scaling_ratio != kvm_default_tsc_scaling_ratio)
+ 		WARN_ON(adjustment < 0);
+ 	adjustment = kvm_scale_tsc(vcpu, (u64) adjustment);
+-	kvm_x86_ops->adjust_tsc_offset_guest(vcpu, adjustment);
++	adjust_tsc_offset_guest(vcpu, adjustment);
+ }
+ 
+ #ifdef CONFIG_X86_64
