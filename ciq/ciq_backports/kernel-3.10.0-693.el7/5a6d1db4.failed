@@ -1,0 +1,129 @@
+SUNRPC: Add a transport-specific private field in rpc_rqst
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 5a6d1db4556940533f1a5b6521e522f3e46508ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5a6d1db4.failed
+
+Currently there's a hidden and indirect mechanism for finding the
+rpcrdma_req that goes with an rpc_rqst. It depends on getting from
+the rq_buffer pointer in struct rpc_rqst to the struct
+rpcrdma_regbuf that controls that buffer, and then to the struct
+rpcrdma_req it goes with.
+
+This was done back in the day to avoid the need to add a per-rqst
+pointer or to alter the buf_free API when support for RPC-over-RDMA
+was introduced.
+
+I'm about to change the way regbuf's work to support larger inline
+thresholds. Now is a good time to replace this indirect mechanism
+with something that is more straightforward. I guess this should be
+considered a clean up.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 5a6d1db4556940533f1a5b6521e522f3e46508ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/transport.c
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,d83bffa92dfc..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -514,8 -523,10 +514,15 @@@ xprt_rdma_allocate(struct rpc_task *tas
+  out:
+  	dprintk("RPC:       %s: size %zd, request 0x%p\n", __func__, size, req);
+  	req->rl_connect_cookie = 0;	/* our reserved value */
+++<<<<<<< HEAD
+ +	req->rl_task = task;
+ +	return req->rl_sendbuf->rg_base;
+++=======
++ 	rpcrdma_set_xprtdata(rqst, req);
++ 	rqst->rq_buffer = req->rl_sendbuf->rg_base;
++ 	rqst->rq_rbuffer = (char *)rqst->rq_buffer + rqst->rq_rcvsize;
++ 	return 0;
+++>>>>>>> 5a6d1db45569 (SUNRPC: Add a transport-specific private field in rpc_rqst)
+  
+  out_rdmabuf:
+  	min_size = r_xprt->rx_data.inline_wsize;
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index a5425a2a0462..e086c682d7c0 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -83,6 +83,7 @@ struct rpc_rqst {
+ 	void (*rq_release_snd_buf)(struct rpc_rqst *); /* release rq_enc_pages */
+ 	struct list_head	rq_list;
+ 
++	void			*rq_xprtdata;	/* Per-xprt private data */
+ 	void			*rq_buffer;	/* Call XDR encode buffer */
+ 	size_t			rq_callsize,
+ 				rq_rcvsize;
+diff --git a/net/sunrpc/xprtrdma/backchannel.c b/net/sunrpc/xprtrdma/backchannel.c
+index d3cfaf281e55..c4904f881640 100644
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@ -55,11 +55,9 @@ static int rpcrdma_bc_setup_rqst(struct rpcrdma_xprt *r_xprt,
+ 	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
+ 	if (IS_ERR(rb))
+ 		goto out_fail;
+-	rb->rg_owner = req;
+ 	req->rl_sendbuf = rb;
+-	/* so that rpcr_to_rdmar works when receiving a request */
+-	rqst->rq_buffer = (void *)req->rl_sendbuf->rg_base;
+-	xdr_buf_init(&rqst->rq_snd_buf, rqst->rq_buffer, size);
++	xdr_buf_init(&rqst->rq_snd_buf, rb->rg_base, size);
++	rpcrdma_set_xprtdata(rqst, req);
+ 	return 0;
+ 
+ out_fail:
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 4dff498a63f2..9bd5e6ecd3f9 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1112,7 +1112,6 @@ rpcrdma_alloc_regbuf(struct rpcrdma_ia *ia, size_t size, gfp_t flags)
+ 	iov->length = size;
+ 	iov->lkey = ia->ri_pd->local_dma_lkey;
+ 	rb->rg_size = size;
+-	rb->rg_owner = NULL;
+ 	return rb;
+ 
+ out_free:
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index be2bcc2ea72b..d7d36d046cae 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -114,7 +114,6 @@ struct rpcrdma_ep {
+ 
+ struct rpcrdma_regbuf {
+ 	size_t			rg_size;
+-	struct rpcrdma_req	*rg_owner;
+ 	struct ib_sge		rg_iov;
+ 	__be32			rg_base[0] __attribute__ ((aligned(256)));
+ };
+@@ -304,14 +303,16 @@ struct rpcrdma_req {
+ 	bool			rl_backchannel;
+ };
+ 
++static inline void
++rpcrdma_set_xprtdata(struct rpc_rqst *rqst, struct rpcrdma_req *req)
++{
++	rqst->rq_xprtdata = req;
++}
++
+ static inline struct rpcrdma_req *
+ rpcr_to_rdmar(struct rpc_rqst *rqst)
+ {
+-	void *buffer = rqst->rq_buffer;
+-	struct rpcrdma_regbuf *rb;
+-
+-	rb = container_of(buffer, struct rpcrdma_regbuf, rg_base);
+-	return rb->rg_owner;
++	return rqst->rq_xprtdata;
+ }
+ 
+ /*
