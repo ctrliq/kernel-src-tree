@@ -75,6 +75,20 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
 }
 
 static int
+nfp_bpf_check_call(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+{
+	u32 func_id = meta->insn.imm;
+
+	switch (func_id) {
+	default:
+		pr_warn("unsupported function id: %d\n", func_id);
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int
 nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
 		   const struct bpf_verifier_env *env)
 {
@@ -178,6 +192,8 @@ nfp_verify_insn(struct bpf_verifier_env *env, int insn_idx, int prev_insn_idx)
 		return -EINVAL;
 	}
 
+	if (meta->insn.code == (BPF_JMP | BPF_CALL))
+		return nfp_bpf_check_call(nfp_prog, meta);
 	if (meta->insn.code == (BPF_JMP | BPF_EXIT))
 		return nfp_bpf_check_exit(priv->prog, env);
 
