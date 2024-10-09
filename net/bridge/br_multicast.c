@@ -1909,7 +1909,10 @@ int br_multicast_set_port_router(struct net_bridge_port *p, unsigned long val)
 	int err = -EINVAL;
 
 	spin_lock(&br->multicast_lock);
-
+	if (p->multicast_router == val) {
+		err = 0;
+		goto unlock;
+	}
 	switch (val) {
 	case 0:
 	case 1:
