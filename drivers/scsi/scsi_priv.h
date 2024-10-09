@@ -177,8 +177,5 @@ extern struct async_domain scsi_sd_probe_domain;
  */
 
 #define SCSI_DEVICE_BLOCK_MAX_TIMEOUT	600	/* units in seconds */
-extern int scsi_internal_device_block(struct scsi_device *sdev);
-extern int scsi_internal_device_unblock(struct scsi_device *sdev,
-					enum scsi_device_state new_state);
 
 #endif /* _SCSI_PRIV_H */
