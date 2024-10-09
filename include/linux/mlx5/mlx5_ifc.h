@@ -1000,7 +1000,8 @@ struct mlx5_ifc_cmd_hca_cap_bits {
 	u8         log_max_wq_sz[0x5];
 
 	u8         nic_vport_change_event[0x1];
-	u8         reserved_at_3e1[0xa];
+	u8         disable_local_lb[0x1];
+	u8         reserved_at_3e2[0x9];
 	u8         log_max_vlan_list[0x5];
 	u8         reserved_at_3f0[0x3];
 	u8         log_max_current_mc_list[0x5];
@@ -2542,7 +2543,9 @@ struct mlx5_ifc_rmpc_bits {
 struct mlx5_ifc_nic_vport_context_bits {
 	u8         reserved_at_0[0x5];
 	u8         min_wqe_inline_mode[0x3];
-	u8         reserved_at_8[0x17];
+	u8         reserved_at_8[0x15];
+	u8         disable_mc_local_lb[0x1];
+	u8         disable_uc_local_lb[0x1];
 	u8         roce_en[0x1];
 
 	u8         arm_change_event[0x1];
@@ -5200,7 +5203,9 @@ struct mlx5_ifc_modify_nic_vport_context_out_bits {
 };
 
 struct mlx5_ifc_modify_nic_vport_field_select_bits {
-	u8         reserved_at_0[0x16];
+	u8         reserved_at_0[0x14];
+	u8         disable_uc_local_lb[0x1];
+	u8         disable_mc_local_lb[0x1];
 	u8         node_guid[0x1];
 	u8         port_guid[0x1];
 	u8         min_inline[0x1];
