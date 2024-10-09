@@ -1,0 +1,222 @@
+locking/rwsem: Return void in __rwsem_mark_wake()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 84b23f9b58687a11ced66cc4be9b0219e8ecab84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/84b23f9b.failed
+
+We currently return a rw_semaphore structure, which is the
+same lock we passed to the function's argument in the first
+place. While there are several functions that choose this
+return value, the callers use it, for example, for things
+like ERR_PTR. This is not the case for __rwsem_mark_wake(),
+and in addition this function is really about the lock
+waiters (which we know there are at this point), so its
+somewhat odd to be returning the sem structure.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Waiman.Long@hp.com
+	Cc: dave@stgolabs.net
+	Cc: jason.low2@hpe.com
+	Cc: wanpeng.li@hotmail.com
+Link: http://lkml.kernel.org/r/1470384285-32163-2-git-send-email-dave@stgolabs.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 84b23f9b58687a11ced66cc4be9b0219e8ecab84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rwsem.c
+diff --cc lib/rwsem.c
+index 09d8c2da4ff3,b03623172277..000000000000
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@@ -113,50 -114,72 +113,80 @@@ enum rwsem_wake_type 
+   *   - the 'active part' of count (&0x0000ffff) reached 0 (but may have changed)
+   *   - the 'waiting part' of count (&0xffff0000) is -ve (and will still be so)
+   * - there must be someone on the queue
+ - * - the wait_lock must be held by the caller
+ - * - tasks are marked for wakeup, the caller must later invoke wake_up_q()
+ - *   to actually wakeup the blocked task(s) and drop the reference count,
+ - *   preferably when the wait_lock is released
+ + * - the spinlock must be held by the caller
+   * - woken process blocks are discarded from the list after having task zeroed
+ - * - writers are only marked woken if downgrading is false
+ + * - writers are only woken if downgrading is false
+   */
+++<<<<<<< HEAD:lib/rwsem.c
+ +static struct rw_semaphore *
+ +__rwsem_do_wake(struct rw_semaphore *sem, enum rwsem_wake_type wake_type)
+++=======
++ static void __rwsem_mark_wake(struct rw_semaphore *sem,
++ 			      enum rwsem_wake_type wake_type,
++ 			      struct wake_q_head *wake_q)
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  {
+  	struct rwsem_waiter *waiter;
+  	struct task_struct *tsk;
+  	struct list_head *next;
+- 	long oldcount, woken, loop, adjustment;
++ 	long loop, oldcount, woken = 0, adjustment = 0;
+  
+  	waiter = list_entry(sem->wait_list.next, struct rwsem_waiter, list);
++ 
+  	if (waiter->type == RWSEM_WAITING_FOR_WRITE) {
+ -		if (wake_type == RWSEM_WAKE_ANY) {
+ -			/*
+ -			 * Mark writer at the front of the queue for wakeup.
+ -			 * Until the task is actually later awoken later by
+ -			 * the caller, other writers are able to steal it.
+ -			 * Readers, on the other hand, will block as they
+ -			 * will notice the queued writer.
+ +		if (wake_type == RWSEM_WAKE_ANY)
+ +			/* Wake writer at the front of the queue, but do not
+ +			 * grant it the lock yet as we want other writers
+ +			 * to be able to steal it.  Readers, on the other hand,
+ +			 * will block as they will notice the queued writer.
+  			 */
+++<<<<<<< HEAD:lib/rwsem.c
+ +			wake_up_process(waiter->task);
+ +		goto out;
+++=======
++ 			wake_q_add(wake_q, waiter->task);
++ 		}
++ 
++ 		return;
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  	}
+  
+- 	/* Writers might steal the lock before we grant it to the next reader.
++ 	/*
++ 	 * Writers might steal the lock before we grant it to the next reader.
+  	 * We prefer to do the first reader grant before counting readers
+  	 * so we can bail out early if a writer stole the lock.
+  	 */
+  	if (wake_type != RWSEM_WAKE_READ_OWNED) {
+  		adjustment = RWSEM_ACTIVE_READ_BIAS;
+   try_reader_grant:
+++<<<<<<< HEAD:lib/rwsem.c
+ +		oldcount = rwsem_atomic_update(adjustment, sem) - adjustment;
+ +		if (unlikely(oldcount < RWSEM_WAITING_BIAS)) {
+ +			/* A writer stole the lock. Undo our reader grant. */
+ +			if (rwsem_atomic_update(-adjustment, sem) &
+ +						RWSEM_ACTIVE_MASK)
+ +				goto out;
+++=======
++ 		oldcount = atomic_long_fetch_add(adjustment, &sem->count);
++ 		if (unlikely(oldcount < RWSEM_WAITING_BIAS)) {
++ 			/*
++ 			 * If the count is still less than RWSEM_WAITING_BIAS
++ 			 * after removing the adjustment, it is assumed that
++ 			 * a writer has stolen the lock. We have to undo our
++ 			 * reader grant.
++ 			 */
++ 			if (atomic_long_add_return(-adjustment, &sem->count) <
++ 			    RWSEM_WAITING_BIAS)
++ 				return;
++ 
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  			/* Last active locker left. Retry waking readers. */
+  			goto try_reader_grant;
+  		}
+ -		/*
+ -		 * It is not really necessary to set it to reader-owned here,
+ -		 * but it gives the spinners an early indication that the
+ -		 * readers now have the lock.
+ -		 */
+ -		rwsem_set_reader_owned(sem);
+  	}
+  
+- 	/* Grant an infinite number of read locks to the readers at the front
++ 	/*
++ 	 * Grant an infinite number of read locks to the readers at the front
+  	 * of the queue.  Note we increment the 'active part' of the count by
+  	 * the number of readers before waking any processes up.
+  	 */
+@@@ -237,9 -254,10 +263,13 @@@ struct rw_semaphore __sched *rwsem_down
+  	if (count == RWSEM_WAITING_BIAS ||
+  	    (count > RWSEM_WAITING_BIAS &&
+  	     adjustment != -RWSEM_ACTIVE_READ_BIAS))
+++<<<<<<< HEAD:lib/rwsem.c
+ +		sem = __rwsem_do_wake(sem, RWSEM_WAKE_ANY);
+++=======
++ 		__rwsem_mark_wake(sem, RWSEM_WAKE_ANY, &wake_q);
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  
+  	raw_spin_unlock_irq(&sem->wait_lock);
+ -	wake_up_q(&wake_q);
+  
+  	/* wait to be given the lock */
+  	while (true) {
+@@@ -453,14 -501,25 +483,30 @@@ struct rw_semaphore __sched *rwsem_down
+  		 * no active writers, the lock must be read owned; so we try to
+  		 * wake any read locks that were queued ahead of us.
+  		 */
+++<<<<<<< HEAD:lib/rwsem.c
+ +		if (count > RWSEM_WAITING_BIAS)
+ +			sem = __rwsem_do_wake(sem, RWSEM_WAKE_READERS);
+++=======
++ 		if (count > RWSEM_WAITING_BIAS) {
++ 			WAKE_Q(wake_q);
++ 
++ 			__rwsem_mark_wake(sem, RWSEM_WAKE_READERS, &wake_q);
++ 			/*
++ 			 * The wakeup is normally called _after_ the wait_lock
++ 			 * is released, but given that we are proactively waking
++ 			 * readers we can deal with the wake_q overhead as it is
++ 			 * similar to releasing and taking the wait_lock again
++ 			 * for attempting rwsem_try_write_lock().
++ 			 */
++ 			wake_up_q(&wake_q);
++ 		}
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  
+  	} else
+ -		count = atomic_long_add_return(RWSEM_WAITING_BIAS, &sem->count);
+ +		count = rwsem_atomic_update(RWSEM_WAITING_BIAS, sem);
+  
+  	/* wait until we successfully acquire the lock */
+ -	set_current_state(state);
+ +	set_current_state(TASK_UNINTERRUPTIBLE);
+  	while (true) {
+  		if (rwsem_try_write_lock(count, sem))
+  			break;
+@@@ -496,9 -614,11 +542,13 @@@ struct rw_semaphore *rwsem_wake(struct 
+  
+  	/* do nothing if list empty */
+  	if (!list_empty(&sem->wait_list))
+++<<<<<<< HEAD:lib/rwsem.c
+ +		sem = __rwsem_do_wake(sem, RWSEM_WAKE_ANY);
+++=======
++ 		__rwsem_mark_wake(sem, RWSEM_WAKE_ANY, &wake_q);
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  
+  	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+ -	wake_up_q(&wake_q);
+  
+  	return sem;
+  }
+@@@ -518,9 -639,10 +568,13 @@@ struct rw_semaphore *rwsem_downgrade_wa
+  
+  	/* do nothing if list empty */
+  	if (!list_empty(&sem->wait_list))
+++<<<<<<< HEAD:lib/rwsem.c
+ +		sem = __rwsem_do_wake(sem, RWSEM_WAKE_READ_OWNED);
+++=======
++ 		__rwsem_mark_wake(sem, RWSEM_WAKE_READ_OWNED, &wake_q);
+++>>>>>>> 84b23f9b5868 (locking/rwsem: Return void in __rwsem_mark_wake()):kernel/locking/rwsem-xadd.c
+  
+  	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+ -	wake_up_q(&wake_q);
+  
+  	return sem;
+  }
+* Unmerged path lib/rwsem.c
