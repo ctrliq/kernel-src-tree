@@ -1,0 +1,275 @@
+fsnotify: remove mark->free_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.com>
+commit 925d1132a03e33cb8f29a0057300d023b4f1be23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/925d1132.failed
+
+Free list is used when all marks on given inode / mount should be
+destroyed when inode / mount is going away.  However we can free all of
+the marks without using a special list with some care.
+
+	Signed-off-by: Jan Kara <jack@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 925d1132a03e33cb8f29a0057300d023b4f1be23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.h
+#	fs/notify/inode_mark.c
+#	fs/notify/mark.c
+#	fs/notify/vfsmount_mark.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/notify/fsnotify.h
+index 3b68b0ae0a97,b44c68a857e7..000000000000
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@@ -31,10 -40,22 +33,29 @@@ extern int fsnotify_add_vfsmount_mark(s
+  extern void fsnotify_destroy_vfsmount_mark(struct fsnotify_mark *mark);
+  /* inode specific destruction of a mark */
+  extern void fsnotify_destroy_inode_mark(struct fsnotify_mark *mark);
+++<<<<<<< HEAD
+ +/* run the list of all marks associated with inode and flag them to be freed */
+ +extern void fsnotify_clear_marks_by_inode(struct inode *inode);
+ +/* run the list of all marks associated with vfsmount and flag them to be freed */
+ +extern void fsnotify_clear_marks_by_mount(struct vfsmount *mnt);
+++=======
++ /* Find mark belonging to given group in the list of marks */
++ extern struct fsnotify_mark *fsnotify_find_mark(struct hlist_head *head,
++ 						struct fsnotify_group *group);
++ /* Destroy all marks in the given list protected by 'lock' */
++ extern void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock);
++ /* run the list of all marks associated with inode and destroy them */
++ static inline void fsnotify_clear_marks_by_inode(struct inode *inode)
++ {
++ 	fsnotify_destroy_marks(&inode->i_fsnotify_marks, &inode->i_lock);
++ }
++ /* run the list of all marks associated with vfsmount and destroy them */
++ static inline void fsnotify_clear_marks_by_mount(struct vfsmount *mnt)
++ {
++ 	fsnotify_destroy_marks(&real_mount(mnt)->mnt_fsnotify_marks,
++ 			       &mnt->mnt_root->d_lock);
++ }
+++>>>>>>> 925d1132a03e (fsnotify: remove mark->free_list)
+  /*
+   * update the dentry->d_flags of all of inode's children to indicate if inode cares
+   * about events that happen to its children.
+diff --cc fs/notify/inode_mark.c
+index 77838b0a60de,474a3ce1b5e1..000000000000
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@@ -81,37 -65,6 +81,40 @@@ void fsnotify_destroy_inode_mark(struc
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Given an inode, destroy all of the marks associated with that inode.
+ + */
+ +void fsnotify_clear_marks_by_inode(struct inode *inode)
+ +{
+ +	struct fsnotify_mark *mark, *lmark;
+ +	struct hlist_node *n;
+ +	LIST_HEAD(free_list);
+ +
+ +	spin_lock(&inode->i_lock);
+ +	hlist_for_each_entry_safe(mark, n, &inode->i_fsnotify_marks, i.i_list) {
+ +		list_add(&mark->i.free_i_list, &free_list);
+ +		hlist_del_init_rcu(&mark->i.i_list);
+ +		fsnotify_get_mark(mark);
+ +	}
+ +	spin_unlock(&inode->i_lock);
+ +
+ +	list_for_each_entry_safe(mark, lmark, &free_list, i.free_i_list) {
+ +		struct fsnotify_group *group;
+ +
+ +		spin_lock(&mark->lock);
+ +		fsnotify_get_group(mark->group);
+ +		group = mark->group;
+ +		spin_unlock(&mark->lock);
+ +
+ +		fsnotify_destroy_mark(mark, group);
+ +		fsnotify_put_mark(mark);
+ +		fsnotify_put_group(group);
+ +	}
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 925d1132a03e (fsnotify: remove mark->free_list)
+   * Given a group clear all of the inode marks associated with that group.
+   */
+  void fsnotify_clear_inode_marks_by_group(struct fsnotify_group *group)
+diff --cc fs/notify/mark.c
+index b46c40e4c8a2,3b2d1ba41e7b..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -192,6 -203,37 +192,40 @@@ void fsnotify_destroy_mark(struct fsnot
+  	mutex_unlock(&group->mark_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock)
++ {
++ 	struct fsnotify_mark *mark;
++ 
++ 	while (1) {
++ 		/*
++ 		 * We have to be careful since we can race with e.g.
++ 		 * fsnotify_clear_marks_by_group() and once we drop 'lock',
++ 		 * mark can get removed from the obj_list and destroyed. But
++ 		 * we are holding mark reference so mark cannot be freed and
++ 		 * calling fsnotify_destroy_mark() more than once is fine.
++ 		 */
++ 		spin_lock(lock);
++ 		if (hlist_empty(head)) {
++ 			spin_unlock(lock);
++ 			break;
++ 		}
++ 		mark = hlist_entry(head->first, struct fsnotify_mark, obj_list);
++ 		/*
++ 		 * We don't update i_fsnotify_mask / mnt_fsnotify_mask here
++ 		 * since inode / mount is going away anyway. So just remove
++ 		 * mark from the list.
++ 		 */
++ 		hlist_del_init_rcu(&mark->obj_list);
++ 		fsnotify_get_mark(mark);
++ 		spin_unlock(lock);
++ 		fsnotify_destroy_mark(mark, mark->group);
++ 		fsnotify_put_mark(mark);
++ 	}
++ }
++ 
+++>>>>>>> 925d1132a03e (fsnotify: remove mark->free_list)
+  void fsnotify_set_mark_mask_locked(struct fsnotify_mark *mark, __u32 mask)
+  {
+  	assert_spin_locked(&mark->lock);
+diff --cc fs/notify/vfsmount_mark.c
+index 03bc12158105,a8fcab68faef..000000000000
+--- a/fs/notify/vfsmount_mark.c
++++ b/fs/notify/vfsmount_mark.c
+@@@ -28,36 -28,6 +28,39 @@@
+  
+  #include <linux/fsnotify_backend.h>
+  #include "fsnotify.h"
+++<<<<<<< HEAD
+ +#include "../mount.h"
+ +
+ +void fsnotify_clear_marks_by_mount(struct vfsmount *mnt)
+ +{
+ +	struct fsnotify_mark *mark, *lmark;
+ +	struct hlist_node *n;
+ +	struct mount *m = real_mount(mnt);
+ +	LIST_HEAD(free_list);
+ +
+ +	spin_lock(&mnt->mnt_root->d_lock);
+ +	hlist_for_each_entry_safe(mark, n, &m->mnt_fsnotify_marks, m.m_list) {
+ +		list_add(&mark->m.free_m_list, &free_list);
+ +		hlist_del_init_rcu(&mark->m.m_list);
+ +		fsnotify_get_mark(mark);
+ +	}
+ +	spin_unlock(&mnt->mnt_root->d_lock);
+ +
+ +	list_for_each_entry_safe(mark, lmark, &free_list, m.free_m_list) {
+ +		struct fsnotify_group *group;
+ +
+ +		spin_lock(&mark->lock);
+ +		fsnotify_get_group(mark->group);
+ +		group = mark->group;
+ +		spin_unlock(&mark->lock);
+ +
+ +		fsnotify_destroy_mark(mark, group);
+ +		fsnotify_put_mark(mark);
+ +		fsnotify_put_group(group);
+ +	}
+ +}
+++=======
+++>>>>>>> 925d1132a03e (fsnotify: remove mark->free_list)
+  
+  void fsnotify_clear_vfsmount_marks_by_group(struct fsnotify_group *group)
+  {
+diff --cc include/linux/fsnotify_backend.h
+index 6b41e8a76df9,f044fe30e8c3..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -216,28 -199,38 +216,46 @@@ struct fsnotify_vfsmount_mark 
+   * fsnotify listener to indicate they are either no longer interested in events
+   * of a type matching mask or only interested in those events.
+   *
+ - * These are flushed when an inode is evicted from core and may be flushed
+ - * when the inode is modified (as seen by fsnotify_access).  Some fsnotify
+ - * users (such as dnotify) will flush these when the open fd is closed and not
+ - * at inode eviction or modification.
+ - *
+ - * Text in brackets is showing the lock(s) protecting modifications of a
+ - * particular entry. obj_lock means either inode->i_lock or
+ - * mnt->mnt_root->d_lock depending on the mark type.
+ + * these are flushed when an inode is evicted from core and may be flushed
+ + * when the inode is modified (as seen by fsnotify_access).  Some fsnotify users
+ + * (such as dnotify) will flush these when the open fd is closed and not at
+ + * inode eviction or modification.
+   */
+  struct fsnotify_mark {
+ -	/* Mask this mark is for [mark->lock, group->mark_mutex] */
+ -	__u32 mask;
+ -	/* We hold one for presence in g_list. Also one ref for each 'thing'
+ +	__u32 mask;			/* mask this mark is for */
+ +	/* we hold ref for each i_list and g_list.  also one ref for each 'thing'
+  	 * in kernel that found and may be using this mark. */
+++<<<<<<< HEAD
+ +	atomic_t refcnt;		/* active things looking at this mark */
+ +	struct fsnotify_group *group;	/* group this mark is for */
+ +	struct list_head g_list;	/* list of marks by group->i_fsnotify_marks
+ +					 * Also reused for queueing mark into
+ +					 * destroy_list when it's waiting for
+ +					 * the end of SRCU period before it can
+ +					 * be freed */
+ +	spinlock_t lock;		/* protect group and inode */
+ +	union {
+ +		struct fsnotify_inode_mark i;
+ +		struct fsnotify_vfsmount_mark m;
+++=======
++ 	atomic_t refcnt;
++ 	/* Group this mark is for. Set on mark creation, stable until last ref
++ 	 * is dropped */
++ 	struct fsnotify_group *group;
++ 	/* List of marks by group->i_fsnotify_marks. Also reused for queueing
++ 	 * mark into destroy_list when it's waiting for the end of SRCU period
++ 	 * before it can be freed. [group->mark_mutex] */
++ 	struct list_head g_list;
++ 	/* Protects inode / mnt pointers, flags, masks */
++ 	spinlock_t lock;
++ 	/* List of marks for inode / vfsmount [obj_lock] */
++ 	struct hlist_node obj_list;
++ 	union {	/* Object pointer [mark->lock, group->mark_mutex] */
++ 		struct inode *inode;	/* inode this mark is associated with */
++ 		struct vfsmount *mnt;	/* vfsmount this mark is associated with */
+++>>>>>>> 925d1132a03e (fsnotify: remove mark->free_list)
+  	};
+ -	/* Events types to ignore [mark->lock, group->mark_mutex] */
+ -	__u32 ignored_mask;
+ +	__u32 ignored_mask;		/* events types to ignore */
+  #define FSNOTIFY_MARK_FLAG_INODE		0x01
+  #define FSNOTIFY_MARK_FLAG_VFSMOUNT		0x02
+  #define FSNOTIFY_MARK_FLAG_OBJECT_PINNED	0x04
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 62b5f40fc8da..786dc25ed03e 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -26,7 +26,6 @@
+ 
+ #include <linux/fsnotify_backend.h>
+ #include "fsnotify.h"
+-#include "../mount.h"
+ 
+ /*
+  * Clear all of the marks on an inode when it is being evicted from core
+* Unmerged path fs/notify/fsnotify.h
+* Unmerged path fs/notify/inode_mark.c
+* Unmerged path fs/notify/mark.c
+* Unmerged path fs/notify/vfsmount_mark.c
+* Unmerged path include/linux/fsnotify_backend.h
