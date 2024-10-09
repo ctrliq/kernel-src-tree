@@ -1,0 +1,177 @@
+nvme: return the whole CQE through the request passthrough interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] return the whole CQE through the request passthrough interface (David Milburn) [1384066]
+Rebuild_FUZZ: 95.38%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 1cb3cce5eb9de335330c8a147e47e3359a51a8b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1cb3cce5.failed
+
+Both LighNVM and NVMe over Fabrics need to look at more than just the
+status and result field.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Matias Bj?rling <m@bjorling.me>
+	Reviewed-by: Jay Freyensee <james.p.freyensee@intel.com>
+	Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 1cb3cce5eb9de335330c8a147e47e3359a51a8b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 89b36d083f16,d47b08783110..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -824,12 -899,10 +822,14 @@@ static void abort_endio(struct request 
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+  	struct nvme_queue *nvmeq = iod->nvmeq;
+- 	u32 result = (u32)(uintptr_t)req->special;
+  	u16 status = req->errors;
+  
+++<<<<<<< HEAD
+ +	dev_warn(nvmeq->q_dmadev, "Abort status:%x result:%x", status, result);
+++=======
++ 	dev_warn(nvmeq->dev->ctrl.device, "Abort status: 0x%x", status);
+++>>>>>>> 1cb3cce5eb9d (nvme: return the whole CQE through the request passthrough interface)
+  	atomic_inc(&nvmeq->dev->ctrl.abort_limit);
+- 
+  	blk_mq_free_request(req);
+  }
+  
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 9f1e7e77d40f..fdf9fefd9a2a 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -127,7 +127,6 @@ struct request *nvme_alloc_request(struct request_queue *q,
+ 
+ 	req->cmd = (unsigned char *)cmd;
+ 	req->cmd_len = sizeof(struct nvme_command);
+-	req->special = (void *)0;
+ 
+ 	return req;
+ }
+@@ -137,7 +136,8 @@ struct request *nvme_alloc_request(struct request_queue *q,
+  * if the result is positive, it's an NVM Express status code
+  */
+ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+-		void *buffer, unsigned bufflen, u32 *result, unsigned timeout)
++		struct nvme_completion *cqe, void *buffer, unsigned bufflen,
++		unsigned timeout)
+ {
+ 	struct request *req;
+ 	int ret;
+@@ -147,6 +147,7 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		return PTR_ERR(req);
+ 
+ 	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
++	req->special = cqe;
+ 
+ 	if (buffer && bufflen) {
+ 		ret = blk_rq_map_kern(q, req, buffer, bufflen, __GFP_WAIT);
+@@ -155,8 +156,6 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 	}
+ 
+ 	blk_execute_rq(req->q, NULL, req, 0);
+-	if (result)
+-		*result = (u32)(uintptr_t)req->special;
+ 	ret = req->errors;
+  out:
+ 	blk_mq_free_request(req);
+@@ -166,7 +165,7 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		void *buffer, unsigned bufflen)
+ {
+-	return __nvme_submit_sync_cmd(q, cmd, buffer, bufflen, NULL, 0);
++	return __nvme_submit_sync_cmd(q, cmd, NULL, buffer, bufflen, 0);
+ }
+ 
+ int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+@@ -175,6 +174,7 @@ int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		u32 *result, unsigned timeout)
+ {
+ 	bool write = cmd->common.opcode & 1;
++	struct nvme_completion cqe;
+ 	struct nvme_ns *ns = q->queuedata;
+ 	struct gendisk *disk = ns ? ns->disk : NULL;
+ 	struct request *req;
+@@ -187,6 +187,7 @@ int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		return PTR_ERR(req);
+ 
+ 	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
++	req->special = &cqe;
+ 
+ 	if (ubuffer && bufflen) {
+ 		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen, __GFP_WAIT);
+@@ -240,7 +241,7 @@ int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 	blk_execute_rq(req->q, disk, req, 0);
+ 	ret = req->errors;
+ 	if (result)
+-		*result = (u32)(uintptr_t)req->special;
++		*result = le32_to_cpu(cqe.result);
+ 	if (meta && !ret && !write) {
+ 		if (copy_to_user(meta_buffer, meta, meta_len))
+ 			ret = -EFAULT;
+@@ -319,6 +320,8 @@ int nvme_get_features(struct nvme_ctrl *dev, unsigned fid, unsigned nsid,
+ 					dma_addr_t dma_addr, u32 *result)
+ {
+ 	struct nvme_command c;
++	struct nvme_completion cqe;
++	int ret;
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.features.opcode = nvme_admin_get_features;
+@@ -326,13 +329,18 @@ int nvme_get_features(struct nvme_ctrl *dev, unsigned fid, unsigned nsid,
+ 	c.features.prp1 = cpu_to_le64(dma_addr);
+ 	c.features.fid = cpu_to_le32(fid);
+ 
+-	return __nvme_submit_sync_cmd(dev->admin_q, &c, NULL, 0, result, 0);
++	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &cqe, NULL, 0, 0);
++	if (ret >= 0)
++		*result = le32_to_cpu(cqe.result);
++	return ret;
+ }
+ 
+ int nvme_set_features(struct nvme_ctrl *dev, unsigned fid, unsigned dword11,
+ 					dma_addr_t dma_addr, u32 *result)
+ {
+ 	struct nvme_command c;
++	struct nvme_completion cqe;
++	int ret;
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.features.opcode = nvme_admin_set_features;
+@@ -340,7 +348,10 @@ int nvme_set_features(struct nvme_ctrl *dev, unsigned fid, unsigned dword11,
+ 	c.features.fid = cpu_to_le32(fid);
+ 	c.features.dword11 = cpu_to_le32(dword11);
+ 
+-	return __nvme_submit_sync_cmd(dev->admin_q, &c, NULL, 0, result, 0);
++	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &cqe, NULL, 0, 0);
++	if (ret >= 0)
++		*result = le32_to_cpu(cqe.result);
++	return ret;
+ }
+ 
+ int nvme_get_log_page(struct nvme_ctrl *dev, struct nvme_smart_log **log)
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index a3f9890d24dc..9c18054267b9 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -255,7 +255,8 @@ void nvme_requeue_req(struct request *req);
+ int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		void *buf, unsigned bufflen);
+ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+-		void *buffer, unsigned bufflen,  u32 *result, unsigned timeout);
++		struct nvme_completion *cqe, void *buffer, unsigned bufflen,
++		unsigned timeout);
+ int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		void __user *ubuffer, unsigned bufflen, u32 *result,
+ 		unsigned timeout);
+* Unmerged path drivers/nvme/host/pci.c
