@@ -1,0 +1,279 @@
+scsi: smartpqi: add suspend and resume support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] smartpqi: add suspend and resume support (Don Brace) [1457414]
+Rebuild_FUZZ: 93.02%
+commit-author Kevin Barnett <kevin.barnett@microsemi.com>
+commit 061ef06a2d436cea85984cf0b51b452547a5496c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/061ef06a.failed
+
+add support for ACPI S3 (suspend) and S4 (hibernate)
+system power states.
+
+	Reviewed-by: Scott Benesh <scott.benesh@microsemi.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microsemi.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 061ef06a2d436cea85984cf0b51b452547a5496c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index 67177749ea48,7af4add16276..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -3034,11 -3149,7 +3170,15 @@@ static int pqi_enable_msix_interrupts(s
+  	}
+  
+  	ctrl_info->num_msix_vectors_enabled = num_vectors_enabled;
+++<<<<<<< HEAD
+ +	for (i = 0; i < num_vectors_enabled; i++) {
+ +		ctrl_info->msix_vectors[i] = msix_entries[i].vector;
+ +		ctrl_info->intr_data[i] = &ctrl_info->queue_groups[i];
+ +	}
+ +
+++=======
++ 	ctrl_info->irq_mode = IRQ_MODE_MSIX;
+++>>>>>>> 061ef06a2d43 (scsi: smartpqi: add suspend and resume support)
+  	return 0;
+  }
+  
+@@@ -4255,22 -4343,16 +4392,23 @@@ static void pqi_calculate_queue_resourc
+  	u16 num_elements_per_iq;
+  	u16 num_elements_per_oq;
+  
+ -	max_queue_groups = min(ctrl_info->max_inbound_queues / 2,
+ -		ctrl_info->max_outbound_queues - 1);
+ -	max_queue_groups = min(max_queue_groups, PQI_MAX_QUEUE_GROUPS);
+ +	if (reset_devices) {
+ +		num_queue_groups = 1;
+ +	} else {
+ +		int num_cpus;
+ +		int max_queue_groups;
+  
+ -	num_cpus = num_online_cpus();
+ -	num_queue_groups = min(num_cpus, ctrl_info->max_msix_vectors);
+ -	num_queue_groups = min(num_queue_groups, max_queue_groups);
+ +		max_queue_groups = min(ctrl_info->max_inbound_queues / 2,
+ +			ctrl_info->max_outbound_queues - 1);
+ +		max_queue_groups = min(max_queue_groups, PQI_MAX_QUEUE_GROUPS);
+ +
+ +		num_cpus = num_online_cpus();
+ +		num_queue_groups = min(num_cpus, ctrl_info->max_msix_vectors);
+ +		num_queue_groups = min(num_queue_groups, max_queue_groups);
+ +	}
+  
+  	ctrl_info->num_queue_groups = num_queue_groups;
++ 	ctrl_info->max_hw_queue_index = num_queue_groups - 1;
+  
+  	/*
+  	 * Make sure that the max. inbound IU length is an even multiple
+diff --git a/drivers/scsi/smartpqi/smartpqi.h b/drivers/scsi/smartpqi/smartpqi.h
+index 6c9e77cf450e..1f42cb0fee9d 100644
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@ -61,7 +61,7 @@ struct pqi_device_registers {
+ /*
+  * controller registers
+  *
+- * These are defined by the PMC implementation.
++ * These are defined by the Microsemi implementation.
+  *
+  * Some registers (those named sis_*) are only used when in
+  * legacy SIS mode before we transition the controller into
+@@ -102,6 +102,12 @@ enum pqi_io_path {
+ 	AIO_PATH = 1
+ };
+ 
++enum pqi_irq_mode {
++	IRQ_MODE_NONE,
++	IRQ_MODE_INTX,
++	IRQ_MODE_MSIX
++};
++
+ struct pqi_sg_descriptor {
+ 	__le64	address;
+ 	__le32	length;
+@@ -910,7 +916,7 @@ struct pqi_ctrl_info {
+ 	dma_addr_t	error_buffer_dma_handle;
+ 	size_t		sg_chain_buffer_length;
+ 	unsigned int	num_queue_groups;
+-	unsigned int	num_active_queue_groups;
++	u16		max_hw_queue_index;
+ 	u16		num_elements_per_iq;
+ 	u16		num_elements_per_oq;
+ 	u16		max_inbound_iu_length_per_firmware;
+@@ -925,6 +931,7 @@ struct pqi_ctrl_info {
+ 	struct pqi_admin_queues admin_queues;
+ 	struct pqi_queue_group queue_groups[PQI_MAX_QUEUE_GROUPS];
+ 	struct pqi_event_queue event_queue;
++	enum pqi_irq_mode irq_mode;
+ 	int		max_msix_vectors;
+ 	int		num_msix_vectors_enabled;
+ 	int		num_msix_vectors_initialized;
+@@ -941,6 +948,7 @@ struct pqi_ctrl_info {
+ 	u8		outbound_spanning_supported : 1;
+ 	u8		pqi_mode_enabled : 1;
+ 	u8		heartbeat_timer_started : 1;
++	u8		update_time_worker_scheduled : 1;
+ 
+ 	struct list_head scsi_device_list;
+ 	spinlock_t	scsi_device_list_lock;
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
+diff --git a/drivers/scsi/smartpqi/smartpqi_sis.c b/drivers/scsi/smartpqi/smartpqi_sis.c
+index c5325a4d0f0f..12853fd75550 100644
+--- a/drivers/scsi/smartpqi/smartpqi_sis.c
++++ b/drivers/scsi/smartpqi/smartpqi_sis.c
+@@ -33,6 +33,7 @@
+ /* for submission of legacy SIS commands */
+ #define SIS_REENABLE_SIS_MODE			0x1
+ #define SIS_ENABLE_MSIX				0x40
++#define SIS_ENABLE_INTX				0x80
+ #define SIS_SOFT_RESET				0x100
+ #define SIS_TRIGGER_SHUTDOWN			0x800000
+ #define SIS_CMD_READY				0x200
+@@ -56,6 +57,7 @@
+ #define SIS_CTRL_KERNEL_UP			0x80
+ #define SIS_CTRL_KERNEL_PANIC			0x100
+ #define SIS_CTRL_READY_TIMEOUT_SECS		30
++#define SIS_CTRL_READY_RESUME_TIMEOUT_SECS	90
+ #define SIS_CTRL_READY_POLL_INTERVAL_MSECS	10
+ 
+ #pragma pack(1)
+@@ -79,12 +81,13 @@ struct sis_base_struct {
+ 
+ #pragma pack()
+ 
+-int sis_wait_for_ctrl_ready(struct pqi_ctrl_info *ctrl_info)
++static int sis_wait_for_ctrl_ready_with_timeout(struct pqi_ctrl_info *ctrl_info,
++	unsigned int timeout_secs)
+ {
+ 	unsigned long timeout;
+ 	u32 status;
+ 
+-	timeout = (SIS_CTRL_READY_TIMEOUT_SECS * HZ) + jiffies;
++	timeout = (timeout_secs * HZ) + jiffies;
+ 
+ 	while (1) {
+ 		status = readl(&ctrl_info->registers->sis_firmware_status);
+@@ -107,6 +110,18 @@ int sis_wait_for_ctrl_ready(struct pqi_ctrl_info *ctrl_info)
+ 	return 0;
+ }
+ 
++int sis_wait_for_ctrl_ready(struct pqi_ctrl_info *ctrl_info)
++{
++	return sis_wait_for_ctrl_ready_with_timeout(ctrl_info,
++		SIS_CTRL_READY_TIMEOUT_SECS);
++}
++
++int sis_wait_for_ctrl_ready_resume(struct pqi_ctrl_info *ctrl_info)
++{
++	return sis_wait_for_ctrl_ready_with_timeout(ctrl_info,
++		SIS_CTRL_READY_RESUME_TIMEOUT_SECS);
++}
++
+ bool sis_is_firmware_running(struct pqi_ctrl_info *ctrl_info)
+ {
+ 	bool running;
+@@ -315,6 +330,34 @@ out:
+ 	return rc;
+ }
+ 
++#define SIS_DOORBELL_BIT_CLEAR_TIMEOUT_SECS	30
++
++static void sis_wait_for_doorbell_bit_to_clear(
++	struct pqi_ctrl_info *ctrl_info, u32 bit)
++{
++	u32 doorbell_register;
++	unsigned long timeout;
++
++	timeout = (SIS_DOORBELL_BIT_CLEAR_TIMEOUT_SECS * HZ) + jiffies;
++
++	while (1) {
++		doorbell_register =
++			readl(&ctrl_info->registers->sis_host_to_ctrl_doorbell);
++		if ((doorbell_register & bit) == 0)
++			break;
++		if (readl(&ctrl_info->registers->sis_firmware_status) &
++			SIS_CTRL_KERNEL_PANIC)
++			break;
++		if (time_after(jiffies, timeout)) {
++			dev_err(&ctrl_info->pci_dev->dev,
++				"doorbell register bit 0x%x not cleared\n",
++				bit);
++			break;
++		}
++		usleep_range(1000, 2000);
++	}
++}
++
+ /* Enable MSI-X interrupts on the controller. */
+ 
+ void sis_enable_msix(struct pqi_ctrl_info *ctrl_info)
+@@ -327,6 +370,8 @@ void sis_enable_msix(struct pqi_ctrl_info *ctrl_info)
+ 
+ 	writel(doorbell_register,
+ 		&ctrl_info->registers->sis_host_to_ctrl_doorbell);
++
++	sis_wait_for_doorbell_bit_to_clear(ctrl_info, SIS_ENABLE_MSIX);
+ }
+ 
+ /* Disable MSI-X interrupts on the controller. */
+@@ -343,6 +388,32 @@ void sis_disable_msix(struct pqi_ctrl_info *ctrl_info)
+ 		&ctrl_info->registers->sis_host_to_ctrl_doorbell);
+ }
+ 
++void sis_enable_intx(struct pqi_ctrl_info *ctrl_info)
++{
++	u32 doorbell_register;
++
++	doorbell_register =
++		readl(&ctrl_info->registers->sis_host_to_ctrl_doorbell);
++	doorbell_register |= SIS_ENABLE_INTX;
++
++	writel(doorbell_register,
++		&ctrl_info->registers->sis_host_to_ctrl_doorbell);
++
++	sis_wait_for_doorbell_bit_to_clear(ctrl_info, SIS_ENABLE_INTX);
++}
++
++void sis_disable_intx(struct pqi_ctrl_info *ctrl_info)
++{
++	u32 doorbell_register;
++
++	doorbell_register =
++		readl(&ctrl_info->registers->sis_host_to_ctrl_doorbell);
++	doorbell_register &= ~SIS_ENABLE_INTX;
++
++	writel(doorbell_register,
++		&ctrl_info->registers->sis_host_to_ctrl_doorbell);
++}
++
+ void sis_soft_reset(struct pqi_ctrl_info *ctrl_info)
+ {
+ 	writel(SIS_SOFT_RESET,
+diff --git a/drivers/scsi/smartpqi/smartpqi_sis.h b/drivers/scsi/smartpqi/smartpqi_sis.h
+index 157768d939a9..08ee0abb8656 100644
+--- a/drivers/scsi/smartpqi/smartpqi_sis.h
++++ b/drivers/scsi/smartpqi/smartpqi_sis.h
+@@ -20,6 +20,7 @@
+ #define _SMARTPQI_SIS_H
+ 
+ int sis_wait_for_ctrl_ready(struct pqi_ctrl_info *ctrl_info);
++int sis_wait_for_ctrl_ready_resume(struct pqi_ctrl_info *ctrl_info);
+ bool sis_is_firmware_running(struct pqi_ctrl_info *ctrl_info);
+ bool sis_is_kernel_up(struct pqi_ctrl_info *ctrl_info);
+ int sis_get_ctrl_properties(struct pqi_ctrl_info *ctrl_info);
+@@ -27,6 +28,8 @@ int sis_get_pqi_capabilities(struct pqi_ctrl_info *ctrl_info);
+ int sis_init_base_struct_addr(struct pqi_ctrl_info *ctrl_info);
+ void sis_enable_msix(struct pqi_ctrl_info *ctrl_info);
+ void sis_disable_msix(struct pqi_ctrl_info *ctrl_info);
++void sis_enable_intx(struct pqi_ctrl_info *ctrl_info);
++void sis_disable_intx(struct pqi_ctrl_info *ctrl_info);
+ void sis_soft_reset(struct pqi_ctrl_info *ctrl_info);
+ void sis_shutdown_ctrl(struct pqi_ctrl_info *ctrl_info);
+ int sis_reenable_sis_mode(struct pqi_ctrl_info *ctrl_info);
