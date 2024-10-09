@@ -194,7 +194,6 @@ struct synaptics_data {
 	bool disable_gesture;			/* disable gestures */
 
 	struct serio *pt_port;			/* Pass-through serio port */
-	unsigned char pt_buttons;		/* Pass-through buttons */
 
 	struct synaptics_mt_state mt_state;	/* Current mt finger state */
 	bool mt_state_lost;			/* mt_state may be incorrect */
