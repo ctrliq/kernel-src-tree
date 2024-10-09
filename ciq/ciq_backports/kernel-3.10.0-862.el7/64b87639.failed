@@ -1,0 +1,178 @@
+netfilter: conntrack: fix race between nf_conntrack proc read and hash resize
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Liping Zhang <liping.zhang@spreadtrum.com>
+commit 64b87639c9cbeb03e26bc65528416c961b1dde96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/64b87639.failed
+
+When we do "cat /proc/net/nf_conntrack", and meanwhile resize the conntrack
+hash table via /sys/module/nf_conntrack/parameters/hashsize, race will
+happen, because reader can observe a newly allocated hash but the old size
+(or vice versa). So oops will happen like follows：
+
+  BUG: unable to handle kernel NULL pointer dereference at 0000000000000017
+  IP: [<ffffffffa0418e21>] seq_print_acct+0x11/0x50 [nf_conntrack]
+  Call Trace:
+  [<ffffffffa0412f4e>] ? ct_seq_show+0x14e/0x340 [nf_conntrack]
+  [<ffffffff81261a1c>] seq_read+0x2cc/0x390
+  [<ffffffff812a8d62>] proc_reg_read+0x42/0x70
+  [<ffffffff8123bee7>] __vfs_read+0x37/0x130
+  [<ffffffff81347980>] ? security_file_permission+0xa0/0xc0
+  [<ffffffff8123cf75>] vfs_read+0x95/0x140
+  [<ffffffff8123e475>] SyS_read+0x55/0xc0
+  [<ffffffff817c2572>] entry_SYSCALL_64_fastpath+0x1a/0xa4
+
+It is very easy to reproduce this kernel crash.
+1. open one shell and input the following cmds:
+  while : ; do
+    echo $RANDOM > /sys/module/nf_conntrack/parameters/hashsize
+  done
+2. open more shells and input the following cmds:
+  while : ; do
+    cat /proc/net/nf_conntrack
+  done
+3. just wait a monent, oops will happen soon.
+
+The solution in this patch is based on Florian's Commit 5e3c61f98175
+("netfilter: conntrack: fix lookup race during hash resize"). And
+add a wrapper function nf_conntrack_get_ht to get hash and hsize
+suggested by Florian Westphal.
+
+	Signed-off-by: Liping Zhang <liping.zhang@spreadtrum.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 64b87639c9cbeb03e26bc65528416c961b1dde96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/netfilter/nf_conntrack_l3proto_ipv4_compat.c
+#	net/netfilter/nf_conntrack_standalone.c
+diff --cc net/ipv4/netfilter/nf_conntrack_l3proto_ipv4_compat.c
+index 4c48e434bb1f,63923710f325..000000000000
+--- a/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4_compat.c
++++ b/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4_compat.c
+@@@ -36,10 -37,10 +38,17 @@@ static struct hlist_nulls_node *ct_get_
+  	struct hlist_nulls_node *n;
+  
+  	for (st->bucket = 0;
+++<<<<<<< HEAD
+ +	     st->bucket < net->ct.htable_size;
+ +	     st->bucket++) {
+ +		n = rcu_dereference(
+ +			hlist_nulls_first_rcu(&net->ct.hash[st->bucket]));
+++=======
++ 	     st->bucket < st->htable_size;
++ 	     st->bucket++) {
++ 		n = rcu_dereference(
++ 			hlist_nulls_first_rcu(&st->hash[st->bucket]));
+++>>>>>>> 64b87639c9cb (netfilter: conntrack: fix race between nf_conntrack proc read and hash resize)
+  		if (!is_a_nulls(n))
+  			return n;
+  	}
+@@@ -55,11 -55,11 +64,19 @@@ static struct hlist_nulls_node *ct_get_
+  	head = rcu_dereference(hlist_nulls_next_rcu(head));
+  	while (is_a_nulls(head)) {
+  		if (likely(get_nulls_value(head) == st->bucket)) {
+++<<<<<<< HEAD
+ +			if (++st->bucket >= net->ct.htable_size)
+ +				return NULL;
+ +		}
+ +		head = rcu_dereference(
+ +			hlist_nulls_first_rcu(&net->ct.hash[st->bucket]));
+++=======
++ 			if (++st->bucket >= st->htable_size)
++ 				return NULL;
++ 		}
++ 		head = rcu_dereference(
++ 			hlist_nulls_first_rcu(&st->hash[st->bucket]));
+++>>>>>>> 64b87639c9cb (netfilter: conntrack: fix race between nf_conntrack proc read and hash resize)
+  	}
+  	return head;
+  }
+diff --cc net/netfilter/nf_conntrack_standalone.c
+index 4a2ef1cad28a,958a1455ca7f..000000000000
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@@ -58,9 -60,10 +60,16 @@@ static struct hlist_nulls_node *ct_get_
+  	struct hlist_nulls_node *n;
+  
+  	for (st->bucket = 0;
+++<<<<<<< HEAD
+ +	     st->bucket < net->ct.htable_size;
+ +	     st->bucket++) {
+ +		n = rcu_dereference(hlist_nulls_first_rcu(&net->ct.hash[st->bucket]));
+++=======
++ 	     st->bucket < st->htable_size;
++ 	     st->bucket++) {
++ 		n = rcu_dereference(
++ 			hlist_nulls_first_rcu(&st->hash[st->bucket]));
+++>>>>>>> 64b87639c9cb (netfilter: conntrack: fix race between nf_conntrack proc read and hash resize)
+  		if (!is_a_nulls(n))
+  			return n;
+  	}
+@@@ -76,12 -78,11 +85,20 @@@ static struct hlist_nulls_node *ct_get_
+  	head = rcu_dereference(hlist_nulls_next_rcu(head));
+  	while (is_a_nulls(head)) {
+  		if (likely(get_nulls_value(head) == st->bucket)) {
+++<<<<<<< HEAD
+ +			if (++st->bucket >= net->ct.htable_size)
+ +				return NULL;
+ +		}
+ +		head = rcu_dereference(
+ +				hlist_nulls_first_rcu(
+ +					&net->ct.hash[st->bucket]));
+++=======
++ 			if (++st->bucket >= st->htable_size)
++ 				return NULL;
++ 		}
++ 		head = rcu_dereference(
++ 			hlist_nulls_first_rcu(&st->hash[st->bucket]));
+++>>>>>>> 64b87639c9cb (netfilter: conntrack: fix race between nf_conntrack proc read and hash resize)
+  	}
+  	return head;
+  }
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index 879b7ab34d59..0d878ddf031f 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -50,6 +50,8 @@ bool nf_ct_invert_tuple(struct nf_conntrack_tuple *inverse,
+ 			const struct nf_conntrack_l3proto *l3proto,
+ 			const struct nf_conntrack_l4proto *l4proto);
+ 
++void nf_conntrack_get_ht(struct hlist_nulls_head **hash, unsigned int *hsize);
++
+ /* Find a connection corresponding to a tuple. */
+ struct nf_conntrack_tuple_hash *
+ nf_conntrack_find_get(struct net *net,
+* Unmerged path net/ipv4/netfilter/nf_conntrack_l3proto_ipv4_compat.c
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index 5140736f7cea..e5a6e9066dc4 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -472,6 +472,23 @@ nf_ct_key_equal(struct nf_conntrack_tuple_hash *h,
+ 	       nf_ct_is_confirmed(ct);
+ }
+ 
++/* must be called with rcu read lock held */
++void nf_conntrack_get_ht(struct hlist_nulls_head **hash, unsigned int *hsize)
++{
++	struct hlist_nulls_head *hptr;
++	unsigned int sequence, hsz;
++
++	do {
++		sequence = read_seqcount_begin(&nf_conntrack_generation);
++		hsz = nf_conntrack_htable_size;
++		hptr = nf_conntrack_hash;
++	} while (read_seqcount_retry(&nf_conntrack_generation, sequence));
++
++	*hash = hptr;
++	*hsize = hsz;
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_get_ht);
++
+ /*
+  * Warning :
+  * - Caller must take a reference on returned object
+* Unmerged path net/netfilter/nf_conntrack_standalone.c
