@@ -1,0 +1,172 @@
+KVM: nVMX: fixes to nested virt interrupt injection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit b96fb439774e1bfb7d027ad324fa48606167cb52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b96fb439.failed
+
+There are three issues in nested_vmx_check_exception:
+
+1) it is not taking PFEC_MATCH/PFEC_MASK into account, as reported
+by Wanpeng Li;
+
+2) it should rebuild the interruption info and exit qualification fields
+from scratch, as reported by Jim Mattson, because the values from the
+L2->L0 vmexit may be invalid (e.g. if an emulated instruction causes
+a page fault, the EPT misconfig's exit qualification is incorrect).
+
+3) CR2 and DR6 should not be written for exception intercept vmexits
+(CR2 only for AMD).
+
+This patch fixes the first two and adds a comment about the last,
+outlining the fix.
+
+	Cc: Jim Mattson <jmattson@google.com>
+	Cc: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b96fb439774e1bfb7d027ad324fa48606167cb52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/svm.c
+index 41bd682455e1,1107626938cc..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -2626,12 -2426,26 +2626,29 @@@ static int nested_svm_check_exception(s
+  	svm->vmcb->control.exit_code = SVM_EXIT_EXCP_BASE + nr;
+  	svm->vmcb->control.exit_code_hi = 0;
+  	svm->vmcb->control.exit_info_1 = error_code;
+++<<<<<<< HEAD
+ +	svm->vmcb->control.exit_info_2 = svm->vcpu.arch.cr2;
+ +
+ +	vmexit = nested_svm_intercept(svm);
+ +	if (vmexit == NESTED_EXIT_DONE)
+ +		svm->nested.exit_required = true;
+++=======
++ 
++ 	/*
++ 	 * FIXME: we should not write CR2 when L1 intercepts an L2 #PF exception.
++ 	 * The fix is to add the ancillary datum (CR2 or DR6) to structs
++ 	 * kvm_queued_exception and kvm_vcpu_events, so that CR2 and DR6 can be
++ 	 * written only when inject_pending_event runs (DR6 would written here
++ 	 * too).  This should be conditional on a new capability---if the
++ 	 * capability is disabled, kvm_multiple_exception would write the
++ 	 * ancillary information to CR2 or DR6, for backwards ABI-compatibility.
++ 	 */
++ 	if (svm->vcpu.arch.exception.nested_apf)
++ 		svm->vmcb->control.exit_info_2 = svm->vcpu.arch.apf.nested_apf_token;
++ 	else
++ 		svm->vmcb->control.exit_info_2 = svm->vcpu.arch.cr2;
+++>>>>>>> b96fb439774e (KVM: nVMX: fixes to nested virt interrupt injection)
+  
+ -	svm->nested.exit_required = true;
+  	return vmexit;
+  }
+  
+diff --cc arch/x86/kvm/vmx.c
+index e9f488a93e48,714d4364ef87..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -1087,9 -927,10 +1087,16 @@@ static u32 vmx_segment_access_rights(st
+  static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx);
+  static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx);
+  static int alloc_identity_pagetable(struct kvm *kvm);
+++<<<<<<< HEAD
+ +static void vmx_update_msr_bitmap(struct kvm_vcpu *vcpu);
+ +static void __always_inline vmx_disable_intercept_for_msr(unsigned long *msr_bitmap,
+ +							  u32 msr, int type);
+++=======
++ static bool vmx_get_nmi_mask(struct kvm_vcpu *vcpu);
++ static void vmx_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked);
++ static bool nested_vmx_is_page_fault_vmexit(struct vmcs12 *vmcs12,
++ 					    u16 error_code);
+++>>>>>>> b96fb439774e (KVM: nVMX: fixes to nested virt interrupt injection)
+  
+  static DEFINE_PER_CPU(struct vmcs *, vmxarea);
+  static DEFINE_PER_CPU(struct vmcs *, current_vmcs);
+@@@ -2640,17 -2460,43 +2671,52 @@@ static void nested_vmx_inject_exception
+   * KVM wants to inject page-faults which it got to the guest. This function
+   * checks whether in a nested guest, we need to inject them to L1 or L2.
+   */
+ -static int nested_vmx_check_exception(struct kvm_vcpu *vcpu)
+ +static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned nr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ -	unsigned int nr = vcpu->arch.exception.nr;
+  
+++<<<<<<< HEAD
+ +	if (!(vmcs12->exception_bitmap & (1u << nr)))
+ +		return 0;
+ +
+ +	nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
+ +			  vmcs_read32(VM_EXIT_INTR_INFO),
+ +			  vmcs_readl(EXIT_QUALIFICATION));
+ +	return 1;
+++=======
++ 	if (nr == PF_VECTOR) {
++ 		if (vcpu->arch.exception.nested_apf) {
++ 			nested_vmx_inject_exception_vmexit(vcpu,
++ 							   vcpu->arch.apf.nested_apf_token);
++ 			return 1;
++ 		}
++ 		/*
++ 		 * FIXME: we must not write CR2 when L1 intercepts an L2 #PF exception.
++ 		 * The fix is to add the ancillary datum (CR2 or DR6) to structs
++ 		 * kvm_queued_exception and kvm_vcpu_events, so that CR2 and DR6
++ 		 * can be written only when inject_pending_event runs.  This should be
++ 		 * conditional on a new capability---if the capability is disabled,
++ 		 * kvm_multiple_exception would write the ancillary information to
++ 		 * CR2 or DR6, for backwards ABI-compatibility.
++ 		 */
++ 		if (nested_vmx_is_page_fault_vmexit(vmcs12,
++ 						    vcpu->arch.exception.error_code)) {
++ 			nested_vmx_inject_exception_vmexit(vcpu, vcpu->arch.cr2);
++ 			return 1;
++ 		}
++ 	} else {
++ 		unsigned long exit_qual = 0;
++ 		if (nr == DB_VECTOR)
++ 			exit_qual = vcpu->arch.dr6;
++ 
++ 		if (vmcs12->exception_bitmap & (1u << nr)) {
++ 			nested_vmx_inject_exception_vmexit(vcpu, exit_qual);
++ 			return 1;
++ 		}
++ 	}
++ 
++ 	return 0;
+++>>>>>>> b96fb439774e (KVM: nVMX: fixes to nested virt interrupt injection)
+  }
+  
+  static void vmx_queue_exception(struct kvm_vcpu *vcpu)
+@@@ -9738,12 -9570,15 +9804,22 @@@ static void vmx_inject_page_fault_neste
+  
+  	WARN_ON(!is_guest_mode(vcpu));
+  
+++<<<<<<< HEAD
+ +	if (nested_vmx_is_page_fault_vmexit(vmcs12, fault->error_code))
+ +		nested_vmx_vmexit(vcpu, to_vmx(vcpu)->exit_reason,
+ +				  vmcs_read32(VM_EXIT_INTR_INFO),
+ +				  vmcs_readl(EXIT_QUALIFICATION));
+ +	else
+++=======
++ 	if (nested_vmx_is_page_fault_vmexit(vmcs12, fault->error_code)) {
++ 		vmcs12->vm_exit_intr_error_code = fault->error_code;
++ 		nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
++ 				  PF_VECTOR | INTR_TYPE_HARD_EXCEPTION |
++ 				  INTR_INFO_DELIVER_CODE_MASK | INTR_INFO_VALID_MASK,
++ 				  fault->address);
++ 	} else {
+++>>>>>>> b96fb439774e (KVM: nVMX: fixes to nested virt interrupt injection)
+  		kvm_inject_page_fault(vcpu, fault);
+ -	}
+  }
+  
+  static inline bool nested_vmx_merge_msr_bitmap(struct kvm_vcpu *vcpu,
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
