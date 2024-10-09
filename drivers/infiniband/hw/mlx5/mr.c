@@ -73,8 +73,7 @@ static int destroy_mkey(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
 
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
 	/* Wait until all page fault handlers using the mr complete. */
-	if (mr->umem && mr->umem->is_odp)
-		synchronize_srcu(&dev->mr_srcu);
+	synchronize_srcu(&dev->mr_srcu);
 #endif
 
 	return err;
@@ -236,9 +235,6 @@ static void remove_keys(struct mlx5_ib_dev *dev, int c, int num)
 {
 	struct mlx5_mr_cache *cache = &dev->cache;
 	struct mlx5_cache_ent *ent = &cache->ent[c];
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	bool odp_mkey_exist = false;
-#endif
 	struct mlx5_ib_mr *tmp_mr;
 	struct mlx5_ib_mr *mr;
 	LIST_HEAD(del_list);
@@ -251,10 +247,6 @@ static void remove_keys(struct mlx5_ib_dev *dev, int c, int num)
 			break;
 		}
 		mr = list_first_entry(&ent->head, struct mlx5_ib_mr, list);
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-		if (mr->umem && mr->umem->is_odp)
-			odp_mkey_exist = true;
-#endif
 		list_move(&mr->list, &del_list);
 		ent->cur--;
 		ent->size--;
@@ -263,8 +255,7 @@ static void remove_keys(struct mlx5_ib_dev *dev, int c, int num)
 	}
 
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	if (odp_mkey_exist)
-		synchronize_srcu(&dev->mr_srcu);
+	synchronize_srcu(&dev->mr_srcu);
 #endif
 
 	list_for_each_entry_safe(mr, tmp_mr, &del_list, list) {
@@ -579,7 +570,6 @@ static void clean_keys(struct mlx5_ib_dev *dev, int c)
 {
 	struct mlx5_mr_cache *cache = &dev->cache;
 	struct mlx5_cache_ent *ent = &cache->ent[c];
-	bool odp_mkey_exist = false;
 	struct mlx5_ib_mr *tmp_mr;
 	struct mlx5_ib_mr *mr;
 	LIST_HEAD(del_list);
@@ -592,8 +582,6 @@ static void clean_keys(struct mlx5_ib_dev *dev, int c)
 			break;
 		}
 		mr = list_first_entry(&ent->head, struct mlx5_ib_mr, list);
-		if (mr->umem && mr->umem->is_odp)
-			odp_mkey_exist = true;
 		list_move(&mr->list, &del_list);
 		ent->cur--;
 		ent->size--;
@@ -602,8 +590,7 @@ static void clean_keys(struct mlx5_ib_dev *dev, int c)
 	}
 
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	if (odp_mkey_exist)
-		synchronize_srcu(&dev->mr_srcu);
+	synchronize_srcu(&dev->mr_srcu);
 #endif
 
 	list_for_each_entry_safe(mr, tmp_mr, &del_list, list) {
