@@ -1,0 +1,192 @@
+mmc: block: Factor out mmc_setup_queue()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Factor out mmc_setup_queue() (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 93.33%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit c8b5fd031a3004dc382e201f69ea9a44ec62c04f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c8b5fd03.failed
+
+Factor out some common code that will also be used with blk-mq.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit c8b5fd031a3004dc382e201f69ea9a44ec62c04f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/queue.c
+diff --cc drivers/mmc/core/queue.c
+index b0ae9d688e28,4f33d277b125..000000000000
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@@ -223,41 -168,38 +223,64 @@@ static int mmc_queue_alloc_bounce_sgs(s
+  
+  	return 0;
+  }
+ +#endif
+ +
+ +static int mmc_queue_alloc_sgs(struct mmc_queue *mq, int max_segs)
+ +{
+ +	int i, ret;
+ +
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].sg = mmc_alloc_sg(max_segs, &ret);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static void mmc_queue_req_free_bufs(struct mmc_queue_req *mqrq)
+ +{
+ +	kfree(mqrq->bounce_sg);
+ +	mqrq->bounce_sg = NULL;
+ +
+ +	kfree(mqrq->sg);
+ +	mqrq->sg = NULL;
+ +
+ +	kfree(mqrq->bounce_buf);
+ +	mqrq->bounce_buf = NULL;
+ +}
+  
+ -static void mmc_exit_request(struct request_queue *q, struct request *req)
+ +static void mmc_queue_reqs_free_bufs(struct mmc_queue *mq)
+  {
+ -	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
+ +	int i;
+  
+ -	kfree(mq_rq->sg);
+ -	mq_rq->sg = NULL;
+ +	for (i = 0; i < mq->qdepth; i++)
+ +		mmc_queue_req_free_bufs(&mq->mqrq[i]);
+  }
+  
++ static void mmc_setup_queue(struct mmc_queue *mq, struct mmc_card *card)
++ {
++ 	struct mmc_host *host = card->host;
++ 	u64 limit = BLK_BOUNCE_HIGH;
++ 
++ 	if (mmc_dev(host)->dma_mask && *mmc_dev(host)->dma_mask)
++ 		limit = (u64)dma_max_pfn(mmc_dev(host)) << PAGE_SHIFT;
++ 
++ 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, mq->queue);
++ 	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, mq->queue);
++ 	if (mmc_can_erase(card))
++ 		mmc_queue_setup_discard(mq->queue, card);
++ 
++ 	blk_queue_bounce_limit(mq->queue, limit);
++ 	blk_queue_max_hw_sectors(mq->queue,
++ 		min(host->max_blk_count, host->max_req_size / 512));
++ 	blk_queue_max_segments(mq->queue, host->max_segs);
++ 	blk_queue_max_segment_size(mq->queue, host->max_seg_size);
++ 
++ 	/* Initialize thread_sem even if it is not used */
++ 	sema_init(&mq->thread_sem, 1);
++ }
++ 
+  /**
+   * mmc_init_queue - initialise a queue structure.
+   * @mq: mmc queue
+@@@ -271,74 -213,28 +294,79 @@@ int mmc_init_queue(struct mmc_queue *mq
+  		   spinlock_t *lock, const char *subname)
+  {
+  	struct mmc_host *host = card->host;
+++<<<<<<< HEAD
+ +	u64 limit = BLK_BOUNCE_HIGH;
+ +	bool bounce = false;
+ +	int ret = -ENOMEM;
+ +
+ +	if (mmc_dev(host)->dma_mask && *mmc_dev(host)->dma_mask)
+ +		limit = *mmc_dev(host)->dma_mask;
+ +
+++=======
++ 	int ret = -ENOMEM;
++ 
+++>>>>>>> c8b5fd031a30 (mmc: block: Factor out mmc_setup_queue())
+  	mq->card = card;
+ -	mq->queue = blk_alloc_queue(GFP_KERNEL);
+ +	mq->queue = blk_init_queue(mmc_request_fn, lock);
+  	if (!mq->queue)
+  		return -ENOMEM;
+ -	mq->queue->queue_lock = lock;
+ -	mq->queue->request_fn = mmc_request_fn;
+ -	mq->queue->init_rq_fn = mmc_init_request;
+ -	mq->queue->exit_rq_fn = mmc_exit_request;
+ -	mq->queue->cmd_size = sizeof(struct mmc_queue_req);
+ +
+ +	mq->qdepth = 2;
+ +	mq->mqrq = kcalloc(mq->qdepth, sizeof(struct mmc_queue_req),
+ +			   GFP_KERNEL);
+ +	if (!mq->mqrq)
+ +		goto blk_cleanup;
+ +	mq->mqrq_cur = &mq->mqrq[0];
+ +	mq->mqrq_prev = &mq->mqrq[1];
+  	mq->queue->queuedata = mq;
+ -	mq->qcnt = 0;
+ -	ret = blk_init_allocated_queue(mq->queue);
+ -	if (ret) {
+ -		blk_cleanup_queue(mq->queue);
+ -		return ret;
+ -	}
+  
+  	blk_queue_prep_rq(mq->queue, mmc_prep_request);
+- 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, mq->queue);
+- 	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, mq->queue);
+- 	if (mmc_can_erase(card))
+- 		mmc_queue_setup_discard(mq->queue, card);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MMC_BLOCK_BOUNCE
+ +	if (host->max_segs == 1) {
+ +		unsigned int bouncesz;
+ +
+ +		bouncesz = MMC_QUEUE_BOUNCESZ;
+ +
+ +		if (bouncesz > host->max_req_size)
+ +			bouncesz = host->max_req_size;
+ +		if (bouncesz > host->max_seg_size)
+ +			bouncesz = host->max_seg_size;
+ +		if (bouncesz > (host->max_blk_count * 512))
+ +			bouncesz = host->max_blk_count * 512;
+ +
+ +		if (bouncesz > 512 &&
+ +		    mmc_queue_alloc_bounce_bufs(mq, bouncesz)) {
+ +			blk_queue_bounce_limit(mq->queue, BLK_BOUNCE_ANY);
+ +			blk_queue_max_hw_sectors(mq->queue, bouncesz / 512);
+ +			blk_queue_max_segments(mq->queue, bouncesz / 512);
+ +			blk_queue_max_segment_size(mq->queue, bouncesz);
+ +
+ +			ret = mmc_queue_alloc_bounce_sgs(mq, bouncesz);
+ +			if (ret)
+ +				goto cleanup_queue;
+ +			bounce = true;
+ +		}
+ +	}
+ +#endif
+ +
+ +	if (!bounce) {
+ +		blk_queue_bounce_limit(mq->queue, limit);
+ +		blk_queue_max_hw_sectors(mq->queue,
+ +			min(host->max_blk_count, host->max_req_size / 512));
+ +		blk_queue_max_segments(mq->queue, host->max_segs);
+ +		blk_queue_max_segment_size(mq->queue, host->max_seg_size);
+ +
+ +		ret = mmc_queue_alloc_sgs(mq, host->max_segs);
+ +		if (ret)
+ +			goto cleanup_queue;
+ +	}
+ +
+ +	sema_init(&mq->thread_sem, 1);
+++=======
++ 	mmc_setup_queue(mq, card);
+++>>>>>>> c8b5fd031a30 (mmc: block: Factor out mmc_setup_queue())
+  
+  	mq->thread = kthread_run(mmc_queue_thread, mq, "mmcqd/%d%s",
+  		host->index, subname ? subname : "");
+* Unmerged path drivers/mmc/core/queue.c
