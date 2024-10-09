@@ -1,0 +1,205 @@
+ipmi: Rescan channel list on BMC changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit 31b0b0730ad2a813bf6b01c5f1f3629c09c73466
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/31b0b073.failed
+
+If the BMC changes versions or a change is otherwise detected,
+rescan the channels on the BMC.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+(cherry picked from commit 31b0b0730ad2a813bf6b01c5f1f3629c09c73466)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_msghandler.c
+diff --cc drivers/char/ipmi/ipmi_msghandler.c
+index 23529b23ec40,b5fc150e5128..000000000000
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@@ -236,12 -236,13 +236,13 @@@ struct seq_table 
+  
+  #define GET_SEQ_FROM_MSGID(msgid, seq, seqid) \
+  	do {								\
+ -		seq = (((msgid) >> 26) & 0x3f);				\
+ -		seqid = ((msgid) & 0x3ffffff);				\
+ +		seq = ((msgid >> 26) & 0x3f);				\
+ +		seqid = (msgid & 0x3fffff);				\
+  	} while (0)
+  
+ -#define NEXT_SEQID(seqid) (((seqid) + 1) & 0x3ffffff)
+ +#define NEXT_SEQID(seqid) (((seqid) + 1) & 0x3fffff)
+  
++ #define IPMI_MAX_CHANNELS       16
+  struct ipmi_channel {
+  	unsigned char medium;
+  	unsigned char protocol;
+@@@ -548,12 -556,13 +555,22 @@@ struct ipmi_smi 
+  };
+  #define to_si_intf_from_dev(device) container_of(device, struct ipmi_smi, dev)
+  
+++<<<<<<< HEAD
+ +struct ipmi_shadow_smi_handlers shadow_smi_handlers;
+ +struct ipmi_shadow_smi_handlers *ipmi_get_shadow_smi_handlers(void)
+ +{
+ +	return &shadow_smi_handlers;
+ +}
+ +EXPORT_SYMBOL_GPL(ipmi_get_shadow_smi_handlers);
+++=======
++ static void __get_guid(ipmi_smi_t intf);
++ static void __ipmi_bmc_unregister(ipmi_smi_t intf);
++ static int __ipmi_bmc_register(ipmi_smi_t intf,
++ 			       struct ipmi_device_id *id,
++ 			       bool guid_set, u8 *guid, int intf_num);
++ static int __scan_channels(ipmi_smi_t intf, struct ipmi_device_id *id);
++ 
+++>>>>>>> 31b0b0730ad2 (ipmi: Rescan channel list on BMC changes)
+  
+  /**
+   * The driver model view of the IPMI messaging driver.
+@@@ -2255,7 -2269,54 +2277,58 @@@ retry_bmc_lock
+  	if (rv)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	memcpy(&bmc->id, &bmc->fetch_id, sizeof(bmc->id));
+++=======
++ 	/*
++ 	 * The guid, device id, manufacturer id, and product id should
++ 	 * not change on a BMC.  If it does we have to do some dancing.
++ 	 */
++ 	if (!intf->bmc_registered
++ 	    || (!prev_guid_set && bmc->dyn_guid_set)
++ 	    || (!prev_dyn_id_set && bmc->dyn_id_set)
++ 	    || (prev_guid_set && bmc->dyn_guid_set
++ 		&& memcmp(bmc->guid, bmc->fetch_guid, 16))
++ 	    || bmc->id.device_id != bmc->fetch_id.device_id
++ 	    || bmc->id.manufacturer_id != bmc->fetch_id.manufacturer_id
++ 	    || bmc->id.product_id != bmc->fetch_id.product_id) {
++ 		struct ipmi_device_id id = bmc->fetch_id;
++ 		int guid_set = bmc->dyn_guid_set;
++ 		u8 guid[16];
++ 
++ 		memcpy(guid, bmc->fetch_guid, 16);
++ 		mutex_unlock(&bmc->dyn_mutex);
++ 
++ 		__ipmi_bmc_unregister(intf);
++ 		/* Fill in the temporary BMC for good measure. */
++ 		intf->bmc->id = id;
++ 		intf->bmc->dyn_guid_set = guid_set;
++ 		memcpy(intf->bmc->guid, guid, 16);
++ 		if (__ipmi_bmc_register(intf, &id, guid_set, guid, intf_num))
++ 			need_waiter(intf); /* Retry later on an error. */
++ 		else
++ 			__scan_channels(intf, &id);
++ 
++ 
++ 		if (!intf_set) {
++ 			/*
++ 			 * We weren't given the interface on the
++ 			 * command line, so restart the operation on
++ 			 * the next interface for the BMC.
++ 			 */
++ 			mutex_unlock(&intf->bmc_reg_mutex);
++ 			mutex_lock(&bmc->dyn_mutex);
++ 			goto retry_bmc_lock;
++ 		}
++ 
++ 		/* We have a new BMC, set it up. */
++ 		bmc = intf->bmc;
++ 		mutex_lock(&bmc->dyn_mutex);
++ 		goto out_noprocessing;
++ 	} else if (memcmp(&bmc->fetch_id, &bmc->id, sizeof(bmc->id)))
++ 		/* Version info changes, scan the channels again. */
++ 		__scan_channels(intf, &bmc->fetch_id);
+++>>>>>>> 31b0b0730ad2 (ipmi: Rescan channel list on BMC changes)
+  
+  	bmc->dyn_id_expiry = jiffies + IPMI_DYN_DEV_ID_EXPIRY;
+  
+@@@ -3119,13 -3248,13 +3194,14 @@@ channel_handler(ipmi_smi_t intf, struc
+  				 * assume it has one IPMB at channel
+  				 * zero.
+  				 */
+- 				intf->channels[0].medium
++ 				intf->wchannels[set].c[0].medium
+  					= IPMI_CHANNEL_MEDIUM_IPMB;
+- 				intf->channels[0].protocol
++ 				intf->wchannels[set].c[0].protocol
+  					= IPMI_CHANNEL_PROTOCOL_IPMB;
+ +				rv = -ENOSYS;
+  
+- 				intf->curr_channel = IPMI_MAX_CHANNELS;
++ 				intf->channel_list = intf->wchannels + set;
++ 				intf->channels_ready = true;
+  				wake_up(&intf->waitq);
+  				goto out;
+  			}
+@@@ -3148,12 -3283,13 +3230,21 @@@
+  
+  		if (rv) {
+  			/* Got an error somehow, just give up. */
+++<<<<<<< HEAD
+ +			intf->curr_channel = IPMI_MAX_CHANNELS;
+++=======
++ 			printk(KERN_WARNING PFX
++ 			       "Error sending channel information for channel"
++ 			       " %d: %d\n", intf->curr_channel, rv);
++ 
++ 			intf->channel_list = intf->wchannels + set;
++ 			intf->channels_ready = true;
+++>>>>>>> 31b0b0730ad2 (ipmi: Rescan channel list on BMC changes)
+  			wake_up(&intf->waitq);
+ +
+ +			printk(KERN_WARNING PFX
+ +			       "Error sending channel information: %d\n",
+ +			       rv);
+  		}
+  	}
+   out:
+@@@ -3287,33 -3477,11 +3425,41 @@@ int ipmi_register_smi(struct ipmi_smi_h
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	rv = ipmi_bmc_register(intf, i);
+ +	if (rv)
+ +		goto out;
+ +
+ +	if (ipmi_version_major(&id) > 1
+ +			|| (ipmi_version_major(&id) == 1
+ +			    && ipmi_version_minor(&id) >= 5)) {
+ +		/*
+ +		 * Start scanning the channels to see what is
+ +		 * available.
+ +		 */
+ +		intf->null_user_handler = channel_handler;
+ +		intf->curr_channel = 0;
+ +		rv = send_channel_info_cmd(intf, 0);
+ +		if (rv)
+ +			goto out;
+ +
+ +		/* Wait for the channel info to be read. */
+ +		wait_event(intf->waitq,
+ +			   intf->curr_channel >= IPMI_MAX_CHANNELS);
+ +		intf->null_user_handler = NULL;
+ +	} else {
+ +		/* Assume a single IPMB channel at zero. */
+ +		intf->channels[0].medium = IPMI_CHANNEL_MEDIUM_IPMB;
+ +		intf->channels[0].protocol = IPMI_CHANNEL_PROTOCOL_IPMB;
+ +		intf->curr_channel = IPMI_MAX_CHANNELS;
+ +	}
+++=======
++ 	mutex_lock(&intf->bmc_reg_mutex);
++ 	rv = __scan_channels(intf, &id);
++ 	mutex_unlock(&intf->bmc_reg_mutex);
++ 	if (rv)
++ 		goto out;
+++>>>>>>> 31b0b0730ad2 (ipmi: Rescan channel list on BMC changes)
+  
+  	rv = add_proc_entries(intf, i);
+  
+* Unmerged path drivers/char/ipmi/ipmi_msghandler.c
