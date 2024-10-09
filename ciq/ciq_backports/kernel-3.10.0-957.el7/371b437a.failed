@@ -1,0 +1,136 @@
+mlxsw: spectrum: qdiscs: Move qdisc's declarations to its designated file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Nogah Frankel <nogahf@mellanox.com>
+commit 371b437a325172fb009c1919a84d0af38f9b4fce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/371b437a.failed
+
+Move all the qdisc related data from the spectrum.h to spectrum_qdisc.c.
+Create an init and fini functions for the qdiscs.
+
+	Signed-off-by: Nogah Frankel <nogahf@mellanox.com>
+	Reviewed-by: Yuval Mintz <yuvalm@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 371b437a325172fb009c1919a84d0af38f9b4fce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index e8dbdc53d070,b6f475e83474..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@@ -269,7 -246,8 +246,12 @@@ struct mlxsw_sp_port 
+  	} periodic_hw_stats;
+  	struct mlxsw_sp_port_sample *sample;
+  	struct list_head vlans_list;
+++<<<<<<< HEAD
+ +	struct mlxsw_sp_qdisc root_qdisc;
+++=======
++ 	struct mlxsw_sp_qdisc *root_qdisc;
++ 	unsigned acl_rule_count;
+++>>>>>>> 371b437a3251 (mlxsw: spectrum: qdiscs: Move qdisc's declarations to its designated file)
+  };
+  
+  static inline bool
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 927ce93af842..9b421060b056 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -3041,6 +3041,13 @@ static int mlxsw_sp_port_create(struct mlxsw_sp *mlxsw_sp, u8 local_port,
+ 		goto err_port_fids_init;
+ 	}
+ 
++	err = mlxsw_sp_tc_qdisc_init(mlxsw_sp_port);
++	if (err) {
++		dev_err(mlxsw_sp->bus_info->dev, "Port %d: Failed to initialize TC qdiscs\n",
++			mlxsw_sp_port->local_port);
++		goto err_port_qdiscs_init;
++	}
++
+ 	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_get(mlxsw_sp_port, 1);
+ 	if (IS_ERR(mlxsw_sp_port_vlan)) {
+ 		dev_err(mlxsw_sp->bus_info->dev, "Port %d: Failed to create VID 1\n",
+@@ -3069,6 +3076,8 @@ err_register_netdev:
+ 	mlxsw_sp_port_switchdev_fini(mlxsw_sp_port);
+ 	mlxsw_sp_port_vlan_put(mlxsw_sp_port_vlan);
+ err_port_vlan_get:
++	mlxsw_sp_tc_qdisc_fini(mlxsw_sp_port);
++err_port_qdiscs_init:
+ 	mlxsw_sp_port_fids_fini(mlxsw_sp_port);
+ err_port_fids_init:
+ 	mlxsw_sp_port_dcb_fini(mlxsw_sp_port);
+@@ -3104,6 +3113,7 @@ static void mlxsw_sp_port_remove(struct mlxsw_sp *mlxsw_sp, u8 local_port)
+ 	mlxsw_sp->ports[local_port] = NULL;
+ 	mlxsw_sp_port_switchdev_fini(mlxsw_sp_port);
+ 	mlxsw_sp_port_vlan_flush(mlxsw_sp_port);
++	mlxsw_sp_tc_qdisc_fini(mlxsw_sp_port);
+ 	mlxsw_sp_port_fids_fini(mlxsw_sp_port);
+ 	mlxsw_sp_port_dcb_fini(mlxsw_sp_port);
+ 	mlxsw_sp_port_swid_set(mlxsw_sp_port, MLXSW_PORT_SWID_DISABLED_PORT);
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_qdisc.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_qdisc.c
+index b5397da94d7f..86934d3de1fd 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_qdisc.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_qdisc.c
+@@ -41,6 +41,28 @@
+ #include "spectrum.h"
+ #include "reg.h"
+ 
++enum mlxsw_sp_qdisc_type {
++	MLXSW_SP_QDISC_NO_QDISC,
++	MLXSW_SP_QDISC_RED,
++};
++
++struct mlxsw_sp_qdisc {
++	u32 handle;
++	enum mlxsw_sp_qdisc_type type;
++	struct red_stats xstats_base;
++	union {
++		struct {
++			u64 tail_drop_base;
++			u64 ecn_base;
++			u64 wred_drop_base;
++		} red;
++	} xstats;
++	u64 tx_bytes;
++	u64 tx_packets;
++	u64 drops;
++	u64 overlimits;
++};
++
+ static int
+ mlxsw_sp_tclass_congestion_enable(struct mlxsw_sp_port *mlxsw_sp_port,
+ 				  int tclass_num, u32 min, u32 max,
+@@ -252,7 +274,7 @@ int mlxsw_sp_setup_tc_red(struct mlxsw_sp_port *mlxsw_sp_port,
+ 	if (p->parent != TC_H_ROOT)
+ 		return -EOPNOTSUPP;
+ 
+-	mlxsw_sp_qdisc = &mlxsw_sp_port->root_qdisc;
++	mlxsw_sp_qdisc = mlxsw_sp_port->root_qdisc;
+ 	tclass_num = MLXSW_SP_PORT_DEFAULT_TCLASS;
+ 
+ 	switch (p->command) {
+@@ -275,3 +297,18 @@ int mlxsw_sp_setup_tc_red(struct mlxsw_sp_port *mlxsw_sp_port,
+ 		return -EOPNOTSUPP;
+ 	}
+ }
++
++int mlxsw_sp_tc_qdisc_init(struct mlxsw_sp_port *mlxsw_sp_port)
++{
++	mlxsw_sp_port->root_qdisc = kzalloc(sizeof(*mlxsw_sp_port->root_qdisc),
++					    GFP_KERNEL);
++	if (!mlxsw_sp_port->root_qdisc)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void mlxsw_sp_tc_qdisc_fini(struct mlxsw_sp_port *mlxsw_sp_port)
++{
++	kfree(mlxsw_sp_port->root_qdisc);
++}
