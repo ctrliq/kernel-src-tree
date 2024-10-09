@@ -1,0 +1,169 @@
+timer: Further simplify the SMP and HOTPLUG logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 3650b57fdf208bc0e36cbe7b5e0744bd0e0cf34d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3650b57f.failed
+
+Remove one CONFIG_HOTPLUG_CPU #ifdef in trade for introducing one
+CONFIG_SMP #ifdef.
+
+The CONFIG_SMP ifdef avoids declaring the per-CPU __tvec_bases storage
+on UP systems since they already have boot_tvec_bases.
+
+Also (re)add a runtime check on the base alignment -- for the paranoid
+amongst us :-)
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/fdd2d35e169bdc554ffa3fe77f77716298c75ada.1427814611.git.viresh.kumar@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 3650b57fdf208bc0e36cbe7b5e0744bd0e0cf34d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/timer.c
+diff --cc kernel/timer.c
+index da449ea19b18,2ece3aa5069c..000000000000
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@@ -86,11 -88,20 +86,15 @@@ struct tvec_base 
+  	struct tvec tv3;
+  	struct tvec tv4;
+  	struct tvec tv5;
+ +	RH_KABI_EXTEND(unsigned long all_timers)
+  } ____cacheline_aligned;
+  
+ -/*
+ - * __TIMER_INITIALIZER() needs to set ->base to a valid pointer (because we've
+ - * made NULL special, hint: lock_timer_base()) and we cannot get a compile time
+ - * pointer to per-cpu entries because we don't know where we'll map the section,
+ - * even for the boot cpu.
+ - *
+ - * And so we use boot_tvec_bases for boot CPU and per-cpu __tvec_bases for the
+ - * rest of them.
+ - */
+  struct tvec_base boot_tvec_bases;
+  EXPORT_SYMBOL(boot_tvec_bases);
+++<<<<<<< HEAD:kernel/timer.c
+++=======
++ 
+++>>>>>>> 3650b57fdf20 (timer: Further simplify the SMP and HOTPLUG logic):kernel/time/timer.c
+  static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;
+  
+  /* Functions below help us manage 'deferrable' flag */
+@@@ -1632,32 -1596,66 +1637,87 @@@ static void migrate_timers(int cpu
+  static int timer_cpu_notify(struct notifier_block *self,
+  				unsigned long action, void *hcpu)
+  {
+++<<<<<<< HEAD:kernel/timer.c
+ +	long cpu = (long)hcpu;
+ +	int err;
+ +
+ +	switch(action) {
+ +	case CPU_UP_PREPARE:
+ +	case CPU_UP_PREPARE_FROZEN:
+ +		err = init_timers_cpu(cpu);
+ +		if (err < 0)
+ +			return notifier_from_errno(err);
+ +		break;
+ +#ifdef CONFIG_HOTPLUG_CPU
+++=======
++ 	switch (action) {
+++>>>>>>> 3650b57fdf20 (timer: Further simplify the SMP and HOTPLUG logic):kernel/time/timer.c
+  	case CPU_DEAD:
+  	case CPU_DEAD_FROZEN:
+ -		migrate_timers((long)hcpu);
+ +		migrate_timers(cpu);
+  		break;
+ +#endif
+  	default:
+  		break;
+  	}
+++<<<<<<< HEAD:kernel/timer.c
+++=======
++ 
+++>>>>>>> 3650b57fdf20 (timer: Further simplify the SMP and HOTPLUG logic):kernel/time/timer.c
+  	return NOTIFY_OK;
+  }
+  
+- static struct notifier_block timers_nb = {
+- 	.notifier_call	= timer_cpu_notify,
+- };
++ static inline void timer_register_cpu_notifier(void)
++ {
++ 	cpu_notifier(timer_cpu_notify, 0);
++ }
++ #else
++ static inline void timer_register_cpu_notifier(void) { }
++ #endif /* CONFIG_HOTPLUG_CPU */
+  
+++<<<<<<< HEAD:kernel/timer.c
+++=======
++ static void __init init_timer_cpu(struct tvec_base *base, int cpu)
++ {
++ 	int j;
++ 
++ 	BUG_ON(base != tbase_get_base(base));
++ 
++ 	base->cpu = cpu;
++ 	per_cpu(tvec_bases, cpu) = base;
++ 	spin_lock_init(&base->lock);
++ 
++ 	for (j = 0; j < TVN_SIZE; j++) {
++ 		INIT_LIST_HEAD(base->tv5.vec + j);
++ 		INIT_LIST_HEAD(base->tv4.vec + j);
++ 		INIT_LIST_HEAD(base->tv3.vec + j);
++ 		INIT_LIST_HEAD(base->tv2.vec + j);
++ 	}
++ 	for (j = 0; j < TVR_SIZE; j++)
++ 		INIT_LIST_HEAD(base->tv1.vec + j);
++ 
++ 	base->timer_jiffies = jiffies;
++ 	base->next_timer = base->timer_jiffies;
++ }
++ 
++ static void __init init_timer_cpus(void)
++ {
++ 	struct tvec_base *base;
++ 	int local_cpu = smp_processor_id();
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		if (cpu == local_cpu)
++ 			base = &boot_tvec_bases;
++ #ifdef CONFIG_SMP
++ 		else
++ 			base = per_cpu_ptr(&__tvec_bases, cpu);
++ #endif
++ 
++ 		init_timer_cpu(base, cpu);
++ 	}
++ }
+++>>>>>>> 3650b57fdf20 (timer: Further simplify the SMP and HOTPLUG logic):kernel/time/timer.c
+  
+  void __init init_timers(void)
+  {
+@@@ -1666,12 -1662,9 +1726,16 @@@
+  	/* ensure there are enough low bits for flags in timer->base pointer */
+  	BUILD_BUG_ON(__alignof__(struct tvec_base) & TIMER_FLAG_MASK);
+  
+ -	init_timer_cpus();
+ +	err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE,
+ +			       (void *)(long)smp_processor_id());
+  	init_timer_stats();
+++<<<<<<< HEAD:kernel/timer.c
+ +
+ +	BUG_ON(err != NOTIFY_OK);
+ +	register_cpu_notifier(&timers_nb);
+++=======
++ 	timer_register_cpu_notifier();
+++>>>>>>> 3650b57fdf20 (timer: Further simplify the SMP and HOTPLUG logic):kernel/time/timer.c
+  	open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+  }
+  
+* Unmerged path kernel/timer.c
