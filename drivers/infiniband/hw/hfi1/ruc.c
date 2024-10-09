@@ -734,6 +734,20 @@ static inline void hfi1_make_ruc_bth(struct rvt_qp *qp,
 	ohdr->bth[2] = cpu_to_be32(bth2);
 }
 
+/**
+ * hfi1_make_ruc_header_16B - build a 16B header
+ * @qp: the queue pair
+ * @ohdr: a pointer to the destination header memory
+ * @bth0: bth0 passed in from the RC/UC builder
+ * @bth2: bth2 passed in from the RC/UC builder
+ * @middle: non zero implies indicates ahg "could" be used
+ * @ps: the current packet state
+ *
+ * This routine may disarm ahg under these situations:
+ * - packet needs a GRH
+ * - BECN needed
+ * - migration state not IB_MIG_MIGRATED
+ */
 static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
 					    struct ib_other_headers *ohdr,
 					    u32 bth0, u32 bth2, int middle,
@@ -778,6 +792,12 @@ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
 	else
 		middle = 0;
 
+	if (qp->s_flags & RVT_S_ECN) {
+		qp->s_flags &= ~RVT_S_ECN;
+		/* we recently received a FECN, so return a BECN */
+		becn = true;
+		middle = 0;
+	}
 	if (middle)
 		build_ahg(qp, bth2);
 	else
@@ -785,11 +805,6 @@ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
 
 	bth0 |= pkey;
 	bth0 |= extra_bytes << 20;
-	if (qp->s_flags & RVT_S_ECN) {
-		qp->s_flags &= ~RVT_S_ECN;
-		/* we recently received a FECN, so return a BECN */
-		becn = true;
-	}
 	hfi1_make_ruc_bth(qp, ohdr, bth0, bth1, bth2);
 
 	if (!ppd->lid)
@@ -807,6 +822,20 @@ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
 			  pkey, becn, 0, l4, priv->s_sc);
 }
 
+/**
+ * hfi1_make_ruc_header_9B - build a 9B header
+ * @qp: the queue pair
+ * @ohdr: a pointer to the destination header memory
+ * @bth0: bth0 passed in from the RC/UC builder
+ * @bth2: bth2 passed in from the RC/UC builder
+ * @middle: non zero implies indicates ahg "could" be used
+ * @ps: the current packet state
+ *
+ * This routine may disarm ahg under these situations:
+ * - packet needs a GRH
+ * - BECN needed
+ * - migration state not IB_MIG_MIGRATED
+ */
 static inline void hfi1_make_ruc_header_9B(struct rvt_qp *qp,
 					   struct ib_other_headers *ohdr,
 					   u32 bth0, u32 bth2, int middle,
@@ -840,6 +869,12 @@ static inline void hfi1_make_ruc_header_9B(struct rvt_qp *qp,
 	else
 		middle = 0;
 
+	if (qp->s_flags & RVT_S_ECN) {
+		qp->s_flags &= ~RVT_S_ECN;
+		/* we recently received a FECN, so return a BECN */
+		bth1 |= (IB_BECN_MASK << IB_BECN_SHIFT);
+		middle = 0;
+	}
 	if (middle)
 		build_ahg(qp, bth2);
 	else
@@ -847,11 +882,6 @@ static inline void hfi1_make_ruc_header_9B(struct rvt_qp *qp,
 
 	bth0 |= pkey;
 	bth0 |= extra_bytes << 20;
-	if (qp->s_flags & RVT_S_ECN) {
-		qp->s_flags &= ~RVT_S_ECN;
-		/* we recently received a FECN, so return a BECN */
-		bth1 |= (IB_BECN_MASK << IB_BECN_SHIFT);
-	}
 	hfi1_make_ruc_bth(qp, ohdr, bth0, bth1, bth2);
 	hfi1_make_ib_hdr(&ps->s_txreq->phdr.hdr.ibh,
 			 lrh0,
