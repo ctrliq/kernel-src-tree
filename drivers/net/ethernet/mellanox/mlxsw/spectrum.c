@@ -3796,7 +3796,7 @@ static void mlxsw_sp_fini(struct mlxsw_core *mlxsw_core)
 	WARN_ON(!list_empty(&mlxsw_sp->fids));
 }
 
-static struct mlxsw_config_profile mlxsw_sp_config_profile = {
+static const struct mlxsw_config_profile mlxsw_sp_config_profile = {
 	.used_max_vepa_channels		= 1,
 	.max_vepa_channels		= 0,
 	.used_max_mid			= 1,
