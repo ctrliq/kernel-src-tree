@@ -1,0 +1,353 @@
+vmcore: add a kernel parameter novmcoredd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Kairui Song <kasong@redhat.com>
+commit c6c405336bd3b0ebd1d76aaf9ea88b35dba77e61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c6c40533.failed
+
+Since commit 2724273e8fd0 ("vmcore: add API to collect hardware dump in
+second kernel"), drivers are allowed to add device related dump data to
+vmcore as they want by using the device dump API.  This has a potential
+issue, the data is stored in memory, drivers may append too much data
+and use too much memory.  The vmcore is typically used in a kdump kernel
+which runs in a pre-reserved small chunk of memory.  So as a result it
+will make kdump unusable at all due to OOM issues.
+
+So introduce new 'novmcoredd' command line option.  User can disable
+device dump to reduce memory usage.  This is helpful if device dump is
+using too much memory, disabling device dump could make sure a regular
+vmcore without device dump data is still available.
+
+[akpm@linux-foundation.org: tweak documentation]
+[akpm@linux-foundation.org: vmcore.c needs moduleparam.h]
+Link: http://lkml.kernel.org/r/20190528111856.7276-1-kasong@redhat.com
+	Signed-off-by: Kairui Song <kasong@redhat.com>
+	Acked-by: Dave Young <dyoung@redhat.com>
+	Reviewed-by: Bhupesh Sharma <bhsharma@redhat.com>
+	Cc: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Cc: "David S . Miller" <davem@davemloft.net>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c6c405336bd3b0ebd1d76aaf9ea88b35dba77e61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/Kconfig
+#	fs/proc/vmcore.c
+diff --cc fs/proc/Kconfig
+index 15af6222f8a4,cba429db95d9..000000000000
+--- a/fs/proc/Kconfig
++++ b/fs/proc/Kconfig
+@@@ -39,6 -45,22 +39,25 @@@ config PROC_VMCOR
+          help
+          Exports the dump image of crashed kernel in ELF format.
+  
+++<<<<<<< HEAD
+++=======
++ config PROC_VMCORE_DEVICE_DUMP
++ 	bool "Device Hardware/Firmware Log Collection"
++ 	depends on PROC_VMCORE
++ 	default n
++ 	help
++ 	  After kernel panic, device drivers can collect the device
++ 	  specific snapshot of their hardware or firmware before the
++ 	  underlying devices are initialized in crash recovery kernel.
++ 	  Note that the device driver must be present in the crash
++ 	  recovery kernel's initramfs to collect its underlying device
++ 	  snapshot.
++ 
++ 	  If you say Y here, the collected device dumps will be added
++ 	  as ELF notes to /proc/vmcore. You can still disable device
++ 	  dump using the kernel command line option 'novmcoredd'.
++ 
+++>>>>>>> c6c405336bd3 (vmcore: add a kernel parameter novmcoredd)
+  config PROC_SYSCTL
+  	bool "Sysctl support (/proc/sys)" if EXPERT
+  	depends on PROC_FS
+diff --cc fs/proc/vmcore.c
+index 7ca36a10c49c,7bcc92add72c..000000000000
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@@ -20,9 -21,13 +20,14 @@@
+  #include <linux/init.h>
+  #include <linux/crash_dump.h>
+  #include <linux/list.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/moduleparam.h>
++ #include <linux/mutex.h>
+++>>>>>>> c6c405336bd3 (vmcore: add a kernel parameter novmcoredd)
+  #include <linux/vmalloc.h>
+  #include <linux/pagemap.h>
+ -#include <linux/uaccess.h>
+ -#include <linux/mem_encrypt.h>
+ -#include <asm/pgtable.h>
+ +#include <asm/uaccess.h>
+  #include <asm/io.h>
+  #include "internal.h"
+  
+@@@ -42,7 -49,19 +47,23 @@@ static size_t elfnotes_sz
+  /* Total size of vmcore file. */
+  static u64 vmcore_size;
+  
+++<<<<<<< HEAD
+ +static struct proc_dir_entry *proc_vmcore = NULL;
+++=======
++ static struct proc_dir_entry *proc_vmcore;
++ 
++ #ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++ /* Device Dump list and mutex to synchronize access to list */
++ static LIST_HEAD(vmcoredd_list);
++ static DEFINE_MUTEX(vmcoredd_mutex);
++ 
++ static bool vmcoredd_disabled;
++ core_param(novmcoredd, vmcoredd_disabled, bool, 0);
++ #endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++ 
++ /* Device Dump Size */
++ static size_t vmcoredd_orig_sz;
+++>>>>>>> c6c405336bd3 (vmcore: add a kernel parameter novmcoredd)
+  
+  /*
+   * Returns > 0 for RAM pages, 0 for non-RAM pages, < 0 on error
+@@@ -1066,6 -1331,207 +1087,210 @@@ static int __init parse_crash_elf_heade
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++ /**
++  * vmcoredd_write_header - Write vmcore device dump header at the
++  * beginning of the dump's buffer.
++  * @buf: Output buffer where the note is written
++  * @data: Dump info
++  * @size: Size of the dump
++  *
++  * Fills beginning of the dump's buffer with vmcore device dump header.
++  */
++ static void vmcoredd_write_header(void *buf, struct vmcoredd_data *data,
++ 				  u32 size)
++ {
++ 	struct vmcoredd_header *vdd_hdr = (struct vmcoredd_header *)buf;
++ 
++ 	vdd_hdr->n_namesz = sizeof(vdd_hdr->name);
++ 	vdd_hdr->n_descsz = size + sizeof(vdd_hdr->dump_name);
++ 	vdd_hdr->n_type = NT_VMCOREDD;
++ 
++ 	strncpy((char *)vdd_hdr->name, VMCOREDD_NOTE_NAME,
++ 		sizeof(vdd_hdr->name));
++ 	memcpy(vdd_hdr->dump_name, data->dump_name, sizeof(vdd_hdr->dump_name));
++ }
++ 
++ /**
++  * vmcoredd_update_program_headers - Update all Elf program headers
++  * @elfptr: Pointer to elf header
++  * @elfnotesz: Size of elf notes aligned to page size
++  * @vmcoreddsz: Size of device dumps to be added to elf note header
++  *
++  * Determine type of Elf header (Elf64 or Elf32) and update the elf note size.
++  * Also update the offsets of all the program headers after the elf note header.
++  */
++ static void vmcoredd_update_program_headers(char *elfptr, size_t elfnotesz,
++ 					    size_t vmcoreddsz)
++ {
++ 	unsigned char *e_ident = (unsigned char *)elfptr;
++ 	u64 start, end, size;
++ 	loff_t vmcore_off;
++ 	u32 i;
++ 
++ 	vmcore_off = elfcorebuf_sz + elfnotesz;
++ 
++ 	if (e_ident[EI_CLASS] == ELFCLASS64) {
++ 		Elf64_Ehdr *ehdr = (Elf64_Ehdr *)elfptr;
++ 		Elf64_Phdr *phdr = (Elf64_Phdr *)(elfptr + sizeof(Elf64_Ehdr));
++ 
++ 		/* Update all program headers */
++ 		for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++ 			if (phdr->p_type == PT_NOTE) {
++ 				/* Update note size */
++ 				phdr->p_memsz = elfnotes_orig_sz + vmcoreddsz;
++ 				phdr->p_filesz = phdr->p_memsz;
++ 				continue;
++ 			}
++ 
++ 			start = rounddown(phdr->p_offset, PAGE_SIZE);
++ 			end = roundup(phdr->p_offset + phdr->p_memsz,
++ 				      PAGE_SIZE);
++ 			size = end - start;
++ 			phdr->p_offset = vmcore_off + (phdr->p_offset - start);
++ 			vmcore_off += size;
++ 		}
++ 	} else {
++ 		Elf32_Ehdr *ehdr = (Elf32_Ehdr *)elfptr;
++ 		Elf32_Phdr *phdr = (Elf32_Phdr *)(elfptr + sizeof(Elf32_Ehdr));
++ 
++ 		/* Update all program headers */
++ 		for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++ 			if (phdr->p_type == PT_NOTE) {
++ 				/* Update note size */
++ 				phdr->p_memsz = elfnotes_orig_sz + vmcoreddsz;
++ 				phdr->p_filesz = phdr->p_memsz;
++ 				continue;
++ 			}
++ 
++ 			start = rounddown(phdr->p_offset, PAGE_SIZE);
++ 			end = roundup(phdr->p_offset + phdr->p_memsz,
++ 				      PAGE_SIZE);
++ 			size = end - start;
++ 			phdr->p_offset = vmcore_off + (phdr->p_offset - start);
++ 			vmcore_off += size;
++ 		}
++ 	}
++ }
++ 
++ /**
++  * vmcoredd_update_size - Update the total size of the device dumps and update
++  * Elf header
++  * @dump_size: Size of the current device dump to be added to total size
++  *
++  * Update the total size of all the device dumps and update the Elf program
++  * headers. Calculate the new offsets for the vmcore list and update the
++  * total vmcore size.
++  */
++ static void vmcoredd_update_size(size_t dump_size)
++ {
++ 	vmcoredd_orig_sz += dump_size;
++ 	elfnotes_sz = roundup(elfnotes_orig_sz, PAGE_SIZE) + vmcoredd_orig_sz;
++ 	vmcoredd_update_program_headers(elfcorebuf, elfnotes_sz,
++ 					vmcoredd_orig_sz);
++ 
++ 	/* Update vmcore list offsets */
++ 	set_vmcore_list_offsets(elfcorebuf_sz, elfnotes_sz, &vmcore_list);
++ 
++ 	vmcore_size = get_vmcore_size(elfcorebuf_sz, elfnotes_sz,
++ 				      &vmcore_list);
++ 	proc_vmcore->size = vmcore_size;
++ }
++ 
++ /**
++  * vmcore_add_device_dump - Add a buffer containing device dump to vmcore
++  * @data: dump info.
++  *
++  * Allocate a buffer and invoke the calling driver's dump collect routine.
++  * Write Elf note at the beginning of the buffer to indicate vmcore device
++  * dump and add the dump to global list.
++  */
++ int vmcore_add_device_dump(struct vmcoredd_data *data)
++ {
++ 	struct vmcoredd_node *dump;
++ 	void *buf = NULL;
++ 	size_t data_size;
++ 	int ret;
++ 
++ 	if (vmcoredd_disabled) {
++ 		pr_err_once("Device dump is disabled\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!data || !strlen(data->dump_name) ||
++ 	    !data->vmcoredd_callback || !data->size)
++ 		return -EINVAL;
++ 
++ 	dump = vzalloc(sizeof(*dump));
++ 	if (!dump) {
++ 		ret = -ENOMEM;
++ 		goto out_err;
++ 	}
++ 
++ 	/* Keep size of the buffer page aligned so that it can be mmaped */
++ 	data_size = roundup(sizeof(struct vmcoredd_header) + data->size,
++ 			    PAGE_SIZE);
++ 
++ 	/* Allocate buffer for driver's to write their dumps */
++ 	buf = vmcore_alloc_buf(data_size);
++ 	if (!buf) {
++ 		ret = -ENOMEM;
++ 		goto out_err;
++ 	}
++ 
++ 	vmcoredd_write_header(buf, data, data_size -
++ 			      sizeof(struct vmcoredd_header));
++ 
++ 	/* Invoke the driver's dump collection routing */
++ 	ret = data->vmcoredd_callback(data, buf +
++ 				      sizeof(struct vmcoredd_header));
++ 	if (ret)
++ 		goto out_err;
++ 
++ 	dump->buf = buf;
++ 	dump->size = data_size;
++ 
++ 	/* Add the dump to driver sysfs list */
++ 	mutex_lock(&vmcoredd_mutex);
++ 	list_add_tail(&dump->list, &vmcoredd_list);
++ 	mutex_unlock(&vmcoredd_mutex);
++ 
++ 	vmcoredd_update_size(data_size);
++ 	return 0;
++ 
++ out_err:
++ 	if (buf)
++ 		vfree(buf);
++ 
++ 	if (dump)
++ 		vfree(dump);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(vmcore_add_device_dump);
++ #endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++ 
++ /* Free all dumps in vmcore device dump list */
++ static void vmcore_free_device_dumps(void)
++ {
++ #ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++ 	mutex_lock(&vmcoredd_mutex);
++ 	while (!list_empty(&vmcoredd_list)) {
++ 		struct vmcoredd_node *dump;
++ 
++ 		dump = list_first_entry(&vmcoredd_list, struct vmcoredd_node,
++ 					list);
++ 		list_del(&dump->list);
++ 		vfree(dump->buf);
++ 		vfree(dump);
++ 	}
++ 	mutex_unlock(&vmcoredd_mutex);
++ #endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++ }
++ 
+++>>>>>>> c6c405336bd3 (vmcore: add a kernel parameter novmcoredd)
+  /* Init function for vmcore module. */
+  static int __init vmcore_init(void)
+  {
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index f6852ae416ce..db05e7be877b 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2236,6 +2236,17 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			/sys/module/printk/parameters/console_suspend) to
+ 			turn on/off it dynamically.
+ 
++	novmcoredd	[KNL,KDUMP]
++			Disable device dump. Device dump allows drivers to
++			append dump data to vmcore so you can collect driver
++			specified debug info.  Drivers can append the data
++			without any limit and this data is stored in memory,
++			so this may cause significant memory stress.  Disabling
++			device dump can help save memory but the driver debug
++			data will be no longer available.  This parameter
++			is only available when CONFIG_PROC_VMCORE_DEVICE_DUMP
++			is set.
++
+ 	noaliencache	[MM, NUMA, SLAB] Disables the allocation of alien
+ 			caches in the slab allocator.  Saves per-node memory,
+ 			but will impact performance.
+* Unmerged path fs/proc/Kconfig
+* Unmerged path fs/proc/vmcore.c
