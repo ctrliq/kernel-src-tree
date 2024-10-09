@@ -1,0 +1,158 @@
+hugetlb: use same fault hash key for shared and private mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 1b426bac66e6cc83c9f2d92b96e4e72acf43419a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/1b426bac.failed
+
+hugetlb uses a fault mutex hash table to prevent page faults of the
+same pages concurrently.  The key for shared and private mappings is
+different.  Shared keys off address_space and file index.  Private keys
+off mm and virtual address.  Consider a private mappings of a populated
+hugetlbfs file.  A fault will map the page from the file and if needed
+do a COW to map a writable page.
+
+Hugetlbfs hole punch uses the fault mutex to prevent mappings of file
+pages.  It uses the address_space file index key.  However, private
+mappings will use a different key and could race with this code to map
+the file page.  This causes problems (BUG) for the page cache remove
+code as it expects the page to be unmapped.  A sample stack is:
+
+page dumped because: VM_BUG_ON_PAGE(page_mapped(page))
+kernel BUG at mm/filemap.c:169!
+...
+RIP: 0010:unaccount_page_cache_page+0x1b8/0x200
+...
+Call Trace:
+__delete_from_page_cache+0x39/0x220
+delete_from_page_cache+0x45/0x70
+remove_inode_hugepages+0x13c/0x380
+? __add_to_page_cache_locked+0x162/0x380
+hugetlbfs_fallocate+0x403/0x540
+? _cond_resched+0x15/0x30
+? __inode_security_revalidate+0x5d/0x70
+? selinux_file_permission+0x100/0x130
+vfs_fallocate+0x13f/0x270
+ksys_fallocate+0x3c/0x80
+__x64_sys_fallocate+0x1a/0x20
+do_syscall_64+0x5b/0x180
+entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+There seems to be another potential COW issue/race with this approach
+of different private and shared keys as noted in commit 8382d914ebf7
+("mm, hugetlb: improve page-fault scalability").
+
+Since every hugetlb mapping (even anon and private) is actually a file
+mapping, just use the address_space index key for all mappings.  This
+results in potentially more hash collisions.  However, this should not
+be the common case.
+
+Link: http://lkml.kernel.org/r/20190328234704.27083-3-mike.kravetz@oracle.com
+Link: http://lkml.kernel.org/r/20190412165235.t4sscoujczfhuiyt@linux-r8p5
+Fixes: b5cec28d36f5 ("hugetlbfs: truncate_hugepages() takes a range of pages")
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1b426bac66e6cc83c9f2d92b96e4e72acf43419a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/hugetlbfs/inode.c
+#	mm/hugetlb.c
+diff --cc fs/hugetlbfs/inode.c
+index f281dd71f4ca,f23237135163..000000000000
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@@ -469,18 -439,8 +469,23 @@@ static void remove_inode_hugepages(stru
+  			struct page *page = pvec.pages[i];
+  			u32 hash;
+  
+++<<<<<<< HEAD
+ +			/*
+ +			 * The page (index) could be beyond end.  This is
+ +			 * only possible in the punch hole case as end is
+ +			 * max page offset in the truncate case.
+ +			 */
+ +			next = page->index;
+ +			if (next >= end)
+ +				break;
+ +
+ +			hash = hugetlb_fault_mutex_hash(h, current->mm,
+ +							&pseudo_vma,
+ +							mapping, next, 0);
+++=======
++ 			index = page->index;
++ 			hash = hugetlb_fault_mutex_hash(h, mapping, index, 0);
+++>>>>>>> 1b426bac66e6 (hugetlb: use same fault hash key for shared and private mappings)
+  			mutex_lock(&hugetlb_fault_mutex_table[hash]);
+  
+  			/*
+diff --cc mm/hugetlb.c
+index 601926def2e1,98a3c7c224cb..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3827,8 -3824,7 +3827,12 @@@ retry
+  			 * handling userfault.  Reacquire after handling
+  			 * fault to make calling code simpler.
+  			 */
+++<<<<<<< HEAD
+ +			hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping,
+ +							idx, address);
+++=======
++ 			hash = hugetlb_fault_mutex_hash(h, mapping, idx, haddr);
+++>>>>>>> 1b426bac66e6 (hugetlb: use same fault hash key for shared and private mappings)
+  			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+  			ret = handle_userfault(&vmf, VM_UFFD_MISSING);
+  			mutex_lock(&hugetlb_fault_mutex_table[hash]);
+@@@ -4004,7 -3995,7 +3999,11 @@@ int hugetlb_fault(struct mm_struct *mm
+  	 * get spurious allocation failures if two CPUs race to instantiate
+  	 * the same page in the page cache.
+  	 */
+++<<<<<<< HEAD
+ +	hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping, idx, address);
+++=======
++ 	hash = hugetlb_fault_mutex_hash(h, mapping, idx, haddr);
+++>>>>>>> 1b426bac66e6 (hugetlb: use same fault hash key for shared and private mappings)
+  	mutex_lock(&hugetlb_fault_mutex_table[hash]);
+  
+  	entry = huge_ptep_get(ptep);
+* Unmerged path fs/hugetlbfs/inode.c
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index d5efe3fef10b..5d492812e4ac 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -99,9 +99,7 @@ bool isolate_huge_page(struct page *page, struct list_head *list);
+ void putback_active_hugepage(struct page *page);
+ void hugetlb_fix_reserve_counts(struct inode *inode);
+ extern struct mutex *hugetlb_fault_mutex_table;
+-u32 hugetlb_fault_mutex_hash(struct hstate *h, struct mm_struct *mm,
+-				struct vm_area_struct *vma,
+-				struct address_space *mapping,
++u32 hugetlb_fault_mutex_hash(struct hstate *h, struct address_space *mapping,
+ 				pgoff_t idx, unsigned long address);
+ 
+ #ifdef CONFIG_ARCH_WANT_HUGE_PMD_SHARE
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index b3eb6d40ac62..f5c080b3e010 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -265,8 +265,7 @@ retry:
+ 		 */
+ 		idx = linear_page_index(dst_vma, dst_addr);
+ 		mapping = dst_vma->vm_file->f_mapping;
+-		hash = hugetlb_fault_mutex_hash(h, dst_mm, dst_vma, mapping,
+-								idx, dst_addr);
++		hash = hugetlb_fault_mutex_hash(h, mapping, idx, dst_addr);
+ 		mutex_lock(&hugetlb_fault_mutex_table[hash]);
+ 
+ 		err = -ENOMEM;
