@@ -1,0 +1,313 @@
+tcmu: move expired command completion to unmap thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 488ebe4c355fdead39dbb3f6a51329c16cbfcc60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/488ebe4c.failed
+
+This moves the expired command completion handling to
+the unmap wq, so the next patch can use a mutex
+in tcmu_check_expired_cmd.
+
+Note:
+tcmu_device_timedout's use of spin_lock_irq was not needed.
+The commands_lock is used between thread context (tcmu_queue_cmd_ring
+and tcmu_irqcontrol (even though this is named irqcontrol it is not
+run in irq context)) and timer/bh context. In the timer/bh context
+bhs are disabled, so you need to use the _bh lock calls from the
+thread context callers.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 488ebe4c355fdead39dbb3f6a51329c16cbfcc60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 8fa83807dcdc,2ccc8e61449b..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -125,7 -143,7 +125,11 @@@ struct tcmu_dev 
+  
+  	struct timer_list timeout;
+  	unsigned int cmd_time_out;
+++<<<<<<< HEAD
+ +	int qfull_time_out;
+++=======
++ 	struct list_head timedout_entry;
+++>>>>>>> 488ebe4c355f (tcmu: move expired command completion to unmap thread)
+  
+  	spinlock_t nl_cmd_lock;
+  	struct tcmu_nl_cmd curr_nl_cmd;
+@@@ -155,11 -177,17 +159,23 @@@ struct tcmu_cmd 
+  	unsigned long flags;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static DEFINE_MUTEX(root_udev_mutex);
++ static LIST_HEAD(root_udev);
++ 
++ static DEFINE_SPINLOCK(timed_out_udevs_lock);
++ static LIST_HEAD(timed_out_udevs);
++ 
++ static atomic_t global_db_count = ATOMIC_INIT(0);
++ static struct work_struct tcmu_unmap_work;
++ 
+++>>>>>>> 488ebe4c355f (tcmu: move expired command completion to unmap thread)
+  static struct kmem_cache *tcmu_cmd_cache;
+  
+ +static DEFINE_IDR(devices_idr);
+ +static DEFINE_MUTEX(device_mutex);
+ +
+  /* multicast group */
+  enum tcmu_multicast_groups {
+  	TCMU_MCGRP_CONFIG,
+@@@ -897,24 -1058,18 +913,35 @@@ static int tcmu_check_expired_cmd(int i
+  	return 0;
+  }
+  
+ -static void tcmu_device_timedout(struct timer_list *t)
+ +static void tcmu_device_timedout(unsigned long data)
+  {
+++<<<<<<< HEAD
+ +	struct tcmu_dev *udev = (struct tcmu_dev *)data;
+ +	unsigned long flags;
+ +	int handled;
+ +
+ +	handled = tcmu_handle_completions(udev);
+ +
+ +	pr_warn("%d completions handled from timeout\n", handled);
+++=======
++ 	struct tcmu_dev *udev = from_timer(udev, t, timeout);
+++>>>>>>> 488ebe4c355f (tcmu: move expired command completion to unmap thread)
+  
+- 	spin_lock_irqsave(&udev->commands_lock, flags);
+- 	idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
+- 	spin_unlock_irqrestore(&udev->commands_lock, flags);
++ 	pr_debug("%s cmd timeout has expired\n", udev->name);
+  
++ 	spin_lock(&timed_out_udevs_lock);
++ 	if (list_empty(&udev->timedout_entry))
++ 		list_add_tail(&udev->timedout_entry, &timed_out_udevs);
++ 	spin_unlock(&timed_out_udevs_lock);
++ 
+++<<<<<<< HEAD
+ +	/*
+ +	 * We don't need to wakeup threads on wait_cmdr since they have their
+ +	 * own timeout.
+ +	 */
+++=======
++ 	schedule_work(&tcmu_unmap_work);
+++>>>>>>> 488ebe4c355f (tcmu: move expired command completion to unmap thread)
+  }
+  
+  static int tcmu_attach_hba(struct se_hba *hba, u32 host_id)
+@@@ -953,13 -1109,11 +980,14 @@@ static struct se_device *tcmu_alloc_dev
+  
+  	udev->hba = hba;
+  	udev->cmd_time_out = TCMU_TIME_OUT;
+ +	udev->qfull_time_out = -1;
+ +
+ +	udev->max_blocks = DATA_BLOCK_BITS_DEF;
+  
+  	init_waitqueue_head(&udev->wait_cmdr);
+ -	mutex_init(&udev->cmdr_lock);
+ +	spin_lock_init(&udev->cmdr_lock);
+  
++ 	INIT_LIST_HEAD(&udev->timedout_entry);
+  	idr_init(&udev->commands);
+  	spin_lock_init(&udev->commands_lock);
+  
+@@@ -1059,6 -1282,73 +1087,76 @@@ static int tcmu_open(struct uio_info *i
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcmu_dev_call_rcu(struct rcu_head *p)
++ {
++ 	struct se_device *dev = container_of(p, struct se_device, rcu_head);
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 
++ 	kfree(udev->uio_info.name);
++ 	kfree(udev->name);
++ 	kfree(udev);
++ }
++ 
++ static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
++ {
++ 	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
++ 		kmem_cache_free(tcmu_cmd_cache, cmd);
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static void tcmu_blocks_release(struct radix_tree_root *blocks,
++ 				int start, int end)
++ {
++ 	int i;
++ 	struct page *page;
++ 
++ 	for (i = start; i < end; i++) {
++ 		page = radix_tree_delete(blocks, i);
++ 		if (page) {
++ 			__free_page(page);
++ 			atomic_dec(&global_db_count);
++ 		}
++ 	}
++ }
++ 
++ static void tcmu_dev_kref_release(struct kref *kref)
++ {
++ 	struct tcmu_dev *udev = container_of(kref, struct tcmu_dev, kref);
++ 	struct se_device *dev = &udev->se_dev;
++ 	struct tcmu_cmd *cmd;
++ 	bool all_expired = true;
++ 	int i;
++ 
++ 	vfree(udev->mb_addr);
++ 	udev->mb_addr = NULL;
++ 
++ 	spin_lock_bh(&timed_out_udevs_lock);
++ 	if (!list_empty(&udev->timedout_entry))
++ 		list_del(&udev->timedout_entry);
++ 	spin_unlock_bh(&timed_out_udevs_lock);
++ 
++ 	/* Upper layer should drain all requests before calling this */
++ 	spin_lock_irq(&udev->commands_lock);
++ 	idr_for_each_entry(&udev->commands, cmd, i) {
++ 		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
++ 			all_expired = false;
++ 	}
++ 	idr_destroy(&udev->commands);
++ 	spin_unlock_irq(&udev->commands_lock);
++ 	WARN_ON(!all_expired);
++ 
++ 	mutex_lock(&udev->cmdr_lock);
++ 	tcmu_blocks_release(&udev->data_blocks, 0, udev->dbi_max + 1);
++ 	mutex_unlock(&udev->cmdr_lock);
++ 
++ 	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
++ }
++ 
+++>>>>>>> 488ebe4c355f (tcmu: move expired command completion to unmap thread)
+  static int tcmu_release(struct uio_info *info, struct inode *inode)
+  {
+  	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+@@@ -1654,6 -1977,106 +1752,109 @@@ static struct target_backend_ops tcmu_o
+  	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void find_free_blocks(void)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	uint32_t start, end, block;
++ 
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 
++ 		/* Try to complete the finished commands first */
++ 		tcmu_handle_completions(udev);
++ 
++ 		/* Skip the udevs waiting the global pool or in idle */
++ 		if (udev->waiting_global || !udev->dbi_thresh) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		end = udev->dbi_max + 1;
++ 		block = find_last_bit(udev->data_bitmap, end);
++ 		if (block == udev->dbi_max) {
++ 			/*
++ 			 * The last bit is dbi_max, so there is
++ 			 * no need to shrink any blocks.
++ 			 */
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		} else if (block == end) {
++ 			/* The current udev will goto idle state */
++ 			udev->dbi_thresh = start = 0;
++ 			udev->dbi_max = 0;
++ 		} else {
++ 			udev->dbi_thresh = start = block + 1;
++ 			udev->dbi_max = block;
++ 		}
++ 
++ 		/* Here will truncate the data area from off */
++ 		off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 		/* Release the block pages */
++ 		tcmu_blocks_release(&udev->data_blocks, start, end);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ }
++ 
++ static void run_cmdr_queues(void)
++ {
++ 	struct tcmu_dev *udev;
++ 
++ 	/*
++ 	 * Try to wake up the udevs who are waiting
++ 	 * for the global data block pool.
++ 	 */
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 		if (!udev->waiting_global) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			break;
++ 		}
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		wake_up(&udev->wait_cmdr);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ }
++ 
++ static void check_timedout_devices(void)
++ {
++ 	struct tcmu_dev *udev, *tmp_dev;
++ 	LIST_HEAD(devs);
++ 
++ 	spin_lock_bh(&timed_out_udevs_lock);
++ 	list_splice_init(&timed_out_udevs, &devs);
++ 
++ 	list_for_each_entry_safe(udev, tmp_dev, &devs, timedout_entry) {
++ 		list_del_init(&udev->timedout_entry);
++ 		spin_unlock_bh(&timed_out_udevs_lock);
++ 
++ 		spin_lock(&udev->commands_lock);
++ 		idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
++ 		spin_unlock(&udev->commands_lock);
++ 
++ 		spin_lock_bh(&timed_out_udevs_lock);
++ 	}
++ 
++ 	spin_unlock_bh(&timed_out_udevs_lock);
++ }
++ 
++ static void tcmu_unmap_work_fn(struct work_struct *work)
++ {
++ 	check_timedout_devices();
++ 	find_free_blocks();
++ 	run_cmdr_queues();
++ }
++ 
+++>>>>>>> 488ebe4c355f (tcmu: move expired command completion to unmap thread)
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+* Unmerged path drivers/target/target_core_user.c
