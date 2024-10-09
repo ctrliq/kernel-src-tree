@@ -1,0 +1,435 @@
+net: use core MTU range checking in virt drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] use core MTU range checking in virt drivers (Mohammed Gamal) [1502554 1497228]
+Rebuild_FUZZ: 94.51%
+commit-author Jarod Wilson <jarod@redhat.com>
+commit d0c2c9973ecd267307543526ae93855e3a3e4b23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d0c2c997.failed
+
+hyperv_net:
+- set min/max_mtu, per Haiyang, after rndis_filter_device_add
+
+virtio_net:
+- set min/max_mtu
+- remove virtnet_change_mtu
+
+vmxnet3:
+- set min/max_mtu
+
+xen-netback:
+- min_mtu = 0, max_mtu = 65517
+
+xen-netfront:
+- min_mtu = 0, max_mtu = 65535
+
+unisys/visor:
+- clean up defines a little to not clash with network core or add
+  redundat definitions
+
+CC: netdev@vger.kernel.org
+CC: virtualization@lists.linux-foundation.org
+CC: "K. Y. Srinivasan" <kys@microsoft.com>
+CC: Haiyang Zhang <haiyangz@microsoft.com>
+CC: "Michael S. Tsirkin" <mst@redhat.com>
+CC: Shrikrishna Khare <skhare@vmware.com>
+CC: "VMware, Inc." <pv-drivers@vmware.com>
+CC: Wei Liu <wei.liu2@citrix.com>
+CC: Paul Durrant <paul.durrant@citrix.com>
+CC: David Kershner <david.kershner@unisys.com>
+	Signed-off-by: Jarod Wilson <jarod@redhat.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d0c2c9973ecd267307543526ae93855e3a3e4b23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+#	drivers/net/xen-netfront.c
+#	drivers/staging/unisys/include/iochannel.h
+diff --cc drivers/net/virtio_net.c
+index 27d840eb5123,720809f82a0e..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -1251,50 -1354,71 +1251,53 @@@ static void virtnet_get_channels(struc
+  	channels->other_count = 0;
+  }
+  
+ -/* Check if the user is trying to change anything besides speed/duplex */
+ -static bool virtnet_validate_ethtool_cmd(const struct ethtool_cmd *cmd)
+ -{
+ -	struct ethtool_cmd diff1 = *cmd;
+ -	struct ethtool_cmd diff2 = {};
+ -
+ -	/* cmd is always set so we need to clear it, validate the port type
+ -	 * and also without autonegotiation we can ignore advertising
+ -	 */
+ -	ethtool_cmd_speed_set(&diff1, 0);
+ -	diff2.port = PORT_OTHER;
+ -	diff1.advertising = 0;
+ -	diff1.duplex = 0;
+ -	diff1.cmd = 0;
+ +static const struct ethtool_ops virtnet_ethtool_ops = {
+ +	.get_drvinfo = virtnet_get_drvinfo,
+ +	.get_link = ethtool_op_get_link,
+ +	.get_ringparam = virtnet_get_ringparam,
+ +	.set_channels = virtnet_set_channels,
+ +	.get_channels = virtnet_get_channels,
+ +};
+  
+ -	return !memcmp(&diff1, &diff2, sizeof(diff1));
+ -}
+++<<<<<<< HEAD
+ +#define MIN_MTU 68
+ +#define MAX_MTU 65535
+  
+ -static int virtnet_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+ +static int virtnet_change_mtu(struct net_device *dev, int new_mtu)
+  {
+  	struct virtnet_info *vi = netdev_priv(dev);
+ -	u32 speed;
+  
+ -	speed = ethtool_cmd_speed(cmd);
+ -	/* don't allow custom speed and duplex */
+ -	if (!ethtool_validate_speed(speed) ||
+ -	    !ethtool_validate_duplex(cmd->duplex) ||
+ -	    !virtnet_validate_ethtool_cmd(cmd))
+ +	if (new_mtu < MIN_MTU || new_mtu > vi->max_mtu)
+  		return -EINVAL;
+ -	vi->speed = speed;
+ -	vi->duplex = cmd->duplex;
+ -
+ +	dev->mtu = new_mtu;
+  	return 0;
+  }
+  
+ -static int virtnet_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+ +/* To avoid contending a lock hold by a vcpu who would exit to host, select the
+ + * txq based on the processor id.
+ + */
+ +static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
+ +			void *accel_priv, select_queue_fallback_t fallback)
+  {
+ +	int txq;
+  	struct virtnet_info *vi = netdev_priv(dev);
+  
+ -	ethtool_cmd_speed_set(cmd, vi->speed);
+ -	cmd->duplex = vi->duplex;
+ -	cmd->port = PORT_OTHER;
+ -
+ -	return 0;
+ -}
+ +	if (skb_rx_queue_recorded(skb)) {
+ +		txq = skb_get_rx_queue(skb);
+ +	} else {
+ +		txq = *__this_cpu_ptr(vi->vq_index);
+ +		if (txq == -1)
+ +			txq = 0;
+ +	}
+  
+ -static void virtnet_init_settings(struct net_device *dev)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ +	while (unlikely(txq >= dev->real_num_tx_queues))
+ +		txq -= dev->real_num_tx_queues;
+  
+ -	vi->speed = SPEED_UNKNOWN;
+ -	vi->duplex = DUPLEX_UNKNOWN;
+ +	return txq;
+  }
+  
+ -static const struct ethtool_ops virtnet_ethtool_ops = {
+ -	.get_drvinfo = virtnet_get_drvinfo,
+ -	.get_link = ethtool_op_get_link,
+ -	.get_ringparam = virtnet_get_ringparam,
+ -	.set_channels = virtnet_set_channels,
+ -	.get_channels = virtnet_get_channels,
+ -	.get_ts_info = ethtool_op_get_ts_info,
+ -	.get_settings = virtnet_get_settings,
+ -	.set_settings = virtnet_set_settings,
+ -};
+ -
+++=======
+++>>>>>>> d0c2c9973ecd (net: use core MTU range checking in virt drivers)
+  static const struct net_device_ops virtnet_netdev = {
+  	.ndo_open            = virtnet_open,
+  	.ndo_stop   	     = virtnet_close,
+@@@ -1537,6 -1675,70 +1539,73 @@@ err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_SYSFS
++ static ssize_t mergeable_rx_buffer_size_show(struct netdev_rx_queue *queue,
++ 		struct rx_queue_attribute *attribute, char *buf)
++ {
++ 	struct virtnet_info *vi = netdev_priv(queue->dev);
++ 	unsigned int queue_index = get_netdev_rx_queue_index(queue);
++ 	struct ewma_pkt_len *avg;
++ 
++ 	BUG_ON(queue_index >= vi->max_queue_pairs);
++ 	avg = &vi->rq[queue_index].mrg_avg_pkt_len;
++ 	return sprintf(buf, "%u\n", get_mergeable_buf_len(avg));
++ }
++ 
++ static struct rx_queue_attribute mergeable_rx_buffer_size_attribute =
++ 	__ATTR_RO(mergeable_rx_buffer_size);
++ 
++ static struct attribute *virtio_net_mrg_rx_attrs[] = {
++ 	&mergeable_rx_buffer_size_attribute.attr,
++ 	NULL
++ };
++ 
++ static const struct attribute_group virtio_net_mrg_rx_group = {
++ 	.name = "virtio_net",
++ 	.attrs = virtio_net_mrg_rx_attrs
++ };
++ #endif
++ 
++ static bool virtnet_fail_on_feature(struct virtio_device *vdev,
++ 				    unsigned int fbit,
++ 				    const char *fname, const char *dname)
++ {
++ 	if (!virtio_has_feature(vdev, fbit))
++ 		return false;
++ 
++ 	dev_err(&vdev->dev, "device advertises feature %s but not %s",
++ 		fname, dname);
++ 
++ 	return true;
++ }
++ 
++ #define VIRTNET_FAIL_ON(vdev, fbit, dbit)			\
++ 	virtnet_fail_on_feature(vdev, fbit, #fbit, dbit)
++ 
++ static bool virtnet_validate_features(struct virtio_device *vdev)
++ {
++ 	if (!virtio_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ) &&
++ 	    (VIRTNET_FAIL_ON(vdev, VIRTIO_NET_F_CTRL_RX,
++ 			     "VIRTIO_NET_F_CTRL_VQ") ||
++ 	     VIRTNET_FAIL_ON(vdev, VIRTIO_NET_F_CTRL_VLAN,
++ 			     "VIRTIO_NET_F_CTRL_VQ") ||
++ 	     VIRTNET_FAIL_ON(vdev, VIRTIO_NET_F_GUEST_ANNOUNCE,
++ 			     "VIRTIO_NET_F_CTRL_VQ") ||
++ 	     VIRTNET_FAIL_ON(vdev, VIRTIO_NET_F_MQ, "VIRTIO_NET_F_CTRL_VQ") ||
++ 	     VIRTNET_FAIL_ON(vdev, VIRTIO_NET_F_CTRL_MAC_ADDR,
++ 			     "VIRTIO_NET_F_CTRL_VQ"))) {
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ #define MIN_MTU ETH_MIN_MTU
++ #define MAX_MTU ETH_MAX_MTU
++ 
+++>>>>>>> d0c2c9973ecd (net: use core MTU range checking in virt drivers)
+  static int virtnet_probe(struct virtio_device *vdev)
+  {
+  	int i, err;
+@@@ -1655,10 -1870,10 +1728,14 @@@
+  		mtu = virtio_cread16(vdev,
+  				     offsetof(struct virtio_net_config,
+  					      mtu));
+- 		if (virtnet_change_mtu(dev, mtu))
++ 		if (mtu < dev->min_mtu || mtu > dev->max_mtu)
+  			__virtio_clear_bit(vdev, VIRTIO_NET_F_MTU);
+  		else
+++<<<<<<< HEAD
+ +			vi->max_mtu = mtu;
+++=======
++ 			dev->mtu = mtu;
+++>>>>>>> d0c2c9973ecd (net: use core MTU range checking in virt drivers)
+  	}
+  
+  	if (vi->any_header_sg)
+diff --cc drivers/net/xen-netfront.c
+index ff2535f43f28,7d616b003e89..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -1307,11 -1328,11 +1307,17 @@@ static struct net_device *xennet_create
+           */
+  	netdev->features |= netdev->hw_features;
+  
+++<<<<<<< HEAD
+ +	SET_ETHTOOL_OPS(netdev, &xennet_ethtool_ops);
+++=======
++ 	netdev->ethtool_ops = &xennet_ethtool_ops;
++ 	netdev->min_mtu = 0;
++ 	netdev->max_mtu = XEN_NETIF_MAX_TX_SIZE;
+++>>>>>>> d0c2c9973ecd (net: use core MTU range checking in virt drivers)
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	netif_set_gso_max_size(netdev, XEN_NETIF_MAX_TX_SIZE - MAX_TCP_HEADER);
+ +
+  	np->netdev = netdev;
+  
+  	netif_carrier_off(netdev);
+diff --cc drivers/staging/unisys/include/iochannel.h
+index 14e656ff73ec,9081b3f8779c..000000000000
+--- a/drivers/staging/unisys/include/iochannel.h
++++ b/drivers/staging/unisys/include/iochannel.h
+@@@ -342,13 -285,11 +340,18 @@@ struct sense_data 
+  struct net_pkt_xmt {
+  	int len;	/* full length of data in the packet */
+  	int num_frags;	/* number of fragments in frags containing data */
+++<<<<<<< HEAD
+ +	struct phys_info frags[MAX_PHYS_INFO];	/* physical page information for
+ +						 * each fragment */
+ +	char ethhdr[ETH_HEADER_SIZE];	/* the ethernet header  */
+++=======
++ 	struct phys_info frags[MAX_PHYS_INFO];	/* physical page information */
++ 	char ethhdr[ETH_HLEN];	/* the ethernet header  */
+++>>>>>>> d0c2c9973ecd (net: use core MTU range checking in virt drivers)
+  	struct {
+ -		/* these are needed for csum at uisnic end */
+ -		u8 valid;	/* 1 = struct is valid - else ignore */
+ +		    /* these are needed for csum at uisnic end */
+ +		u8 valid;	/* 1 = rest of this struct is valid - else
+ +				 * ignore */
+  		u8 hrawoffv;	/* 1 = hwrafoff is valid */
+  		u8 nhrawoffv;	/* 1 = nhwrafoff is valid */
+  		u16 protocol;	/* specifies packet protocol */
+@@@ -380,7 -321,8 +383,12 @@@ struct net_pkt_xmtdone 
+   */
+  #define RCVPOST_BUF_SIZE 4032
+  #define MAX_NET_RCV_CHAIN \
+++<<<<<<< HEAD
+ +	((ETH_MAX_MTU+ETH_HEADER_SIZE + RCVPOST_BUF_SIZE-1) / RCVPOST_BUF_SIZE)
+++=======
++ 	((VISOR_ETH_MAX_MTU + ETH_HLEN + RCVPOST_BUF_SIZE - 1) \
++ 	/ RCVPOST_BUF_SIZE)
+++>>>>>>> d0c2c9973ecd (net: use core MTU range checking in virt drivers)
+  
+  struct net_pkt_rcvpost {
+  	    /* rcv buf size must be large enough to include ethernet data len +
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index a32d7f1b2505..646250ce541e 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -616,8 +616,8 @@ struct nvsp_message {
+ } __packed;
+ 
+ 
+-#define NETVSC_MTU 65536
+-#define NETVSC_MTU_MIN 68
++#define NETVSC_MTU 65535
++#define NETVSC_MTU_MIN ETH_MIN_MTU
+ 
+ #define NETVSC_RECEIVE_BUFFER_SIZE		(1024*1024*16)	/* 16MB */
+ #define NETVSC_RECEIVE_BUFFER_SIZE_LEGACY	(1024*1024*15)  /* 15MB */
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 6db06d7e4863..94ae8d8231e1 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -894,19 +894,12 @@ static int netvsc_change_mtu(struct net_device *ndev, int mtu)
+ 	struct netvsc_device *nvdev = ndevctx->nvdev;
+ 	struct hv_device *hdev = ndevctx->device_ctx;
+ 	struct netvsc_device_info device_info;
+-	int limit = ETH_DATA_LEN;
+ 	u32 num_chn;
+ 	int ret = 0;
+ 
+ 	if (ndevctx->start_remove || !nvdev || nvdev->destroy)
+ 		return -ENODEV;
+ 
+-	if (nvdev->nvsp_version >= NVSP_PROTOCOL_VERSION_2)
+-		limit = NETVSC_MTU - ETH_HLEN;
+-
+-	if (mtu < NETVSC_MTU_MIN || mtu > limit)
+-		return -EINVAL;
+-
+ 	ret = netvsc_close(ndev);
+ 	if (ret)
+ 		goto out;
+@@ -1549,6 +1542,13 @@ static int netvsc_probe(struct hv_device *dev,
+ 	netif_set_real_num_rx_queues(net, nvdev->num_chn);
+ 	netif_set_gso_max_size(net, NETVSC_GSO_MAX_SIZE);
+ 
++	/* MTU range: 68 - 1500 or 65521 */
++	net->min_mtu = NETVSC_MTU_MIN;
++	if (nvdev->nvsp_version >= NVSP_PROTOCOL_VERSION_2)
++		net->max_mtu = NETVSC_MTU - ETH_HLEN;
++	else
++		net->max_mtu = ETH_DATA_LEN;
++
+ 	ret = register_netdev(net);
+ 	if (ret != 0) {
+ 		pr_err("Unable to register netdev.\n");
+* Unmerged path drivers/net/virtio_net.c
+diff --git a/drivers/net/vmxnet3/vmxnet3_drv.c b/drivers/net/vmxnet3/vmxnet3_drv.c
+index 69d1d533aa5f..4290bec8a0a4 100644
+--- a/drivers/net/vmxnet3/vmxnet3_drv.c
++++ b/drivers/net/vmxnet3/vmxnet3_drv.c
+@@ -2834,9 +2834,6 @@ vmxnet3_change_mtu(struct net_device *netdev, int new_mtu)
+ 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
+ 	int err = 0;
+ 
+-	if (new_mtu < VMXNET3_MIN_MTU || new_mtu > VMXNET3_MAX_MTU)
+-		return -EINVAL;
+-
+ 	netdev->mtu = new_mtu;
+ 
+ 	/*
+@@ -3265,6 +3262,10 @@ vmxnet3_probe_device(struct pci_dev *pdev,
+ 	vmxnet3_set_ethtool_ops(netdev);
+ 	netdev->watchdog_timeo = 5 * HZ;
+ 
++	/* MTU range: 60 - 9000 */
++	netdev->min_mtu = VMXNET3_MIN_MTU;
++	netdev->max_mtu = VMXNET3_MAX_MTU;
++
+ 	INIT_WORK(&adapter->work, vmxnet3_reset_work);
+ 	set_bit(VMXNET3_STATE_BIT_QUIESCED, &adapter->state);
+ 
+diff --git a/drivers/net/xen-netback/interface.c b/drivers/net/xen-netback/interface.c
+index 540a796593a3..78801a51dfb8 100644
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -158,7 +158,7 @@ static int xenvif_close(struct net_device *dev)
+ static int xenvif_change_mtu(struct net_device *dev, int mtu)
+ {
+ 	struct xenvif *vif = netdev_priv(dev);
+-	int max = vif->can_sg ? 65535 - VLAN_ETH_HLEN : ETH_DATA_LEN;
++	int max = vif->can_sg ? ETH_MAX_MTU - VLAN_ETH_HLEN : ETH_DATA_LEN;
+ 
+ 	if (mtu > max)
+ 		return -EINVAL;
+@@ -284,6 +284,9 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
+ 
+ 	dev->tx_queue_len = XENVIF_QUEUE_LENGTH;
+ 
++	dev->min_mtu = 0;
++	dev->max_mtu = ETH_MAX_MTU - VLAN_ETH_HLEN;
++
+ 	/*
+ 	 * Initialise a dummy MAC address. We choose the numerically
+ 	 * largest non-broadcast address to prevent the address getting
+* Unmerged path drivers/net/xen-netfront.c
+* Unmerged path drivers/staging/unisys/include/iochannel.h
+diff --git a/drivers/staging/unisys/visornic/visornic_main.c b/drivers/staging/unisys/visornic/visornic_main.c
+index 8c9da7ea7845..e880ce74edf6 100644
+--- a/drivers/staging/unisys/visornic/visornic_main.c
++++ b/drivers/staging/unisys/visornic/visornic_main.c
+@@ -854,7 +854,7 @@ visornic_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	 * pointing to
+ 	 */
+ 	firstfraglen = skb->len - skb->data_len;
+-	if (firstfraglen < ETH_HEADER_SIZE) {
++	if (firstfraglen < ETH_HLEN) {
+ 		spin_unlock_irqrestore(&devdata->priv_lock, flags);
+ 		devdata->busy_cnt++;
+ 		dev_err(&netdev->dev,
+@@ -928,7 +928,7 @@ visornic_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	/* copy ethernet header from first frag into ocmdrsp
+ 	 * - everything else will be pass in frags & DMA'ed
+ 	 */
+-	memcpy(cmdrsp->net.xmt.ethhdr, skb->data, ETH_HEADER_SIZE);
++	memcpy(cmdrsp->net.xmt.ethhdr, skb->data, ETH_HLEN);
+ 	/* copy frags info - from skb->data we need to only provide access
+ 	 * beyond eth header
+ 	 */
