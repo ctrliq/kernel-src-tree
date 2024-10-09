@@ -1,0 +1,649 @@
+net: sched: make bstats per cpu and estimator RCU safe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: make bstats per cpu and estimator RCU safe (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 95.15%
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 22e0f8b9322cb1a48b1357e8f4ae6f5a9eca8cfa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/22e0f8b9.failed
+
+In order to run qdisc's without locking statistics and estimators
+need to be handled correctly.
+
+To resolve bstats make the statistics per cpu. And because this is
+only needed for qdiscs that are running without locks which is not
+the case for most qdiscs in the near future only create percpu
+stats when qdiscs set the TCQ_F_CPUSTATS flag.
+
+Next because estimators use the bstats to calculate packets per
+second and bytes per second the estimator code paths are updated
+to use the per cpu statistics.
+
+	Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 22e0f8b9322cb1a48b1357e8f4ae6f5a9eca8cfa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+diff --cc include/net/sch_generic.h
+index dd1e68d92a44,4b9351120fd8..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -6,7 -6,7 +6,11 @@@
+  #include <linux/rcupdate.h>
+  #include <linux/pkt_sched.h>
+  #include <linux/pkt_cls.h>
+++<<<<<<< HEAD
+ +#include <linux/dynamic_queue_limits.h>
+++=======
++ #include <linux/percpu.h>
+++>>>>>>> 22e0f8b9322c (net: sched: make bstats per cpu and estimator RCU safe)
+  #include <net/gen_stats.h>
+  #include <net/rtnetlink.h>
+  
+diff --git a/include/net/gen_stats.h b/include/net/gen_stats.h
+index ea4271dceff0..ce3c1281f2a0 100644
+--- a/include/net/gen_stats.h
++++ b/include/net/gen_stats.h
+@@ -6,6 +6,11 @@
+ #include <linux/rtnetlink.h>
+ #include <linux/pkt_sched.h>
+ 
++struct gnet_stats_basic_cpu {
++	struct gnet_stats_basic_packed bstats;
++	struct u64_stats_sync syncp;
++};
++
+ struct gnet_dump {
+ 	spinlock_t *      lock;
+ 	struct sk_buff *  skb;
+@@ -27,7 +32,11 @@ int gnet_stats_start_copy_compat(struct sk_buff *skb, int type,
+ 				 spinlock_t *lock, struct gnet_dump *d);
+ 
+ int gnet_stats_copy_basic(struct gnet_dump *d,
++			  struct gnet_stats_basic_cpu __percpu *cpu,
+ 			  struct gnet_stats_basic_packed *b);
++void __gnet_stats_copy_basic(struct gnet_stats_basic_packed *bstats,
++			     struct gnet_stats_basic_cpu __percpu *cpu,
++			     struct gnet_stats_basic_packed *b);
+ int gnet_stats_copy_rate_est(struct gnet_dump *d,
+ 			     const struct gnet_stats_basic_packed *b,
+ 			     struct gnet_stats_rate_est64 *r);
+@@ -37,11 +46,13 @@ int gnet_stats_copy_app(struct gnet_dump *d, void *st, int len);
+ int gnet_stats_finish_copy(struct gnet_dump *d);
+ 
+ int gen_new_estimator(struct gnet_stats_basic_packed *bstats,
++		      struct gnet_stats_basic_cpu __percpu *cpu_bstats,
+ 		      struct gnet_stats_rate_est64 *rate_est,
+ 		      spinlock_t *stats_lock, struct nlattr *opt);
+ void gen_kill_estimator(struct gnet_stats_basic_packed *bstats,
+ 			struct gnet_stats_rate_est64 *rate_est);
+ int gen_replace_estimator(struct gnet_stats_basic_packed *bstats,
++			  struct gnet_stats_basic_cpu __percpu *cpu_bstats,
+ 			  struct gnet_stats_rate_est64 *rate_est,
+ 			  spinlock_t *stats_lock, struct nlattr *opt);
+ bool gen_estimator_active(const struct gnet_stats_basic_packed *bstats,
+* Unmerged path include/net/sch_generic.h
+diff --git a/net/core/gen_estimator.c b/net/core/gen_estimator.c
+index 6b5b6e7013ca..c0cc56f4159e 100644
+--- a/net/core/gen_estimator.c
++++ b/net/core/gen_estimator.c
+@@ -91,6 +91,8 @@ struct gen_estimator
+ 	u32			avpps;
+ 	struct rcu_head		e_rcu;
+ 	struct rb_node		node;
++	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
++	struct rcu_head		head;
+ };
+ 
+ struct gen_estimator_head
+@@ -115,9 +117,8 @@ static void est_timer(unsigned long arg)
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(e, &elist[idx].list, list) {
+-		u64 nbytes;
++		struct gnet_stats_basic_packed b = {0};
+ 		u64 brate;
+-		u32 npackets;
+ 		u32 rate;
+ 
+ 		spin_lock(e->stats_lock);
+@@ -125,15 +126,15 @@ static void est_timer(unsigned long arg)
+ 		if (e->bstats == NULL)
+ 			goto skip;
+ 
+-		nbytes = e->bstats->bytes;
+-		npackets = e->bstats->packets;
+-		brate = (nbytes - e->last_bytes)<<(7 - idx);
+-		e->last_bytes = nbytes;
++		__gnet_stats_copy_basic(&b, e->cpu_bstats, e->bstats);
++
++		brate = (b.bytes - e->last_bytes)<<(7 - idx);
++		e->last_bytes = b.bytes;
+ 		e->avbps += (brate >> e->ewma_log) - (e->avbps >> e->ewma_log);
+ 		e->rate_est->bps = (e->avbps+0xF)>>5;
+ 
+-		rate = (npackets - e->last_packets)<<(12 - idx);
+-		e->last_packets = npackets;
++		rate = (b.packets - e->last_packets)<<(12 - idx);
++		e->last_packets = b.packets;
+ 		e->avpps += (rate >> e->ewma_log) - (e->avpps >> e->ewma_log);
+ 		e->rate_est->pps = (e->avpps+0x1FF)>>10;
+ skip:
+@@ -203,12 +204,14 @@ struct gen_estimator *gen_find_node(const struct gnet_stats_basic_packed *bstats
+  *
+  */
+ int gen_new_estimator(struct gnet_stats_basic_packed *bstats,
++		      struct gnet_stats_basic_cpu __percpu *cpu_bstats,
+ 		      struct gnet_stats_rate_est64 *rate_est,
+ 		      spinlock_t *stats_lock,
+ 		      struct nlattr *opt)
+ {
+ 	struct gen_estimator *est;
+ 	struct gnet_estimator *parm = nla_data(opt);
++	struct gnet_stats_basic_packed b = {0};
+ 	int idx;
+ 
+ 	if (nla_len(opt) < sizeof(*parm))
+@@ -221,15 +224,18 @@ int gen_new_estimator(struct gnet_stats_basic_packed *bstats,
+ 	if (est == NULL)
+ 		return -ENOBUFS;
+ 
++	__gnet_stats_copy_basic(&b, cpu_bstats, bstats);
++
+ 	idx = parm->interval + 2;
+ 	est->bstats = bstats;
+ 	est->rate_est = rate_est;
+ 	est->stats_lock = stats_lock;
+ 	est->ewma_log = parm->ewma_log;
+-	est->last_bytes = bstats->bytes;
++	est->last_bytes = b.bytes;
+ 	est->avbps = rate_est->bps<<5;
+-	est->last_packets = bstats->packets;
++	est->last_packets = b.packets;
+ 	est->avpps = rate_est->pps<<10;
++	est->cpu_bstats = cpu_bstats;
+ 
+ 	spin_lock_bh(&est_tree_lock);
+ 	if (!elist[idx].timer.function) {
+@@ -290,11 +296,12 @@ EXPORT_SYMBOL(gen_kill_estimator);
+  * Returns 0 on success or a negative error code.
+  */
+ int gen_replace_estimator(struct gnet_stats_basic_packed *bstats,
++			  struct gnet_stats_basic_cpu __percpu *cpu_bstats,
+ 			  struct gnet_stats_rate_est64 *rate_est,
+ 			  spinlock_t *stats_lock, struct nlattr *opt)
+ {
+ 	gen_kill_estimator(bstats, rate_est);
+-	return gen_new_estimator(bstats, rate_est, stats_lock, opt);
++	return gen_new_estimator(bstats, cpu_bstats, rate_est, stats_lock, opt);
+ }
+ EXPORT_SYMBOL(gen_replace_estimator);
+ 
+diff --git a/net/core/gen_stats.c b/net/core/gen_stats.c
+index 9d3d9e78397b..bf84b8bfac01 100644
+--- a/net/core/gen_stats.c
++++ b/net/core/gen_stats.c
+@@ -97,6 +97,43 @@ gnet_stats_start_copy(struct sk_buff *skb, int type, spinlock_t *lock,
+ }
+ EXPORT_SYMBOL(gnet_stats_start_copy);
+ 
++static void
++__gnet_stats_copy_basic_cpu(struct gnet_stats_basic_packed *bstats,
++			    struct gnet_stats_basic_cpu __percpu *cpu)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		struct gnet_stats_basic_cpu *bcpu = per_cpu_ptr(cpu, i);
++		unsigned int start;
++		__u64 bytes;
++		__u32 packets;
++
++		do {
++			start = u64_stats_fetch_begin_irq(&bcpu->syncp);
++			bytes = bcpu->bstats.bytes;
++			packets = bcpu->bstats.packets;
++		} while (u64_stats_fetch_retry_irq(&bcpu->syncp, start));
++
++		bstats->bytes += bcpu->bstats.bytes;
++		bstats->packets += bcpu->bstats.packets;
++	}
++}
++
++void
++__gnet_stats_copy_basic(struct gnet_stats_basic_packed *bstats,
++			struct gnet_stats_basic_cpu __percpu *cpu,
++			struct gnet_stats_basic_packed *b)
++{
++	if (cpu) {
++		__gnet_stats_copy_basic_cpu(bstats, cpu);
++	} else {
++		bstats->bytes = b->bytes;
++		bstats->packets = b->packets;
++	}
++}
++EXPORT_SYMBOL(__gnet_stats_copy_basic);
++
+ /**
+  * gnet_stats_copy_basic - copy basic statistics into statistic TLV
+  * @d: dumping handle
+@@ -109,19 +146,25 @@ EXPORT_SYMBOL(gnet_stats_start_copy);
+  * if the room in the socket buffer was not sufficient.
+  */
+ int
+-gnet_stats_copy_basic(struct gnet_dump *d, struct gnet_stats_basic_packed *b)
++gnet_stats_copy_basic(struct gnet_dump *d,
++		      struct gnet_stats_basic_cpu __percpu *cpu,
++		      struct gnet_stats_basic_packed *b)
+ {
++	struct gnet_stats_basic_packed bstats = {0};
++
++	__gnet_stats_copy_basic(&bstats, cpu, b);
++
+ 	if (d->compat_tc_stats) {
+-		d->tc_stats.bytes = b->bytes;
+-		d->tc_stats.packets = b->packets;
++		d->tc_stats.bytes = bstats.bytes;
++		d->tc_stats.packets = bstats.packets;
+ 	}
+ 
+ 	if (d->tail) {
+ 		struct gnet_stats_basic sb;
+ 
+ 		memset(&sb, 0, sizeof(sb));
+-		sb.bytes = b->bytes;
+-		sb.packets = b->packets;
++		sb.bytes = bstats.bytes;
++		sb.packets = bstats.packets;
+ 		return gnet_stats_copy(d, TCA_STATS_BASIC, &sb, sizeof(sb));
+ 	}
+ 	return 0;
+diff --git a/net/netfilter/xt_RATEEST.c b/net/netfilter/xt_RATEEST.c
+index 370adf622cef..604df6fae6fc 100644
+--- a/net/netfilter/xt_RATEEST.c
++++ b/net/netfilter/xt_RATEEST.c
+@@ -136,7 +136,7 @@ static int xt_rateest_tg_checkentry(const struct xt_tgchk_param *par)
+ 	cfg.est.interval	= info->interval;
+ 	cfg.est.ewma_log	= info->ewma_log;
+ 
+-	ret = gen_new_estimator(&est->bstats, &est->rstats,
++	ret = gen_new_estimator(&est->bstats, NULL, &est->rstats,
+ 				&est->lock, &cfg.opt);
+ 	if (ret < 0)
+ 		goto err2;
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index 71f2bdf1efd8..31e187c8e70d 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -238,7 +238,8 @@ struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est,
+ 	p->tcfc_tm.install = jiffies;
+ 	p->tcfc_tm.lastuse = jiffies;
+ 	if (est) {
+-		int err = gen_new_estimator(&p->tcfc_bstats, &p->tcfc_rate_est,
++		int err = gen_new_estimator(&p->tcfc_bstats, NULL,
++					    &p->tcfc_rate_est,
+ 					    &p->tcfc_lock, est);
+ 		if (err) {
+ 			kfree(p);
+@@ -585,7 +586,7 @@ int tcf_action_copy_stats(struct sk_buff *skb, struct tc_action *a,
+ 	if (err < 0)
+ 		goto errout;
+ 
+-	if (gnet_stats_copy_basic(&d, &p->tcfc_bstats) < 0 ||
++	if (gnet_stats_copy_basic(&d, NULL, &p->tcfc_bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(&d, &p->tcfc_bstats,
+ 				     &p->tcfc_rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(&d, &p->tcfc_qstats) < 0)
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index 376c02554325..328ecc704026 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -211,7 +211,7 @@ override:
+ 
+ 	spin_lock_bh(&police->tcf_lock);
+ 	if (est) {
+-		err = gen_replace_estimator(&police->tcf_bstats,
++		err = gen_replace_estimator(&police->tcf_bstats, NULL,
+ 					    &police->tcf_rate_est,
+ 					    &police->tcf_lock, est);
+ 		if (err)
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index 41f2533fbfbd..92094c2e3df4 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -945,6 +945,13 @@ qdisc_create(struct net_device *dev, struct netdev_queue *dev_queue,
+ 	sch->handle = handle;
+ 
+ 	if (!ops->init || (err = ops->init(sch, tca[TCA_OPTIONS])) == 0) {
++		if (qdisc_is_percpu_stats(sch)) {
++			sch->cpu_bstats =
++				alloc_percpu(struct gnet_stats_basic_cpu);
++			if (!sch->cpu_bstats)
++				goto err_out4;
++		}
++
+ 		if (tca[TCA_STAB]) {
+ 			stab = qdisc_get_stab(tca[TCA_STAB]);
+ 			if (IS_ERR(stab)) {
+@@ -967,8 +974,11 @@ qdisc_create(struct net_device *dev, struct netdev_queue *dev_queue,
+ 			else
+ 				root_lock = qdisc_lock(sch);
+ 
+-			err = gen_new_estimator(&sch->bstats, &sch->rate_est,
+-						root_lock, tca[TCA_RATE]);
++			err = gen_new_estimator(&sch->bstats,
++						sch->cpu_bstats,
++						&sch->rate_est,
++						root_lock,
++						tca[TCA_RATE]);
+ 			if (err)
+ 				goto err_out4;
+ 		}
+@@ -987,6 +997,7 @@ err_out:
+ 	return NULL;
+ 
+ err_out4:
++	free_percpu(sch->cpu_bstats);
+ 	/*
+ 	 * Any broken qdiscs that would require a ops->reset() here?
+ 	 * The qdisc was never in action so it shouldn't be necessary.
+@@ -1025,9 +1036,11 @@ static int qdisc_change(struct Qdisc *sch, struct nlattr **tca)
+ 		   because change can't be undone. */
+ 		if (sch->flags & TCQ_F_MQROOT)
+ 			goto out;
+-		gen_replace_estimator(&sch->bstats, &sch->rate_est,
+-					    qdisc_root_sleeping_lock(sch),
+-					    tca[TCA_RATE]);
++		gen_replace_estimator(&sch->bstats,
++				      sch->cpu_bstats,
++				      &sch->rate_est,
++				      qdisc_root_sleeping_lock(sch),
++				      tca[TCA_RATE]);
+ 	}
+ out:
+ 	return 0;
+@@ -1301,6 +1314,7 @@ graft:
+ static int tc_fill_qdisc(struct sk_buff *skb, struct Qdisc *q, u32 clid,
+ 			 u32 portid, u32 seq, u16 flags, int event)
+ {
++	struct gnet_stats_basic_cpu __percpu *cpu_bstats = NULL;
+ 	struct tcmsg *tcm;
+ 	struct nlmsghdr  *nlh;
+ 	unsigned char *b = skb_tail_pointer(skb);
+@@ -1336,7 +1350,10 @@ static int tc_fill_qdisc(struct sk_buff *skb, struct Qdisc *q, u32 clid,
+ 	if (q->ops->dump_stats && q->ops->dump_stats(q, &d) < 0)
+ 		goto nla_put_failure;
+ 
+-	if (gnet_stats_copy_basic(&d, &q->bstats) < 0 ||
++	if (qdisc_is_percpu_stats(q))
++		cpu_bstats = q->cpu_bstats;
++
++	if (gnet_stats_copy_basic(&d, cpu_bstats, &q->bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(&d, &q->bstats, &q->rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(&d, &q->qstats) < 0)
+ 		goto nla_put_failure;
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index a5c6ce48ef31..726cce999768 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -637,7 +637,7 @@ atm_tc_dump_class_stats(struct Qdisc *sch, unsigned long arg,
+ 
+ 	flow->qstats.qlen = flow->q->q.qlen;
+ 
+-	if (gnet_stats_copy_basic(d, &flow->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &flow->bstats) < 0 ||
+ 	    gnet_stats_copy_queue(d, &flow->qstats) < 0)
+ 		return -1;
+ 
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 3389351a8374..a6e07248a988 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -1618,7 +1618,7 @@ cbq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
+ 	if (cl->undertime != PSCHED_PASTPERFECT)
+ 		cl->xstats.undertime = cl->undertime - q->now;
+ 
+-	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl->bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl->qstats) < 0)
+ 		return -1;
+@@ -1771,7 +1771,8 @@ cbq_change_class(struct Qdisc *sch, u32 classid, u32 parentid, struct nlattr **t
+ 		}
+ 
+ 		if (tca[TCA_RATE]) {
+-			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
++			err = gen_replace_estimator(&cl->bstats, NULL,
++						    &cl->rate_est,
+ 						    qdisc_root_sleeping_lock(sch),
+ 						    tca[TCA_RATE]);
+ 			if (err) {
+@@ -1865,7 +1866,7 @@ cbq_change_class(struct Qdisc *sch, u32 classid, u32 parentid, struct nlattr **t
+ 		goto failure;
+ 
+ 	if (tca[TCA_RATE]) {
+-		err = gen_new_estimator(&cl->bstats, &cl->rate_est,
++		err = gen_new_estimator(&cl->bstats, NULL, &cl->rate_est,
+ 					qdisc_root_sleeping_lock(sch),
+ 					tca[TCA_RATE]);
+ 		if (err) {
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index 4c26ee692ff8..1f1ca03dbb26 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -88,7 +88,8 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 
+ 	if (cl != NULL) {
+ 		if (tca[TCA_RATE]) {
+-			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
++			err = gen_replace_estimator(&cl->bstats, NULL,
++						    &cl->rate_est,
+ 						    qdisc_root_sleeping_lock(sch),
+ 						    tca[TCA_RATE]);
+ 			if (err)
+@@ -116,7 +117,7 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 		cl->qdisc = &noop_qdisc;
+ 
+ 	if (tca[TCA_RATE]) {
+-		err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
++		err = gen_replace_estimator(&cl->bstats, NULL, &cl->rate_est,
+ 					    qdisc_root_sleeping_lock(sch),
+ 					    tca[TCA_RATE]);
+ 		if (err) {
+@@ -277,7 +278,7 @@ static int drr_dump_class_stats(struct Qdisc *sch, unsigned long arg,
+ 		cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
+ 	}
+ 
+-	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl->bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl->qdisc->qstats) < 0)
+ 		return -1;
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index c553287f7361..a6d9766eacc0 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -659,6 +659,9 @@ static void qdisc_rcu_free(struct rcu_head *head)
+ {
+ 	struct Qdisc *qdisc = container_of(head, struct Qdisc, rcu_head);
+ 
++	if (qdisc_is_percpu_stats(qdisc))
++		free_percpu(qdisc->cpu_bstats);
++
+ 	kfree((char *) qdisc - qdisc->padded);
+ }
+ 
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index 747f88e3d5d1..10aa0c348a98 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1014,9 +1014,12 @@ hfsc_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 		cur_time = psched_get_time();
+ 
+ 		if (tca[TCA_RATE]) {
+-			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
+-					      qdisc_root_sleeping_lock(sch),
+-					      tca[TCA_RATE]);
++			spinlock_t *lock = qdisc_root_sleeping_lock(sch);
++
++			err = gen_replace_estimator(&cl->bstats, NULL,
++						    &cl->rate_est,
++						    lock,
++						    tca[TCA_RATE]);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -1063,7 +1066,7 @@ hfsc_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 		return -ENOBUFS;
+ 
+ 	if (tca[TCA_RATE]) {
+-		err = gen_new_estimator(&cl->bstats, &cl->rate_est,
++		err = gen_new_estimator(&cl->bstats, NULL, &cl->rate_est,
+ 					qdisc_root_sleeping_lock(sch),
+ 					tca[TCA_RATE]);
+ 		if (err) {
+@@ -1370,7 +1373,7 @@ hfsc_dump_class_stats(struct Qdisc *sch, unsigned long arg,
+ 	xstats.work    = cl->cl_total;
+ 	xstats.rtwork  = cl->cl_cumul;
+ 
+-	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl->bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl->qstats) < 0)
+ 		return -1;
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 38195029b441..de4525e73b46 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -1147,7 +1147,7 @@ htb_dump_class_stats(struct Qdisc *sch, unsigned long arg, struct gnet_dump *d)
+ 	cl->xstats.tokens = PSCHED_NS2TICKS(cl->tokens);
+ 	cl->xstats.ctokens = PSCHED_NS2TICKS(cl->ctokens);
+ 
+-	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl->bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(d, NULL, &cl->rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl->qstats) < 0)
+ 		return -1;
+@@ -1403,7 +1403,8 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
+ 			goto failure;
+ 
+ 		if (htb_rate_est || tca[TCA_RATE]) {
+-			err = gen_new_estimator(&cl->bstats, &cl->rate_est,
++			err = gen_new_estimator(&cl->bstats, NULL,
++						&cl->rate_est,
+ 						qdisc_root_sleeping_lock(sch),
+ 						tca[TCA_RATE] ? : &est.nla);
+ 			if (err) {
+@@ -1465,8 +1466,11 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
+ 			parent->children++;
+ 	} else {
+ 		if (tca[TCA_RATE]) {
+-			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
+-						    qdisc_root_sleeping_lock(sch),
++			spinlock_t *lock = qdisc_root_sleeping_lock(sch);
++
++			err = gen_replace_estimator(&cl->bstats, NULL,
++						    &cl->rate_est,
++						    lock,
+ 						    tca[TCA_RATE]);
+ 			if (err)
+ 				return err;
+diff --git a/net/sched/sch_mq.c b/net/sched/sch_mq.c
+index a8b2864a696b..d3a27fb607af 100644
+--- a/net/sched/sch_mq.c
++++ b/net/sched/sch_mq.c
+@@ -201,7 +201,7 @@ static int mq_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 
+ 	sch = dev_queue->qdisc_sleeping;
+ 	sch->qstats.qlen = sch->q.qlen;
+-	if (gnet_stats_copy_basic(d, &sch->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &sch->bstats) < 0 ||
+ 	    gnet_stats_copy_queue(d, &sch->qstats) < 0)
+ 		return -1;
+ 	return 0;
+diff --git a/net/sched/sch_mqprio.c b/net/sched/sch_mqprio.c
+index 15d8c87be2b6..f63386452d37 100644
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -368,7 +368,7 @@ static int mqprio_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 		}
+ 		/* Reclaim root sleeping lock before completing stats */
+ 		spin_lock_bh(d->lock);
+-		if (gnet_stats_copy_basic(d, &bstats) < 0 ||
++		if (gnet_stats_copy_basic(d, NULL, &bstats) < 0 ||
+ 		    gnet_stats_copy_queue(d, &qstats) < 0)
+ 			return -1;
+ 	} else {
+@@ -376,7 +376,7 @@ static int mqprio_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 
+ 		sch = dev_queue->qdisc_sleeping;
+ 		sch->qstats.qlen = sch->q.qlen;
+-		if (gnet_stats_copy_basic(d, &sch->bstats) < 0 ||
++		if (gnet_stats_copy_basic(d, NULL, &sch->bstats) < 0 ||
+ 		    gnet_stats_copy_queue(d, &sch->qstats) < 0)
+ 			return -1;
+ 	}
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index c433de581b93..a66785537cf4 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -355,7 +355,7 @@ static int multiq_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 
+ 	cl_q = q->queues[cl - 1];
+ 	cl_q->qstats.qlen = cl_q->q.qlen;
+-	if (gnet_stats_copy_basic(d, &cl_q->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl_q->bstats) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl_q->qstats) < 0)
+ 		return -1;
+ 
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index 0b904a19248a..2df8ffb7b353 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -321,7 +321,7 @@ static int prio_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 
+ 	cl_q = q->queues[cl - 1];
+ 	cl_q->qstats.qlen = cl_q->q.qlen;
+-	if (gnet_stats_copy_basic(d, &cl_q->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl_q->bstats) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl_q->qstats) < 0)
+ 		return -1;
+ 
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index 2b0a5cfb2004..132831f9f042 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -459,7 +459,8 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 
+ 	if (cl != NULL) { /* modify existing class */
+ 		if (tca[TCA_RATE]) {
+-			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
++			err = gen_replace_estimator(&cl->bstats, NULL,
++						    &cl->rate_est,
+ 						    qdisc_root_sleeping_lock(sch),
+ 						    tca[TCA_RATE]);
+ 			if (err)
+@@ -484,7 +485,8 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 		cl->qdisc = &noop_qdisc;
+ 
+ 	if (tca[TCA_RATE]) {
+-		err = gen_new_estimator(&cl->bstats, &cl->rate_est,
++		err = gen_new_estimator(&cl->bstats, NULL,
++					&cl->rate_est,
+ 					qdisc_root_sleeping_lock(sch),
+ 					tca[TCA_RATE]);
+ 		if (err)
+@@ -662,7 +664,7 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
+ 	xstats.weight = cl->agg->class_weight;
+ 	xstats.lmax = cl->agg->lmax;
+ 
+-	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
++	if (gnet_stats_copy_basic(d, NULL, &cl->bstats) < 0 ||
+ 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
+ 	    gnet_stats_copy_queue(d, &cl->qdisc->qstats) < 0)
+ 		return -1;
