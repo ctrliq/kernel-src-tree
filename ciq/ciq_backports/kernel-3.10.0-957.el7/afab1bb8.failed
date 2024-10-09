@@ -1,0 +1,231 @@
+mmc: core: Make mmc_pre_req() and mmc_post_req() available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] core: Make mmc_pre_req() and mmc_post_req() available (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 95.50%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit afab1bb8b40c61458e009fdc323c9740f95fcd5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/afab1bb8.failed
+
+Make mmc_pre_req() and mmc_post_req() available to the card drivers. Later
+patches will make use of this.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit afab1bb8b40c61458e009fdc323c9740f95fcd5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/core.c
+#	drivers/mmc/core/core.h
+diff --cc drivers/mmc/core/core.c
+index b7de90751837,7ca6e4866a8b..000000000000
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@@ -625,41 -658,71 +625,106 @@@ bool mmc_is_req_done(struct mmc_host *h
+  EXPORT_SYMBOL(mmc_is_req_done);
+  
+  /**
+++<<<<<<< HEAD
+ + *	mmc_pre_req - Prepare for a new request
+ + *	@host: MMC host to prepare command
+ + *	@mrq: MMC request to prepare for
+ + *
+ + *	mmc_pre_req() is called in prior to mmc_start_req() to let
+ + *	host prepare for the new request. Preparation of a request may be
+ + *	performed while another request is running on the host.
+ + */
+ +static void mmc_pre_req(struct mmc_host *host, struct mmc_request *mrq)
+ +{
+ +	if (host->ops->pre_req)
+ +		host->ops->pre_req(host, mrq);
+ +}
+ +
+ +/**
+ + *	mmc_post_req - Post process a completed request
+ + *	@host: MMC host to post process command
+ + *	@mrq: MMC request to post process for
+ + *	@err: Error, if non zero, clean up any resources made in pre_req
+ + *
+ + *	Let the host post process a completed request. Post processing of
+ + *	a request may be performed while another reuqest is running.
+ + */
+ +static void mmc_post_req(struct mmc_host *host, struct mmc_request *mrq,
+ +			 int err)
+ +{
+ +	if (host->ops->post_req)
+ +		host->ops->post_req(host, mrq, err);
+ +}
+ +
+ +/**
+ + *	mmc_start_req - start a non-blocking request
+++=======
++  * mmc_finalize_areq() - finalize an asynchronous request
++  * @host: MMC host to finalize any ongoing request on
++  *
++  * Returns the status of the ongoing asynchronous request, but
++  * MMC_BLK_SUCCESS if no request was going on.
++  */
++ static enum mmc_blk_status mmc_finalize_areq(struct mmc_host *host)
++ {
++ 	struct mmc_context_info *context_info = &host->context_info;
++ 	enum mmc_blk_status status;
++ 
++ 	if (!host->areq)
++ 		return MMC_BLK_SUCCESS;
++ 
++ 	while (1) {
++ 		wait_event_interruptible(context_info->wait,
++ 				(context_info->is_done_rcv ||
++ 				 context_info->is_new_req));
++ 
++ 		if (context_info->is_done_rcv) {
++ 			struct mmc_command *cmd;
++ 
++ 			context_info->is_done_rcv = false;
++ 			cmd = host->areq->mrq->cmd;
++ 
++ 			if (!cmd->error || !cmd->retries ||
++ 			    mmc_card_removed(host->card)) {
++ 				status = host->areq->err_check(host->card,
++ 							       host->areq);
++ 				break; /* return status */
++ 			} else {
++ 				mmc_retune_recheck(host);
++ 				pr_info("%s: req failed (CMD%u): %d, retrying...\n",
++ 					mmc_hostname(host),
++ 					cmd->opcode, cmd->error);
++ 				cmd->retries--;
++ 				cmd->error = 0;
++ 				__mmc_start_request(host, host->areq->mrq);
++ 				continue; /* wait for done/new event again */
++ 			}
++ 		}
++ 
++ 		return MMC_BLK_NEW_REQUEST;
++ 	}
++ 
++ 	mmc_retune_release(host);
++ 
++ 	/*
++ 	 * Check BKOPS urgency for each R1 response
++ 	 */
++ 	if (host->card && mmc_card_mmc(host->card) &&
++ 	    ((mmc_resp_type(host->areq->mrq->cmd) == MMC_RSP_R1) ||
++ 	     (mmc_resp_type(host->areq->mrq->cmd) == MMC_RSP_R1B)) &&
++ 	    (host->areq->mrq->cmd->resp[0] & R1_EXCEPTION_EVENT)) {
++ 		mmc_start_bkops(host->card, true);
++ 	}
++ 
++ 	return status;
++ }
++ 
++ /**
++  *	mmc_start_areq - start an asynchronous request
+++>>>>>>> afab1bb8b40c (mmc: core: Make mmc_pre_req() and mmc_post_req() available)
+   *	@host: MMC host to start command
+ - *	@areq: asynchronous request to start
+ - *	@ret_stat: out parameter for status
+ + *	@areq: async request to start
+ + *	@error: out parameter returns 0 for success, otherwise non zero
+   *
+   *	Start a new MMC custom command request for a host.
+   *	If there is on ongoing async request wait for completion
+diff --cc drivers/mmc/core/core.h
+index 5ee561264292,3e3d21304e5f..000000000000
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@@ -97,5 -103,82 +97,86 @@@ static inline void mmc_register_pm_noti
+  static inline void mmc_unregister_pm_notifier(struct mmc_host *host) { }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ void mmc_wait_for_req_done(struct mmc_host *host, struct mmc_request *mrq);
++ bool mmc_is_req_done(struct mmc_host *host, struct mmc_request *mrq);
++ 
++ int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq);
++ 
++ struct mmc_async_req;
++ 
++ struct mmc_async_req *mmc_start_areq(struct mmc_host *host,
++ 				     struct mmc_async_req *areq,
++ 				     enum mmc_blk_status *ret_stat);
++ 
++ int mmc_erase(struct mmc_card *card, unsigned int from, unsigned int nr,
++ 		unsigned int arg);
++ int mmc_can_erase(struct mmc_card *card);
++ int mmc_can_trim(struct mmc_card *card);
++ int mmc_can_discard(struct mmc_card *card);
++ int mmc_can_sanitize(struct mmc_card *card);
++ int mmc_can_secure_erase_trim(struct mmc_card *card);
++ int mmc_erase_group_aligned(struct mmc_card *card, unsigned int from,
++ 			unsigned int nr);
++ unsigned int mmc_calc_max_discard(struct mmc_card *card);
++ 
++ int mmc_set_blocklen(struct mmc_card *card, unsigned int blocklen);
++ int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
++ 			bool is_rel_write);
++ 
++ int __mmc_claim_host(struct mmc_host *host, struct mmc_ctx *ctx,
++ 		     atomic_t *abort);
++ void mmc_release_host(struct mmc_host *host);
++ void mmc_get_card(struct mmc_card *card, struct mmc_ctx *ctx);
++ void mmc_put_card(struct mmc_card *card, struct mmc_ctx *ctx);
++ 
++ /**
++  *	mmc_claim_host - exclusively claim a host
++  *	@host: mmc host to claim
++  *
++  *	Claim a host for a set of operations.
++  */
++ static inline void mmc_claim_host(struct mmc_host *host)
++ {
++ 	__mmc_claim_host(host, NULL, NULL);
++ }
++ 
++ int mmc_cqe_start_req(struct mmc_host *host, struct mmc_request *mrq);
++ void mmc_cqe_post_req(struct mmc_host *host, struct mmc_request *mrq);
++ int mmc_cqe_recovery(struct mmc_host *host);
++ 
++ /**
++  *	mmc_pre_req - Prepare for a new request
++  *	@host: MMC host to prepare command
++  *	@mrq: MMC request to prepare for
++  *
++  *	mmc_pre_req() is called in prior to mmc_start_req() to let
++  *	host prepare for the new request. Preparation of a request may be
++  *	performed while another request is running on the host.
++  */
++ static inline void mmc_pre_req(struct mmc_host *host, struct mmc_request *mrq)
++ {
++ 	if (host->ops->pre_req)
++ 		host->ops->pre_req(host, mrq);
++ }
++ 
++ /**
++  *	mmc_post_req - Post process a completed request
++  *	@host: MMC host to post process command
++  *	@mrq: MMC request to post process for
++  *	@err: Error, if non zero, clean up any resources made in pre_req
++  *
++  *	Let the host post process a completed request. Post processing of
++  *	a request may be performed while another request is running.
++  */
++ static inline void mmc_post_req(struct mmc_host *host, struct mmc_request *mrq,
++ 				int err)
++ {
++ 	if (host->ops->post_req)
++ 		host->ops->post_req(host, mrq, err);
++ }
++ 
+++>>>>>>> afab1bb8b40c (mmc: core: Make mmc_pre_req() and mmc_post_req() available)
+  #endif
+ +
+* Unmerged path drivers/mmc/core/core.c
+* Unmerged path drivers/mmc/core/core.h
