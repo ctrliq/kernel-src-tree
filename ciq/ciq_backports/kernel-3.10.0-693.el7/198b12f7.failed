@@ -1,0 +1,137 @@
+IB/IPoIB: Fix race between ipoib_remove_one to sysfs functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Erez Shitrit <erezsh@mellanox.com>
+commit 198b12f77084244d310888dd5d643083cb5c2aa1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/198b12f7.failed
+
+In ipoib_remove_one the driver holds the rtnl_lock and tries to do some
+operation like dev_change_flags or unregister_netdev, while sysfs
+callback like ipoib_vlan_delete holds sysfs mutex and tries to hold the
+rtnl_lock via rtnl_trylock() and restart_syscall() if the lock is not
+free, meanwhile ipoib_remove_one tries to get the sysfs lock in order to
+free its sysfs directory, and we will get  a->b, b->a deadlock.
+
+    Trace like the following:
+
+        schedule+0x37/0x80
+        schedule_preempt_disabled+0xe/0x10
+        __mutex_lock_slowpath+0xb5/0x120
+        mutex_lock+0x23/0x40
+        rtnl_lock+0x15/0x20
+        netdev_run_todo+0x17c/0x320
+        rtnl_unlock+0xe/0x10
+        ipoib_vlan_delete+0x11b/0x1b0 [ib_ipoib]
+        delete_child+0x54/0x80 [ib_ipoib]
+        dev_attr_store+0x18/0x30
+        sysfs_kf_write+0x37/0x40
+        mutex_lock+0x16/0x40
+        SyS_write+0x55/0xc0
+        entry_SYSCALL_64_fastpath+0x16/0x75
+    And
+        schedule+0x37/0x80
+        __kernfs_remove+0x1a8/0x260
+        ? wake_atomic_t_function+0x60/0x60
+        kernfs_remove+0x25/0x40
+        sysfs_remove_dir+0x50/0x80
+        kobject_del+0x18/0x50
+        device_del+0x19f/0x260
+        netdev_unregister_kobject+0x6a/0x80
+        rollback_registered_many+0x1fd/0x340
+        rollback_registered+0x3c/0x70
+        unregister_netdevice_queue+0x55/0xc0
+        unregister_netdev+0x20/0x30
+        ipoib_remove_one+0x114/0x1b0 [ib_ipoib]
+        ib_unregister_client+0x4a/0x170 [ib_core]
+        ? find_module_all+0x71/0xa0
+        ipoib_cleanup_module+0x10/0x94 [ib_ipoib]
+        SyS_delete_module+0x1b5/0x210
+        entry_SYSCALL_64_fastpath+0x16/0x75
+
+The fix is by checking the flag IPOIB_FLAG_INTF_ON_DESTROY in order to
+get out from the sysfs function.
+
+Fixes: 862096a8bbf8 ("IB/ipoib: Add more rtnl_link_ops callbacks")
+Fixes: 9baa0b036410 ("IB/ipoib: Add rtnl_link_ops support")
+	Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 198b12f77084244d310888dd5d643083cb5c2aa1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib.h
+diff --cc drivers/infiniband/ulp/ipoib/ipoib.h
+index cdf4a79551a0,4f7d9b48df64..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@@ -94,6 -92,9 +94,12 @@@ enum 
+  	IPOIB_FLAG_UMCAST	  = 10,
+  	IPOIB_STOP_NEIGH_GC	  = 11,
+  	IPOIB_NEIGH_TBL_FLUSH	  = 12,
+++<<<<<<< HEAD
+++=======
++ 	IPOIB_FLAG_DEV_ADDR_SET	  = 13,
++ 	IPOIB_FLAG_DEV_ADDR_CTRL  = 14,
++ 	IPOIB_FLAG_GOING_DOWN	  = 15,
+++>>>>>>> 198b12f77084 (IB/IPoIB: Fix race between ipoib_remove_one to sysfs functions)
+  
+  	IPOIB_MAX_BACKOFF_SECONDS = 16,
+  
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib.h
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_cm.c b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+index 6e6333648557..bdc5529934de 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -1487,6 +1487,10 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
+ {
+ 	struct net_device *dev = to_net_dev(d);
+ 	int ret;
++	struct ipoib_dev_priv *priv = netdev_priv(dev);
++
++	if (test_bit(IPOIB_FLAG_GOING_DOWN, &priv->flags))
++		return -EPERM;
+ 
+ 	if (!rtnl_trylock())
+ 		return restart_syscall();
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 379887a88961..0b60d6093c92 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -2087,6 +2087,9 @@ static void ipoib_remove_one(struct ib_device *device, void *client_data)
+ 		ib_unregister_event_handler(&priv->event_handler);
+ 		flush_workqueue(ipoib_workqueue);
+ 
++		/* mark interface in the middle of destruction */
++		set_bit(IPOIB_FLAG_GOING_DOWN, &priv->flags);
++
+ 		rtnl_lock();
+ 		dev_change_flags(priv->dev, priv->dev->flags & ~IFF_UP);
+ 		rtnl_unlock();
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index fca1a882de27..d90e8229147b 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@ -129,6 +129,9 @@ int ipoib_vlan_add(struct net_device *pdev, unsigned short pkey)
+ 
+ 	ppriv = netdev_priv(pdev);
+ 
++	if (test_bit(IPOIB_FLAG_GOING_DOWN, &ppriv->flags))
++		return -EPERM;
++
+ 	snprintf(intf_name, sizeof intf_name, "%s.%04x",
+ 		 ppriv->dev->name, pkey);
+ 	priv = ipoib_intf_alloc(intf_name);
+@@ -181,6 +184,9 @@ int ipoib_vlan_delete(struct net_device *pdev, unsigned short pkey)
+ 
+ 	ppriv = netdev_priv(pdev);
+ 
++	if (test_bit(IPOIB_FLAG_GOING_DOWN, &ppriv->flags))
++		return -EPERM;
++
+ 	if (!rtnl_trylock())
+ 		return restart_syscall();
+ 
