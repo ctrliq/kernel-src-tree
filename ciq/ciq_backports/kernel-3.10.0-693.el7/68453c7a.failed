@@ -1,0 +1,182 @@
+nfp: centralize runtime reconfiguration logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 68453c7a8973399441080bcb20512d38033e64f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/68453c7a.failed
+
+All functions which need to reallocate ring resources at runtime
+look very similar.  Centralize that logic into a separate function.
+Encapsulate configuration parameters in a structure.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 68453c7a8973399441080bcb20512d38033e64f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 36b6294ec9a7,e58532d27c5b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -2227,71 -2262,34 +2234,88 @@@ static void nfp_net_set_rx_mode(struct 
+  	nn->ctrl = new_ctrl;
+  }
+  
+- static int nfp_net_change_mtu(struct net_device *netdev, int new_mtu)
++ static int
++ nfp_net_ring_swap_enable(struct nfp_net *nn,
++ 			 struct nfp_net_ring_set *rx,
++ 			 struct nfp_net_ring_set *tx)
+  {
+- 	unsigned int old_mtu, old_fl_bufsz, new_fl_bufsz;
+- 	struct nfp_net *nn = netdev_priv(netdev);
+- 	struct nfp_net_rx_ring *tmp_rings;
+- 	int err;
++ 	if (rx)
++ 		nfp_net_shadow_rx_rings_swap(nn, rx);
++ 	if (tx)
++ 		nfp_net_shadow_tx_rings_swap(nn, tx);
+  
+++<<<<<<< HEAD
+ +	if (new_mtu < 68 || new_mtu > nn->max_mtu) {
+ +		nn_err(nn, "New MTU (%d) is not valid\n", new_mtu);
+ +		return -EINVAL;
+ +	}
+ +
+ +	old_mtu = netdev->mtu;
+ +	old_fl_bufsz = nn->fl_bufsz;
+ +	new_fl_bufsz = NFP_NET_MAX_PREPEND + ETH_HLEN + VLAN_HLEN * 2 + new_mtu;
+ +
+ +	if (!netif_running(netdev)) {
+ +		netdev->mtu = new_mtu;
+ +		nn->fl_bufsz = new_fl_bufsz;
+ +		return 0;
+ +	}
+ +
+ +	/* Prepare new rings */
+ +	tmp_rings = nfp_net_shadow_rx_rings_prepare(nn, new_fl_bufsz,
+ +						    nn->rxd_cnt);
+ +	if (!tmp_rings)
+ +		return -ENOMEM;
+ +
+ +	/* Stop device, swap in new rings, try to start the firmware */
+ +	nfp_net_close_stack(nn);
+ +	nfp_net_clear_config_and_disable(nn);
+ +
+ +	tmp_rings = nfp_net_shadow_rx_rings_swap(nn, tmp_rings);
+ +
+ +	netdev->mtu = new_mtu;
+ +	nn->fl_bufsz = new_fl_bufsz;
+ +
+ +	err = nfp_net_set_config_and_enable(nn);
+ +	if (err) {
+ +		const int err_new = err;
+ +
+ +		/* Try with old configuration and old rings */
+ +		tmp_rings = nfp_net_shadow_rx_rings_swap(nn, tmp_rings);
+ +
+ +		netdev->mtu = old_mtu;
+ +		nn->fl_bufsz = old_fl_bufsz;
+ +
+ +		err = __nfp_net_set_config_and_enable(nn);
+ +		if (err)
+ +			nn_err(nn, "Can't restore MTU - FW communication failed (%d,%d)\n",
+ +			       err_new, err);
+ +	}
+ +
+ +	nfp_net_shadow_rx_rings_free(nn, tmp_rings);
+ +
+ +	nfp_net_open_stack(nn);
+ +
+ +	return err;
+++=======
++ 	return __nfp_net_set_config_and_enable(nn);
+++>>>>>>> 68453c7a8973 (nfp: centralize runtime reconfiguration logic)
+  }
+  
+- int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt)
++ static void
++ nfp_net_ring_reconfig_down(struct nfp_net *nn,
++ 			   struct nfp_net_ring_set *rx,
++ 			   struct nfp_net_ring_set *tx)
++ {
++ 	nn->netdev->mtu = rx ? rx->mtu : nn->netdev->mtu;
++ 	nn->fl_bufsz = nfp_net_calc_fl_bufsz(nn, nn->netdev->mtu);
++ 	nn->rxd_cnt = rx ? rx->dcnt : nn->rxd_cnt;
++ 	nn->txd_cnt = tx ? tx->dcnt : nn->txd_cnt;
++ }
++ 
++ int
++ nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
++ 		      struct nfp_net_ring_set *tx)
+  {
+- 	struct nfp_net_tx_ring *tx_rings = NULL;
+- 	struct nfp_net_rx_ring *rx_rings = NULL;
+- 	u32 old_rxd_cnt, old_txd_cnt;
+  	int err;
+  
+  	if (!netif_running(nn->netdev)) {
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index aecadca0b473..187668747377 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -560,6 +560,12 @@ struct nfp_net {
+ 	struct dentry *debugfs_dir;
+ };
+ 
++struct nfp_net_ring_set {
++	unsigned int mtu;
++	unsigned int dcnt;
++	void *rings;
++};
++
+ /* Functions to read/write from/to a BAR
+  * Performs any endian conversion necessary.
+  */
+@@ -734,7 +740,9 @@ void nfp_net_rss_write_key(struct nfp_net *nn);
+ void nfp_net_coalesce_write_cfg(struct nfp_net *nn);
+ int nfp_net_irqs_alloc(struct nfp_net *nn);
+ void nfp_net_irqs_disable(struct nfp_net *nn);
+-int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt);
++int
++nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
++		      struct nfp_net_ring_set *tx);
+ 
+ #ifdef CONFIG_NFP_NET_DEBUG
+ void nfp_net_debugfs_create(void);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 2ec44232cd0b..79ae509703e1 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@ -146,6 +146,25 @@ static void nfp_net_get_ringparam(struct net_device *netdev,
+ 	ring->tx_pending = nn->txd_cnt;
+ }
+ 
++static int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt)
++{
++	struct nfp_net_ring_set *reconfig_rx = NULL, *reconfig_tx = NULL;
++	struct nfp_net_ring_set rx = {
++		.mtu = nn->netdev->mtu,
++		.dcnt = rxd_cnt,
++	};
++	struct nfp_net_ring_set tx = {
++		.dcnt = txd_cnt,
++	};
++
++	if (nn->rxd_cnt != rxd_cnt)
++		reconfig_rx = &rx;
++	if (nn->txd_cnt != txd_cnt)
++		reconfig_tx = &tx;
++
++	return nfp_net_ring_reconfig(nn, reconfig_rx, reconfig_tx);
++}
++
+ static int nfp_net_set_ringparam(struct net_device *netdev,
+ 				 struct ethtool_ringparam *ring)
+ {
