@@ -1,0 +1,2145 @@
+kernfs: associate a new kernfs_node with its parent on creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit db4aad209bc9aefd91f0a9aeb9e37364088b39ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/db4aad20.failed
+
+Once created, a kernfs_node is always destroyed by kernfs_put().
+Since ba7443bc656e ("sysfs, kernfs: implement
+kernfs_create/destroy_root()"), kernfs_put() depends on kernfs_root()
+to locate the ino_ida.  kernfs_root() in turn depends on
+kernfs_node->parent being set for !dir nodes.  This means that
+kernfs_put() of a !dir node requires its ->parent to be initialized.
+
+This leads to oops when a newly created !dir node is destroyed without
+going through kernfs_add_one() or after failing kernfs_add_one()
+before ->parent is set.  kernfs_root() invoked from kernfs_put() will
+try to dereference NULL parent.
+
+Fix it by moving parent association to kernfs_new_node() from
+kernfs_add_one().  kernfs_new_node() now takes @parent instead of
+@root and determines the root from the parent and also sets the new
+node's parent properly.  @parent parameter is removed from
+kernfs_add_one().  As there's no parent when creating the root node,
+__kernfs_new_node() which takes @root as before and doesn't set the
+parent is used in that case.
+
+This ensures that a kernfs_node in any stage in its life has its
+parent associated and thus can be put.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit db4aad209bc9aefd91f0a9aeb9e37364088b39ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/dir.c
+#	fs/kernfs/file.c
+#	fs/kernfs/kernfs-internal.h
+#	fs/kernfs/symlink.c
+diff --cc fs/kernfs/dir.c
+index 1061602ce81a,5104cf5d25c5..000000000000
+--- a/fs/kernfs/dir.c
++++ b/fs/kernfs/dir.c
+@@@ -7,3 -7,1067 +7,1070 @@@
+   *
+   * This file is released under the GPLv2.
+   */
+++<<<<<<< HEAD
+++=======
++ 
++ #include <linux/fs.h>
++ #include <linux/namei.h>
++ #include <linux/idr.h>
++ #include <linux/slab.h>
++ #include <linux/security.h>
++ #include <linux/hash.h>
++ 
++ #include "kernfs-internal.h"
++ 
++ DEFINE_MUTEX(kernfs_mutex);
++ 
++ #define rb_to_kn(X) rb_entry((X), struct kernfs_node, rb)
++ 
++ /**
++  *	kernfs_name_hash
++  *	@name: Null terminated string to hash
++  *	@ns:   Namespace tag to hash
++  *
++  *	Returns 31 bit hash of ns + name (so it fits in an off_t )
++  */
++ static unsigned int kernfs_name_hash(const char *name, const void *ns)
++ {
++ 	unsigned long hash = init_name_hash();
++ 	unsigned int len = strlen(name);
++ 	while (len--)
++ 		hash = partial_name_hash(*name++, hash);
++ 	hash = (end_name_hash(hash) ^ hash_ptr((void *)ns, 31));
++ 	hash &= 0x7fffffffU;
++ 	/* Reserve hash numbers 0, 1 and INT_MAX for magic directory entries */
++ 	if (hash < 1)
++ 		hash += 2;
++ 	if (hash >= INT_MAX)
++ 		hash = INT_MAX - 1;
++ 	return hash;
++ }
++ 
++ static int kernfs_name_compare(unsigned int hash, const char *name,
++ 			       const void *ns, const struct kernfs_node *kn)
++ {
++ 	if (hash != kn->hash)
++ 		return hash - kn->hash;
++ 	if (ns != kn->ns)
++ 		return ns - kn->ns;
++ 	return strcmp(name, kn->name);
++ }
++ 
++ static int kernfs_sd_compare(const struct kernfs_node *left,
++ 			     const struct kernfs_node *right)
++ {
++ 	return kernfs_name_compare(left->hash, left->name, left->ns, right);
++ }
++ 
++ /**
++  *	kernfs_link_sibling - link kernfs_node into sibling rbtree
++  *	@kn: kernfs_node of interest
++  *
++  *	Link @kn into its sibling rbtree which starts from
++  *	@kn->parent->dir.children.
++  *
++  *	Locking:
++  *	mutex_lock(kernfs_mutex)
++  *
++  *	RETURNS:
++  *	0 on susccess -EEXIST on failure.
++  */
++ static int kernfs_link_sibling(struct kernfs_node *kn)
++ {
++ 	struct rb_node **node = &kn->parent->dir.children.rb_node;
++ 	struct rb_node *parent = NULL;
++ 
++ 	if (kernfs_type(kn) == KERNFS_DIR)
++ 		kn->parent->dir.subdirs++;
++ 
++ 	while (*node) {
++ 		struct kernfs_node *pos;
++ 		int result;
++ 
++ 		pos = rb_to_kn(*node);
++ 		parent = *node;
++ 		result = kernfs_sd_compare(kn, pos);
++ 		if (result < 0)
++ 			node = &pos->rb.rb_left;
++ 		else if (result > 0)
++ 			node = &pos->rb.rb_right;
++ 		else
++ 			return -EEXIST;
++ 	}
++ 	/* add new node and rebalance the tree */
++ 	rb_link_node(&kn->rb, parent, node);
++ 	rb_insert_color(&kn->rb, &kn->parent->dir.children);
++ 	return 0;
++ }
++ 
++ /**
++  *	kernfs_unlink_sibling - unlink kernfs_node from sibling rbtree
++  *	@kn: kernfs_node of interest
++  *
++  *	Unlink @kn from its sibling rbtree which starts from
++  *	kn->parent->dir.children.
++  *
++  *	Locking:
++  *	mutex_lock(kernfs_mutex)
++  */
++ static void kernfs_unlink_sibling(struct kernfs_node *kn)
++ {
++ 	if (kernfs_type(kn) == KERNFS_DIR)
++ 		kn->parent->dir.subdirs--;
++ 
++ 	rb_erase(&kn->rb, &kn->parent->dir.children);
++ }
++ 
++ /**
++  *	kernfs_get_active - get an active reference to kernfs_node
++  *	@kn: kernfs_node to get an active reference to
++  *
++  *	Get an active reference of @kn.  This function is noop if @kn
++  *	is NULL.
++  *
++  *	RETURNS:
++  *	Pointer to @kn on success, NULL on failure.
++  */
++ struct kernfs_node *kernfs_get_active(struct kernfs_node *kn)
++ {
++ 	if (unlikely(!kn))
++ 		return NULL;
++ 
++ 	if (!atomic_inc_unless_negative(&kn->active))
++ 		return NULL;
++ 
++ 	if (kn->flags & KERNFS_LOCKDEP)
++ 		rwsem_acquire_read(&kn->dep_map, 0, 1, _RET_IP_);
++ 	return kn;
++ }
++ 
++ /**
++  *	kernfs_put_active - put an active reference to kernfs_node
++  *	@kn: kernfs_node to put an active reference to
++  *
++  *	Put an active reference to @kn.  This function is noop if @kn
++  *	is NULL.
++  */
++ void kernfs_put_active(struct kernfs_node *kn)
++ {
++ 	int v;
++ 
++ 	if (unlikely(!kn))
++ 		return;
++ 
++ 	if (kn->flags & KERNFS_LOCKDEP)
++ 		rwsem_release(&kn->dep_map, 1, _RET_IP_);
++ 	v = atomic_dec_return(&kn->active);
++ 	if (likely(v != KN_DEACTIVATED_BIAS))
++ 		return;
++ 
++ 	/*
++ 	 * atomic_dec_return() is a mb(), we'll always see the updated
++ 	 * kn->u.completion.
++ 	 */
++ 	complete(kn->u.completion);
++ }
++ 
++ /**
++  *	kernfs_deactivate - deactivate kernfs_node
++  *	@kn: kernfs_node to deactivate
++  *
++  *	Deny new active references and drain existing ones.
++  */
++ static void kernfs_deactivate(struct kernfs_node *kn)
++ {
++ 	DECLARE_COMPLETION_ONSTACK(wait);
++ 	int v;
++ 
++ 	BUG_ON(!(kn->flags & KERNFS_REMOVED));
++ 
++ 	if (!(kernfs_type(kn) & KERNFS_ACTIVE_REF))
++ 		return;
++ 
++ 	kn->u.completion = (void *)&wait;
++ 
++ 	rwsem_acquire(&kn->dep_map, 0, 0, _RET_IP_);
++ 	/* atomic_add_return() is a mb(), put_active() will always see
++ 	 * the updated kn->u.completion.
++ 	 */
++ 	v = atomic_add_return(KN_DEACTIVATED_BIAS, &kn->active);
++ 
++ 	if (v != KN_DEACTIVATED_BIAS) {
++ 		lock_contended(&kn->dep_map, _RET_IP_);
++ 		wait_for_completion(&wait);
++ 	}
++ 
++ 	lock_acquired(&kn->dep_map, _RET_IP_);
++ 	rwsem_release(&kn->dep_map, 1, _RET_IP_);
++ }
++ 
++ /**
++  * kernfs_get - get a reference count on a kernfs_node
++  * @kn: the target kernfs_node
++  */
++ void kernfs_get(struct kernfs_node *kn)
++ {
++ 	if (kn) {
++ 		WARN_ON(!atomic_read(&kn->count));
++ 		atomic_inc(&kn->count);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(kernfs_get);
++ 
++ /**
++  * kernfs_put - put a reference count on a kernfs_node
++  * @kn: the target kernfs_node
++  *
++  * Put a reference count of @kn and destroy it if it reached zero.
++  */
++ void kernfs_put(struct kernfs_node *kn)
++ {
++ 	struct kernfs_node *parent;
++ 	struct kernfs_root *root;
++ 
++ 	if (!kn || !atomic_dec_and_test(&kn->count))
++ 		return;
++ 	root = kernfs_root(kn);
++  repeat:
++ 	/* Moving/renaming is always done while holding reference.
++ 	 * kn->parent won't change beneath us.
++ 	 */
++ 	parent = kn->parent;
++ 
++ 	WARN(!(kn->flags & KERNFS_REMOVED), "kernfs: free using entry: %s/%s\n",
++ 	     parent ? parent->name : "", kn->name);
++ 
++ 	if (kernfs_type(kn) == KERNFS_LINK)
++ 		kernfs_put(kn->symlink.target_kn);
++ 	if (!(kn->flags & KERNFS_STATIC_NAME))
++ 		kfree(kn->name);
++ 	if (kn->iattr) {
++ 		if (kn->iattr->ia_secdata)
++ 			security_release_secctx(kn->iattr->ia_secdata,
++ 						kn->iattr->ia_secdata_len);
++ 		simple_xattrs_free(&kn->iattr->xattrs);
++ 	}
++ 	kfree(kn->iattr);
++ 	ida_simple_remove(&root->ino_ida, kn->ino);
++ 	kmem_cache_free(kernfs_node_cache, kn);
++ 
++ 	kn = parent;
++ 	if (kn) {
++ 		if (atomic_dec_and_test(&kn->count))
++ 			goto repeat;
++ 	} else {
++ 		/* just released the root kn, free @root too */
++ 		ida_destroy(&root->ino_ida);
++ 		kfree(root);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(kernfs_put);
++ 
++ static int kernfs_dop_revalidate(struct dentry *dentry, unsigned int flags)
++ {
++ 	struct kernfs_node *kn;
++ 
++ 	if (flags & LOOKUP_RCU)
++ 		return -ECHILD;
++ 
++ 	/* Always perform fresh lookup for negatives */
++ 	if (!dentry->d_inode)
++ 		goto out_bad_unlocked;
++ 
++ 	kn = dentry->d_fsdata;
++ 	mutex_lock(&kernfs_mutex);
++ 
++ 	/* The kernfs node has been deleted */
++ 	if (kn->flags & KERNFS_REMOVED)
++ 		goto out_bad;
++ 
++ 	/* The kernfs node has been moved? */
++ 	if (dentry->d_parent->d_fsdata != kn->parent)
++ 		goto out_bad;
++ 
++ 	/* The kernfs node has been renamed */
++ 	if (strcmp(dentry->d_name.name, kn->name) != 0)
++ 		goto out_bad;
++ 
++ 	/* The kernfs node has been moved to a different namespace */
++ 	if (kn->parent && kernfs_ns_enabled(kn->parent) &&
++ 	    kernfs_info(dentry->d_sb)->ns != kn->ns)
++ 		goto out_bad;
++ 
++ 	mutex_unlock(&kernfs_mutex);
++ out_valid:
++ 	return 1;
++ out_bad:
++ 	mutex_unlock(&kernfs_mutex);
++ out_bad_unlocked:
++ 	/*
++ 	 * @dentry doesn't match the underlying kernfs node, drop the
++ 	 * dentry and force lookup.  If we have submounts we must allow the
++ 	 * vfs caches to lie about the state of the filesystem to prevent
++ 	 * leaks and other nasty things, so use check_submounts_and_drop()
++ 	 * instead of d_drop().
++ 	 */
++ 	if (check_submounts_and_drop(dentry) != 0)
++ 		goto out_valid;
++ 
++ 	return 0;
++ }
++ 
++ static void kernfs_dop_release(struct dentry *dentry)
++ {
++ 	kernfs_put(dentry->d_fsdata);
++ }
++ 
++ const struct dentry_operations kernfs_dops = {
++ 	.d_revalidate	= kernfs_dop_revalidate,
++ 	.d_release	= kernfs_dop_release,
++ };
++ 
++ static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
++ 					     const char *name, umode_t mode,
++ 					     unsigned flags)
++ {
++ 	char *dup_name = NULL;
++ 	struct kernfs_node *kn;
++ 	int ret;
++ 
++ 	if (!(flags & KERNFS_STATIC_NAME)) {
++ 		name = dup_name = kstrdup(name, GFP_KERNEL);
++ 		if (!name)
++ 			return NULL;
++ 	}
++ 
++ 	kn = kmem_cache_zalloc(kernfs_node_cache, GFP_KERNEL);
++ 	if (!kn)
++ 		goto err_out1;
++ 
++ 	ret = ida_simple_get(&root->ino_ida, 1, 0, GFP_KERNEL);
++ 	if (ret < 0)
++ 		goto err_out2;
++ 	kn->ino = ret;
++ 
++ 	atomic_set(&kn->count, 1);
++ 	atomic_set(&kn->active, 0);
++ 
++ 	kn->name = name;
++ 	kn->mode = mode;
++ 	kn->flags = flags | KERNFS_REMOVED;
++ 
++ 	return kn;
++ 
++  err_out2:
++ 	kmem_cache_free(kernfs_node_cache, kn);
++  err_out1:
++ 	kfree(dup_name);
++ 	return NULL;
++ }
++ 
++ struct kernfs_node *kernfs_new_node(struct kernfs_node *parent,
++ 				    const char *name, umode_t mode,
++ 				    unsigned flags)
++ {
++ 	struct kernfs_node *kn;
++ 
++ 	kn = __kernfs_new_node(kernfs_root(parent), name, mode, flags);
++ 	if (kn) {
++ 		kernfs_get(parent);
++ 		kn->parent = parent;
++ 	}
++ 	return kn;
++ }
++ 
++ /**
++  *	kernfs_addrm_start - prepare for kernfs_node add/remove
++  *	@acxt: pointer to kernfs_addrm_cxt to be used
++  *
++  *	This function is called when the caller is about to add or remove
++  *	kernfs_node.  This function acquires kernfs_mutex.  @acxt is used
++  *	to keep and pass context to other addrm functions.
++  *
++  *	LOCKING:
++  *	Kernel thread context (may sleep).  kernfs_mutex is locked on
++  *	return.
++  */
++ void kernfs_addrm_start(struct kernfs_addrm_cxt *acxt)
++ 	__acquires(kernfs_mutex)
++ {
++ 	memset(acxt, 0, sizeof(*acxt));
++ 
++ 	mutex_lock(&kernfs_mutex);
++ }
++ 
++ /**
++  *	kernfs_add_one - add kernfs_node to parent without warning
++  *	@acxt: addrm context to use
++  *	@kn: kernfs_node to be added
++  *
++  *	The caller must already have initialized @kn->parent.  This
++  *	function increments nlink of the parent's inode if @kn is a
++  *	directory and link into the children list of the parent.
++  *
++  *	This function should be called between calls to
++  *	kernfs_addrm_start() and kernfs_addrm_finish() and should be passed
++  *	the same @acxt as passed to kernfs_addrm_start().
++  *
++  *	LOCKING:
++  *	Determined by kernfs_addrm_start().
++  *
++  *	RETURNS:
++  *	0 on success, -EEXIST if entry with the given name already
++  *	exists.
++  */
++ int kernfs_add_one(struct kernfs_addrm_cxt *acxt, struct kernfs_node *kn)
++ {
++ 	struct kernfs_node *parent = kn->parent;
++ 	bool has_ns = kernfs_ns_enabled(parent);
++ 	struct kernfs_iattrs *ps_iattr;
++ 	int ret;
++ 
++ 	if (has_ns != (bool)kn->ns) {
++ 		WARN(1, KERN_WARNING "kernfs: ns %s in '%s' for '%s'\n",
++ 		     has_ns ? "required" : "invalid", parent->name, kn->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (kernfs_type(parent) != KERNFS_DIR)
++ 		return -EINVAL;
++ 
++ 	if (parent->flags & KERNFS_REMOVED)
++ 		return -ENOENT;
++ 
++ 	kn->hash = kernfs_name_hash(kn->name, kn->ns);
++ 
++ 	ret = kernfs_link_sibling(kn);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Update timestamps on the parent */
++ 	ps_iattr = parent->iattr;
++ 	if (ps_iattr) {
++ 		struct iattr *ps_iattrs = &ps_iattr->ia_iattr;
++ 		ps_iattrs->ia_ctime = ps_iattrs->ia_mtime = CURRENT_TIME;
++ 	}
++ 
++ 	/* Mark the entry added into directory tree */
++ 	kn->flags &= ~KERNFS_REMOVED;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  *	kernfs_remove_one - remove kernfs_node from parent
++  *	@acxt: addrm context to use
++  *	@kn: kernfs_node to be removed
++  *
++  *	Mark @kn removed and drop nlink of parent inode if @kn is a
++  *	directory.  @kn is unlinked from the children list.
++  *
++  *	This function should be called between calls to
++  *	kernfs_addrm_start() and kernfs_addrm_finish() and should be
++  *	passed the same @acxt as passed to kernfs_addrm_start().
++  *
++  *	LOCKING:
++  *	Determined by kernfs_addrm_start().
++  */
++ static void kernfs_remove_one(struct kernfs_addrm_cxt *acxt,
++ 			      struct kernfs_node *kn)
++ {
++ 	struct kernfs_iattrs *ps_iattr;
++ 
++ 	/*
++ 	 * Removal can be called multiple times on the same node.  Only the
++ 	 * first invocation is effective and puts the base ref.
++ 	 */
++ 	if (kn->flags & KERNFS_REMOVED)
++ 		return;
++ 
++ 	if (kn->parent) {
++ 		kernfs_unlink_sibling(kn);
++ 
++ 		/* Update timestamps on the parent */
++ 		ps_iattr = kn->parent->iattr;
++ 		if (ps_iattr) {
++ 			ps_iattr->ia_iattr.ia_ctime = CURRENT_TIME;
++ 			ps_iattr->ia_iattr.ia_mtime = CURRENT_TIME;
++ 		}
++ 	}
++ 
++ 	kn->flags |= KERNFS_REMOVED;
++ 	kn->u.removed_list = acxt->removed;
++ 	acxt->removed = kn;
++ }
++ 
++ /**
++  *	kernfs_addrm_finish - finish up kernfs_node add/remove
++  *	@acxt: addrm context to finish up
++  *
++  *	Finish up kernfs_node add/remove.  Resources acquired by
++  *	kernfs_addrm_start() are released and removed kernfs_nodes are
++  *	cleaned up.
++  *
++  *	LOCKING:
++  *	kernfs_mutex is released.
++  */
++ void kernfs_addrm_finish(struct kernfs_addrm_cxt *acxt)
++ 	__releases(kernfs_mutex)
++ {
++ 	/* release resources acquired by kernfs_addrm_start() */
++ 	mutex_unlock(&kernfs_mutex);
++ 
++ 	/* kill removed kernfs_nodes */
++ 	while (acxt->removed) {
++ 		struct kernfs_node *kn = acxt->removed;
++ 
++ 		acxt->removed = kn->u.removed_list;
++ 
++ 		kernfs_deactivate(kn);
++ 		kernfs_unmap_bin_file(kn);
++ 		kernfs_put(kn);
++ 	}
++ }
++ 
++ /**
++  * kernfs_find_ns - find kernfs_node with the given name
++  * @parent: kernfs_node to search under
++  * @name: name to look for
++  * @ns: the namespace tag to use
++  *
++  * Look for kernfs_node with name @name under @parent.  Returns pointer to
++  * the found kernfs_node on success, %NULL on failure.
++  */
++ static struct kernfs_node *kernfs_find_ns(struct kernfs_node *parent,
++ 					  const unsigned char *name,
++ 					  const void *ns)
++ {
++ 	struct rb_node *node = parent->dir.children.rb_node;
++ 	bool has_ns = kernfs_ns_enabled(parent);
++ 	unsigned int hash;
++ 
++ 	lockdep_assert_held(&kernfs_mutex);
++ 
++ 	if (has_ns != (bool)ns) {
++ 		WARN(1, KERN_WARNING "kernfs: ns %s in '%s' for '%s'\n",
++ 		     has_ns ? "required" : "invalid", parent->name, name);
++ 		return NULL;
++ 	}
++ 
++ 	hash = kernfs_name_hash(name, ns);
++ 	while (node) {
++ 		struct kernfs_node *kn;
++ 		int result;
++ 
++ 		kn = rb_to_kn(node);
++ 		result = kernfs_name_compare(hash, name, ns, kn);
++ 		if (result < 0)
++ 			node = node->rb_left;
++ 		else if (result > 0)
++ 			node = node->rb_right;
++ 		else
++ 			return kn;
++ 	}
++ 	return NULL;
++ }
++ 
++ /**
++  * kernfs_find_and_get_ns - find and get kernfs_node with the given name
++  * @parent: kernfs_node to search under
++  * @name: name to look for
++  * @ns: the namespace tag to use
++  *
++  * Look for kernfs_node with name @name under @parent and get a reference
++  * if found.  This function may sleep and returns pointer to the found
++  * kernfs_node on success, %NULL on failure.
++  */
++ struct kernfs_node *kernfs_find_and_get_ns(struct kernfs_node *parent,
++ 					   const char *name, const void *ns)
++ {
++ 	struct kernfs_node *kn;
++ 
++ 	mutex_lock(&kernfs_mutex);
++ 	kn = kernfs_find_ns(parent, name, ns);
++ 	kernfs_get(kn);
++ 	mutex_unlock(&kernfs_mutex);
++ 
++ 	return kn;
++ }
++ EXPORT_SYMBOL_GPL(kernfs_find_and_get_ns);
++ 
++ /**
++  * kernfs_create_root - create a new kernfs hierarchy
++  * @kdops: optional directory syscall operations for the hierarchy
++  * @priv: opaque data associated with the new directory
++  *
++  * Returns the root of the new hierarchy on success, ERR_PTR() value on
++  * failure.
++  */
++ struct kernfs_root *kernfs_create_root(struct kernfs_dir_ops *kdops, void *priv)
++ {
++ 	struct kernfs_root *root;
++ 	struct kernfs_node *kn;
++ 
++ 	root = kzalloc(sizeof(*root), GFP_KERNEL);
++ 	if (!root)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	ida_init(&root->ino_ida);
++ 
++ 	kn = __kernfs_new_node(root, "", S_IFDIR | S_IRUGO | S_IXUGO,
++ 			       KERNFS_DIR);
++ 	if (!kn) {
++ 		ida_destroy(&root->ino_ida);
++ 		kfree(root);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	kn->flags &= ~KERNFS_REMOVED;
++ 	kn->priv = priv;
++ 	kn->dir.root = root;
++ 
++ 	root->dir_ops = kdops;
++ 	root->kn = kn;
++ 
++ 	return root;
++ }
++ 
++ /**
++  * kernfs_destroy_root - destroy a kernfs hierarchy
++  * @root: root of the hierarchy to destroy
++  *
++  * Destroy the hierarchy anchored at @root by removing all existing
++  * directories and destroying @root.
++  */
++ void kernfs_destroy_root(struct kernfs_root *root)
++ {
++ 	kernfs_remove(root->kn);	/* will also free @root */
++ }
++ 
++ /**
++  * kernfs_create_dir_ns - create a directory
++  * @parent: parent in which to create a new directory
++  * @name: name of the new directory
++  * @mode: mode of the new directory
++  * @priv: opaque data associated with the new directory
++  * @ns: optional namespace tag of the directory
++  *
++  * Returns the created node on success, ERR_PTR() value on failure.
++  */
++ struct kernfs_node *kernfs_create_dir_ns(struct kernfs_node *parent,
++ 					 const char *name, umode_t mode,
++ 					 void *priv, const void *ns)
++ {
++ 	struct kernfs_addrm_cxt acxt;
++ 	struct kernfs_node *kn;
++ 	int rc;
++ 
++ 	/* allocate */
++ 	kn = kernfs_new_node(parent, name, mode | S_IFDIR, KERNFS_DIR);
++ 	if (!kn)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	kn->dir.root = parent->dir.root;
++ 	kn->ns = ns;
++ 	kn->priv = priv;
++ 
++ 	/* link in */
++ 	kernfs_addrm_start(&acxt);
++ 	rc = kernfs_add_one(&acxt, kn);
++ 	kernfs_addrm_finish(&acxt);
++ 
++ 	if (!rc)
++ 		return kn;
++ 
++ 	kernfs_put(kn);
++ 	return ERR_PTR(rc);
++ }
++ 
++ static struct dentry *kernfs_iop_lookup(struct inode *dir,
++ 					struct dentry *dentry,
++ 					unsigned int flags)
++ {
++ 	struct dentry *ret;
++ 	struct kernfs_node *parent = dentry->d_parent->d_fsdata;
++ 	struct kernfs_node *kn;
++ 	struct inode *inode;
++ 	const void *ns = NULL;
++ 
++ 	mutex_lock(&kernfs_mutex);
++ 
++ 	if (kernfs_ns_enabled(parent))
++ 		ns = kernfs_info(dir->i_sb)->ns;
++ 
++ 	kn = kernfs_find_ns(parent, dentry->d_name.name, ns);
++ 
++ 	/* no such entry */
++ 	if (!kn) {
++ 		ret = NULL;
++ 		goto out_unlock;
++ 	}
++ 	kernfs_get(kn);
++ 	dentry->d_fsdata = kn;
++ 
++ 	/* attach dentry and inode */
++ 	inode = kernfs_get_inode(dir->i_sb, kn);
++ 	if (!inode) {
++ 		ret = ERR_PTR(-ENOMEM);
++ 		goto out_unlock;
++ 	}
++ 
++ 	/* instantiate and hash dentry */
++ 	ret = d_materialise_unique(dentry, inode);
++  out_unlock:
++ 	mutex_unlock(&kernfs_mutex);
++ 	return ret;
++ }
++ 
++ static int kernfs_iop_mkdir(struct inode *dir, struct dentry *dentry,
++ 			    umode_t mode)
++ {
++ 	struct kernfs_node *parent = dir->i_private;
++ 	struct kernfs_dir_ops *kdops = kernfs_root(parent)->dir_ops;
++ 
++ 	if (!kdops || !kdops->mkdir)
++ 		return -EPERM;
++ 
++ 	return kdops->mkdir(parent, dentry->d_name.name, mode);
++ }
++ 
++ static int kernfs_iop_rmdir(struct inode *dir, struct dentry *dentry)
++ {
++ 	struct kernfs_node *kn  = dentry->d_fsdata;
++ 	struct kernfs_dir_ops *kdops = kernfs_root(kn)->dir_ops;
++ 
++ 	if (!kdops || !kdops->rmdir)
++ 		return -EPERM;
++ 
++ 	return kdops->rmdir(kn);
++ }
++ 
++ static int kernfs_iop_rename(struct inode *old_dir, struct dentry *old_dentry,
++ 			     struct inode *new_dir, struct dentry *new_dentry)
++ {
++ 	struct kernfs_node *kn  = old_dentry->d_fsdata;
++ 	struct kernfs_node *new_parent = new_dir->i_private;
++ 	struct kernfs_dir_ops *kdops = kernfs_root(kn)->dir_ops;
++ 
++ 	if (!kdops || !kdops->rename)
++ 		return -EPERM;
++ 
++ 	return kdops->rename(kn, new_parent, new_dentry->d_name.name);
++ }
++ 
++ const struct inode_operations kernfs_dir_iops = {
++ 	.lookup		= kernfs_iop_lookup,
++ 	.permission	= kernfs_iop_permission,
++ 	.setattr	= kernfs_iop_setattr,
++ 	.getattr	= kernfs_iop_getattr,
++ 	.setxattr	= kernfs_iop_setxattr,
++ 	.removexattr	= kernfs_iop_removexattr,
++ 	.getxattr	= kernfs_iop_getxattr,
++ 	.listxattr	= kernfs_iop_listxattr,
++ 
++ 	.mkdir		= kernfs_iop_mkdir,
++ 	.rmdir		= kernfs_iop_rmdir,
++ 	.rename		= kernfs_iop_rename,
++ };
++ 
++ static struct kernfs_node *kernfs_leftmost_descendant(struct kernfs_node *pos)
++ {
++ 	struct kernfs_node *last;
++ 
++ 	while (true) {
++ 		struct rb_node *rbn;
++ 
++ 		last = pos;
++ 
++ 		if (kernfs_type(pos) != KERNFS_DIR)
++ 			break;
++ 
++ 		rbn = rb_first(&pos->dir.children);
++ 		if (!rbn)
++ 			break;
++ 
++ 		pos = rb_to_kn(rbn);
++ 	}
++ 
++ 	return last;
++ }
++ 
++ /**
++  * kernfs_next_descendant_post - find the next descendant for post-order walk
++  * @pos: the current position (%NULL to initiate traversal)
++  * @root: kernfs_node whose descendants to walk
++  *
++  * Find the next descendant to visit for post-order traversal of @root's
++  * descendants.  @root is included in the iteration and the last node to be
++  * visited.
++  */
++ static struct kernfs_node *kernfs_next_descendant_post(struct kernfs_node *pos,
++ 						       struct kernfs_node *root)
++ {
++ 	struct rb_node *rbn;
++ 
++ 	lockdep_assert_held(&kernfs_mutex);
++ 
++ 	/* if first iteration, visit leftmost descendant which may be root */
++ 	if (!pos)
++ 		return kernfs_leftmost_descendant(root);
++ 
++ 	/* if we visited @root, we're done */
++ 	if (pos == root)
++ 		return NULL;
++ 
++ 	/* if there's an unvisited sibling, visit its leftmost descendant */
++ 	rbn = rb_next(&pos->rb);
++ 	if (rbn)
++ 		return kernfs_leftmost_descendant(rb_to_kn(rbn));
++ 
++ 	/* no sibling left, visit parent */
++ 	return pos->parent;
++ }
++ 
++ static void __kernfs_remove(struct kernfs_addrm_cxt *acxt,
++ 			    struct kernfs_node *kn)
++ {
++ 	struct kernfs_node *pos, *next;
++ 
++ 	if (!kn)
++ 		return;
++ 
++ 	pr_debug("kernfs %s: removing\n", kn->name);
++ 
++ 	next = NULL;
++ 	do {
++ 		pos = next;
++ 		next = kernfs_next_descendant_post(pos, kn);
++ 		if (pos)
++ 			kernfs_remove_one(acxt, pos);
++ 	} while (next);
++ }
++ 
++ /**
++  * kernfs_remove - remove a kernfs_node recursively
++  * @kn: the kernfs_node to remove
++  *
++  * Remove @kn along with all its subdirectories and files.
++  */
++ void kernfs_remove(struct kernfs_node *kn)
++ {
++ 	struct kernfs_addrm_cxt acxt;
++ 
++ 	kernfs_addrm_start(&acxt);
++ 	__kernfs_remove(&acxt, kn);
++ 	kernfs_addrm_finish(&acxt);
++ }
++ 
++ /**
++  * kernfs_remove_by_name_ns - find a kernfs_node by name and remove it
++  * @parent: parent of the target
++  * @name: name of the kernfs_node to remove
++  * @ns: namespace tag of the kernfs_node to remove
++  *
++  * Look for the kernfs_node with @name and @ns under @parent and remove it.
++  * Returns 0 on success, -ENOENT if such entry doesn't exist.
++  */
++ int kernfs_remove_by_name_ns(struct kernfs_node *parent, const char *name,
++ 			     const void *ns)
++ {
++ 	struct kernfs_addrm_cxt acxt;
++ 	struct kernfs_node *kn;
++ 
++ 	if (!parent) {
++ 		WARN(1, KERN_WARNING "kernfs: can not remove '%s', no directory\n",
++ 			name);
++ 		return -ENOENT;
++ 	}
++ 
++ 	kernfs_addrm_start(&acxt);
++ 
++ 	kn = kernfs_find_ns(parent, name, ns);
++ 	if (kn)
++ 		__kernfs_remove(&acxt, kn);
++ 
++ 	kernfs_addrm_finish(&acxt);
++ 
++ 	if (kn)
++ 		return 0;
++ 	else
++ 		return -ENOENT;
++ }
++ 
++ /**
++  * kernfs_rename_ns - move and rename a kernfs_node
++  * @kn: target node
++  * @new_parent: new parent to put @sd under
++  * @new_name: new name
++  * @new_ns: new namespace tag
++  */
++ int kernfs_rename_ns(struct kernfs_node *kn, struct kernfs_node *new_parent,
++ 		     const char *new_name, const void *new_ns)
++ {
++ 	int error;
++ 
++ 	mutex_lock(&kernfs_mutex);
++ 
++ 	error = -ENOENT;
++ 	if ((kn->flags | new_parent->flags) & KERNFS_REMOVED)
++ 		goto out;
++ 
++ 	error = 0;
++ 	if ((kn->parent == new_parent) && (kn->ns == new_ns) &&
++ 	    (strcmp(kn->name, new_name) == 0))
++ 		goto out;	/* nothing to rename */
++ 
++ 	error = -EEXIST;
++ 	if (kernfs_find_ns(new_parent, new_name, new_ns))
++ 		goto out;
++ 
++ 	/* rename kernfs_node */
++ 	if (strcmp(kn->name, new_name) != 0) {
++ 		error = -ENOMEM;
++ 		new_name = kstrdup(new_name, GFP_KERNEL);
++ 		if (!new_name)
++ 			goto out;
++ 
++ 		if (kn->flags & KERNFS_STATIC_NAME)
++ 			kn->flags &= ~KERNFS_STATIC_NAME;
++ 		else
++ 			kfree(kn->name);
++ 
++ 		kn->name = new_name;
++ 	}
++ 
++ 	/*
++ 	 * Move to the appropriate place in the appropriate directories rbtree.
++ 	 */
++ 	kernfs_unlink_sibling(kn);
++ 	kernfs_get(new_parent);
++ 	kernfs_put(kn->parent);
++ 	kn->ns = new_ns;
++ 	kn->hash = kernfs_name_hash(kn->name, kn->ns);
++ 	kn->parent = new_parent;
++ 	kernfs_link_sibling(kn);
++ 
++ 	error = 0;
++  out:
++ 	mutex_unlock(&kernfs_mutex);
++ 	return error;
++ }
++ 
++ /* Relationship between s_mode and the DT_xxx types */
++ static inline unsigned char dt_type(struct kernfs_node *kn)
++ {
++ 	return (kn->mode >> 12) & 15;
++ }
++ 
++ static int kernfs_dir_fop_release(struct inode *inode, struct file *filp)
++ {
++ 	kernfs_put(filp->private_data);
++ 	return 0;
++ }
++ 
++ static struct kernfs_node *kernfs_dir_pos(const void *ns,
++ 	struct kernfs_node *parent, loff_t hash, struct kernfs_node *pos)
++ {
++ 	if (pos) {
++ 		int valid = !(pos->flags & KERNFS_REMOVED) &&
++ 			pos->parent == parent && hash == pos->hash;
++ 		kernfs_put(pos);
++ 		if (!valid)
++ 			pos = NULL;
++ 	}
++ 	if (!pos && (hash > 1) && (hash < INT_MAX)) {
++ 		struct rb_node *node = parent->dir.children.rb_node;
++ 		while (node) {
++ 			pos = rb_to_kn(node);
++ 
++ 			if (hash < pos->hash)
++ 				node = node->rb_left;
++ 			else if (hash > pos->hash)
++ 				node = node->rb_right;
++ 			else
++ 				break;
++ 		}
++ 	}
++ 	/* Skip over entries in the wrong namespace */
++ 	while (pos && pos->ns != ns) {
++ 		struct rb_node *node = rb_next(&pos->rb);
++ 		if (!node)
++ 			pos = NULL;
++ 		else
++ 			pos = rb_to_kn(node);
++ 	}
++ 	return pos;
++ }
++ 
++ static struct kernfs_node *kernfs_dir_next_pos(const void *ns,
++ 	struct kernfs_node *parent, ino_t ino, struct kernfs_node *pos)
++ {
++ 	pos = kernfs_dir_pos(ns, parent, ino, pos);
++ 	if (pos)
++ 		do {
++ 			struct rb_node *node = rb_next(&pos->rb);
++ 			if (!node)
++ 				pos = NULL;
++ 			else
++ 				pos = rb_to_kn(node);
++ 		} while (pos && pos->ns != ns);
++ 	return pos;
++ }
++ 
++ static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
++ {
++ 	struct dentry *dentry = file->f_path.dentry;
++ 	struct kernfs_node *parent = dentry->d_fsdata;
++ 	struct kernfs_node *pos = file->private_data;
++ 	const void *ns = NULL;
++ 
++ 	if (!dir_emit_dots(file, ctx))
++ 		return 0;
++ 	mutex_lock(&kernfs_mutex);
++ 
++ 	if (kernfs_ns_enabled(parent))
++ 		ns = kernfs_info(dentry->d_sb)->ns;
++ 
++ 	for (pos = kernfs_dir_pos(ns, parent, ctx->pos, pos);
++ 	     pos;
++ 	     pos = kernfs_dir_next_pos(ns, parent, ctx->pos, pos)) {
++ 		const char *name = pos->name;
++ 		unsigned int type = dt_type(pos);
++ 		int len = strlen(name);
++ 		ino_t ino = pos->ino;
++ 
++ 		ctx->pos = pos->hash;
++ 		file->private_data = pos;
++ 		kernfs_get(pos);
++ 
++ 		mutex_unlock(&kernfs_mutex);
++ 		if (!dir_emit(ctx, name, len, ino, type))
++ 			return 0;
++ 		mutex_lock(&kernfs_mutex);
++ 	}
++ 	mutex_unlock(&kernfs_mutex);
++ 	file->private_data = NULL;
++ 	ctx->pos = INT_MAX;
++ 	return 0;
++ }
++ 
++ static loff_t kernfs_dir_fop_llseek(struct file *file, loff_t offset,
++ 				    int whence)
++ {
++ 	struct inode *inode = file_inode(file);
++ 	loff_t ret;
++ 
++ 	mutex_lock(&inode->i_mutex);
++ 	ret = generic_file_llseek(file, offset, whence);
++ 	mutex_unlock(&inode->i_mutex);
++ 
++ 	return ret;
++ }
++ 
++ const struct file_operations kernfs_dir_fops = {
++ 	.read		= generic_read_dir,
++ 	.iterate	= kernfs_fop_readdir,
++ 	.release	= kernfs_dir_fop_release,
++ 	.llseek		= kernfs_dir_fop_llseek,
++ };
+++>>>>>>> db4aad209bc9 (kernfs: associate a new kernfs_node with its parent on creation)
+diff --cc fs/kernfs/file.c
+index 90b1e88dad44,dbf397bfdff2..000000000000
+--- a/fs/kernfs/file.c
++++ b/fs/kernfs/file.c
+@@@ -7,3 -7,861 +7,864 @@@
+   *
+   * This file is released under the GPLv2.
+   */
+++<<<<<<< HEAD
+++=======
++ 
++ #include <linux/fs.h>
++ #include <linux/seq_file.h>
++ #include <linux/slab.h>
++ #include <linux/poll.h>
++ #include <linux/pagemap.h>
++ #include <linux/sched.h>
++ 
++ #include "kernfs-internal.h"
++ 
++ /*
++  * There's one kernfs_open_file for each open file and one kernfs_open_node
++  * for each kernfs_node with one or more open files.
++  *
++  * kernfs_node->attr.open points to kernfs_open_node.  attr.open is
++  * protected by kernfs_open_node_lock.
++  *
++  * filp->private_data points to seq_file whose ->private points to
++  * kernfs_open_file.  kernfs_open_files are chained at
++  * kernfs_open_node->files, which is protected by kernfs_open_file_mutex.
++  */
++ static DEFINE_SPINLOCK(kernfs_open_node_lock);
++ static DEFINE_MUTEX(kernfs_open_file_mutex);
++ 
++ struct kernfs_open_node {
++ 	atomic_t		refcnt;
++ 	atomic_t		event;
++ 	wait_queue_head_t	poll;
++ 	struct list_head	files; /* goes through kernfs_open_file.list */
++ };
++ 
++ static struct kernfs_open_file *kernfs_of(struct file *file)
++ {
++ 	return ((struct seq_file *)file->private_data)->private;
++ }
++ 
++ /*
++  * Determine the kernfs_ops for the given kernfs_node.  This function must
++  * be called while holding an active reference.
++  */
++ static const struct kernfs_ops *kernfs_ops(struct kernfs_node *kn)
++ {
++ 	if (kn->flags & KERNFS_LOCKDEP)
++ 		lockdep_assert_held(kn);
++ 	return kn->attr.ops;
++ }
++ 
++ /*
++  * As kernfs_seq_stop() is also called after kernfs_seq_start() or
++  * kernfs_seq_next() failure, it needs to distinguish whether it's stopping
++  * a seq_file iteration which is fully initialized with an active reference
++  * or an aborted kernfs_seq_start() due to get_active failure.  The
++  * position pointer is the only context for each seq_file iteration and
++  * thus the stop condition should be encoded in it.  As the return value is
++  * directly visible to userland, ERR_PTR(-ENODEV) is the only acceptable
++  * choice to indicate get_active failure.
++  *
++  * Unfortunately, this is complicated due to the optional custom seq_file
++  * operations which may return ERR_PTR(-ENODEV) too.  kernfs_seq_stop()
++  * can't distinguish whether ERR_PTR(-ENODEV) is from get_active failure or
++  * custom seq_file operations and thus can't decide whether put_active
++  * should be performed or not only on ERR_PTR(-ENODEV).
++  *
++  * This is worked around by factoring out the custom seq_stop() and
++  * put_active part into kernfs_seq_stop_active(), skipping it from
++  * kernfs_seq_stop() if ERR_PTR(-ENODEV) while invoking it directly after
++  * custom seq_file operations fail with ERR_PTR(-ENODEV) - this ensures
++  * that kernfs_seq_stop_active() is skipped only after get_active failure.
++  */
++ static void kernfs_seq_stop_active(struct seq_file *sf, void *v)
++ {
++ 	struct kernfs_open_file *of = sf->private;
++ 	const struct kernfs_ops *ops = kernfs_ops(of->kn);
++ 
++ 	if (ops->seq_stop)
++ 		ops->seq_stop(sf, v);
++ 	kernfs_put_active(of->kn);
++ }
++ 
++ static void *kernfs_seq_start(struct seq_file *sf, loff_t *ppos)
++ {
++ 	struct kernfs_open_file *of = sf->private;
++ 	const struct kernfs_ops *ops;
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!kernfs_get_active(of->kn))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	ops = kernfs_ops(of->kn);
++ 	if (ops->seq_start) {
++ 		void *next = ops->seq_start(sf, ppos);
++ 		/* see the comment above kernfs_seq_stop_active() */
++ 		if (next == ERR_PTR(-ENODEV))
++ 			kernfs_seq_stop_active(sf, next);
++ 		return next;
++ 	} else {
++ 		/*
++ 		 * The same behavior and code as single_open().  Returns
++ 		 * !NULL if pos is at the beginning; otherwise, NULL.
++ 		 */
++ 		return NULL + !*ppos;
++ 	}
++ }
++ 
++ static void *kernfs_seq_next(struct seq_file *sf, void *v, loff_t *ppos)
++ {
++ 	struct kernfs_open_file *of = sf->private;
++ 	const struct kernfs_ops *ops = kernfs_ops(of->kn);
++ 
++ 	if (ops->seq_next) {
++ 		void *next = ops->seq_next(sf, v, ppos);
++ 		/* see the comment above kernfs_seq_stop_active() */
++ 		if (next == ERR_PTR(-ENODEV))
++ 			kernfs_seq_stop_active(sf, next);
++ 		return next;
++ 	} else {
++ 		/*
++ 		 * The same behavior and code as single_open(), always
++ 		 * terminate after the initial read.
++ 		 */
++ 		++*ppos;
++ 		return NULL;
++ 	}
++ }
++ 
++ static void kernfs_seq_stop(struct seq_file *sf, void *v)
++ {
++ 	struct kernfs_open_file *of = sf->private;
++ 
++ 	if (v != ERR_PTR(-ENODEV))
++ 		kernfs_seq_stop_active(sf, v);
++ 	mutex_unlock(&of->mutex);
++ }
++ 
++ static int kernfs_seq_show(struct seq_file *sf, void *v)
++ {
++ 	struct kernfs_open_file *of = sf->private;
++ 
++ 	of->event = atomic_read(&of->kn->attr.open->event);
++ 
++ 	return of->kn->attr.ops->seq_show(sf, v);
++ }
++ 
++ static const struct seq_operations kernfs_seq_ops = {
++ 	.start = kernfs_seq_start,
++ 	.next = kernfs_seq_next,
++ 	.stop = kernfs_seq_stop,
++ 	.show = kernfs_seq_show,
++ };
++ 
++ /*
++  * As reading a bin file can have side-effects, the exact offset and bytes
++  * specified in read(2) call should be passed to the read callback making
++  * it difficult to use seq_file.  Implement simplistic custom buffering for
++  * bin files.
++  */
++ static ssize_t kernfs_file_direct_read(struct kernfs_open_file *of,
++ 				       char __user *user_buf, size_t count,
++ 				       loff_t *ppos)
++ {
++ 	ssize_t len = min_t(size_t, count, PAGE_SIZE);
++ 	const struct kernfs_ops *ops;
++ 	char *buf;
++ 
++ 	buf = kmalloc(len, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!kernfs_get_active(of->kn)) {
++ 		len = -ENODEV;
++ 		mutex_unlock(&of->mutex);
++ 		goto out_free;
++ 	}
++ 
++ 	ops = kernfs_ops(of->kn);
++ 	if (ops->read)
++ 		len = ops->read(of, buf, len, *ppos);
++ 	else
++ 		len = -EINVAL;
++ 
++ 	kernfs_put_active(of->kn);
++ 	mutex_unlock(&of->mutex);
++ 
++ 	if (len < 0)
++ 		goto out_free;
++ 
++ 	if (copy_to_user(user_buf, buf, len)) {
++ 		len = -EFAULT;
++ 		goto out_free;
++ 	}
++ 
++ 	*ppos += len;
++ 
++  out_free:
++ 	kfree(buf);
++ 	return len;
++ }
++ 
++ /**
++  * kernfs_fop_read - kernfs vfs read callback
++  * @file: file pointer
++  * @user_buf: data to write
++  * @count: number of bytes
++  * @ppos: starting offset
++  */
++ static ssize_t kernfs_fop_read(struct file *file, char __user *user_buf,
++ 			       size_t count, loff_t *ppos)
++ {
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 
++ 	if (of->kn->flags & KERNFS_HAS_SEQ_SHOW)
++ 		return seq_read(file, user_buf, count, ppos);
++ 	else
++ 		return kernfs_file_direct_read(of, user_buf, count, ppos);
++ }
++ 
++ /**
++  * kernfs_fop_write - kernfs vfs write callback
++  * @file: file pointer
++  * @user_buf: data to write
++  * @count: number of bytes
++  * @ppos: starting offset
++  *
++  * Copy data in from userland and pass it to the matching kernfs write
++  * operation.
++  *
++  * There is no easy way for us to know if userspace is only doing a partial
++  * write, so we don't support them. We expect the entire buffer to come on
++  * the first write.  Hint: if you're writing a value, first read the file,
++  * modify only the the value you're changing, then write entire buffer
++  * back.
++  */
++ static ssize_t kernfs_fop_write(struct file *file, const char __user *user_buf,
++ 				size_t count, loff_t *ppos)
++ {
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	ssize_t len = min_t(size_t, count, PAGE_SIZE);
++ 	const struct kernfs_ops *ops;
++ 	char *buf;
++ 
++ 	buf = kmalloc(len + 1, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	if (copy_from_user(buf, user_buf, len)) {
++ 		len = -EFAULT;
++ 		goto out_free;
++ 	}
++ 	buf[len] = '\0';	/* guarantee string termination */
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!kernfs_get_active(of->kn)) {
++ 		mutex_unlock(&of->mutex);
++ 		len = -ENODEV;
++ 		goto out_free;
++ 	}
++ 
++ 	ops = kernfs_ops(of->kn);
++ 	if (ops->write)
++ 		len = ops->write(of, buf, len, *ppos);
++ 	else
++ 		len = -EINVAL;
++ 
++ 	kernfs_put_active(of->kn);
++ 	mutex_unlock(&of->mutex);
++ 
++ 	if (len > 0)
++ 		*ppos += len;
++ out_free:
++ 	kfree(buf);
++ 	return len;
++ }
++ 
++ static void kernfs_vma_open(struct vm_area_struct *vma)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 
++ 	if (!of->vm_ops)
++ 		return;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return;
++ 
++ 	if (of->vm_ops->open)
++ 		of->vm_ops->open(vma);
++ 
++ 	kernfs_put_active(of->kn);
++ }
++ 
++ static int kernfs_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	ret = VM_FAULT_SIGBUS;
++ 	if (of->vm_ops->fault)
++ 		ret = of->vm_ops->fault(vma, vmf);
++ 
++ 	kernfs_put_active(of->kn);
++ 	return ret;
++ }
++ 
++ static int kernfs_vma_page_mkwrite(struct vm_area_struct *vma,
++ 				   struct vm_fault *vmf)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	ret = 0;
++ 	if (of->vm_ops->page_mkwrite)
++ 		ret = of->vm_ops->page_mkwrite(vma, vmf);
++ 	else
++ 		file_update_time(file);
++ 
++ 	kernfs_put_active(of->kn);
++ 	return ret;
++ }
++ 
++ static int kernfs_vma_access(struct vm_area_struct *vma, unsigned long addr,
++ 			     void *buf, int len, int write)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return -EINVAL;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return -EINVAL;
++ 
++ 	ret = -EINVAL;
++ 	if (of->vm_ops->access)
++ 		ret = of->vm_ops->access(vma, addr, buf, len, write);
++ 
++ 	kernfs_put_active(of->kn);
++ 	return ret;
++ }
++ 
++ #ifdef CONFIG_NUMA
++ static int kernfs_vma_set_policy(struct vm_area_struct *vma,
++ 				 struct mempolicy *new)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return 0;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	if (of->vm_ops->set_policy)
++ 		ret = of->vm_ops->set_policy(vma, new);
++ 
++ 	kernfs_put_active(of->kn);
++ 	return ret;
++ }
++ 
++ static struct mempolicy *kernfs_vma_get_policy(struct vm_area_struct *vma,
++ 					       unsigned long addr)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	struct mempolicy *pol;
++ 
++ 	if (!of->vm_ops)
++ 		return vma->vm_policy;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return vma->vm_policy;
++ 
++ 	pol = vma->vm_policy;
++ 	if (of->vm_ops->get_policy)
++ 		pol = of->vm_ops->get_policy(vma, addr);
++ 
++ 	kernfs_put_active(of->kn);
++ 	return pol;
++ }
++ 
++ static int kernfs_vma_migrate(struct vm_area_struct *vma,
++ 			      const nodemask_t *from, const nodemask_t *to,
++ 			      unsigned long flags)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return 0;
++ 
++ 	if (!kernfs_get_active(of->kn))
++ 		return 0;
++ 
++ 	ret = 0;
++ 	if (of->vm_ops->migrate)
++ 		ret = of->vm_ops->migrate(vma, from, to, flags);
++ 
++ 	kernfs_put_active(of->kn);
++ 	return ret;
++ }
++ #endif
++ 
++ static const struct vm_operations_struct kernfs_vm_ops = {
++ 	.open		= kernfs_vma_open,
++ 	.fault		= kernfs_vma_fault,
++ 	.page_mkwrite	= kernfs_vma_page_mkwrite,
++ 	.access		= kernfs_vma_access,
++ #ifdef CONFIG_NUMA
++ 	.set_policy	= kernfs_vma_set_policy,
++ 	.get_policy	= kernfs_vma_get_policy,
++ 	.migrate	= kernfs_vma_migrate,
++ #endif
++ };
++ 
++ static int kernfs_fop_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	struct kernfs_open_file *of = kernfs_of(file);
++ 	const struct kernfs_ops *ops;
++ 	int rc;
++ 
++ 	/*
++ 	 * mmap path and of->mutex are prone to triggering spurious lockdep
++ 	 * warnings and we don't want to add spurious locking dependency
++ 	 * between the two.  Check whether mmap is actually implemented
++ 	 * without grabbing @of->mutex by testing HAS_MMAP flag.  See the
++ 	 * comment in kernfs_file_open() for more details.
++ 	 */
++ 	if (!(of->kn->flags & KERNFS_HAS_MMAP))
++ 		return -ENODEV;
++ 
++ 	mutex_lock(&of->mutex);
++ 
++ 	rc = -ENODEV;
++ 	if (!kernfs_get_active(of->kn))
++ 		goto out_unlock;
++ 
++ 	ops = kernfs_ops(of->kn);
++ 	rc = ops->mmap(of, vma);
++ 
++ 	/*
++ 	 * PowerPC's pci_mmap of legacy_mem uses shmem_zero_setup()
++ 	 * to satisfy versions of X which crash if the mmap fails: that
++ 	 * substitutes a new vm_file, and we don't then want bin_vm_ops.
++ 	 */
++ 	if (vma->vm_file != file)
++ 		goto out_put;
++ 
++ 	rc = -EINVAL;
++ 	if (of->mmapped && of->vm_ops != vma->vm_ops)
++ 		goto out_put;
++ 
++ 	/*
++ 	 * It is not possible to successfully wrap close.
++ 	 * So error if someone is trying to use close.
++ 	 */
++ 	rc = -EINVAL;
++ 	if (vma->vm_ops && vma->vm_ops->close)
++ 		goto out_put;
++ 
++ 	rc = 0;
++ 	of->mmapped = 1;
++ 	of->vm_ops = vma->vm_ops;
++ 	vma->vm_ops = &kernfs_vm_ops;
++ out_put:
++ 	kernfs_put_active(of->kn);
++ out_unlock:
++ 	mutex_unlock(&of->mutex);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  *	kernfs_get_open_node - get or create kernfs_open_node
++  *	@kn: target kernfs_node
++  *	@of: kernfs_open_file for this instance of open
++  *
++  *	If @kn->attr.open exists, increment its reference count; otherwise,
++  *	create one.  @of is chained to the files list.
++  *
++  *	LOCKING:
++  *	Kernel thread context (may sleep).
++  *
++  *	RETURNS:
++  *	0 on success, -errno on failure.
++  */
++ static int kernfs_get_open_node(struct kernfs_node *kn,
++ 				struct kernfs_open_file *of)
++ {
++ 	struct kernfs_open_node *on, *new_on = NULL;
++ 
++  retry:
++ 	mutex_lock(&kernfs_open_file_mutex);
++ 	spin_lock_irq(&kernfs_open_node_lock);
++ 
++ 	if (!kn->attr.open && new_on) {
++ 		kn->attr.open = new_on;
++ 		new_on = NULL;
++ 	}
++ 
++ 	on = kn->attr.open;
++ 	if (on) {
++ 		atomic_inc(&on->refcnt);
++ 		list_add_tail(&of->list, &on->files);
++ 	}
++ 
++ 	spin_unlock_irq(&kernfs_open_node_lock);
++ 	mutex_unlock(&kernfs_open_file_mutex);
++ 
++ 	if (on) {
++ 		kfree(new_on);
++ 		return 0;
++ 	}
++ 
++ 	/* not there, initialize a new one and retry */
++ 	new_on = kmalloc(sizeof(*new_on), GFP_KERNEL);
++ 	if (!new_on)
++ 		return -ENOMEM;
++ 
++ 	atomic_set(&new_on->refcnt, 0);
++ 	atomic_set(&new_on->event, 1);
++ 	init_waitqueue_head(&new_on->poll);
++ 	INIT_LIST_HEAD(&new_on->files);
++ 	goto retry;
++ }
++ 
++ /**
++  *	kernfs_put_open_node - put kernfs_open_node
++  *	@kn: target kernfs_nodet
++  *	@of: associated kernfs_open_file
++  *
++  *	Put @kn->attr.open and unlink @of from the files list.  If
++  *	reference count reaches zero, disassociate and free it.
++  *
++  *	LOCKING:
++  *	None.
++  */
++ static void kernfs_put_open_node(struct kernfs_node *kn,
++ 				 struct kernfs_open_file *of)
++ {
++ 	struct kernfs_open_node *on = kn->attr.open;
++ 	unsigned long flags;
++ 
++ 	mutex_lock(&kernfs_open_file_mutex);
++ 	spin_lock_irqsave(&kernfs_open_node_lock, flags);
++ 
++ 	if (of)
++ 		list_del(&of->list);
++ 
++ 	if (atomic_dec_and_test(&on->refcnt))
++ 		kn->attr.open = NULL;
++ 	else
++ 		on = NULL;
++ 
++ 	spin_unlock_irqrestore(&kernfs_open_node_lock, flags);
++ 	mutex_unlock(&kernfs_open_file_mutex);
++ 
++ 	kfree(on);
++ }
++ 
++ static int kernfs_fop_open(struct inode *inode, struct file *file)
++ {
++ 	struct kernfs_node *kn = file->f_path.dentry->d_fsdata;
++ 	const struct kernfs_ops *ops;
++ 	struct kernfs_open_file *of;
++ 	bool has_read, has_write, has_mmap;
++ 	int error = -EACCES;
++ 
++ 	if (!kernfs_get_active(kn))
++ 		return -ENODEV;
++ 
++ 	ops = kernfs_ops(kn);
++ 
++ 	has_read = ops->seq_show || ops->read || ops->mmap;
++ 	has_write = ops->write || ops->mmap;
++ 	has_mmap = ops->mmap;
++ 
++ 	/* check perms and supported operations */
++ 	if ((file->f_mode & FMODE_WRITE) &&
++ 	    (!(inode->i_mode & S_IWUGO) || !has_write))
++ 		goto err_out;
++ 
++ 	if ((file->f_mode & FMODE_READ) &&
++ 	    (!(inode->i_mode & S_IRUGO) || !has_read))
++ 		goto err_out;
++ 
++ 	/* allocate a kernfs_open_file for the file */
++ 	error = -ENOMEM;
++ 	of = kzalloc(sizeof(struct kernfs_open_file), GFP_KERNEL);
++ 	if (!of)
++ 		goto err_out;
++ 
++ 	/*
++ 	 * The following is done to give a different lockdep key to
++ 	 * @of->mutex for files which implement mmap.  This is a rather
++ 	 * crude way to avoid false positive lockdep warning around
++ 	 * mm->mmap_sem - mmap nests @of->mutex under mm->mmap_sem and
++ 	 * reading /sys/block/sda/trace/act_mask grabs sr_mutex, under
++ 	 * which mm->mmap_sem nests, while holding @of->mutex.  As each
++ 	 * open file has a separate mutex, it's okay as long as those don't
++ 	 * happen on the same file.  At this point, we can't easily give
++ 	 * each file a separate locking class.  Let's differentiate on
++ 	 * whether the file has mmap or not for now.
++ 	 *
++ 	 * Both paths of the branch look the same.  They're supposed to
++ 	 * look that way and give @of->mutex different static lockdep keys.
++ 	 */
++ 	if (has_mmap)
++ 		mutex_init(&of->mutex);
++ 	else
++ 		mutex_init(&of->mutex);
++ 
++ 	of->kn = kn;
++ 	of->file = file;
++ 
++ 	/*
++ 	 * Always instantiate seq_file even if read access doesn't use
++ 	 * seq_file or is not requested.  This unifies private data access
++ 	 * and readable regular files are the vast majority anyway.
++ 	 */
++ 	if (ops->seq_show)
++ 		error = seq_open(file, &kernfs_seq_ops);
++ 	else
++ 		error = seq_open(file, NULL);
++ 	if (error)
++ 		goto err_free;
++ 
++ 	((struct seq_file *)file->private_data)->private = of;
++ 
++ 	/* seq_file clears PWRITE unconditionally, restore it if WRITE */
++ 	if (file->f_mode & FMODE_WRITE)
++ 		file->f_mode |= FMODE_PWRITE;
++ 
++ 	/* make sure we have open node struct */
++ 	error = kernfs_get_open_node(kn, of);
++ 	if (error)
++ 		goto err_close;
++ 
++ 	/* open succeeded, put active references */
++ 	kernfs_put_active(kn);
++ 	return 0;
++ 
++ err_close:
++ 	seq_release(inode, file);
++ err_free:
++ 	kfree(of);
++ err_out:
++ 	kernfs_put_active(kn);
++ 	return error;
++ }
++ 
++ static int kernfs_fop_release(struct inode *inode, struct file *filp)
++ {
++ 	struct kernfs_node *kn = filp->f_path.dentry->d_fsdata;
++ 	struct kernfs_open_file *of = kernfs_of(filp);
++ 
++ 	kernfs_put_open_node(kn, of);
++ 	seq_release(inode, filp);
++ 	kfree(of);
++ 
++ 	return 0;
++ }
++ 
++ void kernfs_unmap_bin_file(struct kernfs_node *kn)
++ {
++ 	struct kernfs_open_node *on;
++ 	struct kernfs_open_file *of;
++ 
++ 	if (!(kn->flags & KERNFS_HAS_MMAP))
++ 		return;
++ 
++ 	spin_lock_irq(&kernfs_open_node_lock);
++ 	on = kn->attr.open;
++ 	if (on)
++ 		atomic_inc(&on->refcnt);
++ 	spin_unlock_irq(&kernfs_open_node_lock);
++ 	if (!on)
++ 		return;
++ 
++ 	mutex_lock(&kernfs_open_file_mutex);
++ 	list_for_each_entry(of, &on->files, list) {
++ 		struct inode *inode = file_inode(of->file);
++ 		unmap_mapping_range(inode->i_mapping, 0, 0, 1);
++ 	}
++ 	mutex_unlock(&kernfs_open_file_mutex);
++ 
++ 	kernfs_put_open_node(kn, NULL);
++ }
++ 
++ /*
++  * Kernfs attribute files are pollable.  The idea is that you read
++  * the content and then you use 'poll' or 'select' to wait for
++  * the content to change.  When the content changes (assuming the
++  * manager for the kobject supports notification), poll will
++  * return POLLERR|POLLPRI, and select will return the fd whether
++  * it is waiting for read, write, or exceptions.
++  * Once poll/select indicates that the value has changed, you
++  * need to close and re-open the file, or seek to 0 and read again.
++  * Reminder: this only works for attributes which actively support
++  * it, and it is not possible to test an attribute from userspace
++  * to see if it supports poll (Neither 'poll' nor 'select' return
++  * an appropriate error code).  When in doubt, set a suitable timeout value.
++  */
++ static unsigned int kernfs_fop_poll(struct file *filp, poll_table *wait)
++ {
++ 	struct kernfs_open_file *of = kernfs_of(filp);
++ 	struct kernfs_node *kn = filp->f_path.dentry->d_fsdata;
++ 	struct kernfs_open_node *on = kn->attr.open;
++ 
++ 	/* need parent for the kobj, grab both */
++ 	if (!kernfs_get_active(kn))
++ 		goto trigger;
++ 
++ 	poll_wait(filp, &on->poll, wait);
++ 
++ 	kernfs_put_active(kn);
++ 
++ 	if (of->event != atomic_read(&on->event))
++ 		goto trigger;
++ 
++ 	return DEFAULT_POLLMASK;
++ 
++  trigger:
++ 	return DEFAULT_POLLMASK|POLLERR|POLLPRI;
++ }
++ 
++ /**
++  * kernfs_notify - notify a kernfs file
++  * @kn: file to notify
++  *
++  * Notify @kn such that poll(2) on @kn wakes up.
++  */
++ void kernfs_notify(struct kernfs_node *kn)
++ {
++ 	struct kernfs_open_node *on;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&kernfs_open_node_lock, flags);
++ 
++ 	if (!WARN_ON(kernfs_type(kn) != KERNFS_FILE)) {
++ 		on = kn->attr.open;
++ 		if (on) {
++ 			atomic_inc(&on->event);
++ 			wake_up_interruptible(&on->poll);
++ 		}
++ 	}
++ 
++ 	spin_unlock_irqrestore(&kernfs_open_node_lock, flags);
++ }
++ EXPORT_SYMBOL_GPL(kernfs_notify);
++ 
++ const struct file_operations kernfs_file_fops = {
++ 	.read		= kernfs_fop_read,
++ 	.write		= kernfs_fop_write,
++ 	.llseek		= generic_file_llseek,
++ 	.mmap		= kernfs_fop_mmap,
++ 	.open		= kernfs_fop_open,
++ 	.release	= kernfs_fop_release,
++ 	.poll		= kernfs_fop_poll,
++ };
++ 
++ /**
++  * __kernfs_create_file - kernfs internal function to create a file
++  * @parent: directory to create the file in
++  * @name: name of the file
++  * @mode: mode of the file
++  * @size: size of the file
++  * @ops: kernfs operations for the file
++  * @priv: private data for the file
++  * @ns: optional namespace tag of the file
++  * @static_name: don't copy file name
++  * @key: lockdep key for the file's active_ref, %NULL to disable lockdep
++  *
++  * Returns the created node on success, ERR_PTR() value on error.
++  */
++ struct kernfs_node *__kernfs_create_file(struct kernfs_node *parent,
++ 					 const char *name,
++ 					 umode_t mode, loff_t size,
++ 					 const struct kernfs_ops *ops,
++ 					 void *priv, const void *ns,
++ 					 bool name_is_static,
++ 					 struct lock_class_key *key)
++ {
++ 	struct kernfs_addrm_cxt acxt;
++ 	struct kernfs_node *kn;
++ 	unsigned flags;
++ 	int rc;
++ 
++ 	flags = KERNFS_FILE;
++ 	if (name_is_static)
++ 		flags |= KERNFS_STATIC_NAME;
++ 
++ 	kn = kernfs_new_node(parent, name, (mode & S_IALLUGO) | S_IFREG, flags);
++ 	if (!kn)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	kn->attr.ops = ops;
++ 	kn->attr.size = size;
++ 	kn->ns = ns;
++ 	kn->priv = priv;
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	if (key) {
++ 		lockdep_init_map(&kn->dep_map, "s_active", key, 0);
++ 		kn->flags |= KERNFS_LOCKDEP;
++ 	}
++ #endif
++ 
++ 	/*
++ 	 * kn->attr.ops is accesible only while holding active ref.  We
++ 	 * need to know whether some ops are implemented outside active
++ 	 * ref.  Cache their existence in flags.
++ 	 */
++ 	if (ops->seq_show)
++ 		kn->flags |= KERNFS_HAS_SEQ_SHOW;
++ 	if (ops->mmap)
++ 		kn->flags |= KERNFS_HAS_MMAP;
++ 
++ 	kernfs_addrm_start(&acxt);
++ 	rc = kernfs_add_one(&acxt, kn);
++ 	kernfs_addrm_finish(&acxt);
++ 
++ 	if (rc) {
++ 		kernfs_put(kn);
++ 		return ERR_PTR(rc);
++ 	}
++ 	return kn;
++ }
+++>>>>>>> db4aad209bc9 (kernfs: associate a new kernfs_node with its parent on creation)
+diff --cc fs/kernfs/symlink.c
+index 2578715baf0e,4d457055acb9..000000000000
+--- a/fs/kernfs/symlink.c
++++ b/fs/kernfs/symlink.c
+@@@ -7,3 -7,145 +7,148 @@@
+   *
+   * This file is released under the GPLv2.
+   */
+++<<<<<<< HEAD
+++=======
++ 
++ #include <linux/fs.h>
++ #include <linux/gfp.h>
++ #include <linux/namei.h>
++ 
++ #include "kernfs-internal.h"
++ 
++ /**
++  * kernfs_create_link - create a symlink
++  * @parent: directory to create the symlink in
++  * @name: name of the symlink
++  * @target: target node for the symlink to point to
++  *
++  * Returns the created node on success, ERR_PTR() value on error.
++  */
++ struct kernfs_node *kernfs_create_link(struct kernfs_node *parent,
++ 				       const char *name,
++ 				       struct kernfs_node *target)
++ {
++ 	struct kernfs_node *kn;
++ 	struct kernfs_addrm_cxt acxt;
++ 	int error;
++ 
++ 	kn = kernfs_new_node(parent, name, S_IFLNK|S_IRWXUGO, KERNFS_LINK);
++ 	if (!kn)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (kernfs_ns_enabled(parent))
++ 		kn->ns = target->ns;
++ 	kn->symlink.target_kn = target;
++ 	kernfs_get(target);	/* ref owned by symlink */
++ 
++ 	kernfs_addrm_start(&acxt);
++ 	error = kernfs_add_one(&acxt, kn);
++ 	kernfs_addrm_finish(&acxt);
++ 
++ 	if (!error)
++ 		return kn;
++ 
++ 	kernfs_put(kn);
++ 	return ERR_PTR(error);
++ }
++ 
++ static int kernfs_get_target_path(struct kernfs_node *parent,
++ 				  struct kernfs_node *target, char *path)
++ {
++ 	struct kernfs_node *base, *kn;
++ 	char *s = path;
++ 	int len = 0;
++ 
++ 	/* go up to the root, stop at the base */
++ 	base = parent;
++ 	while (base->parent) {
++ 		kn = target->parent;
++ 		while (kn->parent && base != kn)
++ 			kn = kn->parent;
++ 
++ 		if (base == kn)
++ 			break;
++ 
++ 		strcpy(s, "../");
++ 		s += 3;
++ 		base = base->parent;
++ 	}
++ 
++ 	/* determine end of target string for reverse fillup */
++ 	kn = target;
++ 	while (kn->parent && kn != base) {
++ 		len += strlen(kn->name) + 1;
++ 		kn = kn->parent;
++ 	}
++ 
++ 	/* check limits */
++ 	if (len < 2)
++ 		return -EINVAL;
++ 	len--;
++ 	if ((s - path) + len > PATH_MAX)
++ 		return -ENAMETOOLONG;
++ 
++ 	/* reverse fillup of target string from target to base */
++ 	kn = target;
++ 	while (kn->parent && kn != base) {
++ 		int slen = strlen(kn->name);
++ 
++ 		len -= slen;
++ 		strncpy(s + len, kn->name, slen);
++ 		if (len)
++ 			s[--len] = '/';
++ 
++ 		kn = kn->parent;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int kernfs_getlink(struct dentry *dentry, char *path)
++ {
++ 	struct kernfs_node *kn = dentry->d_fsdata;
++ 	struct kernfs_node *parent = kn->parent;
++ 	struct kernfs_node *target = kn->symlink.target_kn;
++ 	int error;
++ 
++ 	mutex_lock(&kernfs_mutex);
++ 	error = kernfs_get_target_path(parent, target, path);
++ 	mutex_unlock(&kernfs_mutex);
++ 
++ 	return error;
++ }
++ 
++ static void *kernfs_iop_follow_link(struct dentry *dentry, struct nameidata *nd)
++ {
++ 	int error = -ENOMEM;
++ 	unsigned long page = get_zeroed_page(GFP_KERNEL);
++ 	if (page) {
++ 		error = kernfs_getlink(dentry, (char *) page);
++ 		if (error < 0)
++ 			free_page((unsigned long)page);
++ 	}
++ 	nd_set_link(nd, error ? ERR_PTR(error) : (char *)page);
++ 	return NULL;
++ }
++ 
++ static void kernfs_iop_put_link(struct dentry *dentry, struct nameidata *nd,
++ 				void *cookie)
++ {
++ 	char *page = nd_get_link(nd);
++ 	if (!IS_ERR(page))
++ 		free_page((unsigned long)page);
++ }
++ 
++ const struct inode_operations kernfs_symlink_iops = {
++ 	.setxattr	= kernfs_iop_setxattr,
++ 	.removexattr	= kernfs_iop_removexattr,
++ 	.getxattr	= kernfs_iop_getxattr,
++ 	.listxattr	= kernfs_iop_listxattr,
++ 	.readlink	= generic_readlink,
++ 	.follow_link	= kernfs_iop_follow_link,
++ 	.put_link	= kernfs_iop_put_link,
++ 	.setattr	= kernfs_iop_setattr,
++ 	.getattr	= kernfs_iop_getattr,
++ 	.permission	= kernfs_iop_permission,
++ };
+++>>>>>>> db4aad209bc9 (kernfs: associate a new kernfs_node with its parent on creation)
+* Unmerged path fs/kernfs/kernfs-internal.h
+* Unmerged path fs/kernfs/dir.c
+* Unmerged path fs/kernfs/file.c
+* Unmerged path fs/kernfs/kernfs-internal.h
+* Unmerged path fs/kernfs/symlink.c
