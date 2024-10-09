@@ -1,0 +1,118 @@
+dax: Fix deadlock in dax_lock_mapping_entry()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Jan Kara <jack@suse.cz>
+commit f52afc93cd018fe6910133a05d44671192d1aeb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/f52afc93.failed
+
+When dax_lock_mapping_entry() has to sleep to obtain entry lock, it will
+fail to unlock mapping->i_pages spinlock and thus immediately deadlock
+against itself when retrying to grab the entry lock again. Fix the
+problem by unlocking mapping->i_pages before retrying.
+
+Fixes: c2a7d2a11552 ("filesystem-dax: Introduce dax_lock_mapping_entry()")
+	Reported-by: Barret Rhoden <brho@google.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit f52afc93cd018fe6910133a05d44671192d1aeb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 97c3ab5e2b69,e4ef8af31aa6..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -396,6 -393,85 +396,88 @@@ static struct page *dax_busy_page(void 
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool entry_wait_revalidate(void)
++ {
++ 	rcu_read_unlock();
++ 	schedule();
++ 	rcu_read_lock();
++ 
++ 	/*
++ 	 * Tell __get_unlocked_mapping_entry() to take a break, we need
++ 	 * to revalidate page->mapping after dropping locks
++ 	 */
++ 	return true;
++ }
++ 
++ bool dax_lock_mapping_entry(struct page *page)
++ {
++ 	pgoff_t index;
++ 	struct inode *inode;
++ 	bool did_lock = false;
++ 	void *entry = NULL, **slot;
++ 	struct address_space *mapping;
++ 
++ 	rcu_read_lock();
++ 	for (;;) {
++ 		mapping = READ_ONCE(page->mapping);
++ 
++ 		if (!dax_mapping(mapping))
++ 			break;
++ 
++ 		/*
++ 		 * In the device-dax case there's no need to lock, a
++ 		 * struct dev_pagemap pin is sufficient to keep the
++ 		 * inode alive, and we assume we have dev_pagemap pin
++ 		 * otherwise we would not have a valid pfn_to_page()
++ 		 * translation.
++ 		 */
++ 		inode = mapping->host;
++ 		if (S_ISCHR(inode->i_mode)) {
++ 			did_lock = true;
++ 			break;
++ 		}
++ 
++ 		xa_lock_irq(&mapping->i_pages);
++ 		if (mapping != page->mapping) {
++ 			xa_unlock_irq(&mapping->i_pages);
++ 			continue;
++ 		}
++ 		index = page->index;
++ 
++ 		entry = __get_unlocked_mapping_entry(mapping, index, &slot,
++ 				entry_wait_revalidate);
++ 		if (!entry) {
++ 			xa_unlock_irq(&mapping->i_pages);
++ 			break;
++ 		} else if (IS_ERR(entry)) {
++ 			xa_unlock_irq(&mapping->i_pages);
++ 			WARN_ON_ONCE(PTR_ERR(entry) != -EAGAIN);
++ 			continue;
++ 		}
++ 		lock_slot(mapping, slot);
++ 		did_lock = true;
++ 		xa_unlock_irq(&mapping->i_pages);
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return did_lock;
++ }
++ 
++ void dax_unlock_mapping_entry(struct page *page)
++ {
++ 	struct address_space *mapping = page->mapping;
++ 	struct inode *inode = mapping->host;
++ 
++ 	if (S_ISCHR(inode->i_mode))
++ 		return;
++ 
++ 	unlock_mapping_entry(mapping, page->index);
++ }
++ 
+++>>>>>>> f52afc93cd01 (dax: Fix deadlock in dax_lock_mapping_entry())
+  /*
+   * Find radix tree entry at given index. If it points to an exceptional entry,
+   * return it with the radix tree entry locked. If the radix tree doesn't
+* Unmerged path fs/dax.c
