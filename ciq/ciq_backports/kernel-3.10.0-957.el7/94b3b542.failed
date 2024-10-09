@@ -1,0 +1,271 @@
+net: aquantia: vlan unicast address list correct handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Igor Russkikh <igor.russkikh@aquantia.com>
+commit 94b3b542303f3055c326df74ef144a8a790d7d7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/94b3b542.failed
+
+Setting up macvlan/macvtap networks over atlantic NIC results
+in no traffic over these networks because ndo_set_rx_mode did
+not listed UC MACs as registered in unicast filter.
+
+Here we fix that taking into account maximum number of UC
+filters supported by hardware. If more than MAX addresses were
+registered, we just enable promisc  and/or allmulti to pass
+the traffic in.
+
+We also remove MULTICAST_ADDRESS_MAX constant from aq_cfg since
+thats not a configurable parameter at all.
+
+Fixes: b21f502 ("net:ethernet:aquantia: Fix for multicast filter handling.")
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 94b3b542303f3055c326df74ef144a8a790d7d7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+#	drivers/net/ethernet/aquantia/atlantic/aq_main.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+index cdd1acd417c2,2c6ebd91a9f2..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+@@@ -87,12 -88,24 +87,27 @@@ struct aq_stats_s 
+  
+  #define AQ_HW_FLAG_ERRORS      (AQ_HW_FLAG_ERR_HW | AQ_HW_FLAG_ERR_UNPLUG)
+  
+++<<<<<<< HEAD
+++=======
++ #define AQ_NIC_FLAGS_IS_NOT_READY (AQ_NIC_FLAG_STOPPING | \
++ 			AQ_NIC_FLAG_RESETTING | AQ_NIC_FLAG_CLOSING | \
++ 			AQ_NIC_FLAG_ERR_UNPLUG | AQ_NIC_FLAG_ERR_HW)
++ 
++ #define AQ_NIC_FLAGS_IS_NOT_TX_READY (AQ_NIC_FLAGS_IS_NOT_READY | \
++ 					AQ_NIC_LINK_DOWN)
++ 
++ #define AQ_HW_MEDIA_TYPE_TP    1U
++ #define AQ_HW_MEDIA_TYPE_FIBRE 2U
++ 
++ #define AQ_HW_MULTICAST_ADDRESS_MAX     32U
++ 
+++>>>>>>> 94b3b542303f (net: aquantia: vlan unicast address list correct handling)
+  struct aq_hw_s {
+  	atomic_t flags;
+ -	u8 rbl_enabled:1;
+  	struct aq_nic_cfg_s *aq_nic_cfg;
+ -	const struct aq_fw_ops *aq_fw_ops;
+ +	struct aq_pci_func_s *aq_pci_func;
+  	void __iomem *mmio;
+ +	unsigned int not_ff_addr;
+  	struct aq_hw_link_status_s aq_link_status;
+  	struct hw_aq_atl_utils_mbox mbox;
+  	struct hw_atl_stats_s last_stats;
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_main.c
+index 3bd408178d19,e3ae29e523f0..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_main.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_main.c
+@@@ -146,19 -135,10 +146,24 @@@ err_exit
+  static void aq_ndev_set_multicast_settings(struct net_device *ndev)
+  {
+  	struct aq_nic_s *aq_nic = netdev_priv(ndev);
+- 	int err = 0;
+  
+++<<<<<<< HEAD
+ +	err = aq_nic_set_packet_filter(aq_nic, ndev->flags);
+ +	if (err < 0)
+ +		goto err_exit;
+ +
+ +	if (netdev_mc_count(ndev)) {
+ +		err = aq_nic_set_multicast_list(aq_nic, ndev);
+ +		if (err < 0)
+ +			goto err_exit;
+ +	}
+ +
+ +err_exit:;
+++=======
++ 	aq_nic_set_packet_filter(aq_nic, ndev->flags);
++ 
++ 	aq_nic_set_multicast_list(aq_nic, ndev);
+++>>>>>>> 94b3b542303f (net: aquantia: vlan unicast address list correct handling)
+  }
+  
+  static const struct net_device_ops aq_ndev_ops = {
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 5c08679f0a07,7a22d0257e04..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -680,31 -567,37 +681,64 @@@ int aq_nic_set_multicast_list(struct aq
+  	struct netdev_hw_addr *ha = NULL;
+  	unsigned int i = 0U;
+  
+++<<<<<<< HEAD
+ +	self->mc_list.count = 0U;
+ +
+ +	netdev_for_each_mc_addr(ha, ndev) {
+ +		ether_addr_copy(self->mc_list.ar[i++], ha->addr);
+ +		++self->mc_list.count;
+ +
+ +		if (i >= AQ_CFG_MULTICAST_ADDRESS_MAX)
+ +			break;
+ +	}
+ +
+ +	if (i >= AQ_CFG_MULTICAST_ADDRESS_MAX) {
+ +		/* Number of filters is too big: atlantic does not support this.
+ +		 * Force all multi filter to support this.
+ +		 * With this we disable all UC filters and setup "all pass"
+ +		 * multicast mask
+ +		 */
+ +		self->packet_filter |= IFF_ALLMULTI;
+ +		self->aq_hw->aq_nic_cfg->mc_list_count = 0;
+ +		return self->aq_hw_ops.hw_packet_filter_set(self->aq_hw,
+ +							self->packet_filter);
+ +	} else {
+ +		return self->aq_hw_ops.hw_multicast_list_set(self->aq_hw,
+ +						    self->mc_list.ar,
+ +						    self->mc_list.count);
+++=======
++ 	self->mc_list.count = 0;
++ 	if (netdev_uc_count(ndev) > AQ_HW_MULTICAST_ADDRESS_MAX) {
++ 		packet_filter |= IFF_PROMISC;
++ 	} else {
++ 		netdev_for_each_uc_addr(ha, ndev) {
++ 			ether_addr_copy(self->mc_list.ar[i++], ha->addr);
++ 
++ 			if (i >= AQ_HW_MULTICAST_ADDRESS_MAX)
++ 				break;
++ 		}
+++>>>>>>> 94b3b542303f (net: aquantia: vlan unicast address list correct handling)
++ 	}
++ 
++ 	if (i + netdev_mc_count(ndev) > AQ_HW_MULTICAST_ADDRESS_MAX) {
++ 		packet_filter |= IFF_ALLMULTI;
++ 	} else {
++ 		netdev_for_each_mc_addr(ha, ndev) {
++ 			ether_addr_copy(self->mc_list.ar[i++], ha->addr);
++ 
++ 			if (i >= AQ_HW_MULTICAST_ADDRESS_MAX)
++ 				break;
++ 		}
++ 	}
++ 
++ 	if (i > 0 && i < AQ_HW_MULTICAST_ADDRESS_MAX) {
++ 		packet_filter |= IFF_MULTICAST;
++ 		self->mc_list.count = i;
++ 		self->aq_hw_ops->hw_multicast_list_set(self->aq_hw,
++ 						       self->mc_list.ar,
++ 						       self->mc_list.count);
+  	}
++ 	return aq_nic_set_packet_filter(self, packet_filter);
+  }
+  
+  int aq_nic_set_mtu(struct aq_nic_s *self, int new_mtu)
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+index 715b53c689ef,fecfc401f95d..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+@@@ -70,13 -57,38 +70,48 @@@ struct aq_nic_cfg_s 
+  #define AQ_NIC_TCVEC2RING(_NIC_, _TC_, _VEC_) \
+  	((_TC_) * AQ_CFG_TCS_MAX + (_VEC_))
+  
+++<<<<<<< HEAD
+ +struct aq_nic_s *aq_nic_alloc_cold(const struct net_device_ops *ndev_ops,
+ +				   const struct ethtool_ops *et_ops,
+ +				   struct pci_dev *pdev,
+ +				   struct aq_pci_func_s *aq_pci_func,
+ +				   unsigned int port,
+ +				   const struct aq_hw_ops *aq_hw_ops);
+ +int aq_nic_ndev_init(struct aq_nic_s *self);
+++=======
++ struct aq_nic_s {
++ 	atomic_t flags;
++ 	struct aq_vec_s *aq_vec[AQ_CFG_VECS_MAX];
++ 	struct aq_ring_s *aq_ring_tx[AQ_CFG_VECS_MAX * AQ_CFG_TCS_MAX];
++ 	struct aq_hw_s *aq_hw;
++ 	struct net_device *ndev;
++ 	unsigned int aq_vecs;
++ 	unsigned int packet_filter;
++ 	unsigned int power_state;
++ 	u8 port;
++ 	const struct aq_hw_ops *aq_hw_ops;
++ 	const struct aq_fw_ops *aq_fw_ops;
++ 	struct aq_nic_cfg_s aq_nic_cfg;
++ 	struct timer_list service_timer;
++ 	struct timer_list polling_timer;
++ 	struct aq_hw_link_status_s link_status;
++ 	struct {
++ 		u32 count;
++ 		u8 ar[AQ_HW_MULTICAST_ADDRESS_MAX][ETH_ALEN];
++ 	} mc_list;
++ 
++ 	struct pci_dev *pdev;
++ 	unsigned int msix_entry_mask;
++ 	u32 irqvecs;
++ };
++ 
++ static inline struct device *aq_nic_get_dev(struct aq_nic_s *self)
++ {
++ 	return self->ndev->dev.parent;
++ }
++ 
++ void aq_nic_ndev_init(struct aq_nic_s *self);
+++>>>>>>> 94b3b542303f (net: aquantia: vlan unicast address list correct handling)
+  struct aq_nic_s *aq_nic_alloc_hot(struct net_device *ndev);
+  void aq_nic_set_tx_ring(struct aq_nic_s *self, unsigned int idx,
+  			struct aq_ring_s *ring);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+index ca0165c4a9c1..3b9aadaa9b32 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+@@ -63,8 +63,6 @@
+ 
+ #define AQ_CFG_NAPI_WEIGHT     64U
+ 
+-#define AQ_CFG_MULTICAST_ADDRESS_MAX     32U
+-
+ /*#define AQ_CFG_MAC_ADDR_PERMANENT {0x30, 0x0E, 0xE3, 0x12, 0x34, 0x56}*/
+ 
+ #define AQ_CFG_FC_MODE 3U
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_main.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c
+index 773434b96bb0..b36dbc254dfa 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_a0.c
+@@ -741,7 +741,7 @@ static int hw_atl_a0_hw_packet_filter_set(struct aq_hw_s *self,
+ 
+ static int hw_atl_a0_hw_multicast_list_set(struct aq_hw_s *self,
+ 					   u8 ar_mac
+-					   [AQ_CFG_MULTICAST_ADDRESS_MAX]
++					   [AQ_HW_MULTICAST_ADDRESS_MAX]
+ 					   [ETH_ALEN],
+ 					   u32 count)
+ {
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+index 5e4035a987be..9f0d1f2e9348 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+@@ -776,7 +776,7 @@ static int hw_atl_b0_hw_packet_filter_set(struct aq_hw_s *self,
+ 
+ static int hw_atl_b0_hw_multicast_list_set(struct aq_hw_s *self,
+ 					   u8 ar_mac
+-					   [AQ_CFG_MULTICAST_ADDRESS_MAX]
++					   [AQ_HW_MULTICAST_ADDRESS_MAX]
+ 					   [ETH_ALEN],
+ 					   u32 count)
+ {
+@@ -804,7 +804,7 @@ static int hw_atl_b0_hw_multicast_list_set(struct aq_hw_s *self,
+ 
+ 		hw_atl_rpfl2_uc_flr_en_set(self,
+ 					   (self->aq_nic_cfg->is_mc_list_enabled),
+-				    HW_ATL_B0_MAC_MIN + i);
++					   HW_ATL_B0_MAC_MIN + i);
+ 	}
+ 
+ 	err = aq_hw_err_from_flags(self);
