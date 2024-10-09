@@ -1,0 +1,95 @@
+scsi: lpfc: Fix MDS diagnostics failure (Rx < Tx)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix MDS diagnostics failure (Rx < Tx) (Dick Kennedy) [1584377]
+Rebuild_FUZZ: 93.48%
+commit-author James Smart <jsmart2021@gmail.com>
+commit dc19e3b4a80e0bb1e5f080473fffa0ac8c0694a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dc19e3b4.failed
+
+MDS diagnostics fail because of frame count mismatch.
+
+Unavailability of SGL is the trigger for this issue. If ELS SGL is not
+available to process MDS frame, IOCB is put in FCP txq but not attempted to
+post afterwards. So, driver stops processing incoming frames as it runs out
+of IOCB.  lpfc_drain_txq attempts to submit IOCBS that are queued in ELS
+txq but MDS frames are posted to FCP WQ.
+
+Attempt to submit IOCBs that are present in FCP txq when MDS loopback is
+running.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit dc19e3b4a80e0bb1e5f080473fffa0ac8c0694a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index bb1674d0be5e,4b70d53acb72..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -19015,12 -19067,24 +19015,25 @@@ lpfc_drain_txq(struct lpfc_hba *phba
+  	unsigned long iflags = 0;
+  	char *fail_msg = NULL;
+  	struct lpfc_sglq *sglq;
+ -	union lpfc_wqe128 wqe;
+ +	union lpfc_wqe128 wqe128;
+ +	union lpfc_wqe *wqe = (union lpfc_wqe *) &wqe128;
+  	uint32_t txq_cnt = 0;
++ 	struct lpfc_queue *wq;
+  
+- 	pring = lpfc_phba_elsring(phba);
+- 	if (unlikely(!pring))
++ 	if (phba->link_flag & LS_MDS_LOOPBACK) {
++ 		/* MDS WQE are posted only to first WQ*/
++ 		wq = phba->sli4_hba.fcp_wq[0];
++ 		if (unlikely(!wq))
++ 			return 0;
++ 		pring = wq->pring;
++ 	} else {
++ 		wq = phba->sli4_hba.els_wq;
++ 		if (unlikely(!wq))
++ 			return 0;
++ 		pring = lpfc_phba_elsring(phba);
++ 	}
++ 
++ 	if (unlikely(!pring) || list_empty(&pring->txq))
+  		return 0;
+  
+  	spin_lock_irqsave(&pring->ring_lock, iflags);
+@@@ -19059,9 -19123,9 +19072,13 @@@
+  		piocbq->sli4_xritag = sglq->sli4_xritag;
+  		if (NO_XRI == lpfc_sli4_bpl2sgl(phba, piocbq, sglq))
+  			fail_msg = "to convert bpl to sgl";
+ -		else if (lpfc_sli4_iocb2wqe(phba, piocbq, &wqe))
+ +		else if (lpfc_sli4_iocb2wqe(phba, piocbq, wqe))
+  			fail_msg = "to convert iocb to wqe";
+++<<<<<<< HEAD
+ +		else if (lpfc_sli4_wq_put(phba->sli4_hba.els_wq, wqe))
+++=======
++ 		else if (lpfc_sli4_wq_put(wq, &wqe))
+++>>>>>>> dc19e3b4a80e (scsi: lpfc: Fix MDS diagnostics failure (Rx < Tx))
+  			fail_msg = " - Wq is full";
+  		else
+  			lpfc_sli_ringtxcmpl_put(phba, pring, piocbq);
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 2ef32ae4114d..62de1ea235f0 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -707,8 +707,7 @@ lpfc_work_done(struct lpfc_hba *phba)
+ 								HA_RXMASK));
+ 			}
+ 		}
+-		if ((phba->sli_rev == LPFC_SLI_REV4) &&
+-				 (!list_empty(&pring->txq)))
++		if (phba->sli_rev == LPFC_SLI_REV4)
+ 			lpfc_drain_txq(phba);
+ 		/*
+ 		 * Turn on Ring interrupts
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
