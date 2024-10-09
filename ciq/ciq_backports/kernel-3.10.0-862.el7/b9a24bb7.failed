@@ -1,0 +1,731 @@
+net_sched: properly handle failure case of tcf_exts_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit b9a24bb76bf611a5268ceffe04219e6ad264559b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b9a24bb7.failed
+
+After commit 22dc13c837c3 ("net_sched: convert tcf_exts from list to pointer array")
+we do dynamic allocation in tcf_exts_init(), therefore we need
+to handle the ENOMEM case properly.
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b9a24bb76bf611a5268ceffe04219e6ad264559b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+#	net/sched/cls_bpf.c
+diff --cc include/net/pkt_cls.h
+index ddbf01b80b4c,a459be5fe1c2..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -72,7 -73,11 +72,15 @@@ static inline int tcf_exts_init(struct 
+  {
+  #ifdef CONFIG_NET_CLS_ACT
+  	exts->type = 0;
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&exts->actions);
+++=======
++ 	exts->nr_actions = 0;
++ 	exts->actions = kcalloc(TCA_ACT_MAX_PRIO, sizeof(struct tc_action *),
++ 				GFP_KERNEL);
++ 	if (!exts->actions)
++ 		return -ENOMEM;
+++>>>>>>> b9a24bb76bf6 (net_sched: properly handle failure case of tcf_exts_init())
+  #endif
+  	exts->action = action;
+  	exts->police = police;
+diff --cc net/sched/cls_bpf.c
+index c13fb5505297,4742f415ee5b..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -156,61 -302,48 +156,87 @@@ static int cls_bpf_modify_existing(stru
+  				   unsigned long base, struct nlattr **tb,
+  				   struct nlattr *est, bool ovr)
+  {
+ -	bool is_bpf, is_ebpf, have_exts = false;
+ +	struct sock_filter *bpf_ops;
+  	struct tcf_exts exts;
+ +	struct sock_fprog tmp;
+ +	struct sk_filter *fp;
+ +	u16 bpf_size, bpf_len;
+ +	u32 classid;
+  	int ret;
+  
+ -	is_bpf = tb[TCA_BPF_OPS_LEN] && tb[TCA_BPF_OPS];
+ -	is_ebpf = tb[TCA_BPF_FD];
+ -	if ((!is_bpf && !is_ebpf) || (is_bpf && is_ebpf))
+ +	if (!tb[TCA_BPF_OPS_LEN] || !tb[TCA_BPF_OPS] || !tb[TCA_BPF_CLASSID])
+  		return -EINVAL;
+  
+- 	tcf_exts_init(&exts, TCA_BPF_ACT, TCA_BPF_POLICE);
+- 	ret = tcf_exts_validate(net, tp, tb, est, &exts, ovr);
++ 	ret = tcf_exts_init(&exts, TCA_BPF_ACT, TCA_BPF_POLICE);
+  	if (ret < 0)
+  		return ret;
++ 	ret = tcf_exts_validate(net, tp, tb, est, &exts, ovr);
++ 	if (ret < 0)
++ 		goto errout;
+  
+++<<<<<<< HEAD
+ +	classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
+ +	bpf_len = nla_get_u16(tb[TCA_BPF_OPS_LEN]);
+ +	if (bpf_len > BPF_MAXINSNS || bpf_len == 0) {
+ +		ret = -EINVAL;
+ +		goto errout;
+ +	}
+ +
+ +	bpf_size = bpf_len * sizeof(*bpf_ops);
+ +	if (bpf_size != nla_len(tb[TCA_BPF_OPS])) {
+ +		ret = -EINVAL;
+ +		goto errout;
+ +	}
+++=======
++ 	if (tb[TCA_BPF_FLAGS]) {
++ 		u32 bpf_flags = nla_get_u32(tb[TCA_BPF_FLAGS]);
++ 
++ 		if (bpf_flags & ~TCA_BPF_FLAG_ACT_DIRECT) {
++ 			ret = -EINVAL;
++ 			goto errout;
++ 		}
++ 
++ 		have_exts = bpf_flags & TCA_BPF_FLAG_ACT_DIRECT;
++ 	}
++ 
++ 	prog->exts_integrated = have_exts;
++ 
++ 	ret = is_bpf ? cls_bpf_prog_from_ops(tb, prog) :
++ 		       cls_bpf_prog_from_efd(tb, prog, tp);
++ 	if (ret < 0)
++ 		goto errout;
+++>>>>>>> b9a24bb76bf6 (net_sched: properly handle failure case of tcf_exts_init())
+  
+ -	if (tb[TCA_BPF_CLASSID]) {
+ -		prog->res.classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
+ -		tcf_bind_filter(tp, &prog->res, base);
+ +	bpf_ops = kzalloc(bpf_size, GFP_KERNEL);
+ +	if (bpf_ops == NULL) {
+ +		ret = -ENOMEM;
+ +		goto errout;
+  	}
+  
+ +	memcpy(bpf_ops, nla_data(tb[TCA_BPF_OPS]), bpf_size);
+ +
+ +	tmp.len = bpf_len;
+ +	tmp.filter = (struct sock_filter __user *) bpf_ops;
+ +
+ +	ret = sk_unattached_filter_create(&fp, &tmp);
+ +	if (ret)
+ +		goto errout_free;
+ +
+ +	prog->bpf_len = bpf_len;
+ +	prog->bpf_ops = bpf_ops;
+ +	prog->filter = fp;
+ +	prog->res.classid = classid;
+ +
+ +	tcf_bind_filter(tp, &prog->res, base);
+  	tcf_exts_change(tp, &prog->exts, &exts);
+ +
+  	return 0;
+++<<<<<<< HEAD
+ +errout_free:
+ +	kfree(bpf_ops);
+++=======
++ 
+++>>>>>>> b9a24bb76bf6 (net_sched: properly handle failure case of tcf_exts_init())
+  errout:
+  	tcf_exts_destroy(&exts);
+  	return ret;
+* Unmerged path include/net/pkt_cls.h
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+index 9d68a920c5a4..3f9f2743a1cc 100644
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -131,10 +131,12 @@ static int basic_set_parms(struct net *net, struct tcf_proto *tp,
+ 	struct tcf_exts e;
+ 	struct tcf_ematch_tree t;
+ 
+-	tcf_exts_init(&e, TCA_BASIC_ACT, TCA_BASIC_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	err = tcf_exts_init(&e, TCA_BASIC_ACT, TCA_BASIC_POLICE);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	if (err < 0)
++		goto errout;
+ 
+ 	err = tcf_em_tree_validate(tp, tb[TCA_BASIC_EMATCHES], &t);
+ 	if (err < 0)
+@@ -182,7 +184,10 @@ static int basic_change(struct net *net, struct sk_buff *in_skb,
+ 	if (!fnew)
+ 		return -ENOBUFS;
+ 
+-	tcf_exts_init(&fnew->exts, TCA_BASIC_ACT, TCA_BASIC_POLICE);
++	err = tcf_exts_init(&fnew->exts, TCA_BASIC_ACT, TCA_BASIC_POLICE);
++	if (err < 0)
++		goto errout;
++
+ 	err = -EINVAL;
+ 	if (handle) {
+ 		fnew->handle = handle;
+@@ -219,6 +224,7 @@ static int basic_change(struct net *net, struct sk_buff *in_skb,
+ 
+ 	return 0;
+ errout:
++	tcf_exts_destroy(&fnew->exts);
+ 	kfree(fnew);
+ 	return err;
+ }
+* Unmerged path net/sched/cls_bpf.c
+diff --git a/net/sched/cls_cgroup.c b/net/sched/cls_cgroup.c
+index 1e87931dbe99..3ac1d2186d36 100644
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -205,7 +205,9 @@ static int cls_cgroup_change(struct net *net, struct sk_buff *in_skb,
+ 	if (!new)
+ 		return -ENOBUFS;
+ 
+-	tcf_exts_init(&new->exts, TCA_CGROUP_ACT, TCA_CGROUP_POLICE);
++	err = tcf_exts_init(&new->exts, TCA_CGROUP_ACT, TCA_CGROUP_POLICE);
++	if (err < 0)
++		goto errout;
+ 	new->handle = handle;
+ 	new->tp = tp;
+ 	err = nla_parse_nested(tb, TCA_CGROUP_MAX, tca[TCA_OPTIONS],
+@@ -213,10 +215,14 @@ static int cls_cgroup_change(struct net *net, struct sk_buff *in_skb,
+ 	if (err < 0)
+ 		goto errout;
+ 
+-	tcf_exts_init(&e, TCA_CGROUP_ACT, TCA_CGROUP_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
++	err = tcf_exts_init(&e, TCA_CGROUP_ACT, TCA_CGROUP_POLICE);
+ 	if (err < 0)
+ 		goto errout;
++	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
++	if (err < 0) {
++		tcf_exts_destroy(&e);
++		goto errout;
++	}
+ 
+ 	err = tcf_em_tree_validate(tp, tb[TCA_CGROUP_EMATCHES], &t);
+ 	if (err < 0) {
+@@ -232,6 +238,7 @@ static int cls_cgroup_change(struct net *net, struct sk_buff *in_skb,
+ 		call_rcu(&head->rcu, cls_cgroup_destroy_rcu);
+ 	return 0;
+ errout:
++	tcf_exts_destroy(&new->exts);
+ 	kfree(new);
+ 	return err;
+ }
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index cc72c460caa1..38fdb7143522 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -418,10 +418,12 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 			return -EOPNOTSUPP;
+ 	}
+ 
+-	tcf_exts_init(&e, TCA_FLOW_ACT, TCA_FLOW_POLICE);
++	err = tcf_exts_init(&e, TCA_FLOW_ACT, TCA_FLOW_POLICE);
++	if (err < 0)
++		goto err1;
+ 	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
+ 	if (err < 0)
+-		return err;
++		goto err1;
+ 
+ 	err = tcf_em_tree_validate(tp, tb[TCA_FLOW_EMATCHES], &t);
+ 	if (err < 0)
+@@ -432,13 +434,15 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 	if (!fnew)
+ 		goto err2;
+ 
+-	tcf_exts_init(&fnew->exts, TCA_FLOW_ACT, TCA_FLOW_POLICE);
++	err = tcf_exts_init(&fnew->exts, TCA_FLOW_ACT, TCA_FLOW_POLICE);
++	if (err < 0)
++		goto err3;
+ 
+ 	fold = (struct flow_filter *)*arg;
+ 	if (fold) {
+ 		err = -EINVAL;
+ 		if (fold->handle != handle && handle)
+-			goto err2;
++			goto err3;
+ 
+ 		/* Copy fold into fnew */
+ 		fnew->tp = fold->tp;
+@@ -458,31 +462,31 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 		if (tb[TCA_FLOW_MODE])
+ 			mode = nla_get_u32(tb[TCA_FLOW_MODE]);
+ 		if (mode != FLOW_MODE_HASH && nkeys > 1)
+-			goto err2;
++			goto err3;
+ 
+ 		if (mode == FLOW_MODE_HASH)
+ 			perturb_period = fold->perturb_period;
+ 		if (tb[TCA_FLOW_PERTURB]) {
+ 			if (mode != FLOW_MODE_HASH)
+-				goto err2;
++				goto err3;
+ 			perturb_period = nla_get_u32(tb[TCA_FLOW_PERTURB]) * HZ;
+ 		}
+ 	} else {
+ 		err = -EINVAL;
+ 		if (!handle)
+-			goto err2;
++			goto err3;
+ 		if (!tb[TCA_FLOW_KEYS])
+-			goto err2;
++			goto err3;
+ 
+ 		mode = FLOW_MODE_MAP;
+ 		if (tb[TCA_FLOW_MODE])
+ 			mode = nla_get_u32(tb[TCA_FLOW_MODE]);
+ 		if (mode != FLOW_MODE_HASH && nkeys > 1)
+-			goto err2;
++			goto err3;
+ 
+ 		if (tb[TCA_FLOW_PERTURB]) {
+ 			if (mode != FLOW_MODE_HASH)
+-				goto err2;
++				goto err3;
+ 			perturb_period = nla_get_u32(tb[TCA_FLOW_PERTURB]) * HZ;
+ 		}
+ 
+@@ -542,6 +546,8 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 		call_rcu(&fold->rcu, flow_destroy_filter);
+ 	return 0;
+ 
++err3:
++	tcf_exts_destroy(&fnew->exts);
+ err2:
+ 	tcf_em_tree_destroy(&t);
+ 	kfree(fnew);
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index 2ba861bbde75..876a2f2c6568 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -780,10 +780,12 @@ static int fl_set_parms(struct net *net, struct tcf_proto *tp,
+ 	struct tcf_exts e;
+ 	int err;
+ 
+-	tcf_exts_init(&e, TCA_FLOWER_ACT, 0);
+-	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	err = tcf_exts_init(&e, TCA_FLOWER_ACT, 0);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	if (err < 0)
++		goto errout;
+ 
+ 	if (tb[TCA_FLOWER_CLASSID]) {
+ 		f->res.classid = nla_get_u32(tb[TCA_FLOWER_CLASSID]);
+@@ -860,7 +862,9 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
+ 		goto errout_tb;
+ 	}
+ 
+-	tcf_exts_init(&fnew->exts, TCA_FLOWER_ACT, 0);
++	err = tcf_exts_init(&fnew->exts, TCA_FLOWER_ACT, 0);
++	if (err < 0)
++		goto errout;
+ 
+ 	if (!handle) {
+ 		handle = fl_grab_new_handle(tp, head);
+@@ -934,6 +938,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
+ 	return 0;
+ 
+ errout:
++	tcf_exts_destroy(&fnew->exts);
+ 	kfree(fnew);
+ errout_tb:
+ 	kfree(tb);
+diff --git a/net/sched/cls_fw.c b/net/sched/cls_fw.c
+index 3a0ab924c0e2..9dc63d54e167 100644
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@ -196,10 +196,12 @@ fw_change_attrs(struct net *net, struct tcf_proto *tp, struct fw_filter *f,
+ 	u32 mask;
+ 	int err;
+ 
+-	tcf_exts_init(&e, TCA_FW_ACT, TCA_FW_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
++	err = tcf_exts_init(&e, TCA_FW_ACT, TCA_FW_POLICE);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
++	if (err < 0)
++		goto errout;
+ 
+ 	if (tb[TCA_FW_CLASSID]) {
+ 		f->res.classid = nla_get_u32(tb[TCA_FW_CLASSID]);
+@@ -270,10 +272,15 @@ static int fw_change(struct net *net, struct sk_buff *in_skb,
+ #endif /* CONFIG_NET_CLS_IND */
+ 		fnew->tp = f->tp;
+ 
+-		tcf_exts_init(&fnew->exts, TCA_FW_ACT, TCA_FW_POLICE);
++		err = tcf_exts_init(&fnew->exts, TCA_FW_ACT, TCA_FW_POLICE);
++		if (err < 0) {
++			kfree(fnew);
++			return err;
++		}
+ 
+ 		err = fw_change_attrs(net, tp, fnew, tb, tca, base, ovr);
+ 		if (err < 0) {
++			tcf_exts_destroy(&fnew->exts);
+ 			kfree(fnew);
+ 			return err;
+ 		}
+@@ -313,7 +320,9 @@ static int fw_change(struct net *net, struct sk_buff *in_skb,
+ 	if (f == NULL)
+ 		return -ENOBUFS;
+ 
+-	tcf_exts_init(&f->exts, TCA_FW_ACT, TCA_FW_POLICE);
++	err = tcf_exts_init(&f->exts, TCA_FW_ACT, TCA_FW_POLICE);
++	if (err < 0)
++		goto errout;
+ 	f->id = handle;
+ 	f->tp = tp;
+ 
+@@ -328,6 +337,7 @@ static int fw_change(struct net *net, struct sk_buff *in_skb,
+ 	return 0;
+ 
+ errout:
++	tcf_exts_destroy(&f->exts);
+ 	kfree(f);
+ 	return err;
+ }
+diff --git a/net/sched/cls_route.c b/net/sched/cls_route.c
+index 4165c76866e4..a4ce39b19be0 100644
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -382,17 +382,19 @@ static int route4_set_parms(struct net *net, struct tcf_proto *tp,
+ 			    struct nlattr **tb, struct nlattr *est, int new,
+ 			    bool ovr)
+ {
+-	int err;
+ 	u32 id = 0, to = 0, nhandle = 0x8000;
+ 	struct route4_filter *fp;
+ 	unsigned int h1;
+ 	struct route4_bucket *b;
+ 	struct tcf_exts e;
++	int err;
+ 
+-	tcf_exts_init(&e, TCA_ROUTE4_ACT, TCA_ROUTE4_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	err = tcf_exts_init(&e, TCA_ROUTE4_ACT, TCA_ROUTE4_POLICE);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	if (err < 0)
++		goto errout;
+ 
+ 	err = -EINVAL;
+ 	if (tb[TCA_ROUTE4_TO]) {
+@@ -500,7 +502,10 @@ static int route4_change(struct net *net, struct sk_buff *in_skb,
+ 	if (!f)
+ 		goto errout;
+ 
+-	tcf_exts_init(&f->exts, TCA_ROUTE4_ACT, TCA_ROUTE4_POLICE);
++	err = tcf_exts_init(&f->exts, TCA_ROUTE4_ACT, TCA_ROUTE4_POLICE);
++	if (err < 0)
++		goto errout;
++
+ 	if (fold) {
+ 		f->id = fold->id;
+ 		f->iif = fold->iif;
+@@ -554,6 +559,7 @@ static int route4_change(struct net *net, struct sk_buff *in_skb,
+ 	return 0;
+ 
+ errout:
++	tcf_exts_destroy(&f->exts);
+ 	kfree(f);
+ 	return err;
+ }
+diff --git a/net/sched/cls_rsvp.h b/net/sched/cls_rsvp.h
+index 9992dfac6938..322438fb3ffc 100644
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -488,10 +488,12 @@ static int rsvp_change(struct net *net, struct sk_buff *in_skb,
+ 	if (err < 0)
+ 		return err;
+ 
+-	tcf_exts_init(&e, TCA_RSVP_ACT, TCA_RSVP_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
++	err = tcf_exts_init(&e, TCA_RSVP_ACT, TCA_RSVP_POLICE);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
++	if (err < 0)
++		goto errout2;
+ 
+ 	f = (struct rsvp_filter *)*arg;
+ 	if (f) {
+@@ -507,7 +509,11 @@ static int rsvp_change(struct net *net, struct sk_buff *in_skb,
+ 			goto errout2;
+ 		}
+ 
+-		tcf_exts_init(&n->exts, TCA_RSVP_ACT, TCA_RSVP_POLICE);
++		err = tcf_exts_init(&n->exts, TCA_RSVP_ACT, TCA_RSVP_POLICE);
++		if (err < 0) {
++			kfree(n);
++			goto errout2;
++		}
+ 
+ 		if (tb[TCA_RSVP_CLASSID]) {
+ 			n->res.classid = nla_get_u32(tb[TCA_RSVP_CLASSID]);
+@@ -531,7 +537,9 @@ static int rsvp_change(struct net *net, struct sk_buff *in_skb,
+ 	if (f == NULL)
+ 		goto errout2;
+ 
+-	tcf_exts_init(&f->exts, TCA_RSVP_ACT, TCA_RSVP_POLICE);
++	err = tcf_exts_init(&f->exts, TCA_RSVP_ACT, TCA_RSVP_POLICE);
++	if (err < 0)
++		goto errout;
+ 	h2 = 16;
+ 	if (tb[TCA_RSVP_SRC]) {
+ 		memcpy(f->src, nla_data(tb[TCA_RSVP_SRC]), sizeof(f->src));
+@@ -628,6 +636,7 @@ insert:
+ 	goto insert;
+ 
+ errout:
++	tcf_exts_destroy(&f->exts);
+ 	kfree(f);
+ errout2:
+ 	tcf_exts_destroy(&e);
+diff --git a/net/sched/cls_tcindex.c b/net/sched/cls_tcindex.c
+index 5f0af005d12e..778ff475fd5c 100644
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -218,10 +218,10 @@ static const struct nla_policy tcindex_policy[TCA_TCINDEX_MAX + 1] = {
+ 	[TCA_TCINDEX_CLASSID]		= { .type = NLA_U32 },
+ };
+ 
+-static void tcindex_filter_result_init(struct tcindex_filter_result *r)
++static int tcindex_filter_result_init(struct tcindex_filter_result *r)
+ {
+ 	memset(r, 0, sizeof(*r));
+-	tcf_exts_init(&r->exts, TCA_TCINDEX_ACT, TCA_TCINDEX_POLICE);
++	return tcf_exts_init(&r->exts, TCA_TCINDEX_ACT, TCA_TCINDEX_POLICE);
+ }
+ 
+ static void __tcindex_partial_destroy(struct rcu_head *head)
+@@ -232,23 +232,57 @@ static void __tcindex_partial_destroy(struct rcu_head *head)
+ 	kfree(p);
+ }
+ 
++static void tcindex_free_perfect_hash(struct tcindex_data *cp)
++{
++	int i;
++
++	for (i = 0; i < cp->hash; i++)
++		tcf_exts_destroy(&cp->perfect[i].exts);
++	kfree(cp->perfect);
++}
++
++static int tcindex_alloc_perfect_hash(struct tcindex_data *cp)
++{
++	int i, err = 0;
++
++	cp->perfect = kcalloc(cp->hash, sizeof(struct tcindex_filter_result),
++			      GFP_KERNEL);
++	if (!cp->perfect)
++		return -ENOMEM;
++
++	for (i = 0; i < cp->hash; i++) {
++		err = tcf_exts_init(&cp->perfect[i].exts,
++				    TCA_TCINDEX_ACT, TCA_TCINDEX_POLICE);
++		if (err < 0)
++			goto errout;
++	}
++
++	return 0;
++
++errout:
++	tcindex_free_perfect_hash(cp);
++	return err;
++}
++
+ static int
+ tcindex_set_parms(struct net *net, struct tcf_proto *tp, unsigned long base,
+ 		  u32 handle, struct tcindex_data *p,
+ 		  struct tcindex_filter_result *r, struct nlattr **tb,
+ 		  struct nlattr *est, bool ovr)
+ {
+-	int err, balloc = 0;
+ 	struct tcindex_filter_result new_filter_result, *old_r = r;
+ 	struct tcindex_filter_result cr;
+-	struct tcindex_data *cp, *oldp;
++	struct tcindex_data *cp = NULL, *oldp;
+ 	struct tcindex_filter *f = NULL; /* make gcc behave */
++	int err, balloc = 0;
+ 	struct tcf_exts e;
+ 
+-	tcf_exts_init(&e, TCA_TCINDEX_ACT, TCA_TCINDEX_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	err = tcf_exts_init(&e, TCA_TCINDEX_ACT, TCA_TCINDEX_POLICE);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	if (err < 0)
++		goto errout;
+ 
+ 	err = -ENOMEM;
+ 	/* tcindex_data attributes must look atomic to classifier/lookup so
+@@ -269,19 +303,20 @@ tcindex_set_parms(struct net *net, struct tcf_proto *tp, unsigned long base,
+ 	if (p->perfect) {
+ 		int i;
+ 
+-		cp->perfect = kmemdup(p->perfect,
+-				      sizeof(*r) * cp->hash, GFP_KERNEL);
+-		if (!cp->perfect)
++		if (tcindex_alloc_perfect_hash(cp) < 0)
+ 			goto errout;
+ 		for (i = 0; i < cp->hash; i++)
+-			tcf_exts_init(&cp->perfect[i].exts,
+-				      TCA_TCINDEX_ACT, TCA_TCINDEX_POLICE);
++			cp->perfect[i].res = p->perfect[i].res;
+ 		balloc = 1;
+ 	}
+ 	cp->h = p->h;
+ 
+-	tcindex_filter_result_init(&new_filter_result);
+-	tcindex_filter_result_init(&cr);
++	err = tcindex_filter_result_init(&new_filter_result);
++	if (err < 0)
++		goto errout1;
++	err = tcindex_filter_result_init(&cr);
++	if (err < 0)
++		goto errout1;
+ 	if (old_r)
+ 		cr.res = r->res;
+ 
+@@ -337,15 +372,8 @@ tcindex_set_parms(struct net *net, struct tcf_proto *tp, unsigned long base,
+ 	err = -ENOMEM;
+ 	if (!cp->perfect && !cp->h) {
+ 		if (valid_perfect_hash(cp)) {
+-			int i;
+-
+-			cp->perfect = kcalloc(cp->hash, sizeof(*r), GFP_KERNEL);
+-			if (!cp->perfect)
++			if (tcindex_alloc_perfect_hash(cp) < 0)
+ 				goto errout_alloc;
+-			for (i = 0; i < cp->hash; i++)
+-				tcf_exts_init(&cp->perfect[i].exts,
+-					      TCA_TCINDEX_ACT,
+-					      TCA_TCINDEX_POLICE);
+ 			balloc = 1;
+ 		} else {
+ 			struct tcindex_filter __rcu **hash;
+@@ -372,8 +400,12 @@ tcindex_set_parms(struct net *net, struct tcf_proto *tp, unsigned long base,
+ 		if (!f)
+ 			goto errout_alloc;
+ 		f->key = handle;
+-		tcindex_filter_result_init(&f->result);
+ 		f->next = NULL;
++		err = tcindex_filter_result_init(&f->result);
++		if (err < 0) {
++			kfree(f);
++			goto errout_alloc;
++		}
+ 	}
+ 
+ 	if (tb[TCA_TCINDEX_CLASSID]) {
+@@ -386,8 +418,13 @@ tcindex_set_parms(struct net *net, struct tcf_proto *tp, unsigned long base,
+ 	else
+ 		tcf_exts_change(tp, &cr.exts, &e);
+ 
+-	if (old_r && old_r != r)
+-		tcindex_filter_result_init(old_r);
++	if (old_r && old_r != r) {
++		err = tcindex_filter_result_init(old_r);
++		if (err < 0) {
++			kfree(f);
++			goto errout_alloc;
++		}
++	}
+ 
+ 	oldp = p;
+ 	r->res = cr.res;
+@@ -414,9 +451,12 @@ tcindex_set_parms(struct net *net, struct tcf_proto *tp, unsigned long base,
+ 
+ errout_alloc:
+ 	if (balloc == 1)
+-		kfree(cp->perfect);
++		tcindex_free_perfect_hash(cp);
+ 	else if (balloc == 2)
+ 		kfree(cp->h);
++errout1:
++	tcf_exts_destroy(&cr.exts);
++	tcf_exts_destroy(&new_filter_result.exts);
+ errout:
+ 	kfree(cp);
+ 	tcf_exts_destroy(&e);
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+index f951d33e38f6..ae83c3aec308 100644
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -705,13 +705,15 @@ static int u32_set_parms(struct net *net, struct tcf_proto *tp,
+ 			 struct tc_u_knode *n, struct nlattr **tb,
+ 			 struct nlattr *est, bool ovr)
+ {
+-	int err;
+ 	struct tcf_exts e;
++	int err;
+ 
+-	tcf_exts_init(&e, TCA_U32_ACT, TCA_U32_POLICE);
+-	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	err = tcf_exts_init(&e, TCA_U32_ACT, TCA_U32_POLICE);
+ 	if (err < 0)
+ 		return err;
++	err = tcf_exts_validate(net, tp, tb, est, &e, ovr);
++	if (err < 0)
++		goto errout;
+ 
+ 	err = -EINVAL;
+ 	if (tb[TCA_U32_LINK]) {
+@@ -828,7 +830,10 @@ static struct tc_u_knode *u32_init_knode(struct tcf_proto *tp,
+ 	new->tp = tp;
+ 	memcpy(&new->sel, s, sizeof(*s) + s->nkeys*sizeof(struct tc_u32_key));
+ 
+-	tcf_exts_init(&new->exts, TCA_U32_ACT, TCA_U32_POLICE);
++	if (tcf_exts_init(&new->exts, TCA_U32_ACT, TCA_U32_POLICE)) {
++		kfree(new);
++		return NULL;
++	}
+ 
+ 	return new;
+ }
+@@ -979,9 +984,12 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
+ 	n->handle = handle;
+ 	n->fshift = s->hmask ? ffs(ntohl(s->hmask)) - 1 : 0;
+ 	n->flags = flags;
+-	tcf_exts_init(&n->exts, TCA_U32_ACT, TCA_U32_POLICE);
+ 	n->tp = tp;
+ 
++	err = tcf_exts_init(&n->exts, TCA_U32_ACT, TCA_U32_POLICE);
++	if (err < 0)
++		goto errout;
++
+ #ifdef CONFIG_CLS_U32_MARK
+ 	n->pcpu_success = alloc_percpu(u32);
+ 	if (!n->pcpu_success) {
+@@ -1022,9 +1030,10 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
+ errhw:
+ #ifdef CONFIG_CLS_U32_MARK
+ 	free_percpu(n->pcpu_success);
+-errout:
+ #endif
+ 
++errout:
++	tcf_exts_destroy(&n->exts);
+ #ifdef CONFIG_CLS_U32_PERF
+ 	free_percpu(n->pf);
+ #endif
