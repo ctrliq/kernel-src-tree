@@ -1,0 +1,489 @@
+Fix implicit logo and RSCN handling for NVMET
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix implicit logo and RSCN handling for NVMET (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 93.75%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 1c5b12f76301b86d0e5828c7d11ec7c36ffd0195
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1c5b12f7.failed
+
+NVMET didn't have any RSCN handling at all and
+would not execute implicit LOGO when receiving a PLOGI
+from an rport that NVMET had in state UNMAPPED.
+
+Clean up the logic in lpfc_nlp_state_cleanup for
+initiators (FCP and NVME). NVMET should not respond to
+RSCN including allocating new ndlps so this code was
+conditionalized when nvmet_support is true.  The check
+for NLP_RCV_PLOGI in lpfc_setup_disc_node was moved
+below the check for nvmet_support to allow the NVMET
+to recover initiator nodes correctly.  The implicit
+logo was introduced with lpfc_rcv_plogi when NVMET gets
+a PLOGI on an ndlp in UNMAPPED state.  The RSCN handling
+was modified to not respond to an RSCN in NVMET.  Instead
+NVMET sends a GID_FT and determines if an NVMEP_INITIATOR
+it has is UNMAPPED but no longer in the zone membership.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+(cherry picked from commit 1c5b12f76301b86d0e5828c7d11ec7c36ffd0195)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_ct.c
+#	drivers/scsi/lpfc/lpfc_els.c
+#	drivers/scsi/lpfc/lpfc_hbadisc.c
+diff --cc drivers/scsi/lpfc/lpfc_ct.c
+index 4ac03b16d17f,1487406aea77..000000000000
+--- a/drivers/scsi/lpfc/lpfc_ct.c
++++ b/drivers/scsi/lpfc/lpfc_ct.c
+@@@ -453,13 -456,127 +453,129 @@@ lpfc_find_vport_by_did(struct lpfc_hba 
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ lpfc_prep_node_fc4type(struct lpfc_vport *vport, uint32_t Did, uint8_t fc4_type)
++ {
++ 	struct lpfc_nodelist *ndlp;
++ 
++ 	if ((vport->port_type != LPFC_NPIV_PORT) ||
++ 	    !(vport->ct_flags & FC_CT_RFF_ID) || !vport->cfg_restrict_login) {
++ 
++ 		ndlp = lpfc_setup_disc_node(vport, Did);
++ 
++ 		if (ndlp && NLP_CHK_NODE_ACT(ndlp)) {
++ 			lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_CT,
++ 				"Parse GID_FTrsp: did:x%x flg:x%x x%x",
++ 				Did, ndlp->nlp_flag, vport->fc_flag);
++ 
++ 			/* By default, the driver expects to support FCP FC4 */
++ 			if (fc4_type == FC_TYPE_FCP)
++ 				ndlp->nlp_fc4_type |= NLP_FC4_FCP;
++ 
++ 			if (fc4_type == FC_TYPE_NVME)
++ 				ndlp->nlp_fc4_type |= NLP_FC4_NVME;
++ 
++ 			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++ 					 "0238 Process x%06x NameServer Rsp "
++ 					 "Data: x%x x%x x%x x%x\n", Did,
++ 					 ndlp->nlp_flag, ndlp->nlp_fc4_type,
++ 					 vport->fc_flag,
++ 					 vport->fc_rscn_id_cnt);
++ 		} else {
++ 			lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_CT,
++ 				"Skip1 GID_FTrsp: did:x%x flg:x%x cnt:%d",
++ 				Did, vport->fc_flag, vport->fc_rscn_id_cnt);
++ 
++ 			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++ 					 "0239 Skip x%06x NameServer Rsp "
++ 					 "Data: x%x x%x\n", Did,
++ 					 vport->fc_flag,
++ 					 vport->fc_rscn_id_cnt);
++ 		}
++ 	} else {
++ 		if (!(vport->fc_flag & FC_RSCN_MODE) ||
++ 		    lpfc_rscn_payload_check(vport, Did)) {
++ 			lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_CT,
++ 				"Query GID_FTrsp: did:x%x flg:x%x cnt:%d",
++ 				Did, vport->fc_flag, vport->fc_rscn_id_cnt);
++ 
++ 			/*
++ 			 * This NPortID was previously a FCP target,
++ 			 * Don't even bother to send GFF_ID.
++ 			 */
++ 			ndlp = lpfc_findnode_did(vport, Did);
++ 			if (ndlp && NLP_CHK_NODE_ACT(ndlp))
++ 				ndlp->nlp_fc4_type = fc4_type;
++ 
++ 			if (ndlp && NLP_CHK_NODE_ACT(ndlp)) {
++ 				ndlp->nlp_fc4_type = fc4_type;
++ 
++ 				if (ndlp->nlp_type & NLP_FCP_TARGET)
++ 					lpfc_setup_disc_node(vport, Did);
++ 
++ 				else if (lpfc_ns_cmd(vport, SLI_CTNS_GFF_ID,
++ 							0, Did) == 0)
++ 					vport->num_disc_nodes++;
++ 
++ 				else
++ 					lpfc_setup_disc_node(vport, Did);
++ 			}
++ 		} else {
++ 			lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_CT,
++ 				"Skip2 GID_FTrsp: did:x%x flg:x%x cnt:%d",
++ 				Did, vport->fc_flag, vport->fc_rscn_id_cnt);
++ 
++ 			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++ 					 "0245 Skip x%06x NameServer Rsp "
++ 					 "Data: x%x x%x\n", Did,
++ 					 vport->fc_flag,
++ 					 vport->fc_rscn_id_cnt);
++ 		}
++ 	}
++ }
++ 
++ static void
++ lpfc_ns_rsp_audit_did(struct lpfc_vport *vport, uint32_t Did, uint8_t fc4_type)
++ {
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_nodelist *ndlp = NULL;
++ 	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
++ 
++ 	/*
++ 	 * To conserve rpi's, filter out addresses for other
++ 	 * vports on the same physical HBAs.
++ 	 */
++ 	if (Did != vport->fc_myDID &&
++ 	    (!lpfc_find_vport_by_did(phba, Did) ||
++ 	     vport->cfg_peer_port_login)) {
++ 		if (!phba->nvmet_support) {
++ 			/* FCPI/NVMEI path. Process Did */
++ 			lpfc_prep_node_fc4type(vport, Did, fc4_type);
++ 			return;
++ 		}
++ 		/* NVMET path.  NVMET only cares about NVMEI nodes. */
++ 		list_for_each_entry(ndlp, &vport->fc_nodes, nlp_listp) {
++ 			if (ndlp->nlp_type != NLP_NVME_INITIATOR ||
++ 			    ndlp->nlp_state != NLP_STE_UNMAPPED_NODE)
++ 				continue;
++ 			spin_lock_irq(shost->host_lock);
++ 			if (ndlp->nlp_DID == Did)
++ 				ndlp->nlp_flag &= ~NLP_NVMET_RECOV;
++ 			else
++ 				ndlp->nlp_flag |= NLP_NVMET_RECOV;
++ 			spin_unlock_irq(shost->host_lock);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  static int
+ -lpfc_ns_rsp(struct lpfc_vport *vport, struct lpfc_dmabuf *mp, uint8_t fc4_type,
+ -	    uint32_t Size)
+ +lpfc_ns_rsp(struct lpfc_vport *vport, struct lpfc_dmabuf *mp, uint32_t Size)
+  {
+- 	struct lpfc_hba  *phba = vport->phba;
+  	struct lpfc_sli_ct_request *Response =
+  		(struct lpfc_sli_ct_request *) mp->virt;
+- 	struct lpfc_nodelist *ndlp = NULL;
+  	struct lpfc_dmabuf *mlast, *next_mp;
+  	uint32_t *ctptr = (uint32_t *) & Response->un.gid.PortType;
+  	uint32_t Did, CTentry;
+@@@ -489,107 -608,10 +607,111 @@@
+  			/* Get next DID from NameServer List */
+  			CTentry = *ctptr++;
+  			Did = ((be32_to_cpu(CTentry)) & Mask_DID);
+++<<<<<<< HEAD
+ +
+ +			ndlp = NULL;
+ +
+ +			/*
+ +			 * Check for rscn processing or not
+ +			 * To conserve rpi's, filter out addresses for other
+ +			 * vports on the same physical HBAs.
+ +			 */
+ +			if ((Did != vport->fc_myDID) &&
+ +			    ((lpfc_find_vport_by_did(phba, Did) == NULL) ||
+ +			     vport->cfg_peer_port_login)) {
+ +				if ((vport->port_type != LPFC_NPIV_PORT) ||
+ +				    (!(vport->ct_flags & FC_CT_RFF_ID)) ||
+ +				    (!vport->cfg_restrict_login)) {
+ +					ndlp = lpfc_setup_disc_node(vport, Did);
+ +					if (ndlp && NLP_CHK_NODE_ACT(ndlp)) {
+ +						lpfc_debugfs_disc_trc(vport,
+ +						LPFC_DISC_TRC_CT,
+ +						"Parse GID_FTrsp: "
+ +						"did:x%x flg:x%x x%x",
+ +						Did, ndlp->nlp_flag,
+ +						vport->fc_flag);
+ +
+ +						lpfc_printf_vlog(vport,
+ +							KERN_INFO,
+ +							LOG_DISCOVERY,
+ +							"0238 Process "
+ +							"x%x NameServer Rsp"
+ +							"Data: x%x x%x x%x\n",
+ +							Did, ndlp->nlp_flag,
+ +							vport->fc_flag,
+ +							vport->fc_rscn_id_cnt);
+ +					} else {
+ +						lpfc_debugfs_disc_trc(vport,
+ +						LPFC_DISC_TRC_CT,
+ +						"Skip1 GID_FTrsp: "
+ +						"did:x%x flg:x%x cnt:%d",
+ +						Did, vport->fc_flag,
+ +						vport->fc_rscn_id_cnt);
+ +
+ +						lpfc_printf_vlog(vport,
+ +							KERN_INFO,
+ +							LOG_DISCOVERY,
+ +							"0239 Skip x%x "
+ +							"NameServer Rsp Data: "
+ +							"x%x x%x\n",
+ +							Did, vport->fc_flag,
+ +							vport->fc_rscn_id_cnt);
+ +					}
+ +
+ +				} else {
+ +					if (!(vport->fc_flag & FC_RSCN_MODE) ||
+ +					(lpfc_rscn_payload_check(vport, Did))) {
+ +						lpfc_debugfs_disc_trc(vport,
+ +						LPFC_DISC_TRC_CT,
+ +						"Query GID_FTrsp: "
+ +						"did:x%x flg:x%x cnt:%d",
+ +						Did, vport->fc_flag,
+ +						vport->fc_rscn_id_cnt);
+ +
+ +						/* This NPortID was previously
+ +						 * a FCP target, * Don't even
+ +						 * bother to send GFF_ID.
+ +						 */
+ +						ndlp = lpfc_findnode_did(vport,
+ +							Did);
+ +						if (ndlp &&
+ +						    NLP_CHK_NODE_ACT(ndlp)
+ +						    && (ndlp->nlp_type &
+ +						     NLP_FCP_TARGET))
+ +							lpfc_setup_disc_node
+ +								(vport, Did);
+ +						else if (lpfc_ns_cmd(vport,
+ +							SLI_CTNS_GFF_ID,
+ +							0, Did) == 0)
+ +							vport->num_disc_nodes++;
+ +						else
+ +							lpfc_setup_disc_node
+ +								(vport, Did);
+ +					}
+ +					else {
+ +						lpfc_debugfs_disc_trc(vport,
+ +						LPFC_DISC_TRC_CT,
+ +						"Skip2 GID_FTrsp: "
+ +						"did:x%x flg:x%x cnt:%d",
+ +						Did, vport->fc_flag,
+ +						vport->fc_rscn_id_cnt);
+ +
+ +						lpfc_printf_vlog(vport,
+ +							KERN_INFO,
+ +							LOG_DISCOVERY,
+ +							"0245 Skip x%x "
+ +							"NameServer Rsp Data: "
+ +							"x%x x%x\n",
+ +							Did, vport->fc_flag,
+ +							vport->fc_rscn_id_cnt);
+ +					}
+ +				}
+ +			}
+++=======
++ 			lpfc_ns_rsp_audit_did(vport, Did, fc4_type);
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  			if (CTentry & (cpu_to_be32(SLI_CT_LAST_ENTRY)))
+  				goto nsout1;
+ -
+  			Cnt -= sizeof(uint32_t);
+  		}
+  		ctptr = NULL;
+diff --cc drivers/scsi/lpfc/lpfc_els.c
+index 5f6d4f79644a,8d1c6897ca62..000000000000
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@@ -5687,6 -5861,11 +5687,14 @@@ lpfc_rscn_recovery_check(struct lpfc_vp
+  		    (ndlp->nlp_state == NLP_STE_UNUSED_NODE) ||
+  		    !lpfc_rscn_payload_check(vport, ndlp->nlp_DID))
+  			continue;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* NVME Target mode does not do RSCN Recovery. */
++ 		if (vport->phba->nvmet_support)
++ 			continue;
++ 
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  		lpfc_disc_state_machine(vport, ndlp, NULL,
+  					NLP_EVT_DEVICE_RECOVERY);
+  		lpfc_cancel_retry_delay_tmo(vport, ndlp);
+@@@ -5975,20 -6153,16 +5983,23 @@@ lpfc_els_handle_rscn(struct lpfc_vport 
+  	ndlp = lpfc_findnode_did(vport, NameServer_DID);
+  	if (ndlp && NLP_CHK_NODE_ACT(ndlp)
+  	    && ndlp->nlp_state == NLP_STE_UNMAPPED_NODE) {
+++<<<<<<< HEAD
+ +		/* Good ndlp, issue CT Request to NameServer */
+ +		if (lpfc_ns_cmd(vport, SLI_CTNS_GID_FT, 0, 0) == 0)
+ +			/* Wait for NameServer query cmpl before we can
+ +			   continue */
+++=======
++ 		/* Good ndlp, issue CT Request to NameServer.  Need to
++ 		 * know how many gidfts were issued.  If none, then just
++ 		 * flush the RSCN.  Otherwise, the outstanding requests
++ 		 * need to complete.
++ 		 */
++ 		vport->gidft_inp = 0;
++ 		if (lpfc_issue_gidft(vport) > 0)
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  			return 1;
+  	} else {
+- 		/* If login to NameServer does not exist, issue one */
+- 		/* Good status, issue PLOGI to NameServer */
+- 		ndlp = lpfc_findnode_did(vport, NameServer_DID);
+- 		if (ndlp && NLP_CHK_NODE_ACT(ndlp))
+- 			/* Wait for NameServer login cmpl before we can
+- 			   continue */
+- 			return 1;
+- 
++ 		/* Nameserver login in question.  Revalidate. */
+  		if (ndlp) {
+  			ndlp = lpfc_enable_node(vport, ndlp,
+  						NLP_STE_PLOGI_ISSUE);
+diff --cc drivers/scsi/lpfc/lpfc_hbadisc.c
+index 79d58e5464d6,0482c5580331..000000000000
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@@ -4049,23 -4158,56 +4049,43 @@@ lpfc_nlp_state_cleanup(struct lpfc_vpor
+  	if (new_state == NLP_STE_NPR_NODE)
+  		ndlp->nlp_flag &= ~NLP_RCV_PLOGI;
+  
+++<<<<<<< HEAD
+ +	/* Transport interface */
+ +	if (ndlp->rport && (old_state == NLP_STE_MAPPED_NODE ||
+ +			    old_state == NLP_STE_UNMAPPED_NODE)) {
+ +		vport->phba->nport_event_cnt++;
+ +		lpfc_unregister_remote_port(ndlp);
+++=======
++ 	/* FCP and NVME Transport interface */
++ 	if ((old_state == NLP_STE_MAPPED_NODE ||
++ 	     old_state == NLP_STE_UNMAPPED_NODE)) {
++ 		if (ndlp->rport) {
++ 			vport->phba->nport_event_cnt++;
++ 			lpfc_unregister_remote_port(ndlp);
++ 		}
++ 
++ 		/* Notify the NVME transport of this rport's loss on the
++ 		 * Initiator.  For NVME Target, should upcall transport
++ 		 * in the else clause when API available.
++ 		 */
++ 		if (ndlp->nlp_fc4_type & NLP_FC4_NVME) {
++ 			vport->phba->nport_event_cnt++;
++ 			if (vport->phba->nvmet_support == 0)
++ 				lpfc_nvme_unregister_port(vport, ndlp);
++ 		}
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  	}
+  
+ -	/* FCP and NVME Transport interfaces */
+ -
+  	if (new_state ==  NLP_STE_MAPPED_NODE ||
+  	    new_state == NLP_STE_UNMAPPED_NODE) {
+ -		if ((ndlp->nlp_fc4_type & NLP_FC4_FCP) ||
+ -		    (ndlp->nlp_DID == Fabric_DID)) {
+ -			vport->phba->nport_event_cnt++;
+ -			/*
+ -			 * Tell the fc transport about the port, if we haven't
+ -			 * already. If we have, and it's a scsi entity, be
+ -			 */
+ -			lpfc_register_remote_port(vport, ndlp);
+ -		}
+ -		/* Notify the NVME transport of this new rport. */
+ -		if (ndlp->nlp_fc4_type & NLP_FC4_NVME) {
+ -			if (vport->phba->nvmet_support == 0) {
+ -				/* Register this rport with the transport.
+ -				 * Initiators take the NDLP ref count in
+ -				 * the register.
+ -				 */
+ -				vport->phba->nport_event_cnt++;
+ -				lpfc_nvme_register_port(vport, ndlp);
+ -			} else {
+ -				/* Just take an NDLP ref count since the
+ -				 * target does not register rports.
+ -				 */
+ -				lpfc_nlp_get(ndlp);
+ -			}
+ -		}
+ +		vport->phba->nport_event_cnt++;
+ +		/*
+ +		 * Tell the fc transport about the port, if we haven't
+ +		 * already. If we have, and it's a scsi entity, be
+ +		 * sure to unblock any attached scsi devices
+ +		 */
+ +		lpfc_register_remote_port(vport, ndlp);
+  	}
+ -
+  	if ((new_state ==  NLP_STE_MAPPED_NODE) &&
+  		(vport->stat_data_enabled)) {
+  		/*
+@@@ -4983,10 -5179,6 +5025,13 @@@ lpfc_setup_disc_node(struct lpfc_vport 
+  			if (ndlp->nlp_flag & NLP_RCV_PLOGI)
+  				return NULL;
+  
+++<<<<<<< HEAD
+ +			/* Since this node is marked for discovery,
+ +			 * delay timeout is not needed.
+ +			 */
+ +			lpfc_cancel_retry_delay_tmo(vport, ndlp);
+++=======
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  			spin_lock_irq(shost->host_lock);
+  			ndlp->nlp_flag |= NLP_NPR_2B_DISC;
+  			spin_unlock_irq(shost->host_lock);
+@@@ -4999,9 -5191,18 +5044,22 @@@
+  		 */
+  		if (ndlp->nlp_state == NLP_STE_ADISC_ISSUE ||
+  		    ndlp->nlp_state == NLP_STE_PLOGI_ISSUE ||
+- 		    ndlp->nlp_flag & NLP_RCV_PLOGI)
++ 		    (!vport->phba->nvmet_support &&
++ 		     ndlp->nlp_flag & NLP_RCV_PLOGI))
+  			return NULL;
+++<<<<<<< HEAD
+++		lpfc_nlp_set_state(vport, ndlp, NLP_STE_NPR_NODE);
+++=======
++ 
++ 		if (vport->phba->nvmet_support)
++ 			return ndlp;
++ 
++ 		/* Moving to NPR state clears unsolicited flags and
++ 		 * allows for rediscovery
++ 		 */
+  		lpfc_nlp_set_state(vport, ndlp, NLP_STE_NPR_NODE);
++ 
+++>>>>>>> 1c5b12f76301 (Fix implicit logo and RSCN handling for NVMET)
+  		spin_lock_irq(shost->host_lock);
+  		ndlp->nlp_flag |= NLP_NPR_2B_DISC;
+  		spin_unlock_irq(shost->host_lock);
+* Unmerged path drivers/scsi/lpfc/lpfc_ct.c
+diff --git a/drivers/scsi/lpfc/lpfc_disc.h b/drivers/scsi/lpfc/lpfc_disc.h
+index 361f5b3d9d93..43c3738b69aa 100644
+--- a/drivers/scsi/lpfc/lpfc_disc.h
++++ b/drivers/scsi/lpfc/lpfc_disc.h
+@@ -139,6 +139,7 @@ struct lpfc_node_rrq {
+ #define NLP_LOGO_SND       0x00000100	/* sent LOGO request for this entry */
+ #define NLP_RNID_SND       0x00000400	/* sent RNID request for this entry */
+ #define NLP_ELS_SND_MASK   0x000007e0	/* sent ELS request for this entry */
++#define NLP_NVMET_RECOV    0x00001000   /* NVMET auditing node for recovery. */
+ #define NLP_DEFER_RM       0x00010000	/* Remove this ndlp if no longer used */
+ #define NLP_DELAY_TMO      0x00020000	/* delay timeout is running for node */
+ #define NLP_NPR_2B_DISC    0x00040000	/* node is included in num_disc_nodes */
+* Unmerged path drivers/scsi/lpfc/lpfc_els.c
+* Unmerged path drivers/scsi/lpfc/lpfc_hbadisc.c
+diff --git a/drivers/scsi/lpfc/lpfc_nportdisc.c b/drivers/scsi/lpfc/lpfc_nportdisc.c
+index 56a3df4fddb0..b363ced447eb 100644
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@ -353,8 +353,12 @@ lpfc_rcv_plogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	case  NLP_STE_PRLI_ISSUE:
+ 	case  NLP_STE_UNMAPPED_NODE:
+ 	case  NLP_STE_MAPPED_NODE:
+-		/* lpfc_plogi_confirm_nport skips fabric did, handle it here */
+-		if (!(ndlp->nlp_type & NLP_FABRIC)) {
++		/* For initiators, lpfc_plogi_confirm_nport skips fabric did.
++		 * For target mode, execute implicit logo.
++		 * Fabric nodes go into NPR.
++		 */
++		if (!(ndlp->nlp_type & NLP_FABRIC) &&
++		    !(phba->nvmet_support)) {
+ 			lpfc_els_rsp_acc(vport, ELS_CMD_PLOGI, cmdiocb,
+ 					 ndlp, NULL);
+ 			return 1;
