@@ -1,0 +1,219 @@
+powerpc/ptrace: Fix coredump since ptrace TM changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] ptrace: Fix coredump since ptrace TM changes (Gustavo Duarte) [1187582]
+Rebuild_FUZZ: 91.67%
+commit-author Cyril Bur <cyrilbur@gmail.com>
+commit c7a318ba868c61fc9be710a4970172d8c2eeb8b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c7a318ba.failed
+
+Commit 8d460f6156cd ("powerpc/process: Add the function
+flush_tmregs_to_thread") added flush_tmregs_to_thread() and included
+the assumption that it would only be called for a task which is not
+current.
+
+Although this is correct for ptrace, when generating a core dump, some
+of the routines which call flush_tmregs_to_thread() are called. This
+leads to a WARNing such as:
+
+  Not expecting ptrace on self: TM regs may be incorrect
+  ------------[ cut here ]------------
+  WARNING: CPU: 123 PID: 7727 at arch/powerpc/kernel/process.c:1088 flush_tmregs_to_thread+0x78/0x80
+  CPU: 123 PID: 7727 Comm: libvirtd Not tainted 4.8.0-rc1-gcc6x-g61e8a0d #1
+  task: c000000fe631b600 task.stack: c000000fe63b0000
+  NIP: c00000000001a1a8 LR: c00000000001a1a4 CTR: c000000000717780
+  REGS: c000000fe63b3420 TRAP: 0700   Not tainted  (4.8.0-rc1-gcc6x-g61e8a0d)
+  MSR: 900000010282b033 <SF,HV,VEC,VSX,EE,FP,ME,IR,DR,RI,LE,TM[E]>  CR: 28004222  XER: 20000000
+  ...
+  NIP [c00000000001a1a8] flush_tmregs_to_thread+0x78/0x80
+  LR [c00000000001a1a4] flush_tmregs_to_thread+0x74/0x80
+  Call Trace:
+   flush_tmregs_to_thread+0x74/0x80 (unreliable)
+   vsr_get+0x64/0x1a0
+   elf_core_dump+0x604/0x1430
+   do_coredump+0x5fc/0x1200
+   get_signal+0x398/0x740
+   do_signal+0x54/0x2b0
+   do_notify_resume+0x98/0xb0
+   ret_from_except_lite+0x70/0x74
+
+So fix flush_tmregs_to_thread() to detect the case where it is called on
+current, and a transaction is active, and in that case flush the TM regs
+to the thread_struct.
+
+This patch also moves flush_tmregs_to_thread() into ptrace.c as it is
+only called from that file.
+
+Fixes: 8d460f6156cd ("powerpc/process: Add the function flush_tmregs_to_thread")
+	Signed-off-by: Cyril Bur <cyrilbur@gmail.com>
+[mpe: Flesh out change log]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit c7a318ba868c61fc9be710a4970172d8c2eeb8b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/switch_to.h
+#	arch/powerpc/kernel/process.c
+diff --cc arch/powerpc/include/asm/switch_to.h
+index 92b3db2429b0,17c8380673a6..000000000000
+--- a/arch/powerpc/include/asm/switch_to.h
++++ b/arch/powerpc/include/asm/switch_to.h
+@@@ -75,11 -63,16 +75,15 @@@ static inline void flush_vsx_to_thread(
+  #endif
+  
+  #ifdef CONFIG_SPE
+ -extern void enable_kernel_spe(void);
+  extern void flush_spe_to_thread(struct task_struct *);
+ -extern void giveup_spe(struct task_struct *);
+ -extern void __giveup_spe(struct task_struct *);
+ -static inline void disable_kernel_spe(void)
+ +#else
+++<<<<<<< HEAD
+ +static inline void flush_spe_to_thread(struct task_struct *t)
+  {
+ -	msr_check_and_clear(MSR_SPE);
+  }
+ -#else
+++=======
++ static inline void __giveup_spe(struct task_struct *t) { }
+++>>>>>>> c7a318ba868c (powerpc/ptrace: Fix coredump since ptrace TM changes)
+  #endif
+  
+  static inline void clear_task_ebb(struct task_struct *t)
+diff --cc arch/powerpc/kernel/process.c
+index 7f3a6ffc29aa,9ee2623e0f67..000000000000
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@@ -759,6 -993,87 +759,90 @@@ void restore_tm_state(struct pt_regs *r
+  #define __switch_to_tm(prev)
+  #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+  
+++<<<<<<< HEAD
+++=======
++ static inline void save_sprs(struct thread_struct *t)
++ {
++ #ifdef CONFIG_ALTIVEC
++ 	if (cpu_has_feature(CPU_FTR_ALTIVEC))
++ 		t->vrsave = mfspr(SPRN_VRSAVE);
++ #endif
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	if (cpu_has_feature(CPU_FTR_DSCR))
++ 		t->dscr = mfspr(SPRN_DSCR);
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S)) {
++ 		t->bescr = mfspr(SPRN_BESCR);
++ 		t->ebbhr = mfspr(SPRN_EBBHR);
++ 		t->ebbrr = mfspr(SPRN_EBBRR);
++ 
++ 		t->fscr = mfspr(SPRN_FSCR);
++ 
++ 		/*
++ 		 * Note that the TAR is not available for use in the kernel.
++ 		 * (To provide this, the TAR should be backed up/restored on
++ 		 * exception entry/exit instead, and be in pt_regs.  FIXME,
++ 		 * this should be in pt_regs anyway (for debug).)
++ 		 */
++ 		t->tar = mfspr(SPRN_TAR);
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_300)) {
++ 		/* Conditionally save Load Monitor registers, if enabled */
++ 		if (t->fscr & FSCR_LM) {
++ 			t->lmrr = mfspr(SPRN_LMRR);
++ 			t->lmser = mfspr(SPRN_LMSER);
++ 		}
++ 	}
++ #endif
++ }
++ 
++ static inline void restore_sprs(struct thread_struct *old_thread,
++ 				struct thread_struct *new_thread)
++ {
++ #ifdef CONFIG_ALTIVEC
++ 	if (cpu_has_feature(CPU_FTR_ALTIVEC) &&
++ 	    old_thread->vrsave != new_thread->vrsave)
++ 		mtspr(SPRN_VRSAVE, new_thread->vrsave);
++ #endif
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	if (cpu_has_feature(CPU_FTR_DSCR)) {
++ 		u64 dscr = get_paca()->dscr_default;
++ 		if (new_thread->dscr_inherit)
++ 			dscr = new_thread->dscr;
++ 
++ 		if (old_thread->dscr != dscr)
++ 			mtspr(SPRN_DSCR, dscr);
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S)) {
++ 		if (old_thread->bescr != new_thread->bescr)
++ 			mtspr(SPRN_BESCR, new_thread->bescr);
++ 		if (old_thread->ebbhr != new_thread->ebbhr)
++ 			mtspr(SPRN_EBBHR, new_thread->ebbhr);
++ 		if (old_thread->ebbrr != new_thread->ebbrr)
++ 			mtspr(SPRN_EBBRR, new_thread->ebbrr);
++ 
++ 		if (old_thread->fscr != new_thread->fscr)
++ 			mtspr(SPRN_FSCR, new_thread->fscr);
++ 
++ 		if (old_thread->tar != new_thread->tar)
++ 			mtspr(SPRN_TAR, new_thread->tar);
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_300)) {
++ 		/* Conditionally restore Load Monitor registers, if enabled */
++ 		if (new_thread->fscr & FSCR_LM) {
++ 			if (old_thread->lmrr != new_thread->lmrr)
++ 				mtspr(SPRN_LMRR, new_thread->lmrr);
++ 			if (old_thread->lmser != new_thread->lmser)
++ 				mtspr(SPRN_LMSER, new_thread->lmser);
++ 		}
++ 	}
++ #endif
++ }
++ 
+++>>>>>>> c7a318ba868c (powerpc/ptrace: Fix coredump since ptrace TM changes)
+  struct task_struct *__switch_to(struct task_struct *prev,
+  	struct task_struct *new)
+  {
+* Unmerged path arch/powerpc/include/asm/switch_to.h
+* Unmerged path arch/powerpc/kernel/process.c
+diff --git a/arch/powerpc/kernel/ptrace.c b/arch/powerpc/kernel/ptrace.c
+index 93fa206c1317..33a764556c16 100644
+--- a/arch/powerpc/kernel/ptrace.c
++++ b/arch/powerpc/kernel/ptrace.c
+@@ -38,6 +38,7 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/switch_to.h>
++#include <asm/tm.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/syscalls.h>
+@@ -117,6 +118,24 @@ static const struct pt_regs_offset regoffset_table[] = {
+ 	REG_OFFSET_END,
+ };
+ 
++#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++static void flush_tmregs_to_thread(struct task_struct *tsk)
++{
++	/*
++	 * If task is not current, it will have been flushed already to
++	 * it's thread_struct during __switch_to().
++	 *
++	 * A reclaim flushes ALL the state.
++	 */
++
++	if (tsk == current && MSR_TM_SUSPENDED(mfmsr()))
++		tm_reclaim_current(TM_CAUSE_SIGNAL);
++
++}
++#else
++static inline void flush_tmregs_to_thread(struct task_struct *tsk) { }
++#endif
++
+ /**
+  * regs_query_register_offset() - query register offset from its name
+  * @name:	the name of a register
