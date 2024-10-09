@@ -129,7 +129,7 @@ struct __packed hw_aq_atl_utils_mbox {
 struct __packed hw_atl_s {
 	struct aq_hw_s base;
 	struct hw_atl_stats_s last_stats;
-	struct hw_atl_stats_s curr_stats;
+	struct aq_stats_s curr_stats;
 	u64 speed;
 	u32 itr_tx;
 	u32 itr_rx;
@@ -210,8 +210,6 @@ int hw_atl_utils_get_fw_version(struct aq_hw_s *self, u32 *fw_version);
 
 int hw_atl_utils_update_stats(struct aq_hw_s *self);
 
-int hw_atl_utils_get_hw_stats(struct aq_hw_s *self,
-			      u64 *data,
-			      unsigned int *p_count);
+struct aq_stats_s *hw_atl_utils_get_hw_stats(struct aq_hw_s *self);
 
 #endif /* HW_ATL_UTILS_H */
