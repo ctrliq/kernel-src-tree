@@ -1,0 +1,130 @@
+scsi: qla2xxx: Query FC4 type during RSCN processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Query FC4 type during RSCN processing (Himanshu Madhani) [1316281]
+Rebuild_FUZZ: 93.88%
+commit-author Giridhar Malavali <giridhar.malavali@cavium.com>
+commit 2d57b5efda511886daa984d5bb3da29759bb157c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2d57b5ef.failed
+
+Based on the FC4 type, login will proceed to either FCP or FC-NVMe
+remote ports.
+
+	Signed-off-by: Giridhar Malavali <giridhar.malavali@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 2d57b5efda511886daa984d5bb3da29759bb157c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c724f888aca6,0b33a84f9b9f..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -4277,6 -4679,98 +4277,101 @@@ qlafx00_post_aenfx_work(struct scsi_qla
+  	return qla2x00_post_work(vha, e);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int qla24xx_post_upd_fcport_work(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	struct qla_work_evt *e;
++ 
++ 	e = qla2x00_alloc_work(vha, QLA_EVT_UPD_FCPORT);
++ 	if (!e)
++ 		return QLA_FUNCTION_FAILED;
++ 
++ 	e->u.fcport.fcport = fcport;
++ 	return qla2x00_post_work(vha, e);
++ }
++ 
++ static
++ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
++ {
++ 	unsigned long flags;
++ 	fc_port_t *fcport =  NULL, *tfcp;
++ 	struct qlt_plogi_ack_t *pla =
++ 	    (struct qlt_plogi_ack_t *)e->u.new_sess.pla;
++ 	uint8_t free_fcport = 0;
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++ 	fcport = qla2x00_find_fcport_by_wwpn(vha, e->u.new_sess.port_name, 1);
++ 	if (fcport) {
++ 		fcport->d_id = e->u.new_sess.id;
++ 		if (pla) {
++ 			fcport->fw_login_state = DSC_LS_PLOGI_PEND;
++ 			qlt_plogi_ack_link(vha, pla, fcport, QLT_PLOGI_LINK_SAME_WWN);
++ 			/* we took an extra ref_count to prevent PLOGI ACK when
++ 			 * fcport/sess has not been created.
++ 			 */
++ 			pla->ref_count--;
++ 		}
++ 	} else {
++ 		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 		fcport = qla2x00_alloc_fcport(vha, GFP_KERNEL);
++ 		if (fcport) {
++ 			fcport->d_id = e->u.new_sess.id;
++ 			fcport->scan_state = QLA_FCPORT_FOUND;
++ 			fcport->flags |= FCF_FABRIC_DEVICE;
++ 			fcport->fw_login_state = DSC_LS_PLOGI_PEND;
++ 
++ 			memcpy(fcport->port_name, e->u.new_sess.port_name,
++ 			    WWN_SIZE);
++ 		} else {
++ 			ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 				   "%s %8phC mem alloc fail.\n",
++ 				   __func__, e->u.new_sess.port_name);
++ 
++ 			if (pla)
++ 				kmem_cache_free(qla_tgt_plogi_cachep, pla);
++ 			return;
++ 		}
++ 
++ 		spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++ 		/* search again to make sure one else got ahead */
++ 		tfcp = qla2x00_find_fcport_by_wwpn(vha,
++ 		    e->u.new_sess.port_name, 1);
++ 		if (tfcp) {
++ 			/* should rarily happen */
++ 			ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 			    "%s %8phC found existing fcport b4 add. DS %d LS %d\n",
++ 			    __func__, tfcp->port_name, tfcp->disc_state,
++ 			    tfcp->fw_login_state);
++ 
++ 			free_fcport = 1;
++ 		} else {
++ 			list_add_tail(&fcport->list, &vha->vp_fcports);
++ 
++ 			if (pla) {
++ 				qlt_plogi_ack_link(vha, pla, fcport,
++ 				    QLT_PLOGI_LINK_SAME_WWN);
++ 				pla->ref_count--;
++ 			}
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 
++ 	if (fcport) {
++ 		if (pla)
++ 			qlt_plogi_ack_unref(vha, pla);
++ 		else
++ 			qla24xx_async_gffid(vha, fcport);
++ 	}
++ 
++ 	if (free_fcport) {
++ 		qla2x00_free_fcport(fcport);
++ 		if (pla)
++ 			kmem_cache_free(qla_tgt_plogi_cachep, pla);
++ 	}
++ }
++ 
+++>>>>>>> 2d57b5efda51 (scsi: qla2xxx: Query FC4 type during RSCN processing)
+  void
+  qla2x00_do_work(struct scsi_qla_host *vha)
+  {
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
