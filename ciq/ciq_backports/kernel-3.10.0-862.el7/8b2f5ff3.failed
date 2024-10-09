@@ -1,0 +1,403 @@
+qla2xxx: cleanup cmd in qla workqueue before processing TMR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Swapnil Nagle <swapnil.nagle@purestorage.com>
+commit 8b2f5ff3d05c2c48b722c3cc67b8226f1601042b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8b2f5ff3.failed
+
+Since cmds go into qla_tgt_wq and TMRs don't, it's possible that TMR
+like TASK_ABORT can be queued over the cmd for which it was meant.
+To avoid this race, use a per-port list to keep track of cmds that
+are enqueued to qla_tgt_wq but not yet processed. When a TMR arrives,
+iterate through this list and remove any cmds that match the TMR.
+This patch supports TASK_ABORT and LUN_RESET.
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Swapnil Nagle <swapnil.nagle@purestorage.com>
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Acked-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 8b2f5ff3d05c2c48b722c3cc67b8226f1601042b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_os.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 866e7a991a8e,e63aa0780b52..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -68,9 -66,9 +68,15 @@@
+   * |                              |                    | 0xd02a,0xd02e	|
+   * |                              |                    | 0xd031-0xd0ff	|
+   * |                              |                    | 0xd101-0xd1fe	|
+++<<<<<<< HEAD
+ + * |                              |                    | 0xd213-0xd2fe	|
+ + * | Target Mode		  |	  0xe070       | 0xe021		|
+ + * | Target Mode Management	  |	  0xf072       | 0xf002-0xf003	|
+++=======
++  * |                              |                    | 0xd214-0xd2fe	|
++  * | Target Mode		  |	  0xe079       |		|
++  * | Target Mode Management	  |	  0xf083       | 0xf002		|
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+   * |                              |                    | 0xf046-0xf049  |
+   * | Target Mode Task Management  |	  0x1000b      |		|
+   * ----------------------------------------------------------------------
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 9cf0dee11112,d9c4ed21b52f..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3656,7 -3579,10 +3656,14 @@@ typedef struct scsi_qla_host 
+  	uint16_t	fcoe_fcf_idx;
+  	uint8_t		fcoe_vn_port_mac[6];
+  
+++<<<<<<< HEAD
+ +	struct list_head	qp_list;
+++=======
++ 	/* list of commands waiting on workqueue */
++ 	struct list_head	qla_cmd_list;
++ 	struct list_head	qla_sess_op_cmd_list;
++ 	spinlock_t		cmd_list_lock;
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  
+  	uint32_t	vp_abort_cnt;
+  
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c679c5766696,7ce395aaf033..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -4121,10 -3764,11 +4121,18 @@@ struct scsi_qla_host *qla2x00_create_ho
+  	INIT_LIST_HEAD(&vha->vp_fcports);
+  	INIT_LIST_HEAD(&vha->work_list);
+  	INIT_LIST_HEAD(&vha->list);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&vha->qp_list);
+ +
+ +	spin_lock_init(&vha->work_lock);
+ +	init_waitqueue_head(&vha->vref_waitq);
+++=======
++ 	INIT_LIST_HEAD(&vha->qla_cmd_list);
++ 	INIT_LIST_HEAD(&vha->qla_sess_op_cmd_list);
++ 
++ 	spin_lock_init(&vha->work_lock);
++ 	spin_lock_init(&vha->cmd_list_lock);
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  
+  	sprintf(vha->host_str, "%s_%ld", QLA2XXX_DRIVER_NAME, vha->host_no);
+  	ql_dbg(ql_dbg_init, vha, 0x0041,
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,eca444827eae..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2638,43 -3337,17 +2713,53 @@@ static void qlt_do_work(struct work_str
+  	if (tgt->tgt_stop)
+  		goto out_term;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha,
+ +	    atio->u.isp24.fcp_hdr.s_id);
+ +	/* Do kref_get() before dropping qla_hw_data->hardware_lock. */
+ +	if (sess)
+ +		kref_get(&sess->se_sess->sess_kref);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +
+ +	if (unlikely(!sess)) {
+ +		uint8_t *s_id =	atio->u.isp24.fcp_hdr.s_id;
+ +
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
+ +			"qla_target(%d): Unable to find wwn login"
+ +			" (s_id %x:%x:%x), trying to create it manually\n",
+ +			vha->vp_idx, s_id[0], s_id[1], s_id[2]);
+ +
+ +		if (atio->u.raw.entry_count > 1) {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
+ +				"Dropping multy entry cmd %p\n", cmd);
+ +			goto out_term;
+ +		}
+ +
+ +		mutex_lock(&ha->tgt.tgt_mutex);
+ +		sess = qlt_make_local_sess(vha, s_id);
+ +		/* sess has an extra creation ref. */
+ +		mutex_unlock(&ha->tgt.tgt_mutex);
+ +
+ +		if (!sess)
+ +			goto out_term;
+ +	}
+ +
+ +	cmd->sess = sess;
+ +	cmd->loop_id = sess->loop_id;
+ +	cmd->conf_compl_supported = sess->conf_compl_supported;
+ +
+++=======
++ 	if (cmd->state == QLA_TGT_STATE_ABORTED) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf082,
++ 		    "cmd with tag %u is aborted\n",
++ 		    cmd->atio.u.isp24.exchange_addr);
++ 		goto out_term;
++ 	}
++ 
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  	cdb = &atio->u.isp24.fcp_cmnd.cdb[0];
+ -	cmd->se_cmd.tag = atio->u.isp24.exchange_addr;
+ +	cmd->tag = atio->u.isp24.exchange_addr;
+  	cmd->unpacked_lun = scsilun_to_int(
+  	    (struct scsi_lun *)&atio->u.isp24.fcp_cmnd.lun);
+  
+@@@ -2715,12 -3386,133 +2800,115 @@@ out_term
+  	 * cmd has not sent to target yet, so pass NULL as the second
+  	 * argument to qlt_send_term_exchange() and free the memory here.
+  	 */
+ -	cmd->cmd_flags |= BIT_2;
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1);
+ -
+ -	qlt_decr_num_pend_cmds(vha);
+ -	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
+ -	ha->tgt.tgt_ops->put_sess(sess);
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+ +	if (sess)
+++=======
++ }
++ 
++ static void qlt_do_work(struct work_struct *work)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
++ 	scsi_qla_host_t *vha = cmd->vha;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_del(&cmd->cmd_list);
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	__qlt_do_work(cmd);
++ }
++ 
++ static struct qla_tgt_cmd *qlt_get_tag(scsi_qla_host_t *vha,
++ 				       struct qla_tgt_sess *sess,
++ 				       struct atio_from_isp *atio)
++ {
++ 	struct se_session *se_sess = sess->se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 	cmd->state = QLA_TGT_STATE_NEW;
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	qlt_incr_num_pend_cmds(vha);
++ 	cmd->vha = vha;
++ 	cmd->se_cmd.map_tag = tag;
++ 	cmd->sess = sess;
++ 	cmd->loop_id = sess->loop_id;
++ 	cmd->conf_compl_supported = sess->conf_compl_supported;
++ 
++ 	cmd->cmd_flags = 0;
++ 	cmd->jiffies_at_alloc = get_jiffies_64();
++ 
++ 	cmd->reset_count = vha->hw->chip_reset;
++ 
++ 	return cmd;
++ }
++ 
++ static void qlt_send_busy(struct scsi_qla_host *, struct atio_from_isp *,
++ 			  uint16_t);
++ 
++ static void qlt_create_sess_from_atio(struct work_struct *work)
++ {
++ 	struct qla_tgt_sess_op *op = container_of(work,
++ 					struct qla_tgt_sess_op, work);
++ 	scsi_qla_host_t *vha = op->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	uint8_t *s_id = op->atio.u.isp24.fcp_hdr.s_id;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_del(&op->cmd_list);
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	if (op->aborted) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf083,
++ 		    "sess_op with tag %u is aborted\n",
++ 		    op->atio.u.isp24.exchange_addr);
++ 		goto out_term;
++ 	}
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
++ 	    "qla_target(%d): Unable to find wwn login"
++ 	    " (s_id %x:%x:%x), trying to create it manually\n",
++ 	    vha->vp_idx, s_id[0], s_id[1], s_id[2]);
++ 
++ 	if (op->atio.u.raw.entry_count > 1) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
++ 		    "Dropping multy entry atio %p\n", &op->atio);
++ 		goto out_term;
++ 	}
++ 
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 	sess = qlt_make_local_sess(vha, s_id);
++ 	/* sess has an extra creation ref. */
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	if (!sess)
++ 		goto out_term;
++ 	/*
++ 	 * Now obtain a pre-allocated session tag using the original op->atio
++ 	 * packet header, and dispatch into __qlt_do_work() using the existing
++ 	 * process context.
++ 	 */
++ 	cmd = qlt_get_tag(vha, sess, &op->atio);
++ 	if (!cmd) {
++ 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  		ha->tgt.tgt_ops->put_sess(sess);
+ -		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -		kfree(op);
+ -		return;
+ -	}
+ -	/*
+ -	 * __qlt_do_work() will call ha->tgt.tgt_ops->put_sess() to release
+ -	 * the extra reference taken above by qlt_make_local_sess()
+ -	 */
+ -	__qlt_do_work(cmd);
+ -	kfree(op);
+ -	return;
+ -
+ -out_term:
+ -	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -	qlt_send_term_exchange(vha, NULL, &op->atio, 1);
+ -	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -	kfree(op);
+ -
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -2737,19 -3530,43 +2925,55 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+ +	cmd = kmem_cache_zalloc(qla_tgt_cmd_cachep, GFP_ATOMIC);
+++=======
++ 	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha, atio->u.isp24.fcp_hdr.s_id);
++ 	if (unlikely(!sess)) {
++ 		struct qla_tgt_sess_op *op = kzalloc(sizeof(struct qla_tgt_sess_op),
++ 						     GFP_ATOMIC);
++ 		if (!op)
++ 			return -ENOMEM;
++ 
++ 		memcpy(&op->atio, atio, sizeof(*atio));
++ 		op->vha = vha;
++ 
++ 		spin_lock(&vha->cmd_list_lock);
++ 		list_add_tail(&op->cmd_list, &vha->qla_sess_op_cmd_list);
++ 		spin_unlock(&vha->cmd_list_lock);
++ 
++ 		INIT_WORK(&op->work, qlt_create_sess_from_atio);
++ 		queue_work(qla_tgt_wq, &op->work);
++ 		return 0;
++ 	}
++ 	/*
++ 	 * Do kref_get() before returning + dropping qla_hw_data->hardware_lock.
++ 	 */
++ 	kref_get(&sess->se_sess->sess_kref);
++ 
++ 	cmd = qlt_get_tag(vha, sess, atio);
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  	if (!cmd) {
+ -		ql_dbg(ql_dbg_io, vha, 0x3062,
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05e,
+  		    "qla_target(%d): Allocation of cmd failed\n", vha->vp_idx);
+ -		ha->tgt.tgt_ops->put_sess(sess);
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&cmd->cmd_list);
+ +
+ +	memcpy(&cmd->atio, atio, sizeof(*atio));
+ +	cmd->state = QLA_TGT_STATE_NEW;
+ +	cmd->tgt = ha->tgt.qla_tgt;
+ +	cmd->vha = vha;
+++=======
++ 	cmd->cmd_in_wq = 1;
++ 	cmd->cmd_flags |= BIT_0;
++ 
++ 	spin_lock(&vha->cmd_list_lock);
++ 	list_add_tail(&cmd->cmd_list, &vha->qla_cmd_list);
++ 	spin_unlock(&vha->cmd_list_lock);
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  
+  	INIT_WORK(&cmd->work, qlt_do_work);
+  	queue_work(qla_tgt_wq, &cmd->work);
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,310433504c0d..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -805,6 -870,14 +805,17 @@@ struct qla_tgt 
+  	struct list_head tgt_list_entry;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct qla_tgt_sess_op {
++ 	struct scsi_qla_host *vha;
++ 	struct atio_from_isp atio;
++ 	struct work_struct work;
++ 	struct list_head cmd_list;
++ 	bool aborted;
++ };
++ 
+++>>>>>>> 8b2f5ff3d05c (qla2xxx: cleanup cmd in qla workqueue before processing TMR)
+  /*
+   * Equivilant to IT Nexus (Initiator-Target)
+   */
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 8e939971fec1..0ab162f510d3 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -1135,9 +1135,7 @@ static struct qla_tgt_sess *tcm_qla2xxx_find_sess_by_s_id(
+ 		return NULL;
+ 	}
+ 
+-	key = (((unsigned long)s_id[0] << 16) |
+-	       ((unsigned long)s_id[1] << 8) |
+-	       (unsigned long)s_id[2]);
++	key = sid_to_key(s_id);
+ 	pr_debug("find_sess_by_s_id: 0x%06x\n", key);
+ 
+ 	se_nacl = btree_lookup32(&lport->lport_fcport_map, key);
+@@ -1172,9 +1170,7 @@ static void tcm_qla2xxx_set_sess_by_s_id(
+ 	void *slot;
+ 	int rc;
+ 
+-	key = (((unsigned long)s_id[0] << 16) |
+-	       ((unsigned long)s_id[1] << 8) |
+-	       (unsigned long)s_id[2]);
++	key = sid_to_key(s_id);
+ 	pr_debug("set_sess_by_s_id: %06x\n", key);
+ 
+ 	slot = btree_lookup32(&lport->lport_fcport_map, key);
