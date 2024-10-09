@@ -33,6 +33,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/mempool.h>
 #include <linux/memory.h>
+#include <linux/cpu.h>
 #include <linux/timer.h>
 #include <linux/io.h>
 #include <linux/iova.h>
@@ -44,6 +45,7 @@
 #include <linux/pci-ats.h>
 #include <linux/memblock.h>
 #include <linux/crash_dump.h>
+#include <linux/dma-contiguous.h>
 #include <asm/irq_remapping.h>
 #include <asm/cacheflush.h>
 #include <asm/iommu.h>
@@ -452,10 +454,9 @@ static LIST_HEAD(dmar_rmrr_units);
 
 static void flush_unmaps_timeout(unsigned long data);
 
-static DEFINE_TIMER(unmap_timer,  flush_unmaps_timeout, 0, 0);
-
 struct deferred_flush_entry {
-	struct iova *iova;
+	unsigned long iova_pfn;
+	unsigned long nrpages;
 	struct dmar_domain *domain;
 	struct page *freelist;
 };
@@ -466,16 +467,18 @@ struct deferred_flush_table {
 	struct deferred_flush_entry entries[HIGH_WATER_MARK];
 };
 
-static struct deferred_flush_table *deferred_flush;
+struct deferred_flush_data {
+	spinlock_t lock;
+	int timer_on;
+	struct timer_list timer;
+	long size;
+	struct deferred_flush_table *tables;
+};
+
+DEFINE_PER_CPU(struct deferred_flush_data, deferred_flush);
 
 /* bitmap for indexing intel_iommus */
 static int g_num_of_iommus;
-
-static DEFINE_SPINLOCK(async_umap_flush_lock);
-static LIST_HEAD(unmaps_to_do);
-
-static int timer_on;
-static long list_size;
 
 static void domain_exit(struct dmar_domain *domain);
 static void domain_remove_dev_info(struct dmar_domain *domain);
@@ -1890,8 +1893,12 @@ static void domain_exit(struct dmar_domain *domain)
 		return;
 
 	/* Flush any lazy unmaps that may reference this domain */
-	if (!intel_iommu_strict)
-		flush_unmaps_timeout(0);
+	if (!intel_iommu_strict) {
+		int cpu;
+
+		for_each_possible_cpu(cpu)
+			flush_unmaps_timeout(cpu);
+	}
 
 	/* Remove associated devices and clear attached or cached domains */
 	rcu_read_lock();
@@ -3083,7 +3090,7 @@ static int __init init_dmars(void)
 	bool copied_tables = false;
 	struct device *dev;
 	struct intel_iommu *iommu;
-	int i, ret;
+	int i, ret, cpu;
 
 	/*
 	 * for each drhd
@@ -3116,11 +3123,20 @@ static int __init init_dmars(void)
 		goto error;
 	}
 
-	deferred_flush = kzalloc(g_num_of_iommus *
-		sizeof(struct deferred_flush_table), GFP_KERNEL);
-	if (!deferred_flush) {
-		ret = -ENOMEM;
-		goto free_g_iommus;
+	for_each_possible_cpu(cpu) {
+		struct deferred_flush_data *dfd = per_cpu_ptr(&deferred_flush,
+							      cpu);
+
+		dfd->tables = kzalloc(g_num_of_iommus *
+				      sizeof(struct deferred_flush_table),
+				      GFP_KERNEL);
+		if (!dfd->tables) {
+			ret = -ENOMEM;
+			goto free_g_iommus;
+		}
+
+		spin_lock_init(&dfd->lock);
+		setup_timer(&dfd->timer, flush_unmaps_timeout, cpu);
 	}
 
 	for_each_active_iommu(iommu, drhd) {
@@ -3294,19 +3310,20 @@ free_iommu:
 		disable_dmar_iommu(iommu);
 		free_dmar_iommu(iommu);
 	}
-	kfree(deferred_flush);
 free_g_iommus:
+	for_each_possible_cpu(cpu)
+		kfree(per_cpu_ptr(&deferred_flush, cpu)->tables);
 	kfree(g_iommus);
 error:
 	return ret;
 }
 
 /* This takes a number of _MM_ pages, not VTD pages */
-static struct iova *intel_alloc_iova(struct device *dev,
+static unsigned long intel_alloc_iova(struct device *dev,
 				     struct dmar_domain *domain,
 				     unsigned long nrpages, uint64_t dma_mask)
 {
-	struct iova *iova = NULL;
+	unsigned long iova_pfn = 0;
 
 	/* Restrict dma_mask to the width that the iommu can handle */
 	dma_mask = min_t(uint64_t, DOMAIN_MAX_ADDR(domain->gaw), dma_mask);
@@ -3319,19 +3336,19 @@ static struct iova *intel_alloc_iova(struct device *dev,
 		 * DMA_BIT_MASK(32) and if that fails then try allocating
 		 * from higher range
 		 */
-		iova = alloc_iova(&domain->iovad, nrpages,
-				  IOVA_PFN(DMA_BIT_MASK(32)), 1);
-		if (iova)
-			return iova;
+		iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
+					   IOVA_PFN(DMA_BIT_MASK(32)));
+		if (iova_pfn)
+			return iova_pfn;
 	}
-	iova = alloc_iova(&domain->iovad, nrpages, IOVA_PFN(dma_mask), 1);
-	if (unlikely(!iova)) {
+	iova_pfn = alloc_iova_fast(&domain->iovad, nrpages, IOVA_PFN(dma_mask));
+	if (unlikely(!iova_pfn)) {
 		pr_err("Allocating %ld-page iova for %s failed",
 		       nrpages, dev_name(dev));
-		return NULL;
+		return 0;
 	}
 
-	return iova;
+	return iova_pfn;
 }
 
 static struct dmar_domain *__get_valid_domain_for_dev(struct device *dev)
@@ -3442,7 +3459,7 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
 {
 	struct dmar_domain *domain;
 	phys_addr_t start_paddr;
-	struct iova *iova;
+	unsigned long iova_pfn;
 	int prot = 0;
 	int ret;
 	struct intel_iommu *iommu;
@@ -3460,8 +3477,8 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
 	iommu = domain_get_iommu(domain);
 	size = aligned_nrpages(paddr, size);
 
-	iova = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size), dma_mask);
-	if (!iova)
+	iova_pfn = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size), dma_mask);
+	if (!iova_pfn)
 		goto error;
 
 	/*
@@ -3479,7 +3496,7 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
 	 * might have two guest_addr mapping to the same host paddr, but this
 	 * is not a big problem
 	 */
-	ret = domain_pfn_mapping(domain, mm_to_dma_pfn(iova->pfn_lo),
+	ret = domain_pfn_mapping(domain, mm_to_dma_pfn(iova_pfn),
 				 mm_to_dma_pfn(paddr_pfn), size, prot);
 	if (ret)
 		goto error;
@@ -3487,18 +3504,18 @@ static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
 	/* it's a non-present to present mapping. Only flush if caching mode */
 	if (cap_caching_mode(iommu->cap))
 		iommu_flush_iotlb_psi(iommu, domain,
-				      mm_to_dma_pfn(iova->pfn_lo),
+				      mm_to_dma_pfn(iova_pfn),
 				      size, 0, 1);
 	else
 		iommu_flush_write_buffer(iommu);
 
-	start_paddr = (phys_addr_t)iova->pfn_lo << PAGE_SHIFT;
+	start_paddr = (phys_addr_t)iova_pfn << PAGE_SHIFT;
 	start_paddr += paddr & ~PAGE_MASK;
 	return start_paddr;
 
 error:
-	if (iova)
-		__free_iova(&domain->iovad, iova);
+	if (iova_pfn)
+		free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(size));
 	pr_err("Device %s request: %zx@%llx dir %d --- failed\n",
 		dev_name(dev), size, (unsigned long long)paddr, dir);
 	return 0;
@@ -3513,98 +3530,120 @@ static dma_addr_t intel_map_page(struct device *dev, struct page *page,
 				  dir, *dev->dma_mask);
 }
 
-static void flush_unmaps(void)
+static void flush_unmaps(struct deferred_flush_data *flush_data)
 {
 	int i, j;
 
-	timer_on = 0;
+	flush_data->timer_on = 0;
 
 	/* just flush them all */
 	for (i = 0; i < g_num_of_iommus; i++) {
 		struct intel_iommu *iommu = g_iommus[i];
+		struct deferred_flush_table *flush_table =
+				&flush_data->tables[i];
 		if (!iommu)
 			continue;
 
-		if (!deferred_flush[i].next)
+		if (!flush_table->next)
 			continue;
 
 		/* In caching mode, global flushes turn emulation expensive */
 		if (!cap_caching_mode(iommu->cap))
 			iommu->flush.flush_iotlb(iommu, 0, 0, 0,
 					 DMA_TLB_GLOBAL_FLUSH);
-		for (j = 0; j < deferred_flush[i].next; j++) {
+		for (j = 0; j < flush_table->next; j++) {
 			unsigned long mask;
 			struct deferred_flush_entry *entry =
-						&deferred_flush->entries[j];
-			struct iova *iova = entry->iova;
+						&flush_table->entries[j];
+			unsigned long iova_pfn = entry->iova_pfn;
+			unsigned long nrpages = entry->nrpages;
 			struct dmar_domain *domain = entry->domain;
 			struct page *freelist = entry->freelist;
 
 			/* On real hardware multiple invalidations are expensive */
 			if (cap_caching_mode(iommu->cap))
 				iommu_flush_iotlb_psi(iommu, domain,
-					mm_to_dma_pfn(iova->pfn_lo),
-					mm_to_dma_pfn(iova_size(iova)),
-					!freelist, 0);
+					mm_to_dma_pfn(iova_pfn),
+					nrpages, !freelist, 0);
 			else {
-				mask = ilog2(mm_to_dma_pfn(iova_size(iova)));
+				mask = ilog2(nrpages);
 				iommu_flush_dev_iotlb(domain,
-						(uint64_t)iova->pfn_lo << PAGE_SHIFT, mask);
+						(uint64_t)iova_pfn << PAGE_SHIFT, mask);
 			}
-			__free_iova(&domain->iovad, iova);
+			free_iova_fast(&domain->iovad, iova_pfn, nrpages);
 			if (freelist)
 				dma_free_pagelist(freelist);
 		}
-		deferred_flush[i].next = 0;
+		flush_table->next = 0;
 	}
 
-	list_size = 0;
+	flush_data->size = 0;
 }
 
-static void flush_unmaps_timeout(unsigned long data)
+static void flush_unmaps_timeout(unsigned long cpuid)
 {
+	struct deferred_flush_data *flush_data = per_cpu_ptr(&deferred_flush, cpuid);
 	unsigned long flags;
 
-	spin_lock_irqsave(&async_umap_flush_lock, flags);
-	flush_unmaps();
-	spin_unlock_irqrestore(&async_umap_flush_lock, flags);
+	spin_lock_irqsave(&flush_data->lock, flags);
+	flush_unmaps(flush_data);
+	spin_unlock_irqrestore(&flush_data->lock, flags);
 }
 
-static void add_unmap(struct dmar_domain *dom, struct iova *iova, struct page *freelist)
+static void add_unmap(struct dmar_domain *dom, unsigned long iova_pfn,
+		      unsigned long nrpages, struct page *freelist)
 {
 	unsigned long flags;
 	int entry_id, iommu_id;
 	struct intel_iommu *iommu;
 	struct deferred_flush_entry *entry;
+	struct deferred_flush_data *flush_data;
+	unsigned int cpuid;
 
-	spin_lock_irqsave(&async_umap_flush_lock, flags);
-	if (list_size == HIGH_WATER_MARK)
-		flush_unmaps();
+	cpuid = get_cpu();
+	flush_data = per_cpu_ptr(&deferred_flush, cpuid);
+
+	/* Flush all CPUs' entries to avoid deferring too much.  If
+	 * this becomes a bottleneck, can just flush us, and rely on
+	 * flush timer for the rest.
+	 */
+	if (flush_data->size == HIGH_WATER_MARK) {
+		int cpu;
+
+		for_each_online_cpu(cpu)
+			flush_unmaps_timeout(cpu);
+	}
+
+	spin_lock_irqsave(&flush_data->lock, flags);
 
 	iommu = domain_get_iommu(dom);
 	iommu_id = iommu->seq_id;
 
-	entry_id = deferred_flush[iommu_id].next;
-	++(deferred_flush[iommu_id].next);
+	entry_id = flush_data->tables[iommu_id].next;
+	++(flush_data->tables[iommu_id].next);
 
-	entry = &deferred_flush[iommu_id].entries[entry_id];
+	entry = &flush_data->tables[iommu_id].entries[entry_id];
 	entry->domain = dom;
-	entry->iova = iova;
+	entry->iova_pfn = iova_pfn;
+	entry->nrpages = nrpages;
 	entry->freelist = freelist;
 
-	if (!timer_on) {
-		mod_timer(&unmap_timer, jiffies + msecs_to_jiffies(10));
-		timer_on = 1;
+	if (!flush_data->timer_on) {
+		mod_timer(&flush_data->timer, jiffies + msecs_to_jiffies(10));
+		flush_data->timer_on = 1;
 	}
-	list_size++;
-	spin_unlock_irqrestore(&async_umap_flush_lock, flags);
+	flush_data->size++;
+	spin_unlock_irqrestore(&flush_data->lock, flags);
+
+	put_cpu();
 }
 
-static void intel_unmap(struct device *dev, dma_addr_t dev_addr)
+static void intel_unmap(struct device *dev, dma_addr_t dev_addr, size_t size)
 {
 	struct dmar_domain *domain;
 	unsigned long start_pfn, last_pfn;
-	struct iova *iova;
+	unsigned long nrpages;
+	unsigned long iova_pfn;
 	struct intel_iommu *iommu;
 	struct page *freelist;
 
@@ -3616,13 +3655,11 @@ static void intel_unmap(struct device *dev, dma_addr_t dev_addr)
 
 	iommu = domain_get_iommu(domain);
 
-	iova = find_iova(&domain->iovad, IOVA_PFN(dev_addr));
-	if (WARN_ONCE(!iova, "Driver unmaps unmatched page at PFN %llx\n",
-		      (unsigned long long)dev_addr))
-		return;
+	iova_pfn = IOVA_PFN(dev_addr);
 
-	start_pfn = mm_to_dma_pfn(iova->pfn_lo);
-	last_pfn = mm_to_dma_pfn(iova->pfn_hi + 1) - 1;
+	nrpages = aligned_nrpages(dev_addr, size);
+	start_pfn = mm_to_dma_pfn(iova_pfn);
+	last_pfn = start_pfn + nrpages - 1;
 
 	pr_debug("Device %s unmapping: pfn %lx-%lx\n",
 		 dev_name(dev), start_pfn, last_pfn);
@@ -3631,12 +3668,12 @@ static void intel_unmap(struct device *dev, dma_addr_t dev_addr)
 
 	if (intel_iommu_strict) {
 		iommu_flush_iotlb_psi(iommu, domain, start_pfn,
-				      last_pfn - start_pfn + 1, !freelist, 0);
+				      nrpages, !freelist, 0);
 		/* free iova */
-		__free_iova(&domain->iovad, iova);
+		free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(nrpages));
 		dma_free_pagelist(freelist);
 	} else {
-		add_unmap(domain, iova, freelist);
+		add_unmap(domain, iova_pfn, nrpages, freelist);
 		/*
 		 * queue up the release of the unmap to save the 1/6th of the
 		 * cpu used up by the iotlb flush operation...
@@ -3648,14 +3685,14 @@ static void intel_unmap_page(struct device *dev, dma_addr_t dev_addr,
 			     size_t size, enum dma_data_direction dir,
 			     struct dma_attrs *attrs)
 {
-	intel_unmap(dev, dev_addr);
+	intel_unmap(dev, dev_addr, size);
 }
 
 static void *intel_alloc_coherent(struct device *dev, size_t size,
 				  dma_addr_t *dma_handle, gfp_t flags,
 				  struct dma_attrs *attrs)
 {
-	void *vaddr;
+	struct page *page = NULL;
 	int order;
 
 	size = PAGE_ALIGN(size);
@@ -3670,17 +3707,31 @@ static void *intel_alloc_coherent(struct device *dev, size_t size,
 			flags |= GFP_DMA32;
 	}
 
-	vaddr = (void *)__get_free_pages(flags, order);
-	if (!vaddr)
-		return NULL;
-	memset(vaddr, 0, size);
+	if (flags & __GFP_WAIT) {
+		unsigned int count = size >> PAGE_SHIFT;
 
-	*dma_handle = __intel_map_single(dev, virt_to_bus(vaddr), size,
+		page = dma_alloc_from_contiguous(dev, count, order);
+		if (page && iommu_no_mapping(dev) &&
+		    page_to_phys(page) + size > dev->coherent_dma_mask) {
+			dma_release_from_contiguous(dev, page, count);
+			page = NULL;
+		}
+	}
+
+	if (!page)
+		page = alloc_pages(flags, order);
+	if (!page)
+		return NULL;
+	memset(page_address(page), 0, size);
+
+	*dma_handle = __intel_map_single(dev, page_to_phys(page), size,
 					 DMA_BIDIRECTIONAL,
 					 dev->coherent_dma_mask);
 	if (*dma_handle)
-		return vaddr;
-	free_pages((unsigned long)vaddr, order);
+		return page_address(page);
+	if (!dma_release_from_contiguous(dev, page, size >> PAGE_SHIFT))
+		__free_pages(page, order);
+
 	return NULL;
 }
 
@@ -3688,19 +3739,30 @@ static void intel_free_coherent(struct device *dev, size_t size, void *vaddr,
 				dma_addr_t dma_handle, struct dma_attrs *attrs)
 {
 	int order;
+	struct page *page = virt_to_page(vaddr);
 
 	size = PAGE_ALIGN(size);
 	order = get_order(size);
 
-	intel_unmap(dev, dma_handle);
-	free_pages((unsigned long)vaddr, order);
+	intel_unmap(dev, dma_handle, size);
+	if (!dma_release_from_contiguous(dev, page, size >> PAGE_SHIFT))
+		__free_pages(page, order);
 }
 
 static void intel_unmap_sg(struct device *dev, struct scatterlist *sglist,
 			   int nelems, enum dma_data_direction dir,
 			   struct dma_attrs *attrs)
 {
-	intel_unmap(dev, sglist[0].dma_address);
+	dma_addr_t startaddr = sg_dma_address(sglist) & PAGE_MASK;
+	unsigned long nrpages = 0;
+	struct scatterlist *sg;
+	int i;
+
+	for_each_sg(sglist, sg, nelems, i) {
+		nrpages += aligned_nrpages(sg_dma_address(sg), sg_dma_len(sg));
+	}
+
+	intel_unmap(dev, startaddr, nrpages << VTD_PAGE_SHIFT);
 }
 
 static int intel_nontranslate_map_sg(struct device *hddev,
@@ -3724,7 +3786,7 @@ static int intel_map_sg(struct device *dev, struct scatterlist *sglist, int nele
 	struct dmar_domain *domain;
 	size_t size = 0;
 	int prot = 0;
-	struct iova *iova = NULL;
+	unsigned long iova_pfn;
 	int ret;
 	struct scatterlist *sg;
 	unsigned long start_vpfn;
@@ -3743,9 +3805,9 @@ static int intel_map_sg(struct device *dev, struct scatterlist *sglist, int nele
 	for_each_sg(sglist, sg, nelems, i)
 		size += aligned_nrpages(sg->offset, sg->length);
 
-	iova = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size),
+	iova_pfn = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size),
 				*dev->dma_mask);
-	if (!iova) {
+	if (!iova_pfn) {
 		sglist->dma_length = 0;
 		return 0;
 	}
@@ -3760,13 +3822,13 @@ static int intel_map_sg(struct device *dev, struct scatterlist *sglist, int nele
 	if (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL)
 		prot |= DMA_PTE_WRITE;
 
-	start_vpfn = mm_to_dma_pfn(iova->pfn_lo);
+	start_vpfn = mm_to_dma_pfn(iova_pfn);
 
 	ret = domain_sg_mapping(domain, start_vpfn, sglist, size, prot);
 	if (unlikely(ret)) {
 		dma_pte_free_pagetable(domain, start_vpfn,
 				       start_vpfn + size - 1);
-		__free_iova(&domain->iovad, iova);
+		free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(size));
 		return 0;
 	}
 
@@ -4501,6 +4563,47 @@ static void intel_disable_iommus(void)
 		iommu_disable_translation(iommu);
 }
 
+static void free_all_cpu_cached_iovas(unsigned int cpu)
+{
+	int i;
+
+	for (i = 0; i < g_num_of_iommus; i++) {
+		struct intel_iommu *iommu = g_iommus[i];
+		struct dmar_domain *domain;
+		int did;
+
+		if (!iommu)
+			continue;
+
+		for (did = 0; did < cap_ndoms(iommu->cap); did++) {
+			domain = get_iommu_domain(iommu, (u16)did);
+
+			if (!domain)
+				continue;
+			free_cpu_cached_iovas(cpu, &domain->iovad);
+		}
+	}
+}
+
+static int intel_iommu_cpu_notifier(struct notifier_block *nfb,
+				    unsigned long action, void *v)
+{
+	unsigned int cpu = (unsigned long)v;
+
+	switch (action) {
+	case CPU_DEAD:
+	case CPU_DEAD_FROZEN:
+		free_all_cpu_cached_iovas(cpu);
+		flush_unmaps_timeout(cpu);
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block intel_iommu_cpu_nb = {
+	.notifier_call = intel_iommu_cpu_notifier,
+};
+
 static ssize_t intel_iommu_show_version(struct device *dev,
 					struct device_attribute *attr,
 					char *buf)
@@ -4640,7 +4743,6 @@ int __init intel_iommu_init(void)
 	up_write(&dmar_global_lock);
 	pr_info("Intel(R) Virtualization Technology for Directed I/O\n");
 
-	init_timer(&unmap_timer);
 #ifdef CONFIG_SWIOTLB
 	swiotlb = 0;
 #endif
@@ -4657,6 +4759,7 @@ int __init intel_iommu_init(void)
 	bus_register_notifier(&pci_bus_type, &device_nb);
 	if (si_domain && !hw_pass_through)
 		register_memory_notifier(&intel_iommu_memory_nb);
+	register_hotcpu_notifier(&intel_iommu_cpu_nb);
 
 	intel_iommu_enabled = 1;
 

@@ -19,6 +19,13 @@ extern const struct cpumask *uv_flush_tlb_others(const struct cpumask *cpumask,
 						 unsigned long start,
 						 unsigned long end,
 						 unsigned int cpu);
+#ifndef __GENKSYMS__
+#include <linux/efi.h>
+#endif
+static inline int is_early_uv_system(void)
+{
+	return !((efi.uv_systab == EFI_INVALID_TABLE_ADDR) || !efi.uv_systab);
+}
 
 #else	/* X86_UV */
 
@@ -31,6 +38,7 @@ static inline const struct cpumask *
 uv_flush_tlb_others(const struct cpumask *cpumask, struct mm_struct *mm,
 		    unsigned long start, unsigned long end, unsigned int cpu)
 { return cpumask; }
+static inline int is_early_uv_system(void)	{ return 0; }
 
 #endif	/* X86_UV */
 

@@ -505,7 +505,9 @@ out:
 
 void zpci_dma_exit_device(struct zpci_dev *zdev)
 {
-	zpci_unregister_ioat(zdev, 0);
+	if (zpci_unregister_ioat(zdev, 0))
+		return;
+
 	dma_cleanup_tables(zdev);
 	vfree(zdev->iommu_bitmap);
 	zdev->iommu_bitmap = NULL;

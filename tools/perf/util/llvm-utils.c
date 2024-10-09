@@ -12,6 +12,7 @@
 #include "config.h"
 #include <stdlib.h>
 #include "util.h"
+#include <sys/wait.h>
 
 #define CLANG_BPF_CMD_DEFAULT_TEMPLATE				\
 		"$CLANG_EXEC -D__KERNEL__ $CLANG_OPTIONS "	\

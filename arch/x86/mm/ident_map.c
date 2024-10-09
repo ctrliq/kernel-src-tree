@@ -39,7 +39,7 @@ static int ident_pud_init(struct x86_mapping_info *info, pud_t *pud_page,
 		if (!pmd)
 			return -ENOMEM;
 		ident_pmd_init(info, pmd, addr, next);
-		set_pud(pud, __pud(__pa(pmd) | _KERNPG_TABLE));
+		set_pud(pud, __pud(__pa(pmd) | info->kernpg_flag));
 	}
 
 	return 0;
@@ -52,6 +52,10 @@ int kernel_ident_mapping_init(struct x86_mapping_info *info, pgd_t *pgd_page,
 	unsigned long end = pend + info->offset;
 	unsigned long next;
 	int result;
+
+	/* Set the default pagetable flags if not supplied */
+	if (!info->kernpg_flag)
+		info->kernpg_flag = _KERNPG_TABLE;
 
 	for (; addr < end; addr = next) {
 		pgd_t *pgd = pgd_page + pgd_index(addr);
@@ -75,7 +79,7 @@ int kernel_ident_mapping_init(struct x86_mapping_info *info, pgd_t *pgd_page,
 		result = ident_pud_init(info, pud, addr, next);
 		if (result)
 			return result;
-		set_pgd(pgd, __pgd(__pa(pud) | _KERNPG_TABLE));
+		set_pgd(pgd, __pgd(__pa(pud) | info->kernpg_flag));
 	}
 
 	return 0;

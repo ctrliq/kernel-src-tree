@@ -383,8 +383,8 @@ static inline void put_be32(__be32 val, __be32 __iomem * p)
 	__raw_writel((__force __u32) val, (__force void __iomem *)p);
 }
 
-static struct rtnl_link_stats64 *myri10ge_get_stats(struct net_device *dev,
-						    struct rtnl_link_stats64 *stats);
+static void myri10ge_get_stats(struct net_device *dev,
+			       struct rtnl_link_stats64 *stats);
 
 static void set_fw_name(struct myri10ge_priv *mgp, char *name, bool allocated)
 {
@@ -3131,8 +3131,8 @@ drop:
 	return NETDEV_TX_OK;
 }
 
-static struct rtnl_link_stats64 *myri10ge_get_stats(struct net_device *dev,
-						    struct rtnl_link_stats64 *stats)
+static void myri10ge_get_stats(struct net_device *dev,
+			       struct rtnl_link_stats64 *stats)
 {
 	const struct myri10ge_priv *mgp = netdev_priv(dev);
 	const struct myri10ge_slice_netstats *slice_stats;
@@ -3147,7 +3147,6 @@ static struct rtnl_link_stats64 *myri10ge_get_stats(struct net_device *dev,
 		stats->rx_dropped += slice_stats->rx_dropped;
 		stats->tx_dropped += slice_stats->tx_dropped;
 	}
-	return stats;
 }
 
 static void myri10ge_set_multicast_list(struct net_device *dev)
@@ -3966,7 +3965,7 @@ static const struct net_device_ops myri10ge_netdev_ops = {
 	.ndo_start_xmit		= myri10ge_xmit,
 	.ndo_get_stats64	= myri10ge_get_stats,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_change_mtu		= myri10ge_change_mtu,
+	.ndo_change_mtu_rh74	= myri10ge_change_mtu,
 	.ndo_set_rx_mode	= myri10ge_set_multicast_list,
 	.ndo_set_mac_address	= myri10ge_set_mac_address,
 #ifdef CONFIG_NET_RX_BUSY_POLL

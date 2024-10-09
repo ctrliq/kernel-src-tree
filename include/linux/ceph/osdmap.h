@@ -90,13 +90,6 @@ static inline void ceph_oloc_copy(struct ceph_object_locator *dest,
 }
 
 /*
- * Maximum supported by kernel client object name length
- *
- * (probably outdated: must be >= RBD_MAX_MD_NAME_LEN -- currently 100)
- */
-#define CEPH_MAX_OID_NAME_LEN 100
-
-/*
  * 51-char inline_name is long enough for all cephfs and all but one
  * rbd requests: <imgname> in "<imgname>.rbd"/"rbd_id.<imgname>" can be
  * arbitrarily long (~PAGE_SIZE).  It's done once during rbd map; all
@@ -150,10 +143,14 @@ struct ceph_pg_mapping {
 		struct {
 			int len;
 			int osds[];
-		} pg_temp;
+		} pg_temp, pg_upmap;
 		struct {
 			int osd;
 		} primary_temp;
+		struct {
+			int len;
+			int from_to[][2];
+		} pg_upmap_items;
 	};
 };
 
@@ -172,6 +169,10 @@ struct ceph_osdmap {
 	struct rb_root pg_temp;
 	struct rb_root primary_temp;
 
+	/* remap (post-CRUSH, pre-up) */
+	struct rb_root pg_upmap;	/* PG := raw set */
+	struct rb_root pg_upmap_items;	/* from -> to within raw set */
+
 	u32 *osd_primary_affinity;
 
 	struct rb_root pg_pools;
@@ -185,19 +186,19 @@ struct ceph_osdmap {
 	void *crush_workspace;
 };
 
-static inline int ceph_osd_exists(struct ceph_osdmap *map, int osd)
+static inline bool ceph_osd_exists(struct ceph_osdmap *map, int osd)
 {
 	return osd >= 0 && osd < map->max_osd &&
 	       (map->osd_state[osd] & CEPH_OSD_EXISTS);
 }
 
-static inline int ceph_osd_is_up(struct ceph_osdmap *map, int osd)
+static inline bool ceph_osd_is_up(struct ceph_osdmap *map, int osd)
 {
 	return ceph_osd_exists(map, osd) &&
 	       (map->osd_state[osd] & CEPH_OSD_UP);
 }
 
-static inline int ceph_osd_is_down(struct ceph_osdmap *map, int osd)
+static inline bool ceph_osd_is_down(struct ceph_osdmap *map, int osd)
 {
 	return !ceph_osd_is_up(map, osd);
 }
@@ -213,11 +214,13 @@ static inline struct ceph_entity_addr *ceph_osd_addr(struct ceph_osdmap *map,
 	return &map->osd_addr[osd];
 }
 
+#define CEPH_PGID_ENCODING_LEN		(1 + 8 + 4 + 4)
+
 static inline int ceph_decode_pgid(void **p, void *end, struct ceph_pg *pgid)
 {
 	__u8 version;
 
-	if (!ceph_has_room(p, end, 1 + 8 + 4 + 4)) {
+	if (!ceph_has_room(p, end, CEPH_PGID_ENCODING_LEN)) {
 		pr_warn("incomplete pg encoding\n");
 		return -EINVAL;
 	}

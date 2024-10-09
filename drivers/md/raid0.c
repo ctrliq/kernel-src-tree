@@ -25,10 +25,12 @@
 #include "raid0.h"
 #include "raid5.h"
 
-static bool devices_discard_performance = false;
-module_param(devices_discard_performance, bool, 0644);
-MODULE_PARM_DESC(devices_discard_performance,
-		 "Set to Y if all devices in each array handles discard requests at proper speed");
+#define UNSUPPORTED_MDDEV_FLAGS		\
+	((1L << MD_HAS_JOURNAL) |	\
+	 (1L << MD_JOURNAL_CLEAN) |	\
+	 (1L << MD_FAILFAST_SUPPORTED) |\
+	 (1L << MD_HAS_PPL) |           \
+	 (1L << MD_HAS_MULTIPLE_PPLS))
 
 static int raid0_congested(struct mddev *mddev, int bits)
 {
@@ -76,7 +78,6 @@ static void dump_zones(struct mddev *mddev)
 			(unsigned long long)zone_size>>1);
 		zone_start = conf->strip_zone[j].zone_end;
 	}
-	printk(KERN_INFO "\n");
 }
 
 static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
@@ -438,7 +439,7 @@ static int raid0_run(struct mddev *mddev)
 
 		blk_queue_max_hw_sectors(mddev->queue, mddev->chunk_sectors);
 		blk_queue_max_write_same_sectors(mddev->queue, mddev->chunk_sectors);
-		blk_queue_max_discard_sectors(mddev->queue, mddev->chunk_sectors);
+		blk_queue_max_discard_sectors(mddev->queue, UINT_MAX);
 
 		blk_queue_io_min(mddev->queue, mddev->chunk_sectors << 9);
 		blk_queue_io_opt(mddev->queue,
@@ -451,21 +452,6 @@ static int raid0_run(struct mddev *mddev)
 				discard_supported = true;
 		}
 
-		/* Unfortunately, some devices have awful discard performance,
-		 * especially for small sized requests. This is particularly
-		 * bad for RAID0 with a small chunk size resulting in a small
-		 * DISCARD requests hitting the underlaying drives.
-		 * Only allow DISCARD if the sysadmin confirms that all devices
-		 * in use can handle small DISCARD requests at reasonable speed,
-		 * by setting a module parameter.
-		 */
-		if (!devices_discard_performance) {
-			if (discard_supported) {
-				pr_info("md/raid0: discard support disabled due to performance uncertainty.\n");
-				pr_info("Set raid0.devices_discard_performance=Y to override.\n");
-			}
-			discard_supported = false;
-		}
 		if (!discard_supported)
 			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
 		else
@@ -527,6 +513,178 @@ static inline int is_io_in_chunk_boundary(struct mddev *mddev,
 	}
 }
 
+static struct bio *next_bio(struct bio *bio, int rw, unsigned int nr_pages,
+			   gfp_t gfp)
+{
+	struct bio *new = bio_alloc(gfp, nr_pages);
+
+	if (bio) {
+		bio_chain(bio, new);
+		submit_bio(rw, bio);
+	}
+
+	return new;
+}
+
+static int __blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+				 sector_t nr_sects, gfp_t gfp_mask, int type,
+				 struct bio **biop)
+{
+	struct request_queue *q = bdev_get_queue(bdev);
+	struct bio *bio = *biop;
+	unsigned int max_discard_sectors, granularity;
+	int alignment;
+
+	if (!q)
+		return -ENXIO;
+	if (!blk_queue_discard(q))
+		return -EOPNOTSUPP;
+	if ((type & REQ_SECURE) && !blk_queue_secdiscard(q))
+		return -EOPNOTSUPP;
+
+	/* Zero-sector (unknown) and one-sector granularities are the same.  */
+	granularity = max(q->limits.discard_granularity >> 9, 1U);
+	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+
+	/*
+	 * Ensure that max_discard_sectors is of the proper
+	 * granularity, so that requests stay aligned after a split.
+	 */
+	max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
+	max_discard_sectors -= max_discard_sectors % granularity;
+	if (unlikely(!max_discard_sectors)) {
+		/* Avoid infinite loop below. Being cautious never hurts. */
+		return -EOPNOTSUPP;
+	}
+
+	while (nr_sects) {
+		unsigned int req_sects;
+		sector_t end_sect, tmp;
+
+		req_sects = min_t(sector_t, nr_sects, max_discard_sectors);
+
+		/**
+		 * If splitting a request, and the next starting sector would be
+		 * misaligned, stop the discard at the previous aligned sector.
+		 */
+		end_sect = sector + req_sects;
+		tmp = end_sect;
+		if (req_sects < nr_sects &&
+		    sector_div(tmp, granularity) != alignment) {
+			end_sect = end_sect - alignment;
+			sector_div(end_sect, granularity);
+			end_sect = end_sect * granularity + alignment;
+			req_sects = end_sect - sector;
+		}
+
+		bio = next_bio(bio, type, 1, gfp_mask);
+		bio->bi_sector = sector;
+		bio->bi_bdev = bdev;
+
+		bio->bi_size = req_sects << 9;
+		nr_sects -= req_sects;
+		sector = end_sect;
+
+		/*
+		 * We can loop for a long time in here, if someone does
+		 * full device discards (like mkfs). Be nice and allow
+		 * us to schedule out to avoid softlocking if preempt
+		 * is disabled.
+		 */
+		cond_resched();
+	}
+
+	*biop = bio;
+	return 0;
+}
+
+static void raid0_handle_discard(struct mddev *mddev, struct bio *bio)
+{
+	struct r0conf *conf = mddev->private;
+	struct strip_zone *zone;
+	sector_t start = bio->bi_sector;
+	sector_t end;
+	unsigned int stripe_size;
+	sector_t first_stripe_index, last_stripe_index;
+	sector_t start_disk_offset;
+	unsigned int start_disk_index;
+	sector_t end_disk_offset;
+	unsigned int end_disk_index;
+	unsigned int disk;
+
+	zone = find_zone(conf, &start);
+
+	if (bio_end_sector(bio) > zone->zone_end) {
+		struct bio_pair *bp = bio_split(bio, zone->zone_end -
+						     bio->bi_sector);
+		raid0_handle_discard(mddev, &bp->bio1);
+		raid0_handle_discard(mddev, &bp->bio2);
+		bio_pair_release(bp);
+		return;
+	} else
+		end = bio_end_sector(bio);
+
+	if (zone != conf->strip_zone)
+		end = end - zone[-1].zone_end;
+
+	/* Now start and end is the offset in zone */
+	stripe_size = zone->nb_dev * mddev->chunk_sectors;
+
+	first_stripe_index = start;
+	sector_div(first_stripe_index, stripe_size);
+	last_stripe_index = end;
+	sector_div(last_stripe_index, stripe_size);
+
+	start_disk_index = (int)(start - first_stripe_index * stripe_size) /
+		mddev->chunk_sectors;
+	start_disk_offset = ((int)(start - first_stripe_index * stripe_size) %
+		mddev->chunk_sectors) +
+		first_stripe_index * mddev->chunk_sectors;
+	end_disk_index = (int)(end - last_stripe_index * stripe_size) /
+		mddev->chunk_sectors;
+	end_disk_offset = ((int)(end - last_stripe_index * stripe_size) %
+		mddev->chunk_sectors) +
+		last_stripe_index * mddev->chunk_sectors;
+
+	for (disk = 0; disk < zone->nb_dev; disk++) {
+		sector_t dev_start, dev_end;
+		struct bio *discard_bio = NULL;
+		struct md_rdev *rdev;
+
+		if (disk < start_disk_index)
+			dev_start = (first_stripe_index + 1) *
+				mddev->chunk_sectors;
+		else if (disk > start_disk_index)
+			dev_start = first_stripe_index * mddev->chunk_sectors;
+		else
+			dev_start = start_disk_offset;
+
+		if (disk < end_disk_index)
+			dev_end = (last_stripe_index + 1) * mddev->chunk_sectors;
+		else if (disk > end_disk_index)
+			dev_end = last_stripe_index * mddev->chunk_sectors;
+		else
+			dev_end = end_disk_offset;
+
+		if (dev_end <= dev_start)
+			continue;
+
+		rdev = conf->devlist[(zone - conf->strip_zone) *
+			conf->strip_zone[0].nb_dev + disk];
+
+		if (__blkdev_issue_discard(rdev->bdev,
+			dev_start + zone->dev_start + rdev->data_offset,
+			dev_end - dev_start, GFP_NOIO, REQ_WRITE | REQ_DISCARD,
+			&discard_bio) ||
+		    !discard_bio)
+			continue;
+		bio_chain(discard_bio, bio);
+		submit_bio(REQ_WRITE | REQ_DISCARD, discard_bio);
+	}
+	bio_endio(bio, 0);
+}
+
+
 static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 {
 	unsigned int chunk_sects;
@@ -536,6 +694,11 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 
 	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
 		md_flush_request(mddev, bio);
+		return true;
+	}
+
+	if (unlikely((bio_op(bio) == REQ_OP_DISCARD))) {
+		raid0_handle_discard(mddev, bio);
 		return true;
 	}
 
@@ -568,13 +731,6 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 	bio->bi_bdev = tmp_dev->bdev;
 	bio->bi_sector = sector_offset + zone->dev_start +
 		tmp_dev->data_offset;
-
-	if (unlikely((bio->bi_rw & REQ_DISCARD) &&
-		     !blk_queue_discard(bdev_get_queue(bio->bi_bdev)))) {
-		/* Just ignore it */
-		bio_endio(bio, 0);
-		return true;
-	}
 
 	generic_make_request(bio);
 	return true;
@@ -625,8 +781,7 @@ static void *raid0_takeover_raid45(struct mddev *mddev)
 	mddev->delta_disks = -1;
 	/* make sure it will be not marked as dirty */
 	mddev->recovery_cp = MaxSector;
-	clear_bit(MD_HAS_JOURNAL, &mddev->flags);
-	clear_bit(MD_JOURNAL_CLEAN, &mddev->flags);
+	mddev_clear_unsupported_flags(mddev, UNSUPPORTED_MDDEV_FLAGS);
 
 	create_strip_zones(mddev, &priv_conf);
 
@@ -669,7 +824,7 @@ static void *raid0_takeover_raid10(struct mddev *mddev)
 	mddev->degraded = 0;
 	/* make sure it will be not marked as dirty */
 	mddev->recovery_cp = MaxSector;
-	clear_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+	mddev_clear_unsupported_flags(mddev, UNSUPPORTED_MDDEV_FLAGS);
 
 	create_strip_zones(mddev, &priv_conf);
 	return priv_conf;
@@ -712,7 +867,7 @@ static void *raid0_takeover_raid1(struct mddev *mddev)
 	mddev->raid_disks = 1;
 	/* make sure it will be not marked as dirty */
 	mddev->recovery_cp = MaxSector;
-	clear_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+	mddev_clear_unsupported_flags(mddev, UNSUPPORTED_MDDEV_FLAGS);
 
 	create_strip_zones(mddev, &priv_conf);
 	return priv_conf;

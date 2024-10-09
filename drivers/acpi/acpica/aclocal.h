@@ -435,6 +435,7 @@ struct acpi_gpe_event_info {
 	u8 flags;		/* Misc info about this GPE */
 	u8 gpe_number;		/* This GPE */
 	u8 runtime_count;	/* References to a run GPE */
+	u8 disable_for_dispatch;	/* Masked during dispatching */
 };
 
 /* Information about a GPE register pair, one per each status/enable pair in an array */
@@ -445,6 +446,8 @@ struct acpi_gpe_register_info {
 	u8 enable_for_wake;	/* GPEs to keep enabled when sleeping */
 	u8 enable_for_run;	/* GPEs to keep enabled when running */
 	u8 base_gpe_number;	/* Base GPE number for this register */
+	u8 mask_for_run;	/* GPEs to keep masked when running */
+	u8 enable_mask;		/* Current mask of enabled GPEs */
 };
 
 /*
@@ -454,6 +457,7 @@ struct acpi_gpe_register_info {
 struct acpi_gpe_block_info {
 	struct acpi_namespace_node *node;
 	struct acpi_gpe_block_info *previous;
+	u8 enable_mask;		/* Current mask of enabled GPEs */
 	struct acpi_gpe_block_info *next;
 	struct acpi_gpe_xrupt_info *xrupt_block;	/* Backpointer to interrupt block */
 	struct acpi_gpe_register_info *register_info;	/* One per GPE register pair */
@@ -943,6 +947,9 @@ struct acpi_interface_info {
 
 #define ACPI_OSI_INVALID                0x01
 #define ACPI_OSI_DYNAMIC                0x02
+#define ACPI_OSI_FEATURE                0x04
+#define ACPI_OSI_DEFAULT_INVALID        0x08
+#define ACPI_OSI_OPTIONAL_FEATURE       (ACPI_OSI_FEATURE | ACPI_OSI_DEFAULT_INVALID | ACPI_OSI_INVALID)
 
 struct acpi_port_info {
 	char *name;

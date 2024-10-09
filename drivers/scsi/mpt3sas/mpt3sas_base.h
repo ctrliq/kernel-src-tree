@@ -73,8 +73,8 @@
 #define MPT3SAS_DRIVER_NAME		"mpt3sas"
 #define MPT3SAS_AUTHOR "Avago Technologies <MPT-FusionLinux.pdl@avagotech.com>"
 #define MPT3SAS_DESCRIPTION	"LSI MPT Fusion SAS 3.0 Device Driver"
-#define MPT3SAS_DRIVER_VERSION		"15.100.00.00"
-#define MPT3SAS_MAJOR_VERSION		15
+#define MPT3SAS_DRIVER_VERSION		"16.100.00.00"
+#define MPT3SAS_MAJOR_VERSION		16
 #define MPT3SAS_MINOR_VERSION		100
 #define MPT3SAS_BUILD_VERSION		0
 #define MPT3SAS_RELEASE_VERSION	00
@@ -1427,7 +1427,7 @@ void mpt3sas_ctl_add_to_event_log(struct MPT3SAS_ADAPTER *ioc,
 	Mpi2EventNotificationReply_t *mpi_reply);
 
 void mpt3sas_enable_diag_buffer(struct MPT3SAS_ADAPTER *ioc,
-	u8 bits_to_regsiter);
+	u8 bits_to_register);
 int mpt3sas_send_diag_release(struct MPT3SAS_ADAPTER *ioc, u8 buffer_type,
 	u8 *issue_reset);
 

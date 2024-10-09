@@ -47,7 +47,8 @@ FILES=                                          \
          test-get_cpuid.bin                     \
          test-sdt.bin                           \
          test-cxx.bin                           \
-         test-jvmti.bin
+         test-jvmti.bin				\
+         test-sched_getcpu.bin
 
 FILES := $(addprefix $(OUTPUT),$(FILES))
 
@@ -88,6 +89,9 @@ $(OUTPUT)test-libelf.bin:
 	$(BUILD) -lelf
 
 $(OUTPUT)test-glibc.bin:
+	$(BUILD)
+
+$(OUTPUT)test-sched_getcpu.bin:
 	$(BUILD)
 
 DWARFLIBS := -ldw

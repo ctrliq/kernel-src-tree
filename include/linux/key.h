@@ -121,6 +121,12 @@ static inline bool is_key_possessed(const key_ref_t key_ref)
 	return (unsigned long) key_ref & 1UL;
 }
 
+
+enum key_state {
+	KEY_IS_UNINSTANTIATED,
+	KEY_IS_POSITIVE,		/* Positively instantiated */
+};
+
 /*****************************************************************************/
 /*
  * authentication token / access credential / keyring
@@ -171,6 +177,7 @@ struct key {
 #define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
 #define KEY_FLAG_BUILTIN	10	/* set if key is builtin */
 #define KEY_FLAG_ROOT_CAN_INVAL	11	/* set if key can be invalidated by root without permission */
+#define KEY_FLAG_UID_KEYRING	12	/* set if key is a user or user session keyring */
 
 	/* the key type and key description string
 	 * - the desc is used to match a key against search criteria
@@ -208,6 +215,9 @@ struct key {
 		} payload;
 		struct assoc_array keys;
 	};
+#ifndef __GENKSYMS__
+	short state;		/* Key state (+) or rejection error (-) */
+#endif
 };
 
 extern struct key *key_alloc(struct key_type *type,
@@ -222,6 +232,7 @@ extern struct key *key_alloc(struct key_type *type,
 #define KEY_ALLOC_QUOTA_OVERRUN	0x0001	/* add to quota, permit even if overrun */
 #define KEY_ALLOC_NOT_IN_QUOTA	0x0002	/* not in quota */
 #define KEY_ALLOC_TRUSTED	0x0004	/* Key should be flagged as trusted */
+#define KEY_ALLOC_UID_KEYRING	0x0080	/* allocating a user or user session keyring */
 
 extern void key_revoke(struct key *key);
 extern void key_invalidate(struct key *key);
@@ -310,20 +321,38 @@ static inline key_serial_t key_serial(const struct key *key)
 
 extern void key_set_timeout(struct key *, unsigned);
 
+static inline short key_read_state(const struct key *key)
+{
+	/* Barrier versus mark_key_instantiated(). */
+	return smp_load_acquire(&key->state);
+}
+
 /**
- * key_is_instantiated - Determine if a key has been positively instantiated
+ * key_is_positive - Determine if a key has been positively instantiated
  * @key: The key to check.
  *
  * Return true if the specified key has been positively instantiated, false
  * otherwise.
  */
-static inline bool key_is_instantiated(const struct key *key)
+static inline bool key_is_positive(const struct key *key)
 {
-	return test_bit(KEY_FLAG_INSTANTIATED, &key->flags) &&
-		!test_bit(KEY_FLAG_NEGATIVE, &key->flags);
+	return key_read_state(key) == KEY_IS_POSITIVE;
 }
 
+static inline bool key_is_negative(const struct key *key)
+{
+	return key_read_state(key) < 0;
+}
+
+/* rcu_dereference_key() is deprecated. */
 #define rcu_dereference_key(KEY)					\
+	(rcu_dereference_protected((KEY)->payload.rcudata,		\
+				   rwsem_is_locked(&((struct key *)(KEY))->sem)))
+
+#define dereference_key_rcu(KEY)					\
+	(rcu_dereference((KEY)->payload.rcudata))
+
+#define dereference_key_locked(KEY)					\
 	(rcu_dereference_protected((KEY)->payload.rcudata,		\
 				   rwsem_is_locked(&((struct key *)(KEY))->sem)))
 

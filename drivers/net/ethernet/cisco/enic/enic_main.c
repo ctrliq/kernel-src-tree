@@ -865,8 +865,8 @@ static netdev_tx_t enic_hard_start_xmit(struct sk_buff *skb,
 }
 
 /* dev_base_lock rwlock held, nominally process context */
-static struct rtnl_link_stats64 *enic_get_stats(struct net_device *netdev,
-						struct rtnl_link_stats64 *net_stats)
+static void enic_get_stats(struct net_device *netdev,
+			   struct rtnl_link_stats64 *net_stats)
 {
 	struct enic *enic = netdev_priv(netdev);
 	struct vnic_stats *stats;
@@ -878,7 +878,7 @@ static struct rtnl_link_stats64 *enic_get_stats(struct net_device *netdev,
 	 * recorded stats.
 	 */
 	if (err == -ENOMEM)
-		return net_stats;
+		return;
 
 	net_stats->tx_packets = stats->tx.tx_frames_ok;
 	net_stats->tx_bytes = stats->tx.tx_bytes_ok;
@@ -892,8 +892,6 @@ static struct rtnl_link_stats64 *enic_get_stats(struct net_device *netdev,
 	net_stats->rx_over_errors = enic->rq_truncated_pkts;
 	net_stats->rx_crc_errors = enic->rq_bad_fcs;
 	net_stats->rx_dropped = stats->rx.rx_no_bufs + stats->rx.rx_drop;
-
-	return net_stats;
 }
 
 static int enic_mc_sync(struct net_device *netdev, const u8 *mc_addr)
@@ -2489,7 +2487,7 @@ static const struct net_device_ops enic_netdev_dynamic_ops = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_rx_mode	= enic_set_rx_mode,
 	.ndo_set_mac_address	= enic_set_mac_address_dynamic,
-	.ndo_change_mtu		= enic_change_mtu,
+	.ndo_change_mtu_rh74	= enic_change_mtu,
 	.ndo_vlan_rx_add_vid	= enic_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= enic_vlan_rx_kill_vid,
 	.ndo_tx_timeout		= enic_tx_timeout,
@@ -2516,7 +2514,7 @@ static const struct net_device_ops enic_netdev_ops = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= enic_set_mac_address,
 	.ndo_set_rx_mode	= enic_set_rx_mode,
-	.ndo_change_mtu		= enic_change_mtu,
+	.ndo_change_mtu_rh74	= enic_change_mtu,
 	.ndo_vlan_rx_add_vid	= enic_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= enic_vlan_rx_kill_vid,
 	.ndo_tx_timeout		= enic_tx_timeout,
@@ -2853,9 +2851,8 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	/* Setup notification timer, HW reset task, and wq locks
 	 */
 
-	init_timer(&enic->notify_timer);
-	enic->notify_timer.function = enic_notify_timer;
-	enic->notify_timer.data = (unsigned long)enic;
+	setup_timer(&enic->notify_timer, enic_notify_timer,
+		    (unsigned long)enic);
 
 	enic_set_rx_coal_setting(enic);
 	INIT_WORK(&enic->reset, enic_reset);

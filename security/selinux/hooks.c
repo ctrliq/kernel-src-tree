@@ -17,6 +17,7 @@
  *	Paul Moore <paul@paul-moore.com>
  *  Copyright (C) 2007 Hitachi Software Engineering Co., Ltd.
  *		       Yuichi Nakamura <ynakam@hitachisoft.jp>
+ *  Copyright (C) 2016 Mellanox Technologies
  *
  *	This program is free software; you can redistribute it and/or modify
  *	it under the terms of the GNU General Public License version 2,
@@ -91,6 +92,7 @@
 #include "netif.h"
 #include "netnode.h"
 #include "netport.h"
+#include "ibpkey.h"
 #include "xfrm.h"
 #include "netlabel.h"
 #include "audit.h"
@@ -156,6 +158,16 @@ static int selinux_netcache_avc_callback(u32 event)
 		sel_netport_flush();
 		synchronize_net();
 	}
+	return 0;
+}
+
+static int selinux_lsm_notifier_avc_callback(u32 event)
+{
+	if (event == AVC_CALLBACK_RESET) {
+		sel_ib_pkey_flush();
+		call_lsm_notifier(LSM_POLICY_CHANGE, NULL);
+	}
+
 	return 0;
 }
 
@@ -488,7 +500,7 @@ static int sb_finish_set_opts(struct super_block *sb)
 		}
 	}
 
-	sbsec->flags |= (SE_SBINITIALIZED | SE_SBLABELSUPP);
+	sbsec->flags |= (SE_SBINITIALIZED | SBLABEL_MNT);
 
 	if (sbsec->behavior > ARRAY_SIZE(labeling_behaviors))
 		printk(KERN_ERR "SELinux: initialized (dev %s, type %s), unknown behavior\n",
@@ -498,11 +510,14 @@ static int sb_finish_set_opts(struct super_block *sb)
 	    sbsec->behavior == SECURITY_FS_USE_MNTPOINT ||
 	    sbsec->behavior == SECURITY_FS_USE_NONE ||
 	    sbsec->behavior > ARRAY_SIZE(labeling_behaviors))
-		sbsec->flags &= ~SE_SBLABELSUPP;
+		sbsec->flags &= ~SBLABEL_MNT;
 
-	/* Special handling for sysfs. Is genfs but also has setxattr handler*/
-	if (strncmp(sb->s_type->name, "sysfs", sizeof("sysfs")) == 0)
-		sbsec->flags |= SE_SBLABELSUPP;
+	/* Special handling. Genfs but also in-core setxattr handler */
+	if (!strcmp(sb->s_type->name, "sysfs") ||
+	    (selinux_policycap_cgroupseclabel &&
+	     (!strcmp(sb->s_type->name, "cgroup") ||
+	      !strcmp(sb->s_type->name, "cgroup2"))))
+		sbsec->flags |= SBLABEL_MNT;
 
 	/* Initialize the root inode. */
 	rc = inode_doinit_with_dentry(root_inode, root);
@@ -564,7 +579,7 @@ static int selinux_get_mnt_opts(const struct super_block *sb,
 		tmp >>= 1;
 	}
 	/* Check if the Label support flag is set */
-	if (sbsec->flags & SE_SBLABELSUPP)
+	if (sbsec->flags & SBLABEL_MNT)
 		opts->num_mnt_opts++;
 
 	opts->mnt_opts = kcalloc(opts->num_mnt_opts, sizeof(char *), GFP_ATOMIC);
@@ -611,9 +626,9 @@ static int selinux_get_mnt_opts(const struct super_block *sb,
 		opts->mnt_opts[i] = context;
 		opts->mnt_opts_flags[i++] = ROOTCONTEXT_MNT;
 	}
-	if (sbsec->flags & SE_SBLABELSUPP) {
+	if (sbsec->flags & SBLABEL_MNT) {
 		opts->mnt_opts[i] = NULL;
-		opts->mnt_opts_flags[i++] = SE_SBLABELSUPP;
+		opts->mnt_opts_flags[i++] = SBLABEL_MNT;
 	}
 
 	BUG_ON(i != opts->num_mnt_opts);
@@ -712,7 +727,7 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 	for (i = 0; i < num_opts; i++) {
 		u32 sid;
 
-		if (flags[i] == SE_SBLABELSUPP)
+		if (flags[i] == SBLABEL_MNT)
 			continue;
 		rc = security_context_to_sid(mount_options[i],
 					     strlen(mount_options[i]), &sid);
@@ -776,7 +791,11 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 	}
 
 	if (strcmp(sb->s_type->name, "proc") == 0)
-		sbsec->flags |= SE_SBPROC;
+		sbsec->flags |= SE_SBPROC | SE_SBGENFS;
+
+	if (!strcmp(sb->s_type->name, "cgroup") ||
+	    !strcmp(sb->s_type->name, "cgroup2"))
+		sbsec->flags |= SE_SBGENFS;
 
 	if (!sbsec->behavior) {
 		/*
@@ -1070,10 +1089,8 @@ static int selinux_parse_opts_str(char *options,
 		goto out_err;
 
 	opts->mnt_opts_flags = kcalloc(NUM_SEL_MNT_OPTS, sizeof(int), GFP_ATOMIC);
-	if (!opts->mnt_opts_flags) {
-		kfree(opts->mnt_opts);
+	if (!opts->mnt_opts_flags)
 		goto out_err;
-	}
 
 	if (fscontext) {
 		opts->mnt_opts[num_mnt_opts] = fscontext;
@@ -1096,6 +1113,7 @@ static int selinux_parse_opts_str(char *options,
 	return 0;
 
 out_err:
+	security_free_mnt_opts(opts);
 	kfree(context);
 	kfree(defcontext);
 	kfree(fscontext);
@@ -1157,7 +1175,7 @@ static void selinux_write_opts(struct seq_file *m,
 		case DEFCONTEXT_MNT:
 			prefix = DEFCONTEXT_STR;
 			break;
-		case SE_SBLABELSUPP:
+		case SBLABEL_MNT:
 			seq_putc(m, ',');
 			seq_puts(m, LABELSUPP_STR);
 			continue;
@@ -1296,12 +1314,13 @@ static inline u16 socket_type_to_security_class(int family, int type, int protoc
 	return SECCLASS_SOCKET;
 }
 
-#ifdef CONFIG_PROC_FS
-static int selinux_proc_get_sid(struct dentry *dentry,
-				u16 tclass,
-				u32 *sid)
+static int selinux_genfs_get_sid(struct dentry *dentry,
+				 u16 tclass,
+				 u16 flags,
+				 u32 *sid)
 {
 	int rc;
+	struct super_block *sb = dentry->d_inode->i_sb;
 	char *buffer, *path;
 
 	buffer = (char *)__get_free_page(GFP_KERNEL);
@@ -1312,26 +1331,20 @@ static int selinux_proc_get_sid(struct dentry *dentry,
 	if (IS_ERR(path))
 		rc = PTR_ERR(path);
 	else {
-		/* each process gets a /proc/PID/ entry. Strip off the
-		 * PID part to get a valid selinux labeling.
-		 * e.g. /proc/1/net/rpc/nfs -> /net/rpc/nfs */
-		while (path[1] >= '0' && path[1] <= '9') {
-			path[1] = '/';
-			path++;
+		if (flags & SE_SBPROC) {
+			/* each process gets a /proc/PID/ entry. Strip off the
+			* PID part to get a valid selinux labeling.
+			* e.g. /proc/1/net/rpc/nfs -> /net/rpc/nfs */
+			while (path[1] >= '0' && path[1] <= '9') {
+				path[1] = '/';
+				path++;
+			}
 		}
-		rc = security_genfs_sid("proc", path, tclass, sid);
+		rc = security_genfs_sid(sb->s_type->name, path, tclass, sid);
 	}
 	free_page((unsigned long)buffer);
 	return rc;
 }
-#else
-static int selinux_proc_get_sid(struct dentry *dentry,
-				u16 tclass,
-				u32 *sid)
-{
-	return -EINVAL;
-}
-#endif
 
 /* The inode's security attributes must be initialized before first use. */
 static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)
@@ -1494,7 +1507,7 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 		/* Default to the fs superblock SID. */
 		sid = sbsec->sid;
 
-		if ((sbsec->flags & SE_SBPROC) && !S_ISLNK(inode->i_mode)) {
+		if ((sbsec->flags & SE_SBGENFS) && !S_ISLNK(inode->i_mode)) {
 			/* We must have a dentry to determine the label on
 			 * procfs inodes */
 			if (opt_dentry)
@@ -1516,7 +1529,8 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 			 */
 			if (!dentry)
 				goto out;
-			rc = selinux_proc_get_sid(dentry, sclass, &sid);
+			rc = selinux_genfs_get_sid(dentry, isec->sclass,
+						   sbsec->flags, &sid);
 			dput(dentry);
 			if (rc)
 				goto out;
@@ -1788,7 +1802,7 @@ selinux_determine_inode_label(struct task_security_struct *tsec,
 	if ((sbsec->flags & SE_SBINITIALIZED) &&
 	    (sbsec->behavior == SECURITY_FS_USE_MNTPOINT)) {
 		*_new_isid = sbsec->mntpoint_sid;
-	} else if ((sbsec->flags & SE_SBLABELSUPP) &&
+	} else if ((sbsec->flags & SBLABEL_MNT) &&
 		   tsec->create_sid) {
 		*_new_isid = tsec->create_sid;
 	} else {
@@ -2199,8 +2213,9 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
 			    const struct task_security_struct *new_tsec)
 {
 	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
-	int nosuid = (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID);
+	int nosuid = !mnt_may_suid(bprm->file->f_path.mnt);
 	int rc;
+	u32 av;
 
 	if (!nnp && !nosuid)
 		return 0; /* neither NNP nor nosuid */
@@ -2209,24 +2224,40 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
 		return 0; /* No change in credentials */
 
 	/*
-	 * The only transitions we permit under NNP or nosuid
-	 * are transitions to bounded SIDs, i.e. SIDs that are
-	 * guaranteed to only be allowed a subset of the permissions
-	 * of the current SID.
+	 * If the policy enables the nnp_nosuid_transition policy capability,
+	 * then we permit transitions under NNP or nosuid if the
+	 * policy allows the corresponding permission between
+	 * the old and new contexts.
+	 */
+	if (selinux_policycap_nnp_nosuid_transition) {
+		av = 0;
+		if (nnp)
+			av |= PROCESS2__NNP_TRANSITION;
+		if (nosuid)
+			av |= PROCESS2__NOSUID_TRANSITION;
+		rc = avc_has_perm(old_tsec->sid, new_tsec->sid,
+				  SECCLASS_PROCESS2, av, NULL);
+		if (!rc)
+			return 0;
+	}
+
+	/*
+	 * We also permit NNP or nosuid transitions to bounded SIDs,
+	 * i.e. SIDs that are guaranteed to only be allowed a subset
+	 * of the permissions of the current SID.
 	 */
 	rc = security_bounded_transition(old_tsec->sid, new_tsec->sid);
-	if (rc) {
-		/*
-		 * On failure, preserve the errno values for NNP vs nosuid.
-		 * NNP:  Operation not permitted for caller.
-		 * nosuid:  Permission denied to file.
-		 */
-		if (nnp)
-			return -EPERM;
-		else
-			return -EACCES;
-	}
-	return 0;
+	if (!rc)
+		return 0;
+
+	/*
+	 * On failure, preserve the errno values for NNP vs nosuid.
+	 * NNP:  Operation not permitted for caller.
+	 * nosuid:  Permission denied to file.
+	 */
+	if (nnp)
+		return -EPERM;
+	return -EACCES;
 }
 
 static int selinux_bprm_set_creds(struct linux_binprm *bprm)
@@ -2649,7 +2680,7 @@ static int selinux_sb_remount(struct super_block *sb, void *data)
 		u32 sid;
 		size_t len;
 
-		if (flags[i] == SE_SBLABELSUPP)
+		if (flags[i] == SBLABEL_MNT)
 			continue;
 		len = strlen(mount_options[i]);
 		rc = security_context_to_sid(mount_options[i], len, &sid);
@@ -2831,7 +2862,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 		isec->initialized = LABEL_INITIALIZED;
 	}
 
-	if (!ss_initialized || !(sbsec->flags & SE_SBLABELSUPP))
+	if (!ss_initialized || !(sbsec->flags & SBLABEL_MNT))
 		return -EOPNOTSUPP;
 
 	if (name) {
@@ -3006,27 +3037,6 @@ static int selinux_inode_getattr(struct vfsmount *mnt, struct dentry *dentry)
 	return path_has_perm(cred, &path, FILE__GETATTR);
 }
 
-static int selinux_inode_setotherxattr(struct dentry *dentry, const char *name)
-{
-	const struct cred *cred = current_cred();
-
-	if (!strncmp(name, XATTR_SECURITY_PREFIX,
-		     sizeof XATTR_SECURITY_PREFIX - 1)) {
-		if (!strcmp(name, XATTR_NAME_CAPS)) {
-			if (!capable(CAP_SETFCAP))
-				return -EPERM;
-		} else if (!capable(CAP_SYS_ADMIN)) {
-			/* A different attribute in the security namespace.
-			   Restrict to administrator. */
-			return -EPERM;
-		}
-	}
-
-	/* Not an attribute we recognize, so just check the
-	   ordinary setattr permission. */
-	return dentry_has_perm(cred, dentry, FILE__SETATTR);
-}
-
 static int selinux_inode_setxattr(struct dentry *dentry, const char *name,
 				  const void *value, size_t size, int flags)
 {
@@ -3037,11 +3047,18 @@ static int selinux_inode_setxattr(struct dentry *dentry, const char *name,
 	u32 newsid, sid = current_sid();
 	int rc = 0;
 
-	if (strcmp(name, XATTR_NAME_SELINUX))
-		return selinux_inode_setotherxattr(dentry, name);
+	if (strcmp(name, XATTR_NAME_SELINUX)) {
+		rc = cap_inode_setxattr(dentry, name, value, size, flags);
+		if (rc)
+			return rc;
+
+		/* Not an attribute we recognize, so just check the
+		   ordinary setattr permission. */
+		return dentry_has_perm(current_cred(), dentry, FILE__SETATTR);
+	}
 
 	sbsec = inode->i_sb->s_security;
-	if (!(sbsec->flags & SE_SBLABELSUPP))
+	if (!(sbsec->flags & SBLABEL_MNT))
 		return -EOPNOTSUPP;
 
 	if (!inode_owner_or_capable(inode))
@@ -3152,8 +3169,15 @@ static int selinux_inode_listxattr(struct dentry *dentry)
 
 static int selinux_inode_removexattr(struct dentry *dentry, const char *name)
 {
-	if (strcmp(name, XATTR_NAME_SELINUX))
-		return selinux_inode_setotherxattr(dentry, name);
+	if (strcmp(name, XATTR_NAME_SELINUX)) {
+		int rc = cap_inode_removexattr(dentry, name);
+		if (rc)
+			return rc;
+
+		/* Not an attribute we recognize, so just check the
+		   ordinary setattr permission. */
+		return dentry_has_perm(current_cred(), dentry, FILE__SETATTR);
+	}
 
 	/* No one is allowed to remove a SELinux security label.
 	   You can change the label, but all data must be labeled. */
@@ -3171,6 +3195,10 @@ static int selinux_inode_getsecurity(struct inode *inode, const char *name, void
 	int error;
 	char *context = NULL;
 	struct inode_security_struct *isec;
+
+	error = cap_inode_getsecurity(inode, name, buffer, alloc);
+	if (error != -EOPNOTSUPP)
+		return error;
 
 	if (strcmp(name, XATTR_SELINUX_SUFFIX))
 		return -EOPNOTSUPP;
@@ -3501,6 +3529,9 @@ static int selinux_file_fcntl(struct file *file, unsigned int cmd,
 	case F_GETLK:
 	case F_SETLK:
 	case F_SETLKW:
+	case F_OFD_GETLK:
+	case F_OFD_SETLK:
+	case F_OFD_SETLKW:
 #if BITS_PER_LONG == 32
 	case F_GETLK64:
 	case F_SETLK64:
@@ -5961,7 +5992,70 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
 	*_buffer = context;
 	return rc;
 }
+#endif
 
+#ifdef CONFIG_SECURITY_INFINIBAND
+static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
+{
+	struct common_audit_data ad;
+	int err;
+	u32 sid = 0;
+	struct ib_security_struct *sec = ib_sec;
+	struct lsm_ibpkey_audit ibpkey;
+
+	err = sel_ib_pkey_sid(subnet_prefix, pkey_val, &sid);
+	if (err)
+		return err;
+
+	ad.type = LSM_AUDIT_DATA_IBPKEY;
+	ibpkey.subnet_prefix = subnet_prefix;
+	ibpkey.pkey = pkey_val;
+	ad.u.ibpkey = &ibpkey;
+	return avc_has_perm(sec->sid, sid,
+			    SECCLASS_INFINIBAND_PKEY,
+			    INFINIBAND_PKEY__ACCESS, &ad);
+}
+
+static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
+					    u8 port_num)
+{
+	struct common_audit_data ad;
+	int err;
+	u32 sid = 0;
+	struct ib_security_struct *sec = ib_sec;
+	struct lsm_ibendport_audit ibendport;
+
+	err = security_ib_endport_sid(dev_name, port_num, &sid);
+
+	if (err)
+		return err;
+
+	ad.type = LSM_AUDIT_DATA_IBENDPORT;
+	strncpy(ibendport.dev_name, dev_name, sizeof(ibendport.dev_name));
+	ibendport.port = port_num;
+	ad.u.ibendport = &ibendport;
+	return avc_has_perm(sec->sid, sid,
+			    SECCLASS_INFINIBAND_ENDPORT,
+			    INFINIBAND_ENDPORT__MANAGE_SUBNET, &ad);
+}
+
+static int selinux_ib_alloc_security(void **ib_sec)
+{
+	struct ib_security_struct *sec;
+
+	sec = kzalloc(sizeof(*sec), GFP_KERNEL);
+	if (!sec)
+		return -ENOMEM;
+	sec->sid = current_sid();
+
+	*ib_sec = sec;
+	return 0;
+}
+
+static void selinux_ib_free_security(void *ib_sec)
+{
+	kfree(ib_sec);
+}
 #endif
 
 static struct security_operations selinux_ops = {
@@ -6144,6 +6238,13 @@ static struct security_operations selinux_ops = {
 	.tun_dev_open =			selinux_tun_dev_open,
 	.skb_owned_by =			selinux_skb_owned_by,
 
+#ifdef CONFIG_SECURITY_INFINIBAND
+	.ib_pkey_access =		selinux_ib_pkey_access,
+	.ib_endport_manage_subnet =	selinux_ib_endport_manage_subnet,
+	.ib_alloc_security =		selinux_ib_alloc_security,
+	.ib_free_security =		selinux_ib_free_security,
+#endif
+
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 	.xfrm_policy_alloc_security =	selinux_xfrm_policy_alloc,
 	.xfrm_policy_clone_security =	selinux_xfrm_policy_clone,
@@ -6201,6 +6302,9 @@ static __init int selinux_init(void)
 
 	if (avc_add_callback(selinux_netcache_avc_callback, AVC_CALLBACK_RESET))
 		panic("SELinux: Unable to register AVC netcache callback\n");
+
+	if (avc_add_callback(selinux_lsm_notifier_avc_callback, AVC_CALLBACK_RESET))
+		panic("SELinux: Unable to register AVC LSM notifier callback\n");
 
 	if (selinux_enforcing)
 		printk(KERN_DEBUG "SELinux:  Starting in enforcing mode\n");

@@ -762,7 +762,7 @@ int i40e_fcoe_handle_offload(struct i40e_ring *rx_ring,
 		    (fh->fh_r_ctl == FC_RCTL_DD_SOL_DATA)) {
 			struct fcoe_crc_eof *crc = NULL;
 
-			crc = (struct fcoe_crc_eof *)skb_put(skb, sizeof(*crc));
+			crc = skb_put(skb, sizeof(*crc));
 			crc->fcoe_eof = FC_EOF_T;
 		} else {
 			/* otherwise, drop the header only frame */
@@ -1458,7 +1458,7 @@ static const struct net_device_ops i40e_fcoe_netdev_ops = {
 	.ndo_set_rx_mode	= i40e_set_rx_mode,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= i40e_set_mac,
-	.ndo_change_mtu		= i40e_fcoe_change_mtu,
+	.ndo_change_mtu_rh74	= i40e_fcoe_change_mtu,
 	.ndo_do_ioctl		= i40e_ioctl,
 	.ndo_tx_timeout		= i40e_tx_timeout,
 	.ndo_vlan_rx_add_vid	= i40e_vlan_rx_add_vid,

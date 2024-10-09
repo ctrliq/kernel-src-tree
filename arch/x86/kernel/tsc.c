@@ -1071,10 +1071,14 @@ static void detect_art(void)
 	cpuid(ART_CPUID_LEAF, &art_to_tsc_denominator,
 	      &art_to_tsc_numerator, unused, unused+1);
 
-	/* Don't enable ART in a VM, non-stop TSC required */
+	/*
+	 * Don't enable ART in a VM, non-stop TSC required,
+	 * and the TSC counter resets must not occur asynchronously.
+	 */
 	if (boot_cpu_has(X86_FEATURE_HYPERVISOR) ||
 	    !boot_cpu_has(X86_FEATURE_NONSTOP_TSC) ||
-	    art_to_tsc_denominator < ART_MIN_DENOMINATOR)
+	    art_to_tsc_denominator < ART_MIN_DENOMINATOR ||
+	    tsc_async_resets)
 		return;
 
 	if (rdmsrl_safe(MSR_IA32_TSC_ADJUST, &art_to_tsc_offset))
@@ -1105,9 +1109,9 @@ static struct clocksource clocksource_tsc;
  * checking the result of read_tsc() - cycle_last for being negative.
  * That works because CLOCKSOURCE_MASK(64) does not mask out any bit.
  */
-static cycle_t read_tsc(struct clocksource *cs)
+static u64 read_tsc(struct clocksource *cs)
 {
-	return (cycle_t)rdtsc_ordered();
+	return (u64)rdtsc_ordered();
 }
 
 /*
@@ -1195,7 +1199,7 @@ int unsynchronized_tsc(void)
 /*
  * Convert ART to TSC given numerator/denominator found in detect_art()
  */
-struct system_counterval_t convert_art_to_tsc(cycle_t art)
+struct system_counterval_t convert_art_to_tsc(u64 art)
 {
 	u64 tmp, res, rem;
 
@@ -1385,7 +1389,7 @@ void __init tsc_init(void)
 	if (unsynchronized_tsc())
 		mark_tsc_unstable("TSCs unsynchronized");
 	else
-		tsc_store_and_check_tsc_adjust();
+		tsc_store_and_check_tsc_adjust(true);
 
 	check_system_tsc_reliable();
 

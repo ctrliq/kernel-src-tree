@@ -198,7 +198,7 @@ xfs_setfilesize_trans_alloc(
  * Update on-disk file size now that data has been written to disk.
  */
 STATIC int
-xfs_setfilesize(
+__xfs_setfilesize(
 	struct xfs_inode	*ip,
 	struct xfs_trans	*tp,
 	xfs_off_t		offset,
@@ -221,6 +221,23 @@ xfs_setfilesize(
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
 	return xfs_trans_commit(tp);
+}
+
+int
+xfs_setfilesize(
+	struct xfs_inode	*ip,
+	xfs_off_t		offset,
+	size_t			size)
+{
+	struct xfs_mount	*mp = ip->i_mount;
+	struct xfs_trans	*tp;
+	int			error;
+
+	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_fsyncts, 0, 0, 0, &tp);
+	if (error)
+		return error;
+
+	return __xfs_setfilesize(ip, tp, offset, size);
 }
 
 STATIC int
@@ -246,7 +263,7 @@ xfs_setfilesize_ioend(
 		return error;
 	}
 
-	return xfs_setfilesize(ip, tp, ioend->io_offset, ioend->io_size);
+	return __xfs_setfilesize(ip, tp, ioend->io_offset, ioend->io_size);
 }
 
 /*
@@ -1131,12 +1148,6 @@ xfs_vm_releasepage(
  * extending the file size. We won't know for sure until IO completion is run
  * and the actual max write offset is communicated to the IO completion
  * routine.
- *
- * For DAX page faults, we are preparing to never see unwritten extents here,
- * nor should we ever extend the inode size. Hence we will soon have nothing to
- * do here for this case, ensuring we don't have to provide an IO completion
- * callback to free an ioend that we don't actually need for a fault into the
- * page at offset (2^63 - 1FSB) bytes.
  */
 
 static void
@@ -1144,8 +1155,7 @@ xfs_map_direct(
 	struct inode		*inode,
 	struct buffer_head	*bh_result,
 	struct xfs_bmbt_irec	*imap,
-	xfs_off_t		offset,
-	bool			dax_fault)
+	xfs_off_t		offset)
 {
 	struct xfs_ioend	*ioend;
 	xfs_off_t		size = bh_result->b_size;
@@ -1157,13 +1167,6 @@ xfs_map_direct(
 		type = XFS_IO_OVERWRITE;
 
 	trace_xfs_gbmap_direct(XFS_I(inode), offset, size, type, imap);
-
-	if (dax_fault) {
-		ASSERT(type == XFS_IO_OVERWRITE);
-		trace_xfs_gbmap_direct_none(XFS_I(inode), offset, size, type,
-					    imap);
-		return;
-	}
 
 	if (bh_result->b_private) {
 		ioend = bh_result->b_private;
@@ -1242,8 +1245,7 @@ __xfs_get_blocks(
 	sector_t		iblock,
 	struct buffer_head	*bh_result,
 	int			create,
-	bool			direct,
-	bool			dax_fault)
+	bool			direct)
 {
 	struct xfs_inode	*ip = XFS_I(inode);
 	struct xfs_mount	*mp = ip->i_mount;
@@ -1343,7 +1345,8 @@ __xfs_get_blocks(
 			 */
 			if (nimaps && imap.br_startblock == HOLESTARTBLOCK)
 				new = 1;
-			error = xfs_iomap_write_delay(ip, offset, size, &imap);
+			error = xfs_iomap_write_delay(ip, offset, size, &imap,
+						      NULL);
 			if (error)
 				goto out_unlock;
 
@@ -1385,8 +1388,7 @@ __xfs_get_blocks(
 			set_buffer_unwritten(bh_result);
 		/* direct IO needs special help */
 		if (create && direct)
-			xfs_map_direct(inode, bh_result, &imap, offset,
-				       dax_fault);
+			xfs_map_direct(inode, bh_result, &imap, offset);
 	}
 
 	/*
@@ -1432,7 +1434,7 @@ xfs_get_blocks(
 	struct buffer_head	*bh_result,
 	int			create)
 {
-	return __xfs_get_blocks(inode, iblock, bh_result, create, false, false);
+	return __xfs_get_blocks(inode, iblock, bh_result, create, false);
 }
 
 int
@@ -1442,17 +1444,7 @@ xfs_get_blocks_direct(
 	struct buffer_head	*bh_result,
 	int			create)
 {
-	return __xfs_get_blocks(inode, iblock, bh_result, create, true, false);
-}
-
-int
-xfs_get_blocks_dax_fault(
-	struct inode		*inode,
-	sector_t		iblock,
-	struct buffer_head	*bh_result,
-	int			create)
-{
-	return __xfs_get_blocks(inode, iblock, bh_result, create, true, true);
+	return __xfs_get_blocks(inode, iblock, bh_result, create, true);
 }
 
 static void
@@ -1659,7 +1651,7 @@ xfs_vm_write_failed(
 		if (!buffer_delay(bh) && !buffer_unwritten(bh))
 			continue;
 
-		if (!xfs_mp_fail_writes(mp) && !buffer_new(bh) &&
+		if (!xfs_mp_drop_writes(mp) && !buffer_new(bh) &&
 		    block_offset < i_size_read(inode))
 			continue;
 
@@ -1709,7 +1701,7 @@ xfs_vm_write_begin(
 		return -ENOMEM;
 
 	status = __block_write_begin(page, pos, len, xfs_get_blocks);
-	if (xfs_mp_fail_writes(mp))
+	if (xfs_mp_drop_writes(mp))
 		status = -EIO;
 	if (unlikely(status)) {
 		struct inode	*inode = mapping->host;
@@ -1723,7 +1715,7 @@ xfs_vm_write_begin(
 		 * allocated in this write, not blocks that were previously
 		 * written successfully.
 		 */
-		if (xfs_mp_fail_writes(mp))
+		if (xfs_mp_drop_writes(mp))
 			isize = 0;
 		if (pos + len > isize) {
 			ssize_t start = max_t(ssize_t, pos, isize);

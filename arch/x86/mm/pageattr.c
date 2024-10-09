@@ -109,12 +109,6 @@ static inline unsigned long highmap_end_pfn(void)
 
 #endif
 
-#ifdef CONFIG_DEBUG_PAGEALLOC
-# define debug_pagealloc 1
-#else
-# define debug_pagealloc 0
-#endif
-
 static inline int
 within(unsigned long addr, unsigned long start, unsigned long end)
 {
@@ -504,9 +498,9 @@ try_preserve_large_page(pte_t *kpte, unsigned long address,
 	 * for the ancient hardware that doesn't support it.
 	 */
 	if (pgprot_val(req_prot) & _PAGE_PRESENT)
-		pgprot_val(req_prot) |= _PAGE_PSE | _PAGE_GLOBAL;
+		pgprot_val(req_prot) |= _PAGE_PSE | __PAGE_KERNEL_GLOBAL;
 	else
-		pgprot_val(req_prot) &= ~(_PAGE_PSE | _PAGE_GLOBAL);
+		pgprot_val(req_prot) &= ~(_PAGE_PSE | __PAGE_KERNEL_GLOBAL);
 
 	req_prot = canon_pgprot(req_prot);
 
@@ -620,9 +614,9 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
 	 * for the ancient hardware that doesn't support it.
 	 */
 	if (pgprot_val(ref_prot) & _PAGE_PRESENT)
-		pgprot_val(ref_prot) |= _PAGE_GLOBAL;
+		pgprot_val(ref_prot) |= __PAGE_KERNEL_GLOBAL;
 	else
-		pgprot_val(ref_prot) &= ~_PAGE_GLOBAL;
+		pgprot_val(ref_prot) &= ~__PAGE_KERNEL_GLOBAL;
 
 	/*
 	 * Get the target pfn from the original entry:
@@ -663,10 +657,10 @@ static int split_large_page(struct cpa_data *cpa, pte_t *kpte,
 {
 	struct page *base;
 
-	if (!debug_pagealloc)
+	if (!debug_pagealloc_enabled())
 		spin_unlock(&cpa_lock);
 	base = alloc_pages(GFP_KERNEL | __GFP_NOTRACK, 0);
-	if (!debug_pagealloc)
+	if (!debug_pagealloc_enabled())
 		spin_lock(&cpa_lock);
 	if (!base)
 		return -ENOMEM;
@@ -865,15 +859,10 @@ static void populate_pte(struct cpa_data *cpa,
 	pte = pte_offset_kernel(pmd, start);
 
 	while (num_pages-- && start < end) {
-
-		/* deal with the NX bit */
-		if (!(pgprot_val(pgprot) & _PAGE_NX))
-			cpa->pfn &= ~_PAGE_NX;
-
-		set_pte(pte, pfn_pte(cpa->pfn >> PAGE_SHIFT, pgprot));
+		set_pte(pte, pfn_pte(cpa->pfn, pgprot));
 
 		start	 += PAGE_SIZE;
-		cpa->pfn += PAGE_SIZE;
+		cpa->pfn++;
 		pte++;
 	}
 }
@@ -926,10 +915,11 @@ static int populate_pmd(struct cpa_data *cpa,
 
 		pmd = pmd_offset(pud, start);
 
-		set_pmd(pmd, __pmd(cpa->pfn | _PAGE_PSE | massage_pgprot(pgprot)));
+		set_pmd(pmd, __pmd(cpa->pfn << PAGE_SHIFT | _PAGE_PSE |
+				   massage_pgprot(pgprot)));
 
 		start	  += PMD_SIZE;
-		cpa->pfn  += PMD_SIZE;
+		cpa->pfn  += PMD_SIZE >> PAGE_SHIFT;
 		cur_pages += PMD_SIZE >> PAGE_SHIFT;
 	}
 
@@ -996,10 +986,11 @@ static int populate_pud(struct cpa_data *cpa, unsigned long start, pgd_t *pgd,
 	 * Map everything starting from the Gb boundary, possibly with 1G pages
 	 */
 	while (end - start >= PUD_SIZE) {
-		set_pud(pud, __pud(cpa->pfn | _PAGE_PSE | massage_pgprot(pgprot)));
+		set_pud(pud, __pud(cpa->pfn << PAGE_SHIFT | _PAGE_PSE |
+				   massage_pgprot(pgprot)));
 
 		start	  += PUD_SIZE;
-		cpa->pfn  += PUD_SIZE;
+		cpa->pfn  += PUD_SIZE >> PAGE_SHIFT;
 		cur_pages += PUD_SIZE >> PAGE_SHIFT;
 		pud++;
 	}
@@ -1137,9 +1128,9 @@ repeat:
 		 * support it.
 		 */
 		if (pgprot_val(new_prot) & _PAGE_PRESENT)
-			pgprot_val(new_prot) |= _PAGE_GLOBAL;
+			pgprot_val(new_prot) |= __PAGE_KERNEL_GLOBAL;
 		else
-			pgprot_val(new_prot) &= ~_PAGE_GLOBAL;
+			pgprot_val(new_prot) &= ~__PAGE_KERNEL_GLOBAL;
 
 		/*
 		 * We need to keep the pfn from the existing PTE,
@@ -1280,10 +1271,10 @@ static int __change_page_attr_set_clr(struct cpa_data *cpa, int checkalias)
 		if (cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY))
 			cpa->numpages = 1;
 
-		if (!debug_pagealloc)
+		if (!debug_pagealloc_enabled())
 			spin_lock(&cpa_lock);
 		ret = __change_page_attr(cpa, checkalias);
-		if (!debug_pagealloc)
+		if (!debug_pagealloc_enabled())
 			spin_unlock(&cpa_lock);
 		if (ret)
 			return ret;
@@ -1308,12 +1299,6 @@ static int __change_page_attr_set_clr(struct cpa_data *cpa, int checkalias)
 
 	}
 	return 0;
-}
-
-static inline int cache_attr(pgprot_t attr)
-{
-	return pgprot_val(attr) &
-		(_PAGE_PAT | _PAGE_PAT_LARGE | _PAGE_PWT | _PAGE_PCD);
 }
 
 static int change_page_attr_set_clr(unsigned long *addr, int numpages,
@@ -1396,7 +1381,7 @@ static int change_page_attr_set_clr(unsigned long *addr, int numpages,
 	 * No need to flush, when we did not set any of the caching
 	 * attributes:
 	 */
-	cache = cache_attr(mask_set);
+	cache = !!pgprot2cachemode(mask_set);
 
 	/*
 	 * On success we use clflush, when the CPU supports it to
@@ -1451,7 +1436,8 @@ int _set_memory_uc(unsigned long addr, int numpages)
 	 * for now UC MINUS. see comments in ioremap_nocache()
 	 */
 	return change_page_attr_set(&addr, numpages,
-				    __pgprot(_PAGE_CACHE_UC_MINUS), 0);
+				    cachemode2pgprot(_PAGE_CACHE_MODE_UC_MINUS),
+				    0);
 }
 
 int set_memory_uc(unsigned long addr, int numpages)
@@ -1462,7 +1448,7 @@ int set_memory_uc(unsigned long addr, int numpages)
 	 * for now UC MINUS. see comments in ioremap_nocache()
 	 */
 	ret = reserve_memtype(__pa(addr), __pa(addr) + numpages * PAGE_SIZE,
-			    _PAGE_CACHE_UC_MINUS, NULL);
+			      _PAGE_CACHE_MODE_UC_MINUS, NULL);
 	if (ret)
 		goto out_err;
 
@@ -1480,7 +1466,7 @@ out_err:
 EXPORT_SYMBOL(set_memory_uc);
 
 static int _set_memory_array(unsigned long *addr, int addrinarray,
-		unsigned long new_type)
+		enum page_cache_mode new_type)
 {
 	int i, j;
 	int ret;
@@ -1496,11 +1482,13 @@ static int _set_memory_array(unsigned long *addr, int addrinarray,
 	}
 
 	ret = change_page_attr_set(addr, addrinarray,
-				    __pgprot(_PAGE_CACHE_UC_MINUS), 1);
+				   cachemode2pgprot(_PAGE_CACHE_MODE_UC_MINUS),
+				   1);
 
-	if (!ret && new_type == _PAGE_CACHE_WC)
+	if (!ret && new_type == _PAGE_CACHE_MODE_WC)
 		ret = change_page_attr_set_clr(addr, addrinarray,
-					       __pgprot(_PAGE_CACHE_WC),
+					       cachemode2pgprot(
+						_PAGE_CACHE_MODE_WC),
 					       __pgprot(_PAGE_CACHE_MASK),
 					       0, CPA_ARRAY, NULL);
 	if (ret)
@@ -1517,13 +1505,13 @@ out_free:
 
 int set_memory_array_uc(unsigned long *addr, int addrinarray)
 {
-	return _set_memory_array(addr, addrinarray, _PAGE_CACHE_UC_MINUS);
+	return _set_memory_array(addr, addrinarray, _PAGE_CACHE_MODE_UC_MINUS);
 }
 EXPORT_SYMBOL(set_memory_array_uc);
 
 int set_memory_array_wc(unsigned long *addr, int addrinarray)
 {
-	return _set_memory_array(addr, addrinarray, _PAGE_CACHE_WC);
+	return _set_memory_array(addr, addrinarray, _PAGE_CACHE_MODE_WC);
 }
 EXPORT_SYMBOL(set_memory_array_wc);
 
@@ -1533,10 +1521,12 @@ int _set_memory_wc(unsigned long addr, int numpages)
 	unsigned long addr_copy = addr;
 
 	ret = change_page_attr_set(&addr, numpages,
-				    __pgprot(_PAGE_CACHE_UC_MINUS), 0);
+				   cachemode2pgprot(_PAGE_CACHE_MODE_UC_MINUS),
+				   0);
 	if (!ret) {
 		ret = change_page_attr_set_clr(&addr_copy, numpages,
-					       __pgprot(_PAGE_CACHE_WC),
+					       cachemode2pgprot(
+						_PAGE_CACHE_MODE_WC),
 					       __pgprot(_PAGE_CACHE_MASK),
 					       0, 0, NULL);
 	}
@@ -1551,7 +1541,7 @@ int set_memory_wc(unsigned long addr, int numpages)
 		return set_memory_uc(addr, numpages);
 
 	ret = reserve_memtype(__pa(addr), __pa(addr) + numpages * PAGE_SIZE,
-		_PAGE_CACHE_WC, NULL);
+		_PAGE_CACHE_MODE_WC, NULL);
 	if (ret)
 		goto out_err;
 
@@ -1570,6 +1560,7 @@ EXPORT_SYMBOL(set_memory_wc);
 
 int _set_memory_wb(unsigned long addr, int numpages)
 {
+	/* WB cache mode is hard wired to all cache attribute bits being 0 */
 	return change_page_attr_clear(&addr, numpages,
 				      __pgprot(_PAGE_CACHE_MASK), 0);
 }
@@ -1592,6 +1583,7 @@ int set_memory_array_wb(unsigned long *addr, int addrinarray)
 	int i;
 	int ret;
 
+	/* WB cache mode is hard wired to all cache attribute bits being 0 */
 	ret = change_page_attr_clear(addr, addrinarray,
 				      __pgprot(_PAGE_CACHE_MASK), 1);
 	if (ret)
@@ -1645,6 +1637,70 @@ int set_memory_4k(unsigned long addr, int numpages)
 					__pgprot(0), 1, 0, NULL);
 }
 
+static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
+{
+	struct cpa_data cpa;
+	unsigned long start;
+	int ret;
+
+	/* Nothing to do if the SME is not active */
+	if (!sme_active())
+		return 0;
+
+	/* Should not be working on unaligned addresses */
+	if (WARN_ONCE(addr & ~PAGE_MASK, "misaligned address: %#lx\n", addr))
+		addr &= PAGE_MASK;
+
+	start = addr;
+
+	memset(&cpa, 0, sizeof(cpa));
+	cpa.vaddr = &addr;
+	cpa.numpages = numpages;
+	cpa.mask_set = enc ? __pgprot(_PAGE_ENC) : __pgprot(0);
+	cpa.mask_clr = enc ? __pgprot(0) : __pgprot(_PAGE_ENC);
+	cpa.pgd = init_mm.pgd;
+
+	/* Must avoid aliasing mappings in the highmem code */
+	kmap_flush_unused();
+	vm_unmap_aliases();
+
+	/*
+	 * Before changing the encryption attribute, we need to flush caches.
+	 */
+	if (static_cpu_has(X86_FEATURE_CLFLUSH))
+		cpa_flush_range(start, numpages, 1);
+	else
+		cpa_flush_all(1);
+
+	ret = __change_page_attr_set_clr(&cpa, 1);
+
+	/*
+	 * After changing the encryption attribute, we need to flush TLBs
+	 * again in case any speculative TLB caching occurred (but no need
+	 * to flush caches again).  We could just use cpa_flush_all(), but
+	 * in case TLB flushing gets optimized in the cpa_flush_range()
+	 * path use the same logic as above.
+	 */
+	if (static_cpu_has(X86_FEATURE_CLFLUSH))
+		cpa_flush_range(start, numpages, 0);
+	else
+		cpa_flush_all(0);
+
+	return ret;
+}
+
+int set_memory_encrypted(unsigned long addr, int numpages)
+{
+	return __set_memory_enc_dec(addr, numpages, true);
+}
+EXPORT_SYMBOL_GPL(set_memory_encrypted);
+
+int set_memory_decrypted(unsigned long addr, int numpages)
+{
+	return __set_memory_enc_dec(addr, numpages, false);
+}
+EXPORT_SYMBOL_GPL(set_memory_decrypted);
+
 int set_pages_uc(struct page *page, int numpages)
 {
 	unsigned long addr = (unsigned long)page_address(page);
@@ -1654,7 +1710,7 @@ int set_pages_uc(struct page *page, int numpages)
 EXPORT_SYMBOL(set_pages_uc);
 
 static int _set_pages_array(struct page **pages, int addrinarray,
-		unsigned long new_type)
+		enum page_cache_mode new_type)
 {
 	unsigned long start;
 	unsigned long end;
@@ -1672,10 +1728,11 @@ static int _set_pages_array(struct page **pages, int addrinarray,
 	}
 
 	ret = cpa_set_pages_array(pages, addrinarray,
-			__pgprot(_PAGE_CACHE_UC_MINUS));
-	if (!ret && new_type == _PAGE_CACHE_WC)
+			cachemode2pgprot(_PAGE_CACHE_MODE_UC_MINUS));
+	if (!ret && new_type == _PAGE_CACHE_MODE_WC)
 		ret = change_page_attr_set_clr(NULL, addrinarray,
-					       __pgprot(_PAGE_CACHE_WC),
+					       cachemode2pgprot(
+						_PAGE_CACHE_MODE_WC),
 					       __pgprot(_PAGE_CACHE_MASK),
 					       0, CPA_PAGES_ARRAY, pages);
 	if (ret)
@@ -1695,13 +1752,13 @@ err_out:
 
 int set_pages_array_uc(struct page **pages, int addrinarray)
 {
-	return _set_pages_array(pages, addrinarray, _PAGE_CACHE_UC_MINUS);
+	return _set_pages_array(pages, addrinarray, _PAGE_CACHE_MODE_UC_MINUS);
 }
 EXPORT_SYMBOL(set_pages_array_uc);
 
 int set_pages_array_wc(struct page **pages, int addrinarray)
 {
-	return _set_pages_array(pages, addrinarray, _PAGE_CACHE_WC);
+	return _set_pages_array(pages, addrinarray, _PAGE_CACHE_MODE_WC);
 }
 EXPORT_SYMBOL(set_pages_array_wc);
 
@@ -1720,6 +1777,7 @@ int set_pages_array_wb(struct page **pages, int addrinarray)
 	unsigned long end;
 	int i;
 
+	/* WB cache mode is hard wired to all cache attribute bits being 0 */
 	retval = cpa_clear_pages_array(pages, addrinarray,
 			__pgprot(_PAGE_CACHE_MASK));
 	if (retval)
@@ -1807,7 +1865,7 @@ static int __set_pages_np(struct page *page, int numpages)
 	return __change_page_attr_set_clr(&cpa, 0);
 }
 
-void kernel_map_pages(struct page *page, int numpages, int enable)
+void __kernel_map_pages(struct page *page, int numpages, int enable)
 {
 	if (PageHighMem(page))
 		return;
@@ -1873,6 +1931,12 @@ int kernel_map_pages_in_pgd(pgd_t *pgd, u64 pfn, unsigned long address,
 
 	if (!(page_flags & _PAGE_NX))
 		cpa.mask_clr = __pgprot(_PAGE_NX);
+
+	if (!(page_flags & _PAGE_RW))
+		cpa.mask_clr = __pgprot(_PAGE_RW);
+
+	if (!(page_flags & _PAGE_ENC))
+		cpa.mask_clr = pgprot_encrypted(cpa.mask_clr);
 
 	cpa.mask_set = __pgprot(_PAGE_PRESENT | page_flags);
 

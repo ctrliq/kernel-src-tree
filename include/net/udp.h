@@ -59,7 +59,7 @@ struct udp_skb_cb {
  *	@lock:	spinlock protecting changes to head/count
  */
 struct udp_hslot {
-	struct hlist_nulls_head	head;
+	RH_KABI_REPLACE(struct hlist_nulls_head head, struct hlist_head head)
 	int			count;
 	spinlock_t		lock;
 } __attribute__((aligned(2 * sizeof(long))));
@@ -194,7 +194,7 @@ static inline void udp_lib_close(struct sock *sk, long timeout)
 }
 
 extern int udp_lib_get_port(struct sock *sk, unsigned short snum,
-			    int (*)(const struct sock *,const struct sock *),
+			    int (*)(const struct sock *, const struct sock *, bool),
 			    unsigned int hash2_nulladdr);
 
 static inline __be16 udp_flow_src_port(struct net *net, struct sk_buff *skb,
@@ -246,7 +246,7 @@ static inline struct sk_buff *skb_recv_udp(struct sock *sk, unsigned int flags,
 	return __skb_recv_udp(sk, flags, noblock, &peeked, &off, err);
 }
 
-void udp_v4_early_demux(struct sk_buff *skb);
+int udp_v4_early_demux(struct sk_buff *skb);
 extern int udp_get_port(struct sock *sk, unsigned short snum,
 			int (*saddr_cmp)(const struct sock *,
 					 const struct sock *));
@@ -270,17 +270,21 @@ extern int udp_lib_getsockopt(struct sock *sk, int level, int optname,
 extern int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 			      char __user *optval, unsigned int optlen,
 			      int (*push_pending_frames)(struct sock *));
+RH_KABI_FORCE_CHANGE(1)
 extern struct sock *udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
 				    __be32 daddr, __be16 dport,
 				    int dif);
+RH_KABI_FORCE_CHANGE(1)
 extern struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
 				    __be32 daddr, __be16 dport,
 				    int dif, struct udp_table *tbl);
 struct sock *udp4_lib_lookup_skb(struct sk_buff *skb,
 				 __be16 sport, __be16 dport);
+RH_KABI_FORCE_CHANGE(1)
 extern struct sock *udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
 				    const struct in6_addr *daddr, __be16 dport,
 				    int dif);
+RH_KABI_FORCE_CHANGE(1)
 extern struct sock *__udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
 				    const struct in6_addr *daddr, __be16 dport,
 				    int dif, struct udp_table *tbl);

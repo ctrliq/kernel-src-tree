@@ -330,9 +330,8 @@ struct gfs2_glock {
 	struct lm_lockname gl_name;
 
 	struct lockref gl_lockref;
-#define gl_spin gl_lockref.lock
 
-	/* State fields protected by gl_spin */
+	/* State fields protected by gl_lockref.lock */
 	unsigned int gl_state:2,	/* Current state */
 		     gl_target:2,	/* Target state */
 		     gl_demote_state:2,	/* State requested by remote node */
@@ -767,15 +766,10 @@ struct gfs2_sbd {
 
 	struct gfs2_trans *sd_log_tr;
 	unsigned int sd_log_blks_reserved;
-	unsigned int sd_log_commited_buf;
-	unsigned int sd_log_commited_databuf;
 	int sd_log_commited_revoke;
 
 	atomic_t sd_log_pinned;
-	unsigned int sd_log_num_buf;
 	unsigned int sd_log_num_revoke;
-	unsigned int sd_log_num_rg;
-	unsigned int sd_log_num_databuf;
 
 	struct list_head sd_log_le_revoke;
 	struct list_head sd_log_le_ordered;
@@ -834,6 +828,8 @@ static inline void gfs2_sbstats_inc(const struct gfs2_glock *gl, int which)
 	this_cpu_ptr(sdp->sd_lkstats)->lkstats[gl->gl_name.ln_type].stats[which]++;
 	preempt_enable();
 }
+
+extern struct gfs2_rgrpd *gfs2_glock2rgrp(struct gfs2_glock *gl);
 
 #endif /* __INCORE_DOT_H__ */
 

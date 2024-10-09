@@ -97,6 +97,16 @@
 struct exception_table_entry {
 	int insn, fixup;
 };
+
+/*
+ * Special exception table used for memcpy_mcsafe()
+ */
+struct mc_exception_table_entry {
+	int insn, fixup, handler;
+};
+extern int mc_fixup_exception(struct pt_regs *regs, int trapnr);
+extern bool ex_has_fault_handler(unsigned long ip);
+
 /* This is not the generic standard exception_table_entry format */
 #define ARCH_HAS_SORT_EXTABLE
 #define ARCH_HAS_SEARCH_EXTABLE

@@ -316,8 +316,8 @@ out:
 	spin_unlock_irqrestore(&ehea_bcmc_regs.lock, flags);
 }
 
-static struct rtnl_link_stats64 *ehea_get_stats64(struct net_device *dev,
-					struct rtnl_link_stats64 *stats)
+static void ehea_get_stats64(struct net_device *dev,
+			     struct rtnl_link_stats64 *stats)
 {
 	struct ehea_port *port = netdev_priv(dev);
 	u64 rx_packets = 0, tx_packets = 0, rx_bytes = 0, tx_bytes = 0;
@@ -340,7 +340,6 @@ static struct rtnl_link_stats64 *ehea_get_stats64(struct net_device *dev,
 
 	stats->multicast = port->stats.multicast;
 	stats->rx_errors = port->stats.rx_errors;
-	return stats;
 }
 
 static void ehea_update_stats(struct work_struct *work)
@@ -2958,7 +2957,7 @@ static const struct net_device_ops ehea_netdev_ops = {
 	.ndo_set_mac_address	= ehea_set_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_rx_mode	= ehea_set_multicast_list,
-	.ndo_change_mtu		= ehea_change_mtu,
+	.ndo_change_mtu_rh74	= ehea_change_mtu,
 	.ndo_vlan_rx_add_vid	= ehea_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= ehea_vlan_rx_kill_vid,
 	.ndo_tx_timeout		= ehea_tx_watchdog,

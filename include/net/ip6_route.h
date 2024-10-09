@@ -18,6 +18,7 @@ struct route_info {
 	__u8			prefix[0];	/* 0,8 or 16 */
 };
 
+#include <net/addrconf.h>
 #include <net/flow.h>
 #include <net/ip6_fib.h>
 #include <net/sock.h>

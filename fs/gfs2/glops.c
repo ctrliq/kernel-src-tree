@@ -58,7 +58,6 @@ static void __gfs2_ail_flush(struct gfs2_glock *gl, bool fsync,
 	struct gfs2_bufdata *bd, *tmp;
 	struct buffer_head *bh;
 	const unsigned long b_state = (1UL << BH_Dirty)|(1UL << BH_Pinned)|(1UL << BH_Lock);
-	sector_t blocknr;
 
 	gfs2_log_lock(sdp);
 	spin_lock(&sdp->sd_ail_lock);
@@ -71,13 +70,6 @@ static void __gfs2_ail_flush(struct gfs2_glock *gl, bool fsync,
 				continue;
 			gfs2_ail_error(gl, bh);
 		}
-		blocknr = bh->b_blocknr;
-		bh->b_private = NULL;
-		gfs2_remove_from_ail(bd); /* drops ref on bh */
-
-		bd->bd_bh = NULL;
-		bd->bd_blkno = blocknr;
-
 		gfs2_trans_add_revoke(sdp, bd);
 		nr_revokes--;
 	}
@@ -150,11 +142,11 @@ static void rgrp_go_sync(struct gfs2_glock *gl)
 	struct gfs2_rgrpd *rgd;
 	int error;
 
-	spin_lock(&gl->gl_spin);
+	spin_lock(&gl->gl_lockref.lock);
 	rgd = gl->gl_object;
 	if (rgd)
 		gfs2_rgrp_brelse(rgd);
-	spin_unlock(&gl->gl_spin);
+	spin_unlock(&gl->gl_lockref.lock);
 
 	if (!test_and_clear_bit(GLF_DIRTY, &gl->gl_flags))
 		return;
@@ -166,11 +158,11 @@ static void rgrp_go_sync(struct gfs2_glock *gl)
         mapping_set_error(metamapping, error);
 	gfs2_ail_empty_gl(gl);
 
-	spin_lock(&gl->gl_spin);
+	spin_lock(&gl->gl_lockref.lock);
 	rgd = gl->gl_object;
 	if (rgd)
 		gfs2_free_clones(rgd);
-	spin_unlock(&gl->gl_spin);
+	spin_unlock(&gl->gl_lockref.lock);
 }
 
 /**
@@ -186,7 +178,7 @@ static void rgrp_go_sync(struct gfs2_glock *gl)
 static void rgrp_go_inval(struct gfs2_glock *gl, int flags)
 {
 	struct address_space *mapping = gfs2_glock2aspace(gl);
-	struct gfs2_rgrpd *rgd = gl->gl_object;
+	struct gfs2_rgrpd *rgd = gfs2_glock2rgrp(gl);
 
 	if (rgd)
 		gfs2_rgrp_brelse(rgd);
@@ -209,6 +201,17 @@ static struct gfs2_inode *gfs2_glock2inode(struct gfs2_glock *gl)
 		set_bit(GIF_GLOP_PENDING, &ip->i_flags);
 	spin_unlock(&gl->gl_lockref.lock);
 	return ip;
+}
+
+struct gfs2_rgrpd *gfs2_glock2rgrp(struct gfs2_glock *gl)
+{
+	struct gfs2_rgrpd *rgd;
+
+	spin_lock(&gl->gl_lockref.lock);
+	rgd = gl->gl_object;
+	spin_unlock(&gl->gl_lockref.lock);
+
+	return rgd;
 }
 
 static void gfs2_clear_glop_pending(struct gfs2_inode *ip)
@@ -540,11 +543,11 @@ static int trans_go_demote_ok(const struct gfs2_glock *gl)
  * iopen_go_callback - schedule the dcache entry for the inode to be deleted
  * @gl: the glock
  *
- * gl_spin lock is held while calling this
+ * gl_lockref.lock lock is held while calling this
  */
 static void iopen_go_callback(struct gfs2_glock *gl, bool remote)
 {
-	struct gfs2_inode *ip = (struct gfs2_inode *)gl->gl_object;
+	struct gfs2_inode *ip = gl->gl_object;
 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
 
 	if (!remote || (sdp->sd_vfs->s_flags & MS_RDONLY))

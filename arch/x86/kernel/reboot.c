@@ -183,7 +183,7 @@ void __noreturn machine_real_restart(unsigned int type)
 
 	/* Exiting long mode will fail if CR4.PCIDE is set. */
 	if (static_cpu_has(X86_FEATURE_PCID))
-		cr4_clear_bits(X86_CR4_PCIDE);
+		clear_in_cr4(X86_CR4_PCIDE);
 #endif
 
 	/* Jump to the identity-mapped low memory code */

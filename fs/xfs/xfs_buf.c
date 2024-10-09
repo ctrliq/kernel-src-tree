@@ -144,12 +144,16 @@ static inline void
 xfs_buf_ioacct_inc(
 	struct xfs_buf	*bp)
 {
-	if (bp->b_flags & (XBF_NO_IOACCT|_XBF_IN_FLIGHT))
+	if (bp->b_flags & XBF_NO_IOACCT)
 		return;
 
 	ASSERT(bp->b_flags & XBF_ASYNC);
-	bp->b_flags |= _XBF_IN_FLIGHT;
-	percpu_counter_inc(&bp->b_target->bt_io_count);
+	spin_lock(&bp->b_lock);
+	if (!(bp->b_state & XFS_BSTATE_IN_FLIGHT)) {
+		bp->b_state |= XFS_BSTATE_IN_FLIGHT;
+		percpu_counter_inc(&bp->b_target->bt_io_count);
+	}
+	spin_unlock(&bp->b_lock);
 }
 
 /*
@@ -157,14 +161,24 @@ xfs_buf_ioacct_inc(
  * freed and unaccount from the buftarg.
  */
 static inline void
+__xfs_buf_ioacct_dec(
+	struct xfs_buf	*bp)
+{
+	ASSERT(spin_is_locked(&bp->b_lock));
+
+	if (bp->b_state & XFS_BSTATE_IN_FLIGHT) {
+		bp->b_state &= ~XFS_BSTATE_IN_FLIGHT;
+		percpu_counter_dec(&bp->b_target->bt_io_count);
+	}
+}
+
+static inline void
 xfs_buf_ioacct_dec(
 	struct xfs_buf	*bp)
 {
-	if (!(bp->b_flags & _XBF_IN_FLIGHT))
-		return;
-
-	bp->b_flags &= ~_XBF_IN_FLIGHT;
-	percpu_counter_dec(&bp->b_target->bt_io_count);
+	spin_lock(&bp->b_lock);
+	__xfs_buf_ioacct_dec(bp);
+	spin_unlock(&bp->b_lock);
 }
 
 /*
@@ -196,9 +210,9 @@ xfs_buf_stale(
 	 * unaccounted (released to LRU) before that occurs. Drop in-flight
 	 * status now to preserve accounting consistency.
 	 */
-	xfs_buf_ioacct_dec(bp);
-
 	spin_lock(&bp->b_lock);
+	__xfs_buf_ioacct_dec(bp);
+
 	atomic_set(&bp->b_lru_ref, 0);
 	if (!list_empty(&bp->b_lru)) {
 		struct xfs_buftarg *btp = bp->b_target;
@@ -1008,12 +1022,12 @@ xfs_buf_rele(
 		 * ensures the decrement occurs only once per-buf.
 		 */
 		if ((atomic_read(&bp->b_hold) == 1) && !list_empty(&bp->b_lru))
-			xfs_buf_ioacct_dec(bp);
+			__xfs_buf_ioacct_dec(bp);
 		goto out_unlock;
 	}
 
 	/* the last reference has been dropped ... */
-	xfs_buf_ioacct_dec(bp);
+	__xfs_buf_ioacct_dec(bp);
 	if (!(bp->b_flags & XBF_STALE) && atomic_read(&bp->b_lru_ref)) {
 		/*
 		 * If the buffer is added to the LRU take a new
@@ -1897,18 +1911,33 @@ xfs_buf_cmp(
 	return 0;
 }
 
+/*
+ * submit buffers for write.
+ *
+ * When we have a large buffer list, we do not want to hold all the buffers
+ * locked while we block on the request queue waiting for IO dispatch. To avoid
+ * this problem, we lock and submit buffers in groups of 50, thereby minimising
+ * the lock hold times for lists which may contain thousands of objects.
+ *
+ * To do this, we sort the buffer list before we walk the list to lock and
+ * submit buffers, and we plug and unplug around each group of buffers we
+ * submit.
+ */
 static int
-__xfs_buf_delwri_submit(
+xfs_buf_delwri_submit_buffers(
 	struct list_head	*buffer_list,
-	struct list_head	*io_list,
-	bool			wait)
+	struct list_head	*wait_list)
 {
-	struct blk_plug		plug;
 	struct xfs_buf		*bp, *n;
+	LIST_HEAD		(submit_list);
 	int			pinned = 0;
+	struct blk_plug		plug;
 
+	list_sort(NULL, buffer_list, xfs_buf_cmp);
+
+	blk_start_plug(&plug);
 	list_for_each_entry_safe(bp, n, buffer_list, b_list) {
-		if (!wait) {
+		if (!wait_list) {
 			if (xfs_buf_ispinned(bp)) {
 				pinned++;
 				continue;
@@ -1931,25 +1960,21 @@ __xfs_buf_delwri_submit(
 			continue;
 		}
 
-		list_move_tail(&bp->b_list, io_list);
 		trace_xfs_buf_delwri_split(bp, _RET_IP_);
-	}
-
-	list_sort(NULL, io_list, xfs_buf_cmp);
-
-	blk_start_plug(&plug);
-	list_for_each_entry_safe(bp, n, io_list, b_list) {
-		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_WRITE_FAIL);
-		bp->b_flags |= XBF_WRITE | XBF_ASYNC;
 
 		/*
-		 * we do all Io submission async. This means if we need to wait
-		 * for IO completion we need to take an extra reference so the
-		 * buffer is still valid on the other side.
+		 * We do all IO submission async. This means if we need
+		 * to wait for IO completion we need to take an extra
+		 * reference so the buffer is still valid on the other
+		 * side. We need to move the buffer onto the io_list
+		 * at this point so the caller can still access it.
 		 */
-		if (wait)
+		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_ASYNC | XBF_WRITE_FAIL);
+		bp->b_flags |= XBF_WRITE | XBF_ASYNC;
+		if (wait_list) {
 			xfs_buf_hold(bp);
-		else
+			list_move_tail(&bp->b_list, wait_list);
+		} else
 			list_del_init(&bp->b_list);
 
 		xfs_buf_submit(bp);
@@ -1972,8 +1997,7 @@ int
 xfs_buf_delwri_submit_nowait(
 	struct list_head	*buffer_list)
 {
-	LIST_HEAD		(io_list);
-	return __xfs_buf_delwri_submit(buffer_list, &io_list, false);
+	return xfs_buf_delwri_submit_buffers(buffer_list, NULL);
 }
 
 /*
@@ -1988,15 +2012,15 @@ int
 xfs_buf_delwri_submit(
 	struct list_head	*buffer_list)
 {
-	LIST_HEAD		(io_list);
+	LIST_HEAD		(wait_list);
 	int			error = 0, error2;
 	struct xfs_buf		*bp;
 
-	__xfs_buf_delwri_submit(buffer_list, &io_list, true);
+	xfs_buf_delwri_submit_buffers(buffer_list, &wait_list);
 
 	/* Wait for IO to complete. */
-	while (!list_empty(&io_list)) {
-		bp = list_first_entry(&io_list, struct xfs_buf, b_list);
+	while (!list_empty(&wait_list)) {
+		bp = list_first_entry(&wait_list, struct xfs_buf, b_list);
 
 		list_del_init(&bp->b_list);
 

@@ -56,7 +56,7 @@ void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte)
 {
 	pgtable_page_dtor(pte);
 	paravirt_release_pte(page_to_pfn(pte));
-	tlb_remove_page(tlb, pte);
+	tlb_remove_table(tlb, pte);
 }
 
 #if PAGETABLE_LEVELS > 2
@@ -72,14 +72,14 @@ void ___pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmd)
 	tlb->need_flush_all = 1;
 #endif
 	pgtable_pmd_page_dtor(page);
-	tlb_remove_page(tlb, page);
+	tlb_remove_table(tlb, page);
 }
 
 #if PAGETABLE_LEVELS > 3
 void ___pud_free_tlb(struct mmu_gather *tlb, pud_t *pud)
 {
 	paravirt_release_pud(__pa(pud) >> PAGE_SHIFT);
-	tlb_remove_page(tlb, virt_to_page(pud));
+	tlb_remove_table(tlb, virt_to_page(pud));
 }
 #endif	/* PAGETABLE_LEVELS > 3 */
 #endif	/* PAGETABLE_LEVELS > 2 */
@@ -274,12 +274,23 @@ static void pgd_prepopulate_pmd(struct mm_struct *mm, pgd_t *pgd, pmd_t *pmds[])
 	}
 }
 
+#ifdef CONFIG_KAISER
+/*
+ * Instead of one pgd, we aquire two pgds.  Being order-1, it is
+ * both 8k in size and 8k-aligned.  That lets us just flip bit 12
+ * in a pointer to swap between the two 4k halves.
+ */
+#define PGD_ALLOCATION_ORDER 1
+#else
+#define PGD_ALLOCATION_ORDER 0
+#endif
+
 pgd_t *pgd_alloc(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 	pmd_t *pmds[PREALLOCATED_PMDS];
 
-	pgd = (pgd_t *)__get_free_page(PGALLOC_GFP);
+	pgd = (pgd_t *)__get_free_pages(PGALLOC_GFP, PGD_ALLOCATION_ORDER);
 
 	if (pgd == NULL)
 		goto out;
@@ -309,7 +320,7 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
 out_free_pmds:
 	free_pmds(pmds);
 out_free_pgd:
-	free_page((unsigned long)pgd);
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
 out:
 	return NULL;
 }
@@ -319,7 +330,7 @@ void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 	pgd_mop_up_pmds(mm, pgd);
 	pgd_dtor(pgd);
 	paravirt_pgd_free(mm, pgd);
-	free_page((unsigned long)pgd);
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
 }
 
 /*
@@ -337,7 +348,7 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 
 	if (changed && dirty) {
 		*ptep = entry;
-		pte_update_defer(vma->vm_mm, address, ptep);
+		pte_update(vma->vm_mm, address, ptep);
 	}
 
 	return changed;
@@ -354,9 +365,28 @@ int pmdp_set_access_flags(struct vm_area_struct *vma,
 
 	if (changed && dirty) {
 		*pmdp = entry;
-		pmd_update_defer(vma->vm_mm, address, pmdp);
 		/*
 		 * We had a write-protection fault here and changed the pmd
+		 * to to more permissive. No need to flush the TLB for that,
+		 * #PF is architecturally guaranteed to do that and in the
+		 * worst-case we'll generate a spurious fault.
+		 */
+	}
+
+	return changed;
+}
+
+int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
+			  pud_t *pudp, pud_t entry, int dirty)
+{
+	int changed = !pud_same(*pudp, entry);
+
+	VM_BUG_ON(address & ~HPAGE_PUD_MASK);
+
+	if (changed && dirty) {
+		*pudp = entry;
+		/*
+		 * We had a write-protection fault here and changed the pud
 		 * to to more permissive. No need to flush the TLB for that,
 		 * #PF is architecturally guaranteed to do that and in the
 		 * worst-case we'll generate a spurious fault.
@@ -392,8 +422,17 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
 					 (unsigned long *)pmdp);
 
-	if (ret)
-		pmd_update(vma->vm_mm, addr, pmdp);
+	return ret;
+}
+
+int pudp_test_and_clear_young(struct vm_area_struct *vma,
+			      unsigned long addr, pud_t *pudp)
+{
+	int ret = 0;
+
+	if (pud_young(*pudp))
+		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+					 (unsigned long *)pudp);
 
 	return ret;
 }
@@ -434,10 +473,37 @@ void pmdp_splitting_flush(struct vm_area_struct *vma,
 	set = !test_and_set_bit(_PAGE_BIT_SPLITTING,
 				(unsigned long *)pmdp);
 	if (set) {
-		pmd_update(vma->vm_mm, address, pmdp);
 		/* need tlb flush only to serialize against gup-fast */
 		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
 	}
+}
+
+static void do_nothing(void *unused)
+{
+
+}
+
+static void serialize_against_pte_lookup(struct mm_struct *mm)
+{
+	smp_mb();
+	smp_call_function_many(mm_cpumask(mm), do_nothing, NULL, 1);
+}
+
+void pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
+		     pmd_t *pmdp)
+{
+	pmd_t entry = *pmdp;
+	if (pmd_numa(entry))
+		entry = pmd_mknonnuma(entry);
+	set_pmd_at(vma->vm_mm, address, pmdp, pmd_mknotpresent(entry));
+	flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+
+	/*
+	 * Serialization requirements for RHEL differ from upstream, make sure
+	 * we deliver IPIs on huge page split.
+	 */
+	if (pv_mmu_ops.flush_tlb_others != native_flush_tlb_others)
+		serialize_against_pte_lookup(vma->vm_mm);
 }
 #endif
 

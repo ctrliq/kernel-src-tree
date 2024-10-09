@@ -2194,7 +2194,7 @@ static const struct net_device_ops ipg_netdev_ops = {
 	.ndo_set_rx_mode	= ipg_nic_set_multicast_list,
 	.ndo_do_ioctl		= ipg_ioctl,
 	.ndo_tx_timeout 	= ipg_tx_timeout,
-	.ndo_change_mtu 	= ipg_nic_change_mtu,
+	.ndo_change_mtu_rh74	= ipg_nic_change_mtu,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 };

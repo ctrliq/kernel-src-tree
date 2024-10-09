@@ -563,7 +563,7 @@ static const struct net_device_ops lec_netdev_ops = {
 	.ndo_open		= lec_open,
 	.ndo_stop		= lec_close,
 	.ndo_start_xmit		= lec_start_xmit,
-	.ndo_change_mtu		= lec_change_mtu,
+	.ndo_change_mtu_rh74	= lec_change_mtu,
 	.ndo_tx_timeout		= lec_tx_timeout,
 	.ndo_set_rx_mode	= lec_set_multicast_list,
 };

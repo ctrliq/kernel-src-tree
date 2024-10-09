@@ -1,7 +1,8 @@
 #include "util.h"
-#include "string.h"
+#include "string2.h"
 #include "strfilter.h"
 
+#include <errno.h>
 #include "sane_ctype.h"
 
 /* Operators */

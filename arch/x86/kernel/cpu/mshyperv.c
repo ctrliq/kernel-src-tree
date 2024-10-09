@@ -51,6 +51,9 @@ void hyperv_vector_handler(struct pt_regs *regs)
 	if (vmbus_handler)
 		vmbus_handler();
 
+	if (ms_hyperv.hints & HV_X64_DEPRECATING_AEOI_RECOMMENDED)
+		ack_APIC_irq();
+
 	irq_exit();
 	set_irq_regs(old_regs);
 }
@@ -134,29 +137,6 @@ static uint32_t  __init ms_hyperv_platform(void)
 	return 0;
 }
 
-static cycle_t read_hv_clock(struct clocksource *arg)
-{
-	cycle_t current_tick;
-	/*
-	 * Read the partition counter to get the current tick count. This count
-	 * is set to 0 when the partition is created and is incremented in
-	 * 100 nanosecond units.
-	 */
-	rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
-	return current_tick;
-}
-
-static struct clocksource hyperv_cs_msr = {
-	.name		= "hyperv_clocksource",
-	.rating		= 400, /* use this when running on Hyperv*/
-	.read		= read_hv_clock,
-	.mask		= CLOCKSOURCE_MASK(64),
-	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
-};
-
-struct clocksource *hyperv_cs;
-EXPORT_SYMBOL_GPL(hyperv_cs);
-
 static unsigned char hv_get_nmi_reason(void)
 {
 	return 0;
@@ -193,6 +173,11 @@ static unsigned long hv_get_tsc_khz(void)
 
 static void __init ms_hyperv_init_platform(void)
 {
+	int hv_host_info_eax;
+	int hv_host_info_ebx;
+	int hv_host_info_ecx;
+	int hv_host_info_edx;
+
 	/*
 	 * Extract the features and hints
 	 */
@@ -203,6 +188,21 @@ static void __init ms_hyperv_init_platform(void)
 	printk(KERN_INFO "HyperV: features 0x%x, hints 0x%x\n",
 	       ms_hyperv.features, ms_hyperv.hints);
 
+	/*
+	 * Extract host information.
+	 */
+	if (cpuid_eax(HVCPUID_VENDOR_MAXFUNCTION) >= HVCPUID_VERSION) {
+		hv_host_info_eax = cpuid_eax(HVCPUID_VERSION);
+		hv_host_info_ebx = cpuid_ebx(HVCPUID_VERSION);
+		hv_host_info_ecx = cpuid_ecx(HVCPUID_VERSION);
+		hv_host_info_edx = cpuid_edx(HVCPUID_VERSION);
+
+		pr_info("Hyper-V Host Build:%d-%d.%d-%d-%d.%d\n",
+			hv_host_info_eax, hv_host_info_ebx >> 16,
+			hv_host_info_ebx & 0xFFFF, hv_host_info_ecx,
+			hv_host_info_edx >> 24, hv_host_info_edx & 0xFFFFFF);
+	}
+
 	if (ms_hyperv.features & HV_X64_ACCESS_FREQUENCY_MSRS &&
 	    ms_hyperv.misc_features & HV_FEATURE_FREQUENCY_MSRS_AVAILABLE) {
 		x86_platform.calibrate_tsc = hv_get_tsc_khz;
@@ -210,7 +210,8 @@ static void __init ms_hyperv_init_platform(void)
 	}
 
 #ifdef CONFIG_X86_LOCAL_APIC
-	if (ms_hyperv.features & HV_X64_MSR_APIC_FREQUENCY_AVAILABLE) {
+	if (ms_hyperv.features & HV_X64_ACCESS_FREQUENCY_MSRS &&
+	    ms_hyperv.misc_features & HV_FEATURE_FREQUENCY_MSRS_AVAILABLE) {
 		/*
 		 * Get the APIC frequency.
 		 */
@@ -226,11 +227,6 @@ static void __init ms_hyperv_init_platform(void)
 	register_nmi_handler(NMI_UNKNOWN, hv_nmi_unknown, NMI_FLAG_FIRST,
 			     "hv_nmi_unknown");
 #endif
-
-	if (ms_hyperv.features & HV_X64_MSR_TIME_REF_COUNT_AVAILABLE) {
-		clocksource_register_hz(&hyperv_cs_msr, NSEC_PER_SEC/100);
-		hyperv_cs = &hyperv_cs_msr;
-	}
 
 #ifdef CONFIG_X86_IO_APIC
 	no_timer_check = 1;
@@ -252,6 +248,7 @@ static void __init ms_hyperv_init_platform(void)
 	 * Setup the hook to get control post apic initialization.
 	 */
 	x86_platform.apic_post_init = hyperv_init;
+	hyperv_setup_mmu_ops();
 #endif
 }
 

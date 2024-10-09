@@ -358,7 +358,7 @@ static const struct net_device_ops ntb_netdev_ops = {
 	.ndo_open = ntb_netdev_open,
 	.ndo_stop = ntb_netdev_close,
 	.ndo_start_xmit = ntb_netdev_start_xmit,
-	.ndo_change_mtu = ntb_netdev_change_mtu,
+	.ndo_change_mtu_rh74 = ntb_netdev_change_mtu,
 	.ndo_set_mac_address = eth_mac_addr,
 };
 

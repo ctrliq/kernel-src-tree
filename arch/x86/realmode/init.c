@@ -48,13 +48,6 @@ void __init setup_real_mode(void)
 
 	base = (unsigned char *)real_mode_header;
 
-	/*
-	 * If SME is active, the trampoline area will need to be in
-	 * decrypted memory in order to bring up other processors
-	 * successfully.
-	 */
-	set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
-
 	memcpy(base, real_mode_blob, size);
 
 	real_mode_seg = __pa(base) >> 4;
@@ -129,6 +122,16 @@ static int __init set_real_mode_permissions(void)
 
 	unsigned long text_start =
 		(unsigned long) __va(real_mode_header->text_start);
+
+	/*
+	 * If SME is active, the trampoline area will need to be in
+	 * decrypted memory in order to bring up other processors
+	 * successfully.
+	 */
+	if (sme_active()) {
+		sme_early_decrypt(__pa(base), size);
+		set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
+	}
 
 	set_memory_nx((unsigned long) base, size >> PAGE_SHIFT);
 	set_memory_ro((unsigned long) base, ro_size >> PAGE_SHIFT);

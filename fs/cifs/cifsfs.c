@@ -894,7 +894,7 @@ struct file_system_type cifs_fs_type = {
 	.name = "cifs",
 	.mount = cifs_do_mount,
 	.kill_sb = cifs_kill_sb,
-	/*  .fs_flags */
+	.fs_flags = FS_HAS_FO_EXTEND,
 };
 MODULE_ALIAS_FS("cifs");
 const struct inode_operations_wrapper cifs_dir_inode_ops = {
@@ -947,119 +947,280 @@ const struct inode_operations cifs_symlink_inode_ops = {
 #endif
 };
 
-const struct file_operations cifs_file_ops = {
-	.read = do_sync_read,
-	.write = do_sync_write,
-	.aio_read = cifs_loose_read,
-	.aio_write = cifs_file_aio_write,
-	.open = cifs_open,
-	.release = cifs_close,
-	.lock = cifs_lock,
-	.fsync = cifs_fsync,
-	.flush = cifs_flush,
-	.mmap  = cifs_file_mmap,
-	.splice_read = generic_file_splice_read,
-	.llseek = cifs_llseek,
-	.unlocked_ioctl	= cifs_ioctl,
-	.setlease = cifs_setlease,
-	.fallocate = cifs_fallocate,
+static int cifs_clone_file_range(struct file *src_file, loff_t off,
+		struct file *dst_file, loff_t destoff, u64 len)
+{
+	struct inode *src_inode = file_inode(src_file);
+	struct inode *target_inode = file_inode(dst_file);
+	struct cifsFileInfo *smb_file_src = src_file->private_data;
+	struct cifsFileInfo *smb_file_target = dst_file->private_data;
+	struct cifs_tcon *target_tcon = tlink_tcon(smb_file_target->tlink);
+	unsigned int xid;
+	int rc;
+
+	cifs_dbg(FYI, "clone range\n");
+
+	xid = get_xid();
+
+	if (!src_file->private_data || !dst_file->private_data) {
+		rc = -EBADF;
+		cifs_dbg(VFS, "missing cifsFileInfo on copy range src file\n");
+		goto out;
+	}
+
+	/*
+	 * Note: cifs case is easier than btrfs since server responsible for
+	 * checks for proper open modes and file type and if it wants
+	 * server could even support copy of range where source = target
+	 */
+	lock_two_nondirectories(target_inode, src_inode);
+
+	if (len == 0)
+		len = src_inode->i_size - off;
+
+	cifs_dbg(FYI, "about to flush pages\n");
+	/* should we flush first and last page first */
+	truncate_inode_pages_range(&target_inode->i_data, destoff,
+				   PAGE_CACHE_ALIGN(destoff + len)-1);
+
+	if (target_tcon->ses->server->ops->duplicate_extents)
+		rc = target_tcon->ses->server->ops->duplicate_extents(xid,
+			smb_file_src, smb_file_target, off, len, destoff);
+	else
+		rc = -EOPNOTSUPP;
+
+	/* force revalidate of size and timestamps of target file now
+	   that target is updated on the server */
+	CIFS_I(target_inode)->time = 0;
+	/* although unlocking in the reverse order from locking is not
+	   strictly necessary here it is a little cleaner to be consistent */
+	unlock_two_nondirectories(src_inode, target_inode);
+out:
+	free_xid(xid);
+	return rc;
+}
+
+ssize_t cifs_file_copychunk_range(unsigned int xid,
+				struct file *src_file, loff_t off,
+				struct file *dst_file, loff_t destoff,
+				size_t len, unsigned int flags)
+{
+	struct inode *src_inode = file_inode(src_file);
+	struct inode *target_inode = file_inode(dst_file);
+	struct cifsFileInfo *smb_file_src;
+	struct cifsFileInfo *smb_file_target;
+	struct cifs_tcon *src_tcon;
+	struct cifs_tcon *target_tcon;
+	ssize_t rc;
+
+	cifs_dbg(FYI, "copychunk range\n");
+
+	if (src_inode == target_inode) {
+		rc = -EINVAL;
+		goto out;
+	}
+
+	if (!src_file->private_data || !dst_file->private_data) {
+		rc = -EBADF;
+		cifs_dbg(VFS, "missing cifsFileInfo on copy range src file\n");
+		goto out;
+	}
+
+	rc = -EXDEV;
+	smb_file_target = dst_file->private_data;
+	smb_file_src = src_file->private_data;
+	src_tcon = tlink_tcon(smb_file_src->tlink);
+	target_tcon = tlink_tcon(smb_file_target->tlink);
+
+	if (src_tcon->ses != target_tcon->ses) {
+		cifs_dbg(VFS, "source and target of copy not on same server\n");
+		goto out;
+	}
+
+	/*
+	 * Note: cifs case is easier than btrfs since server responsible for
+	 * checks for proper open modes and file type and if it wants
+	 * server could even support copy of range where source = target
+	 */
+	lock_two_nondirectories(target_inode, src_inode);
+
+	cifs_dbg(FYI, "about to flush pages\n");
+	/* should we flush first and last page first */
+	truncate_inode_pages(&target_inode->i_data, 0);
+
+	if (target_tcon->ses->server->ops->copychunk_range)
+		rc = target_tcon->ses->server->ops->copychunk_range(xid,
+			smb_file_src, smb_file_target, off, len, destoff);
+	else
+		rc = -EOPNOTSUPP;
+
+	/* force revalidate of size and timestamps of target file now
+	 * that target is updated on the server
+	 */
+	CIFS_I(target_inode)->time = 0;
+	/* although unlocking in the reverse order from locking is not
+	 * strictly necessary here it is a little cleaner to be consistent
+	 */
+	unlock_two_nondirectories(src_inode, target_inode);
+
+out:
+	return rc;
+}
+
+static ssize_t cifs_copy_file_range(struct file *src_file, loff_t off,
+				struct file *dst_file, loff_t destoff,
+				size_t len, unsigned int flags)
+{
+	unsigned int xid = get_xid();
+	ssize_t rc;
+
+	rc = cifs_file_copychunk_range(xid, src_file, off, dst_file, destoff,
+					len, flags);
+	free_xid(xid);
+	return rc;
+}
+
+const struct file_operations_extend cifs_file_ops = {
+	.kabi_fops = {
+		.read = do_sync_read,
+		.write = do_sync_write,
+		.aio_read = cifs_loose_read,
+		.aio_write = cifs_file_aio_write,
+		.open = cifs_open,
+		.release = cifs_close,
+		.lock = cifs_lock,
+		.fsync = cifs_fsync,
+		.flush = cifs_flush,
+		.mmap  = cifs_file_mmap,
+		.splice_read = generic_file_splice_read,
+		.llseek = cifs_llseek,
+		.unlocked_ioctl	= cifs_ioctl,
+		.setlease = cifs_setlease,
+		.fallocate = cifs_fallocate,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
-const struct file_operations cifs_file_strict_ops = {
-	.read = do_sync_read,
-	.write = do_sync_write,
-	.aio_read = cifs_strict_readv,
-	.aio_write = cifs_strict_writev,
-	.open = cifs_open,
-	.release = cifs_close,
-	.lock = cifs_lock,
-	.fsync = cifs_strict_fsync,
-	.flush = cifs_flush,
-	.mmap = cifs_file_strict_mmap,
-	.splice_read = generic_file_splice_read,
-	.llseek = cifs_llseek,
-	.unlocked_ioctl	= cifs_ioctl,
-	.setlease = cifs_setlease,
-	.fallocate = cifs_fallocate,
+const struct file_operations_extend cifs_file_strict_ops = {
+	.kabi_fops = {
+		.read = do_sync_read,
+		.write = do_sync_write,
+		.aio_read = cifs_strict_readv,
+		.aio_write = cifs_strict_writev,
+		.open = cifs_open,
+		.release = cifs_close,
+		.lock = cifs_lock,
+		.fsync = cifs_strict_fsync,
+		.flush = cifs_flush,
+		.mmap = cifs_file_strict_mmap,
+		.splice_read = generic_file_splice_read,
+		.llseek = cifs_llseek,
+		.unlocked_ioctl	= cifs_ioctl,
+		.setlease = cifs_setlease,
+		.fallocate = cifs_fallocate,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
-const struct file_operations cifs_file_direct_ops = {
+const struct file_operations_extend cifs_file_direct_ops = {
 	/* BB reevaluate whether they can be done with directio, no cache */
-	.read = do_sync_read,
-	.write = do_sync_write,
-	.aio_read = cifs_user_readv_wrapper,
-	.aio_write = cifs_user_writev,
-	.open = cifs_open,
-	.release = cifs_close,
-	.lock = cifs_lock,
-	.fsync = cifs_fsync,
-	.flush = cifs_flush,
-	.mmap = cifs_file_mmap,
-	.splice_read = generic_file_splice_read,
-	.unlocked_ioctl  = cifs_ioctl,
-	.llseek = cifs_llseek,
-	.setlease = cifs_setlease,
-	.fallocate = cifs_fallocate,
+	.kabi_fops = {
+		.read = do_sync_read,
+		.write = do_sync_write,
+		.aio_read = cifs_user_readv_wrapper,
+		.aio_write = cifs_user_writev,
+		.open = cifs_open,
+		.release = cifs_close,
+		.lock = cifs_lock,
+		.fsync = cifs_fsync,
+		.flush = cifs_flush,
+		.mmap = cifs_file_mmap,
+		.splice_read = generic_file_splice_read,
+		.unlocked_ioctl  = cifs_ioctl,
+		.llseek = cifs_llseek,
+		.setlease = cifs_setlease,
+		.fallocate = cifs_fallocate,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
-const struct file_operations cifs_file_nobrl_ops = {
-	.read = do_sync_read,
-	.write = do_sync_write,
-	.aio_read = cifs_loose_read,
-	.aio_write = cifs_file_aio_write,
-	.open = cifs_open,
-	.release = cifs_close,
-	.fsync = cifs_fsync,
-	.flush = cifs_flush,
-	.mmap  = cifs_file_mmap,
-	.splice_read = generic_file_splice_read,
-	.llseek = cifs_llseek,
-	.unlocked_ioctl	= cifs_ioctl,
-	.setlease = cifs_setlease,
-	.fallocate = cifs_fallocate,
+const struct file_operations_extend cifs_file_nobrl_ops = {
+	.kabi_fops = {
+		.read = do_sync_read,
+		.write = do_sync_write,
+		.aio_read = cifs_loose_read,
+		.aio_write = cifs_file_aio_write,
+		.open = cifs_open,
+		.release = cifs_close,
+		.fsync = cifs_fsync,
+		.flush = cifs_flush,
+		.mmap  = cifs_file_mmap,
+		.splice_read = generic_file_splice_read,
+		.llseek = cifs_llseek,
+		.unlocked_ioctl	= cifs_ioctl,
+		.setlease = cifs_setlease,
+		.fallocate = cifs_fallocate,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
-const struct file_operations cifs_file_strict_nobrl_ops = {
-	.read = do_sync_read,
-	.write = do_sync_write,
-	.aio_read = cifs_strict_readv,
-	.aio_write = cifs_strict_writev,
-	.open = cifs_open,
-	.release = cifs_close,
-	.fsync = cifs_strict_fsync,
-	.flush = cifs_flush,
-	.mmap = cifs_file_strict_mmap,
-	.splice_read = generic_file_splice_read,
-	.llseek = cifs_llseek,
-	.unlocked_ioctl	= cifs_ioctl,
-	.setlease = cifs_setlease,
-	.fallocate = cifs_fallocate,
+const struct file_operations_extend cifs_file_strict_nobrl_ops = {
+	.kabi_fops = {
+		.read = do_sync_read,
+		.write = do_sync_write,
+		.aio_read = cifs_strict_readv,
+		.aio_write = cifs_strict_writev,
+		.open = cifs_open,
+		.release = cifs_close,
+		.fsync = cifs_strict_fsync,
+		.flush = cifs_flush,
+		.mmap = cifs_file_strict_mmap,
+		.splice_read = generic_file_splice_read,
+		.llseek = cifs_llseek,
+		.unlocked_ioctl	= cifs_ioctl,
+		.setlease = cifs_setlease,
+		.fallocate = cifs_fallocate,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
-const struct file_operations cifs_file_direct_nobrl_ops = {
+const struct file_operations_extend cifs_file_direct_nobrl_ops = {
 	/* BB reevaluate whether they can be done with directio, no cache */
-	.read = do_sync_read,
-	.write = do_sync_write,
-	.aio_read = cifs_user_readv_wrapper,
-	.aio_write = cifs_user_writev,
-	.open = cifs_open,
-	.release = cifs_close,
-	.fsync = cifs_fsync,
-	.flush = cifs_flush,
-	.mmap = cifs_file_mmap,
-	.splice_read = generic_file_splice_read,
-	.unlocked_ioctl  = cifs_ioctl,
-	.llseek = cifs_llseek,
-	.setlease = cifs_setlease,
-	.fallocate = cifs_fallocate,
+	.kabi_fops = {
+		.read = do_sync_read,
+		.write = do_sync_write,
+		.aio_read = cifs_user_readv_wrapper,
+		.aio_write = cifs_user_writev,
+		.open = cifs_open,
+		.release = cifs_close,
+		.fsync = cifs_fsync,
+		.flush = cifs_flush,
+		.mmap = cifs_file_mmap,
+		.splice_read = generic_file_splice_read,
+		.unlocked_ioctl  = cifs_ioctl,
+		.llseek = cifs_llseek,
+		.setlease = cifs_setlease,
+		.fallocate = cifs_fallocate,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
-const struct file_operations cifs_dir_ops = {
-	.readdir = cifs_readdir,
-	.release = cifs_closedir,
-	.read    = generic_read_dir,
-	.unlocked_ioctl  = cifs_ioctl,
-	.llseek = generic_file_llseek,
+const struct file_operations_extend cifs_dir_ops = {
+	.kabi_fops = {
+		.readdir = cifs_readdir,
+		.release = cifs_closedir,
+		.read    = generic_read_dir,
+		.unlocked_ioctl  = cifs_ioctl,
+		.llseek = generic_file_llseek,
+	},
+	.clone_file_range = cifs_clone_file_range,
+	.copy_file_range = cifs_copy_file_range,
 };
 
 static void
@@ -1366,6 +1527,8 @@ MODULE_SOFTDEP("pre: nls");
 MODULE_SOFTDEP("pre: aes");
 MODULE_SOFTDEP("pre: cmac");
 MODULE_SOFTDEP("pre: sha256");
+MODULE_SOFTDEP("pre: aead2");
+MODULE_SOFTDEP("pre: ccm");
 #endif /* CONFIG_CIFS_SMB2 */
 module_init(init_cifs)
 module_exit(exit_cifs)

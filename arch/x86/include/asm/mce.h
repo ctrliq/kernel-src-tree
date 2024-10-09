@@ -144,6 +144,7 @@ struct mca_config {
 	bool ignore_ce;
 	bool disabled;
 	bool ser;
+	bool recovery;
 	bool bios_cmci_threshold;
 	u8 banks;
 	s8 bootlog;
@@ -267,6 +268,7 @@ static inline int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *s
 #endif
 
 int mce_available(struct cpuinfo_x86 *c);
+bool mce_is_memory_error(struct mce *m);
 
 DECLARE_PER_CPU(unsigned, mce_exception_count);
 DECLARE_PER_CPU(unsigned, mce_poll_count);

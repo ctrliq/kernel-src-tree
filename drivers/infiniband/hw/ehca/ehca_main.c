@@ -482,7 +482,7 @@ static int ehca_init_device(struct ehca_shca *shca)
 	shca->ib_device.node_type           = RDMA_NODE_IB_CA;
 	shca->ib_device.phys_port_cnt       = shca->num_ports;
 	shca->ib_device.num_comp_vectors    = 1;
-	shca->ib_device.dma_device          = &shca->ofdev->dev;
+	shca->ib_device.dev.parent          = &shca->ofdev->dev;
 	shca->ib_device.query_device        = ehca_query_device;
 	shca->ib_device.query_port          = ehca_query_port;
 	shca->ib_device.query_gid           = ehca_query_gid;

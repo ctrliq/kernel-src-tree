@@ -67,7 +67,14 @@ void fsnotify_destroy_group(struct fsnotify_group *group)
 	fsnotify_group_stop_queueing(group);
 
 	/* Clear all marks for this group and queue them for destruction */
-	fsnotify_detach_group_marks(group);
+	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_ALL_TYPES);
+
+	/*
+	 * Some marks can still be pinned when waiting for response from
+	 * userspace. Wait for those now. fsnotify_prepare_user_wait() will
+	 * not succeed now so this wait is race-free.
+	 */
+	wait_event(group->notification_waitq, !atomic_read(&group->user_waits));
 
 	/*
 	 * Wait until all marks get really destroyed. We could actually destroy
@@ -126,6 +133,7 @@ struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
 	/* set to 0 when there a no external references to this group */
 	atomic_set(&group->refcnt, 1);
 	atomic_set(&group->num_marks, 0);
+	atomic_set(&group->user_waits, 0);
 
 	spin_lock_init(&group->notification_lock);
 	INIT_LIST_HEAD(&group->notification_list);

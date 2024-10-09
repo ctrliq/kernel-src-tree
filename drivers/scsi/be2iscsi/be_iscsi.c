@@ -1,20 +1,15 @@
-/**
- * Copyright (C) 2005 - 2016 Broadcom
- * All rights reserved.
+/*
+ * Copyright 2017 Broadcom. All Rights Reserved.
+ * The term "Broadcom" refers to Broadcom Limited and/or its subsidiaries.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.  The full GNU General
+ * as published by the Free Software Foundation. The full GNU General
  * Public License is included in this distribution in the file called COPYING.
- *
- * Written by: Jayamohan Kallickal (jayamohan.kallickal@broadcom.com)
  *
  * Contact Information:
  * linux-drivers@broadcom.com
  *
- * Emulex
- * 3333 Susan Street
- * Costa Mesa, CA 92626
  */
 
 #include <scsi/libiscsi.h>
@@ -67,6 +62,7 @@ struct iscsi_cls_session *beiscsi_session_create(struct iscsi_endpoint *ep,
 	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
 		    "BS_%d : In beiscsi_session_create\n");
 	if (cmds_max > beiscsi_ep->phba->params.wrbs_per_cxn) {
+		gmb();
 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
 			    "BS_%d : Cannot handle %d cmds."
 			    "Max cmds per session supported is %d. Using %d."

@@ -395,17 +395,14 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
 {
 	struct scsi_device *sdev;
 	struct device *parent;
-	struct scsi_target *starget;
 	struct list_head *this, *tmp;
 	unsigned long flags;
 
 	sdev = container_of(work, struct scsi_device, ew.work);
 
 	parent = sdev->sdev_gendev.parent;
-	starget = to_scsi_target(parent);
 
 	spin_lock_irqsave(sdev->host->host_lock, flags);
-	starget->reap_ref++;
 	list_del(&sdev->siblings);
 	list_del(&sdev->same_target_siblings);
 	list_del(&sdev->starved_entry);
@@ -424,8 +421,6 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
 	blk_put_queue(sdev->request_queue);
 	/* NULL queue means the device can't be used */
 	sdev->request_queue = NULL;
-
-	scsi_target_reap(scsi_target(sdev));
 
 	kfree(sdev->vpd_pg83);
 	kfree(sdev->vpd_pg80);
@@ -1201,6 +1196,13 @@ void __scsi_remove_device(struct scsi_device *sdev)
 		sdev->host->hostt->slave_destroy(sdev);
 	transport_destroy_device(dev);
 
+	/*
+	 * Paired with the kref_get() in scsi_sysfs_initialize().  We have
+	 * remoed sysfs visibility from the device, so make the target
+	 * invisible if this was the last device underneath it.
+	 */
+	scsi_target_reap(scsi_target(sdev));
+
 	put_device(dev);
 }
 
@@ -1267,11 +1269,15 @@ restart:
 	spin_lock_irqsave(shost->host_lock, flags);
 	list_for_each_entry(starget, &shost->__targets, siblings) {
 		if (starget->state == STARGET_DEL ||
-		    starget->state == STARGET_REMOVE)
+		    starget->state == STARGET_REMOVE ||
+		    starget->state == STARGET_CREATED_REMOVE)
 			continue;
 		if (starget->dev.parent == dev || &starget->dev == dev) {
-			starget->reap_ref++;
-			starget->state = STARGET_REMOVE;
+			kref_get(&starget->reap_ref);
+			if (starget->state == STARGET_CREATED)
+				starget->state = STARGET_CREATED_REMOVE;
+			else
+				starget->state = STARGET_REMOVE;
 			spin_unlock_irqrestore(shost->host_lock, flags);
 			__scsi_remove_target(starget);
 			scsi_target_reap(starget);
@@ -1362,6 +1368,12 @@ void scsi_sysfs_device_initialize(struct scsi_device *sdev)
 	list_add_tail(&sdev->same_target_siblings, &starget->devices);
 	list_add_tail(&sdev->siblings, &shost->__devices);
 	spin_unlock_irqrestore(shost->host_lock, flags);
+	/*
+	 * device can now only be removed via __scsi_remove_device() so hold
+	 * the target.  Target will be held in CREATED state until something
+	 * beneath it becomes visible (in which case it moves to RUNNING)
+	 */
+	kref_get(&starget->reap_ref);
 }
 
 int scsi_is_sdev_device(const struct device *dev)

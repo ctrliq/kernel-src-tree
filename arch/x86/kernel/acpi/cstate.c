@@ -164,7 +164,8 @@ EXPORT_SYMBOL_GPL(acpi_processor_ffh_cstate_enter);
 static int __init ffh_cstate_init(void)
 {
 	struct cpuinfo_x86 *c = &boot_cpu_data;
-	if (c->x86_vendor != X86_VENDOR_INTEL)
+	if (c->x86_vendor != X86_VENDOR_INTEL &&
+	    c->x86_vendor != X86_VENDOR_AMD)
 		return -1;
 
 	cpu_cstate_entry = alloc_percpu(struct cstate_entry);

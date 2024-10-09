@@ -14,6 +14,7 @@
  */
 
 #include <linux/netdevice.h>
+#include <linux/notifier.h>
 #include <linux/export.h>
 
 #include <net/fib_rules.h>
@@ -41,13 +42,23 @@ static bool fib6_rule_matchall(const struct fib_rule *rule)
 bool fib6_rule_default(const struct fib_rule *rule)
 {
 	if (!fib6_rule_matchall(rule) || rule->action != FR_ACT_TO_TBL ||
-	    rule->l3mdev)
+	    0) /* rule->l3mdev - VRF is missing in RHEL */
 		return false;
 	if (rule->table != RT6_TABLE_LOCAL && rule->table != RT6_TABLE_MAIN)
 		return false;
 	return true;
 }
 EXPORT_SYMBOL_GPL(fib6_rule_default);
+
+int fib6_rules_dump(struct net *net, struct notifier_block *nb)
+{
+	return fib_rules_dump(net, nb, AF_INET6);
+}
+
+unsigned int fib6_rules_seq_read(struct net *net)
+{
+	return fib_rules_seq_read(net, AF_INET6);
+}
 
 struct dst_entry *fib6_rule_lookup(struct net *net, struct flowi6 *fl6,
 				   int flags, pol_lookup_t lookup)

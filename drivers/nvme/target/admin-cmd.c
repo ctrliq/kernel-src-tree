@@ -339,7 +339,7 @@ out:
 
 static void nvmet_execute_identify_nslist(struct nvmet_req *req)
 {
-	static const int buf_size = 4096;
+	static const int buf_size = NVME_IDENTIFY_DATA_SIZE;
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	struct nvmet_ns *ns;
 	u32 min_nsid = le32_to_cpu(req->cmd->identify.nsid);
@@ -541,22 +541,16 @@ static void nvmet_execute_keep_alive(struct nvmet_req *req)
 	nvmet_req_complete(req, 0);
 }
 
-int nvmet_parse_admin_cmd(struct nvmet_req *req)
+u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 {
 	struct nvme_command *cmd = req->cmd;
+	u16 ret;
 
 	req->ns = NULL;
 
-	if (unlikely(!(req->sq->ctrl->cc & NVME_CC_ENABLE))) {
-		pr_err("nvmet: got admin cmd %d while CC.EN == 0\n",
-				cmd->common.opcode);
-		return NVME_SC_CMD_SEQ_ERROR | NVME_SC_DNR;
-	}
-	if (unlikely(!(req->sq->ctrl->csts & NVME_CSTS_RDY))) {
-		pr_err("nvmet: got admin cmd %d while CSTS.RDY == 0\n",
-				cmd->common.opcode);
-		return NVME_SC_CMD_SEQ_ERROR | NVME_SC_DNR;
-	}
+	ret = nvmet_check_ctrl_status(req, cmd);
+	if (unlikely(ret))
+		return ret;
 
 	switch (cmd->common.opcode) {
 	case nvme_admin_get_log_page:
@@ -571,8 +565,8 @@ int nvmet_parse_admin_cmd(struct nvmet_req *req)
 		}
 		break;
 	case nvme_admin_identify:
-		req->data_len = 4096;
-		switch (le32_to_cpu(cmd->identify.cns)) {
+		req->data_len = NVME_IDENTIFY_DATA_SIZE;
+		switch (cmd->identify.cns) {
 		case NVME_ID_CNS_NS:
 			req->execute = nvmet_execute_identify_ns;
 			return 0;
@@ -609,6 +603,7 @@ int nvmet_parse_admin_cmd(struct nvmet_req *req)
 		return 0;
 	}
 
-	pr_err("nvmet: unhandled cmd %d\n", cmd->common.opcode);
+	pr_err("unhandled cmd %d on qid %d\n", cmd->common.opcode,
+	       req->sq->qid);
 	return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
 }

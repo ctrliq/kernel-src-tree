@@ -117,6 +117,7 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
 	arg.src = src;
 	arg.dst = dst;
 
+	read_lock(&lowpan_frags.lock);
 	hash = lowpan_hash_frag(cb->d_tag, cb->d_size, src, dst);
 
 	q = inet_frag_find(&ieee802154_lowpan->frags,
@@ -479,12 +480,10 @@ static struct ctl_table lowpan_frags_ns_ctl_table[] = {
 	{ }
 };
 
-/* secret interval has been deprecated */
-static int lowpan_frags_secret_interval_unused;
 static struct ctl_table lowpan_frags_ctl_table[] = {
 	{
 		.procname	= "6lowpanfrag_secret_interval",
-		.data		= &lowpan_frags_secret_interval_unused,
+		.data		= &lowpan_frags.secret_interval,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
@@ -586,7 +585,7 @@ static int __net_init lowpan_frags_init_net(struct net *net)
 	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
 	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
 	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
-
+	lowpan_frags.secret_interval = 10 * 60 * HZ;
 	inet_frags_init_net(&ieee802154_lowpan->frags);
 
 	return lowpan_frags_ns_sysctl_register(net);

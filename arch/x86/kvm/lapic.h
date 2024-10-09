@@ -12,14 +12,19 @@
 #define KVM_APIC_SHORT_MASK	0xc0000
 #define KVM_APIC_DEST_MASK	0x800
 
+#define APIC_BUS_CYCLE_NS       1
+#define APIC_BUS_FREQUENCY      (1000000000ULL / APIC_BUS_CYCLE_NS)
+
 struct kvm_timer {
 	struct hrtimer timer;
 	s64 period; 				/* unit: ns */
+	ktime_t target_expiration;
 	u32 timer_mode;
 	u32 timer_mode_mask;
 	u64 tscdeadline;
 	u64 expired_tscdeadline;
 	atomic_t pending;			/* accumulated triggered timers */
+	bool hv_timer_in_use;
 };
 
 struct kvm_lapic {
@@ -69,8 +74,8 @@ int kvm_lapic_reg_read(struct kvm_lapic *apic, u32 offset, int len,
 bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
 			   int short_hand, unsigned int dest, int dest_mode);
 
-void __kvm_apic_update_irr(u32 *pir, void *regs);
-void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir);
+int __kvm_apic_update_irr(u32 *pir, void *regs);
+int kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir);
 void kvm_apic_update_ppr(struct kvm_vcpu *vcpu);
 int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
 		     struct dest_map *dest_map);
@@ -209,4 +214,9 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
 			struct kvm_vcpu **dest_vcpu);
 int kvm_vector_to_index(u32 vector, u32 dest_vcpus,
 			const unsigned long *bitmap, u32 bitmap_size);
+void kvm_lapic_switch_to_sw_timer(struct kvm_vcpu *vcpu);
+void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu);
+void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu);
+bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu);
+void kvm_lapic_restart_hv_timer(struct kvm_vcpu *vcpu);
 #endif

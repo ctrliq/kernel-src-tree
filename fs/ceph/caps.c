@@ -610,7 +610,7 @@ void ceph_add_cap(struct inode *inode,
 	}
 
 	if (flags & CEPH_CAP_FLAG_AUTH) {
-		if (ci->i_auth_cap == NULL ||
+		if (!ci->i_auth_cap ||
 		    ceph_seq_cmp(ci->i_auth_cap->mseq, mseq) < 0) {
 			ci->i_auth_cap = cap;
 			cap->mds_wanted = wanted;
@@ -727,7 +727,7 @@ static void __touch_cap(struct ceph_cap *cap)
 	struct ceph_mds_session *s = cap->session;
 
 	spin_lock(&s->s_cap_lock);
-	if (s->s_cap_iterator == NULL) {
+	if (!s->s_cap_iterator) {
 		dout("__touch_cap %p cap %p mds%d\n", &cap->ci->vfs_inode, cap,
 		     s->s_mds);
 		list_move_tail(&cap->session_caps, &s->s_caps);
@@ -1014,6 +1014,7 @@ static int send_cap_msg(struct cap_msg_args *arg)
 	void *p;
 	size_t extra_len;
 	struct timespec zerotime = {0};
+	struct ceph_osd_client *osdc = &arg->session->s_mdsc->fsc->client->osdc;
 
 	dout("send_cap_msg %s %llx %llx caps %s wanted %s dirty %s"
 	     " seq %u/%u tid %llu/%llu mseq %u follows %lld size %llu/%llu"
@@ -1075,8 +1076,12 @@ static int send_cap_msg(struct cap_msg_args *arg)
 	ceph_encode_64(&p, arg->inline_data ? 0 : CEPH_INLINE_NONE);
 	/* inline data size */
 	ceph_encode_32(&p, 0);
-	/* osd_epoch_barrier (version 5) */
-	ceph_encode_32(&p, 0);
+	/*
+	 * osd_epoch_barrier (version 5)
+	 * The epoch_barrier is protected osdc->lock, so READ_ONCE here in
+	 * case it was recently changed
+	 */
+	ceph_encode_32(&p, READ_ONCE(osdc->epoch_barrier));
 	/* oldest_flush_tid (version 6) */
 	ceph_encode_64(&p, arg->oldest_flush_tid);
 
@@ -1415,9 +1420,12 @@ void ceph_flush_snaps(struct ceph_inode_info *ci,
 {
 	struct inode *inode = &ci->vfs_inode;
 	struct ceph_mds_client *mdsc = ceph_inode_to_client(inode)->mdsc;
-	struct ceph_mds_session *session = *psession;
+	struct ceph_mds_session *session = NULL;
 	int mds;
+
 	dout("ceph_flush_snaps %p\n", inode);
+	if (psession)
+		session = *psession;
 retry:
 	spin_lock(&ci->i_ceph_lock);
 	if (!(ci->i_ceph_flags & CEPH_I_FLUSH_SNAPS)) {
@@ -1653,6 +1661,21 @@ static int try_nonblocking_invalidate(struct inode *inode)
 	return -1;
 }
 
+bool __ceph_should_report_size(struct ceph_inode_info *ci)
+{
+	loff_t size = ci->vfs_inode.i_size;
+	/* mds will adjust max size according to the reported size */
+	if (ci->i_flushing_caps & CEPH_CAP_FILE_WR)
+		return false;
+	if (size >= ci->i_max_size)
+		return true;
+	/* half of previous max_size increment has been used */
+	if (ci->i_max_size > ci->i_reported_size &&
+	    (size << 1) >= ci->i_max_size + ci->i_reported_size)
+		return true;
+	return false;
+}
+
 /*
  * Swiss army knife function to examine currently used and wanted
  * versus held caps.  Release, flush, ack revoked caps to mds as
@@ -1806,8 +1829,7 @@ retry_locked:
 			}
 
 			/* approaching file_max? */
-			if ((inode->i_size << 1) >= ci->i_max_size &&
-			    (ci->i_reported_size << 1) < ci->i_max_size) {
+			if (__ceph_should_report_size(ci)) {
 				dout("i_size approaching max_size\n");
 				goto ack;
 			}
@@ -2541,6 +2563,27 @@ static void check_max_size(struct inode *inode, loff_t endoff)
 	spin_unlock(&ci->i_ceph_lock);
 	if (check)
 		ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
+}
+
+int ceph_try_get_caps(struct ceph_inode_info *ci, int need, int want, int *got)
+{
+	int ret, err = 0;
+
+	BUG_ON(need & ~CEPH_CAP_FILE_RD);
+	BUG_ON(want & ~(CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO));
+	ret = ceph_pool_perm_check(ci, need);
+	if (ret < 0)
+		return ret;
+
+	ret = try_get_cap_refs(ci, need, want, 0, true, got, &err);
+	if (ret) {
+		if (err == -EAGAIN) {
+			ret = 0;
+		} else if (err < 0) {
+			ret = err;
+		}
+	}
+	return ret;
 }
 
 /*
@@ -3612,12 +3655,18 @@ void ceph_handle_caps(struct ceph_mds_session *session,
 		p += inline_len;
 	}
 
+	if (le16_to_cpu(msg->hdr.version) >= 5) {
+		struct ceph_osd_client	*osdc = &mdsc->fsc->client->osdc;
+		u32			epoch_barrier;
+
+		ceph_decode_32_safe(&p, end, epoch_barrier, bad);
+		ceph_osdc_update_epoch_barrier(osdc, epoch_barrier);
+	}
+
 	if (le16_to_cpu(msg->hdr.version) >= 8) {
 		u64 flush_tid;
 		u32 caller_uid, caller_gid;
-		u32 osd_epoch_barrier;
-		/* version >= 5 */
-		ceph_decode_32_safe(&p, end, osd_epoch_barrier, bad);
+
 		/* version >= 6 */
 		ceph_decode_64_safe(&p, end, flush_tid, bad);
 		/* version >= 7 */
@@ -3919,9 +3968,10 @@ int ceph_encode_inode_release(void **p, struct inode *inode,
 }
 
 int ceph_encode_dentry_release(void **p, struct dentry *dentry,
+			       struct inode *dir,
 			       int mds, int drop, int unless)
 {
-	struct inode *dir = dentry->d_parent->d_inode;
+	struct dentry *parent = NULL;
 	struct ceph_mds_request_release *rel = *p;
 	struct ceph_dentry_info *di = ceph_dentry(dentry);
 	int force = 0;
@@ -3936,9 +3986,14 @@ int ceph_encode_dentry_release(void **p, struct dentry *dentry,
 	spin_lock(&dentry->d_lock);
 	if (di->lease_session && di->lease_session->s_mds == mds)
 		force = 1;
+	if (!dir) {
+		parent = dget(dentry->d_parent);
+		dir = d_inode(parent);
+	}
 	spin_unlock(&dentry->d_lock);
 
 	ret = ceph_encode_inode_release(p, dir, mds, drop, unless, force);
+	dput(parent);
 
 	spin_lock(&dentry->d_lock);
 	if (ret && di->lease_session && di->lease_session->s_mds == mds) {

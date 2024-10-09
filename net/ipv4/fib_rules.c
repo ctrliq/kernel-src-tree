@@ -47,6 +47,36 @@ struct fib4_rule {
 #endif
 };
 
+static bool fib4_rule_matchall(const struct fib_rule *rule)
+{
+	struct fib4_rule *r = container_of(rule, struct fib4_rule, common);
+
+	if (r->dst_len || r->src_len || r->tos)
+		return false;
+	return fib_rule_matchall(rule);
+}
+
+bool fib4_rule_default(const struct fib_rule *rule)
+{
+	if (!fib4_rule_matchall(rule) || rule->action != FR_ACT_TO_TBL)
+		return false;
+	if (rule->table != RT_TABLE_LOCAL && rule->table != RT_TABLE_MAIN &&
+	    rule->table != RT_TABLE_DEFAULT)
+		return false;
+	return true;
+}
+EXPORT_SYMBOL_GPL(fib4_rule_default);
+
+int fib4_rules_dump(struct net *net, struct notifier_block *nb)
+{
+	return fib_rules_dump(net, nb, AF_INET);
+}
+
+unsigned int fib4_rules_seq_read(struct net *net)
+{
+	return fib_rules_seq_read(net, AF_INET);
+}
+
 int __fib_lookup(struct net *net, struct flowi4 *flp, struct fib_result *res)
 {
 	struct fib_lookup_arg arg = {
@@ -131,22 +161,6 @@ static struct fib_table *fib_empty_table(struct net *net)
 	return NULL;
 }
 
-static int call_fib_rule_notifiers(struct net *net,
-				   enum fib_event_type event_type)
-{
-	struct fib_notifier_info info;
-
-	return call_fib_notifiers(net, event_type, &info);
-}
-
-void fib_rules_notify(struct net *net, struct notifier_block *nb)
-{
-	struct fib_notifier_info info;
-
-	if (net->ipv4.fib_has_custom_rules)
-		call_fib_notifier(nb, net, FIB_EVENT_RULE_ADD, &info);
-}
-
 static const struct nla_policy fib4_rule_policy[FRA_MAX+1] = {
 	FRA_GENERIC_POLICY,
 	[FRA_FLOW]	= { .type = NLA_U32 },
@@ -161,6 +175,11 @@ static int fib4_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 	struct fib4_rule *rule4 = (struct fib4_rule *) rule;
 
 	if (frh->tos & ~IPTOS_TOS_MASK)
+		goto errout;
+
+	/* split local/main if they are not already split */
+	err = fib_unmerge(net);
+	if (err)
 		goto errout;
 
 	if (rule->table == RT_TABLE_UNSPEC) {
@@ -198,24 +217,29 @@ static int fib4_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 	rule4->tos = frh->tos;
 
 	net->ipv4.fib_has_custom_rules = true;
-	call_fib_rule_notifiers(net, FIB_EVENT_RULE_ADD);
 
 	err = 0;
 errout:
 	return err;
 }
 
-static void fib4_rule_delete(struct fib_rule *rule)
+static int fib4_rule_delete(struct fib_rule *rule)
 {
 	struct net *net = rule->fr_net;
-#ifdef CONFIG_IP_ROUTE_CLASSID
-	struct fib4_rule *rule4 = (struct fib4_rule *) rule;
+	int err;
 
-	if (rule4->tclassid)
+	/* split local/main if they are not already split */
+	err = fib_unmerge(net);
+	if (err)
+		goto errout;
+
+#ifdef CONFIG_IP_ROUTE_CLASSID
+	if (((struct fib4_rule *)rule)->tclassid)
 		net->ipv4.fib_num_tclassid_users--;
 #endif
 	net->ipv4.fib_has_custom_rules = true;
-	call_fib_rule_notifiers(net, FIB_EVENT_RULE_DEL);
+errout:
+	return err;
 }
 
 static int fib4_rule_compare(struct fib_rule *rule, struct fib_rule_hdr *frh,

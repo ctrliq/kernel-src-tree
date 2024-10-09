@@ -60,12 +60,12 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 
 	switch (priv->key) {
 	case NFT_CT_STATE:
-		if (ct == NULL)
-			state = NF_CT_STATE_INVALID_BIT;
-		else if (nf_ct_is_untracked(ct))
+		if (ct)
+			state = NF_CT_STATE_BIT(ctinfo);
+		else if (ctinfo == IP_CT_UNTRACKED)
 			state = NF_CT_STATE_UNTRACKED_BIT;
 		else
-			state = NF_CT_STATE_BIT(ctinfo);
+			state = NF_CT_STATE_INVALID_BIT;
 		*dest = state;
 		return;
 	default:
@@ -77,7 +77,7 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 
 	switch (priv->key) {
 	case NFT_CT_DIRECTION:
-		*dest = CTINFO2DIR(ctinfo);
+		nft_reg_store8(dest, CTINFO2DIR(ctinfo));
 		return;
 	case NFT_CT_STATUS:
 		*dest = ct->status;
@@ -135,7 +135,7 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 	tuple = &ct->tuplehash[priv->dir].tuple;
 	switch (priv->key) {
 	case NFT_CT_L3PROTOCOL:
-		*dest = nf_ct_l3num(ct);
+		nft_reg_store8(dest, nf_ct_l3num(ct));
 		return;
 	case NFT_CT_SRC:
 		memcpy(dest, tuple->src.u3.all,
@@ -146,13 +146,13 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 		       nf_ct_l3num(ct) == NFPROTO_IPV4 ? 4 : 16);
 		return;
 	case NFT_CT_PROTOCOL:
-		*dest = nf_ct_protonum(ct);
+		nft_reg_store8(dest, nf_ct_protonum(ct));
 		return;
 	case NFT_CT_PROTO_SRC:
-		*dest = (__force __u16)tuple->src.u.all;
+		nft_reg_store16(dest, (__force u16)tuple->src.u.all);
 		return;
 	case NFT_CT_PROTO_DST:
-		*dest = (__force __u16)tuple->dst.u.all;
+		nft_reg_store16(dest, (__force u16)tuple->dst.u.all);
 		return;
 	default:
 		break;

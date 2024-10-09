@@ -678,6 +678,60 @@ static struct cpuidle_state dnv_cstates[] = {
 		.enter = NULL }
 };
 
+static struct cpuidle_state bxt_cstates[] = {
+	{
+		.name = "C1-BXT",
+		.desc = "MWAIT 0x00",
+		.flags = MWAIT2flg(0x00),
+		.exit_latency = 2,
+		.target_residency = 2,
+		.enter = &intel_idle },
+	{
+		.name = "C1E-BXT",
+		.desc = "MWAIT 0x01",
+		.flags = MWAIT2flg(0x01),
+		.exit_latency = 10,
+		.target_residency = 20,
+		.enter = &intel_idle },
+	{
+		.name = "C6-BXT",
+		.desc = "MWAIT 0x20",
+		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 133,
+		.target_residency = 133,
+		.enter = &intel_idle },
+	{
+		.name = "C7s-BXT",
+		.desc = "MWAIT 0x31",
+		.flags = MWAIT2flg(0x31) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 155,
+		.target_residency = 155,
+		.enter = &intel_idle },
+	{
+		.name = "C8-BXT",
+		.desc = "MWAIT 0x40",
+		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 1000,
+		.target_residency = 1000,
+		.enter = &intel_idle },
+	{
+		.name = "C9-BXT",
+		.desc = "MWAIT 0x50",
+		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 2000,
+		.target_residency = 2000,
+		.enter = &intel_idle },
+	{
+		.name = "C10-BXT",
+		.desc = "MWAIT 0x60",
+		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.exit_latency = 10000,
+		.target_residency = 10000,
+		.enter = &intel_idle },
+	{
+		.enter = NULL }
+};
+
 /**
  * intel_idle
  * @dev: cpuidle_device
@@ -847,6 +901,11 @@ static const struct idle_cpu idle_cpu_dnv = {
 	.disable_promotion_to_c1e = true,
 };
 
+static const struct idle_cpu idle_cpu_bxt = {
+	.state_table = bxt_cstates,
+	.disable_promotion_to_c1e = true,
+};
+
 #define ICPU(model, cpu) \
 	{ X86_VENDOR_INTEL, 6, model, X86_FEATURE_MWAIT, (unsigned long)&cpu }
 
@@ -882,6 +941,8 @@ static const struct x86_cpu_id intel_idle_ids[] = {
 	ICPU(INTEL_FAM6_SKYLAKE_X,		idle_cpu_skx),
 	ICPU(INTEL_FAM6_XEON_PHI_KNL,		idle_cpu_knl),
 	ICPU(INTEL_FAM6_XEON_PHI_KNM,		idle_cpu_knl),
+	ICPU(INTEL_FAM6_ATOM_GOLDMONT,		idle_cpu_bxt),
+	ICPU(INTEL_FAM6_ATOM_GEMINI_LAKE,	idle_cpu_bxt),
 	ICPU(INTEL_FAM6_ATOM_DENVERTON,		idle_cpu_dnv),
 	{}
 };
@@ -972,6 +1033,73 @@ static void ivt_idle_state_table_update(void)
 
 	/* else, 1 and 2 socket systems use default ivt_cstates */
 }
+
+/*
+ * Translate IRTL (Interrupt Response Time Limit) MSR to usec
+ */
+
+static unsigned int irtl_ns_units[] = {
+	1, 32, 1024, 32768, 1048576, 33554432, 0, 0 };
+
+static unsigned long long irtl_2_usec(unsigned long long irtl)
+{
+	unsigned long long ns;
+
+	ns = irtl_ns_units[(irtl >> 10) & 0x3];
+
+	return div64_u64((irtl & 0x3FF) * ns, 1000);
+}
+/*
+ * bxt_idle_state_table_update(void)
+ *
+ * On BXT, we trust the IRTL to show the definitive maximum latency
+ * We use the same value for target_residency.
+ */
+static void bxt_idle_state_table_update(void)
+{
+	unsigned long long msr;
+
+	rdmsrl(MSR_PKGC6_IRTL, msr);
+	if (msr) {
+		unsigned int usec = irtl_2_usec(msr);
+
+		bxt_cstates[2].exit_latency = usec;
+		bxt_cstates[2].target_residency = usec;
+	}
+
+	rdmsrl(MSR_PKGC7_IRTL, msr);
+	if (msr) {
+		unsigned int usec = irtl_2_usec(msr);
+
+		bxt_cstates[3].exit_latency = usec;
+		bxt_cstates[3].target_residency = usec;
+	}
+
+	rdmsrl(MSR_PKGC8_IRTL, msr);
+	if (msr) {
+		unsigned int usec = irtl_2_usec(msr);
+
+		bxt_cstates[4].exit_latency = usec;
+		bxt_cstates[4].target_residency = usec;
+	}
+
+	rdmsrl(MSR_PKGC9_IRTL, msr);
+	if (msr) {
+		unsigned int usec = irtl_2_usec(msr);
+
+		bxt_cstates[5].exit_latency = usec;
+		bxt_cstates[5].target_residency = usec;
+	}
+
+	rdmsrl(MSR_PKGC10_IRTL, msr);
+	if (msr) {
+		unsigned int usec = irtl_2_usec(msr);
+
+		bxt_cstates[6].exit_latency = usec;
+		bxt_cstates[6].target_residency = usec;
+	}
+
+}
 /*
  * sklh_idle_state_table_update(void)
  *
@@ -1026,6 +1154,10 @@ static void intel_idle_state_table_update(void)
 
 	case INTEL_FAM6_IVYBRIDGE_X:
 		ivt_idle_state_table_update();
+		break;
+	case INTEL_FAM6_ATOM_GOLDMONT:
+	case INTEL_FAM6_ATOM_GEMINI_LAKE:
+		bxt_idle_state_table_update();
 		break;
 	case INTEL_FAM6_SKYLAKE_DESKTOP:
 		sklh_idle_state_table_update();

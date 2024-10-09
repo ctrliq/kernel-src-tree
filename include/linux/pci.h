@@ -76,12 +76,6 @@ enum pci_mmap_state {
 	pci_mmap_mem
 };
 
-/* This defines the direction arg to the DMA mapping routines. */
-#define PCI_DMA_BIDIRECTIONAL	0
-#define PCI_DMA_TODEVICE	1
-#define PCI_DMA_FROMDEVICE	2
-#define PCI_DMA_NONE		3
-
 /*
  *  For PCI devices, the region numbers are assigned this way:
  */
@@ -188,6 +182,8 @@ enum pci_dev_flags {
 	PCI_DEV_FLAGS_VPD_REF_F0 = (__force pci_dev_flags_t) (1 << 8),
 	/* Do not use FLR even if device advertises PCI_AF_CAP */
 	PCI_DEV_FLAGS_NO_FLR_RESET = (__force pci_dev_flags_t) (1 << 10),
+	/* Don't use Relaxed Ordering for TLPs directed at this device */
+	PCI_DEV_FLAGS_NO_RELAXED_ORDERING = (__force pci_dev_flags_t) (1 << 12),
 };
 
 enum pci_irq_reroute_variant {
@@ -253,6 +249,7 @@ struct pci_cap_saved_state {
 	struct pci_cap_saved_data cap;
 };
 
+struct irq_affinity;
 struct pcie_link_state;
 struct pci_vpd;
 struct pci_sriov;
@@ -369,6 +366,7 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int irq_managed:1)
 	RH_KABI_FILL_HOLE(unsigned int has_secondary_link:1)
 	RH_KABI_FILL_HOLE(unsigned int non_compliant_bars:1) /* broken BARs; ignore them */
+	RH_KABI_FILL_HOLE(unsigned int is_thunderbolt:1) /* Thunderbolt controller */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -1046,8 +1044,6 @@ void pci_intx(struct pci_dev *dev, int enable);
 bool pci_intx_mask_supported(struct pci_dev *dev);
 bool pci_check_and_mask_intx(struct pci_dev *dev);
 bool pci_check_and_unmask_intx(struct pci_dev *dev);
-int pci_set_dma_max_seg_size(struct pci_dev *dev, unsigned int size);
-int pci_set_dma_seg_boundary(struct pci_dev *dev, unsigned long mask);
 int pci_wait_for_pending(struct pci_dev *dev, int pos, u16 mask);
 int pci_wait_for_pending_transaction(struct pci_dev *dev);
 int pcix_get_max_mmrbc(struct pci_dev *dev);
@@ -1117,6 +1113,7 @@ bool pci_check_pme_status(struct pci_dev *dev);
 void pci_pme_wakeup_bus(struct pci_bus *bus);
 void pci_d3cold_enable(struct pci_dev *dev);
 void pci_d3cold_disable(struct pci_dev *dev);
+bool pcie_relaxed_ordering_enabled(struct pci_dev *dev);
 
 int pci_enable_wake(struct pci_dev *dev, pci_power_t state, bool enable);
 
@@ -1256,6 +1253,13 @@ resource_size_t pcibios_iov_resource_alignment(struct pci_dev *dev, int resno);
 
 int pci_set_vga_state(struct pci_dev *pdev, bool decode,
 		      unsigned int command_bits, u32 flags);
+#define PCI_IRQ_LEGACY		(1 << 0) /* allow legacy interrupts */
+#define PCI_IRQ_MSI		(1 << 1) /* allow MSI interrupts */
+#define PCI_IRQ_MSIX		(1 << 2) /* allow MSI-X interrupts */
+#define PCI_IRQ_AFFINITY	(1 << 3) /* auto-assign affinity */
+#define PCI_IRQ_ALL_TYPES \
+	(PCI_IRQ_LEGACY | PCI_IRQ_MSI | PCI_IRQ_MSIX)
+
 /* kmem_cache style wrapper around pci_alloc_consistent() */
 
 #include <linux/pci-dma.h>
@@ -1304,6 +1308,15 @@ static inline int pci_enable_msix_exact(struct pci_dev *dev,
 		return rc;
 	return 0;
 }
+int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
+				   unsigned int max_vecs, unsigned int flags,
+				   const struct irq_affinity *affd);
+
+void pci_free_irq_vectors(struct pci_dev *dev);
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr);
+const struct cpumask *pci_irq_get_affinity(struct pci_dev *pdev, int vec);
+int pci_irq_get_node(struct pci_dev *pdev, int vec);
+
 #else
 static inline int pci_msi_vec_count(struct pci_dev *dev) { return -ENOSYS; }
 static inline int pci_enable_msi_block(struct pci_dev *dev, int nvec)
@@ -1329,7 +1342,46 @@ static inline int pci_enable_msix_range(struct pci_dev *dev,
 static inline int pci_enable_msix_exact(struct pci_dev *dev,
 		      struct msix_entry *entries, int nvec)
 { return -ENOSYS; }
+
+static inline int
+pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
+			       unsigned int max_vecs, unsigned int flags,
+			       const struct irq_affinity *aff_desc)
+{
+	if ((flags & PCI_IRQ_LEGACY) && min_vecs == 1 && dev->irq)
+		return 1;
+	return -ENOSPC;
+}
+
+static inline void pci_free_irq_vectors(struct pci_dev *dev)
+{
+}
+
+static inline int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	if (WARN_ON_ONCE(nr > 0))
+		return -EINVAL;
+	return dev->irq;
+}
+static inline const struct cpumask *pci_irq_get_affinity(struct pci_dev *pdev,
+		int vec)
+{
+	return cpu_possible_mask;
+}
+
+static inline int pci_irq_get_node(struct pci_dev *pdev, int vec)
+{
+	return first_online_node;
+}
 #endif
+
+static inline int
+pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs,
+		      unsigned int max_vecs, unsigned int flags)
+{
+	return pci_alloc_irq_vectors_affinity(dev, min_vecs, max_vecs, flags,
+					      NULL);
+}
 
 #ifdef CONFIG_PCIEPORTBUS
 extern bool pcie_ports_disabled;
@@ -1496,16 +1548,6 @@ static inline struct pci_dev *pci_get_class(unsigned int class,
 static inline void pci_set_master(struct pci_dev *dev) { }
 static inline int pci_enable_device(struct pci_dev *dev) { return -EIO; }
 static inline void pci_disable_device(struct pci_dev *dev) { }
-static inline int pci_set_dma_mask(struct pci_dev *dev, u64 mask)
-{ return -EIO; }
-static inline int pci_set_consistent_dma_mask(struct pci_dev *dev, u64 mask)
-{ return -EIO; }
-static inline int pci_set_dma_max_seg_size(struct pci_dev *dev,
-					unsigned int size)
-{ return -EIO; }
-static inline int pci_set_dma_seg_boundary(struct pci_dev *dev,
-					unsigned long mask)
-{ return -EIO; }
 static inline int pci_assign_resource(struct pci_dev *dev, int i)
 { return -EBUSY; }
 static inline int __pci_register_driver(struct pci_driver *drv,
@@ -2044,4 +2086,30 @@ static inline bool pci_ari_enabled(struct pci_bus *bus)
 {
 	return bus->self && bus->self->ari_enabled;
 }
+
+/**
+ * pci_is_thunderbolt_attached - whether device is on a Thunderbolt daisy chain
+ * @pdev: PCI device to check
+ *
+ * Walk upwards from @pdev and check for each encountered bridge if it's part
+ * of a Thunderbolt controller.  Reaching the host bridge means @pdev is not
+ * Thunderbolt-attached.  (But rather soldered to the mainboard usually.)
+ */
+static inline bool pci_is_thunderbolt_attached(struct pci_dev *pdev)
+{
+	struct pci_dev *parent = pdev;
+
+	if (pdev->is_thunderbolt)
+		return true;
+
+	while ((parent = pci_upstream_bridge(parent)))
+		if (parent->is_thunderbolt)
+			return true;
+
+	return false;
+}
+
+/* provide the legacy pci_dma_* API */
+#include <linux/pci-dma-compat.h>
+
 #endif /* LINUX_PCI_H */

@@ -532,6 +532,59 @@ filelayout_write_pagelist(struct nfs_pgio_header *hdr, int sync)
 	return PNFS_ATTEMPTED;
 }
 
+static int
+filelayout_check_deviceid(struct pnfs_layout_hdr *lo,
+			  struct nfs4_filelayout_segment *fl,
+			  gfp_t gfp_flags)
+{
+	struct nfs4_deviceid_node *d;
+	struct nfs4_file_layout_dsaddr *dsaddr;
+	int status = -EINVAL;
+
+	/* Is the deviceid already set? If so, we're good. */
+	if (fl->dsaddr != NULL)
+		return 0;
+
+	/* find and reference the deviceid */
+	d = nfs4_find_get_deviceid(NFS_SERVER(lo->plh_inode), &fl->deviceid,
+			lo->plh_lc_cred, gfp_flags);
+	if (d == NULL)
+		goto out;
+
+	dsaddr = container_of(d, struct nfs4_file_layout_dsaddr, id_node);
+	/* Found deviceid is unavailable */
+	if (filelayout_test_devid_unavailable(&dsaddr->id_node))
+		goto out_put;
+
+	if (fl->first_stripe_index >= dsaddr->stripe_count) {
+		dprintk("%s Bad first_stripe_index %u\n",
+				__func__, fl->first_stripe_index);
+		goto out_put;
+	}
+
+	if ((fl->stripe_type == STRIPE_SPARSE &&
+	    fl->num_fh > 1 && fl->num_fh != dsaddr->ds_num) ||
+	    (fl->stripe_type == STRIPE_DENSE &&
+	    fl->num_fh != dsaddr->stripe_count)) {
+		dprintk("%s num_fh %u not valid for given packing\n",
+			__func__, fl->num_fh);
+		goto out_put;
+	}
+	status = 0;
+
+	/*
+	 * Atomic compare and xchange to ensure we don't scribble
+	 * over a non-NULL pointer.
+	 */
+	if (cmpxchg(&fl->dsaddr, NULL, dsaddr) != NULL)
+		goto out_put;
+out:
+	return status;
+out_put:
+	nfs4_fl_put_deviceid(dsaddr);
+	goto out;
+}
+
 /*
  * filelayout_check_layout()
  *
@@ -544,11 +597,8 @@ static int
 filelayout_check_layout(struct pnfs_layout_hdr *lo,
 			struct nfs4_filelayout_segment *fl,
 			struct nfs4_layoutget_res *lgr,
-			struct nfs4_deviceid *id,
 			gfp_t gfp_flags)
 {
-	struct nfs4_deviceid_node *d;
-	struct nfs4_file_layout_dsaddr *dsaddr;
 	int status = -EINVAL;
 
 	dprintk("--> %s\n", __func__);
@@ -573,41 +623,10 @@ filelayout_check_layout(struct pnfs_layout_hdr *lo,
 		goto out;
 	}
 
-	/* find and reference the deviceid */
-	d = nfs4_find_get_deviceid(NFS_SERVER(lo->plh_inode), id,
-			lo->plh_lc_cred, gfp_flags);
-	if (d == NULL)
-		goto out;
-
-	dsaddr = container_of(d, struct nfs4_file_layout_dsaddr, id_node);
-	/* Found deviceid is unavailable */
-	if (filelayout_test_devid_unavailable(&dsaddr->id_node))
-		goto out_put;
-
-	fl->dsaddr = dsaddr;
-
-	if (fl->first_stripe_index >= dsaddr->stripe_count) {
-		dprintk("%s Bad first_stripe_index %u\n",
-				__func__, fl->first_stripe_index);
-		goto out_put;
-	}
-
-	if ((fl->stripe_type == STRIPE_SPARSE &&
-	    fl->num_fh > 1 && fl->num_fh != dsaddr->ds_num) ||
-	    (fl->stripe_type == STRIPE_DENSE &&
-	    fl->num_fh != dsaddr->stripe_count)) {
-		dprintk("%s num_fh %u not valid for given packing\n",
-			__func__, fl->num_fh);
-		goto out_put;
-	}
-
 	status = 0;
 out:
 	dprintk("--> %s returns %d\n", __func__, status);
 	return status;
-out_put:
-	nfs4_fl_put_deviceid(dsaddr);
-	goto out;
 }
 
 static void _filelayout_free_lseg(struct nfs4_filelayout_segment *fl)
@@ -629,7 +648,6 @@ static int
 filelayout_decode_layout(struct pnfs_layout_hdr *flo,
 			 struct nfs4_filelayout_segment *fl,
 			 struct nfs4_layoutget_res *lgr,
-			 struct nfs4_deviceid *id,
 			 gfp_t gfp_flags)
 {
 	struct xdr_stream stream;
@@ -654,9 +672,9 @@ filelayout_decode_layout(struct pnfs_layout_hdr *flo,
 	if (unlikely(!p))
 		goto out_err;
 
-	memcpy(id, p, sizeof(*id));
+	memcpy(&fl->deviceid, p, sizeof(fl->deviceid));
 	p += XDR_QUADLEN(NFS4_DEVICEID4_SIZE);
-	nfs4_print_deviceid(id);
+	nfs4_print_deviceid(&fl->deviceid);
 
 	nfl_util = be32_to_cpup(p++);
 	if (nfl_util & NFL4_UFLG_COMMIT_THRU_MDS)
@@ -804,15 +822,14 @@ filelayout_alloc_lseg(struct pnfs_layout_hdr *layoutid,
 {
 	struct nfs4_filelayout_segment *fl;
 	int rc;
-	struct nfs4_deviceid id;
 
 	dprintk("--> %s\n", __func__);
 	fl = kzalloc(sizeof(*fl), gfp_flags);
 	if (!fl)
 		return NULL;
 
-	rc = filelayout_decode_layout(layoutid, fl, lgr, &id, gfp_flags);
-	if (rc != 0 || filelayout_check_layout(layoutid, fl, lgr, &id, gfp_flags)) {
+	rc = filelayout_decode_layout(layoutid, fl, lgr, gfp_flags);
+	if (rc != 0 || filelayout_check_layout(layoutid, fl, lgr, gfp_flags)) {
 		_filelayout_free_lseg(fl);
 		return NULL;
 	}
@@ -861,18 +878,52 @@ filelayout_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
 	return min(stripe_unit - (unsigned int)stripe_offset, size);
 }
 
+static struct pnfs_layout_segment *
+fl_pnfs_update_layout(struct inode *ino,
+		      struct nfs_open_context *ctx,
+		      loff_t pos,
+		      u64 count,
+		      enum pnfs_iomode iomode,
+		      bool strict_iomode,
+		      gfp_t gfp_flags)
+{
+	struct pnfs_layout_segment *lseg = NULL;
+	struct pnfs_layout_hdr *lo;
+	struct nfs4_filelayout_segment *fl;
+	int status;
+
+	lseg = pnfs_update_layout(ino, ctx, pos, count, iomode, strict_iomode,
+				  gfp_flags);
+	if (!lseg)
+		lseg = ERR_PTR(-ENOMEM);
+	if (IS_ERR(lseg))
+		goto out;
+
+	lo = NFS_I(ino)->layout;
+	fl = FILELAYOUT_LSEG(lseg);
+
+	status = filelayout_check_deviceid(lo, fl, gfp_flags);
+	if (status) {
+		pnfs_put_lseg(lseg);
+		lseg = ERR_PTR(status);
+	}
+out:
+	return lseg;
+}
+
 static void
 filelayout_pg_init_read(struct nfs_pageio_descriptor *pgio,
 			struct nfs_page *req)
 {
+	pnfs_generic_pg_check_layout(pgio);
 	if (!pgio->pg_lseg) {
-		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
-					   req->wb_context,
-					   0,
-					   NFS4_MAX_UINT64,
-					   IOMODE_READ,
-					   false,
-					   GFP_KERNEL);
+		pgio->pg_lseg = fl_pnfs_update_layout(pgio->pg_inode,
+						      req->wb_context,
+						      0,
+						      NFS4_MAX_UINT64,
+						      IOMODE_READ,
+						      false,
+						      GFP_KERNEL);
 		if (IS_ERR(pgio->pg_lseg)) {
 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
 			pgio->pg_lseg = NULL;
@@ -891,14 +942,15 @@ filelayout_pg_init_write(struct nfs_pageio_descriptor *pgio,
 	struct nfs_commit_info cinfo;
 	int status;
 
+	pnfs_generic_pg_check_layout(pgio);
 	if (!pgio->pg_lseg) {
-		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
-					   req->wb_context,
-					   0,
-					   NFS4_MAX_UINT64,
-					   IOMODE_RW,
-					   false,
-					   GFP_NOFS);
+		pgio->pg_lseg = fl_pnfs_update_layout(pgio->pg_inode,
+						      req->wb_context,
+						      0,
+						      NFS4_MAX_UINT64,
+						      IOMODE_RW,
+						      false,
+						      GFP_NOFS);
 		if (IS_ERR(pgio->pg_lseg)) {
 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
 			pgio->pg_lseg = NULL;

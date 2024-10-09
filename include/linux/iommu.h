@@ -30,6 +30,7 @@
 #define IOMMU_WRITE	(1 << 1)
 #define IOMMU_CACHE	(1 << 2) /* DMA cache coherency */
 #define IOMMU_EXEC	(1 << 3)
+#define IOMMU_MMIO	(1 << 4) /* e.g. things like MSI doorbells */
 
 struct iommu_ops;
 struct iommu_group;
@@ -78,6 +79,7 @@ struct iommu_domain_geometry {
 struct iommu_domain {
 	unsigned type;
 	struct iommu_ops *ops;
+	unsigned long pgsize_bitmap;	/* Bitmap of page sizes in use */
 	iommu_fault_handler_t handler;
 	void *handler_token;
 	struct iommu_domain_geometry geometry;
@@ -138,7 +140,7 @@ struct iommu_dm_region {
  * @domain_set_windows: Set the number of windows for a domain
  * @domain_get_windows: Return the number of windows for a domain
  * @of_xlate: add OF master IDs to iommu grouping
- * @pgsize_bitmap: bitmap of supported page sizes
+ * @pgsize_bitmap: bitmap of all possible supported page sizes
  */
 struct iommu_ops {
 	bool (*capable)(enum iommu_cap);

@@ -21,7 +21,7 @@
 /* Kernel only BMAP related definitions and functions */
 
 struct xfs_bmbt_irec;
-struct xfs_bmap_free_item;
+struct xfs_extent_free_item;
 struct xfs_ifork;
 struct xfs_inode;
 struct xfs_mount;
@@ -31,8 +31,6 @@ struct xfs_bmalloca;
 int	xfs_bmap_rtalloc(struct xfs_bmalloca *ap);
 int	xfs_bmap_eof(struct xfs_inode *ip, xfs_fileoff_t endoff,
 		     int whichfork, int *eof);
-int	xfs_bmap_count_blocks(struct xfs_trans *tp, struct xfs_inode *ip,
-			      int whichfork, int *count);
 int	xfs_bmap_punch_delalloc_range(struct xfs_inode *ip,
 		xfs_fileoff_t start_fsb, xfs_fileoff_t length);
 

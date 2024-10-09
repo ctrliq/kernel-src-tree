@@ -114,6 +114,9 @@ struct frag_hdr {
 #define	IP6_MF		0x0001
 #define	IP6_OFFSET	0xFFF8
 
+#define IP6_REPLY_MARK(net, mark) \
+	((net)->ipv6_sysctl_fwmark_reflect ? (mark) : 0)
+
 #include <net/sock.h>
 
 /* sysctls */
@@ -764,7 +767,7 @@ int ip6_rcv_finish(struct sock *sk, struct sk_buff *skb);
  *	upper-layer output functions
  */
 int ip6_xmit(struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
-	     struct ipv6_txoptions *opt, int tclass);
+	     __u32 mark, struct ipv6_txoptions *opt, int tclass);
 
 int ip6_find_1stfragopt(struct sk_buff *skb, u8 **nexthdr);
 

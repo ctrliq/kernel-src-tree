@@ -254,7 +254,9 @@ int ath9k_hw_loadnf(struct ath_hw *ah, struct ath9k_channel *chan)
 			if ((i >= AR5416_MAX_CHAINS) && !IS_CHAN_HT40(chan))
 				continue;
 
-			if (h)
+			if (ah->nf_override)
+				nfval = ah->nf_override;
+			else if (h)
 				nfval = h[i].privNF;
 			else
 				nfval = default_nf;
@@ -348,6 +350,7 @@ int ath9k_hw_loadnf(struct ath_hw *ah, struct ath9k_channel *chan)
 
 	return 0;
 }
+EXPORT_SYMBOL(ath9k_hw_loadnf);
 
 
 static void ath9k_hw_nf_sanitize(struct ath_hw *ah, s16 *nf)
@@ -370,11 +373,13 @@ static void ath9k_hw_nf_sanitize(struct ath_hw *ah, s16 *nf)
 			(i >= 3 ? "ext" : "ctl"), i % 3, nf[i]);
 
 		if (nf[i] > limit->max) {
+			gmb();
 			ath_dbg(common, CALIBRATE,
 				"NF[%d] (%d) > MAX (%d), correcting to MAX\n",
 				i, nf[i], limit->max);
 			nf[i] = limit->max;
 		} else if (nf[i] < limit->min) {
+			gmb();
 			ath_dbg(common, CALIBRATE,
 				"NF[%d] (%d) < MIN (%d), correcting to NOM\n",
 				i, nf[i], limit->min);

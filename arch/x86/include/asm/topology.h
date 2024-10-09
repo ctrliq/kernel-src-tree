@@ -131,6 +131,14 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
 
 extern unsigned int __max_logical_packages;
 #define topology_max_packages()			(__max_logical_packages)
+
+extern int __max_smt_threads;
+
+static inline int topology_max_smt_threads(void)
+{
+	return __max_smt_threads;
+}
+
 int topology_update_package_map(unsigned int apicid, unsigned int cpu);
 extern int topology_phys_to_logical_pkg(unsigned int pkg);
 #else
@@ -138,6 +146,7 @@ extern int topology_phys_to_logical_pkg(unsigned int pkg);
 static inline int
 topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
 static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
+static inline int topology_max_smt_threads(void) { return 1; }
 #endif
 
 static inline void arch_fix_phys_package_id(int num, u32 slot)
@@ -148,10 +157,41 @@ struct pci_bus;
 int x86_pci_root_bus_node(int bus);
 void x86_pci_root_bus_resources(int bus, struct list_head *resources);
 
+#ifdef CONFIG_SCHED_MC_PRIO
+#include <asm/percpu.h>
+
+DECLARE_PER_CPU_READ_MOSTLY(int, sched_core_priority);
+extern unsigned int __read_mostly sysctl_sched_itmt_enabled;
+
+/* Interface to set priority of a cpu */
+void sched_set_itmt_core_prio(int prio, int core_cpu);
+
+/* Interface to notify scheduler that system supports ITMT */
+int sched_set_itmt_support(void);
+
+/* Interface to notify scheduler that system revokes ITMT support */
+void sched_clear_itmt_support(void);
+
+#else /* CONFIG_SCHED_MC_PRIO */
+
+#define sysctl_sched_itmt_enabled	0
+static inline void sched_set_itmt_core_prio(int prio, int core_cpu)
+{
+}
+static inline int sched_set_itmt_support(void)
+{
+	return 0;
+}
+static inline void sched_clear_itmt_support(void)
+{
+}
+#endif /* CONFIG_SCHED_MC_PRIO */
+
 #ifdef CONFIG_SMP
 #define mc_capable()	((boot_cpu_data.x86_max_cores > 1) && \
 			(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids))
 #define smt_capable()			(smp_num_siblings > 1)
 #endif
 
+extern bool x86_topology_update;
 #endif /* _ASM_X86_TOPOLOGY_H */

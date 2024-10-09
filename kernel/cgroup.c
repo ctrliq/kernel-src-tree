@@ -1100,6 +1100,8 @@ static int cgroup_show_options(struct seq_file *seq, struct dentry *dentry)
 		seq_puts(seq, ",noprefix");
 	if (root->flags & CGRP_ROOT_XATTR)
 		seq_puts(seq, ",xattr");
+	if (root->flags & CGRP_ROOT_CPUSET_V2_MODE)
+		seq_puts(seq, ",cpuset_v2_mode");
 	if (strlen(root->release_agent_path))
 		seq_show_option(seq, "release_agent",
 				root->release_agent_path);
@@ -1171,6 +1173,10 @@ static int parse_cgroupfs_options(char *data, struct cgroup_sb_opts *opts)
 		}
 		if (!strcmp(token, "clone_children")) {
 			opts->cpuset_clone_children = true;
+			continue;
+		}
+		if (!strcmp(token, "cpuset_v2_mode")) {
+			opts->flags |= CGRP_ROOT_CPUSET_V2_MODE;
 			continue;
 		}
 		if (!strcmp(token, "xattr")) {
@@ -1782,8 +1788,6 @@ static struct file_system_type cgroup_fs_type = {
 	.mount = cgroup_mount,
 	.kill_sb = cgroup_kill_sb,
 };
-
-static struct kobject *cgroup_kobj;
 
 /**
  * cgroup_path - generate the path of a cgroup
@@ -4681,15 +4685,13 @@ int __init cgroup_init(void)
 	hash_add(css_set_table, &init_css_set.hlist, key);
 	BUG_ON(!init_root_id(&rootnode));
 
-	cgroup_kobj = kobject_create_and_add("cgroup", fs_kobj);
-	if (!cgroup_kobj) {
-		err = -ENOMEM;
+	err = sysfs_create_mount_point(fs_kobj, "cgroup");
+	if (err)
 		goto out;
-	}
 
 	err = register_filesystem(&cgroup_fs_type);
 	if (err < 0) {
-		kobject_put(cgroup_kobj);
+		sysfs_remove_mount_point(fs_kobj, "cgroup");
 		goto out;
 	}
 

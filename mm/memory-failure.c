@@ -1339,11 +1339,14 @@ void memory_failure_queue(unsigned long pfn, int trapno, int flags)
 
 	mf_cpu = &get_cpu_var(memory_failure_cpu);
 	spin_lock_irqsave(&mf_cpu->lock, proc_flags);
-	if (kfifo_put(&mf_cpu->fifo, &entry))
+	if (kfifo_put(&mf_cpu->fifo, &entry)) {
+		gmb();
 		schedule_work_on(smp_processor_id(), &mf_cpu->work);
-	else
+	} else {
+		gmb();
 		pr_err("Memory failure: buffer overflow when queuing memory failure at 0x%#lx\n",
 		       pfn);
+	}
 	spin_unlock_irqrestore(&mf_cpu->lock, proc_flags);
 	put_cpu_var(memory_failure_cpu);
 }
@@ -1356,7 +1359,7 @@ static void memory_failure_work_func(struct work_struct *work)
 	unsigned long proc_flags;
 	int gotten;
 
-	mf_cpu = &__get_cpu_var(memory_failure_cpu);
+	mf_cpu = this_cpu_ptr(&memory_failure_cpu);
 	for (;;) {
 		spin_lock_irqsave(&mf_cpu->lock, proc_flags);
 		gotten = kfifo_get(&mf_cpu->fifo, &entry);

@@ -648,7 +648,6 @@ static void mvs_pci_remove(struct pci_dev *pdev)
 	pci_set_drvdata(pdev, NULL);
 	sas_unregister_ha(sha);
 	sas_remove_host(mvi->shost);
-	scsi_remove_host(mvi->shost);
 
 	MVS_CHIP_DISP->interrupt_disable(mvi);
 	free_irq(mvi->pdev->irq, sha);

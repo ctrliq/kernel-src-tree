@@ -686,7 +686,7 @@ DEFINE_INODE_EVENT(xfs_inode_clear_eofblocks_tag);
 DEFINE_INODE_EVENT(xfs_inode_free_eofblocks_invalid);
 
 DEFINE_INODE_EVENT(xfs_filemap_fault);
-DEFINE_INODE_EVENT(xfs_filemap_pmd_fault);
+DEFINE_INODE_EVENT(xfs_filemap_huge_fault);
 DEFINE_INODE_EVENT(xfs_filemap_page_mkwrite);
 DEFINE_INODE_EVENT(xfs_filemap_pfn_mkwrite);
 
@@ -1299,6 +1299,8 @@ DEFINE_IOMAP_EVENT(xfs_gbmap_direct_new);
 DEFINE_IOMAP_EVENT(xfs_gbmap_direct_update);
 DEFINE_IOMAP_EVENT(xfs_gbmap_direct_none);
 DEFINE_IOMAP_EVENT(xfs_gbmap_direct_endio);
+DEFINE_IOMAP_EVENT(xfs_iomap_alloc);
+DEFINE_IOMAP_EVENT(xfs_iomap_found);
 
 DECLARE_EVENT_CLASS(xfs_simple_io_class,
 	TP_PROTO(struct xfs_inode *ip, xfs_off_t offset, ssize_t count),
@@ -1621,7 +1623,7 @@ DECLARE_EVENT_CLASS(xfs_alloc_class,
 		__field(char, wasdel)
 		__field(char, wasfromfl)
 		__field(char, isfl)
-		__field(char, userdata)
+		__field(int, datatype)
 		__field(xfs_fsblock_t, firstblock)
 	),
 	TP_fast_assign(
@@ -1642,13 +1644,13 @@ DECLARE_EVENT_CLASS(xfs_alloc_class,
 		__entry->wasdel = args->wasdel;
 		__entry->wasfromfl = args->wasfromfl;
 		__entry->isfl = args->isfl;
-		__entry->userdata = args->userdata;
+		__entry->datatype = args->datatype;
 		__entry->firstblock = args->firstblock;
 	),
 	TP_printk("dev %d:%d agno %u agbno %u minlen %u maxlen %u mod %u "
 		  "prod %u minleft %u total %u alignment %u minalignslop %u "
 		  "len %u type %s otype %s wasdel %d wasfromfl %d isfl %d "
-		  "userdata %d firstblock 0x%llx",
+		  "datatype 0x%x firstblock 0x%llx",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->agno,
 		  __entry->agbno,
@@ -1666,7 +1668,7 @@ DECLARE_EVENT_CLASS(xfs_alloc_class,
 		  __entry->wasdel,
 		  __entry->wasfromfl,
 		  __entry->isfl,
-		  __entry->userdata,
+		  __entry->datatype,
 		  (unsigned long long)__entry->firstblock)
 )
 
@@ -2209,6 +2211,207 @@ DEFINE_DISCARD_EVENT(xfs_discard_extent);
 DEFINE_DISCARD_EVENT(xfs_discard_toosmall);
 DEFINE_DISCARD_EVENT(xfs_discard_exclude);
 DEFINE_DISCARD_EVENT(xfs_discard_busy);
+
+/* deferred ops */
+struct xfs_defer_pending;
+struct xfs_defer_intake;
+struct xfs_defer_ops;
+
+DECLARE_EVENT_CLASS(xfs_defer_class,
+	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop),
+	TP_ARGS(mp, dop),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(void *, dop)
+		__field(bool, committed)
+		__field(bool, low)
+	),
+	TP_fast_assign(
+		__entry->dev = mp ? mp->m_super->s_dev : 0;
+		__entry->dop = dop;
+		__entry->committed = dop->dop_committed;
+		__entry->low = dop->dop_low;
+	),
+	TP_printk("dev %d:%d ops %p committed %d low %d\n",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->dop,
+		  __entry->committed,
+		  __entry->low)
+)
+#define DEFINE_DEFER_EVENT(name) \
+DEFINE_EVENT(xfs_defer_class, name, \
+	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop), \
+	TP_ARGS(mp, dop))
+
+DECLARE_EVENT_CLASS(xfs_defer_error_class,
+	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop, int error),
+	TP_ARGS(mp, dop, error),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(void *, dop)
+		__field(bool, committed)
+		__field(bool, low)
+		__field(int, error)
+	),
+	TP_fast_assign(
+		__entry->dev = mp ? mp->m_super->s_dev : 0;
+		__entry->dop = dop;
+		__entry->committed = dop->dop_committed;
+		__entry->low = dop->dop_low;
+		__entry->error = error;
+	),
+	TP_printk("dev %d:%d ops %p committed %d low %d err %d\n",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->dop,
+		  __entry->committed,
+		  __entry->low,
+		  __entry->error)
+)
+#define DEFINE_DEFER_ERROR_EVENT(name) \
+DEFINE_EVENT(xfs_defer_error_class, name, \
+	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop, int error), \
+	TP_ARGS(mp, dop, error))
+
+DECLARE_EVENT_CLASS(xfs_defer_pending_class,
+	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_pending *dfp),
+	TP_ARGS(mp, dfp),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(int, type)
+		__field(void *, intent)
+		__field(bool, committed)
+		__field(int, nr)
+	),
+	TP_fast_assign(
+		__entry->dev = mp ? mp->m_super->s_dev : 0;
+		__entry->type = dfp->dfp_type->type;
+		__entry->intent = dfp->dfp_intent;
+		__entry->committed = dfp->dfp_done != NULL;
+		__entry->nr = dfp->dfp_count;
+	),
+	TP_printk("dev %d:%d optype %d intent %p committed %d nr %d\n",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->type,
+		  __entry->intent,
+		  __entry->committed,
+		  __entry->nr)
+)
+#define DEFINE_DEFER_PENDING_EVENT(name) \
+DEFINE_EVENT(xfs_defer_pending_class, name, \
+	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_pending *dfp), \
+	TP_ARGS(mp, dfp))
+
+DECLARE_EVENT_CLASS(xfs_phys_extent_deferred_class,
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno,
+		 int type, xfs_agblock_t agbno, xfs_extlen_t len),
+	TP_ARGS(mp, agno, type, agbno, len),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_agnumber_t, agno)
+		__field(int, type)
+		__field(xfs_agblock_t, agbno)
+		__field(xfs_extlen_t, len)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->agno = agno;
+		__entry->type = type;
+		__entry->agbno = agbno;
+		__entry->len = len;
+	),
+	TP_printk("dev %d:%d op %d agno %u agbno %u len %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->type,
+		  __entry->agno,
+		  __entry->agbno,
+		  __entry->len)
+);
+#define DEFINE_PHYS_EXTENT_DEFERRED_EVENT(name) \
+DEFINE_EVENT(xfs_phys_extent_deferred_class, name, \
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, \
+		 int type, \
+		 xfs_agblock_t bno, \
+		 xfs_extlen_t len), \
+	TP_ARGS(mp, agno, type, bno, len))
+
+DECLARE_EVENT_CLASS(xfs_map_extent_deferred_class,
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno,
+		 int op,
+		 xfs_agblock_t agbno,
+		 xfs_ino_t ino,
+		 int whichfork,
+		 xfs_fileoff_t offset,
+		 xfs_filblks_t len,
+		 xfs_exntst_t state),
+	TP_ARGS(mp, agno, op, agbno, ino, whichfork, offset, len, state),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_agnumber_t, agno)
+		__field(xfs_ino_t, ino)
+		__field(xfs_agblock_t, agbno)
+		__field(int, whichfork)
+		__field(xfs_fileoff_t, l_loff)
+		__field(xfs_filblks_t, l_len)
+		__field(xfs_exntst_t, l_state)
+		__field(int, op)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->agno = agno;
+		__entry->ino = ino;
+		__entry->agbno = agbno;
+		__entry->whichfork = whichfork;
+		__entry->l_loff = offset;
+		__entry->l_len = len;
+		__entry->l_state = state;
+		__entry->op = op;
+	),
+	TP_printk("dev %d:%d op %d agno %u agbno %u owner %lld %s offset %llu len %llu state %d",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->op,
+		  __entry->agno,
+		  __entry->agbno,
+		  __entry->ino,
+		  __entry->whichfork == XFS_ATTR_FORK ? "attr" : "data",
+		  __entry->l_loff,
+		  __entry->l_len,
+		  __entry->l_state)
+);
+#define DEFINE_MAP_EXTENT_DEFERRED_EVENT(name) \
+DEFINE_EVENT(xfs_map_extent_deferred_class, name, \
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, \
+		 int op, \
+		 xfs_agblock_t agbno, \
+		 xfs_ino_t ino, \
+		 int whichfork, \
+		 xfs_fileoff_t offset, \
+		 xfs_filblks_t len, \
+		 xfs_exntst_t state), \
+	TP_ARGS(mp, agno, op, agbno, ino, whichfork, offset, len, state))
+
+DEFINE_DEFER_EVENT(xfs_defer_init);
+DEFINE_DEFER_EVENT(xfs_defer_cancel);
+DEFINE_DEFER_EVENT(xfs_defer_trans_roll);
+DEFINE_DEFER_EVENT(xfs_defer_trans_abort);
+DEFINE_DEFER_EVENT(xfs_defer_finish);
+DEFINE_DEFER_EVENT(xfs_defer_finish_done);
+
+DEFINE_DEFER_ERROR_EVENT(xfs_defer_trans_roll_error);
+DEFINE_DEFER_ERROR_EVENT(xfs_defer_finish_error);
+DEFINE_DEFER_ERROR_EVENT(xfs_defer_op_finish_error);
+
+DEFINE_DEFER_PENDING_EVENT(xfs_defer_intake_work);
+DEFINE_DEFER_PENDING_EVENT(xfs_defer_intake_cancel);
+DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_commit);
+DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_cancel);
+DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_finish);
+DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_abort);
+
+DEFINE_MAP_EXTENT_DEFERRED_EVENT(xfs_defer_map_extent);
+
+#define DEFINE_BMAP_FREE_DEFERRED_EVENT DEFINE_PHYS_EXTENT_DEFERRED_EVENT
+DEFINE_BMAP_FREE_DEFERRED_EVENT(xfs_bmap_free_defer);
+DEFINE_BMAP_FREE_DEFERRED_EVENT(xfs_bmap_free_deferred);
 
 #endif /* _TRACE_XFS_H */
 

@@ -435,6 +435,23 @@ static void update_temperature(struct thermal_zone_device *tz)
 	tz->last_temperature = tz->temperature;
 	tz->temperature = temp;
 	mutex_unlock(&tz->lock);
+
+	if (tz->last_temperature == THERMAL_TEMP_INVALID)
+		dev_dbg(&tz->device, "last_temperature N/A, current_temperature=%d\n",
+			tz->temperature);
+	else
+		dev_dbg(&tz->device, "last_temperature=%d, current_temperature=%d\n",
+			tz->last_temperature, tz->temperature);
+}
+
+static void thermal_zone_device_reset(struct thermal_zone_device *tz)
+{
+	struct thermal_instance *pos;
+
+	tz->temperature = THERMAL_TEMP_INVALID;
+	tz->passive = 0;
+	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
+		pos->initialized = false;
 }
 
 void thermal_zone_device_update(struct thermal_zone_device *tz)
@@ -1723,6 +1740,7 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 
 	INIT_DELAYED_WORK(&(tz->poll_queue), thermal_zone_device_check);
 
+	thermal_zone_device_reset(tz);
 	thermal_zone_device_update(tz);
 
 	if (!result)
@@ -1846,7 +1864,7 @@ static const struct genl_multicast_group thermal_event_mcgrps[] = {
 };
 
 static struct genl_family thermal_event_genl_family = {
-	.id = GENL_ID_GENERATE,
+	.module = THIS_MODULE,
 	.name = THERMAL_GENL_FAMILY_NAME,
 	.version = THERMAL_GENL_VERSION,
 	.maxattr = THERMAL_GENL_ATTR_MAX,

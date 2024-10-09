@@ -587,4 +587,34 @@ static void quirk_amd_xgbe_nic(struct pci_dev *dev)
 }
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, 0x1458, quirk_amd_xgbe_nic);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, 0x1459, quirk_amd_xgbe_nic);
+
+#if defined(CONFIG_X86_64) && defined(CONFIG_X86_MCE)
+#include <linux/jump_label.h>
+
+/* Ivy Bridge, Haswell, Broadwell */
+static void quirk_intel_brickland_xeon_ras_cap(struct pci_dev *pdev)
+{
+	u32 capid0;
+
+	pci_read_config_dword(pdev, 0x84, &capid0);
+
+	if (capid0 & 0x10)
+		static_key_slow_inc(&mcsafe_key);
+}
+
+/* Skylake */
+static void quirk_intel_purley_xeon_ras_cap(struct pci_dev *pdev)
+{
+	u32 capid0;
+
+	pci_read_config_dword(pdev, 0x84, &capid0);
+
+	if ((capid0 & 0xc0) == 0xc0)
+		static_key_slow_inc(&mcsafe_key);
+}
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x0ec3, quirk_intel_brickland_xeon_ras_cap);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2fc0, quirk_intel_brickland_xeon_ras_cap);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x6fc0, quirk_intel_brickland_xeon_ras_cap);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2083, quirk_intel_purley_xeon_ras_cap);
+#endif
 #endif

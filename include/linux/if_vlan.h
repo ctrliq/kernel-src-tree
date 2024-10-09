@@ -73,7 +73,7 @@ static inline struct vlan_ethhdr *vlan_eth_hdr(const struct sk_buff *skb)
 /* found in socket.c */
 extern void vlan_ioctl_set(int (*hook)(struct net *, void __user *));
 
-static inline int is_vlan_dev(struct net_device *dev)
+static inline bool is_vlan_dev(const struct net_device *dev)
 {
         return dev->priv_flags & IFF_802_1Q_VLAN;
 }
@@ -306,7 +306,7 @@ static inline int __vlan_insert_tag(struct sk_buff *skb,
 	if (skb_cow_head(skb, VLAN_HLEN) < 0)
 		return -ENOMEM;
 
-	veth = (struct vlan_ethhdr *)skb_push(skb, VLAN_HLEN);
+	veth = skb_push(skb, VLAN_HLEN);
 
 	/* Move the mac addresses to the beginning of the new header. */
 	memmove(skb->data, skb->data + VLAN_HLEN, 2 * ETH_ALEN);

@@ -43,18 +43,18 @@ static void cifs_set_ops(struct inode *inode)
 		inode->i_op = &cifs_file_inode_ops;
 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_DIRECT_IO) {
 			if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_BRL)
-				inode->i_fop = &cifs_file_direct_nobrl_ops;
+				inode->i_fop = &cifs_file_direct_nobrl_ops.kabi_fops;
 			else
-				inode->i_fop = &cifs_file_direct_ops;
+				inode->i_fop = &cifs_file_direct_ops.kabi_fops;
 		} else if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_STRICT_IO) {
 			if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_BRL)
-				inode->i_fop = &cifs_file_strict_nobrl_ops;
+				inode->i_fop = &cifs_file_strict_nobrl_ops.kabi_fops;
 			else
-				inode->i_fop = &cifs_file_strict_ops;
+				inode->i_fop = &cifs_file_strict_ops.kabi_fops;
 		} else if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_BRL)
-			inode->i_fop = &cifs_file_nobrl_ops;
+			inode->i_fop = &cifs_file_nobrl_ops.kabi_fops;
 		else { /* not direct, send byte range locks */
-			inode->i_fop = &cifs_file_ops;
+			inode->i_fop = &cifs_file_ops.kabi_fops;
 		}
 
 		/* check if server can support readpages */
@@ -73,7 +73,7 @@ static void cifs_set_ops(struct inode *inode)
 		{
 #endif
 			inode->i_op = &cifs_dir_inode_ops.ops;
-			inode->i_fop = &cifs_dir_ops;
+			inode->i_fop = &cifs_dir_ops.kabi_fops;
 			inode->i_flags |= S_IOPS_WRAPPER;
 		}
 		break;
@@ -562,8 +562,7 @@ static int cifs_sfu_mode(struct cifs_fattr *fattr, const unsigned char *path,
 
 	rc = tcon->ses->server->ops->query_all_EAs(xid, tcon, path,
 			"SETFILEBITS", ea_value, 4 /* size of buf */,
-			cifs_sb->local_nls,
-			cifs_remap(cifs_sb));
+			cifs_sb);
 	cifs_put_tlink(tlink);
 	if (rc < 0)
 		return (int)rc;

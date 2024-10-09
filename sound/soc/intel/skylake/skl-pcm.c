@@ -355,8 +355,7 @@ static void skl_pcm_close(struct snd_pcm_substream *substream,
 	}
 
 	mconfig = skl_tplg_fe_get_cpr_module(dai, substream->stream);
-	if (mconfig)
-		skl_tplg_d0i3_put(skl, mconfig->d0i3_caps);
+	skl_tplg_d0i3_put(skl, mconfig->d0i3_caps);
 
 	kfree(dma_params);
 }

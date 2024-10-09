@@ -91,6 +91,14 @@ error:
 
 EXPORT_SYMBOL_GPL(user_instantiate);
 
+static void user_free_payload_rcu(struct rcu_head *head)
+{
+	struct user_key_payload *payload;
+
+	payload = container_of(head, struct user_key_payload, rcu);
+	kzfree(payload);
+}
+
 /*
  * update a user defined key
  * - the key's semaphore is write-locked
@@ -121,13 +129,16 @@ int user_update(struct key *key, struct key_preparsed_payload *prep)
 
 	if (ret == 0) {
 		/* attach the new data, displacing the old */
-		zap = key->payload.data;
+		if (key_is_positive(key))
+			zap = dereference_key_locked(key);
+		else
+			zap = NULL;
 		rcu_assign_keypointer(key, upayload);
 		key->expiry = 0;
 	}
 
 	if (zap)
-		kfree_rcu(zap, rcu);
+		call_rcu(&zap->rcu, user_free_payload_rcu);
 
 error:
 	return ret;
@@ -151,14 +162,14 @@ EXPORT_SYMBOL_GPL(user_match);
  */
 void user_revoke(struct key *key)
 {
-	struct user_key_payload *upayload = key->payload.data;
+	struct user_key_payload *upayload = user_key_payload_locked(key);
 
 	/* clear the quota */
 	key_payload_reserve(key, 0);
 
 	if (upayload) {
 		rcu_assign_keypointer(key, NULL);
-		kfree_rcu(upayload, rcu);
+		call_rcu(&upayload->rcu, user_free_payload_rcu);
 	}
 }
 
@@ -171,7 +182,7 @@ void user_destroy(struct key *key)
 {
 	struct user_key_payload *upayload = key->payload.data;
 
-	kfree(upayload);
+	kzfree(upayload);
 }
 
 EXPORT_SYMBOL_GPL(user_destroy);
@@ -182,7 +193,7 @@ EXPORT_SYMBOL_GPL(user_destroy);
 void user_describe(const struct key *key, struct seq_file *m)
 {
 	seq_puts(m, key->description);
-	if (key_is_instantiated(key))
+	if (key_is_positive(key))
 		seq_printf(m, ": %u", key->datalen);
 }
 
@@ -197,7 +208,7 @@ long user_read(const struct key *key, char __user *buffer, size_t buflen)
 	struct user_key_payload *upayload;
 	long ret;
 
-	upayload = rcu_dereference_key(key);
+	upayload = user_key_payload_locked(key);
 	ret = upayload->datalen;
 
 	/* we can return the data as is */

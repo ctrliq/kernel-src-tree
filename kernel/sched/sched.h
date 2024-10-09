@@ -3,6 +3,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/sched/rt.h>
 #include <linux/sched/deadline.h>
+#include <linux/sched/cpufreq.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/stop_machine.h>
@@ -388,7 +389,6 @@ struct cfs_rq {
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	u32 tg_runnable_contrib;
 	u64 tg_load_contrib;
-#endif /* CONFIG_FAIR_GROUP_SCHED */
 
 	/*
 	 *   h_load = weight * f(tg)
@@ -397,6 +397,7 @@ struct cfs_rq {
 	 * this group.
 	 */
 	unsigned long h_load;
+#endif /* CONFIG_FAIR_GROUP_SCHED */
 #endif /* CONFIG_SMP */
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -424,6 +425,10 @@ struct cfs_rq {
 	int throttled, throttle_count;
 	struct list_head throttled_list;
 #endif /* CONFIG_CFS_BANDWIDTH */
+#ifdef CONFIG_SMP
+	RH_KABI_EXTEND(u64 last_h_load_update)
+	RH_KABI_EXTEND(struct sched_entity *h_load_next)
+#endif
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 };
 
@@ -501,6 +506,11 @@ struct dl_rq {
 };
 
 #ifdef CONFIG_SMP
+
+static inline bool sched_asym_prefer(int a, int b)
+{
+	return arch_asym_cpu_priority(a) > arch_asym_cpu_priority(b);
+}
 
 /*
  * We add the notion of a root-domain which will be used to define per-domain
@@ -584,7 +594,7 @@ struct rq {
 	/* list of leaf cfs_rq on this cpu: */
 	struct list_head leaf_cfs_rq_list;
 #ifdef CONFIG_SMP
-	unsigned long h_load_throttle;
+	RH_KABI_DEPRECATE(unsigned long, h_load_throttle)
 #endif /* CONFIG_SMP */
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
@@ -683,6 +693,8 @@ struct rq {
 	/* try_to_wake_up() stats */
 	unsigned int ttwu_count;
 	unsigned int ttwu_local;
+
+	unsigned long cpu_capacity_orig;
 #endif /* __GENKSYMS__ */
 };
 
@@ -813,6 +825,8 @@ struct sched_group {
 	 * depending on how many CPUs the kernel has booted up with)
 	 */
 	unsigned long cpumask[0];
+	/* cpu of highest priority in group */
+	RH_KABI_EXTEND(int asym_prefer_cpu)
 };
 
 static inline struct cpumask *sched_group_cpus(struct sched_group *sg)
@@ -1678,3 +1692,51 @@ static inline u64 irq_time_read(int cpu)
 }
 #endif /* CONFIG_64BIT */
 #endif /* CONFIG_IRQ_TIME_ACCOUNTING */
+
+#ifdef CONFIG_CPU_FREQ
+DECLARE_PER_CPU(struct update_util_data *, cpufreq_update_util_data);
+
+/**
+ * cpufreq_update_util - Take a note about CPU utilization changes.
+ * @time: Current time.
+ * @util: Current utilization.
+ * @max: Utilization ceiling.
+ *
+ * This function is called by the scheduler on every invocation of
+ * update_load_avg() on the CPU whose utilization is being updated.
+ *
+ * It can only be called from RCU-sched read-side critical sections.
+ */
+static inline void cpufreq_update_util(u64 time, unsigned long util, unsigned long max)
+{
+       struct update_util_data *data;
+
+       data = rcu_dereference_sched(*this_cpu_ptr(&cpufreq_update_util_data));
+       if (data)
+               data->func(data, time, util, max);
+}
+
+/**
+ * cpufreq_trigger_update - Trigger CPU performance state evaluation if needed.
+ * @time: Current time.
+ *
+ * The way cpufreq is currently arranged requires it to evaluate the CPU
+ * performance state (frequency/voltage) on a regular basis to prevent it from
+ * being stuck in a completely inadequate performance level for too long.
+ * That is not guaranteed to happen if the updates are only triggered from CFS,
+ * though, because they may not be coming in if RT or deadline tasks are active
+ * all the time (or there are RT and DL tasks only).
+ *
+ * As a workaround for that issue, this function is called by the RT and DL
+ * sched classes to trigger extra cpufreq updates to prevent it from stalling,
+ * but that really is a band-aid.  Going forward it should be replaced with
+ * solutions targeted more specifically at RT and DL tasks.
+ */
+static inline void cpufreq_trigger_update(u64 time)
+{
+	cpufreq_update_util(time, ULONG_MAX, 0);
+}
+#else
+static inline void cpufreq_update_util(u64 time, unsigned long util, unsigned long max) {}
+static inline void cpufreq_trigger_update(u64 time) {}
+#endif /* CONFIG_CPU_FREQ */

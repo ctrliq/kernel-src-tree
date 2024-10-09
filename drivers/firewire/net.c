@@ -1398,7 +1398,7 @@ static const struct net_device_ops fwnet_netdev_ops = {
 	.ndo_open       = fwnet_open,
 	.ndo_stop	= fwnet_stop,
 	.ndo_start_xmit = fwnet_tx,
-	.ndo_change_mtu = fwnet_change_mtu,
+	.ndo_change_mtu_rh74 = fwnet_change_mtu,
 };
 
 static void fwnet_init_dev(struct net_device *net)

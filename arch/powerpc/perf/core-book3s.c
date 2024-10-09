@@ -302,6 +302,8 @@ static inline void perf_read_regs(struct pt_regs *regs)
 	 */
 	if (TRAP(regs) != 0xf00)
 		use_siar = 0;
+	else if ((ppmu->flags & PPMU_NO_SIAR))
+		use_siar = 0;
 	else if (marked)
 		use_siar = 1;
 	else if ((ppmu->flags & PPMU_NO_CONT_SAMPLING))
@@ -2046,6 +2048,14 @@ static void record_and_restart(struct perf_event *event, unsigned long val,
 			power_pmu_bhrb_read(cpuhw);
 			data.br_stack = &cpuhw->bhrb_stack;
 		}
+
+		if (event->attr.sample_type & PERF_SAMPLE_DATA_SRC &&
+						ppmu->get_mem_data_src)
+			ppmu->get_mem_data_src(&data.data_src, ppmu->flags, regs);
+
+		if (event->attr.sample_type & PERF_SAMPLE_WEIGHT &&
+						ppmu->get_mem_weight)
+			ppmu->get_mem_weight(&data.weight);
 
 		if (perf_event_overflow(event, &data, regs))
 			power_pmu_stop(event, 0);

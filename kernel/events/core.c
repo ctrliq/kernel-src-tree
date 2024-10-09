@@ -963,7 +963,7 @@ perf_cgroup_mark_enabled(struct perf_event *event,
  */
 #define PERF_CPU_HRTIMER (1000 / HZ)
 /*
- * function must be called with interrupts disbled
+ * function must be called with interrupts disabled
  */
 static enum hrtimer_restart perf_mux_hrtimer_handler(struct hrtimer *hr)
 {
@@ -3578,10 +3578,7 @@ unlock:
 
 static inline u64 perf_event_count(struct perf_event *event)
 {
-	if (event->pmu->count)
-		return event->pmu->count(event);
-
-	return __perf_event_count(event);
+	return local64_read(&event->count) + atomic64_read(&event->child_count);
 }
 
 /*
@@ -3616,12 +3613,6 @@ u64 perf_event_read_local(struct perf_event *event)
 	 * all child counters from atomic context.
 	 */
 	WARN_ON_ONCE(event->attr.inherit);
-
-	/*
-	 * It must not have a pmu::count method, those are not
-	 * NMI safe.
-	 */
-	WARN_ON_ONCE(event->pmu->count);
 
 	/*
 	 * If the event is currently on this CPU, its either a per-task event,
@@ -3745,7 +3736,7 @@ find_lively_task_by_vpid(pid_t vpid)
 
 	/* Reuse ptrace permission checks for now. */
 	err = -EACCES;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS))
 		goto errout;
 
 	return task;

@@ -1,5 +1,7 @@
 #include <asm/paravirt.h>
 #include <asm/asm-offsets.h>
+#include <asm/processor.h>
+#include <asm/cpufeature.h>
 #include <linux/stringify.h>
 
 DEF_NATIVE(pv_irq_ops, irq_disable, "cli");
@@ -66,7 +68,14 @@ unsigned native_patch(u8 type, u16 clobbers, void *ibuf,
 		PATCH_SITE(pv_mmu_ops, read_cr3);
 		PATCH_SITE(pv_mmu_ops, write_cr3);
 		PATCH_SITE(pv_cpu_ops, clts);
-		PATCH_SITE(pv_mmu_ops, flush_tlb_single);
+		case PARAVIRT_PATCH(pv_mmu_ops.flush_tlb_single):
+			if (!boot_cpu_has(X86_FEATURE_PCID)) {
+				start = start_pv_mmu_ops_flush_tlb_single;
+				end   = end_pv_mmu_ops_flush_tlb_single;
+				goto patch_site;
+			} else {
+				goto patch_default;
+			}
 		PATCH_SITE(pv_cpu_ops, wbinvd);
 #if defined(CONFIG_PARAVIRT_SPINLOCKS) && defined(CONFIG_QUEUED_SPINLOCKS)
 		case PARAVIRT_PATCH(pv_lock_ops.unlock_kick):

@@ -751,11 +751,9 @@ void usbhid_init_reports(struct hid_device *hid)
 	struct hid_report_enum *report_enum;
 	int err, ret;
 
-	if (!(hid->quirks & HID_QUIRK_NO_INIT_INPUT_REPORTS)) {
-		report_enum = &hid->report_enum[HID_INPUT_REPORT];
-		list_for_each_entry(report, &report_enum->report_list, list)
-			usbhid_submit_report(hid, report, USB_DIR_IN);
-	}
+	report_enum = &hid->report_enum[HID_INPUT_REPORT];
+	list_for_each_entry(report, &report_enum->report_list, list)
+		usbhid_submit_report(hid, report, USB_DIR_IN);
 
 	report_enum = &hid->report_enum[HID_FEATURE_REPORT];
 	list_for_each_entry(report, &report_enum->report_list, list)
@@ -1126,9 +1124,6 @@ static int usbhid_start(struct hid_device *hid)
 	usbhid->urbctrl->transfer_dma = usbhid->ctrlbuf_dma;
 	usbhid->urbctrl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-	if (!(hid->quirks & HID_QUIRK_NO_INIT_REPORTS))
-		usbhid_init_reports(hid);
-
 	set_bit(HID_STARTED, &usbhid->iofl);
 
 	if (hid->quirks & HID_QUIRK_ALWAYS_POLL) {
@@ -1256,7 +1251,7 @@ static int usbhid_idle(struct hid_device *hid, int report, int idle,
 	return hid_set_idle(dev, ifnum, report, idle);
 }
 
-static struct hid_ll_driver usb_hid_driver = {
+struct hid_ll_driver usb_hid_driver = {
 	.parse = usbhid_parse,
 	.start = usbhid_start,
 	.stop = usbhid_stop,
@@ -1269,6 +1264,7 @@ static struct hid_ll_driver usb_hid_driver = {
 	.output_report = usbhid_output_report,
 	.idle = usbhid_idle,
 };
+EXPORT_SYMBOL_GPL(usb_hid_driver);
 
 static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {

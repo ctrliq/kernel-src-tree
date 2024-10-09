@@ -1,4 +1,8 @@
+#include <errno.h>
+#include <inttypes.h>
 #include "util.h"
+#include "string2.h"
+#include <sys/param.h>
 #include <sys/types.h>
 #include <byteswap.h>
 #include <unistd.h>
@@ -7,11 +11,15 @@
 #include <linux/list.h>
 #include <linux/kernel.h>
 #include <linux/bitops.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 #include "evlist.h"
 #include "evsel.h"
 #include "header.h"
+#include "memswap.h"
 #include "../perf.h"
 #include "trace-event.h"
 #include "session.h"
@@ -833,7 +841,7 @@ static int write_group_desc(int fd, struct perf_header *h __maybe_unused,
 
 /*
  * default get_cpuid(): nothing gets recorded
- * actual implementation must be in arch/$(ARCH)/util/header.c
+ * actual implementation must be in arch/$(SRCARCH)/util/header.c
  */
 int __weak get_cpuid(char *buffer __maybe_unused, size_t sz __maybe_unused)
 {

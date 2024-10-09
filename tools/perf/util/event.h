@@ -222,7 +222,7 @@ struct build_id_event {
 enum perf_user_event_type { /* above any possible kernel type */
 	PERF_RECORD_USER_TYPE_START		= 64,
 	PERF_RECORD_HEADER_ATTR			= 64,
-	PERF_RECORD_HEADER_EVENT_TYPE		= 65, /* depreceated */
+	PERF_RECORD_HEADER_EVENT_TYPE		= 65, /* deprecated */
 	PERF_RECORD_HEADER_TRACING_DATA		= 66,
 	PERF_RECORD_HEADER_BUILD_ID		= 67,
 	PERF_RECORD_FINISHED_ROUND		= 68,
@@ -662,4 +662,11 @@ int kallsyms__get_function_start(const char *kallsyms_filename,
 void *cpu_map_data__alloc(struct cpu_map *map, size_t *size, u16 *type, int *max);
 void  cpu_map_data__synthesize(struct cpu_map_data *data, struct cpu_map *map,
 			       u16 type, int max);
+
+void event_attr_init(struct perf_event_attr *attr);
+
+int perf_event_paranoid(void);
+
+extern unsigned int sysctl_perf_event_max_stack;
+
 #endif /* __PERF_RECORD_H */

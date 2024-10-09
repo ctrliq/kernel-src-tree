@@ -27,7 +27,7 @@
  */
 struct tk_read_base {
 	struct clocksource	*clock;
-	cycle_t			cycle_last;
+	u64			cycle_last;
 	u32			mult;
 	u32			shift;
 	u64			xtime_nsec;
@@ -89,7 +89,7 @@ struct timekeeper {
 	unsigned int		clock_was_set_seq;
 	u8			cs_was_changed_seq;
 	ktime_t			next_leap_ktime;
-	cycle_t			cycle_interval;
+	u64			cycle_interval;
 	u64			xtime_interval;
 	s64			xtime_remainder;
 	u32			raw_interval;

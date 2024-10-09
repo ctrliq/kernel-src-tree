@@ -634,7 +634,7 @@ acpi_install_gpe_handler(acpi_handle gpe_device,
 
 	/* Make sure that there isn't a handler there already */
 
-	if ((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) ==
+	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
 	    ACPI_GPE_DISPATCH_HANDLER) {
 		status = AE_ALREADY_EXISTS;
 		goto free_and_exit;
@@ -652,9 +652,10 @@ acpi_install_gpe_handler(acpi_handle gpe_device,
 	 * automatically during initialization, in which case it has to be
 	 * disabled now to avoid spurious execution of the handler.
 	 */
-
-	if ((handler->original_flags & ACPI_GPE_DISPATCH_METHOD)
-	    && gpe_event_info->runtime_count) {
+	if (((ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
+	      ACPI_GPE_DISPATCH_METHOD) ||
+	     (ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
+	      ACPI_GPE_DISPATCH_NOTIFY)) && handler->originally_enabled) {
 		handler->originally_enabled = 1;
 		(void)acpi_ev_remove_gpe_reference(gpe_event_info);
 	}
@@ -731,7 +732,7 @@ acpi_remove_gpe_handler(acpi_handle gpe_device,
 
 	/* Make sure that a handler is indeed installed */
 
-	if ((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) !=
+	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) !=
 	    ACPI_GPE_DISPATCH_HANDLER) {
 		status = AE_NOT_EXIST;
 		goto unlock_and_exit;
@@ -760,8 +761,10 @@ acpi_remove_gpe_handler(acpi_handle gpe_device,
 	 * enabled, it should be enabled at this point to restore the
 	 * post-initialization configuration.
 	 */
-	if ((handler->original_flags & ACPI_GPE_DISPATCH_METHOD) &&
-	    handler->originally_enabled) {
+	if (((ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
+	      ACPI_GPE_DISPATCH_METHOD) ||
+	     (ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
+	      ACPI_GPE_DISPATCH_NOTIFY)) && gpe_event_info->runtime_count) {
 		(void)acpi_ev_add_gpe_reference(gpe_event_info);
 	}
 

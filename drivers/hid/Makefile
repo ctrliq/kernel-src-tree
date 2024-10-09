@@ -37,6 +37,7 @@ ifdef CONFIG_DEBUG_FS
 endif
 
 obj-$(CONFIG_HID_A4TECH)	+= hid-a4tech.o
+obj-$(CONFIG_HID_ALPS)		+= hid-alps.o
 obj-$(CONFIG_HID_ACRUX)		+= hid-axff.o
 obj-$(CONFIG_HID_APPLE)		+= hid-apple.o
 obj-$(CONFIG_HID_APPLEIR)	+= hid-appleir.o

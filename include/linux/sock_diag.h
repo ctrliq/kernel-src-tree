@@ -2,6 +2,7 @@
 #define __SOCK_DIAG_H__
 
 #include <linux/user_namespace.h>
+#include <net/sock.h>
 #include <uapi/linux/sock_diag.h>
 
 struct sk_buff;

@@ -135,8 +135,10 @@ s64 mthca_make_profile(struct mthca_dev *dev,
 	 */
 	for (i = MTHCA_RES_NUM; i > 0; --i)
 		for (j = 1; j < i; ++j) {
-			if (profile[j].size > profile[j - 1].size)
+			if (profile[j].size > profile[j - 1].size) {
+				gmb();
 				swap(profile[j], profile[j - 1]);
+			}
 		}
 
 	for (i = 0; i < MTHCA_RES_NUM; ++i) {

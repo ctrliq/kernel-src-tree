@@ -179,7 +179,7 @@ bool kvm_mtrr_check_gfn_range_consistency(struct kvm_vcpu *vcpu, gfn_t gfn,
 
 #define KVM_SUPPORTED_XCR0     (XSTATE_FP | XSTATE_SSE | XSTATE_YMM \
 				| XSTATE_BNDREGS | XSTATE_BNDCSR \
-				| XSTATE_AVX512)
+				| XSTATE_AVX512 | XSTATE_PKRU)
 
 extern u64 host_xcr0;
 

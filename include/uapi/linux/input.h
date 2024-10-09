@@ -710,8 +710,14 @@ struct input_keymap_entry {
 #define KEY_ATTENDANT_TOGGLE	0x21d	/* Attendant call on or off */
 #define KEY_LIGHTS_TOGGLE	0x21e	/* Reading light on or off */
 
+#define KEY_ROTATE_LOCK_TOGGLE	0x231	/* Display rotation lock */
+
+#define KEY_BUTTONCONFIG		0x240	/* AL Button Configuration */
+#define KEY_CONTROLPANEL		0x243
 #define KEY_VOICECOMMAND		0x246	/* Listening Voice Command */
 #define KEY_BRIGHTNESS_MIN		0x251	/* Set Brightness to Minimum */
+
+#define KEY_ONSCREEN_KEYBOARD		0x278
 
 #define BTN_TRIGGER_HAPPY		0x2c0
 #define BTN_TRIGGER_HAPPY1		0x2c0
@@ -933,6 +939,7 @@ struct input_keymap_entry {
 #define BUS_GSC			0x1A
 #define BUS_ATARI		0x1B
 #define BUS_SPI			0x1C
+#define BUS_INTEL_ISHTP		0x1F
 
 /*
  * MT_TOOL types

@@ -52,6 +52,7 @@
 #include <linux/slab.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_hdrs.h>
+#include <rdma/opa_addr.h>
 #include "qp.h"
 #include "vt.h"
 #include "trace.h"
@@ -1165,6 +1166,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	int mig = 0;
 	int pmtu = 0; /* for gcc warning only */
 	enum rdma_link_layer link;
+	int opa_ah;
 
 	link = rdma_port_get_link_layer(ibqp->device, qp->port_num);
 
@@ -1175,6 +1177,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	cur_state = attr_mask & IB_QP_CUR_STATE ?
 		attr->cur_qp_state : qp->state;
 	new_state = attr_mask & IB_QP_STATE ? attr->qp_state : cur_state;
+	opa_ah = rdma_cap_opa_ah(ibqp->device, qp->port_num);
 
 	if (!ib_modify_qp_is_ok(cur_state, new_state, ibqp->qp_type,
 				attr_mask, link))
@@ -1185,16 +1188,31 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		goto inval;
 
 	if (attr_mask & IB_QP_AV) {
-		if (attr->ah_attr.dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE))
-			goto inval;
+		if (opa_ah) {
+			if (rdma_ah_get_dlid(&attr->ah_attr) >=
+				opa_get_mcast_base(OPA_MCAST_NR))
+				goto inval;
+		} else {
+			if (rdma_ah_get_dlid(&attr->ah_attr) >=
+				be16_to_cpu(IB_MULTICAST_LID_BASE))
+				goto inval;
+		}
+
 		if (rvt_check_ah(qp->ibqp.device, &attr->ah_attr))
 			goto inval;
 	}
 
 	if (attr_mask & IB_QP_ALT_PATH) {
-		if (attr->alt_ah_attr.dlid >=
-		    be16_to_cpu(IB_MULTICAST_LID_BASE))
-			goto inval;
+		if (opa_ah) {
+			if (rdma_ah_get_dlid(&attr->alt_ah_attr) >=
+				opa_get_mcast_base(OPA_MCAST_NR))
+				goto inval;
+		} else {
+			if (rdma_ah_get_dlid(&attr->alt_ah_attr) >=
+				be16_to_cpu(IB_MULTICAST_LID_BASE))
+				goto inval;
+		}
+
 		if (rvt_check_ah(qp->ibqp.device, &attr->alt_ah_attr))
 			goto inval;
 		if (attr->alt_pkey_index >= rvt_get_npkeys(rdi))
@@ -1321,7 +1339,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 
 	if (attr_mask & IB_QP_AV) {
 		qp->remote_ah_attr = attr->ah_attr;
-		qp->s_srate = attr->ah_attr.static_rate;
+		qp->s_srate = rdma_ah_get_static_rate(&attr->ah_attr);
 		qp->srate_mbps = ib_rate_to_mbps(qp->s_srate);
 	}
 
@@ -1334,7 +1352,7 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		qp->s_mig_state = attr->path_mig_state;
 		if (mig) {
 			qp->remote_ah_attr = qp->alt_ah_attr;
-			qp->port_num = qp->alt_ah_attr.port_num;
+			qp->port_num = rdma_ah_get_port_num(&qp->alt_ah_attr);
 			qp->s_pkey_index = qp->s_alt_pkey_index;
 		}
 	}
@@ -1490,7 +1508,8 @@ int rvt_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	attr->timeout = qp->timeout;
 	attr->retry_cnt = qp->s_retry_cnt;
 	attr->rnr_retry = qp->s_rnr_retry_cnt;
-	attr->alt_port_num = qp->alt_ah_attr.port_num;
+	attr->alt_port_num =
+		rdma_ah_get_port_num(&qp->alt_ah_attr);
 	attr->alt_timeout = qp->alt_timeout;
 
 	init_attr->event_handler = qp->ibqp.event_handler;

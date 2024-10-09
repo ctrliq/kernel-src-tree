@@ -210,7 +210,6 @@ struct platform_device *platform_device_alloc(const char *name, int id)
 		device_initialize(&pa->pdev.dev);
 		pa->pdev.dev.release = platform_device_release;
 		arch_setup_pdev_archdata(&pa->pdev);
-		device_rh_alloc(&pa->pdev.dev);
 	}
 
 	return pa ? &pa->pdev : NULL;
@@ -275,16 +274,16 @@ EXPORT_SYMBOL_GPL(platform_device_add_data);
 /**
  * platform_device_add_properties - add built-in properties to a platform device
  * @pdev: platform device to add properties to
- * @pset: properties to add
+ * @properties: null terminated array of properties to add
  *
- * The function will take deep copy of the properties in @pset and attach
- * the copy to the platform device. The memory associated with properties
- * will be freed when the platform device is released.
+ * The function will take deep copy of @properties and attach the copy to the
+ * platform device. The memory associated with properties will be freed when the
+ * platform device is released.
  */
 int platform_device_add_properties(struct platform_device *pdev,
-				   const struct property_set *pset)
+				   struct property_entry *properties)
 {
-	return device_add_property_set(&pdev->dev, pset);
+	return device_add_properties(&pdev->dev, properties);
 }
 EXPORT_SYMBOL_GPL(platform_device_add_properties);
 
@@ -389,7 +388,7 @@ void platform_device_del(struct platform_device *pdev)
 	int i;
 
 	if (pdev) {
-		device_remove_property_set(&pdev->dev);
+		device_remove_properties(&pdev->dev);
 		device_del(&pdev->dev);
 
 		if (pdev->id_auto) {
@@ -482,8 +481,9 @@ struct platform_device *platform_device_register_full(
 	if (ret)
 		goto err;
 
-	if (pdevinfo->pset) {
-		ret = platform_device_add_properties(pdev, pdevinfo->pset);
+	if (pdevinfo->properties) {
+		ret = platform_device_add_properties(pdev,
+						     pdevinfo->properties);
 		if (ret)
 			goto err;
 	}

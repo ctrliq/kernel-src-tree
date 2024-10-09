@@ -357,4 +357,12 @@ extern void arch_phys_wc_del(int handle);
 #define arch_phys_wc_add arch_phys_wc_add
 #endif
 
+extern bool arch_memremap_can_ram_remap(resource_size_t offset,
+					unsigned long size,
+					unsigned long flags);
+#define arch_memremap_can_ram_remap arch_memremap_can_ram_remap
+
+extern bool phys_mem_access_encrypted(unsigned long phys_addr,
+				      unsigned long size);
+
 #endif /* _ASM_X86_IO_H */

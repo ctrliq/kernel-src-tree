@@ -1326,8 +1326,10 @@ mptfc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 "mptfc_wq_%d", sh->host_no);
 	ioc->fc_rescan_work_q =
 		create_singlethread_workqueue(ioc->fc_rescan_work_q_name);
-	if (!ioc->fc_rescan_work_q)
-		goto out_mptfc_probe;
+	if (!ioc->fc_rescan_work_q) {
+		error = -ENOMEM;
+		goto out_mptfc_host;
+	}
 
 	/*
 	 *  Pre-fetch FC port WWN and stuff...
@@ -1347,6 +1349,9 @@ mptfc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	flush_workqueue(ioc->fc_rescan_work_q);
 
 	return 0;
+
+out_mptfc_host:
+	scsi_remove_host(sh);
 
 out_mptfc_probe:
 
@@ -1526,6 +1531,8 @@ static void mptfc_remove(struct pci_dev *pdev)
 			ioc->fc_data.fc_port_page1[ii].data = NULL;
 		}
 	}
+
+	scsi_remove_host(ioc->sh);
 
 	mptscsih_remove(pdev);
 }

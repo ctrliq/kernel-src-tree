@@ -1203,13 +1203,13 @@ static int storvsc_connect_to_vsp(struct hv_device *device, u32 ring_size,
 static int storvsc_dev_remove(struct hv_device *device)
 {
 	struct storvsc_device *stor_device;
-	unsigned long flags;
 
 	stor_device = hv_get_drvdata(device);
 
-	spin_lock_irqsave(&device->channel->inbound_lock, flags);
 	stor_device->destroy = true;
-	spin_unlock_irqrestore(&device->channel->inbound_lock, flags);
+
+	/* Make sure flag is set before waiting */
+	wmb();
 
 	/*
 	 * At this point, all outbound traffic should be disable. We
@@ -1226,9 +1226,7 @@ static int storvsc_dev_remove(struct hv_device *device)
 	 * we have drained - to drain the outgoing packets, we need to
 	 * allow incoming packets.
 	 */
-	spin_lock_irqsave(&device->channel->inbound_lock, flags);
 	hv_set_drvdata(device, NULL);
-	spin_unlock_irqrestore(&device->channel->inbound_lock, flags);
 
 	/* Close the channel */
 	vmbus_close(device->channel);
@@ -1493,10 +1491,6 @@ static int storvsc_host_reset_handler(struct scsi_cmnd *scmnd)
  */
 static enum blk_eh_timer_return storvsc_eh_timed_out(struct scsi_cmnd *scmnd)
 {
-#if IS_ENABLED(CONFIG_SCSI_FC_ATTRS)
-	if (scmnd->device->host->transportt == fc_transport_template)
-		return fc_eh_timed_out(scmnd);
-#endif
 	return BLK_EH_RESET_TIMER;
 }
 
@@ -1921,17 +1915,6 @@ static int __init storvsc_drv_init(void)
 	fc_transport_template = fc_attach_transport(&fc_transport_functions);
 	if (!fc_transport_template)
 		return -ENODEV;
-
-	/*
-	 * Install Hyper-V specific timeout handler.
-	 */
-	fc_transport_template->eh_timed_out = storvsc_eh_timed_out;
-	/*
-	 * The default user scan function associated with FC (fc_user_scan)
-	 * is not suitable for FC hosts on Hyper-V. Set it to NULL so we can
-	 * support manual scan of FC targets on Hyper-V.x
-	 */
-	fc_transport_template->user_scan = NULL;
 #endif
 
 	ret = vmbus_driver_register(&storvsc_drv);

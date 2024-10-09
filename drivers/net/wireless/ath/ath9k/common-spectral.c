@@ -482,11 +482,7 @@ ath_cmn_is_fft_buf_full(struct ath_spec_scan_priv *spec_priv)
 	struct rchan *rc = spec_priv->rfs_chan_spec_scan;
 
 	for_each_online_cpu(i)
-#if 0 /* Not in RHEL */
 		ret += relay_buf_full(*per_cpu_ptr(rc->buf, i));
-#else
-		ret += relay_buf_full(rc->buf[i]);
-#endif
 
 	i = num_online_cpus();
 
@@ -745,6 +741,9 @@ void ath9k_cmn_spectral_scan_trigger(struct ath_common *common,
 		ath_err(common, "spectrum analyzer not implemented on this hardware\n");
 		return;
 	}
+
+	if (!spec_priv->spec_config.enabled)
+		return;
 
 	ath_ps_ops(common)->wakeup(common);
 	rxfilter = ath9k_hw_getrxfilter(ah);

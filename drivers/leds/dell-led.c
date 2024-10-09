@@ -136,7 +136,7 @@ static void __init find_micmute_tokens(const struct dmi_header *dm, void *dummy)
 	}
 }
 
-static int dell_micmute_led_set(int state)
+int dell_micmute_led_set(int state)
 {
 	struct app_wmi_args args;
 	struct dell_bios_data_token *token;
@@ -159,23 +159,7 @@ static int dell_micmute_led_set(int state)
 
 	return state;
 }
-
-int dell_app_wmi_led_set(int whichled, int on)
-{
-	int state = 0;
-
-	switch (whichled) {
-	case DELL_LED_MICMUTE:
-		state = dell_micmute_led_set(on);
-		break;
-	default:
-		pr_warn("led type %x is not supported\n", whichled);
-		break;
-	}
-
-	return state;
-}
-EXPORT_SYMBOL_GPL(dell_app_wmi_led_set);
+EXPORT_SYMBOL_GPL(dell_micmute_led_set);
 
 static int __init dell_micmute_led_init(void)
 {

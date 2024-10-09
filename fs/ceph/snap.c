@@ -140,11 +140,14 @@ static struct ceph_snap_realm *__lookup_snap_realm(struct ceph_mds_client *mdsc,
 
 	while (n) {
 		r = rb_entry(n, struct ceph_snap_realm, node);
-		if (ino < r->ino)
+		if (ino < r->ino) {
+			gmb();
 			n = n->rb_left;
-		else if (ino > r->ino)
+		} else if (ino > r->ino) {
+			gmb();
 			n = n->rb_right;
-		else {
+		} else {
+			gmb();
 			dout("lookup_snap_realm %llx %p\n", r->ino, r);
 			return r;
 		}

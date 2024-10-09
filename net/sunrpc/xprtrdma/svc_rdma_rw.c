@@ -70,7 +70,7 @@ svc_rdma_get_rw_ctxt(struct svcxprt_rdma *rdma, unsigned int sges)
 
 	ctxt->rw_sg_table.sgl = ctxt->rw_first_sgl;
 	if (sg_alloc_table_chained(&ctxt->rw_sg_table, sges,
-				   ctxt->rw_sg_table.sgl)) {
+				   GFP_ATOMIC, ctxt->rw_sg_table.sgl)) {
 		kfree(ctxt);
 		ctxt = NULL;
 	}

@@ -43,7 +43,7 @@
 #include <nvif/device.h>
 #include <nvif/ioctl.h>
 
-#include <drmP.h>
+#include <drm/drmP.h>
 
 #include <drm/ttm/ttm_bo_api.h>
 #include <drm/ttm/ttm_bo_driver.h>
@@ -86,14 +86,17 @@ enum nouveau_drm_handle {
 
 struct nouveau_cli {
 	struct nvif_client base;
+	struct drm_device *dev;
+	struct mutex mutex;
+
+	struct nvif_device device;
+
 	struct nvkm_vm *vm; /*XXX*/
 	struct list_head head;
-	struct mutex mutex;
 	void *abi16;
 	struct list_head objects;
 	struct list_head notifys;
 	char name[32];
-	struct drm_device *dev;
 };
 
 static inline struct nouveau_cli *
@@ -109,7 +112,6 @@ struct nouveau_drm {
 	struct nouveau_cli client;
 	struct drm_device *dev;
 
-	struct nvif_device device;
 	struct list_head clients;
 
 	struct {

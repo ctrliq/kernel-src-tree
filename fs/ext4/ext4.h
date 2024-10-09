@@ -1464,7 +1464,6 @@ enum {
 	EXT4_STATE_EXT_MIGRATE,		/* Inode is migrating */
 	EXT4_STATE_DIO_UNWRITTEN,	/* need convert on dio done*/
 	EXT4_STATE_NEWENTRY,		/* File just added to dir */
-	EXT4_STATE_DELALLOC_RESERVED,	/* blks already reserved for delalloc */
 	EXT4_STATE_DIOREAD_LOCK,	/* Disable support for dio read
 					   nolocking */
 	EXT4_STATE_MAY_INLINE_DATA,	/* may have in-inode data */
@@ -2157,8 +2156,6 @@ struct buffer_head *ext4_bread(handle_t *, struct inode *,
 						ext4_lblk_t, int, int *);
 int ext4_get_block_write(struct inode *inode, sector_t iblock,
 			 struct buffer_head *bh_result, int create);
-int ext4_dax_get_block(struct inode *inode, sector_t iblock,
-		       struct buffer_head *bh_result, int create);
 int ext4_get_block(struct inode *inode, sector_t iblock,
 				struct buffer_head *bh_result, int create);
 int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
@@ -2207,9 +2204,6 @@ extern void ext4_da_update_reserve_space(struct inode *inode,
 					int used, int quota_claim);
 extern int ext4_issue_zeroout(struct inode *inode, ext4_lblk_t lblk,
 			      ext4_fsblk_t pblk, ext4_lblk_t len);
-extern int ext4_get_next_extent(struct inode *inode, ext4_lblk_t lblk,
-				unsigned int map_len,
-				struct extent_status *result);
 
 /* indirect.c */
 extern int ext4_ind_map_blocks(handle_t *handle, struct inode *inode,
@@ -2917,6 +2911,8 @@ static inline bool ext4_aligned_io(struct inode *inode, loff_t off, loff_t len)
 
 	return IS_ALIGNED(off, blksize) && IS_ALIGNED(len, blksize);
 }
+
+extern const struct iomap_ops ext4_iomap_ops;
 
 #endif	/* __KERNEL__ */
 

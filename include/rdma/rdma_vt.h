@@ -57,10 +57,20 @@
 #include <linux/list.h>
 #include <linux/hash.h>
 #include <rdma/ib_verbs.h>
+#include <rdma/ib_mad.h>
 #include <rdma/rdmavt_mr.h>
 #include <rdma/rdmavt_qp.h>
 
 #define RVT_MAX_PKEY_VALUES 16
+
+#define RVT_MAX_TRAP_LEN 100 /* Limit pending trap list */
+#define RVT_MAX_TRAP_LISTS 5 /*((IB_NOTICE_TYPE_INFO & 0x0F) + 1)*/
+#define RVT_TRAP_TIMEOUT 4096 /* 4.096 usec */
+
+struct trap_list {
+	u32 list_len;
+	struct list_head list;
+};
 
 struct rvt_ibport {
 	struct rvt_qp __rcu *qp[2];
@@ -81,7 +91,7 @@ struct rvt_ibport {
 	__be16 pma_counter_select[5];
 	u16 pma_tag;
 	u16 mkey_lease_period;
-	u16 sm_lid;
+	u32 sm_lid;
 	u8 sm_sl;
 	u8 mkeyprot;
 	u8 subnet_timeout;
@@ -128,6 +138,13 @@ struct rvt_ibport {
 	u16 *pkey_table;
 
 	struct rvt_ah *sm_ah;
+
+	/*
+	 * Keep a list of traps that have not been repressed.  They will be
+	 * resent based on trap_timer.
+	 */
+	struct trap_list trap_lists[RVT_MAX_TRAP_LISTS];
+	struct timer_list trap_timer;
 };
 
 #define RVT_CQN_MAX 16 /* maximum length of cq name */
@@ -171,7 +188,7 @@ struct rvt_pd {
 /* Address handle */
 struct rvt_ah {
 	struct ib_ah ibah;
-	struct ib_ah_attr attr;
+	struct rdma_ah_attr attr;
 	atomic_t refcount;
 	u8 vl;
 	u8 log_pmtu;
@@ -311,10 +328,10 @@ struct rvt_driver_provided {
 	unsigned (*free_all_qps)(struct rvt_dev_info *rdi);
 
 	/* Driver specific AH validation */
-	int (*check_ah)(struct ib_device *, struct ib_ah_attr *);
+	int (*check_ah)(struct ib_device *, struct rdma_ah_attr *);
 
 	/* Inform the driver a new AH has been created */
-	void (*notify_new_ah)(struct ib_device *, struct ib_ah_attr *,
+	void (*notify_new_ah)(struct ib_device *, struct rdma_ah_attr *,
 			      struct rvt_ah *);
 
 	/* Let the driver pick the next queue pair number*/
@@ -506,7 +523,7 @@ struct rvt_dev_info *rvt_alloc_device(size_t size, int nports);
 void rvt_dealloc_device(struct rvt_dev_info *rdi);
 int rvt_register_device(struct rvt_dev_info *rvd);
 void rvt_unregister_device(struct rvt_dev_info *rvd);
-int rvt_check_ah(struct ib_device *ibdev, struct ib_ah_attr *ah_attr);
+int rvt_check_ah(struct ib_device *ibdev, struct rdma_ah_attr *ah_attr);
 int rvt_init_port(struct rvt_dev_info *rdi, struct rvt_ibport *port,
 		  int port_index, u16 *pkey_table);
 int rvt_fast_reg_mr(struct rvt_qp *qp, struct ib_mr *ibmr, u32 key,

@@ -323,8 +323,8 @@ static void __rvt_free_mr(struct rvt_mr *mr)
  * @acc: access flags
  *
  * Return: the memory region on success, otherwise returns an errno.
- * Note that all DMA addresses should be created via the
- * struct ib_dma_mapping_ops functions (see dma.c).
+ * Note that all DMA addresses should be created via the functions in
+ * struct dma_virt_ops.
  */
 struct ib_mr *rvt_get_dma_mr(struct ib_pd *pd, int acc)
 {
@@ -408,8 +408,7 @@ struct ib_mr *rvt_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->mr.access_flags = mr_access_flags;
 	mr->umem = umem;
 
-	if (is_power_of_2(umem->page_size))
-		mr->mr.page_shift = ilog2(umem->page_size);
+	mr->mr.page_shift = umem->page_shift;
 	m = 0;
 	n = 0;
 	for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
@@ -421,8 +420,9 @@ struct ib_mr *rvt_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 			goto bail_inval;
 		}
 		mr->mr.map[m]->segs[n].vaddr = vaddr;
-		mr->mr.map[m]->segs[n].length = umem->page_size;
-		trace_rvt_mr_user_seg(&mr->mr, m, n, vaddr, umem->page_size);
+		mr->mr.map[m]->segs[n].length = BIT(umem->page_shift);
+		trace_rvt_mr_user_seg(&mr->mr, m, n, vaddr,
+				      BIT(umem->page_shift));
 		n++;
 		if (n == RVT_SEGSZ) {
 			m++;
@@ -918,7 +918,7 @@ int rvt_lkey_ok(struct rvt_lkey_table *rkt, struct rvt_pd *pd,
 
 	/*
 	 * We use LKEY == zero for kernel virtual addresses
-	 * (see rvt_get_dma_mr and dma.c).
+	 * (see rvt_get_dma_mr() and dma_virt_ops).
 	 */
 	if (sge->lkey == 0) {
 		struct rvt_dev_info *dev = ib_to_rvt(pd->ibpd.device);
@@ -1029,7 +1029,7 @@ int rvt_rkey_ok(struct rvt_qp *qp, struct rvt_sge *sge,
 
 	/*
 	 * We use RKEY == zero for kernel virtual addresses
-	 * (see rvt_get_dma_mr and dma.c).
+	 * (see rvt_get_dma_mr() and dma_virt_ops).
 	 */
 	rcu_read_lock();
 	if (rkey == 0) {

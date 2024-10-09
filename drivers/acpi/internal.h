@@ -23,6 +23,8 @@
 
 #define PREFIX "ACPI: "
 
+int early_acpi_osi_init(void);
+int acpi_osi_init(void);
 acpi_status acpi_os_initialize1(void);
 int init_acpi_device_notify(void);
 int acpi_scan_init(void);
@@ -35,8 +37,10 @@ void acpi_int340x_thermal_init(void);
 int acpi_sysfs_init(void);
 #ifdef CONFIG_ACPI_CONTAINER
 void acpi_container_init(void);
+void acpi_gpe_apply_masked_gpes(void);
 #else
 static inline void acpi_container_init(void) {}
+void acpi_gpe_apply_masked_gpes(void);
 #endif
 #ifdef CONFIG_ACPI_DOCK
 void register_dock_dependent_device(struct acpi_device *adev,
@@ -82,6 +86,9 @@ acpi_status acpi_hotplug_schedule(struct acpi_device *adev, u32 src);
 bool acpi_queue_hotplug_work(struct work_struct *work);
 void acpi_device_hotplug(struct acpi_device *adev, u32 src);
 bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent);
+
+acpi_status acpi_sysfs_table_handler(u32 event, void *table, void *context);
+void acpi_scan_table_handler(u32 event, void *table, void *context);
 
 /* --------------------------------------------------------------------------
                      Device Node Initialization / Removal

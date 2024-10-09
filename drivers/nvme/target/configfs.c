@@ -325,7 +325,7 @@ static ssize_t nvmet_ns_device_uuid_store(struct config_item *item,
 	}
 
 
-	if (uuid_parse(page, &ns->uuid))
+	if (uuid_be_to_bin(page, &ns->uuid))
 		ret = -EINVAL;
 
 out_unlock:

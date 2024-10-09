@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/blkpg.h>
 #include <linux/magic.h>
+#include <linux/dax.h>
 #include <linux/buffer_head.h>
 #include <linux/swap.h>
 #include <linux/pagevec.h>
@@ -187,9 +188,6 @@ blkdev_direct_IO(int rw, struct kiocb *iocb, const struct iovec *iov,
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = bdev_file_inode(file);
 
-	if (IS_DAX(inode))
-		return dax_do_io(rw, iocb, inode, iov, offset, nr_segs,
-				 blkdev_get_block, NULL, DIO_SKIP_DIO_COUNT);
 	return __blockdev_direct_IO(rw, iocb, inode, I_BDEV(inode), iov, offset,
 				    nr_segs, blkdev_get_block, NULL, NULL,
 				    DIO_SKIP_DIO_COUNT);
@@ -347,51 +345,6 @@ static int blkdev_write_end(struct file *file, struct address_space *mapping,
 	return ret;
 }
 
-/**
- * bdev_direct_access() - Get the address for directly-accessibly memory
- * @bdev: The device containing the memory
- * @dax: control and output parameters for ->direct_access
- *
- * If a block device is made up of directly addressable memory, this function
- * will tell the caller the PFN and the address of the memory.  The address
- * may be directly dereferenced within the kernel without the need to call
- * ioremap(), kmap() or similar.  The PFN is suitable for inserting into
- * page tables.
- *
- * Return: negative errno if an error occurs, otherwise the number of bytes
- * accessible at this address.
- */
-long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
-{
-	sector_t sector = dax->sector;
-	long avail, size = dax->size;
-	const struct block_device_operations *ops = bdev->bd_disk->fops;
-
-	/*
-	 * The device driver is allowed to sleep, in order to make the
-	 * memory directly accessible.
-	 */
-	might_sleep();
-
-	if (size < 0)
-		return size;
-	if (!blk_queue_dax(bdev_get_queue(bdev)) || !ops->direct_access)
-		return -EOPNOTSUPP;
-	if ((sector + DIV_ROUND_UP(size, 512)) >
-					part_nr_sects_read(bdev->bd_part))
-		return -ERANGE;
-	sector += get_start_sect(bdev);
-	if (sector % (PAGE_SIZE / 512))
-		return -EINVAL;
-	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn, size);
-	if (!avail)
-		return -ERANGE;
-	if (avail > 0 && avail & ~PAGE_MASK)
-		return -ENXIO;
-	return min(avail, size);
-}
-EXPORT_SYMBOL_GPL(bdev_direct_access);
-
 /*
  * private llseek:
  * for a block special file file_inode(file)->i_size is zero
@@ -477,7 +430,7 @@ int bdev_read_page(struct block_device *bdev, sector_t sector,
 	if (!ops->rw_page || bdev_get_integrity(bdev))
 		return result;
 
-	result = blk_queue_enter(bdev->bd_queue, false);
+	result = blk_queue_enter(bdev->bd_queue, 0);
 	if (result)
 		return result;
 	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
@@ -514,73 +467,22 @@ int bdev_write_page(struct block_device *bdev, sector_t sector,
 
 	if (!ops->rw_page || bdev_get_integrity(bdev))
 		return -EOPNOTSUPP;
-	result = blk_queue_enter(bdev->bd_queue, false);
+	result = blk_queue_enter(bdev->bd_queue, 0);
 	if (result)
 		return result;
 
 	set_page_writeback(page);
 	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, rw);
-	if (result)
+	if (result) {
 		end_page_writeback(page);
-	else
+	} else {
+		clean_page_buffers(page);
 		unlock_page(page);
+	}
 	blk_queue_exit(bdev->bd_queue);
 	return result;
 }
 EXPORT_SYMBOL_GPL(bdev_write_page);
-
-/**
- * bdev_dax_supported() - Check if the device supports dax for filesystem
- * @sb: The superblock of the device
- * @blocksize: The block size of the device
- *
- * This is a library function for filesystems to check if the block device
- * can be mounted with dax option.
- *
- * Return: negative errno if unsupported, 0 if supported.
- */
-int bdev_dax_supported(struct super_block *sb, int blocksize)
-{
-	struct block_device *bdev = sb->s_bdev;
-	struct dax_device *dax_dev;
-	pgoff_t pgoff;
-	int err, id;
-	void *kaddr;
-	pfn_t pfn;
-	long len;
-
-	if (blocksize != PAGE_SIZE) {
-		vfs_msg(sb, KERN_ERR, "error: unsupported blocksize for dax");
-		return -EINVAL;
-	}
-
-	err = bdev_dax_pgoff(bdev, 0, PAGE_SIZE, &pgoff);
-	if (err) {
-		vfs_msg(sb, KERN_ERR, "error: unaligned partition for dax");
-		return err;
-	}
-
-	dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
-	if (!dax_dev) {
-		vfs_msg(sb, KERN_ERR, "error: device does not support dax");
-		return -EOPNOTSUPP;
-	}
-
-	id = dax_read_lock();
-	len = dax_direct_access(dax_dev, pgoff, 1, &kaddr, &pfn);
-	dax_read_unlock(id);
-
-	put_dax(dax_dev);
-
-	if (len < 1) {
-		vfs_msg(sb, KERN_ERR,
-				"error: dax access failed (%ld)", len);
-		return len < 0 ? len : -EIO;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(bdev_dax_supported);
 
 /*
  * pseudo-fs
@@ -1297,7 +1199,6 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
 		bdev->bd_disk = disk;
 		bdev->bd_queue = disk->queue;
 		bdev->bd_contains = bdev;
-		bdev->bd_inode->i_flags = 0;
 
 		if (!partno) {
 			struct backing_dev_info *bdi;
@@ -1861,7 +1762,7 @@ struct block_device *lookup_bdev(const char *pathname)
 	if (!S_ISBLK(inode->i_mode))
 		goto fail;
 	error = -EACCES;
-	if (path.mnt->mnt_flags & MNT_NODEV)
+	if (!may_open_dev(&path))
 		goto fail;
 	error = -ENOMEM;
 	bdev = bd_acquire(inode);
@@ -1901,7 +1802,7 @@ void iterate_bdevs(void (*func)(struct block_device *, void *), void *arg)
 {
 	struct inode *inode, *old_inode = NULL;
 
-	spin_lock(&inode_sb_list_lock);
+	spin_lock(&blockdev_superblock->s_inode_list_lock);
 	list_for_each_entry(inode, &blockdev_superblock->s_inodes, i_sb_list) {
 		struct address_space *mapping = inode->i_mapping;
 
@@ -1913,13 +1814,13 @@ void iterate_bdevs(void (*func)(struct block_device *, void *), void *arg)
 		}
 		__iget(inode);
 		spin_unlock(&inode->i_lock);
-		spin_unlock(&inode_sb_list_lock);
+		spin_unlock(&blockdev_superblock->s_inode_list_lock);
 		/*
 		 * We hold a reference to 'inode' so it couldn't have been
 		 * removed from s_inodes list while we dropped the
-		 * inode_sb_list_lock.  We cannot iput the inode now as we can
+		 * s_inode_list_lock  We cannot iput the inode now as we can
 		 * be holding the last reference and we cannot iput it under
-		 * inode_sb_list_lock. So we keep the reference and iput it
+		 * s_inode_list_lock. So we keep the reference and iput it
 		 * later.
 		 */
 		iput(old_inode);
@@ -1927,8 +1828,8 @@ void iterate_bdevs(void (*func)(struct block_device *, void *), void *arg)
 
 		func(I_BDEV(inode), arg);
 
-		spin_lock(&inode_sb_list_lock);
+		spin_lock(&blockdev_superblock->s_inode_list_lock);
 	}
-	spin_unlock(&inode_sb_list_lock);
+	spin_unlock(&blockdev_superblock->s_inode_list_lock);
 	iput(old_inode);
 }

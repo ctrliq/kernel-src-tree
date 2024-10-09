@@ -77,11 +77,11 @@ static inline struct thread_info *current_thread_info(void)
 /*
  * thread information flags bit numbers
  */
-#define TIF_SYSCALL		0	/* inside a system call */
-#define TIF_NOTIFY_RESUME	1	/* callback before returning to user */
-#define TIF_SIGPENDING		2	/* signal pending */
-#define TIF_NEED_RESCHED	3	/* rescheduling necessary */
-#define TIF_UPROBE		4	/* breakpointed or single-stepping */
+#define TIF_NOTIFY_RESUME	0	/* callback before returning to user */
+#define TIF_SIGPENDING		1	/* signal pending */
+#define TIF_NEED_RESCHED	2	/* rescheduling necessary */
+#define TIF_UPROBE		3	/* breakpointed or single-stepping */
+#define TIF_GUARDED_STORAGE	4	/* load guarded storage control block */
 #define TIF_ASCE		5	/* primary asce needs fixup / uaccess */
 #define TIF_PER_TRAP		6	/* deliver sigtrap on return to user */
 #define TIF_MCCK_PENDING	7	/* machine check handling is pending */
@@ -89,6 +89,7 @@ static inline struct thread_info *current_thread_info(void)
 #define TIF_SYSCALL_AUDIT	9	/* syscall auditing active */
 #define TIF_SECCOMP		10	/* secure computing */
 #define TIF_SYSCALL_TRACEPOINT	11	/* syscall tracepoint instrumentation */
+#define TIF_SYSCALL		12	/* inside a system call */
 #define TIF_31BIT		17	/* 32bit process */
 #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
 #define TIF_RESTORE_SIGMASK	19	/* restore signal mask in do_signal() */
@@ -109,6 +110,7 @@ static inline struct thread_info *current_thread_info(void)
 #define _TIF_UPROBE		(1<<TIF_UPROBE)
 #define _TIF_31BIT		(1<<TIF_31BIT)
 #define _TIF_SINGLE_STEP	(1<<TIF_SINGLE_STEP)
+#define _TIF_GUARDED_STORAGE	(1<<TIF_GUARDED_STORAGE)
 
 #ifdef CONFIG_64BIT
 #define is_32bit_task()		(test_thread_flag(TIF_31BIT))

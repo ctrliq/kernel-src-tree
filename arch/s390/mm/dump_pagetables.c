@@ -53,9 +53,8 @@ static void print_prot(struct seq_file *m, unsigned int pr, int level)
 		seq_printf(m, "I\n");
 		return;
 	}
-	seq_printf(m, "%s", pr & _PAGE_PROTECT ? "RO " : "RW ");
-	seq_printf(m, "%s", pr & _PAGE_CO ? "CO " : "   ");
-	seq_putc(m, '\n');
+	seq_puts(m, (pr & _PAGE_PROTECT) ? "RO " : "RW ");
+	seq_puts(m, (pr & _PAGE_NOEXEC) ? "NX\n" : "X\n");
 }
 
 static void note_page(struct seq_file *m, struct pg_state *st,
@@ -122,14 +121,15 @@ static void walk_pte_level(struct seq_file *m, struct pg_state *st,
 	for (i = 0; i < PTRS_PER_PTE && addr < max_addr; i++) {
 		st->current_address = addr;
 		pte = pte_offset_kernel(pmd, addr);
-		prot = pte_val(*pte) & (_PAGE_PROTECT | _PAGE_INVALID);
+		prot = pte_val(*pte) &
+			(_PAGE_PROTECT | _PAGE_INVALID | _PAGE_NOEXEC);
 		note_page(m, st, prot, 4);
 		addr += PAGE_SIZE;
 	}
 }
 
 #ifdef CONFIG_64BIT
-#define _PMD_PROT_MASK (_SEGMENT_ENTRY_PROTECT | _SEGMENT_ENTRY_CO)
+#define _PMD_PROT_MASK (_SEGMENT_ENTRY_PROTECT | _SEGMENT_ENTRY_NOEXEC)
 #else
 #define _PMD_PROT_MASK 0
 #endif
@@ -157,7 +157,7 @@ static void walk_pmd_level(struct seq_file *m, struct pg_state *st,
 }
 
 #ifdef CONFIG_64BIT
-#define _PUD_PROT_MASK (_REGION3_ENTRY_RO | _REGION3_ENTRY_CO)
+#define _PUD_PROT_MASK (_REGION3_ENTRY_RO | _REGION_ENTRY_NOEXEC)
 #else
 #define _PUD_PROT_MASK 0
 #endif

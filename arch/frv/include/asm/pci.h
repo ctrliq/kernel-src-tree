@@ -15,7 +15,6 @@
 
 #include <linux/mm.h>
 #include <asm/scatterlist.h>
-#include <asm-generic/pci-dma-compat.h>
 #include <asm-generic/pci.h>
 
 struct pci_dev;

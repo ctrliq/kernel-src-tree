@@ -193,6 +193,10 @@ static int modify_irte(int irq, struct irte *irte_modified)
 	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
 
 	iommu = irq_iommu->iommu;
+	if (unlikely(!iommu)) {
+		raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
+		return -1;
+	}
 
 	index = irq_iommu->irte_index + irq_iommu->sub_handle;
 	irte = &iommu->ir_table->base[index];

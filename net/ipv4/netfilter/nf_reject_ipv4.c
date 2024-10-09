@@ -48,7 +48,7 @@ struct iphdr *nf_reject_iphdr_put(struct sk_buff *nskb,
 	struct iphdr *niph, *oiph = ip_hdr(oldskb);
 
 	skb_reset_network_header(nskb);
-	niph = (struct iphdr *)skb_put(nskb, sizeof(struct iphdr));
+	niph = skb_put(nskb, sizeof(struct iphdr));
 	niph->version	= 4;
 	niph->ihl	= sizeof(struct iphdr) / 4;
 	niph->tos	= 0;
@@ -73,8 +73,7 @@ void nf_reject_ip_tcphdr_put(struct sk_buff *nskb, const struct sk_buff *oldskb,
 	struct tcphdr *tcph;
 
 	skb_reset_transport_header(nskb);
-	tcph = (struct tcphdr *)skb_put(nskb, sizeof(struct tcphdr));
-	memset(tcph, 0, sizeof(*tcph));
+	tcph = skb_put_zero(nskb, sizeof(struct tcphdr));
 	tcph->source	= oth->dest;
 	tcph->dest	= oth->source;
 	tcph->doff	= sizeof(struct tcphdr) / 4;
@@ -105,6 +104,9 @@ void nf_send_reset(struct sk_buff *oldskb, int hook)
 	struct iphdr *niph;
 	const struct tcphdr *oth;
 	struct tcphdr _oth;
+	struct net_device *dev = oldskb->dev ? oldskb->dev :
+					       skb_dst(oldskb)->dev;
+	struct net *net = dev_net(dev);
 
 	oth = nf_reject_ip_tcphdr_get(oldskb, &_oth, hook);
 	if (!oth)
@@ -122,6 +124,8 @@ void nf_send_reset(struct sk_buff *oldskb, int hook)
 
 	/* ip_route_me_harder expects skb->dst to be set */
 	skb_dst_set_noref(nskb, skb_dst(oldskb));
+
+	nskb->mark = IP4_REPLY_MARK(net, oldskb->mark);
 
 	skb_reserve(nskb, LL_MAX_HEADER);
 	niph = nf_reject_iphdr_put(nskb, oldskb, IPPROTO_TCP,
@@ -170,7 +174,7 @@ void nf_send_unreach(struct sk_buff *skb_in, int code, int hook)
 	struct iphdr *iph = ip_hdr(skb_in);
 	u8 proto;
 
-	if (skb_in->csum_bad || iph->frag_off & htons(IP_OFFSET))
+	if (iph->frag_off & htons(IP_OFFSET))
 		return;
 
 	if (skb_csum_unnecessary(skb_in)) {

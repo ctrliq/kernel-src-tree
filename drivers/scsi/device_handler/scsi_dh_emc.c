@@ -650,44 +650,8 @@ static bool clariion_match(struct scsi_device *sdev)
 	return false;
 }
 
-static struct scsi_dh_data *clariion_bus_attach(struct scsi_device *sdev)
-{
-	struct clariion_dh_data *h;
-	int err;
-
-	h = kzalloc(sizeof(*h) , GFP_KERNEL);
-	if (!h)
-		return ERR_PTR(-ENOMEM);
-	h->lun_state = CLARIION_LUN_UNINITIALIZED;
-	h->default_sp = CLARIION_UNBOUND_LU;
-	h->current_sp = CLARIION_UNBOUND_LU;
-
-	err = clariion_std_inquiry(sdev, h);
-	if (err != SCSI_DH_OK)
-		goto failed;
-
-	err = clariion_send_inquiry(sdev, h);
-	if (err != SCSI_DH_OK)
-		goto failed;
-
-	sdev_printk(KERN_INFO, sdev,
-		    "%s: connected to SP %c Port %d (%s, default SP %c)\n",
-		    CLARIION_NAME, h->current_sp + 'A',
-		    h->port, lun_state[h->lun_state],
-		    h->default_sp + 'A');
-	return &h->dh_data;
-
-failed:
-	kfree(h);
-	return ERR_PTR(-EINVAL);
-}
-
-static void clariion_bus_detach(struct scsi_device *sdev)
-{
-	struct clariion_dh_data *h = get_clariion_data(sdev);
-
-	kfree(h);
-}
+static int clariion_bus_attach(struct scsi_device *sdev);
+static void clariion_bus_detach(struct scsi_device *sdev);
 
 static struct scsi_device_handler clariion_dh = {
 	.name		= CLARIION_NAME,
@@ -701,11 +665,71 @@ static struct scsi_device_handler clariion_dh = {
 	.match		= clariion_match,
 };
 
+static int clariion_bus_attach(struct scsi_device *sdev)
+{
+	struct clariion_dh_data *h;
+	unsigned long flags;
+	int err;
+
+	h = kzalloc(sizeof(*h) , GFP_KERNEL);
+	if (!h) {
+		sdev_printk(KERN_ERR, sdev, "%s: Attach failed\n",
+			    CLARIION_NAME);
+		return -ENOMEM;
+	}
+
+	h->dh_data.scsi_dh = &clariion_dh;
+	h->lun_state = CLARIION_LUN_UNINITIALIZED;
+	h->default_sp = CLARIION_UNBOUND_LU;
+	h->current_sp = CLARIION_UNBOUND_LU;
+
+	err = clariion_std_inquiry(sdev, h);
+	if (err != SCSI_DH_OK)
+		goto failed;
+
+	err = clariion_send_inquiry(sdev, h);
+	if (err != SCSI_DH_OK)
+		goto failed;
+
+	spin_lock_irqsave(sdev->request_queue->queue_lock, flags);
+	sdev->scsi_dh_data = &h->dh_data;
+	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
+
+	sdev_printk(KERN_INFO, sdev,
+		    "%s: connected to SP %c Port %d (%s, default SP %c)\n",
+		    CLARIION_NAME, h->current_sp + 'A',
+		    h->port, lun_state[h->lun_state],
+		    h->default_sp + 'A');
+
+	return 0;
+
+failed:
+	kfree(h);
+	sdev_printk(KERN_ERR, sdev, "%s: not attached\n",
+		    CLARIION_NAME);
+	return -EINVAL;
+}
+
+static void clariion_bus_detach(struct scsi_device *sdev)
+{
+	struct clariion_dh_data *h = get_clariion_data(sdev);
+	unsigned long flags;
+
+	spin_lock_irqsave(sdev->request_queue->queue_lock, flags);
+	sdev->scsi_dh_data = NULL;
+	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
+
+	sdev_printk(KERN_NOTICE, sdev, "%s: Detached\n",
+		    CLARIION_NAME);
+
+	kfree(h);
+}
+
 static int __init clariion_init(void)
 {
 	int r;
 
-	r = scsi_register_device_handler(&clariion_dh);
+	r = scsi_register_device_handler(&clariion_dh, NULL, 0);
 	if (r != 0)
 		printk(KERN_ERR "%s: Failed to register scsi device handler.",
 			CLARIION_NAME);

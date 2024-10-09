@@ -264,7 +264,7 @@ static struct ip_tunnel *ipip6_tunnel_locate(struct net *net,
 	return nt;
 
 failed_free:
-	ipip6_dev_free(dev);
+	free_netdev(dev);
 failed:
 	return NULL;
 }
@@ -1000,6 +1000,7 @@ static void ipip6_tunnel_update(struct ip_tunnel *t, struct ip_tunnel_parm *p)
 	ipip6_tunnel_link(sitn, t);
 	t->parms.iph.ttl = p->iph.ttl;
 	t->parms.iph.tos = p->iph.tos;
+	t->parms.iph.frag_off = p->iph.frag_off;
 	if (t->parms.link != p->link) {
 		t->parms.link = p->link;
 		ipip6_tunnel_bind_dev(t->dev);
@@ -1249,7 +1250,7 @@ static const struct net_device_ops ipip6_netdev_ops = {
 	.ndo_uninit	= ipip6_tunnel_uninit,
 	.ndo_start_xmit	= sit_tunnel_xmit,
 	.ndo_do_ioctl	= ipip6_tunnel_ioctl,
-	.ndo_change_mtu	= ipip6_tunnel_change_mtu,
+	.ndo_change_mtu_rh74 = ipip6_tunnel_change_mtu,
 	.ndo_get_stats64 = ip_tunnel_get_stats64,
 	.ndo_get_iflink = ip_tunnel_get_iflink,
 };
@@ -1260,7 +1261,6 @@ static void ipip6_dev_free(struct net_device *dev)
 
 	dst_cache_destroy(&tunnel->dst_cache);
 	free_percpu(dev->tstats);
-	free_netdev(dev);
 }
 
 #define SIT_FEATURES (NETIF_F_SG	   | \
@@ -1275,7 +1275,8 @@ static void ipip6_tunnel_setup(struct net_device *dev)
 	int t_hlen = tunnel->hlen + sizeof(struct iphdr);
 
 	dev->netdev_ops		= &ipip6_netdev_ops;
-	dev->destructor 	= ipip6_dev_free;
+	dev->extended->needs_free_netdev	= true;
+	dev->extended->priv_destructor	= ipip6_dev_free;
 
 	dev->type		= ARPHRD_SIT;
 	dev->hard_header_len	= LL_MAX_HEADER + t_hlen;

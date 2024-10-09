@@ -672,10 +672,10 @@ static void send_rc_ack(struct ipath_qp *qp)
 		ohdr->u.aeth = ipath_compute_aeth(qp);
 	lrh0 |= qp->remote_ah_attr.sl << 4;
 	hdr.lrh[0] = cpu_to_be16(lrh0);
-	hdr.lrh[1] = cpu_to_be16(qp->remote_ah_attr.dlid);
+	hdr.lrh[1] = cpu_to_be16(rdma_ah_get_dlid(&qp->remote_ah_attr));
 	hdr.lrh[2] = cpu_to_be16(hwords + SIZE_OF_CRC);
 	hdr.lrh[3] = cpu_to_be16(dd->ipath_lid |
-				 qp->remote_ah_attr.src_path_bits);
+				 rdma_ah_get_path_bits(&qp->remote_ah_attr));
 	ohdr->bth[0] = cpu_to_be32(bth0);
 	ohdr->bth[1] = cpu_to_be32(qp->remote_qpn);
 	ohdr->bth[2] = cpu_to_be32(qp->r_ack_psn & IPATH_PSN_MASK);
@@ -955,7 +955,7 @@ static int do_rc_ack(struct ipath_qp *qp, u32 aeth, u32 psn, int opcode,
 			wc.byte_len = wqe->length;
 			wc.qp = &qp->ibqp;
 			wc.src_qp = qp->remote_qpn;
-			wc.slid = qp->remote_ah_attr.dlid;
+			wc.slid = rdma_ah_get_dlid(&qp->remote_ah_attr);
 			wc.sl = qp->remote_ah_attr.sl;
 			ipath_cq_enter(to_icq(qp->ibqp.send_cq), &wc, 0);
 		}
@@ -1583,7 +1583,7 @@ void ipath_rc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 	unsigned long flags;
 
 	/* Validate the SLID. See Ch. 9.6.1.5 */
-	if (unlikely(be16_to_cpu(hdr->lrh[3]) != qp->remote_ah_attr.dlid))
+	if (unlikely(be16_to_cpu(hdr->lrh[3]) != rdma_ah_get_dlid(&qp->remote_ah_attr)))
 		goto done;
 
 	/* Check for GRH */
@@ -1739,7 +1739,7 @@ void ipath_rc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 			wc.opcode = IB_WC_RECV;
 		wc.qp = &qp->ibqp;
 		wc.src_qp = qp->remote_qpn;
-		wc.slid = qp->remote_ah_attr.dlid;
+		wc.slid = rdma_ah_get_dlid(&qp->remote_ah_attr);
 		wc.sl = qp->remote_ah_attr.sl;
 		/* Signal completion event if the solicited bit is set. */
 		ipath_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,

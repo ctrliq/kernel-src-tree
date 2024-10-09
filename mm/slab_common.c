@@ -130,6 +130,25 @@ out:
 	mutex_unlock(&slab_mutex);
 	return ret;
 }
+static int kmem_cache_destroy_memcg_children(struct kmem_cache *s)
+{
+	int rc;
+
+	if (!s->memcg_params ||
+	    !s->memcg_params->is_root_cache)
+		return 0;
+
+	mutex_unlock(&slab_mutex);
+	rc = __kmem_cache_destroy_memcg_children(s);
+	mutex_lock(&slab_mutex);
+
+	return rc;
+}
+#else
+static int kmem_cache_destroy_memcg_children(struct kmem_cache *s)
+{
+	return 0;
+}
 #endif
 
 /*
@@ -199,6 +218,18 @@ kmem_cache_create_memcg(struct mem_cgroup *memcg, const char *name, size_t size,
 	if (!kmem_cache_sanity_check(memcg, name, size) == 0)
 		goto out_locked;
 
+	if (memcg) {
+		/*
+		 * Since per-memcg caches are created asynchronously on first
+		 * allocation (see memcg_kmem_get_cache()), several threads can
+		 * try to create the same cache, but only one of them may
+		 * succeed. Therefore if we get here and see the cache has
+		 * already been created, we silently return NULL.
+		 */
+		if (cache_from_memcg(parent_cache, memcg_cache_id(memcg)))
+			goto out_locked;
+	}
+
 	/*
 	 * Some allocators will constraint the set of valid flags to a subset
 	 * of all flags. We expect them to define CACHE_CREATE_MASK in this
@@ -207,9 +238,11 @@ kmem_cache_create_memcg(struct mem_cgroup *memcg, const char *name, size_t size,
 	 */
 	flags &= CACHE_CREATE_MASK;
 
-	s = __kmem_cache_alias(memcg, name, size, align, flags, ctor);
-	if (s)
-		goto out_locked;
+	if (!memcg) {
+		s = __kmem_cache_alias(name, size, align, flags, ctor);
+		if (s)
+			goto out_locked;
+	}
 
 	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
 	if (s) {
@@ -217,14 +250,15 @@ kmem_cache_create_memcg(struct mem_cgroup *memcg, const char *name, size_t size,
 		s->align = calculate_alignment(flags, align, size);
 		s->ctor = ctor;
 
-		if (memcg_register_cache(memcg, s, parent_cache)) {
+		err = memcg_alloc_cache_params(memcg, s, parent_cache);
+		if (err) {
 			kmem_cache_free(kmem_cache, s);
-			err = -ENOMEM;
 			goto out_locked;
 		}
 
 		s->name = kstrdup(name, GFP_KERNEL);
 		if (!s->name) {
+			memcg_free_cache_params(s);
 			kmem_cache_free(kmem_cache, s);
 			err = -ENOMEM;
 			goto out_locked;
@@ -234,8 +268,9 @@ kmem_cache_create_memcg(struct mem_cgroup *memcg, const char *name, size_t size,
 		if (!err) {
 			s->refcount = 1;
 			list_add(&s->list, &slab_caches);
-			memcg_cache_list_add(memcg, s);
+			memcg_register_cache(s);
 		} else {
+			memcg_free_cache_params(s);
 			kfree(s->name);
 			kmem_cache_free(kmem_cache, s);
 		}
@@ -276,33 +311,39 @@ void kmem_cache_destroy(struct kmem_cache *s)
 	if (unlikely(!s))
 		return;
 
-	/* Destroy all the children caches if we aren't a memcg cache */
-	kmem_cache_destroy_memcg_children(s);
-
 	get_online_cpus();
 	mutex_lock(&slab_mutex);
+
 	s->refcount--;
-	if (!s->refcount) {
-		list_del(&s->list);
+	if (s->refcount)
+		goto out_unlock;
 
-		if (!__kmem_cache_shutdown(s)) {
-			mutex_unlock(&slab_mutex);
-			if (s->flags & SLAB_DESTROY_BY_RCU)
-				rcu_barrier();
+	if (kmem_cache_destroy_memcg_children(s) != 0)
+		goto out_unlock;
 
-			memcg_release_cache(s);
-			kfree(s->name);
-			kmem_cache_free(kmem_cache, s);
-		} else {
-			list_add(&s->list, &slab_caches);
-			mutex_unlock(&slab_mutex);
-			printk(KERN_ERR "kmem_cache_destroy %s: Slab cache still has objects\n",
-				s->name);
-			dump_stack();
-		}
-	} else {
-		mutex_unlock(&slab_mutex);
+	list_del(&s->list);
+	memcg_unregister_cache(s);
+
+	if (__kmem_cache_shutdown(s) != 0) {
+		list_add(&s->list, &slab_caches);
+		memcg_register_cache(s);
+		printk(KERN_ERR "kmem_cache_destroy %s: "
+		       "Slab cache still has objects\n", s->name);
+		dump_stack();
+		goto out_unlock;
 	}
+	mutex_unlock(&slab_mutex);
+	if (s->flags & SLAB_DESTROY_BY_RCU)
+		rcu_barrier();
+
+	memcg_free_cache_params(s);
+	kfree(s->name);
+	kmem_cache_free(kmem_cache, s);
+	goto out_put_cpus;
+
+out_unlock:
+	mutex_unlock(&slab_mutex);
+out_put_cpus:
 	put_online_cpus();
 }
 EXPORT_SYMBOL(kmem_cache_destroy);

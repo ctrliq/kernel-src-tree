@@ -311,6 +311,7 @@ static void ctnl_untimeout(struct net *net, struct ctnl_timeout *timeout)
 	for (i = 0; i < net->ct.htable_size; i++) {
 		spin_lock(&nf_conntrack_locks[i % CONNTRACK_LOCKS]);
 		if (i < net->ct.htable_size) {
+			gmb();
 			hlist_nulls_for_each_entry(h, nn, &net->ct.hash[i], hnnode)
 				untimeout(h, timeout);
 		}

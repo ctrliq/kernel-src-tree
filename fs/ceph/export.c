@@ -233,7 +233,8 @@ static int ceph_get_name(struct dentry *parent, char *name,
 	req->r_inode = child->d_inode;
 	ihold(child->d_inode);
 	req->r_ino2 = ceph_vino(parent->d_inode);
-	req->r_locked_dir = parent->d_inode;
+	req->r_parent = parent->d_inode;
+	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
 	req->r_num_caps = 2;
 	err = ceph_mdsc_do_request(mdsc, NULL, req);
 

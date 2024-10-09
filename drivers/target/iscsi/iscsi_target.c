@@ -21,6 +21,7 @@
 #include <linux/kthread.h>
 #include <linux/completion.h>
 #include <linux/module.h>
+#include <linux/vmalloc.h>
 #include <linux/idr.h>
 #include <asm/unaligned.h>
 #include <scsi/scsi_device.h>
@@ -28,12 +29,10 @@
 #include <scsi/scsi_tcq.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
-#include <target/target_core_configfs.h>
 
 #include <target/iscsi/iscsi_target_core.h>
 #include "iscsi_target_parameters.h"
 #include "iscsi_target_seq_pdu_list.h"
-#include "iscsi_target_configfs.h"
 #include "iscsi_target_datain_values.h"
 #include "iscsi_target_erl0.h"
 #include "iscsi_target_erl1.h"
@@ -492,7 +491,8 @@ void iscsit_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
 	bool scsi_cmd = (cmd->iscsi_opcode == ISCSI_OP_SCSI_CMD);
 
 	spin_lock_bh(&conn->cmd_lock);
-	if (!list_empty(&cmd->i_conn_node))
+	if (!list_empty(&cmd->i_conn_node) &&
+	    !(cmd->se_cmd.transport_state & CMD_T_FABRIC_STOP))
 		list_del_init(&cmd->i_conn_node);
 	spin_unlock_bh(&conn->cmd_lock);
 
@@ -705,8 +705,8 @@ static int __init iscsi_target_init_module(void)
 	idr_init(&tiqn_idr);
 	idr_init(&sess_idr);
 
-	ret = iscsi_target_register_configfs();
-	if (ret < 0)
+	ret = target_register_template(&iscsi_ops);
+	if (ret)
 		goto out;
 
 	size = BITS_TO_LONGS(ISCSIT_BITMAP_BITS) * sizeof(long);
@@ -770,7 +770,10 @@ qr_out:
 bitmap_out:
 	vfree(iscsit_global->ts_bitmap);
 configfs_out:
-	iscsi_target_deregister_configfs();
+	/* XXX: this probably wants it to be it's own unwind step.. */
+	if (iscsit_global->discovery_tpg)
+		iscsit_tpg_disable_portal_group(iscsit_global->discovery_tpg, 1);
+	target_unregister_template(&iscsi_ops);
 out:
 	kfree(iscsit_global);
 	return -ENOMEM;
@@ -785,7 +788,13 @@ static void __exit iscsi_target_cleanup_module(void)
 	kmem_cache_destroy(lio_ooo_cache);
 	kmem_cache_destroy(lio_r2t_cache);
 
-	iscsi_target_deregister_configfs();
+	/*
+	 * Shutdown discovery sessions and disable discovery TPG
+	 */
+	if (iscsit_global->discovery_tpg)
+		iscsit_tpg_disable_portal_group(iscsit_global->discovery_tpg, 1);
+
+	target_unregister_template(&iscsi_ops);
 
 	vfree(iscsit_global->ts_bitmap);
 	kfree(iscsit_global);
@@ -1139,7 +1148,7 @@ int iscsit_setup_scsi_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
 	/*
 	 * Initialize struct se_cmd descriptor from target_core_mod infrastructure
 	 */
-	transport_init_se_cmd(&cmd->se_cmd, &lio_target_fabric_configfs->tf_ops,
+	transport_init_se_cmd(&cmd->se_cmd, &iscsi_ops,
 			conn->sess->se_sess, be32_to_cpu(hdr->data_length),
 			cmd->data_direction, sam_task_attr,
 			cmd->sense_buffer + 2);
@@ -1156,6 +1165,8 @@ int iscsit_setup_scsi_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
 	if (cmd->sense_reason)
 		goto attach_cmd;
 
+	/* only used for printks or comparing with ->ref_task_tag */
+	cmd->se_cmd.tag = (__force u32)cmd->init_task_tag;
 	cmd->sense_reason = target_setup_cmd_from_cdb(&cmd->se_cmd, hdr->cdb);
 	if (cmd->sense_reason) {
 		if (cmd->sense_reason == TCM_OUT_OF_RESOURCES) {
@@ -1974,8 +1985,7 @@ iscsit_handle_task_mgt_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
 		u8 tcm_function;
 		int ret;
 
-		transport_init_se_cmd(&cmd->se_cmd,
-				      &lio_target_fabric_configfs->tf_ops,
+		transport_init_se_cmd(&cmd->se_cmd, &iscsi_ops,
 				      conn->sess->se_sess, 0, DMA_NONE,
 				      TCM_SIMPLE_TAG, cmd->sense_buffer + 2);
 
@@ -3382,7 +3392,7 @@ iscsit_build_sendtargets_response(struct iscsi_cmd *cmd,
 
 			if ((tpg->tpg_attrib.generate_node_acls == 0) &&
 			    (tpg->tpg_attrib.demo_mode_discovery == 0) &&
-			    (!core_tpg_get_initiator_node_acl(&tpg->tpg_se_tpg,
+			    (!target_tpg_has_node_acl(&tpg->tpg_se_tpg,
 				cmd->conn->sess->sess_ops->InitiatorName))) {
 				continue;
 			}
@@ -3797,6 +3807,8 @@ int iscsi_target_tx_thread(void *arg)
 {
 	int ret = 0;
 	struct iscsi_conn *conn = arg;
+	bool conn_freed = false;
+
 	/*
 	 * Allow ourselves to be interrupted by SIGINT so that a
 	 * connection recovery / failure event can be triggered externally.
@@ -3822,12 +3834,14 @@ get_immediate:
 			goto transport_err;
 
 		ret = iscsit_handle_response_queue(conn);
-		if (ret == 1)
+		if (ret == 1) {
 			goto get_immediate;
-		else if (ret == -ECONNRESET)
+		} else if (ret == -ECONNRESET) {
+			conn_freed = true;
 			goto out;
-		else if (ret < 0)
+		} else if (ret < 0) {
 			goto transport_err;
+		}
 	}
 
 transport_err:
@@ -3837,8 +3851,13 @@ transport_err:
 	 * responsible for cleaning up the early connection failure.
 	 */
 	if (conn->conn_state != TARG_CONN_STATE_IN_LOGIN)
-		iscsit_take_action_for_connection_exit(conn);
+		iscsit_take_action_for_connection_exit(conn, &conn_freed);
 out:
+	if (!conn_freed) {
+		while (!kthread_should_stop()) {
+			msleep(100);
+		}
+	}
 	return 0;
 }
 
@@ -3908,17 +3927,9 @@ static int iscsi_target_rx_opcode(struct iscsi_conn *conn, unsigned char *buf)
 			" opcode while ERL=0, closing iSCSI connection.\n");
 			return -1;
 		}
-		if (!conn->conn_ops->OFMarker) {
-			pr_err("Unable to recover from unknown"
-			" opcode while OFMarker=No, closing iSCSI"
-				" connection.\n");
-			return -1;
-		}
-		if (iscsit_recover_from_unknown_opcode(conn) < 0) {
-			pr_err("Unable to recover from unknown"
-				" opcode, closing iSCSI connection.\n");
-			return -1;
-		}
+		pr_err("Unable to recover from unknown opcode while OFMarker=No,"
+		       " closing iSCSI connection.\n");
+		ret = -1;
 		break;
 	}
 
@@ -4019,6 +4030,7 @@ int iscsi_target_rx_thread(void *arg)
 {
 	int rc;
 	struct iscsi_conn *conn = arg;
+	bool conn_freed = false;
 
 	/*
 	 * Allow ourselves to be interrupted by SIGINT so that a
@@ -4031,7 +4043,7 @@ int iscsi_target_rx_thread(void *arg)
 	 */
 	rc = wait_for_completion_interruptible(&conn->rx_login_comp);
 	if (rc < 0 || iscsi_target_check_conn_state(conn))
-		return 0;
+		goto out;
 
 	if (!conn->conn_transport->iscsit_get_rx_pdu)
 		return 0;
@@ -4040,12 +4052,21 @@ int iscsi_target_rx_thread(void *arg)
 
 	if (!signal_pending(current))
 		atomic_set(&conn->transport_failed, 1);
-	iscsit_take_action_for_connection_exit(conn);
+	iscsit_take_action_for_connection_exit(conn, &conn_freed);
+
+out:
+	if (!conn_freed) {
+		while (!kthread_should_stop()) {
+			msleep(100);
+		}
+	}
+
 	return 0;
 }
 
 static void iscsit_release_commands_from_conn(struct iscsi_conn *conn)
 {
+	LIST_HEAD(tmp_list);
 	struct iscsi_cmd *cmd = NULL, *cmd_tmp = NULL;
 	struct iscsi_session *sess = conn->sess;
 	/*
@@ -4054,18 +4075,26 @@ static void iscsit_release_commands_from_conn(struct iscsi_conn *conn)
 	 * has been reset -> returned sleeping pre-handler state.
 	 */
 	spin_lock_bh(&conn->cmd_lock);
-	list_for_each_entry_safe(cmd, cmd_tmp, &conn->conn_cmd_list, i_conn_node) {
+	list_splice_init(&conn->conn_cmd_list, &tmp_list);
 
-		list_del_init(&cmd->i_conn_node);
-		spin_unlock_bh(&conn->cmd_lock);
+	list_for_each_entry(cmd, &tmp_list, i_conn_node) {
+		struct se_cmd *se_cmd = &cmd->se_cmd;
 
-		iscsit_increment_maxcmdsn(cmd, sess);
-
-		iscsit_free_cmd(cmd, true);
-
-		spin_lock_bh(&conn->cmd_lock);
+		if (se_cmd->se_tfo != NULL) {
+			spin_lock(&se_cmd->t_state_lock);
+			se_cmd->transport_state |= CMD_T_FABRIC_STOP;
+			spin_unlock(&se_cmd->t_state_lock);
+		}
 	}
 	spin_unlock_bh(&conn->cmd_lock);
+
+	list_for_each_entry_safe(cmd, cmd_tmp, &tmp_list, i_conn_node) {
+		list_del_init(&cmd->i_conn_node);
+
+		iscsit_increment_maxcmdsn(cmd, sess);
+		iscsit_free_cmd(cmd, true);
+
+	}
 }
 
 static void iscsit_stop_timers_for_cmds(

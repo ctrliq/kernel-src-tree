@@ -786,6 +786,12 @@ struct ip_vs_pe {
 	u32 (*hashkey_raw)(const struct ip_vs_conn_param *p, u32 initval,
 			   bool inverse);
 	int (*show_pe_data)(const struct ip_vs_conn *cp, char *buf);
+	/* create connections for real-server outgoing packets */
+	struct ip_vs_conn* (*conn_out)(struct ip_vs_service *svc,
+				       struct ip_vs_dest *dest,
+				       struct sk_buff *skb,
+				       const struct ip_vs_iphdr *iph,
+				       __be16 dport, __be16 cport);
 };
 
 /*
@@ -924,6 +930,7 @@ struct netns_ipvs {
 	/* Service counters */
 	atomic_t		ftpsvc_counter;
 	atomic_t		nullsvc_counter;
+	atomic_t		conn_out_counter;
 
 #ifdef CONFIG_SYSCTL
 	/* 1/rate drop and drop-entry variables */
@@ -1132,6 +1139,12 @@ static inline int sysctl_conn_reuse_mode(struct netns_ipvs *ipvs)
  */
 const char *ip_vs_proto_name(unsigned int proto);
 void ip_vs_init_hash_table(struct list_head *table, int rows);
+struct ip_vs_conn *ip_vs_new_conn_out(struct ip_vs_service *svc,
+				      struct ip_vs_dest *dest,
+				      struct sk_buff *skb,
+				      const struct ip_vs_iphdr *iph,
+				      __be16 dport,
+				      __be16 cport);
 #define IP_VS_INIT_HASH_TABLE(t) ip_vs_init_hash_table((t), ARRAY_SIZE((t)))
 
 #define IP_VS_APP_TYPE_FTP	1
@@ -1206,7 +1219,7 @@ void ip_vs_conn_expire_now(struct ip_vs_conn *cp);
 const char *ip_vs_state_name(__u16 proto, int state);
 
 void ip_vs_tcp_conn_listen(struct net *net, struct ip_vs_conn *cp);
-int ip_vs_check_template(struct ip_vs_conn *ct);
+int ip_vs_check_template(struct ip_vs_conn *ct, struct ip_vs_dest *cdest);
 void ip_vs_random_dropentry(struct net *net);
 int ip_vs_conn_init(void);
 void ip_vs_conn_cleanup(void);
@@ -1376,6 +1389,10 @@ ip_vs_service_find(struct net *net, int af, __u32 fwmark, __u16 protocol,
 bool ip_vs_has_real_service(struct net *net, int af, __u16 protocol,
 			    const union nf_inet_addr *daddr, __be16 dport);
 
+struct ip_vs_dest *
+ip_vs_find_real_service(struct netns_ipvs *ipvs, int af, __u16 protocol,
+			const union nf_inet_addr *daddr, __be16 dport);
+
 int ip_vs_use_count_inc(void);
 void ip_vs_use_count_dec(void);
 int ip_vs_register_nl_ioctl(void);
@@ -1539,10 +1556,8 @@ static inline void ip_vs_notrack(struct sk_buff *skb)
 	struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
 
 	if (!ct || !nf_ct_is_untracked(ct)) {
-		nf_conntrack_put(skb->nfct);
-		skb->nfct = &nf_ct_untracked_get()->ct_general;
-		skb->nfctinfo = IP_CT_NEW;
-		nf_conntrack_get(skb->nfct);
+		nf_conntrack_put(&ct->ct_general);
+		nf_ct_set(skb, NULL, IP_CT_UNTRACKED);
 	}
 #endif
 }

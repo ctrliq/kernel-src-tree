@@ -336,9 +336,60 @@ struct page *hmm_vma_alloc_locked_page(struct vm_area_struct *vma,
  *
  * @free: call when refcount on page reach 1 and thus is no longer use
  * @fault: call when there is a page fault to unaddressable memory
+ *
+ * Both callback happens from page_free() and page_fault() callback of struct
+ * dev_pagemap respectively. See include/linux/memremap.h for more details on
+ * those.
+ *
+ * The hmm_devmem_ops callback are just here to provide a coherent and
+ * uniq API to device driver and device driver should not register their
+ * own page_free() or page_fault() but rely on the hmm_devmem_ops call-
+ * back.
  */
 struct hmm_devmem_ops {
+	/*
+	 * free() - free a device page
+	 * @devmem: device memory structure (see struct hmm_devmem)
+	 * @page: pointer to struct page being freed
+	 *
+	 * Call back occurs whenever a device page refcount reach 1 which
+	 * means that no one is holding any reference on the page anymore
+	 * (ZONE_DEVICE page have an elevated refcount of 1 as default so
+	 * that they are not release to the general page allocator).
+	 *
+	 * Note that callback has exclusive ownership of the page (as no
+	 * one is holding any reference).
+	 */
 	void (*free)(struct hmm_devmem *devmem, struct page *page);
+	/*
+	 * fault() - CPU page fault or get user page (GUP)
+	 * @devmem: device memory structure (see struct hmm_devmem)
+	 * @vma: virtual memory area containing the virtual address
+	 * @addr: virtual address that faulted or for which there is a GUP
+	 * @page: pointer to struct page backing virtual address (unreliable)
+	 * @flags: FAULT_FLAG_* (see include/linux/mm.h)
+	 * @pmdp: page middle directory
+	 * Returns: VM_FAULT_MINOR/MAJOR on success or one of VM_FAULT_ERROR
+	 *   on error
+	 *
+	 * The callback occurs whenever there is a CPU page fault or GUP on a
+	 * virtual address. This means that the device driver must migrate the
+	 * page back to regular memory (CPU accessible).
+	 *
+	 * The device driver is free to migrate more than one page from the
+	 * fault() callback as an optimization. However if device decide to
+	 * migrate more than one page it must always priotirize the faulting
+	 * address over the others.
+	 *
+	 * The struct page pointer is only given as an hint to allow quick
+	 * lookup of internal device driver data. A concurrent migration
+	 * might have already free that page and the virtual address might
+	 * not longer be back by it. So it should not be modified by the
+	 * callback.
+	 *
+	 * Note that mmap semaphore is held in read mode at least when this
+	 * callback occurs, hence the vma is valid upon callback entry.
+	 */
 	int (*fault)(struct hmm_devmem *devmem,
 		     struct vm_area_struct *vma,
 		     unsigned long addr,

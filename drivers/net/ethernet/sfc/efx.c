@@ -2191,16 +2191,14 @@ int efx_net_stop(struct net_device *net_dev)
 }
 
 /* Context: process, dev_base_lock or RTNL held, non-blocking. */
-static struct rtnl_link_stats64 *efx_net_stats(struct net_device *net_dev,
-					       struct rtnl_link_stats64 *stats)
+static void efx_net_stats(struct net_device *net_dev,
+			  struct rtnl_link_stats64 *stats)
 {
 	struct efx_nic *efx = netdev_priv(net_dev);
 
 	spin_lock_bh(&efx->stats_lock);
 	efx->type->update_stats(efx, NULL, stats);
 	spin_unlock_bh(&efx->stats_lock);
-
-	return stats;
 }
 
 /* Context: netif_tx_lock held, BHs disabled. */
@@ -2407,7 +2405,7 @@ static const struct net_device_ops efx_netdev_ops = {
 	.ndo_start_xmit		= efx_hard_start_xmit,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_do_ioctl		= efx_ioctl,
-	.ndo_change_mtu		= efx_change_mtu,
+	.extended.ndo_change_mtu	= efx_change_mtu,
 	.ndo_set_mac_address	= efx_set_mac_address,
 	.ndo_set_rx_mode	= efx_set_rx_mode,
 	.ndo_set_features	= efx_set_features,
@@ -2425,7 +2423,7 @@ static const struct net_device_ops efx_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = efx_netpoll,
 #endif
-	.ndo_setup_tc		= efx_setup_tc,
+	.extended.ndo_setup_tc_rh = efx_setup_tc,
 #ifdef CONFIG_RFS_ACCEL
 	.ndo_rx_flow_steer	= efx_filter_rfs,
 #endif
@@ -2499,8 +2497,8 @@ static int efx_register_netdev(struct efx_nic *efx)
 		net_dev->priv_flags |= IFF_UNICAST_FLT;
 	net_dev->ethtool_ops = &efx_ethtool_ops;
 	net_dev->gso_max_segs = EFX_TSO_MAX_SEGS;
-	net_dev->min_mtu = EFX_MIN_MTU;
-	net_dev->max_mtu = EFX_MAX_MTU;
+	net_dev->extended->min_mtu = EFX_MIN_MTU;
+	net_dev->extended->max_mtu = EFX_MAX_MTU;
 
 	rtnl_lock();
 

@@ -2719,7 +2719,6 @@ static void __exit isert_exit(void)
 }
 
 MODULE_DESCRIPTION("iSER-Target for mainline target infrastructure");
-MODULE_VERSION("1.0");
 MODULE_AUTHOR("nab@Linux-iSCSI.org");
 MODULE_LICENSE("GPL");
 

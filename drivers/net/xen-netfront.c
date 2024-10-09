@@ -909,6 +909,7 @@ static int handle_incoming_queue(struct netfront_queue *queue,
 
 		/* Ethernet work: Delayed to here as it peeks the header. */
 		skb->protocol = eth_type_trans(skb, queue->info->netdev);
+		skb_reset_network_header(skb);
 
 		if (checksum_setup(queue->info->netdev, skb)) {
 			kfree_skb(skb);
@@ -1037,8 +1038,8 @@ static int xennet_change_mtu(struct net_device *dev, int mtu)
 	return 0;
 }
 
-static struct rtnl_link_stats64 *xennet_get_stats64(struct net_device *dev,
-						    struct rtnl_link_stats64 *tot)
+static void xennet_get_stats64(struct net_device *dev,
+			       struct rtnl_link_stats64 *tot)
 {
 	struct netfront_info *np = netdev_priv(dev);
 	int cpu;
@@ -1069,8 +1070,6 @@ static struct rtnl_link_stats64 *xennet_get_stats64(struct net_device *dev,
 
 	tot->rx_errors  = dev->stats.rx_errors;
 	tot->tx_dropped = dev->stats.tx_dropped;
-
-	return tot;
 }
 
 static void xennet_release_tx_bufs(struct netfront_queue *queue)
@@ -1229,10 +1228,11 @@ static void xennet_poll_controller(struct net_device *dev)
 #endif
 
 static const struct net_device_ops xennet_netdev_ops = {
+	.ndo_size	     = sizeof(struct net_device_ops),
 	.ndo_open            = xennet_open,
 	.ndo_stop            = xennet_close,
 	.ndo_start_xmit      = xennet_start_xmit,
-	.ndo_change_mtu	     = xennet_change_mtu,
+	.extended.ndo_change_mtu = xennet_change_mtu,
 	.ndo_get_stats64     = xennet_get_stats64,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr   = eth_validate_addr,
@@ -1293,6 +1293,8 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
 	netdev->features |= netdev->hw_features;
 
 	SET_ETHTOOL_OPS(netdev, &xennet_ethtool_ops);
+	netdev->extended->min_mtu = ETH_MIN_MTU;
+	netdev->extended->max_mtu = XEN_NETIF_MAX_TX_SIZE;
 	SET_NETDEV_DEV(netdev, &dev->dev);
 
 	netif_set_gso_max_size(netdev, XEN_NETIF_MAX_TX_SIZE - MAX_TCP_HEADER);

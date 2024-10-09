@@ -137,6 +137,17 @@ struct cpufreq_policy {
 	 */
 	struct rw_semaphore	rwsem;
 
+	/*
+	 * Fast switch flags:
+	 * - fast_switch_possible should be set by the driver if it can
+	 *   guarantee that frequency can be changed on any CPU sharing the
+	 *   policy and that the change will affect all of the policy CPUs then.
+	 * - fast_switch_enabled is to be set by governors that support fast
+	 *   freqnency switching with the help of cpufreq_enable_fast_switch().
+	 */
+	bool			fast_switch_possible;
+	bool			fast_switch_enabled;
+
 	/* Synchronization for frequency transitions */
 	bool			transition_ongoing; /* Tracks transition status */
 	spinlock_t		transition_lock;
@@ -236,6 +247,8 @@ struct cpufreq_governor {
 /*
  * Pass a target to the cpufreq driver.
  */
+unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
+					unsigned int target_freq);
 extern int cpufreq_driver_target(struct cpufreq_policy *policy,
 				 unsigned int target_freq,
 				 unsigned int relation);
@@ -285,6 +298,8 @@ struct cpufreq_driver {
 				  unsigned int relation);	/* Deprecated */
 	int		(*target_index)(struct cpufreq_policy *policy,
 					unsigned int index);
+	unsigned int	(*fast_switch)(struct cpufreq_policy *policy,
+				       unsigned int target_freq);
 	/*
 	 * Only for drivers with target_index() and CPUFREQ_ASYNC_NOTIFICATION
 	 * unset.
@@ -439,6 +454,7 @@ int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu);
 int cpufreq_update_policy(unsigned int cpu);
 bool have_governor_per_policy(void);
 struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
+void cpufreq_enable_fast_switch(struct cpufreq_policy *policy);
 
 #ifdef CONFIG_CPU_FREQ
 /*

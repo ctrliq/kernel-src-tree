@@ -266,7 +266,7 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 
 		if (budget &&
 		    ((j / WB_STRIDE) == 0) && (j > 0) &&
-		    !test_bit(__I40E_DOWN, &vsi->state) &&
+		    !test_bit(__I40E_VSI_DOWN, vsi->state) &&
 		    (I40E_DESC_UNUSED(tx_ring) != tx_ring->count))
 			tx_ring->arm_wb = true;
 	}
@@ -284,7 +284,7 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 		smp_mb();
 		if (__netif_subqueue_stopped(tx_ring->netdev,
 					     tx_ring->queue_index) &&
-		   !test_bit(__I40E_DOWN, &vsi->state)) {
+		   !test_bit(__I40E_VSI_DOWN, vsi->state)) {
 			netif_wake_subqueue(tx_ring->netdev,
 					    tx_ring->queue_index);
 			++tx_ring->tx_stats.restart_queue;
@@ -485,6 +485,7 @@ void i40evf_clean_rx_ring(struct i40e_ring *rx_ring)
 {
 	unsigned long bi_size;
 	u16 i;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* ring already cleared, nothing to do */
 	if (!rx_ring->rx_bi)
@@ -508,14 +509,17 @@ void i40evf_clean_rx_ring(struct i40e_ring *rx_ring)
 		dma_sync_single_range_for_cpu(rx_ring->dev,
 					      rx_bi->dma,
 					      rx_bi->page_offset,
-					      I40E_RXBUFFER_2048,
+					      rx_ring->rx_buf_len,
 					      DMA_FROM_DEVICE);
 
 		/* free resources associated with mapping */
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		dma_unmap_page_attrs(rx_ring->dev, rx_bi->dma,
-				     PAGE_SIZE,
+				     i40e_rx_pg_size(rx_ring),
 				     DMA_FROM_DEVICE,
-				     I40E_RX_DMA_ATTR);
+				     &attrs);
+
 		__page_frag_cache_drain(rx_bi->page, rx_bi->pagecnt_bias);
 
 		rx_bi->page = NULL;
@@ -617,6 +621,17 @@ static inline void i40e_release_rx_desc(struct i40e_ring *rx_ring, u32 val)
 }
 
 /**
+ * i40e_rx_offset - Return expected offset into page to access data
+ * @rx_ring: Ring we are requesting offset of
+ *
+ * Returns the offset value for ring into the data buffer.
+ */
+static inline unsigned int i40e_rx_offset(struct i40e_ring *rx_ring)
+{
+	return ring_uses_build_skb(rx_ring) ? I40E_SKB_PAD : 0;
+}
+
+/**
  * i40e_alloc_mapped_page - recycle or make a new page
  * @rx_ring: ring to use
  * @bi: rx_buffer struct to modify
@@ -629,6 +644,7 @@ static bool i40e_alloc_mapped_page(struct i40e_ring *rx_ring,
 {
 	struct page *page = bi->page;
 	dma_addr_t dma;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* since we are recycling buffers we should seldom need to alloc */
 	if (likely(page)) {
@@ -637,30 +653,32 @@ static bool i40e_alloc_mapped_page(struct i40e_ring *rx_ring,
 	}
 
 	/* alloc new page for storage */
-	page = dev_alloc_page();
+	page = dev_alloc_pages(i40e_rx_pg_order(rx_ring));
 	if (unlikely(!page)) {
 		rx_ring->rx_stats.alloc_page_failed++;
 		return false;
 	}
 
 	/* map page for use */
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+	dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
-				 PAGE_SIZE,
+				 i40e_rx_pg_size(rx_ring),
 				 DMA_FROM_DEVICE,
-				 I40E_RX_DMA_ATTR);
+				 &attrs);
 
 	/* if mapping failed free memory back to system since
 	 * there isn't much point in holding memory we can't use
 	 */
 	if (dma_mapping_error(rx_ring->dev, dma)) {
-		__free_pages(page, 0);
+		__free_pages(page, i40e_rx_pg_order(rx_ring));
 		rx_ring->rx_stats.alloc_page_failed++;
 		return false;
 	}
 
 	bi->dma = dma;
 	bi->page = page;
-	bi->page_offset = 0;
+	bi->page_offset = i40e_rx_offset(rx_ring);
 
 	/* initialize pagecnt_bias to 1 representing we fully own page */
 	bi->pagecnt_bias = 1;
@@ -713,7 +731,7 @@ bool i40evf_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 		/* sync the buffer for use by the device */
 		dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
 						 bi->page_offset,
-						 I40E_RXBUFFER_2048,
+						 rx_ring->rx_buf_len,
 						 DMA_FROM_DEVICE);
 
 		/* Refresh the desc even if buffer_addrs didn't change
@@ -998,9 +1016,6 @@ static inline bool i40e_page_is_reusable(struct page *page)
  **/
 static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer)
 {
-#if (PAGE_SIZE >= 8192)
-	unsigned int last_offset = PAGE_SIZE - I40E_RXBUFFER_2048;
-#endif
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
 
@@ -1013,7 +1028,9 @@ static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer)
 	if (unlikely((page_count(page) - pagecnt_bias) > 1))
 		return false;
 #else
-	if (rx_buffer->page_offset > last_offset)
+#define I40E_LAST_OFFSET \
+	(SKB_WITH_OVERHEAD(PAGE_SIZE) - I40E_RXBUFFER_2048)
+	if (rx_buffer->page_offset > I40E_LAST_OFFSET)
 		return false;
 #endif
 
@@ -1047,9 +1064,9 @@ static void i40e_add_rx_frag(struct i40e_ring *rx_ring,
 			     unsigned int size)
 {
 #if (PAGE_SIZE < 8192)
-	unsigned int truesize = I40E_RXBUFFER_2048;
+	unsigned int truesize = i40e_rx_pg_size(rx_ring) / 2;
 #else
-	unsigned int truesize = SKB_DATA_ALIGN(size);
+	unsigned int truesize = SKB_DATA_ALIGN(size + i40e_rx_offset(rx_ring));
 #endif
 
 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, rx_buffer->page,
@@ -1108,7 +1125,7 @@ static struct sk_buff *i40e_construct_skb(struct i40e_ring *rx_ring,
 {
 	void *va = page_address(rx_buffer->page) + rx_buffer->page_offset;
 #if (PAGE_SIZE < 8192)
-	unsigned int truesize = I40E_RXBUFFER_2048;
+	unsigned int truesize = i40e_rx_pg_size(rx_ring) / 2;
 #else
 	unsigned int truesize = SKB_DATA_ALIGN(size);
 #endif
@@ -1214,14 +1231,19 @@ static struct sk_buff *i40e_build_skb(struct i40e_ring *rx_ring,
 static void i40e_put_rx_buffer(struct i40e_ring *rx_ring,
 			       struct i40e_rx_buffer *rx_buffer)
 {
+	DEFINE_DMA_ATTRS(attrs);
+
 	if (i40e_can_reuse_rx_page(rx_buffer)) {
 		/* hand second half of page back to the ring */
 		i40e_reuse_rx_page(rx_ring, rx_buffer);
 		rx_ring->rx_stats.page_reuse_count++;
 	} else {
 		/* we are not reusing the buffer so unmap it */
-		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma, PAGE_SIZE,
-				     DMA_FROM_DEVICE, I40E_RX_DMA_ATTR);
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
+		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
+				     i40e_rx_pg_size(rx_ring),
+				     DMA_FROM_DEVICE, &attrs);
 		__page_frag_cache_drain(rx_buffer->page,
 					rx_buffer->pagecnt_bias);
 	}
@@ -1397,9 +1419,7 @@ static u32 i40e_buildreg_itr(const int type, const u16 itr)
 	u32 val;
 
 	val = I40E_VFINT_DYN_CTLN1_INTENA_MASK |
-	      /* Don't clear PBA because that can cause lost interrupts that
-	       * came in while we were cleaning/polling
-	       */
+	      I40E_VFINT_DYN_CTLN1_CLEARPBA_MASK |
 	      (type << I40E_VFINT_DYN_CTLN1_ITR_INDX_SHIFT) |
 	      (itr << I40E_VFINT_DYN_CTLN1_INTERVAL_SHIFT);
 
@@ -1492,7 +1512,7 @@ static inline void i40e_update_enable_itr(struct i40e_vsi *vsi,
 	}
 
 enable_int:
-	if (!test_bit(__I40E_DOWN, &vsi->state))
+	if (!test_bit(__I40E_VSI_DOWN, vsi->state))
 		wr32(hw, INTREG(vector - 1), txval);
 
 	if (q_vector->itr_countdown)
@@ -1521,7 +1541,7 @@ int i40evf_napi_poll(struct napi_struct *napi, int budget)
 	int budget_per_ring;
 	int work_done = 0;
 
-	if (test_bit(__I40E_DOWN, &vsi->state)) {
+	if (test_bit(__I40E_VSI_DOWN, vsi->state)) {
 		napi_complete(napi);
 		return 0;
 	}

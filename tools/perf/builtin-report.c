@@ -16,7 +16,6 @@
 #include <linux/rbtree.h>
 #include "util/symbol.h"
 #include "util/callchain.h"
-#include "util/strlist.h"
 #include "util/values.h"
 
 #include "perf.h"
@@ -38,10 +37,18 @@
 #include "arch/common.h"
 #include "util/time-utils.h"
 #include "util/auxtrace.h"
+#include "util/units.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <regex.h>
+#include <signal.h>
 #include <linux/bitmap.h>
 #include <linux/stringify.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 struct report {
 	struct perf_tool	tool;
@@ -1021,7 +1028,7 @@ repeat:
  		 * providing it only in verbose mode not to bloat too
  		 * much struct symbol.
  		 */
-		if (verbose) {
+		if (verbose > 0) {
 			/*
 			 * XXX: Need to provide a less kludgy way to ask for
 			 * more space per symbol, the u32 is for the index on

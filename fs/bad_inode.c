@@ -276,6 +276,12 @@ static int bad_inode_removexattr(struct dentry *dentry, const char *name)
 	return -EIO;
 }
 
+static int bad_inode_tmpfile(struct inode *inode, struct dentry *dentry,
+			     umode_t mode)
+{
+	return -EIO;
+}
+
 static const struct inode_operations_wrapper bad_inode_ops =
 {
 	.ops = {
@@ -302,6 +308,7 @@ static const struct inode_operations_wrapper bad_inode_ops =
 	.removexattr	= bad_inode_removexattr,
 	},
 	.rename2	= bad_inode_rename2,
+	.tmpfile	= bad_inode_tmpfile,
 };
 
 

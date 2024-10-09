@@ -25,6 +25,7 @@ obj-$(CONFIG_VIRTIO_NET) += virtio_net.o
 obj-$(CONFIG_VXLAN) += vxlan.o
 obj-$(CONFIG_GENEVE) += geneve.o
 obj-$(CONFIG_NLMON) += nlmon.o
+obj-$(CONFIG_VSOCKMON) += vsockmon.o
 
 #
 # Networking Drivers

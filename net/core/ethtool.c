@@ -88,7 +88,6 @@ static const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN]
 	[NETIF_F_GSO_SIT_BIT] =		 "tx-sit-segmentation",
 	[NETIF_F_GSO_UDP_TUNNEL_BIT] =	 "tx-udp_tnl-segmentation",
 	[NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT] = "tx-udp_tnl-csum-segmentation",
-	[NETIF_F_GSO_MPLS_BIT] =	 "tx-mpls-segmentation",
 	[NETIF_F_GSO_SCTP_BIT] =	 "tx-sctp-segmentation",
 	[NETIF_F_GSO_PARTIAL_BIT] =	 "tx-gso-partial",
 
@@ -105,6 +104,7 @@ static const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN]
 	[NETIF_F_HW_L2FW_DOFFLOAD_BIT] = "l2-fwd-offload",
 	[NETIF_F_BUSY_POLL_BIT] =        "busy-poll",
 	[NETIF_F_HW_TC_BIT] =		 "hw-tc-offload",
+	[NETIF_F_RX_UDP_TUNNEL_PORT_BIT] =	 "rx-udp_tunnel-port-offload",
 };
 
 static const char
@@ -2365,6 +2365,33 @@ static int ethtool_set_per_queue(struct net_device *dev, void __user *useraddr)
 	};
 }
 
+static int ethtool_get_fecparam(struct net_device *dev, void __user *useraddr)
+{
+	struct ethtool_fecparam fecparam = { ETHTOOL_GFECPARAM };
+
+	if (!dev->ethtool_ops->get_fecparam)
+		return -EOPNOTSUPP;
+
+	dev->ethtool_ops->get_fecparam(dev, &fecparam);
+
+	if (copy_to_user(useraddr, &fecparam, sizeof(fecparam)))
+		return -EFAULT;
+	return 0;
+}
+
+static int ethtool_set_fecparam(struct net_device *dev, void __user *useraddr)
+{
+	struct ethtool_fecparam fecparam;
+
+	if (!dev->ethtool_ops->set_fecparam)
+		return -EOPNOTSUPP;
+
+	if (copy_from_user(&fecparam, useraddr, sizeof(fecparam)))
+		return -EFAULT;
+
+	return dev->ethtool_ops->set_fecparam(dev, &fecparam);
+}
+
 /* The main entry point in this file.  Called from net/core/dev_ioctl.c */
 
 int dev_ethtool(struct net *net, struct ifreq *ifr)
@@ -2421,6 +2448,7 @@ int dev_ethtool(struct net *net, struct ifreq *ifr)
 	case ETHTOOL_GET_TS_INFO:
 	case ETHTOOL_GEEE:
 	case ETHTOOL_GTUNABLE:
+	case ETHTOOL_GFECPARAM:
 		break;
 	default:
 		if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
@@ -2622,6 +2650,12 @@ int dev_ethtool(struct net *net, struct ifreq *ifr)
 		break;
 	case ETHTOOL_SLINKSETTINGS:
 		rc = ethtool_set_link_ksettings(dev, useraddr);
+		break;
+	case ETHTOOL_GFECPARAM:
+		rc = ethtool_get_fecparam(dev, useraddr);
+		break;
+	case ETHTOOL_SFECPARAM:
+		rc = ethtool_set_fecparam(dev, useraddr);
 		break;
 	default:
 		rc = -EOPNOTSUPP;

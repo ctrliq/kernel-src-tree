@@ -40,8 +40,37 @@ struct efi __read_mostly efi = {
 };
 EXPORT_SYMBOL(efi);
 
+static unsigned long *efi_tables[] = {
+	&efi.mps,
+	&efi.acpi,
+	&efi.acpi20,
+	&efi.smbios,
+	&efi.smbios3,
+	&efi.sal_systab,
+	&efi.boot_info,
+	&efi.hcdp,
+	&efi.uga,
+	&efi.uv_systab,
+	&efi.fw_vendor,
+	&efi.runtime,
+	&efi.config_table,
+	&efi.esrt,
+};
+
 struct kobject *efi_kobj;
-static struct kobject *efivars_kobj;
+
+static bool disable_runtime;
+static int __init setup_noefi(char *arg)
+{
+	disable_runtime = true;
+	return 0;
+}
+early_param("noefi", setup_noefi);
+
+bool efi_runtime_disabled(void)
+{
+	return disable_runtime;
+}
 
 /*
  * Let's not leave out systab information that snuck into
@@ -190,10 +219,9 @@ static int __init efisubsys_init(void)
 		goto err_remove_group;
 
 	/* and the standard mountpoint for efivarfs */
-	efivars_kobj = kobject_create_and_add("efivars", efi_kobj);
-	if (!efivars_kobj) {
+	error = sysfs_create_mount_point(efi_kobj, "efivars");
+	if (error) {
 		pr_err("efivars: Subsystem registration failed.\n");
-		error = -ENOMEM;
 		goto err_remove_group;
 	}
 
@@ -219,7 +247,8 @@ subsys_initcall(efisubsys_init);
 int __init efi_mem_desc_lookup(u64 phys_addr, efi_memory_desc_t *out_md)
 {
 	struct efi_memory_map *map = efi.memmap;
-	void *p, *e;
+	void *memmap, *p, *e;
+	int ret;
 
 	if (!efi_enabled(EFI_MEMMAP)) {
 		pr_err_once("EFI_MEMMAP is not enabled.\n");
@@ -239,29 +268,29 @@ int __init efi_mem_desc_lookup(u64 phys_addr, efi_memory_desc_t *out_md)
 	if (WARN_ON_ONCE(map->nr_map == 0) || WARN_ON_ONCE(map->desc_size == 0))
 		return -EINVAL;
 
-	e = map->phys_map + map->nr_map * map->desc_size;
-	for (p = map->phys_map; p < e; p += map->desc_size) {
-		efi_memory_desc_t *md;
+	/*
+	 * If a driver calls this after efi_free_boot_services,
+	 * ->map will be NULL, and the target may also not be mapped.
+	 * So just always get our own virtual map on the CPU.
+	 */
+	memmap = early_memremap((phys_addr_t)map->phys_map,
+				map->nr_map * map->desc_size);
+	if (!memmap) {
+		pr_err_once("early_memremap(%#llx, %zu) failed.\n",
+			    (unsigned long long) map->phys_map, map->nr_map * map->desc_size);
+		return -ENOMEM;
+	}
+
+	ret = -ENOENT;
+	e = memmap + (map->nr_map * map->desc_size);
+	for (p = memmap; p < e; p += map->desc_size) {
+		efi_memory_desc_t *md = p;
 		u64 size;
 		u64 end;
-
-		/*
-		 * If a driver calls this after efi_free_boot_services,
-		 * ->map will be NULL, and the target may also not be mapped.
-		 * So just always get our own virtual map on the CPU.
-		 *
-		 */
-		md = early_memremap((phys_addr_t)p, sizeof (*md));
-		if (!md) {
-			pr_err_once("early_memremap(%p, %zu) failed.\n",
-				    p, sizeof (*md));
-			return -ENOMEM;
-		}
 
 		if (!(md->attribute & EFI_MEMORY_RUNTIME) &&
 		    md->type != EFI_BOOT_SERVICES_DATA &&
 		    md->type != EFI_RUNTIME_SERVICES_DATA) {
-			early_iounmap(md, sizeof (*md));
 			continue;
 		}
 
@@ -269,13 +298,14 @@ int __init efi_mem_desc_lookup(u64 phys_addr, efi_memory_desc_t *out_md)
 		end = md->phys_addr + size;
 		if (phys_addr >= md->phys_addr && phys_addr < end) {
 			memcpy(out_md, md, sizeof(*out_md));
-			early_iounmap(md, sizeof (*md));
-			return 0;
+			ret = 0;
+			break;
 		}
-
-		early_iounmap(md, sizeof (*md));
 	}
-	return -ENOENT;
+
+	early_memunmap(memmap, map->nr_map * map->desc_size);
+
+	return ret;
 }
 
 /*
@@ -361,7 +391,7 @@ int __init efi_config_init(efi_config_table_type_t *arch_tables)
 			if (table64 >> 32) {
 				pr_cont("\n");
 				pr_err("Table located above 4GB, disabling EFI.\n");
-				early_iounmap(config_tables,
+				early_memunmap(config_tables,
 					       efi.systab->nr_tables * sz);
 				return -EINVAL;
 			}
@@ -377,6 +407,21 @@ int __init efi_config_init(efi_config_table_type_t *arch_tables)
 		tablep += sz;
 	}
 	pr_cont("\n");
-	early_iounmap(config_tables, efi.systab->nr_tables * sz);
+	early_memunmap(config_tables, efi.systab->nr_tables * sz);
+
 	return 0;
+}
+
+bool efi_is_table_address(unsigned long phys_addr)
+{
+	unsigned int i;
+
+	if (phys_addr == EFI_INVALID_TABLE_ADDR)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(efi_tables); i++)
+		if (*(efi_tables[i]) == phys_addr)
+			return true;
+
+	return false;
 }

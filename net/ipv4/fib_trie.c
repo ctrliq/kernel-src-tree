@@ -80,6 +80,7 @@
 #include <net/tcp.h>
 #include <net/sock.h>
 #include <net/ip_fib.h>
+#include <net/fib_notifier.h>
 #include "fib_lookup.h"
 
 static int call_fib_entry_notifier(struct notifier_block *nb, struct net *net,
@@ -95,7 +96,7 @@ static int call_fib_entry_notifier(struct notifier_block *nb, struct net *net,
 		.type = type,
 		.tb_id = tb_id,
 	};
-	return call_fib_notifier(nb, net, event_type, &info.info);
+	return call_fib4_notifier(nb, net, event_type, &info.info);
 }
 
 static int call_fib_entry_notifiers(struct net *net,
@@ -111,7 +112,7 @@ static int call_fib_entry_notifiers(struct net *net,
 		.type = type,
 		.tb_id = tb_id,
 	};
-	return call_fib_notifiers(net, event_type, &info.info);
+	return call_fib4_notifiers(net, event_type, &info.info);
 }
 
 #define MAX_STAT_DEPTH 32
@@ -172,7 +173,6 @@ struct trie_stat {
 };
 
 struct trie {
-	struct rcu_head	rcu;
 	struct key_vector kv[1];
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 	struct trie_use_stats __percpu *stats;
@@ -1251,6 +1251,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 	new_fa->fa_type = cfg->fc_type;
 	new_fa->fa_state = 0;
 	new_fa->fa_slen = slen;
+	new_fa->tb_id = tb->tb_id;
 
 	/* Insert new entry to the list. */
 	err = fib_insert_alias(t, tp, l, new_fa, fa, key);
@@ -1263,7 +1264,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 	rt_cache_flush(cfg->fc_nlinfo.nl_net);
 	call_fib_entry_notifiers(net, event, key, plen, fi, tos, cfg->fc_type,
 				 tb->tb_id);
-	rtmsg_fib(RTM_NEWROUTE, htonl(key), new_fa, plen, tb->tb_id,
+	rtmsg_fib(RTM_NEWROUTE, htonl(key), new_fa, plen, new_fa->tb_id,
 		  &cfg->fc_nlinfo, nlflags);
 succeeded:
 	return 0;
@@ -1287,7 +1288,7 @@ static inline t_key prefix_mismatch(t_key key, struct key_vector *n)
 int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
 		     struct fib_result *res, int fib_flags)
 {
-	struct trie *t = (struct trie *)tb->tb_data;
+	struct trie *t = (struct trie *) tb->tb_data;
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 	struct trie_use_stats __percpu *stats = t->stats;
 #endif
@@ -1537,7 +1538,8 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
 		     fi->fib_prefsrc == cfg->fc_prefsrc) &&
 		    (!cfg->fc_protocol ||
 		     fi->fib_protocol == cfg->fc_protocol) &&
-		    fib_nh_match(cfg, fi) == 0) {
+		    fib_nh_match(cfg, fi) == 0 &&
+		    fib_metrics_match(cfg, fi)) {
 			fa_to_delete = fa;
 			break;
 		}
@@ -1621,6 +1623,187 @@ found:
 	/* if we are at the limit for keys just return NULL for the tnode */
 	*tn = pn;
 	return n;
+}
+
+static void fib_trie_free(struct fib_table *tb)
+{
+	struct trie *t = (struct trie *)tb->tb_data;
+	struct key_vector *pn = t->kv;
+	unsigned long cindex = 1;
+	struct hlist_node *tmp;
+	struct fib_alias *fa;
+
+	/* walk trie in reverse order and free everything */
+	for (;;) {
+		struct key_vector *n;
+
+		if (!(cindex--)) {
+			t_key pkey = pn->key;
+
+			if (IS_TRIE(pn))
+				break;
+
+			n = pn;
+			pn = node_parent(pn);
+
+			/* drop emptied tnode */
+			put_child_root(pn, n->key, NULL);
+			node_free(n);
+
+			cindex = get_index(pkey, pn);
+
+			continue;
+		}
+
+		/* grab the next available node */
+		n = get_child(pn, cindex);
+		if (!n)
+			continue;
+
+		if (IS_TNODE(n)) {
+			/* record pn and cindex for leaf walking */
+			pn = n;
+			cindex = 1ul << n->bits;
+
+			continue;
+		}
+
+		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
+			hlist_del_rcu(&fa->fa_list);
+			alias_free_mem_rcu(fa);
+		}
+
+		put_child_root(pn, n->key, NULL);
+		node_free(n);
+	}
+
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+	free_percpu(t->stats);
+#endif
+	kfree(tb);
+}
+
+struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
+{
+	struct trie *ot = (struct trie *)oldtb->tb_data;
+	struct key_vector *l, *tp = ot->kv;
+	struct fib_table *local_tb;
+	struct fib_alias *fa;
+	struct trie *lt;
+	t_key key = 0;
+
+	if (oldtb->tb_data == oldtb->__data)
+		return oldtb;
+
+	local_tb = fib_trie_table(RT_TABLE_LOCAL, NULL);
+	if (!local_tb)
+		return NULL;
+
+	lt = (struct trie *)local_tb->tb_data;
+
+	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
+		struct key_vector *local_l = NULL, *local_tp;
+
+		hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
+			struct fib_alias *new_fa;
+
+			if (local_tb->tb_id != fa->tb_id)
+				continue;
+
+			/* clone fa for new local table */
+			new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);
+			if (!new_fa)
+				goto out;
+
+			memcpy(new_fa, fa, sizeof(*fa));
+
+			/* insert clone into table */
+			if (!local_l)
+				local_l = fib_find_node(lt, &local_tp, l->key);
+
+			if (fib_insert_alias(lt, local_tp, local_l, new_fa,
+					     NULL, l->key)) {
+				kmem_cache_free(fn_alias_kmem, new_fa);
+				goto out;
+			}
+		}
+
+		/* stop loop if key wrapped back to 0 */
+		key = l->key + 1;
+		if (key < l->key)
+			break;
+	}
+
+	return local_tb;
+out:
+	fib_trie_free(local_tb);
+
+	return NULL;
+}
+
+/* Caller must hold RTNL */
+void fib_table_flush_external(struct fib_table *tb)
+{
+	struct trie *t = (struct trie *)tb->tb_data;
+	struct key_vector *pn = t->kv;
+	unsigned long cindex = 1;
+	struct hlist_node *tmp;
+	struct fib_alias *fa;
+
+	/* walk trie in reverse order */
+	for (;;) {
+		unsigned char slen = 0;
+		struct key_vector *n;
+
+		if (!(cindex--)) {
+			t_key pkey = pn->key;
+
+			/* cannot resize the trie vector */
+			if (IS_TRIE(pn))
+				break;
+
+			/* resize completed node */
+			pn = resize(t, pn);
+			cindex = get_index(pkey, pn);
+
+			continue;
+		}
+
+		/* grab the next available node */
+		n = get_child(pn, cindex);
+		if (!n)
+			continue;
+
+		if (IS_TNODE(n)) {
+			/* record pn and cindex for leaf walking */
+			pn = n;
+			cindex = 1ul << n->bits;
+
+			continue;
+		}
+
+		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
+			/* if alias was cloned to local then we just
+			 * need to remove the local copy from main
+			 */
+			if (tb->tb_id != fa->tb_id) {
+				hlist_del_rcu(&fa->fa_list);
+				alias_free_mem_rcu(fa);
+				continue;
+			}
+
+			/* record local slen */
+			slen = fa->fa_slen;
+		}
+
+		/* update leaf slen */
+		n->slen = slen;
+
+		if (hlist_empty(&n->leaf)) {
+			put_child_root(pn, n->key, NULL);
+			node_free(n);
+		}
+	}
 }
 
 /* Caller must hold RTNL. */
@@ -1709,22 +1892,15 @@ static void fib_leaf_notify(struct net *net, struct key_vector *l,
 		if (!fi)
 			continue;
 
-#if 0
 		/* local and main table can share the same trie,
 		 * so don't notify twice for the same entry.
-		 *
-		 * RHEL note: This cannot happen because there is not
-		 * backported 0ddcf43d5d4a ("ipv4: FIB Local/MAIN table
-		 * collapse") in RHEL. Local and main tables cannot share
-		 * a trie. Leaving the code and this note for future.
 		 */
 		if (tb->tb_id != fa->tb_id)
 			continue;
-#endif
 
 		call_fib_entry_notifier(nb, net, FIB_EVENT_ENTRY_ADD, l->key,
 					KEYLENGTH - fa->fa_slen, fi, fa->fa_tos,
-					fa->fa_type, tb->tb_id);
+					fa->fa_type, fa->tb_id);
 	}
 }
 
@@ -1760,21 +1936,19 @@ void fib_notify(struct net *net, struct notifier_block *nb)
 
 static void __trie_free_rcu(struct rcu_head *head)
 {
-	struct trie *t = container_of(head, struct trie, rcu);
-	unsigned long *tb_data = (unsigned long *)t;
-	struct fib_table *tb = container_of(tb_data, struct fib_table,
-					    tb_data[0]);
+	struct fib_table *tb = container_of(head, struct fib_table, rcu);
 #ifdef CONFIG_IP_FIB_TRIE_STATS
-	free_percpu(t->stats);
+	struct trie *t = (struct trie *)tb->tb_data;
+
+	if (tb->tb_data == tb->__data)
+		free_percpu(t->stats);
 #endif /* CONFIG_IP_FIB_TRIE_STATS */
 	kfree(tb);
 }
 
 void fib_free_table(struct fib_table *tb)
 {
-	struct trie *t = (struct trie *)tb->tb_data;
-
-	call_rcu(&t->rcu, __trie_free_rcu);
+	call_rcu(&tb->rcu, __trie_free_rcu);
 }
 
 static int fn_trie_dump_leaf(struct key_vector *l, struct fib_table *tb,
@@ -1789,22 +1963,26 @@ static int fn_trie_dump_leaf(struct key_vector *l, struct fib_table *tb,
 
 	/* rcu_read_lock is hold by caller */
 	hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
+		int err;
+
 		if (i < s_i) {
 			i++;
 			continue;
 		}
 
-		if (fib_dump_info(skb, NETLINK_CB(cb->skb).portid,
-				  cb->nlh->nlmsg_seq,
-				  RTM_NEWROUTE,
-				  tb->tb_id,
-				  fa->fa_type,
-				  xkey,
-				  KEYLENGTH - fa->fa_slen,
-				  fa->fa_tos,
-				  fa->fa_info, NLM_F_MULTI) < 0) {
+		if (tb->tb_id != fa->tb_id) {
+			i++;
+			continue;
+		}
+
+		err = fib_dump_info(skb, NETLINK_CB(cb->skb).portid,
+				    cb->nlh->nlmsg_seq, RTM_NEWROUTE,
+				    tb->tb_id, fa->fa_type,
+				    xkey, KEYLENGTH - fa->fa_slen,
+				    fa->fa_tos, fa->fa_info, NLM_F_MULTI);
+		if (err < 0) {
 			cb->args[4] = i;
-			return -1;
+			return err;
 		}
 		i++;
 	}
@@ -1826,10 +2004,13 @@ int fib_table_dump(struct fib_table *tb, struct sk_buff *skb,
 	t_key key = cb->args[3];
 
 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
-		if (fn_trie_dump_leaf(l, tb, skb, cb) < 0) {
+		int err;
+
+		err = fn_trie_dump_leaf(l, tb, skb, cb);
+		if (err < 0) {
 			cb->args[3] = key;
 			cb->args[2] = count;
-			return -1;
+			return err;
 		}
 
 		++count;
@@ -1860,18 +2041,26 @@ void __init fib_trie_init(void)
 					   0, SLAB_PANIC, NULL);
 }
 
-struct fib_table *fib_trie_table(u32 id)
+struct fib_table *fib_trie_table(u32 id, struct fib_table *alias)
 {
 	struct fib_table *tb;
 	struct trie *t;
+	size_t sz = sizeof(*tb);
 
-	tb = kzalloc(sizeof(*tb) + sizeof(struct trie), GFP_KERNEL);
+	if (!alias)
+		sz += sizeof(struct trie);
+
+	tb = kzalloc(sz, GFP_KERNEL);
 	if (tb == NULL)
 		return NULL;
 
 	tb->tb_id = id;
 	tb->tb_default = -1;
 	tb->tb_num_default = 0;
+	tb->tb_data = (alias ? alias->__data : tb->__data);
+
+	if (alias)
+		return tb;
 
 	t = (struct trie *) tb->tb_data;
 	t->kv[0].pos = KEYLENGTH;
@@ -2430,6 +2619,8 @@ static unsigned int fib_flag_trans(int type, __be32 mask, const struct fib_info 
  */
 static int fib_route_seq_show(struct seq_file *seq, void *v)
 {
+	struct fib_route_iter *iter = seq->private;
+	struct fib_table *tb = iter->main_tb;
 	struct fib_alias *fa;
 	struct key_vector *l = v;
 	__be32 prefix;
@@ -2451,6 +2642,9 @@ static int fib_route_seq_show(struct seq_file *seq, void *v)
 
 		if ((fa->fa_type == RTN_BROADCAST) ||
 		    (fa->fa_type == RTN_MULTICAST))
+			continue;
+
+		if (fa->tb_id != tb->tb_id)
 			continue;
 
 		if (fi)

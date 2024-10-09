@@ -270,7 +270,7 @@ static struct scsi_transport_template *qla4xxx_scsi_transport;
 
 static int qla4xxx_isp_check_reg(struct scsi_qla_host *ha)
 {
-	u32 reg_val = 0;
+	uint32_t reg_val = 0;
 	int rval = QLA_SUCCESS;
 
 	if (is_qla8022(ha))

@@ -4,6 +4,7 @@
  * Copyright (C) 2001 WireX Communications, Inc <chris@wirex.com>
  * Copyright (C) 2001-2002 Greg Kroah-Hartman <greg@kroah.com>
  * Copyright (C) 2001 Networks Associates Technology, Inc <ssmalley@nai.com>
+ * Copyright (C) 2016 Mellanox Technologies
  *
  *	This program is free software; you can redistribute it and/or modify
  *	it under the terms of the GNU General Public License as published by
@@ -28,6 +29,8 @@
 #include <net/flow.h>
 
 #define MAX_LSM_EVM_XATTR	2
+
+static ATOMIC_NOTIFIER_HEAD(lsm_notifier_chain);
 
 /* Boot-time LSM user choice */
 static __initdata char chosen_lsm[SECURITY_NAME_MAX + 1] =
@@ -132,6 +135,24 @@ int __init register_security(struct security_operations *ops)
 
 	return 0;
 }
+
+int call_lsm_notifier(enum lsm_event event, void *data)
+{
+	return atomic_notifier_call_chain(&lsm_notifier_chain, event, data);
+}
+EXPORT_SYMBOL(call_lsm_notifier);
+
+int register_lsm_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(&lsm_notifier_chain, nb);
+}
+EXPORT_SYMBOL(register_lsm_notifier);
+
+int unregister_lsm_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_unregister(&lsm_notifier_chain, nb);
+}
+EXPORT_SYMBOL(unregister_lsm_notifier);
 
 /* Security operations */
 
@@ -754,7 +775,7 @@ static inline unsigned long mmap_prot(struct file *file, unsigned long prot)
 	 * ditto if it's not on noexec mount, except that on !MMU we need
 	 * BDI_CAP_EXEC_MMAP (== VM_MAYEXEC) in this case
 	 */
-	if (!(file->f_path.mnt->mnt_flags & MNT_NOEXEC)) {
+	if (!path_noexec(&file->f_path)) {
 #ifndef CONFIG_MMU
 		unsigned long caps = 0;
 		struct address_space *mapping = file->f_mapping;
@@ -1364,6 +1385,32 @@ void security_skb_owned_by(struct sk_buff *skb, struct sock *sk)
 }
 
 #endif	/* CONFIG_SECURITY_NETWORK */
+
+#ifdef CONFIG_SECURITY_INFINIBAND
+int security_ib_pkey_access(void *sec, u64 subnet_prefix, u16 pkey)
+{
+	return security_ops->ib_pkey_access(sec, subnet_prefix, pkey);
+}
+EXPORT_SYMBOL(security_ib_pkey_access);
+
+int security_ib_endport_manage_subnet(void *sec, const char *dev_name, u8 port_num)
+{
+	return security_ops->ib_endport_manage_subnet(sec, dev_name, port_num);
+}
+EXPORT_SYMBOL(security_ib_endport_manage_subnet);
+
+int security_ib_alloc_security(void **sec)
+{
+	return security_ops->ib_alloc_security(sec);
+}
+EXPORT_SYMBOL(security_ib_alloc_security);
+
+void security_ib_free_security(void *sec)
+{
+	security_ops->ib_free_security(sec);
+}
+EXPORT_SYMBOL(security_ib_free_security);
+#endif	/* CONFIG_SECURITY_INFINIBAND */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 

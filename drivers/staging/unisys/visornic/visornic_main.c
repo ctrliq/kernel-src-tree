@@ -854,7 +854,7 @@ visornic_xmit(struct sk_buff *skb, struct net_device *netdev)
 	 * pointing to
 	 */
 	firstfraglen = skb->len - skb->data_len;
-	if (firstfraglen < ETH_HEADER_SIZE) {
+	if (firstfraglen < ETH_HLEN) {
 		spin_unlock_irqrestore(&devdata->priv_lock, flags);
 		devdata->busy_cnt++;
 		dev_err(&netdev->dev,
@@ -928,7 +928,7 @@ visornic_xmit(struct sk_buff *skb, struct net_device *netdev)
 	/* copy ethernet header from first frag into ocmdrsp
 	 * - everything else will be pass in frags & DMA'ed
 	 */
-	memcpy(cmdrsp->net.xmt.ethhdr, skb->data, ETH_HEADER_SIZE);
+	memcpy(cmdrsp->net.xmt.ethhdr, skb->data, ETH_HLEN);
 	/* copy frags info - from skb->data we need to only provide access
 	 * beyond eth header
 	 */
@@ -1416,11 +1416,12 @@ static void devdata_release(struct visornic_devdata *devdata)
 }
 
 static const struct net_device_ops visornic_dev_ops = {
+	.ndo_size = sizeof(struct net_device_ops),
 	.ndo_open = visornic_open,
 	.ndo_stop = visornic_close,
 	.ndo_start_xmit = visornic_xmit,
 	.ndo_get_stats = visornic_get_stats,
-	.ndo_change_mtu = visornic_change_mtu,
+	.extended.ndo_change_mtu = visornic_change_mtu,
 	.ndo_tx_timeout = visornic_xmit_timeout,
 	.ndo_set_rx_mode = visornic_set_multi,
 };

@@ -26,6 +26,7 @@
 #include <asm/asm-offsets.h>
 #include <asm/os_info.h>
 #include <asm/switch_to.h>
+#include <asm/nmi.h>
 
 typedef void (*relocate_kernel_t)(kimage_entry_t *, unsigned long);
 
@@ -54,6 +55,8 @@ static void add_elf_notes(int cpu)
 void setup_regs(void)
 {
 	unsigned long sa = S390_lowcore.prefixreg_save_area + SAVE_AREA_BASE;
+	struct mcesa *mcesa;
+	unsigned long cr2_old, cr2_new;
 	struct _lowcore *lc;
 	int cpu, this_cpu;
 
@@ -68,8 +71,16 @@ void setup_regs(void)
 			continue;
 		add_elf_notes(cpu);
 	}
+	mcesa = (struct mcesa *)(S390_lowcore.mcesad & MCESA_ORIGIN_MASK);
 	if (MACHINE_HAS_VX)
-		save_vx_regs_safe((void *) lc->vector_save_area_addr);
+		save_vx_regs_safe((void *) mcesa->vector_save_area);
+	if (MACHINE_HAS_GS) {
+		__ctl_store(cr2_old, 2, 2);
+		cr2_new = cr2_old | (1UL << 4);
+		__ctl_load(cr2_new, 2, 2);
+		save_gs_cb((struct gs_cb *) mcesa->guarded_storage_save_area);
+		__ctl_load(cr2_old, 2, 2);
+	}
 	/* Copy dump CPU store status info to absolute zero */
 	memcpy((void *) SAVE_AREA_BASE, (void *) sa, sizeof(struct save_area));
 }
@@ -83,13 +94,13 @@ static int machine_kdump_pm_cb(struct notifier_block *nb, unsigned long action,
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
-		if (crashk_res.start)
-			crash_map_reserved_pages();
+		if (kexec_crash_image)
+			arch_kexec_unprotect_crashkres();
 		break;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
-		if (crashk_res.start)
-			crash_unmap_reserved_pages();
+		if (kexec_crash_image)
+			arch_kexec_protect_crashkres();
 		break;
 	default:
 		return NOTIFY_DONE;
@@ -100,6 +111,8 @@ static int machine_kdump_pm_cb(struct notifier_block *nb, unsigned long action,
 static int __init machine_kdump_pm_init(void)
 {
 	pm_notifier(machine_kdump_pm_cb, 0);
+	/* Create initial mapping for crashkernel memory */
+	arch_kexec_unprotect_crashkres();
 	return 0;
 }
 arch_initcall(machine_kdump_pm_init);
@@ -134,6 +147,8 @@ static int kdump_csum_valid(struct kimage *image)
 #endif
 }
 
+#ifdef CONFIG_CRASH_DUMP
+
 /*
  * Map or unmap crashkernel memory
  */
@@ -155,20 +170,24 @@ static void crash_map_pages(int enable)
 }
 
 /*
- * Map crashkernel memory
+ * Unmap crashkernel memory
  */
-void crash_map_reserved_pages(void)
+void arch_kexec_protect_crashkres(void)
 {
-	crash_map_pages(1);
+	if (crashk_res.end)
+		crash_map_pages(0);
 }
 
 /*
- * Unmap crashkernel memory
+ * Map crashkernel memory
  */
-void crash_unmap_reserved_pages(void)
+void arch_kexec_unprotect_crashkres(void)
 {
-	crash_map_pages(0);
+	if (crashk_res.end)
+		crash_map_pages(1);
 }
+
+#endif
 
 /*
  * Give back memory to hypervisor before new kdump is loaded
@@ -237,6 +256,7 @@ static void __do_machine_kexec(void *data)
 
 	data_mover = (relocate_kernel_t) page_to_phys(image->control_code_page);
 
+	__arch_local_irq_stnsm(0xfb); /* disable DAT - avoid no-execute */
 	/* Call the moving routine */
 	(*data_mover)(&image->head, image->start);
 }

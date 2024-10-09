@@ -67,7 +67,6 @@
 MODULE_AUTHOR("Roland Dreier");
 MODULE_DESCRIPTION("Mellanox ConnectX HCA InfiniBand driver");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION(DRV_VERSION);
 
 int mlx4_ib_sm_guid_assign = 0;
 module_param_named(sm_guid_assign, mlx4_ib_sm_guid_assign, int, 0444);
@@ -776,7 +775,7 @@ int __mlx4_ib_query_port(struct ib_device *ibdev, u8 port,
 {
 	int err;
 
-	memset(props, 0, sizeof *props);
+	/* props being zeroed by the caller, avoid zeroing it here */
 
 	err = mlx4_ib_port_link_layer(ibdev, port) == IB_LINK_LAYER_INFINIBAND ?
 		ib_link_query_port(ibdev, port, props, netw_view) :
@@ -1049,7 +1048,7 @@ static int mlx4_ib_modify_port(struct ib_device *ibdev, u8 port, int mask,
 
 	mutex_lock(&mdev->cap_mask_mutex);
 
-	err = mlx4_ib_query_port(ibdev, port, &attr);
+	err = ib_query_port(ibdev, port, &attr);
 	if (err)
 		goto out;
 
@@ -1191,7 +1190,7 @@ static void mlx4_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
 			 * call to mlx4_ib_vma_close.
 			 */
 			put_task_struct(owning_process);
-			msleep(1);
+			usleep_range(1000, 2000);
 			owning_process = get_pid_task(ibcontext->tgid,
 						      PIDTYPE_PID);
 			if (!owning_process ||
@@ -2578,13 +2577,6 @@ static int mlx4_port_immutable(struct ib_device *ibdev, u8 port_num,
 	struct mlx4_ib_dev *mdev = to_mdev(ibdev);
 	int err;
 
-	err = mlx4_ib_query_port(ibdev, port_num, &attr);
-	if (err)
-		return err;
-
-	immutable->pkey_tbl_len = attr.pkey_tbl_len;
-	immutable->gid_tbl_len = attr.gid_tbl_len;
-
 	if (mlx4_ib_port_link_layer(ibdev, port_num) == IB_LINK_LAYER_INFINIBAND) {
 		immutable->core_cap_flags = RDMA_CORE_PORT_IBA_IB;
 		immutable->max_mad_size = IB_MGMT_MAD_SIZE;
@@ -2600,15 +2592,21 @@ static int mlx4_port_immutable(struct ib_device *ibdev, u8 port_num,
 			immutable->max_mad_size = IB_MGMT_MAD_SIZE;
 	}
 
+	err = ib_query_port(ibdev, port_num, &attr);
+	if (err)
+		return err;
+
+	immutable->pkey_tbl_len = attr.pkey_tbl_len;
+	immutable->gid_tbl_len = attr.gid_tbl_len;
+
 	return 0;
 }
 
-static void get_fw_ver_str(struct ib_device *device, char *str,
-			   size_t str_len)
+static void get_fw_ver_str(struct ib_device *device, char *str)
 {
 	struct mlx4_ib_dev *dev =
 		container_of(device, struct mlx4_ib_dev, ib_dev);
-	snprintf(str, str_len, "%d.%d.%d",
+	snprintf(str, IB_FW_VERSION_NAME_MAX, "%d.%d.%d",
 		 (int) (dev->dev->caps.fw_ver >> 32),
 		 (int) (dev->dev->caps.fw_ver >> 16) & 0xffff,
 		 (int) dev->dev->caps.fw_ver & 0xffff);
@@ -2927,22 +2925,18 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
 	if (mlx4_ib_init_sriov(ibdev))
 		goto err_mad;
 
-	if (dev->caps.flags & MLX4_DEV_CAP_FLAG_IBOE ||
-	    dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ROCE_V1_V2) {
-		if (!iboe->nb.notifier_call) {
-			iboe->nb.notifier_call = mlx4_ib_netdev_event;
-			err = register_netdevice_notifier_rh(&iboe->nb);
-			if (err) {
-				iboe->nb.notifier_call = NULL;
-				goto err_notif;
-			}
+	if (!iboe->nb.notifier_call) {
+		iboe->nb.notifier_call = mlx4_ib_netdev_event;
+		err = register_netdevice_notifier_rh(&iboe->nb);
+		if (err) {
+			iboe->nb.notifier_call = NULL;
+			goto err_notif;
 		}
-		if (dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ROCE_V1_V2) {
-			err = mlx4_config_roce_v2_port(dev, ROCE_V2_UDP_DPORT);
-			if (err) {
-				goto err_notif;
-			}
-		}
+	}
+	if (dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ROCE_V1_V2) {
+		err = mlx4_config_roce_v2_port(dev, ROCE_V2_UDP_DPORT);
+		if (err)
+			goto err_notif;
 	}
 
 	for (j = 0; j < ARRAY_SIZE(mlx4_class_attributes); ++j) {

@@ -934,9 +934,11 @@ static void prb_fill_vlan_info(struct tpacket_kbdq_core *pkc,
 {
 	if (skb_vlan_tag_present(pkc->skb)) {
 		ppd->hv1.tp_vlan_tci = skb_vlan_tag_get(pkc->skb);
-		ppd->tp_status = TP_STATUS_VLAN_VALID;
+		ppd->hv1.tp_vlan_tpid = ntohs(pkc->skb->vlan_proto);
+		ppd->tp_status = TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID;
 	} else {
 		ppd->hv1.tp_vlan_tci = 0;
+		ppd->hv1.tp_vlan_tpid = 0;
 		ppd->tp_status = TP_STATUS_AVAILABLE;
 	}
 }
@@ -944,6 +946,7 @@ static void prb_fill_vlan_info(struct tpacket_kbdq_core *pkc,
 static void prb_run_all_ft_ops(struct tpacket_kbdq_core *pkc,
 			struct tpacket3_hdr *ppd)
 {
+	ppd->hv1.tp_padding = 0;
 	prb_fill_vlan_info(pkc, ppd);
 
 	if (pkc->feature_req_word & TP_FT_REQ_FILL_RXHASH)
@@ -1331,6 +1334,8 @@ static void __fanout_link(struct sock *sk, struct packet_sock *po)
 	f->arr[f->num_members] = sk;
 	smp_wmb();
 	f->num_members++;
+	if (f->num_members == 1)
+		dev_add_pack(&f->prot_hook);
 	spin_unlock(&f->lock);
 }
 
@@ -1347,6 +1352,8 @@ static void __fanout_unlink(struct sock *sk, struct packet_sock *po)
 	BUG_ON(i >= f->num_members);
 	f->arr[i] = f->arr[f->num_members - 1];
 	f->num_members--;
+	if (f->num_members == 0)
+		__dev_remove_pack(&f->prot_hook);
 	spin_unlock(&f->lock);
 }
 
@@ -1379,13 +1386,12 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
 		return -EINVAL;
 	}
 
-	if (!po->running)
-		return -EINVAL;
-
-	if (po->fanout)
-		return -EALREADY;
-
 	mutex_lock(&fanout_mutex);
+
+	err = -EALREADY;
+	if (po->fanout)
+		goto out;
+
 	match = NULL;
 	list_for_each_entry(f, &fanout_list, list) {
 		if (f->id == id &&
@@ -1415,11 +1421,13 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
 		match->prot_hook.func = packet_rcv_fanout;
 		match->prot_hook.af_packet_priv = match;
 		match->prot_hook.id_match = match_fanout_group;
-		dev_add_pack(&match->prot_hook);
 		list_add(&match->list, &fanout_list);
 	}
 	err = -EINVAL;
-	if (match->type == type &&
+
+	spin_lock(&po->bind_lock);
+	if (po->running &&
+	    match->type == type &&
 	    match->prot_hook.type == po->prot_hook.type &&
 	    match->prot_hook.dev == po->prot_hook.dev) {
 		err = -ENOSPC;
@@ -1431,29 +1439,41 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
 			err = 0;
 		}
 	}
+	spin_unlock(&po->bind_lock);
+
+	if (err && !atomic_read(&match->sk_ref)) {
+		list_del(&match->list);
+		kfree(match);
+	}
+
 out:
 	mutex_unlock(&fanout_mutex);
 	return err;
 }
 
-static void fanout_release(struct sock *sk)
+/* If pkt_sk(sk)->fanout->sk_ref is zero, this function removes
+ * pkt_sk(sk)->fanout from fanout_list and returns pkt_sk(sk)->fanout.
+ * It is the responsibility of the caller to call fanout_release_data() and
+ * free the returned packet_fanout (after synchronize_net())
+ */
+static struct packet_fanout *fanout_release(struct sock *sk)
 {
 	struct packet_sock *po = pkt_sk(sk);
 	struct packet_fanout *f;
 
-	f = po->fanout;
-	if (!f)
-		return;
-
 	mutex_lock(&fanout_mutex);
-	po->fanout = NULL;
+	f = po->fanout;
+	if (f) {
+		po->fanout = NULL;
 
-	if (atomic_dec_and_test(&f->sk_ref)) {
-		list_del(&f->list);
-		dev_remove_pack(&f->prot_hook);
-		kfree(f);
+		if (atomic_dec_and_test(&f->sk_ref))
+			list_del(&f->list);
+		else
+			f = NULL;
 	}
 	mutex_unlock(&fanout_mutex);
+
+	return f;
 }
 
 static const struct proto_ops packet_ops;
@@ -1927,9 +1947,11 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
 		h.h2->tp_nsec = ts.tv_nsec;
 		if (skb_vlan_tag_present(skb)) {
 			h.h2->tp_vlan_tci = skb_vlan_tag_get(skb);
-			status |= TP_STATUS_VLAN_VALID;
+			h.h2->tp_vlan_tpid = ntohs(skb->vlan_proto);
+			status |= TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID;
 		} else {
 			h.h2->tp_vlan_tci = 0;
+			h.h2->tp_vlan_tpid = 0;
 		}
 		memset(h.h2->tp_padding, 0, sizeof(h.h2->tp_padding));
 		hdrlen = sizeof(*h.h2);
@@ -2023,7 +2045,7 @@ static void tpacket_destruct_skb(struct sk_buff *skb)
 static bool ll_header_truncated(const struct net_device *dev, int len)
 {
 	/* net device doesn't like empty head */
-	if (unlikely(len <= dev->hard_header_len)) {
+	if (unlikely(len < dev->hard_header_len)) {
 		net_warn_ratelimited("%s: packet size is too short (%d < %d)\n",
 				     current->comm, len, dev->hard_header_len);
 		return true;
@@ -2525,6 +2547,7 @@ static int packet_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
 	struct packet_sock *po;
+	struct packet_fanout *f;
 	struct net *net;
 	union tpacket_req_u req_u;
 
@@ -2564,9 +2587,13 @@ static int packet_release(struct socket *sock)
 		packet_set_ring(sk, &req_u, 1, 1);
 	}
 
-	fanout_release(sk);
+	f = fanout_release(sk);
 
 	synchronize_net();
+
+	if (f) {
+		kfree(f);
+	}
 	/*
 	 *	Now the socket is dead. No more input will appear.
 	 */
@@ -2982,11 +3009,12 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 		aux.tp_net = skb_network_offset(skb);
 		if (skb_vlan_tag_present(skb)) {
 			aux.tp_vlan_tci = skb_vlan_tag_get(skb);
-			aux.tp_status |= TP_STATUS_VLAN_VALID;
+			aux.tp_vlan_tpid = ntohs(skb->vlan_proto);
+			aux.tp_status |= TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID;
 		} else {
 			aux.tp_vlan_tci = 0;
+			aux.tp_vlan_tpid = 0;
 		}
-		aux.tp_padding = 0;
 		put_cmsg(msg, SOL_PACKET, PACKET_AUXDATA, sizeof(aux), &aux);
 	}
 

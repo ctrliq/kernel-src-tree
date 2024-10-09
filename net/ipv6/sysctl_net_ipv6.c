@@ -54,6 +54,13 @@ static struct ctl_table ipv6_table_template[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
 	},
+	{
+		.procname	= "fwmark_reflect",
+		.data		= &init_net.ipv6_sysctl_fwmark_reflect,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
 	{ }
 };
 
@@ -93,6 +100,7 @@ static int __net_init ipv6_sysctl_net_init(struct net *net)
 	ipv6_table[2].data = &net->ipv6_anycast_src_echo_reply;
 	ipv6_table[3].data = &net->idgen_retries;
 	ipv6_table[4].data = &net->idgen_delay;
+	ipv6_table[5].data = &net->ipv6_sysctl_fwmark_reflect;
 
 	ipv6_route_table = ipv6_route_sysctl_init(net);
 	if (!ipv6_route_table)

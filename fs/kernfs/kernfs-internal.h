@@ -26,9 +26,6 @@ struct kernfs_iattrs {
 	struct simple_xattrs	xattrs;
 };
 
-/* +1 to avoid triggering overflow warning when negating it */
-#define KN_DEACTIVATED_BIAS		(INT_MIN + 1)
-
 /* KERNFS_TYPE_MASK and types are defined in include/linux/kernfs.h */
 
 /**
@@ -49,6 +46,8 @@ static inline struct kernfs_root *kernfs_root(struct kernfs_node *kn)
  * mount.c
  */
 struct kernfs_super_info {
+	struct super_block	*sb;
+
 	/*
 	 * The root associated with this super_block.  Each super_block is
 	 * identified by the root and ns it's associated with.
@@ -62,6 +61,9 @@ struct kernfs_super_info {
 	 * an array and compare kernfs_node tag against every entry.
 	 */
 	const void		*ns;
+
+	/* anchored at kernfs_root->supers, protected by kernfs_mutex */
+	struct list_head	node;
 };
 #define kernfs_info(SB) ((struct kernfs_super_info *)(SB->s_fs_info))
 

@@ -44,7 +44,7 @@
 #include "qed_hsi.h"
 #include "qed_sp.h"
 #include "qed_sriov.h"
-#include "qed_roce.h"
+#include "qed_rdma.h"
 #ifdef CONFIG_DCB
 #include <linux/qed/qed_eth_if.h>
 #endif
@@ -904,6 +904,22 @@ qed_dcbx_mib_update_event(struct qed_hwfn *p_hwfn,
 	}
 
 	qed_dcbx_get_params(p_hwfn, &p_hwfn->p_dcbx_info->get, type);
+
+	if (type == QED_DCBX_OPERATIONAL_MIB) {
+		struct qed_dcbx_results *p_data;
+		u16 val;
+
+		/* Configure in NIG which protocols support EDPM and should
+		 * honor PFC.
+		 */
+		p_data = &p_hwfn->p_dcbx_info->results;
+		val = (0x1 << p_data->arr[DCBX_PROTOCOL_ROCE].tc) |
+		      (0x1 << p_data->arr[DCBX_PROTOCOL_ROCE_V2].tc);
+		val <<= NIG_REG_TX_EDPM_CTRL_TX_EDPM_TC_EN_SHIFT;
+		val |= NIG_REG_TX_EDPM_CTRL_TX_EDPM_EN;
+		qed_wr(p_hwfn, p_ptt, NIG_REG_TX_EDPM_CTRL, val);
+	}
+
 	qed_dcbx_aen(p_hwfn, type);
 
 	return rc;
@@ -943,17 +959,18 @@ void qed_dcbx_set_pf_update_params(struct qed_dcbx_results *p_src,
 	p_dest->pf_id = p_src->pf_id;
 
 	update_flag = p_src->arr[DCBX_PROTOCOL_FCOE].update;
-	p_dest->update_fcoe_dcb_data_flag = update_flag;
+	p_dest->update_fcoe_dcb_data_mode = update_flag;
 
 	update_flag = p_src->arr[DCBX_PROTOCOL_ROCE].update;
-	p_dest->update_roce_dcb_data_flag = update_flag;
+	p_dest->update_roce_dcb_data_mode = update_flag;
+
 	update_flag = p_src->arr[DCBX_PROTOCOL_ROCE_V2].update;
-	p_dest->update_roce_dcb_data_flag = update_flag;
+	p_dest->update_rroce_dcb_data_mode = update_flag;
 
 	update_flag = p_src->arr[DCBX_PROTOCOL_ISCSI].update;
-	p_dest->update_iscsi_dcb_data_flag = update_flag;
+	p_dest->update_iscsi_dcb_data_mode = update_flag;
 	update_flag = p_src->arr[DCBX_PROTOCOL_ETH].update;
-	p_dest->update_eth_dcb_data_flag = update_flag;
+	p_dest->update_eth_dcb_data_mode = update_flag;
 
 	p_dcb_data = &p_dest->fcoe_dcb_data;
 	qed_dcbx_update_protocol_data(p_dcb_data, p_src, DCBX_PROTOCOL_FCOE);

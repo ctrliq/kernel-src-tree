@@ -20,6 +20,10 @@
 #ifndef __ASM_KVM_BOOK3S_64_H__
 #define __ASM_KVM_BOOK3S_64_H__
 
+/* Power architecture requires HPT is at least 256kiB, at most 64TiB */
+#define PPC_MIN_HPT_ORDER	18
+#define PPC_MAX_HPT_ORDER	46
+
 #ifdef CONFIG_KVM_BOOK3S_PR_POSSIBLE
 static inline struct kvmppc_book3s_shadow_vcpu *svcpu_get(struct kvm_vcpu *vcpu)
 {
@@ -433,6 +437,18 @@ static inline struct kvm_memslots *kvm_memslots_raw(struct kvm *kvm)
 
 extern void kvmhv_rm_send_ipi(int cpu);
 extern void kvmppc_mmu_debugfs_init(struct kvm *kvm);
+
+static inline unsigned long kvmppc_hpt_npte(struct kvm_hpt_info *hpt)
+{
+	/* HPTEs are 2**4 bytes long */
+	return 1UL << (hpt->order - 4);
+}
+
+static inline unsigned long kvmppc_hpt_mask(struct kvm_hpt_info *hpt)
+{
+	/* 128 (2**7) bytes in each HPTEG */
+	return (1UL << (hpt->order - 7)) - 1;
+}
 
 #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
 

@@ -141,8 +141,9 @@ int bnxt_re_query_device(struct ib_device *ibdev,
 	struct bnxt_qplib_dev_attr *dev_attr = &rdev->dev_attr;
 
 	memset(ib_attr, 0, sizeof(*ib_attr));
-
-	ib_attr->fw_ver = (u64)(unsigned long)(dev_attr->fw_ver);
+	memcpy(&ib_attr->fw_ver, dev_attr->fw_ver,
+	       min(sizeof(dev_attr->fw_ver),
+		   sizeof(ib_attr->fw_ver)));
 	bnxt_qplib_get_guid(rdev->netdev->dev_addr,
 			    (u8 *)&ib_attr->sys_image_guid);
 	ib_attr->max_mr_size = BNXT_RE_MAX_MR_SIZE;
@@ -223,50 +224,6 @@ int bnxt_re_modify_device(struct ib_device *ibdev,
 	return 0;
 }
 
-static void __to_ib_speed_width(struct net_device *netdev, u8 *speed, u8 *width)
-{
-	struct ethtool_link_ksettings lksettings;
-	u32 espeed;
-
-	if (netdev->ethtool_ops && netdev->ethtool_ops->get_link_ksettings) {
-		memset(&lksettings, 0, sizeof(lksettings));
-		rtnl_lock();
-		netdev->ethtool_ops->get_link_ksettings(netdev, &lksettings);
-		rtnl_unlock();
-		espeed = lksettings.base.speed;
-	} else {
-		espeed = SPEED_UNKNOWN;
-	}
-	switch (espeed) {
-	case SPEED_1000:
-		*speed = IB_SPEED_SDR;
-		*width = IB_WIDTH_1X;
-		break;
-	case SPEED_10000:
-		*speed = IB_SPEED_QDR;
-		*width = IB_WIDTH_1X;
-		break;
-	case SPEED_20000:
-		*speed = IB_SPEED_DDR;
-		*width = IB_WIDTH_4X;
-		break;
-	case SPEED_25000:
-		*speed = IB_SPEED_EDR;
-		*width = IB_WIDTH_1X;
-		break;
-	case SPEED_40000:
-		*speed = IB_SPEED_QDR;
-		*width = IB_WIDTH_4X;
-		break;
-	case SPEED_50000:
-		break;
-	default:
-		*speed = IB_SPEED_SDR;
-		*width = IB_WIDTH_1X;
-		break;
-	}
-}
-
 /* Port */
 int bnxt_re_query_port(struct ib_device *ibdev, u8 port_num,
 		       struct ib_port_attr *port_attr)
@@ -303,13 +260,9 @@ int bnxt_re_query_port(struct ib_device *ibdev, u8 port_num,
 	port_attr->sm_sl = 0;
 	port_attr->subnet_timeout = 0;
 	port_attr->init_type_reply = 0;
-	/* call the underlying netdev's ethtool hooks to query speed settings
-	 * for which we acquire rtnl_lock _only_ if it's registered with
-	 * IB stack to avoid race in the NETDEV_UNREG path
-	 */
-	if (test_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags))
-		__to_ib_speed_width(rdev->netdev, &port_attr->active_speed,
-				    &port_attr->active_width);
+	port_attr->active_speed = rdev->active_speed;
+	port_attr->active_width = rdev->active_width;
+
 	return 0;
 }
 
@@ -327,6 +280,15 @@ int bnxt_re_get_port_immutable(struct ib_device *ibdev, u8 port_num,
 	immutable->core_cap_flags |= RDMA_CORE_CAP_PROT_ROCE_UDP_ENCAP;
 	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
 	return 0;
+}
+
+void bnxt_re_query_fw_str(struct ib_device *ibdev, char *str)
+{
+	struct bnxt_re_dev *rdev = to_bnxt_re_dev(ibdev, ibdev);
+
+	snprintf(str, IB_FW_VERSION_NAME_MAX, "%d.%d.%d.%d",
+		 rdev->dev_attr.fw_ver[0], rdev->dev_attr.fw_ver[1],
+		 rdev->dev_attr.fw_ver[2], rdev->dev_attr.fw_ver[3]);
 }
 
 int bnxt_re_query_pkey(struct ib_device *ibdev, u8 port_num,
@@ -706,19 +668,20 @@ int bnxt_re_destroy_ah(struct ib_ah *ib_ah)
 }
 
 struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
-				struct ib_ah_attr *ah_attr,
+				struct rdma_ah_attr *ah_attr,
 				struct ib_udata *udata)
 {
 	struct bnxt_re_pd *pd = container_of(ib_pd, struct bnxt_re_pd, ib_pd);
 	struct bnxt_re_dev *rdev = pd->rdev;
 	struct bnxt_re_ah *ah;
+	const struct ib_global_route *grh = rdma_ah_read_grh(ah_attr);
 	int rc;
 	u16 vlan_tag;
 	u8 nw_type;
 
 	struct ib_gid_attr sgid_attr;
 
-	if (!(ah_attr->ah_flags & IB_AH_GRH)) {
+	if (!(rdma_ah_get_ah_flags(ah_attr) & IB_AH_GRH)) {
 		dev_err(rdev_to_dev(rdev), "Failed to alloc AH: GRH not set");
 		return ERR_PTR(-EINVAL);
 	}
@@ -730,33 +693,33 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
 	ah->qplib_ah.pd = &pd->qplib_pd;
 
 	/* Supply the configuration for the HW */
-	memcpy(ah->qplib_ah.dgid.data, ah_attr->grh.dgid.raw,
+	memcpy(ah->qplib_ah.dgid.data, grh->dgid.raw,
 	       sizeof(union ib_gid));
 	/*
 	 * If RoCE V2 is enabled, stack will have two entries for
 	 * each GID entry. Avoiding this duplicte entry in HW. Dividing
 	 * the GID index by 2 for RoCE V2
 	 */
-	ah->qplib_ah.sgid_index = ah_attr->grh.sgid_index / 2;
-	ah->qplib_ah.host_sgid_index = ah_attr->grh.sgid_index;
-	ah->qplib_ah.traffic_class = ah_attr->grh.traffic_class;
-	ah->qplib_ah.flow_label = ah_attr->grh.flow_label;
-	ah->qplib_ah.hop_limit = ah_attr->grh.hop_limit;
-	ah->qplib_ah.sl = ah_attr->sl;
+	ah->qplib_ah.sgid_index = grh->sgid_index / 2;
+	ah->qplib_ah.host_sgid_index = grh->sgid_index;
+	ah->qplib_ah.traffic_class = grh->traffic_class;
+	ah->qplib_ah.flow_label = grh->flow_label;
+	ah->qplib_ah.hop_limit = grh->hop_limit;
+	ah->qplib_ah.sl = rdma_ah_get_sl(ah_attr);
 	if (ib_pd->uobject &&
 	    !rdma_is_multicast_addr((struct in6_addr *)
-				    ah_attr->grh.dgid.raw) &&
+				    grh->dgid.raw) &&
 	    !rdma_link_local_addr((struct in6_addr *)
-				  ah_attr->grh.dgid.raw)) {
+				  grh->dgid.raw)) {
 		union ib_gid sgid;
 
 		rc = ib_get_cached_gid(&rdev->ibdev, 1,
-				       ah_attr->grh.sgid_index, &sgid,
+				       grh->sgid_index, &sgid,
 				       &sgid_attr);
 		if (rc) {
 			dev_err(rdev_to_dev(rdev),
 				"Failed to query gid at index %d",
-				ah_attr->grh.sgid_index);
+				grh->sgid_index);
 			goto fail;
 		}
 		if (sgid_attr.ndev) {
@@ -777,8 +740,8 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
 			ah->qplib_ah.nw_type = CMDQ_CREATE_AH_TYPE_V1;
 			break;
 		}
-		rc = rdma_addr_find_l2_eth_by_grh(&sgid, &ah_attr->grh.dgid,
-						  ah_attr->dmac, &vlan_tag,
+		rc = rdma_addr_find_l2_eth_by_grh(&sgid, &grh->dgid,
+						  ah_attr->roce.dmac, &vlan_tag,
 						  &sgid_attr.ndev->ifindex,
 						  NULL);
 		if (rc) {
@@ -787,7 +750,7 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
 		}
 	}
 
-	memcpy(ah->qplib_ah.dmac, ah_attr->dmac, ETH_ALEN);
+	memcpy(ah->qplib_ah.dmac, ah_attr->roce.dmac, ETH_ALEN);
 	rc = bnxt_qplib_create_ah(&rdev->qplib_res, &ah->qplib_ah);
 	if (rc) {
 		dev_err(rdev_to_dev(rdev), "Failed to allocate HW AH");
@@ -816,24 +779,24 @@ fail:
 	return ERR_PTR(rc);
 }
 
-int bnxt_re_modify_ah(struct ib_ah *ib_ah, struct ib_ah_attr *ah_attr)
+int bnxt_re_modify_ah(struct ib_ah *ib_ah, struct rdma_ah_attr *ah_attr)
 {
 	return 0;
 }
 
-int bnxt_re_query_ah(struct ib_ah *ib_ah, struct ib_ah_attr *ah_attr)
+int bnxt_re_query_ah(struct ib_ah *ib_ah, struct rdma_ah_attr *ah_attr)
 {
 	struct bnxt_re_ah *ah = container_of(ib_ah, struct bnxt_re_ah, ib_ah);
 
-	memcpy(ah_attr->grh.dgid.raw, ah->qplib_ah.dgid.data,
-	       sizeof(union ib_gid));
-	ah_attr->grh.sgid_index = ah->qplib_ah.host_sgid_index;
-	ah_attr->grh.traffic_class = ah->qplib_ah.traffic_class;
-	ah_attr->sl = ah->qplib_ah.sl;
-	memcpy(ah_attr->dmac, ah->qplib_ah.dmac, ETH_ALEN);
-	ah_attr->ah_flags = IB_AH_GRH;
-	ah_attr->port_num = 1;
-	ah_attr->static_rate = 0;
+	ah_attr->type = ib_ah->type;
+	rdma_ah_set_sl(ah_attr, ah->qplib_ah.sl);
+	memcpy(ah_attr->roce.dmac, ah->qplib_ah.dmac, ETH_ALEN);
+	rdma_ah_set_grh(ah_attr, NULL, 0,
+			ah->qplib_ah.host_sgid_index,
+			0, ah->qplib_ah.traffic_class);
+	rdma_ah_set_dgid_raw(ah_attr, ah->qplib_ah.dgid.data);
+	rdma_ah_set_port_num(ah_attr, 1);
+	rdma_ah_set_static_rate(ah_attr, 0);
 	return 0;
 }
 
@@ -1442,6 +1405,9 @@ int bnxt_re_modify_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
 		qp->qplib_qp.qkey = qp_attr->qkey;
 	}
 	if (qp_attr_mask & IB_QP_AV) {
+		const struct ib_global_route *grh =
+			rdma_ah_read_grh(&qp_attr->ah_attr);
+
 		qp->qplib_qp.modify_flags |= CMDQ_MODIFY_QP_MODIFY_MASK_DGID |
 				     CMDQ_MODIFY_QP_MODIFY_MASK_FLOW_LABEL |
 				     CMDQ_MODIFY_QP_MODIFY_MASK_SGID_INDEX |
@@ -1449,25 +1415,23 @@ int bnxt_re_modify_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
 				     CMDQ_MODIFY_QP_MODIFY_MASK_TRAFFIC_CLASS |
 				     CMDQ_MODIFY_QP_MODIFY_MASK_DEST_MAC |
 				     CMDQ_MODIFY_QP_MODIFY_MASK_VLAN_ID;
-		memcpy(qp->qplib_qp.ah.dgid.data, qp_attr->ah_attr.grh.dgid.raw,
+		memcpy(qp->qplib_qp.ah.dgid.data, grh->dgid.raw,
 		       sizeof(qp->qplib_qp.ah.dgid.data));
-		qp->qplib_qp.ah.flow_label = qp_attr->ah_attr.grh.flow_label;
+		qp->qplib_qp.ah.flow_label = grh->flow_label;
 		/* If RoCE V2 is enabled, stack will have two entries for
 		 * each GID entry. Avoiding this duplicte entry in HW. Dividing
 		 * the GID index by 2 for RoCE V2
 		 */
-		qp->qplib_qp.ah.sgid_index =
-					qp_attr->ah_attr.grh.sgid_index / 2;
-		qp->qplib_qp.ah.host_sgid_index =
-					qp_attr->ah_attr.grh.sgid_index;
-		qp->qplib_qp.ah.hop_limit = qp_attr->ah_attr.grh.hop_limit;
-		qp->qplib_qp.ah.traffic_class =
-					qp_attr->ah_attr.grh.traffic_class;
-		qp->qplib_qp.ah.sl = qp_attr->ah_attr.sl;
-		ether_addr_copy(qp->qplib_qp.ah.dmac, qp_attr->ah_attr.dmac);
+		qp->qplib_qp.ah.sgid_index = grh->sgid_index / 2;
+		qp->qplib_qp.ah.host_sgid_index = grh->sgid_index;
+		qp->qplib_qp.ah.hop_limit = grh->hop_limit;
+		qp->qplib_qp.ah.traffic_class = grh->traffic_class;
+		qp->qplib_qp.ah.sl = rdma_ah_get_sl(&qp_attr->ah_attr);
+		ether_addr_copy(qp->qplib_qp.ah.dmac,
+				qp_attr->ah_attr.roce.dmac);
 
 		status = ib_get_cached_gid(&rdev->ibdev, 1,
-					   qp_attr->ah_attr.grh.sgid_index,
+					   grh->sgid_index,
 					   &sgid, &sgid_attr);
 		if (!status && sgid_attr.ndev) {
 			memcpy(qp->qplib_qp.smac, sgid_attr.ndev->dev_addr,
@@ -1614,43 +1578,46 @@ int bnxt_re_query_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
 {
 	struct bnxt_re_qp *qp = container_of(ib_qp, struct bnxt_re_qp, ib_qp);
 	struct bnxt_re_dev *rdev = qp->rdev;
-	struct bnxt_qplib_qp qplib_qp;
+	struct bnxt_qplib_qp *qplib_qp;
 	int rc;
 
-	memset(&qplib_qp, 0, sizeof(struct bnxt_qplib_qp));
-	qplib_qp.id = qp->qplib_qp.id;
-	qplib_qp.ah.host_sgid_index = qp->qplib_qp.ah.host_sgid_index;
+	qplib_qp = kzalloc(sizeof(*qplib_qp), GFP_KERNEL);
+	if (!qplib_qp)
+		return -ENOMEM;
 
-	rc = bnxt_qplib_query_qp(&rdev->qplib_res, &qplib_qp);
+	qplib_qp->id = qp->qplib_qp.id;
+	qplib_qp->ah.host_sgid_index = qp->qplib_qp.ah.host_sgid_index;
+
+	rc = bnxt_qplib_query_qp(&rdev->qplib_res, qplib_qp);
 	if (rc) {
 		dev_err(rdev_to_dev(rdev), "Failed to query HW QP");
-		return rc;
+		goto out;
 	}
-	qp_attr->qp_state = __to_ib_qp_state(qplib_qp.state);
-	qp_attr->en_sqd_async_notify = qplib_qp.en_sqd_async_notify ? 1 : 0;
-	qp_attr->qp_access_flags = __to_ib_access_flags(qplib_qp.access);
-	qp_attr->pkey_index = qplib_qp.pkey_index;
-	qp_attr->qkey = qplib_qp.qkey;
-	memcpy(qp_attr->ah_attr.grh.dgid.raw, qplib_qp.ah.dgid.data,
-	       sizeof(qplib_qp.ah.dgid.data));
-	qp_attr->ah_attr.grh.flow_label = qplib_qp.ah.flow_label;
-	qp_attr->ah_attr.grh.sgid_index = qplib_qp.ah.host_sgid_index;
-	qp_attr->ah_attr.grh.hop_limit = qplib_qp.ah.hop_limit;
-	qp_attr->ah_attr.grh.traffic_class = qplib_qp.ah.traffic_class;
-	qp_attr->ah_attr.sl = qplib_qp.ah.sl;
-	ether_addr_copy(qp_attr->ah_attr.dmac, qplib_qp.ah.dmac);
-	qp_attr->path_mtu = __to_ib_mtu(qplib_qp.path_mtu);
-	qp_attr->timeout = qplib_qp.timeout;
-	qp_attr->retry_cnt = qplib_qp.retry_cnt;
-	qp_attr->rnr_retry = qplib_qp.rnr_retry;
-	qp_attr->min_rnr_timer = qplib_qp.min_rnr_timer;
-	qp_attr->rq_psn = qplib_qp.rq.psn;
-	qp_attr->max_rd_atomic = qplib_qp.max_rd_atomic;
-	qp_attr->sq_psn = qplib_qp.sq.psn;
-	qp_attr->max_dest_rd_atomic = qplib_qp.max_dest_rd_atomic;
-	qp_init_attr->sq_sig_type = qplib_qp.sig_type ? IB_SIGNAL_ALL_WR :
-							IB_SIGNAL_REQ_WR;
-	qp_attr->dest_qp_num = qplib_qp.dest_qpn;
+	qp_attr->qp_state = __to_ib_qp_state(qplib_qp->state);
+	qp_attr->en_sqd_async_notify = qplib_qp->en_sqd_async_notify ? 1 : 0;
+	qp_attr->qp_access_flags = __to_ib_access_flags(qplib_qp->access);
+	qp_attr->pkey_index = qplib_qp->pkey_index;
+	qp_attr->qkey = qplib_qp->qkey;
+	qp_attr->ah_attr.type = RDMA_AH_ATTR_TYPE_ROCE;
+	rdma_ah_set_grh(&qp_attr->ah_attr, NULL, qplib_qp->ah.flow_label,
+			qplib_qp->ah.host_sgid_index,
+			qplib_qp->ah.hop_limit,
+			qplib_qp->ah.traffic_class);
+	rdma_ah_set_dgid_raw(&qp_attr->ah_attr, qplib_qp->ah.dgid.data);
+	rdma_ah_set_sl(&qp_attr->ah_attr, qplib_qp->ah.sl);
+	ether_addr_copy(qp_attr->ah_attr.roce.dmac, qplib_qp->ah.dmac);
+	qp_attr->path_mtu = __to_ib_mtu(qplib_qp->path_mtu);
+	qp_attr->timeout = qplib_qp->timeout;
+	qp_attr->retry_cnt = qplib_qp->retry_cnt;
+	qp_attr->rnr_retry = qplib_qp->rnr_retry;
+	qp_attr->min_rnr_timer = qplib_qp->min_rnr_timer;
+	qp_attr->rq_psn = qplib_qp->rq.psn;
+	qp_attr->max_rd_atomic = qplib_qp->max_rd_atomic;
+	qp_attr->sq_psn = qplib_qp->sq.psn;
+	qp_attr->max_dest_rd_atomic = qplib_qp->max_dest_rd_atomic;
+	qp_init_attr->sq_sig_type = qplib_qp->sig_type ? IB_SIGNAL_ALL_WR :
+							 IB_SIGNAL_REQ_WR;
+	qp_attr->dest_qp_num = qplib_qp->dest_qpn;
 
 	qp_attr->cap.max_send_wr = qp->qplib_qp.sq.max_wqe;
 	qp_attr->cap.max_send_sge = qp->qplib_qp.sq.max_sge;
@@ -1659,7 +1626,9 @@ int bnxt_re_query_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
 	qp_attr->cap.max_inline_data = qp->qplib_qp.max_inline_data;
 	qp_init_attr->cap = qp_attr->cap;
 
-	return 0;
+out:
+	kfree(qplib_qp);
+	return rc;
 }
 
 /* Routine for sending QP1 packets for RoCE V1 an V2
@@ -3280,7 +3249,7 @@ struct ib_mr *bnxt_re_reg_user_mr(struct ib_pd *ib_pd, u64 start, u64 length,
 	struct bnxt_re_mr *mr;
 	struct ib_umem *umem;
 	u64 *pbl_tbl, *pbl_tbl_orig;
-	int i, umem_pgs, pages, page_shift, rc;
+	int i, umem_pgs, pages, rc;
 	struct scatterlist *sg;
 	int entry;
 
@@ -3332,22 +3301,22 @@ struct ib_mr *bnxt_re_reg_user_mr(struct ib_pd *ib_pd, u64 start, u64 length,
 	}
 	pbl_tbl_orig = pbl_tbl;
 
-	page_shift = ilog2(umem->page_size);
 	if (umem->hugetlb) {
 		dev_err(rdev_to_dev(rdev), "umem hugetlb not supported!");
 		rc = -EFAULT;
 		goto fail;
 	}
-	if (umem->page_size != PAGE_SIZE) {
-		dev_err(rdev_to_dev(rdev), "umem page size unsupported!");
+
+	if (umem->page_shift != PAGE_SHIFT) {
+		dev_err(rdev_to_dev(rdev), "umem page shift unsupported!");
 		rc = -EFAULT;
 		goto fail;
 	}
 	/* Map umem buf ptrs to the PBL */
 	for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
-		pages = sg_dma_len(sg) >> page_shift;
+		pages = sg_dma_len(sg) >> umem->page_shift;
 		for (i = 0; i < pages; i++, pbl_tbl++)
-			*pbl_tbl = sg_dma_address(sg) + (i << page_shift);
+			*pbl_tbl = sg_dma_address(sg) + (i << umem->page_shift);
 	}
 	rc = bnxt_qplib_reg_mr(&rdev->qplib_res, &mr->qplib_mr, pbl_tbl_orig,
 			       umem_pgs, false);

@@ -8,16 +8,20 @@
  */
 
 #include <byteswap.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <linux/bitops.h>
 #include <api/fs/tracing_path.h>
 #include <traceevent/event-parse.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/perf_event.h>
 #include <linux/err.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include "asm/bug.h"
 #include "callchain.h"
 #include "cgroup.h"
+#include "event.h"
 #include "evsel.h"
 #include "evlist.h"
 #include "util.h"
@@ -239,6 +243,10 @@ void perf_evsel__init(struct perf_evsel *evsel,
 	evsel->sample_size = __perf_evsel__sample_size(attr->sample_type);
 	perf_evsel__calc_id_pos(evsel);
 	evsel->cmdline_group_boundary = false;
+	evsel->metric_expr   = NULL;
+	evsel->metric_name   = NULL;
+	evsel->metric_events = NULL;
+	evsel->collect_stat  = false;
 }
 
 struct perf_evsel *perf_evsel__new_idx(struct perf_event_attr *attr, int idx)

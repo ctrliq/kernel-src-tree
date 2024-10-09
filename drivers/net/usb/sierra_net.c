@@ -199,7 +199,7 @@ static const struct net_device_ops sierra_net_device_ops = {
 	.ndo_stop               = usbnet_stop,
 	.ndo_start_xmit         = usbnet_start_xmit,
 	.ndo_tx_timeout         = usbnet_tx_timeout,
-	.ndo_change_mtu         = sierra_net_change_mtu,
+	.ndo_change_mtu_rh74    = sierra_net_change_mtu,
 	.ndo_set_mac_address    = eth_mac_addr,
 	.ndo_validate_addr      = eth_validate_addr,
 };

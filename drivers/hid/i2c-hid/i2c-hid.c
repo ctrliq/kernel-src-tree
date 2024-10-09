@@ -37,6 +37,7 @@
 #include <linux/hid.h>
 #include <linux/mutex.h>
 #include <linux/acpi.h>
+#include <linux/regulator/consumer.h>
 
 #include <linux/platform_data/i2c-hid.h>
 
@@ -449,7 +450,10 @@ out_unlock:
 static void i2c_hid_get_input(struct i2c_hid *ihid)
 {
 	int ret, ret_size;
-	int size = ihid->bufsize;
+	int size = le16_to_cpu(ihid->hdesc.wMaxInputLength);
+
+	if (size > ihid->bufsize)
+		size = ihid->bufsize;
 
 	if (size > ihid->bufsize)
 		size = ihid->bufsize;
@@ -504,70 +508,6 @@ static int i2c_hid_get_report_length(struct hid_report *report)
 {
 	return ((report->size - 1) >> 3) + 1 +
 		report->device->report_enum[report->type].numbered + 2;
-}
-
-static void i2c_hid_init_report(struct hid_report *report, u8 *buffer,
-	size_t bufsize)
-{
-	struct hid_device *hid = report->device;
-	struct i2c_client *client = hid->driver_data;
-	struct i2c_hid *ihid = i2c_get_clientdata(client);
-	unsigned int size, ret_size;
-
-	size = i2c_hid_get_report_length(report);
-	if (i2c_hid_get_report(client,
-			report->type == HID_FEATURE_REPORT ? 0x03 : 0x01,
-			report->id, buffer, size))
-		return;
-
-	i2c_hid_dbg(ihid, "report (len=%d): %*ph\n", size, size, buffer);
-
-	ret_size = buffer[0] | (buffer[1] << 8);
-
-	if (ret_size != size) {
-		dev_err(&client->dev, "error in %s size:%d / ret_size:%d\n",
-			__func__, size, ret_size);
-		return;
-	}
-
-	/* hid->driver_lock is held as we are in probe function,
-	 * we just need to setup the input fields, so using
-	 * hid_report_raw_event is safe. */
-	hid_report_raw_event(hid, report->type, buffer + 2, size - 2, 1);
-}
-
-/*
- * Initialize all reports
- */
-static void i2c_hid_init_reports(struct hid_device *hid)
-{
-	struct hid_report *report;
-	struct i2c_client *client = hid->driver_data;
-	struct i2c_hid *ihid = i2c_get_clientdata(client);
-	u8 *inbuf = kzalloc(ihid->bufsize, GFP_KERNEL);
-
-	if (!inbuf) {
-		dev_err(&client->dev, "can not retrieve initial reports\n");
-		return;
-	}
-
-	list_for_each_entry(report,
-		&hid->report_enum[HID_INPUT_REPORT].report_list, list)
-		i2c_hid_init_report(report, inbuf, ihid->bufsize);
-
-	/*
-	 * The device must be powered on while we fetch initial reports
-	 * from it.
-	 */
-	pm_runtime_get_sync(&client->dev);
-
-	list_for_each_entry(report,
-		&hid->report_enum[HID_FEATURE_REPORT].report_list, list)
-		i2c_hid_init_report(report, inbuf, ihid->bufsize);
-
-	pm_runtime_put(&client->dev);
-
-	kfree(inbuf);
 }
 
 /*
@@ -791,9 +731,6 @@ static int i2c_hid_start(struct hid_device *hid)
 			return ret;
 	}
 
-	if (!(hid->quirks & HID_QUIRK_NO_INIT_REPORTS))
-		i2c_hid_init_reports(hid);
-
 	return 0;
 }
 
@@ -859,7 +796,7 @@ static int i2c_hid_power(struct hid_device *hid, int lvl)
 	return 0;
 }
 
-static struct hid_ll_driver i2c_hid_ll_driver = {
+struct hid_ll_driver i2c_hid_ll_driver = {
 	.parse = i2c_hid_parse,
 	.start = i2c_hid_start,
 	.stop = i2c_hid_stop,
@@ -869,6 +806,7 @@ static struct hid_ll_driver i2c_hid_ll_driver = {
 	.output_report = i2c_hid_output_report,
 	.raw_request = i2c_hid_raw_request,
 };
+EXPORT_SYMBOL_GPL(i2c_hid_ll_driver);
 
 static int i2c_hid_init_irq(struct i2c_client *client)
 {
@@ -878,7 +816,7 @@ static int i2c_hid_init_irq(struct i2c_client *client)
 
 	dev_dbg(&client->dev, "Requesting IRQ: %d\n", client->irq);
 
-	if (!irq_get_trigger_type(client->irq))
+	if (!irqd_get_trigger_type(irq_get_irq_data(client->irq)))
 		irqflags = IRQF_TRIGGER_LOW;
 
 	ret = request_threaded_irq(client->irq, NULL, i2c_hid_irq,
@@ -1252,7 +1190,6 @@ MODULE_DEVICE_TABLE(i2c, i2c_hid_id_table);
 static struct i2c_driver i2c_hid_driver = {
 	.driver = {
 		.name	= "i2c_hid",
-		.owner	= THIS_MODULE,
 		.pm	= &i2c_hid_pm,
 		.acpi_match_table = ACPI_PTR(i2c_hid_acpi_match),
 	},

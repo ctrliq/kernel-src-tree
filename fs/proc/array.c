@@ -152,6 +152,14 @@ static inline const char *get_task_state(struct task_struct *tsk)
 	unsigned int state = (tsk->state & TASK_REPORT) | tsk->exit_state;
 	const char * const *p = &task_state_array[0];
 
+	/*
+	 * Parked tasks do not run; they sit in __kthread_parkme().
+	 * Without this check, we would report them as running, which is
+	 * clearly wrong, so we report them as sleeping instead.
+	 */
+	if (tsk->state == TASK_PARKED)
+		state = TASK_INTERRUPTIBLE;
+
 	BUILD_BUG_ON(1 + ilog2(TASK_STATE_MAX) != ARRAY_SIZE(task_state_array));
 
 	while (state) {
@@ -422,7 +430,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 
 	state = *get_task_state(task);
 	vsize = eip = esp = 0;
-	permitted = ptrace_may_access(task, PTRACE_MODE_READ | PTRACE_MODE_NOAUDIT);
+	permitted = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS | PTRACE_MODE_NOAUDIT);
 	mm = get_task_mm(task);
 	if (mm) {
 		vsize = task_vsize(mm);

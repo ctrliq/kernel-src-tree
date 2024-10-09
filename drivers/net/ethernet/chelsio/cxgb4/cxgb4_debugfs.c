@@ -2634,7 +2634,7 @@ static ssize_t mem_read(struct file *file, char __user *buf, size_t count,
 	if (count > avail - pos)
 		count = avail - pos;
 
-	data = t4_alloc_mem(count);
+	data = kvzalloc(count, GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
@@ -2642,12 +2642,12 @@ static ssize_t mem_read(struct file *file, char __user *buf, size_t count,
 	ret = t4_memory_rw(adap, 0, mem, pos, count, data, T4_MEMORY_READ);
 	spin_unlock(&adap->win0_lock);
 	if (ret) {
-		t4_free_mem(data);
+		kvfree(data);
 		return ret;
 	}
 	ret = copy_to_user(buf, data, count);
 
-	t4_free_mem(data);
+	kvfree(data);
 	if (ret)
 		return -EFAULT;
 
@@ -2770,7 +2770,7 @@ static ssize_t blocked_fl_read(struct file *filp, char __user *ubuf,
 		       adap->sge.egr_sz, adap->sge.blocked_fl);
 	len += sprintf(buf + len, "\n");
 	size = simple_read_from_buffer(ubuf, count, ppos, buf, len);
-	t4_free_mem(buf);
+	kvfree(buf);
 	return size;
 }
 
@@ -2790,7 +2790,7 @@ static ssize_t blocked_fl_write(struct file *filp, const char __user *ubuf,
 		return err;
 
 	bitmap_copy(adap->sge.blocked_fl, t, adap->sge.egr_sz);
-	t4_free_mem(t);
+	kvfree(t);
 	return count;
 }
 
@@ -3086,6 +3086,40 @@ static const struct file_operations meminfo_fops = {
 	.llseek  = seq_lseek,
 	.release = single_release,
 };
+
+static int chcr_show(struct seq_file *seq, void *v)
+{
+	struct adapter *adap = seq->private;
+
+	seq_puts(seq, "Chelsio Crypto Accelerator Stats \n");
+	seq_printf(seq, "Cipher Ops: %10u \n",
+		   atomic_read(&adap->chcr_stats.cipher_rqst));
+	seq_printf(seq, "Digest Ops: %10u \n",
+		   atomic_read(&adap->chcr_stats.digest_rqst));
+	seq_printf(seq, "Aead Ops: %10u \n",
+		   atomic_read(&adap->chcr_stats.aead_rqst));
+	seq_printf(seq, "Completion: %10u \n",
+		   atomic_read(&adap->chcr_stats.complete));
+	seq_printf(seq, "Error: %10u \n",
+		   atomic_read(&adap->chcr_stats.error));
+	seq_printf(seq, "Fallback: %10u \n",
+		   atomic_read(&adap->chcr_stats.fallback));
+	return 0;
+}
+
+
+static int chcr_stats_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, chcr_show, inode->i_private);
+}
+
+static const struct file_operations chcr_stats_debugfs_fops = {
+        .owner   = THIS_MODULE,
+        .open    = chcr_stats_open,
+        .read    = seq_read,
+        .llseek  = seq_lseek,
+        .release = single_release,
+};
 /* Add an array of Debug FS files.
  */
 void add_debugfs_files(struct adapter *adap,
@@ -3160,6 +3194,7 @@ int t4_setup_debugfs(struct adapter *adap)
 		{ "tids", &tid_info_debugfs_fops, S_IRUSR, 0},
 		{ "blocked_fl", &blocked_fl_fops, S_IRUSR | S_IWUSR, 0 },
 		{ "meminfo", &meminfo_fops, S_IRUSR, 0 },
+		{ "crypto", &chcr_stats_debugfs_fops, S_IRUSR, 0 },
 	};
 
 	/* Debug FS nodes common to all T5 and later adapters.

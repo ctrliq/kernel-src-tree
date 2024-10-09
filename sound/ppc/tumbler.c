@@ -901,7 +901,7 @@ static struct snd_kcontrol_new snapper_mixers[] = {
 	},
 };
 
-static struct snd_kcontrol_new tumbler_hp_sw = {
+static const struct snd_kcontrol_new tumbler_hp_sw = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Headphone Playback Switch",
 	.info = snd_pmac_boolean_mono_info,
@@ -909,7 +909,7 @@ static struct snd_kcontrol_new tumbler_hp_sw = {
 	.put = tumbler_put_mute_switch,
 	.private_value = TUMBLER_MUTE_HP,
 };
-static struct snd_kcontrol_new tumbler_speaker_sw = {
+static const struct snd_kcontrol_new tumbler_speaker_sw = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Speaker Playback Switch",
 	.info = snd_pmac_boolean_mono_info,
@@ -917,7 +917,7 @@ static struct snd_kcontrol_new tumbler_speaker_sw = {
 	.put = tumbler_put_mute_switch,
 	.private_value = TUMBLER_MUTE_AMP,
 };
-static struct snd_kcontrol_new tumbler_lineout_sw = {
+static const struct snd_kcontrol_new tumbler_lineout_sw = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Line Out Playback Switch",
 	.info = snd_pmac_boolean_mono_info,
@@ -925,7 +925,7 @@ static struct snd_kcontrol_new tumbler_lineout_sw = {
 	.put = tumbler_put_mute_switch,
 	.private_value = TUMBLER_MUTE_LINE,
 };
-static struct snd_kcontrol_new tumbler_drc_sw = {
+static const struct snd_kcontrol_new tumbler_drc_sw = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "DRC Switch",
 	.info = snd_pmac_boolean_mono_info,

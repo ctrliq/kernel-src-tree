@@ -191,6 +191,17 @@ xfs_iformat_fork(
 	if (error) {
 		return error;
 	}
+
+	/* Check inline dir contents. */
+	if (S_ISDIR(VFS_I(ip)->i_mode) &&
+	    dip->di_format == XFS_DINODE_FMT_LOCAL) {
+		error = xfs_dir2_sf_verify(ip);
+		if (error) {
+			xfs_idestroy_fork(ip, XFS_DATA_FORK);
+			return error;
+		}
+	}
+
 	if (!XFS_DFORK_Q(dip))
 		return 0;
 
@@ -278,8 +289,6 @@ xfs_iformat_local(
 	int		whichfork,
 	int		size)
 {
-	int		error;
-
 	/*
 	 * If the size is unreasonable, then something
 	 * is wrong and we just bail out rather than crash in
@@ -293,14 +302,6 @@ xfs_iformat_local(
 		XFS_CORRUPTION_ERROR("xfs_iformat_local", XFS_ERRLEVEL_LOW,
 				     ip->i_mount, dip);
 		return -EFSCORRUPTED;
-	}
-
-	if (S_ISDIR(VFS_I(ip)->i_mode) && whichfork == XFS_DATA_FORK) {
-		error = xfs_dir2_sf_verify(ip->i_mount,
-				(struct xfs_dir2_sf_hdr *)XFS_DFORK_DPTR(dip),
-				size);
-		if (error)
-			return error;
 	}
 
 	xfs_init_local_fork(ip, whichfork, XFS_DFORK_PTR(dip, whichfork), size);
@@ -738,6 +739,13 @@ xfs_idestroy_fork(
 	}
 }
 
+/* Count number of incore extents based on if_bytes */
+xfs_extnum_t
+xfs_iext_count(struct xfs_ifork *ifp)
+{
+	return ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+}
+
 /*
  * Convert in-core extents to on-disk form
  *
@@ -766,7 +774,7 @@ xfs_iextents_copy(
 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL|XFS_ILOCK_SHARED));
 	ASSERT(ifp->if_bytes > 0);
 
-	nrecs = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nrecs = xfs_iext_count(ifp);
 	XFS_BMAP_TRACE_EXLIST(ip, nrecs, whichfork);
 	ASSERT(nrecs > 0);
 
@@ -809,7 +817,7 @@ xfs_iextents_copy(
  * In these cases, the format always takes precedence, because the
  * format indicates the current state of the fork.
  */
-int
+void
 xfs_iflush_fork(
 	xfs_inode_t		*ip,
 	xfs_dinode_t		*dip,
@@ -819,7 +827,6 @@ xfs_iflush_fork(
 	char			*cp;
 	xfs_ifork_t		*ifp;
 	xfs_mount_t		*mp;
-	int			error;
 	static const short	brootflag[2] =
 		{ XFS_ILOG_DBROOT, XFS_ILOG_ABROOT };
 	static const short	dataflag[2] =
@@ -828,7 +835,7 @@ xfs_iflush_fork(
 		{ XFS_ILOG_DEXT, XFS_ILOG_AEXT };
 
 	if (!iip)
-		return 0;
+		return;
 	ifp = XFS_IFORK_PTR(ip, whichfork);
 	/*
 	 * This can happen if we gave up in iformat in an error path,
@@ -836,19 +843,12 @@ xfs_iflush_fork(
 	 */
 	if (!ifp) {
 		ASSERT(whichfork == XFS_ATTR_FORK);
-		return 0;
+		return;
 	}
 	cp = XFS_DFORK_PTR(dip, whichfork);
 	mp = ip->i_mount;
 	switch (XFS_IFORK_FORMAT(ip, whichfork)) {
 	case XFS_DINODE_FMT_LOCAL:
-		if (S_ISDIR(VFS_I(ip)->i_mode) && whichfork == XFS_DATA_FORK) {
-			error = xfs_dir2_sf_verify(mp,
-					(struct xfs_dir2_sf_hdr *)ifp->if_u1.if_data,
-					ifp->if_bytes);
-			if (error)
-				return error;
-		}
 		if ((iip->ili_fields & dataflag[whichfork]) &&
 		    (ifp->if_bytes > 0)) {
 			ASSERT(ifp->if_u1.if_data != NULL);
@@ -901,7 +901,6 @@ xfs_iflush_fork(
 		ASSERT(0);
 		break;
 	}
-	return 0;
 }
 
 /*
@@ -913,7 +912,7 @@ xfs_iext_get_ext(
 	xfs_extnum_t	idx)		/* index of target extent */
 {
 	ASSERT(idx >= 0);
-	ASSERT(idx < ifp->if_bytes / sizeof(xfs_bmbt_rec_t));
+	ASSERT(idx < xfs_iext_count(ifp));
 
 	if ((ifp->if_flags & XFS_IFEXTIREC) && (idx == 0)) {
 		return ifp->if_u1.if_ext_irec->er_extbuf;
@@ -976,7 +975,7 @@ xfs_iext_add(
 	int		new_size;	/* size of extents after adding */
 	xfs_extnum_t	nextents;	/* number of extents in file */
 
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 	ASSERT((idx >= 0) && (idx <= nextents));
 	byte_diff = ext_diff * sizeof(xfs_bmbt_rec_t);
 	new_size = ifp->if_bytes + byte_diff;
@@ -1200,7 +1199,7 @@ xfs_iext_remove(
 	trace_xfs_iext_remove(ip, idx, state, _RET_IP_);
 
 	ASSERT(ext_diff > 0);
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 	new_size = (nextents - ext_diff) * sizeof(xfs_bmbt_rec_t);
 
 	if (new_size == 0) {
@@ -1229,7 +1228,7 @@ xfs_iext_remove_inline(
 
 	ASSERT(!(ifp->if_flags & XFS_IFEXTIREC));
 	ASSERT(idx < XFS_INLINE_EXTS);
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 	ASSERT(((nextents - ext_diff) > 0) &&
 		(nextents - ext_diff) < XFS_INLINE_EXTS);
 
@@ -1268,7 +1267,7 @@ xfs_iext_remove_direct(
 	ASSERT(!(ifp->if_flags & XFS_IFEXTIREC));
 	new_size = ifp->if_bytes -
 		(ext_diff * sizeof(xfs_bmbt_rec_t));
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 
 	if (new_size == 0) {
 		xfs_iext_destroy(ifp);
@@ -1505,7 +1504,7 @@ xfs_iext_indirect_to_direct(
 	int		size;		/* size of file extents */
 
 	ASSERT(ifp->if_flags & XFS_IFEXTIREC);
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 	ASSERT(nextents <= XFS_LINEAR_EXTS);
 	size = nextents * sizeof(xfs_bmbt_rec_t);
 
@@ -1579,7 +1578,7 @@ xfs_iext_bno_to_ext(
 	xfs_extnum_t	nextents;	/* number of file extents */
 	xfs_fileoff_t	startoff = 0;	/* start offset of extent */
 
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 	if (nextents == 0) {
 		*idxp = 0;
 		return NULL;
@@ -1692,8 +1691,8 @@ xfs_iext_idx_to_irec(
 
 	ASSERT(ifp->if_flags & XFS_IFEXTIREC);
 	ASSERT(page_idx >= 0);
-	ASSERT(page_idx <= ifp->if_bytes / sizeof(xfs_bmbt_rec_t));
-	ASSERT(page_idx < ifp->if_bytes / sizeof(xfs_bmbt_rec_t) || realloc);
+	ASSERT(page_idx <= xfs_iext_count(ifp));
+	ASSERT(page_idx < xfs_iext_count(ifp) || realloc);
 
 	nlists = ifp->if_real_bytes / XFS_IEXT_BUFSZ;
 	erp_idx = 0;
@@ -1741,7 +1740,7 @@ xfs_iext_irec_init(
 	xfs_extnum_t	nextents;	/* number of extents in file */
 
 	ASSERT(!(ifp->if_flags & XFS_IFEXTIREC));
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 	ASSERT(nextents <= XFS_LINEAR_EXTS);
 
 	erp = kmem_alloc(sizeof(xfs_ext_irec_t), KM_NOFS);
@@ -1865,7 +1864,7 @@ xfs_iext_irec_compact(
 
 	ASSERT(ifp->if_flags & XFS_IFEXTIREC);
 	nlists = ifp->if_real_bytes / XFS_IEXT_BUFSZ;
-	nextents = ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t);
+	nextents = xfs_iext_count(ifp);
 
 	if (nextents == 0) {
 		xfs_iext_destroy(ifp);
@@ -1937,4 +1936,50 @@ xfs_iext_irec_update_extoffs(
 	for (i = erp_idx; i < nlists; i++) {
 		ifp->if_u1.if_ext_irec[i].er_extoff += ext_diff;
 	}
+}
+
+/*
+ * Lookup the extent covering bno.
+ *
+ * If there is an extent covering bno return the extent index, and store the
+ * expanded extent structure in *gotp, and the extent index in *idx.
+ * If there is no extent covering bno, but there is an extent after it (e.g.
+ * it lies in a hole) return that extent in *gotp and its index in *idx
+ * instead.
+ * If bno is beyond the last extent return false, and return the index after
+ * the last valid index in *idxp.
+ */
+bool
+xfs_iext_lookup_extent(
+	struct xfs_inode	*ip,
+	struct xfs_ifork	*ifp,
+	xfs_fileoff_t		bno,
+	xfs_extnum_t		*idxp,
+	struct xfs_bmbt_irec	*gotp)
+{
+	struct xfs_bmbt_rec_host *ep;
+
+	XFS_STATS_INC(ip->i_mount, xs_look_exlist);
+
+	ep = xfs_iext_bno_to_ext(ifp, bno, idxp);
+	if (!ep)
+		return false;
+	xfs_bmbt_get_all(ep, gotp);
+	return true;
+}
+
+/*
+ * Return true if there is an extent at index idx, and return the expanded
+ * extent structure at idx in that case.  Else return false.
+ */
+bool
+xfs_iext_get_extent(
+	struct xfs_ifork	*ifp,
+	xfs_extnum_t		idx,
+	struct xfs_bmbt_irec	*gotp)
+{
+	if (idx < 0 || idx >= xfs_iext_count(ifp))
+		return false;
+	xfs_bmbt_get_all(xfs_iext_get_ext(ifp, idx), gotp);
+	return true;
 }

@@ -205,8 +205,8 @@ int bond_net_id __read_mostly;
 
 static int bond_init(struct net_device *bond_dev);
 static void bond_uninit(struct net_device *bond_dev);
-static struct rtnl_link_stats64 *bond_get_stats(struct net_device *bond_dev,
-						struct rtnl_link_stats64 *stats);
+static void bond_get_stats(struct net_device *bond_dev,
+			   struct rtnl_link_stats64 *stats);
 static void bond_slave_arr_handler(struct work_struct *work);
 static bool bond_time_in_interval(struct bonding *bond, unsigned long last_act,
 				  int mod);
@@ -1232,13 +1232,10 @@ static int bond_master_upper_dev_link(struct bonding *bond, struct slave *slave)
 	sprintf(linkname, "slave_%s", slave->dev->name);
 	err = sysfs_create_link(&(bond->dev->dev.kobj), &(slave->dev->dev.kobj),
 				linkname);
-	if (err) {
+	if (err)
 		netdev_upper_dev_unlink(slave->dev, bond->dev);
-		return err;
-	}
 
-	rtmsg_ifinfo(RTM_NEWLINK, slave->dev, IFF_SLAVE, GFP_KERNEL);
-	return 0;
+	return err;
 }
 
 static void bond_upper_dev_unlink(struct bonding *bond, struct slave *slave)
@@ -1248,7 +1245,6 @@ static void bond_upper_dev_unlink(struct bonding *bond, struct slave *slave)
 	sysfs_remove_link(&(bond->dev->dev.kobj), linkname);
 	netdev_upper_dev_unlink(slave->dev, bond->dev);
 	slave->dev->flags &= ~IFF_SLAVE;
-	rtmsg_ifinfo(RTM_NEWLINK, slave->dev, IFF_SLAVE, GFP_KERNEL);
 }
 
 static struct slave *bond_alloc_slave(struct bonding *bond)
@@ -3385,8 +3381,8 @@ static void bond_fold_stats(struct rtnl_link_stats64 *_res,
 	}
 }
 
-static struct rtnl_link_stats64 *bond_get_stats(struct net_device *bond_dev,
-						struct rtnl_link_stats64 *stats)
+static void bond_get_stats(struct net_device *bond_dev,
+			   struct rtnl_link_stats64 *stats)
 {
 	struct bonding *bond = netdev_priv(bond_dev);
 	struct rtnl_link_stats64 temp;
@@ -3410,8 +3406,6 @@ static struct rtnl_link_stats64 *bond_get_stats(struct net_device *bond_dev,
 
 	memcpy(&bond->bond_stats, stats, sizeof(*stats));
 	spin_unlock(&bond->stats_lock);
-
-	return stats;
 }
 
 static int bond_do_ioctl(struct net_device *bond_dev, struct ifreq *ifr, int cmd)
@@ -3620,7 +3614,9 @@ static int bond_change_mtu(struct net_device *bond_dev, int new_mtu)
 
 	bond_for_each_slave(bond, slave, iter) {
 		netdev_dbg(bond_dev, "s %p c_m %p\n",
-			   slave, slave->dev->netdev_ops->ndo_change_mtu);
+			   slave,
+			   get_ndo_ext(slave->dev->netdev_ops, ndo_change_mtu) ?
+			   : slave->dev->netdev_ops->ndo_change_mtu_rh74);
 
 		res = dev_set_mtu(slave->dev, new_mtu);
 
@@ -4186,7 +4182,7 @@ static const struct net_device_ops bond_netdev_ops = {
 	.ndo_do_ioctl		= bond_do_ioctl,
 	.ndo_change_rx_flags	= bond_change_rx_flags,
 	.ndo_set_rx_mode	= bond_set_rx_mode,
-	.ndo_change_mtu		= bond_change_mtu,
+	.extended.ndo_change_mtu	= bond_change_mtu,
 	.ndo_set_mac_address	= bond_set_mac_address,
 	.ndo_neigh_setup	= bond_neigh_setup,
 	.ndo_vlan_rx_add_vid	= bond_vlan_rx_add_vid,
@@ -4219,7 +4215,6 @@ static void bond_destructor(struct net_device *bond_dev)
 	struct bonding *bond = netdev_priv(bond_dev);
 	if (bond->wq)
 		destroy_workqueue(bond->wq);
-	free_netdev(bond_dev);
 }
 
 void bond_setup(struct net_device *bond_dev)
@@ -4235,11 +4230,12 @@ void bond_setup(struct net_device *bond_dev)
 
 	/* Initialize the device entry points */
 	ether_setup(bond_dev);
-	bond_dev->max_mtu = ETH_MAX_MTU;
+	bond_dev->extended->max_mtu = ETH_MAX_MTU;
 	bond_dev->netdev_ops = &bond_netdev_ops;
 	bond_dev->ethtool_ops = &bond_ethtool_ops;
 
-	bond_dev->destructor = bond_destructor;
+	bond_dev->extended->needs_free_netdev = true;
+	bond_dev->extended->priv_destructor = bond_destructor;
 
 	SET_NETDEV_DEVTYPE(bond_dev, &bond_type);
 
@@ -4758,7 +4754,7 @@ int bond_create(struct net *net, const char *name)
 
 	rtnl_unlock();
 	if (res < 0)
-		bond_destructor(bond_dev);
+		free_netdev(bond_dev);
 	return res;
 }
 

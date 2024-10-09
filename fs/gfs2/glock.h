@@ -13,6 +13,7 @@
 #include <linux/sched.h>
 #include <linux/parser.h>
 #include "incore.h"
+#include "util.h"
 
 /* Options for hostdata parser */
 
@@ -141,7 +142,7 @@ static inline struct gfs2_holder *gfs2_glock_is_locked_by_me(struct gfs2_glock *
 	struct pid *pid;
 
 	/* Look in glock's list of holders for one with current task as owner */
-	spin_lock(&gl->gl_spin);
+	spin_lock(&gl->gl_lockref.lock);
 	pid = task_pid(current);
 	list_for_each_entry(gh, &gl->gl_holders, gh_list) {
 		if (!test_bit(HIF_HOLDER, &gh->gh_iflags))
@@ -151,7 +152,7 @@ static inline struct gfs2_holder *gfs2_glock_is_locked_by_me(struct gfs2_glock *
 	}
 	gh = NULL;
 out:
-	spin_unlock(&gl->gl_spin);
+	spin_unlock(&gl->gl_lockref.lock);
 
 	return gh;
 }
@@ -181,7 +182,9 @@ static inline struct address_space *gfs2_glock2aspace(struct gfs2_glock *gl)
 extern int gfs2_glock_get(struct gfs2_sbd *sdp, u64 number,
 			  const struct gfs2_glock_operations *glops,
 			  int create, struct gfs2_glock **glp);
+extern void gfs2_glock_hold(struct gfs2_glock *gl);
 extern void gfs2_glock_put(struct gfs2_glock *gl);
+extern void gfs2_glock_queue_put(struct gfs2_glock *gl);
 extern void gfs2_holder_init(struct gfs2_glock *gl, unsigned int state,
 			     u16 flags, struct gfs2_holder *gh);
 extern void gfs2_holder_reinit(unsigned int state, u16 flags,
@@ -257,10 +260,43 @@ static inline bool gfs2_holder_initialized(struct gfs2_holder *gh)
 	return gh->gh_gl;
 }
 
+/**
+ * glock_set_object - set the gl_object field of a glock
+ * @gl: the glock
+ * @object: the object
+ */
 static inline void glock_set_object(struct gfs2_glock *gl, void *object)
 {
 	spin_lock(&gl->gl_lockref.lock);
+	if (gfs2_assert_warn(gl->gl_name.ln_sbd, gl->gl_object == NULL))
+		gfs2_dump_glock(NULL, gl);
 	gl->gl_object = object;
+	spin_unlock(&gl->gl_lockref.lock);
+}
+
+/**
+ * glock_clear_object - clear the gl_object field of a glock
+ * @gl: the glock
+ * @object: the object
+ *
+ * I'd love to similarly add this:
+ *	else if (gfs2_assert_warn(gl->gl_sbd, gl->gl_object == object))
+ *		gfs2_dump_glock(NULL, gl);
+ * Unfortunately, that's not possible because as soon as gfs2_delete_inode
+ * frees the block in the rgrp, another process can reassign it for an I_NEW
+ * inode in gfs2_create_inode because that calls new_inode, not gfs2_iget.
+ * That means gfs2_delete_inode may subsequently try to call this function
+ * for a glock that's already pointing to a brand new inode. If we clear the
+ * new inode's gl_object, we'll introduce metadata corruption. Function
+ * gfs2_delete_inode calls clear_inode which calls gfs2_clear_inode which also
+ * tries to clear gl_object, so it's more than just gfs2_delete_inode.
+ *
+ */
+static inline void glock_clear_object(struct gfs2_glock *gl, void *object)
+{
+	spin_lock(&gl->gl_lockref.lock);
+	if (gl->gl_object == object)
+		gl->gl_object = NULL;
 	spin_unlock(&gl->gl_lockref.lock);
 }
 

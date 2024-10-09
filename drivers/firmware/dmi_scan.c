@@ -7,6 +7,7 @@
 #include <linux/efi.h>
 #include <linux/bootmem.h>
 #include <linux/random.h>
+#include <linux/io.h>
 #include <asm/dmi.h>
 #include <asm/unaligned.h>
 

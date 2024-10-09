@@ -176,6 +176,16 @@ struct net {
 	RH_KABI_EXTEND(int idgen_retries)
 	RH_KABI_EXTEND(int idgen_delay)
 	RH_KABI_EXTEND(struct ucounts *ucounts)
+	RH_KABI_EXTEND(int ipv4_sysctl_fwmark_reflect)
+	RH_KABI_EXTEND(int ipv6_sysctl_fwmark_reflect)
+	RH_KABI_EXTEND(int ipv4_sysctl_tcp_keepalive_time)
+	RH_KABI_EXTEND(int ipv4_sysctl_tcp_keepalive_probes)
+	RH_KABI_EXTEND(int ipv4_sysctl_tcp_keepalive_intvl)
+	RH_KABI_EXTEND(struct list_head	fib_notifier_ops)  /* protected by net_mutex */
+	/* upstream has this as part of netns_ipv4 */
+	RH_KABI_EXTEND(struct fib_notifier_ops *ipv4_notifier_ops)
+	/* upstream has this as part of netns_ipv6 */
+	RH_KABI_EXTEND(struct fib_notifier_ops *ipv6_notifier_ops)
 };
 
 /*

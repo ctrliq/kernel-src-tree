@@ -30,6 +30,25 @@
 
 #include "trace.h"
 
+static u64 get_time_ref_counter(struct kvm *kvm)
+{
+	struct kvm_hv *hv = &kvm->arch.hyperv;
+	struct kvm_vcpu *vcpu;
+	u64 tsc;
+
+	/*
+	 * The guest has not set up the TSC page or the clock isn't
+	 * stable, fall back to get_kvmclock_ns.
+	 */
+	if (!hv->tsc_ref.tsc_sequence)
+		return div_u64(get_kvmclock_ns(kvm), 100);
+
+	vcpu = kvm_get_vcpu(kvm, 0);
+	tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+	return mul_u64_u64_shr(tsc, hv->tsc_ref.tsc_scale, 64)
+		+ hv->tsc_ref.tsc_offset;
+}
+
 static bool kvm_hv_msr_partition_wide(u32 msr)
 {
 	bool r = false;
@@ -104,6 +123,135 @@ static int kvm_hv_msr_set_crash_data(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
+/*
+ * The kvmclock and Hyper-V TSC page use similar formulas, and converting
+ * between them is possible:
+ *
+ * kvmclock formula:
+ *    nsec = (ticks - tsc_timestamp) * tsc_to_system_mul * 2^(tsc_shift-32)
+ *           + system_time
+ *
+ * Hyper-V formula:
+ *    nsec/100 = ticks * scale / 2^64 + offset
+ *
+ * When tsc_timestamp = system_time = 0, offset is zero in the Hyper-V formula.
+ * By dividing the kvmclock formula by 100 and equating what's left we get:
+ *    ticks * scale / 2^64 = ticks * tsc_to_system_mul * 2^(tsc_shift-32) / 100
+ *            scale / 2^64 =         tsc_to_system_mul * 2^(tsc_shift-32) / 100
+ *            scale        =         tsc_to_system_mul * 2^(32+tsc_shift) / 100
+ *
+ * Now expand the kvmclock formula and divide by 100:
+ *    nsec = ticks * tsc_to_system_mul * 2^(tsc_shift-32)
+ *           - tsc_timestamp * tsc_to_system_mul * 2^(tsc_shift-32)
+ *           + system_time
+ *    nsec/100 = ticks * tsc_to_system_mul * 2^(tsc_shift-32) / 100
+ *               - tsc_timestamp * tsc_to_system_mul * 2^(tsc_shift-32) / 100
+ *               + system_time / 100
+ *
+ * Replace tsc_to_system_mul * 2^(tsc_shift-32) / 100 by scale / 2^64:
+ *    nsec/100 = ticks * scale / 2^64
+ *               - tsc_timestamp * scale / 2^64
+ *               + system_time / 100
+ *
+ * Equate with the Hyper-V formula so that ticks * scale / 2^64 cancels out:
+ *    offset = system_time / 100 - tsc_timestamp * scale / 2^64
+ *
+ * These two equivalencies are implemented in this function.
+ */
+static bool compute_tsc_page_parameters(struct pvclock_vcpu_time_info *hv_clock,
+					HV_REFERENCE_TSC_PAGE *tsc_ref)
+{
+	u64 max_mul;
+
+	if (!(hv_clock->flags & PVCLOCK_TSC_STABLE_BIT))
+		return false;
+
+	/*
+	 * check if scale would overflow, if so we use the time ref counter
+	 *    tsc_to_system_mul * 2^(tsc_shift+32) / 100 >= 2^64
+	 *    tsc_to_system_mul / 100 >= 2^(32-tsc_shift)
+	 *    tsc_to_system_mul >= 100 * 2^(32-tsc_shift)
+	 */
+	max_mul = 100ull << (32 - hv_clock->tsc_shift);
+	if (hv_clock->tsc_to_system_mul >= max_mul)
+		return false;
+
+	/*
+	 * Otherwise compute the scale and offset according to the formulas
+	 * derived above.
+	 */
+	tsc_ref->tsc_scale =
+		mul_u64_u32_div(1ULL << (32 + hv_clock->tsc_shift),
+				hv_clock->tsc_to_system_mul,
+				100);
+
+	tsc_ref->tsc_offset = hv_clock->system_time;
+	do_div(tsc_ref->tsc_offset, 100);
+	tsc_ref->tsc_offset -=
+		mul_u64_u64_shr(hv_clock->tsc_timestamp, tsc_ref->tsc_scale, 64);
+	return true;
+}
+
+void kvm_hv_setup_tsc_page(struct kvm *kvm,
+			   struct pvclock_vcpu_time_info *hv_clock)
+{
+	struct kvm_hv *hv = &kvm->arch.hyperv;
+	u32 tsc_seq;
+	u64 gfn;
+
+	BUILD_BUG_ON(sizeof(tsc_seq) != sizeof(hv->tsc_ref.tsc_sequence));
+	BUILD_BUG_ON(offsetof(HV_REFERENCE_TSC_PAGE, tsc_sequence) != 0);
+
+	if (!(hv->hv_tsc_page & HV_X64_MSR_TSC_REFERENCE_ENABLE))
+		return;
+
+	mutex_lock(&kvm->arch.hyperv.hv_lock);
+	if (!(hv->hv_tsc_page & HV_X64_MSR_TSC_REFERENCE_ENABLE))
+		goto out_unlock;
+
+	gfn = hv->hv_tsc_page >> HV_X64_MSR_TSC_REFERENCE_ADDRESS_SHIFT;
+	/*
+	 * Because the TSC parameters only vary when there is a
+	 * change in the master clock, do not bother with caching.
+	 */
+	if (unlikely(kvm_read_guest(kvm, gfn_to_gpa(gfn),
+				    &tsc_seq, sizeof(tsc_seq))))
+		goto out_unlock;
+
+	/*
+	 * While we're computing and writing the parameters, force the
+	 * guest to use the time reference count MSR.
+	 */
+	hv->tsc_ref.tsc_sequence = 0;
+	if (kvm_write_guest(kvm, gfn_to_gpa(gfn),
+			    &hv->tsc_ref, sizeof(hv->tsc_ref.tsc_sequence)))
+		goto out_unlock;
+
+	if (!compute_tsc_page_parameters(hv_clock, &hv->tsc_ref))
+		goto out_unlock;
+
+	/* Ensure sequence is zero before writing the rest of the struct.  */
+	smp_wmb();
+	if (kvm_write_guest(kvm, gfn_to_gpa(gfn), &hv->tsc_ref, sizeof(hv->tsc_ref)))
+		goto out_unlock;
+
+	/*
+	 * Now switch to the TSC page mechanism by writing the sequence.
+	 */
+	tsc_seq++;
+	if (tsc_seq == 0xFFFFFFFF || tsc_seq == 0)
+		tsc_seq = 1;
+
+	/* Write the struct entirely before the non-zero sequence.  */
+	smp_wmb();
+
+	hv->tsc_ref.tsc_sequence = tsc_seq;
+	kvm_write_guest(kvm, gfn_to_gpa(gfn),
+			&hv->tsc_ref, sizeof(hv->tsc_ref.tsc_sequence));
+out_unlock:
+	mutex_unlock(&kvm->arch.hyperv.hv_lock);
+}
+
 static int kvm_hv_set_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 data,
 			     bool host)
 {
@@ -141,23 +289,11 @@ static int kvm_hv_set_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 data,
 		mark_page_dirty(kvm, gfn);
 		break;
 	}
-	case HV_X64_MSR_REFERENCE_TSC: {
-		u64 gfn;
-		HV_REFERENCE_TSC_PAGE tsc_ref;
-
-		memset(&tsc_ref, 0, sizeof(tsc_ref));
+	case HV_X64_MSR_REFERENCE_TSC:
 		hv->hv_tsc_page = data;
-		if (!(data & HV_X64_MSR_TSC_REFERENCE_ENABLE))
-			break;
-		gfn = data >> HV_X64_MSR_TSC_REFERENCE_ADDRESS_SHIFT;
-		if (kvm_write_guest(
-				kvm,
-				gfn << HV_X64_MSR_TSC_REFERENCE_ADDRESS_SHIFT,
-				&tsc_ref, sizeof(tsc_ref)))
-			return 1;
-		mark_page_dirty(kvm, gfn);
+		if (hv->hv_tsc_page & HV_X64_MSR_TSC_REFERENCE_ENABLE)
+			kvm_make_request(KVM_REQ_MASTERCLOCK_UPDATE, vcpu);
 		break;
-	}
 	case HV_X64_MSR_CRASH_P0 ... HV_X64_MSR_CRASH_P4:
 		return kvm_hv_msr_set_crash_data(vcpu,
 						 msr - HV_X64_MSR_CRASH_P0,
@@ -178,7 +314,16 @@ static int kvm_hv_set_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 data,
 	return 0;
 }
 
-static int kvm_hv_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+/* Calculate cpu time spent by current task in 100ns units */
+static u64 current_task_runtime_100ns(void)
+{
+	cputime_t utime, stime;
+
+	task_cputime_adjusted(current, &utime, &stime);
+	return div_u64(cputime_to_nsecs(utime + stime), 100);
+}
+
+static int kvm_hv_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data, bool host)
 {
 	struct kvm_vcpu_hv *hv = &vcpu->arch.hyperv;
 
@@ -212,6 +357,11 @@ static int kvm_hv_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
 		return kvm_hv_vapic_msr_write(vcpu, APIC_ICR, data);
 	case HV_X64_MSR_TPR:
 		return kvm_hv_vapic_msr_write(vcpu, APIC_TASKPRI, data);
+	case HV_X64_MSR_VP_RUNTIME:
+		if (!host)
+			return 1;
+		hv->runtime_offset = data - current_task_runtime_100ns();
+		break;
 	default:
 		vcpu_unimpl(vcpu, "Hyper-V uhandled wrmsr: 0x%x data 0x%llx\n",
 			    msr, data);
@@ -234,11 +384,9 @@ static int kvm_hv_get_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 	case HV_X64_MSR_HYPERCALL:
 		data = hv->hv_hypercall;
 		break;
-	case HV_X64_MSR_TIME_REF_COUNT: {
-		data =
-		     div_u64(get_kvmclock_ns(kvm), 100);
+	case HV_X64_MSR_TIME_REF_COUNT:
+		data = get_time_ref_counter(kvm);
 		break;
-	}
 	case HV_X64_MSR_REFERENCE_TSC:
 		data = hv->hv_tsc_page;
 		break;
@@ -287,6 +435,15 @@ static int kvm_hv_get_msr(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 	case HV_X64_MSR_APIC_ASSIST_PAGE:
 		data = hv->hv_vapic;
 		break;
+	case HV_X64_MSR_VP_RUNTIME:
+		data = current_task_runtime_100ns() + hv->runtime_offset;
+		break;
+	case HV_X64_MSR_TSC_FREQUENCY:
+		data = (u64)vcpu->arch.virtual_tsc_khz * 1000;
+		break;
+	case HV_X64_MSR_APIC_FREQUENCY:
+		data = APIC_BUS_FREQUENCY;
+		break;
 	default:
 		vcpu_unimpl(vcpu, "Hyper-V unhandled rdmsr: 0x%x\n", msr);
 		return 1;
@@ -300,12 +457,12 @@ int kvm_hv_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data, bool host)
 	if (kvm_hv_msr_partition_wide(msr)) {
 		int r;
 
-		mutex_lock(&vcpu->kvm->lock);
+		mutex_lock(&vcpu->kvm->arch.hyperv.hv_lock);
 		r = kvm_hv_set_msr_pw(vcpu, msr, data, host);
-		mutex_unlock(&vcpu->kvm->lock);
+		mutex_unlock(&vcpu->kvm->arch.hyperv.hv_lock);
 		return r;
 	} else
-		return kvm_hv_set_msr(vcpu, msr, data);
+		return kvm_hv_set_msr(vcpu, msr, data, host);
 }
 
 int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
@@ -313,9 +470,9 @@ int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 	if (kvm_hv_msr_partition_wide(msr)) {
 		int r;
 
-		mutex_lock(&vcpu->kvm->lock);
+		mutex_lock(&vcpu->kvm->arch.hyperv.hv_lock);
 		r = kvm_hv_get_msr_pw(vcpu, msr, pdata);
-		mutex_unlock(&vcpu->kvm->lock);
+		mutex_unlock(&vcpu->kvm->arch.hyperv.hv_lock);
 		return r;
 	} else
 		return kvm_hv_get_msr(vcpu, msr, pdata);
@@ -323,7 +480,7 @@ int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 
 bool kvm_hv_hypercall_enabled(struct kvm *kvm)
 {
-	return kvm->arch.hyperv.hv_hypercall & HV_X64_MSR_HYPERCALL_ENABLE;
+	return READ_ONCE(kvm->arch.hyperv.hv_hypercall) & HV_X64_MSR_HYPERCALL_ENABLE;
 }
 
 int kvm_hv_hypercall(struct kvm_vcpu *vcpu)

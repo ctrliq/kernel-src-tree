@@ -189,6 +189,7 @@ struct scsi_device {
 	unsigned xcopy_reserved:1;
 	RH_KABI_FILL_HOLE(unsigned lun_in_cdb:1) /* Store LUN bits in CDB[1] */
 	RH_KABI_FILL_HOLE(unsigned try_vpd_pages:1)	/* attempt to read VPD pages */
+	RH_KABI_FILL_HOLE(unsigned unmap_limit_for_ws:1)	/* Use the UNMAP limit for WRITE SAME */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 
@@ -236,7 +237,8 @@ struct scsi_device {
 	/* Lock on updates to inquiry and VPD attribute data */
 	RH_KABI_REPLACE(spinlock_t vpd_reserved9, spinlock_t inquiry_lock)
 
-	RH_KABI_RESERVE_P(1)
+	RH_KABI_USE_P(1, struct task_struct	*quiesced_by)
+
 	RH_KABI_RESERVE_P(2)
 	RH_KABI_RESERVE_P(3)
 	RH_KABI_RESERVE_P(4)
@@ -249,6 +251,11 @@ struct scsi_device {
 	unsigned long		sdev_data[0];
 } __attribute__((aligned(sizeof(unsigned long))));
 
+struct scsi_dh_devlist {
+	char *vendor;
+	char *model;
+};
+
 typedef void (*activate_complete)(void *, int);
 struct scsi_device_handler {
 	/* Used by the infrastructure */
@@ -257,8 +264,9 @@ struct scsi_device_handler {
 	/* Filled by the hardware handler */
 	struct module *module;
 	const char *name;
+	RH_KABI_DEPRECATE(const struct scsi_dh_devlist *, devlist)
 	int (*check_sense)(struct scsi_device *, struct scsi_sense_hdr *);
-	struct scsi_dh_data *(*attach)(struct scsi_device *);
+	int (*attach)(struct scsi_device *);
 	void (*detach)(struct scsi_device *);
 	int (*activate)(struct scsi_device *, activate_complete, void *);
 	int (*prep_fn)(struct scsi_device *, struct request *);
@@ -266,10 +274,25 @@ struct scsi_device_handler {
 	bool (*match)(struct scsi_device *);
 };
 
+/*
+ * RHEL specific structure needed to extend 'struct scsi_device_handler'
+ * because that structure is statically allocated by each hardware handler.
+ * - hardware handlers must allocate this structure and pass it when calling
+ *   scsi_register_device_handler() -- avoids further static allocations.
+ */
+struct scsi_device_handler_aux {
+	struct list_head list; /* list of scsi_device_handler_auxs */
+	struct scsi_device_handler *scsi_dh;
+
+	/* Filled by the hardware handler */
+	void (*rescan)(struct scsi_device *);
+};
+
 struct scsi_dh_data {
 	struct scsi_device_handler *scsi_dh;
 	struct scsi_device *sdev;
 	struct kref kref;
+	RH_KABI_DEPRECATE(char, buf[0])
 };
 
 #define	to_scsi_device(d)	\
@@ -311,6 +334,7 @@ enum scsi_target_state {
 	STARGET_DEL,
 #ifndef __GENKSYMS__
 	STARGET_REMOVE,
+	STARGET_CREATED_REMOVE,
 #endif
 };
 
@@ -324,7 +348,7 @@ struct scsi_target {
 	struct list_head	siblings;
 	struct list_head	devices;
 	struct device		dev;
-	unsigned int		reap_ref; /* protected by the host lock */
+	RH_KABI_REPLACE(unsigned int reap_ref, struct kref reap_ref) /* last put renders target invisible */
 	unsigned int		channel;
 	unsigned int		id; /* target id ... replace
 				     * scsi_device.id eventually */
@@ -387,11 +411,16 @@ extern struct scsi_device *__scsi_add_device(struct Scsi_Host *,
 		uint, uint, uint, void *hostdata);
 extern int scsi_add_device(struct Scsi_Host *host, uint channel,
 			   uint target, uint lun);
-extern int scsi_register_device_handler(struct scsi_device_handler *scsi_dh);
+extern struct scsi_device_handler_aux *
+scsi_get_device_handler_aux(struct scsi_device_handler *scsi_dh);
+extern int scsi_register_device_handler(struct scsi_device_handler *scsi_dh,
+					struct scsi_device_handler_aux *scsi_dh_aux,
+					size_t scsi_dh_aux_src_size);
 extern void scsi_remove_device(struct scsi_device *);
 extern int scsi_unregister_device_handler(struct scsi_device_handler *scsi_dh);
 void scsi_attach_vpd(struct scsi_device *sdev);
 
+extern struct scsi_device *scsi_device_from_queue(struct request_queue *q);
 extern int scsi_device_get(struct scsi_device *);
 extern void scsi_device_put(struct scsi_device *);
 extern struct scsi_device *scsi_device_lookup(struct Scsi_Host *,

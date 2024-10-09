@@ -46,6 +46,7 @@
  */
 
 #include <linux/net.h>
+#include <rdma/opa_addr.h>
 #define OPA_NUM_PKEY_BLOCKS_PER_SMP (OPA_SMP_DR_DATA_SIZE \
 			/ (OPA_PARTITION_TABLE_BLK_SIZE * sizeof(u16)))
 
@@ -58,6 +59,16 @@
 /* the reset value from the FM is supposed to be 0xffff, handle both */
 #define OPA_LINK_WIDTH_RESET_OLD 0x0fff
 #define OPA_LINK_WIDTH_RESET 0xffff
+
+struct trap_node {
+	struct list_head list;
+	struct opa_mad_notice_attr data;
+	__be64 tid;
+	int len;
+	u32 retry;
+	u8 in_use;
+	u8 repress;
+};
 
 static int smp_length_check(u32 data_size, u32 request_len)
 {
@@ -97,28 +108,222 @@ void hfi1_event_pkey_change(struct hfi1_devdata *dd, u8 port)
 	ib_dispatch_event(&event);
 }
 
-static void send_trap(struct hfi1_ibport *ibp, void *data, unsigned len)
+/*
+ * If the port is down, clean up all pending traps.  We need to be careful
+ * with the given trap, because it may be queued.
+ */
+static void cleanup_traps(struct hfi1_ibport *ibp, struct trap_node *trap)
+{
+	struct trap_node *node, *q;
+	unsigned long flags;
+	struct list_head trap_list;
+	int i;
+
+	for (i = 0; i < RVT_MAX_TRAP_LISTS; i++) {
+		spin_lock_irqsave(&ibp->rvp.lock, flags);
+		list_replace_init(&ibp->rvp.trap_lists[i].list, &trap_list);
+		ibp->rvp.trap_lists[i].list_len = 0;
+		spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+
+		/*
+		 * Remove all items from the list, freeing all the non-given
+		 * traps.
+		 */
+		list_for_each_entry_safe(node, q, &trap_list, list) {
+			list_del(&node->list);
+			if (node != trap)
+				kfree(node);
+		}
+	}
+
+	/*
+	 * If this wasn't on one of the lists it would not be freed.  If it
+	 * was on the list, it is now safe to free.
+	 */
+	kfree(trap);
+}
+
+static struct trap_node *check_and_add_trap(struct hfi1_ibport *ibp,
+					    struct trap_node *trap)
+{
+	struct trap_node *node;
+	struct trap_list *trap_list;
+	unsigned long flags;
+	unsigned long timeout;
+	int found = 0;
+	unsigned int queue_id;
+	static int trap_count;
+
+	queue_id = trap->data.generic_type & 0x0F;
+	if (queue_id >= RVT_MAX_TRAP_LISTS) {
+		trap_count++;
+		pr_err_ratelimited("hfi1: Invalid trap 0x%0x dropped. Total dropped: %d\n",
+				   trap->data.generic_type, trap_count);
+		kfree(trap);
+		return NULL;
+	}
+
+	/*
+	 * Since the retry (handle timeout) does not remove a trap request
+	 * from the list, all we have to do is compare the node.
+	 */
+	spin_lock_irqsave(&ibp->rvp.lock, flags);
+	trap_list = &ibp->rvp.trap_lists[queue_id];
+
+	list_for_each_entry(node, &trap_list->list, list) {
+		if (node == trap) {
+			node->retry++;
+			found = 1;
+			break;
+		}
+	}
+
+	/* If it is not on the list, add it, limited to RVT-MAX_TRAP_LEN. */
+	if (!found) {
+		if (trap_list->list_len < RVT_MAX_TRAP_LEN) {
+			trap_list->list_len++;
+			list_add_tail(&trap->list, &trap_list->list);
+		} else {
+			pr_warn_ratelimited("hfi1: Maximum trap limit reached for 0x%0x traps\n",
+					    trap->data.generic_type);
+			kfree(trap);
+		}
+	}
+
+	/*
+	 * Next check to see if there is a timer pending.  If not, set it up
+	 * and get the first trap from the list.
+	 */
+	node = NULL;
+	if (!timer_pending(&ibp->rvp.trap_timer)) {
+		/*
+		 * o14-2
+		 * If the time out is set we have to wait until it expires
+		 * before the trap can be sent.
+		 * This should be > RVT_TRAP_TIMEOUT
+		 */
+		timeout = (RVT_TRAP_TIMEOUT *
+			   (1UL << ibp->rvp.subnet_timeout)) / 1000;
+		mod_timer(&ibp->rvp.trap_timer,
+			  jiffies + usecs_to_jiffies(timeout));
+		node = list_first_entry(&trap_list->list, struct trap_node,
+					list);
+		node->in_use = 1;
+	}
+	spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+
+	return node;
+}
+
+static void subn_handle_opa_trap_repress(struct hfi1_ibport *ibp,
+					 struct opa_smp *smp)
+{
+	struct trap_list *trap_list;
+	struct trap_node *trap;
+	unsigned long flags;
+	int i;
+
+	if (smp->attr_id != IB_SMP_ATTR_NOTICE)
+		return;
+
+	spin_lock_irqsave(&ibp->rvp.lock, flags);
+	for (i = 0; i < RVT_MAX_TRAP_LISTS; i++) {
+		trap_list = &ibp->rvp.trap_lists[i];
+		trap = list_first_entry_or_null(&trap_list->list,
+						struct trap_node, list);
+		if (trap && trap->tid == smp->tid) {
+			if (trap->in_use) {
+				trap->repress = 1;
+			} else {
+				trap_list->list_len--;
+				list_del(&trap->list);
+				kfree(trap);
+			}
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+}
+
+static void hfi1_update_sm_ah_attr(struct hfi1_ibport *ibp,
+				   struct rdma_ah_attr *attr, u32 dlid)
+{
+	rdma_ah_set_dlid(attr, dlid);
+	rdma_ah_set_port_num(attr, ppd_from_ibp(ibp)->port);
+	if (dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) {
+		struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
+
+		rdma_ah_set_ah_flags(attr, IB_AH_GRH);
+		grh->sgid_index = 0;
+		grh->hop_limit = 1;
+		grh->dgid.global.subnet_prefix =
+			ibp->rvp.gid_prefix;
+		grh->dgid.global.interface_id = OPA_MAKE_ID(dlid);
+	}
+}
+
+static int hfi1_modify_qp0_ah(struct hfi1_ibport *ibp,
+			      struct rvt_ah *ah, u32 dlid)
+{
+	struct rdma_ah_attr attr;
+	struct rvt_qp *qp0;
+	int ret = -EINVAL;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.type = ah->ibah.type;
+	hfi1_update_sm_ah_attr(ibp, &attr, dlid);
+	rcu_read_lock();
+	qp0 = rcu_dereference(ibp->rvp.qp[0]);
+	if (qp0)
+		ret = rdma_modify_ah(&ah->ibah, &attr);
+	rcu_read_unlock();
+	return ret;
+}
+
+static struct ib_ah *hfi1_create_qp0_ah(struct hfi1_ibport *ibp, u32 dlid)
+{
+	struct rdma_ah_attr attr;
+	struct ib_ah *ah = ERR_PTR(-EINVAL);
+	struct rvt_qp *qp0;
+	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+	struct hfi1_devdata *dd = dd_from_ppd(ppd);
+	u8 port_num = ppd->port;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.type = rdma_ah_find_type(&dd->verbs_dev.rdi.ibdev, port_num);
+	hfi1_update_sm_ah_attr(ibp, &attr, dlid);
+	rcu_read_lock();
+	qp0 = rcu_dereference(ibp->rvp.qp[0]);
+	if (qp0)
+		ah = rdma_create_ah(qp0->ibqp.pd, &attr);
+	rcu_read_unlock();
+	return ah;
+}
+
+static void send_trap(struct hfi1_ibport *ibp, struct trap_node *trap)
 {
 	struct ib_mad_send_buf *send_buf;
 	struct ib_mad_agent *agent;
 	struct opa_smp *smp;
-	int ret;
 	unsigned long flags;
-	unsigned long timeout;
 	int pkey_idx;
 	u32 qpn = ppd_from_ibp(ibp)->sm_trap_qp;
 
 	agent = ibp->rvp.send_agent;
-	if (!agent)
+	if (!agent) {
+		cleanup_traps(ibp, trap);
 		return;
+	}
 
 	/* o14-3.2.1 */
-	if (ppd_from_ibp(ibp)->lstate != IB_PORT_ACTIVE)
+	if (driver_lstate(ppd_from_ibp(ibp)) != IB_PORT_ACTIVE) {
+		cleanup_traps(ibp, trap);
 		return;
+	}
 
-	/* o14-2 */
-	if (ibp->rvp.trap_timeout && time_before(jiffies,
-						 ibp->rvp.trap_timeout))
+	/* Add the trap to the list if necessary and see if we can send it */
+	trap = check_and_add_trap(ibp, trap);
+	if (!trap)
 		return;
 
 	pkey_idx = hfi1_lookup_pkey_idx(ibp, LIM_MGMT_P_KEY);
@@ -139,11 +344,21 @@ static void send_trap(struct hfi1_ibport *ibp, void *data, unsigned len)
 	smp->mgmt_class = IB_MGMT_CLASS_SUBN_LID_ROUTED;
 	smp->class_version = OPA_SM_CLASS_VERSION;
 	smp->method = IB_MGMT_METHOD_TRAP;
-	ibp->rvp.tid++;
-	smp->tid = cpu_to_be64(ibp->rvp.tid);
+
+	/* Only update the transaction ID for new traps (o13-5). */
+	if (trap->tid == 0) {
+		ibp->rvp.tid++;
+		/* make sure that tid != 0 */
+		if (ibp->rvp.tid == 0)
+			ibp->rvp.tid++;
+		trap->tid = cpu_to_be64(ibp->rvp.tid);
+	}
+	smp->tid = trap->tid;
+
 	smp->attr_id = IB_SMP_ATTR_NOTICE;
 	/* o14-1: smp->mkey = 0; */
-	memcpy(smp->route.lid.data, data, len);
+
+	memcpy(smp->route.lid.data, &trap->data, trap->len);
 
 	spin_lock_irqsave(&ibp->rvp.lock, flags);
 	if (!ibp->rvp.sm_ah) {
@@ -152,65 +367,101 @@ static void send_trap(struct hfi1_ibport *ibp, void *data, unsigned len)
 
 			ah = hfi1_create_qp0_ah(ibp, ibp->rvp.sm_lid);
 			if (IS_ERR(ah)) {
-				ret = PTR_ERR(ah);
-			} else {
-				send_buf->ah = ah;
-				ibp->rvp.sm_ah = ibah_to_rvtah(ah);
-				ret = 0;
+				spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+				return;
 			}
+			send_buf->ah = ah;
+			ibp->rvp.sm_ah = ibah_to_rvtah(ah);
 		} else {
-			ret = -EINVAL;
+			spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+			return;
 		}
 	} else {
 		send_buf->ah = &ibp->rvp.sm_ah->ibah;
-		ret = 0;
+	}
+
+	/*
+	 * If the trap was repressed while things were getting set up, don't
+	 * bother sending it. This could happen for a retry.
+	 */
+	if (trap->repress) {
+		list_del(&trap->list);
+		spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+		kfree(trap);
+		ib_free_send_mad(send_buf);
+		return;
+	}
+
+	trap->in_use = 0;
+	spin_unlock_irqrestore(&ibp->rvp.lock, flags);
+
+	if (ib_post_send_mad(send_buf, NULL))
+		ib_free_send_mad(send_buf);
+}
+
+void hfi1_handle_trap_timer(unsigned long data)
+{
+	struct hfi1_ibport *ibp = (struct hfi1_ibport *)data;
+	struct trap_node *trap = NULL;
+	unsigned long flags;
+	int i;
+
+	/* Find the trap with the highest priority */
+	spin_lock_irqsave(&ibp->rvp.lock, flags);
+	for (i = 0; !trap && i < RVT_MAX_TRAP_LISTS; i++) {
+		trap = list_first_entry_or_null(&ibp->rvp.trap_lists[i].list,
+						struct trap_node, list);
 	}
 	spin_unlock_irqrestore(&ibp->rvp.lock, flags);
 
-	if (!ret)
-		ret = ib_post_send_mad(send_buf, NULL);
-	if (!ret) {
-		/* 4.096 usec. */
-		timeout = (4096 * (1UL << ibp->rvp.subnet_timeout)) / 1000;
-		ibp->rvp.trap_timeout = jiffies + usecs_to_jiffies(timeout);
-	} else {
-		ib_free_send_mad(send_buf);
-		ibp->rvp.trap_timeout = 0;
-	}
+	if (trap)
+		send_trap(ibp, trap);
+}
+
+static struct trap_node *create_trap_node(u8 type, __be16 trap_num, u32 lid)
+{
+	struct trap_node *trap;
+
+	trap = kzalloc(sizeof(*trap), GFP_ATOMIC);
+	if (!trap)
+		return NULL;
+
+	INIT_LIST_HEAD(&trap->list);
+	trap->data.generic_type = type;
+	trap->data.prod_type_lsb = IB_NOTICE_PROD_CA;
+	trap->data.trap_num = trap_num;
+	trap->data.issuer_lid = cpu_to_be32(lid);
+
+	return trap;
 }
 
 /*
- * Send a bad [PQ]_Key trap (ch. 14.3.8).
+ * Send a bad P_Key trap (ch. 14.3.8).
  */
-void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
-		    u32 qp1, u32 qp2, u16 lid1, u16 lid2)
+void hfi1_bad_pkey(struct hfi1_ibport *ibp, u32 key, u32 sl,
+		   u32 qp1, u32 qp2, u32 lid1, u32 lid2)
 {
-	struct opa_mad_notice_attr data;
+	struct trap_node *trap;
 	u32 lid = ppd_from_ibp(ibp)->lid;
-	u32 _lid1 = lid1;
-	u32 _lid2 = lid2;
 
-	memset(&data, 0, sizeof(data));
-
-	if (trap_num == OPA_TRAP_BAD_P_KEY)
-		ibp->rvp.pkey_violations++;
-	else
-		ibp->rvp.qkey_violations++;
 	ibp->rvp.n_pkt_drops++;
+	ibp->rvp.pkey_violations++;
+
+	trap = create_trap_node(IB_NOTICE_TYPE_SECURITY, OPA_TRAP_BAD_P_KEY,
+				lid);
+	if (!trap)
+		return;
 
 	/* Send violation trap */
-	data.generic_type = IB_NOTICE_TYPE_SECURITY;
-	data.prod_type_lsb = IB_NOTICE_PROD_CA;
-	data.trap_num = trap_num;
-	data.issuer_lid = cpu_to_be32(lid);
-	data.ntc_257_258.lid1 = cpu_to_be32(_lid1);
-	data.ntc_257_258.lid2 = cpu_to_be32(_lid2);
-	data.ntc_257_258.key = cpu_to_be32(key);
-	data.ntc_257_258.sl = sl << 3;
-	data.ntc_257_258.qp1 = cpu_to_be32(qp1);
-	data.ntc_257_258.qp2 = cpu_to_be32(qp2);
+	trap->data.ntc_257_258.lid1 = cpu_to_be32(lid1);
+	trap->data.ntc_257_258.lid2 = cpu_to_be32(lid2);
+	trap->data.ntc_257_258.key = cpu_to_be32(key);
+	trap->data.ntc_257_258.sl = sl << 3;
+	trap->data.ntc_257_258.qp1 = cpu_to_be32(qp1);
+	trap->data.ntc_257_258.qp2 = cpu_to_be32(qp2);
 
-	send_trap(ibp, &data, sizeof(data));
+	trap->len = sizeof(trap->data);
+	send_trap(ibp, trap);
 }
 
 /*
@@ -219,34 +470,36 @@ void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
 static void bad_mkey(struct hfi1_ibport *ibp, struct ib_mad_hdr *mad,
 		     __be64 mkey, __be32 dr_slid, u8 return_path[], u8 hop_cnt)
 {
-	struct opa_mad_notice_attr data;
+	struct trap_node *trap;
 	u32 lid = ppd_from_ibp(ibp)->lid;
 
-	memset(&data, 0, sizeof(data));
+	trap = create_trap_node(IB_NOTICE_TYPE_SECURITY, OPA_TRAP_BAD_M_KEY,
+				lid);
+	if (!trap)
+		return;
+
 	/* Send violation trap */
-	data.generic_type = IB_NOTICE_TYPE_SECURITY;
-	data.prod_type_lsb = IB_NOTICE_PROD_CA;
-	data.trap_num = OPA_TRAP_BAD_M_KEY;
-	data.issuer_lid = cpu_to_be32(lid);
-	data.ntc_256.lid = data.issuer_lid;
-	data.ntc_256.method = mad->method;
-	data.ntc_256.attr_id = mad->attr_id;
-	data.ntc_256.attr_mod = mad->attr_mod;
-	data.ntc_256.mkey = mkey;
+	trap->data.ntc_256.lid = trap->data.issuer_lid;
+	trap->data.ntc_256.method = mad->method;
+	trap->data.ntc_256.attr_id = mad->attr_id;
+	trap->data.ntc_256.attr_mod = mad->attr_mod;
+	trap->data.ntc_256.mkey = mkey;
 	if (mad->mgmt_class == IB_MGMT_CLASS_SUBN_DIRECTED_ROUTE) {
-		data.ntc_256.dr_slid = dr_slid;
-		data.ntc_256.dr_trunc_hop = IB_NOTICE_TRAP_DR_NOTICE;
-		if (hop_cnt > ARRAY_SIZE(data.ntc_256.dr_rtn_path)) {
-			data.ntc_256.dr_trunc_hop |=
+		trap->data.ntc_256.dr_slid = dr_slid;
+		trap->data.ntc_256.dr_trunc_hop = IB_NOTICE_TRAP_DR_NOTICE;
+		if (hop_cnt > ARRAY_SIZE(trap->data.ntc_256.dr_rtn_path)) {
+			trap->data.ntc_256.dr_trunc_hop |=
 				IB_NOTICE_TRAP_DR_TRUNC;
-			hop_cnt = ARRAY_SIZE(data.ntc_256.dr_rtn_path);
+			hop_cnt = ARRAY_SIZE(trap->data.ntc_256.dr_rtn_path);
 		}
-		data.ntc_256.dr_trunc_hop |= hop_cnt;
-		memcpy(data.ntc_256.dr_rtn_path, return_path,
+		trap->data.ntc_256.dr_trunc_hop |= hop_cnt;
+		memcpy(trap->data.ntc_256.dr_rtn_path, return_path,
 		       hop_cnt);
 	}
 
-	send_trap(ibp, &data, sizeof(data));
+	trap->len = sizeof(trap->data);
+
+	send_trap(ibp, trap);
 }
 
 /*
@@ -254,23 +507,24 @@ static void bad_mkey(struct hfi1_ibport *ibp, struct ib_mad_hdr *mad,
  */
 void hfi1_cap_mask_chg(struct rvt_dev_info *rdi, u8 port_num)
 {
-	struct opa_mad_notice_attr data;
+	struct trap_node *trap;
 	struct hfi1_ibdev *verbs_dev = dev_from_rdi(rdi);
 	struct hfi1_devdata *dd = dd_from_dev(verbs_dev);
 	struct hfi1_ibport *ibp = &dd->pport[port_num - 1].ibport_data;
 	u32 lid = ppd_from_ibp(ibp)->lid;
 
-	memset(&data, 0, sizeof(data));
+	trap = create_trap_node(IB_NOTICE_TYPE_INFO,
+				OPA_TRAP_CHANGE_CAPABILITY,
+				lid);
+	if (!trap)
+		return;
 
-	data.generic_type = IB_NOTICE_TYPE_INFO;
-	data.prod_type_lsb = IB_NOTICE_PROD_CA;
-	data.trap_num = OPA_TRAP_CHANGE_CAPABILITY;
-	data.issuer_lid = cpu_to_be32(lid);
-	data.ntc_144.lid = data.issuer_lid;
-	data.ntc_144.new_cap_mask = cpu_to_be32(ibp->rvp.port_cap_flags);
-	data.ntc_144.cap_mask3 = cpu_to_be16(ibp->rvp.port_cap3_flags);
+	trap->data.ntc_144.lid = trap->data.issuer_lid;
+	trap->data.ntc_144.new_cap_mask = cpu_to_be32(ibp->rvp.port_cap_flags);
+	trap->data.ntc_144.cap_mask3 = cpu_to_be16(ibp->rvp.port_cap3_flags);
 
-	send_trap(ibp, &data, sizeof(data));
+	trap->len = sizeof(trap->data);
+	send_trap(ibp, trap);
 }
 
 /*
@@ -278,19 +532,19 @@ void hfi1_cap_mask_chg(struct rvt_dev_info *rdi, u8 port_num)
  */
 void hfi1_sys_guid_chg(struct hfi1_ibport *ibp)
 {
-	struct opa_mad_notice_attr data;
+	struct trap_node *trap;
 	u32 lid = ppd_from_ibp(ibp)->lid;
 
-	memset(&data, 0, sizeof(data));
+	trap = create_trap_node(IB_NOTICE_TYPE_INFO, OPA_TRAP_CHANGE_SYSGUID,
+				lid);
+	if (!trap)
+		return;
 
-	data.generic_type = IB_NOTICE_TYPE_INFO;
-	data.prod_type_lsb = IB_NOTICE_PROD_CA;
-	data.trap_num = OPA_TRAP_CHANGE_SYSGUID;
-	data.issuer_lid = cpu_to_be32(lid);
-	data.ntc_145.new_sys_guid = ib_hfi1_sys_image_guid;
-	data.ntc_145.lid = data.issuer_lid;
+	trap->data.ntc_145.new_sys_guid = ib_hfi1_sys_image_guid;
+	trap->data.ntc_145.lid = trap->data.issuer_lid;
 
-	send_trap(ibp, &data, sizeof(data));
+	trap->len = sizeof(trap->data);
+	send_trap(ibp, trap);
 }
 
 /*
@@ -298,20 +552,21 @@ void hfi1_sys_guid_chg(struct hfi1_ibport *ibp)
  */
 void hfi1_node_desc_chg(struct hfi1_ibport *ibp)
 {
-	struct opa_mad_notice_attr data;
+	struct trap_node *trap;
 	u32 lid = ppd_from_ibp(ibp)->lid;
 
-	memset(&data, 0, sizeof(data));
+	trap = create_trap_node(IB_NOTICE_TYPE_INFO,
+				OPA_TRAP_CHANGE_CAPABILITY,
+				lid);
+	if (!trap)
+		return;
 
-	data.generic_type = IB_NOTICE_TYPE_INFO;
-	data.prod_type_lsb = IB_NOTICE_PROD_CA;
-	data.trap_num = OPA_TRAP_CHANGE_CAPABILITY;
-	data.issuer_lid = cpu_to_be32(lid);
-	data.ntc_144.lid = data.issuer_lid;
-	data.ntc_144.change_flags =
+	trap->data.ntc_144.lid = trap->data.issuer_lid;
+	trap->data.ntc_144.change_flags =
 		cpu_to_be16(OPA_NOTICE_TRAP_NODE_DESC_CHG);
 
-	send_trap(ibp, &data, sizeof(data));
+	trap->len = sizeof(trap->data);
+	send_trap(ibp, trap);
 }
 
 static int __subn_get_opa_nodedesc(struct opa_smp *smp, u32 am,
@@ -615,7 +870,7 @@ static int __subn_get_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 		ppd->offline_disabled_reason;
 
 	pi->port_states.portphysstate_portstate =
-		(hfi1_ibphys_portstate(ppd) << 4) | state;
+		(driver_pstate(ppd) << 4) | state;
 
 	pi->mkeyprotect_lmc = (ibp->rvp.mkeyprot << 6) | ppd->lmc;
 
@@ -715,8 +970,8 @@ static int __subn_get_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 	pi->buffer_units = cpu_to_be32(buffer_units);
 
 	pi->opa_cap_mask = cpu_to_be16(ibp->rvp.port_cap3_flags);
-	pi->collectivemask_multicastmask = ((HFI1_COLLECTIVE_NR & 0x7)
-					    << 3 | (HFI1_MCAST_NR & 0x7));
+	pi->collectivemask_multicastmask = ((OPA_COLLECTIVE_NR & 0x7)
+					    << 3 | (OPA_MCAST_NR & 0x7));
 
 	/* HFI supports a replay buffer 128 LTPs in size */
 	pi->replay_depth.buffer = 0x80;
@@ -926,8 +1181,8 @@ static int physical_transition_allowed(int old, int new)
 static int port_states_transition_allowed(struct hfi1_pportdata *ppd,
 					  u32 logical_new, u32 physical_new)
 {
-	u32 physical_old = driver_physical_state(ppd);
-	u32 logical_old = driver_logical_state(ppd);
+	u32 physical_old = driver_pstate(ppd);
+	u32 logical_old = driver_lstate(ppd);
 	int ret, logical_allowed, physical_allowed;
 
 	ret = logical_transition_allowed(logical_old, logical_new);
@@ -1094,8 +1349,8 @@ static int __subn_set_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 	struct hfi1_ibport *ibp;
 	u8 clientrereg;
 	unsigned long flags;
-	u32 smlid, opa_lid; /* tmp vars to hold LID values */
-	u16 lid;
+	u32 smlid;
+	u32 lid;
 	u8 ls_old, ls_new, ps_new;
 	u8 vls;
 	u8 msl;
@@ -1112,22 +1367,20 @@ static int __subn_set_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 		return reply((struct ib_mad_hdr *)smp);
 	}
 
-	opa_lid = be32_to_cpu(pi->lid);
-	if (opa_lid & 0xFFFF0000) {
-		pr_warn("OPA_PortInfo lid out of range: %X\n", opa_lid);
+	lid = be32_to_cpu(pi->lid);
+	if (lid & 0xFF000000) {
+		pr_warn("OPA_PortInfo lid out of range: %X\n", lid);
 		smp->status |= IB_SMP_INVALID_FIELD;
 		goto get_only;
 	}
 
-	lid = (u16)(opa_lid & 0x0000FFFF);
 
 	smlid = be32_to_cpu(pi->sm_lid);
-	if (smlid & 0xFFFF0000) {
+	if (smlid & 0xFF000000) {
 		pr_warn("OPA_PortInfo SM lid out of range: %X\n", smlid);
 		smp->status |= IB_SMP_INVALID_FIELD;
 		goto get_only;
 	}
-	smlid &= 0x0000FFFF;
 
 	clientrereg = (pi->clientrereg_subnettimeout &
 			OPA_PI_MASK_CLIENT_REREGISTER);
@@ -1142,12 +1395,16 @@ static int __subn_set_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 	ls_old = driver_lstate(ppd);
 
 	ibp->rvp.mkey = pi->mkey;
-	ibp->rvp.gid_prefix = pi->subnet_prefix;
+	if (ibp->rvp.gid_prefix != pi->subnet_prefix) {
+		ibp->rvp.gid_prefix = pi->subnet_prefix;
+		event.event = IB_EVENT_GID_CHANGE;
+		ib_dispatch_event(&event);
+	}
 	ibp->rvp.mkey_lease_period = be16_to_cpu(pi->mkey_lease_period);
 
 	/* Must be a valid unicast LID address. */
 	if ((lid == 0 && ls_old > IB_PORT_INIT) ||
-	    lid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) {
+	     (hfi1_is_16B_mcast(lid))) {
 		smp->status |= IB_SMP_INVALID_FIELD;
 		pr_warn("SubnSet(OPA_PortInfo) lid invalid 0x%x\n",
 			lid);
@@ -1160,6 +1417,16 @@ static int __subn_set_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 		hfi1_set_lid(ppd, lid, pi->mkeyprotect_lmc & OPA_PI_MASK_LMC);
 		event.event = IB_EVENT_LID_CHANGE;
 		ib_dispatch_event(&event);
+
+		if (HFI1_PORT_GUID_INDEX + 1 < HFI1_GUIDS_PER_PORT) {
+			/* Manufacture GID from LID to support extended
+			 * addresses
+			 */
+			ppd->guids[HFI1_PORT_GUID_INDEX + 1] =
+				be64_to_cpu(OPA_MAKE_ID(lid));
+			event.event = IB_EVENT_GID_CHANGE;
+			ib_dispatch_event(&event);
+		}
 	}
 
 	msl = pi->smsl & OPA_PI_MASK_SMSL;
@@ -1170,7 +1437,7 @@ static int __subn_set_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 
 	/* Must be a valid unicast LID address. */
 	if ((smlid == 0 && ls_old > IB_PORT_INIT) ||
-	    smlid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) {
+	     (hfi1_is_16B_mcast(smlid))) {
 		smp->status |= IB_SMP_INVALID_FIELD;
 		pr_warn("SubnSet(OPA_PortInfo) smlid invalid 0x%x\n", smlid);
 	} else if (smlid != ibp->rvp.sm_lid || msl != ibp->rvp.sm_sl) {
@@ -1178,9 +1445,9 @@ static int __subn_set_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
 		spin_lock_irqsave(&ibp->rvp.lock, flags);
 		if (ibp->rvp.sm_ah) {
 			if (smlid != ibp->rvp.sm_lid)
-				ibp->rvp.sm_ah->attr.dlid = smlid;
+				hfi1_modify_qp0_ah(ibp, ibp->rvp.sm_ah, smlid);
 			if (msl != ibp->rvp.sm_sl)
-				ibp->rvp.sm_ah->attr.sl = msl;
+				rdma_ah_set_sl(&ibp->rvp.sm_ah->attr, msl);
 		}
 		spin_unlock_irqrestore(&ibp->rvp.lock, flags);
 		if (smlid != ibp->rvp.sm_lid)
@@ -1791,7 +2058,7 @@ static int __subn_get_opa_psi(struct opa_smp *smp, u32 am, u8 *data,
 		ppd->offline_disabled_reason;
 
 	psi->port_states.portphysstate_portstate =
-		(hfi1_ibphys_portstate(ppd) << 4) | (lstate & 0xf);
+		(driver_pstate(ppd) << 4) | (lstate & 0xf);
 	psi->link_width_downgrade_tx_active =
 		cpu_to_be16(ppd->link_width_downgrade_tx_active);
 	psi->link_width_downgrade_rx_active =
@@ -4026,7 +4293,6 @@ static int opa_local_smp_check(struct hfi1_ibport *ibp,
 			       const struct ib_wc *in_wc)
 {
 	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
-	u16 slid = in_wc->slid;
 	u16 pkey;
 
 	if (in_wc->pkey_index >= ARRAY_SIZE(ppd->pkeys))
@@ -4053,7 +4319,11 @@ static int opa_local_smp_check(struct hfi1_ibport *ibp,
 	 */
 	if (pkey == LIM_MGMT_P_KEY || pkey == FULL_MGMT_P_KEY)
 		return 0;
-	ingress_pkey_table_fail(ppd, pkey, slid);
+	/*
+	 * On OPA devices it is okay to lose the upper 16 bits of LID as this
+	 * information is obtained elsewhere. Mask off the upper 16 bits.
+	 */
+	ingress_pkey_table_fail(ppd, pkey, ib_lid_cpu16(0xFFFF & in_wc->slid));
 	return 1;
 }
 
@@ -4146,6 +4416,11 @@ static int process_subn_opa(struct ib_device *ibdev, int mad_flags,
 		 * before checking for other consumers.
 		 * Just tell the caller to process it normally.
 		 */
+		ret = IB_MAD_RESULT_SUCCESS;
+		break;
+	case IB_MGMT_METHOD_TRAP_REPRESS:
+		subn_handle_opa_trap_repress(ibp, smp);
+		/* Always successful */
 		ret = IB_MAD_RESULT_SUCCESS;
 		break;
 	default:

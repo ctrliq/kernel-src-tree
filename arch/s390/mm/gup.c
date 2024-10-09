@@ -53,13 +53,12 @@ static inline int gup_pte_range(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 static inline int gup_huge_pmd(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 		unsigned long end, int write, struct page **pages, int *nr)
 {
-	unsigned long mask, result;
 	struct page *head, *page, *tail;
+	unsigned long mask;
 	int refs;
 
-	result = write ? 0 : _SEGMENT_ENTRY_PROTECT;
-	mask = result | _SEGMENT_ENTRY_INVALID;
-	if ((pmd_val(pmd) & mask) != result)
+	mask = (write ? _SEGMENT_ENTRY_PROTECT : 0) | _SEGMENT_ENTRY_INVALID;
+	if ((pmd_val(pmd) & mask) != 0)
 		return 0;
 	VM_BUG_ON(!pfn_valid(pmd_val(pmd) >> PAGE_SHIFT));
 
@@ -225,7 +224,7 @@ int __get_user_pages_fast(unsigned long start, int nr_pages, int write,
 	addr = start;
 	len = (unsigned long) nr_pages << PAGE_SHIFT;
 	end = start + len;
-	if ((end <= start) || (end > TASK_SIZE))
+	if ((end <= start) || (end > mm->context.asce_limit))
 		return 0;
 
 	local_irq_save(flags);

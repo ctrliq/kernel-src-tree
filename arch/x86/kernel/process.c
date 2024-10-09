@@ -37,7 +37,7 @@
  * section. Since TSS's are completely CPU-local, we want them
  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
  */
-DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;
+DEFINE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(struct tss_struct, init_tss) = INIT_TSS;
 
 #ifdef CONFIG_X86_64
 static DEFINE_PER_CPU(unsigned char, is_idle);
@@ -330,6 +330,7 @@ bool xen_set_default_idle(void)
 	return ret;
 }
 #endif
+
 void stop_this_cpu(void *dummy)
 {
 	local_irq_disable();
@@ -340,8 +341,25 @@ void stop_this_cpu(void *dummy)
 	disable_local_APIC();
 	mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
 
-	for (;;)
-		halt();
+	/*
+	 * Use wbinvd on processors that support SME. This provides support
+	 * for performing a successful kexec when going from SME inactive
+	 * to SME active (or vice-versa). The cache must be cleared so that
+	 * if there are entries with the same physical address, both with and
+	 * without the encryption bit, they don't race each other when flushed
+	 * and potentially end up with the wrong entry being committed to
+	 * memory.
+	 */
+	if (boot_cpu_has(X86_FEATURE_SME))
+		native_wbinvd();
+	for (;;) {
+		/*
+		 * Use native_halt() so that memory contents don't change
+		 * (stack usage and variables) after possibly issuing the
+		 * native_wbinvd() above.
+		 */
+		native_halt();
+	}
 }
 
 bool amd_e400_c1e_detected;

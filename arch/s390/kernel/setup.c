@@ -61,6 +61,7 @@
 #include <asm/diag.h>
 #include <asm/os_info.h>
 #include <asm/sclp.h>
+#include <asm/alternative.h>
 #include "entry.h"
 
 /*
@@ -345,9 +346,15 @@ static void __init setup_lowcore(void)
 		__ctl_set_bit(14, 29);
 	}
 #else
-	if (MACHINE_HAS_VX)
-		lc->vector_save_area_addr =
-			(unsigned long) &lc->vector_save_area;
+	if (MACHINE_HAS_VX || MACHINE_HAS_GS) {
+		unsigned long bits, size;
+
+		bits = MACHINE_HAS_GS ? 11 : 10;
+		size = 1UL << bits;
+		lc->mcesad = (__u64) __alloc_bootmem_low(size, size, 0);
+		if (MACHINE_HAS_GS)
+			lc->mcesad |= bits;
+	}
 	lc->vdso_per_cpu_data = (unsigned long) &lc->paste[0];
 #endif
 	lc->sync_enter_timer = S390_lowcore.sync_enter_timer;
@@ -930,9 +937,20 @@ static void __init setup_hwcaps(void)
 	/*
 	 * Vector extension HWCAP_S390_VXRS is bit 11.
 	 */
-	if (test_facility(129))
+	if (test_facility(129)) {
 		elf_hwcap |= HWCAP_S390_VXRS;
+		if (test_facility(134))
+			elf_hwcap |= HWCAP_S390_VXRS_EXT;
+		if (test_facility(135))
+			elf_hwcap |= HWCAP_S390_VXRS_BCD;
+	}
 #endif
+
+	/*
+	 * Guarded storage support HWCAP_S390_GS is bit 12.
+	 */
+	if (MACHINE_HAS_GS)
+		elf_hwcap |= HWCAP_S390_GS;
 
 	get_cpu_id(&cpu_id);
 	switch (cpu_id.machine) {
@@ -1053,6 +1071,8 @@ void __init setup_arch(char **cmdline_p)
         /* Setup default console */
 	conmode_default();
 	set_preferred_console();
+
+	apply_alternative_instructions();
 
 	/* Setup zfcpdump support */
 	setup_zfcpdump();

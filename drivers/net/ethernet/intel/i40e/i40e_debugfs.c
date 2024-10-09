@@ -158,9 +158,12 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 	dev_info(&pf->pdev->dev,
 		 "    vlgrp: & = %p\n", vsi->active_vlans);
 	dev_info(&pf->pdev->dev,
-		 "    state = %li flags = 0x%08lx, netdev_registered = %i, current_netdev_flags = 0x%04x\n",
-		 vsi->state, vsi->flags,
-		 vsi->netdev_registered, vsi->current_netdev_flags);
+		 "    flags = 0x%08lx, netdev_registered = %i, current_netdev_flags = 0x%04x\n",
+		 vsi->flags, vsi->netdev_registered, vsi->current_netdev_flags);
+	for (i = 0; i < BITS_TO_LONGS(__I40E_VSI_STATE_SIZE__); i++)
+		dev_info(&pf->pdev->dev,
+			 "    state[%d] = %08lx\n",
+			 i, vsi->state[i]);
 	if (vsi == pf->vsi[pf->lan_vsi])
 		dev_info(&pf->pdev->dev, "    MAC address: %pM SAN MAC: %pM Port MAC: %pM\n",
 			 pf->hw.mac.addr,
@@ -174,7 +177,7 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 	}
 	dev_info(&pf->pdev->dev, "    active_filters %u, promisc_threshold %u, overflow promisc %s\n",
 		 vsi->active_filters, vsi->promisc_threshold,
-		 (test_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state) ?
+		 (test_bit(__I40E_VSI_OVERFLOW_PROMISC, vsi->state) ?
 		  "ON" : "OFF"));
 	nstat = i40e_get_vsi_stats_struct(vsi);
 	dev_info(&pf->pdev->dev,
@@ -486,25 +489,6 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 			 vsi->bw_ets_limit_credits[i],
 			 vsi->bw_ets_max_quanta[i]);
 	}
-#ifdef I40E_FCOE
-	if (vsi->type == I40E_VSI_FCOE) {
-		dev_info(&pf->pdev->dev,
-			 "    fcoe_stats: rx_packets = %llu, rx_dwords = %llu, rx_dropped = %llu\n",
-			 vsi->fcoe_stats.rx_fcoe_packets,
-			 vsi->fcoe_stats.rx_fcoe_dwords,
-			 vsi->fcoe_stats.rx_fcoe_dropped);
-		dev_info(&pf->pdev->dev,
-			 "    fcoe_stats: tx_packets = %llu, tx_dwords = %llu\n",
-			 vsi->fcoe_stats.tx_fcoe_packets,
-			 vsi->fcoe_stats.tx_fcoe_dwords);
-		dev_info(&pf->pdev->dev,
-			 "    fcoe_stats: bad_crc = %llu, last_error = %llu\n",
-			 vsi->fcoe_stats.fcoe_bad_fccrc,
-			 vsi->fcoe_stats.fcoe_last_error);
-		dev_info(&pf->pdev->dev, "    fcoe_stats: ddp_count = %llu\n",
-			 vsi->fcoe_stats.fcoe_ddp_count);
-	}
-#endif
 }
 
 /**
@@ -728,6 +712,7 @@ static void i40e_dbg_dump_vf(struct i40e_pf *pf, int vf_id)
 	if (!pf->num_alloc_vfs) {
 		dev_info(&pf->pdev->dev, "no VFs allocated\n");
 	} else if ((vf_id >= 0) && (vf_id < pf->num_alloc_vfs)) {
+		gmb();
 		vf = &pf->vf[vf_id];
 		vsi = pf->vsi[vf->lan_vsi_idx];
 		dev_info(&pf->pdev->dev, "vf %2d: VSI id=%d, seid=%d, qps=%d\n",
@@ -1725,7 +1710,7 @@ static ssize_t i40e_dbg_netdev_ops_write(struct file *filp,
 		} else if (!vsi->netdev) {
 			dev_info(&pf->pdev->dev, "tx_timeout: no netdev for VSI %d\n",
 				 vsi_seid);
-		} else if (test_bit(__I40E_DOWN, &vsi->state)) {
+		} else if (test_bit(__I40E_VSI_DOWN, vsi->state)) {
 			dev_info(&pf->pdev->dev, "tx_timeout: VSI %d not UP\n",
 				 vsi_seid);
 		} else if (rtnl_trylock()) {
@@ -1752,7 +1737,7 @@ static ssize_t i40e_dbg_netdev_ops_write(struct file *filp,
 			dev_info(&pf->pdev->dev, "change_mtu: no netdev for VSI %d\n",
 				 vsi_seid);
 		} else if (rtnl_trylock()) {
-			vsi->netdev->netdev_ops->ndo_change_mtu(vsi->netdev,
+			vsi->netdev->netdev_ops->extended.ndo_change_mtu(vsi->netdev,
 								mtu);
 			rtnl_unlock();
 			dev_info(&pf->pdev->dev, "change_mtu called\n");

@@ -7,6 +7,7 @@
 #include <linux/fib_rules.h>
 #include <net/flow.h>
 #include <net/rtnetlink.h>
+#include <net/fib_notifier.h>
 
 struct fib_rule {
 	struct list_head	list;
@@ -57,7 +58,8 @@ struct fib_rules_ops {
 					     struct sk_buff *,
 					     struct fib_rule_hdr *,
 					     struct nlattr **);
-	void			(*delete)(struct fib_rule *);
+	RH_KABI_REPLACE(void	(*delete)(struct fib_rule *),
+			int	(*delete)(struct fib_rule *))
 	int			(*compare)(struct fib_rule *,
 					   struct fib_rule_hdr *,
 					   struct nlattr **);
@@ -77,6 +79,12 @@ struct fib_rules_ops {
 	struct module		*owner;
 	struct net		*fro_net;
 	struct rcu_head		rcu;
+	RH_KABI_EXTEND(unsigned int	fib_rules_seq)
+};
+
+struct fib_rule_notifier_info {
+	struct fib_notifier_info info; /* must be first */
+	struct fib_rule *rule;
 };
 
 #define FRA_GENERIC_POLICY \
@@ -115,4 +123,7 @@ extern int			fib_rules_lookup(struct fib_rules_ops *,
 extern int			fib_default_rule_add(struct fib_rules_ops *,
 						     u32 pref, u32 table,
 						     u32 flags);
+bool fib_rule_matchall(const struct fib_rule *rule);
+int fib_rules_dump(struct net *net, struct notifier_block *nb, int family);
+unsigned int fib_rules_seq_read(struct net *net, int family);
 #endif

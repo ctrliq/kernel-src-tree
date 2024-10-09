@@ -105,8 +105,10 @@ void zpci_teardown_msi_irq(struct zpci_dev *zdev, struct msi_desc *msi)
 	msi->irq = 0;
 
 	spin_lock(&msi_map_lock);
-	map = zdev->msi_map + nr;
-	hlist_del_rcu(&map->msi_chain);
+	if (zdev->msi_map) {
+		map = zdev->msi_map + nr;
+		hlist_del_rcu(&map->msi_chain);
+	}
 	spin_unlock(&msi_map_lock);
 }
 

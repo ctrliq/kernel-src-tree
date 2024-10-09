@@ -82,15 +82,6 @@ void sort_extable(struct exception_table_entry *start,
 void sort_main_extable(void);
 void trim_init_extable(struct module *m);
 
-#ifdef MODULE
-#define MODULE_GENERIC_TABLE(gtype,name)			\
-extern const struct gtype##_id __mod_##gtype##_table		\
-  __attribute__ ((unused, alias(__stringify(name))))
-
-#else  /* !MODULE */
-#define MODULE_GENERIC_TABLE(gtype,name)
-#endif
-
 /* Generic info of form tag = "info" */
 #define MODULE_INFO(tag, info) __MODULE_INFO(tag, tag, info)
 
@@ -141,8 +132,14 @@ extern const struct gtype##_id __mod_##gtype##_table		\
 /* What your module does. */
 #define MODULE_DESCRIPTION(_description) MODULE_INFO(description, _description)
 
-#define MODULE_DEVICE_TABLE(type,name)		\
-  MODULE_GENERIC_TABLE(type##_device,name)
+#ifdef MODULE
+/* Creates an alias so file2alias.c can find device table. */
+#define MODULE_DEVICE_TABLE(type, name)					\
+extern const typeof(name) __mod_##type##__##name##_device_table		\
+  __attribute__ ((unused, alias(__stringify(name))))
+#else  /* !MODULE */
+#define MODULE_DEVICE_TABLE(type, name)
+#endif
 
 /* Version of form [<epoch>:]<version>[-<extra-version>].
    Or for CVS/RCS ID version, everything but the number is stripped.
@@ -225,6 +222,15 @@ struct module_ref {
 	unsigned long decs;
 } __attribute((aligned(2 * sizeof(unsigned long))));
 
+#ifdef CONFIG_LIVEPATCH
+struct klp_modinfo {
+	Elf_Ehdr hdr;
+	Elf_Shdr *sechdrs;
+	char *secstrings;
+	unsigned int symndx;
+};
+#endif
+
 /* extended module structure for RHEL */
 struct module_ext {
 	struct list_head next;
@@ -233,6 +239,13 @@ struct module_ext {
 #if defined(CONFIG_FTRACE_MCOUNT_RECORD) && defined(CONFIG_S390)
 	unsigned int num_ftrace_callsites;
 	unsigned long *ftrace_callsites;
+#endif
+#ifdef CONFIG_LIVEPATCH
+	bool klp; /* Is this a livepatch module? */
+	bool klp_alive;
+
+	/* Elf information */
+	struct klp_modinfo *klp_info;
 #endif
 };
 
@@ -534,6 +547,24 @@ extern void print_modules(void);
 
 bool check_module_rhelversion(struct module *mod, char *version);
 
+#ifdef CONFIG_LIVEPATCH
+static inline bool is_livepatch_module(struct module *mod)
+{
+	bool klp;
+
+	mutex_lock(&module_ext_mutex);
+	klp = find_module_ext(mod)->klp;
+	mutex_unlock(&module_ext_mutex);
+
+	return klp;
+}
+#else /* !CONFIG_LIVEPATCH */
+static inline bool is_livepatch_module(struct module *mod)
+{
+	return false;
+}
+#endif /* CONFIG_LIVEPATCH */
+
 bool is_module_sig_enforced(void);
 
 #else /* !CONFIG_MODULES... */
@@ -674,9 +705,13 @@ extern int module_sysfs_initialized;
 #ifdef CONFIG_DEBUG_SET_MODULE_RONX
 extern void set_all_modules_text_rw(void);
 extern void set_all_modules_text_ro(void);
+extern void module_enable_ro(const struct module *mod);
+extern void module_disable_ro(const struct module *mod);
 #else
 static inline void set_all_modules_text_rw(void) { }
 static inline void set_all_modules_text_ro(void) { }
+static inline void module_enable_ro(const struct module *mod) { }
+static inline void module_disable_ro(const struct module *mod) { }
 #endif
 
 #ifdef CONFIG_GENERIC_BUG

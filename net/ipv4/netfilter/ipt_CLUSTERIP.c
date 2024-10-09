@@ -110,7 +110,7 @@ clusterip_config_entry_put(struct net *net, struct clusterip_config *c)
 		spin_unlock(&cn->lock);
 		local_bh_enable();
 
-		unregister_netdevice_notifier(&c->notifier);
+		unregister_netdevice_notifier_rh(&c->notifier);
 
 		/* In case anyone still accesses the file, the open/close
 		 * functions are also incrementing the refcount on their own,
@@ -257,7 +257,7 @@ clusterip_config_init(struct net *net, const struct ipt_clusterip_tgt_info *i,
 #endif
 
 	c->notifier.notifier_call = clusterip_netdev_event;
-	err = register_netdevice_notifier(&c->notifier);
+	err = register_netdevice_notifier_rh(&c->notifier);
 	if (!err)
 		return c;
 

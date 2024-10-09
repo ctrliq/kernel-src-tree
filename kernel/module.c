@@ -54,6 +54,7 @@
 #include <asm/sections.h>
 #include <linux/tracepoint.h>
 #include <linux/ftrace.h>
+#include <linux/livepatch.h>
 #include <linux/async.h>
 #include <linux/percpu.h>
 #include <linux/kmemleak.h>
@@ -137,12 +138,8 @@ bool check_module_rhelversion(struct module *mod, char *version)
 	return ret;
 }
 
-#ifdef CONFIG_MODULE_SIG
-#ifdef CONFIG_MODULE_SIG_FORCE
-static bool sig_enforce = true;
-#else
-static bool sig_enforce = false;
-
+static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);
+#ifndef CONFIG_MODULE_SIG_FORCE
 static int param_set_bool_enable_only(const char *val,
 				      const struct kernel_param *kp)
 {
@@ -173,7 +170,6 @@ static const struct kernel_param_ops param_ops_bool_enable_only = {
 
 module_param(sig_enforce, bool_enable_only, 0644);
 #endif /* !CONFIG_MODULE_SIG_FORCE */
-#endif /* CONFIG_MODULE_SIG */
 
 /*
  * Export sig_enforce kernel cmdline parameter to allow other subsystems rely
@@ -977,6 +973,9 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 		mod->exit();
 	blocking_notifier_call_chain(&module_notify_list,
 				     MODULE_STATE_GOING, mod);
+	klp_module_going(mod);
+	ftrace_release_mod(mod);
+
 	async_synchronize_full();
 
 	/* Store the name of the last unloaded module for diagnostic purposes */
@@ -1892,6 +1891,22 @@ static void unset_module_init_ro_nx(struct module *mod)
 			  set_memory_rw, set_memory_x);
 }
 
+void module_disable_ro(const struct module *mod)
+{
+	set_memory_rw((unsigned long)mod->module_core,
+		      mod->core_ro_size >> PAGE_SHIFT);
+	set_memory_rw((unsigned long)mod->module_init,
+		      mod->init_ro_size >> PAGE_SHIFT);
+}
+
+void module_enable_ro(const struct module *mod)
+{
+	set_memory_ro((unsigned long)mod->module_core,
+		      mod->core_ro_size >> PAGE_SHIFT);
+	set_memory_ro((unsigned long)mod->module_init,
+		      mod->init_ro_size >> PAGE_SHIFT);
+}
+
 /* Iterate through all modules and set each module's text as RW */
 void set_all_modules_text_rw(void)
 {
@@ -1945,6 +1960,93 @@ static void unset_module_core_ro_nx(struct module *mod) { }
 static void unset_module_init_ro_nx(struct module *mod) { }
 #endif
 
+#ifdef CONFIG_LIVEPATCH
+/*
+ * Persist Elf information about a module. Copy the Elf header,
+ * section header table, section string table, and symtab section
+ * index from info to mod_ext->klp_info.
+ */
+static int copy_module_elf(struct module *mod, struct load_info *info)
+{
+	unsigned int size, symndx;
+	int ret;
+	struct module_ext *mod_ext;
+
+	mutex_lock(&module_ext_mutex);
+	mod_ext = find_module_ext(mod);
+	mutex_unlock(&module_ext_mutex);
+
+	size = sizeof(*mod_ext->klp_info);
+	mod_ext->klp_info = kmalloc(size, GFP_KERNEL);
+	if (mod_ext->klp_info == NULL)
+		return -ENOMEM;
+
+	/* Elf header */
+	size = sizeof(mod_ext->klp_info->hdr);
+	memcpy(&mod_ext->klp_info->hdr, info->hdr, size);
+
+	/* Elf section header table */
+	size = sizeof(*info->sechdrs) * info->hdr->e_shnum;
+	mod_ext->klp_info->sechdrs = kmalloc(size, GFP_KERNEL);
+	if (mod_ext->klp_info->sechdrs == NULL) {
+		ret = -ENOMEM;
+		goto free_info;
+	}
+	memcpy(mod_ext->klp_info->sechdrs, info->sechdrs, size);
+
+	/* Elf section name string table */
+	size = info->sechdrs[info->hdr->e_shstrndx].sh_size;
+	mod_ext->klp_info->secstrings = kmalloc(size, GFP_KERNEL);
+	if (mod_ext->klp_info->secstrings == NULL) {
+		ret = -ENOMEM;
+		goto free_sechdrs;
+	}
+	memcpy(mod_ext->klp_info->secstrings, info->secstrings, size);
+
+	/* Elf symbol section index */
+	symndx = info->index.sym;
+	mod_ext->klp_info->symndx = symndx;
+
+	/*
+	 * For livepatch modules, core_symtab is a complete
+	 * copy of the original symbol table. Adjust sh_addr to point
+	 * to core_symtab since the copy of the symtab in module
+	 * init memory is freed at the end of do_init_module().
+	 */
+	mod_ext->klp_info->sechdrs[symndx].sh_addr = \
+		(unsigned long) mod->core_symtab;
+
+	return 0;
+
+free_sechdrs:
+	kfree(mod_ext->klp_info->sechdrs);
+free_info:
+	kfree(mod_ext->klp_info);
+	return ret;
+}
+
+static void free_module_elf(struct module *mod)
+{
+	struct module_ext *mod_ext;
+
+	mutex_lock(&module_ext_mutex);
+	mod_ext = find_module_ext(mod);
+	kfree(mod_ext->klp_info->sechdrs);
+	kfree(mod_ext->klp_info->secstrings);
+	kfree(mod_ext->klp_info);
+	mutex_unlock(&module_ext_mutex);
+}
+#else /* !CONFIG_LIVEPATCH */
+static int copy_module_elf(struct module *mod, struct load_info *info)
+{
+	return 0;
+}
+
+static void free_module_elf(struct module *mod)
+{
+}
+#endif /* CONFIG_LIVEPATCH */
+
 void __weak module_free(struct module *mod, void *module_region)
 {
 	vfree(module_region);
@@ -1981,6 +2083,9 @@ static void free_module(struct module *mod)
 	/* Free any allocated parameters. */
 	destroy_params(mod->kp, mod->num_kp);
 
+	if (is_livepatch_module(mod))
+		free_module_elf(mod);
+
 	/* Now we can delete it from the lists */
 	mutex_lock(&module_mutex);
 	stop_machine(__unlink_module, mod, NULL);
@@ -1990,6 +2095,7 @@ static void free_module(struct module *mod)
 	mod_ext = find_module_ext(mod);
 	list_del(&mod_ext->next);
 	mutex_unlock(&module_ext_mutex);
+	kfree(mod_ext);
 
 	/* This may be NULL, but that's OK */
 	unset_module_init_ro_nx(mod);
@@ -2091,6 +2197,10 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 			       (long)sym[i].st_value);
 			break;
 
+		case SHN_LIVEPATCH:
+			/* Livepatch symbols are resolved by livepatch */
+			break;
+
 		case SHN_UNDEF:
 			ksym = resolve_symbol_wait(mod, info, name);
 			/* Ok if resolved.  */
@@ -2137,6 +2247,10 @@ static int apply_relocations(struct module *mod, const struct load_info *info)
 
 		/* Don't bother with non-allocated sections */
 		if (!(info->sechdrs[infosec].sh_flags & SHF_ALLOC))
+			continue;
+
+		/* Livepatch relocation sections are applied by livepatch */
+		if (info->sechdrs[i].sh_flags & SHF_RELA_LIVEPATCH)
 			continue;
 
 		if (info->sechdrs[i].sh_type == SHT_REL)
@@ -2284,7 +2398,7 @@ static char *next_string(char *string, unsigned long *secsize)
 	return string;
 }
 
-static char *get_modinfo(struct load_info *info, const char *tag)
+static char *get_modinfo(const struct load_info *info, const char *tag)
 {
 	char *p;
 	unsigned int taglen = strlen(tag);
@@ -2355,7 +2469,7 @@ static char elf_type(const Elf_Sym *sym, const struct load_info *info)
 	}
 	if (sym->st_shndx == SHN_UNDEF)
 		return 'U';
-	if (sym->st_shndx == SHN_ABS)
+	if (sym->st_shndx == SHN_ABS || sym->st_shndx == info->index.pcpu)
 		return 'a';
 	if (sym->st_shndx >= SHN_LORESERVE)
 		return '?';
@@ -2384,7 +2498,7 @@ static char elf_type(const Elf_Sym *sym, const struct load_info *info)
 }
 
 static bool is_core_symbol(const Elf_Sym *src, const Elf_Shdr *sechdrs,
-                           unsigned int shnum)
+			unsigned int shnum, unsigned int pcpundx)
 {
 	const Elf_Shdr *sec;
 
@@ -2392,6 +2506,11 @@ static bool is_core_symbol(const Elf_Sym *src, const Elf_Shdr *sechdrs,
 	    || src->st_shndx >= shnum
 	    || !src->st_name)
 		return false;
+
+#ifdef CONFIG_KALLSYMS_ALL
+	if (src->st_shndx == pcpundx)
+		return true;
+#endif
 
 	sec = sechdrs + src->st_shndx;
 	if (!(sec->sh_flags & SHF_ALLOC)
@@ -2430,7 +2549,9 @@ static void layout_symtab(struct module *mod, struct load_info *info)
 	/* Compute total space required for the core symbols' strtab. */
 	for (ndst = i = 0; i < nsrc; i++) {
 		if (i == 0 ||
-		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
+		    (IS_ENABLED(CONFIG_LIVEPATCH) && get_modinfo(info, "livepatch")) ||
+		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum,
+				   info->index.pcpu)) {
 			strtab_size += strlen(&info->strtab[src[i].st_name])+1;
 			ndst++;
 		}
@@ -2470,7 +2591,9 @@ static void add_kallsyms(struct module *mod, const struct load_info *info)
 	src = mod->symtab;
 	for (ndst = i = 0; i < mod->num_symtab; i++) {
 		if (i == 0 ||
-		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
+		    (IS_ENABLED(CONFIG_LIVEPATCH) && get_modinfo(info, "livepatch")) ||
+		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum,
+				   info->index.pcpu)) {
 			dst[ndst] = src[i];
 			dst[ndst++].st_name = s - mod->core_strtab;
 			s += strlcpy(s, &mod->strtab[src[i].st_name],
@@ -2606,16 +2729,27 @@ static int elf_header_check(struct load_info *info)
 	return 0;
 }
 
+#ifdef CONFIG_LIVEPATCH
+static int check_modinfo_livepatch(struct module *mod, struct load_info *info)
+{
+	/*
+	 * RHEL: This code has been moved to after the module_ext is allocated.
+	 */
+
+	return 0;
+}
+#else /* !CONFIG_LIVEPATCH */
 static int check_modinfo_livepatch(struct module *mod, struct load_info *info)
 {
 	if (get_modinfo(info, "livepatch")) {
-		add_taint_module(mod, TAINT_LIVEPATCH, LOCKDEP_STILL_OK);
-		pr_notice_once("%s: tainting kernel with TAINT_LIVEPATCH\n",
-			       mod->name);
+		pr_err("%s: module is marked as livepatch module, but livepatch support is disabled",
+		       mod->name);
+		return -ENOEXEC;
 	}
 
 	return 0;
 }
+#endif /* CONFIG_LIVEPATCH */
 
 /* Sets info->hdr and info->len. */
 static int copy_module_from_user(const void __user *umod, unsigned long len,
@@ -2835,6 +2969,15 @@ static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 		       mod->name);
 	}
 
+#ifdef CONFIG_RETPOLINE
+{
+	extern void spec_ctrl_report_unsafe_module(struct module *mod);
+
+	if (!get_modinfo(info, "retpoline"))
+		spec_ctrl_report_unsafe_module(mod);
+}
+#endif
+
 	err = check_modinfo_livepatch(mod, info);
 	if (err)
 		return err;
@@ -2847,6 +2990,10 @@ static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 
 static int find_module_sections(struct module *mod, struct load_info *info)
 {
+#ifdef CONFIG_S390
+	struct module_ext *mod_ext;
+#endif
+
 	mod->kp = section_objs(info, "__param",
 			       sizeof(*mod->kp), &mod->num_kp);
 	mod->syms = section_objs(info, "__ksymtab",
@@ -2911,8 +3058,6 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 #endif
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD
 #ifdef CONFIG_S390
-	struct module_ext *mod_ext;
-
 	mutex_lock(&module_ext_mutex);
 	mod_ext = find_module_ext(mod);
 	mod_ext->ftrace_callsites = section_objs(info, "__mcount_loc",
@@ -3229,6 +3374,8 @@ static int do_init_module(struct module *mod)
 		module_put(mod);
 		blocking_notifier_call_chain(&module_notify_list,
 					     MODULE_STATE_GOING, mod);
+		klp_module_going(mod);
+		ftrace_release_mod(mod);
 		free_module(mod);
 		wake_up_all(&module_wq);
 		return ret;
@@ -3356,13 +3503,25 @@ static int complete_formation(struct module *mod, struct load_info *info)
 	mod->state = MODULE_STATE_COMING;
 	mutex_unlock(&module_mutex);
 
-	blocking_notifier_call_chain(&module_notify_list,
-				     MODULE_STATE_COMING, mod);
 	return 0;
 
 out:
 	mutex_unlock(&module_mutex);
 	return err;
+}
+
+static int prepare_coming_module(struct module *mod)
+{
+	int err;
+
+	ftrace_module_enable(mod);
+	err = klp_module_coming(mod);
+	if (err)
+		return err;
+
+	blocking_notifier_call_chain(&module_notify_list,
+				     MODULE_STATE_COMING, mod);
+	return 0;
 }
 
 /* Allocate and load the module: note that size of section 0 is always
@@ -3428,6 +3587,17 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	list_add(&mod_ext->next, &modules_ext);
 	mutex_unlock(&module_ext_mutex);
 
+	/*
+	 * RHEL: moved from check_modinfo_livepatch() to after mod_ext
+	 * allocation.
+	 */
+#ifdef CONFIG_LIVEPATCH
+	if (get_modinfo(info, "livepatch")) {
+		mod_ext->klp = true;
+		add_taint_module(mod, TAINT_LIVEPATCH, LOCKDEP_STILL_OK);
+	}
+#endif
+
 	/* Now we've got everything in the final locations, we can
 	 * find optional sections. */
 	err = find_module_sections(mod, info);
@@ -3480,16 +3650,26 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	if (err)
 		goto ddebug_cleanup;
 
+	err = prepare_coming_module(mod);
+	if (err)
+		goto bug_cleanup;
+
 	/* Module is ready to execute: parsing args may do that. */
 	err = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
 			 -32768, 32767, &ddebug_dyndbg_module_param_cb);
 	if (err < 0)
-		goto bug_cleanup;
+		goto coming_cleanup;
 
 	/* Link in to sysfs. */
 	err = mod_sysfs_setup(mod, info, mod->kp, mod->num_kp);
 	if (err < 0)
-		goto bug_cleanup;
+		goto coming_cleanup;
+
+	if (is_livepatch_module(mod)) {
+		err = copy_module_elf(mod, info);
+		if (err < 0)
+			goto sysfs_cleanup;
+	}
 
 	/* Get rid of temporary copy. */
 	free_copy(info);
@@ -3499,15 +3679,18 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	return do_init_module(mod);
 
+ sysfs_cleanup:
+	mod_sysfs_teardown(mod);
+ coming_cleanup:
+	mod->state = MODULE_STATE_GOING;
+	blocking_notifier_call_chain(&module_notify_list,
+				     MODULE_STATE_GOING, mod);
+	klp_module_going(mod);
  bug_cleanup:
 	/* module_bug_cleanup needs module_mutex protection */
 	mutex_lock(&module_mutex);
 	module_bug_cleanup(mod);
 	mutex_unlock(&module_mutex);
-
-	mod->state = MODULE_STATE_GOING;
-	blocking_notifier_call_chain(&module_notify_list,
-				     MODULE_STATE_GOING, mod);
 
 	/* we can't deallocate the module until we clear memory protection */
 	unset_module_init_ro_nx(mod);
@@ -3525,6 +3708,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	mutex_lock(&module_ext_mutex);
 	list_del(&mod_ext->next);
 	mutex_unlock(&module_ext_mutex);
+	kfree(mod_ext);
  free_unload:
 	module_unload_free(mod);
  unlink_mod:

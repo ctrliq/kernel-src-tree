@@ -488,7 +488,7 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
 	skb_dst_set(head, dst);
 
 	/* Build the SCTP header.  */
-	sh = (struct sctphdr *)skb_push(head, sizeof(struct sctphdr));
+	sh = skb_push(head, sizeof(struct sctphdr));
 	skb_reset_transport_header(head);
 	sh->source = htons(packet->source_port);
 	sh->dest   = htons(packet->destination_port);
@@ -576,7 +576,7 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
 
 			padding = SCTP_PAD4(chunk->skb->len) - chunk->skb->len;
 			if (padding)
-				memset(skb_put(chunk->skb, padding), 0, padding);
+				skb_put_zero(chunk->skb, padding);
 
 			/* if this is the auth chunk that we are adding,
 			 * store pointer where it will be added and put
@@ -585,8 +585,7 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
 			if (chunk == packet->auth)
 				auth = skb_tail_pointer(nskb);
 
-			memcpy(skb_put(nskb, chunk->skb->len),
-			       chunk->skb->data, chunk->skb->len);
+			skb_put_data(nskb, chunk->skb->data, chunk->skb->len);
 
 			pr_debug("*** Chunk:%p[%s] %s 0x%x, length:%d, chunk->skb->len:%d, rtt_in_progress:%d\n",
 				 chunk,
@@ -834,7 +833,7 @@ static sctp_xmit_t sctp_packet_can_append_data(struct sctp_packet *packet,
 	 */
 
 	if ((sctp_sk(asoc->base.sk)->nodelay || inflight == 0) &&
-	    !chunk->msg->force_delay)
+	    !asoc->force_delay)
 		/* Nothing unacked */
 		return SCTP_XMIT_OK;
 

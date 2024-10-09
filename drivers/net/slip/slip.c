@@ -571,7 +571,7 @@ static int sl_change_mtu(struct net_device *dev, int new_mtu)
 
 /* Netdevice get statistics request */
 
-static struct rtnl_link_stats64 *
+static void
 sl_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct net_device_stats *devstats = &dev->stats;
@@ -602,7 +602,6 @@ sl_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 		stats->collisions     += comp->sls_o_misses;
 	}
 #endif
-	return stats;
 }
 
 /* Netdevice register callback */
@@ -635,7 +634,7 @@ static void sl_uninit(struct net_device *dev)
 static void sl_free_netdev(struct net_device *dev)
 {
 	int i = dev->base_addr;
-	free_netdev(dev);
+
 	slip_devs[i] = NULL;
 }
 
@@ -646,7 +645,7 @@ static const struct net_device_ops sl_netdev_ops = {
 	.ndo_stop		= sl_close,
 	.ndo_start_xmit		= sl_xmit,
 	.ndo_get_stats64        = sl_get_stats64,
-	.ndo_change_mtu		= sl_change_mtu,
+	.ndo_change_mtu_rh74	= sl_change_mtu,
 	.ndo_tx_timeout		= sl_tx_timeout,
 #ifdef CONFIG_SLIP_SMART
 	.ndo_do_ioctl		= sl_ioctl,
@@ -657,7 +656,8 @@ static const struct net_device_ops sl_netdev_ops = {
 static void sl_setup(struct net_device *dev)
 {
 	dev->netdev_ops		= &sl_netdev_ops;
-	dev->destructor		= sl_free_netdev;
+	dev->extended->needs_free_netdev	= true;
+	dev->extended->priv_destructor	= sl_free_netdev;
 
 	dev->hard_header_len	= 0;
 	dev->addr_len		= 0;
@@ -1371,8 +1371,6 @@ static void __exit slip_exit(void)
 		if (sl->tty) {
 			printk(KERN_ERR "%s: tty discipline still running\n",
 			       dev->name);
-			/* Intentionally leak the control block. */
-			dev->destructor = NULL;
 		}
 
 		unregister_netdev(dev);

@@ -661,7 +661,7 @@ static void ipv6_push_rthdr(struct sk_buff *skb, u8 *proto,
 
 	ihdr = (struct rt0_hdr *) opt;
 
-	phdr = (struct rt0_hdr *) skb_push(skb, (ihdr->rt_hdr.hdrlen + 1) << 3);
+	phdr = skb_push(skb, (ihdr->rt_hdr.hdrlen + 1) << 3);
 	memcpy(phdr, ihdr, sizeof(struct rt0_hdr));
 
 	hops = ihdr->rt_hdr.hdrlen >> 1;
@@ -679,7 +679,7 @@ static void ipv6_push_rthdr(struct sk_buff *skb, u8 *proto,
 
 static void ipv6_push_exthdr(struct sk_buff *skb, u8 *proto, u8 type, struct ipv6_opt_hdr *opt)
 {
-	struct ipv6_opt_hdr *h = (struct ipv6_opt_hdr *)skb_push(skb, ipv6_optlen(opt));
+	struct ipv6_opt_hdr *h = skb_push(skb, ipv6_optlen(opt));
 
 	memcpy(h, opt, ipv6_optlen(opt));
 	h->nexthdr = *proto;

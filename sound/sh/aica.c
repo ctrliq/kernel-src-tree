@@ -214,7 +214,7 @@ static void aica_chn_halt(void)
 }
 
 /* ALSA code below */
-static const struct snd_pcm_hardware snd_pcm_aica_playback_hw = {
+static struct snd_pcm_hardware snd_pcm_aica_playback_hw = {
 	.info = (SNDRV_PCM_INFO_NONINTERLEAVED),
 	.formats =
 	    (SNDRV_PCM_FMTBIT_S8 | SNDRV_PCM_FMTBIT_S16_LE |
@@ -540,7 +540,7 @@ static int aica_pcmvolume_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
-static struct snd_kcontrol_new snd_aica_pcmswitch_control = {
+static const struct snd_kcontrol_new snd_aica_pcmswitch_control = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "PCM Playback Switch",
 	.index = 0,
@@ -549,7 +549,7 @@ static struct snd_kcontrol_new snd_aica_pcmswitch_control = {
 	.put = aica_pcmswitch_put
 };
 
-static struct snd_kcontrol_new snd_aica_pcmvolume_control = {
+static const struct snd_kcontrol_new snd_aica_pcmvolume_control = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "PCM Playback Volume",
 	.index = 0,

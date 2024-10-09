@@ -18,6 +18,24 @@
 #include <linux/stat.h>
 #include <linux/slab.h>
 
+/**
+ * kobject_namespace - return @kobj's namespace tag
+ * @kobj: kobject in question
+ *
+ * Returns namespace tag of @kobj if its parent has namespace ops enabled
+ * and thus @kobj should have a namespace tag associated with it.  Returns
+ * %NULL otherwise.
+ */
+const void *kobject_namespace(struct kobject *kobj)
+{
+	const struct kobj_ns_type_operations *ns_ops = kobj_ns_ops(kobj);
+
+	if (!ns_ops || ns_ops->type == KOBJ_NS_TYPE_NONE)
+		return NULL;
+
+	return kobj->ktype->namespace(kobj);
+}
+
 /*
  * populate_dir - populate directory with attributes.
  * @kobj: object we're working on.
@@ -46,12 +64,17 @@ static int populate_dir(struct kobject *kobj)
 
 static int create_dir(struct kobject *kobj)
 {
-	int error = 0;
-	error = sysfs_create_dir(kobj);
-	if (!error) {
-		error = populate_dir(kobj);
-		if (error)
-			sysfs_remove_dir(kobj);
+	const struct kobj_ns_type_operations *ops;
+	int error;
+
+	error = sysfs_create_dir_ns(kobj, kobject_namespace(kobj));
+	if (error)
+		return error;
+
+	error = populate_dir(kobj);
+	if (error) {
+		sysfs_remove_dir(kobj);
+		return error;
 	}
 
 	/*
@@ -60,7 +83,20 @@ static int create_dir(struct kobject *kobj)
 	 */
 	sysfs_get(kobj->sd);
 
-	return error;
+	/*
+	 * If @kobj has ns_ops, its children need to be filtered based on
+	 * their namespace tags.  Enable namespace support on @kobj->sd.
+	 */
+	ops = kobj_child_ns_ops(kobj);
+	if (ops) {
+		BUG_ON(ops->type <= KOBJ_NS_TYPE_NONE);
+		BUG_ON(ops->type >= KOBJ_NS_TYPES);
+		BUG_ON(!kobj_ns_type_registered(ops->type));
+
+		sysfs_enable_ns(kobj->sd);
+	}
+
+	return 0;
 }
 
 static int get_kobj_path_length(struct kobject *kobj)
@@ -437,7 +473,7 @@ int kobject_rename(struct kobject *kobj, const char *new_name)
 		goto out;
 	}
 
-	error = sysfs_rename_dir(kobj, new_name);
+	error = sysfs_rename_dir_ns(kobj, new_name, kobject_namespace(kobj));
 	if (error)
 		goto out;
 
@@ -481,6 +517,7 @@ int kobject_move(struct kobject *kobj, struct kobject *new_parent)
 		if (kobj->kset)
 			new_parent = kobject_get(&kobj->kset->kobj);
 	}
+
 	/* old object path */
 	devpath = kobject_get_path(kobj, GFP_KERNEL);
 	if (!devpath) {
@@ -495,7 +532,7 @@ int kobject_move(struct kobject *kobj, struct kobject *new_parent)
 	sprintf(devpath_string, "DEVPATH_OLD=%s", devpath);
 	envp[0] = devpath_string;
 	envp[1] = NULL;
-	error = sysfs_move_dir(kobj, new_parent);
+	error = sysfs_move_dir_ns(kobj, new_parent, kobject_namespace(kobj));
 	if (error)
 		goto out;
 	old_parent = kobj->parent;
@@ -517,7 +554,7 @@ out:
  */
 void kobject_del(struct kobject *kobj)
 {
-	struct sysfs_dirent *sd;
+	struct kernfs_node *sd;
 
 	if (!kobj)
 		return;
@@ -936,6 +973,18 @@ const struct kobj_ns_type_operations *kobj_ns_ops(struct kobject *kobj)
 	return kobj_child_ns_ops(kobj->parent);
 }
 
+bool kobj_ns_current_may_mount(enum kobj_ns_type type)
+{
+	bool may_mount = true;
+
+	spin_lock(&kobj_ns_type_lock);
+	if ((type > KOBJ_NS_TYPE_NONE) && (type < KOBJ_NS_TYPES) &&
+	    kobj_ns_ops_tbl[type])
+		may_mount = kobj_ns_ops_tbl[type]->current_may_mount();
+	spin_unlock(&kobj_ns_type_lock);
+
+	return may_mount;
+}
 
 void *kobj_ns_grab_current(enum kobj_ns_type type)
 {

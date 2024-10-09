@@ -26,8 +26,14 @@ struct fdtable {
 	struct file __rcu **fd;      /* current fd array */
 	unsigned long *close_on_exec;
 	unsigned long *open_fds;
-	unsigned long *full_fds_bits;
+#ifdef __GENKSYMS__
 	struct rcu_head rcu;
+#else
+	union {
+		struct rcu_head rcu;
+		unsigned long *full_fds_bits;
+	};
+#endif
 };
 
 static inline bool close_on_exec(int fd, const struct fdtable *fdt)
@@ -48,6 +54,7 @@ struct files_struct {
    * read mostly part
    */
 	atomic_t count;
+	RH_KABI_FILL_HOLE(bool resize_in_progress)
 	struct fdtable __rcu *fdt;
 	struct fdtable fdtab;
   /*
@@ -57,8 +64,9 @@ struct files_struct {
 	int next_fd;
 	unsigned long close_on_exec_init[1];
 	unsigned long open_fds_init[1];
-	unsigned long full_fds_bits_init[1];
 	struct file __rcu * fd_array[NR_OPEN_DEFAULT];
+	RH_KABI_EXTEND(unsigned long full_fds_bits_init[1])
+	RH_KABI_EXTEND(wait_queue_head_t resize_wait)
 };
 
 #define rcu_dereference_check_fdtable(files, fdtfd) \
@@ -79,8 +87,10 @@ static inline struct file * fcheck_files(struct files_struct *files, unsigned in
 	struct file * file = NULL;
 	struct fdtable *fdt = files_fdtable(files);
 
-	if (fd < fdt->max_fds)
+	if (fd < fdt->max_fds) {
+		gmb();
 		file = rcu_dereference_check_fdtable(files, fdt->fd[fd]);
+	}
 	return file;
 }
 

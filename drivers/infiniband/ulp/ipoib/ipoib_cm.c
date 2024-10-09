@@ -38,6 +38,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/moduleparam.h>
+#include <linux/sched.h>
 
 #include "ipoib.h"
 
@@ -755,30 +756,37 @@ void ipoib_cm_send(struct net_device *dev, struct sk_buff *skb, struct ipoib_cm_
 		return;
 	}
 
+	if ((priv->tx_head - priv->tx_tail) == ipoib_sendq_size - 1) {
+		ipoib_dbg(priv, "TX ring 0x%x full, stopping kernel net queue\n",
+			  tx->qp->qp_num);
+		netif_stop_queue(dev);
+	}
+
 	skb_orphan(skb);
 	skb_dst_drop(skb);
 
+	if (netif_queue_stopped(dev)) {
+		rc = ib_req_notify_cq(priv->send_cq, IB_CQ_NEXT_COMP |
+				      IB_CQ_REPORT_MISSED_EVENTS);
+		if (unlikely(rc < 0))
+			ipoib_warn(priv, "IPoIB/CM:request notify on send CQ failed\n");
+		else if (rc)
+			napi_schedule(&priv->send_napi);
+	}
+
 	rc = post_send(priv, tx, tx->tx_head & (ipoib_sendq_size - 1), tx_req);
 	if (unlikely(rc)) {
-		ipoib_warn(priv, "post_send failed, error %d\n", rc);
+		ipoib_warn(priv, "IPoIB/CM:post_send failed, error %d\n", rc);
 		++dev->stats.tx_errors;
 		ipoib_dma_unmap_tx(priv, tx_req);
 		dev_kfree_skb_any(skb);
+
+		if (netif_queue_stopped(dev))
+			netif_wake_queue(dev);
 	} else {
 		netif_trans_update(dev);
 		++tx->tx_head;
 		++priv->tx_head;
-		if ((priv->tx_head - priv->tx_tail) == ipoib_sendq_size) {
-			ipoib_dbg(priv, "TX ring 0x%x full, stopping kernel net queue\n",
-				  tx->qp->qp_num);
-			netif_stop_queue(dev);
-			rc = ib_req_notify_cq(priv->send_cq,
-				IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS);
-			if (rc < 0)
-				ipoib_warn(priv, "request notify on send CQ failed\n");
-			else if (rc)
-				ipoib_send_comp_handler(priv->send_cq, dev);
-		}
 	}
 }
 
@@ -813,9 +821,10 @@ void ipoib_cm_handle_tx_wc(struct net_device *dev, struct ib_wc *wc)
 
 	++tx->tx_tail;
 	++priv->tx_tail;
-	if (unlikely((priv->tx_head - priv->tx_tail) == ipoib_sendq_size >> 1) &&
-	    netif_queue_stopped(dev) &&
-	    test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
+
+	if (unlikely(netif_queue_stopped(dev) &&
+		     (priv->tx_head - priv->tx_tail) <= ipoib_sendq_size >> 1 &&
+		     test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags)))
 		netif_wake_queue(dev);
 
 	if (wc->status != IB_WC_SUCCESS &&
@@ -959,7 +968,7 @@ void ipoib_cm_dev_stop(struct net_device *dev)
 			break;
 		}
 		spin_unlock_irq(&priv->lock);
-		msleep(1);
+		usleep_range(1000, 2000);
 		ipoib_drain_cq(dev);
 		spin_lock_irq(&priv->lock);
 	}
@@ -1044,7 +1053,7 @@ static struct ib_qp *ipoib_cm_create_tx_qp(struct net_device *dev, struct ipoib_
 {
 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
 	struct ib_qp_init_attr attr = {
-		.send_cq		= priv->recv_cq,
+		.send_cq		= priv->send_cq,
 		.recv_cq		= priv->recv_cq,
 		.srq			= priv->cm.srq,
 		.cap.max_send_wr	= ipoib_sendq_size,
@@ -1052,9 +1061,8 @@ static struct ib_qp *ipoib_cm_create_tx_qp(struct net_device *dev, struct ipoib_
 		.sq_sig_type		= IB_SIGNAL_ALL_WR,
 		.qp_type		= IB_QPT_RC,
 		.qp_context		= tx,
-		.create_flags		= IB_QP_CREATE_USE_GFP_NOIO
+		.create_flags		= 0
 	};
-
 	struct ib_qp *tx_qp;
 
 	if (dev->features & NETIF_F_SG)
@@ -1062,10 +1070,6 @@ static struct ib_qp *ipoib_cm_create_tx_qp(struct net_device *dev, struct ipoib_
 			min_t(u32, priv->ca->attrs.max_sge, MAX_SKB_FRAGS + 1);
 
 	tx_qp = ib_create_qp(priv->pd, &attr);
-	if (PTR_ERR(tx_qp) == -EINVAL) {
-		attr.create_flags &= ~IB_QP_CREATE_USE_GFP_NOIO;
-		tx_qp = ib_create_qp(priv->pd, &attr);
-	}
 	tx->max_send_sge = attr.cap.max_send_sge;
 	return tx_qp;
 }
@@ -1073,7 +1077,7 @@ static struct ib_qp *ipoib_cm_create_tx_qp(struct net_device *dev, struct ipoib_
 static int ipoib_cm_send_req(struct net_device *dev,
 			     struct ib_cm_id *id, struct ib_qp *qp,
 			     u32 qpn,
-			     struct ib_sa_path_rec *pathrec)
+			     struct sa_path_rec *pathrec)
 {
 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
 	struct ipoib_cm_data data = {};
@@ -1133,13 +1137,14 @@ static int ipoib_cm_modify_tx_init(struct net_device *dev,
 }
 
 static int ipoib_cm_tx_init(struct ipoib_cm_tx *p, u32 qpn,
-			    struct ib_sa_path_rec *pathrec)
+			    struct sa_path_rec *pathrec)
 {
 	struct ipoib_dev_priv *priv = ipoib_priv(p->dev);
+	unsigned int noio_flag;
 	int ret;
 
-	p->tx_ring = __vmalloc(ipoib_sendq_size * sizeof *p->tx_ring,
-			       GFP_NOIO, PAGE_KERNEL);
+	noio_flag = memalloc_noio_save();
+	p->tx_ring = vzalloc(ipoib_sendq_size * sizeof(*p->tx_ring));
 	if (!p->tx_ring) {
 		ret = -ENOMEM;
 		goto err_tx;
@@ -1147,9 +1152,10 @@ static int ipoib_cm_tx_init(struct ipoib_cm_tx *p, u32 qpn,
 	memset(p->tx_ring, 0, ipoib_sendq_size * sizeof *p->tx_ring);
 
 	p->qp = ipoib_cm_create_tx_qp(p->dev, p);
+	memalloc_noio_restore(noio_flag);
 	if (IS_ERR(p->qp)) {
 		ret = PTR_ERR(p->qp);
-		ipoib_warn(priv, "failed to allocate tx qp: %d\n", ret);
+		ipoib_warn(priv, "failed to create tx qp: %d\n", ret);
 		goto err_qp;
 	}
 
@@ -1211,7 +1217,7 @@ static void ipoib_cm_tx_destroy(struct ipoib_cm_tx *p)
 				goto timeout;
 			}
 
-			msleep(1);
+			usleep_range(1000, 2000);
 		}
 	}
 
@@ -1221,9 +1227,9 @@ timeout:
 		tx_req = &p->tx_ring[p->tx_tail & (ipoib_sendq_size - 1)];
 		ipoib_dma_unmap_tx(priv, tx_req);
 		dev_kfree_skb_any(tx_req->skb);
+		netif_tx_lock_bh(p->dev);
 		++p->tx_tail;
 		++priv->tx_tail;
-		netif_tx_lock_bh(p->dev);
 		if (unlikely(priv->tx_head - priv->tx_tail == ipoib_sendq_size >> 1) &&
 		    netif_queue_stopped(p->dev) &&
 		    test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
@@ -1338,7 +1344,7 @@ static void ipoib_cm_tx_start(struct work_struct *work)
 	struct ipoib_path *path;
 	int ret;
 
-	struct ib_sa_path_rec pathrec;
+	struct sa_path_rec pathrec;
 	u32 qpn;
 
 	netif_tx_lock_bh(dev);
@@ -1515,8 +1521,13 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
 	if (test_bit(IPOIB_FLAG_GOING_DOWN, &priv->flags))
 		return -EPERM;
 
-	if (!rtnl_trylock())
+	if (!mutex_trylock(&priv->sysfs_mutex))
 		return restart_syscall();
+
+	if (!rtnl_trylock()) {
+		mutex_unlock(&priv->sysfs_mutex);
+		return restart_syscall();
+	}
 
 	ret = ipoib_set_mode(dev, buf);
 
@@ -1526,6 +1537,7 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
 	 */
 	if (ret != -EBUSY)
 		rtnl_unlock();
+	mutex_unlock(&priv->sysfs_mutex);
 
 	return (!ret || ret == -EBUSY) ? count : ret;
 }

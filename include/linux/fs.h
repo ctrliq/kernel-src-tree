@@ -32,6 +32,10 @@
 #include <uapi/linux/fs.h>
 #include <linux/rh_kabi.h>
 
+#ifndef __GENKSYMS__
+#include <linux/mm_types.h>
+#endif
+
 struct export_operations;
 struct hd_geometry;
 struct iovec;
@@ -129,6 +133,9 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 
 /* File was opened by fanotify and shouldn't generate fanotify events */
 #define FMODE_NONOTIFY		((__force fmode_t)0x1000000)
+
+/* The extended KABI iterate method in struct file_operations is present */
+#define FMODE_KABI_ITERATE	((__force fmode_t)0x80000000)
 
 /*
  * Flag for rw_copy_check_uvector and compat_rw_copy_check_uvector
@@ -576,6 +583,8 @@ struct posix_acl;
 #define IOP_LOOKUP	0x0002
 #define IOP_NOFOLLOW	0x0004
 
+struct fsnotify_mark_connector;
+
 /*
  * Keep mostly read-only and often accessed (especially for
  * the RCU path lookup and 'stat' data) fields at the beginning
@@ -635,7 +644,8 @@ struct inode {
 	unsigned long		dirtied_when;	/* jiffies of first dirtying */
 
 	struct hlist_node	i_hash;
-	struct list_head	i_wb_list;	/* backing dev IO list */
+	RH_KABI_RENAME(struct list_head i_wb_list,
+		       struct list_head	i_io_list); /* backing dev IO list */
 	struct list_head	i_lru;		/* inode LRU list */
 	struct list_head	i_sb_list;
 	union {
@@ -663,7 +673,8 @@ struct inode {
 
 #ifdef CONFIG_FSNOTIFY
 	__u32			i_fsnotify_mask; /* all events this inode cares about */
-	struct hlist_head	i_fsnotify_marks;
+	RH_KABI_REPLACE(struct hlist_head i_fsnotify_marks,
+			struct fsnotify_mark_connector __rcu *i_fsnotify_marks)
 #endif
 
 #ifdef CONFIG_IMA
@@ -993,6 +1004,7 @@ static inline int file_check_writeable(struct file *filp)
 #define FL_SLEEP	128	/* A blocking lock */
 #define FL_DOWNGRADE_PENDING	256 /* Lease is being downgraded */
 #define FL_UNLOCK_PENDING	512 /* Lease is being broken */
+#define FL_OFDLCK	1024	/* lock is "owned" by struct file */
 #define FL_LAYOUT	2048	/* outstanding pNFS layout */
 #define FL_LM_OPS_EXTEND	65536 /* safe to use lock_manager_operations_extend */
 
@@ -1137,14 +1149,14 @@ static inline struct inode *locks_inode(const struct file *f)
 }
 
 #ifdef CONFIG_FILE_LOCKING
-extern int fcntl_getlk(struct file *, unsigned int, struct flock __user *);
+extern int fcntl_getlk(struct file *, unsigned int, struct flock *);
 extern int fcntl_setlk(unsigned int, struct file *, unsigned int,
-			struct flock __user *);
+			struct flock *);
 
 #if BITS_PER_LONG == 32
-extern int fcntl_getlk64(struct file *, unsigned int, struct flock64 __user *);
+extern int fcntl_getlk64(struct file *, unsigned int, struct flock64 *);
 extern int fcntl_setlk64(unsigned int, struct file *, unsigned int,
-			struct flock64 __user *);
+			struct flock64 *);
 #endif
 
 extern int fcntl_setlease(unsigned int fd, struct file *filp, long arg);
@@ -1399,6 +1411,13 @@ struct mm_struct;
 extern struct list_head super_blocks;
 extern spinlock_t sb_lock;
 
+/* sb->s_iflags */
+#define SB_I_NOEXEC	0x00000002	/* Ignore executables on this fs */
+#define SB_I_NODEV	0x00000004	/* Ignore devices on this fs */
+
+/* sb->s_iflags to limit user namespace mounts */
+#define SB_I_USERNS_VISIBLE		0x00000010 /* fstype already mounted */
+
 /* Possible states of 'frozen' field */
 enum {
 	SB_UNFROZEN = 0,		/* FS is unfrozen */
@@ -1526,6 +1545,17 @@ struct super_block {
 	RH_KABI_EXTEND(struct workqueue_struct *s_dio_done_wq)
 	RH_KABI_EXTEND(struct rcu_head rcu)
 	RH_KABI_EXTEND(struct hlist_head s_pins)
+
+	/* s_inode_list_lock protects s_inodes */
+	RH_KABI_EXTEND(spinlock_t s_inode_list_lock)
+
+	RH_KABI_EXTEND(struct mutex s_sync_lock) /* sync serialisation lock */
+
+	RH_KABI_EXTEND(spinlock_t s_inode_wblist_lock)
+	RH_KABI_EXTEND(struct list_head s_inodes_wb)	/* writeback inodes */
+
+	RH_KABI_EXTEND(unsigned long	s_iflags)
+	RH_KABI_EXTEND(struct user_namespace *s_user_ns)
 };
 
 extern const unsigned super_block_wrapper_version;
@@ -1704,6 +1734,7 @@ extern void dentry_unhash(struct dentry *dentry);
  */
 extern void inode_init_owner(struct inode *inode, const struct inode *dir,
 			umode_t mode);
+extern bool may_open_dev(const struct path *path);
 /*
  * VFS FS_IOC_FIEMAP helper definitions.
  */
@@ -1741,6 +1772,11 @@ int fiemap_check_flags(struct fiemap_extent_info *fieinfo, u32 fs_flags);
  * to have different dirent layouts depending on the binary type.
  */
 typedef int (*filldir_t)(void *, const char *, int, loff_t, u64, unsigned);
+struct dir_context {
+	filldir_t actor;
+	loff_t pos;
+};
+
 struct block_device_operations;
 
 /* These macros are for out of kernel modules to test that
@@ -1778,6 +1814,7 @@ struct file_operations {
 	long (*fallocate)(struct file *file, int mode, loff_t offset,
 			  loff_t len);
 	int (*show_fdinfo)(struct seq_file *m, struct file *f);
+	RH_KABI_EXTEND(int (*iterate) (struct file *, struct dir_context *))
 };
 
 /* RH usage only, not for external modules use */
@@ -1829,6 +1866,7 @@ struct inode_operations {
  */
 typedef int (*iop_rename2_t) (struct inode *, struct dentry *,
 			      struct inode *, struct dentry *, unsigned int);
+typedef int (*iop_tmpfile_t) (struct inode *, struct dentry *, umode_t);
 
 typedef int (*iop_dentry_open_t) (struct dentry *, struct file *, const struct cred *);
 
@@ -1838,6 +1876,7 @@ struct inode_operations_wrapper {
 	/* -- Wrapper version 0 -- */
 	int (*rename2) (struct inode *, struct dentry *,
 			struct inode *, struct dentry *, unsigned int);
+	int (*tmpfile) (struct inode *, struct dentry *, umode_t);
 
 	/* WARNING: probably going away soon, do not use! */
 	int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
@@ -1888,6 +1927,8 @@ struct super_operations {
 	int (*bdev_try_to_free_page)(struct super_block*, struct page*, gfp_t);
 	int (*nr_cached_objects)(struct super_block *);
 	void (*free_cached_objects)(struct super_block *, int);
+	RH_KABI_EXTEND(struct list_head *(*inode_to_wblist)(struct inode *))
+	RH_KABI_EXTEND(struct inode *(*wblist_to_inode)(struct list_head *))
 };
 
 /*
@@ -2007,6 +2048,9 @@ struct super_operations {
  *
  * I_DIO_WAKEUP		Never set.  Only used as a key for wait_on_bit().
  *
+ * I_OVL_INUSE		Used by overlayfs to get exclusive ownership on upper
+ *			and work dirs among overlayfs mounts.
+ *
  * Q: What is the difference between I_WILL_FREE and I_FREEING?
  */
 #define I_DIRTY_SYNC		(1 << 0)
@@ -2023,6 +2067,7 @@ struct super_operations {
 #define __I_DIO_WAKEUP		9
 #define I_DIO_WAKEUP		(1 << I_DIO_WAKEUP)
 #define I_LINKABLE		(1 << 10)
+#define I_OVL_INUSE		(1 << 11)
 
 #define I_DIRTY (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES)
 
@@ -2093,7 +2138,6 @@ struct file_system_type {
 #define FS_BINARY_MOUNTDATA	2
 #define FS_HAS_SUBTYPE		4
 #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
-#define FS_USERNS_DEV_MOUNT	16 /* A userns mount does not imply MNT_NODEV */
 #define FS_HAS_RM_XQUOTA	256	/* KABI: fs has the rm_xquota quota op */
 #define FS_HAS_INVALIDATE_RANGE	512	/* FS has new ->invalidatepage with length arg */
 #define FS_HAS_DIO_IODONE2	1024	/* KABI: fs supports new iodone */
@@ -2102,6 +2146,7 @@ struct file_system_type {
 dentry_operations_wrapper */
 #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
 #define FS_HAS_FO_EXTEND	65536 	/* fs is using the file_operations_extend struture */
+#define FS_HAS_WBLIST		131072	/* KABI: fs has writeback list super ops */
 	struct dentry *(*mount) (struct file_system_type *, int,
 		       const char *, void *);
 	void (*kill_sb) (struct super_block *);
@@ -2124,6 +2169,7 @@ dentry_operations_wrapper */
 #define sb_has_dops_wrapper(sb)	((sb)->s_type->fs_flags & FS_HAS_DOPS_WRAPPER)
 #define fb_has_fo_extend(fb)	\
 	(file_inode(fp)->i_sb->s_type->fs_flags & FS_HAS_FO_EXTEND)
+#define sb_has_wblist(sb)	((sb)->s_type->fs_flags & FS_HAS_WBLIST)
 
 /*
  * FIXME: These should be in include/linux/dcache.h but there
@@ -2230,6 +2276,11 @@ void deactivate_locked_super(struct super_block *sb);
 int set_anon_super(struct super_block *s, void *data);
 int get_anon_bdev(dev_t *);
 void free_anon_bdev(dev_t);
+struct super_block *sget_userns(struct file_system_type *type,
+			int (*test)(struct super_block *,void *),
+			int (*set)(struct super_block *,void *),
+			int flags, struct user_namespace *user_ns,
+			void *data);
 struct super_block *sget(struct file_system_type *type,
 			int (*test)(struct super_block *,void *),
 			int (*set)(struct super_block *,void *),
@@ -2265,7 +2316,7 @@ extern int may_umount_tree(struct vfsmount *);
 extern int may_umount(struct vfsmount *);
 extern long do_mount(const char *, const char __user *,
 		     const char *, unsigned long, void *);
-extern struct vfsmount *collect_mounts(struct path *);
+extern struct vfsmount *collect_mounts(const struct path *);
 extern void drop_collected_mounts(struct vfsmount *);
 extern int iterate_mounts(int (*)(struct vfsmount *, void *), void *,
 			  struct vfsmount *);
@@ -2288,7 +2339,7 @@ extern struct kobject *fs_kobj;
 #define MAX_RW_COUNT (INT_MAX & PAGE_CACHE_MASK)
 extern int rw_verify_area(int, struct file *, loff_t *, size_t);
 
-#ifdef CONFIG_FILE_LOCKING
+#ifdef CONFIG_MANDATORY_FILE_LOCKING
 extern int locks_mandatory_locked(struct file *);
 extern int locks_mandatory_area(struct inode *, struct file *, loff_t, loff_t, unsigned char);
 
@@ -2335,6 +2386,45 @@ static inline int locks_verify_truncate(struct inode *inode,
 	}
 }
 
+#else /* !CONFIG_MANDATORY_FILE_LOCKING */
+
+static inline int locks_mandatory_locked(struct file *file)
+{
+	return 0;
+}
+
+static inline int locks_mandatory_area(struct inode *inode,
+				       struct file *filp, loff_t start,
+				       loff_t end, unsigned char type)
+{
+	return 0;
+}
+
+static inline int __mandatory_lock(struct inode *inode)
+{
+	return 0;
+}
+
+static inline int mandatory_lock(struct inode *inode)
+{
+	return 0;
+}
+
+static inline int locks_verify_locked(struct file *file)
+{
+	return 0;
+}
+
+static inline int locks_verify_truncate(struct inode *inode, struct file *filp,
+					loff_t size)
+{
+	return 0;
+}
+
+#endif /* CONFIG_MANDATORY_FILE_LOCKING */
+
+
+#ifdef CONFIG_FILE_LOCKING
 static inline int break_lease(struct inode *inode, unsigned int mode)
 {
 	/*
@@ -2388,38 +2478,6 @@ static inline int break_layout(struct inode *inode, bool wait)
 }
 
 #else /* !CONFIG_FILE_LOCKING */
-static inline int locks_mandatory_locked(struct file *file)
-{
-	return 0;
-}
-
-static inline int locks_mandatory_area(struct inode *inode, struct file *filp,
-		loff_t start, loff_t end, unsigned char type)
-{
-	return 0;
-}
-
-static inline int __mandatory_lock(struct inode *inode)
-{
-	return 0;
-}
-
-static inline int mandatory_lock(struct inode *inode)
-{
-	return 0;
-}
-
-static inline int locks_verify_locked(struct file *file)
-{
-	return 0;
-}
-
-static inline int locks_verify_truncate(struct inode *inode, struct file *filp,
-					size_t size)
-{
-	return 0;
-}
-
 static inline int break_lease(struct inode *inode, unsigned int mode)
 {
 	return 0;
@@ -2798,7 +2856,7 @@ extern struct file * open_exec(const char *);
  
 /* fs/dcache.c -- generic fs support functions */
 extern int is_subdir(struct dentry *, struct dentry *);
-extern int path_is_under(struct path *, struct path *);
+extern bool path_is_under(const struct path *, const struct path *);
 extern ino_t find_inode_number(struct dentry *, struct qstr *);
 
 #include <linux/err.h>
@@ -3025,7 +3083,7 @@ void inode_sub_bytes(struct inode *inode, loff_t bytes);
 loff_t inode_get_bytes(struct inode *inode);
 void inode_set_bytes(struct inode *inode, loff_t bytes);
 
-extern int vfs_readdir(struct file *, filldir_t, void *);
+extern int iterate_dir(struct file *, struct dir_context *);
 
 extern int vfs_stat(const char __user *, struct kstat *);
 extern int vfs_lstat(const char __user *, struct kstat *);
@@ -3120,6 +3178,11 @@ extern void replace_mount_options(struct super_block *sb, char *options);
 static inline bool io_is_direct(struct file *filp)
 {
 	return (filp->f_flags & O_DIRECT) || IS_DAX(filp->f_mapping->host);
+}
+
+static inline bool vma_is_dax(struct vm_area_struct *vma)
+{
+	return vma->vm_file && IS_DAX(vma->vm_file->f_mapping->host);
 }
 
 static inline ino_t parent_ino(struct dentry *dentry)
@@ -3238,11 +3301,42 @@ static inline void inode_has_no_xattr(struct inode *inode)
 		inode->i_flags |= S_NOSEC;
 }
 
+static inline bool dir_emit(struct dir_context *ctx,
+			    const char *name, int namelen,
+			    u64 ino, unsigned type)
+{
+	return ctx->actor(ctx, name, namelen, ctx->pos, ino, type) == 0;
+}
+static inline bool dir_emit_dot(struct file *file, struct dir_context *ctx)
+{
+	return ctx->actor(ctx, ".", 1, ctx->pos,
+			  file->f_path.dentry->d_inode->i_ino, DT_DIR) == 0;
+}
+static inline bool dir_emit_dotdot(struct file *file, struct dir_context *ctx)
+{
+	return ctx->actor(ctx, "..", 2, ctx->pos,
+			  parent_ino(file->f_path.dentry), DT_DIR) == 0;
+}
+static inline bool dir_emit_dots(struct file *file, struct dir_context *ctx)
+{
+	if (ctx->pos == 0) {
+		if (!dir_emit_dot(file, ctx))
+			return false;
+		ctx->pos = 1;
+	}
+	if (ctx->pos == 1) {
+		if (!dir_emit_dotdot(file, ctx))
+			return false;
+		ctx->pos = 2;
+	}
+	return true;
+}
+
 static inline const struct inode_operations_wrapper *get_iop_wrapper(struct inode *inode,
 								     unsigned version)
 {
 	const struct inode_operations_wrapper *wrapper;
-		
+
 	if (!IS_IOPS_WRAPPER(inode))
 		return NULL;
 	wrapper = container_of(inode->i_op, const struct inode_operations_wrapper, ops);
@@ -3257,10 +3351,18 @@ static inline iop_rename2_t get_rename2_iop(struct inode *inode)
 	return wrapper ? wrapper->rename2 : NULL;
 }
 
+static inline iop_tmpfile_t get_tmpfile_iop(struct inode *inode)
+{
+	const struct inode_operations_wrapper *wrapper = get_iop_wrapper(inode, 0);
+	return wrapper ? wrapper->tmpfile : NULL;
+}
+
 static inline iop_dentry_open_t get_dentry_open_iop(struct inode *inode)
 {
 	const struct inode_operations_wrapper *wrapper = get_iop_wrapper(inode, 0);
 	return wrapper ? wrapper->dentry_open : NULL;
 }
+
+extern bool path_noexec(const struct path *path);
 
 #endif /* _LINUX_FS_H */

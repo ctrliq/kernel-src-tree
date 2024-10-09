@@ -1131,12 +1131,14 @@ static int iucv_sock_sendmsg(struct kiocb *iocb, struct socket *sock,
 				   noblock, &err, 0);
 	if (!skb)
 		goto out;
-	if (iucv->transport == AF_IUCV_TRANS_HIPER)
-		skb_reserve(skb, sizeof(struct af_iucv_trans_hdr) + ETH_HLEN);
-	if (memcpy_from_msg(skb_put(skb, len), msg, len)) {
-		err = -EFAULT;
+	if (headroom)
+		skb_reserve(skb, headroom);
+	skb_put(skb, linear);
+	skb->len = len;
+	skb->data_len = len - linear;
+	err = skb_copy_datagram_from_iovec(skb, 0, msg->msg_iov, 0, len);
+	if (err)
 		goto fail;
-	}
 
 	/* wait if outstanding messages for iucv path has reached */
 	timeo = sock_sndtimeo(sk, noblock);

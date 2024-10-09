@@ -1,13 +1,6 @@
 #ifndef _ASM_X86_JUMP_LABEL_H
 #define _ASM_X86_JUMP_LABEL_H
 
-#ifdef __KERNEL__
-
-#include <linux/stringify.h>
-#include <linux/types.h>
-#include <asm/nops.h>
-#include <asm/asm.h>
-
 #define JUMP_LABEL_NOP_SIZE 5
 
 #ifdef CONFIG_X86_64
@@ -15,6 +8,14 @@
 #else
 # define STATIC_KEY_INIT_NOP GENERIC_NOP5_ATOMIC
 #endif
+
+#include <asm/nops.h>
+#include <asm/asm.h>
+
+#ifndef __ASSEMBLY__
+
+#include <linux/stringify.h>
+#include <linux/types.h>
 
 static __always_inline bool arch_static_branch(struct static_key *key)
 {
@@ -30,8 +31,6 @@ l_yes:
 	return true;
 }
 
-#endif /* __KERNEL__ */
-
 #ifdef CONFIG_X86_64
 typedef u64 jump_label_t;
 #else
@@ -44,4 +43,16 @@ struct jump_entry {
 	jump_label_t key;
 };
 
+#else	/* __ASSEMBLY__ */
+
+.macro STATIC_JUMP target, key
+.Lstatic_jump_\@:
+	.byte STATIC_KEY_INIT_NOP
+	.pushsection __jump_table, "aw"
+	_ASM_ALIGN
+	_ASM_PTR	.Lstatic_jump_\@, \target, \key
+	.popsection
+.endm
+
+#endif  /* __ASSEMBLY__ */
 #endif

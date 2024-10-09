@@ -51,12 +51,12 @@ int inet6_csk_bind_conflict(const struct sock *sk,
 			     (sk2->sk_state != TCP_TIME_WAIT &&
 			      !uid_eq(uid,
 				      sock_i_uid((struct sock *)sk2))))) {
-				if (ipv6_rcv_saddr_equal(sk, sk2))
+				if (ipv6_rcv_saddr_equal(sk, sk2, true))
 					break;
 			}
 			if (!relax && reuse && sk2->sk_reuse &&
 			    sk2->sk_state != TCP_LISTEN &&
-			    ipv6_rcv_saddr_equal(sk, sk2))
+			    ipv6_rcv_saddr_equal(sk, sk2, true))
 				break;
 		}
 	}
@@ -242,7 +242,7 @@ int inet6_csk_xmit(struct sk_buff *skb, struct flowi *fl_unused)
 	/* Restore final destination back after routing done */
 	fl6.daddr = sk->sk_v6_daddr;
 
-	res = ip6_xmit(sk, skb, &fl6, rcu_dereference(np->opt),
+	res = ip6_xmit(sk, skb, &fl6, sk->sk_mark, rcu_dereference(np->opt),
 		       np->tclass);
 	rcu_read_unlock();
 	return res;

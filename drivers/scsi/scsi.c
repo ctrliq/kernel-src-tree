@@ -773,6 +773,7 @@ void scsi_adjust_queue_depth(struct scsi_device *sdev, int tagged, int tags)
 	}
 
 	sdev->queue_depth = tags;
+	blk_set_queue_depth(sdev->request_queue, sdev->queue_depth);
 	switch (tagged) {
 		case 0:
 			sdev->ordered_tags = 0;

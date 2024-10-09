@@ -8,7 +8,6 @@
 
 #include <linux/pci.h>
 #include <asm-generic/pci.h>
-#include <asm-generic/pci-dma-compat.h>
 #include <asm/pci_clp.h>
 #include <asm/pci_debug.h>
 
@@ -74,7 +73,7 @@ struct msi_map {
 	struct hlist_node msi_chain;
 };
 
-#define ZPCI_MSI_VEC_BITS	11
+#define ZPCI_MSI_VEC_BITS	10
 #define ZPCI_MSI_VEC_MAX	(1 << ZPCI_MSI_VEC_BITS)
 #define ZPCI_MSI_VEC_MASK	(ZPCI_MSI_VEC_MAX - 1)
 
@@ -115,7 +114,7 @@ struct zpci_dev {
 	struct zdev_irq_map *irq_map;
 	struct msi_map *msi_map;
 	struct airq_iv *aibv;		/* adapter interrupt bit vector */
-	unsigned int	aisb;		/* number of the summary bit */
+	unsigned long	aisb;		/* number of the summary bit */
 
 	/* DMA stuff */
 	unsigned long	*dma_table;
@@ -162,11 +161,12 @@ extern const struct attribute_group *zpci_attr_groups[];
 ----------------------------------------------------------------------------- */
 /* Base stuff */
 int zpci_create_device(struct zpci_dev *);
+void zpci_remove_device(struct zpci_dev *zdev);
 int zpci_enable_device(struct zpci_dev *);
 int zpci_disable_device(struct zpci_dev *);
-void zpci_stop_device(struct zpci_dev *);
 int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
 int zpci_unregister_ioat(struct zpci_dev *, u8);
+void zpci_remove_reserved_devices(void);
 
 /* CLP */
 int clp_scan_pci_devices(void);

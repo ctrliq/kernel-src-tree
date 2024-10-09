@@ -152,10 +152,10 @@ static unsigned long xen_tsc_khz(void)
 	return pvclock_tsc_khz(info);
 }
 
-cycle_t xen_clocksource_read(void)
+u64 xen_clocksource_read(void)
 {
         struct pvclock_vcpu_time_info *src;
-	cycle_t ret;
+	u64 ret;
 
 	preempt_disable_notrace();
 	src = &__get_cpu_var(xen_vcpu)->time;
@@ -164,7 +164,7 @@ cycle_t xen_clocksource_read(void)
 	return ret;
 }
 
-static cycle_t xen_clocksource_get_cycles(struct clocksource *cs)
+static u64 xen_clocksource_get_cycles(struct clocksource *cs)
 {
 	return xen_clocksource_read();
 }

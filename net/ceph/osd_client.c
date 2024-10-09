@@ -12,6 +12,7 @@
 #include <linux/bio.h>
 #endif
 
+#include <linux/ceph/ceph_features.h>
 #include <linux/ceph/libceph.h>
 #include <linux/ceph/osd_client.h>
 #include <linux/ceph/messenger.h>
@@ -386,6 +387,7 @@ static void target_copy(struct ceph_osd_request_target *dest,
 	dest->flags = src->flags;
 	dest->paused = src->paused;
 
+	dest->epoch = src->epoch;
 	dest->last_force_resend = src->last_force_resend;
 
 	dest->osd = src->osd;
@@ -440,7 +442,7 @@ static void ceph_osdc_release_request(struct kref *kref)
 void ceph_osdc_get_request(struct ceph_osd_request *req)
 {
 	dout("%s %p (was %d)\n", __func__, req,
-	     atomic_read(&req->r_kref.refcount));
+	     kref_read(&req->r_kref));
 	kref_get(&req->r_kref);
 }
 EXPORT_SYMBOL(ceph_osdc_get_request);
@@ -449,7 +451,7 @@ void ceph_osdc_put_request(struct ceph_osd_request *req)
 {
 	if (req) {
 		dout("%s %p (was %d)\n", __func__, req,
-		     atomic_read(&req->r_kref.refcount));
+		     kref_read(&req->r_kref));
 		kref_put(&req->r_kref, ceph_osdc_release_request);
 	}
 }
@@ -488,11 +490,11 @@ static void request_reinit(struct ceph_osd_request *req)
 	struct ceph_msg *reply_msg = req->r_reply;
 
 	dout("%s req %p\n", __func__, req);
-	WARN_ON(atomic_read(&req->r_kref.refcount) != 1);
+	WARN_ON(kref_read(&req->r_kref) != 1);
 	request_release_checks(req);
 
-	WARN_ON(atomic_read(&request_msg->kref.refcount) != 1);
-	WARN_ON(atomic_read(&reply_msg->kref.refcount) != 1);
+	WARN_ON(kref_read(&request_msg->kref) != 1);
+	WARN_ON(kref_read(&reply_msg->kref) != 1);
 	target_destroy(&req->r_t);
 
 	request_init(req);
@@ -539,6 +541,11 @@ struct ceph_osd_request *ceph_osdc_alloc_request(struct ceph_osd_client *osdc,
 }
 EXPORT_SYMBOL(ceph_osdc_alloc_request);
 
+static int ceph_oloc_encoding_size(const struct ceph_object_locator *oloc)
+{
+	return 8 + 4 + 4 + 4;
+}
+
 int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
 {
 	struct ceph_osd_client *osdc = req->r_osdc;
@@ -548,16 +555,21 @@ int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
 	WARN_ON(ceph_oid_empty(&req->r_base_oid));
 
 	/* create request message */
-	msg_size = 4 + 4 + 4; /* client_inc, osdmap_epoch, flags */
-	msg_size += 4 + 4 + 4 + 8; /* mtime, reassert_version */
-	msg_size += 2 + 4 + 8 + 4 + 4; /* oloc */
-	msg_size += 1 + 8 + 4 + 4; /* pgid */
+	msg_size = CEPH_ENCODING_START_BLK_LEN +
+			CEPH_PGID_ENCODING_LEN + 1; /* spgid */
+	msg_size += 4 + 4 + 4; /* hash, osdmap_epoch, flags */
+	msg_size += CEPH_ENCODING_START_BLK_LEN +
+			sizeof(struct ceph_osd_reqid); /* reqid */
+	msg_size += sizeof(struct ceph_blkin_trace_info); /* trace */
+	msg_size += 4 + sizeof(struct ceph_timespec); /* client_inc, mtime */
+	msg_size += CEPH_ENCODING_START_BLK_LEN +
+			ceph_oloc_encoding_size(&req->r_base_oloc); /* oloc */
 	msg_size += 4 + req->r_base_oid.name_len; /* oid */
 	msg_size += 2 + req->r_num_ops * sizeof(struct ceph_osd_op);
 	msg_size += 8; /* snapid */
 	msg_size += 8; /* snap_seq */
 	msg_size += 4 + 8 * (req->r_snapc ? req->r_snapc->num_snaps : 0);
-	msg_size += 4; /* retry_attempt */
+	msg_size += 4 + 8; /* retry_attempt, features */
 
 	if (req->r_mempool)
 		msg = ceph_msgpool_get(&osdc->msgpool_op, 0);
@@ -1321,6 +1333,7 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 	enum calc_target_result ct_res;
 	int ret;
 
+	t->epoch = osdc->osdmap->epoch;
 	pi = ceph_pg_pool_by_id(osdc->osdmap, t->base_oloc.pool);
 	if (!pi) {
 		t->osd = CEPH_HOMELESS_OSD;
@@ -1709,13 +1722,8 @@ static void hoid_fill_from_target(struct ceph_hobject_id *hoid,
 	hoid->snapid = CEPH_NOSNAP;
 	hoid->hash = t->pgid.seed;
 	hoid->is_max = false;
-	if (t->target_oloc.pool_ns) {
-		hoid->nspace = t->target_oloc.pool_ns->str;
-		hoid->nspace_len = t->target_oloc.pool_ns->len;
-	} else {
-		hoid->nspace = NULL;
-		hoid->nspace_len = 0;
-	}
+	hoid->nspace = NULL;
+	hoid->nspace_len = 0;
 	hoid->pool = t->target_oloc.pool;
 	ceph_hoid_build_hash_cache(hoid);
 }
@@ -1813,7 +1821,33 @@ static void setup_request_data(struct ceph_osd_request *req,
 	WARN_ON(data_len != msg->data_length);
 }
 
-static void encode_request(struct ceph_osd_request *req, struct ceph_msg *msg)
+static void encode_pgid(void **p, const struct ceph_pg *pgid)
+{
+	ceph_encode_8(p, 1);
+	ceph_encode_64(p, pgid->pool);
+	ceph_encode_32(p, pgid->seed);
+	ceph_encode_32(p, -1); /* preferred */
+}
+
+static void encode_spgid(void **p, const struct ceph_spg *spgid)
+{
+	ceph_start_encoding(p, 1, 1, CEPH_PGID_ENCODING_LEN + 1);
+	encode_pgid(p, &spgid->pgid);
+	ceph_encode_8(p, spgid->shard);
+}
+
+static void encode_oloc(void **p, void *end,
+			const struct ceph_object_locator *oloc)
+{
+	ceph_start_encoding(p, 5, 4, ceph_oloc_encoding_size(oloc));
+	ceph_encode_64(p, oloc->pool);
+	ceph_encode_32(p, -1); /* preferred */
+	ceph_encode_32(p, 0);  /* key len */
+	ceph_encode_32(p, 0);
+}
+
+static void encode_request_partial(struct ceph_osd_request *req,
+				   struct ceph_msg *msg)
 {
 	void *p = msg->front.iov_base;
 	void *const end = p + msg->front_alloc_len;
@@ -1830,34 +1864,27 @@ static void encode_request(struct ceph_osd_request *req, struct ceph_msg *msg)
 
 	setup_request_data(req, msg);
 
-	ceph_encode_32(&p, 1); /* client_inc, always 1 */
+	encode_spgid(&p, &req->r_t.spgid); /* actual spg */
+	ceph_encode_32(&p, req->r_t.pgid.seed); /* raw hash */
 	ceph_encode_32(&p, req->r_osdc->osdmap->epoch);
 	ceph_encode_32(&p, req->r_flags);
+
+	/* reqid */
+	ceph_start_encoding(&p, 2, 2, sizeof(struct ceph_osd_reqid));
+	memset(p, 0, sizeof(struct ceph_osd_reqid));
+	p += sizeof(struct ceph_osd_reqid);
+
+	/* trace */
+	memset(p, 0, sizeof(struct ceph_blkin_trace_info));
+	p += sizeof(struct ceph_blkin_trace_info);
+
+	ceph_encode_32(&p, 0); /* client_inc, always 0 */
 	ceph_encode_timespec(p, &req->r_mtime);
 	p += sizeof(struct ceph_timespec);
 
-	/* reassert_version */
-	memset(p, 0, sizeof(struct ceph_eversion));
-	p += sizeof(struct ceph_eversion);
-
-	/* oloc */
-	ceph_encode_8(&p, 4);
-	ceph_encode_8(&p, 4);
-	ceph_encode_32(&p, 8 + 4 + 4);
-	ceph_encode_64(&p, req->r_t.target_oloc.pool);
-	ceph_encode_32(&p, -1); /* preferred */
-	ceph_encode_32(&p, 0); /* key len */
-
-	/* pgid */
-	ceph_encode_8(&p, 1);
-	ceph_encode_64(&p, req->r_t.pgid.pool);
-	ceph_encode_32(&p, req->r_t.pgid.seed);
-	ceph_encode_32(&p, -1); /* preferred */
-
-	/* oid */
-	ceph_encode_32(&p, req->r_t.target_oid.name_len);
-	memcpy(p, req->r_t.target_oid.name, req->r_t.target_oid.name_len);
-	p += req->r_t.target_oid.name_len;
+	encode_oloc(&p, end, &req->r_t.target_oloc);
+	ceph_encode_string(&p, end, req->r_t.target_oid.name,
+			   req->r_t.target_oid.name_len);
 
 	/* ops, can imply data */
 	ceph_encode_16(&p, req->r_num_ops);
@@ -1878,10 +1905,11 @@ static void encode_request(struct ceph_osd_request *req, struct ceph_msg *msg)
 	}
 
 	ceph_encode_32(&p, req->r_attempts); /* retry_attempt */
+	BUG_ON(p > end - 8); /* space for features */
 
-	BUG_ON(p > end);
+	msg->hdr.version = cpu_to_le16(8); /* MOSDOp v8 */
+	/* front_len is finalized in encode_request_finish() */
 	msg->front.iov_len = p - msg->front.iov_base;
-	msg->hdr.version = cpu_to_le16(4); /* MOSDOp v4 */
 	msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
 	msg->hdr.data_len = cpu_to_le32(data_len);
 	/*
@@ -1891,9 +1919,100 @@ static void encode_request(struct ceph_osd_request *req, struct ceph_msg *msg)
 	 */
 	msg->hdr.data_off = cpu_to_le16(req->r_data_offset);
 
-	dout("%s req %p oid %s oid_len %d front %zu data %u\n", __func__,
-	     req, req->r_t.target_oid.name, req->r_t.target_oid.name_len,
-	     msg->front.iov_len, data_len);
+	dout("%s req %p msg %p oid %s oid_len %d\n", __func__, req, msg,
+	     req->r_t.target_oid.name, req->r_t.target_oid.name_len);
+}
+
+static void encode_request_finish(struct ceph_msg *msg)
+{
+	void *p = msg->front.iov_base;
+	void *const partial_end = p + msg->front.iov_len;
+	void *const end = p + msg->front_alloc_len;
+
+	if (CEPH_HAVE_FEATURE(msg->con->peer_features, RESEND_ON_SPLIT)) {
+		/* luminous OSD -- encode features and be done */
+		p = partial_end;
+		ceph_encode_64(&p, msg->con->peer_features);
+	} else {
+		struct {
+			char spgid[CEPH_ENCODING_START_BLK_LEN +
+				   CEPH_PGID_ENCODING_LEN + 1];
+			__le32 hash;
+			__le32 epoch;
+			__le32 flags;
+			char reqid[CEPH_ENCODING_START_BLK_LEN +
+				   sizeof(struct ceph_osd_reqid)];
+			char trace[sizeof(struct ceph_blkin_trace_info)];
+			__le32 client_inc;
+			struct ceph_timespec mtime;
+		} __packed head;
+		struct ceph_pg pgid;
+		void *oloc, *oid, *tail;
+		int oloc_len, oid_len, tail_len;
+		int len;
+
+		/*
+		 * Pre-luminous OSD -- reencode v8 into v4 using @head
+		 * as a temporary buffer.  Encode the raw PG; the rest
+		 * is just a matter of moving oloc, oid and tail blobs
+		 * around.
+		 */
+		memcpy(&head, p, sizeof(head));
+		p += sizeof(head);
+
+		oloc = p;
+		p += CEPH_ENCODING_START_BLK_LEN;
+		pgid.pool = ceph_decode_64(&p);
+		p += 4 + 4; /* preferred, key len */
+		len = ceph_decode_32(&p);
+		p += len;   /* nspace */
+		oloc_len = p - oloc;
+
+		oid = p;
+		len = ceph_decode_32(&p);
+		p += len;
+		oid_len = p - oid;
+
+		tail = p;
+		tail_len = partial_end - p;
+
+		p = msg->front.iov_base;
+		ceph_encode_copy(&p, &head.client_inc, sizeof(head.client_inc));
+		ceph_encode_copy(&p, &head.epoch, sizeof(head.epoch));
+		ceph_encode_copy(&p, &head.flags, sizeof(head.flags));
+		ceph_encode_copy(&p, &head.mtime, sizeof(head.mtime));
+
+		/* reassert_version */
+		memset(p, 0, sizeof(struct ceph_eversion));
+		p += sizeof(struct ceph_eversion);
+
+		BUG_ON(p >= oloc);
+		memmove(p, oloc, oloc_len);
+		p += oloc_len;
+
+		pgid.seed = le32_to_cpu(head.hash);
+		encode_pgid(&p, &pgid); /* raw pg */
+
+		BUG_ON(p >= oid);
+		memmove(p, oid, oid_len);
+		p += oid_len;
+
+		/* tail -- ops, snapid, snapc, retry_attempt */
+		BUG_ON(p >= tail);
+		memmove(p, tail, tail_len);
+		p += tail_len;
+
+		msg->hdr.version = cpu_to_le16(4); /* MOSDOp v4 */
+	}
+
+	BUG_ON(p > end);
+	msg->front.iov_len = p - msg->front.iov_base;
+	msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
+
+	dout("%s msg %p tid %llu %u+%u+%u v%d\n", __func__, msg,
+	     le64_to_cpu(msg->hdr.tid), le32_to_cpu(msg->hdr.front_len),
+	     le32_to_cpu(msg->hdr.middle_len), le32_to_cpu(msg->hdr.data_len),
+	     le16_to_cpu(msg->hdr.version));
 }
 
 /*
@@ -1923,12 +2042,13 @@ static void send_request(struct ceph_osd_request *req)
 	else
 		WARN_ON(req->r_flags & CEPH_OSD_FLAG_RETRY);
 
-	encode_request(req, req->r_request);
+	encode_request_partial(req, req->r_request);
 
-	dout("%s req %p tid %llu to pgid %llu.%x spgid %llu.%xs%d osd%d flags 0x%x attempt %d\n",
+	dout("%s req %p tid %llu to pgid %llu.%x spgid %llu.%xs%d osd%d e%u flags 0x%x attempt %d\n",
 	     __func__, req, req->r_tid, req->r_t.pgid.pool, req->r_t.pgid.seed,
 	     req->r_t.spgid.pgid.pool, req->r_t.spgid.pgid.seed,
-	     req->r_t.spgid.shard, osd->o_osd, req->r_flags, req->r_attempts);
+	     req->r_t.spgid.shard, osd->o_osd, req->r_t.epoch, req->r_flags,
+	     req->r_attempts);
 
 	req->r_t.paused = false;
 	req->r_stamp = jiffies;
@@ -2049,7 +2169,7 @@ promote:
 
 static void account_request(struct ceph_osd_request *req)
 {
-	WARN_ON(req->r_flags & CEPH_OSD_FLAG_ACK);
+	WARN_ON(req->r_flags & (CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK));
 	WARN_ON(!(req->r_flags & (CEPH_OSD_FLAG_READ | CEPH_OSD_FLAG_WRITE)));
 
 	req->r_flags |= CEPH_OSD_FLAG_ONDISK;
@@ -2068,13 +2188,12 @@ static void submit_request(struct ceph_osd_request *req, bool wrlocked)
 static void finish_request(struct ceph_osd_request *req)
 {
 	struct ceph_osd_client *osdc = req->r_osdc;
-	struct ceph_osd *osd = req->r_osd;
-
-	verify_osd_locked(osd);
-	dout("%s req %p tid %llu\n", __func__, req, req->r_tid);
 
 	WARN_ON(lookup_request_mc(&osdc->map_checks, req->r_tid));
-	unlink_request(osd, req);
+	dout("%s req %p tid %llu\n", __func__, req, req->r_tid);
+
+	if (req->r_osd)
+		unlink_request(req->r_osd, req);
 	atomic_dec(&osdc->num_requests);
 
 	/*
@@ -3542,7 +3661,24 @@ static void kick_requests(struct ceph_osd_client *osdc,
 			  struct list_head *need_resend_linger)
 {
 	struct ceph_osd_linger_request *lreq, *nlreq;
+	enum calc_target_result ct_res;
 	struct rb_node *n;
+
+	/* make sure need_resend targets reflect latest map */
+	for (n = rb_first(need_resend); n; ) {
+		struct ceph_osd_request *req =
+		    rb_entry(n, struct ceph_osd_request, r_node);
+
+		n = rb_next(n);
+
+		if (req->r_t.epoch < osdc->osdmap->epoch) {
+			ct_res = calc_target(osdc, &req->r_t, NULL, false);
+			if (ct_res == CALC_TARGET_POOL_DNE) {
+				erase_request(need_resend, req);
+				check_pool_dne(req);
+			}
+		}
+	}
 
 	for (n = rb_first(need_resend); n; ) {
 		struct ceph_osd_request *req =
@@ -3552,8 +3688,6 @@ static void kick_requests(struct ceph_osd_client *osdc,
 		n = rb_next(n);
 		erase_request(need_resend, req); /* before link_request() */
 
-		WARN_ON(req->r_osd);
-		calc_target(osdc, &req->r_t, NULL, false);
 		osd = lookup_create_osd(osdc, req->r_t.osd, true);
 		link_request(osd, req);
 		if (!req->r_linger) {
@@ -4251,7 +4385,7 @@ ceph_osdc_watch(struct ceph_osd_client *osdc,
 
 	ceph_oid_copy(&lreq->t.base_oid, oid);
 	ceph_oloc_copy(&lreq->t.base_oloc, oloc);
-	lreq->t.flags = CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK;
+	lreq->t.flags = CEPH_OSD_FLAG_WRITE;
 	lreq->mtime = CURRENT_TIME;
 
 	lreq->reg_req = alloc_linger_request(lreq);
@@ -4309,7 +4443,7 @@ int ceph_osdc_unwatch(struct ceph_osd_client *osdc,
 
 	ceph_oid_copy(&req->r_base_oid, &lreq->t.base_oid);
 	ceph_oloc_copy(&req->r_base_oloc, &lreq->t.base_oloc);
-	req->r_flags = CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK;
+	req->r_flags = CEPH_OSD_FLAG_WRITE;
 	req->r_mtime = CURRENT_TIME;
 	osd_req_op_watch_init(req, 0, lreq->linger_id,
 			      CEPH_OSD_WATCH_OP_UNWATCH);
@@ -4875,8 +5009,7 @@ int ceph_osdc_writepages(struct ceph_osd_client *osdc, struct ceph_vino vino,
 	int page_align = off & ~PAGE_MASK;
 
 	req = ceph_osdc_new_request(osdc, layout, vino, off, &len, 0, 1,
-				    CEPH_OSD_OP_WRITE,
-				    CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_WRITE,
+				    CEPH_OSD_OP_WRITE, CEPH_OSD_FLAG_WRITE,
 				    snapc, truncate_seq, truncate_size,
 				    true);
 	if (IS_ERR(req))
@@ -5147,6 +5280,14 @@ static int invalidate_authorizer(struct ceph_connection *con)
 	return ceph_monc_validate_auth(&osdc->client->monc);
 }
 
+static void osd_reencode_message(struct ceph_msg *msg)
+{
+	int type = le16_to_cpu(msg->hdr.type);
+
+	if (type == CEPH_MSG_OSD_OP)
+		encode_request_finish(msg);
+}
+
 static int osd_sign_message(struct ceph_msg *msg)
 {
 	struct ceph_osd *o = msg->con->private;
@@ -5171,6 +5312,7 @@ static const struct ceph_connection_operations osd_con_ops = {
 	.verify_authorizer_reply = verify_authorizer_reply,
 	.invalidate_authorizer = invalidate_authorizer,
 	.alloc_msg = alloc_msg,
+	.reencode_message = osd_reencode_message,
 	.sign_message = osd_sign_message,
 	.check_message_signature = osd_check_message_signature,
 	.fault = osd_fault,

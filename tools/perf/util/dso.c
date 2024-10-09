@@ -1,12 +1,20 @@
 #include <asm/bug.h>
+#include <linux/kernel.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+#include "compress.h"
+#include "path.h"
 #include "symbol.h"
 #include "dso.h"
 #include "machine.h"
 #include "auxtrace.h"
 #include "util.h"
 #include "debug.h"
+#include "string2.h"
 #include "vdso.h"
 
 static const char * const debuglink_paths[] = {
@@ -1039,7 +1047,7 @@ static struct dso *__dso__findlink_by_longname(struct rb_root *root,
 		if (rc == 0) {
 			/*
 			 * In case the new DSO is a duplicate of an existing
-			 * one, print an one-time warning & put the new entry
+			 * one, print a one-time warning & put the new entry
 			 * at the end of the list of duplicates.
 			 */
 			if (!dso || (dso == this))
@@ -1146,7 +1154,7 @@ int dso__name_len(const struct dso *dso)
 {
 	if (!dso)
 		return strlen("[unknown]");
-	if (verbose)
+	if (verbose > 0)
 		return dso->long_name_len;
 
 	return dso->short_name_len;

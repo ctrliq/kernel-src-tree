@@ -165,9 +165,10 @@ nfs_direct_select_verf(struct nfs_direct_req *dreq,
 	 * for layout segment where nbuckets is zero.
 	 */
 	if (ds_clp && dreq->ds_cinfo.nbuckets > 0) {
-		if (commit_idx >= 0 && commit_idx < dreq->ds_cinfo.nbuckets)
+		if (commit_idx >= 0 && commit_idx < dreq->ds_cinfo.nbuckets) {
+			gmb();
 			verfp = &dreq->ds_cinfo.buckets[commit_idx].direct_verf;
-		else
+		} else
 			WARN_ON_ONCE(1);
 	}
 #endif

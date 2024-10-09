@@ -25,6 +25,7 @@
 #include <linux/irqflags.h>
 #include <linux/context_tracking.h>
 #include <linux/irqbypass.h>
+#include <linux/swait.h>
 #include <asm/signal.h>
 
 #include <linux/kvm.h>
@@ -249,7 +250,7 @@ struct kvm_vcpu {
 	int fpu_active;
 	int guest_fpu_loaded, guest_xcr0_loaded;
 	unsigned char fpu_counter;
-	wait_queue_head_t wq;
+	struct swait_queue_head wq;
 	struct pid *pid;
 	int sigset_active;
 	sigset_t sigset;
@@ -425,6 +426,7 @@ struct kvm {
 	struct list_head devices;
 	struct dentry *debugfs_dentry;
 	struct kvm_stat_data **debugfs_stat_data;
+	pid_t userspace_pid;
 };
 
 #define kvm_err(fmt, ...) \
@@ -756,8 +758,6 @@ void kvm_arch_check_processor_compat(void *rtn);
 int kvm_arch_vcpu_runnable(struct kvm_vcpu *vcpu);
 int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu);
 
-void *kvm_kvzalloc(unsigned long size);
-
 #ifndef __KVM_HAVE_ARCH_VM_ALLOC
 static inline struct kvm *kvm_arch_alloc_vm(void)
 {
@@ -807,7 +807,7 @@ static inline bool kvm_arch_has_assigned_device(struct kvm *kvm)
 }
 #endif
 
-static inline wait_queue_head_t *kvm_arch_vcpu_wq(struct kvm_vcpu *vcpu)
+static inline struct swait_queue_head *kvm_arch_vcpu_wq(struct kvm_vcpu *vcpu)
 {
 #ifdef __KVM_HAVE_ARCH_WQP
 	return vcpu->arch.wqp;

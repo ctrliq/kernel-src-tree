@@ -19,6 +19,7 @@
 
 #include "blk.h"
 #include "blk-mq.h"
+#include "blk-mq-debugfs.h"
 #include "blk-mq-tag.h"
 #include "blk-mq-sched.h"
 
@@ -283,18 +284,20 @@ dispatch_request:
 	dd->batching++;
 	deadline_move_request(dd, rq);
 done:
-	rq->rq_flags |= RQF_STARTED;
+	rq->cmd_flags |= REQ_STARTED;
 	return rq;
 }
 
-static void dd_dispatch_requests(struct blk_mq_hw_ctx *hctx,
-				 struct list_head *rq_list)
+static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
+	struct request *rq;
 
 	spin_lock(&dd->lock);
-	blk_mq_sched_move_to_dispatch(hctx, rq_list, __dd_dispatch_request);
+	rq = __dd_dispatch_request(hctx);
 	spin_unlock(&dd->lock);
+
+	return rq;
 }
 
 static void dd_exit_queue(struct elevator_queue *e)
@@ -369,11 +372,15 @@ static bool dd_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
 {
 	struct request_queue *q = hctx->queue;
 	struct deadline_data *dd = q->elevator->elevator_data;
-	int ret;
+	struct request *free = NULL;
+	bool ret;
 
 	spin_lock(&dd->lock);
-	ret = blk_mq_sched_try_merge(q, bio);
+	ret = blk_mq_sched_try_merge(q, bio, &free);
 	spin_unlock(&dd->lock);
+
+	if (free)
+		blk_mq_free_request(free);
 
 	return ret;
 }
@@ -392,9 +399,6 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 		return;
 
 	blk_mq_sched_request_inserted(rq);
-
-	if (blk_mq_sched_bypass_insert(hctx, rq))
-		return;
 
 	if (at_head || rq->cmd_type != REQ_TYPE_FS) {
 		if (at_head)
@@ -514,22 +518,140 @@ static struct elv_fs_entry deadline_attrs[] = {
 	__ATTR_NULL
 };
 
-static struct elevator_type mq_deadline = {
-	.ops.mq = {
-		.insert_requests	= dd_insert_requests,
-		.dispatch_requests	= dd_dispatch_requests,
-		.next_request		= elv_rb_latter_request,
-		.former_request		= elv_rb_former_request,
-		.bio_merge		= dd_bio_merge,
-		.request_merge		= dd_request_merge,
-		.requests_merged	= dd_merged_requests,
-		.request_merged		= dd_request_merged,
-		.has_work		= dd_has_work,
-		.init_sched		= dd_init_queue,
-		.exit_sched		= dd_exit_queue,
-	},
+#ifdef CONFIG_BLK_DEBUG_FS
+#define DEADLINE_DEBUGFS_DDIR_ATTRS(ddir, name)				\
+static void *deadline_##name##_fifo_start(struct seq_file *m,		\
+					  loff_t *pos)			\
+	__acquires(&dd->lock)						\
+{									\
+	struct request_queue *q = m->private;				\
+	struct deadline_data *dd = q->elevator->elevator_data;		\
+									\
+	spin_lock(&dd->lock);						\
+	return seq_list_start(&dd->fifo_list[ddir], *pos);		\
+}									\
+									\
+static void *deadline_##name##_fifo_next(struct seq_file *m, void *v,	\
+					 loff_t *pos)			\
+{									\
+	struct request_queue *q = m->private;				\
+	struct deadline_data *dd = q->elevator->elevator_data;		\
+									\
+	return seq_list_next(v, &dd->fifo_list[ddir], pos);		\
+}									\
+									\
+static void deadline_##name##_fifo_stop(struct seq_file *m, void *v)	\
+	__releases(&dd->lock)						\
+{									\
+	struct request_queue *q = m->private;				\
+	struct deadline_data *dd = q->elevator->elevator_data;		\
+									\
+	spin_unlock(&dd->lock);						\
+}									\
+									\
+static const struct seq_operations deadline_##name##_fifo_seq_ops = {	\
+	.start	= deadline_##name##_fifo_start,				\
+	.next	= deadline_##name##_fifo_next,				\
+	.stop	= deadline_##name##_fifo_stop,				\
+	.show	= blk_mq_debugfs_rq_show,				\
+};									\
+									\
+static int deadline_##name##_next_rq_show(void *data,			\
+					  struct seq_file *m)		\
+{									\
+	struct request_queue *q = data;					\
+	struct deadline_data *dd = q->elevator->elevator_data;		\
+	struct request *rq = dd->next_rq[ddir];				\
+									\
+	if (rq)								\
+		__blk_mq_debugfs_rq_show(m, rq);			\
+	return 0;							\
+}
+DEADLINE_DEBUGFS_DDIR_ATTRS(READ, read)
+DEADLINE_DEBUGFS_DDIR_ATTRS(WRITE, write)
+#undef DEADLINE_DEBUGFS_DDIR_ATTRS
 
-	.uses_mq	= true,
+static int deadline_batching_show(void *data, struct seq_file *m)
+{
+	struct request_queue *q = data;
+	struct deadline_data *dd = q->elevator->elevator_data;
+
+	seq_printf(m, "%u\n", dd->batching);
+	return 0;
+}
+
+static int deadline_starved_show(void *data, struct seq_file *m)
+{
+	struct request_queue *q = data;
+	struct deadline_data *dd = q->elevator->elevator_data;
+
+	seq_printf(m, "%u\n", dd->starved);
+	return 0;
+}
+
+static void *deadline_dispatch_start(struct seq_file *m, loff_t *pos)
+	__acquires(&dd->lock)
+{
+	struct request_queue *q = m->private;
+	struct deadline_data *dd = q->elevator->elevator_data;
+
+	spin_lock(&dd->lock);
+	return seq_list_start(&dd->dispatch, *pos);
+}
+
+static void *deadline_dispatch_next(struct seq_file *m, void *v, loff_t *pos)
+{
+	struct request_queue *q = m->private;
+	struct deadline_data *dd = q->elevator->elevator_data;
+
+	return seq_list_next(v, &dd->dispatch, pos);
+}
+
+static void deadline_dispatch_stop(struct seq_file *m, void *v)
+	__releases(&dd->lock)
+{
+	struct request_queue *q = m->private;
+	struct deadline_data *dd = q->elevator->elevator_data;
+
+	spin_unlock(&dd->lock);
+}
+
+static const struct seq_operations deadline_dispatch_seq_ops = {
+	.start	= deadline_dispatch_start,
+	.next	= deadline_dispatch_next,
+	.stop	= deadline_dispatch_stop,
+	.show	= blk_mq_debugfs_rq_show,
+};
+
+#define DEADLINE_QUEUE_DDIR_ATTRS(name)						\
+	{#name "_fifo_list", 0400, .seq_ops = &deadline_##name##_fifo_seq_ops},	\
+	{#name "_next_rq", 0400, deadline_##name##_next_rq_show}
+static const struct blk_mq_debugfs_attr deadline_queue_debugfs_attrs[] = {
+	DEADLINE_QUEUE_DDIR_ATTRS(read),
+	DEADLINE_QUEUE_DDIR_ATTRS(write),
+	{"batching", 0400, deadline_batching_show},
+	{"starved", 0400, deadline_starved_show},
+	{"dispatch", 0400, .seq_ops = &deadline_dispatch_seq_ops},
+	{},
+};
+#undef DEADLINE_QUEUE_DDIR_ATTRS
+#endif
+
+static struct elevator_mq_ops dd_ops = {
+	.insert_requests	= dd_insert_requests,
+	.dispatch_request	= dd_dispatch_request,
+	.next_request		= elv_rb_latter_request,
+	.former_request		= elv_rb_former_request,
+	.bio_merge		= dd_bio_merge,
+	.request_merge		= dd_request_merge,
+	.requests_merged	= dd_merged_requests,
+	.request_merged		= dd_request_merged,
+	.has_work		= dd_has_work,
+	.init_sched		= dd_init_queue,
+	.exit_sched		= dd_exit_queue,
+};
+
+static struct elevator_type mq_deadline = {
 	.elevator_attrs = deadline_attrs,
 	.elevator_name = "mq-deadline",
 	.elevator_owner = THIS_MODULE,
@@ -538,7 +660,18 @@ MODULE_ALIAS("mq-deadline-iosched");
 
 static int __init deadline_init(void)
 {
-	return elv_register(&mq_deadline);
+	int ret = elv_register(&mq_deadline);
+	struct elevator_type_aux *aux;
+
+	if (ret)
+		return ret;
+
+	aux = elevator_aux_find(&mq_deadline);
+	memcpy(&aux->ops.mq, &dd_ops, sizeof(struct elevator_mq_ops));
+	aux->uses_mq = true;
+	aux->queue_debugfs_attrs = deadline_queue_debugfs_attrs;
+
+	return 0;
 }
 
 static void __exit deadline_exit(void)

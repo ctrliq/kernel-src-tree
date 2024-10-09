@@ -347,6 +347,8 @@ xfs_xattr_acl_set(struct dentry *dentry, const char *name,
 {
 	struct inode *inode = dentry->d_inode;
 	struct posix_acl *acl = NULL, *real_acl = NULL;
+	umode_t mode;
+	bool set_mode = false;
 	int error = 0;
 
 	if (flags & XATTR_CREATE)
@@ -382,19 +384,22 @@ xfs_xattr_acl_set(struct dentry *dentry, const char *name,
 
 	real_acl = acl;
 	if (type == ACL_TYPE_ACCESS) {
-		umode_t mode;
-
 		error = posix_acl_update_mode(inode, &mode, &real_acl);
 		if (error)
 			goto out_release;
-
-		error = xfs_set_mode(inode, mode);
-		if (error)
-			goto out_release;
+		set_mode = true;
 	}
 
  set_acl:
 	error = xfs_set_acl(inode, type, real_acl);
+	/*
+	 * We set the mode after successfully updating the ACL xattr because the
+	 * xattr update can fail at ENOSPC and we don't want to change the mode
+	 * if the ACL update hasn't been applied.
+	 */
+	if (!error && set_mode)
+		error = xfs_set_mode(inode, mode);
+
  out_release:
 	posix_acl_release(acl);
  out:

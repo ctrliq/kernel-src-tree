@@ -49,8 +49,18 @@ int eth_mac_addr(struct net_device *dev, void *p);
 int eth_change_mtu(struct net_device *dev, int new_mtu);
 int eth_validate_addr(struct net_device *dev);
 
-struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs,
+/*
+ * RHEL-7.5+: Function alloc_etherdev_mqs() calls ether_setup() that
+ * initializes part of net_device structure. This function is on kABI
+ * white-list and because we have 2 versions of ether_setup() that is also
+ * on white-list we need also 2 versions of alloc_etherdev_mqs(). The old
+ * one is preserved for existing binary modules that were compiled against
+ * RHEL-7.4 and older. The new one is used by inbox drivers and o-o-tree
+ * drivers compiled against RHEL-7.5 and above.
+ */
+struct net_device *alloc_etherdev_mqs_rh(int sizeof_priv, unsigned int txqs,
 					    unsigned int rxqs);
+#define alloc_etherdev_mqs alloc_etherdev_mqs_rh
 #define alloc_etherdev(sizeof_priv) alloc_etherdev_mq(sizeof_priv, 1)
 #define alloc_etherdev_mq(sizeof_priv, count) alloc_etherdev_mqs(sizeof_priv, count, count)
 
@@ -344,6 +354,66 @@ static inline bool ether_addr_equal_unaligned(const u8 *addr1, const u8 *addr2)
 #else
 	return memcmp(addr1, addr2, ETH_ALEN) == 0;
 #endif
+}
+
+/**
+ * ether_addr_to_u64 - Convert an Ethernet address into a u64 value.
+ * @addr: Pointer to a six-byte array containing the Ethernet address
+ *
+ * Return a u64 value of the address
+ */
+static inline u64 ether_addr_to_u64(const u8 *addr)
+{
+	u64 u = 0;
+	int i;
+
+	for (i = 0; i < ETH_ALEN; i++)
+		u = u << 8 | addr[i];
+
+	return u;
+}
+
+/**
+ * u64_to_ether_addr - Convert a u64 to an Ethernet address.
+ * @u: u64 to convert to an Ethernet MAC address
+ * @addr: Pointer to a six-byte array to contain the Ethernet address
+ */
+static inline void u64_to_ether_addr(u64 u, u8 *addr)
+{
+	int i;
+
+	for (i = ETH_ALEN - 1; i >= 0; i--) {
+		addr[i] = u & 0xff;
+		u = u >> 8;
+	}
+}
+
+/**
+ * eth_addr_dec - Decrement the given MAC address
+ *
+ * @addr: Pointer to a six-byte array containing Ethernet address to decrement
+ */
+static inline void eth_addr_dec(u8 *addr)
+{
+	u64 u = ether_addr_to_u64(addr);
+
+	u--;
+	u64_to_ether_addr(u, addr);
+}
+
+/**
+ * ether_addr_greater - Compare two Ethernet addresses
+ * @addr1: Pointer to a six-byte array containing the Ethernet address
+ * @addr2: Pointer other six-byte array containing the Ethernet address
+ *
+ * Compare two Ethernet addresses, returns true addr1 is greater than addr2
+ */
+static inline bool ether_addr_greater(const u8 *addr1, const u8 *addr2)
+{
+	u64 u1 = ether_addr_to_u64(addr1);
+	u64 u2 = ether_addr_to_u64(addr2);
+
+	return u1 > u2;
 }
 
 /**

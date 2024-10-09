@@ -413,6 +413,7 @@ Eagain:
 static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
 		unsigned long new_addr, unsigned long new_len, bool *locked,
 		struct vm_userfaultfd_ctx *uf,
+		struct list_head *uf_unmap_early,
 		struct list_head *uf_unmap)
 {
 	struct mm_struct *mm = current->mm;
@@ -436,7 +437,7 @@ static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
 	if ((addr <= new_addr) && (addr+old_len) > new_addr)
 		goto out;
 
-	ret = do_munmap(mm, new_addr, new_len, NULL);
+	ret = do_munmap(mm, new_addr, new_len, uf_unmap_early);
 	if (ret)
 		goto out;
 
@@ -504,6 +505,7 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	unsigned long charged = 0;
 	bool locked = false;
 	struct vm_userfaultfd_ctx uf = NULL_VM_UFFD_CTX;
+	LIST_HEAD(uf_unmap_early);
 	LIST_HEAD(uf_unmap);
 
 	down_write(&current->mm->mmap_sem);
@@ -528,7 +530,7 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	if (flags & MREMAP_FIXED) {
 		if (flags & MREMAP_MAYMOVE)
 			ret = mremap_to(addr, old_len, new_addr, new_len,
-					&locked, &uf, &uf_unmap);
+					&locked, &uf, &uf_unmap_early, &uf_unmap);
 		goto out;
 	}
 
@@ -606,6 +608,7 @@ out:
 	up_write(&current->mm->mmap_sem);
 	if (locked && new_len > old_len)
 		mm_populate(new_addr + old_len, new_len - old_len);
+	userfaultfd_unmap_complete(mm, &uf_unmap_early);
 	mremap_userfaultfd_complete(&uf, addr, new_addr, old_len);
 	userfaultfd_unmap_complete(mm, &uf_unmap);
 	return ret;

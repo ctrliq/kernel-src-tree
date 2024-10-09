@@ -24,7 +24,7 @@
 #include <drm/drmP.h>
 #include "amdgpu.h"
 #include "amdgpu_trace.h"
-#include "si/sid.h"
+#include "sid.h"
 
 const u32 sdma_offsets[SDMA_MAX_INSTANCE] =
 {
@@ -302,7 +302,7 @@ static int si_dma_ring_test_ib(struct amdgpu_ring *ring, long timeout)
 	ib.ptr[2] = upper_32_bits(gpu_addr) & 0xff;
 	ib.ptr[3] = 0xDEADBEEF;
 	ib.length_dw = 4;
-	r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+	r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
 	if (r)
 		goto err1;
 
@@ -398,7 +398,7 @@ static void si_dma_vm_write_pte(struct amdgpu_ib *ib, uint64_t pe,
 static void si_dma_vm_set_pte_pde(struct amdgpu_ib *ib,
 				     uint64_t pe,
 				     uint64_t addr, unsigned count,
-				     uint32_t incr, uint32_t flags)
+				     uint32_t incr, uint64_t flags)
 {
 	uint64_t value;
 	unsigned ndw;
@@ -417,8 +417,8 @@ static void si_dma_vm_set_pte_pde(struct amdgpu_ib *ib,
 		ib->ptr[ib->length_dw++] = DMA_PTE_PDE_PACKET(ndw);
 		ib->ptr[ib->length_dw++] = pe; /* dst addr */
 		ib->ptr[ib->length_dw++] = upper_32_bits(pe) & 0xff;
-		ib->ptr[ib->length_dw++] = flags; /* mask */
-		ib->ptr[ib->length_dw++] = 0;
+		ib->ptr[ib->length_dw++] = lower_32_bits(flags); /* mask */
+		ib->ptr[ib->length_dw++] = upper_32_bits(flags);
 		ib->ptr[ib->length_dw++] = value; /* value */
 		ib->ptr[ib->length_dw++] = upper_32_bits(value);
 		ib->ptr[ib->length_dw++] = incr; /* increment size */
@@ -517,12 +517,12 @@ static int si_dma_sw_init(void *handle)
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	/* DMA0 trap event */
-	r = amdgpu_irq_add_id(adev, 224, &adev->sdma.trap_irq);
+	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 224, &adev->sdma.trap_irq);
 	if (r)
 		return r;
 
 	/* DMA1 trap event */
-	r = amdgpu_irq_add_id(adev, 244, &adev->sdma.trap_irq_1);
+	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 244, &adev->sdma.trap_irq_1);
 	if (r)
 		return r;
 

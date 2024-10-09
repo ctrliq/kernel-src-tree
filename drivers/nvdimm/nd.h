@@ -32,6 +32,7 @@ enum {
 	ND_MAX_LANES = 256,
 	SECTOR_SHIFT = 9,
 	INT_LBASIZE_ALIGNMENT = 64,
+	NVDIMM_IO_ATOMIC = 1,
 };
 
 struct nd_poison {
@@ -196,6 +197,9 @@ struct nd_btt {
 	u64 size;
 	u8 *uuid;
 	int id;
+	int initial_offset;
+	u16 version_major;
+	u16 version_minor;
 };
 
 enum nd_pfn_mode {
@@ -283,6 +287,13 @@ static inline struct device *nd_btt_create(struct nd_region *nd_region)
 
 struct nd_pfn *to_nd_pfn(struct device *dev);
 #if IS_ENABLED(CONFIG_NVDIMM_PFN)
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define PFN_DEFAULT_ALIGNMENT HPAGE_PMD_SIZE
+#else
+#define PFN_DEFAULT_ALIGNMENT PAGE_SIZE
+#endif
+
 int nd_pfn_probe(struct device *dev, struct nd_namespace_common *ndns);
 bool is_nd_pfn(struct device *dev);
 struct device *nd_pfn_create(struct nd_region *nd_region);

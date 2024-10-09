@@ -24,6 +24,7 @@
 #include <asm/e820.h>
 #include <asm/proto.h>
 #include <asm/setup.h>
+#include <asm/cpufeature.h>
 
 /*
  * The e820 map is the map that gets modified e.g. with command line parameters
@@ -76,7 +77,8 @@ EXPORT_SYMBOL_GPL(e820_any_mapped);
  * Note: this function only works correct if the e820 table is sorted and
  * not-overlapping, which is the case
  */
-int __init e820_all_mapped(u64 start, u64 end, unsigned type)
+static struct e820entry *__e820__mapped_all(u64 start, u64 end,
+					    unsigned type)
 {
 	int i;
 
@@ -99,9 +101,28 @@ int __init e820_all_mapped(u64 start, u64 end, unsigned type)
 		 * coverage
 		 */
 		if (start >= end)
-			return 1;
+			return ei;
 	}
-	return 0;
+
+	return NULL;
+}
+
+/*
+ * This function checks if the entire range <start,end> is mapped with type.
+ */
+int __init e820_all_mapped(u64 start, u64 end, unsigned type)
+{
+	return __e820__mapped_all(start, end, type) != NULL;
+}
+
+/*
+ * This function returns the type associated with the range <start,end>.
+ */
+int e820__get_entry_type(u64 start, u64 end)
+{
+	struct e820entry *entry = __e820__mapped_all(start, end, 0);
+
+	return entry ? entry->type : -EINVAL;
 }
 
 /*

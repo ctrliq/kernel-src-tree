@@ -124,9 +124,6 @@ int setup_msi_irq(struct pci_dev *dev, struct msi_desc *msidesc,
 #include <asm/pci_64.h>
 #endif
 
-/* implement the pci_ DMA API in terms of the generic device dma_ one */
-#include <asm-generic/pci-dma-compat.h>
-
 /* generic pci stuff */
 #include <asm-generic/pci.h>
 

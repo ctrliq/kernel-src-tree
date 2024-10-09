@@ -55,22 +55,18 @@ struct nfs_access_entry {
 	struct rcu_head		rcu_head;
 };
 
-struct nfs_lockowner {
-	fl_owner_t l_owner;
-	pid_t l_pid;
-};
-
 struct nfs_lock_context {
 	atomic_t count;
 	struct list_head list;
 	struct nfs_open_context *open_context;
-	struct nfs_lockowner lockowner;
+	fl_owner_t lockowner;
 	atomic_t io_count;
 };
 
 struct nfs4_state;
 struct nfs_open_context {
 	struct nfs_lock_context lock_context;
+	fl_owner_t flock_owner;
 	struct dentry *dentry;
 	struct rpc_cred *cred;
 	struct nfs4_state *state;
@@ -365,7 +361,7 @@ extern void nfs_setsecurity(struct inode *inode, struct nfs_fattr *fattr,
 extern struct nfs_open_context *get_nfs_open_context(struct nfs_open_context *ctx);
 extern void put_nfs_open_context(struct nfs_open_context *ctx);
 extern struct nfs_open_context *nfs_find_open_context(struct inode *inode, struct rpc_cred *cred, fmode_t mode);
-extern struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry, fmode_t f_mode);
+extern struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry, fmode_t f_mode, struct file *filp);
 extern void nfs_inode_attach_open_context(struct nfs_open_context *ctx);
 extern void nfs_file_set_open_context(struct file *filp, struct nfs_open_context *ctx);
 extern void nfs_file_clear_open_context(struct file *flip);

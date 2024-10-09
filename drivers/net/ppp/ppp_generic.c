@@ -1034,7 +1034,7 @@ ppp_net_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	return err;
 }
 
-static struct rtnl_link_stats64*
+static void
 ppp_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats64)
 {
 	struct ppp *ppp = netdev_priv(dev);
@@ -1054,8 +1054,6 @@ ppp_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats64)
 	stats64->rx_dropped       = dev->stats.rx_dropped;
 	stats64->tx_dropped       = dev->stats.tx_dropped;
 	stats64->rx_length_errors = dev->stats.rx_length_errors;
-
-	return stats64;
 }
 
 static int ppp_dev_init(struct net_device *dev)
@@ -1181,7 +1179,7 @@ ppp_send_frame(struct ppp *ppp, struct sk_buff *skb)
 		/* check if we should pass this packet */
 		/* the filter instructions are constructed assuming
 		   a four-byte PPP header on each packet */
-		*skb_push(skb, 2) = 1;
+		*(u8 *)skb_push(skb, 2) = 1;
 		if (ppp->pass_filter &&
 		    sk_run_filter(skb, ppp->pass_filter) == 0) {
 			if (ppp->debug & 1)
@@ -1815,7 +1813,7 @@ ppp_receive_nonmp_frame(struct ppp *ppp, struct sk_buff *skb)
 			if (skb_unclone(skb, GFP_ATOMIC))
 				goto err;
 
-			*skb_push(skb, 2) = 0;
+			*(u8 *)skb_push(skb, 2) = 0;
 			if (ppp->pass_filter &&
 			    sk_run_filter(skb, ppp->pass_filter) == 0) {
 				if (ppp->debug & 1)
@@ -1947,7 +1945,7 @@ ppp_receive_mp_frame(struct ppp *ppp, struct sk_buff *skb, struct channel *pch)
 	 * Do protocol ID decompression on the first fragment of each packet.
 	 */
 	if ((PPP_MP_CB(skb)->BEbits & B) && (skb->data[0] & 1))
-		*skb_push(skb, 1) = 0;
+		*(u8 *)skb_push(skb, 1) = 0;
 
 	/*
 	 * Expand sequence number to 32 bits, making it as close

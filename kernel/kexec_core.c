@@ -87,6 +87,12 @@ int kexec_should_crash(struct task_struct *p)
 	return 0;
 }
 
+int kexec_crash_loaded(void)
+{
+	return !!kexec_crash_image;
+}
+EXPORT_SYMBOL_GPL(kexec_crash_loaded);
+
 /*
  * When kexec transitions to the new kernel there is a one-to-one
  * mapping between physical and virtual addresses.  On processors
@@ -277,7 +283,7 @@ static struct page *kimage_alloc_pages(gfp_t gfp_mask, unsigned int order)
 {
 	struct page *pages;
 
-	pages = alloc_pages(gfp_mask, order);
+	pages = alloc_pages(gfp_mask & ~__GFP_ZERO, order);
 	if (pages) {
 		unsigned int count, i;
 
@@ -286,6 +292,13 @@ static struct page *kimage_alloc_pages(gfp_t gfp_mask, unsigned int order)
 		count = 1 << order;
 		for (i = 0; i < count; i++)
 			SetPageReserved(pages + i);
+
+		arch_kexec_post_alloc_pages(page_address(pages), count,
+					    gfp_mask);
+
+		if (gfp_mask & __GFP_ZERO)
+			for (i = 0; i < count; i++)
+				clear_highpage(pages + i);
 	}
 
 	return pages;
@@ -297,6 +310,9 @@ static void kimage_free_pages(struct page *page)
 
 	order = page_private(page);
 	count = 1 << order;
+
+	arch_kexec_pre_free_pages(page_address(page), count);
+
 	for (i = 0; i < count; i++)
 		ClearPageReserved(page + i);
 	__free_pages(page, order);
@@ -948,7 +964,6 @@ int crash_shrink_memory(unsigned long new_size)
 	start = roundup(start, KEXEC_CRASH_MEM_ALIGN);
 	end = roundup(start + new_size, KEXEC_CRASH_MEM_ALIGN);
 
-	crash_map_reserved_pages();
 	crash_free_reserved_phys_range(end, crashk_res.end);
 
 	if ((start == end) && (crashk_res.parent != NULL))
@@ -962,7 +977,6 @@ int crash_shrink_memory(unsigned long new_size)
 	crashk_res.end = end - 1;
 
 	insert_resource(&iomem_resource, ram_res);
-	crash_unmap_reserved_pages();
 
 unlock:
 	mutex_unlock(&kexec_mutex);
@@ -1110,17 +1124,12 @@ int kernel_kexec(void)
 }
 
 /*
- * Add and remove page tables for crashkernel memory
+ * Protection mechanism for crashkernel reserved memory after
+ * the kdump kernel is loaded.
  *
  * Provide an empty default implementation here -- architecture
  * code may override this
  */
-void __weak crash_map_reserved_pages(void)
-{}
-
-void __weak crash_unmap_reserved_pages(void)
-{}
-
 void __weak arch_kexec_protect_crashkres(void)
 {}
 

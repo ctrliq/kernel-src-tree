@@ -34,7 +34,9 @@
 #include <linux/compat.h>
 #include <linux/cn_proc.h>
 #include <linux/compiler.h>
-
+#ifndef __GENKSYMS__
+#include <linux/livepatch.h>
+#endif
 #define CREATE_TRACE_POINTS
 #include <trace/events/signal.h>
 
@@ -157,7 +159,8 @@ void recalc_sigpending_and_wake(struct task_struct *t)
 
 void recalc_sigpending(void)
 {
-	if (!recalc_sigpending_tsk(current) && !freezing(current))
+	if (!recalc_sigpending_tsk(current) && !freezing(current) &&
+	    !klp_patch_pending(current))
 		clear_thread_flag(TIF_SIGPENDING);
 
 }
@@ -276,9 +279,25 @@ bool task_set_jobctl_pending(struct task_struct *task, unsigned int mask)
 void task_clear_jobctl_trapping(struct task_struct *task)
 {
 	if (unlikely(task->jobctl & JOBCTL_TRAPPING)) {
+		int trapping_bit = JOBCTL_TRAPPING_BIT;
+#ifdef __BIG_ENDIAN
+		/*
+		 * RHEL-only. task->jobctl is "unsigned int" but wait_on_bit()
+		 * uses test_bit() which takes "unsigned long *", this means
+		 * that bit-nr becomes wrong and should be adjusted.
+		 *
+		 * This was accidentally fixed by e7cc41731153 ("signals,ptrace
+		 * sched: Fix a misaligned load inside ptrace_attach()") which
+		 * simply turns ->jobctl into "unsigned long", but we want to
+		 * avoid the KABI problems and unaligned access is fine on rhel
+		 * supported hardware.
+		 */
+		trapping_bit += (sizeof(long) - sizeof(task->jobctl))
+				* BITS_PER_BYTE;
+#endif
 		task->jobctl &= ~JOBCTL_TRAPPING;
 		smp_mb();	/* advised by wake_up_bit() */
-		wake_up_bit(&task->jobctl, JOBCTL_TRAPPING_BIT);
+		wake_up_bit(&task->jobctl, trapping_bit);
 	}
 }
 
@@ -2786,6 +2805,10 @@ int copy_siginfo_to_user(siginfo_t __user *to, siginfo_t *from)
 		err |= __put_user(from->si_upper, &to->si_upper);
 #endif
 		break;
+#ifdef SEGV_PKUERR
+		if (from->si_signo == SIGSEGV && from->si_code == SEGV_PKUERR)
+			err |= __put_user(from->si_pkey, &to->si_pkey);
+#endif
 	case __SI_CHLD:
 		err |= __put_user(from->si_pid, &to->si_pid);
 		err |= __put_user(from->si_uid, &to->si_uid);

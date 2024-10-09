@@ -180,7 +180,8 @@ static int fanotify_handle_event(struct fsnotify_group *group,
 				 struct fsnotify_mark *inode_mark,
 				 struct fsnotify_mark *fanotify_mark,
 				 u32 mask, const void *data, int data_type,
-				 const unsigned char *file_name, u32 cookie)
+				 const unsigned char *file_name, u32 cookie,
+				 struct fsnotify_iter_info *iter_info)
 {
 	int ret = 0;
 	struct fanotify_event_info *event;
@@ -273,8 +274,14 @@ static void fanotify_free_event(struct fsnotify_event *fsn_event)
 	kmem_cache_free(fanotify_event_cachep, event);
 }
 
+static void fanotify_free_mark(struct fsnotify_mark *fsn_mark)
+{
+	kmem_cache_free(fanotify_mark_cache, fsn_mark);
+}
+
 const struct fsnotify_ops fanotify_fsnotify_ops = {
 	.handle_event = fanotify_handle_event,
 	.free_group_priv = fanotify_free_group_priv,
 	.free_event = fanotify_free_event,
+	.free_mark = fanotify_free_mark,
 };

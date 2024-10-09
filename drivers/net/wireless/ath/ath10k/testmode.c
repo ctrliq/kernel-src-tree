@@ -137,6 +137,13 @@ static int ath10k_tm_cmd_get_version(struct ath10k *ar, struct nlattr *tb[])
 		return ret;
 	}
 
+	ret = nla_put_u32(skb, ATH10K_TM_ATTR_WMI_OP_VERSION,
+			  ar->normal_mode_fw.fw_file.wmi_op_version);
+	if (ret) {
+		kfree_skb(skb);
+		return ret;
+	}
+
 	return cfg80211_testmode_reply(skb);
 }
 
@@ -150,11 +157,7 @@ static int ath10k_tm_fetch_utf_firmware_api_1(struct ath10k *ar,
 		 ar->hw_params.fw.dir, ATH10K_FW_UTF_FILE);
 
 	/* load utf firmware image */
-#if 0 /* Not in RHEL */
 	ret = request_firmware_direct(&fw_file->firmware, filename, ar->dev);
-#else
-	ret = request_firmware(&fw_file->firmware, filename, ar->dev);
-#endif
 	ath10k_dbg(ar, ATH10K_DBG_TESTMODE, "testmode fw request '%s': %d\n",
 		   filename, ret);
 
@@ -424,8 +427,8 @@ int ath10k_tm_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	struct nlattr *tb[ATH10K_TM_ATTR_MAX + 1];
 	int ret;
 
-	ret = nla_parse(tb, ATH10K_TM_ATTR_MAX, data, len,
-			ath10k_tm_policy);
+	ret = nla_parse(tb, ATH10K_TM_ATTR_MAX, data, len, ath10k_tm_policy,
+			NULL);
 	if (ret)
 		return ret;
 

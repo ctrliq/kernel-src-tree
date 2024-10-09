@@ -132,26 +132,6 @@ static int mlxsw_sp_dpipe_table_erif_matches_dump(void *priv,
 	return devlink_dpipe_match_put(skb, &match);
 }
 
-static void mlxsw_sp_erif_entry_clear(struct devlink_dpipe_entry *entry)
-{
-	unsigned int value_count, value_index;
-	struct devlink_dpipe_value *value;
-
-	value = entry->action_values;
-	value_count = entry->action_values_count;
-	for (value_index = 0; value_index < value_count; value_index++) {
-		kfree(value[value_index].value);
-		kfree(value[value_index].mask);
-	}
-
-	value = entry->match_values;
-	value_count = entry->match_values_count;
-	for (value_index = 0; value_index < value_count; value_index++) {
-		kfree(value[value_index].value);
-		kfree(value[value_index].mask);
-	}
-}
-
 static void
 mlxsw_sp_erif_match_action_prepare(struct devlink_dpipe_match *match,
 				   struct devlink_dpipe_action *action)
@@ -263,10 +243,11 @@ start_again:
 		return err;
 	j = 0;
 	for (; i < rif_count; i++) {
-		if (!mlxsw_sp->rifs[i])
+		struct mlxsw_sp_rif *rif = mlxsw_sp_rif_by_index(mlxsw_sp, i);
+
+		if (!rif)
 			continue;
-		err = mlxsw_sp_erif_entry_get(mlxsw_sp, &entry,
-					      mlxsw_sp->rifs[i],
+		err = mlxsw_sp_erif_entry_get(mlxsw_sp, &entry, rif,
 					      counters_enabled);
 		if (err)
 			goto err_entry_get;
@@ -287,12 +268,12 @@ start_again:
 		goto start_again;
 	rtnl_unlock();
 
-	mlxsw_sp_erif_entry_clear(&entry);
+	devlink_dpipe_entry_clear(&entry);
 	return 0;
 err_entry_append:
 err_entry_get:
 	rtnl_unlock();
-	mlxsw_sp_erif_entry_clear(&entry);
+	devlink_dpipe_entry_clear(&entry);
 	return err;
 }
 
@@ -303,19 +284,26 @@ static int mlxsw_sp_dpipe_table_erif_counters_update(void *priv, bool enable)
 
 	rtnl_lock();
 	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++) {
-		if (!mlxsw_sp->rifs[i])
+		struct mlxsw_sp_rif *rif = mlxsw_sp_rif_by_index(mlxsw_sp, i);
+
+		if (!rif)
 			continue;
 		if (enable)
-			mlxsw_sp_rif_counter_alloc(mlxsw_sp,
-						   mlxsw_sp->rifs[i],
+			mlxsw_sp_rif_counter_alloc(mlxsw_sp, rif,
 						   MLXSW_SP_RIF_COUNTER_EGRESS);
 		else
-			mlxsw_sp_rif_counter_free(mlxsw_sp,
-						  mlxsw_sp->rifs[i],
+			mlxsw_sp_rif_counter_free(mlxsw_sp, rif,
 						  MLXSW_SP_RIF_COUNTER_EGRESS);
 	}
 	rtnl_unlock();
 	return 0;
+}
+
+static u64 mlxsw_sp_dpipe_table_erif_size_get(void *priv)
+{
+	struct mlxsw_sp *mlxsw_sp = priv;
+
+	return MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS);
 }
 
 static struct devlink_dpipe_table_ops mlxsw_sp_erif_ops = {
@@ -323,19 +311,17 @@ static struct devlink_dpipe_table_ops mlxsw_sp_erif_ops = {
 	.actions_dump = mlxsw_sp_dpipe_table_erif_actions_dump,
 	.entries_dump = mlxsw_sp_dpipe_table_erif_entries_dump,
 	.counters_set_update = mlxsw_sp_dpipe_table_erif_counters_update,
+	.size_get = mlxsw_sp_dpipe_table_erif_size_get,
 };
 
 static int mlxsw_sp_dpipe_erif_table_init(struct mlxsw_sp *mlxsw_sp)
 {
 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
-	u64 table_size;
 
-	table_size = MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS);
 	return devlink_dpipe_table_register(devlink,
 					    MLXSW_SP_DPIPE_TABLE_NAME_ERIF,
 					    &mlxsw_sp_erif_ops,
-					    mlxsw_sp, table_size,
-					    false);
+					    mlxsw_sp, false);
 }
 
 static void mlxsw_sp_dpipe_erif_table_fini(struct mlxsw_sp *mlxsw_sp)
@@ -694,6 +680,45 @@ mlxsw_sp_dpipe_table_host4_entries_dump(void *priv, bool counters_enabled,
 						      dump_ctx, AF_INET);
 }
 
+static void
+mlxsw_sp_dpipe_table_host_counters_update(struct mlxsw_sp *mlxsw_sp,
+					  bool enable, int type)
+{
+	int i;
+
+	rtnl_lock();
+	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++) {
+		struct mlxsw_sp_rif *rif = mlxsw_sp_rif_by_index(mlxsw_sp, i);
+		struct mlxsw_sp_neigh_entry *neigh_entry;
+
+		if (!rif)
+			continue;
+		mlxsw_sp_rif_neigh_for_each(neigh_entry, rif) {
+			int neigh_type = mlxsw_sp_neigh_entry_type(neigh_entry);
+
+			if (neigh_type != type)
+				continue;
+
+			if (neigh_type == AF_INET6 &&
+			    mlxsw_sp_neigh_ipv6_ignore(neigh_entry))
+				continue;
+
+			mlxsw_sp_neigh_entry_counter_update(mlxsw_sp,
+							    neigh_entry,
+							    enable);
+		}
+	}
+	rtnl_unlock();
+}
+
+static int mlxsw_sp_dpipe_table_host4_counters_update(void *priv, bool enable)
+{
+	struct mlxsw_sp *mlxsw_sp = priv;
+
+	mlxsw_sp_dpipe_table_host_counters_update(mlxsw_sp, enable, AF_INET);
+	return 0;
+}
+
 static u64
 mlxsw_sp_dpipe_table_host_size_get(struct mlxsw_sp *mlxsw_sp, int type)
 {
@@ -736,6 +761,7 @@ static struct devlink_dpipe_table_ops mlxsw_sp_host4_ops = {
 	.matches_dump = mlxsw_sp_dpipe_table_host4_matches_dump,
 	.actions_dump = mlxsw_sp_dpipe_table_host_actions_dump,
 	.entries_dump = mlxsw_sp_dpipe_table_host4_entries_dump,
+	.counters_set_update = mlxsw_sp_dpipe_table_host4_counters_update,
 	.size_get = mlxsw_sp_dpipe_table_host4_size_get,
 };
 
@@ -774,6 +800,14 @@ mlxsw_sp_dpipe_table_host6_entries_dump(void *priv, bool counters_enabled,
 						      dump_ctx, AF_INET6);
 }
 
+static int mlxsw_sp_dpipe_table_host6_counters_update(void *priv, bool enable)
+{
+	struct mlxsw_sp *mlxsw_sp = priv;
+
+	mlxsw_sp_dpipe_table_host_counters_update(mlxsw_sp, enable, AF_INET6);
+	return 0;
+}
+
 static u64 mlxsw_sp_dpipe_table_host6_size_get(void *priv)
 {
 	struct mlxsw_sp *mlxsw_sp = priv;
@@ -785,6 +819,7 @@ static struct devlink_dpipe_table_ops mlxsw_sp_host6_ops = {
 	.matches_dump = mlxsw_sp_dpipe_table_host6_matches_dump,
 	.actions_dump = mlxsw_sp_dpipe_table_host_actions_dump,
 	.entries_dump = mlxsw_sp_dpipe_table_host6_entries_dump,
+	.counters_set_update = mlxsw_sp_dpipe_table_host6_counters_update,
 	.size_get = mlxsw_sp_dpipe_table_host6_size_get,
 };
 
@@ -1098,6 +1133,29 @@ out:
 	return err;
 }
 
+static int mlxsw_sp_dpipe_table_adj_counters_update(void *priv, bool enable)
+{
+	struct mlxsw_sp *mlxsw_sp = priv;
+	struct mlxsw_sp_nexthop *nh;
+	u32 adj_hash_index = 0;
+	u32 adj_index = 0;
+
+	mlxsw_sp_nexthop_for_each(nh, mlxsw_sp->router) {
+		if (!mlxsw_sp_nexthop_offload(nh) ||
+		    mlxsw_sp_nexthop_group_has_ipip(nh))
+			continue;
+
+		mlxsw_sp_nexthop_indexes(nh, &adj_index, &adj_hash_index);
+		if (enable)
+			mlxsw_sp_nexthop_counter_alloc(mlxsw_sp, nh);
+		else
+			mlxsw_sp_nexthop_counter_free(mlxsw_sp, nh);
+		mlxsw_sp_nexthop_update(mlxsw_sp,
+					adj_index + adj_hash_index, nh);
+	}
+	return 0;
+}
+
 static u64
 mlxsw_sp_dpipe_table_adj_size_get(void *priv)
 {
@@ -1115,6 +1173,7 @@ static struct devlink_dpipe_table_ops mlxsw_sp_dpipe_table_adj_ops = {
 	.matches_dump = mlxsw_sp_dpipe_table_adj_matches_dump,
 	.actions_dump = mlxsw_sp_dpipe_table_adj_actions_dump,
 	.entries_dump = mlxsw_sp_dpipe_table_adj_entries_dump,
+	.counters_set_update = mlxsw_sp_dpipe_table_adj_counters_update,
 	.size_get = mlxsw_sp_dpipe_table_adj_size_get,
 };
 

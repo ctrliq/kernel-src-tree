@@ -158,7 +158,8 @@ unsigned long __kprobes prepare_ftrace_return(unsigned long parent,
 	/* Only trace if the calling function expects to. */
 	if (!ftrace_graph_entry(&trace))
 		goto out;
-	if (ftrace_push_return_trace(parent, ip, &trace.depth, 0) == -EBUSY)
+	if (ftrace_push_return_trace(parent, ip, &trace.depth, 0,
+				     NULL) == -EBUSY)
 		goto out;
 	parent = (unsigned long) return_to_handler;
 out:

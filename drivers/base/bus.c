@@ -544,7 +544,7 @@ void bus_probe_device(struct device *dev)
 
 	if (bus->p->drivers_autoprobe) {
 		ret = device_attach(dev);
-		WARN_ON(ret < 0);
+		WARN_ON(ret < 0 && ret != -EPROBE_DEFER);
 	}
 
 	mutex_lock(&bus->p->mutex);

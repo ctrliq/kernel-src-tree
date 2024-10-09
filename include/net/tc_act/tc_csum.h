@@ -6,12 +6,11 @@
 #include <linux/tc_act/tc_csum.h>
 
 struct tcf_csum {
-	struct tcf_common common;
+	struct tc_action common;
 
 	u32 update_flags;
 };
-#define to_tcf_csum(a) \
-	container_of(a->priv,struct tcf_csum,common)
+#define to_tcf_csum(a) ((struct tcf_csum *)a)
 
 static inline bool is_tcf_csum(const struct tc_action *a)
 {

@@ -22,7 +22,11 @@
 #include <linux/pci_ids.h>
 #include <linux/netdevice.h>
 #include <linux/interrupt.h>
+#if 0 /* Not in RHEL */
+#include <linux/sched/signal.h>
+#else
 #include <linux/sched.h>
+#endif
 #include <linux/mmc/sdio.h>
 #include <linux/mmc/sdio_ids.h>
 #include <linux/mmc/sdio_func.h>
@@ -44,6 +48,7 @@
 #include "firmware.h"
 #include "core.h"
 #include "common.h"
+#include "bcdc.h"
 
 #define DCMD_RESP_TIMEOUT	msecs_to_jiffies(2500)
 #define CTL_DONE_TIMEOUT	msecs_to_jiffies(2500)
@@ -313,6 +318,7 @@ struct rte_console {
 
 #define KSO_WAIT_US 50
 #define MAX_KSO_ATTEMPTS (PMU_MAX_TRANSITION_DLY/KSO_WAIT_US)
+#define BRCMF_SDIO_MAX_ACCESS_ERRORS	5
 
 /*
  * Conversion of 802.1D priority to precedence level
@@ -538,7 +544,11 @@ static int qcount[NUMPRIO];
 /* Limit on rounding up frames */
 static const uint max_roundup = 512;
 
+#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+#define ALIGNMENT  8
+#else
 #define ALIGNMENT  4
+#endif
 
 enum brcmf_sdio_frmtype {
 	BRCMF_SDIO_FT_NORMAL,
@@ -606,10 +616,13 @@ BRCMF_FW_NVRAM_DEF(43340, "brcmfmac43340-sdio.bin", "brcmfmac43340-sdio.txt");
 BRCMF_FW_NVRAM_DEF(4335, "brcmfmac4335-sdio.bin", "brcmfmac4335-sdio.txt");
 BRCMF_FW_NVRAM_DEF(43362, "brcmfmac43362-sdio.bin", "brcmfmac43362-sdio.txt");
 BRCMF_FW_NVRAM_DEF(4339, "brcmfmac4339-sdio.bin", "brcmfmac4339-sdio.txt");
-BRCMF_FW_NVRAM_DEF(43430, "brcmfmac43430-sdio.bin", "brcmfmac43430-sdio.txt");
+BRCMF_FW_NVRAM_DEF(43430A0, "brcmfmac43430a0-sdio.bin", "brcmfmac43430a0-sdio.txt");
+/* Note the names are not postfixed with a1 for backward compatibility */
+BRCMF_FW_NVRAM_DEF(43430A1, "brcmfmac43430-sdio.bin", "brcmfmac43430-sdio.txt");
 BRCMF_FW_NVRAM_DEF(43455, "brcmfmac43455-sdio.bin", "brcmfmac43455-sdio.txt");
 BRCMF_FW_NVRAM_DEF(4354, "brcmfmac4354-sdio.bin", "brcmfmac4354-sdio.txt");
 BRCMF_FW_NVRAM_DEF(4356, "brcmfmac4356-sdio.bin", "brcmfmac4356-sdio.txt");
+BRCMF_FW_NVRAM_DEF(4373, "brcmfmac4373-sdio.bin", "brcmfmac4373-sdio.txt");
 
 static struct brcmf_firmware_mapping brcmf_sdio_fwnames[] = {
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43143_CHIP_ID, 0xFFFFFFFF, 43143),
@@ -620,13 +633,16 @@ static struct brcmf_firmware_mapping brcmf_sdio_fwnames[] = {
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4330_CHIP_ID, 0xFFFFFFFF, 4330),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4334_CHIP_ID, 0xFFFFFFFF, 4334),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43340_CHIP_ID, 0xFFFFFFFF, 43340),
+	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43341_CHIP_ID, 0xFFFFFFFF, 43340),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4335_CHIP_ID, 0xFFFFFFFF, 4335),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43362_CHIP_ID, 0xFFFFFFFE, 43362),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4339_CHIP_ID, 0xFFFFFFFF, 4339),
-	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43430_CHIP_ID, 0xFFFFFFFF, 43430),
+	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43430_CHIP_ID, 0x00000001, 43430A0),
+	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_43430_CHIP_ID, 0xFFFFFFFE, 43430A1),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4345_CHIP_ID, 0xFFFFFFC0, 43455),
 	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4354_CHIP_ID, 0xFFFFFFFF, 4354),
-	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4356_CHIP_ID, 0xFFFFFFFF, 4356)
+	BRCMF_FW_NVRAM_ENTRY(BRCM_CC_4356_CHIP_ID, 0xFFFFFFFF, 4356),
+	BRCMF_FW_NVRAM_ENTRY(CY_CC_4373_CHIP_ID, 0xFFFFFFFF, 4373)
 };
 
 static void pkt_align(struct sk_buff *p, int len, int align)
@@ -677,6 +693,7 @@ brcmf_sdio_kso_control(struct brcmf_sdio *bus, bool on)
 {
 	u8 wr_val = 0, rd_val, cmp_val, bmask;
 	int err = 0;
+	int err_cnt = 0;
 	int try_cnt = 0;
 
 	brcmf_dbg(TRACE, "Enter: on=%d\n", on);
@@ -712,9 +729,14 @@ brcmf_sdio_kso_control(struct brcmf_sdio *bus, bool on)
 		 */
 		rd_val = brcmf_sdiod_regrb(bus->sdiodev, SBSDIO_FUNC1_SLEEPCSR,
 					   &err);
-		if (((rd_val & bmask) == cmp_val) && !err)
+		if (!err) {
+			if ((rd_val & bmask) == cmp_val)
+				break;
+			err_cnt = 0;
+		}
+		/* bail out upon subsequent access errors */
+		if (err && (err_cnt++ > BRCMF_SDIO_MAX_ACCESS_ERRORS))
 			break;
-
 		udelay(KSO_WAIT_US);
 		brcmf_sdiod_regwb(bus->sdiodev, SBSDIO_FUNC1_SLEEPCSR,
 				  wr_val, &err);
@@ -1384,8 +1406,7 @@ static int brcmf_sdio_hdparse(struct brcmf_sdio *bus, u8 *header,
 		return -ENXIO;
 	}
 	if (rd->seq_num != rx_seq) {
-		brcmf_err("seq %d: sequence number error, expect %d\n",
-			  rx_seq, rd->seq_num);
+		brcmf_dbg(SDIO, "seq %d, expected %d\n", rx_seq, rd->seq_num);
 		bus->sdcnt.rx_badseq++;
 		rd->seq_num = rx_seq;
 	}
@@ -1654,7 +1675,7 @@ static u8 brcmf_sdio_rxglom(struct brcmf_sdio *bus, u8 rxseq)
 					   pfirst->len, pfirst->next,
 					   pfirst->prev);
 			skb_unlink(pfirst, &bus->glom);
-			if (brcmf_sdio_fromevntchan(pfirst->data))
+			if (brcmf_sdio_fromevntchan(&dptr[SDPCM_HWHDR_LEN]))
 				brcmf_rx_event(bus->sdiodev->dev, pfirst);
 			else
 				brcmf_rx_frame(bus->sdiodev->dev, pfirst,
@@ -2022,6 +2043,7 @@ brcmf_sdio_wait_event_wakeup(struct brcmf_sdio *bus)
 
 static int brcmf_sdio_txpkt_hdalign(struct brcmf_sdio *bus, struct sk_buff *pkt)
 {
+	struct brcmf_bus_stats *stats;
 	u16 head_pad;
 	u8 *dat_buf;
 
@@ -2031,15 +2053,18 @@ static int brcmf_sdio_txpkt_hdalign(struct brcmf_sdio *bus, struct sk_buff *pkt)
 	head_pad = ((unsigned long)dat_buf % bus->head_align);
 	if (head_pad) {
 		if (skb_headroom(pkt) < head_pad) {
-			bus->sdiodev->bus_if->tx_realloc++;
-			head_pad = 0;
-			if (skb_cow(pkt, head_pad))
+			stats = &bus->sdiodev->bus_if->stats;
+			atomic_inc(&stats->pktcowed);
+			if (skb_cow_head(pkt, head_pad)) {
+				atomic_inc(&stats->pktcow_failed);
 				return -ENOMEM;
+			}
+			head_pad = 0;
 		}
 		skb_push(pkt, head_pad);
 		dat_buf = (u8 *)(pkt->data);
-		memset(dat_buf, 0, head_pad + bus->tx_hdrlen);
 	}
+	memset(dat_buf, 0, head_pad + bus->tx_hdrlen);
 	return head_pad;
 }
 
@@ -2258,7 +2283,8 @@ done:
 		bus->tx_seq = (bus->tx_seq + pktq->qlen) % SDPCM_SEQ_WRAP;
 	skb_queue_walk_safe(pktq, pkt_next, tmp) {
 		__skb_unlink(pkt_next, pktq);
-		brcmf_txcomplete(bus->sdiodev->dev, pkt_next, ret == 0);
+		brcmf_proto_bcdc_txcomplete(bus->sdiodev->dev, pkt_next,
+					    ret == 0);
 	}
 	return ret;
 }
@@ -2321,7 +2347,7 @@ static uint brcmf_sdio_sendfromq(struct brcmf_sdio *bus, uint maxframes)
 	if ((bus->sdiodev->state == BRCMF_SDIOD_DATA) &&
 	    bus->txoff && (pktq_len(&bus->txq) < TXLOW)) {
 		bus->txoff = false;
-		brcmf_txflowblock(bus->sdiodev->dev, false);
+		brcmf_proto_bcdc_txflowblock(bus->sdiodev->dev, false);
 	}
 
 	return cnt;
@@ -2746,7 +2772,7 @@ static int brcmf_sdio_bus_txdata(struct device *dev, struct sk_buff *pkt)
 
 	if (pktq_len(&bus->txq) >= TXHI) {
 		bus->txoff = true;
-		brcmf_txflowblock(dev, true);
+		brcmf_proto_bcdc_txflowblock(dev, true);
 	}
 	spin_unlock_bh(&bus->txq_lock);
 
@@ -3306,10 +3332,6 @@ static int brcmf_sdio_download_firmware(struct brcmf_sdio *bus,
 		goto err;
 	}
 
-	/* Allow full data communication using DPC from now on. */
-	brcmf_sdiod_change_state(bus->sdiodev, BRCMF_SDIOD_DATA);
-	bcmerror = 0;
-
 err:
 	brcmf_sdio_clkctl(bus, CLK_SDONLY, false);
 	sdio_release_host(bus->sdiodev->func[1]);
@@ -3413,7 +3435,7 @@ static int brcmf_sdio_bus_preinit(struct device *dev)
 		/* otherwise, set txglomalign */
 		value = sdiodev->settings->bus.sdio.sd_sgentry_align;
 		/* SDIO ADMA requires at least 32 bit alignment */
-		value = max_t(u32, value, 4);
+		value = max_t(u32, value, ALIGNMENT);
 		err = brcmf_iovar_data_set(dev, "bus:txglomalign", &value,
 					   sizeof(u32));
 	}
@@ -3666,7 +3688,7 @@ brcmf_sdio_drivestrengthinit(struct brcmf_sdio_dev *sdiodev,
 		str_shift = 11;
 		break;
 	default:
-		brcmf_err("No SDIO Drive strength init done for chip %s rev %d pmurev %d\n",
+		brcmf_dbg(INFO, "No SDIO driver strength init needed for chip %s rev %d pmurev %d\n",
 			  ci->name, ci->chiprev, ci->pmurev);
 		break;
 	}
@@ -3762,7 +3784,8 @@ static u32 brcmf_sdio_buscore_read32(void *ctx, u32 addr)
 	u32 val, rev;
 
 	val = brcmf_sdiod_regrl(sdiodev, addr, NULL);
-	if (sdiodev->func[0]->device == SDIO_DEVICE_ID_BROADCOM_4335_4339 &&
+	if ((sdiodev->func[0]->device == SDIO_DEVICE_ID_BROADCOM_4335_4339 ||
+	     sdiodev->func[0]->device == SDIO_DEVICE_ID_BROADCOM_4339) &&
 	    addr == CORE_CC_REG(SI_ENUM_BASE, chipid)) {
 		rev = (val & CID_REV_MASK) >> CID_REV_SHIFT;
 		if (rev >= 2) {
@@ -3972,20 +3995,25 @@ static const struct brcmf_bus_ops brcmf_sdio_bus_ops = {
 	.get_memdump = brcmf_sdio_bus_get_memdump,
 };
 
-static void brcmf_sdio_firmware_callback(struct device *dev,
+static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 					 const struct firmware *code,
 					 void *nvram, u32 nvram_len)
 {
-	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
-	struct brcmf_sdio_dev *sdiodev = bus_if->bus_priv.sdio;
-	struct brcmf_sdio *bus = sdiodev->bus;
-	int err = 0;
+	struct brcmf_bus *bus_if;
+	struct brcmf_sdio_dev *sdiodev;
+	struct brcmf_sdio *bus;
 	u8 saveclk;
 
-	brcmf_dbg(TRACE, "Enter: dev=%s\n", dev_name(dev));
+	brcmf_dbg(TRACE, "Enter: dev=%s, err=%d\n", dev_name(dev), err);
+	bus_if = dev_get_drvdata(dev);
+	sdiodev = bus_if->bus_priv.sdio;
+	if (err)
+		goto fail;
 
 	if (!bus_if->drvr)
 		return;
+
+	bus = sdiodev->bus;
 
 	/* try to download image and nvram to the dongle */
 	bus->alp_only = true;
@@ -4047,6 +4075,9 @@ static void brcmf_sdio_firmware_callback(struct device *dev,
 	}
 
 	if (err == 0) {
+		/* Allow full data communication using DPC from now on. */
+		brcmf_sdiod_change_state(bus->sdiodev, BRCMF_SDIOD_DATA);
+
 		err = brcmf_sdiod_intr_register(sdiodev);
 		if (err != 0)
 			brcmf_err("intr register failed:%d\n", err);
@@ -4058,7 +4089,7 @@ static void brcmf_sdio_firmware_callback(struct device *dev,
 
 	sdio_release_host(sdiodev->func[1]);
 
-	err = brcmf_bus_start(dev);
+	err = brcmf_bus_started(dev);
 	if (err != 0) {
 		brcmf_err("dongle is not responding\n");
 		goto fail;
@@ -4069,6 +4100,7 @@ release:
 	sdio_release_host(sdiodev->func[1]);
 fail:
 	brcmf_dbg(TRACE, "failed: dev=%s, err=%d\n", dev_name(dev), err);
+	device_release_driver(&sdiodev->func[2]->dev);
 	device_release_driver(dev);
 }
 
@@ -4148,11 +4180,6 @@ struct brcmf_sdio *brcmf_sdio_probe(struct brcmf_sdio_dev *sdiodev)
 		brcmf_err("brcmf_attach failed\n");
 		goto fail;
 	}
-
-	/* allocate scatter-gather table. sg support
-	 * will be disabled upon allocation failure.
-	 */
-	brcmf_sdiod_sgtable_alloc(bus->sdiodev);
 
 	/* Query the F2 block size, set roundup accordingly */
 	bus->blocksize = bus->sdiodev->func[2]->cur_blksize;

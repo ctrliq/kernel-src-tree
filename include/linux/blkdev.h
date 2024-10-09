@@ -41,6 +41,8 @@ struct bsg_job;
 struct blkcg_gq;
 struct blk_flush_queue;
 struct pr_ops;
+struct blk_queue_stats;
+struct blk_stat_callback;
 
 #define BLKDEV_MIN_RQ	4
 #define BLKDEV_MAX_RQ	128	/* Default maximum */
@@ -300,8 +302,9 @@ struct blk_queue_tag {
 	int max_depth;			/* what we will send to device */
 	int real_max_depth;		/* what the array can hold */
 	atomic_t refcnt;		/* map can be shared */
-	int alloc_policy;		/* tag allocation policy */
-	int next_tag;			/* next tag */
+
+	RH_KABI_EXTEND(int alloc_policy)	/* tag allocation policy */
+	RH_KABI_EXTEND(int next_tag)		/* next tag */
 };
 #define BLK_TAG_ALLOC_FIFO 0 /* allocate starting from 0 */
 #define BLK_TAG_ALLOC_RR 1 /* allocate starting from last allocated tag */
@@ -495,7 +498,6 @@ struct request_queue {
 	int			node;
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	struct blk_trace	*blk_trace;
-	struct mutex		blk_trace_mutex;
 #endif
 	/*
 	 * for flush operations
@@ -545,6 +547,34 @@ struct request_queue {
 	RH_KABI_EXTEND(bool			mq_sysfs_init_done)
 	RH_KABI_EXTEND(struct work_struct	timeout_work)
 	RH_KABI_EXTEND(struct delayed_work	requeue_work)
+	RH_KABI_EXTEND(struct blk_queue_stats	*stats)
+	RH_KABI_EXTEND(struct blk_stat_callback	*poll_cb)
+	RH_KABI_EXTEND(struct blk_rq_stat	poll_stat[2])
+	RH_KABI_EXTEND(atomic_t		shared_hctx_restart)
+	RH_KABI_EXTEND(unsigned int		queue_depth)
+
+	/*
+	 * The flag need to be set if this queue is blk-mq queue and at
+	 * the top of other blk-mq queues, such as DM/MPATH. We don't know
+	 * if there are such 3rd party queues, and if there are, they
+	 * need to set this flag too. This flag is for avoiding IO hang
+	 * in blk_mq_queue_reinit_notify().
+	 */
+	RH_KABI_EXTEND(unsigned int         front_queue:1)
+
+	/*
+	 * The flag need to be set for queues which are depended by other
+	 * IO queues, so far, the only one is NVMe's admin queue. This flag
+	 * is for avoiding IO hang in blk_mq_queue_reinit_notify().
+	 */
+	RH_KABI_EXTEND(unsigned int         tail_queue:1)
+#ifdef CONFIG_BLK_DEBUG_FS
+	RH_KABI_EXTEND(struct dentry		*debugfs_dir)
+	RH_KABI_EXTEND(struct dentry		*sched_debugfs_dir)
+#endif
+#ifdef CONFIG_BLK_DEV_IO_TRACE
+	RH_KABI_EXTEND(struct mutex		blk_trace_mutex)
+#endif
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
@@ -572,6 +602,10 @@ struct request_queue {
 #define QUEUE_FLAG_NO_SG_MERGE 22	/* don't attempt to merge SG segments*/
 #define QUEUE_FLAG_SG_GAPS     23	/* queue doesn't support SG gaps */
 #define QUEUE_FLAG_DAX         24	/* device supports DAX */
+#define QUEUE_FLAG_REGISTERED  25	/* queue has been registered to a disk */
+#define QUEUE_FLAG_STATS       26	/* track rq completion times */
+#define QUEUE_FLAG_POLL_STATS  27	/* collecting stats for hybrid polling */
+#define QUEUE_FLAG_PREEMPT_ONLY	28	/* only process REQ_PREEMPT requests */
 
 #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_STACKABLE)	|	\
@@ -663,6 +697,11 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 #define blk_queue_secdiscard(q)	(blk_queue_discard(q) && \
 	test_bit(QUEUE_FLAG_SECDISCARD, &(q)->queue_flags))
 #define blk_queue_dax(q)	test_bit(QUEUE_FLAG_DAX, &(q)->queue_flags)
+#define blk_queue_preempt_only(q)				\
+	test_bit(QUEUE_FLAG_PREEMPT_ONLY, &(q)->queue_flags)
+
+extern int blk_set_preempt_only(struct request_queue *q);
+extern void blk_clear_preempt_only(struct request_queue *q);
 
 #define blk_noretry_request(rq) \
 	((rq)->cmd_flags & (REQ_FAILFAST_DEV|REQ_FAILFAST_TRANSPORT| \
@@ -768,6 +807,14 @@ static inline bool blk_write_same_mergeable(struct bio *a, struct bio *b)
 	return false;
 }
 
+static inline unsigned int blk_queue_depth(struct request_queue *q)
+{
+	if (q->queue_depth)
+		return q->queue_depth;
+
+	return q->nr_requests;
+}
+
 /*
  * q->prep_rq_fn return values
  */
@@ -868,6 +915,9 @@ extern void generic_make_request(struct bio *bio);
 extern void blk_rq_init(struct request_queue *q, struct request *rq);
 extern void blk_put_request(struct request *);
 extern void __blk_put_request(struct request_queue *, struct request *);
+extern struct request *blk_get_request_flags(struct request_queue *,
+					     unsigned int rw,
+					     unsigned int flags);
 extern struct request *blk_get_request(struct request_queue *, int, gfp_t);
 extern struct request *blk_make_request(struct request_queue *, struct bio *,
 					gfp_t);
@@ -914,7 +964,7 @@ static inline void blk_set_queue_congested(struct request_queue *q, int sync)
 	set_bdi_congested(&q->backing_dev_info, sync);
 }
 
-extern int blk_queue_enter(struct request_queue *q, bool nowait);
+extern int blk_queue_enter(struct request_queue *q, unsigned int flags);
 extern void blk_queue_exit(struct request_queue *q);
 extern void blk_start_queue(struct request_queue *q);
 extern void blk_stop_queue(struct request_queue *q);
@@ -1095,6 +1145,7 @@ extern void blk_limits_io_min(struct queue_limits *limits, unsigned int min);
 extern void blk_queue_io_min(struct request_queue *q, unsigned int min);
 extern void blk_limits_io_opt(struct queue_limits *limits, unsigned int opt);
 extern void blk_queue_io_opt(struct request_queue *q, unsigned int opt);
+extern void blk_set_queue_depth(struct request_queue *q, unsigned int depth);
 extern void blk_set_default_limits(struct queue_limits *lim);
 extern void blk_set_stacking_limits(struct queue_limits *lim);
 extern int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
@@ -1220,7 +1271,6 @@ static inline bool blk_needs_flush_plug(struct task_struct *tsk)
 /*
  * tag stuff
  */
-#define blk_rq_tagged(rq)		((rq)->cmd_flags & REQ_QUEUED)
 extern int blk_queue_start_tag(struct request_queue *, struct request *);
 extern struct request *blk_queue_find_tag(struct request_queue *, int);
 extern void blk_queue_end_tag(struct request_queue *, struct request *);
@@ -1782,29 +1832,13 @@ static inline bool blk_integrity_is_initialized(struct gendisk *g)
 
 #endif /* CONFIG_BLK_DEV_INTEGRITY */
 
-/**
- * struct blk_dax_ctl - control and output parameters for ->direct_access
- * @sector: (input) offset relative to a block_device
- * @addr: (output) kernel virtual address for @sector populated by driver
- * @pfn: (output) page frame number for @addr populated by driver
- * @size: (input) number of bytes requested
- */
-struct blk_dax_ctl {
-	sector_t sector;
-	void *addr;
-	long size;
-	pfn_t pfn;
-};
-
 struct block_device_operations {
 	int (*open) (struct block_device *, fmode_t);
 	void (*release) (struct gendisk *, fmode_t);
 	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
 	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
-	RH_KABI_REPLACE(int (*direct_access) (struct block_device *, sector_t,
-						void **, unsigned long *),
-			long (*direct_access)(struct block_device *, sector_t,
-						void **, pfn_t *, long))
+	RH_KABI_DEPRECATE_FN(int, direct_access, struct block_device *,
+			     sector_t, void **, unsigned long *)
 	unsigned int (*check_events) (struct gendisk *disk,
 				      unsigned int clearing);
 	/* ->media_changed() is DEPRECATED, use ->check_events() instead */
@@ -1832,8 +1866,6 @@ extern int __blkdev_driver_ioctl(struct block_device *, fmode_t, unsigned int,
 extern int bdev_read_page(struct block_device *, sector_t, struct page *);
 extern int bdev_write_page(struct block_device *, sector_t, struct page *,
 						struct writeback_control *);
-extern long bdev_direct_access(struct block_device *, struct blk_dax_ctl *);
-extern int bdev_dax_supported(struct super_block *, int);
 #else /* CONFIG_BLOCK */
 /*
  * stubs for when the block layer is configured out

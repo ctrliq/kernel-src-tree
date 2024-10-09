@@ -161,8 +161,8 @@ static u64 veth_stats_one(struct pcpu_vstats *result, struct net_device *dev)
 	return atomic64_read(&priv->dropped);
 }
 
-static struct rtnl_link_stats64 *veth_get_stats64(struct net_device *dev,
-						  struct rtnl_link_stats64 *tot)
+static void veth_get_stats64(struct net_device *dev,
+			     struct rtnl_link_stats64 *tot)
 {
 	struct veth_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
@@ -180,8 +180,6 @@ static struct rtnl_link_stats64 *veth_get_stats64(struct net_device *dev,
 		tot->rx_packets = one.packets;
 	}
 	rcu_read_unlock();
-
-	return tot;
 }
 
 static int veth_open(struct net_device *dev)
@@ -236,7 +234,6 @@ static int veth_dev_init(struct net_device *dev)
 static void veth_dev_free(struct net_device *dev)
 {
 	free_percpu(dev->vstats);
-	free_netdev(dev);
 }
 
 static int veth_get_iflink(const struct net_device *dev)
@@ -281,7 +278,7 @@ static const struct net_device_ops veth_netdev_ops = {
 	.ndo_open            = veth_open,
 	.ndo_stop            = veth_close,
 	.ndo_start_xmit      = veth_xmit,
-	.ndo_change_mtu      = veth_change_mtu,
+	.ndo_change_mtu_rh74 = veth_change_mtu,
 	.ndo_get_stats64     = veth_get_stats64,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_get_iflink		= veth_get_iflink,
@@ -310,7 +307,8 @@ static void veth_setup(struct net_device *dev)
 	dev->features |= VETH_FEATURES;
 	dev->vlan_features = dev->features &
 			     ~(NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_STAG_TX);
-	dev->destructor = veth_dev_free;
+	dev->extended->needs_free_netdev = true;
+	dev->extended->priv_destructor = veth_dev_free;
 
 	dev->hw_features = VETH_FEATURES;
 	dev->hw_enc_features = VETH_FEATURES;

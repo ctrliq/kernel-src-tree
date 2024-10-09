@@ -1396,6 +1396,10 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		goto out_unmap;
 	}
 
+	/* munlock has nothing to gain from examining un-locked vmas */
+	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
+		goto out;
+
 	pte = page_check_address(page, mm, address, &ptl, 0);
 	if (!pte)
 		goto out;
@@ -1406,10 +1410,13 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	 * skipped over this mm) then we should reactivate it.
 	 */
 	if (!(flags & TTU_IGNORE_MLOCK)) {
-		if (vma->vm_flags & VM_LOCKED)
-			goto out_mlock;
-
-		if (TTU_ACTION(flags) == TTU_MUNLOCK)
+		if (vma->vm_flags & VM_LOCKED) {
+			/* Holding pte lock, we do *not* need mmap_sem here */
+			mlock_vma_page(page);
+			ret = SWAP_MLOCK;
+			goto out_unmap;
+		}
+		if (flags & TTU_MUNLOCK)
 			goto out_unmap;
 	}
 	if (!(flags & TTU_IGNORE_ACCESS)) {
@@ -1476,7 +1483,7 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			 * pte. do_swap_page() will wait until the migration
 			 * pte is removed and then restart fault handling.
 			 */
-			BUG_ON(TTU_ACTION(flags) != TTU_MIGRATION);
+			BUG_ON(!(flags & TTU_MIGRATION));
 			entry = make_migration_entry(page, pte_write(pteval));
 		}
 		swp_pte = swp_entry_to_pte(entry);
@@ -1485,7 +1492,7 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		set_pte_at(mm, address, pte, swp_pte);
 		BUG_ON(pte_file(*pte));
 	} else if (IS_ENABLED(CONFIG_MIGRATION) &&
-		   (TTU_ACTION(flags) == TTU_MIGRATION)) {
+		   (flags & TTU_MIGRATION)) {
 		/* Establish migration entry for a file page */
 		swp_entry_t entry;
 		entry = make_migration_entry(page, pte_write(pteval));
@@ -1498,30 +1505,9 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 
 out_unmap:
 	pte_unmap_unlock(pte, ptl);
-	if (ret != SWAP_FAIL && TTU_ACTION(flags) != TTU_MUNLOCK)
+	if (ret != SWAP_FAIL && ret != SWAP_MLOCK && !(flags & TTU_MUNLOCK))
 		mmu_notifier_invalidate_page(mm, address);
 out:
-	return ret;
-
-out_mlock:
-	pte_unmap_unlock(pte, ptl);
-
-
-	/*
-	 * We need mmap_sem locking, Otherwise VM_LOCKED check makes
-	 * unstable result and race. Plus, We can't wait here because
-	 * we now hold anon_vma->rwsem or mapping->i_mmap_mutex.
-	 * if trylock failed, the page remain in evictable lru and later
-	 * vmscan could retry to move the page to unevictable lru if the
-	 * page is actually mlocked.
-	 */
-	if (down_read_trylock(&vma->vm_mm->mmap_sem)) {
-		if (vma->vm_flags & VM_LOCKED) {
-			mlock_vma_page(page);
-			ret = SWAP_MLOCK;
-		}
-		up_read(&vma->vm_mm->mmap_sem);
-	}
 	return ret;
 }
 
@@ -1762,7 +1748,7 @@ static int try_to_unmap_file(struct page *page, enum ttu_flags flags)
 	 * It's costly. Instead, later, page reclaim logic may call
 	 * try_to_unmap(TTU_MUNLOCK) and recover PG_mlocked lazily.
 	 */
-	if (TTU_ACTION(flags) == TTU_MUNLOCK)
+	if (flags & TTU_MUNLOCK)
 		goto out;
 
 	list_for_each_entry(vma, &mapping->i_mmap_nonlinear,
@@ -1926,6 +1912,8 @@ static int rmap_walk_anon(struct page *page, int (*rmap_one)(struct page *,
 		ret = rmap_one(page, vma, address, arg);
 		if (ret != SWAP_AGAIN)
 			break;
+
+		cond_resched();
 	}
 	anon_vma_unlock_read(anon_vma);
 	return ret;
@@ -1948,6 +1936,8 @@ static int rmap_walk_file(struct page *page, int (*rmap_one)(struct page *,
 		ret = rmap_one(page, vma, address, arg);
 		if (ret != SWAP_AGAIN)
 			break;
+
+		cond_resched();
 	}
 	/*
 	 * No nonlinear handling: being always shared, nonlinear vmas

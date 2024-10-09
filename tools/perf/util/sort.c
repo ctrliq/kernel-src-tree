@@ -1,12 +1,18 @@
+#include <errno.h>
+#include <inttypes.h>
+#include <regex.h>
 #include <sys/mman.h>
 #include "sort.h"
 #include "hist.h"
 #include "comm.h"
 #include "symbol.h"
+#include "thread.h"
 #include "evsel.h"
 #include "evlist.h"
+#include "strlist.h"
 #include <traceevent/event-parse.h>
 #include "mem-events.h"
+#include <linux/kernel.h>
 
 regex_t		parent_regex;
 const char	default_parent_pattern[] = "^sys_|^do_page_fault";
@@ -151,7 +157,7 @@ static int64_t _sort__dso_cmp(struct map *map_l, struct map *map_r)
 	if (!dso_l || !dso_r)
 		return cmp_null(dso_r, dso_l);
 
-	if (verbose) {
+	if (verbose > 0) {
 		dso_name_l = dso_l->long_name;
 		dso_name_r = dso_r->long_name;
 	} else {
@@ -172,8 +178,8 @@ static int _hist_entry__dso_snprintf(struct map *map, char *bf,
 				     size_t size, unsigned int width)
 {
 	if (map && map->dso) {
-		const char *dso_name = !verbose ? map->dso->short_name :
-			map->dso->long_name;
+		const char *dso_name = verbose > 0 ? map->dso->long_name :
+			map->dso->short_name;
 		return repsep_snprintf(bf, size, "%-*.*s", width, width, dso_name);
 	}
 
@@ -261,7 +267,7 @@ static int _hist_entry__sym_snprintf(struct map *map, struct symbol *sym,
 {
 	size_t ret = 0;
 
-	if (verbose) {
+	if (verbose > 0) {
 		char o = map ? dso__symtab_origin(map->dso) : '!';
 		ret += repsep_snprintf(bf, size, "%-#*llx %c ",
 				       BITS_PER_LONG / 4 + 2, ip, o);

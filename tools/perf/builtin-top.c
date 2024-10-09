@@ -27,19 +27,20 @@
 #include "util/drv_configs.h"
 #include "util/evlist.h"
 #include "util/evsel.h"
+#include "util/event.h"
 #include "util/machine.h"
 #include "util/session.h"
 #include "util/symbol.h"
 #include "util/thread.h"
 #include "util/thread_map.h"
 #include "util/top.h"
-#include "util/util.h"
 #include <linux/rbtree.h>
 #include <subcmd/parse-options.h>
 #include "util/parse-events.h"
 #include "util/cpumap.h"
 #include "util/xyarray.h"
 #include "util/sort.h"
+#include "util/term.h"
 #include "util/intlist.h"
 #include "util/parse-branch-options.h"
 #include "arch/common.h"
@@ -58,6 +59,7 @@
 #include <errno.h>
 #include <time.h>
 #include <sched.h>
+#include <signal.h>
 
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
@@ -873,7 +875,7 @@ try_again:
 		if (perf_evsel__open(counter, top->evlist->cpus,
 				     top->evlist->threads) < 0) {
 			if (perf_evsel__fallback(counter, errno, msg, sizeof(msg))) {
-				if (verbose)
+				if (verbose > 0)
 					ui__warning("%s\n", msg);
 				goto try_again;
 			}

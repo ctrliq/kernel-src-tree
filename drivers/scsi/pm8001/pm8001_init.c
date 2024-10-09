@@ -941,7 +941,6 @@ static void pm8001_pci_remove(struct pci_dev *pdev)
 	sas_unregister_ha(sha);
 	sas_remove_host(pm8001_ha->shost);
 	list_del(&pm8001_ha->list);
-	scsi_remove_host(pm8001_ha->shost);
 	PM8001_CHIP_DISP->interrupt_disable(pm8001_ha, 0xFF);
 	PM8001_CHIP_DISP->chip_soft_rst(pm8001_ha);
 

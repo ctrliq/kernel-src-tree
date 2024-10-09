@@ -19,6 +19,7 @@
 #include <linux/pm_runtime.h>
 #include <scsi/scsi_device.h>
 #include "libata.h"
+#include "libata-transport.h"
 
 #include <acpi/acpi_bus.h>
 
@@ -269,6 +270,7 @@ void ata_acpi_dissociate(struct ata_host *host)
 
 		if (ACPI_HANDLE(&ap->tdev) && gtm)
 			ata_acpi_stm(ap, gtm);
+		ata_tport_delete(ap);
 	}
 }
 

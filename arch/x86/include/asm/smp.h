@@ -16,7 +16,6 @@
 #endif
 #include <asm/thread_info.h>
 #include <asm/cpumask.h>
-#include <asm/cpufeature.h>
 
 extern int smp_num_siblings;
 extern unsigned int num_processors;
@@ -58,9 +57,6 @@ DECLARE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_bios_cpu_apicid);
 #if defined(CONFIG_X86_LOCAL_APIC) && defined(CONFIG_X86_32)
 DECLARE_EARLY_PER_CPU_READ_MOSTLY(int, x86_cpu_to_logical_apicid);
 #endif
-
-/* Static state in head.S used to set up a CPU */
-extern unsigned long stack_start; /* Initial stack pointer address */
 
 struct task_struct;
 

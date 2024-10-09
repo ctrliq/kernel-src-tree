@@ -638,8 +638,8 @@ static void macvlan_uninit(struct net_device *dev)
 		macvlan_port_destroy(port->dev);
 }
 
-static struct rtnl_link_stats64 *macvlan_dev_get_stats64(struct net_device *dev,
-							 struct rtnl_link_stats64 *stats)
+static void macvlan_dev_get_stats64(struct net_device *dev,
+				    struct rtnl_link_stats64 *stats)
 {
 	struct macvlan_dev *vlan = netdev_priv(dev);
 
@@ -676,7 +676,6 @@ static struct rtnl_link_stats64 *macvlan_dev_get_stats64(struct net_device *dev,
 		stats->rx_dropped	= rx_errors;
 		stats->tx_dropped	= tx_dropped;
 	}
-	return stats;
 }
 
 static int macvlan_vlan_rx_add_vid(struct net_device *dev,
@@ -795,7 +794,7 @@ static const struct net_device_ops macvlan_netdev_ops = {
 	.ndo_open		= macvlan_open,
 	.ndo_stop		= macvlan_stop,
 	.ndo_start_xmit		= macvlan_start_xmit,
-	.ndo_change_mtu		= macvlan_change_mtu,
+	.ndo_change_mtu_rh74	= macvlan_change_mtu,
 	.ndo_fix_features	= macvlan_fix_features,
 	.ndo_change_rx_flags	= macvlan_change_rx_flags,
 	.ndo_set_mac_address	= macvlan_set_mac_address,
@@ -818,8 +817,8 @@ void macvlan_common_setup(struct net_device *dev)
 	netif_keep_dst(dev);
 	dev->priv_flags	       |= IFF_UNICAST_FLT;
 	dev->netdev_ops		= &macvlan_netdev_ops;
-	dev->destructor		= free_netdev;
-	dev->header_ops		= &macvlan_hard_header_ops,
+	dev->extended->needs_free_netdev	= true;
+	dev->header_ops		= &macvlan_hard_header_ops;
 	dev->ethtool_ops	= &macvlan_ethtool_ops;
 }
 EXPORT_SYMBOL_GPL(macvlan_common_setup);

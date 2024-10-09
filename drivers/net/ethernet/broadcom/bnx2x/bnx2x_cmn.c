@@ -3225,7 +3225,7 @@ static int bnx2x_poll(struct napi_struct *napi, int budget)
 		 * has been updated when NAPI was scheduled.
 		 */
 		if (IS_FCOE_FP(fp)) {
-			napi_complete(napi);
+			napi_complete_done(napi, rx_work_done);
 		} else {
 			bnx2x_update_fpsb_idx(fp);
 			/* bnx2x_has_rx_work() reads the status block,
@@ -3244,13 +3244,14 @@ static int bnx2x_poll(struct napi_struct *napi, int budget)
 			rmb();
 
 			if (!(bnx2x_has_rx_work(fp) || bnx2x_has_tx_work(fp))) {
-				napi_complete_done(napi, rx_work_done);
-				/* Re-enable interrupts */
-				DP(NETIF_MSG_RX_STATUS,
-				   "Update index to %d\n", fp->fp_hc_idx);
-				bnx2x_ack_sb(bp, fp->igu_sb_id, USTORM_ID,
-					     le16_to_cpu(fp->fp_hc_idx),
-					     IGU_INT_ENABLE, 1);
+				if (napi_complete_done(napi, rx_work_done)) {
+					/* Re-enable interrupts */
+					DP(NETIF_MSG_RX_STATUS,
+					   "Update index to %d\n", fp->fp_hc_idx);
+					bnx2x_ack_sb(bp, fp->igu_sb_id, USTORM_ID,
+						     le16_to_cpu(fp->fp_hc_idx),
+						     IGU_INT_ENABLE, 1);
+				}
 			} else {
 				rx_work_done = budget;
 			}
@@ -4283,12 +4284,17 @@ int bnx2x_setup_tc(struct net_device *dev, u8 num_tc)
 	return 0;
 }
 
-int __bnx2x_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
-		     struct tc_to_netdev *tc)
+int __bnx2x_setup_tc(struct net_device *dev, enum tc_setup_type type,
+		     void *type_data)
 {
-	if (tc->type != TC_SETUP_MQPRIO)
-		return -EINVAL;
-	return bnx2x_setup_tc(dev, tc->tc);
+	struct tc_mqprio_qopt *mqprio = type_data;
+
+	if (type != TC_SETUP_MQPRIO)
+		return -EOPNOTSUPP;
+
+	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+
+	return bnx2x_setup_tc(dev, mqprio->num_tc);
 }
 
 /* called with rtnl_lock */
@@ -4860,12 +4866,6 @@ int bnx2x_change_mtu(struct net_device *dev, int new_mtu)
 	if (bp->recovery_state != BNX2X_RECOVERY_DONE) {
 		BNX2X_ERR("Can't perform change MTU during parity recovery\n");
 		return -EAGAIN;
-	}
-
-	if ((new_mtu > ETH_MAX_JUMBO_PACKET_SIZE) ||
-	    (new_mtu < ETH_MIN_PACKET_SIZE)) {
-		BNX2X_ERR("Can't support requested MTU size\n");
-		return -EINVAL;
 	}
 
 	/* This does not race with packet allocation

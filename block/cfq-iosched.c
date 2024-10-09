@@ -2335,7 +2335,7 @@ static int cfq_merge(struct request_queue *q, struct request **req,
 	struct request *__rq;
 
 	__rq = cfq_find_rq_fmerge(cfqd, bio);
-	if (__rq && elv_rq_merge_ok(__rq, bio)) {
+	if (__rq && elv_bio_merge_ok(__rq, bio)) {
 		*req = __rq;
 		return ELEVATOR_FRONT_MERGE;
 	}
@@ -2392,8 +2392,8 @@ cfq_merged_requests(struct request_queue *q, struct request *rq,
 		cfq_del_cfqq_rr(cfqd, cfqq);
 }
 
-static int cfq_allow_merge(struct request_queue *q, struct request *rq,
-			   struct bio *bio)
+static int cfq_allow_bio_merge(struct request_queue *q, struct request *rq,
+			       struct bio *bio)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct cfq_io_cq *cic;
@@ -2415,6 +2415,12 @@ static int cfq_allow_merge(struct request_queue *q, struct request *rq,
 
 	cfqq = cic_to_cfqq(cic, cfq_bio_sync(bio));
 	return cfqq == RQ_CFQQ(rq);
+}
+
+static int cfq_allow_rq_merge(struct request_queue *q, struct request *rq,
+			      struct request *next)
+{
+	return RQ_CFQQ(rq) == RQ_CFQQ(next);
 }
 
 static inline void cfq_del_timer(struct cfq_data *cfqd, struct cfq_queue *cfqq)
@@ -2758,10 +2764,12 @@ static void cfq_arm_slice_timer(struct cfq_data *cfqd)
 	 */
 	if (sample_valid(cic->ttime.ttime_samples) &&
 	    (cfqq->slice_end - jiffies < cic->ttime.ttime_mean)) {
+		gmb();
 		cfq_log_cfqq(cfqd, cfqq, "Not idling. think_time:%lu",
 			     cic->ttime.ttime_mean);
 		return;
 	}
+	gmb();
 
 	/* There are other queues in the group, don't do group idle */
 	if (group_idle && cfqq->cfqg->nr_cfqq > 1)
@@ -4576,7 +4584,6 @@ static struct elevator_type iosched_cfq = {
 		.elevator_merge_fn = 		cfq_merge,
 		.elevator_merged_fn =		cfq_merged_request,
 		.elevator_merge_req_fn =	cfq_merged_requests,
-		.elevator_allow_merge_fn =	cfq_allow_merge,
 		.elevator_bio_merged_fn =	cfq_bio_merged,
 		.elevator_dispatch_fn =		cfq_dispatch_requests,
 		.elevator_add_req_fn =		cfq_insert_request,
@@ -4592,7 +4599,6 @@ static struct elevator_type iosched_cfq = {
 		.elevator_may_queue_fn =	cfq_may_queue,
 		.elevator_init_fn =		cfq_init_queue,
 		.elevator_exit_fn =		cfq_exit_queue,
-		.elevator_registered_fn =	cfq_registered_queue,
 	},
 	.icq_size	=	sizeof(struct cfq_io_cq),
 	.icq_align	=	__alignof__(struct cfq_io_cq),
@@ -4615,6 +4621,7 @@ static struct blkcg_policy blkcg_policy_cfq = {
 static int __init cfq_init(void)
 {
 	int ret;
+	struct elevator_type_aux *aux;
 
 	/*
 	 * could be 0 on HZ < 1000 setups
@@ -4643,6 +4650,11 @@ static int __init cfq_init(void)
 	ret = elv_register(&iosched_cfq);
 	if (ret)
 		goto err_free_pool;
+
+	aux = elevator_aux_find(&iosched_cfq);
+	aux->ops.sq.elevator_allow_bio_merge_fn = cfq_allow_bio_merge;
+	aux->ops.sq.elevator_allow_rq_merge_fn = cfq_allow_rq_merge;
+	aux->ops.sq.elevator_registered_fn = cfq_registered_queue;
 
 	return 0;
 

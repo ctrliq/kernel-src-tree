@@ -31,14 +31,7 @@
 #include "l2tp_core.h"
 
 
-static struct genl_family l2tp_nl_family = {
-	.id		= GENL_ID_GENERATE,
-	.name		= L2TP_GENL_NAME,
-	.version	= L2TP_GENL_VERSION,
-	.hdrsize	= 0,
-	.maxattr	= L2TP_ATTR_MAX,
-	.netnsok	= true,
-};
+static struct genl_family l2tp_nl_family;
 
 /* Accessed under genl lock */
 static const struct l2tp_nl_cmd_ops *l2tp_nl_cmd_ops[__L2TP_PWTYPE_MAX];
@@ -879,6 +872,17 @@ static const struct genl_ops l2tp_nl_ops[] = {
 	},
 };
 
+static struct genl_family l2tp_nl_family = {
+	.name		= L2TP_GENL_NAME,
+	.version	= L2TP_GENL_VERSION,
+	.hdrsize	= 0,
+	.maxattr	= L2TP_ATTR_MAX,
+	.netnsok	= true,
+	.module		= THIS_MODULE,
+	.ops		= l2tp_nl_ops,
+	.n_ops		= ARRAY_SIZE(l2tp_nl_ops),
+};
+
 int l2tp_nl_register_ops(enum l2tp_pwtype pw_type, const struct l2tp_nl_cmd_ops *ops)
 {
 	int ret;
@@ -915,7 +919,7 @@ EXPORT_SYMBOL_GPL(l2tp_nl_unregister_ops);
 static int l2tp_nl_init(void)
 {
 	pr_info("L2TP netlink interface\n");
-	return genl_register_family_with_ops(&l2tp_nl_family, l2tp_nl_ops);
+	return genl_register_family(&l2tp_nl_family);
 }
 
 static void l2tp_nl_cleanup(void)

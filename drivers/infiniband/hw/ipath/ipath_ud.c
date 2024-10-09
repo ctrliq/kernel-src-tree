@@ -50,7 +50,7 @@ static void ipath_ud_loopback(struct ipath_qp *sqp, struct ipath_swqe *swqe)
 {
 	struct ipath_ibdev *dev = to_idev(sqp->ibqp.device);
 	struct ipath_qp *qp;
-	struct ib_ah_attr *ah_attr;
+	struct rdma_ah_attr *ah_attr;
 	unsigned long flags;
 	struct ipath_rq *rq;
 	struct ipath_srq *srq;
@@ -216,11 +216,11 @@ static void ipath_ud_loopback(struct ipath_qp *sqp, struct ipath_swqe *swqe)
 	/* XXX do we know which pkey matched? Only needed for GSI. */
 	wc.pkey_index = 0;
 	wc.slid = dev->dd->ipath_lid |
-		(ah_attr->src_path_bits &
+		(rdma_ah_get_path_bits(ah_attr) &
 		 ((1 << dev->dd->ipath_lmc) - 1));
 	wc.sl = ah_attr->sl;
 	wc.dlid_path_bits =
-		ah_attr->dlid & ((1 << dev->dd->ipath_lmc) - 1);
+		rdma_ah_get_dlid(ah_attr) & ((1 << dev->dd->ipath_lmc) - 1);
 	wc.port_num = 1;
 	/* Signal completion event if the solicited bit is set. */
 	ipath_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
@@ -241,7 +241,7 @@ int ipath_make_ud_req(struct ipath_qp *qp)
 {
 	struct ipath_ibdev *dev = to_idev(qp->ibqp.device);
 	struct ipath_other_headers *ohdr;
-	struct ib_ah_attr *ah_attr;
+	struct rdma_ah_attr *ah_attr;
 	struct ipath_swqe *wqe;
 	unsigned long flags;
 	u32 nwords;
@@ -280,14 +280,14 @@ int ipath_make_ud_req(struct ipath_qp *qp)
 
 	/* Construct the header. */
 	ah_attr = &to_iah(wqe->ud_wr.ah)->attr;
-	if (ah_attr->dlid >= IPATH_MULTICAST_LID_BASE) {
-		if (ah_attr->dlid != IPATH_PERMISSIVE_LID)
+	if (rdma_ah_get_dlid(ah_attr) >= IPATH_MULTICAST_LID_BASE) {
+		if (rdma_ah_get_dlid(ah_attr) != IPATH_PERMISSIVE_LID)
 			dev->n_multicast_xmit++;
 		else
 			dev->n_unicast_xmit++;
 	} else {
 		dev->n_unicast_xmit++;
-		lid = ah_attr->dlid & ~((1 << dev->dd->ipath_lmc) - 1);
+		lid = rdma_ah_get_dlid(ah_attr) & ~((1 << dev->dd->ipath_lmc) - 1);
 		if (unlikely(lid == dev->dd->ipath_lid)) {
 			/*
 			 * If DMAs are in progress, we can't generate
@@ -349,12 +349,12 @@ int ipath_make_ud_req(struct ipath_qp *qp)
 	if (qp->ibqp.qp_type == IB_QPT_SMI)
 		lrh0 |= 0xF000;	/* Set VL (see ch. 13.5.3.1) */
 	qp->s_hdr.lrh[0] = cpu_to_be16(lrh0);
-	qp->s_hdr.lrh[1] = cpu_to_be16(ah_attr->dlid);	/* DEST LID */
+	qp->s_hdr.lrh[1] = cpu_to_be16(rdma_ah_get_dlid(ah_attr));	/* DEST LID */
 	qp->s_hdr.lrh[2] = cpu_to_be16(qp->s_hdrwords + nwords +
 					   SIZE_OF_CRC);
 	lid = dev->dd->ipath_lid;
 	if (lid) {
-		lid |= ah_attr->src_path_bits &
+		lid |= rdma_ah_get_path_bits(ah_attr) &
 			((1 << dev->dd->ipath_lmc) - 1);
 		qp->s_hdr.lrh[3] = cpu_to_be16(lid);
 	} else
@@ -368,8 +368,8 @@ int ipath_make_ud_req(struct ipath_qp *qp)
 	/*
 	 * Use the multicast QP if the destination LID is a multicast LID.
 	 */
-	ohdr->bth[1] = ah_attr->dlid >= IPATH_MULTICAST_LID_BASE &&
-		ah_attr->dlid != IPATH_PERMISSIVE_LID ?
+	ohdr->bth[1] = rdma_ah_get_dlid(ah_attr) >= IPATH_MULTICAST_LID_BASE &&
+		rdma_ah_get_dlid(ah_attr) != IPATH_PERMISSIVE_LID ?
 		cpu_to_be32(IPATH_MULTICAST_QPN) :
 		cpu_to_be32(wqe->ud_wr.remote_qpn);
 	ohdr->bth[2] = cpu_to_be32(qp->s_next_psn++ & IPATH_PSN_MASK);

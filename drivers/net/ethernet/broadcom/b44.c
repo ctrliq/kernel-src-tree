@@ -1636,8 +1636,8 @@ static int b44_close(struct net_device *dev)
 	return 0;
 }
 
-static struct rtnl_link_stats64 *b44_get_stats64(struct net_device *dev,
-					struct rtnl_link_stats64 *nstat)
+static void b44_get_stats64(struct net_device *dev,
+			    struct rtnl_link_stats64 *nstat)
 {
 	struct b44 *bp = netdev_priv(dev);
 	struct b44_hw_stats *hwstat = &bp->hw_stats;
@@ -1680,7 +1680,6 @@ static struct rtnl_link_stats64 *b44_get_stats64(struct net_device *dev,
 #endif
 	} while (u64_stats_fetch_retry_irq(&hwstat->syncp, start));
 
-	return nstat;
 }
 
 static int __b44_load_mcast(struct b44 *bp, struct net_device *dev)
@@ -2130,7 +2129,7 @@ static const struct net_device_ops b44_netdev_ops = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_do_ioctl		= b44_ioctl,
 	.ndo_tx_timeout		= b44_tx_timeout,
-	.ndo_change_mtu		= b44_change_mtu,
+	.ndo_change_mtu_rh74	= b44_change_mtu,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= b44_poll_controller,
 #endif

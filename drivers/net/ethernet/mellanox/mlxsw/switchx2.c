@@ -382,7 +382,7 @@ static int mlxsw_sx_port_change_mtu(struct net_device *dev, int mtu)
 	return 0;
 }
 
-static struct rtnl_link_stats64 *
+static void
 mlxsw_sx_port_get_stats64(struct net_device *dev,
 			  struct rtnl_link_stats64 *stats)
 {
@@ -411,7 +411,6 @@ mlxsw_sx_port_get_stats64(struct net_device *dev,
 		tx_dropped	+= p->tx_dropped;
 	}
 	stats->tx_dropped	= tx_dropped;
-	return stats;
 }
 
 static int mlxsw_sx_port_get_phys_port_name(struct net_device *dev, char *name,
@@ -432,7 +431,7 @@ static const struct net_device_ops mlxsw_sx_port_netdev_ops = {
 	.ndo_open		= mlxsw_sx_port_open,
 	.ndo_stop		= mlxsw_sx_port_stop,
 	.ndo_start_xmit		= mlxsw_sx_port_xmit,
-	.ndo_change_mtu		= mlxsw_sx_port_change_mtu,
+	.extended.ndo_change_mtu = mlxsw_sx_port_change_mtu,
 	.ndo_get_stats64	= mlxsw_sx_port_get_stats64,
 	.extended.ndo_get_phys_port_name = mlxsw_sx_port_get_phys_port_name,
 };
@@ -1085,6 +1084,9 @@ static int __mlxsw_sx_port_eth_create(struct mlxsw_sx *mlxsw_sx, u8 local_port,
 
 	dev->features |= NETIF_F_NETNS_LOCAL | NETIF_F_LLTX | NETIF_F_SG |
 			 NETIF_F_VLAN_CHALLENGED;
+
+	dev->extended->min_mtu = 0;
+	dev->extended->max_mtu = ETH_MAX_MTU;
 
 	/* Each packet needs to have a Tx header (metadata) on top all other
 	 * headers.

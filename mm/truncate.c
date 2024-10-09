@@ -24,20 +24,12 @@
 #include <linux/rmap.h>
 #include "internal.h"
 
-static void clear_exceptional_entry(struct address_space *mapping,
-				    pgoff_t index, void *entry)
+static void clear_shadow_entry(struct address_space *mapping, pgoff_t index,
+			       void *entry)
 {
 	struct radix_tree_node *node;
 	void **slot;
 
-	/* Handled by shmem itself */
-	if (shmem_mapping(mapping))
-		return;
-
-	if (dax_mapping(mapping)) {
-		dax_delete_mapping_entry(mapping, index);
-		return;
-	}
 	spin_lock_irq(&mapping->tree_lock);
 	/*
 	 * Regular page slots are stabilized by the page lock even
@@ -70,6 +62,53 @@ unlock:
 	spin_unlock_irq(&mapping->tree_lock);
 }
 
+/*
+ * Unconditionally remove exceptional entry. Usually called from truncate path.
+ */
+static void truncate_exceptional_entry(struct address_space *mapping,
+				       pgoff_t index, void *entry)
+{
+	/* Handled by shmem itself */
+	if (shmem_mapping(mapping))
+		return;
+
+	if (dax_mapping(mapping)) {
+		dax_delete_mapping_entry(mapping, index);
+		return;
+	}
+	clear_shadow_entry(mapping, index, entry);
+}
+
+/*
+ * Invalidate exceptional entry if easily possible. This handles exceptional
+ * entries for invalidate_inode_pages().
+ */
+static int invalidate_exceptional_entry(struct address_space *mapping,
+					pgoff_t index, void *entry)
+{
+	/* Handled by shmem itself, or for DAX we do nothing. */
+	if (shmem_mapping(mapping) || dax_mapping(mapping))
+		return 1;
+	clear_shadow_entry(mapping, index, entry);
+	return 1;
+}
+
+/*
+ * Invalidate exceptional entry if clean. This handles exceptional entries for
+ * invalidate_inode_pages2() so for DAX it evicts only clean entries.
+ */
+static int invalidate_exceptional_entry2(struct address_space *mapping,
+					 pgoff_t index, void *entry)
+{
+	/* Handled by shmem itself */
+	if (shmem_mapping(mapping))
+		return 1;
+	if (dax_mapping(mapping))
+		return dax_invalidate_mapping_entry_sync(mapping, index);
+	clear_shadow_entry(mapping, index, entry);
+	return 1;
+}
+
 /**
  * do_invalidatepage - invalidate part or all of a page
  * @page: the page which is affected
@@ -84,43 +123,45 @@ unlock:
  * point.  Because the caller is about to free (and possibly reuse) those
  * blocks on-disk.
  *
- * XXX old ->invalidatepage method, no length arg
+ * New _range variant here, old ->invalidatepage method, no length arg follows
  */
-void _do_invalidatepage(struct page *page, unsigned long offset)
-{
-	void (*invalidatepage)(struct page *, unsigned long);
-	invalidatepage = page->mapping->a_ops->invalidatepage;
-#ifdef CONFIG_BLOCK
-	if (!invalidatepage)
-		invalidatepage = block_invalidatepage;
-#endif
-	if (invalidatepage)
-		(*invalidatepage)(page, offset);
-}
-
-void do_invalidatepage(struct page *page, unsigned long offset)
-{
-
-	if (inode_has_invalidate_range(page->mapping->host))
-		do_invalidatepage_range(page, (unsigned int) offset,
-					PAGE_CACHE_SIZE - offset);
-	else
-		_do_invalidatepage(page, offset);
-}
-
-/* XXX new ->invalidatepage_range method, new length arg */
 void do_invalidatepage_range(struct page *page, unsigned int offset,
 			     unsigned int length)
 {
-	void (*invalidatepage_range)(struct page *, unsigned int, unsigned int);
+	void (*invalidatepage_range)(struct page *, unsigned int, unsigned int) = NULL;
+	void (*invalidatepage)(struct page *, unsigned long) = NULL;
 
-	invalidatepage_range = page->mapping->a_ops->invalidatepage_range;
+	/*
+	 * It's only safe to test the kabi-hidden/extended ->invalidatepage_range
+	 * if the special superblock flag is set.
+	 */
+	if (inode_has_invalidate_range(page->mapping->host))
+		invalidatepage_range = page->mapping->a_ops->invalidatepage_range;
+	else
+		invalidatepage = page->mapping->a_ops->invalidatepage;
+
 #ifdef CONFIG_BLOCK
-	if (!invalidatepage_range)
+	if (!invalidatepage_range && !invalidatepage)
 		invalidatepage_range = block_invalidatepage_range;
 #endif
+
+	/*
+	 * use invalidatepage_range (either from mapping or default block f'n)
+	 * if present, otherwise use the mapping's ->invalidatepage, which
+	 * can only handle page-aligned end
+	 */
 	if (invalidatepage_range)
 		(*invalidatepage_range)(page, offset, length);
+	else if (invalidatepage) {
+		BUG_ON(length != PAGE_CACHE_SIZE - offset);
+		(*invalidatepage)(page, offset);
+	}
+}
+
+/* XXX old ->invalidatepage method, no length arg */
+void do_invalidatepage(struct page *page, unsigned long offset)
+{
+	do_invalidatepage_range(page, offset, PAGE_CACHE_SIZE - offset);
 }
 
 /*
@@ -289,8 +330,6 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	/* Offsets within partial pages */
 	partial_start = lstart & (PAGE_CACHE_SIZE - 1);
 	partial_end = (lend + 1) & (PAGE_CACHE_SIZE - 1);
-	if (!inode_has_invalidate_range(mapping->host))
-		BUG_ON(partial_end);
 
 	/*
 	 * 'start' and 'end' always covers the range of pages to be fully
@@ -324,7 +363,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
 				break;
 
 			if (radix_tree_exceptional_entry(page)) {
-				clear_exceptional_entry(mapping, index, page);
+				truncate_exceptional_entry(mapping, index,
+							   page);
 				continue;
 			}
 
@@ -358,12 +398,9 @@ void truncate_inode_pages_range(struct address_space *mapping,
 			zero_user_segment(page, partial_start, top);
 			cleancache_invalidate_page(mapping, page);
 			if (page_has_private(page)) {
-				if (inode_has_invalidate_range(mapping->host))
-					do_invalidatepage_range(page,
-							partial_start,
-							top - partial_start);
-				else
-					do_invalidatepage(page, partial_start);
+				do_invalidatepage_range(page,
+						partial_start,
+						top - partial_start);
 			}
 			unlock_page(page);
 			page_cache_release(page);
@@ -415,7 +452,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
 				break;
 
 			if (radix_tree_exceptional_entry(page)) {
-				clear_exceptional_entry(mapping, index, page);
+				truncate_exceptional_entry(mapping, index,
+							   page);
 				continue;
 			}
 
@@ -536,7 +574,8 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 				break;
 
 			if (radix_tree_exceptional_entry(page)) {
-				clear_exceptional_entry(mapping, index, page);
+				invalidate_exceptional_entry(mapping, index,
+							     page);
 				continue;
 			}
 
@@ -645,7 +684,9 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
 				break;
 
 			if (radix_tree_exceptional_entry(page)) {
-				clear_exceptional_entry(mapping, index, page);
+				if (!invalidate_exceptional_entry2(mapping,
+								   index, page))
+					ret = -EBUSY;
 				continue;
 			}
 
@@ -692,6 +733,18 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
 		cond_resched();
 		index++;
 	}
+	/*
+	 * For DAX we invalidate page tables after invalidating radix tree.  We
+	 * could invalidate page tables while invalidating each entry however
+	 * that would be expensive. And doing range unmapping before doesn't
+	 * work as we have no cheap way to find whether radix tree entry didn't
+	 * get remapped later.
+	 */
+	if (dax_mapping(mapping)) {
+		unmap_mapping_range(mapping, (loff_t)start << PAGE_SHIFT,
+				    (loff_t)(end - start + 1) << PAGE_SHIFT, 0);
+	}
+
 	cleancache_invalidate_inode(mapping);
 	return ret;
 }

@@ -59,7 +59,7 @@ static int do_setup_msi_irqs(struct pci_dev *dev, int nvec)
 
 	msidesc = list_entry(dev->msi_list.next, struct msi_desc, list);
 
-	irq = irq_alloc_hwirqs(nvec, dev_to_node(&dev->dev));
+	irq = irq_alloc_hwirqs_affinity(nvec, dev_to_node(&dev->dev), msidesc->affinity);
 	if (irq == 0)
 		return -ENOSPC;
 
@@ -106,7 +106,7 @@ static int do_setup_msix_irqs(struct pci_dev *dev, int nvec)
 
 	list_for_each_entry(msidesc, &dev->msi_list, list) {
 
-		irq = irq_alloc_hwirq(node);
+		irq = irq_alloc_hwirq_affinity(node, msidesc->affinity);
 		if (irq == 0)
 			return -1;
 

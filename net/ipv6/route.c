@@ -1433,7 +1433,7 @@ void ip6_update_pmtu(struct sk_buff *skb, struct net *net, __be32 mtu,
 
 	memset(&fl6, 0, sizeof(fl6));
 	fl6.flowi6_oif = oif;
-	fl6.flowi6_mark = mark;
+	fl6.flowi6_mark = mark ? mark : IP6_REPLY_MARK(net, skb->mark);
 	fl6.flowi6_flags = 0;
 	fl6.daddr = iph->daddr;
 	fl6.saddr = iph->saddr;
@@ -2746,6 +2746,7 @@ static const struct nla_policy rtm_ipv6_policy[RTA_MAX+1] = {
 	[RTA_PRIORITY]          = { .type = NLA_U32 },
 	[RTA_METRICS]           = { .type = NLA_NESTED },
 	[RTA_MULTIPATH]		= { .len = sizeof(struct rtnexthop) },
+	[RTA_PREF]		= { .type = NLA_U8 },
 	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
 	[RTA_ENCAP]		= { .type = NLA_NESTED },
 	[RTA_EXPIRES]           = { .type = NLA_U32 },
@@ -2756,6 +2757,7 @@ static int rtm_to_fib6_config(struct sk_buff *skb, struct nlmsghdr *nlh,
 {
 	struct rtmsg *rtm;
 	struct nlattr *tb[RTA_MAX+1];
+	unsigned int pref;
 	int err;
 
 	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, rtm_ipv6_policy);
@@ -2832,6 +2834,14 @@ static int rtm_to_fib6_config(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (tb[RTA_MULTIPATH]) {
 		cfg->fc_mp = nla_data(tb[RTA_MULTIPATH]);
 		cfg->fc_mp_len = nla_len(tb[RTA_MULTIPATH]);
+	}
+
+	if (tb[RTA_PREF]) {
+		pref = nla_get_u8(tb[RTA_PREF]);
+		if (pref != ICMPV6_ROUTER_PREF_LOW &&
+		    pref != ICMPV6_ROUTER_PREF_HIGH)
+			pref = ICMPV6_ROUTER_PREF_MEDIUM;
+		cfg->fc_flags |= RTF_PREF(pref);
 	}
 
 	if (tb[RTA_EXPIRES]) {
@@ -3087,6 +3097,7 @@ static inline size_t rt6_nlmsg_size(struct rt6_info *rt)
 	       + RTAX_MAX * nla_total_size(4) /* RTA_METRICS */
 	       + nla_total_size(sizeof(struct rta_cacheinfo))
 	       + nla_total_size(TCP_CA_NAME_MAX)  /* RTAX_CC_ALGO */
+	       + nla_total_size(1) /* RTA_PREF */
 	       + lwtunnel_get_encap_size(rt->dst.lwtstate);
 }
 
@@ -3221,6 +3232,9 @@ static int rt6_fill_node(struct net *net,
 			goto nla_put_failure;
 	}
 
+	if (rt->rt6i_nh_flags & RTNH_F_OFFLOAD)
+		rtm->rtm_flags |= RTNH_F_OFFLOAD;
+
 	if (rt->dst.dev &&
 	    nla_put_u32(skb, RTA_OIF, rt->dst.dev->ifindex))
 		goto nla_put_failure;
@@ -3230,6 +3244,9 @@ static int rt6_fill_node(struct net *net,
 	expires = (rt->rt6i_flags & RTF_EXPIRES) ? rt->dst.expires - jiffies : 0;
 
 	if (rtnl_put_cacheinfo(skb, &rt->dst, 0, expires, rt->dst.error) < 0)
+		goto nla_put_failure;
+
+	if (nla_put_u8(skb, RTA_PREF, IPV6_EXTRACT_PREF(rt->rt6i_flags)))
 		goto nla_put_failure;
 
 	lwtunnel_fill_encap(skb, rt->dst.lwtstate);
@@ -3275,6 +3292,8 @@ static int inet6_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr* nlh)
 
 	err = -EINVAL;
 	memset(&fl6, 0, sizeof(fl6));
+	rtm = nlmsg_data(nlh);
+	fl6.flowlabel = ip6_make_flowinfo(rtm->rtm_tos, 0);
 
 	if (tb[RTA_SRC]) {
 		if (nla_len(tb[RTA_SRC]) < sizeof(struct in6_addr))

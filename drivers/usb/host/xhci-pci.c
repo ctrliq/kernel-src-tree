@@ -52,6 +52,7 @@
 #define PCI_DEVICE_ID_INTEL_BROXTON_M_XHCI		0x0aa8
 #define PCI_DEVICE_ID_INTEL_BROXTON_B_XHCI		0x1aa8
 #define PCI_DEVICE_ID_INTEL_APL_XHCI			0x5aa8
+#define PCI_DEVICE_ID_ASMEDIA_1042A_XHCI		0x1142
 
 static const char hcd_name[] = "xhci_hcd";
 
@@ -198,6 +199,10 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
 	if (pdev->vendor == PCI_VENDOR_ID_ASMEDIA &&
 			pdev->device == 0x1042)
 		xhci->quirks |= XHCI_BROKEN_STREAMS;
+
+	if (pdev->vendor == PCI_VENDOR_ID_ASMEDIA &&
+		pdev->device == PCI_DEVICE_ID_ASMEDIA_1042A_XHCI)
+		xhci->quirks |= XHCI_ASMEDIA_MODIFY_FLOWCONTROL;
 
 	if (xhci->quirks & XHCI_RESET_ON_RESUME)
 		xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,

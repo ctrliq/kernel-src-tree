@@ -7,6 +7,8 @@
  */
 
 #include <drm/drm_backport.h>
+#include <drm/drmP.h>
+#include <linux/slab.h>
 
 /*
  * shrinker
@@ -42,6 +44,21 @@ void unregister_shrinker2(struct shrinker2 *s2)
 	unregister_shrinker(&s2->compat);
 }
 EXPORT_SYMBOL(unregister_shrinker2);
+
+#if IS_ENABLED(CONFIG_SWIOTLB)
+#  include <linux/dma-direction.h>
+#  include <linux/swiotlb.h>
+#endif
+
+unsigned int swiotlb_max_size(void)
+{
+#if IS_ENABLED(CONFIG_SWIOTLB)
+	return rounddown(swiotlb_nr_tbl() << IO_TLB_SHIFT, PAGE_SIZE);
+#else
+	return 0;
+#endif
+}
+EXPORT_SYMBOL(swiotlb_max_size);
 
 int __init drm_backport_init(void)
 {

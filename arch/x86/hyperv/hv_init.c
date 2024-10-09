@@ -21,16 +21,112 @@
 #include <asm/hypervisor.h>
 #include <asm/hyperv.h>
 #include <asm/mshyperv.h>
+#include <asm/fixmap.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
+#include <linux/clockchips.h>
+#include <linux/hyperv.h>
+#include <linux/slab.h>
+#include <linux/cpu.h>
+#include <linux/kaiser.h>
 
-static void *hypercall_pg;
+#ifdef CONFIG_HYPERV_TSCPAGE
+
+static struct ms_hyperv_tsc_page *tsc_pg;
+
+struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
+{
+	return tsc_pg;
+}
+
+static u64 read_hv_clock_tsc(struct clocksource *arg)
+{
+	u64 current_tick = hv_read_tsc_page(tsc_pg);
+
+	if (current_tick == U64_MAX)
+		rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
+
+	return current_tick;
+}
+
+static struct clocksource hyperv_cs_tsc = {
+		.name		= "hyperv_clocksource_tsc_page",
+		.rating		= 400,
+		.read		= read_hv_clock_tsc,
+		.mask		= CLOCKSOURCE_MASK(64),
+		.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+};
+#endif
+
+static u64 read_hv_clock_msr(struct clocksource *arg)
+{
+	u64 current_tick;
+	/*
+	 * Read the partition counter to get the current tick count. This count
+	 * is set to 0 when the partition is created and is incremented in
+	 * 100 nanosecond units.
+	 */
+	rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
+	return current_tick;
+}
+
+static struct clocksource hyperv_cs_msr = {
+	.name		= "hyperv_clocksource_msr",
+	.rating		= 400,
+	.read		= read_hv_clock_msr,
+	.mask		= CLOCKSOURCE_MASK(64),
+	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+};
+
+void *hv_hypercall_pg;
+EXPORT_SYMBOL_GPL(hv_hypercall_pg);
+struct clocksource *hyperv_cs;
+EXPORT_SYMBOL_GPL(hyperv_cs);
+
+u32 *hv_vp_index;
+EXPORT_SYMBOL_GPL(hv_vp_index);
+
+u32 hv_max_vp_index;
+
+static void hv_cpu_init(void *arg)
+{
+	u64 msr_vp_index;
+
+	hv_get_vp_index(msr_vp_index);
+
+	hv_vp_index[smp_processor_id()] = msr_vp_index;
+
+	if (msr_vp_index > hv_max_vp_index)
+		hv_max_vp_index = msr_vp_index;
+}
+
+/* RHEL-only: old CPUHP infrastructure */
+static int hv_newcpu_cb(struct notifier_block *nfb,
+			unsigned long action, void *hcpu)
+{
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_STARTING:
+		hv_cpu_init(hcpu);
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block hv_newcpu_notifier __refdata = {
+       .notifier_call = hv_newcpu_cb,
+       .priority = INT_MAX,
+};
+
 /*
  * This function is to be invoked early in the boot sequence after the
  * hypervisor has been detected.
  *
  * 1. Setup the hypercall page.
+ * 2. Register Hyper-V specific clocksource.
  */
 void hyperv_init(void)
 {
@@ -40,6 +136,17 @@ void hyperv_init(void)
 	if (x86_hyper != &x86_hyper_ms_hyperv)
 		return;
 
+	/* Allocate percpu VP index */
+	hv_vp_index = kmalloc_array(num_possible_cpus(), sizeof(*hv_vp_index),
+				    GFP_KERNEL);
+	if (!hv_vp_index)
+		return;
+
+	cpu_notifier_register_begin();
+	on_each_cpu(hv_cpu_init, NULL, 1);
+	__register_hotcpu_notifier(&hv_newcpu_notifier);
+	cpu_notifier_register_done();
+
 	/*
 	 * Setup the hypercall page and enable hypercalls.
 	 * 1. Register the guest ID
@@ -48,59 +155,126 @@ void hyperv_init(void)
 	guest_id = generate_guest_id(0, LINUX_VERSION_CODE, 0);
 	wrmsrl(HV_X64_MSR_GUEST_OS_ID, guest_id);
 
-	hypercall_pg  = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL_RX);
-	if (hypercall_pg == NULL) {
+	hv_hypercall_pg  = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL_RX);
+	if (hv_hypercall_pg == NULL) {
 		wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
-		return;
+		goto free_vp_index;
 	}
 
 	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
 	hypercall_msr.enable = 1;
-	hypercall_msr.guest_physical_address = vmalloc_to_pfn(hypercall_pg);
+	hypercall_msr.guest_physical_address = vmalloc_to_pfn(hv_hypercall_pg);
 	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+
+	hyper_alloc_mmu();
+
+	/*
+	 * Register Hyper-V specific clocksource.
+	 */
+#ifdef CONFIG_HYPERV_TSCPAGE
+	if (ms_hyperv.features & HV_X64_MSR_REFERENCE_TSC_AVAILABLE) {
+		union hv_x64_msr_hypercall_contents tsc_msr;
+
+		tsc_pg = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL);
+		if (!tsc_pg)
+			goto register_msr_cs;
+
+		hyperv_cs = &hyperv_cs_tsc;
+
+		rdmsrl(HV_X64_MSR_REFERENCE_TSC, tsc_msr.as_uint64);
+
+		tsc_msr.enable = 1;
+		tsc_msr.guest_physical_address = vmalloc_to_pfn(tsc_pg);
+
+		wrmsrl(HV_X64_MSR_REFERENCE_TSC, tsc_msr.as_uint64);
+
+		__set_fixmap(HVCLOCK_TSC_PAGE,
+			     tsc_msr.guest_physical_address << PAGE_SHIFT,
+			     PAGE_KERNEL_VVAR);
+		kaiser_add_mapping(__fix_to_virt(HVCLOCK_TSC_PAGE), PAGE_SIZE,
+				   __PAGE_KERNEL_VVAR | _PAGE_GLOBAL);
+		/* set fixmap before switching vclock mode */
+		wmb();
+		hyperv_cs_tsc.archdata.vclock_mode = VCLOCK_HVCLOCK;
+
+		clocksource_register_hz(&hyperv_cs_tsc, NSEC_PER_SEC/100);
+		return;
+	}
+register_msr_cs:
+#endif
+	/*
+	 * For 32 bit guests just use the MSR based mechanism for reading
+	 * the partition counter.
+	 */
+
+	hyperv_cs = &hyperv_cs_msr;
+	if (ms_hyperv.features & HV_X64_MSR_TIME_REF_COUNT_AVAILABLE)
+		clocksource_register_hz(&hyperv_cs_msr, NSEC_PER_SEC/100);
+
+	return;
+
+free_vp_index:
+	kfree(hv_vp_index);
+	hv_vp_index = NULL;
 }
 
 /*
- * hv_do_hypercall- Invoke the specified hypercall
+ * This routine is called before kexec/kdump, it does the required cleanup.
  */
-u64 hv_do_hypercall(u64 control, void *input, void *output)
+void hyperv_cleanup(void)
 {
-	u64 input_address = (input) ? virt_to_phys(input) : 0;
-	u64 output_address = (output) ? virt_to_phys(output) : 0;
-#ifdef CONFIG_X86_64
-	u64 hv_status = 0;
+	union hv_x64_msr_hypercall_contents hypercall_msr;
 
-	if (!hypercall_pg)
-		return (u64)ULLONG_MAX;
+	/* Reset our OS id */
+	wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
 
-	__asm__ __volatile__("mov %0, %%r8" : : "r" (output_address) : "r8");
-	__asm__ __volatile__("call *%3" : "=a" (hv_status) :
-			     "c" (control), "d" (input_address),
-			     "m" (hypercall_pg));
+	/* Reset the hypercall page */
+	hypercall_msr.as_uint64 = 0;
+	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
 
-	return hv_status;
-
-#else
-
-	u32 control_hi = control >> 32;
-	u32 control_lo = control & 0xFFFFFFFF;
-	u32 hv_status_hi = 1;
-	u32 hv_status_lo = 1;
-	u32 input_address_hi = input_address >> 32;
-	u32 input_address_lo = input_address & 0xFFFFFFFF;
-	u32 output_address_hi = output_address >> 32;
-	u32 output_address_lo = output_address & 0xFFFFFFFF;
-
-	if (!hypercall_pg)
-		return (u64)ULLONG_MAX;
-
-	__asm__ __volatile__ ("call *%8" : "=d"(hv_status_hi),
-			      "=a"(hv_status_lo) : "d" (control_hi),
-			      "a" (control_lo), "b" (input_address_hi),
-			      "c" (input_address_lo), "D"(output_address_hi),
-			      "S"(output_address_lo), "m" (hypercall_pg));
-
-	return hv_status_lo | ((u64)hv_status_hi << 32);
-#endif /* !x86_64 */
+	/* Reset the TSC page */
+	hypercall_msr.as_uint64 = 0;
+	wrmsrl(HV_X64_MSR_REFERENCE_TSC, hypercall_msr.as_uint64);
 }
-EXPORT_SYMBOL_GPL(hv_do_hypercall);
+EXPORT_SYMBOL_GPL(hyperv_cleanup);
+
+void hyperv_report_panic(struct pt_regs *regs)
+{
+	static bool panic_reported;
+
+	/*
+	 * We prefer to report panic on 'die' chain as we have proper
+	 * registers to report, but if we miss it (e.g. on BUG()) we need
+	 * to report it on 'panic'.
+	 */
+	if (panic_reported)
+		return;
+	panic_reported = true;
+
+	wrmsrl(HV_X64_MSR_CRASH_P0, regs->ip);
+	wrmsrl(HV_X64_MSR_CRASH_P1, regs->ax);
+	wrmsrl(HV_X64_MSR_CRASH_P2, regs->bx);
+	wrmsrl(HV_X64_MSR_CRASH_P3, regs->cx);
+	wrmsrl(HV_X64_MSR_CRASH_P4, regs->dx);
+
+	/*
+	 * Let Hyper-V know there is crash data available
+	 */
+	wrmsrl(HV_X64_MSR_CRASH_CTL, HV_CRASH_CTL_CRASH_NOTIFY);
+}
+EXPORT_SYMBOL_GPL(hyperv_report_panic);
+
+bool hv_is_hypercall_page_setup(void)
+{
+	union hv_x64_msr_hypercall_contents hypercall_msr;
+
+	/* Check if the hypercall page is setup */
+	hypercall_msr.as_uint64 = 0;
+	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+
+	if (!hypercall_msr.enable)
+		return false;
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(hv_is_hypercall_page_setup);

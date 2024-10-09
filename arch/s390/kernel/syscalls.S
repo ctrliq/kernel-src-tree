@@ -356,9 +356,9 @@ SYSCALL(sys_finit_module,sys_finit_module,sys_finit_module_wrapper)
 SYSCALL(sys_sched_setattr,sys_sched_setattr,sys_sched_setattr_wrapper) /* 345 */
 SYSCALL(sys_sched_getattr,sys_sched_getattr,sys_sched_getattr_wrapper)
 NI_SYSCALL					/* 347 sys_renameat2 */
-NI_SYSCALL					/* 348 sys_seccomp */
+SYSCALL(sys_seccomp,sys_seccomp,sys_seccomp_wrapper)
 SYSCALL(sys_getrandom,sys_getrandom,sys_getrandom_wrapper)
-NI_SYSCALL					/* 350 sys_memfd_create */
+SYSCALL(sys_memfd_create,sys_memfd_create,sys_memfd_create_wrapper) /* 350 */
 NI_SYSCALL					/* 351 sys_bpf */
 SYSCALL(sys_ni_syscall,sys_s390_pci_mmio_write,sys_s390_pci_mmio_write_wrapper)
 SYSCALL(sys_ni_syscall,sys_s390_pci_mmio_read,sys_s390_pci_mmio_read_wrapper)
@@ -367,20 +367,23 @@ NI_SYSCALL					/* 355 sys_userfaultfd */
 NI_SYSCALL					/* 356 sys_membarrier */
 NI_SYSCALL					/* 357 sys_recvmmsg */
 NI_SYSCALL					/* 358 sys_sendmmsg */
-NI_SYSCALL					/* 359 sys_socket */
+SYSCALL(sys_socket,sys_socket,sys_socket)
 NI_SYSCALL					/* 360 sys_socketpair */
-NI_SYSCALL					/* 361 sys_bind */
-NI_SYSCALL					/* 362 sys_connect */
+SYSCALL(sys_bind,sys_bind,sys_bind_wrapper)
+SYSCALL(sys_connect,sys_connect,sys_connect_wrapper)
 NI_SYSCALL					/* 363 sys_listen */
 NI_SYSCALL					/* 364 sys_accept4 */
-NI_SYSCALL					/* 365 sys_getsockopt */
-NI_SYSCALL					/* 366 sys_setsockopt */
+SYSCALL(sys_getsockopt,compat_sys_getsockopt,sys_getsockopt_wrapper)	/* 365 */
+SYSCALL(sys_setsockopt,compat_sys_setsockopt,sys_setsockopt_wrapper)
 NI_SYSCALL					/* 367 sys_getsockname */
 NI_SYSCALL					/* 368 sys_getpeername */
-NI_SYSCALL					/* 369 sys_sendto */
-NI_SYSCALL					/* 370 sys_sendmsg */
-NI_SYSCALL					/* 371 sys_recvfrom */
-NI_SYSCALL					/* 372 sys_recvmsg */
-NI_SYSCALL					/* 373 sys_shutdown */
+SYSCALL(sys_sendto,sys_sendto,sys_sendto_wrapper)
+SYSCALL(sys_sendmsg,sys_sendmsg,sys_sendmsg_wrapper)	/* 370 */
+SYSCALL(sys_recvfrom,sys_recvfrom,sys_recvfrom_wrapper)
+SYSCALL(sys_recvmsg,sys_recvmsg,sys_recvmsg_wrapper)
+SYSCALL(sys_shutdown,sys_shutdown,sys_shutdown)
 NI_SYSCALL					/* 374 sys_mlock2 */
 SYSCALL(sys_copy_file_range,sys_copy_file_range,sys_copy_file_range_wrapper) /* 375 */
+NI_SYSCALL
+NI_SYSCALL
+SYSCALL(sys_s390_guarded_storage,sys_s390_guarded_storage,sys_s390_guarded_storage_wrapper) /* 378 */

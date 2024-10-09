@@ -83,4 +83,6 @@ extern struct pci_controller_ops pseries_pci_controller_ops;
 
 unsigned long pseries_memory_block_size(void);
 
+int dlpar_workqueue_init(void);
+
 #endif /* _PSERIES_PSERIES_H */

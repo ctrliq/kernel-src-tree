@@ -306,7 +306,7 @@ static void timesync_onchannelcallback(void *context)
 						fw_versions, FW_VER_COUNT,
 						ts_versions, TS_VER_COUNT,
 						NULL, &ts_srv_version)) {
-				pr_info("TimeSync version %d.%d\n",
+				pr_info("TimeSync IC version %d.%d\n",
 					ts_srv_version >> 16,
 					ts_srv_version & 0xFFFF);
 			}
@@ -372,7 +372,7 @@ static void heartbeat_onchannelcallback(void *context)
 					hb_versions, HB_VER_COUNT,
 					NULL, &hb_srv_version)) {
 
-				pr_info("Heartbeat version %d.%d\n",
+				pr_info("Heartbeat IC version %d.%d\n",
 					hb_srv_version >> 16,
 					hb_srv_version & 0xFFFF);
 			}
@@ -420,8 +420,7 @@ static int util_probe(struct hv_device *dev,
 	 * Turn off batched reading for all util drivers before we open the
 	 * channel.
 	 */
-
-	set_channel_read_state(dev->channel, false);
+	set_channel_read_mode(dev->channel, HV_CALL_DIRECT);
 
 	hv_set_drvdata(dev, srv);
 

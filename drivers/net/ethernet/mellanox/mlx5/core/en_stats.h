@@ -65,6 +65,7 @@ struct mlx5e_sw_stats {
 	u64 rx_csum_none;
 	u64 rx_csum_complete;
 	u64 rx_csum_unnecessary_inner;
+	u64 tx_csum_none;
 	u64 tx_csum_partial;
 	u64 tx_csum_partial_inner;
 	u64 tx_queue_stopped;
@@ -76,10 +77,12 @@ struct mlx5e_sw_stats {
 	u64 rx_buff_alloc_err;
 	u64 rx_cqe_compress_blks;
 	u64 rx_cqe_compress_pkts;
+	u64 rx_page_reuse;
 	u64 rx_cache_reuse;
 	u64 rx_cache_full;
 	u64 rx_cache_empty;
 	u64 rx_cache_busy;
+	u64 rx_cache_waive;
 
 	/* Special handling counters */
 	u64 link_down_events_phy;
@@ -100,6 +103,7 @@ static const struct counter_desc sw_stats_desc[] = {
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_none) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_complete) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_unnecessary_inner) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_none) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_partial) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_partial_inner) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_queue_stopped) },
@@ -111,10 +115,12 @@ static const struct counter_desc sw_stats_desc[] = {
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_buff_alloc_err) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cqe_compress_blks) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cqe_compress_pkts) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_page_reuse) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_reuse) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_full) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_empty) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_busy) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_waive) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, link_down_events_phy) },
 };
 
@@ -299,6 +305,12 @@ static const struct counter_desc pport_eth_ext_stats_desc[] = {
 	MLX5_GET(mpcnt_reg, (pcie_stats)->pcie_perf_counters, \
 		 counter_set.pcie_perf_cntrs_grp_data_layout.c)
 
+#define PCIE_PERF_OFF64(c) \
+	MLX5_BYTE_OFF(mpcnt_reg, counter_set.pcie_perf_cntrs_grp_data_layout.c##_high)
+#define PCIE_PERF_GET64(pcie_stats, c) \
+	MLX5_GET64(mpcnt_reg, (pcie_stats)->pcie_perf_counters, \
+		   counter_set.pcie_perf_cntrs_grp_data_layout.c##_high)
+
 struct mlx5e_pcie_stats {
 	__be64 pcie_perf_counters[MLX5_ST_SZ_QW(mpcnt_reg)];
 };
@@ -306,6 +318,10 @@ struct mlx5e_pcie_stats {
 static const struct counter_desc pcie_perf_stats_desc[] = {
 	{ "rx_pci_signal_integrity", PCIE_PERF_OFF(rx_errors) },
 	{ "tx_pci_signal_integrity", PCIE_PERF_OFF(tx_errors) },
+};
+
+static const struct counter_desc pcie_perf_stats_desc64[] = {
+	{ "outbound_pci_buffer_overflow", PCIE_PERF_OFF64(tx_overflow_buffer_pkt) },
 };
 
 static const struct counter_desc pcie_perf_stall_stats_desc[] = {
@@ -319,6 +335,7 @@ struct mlx5e_rq_stats {
 	u64 packets;
 	u64 bytes;
 	u64 csum_complete;
+	u64 csum_unnecessary;
 	u64 csum_unnecessary_inner;
 	u64 csum_none;
 	u64 lro_packets;
@@ -328,16 +345,19 @@ struct mlx5e_rq_stats {
 	u64 buff_alloc_err;
 	u64 cqe_compress_blks;
 	u64 cqe_compress_pkts;
+	u64 page_reuse;
 	u64 cache_reuse;
 	u64 cache_full;
 	u64 cache_empty;
 	u64 cache_busy;
+	u64 cache_waive;
 };
 
 static const struct counter_desc rq_stats_desc[] = {
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, packets) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, bytes) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_complete) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_unnecessary) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_unnecessary_inner) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_none) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, lro_packets) },
@@ -347,10 +367,12 @@ static const struct counter_desc rq_stats_desc[] = {
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, buff_alloc_err) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cqe_compress_blks) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cqe_compress_pkts) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, page_reuse) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_reuse) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_full) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_empty) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_busy) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_waive) },
 };
 
 struct mlx5e_sq_stats {
@@ -362,6 +384,7 @@ struct mlx5e_sq_stats {
 	u64 tso_bytes;
 	u64 tso_inner_packets;
 	u64 tso_inner_bytes;
+	u64 csum_partial;
 	u64 csum_partial_inner;
 	u64 nop;
 	/* less likely accessed in data path */
@@ -378,6 +401,7 @@ static const struct counter_desc sq_stats_desc[] = {
 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, tso_bytes) },
 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, tso_inner_packets) },
 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, tso_inner_bytes) },
+	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, csum_partial) },
 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, csum_partial_inner) },
 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, nop) },
 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, csum_none) },
@@ -399,6 +423,9 @@ static const struct counter_desc sq_stats_desc[] = {
 #define NUM_PCIE_PERF_COUNTERS(priv) \
 	(ARRAY_SIZE(pcie_perf_stats_desc) * \
 	 MLX5_CAP_MCAM_FEATURE((priv)->mdev, pcie_performance_group))
+#define NUM_PCIE_PERF_COUNTERS64(priv) \
+	(ARRAY_SIZE(pcie_perf_stats_desc64) * \
+	 MLX5_CAP_MCAM_FEATURE((priv)->mdev, tx_overflow_buffer_pkt))
 #define NUM_PCIE_PERF_STALL_COUNTERS(priv) \
 	(ARRAY_SIZE(pcie_perf_stall_stats_desc) * \
 	 MLX5_CAP_MCAM_FEATURE((priv)->mdev, pcie_outbound_stalled))
@@ -417,6 +444,7 @@ static const struct counter_desc sq_stats_desc[] = {
 					 NUM_PPORT_PRIO + \
 					 NUM_PPORT_ETH_EXT_COUNTERS(priv))
 #define NUM_PCIE_COUNTERS(priv)		(NUM_PCIE_PERF_COUNTERS(priv) + \
+					 NUM_PCIE_PERF_COUNTERS64(priv) +\
 					 NUM_PCIE_PERF_STALL_COUNTERS(priv))
 #define NUM_RQ_STATS			ARRAY_SIZE(rq_stats_desc)
 #define NUM_SQ_STATS			ARRAY_SIZE(sq_stats_desc)

@@ -93,6 +93,7 @@ extern void __kprobes kernel_thread_starter(void);
 void exit_thread(void)
 {
 	exit_thread_runtime_instr();
+	exit_thread_gs();
 }
 
 void flush_thread(void)
@@ -139,6 +140,7 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 	memset(&p->thread.per_event, 0, sizeof(p->thread.per_event));
 	clear_tsk_thread_flag(p, TIF_SINGLE_STEP);
 	clear_tsk_thread_flag(p, TIF_PER_TRAP);
+	p->thread.per_flags = 0;
 	/* Initialize per thread user and system timer values */
 	ti = task_thread_info(p);
 	ti->user_timer = 0;
@@ -174,6 +176,9 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 	p->thread.ri_cb = NULL;
 	p->thread.ri_signum = 0;
 	frame->childregs.psw.mask &= ~PSW_MASK_RI;
+	/* Don't copy guarded storage control block */
+	p->thread.gs_cb = NULL;
+	p->thread.gs_bc_cb = NULL;
 
 #ifndef CONFIG_64BIT
 	/*

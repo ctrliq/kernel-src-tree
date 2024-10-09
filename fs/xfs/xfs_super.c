@@ -48,6 +48,7 @@
 #include "xfs_ondisk.h"
 
 #include <linux/namei.h>
+#include <linux/dax.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/mount.h>
@@ -578,7 +579,7 @@ xfs_showargs(
 
 	return 0;
 }
-__uint64_t
+static __uint64_t
 xfs_max_file_offset(
 	unsigned int		blockshift)
 {
@@ -1033,6 +1034,8 @@ xfs_fs_inode_init_once(
 		     "xfsino", ip->i_ino);
 	mrlock_init(&ip->i_lock, MRLOCK_ALLOW_EQUAL_PRI|MRLOCK_BARRIER,
 		     "xfsino", ip->i_ino);
+
+	INIT_LIST_HEAD(&ip->i_wblist);
 }
 
 /*
@@ -1602,10 +1605,6 @@ xfs_fs_fill_super(
 	if (XFS_SB_VERSION_NUM(&mp->m_sb) == XFS_SB_VERSION_5)
 		sb->s_flags |= MS_I_VERSION;
 
-	if (xfs_sb_version_hassparseinodes(&mp->m_sb))
-		xfs_alert(mp,
-	"EXPERIMENTAL sparse inode feature enabled. Use at your own risk!");
-
 	if (mp->m_flags & XFS_MOUNT_DAX) {
 		static bool printed = false;
 
@@ -1710,6 +1709,24 @@ xfs_fs_free_cached_objects(
 	xfs_reclaim_inodes_nr(XFS_M(sb), nr_to_scan);
 }
 
+/* RHEL7-specific super operations for the writeback list */
+static struct list_head *
+xfs_fs_inode_to_wblist(
+	struct inode	*inode)
+{
+	return &XFS_I(inode)->i_wblist;
+}
+
+static struct inode *
+xfs_fs_wblist_to_inode(
+	struct list_head	*pos)
+{
+	struct xfs_inode	*ip;
+
+	ip = list_entry(pos, struct xfs_inode, i_wblist);
+	return VFS_I(ip);
+}
+
 static const struct super_operations xfs_super_operations = {
 	.alloc_inode		= xfs_fs_alloc_inode,
 	.destroy_inode		= xfs_fs_destroy_inode,
@@ -1723,6 +1740,8 @@ static const struct super_operations xfs_super_operations = {
 	.show_options		= xfs_fs_show_options,
 	.nr_cached_objects	= xfs_fs_nr_cached_objects,
 	.free_cached_objects	= xfs_fs_free_cached_objects,
+	.inode_to_wblist	= xfs_fs_inode_to_wblist,
+	.wblist_to_inode	= xfs_fs_wblist_to_inode,
 };
 
 static struct file_system_type xfs_fs_type = {
@@ -1732,7 +1751,7 @@ static struct file_system_type xfs_fs_type = {
 	.kill_sb		= kill_block_super,
 	.fs_flags		= FS_REQUIRES_DEV | FS_HAS_RM_XQUOTA |
 				  FS_HAS_INVALIDATE_RANGE | FS_HAS_DIO_IODONE2 |
-				  FS_HAS_NEXTDQBLK,
+				  FS_HAS_NEXTDQBLK | FS_HAS_WBLIST,
 };
 MODULE_ALIAS_FS("xfs");
 
@@ -1750,7 +1769,7 @@ xfs_init_zones(void)
 		goto out_free_ioend_bioset;
 
 	xfs_bmap_free_item_zone = kmem_zone_init(
-			sizeof(struct xfs_bmap_free_item),
+			sizeof(struct xfs_extent_free_item),
 			"xfs_bmap_free_item");
 	if (!xfs_bmap_free_item_zone)
 		goto out_destroy_log_ticket_zone;

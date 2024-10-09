@@ -57,6 +57,16 @@
 	.long (from) - . ;					\
 	.long (to) - . + 0x7ffffff0 ;				\
 	.popsection
+
+#ifndef MODULE
+# define _ASM_EXTABLE_FAULT(from, to)				\
+	.pushsection "__mc_table","a" ;				\
+	.balign 4 ;						\
+	.long (from) - . ;					\
+	.long (to) - . ;					\
+	.long ex_handler_fault - . ;				\
+	.popsection
+#endif
 #else
 # define _ASM_EXTABLE(from,to)					\
 	" .pushsection \"__ex_table\",\"a\"\n"			\

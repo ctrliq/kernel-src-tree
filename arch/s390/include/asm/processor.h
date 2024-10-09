@@ -37,6 +37,7 @@ extern void s390_adjust_jiffies(void);
 extern const struct seq_operations cpuinfo_op;
 extern int sysctl_ieee_emulation_warnings;
 extern void execve_tail(void);
+extern void __bpon(void);
 
 /*
  * User space process size: 2GB for 31 bit, 4TB or 8PT for 64 bit.
@@ -49,12 +50,12 @@ extern void execve_tail(void);
 
 #else /* CONFIG_64BIT */
 
-#define TASK_SIZE_OF(tsk)	((tsk)->mm ? \
-				 (tsk)->mm->context.asce_limit : TASK_MAX_SIZE)
+#define TASK_SIZE_OF(tsk)	(test_tsk_thread_flag(tsk, TIF_31BIT) ? \
+					(1UL << 31) : (1UL << 53))
 #define TASK_UNMAPPED_BASE	(test_thread_flag(TIF_31BIT) ? \
 					(1UL << 30) : (1UL << 41))
 #define TASK_SIZE		TASK_SIZE_OF(current)
-#define TASK_MAX_SIZE		(1UL << 53)
+#define TASK_SIZE_MAX		(1UL << 53)
 
 #endif /* CONFIG_64BIT */
 
@@ -62,7 +63,8 @@ extern void execve_tail(void);
 #define STACK_TOP		(1UL << 31)
 #define STACK_TOP_MAX		(1UL << 31)
 #else /* CONFIG_64BIT */
-#define STACK_TOP		(1UL << (test_thread_flag(TIF_31BIT) ? 31:42))
+#define STACK_TOP		(test_thread_flag(TIF_31BIT) ? \
+					(1UL << 31) : (1UL << 42))
 #define STACK_TOP_MAX		(1UL << 42)
 #endif /* CONFIG_64BIT */
 
@@ -93,6 +95,8 @@ struct thread_struct {
 #ifdef CONFIG_64BIT
 	unsigned char trap_tdb[256];	/* Transaction abort diagnose block */
 	RH_KABI_EXTEND(__vector128 *vxrs) /* Vector register save area */
+	RH_KABI_EXTEND(struct gs_cb *gs_cb) /* Current guarded storage cb */
+	RH_KABI_EXTEND(struct gs_cb *gs_bc_cb) /* Broadcast guarded storage cb */
 #endif
 };
 
@@ -164,6 +168,9 @@ static inline void show_cacheinfo(struct seq_file *m) { }
 
 /* Free all resources held by a thread. */
 extern void release_thread(struct task_struct *);
+
+/* Free guarded storage control block for current */
+void exit_thread_gs(void);
 
 /*
  * Return saved PC of a blocked thread.

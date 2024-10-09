@@ -807,7 +807,7 @@ extern const struct address_space_operations ext2_aops;
 extern const struct address_space_operations ext2_nobh_aops;
 
 /* namei.c */
-extern const struct inode_operations ext2_dir_inode_operations;
+extern const struct inode_operations_wrapper ext2_dir_inode_operations;
 extern const struct inode_operations ext2_special_inode_operations;
 
 /* symlink.c */

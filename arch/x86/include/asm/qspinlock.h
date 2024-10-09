@@ -41,8 +41,17 @@ static inline void queued_spin_unlock(struct qspinlock *lock)
 
 #define virt_spin_lock virt_spin_lock
 
+/*
+ * RHEL7 specific:
+ * To provide backward compatibility with pre-7.4 kernel modules that
+ * inlines the ticket spinlock unlock code. The virt_spin_lock() function
+ * will have to recognize both a lock value of 0 or _Q_UNLOCKED_VAL as
+ * being in an unlocked state.
+ */
 static inline bool virt_spin_lock(struct qspinlock *lock)
 {
+	int lockval;
+
 	if (!static_cpu_has(X86_FEATURE_HYPERVISOR))
 		return false;
 
@@ -53,9 +62,10 @@ static inline bool virt_spin_lock(struct qspinlock *lock)
 	 */
 
 	do {
-		while (atomic_read(&lock->val) != 0)
+		while ((lockval = atomic_read(&lock->val)) &&
+		       (lockval != _Q_UNLOCKED_VAL))
 			cpu_relax();
-	} while (atomic_cmpxchg(&lock->val, 0, _Q_LOCKED_VAL) != 0);
+	} while (atomic_cmpxchg(&lock->val, lockval, _Q_LOCKED_VAL) != lockval);
 
 	return true;
 }

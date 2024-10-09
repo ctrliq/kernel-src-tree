@@ -832,8 +832,11 @@ static int uas_slave_configure(struct scsi_device *sdev)
 	if (devinfo->flags & US_FL_NO_REPORT_OPCODES)
 		sdev->no_report_opcodes = 1;
 
-	scsi_set_tag_type(sdev, MSG_ORDERED_TAG);
-	scsi_activate_tcq(sdev, devinfo->qdepth - 2);
+	/* A few buggy USB-ATA bridges don't understand FUA */
+	if (devinfo->flags & US_FL_BROKEN_FUA)
+		sdev->broken_fua = 1;
+
+	scsi_adjust_queue_depth(sdev, MSG_ORDERED_TAG, devinfo->qdepth - 2);
 	return 0;
 }
 
@@ -851,6 +854,7 @@ static struct scsi_host_template uas_host_template = {
 	.cmd_per_lun = 1,	/* until we override it */
 	.skip_settle_delay = 1,
 	.ordered_tag = 1,
+	.use_host_wide_tags = 1,
 };
 
 #define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
@@ -967,9 +971,11 @@ static int uas_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (result)
 		goto set_alt0;
 
-	result = scsi_init_shared_tag_map(shost, devinfo->qdepth - 2);
-	if (result)
-		goto free_streams;
+	/*
+	 * 1 tag is reserved for untagged commands +
+	 * 1 tag to avoid off by one errors in some bridge firmwares
+	 */
+	shost->can_queue = devinfo->qdepth - 2;
 
 	usb_set_intfdata(intf, shost);
 	result = scsi_add_host(shost, &intf->dev);

@@ -56,7 +56,8 @@ static inline int red_use_harddrop(struct red_sched_data *q)
 	return q->flags & TC_RED_HARDDROP;
 }
 
-static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+		       struct sk_buff **to_free)
 {
 	struct red_sched_data *q = qdisc_priv(sch);
 	struct Qdisc *child = q->qdisc;
@@ -95,7 +96,7 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 		break;
 	}
 
-	ret = qdisc_enqueue(skb, child);
+	ret = qdisc_enqueue(skb, child, to_free);
 	if (likely(ret == NET_XMIT_SUCCESS)) {
 		qdisc_qstats_backlog_inc(sch, skb);
 		sch->q.qlen++;
@@ -106,7 +107,7 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	return ret;
 
 congestion_drop:
-	qdisc_drop(skb, sch);
+	qdisc_drop(skb, sch, to_free);
 	return NET_XMIT_CN;
 }
 
@@ -134,26 +135,6 @@ static struct sk_buff *red_peek(struct Qdisc *sch)
 	struct Qdisc *child = q->qdisc;
 
 	return child->ops->peek(child);
-}
-
-static unsigned int red_drop(struct Qdisc *sch)
-{
-	struct red_sched_data *q = qdisc_priv(sch);
-	struct Qdisc *child = q->qdisc;
-	unsigned int len;
-
-	if (child->ops->drop && (len = child->ops->drop(child)) > 0) {
-		q->stats.other++;
-		qdisc_qstats_drop(sch);
-		sch->qstats.backlog -= len;
-		sch->q.qlen--;
-		return len;
-	}
-
-	if (!red_is_idling(&q->vars))
-		red_start_of_idle_period(&q->vars);
-
-	return 0;
 }
 
 static void red_reset(struct Qdisc *sch)
@@ -210,6 +191,8 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
 			return PTR_ERR(child);
 	}
 
+	if (child != &noop_qdisc)
+		qdisc_hash_add(child, true);
 	sch_tree_lock(sch);
 	q->flags = ctl->flags;
 	q->limit = ctl->limit;
@@ -328,13 +311,9 @@ static struct Qdisc *red_leaf(struct Qdisc *sch, unsigned long arg)
 	return q->qdisc;
 }
 
-static unsigned long red_get(struct Qdisc *sch, u32 classid)
+static unsigned long red_find(struct Qdisc *sch, u32 classid)
 {
 	return 1;
-}
-
-static void red_put(struct Qdisc *sch, unsigned long arg)
-{
 }
 
 static void red_walk(struct Qdisc *sch, struct qdisc_walker *walker)
@@ -352,8 +331,7 @@ static void red_walk(struct Qdisc *sch, struct qdisc_walker *walker)
 static const struct Qdisc_class_ops red_class_ops = {
 	.graft		=	red_graft,
 	.leaf		=	red_leaf,
-	.get		=	red_get,
-	.put		=	red_put,
+	.find		=	red_find,
 	.walk		=	red_walk,
 	.dump		=	red_dump_class,
 };
@@ -365,7 +343,6 @@ static struct Qdisc_ops red_qdisc_ops __read_mostly = {
 	.enqueue	=	red_enqueue,
 	.dequeue	=	red_dequeue,
 	.peek		=	red_peek,
-	.drop		=	red_drop,
 	.init		=	red_init,
 	.reset		=	red_reset,
 	.destroy	=	red_destroy,

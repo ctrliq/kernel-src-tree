@@ -124,7 +124,7 @@ static inline void _tg3_flag_clear(enum TG3_FLAGS flag, unsigned long *bits)
 #define TG3_TX_TIMEOUT			(5 * HZ)
 
 /* hardware minimum and maximum for a single frame's data payload */
-#define TG3_MIN_MTU			60
+#define TG3_MIN_MTU			ETH_ZLEN
 #define TG3_MAX_MTU(tp)	\
 	(tg3_flag(tp, JUMBO_CAPABLE) ? 9000 : 1500)
 
@@ -824,6 +824,7 @@ static int tg3_ape_event_lock(struct tg3 *tp, u32 timeout_us)
 	return timeout_us ? 0 : -EBUSY;
 }
 
+#ifdef CONFIG_TIGON3_HWMON
 static int tg3_ape_wait_for_event(struct tg3 *tp, u32 timeout_us)
 {
 	u32 i, apedata;
@@ -903,6 +904,7 @@ static int tg3_ape_scratchpad_read(struct tg3 *tp, u32 *data, u32 base_off,
 
 	return 0;
 }
+#endif
 
 static int tg3_ape_send_event(struct tg3 *tp, u32 event)
 {
@@ -10752,6 +10754,7 @@ static int tg3_init_hw(struct tg3 *tp, bool reset_phy)
 	return tg3_reset_hw(tp, reset_phy);
 }
 
+#ifdef CONFIG_TIGON3_HWMON
 static void tg3_sd_scan_scratchpad(struct tg3 *tp, struct tg3_ocir *ocir)
 {
 	int i;
@@ -10834,6 +10837,10 @@ static void tg3_hwmon_open(struct tg3 *tp)
 		dev_err(&pdev->dev, "Cannot register hwmon device, aborting\n");
 	}
 }
+#else
+static inline void tg3_hwmon_close(struct tg3 *tp) { }
+static inline void tg3_hwmon_open(struct tg3 *tp) { }
+#endif /* CONFIG_TIGON3_HWMON */
 
 
 #define TG3_STAT_ADD32(PSTAT, REG) \
@@ -11091,9 +11098,7 @@ static void tg3_timer_init(struct tg3 *tp)
 	tp->asf_multiplier = (HZ / tp->timer_offset) *
 			     TG3_FW_UPDATE_FREQ_SEC;
 
-	init_timer(&tp->timer);
-	tp->timer.data = (unsigned long) tp;
-	tp->timer.function = tg3_timer;
+	setup_timer(&tp->timer, tg3_timer, (unsigned long)tp);
 }
 
 static void tg3_timer_start(struct tg3 *tp)
@@ -14141,8 +14146,8 @@ static const struct ethtool_ops tg3_ethtool_ops = {
 	.set_eee		= tg3_set_eee,
 };
 
-static struct rtnl_link_stats64 *tg3_get_stats64(struct net_device *dev,
-						struct rtnl_link_stats64 *stats)
+static void tg3_get_stats64(struct net_device *dev,
+			    struct rtnl_link_stats64 *stats)
 {
 	struct tg3 *tp = netdev_priv(dev);
 
@@ -14150,13 +14155,11 @@ static struct rtnl_link_stats64 *tg3_get_stats64(struct net_device *dev,
 	if (!tp->hw_stats) {
 		*stats = tp->net_stats_prev;
 		spin_unlock_bh(&tp->lock);
-		return stats;
+		return;
 	}
 
 	tg3_get_nstats(tp, stats);
 	spin_unlock_bh(&tp->lock);
-
-	return stats;
 }
 
 static void tg3_set_rx_mode(struct net_device *dev)
@@ -14198,9 +14201,6 @@ static int tg3_change_mtu(struct net_device *dev, int new_mtu)
 	int err;
 	bool reset_phy = false;
 
-	if (new_mtu < TG3_MIN_MTU || new_mtu > TG3_MAX_MTU(tp))
-		return -EINVAL;
-
 	if (!netif_running(dev)) {
 		/* We'll just catch it later when the
 		 * device is up'd.
@@ -14241,6 +14241,7 @@ static int tg3_change_mtu(struct net_device *dev, int new_mtu)
 }
 
 static const struct net_device_ops tg3_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= tg3_open,
 	.ndo_stop		= tg3_close,
 	.ndo_start_xmit		= tg3_start_xmit,
@@ -14250,7 +14251,7 @@ static const struct net_device_ops tg3_netdev_ops = {
 	.ndo_set_mac_address	= tg3_set_mac_addr,
 	.ndo_do_ioctl		= tg3_ioctl,
 	.ndo_tx_timeout		= tg3_tx_timeout,
-	.ndo_change_mtu		= tg3_change_mtu,
+	.extended.ndo_change_mtu	= tg3_change_mtu,
 	.ndo_fix_features	= tg3_fix_features,
 	.ndo_set_features	= tg3_set_features,
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -17801,6 +17802,10 @@ static int tg3_init_one(struct pci_dev *pdev,
 
 	dev->hw_features |= features;
 	dev->priv_flags |= IFF_UNICAST_FLT;
+
+	/* MTU range: 60 - 9000 or 1500, depending on hardware */
+	dev->extended->min_mtu = TG3_MIN_MTU;
+	dev->extended->max_mtu = TG3_MAX_MTU(tp);
 
 	if (tg3_chip_rev_id(tp) == CHIPREV_ID_5705_A1 &&
 	    !tg3_flag(tp, TSO_CAPABLE) &&

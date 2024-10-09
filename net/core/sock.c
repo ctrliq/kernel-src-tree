@@ -837,7 +837,9 @@ set_rcvbuf:
 		if (val & ~SOF_TIMESTAMPING_MASK ||
 		    val & __RH_RESERVED_SOF_TIMESTAMPING_OPT_ID ||
 		    val & __RH_RESERVED_SOF_TIMESTAMPING_TX_SCHED ||
-		    val & __RH_RESERVED_SOF_TIMESTAMPING_TX_ACK) {
+		    val & __RH_RESERVED_SOF_TIMESTAMPING_TX_ACK ||
+		    val & __RH_RESERVED_SOF_TIMESTAMPING_OPT_TSONLY ||
+		    val & __RH_RESERVED_SOF_TIMESTAMPING_OPT_STATS) {
 			ret = -EINVAL;
 			break;
 		}
@@ -1384,8 +1386,12 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 }
 EXPORT_SYMBOL(sk_alloc);
 
-static void __sk_free(struct sock *sk)
+/* Sockets having SOCK_RCU_FREE will call this function after one RCU
+ * grace period. This is the case for UDP sockets and TCP listeners.
+ */
+static void __sk_destruct(struct rcu_head *head)
 {
+	struct sock *sk = container_of(head, struct sock, sk_rcu);
 	struct sk_filter *filter;
 
 	if (sk->sk_destruct)
@@ -1414,6 +1420,19 @@ static void __sk_free(struct sock *sk)
 	put_pid(sk->sk_peer_pid);
 	put_net(sock_net(sk));
 	sk_prot_free(sk->sk_prot_creator, sk);
+}
+
+void sk_destruct(struct sock *sk)
+{
+	if (sock_flag(sk, SOCK_RCU_FREE))
+		call_rcu(&sk->sk_rcu, __sk_destruct);
+	else
+		__sk_destruct(&sk->sk_rcu);
+}
+
+static void __sk_free(struct sock *sk)
+{
+	sk_destruct(sk);
 }
 
 void sk_free(struct sock *sk)
@@ -1604,19 +1623,39 @@ void sock_wfree(struct sk_buff *skb)
 }
 EXPORT_SYMBOL(sock_wfree);
 
+/* This variant of sock_wfree() is used by TCP,
+ * since it sets SOCK_USE_WRITE_QUEUE.
+ */
+void __sock_wfree(struct sk_buff *skb)
+{
+	struct sock *sk = skb->sk;
+
+	if (atomic_sub_and_test(skb->truesize, &sk->sk_wmem_alloc))
+		__sk_free(sk);
+}
+
+/* This helper is used by netem, as it can hold packets in its
+ * delay queue. We want to allow the owner socket to send more
+ * packets, as if they were already TX completed by a typical driver.
+ * But we also want to keep skb->sk set because some packet schedulers
+ * rely on it (sch_fq for example).
+ */
 void skb_orphan_partial(struct sk_buff *skb)
 {
-	/* TCP stack sets skb->ooo_okay based on sk_wmem_alloc,
-	 * so we do not completely orphan skb, but transfert all
-	 * accounted bytes but one, to avoid unexpected reorders.
-	 */
+	if (skb_is_tcp_pure_ack(skb))
+		return;
+
 	if (skb->destructor == sock_wfree
 #ifdef CONFIG_INET
 	    || skb->destructor == tcp_wfree
 #endif
 		) {
-		atomic_sub(skb->truesize - 1, &skb->sk->sk_wmem_alloc);
-		skb->truesize = 1;
+		struct sock *sk = skb->sk;
+
+		if (atomic_inc_not_zero(&sk->sk_refcnt)) {
+			atomic_sub(skb->truesize, &sk->sk_wmem_alloc);
+			skb->destructor = sock_efree;
+		}
 	} else {
 		skb_orphan(skb);
 	}

@@ -90,7 +90,7 @@ struct kvmppc_vcore {
 	struct kvm_vcpu *runnable_threads[MAX_SMT_THREADS];
 	struct list_head preempt_list;
 	spinlock_t lock;
-	wait_queue_head_t wq;
+	struct swait_queue_head wq;
 	spinlock_t stoltb_lock;	/* protects stolen_tb and preempt_tb */
 	u64 stolen_tb;
 	u64 preempt_tb;

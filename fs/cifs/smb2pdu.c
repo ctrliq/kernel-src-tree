@@ -675,6 +675,28 @@ vneg_out:
 	return -EIO;
 }
 
+enum securityEnum
+smb2_select_sectype(struct TCP_Server_Info *server, enum securityEnum requested)
+{
+	switch (requested) {
+	case Kerberos:
+	case RawNTLMSSP:
+		return requested;
+	case NTLMv2:
+		return RawNTLMSSP;
+	case Unspecified:
+		if (server->sec_ntlmssp &&
+			(global_secflags & CIFSSEC_MAY_NTLMSSP))
+			return RawNTLMSSP;
+		if ((server->sec_kerberos || server->sec_mskerberos) &&
+			(global_secflags & CIFSSEC_MAY_KRB5))
+			return Kerberos;
+		/* Fallthrough */
+	default:
+		return Unspecified;
+	}
+}
+
 struct SMB2_sess_data {
 	unsigned int xid;
 	struct cifs_ses *ses;
@@ -1027,10 +1049,17 @@ out:
 static int
 SMB2_select_sec(struct cifs_ses *ses, struct SMB2_sess_data *sess_data)
 {
-	if (ses->sectype != Kerberos && ses->sectype != RawNTLMSSP)
-		ses->sectype = RawNTLMSSP;
+	int type;
 
-	switch (ses->sectype) {
+	type = smb2_select_sectype(ses->server, ses->sectype);
+	cifs_dbg(FYI, "sess setup type %d\n", type);
+	if (type == Unspecified) {
+		cifs_dbg(VFS,
+			"Unable to select appropriate authentication method!");
+		return -EINVAL;
+	}
+
+	switch (type) {
 	case Kerberos:
 		sess_data->func = SMB2_auth_kerberos;
 		break;
@@ -1038,7 +1067,7 @@ SMB2_select_sec(struct cifs_ses *ses, struct SMB2_sess_data *sess_data)
 		sess_data->func = SMB2_sess_auth_rawntlmssp_negotiate;
 		break;
 	default:
-		cifs_dbg(VFS, "secType %d not supported!\n", ses->sectype);
+		cifs_dbg(VFS, "secType %d not supported!\n", type);
 		return -EOPNOTSUPP;
 	}
 
@@ -2137,6 +2166,18 @@ qinf_exit:
 	return rc;
 }
 
+int SMB2_query_eas(const unsigned int xid, struct cifs_tcon *tcon,
+	u64 persistent_fid, u64 volatile_fid,
+	struct smb2_file_full_ea_info *data)
+{
+	return query_info(xid, tcon, persistent_fid, volatile_fid,
+			  FILE_FULL_EA_INFORMATION, SMB2_O_INFO_FILE, 0,
+			  SMB2_MAX_EA_BUF,
+			  sizeof(struct smb2_file_full_ea_info),
+			  (void **)&data,
+			  NULL);
+}
+
 int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
 	u64 persistent_fid, u64 volatile_fid, struct smb2_file_all_info *data)
 {
@@ -2416,7 +2457,7 @@ smb2_readv_callback(struct mid_q_entry *mid)
 	case MID_RESPONSE_RECEIVED:
 		credits_received = le16_to_cpu(shdr->CreditRequest);
 		/* result already set, check signature */
-		if (server->sign) {
+		if (server->sign && !mid->decrypted) {
 			int rc;
 
 			rc = smb2_verify_signature(&rqst, server);
@@ -2517,7 +2558,7 @@ smb2_async_readv(struct cifs_readdata *rdata)
 	kref_get(&rdata->refcount);
 	rc = cifs_call_async(io_parms.tcon->ses->server, &rqst,
 			     cifs_readv_receive, smb2_readv_callback,
-			     NULL, rdata, flags);
+			     smb3_handle_read_data, rdata, flags);
 	if (rc) {
 		kref_put(&rdata->refcount, cifs_readdata_release);
 		cifs_stats_fail_inc(io_parms.tcon, SMB2_READ_HE);
@@ -3180,6 +3221,16 @@ SMB2_set_acl(const unsigned int xid, struct cifs_tcon *tcon,
 	return send_set_info(xid, tcon, persistent_fid, volatile_fid,
 			current->tgid, 0, SMB2_O_INFO_SECURITY, aclflag,
 			1, (void **)&pnntsd, &pacllen);
+}
+
+int
+SMB2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,
+	    u64 persistent_fid, u64 volatile_fid,
+	    struct smb2_file_full_ea_info *buf, int len)
+{
+	return send_set_info(xid, tcon, persistent_fid, volatile_fid,
+		current->tgid, FILE_FULL_EA_INFORMATION, SMB2_O_INFO_FILE,
+		0, 1, (void **)&buf, &len);
 }
 
 int

@@ -647,6 +647,21 @@ cifs_read_from_socket(struct TCP_Server_Info *server, char *buf,
 	return cifs_readv_from_socket(server, &iov, 1, to_read);
 }
 
+int
+cifs_read_page_from_socket(struct TCP_Server_Info *server, struct page *page,
+                      unsigned int to_read)
+{
+	struct kvec iov;
+	int length;
+
+	iov.iov_base = kmap(page);
+	iov.iov_len = to_read;
+	length = cifs_readv_from_socket(server, &iov, 1, iov.iov_len);
+	kunmap(page);
+
+	return length;
+}
+
 static bool
 is_smb_response(struct TCP_Server_Info *server, unsigned char type)
 {
@@ -845,6 +860,15 @@ standard_receive3(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 
 	dump_smb(buf, server->total_read);
 
+	return cifs_handle_standard(server, mid);
+}
+
+int
+cifs_handle_standard(struct TCP_Server_Info *server, struct mid_q_entry *mid)
+{
+	char *buf = server->large_buf ? server->bigbuf : server->smallbuf;
+	int length;
+
 	/*
 	 * We know that we received enough to get to the MID as we
 	 * checked the pdu_length earlier. Now check to see
@@ -858,6 +882,13 @@ standard_receive3(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 	if (length != 0)
 		cifs_dump_mem("Bad SMB: ", buf,
 			min_t(unsigned int, server->total_read, 48));
+
+	if (server->ops->is_session_expired &&
+	    server->ops->is_session_expired(buf)) {
+		cifs_reconnect(server);
+		wake_up(&server->response_q);
+		return -1;
+	}
 
 	if (server->ops->is_status_pending &&
 	    server->ops->is_status_pending(buf, server, length))
@@ -953,10 +984,19 @@ cifs_demultiplex_thread(void *p)
 
 		server->lstrp = jiffies;
 		if (mid_entry != NULL) {
+			if ((mid_entry->mid_flags & MID_WAIT_CANCELLED) &&
+			     mid_entry->mid_state == MID_RESPONSE_RECEIVED &&
+					server->ops->handle_cancelled_mid)
+				server->ops->handle_cancelled_mid(
+							mid_entry->resp_buf,
+							server);
+
 			if (!mid_entry->multiRsp || mid_entry->multiEnd)
 				mid_entry->callback(mid_entry);
-		} else if (!server->ops->is_oplock_break ||
-			   !server->ops->is_oplock_break(buf, server)) {
+		} else if (server->ops->is_oplock_break &&
+			   server->ops->is_oplock_break(buf, server)) {
+			cifs_dbg(FYI, "Received oplock break\n");
+		} else {
 			cifs_dbg(VFS, "No task to wake, unknown frame received! NumMids %d\n",
 				 atomic_read(&midCount));
 			cifs_dump_mem("Received Data is: ", buf,
@@ -2128,7 +2168,8 @@ match_security(struct TCP_Server_Info *server, struct smb_vol *vol)
 	 * that was specified, or "Unspecified" if that sectype was not
 	 * compatible with the given NEGOTIATE request.
 	 */
-	if (select_sectype(server, vol->sectype) == Unspecified)
+	if (server->ops->select_sectype(server, vol->sectype)
+	     == Unspecified)
 		return false;
 
 	/*
@@ -2225,7 +2266,7 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
 	server->tcpStatus = CifsExiting;
 	spin_unlock(&GlobalMid_Lock);
 
-	cifs_crypto_shash_release(server);
+	cifs_crypto_secmech_release(server);
 	cifs_fscache_release_client_cookie(server);
 
 	kfree(server->session_key.response);
@@ -2344,7 +2385,7 @@ cifs_get_tcp_session(struct smb_vol *volume_info)
 	return tcp_ses;
 
 out_err_crypto_release:
-	cifs_crypto_shash_release(tcp_ses);
+	cifs_crypto_secmech_release(tcp_ses);
 
 	put_net(cifs_net_ns(tcp_ses));
 
@@ -2509,7 +2550,7 @@ cifs_set_cifscreds(struct smb_vol *vol, struct cifs_ses *ses)
 	}
 
 	down_read(&key->sem);
-	upayload = key->payload.data;
+	upayload = user_key_payload_locked(key);
 	if (IS_ERR_OR_NULL(upayload)) {
 		rc = upayload ? PTR_ERR(upayload) : -EINVAL;
 		goto out_key_put;

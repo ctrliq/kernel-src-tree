@@ -426,6 +426,10 @@ done:
 	if (bss_desc)
 		kfree(bss_desc->beacon_buf);
 	kfree(bss_desc);
+
+	if (ret < 0)
+		priv->attempted_bss_desc = NULL;
+
 	return ret;
 }
 
@@ -556,7 +560,7 @@ int mwifiex_enable_hs(struct mwifiex_adapter *adapter)
 #endif
 			mwifiex_dbg(adapter, CMD, "aborting bgscan!\n");
 			mwifiex_stop_bg_scan(priv);
-			cfg80211_sched_scan_stopped(priv->wdev.wiphy);
+			cfg80211_sched_scan_stopped(priv->wdev.wiphy, 0);
 #ifdef CONFIG_PM
 		}
 #endif
@@ -570,7 +574,7 @@ int mwifiex_enable_hs(struct mwifiex_adapter *adapter)
 
 	adapter->hs_activate_wait_q_woken = false;
 
-	memset(&hscfg, 0, sizeof(struct mwifiex_ds_hs_cfg));
+	memset(&hscfg, 0, sizeof(hscfg));
 	hscfg.is_invoke_hostcmd = true;
 
 	adapter->hs_enabling = true;
@@ -650,9 +654,9 @@ int mwifiex_get_bss_info(struct mwifiex_private *priv,
  */
 int mwifiex_disable_auto_ds(struct mwifiex_private *priv)
 {
-	struct mwifiex_ds_auto_ds auto_ds;
-
-	auto_ds.auto_ds = DEEP_SLEEP_OFF;
+	struct mwifiex_ds_auto_ds auto_ds = {
+		.auto_ds = DEEP_SLEEP_OFF,
+	};
 
 	return mwifiex_send_cmd(priv, HostCmd_CMD_802_11_PS_MODE_ENH,
 				DIS_AUTO_PS, BITMAP_AUTO_DS, &auto_ds, true);
@@ -807,8 +811,8 @@ int mwifiex_drv_set_power(struct mwifiex_private *priv, u32 *ps_mode)
  * is checked to determine WPA version. If buffer length is zero, the existing
  * WPA IE is reset.
  */
-static int mwifiex_set_wpa_ie_helper(struct mwifiex_private *priv,
-				     u8 *ie_data_ptr, u16 ie_len)
+static int mwifiex_set_wpa_ie(struct mwifiex_private *priv,
+			      u8 *ie_data_ptr, u16 ie_len)
 {
 	if (ie_len) {
 		if (ie_len > sizeof(priv->wpa_ie)) {
@@ -1134,7 +1138,7 @@ int mwifiex_set_encode(struct mwifiex_private *priv, struct key_params *kp,
 {
 	struct mwifiex_ds_encrypt_key encrypt_key;
 
-	memset(&encrypt_key, 0, sizeof(struct mwifiex_ds_encrypt_key));
+	memset(&encrypt_key, 0, sizeof(encrypt_key));
 	encrypt_key.key_len = key_len;
 	encrypt_key.key_index = key_index;
 
@@ -1155,8 +1159,6 @@ int mwifiex_set_encode(struct mwifiex_private *priv, struct key_params *kp,
 			encrypt_key.is_rx_seq_valid = true;
 		}
 	} else {
-		if (GET_BSS_ROLE(priv) == MWIFIEX_BSS_ROLE_UAP)
-			return 0;
 		encrypt_key.key_disable = true;
 		if (mac_addr)
 			memcpy(encrypt_key.mac_addr, mac_addr, ETH_ALEN);
@@ -1176,7 +1178,7 @@ mwifiex_get_ver_ext(struct mwifiex_private *priv, u32 version_str_sel)
 {
 	struct mwifiex_ver_ext ver_ext;
 
-	memset(&ver_ext, 0, sizeof(struct host_cmd_ds_version_ext));
+	memset(&ver_ext, 0, sizeof(ver_ext));
 	ver_ext.version_str_sel = version_str_sel;
 	if (mwifiex_send_cmd(priv, HostCmd_CMD_VERSION_EXT,
 			     HostCmd_ACT_GEN_GET, 0, &ver_ext, true))
@@ -1247,7 +1249,7 @@ static int mwifiex_reg_mem_ioctl_reg_rw(struct mwifiex_private *priv,
 {
 	u16 cmd_no;
 
-	switch (le32_to_cpu(reg_rw->type)) {
+	switch (reg_rw->type) {
 	case MWIFIEX_REG_MAC:
 		cmd_no = HostCmd_CMD_MAC_REG_ACCESS;
 		break;
@@ -1282,9 +1284,9 @@ mwifiex_reg_write(struct mwifiex_private *priv, u32 reg_type,
 {
 	struct mwifiex_ds_reg_rw reg_rw;
 
-	reg_rw.type = cpu_to_le32(reg_type);
-	reg_rw.offset = cpu_to_le32(reg_offset);
-	reg_rw.value = cpu_to_le32(reg_value);
+	reg_rw.type = reg_type;
+	reg_rw.offset = reg_offset;
+	reg_rw.value = reg_value;
 
 	return mwifiex_reg_mem_ioctl_reg_rw(priv, &reg_rw, HostCmd_ACT_GEN_SET);
 }
@@ -1302,14 +1304,14 @@ mwifiex_reg_read(struct mwifiex_private *priv, u32 reg_type,
 	int ret;
 	struct mwifiex_ds_reg_rw reg_rw;
 
-	reg_rw.type = cpu_to_le32(reg_type);
-	reg_rw.offset = cpu_to_le32(reg_offset);
+	reg_rw.type = reg_type;
+	reg_rw.offset = reg_offset;
 	ret = mwifiex_reg_mem_ioctl_reg_rw(priv, &reg_rw, HostCmd_ACT_GEN_GET);
 
 	if (ret)
 		goto done;
 
-	*value = le32_to_cpu(reg_rw.value);
+	*value = reg_rw.value;
 
 done:
 	return ret;
@@ -1328,15 +1330,16 @@ mwifiex_eeprom_read(struct mwifiex_private *priv, u16 offset, u16 bytes,
 	int ret;
 	struct mwifiex_ds_read_eeprom rd_eeprom;
 
-	rd_eeprom.offset = cpu_to_le16((u16) offset);
-	rd_eeprom.byte_count = cpu_to_le16((u16) bytes);
+	rd_eeprom.offset =  offset;
+	rd_eeprom.byte_count = bytes;
 
 	/* Send request to firmware */
 	ret = mwifiex_send_cmd(priv, HostCmd_CMD_802_11_EEPROM_ACCESS,
 			       HostCmd_ACT_GEN_GET, 0, &rd_eeprom, true);
 
 	if (!ret)
-		memcpy(value, rd_eeprom.value, MAX_EEPROM_DATA);
+		memcpy(value, rd_eeprom.value, min((u16)MAX_EEPROM_DATA,
+		       rd_eeprom.byte_count));
 	return ret;
 }
 
@@ -1348,101 +1351,96 @@ static int
 mwifiex_set_gen_ie_helper(struct mwifiex_private *priv, u8 *ie_data_ptr,
 			  u16 ie_len)
 {
-	int ret = 0;
 	struct ieee_types_vendor_header *pvendor_ie;
 	const u8 wpa_oui[] = { 0x00, 0x50, 0xf2, 0x01 };
 	const u8 wps_oui[] = { 0x00, 0x50, 0xf2, 0x04 };
-	u16 unparsed_len = ie_len;
-	int find_wpa_ie = 0;
+	u16 unparsed_len = ie_len, cur_ie_len;
 
 	/* If the passed length is zero, reset the buffer */
 	if (!ie_len) {
 		priv->gen_ie_buf_len = 0;
 		priv->wps.session_enable = false;
-
 		return 0;
-	} else if (!ie_data_ptr) {
+	} else if (!ie_data_ptr ||
+		   ie_len <= sizeof(struct ieee_types_header)) {
 		return -1;
 	}
 	pvendor_ie = (struct ieee_types_vendor_header *) ie_data_ptr;
 
 	while (pvendor_ie) {
-		if (pvendor_ie->element_id == WLAN_EID_VENDOR_SPECIFIC) {
-			/* Test to see if it is a WPA IE, if not, then it is a
-			 * gen IE
-			 */
-			if (!memcmp(pvendor_ie->oui, wpa_oui,
-				    sizeof(wpa_oui))) {
-				find_wpa_ie = 1;
-				break;
-			}
-
-			/* Test to see if it is a WPS IE, if so, enable
-			 * wps session flag
-			 */
-			if (!memcmp(pvendor_ie->oui, wps_oui,
-				    sizeof(wps_oui))) {
-				priv->wps.session_enable = true;
-				mwifiex_dbg(priv->adapter, MSG,
-					    "info: WPS Session Enabled.\n");
-				ret = mwifiex_set_wps_ie(priv,
-							 (u8 *)pvendor_ie,
-							 unparsed_len);
-			}
-		}
+		cur_ie_len = pvendor_ie->len + sizeof(struct ieee_types_header);
 
 		if (pvendor_ie->element_id == WLAN_EID_RSN) {
-			find_wpa_ie = 1;
-			break;
+			/* IE is a WPA/WPA2 IE so call set_wpa function */
+			mwifiex_set_wpa_ie(priv, (u8 *)pvendor_ie, cur_ie_len);
+			priv->wps.session_enable = false;
+			goto next_ie;
 		}
 
 		if (pvendor_ie->element_id == WLAN_EID_BSS_AC_ACCESS_DELAY) {
-		/* IE is a WAPI IE so call set_wapi function */
-			ret = mwifiex_set_wapi_ie(priv, (u8 *)pvendor_ie,
-						  unparsed_len);
-			return ret;
+			/* IE is a WAPI IE so call set_wapi function */
+			mwifiex_set_wapi_ie(priv, (u8 *)pvendor_ie,
+					    cur_ie_len);
+			goto next_ie;
 		}
 
-		unparsed_len -= (pvendor_ie->len +
-				 sizeof(struct ieee_types_header));
+		if (pvendor_ie->element_id == WLAN_EID_VENDOR_SPECIFIC) {
+			/* Test to see if it is a WPA IE, if not, then
+			 * it is a gen IE
+			 */
+			if (!memcmp(pvendor_ie->oui, wpa_oui,
+				    sizeof(wpa_oui))) {
+				/* IE is a WPA/WPA2 IE so call set_wpa function
+				 */
+				mwifiex_set_wpa_ie(priv, (u8 *)pvendor_ie,
+						   cur_ie_len);
+				priv->wps.session_enable = false;
+				goto next_ie;
+			}
+
+			if (!memcmp(pvendor_ie->oui, wps_oui,
+				    sizeof(wps_oui))) {
+				/* Test to see if it is a WPS IE,
+				 * if so, enable wps session flag
+				 */
+				priv->wps.session_enable = true;
+				mwifiex_dbg(priv->adapter, MSG,
+					    "WPS Session Enabled.\n");
+				mwifiex_set_wps_ie(priv, (u8 *)pvendor_ie,
+						   cur_ie_len);
+				goto next_ie;
+			}
+		}
+
+		/* Saved in gen_ie, such as P2P IE.etc.*/
+
+		/* Verify that the passed length is not larger than the
+		 * available space remaining in the buffer
+		 */
+		if (cur_ie_len <
+		    (sizeof(priv->gen_ie_buf) - priv->gen_ie_buf_len)) {
+			/* Append the passed data to the end
+			 * of the genIeBuffer
+			 */
+			memcpy(priv->gen_ie_buf + priv->gen_ie_buf_len,
+			       (u8 *)pvendor_ie, cur_ie_len);
+			/* Increment the stored buffer length by the
+			 * size passed
+			 */
+			priv->gen_ie_buf_len += cur_ie_len;
+		}
+
+next_ie:
+		unparsed_len -= cur_ie_len;
 
 		if (unparsed_len <= sizeof(struct ieee_types_header))
 			pvendor_ie = NULL;
 		else
 			pvendor_ie = (struct ieee_types_vendor_header *)
-				(((u8 *)pvendor_ie) + pvendor_ie->len +
-				 sizeof(struct ieee_types_header));
+				(((u8 *)pvendor_ie) + cur_ie_len);
 	}
 
-	if (find_wpa_ie) {
-		/* IE is a WPA/WPA2 IE so call set_wpa function */
-		ret = mwifiex_set_wpa_ie_helper(priv, (u8 *)pvendor_ie,
-						unparsed_len);
-		priv->wps.session_enable = false;
-		return ret;
-	}
-
-	/*
-	 * Verify that the passed length is not larger than the
-	 * available space remaining in the buffer
-	 */
-	if (ie_len < (sizeof(priv->gen_ie_buf) - priv->gen_ie_buf_len)) {
-
-		/* Append the passed data to the end of the
-		   genIeBuffer */
-		memcpy(priv->gen_ie_buf + priv->gen_ie_buf_len, ie_data_ptr,
-		       ie_len);
-		/* Increment the stored buffer length by the
-		   size passed */
-		priv->gen_ie_buf_len += ie_len;
-	} else {
-		/* Passed data does not fit in the remaining
-		   buffer space */
-		ret = -1;
-	}
-
-	/* Return 0, or -1 for error case */
-	return ret;
+	return 0;
 }
 
 /*

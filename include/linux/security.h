@@ -6,6 +6,7 @@
  * Copyright (C) 2001 Networks Associates Technology, Inc <ssmalley@nai.com>
  * Copyright (C) 2001 James Morris <jmorris@intercode.com.au>
  * Copyright (C) 2001 Silicon Graphics, Inc. (Trust Technology Group)
+ * Copyright (C) 2016 Mellanox Techonologies
  *
  *	This program is free software; you can redistribute it and/or modify
  *	it under the terms of the GNU General Public License as published by
@@ -70,6 +71,10 @@ struct audit_krule;
 struct user_namespace;
 struct timezone;
 
+enum lsm_event {
+	LSM_POLICY_CHANGE,
+};
+
 /*
  * These functions are in security/capability.c and are used
  * as the default capabilities functions
@@ -91,6 +96,8 @@ extern int cap_inode_setxattr(struct dentry *dentry, const char *name,
 extern int cap_inode_removexattr(struct dentry *dentry, const char *name);
 extern int cap_inode_need_killpriv(struct dentry *dentry);
 extern int cap_inode_killpriv(struct dentry *dentry);
+extern int cap_inode_getsecurity(struct inode *inode, const char *name,
+				 void **buffer, bool alloc);
 extern int cap_mmap_addr(unsigned long addr);
 extern int cap_mmap_file(struct file *file, unsigned long reqprot,
 			 unsigned long prot, unsigned long flags);
@@ -168,6 +175,10 @@ struct security_mnt_opts {
 	int *mnt_opts_flags;
 	int num_mnt_opts;
 };
+
+int call_lsm_notifier(enum lsm_event event, void *data);
+int register_lsm_notifier(struct notifier_block *nb);
+int unregister_lsm_notifier(struct notifier_block *nb);
 
 static inline void security_init_mnt_opts(struct security_mnt_opts *opts)
 {
@@ -1057,6 +1068,20 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	This hook sets the packet's owning sock.
  *	@skb is the packet.
  *	@sk the sock which owns the packet.
+ * Security hooks for Infiniband
+ *
+ * @ib_pkey_access:
+ *	Check permission to access a pkey when modifing a QP.
+ *	@subnet_prefix the subnet prefix of the port being used.
+ *	@pkey the pkey to be accessed.
+ *	@sec pointer to a security structure.
+ * @ib_alloc_security:
+ *	Allocate a security structure for Infiniband objects.
+ *	@sec pointer to a security structure pointer.
+ *	Returns 0 on success, non-zero on failure
+ * @ib_free_security:
+ *	Deallocate an Infiniband security structure.
+ *	@sec contains the security structure to be freed.
  *
  * Security hooks for XFRM operations.
  *
@@ -1713,6 +1738,14 @@ struct security_operations {
 	void (*skb_owned_by) (struct sk_buff *skb, struct sock *sk);
 #endif	/* CONFIG_SECURITY_NETWORK */
 
+#ifdef CONFIG_SECURITY_INFINIBAND
+	int (*ib_pkey_access)(void *sec, u64 subnet_prefix, u16 pkey);
+	int (*ib_endport_manage_subnet)(void *sec, const char *dev_name,
+					u8 port_num);
+	int (*ib_alloc_security)(void **sec);
+	void (*ib_free_security)(void *sec);
+#endif	/* CONFIG_SECURITY_INFINIBAND */
+
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 	int (*xfrm_policy_alloc_security) (struct xfrm_sec_ctx **ctxp,
 			struct xfrm_user_sec_ctx *sec_ctx);
@@ -1935,6 +1968,21 @@ int security_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen);
 #else /* CONFIG_SECURITY */
 struct security_mnt_opts {
 };
+
+static inline int call_lsm_notifier(enum lsm_event event, void *data)
+{
+	return 0;
+}
+
+static inline int register_lsm_notifier(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline  int unregister_lsm_notifier(struct notifier_block *nb)
+{
+	return 0;
+}
 
 static inline void security_init_mnt_opts(struct security_mnt_opts *opts)
 {
@@ -2283,7 +2331,7 @@ static inline int security_inode_killpriv(struct dentry *dentry)
 
 static inline int security_inode_getsecurity(struct inode *inode, const char *name, void **buffer, bool alloc)
 {
-	return -EOPNOTSUPP;
+	return cap_inode_getsecurity(inode, name, buffer, alloc);
 }
 
 static inline int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags)
@@ -2921,6 +2969,32 @@ static inline void security_skb_owned_by(struct sk_buff *skb, struct sock *sk)
 }
 
 #endif	/* CONFIG_SECURITY_NETWORK */
+
+#ifdef CONFIG_SECURITY_INFINIBAND
+int security_ib_pkey_access(void *sec, u64 subnet_prefix, u16 pkey);
+int security_ib_endport_manage_subnet(void *sec, const char *name, u8 port_num);
+int security_ib_alloc_security(void **sec);
+void security_ib_free_security(void *sec);
+#else	/* CONFIG_SECURITY_INFINIBAND */
+static inline int security_ib_pkey_access(void *sec, u64 subnet_prefix, u16 pkey)
+{
+	return 0;
+}
+
+static inline int security_ib_endport_manage_subnet(void *sec, const char *dev_name, u8 port_num)
+{
+	return 0;
+}
+
+static inline int security_ib_alloc_security(void **sec)
+{
+	return 0;
+}
+
+static inline void security_ib_free_security(void *sec)
+{
+}
+#endif	/* CONFIG_SECURITY_INFINIBAND */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 

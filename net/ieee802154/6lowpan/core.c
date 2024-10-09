@@ -108,7 +108,7 @@ static void lowpan_setup(struct net_device *ldev)
 
 	ldev->netdev_ops	= &lowpan_netdev_ops;
 	ldev->header_ops	= &lowpan_header_ops;
-	ldev->destructor	= free_netdev;
+	ldev->extended->needs_free_netdev	= true;
 	ldev->features		|= NETIF_F_NETNS_LOCAL;
 }
 

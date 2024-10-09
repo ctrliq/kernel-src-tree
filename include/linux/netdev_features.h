@@ -45,9 +45,13 @@ enum {
 	NETIF_F_GSO_IPIP_BIT,		/* ... IPIP tunnel with TSO */
 	NETIF_F_GSO_SIT_BIT,		/* ... SIT tunnel with TSO */
 	NETIF_F_GSO_UDP_TUNNEL_BIT,	/* ... UDP TUNNEL with TSO */
-	NETIF_F_GSO_MPLS_BIT,		/* ... MPLS segmentation */
+	__NETIF_F_GSO_UNUSED_BIT,	/* RHEL: the last free GSO bit.
+					 * !!! Any reuse of this bit needs
+					 * !!! a prior agreement with the
+					 * !!! Networking Services team.
+					 */
 	/**/NETIF_F_GSO_LAST =		/* last bit, see GSO_MASK */
-		NETIF_F_GSO_MPLS_BIT,
+		__NETIF_F_GSO_UNUSED_BIT,
 
 	NETIF_F_FCOE_CRC_BIT,		/* FCoE CRC32 */
 	NETIF_F_SCTP_CRC_BIT,		/* SCTP checksum offload */
@@ -91,6 +95,7 @@ enum {
 	NETIF_F_HW_L2FW_DOFFLOAD_BIT,	/* Allow L2 Forwarding in Hardware */
 
 	NETIF_F_HW_TC_BIT,		/* Offload TC infrastructure */
+	NETIF_F_RX_UDP_TUNNEL_PORT_BIT, /* Offload of RX port for UDP tunnels */
 
 	/*
 	 * Add your fresh new feature above and remember to update
@@ -145,7 +150,6 @@ enum {
 #define NETIF_F_GSO_UDP_TUNNEL_CSUM __NETIF_F(GSO_UDP_TUNNEL_CSUM)
 #define NETIF_F_TSO_MANGLEID	__NETIF_F(TSO_MANGLEID)
 #define NETIF_F_GSO_PARTIAL	 __NETIF_F(GSO_PARTIAL)
-#define NETIF_F_GSO_MPLS	__NETIF_F(GSO_MPLS)
 #define NETIF_F_GSO_SCTP	__NETIF_F(GSO_SCTP)
 #define NETIF_F_HW_VLAN_STAG_FILTER __NETIF_F(HW_VLAN_STAG_FILTER)
 #define NETIF_F_HW_VLAN_STAG_RX	__NETIF_F(HW_VLAN_STAG_RX)
@@ -153,6 +157,7 @@ enum {
 #define NETIF_F_HW_L2FW_DOFFLOAD	__NETIF_F(HW_L2FW_DOFFLOAD)
 #define NETIF_F_BUSY_POLL	__NETIF_F(BUSY_POLL)
 #define NETIF_F_HW_TC		__NETIF_F(HW_TC)
+#define	NETIF_F_RX_UDP_TUNNEL_PORT  __NETIF_F(RX_UDP_TUNNEL_PORT)
 
 #define for_each_netdev_feature(mask_addr, bit)	\
 	for_each_set_bit(bit, (unsigned long *)mask_addr, NETDEV_FEATURE_COUNT)
@@ -224,7 +229,6 @@ enum {
 				 NETIF_F_GSO_IPIP |			\
 				 NETIF_F_GSO_SIT |			\
 				 NETIF_F_GSO_UDP_TUNNEL |		\
-				 NETIF_F_GSO_UDP_TUNNEL_CSUM |		\
-				 NETIF_F_GSO_MPLS)
+				 NETIF_F_GSO_UDP_TUNNEL_CSUM)
 
 #endif	/* _LINUX_NETDEV_FEATURES_H */

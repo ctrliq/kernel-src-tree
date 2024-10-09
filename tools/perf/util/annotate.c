@@ -7,6 +7,8 @@
  * Released under the GPL v2. (and only v2, not any later version)
  */
 
+#include <errno.h>
+#include <inttypes.h>
 #include "util.h"
 #include "ui/ui.h"
 #include "sort.h"
@@ -18,10 +20,12 @@
 #include "annotate.h"
 #include "evsel.h"
 #include "block-range.h"
+#include "string2.h"
 #include "arch/common.h"
 #include <regex.h>
 #include <pthread.h>
 #include <linux/bitops.h>
+#include <linux/kernel.h>
 #include <sys/utsname.h>
 
 #include "sane_ctype.h"
@@ -1785,7 +1789,7 @@ int symbol__annotate_printf(struct symbol *sym, struct map *map,
 	printf("%-*.*s----\n",
 	       graph_dotted_len, graph_dotted_len, graph_dotted_line);
 
-	if (verbose)
+	if (verbose > 0)
 		symbol__annotate_hits(sym, evsel);
 
 	list_for_each_entry(pos, &notes->src->source, node) {

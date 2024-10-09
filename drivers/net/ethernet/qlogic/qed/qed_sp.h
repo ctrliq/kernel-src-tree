@@ -84,6 +84,7 @@ union ramrod_data {
 	struct tx_queue_stop_ramrod_data tx_queue_stop;
 	struct vport_start_ramrod_data vport_start;
 	struct vport_stop_ramrod_data vport_stop;
+	struct rx_update_gft_filter_data rx_update_gft;
 	struct vport_update_ramrod_data vport_update;
 	struct core_rx_start_ramrod_data core_rx_queue_start;
 	struct core_rx_stop_ramrod_data core_rx_queue_stop;
@@ -103,12 +104,17 @@ union ramrod_data {
 	struct roce_query_qp_req_ramrod_data roce_query_qp_req;
 	struct roce_destroy_qp_resp_ramrod_data roce_destroy_qp_resp;
 	struct roce_destroy_qp_req_ramrod_data roce_destroy_qp_req;
+	struct roce_init_func_ramrod_data roce_init_func;
 	struct rdma_create_cq_ramrod_data rdma_create_cq;
 	struct rdma_destroy_cq_ramrod_data rdma_destroy_cq;
 	struct rdma_srq_create_ramrod_data rdma_create_srq;
 	struct rdma_srq_destroy_ramrod_data rdma_destroy_srq;
 	struct rdma_srq_modify_ramrod_data rdma_modify_srq;
-	struct roce_init_func_ramrod_data roce_init_func;
+	struct iwarp_create_qp_ramrod_data iwarp_create_qp;
+	struct iwarp_tcp_offload_ramrod_data iwarp_tcp_offload;
+	struct iwarp_mpa_offload_ramrod_data iwarp_mpa_offload;
+	struct iwarp_modify_qp_ramrod_data iwarp_modify_qp;
+	struct iwarp_init_func_ramrod_data iwarp_init_func;
 	struct fcoe_init_ramrod_params fcoe_init;
 	struct fcoe_conn_offload_ramrod_params fcoe_conn_ofld;
 	struct fcoe_conn_terminate_ramrod_params fcoe_conn_terminate;
@@ -173,6 +179,22 @@ struct qed_consq {
 	struct qed_chain chain;
 };
 
+typedef int
+(*qed_spq_async_comp_cb)(struct qed_hwfn *p_hwfn,
+			 u8 opcode,
+			 u16 echo,
+			 union event_ring_data *data,
+			 u8 fw_return_code);
+
+int
+qed_spq_register_async_cb(struct qed_hwfn *p_hwfn,
+			  enum protocol_type protocol_id,
+			  qed_spq_async_comp_cb cb);
+
+void
+qed_spq_unregister_async_cb(struct qed_hwfn *p_hwfn,
+			    enum protocol_type protocol_id);
+
 struct qed_spq {
 	spinlock_t		lock; /* SPQ lock */
 
@@ -202,6 +224,7 @@ struct qed_spq {
 	u32			comp_count;
 
 	u32			cid;
+	qed_spq_async_comp_cb async_comp_cb[MAX_PROTOCOL_TYPE];
 };
 
 /**
@@ -391,6 +414,7 @@ int qed_sp_init_request(struct qed_hwfn *p_hwfn,
  * to the internal RAM of the UStorm by the Function Start Ramrod.
  *
  * @param p_hwfn
+ * @param p_ptt
  * @param p_tunn
  * @param mode
  * @param allow_npar_tx_switch
@@ -399,6 +423,7 @@ int qed_sp_init_request(struct qed_hwfn *p_hwfn,
  */
 
 int qed_sp_pf_start(struct qed_hwfn *p_hwfn,
+		    struct qed_ptt *p_ptt,
 		    struct qed_tunnel_info *p_tunn,
 		    enum qed_mf_mode mode, bool allow_npar_tx_switch);
 
@@ -414,6 +439,15 @@ int qed_sp_pf_start(struct qed_hwfn *p_hwfn,
  */
 
 int qed_sp_pf_update(struct qed_hwfn *p_hwfn);
+
+/**
+ * @brief qed_sp_pf_update_stag - Update firmware of new outer tag
+ *
+ * @param p_hwfn
+ *
+ * @return int
+ */
+int qed_sp_pf_update_stag(struct qed_hwfn *p_hwfn);
 
 /**
  * @brief qed_sp_pf_stop - PF Function Stop Ramrod
@@ -432,6 +466,7 @@ int qed_sp_pf_update(struct qed_hwfn *p_hwfn);
 int qed_sp_pf_stop(struct qed_hwfn *p_hwfn);
 
 int qed_sp_pf_update_tunn_cfg(struct qed_hwfn *p_hwfn,
+			      struct qed_ptt *p_ptt,
 			      struct qed_tunnel_info *p_tunn,
 			      enum spq_mode comp_mode,
 			      struct qed_spq_comp_cb *p_comp_data);

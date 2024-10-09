@@ -1,20 +1,15 @@
-/**
- * Copyright (C) 2005 - 2016 Broadcom
- * All rights reserved.
+/*
+ * Copyright 2017 Broadcom. All Rights Reserved.
+ * The term "Broadcom" refers to Broadcom Limited and/or its subsidiaries.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.  The full GNU General
+ * as published by the Free Software Foundation. The full GNU General
  * Public License is included in this distribution in the file called COPYING.
- *
- * Written by: Jayamohan Kallickal (jayamohan.kallickal@broadcom.com)
  *
  * Contact Information:
  * linux-drivers@broadcom.com
  *
- * Emulex
- * 3333 Susan Street
- * Costa Mesa, CA 92626
  */
 
 #ifndef _BEISCSI_MAIN_
@@ -36,7 +31,7 @@
 #include <scsi/scsi_transport_iscsi.h>
 
 #define DRV_NAME		"be2iscsi"
-#define BUILD_STR		"11.2.1.0"
+#define BUILD_STR		"11.4.0.1"
 #define BE_NAME			"Emulex OneConnect" \
 				"Open-iSCSI Driver version" BUILD_STR
 #define DRV_DESC		BE_NAME " " "Driver"

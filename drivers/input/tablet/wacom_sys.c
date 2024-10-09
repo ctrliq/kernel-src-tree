@@ -1073,7 +1073,7 @@ static int wacom_battery_get_property(struct power_supply *psy,
 				      enum power_supply_property psp,
 				      union power_supply_propval *val)
 {
-	struct wacom *wacom = container_of(psy, struct wacom, battery);
+	struct wacom *wacom = power_supply_get_drvdata(psy);
 	int ret = 0;
 
 	switch (psp) {
@@ -1091,33 +1091,33 @@ static int wacom_battery_get_property(struct power_supply *psy,
 
 static int wacom_initialize_battery(struct wacom *wacom)
 {
-	int error = 0;
+	struct power_supply_config psy = { .drv_data = wacom };
 
 	if (wacom->wacom_wac.features.quirks & WACOM_QUIRK_MONITOR) {
-		wacom->battery.properties = wacom_battery_props;
-		wacom->battery.num_properties = ARRAY_SIZE(wacom_battery_props);
-		wacom->battery.get_property = wacom_battery_get_property;
-		wacom->battery.name = "wacom_battery";
-		wacom->battery.type = POWER_SUPPLY_TYPE_BATTERY;
-		wacom->battery.use_for_apm = 0;
+		wacom->battery_desc.properties = wacom_battery_props;
+		wacom->battery_desc.num_properties = ARRAY_SIZE(wacom_battery_props);
+		wacom->battery_desc.get_property = wacom_battery_get_property;
+		wacom->battery_desc.name = "wacom_battery";
+		wacom->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
+		wacom->battery_desc.use_for_apm = 0;
 
-		error = power_supply_register(&wacom->usbdev->dev,
-					      &wacom->battery);
+		wacom->battery = power_supply_register(&wacom->usbdev->dev,
+					      &wacom->battery_desc, &psy);
 
-		if (!error)
-			power_supply_powers(&wacom->battery,
+		if (!IS_ERR(wacom->battery))
+			power_supply_powers(wacom->battery,
 					    &wacom->usbdev->dev);
 	}
 
-	return error;
+	return PTR_ERR(wacom->battery);
 }
 
 static void wacom_destroy_battery(struct wacom *wacom)
 {
 	if (wacom->wacom_wac.features.quirks & WACOM_QUIRK_MONITOR &&
-	    wacom->battery.dev) {
-		power_supply_unregister(&wacom->battery);
-		wacom->battery.dev = NULL;
+	    wacom->battery) {
+		power_supply_unregister(wacom->battery);
+		wacom->battery = NULL;
 	}
 }
 

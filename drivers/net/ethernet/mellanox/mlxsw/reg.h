@@ -959,7 +959,7 @@ enum mlxsw_flood_table_type {
 	MLXSW_REG_SFGC_TABLE_TYPE_VID = 1,
 	MLXSW_REG_SFGC_TABLE_TYPE_SINGLE = 2,
 	MLXSW_REG_SFGC_TABLE_TYPE_ANY = 0,
-	MLXSW_REG_SFGC_TABLE_TYPE_FID_OFFEST = 3,
+	MLXSW_REG_SFGC_TABLE_TYPE_FID_OFFSET = 3,
 	MLXSW_REG_SFGC_TABLE_TYPE_FID = 4,
 };
 
@@ -3680,15 +3680,17 @@ enum mlxsw_reg_htgt_trap_group {
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_LACP,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_LLDP,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_IGMP,
-	MLXSW_REG_HTGT_TRAP_GROUP_SP_BGP_IPV4,
+	MLXSW_REG_HTGT_TRAP_GROUP_SP_BGP,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_OSPF,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_ARP,
-	MLXSW_REG_HTGT_TRAP_GROUP_SP_ARP_MISS,
+	MLXSW_REG_HTGT_TRAP_GROUP_SP_HOST_MISS,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_ROUTER_EXP,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_REMOTE_ROUTE,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_IP2ME,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_DHCP,
 	MLXSW_REG_HTGT_TRAP_GROUP_SP_EVENT,
+	MLXSW_REG_HTGT_TRAP_GROUP_SP_IPV6_MLD,
+	MLXSW_REG_HTGT_TRAP_GROUP_SP_IPV6_ND,
 };
 
 /* reg_htgt_trap_group
@@ -4261,8 +4263,7 @@ static inline void mlxsw_reg_ritr_sp_if_pack(char *payload, bool lag,
 
 static inline void mlxsw_reg_ritr_pack(char *payload, bool enable,
 				       enum mlxsw_reg_ritr_if_type type,
-				       u16 rif, u16 vr_id, u16 mtu,
-				       const char *mac)
+				       u16 rif, u16 vr_id, u16 mtu)
 {
 	bool op = enable ? MLXSW_REG_RITR_RIF_CREATE : MLXSW_REG_RITR_RIF_DEL;
 
@@ -4278,6 +4279,10 @@ static inline void mlxsw_reg_ritr_pack(char *payload, bool enable,
 	mlxsw_reg_ritr_lb_en_set(payload, 1);
 	mlxsw_reg_ritr_virtual_router_set(payload, vr_id);
 	mlxsw_reg_ritr_mtu_set(payload, mtu);
+}
+
+static inline void mlxsw_reg_ritr_mac_pack(char *payload, const char *mac)
+{
 	mlxsw_reg_ritr_if_mac_memcpy_to(payload, mac);
 }
 
@@ -5242,6 +5247,14 @@ static inline void mlxsw_reg_rauht_pack6(char *payload,
 	mlxsw_reg_rauht_pack(payload, op, rif, mac);
 	mlxsw_reg_rauht_type_set(payload, MLXSW_REG_RAUHT_TYPE_IPV6);
 	mlxsw_reg_rauht_dip6_memcpy_to(payload, dip);
+}
+
+static inline void mlxsw_reg_rauht_pack_counter(char *payload,
+						u64 counter_index)
+{
+	mlxsw_reg_rauht_counter_index_set(payload, counter_index);
+	mlxsw_reg_rauht_counter_set_type_set(payload,
+					     MLXSW_REG_FLOW_COUNTER_SET_TYPE_PACKETS_BYTES);
 }
 
 /* RALEU - Router Algorithmic LPM ECMP Update Register

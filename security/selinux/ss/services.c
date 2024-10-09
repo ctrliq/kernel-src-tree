@@ -72,6 +72,8 @@
 
 int selinux_policycap_netpeer;
 int selinux_policycap_openperm;
+int selinux_policycap_cgroupseclabel;
+int selinux_policycap_nnp_nosuid_transition;
 
 static DEFINE_RWLOCK(policy_rwlock);
 
@@ -1816,6 +1818,12 @@ static void security_load_policycaps(void)
 						  POLICYDB_CAPABILITY_NETPEER);
 	selinux_policycap_openperm = ebitmap_get_bit(&policydb.policycaps,
 						  POLICYDB_CAPABILITY_OPENPERM);
+	selinux_policycap_cgroupseclabel =
+		ebitmap_get_bit(&policydb.policycaps,
+				POLICYDB_CAPABILITY_CGROUPSECLABEL);
+	selinux_policycap_nnp_nosuid_transition =
+		ebitmap_get_bit(&policydb.policycaps,
+				POLICYDB_CAPABILITY_NNP_NOSUID_TRANSITION);
 }
 
 static int security_preserve_bools(struct policydb *p);
@@ -2022,6 +2030,87 @@ int security_port_sid(u8 protocol, u16 port, u32 *out_sid)
 	} else {
 		*out_sid = SECINITSID_PORT;
 	}
+
+out:
+	read_unlock(&policy_rwlock);
+	return rc;
+}
+
+/**
+ * security_pkey_sid - Obtain the SID for a pkey.
+ * @subnet_prefix: Subnet Prefix
+ * @pkey_num: pkey number
+ * @out_sid: security identifier
+ */
+int security_ib_pkey_sid(u64 subnet_prefix, u16 pkey_num, u32 *out_sid)
+{
+	struct ocontext *c;
+	int rc = 0;
+
+	read_lock(&policy_rwlock);
+
+	c = policydb.ocontexts[OCON_IBPKEY];
+	while (c) {
+		if (c->u.ibpkey.low_pkey <= pkey_num &&
+		    c->u.ibpkey.high_pkey >= pkey_num &&
+		    c->u.ibpkey.subnet_prefix == subnet_prefix)
+			break;
+
+		c = c->next;
+	}
+
+	if (c) {
+		if (!c->sid[0]) {
+			rc = sidtab_context_to_sid(&sidtab,
+						   &c->context[0],
+						   &c->sid[0]);
+			if (rc)
+				goto out;
+		}
+		*out_sid = c->sid[0];
+	} else
+		*out_sid = SECINITSID_UNLABELED;
+
+out:
+	read_unlock(&policy_rwlock);
+	return rc;
+}
+
+/**
+ * security_ib_endport_sid - Obtain the SID for a subnet management interface.
+ * @dev_name: device name
+ * @port: port number
+ * @out_sid: security identifier
+ */
+int security_ib_endport_sid(const char *dev_name, u8 port_num, u32 *out_sid)
+{
+	struct ocontext *c;
+	int rc = 0;
+
+	read_lock(&policy_rwlock);
+
+	c = policydb.ocontexts[OCON_IBENDPORT];
+	while (c) {
+		if (c->u.ibendport.port == port_num &&
+		    !strncmp(c->u.ibendport.dev_name,
+			     dev_name,
+			     IB_DEVICE_NAME_MAX))
+			break;
+
+		c = c->next;
+	}
+
+	if (c) {
+		if (!c->sid[0]) {
+			rc = sidtab_context_to_sid(&sidtab,
+						   &c->context[0],
+						   &c->sid[0]);
+			if (rc)
+				goto out;
+		}
+		*out_sid = c->sid[0];
+	} else
+		*out_sid = SECINITSID_UNLABELED;
 
 out:
 	read_unlock(&policy_rwlock);

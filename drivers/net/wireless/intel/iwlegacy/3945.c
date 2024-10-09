@@ -520,7 +520,7 @@ il3945_pass_packet_to_mac80211(struct il_priv *il, struct il_rx_buf *rxb,
 	 * and do not consume a full page
 	 */
 	if (len <= SMALL_PACKET_SIZE) {
-		memcpy(skb_put(skb, len), rx_hdr->payload, len);
+		skb_put_data(skb, rx_hdr->payload, len);
 	} else {
 		skb_add_rx_frag(skb, 0, rxb->page,
 				(void *)rx_hdr->payload - (void *)pkt, len,
@@ -570,7 +570,7 @@ il3945_hdl_rx(struct il_priv *il, struct il_rx_buf *rxb)
 
 	/* set the preamble flag if appropriate */
 	if (rx_hdr->phy_flags & RX_RES_PHY_FLAGS_SHORT_PREAMBLE_MSK)
-		rx_status.flag |= RX_FLAG_SHORTPRE;
+		rx_status.enc_flags |= RX_ENC_FLAG_SHORTPRE;
 
 	if ((unlikely(rx_stats->phy_count > 20))) {
 		D_DROP("dsp size out of range [0,20]: %d\n",
@@ -1019,12 +1019,13 @@ il3945_hw_txq_ctx_free(struct il_priv *il)
 	int txq_id;
 
 	/* Tx queues */
-	if (il->txq)
+	if (il->txq) {
 		for (txq_id = 0; txq_id < il->hw_params.max_txq_num; txq_id++)
 			if (txq_id == IL39_CMD_QUEUE_NUM)
 				il_cmd_queue_free(il);
 			else
 				il_tx_queue_free(il, txq_id);
+	}
 
 	/* free tx queue structure */
 	il_free_txq_mem(il);
@@ -2670,7 +2671,7 @@ const struct il_ops il3945_ops = {
 	.send_led_cmd = il3945_send_led_cmd,
 };
 
-static struct il_cfg il3945_bg_cfg = {
+static const struct il_cfg il3945_bg_cfg = {
 	.name = "3945BG",
 	.fw_name_pre = IL3945_FW_PRE,
 	.ucode_api_max = IL3945_UCODE_API_MAX,
@@ -2699,7 +2700,7 @@ static struct il_cfg il3945_bg_cfg = {
 	},
 };
 
-static struct il_cfg il3945_abg_cfg = {
+static const struct il_cfg il3945_abg_cfg = {
 	.name = "3945ABG",
 	.fw_name_pre = IL3945_FW_PRE,
 	.ucode_api_max = IL3945_UCODE_API_MAX,

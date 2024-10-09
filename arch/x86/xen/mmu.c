@@ -1931,7 +1931,7 @@ static void __init xen_write_cr3_init(unsigned long cr3)
 {
 	unsigned long pfn = PFN_DOWN(__pa(swapper_pg_dir));
 
-	BUG_ON(read_cr3() != __pa(initial_page_table));
+	BUG_ON(read_cr3_pa() != __pa(initial_page_table));
 	BUG_ON(cr3 != __pa(swapper_pg_dir));
 
 	/*
@@ -2117,7 +2117,6 @@ static const struct pv_mmu_ops xen_mmu_ops __initconst = {
 	.flush_tlb_others = xen_flush_tlb_others,
 
 	.pte_update = paravirt_nop,
-	.pte_update_defer = paravirt_nop,
 
 	.pgd_alloc = xen_pgd_alloc,
 	.pgd_free = xen_pgd_free,

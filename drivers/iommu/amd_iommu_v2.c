@@ -431,7 +431,7 @@ static void mn_release(struct mmu_notifier_rhel7 *mn, struct mm_struct *mm)
 	unbind_pasid(pasid_state);
 }
 
-static struct mmu_notifier_ops_rhel7 iommu_mn = {
+static const struct mmu_notifier_ops_rhel7 iommu_mn = {
 	.release		= mn_release,
 	.clear_flush_young      = mn_clear_flush_young,
 	.invalidate_page        = mn_invalidate_page,
@@ -512,43 +512,40 @@ static bool access_error(struct vm_area_struct *vma, struct fault *fault)
 static void do_fault(struct work_struct *work)
 {
 	struct fault *fault = container_of(work, struct fault, work);
-	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	int ret = VM_FAULT_ERROR;
+	unsigned int flags = 0;
+	struct mm_struct *mm;
 	u64 address;
-	int ret, write;
-
-	write = !!(fault->flags & PPR_FAULT_WRITE);
 
 	mm = fault->state->mm;
 	address = fault->address;
 
+	if (fault->flags & PPR_FAULT_USER)
+		flags |= FAULT_FLAG_USER;
+	if (fault->flags & PPR_FAULT_WRITE)
+		flags |= FAULT_FLAG_WRITE;
+	flags |= FAULT_FLAG_REMOTE;
+
 	down_read(&mm->mmap_sem);
 	vma = find_extend_vma(mm, address);
-	if (!vma || address < vma->vm_start) {
+	if (!vma || address < vma->vm_start)
 		/* failed to get a vma in the right range */
-		up_read(&mm->mmap_sem);
-		handle_fault_error(fault);
 		goto out;
-	}
 
 	/* Check if we have the right permissions on the vma */
-	if (access_error(vma, fault)) {
-		up_read(&mm->mmap_sem);
-		handle_fault_error(fault);
+	if (access_error(vma, fault))
 		goto out;
-	}
 
-	ret = handle_mm_fault(mm, vma, address, write);
-	if (ret & VM_FAULT_ERROR) {
-		/* failed to service fault */
-		up_read(&mm->mmap_sem);
-		handle_fault_error(fault);
-		goto out;
-	}
-
-	up_read(&mm->mmap_sem);
+	ret = handle_mm_fault(vma, address, flags);
 
 out:
+	up_read(&mm->mmap_sem);
+
+	if (ret & VM_FAULT_ERROR)
+		/* failed to service fault */
+		handle_fault_error(fault);
+
 	finish_pri_tag(fault->dev_state, fault->state, fault->tag);
 
 	put_pasid_state(fault->state);
@@ -564,14 +561,30 @@ static int ppr_notifier(struct notifier_block *nb, unsigned long e, void *data)
 	unsigned long flags;
 	struct fault *fault;
 	bool finish;
-	u16 tag;
+	u16 tag, devid;
 	int ret;
+	struct iommu_dev_data *dev_data;
+	struct pci_dev *pdev = NULL;
 
 	iommu_fault = data;
 	tag         = iommu_fault->tag & 0x1ff;
 	finish      = (iommu_fault->tag >> 9) & 1;
 
+	devid = iommu_fault->device_id;
+	pdev = pci_get_bus_and_slot(PCI_BUS_NUM(devid), devid & 0xff);
+	if (!pdev)
+		return -ENODEV;
+	dev_data = get_dev_data(&pdev->dev);
+
+	/* In kdump kernel pci dev is not initialized yet -> send INVALID */
 	ret = NOTIFY_DONE;
+	if (translation_pre_enabled(amd_iommu_rlookup_table[devid])
+		&& dev_data->defer_attach) {
+		amd_iommu_complete_ppr(pdev, iommu_fault->pasid,
+				       PPR_INVALID, tag);
+		goto out;
+	}
+
 	dev_state = get_device_state(iommu_fault->device_id);
 	if (dev_state == NULL)
 		goto out;

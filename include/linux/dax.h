@@ -7,68 +7,124 @@
 #include <asm/pgtable.h>
 
 /*
- * We use lowest available bit in exceptional entry for locking, other two
- * bits to determine entry type. In total 3 special bits.
+ * We use lowest available bit in exceptional entry for locking, one bit for
+ * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ * page (HZP) or an empty entry that is just used for locking.  In total four
+ * special bits.
+ *
+ * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ * block allocation.
  */
-#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
 #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
-#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
-#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
-#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
-#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
-#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
-#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
-		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
-		RADIX_TREE_EXCEPTIONAL_ENTRY))
+#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
 
+static inline unsigned long dax_radix_sector(void *entry)
+{
+	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+}
 
-ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
-                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
-                  get_block_t get_block, dio_iodone_t end_io, int flags);
-int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
-int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+{
+	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+			((unsigned long)sector << RADIX_DAX_SHIFT) |
+			RADIX_DAX_ENTRY_LOCK);
+}
+
+struct iomap_ops;
+struct dax_device;
+struct dax_operations {
+	/*
+	 * direct_access: translate a device-relative
+	 * logical-page-offset into an absolute physical pfn. Return the
+	 * number of pages available for DAX at that pfn.
+	 */
+	long (*direct_access)(struct dax_device *, pgoff_t, long,
+			void **, pfn_t *);
+	/* flush: optional driver-specific cache management after writes */
+	void (*flush)(struct dax_device *, pgoff_t, void *, size_t);
+};
+
+int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
+#if IS_ENABLED(CONFIG_FS_DAX)
+int __bdev_dax_supported(struct super_block *sb, int blocksize);
+static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+{
+	return __bdev_dax_supported(sb, blocksize);
+}
+#else
+static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_DAX)
+struct dax_device *dax_get_by_host(const char *host);
+void put_dax(struct dax_device *dax_dev);
+#else
+static inline struct dax_device *dax_get_by_host(const char *host)
+{
+	return NULL;
+}
+
+static inline void put_dax(struct dax_device *dax_dev)
+{
+}
+#endif
+
+int dax_read_lock(void);
+void dax_read_unlock(int id);
+struct dax_device *alloc_dax(void *private, const char *host,
+		const struct dax_operations *ops);
+bool dax_alive(struct dax_device *dax_dev);
+void kill_dax(struct dax_device *dax_dev);
+void *dax_get_private(struct dax_device *dax_dev);
+long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+		void **kaddr, pfn_t *pfn);
+
+ssize_t dax_iomap_rw(int rw, struct kiocb *iocb, const struct iovec *iov,
+		unsigned long nr_segs, loff_t pos,
+		size_t count, const struct iomap_ops *ops);
+int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+		const struct iomap_ops *ops);
 int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
 int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+				      pgoff_t index);
 void dax_wake_mapping_entry_waiter(struct address_space *mapping,
 		pgoff_t index, void *entry, bool wake_all);
 
 #ifdef CONFIG_FS_DAX
-struct page *read_dax_sector(struct block_device *bdev, sector_t n);
-void dax_unlock_mapping_entry(struct address_space *mapping, pgoff_t index);
-int __dax_zero_page_range(struct block_device *bdev, sector_t sector,
+int __dax_zero_page_range(struct block_device *bdev,
+		struct dax_device *dax_dev, sector_t sector,
 		unsigned int offset, unsigned int length);
 #else
-static inline struct page *read_dax_sector(struct block_device *bdev,
-		sector_t n)
-{
-	return ERR_PTR(-ENXIO);
-}
-/* Shouldn't ever be called when dax is disabled. */
-static inline void dax_unlock_mapping_entry(struct address_space *mapping,
-					    pgoff_t index)
-{
-	BUG();
-}
 static inline int __dax_zero_page_range(struct block_device *bdev,
-		sector_t sector, unsigned int offset, unsigned int length)
+		struct dax_device *dax_dev, sector_t sector,
+		unsigned int offset, unsigned int length)
 {
 	return -ENXIO;
 }
 #endif
 
-static inline int dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
-				pmd_t *pmd, unsigned int flags, get_block_t gb)
+#ifdef CONFIG_FS_DAX_PMD
+static inline unsigned int dax_radix_order(void *entry)
 {
-	return VM_FAULT_FALLBACK;
+	if ((unsigned long)entry & RADIX_DAX_PMD)
+		return PMD_SHIFT - PAGE_SHIFT;
+	return 0;
 }
-
+#else
+static inline unsigned int dax_radix_order(void *entry)
+{
+	return 0;
+}
+#endif
 int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
-#define dax_mkwrite(vma, vmf, gb)	dax_fault(vma, vmf, gb)
-
-static inline bool vma_is_dax(struct vm_area_struct *vma)
-{
-	return vma->vm_file && IS_DAX(vma->vm_file->f_mapping->host);
-}
 
 static inline bool dax_mapping(struct address_space *mapping)
 {

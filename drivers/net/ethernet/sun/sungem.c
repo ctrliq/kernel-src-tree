@@ -52,7 +52,6 @@
 #endif
 
 #ifdef CONFIG_PPC_PMAC
-#include <asm/pci-bridge.h>
 #include <asm/prom.h>
 #include <asm/machdep.h>
 #include <asm/pmac_feature.h>
@@ -1676,8 +1675,8 @@ static void gem_init_phy(struct gem *gp)
 	if (gp->pdev->vendor == PCI_VENDOR_ID_APPLE) {
 		int i;
 
-		/* Those delays sucks, the HW seems to love them though, I'll
-		 * seriously consider breaking some locks here to be able
+		/* Those delay sucks, the HW seem to love them though, I'll
+		 * serisouly consider breaking some locks here to be able
 		 * to schedule instead
 		 */
 		for (i = 0; i < 3; i++) {

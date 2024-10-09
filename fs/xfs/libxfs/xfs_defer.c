@@ -81,12 +81,44 @@
  *   - For each work item attached to the log intent item,
  *     * Perform the described action.
  *     * Attach the work item to the log done item.
+ *     * If the result of doing the work was -EAGAIN, ->finish work
+ *       wants a new transaction.  See the "Requesting a Fresh
+ *       Transaction while Finishing Deferred Work" section below for
+ *       details.
  *
  * The key here is that we must log an intent item for all pending
  * work items every time we roll the transaction, and that we must log
  * a done item as soon as the work is completed.  With this mechanism
  * we can perform complex remapping operations, chaining intent items
  * as needed.
+ *
+ * Requesting a Fresh Transaction while Finishing Deferred Work
+ *
+ * If ->finish_item decides that it needs a fresh transaction to
+ * finish the work, it must ask its caller (xfs_defer_finish) for a
+ * continuation.  The most likely cause of this circumstance are the
+ * refcount adjust functions deciding that they've logged enough items
+ * to be at risk of exceeding the transaction reservation.
+ *
+ * To get a fresh transaction, we want to log the existing log done
+ * item to prevent the log intent item from replaying, immediately log
+ * a new log intent item with the unfinished work items, roll the
+ * transaction, and re-call ->finish_item wherever it left off.  The
+ * log done item and the new log intent item must be in the same
+ * transaction or atomicity cannot be guaranteed; defer_finish ensures
+ * that this happens.
+ *
+ * This requires some coordination between ->finish_item and
+ * defer_finish.  Upon deciding to request a new transaction,
+ * ->finish_item should update the current work item to reflect the
+ * unfinished work.  Next, it should reset the log done item's list
+ * count to the number of items finished, and return -EAGAIN.
+ * defer_finish sees the -EAGAIN, logs the new log intent item
+ * with the remaining work items, and leaves the xfs_defer_pending
+ * item at the head of the dop_work queue.  Then it rolls the
+ * transaction and picks up processing where it left off.  It is
+ * required that ->finish_item must be careful to leave enough
+ * transaction reservation to fit the new log intent item.
  *
  * This is an example of remapping the extent (E, E+B) into file X at
  * offset A and dealing with the extent (C, C+B) already being mapped
@@ -104,21 +136,26 @@
  * | Intent to add rmap (X, E, A, B)                 |
  * +-------------------------------------------------+
  * | Reduce refcount for extent (C, B)               | t2
- * | Done reducing refcount for extent (C, B)        |
+ * | Done reducing refcount for extent (C, 9)        |
+ * | Intent to reduce refcount for extent (C+9, B-9) |
+ * | (ran out of space after 9 refcount updates)     |
+ * +-------------------------------------------------+
+ * | Reduce refcount for extent (C+9, B+9)           | t3
+ * | Done reducing refcount for extent (C+9, B-9)    |
  * | Increase refcount for extent (E, B)             |
  * | Done increasing refcount for extent (E, B)      |
  * | Intent to free extent (C, B)                    |
  * | Intent to free extent (F, 1) (refcountbt block) |
  * | Intent to remove rmap (F, 1, REFC)              |
  * +-------------------------------------------------+
- * | Remove rmap (X, C, A, B)                        | t3
+ * | Remove rmap (X, C, A, B)                        | t4
  * | Done removing rmap (X, C, A, B)                 |
  * | Add rmap (X, E, A, B)                           |
  * | Done adding rmap (X, E, A, B)                   |
  * | Remove rmap (F, 1, REFC)                        |
  * | Done removing rmap (F, 1, REFC)                 |
  * +-------------------------------------------------+
- * | Free extent (C, B)                              | t4
+ * | Free extent (C, B)                              | t5
  * | Done freeing extent (C, B)                      |
  * | Free extent (D, 1)                              |
  * | Done freeing extent (D, 1)                      |
@@ -141,6 +178,9 @@
  * - Intent to free extent (C, B)
  * - Intent to free extent (F, 1) (refcountbt block)
  * - Intent to remove rmap (F, 1, REFC)
+ *
+ * Note that the continuation requested between t2 and t3 is likely to
+ * reoccur.
  */
 
 static const struct xfs_defer_op_type *defer_op_types[XFS_DEFER_OPS_TYPE_MAX];
@@ -161,6 +201,7 @@ xfs_defer_intake_work(
 	list_for_each_entry(dfp, &dop->dop_intake, dfp_list) {
 		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
 				dfp->dfp_count);
+		trace_xfs_defer_intake_work(tp->t_mountp, dfp);
 		list_sort(tp->t_mountp, &dfp->dfp_work,
 				dfp->dfp_type->diff_items);
 		list_for_each(li, &dfp->dfp_work)
@@ -179,20 +220,15 @@ xfs_defer_trans_abort(
 {
 	struct xfs_defer_pending	*dfp;
 
-	/*
-	 * If the transaction was committed, drop the intent reference
-	 * since we're bailing out of here. The other reference is
-	 * dropped when the intent hits the AIL.  If the transaction
-	 * was not committed, the intent is freed by the intent item
-	 * unlock handler on abort.
-	 */
-	if (!dop->dop_committed)
-		return;
+	trace_xfs_defer_trans_abort(tp->t_mountp, dop);
 
-	/* Abort intent items. */
+	/* Abort intent items that don't have a done item. */
 	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
-		if (dfp->dfp_committed)
+		trace_xfs_defer_pending_abort(tp->t_mountp, dfp);
+		if (dfp->dfp_intent && !dfp->dfp_done) {
 			dfp->dfp_type->abort_intent(dfp->dfp_intent);
+			dfp->dfp_intent = NULL;
+		}
 	}
 
 	/* Shut down FS. */
@@ -217,9 +253,12 @@ xfs_defer_trans_roll(
 		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
 	}
 
+	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
+
 	/* Roll the transaction. */
 	error = xfs_trans_roll(tp, ip);
 	if (error) {
+		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
 		xfs_defer_trans_abort(*tp, dop, error);
 		return error;
 	}
@@ -284,12 +323,13 @@ xfs_defer_finish(
 	struct xfs_defer_pending	*dfp;
 	struct list_head		*li;
 	struct list_head		*n;
-	void				*done_item = NULL;
 	void				*state;
 	int				error = 0;
 	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
 
 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+
+	trace_xfs_defer_finish((*tp)->t_mountp, dop);
 
 	/* Until we run out of pending work to finish... */
 	while (xfs_defer_has_unfinished_work(dop)) {
@@ -301,17 +341,11 @@ xfs_defer_finish(
 		if (error)
 			goto out;
 
-		/* Mark all pending intents as committed. */
-		list_for_each_entry_reverse(dfp, &dop->dop_pending, dfp_list) {
-			if (dfp->dfp_committed)
-				break;
-			dfp->dfp_committed = true;
-		}
-
 		/* Log an intent-done item for the first pending item. */
 		dfp = list_first_entry(&dop->dop_pending,
 				struct xfs_defer_pending, dfp_list);
-		done_item = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
+		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+		dfp->dfp_done = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
 				dfp->dfp_count);
 		cleanup_fn = dfp->dfp_type->finish_cleanup;
 
@@ -321,8 +355,17 @@ xfs_defer_finish(
 			list_del(li);
 			dfp->dfp_count--;
 			error = dfp->dfp_type->finish_item(*tp, dop, li,
-					done_item, &state);
-			if (error) {
+					dfp->dfp_done, &state);
+			if (error == -EAGAIN) {
+				/*
+				 * Caller wants a fresh transaction;
+				 * put the work item back on the list
+				 * and jump out.
+				 */
+				list_add(li, &dfp->dfp_work);
+				dfp->dfp_count++;
+				break;
+			} else if (error) {
 				/*
 				 * Clean up after ourselves and jump out.
 				 * xfs_defer_cancel will take care of freeing
@@ -334,15 +377,35 @@ xfs_defer_finish(
 				goto out;
 			}
 		}
-		/* Done with the dfp, free it. */
-		list_del(&dfp->dfp_list);
-		kmem_free(dfp);
+		if (error == -EAGAIN) {
+			/*
+			 * Caller wants a fresh transaction, so log a
+			 * new log intent item to replace the old one
+			 * and roll the transaction.  See "Requesting
+			 * a Fresh Transaction while Finishing
+			 * Deferred Work" above.
+			 */
+			dfp->dfp_intent = dfp->dfp_type->create_intent(*tp,
+					dfp->dfp_count);
+			dfp->dfp_done = NULL;
+			list_for_each(li, &dfp->dfp_work)
+				dfp->dfp_type->log_item(*tp, dfp->dfp_intent,
+						li);
+		} else {
+			/* Done with the dfp, free it. */
+			list_del(&dfp->dfp_list);
+			kmem_free(dfp);
+		}
 
 		if (cleanup_fn)
 			cleanup_fn(*tp, state, error);
 	}
 
 out:
+	if (error)
+		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+	else
+		trace_xfs_defer_finish_done((*tp)->t_mountp, dop);
 	return error;
 }
 
@@ -358,11 +421,14 @@ xfs_defer_cancel(
 	struct list_head		*pwi;
 	struct list_head		*n;
 
+	trace_xfs_defer_cancel(NULL, dop);
+
 	/*
 	 * Free the pending items.  Caller should already have arranged
 	 * for the intent items to be released.
 	 */
 	list_for_each_entry_safe(dfp, pli, &dop->dop_intake, dfp_list) {
+		trace_xfs_defer_intake_cancel(NULL, dfp);
 		list_del(&dfp->dfp_list);
 		list_for_each_safe(pwi, n, &dfp->dfp_work) {
 			list_del(pwi);
@@ -373,6 +439,7 @@ xfs_defer_cancel(
 		kmem_free(dfp);
 	}
 	list_for_each_entry_safe(dfp, pli, &dop->dop_pending, dfp_list) {
+		trace_xfs_defer_pending_cancel(NULL, dfp);
 		list_del(&dfp->dfp_list);
 		list_for_each_safe(pwi, n, &dfp->dfp_work) {
 			list_del(pwi);
@@ -410,8 +477,8 @@ xfs_defer_add(
 		dfp = kmem_alloc(sizeof(struct xfs_defer_pending),
 				KM_SLEEP | KM_NOFS);
 		dfp->dfp_type = defer_op_types[type];
-		dfp->dfp_committed = false;
 		dfp->dfp_intent = NULL;
+		dfp->dfp_done = NULL;
 		dfp->dfp_count = 0;
 		INIT_LIST_HEAD(&dfp->dfp_work);
 		list_add_tail(&dfp->dfp_list, &dop->dop_intake);
@@ -441,4 +508,5 @@ xfs_defer_init(
 	*fbp = NULLFSBLOCK;
 	INIT_LIST_HEAD(&dop->dop_intake);
 	INIT_LIST_HEAD(&dop->dop_pending);
+	trace_xfs_defer_init(NULL, dop);
 }

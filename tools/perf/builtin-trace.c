@@ -21,9 +21,11 @@
 #include "builtin.h"
 #include "util/color.h"
 #include "util/debug.h"
+#include "util/event.h"
 #include "util/evlist.h"
 #include <subcmd/exec-cmd.h>
 #include "util/machine.h"
+#include "util/path.h"
 #include "util/session.h"
 #include "util/thread.h"
 #include <subcmd/parse-options.h>
@@ -31,17 +33,25 @@
 #include "util/intlist.h"
 #include "util/thread_map.h"
 #include "util/stat.h"
+#include "trace/beauty/beauty.h"
 #include "trace-event.h"
 #include "util/parse-events.h"
 #include "callchain.h"
+#include "print_binary.h"
+#include "string2.h"
 #include "syscalltbl.h"
 #include "rb_resort.h"
 
+#include <errno.h>
+#include <inttypes.h>
 #include <libaudit.h> /* FIXME: Still needed for audit_errno_to_name */
+#include <poll.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <linux/err.h>
 #include <linux/audit.h>
+#include <linux/kernel.h>
 #include <linux/random.h>
 #include <linux/stringify.h>
 #include <linux/time64.h>
@@ -266,15 +276,6 @@ out_delete:
 #define perf_evsel__sc_tp_ptr(evsel, name, sample) \
 	({ struct syscall_tp *fields = evsel->priv; \
 	   fields->name.pointer(&fields->name, sample); })
-
-struct syscall_arg {
-	unsigned long val;
-	struct thread *thread;
-	struct trace  *trace;
-	void	      *parm;
-	u8	      idx;
-	u8	      mask;
-};
 
 struct strarray {
 	int	    offset;
@@ -768,6 +769,14 @@ static struct syscall_fmt {
 	  .arg_parm	 = { [0] = &strarray__socket_families, /* family */ }, },
 	{ .name	    = "stat",	    .errmsg = true, .alias = "newstat", },
 	{ .name	    = "statfs",	    .errmsg = true, },
+#if 0
+	XXX there is no statx syscall in RHEL7
+
+	{ .name	    = "statx",	    .errmsg = true,
+	  .arg_scnprintf = { [0] = SCA_FDAT, /* flags */
+			     [2] = SCA_STATX_FLAGS, /* flags */
+			     [3] = SCA_STATX_MASK, /* mask */ }, },
+#endif
 	{ .name	    = "swapoff",    .errmsg = true,
 	  .arg_scnprintf = { [0] = SCA_FILENAME, /* specialfile */ }, },
 	{ .name	    = "swapon",	    .errmsg = true,
@@ -1419,7 +1428,7 @@ static struct syscall *trace__syscall_info(struct trace *trace,
 	return &trace->syscalls.table[id];
 
 out_cant_read:
-	if (verbose) {
+	if (verbose > 0) {
 		fprintf(trace->output, "Problems reading syscall %d", id);
 		if (id <= trace->syscalls.max && trace->syscalls.table[id].name != NULL)
 			fprintf(trace->output, "(%s)", trace->syscalls.table[id].name);
@@ -1794,10 +1803,10 @@ static void print_location(FILE *f, struct perf_sample *sample,
 			   bool print_dso, bool print_sym)
 {
 
-	if ((verbose || print_dso) && al->map)
+	if ((verbose > 0 || print_dso) && al->map)
 		fprintf(f, "%s@", al->map->dso->long_name);
 
-	if ((verbose || print_sym) && al->sym)
+	if ((verbose > 0 || print_sym) && al->sym)
 		fprintf(f, "%s+0x%" PRIx64, al->sym->name,
 			al->addr - al->sym->start);
 	else if (al->map)

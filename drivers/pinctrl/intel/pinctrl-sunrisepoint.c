@@ -30,6 +30,8 @@
 		.padcfglock_offset = SPT_PADCFGLOCK,	\
 		.hostown_offset = SPT_HOSTSW_OWN,	\
 		.ie_offset = SPT_GPI_IE,		\
+		.gpp_size = 24,				\
+		.gpp_num_padown_regs = 4,		\
 		.pin_base = (s),			\
 		.npins = ((e) - (s) + 1),		\
 	}

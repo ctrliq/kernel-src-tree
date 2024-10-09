@@ -7,6 +7,7 @@
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/spinlock.h>
+#include <linux/utsname.h>
 
 #include <linux/ceph/types.h>
 #include <linux/ceph/messenger.h>
@@ -47,6 +48,14 @@ struct ceph_mds_reply_info_in {
 	u32 pool_ns_len;
 };
 
+struct ceph_mds_reply_dir_entry {
+	char                          *name;
+	u32                           name_len;
+	struct ceph_mds_reply_lease   *lease;
+	struct ceph_mds_reply_info_in inode;
+	loff_t			      offset;
+};
+
 /*
  * parsed info about an mds reply, including information about
  * either: 1) the target inode and/or its parent directory and dentry,
@@ -73,11 +82,11 @@ struct ceph_mds_reply_info_parsed {
 			struct ceph_mds_reply_dirfrag *dir_dir;
 			size_t			      dir_buf_size;
 			int                           dir_nr;
-			char                          **dir_dname;
-			u32                           *dir_dname_len;
-			struct ceph_mds_reply_lease   **dir_dlease;
-			struct ceph_mds_reply_info_in *dir_in;
-			u8                            dir_complete, dir_end;
+			bool			      dir_end;
+			bool			      dir_complete;
+			bool			      hash_order;
+			bool			      offset_hash;
+			struct ceph_mds_reply_dir_entry  *dir_entries;
 		};
 
 		/* for create results */
@@ -96,10 +105,13 @@ struct ceph_mds_reply_info_parsed {
 
 /*
  * cap releases are batched and sent to the MDS en masse.
+ *
+ * Account for per-message overhead of mds_cap_release header
+ * and __le32 for osd epoch barrier trailing field.
  */
-#define CEPH_CAPS_PER_RELEASE ((PAGE_CACHE_SIZE -			\
+#define CEPH_CAPS_PER_RELEASE ((PAGE_CACHE_SIZE - sizeof(u32) -		\
 				sizeof(struct ceph_mds_cap_release)) /	\
-			       sizeof(struct ceph_mds_cap_item))
+			        sizeof(struct ceph_mds_cap_item))
 
 
 /*
@@ -194,7 +206,7 @@ struct ceph_mds_request {
 	char *r_path1, *r_path2;
 	struct ceph_vino r_ino1, r_ino2;
 
-	struct inode *r_locked_dir; /* dir (if any) i_mutex locked by vfs */
+	struct inode *r_parent;		    /* parent dir inode */
 	struct inode *r_target_inode;       /* resulting inode */
 
 #define CEPH_MDS_R_DIRECT_IS_HASH	(1) /* r_direct_hash is valid */
@@ -203,6 +215,7 @@ struct ceph_mds_request {
 #define CEPH_MDS_R_GOT_SAFE		(4) /* got a safe reply */
 #define CEPH_MDS_R_GOT_RESULT		(5) /* got a result */
 #define CEPH_MDS_R_DID_PREPOPULATE	(6) /* prepopulated readdir */
+#define CEPH_MDS_R_PARENT_LOCKED	(7) /* is r_parent->i_rwsem wlocked? */
 	unsigned long	r_req_flags;
 
 	struct mutex r_fill_mutex;
@@ -352,6 +365,8 @@ struct ceph_mds_client {
 
 	struct rw_semaphore     pool_perm_rwsem;
 	struct rb_root		pool_perm_tree;
+
+	char nodename[__NEW_UTS_LEN + 1];
 };
 
 extern const char *ceph_mds_op_name(int op);
@@ -379,10 +394,6 @@ extern void ceph_mdsc_force_umount(struct ceph_mds_client *mdsc);
 extern void ceph_mdsc_destroy(struct ceph_fs_client *fsc);
 
 extern void ceph_mdsc_sync(struct ceph_mds_client *mdsc);
-
-extern void ceph_mdsc_lease_release(struct ceph_mds_client *mdsc,
-				    struct inode *inode,
-				    struct dentry *dn);
 
 extern void ceph_invalidate_dir_request(struct ceph_mds_request *req);
 extern int ceph_alloc_readdir_reply_buffer(struct ceph_mds_request *req,

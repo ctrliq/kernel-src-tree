@@ -72,6 +72,7 @@
 #include <linux/perf_event.h>
 #include <linux/file.h>
 #include <linux/ptrace.h>
+#include <linux/kaiser.h>
 #include <linux/blkdev.h>
 #include <linux/elevator.h>
 #include <linux/random.h>
@@ -462,6 +463,8 @@ void __init __weak thread_info_cache_init(void)
 }
 #endif
 
+void __init __weak mem_encrypt_init(void) { }
+
 /*
  * Set up kernel memory allocators
  */
@@ -478,6 +481,8 @@ static void __init mm_init(void)
 	pgtable_init();
 	vmalloc_init();
 	ioremap_huge_init();
+	/* This just needs to be done before we first run userspace: */
+	kaiser_init();
 }
 
 asmlinkage void __init start_kernel(void)
@@ -595,6 +600,14 @@ asmlinkage void __init start_kernel(void)
 	 */
 	locking_selftest();
 
+	/*
+	 * This needs to be called before any devices perform DMA
+	 * operations that might use the SWIOTLB bounce buffers. It will
+	 * mark the bounce buffers as decrypted so that their usage will
+	 * not cause "plain-text" data to be decrypted when accessed.
+	 */
+	mem_encrypt_init();
+
 #ifdef CONFIG_BLK_DEV_INITRD
 	if (initrd_start && !initrd_below_start_ok &&
 	    page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) {
@@ -605,8 +618,8 @@ asmlinkage void __init start_kernel(void)
 	}
 #endif
 	page_cgroup_init();
-	debug_objects_mem_init();
 	kmemleak_init();
+	debug_objects_mem_init();
 	setup_per_cpu_pageset();
 	numa_policy_init();
 	if (late_time_init)

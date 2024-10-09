@@ -20,9 +20,7 @@
 
 #include "fm10k.h"
 #include <linux/vmalloc.h>
-#ifdef CONFIG_FM10K_VXLAN
-#include <net/vxlan.h>
-#endif /* CONFIG_FM10K_VXLAN */
+#include <net/udp_tunnel.h>
 
 /**
  * fm10k_setup_tx_resources - allocate Tx resources (Descriptors)
@@ -436,6 +434,7 @@ static void fm10k_restore_vxlan_port(struct fm10k_intfc *interface)
  * @netdev: network interface device structure
  * @sa_family: Address family of new port
  * @port: port number used for VXLAN
+ * @type: Enumerated value specifying udp encapsulation type
  *
  * This function is called when a new VXLAN interface has added a new port
  * number to the range that is currently in use for VXLAN.  The new port
@@ -444,18 +443,21 @@ static void fm10k_restore_vxlan_port(struct fm10k_intfc *interface)
  * is always used as the VXLAN port number for offloads.
  **/
 static void fm10k_add_vxlan_port(struct net_device *dev,
-				 sa_family_t sa_family, __be16 port) {
+				 struct udp_tunnel_info *ti)
+{
 	struct fm10k_intfc *interface = netdev_priv(dev);
 	struct fm10k_vxlan_port *vxlan_port;
 
+	if (ti->type != UDP_TUNNEL_TYPE_VXLAN)
+		return;
 	/* only the PF supports configuring tunnels */
 	if (interface->hw.mac.type != fm10k_mac_pf)
 		return;
 
 	/* existing ports are pulled out so our new entry is always last */
 	fm10k_vxlan_port_for_each(vxlan_port, interface) {
-		if ((vxlan_port->port == port) &&
-		    (vxlan_port->sa_family == sa_family)) {
+		if ((vxlan_port->port == ti->port) &&
+		    (vxlan_port->sa_family == ti->sa_family)) {
 			list_del(&vxlan_port->list);
 			goto insert_tail;
 		}
@@ -465,8 +467,8 @@ static void fm10k_add_vxlan_port(struct net_device *dev,
 	vxlan_port = kmalloc(sizeof(*vxlan_port), GFP_ATOMIC);
 	if (!vxlan_port)
 		return;
-	vxlan_port->port = port;
-	vxlan_port->sa_family = sa_family;
+	vxlan_port->port = ti->port;
+	vxlan_port->sa_family = ti->sa_family;
 
 insert_tail:
 	/* add new port value to list */
@@ -480,6 +482,7 @@ insert_tail:
  * @netdev: network interface device structure
  * @sa_family: Address family of freed port
  * @port: port number used for VXLAN
+ * @type: Enumerated value specifying udp encapsulation type
  *
  * This function is called when a new VXLAN interface has freed a port
  * number from the range that is currently in use for VXLAN.  The freed
@@ -487,17 +490,20 @@ insert_tail:
  * the port number for offloads.
  **/
 static void fm10k_del_vxlan_port(struct net_device *dev,
-				 sa_family_t sa_family, __be16 port) {
+				 struct udp_tunnel_info *ti)
+{
 	struct fm10k_intfc *interface = netdev_priv(dev);
 	struct fm10k_vxlan_port *vxlan_port;
 
+	if (ti->type != UDP_TUNNEL_TYPE_VXLAN)
+		return;
 	if (interface->hw.mac.type != fm10k_mac_pf)
 		return;
 
 	/* find the port in the list and free it */
 	fm10k_vxlan_port_for_each(vxlan_port, interface) {
-		if ((vxlan_port->port == port) &&
-		    (vxlan_port->sa_family == sa_family)) {
+		if ((vxlan_port->port == ti->port) &&
+		    (vxlan_port->sa_family == ti->sa_family)) {
 			list_del(&vxlan_port->list);
 			kfree(vxlan_port);
 			break;
@@ -553,10 +559,8 @@ int fm10k_open(struct net_device *netdev)
 	if (err)
 		goto err_set_queues;
 
-#ifdef CONFIG_FM10K_VXLAN
 	/* update VXLAN port configuration */
-	vxlan_get_rx_port(netdev);
-#endif
+	udp_tunnel_get_rx_info(netdev);
 
 	fm10k_up(interface);
 
@@ -1132,8 +1136,8 @@ void fm10k_reset_rx_state(struct fm10k_intfc *interface)
  * Obtain 64bit statistics in a way that is safe for both 32bit and 64bit
  * architectures.
  */
-static struct rtnl_link_stats64 *fm10k_get_stats64(struct net_device *netdev,
-						   struct rtnl_link_stats64 *stats)
+static void fm10k_get_stats64(struct net_device *netdev,
+			      struct rtnl_link_stats64 *stats)
 {
 	struct fm10k_intfc *interface = netdev_priv(netdev);
 	struct fm10k_ring *ring;
@@ -1178,8 +1182,6 @@ static struct rtnl_link_stats64 *fm10k_get_stats64(struct net_device *netdev,
 
 	/* following stats updated by fm10k_service_task() */
 	stats->rx_missed_errors	= netdev->stats.rx_missed_errors;
-
-	return stats;
 }
 
 int fm10k_setup_tc(struct net_device *dev, u8 tc)
@@ -1236,13 +1238,17 @@ err_queueing_scheme:
 	return err;
 }
 
-static int __fm10k_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
-			    struct tc_to_netdev *tc)
+static int __fm10k_setup_tc(struct net_device *dev, enum tc_setup_type type,
+			    void *type_data)
 {
-	if (tc->type != TC_SETUP_MQPRIO)
-		return -EINVAL;
+	struct tc_mqprio_qopt *mqprio = type_data;
 
-	return fm10k_setup_tc(dev, tc->tc);
+	if (type != TC_SETUP_MQPRIO)
+		return -EOPNOTSUPP;
+
+	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+
+	return fm10k_setup_tc(dev, mqprio->num_tc);
 }
 
 #if 0
@@ -1406,25 +1412,25 @@ static void fm10k_dfwd_del_station(struct net_device *dev, void *priv)
 #endif
 
 static const struct net_device_ops fm10k_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= fm10k_open,
 	.ndo_stop		= fm10k_close,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_start_xmit		= fm10k_xmit_frame,
 	.ndo_set_mac_address	= fm10k_set_mac,
-	.ndo_change_mtu		= fm10k_change_mtu,
+	.ndo_change_mtu_rh74	= fm10k_change_mtu,
 	.ndo_tx_timeout		= fm10k_tx_timeout,
 	.ndo_vlan_rx_add_vid	= fm10k_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= fm10k_vlan_rx_kill_vid,
 	.ndo_set_rx_mode	= fm10k_set_rx_mode,
 	.ndo_get_stats64	= fm10k_get_stats64,
-	.ndo_setup_tc		= __fm10k_setup_tc,
+	.extended.ndo_setup_tc_rh = __fm10k_setup_tc,
 	.ndo_set_vf_mac		= fm10k_ndo_set_vf_mac,
 	.extended.ndo_set_vf_vlan	= fm10k_ndo_set_vf_vlan,
 	.ndo_set_vf_tx_rate	= fm10k_ndo_set_vf_bw,
 	.ndo_get_vf_config	= fm10k_ndo_get_vf_config,
-	.ndo_add_vxlan_port	= fm10k_add_vxlan_port,
-	.ndo_del_vxlan_port	= fm10k_del_vxlan_port,
-	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_udp_tunnel_add	= fm10k_add_vxlan_port,
+	.extended.ndo_udp_tunnel_del	= fm10k_del_vxlan_port,
 #if 0
 	.extended.ndo_dfwd_add_station	= fm10k_dfwd_add_station,
 	.extended.ndo_dfwd_del_station	= fm10k_dfwd_del_station,

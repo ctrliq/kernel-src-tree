@@ -742,6 +742,36 @@ static int inet_diag_fill_req(struct sk_buff *skb, struct sock *sk,
 
 	r = nlmsg_data(nlh);
 	inet_diag_msg_common_fill(r, (struct sock *)ireq);
+
+	/* RHEL hack: detect TCP SYN-RECV pseudo sockets with IPv4-mapped-IPv6
+	 * addresses in listeners hash table with AF_INET6 family but only IPv4
+	 * part of the address filled in, and fix up the addresses in the diag
+	 * response.
+	 *
+	 * This doesn't need to be fixed upstream as SYN-RECV pseudo sockets
+	 * have been moved to the ehash table, together with fully initialized
+	 * address storage, by:
+	 *
+	 *	commit 079096f103faca2dd87342cca6f23d4b34da8871
+	 *	Author: Eric Dumazet <edumazet@google.com>
+	 *	Date:   Fri Oct 2 11:43:32 2015 -0700
+	 *
+	 *	    tcp/dccp: install syn_recv requests into ehash table
+	 */
+#if IS_ENABLED(CONFIG_IPV6)
+	if (ireq->ireq_family == AF_INET6 && req->rsk_ops->family == AF_INET) {
+		struct sock *req_sk = (struct sock *)ireq;
+
+		memset(&r->id.idiag_src, 0, sizeof(r->id.idiag_src));
+		memset(&r->id.idiag_dst, 0, sizeof(r->id.idiag_dst));
+
+		r->id.idiag_src[2] = htonl(0xffff);
+		r->id.idiag_src[3] = req_sk->sk_rcv_saddr;
+		r->id.idiag_dst[2] = htonl(0xffff);
+		r->id.idiag_dst[3] = req_sk->sk_daddr;
+	}
+#endif
+
 	r->idiag_state = TCP_SYN_RECV;
 	r->idiag_timer = 1;
 	r->idiag_retrans = req->num_retrans;

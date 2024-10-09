@@ -2751,7 +2751,7 @@ static const struct net_device_ops cxgb4vf_netdev_ops	= {
 	.ndo_set_mac_address	= cxgb4vf_set_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_do_ioctl		= cxgb4vf_do_ioctl,
-	.ndo_change_mtu		= cxgb4vf_change_mtu,
+	.ndo_change_mtu_rh74	= cxgb4vf_change_mtu,
 	.ndo_fix_features	= cxgb4vf_fix_features,
 	.ndo_set_features	= cxgb4vf_set_features,
 #ifdef CONFIG_NET_POLL_CONTROLLER

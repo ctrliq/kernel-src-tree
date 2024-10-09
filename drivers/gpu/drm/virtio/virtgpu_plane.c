@@ -116,6 +116,7 @@ uint32_t virtio_gpu_translate_format(uint32_t drm_fourcc)
 
 static void virtio_gpu_plane_destroy(struct drm_plane *plane)
 {
+	drm_plane_cleanup(plane);
 	kfree(plane);
 }
 
@@ -297,7 +298,7 @@ struct drm_plane *virtio_gpu_plane_init(struct virtio_gpu_device *vgdev,
 	ret = drm_universal_plane_init(dev, plane, 1 << index,
 				       &virtio_gpu_plane_funcs,
 				       formats, nformats,
-				       type, NULL);
+				       NULL, type, NULL);
 	if (ret)
 		goto err_plane_init;
 

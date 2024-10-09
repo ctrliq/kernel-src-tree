@@ -108,7 +108,7 @@ enum {
 	MLX4_MFUNC_EQE_MASK     = (MLX4_MFUNC_MAX_EQES - 1)
 };
 
-/* Driver supports 3 diffrent device methods to manage traffic steering:
+/* Driver supports 3 different device methods to manage traffic steering:
  *	-device managed - High level API for ib and eth flow steering. FW is
  *			  managing flow steering tables.
  *	- B0 steering mode - Common low level API for ib and (if supported) eth.
@@ -1025,8 +1025,7 @@ struct mlx4_mad_ifc {
 #define mlx4_foreach_ib_transport_port(port, dev)                         \
 	for ((port) = 1; (port) <= (dev)->caps.num_ports; (port)++)       \
 		if (((dev)->caps.port_mask[port] == MLX4_PORT_TYPE_IB) || \
-			((dev)->caps.flags & MLX4_DEV_CAP_FLAG_IBOE) || \
-			((dev)->caps.flags2 & MLX4_DEV_CAP_FLAG2_ROCE_V1_V2))
+		    ((dev)->caps.port_mask[port] == MLX4_PORT_TYPE_ETH))
 
 #define MLX4_INVALID_SLAVE_ID	0xFF
 #define MLX4_SINK_COUNTER_INDEX(dev)	(dev->caps.max_counters - 1)
@@ -1477,7 +1476,7 @@ int mlx4_get_roce_gid_from_slave(struct mlx4_dev *dev, int port, int slave_id,
 int mlx4_FLOW_STEERING_IB_UC_QP_RANGE(struct mlx4_dev *dev, u32 min_range_qpn,
 				      u32 max_range_qpn);
 
-cycle_t mlx4_read_clock(struct mlx4_dev *dev);
+u64 mlx4_read_clock(struct mlx4_dev *dev);
 
 struct mlx4_active_ports {
 	DECLARE_BITMAP(ports, MLX4_MAX_PORTS);

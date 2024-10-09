@@ -220,12 +220,15 @@ static int _opcode_stats_seq_show(struct seq_file *s, void *v)
 	u64 n_packets = 0, n_bytes = 0;
 	struct hfi1_ibdev *ibd = (struct hfi1_ibdev *)s->private;
 	struct hfi1_devdata *dd = dd_from_dev(ibd);
+	struct hfi1_ctxtdata *rcd;
 
 	for (j = 0; j < dd->first_dyn_alloc_ctxt; j++) {
-		if (!dd->rcd[j])
-			continue;
-		n_packets += dd->rcd[j]->opstats->stats[i].n_packets;
-		n_bytes += dd->rcd[j]->opstats->stats[i].n_bytes;
+		rcd = hfi1_rcd_get_by_index(dd, j);
+		if (rcd) {
+			n_packets += rcd->opstats->stats[i].n_packets;
+			n_bytes += rcd->opstats->stats[i].n_bytes;
+		}
+		hfi1_rcd_put(rcd);
 	}
 	if (!n_packets && !n_bytes)
 		return SEQ_SKIP;
@@ -278,6 +281,7 @@ static int _ctx_stats_seq_show(struct seq_file *s, void *v)
 	u64 n_packets = 0;
 	struct hfi1_ibdev *ibd = (struct hfi1_ibdev *)s->private;
 	struct hfi1_devdata *dd = dd_from_dev(ibd);
+	struct hfi1_ctxtdata *rcd;
 
 	if (v == SEQ_START_TOKEN) {
 		seq_puts(s, "Ctx:npkts\n");
@@ -287,11 +291,14 @@ static int _ctx_stats_seq_show(struct seq_file *s, void *v)
 	spos = v;
 	i = *spos;
 
-	if (!dd->rcd[i])
+	rcd = hfi1_rcd_get_by_index(dd, i);
+	if (!rcd)
 		return SEQ_SKIP;
 
-	for (j = 0; j < ARRAY_SIZE(dd->rcd[i]->opstats->stats); j++)
-		n_packets += dd->rcd[i]->opstats->stats[j].n_packets;
+	for (j = 0; j < ARRAY_SIZE(rcd->opstats->stats); j++)
+		n_packets += rcd->opstats->stats[j].n_packets;
+
+	hfi1_rcd_put(rcd);
 
 	if (!n_packets)
 		return SEQ_SKIP;
@@ -1191,12 +1198,15 @@ static int _fault_stats_seq_show(struct seq_file *s, void *v)
 	u64 n_packets = 0, n_bytes = 0;
 	struct hfi1_ibdev *ibd = (struct hfi1_ibdev *)s->private;
 	struct hfi1_devdata *dd = dd_from_dev(ibd);
+	struct hfi1_ctxtdata *rcd;
 
 	for (j = 0; j < dd->first_dyn_alloc_ctxt; j++) {
-		if (!dd->rcd[j])
-			continue;
-		n_packets += dd->rcd[j]->opstats->stats[i].n_packets;
-		n_bytes += dd->rcd[j]->opstats->stats[i].n_bytes;
+		rcd = hfi1_rcd_get_by_index(dd, j);
+		if (rcd) {
+			n_packets += rcd->opstats->stats[i].n_packets;
+			n_bytes += rcd->opstats->stats[i].n_bytes;
+		}
+		hfi1_rcd_put(rcd);
 	}
 	if (!n_packets && !n_bytes)
 		return SEQ_SKIP;
@@ -1235,7 +1245,7 @@ static int fault_init_opcode_debugfs(struct hfi1_ibdev *ibd)
 	ibd->fault_opcode->attr.stacktrace_depth = 32;
 	ibd->fault_opcode->attr.dname = NULL;
 	ibd->fault_opcode->attr.verbose = 0;
-	ibd->fault_opcode->fault_by_opcode = false;
+	ibd->fault_opcode->fault_by_opcode = 0;
 	ibd->fault_opcode->opcode = 0;
 	ibd->fault_opcode->mask = 0xff;
 
@@ -1286,7 +1296,7 @@ static int fault_init_packet_debugfs(struct hfi1_ibdev *ibd)
 	ibd->fault_packet->attr.stacktrace_depth = 32;
 	ibd->fault_packet->attr.dname = NULL;
 	ibd->fault_packet->attr.verbose = 0;
-	ibd->fault_packet->fault_by_packet = false;
+	ibd->fault_packet->fault_by_packet = 0;
 
 	ibd->fault_packet->dir =
 		fault_create_debugfs_attr("fault_packet",
@@ -1333,20 +1343,20 @@ static int fault_init_debugfs(struct hfi1_ibdev *ibd)
 	return ret;
 }
 
-bool hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd)
+u32 hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd)
 {
 	return ibd->fault_suppress_err;
 }
 
-bool hfi1_dbg_fault_opcode(struct rvt_qp *qp, u32 opcode, bool rx)
+u32 hfi1_dbg_fault_opcode(struct rvt_qp *qp, u32 opcode, u32 rx)
 {
-	bool ret = false;
+	int ret = 0;
 	struct hfi1_ibdev *ibd = to_idev(qp->ibqp.device);
 
 	if (!ibd->fault_opcode || !ibd->fault_opcode->fault_by_opcode)
-		return false;
+		return 0;
 	if (ibd->fault_opcode->opcode != (opcode & ibd->fault_opcode->mask))
-		return false;
+		return 0;
 	ret = should_fail(&ibd->fault_opcode->attr, 1);
 	if (ret) {
 		trace_hfi1_fault_opcode(qp, opcode);
@@ -1358,14 +1368,14 @@ bool hfi1_dbg_fault_opcode(struct rvt_qp *qp, u32 opcode, bool rx)
 	return ret;
 }
 
-bool hfi1_dbg_fault_packet(struct hfi1_packet *packet)
+u32 hfi1_dbg_fault_packet(struct hfi1_packet *packet)
 {
 	struct rvt_dev_info *rdi = &packet->rcd->ppd->dd->verbs_dev.rdi;
 	struct hfi1_ibdev *ibd = dev_from_rdi(rdi);
-	bool ret = false;
+	u32 ret = 0;
 
 	if (!ibd->fault_packet || !ibd->fault_packet->fault_by_packet)
-		return false;
+		return 0;
 
 	ret = should_fail(&ibd->fault_packet->attr, 1);
 	if (ret) {

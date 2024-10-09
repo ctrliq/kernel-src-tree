@@ -29,8 +29,8 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-#ifndef _QED_ROCE_H
-#define _QED_ROCE_H
+#ifndef _QED_RDMA_H
+#define _QED_RDMA_H
 #include <linux/types.h>
 #include <linux/bitops.h>
 #include <linux/kernel.h>
@@ -38,11 +38,12 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/qed/qed_if.h>
-#include <linux/qed/qed_roce_if.h>
+#include <linux/qed/qed_rdma_if.h>
 #include "qed.h"
 #include "qed_dev_api.h"
 #include "qed_hsi.h"
-#include "qed_ll2.h"
+#include "qed_iwarp.h"
+#include "qed_roce.h"
 
 #define QED_RDMA_MAX_FMR                    (RDMA_MAX_TIDS)
 #define QED_RDMA_MAX_P_KEY                  (1)
@@ -84,6 +85,7 @@ struct qed_rdma_info {
 	struct qed_bmap qp_map;
 	struct qed_bmap srq_map;
 	struct qed_bmap cid_map;
+	struct qed_bmap tcp_cid_map;
 	struct qed_bmap real_cid_map;
 	struct qed_bmap dpi_map;
 	struct qed_bmap toggle_bits;
@@ -97,6 +99,7 @@ struct qed_rdma_info {
 	u16 queue_zone_base;
 	u16 max_queue_zones;
 	enum protocol_type proto;
+	struct qed_iwarp_info iwarp;
 };
 
 struct qed_rdma_qp {
@@ -105,6 +108,7 @@ struct qed_rdma_qp {
 	u32 qpid;
 	u16 icid;
 	enum qed_roce_qp_state cur_state;
+	enum qed_iwarp_qp_state iwarp_state;
 	bool use_srq;
 	bool signal_all;
 	bool fmr_and_reserved_lkey;
@@ -164,15 +168,39 @@ struct qed_rdma_qp {
 
 	void *shared_queue;
 	dma_addr_t shared_queue_phys_addr;
+	struct qed_iwarp_ep *ep;
 };
 
 #if IS_ENABLED(CONFIG_QED_RDMA)
 void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
-void qed_roce_dpm_dcbx(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
+void qed_rdma_dpm_conf(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
 #else
-static inline void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt) {}
-
-static inline void qed_roce_dpm_dcbx(struct qed_hwfn *p_hwfn,
-				     struct qed_ptt *p_ptt) {}
+static inline void qed_rdma_dpm_conf(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt) {}
+static inline void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn,
+				    struct qed_ptt *p_ptt) {}
 #endif
+
+int
+qed_rdma_bmap_alloc(struct qed_hwfn *p_hwfn,
+		    struct qed_bmap *bmap, u32 max_count, char *name);
+
+void
+qed_rdma_bmap_free(struct qed_hwfn *p_hwfn, struct qed_bmap *bmap, bool check);
+
+int
+qed_rdma_bmap_alloc_id(struct qed_hwfn *p_hwfn,
+		       struct qed_bmap *bmap, u32 *id_num);
+
+void
+qed_bmap_set_id(struct qed_hwfn *p_hwfn, struct qed_bmap *bmap, u32 id_num);
+
+void
+qed_bmap_release_id(struct qed_hwfn *p_hwfn, struct qed_bmap *bmap, u32 id_num);
+
+int
+qed_bmap_test_id(struct qed_hwfn *p_hwfn, struct qed_bmap *bmap, u32 id_num);
+
+void qed_rdma_set_fw_mac(u16 *p_fw_mac, u8 *p_qed_mac);
+
+bool qed_rdma_allocated_qps(struct qed_hwfn *p_hwfn);
 #endif

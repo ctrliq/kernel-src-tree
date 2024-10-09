@@ -51,16 +51,6 @@
  */
 #define R5L_POOL_SIZE	4
 
-/*
- * r5c journal modes of the array: write-back or write-through.
- * write-through mode has identical behavior as existing log only
- * implementation.
- */
-enum r5c_journal_mode {
-	R5C_JOURNAL_MODE_WRITE_THROUGH = 0,
-	R5C_JOURNAL_MODE_WRITE_BACK = 1,
-};
-
 static char *r5c_journal_mode_str[] = {"write-through",
 				       "write-back"};
 /*
@@ -158,6 +148,9 @@ struct r5l_log {
 
 	spinlock_t stripe_in_journal_lock;
 	atomic_t stripe_in_journal_count;
+
+	/* to disable write back during in degraded mode */
+	struct work_struct disable_writeback_work;
 };
 
 /*
@@ -254,8 +247,8 @@ r5c_return_dev_pending_writes(struct r5conf *conf, struct r5dev *dev,
 	while (wbi && wbi->bi_sector <
 	       dev->sector + STRIPE_SECTORS) {
 		wbi2 = r5_next_bio(wbi, dev->sector);
+		md_write_end(conf->mddev);
 		if (!raid5_dec_bi_active_stripes(wbi)) {
-			md_write_end(conf->mddev);
 			bio_list_add(return_bi, wbi);
 		}
 		wbi = wbi2;
@@ -531,6 +524,32 @@ static void r5l_log_endio(struct bio *bio, int error)
 
 	if (log->need_cache_flush)
 		md_wakeup_thread(log->rdev->mddev->thread);
+}
+
+static void r5c_disable_writeback_async(struct work_struct *work)
+{
+	struct r5l_log *log = container_of(work, struct r5l_log,
+					   disable_writeback_work);
+	struct mddev *mddev = log->rdev->mddev;
+	struct r5conf *conf = mddev->private;
+	int locked = 0;
+
+	if (log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_THROUGH)
+		return;
+	pr_info("md/raid:%s: Disabling writeback cache for degraded array.\n",
+		mdname(mddev));
+
+	/* wait superblock change before suspend */
+	wait_event(mddev->sb_wait,
+		   conf->log == NULL ||
+		   (!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags) &&
+		    (locked = mddev_trylock(mddev))));
+	if (locked) {
+		mddev_suspend(mddev);
+		log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_THROUGH;
+		mddev_resume(mddev);
+		mddev_unlock(mddev);
+	}
 }
 
 static void r5l_submit_current_io(struct r5l_log *log)
@@ -2120,36 +2139,56 @@ static ssize_t r5c_journal_mode_show(struct mddev *mddev, char *page)
 	return ret;
 }
 
-static ssize_t r5c_journal_mode_store(struct mddev *mddev,
-				      const char *page, size_t length)
+/*
+ * Set journal cache mode on @mddev (external API initially needed by dm-raid).
+ *
+ * @mode as defined in 'enum r5c_journal_mode'.
+ *
+ */
+int r5c_journal_mode_set(struct mddev *mddev, int mode)
 {
 	struct r5conf *conf = mddev->private;
 	struct r5l_log *log = conf->log;
-	int val = -1, i;
-	int len = length;
 
 	if (!log)
 		return -ENODEV;
 
-	if (len && page[len - 1] == '\n')
-		len -= 1;
-	for (i = 0; i < ARRAY_SIZE(r5c_journal_mode_str); i++)
-		if (strlen(r5c_journal_mode_str[i]) == len &&
-		    strncmp(page, r5c_journal_mode_str[i], len) == 0) {
-			val = i;
-			break;
-		}
-	if (val < R5C_JOURNAL_MODE_WRITE_THROUGH ||
-	    val > R5C_JOURNAL_MODE_WRITE_BACK)
+	if (mode < R5C_JOURNAL_MODE_WRITE_THROUGH ||
+	    mode > R5C_JOURNAL_MODE_WRITE_BACK)
+		return -EINVAL;
+
+	if (raid5_calc_degraded(conf) > 0 &&
+	    mode == R5C_JOURNAL_MODE_WRITE_BACK)
 		return -EINVAL;
 
 	mddev_suspend(mddev);
-	conf->log->r5c_journal_mode = val;
+	conf->log->r5c_journal_mode = mode;
 	mddev_resume(mddev);
 
 	pr_debug("md/raid:%s: setting r5c cache mode to %d: %s\n",
-		 mdname(mddev), val, r5c_journal_mode_str[val]);
-	return length;
+		 mdname(mddev), mode, r5c_journal_mode_str[mode]);
+	return 0;
+}
+EXPORT_SYMBOL(r5c_journal_mode_set);
+
+static ssize_t r5c_journal_mode_store(struct mddev *mddev,
+				      const char *page, size_t length)
+{
+	int mode = ARRAY_SIZE(r5c_journal_mode_str);
+	size_t len = length;
+
+	if (len < 2)
+		return -EINVAL;
+
+	if (page[len - 1] == '\n')
+		len--;
+
+	while (mode--)
+		if (strlen(r5c_journal_mode_str[mode]) == len &&
+		    !strncmp(page, r5c_journal_mode_str[mode], len))
+			break;
+
+	return r5c_journal_mode_set(mddev, mode) ?: length;
 }
 
 struct md_sysfs_entry
@@ -2195,6 +2234,16 @@ int r5c_try_caching_write(struct r5conf *conf,
 			return -EAGAIN;
 		/* case 2 */
 		set_bit(STRIPE_R5C_CACHING, &sh->state);
+	}
+
+	/*
+	 * When run in degraded mode, array is set to write-through mode.
+	 * This check helps drain pending write safely in the transition to
+	 * write-through mode.
+	 */
+	if (s->failed) {
+		r5c_make_stripe_write_out(sh);
+		return -EAGAIN;
 	}
 
 	for (i = disks; i--; ) {
@@ -2454,6 +2503,19 @@ ioerr:
 	return ret;
 }
 
+void r5c_update_on_rdev_error(struct mddev *mddev)
+{
+	struct r5conf *conf = mddev->private;
+	struct r5l_log *log = conf->log;
+
+	if (!log)
+		return;
+
+	if (raid5_calc_degraded(conf) > 0 &&
+	    conf->log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_BACK)
+		schedule_work(&log->disable_writeback_work);
+}
+
 int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev)
 {
 	struct r5l_log *log;
@@ -2528,6 +2590,8 @@ int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev)
 	INIT_LIST_HEAD(&log->no_space_stripes);
 	spin_lock_init(&log->no_space_stripes_lock);
 
+	INIT_WORK(&log->disable_writeback_work, r5c_disable_writeback_async);
+
 	log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_THROUGH;
 	INIT_LIST_HEAD(&log->stripe_in_journal_list);
 	spin_lock_init(&log->stripe_in_journal_lock);
@@ -2562,6 +2626,9 @@ void r5l_exit_log(struct r5conf *conf)
 	conf->log = NULL;
 	synchronize_rcu();
 
+	/* Ensure disable_writeback_work wakes up and exits */
+	wake_up(&conf->mddev->sb_wait);
+	flush_work(&log->disable_writeback_work);
 	md_unregister_thread(&log->reclaim_thread);
 	mempool_destroy(log->meta_pool);
 	bioset_free(log->bs);

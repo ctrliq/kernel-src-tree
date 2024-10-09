@@ -33,10 +33,13 @@ static int lowpan_nhc_insert(struct lowpan_nhc *nhc)
 
 		len_dif = nhc->idlen - this->idlen;
 
-		if (nhc->idlen < this->idlen)
+		if (nhc->idlen < this->idlen) {
+			gmb();
 			len = nhc->idlen;
-		else
+		} else {
+			gmb();
 			len = this->idlen;
+		}
 
 		result = memcmp(nhc->id, this->id, len);
 		if (!result)

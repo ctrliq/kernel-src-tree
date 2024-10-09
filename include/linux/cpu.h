@@ -36,6 +36,13 @@ extern void cpu_remove_dev_attr(struct device_attribute *attr);
 extern int cpu_add_dev_attr_group(struct attribute_group *attrs);
 extern void cpu_remove_dev_attr_group(struct attribute_group *attrs);
 
+extern ssize_t cpu_show_meltdown(struct device *dev,
+				 struct device_attribute *attr, char *buf);
+extern ssize_t cpu_show_spectre_v1(struct device *dev,
+				   struct device_attribute *attr, char *buf);
+extern ssize_t cpu_show_spectre_v2(struct device *dev,
+				   struct device_attribute *attr, char *buf);
+
 #ifdef CONFIG_HOTPLUG_CPU
 extern void unregister_cpu(struct cpu *cpu);
 extern ssize_t arch_cpu_probe(const char *, size_t);
@@ -217,6 +224,7 @@ extern struct bus_type cpu_subsys;
 /* Stop CPUs going up and down. */
 
 extern void get_online_cpus(void);
+extern bool try_get_online_cpus(void);
 extern void put_online_cpus(void);
 extern void cpu_hotplug_disable(void);
 extern void cpu_hotplug_enable(void);
@@ -232,6 +240,7 @@ int cpu_down(unsigned int cpu);
 #else		/* CONFIG_HOTPLUG_CPU */
 
 #define get_online_cpus()	do { } while (0)
+#define try_get_online_cpus()	true
 #define put_online_cpus()	do { } while (0)
 #define cpu_hotplug_disable()	do { } while (0)
 #define cpu_hotplug_enable()	do { } while (0)

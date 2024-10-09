@@ -74,7 +74,7 @@ struct fgraph_data {
 #define TRACE_GRAPH_PRINT_ABS_TIME	0x20
 #define TRACE_GRAPH_PRINT_IRQS		0x40
 
-static unsigned int max_depth;
+unsigned int fgraph_max_depth;
 
 static struct tracer_opt trace_opts[] = {
 	/* Display overruns? (for self-debug purpose) */
@@ -121,7 +121,7 @@ print_graph_duration(unsigned long long duration, struct trace_seq *s,
 /* Add a function return address to the trace stack on thread info.*/
 int
 ftrace_push_return_trace(unsigned long ret, unsigned long func, int *depth,
-			 unsigned long frame_pointer)
+			 unsigned long frame_pointer, unsigned long *retp)
 {
 	unsigned long long calltime;
 	int index;
@@ -152,7 +152,12 @@ ftrace_push_return_trace(unsigned long ret, unsigned long func, int *depth,
 	current->ret_stack[index].func = func;
 	current->ret_stack[index].calltime = calltime;
 	current->ret_stack[index].subtime = 0;
+#ifdef HAVE_FUNCTION_GRAPH_FP_TEST
 	current->ret_stack[index].fp = frame_pointer;
+#endif
+#ifdef HAVE_FUNCTION_GRAPH_RET_ADDR_PTR
+	current->ret_stack[index].retp = retp;
+#endif
 	*depth = index;
 
 	return 0;
@@ -175,7 +180,7 @@ ftrace_pop_return_trace(struct ftrace_graph_ret *trace, unsigned long *ret,
 		return;
 	}
 
-#if defined(CONFIG_HAVE_FUNCTION_GRAPH_FP_TEST) && !defined(CC_USING_FENTRY)
+#ifdef HAVE_FUNCTION_GRAPH_FP_TEST
 	/*
 	 * The arch may choose to record the frame pointer used
 	 * and check it here to make sure that it is what we expect it
@@ -227,7 +232,7 @@ unsigned long ftrace_return_to_handler(unsigned long frame_pointer)
 	/*
 	 * The trace should run after decrementing the ret counter
 	 * in case an interrupt were to come in. We don't want to
-	 * lose the interrupt if max_depth is set.
+	 * lose the interrupt if fgraph_max_depth is set.
 	 */
 	ftrace_graph_return(&trace);
 
@@ -265,9 +270,6 @@ unsigned long ftrace_graph_ret_addr(struct task_struct *task, int *idx,
 
 	if (ret != (unsigned long)return_to_handler)
 		return ret;
-
-	if (index < -1)
-		index += FTRACE_NOTRACE_DEPTH;
 
 	if (index < 0)
 		return ret;
@@ -348,7 +350,7 @@ int trace_graph_entry(struct ftrace_graph_ent *trace)
 	/* trace it when it is-nested-in or is a function enabled. */
 	if ((!(trace->depth || ftrace_graph_addr(trace->func)) ||
 	     ftrace_graph_ignore_irqs()) ||
-	    (max_depth && trace->depth >= max_depth))
+	    (fgraph_max_depth && trace->depth >= fgraph_max_depth))
 		return 0;
 
 	local_irq_save(flags);
@@ -1567,7 +1569,7 @@ graph_depth_write(struct file *filp, const char __user *ubuf, size_t cnt,
 	if (ret)
 		return ret;
 
-	max_depth = val;
+	fgraph_max_depth = val;
 
 	*ppos += cnt;
 
@@ -1581,7 +1583,7 @@ graph_depth_read(struct file *filp, char __user *ubuf, size_t cnt,
 	char buf[15]; /* More than enough to hold UINT_MAX + "\n"*/
 	int n;
 
-	n = sprintf(buf, "%d\n", max_depth);
+	n = sprintf(buf, "%d\n", fgraph_max_depth);
 
 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, n);
 }

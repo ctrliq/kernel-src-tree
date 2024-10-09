@@ -1052,7 +1052,7 @@ static void pvc_setup(struct net_device *dev)
 static const struct net_device_ops pvc_ops = {
 	.ndo_open       = pvc_open,
 	.ndo_stop       = pvc_close,
-	.ndo_change_mtu = hdlc_change_mtu,
+	.ndo_change_mtu_rh74 = hdlc_change_mtu,
 	.ndo_start_xmit = pvc_xmit,
 	.ndo_do_ioctl   = pvc_ioctl,
 };
@@ -1103,7 +1103,7 @@ static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
 		return -EIO;
 	}
 
-	dev->destructor = free_netdev;
+	dev->extended->needs_free_netdev = true;
 	*get_dev_p(pvc, type) = dev;
 	if (!used) {
 		state(hdlc)->dce_changed = 1;

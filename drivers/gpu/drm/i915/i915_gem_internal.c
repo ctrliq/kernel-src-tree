@@ -35,8 +35,10 @@ static void internal_free_pages(struct sg_table *st)
 {
 	struct scatterlist *sg;
 
-	for (sg = st->sgl; sg; sg = __sg_next(sg))
-		__free_pages(sg_page(sg), get_order(sg->length));
+	for (sg = st->sgl; sg; sg = __sg_next(sg)) {
+		if (sg_page(sg))
+			__free_pages(sg_page(sg), get_order(sg->length));
+	}
 
 	sg_free_table(st);
 	kfree(st);
@@ -54,12 +56,20 @@ i915_gem_object_get_pages_internal(struct drm_i915_gem_object *obj)
 
 	max_order = MAX_ORDER;
 #ifdef CONFIG_SWIOTLB
-	if (swiotlb_nr_tbl()) /* minimum max swiotlb size is IO_TLB_SEGSIZE */
-		max_order = min(max_order, ilog2(IO_TLB_SEGPAGES));
+	if (swiotlb_nr_tbl()) {
+		unsigned int max_segment;
+
+		max_segment = swiotlb_max_segment();
+		if (max_segment) {
+			max_segment = max_t(unsigned int, max_segment,
+					    PAGE_SIZE) >> PAGE_SHIFT;
+			max_order = min(max_order, ilog2(max_segment));
+		}
+	}
 #endif
 
 	gfp = GFP_KERNEL | __GFP_HIGHMEM | __GFP_RECLAIMABLE;
-	if (IS_CRESTLINE(i915) || IS_BROADWATER(i915)) {
+	if (IS_I965GM(i915) || IS_I965G(i915)) {
 		/* 965gm cannot relocate objects above 4GiB. */
 		gfp &= ~__GFP_HIGHMEM;
 		gfp |= __GFP_DMA32;
@@ -125,6 +135,7 @@ create_st:
 	return st;
 
 err:
+	sg_set_page(sg, NULL, 0, 0);
 	sg_mark_end(sg);
 	internal_free_pages(st);
 	return ERR_PTR(-ENOMEM);
@@ -160,20 +171,29 @@ static const struct drm_i915_gem_object_ops i915_gem_object_internal_ops = {
  */
 struct drm_i915_gem_object *
 i915_gem_object_create_internal(struct drm_i915_private *i915,
-				unsigned int size)
+				phys_addr_t size)
 {
 	struct drm_i915_gem_object *obj;
+	unsigned int cache_level;
 
-	obj = i915_gem_object_alloc(&i915->drm);
+	GEM_BUG_ON(!size);
+	GEM_BUG_ON(!IS_ALIGNED(size, PAGE_SIZE));
+
+	if (overflows_type(size, obj->base.size))
+		return ERR_PTR(-E2BIG);
+
+	obj = i915_gem_object_alloc(i915);
 	if (!obj)
 		return ERR_PTR(-ENOMEM);
 
 	drm_gem_private_object_init(&i915->drm, &obj->base, size);
 	i915_gem_object_init(obj, &i915_gem_object_internal_ops);
 
-	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
 	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
-	obj->cache_level = HAS_LLC(i915) ? I915_CACHE_LLC : I915_CACHE_NONE;
+	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+
+	cache_level = HAS_LLC(i915) ? I915_CACHE_LLC : I915_CACHE_NONE;
+	i915_gem_object_set_cache_coherency(obj, cache_level);
 
 	return obj;
 }

@@ -6,6 +6,7 @@ struct x86_mapping_info {
 	void *context;			 /* context for alloc_pgt_page */
 	unsigned long pmd_flag;		 /* page flag for PMD entry */
 	unsigned long offset;		 /* ident mapping offset */
+	unsigned long kernpg_flag;	 /* kernel pagetable flag override */
 };
 
 int kernel_ident_mapping_init(struct x86_mapping_info *info, pgd_t *pgd_page,

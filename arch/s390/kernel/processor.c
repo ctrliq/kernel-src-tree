@@ -6,12 +6,14 @@
 #define KMSG_COMPONENT "cpu"
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
+#include <linux/bitops.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/seq_file.h>
 #include <linux/delay.h>
 #include <linux/cpu.h>
 #include <asm/elf.h>
+#include <asm/facility.h>
 #include <asm/lowcore.h>
 #include <asm/param.h>
 #include <asm/smp.h>
@@ -42,6 +44,18 @@ void cpu_init(void)
 	memset(idle, 0, sizeof(*idle));
 }
 
+static void show_facilities(struct seq_file *m)
+{
+	unsigned int bit;
+	long *facilities;
+
+	facilities = (long *)&S390_lowcore.stfle_fac_list;
+	seq_puts(m, "facilities      :");
+	for_each_set_bit_left(bit, facilities, MAX_FACILITY_BIT)
+		seq_printf(m, " %d", bit);
+	seq_putc(m, '\n');
+}
+
 /*
  * show_cpuinfo - Get information on one CPU for use by procfs.
  */
@@ -49,7 +63,7 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 {
 	static const char *hwcap_str[] = {
 		"esan3", "zarch", "stfle", "msa", "ldisp", "eimm", "dfp",
-		"edat", "etf3eh", "highgprs", "te", "vx"
+		"edat", "etf3eh", "highgprs", "te", "vx", "vxd", "vxe", "gs"
 	};
 	static const char * const int_hwcap_str[] = {
 		"sie"
@@ -73,6 +87,7 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 			if (int_hwcap_str[i] && (int_hwcap & (1UL << i)))
 				seq_printf(m, "%s ", int_hwcap_str[i]);
 		seq_puts(m, "\n");
+		show_facilities(m);
 		show_cacheinfo(m);
 	}
 	get_online_cpus();

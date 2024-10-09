@@ -160,8 +160,7 @@ struct sctp_ulpevent  *sctp_ulpevent_make_assoc_change(
 		sctp_ulpevent_init(event, MSG_NOTIFICATION, skb->truesize);
 
 		/* Include the notification structure */
-		sac = (struct sctp_assoc_change *)
-			skb_push(skb, sizeof(struct sctp_assoc_change));
+		sac = skb_push(skb, sizeof(struct sctp_assoc_change));
 
 		/* Trim the buffer to the right length.  */
 		skb_trim(skb, sizeof(struct sctp_assoc_change) +
@@ -174,8 +173,7 @@ struct sctp_ulpevent  *sctp_ulpevent_make_assoc_change(
 			goto fail;
 
 		skb = sctp_event2skb(event);
-		sac = (struct sctp_assoc_change *) skb_put(skb,
-					sizeof(struct sctp_assoc_change));
+		sac = skb_put(skb, sizeof(struct sctp_assoc_change));
 	}
 
 	/* Socket Extensions for SCTP
@@ -277,8 +275,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_peer_addr_change(
 		goto fail;
 
 	skb = sctp_event2skb(event);
-	spc = (struct sctp_paddr_change *)
-		skb_put(skb, sizeof(struct sctp_paddr_change));
+	spc = skb_put(skb, sizeof(struct sctp_paddr_change));
 
 	/* Sockets API Extensions for SCTP
 	 * Section 5.3.1.2 SCTP_PEER_ADDR_CHANGE
@@ -409,7 +406,7 @@ sctp_ulpevent_make_remote_error(const struct sctp_association *asoc,
 	event = sctp_skb2event(skb);
 	sctp_ulpevent_init(event, MSG_NOTIFICATION, skb->truesize);
 
-	sre = (struct sctp_remote_error *) skb_push(skb, sizeof(*sre));
+	sre = skb_push(skb, sizeof(*sre));
 
 	/* Trim the buffer to the right length.  */
 	skb_trim(skb, sizeof(*sre) + elen);
@@ -460,8 +457,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_send_failed(
 	event = sctp_skb2event(skb);
 	sctp_ulpevent_init(event, MSG_NOTIFICATION, skb->truesize);
 
-	ssf = (struct sctp_send_failed *)
-		skb_push(skb, sizeof(struct sctp_send_failed));
+	ssf = skb_push(skb, sizeof(struct sctp_send_failed));
 
 	/* Socket Extensions for SCTP
 	 * 5.3.1.4 SCTP_SEND_FAILED
@@ -556,8 +552,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_shutdown_event(
 		goto fail;
 
 	skb = sctp_event2skb(event);
-	sse = (struct sctp_shutdown_event *)
-		skb_put(skb, sizeof(struct sctp_shutdown_event));
+	sse = skb_put(skb, sizeof(struct sctp_shutdown_event));
 
 	/* Socket Extensions for SCTP
 	 * 5.3.1.5 SCTP_SHUTDOWN_EVENT
@@ -619,8 +614,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_adaptation_indication(
 		goto fail;
 
 	skb = sctp_event2skb(event);
-	sai = (struct sctp_adaptation_event *)
-		skb_put(skb, sizeof(struct sctp_adaptation_event));
+	sai = skb_put(skb, sizeof(struct sctp_adaptation_event));
 
 	sai->sai_type = SCTP_ADAPTATION_INDICATION;
 	sai->sai_flags = 0;
@@ -758,8 +752,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_pdapi(
 		goto fail;
 
 	skb = sctp_event2skb(event);
-	pd = (struct sctp_pdapi_event *)
-		skb_put(skb, sizeof(struct sctp_pdapi_event));
+	pd = skb_put(skb, sizeof(struct sctp_pdapi_event));
 
 	/* pdapi_type
 	 *   It should be SCTP_PARTIAL_DELIVERY_EVENT
@@ -810,8 +803,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_authkey(
 		goto fail;
 
 	skb = sctp_event2skb(event);
-	ak = (struct sctp_authkey_event *)
-		skb_put(skb, sizeof(struct sctp_authkey_event));
+	ak = skb_put(skb, sizeof(struct sctp_authkey_event));
 
 	ak->auth_type = SCTP_AUTHENTICATION_EVENT;
 	ak->auth_flags = 0;
@@ -849,8 +841,7 @@ struct sctp_ulpevent *sctp_ulpevent_make_sender_dry_event(
 		return NULL;
 
 	skb = sctp_event2skb(event);
-	sdry = (struct sctp_sender_dry_event *)
-		skb_put(skb, sizeof(struct sctp_sender_dry_event));
+	sdry = skb_put(skb, sizeof(struct sctp_sender_dry_event));
 
 	sdry->sender_dry_type = SCTP_SENDER_DRY_EVENT;
 	sdry->sender_dry_flags = 0;

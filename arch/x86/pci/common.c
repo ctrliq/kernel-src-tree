@@ -12,7 +12,6 @@
 #include <linux/dmi.h>
 #include <linux/slab.h>
 
-#include <asm-generic/pci-bridge.h>
 #include <asm/acpi.h>
 #include <asm/segment.h>
 #include <asm/io.h>
@@ -677,7 +676,7 @@ static void set_dma_domain_ops(struct pci_dev *pdev)
 	spin_lock(&dma_domain_list_lock);
 	list_for_each_entry(domain, &dma_domain_list, node) {
 		if (pci_domain_nr(pdev->bus) == domain->domain_nr) {
-			pdev->dev.archdata.dma_ops = domain->dma_ops;
+			pdev->dev.device_rh->dma_ops = domain->dma_ops;
 			break;
 		}
 	}
@@ -695,7 +694,7 @@ int pcibios_add_device(struct pci_dev *dev)
 
 	pa_data = boot_params.hdr.setup_data;
 	while (pa_data) {
-		data = ioremap(pa_data, sizeof(*rom));
+		data = memremap(pa_data, sizeof(*rom), MEMREMAP_WB);
 		if (!data)
 			return -ENOMEM;
 
@@ -714,7 +713,7 @@ int pcibios_add_device(struct pci_dev *dev)
 			}
 		}
 		pa_data = data->next;
-		iounmap(data);
+		memunmap(data);
 	}
 	set_dma_domain_ops(dev);
 	set_dev_domain_options(dev);

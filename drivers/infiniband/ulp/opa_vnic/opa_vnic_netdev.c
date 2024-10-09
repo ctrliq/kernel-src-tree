@@ -140,10 +140,10 @@ void opa_vnic_process_vema_config(struct opa_vnic_adapter *adapter)
 
 	/* Handle MTU limit change */
 	rtnl_lock();
-	netdev->max_mtu = max_t(unsigned int, info->vesw.eth_mtu_non_vlan,
-				netdev->min_mtu);
-	if (netdev->mtu > netdev->max_mtu)
-		dev_set_mtu(netdev, netdev->max_mtu);
+	netdev->extended->max_mtu = max_t(unsigned int, info->vesw.eth_mtu_non_vlan,
+				netdev->extended->min_mtu);
+	if (netdev->mtu > netdev->extended->max_mtu)
+		dev_set_mtu(netdev, netdev->extended->max_mtu);
 	rtnl_unlock();
 
 	/* Update flow to default port redirection table */
@@ -316,20 +316,20 @@ struct opa_vnic_adapter *opa_vnic_add_netdev(struct ib_device *ibdev,
 
 	netdev = ibdev->alloc_rdma_netdev(ibdev, port_num,
 					  RDMA_NETDEV_OPA_VNIC,
-					  "veth%d", NET_NAME_UNKNOWN,
+					  "veth%d", 0,	/* NET_NAME_UNKNOWN, */
 					  ether_setup);
 	if (!netdev)
 		return ERR_PTR(-ENOMEM);
 	else if (IS_ERR(netdev))
 		return ERR_CAST(netdev);
 
+	rn = netdev_priv(netdev);
 	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
 	if (!adapter) {
 		rc = -ENOMEM;
 		goto adapter_err;
 	}
 
-	rn = netdev_priv(netdev);
 	rn->clnt_priv = adapter;
 	rn->hca = ibdev;
 	rn->port_num = port_num;
@@ -366,7 +366,7 @@ netdev_err:
 	mutex_destroy(&adapter->mactbl_lock);
 	kfree(adapter);
 adapter_err:
-	ibdev->free_rdma_netdev(netdev);
+	rn->free_rdma_netdev(netdev);
 
 	return ERR_PTR(rc);
 }
@@ -375,7 +375,7 @@ adapter_err:
 void opa_vnic_rem_netdev(struct opa_vnic_adapter *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
-	struct ib_device *ibdev = adapter->ibdev;
+	struct rdma_netdev *rn = netdev_priv(netdev);
 
 	v_info("removing\n");
 	unregister_netdev(netdev);
@@ -383,5 +383,5 @@ void opa_vnic_rem_netdev(struct opa_vnic_adapter *adapter)
 	mutex_destroy(&adapter->lock);
 	mutex_destroy(&adapter->mactbl_lock);
 	kfree(adapter);
-	ibdev->free_rdma_netdev(netdev);
+	rn->free_rdma_netdev(netdev);
 }

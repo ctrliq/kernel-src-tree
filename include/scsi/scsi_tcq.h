@@ -71,7 +71,8 @@ static inline void scsi_activate_tcq(struct scsi_device *sdev, int depth)
 		queue_flag_set_unlocked(QUEUE_FLAG_QUEUED, sdev->request_queue);
 	else if (!blk_queue_tagged(sdev->request_queue))
 		blk_queue_init_tags(sdev->request_queue, depth,
-				    sdev->host->bqt);
+				    sdev->host->bqt,
+				    sdev->host->hostt->tag_alloc_policy);
 
 	scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), depth);
 }
@@ -99,11 +100,9 @@ static inline void scsi_deactivate_tcq(struct scsi_device *sdev, int depth)
  **/
 static inline int scsi_populate_tag_msg(struct scsi_cmnd *cmd, char *msg)
 {
-        struct request *req = cmd->request;
-
-        if (blk_rq_tagged(req)) {
+        if (cmd->flags & SCMD_TAGGED) {
 		*msg++ = MSG_SIMPLE_TAG;
-        	*msg++ = req->tag;
+        	*msg++ = cmd->request->tag;
         	return 2;
 	}
 

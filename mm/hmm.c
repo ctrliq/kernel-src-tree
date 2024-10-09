@@ -264,7 +264,7 @@ static int hmm_vma_do_fault(struct mm_walk *walk,
 
 	flags |= hmm_vma_walk->block ? 0 : FAULT_FLAG_ALLOW_RETRY;
 	flags |= hmm_vma_walk->write ? FAULT_FLAG_WRITE : 0;
-	r = handle_mm_fault(vma->vm_mm, vma, addr, flags);
+	r = handle_mm_fault(vma, addr, flags);
 	if (r & VM_FAULT_RETRY)
 		return -EBUSY;
 	if (r & VM_FAULT_ERROR) {
@@ -1148,17 +1148,10 @@ static void hmm_device_release(struct device *device)
 struct hmm_device *hmm_device_new(void *drvdata)
 {
 	struct hmm_device *hmm_device;
-	int ret;
 
 	hmm_device = kzalloc(sizeof(*hmm_device), GFP_KERNEL);
 	if (!hmm_device)
 		return ERR_PTR(-ENOMEM);
-
-	ret = alloc_chrdev_region(&hmm_device->device.devt, 0, 1, "hmm_device");
-	if (ret < 0) {
-		kfree(hmm_device);
-		return NULL;
-	}
 
 	spin_lock(&hmm_device_lock);
 	hmm_device->minor = find_first_zero_bit(hmm_device_mask, HMM_DEVICE_MAX);

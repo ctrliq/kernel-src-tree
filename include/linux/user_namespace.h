@@ -53,8 +53,8 @@ struct user_namespace {
 	kuid_t			owner;
 	kgid_t			group;
 	unsigned int		proc_inum;
-	bool			may_mount_sysfs;
-	bool			may_mount_proc;
+	RH_KABI_DEPRECATE(bool,	may_mount_sysfs)
+	RH_KABI_DEPRECATE(bool, may_mount_proc)
 
 	/* Register of per-UID persistent keyrings for this namespace */
 #ifdef CONFIG_PERSISTENT_KEYRINGS
@@ -114,6 +114,7 @@ extern ssize_t proc_projid_map_write(struct file *, const char __user *, size_t,
 extern ssize_t proc_setgroups_write(struct file *, const char __user *, size_t, loff_t *);
 extern int proc_setgroups_show(struct seq_file *m, void *v);
 extern bool userns_may_setgroups(const struct user_namespace *ns);
+extern bool current_in_userns(const struct user_namespace *target_ns);
 #else
 
 static inline struct user_namespace *get_user_ns(struct user_namespace *ns)
@@ -142,8 +143,11 @@ static inline bool userns_may_setgroups(const struct user_namespace *ns)
 {
 	return true;
 }
-#endif
 
-void update_mnt_policy(struct user_namespace *userns);
+static inline bool current_in_userns(const struct user_namespace *target_ns)
+{
+	return true;
+}
+#endif
 
 #endif /* _LINUX_USER_H */

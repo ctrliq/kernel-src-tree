@@ -179,7 +179,6 @@ vti6_tnl_unlink(struct vti6_net *ip6n, struct ip6_tnl *t)
 static void vti6_dev_free(struct net_device *dev)
 {
 	free_percpu(dev->tstats);
-	free_netdev(dev);
 }
 
 static int vti6_tnl_create2(struct net_device *dev)
@@ -234,7 +233,7 @@ static struct ip6_tnl *vti6_tnl_create(struct net *net, struct __ip6_tnl_parm *p
 	return t;
 
 failed_free:
-	vti6_dev_free(dev);
+	free_netdev(dev);
 failed:
 	return NULL;
 }
@@ -822,7 +821,7 @@ static const struct net_device_ops vti6_netdev_ops = {
 	.ndo_uninit	= vti6_dev_uninit,
 	.ndo_start_xmit = vti6_tnl_xmit,
 	.ndo_do_ioctl	= vti6_ioctl,
-	.ndo_change_mtu = vti6_change_mtu,
+	.ndo_change_mtu_rh74 = vti6_change_mtu,
 	.ndo_get_stats64 = ip_tunnel_get_stats64,
 	.ndo_get_iflink = ip6_tnl_get_iflink,
 };
@@ -837,7 +836,8 @@ static const struct net_device_ops vti6_netdev_ops = {
 static void vti6_dev_setup(struct net_device *dev)
 {
 	dev->netdev_ops = &vti6_netdev_ops;
-	dev->destructor = vti6_dev_free;
+	dev->extended->needs_free_netdev = true;
+	dev->extended->priv_destructor = vti6_dev_free;
 
 	dev->type = ARPHRD_TUNNEL6;
 	dev->hard_header_len = LL_MAX_HEADER + sizeof(struct ipv6hdr);
@@ -1083,7 +1083,7 @@ static int __net_init vti6_init_net(struct net *net)
 	return 0;
 
 err_register:
-	vti6_dev_free(ip6n->fb_tnl_dev);
+	free_netdev(ip6n->fb_tnl_dev);
 err_alloc_dev:
 	return err;
 }

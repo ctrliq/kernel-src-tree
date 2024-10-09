@@ -485,7 +485,7 @@ void rotate_reclaimable_page(struct page *page)
 
 		page_cache_get(page);
 		local_irq_save(flags);
-		pvec = &__get_cpu_var(lru_rotate_pvecs);
+		pvec = this_cpu_ptr(&lru_rotate_pvecs);
 		if (!pagevec_add(pvec, page) || PageCompound(page))
 			pagevec_move_tail(pvec);
 		local_irq_restore(flags);
@@ -1207,15 +1207,8 @@ void __init swap_setup(void)
 {
 	unsigned long megs = totalram_pages >> (20 - PAGE_SHIFT);
 #ifdef CONFIG_SWAP
-	int i;
-
-	bdi_init(swapper_spaces[0].backing_dev_info);
-	for (i = 0; i < MAX_SWAPFILES; i++) {
-		spin_lock_init(&swapper_spaces[i].tree_lock);
-		INIT_LIST_HEAD(&swapper_spaces[i].i_mmap_nonlinear);
-	}
+	bdi_init(&swap_backing_dev_info);
 #endif
-
 	/* Use a smaller cluster for small-memory machines */
 	if (megs < 16)
 		page_cluster = 2;

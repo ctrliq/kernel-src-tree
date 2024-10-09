@@ -1623,7 +1623,7 @@ void balance_dirty_pages_ratelimited(struct address_space *mapping)
 	 * 1000+ tasks, all of them start dirtying pages at exactly the same
 	 * time, hence all honoured too large initial task->nr_dirtied_pause.
 	 */
-	p =  &__get_cpu_var(bdp_ratelimits);
+	p =  this_cpu_ptr(&bdp_ratelimits);
 	if (unlikely(current->nr_dirtied >= ratelimit))
 		*p = 0;
 	else if (unlikely(*p >= ratelimit_pages)) {
@@ -1635,7 +1635,7 @@ void balance_dirty_pages_ratelimited(struct address_space *mapping)
 	 * short-lived tasks (eg. gcc invocations in a kernel build) escaping
 	 * the dirty throttling and livelock other long-run dirtiers.
 	 */
-	p = &__get_cpu_var(dirty_throttle_leaks);
+	p = this_cpu_ptr(&dirty_throttle_leaks);
 	if (*p > 0 && current->nr_dirtied < ratelimit) {
 		unsigned long nr_pages_dirtied;
 		nr_pages_dirtied = min(*p, ratelimit - current->nr_dirtied);
@@ -2364,7 +2364,7 @@ int test_clear_page_writeback(struct page *page)
 	struct address_space *mapping = page_mapping(page);
 	int ret;
 
-	if (mapping) {
+	if (mapping && mapping_use_writeback_tags(mapping)) {
 		struct backing_dev_info *bdi = mapping->backing_dev_info;
 		unsigned long flags;
 
@@ -2379,6 +2379,11 @@ int test_clear_page_writeback(struct page *page)
 				__bdi_writeout_inc(bdi);
 			}
 		}
+
+		if (mapping->host && !mapping_tagged(mapping,
+						     PAGECACHE_TAG_WRITEBACK))
+			sb_clear_inode_writeback(mapping->host);
+
 		spin_unlock_irqrestore(&mapping->tree_lock, flags);
 	} else {
 		ret = TestClearPageWriteback(page);
@@ -2395,18 +2400,31 @@ int __test_set_page_writeback(struct page *page, bool keep_write)
 	struct address_space *mapping = page_mapping(page);
 	int ret;
 
-	if (mapping) {
+	if (mapping && mapping_use_writeback_tags(mapping)) {
 		struct backing_dev_info *bdi = mapping->backing_dev_info;
 		unsigned long flags;
 
 		spin_lock_irqsave(&mapping->tree_lock, flags);
 		ret = TestSetPageWriteback(page);
 		if (!ret) {
+			bool on_wblist;
+
+			on_wblist = mapping_tagged(mapping,
+						   PAGECACHE_TAG_WRITEBACK);
+
 			radix_tree_tag_set(&mapping->page_tree,
 						page_index(page),
 						PAGECACHE_TAG_WRITEBACK);
 			if (bdi_cap_account_writeback(bdi))
 				__inc_bdi_stat(bdi, BDI_WRITEBACK);
+
+			/*
+			 * We can come through here when swapping anonymous
+			 * pages, so we don't necessarily have an inode to track
+			 * for sync.
+			 */
+			if (mapping->host && !on_wblist)
+				sb_mark_inode_writeback(mapping->host);
 		}
 		if (!PageDirty(page))
 			radix_tree_tag_clear(&mapping->page_tree,

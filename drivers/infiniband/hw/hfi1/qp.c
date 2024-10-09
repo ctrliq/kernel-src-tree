@@ -1,5 +1,5 @@
 /*
- * Copyright(c) 2015, 2016 Intel Corporation.
+ * Copyright(c) 2015 - 2017 Intel Corporation.
  *
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
@@ -68,7 +68,8 @@ static int iowait_sleep(
 	struct sdma_engine *sde,
 	struct iowait *wait,
 	struct sdma_txreq *stx,
-	unsigned seq);
+	unsigned int seq,
+	bool pkts_sent);
 static void iowait_wakeup(struct iowait *wait, int reason);
 static void iowait_sdma_drained(struct iowait *wait);
 static void qp_pio_drain(struct rvt_qp *qp);
@@ -231,6 +232,31 @@ int hfi1_check_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
 	return 0;
 }
 
+/*
+ * qp_set_16b - Set the hdr_type based on whether the slid or the
+ * dlid in the connection is extended. Only applicable for RC and UC
+ * QPs. UD QPs determine this on the fly from the ah in the wqe
+ */
+static inline void qp_set_16b(struct rvt_qp *qp)
+{
+	struct hfi1_pportdata *ppd;
+	struct hfi1_ibport *ibp;
+	struct hfi1_qp_priv *priv = qp->priv;
+
+	/* Update ah_attr to account for extended LIDs */
+	hfi1_update_ah_attr(qp->ibqp.device, &qp->remote_ah_attr);
+
+	/* Create 32 bit LIDs */
+	hfi1_make_opa_lid(&qp->remote_ah_attr);
+
+	if (!(rdma_ah_get_ah_flags(&qp->remote_ah_attr) & IB_AH_GRH))
+		return;
+
+	ibp = to_iport(qp->ibqp.device, qp->port_num);
+	ppd = ppd_from_ibp(ibp);
+	priv->hdr_type = hfi1_get_hdr_type(ppd->lid, &qp->remote_ah_attr);
+}
+
 void hfi1_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
 		    int attr_mask, struct ib_udata *udata)
 {
@@ -241,6 +267,7 @@ void hfi1_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
 		priv->s_sc = ah_to_sc(ibqp->device, &qp->remote_ah_attr);
 		priv->s_sde = qp_to_sdma_engine(qp, priv->s_sc);
 		priv->s_sendcontext = qp_to_send_context(qp, priv->s_sc);
+		qp_set_16b(qp);
 	}
 
 	if (attr_mask & IB_QP_PATH_MIG_STATE &&
@@ -250,6 +277,7 @@ void hfi1_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
 		priv->s_sc = ah_to_sc(ibqp->device, &qp->remote_ah_attr);
 		priv->s_sde = qp_to_sdma_engine(qp, priv->s_sc);
 		priv->s_sendcontext = qp_to_send_context(qp, priv->s_sc);
+		qp_set_16b(qp);
 	}
 }
 
@@ -288,7 +316,7 @@ int hfi1_check_send_wqe(struct rvt_qp *qp,
 		ah = ibah_to_rvtah(wqe->ud_wr.ah);
 		if (wqe->length > (1 << ah->log_pmtu))
 			return -EINVAL;
-		if (ibp->sl_to_sc[ah->attr.sl] == 0xf)
+		if (ibp->sl_to_sc[rdma_ah_get_sl(&ah->attr)] == 0xf)
 			return -EINVAL;
 	default:
 		break;
@@ -371,7 +399,8 @@ static int iowait_sleep(
 	struct sdma_engine *sde,
 	struct iowait *wait,
 	struct sdma_txreq *stx,
-	unsigned seq)
+	uint seq,
+	bool pkts_sent)
 {
 	struct verbs_txreq *tx = container_of(stx, struct verbs_txreq, txreq);
 	struct rvt_qp *qp;
@@ -402,7 +431,8 @@ static int iowait_sleep(
 
 			ibp->rvp.n_dmawait++;
 			qp->s_flags |= RVT_S_WAIT_DMA_DESC;
-			list_add_tail(&priv->s_iowait.list, &sde->dmawait);
+			iowait_queue(pkts_sent, &priv->s_iowait,
+				     &sde->dmawait);
 			priv->s_iowait.lock = &dev->iowait_lock;
 			trace_hfi1_qpsleep(qp, RVT_S_WAIT_DMA_DESC);
 			rvt_get_qp(qp);
@@ -561,8 +591,8 @@ void qp_iter_print(struct seq_file *s, struct rvt_qp_iter *iter)
 		   rvt_max_atomic(&to_idev(qp->ibqp.device)->rdi),
 		   /* remote QP info  */
 		   qp->remote_qpn,
-		   qp->remote_ah_attr.dlid,
-		   qp->remote_ah_attr.sl,
+		   rdma_ah_get_dlid(&qp->remote_ah_attr),
+		   rdma_ah_get_sl(&qp->remote_ah_attr),
 		   qp->pmtu,
 		   qp->s_retry,
 		   qp->s_retry_cnt,
@@ -681,11 +711,12 @@ void hfi1_migrate_qp(struct rvt_qp *qp)
 
 	qp->s_mig_state = IB_MIG_MIGRATED;
 	qp->remote_ah_attr = qp->alt_ah_attr;
-	qp->port_num = qp->alt_ah_attr.port_num;
+	qp->port_num = rdma_ah_get_port_num(&qp->alt_ah_attr);
 	qp->s_pkey_index = qp->s_alt_pkey_index;
 	qp->s_flags |= RVT_S_AHG_CLEAR;
 	priv->s_sc = ah_to_sc(qp->ibqp.device, &qp->remote_ah_attr);
 	priv->s_sde = qp_to_sdma_engine(qp, priv->s_sc);
+	qp_set_16b(qp);
 
 	ev.device = qp->ibqp.device;
 	ev.element.qp = &qp->ibqp;
@@ -711,7 +742,7 @@ u32 mtu_from_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp, u32 pmtu)
 	u8 sc, vl;
 
 	ibp = &dd->pport[qp->port_num - 1].ibport_data;
-	sc = ibp->sl_to_sc[qp->remote_ah_attr.sl];
+	sc = ibp->sl_to_sc[rdma_ah_get_sl(&qp->remote_ah_attr)];
 	vl = sc_to_vlt(dd, sc);
 
 	mtu = verbs_mtu_enum_to_int(qp->ibqp.device, pmtu);
@@ -768,6 +799,45 @@ void notify_error_qp(struct rvt_qp *qp)
 }
 
 /**
+ * hfi1_qp_iter_cb - callback for iterator
+ * @qp - the qp
+ * @v - the sl in low bits of v
+ *
+ * This is called from the iterator callback to work
+ * on an individual qp.
+ */
+static void hfi1_qp_iter_cb(struct rvt_qp *qp, u64 v)
+{
+	int lastwqe;
+	struct ib_event ev;
+	struct hfi1_ibport *ibp =
+		to_iport(qp->ibqp.device, qp->port_num);
+	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+	u8 sl = (u8)v;
+
+	if (qp->port_num != ppd->port ||
+	    (qp->ibqp.qp_type != IB_QPT_UC &&
+	     qp->ibqp.qp_type != IB_QPT_RC) ||
+	    rdma_ah_get_sl(&qp->remote_ah_attr) != sl ||
+	    !(ib_rvt_state_ops[qp->state] & RVT_POST_SEND_OK))
+		return;
+
+	spin_lock_irq(&qp->r_lock);
+	spin_lock(&qp->s_hlock);
+	spin_lock(&qp->s_lock);
+	lastwqe = rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+	spin_unlock(&qp->s_lock);
+	spin_unlock(&qp->s_hlock);
+	spin_unlock_irq(&qp->r_lock);
+	if (lastwqe) {
+		ev.device = qp->ibqp.device;
+		ev.element.qp = &qp->ibqp;
+		ev.event = IB_EVENT_QP_LAST_WQE_REACHED;
+		qp->ibqp.event_handler(&ev, qp->ibqp.qp_context);
+	}
+}
+
+/**
  * hfi1_error_port_qps - put a port's RC/UC qps into error state
  * @ibp: the ibport.
  * @sl: the service level.
@@ -778,44 +848,8 @@ void notify_error_qp(struct rvt_qp *qp)
  */
 void hfi1_error_port_qps(struct hfi1_ibport *ibp, u8 sl)
 {
-	struct rvt_qp *qp = NULL;
 	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
 	struct hfi1_ibdev *dev = &ppd->dd->verbs_dev;
-	int n;
-	int lastwqe;
-	struct ib_event ev;
 
-	rcu_read_lock();
-
-	/* Deal only with RC/UC qps that use the given SL. */
-	for (n = 0; n < dev->rdi.qp_dev->qp_table_size; n++) {
-		for (qp = rcu_dereference(dev->rdi.qp_dev->qp_table[n]); qp;
-			qp = rcu_dereference(qp->next)) {
-			if (qp->port_num == ppd->port &&
-			    (qp->ibqp.qp_type == IB_QPT_UC ||
-			     qp->ibqp.qp_type == IB_QPT_RC) &&
-			    qp->remote_ah_attr.sl == sl &&
-			    (ib_rvt_state_ops[qp->state] &
-			     RVT_POST_SEND_OK)) {
-				spin_lock_irq(&qp->r_lock);
-				spin_lock(&qp->s_hlock);
-				spin_lock(&qp->s_lock);
-				lastwqe = rvt_error_qp(qp,
-						       IB_WC_WR_FLUSH_ERR);
-				spin_unlock(&qp->s_lock);
-				spin_unlock(&qp->s_hlock);
-				spin_unlock_irq(&qp->r_lock);
-				if (lastwqe) {
-					ev.device = qp->ibqp.device;
-					ev.element.qp = &qp->ibqp;
-					ev.event =
-						IB_EVENT_QP_LAST_WQE_REACHED;
-					qp->ibqp.event_handler(&ev,
-						qp->ibqp.qp_context);
-				}
-			}
-		}
-	}
-
-	rcu_read_unlock();
+	rvt_qp_iter(&dev->rdi, sl, hfi1_qp_iter_cb);
 }

@@ -1819,6 +1819,7 @@ struct xhci_hcd {
 #define XHCI_MISSING_CAS	(1 << 24)
 /* For controller with a broken Port Disable implementation */
 #define XHCI_BROKEN_PORT_PED	(1 << 25)
+#define XHCI_ASMEDIA_MODIFY_FLOWCONTROL	(1 << 28)
 
 	unsigned int		num_active_eps;
 	unsigned int		limit_active_eps;

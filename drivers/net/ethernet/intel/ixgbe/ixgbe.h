@@ -55,9 +55,6 @@
 
 #include <net/busy_poll.h>
 
-#ifdef CONFIG_NET_RX_BUSY_POLL
-#define BP_EXTENDED_STATS
-#endif
 /* common prefix used by pr_<> macros */
 #undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -262,11 +259,6 @@ struct ixgbe_rx_buffer {
 struct ixgbe_queue_stats {
 	u64 packets;
 	u64 bytes;
-#ifdef BP_EXTENDED_STATS
-	u64 yields;
-	u64 misses;
-	u64 cleaned;
-#endif  /* BP_EXTENDED_STATS */
 };
 
 struct ixgbe_tx_queue_stats {
@@ -466,158 +458,10 @@ struct ixgbe_q_vector {
 	struct rcu_head rcu;	/* to avoid race with update stats on free */
 	char name[IFNAMSIZ + 9];
 
-#ifdef CONFIG_NET_RX_BUSY_POLL
-	unsigned int state;
-#define IXGBE_QV_STATE_IDLE        0
-#define IXGBE_QV_STATE_NAPI	   1     /* NAPI owns this QV */
-#define IXGBE_QV_STATE_POLL	   2     /* poll owns this QV */
-#define IXGBE_QV_STATE_DISABLED	   4     /* QV is disabled */
-#define IXGBE_QV_OWNED (IXGBE_QV_STATE_NAPI | IXGBE_QV_STATE_POLL)
-#define IXGBE_QV_LOCKED (IXGBE_QV_OWNED | IXGBE_QV_STATE_DISABLED)
-#define IXGBE_QV_STATE_NAPI_YIELD  8     /* NAPI yielded this QV */
-#define IXGBE_QV_STATE_POLL_YIELD  16    /* poll yielded this QV */
-#define IXGBE_QV_YIELD (IXGBE_QV_STATE_NAPI_YIELD | IXGBE_QV_STATE_POLL_YIELD)
-#define IXGBE_QV_USER_PEND (IXGBE_QV_STATE_POLL | IXGBE_QV_STATE_POLL_YIELD)
-	spinlock_t lock;
-#endif  /* CONFIG_NET_RX_BUSY_POLL */
-
 	/* for dynamic allocation of rings associated with this q_vector */
 	struct ixgbe_ring ring[0] ____cacheline_internodealigned_in_smp;
 };
-#ifdef CONFIG_NET_RX_BUSY_POLL
-static inline void ixgbe_qv_init_lock(struct ixgbe_q_vector *q_vector)
-{
 
-	spin_lock_init(&q_vector->lock);
-	q_vector->state = IXGBE_QV_STATE_IDLE;
-}
-
-/* called from the device poll routine to get ownership of a q_vector */
-static inline bool ixgbe_qv_lock_napi(struct ixgbe_q_vector *q_vector)
-{
-	int rc = true;
-	spin_lock_bh(&q_vector->lock);
-	if (q_vector->state & IXGBE_QV_LOCKED) {
-		WARN_ON(q_vector->state & IXGBE_QV_STATE_NAPI);
-		q_vector->state |= IXGBE_QV_STATE_NAPI_YIELD;
-		rc = false;
-#ifdef BP_EXTENDED_STATS
-		q_vector->tx.ring->stats.yields++;
-#endif
-	} else {
-		/* we don't care if someone yielded */
-		q_vector->state = IXGBE_QV_STATE_NAPI;
-	}
-	spin_unlock_bh(&q_vector->lock);
-	return rc;
-}
-
-/* returns true is someone tried to get the qv while napi had it */
-static inline bool ixgbe_qv_unlock_napi(struct ixgbe_q_vector *q_vector)
-{
-	int rc = false;
-	spin_lock_bh(&q_vector->lock);
-	WARN_ON(q_vector->state & (IXGBE_QV_STATE_POLL |
-			       IXGBE_QV_STATE_NAPI_YIELD));
-
-	if (q_vector->state & IXGBE_QV_STATE_POLL_YIELD)
-		rc = true;
-	/* will reset state to idle, unless QV is disabled */
-	q_vector->state &= IXGBE_QV_STATE_DISABLED;
-	spin_unlock_bh(&q_vector->lock);
-	return rc;
-}
-
-/* called from ixgbe_low_latency_poll() */
-static inline bool ixgbe_qv_lock_poll(struct ixgbe_q_vector *q_vector)
-{
-	int rc = true;
-	spin_lock_bh(&q_vector->lock);
-	if ((q_vector->state & IXGBE_QV_LOCKED)) {
-		q_vector->state |= IXGBE_QV_STATE_POLL_YIELD;
-		rc = false;
-#ifdef BP_EXTENDED_STATS
-		q_vector->rx.ring->stats.yields++;
-#endif
-	} else {
-		/* preserve yield marks */
-		q_vector->state |= IXGBE_QV_STATE_POLL;
-	}
-	spin_unlock_bh(&q_vector->lock);
-	return rc;
-}
-
-/* returns true if someone tried to get the qv while it was locked */
-static inline bool ixgbe_qv_unlock_poll(struct ixgbe_q_vector *q_vector)
-{
-	int rc = false;
-	spin_lock_bh(&q_vector->lock);
-	WARN_ON(q_vector->state & (IXGBE_QV_STATE_NAPI));
-
-	if (q_vector->state & IXGBE_QV_STATE_POLL_YIELD)
-		rc = true;
-	/* will reset state to idle, unless QV is disabled */
-	q_vector->state &= IXGBE_QV_STATE_DISABLED;
-	spin_unlock_bh(&q_vector->lock);
-	return rc;
-}
-
-/* true if a socket is polling, even if it did not get the lock */
-static inline bool ixgbe_qv_busy_polling(struct ixgbe_q_vector *q_vector)
-{
-	WARN_ON(!(q_vector->state & IXGBE_QV_OWNED));
-	return q_vector->state & IXGBE_QV_USER_PEND;
-}
-
-/* false if QV is currently owned */
-static inline bool ixgbe_qv_disable(struct ixgbe_q_vector *q_vector)
-{
-	int rc = true;
-	spin_lock_bh(&q_vector->lock);
-	if (q_vector->state & IXGBE_QV_OWNED)
-		rc = false;
-	q_vector->state |= IXGBE_QV_STATE_DISABLED;
-	spin_unlock_bh(&q_vector->lock);
-
-	return rc;
-}
-
-#else /* CONFIG_NET_RX_BUSY_POLL */
-static inline void ixgbe_qv_init_lock(struct ixgbe_q_vector *q_vector)
-{
-}
-
-static inline bool ixgbe_qv_lock_napi(struct ixgbe_q_vector *q_vector)
-{
-	return true;
-}
-
-static inline bool ixgbe_qv_unlock_napi(struct ixgbe_q_vector *q_vector)
-{
-	return false;
-}
-
-static inline bool ixgbe_qv_lock_poll(struct ixgbe_q_vector *q_vector)
-{
-	return false;
-}
-
-static inline bool ixgbe_qv_unlock_poll(struct ixgbe_q_vector *q_vector)
-{
-	return false;
-}
-
-static inline bool ixgbe_qv_busy_polling(struct ixgbe_q_vector *q_vector)
-{
-	return false;
-}
-
-static inline bool ixgbe_qv_disable(struct ixgbe_q_vector *q_vector)
-{
-	return true;
-}
-
-#endif /* CONFIG_NET_RX_BUSY_POLL */
 
 #ifdef CONFIG_IXGBE_HWMON
 
@@ -897,6 +741,10 @@ struct ixgbe_adapter {
 	u8 default_up;
 	unsigned long fwd_bitmask; /* Bitmask indicating in use pools */
 
+#define IXGBE_MAX_LINK_HANDLE 10
+	struct ixgbe_jump_table *jump_tables[IXGBE_MAX_LINK_HANDLE];
+	unsigned long tables;
+
 /* maximum number of RETA entries among all devices supported by ixgbe
  * driver: currently it's x550 device in non-SRIOV mode
  */
@@ -1036,6 +884,9 @@ s32 ixgbe_fdir_erase_perfect_filter_82599(struct ixgbe_hw *hw,
 					  u16 soft_id);
 void ixgbe_atr_compute_perfect_hash_82599(union ixgbe_atr_input *input,
 					  union ixgbe_atr_input *mask);
+int ixgbe_update_ethtool_fdir_entry(struct ixgbe_adapter *adapter,
+				    struct ixgbe_fdir_filter *input,
+				    u16 sw_idx);
 void ixgbe_set_rx_mode(struct net_device *netdev);
 #ifdef CONFIG_IXGBE_DCB
 void ixgbe_set_rx_drop_en(struct ixgbe_adapter *adapter);

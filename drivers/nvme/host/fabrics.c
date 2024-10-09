@@ -58,7 +58,6 @@ static struct nvmf_host *nvmf_host_add(const char *hostnqn)
 
 	kref_init(&host->ref);
 	memcpy(host->nqn, hostnqn, NVMF_NQN_SIZE);
-	uuid_be_gen(&host->id);
 
 	list_add_tail(&host->list, &nvmf_hosts);
 out_unlock:
@@ -126,16 +125,6 @@ int nvmf_get_address(struct nvme_ctrl *ctrl, char *buf, int size)
 	return len;
 }
 EXPORT_SYMBOL_GPL(nvmf_get_address);
-
-/**
- * nvmf_get_subsysnqn() - Get subsystem NQN
- * @ctrl:	Host NVMe controller instance which we got the NQN
- */
-const char *nvmf_get_subsysnqn(struct nvme_ctrl *ctrl)
-{
-	return ctrl->opts->subsysnqn;
-}
-EXPORT_SYMBOL_GPL(nvmf_get_subsysnqn);
 
 /**
  * nvmf_reg_read32() -  NVMe Fabrics "Property Get" API function.
@@ -486,7 +475,7 @@ EXPORT_SYMBOL_GPL(nvmf_connect_io_queue);
 bool nvmf_should_reconnect(struct nvme_ctrl *ctrl)
 {
 	if (ctrl->opts->max_reconnects != -1 &&
-	    ctrl->opts->nr_reconnects < ctrl->opts->max_reconnects)
+	    ctrl->nr_reconnects < ctrl->opts->max_reconnects)
 		return true;
 
 	return false;
@@ -559,6 +548,8 @@ static const match_table_t opt_tokens = {
 	{ NVMF_OPT_KATO,		"keep_alive_tmo=%d"	},
 	{ NVMF_OPT_HOSTNQN,		"hostnqn=%s"		},
 	{ NVMF_OPT_HOST_TRADDR,		"host_traddr=%s"	},
+	{ NVMF_OPT_HOST_ID,		"hostid=%s"		},
+	{ NVMF_OPT_DUP_CONNECT,		"duplicate_connect"	},
 	{ NVMF_OPT_ERR,			NULL			}
 };
 
@@ -570,15 +561,19 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
 	int token, ret = 0;
 	size_t nqnlen  = 0;
 	int ctrl_loss_tmo = NVMF_DEF_CTRL_LOSS_TMO;
+	uuid_be hostid;
 
 	/* Set defaults */
 	opts->queue_size = NVMF_DEF_QUEUE_SIZE;
 	opts->nr_io_queues = num_online_cpus();
 	opts->reconnect_delay = NVMF_DEF_RECONNECT_DELAY;
+	opts->duplicate_connect = false;
 
 	options = o = kstrdup(buf, GFP_KERNEL);
 	if (!options)
 		return -ENOMEM;
+
+	uuid_be_gen(&hostid);
 
 	while ((p = strsep(&o, ",\n")) != NULL) {
 		if (!*p)
@@ -736,6 +731,20 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
 			}
 			opts->host_traddr = p;
 			break;
+		case NVMF_OPT_HOST_ID:
+			p = match_strdup(args);
+			if (!p) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			if (uuid_be_to_bin(p, &hostid)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			break;
+		case NVMF_OPT_DUP_CONNECT:
+			opts->duplicate_connect = true;
+			break;
 		default:
 			pr_warn("unknown parameter or missing value '%s' in ctrl creation request\n",
 				p);
@@ -754,6 +763,8 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
 		kref_get(&nvmf_default_host->ref);
 		opts->host = nvmf_default_host;
 	}
+
+	memcpy(&opts->host->id, &hostid, sizeof(uuid_be));
 
 out:
 	if (!opts->discovery_nqn && !opts->kato)
@@ -816,7 +827,8 @@ EXPORT_SYMBOL_GPL(nvmf_free_options);
 
 #define NVMF_REQUIRED_OPTS	(NVMF_OPT_TRANSPORT | NVMF_OPT_NQN)
 #define NVMF_ALLOWED_OPTS	(NVMF_OPT_QUEUE_SIZE | NVMF_OPT_NR_IO_QUEUES | \
-				 NVMF_OPT_KATO | NVMF_OPT_HOSTNQN)
+				 NVMF_OPT_KATO | NVMF_OPT_HOSTNQN | \
+				 NVMF_OPT_HOST_ID | NVMF_OPT_DUP_CONNECT)
 
 static struct nvme_ctrl *
 nvmf_create_ctrl(struct device *dev, const char *buf, size_t count)

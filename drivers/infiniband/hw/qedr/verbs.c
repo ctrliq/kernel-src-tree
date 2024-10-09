@@ -247,8 +247,8 @@ int qedr_query_port(struct ib_device *ibdev, u8 port, struct ib_port_attr *attr)
 	}
 
 	rdma_port = dev->ops->rdma_query_port(dev->rdma_ctx);
-	memset(attr, 0, sizeof(*attr));
 
+	/* *attr being zeroed by the caller, avoid zeroing it here */
 	if (rdma_port->port_state == QED_RDMA_PORT_UP) {
 		attr->state = IB_PORT_ACTIVE;
 		attr->phys_state = 5;
@@ -664,14 +664,15 @@ static int qedr_prepare_pbl_tbl(struct qedr_dev *dev,
 
 static void qedr_populate_pbls(struct qedr_dev *dev, struct ib_umem *umem,
 			       struct qedr_pbl *pbl,
-			       struct qedr_pbl_info *pbl_info)
+			       struct qedr_pbl_info *pbl_info, u32 pg_shift)
 {
 	int shift, pg_cnt, pages, pbe_cnt, total_num_pbes = 0;
+	u32 fw_pg_cnt, fw_pg_per_umem_pg;
 	struct qedr_pbl *pbl_tbl;
 	struct scatterlist *sg;
 	struct regpair *pbe;
+	u64 pg_addr;
 	int entry;
-	u32 addr;
 
 	if (!pbl_info->num_pbes)
 		return;
@@ -692,31 +693,37 @@ static void qedr_populate_pbls(struct qedr_dev *dev, struct ib_umem *umem,
 
 	pbe_cnt = 0;
 
-	shift = ilog2(umem->page_size);
+	shift = umem->page_shift;
+
+	fw_pg_per_umem_pg = BIT(umem->page_shift - pg_shift);
 
 	for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
 		pages = sg_dma_len(sg) >> shift;
+		pg_addr = sg_dma_address(sg);
 		for (pg_cnt = 0; pg_cnt < pages; pg_cnt++) {
-			/* store the page address in pbe */
-			pbe->lo = cpu_to_le32(sg_dma_address(sg) +
-					      umem->page_size * pg_cnt);
-			addr = upper_32_bits(sg_dma_address(sg) +
-					     umem->page_size * pg_cnt);
-			pbe->hi = cpu_to_le32(addr);
-			pbe_cnt++;
-			total_num_pbes++;
-			pbe++;
+			for (fw_pg_cnt = 0; fw_pg_cnt < fw_pg_per_umem_pg;) {
+				pbe->lo = cpu_to_le32(pg_addr);
+				pbe->hi = cpu_to_le32(upper_32_bits(pg_addr));
 
-			if (total_num_pbes == pbl_info->num_pbes)
-				return;
+				pg_addr += BIT(pg_shift);
+				pbe_cnt++;
+				total_num_pbes++;
+				pbe++;
 
-			/* If the given pbl is full storing the pbes,
-			 * move to next pbl.
-			 */
-			if (pbe_cnt == (pbl_info->pbl_size / sizeof(u64))) {
-				pbl_tbl++;
-				pbe = (struct regpair *)pbl_tbl->va;
-				pbe_cnt = 0;
+				if (total_num_pbes == pbl_info->num_pbes)
+					return;
+
+				/* If the given pbl is full storing the pbes,
+				 * move to next pbl.
+				 */
+				if (pbe_cnt ==
+				    (pbl_info->pbl_size / sizeof(u64))) {
+					pbl_tbl++;
+					pbe = (struct regpair *)pbl_tbl->va;
+					pbe_cnt = 0;
+				}
+
+				fw_pg_cnt++;
 			}
 		}
 	}
@@ -765,7 +772,7 @@ static inline int qedr_init_user_queue(struct ib_ucontext *ib_ctx,
 				       u64 buf_addr, size_t buf_len,
 				       int access, int dmasync)
 {
-	int page_cnt;
+	u32 fw_pages;
 	int rc;
 
 	q->buf_addr = buf_addr;
@@ -777,8 +784,10 @@ static inline int qedr_init_user_queue(struct ib_ucontext *ib_ctx,
 		return PTR_ERR(q->umem);
 	}
 
-	page_cnt = ib_umem_page_count(q->umem);
-	rc = qedr_prepare_pbl_tbl(dev, &q->pbl_info, page_cnt, 0);
+	fw_pages = ib_umem_page_count(q->umem) <<
+	    (q->umem->page_shift - FW_PAGE_SHIFT);
+
+	rc = qedr_prepare_pbl_tbl(dev, &q->pbl_info, fw_pages, 0);
 	if (rc)
 		goto err0;
 
@@ -788,7 +797,8 @@ static inline int qedr_init_user_queue(struct ib_ucontext *ib_ctx,
 		goto err0;
 	}
 
-	qedr_populate_pbls(dev, q->umem, q->pbl_tbl, &q->pbl_info);
+		qedr_populate_pbls(dev, q->umem, q->pbl_tbl, &q->pbl_info,
+				   FW_PAGE_SHIFT);
 
 	return 0;
 
@@ -936,7 +946,7 @@ struct ib_cq *qedr_create_cq(struct ib_device *ibdev,
 						   QED_CHAIN_CNT_TYPE_U32,
 						   chain_entries,
 						   sizeof(union rdma_cqe),
-						   &cq->pbl);
+						   &cq->pbl, NULL);
 		if (rc)
 			goto err1;
 
@@ -1095,13 +1105,15 @@ static inline int get_gid_info_from_table(struct ib_qp *ibqp,
 {
 	enum rdma_network_type nw_type;
 	struct ib_gid_attr gid_attr;
+	const struct ib_global_route *grh = rdma_ah_read_grh(&attr->ah_attr);
 	union ib_gid gid;
 	u32 ipv4_addr;
 	int rc = 0;
 	int i;
 
-	rc = ib_get_cached_gid(ibqp->device, attr->ah_attr.port_num,
-			       attr->ah_attr.grh.sgid_index, &gid, &gid_attr);
+	rc = ib_get_cached_gid(ibqp->device,
+			       rdma_ah_get_port_num(&attr->ah_attr),
+			       grh->sgid_index, &gid, &gid_attr);
 	if (rc)
 		return rc;
 
@@ -1118,7 +1130,7 @@ static inline int get_gid_info_from_table(struct ib_qp *ibqp,
 			memcpy(&qp_params->sgid.bytes[0], &gid.raw[0],
 			       sizeof(qp_params->sgid));
 			memcpy(&qp_params->dgid.bytes[0],
-			       &attr->ah_attr.grh.dgid,
+			       &grh->dgid,
 			       sizeof(qp_params->dgid));
 			qp_params->roce_mode = ROCE_V2_IPV6;
 			SET_FIELD(qp_params->modify_flags,
@@ -1128,7 +1140,7 @@ static inline int get_gid_info_from_table(struct ib_qp *ibqp,
 			memcpy(&qp_params->sgid.bytes[0], &gid.raw[0],
 			       sizeof(qp_params->sgid));
 			memcpy(&qp_params->dgid.bytes[0],
-			       &attr->ah_attr.grh.dgid,
+			       &grh->dgid,
 			       sizeof(qp_params->dgid));
 			qp_params->roce_mode = ROCE_V1;
 			break;
@@ -1138,7 +1150,7 @@ static inline int get_gid_info_from_table(struct ib_qp *ibqp,
 			ipv4_addr = qedr_get_ipv4_from_gid(gid.raw);
 			qp_params->sgid.ipv4_addr = ipv4_addr;
 			ipv4_addr =
-			    qedr_get_ipv4_from_gid(attr->ah_attr.grh.dgid.raw);
+			    qedr_get_ipv4_from_gid(grh->dgid.raw);
 			qp_params->dgid.ipv4_addr = ipv4_addr;
 			SET_FIELD(qp_params->modify_flags,
 				  QED_ROCE_MODIFY_QP_VALID_ROCE_MODE, 1);
@@ -1422,7 +1434,7 @@ qedr_roce_create_kernel_qp(struct qedr_dev *dev,
 					   QED_CHAIN_CNT_TYPE_U32,
 					   n_sq_elems,
 					   QEDR_SQE_ELEMENT_SIZE,
-					   &qp->sq.pbl);
+					   &qp->sq.pbl, NULL);
 
 	if (rc)
 		return rc;
@@ -1436,7 +1448,7 @@ qedr_roce_create_kernel_qp(struct qedr_dev *dev,
 					   QED_CHAIN_CNT_TYPE_U32,
 					   n_rq_elems,
 					   QEDR_RQE_ELEMENT_SIZE,
-					   &qp->rq.pbl);
+					   &qp->rq.pbl, NULL);
 	if (rc)
 		return rc;
 
@@ -1760,6 +1772,7 @@ int qedr_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	struct qedr_qp *qp = get_qedr_qp(ibqp);
 	struct qed_rdma_modify_qp_in_params qp_params = { 0 };
 	struct qedr_dev *dev = get_qedr_dev(&qp->dev->ibdev);
+	const struct ib_global_route *grh = rdma_ah_read_grh(&attr->ah_attr);
 	enum ib_qp_state old_qp_state, new_qp_state;
 	int rc = 0;
 
@@ -1842,17 +1855,17 @@ int qedr_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		SET_FIELD(qp_params.modify_flags,
 			  QED_ROCE_MODIFY_QP_VALID_ADDRESS_VECTOR, 1);
 
-		qp_params.traffic_class_tos = attr->ah_attr.grh.traffic_class;
-		qp_params.flow_label = attr->ah_attr.grh.flow_label;
-		qp_params.hop_limit_ttl = attr->ah_attr.grh.hop_limit;
+		qp_params.traffic_class_tos = grh->traffic_class;
+		qp_params.flow_label = grh->flow_label;
+		qp_params.hop_limit_ttl = grh->hop_limit;
 
-		qp->sgid_idx = attr->ah_attr.grh.sgid_index;
+		qp->sgid_idx = grh->sgid_index;
 
 		rc = get_gid_info_from_table(ibqp, attr, attr_mask, &qp_params);
 		if (rc) {
 			DP_ERR(dev,
 			       "modify qp: problems with GID index %d (rc=%d)\n",
-			       attr->ah_attr.grh.sgid_index, rc);
+			       grh->sgid_index, rc);
 			return rc;
 		}
 
@@ -2037,25 +2050,21 @@ int qedr_query_qp(struct ib_qp *ibqp,
 	qp_attr->cap.max_inline_data = ROCE_REQ_MAX_INLINE_DATA_SIZE;
 	qp_init_attr->cap = qp_attr->cap;
 
-	memcpy(&qp_attr->ah_attr.grh.dgid.raw[0], &params.dgid.bytes[0],
-	       sizeof(qp_attr->ah_attr.grh.dgid.raw));
-
-	qp_attr->ah_attr.grh.flow_label = params.flow_label;
-	qp_attr->ah_attr.grh.sgid_index = qp->sgid_idx;
-	qp_attr->ah_attr.grh.hop_limit = params.hop_limit_ttl;
-	qp_attr->ah_attr.grh.traffic_class = params.traffic_class_tos;
-
-	qp_attr->ah_attr.ah_flags = IB_AH_GRH;
-	qp_attr->ah_attr.port_num = 1;
-	qp_attr->ah_attr.sl = 0;
+	qp_attr->ah_attr.type = RDMA_AH_ATTR_TYPE_ROCE;
+	rdma_ah_set_grh(&qp_attr->ah_attr, NULL,
+			params.flow_label, qp->sgid_idx,
+			params.hop_limit_ttl, params.traffic_class_tos);
+	rdma_ah_set_dgid_raw(&qp_attr->ah_attr, &params.dgid.bytes[0]);
+	rdma_ah_set_port_num(&qp_attr->ah_attr, 1);
+	rdma_ah_set_sl(&qp_attr->ah_attr, 0);
 	qp_attr->timeout = params.timeout;
 	qp_attr->rnr_retry = params.rnr_retry;
 	qp_attr->retry_cnt = params.retry_cnt;
 	qp_attr->min_rnr_timer = params.min_rnr_nak_timer;
 	qp_attr->pkey_index = params.pkey_index;
 	qp_attr->port_num = 1;
-	qp_attr->ah_attr.src_path_bits = 0;
-	qp_attr->ah_attr.static_rate = 0;
+	rdma_ah_set_path_bits(&qp_attr->ah_attr, 0);
+	rdma_ah_set_static_rate(&qp_attr->ah_attr, 0);
 	qp_attr->alt_pkey_index = 0;
 	qp_attr->alt_port_num = 0;
 	qp_attr->alt_timeout = 0;
@@ -2123,7 +2132,7 @@ int qedr_destroy_qp(struct ib_qp *ibqp)
 	return rc;
 }
 
-struct ib_ah *qedr_create_ah(struct ib_pd *ibpd, struct ib_ah_attr *attr,
+struct ib_ah *qedr_create_ah(struct ib_pd *ibpd, struct rdma_ah_attr *attr,
 			     struct ib_udata *udata)
 {
 	struct qedr_ah *ah;
@@ -2238,7 +2247,7 @@ struct ib_mr *qedr_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 len,
 		goto err1;
 
 	qedr_populate_pbls(dev, mr->umem, mr->info.pbl_table,
-			   &mr->info.pbl_info);
+			   &mr->info.pbl_info, mr->umem->page_shift);
 
 	rc = dev->ops->rdma_alloc_tid(dev->rdma_ctx, &mr->hw_mr.itid);
 	if (rc) {
@@ -2259,7 +2268,7 @@ struct ib_mr *qedr_reg_user_mr(struct ib_pd *ibpd, u64 start, u64 len,
 	mr->hw_mr.pbl_ptr = mr->info.pbl_table[0].pa;
 	mr->hw_mr.pbl_two_level = mr->info.pbl_info.two_layered;
 	mr->hw_mr.pbl_page_size_log = ilog2(mr->info.pbl_info.pbl_size);
-	mr->hw_mr.page_size_log = ilog2(mr->umem->page_size);
+	mr->hw_mr.page_size_log = mr->umem->page_shift;
 	mr->hw_mr.fbo = ib_umem_offset(mr->umem);
 	mr->hw_mr.length = len;
 	mr->hw_mr.vaddr = usr_addr;
@@ -3601,14 +3610,15 @@ int qedr_port_immutable(struct ib_device *ibdev, u8 port_num,
 	struct ib_port_attr attr;
 	int err;
 
-	err = qedr_query_port(ibdev, port_num, &attr);
+	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE |
+				    RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
+
+	err = ib_query_port(ibdev, port_num, &attr);
 	if (err)
 		return err;
 
 	immutable->pkey_tbl_len = attr.pkey_tbl_len;
 	immutable->gid_tbl_len = attr.gid_tbl_len;
-	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE |
-				    RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
 	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
 
 	return 0;

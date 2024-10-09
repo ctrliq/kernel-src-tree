@@ -9,10 +9,11 @@
 #include <linux/bootmem.h>
 #include <linux/init.h>
 #include <linux/io.h>
-#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mmiotrace.h>
+#include <linux/mem_encrypt.h>
+#include <linux/efi.h>
 
 #include <asm/cacheflush.h>
 #include <asm/e820.h>
@@ -21,6 +22,7 @@
 #include <asm/tlbflush.h>
 #include <asm/pgalloc.h>
 #include <asm/pat.h>
+#include <asm/setup.h>
 
 #include "physaddr.h"
 
@@ -86,7 +88,6 @@ static void __iomem *__ioremap_caller(resource_size_t phys_addr,
 	const unsigned long unaligned_size = size;
 	struct vm_struct *area;
 	enum page_cache_mode new_pcm;
-	unsigned long new_prot_val;
 	pgprot_t prot;
 	int retval;
 	void __iomem *ret_addr;
@@ -123,13 +124,11 @@ static void __iomem *__ioremap_caller(resource_size_t phys_addr,
 	size = PAGE_ALIGN(last_addr+1) - phys_addr;
 
 	retval = reserve_memtype(phys_addr, (u64)phys_addr + size,
-				 cachemode2protval(pcm), &new_prot_val);
+						pcm, &new_pcm);
 	if (retval) {
 		printk(KERN_ERR "ioremap reserve_memtype failed %d\n", retval);
 		return NULL;
 	}
-
-	new_pcm = pgprot2cachemode(__pgprot(new_prot_val));
 
 	if (pcm != new_pcm) {
 		if (!is_new_memtype_allowed(phys_addr, size, pcm, new_pcm)) {
@@ -345,12 +344,10 @@ void *xlate_dev_mem_ptr(unsigned long phys)
 	unsigned long offset = phys & ~PAGE_MASK;
 	void *vaddr;
 
-	/* If page is RAM, we can use __va. Otherwise ioremap and unmap. */
-	if (page_is_ram(start >> PAGE_SHIFT))
-		return __va(phys);
+	/* memremap() maps if RAM, otherwise falls back to ioremap() */
+	vaddr = memremap(start, PAGE_SIZE, MEMREMAP_WB);
 
-	vaddr = ioremap_cache(start, PAGE_SIZE);
-	/* Only add the offset on success and return NULL if the ioremap() failed: */
+	/* Only add the offset on success and return NULL if memremap() failed */
 	if (vaddr)
 		vaddr += offset;
 
@@ -359,11 +356,276 @@ void *xlate_dev_mem_ptr(unsigned long phys)
 
 void unxlate_dev_mem_ptr(unsigned long phys, void *addr)
 {
-	if (page_is_ram(phys >> PAGE_SHIFT))
-		return;
-
-	iounmap((void __iomem *)((unsigned long)addr & PAGE_MASK));
+	memunmap((void *)((unsigned long)addr & PAGE_MASK));
 }
+
+/*
+ * Examine the physical address to determine if it is an area of memory
+ * that should be mapped decrypted.  If the memory is not part of the
+ * kernel usable area it was accessed and created decrypted, so these
+ * areas should be mapped decrypted. And since the encryption key can
+ * change across reboots, persistent memory should also be mapped
+ * decrypted.
+ */
+static bool memremap_should_map_decrypted(resource_size_t phys_addr,
+					  unsigned long size)
+{
+	int is_pmem;
+
+	/*
+	 * Check if the address is part of a persistent memory region.
+	 * This check covers areas added by E820, EFI and ACPI.
+	 */
+	is_pmem = region_intersects_pmem(phys_addr, size);
+	if (is_pmem != REGION_DISJOINT)
+		return true;
+
+	/*
+	 * Check if the non-volatile attribute is set for an EFI
+	 * reserved area.
+	 */
+	if (efi_enabled(EFI_BOOT)) {
+		switch (efi_mem_type(phys_addr)) {
+		case EFI_RESERVED_TYPE:
+			if (efi_mem_attributes(phys_addr) & EFI_MEMORY_NV)
+				return true;
+			break;
+		case -EINVAL:
+			return true;
+		default:
+			break;
+		}
+	}
+
+	/* Check if the address is outside kernel usable area */
+	switch (e820__get_entry_type(phys_addr, phys_addr + size - 1)) {
+	case E820_RESERVED:
+	case E820_ACPI:
+	case E820_NVS:
+	case E820_UNUSABLE:
+	case E820_PRAM:
+		return true;
+	default:
+		break;
+	}
+
+	return false;
+}
+
+/*
+ * Examine the physical address to determine if it is EFI data. Check
+ * it against the boot params structure and EFI tables and memory types.
+ */
+static bool memremap_is_efi_data(resource_size_t phys_addr,
+				 unsigned long size)
+{
+	u64 paddr;
+
+	/* Check if the address is part of EFI boot/runtime data */
+	if (!efi_enabled(EFI_BOOT))
+		return false;
+
+	paddr = boot_params.efi_info.efi_memmap_hi;
+	paddr <<= 32;
+	paddr |= boot_params.efi_info.efi_memmap;
+	if (phys_addr == paddr)
+		return true;
+
+	paddr = boot_params.efi_info.efi_systab_hi;
+	paddr <<= 32;
+	paddr |= boot_params.efi_info.efi_systab;
+	if (phys_addr == paddr)
+		return true;
+
+	if (efi_is_table_address(phys_addr))
+		return true;
+
+	switch (efi_mem_type(phys_addr)) {
+	case EFI_BOOT_SERVICES_DATA:
+	case EFI_RUNTIME_SERVICES_DATA:
+		return true;
+	default:
+		break;
+	}
+
+	return false;
+}
+
+/*
+ * Examine the physical address to determine if it is boot data by checking
+ * it against the boot params setup_data chain.
+ */
+static bool memremap_is_setup_data(resource_size_t phys_addr,
+				   unsigned long size)
+{
+	struct setup_data *data;
+	u64 paddr, paddr_next;
+
+	paddr = boot_params.hdr.setup_data;
+	while (paddr) {
+		unsigned int len;
+
+		if (phys_addr == paddr)
+			return true;
+
+		data = memremap(paddr, sizeof(*data),
+				MEMREMAP_WB | MEMREMAP_DEC);
+
+		paddr_next = data->next;
+		len = data->len;
+
+		memunmap(data);
+
+		if ((phys_addr > paddr) && (phys_addr < (paddr + len)))
+			return true;
+
+		paddr = paddr_next;
+	}
+
+	return false;
+}
+
+/*
+ * Examine the physical address to determine if it is boot data by checking
+ * it against the boot params setup_data chain (early boot version).
+ */
+static bool __init early_memremap_is_setup_data(resource_size_t phys_addr,
+						unsigned long size)
+{
+	struct setup_data *data;
+	u64 paddr, paddr_next;
+
+	paddr = boot_params.hdr.setup_data;
+	while (paddr) {
+		unsigned int len;
+
+		if (phys_addr == paddr)
+			return true;
+
+		data = early_memremap_decrypted(paddr, sizeof(*data));
+
+		paddr_next = data->next;
+		len = data->len;
+
+		early_memunmap(data, sizeof(*data));
+
+		if ((phys_addr > paddr) && (phys_addr < (paddr + len)))
+			return true;
+
+		paddr = paddr_next;
+	}
+
+	return false;
+}
+
+/*
+ * Architecture function to determine if RAM remap is allowed. By default, a
+ * RAM remap will map the data as encrypted. Determine if a RAM remap should
+ * not be done so that the data will be mapped decrypted.
+ */
+bool arch_memremap_can_ram_remap(resource_size_t phys_addr, unsigned long size,
+				 unsigned long flags)
+{
+	if (!sme_active())
+		return true;
+
+	if (flags & MEMREMAP_ENC)
+		return true;
+
+	if (flags & MEMREMAP_DEC)
+		return false;
+
+	if (memremap_is_setup_data(phys_addr, size) ||
+	    memremap_is_efi_data(phys_addr, size) ||
+	    memremap_should_map_decrypted(phys_addr, size))
+		return false;
+
+	return true;
+}
+
+/*
+ * Architecture override of __weak function to adjust the protection attributes
+ * used when remapping memory. By default, early_memremap() will map the data
+ * as encrypted. Determine if an encrypted mapping should not be done and set
+ * the appropriate protection attributes.
+ */
+pgprot_t __init early_memremap_pgprot_adjust(resource_size_t phys_addr,
+					     unsigned long size,
+					     pgprot_t prot)
+{
+	if (!sme_active())
+		return prot;
+
+	if (early_memremap_is_setup_data(phys_addr, size) ||
+	    memremap_is_efi_data(phys_addr, size) ||
+	    memremap_should_map_decrypted(phys_addr, size))
+		prot = pgprot_decrypted(prot);
+	else
+		prot = pgprot_encrypted(prot);
+
+	return prot;
+}
+
+bool phys_mem_access_encrypted(unsigned long phys_addr, unsigned long size)
+{
+	return arch_memremap_can_ram_remap(phys_addr, size, 0);
+}
+
+#ifdef CONFIG_ARCH_USE_MEMREMAP_PROT
+
+static void __init __iomem *
+__early_ioremap(resource_size_t phys_addr, unsigned long size, pgprot_t prot);
+
+void __init *
+early_memremap_prot(resource_size_t phys_addr, unsigned long size,
+		    unsigned long prot_val)
+{
+	return (__force void *)__early_ioremap(phys_addr, size,
+					       __pgprot(prot_val));
+}
+
+/* Remap memory with encryption */
+void __init *early_memremap_encrypted(resource_size_t phys_addr,
+				      unsigned long size)
+{
+	return early_memremap_prot(phys_addr, size, __PAGE_KERNEL_ENC);
+}
+
+/*
+ * Remap memory with encryption and write-protected - cannot be called
+ * before pat_init() is called
+ */
+void __init *early_memremap_encrypted_wp(resource_size_t phys_addr,
+					 unsigned long size)
+{
+	/* Be sure the write-protect PAT entry is set for write-protect */
+	if (__pte2cachemode_tbl[_PAGE_CACHE_MODE_WP] != _PAGE_CACHE_MODE_WP)
+		return NULL;
+
+	return early_memremap_prot(phys_addr, size, __PAGE_KERNEL_ENC_WP);
+}
+
+/* Remap memory without encryption */
+void __init *early_memremap_decrypted(resource_size_t phys_addr,
+				      unsigned long size)
+{
+	return early_memremap_prot(phys_addr, size, __PAGE_KERNEL_NOENC);
+}
+
+/*
+ * Remap memory without encryption and write-protected - cannot be called
+ * before pat_init() is called
+ */
+void __init *early_memremap_decrypted_wp(resource_size_t phys_addr,
+					 unsigned long size)
+{
+	/* Be sure the write-protect PAT entry is set for write-protect */
+	if (__pte2cachemode_tbl[_PAGE_CACHE_MODE_WP] != _PAGE_CACHE_MODE_WP)
+		return NULL;
+
+	return early_memremap_prot(phys_addr, size, __PAGE_KERNEL_NOENC_WP);
+}
+#endif	/* CONFIG_ARCH_USE_MEMREMAP_PROT */
 
 static int __initdata early_ioremap_debug;
 
@@ -381,7 +643,7 @@ static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
 static inline pmd_t * __init early_ioremap_pmd(unsigned long addr)
 {
 	/* Don't assume we're using swapper_pg_dir at this point */
-	pgd_t *base = __va(read_cr3());
+	pgd_t *base = __va(read_cr3_pa());
 	pgd_t *pgd = &base[pgd_index(addr)];
 	pud_t *pud = pud_offset(pgd, addr);
 	pmd_t *pmd = pmd_offset(pud, addr);
@@ -602,7 +864,10 @@ early_ioremap(resource_size_t phys_addr, unsigned long size)
 /* Remap memory */
 void __init *early_memremap(resource_size_t phys_addr, unsigned long size)
 {
-	return (__force void *)__early_ioremap(phys_addr, size, PAGE_KERNEL);
+	pgprot_t prot = early_memremap_pgprot_adjust(phys_addr, size,
+						     PAGE_KERNEL);
+
+	return (__force void *)__early_ioremap(phys_addr, size, prot);
 }
 
 void __init early_iounmap(void __iomem *addr, unsigned long size)

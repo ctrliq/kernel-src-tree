@@ -92,10 +92,15 @@ typedef struct siginfo {
 #endif
 			short _addr_lsb; /* LSB of the reported address */
 #ifndef __GENKSYMS__
-			struct {
-				void __user *_lower;
-				void __user *_upper;
-			} _addr_bnd;
+			union {
+				/* used when si_code=SEGV_BNDERR */
+				struct {
+					void __user *_lower;
+					void __user *_upper;
+				} _addr_bnd;
+				/* used when si_code=SEGV_PKUERR */
+				__u32 _pkey;
+			};
 #endif
 		} _sigfault;
 
@@ -139,6 +144,7 @@ typedef struct siginfo {
 #define si_addr_lsb	_sifields._sigfault._addr_lsb
 #define si_lower	_sifields._sigfault._addr_bnd._lower
 #define si_upper	_sifields._sigfault._addr_bnd._upper
+#define si_pkey		_sifields._sigfault._pkey
 #define si_band		_sifields._sigpoll._band
 #define si_fd		_sifields._sigpoll._fd
 #ifdef __ARCH_SIGSYS
@@ -208,7 +214,8 @@ typedef struct siginfo {
 #define SEGV_MAPERR	(__SI_FAULT|1)	/* address not mapped to object */
 #define SEGV_ACCERR	(__SI_FAULT|2)	/* invalid permissions for mapped object */
 #define SEGV_BNDERR	(__SI_FAULT|3)  /* failed address bound checks */
-#define NSIGSEGV	3
+#define SEGV_PKUERR	(__SI_FAULT|4)  /* failed protection key checks */
+#define NSIGSEGV	4
 
 /*
  * SIGBUS si_codes

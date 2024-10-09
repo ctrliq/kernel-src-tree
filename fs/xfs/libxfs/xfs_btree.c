@@ -4240,3 +4240,50 @@ xfs_btree_compute_maxlevels(
 		maxblocks = (maxblocks + limits[1] - 1) / limits[1];
 	return level;
 }
+
+/*
+ * Calculate the number of blocks needed to store a given number of records
+ * in a short-format (per-AG metadata) btree.
+ */
+xfs_extlen_t
+xfs_btree_calc_size(
+	struct xfs_mount	*mp,
+	uint			*limits,
+	unsigned long long	len)
+{
+	int			level;
+	int			maxrecs;
+	xfs_extlen_t		rval;
+
+	maxrecs = limits[0];
+	for (level = 0, rval = 0; len > 1; level++) {
+		len += maxrecs - 1;
+		do_div(len, maxrecs);
+		maxrecs = limits[1];
+		rval += len;
+	}
+	return rval;
+}
+
+static int
+xfs_btree_count_blocks_helper(
+	struct xfs_btree_cur	*cur,
+	int			level,
+	void			*data)
+{
+	xfs_extlen_t		*blocks = data;
+	(*blocks)++;
+
+	return 0;
+}
+
+/* Count the blocks in a btree and return the result in *blocks. */
+int
+xfs_btree_count_blocks(
+	struct xfs_btree_cur	*cur,
+	xfs_extlen_t		*blocks)
+{
+	*blocks = 0;
+	return xfs_btree_visit_blocks(cur, xfs_btree_count_blocks_helper,
+			blocks);
+}

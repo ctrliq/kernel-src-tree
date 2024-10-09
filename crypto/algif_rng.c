@@ -160,6 +160,10 @@ static int rng_accept_parent(void *private, struct sock *sk)
 
 static int rng_setkey(void *private, const u8 *seed, unsigned int seedlen)
 {
+	/* Prevent entry into test-only code path in drbg. */
+	if (!seedlen)
+		seed = NULL;
+
 	/*
 	 * Check whether seedlen is of sufficient size is done in RNG
 	 * implementations.

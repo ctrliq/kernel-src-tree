@@ -270,7 +270,7 @@ static const struct net_device_ops ipip_netdev_ops = {
 	.ndo_uninit     = ip_tunnel_uninit,
 	.ndo_start_xmit	= ipip_tunnel_xmit,
 	.ndo_do_ioctl	= ipip_tunnel_ioctl,
-	.ndo_change_mtu = ip_tunnel_change_mtu,
+	.ndo_change_mtu_rh74 = ip_tunnel_change_mtu,
 	.ndo_get_stats64 = ip_tunnel_get_stats64,
 	.ndo_get_iflink = ip_tunnel_get_iflink,
 };

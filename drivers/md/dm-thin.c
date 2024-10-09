@@ -1192,6 +1192,19 @@ static void process_prepared_discard_passdown_pt1(struct dm_thin_new_mapping *m)
 		return;
 	}
 
+	/*
+	 * Increment the unmapped blocks.  This prevents a race between the
+	 * passdown io and reallocation of freed blocks.
+	 */
+	r = dm_pool_inc_data_range(pool->pmd, m->data_block, data_end);
+	if (r) {
+		metadata_operation_failed(pool, "dm_pool_inc_data_range", r);
+		bio_endio(m->bio, r);
+		cell_defer_no_holder(tc, m->cell);
+		mempool_free(m, pool->mapping_pool);
+		return;
+	}
+
 	discard_parent = bio_alloc(GFP_NOIO, 1);
 	if (!discard_parent) {
 		DMWARN("%s: unable to allocate top level discard bio for passdown. Skipping passdown.",
@@ -1211,19 +1224,6 @@ static void process_prepared_discard_passdown_pt1(struct dm_thin_new_mapping *m)
 			r = issue_discard(&op, m->data_block, data_end);
 			end_discard(&op, r);
 		}
-	}
-
-	/*
-	 * Increment the unmapped blocks.  This prevents a race between the
-	 * passdown io and reallocation of freed blocks.
-	 */
-	r = dm_pool_inc_data_range(pool->pmd, m->data_block, data_end);
-	if (r) {
-		metadata_operation_failed(pool, "dm_pool_inc_data_range", r);
-		bio_endio(m->bio, r);
-		cell_defer_no_holder(tc, m->cell);
-		mempool_free(m, pool->mapping_pool);
-		return;
 	}
 }
 
@@ -3138,7 +3138,7 @@ static int parse_pool_features(struct dm_arg_set *as, struct pool_features *pf,
 	unsigned argc;
 	const char *arg_name;
 
-	static struct dm_arg _args[] = {
+	static const struct dm_arg _args[] = {
 		{0, 4, "Invalid number of pool feature arguments"},
 	};
 

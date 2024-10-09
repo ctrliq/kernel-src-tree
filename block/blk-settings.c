@@ -878,6 +878,18 @@ void blk_queue_flush_queueable(struct request_queue *q, bool queueable)
 }
 EXPORT_SYMBOL_GPL(blk_queue_flush_queueable);
 
+/**
+ * blk_set_queue_depth - tell the block layer about the device queue depth
+ * @q:		the request queue for the device
+ * @depth:		queue depth
+ *
+ */
+void blk_set_queue_depth(struct request_queue *q, unsigned int depth)
+{
+	q->queue_depth = depth;
+}
+EXPORT_SYMBOL(blk_set_queue_depth);
+
 static int __init blk_settings_init(void)
 {
 	blk_max_low_pfn = max_low_pfn - 1;

@@ -444,6 +444,7 @@ void task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
 	*ut = p->utime;
 	*st = p->stime;
 }
+EXPORT_SYMBOL_GPL(task_cputime_adjusted);
 
 void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
 {
@@ -635,6 +636,7 @@ update:
 	 * monotonicity for stime, analogous argument to above.
 	 */
 	if (utime < prev->utime) {
+		gmb();
 		utime = prev->utime;
 		stime = rtime - utime;
 	}
@@ -656,6 +658,7 @@ void task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
 	task_cputime(p, &cputime.utime, &cputime.stime);
 	cputime_adjust(&cputime, &p->prev_cputime, ut, st);
 }
+EXPORT_SYMBOL_GPL(task_cputime_adjusted);
 
 void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
 {

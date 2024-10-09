@@ -29,4 +29,7 @@ int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata);
 bool kvm_hv_hypercall_enabled(struct kvm *kvm);
 int kvm_hv_hypercall(struct kvm_vcpu *vcpu);
 
+void kvm_hv_setup_tsc_page(struct kvm *kvm,
+			   struct pvclock_vcpu_time_info *hv_clock);
+
 #endif

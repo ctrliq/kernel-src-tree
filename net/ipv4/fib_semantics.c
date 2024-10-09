@@ -43,6 +43,7 @@
 #include <net/netlink.h>
 #include <net/nexthop.h>
 #include <net/lwtunnel.h>
+#include <net/fib_notifier.h>
 
 #include "fib_lookup.h"
 
@@ -661,6 +662,44 @@ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi)
 	return 0;
 }
 
+bool fib_metrics_match(struct fib_config *cfg, struct fib_info *fi)
+{
+	struct nlattr *nla;
+	int remaining;
+
+	if (!cfg->fc_mx)
+		return true;
+
+	nla_for_each_attr(nla, cfg->fc_mx, cfg->fc_mx_len, remaining) {
+		int type = nla_type(nla);
+		u32 fi_val, val;
+
+		if (!type)
+			continue;
+		if (type > RTAX_MAX)
+			return false;
+
+		if (type == RTAX_CC_ALGO) {
+			char tmp[TCP_CA_NAME_MAX];
+			bool ecn_ca = false;
+
+			nla_strlcpy(tmp, nla, sizeof(tmp));
+			val = tcp_ca_get_key_by_name(tmp, &ecn_ca);
+		} else {
+			val = nla_get_u32(nla);
+		}
+
+		fi_val = fi->fib_metrics[type - 1];
+		if (type == RTAX_FEATURES)
+			fi_val &= ~DST_FEATURE_ECN_CA;
+
+		if (fi_val != val)
+			return false;
+	}
+
+	return true;
+}
+
 
 /*
  * Picture
@@ -1193,6 +1232,8 @@ int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
 		if (fi->fib_nh->nh_oif &&
 		    nla_put_u32(skb, RTA_OIF, fi->fib_nh->nh_oif))
 			goto nla_put_failure;
+		if (fi->fib_nh->nh_flags & RTNH_F_OFFLOAD)
+			rtm->rtm_flags |= RTNH_F_OFFLOAD;
 #ifdef CONFIG_IP_ROUTE_CLASSID
 		if (fi->fib_nh[0].nh_tclassid &&
 		    nla_put_u32(skb, RTA_FLOW, fi->fib_nh[0].nh_tclassid))
@@ -1292,8 +1333,8 @@ static int call_fib_nh_notifiers(struct fib_nh *fib_nh,
 		    fib_nh->nh_flags & RTNH_F_LINKDOWN)
 			break;
 #endif
-		return call_fib_notifiers(dev_net(fib_nh->nh_dev), event_type,
-					  &info.info);
+		return call_fib4_notifiers(dev_net(fib_nh->nh_dev), event_type,
+					   &info.info);
 	case FIB_EVENT_NH_DEL:
 #ifdef RTNH_F_LINKDOWN
 #error RTNH_F_LINKDOWN has been backported, fix me please!
@@ -1303,8 +1344,8 @@ static int call_fib_nh_notifiers(struct fib_nh *fib_nh,
 #else
 		if (fib_nh->nh_flags & RTNH_F_DEAD)
 #endif
-			return call_fib_notifiers(dev_net(fib_nh->nh_dev),
-						  event_type, &info.info);
+			return call_fib4_notifiers(dev_net(fib_nh->nh_dev),
+						   event_type, &info.info);
 	default:
 		break;
 	}

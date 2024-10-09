@@ -62,6 +62,22 @@
 #include "qed_sriov.h"
 #include "qed_reg_addr.h"
 
+static int
+qed_iscsi_async_event(struct qed_hwfn *p_hwfn,
+		      u8 fw_event_code,
+		      u16 echo, union event_ring_data *data, u8 fw_return_code)
+{
+	if (p_hwfn->p_iscsi_info->event_cb) {
+		struct qed_iscsi_info *p_iscsi = p_hwfn->p_iscsi_info;
+
+		return p_iscsi->event_cb(p_iscsi->event_context,
+					 fw_event_code, data);
+	} else {
+		DP_NOTICE(p_hwfn, "iSCSI async completion is not set\n");
+		return -EINVAL;
+	}
+}
+
 struct qed_iscsi_conn {
 	struct list_head list_entry;
 	bool free_on_delete;
@@ -180,6 +196,15 @@ qed_sp_iscsi_func_start(struct qed_hwfn *p_hwfn,
 	p_params = &p_hwfn->pf_params.iscsi_pf_params;
 	p_queue = &p_init->q_params;
 
+	/* Sanity */
+	if (p_params->num_queues > p_hwfn->hw_info.feat_num[QED_ISCSI_CQ]) {
+		DP_ERR(p_hwfn,
+		       "Cannot satisfy CQ amount. Queues requested %d, CQs available %d. Aborting function start\n",
+		       p_params->num_queues,
+		       p_hwfn->hw_info.feat_num[QED_ISCSI_CQ]);
+		return -EINVAL;
+	}
+
 	SET_FIELD(p_init->hdr.flags,
 		  ISCSI_SLOW_PATH_HDR_LAYER_CODE, ISCSI_SLOW_PATH_LAYER_CODE);
 	p_init->hdr.op_code = ISCSI_RAMROD_CMD_ID_INIT_FUNC;
@@ -211,7 +236,7 @@ qed_sp_iscsi_func_start(struct qed_hwfn *p_hwfn,
 	p_queue->cmdq_sb_pi = p_params->gl_cmd_pi;
 
 	for (i = 0; i < p_params->num_queues; i++) {
-		val = p_hwfn->sbs_info[i]->igu_sb_id;
+		val = qed_get_igu_sb_id(p_hwfn, i);
 		p_queue->cq_cmdq_sb_num_arr[i] = cpu_to_le16(val);
 	}
 
@@ -255,6 +280,9 @@ qed_sp_iscsi_func_start(struct qed_hwfn *p_hwfn,
 
 	p_hwfn->p_iscsi_info->event_context = event_context;
 	p_hwfn->p_iscsi_info->event_cb = async_event_cb;
+
+	qed_spq_register_async_cb(p_hwfn, PROTOCOLID_ISCSI,
+				  qed_iscsi_async_event);
 
 	return qed_spq_post(p_hwfn, p_ent, NULL);
 }
@@ -365,7 +393,6 @@ static int qed_sp_iscsi_conn_offload(struct qed_hwfn *p_hwfn,
 		p_tcp->ss_thresh = cpu_to_le32(p_conn->ss_thresh);
 		p_tcp->srtt = cpu_to_le16(p_conn->srtt);
 		p_tcp->rtt_var = cpu_to_le16(p_conn->rtt_var);
-		p_tcp->ts_time = cpu_to_le32(p_conn->ts_time);
 		p_tcp->ts_recent = cpu_to_le32(p_conn->ts_recent);
 		p_tcp->ts_recent_age = cpu_to_le32(p_conn->ts_recent_age);
 		p_tcp->total_rt = cpu_to_le32(p_conn->total_rt);
@@ -390,8 +417,6 @@ static int qed_sp_iscsi_conn_offload(struct qed_hwfn *p_hwfn,
 		p_tcp->mss = cpu_to_le16(p_conn->mss);
 		p_tcp->snd_wnd_scale = p_conn->snd_wnd_scale;
 		p_tcp->rcv_wnd_scale = p_conn->rcv_wnd_scale;
-		dval = p_conn->ts_ticks_per_second;
-		p_tcp->ts_ticks_per_second = cpu_to_le32(dval);
 		wval = p_conn->da_timeout_value;
 		p_tcp->da_timeout_value = cpu_to_le16(wval);
 		p_tcp->ack_frequency = p_conn->ack_frequency;
@@ -625,7 +650,10 @@ static int qed_sp_iscsi_func_stop(struct qed_hwfn *p_hwfn,
 	p_ramrod = &p_ent->ramrod.iscsi_destroy;
 	p_ramrod->hdr.op_code = ISCSI_RAMROD_CMD_ID_DESTROY_FUNC;
 
-	return qed_spq_post(p_hwfn, p_ent, NULL);
+	rc = qed_spq_post(p_hwfn, p_ent, NULL);
+
+	qed_spq_unregister_async_cb(p_hwfn, PROTOCOLID_ISCSI);
+	return rc;
 }
 
 static void __iomem *qed_iscsi_get_db_addr(struct qed_hwfn *p_hwfn, u32 cid)
@@ -746,7 +774,7 @@ static int qed_iscsi_allocate_connection(struct qed_hwfn *p_hwfn,
 			     QED_CHAIN_USE_TO_CONSUME_PRODUCE,
 			     QED_CHAIN_MODE_PBL,
 			     QED_CHAIN_CNT_TYPE_U16,
-			     r2tq_num_elements, 0x80, &p_conn->r2tq);
+			     r2tq_num_elements, 0x80, &p_conn->r2tq, NULL);
 	if (rc)
 		goto nomem_r2tq;
 
@@ -757,7 +785,7 @@ static int qed_iscsi_allocate_connection(struct qed_hwfn *p_hwfn,
 			     QED_CHAIN_MODE_PBL,
 			     QED_CHAIN_CNT_TYPE_U16,
 			     uhq_num_elements,
-			     sizeof(struct iscsi_uhqe), &p_conn->uhq);
+			     sizeof(struct iscsi_uhqe), &p_conn->uhq, NULL);
 	if (rc)
 		goto nomem_uhq;
 
@@ -767,7 +795,7 @@ static int qed_iscsi_allocate_connection(struct qed_hwfn *p_hwfn,
 			     QED_CHAIN_MODE_PBL,
 			     QED_CHAIN_CNT_TYPE_U16,
 			     xhq_num_elements,
-			     sizeof(struct iscsi_xhqe), &p_conn->xhq);
+			     sizeof(struct iscsi_xhqe), &p_conn->xhq, NULL);
 	if (rc)
 		goto nomem;
 
@@ -1062,6 +1090,8 @@ static int qed_fill_iscsi_dev_info(struct qed_dev *cdev,
 	    qed_iscsi_get_primary_bdq_prod(hwfn, BDQ_ID_RQ);
 	info->secondary_bdq_rq_addr =
 	    qed_iscsi_get_secondary_bdq_prod(hwfn, BDQ_ID_RQ);
+
+	info->num_cqs = FEAT_NUM(hwfn, QED_ISCSI_CQ);
 
 	return rc;
 }

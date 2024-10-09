@@ -251,7 +251,7 @@ void ipath_uc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 	int header_in_data;
 
 	/* Validate the SLID. See Ch. 9.6.1.5 */
-	if (unlikely(be16_to_cpu(hdr->lrh[3]) != qp->remote_ah_attr.dlid))
+	if (unlikely(be16_to_cpu(hdr->lrh[3]) != rdma_ah_get_dlid(&qp->remote_ah_attr)))
 		goto done;
 
 	/* Check for GRH */
@@ -414,7 +414,7 @@ void ipath_uc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 		wc.status = IB_WC_SUCCESS;
 		wc.qp = &qp->ibqp;
 		wc.src_qp = qp->remote_qpn;
-		wc.slid = qp->remote_ah_attr.dlid;
+		wc.slid = rdma_ah_get_dlid(&qp->remote_ah_attr);
 		wc.sl = qp->remote_ah_attr.sl;
 		/* Signal completion event if the solicited bit is set. */
 		ipath_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,

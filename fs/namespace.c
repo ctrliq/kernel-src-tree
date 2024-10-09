@@ -23,11 +23,13 @@
 #include <linux/proc_ns.h>
 #include <linux/magic.h>
 #include <linux/module.h>
-#include <linux/kernfs.h>
 #include <linux/bootmem.h>
 #include <linux/task_work.h>
 #include "pnode.h"
 #include "internal.h"
+
+/* Maximum number of mounts in a mount namespace */
+unsigned int sysctl_mount_max __read_mostly = 100000;
 
 static unsigned int m_hash_mask __read_mostly;
 static unsigned int m_hash_shift __read_mostly;
@@ -232,9 +234,7 @@ static struct mount *alloc_vfsmnt(const char *name)
 		INIT_LIST_HEAD(&mnt->mnt_slave_list);
 		INIT_LIST_HEAD(&mnt->mnt_slave);
 		INIT_HLIST_NODE(&mnt->mnt_mp_list);
-#ifdef CONFIG_FSNOTIFY
-		INIT_HLIST_HEAD(&mnt->mnt_fsnotify_marks);
-#endif
+		INIT_LIST_HEAD(&mnt->mnt_umounting);
 		init_fs_pin(&mnt->mnt_umount, drop_mountpoint);
 	}
 	return mnt;
@@ -638,28 +638,6 @@ struct mount *__lookup_mnt(struct vfsmount *mnt, struct dentry *dentry)
 }
 
 /*
- * find the last mount at @dentry on vfsmount @mnt.
- * mount_lock must be held.
- */
-struct mount *__lookup_mnt_last(struct vfsmount *mnt, struct dentry *dentry)
-{
-	struct mount *p, *res = NULL;
-	p = __lookup_mnt(mnt, dentry);
-	if (!p)
-		goto out;
-	if (!(p->mnt.mnt_flags & MNT_UMOUNT))
-		res = p;
-	hlist_for_each_entry_continue(p, mnt_hash) {
-		if (&p->mnt_parent->mnt != mnt || p->mnt_mountpoint != dentry)
-			break;
-		if (!(p->mnt.mnt_flags & MNT_UMOUNT))
-			res = p;
-	}
-out:
-	return res;
-}
-
-/*
  * lookup_mnt - Return the first child mount mounted at path
  *
  * "First" means first mounted chronologically.  If you create the
@@ -675,7 +653,7 @@ out:
  *
  * lookup_mnt takes a reference to the found vfsmount.
  */
-struct vfsmount *lookup_mnt(struct path *path)
+struct vfsmount *lookup_mnt(const struct path *path)
 {
 	struct mount *child_mnt;
 	struct vfsmount *m;
@@ -879,6 +857,13 @@ void mnt_set_mountpoint(struct mount *mnt,
 	hlist_add_head(&child_mnt->mnt_mp_list, &mp->m_list);
 }
 
+static void __attach_mnt(struct mount *mnt, struct mount *parent)
+{
+	hlist_add_head_rcu(&mnt->mnt_hash,
+			   m_hash(&parent->mnt, mnt->mnt_mountpoint));
+	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
+}
+
 /*
  * vfsmount lock must be held for write
  */
@@ -887,28 +872,45 @@ static void attach_mnt(struct mount *mnt,
 			struct mountpoint *mp)
 {
 	mnt_set_mountpoint(parent, mp, mnt);
-	hlist_add_head_rcu(&mnt->mnt_hash, m_hash(&parent->mnt, mp->m_dentry));
-	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
+	__attach_mnt(mnt, parent);
 }
 
-static void attach_shadowed(struct mount *mnt,
-			struct mount *parent,
-			struct mount *shadows)
+void mnt_change_mountpoint(struct mount *parent, struct mountpoint *mp, struct mount *mnt)
 {
-	if (shadows) {
-		hlist_add_behind_rcu(&mnt->mnt_hash, &shadows->mnt_hash);
-		list_add(&mnt->mnt_child, &shadows->mnt_child);
-	} else {
-		hlist_add_head_rcu(&mnt->mnt_hash,
-				m_hash(&parent->mnt, mnt->mnt_mountpoint));
-		list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
-	}
+	struct mountpoint *old_mp = mnt->mnt_mp;
+	struct dentry *old_mountpoint = mnt->mnt_mountpoint;
+	struct mount *old_parent = mnt->mnt_parent;
+
+	list_del_init(&mnt->mnt_child);
+	hlist_del_init(&mnt->mnt_mp_list);
+	hlist_del_init_rcu(&mnt->mnt_hash);
+
+	attach_mnt(mnt, parent, mp);
+
+	put_mountpoint(old_mp);
+
+	/*
+	 * Safely avoid even the suggestion this code might sleep or
+	 * lock the mount hash by taking advantage of the knowledge that
+	 * mnt_change_mountpoint will not release the final reference
+	 * to a mountpoint.
+	 *
+	 * During mounting, the mount passed in as the parent mount will
+	 * continue to use the old mountpoint and during unmounting, the
+	 * old mountpoint will continue to exist until namespace_unlock,
+	 * which happens well after mnt_change_mountpoint.
+	 */
+	spin_lock(&old_mountpoint->d_lock);
+	old_mountpoint->d_lockref.count--;
+	spin_unlock(&old_mountpoint->d_lock);
+
+	mnt_add_count(old_parent, -1);
 }
 
 /*
  * vfsmount lock must be held for write
  */
-static void commit_tree(struct mount *mnt, struct mount *shadows)
+static void commit_tree(struct mount *mnt)
 {
 	struct mount *parent = mnt->mnt_parent;
 	struct mount *m;
@@ -923,7 +925,10 @@ static void commit_tree(struct mount *mnt, struct mount *shadows)
 
 	list_splice(&head, n->list.prev);
 
-	attach_shadowed(mnt, parent, shadows);
+	n->mounts += n->pending_mounts;
+	n->pending_mounts = 0;
+
+	__attach_mnt(mnt, parent);
 	touch_mnt_namespace(n);
 }
 
@@ -986,6 +991,21 @@ vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void 
 	return &mnt->mnt;
 }
 EXPORT_SYMBOL_GPL(vfs_kern_mount);
+
+struct vfsmount *
+vfs_submount(const struct dentry *mountpoint, struct file_system_type *type,
+	     const char *name, void *data)
+{
+	/* Until it is worked out how to pass the user namespace
+	 * through from the parent mount to the submount don't support
+	 * unprivileged mounts with submounts.
+	 */
+	if (mountpoint->d_sb->s_user_ns != &init_user_ns)
+		return ERR_PTR(-EPERM);
+
+	return vfs_kern_mount(type, MS_SUBMOUNT, name, data);
+}
+EXPORT_SYMBOL_GPL(vfs_submount);
 
 static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 					int flag)
@@ -1208,7 +1228,7 @@ bool path_is_mountpoint(const struct path *path)
 }
 EXPORT_SYMBOL(path_is_mountpoint);
 
-struct vfsmount *mnt_clone_internal(struct path *path)
+struct vfsmount *mnt_clone_internal(const struct path *path)
 {
 	struct mount *p;
 	p = clone_mnt(real_mount(path->mnt), path->dentry, CL_PRIVATE);
@@ -1474,11 +1494,16 @@ static void umount_tree(struct mount *mnt, enum umount_tree_flags how)
 		propagate_umount(&tmp_list);
 
 	while (!list_empty(&tmp_list)) {
+		struct mnt_namespace *ns;
 		bool disconnect;
 		p = list_first_entry(&tmp_list, struct mount, mnt_list);
 		list_del_init(&p->mnt_expire);
 		list_del_init(&p->mnt_list);
-		__touch_mnt_namespace(p->mnt_ns);
+		ns = p->mnt_ns;
+		if (ns) {
+			ns->mounts--;
+			__touch_mnt_namespace(ns);
+		}
 		p->mnt_ns = NULL;
 		if (how & UMOUNT_SYNC)
 			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
@@ -1598,6 +1623,43 @@ static int do_umount(struct mount *mnt, int flags)
 
 int may_detach_mounts __read_mostly;
 
+static int proc_set_may_detach_mounts(struct ctl_table *table, int write,
+	void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tbl;
+	int new = may_detach_mounts;
+	int ret;
+
+	tbl = *table;
+	tbl.data = &new;
+	ret = proc_dointvec_minmax(&tbl, write, buffer, lenp, ppos);
+	if (ret)
+		return ret;
+
+	if (write) {
+		if (new)
+			may_detach_mounts = 1;
+		else if (may_detach_mounts)
+			ret = -EINVAL;
+	}
+	return ret;
+}
+
+static int zero = 0;
+static int one = 1;
+static struct ctl_table fs_table[] = {
+	{
+		.procname	= "may_detach_mounts",
+		.data		= NULL,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_set_may_detach_mounts,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{}
+};
+
 /*
  * __detach_mounts - lazily unmount all mounts on the specified dentry
  *
@@ -1640,6 +1702,14 @@ out_unlock:
 static inline bool may_mount(void)
 {
 	return ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN);
+}
+
+static inline bool may_mandlock(void)
+{
+#ifndef	CONFIG_MANDATORY_FILE_LOCKING
+	return false;
+#endif
+	return capable(CAP_SYS_ADMIN);
 }
 
 /*
@@ -1755,7 +1825,6 @@ struct mount *copy_tree(struct mount *mnt, struct dentry *dentry,
 			continue;
 
 		for (s = r; s; s = next_mnt(s, r)) {
-			struct mount *t = NULL;
 			if (!(flag & CL_COPY_UNBINDABLE) &&
 			    IS_MNT_UNBINDABLE(s)) {
 				s = skip_mnt_tree(s);
@@ -1777,14 +1846,7 @@ struct mount *copy_tree(struct mount *mnt, struct dentry *dentry,
 				goto out;
 			lock_mount_hash();
 			list_add_tail(&q->mnt_list, &res->mnt_list);
-			mnt_set_mountpoint(parent, p->mnt_mp, q);
-			if (!list_empty(&parent->mnt_mounts)) {
-				t = list_last_entry(&parent->mnt_mounts,
-					struct mount, mnt_child);
-				if (t->mnt_mp != p->mnt_mp)
-					t = NULL;
-			}
-			attach_shadowed(q, parent, t);
+			attach_mnt(q, parent, p->mnt_mp);
 			unlock_mount_hash();
 		}
 	}
@@ -1800,7 +1862,7 @@ out:
 
 /* Caller should check returned pointer for errors */
 
-struct vfsmount *collect_mounts(struct path *path)
+struct vfsmount *collect_mounts(const struct path *path)
 {
 	struct mount *tree;
 	namespace_lock();
@@ -1833,7 +1895,7 @@ void drop_collected_mounts(struct vfsmount *mnt)
  *
  * Release with mntput().
  */
-struct vfsmount *clone_private_mount(struct path *path)
+struct vfsmount *clone_private_mount(const struct path *path)
 {
 	struct mount *old_mnt = real_mount(path->mnt);
 	struct mount *new_mnt;
@@ -1888,6 +1950,28 @@ static int invent_group_ids(struct mount *mnt, bool recurse)
 		}
 	}
 
+	return 0;
+}
+
+int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
+{
+	unsigned int max = READ_ONCE(sysctl_mount_max);
+	unsigned int mounts = 0, old, pending, sum;
+	struct mount *p;
+
+	for (p = mnt; p; p = next_mnt(p, mnt))
+		mounts++;
+
+	old = ns->mounts;
+	pending = ns->pending_mounts;
+	sum = old + pending;
+	if ((old > sum) ||
+	    (pending > sum) ||
+	    (max < sum) ||
+	    (mounts > (max - sum)))
+		return -ENOSPC;
+
+	ns->pending_mounts = pending + mounts;
 	return 0;
 }
 
@@ -1960,9 +2044,25 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 			struct path *parent_path)
 {
 	HLIST_HEAD(tree_list);
+	struct mnt_namespace *ns = dest_mnt->mnt_ns;
+	struct mountpoint *smp;
 	struct mount *child, *p;
 	struct hlist_node *n;
 	int err;
+
+	/* Preallocate a mountpoint in case the new mounts need
+	 * to be tucked under other mounts.
+	 */
+	smp = get_mountpoint(source_mnt->mnt.mnt_root);
+	if (IS_ERR(smp))
+		return PTR_ERR(smp);
+
+	/* Is there space to add these mounts to the mount namespace? */
+	if (!parent_path) {
+		err = count_mounts(ns, source_mnt);
+		if (err)
+			goto out;
+	}
 
 	if (IS_MNT_SHARED(dest_mnt)) {
 		err = invent_group_ids(source_mnt, true);
@@ -1984,16 +2084,19 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 		touch_mnt_namespace(source_mnt->mnt_ns);
 	} else {
 		mnt_set_mountpoint(dest_mnt, dest_mp, source_mnt);
-		commit_tree(source_mnt, NULL);
+		commit_tree(source_mnt);
 	}
 
 	hlist_for_each_entry_safe(child, n, &tree_list, mnt_hash) {
 		struct mount *q;
 		hlist_del_init(&child->mnt_hash);
-		q = __lookup_mnt_last(&child->mnt_parent->mnt,
-				      child->mnt_mountpoint);
-		commit_tree(child, q);
+		q = __lookup_mnt(&child->mnt_parent->mnt,
+				 child->mnt_mountpoint);
+		if (q)
+			mnt_change_mountpoint(child, smp, q);
+		commit_tree(child);
 	}
+	put_mountpoint(smp);
 	unlock_mount_hash();
 
 	return 0;
@@ -2001,11 +2104,18 @@ static int attach_recursive_mnt(struct mount *source_mnt,
  out_cleanup_ids:
 	while (!hlist_empty(&tree_list)) {
 		child = hlist_entry(tree_list.first, struct mount, mnt_hash);
+		child->mnt_parent->mnt_ns->pending_mounts = 0;
 		umount_tree(child, UMOUNT_SYNC);
 	}
 	unlock_mount_hash();
 	cleanup_group_ids(source_mnt, NULL);
  out:
+	ns->pending_mounts = 0;
+
+	read_seqlock_excl(&mount_lock);
+	put_mountpoint(smp);
+	read_sequnlock_excl(&mount_lock);
+
 	return err;
 }
 
@@ -2237,13 +2347,7 @@ static int do_remount(struct path *path, int flags, int mnt_flags,
 	}
 	if ((mnt->mnt.mnt_flags & MNT_LOCK_NODEV) &&
 	    !(mnt_flags & MNT_NODEV)) {
-		/* Was the nodev implicitly added in mount? */
-		if ((mnt->mnt_ns->user_ns != &init_user_ns) &&
-		    !(sb->s_type->fs_flags & FS_USERNS_DEV_MOUNT)) {
-			mnt_flags |= MNT_NODEV;
-		} else {
-			return -EPERM;
-		}
+		return -EPERM;
 	}
 	if ((mnt->mnt.mnt_flags & MNT_LOCK_NOSUID) &&
 	    !(mnt_flags & MNT_NOSUID)) {
@@ -2427,6 +2531,8 @@ unlock:
 	return err;
 }
 
+static bool mount_too_revealing(struct vfsmount *mnt, int *new_mnt_flags);
+
 /*
  * create a new mount for userspace and request it to be added into the
  * namespace's tree
@@ -2435,7 +2541,6 @@ static int do_new_mount(struct path *path, const char *fstype, int flags,
 			int mnt_flags, const char *name, void *data)
 {
 	struct file_system_type *type;
-	struct user_namespace *user_ns = current->nsproxy->mnt_ns->user_ns;
 	struct vfsmount *mnt;
 	int err;
 
@@ -2446,16 +2551,6 @@ static int do_new_mount(struct path *path, const char *fstype, int flags,
 	if (!type)
 		return -ENODEV;
 
-	if (user_ns != &init_user_ns) {
-		/* Only in special cases allow devices from mounts
-		 * created outside the initial user namespace.
-		 */
-		if (!(type->fs_flags & FS_USERNS_DEV_MOUNT)) {
-			flags |= MS_NODEV;
-			mnt_flags |= MNT_NODEV | MNT_LOCK_NODEV;
-		}
-	}
-
 	mnt = vfs_kern_mount(type, flags, name, data);
 	if (!IS_ERR(mnt) && (type->fs_flags & FS_HAS_SUBTYPE) &&
 	    !mnt->mnt_sb->s_subtype)
@@ -2464,6 +2559,11 @@ static int do_new_mount(struct path *path, const char *fstype, int flags,
 	put_filesystem(type);
 	if (IS_ERR(mnt))
 		return PTR_ERR(mnt);
+
+	if (mount_too_revealing(mnt, &mnt_flags)) {
+		mntput(mnt);
+		return -EPERM;
+	}
 
 	err = do_add_mount(real_mount(mnt), path, mnt_flags);
 	if (err)
@@ -2726,6 +2826,8 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 				   type_page, flags, data_page);
 	if (!retval && !may_mount())
 		retval = -EPERM;
+	if (!retval && (flags & MS_MANDLOCK) && !may_mandlock())
+		retval = -EPERM;
 	if (retval)
 		goto dput_out;
 
@@ -2759,7 +2861,7 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 
 	flags &= ~(MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_ACTIVE | MS_BORN |
 		   MS_NOATIME | MS_NODIRATIME | MS_RELATIME| MS_KERNMOUNT |
-		   MS_STRICTATIME | MS_NOREMOTELOCK);
+		   MS_STRICTATIME | MS_NOREMOTELOCK | MS_SUBMOUNT);
 
 	if (flags & MS_REMOUNT)
 		retval = do_remount(&path, flags & ~MS_REMOUNT, mnt_flags,
@@ -2834,13 +2936,10 @@ static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
 	new_ns->event = 0;
 	new_ns->user_ns = get_user_ns(user_ns);
 	new_ns->ucounts = ucounts;
+	new_ns->mounts = 0;
+	new_ns->pending_mounts = 0;
 	return new_ns;
 }
-
-/* namespace.unpriv_enable = 1 */
-static bool enable_unpriv_mnt_ns_creation;
-module_param_named(unpriv_enable, enable_unpriv_mnt_ns_creation, bool, 0444);
-MODULE_PARM_DESC(unpriv_enable, "Enable unprivileged creation of mount namespaces");
 
 struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
 		struct user_namespace *user_ns, struct fs_struct *new_fs)
@@ -2859,16 +2958,9 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
 		return ns;
 	}
 
-	/* Unprivileged creation currently tech preview in RHEL7  */
-	if (user_ns != &init_user_ns) {
-		static int __read_mostly called_mark_tech_preview = 0;
-		if (!enable_unpriv_mnt_ns_creation) {
-			return ERR_PTR(-EPERM);
-		}
-		if (!called_mark_tech_preview &&
-		    !xchg(&called_mark_tech_preview, 1))
-			mark_tech_preview("unpriv mount namespace", NULL);
-	}
+	/* Unprivileged creation must set may_detach_mounts in RHEL7 */
+	if (user_ns != &init_user_ns)
+		may_detach_mounts = 1;
 
 	old = ns->root;
 
@@ -2899,6 +2991,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
 	q = new;
 	while (p) {
 		q->mnt_ns = new_ns;
+		new_ns->mounts++;
 		if (new_fs) {
 			if (&p->mnt == new_fs->root.mnt) {
 				new_fs->root.mnt = mntget(&q->mnt);
@@ -2937,6 +3030,7 @@ static struct mnt_namespace *create_mnt_ns(struct vfsmount *m)
 		struct mount *mnt = real_mount(m);
 		mnt->mnt_ns = new_ns;
 		new_ns->root = mnt;
+		new_ns->mounts++;
 		list_add(&mnt->mnt_list, &new_ns->list);
 	} else {
 		mntput(m);
@@ -3023,9 +3117,9 @@ bool is_path_reachable(struct mount *mnt, struct dentry *dentry,
 	return &mnt->mnt == root->mnt && is_subdir(dentry, root->dentry);
 }
 
-int path_is_under(struct path *path1, struct path *path2)
+bool path_is_under(const struct path *path1, const struct path *path2)
 {
-	int res;
+	bool res;
 	read_seqlock_excl(&mount_lock);
 	res = is_path_reachable(real_mount(path1->mnt), path1->dentry, path2);
 	read_sequnlock_excl(&mount_lock);
@@ -3213,9 +3307,7 @@ void __init mnt_init(void)
 	for (u = 0; u <= mp_hash_mask; u++)
 		INIT_HLIST_HEAD(&mountpoint_hashtable[u]);
 
-#ifdef CONFIG_KERNFS
 	kernfs_init();
-#endif
 
 	err = sysfs_init();
 	if (err)
@@ -3226,6 +3318,8 @@ void __init mnt_init(void)
 		printk(KERN_WARNING "%s: kobj create error\n", __func__);
 	init_rootfs();
 	init_mount_tree();
+	if (!register_sysctl("fs", fs_table))
+		printk(KERN_WARNING "%s: failed to register sysctl table\n", __func__);
 }
 
 void put_mnt_ns(struct mnt_namespace *ns)
@@ -3291,25 +3385,103 @@ bool current_chrooted(void)
 	return chrooted;
 }
 
-void update_mnt_policy(struct user_namespace *userns)
+static bool mnt_already_visible(struct mnt_namespace *ns, struct vfsmount *new,
+				int *new_mnt_flags)
 {
-	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+	int new_flags = *new_mnt_flags;
 	struct mount *mnt;
+	bool visible = false;
 
 	down_read(&namespace_sem);
 	list_for_each_entry(mnt, &ns->list, mnt_list) {
-		switch (mnt->mnt.mnt_sb->s_magic) {
-		case SYSFS_MAGIC:
-			userns->may_mount_sysfs = true;
-			break;
-		case PROC_SUPER_MAGIC:
-			userns->may_mount_proc = true;
-			break;
+		struct mount *child;
+		int mnt_flags;
+
+		if (mnt->mnt.mnt_sb->s_type != new->mnt_sb->s_type)
+			continue;
+
+		/* This mount is not fully visible if it's root directory
+		 * is not the root directory of the filesystem.
+		 */
+		if (mnt->mnt.mnt_root != mnt->mnt.mnt_sb->s_root)
+			continue;
+
+		/* A local view of the mount flags */
+		mnt_flags = mnt->mnt.mnt_flags;
+
+		/* Don't miss readonly hidden in the superblock flags */
+		if (mnt->mnt.mnt_sb->s_flags & MS_RDONLY)
+			mnt_flags |= MNT_LOCK_READONLY;
+
+		/* Verify the mount flags are equal to or more permissive
+		 * than the proposed new mount.
+		 */
+		if ((mnt_flags & MNT_LOCK_READONLY) &&
+		    !(new_flags & MNT_READONLY))
+			continue;
+		if ((mnt_flags & MNT_LOCK_ATIME) &&
+		    ((mnt_flags & MNT_ATIME_MASK) != (new_flags & MNT_ATIME_MASK)))
+			continue;
+
+		/* This mount is not fully visible if there are any
+		 * locked child mounts that cover anything except for
+		 * empty directories.
+		 */
+		list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
+			struct inode *inode = child->mnt_mountpoint->d_inode;
+			/* Only worry about locked mounts */
+			if (!(child->mnt.mnt_flags & MNT_LOCKED))
+				continue;
+			/* Is the directory permanetly empty? */
+			if (!is_empty_dir_inode(inode))
+				goto next;
 		}
-		if (userns->may_mount_sysfs && userns->may_mount_proc)
-			break;
+		/* Preserve the locked attributes */
+		*new_mnt_flags |= mnt_flags & (MNT_LOCK_READONLY | \
+					       MNT_LOCK_ATIME);
+		visible = true;
+		goto found;
+	next:	;
 	}
+found:
 	up_read(&namespace_sem);
+	return visible;
+}
+
+static bool mount_too_revealing(struct vfsmount *mnt, int *new_mnt_flags)
+{
+	const unsigned long required_iflags = SB_I_NOEXEC | SB_I_NODEV;
+	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+	unsigned long s_iflags;
+
+	if (ns->user_ns == &init_user_ns)
+		return false;
+
+	/* Can this filesystem be too revealing? */
+	s_iflags = mnt->mnt_sb->s_iflags;
+	if (!(s_iflags & SB_I_USERNS_VISIBLE))
+		return false;
+
+	if ((s_iflags & required_iflags) != required_iflags) {
+		WARN_ONCE(1, "Expected s_iflags to contain 0x%lx\n",
+			  required_iflags);
+		return true;
+	}
+
+	return !mnt_already_visible(ns, mnt, new_mnt_flags);
+}
+
+bool mnt_may_suid(struct vfsmount *mnt)
+{
+	/*
+	 * Foreign mounts (accessed via fchdir or through /proc
+	 * symlinks) are always treated as if they are nosuid.  This
+	 * prevents namespaces from trusting potentially unsafe
+	 * suid/sgid bits, file caps, or security labels that originate
+	 * in other namespaces.
+	 */
+	return !(mnt->mnt_flags & MNT_NOSUID) && check_mnt(real_mount(mnt)) &&
+	       current_in_userns(mnt->mnt_sb->s_user_ns);
 }
 
 static void *mntns_get(struct task_struct *task)
@@ -3336,8 +3508,9 @@ static void mntns_put(void *ns)
 static int mntns_install(struct nsproxy *nsproxy, void *ns)
 {
 	struct fs_struct *fs = current->fs;
-	struct mnt_namespace *mnt_ns = ns;
+	struct mnt_namespace *mnt_ns = ns, *old_mnt_ns;
 	struct path root;
+	int err;
 
 	if (!ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN) ||
 	    !ns_capable(current_user_ns(), CAP_SYS_CHROOT) ||
@@ -3348,15 +3521,18 @@ static int mntns_install(struct nsproxy *nsproxy, void *ns)
 		return -EINVAL;
 
 	get_mnt_ns(mnt_ns);
-	put_mnt_ns(nsproxy->mnt_ns);
+	old_mnt_ns = nsproxy->mnt_ns;
 	nsproxy->mnt_ns = mnt_ns;
 
 	/* Find the root */
-	root.mnt    = &mnt_ns->root->mnt;
-	root.dentry = mnt_ns->root->mnt.mnt_root;
-	path_get(&root);
-	while(d_mountpoint(root.dentry) && follow_down_one(&root))
-		;
+	err = vfs_path_lookup(mnt_ns->root->mnt.mnt_root, &mnt_ns->root->mnt,
+				"/", LOOKUP_DOWN, &root);
+	if (err) {
+		/* revert to old namespace */
+		nsproxy->mnt_ns = old_mnt_ns;
+		put_mnt_ns(mnt_ns);
+		return err;
+	}
 
 	put_mnt_ns(old_mnt_ns);
 

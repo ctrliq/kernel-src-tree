@@ -29,7 +29,7 @@
 
 #include "i40e_type.h"
 #include "i40e_alloc.h"
-#include "i40e_virtchnl.h"
+#include <linux/avf/virtchnl.h>
 
 /* Prototypes for shared code functions that are not in
  * the standard function pointer structures.  These are
@@ -304,9 +304,6 @@ i40e_status i40e_read_pba_string(struct i40e_hw *hw, u8 *pba_num,
 				 u32 pba_num_size);
 i40e_status i40e_validate_mac_addr(u8 *mac_addr);
 void i40e_pre_tx_queue_cfg(struct i40e_hw *hw, u32 queue, bool enable);
-#ifdef I40E_FCOE
-i40e_status i40e_get_san_mac_addr(struct i40e_hw *hw, u8 *mac_addr);
-#endif
 /* prototype for functions used for NVM access */
 i40e_status i40e_init_nvm(struct i40e_hw *hw);
 i40e_status i40e_acquire_nvm(struct i40e_hw *hw,
@@ -334,10 +331,10 @@ static inline struct i40e_rx_ptype_decoded decode_rx_desc_ptype(u8 ptype)
 
 /* i40e_common for VF drivers*/
 void i40e_vf_parse_hw_config(struct i40e_hw *hw,
-			     struct i40e_virtchnl_vf_resource *msg);
+			     struct virtchnl_vf_resource *msg);
 i40e_status i40e_vf_reset(struct i40e_hw *hw);
 i40e_status i40e_aq_send_msg_to_pf(struct i40e_hw *hw,
-				enum i40e_virtchnl_ops v_opcode,
+				enum virtchnl_ops v_opcode,
 				i40e_status v_retval,
 				u8 *msg, u16 msglen,
 				struct i40e_asq_cmd_details *cmd_details);

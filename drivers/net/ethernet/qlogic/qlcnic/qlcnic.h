@@ -1851,17 +1851,17 @@ static inline bool qlcnic_82xx_encap_tx_offload(struct qlcnic_adapter *adapter)
 
 static inline bool qlcnic_82xx_encap_rx_offload(struct qlcnic_adapter *adapter)
 {
-        return false;
+	return false;
 }
 
 static inline bool qlcnic_encap_rx_offload(struct qlcnic_adapter *adapter)
 {
-        return adapter->ahw->hw_ops->encap_rx_offload(adapter);
+	return adapter->ahw->hw_ops->encap_rx_offload(adapter);
 }
 
 static inline bool qlcnic_encap_tx_offload(struct qlcnic_adapter *adapter)
 {
-        return adapter->ahw->hw_ops->encap_tx_offload(adapter);
+	return adapter->ahw->hw_ops->encap_tx_offload(adapter);
 }
 
 static inline int qlcnic_start_firmware(struct qlcnic_adapter *adapter)

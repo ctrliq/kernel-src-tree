@@ -475,7 +475,7 @@ static int nes_query_port(struct ib_device *ibdev, u8 port, struct ib_port_attr 
 	struct nes_vnic *nesvnic = to_nesvnic(ibdev);
 	struct net_device *netdev = nesvnic->netdev;
 
-	memset(props, 0, sizeof(*props));
+	/* props being zeroed by the caller, avoid zeroing it here */
 
 	props->max_mtu = IB_MTU_4096;
 	props->active_mtu = ib_mtu_int_to_enum(netdev->mtu);
@@ -756,7 +756,8 @@ static int nes_dealloc_pd(struct ib_pd *ibpd)
 /**
  * nes_create_ah
  */
-static struct ib_ah *nes_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr,
+static struct ib_ah *nes_create_ah(struct ib_pd *pd,
+				   struct rdma_ah_attr *ah_attr,
 				   struct ib_udata *udata)
 {
 	return ERR_PTR(-ENOSYS);
@@ -2159,9 +2160,9 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	}
 
 	nes_debug(NES_DBG_MR, "User base = 0x%lX, Virt base = 0x%lX, length = %u,"
-			" offset = %u, page size = %u.\n",
+			" offset = %u, page size = %lu.\n",
 			(unsigned long int)start, (unsigned long int)virt, (u32)length,
-			ib_umem_offset(region), region->page_size);
+			ib_umem_offset(region), BIT(region->page_shift));
 
 	skip_pages = ((u32)ib_umem_offset(region)) >> 12;
 
@@ -3656,26 +3657,26 @@ static int nes_port_immutable(struct ib_device *ibdev, u8 port_num,
 	struct ib_port_attr attr;
 	int err;
 
+	immutable->core_cap_flags = RDMA_CORE_PORT_IWARP;
+
 	err = nes_query_port(ibdev, port_num, &attr);
 	if (err)
 		return err;
 
 	immutable->pkey_tbl_len = attr.pkey_tbl_len;
 	immutable->gid_tbl_len = attr.gid_tbl_len;
-	immutable->core_cap_flags = RDMA_CORE_PORT_IWARP;
 
 	return 0;
 }
 
-static void get_dev_fw_str(struct ib_device *dev, char *str,
-			   size_t str_len)
+static void get_dev_fw_str(struct ib_device *dev, char *str)
 {
 	struct nes_ib_device *nesibdev =
 			container_of(dev, struct nes_ib_device, ibdev);
 	struct nes_vnic *nesvnic = nesibdev->nesvnic;
 
 	nes_debug(NES_DBG_INIT, "\n");
-	snprintf(str, str_len, "%u.%u",
+	snprintf(str, IB_FW_VERSION_NAME_MAX, "%u.%u",
 		 (nesvnic->nesdev->nesadapter->firmware_version >> 16),
 		 (nesvnic->nesdev->nesadapter->firmware_version & 0x000000ff));
 }

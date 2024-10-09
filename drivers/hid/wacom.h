@@ -109,6 +109,7 @@ enum wacom_worker {
 	WACOM_WORKER_WIRELESS,
 	WACOM_WORKER_BATTERY,
 	WACOM_WORKER_REMOTE,
+	WACOM_WORKER_MODE_CHANGE,
 };
 
 struct wacom_group_leds {
@@ -117,7 +118,8 @@ struct wacom_group_leds {
 
 struct wacom_battery {
 	struct wacom *wacom;
-	struct power_supply battery;
+	struct power_supply *battery;
+	struct power_supply_desc bat_desc;
 	char bat_name[WACOM_NAME_MAX];
 	int bat_status;
 	int battery_capacity;
@@ -150,6 +152,7 @@ struct wacom {
 	struct work_struct remote_work;
 	struct delayed_work init_work;
 	struct wacom_remote *remote;
+	struct work_struct mode_change_work;
 	struct wacom_leds {
 		struct wacom_group_leds *groups;
 		u8 llv;       /* status led brightness no button (1..127) */
@@ -175,6 +178,9 @@ static inline void wacom_schedule_work(struct wacom_wac *wacom_wac,
 	case WACOM_WORKER_REMOTE:
 		schedule_work(&wacom->remote_work);
 		break;
+	case WACOM_WORKER_MODE_CHANGE:
+		schedule_work(&wacom->mode_change_work);
+		break;
 	}
 }
 
@@ -194,4 +200,5 @@ void wacom_wac_event(struct hid_device *hdev, struct hid_field *field,
 		struct hid_usage *usage, __s32 value);
 void wacom_wac_report(struct hid_device *hdev, struct hid_report *report);
 void wacom_battery_work(struct work_struct *work);
+int wacom_equivalent_usage(int usage);
 #endif

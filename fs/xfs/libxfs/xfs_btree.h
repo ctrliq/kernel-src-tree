@@ -19,7 +19,7 @@
 #define	__XFS_BTREE_H__
 
 struct xfs_buf;
-struct xfs_bmap_free;
+struct xfs_defer_ops;
 struct xfs_inode;
 struct xfs_mount;
 struct xfs_trans;
@@ -229,11 +229,12 @@ typedef struct xfs_btree_cur
 	union {
 		struct {			/* needed for BNO, CNT, INO */
 			struct xfs_buf	*agbp;	/* agf/agi buffer pointer */
+			struct xfs_defer_ops *dfops;	/* deferred updates */
 			xfs_agnumber_t	agno;	/* ag number */
 		} a;
 		struct {			/* needed for BMAP */
 			struct xfs_inode *ip;	/* pointer to our inode */
-			struct xfs_bmap_free *flist;	/* list to free after */
+			struct xfs_defer_ops *dfops;	/* deferred updates */
 			xfs_fsblock_t	firstblock;	/* 1st blk allocated */
 			int		allocated;	/* count of alloced */
 			short		forksize;	/* fork's inode space */
@@ -487,6 +488,8 @@ bool xfs_btree_sblock_v5hdr_verify(struct xfs_buf *bp);
 bool xfs_btree_sblock_verify(struct xfs_buf *bp, unsigned int max_recs);
 uint xfs_btree_compute_maxlevels(struct xfs_mount *mp, uint *limits,
 				 unsigned long len);
+xfs_extlen_t xfs_btree_calc_size(struct xfs_mount *mp, uint *limits,
+		unsigned long long len);
 
 void xfs_btree_get_leaf_keys(struct xfs_btree_cur *cur,
 		struct xfs_btree_block *block, union xfs_btree_key *key);
@@ -498,5 +501,7 @@ typedef int (*xfs_btree_visit_blocks_fn)(struct xfs_btree_cur *cur, int level,
 		void *data);
 int xfs_btree_visit_blocks(struct xfs_btree_cur *cur,
 		xfs_btree_visit_blocks_fn fn, void *data);
+
+int xfs_btree_count_blocks(struct xfs_btree_cur *cur, xfs_extlen_t *blocks);
 
 #endif	/* __XFS_BTREE_H__ */

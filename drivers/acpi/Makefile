@@ -18,7 +18,7 @@ obj-y				+= acpi.o \
 					acpica/
 
 # All the builtin files are in the "acpi." module_param namespace.
-acpi-y				+= osl.o utils.o reboot.o
+acpi-y				+= osi.o osl.o utils.o reboot.o
 acpi-y				+= nvs.o
 
 # Power management related files
@@ -42,7 +42,6 @@ acpi-y				+= pci_root.o pci_link.o pci_irq.o
 acpi-y				+= acpi_lpss.o acpi_apd.o
 acpi-y				+= acpi_platform.o
 acpi-y				+= acpi_pnp.o
-acpi-y				+= int340x_thermal.o
 acpi-y				+= power.o
 acpi-y				+= event.o
 acpi-y				+= sysfs.o
@@ -54,6 +53,7 @@ acpi-$(CONFIG_ACPI_PROCFS_POWER) += cm_sbs.o
 ifdef CONFIG_ACPI_VIDEO
 acpi-y				+= video_detect.o
 endif
+obj-y				+= dptf/
 
 # These are (potentially) separate modules
 
@@ -77,6 +77,7 @@ obj-$(CONFIG_ACPI_HED)		+= hed.o
 obj-$(CONFIG_ACPI_EC_DEBUGFS)	+= ec_sys.o
 obj-$(CONFIG_ACPI_CUSTOM_METHOD)+= custom_method.o
 obj-$(CONFIG_ACPI_BGRT)		+= bgrt.o
+obj-$(CONFIG_ACPI_CPPC_LIB)	+= cppc_acpi.o
 
 # processor has its own "processor." module_param namespace
 processor-y			:= processor_driver.o processor_throttling.o

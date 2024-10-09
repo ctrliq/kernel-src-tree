@@ -20,6 +20,7 @@
 #include <linux/ctype.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_graph.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -180,11 +181,11 @@ static ssize_t of_node_property_read(struct file *filp, struct kobject *kobj,
 static const char *safe_name(struct kobject *kobj, const char *orig_name)
 {
 	const char *name = orig_name;
-	struct sysfs_dirent *kn;
+	struct kernfs_node *kn;
 	int i = 0;
 
 	/* don't be a hero. After 16 tries give up */
-	while (i < 16 && (kn = sysfs_get_dirent(kobj->sd, NULL, name))) {
+	while (i < 16 && (kn = sysfs_get_dirent(kobj->sd, name))) {
 		sysfs_put(kn);
 		if (name != orig_name)
 			kfree(name);
@@ -1922,3 +1923,290 @@ const char *of_prop_next_string(struct property *prop, const char *cur)
 	return curv;
 }
 EXPORT_SYMBOL_GPL(of_prop_next_string);
+
+/**
+ * of_graph_parse_endpoint() - parse common endpoint node properties
+ * @node: pointer to endpoint device_node
+ * @endpoint: pointer to the OF endpoint data structure
+ *
+ * The caller should hold a reference to @node.
+ */
+int of_graph_parse_endpoint(const struct device_node *node,
+			    struct of_endpoint *endpoint)
+{
+	struct device_node *port_node = of_get_parent(node);
+
+	memset(endpoint, 0, sizeof(*endpoint));
+
+	endpoint->local_node = node;
+	/*
+	 * It doesn't matter whether the two calls below succeed.
+	 * If they don't then the default value 0 is used.
+	 */
+	of_property_read_u32(port_node, "reg", &endpoint->port);
+	of_property_read_u32(node, "reg", &endpoint->id);
+
+	of_node_put(port_node);
+
+	return 0;
+}
+EXPORT_SYMBOL(of_graph_parse_endpoint);
+
+/**
+ * of_graph_get_port_by_id() - get the port matching a given id
+ * @parent: pointer to the parent device node
+ * @id: id of the port
+ *
+ * Return: A 'port' node pointer with refcount incremented. The caller
+ * has to use of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_port_by_id(struct device_node *parent, u32 id)
+{
+	struct device_node *node, *port;
+
+	node = of_get_child_by_name(parent, "ports");
+	if (node)
+		parent = node;
+
+	for_each_child_of_node(parent, port) {
+		u32 port_id = 0;
+
+		if (of_node_cmp(port->name, "port") != 0)
+			continue;
+		of_property_read_u32(port, "reg", &port_id);
+		if (id == port_id)
+			break;
+	}
+
+	of_node_put(node);
+
+	return port;
+}
+EXPORT_SYMBOL(of_graph_get_port_by_id);
+
+/**
+ * of_graph_get_next_endpoint() - get next endpoint node
+ * @parent: pointer to the parent device node
+ * @prev: previous endpoint node, or NULL to get first
+ *
+ * Return: An 'endpoint' node pointer with refcount incremented. Refcount
+ * of the passed @prev node is not decremented, the caller have to use
+ * of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_next_endpoint(const struct device_node *parent,
+					struct device_node *prev)
+{
+	struct device_node *endpoint;
+	struct device_node *port = NULL;
+
+	if (!parent)
+		return NULL;
+
+	if (!prev) {
+		struct device_node *node;
+		/*
+		 * It's the first call, we have to find a port subnode
+		 * within this node or within an optional 'ports' node.
+		 */
+		node = of_get_child_by_name(parent, "ports");
+		if (node)
+			parent = node;
+
+		port = of_get_child_by_name(parent, "port");
+
+		if (port) {
+			/* Found a port, get an endpoint. */
+			endpoint = of_get_next_child(port, NULL);
+			of_node_put(port);
+		} else {
+			endpoint = NULL;
+		}
+
+		if (!endpoint)
+			pr_err("%s(): no endpoint nodes specified for %s\n",
+			       __func__, parent->full_name);
+		of_node_put(node);
+	} else {
+		port = of_get_parent(prev);
+		if (!port)
+			/* Hm, has someone given us the root node ?... */
+			return NULL;
+
+		/* Avoid dropping prev node refcount to 0. */
+		of_node_get(prev);
+		endpoint = of_get_next_child(port, prev);
+		if (endpoint) {
+			of_node_put(port);
+			return endpoint;
+		}
+
+		/* No more endpoints under this port, try the next one. */
+		do {
+			port = of_get_next_child(parent, port);
+			if (!port)
+				return NULL;
+		} while (of_node_cmp(port->name, "port"));
+
+		/* Pick up the first endpoint in this port. */
+		endpoint = of_get_next_child(port, NULL);
+		of_node_put(port);
+	}
+
+	return endpoint;
+}
+EXPORT_SYMBOL(of_graph_get_next_endpoint);
+
+/**
+ * of_graph_get_endpoint_by_regs() - get endpoint node of specific identifiers
+ * @parent: pointer to the parent device node
+ * @port_reg: identifier (value of reg property) of the parent port node
+ * @reg: identifier (value of reg property) of the endpoint node
+ *
+ * Return: An 'endpoint' node pointer which is identified by reg and at the same
+ * is the child of a port node identified by port_reg. reg and port_reg are
+ * ignored when they are -1.
+ */
+struct device_node *of_graph_get_endpoint_by_regs(
+	const struct device_node *parent, int port_reg, int reg)
+{
+	struct of_endpoint endpoint;
+	struct device_node *node, *prev_node = NULL;
+
+	while (1) {
+		node = of_graph_get_next_endpoint(parent, prev_node);
+		of_node_put(prev_node);
+		if (!node)
+			break;
+
+		of_graph_parse_endpoint(node, &endpoint);
+		if (((port_reg == -1) || (endpoint.port == port_reg)) &&
+			((reg == -1) || (endpoint.id == reg)))
+			return node;
+
+		prev_node = node;
+	}
+
+	return NULL;
+}
+
+/**
+ * of_graph_get_remote_endpoint() - get remote endpoint node
+ * @node: pointer to a local endpoint device_node
+ *
+ * Return: Remote endpoint node associated with remote endpoint node linked
+ *	   to @node. Use of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_remote_endpoint(const struct device_node *node)
+{
+	/* Get remote endpoint node. */
+	return of_parse_phandle(node, "remote-endpoint", 0);
+}
+EXPORT_SYMBOL(of_graph_get_remote_endpoint);
+
+/**
+ * of_graph_get_port_parent() - get port's parent node
+ * @node: pointer to a local endpoint device_node
+ *
+ * Return: device node associated with endpoint node linked
+ *	   to @node. Use of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_port_parent(struct device_node *node)
+{
+	unsigned int depth;
+
+	/* Walk 3 levels up only if there is 'ports' node. */
+	for (depth = 3; depth && node; depth--) {
+		node = of_get_next_parent(node);
+		if (depth == 2 && of_node_cmp(node->name, "ports"))
+			break;
+	}
+	return node;
+}
+EXPORT_SYMBOL(of_graph_get_port_parent);
+
+/**
+ * of_graph_get_remote_port_parent() - get remote port's parent node
+ * @node: pointer to a local endpoint device_node
+ *
+ * Return: Remote device node associated with remote endpoint node linked
+ *	   to @node. Use of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_remote_port_parent(
+			       const struct device_node *node)
+{
+	struct device_node *np;
+
+	/* Get remote endpoint node. */
+	np = of_graph_get_remote_endpoint(node);
+
+	return of_graph_get_port_parent(np);
+}
+EXPORT_SYMBOL(of_graph_get_remote_port_parent);
+
+/**
+ * of_graph_get_remote_port() - get remote port node
+ * @node: pointer to a local endpoint device_node
+ *
+ * Return: Remote port node associated with remote endpoint node linked
+ *	   to @node. Use of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_remote_port(const struct device_node *node)
+{
+	struct device_node *np;
+
+	/* Get remote endpoint node. */
+	np = of_graph_get_remote_endpoint(node);
+	if (!np)
+		return NULL;
+	return of_get_next_parent(np);
+}
+EXPORT_SYMBOL(of_graph_get_remote_port);
+
+int of_graph_get_endpoint_count(const struct device_node *np)
+{
+	struct device_node *endpoint;
+	int num = 0;
+
+	for_each_endpoint_of_node(np, endpoint)
+		num++;
+
+	return num;
+}
+EXPORT_SYMBOL(of_graph_get_endpoint_count);
+
+/**
+ * of_graph_get_remote_node() - get remote parent device_node for given port/endpoint
+ * @node: pointer to parent device_node containing graph port/endpoint
+ * @port: identifier (value of reg property) of the parent port node
+ * @endpoint: identifier (value of reg property) of the endpoint node
+ *
+ * Return: Remote device node associated with remote endpoint node linked
+ *	   to @node. Use of_node_put() on it when done.
+ */
+struct device_node *of_graph_get_remote_node(const struct device_node *node,
+					     u32 port, u32 endpoint)
+{
+	struct device_node *endpoint_node, *remote;
+
+	endpoint_node = of_graph_get_endpoint_by_regs(node, port, endpoint);
+	if (!endpoint_node) {
+		pr_debug("no valid endpoint (%d, %d) for node %s\n",
+			 port, endpoint, node->full_name);
+		return NULL;
+	}
+
+	remote = of_graph_get_remote_port_parent(endpoint_node);
+	of_node_put(endpoint_node);
+	if (!remote) {
+		pr_debug("no valid remote node\n");
+		return NULL;
+	}
+
+	if (!of_device_is_available(remote)) {
+		pr_debug("not available for remote node\n");
+		return NULL;
+	}
+
+	return remote;
+}
+EXPORT_SYMBOL(of_graph_get_remote_node);

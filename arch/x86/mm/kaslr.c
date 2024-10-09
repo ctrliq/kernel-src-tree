@@ -27,6 +27,7 @@
 #include <asm/pgtable.h>
 #include <asm/setup.h>
 #include <asm/kaslr.h>
+#include <asm/uv/uv.h>
 
 #include "mm_internal.h"
 
@@ -123,7 +124,7 @@ void __init kernel_randomize_memory(void)
 		CONFIG_RANDOMIZE_MEMORY_PHYSICAL_PADDING;
 
 	/* Adapt phyiscal memory region size based on available memory */
-	if (memory_tb < kaslr_regions[0].size_tb)
+	if (memory_tb < kaslr_regions[0].size_tb && !is_early_uv_system())
 		kaslr_regions[0].size_tb = memory_tb;
 
 	/* Calculate entropy available between regions */

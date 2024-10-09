@@ -33,6 +33,7 @@
 #include "util/block-range.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <linux/bitmap.h>
 
 struct perf_annotate {
@@ -393,6 +394,8 @@ int cmd_annotate(int argc, const char **argv)
 			.comm	= perf_event__process_comm,
 			.exit	= perf_event__process_exit,
 			.fork	= perf_event__process_fork,
+			.attr	= perf_event__process_attr,
+			.build_id = perf_event__process_build_id,
 			.ordered_events = true,
 			.ordering_requires_timestamps = true,
 		},

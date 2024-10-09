@@ -431,7 +431,6 @@ static inline void t4_sq_produce(struct t4_wq *wq, u8 len16)
 
 static inline void t4_sq_consume(struct t4_wq *wq)
 {
-	BUG_ON(wq->sq.in_use < 1);
 	if (wq->sq.cidx == wq->sq.flush_cidx)
 		wq->sq.flush_cidx = -1;
 	wq->sq.in_use--;
@@ -472,14 +471,12 @@ static inline void t4_ring_sq_db(struct t4_wq *wq, u16 inc, union t4_wr *wqe)
 	wmb();
 	if (wq->sq.bar2_va) {
 		if (inc == 1 && wq->sq.bar2_qid == 0 && wqe) {
-			PDBG("%s: WC wq->sq.pidx = %d\n",
-			     __func__, wq->sq.pidx);
+			pr_debug("WC wq->sq.pidx = %d\n", wq->sq.pidx);
 			pio_copy((u64 __iomem *)
 				 (wq->sq.bar2_va + SGE_UDB_WCDOORBELL),
 				 (u64 *)wqe);
 		} else {
-			PDBG("%s: DB wq->sq.pidx = %d\n",
-			     __func__, wq->sq.pidx);
+			pr_debug("DB wq->sq.pidx = %d\n", wq->sq.pidx);
 			writel(PIDX_T5_V(inc) | QID_V(wq->sq.bar2_qid),
 			       wq->sq.bar2_va + SGE_UDB_KDOORBELL);
 		}
@@ -499,14 +496,12 @@ static inline void t4_ring_rq_db(struct t4_wq *wq, u16 inc,
 	wmb();
 	if (wq->rq.bar2_va) {
 		if (inc == 1 && wq->rq.bar2_qid == 0 && wqe) {
-			PDBG("%s: WC wq->rq.pidx = %d\n",
-			     __func__, wq->rq.pidx);
+			pr_debug("WC wq->rq.pidx = %d\n", wq->rq.pidx);
 			pio_copy((u64 __iomem *)
 				 (wq->rq.bar2_va + SGE_UDB_WCDOORBELL),
 				 (void *)wqe);
 		} else {
-			PDBG("%s: DB wq->rq.pidx = %d\n",
-			     __func__, wq->rq.pidx);
+			pr_debug("DB wq->rq.pidx = %d\n", wq->rq.pidx);
 			writel(PIDX_T5_V(inc) | QID_V(wq->rq.bar2_qid),
 			       wq->rq.bar2_va + SGE_UDB_KDOORBELL);
 		}
@@ -607,9 +602,11 @@ static inline void t4_swcq_produce(struct t4_cq *cq)
 {
 	cq->sw_in_use++;
 	if (cq->sw_in_use == cq->size) {
-		PDBG("%s cxgb4 sw cq overflow cqid %u\n", __func__, cq->cqid);
+		pr_warn("%s cxgb4 sw cq overflow cqid %u\n",
+			__func__, cq->cqid);
 		cq->error = 1;
-		BUG_ON(1);
+		cq->sw_in_use--;
+		return;
 	}
 	if (++cq->sw_pidx == cq->size)
 		cq->sw_pidx = 0;
@@ -617,7 +614,6 @@ static inline void t4_swcq_produce(struct t4_cq *cq)
 
 static inline void t4_swcq_consume(struct t4_cq *cq)
 {
-	BUG_ON(cq->sw_in_use < 1);
 	cq->sw_in_use--;
 	if (++cq->sw_cidx == cq->size)
 		cq->sw_cidx = 0;
@@ -662,8 +658,7 @@ static inline int t4_next_hw_cqe(struct t4_cq *cq, struct t4_cqe **cqe)
 	if (cq->queue[prev_cidx].bits_type_ts != cq->bits_type_ts) {
 		ret = -EOVERFLOW;
 		cq->error = 1;
-		printk(KERN_ERR MOD "cq overflow cqid %u\n", cq->cqid);
-		BUG_ON(1);
+		pr_err("cq overflow cqid %u\n", cq->cqid);
 	} else if (t4_valid_cqe(cq, &cq->queue[cq->cidx])) {
 
 		/* Ensure CQE is flushed to memory */
@@ -678,9 +673,9 @@ static inline int t4_next_hw_cqe(struct t4_cq *cq, struct t4_cqe **cqe)
 static inline struct t4_cqe *t4_next_sw_cqe(struct t4_cq *cq)
 {
 	if (cq->sw_in_use == cq->size) {
-		PDBG("%s cxgb4 sw cq overflow cqid %u\n", __func__, cq->cqid);
+		pr_warn("%s cxgb4 sw cq overflow cqid %u\n",
+			__func__, cq->cqid);
 		cq->error = 1;
-		BUG_ON(1);
 		return NULL;
 	}
 	if (cq->sw_in_use)

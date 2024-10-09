@@ -74,7 +74,7 @@ static int init_transition_pgtable(struct kimage *image, pgd_t *pgd)
 		set_pmd(pmd, __pmd(__pa(pte) | _KERNPG_TABLE));
 	}
 	pte = pte_offset_kernel(pmd, vaddr);
-	set_pte(pte, pfn_pte(paddr >> PAGE_SHIFT, PAGE_KERNEL_EXEC));
+	set_pte(pte, pfn_pte(paddr >> PAGE_SHIFT, PAGE_KERNEL_EXEC_NOENC));
 	return 0;
 err:
 	free_transition_pgtable(image);
@@ -102,6 +102,7 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
 		.alloc_pgt_page	= alloc_pgt_page,
 		.context	= image,
 		.pmd_flag	= __PAGE_KERNEL_LARGE_EXEC,
+		.kernpg_flag	= _KERNPG_TABLE_NOENC,
 	};
 	unsigned long mstart, mend;
 	pgd_t *level4p;
@@ -536,6 +537,25 @@ overflow:
 	pr_err("Overflow in relocation type %d value 0x%lx\n",
 	       (int)ELF64_R_TYPE(rel[i].r_info), value);
 	return -ENOEXEC;
+}
+
+int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages, gfp_t gfp)
+{
+	/*
+	 * If SME is active we need to be sure that kexec pages are
+	 * not encrypted because when we boot to the new kernel the
+	 * pages won't be accessed encrypted (initially).
+	 */
+	return set_memory_decrypted((unsigned long)vaddr, pages);
+}
+
+void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages)
+{
+	/*
+	 * If SME is active we need to reset the pages back to being
+	 * an encrypted mapping before freeing them.
+	 */
+	set_memory_encrypted((unsigned long)vaddr, pages);
 }
 #endif /* CONFIG_KEXEC_FILE */
 

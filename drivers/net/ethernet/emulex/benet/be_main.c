@@ -26,7 +26,6 @@
 #include <net/vxlan.h>
 
 MODULE_VERSION(DRV_VER);
-MODULE_DEVICE_TABLE(pci, be_dev_ids);
 MODULE_DESCRIPTION(DRV_DESC " " DRV_VER);
 MODULE_AUTHOR("Emulex Corporation");
 MODULE_LICENSE("GPL");
@@ -648,8 +647,8 @@ void be_parse_stats(struct be_adapter *adapter)
 	}
 }
 
-static struct rtnl_link_stats64 *be_get_stats64(struct net_device *netdev,
-						struct rtnl_link_stats64 *stats)
+static void be_get_stats64(struct net_device *netdev,
+			   struct rtnl_link_stats64 *stats)
 {
 	struct be_adapter *adapter = netdev_priv(netdev);
 	struct be_drv_stats *drvs = &adapter->drv_stats;
@@ -713,7 +712,6 @@ static struct rtnl_link_stats64 *be_get_stats64(struct net_device *netdev,
 	stats->rx_fifo_errors = drvs->rxpp_fifo_overflow_drop +
 				drvs->rx_input_fifo_overflow_drop +
 				drvs->rx_drops_no_pbuf;
-	return stats;
 }
 
 void be_link_status_update(struct be_adapter *adapter, u8 link_status)
@@ -1413,23 +1411,6 @@ drop:
 		be_xmit_flush(adapter, txo);
 
 	return NETDEV_TX_OK;
-}
-
-static int be_change_mtu(struct net_device *netdev, int new_mtu)
-{
-	struct be_adapter *adapter = netdev_priv(netdev);
-	struct device *dev = &adapter->pdev->dev;
-
-	if (new_mtu < BE_MIN_MTU || new_mtu > BE_MAX_MTU) {
-		dev_info(dev, "MTU must be between %d and %d bytes\n",
-			 BE_MIN_MTU, BE_MAX_MTU);
-		return -EINVAL;
-	}
-
-	dev_info(dev, "MTU changed from %d to %d bytes\n",
-		 netdev->mtu, new_mtu);
-	netdev->mtu = new_mtu;
-	return 0;
 }
 
 static inline bool be_in_all_promisc(struct be_adapter *adapter)
@@ -5207,7 +5188,6 @@ static const struct net_device_ops be_netdev_ops = {
 	.ndo_start_xmit		= be_xmit,
 	.ndo_set_rx_mode	= be_set_rx_mode,
 	.ndo_set_mac_address	= be_mac_addr_set,
-	.ndo_change_mtu		= be_change_mtu,
 	.ndo_get_stats64	= be_get_stats64,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_vlan_rx_add_vid	= be_vlan_add_vid,
@@ -5254,6 +5234,10 @@ static void be_netdev_init(struct net_device *netdev)
 	netdev->netdev_ops = &be_netdev_ops;
 
 	netdev->ethtool_ops = &be_ethtool_ops;
+
+	/* MTU range: 256 - 9000 */
+	netdev->extended->min_mtu = BE_MIN_MTU;
+	netdev->extended->max_mtu = BE_MAX_MTU;
 }
 
 static void be_cleanup(struct be_adapter *adapter)

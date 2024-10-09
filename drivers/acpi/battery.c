@@ -113,7 +113,8 @@ enum {
 struct acpi_battery {
 	struct mutex lock;
 	struct mutex sysfs_lock;
-	struct power_supply bat;
+	struct power_supply *bat;
+	struct power_supply_desc bat_desc;
 	struct acpi_device *device;
 	struct notifier_block pm_nb;
 	unsigned long update_time;
@@ -145,7 +146,7 @@ struct acpi_battery {
 	unsigned long flags;
 };
 
-#define to_acpi_battery(x) container_of(x, struct acpi_battery, bat)
+#define to_acpi_battery(x) power_supply_get_drvdata(x)
 
 static inline int acpi_battery_present(struct acpi_battery *battery)
 {
@@ -586,39 +587,45 @@ static struct device_attribute alarm_attr = {
 
 static int sysfs_add_battery(struct acpi_battery *battery)
 {
-	int result;
+	struct power_supply_config psy_cfg = { .drv_data = battery, };
 
 	if (battery->power_unit == ACPI_BATTERY_POWER_UNIT_MA) {
-		battery->bat.properties = charge_battery_props;
-		battery->bat.num_properties =
+		battery->bat_desc.properties = charge_battery_props;
+		battery->bat_desc.num_properties =
 			ARRAY_SIZE(charge_battery_props);
 	} else {
-		battery->bat.properties = energy_battery_props;
-		battery->bat.num_properties =
+		battery->bat_desc.properties = energy_battery_props;
+		battery->bat_desc.num_properties =
 			ARRAY_SIZE(energy_battery_props);
 	}
 
-	battery->bat.name = acpi_device_bid(battery->device);
-	battery->bat.type = POWER_SUPPLY_TYPE_BATTERY;
-	battery->bat.get_property = acpi_battery_get_property;
+	battery->bat_desc.name = acpi_device_bid(battery->device);
+	battery->bat_desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	battery->bat_desc.get_property = acpi_battery_get_property;
 
-	result = power_supply_register(&battery->device->dev, &battery->bat);
-	if (result)
+	battery->bat = power_supply_register_no_ws(&battery->device->dev,
+				&battery->bat_desc, &psy_cfg);
+
+	if (IS_ERR(battery->bat)) {
+		int result = PTR_ERR(battery->bat);
+
+		battery->bat = NULL;
 		return result;
-	return device_create_file(battery->bat.dev, &alarm_attr);
+	}
+	return device_create_file(&battery->bat->dev, &alarm_attr);
 }
 
 static void sysfs_remove_battery(struct acpi_battery *battery)
 {
 	mutex_lock(&battery->sysfs_lock);
-	if (!battery->bat.dev) {
+	if (!battery->bat) {
 		mutex_unlock(&battery->sysfs_lock);
 		return;
 	}
 
-	device_remove_file(battery->bat.dev, &alarm_attr);
-	power_supply_unregister(&battery->bat);
-	battery->bat.dev = NULL;
+	device_remove_file(&battery->bat->dev, &alarm_attr);
+	power_supply_unregister(battery->bat);
+	battery->bat = NULL;
 	mutex_unlock(&battery->sysfs_lock);
 }
 
@@ -715,7 +722,7 @@ static int acpi_battery_update(struct acpi_battery *battery, bool resume)
 			return result;
 		acpi_battery_init_alarm(battery);
 	}
-	if (!battery->bat.dev) {
+	if (!battery->bat) {
 		result = sysfs_add_battery(battery);
 		if (result)
 			return result;
@@ -729,7 +736,7 @@ static void acpi_battery_refresh(struct acpi_battery *battery)
 {
 	int power_unit;
 
-	if (!battery->bat.dev)
+	if (!battery->bat)
 		return;
 
 	power_unit = battery->power_unit;
@@ -1024,11 +1031,11 @@ static void acpi_battery_remove_fs(struct acpi_device *device)
 static void acpi_battery_notify(struct acpi_device *device, u32 event)
 {
 	struct acpi_battery *battery = acpi_driver_data(device);
-	struct device *old;
+	struct power_supply *old;
 
 	if (!battery)
 		return;
-	old = battery->bat.dev;
+	old = battery->bat;
 	if (event == ACPI_BATTERY_NOTIFY_INFO)
 		acpi_battery_refresh(battery);
 	acpi_battery_update(battery, false);
@@ -1038,8 +1045,8 @@ static void acpi_battery_notify(struct acpi_device *device, u32 event)
 					dev_name(&device->dev), event,
 					acpi_battery_present(battery));
 	/* acpi_battery_update could remove power_supply object */
-	if (old && battery->bat.dev)
-		power_supply_changed(&battery->bat);
+	if (old && battery->bat)
+		power_supply_changed(battery->bat);
 }
 
 static int battery_notify(struct notifier_block *nb,
@@ -1055,7 +1062,7 @@ static int battery_notify(struct notifier_block *nb,
 		if (!acpi_battery_present(battery))
 			return 0;
 
-		if (!battery->bat.dev) {
+		if (!battery->bat) {
 			result = acpi_battery_get_info(battery);
 			if (result)
 				return result;

@@ -2318,6 +2318,52 @@ void scsi_report_device_reset(struct Scsi_Host *shost, int channel, int target)
 }
 EXPORT_SYMBOL(scsi_report_device_reset);
 
+static struct scsi_cmnd *scsi_reset_alloc_cmd(struct scsi_device *dev)
+{
+	struct request *rq;
+	struct Scsi_Host *shost = dev->host;
+	struct scsi_cmnd *cmd;
+
+	rq = kzalloc(sizeof(struct request) + sizeof(struct scsi_cmnd) +
+		     shost->hostt->cmd_size + sizeof(struct request_aux),
+		     GFP_KERNEL);
+	if (!rq)
+		return ERR_PTR(-ENOMEM);
+
+	blk_rq_init(NULL, rq);
+	if (!shost_use_blk_mq(shost)) {
+		cmd = scsi_get_command(dev, GFP_KERNEL);
+		if (!cmd) {
+			kfree(rq);
+			return ERR_PTR(-ENOMEM);
+		}
+	} else {
+		unsigned long flags;
+
+		cmd = (struct scsi_cmnd *)(rq + 1);
+		cmd->device = dev;
+		INIT_LIST_HEAD(&cmd->list);
+		INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
+		spin_lock_irqsave(&dev->list_lock, flags);
+		list_add_tail(&cmd->list, &dev->cmd_list);
+		spin_unlock_irqrestore(&dev->list_lock, flags);
+		cmd->jiffies_at_alloc = jiffies;
+	}
+	cmd->request = rq;
+	cmd->cmnd = rq->cmd;
+
+	return cmd;
+}
+
+static void scsi_reset_free_cmd(struct scsi_cmnd *cmd)
+{
+	struct Scsi_Host *shost = cmd->device->host;
+
+	kfree(cmd->request);
+	if (!shost_use_blk_mq(shost))
+		scsi_next_command(cmd);
+}
+
 static void
 scsi_reset_provider_done_command(struct scsi_cmnd *scmd)
 {
@@ -2341,7 +2387,6 @@ scsi_reset_provider(struct scsi_device *dev, int flag)
 {
 	struct scsi_cmnd *scmd;
 	struct Scsi_Host *shost = dev->host;
-	struct request req;
 	unsigned long flags;
 	int rtn;
 
@@ -2353,17 +2398,12 @@ scsi_reset_provider(struct scsi_device *dev, int flag)
 		goto out_put_autopm_host;
 	}
 
-	scmd = scsi_get_command(dev, GFP_KERNEL);
-	if (!scmd) {
+	scmd = scsi_reset_alloc_cmd(dev);
+	if (IS_ERR(scmd)) {
 		rtn = FAILED;
 		put_device(&dev->sdev_gendev);
 		goto out_put_autopm_host;
 	}
-
-	blk_rq_init(NULL, &req);
-	scmd->request = &req;
-
-	scmd->cmnd = req.cmd;
 
 	scmd->scsi_done		= scsi_reset_provider_done_command;
 	memset(&scmd->sdb, 0, sizeof(scmd->sdb));
@@ -2415,7 +2455,7 @@ scsi_reset_provider(struct scsi_device *dev, int flag)
 
 	scsi_run_host_queues(shost);
 
-	scsi_next_command(scmd);
+	scsi_reset_free_cmd(scmd);
 out_put_autopm_host:
 	scsi_autopm_put_host(shost);
 	return rtn;

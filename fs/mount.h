@@ -2,6 +2,7 @@
 #include <linux/seq_file.h>
 #include <linux/poll.h>
 #include <linux/fs_pin.h>
+#include <linux/rh_kabi.h>
 
 struct mnt_namespace {
 	atomic_t		count;
@@ -13,6 +14,8 @@ struct mnt_namespace {
 	u64			seq;	/* Sequence number to prevent loops */
 	wait_queue_head_t poll;
 	u64 event;
+	RH_KABI_EXTEND(unsigned int	mounts) /* # of mounts in the namespace */
+	RH_KABI_EXTEND(unsigned int	pending_mounts)
 };
 
 struct mnt_pcp {
@@ -56,7 +59,8 @@ struct mount {
 	struct mountpoint *mnt_mp;	/* where is it mounted */
 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
 #ifdef CONFIG_FSNOTIFY
-	struct hlist_head mnt_fsnotify_marks;
+	RH_KABI_REPLACE(struct hlist_head mnt_fsnotify_marks,
+		     struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks)
 	__u32 mnt_fsnotify_mask;
 #endif
 	int mnt_id;			/* mount identifier */
@@ -65,6 +69,7 @@ struct mount {
 	struct hlist_head mnt_pins;
 	struct fs_pin mnt_umount;
 	struct dentry *mnt_ex_mountpoint;
+	RH_KABI_EXTEND(struct list_head mnt_umounting)	/* list entry for umount propagation */
 };
 
 #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
@@ -86,7 +91,6 @@ static inline int is_mounted(struct vfsmount *mnt)
 }
 
 extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
-extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
 
 extern int __legitimize_mnt(struct vfsmount *, unsigned);
 extern bool legitimize_mnt(struct vfsmount *, unsigned);

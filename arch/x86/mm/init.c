@@ -18,6 +18,8 @@
 #include <asm/dma.h>		/* for MAX_DMA_PFN */
 #include <asm/microcode.h>
 #include <asm/kaslr.h>
+#include <asm/cpufeature.h>
+#include <asm/mmu_context.h>
 
 #include "mm_internal.h"
 
@@ -169,17 +171,20 @@ static void __init probe_page_size_mask(void)
 {
 	init_gbpages();
 
-#if !defined(CONFIG_DEBUG_PAGEALLOC) && !defined(CONFIG_KMEMCHECK)
 	/*
-	 * For CONFIG_DEBUG_PAGEALLOC, identity mapping will use small pages.
+	 * For CONFIG_KMEMCHECK or pagealloc debugging, identity mapping will
+	 * use small pages.
 	 * This will simplify cpa(), which otherwise needs to support splitting
 	 * large pages into small in interrupt context, etc.
 	 */
+	if (cpu_has_pse && !debug_pagealloc_enabled() &&
+	   !IS_ENABLED(CONFIG_KMEMCHECK))
+		page_size_mask |= 1 << PG_LEVEL_2M;
+	else
+		direct_gbpages = 0;
+
 	if (direct_gbpages)
 		page_size_mask |= 1 << PG_LEVEL_1G;
-	if (cpu_has_pse)
-		page_size_mask |= 1 << PG_LEVEL_2M;
-#endif
 
 	/* Enable PSE if available */
 	if (cpu_has_pse)
@@ -190,6 +195,47 @@ static void __init probe_page_size_mask(void)
 		set_in_cr4(X86_CR4_PGE);
 		__supported_pte_mask |= _PAGE_GLOBAL;
 	}
+}
+
+static void setup_pcid(void)
+{
+#ifdef CONFIG_X86_64
+	if (boot_cpu_has(X86_FEATURE_PCID)) {
+		if (boot_cpu_has(X86_FEATURE_PGE)) {
+			/*
+			 * This can't be cr4_set_bits_and_update_boot() --
+			 * the trampoline code can't handle CR4.PCIDE and
+			 * it wouldn't do any good anyway.  Despite the name,
+			 * cr4_set_bits_and_update_boot() doesn't actually
+			 * cause the bits in question to remain set all the
+			 * way through the secondary boot asm.
+			 *
+			 * Instead, we brute-force it and set CR4.PCIDE
+			 * manually in start_secondary().
+			 */
+			set_in_cr4(X86_CR4_PCIDE);
+			/*
+			 * INVPCID's single-context modes (2/3) only work
+			 * if we set X86_CR4_PCIDE, *and* we INVPCID
+			 * support.  It's unusable on systems that have
+			 * X86_CR4_PCIDE clear, or that have no INVPCID
+			 * support at all.
+			 */
+			if (boot_cpu_has(X86_FEATURE_INVPCID))
+				setup_force_cpu_cap(X86_FEATURE_INVPCID_SINGLE);
+		} else {
+			/*
+			 * flush_tlb_all(), as currently implemented, won't
+			 * work if PCID is on but PGE is not.  Since that
+			 * combination doesn't exist on real hardware, there's
+			 * no reason to try to fully support it, but it's
+			 * polite to avoid corrupting data if we're on
+			 * an improperly configured VM.
+			 */
+			setup_clear_cpu_cap(X86_FEATURE_PCID);
+		}
+	}
+#endif
 }
 
 #ifdef CONFIG_X86_32
@@ -570,6 +616,7 @@ void __init init_mem_mapping(void)
 	unsigned long end;
 
 	probe_page_size_mask();
+	setup_pcid();
 
 #ifdef CONFIG_X86_64
 	end = max_pfn << PAGE_SHIFT;
@@ -682,26 +729,26 @@ void free_init_pages(char *what, unsigned long begin, unsigned long end)
 	 * mark them not present - any buggy init-section access will
 	 * create a kernel page fault:
 	 */
-#ifdef CONFIG_DEBUG_PAGEALLOC
-	printk(KERN_INFO "debug: unmapping init [mem %#010lx-%#010lx]\n",
-		begin, end - 1);
-	set_memory_np(begin, (end - begin) >> PAGE_SHIFT);
-#else
-	/*
-	 * We just marked the kernel text read only above, now that
-	 * we are going to free part of that, we need to make that
-	 * writeable and non-executable first.
-	 */
-	set_memory_nx(begin, (end - begin) >> PAGE_SHIFT);
-	set_memory_rw(begin, (end - begin) >> PAGE_SHIFT);
+	if (debug_pagealloc_enabled()) {
+		pr_info("debug: unmapping init [mem %#010lx-%#010lx]\n",
+			begin, end - 1);
+		set_memory_np(begin, (end - begin) >> PAGE_SHIFT);
+	} else {
+		/*
+		 * We just marked the kernel text read only above, now that
+		 * we are going to free part of that, we need to make that
+		 * writeable and non-executable first.
+		 */
+		set_memory_nx(begin, (end - begin) >> PAGE_SHIFT);
+		set_memory_rw(begin, (end - begin) >> PAGE_SHIFT);
 
-	printk(KERN_INFO "Freeing %s: %luk freed\n", what, (end - begin) >> 10);
+		printk(KERN_INFO "Freeing %s: %luk freed\n", what, (end - begin) >> 10);
 
-	for (; addr < end; addr += PAGE_SIZE) {
-		memset((void *)addr, POISON_FREE_INITMEM, PAGE_SIZE);
-		free_reserved_page(virt_to_page(addr));
+		for (; addr < end; addr += PAGE_SIZE) {
+			memset((void *)addr, POISON_FREE_INITMEM, PAGE_SIZE);
+			free_reserved_page(virt_to_page(addr));
+		}
 	}
-#endif
 }
 
 void free_initmem(void)

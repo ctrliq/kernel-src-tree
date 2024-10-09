@@ -1187,7 +1187,7 @@ static int hdac_hdmi_parse_eld(struct hdac_ext_device *edev,
 						>> DRM_ELD_VER_SHIFT;
 
 	if (ver != ELD_VER_CEA_861D && ver != ELD_VER_PARTIAL) {
-		dev_dbg(&edev->hdac.dev, "HDMI: Unknown ELD version %d\n", ver);
+		dev_err(&edev->hdac.dev, "HDMI: Unknown ELD version %d\n", ver);
 		return -EINVAL;
 	}
 
@@ -1195,7 +1195,7 @@ static int hdac_hdmi_parse_eld(struct hdac_ext_device *edev,
 		DRM_ELD_MNL_MASK) >> DRM_ELD_MNL_SHIFT;
 
 	if (mnl > ELD_MAX_MNL) {
-		dev_dbg(&edev->hdac.dev, "HDMI: MNL Invalid %d\n", mnl);
+		dev_err(&edev->hdac.dev, "HDMI: MNL Invalid %d\n", mnl);
 		return -EINVAL;
 	}
 
@@ -1870,7 +1870,7 @@ static void hdmi_codec_complete(struct device *dev)
 #define hdmi_codec_complete NULL
 #endif
 
-static struct snd_soc_codec_driver hdmi_hda_codec = {
+static const struct snd_soc_codec_driver hdmi_hda_codec = {
 	.probe		= hdmi_codec_probe,
 	.remove		= hdmi_codec_remove,
 	.idle_bias_off	= true,

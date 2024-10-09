@@ -370,6 +370,19 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
 	___pmd;								\
 })
 
+#define pudp_clear_flush_notify(__vma, __haddr, __pud)			\
+({									\
+	unsigned long ___haddr = __haddr & HPAGE_PUD_MASK;		\
+	struct mm_struct *___mm = (__vma)->vm_mm;			\
+	pud_t ___pud;							\
+									\
+	___pud = pudp_clear_flush(__vma, __haddr, __pud);		\
+	mmu_notifier_invalidate_range(___mm, ___haddr,			\
+				      ___haddr + HPAGE_PUD_SIZE);	\
+									\
+	___pud;								\
+})
+
 #define pmdp_get_and_clear_notify(__mm, __haddr, __pmd)			\
 ({									\
 	unsigned long ___haddr = __haddr & HPAGE_PMD_MASK;		\

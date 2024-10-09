@@ -292,7 +292,7 @@ struct hid_item {
 #define HID_QUIRK_MULTI_INPUT			0x00000040
 #define HID_QUIRK_HIDINPUT_FORCE		0x00000080
 #define HID_QUIRK_NO_EMPTY_INPUT		0x00000100
-#define HID_QUIRK_NO_INIT_INPUT_REPORTS		0x00000200
+/* 0x00000200 reserved for backward compatibility, was NO_INIT_INPUT_REPORTS */
 #define HID_QUIRK_ALWAYS_POLL			0x00000400
 #define HID_QUIRK_SKIP_OUTPUT_REPORTS		0x00010000
 #define HID_QUIRK_SKIP_OUTPUT_REPORT_ID		0x00020000
@@ -497,10 +497,10 @@ struct hid_device {							/* device report descriptor */
 #ifdef CONFIG_HID_BATTERY_STRENGTH
 	/*
 	 * Power supply information for HID devices which report
-	 * battery strength. power_supply is registered iff
-	 * battery.name is non-NULL.
+	 * battery strength. power_supply was successfully registered if
+	 * battery is non-NULL.
 	 */
-	struct power_supply battery;
+	struct power_supply *battery;
 	__s32 battery_min;
 	__s32 battery_max;
 	__s32 battery_report_type;
@@ -732,6 +732,17 @@ struct hid_ll_driver {
 
 	int (*idle)(struct hid_device *hdev, int report, int idle, int reqtype);
 };
+
+extern struct hid_ll_driver i2c_hid_ll_driver;
+extern struct hid_ll_driver hidp_hid_driver;
+extern struct hid_ll_driver uhid_hid_driver;
+extern struct hid_ll_driver usb_hid_driver;
+
+static inline bool hid_is_using_ll_driver(struct hid_device *hdev,
+		struct hid_ll_driver *driver)
+{
+	return hdev->ll_driver == driver;
+}
 
 #define	PM_HINT_FULLON	1<<5
 #define PM_HINT_NORMAL	1<<1

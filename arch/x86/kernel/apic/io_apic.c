@@ -1345,6 +1345,9 @@ int assign_irq_vector(int irq, struct irq_cfg *cfg, const struct cpumask *mask)
 	int err;
 	unsigned long flags;
 
+	if (!cfg)
+		err = -EBUSY;
+
 	raw_spin_lock_irqsave(&vector_lock, flags);
 	err = __assign_irq_vector(irq, cfg, mask);
 	raw_spin_unlock_irqrestore(&vector_lock, flags);
@@ -1355,7 +1358,8 @@ static void __clear_irq_vector(int irq, struct irq_cfg *cfg)
 {
 	int cpu, vector;
 
-	BUG_ON(!cfg->vector);
+	if (!cfg->vector)
+		return;
 
 	vector = cfg->vector;
 	for_each_cpu_and(cpu, cfg->domain, cpu_online_mask)
@@ -3239,7 +3243,7 @@ int native_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 	node = dev_to_node(&dev->dev);
 
 	list_for_each_entry(msidesc, &dev->msi_list, list) {
-		irq = irq_alloc_hwirq(node);
+		irq = irq_alloc_hwirq_affinity(node, msidesc->affinity);
 		if (!irq)
 			return -ENOSPC;
 

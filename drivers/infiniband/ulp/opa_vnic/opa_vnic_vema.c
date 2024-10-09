@@ -605,7 +605,7 @@ static void vema_set(struct opa_vnic_vema_port *port,
 static void vema_send(struct ib_mad_agent *mad_agent,
 		      struct ib_mad_send_wc *mad_wc)
 {
-	ib_destroy_ah(mad_wc->send_buf->ah);
+	rdma_destroy_ah(mad_wc->send_buf->ah);
 	ib_free_send_mad(mad_wc->send_buf);
 }
 
@@ -679,7 +679,7 @@ static void vema_recv(struct ib_mad_agent *mad_agent,
 	ib_free_send_mad(rsp);
 
 err_rsp:
-	ib_destroy_ah(ah);
+	rdma_destroy_ah(ah);
 free_recv_mad:
 	ib_free_recv_mad(mad_wc);
 }
@@ -732,7 +732,7 @@ void opa_vnic_vema_send_trap(struct opa_vnic_adapter *adapter,
 	struct ib_device *ibp;
 	struct opa_vnic_vema_mad_trap *trap_mad;
 	struct opa_class_port_info *class;
-	struct ib_ah_attr ah_attr;
+	struct rdma_ah_attr ah_attr;
 	struct ib_ah *ah;
 	struct opa_veswport_trap *trap;
 	u32 trap_lid;
@@ -759,8 +759,10 @@ void opa_vnic_vema_send_trap(struct opa_vnic_adapter *adapter,
 	class = &port->class_port_info;
 	/* Set up address handle */
 	memset(&ah_attr, 0, sizeof(ah_attr));
-	ah_attr.sl = GET_TRAP_SL_FROM_CLASS_PORT_INFO(class->trap_sl_rsvd);
-	ah_attr.port_num = port->port_num;
+	ah_attr.type = rdma_ah_find_type(ibp, port->port_num);
+	rdma_ah_set_sl(&ah_attr,
+		       GET_TRAP_SL_FROM_CLASS_PORT_INFO(class->trap_sl_rsvd));
+	rdma_ah_set_port_num(&ah_attr, port->port_num);
 	trap_lid = be32_to_cpu(class->trap_lid);
 	/*
 	 * check for trap lid validity, must not be zero
@@ -773,12 +775,13 @@ void opa_vnic_vema_send_trap(struct opa_vnic_adapter *adapter,
 		goto err_exit;
 	}
 
-	ah_attr.dlid = trap_lid;
-	ah = ib_create_ah(port->mad_agent->qp->pd, &ah_attr);
+	rdma_ah_set_dlid(&ah_attr, trap_lid);
+	ah = rdma_create_ah(port->mad_agent->qp->pd, &ah_attr);
 	if (IS_ERR(ah)) {
 		c_err("%s:Couldn't create new AH = %p\n", __func__, ah);
 		c_err("%s:dlid = %d, sl = %d, port = %d\n", __func__,
-		      ah_attr.dlid, ah_attr.sl, ah_attr.port_num);
+		      rdma_ah_get_dlid(&ah_attr), rdma_ah_get_sl(&ah_attr),
+		      rdma_ah_get_port_num(&ah_attr));
 		goto err_exit;
 	}
 
@@ -844,7 +847,7 @@ void opa_vnic_vema_send_trap(struct opa_vnic_adapter *adapter,
 	}
 
 err_sndbuf:
-	ib_destroy_ah(ah);
+	rdma_destroy_ah(ah);
 err_exit:
 	v_err("Aborting trap\n");
 }
@@ -951,12 +954,7 @@ static int vema_register(struct opa_vnic_ctrl_port *cport)
 
 		INIT_IB_EVENT_HANDLER(&port->event_handler,
 				      cport->ibdev, opa_vnic_event);
-		ret = ib_register_event_handler(&port->event_handler);
-		if (ret) {
-			c_err("port %d: event handler register failed\n", i);
-			vema_unregister(cport);
-			return ret;
-		}
+		ib_register_event_handler(&port->event_handler);
 
 		idr_init(&port->vport_idr);
 		mutex_init(&port->lock);
@@ -1075,4 +1073,3 @@ module_exit(opa_vnic_deinit);
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Intel Corporation");
 MODULE_DESCRIPTION("Intel OPA Virtual Network driver");
-MODULE_VERSION(DRV_VERSION);

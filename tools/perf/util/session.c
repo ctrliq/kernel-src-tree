@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <inttypes.h>
 #include <linux/kernel.h>
 #include <traceevent/event-parse.h>
 #include <api/fs/fs.h>
@@ -9,6 +11,7 @@
 
 #include "evlist.h"
 #include "evsel.h"
+#include "memswap.h"
 #include "session.h"
 #include "tool.h"
 #include "sort.h"
@@ -17,6 +20,7 @@
 #include "perf_regs.h"
 #include "asm/bug.h"
 #include "auxtrace.h"
+#include "thread.h"
 #include "thread-stack.h"
 #include "stat.h"
 

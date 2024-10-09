@@ -54,6 +54,7 @@ static const struct intel_gvt_ops intel_gvt_ops = {
 	.vgpu_reset = intel_gvt_reset_vgpu,
 	.vgpu_activate = intel_gvt_activate_vgpu,
 	.vgpu_deactivate = intel_gvt_deactivate_vgpu,
+	.write_protect_handler = intel_vgpu_write_protect_handler,
 };
 
 /**
@@ -108,7 +109,8 @@ static void init_device_info(struct intel_gvt *gvt)
 	struct intel_gvt_device_info *info = &gvt->device_info;
 	struct pci_dev *pdev = gvt->dev_priv->drm.pdev;
 
-	if (IS_BROADWELL(gvt->dev_priv) || IS_SKYLAKE(gvt->dev_priv)) {
+	if (IS_BROADWELL(gvt->dev_priv) || IS_SKYLAKE(gvt->dev_priv)
+		|| IS_KABYLAKE(gvt->dev_priv)) {
 		info->max_support_vgpus = 8;
 		info->cfg_space_size = PCI_CFG_SPACE_EXP_SIZE;
 		info->mmio_size = 2 * 1024 * 1024;
@@ -144,6 +146,13 @@ static int gvt_service_thread(void *data)
 			mutex_lock(&gvt->lock);
 			intel_gvt_emulate_vblank(gvt);
 			mutex_unlock(&gvt->lock);
+		}
+
+		if (test_bit(INTEL_GVT_REQUEST_SCHED,
+				(void *)&gvt->service_request) ||
+			test_bit(INTEL_GVT_REQUEST_EVENT_SCHED,
+					(void *)&gvt->service_request)) {
+			intel_gvt_schedule(gvt);
 		}
 	}
 
@@ -198,6 +207,8 @@ void intel_gvt_clean_device(struct drm_i915_private *dev_priv)
 
 	idr_destroy(&gvt->vgpu_idr);
 
+	intel_gvt_destroy_idle_vgpu(gvt->idle_vgpu);
+
 	kfree(dev_priv->gvt);
 	dev_priv->gvt = NULL;
 }
@@ -216,6 +227,7 @@ void intel_gvt_clean_device(struct drm_i915_private *dev_priv)
 int intel_gvt_init_device(struct drm_i915_private *dev_priv)
 {
 	struct intel_gvt *gvt;
+	struct intel_vgpu *vgpu;
 	int ret;
 
 	/*
@@ -235,7 +247,7 @@ int intel_gvt_init_device(struct drm_i915_private *dev_priv)
 	gvt_dbg_core("init gvt device\n");
 
 	idr_init(&gvt->vgpu_idr);
-
+	spin_lock_init(&gvt->scheduler.mmio_context_lock);
 	mutex_init(&gvt->lock);
 	gvt->dev_priv = dev_priv;
 
@@ -287,6 +299,14 @@ int intel_gvt_init_device(struct drm_i915_private *dev_priv)
 		gvt_err("failed to register gvt-g host device: %d\n", ret);
 		goto out_clean_types;
 	}
+
+	vgpu = intel_gvt_create_idle_vgpu(gvt);
+	if (IS_ERR(vgpu)) {
+		ret = PTR_ERR(vgpu);
+		gvt_err("failed to create idle vgpu\n");
+		goto out_clean_types;
+	}
+	gvt->idle_vgpu = vgpu;
 
 	gvt_dbg_core("gvt device initialization is done\n");
 	dev_priv->gvt = gvt;

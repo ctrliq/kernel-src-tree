@@ -198,6 +198,9 @@ int xhci_reset(struct xhci_hcd *xhci)
 	if (ret)
 		return ret;
 
+	if (xhci->quirks & XHCI_ASMEDIA_MODIFY_FLOWCONTROL)
+		usb_asmedia_modifyflowcontrol(to_pci_dev(xhci_to_hcd(xhci)->self.controller));
+
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
 			 "Wait for controller to be ready for doorbell rings");
 	/*
@@ -870,7 +873,7 @@ static void xhci_disable_port_wake_on_bits(struct xhci_hcd *xhci)
 
 	spin_lock_irqsave(&xhci->lock, flags);
 
-	/* disble usb3 ports Wake bits*/
+	/* disable usb3 ports Wake bits */
 	port_index = xhci->num_usb3_ports;
 	port_array = xhci->usb3_ports;
 	while (port_index--) {
@@ -881,7 +884,7 @@ static void xhci_disable_port_wake_on_bits(struct xhci_hcd *xhci)
 			writel(t2, port_array[port_index]);
 	}
 
-	/* disble usb2 ports Wake bits*/
+	/* disable usb2 ports Wake bits */
 	port_index = xhci->num_usb2_ports;
 	port_array = xhci->usb2_ports;
 	while (port_index--) {
@@ -1128,6 +1131,9 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
 	 */
 	if ((xhci->quirks & XHCI_COMP_MODE_QUIRK) && !comp_timer_running)
 		compliance_mode_recovery_timer_init(xhci);
+
+	if (xhci->quirks & XHCI_ASMEDIA_MODIFY_FLOWCONTROL)
+		usb_asmedia_modifyflowcontrol(to_pci_dev(hcd->self.controller));
 
 	/* Re-enable port polling. */
 	xhci_dbg(xhci, "%s: starting port polling.\n", __func__);

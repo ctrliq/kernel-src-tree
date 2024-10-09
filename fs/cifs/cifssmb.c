@@ -1412,8 +1412,8 @@ openRetry:
  * Discard any remaining data in the current SMB. To do this, we borrow the
  * current bigbuf.
  */
-static int
-discard_remaining_data(struct TCP_Server_Info *server)
+int
+cifs_discard_remaining_data(struct TCP_Server_Info *server)
 {
 	unsigned int rfclen = get_rfc1002_length(server->smallbuf);
 	int remaining = rfclen + 4 - server->total_read;
@@ -1439,7 +1439,7 @@ cifs_readv_discard(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 	int length;
 	struct cifs_readdata *rdata = mid->callback_data;
 
-	length = discard_remaining_data(server);
+	length = cifs_discard_remaining_data(server);
 	dequeue_mid(mid, rdata->result);
 	return length;
 }
@@ -1470,9 +1470,16 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 		return length;
 	server->total_read += length;
 
+	if (server->ops->is_session_expired &&
+	    server->ops->is_session_expired(buf)) {
+		cifs_reconnect(server);
+		wake_up(&server->response_q);
+		return -1;
+	}
+
 	if (server->ops->is_status_pending &&
 	    server->ops->is_status_pending(buf, server, 0)) {
-		discard_remaining_data(server);
+		cifs_discard_remaining_data(server);
 		return -1;
 	}
 
@@ -2523,7 +2530,7 @@ CIFSSMBPosixLock(const unsigned int xid, struct cifs_tcon *tcon,
 			pLockData->fl_start = le64_to_cpu(parm_data->start);
 			pLockData->fl_end = pLockData->fl_start +
 					le64_to_cpu(parm_data->length) - 1;
-			pLockData->fl_pid = le32_to_cpu(parm_data->pid);
+			pLockData->fl_pid = -le32_to_cpu(parm_data->pid);
 		}
 	}
 
@@ -6075,11 +6082,13 @@ ssize_t
 CIFSSMBQAllEAs(const unsigned int xid, struct cifs_tcon *tcon,
 		const unsigned char *searchName, const unsigned char *ea_name,
 		char *EAData, size_t buf_size,
-		const struct nls_table *nls_codepage, int remap)
+		struct cifs_sb_info *cifs_sb)
 {
 		/* BB assumes one setup word */
 	TRANSACTION2_QPI_REQ *pSMB = NULL;
 	TRANSACTION2_QPI_RSP *pSMBr = NULL;
+	int remap = cifs_remap(cifs_sb);
+	struct nls_table *nls_codepage = cifs_sb->local_nls;
 	int rc = 0;
 	int bytes_returned;
 	int list_len;
@@ -6261,7 +6270,7 @@ int
 CIFSSMBSetEA(const unsigned int xid, struct cifs_tcon *tcon,
 	     const char *fileName, const char *ea_name, const void *ea_value,
 	     const __u16 ea_value_len, const struct nls_table *nls_codepage,
-	     int remap)
+	     struct cifs_sb_info *cifs_sb)
 {
 	struct smb_com_transaction2_spi_req *pSMB = NULL;
 	struct smb_com_transaction2_spi_rsp *pSMBr = NULL;
@@ -6270,6 +6279,7 @@ CIFSSMBSetEA(const unsigned int xid, struct cifs_tcon *tcon,
 	int rc = 0;
 	int bytes_returned = 0;
 	__u16 params, param_offset, byte_count, offset, count;
+	int remap = cifs_remap(cifs_sb);
 
 	cifs_dbg(FYI, "In SetEA\n");
 SetEARetry:

@@ -1439,10 +1439,13 @@ static int tree_insert_offset(struct rb_root *root, u64 offset,
 		info = rb_entry(parent, struct btrfs_free_space, offset_index);
 
 		if (offset < info->offset) {
+			gmb();
 			p = &(*p)->rb_left;
 		} else if (offset > info->offset) {
+			gmb();
 			p = &(*p)->rb_right;
 		} else {
+			gmb();
 			/*
 			 * we could have a bitmap entry and an extent entry
 			 * share the same offset.  If this is the case, we want
@@ -1796,6 +1799,7 @@ find_free_space(struct btrfs_free_space_ctl *ctl, u64 *offset, u64 *bytes,
 	for (node = &entry->offset_index; node; node = rb_next(node)) {
 		entry = rb_entry(node, struct btrfs_free_space, offset_index);
 		if (entry->bytes < *bytes) {
+			gmb();
 			if (entry->bytes > *max_extent_size)
 				*max_extent_size = entry->bytes;
 			continue;

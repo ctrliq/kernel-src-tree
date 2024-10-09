@@ -35,6 +35,7 @@
 #include <linux/if_vlan.h>
 #include <linux/if_bridge.h>
 #include <linux/rtc.h>
+#include <linux/bpf.h>
 #include <net/ip.h>
 #include <net/tcp.h>
 #include <net/udp.h>
@@ -49,6 +50,7 @@
 #include <linux/bitmap.h>
 #include <linux/cpu_rmap.h>
 #include <linux/cpumask.h>
+#include <net/pkt_cls.h>
 
 #include "bnxt_hsi.h"
 #include "bnxt.h"
@@ -56,6 +58,10 @@
 #include "bnxt_sriov.h"
 #include "bnxt_ethtool.h"
 #include "bnxt_dcb.h"
+#include "bnxt_xdp.h"
+#include "bnxt_vfr.h"
+#include "bnxt_tc.h"
+#include "bnxt_devlink.h"
 
 #define BNXT_TX_TIMEOUT		(5 * HZ)
 
@@ -109,36 +115,36 @@ enum board_idx {
 static const struct {
 	char *name;
 } board_info[] = {
-	{ "Broadcom BCM57301 NetXtreme-C 10Gb Ethernet" },
-	{ "Broadcom BCM57302 NetXtreme-C 10Gb/25Gb Ethernet" },
-	{ "Broadcom BCM57304 NetXtreme-C 10Gb/25Gb/40Gb/50Gb Ethernet" },
-	{ "Broadcom BCM57417 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM58700 Nitro 1Gb/2.5Gb/10Gb Ethernet" },
-	{ "Broadcom BCM57311 NetXtreme-C 10Gb Ethernet" },
-	{ "Broadcom BCM57312 NetXtreme-C 10Gb/25Gb Ethernet" },
-	{ "Broadcom BCM57402 NetXtreme-E 10Gb Ethernet" },
-	{ "Broadcom BCM57404 NetXtreme-E 10Gb/25Gb Ethernet" },
-	{ "Broadcom BCM57406 NetXtreme-E 10GBase-T Ethernet" },
-	{ "Broadcom BCM57402 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57407 NetXtreme-E 10GBase-T Ethernet" },
-	{ "Broadcom BCM57412 NetXtreme-E 10Gb Ethernet" },
-	{ "Broadcom BCM57414 NetXtreme-E 10Gb/25Gb Ethernet" },
-	{ "Broadcom BCM57416 NetXtreme-E 10GBase-T Ethernet" },
-	{ "Broadcom BCM57417 NetXtreme-E 10GBase-T Ethernet" },
-	{ "Broadcom BCM57412 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57314 NetXtreme-C 10Gb/25Gb/40Gb/50Gb Ethernet" },
-	{ "Broadcom BCM57417 NetXtreme-E 10Gb/25Gb Ethernet" },
-	{ "Broadcom BCM57416 NetXtreme-E 10Gb Ethernet" },
-	{ "Broadcom BCM57404 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57406 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57407 NetXtreme-E 25Gb Ethernet" },
-	{ "Broadcom BCM57407 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57414 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57416 NetXtreme-E Ethernet Partition" },
-	{ "Broadcom BCM57452 NetXtreme-E 10Gb/25Gb/40Gb/50Gb Ethernet" },
-	{ "Broadcom BCM57454 NetXtreme-E 10Gb/25Gb/40Gb/50Gb/100Gb Ethernet" },
-	{ "Broadcom NetXtreme-E Ethernet Virtual Function" },
-	{ "Broadcom NetXtreme-C Ethernet Virtual Function" },
+	[BCM57301] = { "Broadcom BCM57301 NetXtreme-C 10Gb Ethernet" },
+	[BCM57302] = { "Broadcom BCM57302 NetXtreme-C 10Gb/25Gb Ethernet" },
+	[BCM57304] = { "Broadcom BCM57304 NetXtreme-C 10Gb/25Gb/40Gb/50Gb Ethernet" },
+	[BCM57417_NPAR] = { "Broadcom BCM57417 NetXtreme-E Ethernet Partition" },
+	[BCM58700] = { "Broadcom BCM58700 Nitro 1Gb/2.5Gb/10Gb Ethernet" },
+	[BCM57311] = { "Broadcom BCM57311 NetXtreme-C 10Gb Ethernet" },
+	[BCM57312] = { "Broadcom BCM57312 NetXtreme-C 10Gb/25Gb Ethernet" },
+	[BCM57402] = { "Broadcom BCM57402 NetXtreme-E 10Gb Ethernet" },
+	[BCM57404] = { "Broadcom BCM57404 NetXtreme-E 10Gb/25Gb Ethernet" },
+	[BCM57406] = { "Broadcom BCM57406 NetXtreme-E 10GBase-T Ethernet" },
+	[BCM57402_NPAR] = { "Broadcom BCM57402 NetXtreme-E Ethernet Partition" },
+	[BCM57407] = { "Broadcom BCM57407 NetXtreme-E 10GBase-T Ethernet" },
+	[BCM57412] = { "Broadcom BCM57412 NetXtreme-E 10Gb Ethernet" },
+	[BCM57414] = { "Broadcom BCM57414 NetXtreme-E 10Gb/25Gb Ethernet" },
+	[BCM57416] = { "Broadcom BCM57416 NetXtreme-E 10GBase-T Ethernet" },
+	[BCM57417] = { "Broadcom BCM57417 NetXtreme-E 10GBase-T Ethernet" },
+	[BCM57412_NPAR] = { "Broadcom BCM57412 NetXtreme-E Ethernet Partition" },
+	[BCM57314] = { "Broadcom BCM57314 NetXtreme-C 10Gb/25Gb/40Gb/50Gb Ethernet" },
+	[BCM57417_SFP] = { "Broadcom BCM57417 NetXtreme-E 10Gb/25Gb Ethernet" },
+	[BCM57416_SFP] = { "Broadcom BCM57416 NetXtreme-E 10Gb Ethernet" },
+	[BCM57404_NPAR] = { "Broadcom BCM57404 NetXtreme-E Ethernet Partition" },
+	[BCM57406_NPAR] = { "Broadcom BCM57406 NetXtreme-E Ethernet Partition" },
+	[BCM57407_SFP] = { "Broadcom BCM57407 NetXtreme-E 25Gb Ethernet" },
+	[BCM57407_NPAR] = { "Broadcom BCM57407 NetXtreme-E Ethernet Partition" },
+	[BCM57414_NPAR] = { "Broadcom BCM57414 NetXtreme-E Ethernet Partition" },
+	[BCM57416_NPAR] = { "Broadcom BCM57416 NetXtreme-E Ethernet Partition" },
+	[BCM57452] = { "Broadcom BCM57452 NetXtreme-E 10Gb/25Gb/40Gb/50Gb Ethernet" },
+	[BCM57454] = { "Broadcom BCM57454 NetXtreme-E 10Gb/25Gb/40Gb/50Gb/100Gb Ethernet" },
+	[NETXTREME_E_VF] = { "Broadcom NetXtreme-E Ethernet Virtual Function" },
+	[NETXTREME_C_VF] = { "Broadcom NetXtreme-C Ethernet Virtual Function" },
 };
 
 static const struct pci_device_id bnxt_pci_tbl[] = {
@@ -203,6 +209,8 @@ static const u16 bnxt_async_events_arr[] = {
 	ASYNC_EVENT_CMPL_EVENT_ID_LINK_SPEED_CFG_CHANGE,
 };
 
+static struct workqueue_struct *bnxt_pf_wq;
+
 static bool bnxt_vf_pciid(enum board_idx idx)
 {
 	return (idx == NETXTREME_C_VF || idx == NETXTREME_E_VF);
@@ -221,16 +229,7 @@ static bool bnxt_vf_pciid(enum board_idx idx)
 #define BNXT_CP_DB_IRQ_DIS(db)						\
 		writel(DB_CP_IRQ_DIS_FLAGS, db)
 
-static inline u32 bnxt_tx_avail(struct bnxt *bp, struct bnxt_tx_ring_info *txr)
-{
-	/* Tell compiler to fetch tx indices from memory. */
-	barrier();
-
-	return bp->tx_ring_size -
-		((txr->tx_prod - txr->tx_cons) & bp->tx_ring_mask);
-}
-
-static const u16 bnxt_lhint_arr[] = {
+const u16 bnxt_lhint_arr[] = {
 	TX_BD_FLAGS_LHINT_512_AND_SMALLER,
 	TX_BD_FLAGS_LHINT_512_TO_1023,
 	TX_BD_FLAGS_LHINT_1024_TO_2047,
@@ -251,6 +250,16 @@ static const u16 bnxt_lhint_arr[] = {
 	TX_BD_FLAGS_LHINT_2048_AND_LARGER,
 	TX_BD_FLAGS_LHINT_2048_AND_LARGER,
 };
+
+static u16 bnxt_xmit_get_cfa_action(struct sk_buff *skb)
+{
+	struct metadata_dst *md_dst = skb_metadata_dst(skb);
+
+	if (!md_dst || md_dst->type != METADATA_HW_PORT_MUX)
+		return 0;
+
+	return md_dst->u.port_info.port_id;
+}
 
 static netdev_tx_t bnxt_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
@@ -296,7 +305,7 @@ static netdev_tx_t bnxt_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	tx_buf->nr_frags = last_frag;
 
 	vlan_tag_flags = 0;
-	cfa_action = 0;
+	cfa_action = bnxt_xmit_get_cfa_action(skb);
 	if (skb_vlan_tag_present(skb)) {
 		vlan_tag_flags = TX_BD_CFA_META_KEY_VLAN |
 				 skb_vlan_tag_get(skb);
@@ -331,7 +340,8 @@ static netdev_tx_t bnxt_start_xmit(struct sk_buff *skb, struct net_device *dev)
 			tx_push1->tx_bd_hsize_lflags = 0;
 
 		tx_push1->tx_bd_cfa_meta = cpu_to_le32(vlan_tag_flags);
-		tx_push1->tx_bd_cfa_action = cpu_to_le32(cfa_action);
+		tx_push1->tx_bd_cfa_action =
+			cpu_to_le32(cfa_action << TX_BD_CFA_ACTION_SHIFT);
 
 		end = pdata + length;
 		end = PTR_ALIGN(end, 8) - 1;
@@ -436,7 +446,8 @@ normal_tx:
 	txbd->tx_bd_len_flags_type = cpu_to_le32(flags);
 
 	txbd1->tx_bd_cfa_meta = cpu_to_le32(vlan_tag_flags);
-	txbd1->tx_bd_cfa_action = cpu_to_le32(cfa_action);
+	txbd1->tx_bd_cfa_action =
+			cpu_to_le32(cfa_action << TX_BD_CFA_ACTION_SHIFT);
 	for (i = 0; i < last_frag; i++) {
 		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
@@ -472,14 +483,17 @@ normal_tx:
 	prod = NEXT_TX(prod);
 	txr->tx_prod = prod;
 
-	writel(DB_KEY_TX | prod, txr->tx_doorbell);
-	writel(DB_KEY_TX | prod, txr->tx_doorbell);
+	if (!skb->xmit_more || netif_xmit_stopped(txq))
+		bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | prod);
 
 tx_done:
 
 	mmiowb();
 
 	if (unlikely(bnxt_tx_avail(bp, txr) <= MAX_SKB_FRAGS + 1)) {
+		if (skb->xmit_more && !tx_buf->is_push)
+			bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | prod);
+
 		netif_tx_stop_queue(txq);
 
 		/* netif_tx_stop_queue() must be done before checking
@@ -583,6 +597,25 @@ next_tx_int:
 	}
 }
 
+static struct page *__bnxt_alloc_rx_page(struct bnxt *bp, dma_addr_t *mapping,
+					 gfp_t gfp)
+{
+	struct device *dev = &bp->pdev->dev;
+	struct page *page;
+
+	page = alloc_page(gfp);
+	if (!page)
+		return NULL;
+
+	*mapping = dma_map_page(dev, page, 0, PAGE_SIZE, bp->rx_dir);
+	if (dma_mapping_error(dev, *mapping)) {
+		__free_page(page);
+		return NULL;
+	}
+	*mapping += bp->rx_dma_offset;
+	return page;
+}
+
 static inline u8 *__bnxt_alloc_rx_data(struct bnxt *bp, dma_addr_t *mapping,
 				       gfp_t gfp)
 {
@@ -603,30 +636,37 @@ static inline u8 *__bnxt_alloc_rx_data(struct bnxt *bp, dma_addr_t *mapping,
 	return data;
 }
 
-static inline int bnxt_alloc_rx_data(struct bnxt *bp,
-				     struct bnxt_rx_ring_info *rxr,
-				     u16 prod, gfp_t gfp)
+int bnxt_alloc_rx_data(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
+		       u16 prod, gfp_t gfp)
 {
 	struct rx_bd *rxbd = &rxr->rx_desc_ring[RX_RING(prod)][RX_IDX(prod)];
 	struct bnxt_sw_rx_bd *rx_buf = &rxr->rx_buf_ring[prod];
-	u8 *data;
 	dma_addr_t mapping;
 
-	data = __bnxt_alloc_rx_data(bp, &mapping, gfp);
-	if (!data)
-		return -ENOMEM;
+	if (BNXT_RX_PAGE_MODE(bp)) {
+		struct page *page = __bnxt_alloc_rx_page(bp, &mapping, gfp);
 
-	rx_buf->data = data;
-	rx_buf->data_ptr = data + bp->rx_offset;
+		if (!page)
+			return -ENOMEM;
+
+		rx_buf->data = page;
+		rx_buf->data_ptr = page_address(page) + bp->rx_offset;
+	} else {
+		u8 *data = __bnxt_alloc_rx_data(bp, &mapping, gfp);
+
+		if (!data)
+			return -ENOMEM;
+
+		rx_buf->data = data;
+		rx_buf->data_ptr = data + bp->rx_offset;
+	}
 	rx_buf->mapping = mapping;
 
 	rxbd->rx_bd_haddr = cpu_to_le64(mapping);
-
 	return 0;
 }
 
-static void bnxt_reuse_rx_data(struct bnxt_rx_ring_info *rxr, u16 cons,
-			       void *data)
+void bnxt_reuse_rx_data(struct bnxt_rx_ring_info *rxr, u16 cons, void *data)
 {
 	u16 prod = rxr->rx_prod;
 	struct bnxt_sw_rx_bd *cons_rx_buf, *prod_rx_buf;
@@ -762,6 +802,51 @@ static void bnxt_reuse_rx_agg_bufs(struct bnxt_napi *bnapi, u16 cp_cons,
 	}
 	rxr->rx_agg_prod = prod;
 	rxr->rx_sw_agg_prod = sw_prod;
+}
+
+static struct sk_buff *bnxt_rx_page_skb(struct bnxt *bp,
+					struct bnxt_rx_ring_info *rxr,
+					u16 cons, void *data, u8 *data_ptr,
+					dma_addr_t dma_addr,
+					unsigned int offset_and_len)
+{
+	unsigned int payload = offset_and_len >> 16;
+	unsigned int len = offset_and_len & 0xffff;
+	struct skb_frag_struct *frag;
+	struct page *page = data;
+	u16 prod = rxr->rx_prod;
+	struct sk_buff *skb;
+	int off, err;
+
+	err = bnxt_alloc_rx_data(bp, rxr, prod, GFP_ATOMIC);
+	if (unlikely(err)) {
+		bnxt_reuse_rx_data(rxr, cons, data);
+		return NULL;
+	}
+	dma_addr -= bp->rx_dma_offset;
+	dma_unmap_page(&bp->pdev->dev, dma_addr, PAGE_SIZE, bp->rx_dir);
+
+	if (unlikely(!payload))
+		payload = eth_get_headlen(data_ptr, len);
+
+	skb = napi_alloc_skb(&rxr->bnapi->napi, payload);
+	if (!skb) {
+		__free_page(page);
+		return NULL;
+	}
+
+	off = (void *)data_ptr - page_address(page);
+	skb_add_rx_frag(skb, 0, page, off, len, PAGE_SIZE);
+	memcpy(skb->data - NET_IP_ALIGN, data_ptr - NET_IP_ALIGN,
+	       payload + NET_IP_ALIGN);
+
+	frag = &skb_shinfo(skb)->frags[0];
+	skb_frag_size_sub(frag, payload);
+	frag->page_offset += payload;
+	skb->data_len -= payload;
+	skb->tail += payload;
+
+	return skb;
 }
 
 static struct sk_buff *bnxt_rx_skb(struct bnxt *bp,
@@ -931,12 +1016,28 @@ static int bnxt_discard_rx(struct bnxt *bp, struct bnxt_napi *bnapi,
 	return 0;
 }
 
+static void bnxt_queue_sp_work(struct bnxt *bp)
+{
+	if (BNXT_PF(bp))
+		queue_work(bnxt_pf_wq, &bp->sp_task);
+	else
+		schedule_work(&bp->sp_task);
+}
+
+static void bnxt_cancel_sp_work(struct bnxt *bp)
+{
+	if (BNXT_PF(bp))
+		flush_workqueue(bnxt_pf_wq);
+	else
+		cancel_work_sync(&bp->sp_task);
+}
+
 static void bnxt_sched_reset(struct bnxt *bp, struct bnxt_rx_ring_info *rxr)
 {
 	if (!rxr->bnapi->in_reset) {
 		rxr->bnapi->in_reset = true;
 		set_bit(BNXT_RESET_TASK_SP_EVENT, &bp->sp_event);
-		schedule_work(&bp->sp_task);
+		bnxt_queue_sp_work(bp);
 	}
 	rxr->rx_next_cons = 0xffff;
 }
@@ -962,7 +1063,10 @@ static void bnxt_tpa_start(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
 		bnxt_sched_reset(bp, rxr);
 		return;
 	}
-
+	/* Store cfa_code in tpa_info to use in tpa_end
+	 * completion processing.
+	 */
+	tpa_info->cfa_code = TPA_START_CFA_CODE(tpa_start1);
 	prod_rx_buf->data = tpa_info->data;
 	prod_rx_buf->data_ptr = tpa_info->data_ptr;
 
@@ -1197,6 +1301,17 @@ static inline struct sk_buff *bnxt_gro_skb(struct bnxt *bp,
 	return skb;
 }
 
+/* Given the cfa_code of a received packet determine which
+ * netdev (vf-rep or PF) the packet is destined to.
+ */
+static struct net_device *bnxt_get_pkt_dev(struct bnxt *bp, u16 cfa_code)
+{
+	struct net_device *dev = bnxt_get_vf_rep(bp, cfa_code);
+
+	/* if vf-rep dev is NULL, the must belongs to the PF */
+	return dev ? dev : bp->dev;
+}
+
 static inline struct sk_buff *bnxt_tpa_end(struct bnxt *bp,
 					   struct bnxt_napi *bnapi,
 					   u32 *raw_cons,
@@ -1289,7 +1404,9 @@ static inline struct sk_buff *bnxt_tpa_end(struct bnxt *bp,
 			return NULL;
 		}
 	}
-	skb->protocol = eth_type_trans(skb, bp->dev);
+
+	skb->protocol =
+		eth_type_trans(skb, bnxt_get_pkt_dev(bp, tpa_info->cfa_code));
 
 	if (tpa_info->hash_type != PKT_HASH_TYPE_NONE)
 		skb_set_hash(skb, tpa_info->rss_hash, tpa_info->hash_type);
@@ -1316,6 +1433,18 @@ static inline struct sk_buff *bnxt_tpa_end(struct bnxt *bp,
 	return skb;
 }
 
+static void bnxt_deliver_skb(struct bnxt *bp, struct bnxt_napi *bnapi,
+			     struct sk_buff *skb)
+{
+	if (skb->dev != bp->dev) {
+		/* this packet belongs to a vf-rep */
+		bnxt_vf_rep_rx(bp, skb);
+		return;
+	}
+	skb_record_rx_queue(skb, bnapi->index);
+	napi_gro_receive(&bnapi->napi, skb);
+}
+
 /* returns the following:
  * 1       - 1 packet successfully received
  * 0       - successful TPA_START, packet not completed yet
@@ -1332,7 +1461,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 	struct rx_cmp *rxcmp;
 	struct rx_cmp_ext *rxcmp1;
 	u32 tmp_raw_cons = *raw_cons;
-	u16 cons, prod, cp_cons = RING_CMP(tmp_raw_cons);
+	u16 cfa_code, cons, prod, cp_cons = RING_CMP(tmp_raw_cons);
 	struct bnxt_sw_rx_bd *rx_buf;
 	unsigned int len;
 	u8 *data_ptr, agg_bufs, cmp_type;
@@ -1340,6 +1469,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 	struct sk_buff *skb;
 	void *data;
 	int rc = 0;
+	u32 misc;
 
 	rxcmp = (struct rx_cmp *)
 			&cpr->cp_desc_ring[CP_RING(cp_cons)][CP_IDX(cp_cons)];
@@ -1373,8 +1503,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 
 		rc = -ENOMEM;
 		if (likely(skb)) {
-			skb_record_rx_queue(skb, bnapi->index);
-			napi_gro_receive(&bnapi->napi, skb);
+			bnxt_deliver_skb(bp, bnapi, skb);
 			rc = 1;
 		}
 		*event |= BNXT_RX_EVENT;
@@ -1393,8 +1522,8 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 	}
 	prefetch(data_ptr);
 
-	agg_bufs = (le32_to_cpu(rxcmp->rx_cmp_misc_v1) & RX_CMP_AGG_BUFS) >>
-				RX_CMP_AGG_BUFS_SHIFT;
+	misc = le32_to_cpu(rxcmp->rx_cmp_misc_v1);
+	agg_bufs = (misc & RX_CMP_AGG_BUFS) >> RX_CMP_AGG_BUFS_SHIFT;
 
 	if (agg_bufs) {
 		if (!bnxt_agg_bufs_valid(bp, cpr, agg_bufs, &tmp_raw_cons))
@@ -1418,6 +1547,11 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 	len = le32_to_cpu(rxcmp->rx_cmp_len_flags_type) >> RX_CMP_LEN_SHIFT;
 	dma_addr = rx_buf->mapping;
 
+	if (bnxt_rx_xdp(bp, rxr, cons, data, &data_ptr, &len, event)) {
+		rc = 1;
+		goto next_rx;
+	}
+
 	if (len <= bp->rx_copy_thresh) {
 		skb = bnxt_copy_skb(bnapi, data_ptr, len, dma_addr);
 		bnxt_reuse_rx_data(rxr, cons, data);
@@ -1426,8 +1560,14 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 			goto next_rx;
 		}
 	} else {
+		u32 payload;
+
+		if (rx_buf->data_ptr == data_ptr)
+			payload = misc & RX_CMP_PAYLOAD_OFFSET;
+		else
+			payload = 0;
 		skb = bp->rx_skb_func(bp, rxr, cons, data, data_ptr, dma_addr,
-				      len);
+				      payload | len);
 		if (!skb) {
 			rc = -ENOMEM;
 			goto next_rx;
@@ -1452,7 +1592,8 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 		skb_set_hash(skb, le32_to_cpu(rxcmp->rx_cmp_rss_hash), type);
 	}
 
-	skb->protocol = eth_type_trans(skb, dev);
+	cfa_code = RX_CMP_CFA_CODE(rxcmp1);
+	skb->protocol = eth_type_trans(skb, bnxt_get_pkt_dev(bp, cfa_code));
 
 	if ((rxcmp1->rx_cmp_flags2 &
 	     cpu_to_le32(RX_CMP_FLAGS2_META_FORMAT_VLAN)) &&
@@ -1477,8 +1618,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
 		}
 	}
 
-	skb_record_rx_queue(skb, bnapi->index);
-	napi_gro_receive(&bnapi->napi, skb);
+	bnxt_deliver_skb(bp, bnapi, skb);
 	rc = 1;
 
 next_rx:
@@ -1588,7 +1728,7 @@ static int bnxt_async_event_process(struct bnxt *bp,
 	default:
 		goto async_event_process_exit;
 	}
-	schedule_work(&bp->sp_task);
+	bnxt_queue_sp_work(bp);
 async_event_process_exit:
 	bnxt_ulp_async_events(bp, cmpl);
 	return 0;
@@ -1622,7 +1762,7 @@ static int bnxt_hwrm_handler(struct bnxt *bp, struct tx_cmp *txcmp)
 
 		set_bit(vf_id - bp->pf.first_vf_id, bp->pf.vf_event_bmap);
 		set_bit(BNXT_HWRM_EXEC_FWD_REQ_SP_EVENT, &bp->sp_event);
-		schedule_work(&bp->sp_task);
+		bnxt_queue_sp_work(bp);
 		break;
 
 	case CMPL_BASE_TYPE_HWRM_ASYNC_EVENT:
@@ -1746,6 +1886,17 @@ static int bnxt_poll_work(struct bnxt *bp, struct bnxt_napi *bnapi, int budget)
 			break;
 	}
 
+	if (event & BNXT_TX_EVENT) {
+		struct bnxt_tx_ring_info *txr = bnapi->tx_ring;
+		void __iomem *db = txr->tx_doorbell;
+		u16 prod = txr->tx_prod;
+
+		/* Sync BD data before updating doorbell */
+		wmb();
+
+		bnxt_db_write(bp, db, DB_KEY_TX | prod);
+	}
+
 	cpr->cp_raw_cons = raw_cons;
 	/* ACK completion ring before freeing tx ring and producing new
 	 * buffers in rx/agg rings to prevent overflowing the completion
@@ -1754,19 +1905,15 @@ static int bnxt_poll_work(struct bnxt *bp, struct bnxt_napi *bnapi, int budget)
 	BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
 
 	if (tx_pkts)
-		bnxt_tx_int(bp, bnapi, tx_pkts);
+		bnapi->tx_int(bp, bnapi, tx_pkts);
 
 	if (event & BNXT_RX_EVENT) {
 		struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
 
-		writel(DB_KEY_RX | rxr->rx_prod, rxr->rx_doorbell);
-		writel(DB_KEY_RX | rxr->rx_prod, rxr->rx_doorbell);
-		if (event & BNXT_AGG_EVENT) {
-			writel(DB_KEY_RX | rxr->rx_agg_prod,
-			       rxr->rx_agg_doorbell);
-			writel(DB_KEY_RX | rxr->rx_agg_prod,
-			       rxr->rx_agg_doorbell);
-		}
+		bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rxr->rx_prod);
+		if (event & BNXT_AGG_EVENT)
+			bnxt_db_write(bp, rxr->rx_agg_doorbell,
+				      DB_KEY_RX | rxr->rx_agg_prod);
 	}
 	return rx_pkts;
 }
@@ -1826,13 +1973,11 @@ static int bnxt_poll_nitroa0(struct napi_struct *napi, int budget)
 
 	cpr->cp_raw_cons = raw_cons;
 	BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
-	writel(DB_KEY_RX | rxr->rx_prod, rxr->rx_doorbell);
-	writel(DB_KEY_RX | rxr->rx_prod, rxr->rx_doorbell);
+	bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rxr->rx_prod);
 
-	if (event & BNXT_AGG_EVENT) {
-		writel(DB_KEY_RX | rxr->rx_agg_prod, rxr->rx_agg_doorbell);
-		writel(DB_KEY_RX | rxr->rx_agg_prod, rxr->rx_agg_doorbell);
-	}
+	if (event & BNXT_AGG_EVENT)
+		bnxt_db_write(bp, rxr->rx_agg_doorbell,
+			      DB_KEY_RX | rxr->rx_agg_prod);
 
 	if (!bnxt_has_work(bp, cpr) && rx_pkts < budget) {
 		napi_complete(napi);
@@ -1954,17 +2099,25 @@ static void bnxt_free_rx_skbs(struct bnxt *bp)
 
 		for (j = 0; j < max_idx; j++) {
 			struct bnxt_sw_rx_bd *rx_buf = &rxr->rx_buf_ring[j];
+			dma_addr_t mapping = rx_buf->mapping;
 			void *data = rx_buf->data;
 
 			if (!data)
 				continue;
 
-			dma_unmap_single(&pdev->dev, rx_buf->mapping,
-					 bp->rx_buf_use_size, bp->rx_dir);
-
 			rx_buf->data = NULL;
 
-			kfree(data);
+			if (BNXT_RX_PAGE_MODE(bp)) {
+				mapping -= bp->rx_dma_offset;
+				dma_unmap_page(&pdev->dev, mapping,
+					       PAGE_SIZE, bp->rx_dir);
+				__free_page(data);
+			} else {
+				dma_unmap_single(&pdev->dev, mapping,
+						 bp->rx_buf_use_size,
+						 bp->rx_dir);
+				kfree(data);
+			}
 		}
 
 		for (j = 0; j < max_agg_idx; j++) {
@@ -2065,6 +2218,9 @@ static void bnxt_free_rx_rings(struct bnxt *bp)
 	for (i = 0; i < bp->rx_nr_rings; i++) {
 		struct bnxt_rx_ring_info *rxr = &bp->rx_ring[i];
 		struct bnxt_ring_struct *ring;
+
+		if (rxr->xdp_prog)
+			bpf_prog_put(rxr->xdp_prog);
 
 		kfree(rxr->rx_tpa);
 		rxr->rx_tpa = NULL;
@@ -2204,6 +2360,8 @@ static int bnxt_alloc_tx_rings(struct bnxt *bp)
 			memset(txr->tx_push, 0, sizeof(struct tx_push_bd));
 		}
 		ring->queue_id = bp->q_info[j].queue_id;
+		if (i < bp->tx_nr_rings_xdp)
+			continue;
 		if (i % bp->tx_nr_rings_per_tc == (bp->tx_nr_rings_per_tc - 1))
 			j++;
 	}
@@ -2351,6 +2509,15 @@ static int bnxt_init_one_rx_ring(struct bnxt *bp, int ring_nr)
 	ring = &rxr->rx_ring_struct;
 	bnxt_init_rxbd_pages(ring, type);
 
+	if (BNXT_RX_PAGE_MODE(bp) && bp->xdp_prog) {
+		rxr->xdp_prog = bpf_prog_add(bp->xdp_prog, 1);
+		if (IS_ERR(rxr->xdp_prog)) {
+			int rc = PTR_ERR(rxr->xdp_prog);
+
+			rxr->xdp_prog = NULL;
+			return rc;
+		}
+	}
 	prod = rxr->rx_prod;
 	for (i = 0; i < bp->rx_ring_size; i++) {
 		if (bnxt_alloc_rx_data(bp, rxr, prod, GFP_KERNEL) != 0) {
@@ -2425,8 +2592,13 @@ static int bnxt_init_rx_rings(struct bnxt *bp)
 {
 	int i, rc = 0;
 
-	bp->rx_offset = BNXT_RX_OFFSET;
-	bp->rx_dma_offset = BNXT_RX_DMA_OFFSET;
+	if (BNXT_RX_PAGE_MODE(bp)) {
+		bp->rx_offset = NET_IP_ALIGN + XDP_PACKET_HEADROOM;
+		bp->rx_dma_offset = XDP_PACKET_HEADROOM;
+	} else {
+		bp->rx_offset = BNXT_RX_OFFSET;
+		bp->rx_dma_offset = BNXT_RX_DMA_OFFSET;
+	}
 
 	for (i = 0; i < bp->rx_nr_rings; i++) {
 		rc = bnxt_init_one_rx_ring(bp, i);
@@ -2551,7 +2723,7 @@ static int bnxt_calc_nr_ring_pages(u32 ring_size, int desc_per_pg)
 	return pages;
 }
 
-static void bnxt_set_tpa_flags(struct bnxt *bp)
+void bnxt_set_tpa_flags(struct bnxt *bp)
 {
 	bp->flags &= ~BNXT_FLAG_TPA;
 	if (bp->flags & BNXT_FLAG_NO_AGG_RINGS)
@@ -2637,10 +2809,25 @@ void bnxt_set_ring_params(struct bnxt *bp)
 	bp->cp_ring_mask = bp->cp_bit - 1;
 }
 
-static int bnxt_set_rx_skb_mode(struct bnxt *bp)
+int bnxt_set_rx_skb_mode(struct bnxt *bp, bool page_mode)
 {
-	bp->rx_dir = DMA_FROM_DEVICE;
-	bp->rx_skb_func = bnxt_rx_skb;
+	if (page_mode) {
+		if (bp->dev->mtu > BNXT_MAX_PAGE_MODE_MTU)
+			return -EOPNOTSUPP;
+		bp->dev->extended->max_mtu =
+			min_t(u16, bp->max_mtu, BNXT_MAX_PAGE_MODE_MTU);
+		bp->flags &= ~BNXT_FLAG_AGG_RINGS;
+		bp->flags |= BNXT_FLAG_NO_AGG_RINGS | BNXT_FLAG_RX_PAGE_MODE;
+		bp->dev->hw_features &= ~NETIF_F_LRO;
+		bp->dev->features &= ~NETIF_F_LRO;
+		bp->rx_dir = DMA_BIDIRECTIONAL;
+		bp->rx_skb_func = bnxt_rx_page_skb;
+	} else {
+		bp->dev->extended->max_mtu = bp->max_mtu;
+		bp->flags &= ~BNXT_FLAG_RX_PAGE_MODE;
+		bp->rx_dir = DMA_FROM_DEVICE;
+		bp->rx_skb_func = bnxt_rx_skb;
+	}
 	return 0;
 }
 
@@ -2782,6 +2969,32 @@ static int bnxt_alloc_hwrm_resources(struct bnxt *bp)
 						    GFP_KERNEL);
 	if (!bp->hwrm_dbg_resp_addr)
 		netdev_warn(bp->dev, "fail to alloc debug register dma mem\n");
+
+	return 0;
+}
+
+static void bnxt_free_hwrm_short_cmd_req(struct bnxt *bp)
+{
+	if (bp->hwrm_short_cmd_req_addr) {
+		struct pci_dev *pdev = bp->pdev;
+
+		dma_free_coherent(&pdev->dev, BNXT_HWRM_MAX_REQ_LEN,
+				  bp->hwrm_short_cmd_req_addr,
+				  bp->hwrm_short_cmd_req_dma_addr);
+		bp->hwrm_short_cmd_req_addr = NULL;
+	}
+}
+
+static int bnxt_alloc_hwrm_short_cmd_req(struct bnxt *bp)
+{
+	struct pci_dev *pdev = bp->pdev;
+
+	bp->hwrm_short_cmd_req_addr =
+		dma_alloc_coherent(&pdev->dev, BNXT_HWRM_MAX_REQ_LEN,
+				   &bp->hwrm_short_cmd_req_dma_addr,
+				   GFP_KERNEL);
+	if (!bp->hwrm_short_cmd_req_addr)
+		return -ENOMEM;
 
 	return 0;
 }
@@ -3022,8 +3235,15 @@ static int bnxt_alloc_mem(struct bnxt *bp, bool irq_re_init)
 		for (i = 0; i < bp->tx_nr_rings; i++, j++) {
 			bp->tx_ring[i].bnapi = bp->bnapi[j];
 			bp->bnapi[j]->tx_ring = &bp->tx_ring[i];
-			bp->tx_ring_map[i] = i;
-			bp->tx_ring[i].txq_index = i;
+			bp->tx_ring_map[i] = bp->tx_nr_rings_xdp + i;
+			if (i >= bp->tx_nr_rings_xdp) {
+				bp->tx_ring[i].txq_index = i -
+					bp->tx_nr_rings_xdp;
+				bp->bnapi[j]->tx_int = bnxt_tx_int;
+			} else {
+				bp->bnapi[j]->flags |= BNXT_NAPI_FLAG_XDP;
+				bp->bnapi[j]->tx_int = bnxt_tx_int_xdp;
+			}
 		}
 
 		rc = bnxt_alloc_stats(bp);
@@ -3126,16 +3346,41 @@ static int bnxt_hwrm_do_send_msg(struct bnxt *bp, void *msg, u32 msg_len,
 	__le32 *resp_len, *valid;
 	u16 cp_ring_id, len = 0;
 	struct hwrm_err_output *resp = bp->hwrm_cmd_resp_addr;
+	u16 max_req_len = BNXT_HWRM_MAX_REQ_LEN;
+	struct hwrm_short_input short_input = {0};
 
 	req->seq_id = cpu_to_le16(bp->hwrm_cmd_seq++);
 	memset(resp, 0, PAGE_SIZE);
 	cp_ring_id = le16_to_cpu(req->cmpl_ring);
 	intr_process = (cp_ring_id == INVALID_HW_RING_ID) ? 0 : 1;
 
+	if (bp->flags & BNXT_FLAG_SHORT_CMD) {
+		void *short_cmd_req = bp->hwrm_short_cmd_req_addr;
+
+		memcpy(short_cmd_req, req, msg_len);
+		memset(short_cmd_req + msg_len, 0, BNXT_HWRM_MAX_REQ_LEN -
+						   msg_len);
+
+		short_input.req_type = req->req_type;
+		short_input.signature =
+				cpu_to_le16(SHORT_REQ_SIGNATURE_SHORT_CMD);
+		short_input.size = cpu_to_le16(msg_len);
+		short_input.req_addr =
+			cpu_to_le64(bp->hwrm_short_cmd_req_dma_addr);
+
+		data = (u32 *)&short_input;
+		msg_len = sizeof(short_input);
+
+		/* Sync memory write before updating doorbell */
+		wmb();
+
+		max_req_len = BNXT_HWRM_SHORT_REQ_LEN;
+	}
+
 	/* Write request msg to hwrm channel */
 	__iowrite32_copy(bp->bar0, data, msg_len / 4);
 
-	for (i = msg_len; i < BNXT_HWRM_MAX_REQ_LEN; i += 4)
+	for (i = msg_len; i < max_req_len; i += 4)
 		writel(0, bp->bar0 + i);
 
 	/* currently supports only one outstanding message */
@@ -4222,7 +4467,7 @@ int __bnxt_hwrm_get_tx_rings(struct bnxt *bp, u16 fid, int *tx_rings)
 	return rc;
 }
 
-int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings)
+static int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings)
 {
 	struct hwrm_func_cfg_input req = {0};
 	int rc;
@@ -4244,22 +4489,73 @@ int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings)
 	mutex_lock(&bp->hwrm_cmd_lock);
 	rc = __bnxt_hwrm_get_tx_rings(bp, 0xffff, tx_rings);
 	mutex_unlock(&bp->hwrm_cmd_lock);
+	if (!rc)
+		bp->tx_reserved_rings = *tx_rings;
 	return rc;
 }
 
-static void bnxt_hwrm_set_coal_params(struct bnxt *bp, u32 max_bufs,
-	u32 buf_tmrs, u16 flags,
+static int bnxt_hwrm_check_tx_rings(struct bnxt *bp, int tx_rings)
+{
+	struct hwrm_func_cfg_input req = {0};
+	int rc;
+
+	if (bp->hwrm_spec_code < 0x10801)
+		return 0;
+
+	if (BNXT_VF(bp))
+		return 0;
+
+	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
+	req.fid = cpu_to_le16(0xffff);
+	req.flags = cpu_to_le32(FUNC_CFG_REQ_FLAGS_TX_ASSETS_TEST);
+	req.enables = cpu_to_le32(FUNC_CFG_REQ_ENABLES_NUM_TX_RINGS);
+	req.num_tx_rings = cpu_to_le16(tx_rings);
+	rc = hwrm_send_message_silent(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
+	if (rc)
+		return -ENOMEM;
+	return 0;
+}
+
+static void bnxt_hwrm_set_coal_params(struct bnxt_coal *hw_coal,
 	struct hwrm_ring_cmpl_ring_cfg_aggint_params_input *req)
 {
+	u16 val, tmr, max, flags;
+
+	max = hw_coal->bufs_per_record * 128;
+	if (hw_coal->budget)
+		max = hw_coal->bufs_per_record * hw_coal->budget;
+
+	val = clamp_t(u16, hw_coal->coal_bufs, 1, max);
+	req->num_cmpl_aggr_int = cpu_to_le16(val);
+
+	/* This is a 6-bit value and must not be 0, or we'll get non stop IRQ */
+	val = min_t(u16, val, 63);
+	req->num_cmpl_dma_aggr = cpu_to_le16(val);
+
+	/* This is a 6-bit value and must not be 0, or we'll get non stop IRQ */
+	val = clamp_t(u16, hw_coal->coal_bufs_irq, 1, 63);
+	req->num_cmpl_dma_aggr_during_int = cpu_to_le16(val);
+
+	tmr = BNXT_USEC_TO_COAL_TIMER(hw_coal->coal_ticks);
+	tmr = max_t(u16, tmr, 1);
+	req->int_lat_tmr_max = cpu_to_le16(tmr);
+
+	/* min timer set to 1/2 of interrupt timer */
+	val = tmr / 2;
+	req->int_lat_tmr_min = cpu_to_le16(val);
+
+	/* buf timer set to 1/4 of interrupt timer */
+	val = max_t(u16, tmr / 4, 1);
+	req->cmpl_aggr_dma_tmr = cpu_to_le16(val);
+
+	tmr = BNXT_USEC_TO_COAL_TIMER(hw_coal->coal_ticks_irq);
+	tmr = max_t(u16, tmr, 1);
+	req->cmpl_aggr_dma_tmr_during_int = cpu_to_le16(tmr);
+
+	flags = RING_CMPL_RING_CFG_AGGINT_PARAMS_REQ_FLAGS_TIMER_RESET;
+	if (hw_coal->idle_thresh && hw_coal->coal_ticks < hw_coal->idle_thresh)
+		flags |= RING_CMPL_RING_CFG_AGGINT_PARAMS_REQ_FLAGS_RING_IDLE;
 	req->flags = cpu_to_le16(flags);
-	req->num_cmpl_dma_aggr = cpu_to_le16((u16)max_bufs);
-	req->num_cmpl_dma_aggr_during_int = cpu_to_le16(max_bufs >> 16);
-	req->cmpl_aggr_dma_tmr = cpu_to_le16((u16)buf_tmrs);
-	req->cmpl_aggr_dma_tmr_during_int = cpu_to_le16(buf_tmrs >> 16);
-	/* Minimum time between 2 interrupts set to buf_tmr x 2 */
-	req->int_lat_tmr_min = cpu_to_le16((u16)buf_tmrs * 2);
-	req->int_lat_tmr_max = cpu_to_le16((u16)buf_tmrs * 4);
-	req->num_cmpl_aggr_int = cpu_to_le16((u16)max_bufs * 4);
 }
 
 int bnxt_hwrm_set_coal(struct bnxt *bp)
@@ -4267,51 +4563,14 @@ int bnxt_hwrm_set_coal(struct bnxt *bp)
 	int i, rc = 0;
 	struct hwrm_ring_cmpl_ring_cfg_aggint_params_input req_rx = {0},
 							   req_tx = {0}, *req;
-	u16 max_buf, max_buf_irq;
-	u16 buf_tmr, buf_tmr_irq;
-	u32 flags;
 
 	bnxt_hwrm_cmd_hdr_init(bp, &req_rx,
 			       HWRM_RING_CMPL_RING_CFG_AGGINT_PARAMS, -1, -1);
 	bnxt_hwrm_cmd_hdr_init(bp, &req_tx,
 			       HWRM_RING_CMPL_RING_CFG_AGGINT_PARAMS, -1, -1);
 
-	/* Each rx completion (2 records) should be DMAed immediately.
-	 * DMA 1/4 of the completion buffers at a time.
-	 */
-	max_buf = min_t(u16, bp->rx_coal_bufs / 4, 2);
-	/* max_buf must not be zero */
-	max_buf = clamp_t(u16, max_buf, 1, 63);
-	max_buf_irq = clamp_t(u16, bp->rx_coal_bufs_irq, 1, 63);
-	buf_tmr = BNXT_USEC_TO_COAL_TIMER(bp->rx_coal_ticks);
-	/* buf timer set to 1/4 of interrupt timer */
-	buf_tmr = max_t(u16, buf_tmr / 4, 1);
-	buf_tmr_irq = BNXT_USEC_TO_COAL_TIMER(bp->rx_coal_ticks_irq);
-	buf_tmr_irq = max_t(u16, buf_tmr_irq, 1);
-
-	flags = RING_CMPL_RING_CFG_AGGINT_PARAMS_REQ_FLAGS_TIMER_RESET;
-
-	/* RING_IDLE generates more IRQs for lower latency.  Enable it only
-	 * if coal_ticks is less than 25 us.
-	 */
-	if (bp->rx_coal_ticks < 25)
-		flags |= RING_CMPL_RING_CFG_AGGINT_PARAMS_REQ_FLAGS_RING_IDLE;
-
-	bnxt_hwrm_set_coal_params(bp, max_buf_irq << 16 | max_buf,
-				  buf_tmr_irq << 16 | buf_tmr, flags, &req_rx);
-
-	/* max_buf must not be zero */
-	max_buf = clamp_t(u16, bp->tx_coal_bufs, 1, 63);
-	max_buf_irq = clamp_t(u16, bp->tx_coal_bufs_irq, 1, 63);
-	buf_tmr = BNXT_USEC_TO_COAL_TIMER(bp->tx_coal_ticks);
-	/* buf timer set to 1/4 of interrupt timer */
-	buf_tmr = max_t(u16, buf_tmr / 4, 1);
-	buf_tmr_irq = BNXT_USEC_TO_COAL_TIMER(bp->tx_coal_ticks_irq);
-	buf_tmr_irq = max_t(u16, buf_tmr_irq, 1);
-
-	flags = RING_CMPL_RING_CFG_AGGINT_PARAMS_REQ_FLAGS_TIMER_RESET;
-	bnxt_hwrm_set_coal_params(bp, max_buf_irq << 16 | max_buf,
-				  buf_tmr_irq << 16 | buf_tmr, flags, &req_tx);
+	bnxt_hwrm_set_coal_params(&bp->rx_coal, &req_rx);
+	bnxt_hwrm_set_coal_params(&bp->tx_coal, &req_tx);
 
 	mutex_lock(&bp->hwrm_cmd_lock);
 	for (i = 0; i < bp->cp_nr_rings; i++) {
@@ -4401,6 +4660,7 @@ static int bnxt_hwrm_func_qcfg(struct bnxt *bp)
 {
 	struct hwrm_func_qcfg_input req = {0};
 	struct hwrm_func_qcfg_output *resp = bp->hwrm_cmd_resp_addr;
+	u16 flags;
 	int rc;
 
 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_QCFG, -1, -1);
@@ -4417,15 +4677,15 @@ static int bnxt_hwrm_func_qcfg(struct bnxt *bp)
 		vf->vlan = le16_to_cpu(resp->vlan) & VLAN_VID_MASK;
 	}
 #endif
-	if (BNXT_PF(bp)) {
-		u16 flags = le16_to_cpu(resp->flags);
-
-		if (flags & (FUNC_QCFG_RESP_FLAGS_FW_DCBX_AGENT_ENABLED |
-			     FUNC_QCFG_RESP_FLAGS_FW_LLDP_AGENT_ENABLED))
-			bp->flags |= BNXT_FLAG_FW_LLDP_AGENT;
-		if (flags & FUNC_QCFG_RESP_FLAGS_MULTI_HOST)
-			bp->flags |= BNXT_FLAG_MULTI_HOST;
+	flags = le16_to_cpu(resp->flags);
+	if (flags & (FUNC_QCFG_RESP_FLAGS_FW_DCBX_AGENT_ENABLED |
+		     FUNC_QCFG_RESP_FLAGS_FW_LLDP_AGENT_ENABLED)) {
+		bp->flags |= BNXT_FLAG_FW_LLDP_AGENT;
+		if (flags & FUNC_QCFG_RESP_FLAGS_FW_DCBX_AGENT_ENABLED)
+			bp->flags |= BNXT_FLAG_FW_DCBX_AGENT;
 	}
+	if (BNXT_PF(bp) && (flags & FUNC_QCFG_RESP_FLAGS_MULTI_HOST))
+		bp->flags |= BNXT_FLAG_MULTI_HOST;
 
 	switch (resp->port_partition_type) {
 	case FUNC_QCFG_RESP_PORT_PARTITION_TYPE_NPAR1_0:
@@ -4441,6 +4701,10 @@ static int bnxt_hwrm_func_qcfg(struct bnxt *bp)
 		bp->br_mode = BRIDGE_MODE_VEPA;
 	else
 		bp->br_mode = BRIDGE_MODE_UNDEF;
+
+	bp->max_mtu = le16_to_cpu(resp->max_mtu_configured);
+	if (!bp->max_mtu)
+		bp->max_mtu = BNXT_MAX_MTU;
 
 func_qcfg_exit:
 	mutex_unlock(&bp->hwrm_cmd_lock);
@@ -4580,6 +4844,7 @@ static int bnxt_hwrm_ver_get(struct bnxt *bp)
 	int rc;
 	struct hwrm_ver_get_input req = {0};
 	struct hwrm_ver_get_output *resp = bp->hwrm_cmd_resp_addr;
+	u32 dev_caps_cfg;
 
 	bp->hwrm_max_req_len = HWRM_MAX_REQ_LEN;
 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_VER_GET, -1, -1);
@@ -4601,9 +4866,9 @@ static int bnxt_hwrm_ver_get(struct bnxt *bp)
 			    resp->hwrm_intf_upd);
 		netdev_warn(bp->dev, "Please update firmware with HWRM interface 1.0.0 or newer.\n");
 	}
-	snprintf(bp->fw_ver_str, BC_HWRM_STR_LEN, "%d.%d.%d/%d.%d.%d",
+	snprintf(bp->fw_ver_str, BC_HWRM_STR_LEN, "%d.%d.%d.%d",
 		 resp->hwrm_fw_maj, resp->hwrm_fw_min, resp->hwrm_fw_bld,
-		 resp->hwrm_intf_maj, resp->hwrm_intf_min, resp->hwrm_intf_upd);
+		 resp->hwrm_fw_rsvd);
 
 	bp->hwrm_cmd_timeout = le16_to_cpu(resp->def_req_timeout);
 	if (!bp->hwrm_cmd_timeout)
@@ -4616,6 +4881,11 @@ static int bnxt_hwrm_ver_get(struct bnxt *bp)
 	if (bp->chip_num == CHIP_NUM_58700 && !resp->chip_rev &&
 	    !resp->chip_metal)
 		bp->flags |= BNXT_FLAG_CHIP_NITRO_A0;
+
+	dev_caps_cfg = le32_to_cpu(resp->dev_caps_cfg);
+	if ((dev_caps_cfg & VER_GET_RESP_DEV_CAPS_CFG_SHORT_CMD_SUPPORTED) &&
+	    (dev_caps_cfg & VER_GET_RESP_DEV_CAPS_CFG_SHORT_CMD_REQUIRED))
+		bp->flags |= BNXT_FLAG_SHORT_CMD;
 
 hwrm_ver_get_exit:
 	mutex_unlock(&bp->hwrm_cmd_lock);
@@ -4723,6 +4993,26 @@ static void bnxt_hwrm_resource_free(struct bnxt *bp, bool close_path,
 		bnxt_hwrm_stat_ctx_free(bp);
 		bnxt_hwrm_free_tunnel_ports(bp);
 	}
+}
+
+static int bnxt_hwrm_set_br_mode(struct bnxt *bp, u16 br_mode)
+{
+	struct hwrm_func_cfg_input req = {0};
+	int rc;
+
+	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
+	req.fid = cpu_to_le16(0xffff);
+	req.enables = cpu_to_le32(FUNC_CFG_REQ_ENABLES_EVB_MODE);
+	if (br_mode == BRIDGE_MODE_VEB)
+		req.evb_mode = FUNC_CFG_REQ_EVB_MODE_VEB;
+	else if (br_mode == BRIDGE_MODE_VEPA)
+		req.evb_mode = FUNC_CFG_REQ_EVB_MODE_VEPA;
+	else
+		return -EINVAL;
+	rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
+	if (rc)
+		rc = -EIO;
+	return rc;
 }
 
 static int bnxt_setup_vnic(struct bnxt *bp, u16 vnic_id)
@@ -4860,6 +5150,15 @@ static int bnxt_init_chip(struct bnxt *bp, bool irq_re_init)
 				   rc);
 			goto err_out;
 		}
+		if (bp->tx_reserved_rings != bp->tx_nr_rings) {
+			int tx = bp->tx_nr_rings;
+
+			if (bnxt_hwrm_reserve_tx_rings(bp, &tx) ||
+			    tx < bp->tx_nr_rings) {
+				rc = -ENOMEM;
+				goto err_out;
+			}
+		}
 	}
 
 	rc = bnxt_hwrm_ring_alloc(bp);
@@ -4977,7 +5276,8 @@ static int bnxt_set_real_num_queues(struct bnxt *bp)
 	int rc;
 	struct net_device *dev = bp->dev;
 
-	rc = netif_set_real_num_tx_queues(dev, bp->tx_nr_rings);
+	rc = netif_set_real_num_tx_queues(dev, bp->tx_nr_rings -
+					  bp->tx_nr_rings_xdp);
 	if (rc)
 		return rc;
 
@@ -5025,19 +5325,12 @@ static void bnxt_setup_msix(struct bnxt *bp)
 
 	tcs = netdev_get_num_tc(dev);
 	if (tcs > 1) {
-		bp->tx_nr_rings_per_tc = bp->tx_nr_rings / tcs;
-		if (bp->tx_nr_rings_per_tc == 0) {
-			netdev_reset_tc(dev);
-			bp->tx_nr_rings_per_tc = bp->tx_nr_rings;
-		} else {
-			int i, off, count;
+		int i, off, count;
 
-			bp->tx_nr_rings = bp->tx_nr_rings_per_tc * tcs;
-			for (i = 0; i < tcs; i++) {
-				count = bp->tx_nr_rings_per_tc;
-				off = i * count;
-				netdev_set_tc_queue(dev, i, count, off);
-			}
+		for (i = 0; i < tcs; i++) {
+			count = bp->tx_nr_rings_per_tc;
+			off = i * count;
+			netdev_set_tc_queue(dev, i, count, off);
 		}
 	}
 
@@ -5498,6 +5791,8 @@ static int bnxt_hwrm_phy_qcaps(struct bnxt *bp)
 	if (resp->supported_speeds_auto_mode)
 		link_info->support_auto_speeds =
 			le16_to_cpu(resp->supported_speeds_auto_mode);
+
+	bp->port_count = resp->port_cnt;
 
 hwrm_phy_qcaps_exit:
 	mutex_unlock(&bp->hwrm_cmd_lock);
@@ -6056,6 +6351,9 @@ static int __bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 	/* Poll link status and check for SFP+ module status */
 	bnxt_get_port_module_status(bp);
 
+	/* VF-reps may need to be re-opened after the PF is re-opened */
+	if (BNXT_PF(bp))
+		bnxt_vf_reps_open(bp);
 	return 0;
 
 open_err:
@@ -6082,11 +6380,54 @@ int bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 	return rc;
 }
 
+/* rtnl_lock held, open the NIC half way by allocating all resources, but
+ * NAPI, IRQ, and TX are not enabled.  This is mainly used for offline
+ * self tests.
+ */
+int bnxt_half_open_nic(struct bnxt *bp)
+{
+	int rc = 0;
+
+	rc = bnxt_alloc_mem(bp, false);
+	if (rc) {
+		netdev_err(bp->dev, "bnxt_alloc_mem err: %x\n", rc);
+		goto half_open_err;
+	}
+	rc = bnxt_init_nic(bp, false);
+	if (rc) {
+		netdev_err(bp->dev, "bnxt_init_nic err: %x\n", rc);
+		goto half_open_err;
+	}
+	return 0;
+
+half_open_err:
+	bnxt_free_skbs(bp);
+	bnxt_free_mem(bp, false);
+	dev_close(bp->dev);
+	return rc;
+}
+
+/* rtnl_lock held, this call can only be made after a previous successful
+ * call to bnxt_half_open_nic().
+ */
+void bnxt_half_close_nic(struct bnxt *bp)
+{
+	bnxt_hwrm_resource_free(bp, false, false);
+	bnxt_free_skbs(bp);
+	bnxt_free_mem(bp, false);
+}
+
 static int bnxt_open(struct net_device *dev)
 {
 	struct bnxt *bp = netdev_priv(dev);
 
 	return __bnxt_open_nic(bp, true, true);
+}
+
+static bool bnxt_drv_busy(struct bnxt *bp)
+{
+	return (test_bit(BNXT_STATE_IN_SP_TASK, &bp->state) ||
+		test_bit(BNXT_STATE_READ_STATS, &bp->state));
 }
 
 int bnxt_close_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
@@ -6101,13 +6442,17 @@ int bnxt_close_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 		if (rc)
 			netdev_warn(bp->dev, "timeout waiting for SRIOV config operation to complete!\n");
 	}
+
+	/* Close the VF-reps before closing PF */
+	if (BNXT_PF(bp))
+		bnxt_vf_reps_close(bp);
 #endif
 	/* Change device state to avoid TX queue wake up's */
 	bnxt_tx_disable(bp);
 
 	clear_bit(BNXT_STATE_OPEN, &bp->state);
 	smp_mb__after_atomic();
-	while (test_bit(BNXT_STATE_IN_SP_TASK, &bp->state))
+	while (bnxt_drv_busy(bp))
 		msleep(20);
 
 	/* Flush rings and and disable interrupts */
@@ -6162,14 +6507,21 @@ static int bnxt_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	return -EOPNOTSUPP;
 }
 
-static struct rtnl_link_stats64 *
+static void
 bnxt_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	u32 i;
 	struct bnxt *bp = netdev_priv(dev);
 
-	if (!bp->bnapi)
-		return stats;
+	set_bit(BNXT_STATE_READ_STATS, &bp->state);
+	/* Make sure bnxt_close_nic() sees that we are reading stats before
+	 * we check the BNXT_STATE_OPEN flag.
+	 */
+	smp_mb__after_atomic();
+	if (!test_bit(BNXT_STATE_OPEN, &bp->state)) {
+		clear_bit(BNXT_STATE_READ_STATS, &bp->state);
+		return;
+	}
 
 	/* TODO check if we need to synchronize with bnxt_close path */
 	for (i = 0; i < bp->cp_nr_rings; i++) {
@@ -6216,8 +6568,7 @@ bnxt_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 		stats->tx_fifo_errors = le64_to_cpu(tx->tx_fifo_underruns);
 		stats->tx_errors = le64_to_cpu(tx->tx_err);
 	}
-
-	return stats;
+	clear_bit(BNXT_STATE_READ_STATS, &bp->state);
 }
 
 static bool bnxt_mc_list_updated(struct bnxt *bp, u32 *rx_mask)
@@ -6304,7 +6655,7 @@ static void bnxt_set_rx_mode(struct net_device *dev)
 		vnic->rx_mask = mask;
 
 		set_bit(BNXT_RX_MASK_SP_EVENT, &bp->sp_event);
-		schedule_work(&bp->sp_task);
+		bnxt_queue_sp_work(bp);
 	}
 }
 
@@ -6577,7 +6928,7 @@ static void bnxt_tx_timeout(struct net_device *dev)
 
 	netdev_err(bp->dev,  "TX timeout detected, starting reset task!\n");
 	set_bit(BNXT_RESET_TASK_SP_EVENT, &bp->sp_event);
-	schedule_work(&bp->sp_task);
+	bnxt_queue_sp_work(bp);
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -6609,7 +6960,12 @@ static void bnxt_timer(unsigned long data)
 	if (bp->link_info.link_up && (bp->flags & BNXT_FLAG_PORT_STATS) &&
 	    bp->stats_coal_ticks) {
 		set_bit(BNXT_PERIODIC_STATS_SP_EVENT, &bp->sp_event);
-		schedule_work(&bp->sp_task);
+		bnxt_queue_sp_work(bp);
+	}
+
+	if (bnxt_tc_flower_enabled(bp)) {
+		set_bit(BNXT_FLOW_STATS_SP_EVENT, &bp->sp_event);
+		bnxt_queue_sp_work(bp);
 	}
 bnxt_restart_timer:
 	mod_timer(&bp->timer, jiffies + bp->current_interval);
@@ -6701,6 +7057,10 @@ static void bnxt_sp_task(struct work_struct *work)
 		bnxt_get_port_module_status(bp);
 		mutex_unlock(&bp->link_lock);
 	}
+
+	if (test_and_clear_bit(BNXT_FLOW_STATS_SP_EVENT, &bp->sp_event))
+		bnxt_tc_flow_stats_work(bp);
+
 	/* These functions below will clear BNXT_STATE_IN_SP_TASK.  They
 	 * must be the last functions to be called before exiting.
 	 */
@@ -6737,6 +7097,57 @@ static void bnxt_cleanup_pci(struct bnxt *bp)
 	bnxt_unmap_bars(bp, bp->pdev);
 	pci_release_regions(bp->pdev);
 	pci_disable_device(bp->pdev);
+}
+
+/* Under rtnl_lock */
+int bnxt_check_rings(struct bnxt *bp, int tx, int rx, bool sh, int tcs,
+		     int tx_xdp)
+{
+	int max_rx, max_tx, tx_sets = 1;
+	int tx_rings_needed;
+	int rc;
+
+	if (tcs)
+		tx_sets = tcs;
+
+	rc = bnxt_get_max_rings(bp, &max_rx, &max_tx, sh);
+	if (rc)
+		return rc;
+
+	if (max_rx < rx)
+		return -ENOMEM;
+
+	tx_rings_needed = tx * tx_sets + tx_xdp;
+	if (max_tx < tx_rings_needed)
+		return -ENOMEM;
+
+	return bnxt_hwrm_check_tx_rings(bp, tx_rings_needed);
+}
+
+static void bnxt_init_dflt_coal(struct bnxt *bp)
+{
+	struct bnxt_coal *coal;
+
+	/* Tick values in micro seconds.
+	 * 1 coal_buf x bufs_per_record = 1 completion record.
+	 */
+	coal = &bp->rx_coal;
+	coal->coal_ticks = 14;
+	coal->coal_bufs = 30;
+	coal->coal_ticks_irq = 1;
+	coal->coal_bufs_irq = 2;
+	coal->idle_thresh = 25;
+	coal->bufs_per_record = 2;
+	coal->budget = 64;		/* NAPI budget */
+
+	coal = &bp->tx_coal;
+	coal->coal_ticks = 28;
+	coal->coal_bufs = 30;
+	coal->coal_ticks_irq = 2;
+	coal->coal_bufs_irq = 2;
+	coal->bufs_per_record = 1;
+
+	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
 }
 
 static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
@@ -6807,22 +7218,9 @@ static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
 	bp->rx_ring_size = BNXT_DEFAULT_RX_RING_SIZE;
 	bp->tx_ring_size = BNXT_DEFAULT_TX_RING_SIZE;
 
-	/* tick values in micro seconds */
-	bp->rx_coal_ticks = 12;
-	bp->rx_coal_bufs = 30;
-	bp->rx_coal_ticks_irq = 1;
-	bp->rx_coal_bufs_irq = 2;
+	bnxt_init_dflt_coal(bp);
 
-	bp->tx_coal_ticks = 25;
-	bp->tx_coal_bufs = 30;
-	bp->tx_coal_ticks_irq = 2;
-	bp->tx_coal_bufs_irq = 2;
-
-	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
-
-	init_timer(&bp->timer);
-	bp->timer.data = (unsigned long)bp;
-	bp->timer.function = bnxt_timer;
+	setup_timer(&bp->timer, bnxt_timer, (unsigned long)bp);
 	bp->current_interval = BNXT_TIMER_INTERVAL;
 
 	clear_bit(BNXT_STATE_OPEN, &bp->state);
@@ -6870,9 +7268,6 @@ static int bnxt_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct bnxt *bp = netdev_priv(dev);
 
-	if (new_mtu < 60 || new_mtu > 9500)
-		return -EINVAL;
-
 	if (netif_running(dev))
 		bnxt_close_nic(bp, false, false);
 
@@ -6889,6 +7284,7 @@ int bnxt_setup_mq_tc(struct net_device *dev, u8 tc)
 {
 	struct bnxt *bp = netdev_priv(dev);
 	bool sh = false;
+	int rc;
 
 	if (tc > bp->max_tc) {
 		netdev_err(dev, "Too many traffic classes requested: %d. Max supported is %d.\n",
@@ -6902,19 +7298,10 @@ int bnxt_setup_mq_tc(struct net_device *dev, u8 tc)
 	if (bp->flags & BNXT_FLAG_SHARED_RINGS)
 		sh = true;
 
-	if (tc) {
-		int max_rx_rings, max_tx_rings, req_tx_rings, rsv_tx_rings, rc;
-
-		req_tx_rings = bp->tx_nr_rings_per_tc * tc;
-		rc = bnxt_get_max_rings(bp, &max_rx_rings, &max_tx_rings, sh);
-		if (rc || req_tx_rings > max_tx_rings)
-			return -ENOMEM;
-
-		rsv_tx_rings = req_tx_rings;
-		if (bnxt_hwrm_reserve_tx_rings(bp, &rsv_tx_rings) ||
-		    rsv_tx_rings < req_tx_rings)
-			return -ENOMEM;
-	}
+	rc = bnxt_check_rings(bp, bp->tx_nr_rings_per_tc, bp->rx_nr_rings,
+			      sh, tc, bp->tx_nr_rings_xdp);
+	if (rc)
+		return rc;
 
 	/* Needs to close the device and do hw resource re-allocations */
 	if (netif_running(bp->dev))
@@ -6938,13 +7325,33 @@ int bnxt_setup_mq_tc(struct net_device *dev, u8 tc)
 	return 0;
 }
 
-static int bnxt_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
-			 struct tc_to_netdev *ntc)
+static int bnxt_setup_flower(struct net_device *dev,
+			     struct tc_cls_flower_offload *cls_flower)
 {
-	if (ntc->type != TC_SETUP_MQPRIO)
-		return -EINVAL;
+	struct bnxt *bp = netdev_priv(dev);
 
-	return bnxt_setup_mq_tc(dev, ntc->tc);
+	if (!bnxt_tc_flower_enabled(bp))
+		return -EOPNOTSUPP;
+
+	return bnxt_tc_setup_flower(bp, bp->pf.fw_fid, cls_flower);
+}
+
+static int bnxt_setup_tc(struct net_device *dev, enum tc_setup_type type,
+			 void *type_data)
+{
+	switch (type) {
+	case TC_SETUP_CLSFLOWER:
+		return bnxt_setup_flower(dev, type_data);
+	case TC_SETUP_MQPRIO: {
+		struct tc_mqprio_qopt *mqprio = type_data;
+
+		mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+
+		return bnxt_setup_mq_tc(dev, mqprio->num_tc);
+	}
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 #ifdef CONFIG_RFS_ACCEL
@@ -7054,7 +7461,7 @@ static int bnxt_rx_flow_steer(struct net_device *dev, const struct sk_buff *skb,
 	spin_unlock_bh(&bp->ntp_fltr_lock);
 
 	set_bit(BNXT_RX_NTP_FLTR_SP_EVENT, &bp->sp_event);
-	schedule_work(&bp->sp_task);
+	bnxt_queue_sp_work(bp);
 
 	return new_fltr->sw_id;
 
@@ -7137,7 +7544,7 @@ static void bnxt_udp_tunnel_add(struct net_device *dev,
 		if (bp->vxlan_port_cnt == 1) {
 			bp->vxlan_port = ti->port;
 			set_bit(BNXT_VXLAN_ADD_PORT_SP_EVENT, &bp->sp_event);
-			schedule_work(&bp->sp_task);
+			bnxt_queue_sp_work(bp);
 		}
 		break;
 	case UDP_TUNNEL_TYPE_GENEVE:
@@ -7154,7 +7561,7 @@ static void bnxt_udp_tunnel_add(struct net_device *dev,
 		return;
 	}
 
-	schedule_work(&bp->sp_task);
+	bnxt_queue_sp_work(bp);
 }
 
 static void bnxt_udp_tunnel_del(struct net_device *dev,
@@ -7193,8 +7600,100 @@ static void bnxt_udp_tunnel_del(struct net_device *dev,
 		return;
 	}
 
-	schedule_work(&bp->sp_task);
+	bnxt_queue_sp_work(bp);
 }
+
+static int bnxt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
+			       struct net_device *dev, u32 filter_mask,
+			       int nlflags)
+{
+	struct bnxt *bp = netdev_priv(dev);
+
+	return ndo_dflt_bridge_getlink(skb, pid, seq, dev, bp->br_mode, 0, 0,
+				       nlflags, filter_mask, NULL);
+}
+
+static int bnxt_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+			       u16 flags)
+{
+	struct bnxt *bp = netdev_priv(dev);
+	struct nlattr *attr, *br_spec;
+	int rem, rc = 0;
+
+	if (bp->hwrm_spec_code < 0x10708 || !BNXT_SINGLE_PF(bp))
+		return -EOPNOTSUPP;
+
+	br_spec = nlmsg_find_attr(nlh, sizeof(struct ifinfomsg), IFLA_AF_SPEC);
+	if (!br_spec)
+		return -EINVAL;
+
+	nla_for_each_nested(attr, br_spec, rem) {
+		u16 mode;
+
+		if (nla_type(attr) != IFLA_BRIDGE_MODE)
+			continue;
+
+		if (nla_len(attr) < sizeof(mode))
+			return -EINVAL;
+
+		mode = nla_get_u16(attr);
+		if (mode == bp->br_mode)
+			break;
+
+		rc = bnxt_hwrm_set_br_mode(bp, mode);
+		if (!rc)
+			bp->br_mode = mode;
+		break;
+	}
+	return rc;
+}
+
+static int bnxt_get_phys_port_name(struct net_device *dev, char *buf,
+				   size_t len)
+{
+	struct bnxt *bp = netdev_priv(dev);
+	int rc;
+
+	/* The PF and it's VF-reps only support the switchdev framework */
+	if (!BNXT_PF(bp))
+		return -EOPNOTSUPP;
+
+	rc = snprintf(buf, len, "p%d", bp->pf.port_id);
+
+	if (rc >= len)
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+int bnxt_port_attr_get(struct bnxt *bp, struct switchdev_attr *attr)
+{
+	if (bp->eswitch_mode != DEVLINK_ESWITCH_MODE_SWITCHDEV)
+		return -EOPNOTSUPP;
+
+	/* The PF and it's VF-reps only support the switchdev framework */
+	if (!BNXT_PF(bp))
+		return -EOPNOTSUPP;
+
+	switch (attr->id) {
+	case SWITCHDEV_ATTR_ID_PORT_PARENT_ID:
+		attr->u.ppid.id_len = sizeof(bp->switch_id);
+		memcpy(attr->u.ppid.id, bp->switch_id, attr->u.ppid.id_len);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+static int bnxt_swdev_port_attr_get(struct net_device *dev,
+				    struct switchdev_attr *attr)
+{
+	return bnxt_port_attr_get(netdev_priv(dev), attr);
+}
+
+static const struct switchdev_ops bnxt_switchdev_ops = {
+	.switchdev_port_attr_get	= bnxt_swdev_port_attr_get
+};
 
 static const struct net_device_ops bnxt_netdev_ops = {
 	.ndo_size		= sizeof(struct net_device_ops),
@@ -7206,7 +7705,7 @@ static const struct net_device_ops bnxt_netdev_ops = {
 	.ndo_do_ioctl		= bnxt_ioctl,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= bnxt_change_mac_addr,
-	.ndo_change_mtu		= bnxt_change_mtu,
+	.extended.ndo_change_mtu	= bnxt_change_mtu,
 	.ndo_fix_features	= bnxt_fix_features,
 	.ndo_set_features	= bnxt_set_features,
 	.ndo_tx_timeout		= bnxt_tx_timeout,
@@ -7221,12 +7720,16 @@ static const struct net_device_ops bnxt_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= bnxt_poll_controller,
 #endif
-	.ndo_setup_tc           = bnxt_setup_tc,
+	.extended.ndo_setup_tc_rh = bnxt_setup_tc,
 #ifdef CONFIG_RFS_ACCEL
 	.ndo_rx_flow_steer	= bnxt_rx_flow_steer,
 #endif
 	.extended.ndo_udp_tunnel_add	= bnxt_udp_tunnel_add,
 	.extended.ndo_udp_tunnel_del	= bnxt_udp_tunnel_del,
+	.extended.ndo_xdp		= bnxt_xdp,
+	.ndo_bridge_getlink	= bnxt_bridge_getlink,
+	.ndo_bridge_setlink	= bnxt_bridge_setlink,
+	.extended.ndo_get_phys_port_name = bnxt_get_phys_port_name
 };
 
 static void bnxt_remove_one(struct pci_dev *pdev)
@@ -7234,21 +7737,28 @@ static void bnxt_remove_one(struct pci_dev *pdev)
 	struct net_device *dev = pci_get_drvdata(pdev);
 	struct bnxt *bp = netdev_priv(dev);
 
-	if (BNXT_PF(bp))
+	if (BNXT_PF(bp)) {
 		bnxt_sriov_disable(bp);
+		bnxt_dl_unregister(bp);
+	}
 
 	pci_disable_pcie_error_reporting(pdev);
 	unregister_netdev(dev);
-	cancel_work_sync(&bp->sp_task);
+	bnxt_shutdown_tc(bp);
+	bnxt_cancel_sp_work(bp);
 	bp->sp_event = 0;
 
 	bnxt_clear_int_mode(bp);
 	bnxt_hwrm_func_drv_unrgtr(bp);
 	bnxt_free_hwrm_resources(bp);
+	bnxt_free_hwrm_short_cmd_req(bp);
+	bnxt_ethtool_free(bp);
 	bnxt_dcb_free(bp);
 	kfree(bp->edev);
 	bp->edev = NULL;
 	bnxt_cleanup_pci(bp);
+	if (bp->xdp_prog)
+		bpf_prog_put(bp->xdp_prog);
 	free_netdev(dev);
 }
 
@@ -7404,6 +7914,9 @@ static int bnxt_set_dflt_rings(struct bnxt *bp, bool sh)
 	if (sh)
 		bp->flags |= BNXT_FLAG_SHARED_RINGS;
 	dflt_rings = netif_get_num_default_rss_queues();
+	/* Reduce default rings to reduce memory usage on multi-port cards */
+	if (bp->port_count > 1)
+		dflt_rings = min_t(int, dflt_rings, 4);
 	rc = bnxt_get_dflt_rings(bp, &max_rx_rings, &max_tx_rings, sh);
 	if (rc)
 		return rc;
@@ -7503,6 +8016,7 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	dev->netdev_ops = &bnxt_netdev_ops;
 	dev->watchdog_timeo = BNXT_TX_TIMEOUT;
 	dev->ethtool_ops = &bnxt_ethtool_ops;
+	SWITCHDEV_SET_OPS(dev, &bnxt_switchdev_ops);
 	pci_set_drvdata(pdev, dev);
 
 	rc = bnxt_alloc_hwrm_resources(bp);
@@ -7513,6 +8027,12 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	rc = bnxt_hwrm_ver_get(bp);
 	if (rc)
 		goto init_err_pci_clean;
+
+	if (bp->flags & BNXT_FLAG_SHORT_CMD) {
+		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
+		if (rc)
+			goto init_err_pci_clean;
+	}
 
 	rc = bnxt_hwrm_func_reset(bp);
 	if (rc)
@@ -7548,10 +8068,13 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 #ifdef CONFIG_BNXT_SRIOV
 	init_waitqueue_head(&bp->sriov_cfg_wait);
+	mutex_init(&bp->sriov_lock);
 #endif
 	bp->gro_func = bnxt_gro_func_5730x;
 	if (BNXT_CHIP_P4_PLUS(bp))
 		bp->gro_func = bnxt_gro_func_5731x;
+	else
+		bp->flags |= BNXT_FLAG_DOUBLE_DB;
 
 	rc = bnxt_hwrm_func_drv_rgtr(bp);
 	if (rc)
@@ -7587,9 +8110,18 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	bnxt_hwrm_func_qcfg(bp);
 	bnxt_hwrm_port_led_qcaps(bp);
+	bnxt_ethtool_init(bp);
 	bnxt_dcb_init(bp);
 
-	bnxt_set_rx_skb_mode(bp);
+	/* MTU range: 60 - FW defined max */
+	dev->extended->min_mtu = ETH_ZLEN;
+	dev->extended->max_mtu = bp->max_mtu;
+
+	rc = bnxt_probe_phy(bp);
+	if (rc)
+		goto init_err_pci_clean;
+
+	bnxt_set_rx_skb_mode(bp, false);
 	bnxt_set_tpa_flags(bp);
 	bnxt_set_ring_params(bp);
 	bnxt_set_max_func_irqs(bp, max_irqs);
@@ -7623,10 +8155,6 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (dev->hw_features & NETIF_F_HW_VLAN_CTAG_RX)
 		bp->flags |= BNXT_FLAG_STRIP_VLAN;
 
-	rc = bnxt_probe_phy(bp);
-	if (rc)
-		goto init_err_pci_clean;
-
 	rc = bnxt_init_int_mode(bp);
 	if (rc)
 		goto init_err_pci_clean;
@@ -7637,9 +8165,24 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	else
 		device_set_wakeup_capable(&pdev->dev, false);
 
+	if (BNXT_PF(bp)) {
+		if (!bnxt_pf_wq) {
+			bnxt_pf_wq =
+				create_singlethread_workqueue("bnxt_pf_wq");
+			if (!bnxt_pf_wq) {
+				dev_err(&pdev->dev, "Unable to create workqueue.\n");
+				goto init_err_pci_clean;
+			}
+		}
+		bnxt_init_tc(bp);
+	}
+
 	rc = register_netdev(dev);
 	if (rc)
-		goto init_err_clr_int;
+		goto init_err_cleanup_tc;
+
+	if (BNXT_PF(bp))
+		bnxt_dl_register(bp);
 
 	netdev_info(dev, "%s found at mem %lx, node addr %pM\n",
 		    board_info[ent->driver_data].name,
@@ -7649,7 +8192,8 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	return 0;
 
-init_err_clr_int:
+init_err_cleanup_tc:
+	bnxt_shutdown_tc(bp);
 	bnxt_clear_int_mode(bp);
 
 init_err_pci_clean:
@@ -7868,4 +8412,17 @@ static struct pci_driver bnxt_pci_driver = {
 #endif
 };
 
-module_pci_driver(bnxt_pci_driver);
+static int __init bnxt_init(void)
+{
+	return pci_register_driver(&bnxt_pci_driver);
+}
+
+static void __exit bnxt_exit(void)
+{
+	pci_unregister_driver(&bnxt_pci_driver);
+	if (bnxt_pf_wq)
+		destroy_workqueue(bnxt_pf_wq);
+}
+
+module_init(bnxt_init);
+module_exit(bnxt_exit);

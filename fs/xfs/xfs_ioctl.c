@@ -760,7 +760,7 @@ xfs_ioc_space(
 		iattr.ia_valid = ATTR_SIZE;
 		iattr.ia_size = bf->l_start;
 
-		error = xfs_setattr_size(ip, &iattr);
+		error = xfs_vn_setattr_size(file_dentry(filp), &iattr);
 		break;
 	default:
 		ASSERT(0);
@@ -948,16 +948,14 @@ xfs_ioc_fsgetxattr(
 	if (attr) {
 		if (ip->i_afp) {
 			if (ip->i_afp->if_flags & XFS_IFEXTENTS)
-				fa.fsx_nextents = ip->i_afp->if_bytes /
-							sizeof(xfs_bmbt_rec_t);
+				fa.fsx_nextents = xfs_iext_count(ip->i_afp);
 			else
 				fa.fsx_nextents = ip->i_d.di_anextents;
 		} else
 			fa.fsx_nextents = 0;
 	} else {
 		if (ip->i_df.if_flags & XFS_IFEXTENTS)
-			fa.fsx_nextents = ip->i_df.if_bytes /
-						sizeof(xfs_bmbt_rec_t);
+			fa.fsx_nextents = xfs_iext_count(&ip->i_df);
 		else
 			fa.fsx_nextents = ip->i_d.di_nextents;
 	}
@@ -1044,11 +1042,12 @@ xfs_diflags_to_linux(
 		inode->i_flags |= S_NOATIME;
 	else
 		inode->i_flags &= ~S_NOATIME;
+#if 0	/* disabled until the flag switching races are sorted out */
 	if (xflags & XFS_XFLAG_DAX)
 		inode->i_flags |= S_DAX;
 	else
 		inode->i_flags &= ~S_DAX;
-
+#endif
 }
 
 static int

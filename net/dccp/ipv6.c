@@ -260,8 +260,8 @@ static int dccp_v6_send_response(struct sock *sk, struct request_sock *req)
 							 &ireq->ir_v6_rmt_addr);
 		fl6.daddr = ireq->ir_v6_rmt_addr;
 		rcu_read_lock();
-		err = ip6_xmit(sk, skb, &fl6, rcu_dereference(np->opt),
-			       np->tclass);
+		err = ip6_xmit(sk, skb, &fl6, sk->sk_mark,
+			       rcu_dereference(np->opt), np->tclass);
 		rcu_read_unlock();
 		err = net_xmit_eval(err);
 	}
@@ -314,7 +314,7 @@ static void dccp_v6_ctl_send_reset(struct sock *sk, struct sk_buff *rxskb)
 	dst = ip6_dst_lookup_flow(ctl_sk, &fl6, NULL);
 	if (!IS_ERR(dst)) {
 		skb_dst_set(skb, dst);
-		ip6_xmit(ctl_sk, skb, &fl6, NULL, 0);
+		ip6_xmit(ctl_sk, skb, &fl6, 0, NULL, 0);
 		DCCP_INC_STATS_BH(DCCP_MIB_OUTSEGS);
 		DCCP_INC_STATS_BH(DCCP_MIB_OUTRSTS);
 		return;

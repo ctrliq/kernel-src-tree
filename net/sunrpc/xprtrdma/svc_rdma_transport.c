@@ -748,6 +748,7 @@ static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
 	newxprt->sc_rq_depth = newxprt->sc_max_requests +
 			       newxprt->sc_max_bc_requests;
 	if (newxprt->sc_rq_depth > dev->attrs.max_qp_wr) {
+		gmb();
 		pr_warn("svcrdma: reducing receive depth to %d\n",
 			dev->attrs.max_qp_wr);
 		newxprt->sc_rq_depth = dev->attrs.max_qp_wr;
@@ -922,9 +923,9 @@ static void __svc_rdma_free(struct work_struct *work)
 		ib_drain_qp(rdma->sc_qp);
 
 	/* We should only be called from kref_put */
-	if (atomic_read(&xprt->xpt_ref.refcount) != 0)
+	if (kref_read(&xprt->xpt_ref) != 0)
 		pr_err("svcrdma: sc_xprt still in use? (%d)\n",
-		       atomic_read(&xprt->xpt_ref.refcount));
+		       kref_read(&xprt->xpt_ref));
 
 	while (!list_empty(&rdma->sc_read_complete_q)) {
 		struct svc_rdma_op_ctxt *ctxt;

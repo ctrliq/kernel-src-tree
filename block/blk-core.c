@@ -32,6 +32,7 @@
 #include <linux/delay.h>
 #include <linux/ratelimit.h>
 #include <linux/pm_runtime.h>
+#include <linux/debugfs.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/block.h>
@@ -39,6 +40,12 @@
 #include "blk.h"
 #include "blk-cgroup.h"
 #include "blk-mq.h"
+#include "blk-mq-tag.h"
+#include "blk-mq-sched.h"
+
+#ifdef CONFIG_DEBUG_FS
+struct dentry *blk_debugfs_root;
+#endif
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
@@ -108,6 +115,8 @@ void blk_rq_init(struct request_queue *q, struct request *rq)
 	rq->cmd = rq->__cmd;
 	rq->cmd_len = BLK_MAX_CDB;
 	rq->tag = -1;
+	if (q && q->mq_ops)
+		rq_aux(rq)->internal_tag = -1;
 	rq->start_time = jiffies;
 	set_start_time_ns(rq);
 	rq->part = NULL;
@@ -249,6 +258,7 @@ void blk_sync_queue(struct request_queue *q)
 		struct blk_mq_hw_ctx *hctx;
 		int i;
 
+		cancel_delayed_work_sync(&q->requeue_work);
 		queue_for_each_hw_ctx(q, hctx, i) {
 			cancel_delayed_work_sync(&hctx->run_work);
 			cancel_delayed_work_sync(&hctx->delay_work);
@@ -258,6 +268,36 @@ void blk_sync_queue(struct request_queue *q)
 	}
 }
 EXPORT_SYMBOL(blk_sync_queue);
+
+/**
+ * blk_set_preempt_only - set QUEUE_FLAG_PREEMPT_ONLY
+ * @q: request queue pointer
+ *
+ * Returns the previous value of the PREEMPT_ONLY flag - 0 if the flag was not
+ * set and 1 if the flag was already set.
+ */
+int blk_set_preempt_only(struct request_queue *q)
+{
+	unsigned long flags;
+	int res;
+
+	spin_lock_irqsave(q->queue_lock, flags);
+	res = queue_flag_test_and_set(QUEUE_FLAG_PREEMPT_ONLY, q);
+	spin_unlock_irqrestore(q->queue_lock, flags);
+
+	return res;
+}
+EXPORT_SYMBOL_GPL(blk_set_preempt_only);
+
+void blk_clear_preempt_only(struct request_queue *q)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(q->queue_lock, flags);
+	queue_flag_clear(QUEUE_FLAG_PREEMPT_ONLY, q);
+	spin_unlock_irqrestore(q->queue_lock, flags);
+}
+EXPORT_SYMBOL_GPL(blk_clear_preempt_only);
 
 /**
  * __blk_run_queue_uncond - run a queue whether or not it has been stopped
@@ -425,6 +465,13 @@ static void __blk_drain_queue(struct request_queue *q, bool drain_all)
 	}
 }
 
+void blk_drain_queue(struct request_queue *q)
+{
+	spin_lock_irq(q->queue_lock);
+	__blk_drain_queue(q, true);
+	spin_unlock_irq(q->queue_lock);
+}
+
 /**
  * blk_queue_bypass_start - enter queue bypass mode
  * @q: queue of interest
@@ -541,13 +588,7 @@ void blk_cleanup_queue(struct request_queue *q)
 	 * prevent that q->request_fn() gets invoked after draining finished.
 	 */
 	blk_freeze_queue(q);
-	if (!q->mq_ops) {
-		spin_lock_irq(lock);
-		__blk_drain_queue(q, true);
-	} else {
-		blk_mq_debugfs_unregister_mq(q);
-		spin_lock_irq(lock);
-	}
+	spin_lock_irq(lock);
 	queue_flag_set(QUEUE_FLAG_DEAD, q);
 	spin_unlock_irq(lock);
 
@@ -614,15 +655,38 @@ static void queue_limits_init_aux(struct request_queue *q, struct queue_limits_a
 	q->limits.limits_aux = limits_aux;
 }
 
-int blk_queue_enter(struct request_queue *q, bool nowait)
+/**
+ * blk_queue_enter() - try to increase q->q_usage_counter
+ * @q: request queue pointer
+ * @flags: BLK_MQ_REQ_NOWAIT and/or BLK_MQ_REQ_PREEMPT
+ */
+int blk_queue_enter(struct request_queue *q, unsigned int flags)
 {
+	const bool preempt = flags & BLK_MQ_REQ_PREEMPT;
+
 	while (true) {
+		bool success = false;
 		int ret;
 
-		if (percpu_ref_tryget_live(&q->q_usage_counter))
+		rcu_read_lock_sched();
+		if (percpu_ref_tryget_live(&q->q_usage_counter)) {
+			/*
+			 * The code that sets the PREEMPT_ONLY flag is
+			 * responsible for ensuring that that flag is globally
+			 * visible before the queue is unfrozen.
+			 */
+			if (preempt || !blk_queue_preempt_only(q)) {
+				success = true;
+			} else {
+				percpu_ref_put(&q->q_usage_counter);
+			}
+		}
+		rcu_read_unlock_sched();
+
+		if (success)
 			return 0;
 
-		if (nowait)
+		if (flags & BLK_MQ_REQ_NOWAIT)
 			return -EBUSY;
 
 		/*
@@ -635,13 +699,17 @@ int blk_queue_enter(struct request_queue *q, bool nowait)
 		smp_rmb();
 
 		ret = wait_event_interruptible(q->mq_freeze_wq,
-				!atomic_read(&q->mq_freeze_depth) ||
+				(atomic_read(&q->mq_freeze_depth) == 0 &&
+				 (preempt || !blk_queue_preempt_only(q))) ||
 				blk_queue_dying(q));
 		if (blk_queue_dying(q))
 			return -ENODEV;
 		if (ret)
 			return ret;
 	}
+
+	/* Make blk_queue_enter() reexamine the DYING flag. */
+	wake_up_all(&q->mq_freeze_wq);
 }
 
 void blk_queue_exit(struct request_queue *q)
@@ -678,6 +746,10 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	q->id = ida_simple_get(&blk_queue_ida, 0, 0, gfp_mask);
 	if (q->id < 0)
 		goto fail_q;
+
+	q->stats = blk_alloc_queue_stats();
+	if (!q->stats)
+		goto fail_stats;
 
 	q->backing_dev_info.ra_pages =
 			(VM_MAX_READAHEAD * 1024) / PAGE_CACHE_SIZE;
@@ -750,6 +822,8 @@ fail_ref:
 fail_bdi:
 	bdi_destroy(&q->backing_dev_info);
 fail_id:
+	blk_free_queue_stats(q->stats);
+fail_stats:
 	ida_simple_remove(&blk_queue_ida, q->id);
 fail_q:
 	kmem_cache_free(blk_requestq_cachep, q);
@@ -1020,22 +1094,6 @@ static bool blk_rq_should_init_elevator(struct bio *bio)
 }
 
 /**
- * rq_ioc - determine io_context for request allocation
- * @bio: request being allocated is for this bio (can be %NULL)
- *
- * Determine io_context to use for request allocation for @bio.  May return
- * %NULL if %current->io_context doesn't exist.
- */
-static struct io_context *rq_ioc(struct bio *bio)
-{
-#ifdef CONFIG_BLK_CGROUP
-	if (bio && bio->bi_ioc)
-		return bio->bi_ioc;
-#endif
-	return current->io_context;
-}
-
-/**
  * __get_request - get a free request
  * @rl: request list to allocate from
  * @rw_flags: RW and SYNC flags
@@ -1050,7 +1108,7 @@ static struct io_context *rq_ioc(struct bio *bio)
  * Returns request pointer on success, with @q->queue_lock *not held*.
  */
 static struct request *__get_request(struct request_list *rl, int rw_flags,
-				     struct bio *bio, gfp_t gfp_mask)
+				     struct bio *bio, unsigned int flags)
 {
 	struct request_queue *q = rl->q;
 	struct request *rq;
@@ -1059,6 +1117,7 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
 	struct io_cq *icq = NULL;
 	const bool is_sync = rw_is_sync(rw_flags) != 0;
 	int may_queue;
+	gfp_t gfp_mask = flags & BLK_MQ_REQ_NOWAIT ? GFP_ATOMIC : __GFP_WAIT;
 
 	if (unlikely(blk_queue_dying(q)))
 		return ERR_PTR(-ENODEV);
@@ -1139,6 +1198,8 @@ static struct request *__get_request(struct request_list *rl, int rw_flags,
 	blk_rq_init(q, rq);
 	blk_rq_set_rl(rq, rl);
 	rq->cmd_flags = rw_flags | REQ_ALLOCED;
+	if (flags & BLK_MQ_REQ_PREEMPT)
+		rq->cmd_flags |= REQ_PREEMPT;
 
 	/* init elvpriv */
 	if (rw_flags & REQ_ELVPRIV) {
@@ -1217,7 +1278,7 @@ rq_starved:
  * @q: request_queue to allocate request from
  * @rw_flags: RW and SYNC flags
  * @bio: bio to allocate request for (can be %NULL)
- * @gfp_mask: allocation mask
+ * @flags: BLQ_MQ_REQ_* flags.
  *
  * Get a free request from @q.  If %__GFP_WAIT is set in @gfp_mask, this
  * function keeps retrying under memory pressure and fails iff @q is dead.
@@ -1227,7 +1288,7 @@ rq_starved:
  * Returns request pointer on success, with @q->queue_lock *not held*.
  */
 static struct request *get_request(struct request_queue *q, int rw_flags,
-				   struct bio *bio, gfp_t gfp_mask)
+				   struct bio *bio, unsigned int flags)
 {
 	const bool is_sync = rw_is_sync(rw_flags) != 0;
 	DEFINE_WAIT(wait);
@@ -1236,11 +1297,11 @@ static struct request *get_request(struct request_queue *q, int rw_flags,
 
 	rl = blk_get_rl(q, bio);	/* transferred to @rq on success */
 retry:
-	rq = __get_request(rl, rw_flags, bio, gfp_mask);
+	rq = __get_request(rl, rw_flags, bio, flags);
 	if (!IS_ERR(rq))
 		return rq;
 
-	if (!(gfp_mask & __GFP_WAIT) || unlikely(blk_queue_dying(q))) {
+	if ((flags & BLK_MQ_REQ_NOWAIT) || unlikely(blk_queue_dying(q))) {
 		blk_put_rl(rl);
 		return rq;
 	}
@@ -1267,33 +1328,57 @@ retry:
 	goto retry;
 }
 
+/* flags: BLK_MQ_REQ_PREEMPT and/or BLK_MQ_REQ_NOWAIT. */
 static struct request *blk_old_get_request(struct request_queue *q, int rw,
-		gfp_t gfp_mask)
+					   unsigned int flags)
 {
 	struct request *rq;
+	gfp_t gfp_mask = flags & BLK_MQ_REQ_NOWAIT ? GFP_ATOMIC :
+			 __GFP_WAIT;
+	int ret = 0;
 
 	BUG_ON(rw != READ && rw != WRITE);
 
 	/* create ioc upfront */
 	create_io_context(gfp_mask, q->node);
 
+	ret = blk_queue_enter(q, flags);
+	if (ret)
+		return ERR_PTR(ret);
+
 	spin_lock_irq(q->queue_lock);
-	rq = get_request(q, rw, NULL, gfp_mask);
-	if (IS_ERR(rq))
+	rq = get_request(q, rw, NULL, flags);
+	if (IS_ERR(rq)) {
 		spin_unlock_irq(q->queue_lock);
+		blk_queue_exit(q);
 	/* q->queue_lock is unlocked at this point */
+	}
 
 	return rq;
 }
 
+/**
+ * blk_get_request_flags - allocate a request
+ * @q: request queue to allocate a request for
+ * @rw: operation (REQ_OP_*) and REQ_* flags, e.g. REQ_SYNC.
+ * @flags: BLK_MQ_REQ_* flags, e.g. BLK_MQ_REQ_NOWAIT.
+ */
+struct request *blk_get_request_flags(struct request_queue *q, unsigned int rw,
+				      unsigned int flags)
+{
+	WARN_ON_ONCE(flags & ~(BLK_MQ_REQ_NOWAIT | BLK_MQ_REQ_PREEMPT));
+
+	if (q->mq_ops)
+		return blk_mq_alloc_request(q, rw, flags);
+	else
+		return blk_old_get_request(q, rw, flags);
+}
+EXPORT_SYMBOL(blk_get_request_flags);
+
 struct request *blk_get_request(struct request_queue *q, int rw, gfp_t gfp_mask)
 {
-	if (q->mq_ops)
-		return blk_mq_alloc_request(q, rw,
-			(gfp_mask & __GFP_WAIT) ?
-				0 : BLK_MQ_REQ_NOWAIT);
-	else
-		return blk_old_get_request(q, rw, gfp_mask);
+	return blk_get_request_flags(q, rw, gfp_mask & __GFP_WAIT ?
+				     0 : BLK_MQ_REQ_NOWAIT);
 }
 EXPORT_SYMBOL(blk_get_request);
 
@@ -1385,7 +1470,7 @@ void blk_requeue_request(struct request_queue *q, struct request *rq)
 	blk_clear_rq_complete(rq);
 	trace_block_rq_requeue(q, rq);
 
-	if (blk_rq_tagged(rq))
+	if (rq->cmd_flags & REQ_QUEUED)
 		blk_queue_end_tag(q, rq);
 
 	BUG_ON(blk_queued_rq(rq));
@@ -1488,6 +1573,7 @@ void __blk_put_request(struct request_queue *q, struct request *req)
 		blk_free_request(rl, req);
 		freed_request(rl, flags);
 		blk_put_rl(rl);
+		blk_queue_exit(q);
 	}
 }
 EXPORT_SYMBOL_GPL(__blk_put_request);
@@ -1663,6 +1749,30 @@ out:
 	return ret;
 }
 
+unsigned int blk_plug_queued_count(struct request_queue *q)
+{
+	struct blk_plug *plug;
+	struct request *rq;
+	struct list_head *plug_list;
+	unsigned int ret = 0;
+
+	plug = current->plug;
+	if (!plug)
+		goto out;
+
+	if (q->mq_ops)
+		plug_list = &plug->mq_list;
+	else
+		plug_list = &plug->list;
+
+	list_for_each_entry(rq, plug_list, queuelist) {
+		if (rq->q == q)
+			ret++;
+	}
+out:
+	return ret;
+}
+
 void init_request_from_bio(struct request *req, struct bio *bio)
 {
 	req->cmd_type = REQ_TYPE_FS;
@@ -1682,7 +1792,7 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 	const bool sync = !!(bio->bi_rw & REQ_SYNC);
 	struct blk_plug *plug;
 	int el_ret, rw_flags, where = ELEVATOR_INSERT_SORT;
-	struct request *req;
+	struct request *req, *free;
 	unsigned int request_count = 0;
 
 	/*
@@ -1707,9 +1817,11 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 	 * Check if we can merge with the plugged list before grabbing
 	 * any locks.
 	 */
-	if (!blk_queue_nomerges(q) &&
-	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
-		return;
+	if (!blk_queue_nomerges(q)) {
+		if (blk_attempt_plug_merge(q, bio, &request_count, NULL))
+			return;
+	} else
+		request_count = blk_plug_queued_count(q);
 
 	spin_lock_irq(q->queue_lock);
 
@@ -1717,15 +1829,21 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 	if (el_ret == ELEVATOR_BACK_MERGE) {
 		if (bio_attempt_back_merge(q, req, bio)) {
 			elv_bio_merged(q, req, bio);
-			if (!attempt_back_merge(q, req))
+			free = attempt_back_merge(q, req);
+			if (!free)
 				elv_merged_request(q, req, el_ret);
+			else
+				__blk_put_request(q, free);
 			goto out_unlock;
 		}
 	} else if (el_ret == ELEVATOR_FRONT_MERGE) {
 		if (bio_attempt_front_merge(q, req, bio)) {
 			elv_bio_merged(q, req, bio);
-			if (!attempt_front_merge(q, req))
+			free = attempt_front_merge(q, req);
+			if (!free)
 				elv_merged_request(q, req, el_ret);
+			else
+				__blk_put_request(q, free);
 			goto out_unlock;
 		}
 	}
@@ -1744,8 +1862,10 @@ get_rq:
 	 * Grab a free request. This is might sleep but can not fail.
 	 * Returns with the queue unlocked.
 	 */
-	req = get_request(q, rw_flags, bio, GFP_NOIO);
+	blk_queue_enter_live(q);
+	req = get_request(q, rw_flags, bio, 0);
 	if (IS_ERR(req)) {
+		blk_queue_exit(q);
 		bio_endio(bio, PTR_ERR(req));	/* @q is dead */
 		goto out_unlock;
 	}
@@ -2052,7 +2172,7 @@ void generic_make_request(struct bio *bio)
 	do {
 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
 
-		if (likely(blk_queue_enter(q, false) == 0)) {
+		if (likely(blk_queue_enter(q, 0) == 0)) {
 			struct bio_list lower, same;
 
 			/* Create a fresh bio_list for all subordinate requests */
@@ -2193,7 +2313,12 @@ int blk_insert_cloned_request(struct request_queue *q, struct request *rq)
 	if (q->mq_ops) {
 		if (blk_queue_io_stat(q))
 			blk_account_io_start(rq, true);
-		blk_mq_insert_request(rq, false, true, false);
+		/*
+		 * Since we have a scheduler attached on the top device,
+		 * bypass a potential scheduler on the bottom device for
+		 * insert.
+		 */
+		blk_mq_request_bypass_insert(rq, true);
 		return 0;
 	}
 
@@ -2506,6 +2631,14 @@ void blk_start_request(struct request *req)
 {
 	blk_dequeue_request(req);
 
+	/* blk-stat isn't used on non-mq now, so disable it until it is needed */
+#if 0
+	if (test_bit(QUEUE_FLAG_STATS, &req->q->queue_flags)) {
+		blk_stat_set_issue_time(&req->issue_stat);
+		req->cmd_flags |= REQ_STATS;
+	}
+#endif
+
 	/*
 	 * We are now handing the request to the hardware, initialize
 	 * resid_len to full count and add the timeout handler.
@@ -2723,8 +2856,13 @@ EXPORT_SYMBOL_GPL(blk_unprep_request);
  */
 void blk_finish_request(struct request *req, int error)
 {
-	if (blk_rq_tagged(req))
-		blk_queue_end_tag(req->q, req);
+	struct request_queue *q = req->q;
+
+	if (req->cmd_flags & REQ_STATS)
+		blk_stat_add(req);
+
+	if (req->cmd_flags & REQ_QUEUED)
+		blk_queue_end_tag(q, req);
 
 	BUG_ON(blk_queued_rq(req));
 
@@ -2744,7 +2882,7 @@ void blk_finish_request(struct request *req, int error)
 		if (blk_bidi_rq(req))
 			__blk_put_request(req->next_rq->q, req->next_rq);
 
-		__blk_put_request(req->q, req);
+		__blk_put_request(q, req);
 	}
 }
 EXPORT_SYMBOL(blk_finish_request);
@@ -3496,6 +3634,10 @@ int __init blk_dev_init(void)
 	blk_requestq_cachep = kmem_cache_create("blkdev_queue",
 						sizeof(struct request_queue) + sizeof(struct queue_limits_aux), 
 						0, SLAB_PANIC, NULL);
+
+#ifdef CONFIG_DEBUG_FS
+	blk_debugfs_root = debugfs_create_dir("block", NULL);
+#endif
 
 	return 0;
 }

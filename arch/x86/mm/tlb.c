@@ -4,7 +4,7 @@
 #include <linux/spinlock.h>
 #include <linux/smp.h>
 #include <linux/interrupt.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/cpu.h>
 
 #include <asm/tlbflush.h>
@@ -141,19 +141,6 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 		return;
 	}
 	smp_call_function_many(cpumask, flush_tlb_func, &info, 1);
-}
-
-void flush_tlb_current_task(void)
-{
-	struct mm_struct *mm = current->mm;
-
-	preempt_disable();
-
-	/* This is an implicit full barrier that synchronizes with switch_mm. */
-	local_flush_tlb();
-	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
-		flush_tlb_others(mm_cpumask(mm), mm, 0UL, TLB_FLUSH_ALL);
-	preempt_enable();
 }
 
 void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,

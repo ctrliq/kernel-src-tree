@@ -17,9 +17,10 @@
 #include <linux/skbuff.h>
 #include <net/pkt_sched.h>
 
-static int blackhole_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+static int blackhole_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+			     struct sk_buff **to_free)
 {
-	qdisc_drop(skb, sch);
+	qdisc_drop(skb, sch, to_free);
 	return NET_XMIT_SUCCESS;
 }
 
@@ -41,4 +42,4 @@ static int __init blackhole_init(void)
 {
 	return register_qdisc(&blackhole_qdisc_ops);
 }
-device_initcall(blackhole_init)
+device_initcall(blackhole_init);

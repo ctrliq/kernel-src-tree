@@ -30,6 +30,7 @@ extern void apic_timer_interrupt(void);
 extern void x86_platform_ipi(void);
 extern void kvm_posted_intr_ipi(void);
 extern void kvm_posted_intr_wakeup_ipi(void);
+extern void kvm_posted_intr_nested_ipi(void);
 extern void error_interrupt(void);
 extern void irq_work_interrupt(void);
 
@@ -96,6 +97,7 @@ extern void trace_call_function_single_interrupt(void);
 #define trace_reboot_interrupt  reboot_interrupt
 #define trace_kvm_posted_intr_ipi kvm_posted_intr_ipi
 #define trace_kvm_posted_intr_wakeup_ipi kvm_posted_intr_wakeup_ipi
+#define trace_kvm_posted_intr_nested_ipi kvm_posted_intr_nested_ipi
 #endif /* CONFIG_TRACING */
 
 /* IOAPIC */
@@ -142,6 +144,7 @@ struct irq_2_iommu {
 struct irq_2_irte {
 	u16 devid; /* Device ID for IRTE table */
 	u16 index; /* Index into IRTE table*/
+	struct amd_ir_data *ir_data;
 };
 
 /*

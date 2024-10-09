@@ -14,6 +14,7 @@
 struct super_block;
 struct file_system_type;
 struct iomap;
+struct iomap_ops;
 struct linux_binprm;
 struct path;
 struct mount;
@@ -62,7 +63,7 @@ extern int vfs_path_lookup(struct dentry *, struct vfsmount *,
 extern void *copy_mount_options(const void __user *);
 extern char *copy_mount_string(const void __user *);
 
-extern struct vfsmount *lookup_mnt(struct path *);
+extern struct vfsmount *lookup_mnt(const struct path *);
 extern int finish_automount(struct vfsmount *, struct path *);
 
 extern int sb_prepare_remount_readonly(struct super_block *);
@@ -101,11 +102,12 @@ struct open_flags {
 	umode_t mode;
 	int acc_mode;
 	int intent;
+	int lookup_flags;
 };
 extern struct file *do_filp_open(int dfd, struct filename *pathname,
-		const struct open_flags *op, int flags);
+		const struct open_flags *op);
 extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
-		const char *, const struct open_flags *, int lookup_flags);
+		const char *, const struct open_flags *);
 
 extern long do_handle_open(int mountdirfd,
 			   struct file_handle __user *ufh, int open_flag);
@@ -114,7 +116,6 @@ extern int open_check_o_direct(struct file *f);
 /*
  * inode.c
  */
-extern spinlock_t inode_sb_list_lock;
 extern void inode_add_lru(struct inode *inode);
 
 extern bool __atime_needs_update(const struct path *, struct inode *, bool);
@@ -129,7 +130,7 @@ extern bool atime_needs_update_rcu(const struct path *, struct inode *);
 /*
  * fs-writeback.c
  */
-extern void inode_wb_list_del(struct inode *inode);
+extern void inode_io_list_del(struct inode *inode);
 
 extern int get_nr_dirty_inodes(void);
 extern void evict_inodes(struct super_block *);
@@ -149,6 +150,16 @@ extern int d_set_mounted(struct dentry *dentry);
  * pipe.c
  */
 extern const struct file_operations pipefifo_fops;
+
+/*
+ * iomap support:
+ */
+typedef loff_t (*iomap_actor_t)(struct inode *inode, loff_t pos, loff_t len,
+		void *data, struct iomap *iomap);
+
+loff_t iomap_apply(struct inode *inode, loff_t pos, loff_t length,
+		unsigned flags, const struct iomap_ops *ops, void *data,
+		iomap_actor_t actor);
 
 /*
  * fs_pin.c

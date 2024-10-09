@@ -20,6 +20,7 @@
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/exportfs.h>
+#include <linux/pid_namespace.h>
 
 MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Filesystem in Userspace");
@@ -588,6 +589,7 @@ void fuse_conn_init(struct fuse_conn *fc)
 	fc->initialized = 0;
 	fc->attr_version = 1;
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
+	fc->pid_ns = get_pid_ns(task_active_pid_ns(current));
 }
 EXPORT_SYMBOL_GPL(fuse_conn_init);
 
@@ -597,6 +599,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 		if (fc->destroy_req)
 			fuse_request_free(fc->destroy_req);
 		mutex_destroy(&fc->inst_mutex);
+		put_pid_ns(fc->pid_ns);
 		fc->release(fc);
 	}
 }
@@ -1228,7 +1231,6 @@ static void fuse_fs_cleanup(void)
 }
 
 static struct kobject *fuse_kobj;
-static struct kobject *connections_kobj;
 
 static int fuse_sysfs_init(void)
 {
@@ -1240,11 +1242,9 @@ static int fuse_sysfs_init(void)
 		goto out_err;
 	}
 
-	connections_kobj = kobject_create_and_add("connections", fuse_kobj);
-	if (!connections_kobj) {
-		err = -ENOMEM;
+	err = sysfs_create_mount_point(fuse_kobj, "connections");
+	if (err)
 		goto out_fuse_unregister;
-	}
 
 	return 0;
 
@@ -1256,7 +1256,7 @@ static int fuse_sysfs_init(void)
 
 static void fuse_sysfs_cleanup(void)
 {
-	kobject_put(connections_kobj);
+	sysfs_remove_mount_point(fuse_kobj, "connections");
 	kobject_put(fuse_kobj);
 }
 

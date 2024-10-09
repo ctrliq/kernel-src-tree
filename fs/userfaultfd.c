@@ -180,7 +180,8 @@ static inline void msg_init(struct uffd_msg *msg)
 
 static inline struct uffd_msg userfault_msg(unsigned long address,
 					    unsigned int flags,
-					    unsigned long reason)
+					    unsigned long reason,
+					    unsigned int features)
 {
 	struct uffd_msg msg;
 	msg_init(&msg);
@@ -204,6 +205,8 @@ static inline struct uffd_msg userfault_msg(unsigned long address,
 		 * write protect fault.
 		 */
 		msg.arg.pagefault.flags |= UFFD_PAGEFAULT_FLAG_WP;
+	if (features & UFFD_FEATURE_THREAD_ID)
+		msg.arg.pagefault.feat.ptid = task_pid_vnr(current);
 	return msg;
 }
 
@@ -326,10 +329,11 @@ out:
  * fatal_signal_pending()s, and the mmap_sem must be released before
  * returning it.
  */
-int handle_userfault(struct vm_area_struct *vma, unsigned long address,
-		     unsigned int flags, unsigned long reason)
+int handle_userfault(struct vm_fault *vmf, unsigned long reason)
 {
+	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = (unsigned long)vmf->virtual_address;
 	struct userfaultfd_ctx *ctx;
 	struct userfaultfd_wait_queue uwq;
 	int ret;
@@ -406,17 +410,18 @@ int handle_userfault(struct vm_area_struct *vma, unsigned long address,
 	 * without first stopping userland access to the memory. For
 	 * VM_UFFD_MISSING userfaults this is enough for now.
 	 */
-	if (unlikely(!(flags & FAULT_FLAG_ALLOW_RETRY))) {
+	if (unlikely(!(vmf->flags & FAULT_FLAG_ALLOW_RETRY))) {
 		/*
 		 * Validate the invariant that nowait must allow retry
 		 * to be sure not to return SIGBUS erroneously on
 		 * nowait invocations.
 		 */
-		BUG_ON(flags & FAULT_FLAG_RETRY_NOWAIT);
+		BUG_ON(vmf->flags & FAULT_FLAG_RETRY_NOWAIT);
 #ifdef CONFIG_DEBUG_VM
 		if (printk_ratelimit()) {
 			printk(KERN_WARNING
-			       "FAULT_FLAG_ALLOW_RETRY missing %x\n", flags);
+			       "FAULT_FLAG_ALLOW_RETRY missing %x\n",
+			       vmf->flags);
 			dump_stack();
 		}
 #endif
@@ -428,7 +433,7 @@ int handle_userfault(struct vm_area_struct *vma, unsigned long address,
 	 * and wait.
 	 */
 	ret = VM_FAULT_RETRY;
-	if (flags & FAULT_FLAG_RETRY_NOWAIT)
+	if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 		goto out;
 
 	/* take the reference before dropping the mmap_sem */
@@ -436,11 +441,13 @@ int handle_userfault(struct vm_area_struct *vma, unsigned long address,
 
 	init_waitqueue_func_entry(&uwq.wq, userfaultfd_wake_function);
 	uwq.wq.private = current;
-	uwq.msg = userfault_msg(address, flags, reason);
+	uwq.msg = userfault_msg(address, vmf->flags, reason,
+			ctx->features);
 	uwq.ctx = ctx;
 	uwq.waken = false;
 
-	return_to_userland = (flags & (FAULT_FLAG_USER|FAULT_FLAG_KILLABLE)) ==
+	return_to_userland =
+		(vmf->flags & (FAULT_FLAG_USER|FAULT_FLAG_KILLABLE)) ==
 		(FAULT_FLAG_USER|FAULT_FLAG_KILLABLE);
 	blocking_state = return_to_userland ? TASK_INTERRUPTIBLE :
 			 TASK_KILLABLE;
@@ -460,11 +467,11 @@ int handle_userfault(struct vm_area_struct *vma, unsigned long address,
 	spin_unlock(&ctx->fault_pending_wqh.lock);
 
 	if (!is_vm_hugetlb_page(vma))
-		must_wait = userfaultfd_must_wait(ctx, address, flags,
+		must_wait = userfaultfd_must_wait(ctx, address, vmf->flags,
 						  reason);
 	else
 		must_wait = userfaultfd_huge_must_wait(ctx, address,
-						       flags, reason);
+						       vmf->flags, reason);
 	up_read(&mm->mmap_sem);
 
 	if (likely(must_wait && !ACCESS_ONCE(ctx->released) &&
@@ -581,6 +588,12 @@ static void userfaultfd_event_wait_completion(struct userfaultfd_ctx *ctx,
 			break;
 		if (ACCESS_ONCE(ctx->released) ||
 		    fatal_signal_pending(current)) {
+			/*
+			 * &ewq->wq may be queued in fork_event, but
+			 * __remove_wait_queue ignores the head
+			 * parameter. It would be a problem if it
+			 * didn't.
+			 */
 			__remove_wait_queue(&ctx->event_wqh, &ewq->wq);
 			if (ewq->msg.event == UFFD_EVENT_FORK) {
 				struct userfaultfd_ctx *new;
@@ -1067,6 +1080,12 @@ static ssize_t userfaultfd_ctx_read(struct userfaultfd_ctx *ctx, int no_wait,
 					(unsigned long)
 					uwq->msg.arg.reserved.reserved1;
 				list_move(&uwq->wq.task_list, &fork_event);
+				/*
+				 * fork_nctx can be freed as soon as
+				 * we drop the lock, unless we take a
+				 * reference on it.
+				 */
+				userfaultfd_ctx_get(fork_nctx);
 				spin_unlock(&ctx->event_wqh.lock);
 				ret = 0;
 				break;
@@ -1097,19 +1116,53 @@ static ssize_t userfaultfd_ctx_read(struct userfaultfd_ctx *ctx, int no_wait,
 
 	if (!ret && msg->event == UFFD_EVENT_FORK) {
 		ret = resolve_userfault_fork(ctx, fork_nctx, msg);
+		spin_lock(&ctx->event_wqh.lock);
+		if (!list_empty(&fork_event)) {
+			/*
+			 * The fork thread didn't abort, so we can
+			 * drop the temporary refcount.
+			 */
+			userfaultfd_ctx_put(fork_nctx);
 
-		if (!ret) {
-			spin_lock(&ctx->event_wqh.lock);
-			if (!list_empty(&fork_event)) {
-				uwq = list_first_entry(&fork_event,
-						       typeof(*uwq),
-						       wq.task_list);
-				list_del(&uwq->wq.task_list);
-				__add_wait_queue(&ctx->event_wqh, &uwq->wq);
+			uwq = list_first_entry(&fork_event,
+					       typeof(*uwq),
+					       wq.task_list);
+			/*
+			 * If fork_event list wasn't empty and in turn
+			 * the event wasn't already released by fork
+			 * (the event is allocated on fork kernel
+			 * stack), put the event back to its place in
+			 * the event_wq. fork_event head will be freed
+			 * as soon as we return so the event cannot
+			 * stay queued there no matter the current
+			 * "ret" value.
+			 */
+			list_del(&uwq->wq.task_list);
+			__add_wait_queue(&ctx->event_wqh, &uwq->wq);
+
+			/*
+			 * Leave the event in the waitqueue and report
+			 * error to userland if we failed to resolve
+			 * the userfault fork.
+			 */
+			if (likely(!ret))
 				userfaultfd_event_complete(ctx, uwq);
-			}
-			spin_unlock(&ctx->event_wqh.lock);
+		} else {
+			/*
+			 * Here the fork thread aborted and the
+			 * refcount from the fork thread on fork_nctx
+			 * has already been released. We still hold
+			 * the reference we took before releasing the
+			 * lock above. If resolve_userfault_fork
+			 * failed we've to drop it because the
+			 * fork_nctx has to be freed in such case. If
+			 * it succeeded we'll hold it because the new
+			 * uffd references it.
+			 */
+			if (ret)
+				userfaultfd_ctx_put(fork_nctx);
 		}
+		spin_unlock(&ctx->event_wqh.lock);
 	}
 
 	return ret;

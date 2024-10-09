@@ -222,10 +222,10 @@ static int __init xen_guest_init(void)
 	}
 	if (of_address_to_resource(node, GRANT_TABLE_PHYSADDR, &res))
 		return 0;
-	xen_hvm_resume_frames = res.start;
+	xen_hvm_resume_frames = res.start >> PAGE_SHIFT;
 	xen_events_irq = irq_of_parse_and_map(node, 0);
 	pr_info("Xen %s support found, events_irq=%d gnttab_frame_pfn=%lx\n",
-			version, xen_events_irq, (xen_hvm_resume_frames >> PAGE_SHIFT));
+			version, xen_events_irq, xen_hvm_resume_frames);
 	xen_domain_type = XEN_HVM_DOMAIN;
 
 	xen_setup_features();

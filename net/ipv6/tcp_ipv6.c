@@ -500,8 +500,8 @@ static int tcp_v6_send_synack(struct sock *sk, struct dst_entry *dst,
 		fl6->daddr = ireq->ir_v6_rmt_addr;
 		skb_set_queue_mapping(skb, queue_mapping);
 		rcu_read_lock();
-		err = ip6_xmit(sk, skb, fl6, rcu_dereference(np->opt),
-			       np->tclass);
+		err = ip6_xmit(sk, skb, fl6, sk->sk_mark,
+			       rcu_dereference(np->opt), np->tclass);
 		rcu_read_unlock();
 		err = net_xmit_eval(err);
 	}
@@ -816,7 +816,7 @@ static void tcp_v6_send_response(struct sock *sk, struct sk_buff *skb, u32 seq,
 
 	skb_reserve(buff, MAX_HEADER + sizeof(struct ipv6hdr) + tot_len);
 
-	t1 = (struct tcphdr *) skb_push(buff, tot_len);
+	t1 = skb_push(buff, tot_len);
 	skb_reset_transport_header(buff);
 
 	/* Swap the send and the receive. */
@@ -864,6 +864,7 @@ static void tcp_v6_send_response(struct sock *sk, struct sk_buff *skb, u32 seq,
 		fl6.flowi6_oif = inet6_iif(skb);
 	else
 		fl6.flowi6_oif = oif;
+	fl6.flowi6_mark = IP6_REPLY_MARK(net, skb->mark);
 	fl6.fl6_dport = t1->dest;
 	fl6.fl6_sport = t1->source;
 	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
@@ -875,8 +876,7 @@ static void tcp_v6_send_response(struct sock *sk, struct sk_buff *skb, u32 seq,
 	dst = ip6_dst_lookup_flow(ctl_sk, &fl6, NULL);
 	if (!IS_ERR(dst)) {
 		skb_dst_set(buff, dst);
-		ctl_sk->sk_mark = fl6.flowi6_mark;
-		ip6_xmit(ctl_sk, buff, &fl6, NULL, tclass);
+		ip6_xmit(ctl_sk, buff, &fl6, fl6.flowi6_mark, NULL, tclass);
 		TCP_INC_STATS_BH(net, TCP_MIB_OUTSEGS);
 		if (rst)
 			TCP_INC_STATS_BH(net, TCP_MIB_OUTRSTS);

@@ -208,7 +208,6 @@ struct srpt_send_ioctx {
 	enum srpt_command_state	state;
 	struct se_cmd		cmd;
 	struct completion	tx_done;
-	u64			tag;
 	u8			n_rdma;
 	u8			n_rw_ctx;
 	bool			queue_status_only;
@@ -326,11 +325,9 @@ struct srpt_port {
 	u32			sm_lid;
 	u32			lid;
 	union ib_gid		gid;
-	spinlock_t		port_acl_lock;
 	struct work_struct	work;
 	struct se_portal_group	port_tpg_1;
 	struct se_wwn		port_wwn;
-	struct list_head	port_acl_list;
 	struct srpt_port_attrib port_attrib;
 };
 
@@ -367,34 +364,10 @@ struct srpt_device {
 
 /**
  * struct srpt_node_acl - Per-initiator ACL data (managed via configfs).
- * @i_port_id: 128-bit SRP initiator port ID.
- * @sport:     port information.
  * @nacl:      Target core node ACL information.
- * @list:      Element of the per-HCA ACL list.
  */
 struct srpt_node_acl {
-	u8			i_port_id[16];
-	struct srpt_port	*sport;
 	struct se_node_acl	nacl;
-	struct list_head	list;
-};
-
-/*
- * SRP-releated SCSI persistent reservation definitions.
- *
- * See also SPC4r28, section 7.6.1 (Protocol specific parameters introduction).
- * See also SPC4r28, section 7.6.4.5 (TransportID for initiator ports using
- * SCSI over an RDMA interface).
- */
-
-enum {
-	SCSI_TRANSPORTID_PROTOCOLID_SRP	= 4,
-};
-
-struct spc_rdma_transport_id {
-	uint8_t protocol_identifier;
-	uint8_t reserved[7];
-	uint8_t i_port_id[16];
 };
 
 #endif				/* IB_SRPT_H */

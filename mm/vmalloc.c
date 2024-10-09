@@ -1538,7 +1538,7 @@ void vfree(const void *addr)
 	if (!addr)
 		return;
 	if (unlikely(in_interrupt())) {
-		struct vfree_deferred *p = &__get_cpu_var(vfree_deferred);
+		struct vfree_deferred *p = this_cpu_ptr(&vfree_deferred);
 		llist_add((struct llist_node *)addr, &p->list);
 		schedule_work(&p->wq);
 	} else
@@ -1598,9 +1598,6 @@ void *vmap(struct page **pages, unsigned int count,
 }
 EXPORT_SYMBOL(vmap);
 
-static void *__vmalloc_node(unsigned long size, unsigned long align,
-			    gfp_t gfp_mask, pgprot_t prot,
-			    int node, const void *caller);
 static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 				 pgprot_t prot, int node, const void *caller)
 {
@@ -1729,8 +1726,15 @@ fail:
  *	Allocate enough pages to cover @size from the page level
  *	allocator with @gfp_mask flags.  Map them into contiguous
  *	kernel virtual space, using a pagetable protection of @prot.
+ *
+ *	Reclaim modifiers in @gfp_mask - __GFP_NORETRY, __GFP_REPEAT
+ *	and __GFP_NOFAIL are not supported
+ *
+ *	Any use of gfp flags outside of GFP_KERNEL should be consulted
+ *	with mm people.
+ *
  */
-static void *__vmalloc_node(unsigned long size, unsigned long align,
+void *__vmalloc_node(unsigned long size, unsigned long align,
 			    gfp_t gfp_mask, pgprot_t prot,
 			    int node, const void *caller)
 {
@@ -1744,13 +1748,6 @@ void *__vmalloc(unsigned long size, gfp_t gfp_mask, pgprot_t prot)
 				__builtin_return_address(0));
 }
 EXPORT_SYMBOL(__vmalloc);
-
-static inline void *__vmalloc_node_flags(unsigned long size,
-					int node, gfp_t flags)
-{
-	return __vmalloc_node(size, 1, flags, PAGE_KERNEL,
-					node, __builtin_return_address(0));
-}
 
 /**
  *	vmalloc  -  allocate virtually contiguous memory

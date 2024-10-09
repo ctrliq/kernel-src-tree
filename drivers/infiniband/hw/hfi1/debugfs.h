@@ -59,7 +59,7 @@ void hfi1_dbg_exit(void);
 struct fault_opcode {
 	struct fault_attr attr;
 	struct dentry *dir;
-	bool fault_by_opcode;
+	u32 fault_by_opcode;
 	u64 n_rxfaults[256];
 	u64 n_txfaults[256];
 	u8 opcode;
@@ -69,28 +69,28 @@ struct fault_opcode {
 struct fault_packet {
 	struct fault_attr attr;
 	struct dentry *dir;
-	bool fault_by_packet;
+	u32 fault_by_packet;
 	u64 n_faults;
 };
 
-bool hfi1_dbg_fault_opcode(struct rvt_qp *qp, u32 opcode, bool rx);
-bool hfi1_dbg_fault_packet(struct hfi1_packet *packet);
-bool hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd);
+u32 hfi1_dbg_fault_opcode(struct rvt_qp *qp, u32 opcode, u32 rx);
+u32 hfi1_dbg_fault_packet(struct hfi1_packet *packet);
+u32 hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd);
 #else
-static inline bool hfi1_dbg_fault_packet(struct hfi1_packet *packet)
+static inline u32 hfi1_dbg_fault_packet(struct hfi1_packet *packet)
 {
-	return false;
+	return 0;
 }
 
-static inline bool hfi1_dbg_fault_opcode(struct rvt_qp *qp,
-					 u32 opcode, bool rx)
+static inline u32 hfi1_dbg_fault_opcode(struct rvt_qp *qp,
+					 u32 opcode, u32 rx)
 {
-	return false;
+	return 0;
 }
 
-static inline bool hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd)
+static inline u32 hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd)
 {
-	return false;
+	return 0;
 }
 #endif
 
@@ -111,20 +111,20 @@ static inline void hfi1_dbg_exit(void)
 {
 }
 
-static inline bool hfi1_dbg_fault_packet(struct hfi1_packet *packet)
+static inline u32 hfi1_dbg_fault_packet(struct hfi1_packet *packet)
 {
-	return false;
+	return 0;
 }
 
-static inline bool hfi1_dbg_fault_opcode(struct rvt_qp *qp,
-					 u32 opcode, bool rx)
+static inline u32 hfi1_dbg_fault_opcode(struct rvt_qp *qp,
+					 u32 opcode, u32 rx)
 {
-	return false;
+	return 0;
 }
 
-static inline bool hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd)
+static inline u32 hfi1_dbg_fault_suppress_err(struct hfi1_ibdev *ibd)
 {
-	return false;
+	return 0;
 }
 #endif
 

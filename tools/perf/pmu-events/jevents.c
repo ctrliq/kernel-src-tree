@@ -330,7 +330,8 @@ static void print_events_table_prefix(FILE *fp, const char *tblname)
 static int print_events_table_entry(void *data, char *name, char *event,
 				    char *desc, char *long_desc,
 				    char *pmu, char *unit, char *perpkg,
-				    char *metric_expr)
+				    char *metric_expr,
+				    char *metric_name)
 {
 	struct perf_entry_data *pd = data;
 	FILE *outfp = pd->outfp;
@@ -356,6 +357,8 @@ static int print_events_table_entry(void *data, char *name, char *event,
 		fprintf(outfp, "\t.perpkg = \"%s\",\n", perpkg);
 	if (metric_expr)
 		fprintf(outfp, "\t.metric_expr = \"%s\",\n", metric_expr);
+	if (metric_name)
+		fprintf(outfp, "\t.metric_name = \"%s\",\n", metric_name);
 	fprintf(outfp, "},\n");
 
 	return 0;
@@ -404,7 +407,8 @@ int json_events(const char *fn,
 	  int (*func)(void *data, char *name, char *event, char *desc,
 		      char *long_desc,
 		      char *pmu, char *unit, char *perpkg,
-		      char *metric_expr),
+		      char *metric_expr,
+		      char *metric_name),
 	  void *data)
 {
 	int err = -EIO;
@@ -431,6 +435,7 @@ int json_events(const char *fn,
 		char *perpkg = NULL;
 		char *unit = NULL;
 		char *metric_expr = NULL;
+		char *metric_name = NULL;
 		unsigned long long eventcode = 0;
 		struct msrmap *msr = NULL;
 		jsmntok_t *msrval = NULL;
@@ -508,6 +513,8 @@ int json_events(const char *fn,
 				addfield(map, &unit, "", "", val);
 			} else if (json_streq(map, field, "PerPkg")) {
 				addfield(map, &perpkg, "", "", val);
+			} else if (json_streq(map, field, "MetricName")) {
+				addfield(map, &metric_name, "", "", val);
 			} else if (json_streq(map, field, "MetricExpr")) {
 				addfield(map, &metric_expr, "", "", val);
 				for (s = metric_expr; *s; s++)
@@ -536,7 +543,7 @@ int json_events(const char *fn,
 		fixname(name);
 
 		err = func(data, name, real_event(name, event), desc, long_desc,
-				pmu, unit, perpkg, metric_expr);
+				pmu, unit, perpkg, metric_expr, metric_name);
 		free(event);
 		free(desc);
 		free(name);
@@ -547,6 +554,7 @@ int json_events(const char *fn,
 		free(perpkg);
 		free(unit);
 		free(metric_expr);
+		free(metric_name);
 		if (err)
 			break;
 		tok += j;

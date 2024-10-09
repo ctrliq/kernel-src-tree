@@ -18,6 +18,12 @@
 #define DRV_VER_MIN	8
 #define DRV_VER_UPD	0
 
+#include <linux/interrupt.h>
+#include <linux/rhashtable.h>
+#include <net/devlink.h>
+#include <net/dst_metadata.h>
+#include <net/switchdev.h>
+
 struct tx_bd {
 	__le32 tx_bd_len_flags_type;
 	#define TX_BD_TYPE					(0x3f << 0)
@@ -240,6 +246,10 @@ struct rx_cmp_ext {
 	    ((le32_to_cpu((rxcmp1)->rx_cmp_flags2) &			\
 	     RX_CMP_FLAGS2_T_L4_CS_CALC) >> 3)
 
+#define RX_CMP_CFA_CODE(rxcmpl1)					\
+	((le32_to_cpu((rxcmpl1)->rx_cmp_cfa_code_errors_v2) &		\
+	  RX_CMPL_CFA_CODE_MASK) >> RX_CMPL_CFA_CODE_SFT)
+
 struct rx_agg_cmp {
 	__le32 rx_agg_cmp_len_flags_type;
 	#define RX_AGG_CMP_TYPE					(0x3f << 0)
@@ -308,6 +318,10 @@ struct rx_tpa_start_cmp_ext {
 	 #define RX_TPA_START_CMPL_CFA_CODE_SHIFT		 16
 	__le32 rx_tpa_start_cmp_hdr_info;
 };
+
+#define TPA_START_CFA_CODE(rx_tpa_start)				\
+	((le32_to_cpu((rx_tpa_start)->rx_tpa_start_cmp_cfa_code_v2) &	\
+	 RX_TPA_START_CMP_CFA_CODE) >> RX_TPA_START_CMPL_CFA_CODE_SHIFT)
 
 struct rx_tpa_end_cmp {
 	__le32 rx_tpa_end_cmp_len_flags_type;
@@ -421,9 +435,12 @@ struct rx_tpa_end_cmp_ext {
 
 #define BNXT_RX_PAGE_SIZE (1 << BNXT_RX_PAGE_SHIFT)
 
-#define BNXT_MIN_PKT_SIZE	52
+#define BNXT_MAX_MTU		9500
+#define BNXT_MAX_PAGE_MODE_MTU	\
+	((unsigned int)PAGE_SIZE - VLAN_ETH_HLEN - NET_IP_ALIGN -	\
+	 XDP_PACKET_HEADROOM)
 
-#define BNXT_NUM_TESTS(bp)	0
+#define BNXT_MIN_PKT_SIZE	52
 
 #define BNXT_DEFAULT_RX_RING_SIZE	511
 #define BNXT_DEFAULT_TX_RING_SIZE	511
@@ -499,6 +516,7 @@ struct rx_tpa_end_cmp_ext {
 #define NEXT_CMP(idx)		RING_CMP(ADV_RAW_CMP(idx, 1))
 
 #define BNXT_HWRM_MAX_REQ_LEN		(bp->hwrm_max_req_len)
+#define BNXT_HWRM_SHORT_REQ_LEN		sizeof(struct hwrm_short_input)
 #define DFLT_HWRM_CMD_TIMEOUT		500
 #define HWRM_CMD_TIMEOUT		(bp->hwrm_cmd_timeout)
 #define HWRM_RESET_TIMEOUT		((HWRM_CMD_TIMEOUT) * 4)
@@ -514,13 +532,17 @@ struct rx_tpa_end_cmp_ext {
 
 #define BNXT_RX_EVENT	1
 #define BNXT_AGG_EVENT	2
+#define BNXT_TX_EVENT	4
 
 struct bnxt_sw_tx_bd {
 	struct sk_buff		*skb;
 	DEFINE_DMA_UNMAP_ADDR(mapping);
 	u8			is_gso;
 	u8			is_push;
-	unsigned short		nr_frags;
+	union {
+		unsigned short		nr_frags;
+		u16			rx_prod;
+	};
 };
 
 struct bnxt_sw_rx_bd {
@@ -608,6 +630,8 @@ struct bnxt_tpa_info {
 
 #define BNXT_TPA_OUTER_L3_OFF(hdr_info)	\
 	((hdr_info) & 0x1ff)
+
+	u16			cfa_code; /* cfa_code in TPA start compl */
 };
 
 struct bnxt_rx_ring_info {
@@ -618,6 +642,8 @@ struct bnxt_rx_ring_info {
 	u16			rx_next_cons;
 	void __iomem		*rx_doorbell;
 	void __iomem		*rx_agg_doorbell;
+
+	struct bpf_prog		*xdp_prog;
 
 	struct rx_bd		*rx_desc_ring[MAX_RX_PAGES];
 	struct bnxt_sw_rx_bd	*rx_buf_ring;
@@ -664,6 +690,11 @@ struct bnxt_napi {
 	struct bnxt_cp_ring_info	cp_ring;
 	struct bnxt_rx_ring_info	*rx_ring;
 	struct bnxt_tx_ring_info	*tx_ring;
+
+	void			(*tx_int)(struct bnxt *, struct bnxt_napi *,
+					  int);
+	u32			flags;
+#define BNXT_NAPI_FLAG_XDP	0x1
 
 	bool			in_reset;
 };
@@ -901,9 +932,89 @@ struct bnxt_led_info {
 	__le16	led_color_caps;
 };
 
+#define BNXT_MAX_TEST	8
+
+struct bnxt_test_info {
+	u8 offline_mask;
+	u16 timeout;
+	char string[BNXT_MAX_TEST][ETH_GSTRING_LEN];
+};
+
 #define BNXT_GRCPF_REG_WINDOW_BASE_OUT	0x400
 #define BNXT_CAG_REG_LEGACY_INT_STATUS	0x4014
 #define BNXT_CAG_REG_BASE		0x300000
+
+struct bnxt_coal {
+	u16			coal_ticks;
+	u16			coal_ticks_irq;
+	u16			coal_bufs;
+	u16			coal_bufs_irq;
+			/* RING_IDLE enabled when coal ticks < idle_thresh  */
+	u16			idle_thresh;
+	u8			bufs_per_record;
+	u8			budget;
+};
+
+struct bnxt_tc_flow_stats {
+	u64		packets;
+	u64		bytes;
+};
+
+struct bnxt_tc_info {
+	bool				enabled;
+
+	/* hash table to store TC offloaded flows */
+	struct rhashtable		flow_table;
+	struct rhashtable_params	flow_ht_params;
+
+	/* hash table to store L2 keys of TC flows */
+	struct rhashtable		l2_table;
+	struct rhashtable_params	l2_ht_params;
+	/* hash table to store L2 keys for TC tunnel decap */
+	struct rhashtable		decap_l2_table;
+	struct rhashtable_params	decap_l2_ht_params;
+	/* hash table to store tunnel decap entries */
+	struct rhashtable		decap_table;
+	struct rhashtable_params	decap_ht_params;
+	/* hash table to store tunnel encap entries */
+	struct rhashtable		encap_table;
+	struct rhashtable_params	encap_ht_params;
+
+	/* lock to atomically add/del an l2 node when a flow is
+	 * added or deleted.
+	 */
+	struct mutex			lock;
+
+	/* Fields used for batching stats query */
+	struct rhashtable_iter		iter;
+#define BNXT_FLOW_STATS_BATCH_MAX	10
+	struct bnxt_tc_stats_batch {
+		void			  *flow_node;
+		struct bnxt_tc_flow_stats hw_stats;
+	} stats_batch[BNXT_FLOW_STATS_BATCH_MAX];
+
+	/* Stat counter mask (width) */
+	u64				bytes_mask;
+	u64				packets_mask;
+};
+
+struct bnxt_vf_rep_stats {
+	u64			packets;
+	u64			bytes;
+	u64			dropped;
+};
+
+struct bnxt_vf_rep {
+	struct bnxt			*bp;
+	struct net_device		*dev;
+	struct metadata_dst		*dst;
+	u16				vf_idx;
+	u16				tx_cfa_action;
+	u16				rx_cfa_code;
+
+	struct bnxt_vf_rep_stats	rx_stats;
+	struct bnxt_vf_rep_stats	tx_stats;
+};
 
 struct bnxt {
 	void __iomem		*bar0;
@@ -999,8 +1110,12 @@ struct bnxt {
 	#define BNXT_FLAG_ROCE_CAP	(BNXT_FLAG_ROCEV1_CAP |	\
 					 BNXT_FLAG_ROCEV2_CAP)
 	#define BNXT_FLAG_NO_AGG_RINGS	0x20000
+	#define BNXT_FLAG_RX_PAGE_MODE	0x40000
 	#define BNXT_FLAG_FW_LLDP_AGENT	0x80000
 	#define BNXT_FLAG_MULTI_HOST	0x100000
+	#define BNXT_FLAG_SHORT_CMD	0x200000
+	#define BNXT_FLAG_DOUBLE_DB	0x400000
+	#define BNXT_FLAG_FW_DCBX_AGENT	0x800000
 	#define BNXT_FLAG_CHIP_NITRO_A0	0x1000000
 
 	#define BNXT_FLAG_ALL_CONFIG_FEATS (BNXT_FLAG_TPA |		\
@@ -1013,6 +1128,7 @@ struct bnxt {
 #define BNXT_MH(bp)		((bp)->flags & BNXT_FLAG_MULTI_HOST)
 #define BNXT_SINGLE_PF(bp)	(BNXT_PF(bp) && !BNXT_NPAR(bp) && !BNXT_MH(bp))
 #define BNXT_CHIP_TYPE_NITRO_A0(bp) ((bp)->flags & BNXT_FLAG_CHIP_NITRO_A0)
+#define BNXT_RX_PAGE_MODE(bp)	((bp)->flags & BNXT_FLAG_RX_PAGE_MODE)
 
 /* Chip class phase 4 and later */
 #define BNXT_CHIP_P4_PLUS(bp)			\
@@ -1058,6 +1174,8 @@ struct bnxt {
 	int			tx_nr_pages;
 	int			tx_nr_rings;
 	int			tx_nr_rings_per_tc;
+	int			tx_nr_rings_xdp;
+	int			tx_reserved_rings;
 
 	int			tx_wake_thresh;
 	int			tx_push_thresh;
@@ -1077,6 +1195,7 @@ struct bnxt {
 	int			nr_vnics;
 	u32			rss_hash_cfg;
 
+	u16			max_mtu;
 	u8			max_tc;
 	u8			max_lltc;	/* lossless TCs */
 	struct bnxt_queue_info	q_info[BNXT_MAX_QUEUE];
@@ -1089,6 +1208,7 @@ struct bnxt {
 	unsigned long		state;
 #define BNXT_STATE_OPEN		0
 #define BNXT_STATE_IN_SP_TASK	1
+#define BNXT_STATE_READ_STATS	2
 
 	struct bnxt_irq	*irq_tbl;
 	int			total_irqs;
@@ -1106,6 +1226,8 @@ struct bnxt {
 	u32			hwrm_spec_code;
 	u16			hwrm_cmd_seq;
 	u32			hwrm_intr_seq_id;
+	void			*hwrm_short_cmd_req_addr;
+	dma_addr_t		hwrm_short_cmd_req_dma_addr;
 	void			*hwrm_cmd_resp_addr;
 	dma_addr_t		hwrm_cmd_resp_dma_addr;
 	void			*hwrm_dbg_resp_addr;
@@ -1133,16 +1255,11 @@ struct bnxt {
 	u8			nge_port_cnt;
 	__le16			nge_fw_dst_port_id;
 	u8			port_partition_type;
+	u8			port_count;
 	u16			br_mode;
 
-	u16			rx_coal_ticks;
-	u16			rx_coal_ticks_irq;
-	u16			rx_coal_bufs;
-	u16			rx_coal_bufs_irq;
-	u16			tx_coal_ticks;
-	u16			tx_coal_ticks_irq;
-	u16			tx_coal_bufs;
-	u16			tx_coal_bufs_irq;
+	struct bnxt_coal	rx_coal;
+	struct bnxt_coal	tx_coal;
 
 #define BNXT_USEC_TO_COAL_TIMER(x)	((x) * 25 / 2)
 
@@ -1168,6 +1285,7 @@ struct bnxt {
 #define BNXT_GENEVE_ADD_PORT_SP_EVENT	12
 #define BNXT_GENEVE_DEL_PORT_SP_EVENT	13
 #define BNXT_LINK_SPEED_CHNG_SP_EVENT	14
+#define BNXT_FLOW_STATS_SP_EVENT	15
 
 	struct bnxt_pf_info	pf;
 #ifdef CONFIG_BNXT_SRIOV
@@ -1176,6 +1294,12 @@ struct bnxt {
 	wait_queue_head_t	sriov_cfg_wait;
 	bool			sriov_cfg;
 #define BNXT_SRIOV_CFG_WAIT_TMO	msecs_to_jiffies(10000)
+
+	/* lock to protect VF-rep creation/cleanup via
+	 * multiple paths such as ->sriov_configure() and
+	 * devlink ->eswitch_mode_set()
+	 */
+	struct mutex		sriov_lock;
 #endif
 
 #define BNXT_NTP_FLTR_MAX_FLTR	4096
@@ -1196,11 +1320,24 @@ struct bnxt {
 	u32			lpi_tmr_lo;
 	u32			lpi_tmr_hi;
 
+	u8			num_tests;
+	struct bnxt_test_info	*test_info;
+
 	u8			wol_filter_id;
 	u8			wol;
 
 	u8			num_leds;
 	struct bnxt_led_info	leds[BNXT_MAX_LED];
+
+	struct bpf_prog		*xdp_prog;
+
+	/* devlink interface and vf-rep structs */
+	struct devlink		*dl;
+	enum devlink_eswitch_mode eswitch_mode;
+	struct bnxt_vf_rep	**vf_reps; /* array of vf-rep ptrs */
+	u16			*cfa_code_map; /* cfa_code -> vf_idx map */
+	u8			switch_id[8];
+	struct bnxt_tc_info	*tc_info;
 };
 
 #define BNXT_RX_STATS_OFFSET(counter)			\
@@ -1220,7 +1357,31 @@ struct bnxt {
 #define SFF_MODULE_ID_QSFP28			0x11
 #define BNXT_MAX_PHY_I2C_RESP_SIZE		64
 
+static inline u32 bnxt_tx_avail(struct bnxt *bp, struct bnxt_tx_ring_info *txr)
+{
+	/* Tell compiler to fetch tx indices from memory. */
+	barrier();
+
+	return bp->tx_ring_size -
+		((txr->tx_prod - txr->tx_cons) & bp->tx_ring_mask);
+}
+
+/* For TX and RX ring doorbells */
+static inline void bnxt_db_write(struct bnxt *bp, void __iomem *db, u32 val)
+{
+	writel(val, db);
+	if (bp->flags & BNXT_FLAG_DOUBLE_DB)
+		writel(val, db);
+}
+
+extern const u16 bnxt_lhint_arr[];
+
+int bnxt_alloc_rx_data(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
+		       u16 prod, gfp_t gfp);
+void bnxt_reuse_rx_data(struct bnxt_rx_ring_info *rxr, u16 cons, void *data);
+void bnxt_set_tpa_flags(struct bnxt *bp);
 void bnxt_set_ring_params(struct bnxt *);
+int bnxt_set_rx_skb_mode(struct bnxt *bp, bool page_mode);
 void bnxt_hwrm_cmd_hdr_init(struct bnxt *, void *, u16, u16, u16);
 int _hwrm_send_message(struct bnxt *, void *, u32, int);
 int _hwrm_send_message_silent(struct bnxt *bp, void *msg, u32 len, int timeout);
@@ -1230,7 +1391,6 @@ int bnxt_hwrm_func_rgtr_async_events(struct bnxt *bp, unsigned long *bmap,
 				     int bmap_size);
 int bnxt_hwrm_vnic_cfg(struct bnxt *bp, u16 vnic_id);
 int __bnxt_hwrm_get_tx_rings(struct bnxt *bp, u16 fid, int *tx_rings);
-int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings);
 int bnxt_hwrm_set_coal(struct bnxt *);
 unsigned int bnxt_get_max_func_stat_ctxs(struct bnxt *bp);
 void bnxt_set_max_func_stat_ctxs(struct bnxt *bp, unsigned int max);
@@ -1245,8 +1405,13 @@ int bnxt_hwrm_alloc_wol_fltr(struct bnxt *bp);
 int bnxt_hwrm_free_wol_fltr(struct bnxt *bp);
 int bnxt_hwrm_fw_set_time(struct bnxt *);
 int bnxt_open_nic(struct bnxt *, bool, bool);
+int bnxt_half_open_nic(struct bnxt *bp);
+void bnxt_half_close_nic(struct bnxt *bp);
 int bnxt_close_nic(struct bnxt *, bool, bool);
+int bnxt_check_rings(struct bnxt *bp, int tx, int rx, bool sh, int tcs,
+		     int tx_xdp);
 int bnxt_setup_mq_tc(struct net_device *dev, u8 tc);
 int bnxt_get_max_rings(struct bnxt *, int *, int *, bool);
 void bnxt_restore_pf_fw_resources(struct bnxt *bp);
+int bnxt_port_attr_get(struct bnxt *bp, struct switchdev_attr *attr);
 #endif

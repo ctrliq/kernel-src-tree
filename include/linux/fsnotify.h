@@ -16,15 +16,6 @@
 #include <linux/slab.h>
 #include <linux/bug.h>
 
-/*
- * fsnotify_d_instantiate - instantiate a dentry for inode
- */
-static inline void fsnotify_d_instantiate(struct dentry *dentry,
-					  struct inode *inode)
-{
-	__fsnotify_d_instantiate(dentry, inode);
-}
-
 /* Notify this dentry's parent about a child's events. */
 static inline int fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask)
 {
@@ -62,18 +53,6 @@ static inline int fsnotify_perm(struct file *file, int mask)
 		return ret;
 
 	return fsnotify(inode, fsnotify_mask, path, FSNOTIFY_EVENT_PATH, NULL, 0);
-}
-
-/*
- * fsnotify_d_move - dentry has been moved
- */
-static inline void fsnotify_d_move(struct dentry *dentry)
-{
-	/*
-	 * On move we need to update dentry->d_flags to indicate if the new parent
-	 * cares about events from this dentry.
-	 */
-	__fsnotify_update_dcache_flags(dentry);
 }
 
 /*
@@ -313,36 +292,5 @@ static inline void fsnotify_change(struct dentry *dentry, unsigned int ia_valid)
 		fsnotify(inode, mask, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
 	}
 }
-
-#if defined(CONFIG_FSNOTIFY)	/* notify helpers */
-
-/*
- * fsnotify_oldname_init - save off the old filename before we change it
- */
-static inline const unsigned char *fsnotify_oldname_init(const unsigned char *name)
-{
-	return kstrdup(name, GFP_KERNEL);
-}
-
-/*
- * fsnotify_oldname_free - free the name we got from fsnotify_oldname_init
- */
-static inline void fsnotify_oldname_free(const unsigned char *old_name)
-{
-	kfree(old_name);
-}
-
-#else	/* CONFIG_FSNOTIFY */
-
-static inline const char *fsnotify_oldname_init(const unsigned char *name)
-{
-	return NULL;
-}
-
-static inline void fsnotify_oldname_free(const unsigned char *old_name)
-{
-}
-
-#endif	/*  CONFIG_FSNOTIFY */
 
 #endif	/* _LINUX_FS_NOTIFY_H */

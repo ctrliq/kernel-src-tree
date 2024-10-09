@@ -112,11 +112,12 @@ static void wacom_feature_mapping(struct hid_device *hdev,
 	struct wacom *wacom = hid_get_drvdata(hdev);
 	struct wacom_features *features = &wacom->wacom_wac.features;
 	struct hid_data *hid_data = &wacom->wacom_wac.hid_data;
+	unsigned int equivalent_usage = wacom_equivalent_usage(usage->hid);
 	u8 *data;
 	int ret;
 	int n;
 
-	switch (usage->hid) {
+	switch (equivalent_usage) {
 	case HID_DG_CONTACTMAX:
 		/* leave touch_max as is if predefined */
 		if (!features->touch_max) {
@@ -331,9 +332,22 @@ static void wacom_post_parse_hid(struct hid_device *hdev,
 
 	if (features->type == HID_GENERIC) {
 		/* Any last-minute generic device setup */
+		if (wacom_wac->has_mode_change) {
+			if (wacom_wac->is_direct_mode)
+				features->device_type |= WACOM_DEVICETYPE_DIRECT;
+			else
+				features->device_type &= ~WACOM_DEVICETYPE_DIRECT;
+		}
+
 		if (features->touch_max > 1) {
-			input_mt_init_slots(wacom_wac->touch_input, wacom_wac->features.touch_max,
-				    INPUT_MT_DIRECT);
+			if (features->device_type & WACOM_DEVICETYPE_DIRECT)
+				input_mt_init_slots(wacom_wac->touch_input,
+						    wacom_wac->features.touch_max,
+						    INPUT_MT_DIRECT);
+			else
+				input_mt_init_slots(wacom_wac->touch_input,
+						    wacom_wac->features.touch_max,
+						    INPUT_MT_POINTER);
 		}
 	}
 }
@@ -1191,8 +1205,7 @@ static int wacom_initialize_leds(struct wacom *wacom)
 
 	case INTUOSP2_BT:
 		wacom->led.llv = 50;
-		wacom->led.max_llv = 100;
-		error = wacom_leds_alloc_and_register(wacom, 1, 4, false);
+		error = wacom_led_groups_allocate(wacom, 4);
 		if (error) {
 			hid_err(wacom->hdev,
 				"cannot create leds err: %d\n", error);
@@ -1247,7 +1260,7 @@ static int wacom_battery_get_property(struct power_supply *psy,
 				      enum power_supply_property psp,
 				      union power_supply_propval *val)
 {
-	struct wacom_battery *battery = container_of(psy, struct wacom_battery, battery);
+	struct wacom_battery *battery = power_supply_get_drvdata(psy);
 	int ret = 0;
 
 	switch (psp) {
@@ -1289,44 +1302,42 @@ static int __wacom_initialize_battery(struct wacom *wacom,
 {
 	static atomic_t battery_no = ATOMIC_INIT(0);
 	struct device *dev = &wacom->hdev->dev;
-	int error;
+	struct power_supply_config psy_cfg = { .drv_data = battery, };
+	struct power_supply *ps_bat;
+	struct power_supply_desc *bat_desc = &battery->bat_desc;
 	unsigned long n;
+	int error;
 
-	/*
-	 * Disabling power_supply code for RHEL-7.4 due lack of more intrusive
-	 * changes. This will be fixed in RHEL-7.5
-	 */
-	if (wacom->wacom_wac.features.type == REMOTE ||
-	    wacom->wacom_wac.features.quirks & WACOM_QUIRK_BATTERY)
-		return 0;
-
-	if (!devres_open_group(dev, &wacom->battery, GFP_KERNEL))
+	if (!devres_open_group(dev, bat_desc, GFP_KERNEL))
 		return -ENOMEM;
 
 	battery->wacom = wacom;
 
 	n = atomic_inc_return(&battery_no) - 1;
 
-	wacom->battery.battery.properties = wacom_battery_props;
-	wacom->battery.battery.num_properties = ARRAY_SIZE(wacom_battery_props);
-	wacom->battery.battery.get_property = wacom_battery_get_property;
-	sprintf(wacom->battery.bat_name, "wacom_battery_%ld", n);
-	wacom->battery.battery.name = wacom->battery.bat_name;
-	wacom->battery.battery.type = POWER_SUPPLY_TYPE_USB;
-	wacom->battery.battery.use_for_apm = 0;
+	bat_desc->properties = wacom_battery_props;
+	bat_desc->num_properties = ARRAY_SIZE(wacom_battery_props);
+	bat_desc->get_property = wacom_battery_get_property;
+	sprintf(battery->bat_name, "wacom_battery_%ld", n);
+	bat_desc->name = battery->bat_name;
+	bat_desc->type = POWER_SUPPLY_TYPE_USB;
+	bat_desc->use_for_apm = 0;
 
-	error = devm_power_supply_register(&wacom->hdev->dev,
-					   &wacom->battery.battery);
-	if (error)
+	ps_bat = devm_power_supply_register(dev, bat_desc, &psy_cfg);
+	if (IS_ERR(ps_bat)) {
+		error = PTR_ERR(ps_bat);
 		goto err;
+	}
 
-	power_supply_powers(&wacom->battery.battery, &wacom->hdev->dev);
+	power_supply_powers(ps_bat, &wacom->hdev->dev);
 
-	devres_close_group(dev, &wacom->battery);
+	battery->battery = ps_bat;
+
+	devres_close_group(dev, bat_desc);
 	return 0;
 
 err:
-	devres_release_group(dev, &wacom->battery);
+	devres_release_group(dev, bat_desc);
 	return error;
 }
 
@@ -1340,14 +1351,10 @@ static int wacom_initialize_battery(struct wacom *wacom)
 
 static void wacom_destroy_battery(struct wacom *wacom)
 {
-	if (wacom->wacom_wac.features.type == REMOTE ||
-	    wacom->wacom_wac.features.quirks & WACOM_QUIRK_BATTERY)
-		return;
-
-	if (wacom->battery.battery.dev) {
+	if (wacom->battery.battery) {
 		devres_release_group(&wacom->hdev->dev,
-				     &wacom->battery);
-		wacom->battery.battery.dev = NULL;
+				     &wacom->battery.bat_desc);
+		wacom->battery.battery = NULL;
 	}
 }
 
@@ -1714,11 +1721,11 @@ void wacom_battery_work(struct work_struct *work)
 	struct wacom *wacom = container_of(work, struct wacom, battery_work);
 
 	if ((wacom->wacom_wac.features.quirks & WACOM_QUIRK_BATTERY) &&
-	     !wacom->battery.battery.dev) {
+	     !wacom->battery.battery) {
 		wacom_initialize_battery(wacom);
 	}
 	else if (!(wacom->wacom_wac.features.quirks & WACOM_QUIRK_BATTERY) &&
-		 wacom->battery.battery.dev) {
+		 wacom->battery.battery) {
 		wacom_destroy_battery(wacom);
 	}
 }
@@ -1818,8 +1825,10 @@ static void wacom_set_shared_values(struct wacom_wac *wacom_wac)
 		wacom_wac->shared->touch_input = wacom_wac->touch_input;
 	}
 
-	if (wacom_wac->has_mute_touch_switch)
+	if (wacom_wac->has_mute_touch_switch) {
 		wacom_wac->shared->has_mute_touch_switch = true;
+		wacom_wac->shared->is_touch_on = true;
+	}
 
 	if (wacom_wac->shared->has_mute_touch_switch &&
 	    wacom_wac->shared->touch_input) {
@@ -2060,9 +2069,9 @@ static void wacom_remote_destroy_one(struct wacom *wacom, unsigned int index)
 	remote->remotes[index].registered = false;
 	spin_unlock_irqrestore(&remote->remote_lock, flags);
 
-	if (remote->remotes[index].battery.battery.dev)
+	if (remote->remotes[index].battery.battery)
 		devres_release_group(&wacom->hdev->dev,
-				     &remote->remotes[index].battery);
+				     &remote->remotes[index].battery.bat_desc);
 
 	if (remote->remotes[index].group.name)
 		devres_release_group(&wacom->hdev->dev,
@@ -2073,7 +2082,7 @@ static void wacom_remote_destroy_one(struct wacom *wacom, unsigned int index)
 			remote->remotes[i].serial = 0;
 			remote->remotes[i].group.name = NULL;
 			remote->remotes[i].registered = false;
-			remote->remotes[i].battery.battery.dev = NULL;
+			remote->remotes[i].battery.battery = NULL;
 			wacom->led.groups[i].select = WACOM_STATUS_UNKNOWN;
 		}
 	}
@@ -2149,7 +2158,7 @@ static int wacom_remote_attach_battery(struct wacom *wacom, int index)
 	if (!remote->remotes[index].registered)
 		return 0;
 
-	if (remote->remotes[index].battery.battery.dev)
+	if (remote->remotes[index].battery.battery)
 		return 0;
 
 	if (wacom->led.groups[index].select == WACOM_STATUS_UNKNOWN)
@@ -2209,6 +2218,46 @@ static void wacom_remote_work(struct work_struct *work)
 	}
 }
 
+static void wacom_mode_change_work(struct work_struct *work)
+{
+	struct wacom *wacom = container_of(work, struct wacom, mode_change_work);
+	struct wacom_shared *shared = wacom->wacom_wac.shared;
+	struct wacom *wacom1 = NULL;
+	struct wacom *wacom2 = NULL;
+	bool is_direct = wacom->wacom_wac.is_direct_mode;
+	int error = 0;
+
+	if (shared->pen) {
+		wacom1 = hid_get_drvdata(shared->pen);
+		wacom_release_resources(wacom1);
+		hid_hw_stop(wacom1->hdev);
+		wacom1->wacom_wac.has_mode_change = true;
+		wacom1->wacom_wac.is_direct_mode = is_direct;
+	}
+
+	if (shared->touch) {
+		wacom2 = hid_get_drvdata(shared->touch);
+		wacom_release_resources(wacom2);
+		hid_hw_stop(wacom2->hdev);
+		wacom2->wacom_wac.has_mode_change = true;
+		wacom2->wacom_wac.is_direct_mode = is_direct;
+	}
+
+	if (wacom1) {
+		error = wacom_parse_and_register(wacom1, false);
+		if (error)
+			return;
+	}
+
+	if (wacom2) {
+		error = wacom_parse_and_register(wacom2, false);
+		if (error)
+			return;
+	}
+
+	return;
+}
+
 static int wacom_probe(struct hid_device *hdev,
 		const struct hid_device_id *id)
 {
@@ -2253,6 +2302,7 @@ static int wacom_probe(struct hid_device *hdev,
 	INIT_WORK(&wacom->wireless_work, wacom_wireless_work);
 	INIT_WORK(&wacom->battery_work, wacom_battery_work);
 	INIT_WORK(&wacom->remote_work, wacom_remote_work);
+	INIT_WORK(&wacom->mode_change_work, wacom_mode_change_work);
 
 	/* ask for the report descriptor to be loaded by HID */
 	error = hid_parse(hdev);
@@ -2295,6 +2345,7 @@ static void wacom_remove(struct hid_device *hdev)
 	cancel_work_sync(&wacom->wireless_work);
 	cancel_work_sync(&wacom->battery_work);
 	cancel_work_sync(&wacom->remote_work);
+	cancel_work_sync(&wacom->mode_change_work);
 	if (hdev->bus == BUS_BLUETOOTH)
 		device_remove_file(&hdev->dev, &dev_attr_speed);
 

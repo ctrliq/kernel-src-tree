@@ -565,47 +565,17 @@ qla2x00_sysfs_read_sfp(struct file *filp, struct kobject *kobj,
 {
 	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
 	    struct device, kobj)));
-	struct qla_hw_data *ha = vha->hw;
-	uint16_t iter, addr, offset;
 	int rval;
 
-	if (!capable(CAP_SYS_ADMIN) || off != 0 || count != SFP_DEV_SIZE * 2)
+	if (!capable(CAP_SYS_ADMIN) || off != 0 || count < SFP_DEV_SIZE)
 		return 0;
 
-	if (ha->sfp_data)
-		goto do_read;
-
-	ha->sfp_data = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL,
-	    &ha->sfp_data_dma);
-	if (!ha->sfp_data) {
-		ql_log(ql_log_warn, vha, 0x706c,
-		    "Unable to allocate memory for SFP read-data.\n");
+	if (qla2x00_reset_active(vha))
 		return 0;
-	}
 
-do_read:
-	memset(ha->sfp_data, 0, SFP_BLOCK_SIZE);
-	addr = 0xa0;
-	for (iter = 0, offset = 0; iter < (SFP_DEV_SIZE * 2) / SFP_BLOCK_SIZE;
-	    iter++, offset += SFP_BLOCK_SIZE) {
-		if (iter == 4) {
-			/* Skip to next device address. */
-			addr = 0xa2;
-			offset = 0;
-		}
-
-		rval = qla2x00_read_sfp(vha, ha->sfp_data_dma, ha->sfp_data,
-		    addr, offset, SFP_BLOCK_SIZE, BIT_1);
-		if (rval != QLA_SUCCESS) {
-			ql_log(ql_log_warn, vha, 0x706d,
-			    "Unable to read SFP data (%x/%x/%x).\n", rval,
-			    addr, offset);
-
-			return -EIO;
-		}
-		memcpy(buf, ha->sfp_data, SFP_BLOCK_SIZE);
-		buf += SFP_BLOCK_SIZE;
-	}
+	rval = qla2x00_read_sfp_dev(vha, buf, count);
+	if (rval)
+		return -EIO;
 
 	return count;
 }
@@ -615,7 +585,7 @@ static struct bin_attribute sysfs_sfp_attr = {
 		.name = "sfp",
 		.mode = S_IRUSR | S_IWUSR,
 	},
-	.size = SFP_DEV_SIZE * 2,
+	.size = SFP_DEV_SIZE,
 	.read = qla2x00_sysfs_read_sfp,
 };
 
@@ -754,6 +724,41 @@ static struct bin_attribute sysfs_reset_attr = {
 };
 
 static ssize_t
+qla2x00_issue_logo(struct file *filp, struct kobject *kobj,
+			struct bin_attribute *bin_attr,
+			char *buf, loff_t off, size_t count)
+{
+	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
+	    struct device, kobj)));
+	int type;
+	int rval = 0;
+	port_id_t did;
+
+	type = simple_strtol(buf, NULL, 10);
+
+	did.b.domain = (type & 0x00ff0000) >> 16;
+	did.b.area = (type & 0x0000ff00) >> 8;
+	did.b.al_pa = (type & 0x000000ff);
+
+	ql_log(ql_log_info, vha, 0xd04d, "portid=%02x%02x%02x done\n",
+	    did.b.domain, did.b.area, did.b.al_pa);
+
+	ql_log(ql_log_info, vha, 0x70e4, "%s: %d\n", __func__, type);
+
+	rval = qla24xx_els_dcmd_iocb(vha, ELS_DCMD_LOGO, did);
+	return count;
+}
+
+static struct bin_attribute sysfs_issue_logo_attr = {
+	.attr = {
+		.name = "issue_logo",
+		.mode = S_IWUSR,
+	},
+	.size = 0,
+	.write = qla2x00_issue_logo,
+};
+
+static ssize_t
 qla2x00_sysfs_read_xgmac_stats(struct file *filp, struct kobject *kobj,
 		       struct bin_attribute *bin_attr,
 		       char *buf, loff_t off, size_t count)
@@ -866,6 +871,7 @@ static struct sysfs_entry {
 	{ "vpd", &sysfs_vpd_attr, 1 },
 	{ "sfp", &sysfs_sfp_attr, 1 },
 	{ "reset", &sysfs_reset_attr, },
+	{ "issue_logo", &sysfs_issue_logo_attr, },
 	{ "xgmac_stats", &sysfs_xgmac_stats_attr, 3 },
 	{ "dcbx_tlv", &sysfs_dcbx_tlv_attr, 3 },
 	{ NULL },
@@ -1786,10 +1792,9 @@ qla2x00_get_fc_host_stats(struct Scsi_Host *shost)
 	int rval;
 	struct link_statistics *stats;
 	dma_addr_t stats_dma;
-	struct fc_host_statistics *pfc_host_stat;
+	struct fc_host_statistics *p = &vha->fc_host_stat;
 
-	pfc_host_stat = &vha->fc_host_stat;
-	memset(pfc_host_stat, -1, sizeof(struct fc_host_statistics));
+	memset(p, -1, sizeof(*p));
 
 	if (IS_QLAFX00(vha->hw))
 		goto done;
@@ -1825,37 +1830,37 @@ qla2x00_get_fc_host_stats(struct Scsi_Host *shost)
 	if (rval != QLA_SUCCESS)
 		goto done_free;
 
-	pfc_host_stat->link_failure_count = stats->link_fail_cnt;
-	pfc_host_stat->loss_of_sync_count = stats->loss_sync_cnt;
-	pfc_host_stat->loss_of_signal_count = stats->loss_sig_cnt;
-	pfc_host_stat->prim_seq_protocol_err_count = stats->prim_seq_err_cnt;
-	pfc_host_stat->invalid_tx_word_count = stats->inval_xmit_word_cnt;
-	pfc_host_stat->invalid_crc_count = stats->inval_crc_cnt;
+	p->link_failure_count = stats->link_fail_cnt;
+	p->loss_of_sync_count = stats->loss_sync_cnt;
+	p->loss_of_signal_count = stats->loss_sig_cnt;
+	p->prim_seq_protocol_err_count = stats->prim_seq_err_cnt;
+	p->invalid_tx_word_count = stats->inval_xmit_word_cnt;
+	p->invalid_crc_count = stats->inval_crc_cnt;
 	if (IS_FWI2_CAPABLE(ha)) {
-		pfc_host_stat->lip_count = stats->lip_cnt;
-		pfc_host_stat->tx_frames = stats->tx_frames;
-		pfc_host_stat->rx_frames = stats->rx_frames;
-		pfc_host_stat->dumped_frames = stats->discarded_frames;
-		pfc_host_stat->nos_count = stats->nos_rcvd;
-		pfc_host_stat->error_frames =
+		p->lip_count = stats->lip_cnt;
+		p->tx_frames = stats->tx_frames;
+		p->rx_frames = stats->rx_frames;
+		p->dumped_frames = stats->discarded_frames;
+		p->nos_count = stats->nos_rcvd;
+		p->error_frames =
 			stats->dropped_frames + stats->discarded_frames;
-		pfc_host_stat->rx_words = vha->qla_stats.input_bytes;
-		pfc_host_stat->tx_words = vha->qla_stats.output_bytes;
+		p->rx_words = vha->qla_stats.input_bytes;
+		p->tx_words = vha->qla_stats.output_bytes;
 	}
-	pfc_host_stat->fcp_control_requests = vha->qla_stats.control_requests;
-	pfc_host_stat->fcp_input_requests = vha->qla_stats.input_requests;
-	pfc_host_stat->fcp_output_requests = vha->qla_stats.output_requests;
-	pfc_host_stat->fcp_input_megabytes = vha->qla_stats.input_bytes >> 20;
-	pfc_host_stat->fcp_output_megabytes = vha->qla_stats.output_bytes >> 20;
-	pfc_host_stat->seconds_since_last_reset =
+	p->fcp_control_requests = vha->qla_stats.control_requests;
+	p->fcp_input_requests = vha->qla_stats.input_requests;
+	p->fcp_output_requests = vha->qla_stats.output_requests;
+	p->fcp_input_megabytes = vha->qla_stats.input_bytes >> 20;
+	p->fcp_output_megabytes = vha->qla_stats.output_bytes >> 20;
+	p->seconds_since_last_reset =
 		get_jiffies_64() - vha->qla_stats.jiffies_at_last_reset;
-	do_div(pfc_host_stat->seconds_since_last_reset, HZ);
+	do_div(p->seconds_since_last_reset, HZ);
 
 done_free:
 	dma_free_coherent(&ha->pdev->dev, sizeof(struct link_statistics),
 	    stats, stats_dma);
 done:
-	return pfc_host_stat;
+	return p;
 }
 
 static void
@@ -1867,6 +1872,7 @@ qla2x00_reset_host_stats(struct Scsi_Host *shost)
 	struct link_statistics *stats;
 	dma_addr_t stats_dma;
 
+	memset(&vha->qla_stats, 0, sizeof(vha->qla_stats));
 	memset(&vha->fc_host_stat, 0, sizeof(vha->fc_host_stat));
 
 	vha->qla_stats.jiffies_at_last_reset = get_jiffies_64();
@@ -2061,7 +2067,7 @@ qla24xx_vport_create(struct fc_vport *fc_vport, bool disable)
 	}
 
 	if (qos) {
-		qpair = qla2xxx_create_qpair(vha, 0, qos, vha->vp_idx);
+		qpair = qla2xxx_create_qpair(vha, 0, qos, vha->vp_idx, true);
 		if (!qpair)
 			ql_log(ql_log_warn, vha, 0x7084,
 			    "Can't create qpair for VP[%d]\n",
@@ -2104,6 +2110,8 @@ qla24xx_vport_delete(struct fc_vport *fc_vport)
 
 	vha->flags.delete_progress = 1;
 
+	qlt_remove_target(ha, vha);
+
 	fc_remove_host(vha->host);
 
 	scsi_remove_host(vha->host);
@@ -2123,6 +2131,9 @@ qla24xx_vport_delete(struct fc_vport *fc_vport)
 	ha->cur_vport_count--;
 	clear_bit(vha->vp_idx, ha->vp_idx_map);
 	mutex_unlock(&ha->vport_lock);
+
+	dma_free_coherent(&ha->pdev->dev, vha->gnl.size, vha->gnl.l,
+	    vha->gnl.ldma);
 
 	if (vha->qpair && vha->qpair->vp_idx == vha->vp_idx) {
 		if (qla2xxx_delete_qpair(vha, vha->qpair) != QLA_SUCCESS)
@@ -2249,7 +2260,7 @@ qla2x00_init_host_attr(scsi_qla_host_t *vha)
 	fc_host_dev_loss_tmo(vha->host) = ha->port_down_retry_count;
 	fc_host_node_name(vha->host) = wwn_to_u64(vha->node_name);
 	fc_host_port_name(vha->host) = wwn_to_u64(vha->port_name);
-	fc_host_supported_classes(vha->host) = ha->tgt.enable_class_2 ?
+	fc_host_supported_classes(vha->host) = ha->base_qpair->enable_class_2 ?
 			(FC_COS_CLASS2|FC_COS_CLASS3) : FC_COS_CLASS3;
 	fc_host_max_npiv_vports(vha->host) = ha->max_npiv_vports;
 	fc_host_npiv_vports_inuse(vha->host) = ha->cur_vport_count;

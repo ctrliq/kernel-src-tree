@@ -350,7 +350,7 @@ static void wakeup_print_header(struct seq_file *s)
 /*
  * Should this new latency be reported/recorded?
  */
-static int report_latency(struct trace_array *tr, cycle_t delta)
+static int report_latency(struct trace_array *tr, u64 delta)
 {
 	if (tracing_thresh) {
 		if (delta < tracing_thresh)
@@ -376,7 +376,7 @@ probe_wakeup_sched_switch(void *ignore,
 			  struct task_struct *prev, struct task_struct *next)
 {
 	struct trace_array_cpu *data;
-	cycle_t T0, T1, delta;
+	u64 T0, T1, delta;
 	unsigned long flags;
 	long disabled;
 	int cpu;

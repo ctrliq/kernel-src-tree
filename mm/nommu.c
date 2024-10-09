@@ -282,6 +282,11 @@ void *__vmalloc(unsigned long size, gfp_t gfp_mask, pgprot_t prot)
 }
 EXPORT_SYMBOL(__vmalloc);
 
+void *__vmalloc_node_flags(unsigned long size, int node, gfp_t flags)
+{
+	return __vmalloc(size, flags, PAGE_KERNEL);
+}
+
 void *vmalloc_user(unsigned long size)
 {
 	void *ret;
@@ -1063,7 +1068,7 @@ static int validate_mmap_request(struct file *file,
 
 		/* handle executable mappings and implied executable
 		 * mappings */
-		if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
+		if (path_noexec(&file->f_path)) {
 			if (prot & PROT_EXEC)
 				return -EPERM;
 		}
@@ -1115,7 +1120,7 @@ static unsigned long determine_vm_flags(struct file *file,
 {
 	unsigned long vm_flags;
 
-	vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags);
+	vm_flags = calc_vm_prot_bits(prot, 0) | calc_vm_flag_bits(flags);
 	/* vm_flags |= mm->def_flags; */
 
 	if (!(capabilities & BDI_CAP_MAP_DIRECT)) {
@@ -1281,19 +1286,20 @@ enomem:
 /*
  * handle mapping creation for uClinux
  */
-unsigned long do_mmap_pgoff(struct file *file,
-			    unsigned long addr,
-			    unsigned long len,
-			    unsigned long prot,
-			    unsigned long flags,
-			    unsigned long pgoff,
-			    unsigned long *populate,
-			    struct list_head *uf_unused)
+unsigned long do_mmap(struct file *file,
+			unsigned long addr,
+			unsigned long len,
+			unsigned long prot,
+			unsigned long flags,
+			vm_flags_t vm_flags,
+			unsigned long pgoff,
+			unsigned long *populate,
+			struct list_head *uf_unused)
 {
 	struct vm_area_struct *vma;
 	struct vm_region *region;
 	struct rb_node *rb;
-	unsigned long capabilities, vm_flags, result;
+	unsigned long capabilities, result;
 	int ret;
 
 	kenter(",%lx,%lx,%lx,%lx,%lx", addr, len, prot, flags, pgoff);
@@ -1315,7 +1321,7 @@ unsigned long do_mmap_pgoff(struct file *file,
 
 	/* we've determined that we can make the mapping, now translate what we
 	 * now know into VMA flags */
-	vm_flags = determine_vm_flags(file, prot, flags, capabilities);
+	vm_flags |= determine_vm_flags(file, prot, flags, capabilities);
 
 	/* we're going to need to record the mapping */
 	region = kmem_cache_zalloc(vm_region_jar, GFP_KERNEL);

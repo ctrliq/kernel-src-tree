@@ -46,11 +46,13 @@ void iscsit_create_conn_recovery_datain_values(
 		if ((cmd->next_burst_len +
 		     conn->conn_ops->MaxRecvDataSegmentLength) <
 		     conn->sess->sess_ops->MaxBurstLength) {
+			gmb();
 			cmd->read_data_done +=
 			       conn->conn_ops->MaxRecvDataSegmentLength;
 			cmd->next_burst_len +=
 			       conn->conn_ops->MaxRecvDataSegmentLength;
 		} else {
+			gmb();
 			cmd->read_data_done +=
 				(conn->sess->sess_ops->MaxBurstLength -
 				cmd->next_burst_len);

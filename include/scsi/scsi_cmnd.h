@@ -54,6 +54,9 @@ struct scsi_pointer {
 	volatile int phase;
 };
 
+/* for scmd->flags */
+#define SCMD_TAGGED		(1 << 0)
+
 struct scsi_cmnd {
 	struct scsi_device *device;
 	struct list_head list;  /* scsi_cmnd participates in queue lists */
@@ -140,7 +143,7 @@ struct scsi_cmnd {
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserve ABI.
 	 */
-	RH_KABI_RESERVE_P(1)
+	RH_KABI_USE_P(1,	int flags)	/* Command flags */
 	RH_KABI_RESERVE_P(2)
 	RH_KABI_RESERVE_P(3)
 	RH_KABI_RESERVE_P(4)

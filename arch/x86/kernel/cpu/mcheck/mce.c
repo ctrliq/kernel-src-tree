@@ -42,7 +42,9 @@
 #include <linux/irq_work.h>
 #include <linux/export.h>
 
+#include <asm/intel-family.h>
 #include <asm/processor.h>
+#include <asm/traps.h>
 #include <asm/mce.h>
 #include <asm/msr.h>
 #include <asm/reboot.h>
@@ -133,6 +135,9 @@ void mce_setup(struct mce *m)
 	m->socketid = cpu_data(m->extcpu).phys_proc_id;
 	m->apicid = cpu_data(m->extcpu).initial_apicid;
 	rdmsrl(MSR_IA32_MCG_CAP, m->mcgcap);
+
+	if (this_cpu_has(X86_FEATURE_INTEL_PPIN))
+		rdmsrl(MSR_PPIN, m->ppin);
 }
 
 DEFINE_PER_CPU(struct mce, injectm);
@@ -632,16 +637,14 @@ static void mce_read_aux(struct mce *m, int i)
 	}
 }
 
-static bool memory_error(struct mce *m)
+bool mce_is_memory_error(struct mce *m)
 {
-	struct cpuinfo_x86 *c = &boot_cpu_data;
-
-	if (c->x86_vendor == X86_VENDOR_AMD) {
+	if (m->cpuvendor == X86_VENDOR_AMD) {
 		/* ErrCodeExt[20:16] */
 		u8 xec = (m->status >> 16) & 0x1f;
 
 		return (xec == 0x0 || xec == 0x8);
-	} else if (c->x86_vendor == X86_VENDOR_INTEL) {
+	} else if (m->cpuvendor == X86_VENDOR_INTEL) {
 		/*
 		 * Intel SDM Volume 3B - 15.9.2 Compound Error Codes
 		 *
@@ -662,6 +665,7 @@ static bool memory_error(struct mce *m)
 
 	return false;
 }
+EXPORT_SYMBOL_GPL(mce_is_memory_error);
 
 DEFINE_PER_CPU(unsigned, mce_poll_count);
 
@@ -725,7 +729,7 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 
 		severity = mce_severity(&m, mca_cfg.tolerant, NULL, false);
 
-		if (severity == MCE_DEFERRED_SEVERITY && memory_error(&m))
+		if (severity == MCE_DEFERRED_SEVERITY && mce_is_memory_error(&m))
 			if (m.status & MCI_STATUS_ADDRV)
 				m.severity = severity;
 
@@ -1055,6 +1059,20 @@ static void mce_clear_state(unsigned long *toclear)
 	}
 }
 
+static int do_memory_failure(struct mce *m)
+{
+	int flags = MF_ACTION_REQUIRED;
+	int ret;
+
+	pr_err("Uncorrected hardware memory error in user-access at %llx", m->addr);
+	if (!(m->mcgstatus & MCG_STATUS_RIPV))
+		flags |= MF_MUST_KILL;
+	ret = memory_failure(m->addr >> PAGE_SHIFT, MCE_VECTOR, flags);
+	if (ret)
+		pr_err("Memory error not recovered");
+	return ret;
+}
+
 /*
  * The actual machine check handler. This only handles real
  * exceptions when something got corrupted coming in through int 18.
@@ -1093,8 +1111,6 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
 	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
 	char *msg = "Unknown";
-	u64 recover_paddr = ~0ull;
-	int flags = MF_ACTION_REQUIRED;
 
 	/*
 	 * MCEs are always local on AMD. Same is determined by MCG_STATUS_LMCES
@@ -1248,22 +1264,13 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	}
 
 	/*
-	 * At insane "tolerant" levels we take no action. Otherwise
-	 * we only die if we have no other choice. For less serious
-	 * issues we try to recover, or limit damage to the current
-	 * process.
+	 * If tolerant is at an insane level we drop requests to kill
+	 * processes and continue even when there is no way out.
 	 */
-	if (cfg->tolerant < 3) {
-		if (no_way_out)
-			mce_panic("Fatal machine check on current CPU", &m, msg);
-		if (worst == MCE_AR_SEVERITY) {
-			recover_paddr = m.addr;
-			if (!(m.mcgstatus & MCG_STATUS_RIPV))
-				flags |= MF_MUST_KILL;
-		} else if (kill_it) {
-			force_sig(SIGBUS, current);
-		}
-	}
+	if (cfg->tolerant == 3)
+		kill_it = 0;
+	else if (no_way_out)
+		mce_panic("Fatal machine check on current CPU", &m, msg);
 
 	if (worst > 0)
 		mce_report_event(regs);
@@ -1271,22 +1278,20 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 out:
 	sync_core();
 
-	if (recover_paddr == ~0ull)
+	if (worst != MCE_AR_SEVERITY && !kill_it)
 		return;
 
-	pr_err("Uncorrected hardware memory error in user-access at %llx",
-		 recover_paddr);
-	/*
-	 * We must call memory_failure() here even if the current process is
-	 * doomed. We still need to mark the page as poisoned and alert any
-	 * other users of the page.
-	 */
-	local_irq_enable();
-	if (memory_failure(recover_paddr >> PAGE_SHIFT, MCE_VECTOR, flags) < 0) {
-		pr_err("Memory error not recovered");
-		force_sig(SIGBUS, current);
+	/* Fault was in user mode and we need to take some action */
+	if ((m.cs & 3) == 3) {
+		local_irq_enable();
+
+		if (kill_it || do_memory_failure(&m))
+			force_sig(SIGBUS, current);
+		local_irq_disable();
+	} else {
+		if (!mc_fixup_exception(regs, X86_TRAP_MC))
+			mce_panic("Failed kernel mode recovery", &m, NULL);
 	}
-	local_irq_disable();
 }
 EXPORT_SYMBOL_GPL(do_machine_check);
 
@@ -1769,6 +1774,11 @@ static void unexpected_machine_check(struct pt_regs *regs, long error_code)
 void (*machine_check_vector)(struct pt_regs *, long error_code) =
 						unexpected_machine_check;
 
+dotraplinkage void do_mce(struct pt_regs *regs, long error_code)
+{
+	machine_check_vector(regs, error_code);
+}
+
 /*
  * Called for each booted CPU to set up machine checks.
  * Must be called with preempt off:
@@ -2099,6 +2109,7 @@ void mce_disable_bank(int bank)
  * mce=bootlog Log MCEs from before booting. Disabled by default on AMD.
  * mce=nobootlog Don't log MCEs from before booting.
  * mce=bios_cmci_threshold Don't program the CMCI threshold
+ * mce=recovery force enable memcpy_mcsafe()
  */
 static int __init mcheck_enable(char *str)
 {
@@ -2124,6 +2135,8 @@ static int __init mcheck_enable(char *str)
 		cfg->bootlog = (str[0] == 'b');
 	else if (!strcmp(str, "bios_cmci_threshold"))
 		cfg->bios_cmci_threshold = true;
+	else if (!strcmp(str, "recovery"))
+		cfg->recovery = true;
 	else if (isdigit(str[0])) {
 		if (get_option(&str, &cfg->tolerant) == 2)
 			get_option(&str, &(cfg->monarch_timeout));
@@ -2695,8 +2708,14 @@ static int __init mcheck_debugfs_init(void)
 static int __init mcheck_debugfs_init(void) { return -EINVAL; }
 #endif
 
+struct static_key mcsafe_key = STATIC_KEY_INIT_FALSE;
+EXPORT_SYMBOL_GPL(mcsafe_key);
+
 static int __init mcheck_late_init(void)
 {
+	if (mca_cfg.recovery)
+		static_key_slow_inc(&mcsafe_key);
+
 	mcheck_debugfs_init();
 
 	/*

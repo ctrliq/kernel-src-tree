@@ -7,6 +7,7 @@
 #include <linux/kthread.h>
 #include <linux/net.h>
 #include <linux/nsproxy.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/socket.h>
 #include <linux/string.h>
@@ -466,11 +467,16 @@ static int ceph_tcp_connect(struct ceph_connection *con)
 {
 	struct sockaddr_storage *paddr = &con->peer_addr.in_addr;
 	struct socket *sock;
+	unsigned int noio_flag;
 	int ret;
 
 	BUG_ON(con->sock);
+
+	/* __sock_create() allocates with GFP_KERNEL */
+	noio_flag = memalloc_noio_save();
 	ret = __sock_create(read_pnet(&con->msgr->net), paddr->ss_family,
 			    SOCK_STREAM, IPPROTO_TCP, &sock, 1);
+	memalloc_noio_restore(noio_flag);
 	if (ret)
 		return ret;
 	sock->sk->sk_allocation = GFP_NOFS;
@@ -1246,6 +1252,7 @@ static void prepare_write_message(struct ceph_connection *con)
 	/* Sneak an ack in there first?  If we can get it into the same
 	 * TCP packet that's a good thing. */
 	if (con->in_seq > con->in_seq_acked) {
+		gmb();
 		con->in_seq_acked = con->in_seq;
 		con_out_kvec_add(con, sizeof (tag_ack), &tag_ack);
 		con->out_temp_ack = cpu_to_le64(con->in_seq_acked);
@@ -3437,7 +3444,7 @@ static void ceph_msg_release(struct kref *kref)
 struct ceph_msg *ceph_msg_get(struct ceph_msg *msg)
 {
 	dout("%s %p (was %d)\n", __func__, msg,
-	     atomic_read(&msg->kref.refcount));
+	     kref_read(&msg->kref));
 	kref_get(&msg->kref);
 	return msg;
 }
@@ -3446,7 +3453,7 @@ EXPORT_SYMBOL(ceph_msg_get);
 void ceph_msg_put(struct ceph_msg *msg)
 {
 	dout("%s %p (was %d)\n", __func__, msg,
-	     atomic_read(&msg->kref.refcount));
+	     kref_read(&msg->kref));
 	kref_put(&msg->kref, ceph_msg_release);
 }
 EXPORT_SYMBOL(ceph_msg_put);

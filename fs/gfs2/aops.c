@@ -1114,7 +1114,7 @@ static ssize_t gfs2_direct_IO(int rw, struct kiocb *iocb,
 	gfs2_holder_init(ip->i_gl, LM_ST_DEFERRED, 0, &gh);
 	rv = gfs2_glock_nq(&gh);
 	if (rv)
-		return rv;
+		goto out_uninit;
 	rv = gfs2_ok_for_dio(ip, rw, offset);
 	if (rv != 1)
 		goto out; /* dio not valid, fall back to buffered i/o */
@@ -1154,6 +1154,7 @@ static ssize_t gfs2_direct_IO(int rw, struct kiocb *iocb,
 				  NULL, NULL, 0);
 out:
 	gfs2_glock_dq(&gh);
+out_uninit:
 	gfs2_holder_uninit(&gh);
 	return rv;
 }

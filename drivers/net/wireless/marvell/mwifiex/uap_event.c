@@ -202,7 +202,7 @@ int mwifiex_process_uap_event(struct mwifiex_private *priv)
 			    "AP EVENT: event id: %#x\n", eventcause);
 		break;
 	case EVENT_AMSDU_AGGR_CTRL:
-		ctrl = le16_to_cpu(*(__le16 *)adapter->event_body);
+		ctrl = get_unaligned_le16(adapter->event_body);
 		mwifiex_dbg(adapter, EVENT,
 			    "event: AMSDU_AGGR_CTRL %d\n", ctrl);
 
@@ -305,6 +305,22 @@ int mwifiex_process_uap_event(struct mwifiex_private *priv)
 	case EVENT_MULTI_CHAN_INFO:
 		mwifiex_dbg(adapter, EVENT, "event: multi-chan info\n");
 		mwifiex_process_multi_chan_event(priv, adapter->event_skb);
+		break;
+	case EVENT_RXBA_SYNC:
+		dev_dbg(adapter->dev, "EVENT: RXBA_SYNC\n");
+		mwifiex_11n_rxba_sync_event(priv, adapter->event_body,
+					    adapter->event_skb->len -
+					    sizeof(eventcause));
+		break;
+
+	case EVENT_REMAIN_ON_CHAN_EXPIRED:
+		mwifiex_dbg(adapter, EVENT,
+			    "event: uap: Remain on channel expired\n");
+		cfg80211_remain_on_channel_expired(&priv->wdev,
+						   priv->roc_cfg.cookie,
+						   &priv->roc_cfg.chan,
+						   GFP_ATOMIC);
+		memset(&priv->roc_cfg, 0x00, sizeof(struct mwifiex_roc_cfg));
 		break;
 
 	default:

@@ -33,6 +33,7 @@ union nf_conntrack_proto {
 	struct ip_ct_sctp sctp;
 	struct ip_ct_tcp tcp;
 	struct nf_ct_gre gre;
+	unsigned int tmpl_padto;
 };
 
 union nf_conntrack_expect_proto {
@@ -232,14 +233,6 @@ extern s32 (*nf_ct_nat_offset)(const struct nf_conn *ct,
 			       enum ip_conntrack_dir dir,
 			       u32 seq);
 
-/* Fake conntrack entry for untracked connections */
-DECLARE_PER_CPU(struct nf_conn, nf_conntrack_untracked);
-static inline struct nf_conn *nf_ct_untracked_get(void)
-{
-	return &__raw_get_cpu_var(nf_conntrack_untracked);
-}
-void nf_ct_untracked_status_or(unsigned long bits);
-
 /* Iterate over all conntracks: if iter returns true, it's deleted. */
 void nf_ct_iterate_cleanup(struct net *net,
 			   int (*iter)(struct nf_conn *i, void *data),
@@ -272,7 +265,7 @@ static inline int nf_ct_is_dying(struct nf_conn *ct)
 
 static inline int nf_ct_is_untracked(const struct nf_conn *ct)
 {
-	return test_bit(IPS_UNTRACKED_BIT, &ct->status);
+	return false;
 }
 
 /* Packet is received from loopback */
@@ -301,6 +294,13 @@ struct nf_conn *nf_ct_tmpl_alloc(struct net *net,
 				 const struct nf_conntrack_zone *zone,
 				 gfp_t flags);
 void nf_ct_tmpl_free(struct nf_conn *tmpl);
+
+static inline void
+nf_ct_set(struct sk_buff *skb, struct nf_conn *ct, enum ip_conntrack_info info)
+{
+	skb->nfct = &ct->ct_general;
+	skb->nfctinfo = info;
+}
 
 #define NF_CT_STAT_INC(net, count)	  __this_cpu_inc((net)->ct.stat->count)
 #define NF_CT_STAT_INC_ATOMIC(net, count) this_cpu_inc((net)->ct.stat->count)

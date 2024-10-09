@@ -143,7 +143,6 @@ int cpuidle_idle_call(void)
 		/* give the governor an opportunity to reflect on the outcome */
 		if (cpuidle_curr_governor->reflect)
 			cpuidle_curr_governor->reflect(dev, next_state);
-		local_irq_enable();
 		return 0;
 	}
 

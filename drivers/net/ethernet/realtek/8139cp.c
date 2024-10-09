@@ -1874,7 +1874,7 @@ static const struct net_device_ops cp_netdev_ops = {
 	.ndo_start_xmit		= cp_start_xmit,
 	.ndo_tx_timeout		= cp_tx_timeout,
 	.ndo_set_features	= cp_set_features,
-	.ndo_change_mtu		= cp_change_mtu,
+	.ndo_change_mtu_rh74	= cp_change_mtu,
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= cp_poll_controller,

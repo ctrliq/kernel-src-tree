@@ -34,6 +34,7 @@
 #define _MLX5_FS_CORE_
 
 #include <linux/mlx5/fs.h>
+#include <linux/rhashtable.h>
 
 enum fs_node_type {
 	FS_TYPE_NAMESPACE,
@@ -65,6 +66,8 @@ enum fs_fte_status {
 
 struct mlx5_flow_steering {
 	struct mlx5_core_dev *dev;
+	struct kmem_cache               *fgs_cache;
+	struct kmem_cache               *ftes_cache;
 	struct mlx5_flow_root_namespace *root_ns;
 	struct mlx5_flow_root_namespace *fdb_root_ns;
 	struct mlx5_flow_root_namespace *esw_egress_root_ns;
@@ -80,9 +83,12 @@ struct fs_node {
 	struct fs_node		*parent;
 	struct fs_node		*root;
 	/* lock the node for writing and traversing */
-	struct mutex		lock;
+	struct rw_semaphore	lock;
 	atomic_t		refcount;
-	void			(*remove_func)(struct fs_node *);
+	bool			active;
+	void			(*del_hw_func)(struct fs_node *);
+	void			(*del_sw_func)(struct fs_node *);
+	atomic_t		version;
 };
 
 struct mlx5_flow_rule {
@@ -119,7 +125,7 @@ struct mlx5_flow_table {
 	/* FWD rules that point on this flow table */
 	struct list_head		fwd_rules;
 	u32				flags;
-	u32				underlay_qpn;
+	struct rhltable			fgs_hash;
 };
 
 struct mlx5_fc_cache {
@@ -145,10 +151,27 @@ struct mlx5_fc {
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
 };
 
+struct mlx5_ft_underlay_qp {
+	struct list_head list;
+	u32 qpn;
+};
+
+#define MLX5_FTE_MATCH_PARAM_RESERVED	reserved_at_600
+/* Calculate the fte_match_param length and without the reserved length.
+ * Make sure the reserved field is the last.
+ */
+#define MLX5_ST_SZ_DW_MATCH_PARAM					    \
+	((MLX5_BYTE_OFF(fte_match_param, MLX5_FTE_MATCH_PARAM_RESERVED) / sizeof(u32)) + \
+	 BUILD_BUG_ON_ZERO(MLX5_ST_SZ_BYTES(fte_match_param) !=		     \
+			   MLX5_FLD_SZ_BYTES(fte_match_param,		     \
+					     MLX5_FTE_MATCH_PARAM_RESERVED) +\
+			   MLX5_BYTE_OFF(fte_match_param,		     \
+					 MLX5_FTE_MATCH_PARAM_RESERVED)))
+
 /* Type of children is mlx5_flow_rule */
 struct fs_fte {
 	struct fs_node			node;
-	u32				val[MLX5_ST_SZ_DW(fte_match_param)];
+	u32				val[MLX5_ST_SZ_DW_MATCH_PARAM];
 	u32				dests_size;
 	u32				flow_tag;
 	u32				index;
@@ -157,6 +180,7 @@ struct fs_fte {
 	u32				modify_id;
 	enum fs_fte_status		status;
 	struct mlx5_fc			*counter;
+	struct rhash_head		hash;
 };
 
 /* Type of children is mlx5_flow_table/namespace */
@@ -176,7 +200,7 @@ struct mlx5_flow_namespace {
 
 struct mlx5_flow_group_mask {
 	u8	match_criteria_enable;
-	u32	match_criteria[MLX5_ST_SZ_DW(fte_match_param)];
+	u32	match_criteria[MLX5_ST_SZ_DW_MATCH_PARAM];
 };
 
 /* Type of children is fs_fte */
@@ -185,8 +209,10 @@ struct mlx5_flow_group {
 	struct mlx5_flow_group_mask	mask;
 	u32				start_index;
 	u32				max_ftes;
-	u32				num_ftes;
+	struct ida			fte_allocator;
 	u32				id;
+	struct rhashtable		ftes_hash;
+	struct rhlist_head		hash;
 };
 
 struct mlx5_flow_root_namespace {
@@ -196,10 +222,16 @@ struct mlx5_flow_root_namespace {
 	struct mlx5_flow_table		*root_ft;
 	/* Should be held when chaining flow tables */
 	struct mutex			chain_lock;
+	struct list_head		underlay_qpns;
 };
 
 int mlx5_init_fc_stats(struct mlx5_core_dev *dev);
 void mlx5_cleanup_fc_stats(struct mlx5_core_dev *dev);
+void mlx5_fc_queue_stats_work(struct mlx5_core_dev *dev,
+			      struct delayed_work *dwork,
+			      unsigned long delay);
+void mlx5_fc_update_sampling_interval(struct mlx5_core_dev *dev,
+				      unsigned long interval);
 
 int mlx5_init_fs(struct mlx5_core_dev *dev);
 void mlx5_cleanup_fs(struct mlx5_core_dev *dev);

@@ -14,7 +14,6 @@
 #include <linux/cpumask.h>
 #include <linux/pci-aspm.h>
 #include <linux/aer.h>
-#include <asm-generic/pci-bridge.h>
 #include <linux/pm_runtime.h>
 #include "pci.h"
 
@@ -1076,6 +1075,24 @@ void set_pcie_hotplug_bridge(struct pci_dev *pdev)
 		pdev->is_hotplug_bridge = 1;
 }
 
+static void set_pcie_thunderbolt(struct pci_dev *dev)
+{
+	int vsec = 0;
+	u32 header;
+
+	while ((vsec = pci_find_next_ext_capability(dev, vsec,
+						    PCI_EXT_CAP_ID_VNDR))) {
+		pci_read_config_dword(dev, vsec + PCI_VNDR_HEADER, &header);
+
+		/* Is the device part of a Thunderbolt controller? */
+		if (dev->vendor == PCI_VENDOR_ID_INTEL &&
+		    PCI_VNDR_HEADER_ID(header) == PCI_VSEC_ID_INTEL_TBT) {
+			dev->is_thunderbolt = 1;
+			return;
+		}
+	}
+}
+
 /**
  * pci_ext_cfg_is_aliased - is ext config space just an alias of std config?
  * @dev: PCI device
@@ -1227,6 +1244,9 @@ int pci_setup_device(struct pci_dev *dev)
 
 	/* need to have dev->class ready */
 	dev->cfg_size = pci_cfg_space_size(dev);
+
+	/* need to have dev->cfg_size ready */
+	set_pcie_thunderbolt(dev);
 
 	/* "Unknown power state" */
 	dev->current_state = PCI_UNKNOWN;
@@ -1520,12 +1540,55 @@ static void program_hpp_type2(struct pci_dev *dev, struct hpp_type2 *hpp)
 	 */
 }
 
+/**
+ * pcie_relaxed_ordering_enabled - Probe for PCIe relaxed ordering enable
+ * @dev: PCI device to query
+ *
+ * Returns true if the device has enabled relaxed ordering attribute.
+ */
+bool pcie_relaxed_ordering_enabled(struct pci_dev *dev)
+{
+	u16 v;
+
+	pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &v);
+
+	return !!(v & PCI_EXP_DEVCTL_RELAX_EN);
+}
+EXPORT_SYMBOL(pcie_relaxed_ordering_enabled);
+
+static void pci_configure_relaxed_ordering(struct pci_dev *dev)
+{
+	struct pci_dev *root;
+
+	/* PCI_EXP_DEVICE_RELAX_EN is RsvdP in VFs */
+	if (dev->is_virtfn)
+		return;
+
+	if (!pcie_relaxed_ordering_enabled(dev))
+		return;
+
+	/*
+	 * For now, we only deal with Relaxed Ordering issues with Root
+	 * Ports. Peer-to-Peer DMA is another can of worms.
+	 */
+	root = pci_find_pcie_root_port(dev);
+	if (!root)
+		return;
+
+	if (root->dev_flags & PCI_DEV_FLAGS_NO_RELAXED_ORDERING) {
+		pcie_capability_clear_word(dev, PCI_EXP_DEVCTL,
+					   PCI_EXP_DEVCTL_RELAX_EN);
+		dev_info(&dev->dev, "Disable Relaxed Ordering because the Root Port didn't support it\n");
+	}
+}
+
 static void pci_configure_device(struct pci_dev *dev)
 {
 	struct hotplug_params hpp;
 	int ret;
 
 	pci_configure_mps(dev);
+        pci_configure_relaxed_ordering(dev);
 
 	memset(&hpp, 0, sizeof(hpp));
 	ret = pci_get_hp_params(dev, &hpp);

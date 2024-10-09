@@ -12,6 +12,8 @@
 #define XSTATE_OPMASK		0x20
 #define XSTATE_ZMM_Hi256	0x40
 #define XSTATE_Hi16_ZMM		0x80
+#define XSTATE_PT_UNIMPLEMENTED_SO_FAR	0x100
+#define XSTATE_PKRU	0x200
 #define XSTATE_BNDREGS	0x8
 #define XSTATE_BNDCSR	0x10
 
@@ -33,7 +35,7 @@
 			| XSTATE_OPMASK | XSTATE_ZMM_Hi256 | XSTATE_Hi16_ZMM)
 
 /* Supported features which require eager state saving */
-#define XSTATE_EAGER	(XSTATE_BNDREGS | XSTATE_BNDCSR)
+#define XSTATE_EAGER	(XSTATE_BNDREGS | XSTATE_BNDCSR | XSTATE_PKRU)
 
 /* All currently supported features */
 #define XCNTXT_MASK	(XSTATE_LAZY | XSTATE_EAGER)

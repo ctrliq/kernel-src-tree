@@ -49,7 +49,7 @@
 #include <asm/syscalls.h>
 #include <asm/debugreg.h>
 #include <asm/switch_to.h>
-#include <asm/intel_rdt.h>
+#include <asm/intel_rdt_sched.h>
 
 asmlinkage extern void ret_from_fork(void);
 
@@ -119,6 +119,8 @@ void __show_regs(struct pt_regs *regs, int all)
 		       d3, d6, d7);
 	}
 
+	if (boot_cpu_has(X86_FEATURE_OSPKE))
+		printk(KERN_DEFAULT "PKRU: %08x\n", read_pkru());
 }
 
 void release_thread(struct task_struct *dead_task)
@@ -287,9 +289,6 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	fpu_switch_t fpu;
 
 	fpu = switch_fpu_prepare(prev_p, next_p, cpu);
-
-	/* Reload esp0 and ss1. */
-	load_sp0(tss, next);
 
 	/* We must save %fs and %gs before load_TLS() because
 	 * %fs and %gs may be cleared by load_TLS().

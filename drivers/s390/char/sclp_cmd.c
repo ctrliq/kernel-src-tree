@@ -269,6 +269,7 @@ static int sclp_attach_storage(u8 id)
 	if (!sccb)
 		return -ENOMEM;
 	sccb->header.length = PAGE_SIZE;
+	sccb->header.function_code = 0x40;
 	rc = sclp_sync_request(0x00080001 | id << 8, sccb);
 	if (rc)
 		goto out;

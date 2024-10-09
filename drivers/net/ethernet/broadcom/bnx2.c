@@ -2301,7 +2301,7 @@ bnx2_init_5706s_phy(struct bnx2 *bp, int reset_phy)
 	if (BNX2_CHIP(bp) == BNX2_CHIP_5706)
 		BNX2_WR(bp, BNX2_MISC_GP_HW_CTL0, 0x300);
 
-	if (bp->dev->mtu > 1500) {
+	if (bp->dev->mtu > ETH_DATA_LEN) {
 		u32 val;
 
 		/* Set extended packet length bit */
@@ -2355,7 +2355,7 @@ bnx2_init_copper_phy(struct bnx2 *bp, int reset_phy)
 		bnx2_write_phy(bp, MII_BNX2_DSP_RW_PORT, val);
 	}
 
-	if (bp->dev->mtu > 1500) {
+	if (bp->dev->mtu > ETH_DATA_LEN) {
 		/* Set extended packet length bit */
 		bnx2_write_phy(bp, 0x18, 0x7);
 		bnx2_read_phy(bp, 0x18, &val);
@@ -3515,7 +3515,7 @@ static int bnx2_poll_msix(struct napi_struct *napi, int budget)
 		rmb();
 		if (likely(!bnx2_has_fast_work(bnapi))) {
 
-			napi_complete(napi);
+			napi_complete_done(napi, work_done);
 			BNX2_WR(bp, BNX2_PCICFG_INT_ACK_CMD, bnapi->int_num |
 				BNX2_PCICFG_INT_ACK_CMD_INDEX_VALID |
 				bnapi->last_status_idx);
@@ -3552,7 +3552,7 @@ static int bnx2_poll(struct napi_struct *napi, int budget)
 
 		rmb();
 		if (likely(!bnx2_has_work(bnapi))) {
-			napi_complete(napi);
+			napi_complete_done(napi, work_done);
 			if (likely(bp->flags & BNX2_FLAG_USING_MSI_OR_MSIX)) {
 				BNX2_WR(bp, BNX2_PCICFG_INT_ACK_CMD,
 					BNX2_PCICFG_INT_ACK_CMD_INDEX_VALID |
@@ -5000,12 +5000,12 @@ bnx2_init_chip(struct bnx2 *bp)
 	/* Program the MTU.  Also include 4 bytes for CRC32. */
 	mtu = bp->dev->mtu;
 	val = mtu + ETH_HLEN + ETH_FCS_LEN;
-	if (val > (MAX_ETHERNET_PACKET_SIZE + 4))
+	if (val > (MAX_ETHERNET_PACKET_SIZE + ETH_HLEN + 4))
 		val |= BNX2_EMAC_RX_MTU_SIZE_JUMBO_ENA;
 	BNX2_WR(bp, BNX2_EMAC_RX_MTU_SIZE, val);
 
-	if (mtu < 1500)
-		mtu = 1500;
+	if (mtu < ETH_DATA_LEN)
+		mtu = ETH_DATA_LEN;
 
 	bnx2_reg_wr_ind(bp, BNX2_RBUF_CONFIG, BNX2_RBUF_CONFIG_VAL(mtu));
 	bnx2_reg_wr_ind(bp, BNX2_RBUF_CONFIG2, BNX2_RBUF_CONFIG2_VAL(mtu));
@@ -6821,13 +6821,13 @@ bnx2_save_stats(struct bnx2 *bp)
 	(unsigned long) (bp->stats_blk->ctr +			\
 			 bp->temp_stats_blk->ctr)
 
-static struct rtnl_link_stats64 *
+static void
 bnx2_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *net_stats)
 {
 	struct bnx2 *bp = netdev_priv(dev);
 
 	if (bp->stats_blk == NULL)
-		return net_stats;
+		return;
 
 	net_stats->rx_packets =
 		GET_64BIT_NET_STATS(stat_IfHCInUcastPkts) +
@@ -6891,7 +6891,6 @@ bnx2_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *net_stats)
 		GET_32BIT_NET_STATS(stat_IfInMBUFDiscards) +
 		GET_32BIT_NET_STATS(stat_FwRxDrop);
 
-	return net_stats;
 }
 
 /* All ethtool functions called with rtnl_lock */
@@ -7924,10 +7923,6 @@ bnx2_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct bnx2 *bp = netdev_priv(dev);
 
-	if (((new_mtu + ETH_HLEN) > MAX_ETHERNET_JUMBO_PACKET_SIZE) ||
-		((new_mtu + ETH_HLEN) < MIN_ETHERNET_PACKET_SIZE))
-		return -EINVAL;
-
 	dev->mtu = new_mtu;
 	return bnx2_change_ring_size(bp, bp->rx_ring_size, bp->tx_ring_size,
 				     false);
@@ -8467,10 +8462,8 @@ bnx2_init_board(struct pci_dev *pdev, struct net_device *dev)
 	bnx2_set_default_link(bp);
 	bp->req_flow_ctrl = FLOW_CTRL_RX | FLOW_CTRL_TX;
 
-	init_timer(&bp->timer);
+	setup_timer(&bp->timer, bnx2_timer, (unsigned long)bp);
 	bp->timer.expires = RUN_AT(BNX2_TIMER_INTERVAL);
-	bp->timer.data = (unsigned long) bp;
-	bp->timer.function = bnx2_timer;
 
 #ifdef BCM_CNIC
 	if (bnx2_shmem_rd(bp, BNX2_ISCSI_INITIATOR) & BNX2_ISCSI_INITIATOR_EN)
@@ -8553,6 +8546,7 @@ bnx2_init_napi(struct bnx2 *bp)
 }
 
 static const struct net_device_ops bnx2_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= bnx2_open,
 	.ndo_start_xmit		= bnx2_start_xmit,
 	.ndo_stop		= bnx2_close,
@@ -8561,7 +8555,7 @@ static const struct net_device_ops bnx2_netdev_ops = {
 	.ndo_do_ioctl		= bnx2_ioctl,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= bnx2_change_mac_addr,
-	.ndo_change_mtu		= bnx2_change_mtu,
+	.extended.ndo_change_mtu	= bnx2_change_mtu,
 	.ndo_set_features	= bnx2_set_features,
 	.ndo_tx_timeout		= bnx2_tx_timeout,
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -8620,6 +8614,8 @@ bnx2_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	dev->hw_features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
 	dev->features |= dev->hw_features;
 	dev->priv_flags |= IFF_UNICAST_FLT;
+	dev->extended->min_mtu = MIN_ETHERNET_PACKET_SIZE;
+	dev->extended->max_mtu = MAX_ETHERNET_JUMBO_PACKET_SIZE;
 
 	if (!(bp->flags & BNX2_FLAG_CAN_KEEP_VLAN))
 		dev->hw_features &= ~NETIF_F_HW_VLAN_CTAG_RX;

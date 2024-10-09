@@ -1000,7 +1000,7 @@ static struct snd_soc_component *soc_find_component(
  *
  * @dlc: name of the DAI or the DAI driver and optional component info to match
  *
- * This function will search all regsitered components and their DAIs to
+ * This function will search all registered components and their DAIs to
  * find the DAI of the same name. The component's of_node and name
  * should also match if being specified.
  *
@@ -1046,7 +1046,7 @@ EXPORT_SYMBOL_GPL(snd_soc_find_dai);
  * @card: soc card
  * @id: DAI link ID to match
  * @name: DAI link name to match, optional
- * @stream name: DAI link stream name to match, optional
+ * @stream_name: DAI link stream name to match, optional
  *
  * This function will search all existing DAI links of the soc card to
  * find the link of the same ID. Since DAI links may not have their
@@ -2006,7 +2006,7 @@ static int is_dmi_valid(const char *field)
 		if (strstr(field, dmi_blacklist[i]))
 			return 0;
 		i++;
-	};
+	}
 
 	return 1;
 }
@@ -3170,7 +3170,7 @@ static int snd_soc_register_dais(struct snd_soc_component *component,
 	unsigned int i;
 	int ret;
 
-	dev_dbg(dev, "ASoC: dai register %s #%Zu\n", dev_name(dev), count);
+	dev_dbg(dev, "ASoC: dai register %s #%zu\n", dev_name(dev), count);
 
 	component->dai_drv = dai_drv;
 
@@ -4222,6 +4222,8 @@ int snd_soc_get_dai_id(struct device_node *ep)
 		break;
 	}
 	mutex_unlock(&client_mutex);
+
+	of_node_put(node);
 
 	return ret;
 }

@@ -72,6 +72,10 @@ struct tc_estimator {
 #define TC_H_UNSPEC	(0U)
 #define TC_H_ROOT	(0xFFFFFFFFU)
 #define TC_H_INGRESS    (0xFFFFFFF1U)
+#define TC_H_CLSACT	TC_H_INGRESS
+
+#define TC_H_MIN_INGRESS	0xFFF2U
+#define TC_H_MIN_EGRESS		0xFFF3U
 
 /* Need to corrospond to iproute2 tc/tc_core.h "enum link_layer" */
 enum tc_link_layer {
@@ -612,6 +616,14 @@ struct tc_drr_stats {
 /* MQPRIO */
 #define TC_QOPT_BITMASK 15
 #define TC_QOPT_MAX_QUEUE 16
+
+enum {
+	TC_MQPRIO_HW_OFFLOAD_NONE,	/* no offload requested */
+	TC_MQPRIO_HW_OFFLOAD_TCS,	/* offload TCs, no queue counts */
+	__TC_MQPRIO_HW_OFFLOAD_MAX
+};
+
+#define TC_MQPRIO_HW_OFFLOAD_MAX (__TC_MQPRIO_HW_OFFLOAD_MAX - 1)
 
 struct tc_mqprio_qopt {
 	__u8	num_tc;

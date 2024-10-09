@@ -15,7 +15,7 @@
 #include <linux/sched.h>
 #include <linux/pci.h>
 
-#include <asm/processor.h>
+#include <asm/cpufeature.h>
 #include <linux/smp.h>
 #include <asm/amd_nb.h>
 #include <asm/smp.h>
@@ -751,7 +751,22 @@ static int cache_shared_amd_cpu_map_setup(unsigned int cpu, int index)
 	struct _cpuid4_info *this_leaf;
 	int i, sibling;
 
-	if (cpu_has_topoext) {
+	/*
+	 * For L3, always use the pre-calculated cpu_llc_shared_mask
+	 * to derive shared_cpu_map.
+	 */
+	if (index == 3) {
+		for_each_cpu(i, cpu_llc_shared_mask(cpu)) {
+			if (!per_cpu(ici_cpuid4_info, i))
+				continue;
+			this_leaf = CPUID4_INFO_IDX(i, index);
+			for_each_cpu(sibling, cpu_llc_shared_mask(cpu)) {
+				if (!cpu_online(sibling))
+					continue;
+				set_bit(sibling, this_leaf->shared_cpu_map);
+			}
+		}
+	} else if (cpu_has_topoext) {
 		unsigned int apicid, nshared, first, last;
 
 		if (!per_cpu(ici_cpuid4_info, cpu))
@@ -774,17 +789,6 @@ static int cache_shared_amd_cpu_map_setup(unsigned int cpu, int index)
 			for_each_online_cpu(sibling) {
 				apicid = cpu_data(sibling).apicid;
 				if ((apicid < first) || (apicid > last))
-					continue;
-				set_bit(sibling, this_leaf->shared_cpu_map);
-			}
-		}
-	} else if (index == 3) {
-		for_each_cpu(i, cpu_llc_shared_mask(cpu)) {
-			if (!per_cpu(ici_cpuid4_info, i))
-				continue;
-			this_leaf = CPUID4_INFO_IDX(i, index);
-			for_each_cpu(sibling, cpu_llc_shared_mask(cpu)) {
-				if (!cpu_online(sibling))
 					continue;
 				set_bit(sibling, this_leaf->shared_cpu_map);
 			}

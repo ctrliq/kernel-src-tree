@@ -477,7 +477,6 @@ static void mlx5_lag_dev_remove_pf(struct mlx5_lag *ldev,
 	mutex_unlock(&lag_mutex);
 }
 
-
 /* Must be called with intf_mutex held */
 void mlx5_lag_add(struct mlx5_core_dev *dev, struct net_device *netdev)
 {

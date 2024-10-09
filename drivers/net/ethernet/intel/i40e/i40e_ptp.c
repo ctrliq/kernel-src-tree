@@ -367,6 +367,7 @@ void i40e_ptp_tx_hang(struct i40e_pf *pf)
 void i40e_ptp_tx_hwtstamp(struct i40e_pf *pf)
 {
 	struct skb_shared_hwtstamps shhwtstamps;
+	struct sk_buff *skb = pf->ptp_tx_skb;
 	struct i40e_hw *hw = &pf->hw;
 	u32 hi, lo;
 	u64 ns;
@@ -382,12 +383,19 @@ void i40e_ptp_tx_hwtstamp(struct i40e_pf *pf)
 	hi = rd32(hw, I40E_PRTTSYN_TXTIME_H);
 
 	ns = (((u64)hi) << 32) | lo;
-
 	i40e_ptp_convert_to_hwtstamp(&shhwtstamps, ns);
-	skb_tstamp_tx(pf->ptp_tx_skb, &shhwtstamps);
-	dev_kfree_skb_any(pf->ptp_tx_skb);
+
+	/* Clear the bit lock as soon as possible after reading the register,
+	 * and prior to notifying the stack via skb_tstamp_tx(). Otherwise
+	 * applications might wake up and attempt to request another transmit
+	 * timestamp prior to the bit lock being cleared.
+	 */
 	pf->ptp_tx_skb = NULL;
-	clear_bit_unlock(__I40E_PTP_TX_IN_PROGRESS, &pf->state);
+	clear_bit_unlock(__I40E_PTP_TX_IN_PROGRESS, pf->state);
+
+	/* Notify the stack and free the skb after we've unlocked */
+	skb_tstamp_tx(skb, &shhwtstamps);
+	dev_kfree_skb_any(skb);
 }
 
 /**
@@ -561,7 +569,7 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
 	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
 	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
 	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
-		if (!(pf->flags & I40E_FLAG_PTP_L4_CAPABLE))
+		if (!(pf->hw_features & I40E_HW_PTP_L4_CAPABLE))
 			return -ERANGE;
 		pf->ptp_rx = true;
 		tsyntype = I40E_PRTTSYN_CTL1_V1MESSTYPE0_MASK |
@@ -575,7 +583,7 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
 	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
 	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
 	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
-		if (!(pf->flags & I40E_FLAG_PTP_L4_CAPABLE))
+		if (!(pf->hw_features & I40E_HW_PTP_L4_CAPABLE))
 			return -ERANGE;
 		/* fall through */
 	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:
@@ -584,13 +592,14 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
 		pf->ptp_rx = true;
 		tsyntype = I40E_PRTTSYN_CTL1_V2MESSTYPE0_MASK |
 			   I40E_PRTTSYN_CTL1_TSYNTYPE_V2;
-		if (pf->flags & I40E_FLAG_PTP_L4_CAPABLE) {
+		if (pf->hw_features & I40E_HW_PTP_L4_CAPABLE) {
 			tsyntype |= I40E_PRTTSYN_CTL1_UDP_ENA_MASK;
 			config->rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
 		} else {
 			config->rx_filter = HWTSTAMP_FILTER_PTP_V2_L2_EVENT;
 		}
 		break;
+	case HWTSTAMP_FILTER_NTP_ALL:
 	case HWTSTAMP_FILTER_ALL:
 	default:
 		return -ERANGE;
@@ -797,7 +806,7 @@ void i40e_ptp_stop(struct i40e_pf *pf)
 	if (pf->ptp_tx_skb) {
 		dev_kfree_skb_any(pf->ptp_tx_skb);
 		pf->ptp_tx_skb = NULL;
-		clear_bit_unlock(__I40E_PTP_TX_IN_PROGRESS, &pf->state);
+		clear_bit_unlock(__I40E_PTP_TX_IN_PROGRESS, pf->state);
 	}
 
 	if (pf->ptp_clock) {

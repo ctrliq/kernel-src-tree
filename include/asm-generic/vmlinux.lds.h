@@ -254,6 +254,9 @@
 									\
 	BUG_TABLE							\
 									\
+	UNWIND_END_OF_STACK_TABLE					\
+	UNWIND_UNSAFE_STACK_TABLE					\
+									\
 	/* PCI quirks */						\
 	.pci_fixup        : AT(ADDR(.pci_fixup) - LOAD_OFFSET) {	\
 		VMLINUX_SYMBOL(__start_pci_fixups_early) = .;		\
@@ -489,6 +492,17 @@
 	}
 
 /*
+ * MC Exception table
+ */
+#define MC_EXCEPTION_TABLE(align)						\
+	. = ALIGN(align);						\
+	__mc_table : AT(ADDR(__mc_table) - LOAD_OFFSET) {		\
+		VMLINUX_SYMBOL(__start___mc_table) = .;			\
+		*(__mc_table)						\
+		VMLINUX_SYMBOL(__stop___mc_table) = .;			\
+	}
+
+/*
  * Init task
  */
 #define INIT_TASK_DATA_SECTION(align)					\
@@ -626,6 +640,26 @@
 #define BUG_TABLE
 #endif
 
+#ifdef CONFIG_X86_64
+#define UNWIND_END_OF_STACK_TABLE					\
+	. = ALIGN(8);							\
+	__unwind_end_of_stack : AT(ADDR(__unwind_end_of_stack) - LOAD_OFFSET) {\
+		VMLINUX_SYMBOL(__start___unwind_end_of_stack) = .;	\
+		*(__unwind_end_of_stack)				\
+		VMLINUX_SYMBOL(__stop___unwind_end_of_stack) = .;	\
+	}
+#define UNWIND_UNSAFE_STACK_TABLE					\
+	. = ALIGN(8);							\
+	__unwind_unsafe_stack : AT(ADDR(__unwind_unsafe_stack) - LOAD_OFFSET) {\
+		VMLINUX_SYMBOL(__start___unwind_unsafe_stack) = .;	\
+		*(__unwind_unsafe_stack)				\
+		VMLINUX_SYMBOL(__stop___unwind_unsafe_stack) = .;	\
+	}
+#else
+#define UNWIND_END_OF_STACK_TABLE
+#define UNWIND_UNSAFE_STACK_TABLE
+#endif
+
 #ifdef CONFIG_PM_TRACE
 #define TRACEDATA							\
 	. = ALIGN(4);							\
@@ -722,6 +756,13 @@
 #define PERCPU_INPUT(cacheline)						\
 	VMLINUX_SYMBOL(__per_cpu_start) = .;				\
 	*(.data..percpu..first)						\
+	. = ALIGN(PAGE_SIZE);						\
+	VMLINUX_SYMBOL(__per_cpu_user_mapped_start) = .;		\
+	*(.data..percpu..user_mapped..page_aligned)			\
+	. = ALIGN(cacheline);						\
+	*(.data..percpu..user_mapped)					\
+	*(.data..percpu..user_mapped..shared_aligned)			\
+	VMLINUX_SYMBOL(__per_cpu_user_mapped_end) = .;			\
 	. = ALIGN(PAGE_SIZE);						\
 	*(.data..percpu..page_aligned)					\
 	. = ALIGN(cacheline);						\

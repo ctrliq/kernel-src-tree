@@ -16,11 +16,18 @@
 #include "util/parse-events.h"
 #include <subcmd/parse-options.h>
 #include "util/debug.h"
+#include "util/event.h"
 #include <api/fs/fs.h>
 #include <api/fs/tracing_path.h>
+#include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <linux/kernel.h>
 
 const char perf_usage_string[] =
 	"perf [--version] [--help] [OPTIONS] COMMAND [ARGS]";

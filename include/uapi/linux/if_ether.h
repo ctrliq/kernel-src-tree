@@ -35,6 +35,9 @@
 #define ETH_FRAME_LEN	1514		/* Max. octets in frame sans FCS */
 #define ETH_FCS_LEN	4		/* Octets in the FCS		 */
 
+#define ETH_MIN_MTU	68		/* Min IPv4 MTU per RFC791	*/
+#define ETH_MAX_MTU	0xFFFFU		/* 65535, same as IP_MAX_MTU	*/
+
 /*
  *	These are the defined Ethernet Protocol ID's.
  */
@@ -91,6 +94,7 @@
 #define ETH_P_TDLS	0x890D          /* TDLS */
 #define ETH_P_FIP	0x8914		/* FCoE Initialization Protocol */
 #define ETH_P_80221	0x8917		/* IEEE 802.21 Media Independent Handover Protocol */
+#define ETH_P_NSH	0x894F		/* Network Service Header */
 #define ETH_P_LOOPBACK	0x9000		/* Ethernet loopback packet, per IEEE 802.3 */
 #define ETH_P_QINQ1	0x9100		/* deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ] */
 #define ETH_P_QINQ2	0x9200		/* deprecated QinQ VLAN [ NOT AN OFFICIALLY REGISTERED ID ] */

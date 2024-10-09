@@ -1514,7 +1514,6 @@ static int era_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	ti->flush_supported = true;
 
 	ti->num_discard_bios = 1;
-	ti->discards_supported = true;
 	era->callbacks.congested_fn = era_is_congested;
 	dm_table_add_target_callbacks(ti->table, &era->callbacks);
 
@@ -1701,6 +1700,7 @@ static void era_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	 */
 	if (io_opt_sectors < era->sectors_per_block ||
 	    do_div(io_opt_sectors, era->sectors_per_block)) {
+		gmb();
 		blk_limits_io_min(limits, 0);
 		blk_limits_io_opt(limits, era->sectors_per_block << SECTOR_SHIFT);
 	}

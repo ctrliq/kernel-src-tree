@@ -351,6 +351,8 @@ struct acpi_device_data {
 	struct list_head subnodes;
 };
 
+struct acpi_gpio_mapping;
+
 /* Device */
 struct acpi_device {
 	int device_type;
@@ -372,6 +374,7 @@ struct acpi_device {
 	struct acpi_scan_handler *handler;
 	struct acpi_hotplug_context *hp;
 	struct acpi_driver *driver;
+	const struct acpi_gpio_mapping *driver_gpios;
 	void *driver_data;
 	struct device dev;
 	unsigned int physical_node_count;
@@ -417,6 +420,13 @@ static inline struct acpi_data_node *to_acpi_data_node(struct fwnode_handle *fwn
 {
 	return is_acpi_data_node(fwnode) ?
 		container_of(fwnode, struct acpi_data_node, fwnode) : NULL;
+}
+
+static inline bool acpi_data_node_match(struct fwnode_handle *fwnode,
+					const char *name)
+{
+	return is_acpi_data_node(fwnode) ?
+		(!strcmp(to_acpi_data_node(fwnode)->name, name)) : false;
 }
 
 static inline struct fwnode_handle *acpi_fwnode_handle(struct acpi_device *adev)

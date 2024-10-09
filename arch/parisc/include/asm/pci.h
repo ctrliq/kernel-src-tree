@@ -193,9 +193,6 @@ static inline void pcibios_register_hba(struct pci_hba_data *x)
 #define PCIBIOS_MIN_IO          0x10
 #define PCIBIOS_MIN_MEM         0x1000 /* NBPG - but pci/setup-res.c dies */
 
-/* export the pci_ DMA API in terms of the dma_ one */
-#include <asm-generic/pci-dma-compat.h>
-
 #ifdef CONFIG_PCI
 static inline void pci_dma_burst_advice(struct pci_dev *pdev,
 					enum pci_dma_burst_strategy *strat,

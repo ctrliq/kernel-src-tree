@@ -120,6 +120,7 @@ static int cpl_fw6_pld_handler(struct chcr_dev *dev,
 	struct cpl_fw6_pld *fw6_pld;
 	u32 ack_err_status = 0;
 	int error_status = 0;
+	struct adapter *adap = padap(dev);
 
 	fw6_pld = (struct cpl_fw6_pld *)input;
 	req = (struct crypto_async_request *)(uintptr_t)be64_to_cpu(
@@ -130,14 +131,12 @@ static int cpl_fw6_pld_handler(struct chcr_dev *dev,
 	if (ack_err_status) {
 		if (CHK_MAC_ERR_BIT(ack_err_status) ||
 		    CHK_PAD_ERR_BIT(ack_err_status))
-			error_status = -EINVAL;
+			error_status = -EBADMSG;
+		atomic_inc(&adap->chcr_stats.error);
 	}
 	/* call completion callback with failure status */
 	if (req) {
-		if (!chcr_handle_resp(req, input, error_status))
-			req->complete(req, error_status);
-		else
-			return -EINVAL;
+		error_status = chcr_handle_resp(req, input, error_status);
 	} else {
 		pr_err("Incorrect request address from the firmware\n");
 		return -EFAULT;
@@ -155,12 +154,12 @@ static void *chcr_uld_add(const struct cxgb4_lld_info *lld)
 	struct uld_ctx *u_ctx;
 
 	/* Create the device and add it in the device list */
+	if (!(lld->ulp_crypto & ULP_CRYPTO_LOOKASIDE))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	/* Create the device and add it in the device list */
 	u_ctx = kzalloc(sizeof(*u_ctx), GFP_KERNEL);
 	if (!u_ctx) {
-		u_ctx = ERR_PTR(-ENOMEM);
-		goto out;
-	}
-	if (!(lld->ulp_crypto & ULP_CRYPTO_LOOKASIDE)) {
 		u_ctx = ERR_PTR(-ENOMEM);
 		goto out;
 	}

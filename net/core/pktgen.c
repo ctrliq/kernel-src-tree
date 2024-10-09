@@ -2575,7 +2575,7 @@ static int process_ipsec(struct pktgen_dev *pkt_dev,
 				goto err;
 			}
 			/* restore ll */
-			eth = (__u8 *) skb_push(skb, ETH_HLEN);
+			eth = skb_push(skb, ETH_HLEN);
 			memcpy(eth, pkt_dev->hh, 12);
 			*(u16 *) &eth[12] = protocol;
 
@@ -2614,11 +2614,11 @@ static void pktgen_finalize_skb(struct pktgen_dev *pkt_dev, struct sk_buff *skb,
 	struct timeval timestamp;
 	struct pktgen_hdr *pgh;
 
-	pgh = (struct pktgen_hdr *)skb_put(skb, sizeof(*pgh));
+	pgh = skb_put(skb, sizeof(*pgh));
 	datalen -= sizeof(*pgh);
 
 	if (pkt_dev->nfrags <= 0) {
-		memset(skb_put(skb, datalen), 0, datalen);
+		skb_put_zero(skb, datalen);
 	} else {
 		int frags = pkt_dev->nfrags;
 		int i, len;
@@ -2629,7 +2629,7 @@ static void pktgen_finalize_skb(struct pktgen_dev *pkt_dev, struct sk_buff *skb,
 			frags = MAX_SKB_FRAGS;
 		len = datalen - frags * PAGE_SIZE;
 		if (len > 0) {
-			memset(skb_put(skb, len), 0, len);
+			skb_put_zero(skb, len);
 			datalen = frags * PAGE_SIZE;
 		}
 
@@ -2744,34 +2744,35 @@ static struct sk_buff *fill_packet_ipv4(struct net_device *odev,
 	skb_reserve(skb, 16);
 
 	/*  Reserve for ethernet and IP header  */
-	eth = (__u8 *) skb_push(skb, 14);
-	mpls = (__be32 *)skb_put(skb, pkt_dev->nr_labels*sizeof(__u32));
+	eth = skb_push(skb, 14);
+	mpls = skb_put(skb, pkt_dev->nr_labels * sizeof(__u32));
 	if (pkt_dev->nr_labels)
 		mpls_push(mpls, pkt_dev);
 
 	if (pkt_dev->vlan_id != 0xffff) {
 		if (pkt_dev->svlan_id != 0xffff) {
-			svlan_tci = (__be16 *)skb_put(skb, sizeof(__be16));
+			svlan_tci = skb_put(skb, sizeof(__be16));
 			*svlan_tci = build_tci(pkt_dev->svlan_id,
 					       pkt_dev->svlan_cfi,
 					       pkt_dev->svlan_p);
-			svlan_encapsulated_proto = (__be16 *)skb_put(skb, sizeof(__be16));
+			svlan_encapsulated_proto = skb_put(skb,
+							   sizeof(__be16));
 			*svlan_encapsulated_proto = htons(ETH_P_8021Q);
 		}
-		vlan_tci = (__be16 *)skb_put(skb, sizeof(__be16));
+		vlan_tci = skb_put(skb, sizeof(__be16));
 		*vlan_tci = build_tci(pkt_dev->vlan_id,
 				      pkt_dev->vlan_cfi,
 				      pkt_dev->vlan_p);
-		vlan_encapsulated_proto = (__be16 *)skb_put(skb, sizeof(__be16));
+		vlan_encapsulated_proto = skb_put(skb, sizeof(__be16));
 		*vlan_encapsulated_proto = htons(ETH_P_IP);
 	}
 
 	skb_reset_mac_header(skb);
 	skb_set_network_header(skb, skb->len);
-	iph = (struct iphdr *) skb_put(skb, sizeof(struct iphdr));
+	iph = skb_put(skb, sizeof(struct iphdr));
 
 	skb_set_transport_header(skb, skb->len);
-	udph = (struct udphdr *) skb_put(skb, sizeof(struct udphdr));
+	udph = skb_put(skb, sizeof(struct udphdr));
 	skb_set_queue_mapping(skb, queue_map);
 	skb->priority = pkt_dev->skb_priority;
 
@@ -2872,34 +2873,35 @@ static struct sk_buff *fill_packet_ipv6(struct net_device *odev,
 	skb_reserve(skb, 16);
 
 	/*  Reserve for ethernet and IP header  */
-	eth = (__u8 *) skb_push(skb, 14);
-	mpls = (__be32 *)skb_put(skb, pkt_dev->nr_labels*sizeof(__u32));
+	eth = skb_push(skb, 14);
+	mpls = skb_put(skb, pkt_dev->nr_labels * sizeof(__u32));
 	if (pkt_dev->nr_labels)
 		mpls_push(mpls, pkt_dev);
 
 	if (pkt_dev->vlan_id != 0xffff) {
 		if (pkt_dev->svlan_id != 0xffff) {
-			svlan_tci = (__be16 *)skb_put(skb, sizeof(__be16));
+			svlan_tci = skb_put(skb, sizeof(__be16));
 			*svlan_tci = build_tci(pkt_dev->svlan_id,
 					       pkt_dev->svlan_cfi,
 					       pkt_dev->svlan_p);
-			svlan_encapsulated_proto = (__be16 *)skb_put(skb, sizeof(__be16));
+			svlan_encapsulated_proto = skb_put(skb,
+							   sizeof(__be16));
 			*svlan_encapsulated_proto = htons(ETH_P_8021Q);
 		}
-		vlan_tci = (__be16 *)skb_put(skb, sizeof(__be16));
+		vlan_tci = skb_put(skb, sizeof(__be16));
 		*vlan_tci = build_tci(pkt_dev->vlan_id,
 				      pkt_dev->vlan_cfi,
 				      pkt_dev->vlan_p);
-		vlan_encapsulated_proto = (__be16 *)skb_put(skb, sizeof(__be16));
+		vlan_encapsulated_proto = skb_put(skb, sizeof(__be16));
 		*vlan_encapsulated_proto = htons(ETH_P_IPV6);
 	}
 
 	skb_reset_mac_header(skb);
 	skb_set_network_header(skb, skb->len);
-	iph = (struct ipv6hdr *) skb_put(skb, sizeof(struct ipv6hdr));
+	iph = skb_put(skb, sizeof(struct ipv6hdr));
 
 	skb_set_transport_header(skb, skb->len);
-	udph = (struct udphdr *) skb_put(skb, sizeof(struct udphdr));
+	udph = skb_put(skb, sizeof(struct udphdr));
 	skb_set_queue_mapping(skb, queue_map);
 	skb->priority = pkt_dev->skb_priority;
 
@@ -3351,7 +3353,6 @@ xmit_more:
 		break;
 	case NET_XMIT_DROP:
 	case NET_XMIT_CN:
-	case NET_XMIT_POLICED:
 		/* skb has been consumed */
 		pkt_dev->errors++;
 		break;

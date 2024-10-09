@@ -203,13 +203,6 @@ static inline unsigned long of_read_ulong(const __be32 *cell, int size)
 #define OF_ROOT_NODE_SIZE_CELLS_DEFAULT 1
 #endif
 
-/* Default string compare functions, Allow arch asm/prom.h to override */
-#if !defined(of_compat_cmp)
-#define of_compat_cmp(s1, s2, l)	strcasecmp((s1), (s2))
-#define of_prop_cmp(s1, s2)		strcmp((s1), (s2))
-#define of_node_cmp(s1, s2)		strcasecmp((s1), (s2))
-#endif
-
 /* flag descriptions */
 #define OF_DYNAMIC	1 /* node and properties were allocated via kmalloc */
 #define OF_DETACHED	2 /* node has been detached from the device tree */
@@ -348,12 +341,6 @@ extern int of_detach_node(struct device_node *);
  */
 const __be32 *of_prop_next_u32(struct property *prop, const __be32 *cur,
 			       u32 *pu);
-#define of_property_for_each_u32(np, propname, prop, p, u)	\
-	for (prop = of_find_property(np, propname, NULL),	\
-		p = of_prop_next_u32(prop, NULL, &u);		\
-		p;						\
-		p = of_prop_next_u32(prop, p, &u))
-
 /*
  * struct property *prop;
  * const char *s;
@@ -362,11 +349,6 @@ const __be32 *of_prop_next_u32(struct property *prop, const __be32 *cur,
  *         printk("String value: %s\n", s);
  */
 const char *of_prop_next_string(struct property *prop, const char *cur);
-#define of_property_for_each_string(np, propname, prop, s)	\
-	for (prop = of_find_property(np, propname, NULL),	\
-		s = of_prop_next_string(prop, NULL);		\
-		s;						\
-		s = of_prop_next_string(prop, s))
 
 #else /* CONFIG_OF */
 
@@ -571,13 +553,28 @@ static inline int of_machine_is_compatible(const char *compat)
 	return 0;
 }
 
+static inline const __be32 *of_prop_next_u32(struct property *prop,
+		const __be32 *cur, u32 *pu)
+{
+	return NULL;
+}
+
+static inline const char *of_prop_next_string(struct property *prop,
+		const char *cur)
+{
+	return NULL;
+}
+
 #define of_match_ptr(_ptr)	NULL
 #define of_match_node(_matches, _node)	NULL
-#define of_property_for_each_u32(np, propname, prop, p, u) \
-	while (0)
-#define of_property_for_each_string(np, propname, prop, s) \
-	while (0)
 #endif /* CONFIG_OF */
+
+/* Default string compare functions, Allow arch asm/prom.h to override */
+#if !defined(of_compat_cmp)
+#define of_compat_cmp(s1, s2, l)	strcasecmp((s1), (s2))
+#define of_prop_cmp(s1, s2)		strcmp((s1), (s2))
+#define of_node_cmp(s1, s2)		strcasecmp((s1), (s2))
+#endif
 
 #if defined(CONFIG_OF) && defined(CONFIG_NUMA)
 extern int of_node_to_nid(struct device_node *np);
@@ -812,6 +809,18 @@ static inline int of_get_available_child_count(const struct device_node *np)
 
 	return num;
 }
+
+#define of_property_for_each_u32(np, propname, prop, p, u)	\
+	for (prop = of_find_property(np, propname, NULL),	\
+		p = of_prop_next_u32(prop, NULL, &u);		\
+		p;						\
+		p = of_prop_next_u32(prop, p, &u))
+
+#define of_property_for_each_string(np, propname, prop, s)	\
+	for (prop = of_find_property(np, propname, NULL),	\
+		s = of_prop_next_string(prop, NULL);		\
+		s;						\
+		s = of_prop_next_string(prop, s))
 
 #if defined(CONFIG_PROC_FS) && defined(CONFIG_PROC_DEVICETREE)
 extern void proc_device_tree_add_node(struct device_node *, struct proc_dir_entry *);

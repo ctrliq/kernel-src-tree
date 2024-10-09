@@ -139,6 +139,15 @@ static void __init allocate_slb_shadows(int nr_cpus, int limit) { }
 struct paca_struct *paca;
 EXPORT_SYMBOL(paca);
 
+/*
+ * Auiliary structure that can be used to basically add fields to the
+ * paca without changing its size (for kABI purposes). Upstream code should
+ * have these fields directly in the paca.
+ * paca->exslb[EX_DAR] is a pointer to paca_aux (it's unused by SLB
+ * exception handlers).
+ */
+static struct paca_aux_struct * __initdata paca_aux;
+
 void __init initialise_paca(struct paca_struct *new_paca, int cpu)
 {
        /* The TOC register (GPR2) points 32kB into the TOC, so that 64kB
@@ -163,6 +172,7 @@ void __init initialise_paca(struct paca_struct *new_paca, int cpu)
 	new_paca->data_offset = 0xfeeeeeeeeeeeeeeeULL;
 #ifdef CONFIG_PPC_STD_MMU_64
 	new_paca->slb_shadow_ptr = init_slb_shadow(cpu);
+	new_paca->exslb[EX_DAR/8] = (u64)&paca_aux[cpu];
 #endif /* CONFIG_PPC_STD_MMU_64 */
 }
 
@@ -188,6 +198,7 @@ void setup_paca(struct paca_struct *new_paca)
 }
 
 static int __initdata paca_size;
+static int __initdata paca_aux_size;
 
 void __init allocate_pacas(void)
 {
@@ -205,8 +216,13 @@ void __init allocate_pacas(void)
 	paca = __va(memblock_alloc_base(paca_size, PAGE_SIZE, limit));
 	memset(paca, 0, paca_size);
 
+	paca_aux_size = PAGE_ALIGN(sizeof(struct paca_aux_struct) * nr_cpu_ids);
+
+	paca_aux = __va(memblock_alloc_base(paca_aux_size, PAGE_SIZE, limit));
+	memset(paca_aux, 0, paca_aux_size);
+
 	printk(KERN_DEBUG "Allocated %u bytes for %d pacas at %p\n",
-		paca_size, nr_cpu_ids, paca);
+		paca_size + paca_aux_size, nr_cpu_ids, paca);
 
 	allocate_lppacas(nr_cpu_ids, limit);
 
@@ -220,18 +236,22 @@ void __init allocate_pacas(void)
 void __init free_unused_pacas(void)
 {
 	int new_size;
+	int new_aux_size;
 
 	new_size = PAGE_ALIGN(sizeof(struct paca_struct) * nr_cpu_ids);
+	new_aux_size = PAGE_ALIGN(sizeof(struct paca_aux_struct) * nr_cpu_ids);
 
 	if (new_size >= paca_size)
 		return;
 
 	memblock_free(__pa(paca) + new_size, paca_size - new_size);
+	memblock_free(__pa(paca_aux) + new_aux_size, paca_aux_size - new_aux_size);
 
 	printk(KERN_DEBUG "Freed %u bytes for unused pacas\n",
 		paca_size - new_size);
 
 	paca_size = new_size;
+	paca_aux_size = new_aux_size;
 
 	free_lppacas();
 }

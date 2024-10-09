@@ -265,7 +265,7 @@ static int uhid_raw_request(struct hid_device *hid, unsigned char reportnum,
 	}
 }
 
-static struct hid_ll_driver uhid_hid_driver = {
+struct hid_ll_driver uhid_hid_driver = {
 	.start = uhid_hid_start,
 	.stop = uhid_hid_stop,
 	.open = uhid_hid_open,
@@ -274,6 +274,7 @@ static struct hid_ll_driver uhid_hid_driver = {
 	.output_report = uhid_hid_output_report,
 	.raw_request = uhid_raw_request,
 };
+EXPORT_SYMBOL_GPL(uhid_hid_driver);
 
 #ifdef CONFIG_COMPAT
 

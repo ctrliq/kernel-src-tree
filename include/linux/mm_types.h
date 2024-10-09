@@ -10,7 +10,6 @@
 #include <linux/rwsem.h>
 #include <linux/completion.h>
 #include <linux/cpumask.h>
-#include <linux/page-debug-flags.h>
 #include <linux/uprobes.h>
 #include <linux/page-flags-layout.h>
 #include <asm/page.h>
@@ -185,9 +184,6 @@ struct page {
 	void *virtual;			/* Kernel virtual address (NULL if
 					   not kmapped, ie. highmem) */
 #endif /* WANT_PAGE_VIRTUAL */
-#ifdef CONFIG_WANT_PAGE_DEBUG_FLAGS
-	unsigned long debug_flags;	/* Use atomic bitops on this */
-#endif
 
 #ifdef CONFIG_KMEMCHECK
 	/*
@@ -538,7 +534,15 @@ struct mm_struct {
 	RH_KABI_RESERVE(5)
 #endif
 
+#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+	/*
+	 * One bit per protection key says whether userspace can
+	 * use it or not.  protected by mmap_sem.
+	 */
+	RH_KABI_USE2(6, u16 pkey_allocation_map, s16 execute_only_pkey)
+#else
 	RH_KABI_RESERVE(6)
+#endif /* CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS */
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
 };

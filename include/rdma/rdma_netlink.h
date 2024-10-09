@@ -5,29 +5,42 @@
 #include <linux/netlink.h>
 #include <uapi/rdma/rdma_netlink.h>
 
-struct ibnl_client_cbs {
+struct rdma_nl_cbs {
+	int (*doit)(struct sk_buff *skb, struct nlmsghdr *nlh);
 	int (*dump)(struct sk_buff *skb, struct netlink_callback *nlcb);
-	struct module *module;
+	u8 flags;
 };
 
-/**
- * Add a a client to the list of IB netlink exporters.
- * @index: Index of the added client
- * @nops: Number of supported ops by the added client.
- * @cb_table: A table for op->callback
- *
- * Returns 0 on success or a negative error code.
+enum rdma_nl_flags {
+	/* Require CAP_NET_ADMIN */
+	RDMA_NL_ADMIN_PERM	= 1 << 0,
+};
+
+/* Define this module as providing netlink services for NETLINK_RDMA, with
+ * index _index.  Since the client indexes were setup in a uapi header as an
+ * enum and we do no want to change that, the user must supply the expanded
+ * constant as well and the compiler checks they are the same.
  */
-int ibnl_add_client(int index, int nops,
-		    const struct ibnl_client_cbs cb_table[]);
+#define MODULE_ALIAS_RDMA_NETLINK(_index, _val)                                \
+	static inline void __chk_##_index(void)                                \
+	{                                                                      \
+		BUILD_BUG_ON(_index != _val);                                  \
+	}                                                                      \
+	MODULE_ALIAS("rdma-netlink-subsys-" __stringify(_val))
+
+/**
+ * Register client in RDMA netlink.
+ * @index: Index of the added client
+ * @cb_table: A table for op->callback
+ */
+void rdma_nl_register(unsigned int index,
+		      const struct rdma_nl_cbs cb_table[]);
 
 /**
  * Remove a client from IB netlink.
  * @index: Index of the removed IB client.
- *
- * Returns 0 on success or a negative error code.
  */
-int ibnl_remove_client(int index);
+void rdma_nl_unregister(unsigned int index);
 
 /**
  * Put a new message in a supplied skb.
@@ -78,4 +91,10 @@ int rdma_nl_unicast_wait(struct sk_buff *skb, __u32 pid);
  */
 int rdma_nl_multicast(struct sk_buff *skb, unsigned int group, gfp_t flags);
 
+/**
+ * Check if there are any listeners to the netlink group
+ * @group: the netlink group ID
+ * Returns 0 on success or a negative for no listeners.
+ */
+int rdma_nl_chk_listeners(unsigned int group);
 #endif /* _RDMA_NETLINK_H */

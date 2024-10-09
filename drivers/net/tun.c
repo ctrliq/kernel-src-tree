@@ -70,6 +70,7 @@
 #include <net/rtnetlink.h>
 #include <net/sock.h>
 #include <linux/skb_array.h>
+#include <linux/seq_file.h>
 
 #include <asm/uaccess.h>
 
@@ -911,7 +912,7 @@ static netdev_features_t tun_net_fix_features(struct net_device *dev,
 	return (features & tun->set_features) | (features & ~TUN_USER_FEATURES);
 }
 
-static struct rtnl_link_stats64 *
+static void
 tun_net_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	u32 rx_dropped = 0, tx_dropped = 0, rx_frame_errors = 0;
@@ -945,7 +946,6 @@ tun_net_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 	stats->rx_dropped  = rx_dropped;
 	stats->rx_frame_errors = rx_frame_errors;
 	stats->tx_dropped = tx_dropped;
-	return stats;
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -981,7 +981,7 @@ static const struct net_device_ops tun_netdev_ops = {
 	.ndo_open		= tun_net_open,
 	.ndo_stop		= tun_net_close,
 	.ndo_start_xmit		= tun_net_xmit,
-	.ndo_change_mtu		= tun_net_change_mtu,
+	.ndo_change_mtu_rh74	= tun_net_change_mtu,
 	.ndo_fix_features	= tun_net_fix_features,
 	.ndo_select_queue	= tun_select_queue,
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -997,7 +997,7 @@ static const struct net_device_ops tap_netdev_ops = {
 	.ndo_open		= tun_net_open,
 	.ndo_stop		= tun_net_close,
 	.ndo_start_xmit		= tun_net_xmit,
-	.ndo_change_mtu		= tun_net_change_mtu,
+	.ndo_change_mtu_rh74	= tun_net_change_mtu,
 	.ndo_fix_features	= tun_net_fix_features,
 	.ndo_set_rx_mode	= tun_net_mclist,
 	.ndo_set_mac_address	= eth_mac_addr,
@@ -1701,7 +1701,6 @@ static void tun_free_netdev(struct net_device *dev)
 	free_percpu(tun->pcpu_stats);
 	tun_flow_uninit(tun);
 	security_tun_dev_free_security(tun->security);
-	free_netdev(dev);
 }
 
 static void tun_setup(struct net_device *dev)
@@ -1712,7 +1711,8 @@ static void tun_setup(struct net_device *dev)
 	tun->group = INVALID_GID;
 
 	dev->ethtool_ops = &tun_ethtool_ops;
-	dev->destructor = tun_free_netdev;
+	dev->extended->needs_free_netdev = true;
+	dev->extended->priv_destructor = tun_free_netdev;
 	/* We prefer our own queue length */
 	dev->tx_queue_len = TUN_READQ_SIZE;
 }
@@ -2534,6 +2534,27 @@ static int tun_chr_close(struct inode *inode, struct file *file)
 	return 0;
 }
 
+#ifdef CONFIG_PROC_FS
+static int tun_chr_show_fdinfo(struct seq_file *m, struct file *f)
+{
+	struct tun_struct *tun;
+	struct ifreq ifr;
+
+	memset(&ifr, 0, sizeof(ifr));
+
+	rtnl_lock();
+	tun = tun_get(f);
+	if (tun)
+		tun_get_iff(current->nsproxy->net_ns, tun, &ifr);
+	rtnl_unlock();
+
+	if (tun)
+		tun_put(tun);
+
+	return seq_printf(m, "iff:\t%s\n", ifr.ifr_name);
+}
+#endif
+
 static const struct file_operations tun_fops = {
 	.owner	= THIS_MODULE,
 	.llseek = no_llseek,
@@ -2548,7 +2569,10 @@ static const struct file_operations tun_fops = {
 #endif
 	.open	= tun_chr_open,
 	.release = tun_chr_close,
-	.fasync = tun_chr_fasync
+	.fasync = tun_chr_fasync,
+#ifdef CONFIG_PROC_FS
+	.show_fdinfo = tun_chr_show_fdinfo,
+#endif
 };
 
 static struct miscdevice tun_miscdev = {

@@ -179,7 +179,7 @@ static int gfs2_get_flags(struct file *filp, u32 __user *ptr)
 	gfs2_holder_init(ip->i_gl, LM_ST_SHARED, 0, &gh);
 	error = gfs2_glock_nq(&gh);
 	if (error)
-		return error;
+		goto out_uninit;
 
 	fsflags = fsflags_cvt(gfs2_to_fsflags, ip->i_diskflags);
 	if (!S_ISDIR(inode->i_mode) && ip->i_diskflags & GFS2_DIF_JDATA)
@@ -188,6 +188,7 @@ static int gfs2_get_flags(struct file *filp, u32 __user *ptr)
 		error = -EFAULT;
 
 	gfs2_glock_dq(&gh);
+out_uninit:
 	gfs2_holder_uninit(&gh);
 	return error;
 }
@@ -274,7 +275,7 @@ static int do_gfs2_set_flags(struct file *filp, u32 reqflags, u32 mask)
 			goto out;
 	}
 	if ((flags ^ new_flags) & GFS2_DIF_JDATA) {
-		if (flags & GFS2_DIF_JDATA)
+		if (new_flags & GFS2_DIF_JDATA)
 			gfs2_log_flush(sdp, ip->i_gl);
 		error = filemap_fdatawrite(inode->i_mapping);
 		if (error)
@@ -282,6 +283,8 @@ static int do_gfs2_set_flags(struct file *filp, u32 reqflags, u32 mask)
 		error = filemap_fdatawait(inode->i_mapping);
 		if (error)
 			goto out;
+		if (new_flags & GFS2_DIF_JDATA)
+			gfs2_ordered_del_inode(ip);
 	}
 	error = gfs2_trans_begin(sdp, RES_DINODE, 0);
 	if (error)
@@ -289,7 +292,7 @@ static int do_gfs2_set_flags(struct file *filp, u32 reqflags, u32 mask)
 	error = gfs2_meta_inode_buffer(ip, &bh);
 	if (error)
 		goto out_trans_end;
-	inode->i_ctime = current_time(inode);
+	inode->i_ctime = CURRENT_TIME;
 	gfs2_trans_add_meta(ip->i_gl, bh);
 	ip->i_diskflags = new_flags;
 	gfs2_dinode_out(ip, bh->b_data);

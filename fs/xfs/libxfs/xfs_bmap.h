@@ -32,7 +32,7 @@ extern kmem_zone_t	*xfs_bmap_free_item_zone;
  */
 struct xfs_bmalloca {
 	xfs_fsblock_t		*firstblock; /* i/o first block allocated */
-	struct xfs_bmap_free	*flist;	/* bmap freelist */
+	struct xfs_defer_ops	*dfops;	/* bmap freelist */
 	struct xfs_trans	*tp;	/* transaction pointer */
 	struct xfs_inode	*ip;	/* incore inode pointer */
 	struct xfs_bmbt_irec	prev;	/* extent before the new one */
@@ -54,7 +54,7 @@ struct xfs_bmalloca {
 	bool			wasdel;	/* replacing a delayed allocation */
 	bool			aeof;	/* allocated space at eof */
 	bool			conv;	/* overwriting unwritten extents */
-	char			userdata;/* userdata mask */
+	int			datatype;/* data type being allocated */
 	int			flags;
 };
 
@@ -62,11 +62,11 @@ struct xfs_bmalloca {
  * List of extents to be free "later".
  * The list is kept sorted on xbf_startblock.
  */
-struct xfs_bmap_free_item
+struct xfs_extent_free_item
 {
-	xfs_fsblock_t		xbfi_startblock;/* starting fs block number */
-	xfs_extlen_t		xbfi_blockcount;/* number of blocks in extent */
-	struct list_head	xbfi_list;
+	xfs_fsblock_t		xefi_startblock;/* starting fs block number */
+	xfs_extlen_t		xefi_blockcount;/* number of blocks in extent */
+	struct list_head	xefi_list;
 };
 
 #define	XFS_BMAP_MAX_NMAP	4
@@ -162,7 +162,7 @@ void	xfs_trim_extent(struct xfs_bmbt_irec *irec, xfs_fileoff_t bno,
 void	xfs_trim_extent_eof(struct xfs_bmbt_irec *, struct xfs_inode *);
 int	xfs_bmap_add_attrfork(struct xfs_inode *ip, int size, int rsvd);
 void	xfs_bmap_local_to_extents_empty(struct xfs_inode *ip, int whichfork);
-void	xfs_bmap_add_free(struct xfs_mount *mp, struct xfs_bmap_free *flist,
+void	xfs_bmap_add_free(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
 			  xfs_fsblock_t bno, xfs_filblks_t len);
 void	xfs_bmap_compute_maxlevels(struct xfs_mount *mp, int whichfork);
 int	xfs_bmap_first_unused(struct xfs_trans *tp, struct xfs_inode *ip,
@@ -177,24 +177,32 @@ int	xfs_bmap_read_extents(struct xfs_trans *tp, struct xfs_inode *ip,
 int	xfs_bmapi_read(struct xfs_inode *ip, xfs_fileoff_t bno,
 		xfs_filblks_t len, struct xfs_bmbt_irec *mval,
 		int *nmap, int flags);
-int	xfs_bmapi_delay(struct xfs_inode *ip, xfs_fileoff_t bno,
-		xfs_filblks_t len, struct xfs_bmbt_irec *mval,
-		int *nmap, int flags);
 int	xfs_bmapi_write(struct xfs_trans *tp, struct xfs_inode *ip,
 		xfs_fileoff_t bno, xfs_filblks_t len, int flags,
 		xfs_fsblock_t *firstblock, xfs_extlen_t total,
 		struct xfs_bmbt_irec *mval, int *nmap,
-		struct xfs_bmap_free *flist);
+		struct xfs_defer_ops *dfops);
+int	__xfs_bunmapi(struct xfs_trans *tp, struct xfs_inode *ip,
+		xfs_fileoff_t bno, xfs_filblks_t *rlen, int flags,
+		xfs_extnum_t nexts, xfs_fsblock_t *firstblock,
+		struct xfs_defer_ops *dfops);
 int	xfs_bunmapi(struct xfs_trans *tp, struct xfs_inode *ip,
 		xfs_fileoff_t bno, xfs_filblks_t len, int flags,
 		xfs_extnum_t nexts, xfs_fsblock_t *firstblock,
-		struct xfs_bmap_free *flist, int *done);
+		struct xfs_defer_ops *dfops, int *done);
 int	xfs_check_nostate_extents(struct xfs_ifork *ifp, xfs_extnum_t idx,
 		xfs_extnum_t num);
 uint	xfs_default_attroffset(struct xfs_inode *ip);
 int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
 		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
 		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
-		struct xfs_bmap_free *flist, int num_exts);
+		struct xfs_defer_ops *dfops, int num_exts);
+struct xfs_bmbt_rec_host *
+	xfs_bmap_search_extents(struct xfs_inode *ip, xfs_fileoff_t bno,
+		int fork, int *eofp, xfs_extnum_t *lastxp,
+		struct xfs_bmbt_irec *gotp, struct xfs_bmbt_irec *prevp);
+int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t aoff,
+		xfs_filblks_t len, struct xfs_bmbt_irec *got,
+		struct xfs_bmbt_irec *prev, xfs_extnum_t *lastx, int eof);
 
 #endif	/* __XFS_BMAP_H__ */

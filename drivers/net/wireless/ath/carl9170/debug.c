@@ -75,7 +75,12 @@ static ssize_t carl9170_debugfs_read(struct file *file, char __user *userbuf,
 
 	if (!ar)
 		return -ENODEV;
+#if 0 /* Not in RHEL */
+	dfops = container_of(debugfs_real_fops(file),
+			     struct carl9170_debugfs_fops, fops);
+#else
 	dfops = container_of(file->f_op, struct carl9170_debugfs_fops, fops);
+#endif
 
 	if (!dfops->read)
 		return -ENOSYS;
@@ -127,7 +132,12 @@ static ssize_t carl9170_debugfs_write(struct file *file,
 
 	if (!ar)
 		return -ENODEV;
+#if 0 /* Not in RHEL */
+	dfops = container_of(debugfs_real_fops(file),
+			     struct carl9170_debugfs_fops, fops);
+#else
 	dfops = container_of(file->f_op, struct carl9170_debugfs_fops, fops);
+#endif
 
 	if (!dfops->write)
 		return -ENOSYS;

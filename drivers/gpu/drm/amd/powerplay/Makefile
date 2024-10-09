@@ -1,5 +1,6 @@
 
-subdir-ccflags-y += -Iinclude/drm  \
+subdir-ccflags-y += \
+		-Iinclude/drm \
 		-I$(FULL_AMD_PATH)/powerplay/inc/  \
 		-I$(FULL_AMD_PATH)/include/asic_reg  \
 		-I$(FULL_AMD_PATH)/include  \

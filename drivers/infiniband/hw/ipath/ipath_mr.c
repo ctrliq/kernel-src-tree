@@ -175,7 +175,7 @@ struct ib_mr *ipath_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 			goto bail;
 		}
 		mr->mr.map[m]->segs[n].vaddr = vaddr;
-		mr->mr.map[m]->segs[n].length = umem->page_size;
+		mr->mr.map[m]->segs[n].length = 1<<umem->page_shift;
 		n++;
 		if (n == IPATH_SEGSZ) {
 			m++;

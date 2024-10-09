@@ -916,6 +916,7 @@ static unsigned int xdr_align_pages(struct xdr_stream *xdr, unsigned int len)
 	}
 
 	if (nwords > xdr->nwords) {
+		gmb();
 		nwords = xdr->nwords;
 		len = nwords << 2;
 	}

@@ -56,11 +56,11 @@ int mlx4_en_setup_tc(struct net_device *dev, u8 up)
 	int i;
 	unsigned int offset = 0;
 
-	if (up && up != MLX4_EN_NUM_UP)
+	if (up && up != MLX4_EN_NUM_UP_HIGH)
 		return -EINVAL;
 
 	netdev_set_num_tc(dev, up);
-
+	netif_set_real_num_tx_queues(dev, priv->tx_ring_num[TX]);
 	/* Partition Tx queues evenly amongst UP's */
 	for (i = 0; i < up; i++) {
 		netdev_set_tc_queue(dev, i, priv->num_tx_rings_p_up, offset);
@@ -82,13 +82,64 @@ int mlx4_en_setup_tc(struct net_device *dev, u8 up)
 	return 0;
 }
 
-static int __mlx4_en_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
-			      struct tc_to_netdev *tc)
+int mlx4_en_alloc_tx_queue_per_tc(struct net_device *dev, u8 tc)
 {
-	if (tc->type != TC_SETUP_MQPRIO)
+	struct mlx4_en_priv *priv = netdev_priv(dev);
+	struct mlx4_en_dev *mdev = priv->mdev;
+	struct mlx4_en_port_profile new_prof;
+	struct mlx4_en_priv *tmp;
+	int port_up = 0;
+	int err = 0;
+
+	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
+	mutex_lock(&mdev->state_lock);
+	memcpy(&new_prof, priv->prof, sizeof(struct mlx4_en_port_profile));
+	new_prof.num_up = (tc == 0) ? MLX4_EN_NUM_UP_LOW :
+				      MLX4_EN_NUM_UP_HIGH;
+	new_prof.tx_ring_num[TX] = new_prof.num_tx_rings_p_up *
+				   new_prof.num_up;
+	err = mlx4_en_try_alloc_resources(priv, tmp, &new_prof);
+	if (err)
+		goto out;
+
+	if (priv->port_up) {
+		port_up = 1;
+		mlx4_en_stop_port(dev, 1);
+	}
+
+	mlx4_en_safe_replace_resources(priv, tmp);
+	if (port_up) {
+		err = mlx4_en_start_port(dev);
+		if (err) {
+			en_err(priv, "Failed starting port for setup TC\n");
+			goto out;
+		}
+	}
+
+	err = mlx4_en_setup_tc(dev, tc);
+out:
+	mutex_unlock(&mdev->state_lock);
+	kfree(tmp);
+	return err;
+}
+
+static int __mlx4_en_setup_tc(struct net_device *dev, enum tc_setup_type type,
+			      void *type_data)
+{
+	struct tc_mqprio_qopt *mqprio = type_data;
+
+	if (type != TC_SETUP_MQPRIO)
+		return -EOPNOTSUPP;
+
+	if (mqprio->num_tc && mqprio->num_tc != MLX4_EN_NUM_UP_HIGH)
 		return -EINVAL;
 
-	return mlx4_en_setup_tc(dev, tc->tc);
+	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+
+	return mlx4_en_alloc_tx_queue_per_tc(dev, mqprio->num_tc);
 }
 
 #ifdef CONFIG_RFS_ACCEL
@@ -1339,7 +1390,7 @@ static void mlx4_en_tx_timeout(struct net_device *dev)
 }
 
 
-static struct rtnl_link_stats64 *
+static void
 mlx4_en_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
@@ -1348,8 +1399,6 @@ mlx4_en_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 	mlx4_en_fold_software_stats(dev);
 	netdev_stats_to_stats64(stats, &dev->stats);
 	spin_unlock_bh(&priv->stats_lock);
-
-	return stats;
 }
 
 static void mlx4_en_set_default_moderation(struct mlx4_en_priv *priv)
@@ -2146,7 +2195,7 @@ static int mlx4_en_copy_priv(struct mlx4_en_priv *dst,
 
 	memcpy(&dst->hwtstamp_config, &prof->hwtstamp_config,
 	       sizeof(dst->hwtstamp_config));
-	dst->num_tx_rings_p_up = src->mdev->profile.num_tx_rings_p_up;
+	dst->num_tx_rings_p_up = prof->num_tx_rings_p_up;
 	dst->rx_ring_num = prof->rx_ring_num;
 	dst->flags = prof->flags;
 	dst->mdev = src->mdev;
@@ -2199,6 +2248,7 @@ static void mlx4_en_update_priv(struct mlx4_en_priv *dst,
 		dst->tx_ring[t] = src->tx_ring[t];
 		dst->tx_cq[t] = src->tx_cq[t];
 	}
+	dst->num_tx_rings_p_up = src->num_tx_rings_p_up;
 	dst->rx_ring_num = src->rx_ring_num;
 	memcpy(dst->prof, src->prof, sizeof(struct mlx4_en_port_profile));
 }
@@ -2280,10 +2330,6 @@ static int mlx4_en_change_mtu(struct net_device *dev, int new_mtu)
 	en_dbg(DRV, priv, "Change MTU called - current:%d new:%d\n",
 		 dev->mtu, new_mtu);
 
-	if ((new_mtu < MLX4_EN_MIN_MTU) || (new_mtu > priv->max_mtu)) {
-		en_err(priv, "Bad MTU size:%d.\n", new_mtu);
-		return -EPERM;
-	}
 	dev->mtu = new_mtu;
 
 	if (netif_running(dev)) {
@@ -2350,6 +2396,7 @@ static int mlx4_en_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
 	case HWTSTAMP_FILTER_PTP_V2_EVENT:
 	case HWTSTAMP_FILTER_PTP_V2_SYNC:
 	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+	case HWTSTAMP_FILTER_NTP_ALL:
 		config.rx_filter = HWTSTAMP_FILTER_ALL;
 		break;
 	default:
@@ -2698,7 +2745,7 @@ static const struct net_device_ops mlx4_netdev_ops = {
 	.ndo_set_rx_mode	= mlx4_en_set_rx_mode,
 	.ndo_set_mac_address	= mlx4_en_set_mac,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_change_mtu		= mlx4_en_change_mtu,
+	.extended.ndo_change_mtu	= mlx4_en_change_mtu,
 	.ndo_do_ioctl		= mlx4_en_ioctl,
 	.ndo_tx_timeout		= mlx4_en_tx_timeout,
 	.ndo_vlan_rx_add_vid	= mlx4_en_vlan_rx_add_vid,
@@ -2708,7 +2755,7 @@ static const struct net_device_ops mlx4_netdev_ops = {
 #endif
 	.ndo_set_features	= mlx4_en_set_features,
 	.ndo_fix_features	= mlx4_en_fix_features,
-	.ndo_setup_tc		= __mlx4_en_setup_tc,
+	.extended.ndo_setup_tc_rh = __mlx4_en_setup_tc,
 #ifdef CONFIG_RFS_ACCEL
 	.ndo_rx_flow_steer	= mlx4_en_filter_rfs,
 #endif
@@ -2729,7 +2776,7 @@ static const struct net_device_ops mlx4_netdev_ops_master = {
 	.ndo_set_rx_mode	= mlx4_en_set_rx_mode,
 	.ndo_set_mac_address	= mlx4_en_set_mac,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_change_mtu		= mlx4_en_change_mtu,
+	.extended.ndo_change_mtu	= mlx4_en_change_mtu,
 	.ndo_tx_timeout		= mlx4_en_tx_timeout,
 	.ndo_vlan_rx_add_vid	= mlx4_en_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= mlx4_en_vlan_rx_kill_vid,
@@ -2745,7 +2792,7 @@ static const struct net_device_ops mlx4_netdev_ops_master = {
 #endif
 	.ndo_set_features	= mlx4_en_set_features,
 	.ndo_fix_features	= mlx4_en_fix_features,
-	.ndo_setup_tc		= __mlx4_en_setup_tc,
+	.extended.ndo_setup_tc_rh = __mlx4_en_setup_tc,
 #ifdef CONFIG_RFS_ACCEL
 	.ndo_rx_flow_steer	= mlx4_en_filter_rfs,
 #endif
@@ -3095,7 +3142,7 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
 		priv->flags |= MLX4_EN_DCB_ENABLED;
 		priv->cee_config.pfc_state = false;
 
-		for (i = 0; i < MLX4_EN_NUM_UP; i++)
+		for (i = 0; i < MLX4_EN_NUM_UP_HIGH; i++)
 			priv->cee_config.dcb_pfc[i] = pfc_disabled;
 
 		if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ETS_CFG) {
@@ -3254,6 +3301,10 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
 				    NETIF_F_GSO_PARTIAL;
 		dev->gso_partial_features = NETIF_F_GSO_UDP_TUNNEL_CSUM;
 	}
+
+	/* MTU range: 46 - hw-specific max */
+	dev->extended->min_mtu = MLX4_EN_MIN_MTU;
+	dev->extended->max_mtu = priv->max_mtu;
 
 	mdev->pndev[port] = dev;
 	mdev->upper[port] = NULL;

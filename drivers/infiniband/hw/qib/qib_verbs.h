@@ -241,8 +241,8 @@ static inline int qib_pkey_ok(u16 pkey1, u16 pkey2)
 	return p1 && p1 == p2 && ((__s16)pkey1 < 0 || (__s16)pkey2 < 0);
 }
 
-void qib_bad_pqkey(struct qib_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
-		   u32 qp1, u32 qp2, __be16 lid1, __be16 lid2);
+void qib_bad_pkey(struct qib_ibport *ibp, u32 key, u32 sl,
+		  u32 qp1, u32 qp2, __be16 lid1, __be16 lid2);
 void qib_cap_mask_chg(struct rvt_dev_info *rdi, u8 port_num);
 void qib_sys_guid_chg(struct qib_ibport *ibp);
 void qib_node_desc_chg(struct qib_ibport *ibp);
@@ -304,7 +304,7 @@ void qib_uc_rcv(struct qib_ibport *ibp, struct ib_header *hdr,
 void qib_rc_rcv(struct qib_ctxtdata *rcd, struct ib_header *hdr,
 		int has_grh, void *data, u32 tlen, struct rvt_qp *qp);
 
-int qib_check_ah(struct ib_device *ibdev, struct ib_ah_attr *ah_attr);
+int qib_check_ah(struct ib_device *ibdev, struct rdma_ah_attr *ah_attr);
 
 int qib_check_send_wqe(struct rvt_qp *qp, struct rvt_swqe *wqe);
 
@@ -329,7 +329,7 @@ int qib_ruc_check_hdr(struct qib_ibport *ibp, struct ib_header *hdr,
 		      int has_grh, struct rvt_qp *qp, u32 bth0);
 
 u32 qib_make_grh(struct qib_ibport *ibp, struct ib_grh *hdr,
-		 struct ib_global_route *grh, u32 hwords, u32 nwords);
+		 const struct ib_global_route *grh, u32 hwords, u32 nwords);
 
 void qib_make_ruc_header(struct rvt_qp *qp, struct ib_other_headers *ohdr,
 			 u32 bth0, u32 bth2);

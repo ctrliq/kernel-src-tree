@@ -188,7 +188,7 @@ static void kcryptd_queue_crypt(struct dm_crypt_io *io);
 static u8 *iv_of_dmreq(struct crypt_config *cc, struct dm_crypt_request *dmreq);
 
 /*
- * Use this to access cipher attributes that are the same for each CPU.
+ * Use this to access cipher attributes that are independent of the key.
  */
 static struct crypto_ablkcipher *any_tfm(struct crypt_config *cc)
 {
@@ -305,10 +305,11 @@ static int crypt_iv_essiv_wipe(struct crypt_config *cc)
 	return err;
 }
 
-/* Set up per cpu cipher state */
-static struct crypto_cipher *setup_essiv_cpu(struct crypt_config *cc,
-					     struct dm_target *ti,
-					     u8 *salt, unsigned saltsize)
+/* Allocate the cipher for ESSIV */
+static struct crypto_cipher *alloc_essiv_cipher(struct crypt_config *cc,
+						struct dm_target *ti,
+						const u8 *salt,
+						unsigned int saltsize)
 {
 	struct crypto_cipher *essiv_tfm;
 	int err;
@@ -388,8 +389,8 @@ static int crypt_iv_essiv_ctr(struct crypt_config *cc, struct dm_target *ti,
 	cc->iv_gen_private.essiv.salt = salt;
 	cc->iv_gen_private.essiv.hash_tfm = hash_tfm;
 
-	essiv_tfm = setup_essiv_cpu(cc, ti, salt,
-				crypto_hash_digestsize(hash_tfm));
+	essiv_tfm = alloc_essiv_cipher(cc, ti, salt,
+				       crypto_hash_digestsize(hash_tfm));
 	if (IS_ERR(essiv_tfm)) {
 		crypt_iv_essiv_dtr(cc);
 		return PTR_ERR(essiv_tfm);
@@ -1405,30 +1406,6 @@ static void kcryptd_queue_crypt(struct dm_crypt_io *io)
 	queue_work(cc->crypt_queue, &io->work);
 }
 
-/*
- * Decode key from its hex representation
- */
-static int crypt_decode_key(u8 *key, char *hex, unsigned int size)
-{
-	char buffer[3];
-	unsigned int i;
-
-	buffer[2] = '\0';
-
-	for (i = 0; i < size; i++) {
-		buffer[0] = *hex++;
-		buffer[1] = *hex++;
-
-		if (kstrtou8(buffer, 16, &key[i]))
-			return -EINVAL;
-	}
-
-	if (*hex != '\0')
-		return -EINVAL;
-
-	return 0;
-}
-
 static void crypt_free_tfms(struct crypt_config *cc)
 {
 	unsigned i;
@@ -1503,7 +1480,8 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 	/* clear the flag since following operations may invalidate previously valid key */
 	clear_bit(DM_CRYPT_KEY_VALID, &cc->flags);
 
-	if (cc->key_size && crypt_decode_key(cc->key, key, cc->key_size) < 0)
+	/* Decode key from its hex representation. */
+	if (cc->key_size && hex2bin(cc->key, key, cc->key_size) < 0)
 		goto out;
 
 	r = crypt_setkey(cc);
@@ -1743,7 +1721,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	const char *opt_string;
 	char dummy;
 
-	static struct dm_arg _args[] = {
+	static const struct dm_arg _args[] = {
 		{0, 3, "Invalid number of feature args"},
 	};
 

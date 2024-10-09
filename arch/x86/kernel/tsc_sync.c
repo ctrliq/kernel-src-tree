@@ -30,6 +30,20 @@ struct tsc_adjust {
 
 static DEFINE_PER_CPU(struct tsc_adjust, tsc_adjust);
 
+/*
+ * TSC's on different sockets may be reset asynchronously.
+ * This may cause the TSC ADJUST value on socket 0 to be NOT 0.
+ */
+bool __read_mostly tsc_async_resets;
+
+void mark_tsc_async_resets(char *reason)
+{
+	if (tsc_async_resets)
+		return;
+	tsc_async_resets = true;
+	pr_info("tsc: Marking TSC async resets true due to %s\n", reason);
+}
+
 void tsc_verify_tsc_adjust(void)
 {
 	struct tsc_adjust *adj = this_cpu_ptr(&tsc_adjust);
@@ -62,8 +76,41 @@ void tsc_verify_tsc_adjust(void)
 	}
 }
 
+static void tsc_sanitize_first_cpu(struct tsc_adjust *cur, s64 bootval,
+				   unsigned int cpu, bool bootcpu)
+{
+	/*
+	 * First online CPU in a package stores the boot value in the
+	 * adjustment value. This value might change later via the sync
+	 * mechanism. If that fails we still can yell about boot values not
+	 * being consistent.
+	 *
+	 * On the boot cpu we just force set the ADJUST value to 0 if it's
+	 * non zero. We don't do that on non boot cpus because physical
+	 * hotplug should have set the ADJUST register to a value > 0 so
+	 * the TSC is in sync with the already running cpus.
+	 *
+	 * Also don't force the ADJUST value to zero if that is a valid value
+	 * for socket 0 as determined by the system arch.  This is required
+	 * when multiple sockets are reset asynchronously with each other
+	 * and socket 0 may not have an TSC ADJUST value of 0.
+	 */
+	if (bootcpu && bootval != 0) {
+		if (likely(!tsc_async_resets)) {
+			pr_warn(FW_BUG "TSC ADJUST: CPU%u: %lld force to 0\n",
+				cpu, bootval);
+			wrmsrl(MSR_IA32_TSC_ADJUST, 0);
+			bootval = 0;
+		} else {
+			pr_info("TSC ADJUST: CPU%u: %lld NOT forced to 0\n",
+				cpu, bootval);
+		}
+	}
+	cur->adjusted = bootval;
+}
+
 #ifndef CONFIG_SMP
-bool __init tsc_store_and_check_tsc_adjust(void)
+bool __init tsc_store_and_check_tsc_adjust(bool bootcpu)
 {
 	struct tsc_adjust *ref, *cur = this_cpu_ptr(&tsc_adjust);
 	s64 bootval;
@@ -77,9 +124,8 @@ bool __init tsc_store_and_check_tsc_adjust(void)
 
 	rdmsrl(MSR_IA32_TSC_ADJUST, bootval);
 	cur->bootval = bootval;
-	cur->adjusted = bootval;
 	cur->nextcheck = jiffies + HZ;
-	pr_info("TSC ADJUST: Boot CPU0: %lld\n", bootval);
+	tsc_sanitize_first_cpu(cur, bootval, smp_processor_id(), bootcpu);
 	return false;
 }
 
@@ -88,7 +134,7 @@ bool __init tsc_store_and_check_tsc_adjust(void)
 /*
  * Store and check the TSC ADJUST MSR if available
  */
-bool tsc_store_and_check_tsc_adjust(void)
+bool tsc_store_and_check_tsc_adjust(bool bootcpu)
 {
 	struct tsc_adjust *ref, *cur = this_cpu_ptr(&tsc_adjust);
 	unsigned int refcpu, cpu = smp_processor_id();
@@ -104,24 +150,25 @@ bool tsc_store_and_check_tsc_adjust(void)
 	cur->warned = false;
 
 	/*
+	 * If a non-zero TSC value for socket 0 may be valid then the default
+	 * adjusted value cannot assumed to be zero either.
+	 */
+	if (tsc_async_resets)
+		cur->adjusted = bootval;
+
+	/*
 	 * Check whether this CPU is the first in a package to come up. In
 	 * this case do not check the boot value against another package
-	 * because the package might have been physically hotplugged, where
-	 * TSC_ADJUST is expected to be different. When called on the boot
-	 * CPU topology_core_cpumask() might not be available yet.
+	 * because the new package might have been physically hotplugged,
+	 * where TSC_ADJUST is expected to be different. When called on the
+	 * boot CPU topology_core_cpumask() might not be available yet.
 	 */
 	mask = topology_core_cpumask(cpu);
 	refcpu = mask ? cpumask_any_but(mask, cpu) : nr_cpu_ids;
 
 	if (refcpu >= nr_cpu_ids) {
-		/*
-		 * First online CPU in a package stores the boot value in
-		 * the adjustment value. This value might change later via
-		 * the sync mechanism. If that fails we still can yell
-		 * about boot values not being consistent.
-		 */
-		cur->adjusted = bootval;
-		pr_info_once("TSC ADJUST: Boot CPU%u: %lld\n", cpu,  bootval);
+		tsc_sanitize_first_cpu(cur, bootval, smp_processor_id(),
+				       bootcpu);
 		return false;
 	}
 
@@ -130,10 +177,9 @@ bool tsc_store_and_check_tsc_adjust(void)
 	 * Compare the boot value and complain if it differs in the
 	 * package.
 	 */
-	if (bootval != ref->bootval) {
-		pr_warn("TSC ADJUST differs: Reference CPU%u: %lld CPU%u: %lld\n",
-			refcpu, ref->bootval, cpu, bootval);
-	}
+	if (bootval != ref->bootval)
+		printk_once(FW_BUG "TSC ADJUST differs within socket(s), fixing all errors\n");
+
 	/*
 	 * The TSC_ADJUST values in a package must be the same. If the boot
 	 * value on this newly upcoming CPU differs from the adjustment
@@ -141,8 +187,6 @@ bool tsc_store_and_check_tsc_adjust(void)
 	 * adjusted value.
 	 */
 	if (bootval != ref->adjusted) {
-		pr_warn("TSC ADJUST synchronize: Reference CPU%u: %lld CPU%u: %lld\n",
-			refcpu, ref->adjusted, cpu, bootval);
 		cur->adjusted = ref->adjusted;
 		wrmsrl(MSR_IA32_TSC_ADJUST, ref->adjusted);
 	}
@@ -374,7 +418,7 @@ void check_tsc_sync_target(void)
 	 * Store, verify and sanitize the TSC adjust register. If
 	 * successful skip the test.
 	 */
-	if (tsc_store_and_check_tsc_adjust()) {
+	if (tsc_store_and_check_tsc_adjust(false)) {
 		atomic_inc(&skip_test);
 		return;
 	}

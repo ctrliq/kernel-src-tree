@@ -95,6 +95,7 @@ typedef	struct {
 #define EFI_MEMORY_WP		((u64)0x0000000000001000ULL)	/* write-protect */
 #define EFI_MEMORY_RP		((u64)0x0000000000002000ULL)	/* read-protect */
 #define EFI_MEMORY_XP		((u64)0x0000000000004000ULL)	/* execute-protect */
+#define EFI_MEMORY_NV		((u64)0x0000000000008000ULL)	/* non-volatile */
 #define EFI_MEMORY_MORE_RELIABLE \
 				((u64)0x0000000000010000ULL)	/* higher reliability */
 #define EFI_MEMORY_RUNTIME	((u64)0x8000000000000000ULL)	/* range requires runtime mapping */
@@ -524,6 +525,8 @@ typedef efi_status_t efi_query_capsule_caps_t(efi_capsule_header_t **capsules,
 					      int *reset_type);
 typedef efi_status_t efi_query_variable_store_t(u32 attributes, unsigned long size);
 
+void efi_native_runtime_setup(void);
+
 /*
  *  EFI Configuration Table and GUID definitions
  */
@@ -677,7 +680,7 @@ typedef struct {
 } efi_system_table_t;
 
 struct efi_memory_map {
-	void *phys_map;
+	RH_KABI_REPLACE(void *phys_map, phys_addr_t phys_map)
 	void *map;
 	void *map_end;
 	int nr_map;
@@ -853,6 +856,8 @@ extern struct efi {
 	RH_KABI_EXTEND(unsigned long smbios3)
 	/* ESRT table */
 	RH_KABI_EXTEND(unsigned long esrt)
+	/* EFI facility flags */
+	RH_KABI_EXTEND(unsigned long flags)
 } efi;
 
 static inline int
@@ -914,6 +919,28 @@ struct key;
 extern int __init parse_efi_signature_list(const void *data, size_t size,
 					   struct key *keyring);
 
+/*
+ * efi_early_memdesc_ptr - get the n-th EFI memmap descriptor
+ * @map: the start of efi memmap
+ * @desc_size: the size of space for each EFI memmap descriptor
+ * @n: the index of efi memmap descriptor
+ *
+ * EFI boot service provides the GetMemoryMap() function to get a copy of the
+ * current memory map which is an array of memory descriptors, each of
+ * which describes a contiguous block of memory. It also gets the size of the
+ * map, and the size of each descriptor, etc.
+ *
+ * Note that per section 6.2 of UEFI Spec 2.6 Errata A, the returned size of
+ * each descriptor might not be equal to sizeof(efi_memory_memdesc_t),
+ * since efi_memory_memdesc_t may be extended in the future. Thus the OS
+ * MUST use the returned size of the descriptor to find the start of each
+ * efi_memory_memdesc_t in the memory map array. This should only be used
+ * during bootup since for_each_efi_memory_desc_xxx() is available after the
+ * kernel initializes the EFI subsystem to set up struct efi_memory_map.
+ */
+#define efi_early_memdesc_ptr(map, desc_size, n)			\
+	(efi_memory_desc_t *)((void *)(map) + ((n) * (desc_size)))
+
 /**
  * efi_range_is_wc - check the WC bit on an address range
  * @start: starting kvirt address
@@ -954,17 +981,31 @@ extern int __init efi_setup_pcdp_console(char *);
 
 #ifdef CONFIG_EFI
 # ifdef CONFIG_X86
-extern int efi_enabled(int facility);
-# else
-static inline int efi_enabled(int facility)
+
+/*
+ * Test whether the above EFI_* bits are enabled.
+ */
+static inline bool efi_enabled(int feature)
 {
-	return 1;
+	return test_bit(feature, &efi.flags) != 0;
+}
+
+extern bool efi_is_table_address(unsigned long phys_addr);
+# else
+static inline bool efi_enabled(int feature)
+{
+	return true;
 }
 # endif
 #else
-static inline int efi_enabled(int facility)
+static inline bool efi_enabled(int feature)
 {
-	return 0;
+	return false;
+}
+
+static inline bool efi_is_table_address(unsigned long phys_addr)
+{
+	return false;
 }
 #endif
 
@@ -1042,6 +1083,26 @@ struct efi_generic_dev_path {
 	u8 sub_type;
 	u16 length;
 } __attribute ((packed));
+
+struct efi_dev_path {
+	u8 type;	/* can be replaced with unnamed */
+	u8 sub_type;	/* struct efi_generic_dev_path; */
+	u16 length;	/* once we've moved to -std=c11 */
+	union {
+		struct {
+			u32 hid;
+			u32 uid;
+		} acpi;
+		struct {
+			u8 fn;
+			u8 dev;
+		} pci;
+	};
+} __attribute ((packed));
+
+#if IS_ENABLED(CONFIG_EFI_DEV_PATH_PARSER)
+struct device *efi_get_device_by_path(struct efi_dev_path **node, size_t *len);
+#endif
 
 static inline void memrange_efi_to_native(u64 *addr, u64 *npages)
 {
@@ -1212,5 +1273,59 @@ static inline int efi_runtime_map_copy(void *buf, size_t bufsz)
 }
 
 #endif
+
+bool efi_runtime_disabled(void);
+extern void efi_call_virt_check_flags(unsigned long flags, const char *call);
+
+/*
+ * Arch code can implement the following three template macros, avoiding
+ * reptition for the void/non-void return cases of {__,}efi_call_virt():
+ *
+ *  * arch_efi_call_virt_setup()
+ *
+ *    Sets up the environment for the call (e.g. switching page tables,
+ *    allowing kernel-mode use of floating point, if required).
+ *
+ *  * arch_efi_call_virt()
+ *
+ *    Performs the call. The last expression in the macro must be the call
+ *    itself, allowing the logic to be shared by the void and non-void
+ *    cases.
+ *
+ *  * arch_efi_call_virt_teardown()
+ *
+ *    Restores the usual kernel environment once the call has returned.
+ */
+
+#define efi_call_virt_pointer(p, f, args...)				\
+({									\
+	efi_status_t __s;						\
+	unsigned long __flags;						\
+	bool ibrs_on;							\
+									\
+	ibrs_on = arch_efi_call_virt_setup();				\
+									\
+	local_save_flags(__flags);					\
+	__s = arch_efi_call_virt(p, f, args);				\
+	efi_call_virt_check_flags(__flags, __stringify(f));		\
+									\
+	arch_efi_call_virt_teardown(ibrs_on);				\
+									\
+	__s;								\
+})
+
+#define __efi_call_virt_pointer(p, f, args...)				\
+({									\
+	unsigned long __flags;						\
+	bool ibrs_on;							\
+									\
+	ibrs_on = arch_efi_call_virt_setup();				\
+									\
+	local_save_flags(__flags);					\
+	arch_efi_call_virt(p, f, args);					\
+	efi_call_virt_check_flags(__flags, __stringify(f));		\
+									\
+	arch_efi_call_virt_teardown(ibrs_on);				\
+})
 
 #endif /* _LINUX_EFI_H */

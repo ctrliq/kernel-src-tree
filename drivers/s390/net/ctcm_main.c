@@ -1106,7 +1106,7 @@ static const struct net_device_ops ctcm_netdev_ops = {
 	.ndo_open		= ctcm_open,
 	.ndo_stop		= ctcm_close,
 	.ndo_get_stats		= ctcm_stats,
-	.ndo_change_mtu	   	= ctcm_change_mtu,
+	.ndo_change_mtu_rh74	= ctcm_change_mtu,
 	.ndo_start_xmit		= ctcm_tx,
 };
 
@@ -1114,7 +1114,7 @@ static const struct net_device_ops ctcm_mpc_netdev_ops = {
 	.ndo_open		= ctcm_open,
 	.ndo_stop		= ctcm_close,
 	.ndo_get_stats		= ctcm_stats,
-	.ndo_change_mtu	   	= ctcm_change_mtu,
+	.ndo_change_mtu_rh74	= ctcm_change_mtu,
 	.ndo_start_xmit		= ctcmpc_tx,
 };
 

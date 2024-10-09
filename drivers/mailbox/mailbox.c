@@ -21,9 +21,7 @@
 #include <linux/mailbox_client.h>
 #include <linux/mailbox_controller.h>
 
-#define TXDONE_BY_IRQ	BIT(0) /* controller has remote RTR irq */
-#define TXDONE_BY_POLL	BIT(1) /* controller can read status of last TX */
-#define TXDONE_BY_ACK	BIT(2) /* S/W ACK recevied by Client ticks the TX */
+#include "mailbox.h"
 
 static LIST_HEAD(mbox_cons);
 static DEFINE_MUTEX(con_mutex);
@@ -106,8 +104,11 @@ static void tx_tick(struct mbox_chan *chan, int r)
 	/* Submit next message */
 	msg_submit(chan);
 
+	if (!mssg)
+		return;
+
 	/* Notify the client */
-	if (mssg && chan->cl->tx_done)
+	if (chan->cl->tx_done)
 		chan->cl->tx_done(chan->cl, mssg, r);
 
 	if (r != -ETIME && chan->cl->tx_block)
@@ -323,7 +324,7 @@ struct mbox_chan *mbox_request_channel(struct mbox_client *cl, int index)
 		return ERR_PTR(-ENODEV);
 	}
 
-	chan = NULL;
+	chan = ERR_PTR(-EPROBE_DEFER);
 	list_for_each_entry(mbox, &mbox_cons, node)
 		if (mbox->dev->of_node == spec.np) {
 			chan = mbox->of_xlate(mbox, &spec);
@@ -332,7 +333,12 @@ struct mbox_chan *mbox_request_channel(struct mbox_client *cl, int index)
 
 	of_node_put(spec.np);
 
-	if (!chan || chan->cl || !try_module_get(mbox->dev->driver->owner)) {
+	if (IS_ERR(chan)) {
+		mutex_unlock(&con_mutex);
+		return chan;
+	}
+
+	if (chan->cl || !try_module_get(mbox->dev->driver->owner)) {
 		dev_dbg(dev, "%s: mailbox not free\n", __func__);
 		mutex_unlock(&con_mutex);
 		return ERR_PTR(-EBUSY);
@@ -428,7 +434,7 @@ of_mbox_index_xlate(struct mbox_controller *mbox,
 	int ind = sp->args[0];
 
 	if (ind >= mbox->num_chans)
-		return NULL;
+		return ERR_PTR(-EINVAL);
 
 	return &mbox->chans[ind];
 }

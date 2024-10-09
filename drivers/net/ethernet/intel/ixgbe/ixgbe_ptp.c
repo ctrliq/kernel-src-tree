@@ -245,7 +245,7 @@ static void ixgbe_ptp_setup_sdp_x540(struct ixgbe_adapter *adapter)
  * result of SYSTIME is 32bits of "billions of cycles" and 32 bits of
  * "cycles", rather than seconds and nanoseconds.
  */
-static cycle_t ixgbe_ptp_read_X550(const struct cyclecounter *hw_cc)
+static u64 ixgbe_ptp_read_X550(const struct cyclecounter *hw_cc)
 {
 	struct ixgbe_adapter *adapter =
 			container_of(hw_cc, struct ixgbe_adapter, hw_cc);
@@ -282,7 +282,7 @@ static cycle_t ixgbe_ptp_read_X550(const struct cyclecounter *hw_cc)
  * cyclecounter structure used to construct a ns counter from the
  * arbitrary fixed point registers
  */
-static cycle_t ixgbe_ptp_read_82599(const struct cyclecounter *cc)
+static u64 ixgbe_ptp_read_82599(const struct cyclecounter *cc)
 {
 	struct ixgbe_adapter *adapter =
 		container_of(cc, struct ixgbe_adapter, hw_cc);
@@ -919,6 +919,7 @@ static int ixgbe_ptp_set_timestamp_mode(struct ixgbe_adapter *adapter,
 				   IXGBE_FLAG_RX_HWTSTAMP_IN_REGISTER);
 		break;
 	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
+	case HWTSTAMP_FILTER_NTP_ALL:
 	case HWTSTAMP_FILTER_ALL:
 		/* The X550 controller is capable of timestamping all packets,
 		 * which allows it to accept any filter.

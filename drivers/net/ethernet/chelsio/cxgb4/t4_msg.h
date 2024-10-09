@@ -92,6 +92,7 @@ enum {
 	CPL_RDMA_TERMINATE    = 0xA2,
 	CPL_RDMA_WRITE        = 0xA4,
 	CPL_SGE_EGR_UPDATE    = 0xA5,
+	CPL_RX_MPS_PKT        = 0xAF,
 
 	CPL_TRACE_PKT         = 0xB0,
 	CPL_ISCSI_DATA	      = 0xB2,
@@ -807,6 +808,10 @@ struct cpl_tx_pkt {
 #define TXPKT_INS_OVLAN_V(x) ((x) << TXPKT_INS_OVLAN_S)
 #define TXPKT_INS_OVLAN_F    TXPKT_INS_OVLAN_V(1U)
 
+#define TXPKT_TSTAMP_S    23
+#define TXPKT_TSTAMP_V(x) ((x) << TXPKT_TSTAMP_S)
+#define TXPKT_TSTAMP_F    TXPKT_TSTAMP_V(1ULL)
+
 #define TXPKT_OPCODE_S    24
 #define TXPKT_OPCODE_V(x) ((x) << TXPKT_OPCODE_S)
 
@@ -1157,6 +1162,21 @@ struct cpl_rx_pkt {
 #define RX_IPHDR_LEN_M    0x3FF
 #define RX_IPHDR_LEN_V(x) ((x) << RX_IPHDR_LEN_S)
 #define RX_IPHDR_LEN_G(x) (((x) >> RX_IPHDR_LEN_S) & RX_IPHDR_LEN_M)
+
+#define T6_COMPR_RXERR_LEN_S    1
+#define T6_COMPR_RXERR_LEN_V(x) ((x) << T6_COMPR_RXERR_LEN_S)
+#define T6_COMPR_RXERR_LEN_F    T6_COMPR_RXERR_LEN_V(1U)
+
+#define T6_COMPR_RXERR_VEC_S    0
+#define T6_COMPR_RXERR_VEC_M    0x3F
+#define T6_COMPR_RXERR_VEC_V(x) ((x) << T6_COMPR_RXERR_LEN_S)
+#define T6_COMPR_RXERR_VEC_G(x) \
+		(((x) >> T6_COMPR_RXERR_VEC_S) & T6_COMPR_RXERR_VEC_M)
+
+/* Logical OR of RX_ERROR_CSUM, RX_ERROR_CSIP */
+#define T6_COMPR_RXERR_SUM_S    4
+#define T6_COMPR_RXERR_SUM_V(x) ((x) << T6_COMPR_RXERR_SUM_S)
+#define T6_COMPR_RXERR_SUM_F    T6_COMPR_RXERR_SUM_V(1U)
 
 struct cpl_trace_pkt {
 	u8 opcode;
@@ -1843,4 +1863,27 @@ struct cpl_rx_phys_dsgl {
 	(((x) >> CPL_RX_PHYS_DSGL_NOOFSGENTR_S) & \
 	 CPL_RX_PHYS_DSGL_NOOFSGENTR_M)
 
+struct cpl_rx_mps_pkt {
+	__be32 op_to_r1_hi;
+	__be32 r1_lo_length;
+};
+
+#define CPL_RX_MPS_PKT_OP_S     24
+#define CPL_RX_MPS_PKT_OP_M     0xff
+#define CPL_RX_MPS_PKT_OP_V(x)  ((x) << CPL_RX_MPS_PKT_OP_S)
+#define CPL_RX_MPS_PKT_OP_G(x)  \
+	(((x) >> CPL_RX_MPS_PKT_OP_S) & CPL_RX_MPS_PKT_OP_M)
+
+#define CPL_RX_MPS_PKT_TYPE_S           20
+#define CPL_RX_MPS_PKT_TYPE_M           0xf
+#define CPL_RX_MPS_PKT_TYPE_V(x)        ((x) << CPL_RX_MPS_PKT_TYPE_S)
+#define CPL_RX_MPS_PKT_TYPE_G(x)        \
+	(((x) >> CPL_RX_MPS_PKT_TYPE_S) & CPL_RX_MPS_PKT_TYPE_M)
+
+enum {
+	X_CPL_RX_MPS_PKT_TYPE_PAUSE = 1 << 0,
+	X_CPL_RX_MPS_PKT_TYPE_PPP   = 1 << 1,
+	X_CPL_RX_MPS_PKT_TYPE_QFC   = 1 << 2,
+	X_CPL_RX_MPS_PKT_TYPE_PTP   = 1 << 3
+};
 #endif  /* __T4_MSG_H */

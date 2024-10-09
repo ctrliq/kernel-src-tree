@@ -210,7 +210,7 @@ void read_boot_clock(struct timespec *ts)
 	tod_to_timeval(sched_clock_base_cc - TOD_UNIX_EPOCH, ts);
 }
 
-static cycle_t read_tod_clock(struct clocksource *cs)
+static u64 read_tod_clock(struct clocksource *cs)
 {
 	return get_tod_clock();
 }

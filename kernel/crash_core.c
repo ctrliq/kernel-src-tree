@@ -6,7 +6,6 @@
  * Version 2.  See the file COPYING for more details.
  */
 
-#include <linux/crash_core.h>
 #include <linux/utsname.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
@@ -17,6 +16,7 @@
 #ifdef CONFIG_KEXEC_AUTO_RESERVE
 #include <asm/kexec.h>
 #endif
+#include <linux/crash_core.h>
 
 /* vmcoreinfo stuff */
 static unsigned char vmcoreinfo_data[VMCOREINFO_BYTES];

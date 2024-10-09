@@ -4,6 +4,7 @@
 #include <linux/types.h>
 #include <linux/pkt_sched.h>
 
+#ifdef __KERNEL__
 /* I think i could have done better macros ; for now this is stolen from
  * some arch/mips code - jhs
 */
@@ -16,13 +17,6 @@
 
 /* verdict bit breakdown 
  *
-bit 0: when set -> this packet has been munged already
-
-bit 1: when set -> It is ok to munge this packet
-
-bit 2,3,4,5: Reclassify counter - sort of reverse TTL - if exceeded
-assume loop
-
 bit 6,7: Where this packet was last seen 
 0: Above the transmit example at the socket level
 1: on the Ingress
@@ -30,27 +24,8 @@ bit 6,7: Where this packet was last seen
 
 bit 8: when set --> Request not to classify on ingress. 
 
-bits 9,10,11: redirect counter -  redirect TTL. Loop avoidance
-
  *
  * */
-
-#ifndef __KERNEL__
-/* backwards compat for userspace only */
-#define TC_MUNGED          _TC_MAKEMASK1(0)
-#define SET_TC_MUNGED(v)   ( TC_MUNGED | (v & ~TC_MUNGED))
-#define CLR_TC_MUNGED(v)   ( v & ~TC_MUNGED)
-
-#define TC_OK2MUNGE        _TC_MAKEMASK1(1)
-#define SET_TC_OK2MUNGE(v)   ( TC_OK2MUNGE | (v & ~TC_OK2MUNGE))
-#define CLR_TC_OK2MUNGE(v)   ( v & ~TC_OK2MUNGE)
-
-#define S_TC_VERD          _TC_MAKE32(2)
-#define M_TC_VERD          _TC_MAKEMASK(4,S_TC_VERD)
-#define G_TC_VERD(x)       _TC_GETVALUE(x,S_TC_VERD,M_TC_VERD)
-#define V_TC_VERD(x)       _TC_MAKEVALUE(x,S_TC_VERD)
-#define SET_TC_VERD(v,n)   ((V_TC_VERD(n)) | (v & ~M_TC_VERD))
-#endif
 
 #define S_TC_FROM          _TC_MAKE32(6)
 #define M_TC_FROM          _TC_MAKEMASK(2,S_TC_FROM)
@@ -65,19 +40,12 @@ bits 9,10,11: redirect counter -  redirect TTL. Loop avoidance
 #define SET_TC_NCLS(v)   ( TC_NCLS | (v & ~TC_NCLS))
 #define CLR_TC_NCLS(v)   ( v & ~TC_NCLS)
 
-#ifndef __KERNEL__
-#define S_TC_RTTL          _TC_MAKE32(9)
-#define M_TC_RTTL          _TC_MAKEMASK(3,S_TC_RTTL)
-#define G_TC_RTTL(x)       _TC_GETVALUE(x,S_TC_RTTL,M_TC_RTTL)
-#define V_TC_RTTL(x)       _TC_MAKEVALUE(x,S_TC_RTTL)
-#define SET_TC_RTTL(v,n)   ((V_TC_RTTL(n)) | (v & ~M_TC_RTTL))
-#endif
-
 #define S_TC_AT          _TC_MAKE32(12)
 #define M_TC_AT          _TC_MAKEMASK(2,S_TC_AT)
 #define G_TC_AT(x)       _TC_GETVALUE(x,S_TC_AT,M_TC_AT)
 #define V_TC_AT(x)       _TC_MAKEVALUE(x,S_TC_AT)
 #define SET_TC_AT(v,n)   ((V_TC_AT(n)) | (v & ~M_TC_AT))
+#endif
 
 #define TC_COOKIE_MAX_SIZE 16
 
@@ -102,8 +70,6 @@ enum {
 #define TCA_ACT_NOUNBIND	0
 #define TCA_ACT_REPLACE		1
 #define TCA_ACT_NOREPLACE	0
-#define MAX_REC_LOOP 4
-#define MAX_RED_LOOP 4
 
 #define TC_ACT_UNSPEC	(-1)
 #define TC_ACT_OK		0
@@ -113,7 +79,28 @@ enum {
 #define TC_ACT_STOLEN		4
 #define TC_ACT_QUEUED		5
 #define TC_ACT_REPEAT		6
-#define TC_ACT_JUMP		0x10000000
+#define TC_ACT_TRAP		8 /* For hw path, this means "trap to cpu"
+				   * and don't further process the frame
+				   * in hardware. For sw path, this is
+				   * equivalent of TC_ACT_STOLEN - drop
+				   * the skb and act like everything
+				   * is alright.
+				   */
+
+/* There is a special kind of actions called "extended actions",
+ * which need a value parameter. These have a local opcode located in
+ * the highest nibble, starting from 1. The rest of the bits
+ * are used to carry the value. These two parts together make
+ * a combined opcode.
+ */
+#define __TC_ACT_EXT_SHIFT 28
+#define __TC_ACT_EXT(local) ((local) << __TC_ACT_EXT_SHIFT)
+#define TC_ACT_EXT_VAL_MASK ((1 << __TC_ACT_EXT_SHIFT) - 1)
+#define TC_ACT_EXT_CMP(combined, opcode) \
+	(((combined) & (~TC_ACT_EXT_VAL_MASK)) == opcode)
+
+#define TC_ACT_JUMP __TC_ACT_EXT(1)
+#define TC_ACT_GOTO_CHAIN __TC_ACT_EXT(2)
 
 /* Action type identifiers*/
 enum {

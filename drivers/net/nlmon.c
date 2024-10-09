@@ -77,7 +77,7 @@ static int nlmon_close(struct net_device *dev)
 	return netlink_remove_tap(&nlmon->nt);
 }
 
-static struct rtnl_link_stats64 *
+static void
 nlmon_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	int i;
@@ -105,8 +105,6 @@ nlmon_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 
 	stats->rx_bytes = bytes;
 	stats->tx_bytes = 0;
-
-	return stats;
 }
 
 static u32 always_on(struct net_device *dev)
@@ -125,7 +123,7 @@ static const struct net_device_ops nlmon_ops = {
 	.ndo_stop = nlmon_close,
 	.ndo_start_xmit = nlmon_xmit,
 	.ndo_get_stats64 = nlmon_get_stats64,
-	.ndo_change_mtu = nlmon_change_mtu,
+	.ndo_change_mtu_rh74 = nlmon_change_mtu,
 };
 
 static void nlmon_setup(struct net_device *dev)
@@ -135,7 +133,7 @@ static void nlmon_setup(struct net_device *dev)
 
 	dev->netdev_ops	= &nlmon_ops;
 	dev->ethtool_ops = &nlmon_ethtool_ops;
-	dev->destructor	= free_netdev;
+	dev->extended->needs_free_netdev = true;
 
 	dev->features = NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
 	dev->flags = IFF_NOARP;

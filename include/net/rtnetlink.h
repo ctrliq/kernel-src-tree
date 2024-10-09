@@ -24,6 +24,14 @@ static inline int rtnl_msg_family(const struct nlmsghdr *nlh)
 		return AF_UNSPEC;
 }
 
+/*
+ * RHEL specific: Forward declaration of structure nla_policy that is used
+ * in RHEL 7.4 and earlier.
+ * For more details see the explanation in __rtnl_link_register() in
+ * net/core/rtnetlink.c
+ */
+struct nla_policy_rh74;
+
 /**
  *	struct rtnl_link_ops - rtnetlink link operations
  *
@@ -61,7 +69,8 @@ struct rtnl_link_ops {
 	void			(*setup)(struct net_device *dev);
 
 	int			maxtype;
-	const struct nla_policy	*policy;
+	RH_KABI_REPLACE(const struct nla_policy	*policy,
+			const struct nla_policy_rh74 *policy_rh74)
 	int			(*validate)(struct nlattr *tb[],
 					    struct nlattr *data[]);
 
@@ -94,7 +103,7 @@ struct rtnl_link_ops {
 	 */
 	RH_KABI_USE_P(1, struct net	*(*get_link_net)(const struct net_device *dev))
 	RH_KABI_USE_P(2, int	slave_maxtype)
-	RH_KABI_USE_P(3, const struct nla_policy *slave_policy)
+	RH_KABI_USE_P(3, const struct nla_policy_rh74 *slave_policy_rh74)
 	RH_KABI_USE_P(4, int	(*slave_validate)(struct nlattr *tb[], struct nlattr *data[]))
 	RH_KABI_USE_P(5, int	(*slave_changelink)(struct net_device *dev,
 						    struct net_device *slave_dev,
@@ -109,8 +118,8 @@ struct rtnl_link_ops {
 	RH_KABI_USE_P(9, int	(*fill_linkxstats)(struct sk_buff *skb,
 						   const struct net_device *dev,
 						   int *prividx, int attr))
-	RH_KABI_RESERVE_P(10)
-	RH_KABI_RESERVE_P(11)
+	RH_KABI_USE_P(10, const struct nla_policy *policy)
+	RH_KABI_USE_P(11, const struct nla_policy *slave_policy)
 	RH_KABI_RESERVE_P(12)
 	RH_KABI_RESERVE_P(13)
 	RH_KABI_RESERVE_P(14)

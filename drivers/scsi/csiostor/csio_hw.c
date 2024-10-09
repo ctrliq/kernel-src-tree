@@ -60,37 +60,10 @@ int csio_msi = 2;
 static int dev_num;
 
 /* FCoE Adapter types & its description */
-static const struct csio_adap_desc csio_t4_fcoe_adapters[] = {
-	{"T440-Dbg 10G", "Chelsio T440-Dbg 10G [FCoE]"},
-	{"T420-CR 10G", "Chelsio T420-CR 10G [FCoE]"},
-	{"T422-CR 10G/1G", "Chelsio T422-CR 10G/1G [FCoE]"},
-	{"T440-CR 10G", "Chelsio T440-CR 10G [FCoE]"},
-	{"T420-BCH 10G", "Chelsio T420-BCH 10G [FCoE]"},
-	{"T440-BCH 10G", "Chelsio T440-BCH 10G [FCoE]"},
-	{"T440-CH 10G", "Chelsio T440-CH 10G [FCoE]"},
-	{"T420-SO 10G", "Chelsio T420-SO 10G [FCoE]"},
-	{"T420-CX4 10G", "Chelsio T420-CX4 10G [FCoE]"},
-	{"T420-BT 10G", "Chelsio T420-BT 10G [FCoE]"},
-	{"T404-BT 1G", "Chelsio T404-BT 1G [FCoE]"},
-	{"B420-SR 10G", "Chelsio B420-SR 10G [FCoE]"},
-	{"B404-BT 1G", "Chelsio B404-BT 1G [FCoE]"},
-	{"T480-CR 10G", "Chelsio T480-CR 10G [FCoE]"},
-	{"T440-LP-CR 10G", "Chelsio T440-LP-CR 10G [FCoE]"},
-	{"AMSTERDAM 10G", "Chelsio AMSTERDAM 10G [FCoE]"},
-	{"HUAWEI T480 10G", "Chelsio HUAWEI T480 10G [FCoE]"},
-	{"HUAWEI T440 10G", "Chelsio HUAWEI T440 10G [FCoE]"},
-	{"HUAWEI STG 10G", "Chelsio HUAWEI STG 10G [FCoE]"},
-	{"ACROMAG XAUI 10G", "Chelsio ACROMAG XAUI 10G [FCoE]"},
-	{"ACROMAG SFP+ 10G", "Chelsio ACROMAG SFP+ 10G [FCoE]"},
-	{"QUANTA SFP+ 10G", "Chelsio QUANTA SFP+ 10G [FCoE]"},
-	{"HUAWEI 10Gbase-T", "Chelsio HUAWEI 10Gbase-T [FCoE]"},
-	{"HUAWEI T4TOE 10G", "Chelsio HUAWEI T4TOE 10G [FCoE]"}
-};
-
 static const struct csio_adap_desc csio_t5_fcoe_adapters[] = {
 	{"T580-Dbg 10G", "Chelsio T580-Dbg 10G [FCoE]"},
 	{"T520-CR 10G", "Chelsio T520-CR 10G [FCoE]"},
-	{"T522-CR 10G/1G", "Chelsio T452-CR 10G/1G [FCoE]"},
+	{"T522-CR 10G/1G", "Chelsio T522-CR 10G/1G [FCoE]"},
 	{"T540-CR 10G", "Chelsio T540-CR 10G [FCoE]"},
 	{"T520-BCH 10G", "Chelsio T520-BCH 10G [FCoE]"},
 	{"T540-BCH 10G", "Chelsio T540-BCH 10G [FCoE]"},
@@ -107,7 +80,9 @@ static const struct csio_adap_desc csio_t5_fcoe_adapters[] = {
 	{"T580-LP-CR 40G", "Chelsio T580-LP-CR 40G [FCoE]"},
 	{"T520-LL-CR 10G", "Chelsio T520-LL-CR 10G [FCoE]"},
 	{"T560-CR 40G", "Chelsio T560-CR 40G [FCoE]"},
-	{"T580-CR 40G", "Chelsio T580-CR 40G [FCoE]"}
+	{"T580-CR 40G", "Chelsio T580-CR 40G [FCoE]"},
+	{"T580-SO 40G", "Chelsio T580-SO 40G [FCoE]"},
+	{"T502-BT 1G", "Chelsio T502-BT 1G [FCoE]"}
 };
 
 static void csio_mgmtm_cleanup(struct csio_mgmtm *);
@@ -661,7 +636,7 @@ csio_hw_print_fw_version(struct csio_hw *hw, char *str)
 static int
 csio_hw_get_fw_version(struct csio_hw *hw, uint32_t *vers)
 {
-	return csio_hw_read_flash(hw, FW_IMG_START +
+	return csio_hw_read_flash(hw, FLASH_FW_START +
 				  offsetof(struct fw_hdr, fw_ver), 1,
 				  vers, 0);
 }
@@ -721,9 +696,9 @@ csio_hw_fw_dload(struct csio_hw *hw, uint8_t *fw_data, uint32_t size)
 		return -EINVAL;
 	}
 
-	if (size > FW_MAX_SIZE) {
+	if (size > FLASH_FW_MAX_SIZE) {
 		csio_err(hw, "FW image too large, max is %u bytes\n",
-			    FW_MAX_SIZE);
+			    FLASH_FW_MAX_SIZE);
 		return -EINVAL;
 	}
 
@@ -739,10 +714,10 @@ csio_hw_fw_dload(struct csio_hw *hw, uint8_t *fw_data, uint32_t size)
 	i = DIV_ROUND_UP(size, sf_sec_size);        /* # of sectors spanned */
 
 	csio_dbg(hw, "Erasing sectors... start:%d end:%d\n",
-			  FW_START_SEC, FW_START_SEC + i - 1);
+			  FLASH_FW_START_SEC, FLASH_FW_START_SEC + i - 1);
 
-	ret = csio_hw_flash_erase_sectors(hw, FW_START_SEC,
-					  FW_START_SEC + i - 1);
+	ret = csio_hw_flash_erase_sectors(hw, FLASH_FW_START_SEC,
+					  FLASH_FW_START_SEC + i - 1);
 	if (ret) {
 		csio_err(hw, "Flash Erase failed\n");
 		goto out;
@@ -755,14 +730,14 @@ csio_hw_fw_dload(struct csio_hw *hw, uint8_t *fw_data, uint32_t size)
 	 */
 	memcpy(first_page, fw_data, SF_PAGE_SIZE);
 	((struct fw_hdr *)first_page)->fw_ver = htonl(0xffffffff);
-	ret = csio_hw_write_flash(hw, FW_IMG_START, SF_PAGE_SIZE, first_page);
+	ret = csio_hw_write_flash(hw, FLASH_FW_START, SF_PAGE_SIZE, first_page);
 	if (ret)
 		goto out;
 
 	csio_dbg(hw, "Writing Flash .. start:%d end:%d\n",
 		    FW_IMG_START, FW_IMG_START + size);
 
-	addr = FW_IMG_START;
+	addr = FLASH_FW_START;
 	for (size -= SF_PAGE_SIZE; size; size -= SF_PAGE_SIZE) {
 		addr += SF_PAGE_SIZE;
 		fw_data += SF_PAGE_SIZE;
@@ -772,7 +747,7 @@ csio_hw_fw_dload(struct csio_hw *hw, uint8_t *fw_data, uint32_t size)
 	}
 
 	ret = csio_hw_write_flash(hw,
-				  FW_IMG_START +
+				  FLASH_FW_START +
 					offsetof(struct fw_hdr, fw_ver),
 				  sizeof(hdr->fw_ver),
 				  (const uint8_t *)&hdr->fw_ver);
@@ -819,18 +794,24 @@ csio_hw_dev_ready(struct csio_hw *hw)
 {
 	uint32_t reg;
 	int cnt = 6;
+	int src_pf;
 
 	while (((reg = csio_rd_reg32(hw, PL_WHOAMI_A)) == 0xFFFFFFFF) &&
 	       (--cnt != 0))
 		mdelay(100);
 
-	if ((cnt == 0) && (((int32_t)(SOURCEPF_G(reg)) < 0) ||
-			   (SOURCEPF_G(reg) >= CSIO_MAX_PFN))) {
+	if (csio_is_t5(hw->pdev->device & CSIO_HW_CHIP_MASK))
+		src_pf = SOURCEPF_G(reg);
+	else
+		src_pf = T6_SOURCEPF_G(reg);
+
+	if ((cnt == 0) && (((int32_t)(src_pf) < 0) ||
+			   (src_pf >= CSIO_MAX_PFN))) {
 		csio_err(hw, "PL_WHOAMI returned 0x%x, cnt:%d\n", reg, cnt);
 		return -EIO;
 	}
 
-	hw->pfn = SOURCEPF_G(reg);
+	hw->pfn = src_pf;
 
 	return 0;
 }
@@ -1275,116 +1256,6 @@ csio_hw_fw_upgrade(struct csio_hw *hw, uint32_t mbox,
 	return csio_hw_fw_restart(hw, mbox, reset);
 }
 
-
-/*
- *	csio_hw_fw_config_file - setup an adapter via a Configuration File
- *	@hw: the HW module
- *	@mbox: mailbox to use for the FW command
- *	@mtype: the memory type where the Configuration File is located
- *	@maddr: the memory address where the Configuration File is located
- *	@finiver: return value for CF [fini] version
- *	@finicsum: return value for CF [fini] checksum
- *	@cfcsum: return value for CF computed checksum
- *
- *	Issue a command to get the firmware to process the Configuration
- *	File located at the specified mtype/maddress.  If the Configuration
- *	File is processed successfully and return value pointers are
- *	provided, the Configuration File "[fini] section version and
- *	checksum values will be returned along with the computed checksum.
- *	It's up to the caller to decide how it wants to respond to the
- *	checksums not matching but it recommended that a prominant warning
- *	be emitted in order to help people rapidly identify changed or
- *	corrupted Configuration Files.
- *
- *	Also note that it's possible to modify things like "niccaps",
- *	"toecaps",etc. between processing the Configuration File and telling
- *	the firmware to use the new configuration.  Callers which want to
- *	do this will need to "hand-roll" their own CAPS_CONFIGS commands for
- *	Configuration Files if they want to do this.
- */
-static int
-csio_hw_fw_config_file(struct csio_hw *hw,
-		      unsigned int mtype, unsigned int maddr,
-		      uint32_t *finiver, uint32_t *finicsum, uint32_t *cfcsum)
-{
-	struct csio_mb	*mbp;
-	struct fw_caps_config_cmd *caps_cmd;
-	int rv = -EINVAL;
-	enum fw_retval ret;
-
-	mbp = mempool_alloc(hw->mb_mempool, GFP_ATOMIC);
-	if (!mbp) {
-		CSIO_INC_STATS(hw, n_err_nomem);
-		return -ENOMEM;
-	}
-	/*
-	 * Tell the firmware to process the indicated Configuration File.
-	 * If there are no errors and the caller has provided return value
-	 * pointers for the [fini] section version, checksum and computed
-	 * checksum, pass those back to the caller.
-	 */
-	caps_cmd = (struct fw_caps_config_cmd *)(mbp->mb);
-	CSIO_INIT_MBP(mbp, caps_cmd, CSIO_MB_DEFAULT_TMO, hw, NULL, 1);
-	caps_cmd->op_to_write =
-		htonl(FW_CMD_OP_V(FW_CAPS_CONFIG_CMD) |
-		      FW_CMD_REQUEST_F |
-		      FW_CMD_READ_F);
-	caps_cmd->cfvalid_to_len16 =
-		htonl(FW_CAPS_CONFIG_CMD_CFVALID_F |
-		      FW_CAPS_CONFIG_CMD_MEMTYPE_CF_V(mtype) |
-		      FW_CAPS_CONFIG_CMD_MEMADDR64K_CF_V(maddr >> 16) |
-		      FW_LEN16(*caps_cmd));
-
-	if (csio_mb_issue(hw, mbp)) {
-		csio_err(hw, "Issue of FW_CAPS_CONFIG_CMD failed!\n");
-		goto out;
-	}
-
-	ret = csio_mb_fw_retval(mbp);
-	if (ret != FW_SUCCESS) {
-		csio_dbg(hw, "FW_CAPS_CONFIG_CMD returned %d!\n", rv);
-		goto out;
-	}
-
-	if (finiver)
-		*finiver = ntohl(caps_cmd->finiver);
-	if (finicsum)
-		*finicsum = ntohl(caps_cmd->finicsum);
-	if (cfcsum)
-		*cfcsum = ntohl(caps_cmd->cfcsum);
-
-	/* Validate device capabilities */
-	if (csio_hw_validate_caps(hw, mbp)) {
-		rv = -ENOENT;
-		goto out;
-	}
-
-	/*
-	 * And now tell the firmware to use the configuration we just loaded.
-	 */
-	caps_cmd->op_to_write =
-		htonl(FW_CMD_OP_V(FW_CAPS_CONFIG_CMD) |
-		      FW_CMD_REQUEST_F |
-		      FW_CMD_WRITE_F);
-	caps_cmd->cfvalid_to_len16 = htonl(FW_LEN16(*caps_cmd));
-
-	if (csio_mb_issue(hw, mbp)) {
-		csio_err(hw, "Issue of FW_CAPS_CONFIG_CMD failed!\n");
-		goto out;
-	}
-
-	ret = csio_mb_fw_retval(mbp);
-	if (ret != FW_SUCCESS) {
-		csio_dbg(hw, "FW_CAPS_CONFIG_CMD returned %d!\n", rv);
-		goto out;
-	}
-
-	rv = 0;
-out:
-	mempool_free(mbp, hw->mb_mempool);
-	return rv;
-}
-
 /*
  * csio_get_device_params - Get device parameters.
  * @hw: HW module
@@ -1507,7 +1378,8 @@ csio_config_device_caps(struct csio_hw *hw)
 	}
 
 	/* Validate device capabilities */
-	if (csio_hw_validate_caps(hw, mbp))
+	rv = csio_hw_validate_caps(hw, mbp);
+	if (rv != 0)
 		goto out;
 
 	/* Don't config device capabilities if already configured */
@@ -1715,10 +1587,16 @@ csio_hw_flash_config(struct csio_hw *hw, u32 *fw_cfg_param, char *path)
 	unsigned int mtype = 0, maddr = 0;
 	uint32_t *cfg_data;
 	int value_to_add = 0;
+	const char *fw_cfg_file;
 
-	if (request_firmware(&cf, CSIO_CF_FNAME(hw), dev) < 0) {
+	if (csio_is_t5(pci_dev->device & CSIO_HW_CHIP_MASK))
+		fw_cfg_file = FW_CFG_NAME_T5;
+	else
+		fw_cfg_file = FW_CFG_NAME_T6;
+
+	if (request_firmware(&cf, fw_cfg_file, dev) < 0) {
 		csio_err(hw, "could not find config file %s, err: %d\n",
-			 CSIO_CF_FNAME(hw), ret);
+			 fw_cfg_file, ret);
 		return -ENOENT;
 	}
 
@@ -1757,9 +1635,8 @@ csio_hw_flash_config(struct csio_hw *hw, u32 *fw_cfg_param, char *path)
 		ret = csio_memory_write(hw, mtype, maddr + size, 4, &last.word);
 	}
 	if (ret == 0) {
-		csio_info(hw, "config file upgraded to %s\n",
-			  CSIO_CF_FNAME(hw));
-		snprintf(path, 64, "%s%s", "/lib/firmware/", CSIO_CF_FNAME(hw));
+		csio_info(hw, "config file upgraded to %s\n", fw_cfg_file);
+		snprintf(path, 64, "%s%s", "/lib/firmware/", fw_cfg_file);
 	}
 
 leave:
@@ -1787,11 +1664,13 @@ leave:
 static int
 csio_hw_use_fwconfig(struct csio_hw *hw, int reset, u32 *fw_cfg_param)
 {
+	struct csio_mb	*mbp = NULL;
+	struct fw_caps_config_cmd *caps_cmd;
 	unsigned int mtype, maddr;
-	int rv;
+	int rv = -EINVAL;
 	uint32_t finiver = 0, finicsum = 0, cfcsum = 0;
-	int using_flash;
 	char path[64];
+	char *config_name = NULL;
 
 	/*
 	 * Reset device if necessary
@@ -1811,50 +1690,109 @@ csio_hw_use_fwconfig(struct csio_hw *hw, int reset, u32 *fw_cfg_param)
 	rv = csio_hw_flash_config(hw, fw_cfg_param, path);
 	spin_lock_irq(&hw->lock);
 	if (rv != 0) {
-		if (rv == -ENOENT) {
-			/*
-			 * config file was not found. Use default
-			 * config file from flash.
-			 */
-			mtype = FW_MEMTYPE_CF_FLASH;
-			maddr = hw->chip_ops->chip_flash_cfg_addr(hw);
-			using_flash = 1;
-		} else {
-			/*
-			 * we revert back to the hardwired config if
-			 * flashing failed.
-			 */
-			goto bye;
-		}
+		/*
+		 * config file was not found. Use default
+		 * config file from flash.
+		 */
+		config_name = "On FLASH";
+		mtype = FW_MEMTYPE_CF_FLASH;
+		maddr = hw->chip_ops->chip_flash_cfg_addr(hw);
 	} else {
+		config_name = path;
 		mtype = FW_PARAMS_PARAM_Y_G(*fw_cfg_param);
 		maddr = FW_PARAMS_PARAM_Z_G(*fw_cfg_param) << 16;
-		using_flash = 0;
 	}
 
-	hw->cfg_store = (uint8_t)mtype;
-
+	mbp = mempool_alloc(hw->mb_mempool, GFP_ATOMIC);
+	if (!mbp) {
+		CSIO_INC_STATS(hw, n_err_nomem);
+		return -ENOMEM;
+	}
 	/*
-	 * Issue a Capability Configuration command to the firmware to get it
-	 * to parse the Configuration File.
+	 * Tell the firmware to process the indicated Configuration File.
+	 * If there are no errors and the caller has provided return value
+	 * pointers for the [fini] section version, checksum and computed
+	 * checksum, pass those back to the caller.
 	 */
-	rv = csio_hw_fw_config_file(hw, mtype, maddr, &finiver,
-		&finicsum, &cfcsum);
-	if (rv != 0)
+	caps_cmd = (struct fw_caps_config_cmd *)(mbp->mb);
+	CSIO_INIT_MBP(mbp, caps_cmd, CSIO_MB_DEFAULT_TMO, hw, NULL, 1);
+	caps_cmd->op_to_write =
+		htonl(FW_CMD_OP_V(FW_CAPS_CONFIG_CMD) |
+		      FW_CMD_REQUEST_F |
+		      FW_CMD_READ_F);
+	caps_cmd->cfvalid_to_len16 =
+		htonl(FW_CAPS_CONFIG_CMD_CFVALID_F |
+		      FW_CAPS_CONFIG_CMD_MEMTYPE_CF_V(mtype) |
+		      FW_CAPS_CONFIG_CMD_MEMADDR64K_CF_V(maddr >> 16) |
+		      FW_LEN16(*caps_cmd));
+
+	if (csio_mb_issue(hw, mbp)) {
+		rv = -EINVAL;
+		goto bye;
+	}
+
+	rv = csio_mb_fw_retval(mbp);
+	 /* If the CAPS_CONFIG failed with an ENOENT (for a Firmware
+	  * Configuration File in FLASH), our last gasp effort is to use the
+	  * Firmware Configuration File which is embedded in the
+	  * firmware.  A very few early versions of the firmware didn't
+	  * have one embedded but we can ignore those.
+	  */
+	if (rv == ENOENT) {
+		CSIO_INIT_MBP(mbp, caps_cmd, CSIO_MB_DEFAULT_TMO, hw, NULL, 1);
+		caps_cmd->op_to_write = htonl(FW_CMD_OP_V(FW_CAPS_CONFIG_CMD) |
+					      FW_CMD_REQUEST_F |
+					      FW_CMD_READ_F);
+		caps_cmd->cfvalid_to_len16 = htonl(FW_LEN16(*caps_cmd));
+
+		if (csio_mb_issue(hw, mbp)) {
+			rv = -EINVAL;
+			goto bye;
+		}
+
+		rv = csio_mb_fw_retval(mbp);
+		config_name = "Firmware Default";
+	}
+	if (rv != FW_SUCCESS)
 		goto bye;
 
-	hw->cfg_finiver		= finiver;
-	hw->cfg_finicsum	= finicsum;
-	hw->cfg_cfcsum		= cfcsum;
-	hw->cfg_csum_status	= true;
+	finiver = ntohl(caps_cmd->finiver);
+	finicsum = ntohl(caps_cmd->finicsum);
+	cfcsum = ntohl(caps_cmd->cfcsum);
+
+	/*
+	 * And now tell the firmware to use the configuration we just loaded.
+	 */
+	caps_cmd->op_to_write =
+		htonl(FW_CMD_OP_V(FW_CAPS_CONFIG_CMD) |
+		      FW_CMD_REQUEST_F |
+		      FW_CMD_WRITE_F);
+	caps_cmd->cfvalid_to_len16 = htonl(FW_LEN16(*caps_cmd));
+
+	if (csio_mb_issue(hw, mbp)) {
+		rv = -EINVAL;
+		goto bye;
+	}
+
+	rv = csio_mb_fw_retval(mbp);
+	if (rv != FW_SUCCESS) {
+		csio_dbg(hw, "FW_CAPS_CONFIG_CMD returned %d!\n", rv);
+		goto bye;
+	}
 
 	if (finicsum != cfcsum) {
 		csio_warn(hw,
 		      "Config File checksum mismatch: csum=%#x, computed=%#x\n",
 		      finicsum, cfcsum);
-
-		hw->cfg_csum_status = false;
 	}
+
+	/* Validate device capabilities */
+	rv = csio_hw_validate_caps(hw, mbp);
+	if (rv != 0)
+		goto bye;
+
+	mempool_free(mbp, hw->mb_mempool);
+	mbp = NULL;
 
 	/*
 	 * Note that we're operating with parameters
@@ -1878,55 +1816,19 @@ csio_hw_use_fwconfig(struct csio_hw *hw, int reset, u32 *fw_cfg_param)
 	/* Post event to notify completion of configuration */
 	csio_post_event(&hw->sm, CSIO_HWE_INIT);
 
-	csio_info(hw,
-	 "Firmware Configuration File %s, version %#x, computed checksum %#x\n",
-		  (using_flash ? "in device FLASH" : path), finiver, cfcsum);
-
+	csio_info(hw, "Successfully configure using Firmware "
+		  "Configuration File %s, version %#x, computed checksum %#x\n",
+		  config_name, finiver, cfcsum);
 	return 0;
 
 	/*
 	 * Something bad happened.  Return the error ...
 	 */
 bye:
+	if (mbp)
+		mempool_free(mbp, hw->mb_mempool);
 	hw->flags &= ~CSIO_HWF_USING_SOFT_PARAMS;
-	csio_dbg(hw, "Configuration file error %d\n", rv);
-	return rv;
-}
-
-/*
- * Attempt to initialize the adapter via hard-coded, driver supplied
- * parameters ...
- */
-static int
-csio_hw_no_fwconfig(struct csio_hw *hw, int reset)
-{
-	int		rv;
-	/*
-	 * Reset device if necessary
-	 */
-	if (reset) {
-		rv = csio_do_reset(hw, true);
-		if (rv != 0)
-			goto out;
-	}
-
-	/* Get and set device capabilities */
-	rv = csio_config_device_caps(hw);
-	if (rv != 0)
-		goto out;
-
-	/* device parameters */
-	rv = csio_get_device_params(hw);
-	if (rv != 0)
-		goto out;
-
-	/* Configure SGE */
-	csio_wr_sge_init(hw);
-
-	/* Post event to notify completion of configuration */
-	csio_post_event(&hw->sm, CSIO_HWE_INIT);
-
-out:
+	csio_warn(hw, "Configuration file error %d\n", rv);
 	return rv;
 }
 
@@ -1994,6 +1896,19 @@ static struct fw_info fw_info_array[] = {
 			.intfver_ri = FW_INTFVER(T5, RI),
 			.intfver_iscsi = FW_INTFVER(T5, ISCSI),
 			.intfver_fcoe = FW_INTFVER(T5, FCOE),
+		},
+	}, {
+		.chip = CHELSIO_T6,
+		.fs_name = FW_CFG_NAME_T6,
+		.fw_mod_name = FW_FNAME_T6,
+		.fw_hdr = {
+			.chip = FW_HDR_CHIP_T6,
+			.fw_ver = __cpu_to_be32(FW_VERSION(T6)),
+			.intfver_nic = FW_INTFVER(T6, NIC),
+			.intfver_vnic = FW_INTFVER(T6, VNIC),
+			.intfver_ri = FW_INTFVER(T6, RI),
+			.intfver_iscsi = FW_INTFVER(T6, ISCSI),
+			.intfver_fcoe = FW_INTFVER(T6, FCOE),
 		},
 	}
 };
@@ -2111,6 +2026,7 @@ csio_hw_flash_fw(struct csio_hw *hw, int *reset)
 	struct device *dev = &pci_dev->dev ;
 	const u8 *fw_data = NULL;
 	unsigned int fw_size = 0;
+	const char *fw_bin_file;
 
 	/* This is the firmware whose headers the driver was compiled
 	 * against
@@ -2123,19 +2039,23 @@ csio_hw_flash_fw(struct csio_hw *hw, int *reset)
 		return -EINVAL;
 	}
 
-	if (request_firmware(&fw, CSIO_FW_FNAME(hw), dev) < 0) {
+	if (csio_is_t5(pci_dev->device & CSIO_HW_CHIP_MASK))
+		fw_bin_file = FW_FNAME_T5;
+	else
+		fw_bin_file = FW_FNAME_T6;
+
+	if (request_firmware(&fw, fw_bin_file, dev) < 0) {
 		csio_err(hw, "could not find firmware image %s, err: %d\n",
-			 CSIO_FW_FNAME(hw), ret);
-		return -EINVAL;
+			 fw_bin_file, ret);
+	} else {
+		fw_data = fw->data;
+		fw_size = fw->size;
 	}
 
 	/* allocate memory to read the header of the firmware on the
 	 * card
 	 */
 	card_fw = kmalloc(sizeof(*card_fw), GFP_KERNEL);
-
-	fw_data = fw->data;
-	fw_size = fw->size;
 
 	/* upgrade FW logic */
 	ret = csio_hw_prep_fw(hw, fw_info, fw_data, fw_size, card_fw,
@@ -2146,6 +2066,17 @@ csio_hw_flash_fw(struct csio_hw *hw, int *reset)
 		release_firmware(fw);
 	kfree(card_fw);
 	return ret;
+}
+
+static int csio_hw_check_fwver(struct csio_hw *hw)
+{
+	if (csio_is_t6(hw->pdev->device & CSIO_HW_CHIP_MASK) &&
+	    (hw->fwrev < CSIO_MIN_T6_FW)) {
+		csio_hw_print_fw_version(hw, "T6 unsupported fw");
+		return -1;
+	}
+
+	return 0;
 }
 
 /*
@@ -2215,33 +2146,41 @@ csio_hw_configure(struct csio_hw *hw)
 		if (rv != 0)
 			goto out;
 
-		/*
-		 * If the firmware doesn't support Configuration
-		 * Files, use the old Driver-based, hard-wired
-		 * initialization.  Otherwise, try using the
-		 * Configuration File support and fall back to the
-		 * Driver-based initialization if there's no
-		 * Configuration File found.
-		 */
-		if (csio_hw_check_fwconfig(hw, param) == 0) {
-			rv = csio_hw_use_fwconfig(hw, reset, param);
-			if (rv == -ENOENT)
-				goto out;
-			if (rv != 0) {
-				csio_info(hw,
-				    "No Configuration File present "
-				    "on adapter.  Using hard-wired "
-				    "configuration parameters.\n");
-				rv = csio_hw_no_fwconfig(hw, reset);
-			}
-		} else {
-			rv = csio_hw_no_fwconfig(hw, reset);
-		}
-
-		if (rv != 0)
+		rv = csio_hw_check_fwver(hw);
+		if (rv < 0)
 			goto out;
 
+		/* If the firmware doesn't support Configuration Files,
+		 * return an error.
+		 */
+		rv = csio_hw_check_fwconfig(hw, param);
+		if (rv != 0) {
+			csio_info(hw, "Firmware doesn't support "
+				  "Firmware Configuration files\n");
+			goto out;
+		}
+
+		/* The firmware provides us with a memory buffer where we can
+		 * load a Configuration File from the host if we want to
+		 * override the Configuration File in flash.
+		 */
+		rv = csio_hw_use_fwconfig(hw, reset, param);
+		if (rv == -ENOENT) {
+			csio_info(hw, "Could not initialize "
+				  "adapter, error%d\n", rv);
+			goto out;
+		}
+		if (rv != 0) {
+			csio_info(hw, "Could not initialize "
+				  "adapter, error%d\n", rv);
+			goto out;
+		}
+
 	} else {
+		rv = csio_hw_check_fwver(hw);
+		if (rv < 0)
+			goto out;
+
 		if (hw->fw_state == CSIO_DEV_STATE_INIT) {
 
 			hw->flags |= CSIO_HWF_USING_SOFT_PARAMS;
@@ -2351,8 +2290,13 @@ static void
 csio_hw_intr_enable(struct csio_hw *hw)
 {
 	uint16_t vec = (uint16_t)csio_get_mb_intr_idx(csio_hw_to_mbm(hw));
-	uint32_t pf = SOURCEPF_G(csio_rd_reg32(hw, PL_WHOAMI_A));
+	u32 pf = 0;
 	uint32_t pl = csio_rd_reg32(hw, PL_INT_ENABLE_A);
+
+	if (csio_is_t5(hw->pdev->device & CSIO_HW_CHIP_MASK))
+		pf = SOURCEPF_G(csio_rd_reg32(hw, PL_WHOAMI_A));
+	else
+		pf = T6_SOURCEPF_G(csio_rd_reg32(hw, PL_WHOAMI_A));
 
 	/*
 	 * Set aivec for MSI/MSIX. PCIE_PF_CFG.INTXType is set up
@@ -2403,7 +2347,12 @@ csio_hw_intr_enable(struct csio_hw *hw)
 void
 csio_hw_intr_disable(struct csio_hw *hw)
 {
-	uint32_t pf = SOURCEPF_G(csio_rd_reg32(hw, PL_WHOAMI_A));
+	u32 pf = 0;
+
+	if (csio_is_t5(hw->pdev->device & CSIO_HW_CHIP_MASK))
+		pf = SOURCEPF_G(csio_rd_reg32(hw, PL_WHOAMI_A));
+	else
+		pf = T6_SOURCEPF_G(csio_rd_reg32(hw, PL_WHOAMI_A));
 
 	if (!(hw->flags & CSIO_HWF_HW_INTR_ENABLED))
 		return;
@@ -3028,6 +2977,8 @@ static void csio_cplsw_intr_handler(struct csio_hw *hw)
  */
 static void csio_le_intr_handler(struct csio_hw *hw)
 {
+	enum chip_type chip = CHELSIO_CHIP_VERSION(hw->chip_id);
+
 	static struct intr_info le_intr_info[] = {
 		{ LIPMISS_F, "LE LIP miss", -1, 0 },
 		{ LIP0_F, "LE 0 LIP error", -1, 0 },
@@ -3037,7 +2988,18 @@ static void csio_le_intr_handler(struct csio_hw *hw)
 		{ 0, NULL, 0, 0 }
 	};
 
-	if (csio_handle_intr_status(hw, LE_DB_INT_CAUSE_A, le_intr_info))
+	static struct intr_info t6_le_intr_info[] = {
+		{ T6_LIPMISS_F, "LE LIP miss", -1, 0 },
+		{ T6_LIP0_F, "LE 0 LIP error", -1, 0 },
+		{ TCAMINTPERR_F, "LE parity error", -1, 1 },
+		{ T6_UNKNOWNCMD_F, "LE unknown command", -1, 1 },
+		{ SSRAMINTPERR_F, "LE request queue parity error", -1, 1 },
+		{ 0, NULL, 0, 0 }
+	};
+
+	if (csio_handle_intr_status(hw, LE_DB_INT_CAUSE_A,
+				    (chip == CHELSIO_T5) ?
+				    le_intr_info : t6_le_intr_info))
 		csio_hw_fatal_err(hw);
 }
 
@@ -3207,7 +3169,7 @@ static void csio_ncsi_intr_handler(struct csio_hw *hw)
  */
 static void csio_xgmac_intr_handler(struct csio_hw *hw, int port)
 {
-	uint32_t v = csio_rd_reg32(hw, CSIO_MAC_INT_CAUSE_REG(hw, port));
+	uint32_t v = csio_rd_reg32(hw, T5_PORT_REG(port, MAC_PORT_INT_CAUSE_A));
 
 	v &= TXFIFO_PRTY_ERR_F | RXFIFO_PRTY_ERR_F;
 	if (!v)
@@ -3217,7 +3179,7 @@ static void csio_xgmac_intr_handler(struct csio_hw *hw, int port)
 		csio_fatal(hw, "XGMAC %d Tx FIFO parity error\n", port);
 	if (v & RXFIFO_PRTY_ERR_F)
 		csio_fatal(hw, "XGMAC %d Rx FIFO parity error\n", port);
-	csio_wr_reg32(hw, v, CSIO_MAC_INT_CAUSE_REG(hw, port));
+	csio_wr_reg32(hw, v, T5_PORT_REG(port, MAC_PORT_INT_CAUSE_A));
 	csio_hw_fatal_err(hw);
 }
 
@@ -3968,13 +3930,7 @@ csio_hw_set_description(struct csio_hw *hw, uint16_t ven_id, uint16_t dev_id)
 		prot_type = (dev_id & CSIO_ASIC_DEVID_PROTO_MASK);
 		adap_type = (dev_id & CSIO_ASIC_DEVID_TYPE_MASK);
 
-		if (prot_type == CSIO_T4_FCOE_ASIC) {
-			memcpy(hw->hw_ver,
-			       csio_t4_fcoe_adapters[adap_type].model_no, 16);
-			memcpy(hw->model_desc,
-			       csio_t4_fcoe_adapters[adap_type].description,
-			       32);
-		} else if (prot_type == CSIO_T5_FCOE_ASIC) {
+		if (prot_type == CSIO_T5_FCOE_ASIC) {
 			memcpy(hw->hw_ver,
 			       csio_t5_fcoe_adapters[adap_type].model_no, 16);
 			memcpy(hw->model_desc,
@@ -4011,8 +3967,8 @@ csio_hw_init(struct csio_hw *hw)
 
 	strcpy(hw->name, CSIO_HW_NAME);
 
-	/* Initialize the HW chip ops with T4/T5 specific ops */
-	hw->chip_ops = csio_is_t4(hw->chip_id) ? &t4_ops : &t5_ops;
+	/* Initialize the HW chip ops T5 specific ops */
+	hw->chip_ops = &t5_ops;
 
 	/* Set the model & its description */
 

@@ -7,17 +7,24 @@
  * Copyright (C) 2009, 2010 Arnaldo Carvalho de Melo <acme@redhat.com>
  */
 #include "util.h"
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "build-id.h"
 #include "event.h"
 #include "symbol.h"
+#include "thread.h"
 #include <linux/kernel.h>
 #include "debug.h"
 #include "session.h"
 #include "tool.h"
 #include "header.h"
 #include "vdso.h"
+#include "path.h"
 #include "probe-file.h"
+#include "strlist.h"
 
 #include "sane_ctype.h"
 

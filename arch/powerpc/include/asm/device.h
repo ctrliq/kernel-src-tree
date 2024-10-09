@@ -31,7 +31,7 @@ struct dev_arch_dmadata {
  */
 struct dev_archdata {
 	/* DMA operations on that device */
-	struct dma_map_ops	*dma_ops;
+	RH_KABI_DEPRECATE(struct dma_map_ops *, dma_ops)
 
 	RH_KABI_REPLACE(union { dma_addr_t dma_offset; void *iommu_table_base; }dma_data,
 	                struct dev_arch_dmadata *hybrid_dma_data)

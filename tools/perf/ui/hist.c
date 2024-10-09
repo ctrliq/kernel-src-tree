@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <math.h>
 #include <linux/compiler.h>
 
@@ -650,7 +651,7 @@ unsigned int hists__sort_list_width(struct hists *hists)
 		ret += fmt->width(fmt, &dummy_hpp, hists);
 	}
 
-	if (verbose && hists__has(hists, sym)) /* Addr + origin */
+	if (verbose > 0 && hists__has(hists, sym)) /* Addr + origin */
 		ret += 3 + BITS_PER_LONG / 4;
 
 	return ret;

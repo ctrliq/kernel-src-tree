@@ -9,6 +9,7 @@ OBJECT_FILES_NON_STANDARD_memcpy_64.o		+= y
 OBJECT_FILES_NON_STANDARD_memmove_64.o		+= y
 OBJECT_FILES_NON_STANDARD_memset_64.o		+= y
 OBJECT_FILES_NON_STANDARD_rwlock.o		+= y
+OBJECT_FILES_NON_STANDARD_retpoline.o		+= y
 
 inat_tables_script = $(srctree)/arch/x86/tools/gen-insn-attr-x86.awk
 inat_tables_maps = $(srctree)/arch/x86/lib/x86-opcode-map.txt
@@ -33,6 +34,7 @@ lib-$(CONFIG_SMP) += rwlock.o
 lib-$(CONFIG_RWSEM_XCHGADD_ALGORITHM) += rwsem.o
 lib-$(CONFIG_INSTRUCTION_DECODER) += insn.o inat.o
 lib-$(CONFIG_RANDOMIZE_BASE) += kaslr.o
+lib-$(CONFIG_RETPOLINE) += retpoline.o
 
 obj-y += msr.o msr-reg.o msr-reg-export.o
 

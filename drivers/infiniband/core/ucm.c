@@ -618,7 +618,7 @@ static ssize_t ib_ucm_init_qp_attr(struct ib_ucm_file *file,
 	if (result)
 		goto out;
 
-	ib_copy_qp_attr_to_user(&resp, &qp_attr);
+	ib_copy_qp_attr_to_user(ctx->cm_id->device, &resp, &qp_attr);
 
 	if (copy_to_user((void __user *)(unsigned long)cmd.response,
 			 &resp, sizeof(resp)))
@@ -702,10 +702,10 @@ static int ib_ucm_alloc_data(const void **dest, u64 src, u32 len)
 	return 0;
 }
 
-static int ib_ucm_path_get(struct ib_sa_path_rec **path, u64 src)
+static int ib_ucm_path_get(struct sa_path_rec **path, u64 src)
 {
 	struct ib_user_path_rec upath;
-	struct ib_sa_path_rec  *sa_path;
+	struct sa_path_rec  *sa_path;
 
 	*path = NULL;
 
@@ -962,7 +962,7 @@ static ssize_t ib_ucm_send_lap(struct ib_ucm_file *file,
 			       int in_len, int out_len)
 {
 	struct ib_ucm_context *ctx;
-	struct ib_sa_path_rec *path = NULL;
+	struct sa_path_rec *path = NULL;
 	struct ib_ucm_lap cmd;
 	const void *data = NULL;
 	int result;

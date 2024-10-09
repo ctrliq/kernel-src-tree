@@ -233,6 +233,72 @@ static void acpi_gpiochip_free_interrupts(struct gpio_chip *chip)
 	kfree(evt_pins);
 }
 
+int acpi_dev_add_driver_gpios(struct acpi_device *adev,
+			      const struct acpi_gpio_mapping *gpios)
+{
+	if (adev && gpios) {
+		adev->driver_gpios = gpios;
+		return 0;
+	}
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(acpi_dev_add_driver_gpios);
+
+static void devm_acpi_dev_release_driver_gpios(struct device *dev, void *res)
+{
+	acpi_dev_remove_driver_gpios(ACPI_COMPANION(dev));
+}
+
+int devm_acpi_dev_add_driver_gpios(struct device *dev,
+				   const struct acpi_gpio_mapping *gpios)
+{
+	void *res;
+	int ret;
+
+	res = devres_alloc(devm_acpi_dev_release_driver_gpios, 0, GFP_KERNEL);
+	if (!res)
+		return -ENOMEM;
+
+	ret = acpi_dev_add_driver_gpios(ACPI_COMPANION(dev), gpios);
+	if (ret) {
+		devres_free(res);
+		return ret;
+	}
+	devres_add(dev, res);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(devm_acpi_dev_add_driver_gpios);
+
+void devm_acpi_dev_remove_driver_gpios(struct device *dev)
+{
+	WARN_ON(devres_release(dev, devm_acpi_dev_release_driver_gpios, NULL, NULL));
+}
+EXPORT_SYMBOL_GPL(devm_acpi_dev_remove_driver_gpios);
+
+static bool acpi_get_driver_gpio_data(struct acpi_device *adev,
+				      const char *name, int index,
+				      struct acpi_reference_args *args)
+{
+	const struct acpi_gpio_mapping *gm;
+
+	if (!adev->driver_gpios)
+		return false;
+
+	for (gm = adev->driver_gpios; gm->name; gm++)
+		if (!strcmp(name, gm->name) && gm->data && index < gm->size) {
+			const struct acpi_gpio_params *par = gm->data + index;
+
+			args->adev = adev;
+			args->args[0] = par->crs_entry_index;
+			args->args[1] = par->line_index;
+			args->args[2] = par->active_low;
+			args->nargs = 3;
+			return true;
+		}
+
+	return false;
+}
+
 struct acpi_gpio_lookup {
 	struct acpi_gpio_info info;
 	int index;
@@ -318,8 +384,12 @@ struct gpio_desc *acpi_get_gpiod_by_index(struct acpi_device *adev,
 		memset(&args, 0, sizeof(args));
 		ret = acpi_node_get_property_reference(acpi_fwnode_handle(adev),
 						       propname, index, &args);
-		if (ret)
-			return ERR_PTR(ret);
+		if (ret) {
+			bool found = acpi_get_driver_gpio_data(adev, propname,
+							       index, &args);
+			if (!found)
+				return ERR_PTR(ret);
+		}
 
 		/*
 		 * The property was found and resolved so need to

@@ -224,6 +224,8 @@ struct x86_emulate_ops {
 
 	unsigned (*get_hflags)(struct x86_emulate_ctxt *ctxt);
 	void (*set_hflags)(struct x86_emulate_ctxt *ctxt, unsigned hflags);
+	int (*pre_leave_smm)(struct x86_emulate_ctxt *ctxt, u64 smbase);
+
 };
 
 typedef u32 __attribute__((vector_size(16))) sse128_t;
@@ -296,6 +298,7 @@ struct x86_emulate_ctxt {
 
 	bool perm_ok; /* do not check permissions if true */
 	bool ud;	/* inject an #UD if host doesn't support insn */
+	bool tf;	/* TF value before instruction (after for syscall/sysret) */
 
 	bool have_exception;
 	struct x86_exception exception;

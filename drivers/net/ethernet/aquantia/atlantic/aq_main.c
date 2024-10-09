@@ -94,17 +94,8 @@ static int aq_ndev_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 static int aq_ndev_change_mtu(struct net_device *ndev, int new_mtu)
 {
 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
-	int err = 0;
+	int err = aq_nic_set_mtu(aq_nic, new_mtu + ETH_HLEN);
 
-	if (new_mtu == ndev->mtu) {
-		err = 0;
-		goto err_exit;
-	}
-	if (new_mtu < 68) {
-		err = -EINVAL;
-		goto err_exit;
-	}
-	err = aq_nic_set_mtu(aq_nic, new_mtu + ETH_HLEN);
 	if (err < 0)
 		goto err_exit;
 	ndev->mtu = new_mtu;
@@ -171,11 +162,12 @@ err_exit:;
 }
 
 static const struct net_device_ops aq_ndev_ops = {
+	.ndo_size = sizeof(struct net_device_ops),
 	.ndo_open = aq_ndev_open,
 	.ndo_stop = aq_ndev_close,
 	.ndo_start_xmit = aq_ndev_start_xmit,
 	.ndo_set_rx_mode = aq_ndev_set_multicast_settings,
-	.ndo_change_mtu = aq_ndev_change_mtu,
+	.extended.ndo_change_mtu = aq_ndev_change_mtu,
 	.ndo_set_mac_address = aq_ndev_set_mac_address,
 	.ndo_set_features = aq_ndev_set_features
 };

@@ -41,10 +41,12 @@
 #include <linux/list.h>
 #include <linux/mod_devicetable.h>
 #include <linux/dynamic_debug.h>
+#include <linux/uuid.h>
 
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 #include <acpi/acpi_numa.h>
+#include <acpi/acpi_io.h>
 #include <asm/acpi.h>
 
 static inline acpi_handle acpi_device_handle(struct acpi_device *adev)
@@ -72,6 +74,8 @@ static inline const char *acpi_dev_name(struct acpi_device *adev)
 {
 	return dev_name(&adev->dev);
 }
+
+struct device *acpi_get_first_physical_node(struct acpi_device *adev);
 
 enum acpi_irq_model_id {
 	ACPI_IRQ_MODEL_PIC = 0,
@@ -373,6 +377,7 @@ acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context);
 #define OSC_SB_HOTPLUG_OST_SUPPORT		0x00000008
 #define OSC_SB_APEI_SUPPORT			0x00000010
 #define OSC_SB_CPC_SUPPORT			0x00000020
+#define OSC_SB_CPC_DIVERSE_HIGH_SUPPORT		0x00001000
 
 extern bool osc_sb_apei_support_acked;
 
@@ -457,6 +462,24 @@ extern bool acpi_driver_match_device(struct device *dev,
 struct platform_device *acpi_create_platform_device(struct acpi_device *);
 #define ACPI_PTR(_ptr)	(_ptr)
 
+static inline void acpi_device_set_enumerated(struct acpi_device *adev)
+{
+	adev->flags.visited = true;
+}
+
+static inline void acpi_device_clear_enumerated(struct acpi_device *adev)
+{
+	adev->flags.visited = false;
+}
+
+enum acpi_reconfig_event  {
+	ACPI_RECONFIG_DEVICE_ADD = 0,
+	ACPI_RECONFIG_DEVICE_REMOVE,
+};
+
+int acpi_reconfig_notifier_register(struct notifier_block *nb);
+int acpi_reconfig_notifier_unregister(struct notifier_block *nb);
+
 #else	/* !CONFIG_ACPI */
 
 #define acpi_disabled 1
@@ -492,6 +515,12 @@ static inline struct acpi_data_node *to_acpi_data_node(struct fwnode_handle *fwn
 	return NULL;
 }
 
+static inline bool acpi_data_node_match(struct fwnode_handle *fwnode,
+					const char *name)
+{
+	return false;
+}
+
 static inline struct fwnode_handle *acpi_fwnode_handle(struct acpi_device *adev)
 {
 	return NULL;
@@ -505,6 +534,11 @@ static inline const char *acpi_dev_name(struct acpi_device *adev)
 static inline bool has_acpi_companion(struct device *dev)
 {
 	return false;
+}
+
+static inline struct device *acpi_get_first_physical_node(struct acpi_device *adev)
+{
+	return NULL;
 }
 
 static inline void acpi_early_init(void) { }
@@ -572,6 +606,24 @@ static inline bool acpi_driver_match_device(struct device *dev,
 }
 
 #define ACPI_PTR(_ptr)	(NULL)
+
+static inline void acpi_device_set_enumerated(struct acpi_device *adev)
+{
+}
+
+static inline void acpi_device_clear_enumerated(struct acpi_device *adev)
+{
+}
+
+static inline int acpi_reconfig_notifier_register(struct notifier_block *nb)
+{
+	return -EINVAL;
+}
+
+static inline int acpi_reconfig_notifier_unregister(struct notifier_block *nb)
+{
+	return -EINVAL;
+}
 
 #endif	/* !CONFIG_ACPI */
 
@@ -700,6 +752,47 @@ do {									\
 	0;								\
 })
 #endif
+#endif
+
+struct acpi_gpio_params {
+	unsigned int crs_entry_index;
+	unsigned int line_index;
+	bool active_low;
+};
+
+struct acpi_gpio_mapping {
+	const char *name;
+	const struct acpi_gpio_params *data;
+	unsigned int size;
+};
+
+#if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)
+int acpi_dev_add_driver_gpios(struct acpi_device *adev,
+			      const struct acpi_gpio_mapping *gpios);
+
+static inline void acpi_dev_remove_driver_gpios(struct acpi_device *adev)
+{
+	if (adev)
+		adev->driver_gpios = NULL;
+}
+
+int devm_acpi_dev_add_driver_gpios(struct device *dev,
+				   const struct acpi_gpio_mapping *gpios);
+void devm_acpi_dev_remove_driver_gpios(struct device *dev);
+#else
+static inline int acpi_dev_add_driver_gpios(struct acpi_device *adev,
+			      const struct acpi_gpio_mapping *gpios)
+{
+	return -ENXIO;
+}
+static inline void acpi_dev_remove_driver_gpios(struct acpi_device *adev) {}
+
+static inline int devm_acpi_dev_add_driver_gpios(struct device *dev,
+			      const struct acpi_gpio_mapping *gpios)
+{
+	return -ENXIO;
+}
+static inline void devm_acpi_dev_remove_driver_gpios(struct device *dev) {}
 #endif
 
 #if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)

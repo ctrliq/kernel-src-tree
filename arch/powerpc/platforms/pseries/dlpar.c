@@ -26,7 +26,7 @@
 #include <asm/uaccess.h>
 #include <asm/rtas.h>
 
-struct workqueue_struct *pseries_hp_wq;
+static struct workqueue_struct *pseries_hp_wq;
 
 struct pseries_hp_work {
 	struct work_struct work;
@@ -402,7 +402,7 @@ static int handle_dlpar_errorlog(struct pseries_hp_errorlog *hp_elog)
 	return rc;
 }
 
-void pseries_hp_work_fn(struct work_struct *work)
+static void pseries_hp_work_fn(struct work_struct *work)
 {
 	struct pseries_hp_work *hp_work =
 			container_of(work, struct pseries_hp_work, work);
@@ -603,16 +603,31 @@ dlpar_store_out:
 static ssize_t dlpar_show(struct class *class, struct class_attribute *attr,
 			  char *buf)
 {
-	return sprintf(buf, "%s\n", "memory,cpu");
+	return sprintf(buf, "%s\n", "memory");
 }
 
 static CLASS_ATTR(dlpar, S_IWUSR | S_IRUSR, dlpar_show, dlpar_store);
 
-static int __init pseries_dlpar_init(void)
+int __init dlpar_workqueue_init(void)
 {
+	if (pseries_hp_wq)
+		return 0;
+
 	pseries_hp_wq = alloc_workqueue("pseries hotplug workqueue",
-					WQ_UNBOUND, 1);
+			WQ_UNBOUND, 1);
+
+	return pseries_hp_wq ? 0 : -ENOMEM;
+}
+
+static int __init dlpar_sysfs_init(void)
+{
+	int rc;
+
+	rc = dlpar_workqueue_init();
+	if (rc)
+		return rc;
+
 	return sysfs_create_file(kernel_kobj, &class_attr_dlpar.attr);
 }
-machine_device_initcall(pseries, pseries_dlpar_init);
+machine_device_initcall(pseries, dlpar_sysfs_init);
 

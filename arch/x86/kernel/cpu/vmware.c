@@ -26,6 +26,8 @@
 #include <asm/div64.h>
 #include <asm/x86_init.h>
 #include <asm/hypervisor.h>
+#include <asm/timer.h>
+#include <asm/apic.h>
 
 #define CPUID_VMWARE_INFO_LEAF	0x40000000
 #define VMWARE_HYPERVISOR_MAGIC	0x564D5868
@@ -81,11 +83,24 @@ static void __init vmware_platform_setup(void)
 
 	VMWARE_PORT(GETHZ, eax, ebx, ecx, edx);
 
-	if (ebx != UINT_MAX)
+	if (ebx != UINT_MAX) {
 		x86_platform.calibrate_tsc = vmware_get_tsc_khz;
-	else
+		x86_platform.calibrate_cpu = vmware_get_tsc_khz;
+
+#ifdef CONFIG_X86_LOCAL_APIC
+		/* Skip lapic calibration since we know the bus frequency. */
+		lapic_timer_frequency = ecx / HZ;
+		pr_info("Host bus clock speed read from hypervisor : %u Hz\n",
+			ecx);
+#endif
+	} else {
 		printk(KERN_WARNING
 		       "Failed to get TSC freq from the hypervisor\n");
+	}
+
+#ifdef CONFIG_X86_IO_APIC
+	no_timer_check = 1;
+#endif
 }
 
 /*

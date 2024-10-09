@@ -130,6 +130,10 @@ static const struct usb_device_id btusb_table[] = {
 	/* Broadcom BCM43142A0 (Foxconn/Lenovo) */
 	{ USB_DEVICE(0x105b, 0xe065), .driver_info = BTUSB_BCM_PATCHRAM },
 
+	/* Broadcom BCM920703 (HTC Vive) */
+	{ USB_VENDOR_AND_INTERFACE_INFO(0x0bb4, 0xff, 0x01, 0x01),
+	  .driver_info = BTUSB_BCM_PATCHRAM },
+
 	/* Foxconn - Hon Hai */
 	{ USB_VENDOR_AND_INTERFACE_INFO(0x0489, 0xff, 0x01, 0x01),
 	  .driver_info = BTUSB_BCM_PATCHRAM },
@@ -152,6 +156,10 @@ static const struct usb_device_id btusb_table[] = {
 
 	/* IMC Networks - Broadcom based */
 	{ USB_VENDOR_AND_INTERFACE_INFO(0x13d3, 0xff, 0x01, 0x01),
+	  .driver_info = BTUSB_BCM_PATCHRAM },
+
+	/* Dell Computer - Broadcom based  */
+	{ USB_VENDOR_AND_INTERFACE_INFO(0x413c, 0xff, 0x01, 0x01),
 	  .driver_info = BTUSB_BCM_PATCHRAM },
 
 	/* Toshiba Corp - Broadcom based */
@@ -209,6 +217,7 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x04ca, 0x300f), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x04ca, 0x3010), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x04ca, 0x3014), .driver_info = BTUSB_ATH3012 },
+	{ USB_DEVICE(0x04ca, 0x3018), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x0930, 0x0219), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x0930, 0x021c), .driver_info = BTUSB_ATH3012 },
 	{ USB_DEVICE(0x0930, 0x0220), .driver_info = BTUSB_ATH3012 },
@@ -1828,7 +1837,7 @@ static int inject_cmd_complete(struct hci_dev *hdev, __u16 opcode)
 	evt->ncmd = 0x01;
 	evt->opcode = cpu_to_le16(opcode);
 
-	*skb_put(skb, 1) = 0x00;
+	*(u8 *)skb_put(skb, 1) = 0x00;
 
 	hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
 
@@ -2747,8 +2756,8 @@ static struct urb *alloc_diag_urb(struct hci_dev *hdev, bool enable)
 		return ERR_PTR(-ENOMEM);
 	}
 
-	*skb_put(skb, 1) = 0xf0;
-	*skb_put(skb, 1) = enable;
+	*(u8 *)skb_put(skb, 1) = 0xf0;
+	*(u8 *)skb_put(skb, 1) = enable;
 
 	pipe = usb_sndbulkpipe(data->udev, data->diag_tx_ep->bEndpointAddress);
 

@@ -3208,6 +3208,13 @@ static void hugetlb_vm_op_close(struct vm_area_struct *vma)
 	}
 }
 
+static int hugetlb_vm_op_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	if (addr & ~(huge_page_mask(hstate_vma(vma))))
+		return -EINVAL;
+	return 0;
+}
+
 /*
  * We cannot handle pagefaults against hugetlb pages at all.  They cause
  * handle_mm_fault() to try to instantiate regular-sized pages in the
@@ -3224,6 +3231,7 @@ const struct vm_operations_struct hugetlb_vm_ops = {
 	.fault = hugetlb_vm_op_fault,
 	.open = hugetlb_vm_op_open,
 	.close = hugetlb_vm_op_close,
+	.split = hugetlb_vm_op_split,
 };
 
 static pte_t make_huge_pte(struct vm_area_struct *vma, struct page *page,
@@ -3765,6 +3773,11 @@ retry:
 		 * Check for page in userfault range
 		 */
 		if (userfaultfd_missing(vma)) {
+			struct vm_fault vmf = {
+				.vma = vma,
+				.virtual_address = (void *)address,
+				.flags = flags,
+			};
 			u32 hash;
 			/*
 			 * hugetlb_fault_mutex must be dropped before
@@ -3774,8 +3787,7 @@ retry:
 			hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping,
 							idx, address);
 			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-			ret = handle_userfault(vma, address, flags,
-					       VM_UFFD_MISSING);
+			ret = handle_userfault(&vmf, VM_UFFD_MISSING);
 			mutex_lock(&hugetlb_fault_mutex_table[hash]);
 			goto out;
 		}

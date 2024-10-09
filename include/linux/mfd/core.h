@@ -17,7 +17,7 @@
 #include <linux/platform_device.h>
 
 struct irq_domain;
-struct property_set;
+struct property_entry;
 
 /*
  * This struct describes the MFD part ("cell").
@@ -41,7 +41,7 @@ struct mfd_cell {
 	size_t			pdata_size;
 
 	/* device properties passed to the sub devices drivers */
-	const struct property_set *pset;
+	struct property_entry *properties;
 
 	/*
 	 * Device Tree compatible string

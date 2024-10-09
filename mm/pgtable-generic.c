@@ -95,8 +95,8 @@ pte_t ptep_clear_flush(struct vm_area_struct *vma, unsigned long address,
 }
 #endif
 
-#ifndef __HAVE_ARCH_PMDP_CLEAR_FLUSH
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#ifndef __HAVE_ARCH_PMDP_CLEAR_FLUSH
 pmd_t pmdp_clear_flush(struct vm_area_struct *vma, unsigned long address,
 		       pmd_t *pmdp)
 {
@@ -106,8 +106,21 @@ pmd_t pmdp_clear_flush(struct vm_area_struct *vma, unsigned long address,
 	flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
 	return pmd;
 }
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 #endif
+#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+pud_t pudp_clear_flush(struct vm_area_struct *vma, unsigned long address,
+			    pud_t *pudp)
+{
+	pud_t pud;
+
+	VM_BUG_ON(address & ~HPAGE_PUD_MASK);
+	VM_BUG_ON(!pud_trans_huge(*pudp) && !pud_devmap(*pudp));
+	pud = pudp_get_and_clear(vma->vm_mm, address, pudp);
+	flush_tlb_range(vma, address, address + HPAGE_PUD_SIZE);
+	return pud;
+}
+#endif
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 #ifndef __HAVE_ARCH_PMDP_SPLITTING_FLUSH
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE

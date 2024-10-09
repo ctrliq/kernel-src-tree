@@ -70,12 +70,12 @@ struct ib_pd *ehca_alloc_pd(struct ib_device *device,
 
 int ehca_dealloc_pd(struct ib_pd *pd);
 
-struct ib_ah *ehca_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr,
+struct ib_ah *ehca_create_ah(struct ib_pd *pd, struct rdma_ah_attr *ah_attr,
 			      struct ib_udata *udata);
 
-int ehca_modify_ah(struct ib_ah *ah, struct ib_ah_attr *ah_attr);
+int ehca_modify_ah(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
 
-int ehca_query_ah(struct ib_ah *ah, struct ib_ah_attr *ah_attr);
+int ehca_query_ah(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
 
 int ehca_destroy_ah(struct ib_ah *ah);
 

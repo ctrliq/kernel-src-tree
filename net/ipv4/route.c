@@ -1026,6 +1026,9 @@ void ipv4_update_pmtu(struct sk_buff *skb, struct net *net, u32 mtu,
 	struct flowi4 fl4;
 	struct rtable *rt;
 
+	if (!mark)
+		mark = IP4_REPLY_MARK(net, skb->mark);
+
 	__build_flow_key(&fl4, NULL, iph, oif,
 			 RT_TOS(iph->tos), protocol, mark, flow_flags);
 	rt = __ip_route_output_key(net, &fl4);
@@ -1043,6 +1046,10 @@ static void __ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 	struct rtable *rt;
 
 	__build_flow_key(&fl4, sk, iph, 0, 0, 0, 0, 0);
+
+	if (!fl4.flowi4_mark)
+		fl4.flowi4_mark = IP4_REPLY_MARK(sock_net(sk), skb->mark);
+
 	rt = __ip_route_output_key(sock_net(sk), &fl4);
 	if (!IS_ERR(rt)) {
 		__ip_rt_update_pmtu(rt, &fl4, mtu);
@@ -1447,40 +1454,53 @@ static struct rtable *rt_dst_alloc(struct net_device *dev,
 }
 
 /* called in rcu_read_lock() section */
-static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-				u8 tos, struct net_device *dev, int our)
+int ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+			  u8 tos, struct net_device *dev,
+			  struct in_device *in_dev, u32 *itag)
 {
-	struct rtable *rth;
-	struct in_device *in_dev = __in_dev_get_rcu(dev);
-	u32 itag = 0;
 	int err;
 
 	/* Primary sanity checks. */
-
 	if (in_dev == NULL)
 		return -EINVAL;
 
 	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr) ||
 	    skb->protocol != htons(ETH_P_IP))
-		goto e_inval;
+		return -EINVAL;
 
 	if (likely(!IN_DEV_ROUTE_LOCALNET(in_dev)))
 		if (ipv4_is_loopback(saddr))
-			goto e_inval;
+			return -EINVAL;
 
 	if (ipv4_is_zeronet(saddr)) {
 		if (!ipv4_is_local_multicast(daddr))
-			goto e_inval;
+			return -EINVAL;
 	} else {
 		err = fib_validate_source(skb, saddr, 0, tos, 0, dev,
-					  in_dev, &itag);
+					  in_dev, itag);
 		if (err < 0)
-			goto e_err;
+			return err;
 	}
+	return 0;
+}
+
+/* called in rcu_read_lock() section */
+static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+			     u8 tos, struct net_device *dev, int our)
+{
+	struct in_device *in_dev = __in_dev_get_rcu(dev);
+	struct rtable *rth;
+	u32 itag = 0;
+	int err;
+
+	err = ip_mc_validate_source(skb, daddr, saddr, tos, dev, in_dev, &itag);
+	if (err)
+		return err;
+
 	rth = rt_dst_alloc(dev_net(dev)->loopback_dev,
 			   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
 	if (!rth)
-		goto e_nobufs;
+		return -ENOBUFS;
 
 #ifdef CONFIG_IP_ROUTE_CLASSID
 	rth->dst.tclassid = itag;
@@ -1509,13 +1529,6 @@ static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 
 	skb_dst_set(skb, &rth->dst);
 	return 0;
-
-e_nobufs:
-	return -ENOBUFS;
-e_inval:
-	return -EINVAL;
-e_err:
-	return err;
 }
 
 

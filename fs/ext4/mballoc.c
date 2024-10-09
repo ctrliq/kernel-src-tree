@@ -2350,7 +2350,7 @@ int ext4_mb_alloc_groupinfo(struct super_block *sb, ext4_group_t ngroups)
 		return 0;
 
 	size = roundup_pow_of_two(sizeof(*sbi->s_group_info) * size);
-	new_groupinfo = ext4_kvzalloc(size, GFP_KERNEL);
+	new_groupinfo = kvzalloc(size, GFP_KERNEL);
 	if (!new_groupinfo) {
 		ext4_msg(sb, KERN_ERR, "can't allocate buddy meta group");
 		return -ENOMEM;
@@ -4417,14 +4417,7 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	if (IS_NOQUOTA(ar->inode))
 		ar->flags |= EXT4_MB_USE_ROOT_BLOCKS;
 
-	/*
-	 * For delayed allocation, we could skip the ENOSPC and
-	 * EDQUOT check, as blocks and quotas have been already
-	 * reserved when data being copied into pagecache.
-	 */
-	if (ext4_test_inode_state(ar->inode, EXT4_STATE_DELALLOC_RESERVED))
-		ar->flags |= EXT4_MB_DELALLOC_RESERVED;
-	else {
+	if ((ar->flags & EXT4_MB_DELALLOC_RESERVED) == 0) {
 		/* Without delayed allocation we need to verify
 		 * there is enough free blocks to do block allocation
 		 * and verify allocation doesn't exceed the quota limits.
@@ -4524,8 +4517,7 @@ out:
 	if (inquota && ar->len < inquota)
 		dquot_free_block(ar->inode, EXT4_C2B(sbi, inquota - ar->len));
 	if (!ar->len) {
-		if (!ext4_test_inode_state(ar->inode,
-					   EXT4_STATE_DELALLOC_RESERVED))
+		if ((ar->flags & EXT4_MB_DELALLOC_RESERVED) == 0)
 			/* release all the reserved blocks if non delalloc */
 			percpu_counter_sub(&sbi->s_dirtyclusters_counter,
 						reserv_clstrs);

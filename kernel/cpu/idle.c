@@ -6,6 +6,7 @@
 #include <linux/tick.h>
 #include <linux/mm.h>
 #include <linux/stackprotector.h>
+#include <linux/livepatch.h>
 
 #include <asm/tlb.h>
 
@@ -140,6 +141,9 @@ static void cpu_idle_loop(void)
 
 		sched_ttwu_pending();
 		schedule_preempt_disabled();
+
+		if (unlikely(klp_patch_pending(current)))
+			klp_update_patch_state(current);
 	}
 }
 

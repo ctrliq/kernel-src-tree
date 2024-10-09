@@ -45,6 +45,21 @@
  * the kabi checker (mainly for RH_KABI_EXTEND, but applied to all macros for
  * uniformity).
  * NOTE NOTE NOTE
+ *
+ * RH_KABI_CONST - adds a new const modifier to a function parameter
+ *		   preserving the old checksum
+ *
+ * This macro does the opposite: it changes the symbol checksum without
+ * actually changing anything about the exported symbol. It is useful for
+ * symbols that are not whitelisted, we're changing them in an incompatible
+ * way and want to prevent 3rd party modules to silently corrupt memory.
+ * Instead, by changing the symbol checksum, such modules won't be loaded by
+ * the kernel. This macro should only be used as a last resort when all other
+ * KABI workarounds have failed.
+ *
+ * RH_KABI_FORCE_CHANGE - Force change of the symbol checksum. The argument
+ *			  of the macro is a version for cases we need to do
+ *			  this more than once.
  */
 #ifdef __GENKSYMS__
 
@@ -56,6 +71,10 @@
 # define RH_KABI_EXTEND(_new)
 # define RH_KABI_FILL_HOLE(_new)
 # define RH_KABI_RENAME(_orig, _new)		_orig
+
+# define RH_KABI_CONST
+
+# define RH_KABI_FORCE_CHANGE(ver)		__attribute__((rh_kabi_change ## ver))
 
 #else
 
@@ -94,6 +113,10 @@
 # define RH_KABI_FILL_HOLE(_new)       	_new;
 # define RH_KABI_RENAME(_orig, _new)		_new
 
+# define RH_KABI_CONST				const
+
+# define RH_KABI_FORCE_CHANGE(ver)
+
 #endif /* __GENKSYMS__ */
 
 /* colon added wrappers for the RH_KABI_REPLACE macros */
@@ -124,5 +147,11 @@
  */
 #define RH_KABI_USE2(n, _new1, _new2)	RH_KABI_REPLACE(_RH_KABI_RESERVE(n), struct{ _new1; _new2; })
 #define RH_KABI_USE2_P(n, _new1, _new2)	RH_KABI_REPLACE(_RH_KABI_RESERVE_P(n), struct{ _new1; _new2;})
+
+/*
+ * Macro for breaking up a random element into two smaller chunks using an anonymous
+ * struct inside an anonymous union.
+ */
+#define RH_KABI_REPLACE2(orig, _new1, _new2)	RH_KABI_REPLACE(orig, struct{ _new1; _new2;})
 
 #endif /* _LINUX_RH_KABI_H */

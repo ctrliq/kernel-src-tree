@@ -7,6 +7,7 @@
 #include <linux/writeback.h>
 #include <linux/mmu_notifier.h>
 #include <linux/swapops.h>
+#include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
 #include "internal.h"
@@ -107,6 +108,13 @@ struct page *follow_page_mask(struct vm_area_struct *vma,
 			return page;
 		goto no_page_table;
 	}
+	if (pud_devmap(*pud)) {
+		ptl = pud_lock(mm, pud);
+		page = follow_devmap_pud(vma, address, pud, flags);
+		spin_unlock(ptl);
+		if (page)
+			return page;
+	}
 	if (unlikely(pud_bad(*pud)))
 		goto no_page_table;
 
@@ -121,6 +129,13 @@ struct page *follow_page_mask(struct vm_area_struct *vma,
 	}
 	if ((flags & FOLL_NUMA) && pmd_numa(*pmd))
 		goto no_page_table;
+	if (pmd_devmap(*pmd)) {
+		ptl = pmd_lock(mm, pmd);
+		page = follow_devmap_pmd(vma, address, pmd, flags);
+		spin_unlock(ptl);
+		if (page)
+			return page;
+	}
 	if (pmd_trans_huge(*pmd)) {
 		if (flags & FOLL_SPLIT) {
 			split_huge_page_pmd(vma, address, pmd);
@@ -328,6 +343,8 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 	long i;
 	unsigned long vm_flags;
 	unsigned int page_mask;
+	int write = (gup_flags & FOLL_WRITE);
+	int foreign = (gup_flags & FOLL_REMOTE);
 
 	if (!nr_pages)
 		return 0;
@@ -414,6 +431,13 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		    !(vm_flags & vma->vm_flags))
 			return i ? : -EFAULT;
 
+		/*
+		 * gups are always data accesses, not instruction
+		 * fetches, so execute=false here
+		 */
+		if (!arch_vma_access_permitted(vma, write, false, foreign))
+			return i ? : -EFAULT;
+
 		if (is_vm_hugetlb_page(vma)) {
 			i = follow_hugetlb_page(mm, vma, pages, vmas,
 					&start, &nr_pages, i,
@@ -441,6 +465,8 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 
 				if (foll_flags & FOLL_WRITE)
 					fault_flags |= FAULT_FLAG_WRITE;
+				if (foll_flags & FOLL_REMOTE)
+					fault_flags |= FAULT_FLAG_REMOTE;
 				if (nonblocking)
 					fault_flags |= FAULT_FLAG_ALLOW_RETRY;
 				if (foll_flags & FOLL_NOWAIT)
@@ -451,7 +477,7 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 					fault_flags |= FAULT_FLAG_TRIED;
 				}
 
-				ret = handle_mm_fault(mm, vma, start,
+				ret = handle_mm_fault(vma, start,
 							fault_flags);
 
 				if (ret & VM_FAULT_ERROR) {
@@ -466,7 +492,7 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 						else
 							return -EFAULT;
 					}
-					if (ret & VM_FAULT_SIGBUS)
+					if (ret & (VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV))
 						return i ? i : -EFAULT;
 					BUG();
 				}
@@ -535,6 +561,28 @@ next_page:
 }
 EXPORT_SYMBOL(__get_user_pages);
 
+bool vma_permits_fault(struct vm_area_struct *vma, unsigned int fault_flags)
+{
+	bool write   = !!(fault_flags & FAULT_FLAG_WRITE);
+	bool foreign = !!(fault_flags & FAULT_FLAG_REMOTE);
+	vm_flags_t vm_flags = write ? VM_WRITE : VM_READ;
+
+	if (!(vm_flags & vma->vm_flags))
+		return false;
+
+	/*
+	 * The architecture might have a hardware protection
+	 * mechanism other than read/write that can deny access.
+	 *
+	 * gup always represents data access, not instruction
+	 * fetches, so execute=false here:
+	 */
+	if (!arch_vma_access_permitted(vma, write, false, foreign))
+		return false;
+
+	return true;
+}
+
 /*
  * fixup_user_fault() - manually resolve a user page fault
  * @tsk:	the task_struct to use for page fault accounting, or
@@ -566,24 +614,22 @@ int fixup_user_fault(struct task_struct *tsk, struct mm_struct *mm,
 		     unsigned long address, unsigned int fault_flags)
 {
 	struct vm_area_struct *vma;
-	vm_flags_t vm_flags;
 	int ret;
 
 	vma = find_extend_vma(mm, address);
 	if (!vma || address < vma->vm_start)
 		return -EFAULT;
 
-	vm_flags = (fault_flags & FAULT_FLAG_WRITE) ? VM_WRITE : VM_READ;
-	if (!(vm_flags & vma->vm_flags))
+	if (!vma_permits_fault(vma, fault_flags))
 		return -EFAULT;
 
-	ret = handle_mm_fault(mm, vma, address, fault_flags);
+	ret = handle_mm_fault(vma, address, fault_flags);
 	if (ret & VM_FAULT_ERROR) {
 		if (ret & VM_FAULT_OOM)
 			return -ENOMEM;
 		if (ret & (VM_FAULT_HWPOISON | VM_FAULT_HWPOISON_LARGE))
 			return -EHWPOISON;
-		if (ret & VM_FAULT_SIGBUS)
+		if (ret & (VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV))
 			return -EFAULT;
 		BUG();
 	}
@@ -777,7 +823,7 @@ long get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
 EXPORT_SYMBOL(get_user_pages_unlocked);
 
 /*
- * get_user_pages() - pin user pages in memory
+ * get_user_pages_remote() - pin user pages in memory
  * @tsk:	the task_struct to use for page fault accounting, or
  *		NULL if faults are not to be recorded.
  * @mm:		mm_struct of target mm
@@ -832,12 +878,29 @@ EXPORT_SYMBOL(get_user_pages_unlocked);
  * should use get_user_pages because it cannot pass
  * FAULT_FLAG_ALLOW_RETRY to handle_mm_fault.
  */
-long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
-		unsigned long start, unsigned long nr_pages, int write,
-		int force, struct page **pages, struct vm_area_struct **vmas)
+long get_user_pages_remote(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long start, unsigned long nr_pages,
+		int write, int force, struct page **pages,
+		struct vm_area_struct **vmas)
 {
 	return __get_user_pages_locked(tsk, mm, start, nr_pages, write, force,
-				       pages, vmas, NULL, false, FOLL_TOUCH);
+				       pages, vmas, NULL, false,
+				       FOLL_TOUCH | FOLL_REMOTE);
+}
+EXPORT_SYMBOL(get_user_pages_remote);
+
+/*
+ * This is the same as get_user_pages_remote() for the time
+ * being.
+ */
+long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long start, unsigned long nr_pages,
+		int write, int force, struct page **pages,
+		struct vm_area_struct **vmas)
+{
+	return __get_user_pages_locked(tsk, mm, start, nr_pages,
+				       write, force, pages, vmas, NULL, false,
+				       FOLL_TOUCH);
 }
 EXPORT_SYMBOL(get_user_pages);
 

@@ -326,12 +326,12 @@ static void amd_get_topology(struct cpuinfo_x86 *c)
 
 		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
 		nodes_per_socket = ((ecx >> 8) & 7) + 1;
-		node_id = ecx & 7;
 
-		/* get compute unit information */
-		smp_num_siblings = ((ebx >> 8) & 3) + 1;
-		c->x86_max_cores /= smp_num_siblings;
-		c->cpu_core_id = ebx & 0xff;
+		node_id  = ecx & 0xff;
+		smp_num_siblings = ((ebx >> 8) & 0xff) + 1;
+
+		if (c->x86 == 0x15)
+			c->cu_id = ebx & 0xff;
 
 		if (c->x86 >= 0x17) {
 			c->cpu_core_id = ebx & 0xff;
@@ -516,7 +516,11 @@ static void bsp_init_amd(struct cpuinfo_x86 *c)
 
 static void early_init_amd(struct cpuinfo_x86 *c)
 {
+	u32 dummy;
+
 	early_init_amd_mc(c);
+
+	rdmsr_safe(MSR_AMD64_PATCH_LEVEL, &c->microcode, &dummy);
 
 	/*
 	 * c->x86_power is 8000_0007 edx. Bit 8 is TSC runs at constant rate
@@ -555,6 +559,33 @@ static void early_init_amd(struct cpuinfo_x86 *c)
 			set_cpu_cap(c, X86_FEATURE_EXTD_APICID);
 	}
 #endif
+	/*
+	 * This is only needed to tell the kernel whether to use VMCALL
+	 * and VMMCALL.  VMMCALL is never executed except under virt, so
+	 * we can set it unconditionally.
+	 */
+	set_cpu_cap(c, X86_FEATURE_VMMCALL);
+
+	/*
+	 * BIOS support is required for SME. If BIOS has enabled SME then
+	 * adjust x86_phys_bits by the SME physical address space reduction
+	 * value. If BIOS has not enabled SME then don't advertise the
+	 * feature (set in scattered.c). Also, since the SME support requires
+	 * long mode, don't advertise the feature under CONFIG_X86_32.
+	 */
+	if (cpu_has(c, X86_FEATURE_SME)) {
+		u64 msr;
+
+		/* Check if SME is enabled */
+		rdmsrl(MSR_K8_SYSCFG, msr);
+		if (msr & MSR_K8_SYSCFG_MEM_ENCRYPT) {
+			c->x86_phys_bits -= (cpuid_ebx(0x8000001f) >> 6) & 0x3f;
+			if (IS_ENABLED(CONFIG_X86_32))
+				clear_cpu_cap(c, X86_FEATURE_SME);
+		} else {
+			clear_cpu_cap(c, X86_FEATURE_SME);
+		}
+	}
 }
 
 static const int amd_erratum_383[];
@@ -563,7 +594,6 @@ static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum);
 
 static void init_amd(struct cpuinfo_x86 *c)
 {
-	u32 dummy;
 	unsigned long long value;
 
 #ifdef CONFIG_SMP
@@ -580,7 +610,6 @@ static void init_amd(struct cpuinfo_x86 *c)
 		wrmsrl(MSR_K7_HWCR, value);
 	}
 #endif
-
 	early_init_amd(c);
 
 	/*
@@ -704,8 +733,17 @@ static void init_amd(struct cpuinfo_x86 *c)
 		set_cpu_cap(c, X86_FEATURE_K8);
 
 	if (cpu_has_xmm2) {
-		/* MFENCE stops RDTSC speculation */
-		set_cpu_cap(c, X86_FEATURE_MFENCE_RDTSC);
+		/*
+		 * Use LFENCE for execution serialization. On some families
+		 * LFENCE is already serialized and the MSR is not available,
+		 * but msr_set_bit() uses rdmsrl_safe() and wrmsrl_safe().
+		 */
+		if (c->x86 > 0xf)
+			msr_set_bit(MSR_F10H_DECFG,
+				    MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT);
+
+		/* LFENCE with MSR_F10H_DECFG[1]=1 stops RDTSC speculation */
+		set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
 	}
 
 #ifdef CONFIG_X86_64
@@ -783,7 +821,10 @@ static void init_amd(struct cpuinfo_x86 *c)
 	if (cpu_has_amd_erratum(c, amd_erratum_400))
 		set_cpu_bug(c, X86_BUG_AMD_APIC_C1E);
 
-	rdmsr_safe(MSR_AMD64_PATCH_LEVEL, &c->microcode, &dummy);
+	if (c->x86 == 0x10 || c->x86 == 0x12)
+		set_cpu_cap(c, X86_FEATURE_IBP_DISABLE);
+
+	set_cpu_cap(c, X86_FEATURE_RETPOLINE_AMD);
 }
 
 #ifdef CONFIG_X86_32

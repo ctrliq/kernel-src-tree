@@ -471,7 +471,7 @@ static const struct net_device_ops dlci_netdev_ops = {
 	.ndo_stop	= dlci_close,
 	.ndo_do_ioctl	= dlci_dev_ioctl,
 	.ndo_start_xmit	= dlci_transmit,
-	.ndo_change_mtu	= dlci_change_mtu,
+	.ndo_change_mtu_rh74 = dlci_change_mtu,
 };
 
 static void dlci_setup(struct net_device *dev)
@@ -481,7 +481,7 @@ static void dlci_setup(struct net_device *dev)
 	dev->flags		= 0;
 	dev->header_ops		= &dlci_header_ops;
 	dev->netdev_ops		= &dlci_netdev_ops;
-	dev->destructor		= free_netdev;
+	dev->extended->needs_free_netdev	= true;
 
 	dlp->receive		= dlci_receive;
 

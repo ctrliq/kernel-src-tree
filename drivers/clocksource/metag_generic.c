@@ -75,7 +75,7 @@ static void metag_timer_set_mode(enum clock_event_mode mode,
 	};
 }
 
-static cycle_t metag_clocksource_read(struct clocksource *cs)
+static u64 metag_clocksource_read(struct clocksource *cs)
 {
 	return __core_reg_get(TXTIMER);
 }

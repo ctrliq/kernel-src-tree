@@ -242,6 +242,14 @@ static const struct soc_tplg_map dapm_map[] = {
 	{SND_SOC_TPLG_DAPM_DAI_IN, snd_soc_dapm_dai_in},
 	{SND_SOC_TPLG_DAPM_DAI_OUT, snd_soc_dapm_dai_out},
 	{SND_SOC_TPLG_DAPM_DAI_LINK, snd_soc_dapm_dai_link},
+	{SND_SOC_TPLG_DAPM_BUFFER, snd_soc_dapm_buffer},
+	{SND_SOC_TPLG_DAPM_SCHEDULER, snd_soc_dapm_scheduler},
+	{SND_SOC_TPLG_DAPM_EFFECT, snd_soc_dapm_effect},
+	{SND_SOC_TPLG_DAPM_SIGGEN, snd_soc_dapm_siggen},
+	{SND_SOC_TPLG_DAPM_SRC, snd_soc_dapm_src},
+	{SND_SOC_TPLG_DAPM_ASRC, snd_soc_dapm_asrc},
+	{SND_SOC_TPLG_DAPM_ENCODER, snd_soc_dapm_encoder},
+	{SND_SOC_TPLG_DAPM_DECODER, snd_soc_dapm_decoder},
 };
 
 static int tplc_chan_get_reg(struct soc_tplg *tplg,
@@ -344,7 +352,18 @@ static int soc_tplg_widget_load(struct soc_tplg *tplg,
 	return 0;
 }
 
-/* pass DAI configurations to component driver for extra intialization */
+/* optionally pass new dynamic widget to component driver. This is mainly for
+ * external widgets where we can assign private data/ops */
+static int soc_tplg_widget_ready(struct soc_tplg *tplg,
+	struct snd_soc_dapm_widget *w, struct snd_soc_tplg_dapm_widget *tplg_w)
+{
+	if (tplg->comp && tplg->ops && tplg->ops->widget_ready)
+		return tplg->ops->widget_ready(tplg->comp, w, tplg_w);
+
+	return 0;
+}
+
+/* pass DAI configurations to component driver for extra initialization */
 static int soc_tplg_dai_load(struct soc_tplg *tplg,
 	struct snd_soc_dai_driver *dai_drv)
 {
@@ -354,7 +373,7 @@ static int soc_tplg_dai_load(struct soc_tplg *tplg,
 	return 0;
 }
 
-/* pass link configurations to component driver for extra intialization */
+/* pass link configurations to component driver for extra initialization */
 static int soc_tplg_dai_link_load(struct soc_tplg *tplg,
 	struct snd_soc_dai_link *link)
 {
@@ -1580,8 +1599,16 @@ widget:
 	widget->dobj.ops = tplg->ops;
 	widget->dobj.index = tplg->index;
 	list_add(&widget->dobj.list, &tplg->comp->dobj_list);
+
+	ret = soc_tplg_widget_ready(tplg, widget, w);
+	if (ret < 0)
+		goto ready_err;
+
 	return 0;
 
+ready_err:
+	snd_soc_tplg_widget_remove(widget);
+	snd_soc_dapm_free_widget(widget);
 hdr_err:
 	kfree(template.sname);
 err:
@@ -1929,7 +1956,7 @@ static int soc_tplg_pcm_elems_load(struct soc_tplg *tplg,
 
 /**
  * set_link_hw_format - Set the HW audio format of the physical DAI link.
- * @tplg: topology context
+ * @link: &snd_soc_dai_link which should be updated
  * @cfg: physical link configs.
  *
  * Topology context contains a list of supported HW formats (configs) and
@@ -1980,7 +2007,7 @@ static void set_link_hw_format(struct snd_soc_dai_link *link,
 /**
  * link_new_ver - Create a new physical link config from the old
  * version of source.
- * @toplogy: topology context
+ * @tplg: topology context
  * @src: old version of phyical link config as a source
  * @link: latest version of physical link config created from the source
  *
@@ -2222,7 +2249,7 @@ static int soc_tplg_dai_elems_load(struct soc_tplg *tplg,
 /**
  * manifest_new_ver - Create a new version of manifest from the old version
  * of source.
- * @toplogy: topology context
+ * @tplg: topology context
  * @src: old version of manifest as a source
  * @manifest: latest version of manifest created from the source
  *

@@ -27,7 +27,7 @@
 struct xfs_dinode;
 struct xfs_inode;
 struct xfs_buf;
-struct xfs_bmap_free;
+struct xfs_defer_ops;
 struct xfs_bmbt_irec;
 struct xfs_inode_log_item;
 struct xfs_mount;
@@ -63,6 +63,8 @@ typedef struct xfs_inode {
 	unsigned long		i_flags;	/* see defined flags below */
 	unsigned int		i_delayed_blks;	/* count of delay alloc blks */
 	spinlock_t		i_size_lock;	/* concurrent dio i_size lock */
+
+	struct list_head	i_wblist;	/* RHEL7: for writeback list */
 
 	struct xfs_icdinode	i_d;		/* most of ondisk inode */
 
@@ -399,14 +401,10 @@ void		xfs_ilock_demote(xfs_inode_t *, uint);
 int		xfs_isilocked(xfs_inode_t *, uint);
 uint		xfs_ilock_data_map_shared(struct xfs_inode *);
 uint		xfs_ilock_attr_map_shared(struct xfs_inode *);
-int		xfs_ialloc(struct xfs_trans *, xfs_inode_t *, umode_t,
-			   xfs_nlink_t, xfs_dev_t, prid_t, int,
-			   struct xfs_buf **, xfs_inode_t **);
 
 uint		xfs_ip2xflags(struct xfs_inode *);
-uint		xfs_dic2xflags(struct xfs_dinode *);
 int		xfs_ifree(struct xfs_trans *, xfs_inode_t *,
-			   struct xfs_bmap_free *);
+			   struct xfs_defer_ops *);
 int		xfs_itruncate_extents(struct xfs_trans **, struct xfs_inode *,
 				      int, xfs_fsize_t);
 void		xfs_iext_realloc(xfs_inode_t *, int, int);
@@ -415,7 +413,6 @@ void		xfs_iunpin_wait(xfs_inode_t *);
 #define xfs_ipincount(ip)	((unsigned int) atomic_read(&ip->i_pincount))
 
 int		xfs_iflush(struct xfs_inode *, struct xfs_buf **);
-void		xfs_lock_inodes(xfs_inode_t **, int, uint);
 void		xfs_lock_two_inodes(xfs_inode_t *, xfs_inode_t *, uint);
 
 xfs_extlen_t	xfs_get_extsz_hint(struct xfs_inode *ip);
@@ -423,8 +420,6 @@ xfs_extlen_t	xfs_get_extsz_hint(struct xfs_inode *ip);
 int		xfs_dir_ialloc(struct xfs_trans **, struct xfs_inode *, umode_t,
 			       xfs_nlink_t, xfs_dev_t, prid_t, int,
 			       struct xfs_inode **, int *);
-int		xfs_droplink(struct xfs_trans *, struct xfs_inode *);
-int		xfs_bumplink(struct xfs_trans *, struct xfs_inode *);
 
 /* from xfs_file.c */
 enum xfs_prealloc_flags {
@@ -438,9 +433,8 @@ int	xfs_update_prealloc_flags(struct xfs_inode *ip,
 				  enum xfs_prealloc_flags flags);
 int	xfs_zero_eof(struct xfs_inode *ip, xfs_off_t offset,
 		     xfs_fsize_t isize, bool *did_zeroing);
-int	xfs_iozero(struct xfs_inode *ip, loff_t pos, size_t count);
-loff_t	__xfs_seek_hole_data(struct inode *inode, loff_t start,
-			     loff_t eof, int whence);
+int	xfs_zero_range(struct xfs_inode *ip, xfs_off_t pos, xfs_off_t count,
+		bool *did_zero);
 
 /* from xfs_iops.c */
 extern void xfs_setup_inode(struct xfs_inode *ip);

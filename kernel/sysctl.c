@@ -63,6 +63,7 @@
 #include <linux/binfmts.h>
 #include <linux/sched/sysctl.h>
 #include <linux/kexec.h>
+#include <linux/mount.h>
 
 #include <asm/uaccess.h>
 #include <asm/processor.h>
@@ -172,6 +173,34 @@ extern int no_unaligned_warning;
 #endif
 
 #ifdef CONFIG_PROC_SYSCTL
+
+/**
+ * enum sysctl_writes_mode - supported sysctl write modes
+ *
+ * @SYSCTL_WRITES_LEGACY: each write syscall must fully contain the sysctl value
+ * 	to be written, and multiple writes on the same sysctl file descriptor
+ * 	will rewrite the sysctl value, regardless of file position. No warning
+ * 	is issued when the initial position is not 0.
+ * @SYSCTL_WRITES_WARN: same as above but warn when the initial file position is
+ * 	not 0.
+ * @SYSCTL_WRITES_STRICT: writes to numeric sysctl entries must always be at
+ * 	file position 0 and the value must be fully contained in the buffer
+ * 	sent to the write syscall. If dealing with strings respect the file
+ * 	position, but restrict this to the max length of the buffer, anything
+ * 	passed the max lenght will be ignored. Multiple writes will append
+ * 	to the buffer.
+ *
+ * These write modes control how current file position affects the behavior of
+ * updating sysctl values through the proc interface on each write.
+ */
+enum sysctl_writes_mode {
+	SYSCTL_WRITES_LEGACY		= -1,
+	SYSCTL_WRITES_WARN		= 0,
+	SYSCTL_WRITES_STRICT		= 1,
+};
+
+static enum sysctl_writes_mode sysctl_writes_strict = SYSCTL_WRITES_STRICT;
+
 static int proc_do_cad_pid(struct ctl_table *table, int write,
 		  void __user *buffer, size_t *lenp, loff_t *ppos);
 static int proc_taint(struct ctl_table *table, int write,
@@ -512,6 +541,15 @@ static struct ctl_table kern_table[] = {
 		.maxlen 	= sizeof(long),
 		.mode		= 0644,
 		.proc_handler	= proc_taint,
+	},
+	{
+		.procname	= "sysctl_writes_strict",
+		.data		= &sysctl_writes_strict,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &neg_one,
+		.extra2		= &one,
 	},
 #endif
 #ifdef CONFIG_LATENCYTOP
@@ -975,13 +1013,6 @@ static struct ctl_table kern_table[] = {
 		.data		= &bootloader_version,
 		.maxlen		= sizeof (int),
 		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "kstack_depth_to_print",
-		.data		= &kstack_depth_to_print,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
 	{
@@ -1753,13 +1784,12 @@ static struct ctl_table fs_table[] = {
 		.proc_handler	= proc_doulongvec_minmax,
 	},
 	{
-		.procname	= "may_detach_mounts",
-		.data		= &may_detach_mounts,
-		.maxlen		= sizeof(may_detach_mounts),
+		.procname	= "mount-max",
+		.data		= &sysctl_mount_max,
+		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= &one,
 	},
 	{ }
 };
@@ -1834,8 +1864,20 @@ static int _proc_do_string(char *data, int maxlen, int write,
 	}
 
 	if (write) {
-		/* Start writing from beginning of buffer. */
-		len = 0;
+		if (sysctl_writes_strict == SYSCTL_WRITES_STRICT) {
+			/* Only continue writes not past the end of buffer. */
+			len = strlen(data);
+			if (len > maxlen - 1)
+				len = maxlen - 1;
+
+			if (*ppos > len)
+				return 0;
+			len = *ppos;
+		} else {
+			/* Start writing from beginning of buffer. */
+			len = 0;
+		}
+
 		*ppos += *lenp;
 		p = buffer;
 		while ((p - buffer) < *lenp && len < maxlen - 1) {
@@ -1875,6 +1917,40 @@ static int _proc_do_string(char *data, int maxlen, int write,
 	return 0;
 }
 
+static void warn_sysctl_write(struct ctl_table *table)
+{
+	pr_warn_once("%s wrote to %s when file position was not 0!\n"
+		"This will not be supported in the future. To silence this\n"
+		"warning, set kernel.sysctl_writes_strict = -1\n",
+		current->comm, table->procname);
+}
+
+/**
+ * proc_first_pos_non_zero_ignore - check if firs position is allowed
+ * @ppos: file position
+ * @table: the sysctl table
+ *
+ * Returns true if the first position is non-zero and the sysctl_writes_strict
+ * mode indicates this is not allowed for numeric input types. String proc
+ * hadlers can ignore the return value.
+ */
+static bool proc_first_pos_non_zero_ignore(loff_t *ppos,
+					   struct ctl_table *table)
+{
+	if (!*ppos)
+		return false;
+
+	switch (sysctl_writes_strict) {
+	case SYSCTL_WRITES_STRICT:
+		return true;
+	case SYSCTL_WRITES_WARN:
+		warn_sysctl_write(table);
+		return false;
+	default:
+		return false;
+	}
+}
+
 /**
  * proc_dostring - read a string sysctl
  * @table: the sysctl table
@@ -1895,6 +1971,9 @@ static int _proc_do_string(char *data, int maxlen, int write,
 int proc_dostring(struct ctl_table *table, int write,
 		  void __user *buffer, size_t *lenp, loff_t *ppos)
 {
+	if (write)
+		proc_first_pos_non_zero_ignore(ppos, table);
+
 	return _proc_do_string((char *)(table->data), table->maxlen, write,
 			       (char __user *)buffer, lenp, ppos);
 }
@@ -2093,6 +2172,9 @@ static int __do_proc_dointvec(void *tbl_data, struct ctl_table *table,
 		conv = do_proc_dointvec_conv;
 
 	if (write) {
+		if (proc_first_pos_non_zero_ignore(ppos, table))
+			goto out;
+
 		if (left > PAGE_SIZE - 1)
 			left = PAGE_SIZE - 1;
 		page = __get_free_page(GFP_TEMPORARY);
@@ -2150,6 +2232,7 @@ free:
 			return err ? : -EINVAL;
 	}
 	*lenp -= left;
+out:
 	*ppos += *lenp;
 	return err;
 }
@@ -2459,12 +2542,13 @@ static int do_proc_douintvec_minmax_conv(unsigned long *lvalp,
 	if (write) {
 		unsigned int val = *lvalp;
 
+		if (*lvalp > UINT_MAX)
+			return -EINVAL;
+
 		if ((param->min && *param->min > val) ||
 		    (param->max && *param->max < val))
 			return -ERANGE;
 
-		if (*lvalp > UINT_MAX)
-			return -EINVAL;
 		*valp = val;
 	} else {
 		unsigned int val = *valp;
@@ -2502,6 +2586,48 @@ int proc_douintvec_minmax(struct ctl_table *table, int write,
 	};
 	return do_proc_douintvec(table, write, buffer, lenp, ppos,
 				 do_proc_douintvec_minmax_conv, &param);
+}
+
+struct do_proc_dopipe_max_size_conv_param {
+	unsigned int *min;
+};
+
+static int do_proc_dopipe_max_size_conv(unsigned long *lvalp,
+					unsigned int *valp,
+					int write, void *data)
+{
+	struct do_proc_dopipe_max_size_conv_param *param = data;
+
+	if (write) {
+		unsigned int val;
+
+		if (*lvalp > UINT_MAX)
+			return -EINVAL;
+
+		val = round_pipe_size(*lvalp);
+		if (val == 0)
+			return -EINVAL;
+
+		if (param->min && *param->min > val)
+			return -ERANGE;
+
+		*valp = val;
+	} else {
+		unsigned int val = *valp;
+		*lvalp = (unsigned long) val;
+	}
+
+	return 0;
+}
+
+int proc_dopipe_max_size(struct ctl_table *table, int write,
+			 void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct do_proc_dopipe_max_size_conv_param param = {
+		.min = (unsigned int *) table->extra1,
+	};
+	return do_proc_douintvec(table, write, buffer, lenp, ppos,
+				 do_proc_dopipe_max_size_conv, &param);
 }
 
 static void validate_coredump_safety(void)
@@ -2560,6 +2686,9 @@ static int __do_proc_doulongvec_minmax(void *data, struct ctl_table *table, int 
 	left = *lenp;
 
 	if (write) {
+		if (proc_first_pos_non_zero_ignore(ppos, table))
+			goto out;
+
 		if (left > PAGE_SIZE - 1)
 			left = PAGE_SIZE - 1;
 		page = __get_free_page(GFP_TEMPORARY);
@@ -2612,6 +2741,7 @@ free:
 			return err ? : -EINVAL;
 	}
 	*lenp -= left;
+out:
 	*ppos += *lenp;
 	return err;
 }
@@ -3014,6 +3144,12 @@ int proc_douintvec_minmax(struct ctl_table *table, int write,
 	return -ENOSYS;
 }
 
+int proc_dopipe_max_size(struct ctl_table *table, int write,
+			 void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	return -ENOSYS;
+}
+
 int proc_dointvec_jiffies(struct ctl_table *table, int write,
 		    void __user *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -3057,6 +3193,7 @@ EXPORT_SYMBOL(proc_douintvec);
 EXPORT_SYMBOL(proc_dointvec_jiffies);
 EXPORT_SYMBOL(proc_dointvec_minmax);
 EXPORT_SYMBOL_GPL(proc_douintvec_minmax);
+EXPORT_SYMBOL_GPL(proc_dopipe_max_size);
 EXPORT_SYMBOL(proc_dointvec_userhz_jiffies);
 EXPORT_SYMBOL(proc_dointvec_ms_jiffies);
 EXPORT_SYMBOL(proc_dostring);

@@ -14,6 +14,13 @@
 #include <linux/io.h>
 #include <linux/console.h>
 
+
+#include <linux/time64.h>
+static inline time64_t ktime_get_real_seconds(void)
+{
+	return get_seconds();
+}
+
 /**
  * ktime_mono_to_real - Convert monotonic time to clock realtime
  */
@@ -152,13 +159,6 @@ static inline int arch_phys_wc_index(int handle)
 	return -1;
 #endif
 }
-
-#ifdef CONFIG_X86
-static inline void __iomem *acpi_os_ioremap(u64 phys, u32 size)
-{
-	return ioremap_cache(phys, size);
-}
-#endif
 
 /*
  * avoiding/emulating 87521e16a7abbf3fa337f56cb4d1e18247f15e8a upstream:
@@ -307,11 +307,6 @@ static inline void atomic_andnot(int i, atomic_t *v)
 #endif
 #endif
 
-static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
-{
-	return !!(gfp_flags & __GFP_WAIT);
-}
-
 /* drm_panel stubs to make i915 happy.. I don't think we support any hw
  * using DSI and panel stuff without some work will be unhappy on power
  * or anything else w/ CONFIG_OF..
@@ -333,6 +328,55 @@ static inline int drm_panel_add(struct drm_panel *panel)
 }
 static inline void drm_panel_remove(struct drm_panel *panel) {}
 
+typedef wait_queue_t wait_queue_entry_t;
+#define __add_wait_queue_entry_tail __add_wait_queue_tail
+
+unsigned int swiotlb_max_size(void);
+#define swiotlb_max_segment swiotlb_max_size
+
+#define SLAB_TYPESAFE_BY_RCU SLAB_DESTROY_BY_RCU
+
+#include <linux/fs.h>
+
+static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	return file->f_op->mmap(file, vma);
+}
+
+static inline void mmgrab(struct mm_struct *mm)
+{
+	atomic_inc(&mm->mm_count);
+}
+
+/*
+ * since we just use get_user()/put_user() for unsafe_put_user()
+ * and unsafe_get_user(), these can be no-op
+ */
+#define user_access_begin() do {} while (0)
+#define user_access_end()   do {} while (0)
+
+#define unsafe_put_user(x, ptr, err_label)	\
+do {						\
+	int __pu_err = put_user(x, ptr);	\
+	if (unlikely(__pu_err)) goto err_label;	\
+} while (0)
+
+#define unsafe_get_user(x, ptr, err_label)	\
+do {						\
+	int __gu_err = get_user(x, ptr);	\
+	if (unlikely(__gu_err)) goto err_label;	\
+} while (0)
+
+/*
+ * We don't have the commits in the rhel7 kernel which necessitate
+ * this flag, so it is just zero.  Define it as an enum so if someone
+ * does backport the pci/pm patches, it won't go unnoticed that this
+ * needs to be removed.  See bac2a909a096c9110525c18cbb8ce73c660d5f71
+ * and 4d071c3238987325b9e50e33051a40d1cce311cc upstream.
+ */
+enum {
+	PCI_DEV_FLAGS_NEEDS_RESUME = 0,
+};
 
 int __init drm_backport_init(void);
 void __exit drm_backport_exit(void);

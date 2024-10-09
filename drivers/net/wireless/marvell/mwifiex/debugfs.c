@@ -114,10 +114,13 @@ mwifiex_info_read(struct file *file, char __user *ubuf,
 	if (GET_BSS_ROLE(priv) == MWIFIEX_BSS_ROLE_STA) {
 		p += sprintf(p, "multicast_count=\"%d\"\n",
 			     netdev_mc_count(netdev));
-		p += sprintf(p, "essid=\"%s\"\n", info.ssid.ssid);
+		p += sprintf(p, "essid=\"%.*s\"\n", info.ssid.ssid_len,
+			     info.ssid.ssid);
 		p += sprintf(p, "bssid=\"%pM\"\n", info.bssid);
 		p += sprintf(p, "channel=\"%d\"\n", (int) info.bss_chan);
 		p += sprintf(p, "country_code = \"%s\"\n", info.country_code);
+		p += sprintf(p, "region_code=\"0x%x\"\n",
+			     priv->adapter->region_code);
 
 		netdev_for_each_mc_addr(ha, netdev)
 			p += sprintf(p, "multicast_address[%d]=\"%pM\"\n",
@@ -926,28 +929,17 @@ mwifiex_reset_write(struct file *file,
 	struct mwifiex_private *priv = file->private_data;
 	struct mwifiex_adapter *adapter = priv->adapter;
 	bool result;
-#if 0 /* Not in RHEL */
 	int rc;
 
 	rc = kstrtobool_from_user(ubuf, count, &result);
 	if (rc)
 		return rc;
-#else
-	char cmd;
-
-	if (copy_from_user(&cmd, ubuf, sizeof(cmd)))
-		return -EFAULT;
-	if (strtobool(&cmd, &result))
-		return -EINVAL;
-#endif
 
 	if (!result)
 		return -EINVAL;
 
 	if (adapter->if_ops.card_reset) {
 		dev_info(adapter->dev, "Resetting per request\n");
-		adapter->hw_status = MWIFIEX_HW_STATUS_RESET;
-		mwifiex_cancel_all_pending_cmd(adapter);
 		adapter->if_ops.card_reset(adapter);
 	}
 
@@ -1052,6 +1044,5 @@ mwifiex_debugfs_init(void)
 void
 mwifiex_debugfs_remove(void)
 {
-	if (mwifiex_dfs_dir)
-		debugfs_remove(mwifiex_dfs_dir);
+	debugfs_remove(mwifiex_dfs_dir);
 }

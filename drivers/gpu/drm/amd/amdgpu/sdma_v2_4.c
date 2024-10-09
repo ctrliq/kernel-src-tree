@@ -158,7 +158,7 @@ static int sdma_v2_4_init_microcode(struct amdgpu_device *adev)
 		if (adev->sdma.instance[i].feature_version >= 20)
 			adev->sdma.instance[i].burst_nop = true;
 
-		if (adev->firmware.smu_load) {
+		if (adev->firmware.load_type == AMDGPU_FW_LOAD_SMU) {
 			info = &adev->firmware.ucode[AMDGPU_UCODE_ID_SDMA0 + i];
 			info->ucode_id = AMDGPU_UCODE_ID_SDMA0 + i;
 			info->fw = adev->sdma.instance[i].fw;
@@ -170,9 +170,7 @@ static int sdma_v2_4_init_microcode(struct amdgpu_device *adev)
 
 out:
 	if (err) {
-		printk(KERN_ERR
-		       "sdma_v2_4: Failed to load firmware \"%s\"\n",
-		       fw_name);
+		pr_err("sdma_v2_4: Failed to load firmware \"%s\"\n", fw_name);
 		for (i = 0; i < adev->sdma.num_instances; i++) {
 			release_firmware(adev->sdma.instance[i].fw);
 			adev->sdma.instance[i].fw = NULL;
@@ -564,7 +562,7 @@ static int sdma_v2_4_start(struct amdgpu_device *adev)
 	int r;
 
 	if (!adev->pp_enabled) {
-		if (!adev->firmware.smu_load) {
+		if (adev->firmware.load_type != AMDGPU_FW_LOAD_SMU) {
 			r = sdma_v2_4_load_microcode(adev);
 			if (r)
 				return r;
@@ -701,7 +699,7 @@ static int sdma_v2_4_ring_test_ib(struct amdgpu_ring *ring, long timeout)
 	ib.ptr[7] = SDMA_PKT_HEADER_OP(SDMA_OP_NOP);
 	ib.length_dw = 8;
 
-	r = amdgpu_ib_schedule(ring, 1, &ib, NULL, NULL, &f);
+	r = amdgpu_ib_schedule(ring, 1, &ib, NULL, &f);
 	if (r)
 		goto err1;
 
@@ -800,14 +798,14 @@ static void sdma_v2_4_vm_write_pte(struct amdgpu_ib *ib, uint64_t pe,
  */
 static void sdma_v2_4_vm_set_pte_pde(struct amdgpu_ib *ib, uint64_t pe,
 				     uint64_t addr, unsigned count,
-				     uint32_t incr, uint32_t flags)
+				     uint32_t incr, uint64_t flags)
 {
 	/* for physically contiguous pages (vram) */
 	ib->ptr[ib->length_dw++] = SDMA_PKT_HEADER_OP(SDMA_OP_GEN_PTEPDE);
 	ib->ptr[ib->length_dw++] = lower_32_bits(pe); /* dst addr */
 	ib->ptr[ib->length_dw++] = upper_32_bits(pe);
-	ib->ptr[ib->length_dw++] = flags; /* mask */
-	ib->ptr[ib->length_dw++] = 0;
+	ib->ptr[ib->length_dw++] = lower_32_bits(flags); /* mask */
+	ib->ptr[ib->length_dw++] = upper_32_bits(flags);
 	ib->ptr[ib->length_dw++] = lower_32_bits(addr); /* value */
 	ib->ptr[ib->length_dw++] = upper_32_bits(addr);
 	ib->ptr[ib->length_dw++] = incr; /* increment size */
@@ -923,17 +921,20 @@ static int sdma_v2_4_sw_init(void *handle)
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
 	/* SDMA trap event */
-	r = amdgpu_irq_add_id(adev, 224, &adev->sdma.trap_irq);
+	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 224,
+			      &adev->sdma.trap_irq);
 	if (r)
 		return r;
 
 	/* SDMA Privileged inst */
-	r = amdgpu_irq_add_id(adev, 241, &adev->sdma.illegal_inst_irq);
+	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 241,
+			      &adev->sdma.illegal_inst_irq);
 	if (r)
 		return r;
 
 	/* SDMA Privileged inst */
-	r = amdgpu_irq_add_id(adev, 247, &adev->sdma.illegal_inst_irq);
+	r = amdgpu_irq_add_id(adev, AMDGPU_IH_CLIENTID_LEGACY, 247,
+			      &adev->sdma.illegal_inst_irq);
 	if (r)
 		return r;
 

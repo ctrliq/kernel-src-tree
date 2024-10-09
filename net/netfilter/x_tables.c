@@ -39,6 +39,7 @@ MODULE_AUTHOR("Harald Welte <laforge@netfilter.org>");
 MODULE_DESCRIPTION("{ip,ip6,arp,eb}_tables backend module");
 
 #define SMP_ALIGN(x) (((x) + SMP_CACHE_BYTES-1) & ~(SMP_CACHE_BYTES-1))
+#define XT_PCPU_BLOCK_SIZE 4096
 
 struct compat_delta {
 	unsigned int offset; /* offset in kernel */
@@ -730,17 +731,8 @@ EXPORT_SYMBOL(xt_check_entry_offsets);
  */
 unsigned int *xt_alloc_entry_offsets(unsigned int size)
 {
-	unsigned int *off;
+	return kvmalloc_array(size, sizeof(unsigned int), GFP_KERNEL | __GFP_ZERO);
 
-	off = kcalloc(size, sizeof(unsigned int), GFP_KERNEL | __GFP_NOWARN);
-
-	if (off)
-		return off;
-
-	if (size < (SIZE_MAX / sizeof(unsigned int)))
-		off = vmalloc(size * sizeof(unsigned int));
-
-	return off;
 }
 EXPORT_SYMBOL(xt_alloc_entry_offsets);
 
@@ -1054,7 +1046,7 @@ static int xt_jumpstack_alloc(struct xt_table_info *i)
 
 	size = sizeof(void **) * nr_cpu_ids;
 	if (size > PAGE_SIZE)
-		i->jumpstack = vzalloc(size);
+		i->jumpstack = kvzalloc(size, GFP_KERNEL);
 	else
 		i->jumpstack = kzalloc(size, GFP_KERNEL);
 	if (i->jumpstack == NULL)
@@ -1063,12 +1055,8 @@ static int xt_jumpstack_alloc(struct xt_table_info *i)
 	i->stacksize *= xt_jumpstack_multiplier;
 	size = sizeof(void *) * i->stacksize;
 	for_each_possible_cpu(cpu) {
-		if (size > PAGE_SIZE)
-			i->jumpstack[cpu] = vmalloc_node(size,
-				cpu_to_node(cpu));
-		else
-			i->jumpstack[cpu] = kmalloc_node(size,
-				GFP_KERNEL, cpu_to_node(cpu));
+		i->jumpstack[cpu] = kvmalloc_node(size, GFP_KERNEL,
+			cpu_to_node(cpu));
 		if (i->jumpstack[cpu] == NULL)
 			/*
 			 * Freeing will be done later on by the callers. The
@@ -1639,6 +1627,59 @@ void xt_proto_fini(struct net *net, u_int8_t af)
 #endif /*CONFIG_PROC_FS*/
 }
 EXPORT_SYMBOL_GPL(xt_proto_fini);
+
+/**
+ * xt_percpu_counter_alloc - allocate x_tables rule counter
+ *
+ * @state: pointer to xt_percpu allocation state
+ * @counter: pointer to counter struct inside the ip(6)/arpt_entry struct
+ *
+ * On SMP, the packet counter [ ip(6)t_entry->counters.pcnt ] will then
+ * contain the address of the real (percpu) counter.
+ *
+ * Rule evaluation needs to use xt_get_this_cpu_counter() helper
+ * to fetch the real percpu counter.
+ *
+ * To speed up allocation and improve data locality, a 4kb block is
+ * allocated.
+ *
+ * xt_percpu_counter_alloc_state contains the base address of the
+ * allocated page and the current sub-offset.
+ *
+ * returns false on error.
+ */
+bool xt_percpu_counter_alloc(struct xt_percpu_counter_alloc_state *state,
+			     struct xt_counters *counter)
+{
+	BUILD_BUG_ON(XT_PCPU_BLOCK_SIZE < (sizeof(*counter) * 2));
+
+	if (nr_cpu_ids <= 1)
+		return true;
+
+	if (!state->mem) {
+		state->mem = __alloc_percpu(XT_PCPU_BLOCK_SIZE,
+					    XT_PCPU_BLOCK_SIZE);
+		if (!state->mem)
+			return false;
+	}
+	counter->pcnt = (__force unsigned long)(state->mem + state->off);
+	state->off += sizeof(*counter);
+	if (state->off > (XT_PCPU_BLOCK_SIZE - sizeof(*counter))) {
+		state->mem = NULL;
+		state->off = 0;
+	}
+	return true;
+}
+EXPORT_SYMBOL_GPL(xt_percpu_counter_alloc);
+
+void xt_percpu_counter_free(struct xt_counters *counters)
+{
+	unsigned long pcnt = counters->pcnt;
+
+	if (nr_cpu_ids > 1 && (pcnt & (XT_PCPU_BLOCK_SIZE - 1)) == 0)
+		free_percpu((void __percpu *)pcnt);
+}
+EXPORT_SYMBOL_GPL(xt_percpu_counter_free);
 
 static int __net_init xt_net_init(struct net *net)
 {

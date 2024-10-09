@@ -967,6 +967,10 @@ static int smack_inode_getsecurity(const struct inode *inode,
 	int ilen;
 	int rc = 0;
 
+	ilen = cap_inode_getsecurity(inode, name, buffer, alloc);
+	if (ilen != -EOPNOTSUPP)
+		return ilen;
+
 	if (strcmp(name, XATTR_SMACK_SUFFIX) == 0) {
 		isp = smk_of_inode(inode);
 		ilen = strlen(isp) + 1;

@@ -12,6 +12,7 @@
 #include "blk.h"
 #include "blk-cgroup.h"
 #include "blk-mq.h"
+#include "blk-mq-debugfs.h"
 
 struct queue_sysfs_entry {
 	struct attribute attr;
@@ -540,14 +541,19 @@ static void blk_release_queue(struct kobject *kobj)
 	struct request_queue *q =
 		container_of(kobj, struct request_queue, kobj);
 
+	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags))
+		blk_stat_remove_callback(q, q->poll_cb);
+	blk_stat_free_callback(q->poll_cb);
 	blkcg_exit_queue(q);
 
 	if (q->elevator) {
 		spin_lock_irq(q->queue_lock);
 		ioc_clear_queue(q);
 		spin_unlock_irq(q->queue_lock);
-		elevator_exit(q->elevator);
+		elevator_exit(q, q->elevator);
 	}
+
+	blk_free_queue_stats(q->stats);
 
 	blk_exit_rl(&q->root_rl);
 
@@ -560,6 +566,9 @@ static void blk_release_queue(struct kobject *kobj)
 		blk_mq_release(q);
 
 	blk_trace_shutdown(q);
+
+	if (q->mq_ops)
+		blk_mq_debugfs_unregister(q);
 
 	bdi_destroy(&q->backing_dev_info);
 
@@ -578,6 +587,10 @@ struct kobj_type blk_queue_ktype = {
 	.release	= blk_release_queue,
 };
 
+/**
+ * blk_register_queue - register a block layer queue with sysfs
+ * @disk: Disk of which the request queue should be registered with sysfs.
+ */
 int blk_register_queue(struct gendisk *disk)
 {
 	int ret;
@@ -586,6 +599,11 @@ int blk_register_queue(struct gendisk *disk)
 
 	if (WARN_ON(!q))
 		return -ENXIO;
+
+	WARN_ONCE(test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags),
+		  "%s is registering an already registered queue\n",
+		  kobject_name(&dev->kobj));
+	queue_flag_set_unlocked(QUEUE_FLAG_REGISTERED, q);
 
 	/*
 	 * SCSI probing may synchronously create and destroy a lot of
@@ -610,20 +628,26 @@ int blk_register_queue(struct gendisk *disk)
 	if (ret)
 		return ret;
 
+	/* Prevent changes through sysfs until registration is completed. */
+	mutex_lock(&q->sysfs_lock);
+
 	ret = kobject_add(&q->kobj, kobject_get(&dev->kobj), "%s", "queue");
 	if (ret < 0) {
 		blk_trace_remove_sysfs(dev);
-		return ret;
+		goto unlock;
 	}
 
-	kobject_uevent(&q->kobj, KOBJ_ADD);
-
 	if (q->mq_ops)
-		blk_mq_register_dev(dev, q);
+		__blk_mq_register_dev(dev, q);
+
+	blk_mq_debugfs_register(q);
+
+	kobject_uevent(&q->kobj, KOBJ_ADD);
 
 	if (q->request_fn || (q->mq_ops && q->elevator)) {
 		ret = elv_register_queue(q);
 		if (ret) {
+			mutex_unlock(&q->sysfs_lock);
 			kobject_uevent(&q->kobj, KOBJ_REMOVE);
 			kobject_del(&q->kobj);
 			blk_trace_remove_sysfs(dev);
@@ -631,10 +655,20 @@ int blk_register_queue(struct gendisk *disk)
 			return ret;
 		}
 	}
-
-	return 0;
+	ret = 0;
+unlock:
+	mutex_unlock(&q->sysfs_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(blk_register_queue);
 
+/**
+ * blk_unregister_queue - counterpart of blk_register_queue()
+ * @disk: Disk of which the request queue should be unregistered from sysfs.
+ *
+ * Note: the caller is responsible for guaranteeing that this function is called
+ * after blk_register_queue() has finished.
+ */
 void blk_unregister_queue(struct gendisk *disk)
 {
 	struct request_queue *q = disk->queue;
@@ -642,14 +676,37 @@ void blk_unregister_queue(struct gendisk *disk)
 	if (WARN_ON(!q))
 		return;
 
+	/* Return early if disk->queue was never registered. */
+	if (!test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags))
+		return;
+
+	/*
+	 * Since sysfs_remove_dir() prevents adding new directory entries
+	 * before removal of existing entries starts, protect against
+	 * concurrent elv_iosched_store() calls.
+	 */
+	mutex_lock(&q->sysfs_lock);
+
+	spin_lock_irq(q->queue_lock);
+	queue_flag_clear(QUEUE_FLAG_REGISTERED, q);
+	spin_unlock_irq(q->queue_lock);
+
+	/*
+	 * Remove the sysfs attributes before unregistering the queue data
+	 * structures that can be modified through sysfs.
+	 */
 	if (q->mq_ops)
 		blk_mq_unregister_dev(disk_to_dev(disk), q);
-
-	if (q->request_fn || (q->mq_ops && q->elevator))
-		elv_unregister_queue(q);
+	mutex_unlock(&q->sysfs_lock);
 
 	kobject_uevent(&q->kobj, KOBJ_REMOVE);
 	kobject_del(&q->kobj);
 	blk_trace_remove_sysfs(disk_to_dev(disk));
+
+	mutex_lock(&q->sysfs_lock);
+	if (q->request_fn || (q->mq_ops && q->elevator))
+		elv_unregister_queue(q);
+	mutex_unlock(&q->sysfs_lock);
+
 	kobject_put(&disk_to_dev(disk)->kobj);
 }

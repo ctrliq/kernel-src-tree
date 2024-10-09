@@ -32,6 +32,12 @@ extern int pmdp_set_access_flags(struct vm_area_struct *vma,
 				 pmd_t entry, int dirty);
 #endif
 
+#ifndef __HAVE_ARCH_PUDP_SET_ACCESS_FLAGS
+extern int pudp_set_access_flags(struct vm_area_struct *vma,
+				 unsigned long address, pud_t *pudp,
+				 pud_t entry, int dirty);
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
 static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
 					    unsigned long address,
@@ -93,8 +99,8 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 }
 #endif
 
-#ifndef __HAVE_ARCH_PMDP_GET_AND_CLEAR
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#ifndef __HAVE_ARCH_PMDP_GET_AND_CLEAR
 static inline pmd_t pmdp_get_and_clear(struct mm_struct *mm,
 				       unsigned long address,
 				       pmd_t *pmdp)
@@ -103,8 +109,18 @@ static inline pmd_t pmdp_get_and_clear(struct mm_struct *mm,
 	pmd_clear(pmdp);
 	return pmd;
 }
+#endif /* __HAVE_ARCH_PMDP_GET_AND_CLEAR */
+#ifndef __HAVE_ARCH_PUDP_GET_AND_CLEAR
+static inline pud_t pudp_get_and_clear(struct mm_struct *mm,
+				       unsigned long address,
+				       pud_t *pudp)
+{
+	pud_t pud = *pudp;
+	pud_clear(pudp);
+	return pud;
+}
+#endif /* __HAVE_ARCH_PUDP_GET_AND_CLEAR */
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
-#endif
 
 #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
 static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
@@ -144,6 +160,12 @@ extern pmd_t pmdp_clear_flush(struct vm_area_struct *vma,
 			      pmd_t *pmdp);
 #endif
 
+#ifndef __HAVE_ARCH_PUDP_CLEAR_FLUSH
+extern pud_t pudp_clear_flush(struct vm_area_struct *vma,
+			      unsigned long address,
+			      pud_t *pudp);
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_SET_WRPROTECT
 struct mm_struct;
 static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long address, pte_t *ptep)
@@ -168,6 +190,24 @@ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
 	BUG();
 }
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
+#ifndef __HAVE_ARCH_PUDP_SET_WRPROTECT
+#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+static inline void pudp_set_wrprotect(struct mm_struct *mm,
+				      unsigned long address, pud_t *pudp)
+{
+	pud_t old_pud = *pudp;
+
+	set_pud_at(mm, address, pudp, pud_wrprotect(old_pud));
+}
+#else
+static inline void pudp_set_wrprotect(struct mm_struct *mm,
+				      unsigned long address, pud_t *pudp)
+{
+	BUILD_BUG();
+}
+#endif /* CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD */
 #endif
 
 #ifndef __HAVE_ARCH_PMDP_SPLITTING_FLUSH
@@ -202,10 +242,21 @@ static inline int pmd_same(pmd_t pmd_a, pmd_t pmd_b)
 {
 	return pmd_val(pmd_a) == pmd_val(pmd_b);
 }
+
+static inline int pud_same(pud_t pud_a, pud_t pud_b)
+{
+	return pud_val(pud_a) == pud_val(pud_b);
+}
 #else /* CONFIG_TRANSPARENT_HUGEPAGE */
 static inline int pmd_same(pmd_t pmd_a, pmd_t pmd_b)
 {
-	BUG();
+	BUILD_BUG();
+	return 0;
+}
+
+static inline int pud_same(pud_t pud_a, pud_t pud_b)
+{
+	BUILD_BUG();
 	return 0;
 }
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
@@ -377,6 +428,18 @@ static inline void ptep_modify_prot_commit(struct mm_struct *mm,
 }
 #endif /* __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION */
 #endif /* CONFIG_MMU */
+
+/*
+ * No-op macros that just return the current protection value. Defined here
+ * because these macros can be used used even if CONFIG_MMU is not defined.
+ */
+#ifndef pgprot_encrypted
+#define pgprot_encrypted(prot)	(prot)
+#endif
+
+#ifndef pgprot_decrypted
+#define pgprot_decrypted(prot)	(prot)
+#endif
 
 /*
  * A facility to provide lazy MMU batching.  This allows PTE updates and
@@ -566,6 +629,14 @@ static inline int pmd_trans_splitting(pmd_t pmd)
 {
 	return 0;
 }
+static inline int pud_trans_huge(pud_t pud)
+{
+	return 0;
+}
+static inline int pud_trans_splitting(pud_t pud)
+{
+	return 0;
+}
 #ifndef __HAVE_ARCH_PMD_WRITE
 static inline int pmd_write(pmd_t pmd)
 {
@@ -573,7 +644,23 @@ static inline int pmd_write(pmd_t pmd)
 	return 0;
 }
 #endif /* __HAVE_ARCH_PMD_WRITE */
+#ifndef __HAVE_ARCH_PUD_WRITE
+static inline int pud_write(pud_t pud)
+{
+	BUG();
+	return 0;
+}
+#endif /* __HAVE_ARCH_PUD_WRITE */
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+
+#if !defined(CONFIG_TRANSPARENT_HUGEPAGE) || \
+	(defined(CONFIG_TRANSPARENT_HUGEPAGE) && \
+	 !defined(CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD))
+static inline int pud_trans_huge(pud_t pud)
+{
+	return 0;
+}
+#endif
 
 #ifndef pmd_read_atomic
 static inline pmd_t pmd_read_atomic(pmd_t *pmdp)

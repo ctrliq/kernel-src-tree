@@ -64,6 +64,9 @@
 #include <net/dsa.h>
 #include <net/flow_dissector.h>
 #include <asm/uaccess.h>
+#ifndef __GENKSYMS__
+#include <net/pkt_sched.h>
+#endif
 
 __setup("ether=", netdev_boot_setup);
 
@@ -84,7 +87,7 @@ int eth_header(struct sk_buff *skb, struct net_device *dev,
 	       unsigned short type,
 	       const void *daddr, const void *saddr, unsigned int len)
 {
-	struct ethhdr *eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
+	struct ethhdr *eth = skb_push(skb, ETH_HLEN);
 
 	if (type != ETH_P_802_3 && type != ETH_P_802_2)
 		eth->h_proto = htons(type);
@@ -364,7 +367,12 @@ EXPORT_SYMBOL(eth_mac_addr);
  */
 int eth_change_mtu(struct net_device *dev, int new_mtu)
 {
-	if (new_mtu < 68 || new_mtu > ETH_DATA_LEN)
+	/* RHEL - For newer drivers show deprecation warning and for older
+	 * ones preserve old behavior.
+	 */
+	if (get_ndo_ext(dev->netdev_ops, ndo_change_mtu))
+		netdev_warn(dev, "%s is deprecated\n", __func__);
+	else if (new_mtu < 68 || new_mtu > ETH_DATA_LEN)
 		return -EINVAL;
 	dev->mtu = new_mtu;
 	return 0;
@@ -388,11 +396,22 @@ const struct header_ops eth_header_ops ____cacheline_aligned = {
 	.cache_update	= eth_header_cache_update,
 };
 
+/*
+ * RHEL: The macros ether_setup and alloc_etherdev_mqs need to be undefined
+ * here. For details, please see their definition in include/linux/netdevice.h
+ * and include/linux/etherdevice.h
+ */
+#undef ether_setup
+#undef alloc_etherdev_mqs
+
 /**
  * ether_setup - setup Ethernet network device
  * @dev: network device
  *
  * Fill in the fields of the device structure with Ethernet-generic values.
+ *
+ * RHEL: This function is preserved for existing binary modules compiled
+ * against RHEL-7.4 and older.
  */
 void ether_setup(struct net_device *dev)
 {
@@ -401,7 +420,7 @@ void ether_setup(struct net_device *dev)
 	dev->hard_header_len 	= ETH_HLEN;
 	dev->mtu		= ETH_DATA_LEN;
 	dev->addr_len		= ETH_ALEN;
-	dev->tx_queue_len	= 1000;	/* Ethernet wants good queues */
+	dev->tx_queue_len	= DEFAULT_TX_QUEUE_LEN;
 	dev->flags		= IFF_BROADCAST|IFF_MULTICAST;
 	dev->priv_flags		|= IFF_TX_SKB_SHARING;
 
@@ -411,7 +430,23 @@ void ether_setup(struct net_device *dev)
 EXPORT_SYMBOL(ether_setup);
 
 /**
- * alloc_etherdev_mqs - Allocates and sets up an Ethernet device
+ * ether_setup_rh - setup Ethernet network device
+ * @dev: network device
+ *
+ * Fill in the fields of the device structure with Ethernet-generic values.
+ *
+ * RHEL: This variant also initializes .min_mtu & .max_mtu
+ */
+void ether_setup_rh(struct net_device *dev)
+{
+	ether_setup(dev);
+	dev->extended->min_mtu	= ETH_MIN_MTU;
+	dev->extended->max_mtu	= ETH_DATA_LEN;
+}
+EXPORT_SYMBOL(ether_setup_rh);
+
+/**
+ * alloc_etherdev_mqs_rh - Allocates and sets up an Ethernet device
  * @sizeof_priv: Size of additional driver-private structure to be allocated
  *	for this Ethernet device
  * @txqs: The number of TX queues this device has.
@@ -423,8 +458,23 @@ EXPORT_SYMBOL(ether_setup);
  * Constructs a new net device, complete with a private data area of
  * size (sizeof_priv).  A 32-byte (not bit) alignment is enforced for
  * this private data area.
+ *
+ * RHEL: This function uses ether_setup_rh() that also initializes
+ * .{min,max}_mtu members to their default values.
  */
 
+struct net_device *alloc_etherdev_mqs_rh(int sizeof_priv, unsigned int txqs,
+					 unsigned int rxqs)
+{
+	return alloc_netdev_mqs(sizeof_priv, "eth%d", ether_setup_rh, txqs,
+				rxqs);
+}
+EXPORT_SYMBOL(alloc_etherdev_mqs_rh);
+
+/*
+ * RHEL: This function is preserved for existing binary modules compiled
+ * against RHEL-7.4 and older.
+ */
 struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs,
 				      unsigned int rxqs)
 {

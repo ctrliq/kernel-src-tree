@@ -237,9 +237,6 @@ extern int sysctl_tcp_timestamps;
 extern int sysctl_tcp_window_scaling;
 extern int sysctl_tcp_sack;
 extern int sysctl_tcp_fin_timeout;
-extern int sysctl_tcp_keepalive_time;
-extern int sysctl_tcp_keepalive_probes;
-extern int sysctl_tcp_keepalive_intvl;
 extern int sysctl_tcp_syn_retries;
 extern int sysctl_tcp_synack_retries;
 extern int sysctl_tcp_retries1;
@@ -287,7 +284,7 @@ extern int tcp_memory_pressure;
 static inline bool tcp_under_memory_pressure(const struct sock *sk)
 {
 	if (mem_cgroup_sockets_enabled && sk->sk_cgrp)
-		return !!sk->sk_cgrp->memory_pressure;
+		return *sk->sk_cgrp->memory_pressure;
 
 	return tcp_memory_pressure;
 }
@@ -362,7 +359,7 @@ void tcp_v4_err(struct sk_buff *skb, u32);
 
 void tcp_shutdown (struct sock *sk, int how);
 
-void tcp_v4_early_demux(struct sk_buff *skb);
+int tcp_v4_early_demux(struct sk_buff *skb);
 int tcp_v4_rcv(struct sk_buff *skb);
 
 int tcp_v4_tw_remember_stamp(struct inet_timewait_sock *tw);
@@ -1151,17 +1148,23 @@ void tcp_enter_memory_pressure(struct sock *sk);
 
 static inline int keepalive_intvl_when(const struct tcp_sock *tp)
 {
-	return tp->keepalive_intvl ? : sysctl_tcp_keepalive_intvl;
+	struct net *net = sock_net((struct sock *)tp);
+
+	return tp->keepalive_intvl ? : net->ipv4_sysctl_tcp_keepalive_intvl;
 }
 
 static inline int keepalive_time_when(const struct tcp_sock *tp)
 {
-	return tp->keepalive_time ? : sysctl_tcp_keepalive_time;
+	struct net *net = sock_net((struct sock *)tp);
+
+	return tp->keepalive_time ? : net->ipv4_sysctl_tcp_keepalive_time;
 }
 
 static inline int keepalive_probes(const struct tcp_sock *tp)
 {
-	return tp->keepalive_probes ? : sysctl_tcp_keepalive_probes;
+	struct net *net = sock_net((struct sock *)tp);
+
+	return tp->keepalive_probes ? : net->ipv4_sysctl_tcp_keepalive_probes;
 }
 
 static inline u32 keepalive_time_elapsed(const struct tcp_sock *tp)

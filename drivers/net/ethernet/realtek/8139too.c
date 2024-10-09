@@ -649,9 +649,8 @@ static int rtl8139_poll(struct napi_struct *napi, int budget);
 static irqreturn_t rtl8139_interrupt (int irq, void *dev_instance);
 static int rtl8139_close (struct net_device *dev);
 static int netdev_ioctl (struct net_device *dev, struct ifreq *rq, int cmd);
-static struct rtnl_link_stats64 *rtl8139_get_stats64(struct net_device *dev,
-						    struct rtnl_link_stats64
-						    *stats);
+static void rtl8139_get_stats64(struct net_device *dev,
+				struct rtnl_link_stats64 *stats);
 static void rtl8139_set_rx_mode (struct net_device *dev);
 static void __set_rx_mode (struct net_device *dev);
 static void rtl8139_hw_start (struct net_device *dev);
@@ -922,7 +921,7 @@ static const struct net_device_ops rtl8139_netdev_ops = {
 	.ndo_open		= rtl8139_open,
 	.ndo_stop		= rtl8139_close,
 	.ndo_get_stats64	= rtl8139_get_stats64,
-	.ndo_change_mtu		= eth_change_mtu,
+	.ndo_change_mtu_rh74	= eth_change_mtu,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address 	= rtl8139_set_mac_address,
 	.ndo_start_xmit		= rtl8139_start_xmit,
@@ -2501,7 +2500,7 @@ static int netdev_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 }
 
 
-static struct rtnl_link_stats64 *
+static void
 rtl8139_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct rtl8139_private *tp = netdev_priv(dev);
@@ -2529,8 +2528,6 @@ rtl8139_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 		stats->tx_packets = tp->tx_stats.packets;
 		stats->tx_bytes = tp->tx_stats.bytes;
 	} while (u64_stats_fetch_retry_irq(&tp->tx_stats.syncp, start));
-
-	return stats;
 }
 
 /* Set or clear the multicast filter for this adaptor.

@@ -231,12 +231,6 @@ static int cap_inode_listxattr(struct dentry *dentry)
 	return 0;
 }
 
-static int cap_inode_getsecurity(struct inode *inode, const char *name,
-				 void **buffer, bool alloc)
-{
-	return -EOPNOTSUPP;
-}
-
 static int cap_inode_setsecurity(struct inode *inode, const char *name,
 				 const void *value, size_t size, int flags)
 {
@@ -774,6 +768,27 @@ static void cap_skb_owned_by(struct sk_buff *skb, struct sock *sk)
 
 #endif	/* CONFIG_SECURITY_NETWORK */
 
+#ifdef CONFIG_SECURITY_INFINIBAND
+static int cap_ib_pkey_access(void *sec, u64 subnet_prefix, u16 pkey)
+{
+	return 0;
+}
+
+static int cap_ib_endport_manage_subnet(void *sec, const char *dev_name, u8 port_num)
+{
+	return 0;
+}
+
+static int cap_ib_alloc_security(void **sec)
+{
+	return 0;
+}
+
+static void cap_ib_free_security(void *sec)
+{
+}
+#endif	/* CONFIG_SECURITY_INFINIBAND */
+
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 static int cap_xfrm_policy_alloc_security(struct xfrm_sec_ctx **ctxp,
 					  struct xfrm_user_sec_ctx *sec_ctx)
@@ -1123,6 +1138,12 @@ void __init security_fixup_ops(struct security_operations *ops)
 	set_to_cap_if_null(ops, tun_dev_attach);
 	set_to_cap_if_null(ops, skb_owned_by);
 #endif	/* CONFIG_SECURITY_NETWORK */
+#ifdef CONFIG_SECURITY_INFINIBAND
+	set_to_cap_if_null(ops, ib_pkey_access);
+	set_to_cap_if_null(ops, ib_endport_manage_subnet);
+	set_to_cap_if_null(ops, ib_alloc_security);
+	set_to_cap_if_null(ops, ib_free_security);
+#endif	/* CONFIG_SECURITY_INFINIBAND */
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 	set_to_cap_if_null(ops, xfrm_policy_alloc_security);
 	set_to_cap_if_null(ops, xfrm_policy_clone_security);

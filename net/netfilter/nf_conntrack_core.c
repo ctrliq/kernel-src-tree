@@ -72,6 +72,8 @@ EXPORT_SYMBOL_GPL(nf_conntrack_locks);
 __cacheline_aligned_in_smp DEFINE_SPINLOCK(nf_conntrack_expect_lock);
 EXPORT_SYMBOL_GPL(nf_conntrack_expect_lock);
 
+static __read_mostly seqcount_t nf_conntrack_generation;
+
 static void nf_conntrack_double_unlock(unsigned int h1, unsigned int h2)
 {
 	h1 %= CONNTRACK_LOCKS;
@@ -97,7 +99,7 @@ static bool nf_conntrack_double_lock(struct net *net, unsigned int h1,
 		spin_lock_nested(&nf_conntrack_locks[h1],
 				 SINGLE_DEPTH_NESTING);
 	}
-	if (read_seqcount_retry(&net->ct.generation, sequence)) {
+	if (read_seqcount_retry(&nf_conntrack_generation, sequence)) {
 		nf_conntrack_double_unlock(h1, h2);
 		return true;
 	}
@@ -125,9 +127,6 @@ EXPORT_SYMBOL_GPL(nf_conntrack_htable_size);
 
 unsigned int nf_conntrack_max __read_mostly;
 EXPORT_SYMBOL_GPL(nf_conntrack_max);
-
-DEFINE_PER_CPU(struct nf_conn, nf_conntrack_untracked);
-EXPORT_PER_CPU_SYMBOL(nf_conntrack_untracked);
 
 unsigned int nf_conntrack_hash_rnd __read_mostly;
 EXPORT_SYMBOL_GPL(nf_conntrack_hash_rnd);
@@ -379,7 +378,7 @@ static void nf_ct_delete_from_lists(struct nf_conn *ct)
 
 	local_bh_disable();
 	do {
-		sequence = read_seqcount_begin(&net->ct.generation);
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
 		hash = hash_conntrack(net,
 				      &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
 		reply_hash = hash_conntrack(net,
@@ -472,6 +471,23 @@ nf_ct_key_equal(struct nf_conntrack_tuple_hash *h,
 	       nf_ct_is_confirmed(ct);
 }
 
+/* must be called with rcu read lock held */
+void nf_conntrack_get_ht(struct net *net, struct hlist_nulls_head **hash, unsigned int *hsize)
+{
+	struct hlist_nulls_head *hptr;
+	unsigned int sequence, hsz;
+
+	do {
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
+		hsz = net->ct.htable_size;
+		hptr = net->ct.hash;
+	} while (read_seqcount_retry(&nf_conntrack_generation, sequence));
+
+	*hash = hptr;
+	*hsize = hsz;
+}
+EXPORT_SYMBOL_GPL(nf_conntrack_get_ht);
+
 /*
  * Warning :
  * - Caller must take a reference on returned object
@@ -482,15 +498,22 @@ ____nf_conntrack_find(struct net *net, const struct nf_conntrack_zone *zone,
 		      const struct nf_conntrack_tuple *tuple, u32 hash)
 {
 	struct nf_conntrack_tuple_hash *h;
+	struct hlist_nulls_head *ct_hash;
 	struct hlist_nulls_node *n;
-	unsigned int bucket = hash_bucket(hash, net);
+	unsigned int bucket, sequence;
 
 	/* Disable BHs the entire time since we normally need to disable them
 	 * at least once for the stats anyway.
 	 */
 	local_bh_disable();
 begin:
-	hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[bucket], hnnode) {
+	do {
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
+		bucket = hash_bucket(hash, net);
+		ct_hash = net->ct.hash;
+	} while (read_seqcount_retry(&nf_conntrack_generation, sequence));
+
+	hlist_nulls_for_each_entry_rcu(h, n, &ct_hash[bucket], hnnode) {
 		if (nf_ct_key_equal(h, tuple, zone)) {
 			NF_CT_STAT_INC(net, found);
 			local_bh_enable();
@@ -575,7 +598,7 @@ nf_conntrack_hash_check_insert(struct nf_conn *ct)
 
 	local_bh_disable();
 	do {
-		sequence = read_seqcount_begin(&net->ct.generation);
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
 		hash = hash_conntrack(net,
 				      &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
 		reply_hash = hash_conntrack(net,
@@ -643,7 +666,7 @@ __nf_conntrack_confirm(struct sk_buff *skb)
 	local_bh_disable();
 
 	do {
-		sequence = read_seqcount_begin(&net->ct.generation);
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
 		/* reuse the hash saved before */
 		hash = *(unsigned long *)&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev;
 		hash = hash_bucket(hash, net);
@@ -743,18 +766,24 @@ nf_conntrack_tuple_taken(const struct nf_conntrack_tuple *tuple,
 	struct net *net = nf_ct_net(ignored_conntrack);
 	const struct nf_conntrack_zone *zone;
 	struct nf_conntrack_tuple_hash *h;
+	struct hlist_nulls_head *ct_hash;
+	unsigned int hash, sequence;
 	struct hlist_nulls_node *n;
 	struct nf_conn *ct;
-	unsigned int hash;
 
 	zone = nf_ct_zone(ignored_conntrack);
-	hash = hash_conntrack(net, tuple);
 
 	/* Disable BHs the entire time since we need to disable them at
 	 * least once for the stats anyway.
 	 */
 	rcu_read_lock_bh();
-	hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[hash], hnnode) {
+	do {
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
+		hash = hash_conntrack(net, tuple);
+		ct_hash = net->ct.hash;
+	} while (read_seqcount_retry(&nf_conntrack_generation, sequence));
+
+	hlist_nulls_for_each_entry_rcu(h, n, &ct_hash[hash], hnnode) {
 		ct = nf_ct_tuplehash_to_ctrack(h);
 		if (ct != ignored_conntrack &&
 		    nf_ct_tuple_equal(tuple, &h->tuple) &&
@@ -788,12 +817,12 @@ static noinline int early_drop(struct net *net, unsigned int _hash)
 
 	local_bh_disable();
 restart:
-	sequence = read_seqcount_begin(&net->ct.generation);
+	sequence = read_seqcount_begin(&nf_conntrack_generation);
 	hash = hash_bucket(_hash, net);
 	for (; i < net->ct.htable_size; i++) {
 		lockp = &nf_conntrack_locks[hash % CONNTRACK_LOCKS];
 		spin_lock(lockp);
-		if (read_seqcount_retry(&net->ct.generation, sequence)) {
+		if (read_seqcount_retry(&nf_conntrack_generation, sequence)) {
 			spin_unlock(lockp);
 			goto restart;
 		}
@@ -1113,8 +1142,7 @@ resolve_normal_ct(struct net *net, struct nf_conn *tmpl,
 		}
 		*set_reply = 0;
 	}
-	skb->nfct = &ct->ct_general;
-	skb->nfctinfo = *ctinfo;
+	nf_ct_set(skb, ct, *ctinfo);
 	return ct;
 }
 
@@ -1122,7 +1150,7 @@ unsigned int
 nf_conntrack_in(struct net *net, u_int8_t pf, unsigned int hooknum,
 		struct sk_buff *skb)
 {
-	struct nf_conn *ct, *tmpl = NULL;
+	struct nf_conn *ct, *tmpl;
 	enum ip_conntrack_info ctinfo;
 	struct nf_conntrack_l3proto *l3proto;
 	struct nf_conntrack_l4proto *l4proto;
@@ -1132,10 +1160,11 @@ nf_conntrack_in(struct net *net, u_int8_t pf, unsigned int hooknum,
 	int set_reply = 0;
 	int ret;
 
-	if (skb->nfct) {
+	tmpl = nf_ct_get(skb, &ctinfo);
+	if (tmpl || ctinfo == IP_CT_UNTRACKED) {
 		/* Previously seen (loopback or untracked)?  Ignore. */
-		tmpl = (struct nf_conn *)skb->nfct;
-		if (!nf_ct_is_template(tmpl)) {
+		if ((tmpl && !nf_ct_is_template(tmpl)) ||
+		     ctinfo == IP_CT_UNTRACKED) {
 			NF_CT_STAT_INC_ATOMIC(net, ignore);
 			return NF_ACCEPT;
 		}
@@ -1188,7 +1217,7 @@ nf_conntrack_in(struct net *net, u_int8_t pf, unsigned int hooknum,
 		goto out;
 	}
 
-	NF_CT_ASSERT(skb->nfct);
+	NF_CT_ASSERT(skb_nfct(skb));
 
 	/* Decide what timeout policy we want to apply to this flow. */
 	timeouts = nf_ct_timeout_lookup(net, ct, l4proto);
@@ -1198,7 +1227,7 @@ nf_conntrack_in(struct net *net, u_int8_t pf, unsigned int hooknum,
 		/* Invalid: inverse of the return code tells
 		 * the netfilter core what to do */
 		pr_debug("nf_conntrack_in: Can't track with proto module\n");
-		nf_conntrack_put(skb->nfct);
+		nf_conntrack_put(&ct->ct_general);
 		skb->nfct = NULL;
 		NF_CT_STAT_INC_ATOMIC(net, invalid);
 		if (ret == -NF_DROP)
@@ -1396,9 +1425,8 @@ static void nf_conntrack_attach(struct sk_buff *nskb, const struct sk_buff *skb)
 		ctinfo = IP_CT_RELATED;
 
 	/* Attach to new skbuff, and increment count */
-	nskb->nfct = &ct->ct_general;
-	nskb->nfctinfo = ctinfo;
-	nf_conntrack_get(nskb->nfct);
+	nf_ct_set(nskb, ct, ctinfo);
+	nf_conntrack_get(skb_nfct(nskb));
 }
 
 /* Bring out ya dead! */
@@ -1417,6 +1445,7 @@ get_next_corpse(struct net *net, int (*iter)(struct nf_conn *i, void *data),
 		local_bh_disable();
 		spin_lock(lockp);
 		if (*bucket < net->ct.htable_size) {
+			gmb();
 			hlist_nulls_for_each_entry(h, n, &net->ct.hash[*bucket], hnnode) {
 				if (NF_CT_DIRECTION(h) != IP_CT_DIR_ORIGINAL)
 					continue;
@@ -1508,18 +1537,6 @@ static void nf_ct_release_dying_list(struct net *net)
 	}
 }
 
-static int untrack_refs(void)
-{
-	int cnt = 0, cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct nf_conn *ct = &per_cpu(nf_conntrack_untracked, cpu);
-
-		cnt += atomic_read(&ct->ct_general.use) - 1;
-	}
-	return cnt;
-}
-
 void nf_conntrack_cleanup_start(void)
 {
 	RCU_INIT_POINTER(ip_ct_attach, NULL);
@@ -1528,8 +1545,6 @@ void nf_conntrack_cleanup_start(void)
 void nf_conntrack_cleanup_end(void)
 {
 	RCU_INIT_POINTER(nf_ct_destroy, NULL);
-	while (untrack_refs() > 0)
-		schedule();
 
 #ifdef CONFIG_NF_CONNTRACK_ZONES
 	nf_ct_extend_unregister(&nf_ct_zone_extend);
@@ -1647,7 +1662,7 @@ int nf_conntrack_set_hashsize(const char *val, struct kernel_param *kp)
 
 	local_bh_disable();
 	nf_conntrack_all_lock();
-	write_seqcount_begin(&init_net.ct.generation);
+	write_seqcount_begin(&nf_conntrack_generation);
 
 	/* Lookups in the old hash might happen in parallel, which means we
 	 * might get false negatives during connection lookup. New connections
@@ -1671,10 +1686,11 @@ int nf_conntrack_set_hashsize(const char *val, struct kernel_param *kp)
 	init_net.ct.htable_size = nf_conntrack_htable_size = hashsize;
 	init_net.ct.hash = hash;
 
-	write_seqcount_end(&init_net.ct.generation);
+	write_seqcount_end(&nf_conntrack_generation);
 	nf_conntrack_all_unlock();
 	local_bh_enable();
 
+	synchronize_net();
 	nf_ct_free_hashtable(old_hash, old_size);
 	return 0;
 }
@@ -1683,19 +1699,12 @@ EXPORT_SYMBOL_GPL(nf_conntrack_set_hashsize);
 module_param_call(hashsize, nf_conntrack_set_hashsize, param_get_uint,
 		  &nf_conntrack_htable_size, 0600);
 
-void nf_ct_untracked_status_or(unsigned long bits)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu)
-		per_cpu(nf_conntrack_untracked, cpu).status |= bits;
-}
-EXPORT_SYMBOL_GPL(nf_ct_untracked_status_or);
-
 int nf_conntrack_init_start(void)
 {
 	int max_factor = 8;
-	int i, ret, cpu;
+	int i, ret;
+
+	seqcount_init(&nf_conntrack_generation);
 
 	for (i = 0; i < CONNTRACK_LOCKS; i++)
 		spin_lock_init(&nf_conntrack_locks[i]);
@@ -1769,14 +1778,6 @@ int nf_conntrack_init_start(void)
 	if (ret < 0)
 		goto err_proto;
 
-	/* Set up fake conntrack: to never be deleted, not in any hashes */
-	for_each_possible_cpu(cpu) {
-		struct nf_conn *ct = &per_cpu(nf_conntrack_untracked, cpu);
-		write_pnet(&ct->ct_net, &init_net);
-		atomic_set(&ct->ct_general.use, 1);
-	}
-	/*  - and look it like as a confirmed connection */
-	nf_ct_untracked_status_or(IPS_CONFIRMED | IPS_UNTRACKED);
 	return 0;
 
 err_proto:
@@ -1822,8 +1823,8 @@ int nf_conntrack_init_net(struct net *net)
 	int ret = -ENOMEM;
 	int cpu;
 
+	BUILD_BUG_ON(IP_CT_UNTRACKED == IP_CT_NUMBER);
 	atomic_set(&net->ct.count, 0);
-	seqcount_init(&net->ct.generation);
 
 	net->ct.pcpu_lists = alloc_percpu(struct ct_pcpu);
 	if (!net->ct.pcpu_lists)

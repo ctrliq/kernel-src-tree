@@ -176,7 +176,7 @@ struct ipath_pd {
 /* Address Handle */
 struct ipath_ah {
 	struct ib_ah ibah;
-	struct ib_ah_attr attr;
+	struct rdma_ah_attr attr;
 };
 
 /*
@@ -367,7 +367,7 @@ struct ipath_qp {
 	struct ipath_qp *pio_next;	/* link for ipath_ib_piobufavail() */
 	struct list_head piowait;	/* link for wait PIO buf */
 	struct list_head timerwait;	/* link for waiting for timeouts */
-	struct ib_ah_attr remote_ah_attr;
+	struct rdma_ah_attr remote_ah_attr;
 	struct ipath_ib_header s_hdr;	/* next packet header to send */
 	atomic_t refcount;
 	wait_queue_head_t wait;

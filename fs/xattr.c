@@ -338,12 +338,9 @@ setxattr(struct dentry *d, const char __user *name, const void __user *value,
 	if (size) {
 		if (size > XATTR_SIZE_MAX)
 			return -E2BIG;
-		kvalue = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
-		if (!kvalue) {
-			kvalue = vmalloc(size);
-			if (!kvalue)
-				return -ENOMEM;
-		}
+		kvalue = kvmalloc(size, GFP_KERNEL);
+		if (!kvalue)
+			return -ENOMEM;
 		if (copy_from_user(kvalue, value, size)) {
 			error = -EFAULT;
 			goto out;
@@ -351,6 +348,12 @@ setxattr(struct dentry *d, const char __user *name, const void __user *value,
 		if ((strcmp(kname, XATTR_NAME_POSIX_ACL_ACCESS) == 0) ||
 		    (strcmp(kname, XATTR_NAME_POSIX_ACL_DEFAULT) == 0))
 			posix_acl_fix_xattr_from_user(kvalue, size);
+		else if (strcmp(kname, XATTR_NAME_CAPS) == 0) {
+			error = cap_convert_nscap(d, &kvalue, size);
+			if (error < 0)
+				goto out;
+			size = error;
+		}
 	}
 
 	error = vfs_setxattr(d, kname, kvalue, size, flags);
@@ -448,12 +451,9 @@ getxattr(struct dentry *d, const char __user *name, void __user *value,
 	if (size) {
 		if (size > XATTR_SIZE_MAX)
 			size = XATTR_SIZE_MAX;
-		kvalue = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
-		if (!kvalue) {
-			kvalue = vzalloc(size);
-			if (!kvalue)
-				return -ENOMEM;
-		}
+		kvalue = kvzalloc(size, GFP_KERNEL);
+		if (!kvalue)
+			return -ENOMEM;
 	}
 
 	error = vfs_getxattr(d, kname, kvalue, size);
@@ -538,12 +538,9 @@ listxattr(struct dentry *d, char __user *list, size_t size)
 	if (size) {
 		if (size > XATTR_LIST_MAX)
 			size = XATTR_LIST_MAX;
-		klist = kmalloc(size, __GFP_NOWARN | GFP_KERNEL);
-		if (!klist) {
-			klist = vmalloc(size);
-			if (!klist)
-				return -ENOMEM;
-		}
+		klist = kvmalloc(size, GFP_KERNEL);
+		if (!klist)
+			return -ENOMEM;
 	}
 
 	error = vfs_listxattr(d, klist, size);

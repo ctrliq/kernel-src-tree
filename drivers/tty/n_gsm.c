@@ -2727,7 +2727,7 @@ static void gsm_mux_net_init(struct net_device *net)
 		.ndo_start_xmit		= gsm_mux_net_start_xmit,
 		.ndo_tx_timeout		= gsm_mux_net_tx_timeout,
 		.ndo_get_stats		= gsm_mux_net_get_stats,
-		.ndo_change_mtu		= gsm_change_mtu,
+		.ndo_change_mtu_rh74	= gsm_change_mtu,
 	};
 
 	net->netdev_ops = &gsm_netdev_ops;

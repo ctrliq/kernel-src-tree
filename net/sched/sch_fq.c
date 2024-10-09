@@ -367,18 +367,19 @@ static void flow_queue_add(struct fq_flow *flow, struct sk_buff *skb)
 	}
 }
 
-static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+		      struct sk_buff **to_free)
 {
 	struct fq_sched_data *q = qdisc_priv(sch);
 	struct fq_flow *f;
 
 	if (unlikely(sch->q.qlen >= sch->limit))
-		return qdisc_drop(skb, sch);
+		return qdisc_drop(skb, sch, to_free);
 
 	f = fq_classify(skb, q);
 	if (unlikely(f->qlen >= q->flow_plimit && f != &q->internal)) {
 		q->stat_flows_plimit++;
-		return qdisc_drop(skb, sch);
+		return qdisc_drop(skb, sch, to_free);
 	}
 
 	f->qlen++;
@@ -622,10 +623,7 @@ static void fq_rehash(struct fq_sched_data *q,
 
 static void fq_free(void *addr)
 {
-	if (addr && is_vmalloc_addr(addr))
-		vfree(addr);
-	else
-		kfree(addr);
+	kvfree(addr);
 }
 
 static int fq_resize(struct Qdisc *sch, u32 log)

@@ -9,6 +9,9 @@
 #include <net/udp.h>
 #include <net/udp_tunnel.h>
 
+static void __udp_tunnel_pull_rx_port(struct net_device *dev,
+				      struct udp_tunnel_info *ti);
+
 int udp_sock_create4(struct net *net, struct udp_port_cfg *cfg,
 		     struct socket **sockp)
 {
@@ -81,6 +84,9 @@ EXPORT_SYMBOL_GPL(setup_udp_tunnel_sock);
 static void __udp_tunnel_push_rx_port(struct net_device *dev,
 				      struct udp_tunnel_info *ti)
 {
+	if (!(dev->features & NETIF_F_RX_UDP_TUNNEL_PORT))
+		return;
+
 	if (get_ndo_ext(dev->netdev_ops, ndo_udp_tunnel_add)) {
 		get_ndo_ext(dev->netdev_ops, ndo_udp_tunnel_add)(dev, ti);
 		return;
@@ -122,6 +128,20 @@ void udp_tunnel_push_rx_port(struct net_device *dev, struct socket *sock,
 }
 EXPORT_SYMBOL_GPL(udp_tunnel_push_rx_port);
 
+void udp_tunnel_drop_rx_port(struct net_device *dev, struct socket *sock,
+			     unsigned short type)
+{
+	struct sock *sk = sock->sk;
+	struct udp_tunnel_info ti;
+
+	ti.type = type;
+	ti.sa_family = sk->sk_family;
+	ti.port = inet_sk(sk)->inet_sport;
+
+	__udp_tunnel_pull_rx_port(dev, &ti);
+}
+EXPORT_SYMBOL_GPL(udp_tunnel_drop_rx_port);
+
 /* Notify netdevs that UDP port started listening */
 void udp_tunnel_notify_add_rx_port(struct socket *sock, unsigned short type)
 {
@@ -144,6 +164,9 @@ EXPORT_SYMBOL_GPL(udp_tunnel_notify_add_rx_port);
 static void __udp_tunnel_pull_rx_port(struct net_device *dev,
 				      struct udp_tunnel_info *ti)
 {
+	if (!(dev->features & NETIF_F_RX_UDP_TUNNEL_PORT))
+		return;
+
 	if (get_ndo_ext(dev->netdev_ops, ndo_udp_tunnel_del)) {
 		get_ndo_ext(dev->netdev_ops, ndo_udp_tunnel_del)(dev, ti);
 		return;

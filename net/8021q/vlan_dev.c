@@ -90,7 +90,7 @@ static int vlan_dev_hard_header(struct sk_buff *skb, struct net_device *dev,
 	int rc;
 
 	if (!(vlan->flags & VLAN_FLAG_REORDER_HDR)) {
-		vhdr = (struct vlan_hdr *) skb_push(skb, VLAN_HLEN);
+		vhdr = skb_push(skb, VLAN_HLEN);
 
 		vlan_tci = vlan->vlan_id;
 		vlan_tci |= vlan_dev_get_egress_qos_mask(dev, skb->priority);
@@ -682,7 +682,8 @@ static void vlan_ethtool_get_drvinfo(struct net_device *dev,
 	strlcpy(info->fw_version, "N/A", sizeof(info->fw_version));
 }
 
-static struct rtnl_link_stats64 *vlan_dev_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+static void vlan_dev_get_stats64(struct net_device *dev,
+				 struct rtnl_link_stats64 *stats)
 {
 
 	if (vlan_dev_priv(dev)->vlan_pcpu_stats) {
@@ -716,7 +717,6 @@ static struct rtnl_link_stats64 *vlan_dev_get_stats64(struct net_device *dev, st
 		stats->rx_errors  = rx_errors;
 		stats->tx_dropped = tx_dropped;
 	}
-	return stats;
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -779,7 +779,7 @@ static const struct ethtool_ops vlan_ethtool_ops = {
 
 static const struct net_device_ops vlan_netdev_ops = {
 	.ndo_size		= sizeof(struct net_device_ops),
-	.ndo_change_mtu		= vlan_dev_change_mtu,
+	.ndo_change_mtu_rh74	= vlan_dev_change_mtu,
 	.ndo_init		= vlan_dev_init,
 	.ndo_uninit		= vlan_dev_uninit,
 	.ndo_open		= vlan_dev_open,
@@ -826,7 +826,7 @@ void vlan_setup(struct net_device *dev)
 	netif_keep_dst(dev);
 
 	dev->netdev_ops		= &vlan_netdev_ops;
-	dev->destructor		= free_netdev;
+	dev->extended->needs_free_netdev	= true;
 	dev->ethtool_ops	= &vlan_ethtool_ops;
 
 	memset(dev->broadcast, 0, ETH_ALEN);

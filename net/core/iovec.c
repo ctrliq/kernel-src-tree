@@ -150,6 +150,41 @@ int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 }
 EXPORT_SYMBOL(memcpy_fromiovecend);
 
+#ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
+int memcpy_fromiovecend_partial_flushcache(unsigned char *kdata,
+				const struct iovec *iov, int offset, int len)
+{
+	int orig_len = len;
+
+	/* Skip over the finished iovecs */
+	while (offset >= iov->iov_len) {
+		offset -= iov->iov_len;
+		iov++;
+	}
+
+	while (len > 0) {
+		u8 __user *base = iov->iov_base + offset;
+		int copy = min_t(unsigned int, len, iov->iov_len - offset);
+
+		offset = 0;
+		if (__copy_from_user_flushcache(kdata, base, copy))
+			return orig_len - len;
+		len -= copy;
+		kdata += copy;
+		iov++;
+	}
+
+	return orig_len - len;
+}
+#else
+int memcpy_fromiovecend_partial_flushcache(unsigned char *kdata,
+				const struct iovec *iov, int offset, int len)
+{
+	return memcpy_fromiovecend_partial_nocache(kdata, iov, offset, len);
+}
+#endif
+EXPORT_SYMBOL(memcpy_fromiovecend_partial_flushcache);
+
 int memcpy_fromiovecend_partial_nocache(unsigned char *kdata,
 				const struct iovec *iov, int offset, int len)
 {

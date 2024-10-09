@@ -2677,7 +2677,7 @@ static inline void sky2_rx_done(struct sky2_hw *hw, unsigned port,
 	sky2->rx_stats.bytes += bytes;
 	u64_stats_update_end(&sky2->rx_stats.syncp);
 
-	dev->last_rx = jiffies;
+	sky2->last_rx = jiffies;
 	sky2_rx_update(netdev_priv(dev), rxqaddr[port]);
 }
 
@@ -2961,7 +2961,7 @@ static int sky2_rx_hung(struct net_device *dev)
 	u8 fifo_lev = sky2_read8(hw, Q_ADDR(rxq, Q_RL));
 
 	/* If idle and MAC or PCI is stuck */
-	if (sky2->check.last == dev->last_rx &&
+	if (sky2->check.last == sky2->last_rx &&
 	    ((mac_rp == sky2->check.mac_rp &&
 	      mac_lev != 0 && mac_lev >= sky2->check.mac_lev) ||
 	     /* Check if the PCI RX hang */
@@ -2973,7 +2973,7 @@ static int sky2_rx_hung(struct net_device *dev)
 			      fifo_rp, sky2_read8(hw, Q_ADDR(rxq, Q_WP)));
 		return 1;
 	} else {
-		sky2->check.last = dev->last_rx;
+		sky2->check.last = sky2->last_rx;
 		sky2->check.mac_rp = mac_rp;
 		sky2->check.mac_lev = mac_lev;
 		sky2->check.fifo_rp = fifo_rp;
@@ -3896,8 +3896,8 @@ static void sky2_set_multicast(struct net_device *dev)
 	gma_write16(hw, port, GM_RX_CTRL, reg);
 }
 
-static struct rtnl_link_stats64 *sky2_get_stats(struct net_device *dev,
-						struct rtnl_link_stats64 *stats)
+static void sky2_get_stats(struct net_device *dev,
+			   struct rtnl_link_stats64 *stats)
 {
 	struct sky2_port *sky2 = netdev_priv(dev);
 	struct sky2_hw *hw = sky2->hw;
@@ -3937,8 +3937,6 @@ static struct rtnl_link_stats64 *sky2_get_stats(struct net_device *dev,
 	stats->rx_dropped = dev->stats.rx_dropped;
 	stats->rx_fifo_errors = dev->stats.rx_fifo_errors;
 	stats->tx_fifo_errors = dev->stats.tx_fifo_errors;
-
-	return stats;
 }
 
 /* Can have one global because blinking is controlled by
@@ -4717,7 +4715,7 @@ static const struct net_device_ops sky2_netdev_ops[2] = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= sky2_set_mac_address,
 	.ndo_set_rx_mode	= sky2_set_multicast,
-	.ndo_change_mtu		= sky2_change_mtu,
+	.ndo_change_mtu_rh74	= sky2_change_mtu,
 	.ndo_fix_features	= sky2_fix_features,
 	.ndo_set_features	= sky2_set_features,
 	.ndo_tx_timeout		= sky2_tx_timeout,
@@ -4734,7 +4732,7 @@ static const struct net_device_ops sky2_netdev_ops[2] = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= sky2_set_mac_address,
 	.ndo_set_rx_mode	= sky2_set_multicast,
-	.ndo_change_mtu		= sky2_change_mtu,
+	.ndo_change_mtu_rh74	= sky2_change_mtu,
 	.ndo_fix_features	= sky2_fix_features,
 	.ndo_set_features	= sky2_set_features,
 	.ndo_tx_timeout		= sky2_tx_timeout,

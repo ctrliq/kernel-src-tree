@@ -218,7 +218,6 @@ static void free_cmd(struct mlx5_cmd_work_ent *ent)
 	kfree(ent);
 }
 
-
 static int verify_signature(struct mlx5_cmd_work_ent *ent)
 {
 	struct mlx5_cmd_mailbox *next = ent->out->next;
@@ -309,6 +308,7 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_SET_FLOW_TABLE_ROOT:
 	case MLX5_CMD_OP_DEALLOC_ENCAP_HEADER:
 	case MLX5_CMD_OP_DEALLOC_MODIFY_HEADER_CONTEXT:
+	case MLX5_CMD_OP_FPGA_DESTROY_QP:
 		return MLX5_CMD_STAT_OK;
 
 	case MLX5_CMD_OP_QUERY_HCA_CAP:
@@ -421,6 +421,10 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_QUERY_FLOW_COUNTER:
 	case MLX5_CMD_OP_ALLOC_ENCAP_HEADER:
 	case MLX5_CMD_OP_ALLOC_MODIFY_HEADER_CONTEXT:
+	case MLX5_CMD_OP_FPGA_CREATE_QP:
+	case MLX5_CMD_OP_FPGA_MODIFY_QP:
+	case MLX5_CMD_OP_FPGA_QUERY_QP:
+	case MLX5_CMD_OP_FPGA_QUERY_QP_COUNTERS:
 		*status = MLX5_DRIVER_STATUS_ABORTED;
 		*synd = MLX5_DRIVER_SYND;
 		return -EIO;
@@ -587,6 +591,11 @@ const char *mlx5_command_str(int command)
 	MLX5_COMMAND_STR_CASE(DEALLOC_ENCAP_HEADER);
 	MLX5_COMMAND_STR_CASE(ALLOC_MODIFY_HEADER_CONTEXT);
 	MLX5_COMMAND_STR_CASE(DEALLOC_MODIFY_HEADER_CONTEXT);
+	MLX5_COMMAND_STR_CASE(FPGA_CREATE_QP);
+	MLX5_COMMAND_STR_CASE(FPGA_MODIFY_QP);
+	MLX5_COMMAND_STR_CASE(FPGA_QUERY_QP);
+	MLX5_COMMAND_STR_CASE(FPGA_QUERY_QP_COUNTERS);
+	MLX5_COMMAND_STR_CASE(FPGA_DESTROY_QP);
 	default: return "unknown command opcode";
 	}
 }
@@ -778,6 +787,10 @@ static void cb_timeout_handler(struct work_struct *work)
 	mlx5_cmd_comp_handler(dev, 1UL << ent->idx, true);
 }
 
+static void free_msg(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *msg);
+static void mlx5_free_cmd_msg(struct mlx5_core_dev *dev,
+			      struct mlx5_cmd_msg *msg);
+
 static void cmd_work_handler(struct work_struct *work)
 {
 	struct mlx5_cmd_work_ent *ent = container_of(work, struct mlx5_cmd_work_ent, work);
@@ -787,18 +800,27 @@ static void cmd_work_handler(struct work_struct *work)
 	struct mlx5_cmd_layout *lay;
 	struct semaphore *sem;
 	unsigned long flags;
-	bool poll_cmd = ent->polling;
-
+	int alloc_ret;
 
 	sem = ent->page_queue ? &cmd->pages_sem : &cmd->sem;
 	down(sem);
 	if (!ent->page_queue) {
-		ent->idx = alloc_ent(cmd);
-		if (ent->idx < 0) {
+		alloc_ret = alloc_ent(cmd);
+		if (alloc_ret < 0) {
 			mlx5_core_err(dev, "failed to allocate command entry\n");
+			if (ent->callback) {
+				ent->callback(-EAGAIN, ent->context);
+				mlx5_free_cmd_msg(dev, ent->out);
+				free_msg(dev, ent->in);
+				free_cmd(ent);
+			} else {
+				ent->ret = -EAGAIN;
+				complete(&ent->done);
+			}
 			up(sem);
 			return;
 		}
+		ent->idx = alloc_ret;
 	} else {
 		ent->idx = cmd->max_reg_cmds;
 		spin_lock_irqsave(&cmd->alloc_lock, flags);
@@ -849,7 +871,7 @@ static void cmd_work_handler(struct work_struct *work)
 	iowrite32be(1 << ent->idx, &dev->iseg->cmd_dbell);
 	mmiowb();
 	/* if not in polling don't use ent after this point */
-	if (cmd->mode == CMD_MODE_POLLING || poll_cmd) {
+	if (cmd->mode == CMD_MODE_POLLING) {
 		poll_timeout(ent);
 		/* make sure we read the descriptor after ownership is SW */
 		rmb();
@@ -877,7 +899,7 @@ static const char *deliv_status_to_str(u8 status)
 	case MLX5_CMD_DELIVERY_STAT_IN_LENGTH_ERR:
 		return "command input length error";
 	case MLX5_CMD_DELIVERY_STAT_OUT_LENGTH_ERR:
-		return "command ouput length error";
+		return "command output length error";
 	case MLX5_CMD_DELIVERY_STAT_RES_FLD_NOT_CLR_ERR:
 		return "reserved fields not cleared";
 	case MLX5_CMD_DELIVERY_STAT_CMD_DESCR_ERR:
@@ -893,7 +915,7 @@ static int wait_func(struct mlx5_core_dev *dev, struct mlx5_cmd_work_ent *ent)
 	struct mlx5_cmd *cmd = &dev->cmd;
 	int err;
 
-	if (cmd->mode == CMD_MODE_POLLING || ent->polling) {
+	if (cmd->mode == CMD_MODE_POLLING) {
 		wait_for_completion(&ent->done);
 	} else if (!wait_for_completion_timeout(&ent->done, timeout)) {
 		ent->ret = -ETIMEDOUT;
@@ -921,7 +943,7 @@ static int mlx5_cmd_invoke(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *in,
 			   struct mlx5_cmd_msg *out, void *uout, int uout_size,
 			   mlx5_cmd_cbk_t callback,
 			   void *context, int page_queue, u8 *status,
-			   u8 token, bool force_polling)
+			   u8 token)
 {
 	struct mlx5_cmd *cmd = &dev->cmd;
 	struct mlx5_cmd_work_ent *ent;
@@ -939,7 +961,6 @@ static int mlx5_cmd_invoke(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *in,
 		return PTR_ERR(ent);
 
 	ent->token = token;
-	ent->polling = force_polling;
 
 	if (!callback)
 		init_completion(&ent->done);
@@ -1004,7 +1025,6 @@ static ssize_t dbg_write(struct file *filp, const char __user *buf,
 
 	return err ? err : count;
 }
-
 
 static const struct file_operations fops = {
 	.owner	= THIS_MODULE,
@@ -1157,7 +1177,7 @@ err_alloc:
 }
 
 static void mlx5_free_cmd_msg(struct mlx5_core_dev *dev,
-				  struct mlx5_cmd_msg *msg)
+			      struct mlx5_cmd_msg *msg)
 {
 	struct mlx5_cmd_mailbox *head = msg->next;
 	struct mlx5_cmd_mailbox *next;
@@ -1543,8 +1563,7 @@ static int is_manage_pages(void *in)
 }
 
 static int cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
-		    int out_size, mlx5_cmd_cbk_t callback, void *context,
-		    bool force_polling)
+		    int out_size, mlx5_cmd_cbk_t callback, void *context)
 {
 	struct mlx5_cmd_msg *inb;
 	struct mlx5_cmd_msg *outb;
@@ -1589,7 +1608,7 @@ static int cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
 	}
 
 	err = mlx5_cmd_invoke(dev, inb, outb, out, out_size, callback, context,
-			      pages_queue, &status, token, force_polling);
+			      pages_queue, &status, token);
 	if (err)
 		goto out_out;
 
@@ -1617,7 +1636,7 @@ int mlx5_cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
 {
 	int err;
 
-	err = cmd_exec(dev, in, in_size, out, out_size, NULL, NULL, false);
+	err = cmd_exec(dev, in, in_size, out, out_size, NULL, NULL);
 	return err ? : mlx5_cmd_check(dev, in, out);
 }
 EXPORT_SYMBOL(mlx5_cmd_exec);
@@ -1626,21 +1645,9 @@ int mlx5_cmd_exec_cb(struct mlx5_core_dev *dev, void *in, int in_size,
 		     void *out, int out_size, mlx5_cmd_cbk_t callback,
 		     void *context)
 {
-	return cmd_exec(dev, in, in_size, out, out_size, callback, context,
-			false);
+	return cmd_exec(dev, in, in_size, out, out_size, callback, context);
 }
 EXPORT_SYMBOL(mlx5_cmd_exec_cb);
-
-int mlx5_cmd_exec_polling(struct mlx5_core_dev *dev, void *in, int in_size,
-			  void *out, int out_size)
-{
-	int err;
-
-	err = cmd_exec(dev, in, in_size, out, out_size, NULL, NULL, true);
-
-	return err ? : mlx5_cmd_check(dev, in, out);
-}
-EXPORT_SYMBOL(mlx5_cmd_exec_polling);
 
 static void destroy_msg_cache(struct mlx5_core_dev *dev)
 {

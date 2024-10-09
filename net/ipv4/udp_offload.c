@@ -303,8 +303,6 @@ unflush:
 	}
 
 out_unlock:
-	if (sk)
-		sock_put(sk);
 	rcu_read_unlock();
 out:
 	NAPI_GRO_CB(skb)->flush |= flush;
@@ -360,8 +358,6 @@ int udp_gro_complete(struct sk_buff *skb, int nhoff,
 		err = udp_sk(sk)->gro_complete(sk, skb,
 				nhoff + sizeof(struct udphdr));
 	rcu_read_unlock();
-	if (sk)
-		sock_put(sk);
 
 	return err;
 }

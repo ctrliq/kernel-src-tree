@@ -43,6 +43,7 @@
 #include <linux/ctype.h>
 #include <linux/types.h>
 #include <linux/err.h>
+#include <linux/sizes.h>
 
 #ifndef NFP_SUBSYS
 #define NFP_SUBSYS "nfp"
@@ -60,6 +61,8 @@
 #define PCI_64BIT_BAR_COUNT             3
 
 #define NFP_CPP_NUM_TARGETS             16
+/* Max size of area it should be safe to request */
+#define NFP_CPP_SAFE_AREA_SIZE		SZ_2M
 
 /* NFP_MUTEX_WAIT_* are timeouts in seconds when waiting for a mutex */
 #define NFP_MUTEX_WAIT_FIRST_WARN	15
@@ -220,13 +223,6 @@ u32 nfp_cpp_model(struct nfp_cpp *cpp);
 u16 nfp_cpp_interface(struct nfp_cpp *cpp);
 int nfp_cpp_serial(struct nfp_cpp *cpp, const u8 **serial);
 
-void *nfp_hwinfo_cache(struct nfp_cpp *cpp);
-void nfp_hwinfo_cache_set(struct nfp_cpp *cpp, void *val);
-void *nfp_rtsym_cache(struct nfp_cpp *cpp);
-void nfp_rtsym_cache_set(struct nfp_cpp *cpp, void *val);
-
-void nfp_nffw_cache_flush(struct nfp_cpp *cpp);
-
 struct nfp_cpp_area *nfp_cpp_area_alloc_with_name(struct nfp_cpp *cpp,
 						  u32 cpp_id,
 						  const char *name,
@@ -235,6 +231,9 @@ struct nfp_cpp_area *nfp_cpp_area_alloc_with_name(struct nfp_cpp *cpp,
 struct nfp_cpp_area *nfp_cpp_area_alloc(struct nfp_cpp *cpp, u32 cpp_id,
 					unsigned long long address,
 					unsigned long size);
+struct nfp_cpp_area *
+nfp_cpp_area_alloc_acquire(struct nfp_cpp *cpp, const char *name, u32 cpp_id,
+			   unsigned long long address, unsigned long size);
 void nfp_cpp_area_free(struct nfp_cpp_area *area);
 int nfp_cpp_area_acquire(struct nfp_cpp_area *area);
 int nfp_cpp_area_acquire_nonblocking(struct nfp_cpp_area *area);
@@ -280,6 +279,10 @@ int nfp_cpp_readq(struct nfp_cpp *cpp, u32 cpp_id,
 		  unsigned long long address, u64 *value);
 int nfp_cpp_writeq(struct nfp_cpp *cpp, u32 cpp_id,
 		   unsigned long long address, u64 value);
+
+u8 __iomem *
+nfp_cpp_map_area(struct nfp_cpp *cpp, const char *name, int domain, int target,
+		 u64 addr, unsigned long size, struct nfp_cpp_area **area);
 
 struct nfp_cpp_mutex;
 

@@ -316,17 +316,6 @@ done:
 }
 EXPORT_SYMBOL(queued_spin_unlock_wait);
 #endif
-
-/*
- * Enable paravirt_ticketlocks_enabled call sites patching.
- */
-static int __init queued_enable_pv_ticketlock(void)
-{
-	static_key_slow_inc(&paravirt_ticketlocks_enabled);
-	return 0;
-}
-pure_initcall(queued_enable_pv_ticketlock);
-
 #endif /* _GEN_PV_LOCK_SLOWPATH */
 
 /**

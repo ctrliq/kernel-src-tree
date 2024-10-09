@@ -146,9 +146,10 @@ static int ceph_set_acl(struct dentry *dentry, struct inode *inode,
 	}
 
 	if (new_mode != old_mode) {
+		newattrs.ia_ctime = current_fs_time(inode->i_sb);
 		newattrs.ia_mode = new_mode;
 		newattrs.ia_valid = ATTR_MODE;
-		ret = ceph_setattr(dentry, &newattrs);
+		ret = __ceph_setattr(dentry, &newattrs);
 		if (ret)
 			goto out_free;
 	}
@@ -158,7 +159,7 @@ static int ceph_set_acl(struct dentry *dentry, struct inode *inode,
 		if (new_mode != old_mode) {
 			newattrs.ia_mode = old_mode;
 			newattrs.ia_valid = ATTR_MODE;
-			ceph_setattr(dentry, &newattrs);
+			__ceph_setattr(dentry, &newattrs);
 		}
 		goto out_free;
 	}

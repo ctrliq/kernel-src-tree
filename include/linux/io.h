@@ -73,6 +73,8 @@ void __iomem *devm_ioremap(struct device *dev, resource_size_t offset,
 			    unsigned long size);
 void __iomem *devm_ioremap_nocache(struct device *dev, resource_size_t offset,
 				    unsigned long size);
+void __iomem *devm_ioremap_wc(struct device *dev, resource_size_t offset,
+				   resource_size_t size);
 void devm_iounmap(struct device *dev, void __iomem *addr);
 int check_signature(const volatile void __iomem *io_addr,
 			const unsigned char *signature, int length);
@@ -122,6 +124,9 @@ enum {
 	/* See memremap() kernel-doc for usage description... */
 	MEMREMAP_WB = 1 << 0,
 	MEMREMAP_WT = 1 << 1,
+	MEMREMAP_WC = 1 << 2,
+	MEMREMAP_ENC = 1 << 3,
+	MEMREMAP_DEC = 1 << 4,
 };
 
 void *memremap(resource_size_t offset, size_t size, unsigned long flags);

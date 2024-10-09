@@ -162,7 +162,7 @@ static void exynos4_mct_frc_start(u32 hi, u32 lo)
 	exynos4_mct_write(reg, EXYNOS4_MCT_G_TCON);
 }
 
-static cycle_t exynos4_frc_read(struct clocksource *cs)
+static u64 exynos4_frc_read(struct clocksource *cs)
 {
 	unsigned int lo, hi;
 	u32 hi2 = __raw_readl(reg_base + EXYNOS4_MCT_G_CNT_U);
@@ -173,7 +173,7 @@ static cycle_t exynos4_frc_read(struct clocksource *cs)
 		hi2 = __raw_readl(reg_base + EXYNOS4_MCT_G_CNT_U);
 	} while (hi != hi2);
 
-	return ((cycle_t)hi << 32) | lo;
+	return ((u64)hi << 32) | lo;
 }
 
 static void exynos4_frc_resume(struct clocksource *cs)
@@ -213,7 +213,7 @@ static void exynos4_mct_comp0_start(enum clock_event_mode mode,
 				    unsigned long cycles)
 {
 	unsigned int tcon;
-	cycle_t comp_cycle;
+	u64 comp_cycle;
 
 	tcon = __raw_readl(reg_base + EXYNOS4_MCT_G_TCON);
 

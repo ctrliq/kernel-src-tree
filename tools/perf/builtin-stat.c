@@ -64,20 +64,29 @@
 #include "util/session.h"
 #include "util/tool.h"
 #include "util/group.h"
+#include "util/string2.h"
 #include "asm/bug.h"
 
 #include <linux/time64.h>
 #include <api/fs/fs.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
+#include <inttypes.h>
 #include <locale.h>
 #include <math.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "sane_ctype.h"
 
 #define DEFAULT_SEPARATOR	" "
 #define CNTR_NOT_SUPPORTED	"<not supported>"
 #define CNTR_NOT_COUNTED	"<not counted>"
+#define FREEZE_ON_SMI_PATH	"devices/cpu/freeze_on_smi"
 
 static void print_counters(struct timespec *ts, int argc, const char **argv);
 
@@ -114,6 +123,14 @@ static const char * topdown_attrs[] = {
 	NULL,
 };
 
+static const char *smi_cost_attrs = {
+	"{"
+	"msr/aperf/,"
+	"msr/smi/,"
+	"cycles"
+	"}"
+};
+
 static struct perf_evlist	*evsel_list;
 
 static struct target target = {
@@ -129,6 +146,8 @@ static bool			null_run			=  false;
 static int			detailed_run			=  0;
 static bool			transaction_run;
 static bool			topdown_run			= false;
+static bool			smi_cost			= false;
+static bool			smi_reset			= false;
 static bool			big_num				=  true;
 static int			big_num_opt			=  -1;
 static const char		*csv_sep			= NULL;
@@ -142,6 +161,7 @@ static unsigned int		unit_width			= 4; /* strlen("unit") */
 static bool			forever				= false;
 static bool			metric_only			= false;
 static bool			force_metric_only		= false;
+static bool			no_merge			= false;
 static struct timespec		ref_time;
 static struct cpu_map		*aggr_map;
 static aggr_get_id_t		aggr_get_id;
@@ -582,7 +602,7 @@ try_again:
 			if (errno == EINVAL || errno == ENOSYS ||
 			    errno == ENOENT || errno == EOPNOTSUPP ||
 			    errno == ENXIO) {
-				if (verbose)
+				if (verbose > 0)
 					ui__warning("%s event is not supported by the kernel.\n",
 						    perf_evsel__name(counter));
 				counter->supported = false;
@@ -591,7 +611,7 @@ try_again:
 				    !(counter->leader->nr_members > 1))
 					continue;
 			} else if (perf_evsel__fallback(counter, errno, msg, sizeof(msg))) {
-                                if (verbose)
+                                if (verbose > 0)
                                         ui__warning("%s\n", msg);
                                 goto try_again;
                         }
@@ -1146,6 +1166,7 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
 	out.print_metric = pm;
 	out.new_line = nl;
 	out.ctx = &os;
+	out.force_header = false;
 
 	if (csv_output && !metric_only) {
 		print_noise(counter, noise);
@@ -1184,12 +1205,37 @@ static void aggr_update_shadow(void)
 	}
 }
 
-static void collect_data(struct perf_evsel *counter,
+static void collect_all_aliases(struct perf_evsel *counter,
 			    void (*cb)(struct perf_evsel *counter, void *data,
 				       bool first),
 			    void *data)
 {
+	struct perf_evsel *alias;
+
+	alias = list_prepare_entry(counter, &(evsel_list->entries), node);
+	list_for_each_entry_continue (alias, &evsel_list->entries, node) {
+		if (strcmp(perf_evsel__name(alias), perf_evsel__name(counter)) ||
+		    alias->scale != counter->scale ||
+		    alias->cgrp != counter->cgrp ||
+		    strcmp(alias->unit, counter->unit) ||
+		    nsec_counter(alias) != nsec_counter(counter))
+			break;
+		alias->merged_stat = true;
+		cb(alias, data, false);
+	}
+}
+
+static bool collect_data(struct perf_evsel *counter,
+			    void (*cb)(struct perf_evsel *counter, void *data,
+				       bool first),
+			    void *data)
+{
+	if (counter->merged_stat)
+		return false;
 	cb(counter, data, true);
+	if (!no_merge)
+		collect_all_aliases(counter, cb, data);
+	return true;
 }
 
 struct aggr_data {
@@ -1257,7 +1303,8 @@ static void print_aggr(char *prefix)
 		evlist__for_each_entry(evsel_list, counter) {
 			ad.val = ad.ena = ad.run = 0;
 			ad.nr = 0;
-			collect_data(counter, aggr_cb, &ad);
+			if (!collect_data(counter, aggr_cb, &ad))
+				continue;
 			nr = ad.nr;
 			ena = ad.ena;
 			run = ad.run;
@@ -1330,7 +1377,8 @@ static void print_counter_aggr(struct perf_evsel *counter, char *prefix)
 	double uval;
 	struct caggr_data cd = { .avg = 0.0 };
 
-	collect_data(counter, counter_aggr_cb, &cd);
+	if (!collect_data(counter, counter_aggr_cb, &cd))
+		return;
 
 	if (prefix && !metric_only)
 		fprintf(output, "%s", prefix);
@@ -1365,7 +1413,8 @@ static void print_counter(struct perf_evsel *counter, char *prefix)
 	for (cpu = 0; cpu < perf_evsel__nr_cpus(counter); cpu++) {
 		struct aggr_data ad = { .cpu = cpu };
 
-		collect_data(counter, counter_cb, &ad);
+		if (!collect_data(counter, counter_cb, &ad))
+			return;
 		val = ad.val;
 		ena = ad.ena;
 		run = ad.run;
@@ -1453,6 +1502,7 @@ static void print_metric_headers(const char *prefix, bool no_indent)
 		out.ctx = &os;
 		out.print_metric = print_metric_header;
 		out.new_line = new_line_metric;
+		out.force_header = true;
 		os.evsel = counter;
 		perf_stat__print_shadow_stats(counter, 0,
 					      0,
@@ -1716,6 +1766,7 @@ static const struct option stat_options[] = {
 		    "list of cpus to monitor in system-wide"),
 	OPT_SET_UINT('A', "no-aggr", &stat_config.aggr_mode,
 		    "disable CPU count aggregation", AGGR_NONE),
+	OPT_BOOLEAN(0, "no-merge", &no_merge, "Do not merge identical named events"),
 	OPT_STRING('x', "field-separator", &csv_sep, "separator",
 		   "print counts with custom separator"),
 	OPT_CALLBACK('G', "cgroup", &evsel_list, "name",
@@ -1742,6 +1793,8 @@ static const struct option stat_options[] = {
 			"Only print computed metrics. No raw values", enable_metric_only),
 	OPT_BOOLEAN(0, "topdown", &topdown_run,
 			"measure topdown level 1 statistics"),
+	OPT_BOOLEAN(0, "smi-cost", &smi_cost,
+			"measure SMI cost"),
 	OPT_END()
 };
 
@@ -2120,6 +2173,39 @@ static int add_default_attributes(void)
 		return 0;
 	}
 
+	if (smi_cost) {
+		int smi;
+
+		if (sysfs__read_int(FREEZE_ON_SMI_PATH, &smi) < 0) {
+			fprintf(stderr, "freeze_on_smi is not supported.\n");
+			return -1;
+		}
+
+		if (!smi) {
+			if (sysfs__write_int(FREEZE_ON_SMI_PATH, 1) < 0) {
+				fprintf(stderr, "Failed to set freeze_on_smi.\n");
+				return -1;
+			}
+			smi_reset = true;
+		}
+
+		if (pmu_have_event("msr", "aperf") &&
+		    pmu_have_event("msr", "smi")) {
+			if (!force_metric_only)
+				metric_only = true;
+			err = parse_events(evsel_list, smi_cost_attrs, NULL);
+		} else {
+			fprintf(stderr, "To measure SMI cost, it needs "
+				"msr/aperf/, msr/smi/ and cpu/cycles/ support\n");
+			return -1;
+		}
+		if (err) {
+			fprintf(stderr, "Cannot set up SMI cost events\n");
+			return -1;
+		}
+		return 0;
+	}
+
 	if (topdown_run) {
 		char *str = NULL;
 		bool warn = false;
@@ -2473,6 +2559,7 @@ int cmd_stat(int argc, const char **argv)
 	argc = parse_options_subcommand(argc, argv, stat_options, stat_subcommands,
 					(const char **) stat_usage,
 					PARSE_OPT_STOP_AT_NON_OPTION);
+	perf_stat__collect_metric_expr(evsel_list);
 	perf_stat__init_shadow_stats();
 
 	if (csv_sep) {
@@ -2649,7 +2736,7 @@ int cmd_stat(int argc, const char **argv)
 
 	status = 0;
 	for (run_idx = 0; forever || run_idx < run_count; run_idx++) {
-		if (run_count != 1 && verbose)
+		if (run_count != 1 && verbose > 0)
 			fprintf(output, "[ perf stat: executing run #%d ... ]\n",
 				run_idx + 1);
 
@@ -2701,6 +2788,9 @@ int cmd_stat(int argc, const char **argv)
 	perf_stat__exit_aggr_mode();
 	perf_evlist__free_stats(evsel_list);
 out:
+	if (smi_cost && smi_reset)
+		sysfs__write_int(FREEZE_ON_SMI_PATH, 0);
+
 	perf_evlist__delete(evsel_list);
 	return status;
 }

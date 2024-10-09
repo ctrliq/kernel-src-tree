@@ -53,6 +53,9 @@
 #define MAC_ERROR_BIT		0
 #define CHK_MAC_ERR_BIT(x)	(((x) >> MAC_ERROR_BIT) & 1)
 #define MAX_SALT                4
+#define WR_MIN_LEN (sizeof(struct chcr_wr) + \
+		    sizeof(struct cpl_rx_phys_dsgl) + \
+		    sizeof(struct ulptx_sgl))
 
 #define padap(dev) pci_get_drvdata(dev->u_ctx->lldi.pdev)
 
@@ -74,9 +77,7 @@ struct chcr_wr {
 };
 
 struct chcr_dev {
-	/* Request submited to h/w and waiting for response. */
 	spinlock_t lock_chcr_dev;
-	struct crypto_queue pending_queue;
 	struct uld_ctx *u_ctx;
 	unsigned char tx_channel_id;
 	unsigned char rx_channel_id;

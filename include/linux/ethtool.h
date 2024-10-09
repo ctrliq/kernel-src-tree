@@ -394,8 +394,10 @@ struct ethtool_ops {
 					      struct ethtool_link_ksettings *))
 	RH_KABI_USE_P(9, int	(*set_link_ksettings)(struct net_device *,
 				      const struct ethtool_link_ksettings *))
-	RH_KABI_RESERVE_P(10)
-	RH_KABI_RESERVE_P(11)
+	RH_KABI_USE_P(10,int	(*get_fecparam)(struct net_device *,
+				      struct ethtool_fecparam *))
+	RH_KABI_USE_P(11,int	(*set_fecparam)(struct net_device *,
+				      struct ethtool_fecparam *))
 	RH_KABI_RESERVE_P(12)
 	RH_KABI_RESERVE_P(13)
 	RH_KABI_RESERVE_P(14)

@@ -303,7 +303,7 @@ static void irqsoff_print_header(struct seq_file *s)
 /*
  * Should this new latency be reported/recorded?
  */
-static int report_latency(struct trace_array *tr, cycle_t delta)
+static int report_latency(struct trace_array *tr, u64 delta)
 {
 	if (tracing_thresh) {
 		if (delta < tracing_thresh)
@@ -321,7 +321,7 @@ check_critical_timing(struct trace_array *tr,
 		      unsigned long parent_ip,
 		      int cpu)
 {
-	cycle_t T0, T1, delta;
+	u64 T0, T1, delta;
 	unsigned long flags;
 	int pc;
 

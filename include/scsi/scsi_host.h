@@ -446,9 +446,6 @@ struct scsi_host_template {
 	 */
 	unsigned char present;
 
-	/* If use block layer to manage tags, this is tag allocation policy */
-	int tag_alloc_policy;
-
 	/*
 	 * This specifies the mode that a LLD supports.
 	 */
@@ -545,7 +542,8 @@ struct scsi_host_template {
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserve ABI.
 	 */
-	RH_KABI_RESERVE_P(1)
+	/* If use block layer to manage tags, this is tag allocation policy */
+	RH_KABI_USE_P(1, int tag_alloc_policy)
 	RH_KABI_RESERVE_P(2)
 	RH_KABI_RESERVE_P(3)
 	RH_KABI_RESERVE_P(4)

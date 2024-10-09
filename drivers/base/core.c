@@ -652,6 +652,23 @@ void device_remove_file(struct device *dev,
 }
 
 /**
+ * device_remove_file_self - remove sysfs attribute file from its own method.
+ * @dev: device.
+ * @attr: device attribute descriptor.
+ *
+ * See kernfs_remove_self() for details.
+ */
+bool device_remove_file_self(struct device *dev,
+			     const struct device_attribute *attr)
+{
+	if (dev)
+		return sysfs_remove_file_self(&dev->kobj, &attr->attr);
+	else
+		return false;
+}
+EXPORT_SYMBOL_GPL(device_remove_file_self);
+
+/**
  * device_create_bin_file - create sysfs binary attribute file for device.
  * @dev: device.
  * @attr: device binary attribute descriptor.
@@ -750,6 +767,12 @@ static void klist_children_put(struct klist_node *n)
  */
 void device_initialize(struct device *dev)
 {
+	/* many platform-like devices or abstracted devices that don't
+	 * use acpi, of, or pci invoke device_initialize()
+	 * and not device_register() or device_add().
+	 */
+	if (!dev->device_rh)
+		device_rh_alloc(dev);
 	dev->kobj.kset = devices_kset;
 	kobject_init(&dev->kobj, &device_ktype);
 	INIT_LIST_HEAD(&dev->dma_pools);
@@ -1978,6 +2001,7 @@ EXPORT_SYMBOL_GPL(device_destroy);
  */
 int device_rename(struct device *dev, const char *new_name)
 {
+	struct kobject *kobj = &dev->kobj;
 	char *old_device_name = NULL;
 	int error;
 
@@ -1995,13 +2019,14 @@ int device_rename(struct device *dev, const char *new_name)
 	}
 
 	if (dev->class) {
-		error = sysfs_rename_link(&dev->class->p->subsys.kobj,
-			&dev->kobj, old_device_name, new_name);
+		error = sysfs_rename_link_ns(&dev->class->p->subsys.kobj,
+					     kobj, old_device_name,
+					     new_name, kobject_namespace(kobj));
 		if (error)
 			goto out;
 	}
 
-	error = kobject_rename(&dev->kobj, new_name);
+	error = kobject_rename(kobj, new_name);
 	if (error)
 		goto out;
 
@@ -2149,10 +2174,10 @@ void device_shutdown(void)
 		pm_runtime_get_noresume(dev);
 		pm_runtime_barrier(dev);
 
-		if (dev->class && dev->class->shutdown_pre) {
+		if (dev->device_rh && dev->device_rh->class_shutdown_pre) {
 			if (initcall_debug)
 				dev_info(dev, "shutdown_pre\n");
-			dev->class->shutdown_pre(dev);
+			dev->device_rh->class_shutdown_pre(dev);
 		}
 		if (dev->bus && dev->bus->shutdown) {
 			if (initcall_debug)

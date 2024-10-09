@@ -116,7 +116,7 @@ struct md_rdev {
 					   */
 	struct work_struct del_work;	/* used for delayed sysfs removal */
 
-	struct sysfs_dirent *sysfs_state; /* handle for 'state'
+	struct kernfs_node *sysfs_state; /* handle for 'state'
 					   * sysfs entry */
 
 	struct badblocks badblocks;
@@ -220,6 +220,7 @@ extern int rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 				int is_new);
 struct md_cluster_info;
 
+/* change UNSUPPORTED_MDDEV_FLAGS for each array type if new flag is added */
 enum mddev_sb_flags {
 	MD_SB_CHANGE_DEVS,		/* Some device status has changed */
 	MD_SB_CHANGE_CLEAN,	/* transition to or from 'clean' */
@@ -258,6 +259,13 @@ struct mddev {
 	struct kobject			kobj;
 	int				hold_active;
 #define MD_HAS_PPL 9           /* The raid array has PPL feature set */
+#define MD_HAS_MULTIPLE_PPLS 10 /* The raid array has multiple PPLs feature set */
+#define MD_ALLOW_SB_UPDATE 11   /* md_check_recovery is allowed to update
+				 * the metadata without taking reconfig_mutex.
+				 */
+#define MD_UPDATING_SB 12       /* md_check_recovery is updating the metadata
+				 * without explicitly holding reconfig_mutex.
+				 */
 #define	UNTIL_IOCTL	1
 #define	UNTIL_STOP	2
 
@@ -406,10 +414,10 @@ struct mddev {
 	sector_t			resync_max;	/* resync should pause
 							 * when it gets here */
 
-	struct sysfs_dirent		*sysfs_state;	/* handle for 'array_state'
+	struct kernfs_node		*sysfs_state;	/* handle for 'array_state'
 							 * file in sysfs.
 							 */
-	struct sysfs_dirent		*sysfs_action;  /* handle for 'sync_action' */
+	struct kernfs_node		*sysfs_action;  /* handle for 'sync_action' */
 
 	struct work_struct del_work;	/* used for delayed sysfs removal */
 
@@ -433,7 +441,8 @@ struct mddev {
 							 */
 	unsigned int			safemode_delay;
 	struct timer_list		safemode_timer;
-	atomic_t			writes_pending;
+	struct percpu_ref		writes_pending;
+	int				sync_checkers;	/* # of threads checking writes_pending */
 	struct request_queue		*queue;	/* for plugging ... */
 
 	struct bitmap			*bitmap; /* the bitmap for the device */
@@ -563,13 +572,13 @@ struct md_sysfs_entry {
 };
 extern struct attribute_group md_bitmap_group;
 
-static inline struct sysfs_dirent *sysfs_get_dirent_safe(struct sysfs_dirent *sd, char *name)
+static inline struct kernfs_node *sysfs_get_dirent_safe(struct kernfs_node *sd, char *name)
 {
 	if (sd)
-		return sysfs_get_dirent(sd, NULL, name);
+		return sysfs_get_dirent(sd, name);
 	return sd;
 }
-static inline void sysfs_notify_dirent_safe(struct sysfs_dirent *sd)
+static inline void sysfs_notify_dirent_safe(struct kernfs_node *sd)
 {
 	if (sd)
 		sysfs_notify_dirent(sd);
@@ -649,7 +658,9 @@ extern void md_unregister_thread(struct md_thread **threadp);
 extern void md_wakeup_thread(struct md_thread *thread);
 extern void md_check_recovery(struct mddev *mddev);
 extern void md_reap_sync_thread(struct mddev *mddev);
+extern int mddev_init_writes_pending(struct mddev *mddev);
 extern bool md_write_start(struct mddev *mddev, struct bio *bi);
+extern void md_write_inc(struct mddev *mddev, struct bio *bi);
 extern void md_write_end(struct mddev *mddev);
 extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
 extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
@@ -664,7 +675,7 @@ extern int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
 			struct page *page, int rw, bool metadata_op);
 extern void md_do_sync(struct md_thread *thread);
 extern void md_new_event(struct mddev *mddev);
-extern int md_allow_write(struct mddev *mddev);
+extern void md_allow_write(struct mddev *mddev);
 extern void md_wait_for_blocked_rdev(struct md_rdev *rdev, struct mddev *mddev);
 extern void md_set_array_sectors(struct mddev *mddev, sector_t array_sectors);
 extern int md_check_no_bitmap(struct mddev *mddev);
@@ -679,6 +690,7 @@ extern void md_stop_writes(struct mddev *mddev);
 extern int md_rdev_init(struct md_rdev *rdev);
 extern void md_rdev_clear(struct md_rdev *rdev);
 
+extern void md_handle_request(struct mddev *mddev, struct bio *bio);
 extern void mddev_suspend(struct mddev *mddev);
 extern void mddev_resume(struct mddev *mddev);
 extern struct bio *bio_clone_mddev(struct bio *bio, gfp_t gfp_mask,
@@ -705,4 +717,10 @@ static inline void rdev_dec_pending(struct md_rdev *rdev, struct mddev *mddev)
 	}
 }
 
+/* clear unsupported mddev_flags */
+static inline void mddev_clear_unsupported_flags(struct mddev *mddev,
+	unsigned long unsupported_flags)
+{
+	mddev->flags &= ~unsupported_flags;
+}
 #endif /* _MD_MD_H */

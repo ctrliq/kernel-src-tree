@@ -911,8 +911,8 @@ static int virtnet_set_mac_address(struct net_device *dev, void *p)
 	return 0;
 }
 
-static struct rtnl_link_stats64 *virtnet_stats(struct net_device *dev,
-					       struct rtnl_link_stats64 *tot)
+static void virtnet_stats(struct net_device *dev,
+			  struct rtnl_link_stats64 *tot)
 {
 	struct virtnet_info *vi = netdev_priv(dev);
 	int cpu;
@@ -945,8 +945,6 @@ static struct rtnl_link_stats64 *virtnet_stats(struct net_device *dev,
 	tot->rx_dropped = dev->stats.rx_dropped;
 	tot->rx_length_errors = dev->stats.rx_length_errors;
 	tot->rx_frame_errors = dev->stats.rx_frame_errors;
-
-	return tot;
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -1259,19 +1257,6 @@ static const struct ethtool_ops virtnet_ethtool_ops = {
 	.get_channels = virtnet_get_channels,
 };
 
-#define MIN_MTU 68
-#define MAX_MTU 65535
-
-static int virtnet_change_mtu(struct net_device *dev, int new_mtu)
-{
-	struct virtnet_info *vi = netdev_priv(dev);
-
-	if (new_mtu < MIN_MTU || new_mtu > vi->max_mtu)
-		return -EINVAL;
-	dev->mtu = new_mtu;
-	return 0;
-}
-
 /* To avoid contending a lock hold by a vcpu who would exit to host, select the
  * txq based on the processor id.
  */
@@ -1302,7 +1287,6 @@ static const struct net_device_ops virtnet_netdev = {
 	.ndo_validate_addr   = eth_validate_addr,
 	.ndo_set_mac_address = virtnet_set_mac_address,
 	.ndo_set_rx_mode     = virtnet_set_rx_mode,
-	.ndo_change_mtu	     = virtnet_change_mtu,
 	.ndo_get_stats64     = virtnet_stats,
 	.ndo_vlan_rx_add_vid = virtnet_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid = virtnet_vlan_rx_kill_vid,
@@ -1537,6 +1521,9 @@ err:
 	return ret;
 }
 
+#define MIN_MTU ETH_MIN_MTU
+#define MAX_MTU ETH_MAX_MTU
+
 static int virtnet_probe(struct virtio_device *vdev)
 {
 	int i, err;
@@ -1605,6 +1592,10 @@ static int virtnet_probe(struct virtio_device *vdev)
 
 	dev->vlan_features = dev->features;
 
+	/* MTU range: 68 - 65535 */
+	dev->extended->min_mtu = MIN_MTU;
+	dev->extended->max_mtu = MAX_MTU;
+
 	/* Configuration may specify what MAC to use.  Otherwise random. */
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_MAC))
 		virtio_cread_bytes(vdev,
@@ -1655,7 +1646,7 @@ static int virtnet_probe(struct virtio_device *vdev)
 		mtu = virtio_cread16(vdev,
 				     offsetof(struct virtio_net_config,
 					      mtu));
-		if (virtnet_change_mtu(dev, mtu))
+		if (mtu < dev->extended->min_mtu || mtu > dev->extended->max_mtu)
 			__virtio_clear_bit(vdev, VIRTIO_NET_F_MTU);
 		else
 			vi->max_mtu = mtu;

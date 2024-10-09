@@ -22,16 +22,12 @@ struct tcf_tunnel_key_params {
 	struct metadata_dst     *tcft_enc_metadata;
 };
 
-/* RHEL - we have to use tcf_common due to missing commit ec0595cc4495
- * ("net_sched: get rid of struct tcf_common). 
- */
 struct tcf_tunnel_key {
-	struct tcf_common	      common;
+	struct tc_action	      common;
 	struct tcf_tunnel_key_params __rcu *params;
 };
 
-#define to_tunnel_key(a) \
-	container_of(a->priv, struct tcf_tunnel_key, common)
+#define to_tunnel_key(a) ((struct tcf_tunnel_key *)a)
 
 static inline bool is_tcf_tunnel_set(const struct tc_action *a)
 {

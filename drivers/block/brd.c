@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #ifdef CONFIG_BLK_DEV_RAM_DAX
 #include <linux/pfn_t.h>
+#include <linux/dax.h>
 #endif
 
 #include <asm/uaccess.h>
@@ -41,6 +42,9 @@ struct brd_device {
 
 	struct request_queue	*brd_queue;
 	struct gendisk		*brd_disk;
+#ifdef CONFIG_BLK_DEV_RAM_DAX
+	struct dax_device	*dax_dev;
+#endif
 	struct list_head	brd_list;
 
 	/*
@@ -373,24 +377,33 @@ static int brd_rw_page(struct block_device *bdev, sector_t sector,
 }
 
 #ifdef CONFIG_BLK_DEV_RAM_DAX
-static long brd_direct_access(struct block_device *bdev, sector_t sector,
-			void **kaddr, pfn_t *pfn, long size)
+static long __brd_direct_access(struct brd_device *brd, pgoff_t pgoff,
+		long nr_pages, void **kaddr, pfn_t *pfn)
 {
-	struct brd_device *brd = bdev->bd_disk->private_data;
 	struct page *page;
 
 	if (!brd)
 		return -ENODEV;
-	page = brd_insert_page(brd, sector);
+	page = brd_insert_page(brd, PFN_PHYS(pgoff) / 512);
 	if (!page)
 		return -ENOSPC;
 	*kaddr = page_address(page);
 	*pfn = page_to_pfn_t(page);
 
-	return PAGE_SIZE;
+	return 1;
 }
-#else
-#define brd_direct_access NULL
+
+static long brd_dax_direct_access(struct dax_device *dax_dev,
+		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
+{
+	struct brd_device *brd = dax_get_private(dax_dev);
+
+	return __brd_direct_access(brd, pgoff, nr_pages, kaddr, pfn);
+}
+
+static const struct dax_operations brd_dax_ops = {
+	.direct_access = brd_dax_direct_access,
+};
 #endif
 
 static int brd_ioctl(struct block_device *bdev, fmode_t mode,
@@ -431,7 +444,6 @@ static const struct block_device_operations brd_fops = {
 	.owner =		THIS_MODULE,
 	.rw_page =		brd_rw_page,
 	.ioctl =		brd_ioctl,
-	.direct_access =	brd_direct_access,
 };
 
 /*
@@ -491,9 +503,6 @@ static struct brd_device *brd_alloc(int i)
 	brd->brd_queue->limits.max_discard_sectors = UINT_MAX;
 	brd->brd_queue->limits.discard_zeroes_data = 1;
 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, brd->brd_queue);
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-	queue_flag_set_unlocked(QUEUE_FLAG_DAX, brd->brd_queue);
-#endif
 	disk = brd->brd_disk = alloc_disk(1 << part_shift);
 	if (!disk)
 		goto out_free_queue;
@@ -506,8 +515,21 @@ static struct brd_device *brd_alloc(int i)
 	sprintf(disk->disk_name, "ram%d", i);
 	set_capacity(disk, rd_size * 2);
 
+#ifdef CONFIG_BLK_DEV_RAM_DAX
+	queue_flag_set_unlocked(QUEUE_FLAG_DAX, brd->brd_queue);
+	brd->dax_dev = alloc_dax(brd, disk->disk_name, &brd_dax_ops);
+	if (!brd->dax_dev)
+		goto out_free_inode;
+#endif
+
+
 	return brd;
 
+#ifdef CONFIG_BLK_DEV_RAM_DAX
+out_free_inode:
+	kill_dax(brd->dax_dev);
+	put_dax(brd->dax_dev);
+#endif
 out_free_queue:
 	blk_cleanup_queue(brd->brd_queue);
 out_free_dev:
@@ -545,6 +567,10 @@ out:
 static void brd_del_one(struct brd_device *brd)
 {
 	list_del(&brd->brd_list);
+#ifdef CONFIG_BLK_DEV_RAM_DAX
+	kill_dax(brd->dax_dev);
+	put_dax(brd->dax_dev);
+#endif
 	del_gendisk(brd->brd_disk);
 	brd_free(brd);
 }

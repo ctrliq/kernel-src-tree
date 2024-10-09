@@ -42,6 +42,15 @@ extern unsigned int debug_smp_processor_id(void); /* from linux/smp.h */
 #define get_lppaca()	(get_paca()->lppaca_ptr)
 #define get_slb_shadow()	(get_paca()->slb_shadow_ptr)
 
+/*
+ * RHEL7 kABI: This is required for kABI paca_aux workaround definition
+ * of PACA_AUX_PTR. We use new paca_aux accessors to use shadow struct
+ */
+#define EX_DAR		48
+
+#define get_paca_aux()   ((struct paca_aux_struct *)get_paca()->exslb[EX_DAR/8])
+#define paca_aux_of(cpu) ((struct paca_aux_struct *)paca[cpu].exslb[EX_DAR/8])
+
 struct task_struct;
 struct opal_machine_check_event;
 
@@ -199,6 +208,24 @@ struct paca_struct {
 	struct kvmppc_host_state kvm_hstate;
 #endif
 };
+
+/*
+ * This is pointer to by a pointer in paca->exslb[EX_DAR] (which is not used
+ * by exception handlers in RHEL7. For the purpose of extending the PACA
+ * structure without breaking kABI.
+ */
+
+#ifdef CONFIG_PPC_BOOK3S_64
+struct paca_aux_struct {
+	/*
+	 * rfi fallback flush must be in its own cacheline to prevent
+	 * other paca data leaking into the L1d
+	 */
+	u64 exrfi[13] __aligned(0x80);
+	void *rfi_flush_fallback_area;
+	u64 l1d_flush_size;
+};
+#endif
 
 extern struct paca_struct *paca;
 extern void initialise_paca(struct paca_struct *new_paca, int cpu);

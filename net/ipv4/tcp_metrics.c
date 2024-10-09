@@ -735,14 +735,7 @@ void tcp_fastopen_cache_set(struct sock *sk, u16 mss,
 	rcu_read_unlock();
 }
 
-static struct genl_family tcp_metrics_nl_family = {
-	.id		= GENL_ID_GENERATE,
-	.hdrsize	= 0,
-	.name		= TCP_METRICS_GENL_NAME,
-	.version	= TCP_METRICS_GENL_VERSION,
-	.maxattr	= TCP_METRICS_ATTR_MAX,
-	.netnsok	= true,
-};
+static struct genl_family tcp_metrics_nl_family;
 
 static struct nla_policy tcp_metrics_nl_policy[TCP_METRICS_ATTR_MAX + 1] = {
 	[TCP_METRICS_ATTR_ADDR_IPV4]	= { .type = NLA_U32, },
@@ -1108,6 +1101,17 @@ static const struct genl_ops tcp_metrics_nl_ops[] = {
 	},
 };
 
+static struct genl_family tcp_metrics_nl_family = {
+	.hdrsize	= 0,
+	.name		= TCP_METRICS_GENL_NAME,
+	.version	= TCP_METRICS_GENL_VERSION,
+	.maxattr	= TCP_METRICS_ATTR_MAX,
+	.netnsok	= true,
+	.module		= THIS_MODULE,
+	.ops		= tcp_metrics_nl_ops,
+	.n_ops		= ARRAY_SIZE(tcp_metrics_nl_ops),
+};
+
 static unsigned int tcpmhash_entries;
 static int __init set_tcpmhash_entries(char *str)
 {
@@ -1140,9 +1144,7 @@ static int __net_init tcp_net_metrics_init(struct net *net)
 	net->ipv4.tcp_metrics_hash_log = order_base_2(slots);
 	size = sizeof(struct tcpm_hash_bucket) << net->ipv4.tcp_metrics_hash_log;
 
-	net->ipv4.tcp_metrics_hash = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
-	if (!net->ipv4.tcp_metrics_hash)
-		net->ipv4.tcp_metrics_hash = vzalloc(size);
+	net->ipv4.tcp_metrics_hash = kvzalloc(size, GFP_KERNEL);
 
 	if (!net->ipv4.tcp_metrics_hash)
 		return -ENOMEM;
@@ -1164,10 +1166,7 @@ static void __net_exit tcp_net_metrics_exit(struct net *net)
 			tm = next;
 		}
 	}
-	if (is_vmalloc_addr(net->ipv4.tcp_metrics_hash))
-		vfree(net->ipv4.tcp_metrics_hash);
-	else
-		kfree(net->ipv4.tcp_metrics_hash);
+	kvfree(net->ipv4.tcp_metrics_hash);
 }
 
 static __net_initdata struct pernet_operations tcp_net_metrics_ops = {
@@ -1182,8 +1181,7 @@ void __init tcp_metrics_init(void)
 	ret = register_pernet_subsys(&tcp_net_metrics_ops);
 	if (ret < 0)
 		goto cleanup;
-	ret = genl_register_family_with_ops(&tcp_metrics_nl_family,
-					    tcp_metrics_nl_ops);
+	ret = genl_register_family(&tcp_metrics_nl_family);
 	if (ret < 0)
 		goto cleanup_subsys;
 	return;

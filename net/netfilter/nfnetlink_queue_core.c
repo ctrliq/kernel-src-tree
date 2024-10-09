@@ -314,8 +314,7 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 	if (queue->flags & NFQA_CFG_F_CONNTRACK)
 		ct = nfqnl_ct_get(entskb, &size, &ctinfo);
 
-	skb = nfnetlink_alloc_skb(&init_net, size, queue->peer_portid,
-				  GFP_ATOMIC);
+	skb = alloc_skb(size, GFP_ATOMIC);
 	if (!skb) {
 		skb_tx_error(entskb);
 		return NULL;
@@ -452,7 +451,7 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 		if (skb_tailroom(skb) < sizeof(*nla) + hlen)
 			goto nla_put_failure;
 
-		nla = (struct nlattr *)skb_put(skb, sizeof(*nla));
+		nla = skb_put(skb, sizeof(*nla));
 		nla->nla_type = NFQA_PAYLOAD;
 		nla->nla_len = nla_attr_size(data_len);
 

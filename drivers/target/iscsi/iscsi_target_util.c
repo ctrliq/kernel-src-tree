@@ -22,7 +22,6 @@
 #include <scsi/iscsi_proto.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
-#include <target/target_core_configfs.h>
 #include <target/iscsi/iscsi_transport.h>
 
 #include <target/iscsi/iscsi_target_core.h>
@@ -738,21 +737,23 @@ void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
 {
 	struct se_cmd *se_cmd = NULL;
 	int rc;
+	bool op_scsi = false;
 	/*
 	 * Determine if a struct se_cmd is associated with
 	 * this struct iscsi_cmd.
 	 */
 	switch (cmd->iscsi_opcode) {
 	case ISCSI_OP_SCSI_CMD:
-		se_cmd = &cmd->se_cmd;
-		__iscsit_free_cmd(cmd, true, shutdown);
+		op_scsi = true;
 		/*
 		 * Fallthrough
 		 */
 	case ISCSI_OP_SCSI_TMFUNC:
-		rc = transport_generic_free_cmd(&cmd->se_cmd, shutdown);
-		if (!rc && shutdown && se_cmd && se_cmd->se_sess) {
-			__iscsit_free_cmd(cmd, true, shutdown);
+		se_cmd = &cmd->se_cmd;
+		__iscsit_free_cmd(cmd, op_scsi, shutdown);
+		rc = transport_generic_free_cmd(se_cmd, shutdown);
+		if (!rc && shutdown && se_cmd->se_sess) {
+			__iscsit_free_cmd(cmd, op_scsi, shutdown);
 			target_put_sess_cmd(se_cmd);
 		}
 		break;
@@ -815,54 +816,6 @@ void iscsit_inc_session_usage_count(struct iscsi_session *sess)
 	spin_lock_bh(&sess->session_usage_lock);
 	sess->session_usage_count++;
 	spin_unlock_bh(&sess->session_usage_lock);
-}
-
-/*
- *	Setup conn->if_marker and conn->of_marker values based upon
- *	the initial marker-less interval. (see iSCSI v19 A.2)
- */
-int iscsit_set_sync_and_steering_values(struct iscsi_conn *conn)
-{
-	int login_ifmarker_count = 0, login_ofmarker_count = 0, next_marker = 0;
-	/*
-	 * IFMarkInt and OFMarkInt are negotiated as 32-bit words.
-	 */
-	u32 IFMarkInt = (conn->conn_ops->IFMarkInt * 4);
-	u32 OFMarkInt = (conn->conn_ops->OFMarkInt * 4);
-
-	if (conn->conn_ops->OFMarker) {
-		/*
-		 * Account for the first Login Command received not
-		 * via iscsi_recv_msg().
-		 */
-		conn->of_marker += ISCSI_HDR_LEN;
-		if (conn->of_marker <= OFMarkInt) {
-			conn->of_marker = (OFMarkInt - conn->of_marker);
-		} else {
-			login_ofmarker_count = (conn->of_marker / OFMarkInt);
-			next_marker = (OFMarkInt * (login_ofmarker_count + 1)) +
-					(login_ofmarker_count * MARKER_SIZE);
-			conn->of_marker = (next_marker - conn->of_marker);
-		}
-		conn->of_marker_offset = 0;
-		pr_debug("Setting OFMarker value to %u based on Initial"
-			" Markerless Interval.\n", conn->of_marker);
-	}
-
-	if (conn->conn_ops->IFMarker) {
-		if (conn->if_marker <= IFMarkInt) {
-			conn->if_marker = (IFMarkInt - conn->if_marker);
-		} else {
-			login_ifmarker_count = (conn->if_marker / IFMarkInt);
-			next_marker = (IFMarkInt * (login_ifmarker_count + 1)) +
-					(login_ifmarker_count * MARKER_SIZE);
-			conn->if_marker = (next_marker - conn->if_marker);
-		}
-		pr_debug("Setting IFMarker value to %u based on Initial"
-			" Markerless Interval.\n", conn->if_marker);
-	}
-
-	return 0;
 }
 
 struct iscsi_conn *iscsit_get_conn_from_cid(struct iscsi_session *sess, u16 cid)

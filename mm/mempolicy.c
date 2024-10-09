@@ -679,8 +679,18 @@ queue_pages_range(struct mm_struct *mm, unsigned long start, unsigned long end,
 		}
 
 		if (flags & MPOL_MF_LAZY) {
-			change_prot_numa(vma, start, endvma);
-			goto next;
+			/*
+			 * Similar to task_numa_work, skip inaccessible
+			 * VMAs
+			 */
+			if (!is_vm_hugetlb_page(vma) &&
+				(vma->vm_flags &
+				 (VM_READ | VM_EXEC | VM_WRITE)) &&
+				!(vma->vm_flags & VM_MIXEDMAP)) {
+				change_prot_numa(vma, start, endvma);
+				goto next;
+			} else
+				continue;
 		}
 
 		if ((flags & MPOL_MF_STRICT) ||

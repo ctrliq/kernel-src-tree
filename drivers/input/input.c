@@ -1505,6 +1505,7 @@ static void input_dev_release(struct device *device)
 	input_mt_destroy_slots(dev);
 	kfree(dev->absinfo);
 	kfree(dev->vals);
+	kfree(dev->dev.device_rh);
 	kfree(dev);
 
 	module_put(THIS_MODULE);

@@ -532,7 +532,7 @@ static const struct net_device_ops qlcnic_netdev_ops = {
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_set_rx_mode   = qlcnic_set_multi,
 	.ndo_set_mac_address    = qlcnic_set_mac,
-	.ndo_change_mtu	   = qlcnic_change_mtu,
+	.extended.ndo_change_mtu = qlcnic_change_mtu,
 	.ndo_fix_features  = qlcnic_fix_features,
 	.ndo_set_features  = qlcnic_set_features,
 	.ndo_tx_timeout	   = qlcnic_tx_timeout,
@@ -2345,8 +2345,8 @@ qlcnic_setup_netdev(struct qlcnic_adapter *adapter, struct net_device *netdev,
 	netdev->irq = adapter->msix_entries[0].vector;
 
 	/* MTU range: 68 - 9600 */
-	netdev->min_mtu = P3P_MIN_MTU;
-	netdev->max_mtu = P3P_MAX_MTU;
+	netdev->extended->min_mtu = P3P_MIN_MTU;
+	netdev->extended->max_mtu = P3P_MAX_MTU;
 
 	err = qlcnic_set_real_num_queues(adapter, adapter->drv_tx_rings,
 					 adapter->drv_sds_rings);
@@ -4222,7 +4222,7 @@ recheck:
 	if (dev == NULL)
 		goto done;
 
-	if (dev->priv_flags & IFF_802_1Q_VLAN) {
+	if (is_vlan_dev(dev)) {
 		dev = vlan_dev_real_dev(dev);
 		goto recheck;
 	}
@@ -4258,7 +4258,7 @@ recheck:
 	if (dev == NULL)
 		goto done;
 
-	if (dev->priv_flags & IFF_802_1Q_VLAN) {
+	if (is_vlan_dev(dev)) {
 		dev = vlan_dev_real_dev(dev);
 		goto recheck;
 	}

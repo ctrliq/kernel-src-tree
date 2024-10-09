@@ -189,6 +189,7 @@ ssize_t nd_namespace_store(struct device *dev,
 	case NVDIMM_CCLASS_NONE:
 		break;
 	case NVDIMM_CCLASS_BTT:
+	case NVDIMM_CCLASS_BTT2:
 		if (!is_nd_btt(dev)) {
 			len = -EBUSY;
 			goto out_attach;
@@ -256,7 +257,8 @@ u64 nd_sb_checksum(struct nd_gen_sb *nd_gen_sb)
 EXPORT_SYMBOL(nd_sb_checksum);
 
 static int nsio_rw_bytes(struct nd_namespace_common *ndns,
-		resource_size_t offset, void *buf, size_t size, int rw)
+		resource_size_t offset, void *buf, size_t size, int rw,
+		unsigned long flags)
 {
 	struct nd_namespace_io *nsio = to_nd_namespace_io(&ndns->dev);
 	unsigned int sz_align = ALIGN(size + (offset & (512 - 1)), 512);
@@ -274,22 +276,15 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
 	if (rw == READ) {
 		if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align)))
 			return -EIO;
-		return memcpy_from_pmem(buf, nsio->addr + offset, size);
+		return memcpy_mcsafe(buf, nsio->addr + offset, size);
 	}
 
 	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
-		/*
-		 * FIXME: nsio_rw_bytes() may be called from atomic
-		 * context in the btt case and the ACPI DSM path for
-		 * clearing the error takes sleeping locks and allocates
-		 * memory. An explicit error clearing path, and support
-		 * for tracking badblocks in BTT metadata is needed to
-		 * work around this collision.
-		 */
 		if (IS_ALIGNED(offset, 512) && IS_ALIGNED(size, 512)
-				&& (!ndns->claim || !is_nd_btt(ndns->claim))) {
+				&& !(flags & NVDIMM_IO_ATOMIC)) {
 			long cleared;
 
+			might_sleep();
 			cleared = nvdimm_clear_poison(&ndns->dev,
 					nsio->res.start + offset, size);
 			if (cleared < size)
@@ -303,7 +298,7 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
 			rc = -EIO;
 	}
 
-	memcpy_to_pmem(nsio->addr + offset, buf, size);
+	memcpy_flushcache(nsio->addr + offset, buf, size);
 	nvdimm_flush(to_nd_region(ndns->dev.parent));
 
 	return rc;

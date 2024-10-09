@@ -79,6 +79,12 @@ PHDRS {
 	note PT_NOTE FLAGS(0);          /* ___ */
 }
 
+#ifdef CONFIG_KAISER
+#define ALIGN_KAISER()	. = ALIGN(PAGE_SIZE);
+#else
+#define ALIGN_KAISER()
+#endif
+
 SECTIONS
 {
 #ifdef CONFIG_X86_32
@@ -100,9 +106,11 @@ SECTIONS
 		SCHED_TEXT
 		CPUIDLE_TEXT
 		LOCK_TEXT
+		ALIGN_KAISER()
 		KPROBES_TEXT
 		ENTRY_TEXT
 		IRQENTRY_TEXT
+		ALIGN_KAISER()
 		*(.fixup)
 		*(.gnu.warning)
 		/* End of text section */
@@ -112,6 +120,8 @@ SECTIONS
 	NOTES :text :note
 
 	EXCEPTION_TABLE(16) :text = 0x9090
+
+	MC_EXCEPTION_TABLE(16) :text = 0x9090
 
 #if defined(CONFIG_DEBUG_RODATA)
 	/* .text should occupy whole number of pages */

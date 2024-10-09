@@ -92,12 +92,12 @@ extern const struct inode_operations cifs_dfs_referral_inode_operations;
 
 
 /* Functions related to files and directories */
-extern const struct file_operations cifs_file_ops;
-extern const struct file_operations cifs_file_direct_ops; /* if directio mnt */
-extern const struct file_operations cifs_file_strict_ops; /* if strictio mnt */
-extern const struct file_operations cifs_file_nobrl_ops; /* no brlocks */
-extern const struct file_operations cifs_file_direct_nobrl_ops;
-extern const struct file_operations cifs_file_strict_nobrl_ops;
+extern const struct file_operations_extend cifs_file_ops;
+extern const struct file_operations_extend cifs_file_direct_ops; /* if directio mnt */
+extern const struct file_operations_extend cifs_file_strict_ops; /* if strictio mnt */
+extern const struct file_operations_extend cifs_file_nobrl_ops; /* no brlocks */
+extern const struct file_operations_extend cifs_file_direct_nobrl_ops;
+extern const struct file_operations_extend cifs_file_strict_nobrl_ops;
 extern int cifs_open(struct inode *inode, struct file *file);
 extern int cifs_close(struct inode *inode, struct file *file);
 extern int cifs_closedir(struct inode *inode, struct file *file);
@@ -117,7 +117,7 @@ extern int cifs_strict_fsync(struct file *, loff_t, loff_t, int);
 extern int cifs_flush(struct file *, fl_owner_t id);
 extern int cifs_file_mmap(struct file * , struct vm_area_struct *);
 extern int cifs_file_strict_mmap(struct file * , struct vm_area_struct *);
-extern const struct file_operations cifs_dir_ops;
+extern const struct file_operations_extend cifs_dir_ops;
 extern int cifs_dir_open(struct inode *inode, struct file *file);
 extern int cifs_readdir(struct file *file, void *direntry, filldir_t filldir);
 
@@ -142,8 +142,13 @@ extern int	cifs_setxattr(struct dentry *, const char *, const void *,
 			size_t, int);
 extern ssize_t	cifs_getxattr(struct dentry *, const char *, void *, size_t);
 extern ssize_t	cifs_listxattr(struct dentry *, char *, size_t);
-extern long cifs_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
 
+extern ssize_t cifs_file_copychunk_range(unsigned int xid,
+					struct file *src_file, loff_t off,
+					struct file *dst_file, loff_t destoff,
+					size_t len, unsigned int flags);
+
+extern long cifs_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
 #ifdef CONFIG_CIFS_NFSD_EXPORT
 extern const struct export_operations cifs_export_ops;
 #endif /* CONFIG_CIFS_NFSD_EXPORT */

@@ -54,6 +54,9 @@ struct ipv6_devconf {
 		bool initialized;
 		struct in6_addr secret;
 	} stable_secret;
+#ifdef CONFIG_IPV6_OPTIMISTIC_DAD
+	__s32		use_optimistic;
+#endif
 #endif
 	void		*sysctl;
 };

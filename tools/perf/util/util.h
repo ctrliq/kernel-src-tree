@@ -6,43 +6,12 @@
 /* glibc 2.20 deprecates _BSD_SOURCE in favour of _DEFAULT_SOURCE */
 #define _DEFAULT_SOURCE 1
 
-#include <unistd.h>
-#include <stdio.h>
-#include <sys/stat.h>
-#include <sys/statfs.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <string.h>
-#include <term.h>
-#include <errno.h>
-#include <limits.h>
-#include <sys/param.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <sys/time.h>
-#include <time.h>
-#include <signal.h>
-#include <fnmatch.h>
-#include <assert.h>
-#include <regex.h>
-#include <utime.h>
-#include <sys/wait.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <linux/kernel.h>
 #include <linux/types.h>
-#include <sys/ttydefaults.h>
-#include <api/fs/tracing_path.h>
-#include <termios.h>
-#include <linux/bitops.h>
-#include <termios.h>
-#include "strlist.h"
-
-extern char buildid_dir[];
 
 #ifdef __GNUC__
 #define NORETURN __attribute__((__noreturn__))
@@ -61,15 +30,15 @@ void warning(const char *err, ...) __attribute__((format (printf, 1, 2)));
 
 void set_warning_routine(void (*routine)(const char *err, va_list params));
 
-int prefixcmp(const char *str, const char *prefix);
-void set_buildid_dir(const char *dir);
-
 static inline void *zalloc(size_t size)
 {
 	return calloc(1, size);
 }
 
 #define zfree(ptr) ({ free(*ptr); *ptr = NULL; })
+
+struct dirent;
+struct strlist;
 
 int mkdir_p(char *path, mode_t mode);
 int rm_rf(const char *path);
@@ -79,131 +48,21 @@ int copyfile(const char *from, const char *to);
 int copyfile_mode(const char *from, const char *to, mode_t mode);
 int copyfile_offset(int fromfd, loff_t from_ofs, int tofd, loff_t to_ofs, u64 size);
 
-s64 perf_atoll(const char *str);
-char **argv_split(const char *str, int *argcp);
-void argv_free(char **argv);
-bool strglobmatch(const char *str, const char *pat);
-bool strglobmatch_nocase(const char *str, const char *pat);
-bool strlazymatch(const char *str, const char *pat);
-static inline bool strisglob(const char *str)
-{
-	return strpbrk(str, "*?[") != NULL;
-}
-int strtailcmp(const char *s1, const char *s2);
-char *strxfrchar(char *s, char from, char to);
-unsigned long convert_unit(unsigned long value, char *unit);
 ssize_t readn(int fd, void *buf, size_t n);
 ssize_t writen(int fd, void *buf, size_t n);
-
-struct perf_event_attr;
-
-void event_attr_init(struct perf_event_attr *attr);
-
-#define _STR(x) #x
-#define STR(x) _STR(x)
 
 size_t hex_width(u64 v);
 int hex2u64(const char *ptr, u64 *val);
 
-char *ltrim(char *s);
-char *rtrim(char *s);
-
-static inline char *trim(char *s)
-{
-	return ltrim(rtrim(s));
-}
-
-void dump_stack(void);
-void sighandler_dump_stack(int sig);
-
 extern unsigned int page_size;
 extern int cacheline_size;
-extern unsigned int sysctl_perf_event_max_stack;
-
-struct parse_tag {
-	char tag;
-	int mult;
-};
-
-unsigned long parse_tag_value(const char *str, struct parse_tag *tags);
-
-static inline int path__join(char *bf, size_t size,
-			     const char *path1, const char *path2)
-{
-	return scnprintf(bf, size, "%s%s%s", path1, path1[0] ? "/" : "", path2);
-}
-
-static inline int path__join3(char *bf, size_t size,
-			      const char *path1, const char *path2,
-			      const char *path3)
-{
-	return scnprintf(bf, size, "%s%s%s%s%s",
-			 path1, path1[0] ? "/" : "",
-			 path2, path2[0] ? "/" : "", path3);
-}
-
-int perf_event_paranoid(void);
-
-void mem_bswap_64(void *src, int byte_size);
-void mem_bswap_32(void *src, int byte_size);
 
 bool find_process(const char *name);
 
-#ifdef HAVE_ZLIB_SUPPORT
-int gzip_decompress_to_file(const char *input, int output_fd);
-#endif
-
-#ifdef HAVE_LZMA_SUPPORT
-int lzma_decompress_to_file(const char *input, int output_fd);
-#endif
-
-char *asprintf_expr_inout_ints(const char *var, bool in, size_t nints, int *ints);
-
-static inline char *asprintf_expr_in_ints(const char *var, size_t nints, int *ints)
-{
-	return asprintf_expr_inout_ints(var, true, nints, ints);
-}
-
-static inline char *asprintf_expr_not_in_ints(const char *var, size_t nints, int *ints)
-{
-	return asprintf_expr_inout_ints(var, false, nints, ints);
-}
-
-int get_stack_size(const char *str, unsigned long *_size);
-
 const char *perf_tip(const char *dirpath);
-bool is_regular_file(const char *file);
-int fetch_current_timestamp(char *buf, size_t sz);
 
-enum binary_printer_ops {
-	BINARY_PRINT_DATA_BEGIN,
-	BINARY_PRINT_LINE_BEGIN,
-	BINARY_PRINT_ADDR,
-	BINARY_PRINT_NUM_DATA,
-	BINARY_PRINT_NUM_PAD,
-	BINARY_PRINT_SEP,
-	BINARY_PRINT_CHAR_DATA,
-	BINARY_PRINT_CHAR_PAD,
-	BINARY_PRINT_LINE_END,
-	BINARY_PRINT_DATA_END,
-};
-
-typedef void (*print_binary_t)(enum binary_printer_ops,
-			       unsigned int val,
-			       void *extra);
-
-void print_binary(unsigned char *data, size_t len,
-		  size_t bytes_per_line, print_binary_t printer,
-		  void *extra);
-
-#if !defined(__GLIBC__) && !defined(__ANDROID__)
-extern int sched_getcpu(void);
+#ifndef HAVE_SCHED_GETCPU_SUPPORT
+int sched_getcpu(void);
 #endif
-
-int is_printable_array(char *p, unsigned int len);
-
-int timestamp__scnprintf_usec(u64 timestamp, char *buf, size_t sz);
-
-int unit_number__scnprintf(char *buf, size_t size, u64 n);
 
 #endif /* GIT_COMPAT_UTIL_H */

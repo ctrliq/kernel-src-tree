@@ -201,7 +201,7 @@ xfs_attr_set(
 {
 	struct xfs_mount	*mp = dp->i_mount;
 	struct xfs_da_args	args;
-	struct xfs_bmap_free	flist;
+	struct xfs_defer_ops	dfops;
 	struct xfs_trans_res	tres;
 	xfs_fsblock_t		firstblock;
 	int			rsvd = (flags & ATTR_ROOT) != 0;
@@ -219,7 +219,7 @@ xfs_attr_set(
 	args.value = value;
 	args.valuelen = valuelen;
 	args.firstblock = &firstblock;
-	args.flist = &flist;
+	args.dfops = &dfops;
 	args.op_flags = XFS_DA_OP_ADDNAME | XFS_DA_OP_OKNOENT;
 	args.total = xfs_attr_calc_size(&args, &local);
 
@@ -314,13 +314,13 @@ xfs_attr_set(
 		 * It won't fit in the shortform, transform to a leaf block.
 		 * GROT: another possible req'mt for a double-split btree op.
 		 */
-		xfs_bmap_init(args.flist, args.firstblock);
+		xfs_defer_init(args.dfops, args.firstblock);
 		error = xfs_attr_shortform_to_leaf(&args);
 		if (!error)
-			error = xfs_bmap_finish(&args.trans, args.flist, dp);
+			error = xfs_defer_finish(&args.trans, args.dfops, dp);
 		if (error) {
 			args.trans = NULL;
-			xfs_bmap_cancel(&flist);
+			xfs_defer_cancel(&dfops);
 			goto out;
 		}
 
@@ -380,7 +380,7 @@ xfs_attr_remove(
 {
 	struct xfs_mount	*mp = dp->i_mount;
 	struct xfs_da_args	args;
-	struct xfs_bmap_free	flist;
+	struct xfs_defer_ops	dfops;
 	xfs_fsblock_t		firstblock;
 	int			error;
 
@@ -394,7 +394,7 @@ xfs_attr_remove(
 		return error;
 
 	args.firstblock = &firstblock;
-	args.flist = &flist;
+	args.dfops = &dfops;
 
 	/*
 	 * we have no control over the attribute names that userspace passes us
@@ -579,13 +579,13 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
 		 * Commit that transaction so that the node_addname() call
 		 * can manage its own transactions.
 		 */
-		xfs_bmap_init(args->flist, args->firstblock);
+		xfs_defer_init(args->dfops, args->firstblock);
 		error = xfs_attr3_leaf_to_node(args);
 		if (!error)
-			error = xfs_bmap_finish(&args->trans, args->flist, dp);
+			error = xfs_defer_finish(&args->trans, args->dfops, dp);
 		if (error) {
 			args->trans = NULL;
-			xfs_bmap_cancel(args->flist);
+			xfs_defer_cancel(args->dfops);
 			return error;
 		}
 
@@ -669,15 +669,15 @@ xfs_attr_leaf_addname(xfs_da_args_t *args)
 		 * If the result is small enough, shrink it all into the inode.
 		 */
 		if ((forkoff = xfs_attr_shortform_allfit(bp, dp))) {
-			xfs_bmap_init(args->flist, args->firstblock);
+			xfs_defer_init(args->dfops, args->firstblock);
 			error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
 			/* bp is gone due to xfs_da_shrink_inode */
 			if (!error)
-				error = xfs_bmap_finish(&args->trans,
-							args->flist, dp);
+				error = xfs_defer_finish(&args->trans,
+							args->dfops, dp);
 			if (error) {
 				args->trans = NULL;
-				xfs_bmap_cancel(args->flist);
+				xfs_defer_cancel(args->dfops);
 				return error;
 			}
 		}
@@ -732,14 +732,14 @@ xfs_attr_leaf_removename(xfs_da_args_t *args)
 	 * If the result is small enough, shrink it all into the inode.
 	 */
 	if ((forkoff = xfs_attr_shortform_allfit(bp, dp))) {
-		xfs_bmap_init(args->flist, args->firstblock);
+		xfs_defer_init(args->dfops, args->firstblock);
 		error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
 		/* bp is gone due to xfs_da_shrink_inode */
 		if (!error)
-			error = xfs_bmap_finish(&args->trans, args->flist, dp);
+			error = xfs_defer_finish(&args->trans, args->dfops, dp);
 		if (error) {
 			args->trans = NULL;
-			xfs_bmap_cancel(args->flist);
+			xfs_defer_cancel(args->dfops);
 			return error;
 		}
 	}
@@ -858,14 +858,14 @@ restart:
 			 */
 			xfs_da_state_free(state);
 			state = NULL;
-			xfs_bmap_init(args->flist, args->firstblock);
+			xfs_defer_init(args->dfops, args->firstblock);
 			error = xfs_attr3_leaf_to_node(args);
 			if (!error)
-				error = xfs_bmap_finish(&args->trans,
-							args->flist, dp);
+				error = xfs_defer_finish(&args->trans,
+							args->dfops, dp);
 			if (error) {
 				args->trans = NULL;
-				xfs_bmap_cancel(args->flist);
+				xfs_defer_cancel(args->dfops);
 				goto out;
 			}
 
@@ -886,13 +886,13 @@ restart:
 		 * in the index/blkno/rmtblkno/rmtblkcnt fields and
 		 * in the index2/blkno2/rmtblkno2/rmtblkcnt2 fields.
 		 */
-		xfs_bmap_init(args->flist, args->firstblock);
+		xfs_defer_init(args->dfops, args->firstblock);
 		error = xfs_da3_split(state);
 		if (!error)
-			error = xfs_bmap_finish(&args->trans, args->flist, dp);
+			error = xfs_defer_finish(&args->trans, args->dfops, dp);
 		if (error) {
 			args->trans = NULL;
-			xfs_bmap_cancel(args->flist);
+			xfs_defer_cancel(args->dfops);
 			goto out;
 		}
 	} else {
@@ -985,14 +985,14 @@ restart:
 		 * Check to see if the tree needs to be collapsed.
 		 */
 		if (retval && (state->path.active > 1)) {
-			xfs_bmap_init(args->flist, args->firstblock);
+			xfs_defer_init(args->dfops, args->firstblock);
 			error = xfs_da3_join(state);
 			if (!error)
-				error = xfs_bmap_finish(&args->trans,
-							args->flist, dp);
+				error = xfs_defer_finish(&args->trans,
+							args->dfops, dp);
 			if (error) {
 				args->trans = NULL;
-				xfs_bmap_cancel(args->flist);
+				xfs_defer_cancel(args->dfops);
 				goto out;
 			}
 		}
@@ -1108,13 +1108,13 @@ xfs_attr_node_removename(xfs_da_args_t *args)
 	 * Check to see if the tree needs to be collapsed.
 	 */
 	if (retval && (state->path.active > 1)) {
-		xfs_bmap_init(args->flist, args->firstblock);
+		xfs_defer_init(args->dfops, args->firstblock);
 		error = xfs_da3_join(state);
 		if (!error)
-			error = xfs_bmap_finish(&args->trans, args->flist, dp);
+			error = xfs_defer_finish(&args->trans, args->dfops, dp);
 		if (error) {
 			args->trans = NULL;
-			xfs_bmap_cancel(args->flist);
+			xfs_defer_cancel(args->dfops);
 			goto out;
 		}
 		/*
@@ -1141,15 +1141,15 @@ xfs_attr_node_removename(xfs_da_args_t *args)
 			goto out;
 
 		if ((forkoff = xfs_attr_shortform_allfit(bp, dp))) {
-			xfs_bmap_init(args->flist, args->firstblock);
+			xfs_defer_init(args->dfops, args->firstblock);
 			error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
 			/* bp is gone due to xfs_da_shrink_inode */
 			if (!error)
-				error = xfs_bmap_finish(&args->trans,
-							args->flist, dp);
+				error = xfs_defer_finish(&args->trans,
+							args->dfops, dp);
 			if (error) {
 				args->trans = NULL;
-				xfs_bmap_cancel(args->flist);
+				xfs_defer_cancel(args->dfops);
 				goto out;
 			}
 		} else

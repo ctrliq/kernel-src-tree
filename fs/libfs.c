@@ -1084,7 +1084,6 @@ simple_nosetlease(struct file *filp, long arg, struct file_lock **flp,
 }
 EXPORT_SYMBOL(simple_nosetlease);
 
-
 /*
  * Operations for a permanently empty directory.
  */
@@ -1151,7 +1150,15 @@ static int empty_dir_readdir(struct file *file, struct dir_context *ctx)
 	return 0;
 }
 
+static int empty_dir_open(struct inode *inode, struct file *file)
+{
+	/* Let the kernel safely know that iterate is present */
+	file->f_mode |= FMODE_KABI_ITERATE;
+	return 0;
+}
+
 static const struct file_operations empty_dir_operations = {
+	.open		= empty_dir_open,
 	.llseek		= empty_dir_llseek,
 	.read		= generic_read_dir,
 	.iterate	= empty_dir_readdir,

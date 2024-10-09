@@ -94,7 +94,7 @@ static void _rtl_rc_rate_set_series(struct rtl_priv *rtlpriv,
 				    struct ieee80211_sta *sta,
 				    struct ieee80211_tx_rate *rate,
 				    struct ieee80211_tx_rate_control *txrc,
-				    u8 tries, char rix, int rtsctsenable,
+				    u8 tries, s8 rix, int rtsctsenable,
 				    bool not_data)
 {
 	struct rtl_mac *mac = rtl_mac(rtlpriv);
@@ -267,8 +267,7 @@ static void *rtl_rate_alloc_sta(void *ppriv,
 
 	rate_priv = kzalloc(sizeof(struct rtl_rate_priv), gfp);
 	if (!rate_priv) {
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG,
-			 "Unable to allocate private rc structure\n");
+		pr_err("Unable to allocate private rc structure\n");
 		return NULL;
 	}
 
@@ -284,7 +283,7 @@ static void rtl_rate_free_sta(void *rtlpriv,
 	kfree(rate_priv);
 }
 
-static struct rate_control_ops rtl_rate_ops = {
+static const struct rate_control_ops rtl_rate_ops = {
 	.name = "rtl_rc",
 	.alloc = rtl_rate_alloc,
 	.free = rtl_rate_free,

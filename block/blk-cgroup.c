@@ -951,7 +951,10 @@ int blkcg_activate_policy(struct request_queue *q,
 	if (!new_blkg)
 		return -ENOMEM;
 
-	blk_queue_bypass_start(q);
+	if (q->mq_ops)
+		blk_mq_freeze_queue(q);
+	else
+		blk_queue_bypass_start(q);
 
 	preloaded = !radix_tree_preload(GFP_KERNEL);
 
@@ -1026,7 +1029,10 @@ int blkcg_activate_policy(struct request_queue *q,
 out_unlock:
 	spin_unlock_irq(q->queue_lock);
 out_free:
-	blk_queue_bypass_end(q);
+	if (q->mq_ops)
+		blk_mq_unfreeze_queue(q);
+	else
+		blk_queue_bypass_end(q);
 	list_for_each_entry_safe(pd, n, &pds, alloc_node)
 		kfree(pd);
 	return ret;
@@ -1049,7 +1055,11 @@ void blkcg_deactivate_policy(struct request_queue *q,
 	if (!blkcg_policy_enabled(q, pol))
 		return;
 
-	blk_queue_bypass_start(q);
+	if (q->mq_ops)
+		blk_mq_freeze_queue(q);
+	else
+		blk_queue_bypass_start(q);
+
 	spin_lock_irq(q->queue_lock);
 
 	__clear_bit(pol->plid, q->blkcg_pols);
@@ -1074,7 +1084,11 @@ void blkcg_deactivate_policy(struct request_queue *q,
 	}
 
 	spin_unlock_irq(q->queue_lock);
-	blk_queue_bypass_end(q);
+
+	if (q->mq_ops)
+		blk_mq_unfreeze_queue(q);
+	else
+		blk_queue_bypass_end(q);
 }
 EXPORT_SYMBOL_GPL(blkcg_deactivate_policy);
 

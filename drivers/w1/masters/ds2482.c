@@ -96,6 +96,7 @@ static const struct i2c_device_id ds2482_id[] = {
 
 static struct i2c_driver ds2482_driver = {
 	.driver = {
+		.owner	= THIS_MODULE,
 		.name	= "ds2482",
 	},
 	.probe		= ds2482_probe,

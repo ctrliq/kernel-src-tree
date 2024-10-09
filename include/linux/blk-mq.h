@@ -3,6 +3,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/rh_kabi.h>
+#include <linux/sbitmap.h>
 
 struct blk_mq_tags;
 struct blk_flush_queue;
@@ -72,12 +73,20 @@ struct blk_mq_hw_ctx {
 	RH_KABI_EXTEND(int			next_cpu)
 	RH_KABI_EXTEND(int			next_cpu_batch)
 
-	RH_KABI_EXTEND(struct blk_mq_ctxmap	ctx_map)
+	RH_KABI_EXTEND(struct sbitmap ctx_map)
 
 	RH_KABI_EXTEND(atomic_t		nr_active)
 
 	RH_KABI_EXTEND(struct blk_flush_queue	*fq)
 	RH_KABI_EXTEND(struct srcu_struct	queue_rq_srcu)
+	RH_KABI_EXTEND(wait_queue_t		dispatch_wait)
+	RH_KABI_EXTEND(void			*sched_data)
+	RH_KABI_EXTEND(struct blk_mq_tags	*sched_tags)
+	RH_KABI_EXTEND(struct blk_mq_ctx	*dispatch_from)
+#ifdef CONFIG_BLK_DEBUG_FS
+	RH_KABI_EXTEND(struct dentry		*debugfs_dir)
+	RH_KABI_EXTEND(struct dentry		*sched_debugfs_dir)
+#endif
 };
 
 #ifdef __GENKSYMS__
@@ -117,12 +126,25 @@ struct blk_mq_queue_data {
 	bool last;
 };
 
+/*
+ * This structure is only for blk-mq and per request
+ * for support some new blk-mq features, such as io
+ * scheduler, blk-stat and so on.
+ */
+struct request_aux {
+	int internal_tag;
+	struct blk_issue_stat issue_stat;
+}____cacheline_aligned_in_smp;
+
 /* None of these function pointers are covered by RHEL kABI */
 #ifdef __GENKSYMS__
 typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
 #else
 typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, const struct blk_mq_queue_data *);
 #endif
+
+typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
+typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
 
 typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
 #ifdef __GENKSYMS__
@@ -143,6 +165,20 @@ typedef void (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
 typedef void (busy_tag_iter_fn)(struct request *, void *, bool);
 typedef int (map_queues_fn)(struct blk_mq_tag_set *set);
 
+struct blk_mq_aux_ops {
+	reinit_request_fn	*reinit_request;
+	map_queues_fn		*map_queues;
+
+	/*
+	 * Reserve budget before queue request, once .queue_rq is
+	 * run, it is driver's responsibility to release the
+	 * reserved budget. Also we have to handle failure case
+	 * of .get_budget for avoiding I/O deadlock.
+	 */
+	get_budget_fn		*get_budget;
+	put_budget_fn		*put_budget;
+};
+
 struct blk_mq_ops {
 	/*
 	 * Queue request
@@ -151,8 +187,10 @@ struct blk_mq_ops {
 
 	/*
 	 * Map to specific hardware queue
+	 *
+	 * Reuse this pointer for aux ops.
 	 */
-	map_queue_fn		*map_queue;
+	RH_KABI_REPLACE(map_queue_fn *map_queue, struct blk_mq_aux_ops *aux_ops)
 
 	/*
 	 * Called on request timeout
@@ -180,9 +218,6 @@ struct blk_mq_ops {
 	 */
 	init_request_fn		*init_request;
 	exit_request_fn		*exit_request;
-	reinit_request_fn	*reinit_request;
-
-	map_queues_fn		*map_queues;
 #endif
 
 	/*
@@ -203,16 +238,26 @@ enum {
 	BLK_MQ_F_SHOULD_SORT	= 1 << 1,
 	BLK_MQ_F_TAG_SHARED	= 1 << 2,
 	BLK_MQ_F_SG_MERGE	= 1 << 3,
-	BLK_MQ_F_DEFER_ISSUE	= 1 << 5,
 	BLK_MQ_F_BLOCKING	= 1 << 6,
+	BLK_MQ_F_NO_SCHED	= 1 << 7,
+
+	BLK_MQ_F_ALLOC_POLICY_START_BIT = 8,
+	BLK_MQ_F_ALLOC_POLICY_BITS = 1,
 
 	BLK_MQ_S_STOPPED	= 0,
 	BLK_MQ_S_TAG_ACTIVE	= 1,
+	BLK_MQ_S_SCHED_RESTART	= 2,
 
 	BLK_MQ_MAX_DEPTH	= 10240,
 
 	BLK_MQ_CPU_WORK_BATCH	= 8,
 };
+#define BLK_MQ_FLAG_TO_ALLOC_POLICY(flags) \
+	((flags >> BLK_MQ_F_ALLOC_POLICY_START_BIT) & \
+		((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1))
+#define BLK_ALLOC_POLICY_TO_MQ_FLAG(policy) \
+	((policy & ((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1)) \
+		<< BLK_MQ_F_ALLOC_POLICY_START_BIT)
 
 struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *);
 struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
@@ -225,13 +270,14 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set);
 
 void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule);
 
-void blk_mq_insert_request(struct request *, bool, bool, bool);
 void blk_mq_free_request(struct request *rq);
 bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
 
 enum {
 	BLK_MQ_REQ_NOWAIT	= (1 << 0), /* return when out of requests */
 	BLK_MQ_REQ_RESERVED	= (1 << 1), /* allocate from reserved pool */
+	BLK_MQ_REQ_INTERNAL	= (1 << 2), /* allocate internal/sched tag */
+	BLK_MQ_REQ_PREEMPT	= (1 << 3), /* set RQF_PREEMPT */
 };
 
 struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
@@ -239,7 +285,6 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
 struct request *blk_mq_alloc_request_hctx(struct request_queue *q, int op,
 		unsigned int flags, unsigned int hctx_idx);
 struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
-struct cpumask *blk_mq_tags_cpumask(struct blk_mq_tags *tags);
 
 enum {
 	BLK_MQ_UNIQUE_TAG_BITS = 16,
@@ -258,7 +303,6 @@ static inline u16 blk_mq_unique_tag_to_tag(u32 unique_tag)
 	return unique_tag & BLK_MQ_UNIQUE_TAG_MASK;
 }
 
-struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
 struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
 
 int blk_mq_request_started(struct request *rq);
@@ -306,6 +350,18 @@ static inline struct request *blk_mq_rq_from_pdu(void *pdu)
 static inline void *blk_mq_rq_to_pdu(struct request *rq)
 {
 	return (void *) rq + sizeof(*rq);
+}
+
+static inline struct request_aux *__rq_aux(struct request *rq,
+					   struct request_queue *q)
+{
+	BUG_ON(!q->mq_ops);
+	return (void *) rq + sizeof(*rq) + q->tag_set->cmd_size;
+}
+
+static inline struct request_aux *rq_aux(struct request *rq)
+{
+	return __rq_aux(rq, rq->q);
 }
 
 #define queue_for_each_hw_ctx(q, hctx, i)				\

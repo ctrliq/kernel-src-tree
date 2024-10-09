@@ -56,6 +56,13 @@ struct msi_desc {
 	struct msi_msg msg;
 
 	struct kobject kobj;	/* Deprecated - do not use */
+
+	/*
+	 * struct msi_desc is allocated and managed by the kernel and
+	 * isn't accessed by 3rd party drivers.  Therefore it is safe
+	 * to extend.
+	 */
+	RH_KABI_EXTEND(struct cpumask *affinity)
 };
 
 /*

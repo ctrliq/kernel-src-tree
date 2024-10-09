@@ -1921,8 +1921,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
 		priv->hw->desc->enable_tx_timestamp(first);
 	}
 
-	if (!priv->hwts_tx_en)
-		skb_tx_timestamp(skb);
+	skb_tx_timestamp(skb);
 
 	priv->hw->dma->enable_dma_transmission(priv->ioaddr);
 

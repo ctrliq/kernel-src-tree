@@ -1803,8 +1803,10 @@ static int btrfs_check_raid_min_devices(struct btrfs_fs_info *fs_info,
 			continue;
 
 		if (num_devices < btrfs_raid_array[i].devs_min) {
-			int ret = btrfs_raid_mindev_error[i];
+			int ret;
 
+			gmb();
+			ret = btrfs_raid_mindev_error[i];
 			if (ret)
 				return ret;
 		}

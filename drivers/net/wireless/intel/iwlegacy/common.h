@@ -45,6 +45,7 @@ struct il_tx_queue;
 
 #define IL_ERR(f, a...) dev_err(&il->pci_dev->dev, f, ## a)
 #define IL_WARN(f, a...) dev_warn(&il->pci_dev->dev, f, ## a)
+#define IL_WARN_ONCE(f, a...) dev_warn_once(&il->pci_dev->dev, f, ## a)
 #define IL_INFO(f, a...) dev_info(&il->pci_dev->dev, f, ## a)
 
 #define RX_QUEUE_SIZE                         256
@@ -1320,7 +1321,7 @@ struct il_priv {
 	u64 timestamp;
 
 	union {
-#if defined(CONFIG_IWL3945) || defined(CONFIG_IWL3945_MODULE)
+#if IS_ENABLED(CONFIG_IWL3945)
 		struct {
 			void *shared_virt;
 			dma_addr_t shared_phys;
@@ -1351,7 +1352,7 @@ struct il_priv {
 
 		} _3945;
 #endif
-#if defined(CONFIG_IWL4965) || defined(CONFIG_IWL4965_MODULE)
+#if IS_ENABLED(CONFIG_IWL4965)
 		struct {
 			struct il_rx_phy_res last_phy_res;
 			bool last_phy_res_valid;

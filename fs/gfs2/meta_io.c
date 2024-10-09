@@ -350,15 +350,10 @@ void gfs2_remove_from_journal(struct buffer_head *bh, struct gfs2_trans *tr, int
 		trace_gfs2_pin(bd, 0);
 		atomic_dec(&sdp->sd_log_pinned);
 		list_del_init(&bd->bd_list);
-		if (meta) {
-			gfs2_assert_warn(sdp, sdp->sd_log_num_buf);
-			sdp->sd_log_num_buf--;
+		if (meta)
 			tr->tr_num_buf_rm++;
-		} else {
-			gfs2_assert_warn(sdp, sdp->sd_log_num_databuf);
-			sdp->sd_log_num_databuf--;
+		else
 			tr->tr_num_databuf_rm++;
-		}
 		set_bit(TR_TOUCHED, &tr->tr_flags);
 		was_pinned = 1;
 		brelse(bh);
@@ -366,10 +361,6 @@ void gfs2_remove_from_journal(struct buffer_head *bh, struct gfs2_trans *tr, int
 	if (bd) {
 		spin_lock(&sdp->sd_ail_lock);
 		if (bd->bd_tr) {
-			bh->b_private = NULL;
-			bd->bd_blkno = bh->b_blocknr;
-			gfs2_remove_from_ail(bd);
-			bd->bd_bh = NULL;
 			gfs2_trans_add_revoke(sdp, bd);
 		} else if (was_pinned) {
 			bh->b_private = NULL;

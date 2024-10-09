@@ -517,7 +517,7 @@ static struct sk_buff *create_monitor_ctrl_open(struct sock *sk)
 	put_unaligned_le16(format, skb_put(skb, 2));
 	memcpy(skb_put(skb, sizeof(ver)), ver, sizeof(ver));
 	put_unaligned_le32(flags, skb_put(skb, 4));
-	*skb_put(skb, 1) = TASK_COMM_LEN;
+	*(u8 *)skb_put(skb, 1) = TASK_COMM_LEN;
 	memcpy(skb_put(skb, TASK_COMM_LEN), hci_pi(sk)->comm, TASK_COMM_LEN);
 
 	__net_timestamp(skb);
@@ -616,7 +616,7 @@ send_monitor_note(struct sock *sk, const char *fmt, ...)
 
 	va_start(args, fmt);
 	vsprintf(skb_put(skb, len), fmt, args);
-	*skb_put(skb, 1) = 0;
+	*(u8 *)skb_put(skb, 1) = 0;
 	va_end(args);
 
 	__net_timestamp(skb);
@@ -851,7 +851,7 @@ static int hci_sock_release(struct socket *sock)
 
 	if (hdev) {
 		if (hci_pi(sk)->channel == HCI_CHANNEL_USER) {
-			/* When releasing an user channel exclusive access,
+			/* When releasing a user channel exclusive access,
 			 * call hci_dev_do_close directly instead of calling
 			 * hci_dev_close to ensure the exclusive access will
 			 * be released and the controller brought back down.
@@ -1172,7 +1172,7 @@ static int hci_sock_bind(struct socket *sock, struct sockaddr *addr,
 				/* In case the transport is already up and
 				 * running, clear the error here.
 				 *
-				 * This can happen when opening an user
+				 * This can happen when opening a user
 				 * channel and HCI_AUTO_OFF grace period
 				 * is still active.
 				 */
@@ -1190,7 +1190,7 @@ static int hci_sock_bind(struct socket *sock, struct sockaddr *addr,
 		if (!hci_sock_gen_cookie(sk)) {
 			/* In the case when a cookie has already been assigned,
 			 * this socket will transition from a raw socket into
-			 * an user channel socket. For a clean transition, send
+			 * a user channel socket. For a clean transition, send
 			 * the close notification first.
 			 */
 			skb = create_monitor_ctrl_close(sk);

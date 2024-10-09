@@ -144,17 +144,8 @@ int mei_reset(struct mei_device *dev)
 	/* fall through and remove the sw state even if hw reset has failed */
 
 	/* no need to clean up software state in case of power up */
-	if (state != MEI_DEV_INITIALIZING &&
-	    state != MEI_DEV_POWER_UP) {
-
-		/* remove all waiting requests */
+	if (state != MEI_DEV_INITIALIZING && state != MEI_DEV_POWER_UP)
 		mei_cl_all_disconnect(dev);
-
-		/* remove entry if already in list */
-		dev_dbg(dev->dev, "remove iamthif from the file list.\n");
-		mei_cl_unlink(&dev->iamthif_cl);
-		mei_amthif_reset_params(dev);
-	}
 
 	mei_hbm_reset(dev);
 
@@ -339,16 +330,16 @@ EXPORT_SYMBOL_GPL(mei_stop);
 bool mei_write_is_idle(struct mei_device *dev)
 {
 	bool idle = (dev->dev_state == MEI_DEV_ENABLED &&
-		list_empty(&dev->ctrl_wr_list.list) &&
-		list_empty(&dev->write_list.list)   &&
-		list_empty(&dev->write_waiting_list.list));
+		list_empty(&dev->ctrl_wr_list) &&
+		list_empty(&dev->write_list)   &&
+		list_empty(&dev->write_waiting_list));
 
 	dev_dbg(dev->dev, "write pg: is idle[%d] state=%s ctrl=%01d write=%01d wwait=%01d\n",
 		idle,
 		mei_dev_state_str(dev->dev_state),
-		list_empty(&dev->ctrl_wr_list.list),
-		list_empty(&dev->write_list.list),
-		list_empty(&dev->write_waiting_list.list));
+		list_empty(&dev->ctrl_wr_list),
+		list_empty(&dev->write_list),
+		list_empty(&dev->write_waiting_list));
 
 	return idle;
 }
@@ -378,17 +369,14 @@ void mei_device_init(struct mei_device *dev,
 	dev->dev_state = MEI_DEV_INITIALIZING;
 	dev->reset_count = 0;
 
-	mei_io_list_init(&dev->write_list);
-	mei_io_list_init(&dev->write_waiting_list);
-	mei_io_list_init(&dev->ctrl_wr_list);
-	mei_io_list_init(&dev->ctrl_rd_list);
+	INIT_LIST_HEAD(&dev->write_list);
+	INIT_LIST_HEAD(&dev->write_waiting_list);
+	INIT_LIST_HEAD(&dev->ctrl_wr_list);
+	INIT_LIST_HEAD(&dev->ctrl_rd_list);
 
 	INIT_DELAYED_WORK(&dev->timer_work, mei_timer);
 	INIT_WORK(&dev->reset_work, mei_reset_work);
 	INIT_WORK(&dev->bus_rescan_work, mei_cl_bus_rescan_work);
-
-	INIT_LIST_HEAD(&dev->iamthif_cl.link);
-	mei_io_list_init(&dev->amthif_cmd_list);
 
 	bitmap_zero(dev->host_clients_map, MEI_CLIENTS_MAX);
 	dev->open_handle_count = 0;

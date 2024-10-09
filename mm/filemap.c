@@ -108,15 +108,80 @@
  *   ->tasklist_lock            (memory_failure, collect_procs_ao)
  */
 
+static int page_cache_tree_insert(struct address_space *mapping,
+				  struct page *page, void **shadowp)
+{
+	struct radix_tree_node *node;
+	void **slot;
+	int error;
+
+	error = __radix_tree_create(&mapping->page_tree, page->index, 0,
+				    &node, &slot);
+	if (error)
+		return error;
+	if (*slot) {
+		void *p;
+
+		p = radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
+		if (!radix_tree_exceptional_entry(p))
+			return -EEXIST;
+
+		mapping->nrexceptional--;
+		if (!dax_mapping(mapping)) {
+			if (shadowp)
+				*shadowp = p;
+			if (node)
+				workingset_node_shadows_dec(node);
+		} else {
+			/* DAX can replace empty locked entry with a hole */
+			WARN_ON_ONCE(p !=
+				dax_radix_locked_entry(0, RADIX_DAX_EMPTY));
+			/* DAX accounts exceptional entries as normal pages */
+			if (node)
+				workingset_node_pages_dec(node);
+			/* Wakeup waiters for exceptional entry lock */
+			dax_wake_mapping_entry_waiter(mapping, page->index, p,
+						      true);
+		}
+	}
+	radix_tree_replace_slot(slot, page);
+	mapping->nrpages++;
+	if (node) {
+		workingset_node_pages_inc(node);
+		/*
+		 * Don't track node that contains actual pages.
+		 *
+		 * Avoid acquiring the list_lru lock if already
+		 * untracked.  The list_empty() test is safe as
+		 * node->private_list is protected by
+		 * mapping->tree_lock.
+		 */
+		if (!list_empty(&node->private_list))
+			workingset_forget_node(node);
+	}
+	return 0;
+}
+
 static void page_cache_tree_delete(struct address_space *mapping,
 				   struct page *page, void *shadow)
 {
 	struct radix_tree_node *node;
+	void **slot;
 
 	VM_BUG_ON(!PageLocked(page));
 
-	node = radix_tree_replace_clear_tags(&mapping->page_tree, page->index,
-								shadow);
+	__radix_tree_lookup(&mapping->page_tree, page->index, &node, &slot);
+	radix_tree_clear_tags(&mapping->page_tree, node, slot);
+
+	if (!node) {
+		/*
+		 * We need a node to properly account shadow
+		 * entries. Don't plant any without. XXX
+		 */
+		shadow = NULL;
+	}
+
+	radix_tree_replace_slot(slot, shadow);
 
 	if (shadow) {
 		mapping->nrexceptional++;
@@ -509,9 +574,9 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 
 		spin_lock_irq(&mapping->tree_lock);
 		__delete_from_page_cache(old, NULL);
-		error = radix_tree_insert(&mapping->page_tree, offset, new);
+		error = page_cache_tree_insert(mapping, new, NULL);
 		BUG_ON(error);
-		mapping->nrpages++;
+
 		__inc_zone_page_state(new, NR_FILE_PAGES);
 		if (PageSwapBacked(new))
 			__inc_zone_page_state(new, NR_SHMEM);
@@ -528,61 +593,6 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
 }
 EXPORT_SYMBOL_GPL(replace_page_cache_page);
 
-static int page_cache_tree_insert(struct address_space *mapping,
-				  struct page *page, void **shadowp)
-{
-	struct radix_tree_node *node;
-	void **slot;
-	int error;
-
-	error = __radix_tree_create(&mapping->page_tree, page->index, 0,
-				    &node, &slot);
-	if (error)
-		return error;
-	if (*slot) {
-		void *p;
-
-		p = radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
-		if (!radix_tree_exceptional_entry(p))
-			return -EEXIST;
-
-		mapping->nrexceptional--;
-		if (!dax_mapping(mapping)) {
-			if (shadowp)
-				*shadowp = p;
-			if (node)
-				workingset_node_shadows_dec(node);
-		} else {
-			/* DAX can replace empty locked entry with a hole */
-			WARN_ON_ONCE(p !=
-				(void *)(RADIX_TREE_EXCEPTIONAL_ENTRY |
-					 RADIX_DAX_ENTRY_LOCK));
-			/* DAX accounts exceptional entries as normal pages */
-			if (node)
-				workingset_node_pages_dec(node);
-			/* Wakeup waiters for exceptional entry lock */
-			dax_wake_mapping_entry_waiter(mapping, page->index, p,
-						      true);
-		}
-	}
-	radix_tree_replace_slot(slot, page);
-	mapping->nrpages++;
-	if (node) {
-		workingset_node_pages_inc(node);
-		/*
-		 * Don't track node that contains actual pages.
-		 *
-		 * Avoid acquiring the list_lru lock if already
-		 * untracked.  The list_empty() test is safe as
-		 * node->private_list is protected by
-		 * mapping->tree_lock.
-		 */
-		if (!list_empty(&node->private_list))
-			workingset_forget_node(node);
-	}
-	return 0;
-}
-
 static int __add_to_page_cache_locked(struct page *page,
 				      struct address_space *mapping,
 				      pgoff_t offset, gfp_t gfp_mask,
@@ -592,6 +602,8 @@ static int __add_to_page_cache_locked(struct page *page,
 
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(PageSwapBacked(page));
+
+	gfp_mask = mapping_gfp_constraint(mapping, gfp_mask);
 
 	error = mem_cgroup_cache_charge(page, current->mm,
 					gfp_mask & GFP_RECLAIM_MASK);
@@ -2144,18 +2156,18 @@ EXPORT_SYMBOL(generic_file_aio_read);
  * This adds the requested page to the page cache if it isn't already there,
  * and schedules an I/O to read in its contents from disk.
  */
-static int page_cache_read(struct file *file, pgoff_t offset)
+static int page_cache_read(struct file *file, pgoff_t offset, gfp_t gfp_mask)
 {
 	struct address_space *mapping = file->f_mapping;
 	struct page *page; 
 	int ret;
 
 	do {
-		page = page_cache_alloc_cold(mapping);
+		page = __page_cache_alloc(gfp_mask|__GFP_COLD);
 		if (!page)
 			return -ENOMEM;
 
-		ret = add_to_page_cache_lru(page, mapping, offset, GFP_KERNEL);
+		ret = add_to_page_cache_lru(page, mapping, offset, gfp_mask & GFP_KERNEL);
 		if (ret == 0)
 			ret = mapping->a_ops->readpage(file, page);
 		else if (ret == -EEXIST)
@@ -2324,7 +2336,7 @@ no_cached_page:
 	 * We're only likely to ever get here if MADV_RANDOM is in
 	 * effect.
 	 */
-	error = page_cache_read(file, offset);
+	error = page_cache_read(file, offset, vmf->gfp_mask);
 
 	/*
 	 * The page we want has now been added to the page cache.
@@ -2927,7 +2939,7 @@ repeat:
 	if (!page)
 		return NULL;
 	status = add_to_page_cache_lru(page, mapping, index,
-						GFP_KERNEL & ~gfp_notmask);
+						gfp_mask & ~gfp_notmask);
 	if (unlikely(status)) {
 		page_cache_release(page);
 		if (status == -EEXIST)

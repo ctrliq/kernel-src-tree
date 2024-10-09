@@ -412,7 +412,7 @@ int intel_lpss_probe(struct device *dev,
 	if (ret)
 		return ret;
 
-	lpss->cell->pset = info->pset;
+	lpss->cell->properties = info->properties;
 
 	intel_lpss_init_dev(lpss);
 

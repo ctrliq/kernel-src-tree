@@ -53,6 +53,7 @@ SECTIONS
 		*(.gnu.warning)
 	} :text = 0x0700
 
+	. = ALIGN(PAGE_SIZE);
 	_etext = .;		/* End of text section */
 
 	NOTES :text :note
@@ -79,7 +80,13 @@ SECTIONS
 	. = ALIGN(PAGE_SIZE);	/* Init code and data */
 	__init_begin = .;
 
-	INIT_TEXT_SECTION(PAGE_SIZE)
+	. = ALIGN(PAGE_SIZE);
+	.init.text : AT(ADDR(.init.text) - LOAD_OFFSET) {
+		VMLINUX_SYMBOL(_sinittext) = . ;
+		INIT_TEXT
+		. = ALIGN(PAGE_SIZE);
+		VMLINUX_SYMBOL(_einittext) = . ;
+	}
 
 	/*
 	 * .exit.text is discarded at runtime, not link time,
@@ -91,6 +98,32 @@ SECTIONS
 
 	.exit.data : {
 		EXIT_DATA
+	}
+
+	/*
+	 * struct alt_inst entries. From the header (alternative.h):
+	 * "Alternative instructions for different CPU types or capabilities"
+	 * Think locking instructions on spinlocks.
+	 * Note, that it is a part of __init region.
+	 */
+	. = ALIGN(8);
+	.altinstructions : {
+		__alt_instructions = .;
+		*(.altinstructions)
+		__alt_instructions_end = .;
+		__alt_nobp = .;
+		*(.altnobp)
+		__alt_nobp_end = . ;
+	}
+
+	/*
+	 * And here are the replacement instructions. The linker sticks
+	 * them as binary blobs. The .altinstructions has enough data to
+	 * get the address and the length of them to patch the kernel safely.
+	 * Note, that it is a part of __init region.
+	 */
+	.altinstr_replacement : {
+		*(.altinstr_replacement)
 	}
 
 	/* early.c uses stsi, which requires page aligned data. */

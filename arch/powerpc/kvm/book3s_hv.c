@@ -156,11 +156,11 @@ static bool kvmppc_ipi_thread(int cpu)
 static void kvmppc_fast_vcpu_kick_hv(struct kvm_vcpu *vcpu)
 {
 	int cpu;
-	wait_queue_head_t *wqp;
+	struct swait_queue_head *wqp;
 
 	wqp = kvm_arch_vcpu_wq(vcpu);
-	if (waitqueue_active(wqp)) {
-		wake_up_interruptible(wqp);
+	if (swq_has_sleeper(wqp)) {
+		swake_up(wqp);
 		++vcpu->stat.halt_wakeup;
 	}
 
@@ -749,8 +749,8 @@ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
 		tvcpu->arch.prodded = 1;
 		smp_mb();
 		if (vcpu->arch.ceded) {
-			if (waitqueue_active(&vcpu->wq)) {
-				wake_up_interruptible(&vcpu->wq);
+			if (swait_active(&vcpu->wq)) {
+				swake_up(&vcpu->wq);
 				vcpu->stat.halt_wakeup++;
 			}
 		}
@@ -1536,7 +1536,7 @@ static struct kvmppc_vcore *kvmppc_vcore_create(struct kvm *kvm, int core)
 
 	spin_lock_init(&vcore->lock);
 	spin_lock_init(&vcore->stoltb_lock);
-	init_waitqueue_head(&vcore->wq);
+	init_swait_queue_head(&vcore->wq);
 	vcore->preempt_tb = TB_NIL;
 	vcore->lpcr = kvm->arch.lpcr;
 	vcore->first_vcpuid = core * threads_per_subcore;
@@ -2565,7 +2565,7 @@ static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
 	int do_sleep = 1;
 	u64 block_ns;
 
-	DEFINE_WAIT(wait);
+	DECLARE_SWAITQUEUE(wait);
 
 	/* Poll for pending exceptions and ceded state */
 	cur = start_poll = ktime_get();
@@ -2593,10 +2593,10 @@ static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
 		}
 	}
 
-	prepare_to_wait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+	prepare_to_swait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
 
 	if (kvmppc_vcore_check_block(vc)) {
-		finish_wait(&vc->wq, &wait);
+		finish_swait(&vc->wq, &wait);
 		do_sleep = 0;
 		/* If we polled, count this as a successful poll */
 		if (vc->halt_poll_ns)
@@ -2610,7 +2610,7 @@ static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
 	trace_kvmppc_vcore_blocked(vc, 0);
 	spin_unlock(&vc->lock);
 	schedule();
-	finish_wait(&vc->wq, &wait);
+	finish_swait(&vc->wq, &wait);
 	spin_lock(&vc->lock);
 	vc->vcore_state = VCORE_INACTIVE;
 	trace_kvmppc_vcore_blocked(vc, 1);
@@ -2659,7 +2659,7 @@ out:
 
 static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
 {
-	int n_ceded, i;
+	int n_ceded, i, r;
 	struct kvmppc_vcore *vc;
 	struct kvm_vcpu *v;
 
@@ -2707,13 +2707,26 @@ static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
 			kvmppc_start_thread(vcpu, vc);
 			trace_kvm_guest_enter(vcpu);
 		} else if (vc->vcore_state == VCORE_SLEEPING) {
-			wake_up(&vc->wq);
+			swake_up(&vc->wq);
 		}
 
 	}
 
 	while (vcpu->arch.state == KVMPPC_VCPU_RUNNABLE &&
 	       !signal_pending(current)) {
+		/* See if the HPT and VRMA are ready to go */
+		if (!vcpu->kvm->arch.hpte_setup_done) {
+			spin_unlock(&vc->lock);
+			r = kvmppc_hv_setup_htab_rma(vcpu);
+			spin_lock(&vc->lock);
+			if (r) {
+				kvm_run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+				kvm_run->fail_entry.hardware_entry_failure_reason = 0;
+				vcpu->arch.ret = r;
+				break;
+			}
+		}
+
 		if (vc->vcore_state == VCORE_PREEMPT && vc->runner == NULL)
 			kvmppc_vcore_end_preempt(vc);
 
@@ -2805,13 +2818,6 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
 	/* Order vcpus_running vs. hpte_setup_done, see kvmppc_alloc_reset_hpt */
 	smp_mb();
 
-	/* On the first time here, set up HTAB and VRMA */
-	if (!vcpu->kvm->arch.hpte_setup_done) {
-		r = kvmppc_hv_setup_htab_rma(vcpu);
-		if (r)
-			goto out;
-	}
-
 	flush_fp_to_thread(current);
 	flush_altivec_to_thread(current);
 	flush_vsx_to_thread(current);
@@ -2836,7 +2842,6 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
 		}
 	} while (is_kvmppc_resume_guest(r));
 
- out:
 	vcpu->arch.state = KVMPPC_VCPU_NOTREADY;
 	atomic_dec(&vcpu->kvm->arch.vcpus_running);
 	return r;
@@ -3017,12 +3022,23 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
 		goto out;	/* another vcpu beat us to it */
 
 	/* Allocate hashed page table (if not done already) and reset it */
-	if (!kvm->arch.hpt_virt) {
-		err = kvmppc_alloc_hpt(kvm, NULL);
-		if (err) {
+	if (!kvm->arch.hpt.virt) {
+		int order = KVM_DEFAULT_HPT_ORDER;
+		struct kvm_hpt_info info;
+
+		err = kvmppc_allocate_hpt(&info, order);
+		/* If we get here, it means userspace didn't specify a
+		 * size explicitly.  So, try successively smaller
+		 * sizes if the default failed. */
+		while ((err == -ENOMEM) && --order >= PPC_MIN_HPT_ORDER)
+			err  = kvmppc_allocate_hpt(&info, order);
+
+		if (err < 0) {
 			pr_err("KVM: Couldn't alloc HPT\n");
 			goto out;
 		}
+
+		kvmppc_set_hpt(kvm, &info);
 	}
 
 	/* Look up the memslot for guest physical address 0 */
@@ -3227,6 +3243,9 @@ static int kvmppc_core_init_vm_hv(struct kvm *kvm)
 		lpcr |= LPCR_ONL;
 	kvm->arch.lpcr = lpcr;
 
+	/* Initialization for future HPT resizes */
+	kvm->arch.resize_hpt = NULL;
+
 	/*
 	 * Track that we now have a HV mode VM active. This blocks secondary
 	 * CPU threads from coming online.
@@ -3262,7 +3281,8 @@ static void kvmppc_core_destroy_vm_hv(struct kvm *kvm)
 
 	kvmppc_free_vcores(kvm);
 
-	kvmppc_free_hpt(kvm);
+	kvmppc_free_lpid(kvm->arch.lpid);
+	kvmppc_free_hpt(&kvm->arch.hpt);
 
 	kvmppc_free_pimap(kvm);
 }
@@ -3481,11 +3501,8 @@ static long kvm_arch_vm_ioctl_hv(struct file *filp,
 		r = -EFAULT;
 		if (get_user(htab_order, (u32 __user *)argp))
 			break;
-		r = kvmppc_alloc_reset_hpt(kvm, &htab_order);
+		r = kvmppc_alloc_reset_hpt(kvm, htab_order);
 		if (r)
-			break;
-		r = -EFAULT;
-		if (put_user(htab_order, (u32 __user *)argp))
 			break;
 		r = 0;
 		break;
@@ -3498,6 +3515,28 @@ static long kvm_arch_vm_ioctl_hv(struct file *filp,
 		if (copy_from_user(&ghf, argp, sizeof(ghf)))
 			break;
 		r = kvm_vm_ioctl_get_htab_fd(kvm, &ghf);
+		break;
+	}
+
+	case KVM_PPC_RESIZE_HPT_PREPARE: {
+		struct kvm_ppc_resize_hpt rhpt;
+
+		r = -EFAULT;
+		if (copy_from_user(&rhpt, argp, sizeof(rhpt)))
+			break;
+
+		r = kvm_vm_ioctl_resize_hpt_prepare(kvm, &rhpt);
+		break;
+	}
+
+	case KVM_PPC_RESIZE_HPT_COMMIT: {
+		struct kvm_ppc_resize_hpt rhpt;
+
+		r = -EFAULT;
+		if (copy_from_user(&rhpt, argp, sizeof(rhpt)))
+			break;
+
+		r = kvm_vm_ioctl_resize_hpt_commit(kvm, &rhpt);
 		break;
 	}
 

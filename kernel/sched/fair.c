@@ -99,6 +99,16 @@ const_debug unsigned int sysctl_sched_migration_cost = 500000UL;
  */
 unsigned int __read_mostly sysctl_sched_shares_window = 10000000UL;
 
+#ifdef CONFIG_SMP
+/*
+ * For asym packing, by default the lower numbered cpu has higher priority.
+ */
+int __weak arch_asym_cpu_priority(int cpu)
+{
+	return -cpu;
+}
+#endif
+
 #ifdef CONFIG_CFS_BANDWIDTH
 /*
  * Amount of runtime to allocate from global (tg) to local (per-cfs_rq) pool
@@ -692,9 +702,14 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	struct sched_entity *curr = cfs_rq->curr;
 	u64 now = rq_clock_task(rq_of(cfs_rq));
 	u64 delta_exec;
+	struct rq *rq = rq_of(cfs_rq);
+	int cpu = cpu_of(rq);
 
 	if (unlikely(!curr))
 		return;
+
+	if (cpu == smp_processor_id())
+		cpufreq_trigger_update(now);
 
 	delta_exec = now - curr->exec_start;
 	if (unlikely((s64)delta_exec <= 0))
@@ -4067,6 +4082,11 @@ static unsigned long power_of(int cpu)
 	return cpu_rq(cpu)->cpu_power;
 }
 
+static unsigned long capacity_orig_of(int cpu)
+{
+	return cpu_rq(cpu)->cpu_capacity_orig;
+}
+
 static unsigned long cpu_avg_load_per_task(int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -5371,41 +5391,41 @@ static void update_blocked_averages(int cpu)
 }
 
 /*
- * Compute the cpu's hierarchical load factor for each task group.
+ * Compute the hierarchical load factor for cfs_rq and all its ascendants.
  * This needs to be done in a top-down fashion because the load of a child
  * group is a fraction of its parents load.
  */
-static int tg_load_down(struct task_group *tg, void *data)
+static void update_cfs_rq_h_load(struct cfs_rq *cfs_rq)
 {
-	unsigned long load;
-	long cpu = (long)data;
-
-	if (!tg->parent) {
-		load = cpu_rq(cpu)->load.weight;
-	} else {
-		load = tg->parent->cfs_rq[cpu]->h_load;
-		load *= tg->se[cpu]->load.weight;
-		load /= tg->parent->cfs_rq[cpu]->load.weight + 1;
-	}
-
-	tg->cfs_rq[cpu]->h_load = load;
-
-	return 0;
-}
-
-static void update_h_load(long cpu)
-{
-	struct rq *rq = cpu_rq(cpu);
+	struct rq *rq = rq_of(cfs_rq);
+	struct sched_entity *se = cfs_rq->tg->se[cpu_of(rq)];
 	unsigned long now = jiffies;
+	unsigned long load;
 
-	if (rq->h_load_throttle == now)
+	if (cfs_rq->last_h_load_update == now)
 		return;
 
-	rq->h_load_throttle = now;
+	cfs_rq->h_load_next = NULL;
+	for_each_sched_entity(se) {
+		cfs_rq = cfs_rq_of(se);
+		cfs_rq->h_load_next = se;
+		if (cfs_rq->last_h_load_update == now)
+			break;
+	}
 
-	rcu_read_lock();
-	walk_tg_tree(tg_load_down, tg_nop, (void *)cpu);
-	rcu_read_unlock();
+	if (!se) {
+		cfs_rq->h_load = rq->load.weight;
+		cfs_rq->last_h_load_update = now;
+	}
+
+	while ((se = cfs_rq->h_load_next) != NULL) {
+		load = cfs_rq->h_load;
+		load *= se->load.weight;
+		load /= cfs_rq->load.weight + 1;
+		cfs_rq = group_cfs_rq(se);
+		cfs_rq->h_load = load;
+		cfs_rq->last_h_load_update = now;
+	}
 }
 
 static unsigned long task_h_load(struct task_struct *p)
@@ -5416,14 +5436,11 @@ static unsigned long task_h_load(struct task_struct *p)
 	load = p->se.load.weight;
 	load = div_u64(load * cfs_rq->h_load, cfs_rq->load.weight + 1);
 
+	update_cfs_rq_h_load(cfs_rq);
 	return load;
 }
 #else
 static inline void update_blocked_averages(int cpu)
-{
-}
-
-static inline void update_h_load(long cpu)
 {
 }
 
@@ -5621,6 +5638,8 @@ static void update_cpu_power(struct sched_domain *sd, int cpu)
 
 	power >>= SCHED_POWER_SHIFT;
 
+	cpu_rq(cpu)->cpu_capacity_orig = power;
+
 	power *= scale_rt_power(cpu);
 	power >>= SCHED_POWER_SHIFT;
 
@@ -5673,7 +5692,7 @@ void update_group_power(struct sched_domain *sd, int cpu)
 			 * Runtime updates will correct power_orig.
 			 */
 			if (unlikely(!rq->sd)) {
-				power_orig += power_of(cpu);
+				power_orig += capacity_orig_of(cpu);
 				power += power_of(cpu);
 				continue;
 			}
@@ -5889,15 +5908,18 @@ static bool update_sd_pick_busiest(struct lb_env *env,
 		return true;
 
 	/*
-	 * ASYM_PACKING needs to move all the work to the lowest
-	 * numbered CPUs in the group, therefore mark all groups
-	 * higher than ourself as busy.
+	 * ASYM_PACKING needs to move all the work to the highest
+	 * prority CPUs in the group, therefore mark all groups
+	 * of lower priority than ourself as busy.
 	 */
-	if (sgs->sum_nr_running && env->dst_cpu < group_first_cpu(sg)) {
+	if (sgs->sum_nr_running &&
+	    sched_asym_prefer(env->dst_cpu, sg->asym_prefer_cpu)) {
 		if (!sds->busiest)
 			return true;
 
-		if (group_first_cpu(sds->busiest) > group_first_cpu(sg))
+		/* Prefer to move from lowest priority cpu's work */
+		if (sched_asym_prefer(sds->busiest->asym_prefer_cpu,
+				      sg->asym_prefer_cpu))
 			return true;
 	}
 
@@ -6046,8 +6068,8 @@ static int check_asym_packing(struct lb_env *env, struct sd_lb_stats *sds)
 	if (!sds->busiest)
 		return 0;
 
-	busiest_cpu = group_first_cpu(sds->busiest);
-	if (env->dst_cpu > busiest_cpu)
+	busiest_cpu = sds->busiest->asym_prefer_cpu;
+	if (sched_asym_prefer(busiest_cpu, env->dst_cpu))
 		return 0;
 
 	env->imbalance = DIV_ROUND_CLOSEST(
@@ -6381,6 +6403,13 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 /* Working cpumask for load_balance and load_balance_newidle. */
 DEFINE_PER_CPU(cpumask_var_t, load_balance_mask);
 
+static inline int
+check_cpu_capacity(struct rq *rq, struct sched_domain *sd)
+{
+	return ((rq->cpu_power * sd->imbalance_pct) <
+				(rq->cpu_capacity_orig * 100));
+}
+
 static int need_active_balance(struct lb_env *env)
 {
 	struct sched_domain *sd = env->sd;
@@ -6389,10 +6418,24 @@ static int need_active_balance(struct lb_env *env)
 
 		/*
 		 * ASYM_PACKING needs to force migrate tasks from busy but
-		 * higher numbered CPUs in order to pack all tasks in the
-		 * lowest numbered CPUs.
+		 * lower priority CPUs in order to pack all tasks in the
+		 * highest priority CPUs.
 		 */
-		if ((sd->flags & SD_ASYM_PACKING) && env->src_cpu > env->dst_cpu)
+		if ((sd->flags & SD_ASYM_PACKING) &&
+		    sched_asym_prefer(env->dst_cpu, env->src_cpu))
+			return 1;
+	}
+
+	/*
+	 * The dst_cpu is idle and the src_cpu CPU has only 1 CFS task.
+	 * It's worth migrating the task if the src_cpu's capacity is reduced
+	 * because of other sched_class or IRQs if more capacity stays
+	 * available on dst_cpu.
+	 */
+	if ((env->idle != CPU_NOT_IDLE) &&
+	    (env->src_rq->cfs.h_nr_running == 1)) {
+		if ((check_cpu_capacity(env->src_rq, sd)) &&
+		    (power_of(env->src_cpu)*sd->imbalance_pct < power_of(env->dst_cpu)*100))
 			return 1;
 	}
 
@@ -6404,7 +6447,7 @@ static int active_load_balance_cpu_stop(void *data);
 static int should_we_balance(struct lb_env *env)
 {
 	struct sched_group *sg = env->sd->groups;
-	struct cpumask *sg_cpus, *sg_mask;
+	struct cpumask *sg_mask;
 	int cpu, balance_cpu = -1;
 
 	/*
@@ -6414,11 +6457,10 @@ static int should_we_balance(struct lb_env *env)
 	if (env->idle == CPU_NEWLY_IDLE)
 		return 1;
 
-	sg_cpus = sched_group_cpus(sg);
 	sg_mask = sched_group_mask(sg);
 	/* Try to find first idle cpu */
-	for_each_cpu_and(cpu, sg_cpus, env->cpus) {
-		if (!cpumask_test_cpu(cpu, sg_mask) || !idle_cpu(cpu))
+	for_each_cpu_and(cpu, sg_mask, env->cpus) {
+		if (!idle_cpu(cpu))
 			continue;
 
 		balance_cpu = cpu;
@@ -6492,6 +6534,9 @@ redo:
 
 	schedstat_add(sd, lb_imbalance[idle], env.imbalance);
 
+	env.src_cpu = busiest->cpu;
+	env.src_rq = busiest;
+
 	ld_moved = 0;
 	if (busiest->nr_running > 1) {
 		/*
@@ -6501,11 +6546,8 @@ redo:
 		 * correctly treated as an imbalance.
 		 */
 		env.flags |= LBF_ALL_PINNED;
-		env.src_cpu   = busiest->cpu;
-		env.src_rq    = busiest;
 		env.loop_max  = min(sysctl_sched_nr_migrate, busiest->nr_running);
 
-		update_h_load(env.src_cpu);
 more_balance:
 		local_irq_save(flags);
 		double_rq_lock(env.dst_rq, busiest);
@@ -7163,22 +7205,25 @@ end:
 
 /*
  * Current heuristic for kicking the idle load balancer in the presence
- * of an idle cpu is the system.
+ * of an idle cpu in the system.
  *   - This rq has more than one task.
- *   - At any scheduler domain level, this cpu's scheduler group has multiple
- *     busy cpu's exceeding the group's power.
+ *   - This rq has at least one CFS task and the capacity of the CPU is
+ *     significantly reduced because of RT tasks or IRQs.
+ *   - At parent of LLC scheduler domain level, this cpu's scheduler group has
+ *     multiple busy cpu.
  *   - For SD_ASYM_PACKING, if the lower numbered cpu's in the scheduler
  *     domain span are idle.
  */
-static inline int nohz_kick_needed(struct rq *rq, int cpu)
+static inline bool nohz_kick_needed(struct rq *rq)
 {
 	unsigned long now = jiffies;
 	struct sched_domain *sd;
 	struct sched_group_power *sgp;
-	int nr_busy;
+	int nr_busy, i, cpu = rq->cpu;
+	bool kick = false;
 
 	if (unlikely(idle_cpu(cpu)))
-		return 0;
+		return false;
 
        /*
 	* We may be recently in ticked or tickless idle mode. At the first
@@ -7192,38 +7237,53 @@ static inline int nohz_kick_needed(struct rq *rq, int cpu)
 	 * balancing.
 	 */
 	if (likely(!atomic_read(&nohz.nr_cpus)))
-		return 0;
+		return false;
 
 	if (time_before(now, nohz.next_balance))
-		return 0;
+		return false;
 
 	if (rq->nr_running >= 2)
-		goto need_kick;
+		return true;
 
 	rcu_read_lock();
 	sd = rcu_dereference(per_cpu(sd_busy, cpu));
-
 	if (sd) {
 		sgp = sd->groups->sgp;
 		nr_busy = atomic_read(&sgp->nr_busy_cpus);
 
-		if (nr_busy > 1)
-			goto need_kick_unlock;
+		if (nr_busy > 1) {
+			kick = true;
+			goto unlock;
+		}
+
+	}
+
+	sd = rcu_dereference(rq->sd);
+	if (sd) {
+		if ((rq->cfs.h_nr_running >= 1) &&
+				check_cpu_capacity(rq, sd)) {
+			kick = true;
+			goto unlock;
+		}
 	}
 
 	sd = rcu_dereference(per_cpu(sd_asym, cpu));
 
-	if (sd && (cpumask_first_and(nohz.idle_cpus_mask,
-				  sched_domain_span(sd)) < cpu))
-		goto need_kick_unlock;
+	if (sd) {
+		for_each_cpu(i, sched_domain_span(sd)) {
+			if (i == cpu ||
+			    !cpumask_test_cpu(i, nohz.idle_cpus_mask))
+				continue;
 
+			if (sched_asym_prefer(i, cpu)) {
+				kick = true;
+				goto unlock;
+			}
+		}
+	}
+unlock:
 	rcu_read_unlock();
-	return 0;
-
-need_kick_unlock:
-	rcu_read_unlock();
-need_kick:
-	return 1;
+	return kick;
 }
 #else
 static void nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle) { }
@@ -7266,7 +7326,7 @@ void trigger_load_balance(struct rq *rq, int cpu)
 	    likely(!on_null_domain(cpu)))
 		raise_softirq(SCHED_SOFTIRQ);
 #ifdef CONFIG_NO_HZ_COMMON
-	if (nohz_kick_needed(rq, cpu) && likely(!on_null_domain(cpu)))
+	if (nohz_kick_needed(rq) && likely(!on_null_domain(cpu)))
 		nohz_balancer_kick(cpu);
 #endif
 }

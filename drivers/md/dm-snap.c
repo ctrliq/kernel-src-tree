@@ -2289,8 +2289,8 @@ static int origin_map(struct dm_target *ti, struct bio *bio)
 	return (bio_rw(bio) == WRITE) ? do_origin(o->dev, bio) : DM_MAPIO_REMAPPED;
 }
 
-static long origin_direct_access(struct dm_target *ti, sector_t sector,
-		void **kaddr, pfn_t *pfn, long size)
+static long origin_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
+		long nr_pages, void **kaddr, pfn_t *pfn)
 {
 	DMWARN("device does not support dax.");
 	return -EIO;
@@ -2370,7 +2370,7 @@ static struct target_type origin_target = {
 	.status  = origin_status,
 	.merge	 = origin_merge,
 	.iterate_devices = origin_iterate_devices,
-	.direct_access = origin_direct_access,
+	.direct_access = origin_dax_direct_access,
 };
 
 static struct target_type snapshot_target = {

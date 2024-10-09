@@ -96,6 +96,12 @@ static inline void put_binfmt(struct linux_binfmt * fmt)
 	module_put(fmt->module);
 }
 
+bool path_noexec(const struct path *path)
+{
+	return (path->mnt->mnt_flags & MNT_NOEXEC) ||
+	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
+}
+
 /*
  * Note that a shared library must be both readable and executable due to
  * security reasons.
@@ -110,13 +116,14 @@ SYSCALL_DEFINE1(uselib, const char __user *, library)
 	static const struct open_flags uselib_flags = {
 		.open_flag = O_LARGEFILE | O_RDONLY | __FMODE_EXEC,
 		.acc_mode = MAY_READ | MAY_EXEC | MAY_OPEN,
-		.intent = LOOKUP_OPEN
+		.intent = LOOKUP_OPEN,
+		.lookup_flags = LOOKUP_FOLLOW,
 	};
 
 	if (IS_ERR(tmp))
 		goto out;
 
-	file = do_filp_open(AT_FDCWD, tmp, &uselib_flags, LOOKUP_FOLLOW);
+	file = do_filp_open(AT_FDCWD, tmp, &uselib_flags);
 	putname(tmp);
 	error = PTR_ERR(file);
 	if (IS_ERR(file))
@@ -127,7 +134,7 @@ SYSCALL_DEFINE1(uselib, const char __user *, library)
 		goto exit;
 
 	error = -EACCES;
-	if (file->f_path.mnt->mnt_flags & MNT_NOEXEC)
+	if (path_noexec(&file->f_path))
 		goto exit;
 
 	fsnotify_open(file);
@@ -189,8 +196,12 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 			return NULL;
 	}
 #endif
-	ret = get_user_pages(current, bprm->mm, pos,
-			1, write, 1, &page, NULL);
+	/*
+	 * We are doing an exec().  'current' is the process
+	 * doing the exec and bprm->mm is the new process's mm.
+	 */
+	ret = get_user_pages_remote(current, bprm->mm, pos, 1, write,
+			1, &page, NULL);
 	if (ret <= 0)
 		return NULL;
 
@@ -756,10 +767,11 @@ static struct file *do_open_exec(struct filename *name)
 	static const struct open_flags open_exec_flags = {
 		.open_flag = O_LARGEFILE | O_RDONLY | __FMODE_EXEC,
 		.acc_mode = MAY_EXEC | MAY_OPEN,
-		.intent = LOOKUP_OPEN
+		.intent = LOOKUP_OPEN,
+		.lookup_flags = LOOKUP_FOLLOW,
 	};
 
-	file = do_filp_open(AT_FDCWD, name, &open_exec_flags, LOOKUP_FOLLOW);
+	file = do_filp_open(AT_FDCWD, name, &open_exec_flags);
 	if (IS_ERR(file))
 		goto out;
 
@@ -767,7 +779,7 @@ static struct file *do_open_exec(struct filename *name)
 	if (!S_ISREG(file_inode(file)->i_mode))
 		goto exit;
 
-	if (file->f_path.mnt->mnt_flags & MNT_NOEXEC)
+	if (path_noexec(&file->f_path))
 		goto exit;
 
 	fsnotify_open(file);
@@ -1246,10 +1258,10 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 	bprm->cred->euid = current_euid();
 	bprm->cred->egid = current_egid();
 
-	if (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID)
+	if (!mnt_may_suid(bprm->file->f_path.mnt))
 		return;
 
-	if (current->no_new_privs)
+	if (task_no_new_privs(current))
 		return;
 
 	inode = file_inode(bprm->file);
@@ -1285,7 +1297,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 /*
  * determine how safe it is to execute the proposed program
  * - the caller must hold ->cred_guard_mutex to protect against
- *   PTRACE_ATTACH
+ *   PTRACE_ATTACH or seccomp thread-sync
  */
 static int check_unsafe_exec(struct linux_binprm *bprm)
 {
@@ -1304,7 +1316,7 @@ static int check_unsafe_exec(struct linux_binprm *bprm)
 	 * This isn't strictly necessary, but it makes it harder for LSMs to
 	 * mess up.
 	 */
-	if (current->no_new_privs)
+	if (task_no_new_privs(current))
 		bprm->unsafe |= LSM_UNSAFE_NO_NEW_PRIVS;
 
 	n_fs = 1;

@@ -108,13 +108,6 @@ static int ena_change_mtu(struct net_device *dev, int new_mtu)
 	struct ena_adapter *adapter = netdev_priv(dev);
 	int ret;
 
-	if ((new_mtu > adapter->max_mtu) || (new_mtu < ENA_MIN_MTU)) {
-		netif_err(adapter, drv, dev,
-			  "Invalid MTU setting. new_mtu: %d\n", new_mtu);
-
-		return -EINVAL;
-	}
-
 	ret = ena_com_set_dev_mtu(adapter->ena_dev, new_mtu);
 	if (!ret) {
 		netif_dbg(adapter, drv, dev, "set MTU to %d\n", new_mtu);
@@ -703,6 +696,7 @@ static int validate_tx_req_id(struct ena_ring *tx_ring, u16 req_id)
 	struct ena_tx_buffer *tx_info = NULL;
 
 	if (likely(req_id < tx_ring->ring_size)) {
+		gmb();
 		tx_info = &tx_ring->tx_buffer_info[req_id];
 		if (likely(tx_info->skb))
 			return 0;
@@ -1152,6 +1146,26 @@ inline void ena_adjust_intr_moderation(struct ena_ring *rx_ring,
 	rx_ring->per_napi_bytes = 0;
 }
 
+static inline void ena_unmask_interrupt(struct ena_ring *tx_ring,
+					struct ena_ring *rx_ring)
+{
+	struct ena_eth_io_intr_reg intr_reg;
+
+	/* Update intr register: rx intr delay,
+	 * tx intr delay and interrupt unmask
+	 */
+	ena_com_update_intr_reg(&intr_reg,
+				rx_ring->smoothed_interval,
+				tx_ring->smoothed_interval,
+				true);
+
+	/* It is a shared MSI-X.
+	 * Tx and Rx CQ have pointer to it.
+	 * So we use one of them to reach the intr reg
+	 */
+	ena_com_unmask_intr(rx_ring->ena_com_io_cq, &intr_reg);
+}
+
 static inline void ena_update_ring_numa_node(struct ena_ring *tx_ring,
 					     struct ena_ring *rx_ring)
 {
@@ -1182,7 +1196,6 @@ static int ena_io_poll(struct napi_struct *napi, int budget)
 {
 	struct ena_napi *ena_napi = container_of(napi, struct ena_napi, napi);
 	struct ena_ring *tx_ring, *rx_ring;
-	struct ena_eth_io_intr_reg intr_reg;
 
 	u32 tx_work_done;
 	u32 rx_work_done;
@@ -1212,18 +1225,7 @@ static int ena_io_poll(struct napi_struct *napi, int budget)
 		if (ena_com_get_adaptive_moderation_enabled(rx_ring->ena_dev))
 			ena_adjust_intr_moderation(rx_ring, tx_ring);
 
-		/* Update intr register: rx intr delay, tx intr delay and
-		 * interrupt unmask
-		 */
-		ena_com_update_intr_reg(&intr_reg,
-					rx_ring->smoothed_interval,
-					tx_ring->smoothed_interval,
-					true);
-
-		/* It is a shared MSI-X. Tx and Rx CQ have pointer to it.
-		 * So we use one of them to reach the intr reg
-		 */
-		ena_com_unmask_intr(rx_ring->ena_com_io_cq, &intr_reg);
+		ena_unmask_interrupt(tx_ring, rx_ring);
 
 		ena_update_ring_numa_node(tx_ring, rx_ring);
 
@@ -1574,6 +1576,11 @@ static int ena_up_complete(struct ena_adapter *adapter)
 	ena_restore_ethtool_params(adapter);
 
 	ena_napi_enable_all(adapter);
+
+	/* Enable completion queues interrupt */
+	for (i = 0; i < adapter->num_queues; i++)
+		ena_unmask_interrupt(&adapter->tx_ring[i],
+				     &adapter->rx_ring[i]);
 
 	/* schedule napi in case we had pending packets
 	 * from the last time we disable napi
@@ -2273,32 +2280,50 @@ err:
 	ena_com_delete_debug_area(adapter->ena_dev);
 }
 
-static struct rtnl_link_stats64 *ena_get_stats64(struct net_device *netdev,
-						 struct rtnl_link_stats64 *stats)
+static void ena_get_stats64(struct net_device *netdev,
+			    struct rtnl_link_stats64 *stats)
 {
 	struct ena_adapter *adapter = netdev_priv(netdev);
-	struct ena_admin_basic_stats ena_stats;
-	int rc;
+	struct ena_ring *rx_ring, *tx_ring;
+	unsigned int start;
+	u64 rx_drops;
+	int i;
 
 	if (!test_bit(ENA_FLAG_DEV_UP, &adapter->flags))
-		return NULL;
+		return;
 
-	rc = ena_com_get_dev_basic_stats(adapter->ena_dev, &ena_stats);
-	if (rc)
-		return NULL;
+	for (i = 0; i < adapter->num_queues; i++) {
+		u64 bytes, packets;
 
-	stats->tx_bytes = ((u64)ena_stats.tx_bytes_high << 32) |
-		ena_stats.tx_bytes_low;
-	stats->rx_bytes = ((u64)ena_stats.rx_bytes_high << 32) |
-		ena_stats.rx_bytes_low;
+		tx_ring = &adapter->tx_ring[i];
 
-	stats->rx_packets = ((u64)ena_stats.rx_pkts_high << 32) |
-		ena_stats.rx_pkts_low;
-	stats->tx_packets = ((u64)ena_stats.tx_pkts_high << 32) |
-		ena_stats.tx_pkts_low;
+		do {
+			start = u64_stats_fetch_begin_irq(&tx_ring->syncp);
+			packets = tx_ring->tx_stats.cnt;
+			bytes = tx_ring->tx_stats.bytes;
+		} while (u64_stats_fetch_retry_irq(&tx_ring->syncp, start));
 
-	stats->rx_dropped = ((u64)ena_stats.rx_drops_high << 32) |
-		ena_stats.rx_drops_low;
+		stats->tx_packets += packets;
+		stats->tx_bytes += bytes;
+
+		rx_ring = &adapter->rx_ring[i];
+
+		do {
+			start = u64_stats_fetch_begin_irq(&rx_ring->syncp);
+			packets = rx_ring->rx_stats.cnt;
+			bytes = rx_ring->rx_stats.bytes;
+		} while (u64_stats_fetch_retry_irq(&rx_ring->syncp, start));
+
+		stats->rx_packets += packets;
+		stats->rx_bytes += bytes;
+	}
+
+	do {
+		start = u64_stats_fetch_begin_irq(&adapter->syncp);
+		rx_drops = adapter->dev_stats.rx_drops;
+	} while (u64_stats_fetch_retry_irq(&adapter->syncp, start));
+
+	stats->rx_dropped = rx_drops;
 
 	stats->multicast = 0;
 	stats->collisions = 0;
@@ -2312,18 +2337,17 @@ static struct rtnl_link_stats64 *ena_get_stats64(struct net_device *netdev,
 
 	stats->rx_errors = 0;
 	stats->tx_errors = 0;
-
-	return stats;
 }
 
 static const struct net_device_ops ena_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= ena_open,
 	.ndo_stop		= ena_close,
 	.ndo_start_xmit		= ena_start_xmit,
 	.ndo_select_queue	= ena_select_queue,
 	.ndo_get_stats64	= ena_get_stats64,
 	.ndo_tx_timeout		= ena_tx_timeout,
-	.ndo_change_mtu		= ena_change_mtu,
+	.extended.ndo_change_mtu		= ena_change_mtu,
 	.ndo_set_mac_address	= NULL,
 	.ndo_validate_addr	= eth_validate_addr,
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -2978,6 +3002,8 @@ static void ena_set_conf_feat_params(struct ena_adapter *adapter,
 	ena_set_dev_offloads(feat, netdev);
 
 	adapter->max_mtu = feat->dev_attr.max_mtu;
+	netdev->extended->max_mtu = adapter->max_mtu;
+	netdev->extended->min_mtu = ENA_MIN_MTU;
 }
 
 static int ena_rss_init_default(struct ena_adapter *adapter)

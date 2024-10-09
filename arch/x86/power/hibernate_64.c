@@ -131,7 +131,8 @@ static int relocate_restore_code(void)
 	memcpy((void *)relocated_restore_code, &core_restore_code, PAGE_SIZE);
 
 	/* Make the page containing the relocated code executable */
-	pgd = (pgd_t *)__va(read_cr3()) + pgd_index(relocated_restore_code);
+	pgd = (pgd_t *)__va(read_cr3_pa()) +
+		pgd_index(relocated_restore_code);
 	pud = pud_offset(pgd, relocated_restore_code);
 	if (pud_large(*pud)) {
 		set_pud(pud, __pud(pud_val(*pud) & ~_PAGE_NX));

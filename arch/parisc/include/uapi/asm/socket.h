@@ -73,4 +73,6 @@
 
 #define SO_SELECT_ERR_QUEUE	0x4026
 
+#define SCM_TIMESTAMPING_PKTINFO	58
+
 #endif /* _UAPI_ASM_SOCKET_H */

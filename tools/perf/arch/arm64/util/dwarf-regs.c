@@ -8,8 +8,11 @@
  * published by the Free Software Foundation.
  */
 
+#include <errno.h>
 #include <stddef.h>
+#include <string.h>
 #include <dwarf-regs.h>
+#include <linux/stringify.h>
 
 struct pt_regs_dwarfnum {
 	const char *name;
@@ -19,7 +22,7 @@ struct pt_regs_dwarfnum {
 #define STR(s) #s
 #define REG_DWARFNUM_NAME(r, num) {.name = r, .dwarfnum = num}
 #define GPR_DWARFNUM_NAME(num) \
-	{.name = STR(%x##num), .dwarfnum = num}
+	{.name = __stringify(%x##num), .dwarfnum = num}
 #define REG_DWARFNUM_END {.name = NULL, .dwarfnum = 0}
 
 /*

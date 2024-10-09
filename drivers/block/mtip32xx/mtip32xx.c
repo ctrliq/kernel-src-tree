@@ -194,7 +194,7 @@ static struct mtip_cmd *mtip_get_int_command(struct driver_data *dd)
 	if (mtip_check_surprise_removal(dd->pdev))
 		return NULL;
 
-	rq = blk_mq_alloc_request(dd->queue, REQ_OP_DRV_IN, BLK_MQ_REQ_RESERVED);
+	rq = blk_mq_alloc_request(dd->queue, READ, BLK_MQ_REQ_RESERVED);
 	if (IS_ERR(rq))
 		return NULL;
 
@@ -1179,7 +1179,7 @@ static int mtip_exec_internal_command(struct mtip_port *port,
 	blk_execute_rq_nowait(rq->q, NULL, rq, true, NULL);
 
 	wait_for_completion(&wait);
-	rv = int_cmd->status;
+	rv = rq->errors;
 
 	if (rv < 0) {
 		if (rv == -ERESTARTSYS) { /* interrupted */
@@ -3793,6 +3793,11 @@ static int mtip_issue_reserved_cmd(struct blk_mq_hw_ctx *hctx,
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
+static inline bool mtip_rq_is_reserved(struct request *rq)
+{
+	return rq->tag == 0;
+}
+
 static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 const struct blk_mq_queue_data *bd)
 {
@@ -3801,7 +3806,7 @@ static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	mtip_init_cmd_header(rq);
 
-	if (blk_rq_is_passthrough(rq))
+	if (mtip_rq_is_reserved(rq))
 		return mtip_issue_reserved_cmd(hctx, rq);
 
 	if (unlikely(mtip_check_unal_depth(hctx, rq)))
@@ -3863,7 +3868,7 @@ static enum blk_eh_timer_return mtip_cmd_timeout(struct request *req,
 	if (reserved) {
 		struct mtip_cmd *cmd = blk_mq_rq_to_pdu(req);
 
-		cmd->status = -ETIME;
+		req->errors = -ETIME;
 		if (cmd->comp_func)
 			cmd->comp_func(dd->port, MTIP_TAG_INTERNAL, cmd, -ETIME);
 		goto exit_handler;
@@ -3882,7 +3887,6 @@ exit_handler:
 
 static struct blk_mq_ops mtip_mq_ops = {
 	.queue_rq	= mtip_queue_rq,
-	.map_queue	= blk_mq_map_queue,
 	.init_request	= mtip_init_cmd,
 	.exit_request	= mtip_free_cmd,
 	.complete	= mtip_softirq_done_fn,
@@ -4112,7 +4116,7 @@ static void mtip_no_dev_cleanup(struct request *rq, void *data, bool reserv)
 	else if (test_bit(MTIP_PF_IC_ACTIVE_BIT, &dd->port->flags)) {
 
 		cmd = mtip_cmd_from_tag(dd, MTIP_TAG_INTERNAL);
-		cmd->status = -ENODEV;
+		rq->errors = -ENODEV;
 		if (cmd->comp_func)
 			cmd->comp_func(dd->port, MTIP_TAG_INTERNAL,
 					cmd, -ENODEV);

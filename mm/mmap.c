@@ -37,6 +37,7 @@
 #include <linux/notifier.h>
 #include <linux/memory.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/pkeys.h>
 
 #include <asm/uaccess.h>
 #include <asm/cacheflush.h>
@@ -106,13 +107,16 @@ static pgprot_t vm_pgprot_modify(pgprot_t oldprot, unsigned long vm_flags)
 void vma_set_page_prot(struct vm_area_struct *vma)
 {
 	unsigned long vm_flags = vma->vm_flags;
+	pgprot_t vm_page_prot;
 
-	vma->vm_page_prot = vm_pgprot_modify(vma->vm_page_prot, vm_flags);
-	if (vma_wants_writenotify(vma)) {
+	vm_page_prot = vm_pgprot_modify(vma->vm_page_prot, vm_flags);
+	if (vma_wants_writenotify(vma, vm_page_prot)) {
 		vm_flags &= ~VM_SHARED;
-		vma->vm_page_prot = vm_pgprot_modify(vma->vm_page_prot,
-						     vm_flags);
+		vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags);
 	}
+
+	/* remove_protection_ptes reads vma->vm_page_prot without mmap_sem */
+	WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
 }
 
 
@@ -1397,14 +1401,14 @@ static inline unsigned long round_hint_to_min(unsigned long hint)
  * The caller must hold down_write(&current->mm->mmap_sem).
  */
 
-unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+unsigned long do_mmap(struct file *file, unsigned long addr,
 			unsigned long len, unsigned long prot,
-			unsigned long flags, unsigned long pgoff,
-			unsigned long *populate,
+			unsigned long flags, vm_flags_t vm_flags,
+			unsigned long pgoff, unsigned long *populate,
 			struct list_head *uf)
 {
 	struct mm_struct * mm = current->mm;
-	vm_flags_t vm_flags;
+	int pkey = 0;
 
 	*populate = 0;
 
@@ -1415,7 +1419,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 	 *  mounted, in which case we dont add PROT_EXEC.)
 	 */
 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
-		if (!(file && (file->f_path.mnt->mnt_flags & MNT_NOEXEC)))
+		if (!(file && path_noexec(&file->f_path)))
 			prot |= PROT_EXEC;
 
 	if (!len)
@@ -1444,11 +1448,17 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 	if (offset_in_page(addr))
 		return addr;
 
+	if (prot == PROT_EXEC) {
+		pkey = execute_only_pkey(mm);
+		if (pkey < 0)
+			pkey = 0;
+	}
+
 	/* Do simple checking here so the lower-level routines won't have
 	 * to. we assume access permissions have been handled by the open
 	 * of the memory object, so we don't do any here.
 	 */
-	vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags) |
+	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 
 	if (flags & MAP_LOCKED)
@@ -1495,7 +1505,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 		case MAP_PRIVATE:
 			if (!(file->f_mode & FMODE_READ))
 				return -EACCES;
-			if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
+			if (path_noexec(&file->f_path)) {
 				if (vm_flags & VM_EXEC)
 					return -EPERM;
 				vm_flags &= ~VM_MAYEXEC;
@@ -1628,7 +1638,7 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
  * to the private version (using protection_map[] without the
  * VM_SHARED bit).
  */
-int vma_wants_writenotify(struct vm_area_struct *vma)
+int vma_wants_writenotify(struct vm_area_struct *vma, pgprot_t vm_page_prot)
 {
 	vm_flags_t vm_flags = vma->vm_flags;
 	const struct vm_operations_struct *vm_ops = vma->vm_ops;
@@ -1643,8 +1653,8 @@ int vma_wants_writenotify(struct vm_area_struct *vma)
 
 	/* The open routine did something to the protections that pgprot_modify
 	 * won't preserve? */
-	if (pgprot_val(vma->vm_page_prot) !=
-	    pgprot_val(vm_pgprot_modify(vma->vm_page_prot, vm_flags)))
+	if (pgprot_val(vm_page_prot) !=
+	    pgprot_val(vm_pgprot_modify(vm_page_prot, vm_flags)))
 		return 0;
 
 	/* Do we need to track softdirty? */
@@ -2654,9 +2664,11 @@ static int __split_vma(struct mm_struct * mm, struct vm_area_struct * vma,
 	struct vm_area_struct *new;
 	int err = -ENOMEM;
 
-	if (is_vm_hugetlb_page(vma) && (addr &
-					~(huge_page_mask(hstate_vma(vma)))))
-		return -EINVAL;
+	if (vma->vm_ops && (vma->vm_flags2 & VM_SPLIT) && vma->vm_ops->split) {
+		err = vma->vm_ops->split(vma, addr);
+		if (err)
+			return err;
+	}
 
 	new = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
 	if (!new)

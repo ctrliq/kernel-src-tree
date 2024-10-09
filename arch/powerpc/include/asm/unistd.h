@@ -17,6 +17,10 @@
 #define __NR__exit __NR_exit
 #define NR_syscalls	__NR_syscalls
 
+#define __IGNORE_pkey_mprotect
+#define __IGNORE_pkey_alloc
+#define __IGNORE_pkey_free
+
 #ifndef __ASSEMBLY__
 
 #include <linux/types.h>

@@ -333,15 +333,9 @@ static int i40e_add_del_fdir_tcpv4(struct i40e_vsi *vsi,
 		if ((pf->flags & I40E_FLAG_FD_ATR_ENABLED) &&
 		    I40E_DEBUG_FD & pf->hw.debug_mask)
 			dev_info(&pf->pdev->dev, "Forcing ATR off, sideband rules for TCP/IPv4 flow being applied\n");
-		pf->hw_disabled_flags |= I40E_FLAG_FD_ATR_ENABLED;
+		pf->flags |= I40E_FLAG_FD_ATR_AUTO_DISABLED;
 	} else {
 		pf->fd_tcp4_filter_cnt--;
-		if (pf->fd_tcp4_filter_cnt == 0) {
-			if ((pf->flags & I40E_FLAG_FD_ATR_ENABLED) &&
-			    I40E_DEBUG_FD & pf->hw.debug_mask)
-				dev_info(&pf->pdev->dev, "ATR re-enabled due to no sideband TCP/IPv4 rules\n");
-			pf->hw_disabled_flags &= ~I40E_FLAG_FD_ATR_ENABLED;
-		}
 	}
 
 	return 0;
@@ -589,7 +583,7 @@ static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
 		 * progress do nothing, once flush is complete the state will
 		 * be cleared.
 		 */
-		if (test_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state))
+		if (test_bit(__I40E_FD_FLUSH_REQUESTED, pf->state))
 			return;
 
 		pf->fd_add_err++;
@@ -597,9 +591,9 @@ static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
 		pf->fd_atr_cnt = i40e_get_current_atr_cnt(pf);
 
 		if ((rx_desc->wb.qword0.hi_dword.fd_id == 0) &&
-		    (pf->hw_disabled_flags & I40E_FLAG_FD_SB_ENABLED)) {
-			pf->hw_disabled_flags |= I40E_FLAG_FD_ATR_ENABLED;
-			set_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state);
+		    pf->flags & I40E_FLAG_FD_SB_AUTO_DISABLED) {
+			pf->flags |= I40E_FLAG_FD_ATR_AUTO_DISABLED;
+			set_bit(__I40E_FD_FLUSH_REQUESTED, pf->state);
 		}
 
 		/* filter programming failed most likely due to table full */
@@ -611,12 +605,10 @@ static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
 		 */
 		if (fcnt_prog >= (fcnt_avail - I40E_FDIR_BUFFER_FULL_MARGIN)) {
 			if ((pf->flags & I40E_FLAG_FD_SB_ENABLED) &&
-			    !(pf->hw_disabled_flags &
-				     I40E_FLAG_FD_SB_ENABLED)) {
+			    !(pf->flags & I40E_FLAG_FD_SB_AUTO_DISABLED)) {
+				pf->flags |= I40E_FLAG_FD_SB_AUTO_DISABLED;
 				if (I40E_DEBUG_FD & pf->hw.debug_mask)
 					dev_warn(&pdev->dev, "FD filter space full, new ntuple rules will not be added\n");
-				pf->hw_disabled_flags |=
-							I40E_FLAG_FD_SB_ENABLED;
 			}
 		}
 	} else if (error == BIT(I40E_RX_PROG_STATUS_DESC_NO_FD_ENTRY_SHIFT)) {
@@ -850,7 +842,7 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 
 		if (budget &&
 		    ((j / WB_STRIDE) == 0) && (j > 0) &&
-		    !test_bit(__I40E_DOWN, &vsi->state) &&
+		    !test_bit(__I40E_VSI_DOWN, vsi->state) &&
 		    (I40E_DESC_UNUSED(tx_ring) != tx_ring->count))
 			tx_ring->arm_wb = true;
 	}
@@ -868,7 +860,7 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 		smp_mb();
 		if (__netif_subqueue_stopped(tx_ring->netdev,
 					     tx_ring->queue_index) &&
-		   !test_bit(__I40E_DOWN, &vsi->state)) {
+		   !test_bit(__I40E_VSI_DOWN, vsi->state)) {
 			netif_wake_subqueue(tx_ring->netdev,
 					    tx_ring->queue_index);
 			++tx_ring->tx_stats.restart_queue;
@@ -1037,6 +1029,32 @@ reset_latency:
 }
 
 /**
+ * i40e_reuse_rx_page - page flip buffer and store it back on the ring
+ * @rx_ring: rx descriptor ring to store buffers on
+ * @old_buff: donor buffer to have page reused
+ *
+ * Synchronizes page for reuse by the adapter
+ **/
+static void i40e_reuse_rx_page(struct i40e_ring *rx_ring,
+			       struct i40e_rx_buffer *old_buff)
+{
+	struct i40e_rx_buffer *new_buff;
+	u16 nta = rx_ring->next_to_alloc;
+
+	new_buff = &rx_ring->rx_bi[nta];
+
+	/* update, and store next to alloc */
+	nta++;
+	rx_ring->next_to_alloc = (nta < rx_ring->count) ? nta : 0;
+
+	/* transfer page from old buffer to new buffer */
+	new_buff->dma		= old_buff->dma;
+	new_buff->page		= old_buff->page;
+	new_buff->page_offset	= old_buff->page_offset;
+	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
+}
+
+/**
  * i40e_rx_is_programming_status - check for programming status descriptor
  * @qw: qword representing status_error_len in CPU ordering
  *
@@ -1070,25 +1088,29 @@ static void i40e_clean_programming_status(struct i40e_ring *rx_ring,
 					  union i40e_rx_desc *rx_desc,
 					  u64 qw)
 {
-	u32 ntc = rx_ring->next_to_clean + 1;
+	struct i40e_rx_buffer *rx_buffer;
+	u32 ntc = rx_ring->next_to_clean;
 	u8 id;
 
 	/* fetch, update, and store next to clean */
+	rx_buffer = &rx_ring->rx_bi[ntc++];
 	ntc = (ntc < rx_ring->count) ? ntc : 0;
 	rx_ring->next_to_clean = ntc;
 
 	prefetch(I40E_RX_DESC(rx_ring, ntc));
+
+	/* place unused page back on the ring */
+	i40e_reuse_rx_page(rx_ring, rx_buffer);
+	rx_ring->rx_stats.page_reuse_count++;
+
+	/* clear contents of buffer_info */
+	rx_buffer->page = NULL;
 
 	id = (qw & I40E_RX_PROG_STATUS_DESC_QW1_PROGID_MASK) >>
 		  I40E_RX_PROG_STATUS_DESC_QW1_PROGID_SHIFT;
 
 	if (id == I40E_RX_PROG_STATUS_DESC_FD_FILTER_STATUS)
 		i40e_fd_handle_status(rx_ring, rx_desc, id);
-#ifdef I40E_FCOE
-	else if ((id == I40E_RX_PROG_STATUS_DESC_FCOE_CTXT_PROG_STATUS) ||
-		 (id == I40E_RX_PROG_STATUS_DESC_FCOE_CTXT_INVL_STATUS))
-		i40e_fcoe_handle_status(rx_ring, rx_desc, id);
-#endif
 }
 
 /**
@@ -1147,6 +1169,7 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 {
 	unsigned long bi_size;
 	u16 i;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* ring already cleared, nothing to do */
 	if (!rx_ring->rx_bi)
@@ -1170,14 +1193,17 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 		dma_sync_single_range_for_cpu(rx_ring->dev,
 					      rx_bi->dma,
 					      rx_bi->page_offset,
-					      I40E_RXBUFFER_2048,
+					      rx_ring->rx_buf_len,
 					      DMA_FROM_DEVICE);
 
 		/* free resources associated with mapping */
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		dma_unmap_page_attrs(rx_ring->dev, rx_bi->dma,
-				     PAGE_SIZE,
+				     i40e_rx_pg_size(rx_ring),
 				     DMA_FROM_DEVICE,
-				     I40E_RX_DMA_ATTR);
+				     &attrs);
+
 		__page_frag_cache_drain(rx_bi->page, rx_bi->pagecnt_bias);
 
 		rx_bi->page = NULL;
@@ -1279,6 +1305,17 @@ static inline void i40e_release_rx_desc(struct i40e_ring *rx_ring, u32 val)
 }
 
 /**
+ * i40e_rx_offset - Return expected offset into page to access data
+ * @rx_ring: Ring we are requesting offset of
+ *
+ * Returns the offset value for ring into the data buffer.
+ */
+static inline unsigned int i40e_rx_offset(struct i40e_ring *rx_ring)
+{
+	return ring_uses_build_skb(rx_ring) ? I40E_SKB_PAD : 0;
+}
+
+/**
  * i40e_alloc_mapped_page - recycle or make a new page
  * @rx_ring: ring to use
  * @bi: rx_buffer struct to modify
@@ -1291,6 +1328,7 @@ static bool i40e_alloc_mapped_page(struct i40e_ring *rx_ring,
 {
 	struct page *page = bi->page;
 	dma_addr_t dma;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* since we are recycling buffers we should seldom need to alloc */
 	if (likely(page)) {
@@ -1299,30 +1337,32 @@ static bool i40e_alloc_mapped_page(struct i40e_ring *rx_ring,
 	}
 
 	/* alloc new page for storage */
-	page = dev_alloc_page();
+	page = dev_alloc_pages(i40e_rx_pg_order(rx_ring));
 	if (unlikely(!page)) {
 		rx_ring->rx_stats.alloc_page_failed++;
 		return false;
 	}
 
 	/* map page for use */
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+	dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
-				 PAGE_SIZE,
+				 i40e_rx_pg_size(rx_ring),
 				 DMA_FROM_DEVICE,
-				 I40E_RX_DMA_ATTR);
+				 &attrs);
 
 	/* if mapping failed free memory back to system since
 	 * there isn't much point in holding memory we can't use
 	 */
 	if (dma_mapping_error(rx_ring->dev, dma)) {
-		__free_pages(page, 0);
+		__free_pages(page, i40e_rx_pg_order(rx_ring));
 		rx_ring->rx_stats.alloc_page_failed++;
 		return false;
 	}
 
 	bi->dma = dma;
 	bi->page = page;
-	bi->page_offset = 0;
+	bi->page_offset = i40e_rx_offset(rx_ring);
 
 	/* initialize pagecnt_bias to 1 representing we fully own page */
 	bi->pagecnt_bias = 1;
@@ -1375,7 +1415,7 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 		/* sync the buffer for use by the device */
 		dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
 						 bi->page_offset,
-						 I40E_RXBUFFER_2048,
+						 rx_ring->rx_buf_len,
 						 DMA_FROM_DEVICE);
 
 		/* Refresh the desc even if buffer_addrs didn't change
@@ -1610,32 +1650,6 @@ static bool i40e_cleanup_headers(struct i40e_ring *rx_ring, struct sk_buff *skb)
 }
 
 /**
- * i40e_reuse_rx_page - page flip buffer and store it back on the ring
- * @rx_ring: rx descriptor ring to store buffers on
- * @old_buff: donor buffer to have page reused
- *
- * Synchronizes page for reuse by the adapter
- **/
-static void i40e_reuse_rx_page(struct i40e_ring *rx_ring,
-			       struct i40e_rx_buffer *old_buff)
-{
-	struct i40e_rx_buffer *new_buff;
-	u16 nta = rx_ring->next_to_alloc;
-
-	new_buff = &rx_ring->rx_bi[nta];
-
-	/* update, and store next to alloc */
-	nta++;
-	rx_ring->next_to_alloc = (nta < rx_ring->count) ? nta : 0;
-
-	/* transfer page from old buffer to new buffer */
-	new_buff->dma		= old_buff->dma;
-	new_buff->page		= old_buff->page;
-	new_buff->page_offset	= old_buff->page_offset;
-	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
-}
-
-/**
  * i40e_page_is_reusable - check if any reuse is possible
  * @page: page struct to check
  *
@@ -1677,9 +1691,6 @@ static inline bool i40e_page_is_reusable(struct page *page)
  **/
 static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer)
 {
-#if (PAGE_SIZE >= 8192)
-	unsigned int last_offset = PAGE_SIZE - I40E_RXBUFFER_2048;
-#endif
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
 
@@ -1692,7 +1703,9 @@ static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer)
 	if (unlikely((page_count(page) - pagecnt_bias) > 1))
 		return false;
 #else
-	if (rx_buffer->page_offset > last_offset)
+#define I40E_LAST_OFFSET \
+	(SKB_WITH_OVERHEAD(PAGE_SIZE) - I40E_RXBUFFER_2048)
+	if (rx_buffer->page_offset > I40E_LAST_OFFSET)
 		return false;
 #endif
 
@@ -1726,9 +1739,9 @@ static void i40e_add_rx_frag(struct i40e_ring *rx_ring,
 			     unsigned int size)
 {
 #if (PAGE_SIZE < 8192)
-	unsigned int truesize = I40E_RXBUFFER_2048;
+	unsigned int truesize = i40e_rx_pg_size(rx_ring) / 2;
 #else
-	unsigned int truesize = SKB_DATA_ALIGN(size);
+	unsigned int truesize = SKB_DATA_ALIGN(size + i40e_rx_offset(rx_ring));
 #endif
 
 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, rx_buffer->page,
@@ -1787,7 +1800,7 @@ static struct sk_buff *i40e_construct_skb(struct i40e_ring *rx_ring,
 {
 	void *va = page_address(rx_buffer->page) + rx_buffer->page_offset;
 #if (PAGE_SIZE < 8192)
-	unsigned int truesize = I40E_RXBUFFER_2048;
+	unsigned int truesize = i40e_rx_pg_size(rx_ring) / 2;
 #else
 	unsigned int truesize = SKB_DATA_ALIGN(size);
 #endif
@@ -1893,14 +1906,19 @@ static struct sk_buff *i40e_build_skb(struct i40e_ring *rx_ring,
 static void i40e_put_rx_buffer(struct i40e_ring *rx_ring,
 			       struct i40e_rx_buffer *rx_buffer)
 {
+	DEFINE_DMA_ATTRS(attrs);
+
 	if (i40e_can_reuse_rx_page(rx_buffer)) {
 		/* hand second half of page back to the ring */
 		i40e_reuse_rx_page(rx_ring, rx_buffer);
 		rx_ring->rx_stats.page_reuse_count++;
 	} else {
 		/* we are not reusing the buffer so unmap it */
-		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma, PAGE_SIZE,
-				     DMA_FROM_DEVICE, I40E_RX_DMA_ATTR);
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
+		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
+				     i40e_rx_pg_size(rx_ring),
+				     DMA_FROM_DEVICE, &attrs);
 		__page_frag_cache_drain(rx_buffer->page,
 					rx_buffer->pagecnt_bias);
 	}
@@ -2051,15 +2069,6 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 		/* populate checksum, VLAN, and protocol */
 		i40e_process_skb_fields(rx_ring, rx_desc, skb, rx_ptype);
 
-#ifdef I40E_FCOE
-		if (unlikely(
-		    i40e_rx_is_fcoe(rx_ptype) &&
-		    !i40e_fcoe_handle_offload(rx_ring, rx_desc, skb))) {
-			dev_kfree_skb_any(skb);
-			continue;
-		}
-#endif
-
 		vlan_tag = (qword & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)) ?
 			   le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1) : 0;
 
@@ -2089,9 +2098,7 @@ static u32 i40e_buildreg_itr(const int type, const u16 itr)
 	u32 val;
 
 	val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
-	      /* Don't clear PBA because that can cause lost interrupts that
-	       * came in while we were cleaning/polling
-	       */
+	      I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
 	      (type << I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT) |
 	      (itr << I40E_PFINT_DYN_CTLN_INTERVAL_SHIFT);
 
@@ -2128,7 +2135,7 @@ static inline void i40e_update_enable_itr(struct i40e_vsi *vsi,
 
 	/* If we don't have MSIX, then we only need to re-enable icr0 */
 	if (!(vsi->back->flags & I40E_FLAG_MSIX_ENABLED)) {
-		i40e_irq_dynamic_enable_icr0(vsi->back, false);
+		i40e_irq_dynamic_enable_icr0(vsi->back);
 		return;
 	}
 
@@ -2186,7 +2193,7 @@ static inline void i40e_update_enable_itr(struct i40e_vsi *vsi,
 	}
 
 enable_int:
-	if (!test_bit(__I40E_DOWN, &vsi->state))
+	if (!test_bit(__I40E_VSI_DOWN, vsi->state))
 		wr32(hw, INTREG(vector - 1), txval);
 
 	if (q_vector->itr_countdown)
@@ -2215,7 +2222,7 @@ int i40e_napi_poll(struct napi_struct *napi, int budget)
 	int budget_per_ring;
 	int work_done = 0;
 
-	if (test_bit(__I40E_DOWN, &vsi->state)) {
+	if (test_bit(__I40E_VSI_DOWN, vsi->state)) {
 		napi_complete(napi);
 		return 0;
 	}
@@ -2316,7 +2323,7 @@ static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
 	if (!(pf->flags & I40E_FLAG_FD_ATR_ENABLED))
 		return;
 
-	if ((pf->hw_disabled_flags & I40E_FLAG_FD_ATR_ENABLED))
+	if (pf->flags & I40E_FLAG_FD_ATR_AUTO_DISABLED)
 		return;
 
 	/* if sampling is disabled do nothing */
@@ -2356,9 +2363,9 @@ static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
 	th = (struct tcphdr *)(hdr.network + hlen);
 
 	/* Due to lack of space, no more new filters can be programmed */
-	if (th->syn && (pf->hw_disabled_flags & I40E_FLAG_FD_ATR_ENABLED))
+	if (th->syn && (pf->flags & I40E_FLAG_FD_ATR_AUTO_DISABLED))
 		return;
-	if (pf->flags & I40E_FLAG_HW_ATR_EVICT_CAPABLE) {
+	if (pf->flags & I40E_FLAG_HW_ATR_EVICT_ENABLED) {
 		/* HW ATR eviction will take care of removing filters on FIN
 		 * and RST packets.
 		 */
@@ -2420,7 +2427,7 @@ static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
 			I40E_TXD_FLTR_QW1_CNTINDEX_SHIFT) &
 			I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
 
-	if (pf->flags & I40E_FLAG_HW_ATR_EVICT_CAPABLE)
+	if (pf->flags & I40E_FLAG_HW_ATR_EVICT_ENABLED)
 		dtype_cmd |= I40E_TXD_FLTR_QW1_ATR_MASK;
 
 	fdir_desc->qindex_flex_ptype_vsi = cpu_to_le32(flex_ptype);
@@ -2441,15 +2448,9 @@ static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
  * Returns error code indicate the frame should be dropped upon error and the
  * otherwise  returns 0 to indicate the flags has been set properly.
  **/
-#ifdef I40E_FCOE
-inline int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
-				      struct i40e_ring *tx_ring,
-				      u32 *flags)
-#else
 static inline int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
 					     struct i40e_ring *tx_ring,
 					     u32 *flags)
-#endif
 {
 	__be16 protocol = skb->protocol;
 	u32  tx_flags = 0;
@@ -2650,7 +2651,7 @@ static int i40e_tsyn(struct i40e_ring *tx_ring, struct sk_buff *skb,
 		return 0;
 
 	if (pf->ptp_tx &&
-	    !test_and_set_bit_lock(__I40E_PTP_TX_IN_PROGRESS, &pf->state)) {
+	    !test_and_set_bit_lock(__I40E_PTP_TX_IN_PROGRESS, pf->state)) {
 		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 		pf->ptp_tx_start = jiffies;
 		pf->ptp_tx_skb = skb_get(skb);
@@ -2958,16 +2959,12 @@ bool __i40e_chk_linearize(struct sk_buff *skb)
  * @hdr_len:  size of the packet header
  * @td_cmd:   the command field in the descriptor
  * @td_offset: offset for checksum or crc
+ *
+ * Returns 0 on success, -1 on failure to DMA
  **/
-#ifdef I40E_FCOE
-inline void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
-			struct i40e_tx_buffer *first, u32 tx_flags,
-			const u8 hdr_len, u32 td_cmd, u32 td_offset)
-#else
-static inline void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
-			       struct i40e_tx_buffer *first, u32 tx_flags,
-			       const u8 hdr_len, u32 td_cmd, u32 td_offset)
-#endif
+static inline int i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
+			      struct i40e_tx_buffer *first, u32 tx_flags,
+			      const u8 hdr_len, u32 td_cmd, u32 td_offset)
 {
 	unsigned int data_len = skb->data_len;
 	unsigned int size = skb_headlen(skb);
@@ -3099,7 +3096,7 @@ static inline void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
 		mmiowb();
 	}
 
-	return;
+	return 0;
 
 dma_error:
 	dev_info(tx_ring->dev, "TX DMA map failed\n");
@@ -3116,6 +3113,8 @@ dma_error:
 	}
 
 	tx_ring->next_to_use = i;
+
+	return -1;
 }
 
 /**
@@ -3216,8 +3215,9 @@ static netdev_tx_t i40e_xmit_frame_ring(struct sk_buff *skb,
 	 */
 	i40e_atr(tx_ring, skb, tx_flags);
 
-	i40e_tx_map(tx_ring, skb, first, tx_flags, hdr_len,
-		    td_cmd, td_offset);
+	if (i40e_tx_map(tx_ring, skb, first, tx_flags, hdr_len,
+			td_cmd, td_offset))
+		goto cleanup_tx_tstamp;
 
 	return NETDEV_TX_OK;
 
@@ -3225,6 +3225,15 @@ out_drop:
 	i40e_trace(xmit_frame_ring_drop, first->skb, tx_ring);
 	dev_kfree_skb_any(first->skb);
 	first->skb = NULL;
+cleanup_tx_tstamp:
+	if (unlikely(tx_flags & I40E_TX_FLAGS_TSYN)) {
+		struct i40e_pf *pf = i40e_netdev_to_pf(tx_ring->netdev);
+
+		dev_kfree_skb_any(pf->ptp_tx_skb);
+		pf->ptp_tx_skb = NULL;
+		clear_bit_unlock(__I40E_PTP_TX_IN_PROGRESS, pf->state);
+	}
+
 	return NETDEV_TX_OK;
 }
 

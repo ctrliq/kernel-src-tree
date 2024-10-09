@@ -757,7 +757,7 @@ static const struct net_device_ops cdc_ncm_netdev_ops = {
 	.ndo_stop	     = usbnet_stop,
 	.ndo_start_xmit	     = usbnet_start_xmit,
 	.ndo_tx_timeout	     = usbnet_tx_timeout,
-	.ndo_change_mtu	     = cdc_ncm_change_mtu,
+	.ndo_change_mtu_rh74 = cdc_ncm_change_mtu,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr   = eth_validate_addr,
 };
@@ -1250,7 +1250,7 @@ cdc_ncm_fill_tx_frame(struct usbnet *dev, struct sk_buff *skb, __le32 sign)
 		memset(skb_put(skb_out, ctx->tx_max - skb_out->len), 0,
 		       ctx->tx_max - skb_out->len);
 	else if (skb_out->len < ctx->tx_max && (skb_out->len % dev->maxpacket) == 0)
-		*skb_put(skb_out, 1) = 0;	/* force short packet */
+		*(u8 *)skb_put(skb_out, 1) = 0;	/* force short packet */
 
 	/* set final frame length */
 	nth16 = (struct usb_cdc_ncm_nth16 *)skb_out->data;

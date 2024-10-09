@@ -303,9 +303,15 @@ static void acpi_bus_osc_support(void)
 #ifdef CONFIG_X86
 	if (boot_cpu_has(X86_FEATURE_HWP)) {
 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_CPC_SUPPORT;
+#if 0
+		/* Not supported in RHEL7 */
 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_CPCV2_SUPPORT;
+#endif
 	}
 #endif
+
+	if (IS_ENABLED(CONFIG_SCHED_MC_PRIO))
+		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_CPC_DIVERSE_HIGH_SUPPORT;
 
 	if (!ghes_disable)
 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_APEI_SUPPORT;
@@ -504,6 +510,37 @@ static void acpi_bus_notify(acpi_handle handle, u32 type, void *data)
 }
 
 /* --------------------------------------------------------------------------
+                             Device Matching
+   -------------------------------------------------------------------------- */
+
+/**
+ * acpi_get_first_physical_node - Get first physical node of an ACPI device
+ * @adev:       ACPI device in question
+ *
+ * Return: First physical node of ACPI device @adev
+ */
+struct device *acpi_get_first_physical_node(struct acpi_device *adev)
+{
+        struct mutex *physical_node_lock = &adev->physical_node_lock;
+        struct device *phys_dev;
+
+        mutex_lock(physical_node_lock);
+        if (list_empty(&adev->physical_node_list)) {
+                phys_dev = NULL;
+        } else {
+                const struct acpi_device_physical_node *node;
+
+                node = list_first_entry(&adev->physical_node_list,
+                                        struct acpi_device_physical_node, node);
+
+                phys_dev = node->dev;
+        }
+        mutex_unlock(physical_node_lock);
+        return phys_dev;
+}
+
+
+/* --------------------------------------------------------------------------
                              Initialization/Cleanup
    -------------------------------------------------------------------------- */
 
@@ -627,6 +664,13 @@ void __init acpi_early_init(void)
 	return;
 }
 
+static acpi_status acpi_bus_table_handler(u32 event, void *table, void *context)
+{
+	acpi_scan_table_handler(event, table, context);
+
+	return acpi_sysfs_table_handler(event, table, context);
+}
+
 static int __init acpi_bus_init(void)
 {
 	int result;
@@ -671,6 +715,8 @@ static int __init acpi_bus_init(void)
 	 * _PDC control method may load dynamic SSDT tables,
 	 * and we need to install the table handler before that.
 	 */
+	status = acpi_install_table_handler(acpi_bus_table_handler, NULL);
+
 	acpi_sysfs_init();
 
 	acpi_early_processor_set_pdc();

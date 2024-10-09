@@ -1861,7 +1861,6 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 static int path_init(int dfd, const char *name, unsigned int flags,
 		     struct nameidata *nd, struct file **fp)
 {
-	int retval = 0;
 
 	nd->last_type = LAST_ROOT; /* if there are only slashes... */
 	nd->flags = flags | LOOKUP_JUMPED;
@@ -1869,13 +1868,8 @@ static int path_init(int dfd, const char *name, unsigned int flags,
 	if (flags & LOOKUP_ROOT) {
 		struct dentry *root = nd->root.dentry;
 		struct inode *inode = root->d_inode;
-		if (*name) {
-			if (!d_can_lookup(root))
-				return -ENOTDIR;
-			retval = inode_permission(inode, MAY_EXEC);
-			if (retval)
-				return retval;
-		}
+		if (*name && unlikely(!d_can_lookup(root)))
+			return -ENOTDIR;
 		nd->path = nd->root;
 		nd->inode = inode;
 		if (flags & LOOKUP_RCU) {
@@ -1957,6 +1951,36 @@ static inline int lookup_last(struct nameidata *nd, struct path *path)
 	return walk_component(nd, path, nd->flags & LOOKUP_FOLLOW);
 }
 
+static int handle_lookup_down(struct nameidata *nd)
+{
+	struct path path = nd->path;
+	struct inode *inode = nd->inode;
+	int err;
+
+	if (nd->flags & LOOKUP_RCU) {
+		/*
+		 * don't bother with unlazy_walk on failure - we are
+		 * at the very beginning of walk, so we lose nothing
+		 * if we simply redo everything in non-RCU mode
+		 */
+		if (unlikely(!__follow_mount_rcu(nd, &path, &inode)))
+			return -ECHILD;
+	} else {
+		dget(path.dentry);
+		err = follow_managed(&path, nd->flags);
+		if (unlikely(err < 0)) {
+			path_put_conditional(&path, nd);
+			return err;
+		}
+		if (err)
+			nd->flags |= LOOKUP_JUMPED;
+		inode = d_backing_inode(path.dentry);
+	}
+	path_to_nameidata(&path, nd);
+	nd->inode = inode;
+	return 0;
+}
+
 /* Returns 0 and nd will be valid on success; Retuns error, otherwise. */
 static int path_lookupat(int dfd, const char *name,
 				unsigned int flags, struct nameidata *nd)
@@ -1985,7 +2009,15 @@ static int path_lookupat(int dfd, const char *name,
 		return err;
 
 	current->total_link_count = 0;
-	err = link_path_walk(name, nd);
+
+	if (unlikely(flags & LOOKUP_DOWN)) {
+		err = handle_lookup_down(nd);
+		if (unlikely(err < 0))
+			terminate_walk(nd);
+	}
+
+	if (!err)
+		err = link_path_walk(name, nd);
 
 	if (!err && !(flags & LOOKUP_PARENT)) {
 		err = lookup_last(nd, &path);
@@ -2639,6 +2671,12 @@ int vfs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	return error;
 }
 
+bool may_open_dev(const struct path *path)
+{
+	return !(path->mnt->mnt_flags & MNT_NODEV) &&
+		!(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
+}
+
 static int may_open(struct path *path, int acc_mode, int flag)
 {
 	struct dentry *dentry = path->dentry;
@@ -2661,7 +2699,7 @@ static int may_open(struct path *path, int acc_mode, int flag)
 		break;
 	case S_IFBLK:
 	case S_IFCHR:
-		if (path->mnt->mnt_flags & MNT_NODEV)
+		if (!may_open_dev(path))
 			return -EACCES;
 		/*FALLTHRU*/
 	case S_IFIFO:
@@ -3240,6 +3278,71 @@ stale_open:
 	goto retry_lookup;
 }
 
+static int do_tmpfile(int dfd, struct filename *pathname,
+		struct nameidata *nd, int flags,
+		const struct open_flags *op,
+		struct file *file, int *opened)
+{
+	static const struct qstr name = QSTR_INIT("/", 1);
+	struct dentry *dentry, *child;
+	struct inode *dir;
+	iop_tmpfile_t tmpfile;
+	int error = path_lookupat(dfd, pathname->name,
+				  flags | LOOKUP_DIRECTORY, nd);
+	if (unlikely(error))
+		return error;
+	error = mnt_want_write(nd->path.mnt);
+	if (unlikely(error))
+		goto out;
+	/* we want directory to be writable */
+	error = inode_permission(nd->inode, MAY_WRITE | MAY_EXEC);
+	if (error)
+		goto out2;
+	dentry = nd->path.dentry;
+	dir = dentry->d_inode;
+
+	tmpfile = get_tmpfile_iop(dir);
+
+	if (!tmpfile) {
+		error = -EOPNOTSUPP;
+		goto out2;
+	}
+	child = d_alloc(dentry, &name);
+	if (unlikely(!child)) {
+		error = -ENOMEM;
+		goto out2;
+	}
+	nd->flags &= ~LOOKUP_DIRECTORY;
+	nd->flags |= op->intent;
+	dput(nd->path.dentry);
+	nd->path.dentry = child;
+	error = tmpfile(dir, nd->path.dentry, op->mode);
+	if (error)
+		goto out2;
+	audit_inode(pathname, nd->path.dentry, 0);
+	error = may_open(&nd->path, op->acc_mode, op->open_flag);
+	if (error)
+		goto out2;
+	file->f_path.mnt = nd->path.mnt;
+	error = finish_open(file, nd->path.dentry, NULL, opened);
+	if (error)
+		goto out2;
+	error = open_check_o_direct(file);
+	if (error) {
+		fput(file);
+	} else if (!(op->open_flag & O_EXCL)) {
+		struct inode *inode = file_inode(file);
+		spin_lock(&inode->i_lock);
+		inode->i_state |= I_LINKABLE;
+		spin_unlock(&inode->i_lock);
+	}
+out2:
+	mnt_drop_write(nd->path.mnt);
+out:
+	path_put(&nd->path);
+	return error;
+}
+
 static struct file *path_openat(int dfd, struct filename *pathname,
 		struct nameidata *nd, const struct open_flags *op, int flags)
 {
@@ -3254,6 +3357,11 @@ static struct file *path_openat(int dfd, struct filename *pathname,
 		return file;
 
 	file->f_flags = op->open_flag;
+
+	if (unlikely(file->f_flags & __O_TMPFILE)) {
+		error = do_tmpfile(dfd, pathname, nd, flags, op, file, &opened);
+		goto out2;
+	}
 
 	error = path_init(dfd, pathname->name, flags | LOOKUP_PARENT, nd, &base);
 	if (unlikely(error))
@@ -3290,6 +3398,7 @@ out:
 		path_put(&nd->root);
 	if (base)
 		fput(base);
+out2:
 	if (!(opened & FILE_OPENED)) {
 		BUG_ON(!error);
 		put_filp(file);
@@ -3307,9 +3416,10 @@ out:
 }
 
 struct file *do_filp_open(int dfd, struct filename *pathname,
-		const struct open_flags *op, int flags)
+		const struct open_flags *op)
 {
 	struct nameidata nd;
+	int flags = op->lookup_flags;
 	struct file *filp;
 
 	filp = path_openat(dfd, pathname, &nd, op, flags | LOOKUP_RCU);
@@ -3321,16 +3431,15 @@ struct file *do_filp_open(int dfd, struct filename *pathname,
 }
 
 struct file *do_file_open_root(struct dentry *dentry, struct vfsmount *mnt,
-		const char *name, const struct open_flags *op, int flags)
+		const char *name, const struct open_flags *op)
 {
 	struct nameidata nd;
 	struct file *file;
 	struct filename *filename;
+	int flags = op->lookup_flags | LOOKUP_ROOT;
 
 	nd.root.mnt = mnt;
 	nd.root.dentry = dentry;
-
-	flags |= LOOKUP_ROOT;
 
 	if (d_is_symlink(dentry) && op->intent & LOOKUP_OPEN)
 		return ERR_PTR(-ELOOP);
@@ -4136,11 +4245,11 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 {
 	int error;
 	bool is_dir = d_is_dir(old_dentry);
-	const unsigned char *old_name;
 	struct inode *source = old_dentry->d_inode;
 	struct inode *target = new_dentry->d_inode;
 	bool new_is_dir = false;
 	unsigned max_links = new_dir->i_sb->s_max_links;
+	struct name_snapshot old_name;
 	iop_rename2_t rename2;
 
 	if (source == target)
@@ -4192,7 +4301,7 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (error)
 		return error;
 
-	old_name = fsnotify_oldname_init(old_dentry->d_name.name);
+	take_dentry_name_snapshot(&old_name, old_dentry);
 	dget(new_dentry);
 	if (!is_dir || (flags & RENAME_EXCHANGE))
 		lock_two_nondirectories(source, target);
@@ -4253,14 +4362,14 @@ out:
 		mutex_unlock(&target->i_mutex);
 	dput(new_dentry);
 	if (!error) {
-		fsnotify_move(old_dir, new_dir, old_name, is_dir,
+		fsnotify_move(old_dir, new_dir, old_name.name, is_dir,
 			      !(flags & RENAME_EXCHANGE) ? target : NULL, old_dentry);
 		if (flags & RENAME_EXCHANGE) {
 			fsnotify_move(new_dir, old_dir, old_dentry->d_name.name,
 				      new_is_dir, NULL, new_dentry);
 		}
 	}
-	fsnotify_oldname_free(old_name);
+	release_dentry_name_snapshot(&old_name);
 
 	return error;
 }

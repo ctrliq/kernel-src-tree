@@ -48,7 +48,7 @@
 /* helper macros */
 #define __mlx5_nullp(typ) ((struct mlx5_ifc_##typ##_bits *)0)
 #define __mlx5_bit_sz(typ, fld) sizeof(__mlx5_nullp(typ)->fld)
-#define __mlx5_bit_off(typ, fld) ((unsigned)(unsigned long)(&(__mlx5_nullp(typ)->fld)))
+#define __mlx5_bit_off(typ, fld) (offsetof(struct mlx5_ifc_##typ##_bits, fld))
 #define __mlx5_dw_off(typ, fld) (__mlx5_bit_off(typ, fld) / 32)
 #define __mlx5_64_off(typ, fld) (__mlx5_bit_off(typ, fld) / 64)
 #define __mlx5_dw_bit_off(typ, fld) (32 - __mlx5_bit_sz(typ, fld) - (__mlx5_bit_off(typ, fld) & 0x1f))
@@ -213,10 +213,20 @@ enum {
 };
 
 enum {
-	MLX5_BF_REGS_PER_PAGE		= 4,
-	MLX5_MAX_UAR_PAGES		= 1 << 8,
-	MLX5_NON_FP_BF_REGS_PER_PAGE	= 2,
-	MLX5_MAX_UUARS	= MLX5_MAX_UAR_PAGES * MLX5_NON_FP_BF_REGS_PER_PAGE,
+	MLX5_ADAPTER_PAGE_SHIFT		= 12,
+	MLX5_ADAPTER_PAGE_SIZE		= 1 << MLX5_ADAPTER_PAGE_SHIFT,
+};
+
+enum {
+	MLX5_BFREGS_PER_UAR		= 4,
+	MLX5_MAX_UARS			= 1 << 8,
+	MLX5_NON_FP_BFREGS_PER_UAR	= 2,
+	MLX5_FP_BFREGS_PER_UAR		= MLX5_BFREGS_PER_UAR -
+					  MLX5_NON_FP_BFREGS_PER_UAR,
+	MLX5_MAX_BFREGS			= MLX5_MAX_UARS *
+					  MLX5_NON_FP_BFREGS_PER_UAR,
+	MLX5_UARS_IN_PAGE		= PAGE_SIZE / MLX5_ADAPTER_PAGE_SIZE,
+	MLX5_NON_FP_BFREGS_IN_PAGE	= MLX5_NON_FP_BFREGS_PER_UAR * MLX5_UARS_IN_PAGE,
 };
 
 enum {
@@ -280,6 +290,7 @@ enum mlx5_event {
 	MLX5_EVENT_TYPE_GPIO_EVENT	   = 0x15,
 	MLX5_EVENT_TYPE_PORT_MODULE_EVENT  = 0x16,
 	MLX5_EVENT_TYPE_REMOTE_CONFIG	   = 0x19,
+	MLX5_EVENT_TYPE_GENERAL_EVENT	   = 0x22,
 	MLX5_EVENT_TYPE_PPS_EVENT          = 0x25,
 
 	MLX5_EVENT_TYPE_DB_BF_CONGESTION   = 0x1a,
@@ -290,6 +301,12 @@ enum mlx5_event {
 
 	MLX5_EVENT_TYPE_PAGE_FAULT	   = 0xc,
 	MLX5_EVENT_TYPE_NIC_VPORT_CHANGE   = 0xd,
+
+	MLX5_EVENT_TYPE_FPGA_ERROR         = 0x20,
+};
+
+enum {
+	MLX5_GENERAL_SUBTYPE_DELAY_DROP_TIMEOUT = 0x1,
 };
 
 enum {
@@ -388,11 +405,6 @@ enum {
 
 enum {
 	MLX5_MAX_PAGE_SHIFT		= 31
-};
-
-enum {
-	MLX5_ADAPTER_PAGE_SHIFT		= 12,
-	MLX5_ADAPTER_PAGE_SIZE		= 1 << MLX5_ADAPTER_PAGE_SHIFT,
 };
 
 enum {
@@ -536,7 +548,9 @@ struct mlx5_eqe_page_fault {
 			__be16  wqe_index;
 			u16	reserved2;
 			__be16  packet_length;
-			u8	reserved3[12];
+			__be32  token;
+			u8	reserved4[8];
+			__be32  pftype_wq;
 		} __packed wqe;
 		struct {
 			__be32  r_key;
@@ -544,9 +558,9 @@ struct mlx5_eqe_page_fault {
 			__be16  packet_length;
 			__be32  rdma_op_len;
 			__be64  rdma_va;
+			__be32  pftype_token;
 		} __packed rdma;
 	} __packed;
-	__be32 flags_qpn;
 } __packed;
 
 struct mlx5_eqe_vport_change {
@@ -1093,6 +1107,12 @@ enum mlx5_mcam_feature_groups {
 
 #define MLX5_CAP_MCAM_FEATURE(mdev, fld) \
 	MLX5_GET(mcam_reg, (mdev)->caps.mcam, mng_feature_cap_mask.enhanced_features.fld)
+
+#define MLX5_CAP_FPGA(mdev, cap) \
+	MLX5_GET(fpga_cap, (mdev)->caps.fpga, cap)
+
+#define MLX5_CAP64_FPGA(mdev, cap) \
+	MLX5_GET64(fpga_cap, (mdev)->caps.fpga, cap)
 
 enum {
 	MLX5_CMD_STAT_OK			= 0x0,

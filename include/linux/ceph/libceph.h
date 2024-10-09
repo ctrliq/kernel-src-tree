@@ -82,16 +82,6 @@ struct ceph_options {
 
 #define CEPH_AUTH_NAME_DEFAULT   "guest"
 
-/*
- * Delay telling the MDS we no longer want caps, in case we reopen
- * the file.  Delay a minimum amount of time, even if we send a cap
- * message for some other reason.  Otherwise, take the oppotunity to
- * update the mds to avoid sending another message later.
- */
-#define CEPH_CAPS_WANTED_DELAY_MIN_DEFAULT      5  /* cap release delay */
-#define CEPH_CAPS_WANTED_DELAY_MAX_DEFAULT     60  /* cap release delay */
-
-
 /* mount state */
 enum {
 	CEPH_MOUNT_MOUNTING,
@@ -199,11 +189,13 @@ static void insert_##name(struct rb_root *root, type *t)		\
 									\
 		parent = *n;						\
 		cmp = cmpexp(keyexp(t->keyfld), keyexp(cur->keyfld));	\
-		if (cmp < 0)						\
+		if (cmp < 0) {						\
+			gmb();						\
 			n = &(*n)->rb_left;				\
-		else if (cmp > 0)					\
+		} else if (cmp > 0) {					\
+			gmb();						\
 			n = &(*n)->rb_right;				\
-		else							\
+		} else							\
 			BUG();						\
 	}								\
 									\

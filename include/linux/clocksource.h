@@ -68,9 +68,9 @@ struct clocksource {
 	 * Hotpath data, fits in a single cache line when the
 	 * clocksource itself is cacheline aligned.
 	 */
-	cycle_t (*read)(struct clocksource *cs);
-	cycle_t cycle_last;
-	cycle_t mask;
+	u64 (*read)(struct clocksource *cs);
+	u64 cycle_last;
+	u64 mask;
 	u32 mult;
 	u32 shift;
 	u64 max_idle_ns;
@@ -92,8 +92,8 @@ struct clocksource {
 #ifdef CONFIG_CLOCKSOURCE_WATCHDOG
 	/* Watchdog related data, used by the framework */
 	struct list_head wd_list;
-	cycle_t cs_last;
-	cycle_t wd_last;
+	u64 cs_last;
+	u64 wd_last;
 #endif
 	struct module *owner;
 } ____cacheline_aligned;
@@ -111,7 +111,7 @@ struct clocksource {
 #define CLOCK_SOURCE_RESELECT			0x100
 
 /* simplify initialization of mask field */
-#define CLOCKSOURCE_MASK(bits) (cycle_t)((bits) < 64 ? ((1ULL<<(bits))-1) : -1)
+#define CLOCKSOURCE_MASK(bits) (u64)((bits) < 64 ? ((1ULL<<(bits))-1) : -1)
 
 /**
  * clocksource_khz2mult - calculates mult from khz and shift
@@ -174,7 +174,7 @@ static inline u32 clocksource_hz2mult(u32 hz, u32 shift_constant)
  *
  * XXX - This could use some mult_lxl_ll() asm optimization
  */
-static inline s64 clocksource_cyc2ns(cycle_t cycles, u32 mult, u32 shift)
+static inline s64 clocksource_cyc2ns(u64 cycles, u32 mult, u32 shift)
 {
 	return ((u64) cycles * mult) >> shift;
 }
@@ -230,13 +230,13 @@ static inline void __clocksource_updatefreq_khz(struct clocksource *cs, u32 khz)
 
 extern int timekeeping_notify(struct clocksource *clock);
 
-extern cycle_t clocksource_mmio_readl_up(struct clocksource *);
-extern cycle_t clocksource_mmio_readl_down(struct clocksource *);
-extern cycle_t clocksource_mmio_readw_up(struct clocksource *);
-extern cycle_t clocksource_mmio_readw_down(struct clocksource *);
+extern u64 clocksource_mmio_readl_up(struct clocksource *);
+extern u64 clocksource_mmio_readl_down(struct clocksource *);
+extern u64 clocksource_mmio_readw_up(struct clocksource *);
+extern u64 clocksource_mmio_readw_down(struct clocksource *);
 
 extern int clocksource_mmio_init(void __iomem *, const char *,
-	unsigned long, int, unsigned, cycle_t (*)(struct clocksource *));
+	unsigned long, int, unsigned, u64 (*)(struct clocksource *));
 
 extern int clocksource_i8253_init(void);
 

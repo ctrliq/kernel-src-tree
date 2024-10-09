@@ -14,6 +14,7 @@
 #include <linux/regset.h>
 #include <linux/compat.h>
 #include <linux/slab.h>
+#include <linux/pkeys.h>
 #include <asm/asm.h>
 #include <asm/cpufeature.h>
 #include <asm/processor.h>
@@ -383,6 +384,9 @@ static inline void drop_init_fpu(struct task_struct *tsk)
 			xrstor_state(init_xstate_buf, -1);
 		else
 			fxrstor_checking(&init_xstate_buf->i387);
+
+		if (boot_cpu_has(X86_FEATURE_OSPKE))
+			copy_init_pkru_to_fpregs();
 	}
 }
 

@@ -479,9 +479,9 @@ int cifs_open(struct inode *inode, struct file *file)
 	if (file->f_flags & O_DIRECT &&
 	    cifs_sb->mnt_cifs_flags & CIFS_MOUNT_STRICT_IO) {
 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_BRL)
-			file->f_op = &cifs_file_direct_nobrl_ops;
+			file->f_op = &cifs_file_direct_nobrl_ops.kabi_fops;
 		else
-			file->f_op = &cifs_file_direct_ops;
+			file->f_op = &cifs_file_direct_ops.kabi_fops;
 	}
 
 	if (server->oplocks)
@@ -2934,13 +2934,23 @@ cifs_uncached_readv_complete(struct work_struct *work)
 }
 
 static int
-cifs_uncached_read_into_pages(struct TCP_Server_Info *server,
-			struct cifs_readdata *rdata, unsigned int len)
+uncached_fill_pages(struct TCP_Server_Info *server,
+		    struct cifs_readdata *rdata, struct kvec *kvec,
+		    struct bio_vec *bvec, unsigned int len)
 {
 	int result = 0;
 	unsigned int i;
 	unsigned int nr_pages = rdata->nr_pages;
 	struct kvec iov;
+	size_t kvec_offset = 0;
+	unsigned int bvec_idx = 0;
+	unsigned int bvec_offset = 0;
+	void *bvec_ptr;
+	size_t cp_size;
+	size_t to_copy;
+
+	if (bvec)
+		bvec_offset = bvec[0].bv_offset;
 
 	rdata->got_bytes = 0;
 	rdata->tailsz = PAGE_SIZE;
@@ -2971,7 +2981,34 @@ cifs_uncached_read_into_pages(struct TCP_Server_Info *server,
 			continue;
 		}
 
-		result = cifs_readv_from_socket(server, &iov, 1, iov.iov_len);
+		if (bvec) {
+			to_copy = iov.iov_len;
+bvec_copy:
+			cp_size = min_t(size_t,
+					bvec[bvec_idx].bv_len - bvec_offset,
+					to_copy);
+			bvec_ptr = kmap(bvec[bvec_idx].bv_page) + bvec_offset;
+			memcpy(iov.iov_base, bvec_ptr, cp_size);
+			kunmap(bvec[bvec_idx].bv_page);
+
+			bvec_offset += cp_size;
+			if (bvec_offset == bvec[bvec_idx].bv_len) {
+				bvec_idx++;
+				bvec_offset = 0;
+			}
+
+                        to_copy -= cp_size;
+                        if (to_copy)
+                                goto bvec_copy;
+
+                        result = iov.iov_len;
+		} else if (kvec){
+			memcpy(iov.iov_base, kvec->iov_base + kvec_offset,
+				iov.iov_len);
+			kvec_offset += iov.iov_len;
+			result = iov.iov_len;
+		} else
+			result = cifs_readv_from_socket(server, &iov, 1, iov.iov_len);
 		kunmap(page);
 		if (result < 0)
 			break;
@@ -2981,6 +3018,22 @@ cifs_uncached_read_into_pages(struct TCP_Server_Info *server,
 
 	return rdata->got_bytes > 0 && result != -ECONNABORTED ?
 						rdata->got_bytes : result;
+}
+
+static int
+cifs_uncached_read_into_pages(struct TCP_Server_Info *server,
+			      struct cifs_readdata *rdata, unsigned int len)
+{
+	return uncached_fill_pages(server, rdata, NULL, NULL, len);
+}
+
+static int
+cifs_uncached_copy_into_pages(struct TCP_Server_Info *server,
+			      struct cifs_readdata *rdata,
+			      struct kvec *kvec, struct bio_vec *bvec,
+                              unsigned int data_len)
+{
+	return uncached_fill_pages(server, rdata, kvec, bvec, data_len);
 }
 
 static int
@@ -3030,6 +3083,7 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
 		rdata->pid = pid;
 		rdata->pagesz = PAGE_SIZE;
 		rdata->read_into_pages = cifs_uncached_read_into_pages;
+		rdata->copy_into_pages = cifs_uncached_copy_into_pages;
 		rdata->credits = credits;
 
 		if (!rdata->cfile->invalidHandle ||
@@ -3391,8 +3445,9 @@ cifs_readv_complete(struct work_struct *work)
 }
 
 static int
-cifs_readpages_read_into_pages(struct TCP_Server_Info *server,
-			struct cifs_readdata *rdata, unsigned int len)
+readpages_fill_pages(struct TCP_Server_Info *server,
+		     struct cifs_readdata *rdata, struct kvec *kvec,
+		     struct bio_vec *bvec, unsigned int len)
 {
 	int result = 0;
 	unsigned int i;
@@ -3400,6 +3455,15 @@ cifs_readpages_read_into_pages(struct TCP_Server_Info *server,
 	pgoff_t eof_index;
 	unsigned int nr_pages = rdata->nr_pages;
 	struct kvec iov;
+	size_t kvec_offset = 0;
+	int bvec_idx = 0;
+	unsigned int bvec_offset = 0;
+	void *bvec_ptr;
+	size_t cp_size;
+	size_t to_copy;
+
+	if (bvec)
+		bvec_offset = bvec[0].bv_offset;
 
 	/* determine the eof that the server (probably) has */
 	eof = CIFS_I(rdata->mapping->host)->server_eof;
@@ -3456,7 +3520,34 @@ cifs_readpages_read_into_pages(struct TCP_Server_Info *server,
 			continue;
 		}
 
-		result = cifs_readv_from_socket(server, &iov, 1, iov.iov_len);
+		if (bvec) {
+			to_copy = iov.iov_len;
+bvec_copy:
+			cp_size = min_t(size_t,
+					bvec[bvec_idx].bv_len - bvec_offset,
+					to_copy);
+			bvec_ptr = kmap(bvec[bvec_idx].bv_page) + bvec_offset;
+			memcpy(iov.iov_base, bvec_ptr, cp_size);
+			kunmap(bvec[bvec_idx].bv_page);
+
+			bvec_offset += cp_size;
+			if (bvec_offset == bvec[bvec_idx].bv_len) {
+				bvec_idx++;
+				bvec_offset = 0;
+			}
+
+			to_copy -= cp_size;
+			if (to_copy)
+				goto bvec_copy;
+
+			result = iov.iov_len;
+		} else if (kvec) {
+			memcpy(iov.iov_base, kvec->iov_base + kvec_offset,
+				iov.iov_len);
+			kvec_offset += iov.iov_len;
+			result = iov.iov_len;
+		} else
+			result = cifs_readv_from_socket(server, &iov, 1, iov.iov_len);
 		kunmap(page);
 		if (result < 0)
 			break;
@@ -3466,6 +3557,22 @@ cifs_readpages_read_into_pages(struct TCP_Server_Info *server,
 
 	return rdata->got_bytes > 0 && result != -ECONNABORTED ?
 						rdata->got_bytes : result;
+}
+
+static int
+cifs_readpages_read_into_pages(struct TCP_Server_Info *server,
+			       struct cifs_readdata *rdata, unsigned int len)
+{
+	return readpages_fill_pages(server, rdata, NULL, NULL, len);
+}
+
+static int
+cifs_readpages_copy_into_pages(struct TCP_Server_Info *server,
+			       struct cifs_readdata *rdata,
+			       struct kvec *kvec, struct bio_vec *bvec,
+                               unsigned int data_len)
+{
+	return readpages_fill_pages(server, rdata, kvec, bvec, data_len);
 }
 
 static int
@@ -3622,6 +3729,7 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 		rdata->pid = pid;
 		rdata->pagesz = PAGE_SIZE;
 		rdata->read_into_pages = cifs_readpages_read_into_pages;
+		rdata->copy_into_pages = cifs_readpages_copy_into_pages;
 		rdata->credits = credits;
 
 		list_for_each_entry_safe(page, tpage, &tmplist, lru) {

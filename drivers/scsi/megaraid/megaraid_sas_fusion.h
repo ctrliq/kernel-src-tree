@@ -103,6 +103,7 @@ enum MR_RAID_FLAGS_IO_SUB_TYPE {
 #define THRESHOLD_REPLY_COUNT 50
 #define RAID_1_PEER_CMDS 2
 #define JBOD_MAPS_COUNT	2
+#define IOC_INIT_FRAME_SIZE 4096
 
 enum MR_FUSION_ADAPTER_TYPE {
 	THUNDERBOLT_SERIES = 0,
@@ -1321,6 +1322,7 @@ struct fusion_context {
 	LD_SPAN_INFO log_to_span[MAX_LOGICAL_DRIVES_EXT];
 	u8 adapter_type;
 	struct LD_STREAM_DETECT **stream_detect_by_ld;
+	struct megasas_cmd *ioc_init_cmd;
 };
 
 union desc_value {

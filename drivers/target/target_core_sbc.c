@@ -38,6 +38,7 @@
 
 static sense_reason_t
 sbc_check_prot(struct se_device *, struct se_cmd *, unsigned char *, u32, bool);
+static sense_reason_t sbc_execute_unmap(struct se_cmd *cmd);
 
 static sense_reason_t
 sbc_emulate_readcapacity(struct se_cmd *cmd)
@@ -140,8 +141,16 @@ sbc_emulate_readcapacity_16(struct se_cmd *cmd)
 	 * Set Thin Provisioning Enable bit following sbc3r22 in section
 	 * READ CAPACITY (16) byte 14 if emulate_tpu or emulate_tpws is enabled.
 	 */
-	if (dev->dev_attrib.emulate_tpu || dev->dev_attrib.emulate_tpws)
+	if (dev->dev_attrib.emulate_tpu || dev->dev_attrib.emulate_tpws) {
 		buf[14] |= 0x80;
+
+		/*
+		 * LBPRZ signifies that zeroes will be read back from an LBA after
+		 * an UNMAP or WRITE SAME w/ unmap bit (sbc3r36 5.16.2)
+		 */
+		if (dev->dev_attrib.unmap_zeroes_data)
+			buf[14] |= 0x40;
+	}
 
 	rbuf = transport_kmap_data_sg(cmd);
 	if (rbuf) {
@@ -207,6 +216,23 @@ sector_t sbc_get_write_same_sectors(struct se_cmd *cmd)
 		cmd->t_task_lba + 1;
 }
 EXPORT_SYMBOL(sbc_get_write_same_sectors);
+
+static sense_reason_t
+sbc_execute_write_same_unmap(struct se_cmd *cmd)
+{
+	struct sbc_ops *ops = cmd->protocol_data;
+	sector_t nolb = sbc_get_write_same_sectors(cmd);
+	sense_reason_t ret;
+
+	if (nolb) {
+		ret = ops->execute_unmap(cmd, cmd->t_task_lba, nolb);
+		if (ret)
+			return ret;
+	}
+
+	target_complete_cmd(cmd, GOOD);
+	return 0;
+}
 
 static sense_reason_t
 sbc_emulate_noop(struct se_cmd *cmd)
@@ -331,7 +357,7 @@ sbc_setup_write_same(struct se_cmd *cmd, unsigned char *flags, struct sbc_ops *o
 	 * translated into block discard requests within backend code.
 	 */
 	if (flags[0] & 0x08) {
-		if (!ops->execute_write_same_unmap)
+		if (!ops->execute_unmap)
 			return TCM_UNSUPPORTED_SCSI_OPCODE;
 
 		if (!dev->dev_attrib.emulate_tpws) {
@@ -339,7 +365,7 @@ sbc_setup_write_same(struct se_cmd *cmd, unsigned char *flags, struct sbc_ops *o
 			       " has emulate_tpws disabled\n");
 			return TCM_UNSUPPORTED_SCSI_OPCODE;
 		}
-		cmd->execute_cmd = ops->execute_write_same_unmap;
+		cmd->execute_cmd = sbc_execute_write_same_unmap;
 		return 0;
 	}
 	if (!ops->execute_write_same)
@@ -778,14 +804,15 @@ static int
 sbc_check_dpofua(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb)
 {
 	if (cdb[1] & 0x10) {
-		if (!dev->dev_attrib.emulate_dpo) {
+		/* see explanation in spc_emulate_modesense */
+		if (!target_check_fua(dev)) {
 			pr_err("Got CDB: 0x%02x with DPO bit set, but device"
 			       " does not advertise support for DPO\n", cdb[0]);
 			return -EINVAL;
 		}
 	}
 	if (cdb[1] & 0x8) {
-		if (!dev->dev_attrib.emulate_fua_write || !se_dev_check_wce(dev)) {
+		if (!target_check_fua(dev)) {
 			pr_err("Got CDB: 0x%02x with FUA bit set, but device"
 			       " does not advertise support for FUA write\n",
 			       cdb[0]);
@@ -1038,7 +1065,7 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 			return TCM_UNSUPPORTED_SCSI_OPCODE;
 		}
 		size = get_unaligned_be16(&cdb[7]);
-		cmd->execute_cmd = ops->execute_unmap;
+		cmd->execute_cmd = sbc_execute_unmap;
 		break;
 	case WRITE_SAME_16:
 		sectors = transport_get_sectors_16(cdb);
@@ -1130,12 +1157,10 @@ u32 sbc_get_device_type(struct se_device *dev)
 }
 EXPORT_SYMBOL(sbc_get_device_type);
 
-sense_reason_t
-sbc_execute_unmap(struct se_cmd *cmd,
-	sense_reason_t (*do_unmap_fn)(struct se_cmd *, void *,
-				      sector_t, sector_t),
-	void *priv)
+static sense_reason_t
+sbc_execute_unmap(struct se_cmd *cmd)
 {
+	struct sbc_ops *ops = cmd->protocol_data;
 	struct se_device *dev = cmd->se_dev;
 	unsigned char *buf, *ptr = NULL;
 	sector_t lba;
@@ -1199,7 +1224,7 @@ sbc_execute_unmap(struct se_cmd *cmd,
 			goto err;
 		}
 
-		ret = do_unmap_fn(cmd, priv, lba, range);
+		ret = ops->execute_unmap(cmd, lba, range);
 		if (ret)
 			goto err;
 
@@ -1213,7 +1238,6 @@ err:
 		target_complete_cmd(cmd, GOOD);
 	return ret;
 }
-EXPORT_SYMBOL(sbc_execute_unmap);
 
 void
 sbc_dif_generate(struct se_cmd *cmd)

@@ -32,26 +32,26 @@
 #include <asm/reboot.h>
 
 struct nmi_desc {
-	spinlock_t lock;
+	raw_spinlock_t lock;
 	struct list_head head;
 };
 
 static struct nmi_desc nmi_desc[NMI_MAX] = 
 {
 	{
-		.lock = __SPIN_LOCK_UNLOCKED(&nmi_desc[0].lock),
+		.lock = __RAW_SPIN_LOCK_UNLOCKED(&nmi_desc[0].lock),
 		.head = LIST_HEAD_INIT(nmi_desc[0].head),
 	},
 	{
-		.lock = __SPIN_LOCK_UNLOCKED(&nmi_desc[1].lock),
+		.lock = __RAW_SPIN_LOCK_UNLOCKED(&nmi_desc[1].lock),
 		.head = LIST_HEAD_INIT(nmi_desc[1].head),
 	},
 	{
-		.lock = __SPIN_LOCK_UNLOCKED(&nmi_desc[2].lock),
+		.lock = __RAW_SPIN_LOCK_UNLOCKED(&nmi_desc[2].lock),
 		.head = LIST_HEAD_INIT(nmi_desc[2].head),
 	},
 	{
-		.lock = __SPIN_LOCK_UNLOCKED(&nmi_desc[3].lock),
+		.lock = __RAW_SPIN_LOCK_UNLOCKED(&nmi_desc[3].lock),
 		.head = LIST_HEAD_INIT(nmi_desc[3].head),
 	},
 
@@ -109,7 +109,7 @@ static int __kprobes nmi_handle(unsigned int type, struct pt_regs *regs, bool b2
 	 */
 	list_for_each_entry_rcu(a, &desc->head, list) {
 		u64 before, delta, whole_msecs;
-		int decimal_msecs;
+		int remainder_ns, decimal_msecs;
 
 		before = sched_clock();
 		handled += a->handler(type, regs);
@@ -119,8 +119,9 @@ static int __kprobes nmi_handle(unsigned int type, struct pt_regs *regs, bool b2
 			continue;
 
 		nmi_longest_ns = delta;
-		whole_msecs = do_div(delta, (1000 * 1000));
-		decimal_msecs = do_div(delta, 1000) % 1000;
+		whole_msecs = delta;
+		remainder_ns = do_div(whole_msecs, (1000 * 1000));
+		decimal_msecs = remainder_ns / 1000;
 		printk_ratelimited(KERN_INFO
 			"INFO: NMI handler (%ps) took too long to run: "
 			"%lld.%03d msecs\n", a->handler, whole_msecs,
@@ -141,7 +142,7 @@ int __register_nmi_handler(unsigned int type, struct nmiaction *action)
 	if (!action->handler)
 		return -EINVAL;
 
-	spin_lock_irqsave(&desc->lock, flags);
+	raw_spin_lock_irqsave(&desc->lock, flags);
 
 	/*
 	 * Indicate if there are multiple registrations on the
@@ -159,7 +160,7 @@ int __register_nmi_handler(unsigned int type, struct nmiaction *action)
 	else
 		list_add_tail_rcu(&action->list, &desc->head);
 	
-	spin_unlock_irqrestore(&desc->lock, flags);
+	raw_spin_unlock_irqrestore(&desc->lock, flags);
 	return 0;
 }
 EXPORT_SYMBOL(__register_nmi_handler);
@@ -170,7 +171,7 @@ void unregister_nmi_handler(unsigned int type, const char *name)
 	struct nmiaction *n;
 	unsigned long flags;
 
-	spin_lock_irqsave(&desc->lock, flags);
+	raw_spin_lock_irqsave(&desc->lock, flags);
 
 	list_for_each_entry_rcu(n, &desc->head, list) {
 		/*
@@ -185,7 +186,7 @@ void unregister_nmi_handler(unsigned int type, const char *name)
 		}
 	}
 
-	spin_unlock_irqrestore(&desc->lock, flags);
+	raw_spin_unlock_irqrestore(&desc->lock, flags);
 	synchronize_rcu();
 }
 EXPORT_SYMBOL_GPL(unregister_nmi_handler);

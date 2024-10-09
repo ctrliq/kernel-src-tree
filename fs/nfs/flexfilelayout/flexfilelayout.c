@@ -346,9 +346,11 @@ static void ff_layout_sort_mirrors(struct nfs4_ff_layout_segment *fls)
 	for (i = 0; i < fls->mirror_array_cnt - 1; i++) {
 		for (j = i + 1; j < fls->mirror_array_cnt; j++)
 			if (fls->mirror_array[i]->efficiency <
-			    fls->mirror_array[j]->efficiency)
+			    fls->mirror_array[j]->efficiency) {
+				gmb();
 				swap(fls->mirror_array[i],
 				     fls->mirror_array[j]);
+			}
 	}
 }
 
@@ -839,6 +841,7 @@ ff_layout_pg_init_read(struct nfs_pageio_descriptor *pgio,
 	int ds_idx;
 
 retry:
+	pnfs_generic_pg_check_layout(pgio);
 	/* Use full layout for now */
 	if (!pgio->pg_lseg)
 		ff_layout_pg_get_read(pgio, req, false);
@@ -887,6 +890,7 @@ ff_layout_pg_init_write(struct nfs_pageio_descriptor *pgio,
 	int status;
 
 retry:
+	pnfs_generic_pg_check_layout(pgio);
 	if (!pgio->pg_lseg) {
 		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
 						   req->wb_context,

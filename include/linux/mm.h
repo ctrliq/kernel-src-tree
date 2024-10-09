@@ -22,6 +22,7 @@
 #include <linux/resource.h>
 #include <linux/err.h>
 #include <linux/page_ref.h>
+#include <linux/page_ext.h>
 
 struct mempolicy;
 struct anon_vma;
@@ -36,6 +37,7 @@ extern unsigned long max_mapnr;
 
 extern unsigned long num_physpages;
 extern unsigned long totalram_pages;
+extern unsigned long totalcma_pages;
 extern void * high_memory;
 extern int page_cluster;
 
@@ -154,14 +156,33 @@ extern unsigned int kobjsize(const void *objp);
 #define VM_NOHUGEPAGE	0x40000000	/* MADV_NOHUGEPAGE marked this vma */
 #define VM_MERGEABLE	0x80000000	/* KSM may merge identical pages */
 
+#ifdef CONFIG_ARCH_USES_HIGH_VMA_FLAGS
+#define VM_HIGH_ARCH_BIT_0	32	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_BIT_1	33	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_BIT_2	34	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_BIT_3	35	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_0	BIT(VM_HIGH_ARCH_BIT_0)
+#define VM_HIGH_ARCH_1	BIT(VM_HIGH_ARCH_BIT_1)
+#define VM_HIGH_ARCH_2	BIT(VM_HIGH_ARCH_BIT_2)
+#define VM_HIGH_ARCH_3	BIT(VM_HIGH_ARCH_BIT_3)
+#endif /* CONFIG_ARCH_USES_HIGH_VMA_FLAGS */
+
 /*
  * vm_flags2 in vm_area_struct, see mm_types.h.
  */
 #define VM_PFN_MKWRITE	0x00000001	/* vm_operations_struct includes pfn_mkwrite */
-#define VM_PMD_FAULT	0x00000002	/* vm_operations_struct includes pmd_fault */
+#define VM_HUGE_FAULT	0x00000002	/* vm_operations_struct includes huge_fault */
+#define VM_SPLIT	0x00000004	/* vm_operations_struct includes split */
 
 #if defined(CONFIG_X86)
 # define VM_PAT		VM_ARCH_1	/* PAT reserves whole VMA at once (x86) */
+#if defined (CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS)
+# define VM_PKEY_SHIFT	VM_HIGH_ARCH_BIT_0
+# define VM_PKEY_BIT0	VM_HIGH_ARCH_0	/* A protection key is a 4-bit value */
+# define VM_PKEY_BIT1	VM_HIGH_ARCH_1
+# define VM_PKEY_BIT2	VM_HIGH_ARCH_2
+# define VM_PKEY_BIT3	VM_HIGH_ARCH_3
+#endif
 #elif defined(CONFIG_PPC)
 # define VM_SAO		VM_ARCH_1	/* Strong Access Ordering (powerpc) */
 #elif defined(CONFIG_PARISC)
@@ -225,6 +246,19 @@ extern pgprot_t protection_map[16];
 #define FAULT_FLAG_KILLABLE	0x20	/* The fault task is in SIGKILL killable region */
 #define FAULT_FLAG_TRIED	0x40	/* second try */
 #define FAULT_FLAG_USER		0x80	/* The fault originated in userspace */
+#define FAULT_FLAG_REMOTE	0x100	/* faulting for non current tsk/mm */
+#define FAULT_FLAG_INSTRUCTION  0x200	/* The fault was during an instruction fetch */
+
+#define FAULT_FLAG_TRACE \
+	{ FAULT_FLAG_WRITE,		"WRITE" }, \
+	{ FAULT_FLAG_MKWRITE,		"MKWRITE" }, \
+	{ FAULT_FLAG_ALLOW_RETRY,	"ALLOW_RETRY" }, \
+	{ FAULT_FLAG_RETRY_NOWAIT,	"RETRY_NOWAIT" }, \
+	{ FAULT_FLAG_KILLABLE,		"KILLABLE" }, \
+	{ FAULT_FLAG_TRIED,		"TRIED" }, \
+	{ FAULT_FLAG_USER,		"USER" }, \
+	{ FAULT_FLAG_REMOTE,		"REMOTE" }, \
+	{ FAULT_FLAG_INSTRUCTION,	"INSTRUCTION" }
 
 /*
  * vm_fault is filled by the the pagefault handler and passed to the vma's
@@ -233,6 +267,9 @@ extern pgprot_t protection_map[16];
  *
  * pgoff should be used in favour of virtual_address, if possible. If pgoff
  * is used, one may implement ->remap_pages to get nonlinear mapping support.
+ *
+ * MM layer fills up gfp_mask for page allocations but fault handler might
+ * alter it if its implementation requires a different allocation context.
  */
 struct vm_fault {
 	unsigned int flags;		/* FAULT_FLAG_xxx flags */
@@ -245,12 +282,23 @@ struct vm_fault {
 					 * VM_FAULT_ERROR).
 					 */
 	RH_KABI_EXTEND(struct page *cow_page)	/* Handler may choose to COW */
-	RH_KABI_EXTEND(void *entry)	/* ->fault handler can alternatively
-					 * return locked DAX entry. In that
-					 * case handler should return
-					 * VM_FAULT_DAX_LOCKED and fill in
-					 * entry here.
+	RH_KABI_EXTEND(pte_t orig_pte)	/* Value of PTE at the time of fault */
+	RH_KABI_EXTEND(pmd_t *pmd)	/* Pointer to pmd entry matching
+					 * the 'virtual_address'
 					 */
+	RH_KABI_EXTEND(struct vm_area_struct *vma)	/* Target VMA */
+	RH_KABI_EXTEND(gfp_t gfp_mask)	/* gfp mask to be used for allocations */
+	RH_KABI_EXTEND(pte_t *pte)
+	RH_KABI_EXTEND(pud_t *pud)		/* Pointer to pud entry matching
+						 * the address
+						 */
+};
+
+/* page entry size for vm->huge_fault() */
+enum page_entry_size {
+	PE_SIZE_PTE = 0,
+	PE_SIZE_PMD,
+	PE_SIZE_PUD,
 };
 
 /*
@@ -303,9 +351,10 @@ struct vm_operations_struct {
 
 	/* same as page_mkwrite when using VM_PFNMAP|VM_MIXEDMAP */
 	RH_KABI_EXTEND(int (*pfn_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf))
-	RH_KABI_EXTEND(int (*pmd_fault)(struct vm_area_struct *,
-			unsigned long address, pmd_t *, unsigned int flags))
-
+	RH_KABI_EXTEND(int (*huge_fault)(struct vm_fault *vmf,
+					 enum page_entry_size pe_size))
+	RH_KABI_EXTEND(int (*split)(struct vm_area_struct *area,
+				    unsigned long addr))
 };
 
 struct mmu_gather;
@@ -325,6 +374,17 @@ static inline int get_freepage_migratetype(struct page *page)
 {
 	return page->index;
 }
+
+#if !defined(__HAVE_ARCH_PTE_DEVMAP) || !defined(CONFIG_TRANSPARENT_HUGEPAGE)
+static inline int pmd_devmap(pmd_t pmd)
+{
+	return 0;
+}
+static inline int pud_devmap(pud_t pud)
+{
+	return 0;
+}
+#endif
 
 /*
  * FIXME: take this include out, include page-flags.h in
@@ -405,6 +465,28 @@ static inline int is_vmalloc_or_module_addr(const void *x)
 	return 0;
 }
 #endif
+
+extern void *kvmalloc_node(size_t size, gfp_t flags, int node);
+static inline void *kvmalloc(size_t size, gfp_t flags)
+{
+	return kvmalloc_node(size, flags, NUMA_NO_NODE);
+}
+static inline void *kvzalloc_node(size_t size, gfp_t flags, int node)
+{
+	return kvmalloc_node(size, flags | __GFP_ZERO, node);
+}
+static inline void *kvzalloc(size_t size, gfp_t flags)
+{
+	return kvmalloc(size, flags | __GFP_ZERO);
+}
+
+static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
+{
+	if (size != 0 && n > SIZE_MAX / size)
+		return NULL;
+
+	return kvmalloc(n * size, flags);
+}
 
 extern void kvfree(const void *addr);
 
@@ -599,6 +681,8 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
 		pte = pte_mkwrite(pte);
 	return pte;
 }
+int finish_fault(struct vm_fault *vmf);
+int finish_mkwrite_fault(struct vm_fault *vmf);
 #endif
 
 /*
@@ -1111,17 +1195,33 @@ static inline void clear_page_pfmemalloc(struct page *page)
 #define VM_FAULT_WRITE	0x0008	/* Special case for get_user_pages */
 #define VM_FAULT_HWPOISON 0x0010	/* Hit poisoned small page */
 #define VM_FAULT_HWPOISON_LARGE 0x0020  /* Hit poisoned large page. Index encoded in upper bits */
+#define VM_FAULT_SIGSEGV 0x0040
 
 #define VM_FAULT_NOPAGE	0x0100	/* ->fault installed the pte, not return page */
 #define VM_FAULT_LOCKED	0x0200	/* ->fault locked the returned page */
 #define VM_FAULT_RETRY	0x0400	/* ->fault blocked, must retry */
 #define VM_FAULT_FALLBACK 0x0800	/* huge page fault failed, fall back to small */
-#define VM_FAULT_DAX_LOCKED 0x1000	/* ->fault has locked DAX entry */
+#define VM_FAULT_DONE_COW   0x1000	/* ->fault has fully handled COW */
 
 #define VM_FAULT_HWPOISON_LARGE_MASK 0xf000 /* encodes hpage index for large hwpoison */
 
-#define VM_FAULT_ERROR	(VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_HWPOISON | \
-			 VM_FAULT_FALLBACK | VM_FAULT_HWPOISON_LARGE)
+#define VM_FAULT_ERROR	(VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | \
+			 VM_FAULT_HWPOISON | VM_FAULT_HWPOISON_LARGE | \
+			 VM_FAULT_FALLBACK)
+
+#define VM_FAULT_RESULT_TRACE \
+	{ VM_FAULT_OOM,			"OOM" }, \
+	{ VM_FAULT_SIGBUS,		"SIGBUS" }, \
+	{ VM_FAULT_MAJOR,		"MAJOR" }, \
+	{ VM_FAULT_WRITE,		"WRITE" }, \
+	{ VM_FAULT_HWPOISON,		"HWPOISON" }, \
+	{ VM_FAULT_HWPOISON_LARGE,	"HWPOISON_LARGE" }, \
+	{ VM_FAULT_SIGSEGV,		"SIGSEGV" }, \
+	{ VM_FAULT_NOPAGE,		"NOPAGE" }, \
+	{ VM_FAULT_LOCKED,		"LOCKED" }, \
+	{ VM_FAULT_RETRY,		"RETRY" }, \
+	{ VM_FAULT_FALLBACK,		"FALLBACK" }, \
+	{ VM_FAULT_DONE_COW,		"DONE_COW" }
 
 /* Encode hstate index for a hwpoisoned large page */
 #define VM_FAULT_SET_HINDEX(x) ((x) << 12)
@@ -1220,8 +1320,8 @@ int copy_page_range(struct mm_struct *dst, struct mm_struct *src,
 			struct vm_area_struct *vma);
 void unmap_mapping_range(struct address_space *mapping,
 		loff_t const holebegin, loff_t const holelen, int even_cows);
-int follow_pte(struct mm_struct *mm, unsigned long address, pte_t **ptepp,
-	       spinlock_t **ptlp);
+int follow_pte_pmd(struct mm_struct *mm, unsigned long address,
+			     pte_t **ptepp, pmd_t **pmdpp, spinlock_t **ptlp);
 int follow_pfn(struct vm_area_struct *vma, unsigned long address,
 	unsigned long *pfn);
 int follow_phys(struct vm_area_struct *vma, unsigned long address,
@@ -1244,14 +1344,13 @@ int generic_error_remove_page(struct address_space *mapping, struct page *page);
 int invalidate_inode_page(struct page *page);
 
 #ifdef CONFIG_MMU
-extern int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
-			unsigned long address, unsigned int flags);
+extern int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+		unsigned int flags);
 extern int fixup_user_fault(struct task_struct *tsk, struct mm_struct *mm,
 			    unsigned long address, unsigned int fault_flags);
 #else
-static inline int handle_mm_fault(struct mm_struct *mm,
-			struct vm_area_struct *vma, unsigned long address,
-			unsigned int flags)
+static inline int handle_mm_fault(struct vm_area_struct *vma,
+		unsigned long address, unsigned int flags)
 {
 	/* should never happen if there's no MMU */
 	BUG();
@@ -1275,6 +1374,10 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		      unsigned long start, unsigned long nr_pages,
 		      unsigned int foll_flags, struct page **pages,
 		      struct vm_area_struct **vmas, int *nonblocking);
+long get_user_pages_remote(struct task_struct *tsk, struct mm_struct *mm,
+			    unsigned long start, unsigned long nr_pages,
+			    int write, int force, struct page **pages,
+			    struct vm_area_struct **vmas);
 long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		    unsigned long start, unsigned long nr_pages,
 		    int write, int force, struct page **pages,
@@ -1329,8 +1432,7 @@ bool vma_is_shmem(struct vm_area_struct *vma);
 static inline bool vma_is_shmem(struct vm_area_struct *vma) { return false; }
 #endif
 
-extern struct task_struct *task_of_stack(struct task_struct *task,
-				struct vm_area_struct *vma, bool in_group);
+int vma_is_stack_for_task(struct vm_area_struct *vma, struct task_struct *t);
 
 extern unsigned long move_page_tables(struct vm_area_struct *vma,
 		unsigned long old_addr, struct vm_area_struct *new_vma,
@@ -1459,7 +1561,7 @@ static inline int pte_devmap(pte_t pte)
 }
 #endif
 
-int vma_wants_writenotify(struct vm_area_struct *vma);
+int vma_wants_writenotify(struct vm_area_struct *vma, pgprot_t vm_page_prot);
 
 extern pte_t *__get_locked_pte(struct mm_struct *mm, unsigned long addr,
 			       spinlock_t **ptl);
@@ -1670,6 +1772,25 @@ static inline void pgtable_pmd_page_dtor(struct page *page) {}
 static inline spinlock_t *pmd_lock(struct mm_struct *mm, pmd_t *pmd)
 {
 	spinlock_t *ptl = pmd_lockptr(mm, pmd);
+	spin_lock(ptl);
+	return ptl;
+}
+
+/*
+ * No scalability reason to split PUD locks yet, but follow the same pattern
+ * as the PMD locks to make it easier if we decide to.  The VM should not be
+ * considered ready to switch to split PUD locks yet; there may be places
+ * which need to be converted from page_table_lock.
+ */
+static inline spinlock_t *pud_lockptr(struct mm_struct *mm, pud_t *pud)
+{
+	return &mm->page_table_lock;
+}
+
+static inline spinlock_t *pud_lock(struct mm_struct *mm, pud_t *pud)
+{
+	spinlock_t *ptl = pud_lockptr(mm, pud);
+
 	spin_lock(ptl);
 	return ptl;
 }
@@ -1926,12 +2047,20 @@ extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned lo
 extern unsigned long mmap_region(struct file *file, unsigned long addr,
 	unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
 	 struct list_head *uf);
-extern unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+extern unsigned long do_mmap(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot, unsigned long flags,
-	unsigned long pgoff, unsigned long *populate,
+	vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate,
 	struct list_head *uf);
 extern int do_munmap(struct mm_struct *, unsigned long, size_t,
 		     struct list_head *uf);
+
+static inline unsigned long
+do_mmap_pgoff(struct file *file, unsigned long addr,
+	unsigned long len, unsigned long prot, unsigned long flags,
+	unsigned long pgoff, unsigned long *populate, struct list_head *uf)
+{
+	return do_mmap(file, addr, len, prot, flags, 0, pgoff, populate, NULL);
+}
 
 #ifdef CONFIG_MMU
 extern int __mm_populate(unsigned long addr, unsigned long len,
@@ -2147,6 +2276,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
 #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
 #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
 #define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
+#define FOLL_REMOTE	0x2000	/* we are working on non-current tsk/mm */
 #define FOLL_COW	0x4000	/* internal GUP flag */
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
@@ -2165,17 +2295,36 @@ static inline void vm_stat_account(struct mm_struct *mm,
 #endif /* CONFIG_PROC_FS */
 
 #ifdef CONFIG_DEBUG_PAGEALLOC
-extern void kernel_map_pages(struct page *page, int numpages, int enable);
+extern bool _debug_pagealloc_enabled;
+extern void __kernel_map_pages(struct page *page, int numpages, int enable);
+
+static inline bool debug_pagealloc_enabled(void)
+{
+	return _debug_pagealloc_enabled;
+}
+
+static inline void
+kernel_map_pages(struct page *page, int numpages, int enable)
+{
+	if (!debug_pagealloc_enabled())
+		return;
+
+	__kernel_map_pages(page, numpages, enable);
+}
 #ifdef CONFIG_HIBERNATION
 extern bool kernel_page_present(struct page *page);
-#endif /* CONFIG_HIBERNATION */
-#else
+#endif	/* CONFIG_HIBERNATION */
+#else	/* CONFIG_DEBUG_PAGEALLOC */
 static inline void
 kernel_map_pages(struct page *page, int numpages, int enable) {}
 #ifdef CONFIG_HIBERNATION
 static inline bool kernel_page_present(struct page *page) { return true; }
-#endif /* CONFIG_HIBERNATION */
-#endif
+#endif	/* CONFIG_HIBERNATION */
+static inline bool debug_pagealloc_enabled(void)
+{
+	return false;
+}
+#endif	/* CONFIG_DEBUG_PAGEALLOC */
 
 extern struct vm_area_struct *get_gate_vma(struct mm_struct *mm);
 #ifdef	__HAVE_ARCH_GATE_AREA
@@ -2265,20 +2414,36 @@ extern long copy_huge_page_from_user(struct page *dst_page,
 				bool allow_pagefault);
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE || CONFIG_HUGETLBFS */
 
+extern struct page_ext_operations debug_guardpage_ops;
+extern struct page_ext_operations page_poisoning_ops;
+
 #ifdef CONFIG_DEBUG_PAGEALLOC
 extern unsigned int _debug_guardpage_minorder;
+extern bool _debug_guardpage_enabled;
 
 static inline unsigned int debug_guardpage_minorder(void)
 {
 	return _debug_guardpage_minorder;
 }
 
+static inline bool debug_guardpage_enabled(void)
+{
+	return _debug_guardpage_enabled;
+}
+
 static inline bool page_is_guard(struct page *page)
 {
-	return test_bit(PAGE_DEBUG_FLAG_GUARD, &page->debug_flags);
+	struct page_ext *page_ext;
+
+	if (!debug_guardpage_enabled())
+		return false;
+
+	page_ext = lookup_page_ext(page);
+	return test_bit(PAGE_EXT_DEBUG_GUARD, &page_ext->flags);
 }
 #else
 static inline unsigned int debug_guardpage_minorder(void) { return 0; }
+static inline bool debug_guardpage_enabled(void) { return false; }
 static inline bool page_is_guard(struct page *page) { return false; }
 #endif /* CONFIG_DEBUG_PAGEALLOC */
 

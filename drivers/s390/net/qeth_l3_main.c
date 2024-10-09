@@ -2799,7 +2799,7 @@ static inline int qeth_l3_tso_elements(struct sk_buff *skb)
 	unsigned long tcpd = (unsigned long)tcp_hdr(skb) +
 		tcp_hdr(skb)->doff * 4;
 	int tcpd_len = skb->len - (tcpd - (unsigned long)skb->data);
-	int elements = PFN_UP(tcpd + tcpd_len - 1) - PFN_DOWN(tcpd);
+	int elements = PFN_UP(tcpd + tcpd_len) - PFN_DOWN(tcpd);
 
 	elements += qeth_get_elements_for_frags(skb);
 
@@ -2928,7 +2928,8 @@ static int qeth_l3_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
 			qeth_l3_hdr_csum(card, hdr, new_skb);
 	}
 
-	elems = qeth_get_elements_no(card, new_skb, elements_needed);
+	elems = qeth_get_elements_no(card, new_skb, elements_needed,
+				     (data_offset > 0) ? data_offset : 0);
 	if (!elems) {
 		if (data_offset >= 0)
 			kmem_cache_free(qeth_core_header_cache, hdr);
@@ -3118,7 +3119,7 @@ static const struct net_device_ops qeth_l3_netdev_ops = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_rx_mode	= qeth_l3_set_multicast_list,
 	.ndo_do_ioctl		= qeth_l3_do_ioctl,
-	.ndo_change_mtu		= qeth_change_mtu,
+	.ndo_change_mtu_rh74	= qeth_change_mtu,
 	.ndo_fix_features	= qeth_l3_fix_features,
 	.ndo_set_features	= qeth_l3_set_features,
 	.ndo_vlan_rx_add_vid	= qeth_l3_vlan_rx_add_vid,
@@ -3134,7 +3135,7 @@ static const struct net_device_ops qeth_l3_osa_netdev_ops = {
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_rx_mode	= qeth_l3_set_multicast_list,
 	.ndo_do_ioctl		= qeth_l3_do_ioctl,
-	.ndo_change_mtu		= qeth_change_mtu,
+	.ndo_change_mtu_rh74	= qeth_change_mtu,
 	.ndo_fix_features	= qeth_l3_fix_features,
 	.ndo_set_features	= qeth_l3_set_features,
 	.ndo_vlan_rx_add_vid	= qeth_l3_vlan_rx_add_vid,

@@ -359,6 +359,62 @@ out:
 	return ret;
 }
 
+#define SDHCI_INTEL_PWR_TIMEOUT_CNT	20
+#define SDHCI_INTEL_PWR_TIMEOUT_UDELAY	100
+
+static void sdhci_intel_set_power(struct sdhci_host *host, unsigned char mode,
+				  unsigned short vdd)
+{
+	int cntr;
+	u8 reg;
+
+	sdhci_set_power(host, mode, vdd);
+
+	if (mode == MMC_POWER_OFF)
+		return;
+
+	/*
+	 * Bus power might not enable after D3 -> D0 transition due to the
+	 * present state not yet having propagated. Retry for up to 2ms.
+	 */
+	for (cntr = 0; cntr < SDHCI_INTEL_PWR_TIMEOUT_CNT; cntr++) {
+		reg = sdhci_readb(host, SDHCI_POWER_CONTROL);
+		if (reg & SDHCI_POWER_ON)
+			break;
+		udelay(SDHCI_INTEL_PWR_TIMEOUT_UDELAY);
+		reg |= SDHCI_POWER_ON;
+		sdhci_writeb(host, reg, SDHCI_POWER_CONTROL);
+	}
+}
+
+#define INTEL_HS400_ES_REG 0x78
+#define INTEL_HS400_ES_BIT BIT(0)
+
+static void intel_hs400_enhanced_strobe(struct mmc_host *mmc,
+					struct mmc_ios *ios)
+{
+	struct sdhci_host *host = mmc_priv(mmc);
+	u32 val;
+
+	val = sdhci_readl(host, INTEL_HS400_ES_REG);
+	if (ios->enhanced_strobe)
+		val |= INTEL_HS400_ES_BIT;
+	else
+		val &= ~INTEL_HS400_ES_BIT;
+	sdhci_writel(host, val, INTEL_HS400_ES_REG);
+}
+
+static const struct sdhci_ops sdhci_intel_byt_ops = {
+	.set_clock		= sdhci_set_clock,
+	.set_power		= sdhci_intel_set_power,
+	.enable_dma		= sdhci_pci_enable_dma,
+	.set_bus_width		= sdhci_pci_set_bus_width,
+	.reset			= sdhci_reset,
+	.set_uhs_signaling	= sdhci_set_uhs_signaling,
+	.hw_reset		= sdhci_pci_hw_reset,
+	.select_drive_strength	= sdhci_pci_select_drive_strength,
+};
+
 static int byt_emmc_probe_slot(struct sdhci_pci_slot *slot)
 {
 	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
@@ -374,6 +430,19 @@ static int byt_emmc_probe_slot(struct sdhci_pci_slot *slot)
 		slot->select_drive_strength = spt_select_drive_strength;
 	}
 	return 0;
+}
+
+static int glk_emmc_probe_slot(struct sdhci_pci_slot *slot)
+{
+	int ret = byt_emmc_probe_slot(slot);
+
+	if (slot->chip->pdev->device != PCI_DEVICE_ID_INTEL_GLK_EMMC) {
+		slot->host->mmc->caps2 |= MMC_CAP2_HS400_ES,
+		slot->host->mmc_host_ops.hs400_enhanced_strobe =
+						intel_hs400_enhanced_strobe;
+	}
+
+	return ret;
 }
 
 #ifdef CONFIG_ACPI
@@ -438,45 +507,6 @@ static int byt_sd_probe_slot(struct sdhci_pci_slot *slot)
 	return 0;
 }
 
-#define SDHCI_INTEL_PWR_TIMEOUT_CNT	20
-#define SDHCI_INTEL_PWR_TIMEOUT_UDELAY	100
-
-static void sdhci_intel_set_power(struct sdhci_host *host, unsigned char mode,
-				  unsigned short vdd)
-{
-	int cntr;
-	u8 reg;
-
-	sdhci_set_power(host, mode, vdd);
-
-	if (mode == MMC_POWER_OFF)
-		return;
-
-	/*
-	 * Bus power might not enable after D3 -> D0 transition due to the
-	 * present state not yet having propagated. Retry for up to 2ms.
-	 */
-	for (cntr = 0; cntr < SDHCI_INTEL_PWR_TIMEOUT_CNT; cntr++) {
-		reg = sdhci_readb(host, SDHCI_POWER_CONTROL);
-		if (reg & SDHCI_POWER_ON)
-			break;
-		udelay(SDHCI_INTEL_PWR_TIMEOUT_UDELAY);
-		reg |= SDHCI_POWER_ON;
-		sdhci_writeb(host, reg, SDHCI_POWER_CONTROL);
-	}
-}
-
-static const struct sdhci_ops sdhci_intel_byt_ops = {
-	.set_clock		= sdhci_set_clock,
-	.set_power		= sdhci_intel_set_power,
-	.enable_dma		= sdhci_pci_enable_dma,
-	.set_bus_width		= sdhci_pci_set_bus_width,
-	.reset			= sdhci_reset,
-	.set_uhs_signaling	= sdhci_set_uhs_signaling,
-	.hw_reset		= sdhci_pci_hw_reset,
-	.select_drive_strength	= sdhci_pci_select_drive_strength,
-};
-
 static const struct sdhci_pci_fixes sdhci_intel_byt_emmc = {
 	.allow_runtime_pm = true,
 	.probe_slot	= byt_emmc_probe_slot,
@@ -485,6 +515,16 @@ static const struct sdhci_pci_fixes sdhci_intel_byt_emmc = {
 			  SDHCI_QUIRK2_CAPS_BIT63_FOR_HS400 |
 			  SDHCI_QUIRK2_STOP_WITH_TC,
 	.ops		= &sdhci_intel_byt_ops,
+};
+
+static const struct sdhci_pci_fixes sdhci_intel_glk_emmc = {
+	.allow_runtime_pm	= true,
+	.probe_slot		= glk_emmc_probe_slot,
+	.quirks			= SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC,
+	.quirks2		= SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
+				  SDHCI_QUIRK2_CAPS_BIT63_FOR_HS400 |
+				  SDHCI_QUIRK2_STOP_WITH_TC,
+	.ops			= &sdhci_intel_byt_ops,
 };
 
 static const struct sdhci_pci_fixes sdhci_ni_byt_sdio = {
@@ -955,9 +995,12 @@ static const struct pci_device_id pci_ids[] = {
 	SDHCI_PCI_DEVICE(INTEL, APL_EMMC,  intel_byt_emmc),
 	SDHCI_PCI_DEVICE(INTEL, APL_SDIO,  intel_byt_sdio),
 	SDHCI_PCI_DEVICE(INTEL, APL_SD,    intel_byt_sd),
-	SDHCI_PCI_DEVICE(INTEL, GLK_EMMC,  intel_byt_emmc),
+	SDHCI_PCI_DEVICE(INTEL, GLK_EMMC,  intel_glk_emmc),
 	SDHCI_PCI_DEVICE(INTEL, GLK_SDIO,  intel_byt_sdio),
 	SDHCI_PCI_DEVICE(INTEL, GLK_SD,    intel_byt_sd),
+	SDHCI_PCI_DEVICE(INTEL, CNP_EMMC,  intel_glk_emmc),
+	SDHCI_PCI_DEVICE(INTEL, CNP_SD,    intel_byt_sd),
+	SDHCI_PCI_DEVICE(INTEL, CNPH_SD,   intel_byt_sd),
 	SDHCI_PCI_DEVICE(O2, 8120,     o2),
 	SDHCI_PCI_DEVICE(O2, 8220,     o2),
 	SDHCI_PCI_DEVICE(O2, 8221,     o2),

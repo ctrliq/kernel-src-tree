@@ -102,6 +102,7 @@ enum {
 	NVME_REG_ACQ	= 0x0030,	/* Admin CQ Base Address */
 	NVME_REG_CMBLOC = 0x0038,	/* Controller Memory Buffer Location */
 	NVME_REG_CMBSZ	= 0x003c,	/* Controller Memory Buffer Size */
+	NVME_REG_DBS	= 0x1000,	/* SQ 0 Tail Doorbell */
 };
 
 #define NVME_CAP_MQES(cap)	((cap) & 0xffff)
@@ -250,6 +251,7 @@ enum {
 	NVME_CTRL_ONCS_WRITE_UNCORRECTABLE	= 1 << 1,
 	NVME_CTRL_ONCS_DSM			= 1 << 2,
 	NVME_CTRL_VWC_PRESENT			= 1 << 0,
+	NVME_CTRL_OACS_DBBUF_SUPP		= 1 << 8,
 };
 
 struct nvme_lbaf {
@@ -278,7 +280,7 @@ struct nvme_id_ns {
 	__le16			nabsn;
 	__le16			nabo;
 	__le16			nabspf;
-	__u16			rsvd46;
+	__le16			noiob;
 	__u8			nvmcap[16];
 	__u8			rsvd64[40];
 	__u8			nguid[16];
@@ -588,6 +590,17 @@ struct nvme_dsm_range {
 	__le64			slba;
 };
 
+/* Features */
+
+struct nvme_feat_auto_pst {
+	__le64 entries[32];
+};
+
+enum {
+	NVME_HOST_MEM_ENABLE	= (1 << 0),
+	NVME_HOST_MEM_RETURN	= (1 << 1),
+};
+
 /* Admin commands */
 
 enum nvme_admin_opcode {
@@ -606,6 +619,7 @@ enum nvme_admin_opcode {
 	nvme_admin_download_fw		= 0x11,
 	nvme_admin_ns_attach		= 0x15,
 	nvme_admin_keep_alive		= 0x18,
+	nvme_admin_dbbuf		= 0x7C,
 	nvme_admin_format_nvm		= 0x80,
 	nvme_admin_security_send	= 0x81,
 	nvme_admin_security_recv	= 0x82,
@@ -653,9 +667,13 @@ struct nvme_identify {
 	__le32			nsid;
 	__u64			rsvd2[2];
 	union nvme_data_ptr	dptr;
-	__le32			cns;
+	__u8			cns;
+	__u8			rsvd3;
+	__le16			ctrlid;
 	__u32			rsvd11[5];
 };
+
+#define NVME_IDENTIFY_DATA_SIZE 4096
 
 struct nvme_features {
 	__u8			opcode;
@@ -670,6 +688,12 @@ struct nvme_features {
 	__le32                  dword13;
 	__le32                  dword14;
 	__le32                  dword15;
+};
+
+struct nvme_host_mem_buf_desc {
+	__le64			addr;
+	__le32			size;
+	__u32			rsvd;
 };
 
 struct nvme_create_cq {
@@ -878,6 +902,16 @@ struct nvmf_property_get_command {
 	__u8		resv4[16];
 };
 
+struct nvme_dbbuf {
+	__u8			opcode;
+	__u8			flags;
+	__u16			command_id;
+	__u32			rsvd1[5];
+	__le64			prp1;
+	__le64			prp2;
+	__u32			rsvd12[6];
+};
+
 struct nvme_command {
 	union {
 		struct nvme_common_command common;
@@ -896,6 +930,7 @@ struct nvme_command {
 		struct nvmf_connect_command connect;
 		struct nvmf_property_set_command prop_set;
 		struct nvmf_property_get_command prop_get;
+		struct nvme_dbbuf dbbuf;
 	};
 };
 

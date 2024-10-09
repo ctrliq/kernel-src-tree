@@ -1656,8 +1656,8 @@ static void alx_poll_controller(struct net_device *netdev)
 }
 #endif
 
-static struct rtnl_link_stats64 *alx_get_stats64(struct net_device *dev,
-					struct rtnl_link_stats64 *net_stats)
+static void alx_get_stats64(struct net_device *dev,
+			    struct rtnl_link_stats64 *net_stats)
 {
 	struct alx_priv *alx = netdev_priv(dev);
 	struct alx_hw_stats *hw_stats = &alx->hw.stats;
@@ -1701,8 +1701,6 @@ static struct rtnl_link_stats64 *alx_get_stats64(struct net_device *dev,
 	net_stats->rx_packets = hw_stats->rx_ok + net_stats->rx_errors;
 
 	spin_unlock(&alx->stats_lock);
-
-	return net_stats;
 }
 
 static const struct net_device_ops alx_netdev_ops = {
@@ -1713,7 +1711,7 @@ static const struct net_device_ops alx_netdev_ops = {
 	.ndo_set_rx_mode        = alx_set_rx_mode,
 	.ndo_validate_addr      = eth_validate_addr,
 	.ndo_set_mac_address    = alx_set_mac_address,
-	.ndo_change_mtu         = alx_change_mtu,
+	.ndo_change_mtu_rh74    = alx_change_mtu,
 	.ndo_do_ioctl           = alx_ioctl,
 	.ndo_tx_timeout         = alx_tx_timeout,
 	.ndo_fix_features	= alx_fix_features,

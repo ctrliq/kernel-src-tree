@@ -4,15 +4,15 @@ SUBLEVEL = 0
 EXTRAVERSION =
 NAME = Unicycling Gorilla
 RHEL_MAJOR = 7
-RHEL_MINOR = 4
-RHEL_RELEASE = 693
+RHEL_MINOR = 5
+RHEL_RELEASE = 862
 
 #
 # DRM backport version
 #
 RHEL_DRM_VERSION = 4
-RHEL_DRM_PATCHLEVEL = 10
-RHEL_DRM_SUBLEVEL = 13
+RHEL_DRM_PATCHLEVEL = 14
+RHEL_DRM_SUBLEVEL = 0
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -397,7 +397,7 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 
 ifneq ($(WITH_GCOV),1)
 ifeq ($(KBUILD_EXTMOD),)
-ifneq (,$(filter $(ARCH), x86 x86_64 powerpc))
+ifneq (,$(filter $(ARCH), x86 x86_64 powerpc s390))
 KBUILD_CFLAGS   += $(call cc-ifversion, -eq, 0408, -Werror)
 endif
 # powerpc is compiled with -O3 and gcc 4.8 has some known problems
@@ -609,7 +609,14 @@ all: vmlinux
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
 else
+# powerpc is compiled with -O3, via specfile rpmbuild -- see rhbz1051067.
+# we need to keep consistency here, however, for out of tree kmod builds --
+# see rhbz1431029 for reference
+ifeq ($(SRCARCH), powerpc)
+KBUILD_CFLAGS	+= -O3
+else
 KBUILD_CFLAGS	+= -O2
+endif
 endif
 
 include $(srctree)/arch/$(SRCARCH)/Makefile

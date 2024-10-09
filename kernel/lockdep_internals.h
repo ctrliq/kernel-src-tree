@@ -64,8 +64,10 @@ enum {
 /*
  * Stack-trace: tightly packed array of stack backtrace
  * addresses. Protected by the hash_lock.
+ *
+ * RHEL7 specific: Increase # of stack entries from 512k to 640k.
  */
-#define MAX_STACK_TRACE_ENTRIES	524288UL
+#define MAX_STACK_TRACE_ENTRIES	655360UL
 
 extern struct list_head all_lock_classes;
 extern struct lock_chain lock_chains[];

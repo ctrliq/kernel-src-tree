@@ -1948,7 +1948,9 @@ static int hotmod_handler(const char *val, struct kernel_param *kp)
 				kfree(info);
 				goto out;
 			}
+			mutex_lock(&smi_infos_lock);
 			rv = try_smi_init(info);
+			mutex_unlock(&smi_infos_lock);
 			if (rv) {
 				cleanup_one_si(info);
 				goto out;
@@ -2036,8 +2038,10 @@ static int hardcode_find_bmc(void)
 		info->slave_addr = slave_addrs[i];
 
 		if (!add_smi(info)) {
+			mutex_lock(&smi_infos_lock);
 			if (try_smi_init(info))
 				cleanup_one_si(info);
+			mutex_unlock(&smi_infos_lock);
 			ret = 0;
 		} else {
 			kfree(info);
@@ -3497,11 +3501,17 @@ out_err:
 	return rv;
 }
 
+/*
+ * Try to start up an interface.  Must be called with smi_infos_lock
+ * held, primarily to keep smi_num consistent, we only one to do these
+ * one at a time.
+ */
 static int try_smi_init(struct smi_info *new_smi)
 {
 	int rv = 0;
 	int i;
 	struct ipmi_shadow_smi_handlers *shadow_handlers;
+	char *init_name = NULL;
 
 	pr_info(PFX "Trying %s-specified %s state machine at %s address 0x%lx, slave address 0x%x, irq %d\n",
 		ipmi_addr_src_to_str(new_smi->addr_source),
@@ -3527,6 +3537,29 @@ static int try_smi_init(struct smi_info *new_smi)
 		/* No support for anything else yet. */
 		rv = -EIO;
 		goto out_err;
+	}
+
+	new_smi->intf_num = smi_num;
+
+	/* Do this early so it's available for logs. */
+	if (!new_smi->dev) {
+		init_name = kasprintf(GFP_KERNEL, "ipmi_si.%d",
+				      new_smi->intf_num);
+
+		/*
+		 * If we don't already have a device from something
+		 * else (like PCI), then register a new one.
+		 */
+		new_smi->pdev = platform_device_alloc("ipmi_si",
+						      new_smi->intf_num);
+		if (!new_smi->pdev) {
+			pr_err(PFX "Unable to allocate platform device\n");
+			goto out_err;
+		}
+		new_smi->dev = &new_smi->pdev->dev;
+		new_smi->dev->driver = &ipmi_driver.driver;
+		/* Nulled by device_add() */
+		new_smi->dev->init_name = init_name;
 	}
 
 	/* Allocate the state machine's data and initialize it. */
@@ -3578,8 +3611,6 @@ static int try_smi_init(struct smi_info *new_smi)
 
 	new_smi->interrupt_disabled = true;
 	atomic_set(&new_smi->need_watch, 0);
-	new_smi->intf_num = smi_num;
-	smi_num++;
 
 	rv = try_enable_event_buffer(new_smi);
 	if (rv == 0)
@@ -3600,21 +3631,7 @@ static int try_smi_init(struct smi_info *new_smi)
 		atomic_set(&new_smi->req_events, 1);
 	}
 
-	if (!new_smi->dev) {
-		/*
-		 * If we don't already have a device from something
-		 * else (like PCI), then register a new one.
-		 */
-		new_smi->pdev = platform_device_alloc("ipmi_si",
-						      new_smi->intf_num);
-		if (!new_smi->pdev) {
-			printk(KERN_ERR PFX
-			       "Unable to allocate platform device\n");
-			goto out_err;
-		}
-		new_smi->dev = &new_smi->pdev->dev;
-		new_smi->dev->driver = &ipmi_driver.driver;
-
+	if (new_smi->pdev) {
 		rv = platform_device_add(new_smi->pdev);
 		if (rv) {
 			dev_err(new_smi->dev,
@@ -3667,8 +3684,14 @@ static int try_smi_init(struct smi_info *new_smi)
 		goto out_err_stop_timer;
 	}
 
+	/* Don't increment till we know we have succeeded. */
+	smi_num++;
+
 	dev_info(new_smi->dev, "IPMI %s interface initialized\n",
 		 si_to_str[new_smi->si_type]);
+
+	WARN_ON(new_smi->dev->init_name != NULL);
+	kfree(init_name);
 
 	return 0;
 
@@ -3714,7 +3737,13 @@ out_err:
 	if (new_smi->dev_registered) {
 		platform_device_unregister(new_smi->pdev);
 		new_smi->dev_registered = 0;
+		new_smi->pdev = NULL;
+	} else if (new_smi->pdev) {
+		platform_device_put(new_smi->pdev);
+		new_smi->pdev = NULL;
 	}
+
+	kfree(init_name);
 
 	return rv;
 }

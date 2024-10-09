@@ -2222,7 +2222,7 @@ static const struct net_device_ops atl1e_netdev_ops = {
 	.ndo_set_mac_address	= atl1e_set_mac_addr,
 	.ndo_fix_features	= atl1e_fix_features,
 	.ndo_set_features	= atl1e_set_features,
-	.ndo_change_mtu		= atl1e_change_mtu,
+	.ndo_change_mtu_rh74	= atl1e_change_mtu,
 	.ndo_do_ioctl		= atl1e_ioctl,
 	.ndo_tx_timeout		= atl1e_tx_timeout,
 #ifdef CONFIG_NET_POLL_CONTROLLER

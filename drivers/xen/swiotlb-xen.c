@@ -275,9 +275,6 @@ xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
 	*/
 	flags &= ~(__GFP_DMA | __GFP_HIGHMEM);
 
-	if (dma_alloc_from_coherent(hwdev, size, dma_handle, &ret))
-		return ret;
-
 	vstart = __get_free_pages(flags, order);
 	ret = (void *)vstart;
 
@@ -312,9 +309,6 @@ xen_swiotlb_free_coherent(struct device *hwdev, size_t size, void *vaddr,
 	int order = get_order(size);
 	phys_addr_t phys;
 	u64 dma_mask = DMA_BIT_MASK(32);
-
-	if (dma_release_from_coherent(hwdev, order, vaddr))
-		return;
 
 	if (hwdev && hwdev->coherent_dma_mask)
 		dma_mask = hwdev->coherent_dma_mask;

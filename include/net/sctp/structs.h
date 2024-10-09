@@ -537,7 +537,6 @@ struct sctp_datamsg {
 	/* Did the messenge fail to send? */
 	int send_error;
 	u8 send_failed:1,
-	   force_delay:1,
 	   can_delay;	    /* should this message be Nagle delayed */
 };
 
@@ -1891,6 +1890,7 @@ struct sctp_association {
 
 	__u8 need_ecne:1,	/* Need to send an ECNE Chunk? */
 	     temp:1,		/* Is it a temporary association? */
+	     force_delay:1,
 	     prsctp_enable:1;
 
 	struct sctp_priv_assoc_stats stats;

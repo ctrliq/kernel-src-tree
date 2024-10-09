@@ -18,12 +18,13 @@
 #include "brcmu_wifi.h"
 #include "brcmu_utils.h"
 
+#include "cfg80211.h"
 #include "core.h"
 #include "debug.h"
 #include "tracepoint.h"
-#include "fwsignal.h"
 #include "fweh.h"
 #include "fwil.h"
+#include "proto.h"
 
 /**
  * struct brcmf_fweh_queue_item - event item on event queue.
@@ -68,7 +69,7 @@ static struct brcmf_fweh_event_name fweh_event_names[] = {
  *
  * @code: code to lookup.
  */
-static const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code)
+const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code)
 {
 	int i;
 	for (i = 0; i < ARRAY_SIZE(fweh_event_names); i++) {
@@ -78,7 +79,7 @@ static const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code)
 	return "unknown";
 }
 #else
-static const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code)
+const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code)
 {
 	return "nodebug";
 }
@@ -171,19 +172,24 @@ static void brcmf_fweh_handle_if_event(struct brcmf_pub *drvr,
 		if (IS_ERR(ifp))
 			return;
 		if (!is_p2pdev)
-			brcmf_fws_add_interface(ifp);
+			brcmf_proto_add_if(drvr, ifp);
 		if (!drvr->fweh.evt_handler[BRCMF_E_IF])
 			if (brcmf_net_attach(ifp, false) < 0)
 				return;
 	}
 
 	if (ifp && ifevent->action == BRCMF_E_IF_CHANGE)
-		brcmf_fws_reset_interface(ifp);
+		brcmf_proto_reset_if(drvr, ifp);
 
 	err = brcmf_fweh_call_event_handler(ifp, emsg->event_code, emsg, data);
 
-	if (ifp && ifevent->action == BRCMF_E_IF_DEL)
-		brcmf_remove_interface(ifp);
+	if (ifp && ifevent->action == BRCMF_E_IF_DEL) {
+		bool armed = brcmf_cfg80211_vif_event_armed(drvr->config);
+
+		/* Default handling in case no-one waits for this event */
+		if (!armed)
+			brcmf_remove_interface(ifp, false);
+	}
 }
 
 /**

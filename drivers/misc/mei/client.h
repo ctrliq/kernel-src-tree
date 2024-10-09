@@ -93,15 +93,12 @@ static inline void mei_io_list_init(struct mei_cl_cb *list)
 {
 	INIT_LIST_HEAD(&list->list);
 }
-void mei_io_list_flush(struct mei_cl_cb *list, struct mei_cl *cl);
 
 /*
  * MEI Host Client Functions
  */
 
 struct mei_cl *mei_cl_allocate(struct mei_device *dev);
-void mei_cl_init(struct mei_cl *cl, struct mei_device *dev);
-
 
 int mei_cl_link(struct mei_cl *cl);
 int mei_cl_unlink(struct mei_cl *cl);
@@ -211,17 +208,15 @@ static inline u8 mei_cl_host_addr(const struct mei_cl *cl)
 int mei_cl_disconnect(struct mei_cl *cl);
 void mei_cl_set_disconnected(struct mei_cl *cl);
 int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
-			  struct mei_cl_cb *cmpl_list);
+			  struct list_head *cmpl_list);
 int mei_cl_connect(struct mei_cl *cl, struct mei_me_client *me_cl,
 		   const struct file *file);
 int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
-			      struct mei_cl_cb *cmpl_list);
+			      struct list_head *cmpl_list);
 int mei_cl_read_start(struct mei_cl *cl, size_t length, const struct file *fp);
-int mei_cl_irq_read_msg(struct mei_cl *cl, struct mei_msg_hdr *hdr,
-			struct mei_cl_cb *cmpl_list);
 int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb);
 int mei_cl_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
-		     struct mei_cl_cb *cmpl_list);
+		     struct list_head *cmpl_list);
 
 void mei_cl_complete(struct mei_cl *cl, struct mei_cl_cb *cb);
 
@@ -232,7 +227,7 @@ enum mei_cb_file_ops mei_cl_notify_req2fop(u8 request);
 int mei_cl_notify_request(struct mei_cl *cl,
 			  const struct file *file, u8 request);
 int mei_cl_irq_notify(struct mei_cl *cl, struct mei_cl_cb *cb,
-		      struct mei_cl_cb *cmpl_list);
+		      struct list_head *cmpl_list);
 int mei_cl_notify_get(struct mei_cl *cl, bool block, bool *notify_ev);
 void mei_cl_notify(struct mei_cl *cl);
 

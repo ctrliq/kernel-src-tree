@@ -909,23 +909,9 @@ int nfs_flock(struct file *filp, int cmd, struct file_lock *fl)
 	fl->fl_start = 0;
 	fl->fl_end = OFFSET_MAX;
 
-	/*
-	 * VFS doesn't require the open mode to match a flock() lock's type.
-	 * NFS, however, may simulate flock() locking with posix locking which
-	 * requires the open mode to match the lock type.
-	 */
-	switch (fl->fl_type) {
-	case F_UNLCK:
+	/* We're simulating flock() locks using posix locks on the server */
+	if (fl->fl_type == F_UNLCK)
 		return do_unlk(filp, cmd, fl, is_local);
-	case F_RDLCK:
-		if (!(filp->f_mode & FMODE_READ))
-			return -EBADF;
-		break;
-	case F_WRLCK:
-		if (!(filp->f_mode & FMODE_WRITE))
-			return -EBADF;
-	}
-
 	return do_setlk(filp, cmd, fl, is_local);
 }
 EXPORT_SYMBOL_GPL(nfs_flock);

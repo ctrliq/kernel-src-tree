@@ -183,7 +183,7 @@ static int __init set_trace_boot_options(char *str)
 __setup("trace_options=", set_trace_boot_options);
 
 
-unsigned long long ns2usecs(cycle_t nsec)
+unsigned long long ns2usecs(u64 nsec)
 {
 	nsec += 500;
 	do_div(nsec, 1000);
@@ -245,7 +245,7 @@ int filter_current_check_discard(struct ring_buffer *buffer,
 }
 EXPORT_SYMBOL_GPL(filter_current_check_discard);
 
-cycle_t buffer_ftrace_now(struct trace_buffer *buf, int cpu)
+u64 buffer_ftrace_now(struct trace_buffer *buf, int cpu)
 {
 	u64 ts;
 
@@ -259,7 +259,7 @@ cycle_t buffer_ftrace_now(struct trace_buffer *buf, int cpu)
 	return ts;
 }
 
-cycle_t ftrace_now(int cpu)
+u64 ftrace_now(int cpu)
 {
 	return buffer_ftrace_now(&global_trace.trace_buffer, cpu);
 }
@@ -6718,4 +6718,4 @@ __init static int clear_boot_tracer(void)
 
 early_initcall(tracer_alloc_buffers);
 fs_initcall(tracer_init_debugfs);
-late_initcall(clear_boot_tracer);
+late_initcall_sync(clear_boot_tracer);

@@ -466,8 +466,8 @@ int ipath_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		goto inval;
 
 	if (attr_mask & IB_QP_AV) {
-		if (attr->ah_attr.dlid == 0 ||
-		    attr->ah_attr.dlid >= IPATH_MULTICAST_LID_BASE)
+		if (rdma_ah_get_dlid(&attr->ah_attr) == 0 ||
+		    rdma_ah_get_dlid(&attr->ah_attr) >= IPATH_MULTICAST_LID_BASE)
 			goto inval;
 
 		if ((attr->ah_attr.ah_flags & IB_AH_GRH) &&

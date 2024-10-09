@@ -95,16 +95,11 @@ SYSCALL_DEFINE5(add_key, const char __user *, _type,
 	/* pull the payload in if one was supplied */
 	payload = NULL;
 
-	if (_payload) {
+	if (plen) {
 		ret = -ENOMEM;
-		payload = kmalloc(plen, GFP_KERNEL | __GFP_NOWARN);
-		if (!payload) {
-			if (plen <= PAGE_SIZE)
-				goto error2;
-			payload = vmalloc(plen);
-			if (!payload)
-				goto error2;
-		}
+		payload = kvmalloc(plen, GFP_KERNEL);
+		if (!payload)
+			goto error2;
 
 		ret = -EFAULT;
 		if (copy_from_user(payload, _payload, plen) != 0)
@@ -133,7 +128,10 @@ SYSCALL_DEFINE5(add_key, const char __user *, _type,
 
 	key_ref_put(keyring_ref);
  error3:
-	kvfree(payload);
+	if (payload) {
+		memzero_explicit(payload, plen);
+		kvfree(payload);
+	}
  error2:
 	kfree(description);
  error:
@@ -325,7 +323,7 @@ long keyctl_update_key(key_serial_t id,
 
 	/* pull the payload in if one was supplied */
 	payload = NULL;
-	if (_payload) {
+	if (plen) {
 		ret = -ENOMEM;
 		payload = kmalloc(plen, GFP_KERNEL);
 		if (!payload)
@@ -348,7 +346,7 @@ long keyctl_update_key(key_serial_t id,
 
 	key_ref_put(key_ref);
 error2:
-	kfree(payload);
+	kzfree(payload);
 error:
 	return ret;
 }
@@ -742,10 +740,9 @@ long keyctl_read_key(key_serial_t keyid, char __user *buffer, size_t buflen)
 
 	key = key_ref_to_ptr(key_ref);
 
-	if (test_bit(KEY_FLAG_NEGATIVE, &key->flags)) {
-		ret = -ENOKEY;
-		goto error2;
-	}
+	ret = key_read_state(key);
+	if (ret < 0)
+		goto error2; /* Negatively instantiated */
 
 	/* see if we can read it directly */
 	ret = key_permission(key_ref, KEY_READ);
@@ -877,7 +874,7 @@ long keyctl_chown_key(key_serial_t id, uid_t user, gid_t group)
 		atomic_dec(&key->user->nkeys);
 		atomic_inc(&newowner->nkeys);
 
-		if (test_bit(KEY_FLAG_INSTANTIATED, &key->flags)) {
+		if (key->state != KEY_IS_UNINSTANTIATED) {
 			atomic_dec(&key->user->nikeys);
 			atomic_inc(&newowner->nikeys);
 		}
@@ -1040,7 +1037,6 @@ long keyctl_instantiate_key_common(key_serial_t id,
 	struct key *instkey, *dest_keyring;
 	void *payload;
 	long ret;
-	bool vm = false;
 
 	kenter("%d,,%zu,%d", id, plen, ringid);
 
@@ -1064,15 +1060,9 @@ long keyctl_instantiate_key_common(key_serial_t id,
 
 	if (payload_iov) {
 		ret = -ENOMEM;
-		payload = kmalloc(plen, GFP_KERNEL);
-		if (!payload) {
-			if (plen <= PAGE_SIZE)
-				goto error;
-			vm = true;
-			payload = vmalloc(plen);
-			if (!payload)
-				goto error;
-		}
+		payload = kvmalloc(plen, GFP_KERNEL);
+		if (!payload)
+			goto error;
 
 		ret = copy_from_user_iovec(payload, payload_iov, ioc);
 		if (ret < 0)
@@ -1097,10 +1087,9 @@ long keyctl_instantiate_key_common(key_serial_t id,
 		keyctl_change_reqkey_auth(NULL);
 
 error2:
-	if (!vm)
-		kfree(payload);
-	else
-		vfree(payload);
+	if (payload) {
+		kvfree(payload);
+	}
 error:
 	return ret;
 }

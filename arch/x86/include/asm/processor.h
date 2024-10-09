@@ -13,7 +13,7 @@ struct mm_struct;
 #include <asm/types.h>
 #include <asm/sigcontext.h>
 #include <asm/current.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
 #include <asm/page.h>
 #include <asm/pgtable_types.h>
 #include <asm/percpu.h>
@@ -23,12 +23,13 @@ struct mm_struct;
 #include <asm/special_insns.h>
 
 #include <linux/personality.h>
-#include <linux/cpumask.h>
 #include <linux/cache.h>
 #include <linux/threads.h>
 #include <linux/math64.h>
 #include <linux/err.h>
 #include <linux/irqflags.h>
+#include <linux/mem_encrypt.h>
+#include <linux/magic.h>
 
 #include <linux/rh_kabi.h>
 
@@ -82,6 +83,7 @@ struct rh_cpuinfo_x86 {
 	int			x86_cache_occ_scale;
 	/* Logical processor id: */
 	u16			logical_proc_id;
+	unsigned		initialized : 1;
 };
 
 /*
@@ -133,6 +135,8 @@ struct cpuinfo_x86 {
 	u16			phys_proc_id;
 	/* Core id: */
 	u16			cpu_core_id;
+	/* Compute unit id */
+	RH_KABI_REPLACE(u8 compute_unit_id, __u8 cu_id)
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 	u32			microcode;
@@ -224,9 +228,17 @@ static inline void native_cpuid(unsigned int *eax, unsigned int *ebx,
 	    : "memory");
 }
 
-static inline void load_cr3(pgd_t *pgdir)
+/*
+ * Friendlier CR3 helpers.
+ */
+static inline unsigned long read_cr3_pa(void)
 {
-	write_cr3(__pa(pgdir));
+	return read_cr3() & CR3_ADDR_MASK;
+}
+
+static inline unsigned long native_read_cr3_pa(void)
+{
+	return native_read_cr3() & CR3_ADDR_MASK;
 }
 
 #ifdef CONFIG_X86_32
@@ -304,11 +316,30 @@ struct tss_struct {
 	/*
 	 * .. and then another 0x100 bytes for the emergency kernel stack:
 	 */
+	RH_KABI_FILL_HOLE(unsigned long stack_canary)
 	unsigned long		stack[64];
 
-} ____cacheline_aligned;
+	/*
+	 *
+	 * The Intel SDM says (Volume 3, 7.2.1):
+	 *
+	 *  Avoid placing a page boundary in the part of the TSS that the
+	 *  processor reads during a task switch (the first 104 bytes). The
+	 *  processor may not correctly perform address translations if a
+	 *  boundary occurs in this area. During a task switch, the processor
+	 *  reads and writes into the first 104 bytes of each TSS (using
+	 *  contiguous physical addresses beginning with the physical address
+	 *  of the first byte of the TSS). So, after TSS access begins, if
+	 *  part of the 104 bytes is not physically contiguous, the processor
+	 *  will access incorrect information without generating a page-fault
+	 *  exception.
+	 *
+	 * There are also a lot of errata involving the TSS spanning a page
+	 * boundary.  Assert that we're not doing that.
+	 */
+} __attribute__((__aligned__(PAGE_SIZE)));
 
-DECLARE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss);
+DECLARE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(struct tss_struct, init_tss);
 
 /*
  * Save the original ist values for checking stack pointers during debugging
@@ -414,6 +445,15 @@ struct bndreg {
 struct bndcsr {
 	u64 bndcfgu;
 	u64 bndstatus;
+} __packed;
+
+/*
+ * State component 9: 32-bit PKRU register.  The state is
+ * 8 bytes long but only 4 bytes is used currently.
+ */
+struct pkru_state {
+	u32				pkru;
+	u32				pad;
 } __packed;
 
 struct xsave_hdr_struct {
@@ -613,8 +653,13 @@ static inline void set_in_cr4(unsigned long mask)
 	unsigned long cr4;
 
 	mmu_cr4_features |= mask;
-	if (trampoline_cr4_features)
-		*trampoline_cr4_features = mmu_cr4_features;
+	if (trampoline_cr4_features) {
+		/*
+		 * Mask off features that don't work outside long mode (just
+		 * PCIDE for now).
+		 */
+		*trampoline_cr4_features = mmu_cr4_features & ~X86_CR4_PCIDE;
+	}
 	cr4 = read_cr4();
 	cr4 |= mask;
 	write_cr4(cr4);
@@ -935,7 +980,8 @@ extern unsigned long thread_saved_pc(struct task_struct *tsk);
 }
 
 #define INIT_TSS  { \
-	.x86_tss.sp0 = (unsigned long)&init_stack + sizeof(init_stack) \
+	.x86_tss.sp0 = (unsigned long)&init_stack + sizeof(init_stack), \
+	.stack_canary		= STACK_END_MAGIC, \
 }
 
 /*

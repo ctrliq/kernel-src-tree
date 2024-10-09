@@ -193,7 +193,7 @@ struct sock_common {
 	int			skc_bound_dev_if;
 	union {
 		struct hlist_node	skc_bind_node;
-		struct hlist_nulls_node skc_portaddr_node;
+		RH_KABI_REPLACE(struct hlist_nulls_node skc_portaddr_node, struct hlist_node skc_portaddr_node)
 	};
 	struct proto		*skc_prot;
 	possible_net_t		skc_net;
@@ -298,6 +298,7 @@ struct cg_proto;
   *	@sk_error_report: callback to indicate errors (e.g. %MSG_ERRQUEUE)
   *	@sk_backlog_rcv: callback to process the backlog
   *	@sk_destruct: called at sock freeing time, i.e. when all refcnt == 0
+  *	@sk_reuseport_cb: reuseport group container
  */
 struct sock {
 	/*
@@ -446,9 +447,13 @@ struct sock {
 	 */
 	RH_KABI_USE2_P(1, __u32	sk_txhash, u32 sk_max_pacing_rate)
 	RH_KABI_USE2_P(2, u16 sk_tsflags, __u32 sk_dst_pending_confirm)
-	RH_KABI_RESERVE_P(3)
-	RH_KABI_RESERVE_P(4)
-	RH_KABI_RESERVE_P(5)
+	RH_KABI_USE_P(3, struct sock_reuseport __rcu	*sk_reuseport_cb)
+#ifndef __GENKSYMS__
+	struct rcu_head		sk_rcu;
+#else
+	RH_KABI_USE_P(4, sk_rcu.next)
+	RH_KABI_USE_P(5, sk_rcu.func)
+#endif
 	RH_KABI_RESERVE_P(6)
 	RH_KABI_RESERVE_P(7)
 	RH_KABI_RESERVE_P(8)
@@ -641,7 +646,11 @@ static inline void sk_add_node(struct sock *sk, struct hlist_head *list)
 static inline void sk_add_node_rcu(struct sock *sk, struct hlist_head *list)
 {
 	sock_hold(sk);
-	hlist_add_head_rcu(&sk->sk_node, list);
+	if (IS_ENABLED(CONFIG_IPV6) && sk->sk_reuseport &&
+	    sk->sk_family == AF_INET6)
+		hlist_add_tail_rcu(&sk->sk_node, list);
+	else
+		hlist_add_head_rcu(&sk->sk_node, list);
 }
 
 static inline void __sk_nulls_add_node_rcu(struct sock *sk, struct hlist_nulls_head *list)
@@ -689,18 +698,18 @@ static inline void sk_add_bind_node(struct sock *sk,
 	hlist_for_each_entry(__sk, list, sk_bind_node)
 
 /**
- * sk_nulls_for_each_entry_offset - iterate over a list at a given struct offset
+ * sk_for_each_entry_offset_rcu - iterate over a list at a given struct offset
  * @tpos:	the type * to use as a loop cursor.
  * @pos:	the &struct hlist_node to use as a loop cursor.
  * @head:	the head for your list.
  * @offset:	offset of hlist_node within the struct.
  *
  */
-#define sk_nulls_for_each_entry_offset(tpos, pos, head, offset)		       \
-	for (pos = (head)->first;					       \
-	     (!is_a_nulls(pos)) &&					       \
+#define sk_for_each_entry_offset_rcu(tpos, pos, head, offset)		       \
+	for (pos = rcu_dereference((head)->first);			       \
+	     pos != NULL &&						       \
 		({ tpos = (typeof(*tpos) *)((void *)pos - offset); 1;});       \
-	     pos = pos->next)
+	     pos = rcu_dereference(pos->next))
 
 static inline struct user_namespace *sk_user_ns(struct sock *sk)
 {
@@ -748,6 +757,7 @@ enum sock_flags {
 		     */
 	SOCK_FILTER_LOCKED, /* Filter cannot be changed anymore */
 	SOCK_SELECT_ERR_QUEUE, /* Wake select on error queue */
+	SOCK_RCU_FREE, /* wait rcu grace period in sk_destruct() */
 };
 
 #define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))
@@ -1607,6 +1617,7 @@ extern struct sk_buff		*sock_wmalloc(struct sock *sk,
 extern struct sk_buff		*sock_rmalloc(struct sock *sk,
 					      unsigned long size, int force,
 					      gfp_t priority);
+void __sock_wfree(struct sk_buff *skb);
 extern void			sock_wfree(struct sk_buff *skb);
 extern void			skb_orphan_partial(struct sk_buff *skb);
 extern void			sock_rfree(struct sk_buff *skb);
@@ -1614,7 +1625,7 @@ extern void			sock_efree(struct sk_buff *skb);
 #ifdef CONFIG_INET
 void sock_edemux(struct sk_buff *skb);
 #else
-#define sock_edemux(skb) sock_efree(skb)
+#define sock_edemux sock_efree
 #endif
 
 extern int			sock_setsockopt(struct socket *sock, int level,

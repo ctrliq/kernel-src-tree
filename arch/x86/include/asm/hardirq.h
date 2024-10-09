@@ -43,6 +43,7 @@ typedef struct {
 	unsigned int irq_deferred_error_count;
 #endif
 	unsigned int kvm_posted_intr_wakeup_ipis;
+	unsigned int kvm_posted_intr_nested_ipis;
 } ____cacheline_aligned rh_irq_cpustat_t;
 
 DECLARE_PER_CPU_SHARED_ALIGNED(rh_irq_cpustat_t, rh_irq_stat);

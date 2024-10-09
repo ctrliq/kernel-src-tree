@@ -1525,6 +1525,9 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
 	struct futex_q *this, *next;
 	WAKE_Q(wake_q);
 
+	if (nr_wake < 0 || nr_requeue < 0)
+		return -EINVAL;
+
 	if (requeue_pi) {
 		/*
 		 * Requeue PI only works on two distinct uaddrs. This
@@ -2785,7 +2788,7 @@ SYSCALL_DEFINE3(get_robust_list, int, pid,
 	}
 
 	ret = -EPERM;
-	if (!ptrace_may_access(p, PTRACE_MODE_READ))
+	if (!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS))
 		goto err_unlock;
 
 	head = p->robust_list;

@@ -26,7 +26,7 @@ synproxy_build_ip(struct sk_buff *skb, const struct in6_addr *saddr,
 	struct ipv6hdr *iph;
 
 	skb_reset_network_header(skb);
-	iph = (struct ipv6hdr *)skb_put(skb, sizeof(*iph));
+	iph = skb_put(skb, sizeof(*iph));
 	ip6_flow_hdr(iph, 0, 0);
 	iph->hop_limit	= 64;	//XXX
 	iph->nexthdr	= IPPROTO_TCP;
@@ -71,8 +71,7 @@ synproxy_send_tcp(const struct synproxy_net *snet,
 	skb_dst_set(nskb, dst);
 
 	if (nfct) {
-		nskb->nfct = nfct;
-		nskb->nfctinfo = ctinfo;
+		nf_ct_set(nskb, (struct nf_conn *)nfct, ctinfo);
 		nf_conntrack_get(nfct);
 	}
 
@@ -106,7 +105,7 @@ synproxy_send_client_synack(const struct synproxy_net *snet,
 	niph = synproxy_build_ip(nskb, &iph->daddr, &iph->saddr);
 
 	skb_reset_transport_header(nskb);
-	nth = (struct tcphdr *)skb_put(nskb, tcp_hdr_size);
+	nth = skb_put(nskb, tcp_hdr_size);
 	nth->source	= th->dest;
 	nth->dest	= th->source;
 	nth->seq	= htonl(__cookie_v6_init_sequence(iph, th, &mss));
@@ -121,8 +120,8 @@ synproxy_send_client_synack(const struct synproxy_net *snet,
 
 	synproxy_build_options(nth, opts);
 
-	synproxy_send_tcp(snet, skb, nskb, skb->nfct, IP_CT_ESTABLISHED_REPLY,
-			  niph, nth, tcp_hdr_size);
+	synproxy_send_tcp(snet, skb, nskb, skb_nfct(skb),
+			  IP_CT_ESTABLISHED_REPLY, niph, nth, tcp_hdr_size);
 }
 
 static void
@@ -147,7 +146,7 @@ synproxy_send_server_syn(const struct synproxy_net *snet,
 	niph = synproxy_build_ip(nskb, &iph->saddr, &iph->daddr);
 
 	skb_reset_transport_header(nskb);
-	nth = (struct tcphdr *)skb_put(nskb, tcp_hdr_size);
+	nth = skb_put(nskb, tcp_hdr_size);
 	nth->source	= th->source;
 	nth->dest	= th->dest;
 	nth->seq	= htonl(recv_seq - 1);
@@ -192,7 +191,7 @@ synproxy_send_server_ack(const struct synproxy_net *snet,
 	niph = synproxy_build_ip(nskb, &iph->daddr, &iph->saddr);
 
 	skb_reset_transport_header(nskb);
-	nth = (struct tcphdr *)skb_put(nskb, tcp_hdr_size);
+	nth = skb_put(nskb, tcp_hdr_size);
 	nth->source	= th->dest;
 	nth->dest	= th->source;
 	nth->seq	= htonl(ntohl(th->ack_seq));
@@ -230,7 +229,7 @@ synproxy_send_client_ack(const struct synproxy_net *snet,
 	niph = synproxy_build_ip(nskb, &iph->saddr, &iph->daddr);
 
 	skb_reset_transport_header(nskb);
-	nth = (struct tcphdr *)skb_put(nskb, tcp_hdr_size);
+	nth = skb_put(nskb, tcp_hdr_size);
 	nth->source	= th->source;
 	nth->dest	= th->dest;
 	nth->seq	= htonl(ntohl(th->seq) + 1);
@@ -243,8 +242,8 @@ synproxy_send_client_ack(const struct synproxy_net *snet,
 
 	synproxy_build_options(nth, opts);
 
-	synproxy_send_tcp(snet, skb, nskb, skb->nfct, IP_CT_ESTABLISHED_REPLY,
-			  niph, nth, tcp_hdr_size);
+	synproxy_send_tcp(snet, skb, nskb, skb_nfct(skb),
+			  IP_CT_ESTABLISHED_REPLY, niph, nth, tcp_hdr_size);
 }
 
 static bool

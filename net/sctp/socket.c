@@ -1973,7 +1973,7 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
 		err = PTR_ERR(datamsg);
 		goto out_free;
 	}
-	datamsg->force_delay = !!(msg->msg_flags & MSG_MORE);
+	asoc->force_delay = !!(msg->msg_flags & MSG_MORE);
 
 	/* Now send the (possibly) fragmented message. */
 	list_for_each_entry(chunk, &datamsg->chunks, frag_list) {

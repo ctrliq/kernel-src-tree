@@ -3,7 +3,7 @@
 
 #include <asm/asm.h>
 #include <asm/segment.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
 #include <asm/cmpxchg.h>
 #include <asm/nops.h>
 
@@ -64,7 +64,6 @@
  */
 static inline void rdtsc_barrier(void)
 {
-	alternative(ASM_NOP3, "mfence", X86_FEATURE_MFENCE_RDTSC);
 	alternative(ASM_NOP3, "lfence", X86_FEATURE_LFENCE_RDTSC);
 }
 

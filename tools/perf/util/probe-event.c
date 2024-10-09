@@ -19,6 +19,7 @@
  *
  */
 
+#include <inttypes.h>
 #include <sys/utsname.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -35,6 +36,7 @@
 #include "util.h"
 #include "event.h"
 #include "strlist.h"
+#include "strfilter.h"
 #include "debug.h"
 #include "cache.h"
 #include "color.h"
@@ -46,6 +48,7 @@
 #include "probe-finder.h"
 #include "probe-file.h"
 #include "session.h"
+#include "string2.h"
 
 #include "sane_ctype.h"
 
@@ -595,7 +598,7 @@ static int find_perf_probe_point_from_dwarf(struct probe_trace_point *tp,
 	pr_debug("try to find information at %" PRIx64 " in %s\n", addr,
 		 tp->module ? : "kernel");
 
-	dinfo = debuginfo_cache__open(tp->module, verbose == 0);
+	dinfo = debuginfo_cache__open(tp->module, verbose <= 0);
 	if (dinfo)
 		ret = debuginfo__find_probe_point(dinfo,
 						 (unsigned long)addr, pp);

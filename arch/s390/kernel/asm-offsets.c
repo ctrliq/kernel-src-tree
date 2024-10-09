@@ -80,6 +80,7 @@ int main(void)
 	DEFINE(__TIMER_IDLE_ENTER, offsetof(struct s390_idle_data, timer_idle_enter));
 	DEFINE(__TIMER_IDLE_EXIT, offsetof(struct s390_idle_data, timer_idle_exit));
 	/* lowcore offsets */
+	DEFINE(__LC_MCESAD, offsetof(struct _lowcore, mcesad));
 	DEFINE(__LC_EXT_PARAMS, offsetof(struct _lowcore, ext_params));
 	DEFINE(__LC_EXT_CPU_ADDR, offsetof(struct _lowcore, ext_cpu_addr));
 	DEFINE(__LC_EXT_INT_CODE, offsetof(struct _lowcore, ext_int_code));

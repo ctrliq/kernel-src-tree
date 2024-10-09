@@ -22,8 +22,7 @@
 #include <linux/kernel.h>
 #include <linux/bug.h>
 #include <linux/types.h>
-#include <linux/init.h>
-#include <linux/export.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/iommu.h>
@@ -35,8 +34,7 @@
 #include <trace/events/iommu.h>
 
 static struct kset *iommu_group_kset;
-static struct ida iommu_group_ida;
-static struct mutex iommu_group_mutex;
+static DEFINE_IDA(iommu_group_ida);
 
 struct iommu_callback_data {
 	struct iommu_ops *ops;
@@ -145,9 +143,7 @@ static void iommu_group_release(struct kobject *kobj)
 	if (group->iommu_data_release)
 		group->iommu_data_release(group->iommu_data);
 
-	mutex_lock(&iommu_group_mutex);
-	ida_remove(&iommu_group_ida, group->id);
-	mutex_unlock(&iommu_group_mutex);
+	ida_simple_remove(&iommu_group_ida, group->id);
 
 	if (group->default_domain)
 		iommu_domain_free(group->default_domain);
@@ -187,26 +183,17 @@ struct iommu_group *iommu_group_alloc(void)
 	INIT_LIST_HEAD(&group->devices);
 	BLOCKING_INIT_NOTIFIER_HEAD(&group->notifier);
 
-	mutex_lock(&iommu_group_mutex);
-
-again:
-	if (unlikely(0 == ida_pre_get(&iommu_group_ida, GFP_KERNEL))) {
+	ret = ida_simple_get(&iommu_group_ida, 0, 0, GFP_KERNEL);
+	if (ret < 0) {
 		kfree(group);
-		mutex_unlock(&iommu_group_mutex);
-		return ERR_PTR(-ENOMEM);
+		return ERR_PTR(ret);
 	}
-
-	if (-EAGAIN == ida_get_new(&iommu_group_ida, &group->id))
-		goto again;
-
-	mutex_unlock(&iommu_group_mutex);
+	group->id = ret;
 
 	ret = kobject_init_and_add(&group->kobj, &iommu_group_ktype,
 				   NULL, "%d", group->id);
 	if (ret) {
-		mutex_lock(&iommu_group_mutex);
-		ida_remove(&iommu_group_ida, group->id);
-		mutex_unlock(&iommu_group_mutex);
+		ida_simple_remove(&iommu_group_ida, group->id);
 		kfree(group);
 		return ERR_PTR(ret);
 	}
@@ -338,9 +325,9 @@ static int iommu_group_create_direct_mappings(struct iommu_group *group,
 	if (!domain || domain->type != IOMMU_DOMAIN_DMA)
 		return 0;
 
-	BUG_ON(!domain->ops->pgsize_bitmap);
+	BUG_ON(!domain->pgsize_bitmap);
 
-	pg_size = 1UL << __ffs(domain->ops->pgsize_bitmap);
+	pg_size = 1UL << __ffs(domain->pgsize_bitmap);
 	INIT_LIST_HEAD(&mappings);
 
 	iommu_get_dm_regions(dev, &mappings);
@@ -1086,6 +1073,8 @@ static struct iommu_domain *__iommu_domain_alloc(struct bus_type *bus,
 
 	domain->ops  = bus->iommu_ops;
 	domain->type = type;
+	/* Assume all sizes by default; the driver may override this later */
+	domain->pgsize_bitmap  = bus->iommu_ops->pgsize_bitmap;
 
 	return domain;
 }
@@ -1318,7 +1307,7 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
 	pgsize = (1UL << (pgsize_idx + 1)) - 1;
 
 	/* throw away page sizes not supported by the hardware */
-	pgsize &= domain->ops->pgsize_bitmap;
+	pgsize &= domain->pgsize_bitmap;
 
 	/* make sure we're still sane */
 	BUG_ON(!pgsize);
@@ -1340,14 +1329,14 @@ int iommu_map(struct iommu_domain *domain, unsigned long iova,
 	int ret = 0;
 
 	if (unlikely(domain->ops->map == NULL ||
-		     domain->ops->pgsize_bitmap == 0UL))
+		     domain->pgsize_bitmap == 0UL))
 		return -ENODEV;
 
 	if (unlikely(!(domain->type & __IOMMU_DOMAIN_PAGING)))
 		return -EINVAL;
 
 	/* find out the minimum page size supported */
-	min_pagesz = 1 << __ffs(domain->ops->pgsize_bitmap);
+	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
 
 	/*
 	 * both the virtual address and the physical one, as well as
@@ -1394,14 +1383,14 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
 	unsigned long orig_iova = iova;
 
 	if (unlikely(domain->ops->unmap == NULL ||
-		     domain->ops->pgsize_bitmap == 0UL))
+		     domain->pgsize_bitmap == 0UL))
 		return -ENODEV;
 
 	if (unlikely(!(domain->type & __IOMMU_DOMAIN_PAGING)))
 		return -EINVAL;
 
 	/* find out the minimum page size supported */
-	min_pagesz = 1 << __ffs(domain->ops->pgsize_bitmap);
+	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
 
 	/*
 	 * The virtual address, as well as the size of the mapping, must be
@@ -1447,10 +1436,10 @@ size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
 	unsigned int i, min_pagesz;
 	int ret;
 
-	if (unlikely(domain->ops->pgsize_bitmap == 0UL))
+	if (unlikely(domain->pgsize_bitmap == 0UL))
 		return 0;
 
-	min_pagesz = 1 << __ffs(domain->ops->pgsize_bitmap);
+	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
 
 	for_each_sg(sg, s, nents, i) {
 		phys_addr_t phys = page_to_phys(sg_page(s)) + s->offset;
@@ -1506,9 +1495,6 @@ static int __init iommu_init(void)
 {
 	iommu_group_kset = kset_create_and_add("iommu_groups",
 					       NULL, kernel_kobj);
-	ida_init(&iommu_group_ida);
-	mutex_init(&iommu_group_mutex);
-
 	BUG_ON(!iommu_group_kset);
 
 	return 0;
@@ -1531,7 +1517,7 @@ int iommu_domain_get_attr(struct iommu_domain *domain,
 		break;
 	case DOMAIN_ATTR_PAGING:
 		paging  = data;
-		*paging = (domain->ops->pgsize_bitmap != 0UL);
+		*paging = (domain->pgsize_bitmap != 0UL);
 		break;
 	case DOMAIN_ATTR_WINDOWS:
 		count = data;

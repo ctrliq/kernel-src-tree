@@ -1,6 +1,22 @@
 #ifndef __NET_SCHED_GENERIC_H
 #define __NET_SCHED_GENERIC_H
 
+/*
+ * RHEL - include a different sch_generic.h for kABI checksums generation.
+ * We can do it as we don't preserve kABI for Qdisc/net-sched API.
+ * Unfortunately pointer to struct Qdisc is part of struct net_device so
+ * any change in this struct or Qdisc_ops etc. will change kABI checksums.
+ *
+ * Change - Qdisc and all dependant structs are now frozen. We have special
+ * witelisted symbol __rh_kabi_protect_Qdisc and during generation of its
+ * checksum the genksyms tool has to see the real structure not the fake one.
+ */
+#if defined(__GENKSYMS__) && !defined(__RH_KABI_PROTECT_QDISC)
+
+#include <net/sch_generic_kabi.h>
+
+#else
+
 #include <linux/netdevice.h>
 #include <linux/types.h>
 #include <linux/rcupdate.h>
@@ -8,6 +24,8 @@
 #include <linux/pkt_cls.h>
 #include <linux/percpu.h>
 #include <linux/dynamic_queue_limits.h>
+#include <linux/list.h>
+#include <linux/workqueue.h>
 #include <net/gen_stats.h>
 #include <net/rtnetlink.h>
 
@@ -28,13 +46,6 @@ enum qdisc_state_t {
 	__QDISC_STATE_DEACTIVATED,
 };
 
-/*
- * following bits are only changed while qdisc lock is held
- */
-enum qdisc___state_t {
-	__QDISC___STATE_RUNNING = 1,
-};
-
 struct qdisc_size_table {
 	struct rcu_head		rcu;
 	struct list_head	list;
@@ -43,9 +54,19 @@ struct qdisc_size_table {
 	u16			data[];
 };
 
+/* similar to sk_buff_head, but skb->prev pointer is undefined. */
+struct qdisc_skb_head {
+	struct sk_buff	*head;
+	struct sk_buff	*tail;
+	__u32		qlen;
+	spinlock_t	lock;
+};
+
 struct Qdisc {
-	int 			(*enqueue)(struct sk_buff *skb, struct Qdisc *dev);
-	struct sk_buff *	(*dequeue)(struct Qdisc *dev);
+	int 			(*enqueue)(struct sk_buff *skb,
+					   struct Qdisc *sch,
+					   struct sk_buff **to_free);
+	struct sk_buff *	(*dequeue)(struct Qdisc *sch);
 	unsigned int		flags;
 #define TCQ_F_BUILTIN		1
 #define TCQ_F_INGRESS		2
@@ -63,54 +84,64 @@ struct Qdisc {
 #define TCQ_F_NOPARENT		0x40 /* root of its hierarchy :
 				      * qdisc_tree_decrease_qlen() should stop.
 				      */
+#define TCQ_F_INVISIBLE		0x80 /* invisible by default in dump */
 	u32			limit;
 	const struct Qdisc_ops	*ops;
 	struct qdisc_size_table	__rcu *stab;
-	struct list_head	list;
+	struct hlist_node       hash;
 	u32			handle;
 	u32			parent;
 
 	struct netdev_queue	*dev_queue;
 
-	struct gnet_stats_rate_est64	rate_est;
-	struct Qdisc		*next_sched;
-	struct sk_buff		*gso_skb;
+	struct net_rate_estimator __rcu *rate_est;
+	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
+	struct gnet_stats_queue __percpu *cpu_qstats;
+
 	/*
 	 * For performance sake on SMP, we put highly modified fields at the end
 	 */
-	unsigned long		state;
-	struct sk_buff_head	q;
+	struct sk_buff		*gso_skb ____cacheline_aligned_in_smp;
+	struct qdisc_skb_head	q;
 	struct gnet_stats_basic_packed bstats;
-	unsigned int		__state;
+	seqcount_t		running;
 	struct gnet_stats_queue	qstats;
+	unsigned long		state;
+	struct Qdisc            *next_sched;
+	struct sk_buff		*skb_bad_txq;
 	struct rcu_head		rcu_head;
 	int			padded;
 	atomic_t		refcnt;
 
-	RH_KABI_FILL_HOLE(struct gnet_stats_basic_cpu __percpu *cpu_bstats)
-	RH_KABI_FILL_HOLE(struct gnet_stats_queue __percpu *cpu_qstats)
-	RH_KABI_FILL_HOLE(void *rh_reserved_1)
-	RH_KABI_FILL_HOLE(void *rh_reserved_2)
-
 	spinlock_t		busylock ____cacheline_aligned_in_smp;
 };
 
+static inline void qdisc_refcount_inc(struct Qdisc *qdisc)
+{
+	if (qdisc->flags & TCQ_F_BUILTIN)
+		return;
+	atomic_inc(&qdisc->refcnt);
+}
+
 static inline bool qdisc_is_running(const struct Qdisc *qdisc)
 {
-	return (qdisc->__state & __QDISC___STATE_RUNNING) ? true : false;
+	return (raw_read_seqcount(&qdisc->running) & 1) ? true : false;
 }
 
 static inline bool qdisc_run_begin(struct Qdisc *qdisc)
 {
 	if (qdisc_is_running(qdisc))
 		return false;
-	qdisc->__state |= __QDISC___STATE_RUNNING;
+	/* RHEL: The seqcount structure has not lockdep functionality so
+	 * we use plain write_seqcount_begin() here.
+	 */
+	write_seqcount_begin(&qdisc->running);
 	return true;
 }
 
 static inline void qdisc_run_end(struct Qdisc *qdisc)
 {
-	qdisc->__state &= ~__QDISC___STATE_RUNNING;
+	write_seqcount_end(&qdisc->running);
 }
 
 static inline bool qdisc_may_bulk(const struct Qdisc *qdisc)
@@ -137,15 +168,14 @@ struct Qdisc_class_ops {
 	void			(*qlen_notify)(struct Qdisc *, unsigned long);
 
 	/* Class manipulation routines */
-	unsigned long		(*get)(struct Qdisc *, u32 classid);
-	void			(*put)(struct Qdisc *, unsigned long);
+	unsigned long		(*find)(struct Qdisc *, u32 classid);
 	int			(*change)(struct Qdisc *, u32, u32,
 					struct nlattr **, unsigned long *);
 	int			(*delete)(struct Qdisc *, unsigned long);
 	void			(*walk)(struct Qdisc *, struct qdisc_walker * arg);
 
 	/* Filter manipulation */
-	struct tcf_proto __rcu ** (*tcf_chain)(struct Qdisc *, unsigned long);
+	struct tcf_block *	(*tcf_block)(struct Qdisc *, unsigned long);
 	unsigned long		(*bind_tcf)(struct Qdisc *, unsigned long,
 					u32 classid);
 	void			(*unbind_tcf)(struct Qdisc *, unsigned long);
@@ -163,10 +193,11 @@ struct Qdisc_ops {
 	char			id[IFNAMSIZ];
 	int			priv_size;
 
-	int 			(*enqueue)(struct sk_buff *, struct Qdisc *);
+	int 			(*enqueue)(struct sk_buff *skb,
+					   struct Qdisc *sch,
+					   struct sk_buff **to_free);
 	struct sk_buff *	(*dequeue)(struct Qdisc *);
 	struct sk_buff *	(*peek)(struct Qdisc *);
-	unsigned int		(*drop)(struct Qdisc *);
 
 	int			(*init)(struct Qdisc *, struct nlattr *arg);
 	void			(*reset)(struct Qdisc *);
@@ -182,42 +213,37 @@ struct Qdisc_ops {
 
 
 struct tcf_result {
-	unsigned long	class;
-	u32		classid;
+	union {
+		struct {
+			unsigned long	class;
+			u32		classid;
+		};
+		const struct tcf_proto *goto_tp;
+	};
 };
 
 struct tcf_proto_ops {
-	RH_KABI_REPLACE_UNSAFE(struct tcf_proto_ops	*next,
-			       struct list_head		head)
+	struct list_head	head;
 	char			kind[IFNAMSIZ];
 
 	int			(*classify)(struct sk_buff *,
 					    const struct tcf_proto *,
 					    struct tcf_result *);
 	int			(*init)(struct tcf_proto*);
-	RH_KABI_REPLACE(void	(*destroy)(struct tcf_proto*),
-			bool	(*destroy)(struct tcf_proto*, bool))
+	void			(*destroy)(struct tcf_proto*);
 
-	unsigned long		(*get)(struct tcf_proto*, u32 handle);
-	RH_KABI_DEPRECATE_FN(void, put, struct tcf_proto*, unsigned long)
-	RH_KABI_REPLACE(int	(*change)(struct net *net, struct sk_buff *,
+	void*			(*get)(struct tcf_proto*, u32 handle);
+	int			(*change)(struct net *net, struct sk_buff *,
 					struct tcf_proto*, unsigned long,
 					u32 handle, struct nlattr **,
-					unsigned long *),
-			int	(*change)(struct net *net, struct sk_buff *,
-					struct tcf_proto*, unsigned long,
-					u32 handle, struct nlattr **,
-					unsigned long *, bool))
-	int			(*delete)(struct tcf_proto*, unsigned long);
+					void **, bool);
+	int			(*delete)(struct tcf_proto*, void *, bool*);
 	void			(*walk)(struct tcf_proto*, struct tcf_walker *arg);
+	void			(*bind_class)(void *, u32, unsigned long);
 
 	/* rtnetlink specific */
-	RH_KABI_REPLACE(
-			int	(*dump)(struct tcf_proto*, unsigned long,
-					struct sk_buff *skb, struct tcmsg*),
-			int	(*dump)(struct net*, struct tcf_proto*, unsigned long,
-					struct sk_buff *skb, struct tcmsg*)
-		       )
+	int			(*dump)(struct net*, struct tcf_proto*, void *,
+					struct sk_buff *skb, struct tcmsg*);
 
 	struct module		*owner;
 };
@@ -237,7 +263,8 @@ struct tcf_proto {
 	struct Qdisc		*q;
 	void			*data;
 	const struct tcf_proto_ops	*ops;
-	RH_KABI_EXTEND(struct rcu_head		rcu)
+	struct tcf_chain	*chain;
+	struct rcu_head		rcu;
 };
 
 struct qdisc_skb_cb {
@@ -246,6 +273,19 @@ struct qdisc_skb_cb {
 	u16			_pad;
 #define QDISC_CB_PRIV_LEN 20
 	unsigned char		data[QDISC_CB_PRIV_LEN];
+};
+
+struct tcf_chain {
+	struct tcf_proto __rcu *filter_chain;
+	struct tcf_proto __rcu **p_filter_chain;
+	struct list_head list;
+	struct tcf_block *block;
+	u32 index; /* chain index */
+	unsigned int refcnt;
+};
+
+struct tcf_block {
+	struct list_head chain_list;
 };
 
 static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
@@ -410,8 +450,33 @@ struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
 				const struct Qdisc_ops *ops, u32 parentid);
 void __qdisc_calculate_pkt_len(struct sk_buff *skb,
 			       const struct qdisc_size_table *stab);
-bool tcf_proto_destroy(struct tcf_proto *tp, bool force);
-void tcf_destroy_chain(struct tcf_proto __rcu **fl);
+
+static inline void skb_reset_tc(struct sk_buff *skb)
+{
+#ifdef CONFIG_NET_CLS_ACT
+	skb->tc_verd = SET_TC_FROM(skb->tc_verd, 0);
+#endif
+}
+
+static inline bool skb_at_tc_ingress(const struct sk_buff *skb)
+{
+#ifdef CONFIG_NET_CLS_ACT
+	return G_TC_AT(skb->tc_verd) & AT_INGRESS;
+#else
+	return false;
+#endif
+}
+
+static inline bool skb_skip_tc_classify(struct sk_buff *skb)
+{
+#ifdef CONFIG_NET_CLS_ACT
+	if (skb->tc_verd & TC_NCLS) {
+		skb->tc_verd = CLR_TC_NCLS(skb->tc_verd);
+		return true;
+	}
+#endif
+	return false;
+}
 
 /* Reset all TX qdiscs greater then index of a device.  */
 static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
@@ -506,10 +571,11 @@ static inline void qdisc_calculate_pkt_len(struct sk_buff *skb,
 #endif
 }
 
-static inline int qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+static inline int qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+				struct sk_buff **to_free)
 {
 	qdisc_calculate_pkt_len(skb, sch);
-	return sch->enqueue(skb, sch);
+	return sch->enqueue(skb, sch, to_free);
 }
 
 static inline bool qdisc_is_percpu_stats(const struct Qdisc *q)
@@ -602,10 +668,27 @@ static inline void qdisc_qstats_overlimit(struct Qdisc *sch)
 	sch->qstats.overlimits++;
 }
 
-static inline int __qdisc_enqueue_tail(struct sk_buff *skb, struct Qdisc *sch,
-				       struct sk_buff_head *list)
+static inline void qdisc_skb_head_init(struct qdisc_skb_head *qh)
 {
-	__skb_queue_tail(list, skb);
+	qh->head = NULL;
+	qh->tail = NULL;
+	qh->qlen = 0;
+}
+
+static inline int __qdisc_enqueue_tail(struct sk_buff *skb, struct Qdisc *sch,
+				       struct qdisc_skb_head *qh)
+{
+	struct sk_buff *last = qh->tail;
+
+	if (last) {
+		skb->next = NULL;
+		last->next = skb;
+		qh->tail = skb;
+	} else {
+		qh->tail = skb;
+		qh->head = skb;
+	}
+	qh->qlen++;
 	qdisc_qstats_backlog_inc(sch, skb);
 
 	return NET_XMIT_SUCCESS;
@@ -616,10 +699,24 @@ static inline int qdisc_enqueue_tail(struct sk_buff *skb, struct Qdisc *sch)
 	return __qdisc_enqueue_tail(skb, sch, &sch->q);
 }
 
-static inline struct sk_buff *__qdisc_dequeue_head(struct Qdisc *sch,
-						   struct sk_buff_head *list)
+static inline struct sk_buff *__qdisc_dequeue_head(struct qdisc_skb_head *qh)
 {
-	struct sk_buff *skb = __skb_dequeue(list);
+	struct sk_buff *skb = qh->head;
+
+	if (likely(skb != NULL)) {
+		qh->head = skb->next;
+		qh->qlen--;
+		if (qh->head == NULL)
+			qh->tail = NULL;
+		skb->next = NULL;
+	}
+
+	return skb;
+}
+
+static inline struct sk_buff *qdisc_dequeue_head(struct Qdisc *sch)
+{
+	struct sk_buff *skb = __qdisc_dequeue_head(&sch->q);
 
 	if (likely(skb != NULL)) {
 		qdisc_qstats_backlog_dec(sch, skb);
@@ -629,50 +726,43 @@ static inline struct sk_buff *__qdisc_dequeue_head(struct Qdisc *sch,
 	return skb;
 }
 
-static inline struct sk_buff *qdisc_dequeue_head(struct Qdisc *sch)
+/* Instead of calling kfree_skb() while root qdisc lock is held,
+ * queue the skb for future freeing at end of __dev_xmit_skb()
+ */
+static inline void __qdisc_drop(struct sk_buff *skb, struct sk_buff **to_free)
 {
-	return __qdisc_dequeue_head(sch, &sch->q);
+	skb->next = *to_free;
+	*to_free = skb;
 }
 
 static inline unsigned int __qdisc_queue_drop_head(struct Qdisc *sch,
-					      struct sk_buff_head *list)
+						   struct qdisc_skb_head *qh,
+						   struct sk_buff **to_free)
 {
-	struct sk_buff *skb = __skb_dequeue(list);
+	struct sk_buff *skb = __qdisc_dequeue_head(qh);
 
 	if (likely(skb != NULL)) {
 		unsigned int len = qdisc_pkt_len(skb);
+
 		qdisc_qstats_backlog_dec(sch, skb);
-		kfree_skb(skb);
+		__qdisc_drop(skb, to_free);
 		return len;
 	}
 
 	return 0;
 }
 
-static inline unsigned int qdisc_queue_drop_head(struct Qdisc *sch)
+static inline unsigned int qdisc_queue_drop_head(struct Qdisc *sch,
+						 struct sk_buff **to_free)
 {
-	return __qdisc_queue_drop_head(sch, &sch->q);
-}
-
-static inline struct sk_buff *__qdisc_dequeue_tail(struct Qdisc *sch,
-						   struct sk_buff_head *list)
-{
-	struct sk_buff *skb = __skb_dequeue_tail(list);
-
-	if (likely(skb != NULL))
-		qdisc_qstats_backlog_dec(sch, skb);
-
-	return skb;
-}
-
-static inline struct sk_buff *qdisc_dequeue_tail(struct Qdisc *sch)
-{
-	return __qdisc_dequeue_tail(sch, &sch->q);
+	return __qdisc_queue_drop_head(sch, &sch->q, to_free);
 }
 
 static inline struct sk_buff *qdisc_peek_head(struct Qdisc *sch)
 {
-	return skb_peek(&sch->q);
+	const struct qdisc_skb_head *qh = &sch->q;
+
+	return qh->head;
 }
 
 /* generic pseudo peek method for non-work-conserving qdisc */
@@ -707,19 +797,25 @@ static inline struct sk_buff *qdisc_dequeue_peeked(struct Qdisc *sch)
 	return skb;
 }
 
-static inline void __qdisc_reset_queue(struct Qdisc *sch,
-				       struct sk_buff_head *list)
+static inline void __qdisc_reset_queue(struct qdisc_skb_head *qh)
 {
 	/*
 	 * We do not know the backlog in bytes of this list, it
 	 * is up to the caller to correct it
 	 */
-	__skb_queue_purge(list);
+	ASSERT_RTNL();
+	if (qh->qlen) {
+		rtnl_kfree_skbs(qh->head, qh->tail);
+
+		qh->head = NULL;
+		qh->tail = NULL;
+		qh->qlen = 0;
+	}
 }
 
 static inline void qdisc_reset_queue(struct Qdisc *sch)
 {
-	__qdisc_reset_queue(sch, &sch->q);
+	__qdisc_reset_queue(&sch->q);
 	sch->qstats.backlog = 0;
 }
 
@@ -743,28 +839,17 @@ static inline struct Qdisc *qdisc_replace(struct Qdisc *sch, struct Qdisc *new,
 	return old;
 }
 
-static inline unsigned int __qdisc_queue_drop(struct Qdisc *sch,
-					      struct sk_buff_head *list)
+static inline void rtnl_qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
 {
-	struct sk_buff *skb = __qdisc_dequeue_tail(sch, list);
-
-	if (likely(skb != NULL)) {
-		unsigned int len = qdisc_pkt_len(skb);
-		kfree_skb(skb);
-		return len;
-	}
-
-	return 0;
+	rtnl_kfree_skbs(skb, skb);
+	qdisc_qstats_drop(sch);
 }
 
-static inline unsigned int qdisc_queue_drop(struct Qdisc *sch)
-{
-	return __qdisc_queue_drop(sch, &sch->q);
-}
 
-static inline int qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
+static inline int qdisc_drop(struct sk_buff *skb, struct Qdisc *sch,
+			     struct sk_buff **to_free)
 {
-	kfree_skb(skb);
+	__qdisc_drop(skb, to_free);
 	qdisc_qstats_drop(sch);
 
 	return NET_XMIT_DROP;
@@ -822,4 +907,5 @@ static inline void psched_ratecfg_getrate(struct tc_ratespec *res,
 	res->linklayer = (r->linklayer & TC_LINKLAYER_MASK);
 }
 
+#endif
 #endif

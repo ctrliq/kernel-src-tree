@@ -16,6 +16,10 @@
 /* Max future timer expiry for timeouts */
 #define BLK_MAX_TIMEOUT		(5 * HZ)
 
+#ifdef CONFIG_DEBUG_FS
+extern struct dentry *blk_debugfs_root;
+#endif
+
 struct blk_flush_queue {
 	unsigned int		flush_queue_delayed:1;
 	unsigned int		flush_pending_idx:1;
@@ -41,14 +45,9 @@ extern struct ida blk_queue_ida;
 static inline struct blk_flush_queue *blk_get_flush_queue(
 		struct request_queue *q, struct blk_mq_ctx *ctx)
 {
-	struct blk_mq_hw_ctx *hctx;
-
-	if (!q->mq_ops)
-		return q->fq;
-
-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
-
-	return hctx->fq;
+	if (q->mq_ops)
+		return blk_mq_map_queue(q, ctx->cpu)->fq;
+	return q->fq;
 }
 
 static inline void __blk_get_queue(struct request_queue *q)
@@ -108,6 +107,7 @@ bool bio_attempt_back_merge(struct request_queue *q, struct request *req,
 bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
 			    unsigned int *request_count,
 			    struct request **same_queue_rq);
+unsigned int blk_plug_queued_count(struct request_queue *q);
 
 void blk_account_io_start(struct request *req, bool new_io);
 void blk_account_io_completion(struct request *req, unsigned int bytes);
@@ -174,7 +174,7 @@ static inline struct request *__elv_next_request(struct request_queue *q)
 			return NULL;
 		}
 		if (unlikely(blk_queue_bypass(q)) ||
-		    !q->elevator->type->ops.elevator_dispatch_fn(q, 0))
+		    !q->elevator->aux->ops.sq.elevator_dispatch_fn(q, 0))
 			return NULL;
 	}
 }
@@ -183,17 +183,19 @@ static inline void elv_activate_rq(struct request_queue *q, struct request *rq)
 {
 	struct elevator_queue *e = q->elevator;
 
-	if (e->type->ops.elevator_activate_req_fn)
-		e->type->ops.elevator_activate_req_fn(q, rq);
+	if (e->aux->ops.sq.elevator_activate_req_fn)
+		e->aux->ops.sq.elevator_activate_req_fn(q, rq);
 }
 
 static inline void elv_deactivate_rq(struct request_queue *q, struct request *rq)
 {
 	struct elevator_queue *e = q->elevator;
 
-	if (e->type->ops.elevator_deactivate_req_fn)
-		e->type->ops.elevator_deactivate_req_fn(q, rq);
+	if (e->aux->ops.sq.elevator_deactivate_req_fn)
+		e->aux->ops.sq.elevator_deactivate_req_fn(q, rq);
 }
+
+struct elevator_type_aux *elevator_aux_find(struct elevator_type *e);
 
 #ifdef CONFIG_FAIL_IO_TIMEOUT
 int blk_should_fake_timeout(struct request_queue *);
@@ -211,8 +213,8 @@ int ll_back_merge_fn(struct request_queue *q, struct request *req,
 		     struct bio *bio);
 int ll_front_merge_fn(struct request_queue *q, struct request *req, 
 		      struct bio *bio);
-int attempt_back_merge(struct request_queue *q, struct request *rq);
-int attempt_front_merge(struct request_queue *q, struct request *rq);
+struct request *attempt_back_merge(struct request_queue *q, struct request *rq);
+struct request *attempt_front_merge(struct request_queue *q, struct request *rq);
 int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
 				struct request *next);
 void blk_recalc_rq_segments(struct request *rq);
@@ -261,6 +263,13 @@ static inline int blk_do_io_stat(struct request *rq)
 		(rq->cmd_type == REQ_TYPE_FS);
 }
 
+static inline void req_set_nomerge(struct request_queue *q, struct request *req)
+{
+	req->cmd_flags |= REQ_NOMERGE;
+	if (req == q->last_merge)
+		q->last_merge = NULL;
+}
+
 /*
  * Internal io_context interface
  */
@@ -271,6 +280,22 @@ struct io_cq *ioc_create_icq(struct io_context *ioc, struct request_queue *q,
 void ioc_clear_queue(struct request_queue *q);
 
 int create_task_io_context(struct task_struct *task, gfp_t gfp_mask, int node);
+
+/**
+ * rq_ioc - determine io_context for request allocation
+ * @bio: request being allocated is for this bio (can be %NULL)
+ *
+ * Determine io_context to use for request allocation for @bio.  May return
+ * %NULL if %current->io_context doesn't exist.
+ */
+static inline struct io_context *rq_ioc(struct bio *bio)
+{
+#ifdef CONFIG_BLK_CGROUP
+	if (bio && bio->bi_ioc)
+		return bio->bi_ioc;
+#endif
+	return current->io_context;
+}
 
 /**
  * create_io_context - try to create task->io_context
@@ -309,5 +334,7 @@ static inline void blk_throtl_drain(struct request_queue *q) { }
 static inline int blk_throtl_init(struct request_queue *q) { return 0; }
 static inline void blk_throtl_exit(struct request_queue *q) { }
 #endif /* CONFIG_BLK_DEV_THROTTLING */
+
+extern void blk_drain_queue(struct request_queue *q);
 
 #endif /* BLK_INTERNAL_H */

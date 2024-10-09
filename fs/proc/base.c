@@ -401,7 +401,7 @@ static const struct file_operations proc_pid_cmdline_ops = {
 
 static int proc_pid_auxv(struct task_struct *task, char *buffer)
 {
-	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ);
+	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
 	int res = PTR_ERR(mm);
 	if (mm && !IS_ERR(mm)) {
 		unsigned int nwords = 0;
@@ -431,7 +431,7 @@ static int proc_pid_wchan(struct task_struct *task, char *buffer)
 	wchan = get_wchan(task);
 
 	if (lookup_symbol_name(wchan, symname) < 0)
-		if (!ptrace_may_access(task, PTRACE_MODE_READ))
+		if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 			return 0;
 		else
 			return sprintf(buffer, "%lu", wchan);
@@ -445,7 +445,7 @@ static int lock_trace(struct task_struct *task)
 	int err = mutex_lock_killable(&task->signal->cred_guard_mutex);
 	if (err)
 		return err;
-	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH_FSCREDS)) {
 		mutex_unlock(&task->signal->cred_guard_mutex);
 		return -EPERM;
 	}
@@ -725,7 +725,7 @@ static int proc_fd_access_allowed(struct inode *inode)
 	 */
 	task = get_proc_task(inode);
 	if (task) {
-		allowed = ptrace_may_access(task, PTRACE_MODE_READ);
+		allowed = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
 		put_task_struct(task);
 	}
 	return allowed;
@@ -760,7 +760,7 @@ static bool has_pid_permissions(struct pid_namespace *pid,
 		return true;
 	if (in_group_p(pid->pid_gid))
 		return true;
-	return ptrace_may_access(task, PTRACE_MODE_READ);
+	return ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
 }
 
 
@@ -874,7 +874,7 @@ struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
 	struct mm_struct *mm = ERR_PTR(-ESRCH);
 
 	if (task) {
-		mm = mm_access(task, mode);
+		mm = mm_access(task, mode | PTRACE_MODE_FSCREDS);
 		put_task_struct(task);
 
 		if (!IS_ERR_OR_NULL(mm)) {
@@ -1944,7 +1944,7 @@ static int map_files_d_revalidate(struct dentry *dentry, unsigned int flags)
 	if (!task)
 		goto out_notask;
 
-	mm = mm_access(task, PTRACE_MODE_READ);
+	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
 	if (IS_ERR_OR_NULL(mm))
 		goto out;
 
@@ -2072,7 +2072,7 @@ static struct dentry *proc_map_files_lookup(struct inode *dir,
 		goto out;
 
 	result = ERR_PTR(-EACCES);
-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 		goto out_put_task;
 
 	result = ERR_PTR(-ENOENT);
@@ -2128,7 +2128,7 @@ proc_map_files_readdir(struct file *filp, void *dirent, filldir_t filldir)
 		goto out;
 
 	ret = -EACCES;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 		goto out_put_task;
 
 	ret = 0;
@@ -2663,7 +2663,7 @@ static int do_io_accounting(struct task_struct *task, char *buffer, int whole)
 	if (result)
 		return result;
 
-	if (!ptrace_may_access(task, PTRACE_MODE_READ)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
 		result = -EACCES;
 		goto out_unlock;
 	}
@@ -2851,6 +2851,19 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
+#ifdef CONFIG_LIVEPATCH
+static int proc_pid_patch_state(struct seq_file *m, struct pid_namespace *ns,
+				struct pid *pid, struct task_struct *task)
+{
+	/*
+	 * RHEL: For kABI-related reasons, the patch_state value is offset by 1
+	 * internally.  Subtract 1 here so it doesn't affect user ABI.
+	 */
+	seq_printf(m, "%d\n", task->patch_state - 1);
+	return 0;
+}
+#endif /* CONFIG_LIVEPATCH */
+
 /*
  * Thread groups
  */
@@ -2950,6 +2963,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 #endif
 #ifdef CONFIG_CHECKPOINT_RESTORE
 	REG("timers",	  S_IRUGO, proc_timers_operations),
+#endif
+#ifdef CONFIG_LIVEPATCH
+	ONE("patch_state",  S_IRUSR, proc_pid_patch_state),
 #endif
 };
 
@@ -3304,6 +3320,9 @@ static const struct pid_entry tid_base_stuff[] = {
 	REG("gid_map",    S_IRUGO|S_IWUSR, proc_gid_map_operations),
 	REG("projid_map", S_IRUGO|S_IWUSR, proc_projid_map_operations),
 	REG("setgroups",  S_IRUGO|S_IWUSR, proc_setgroups_operations),
+#endif
+#ifdef CONFIG_LIVEPATCH
+	ONE("patch_state",  S_IRUSR, proc_pid_patch_state),
 #endif
 };
 

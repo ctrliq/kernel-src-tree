@@ -137,8 +137,8 @@ static void igb_update_phy_info(unsigned long);
 static void igb_watchdog(unsigned long);
 static void igb_watchdog_task(struct work_struct *);
 static netdev_tx_t igb_xmit_frame(struct sk_buff *skb, struct net_device *);
-static struct rtnl_link_stats64 *igb_get_stats64(struct net_device *dev,
-					  struct rtnl_link_stats64 *stats);
+static void igb_get_stats64(struct net_device *dev,
+			    struct rtnl_link_stats64 *stats);
 static int igb_change_mtu(struct net_device *, int);
 static int igb_set_mac(struct net_device *, void *);
 static void igb_set_uta(struct igb_adapter *adapter, bool set);
@@ -384,9 +384,9 @@ static void igb_dump(struct igb_adapter *adapter)
 	/* Print netdevice Info */
 	if (netdev) {
 		dev_info(&adapter->pdev->dev, "Net device Info\n");
-		pr_info("Device Name     state            trans_start      last_rx\n");
-		pr_info("%-15s %016lX %016lX %016lX\n", netdev->name,
-			netdev->state, dev_trans_start(netdev), netdev->last_rx);
+		pr_info("Device Name     state            trans_start\n");
+		pr_info("%-15s %016lX %016lX\n", netdev->name,
+			netdev->state, dev_trans_start(netdev));
 	}
 
 	/* Print Registers */
@@ -2158,7 +2158,7 @@ static const struct net_device_ops igb_netdev_ops = {
 	.ndo_get_stats64	= igb_get_stats64,
 	.ndo_set_rx_mode	= igb_set_rx_mode,
 	.ndo_set_mac_address	= igb_set_mac,
-	.ndo_change_mtu		= igb_change_mtu,
+	.extended.ndo_change_mtu	= igb_change_mtu,
 	.ndo_do_ioctl		= igb_ioctl,
 	.ndo_tx_timeout		= igb_tx_timeout,
 	.ndo_validate_addr	= eth_validate_addr,
@@ -2478,6 +2478,10 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	netdev->priv_flags |= IFF_SUPP_NOFCS;
 
 	netdev->priv_flags |= IFF_UNICAST_FLT;
+
+	/* MTU range: 68 - 9216 */
+	netdev->extended->min_mtu = ETH_MIN_MTU;
+	netdev->extended->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;
 
 	adapter->en_mng_pt = igb_enable_mng_pass_thru(hw);
 
@@ -4041,6 +4045,7 @@ static void igb_clean_rx_ring(struct igb_ring *rx_ring)
 	/* Free all the Rx ring sk_buffs */
 	while (i != rx_ring->next_to_alloc) {
 		struct igb_rx_buffer *buffer_info = &rx_ring->rx_buffer_info[i];
+		DEFINE_DMA_ATTRS(attrs);
 
 		/* Invalidate cache lines that may have been written to by
 		 * device so that we avoid corrupting memory.
@@ -4052,11 +4057,13 @@ static void igb_clean_rx_ring(struct igb_ring *rx_ring)
 					      DMA_FROM_DEVICE);
 
 		/* free resources associated with mapping */
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		dma_unmap_page_attrs(rx_ring->dev,
 				     buffer_info->dma,
 				     igb_rx_pg_size(rx_ring),
 				     DMA_FROM_DEVICE,
-				     IGB_RX_DMA_ATTR);
+				     &attrs);
 		__page_frag_cache_drain(buffer_info->page,
 					buffer_info->pagecnt_bias);
 
@@ -5493,8 +5500,8 @@ static void igb_reset_task(struct work_struct *work)
  *  @netdev: network interface device structure
  *  @stats: rtnl_link_stats64 pointer
  **/
-static struct rtnl_link_stats64 *igb_get_stats64(struct net_device *netdev,
-						struct rtnl_link_stats64 *stats)
+static void igb_get_stats64(struct net_device *netdev,
+			    struct rtnl_link_stats64 *stats)
 {
 	struct igb_adapter *adapter = netdev_priv(netdev);
 
@@ -5502,8 +5509,6 @@ static struct rtnl_link_stats64 *igb_get_stats64(struct net_device *netdev,
 	igb_update_stats(adapter);
 	memcpy(stats, &adapter->stats64, sizeof(*stats));
 	spin_unlock(&adapter->stats64_lock);
-
-	return stats;
 }
 
 /**
@@ -5518,17 +5523,6 @@ static int igb_change_mtu(struct net_device *netdev, int new_mtu)
 	struct igb_adapter *adapter = netdev_priv(netdev);
 	struct pci_dev *pdev = adapter->pdev;
 	int max_frame = new_mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
-
-	if ((new_mtu < 68) || (max_frame > MAX_JUMBO_FRAME_SIZE)) {
-		dev_err(&pdev->dev, "Invalid MTU setting\n");
-		return -EINVAL;
-	}
-
-#define MAX_STD_JUMBO_FRAME_SIZE 9238
-	if (max_frame > MAX_STD_JUMBO_FRAME_SIZE) {
-		dev_err(&pdev->dev, "MTU > 9216 not supported.\n");
-		return -EINVAL;
-	}
 
 	/* adjust max frame to be at least the size of a standard frame */
 	if (max_frame < (ETH_FRAME_LEN + ETH_FCS_LEN))
@@ -6480,8 +6474,8 @@ static void igb_set_default_mac_filter(struct igb_adapter *adapter)
 	igb_rar_set_index(adapter, 0);
 }
 
-int igb_add_mac_filter(struct igb_adapter *adapter, const u8 *addr,
-		       const u8 queue)
+static int igb_add_mac_filter(struct igb_adapter *adapter, const u8 *addr,
+			      const u8 queue)
 {
 	struct e1000_hw *hw = &adapter->hw;
 	int rar_entries = hw->mac.rar_entry_count -
@@ -6510,8 +6504,8 @@ int igb_add_mac_filter(struct igb_adapter *adapter, const u8 *addr,
 	return -ENOSPC;
 }
 
-int igb_del_mac_filter(struct igb_adapter *adapter, const u8 *addr,
-		       const u8 queue)
+static int igb_del_mac_filter(struct igb_adapter *adapter, const u8 *addr,
+			      const u8 queue)
 {
 	struct e1000_hw *hw = &adapter->hw;
 	int rar_entries = hw->mac.rar_entry_count -
@@ -6563,8 +6557,8 @@ static int igb_uc_unsync(struct net_device *netdev, const unsigned char *addr)
 	return 0;
 }
 
-int igb_set_vf_mac_filter(struct igb_adapter *adapter, const int vf,
-			  const u32 info, const u8 *addr)
+static int igb_set_vf_mac_filter(struct igb_adapter *adapter, const int vf,
+				 const u32 info, const u8 *addr)
 {
 	struct pci_dev *pdev = adapter->pdev;
 	struct vf_data_storage *vf_data = &adapter->vf_data[vf];
@@ -7504,9 +7498,12 @@ static void igb_put_rx_buffer(struct igb_ring *rx_ring,
 		/* We are not reusing the buffer so unmap it and free
 		 * any references we are holding to it
 		 */
+		DEFINE_DMA_ATTRS(attrs);
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
 				     igb_rx_pg_size(rx_ring), DMA_FROM_DEVICE,
-				     IGB_RX_DMA_ATTR);
+				     &attrs);
 		__page_frag_cache_drain(rx_buffer->page,
 					rx_buffer->pagecnt_bias);
 	}
@@ -7616,6 +7613,7 @@ static bool igb_alloc_mapped_page(struct igb_ring *rx_ring,
 {
 	struct page *page = bi->page;
 	dma_addr_t dma;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* since we are recycling buffers we should seldom need to alloc */
 	if (likely(page))
@@ -7629,10 +7627,12 @@ static bool igb_alloc_mapped_page(struct igb_ring *rx_ring,
 	}
 
 	/* map page for use */
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+	dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
 				 igb_rx_pg_size(rx_ring),
 				 DMA_FROM_DEVICE,
-				 IGB_RX_DMA_ATTR);
+				 &attrs);
 
 	/* if mapping failed free memory back to system since
 	 * there isn't much point in holding memory we can't use

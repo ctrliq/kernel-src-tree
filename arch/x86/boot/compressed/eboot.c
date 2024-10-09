@@ -610,7 +610,7 @@ setup_pixel_info(struct screen_info *si, u32 pixels_per_scan_line,
 static efi_status_t
 __gop_query32(struct efi_graphics_output_protocol_32 *gop32,
 	      struct efi_graphics_output_mode_info **info,
-	      unsigned long *size, u32 *fb_base)
+	      unsigned long *size, u64 *fb_base)
 {
 	struct efi_graphics_output_protocol_mode_32 *mode;
 	efi_status_t status;
@@ -636,7 +636,8 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 	unsigned long nr_gops;
 	u16 width, height;
 	u32 pixels_per_scan_line;
-	u32 fb_base;
+	u32 ext_lfb_base;
+	u64 fb_base;
 	struct efi_pixel_bitmask pixel_info;
 	int pixel_format;
 	efi_status_t status;
@@ -699,6 +700,13 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 	si->lfb_width = width;
 	si->lfb_height = height;
 	si->lfb_base = fb_base;
+
+	ext_lfb_base = (u64)(unsigned long)fb_base >> 32;
+	if (ext_lfb_base) {
+		si->capabilities |= VIDEO_CAPABILITY_64BIT_BASE;
+		si->ext_lfb_base = ext_lfb_base;
+	}
+
 	si->pages = 1;
 
 	setup_pixel_info(si, pixels_per_scan_line, pixel_info, pixel_format);
@@ -713,7 +721,7 @@ out:
 static efi_status_t
 __gop_query64(struct efi_graphics_output_protocol_64 *gop64,
 	      struct efi_graphics_output_mode_info **info,
-	      unsigned long *size, u32 *fb_base)
+	      unsigned long *size, u64 *fb_base)
 {
 	struct efi_graphics_output_protocol_mode_64 *mode;
 	efi_status_t status;
@@ -739,7 +747,8 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 	unsigned long nr_gops;
 	u16 width, height;
 	u32 pixels_per_scan_line;
-	u32 fb_base;
+	u32 ext_lfb_base;
+	u64 fb_base;
 	struct efi_pixel_bitmask pixel_info;
 	int pixel_format;
 	efi_status_t status;
@@ -802,6 +811,13 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 	si->lfb_width = width;
 	si->lfb_height = height;
 	si->lfb_base = fb_base;
+
+	ext_lfb_base = (u64)(unsigned long)fb_base >> 32;
+	if (ext_lfb_base) {
+		si->capabilities |= VIDEO_CAPABILITY_64BIT_BASE;
+		si->ext_lfb_base = ext_lfb_base;
+	}
+
 	si->pages = 1;
 
 	setup_pixel_info(si, pixels_per_scan_line, pixel_info, pixel_format);
@@ -1209,7 +1225,7 @@ static efi_status_t setup_e820(struct boot_params *params,
 		m |= (u64)efi->efi_memmap_hi << 32;
 #endif
 
-		d = (efi_memory_desc_t *)(m + (i * efi->efi_memdesc_size));
+		d = efi_early_memdesc_ptr(m, efi->efi_memdesc_size, i);
 		switch (d->type) {
 		case EFI_RESERVED_TYPE:
 		case EFI_RUNTIME_SERVICES_CODE:

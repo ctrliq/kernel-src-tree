@@ -4149,6 +4149,7 @@ static int ql_configure_rings(struct ql_adapter *qdev)
 		rx_ring->cq_id = i;
 		rx_ring->cpu = i % cpu_cnt;	/* CPU to run handler on. */
 		if (i < qdev->rss_ring_count) {
+			gmb();
 			/*
 			 * Inbound (RSS) queues.
 			 */
@@ -4165,6 +4166,7 @@ static int ql_configure_rings(struct ql_adapter *qdev)
 			rx_ring->sbq_buf_size = SMALL_BUF_MAP_SIZE;
 			rx_ring->type = RX_Q;
 		} else {
+			gmb();
 			/*
 			 * Outbound queue handles outbound completions only.
 			 */
@@ -4712,7 +4714,7 @@ static const struct net_device_ops qlge_netdev_ops = {
 	.ndo_open		= qlge_open,
 	.ndo_stop		= qlge_close,
 	.ndo_start_xmit		= qlge_send,
-	.ndo_change_mtu		= qlge_change_mtu,
+	.ndo_change_mtu_rh74	= qlge_change_mtu,
 	.ndo_get_stats		= qlge_get_stats,
 	.ndo_set_rx_mode	= qlge_set_multicast_list,
 	.ndo_set_mac_address	= qlge_set_mac_address,

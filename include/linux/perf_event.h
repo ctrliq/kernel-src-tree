@@ -126,14 +126,6 @@ struct hw_perf_event {
 			struct list_head	tp_list;
 		};
 #ifndef __GENKSYMS__
-		struct { /* intel_cqm */
-			int			cqm_state;
-			u32			cqm_rmid;
-			int			is_group_event;
-			struct list_head	cqm_events_entry;
-			struct list_head	cqm_groups_entry;
-			struct list_head	cqm_group_entry;
-		};
 		struct { /* itrace */
 			int			itrace_started;
 		};
@@ -316,11 +308,6 @@ struct pmu {
 	 * PMU specific data size
 	 */
 	RH_KABI_EXTEND(size_t task_ctx_size)
-
-	/*
-	 * Return the count value for a counter.
-	 */
-	RH_KABI_EXTEND(u64 (*count)			(struct perf_event *event)) /*optional*/
 
 	/*
 	 * Set up pmu-private data structures for an AUX area
@@ -705,6 +692,7 @@ struct perf_output_handle {
 	struct ring_buffer		*rb;
 	unsigned long			wakeup;
 	unsigned long			size;
+	u64				aux_flags;
 	union {
 		void			*addr;
 		unsigned long		head;
@@ -748,10 +736,11 @@ perf_cgroup_from_task(struct task_struct *task)
 extern void *perf_aux_output_begin(struct perf_output_handle *handle,
 				   struct perf_event *event);
 extern void perf_aux_output_end(struct perf_output_handle *handle,
-				unsigned long size, bool truncated);
+				unsigned long size);
 extern int perf_aux_output_skip(struct perf_output_handle *handle,
 				unsigned long size);
 extern void *perf_get_aux(struct perf_output_handle *handle);
+extern void perf_aux_output_flag(struct perf_output_handle *handle, u64 flags);
 
 extern int perf_pmu_register(struct pmu *pmu, const char *name, int type);
 extern void perf_pmu_unregister(struct pmu *pmu);
@@ -979,11 +968,6 @@ static inline void perf_event_task_sched_out(struct task_struct *prev,
 		__perf_event_task_sched_out(prev, next);
 }
 
-static inline u64 __perf_event_count(struct perf_event *event)
-{
-	return local64_read(&event->count) + atomic64_read(&event->child_count);
-}
-
 extern void perf_event_mmap(struct vm_area_struct *vma);
 extern struct perf_guest_info_callbacks *perf_guest_cbs;
 extern int perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *callbacks);
@@ -1126,8 +1110,8 @@ static inline void *
 perf_aux_output_begin(struct perf_output_handle *handle,
 		      struct perf_event *event)				{ return NULL; }
 static inline void
-perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
-		    bool truncated)					{ }
+perf_aux_output_end(struct perf_output_handle *handle, unsigned long size)
+									{ }
 static inline int
 perf_aux_output_skip(struct perf_output_handle *handle,
 		     unsigned long size)				{ return -EINVAL; }

@@ -12,9 +12,6 @@
 #include <linux/vmstat.h>
 #include <linux/atomic.h>
 #include <linux/vmalloc.h>
-#ifdef CONFIG_CMA
-#include <linux/cma.h>
-#endif
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include "internal.h"

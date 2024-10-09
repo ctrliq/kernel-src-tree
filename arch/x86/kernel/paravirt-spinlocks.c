@@ -44,3 +44,25 @@ EXPORT_SYMBOL(pv_lock_ops);
 
 struct static_key paravirt_ticketlocks_enabled = STATIC_KEY_INIT_FALSE;
 EXPORT_SYMBOL(paravirt_ticketlocks_enabled);
+
+#ifdef CONFIG_QUEUED_SPINLOCKS
+/*
+ * Enable paravirt_ticketlocks_enabled call sites patching unless
+ * 1) A hypervisor is running; and
+ * 2) the .queued_spin_lock_slowpath method hasn't changed.
+ *
+ * In this case, the virt_spin_lock() function will be used. This
+ * lock function is simple enough that we don't need the atomic add
+ * guarantee of the unlock function. So paravirt_ticketlocks_enabled
+ * does not need to be turned on.
+ */
+static int __init queued_enable_pv_ticketlock(void)
+{
+	if (!static_cpu_has(X86_FEATURE_HYPERVISOR) ||
+	   (pv_lock_ops.queued_spin_lock_slowpath !=
+	    native_queued_spin_lock_slowpath))
+		static_key_slow_inc(&paravirt_ticketlocks_enabled);
+	return 0;
+}
+pure_initcall(queued_enable_pv_ticketlock);
+#endif

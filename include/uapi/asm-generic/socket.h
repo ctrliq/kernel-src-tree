@@ -82,4 +82,6 @@
 
 #define SO_BPF_EXTENSIONS	48
 
+#define SCM_TIMESTAMPING_PKTINFO	58
+
 #endif /* __ASM_GENERIC_SOCKET_H */

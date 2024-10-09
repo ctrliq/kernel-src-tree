@@ -7,7 +7,10 @@
  * Released under the GPL v2. (and only v2, not any later version)
  */
 
+#include <errno.h>
+#include <inttypes.h>
 #include <linux/compiler.h>
+#include <linux/kernel.h>
 #include <babeltrace/ctf-writer/writer.h>
 #include <babeltrace/ctf-writer/clock.h>
 #include <babeltrace/ctf-writer/stream.h>

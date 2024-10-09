@@ -570,6 +570,7 @@ static int loop_thread(void *data)
 	struct bio *bio;
 
 	set_user_nice(current, -20);
+	current->flags |= PF_LESS_THROTTLE;
 
 	while (!kthread_should_stop() || !bio_list_empty(&lo->lo_bio_list)) {
 

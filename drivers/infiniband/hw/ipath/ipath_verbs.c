@@ -1777,7 +1777,7 @@ static int ipath_dealloc_pd(struct ib_pd *ibpd)
  * This may be called from interrupt context.
  */
 static struct ib_ah *ipath_create_ah(struct ib_pd *pd,
-				     struct ib_ah_attr *ah_attr,
+				     struct rdma_ah_attr *ah_attr,
 				     struct ib_udata *udata)
 
 {
@@ -1785,16 +1785,19 @@ static struct ib_ah *ipath_create_ah(struct ib_pd *pd,
 	struct ib_ah *ret;
 	struct ipath_ibdev *dev = to_idev(pd->device);
 	unsigned long flags;
+	u16 dlid;
+
+	dlid = rdma_ah_get_dlid(ah_attr);
 
 	/* A multicast address requires a GRH (see ch. 8.4.1). */
-	if (ah_attr->dlid >= IPATH_MULTICAST_LID_BASE &&
-	    ah_attr->dlid != IPATH_PERMISSIVE_LID &&
+	if (dlid >= IPATH_MULTICAST_LID_BASE &&
+	    dlid != IPATH_PERMISSIVE_LID &&
 	    !(ah_attr->ah_flags & IB_AH_GRH)) {
 		ret = ERR_PTR(-EINVAL);
 		goto bail;
 	}
 
-	if (ah_attr->dlid == 0) {
+	if (dlid == 0) {
 		ret = ERR_PTR(-EINVAL);
 		goto bail;
 	}
@@ -1853,7 +1856,7 @@ static int ipath_destroy_ah(struct ib_ah *ibah)
 	return 0;
 }
 
-static int ipath_query_ah(struct ib_ah *ibah, struct ib_ah_attr *ah_attr)
+static int ipath_query_ah(struct ib_ah *ibah, struct rdma_ah_attr *ah_attr)
 {
 	struct ipath_ah *ah = to_iah(ibah);
 
@@ -2172,7 +2175,7 @@ int ipath_register_ib_device(struct ipath_devdata *dd)
 	dev->node_type = RDMA_NODE_IB_CA;
 	dev->phys_port_cnt = 1;
 	dev->num_comp_vectors = 1;
-	dev->dma_device = &dd->pcidev->dev;
+	dev->dev.parent = &dd->pcidev->dev;
 	dev->query_device = ipath_query_device;
 	dev->modify_device = ipath_modify_device;
 	dev->query_port = ipath_query_port;

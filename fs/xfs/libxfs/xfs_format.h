@@ -664,7 +664,8 @@ typedef struct xfs_agf {
 #define	XFS_AGF_LONGEST		0x00000400
 #define	XFS_AGF_BTREEBLKS	0x00000800
 #define	XFS_AGF_UUID		0x00001000
-#define	XFS_AGF_NUM_BITS	13
+#define	XFS_AGF_SPARE64		0x00002000
+#define	XFS_AGF_NUM_BITS	14
 #define	XFS_AGF_ALL_BITS	((1 << XFS_AGF_NUM_BITS) - 1)
 
 #define XFS_AGF_FLAGS \
@@ -680,7 +681,8 @@ typedef struct xfs_agf {
 	{ XFS_AGF_FREEBLKS,	"FREEBLKS" }, \
 	{ XFS_AGF_LONGEST,	"LONGEST" }, \
 	{ XFS_AGF_BTREEBLKS,	"BTREEBLKS" }, \
-	{ XFS_AGF_UUID,		"UUID" }
+	{ XFS_AGF_UUID,		"UUID" }, \
+	{ XFS_AGF_SPARE64,	"SPARE64" }
 
 /* disk block (xfs_daddr_t) in the AG */
 #define XFS_AGF_DADDR(mp)	((xfs_daddr_t)(1 << (mp)->m_sectbb_log))

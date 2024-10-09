@@ -9,10 +9,26 @@
 #include <linux/bootmem.h>
 #include <linux/compat.h>
 #include <linux/cpu.h>
+#include <linux/mman.h>
+#include <linux/pkeys.h>
+#include <asm/cpufeature.h>
 #include <asm/i387.h>
 #include <asm/fpu-internal.h>
 #include <asm/sigframe.h>
 #include <asm/xcr.h>
+
+static short xsave_cpuid_features[] __initdata = {
+	X86_FEATURE_FPU,
+	X86_FEATURE_XMM,
+	X86_FEATURE_AVX,
+	X86_FEATURE_MPX,
+	X86_FEATURE_MPX,
+	X86_FEATURE_AVX512F,
+	X86_FEATURE_AVX512F,
+	X86_FEATURE_AVX512F,
+	X86_FEATURE_INTEL_PT,
+	X86_FEATURE_PKU,
+};
 
 /*
  * Supported feature mask by the CPU and the kernel.
@@ -607,6 +623,7 @@ static void __init init_xstate_size(void)
 static void __init xstate_enable_boot_cpu(void)
 {
 	unsigned int eax, ebx, ecx, edx;
+	int i;
 
 	if (boot_cpu_data.cpuid_level < XSTATE_CPUID) {
 		WARN(1, KERN_ERR "XSTATE_CPUID missing\n");
@@ -620,6 +637,14 @@ static void __init xstate_enable_boot_cpu(void)
 		pr_err("FP/SSE not shown under xsave features 0x%llx\n",
 		       pcntxt_mask);
 		BUG();
+	}
+
+	/*
+	 * Clear XSAVE features that are disabled in the normal CPUID.
+	 */
+	for (i = 0; i < ARRAY_SIZE(xsave_cpuid_features); i++) {
+		if (!boot_cpu_has(xsave_cpuid_features[i]))
+			pcntxt_mask &= ~BIT(i);
 	}
 
 	/*
@@ -718,6 +743,19 @@ void eager_fpu_init(void)
 }
 
 /*
+ * Given an xstate feature mask, calculate where in the xsave
+ * buffer the state is.  Callers should ensure that the buffer
+ * is valid.
+ *
+ * Note: does not work for compacted buffers.
+ */
+void *__raw_xsave_addr(struct xsave_struct *xsave, int xstate_feature_mask)
+{
+	int feature_nr = fls64(xstate_feature_mask) - 1;
+
+	return (void *)xsave + xstate_comp_offsets[feature_nr];
+}
+/*
  * Given the xsave area and a state inside, this function returns the
  * address of the state.
  *
@@ -737,14 +775,12 @@ void eager_fpu_init(void)
  */
 void *get_xsave_addr(struct xsave_struct *xsave, int xstate_feature)
 {
-	int feature_nr = fls64(xstate_feature) - 1;
 	/*
 	 * Do we even *have* xsave state?
 	 */
 	if (!boot_cpu_has(X86_FEATURE_XSAVE))
 		return NULL;
 
-	xsave = &current->thread.fpu.state->xsave;
 	/*
 	 * We should not ever be requesting features that we
 	 * have not enabled.  Remember that pcntxt_mask is
@@ -766,7 +802,7 @@ void *get_xsave_addr(struct xsave_struct *xsave, int xstate_feature)
 	if (!(xsave->xsave_hdr.xstate_bv & xstate_feature))
 		return NULL;
 
-	return (void *)xsave + xstate_comp_offsets[feature_nr];
+	return __raw_xsave_addr(xsave, xstate_feature);
 }
 EXPORT_SYMBOL_GPL(get_xsave_addr);
 
@@ -801,3 +837,55 @@ const void *get_xsave_field_ptr(int xsave_state)
 
 	return get_xsave_addr(&current->thread.fpu.state->xsave, xsave_state);
 }
+
+#ifdef CONFIG_ARCH_HAS_PKEYS
+
+#define NR_VALID_PKRU_BITS (CONFIG_NR_PROTECTION_KEYS * 2)
+#define PKRU_VALID_MASK (NR_VALID_PKRU_BITS - 1)
+
+/*
+ * This will go out and modify PKRU register to set the access
+ * rights for @pkey to @init_val.
+ */
+int arch_set_user_pkey_access(struct task_struct *tsk, int pkey,
+		unsigned long init_val)
+{
+	u32 old_pkru;
+	int pkey_shift = (pkey * PKRU_BITS_PER_PKEY);
+	u32 new_pkru_bits = 0;
+
+	/*
+	 * This check implies XSAVE support.  OSPKE only gets
+	 * set if we enable XSAVE and we enable PKU in XCR0.
+	 */
+	if (!boot_cpu_has(X86_FEATURE_OSPKE))
+		return -EINVAL;
+	/*
+	 * For most XSAVE components, this would be an arduous task:
+	 * brining fpstate up to date with fpregs, updating fpstate,
+	 * then re-populating fpregs.  But, for components that are
+	 * never lazily managed, we can just access the fpregs
+	 * directly.  PKRU is never managed lazily, so we can just
+	 * manipulate it directly.  Make sure it stays that way.
+	 */
+	WARN_ON_ONCE(!use_eager_fpu());
+
+	/* Set the bits we need in PKRU  */
+	if (init_val & PKEY_DISABLE_ACCESS)
+		new_pkru_bits |= PKRU_AD_BIT;
+	if (init_val & PKEY_DISABLE_WRITE)
+		new_pkru_bits |= PKRU_WD_BIT;
+
+	/* Shift the bits in to the correct place in PKRU for pkey. */
+	new_pkru_bits <<= pkey_shift;
+
+	/* Get old PKRU and mask off any old bits in place: */
+	old_pkru = read_pkru();
+	old_pkru &= ~((PKRU_AD_BIT|PKRU_WD_BIT) << pkey_shift);
+
+	/* Write old part along with new part: */
+	write_pkru(old_pkru | new_pkru_bits);
+
+	return 0;
+}
+#endif /* ! CONFIG_ARCH_HAS_PKEYS */

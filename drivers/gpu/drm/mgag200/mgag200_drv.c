@@ -22,12 +22,9 @@
  * functions
  */
 int mgag200_modeset = -1;
-int mgag200_preferred_depth __read_mostly = 0;
 
 MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
 module_param_named(modeset, mgag200_modeset, int, 0400);
-MODULE_PARM_DESC(preferreddepth, "Set preferred bpp");
-module_param_named(preferreddepth, mgag200_preferred_depth, int, 0400);
 
 static struct drm_driver driver;
 
@@ -94,7 +91,6 @@ static struct drm_driver driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET,
 	.load = mgag200_driver_load,
 	.unload = mgag200_driver_unload,
-	.set_busid = drm_pci_set_busid,
 	.fops = &mgag200_driver_fops,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
@@ -106,7 +102,6 @@ static struct drm_driver driver = {
 	.gem_free_object_unlocked = mgag200_gem_free_object,
 	.dumb_create = mgag200_dumb_create,
 	.dumb_map_offset = mgag200_dumb_mmap_offset,
-	.dumb_destroy = drm_gem_dumb_destroy,
 };
 
 static struct pci_driver mgag200_pci_driver = {
@@ -123,20 +118,13 @@ static int __init mgag200_init(void)
 
 	if (mgag200_modeset == 0)
 		return -EINVAL;
-	switch (mgag200_preferred_depth) {
-	case 0: /* driver default */
-	case 16:
-	case 24:
-		break;
-	default:
-		return -EINVAL;
-	}
-	return drm_pci_init(&driver, &mgag200_pci_driver);
+
+	return pci_register_driver(&mgag200_pci_driver);
 }
 
 static void __exit mgag200_exit(void)
 {
-	drm_pci_exit(&driver, &mgag200_pci_driver);
+	pci_unregister_driver(&mgag200_pci_driver);
 }
 
 module_init(mgag200_init);

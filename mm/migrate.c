@@ -39,6 +39,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/memremap.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/ptrace.h>
 
 #include <asm/tlbflush.h>
 
@@ -161,7 +162,7 @@ static int remove_migration_pte(struct page *new, struct vm_area_struct *vma,
 		goto unlock;
 
 	get_page(new);
-	pte = pte_mkold(mk_pte(new, vma->vm_page_prot));
+	pte = pte_mkold(mk_pte(new, READ_ONCE(vma->vm_page_prot)));
 	if (pte_swp_soft_dirty(*ptep))
 		pte = pte_mksoft_dirty(pte);
 	if (is_write_migration_entry(entry))
@@ -1484,7 +1485,6 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
 		const int __user *, nodes,
 		int __user *, status, int, flags)
 {
-	const struct cred *cred = current_cred(), *tcred;
 	struct task_struct *task;
 	struct mm_struct *mm;
 	int err;
@@ -1508,14 +1508,9 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
 
 	/*
 	 * Check if this process has the right to modify the specified
-	 * process. The right exists if the process has administrative
-	 * capabilities, superuser privileges or the same
-	 * userid as the target process.
+	 * process. Use the regular "ptrace_may_access()" checks.
 	 */
-	tcred = __task_cred(task);
-	if (!uid_eq(cred->euid, tcred->suid) && !uid_eq(cred->euid, tcred->uid) &&
-	    !uid_eq(cred->uid,  tcred->suid) && !uid_eq(cred->uid,  tcred->uid) &&
-	    !capable(CAP_SYS_NICE)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
 		rcu_read_unlock();
 		err = -EPERM;
 		goto out;
@@ -1952,9 +1947,10 @@ static int migrate_vma_collect_hole(unsigned long start,
 	unsigned long addr;
 
 	for (addr = start & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
-		migrate->cpages++;
+		migrate->src[migrate->npages] = MIGRATE_PFN_MIGRATE;
 		migrate->dst[migrate->npages] = 0;
-		migrate->src[migrate->npages++] = 0;
+		migrate->npages++;
+		migrate->cpages++;
 	}
 
 	return 0;
@@ -1971,10 +1967,10 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
 	spinlock_t *ptl;
 	pte_t *ptep;
 
-	if (pmd_none(*pmdp) || pmd_trans_unstable(pmdp)) {
-		/* FIXME support THP */
+	if (pmd_trans_huge(*pmdp))
+		split_huge_page_pmd(migrate->vma, start, pmdp);
+	if (pmd_none_or_trans_huge_or_clear_bad(pmdp))
 		return migrate_vma_collect_hole(start, end, walk);
-	}
 
 	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
 	arch_enter_lazy_mmu_mode();
@@ -1989,8 +1985,9 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
 		pfn = pte_pfn(pte);
 
 		if (pte_none(pte)) {
+			mpfn = MIGRATE_PFN_MIGRATE;
 			migrate->cpages++;
-			mpfn = pfn = 0;
+			pfn = 0;
 			goto next;
 		}
 
@@ -2064,7 +2061,8 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
 			 */
 			page_remove_rmap(page);
 			put_page(page);
-			unmapped++;
+			if (pte_present(pte))
+				unmapped++;
 		}
 
 next:
@@ -2138,14 +2136,25 @@ static bool migrate_vma_check_page(struct page *page)
 	if (PageCompound(page))
 		return false;
 
-	/* Page from ZONE_DEVICE have one extra reference */
-	if (is_zone_device_page(page)) {
-		if (is_hmm_page(page)) {
-			extra++;
-		} else
-			/* Other ZONE_DEVICE memory type are not supported */
-			return false;
-	}
+	/*
+	 * Private page can never be pin as they have no valid pte and
+	 * GUP will fail for those. Yet if there is a pending migration
+	 * a thread might try to wait on the pte migration entry and
+	 * will bump the page reference count. Sadly there is no way to
+	 * differentiate a regular pin from migration wait. Hence to
+	 * avoid 2 racing thread trying to migrate back to CPU to enter
+	 * infinite loop (one stoping migration because the other is
+	 * waiting on pte migration entry). We always return true here.
+	 *
+	 * FIXME proper solution is to rework migration_entry_wait() so
+	 * it does not need to take a reference on page.
+	 */
+	if (is_hmm_page(page))
+		return true;
+
+	if (is_zone_device_page(page))
+		/* Other ZONE_DEVICE memory type are not supported */
+		return false;
 
 	if ((page_count(page) - extra) > page_mapcount(page))
 		return false;
@@ -2171,7 +2180,7 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
 
 	lru_add_drain();
 
-	for (i = 0; i < npages; i++) {
+	for (i = 0; (i < npages) && migrate->cpages; i++) {
 		struct page *page = migrate_pfn_to_page(migrate->src[i]);
 		bool remap = true;
 
@@ -2179,8 +2188,21 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
 			continue;
 
 		if (!(migrate->src[i] & MIGRATE_PFN_LOCKED)) {
+			/*
+			 * Because we are migrating several pages there can be
+			 * a deadlock between 2 concurrent migration where each
+			 * are waiting on each other page lock.
+			 *
+			 * Make migrate_vma() a best effort thing and backoff
+			 * for any page we can not lock right away.
+			 */
+			if (!trylock_page(page)) {
+				migrate->src[i] = 0;
+				migrate->cpages--;
+				put_page(page);
+				continue;
+			}
 			remap = false;
-			lock_page(page);
 			migrate->src[i] |= MIGRATE_PFN_LOCKED;
 		}
 
@@ -2314,6 +2336,7 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 {
 	struct vm_area_struct *vma = migrate->vma;
 	struct mm_struct *mm = vma->vm_mm;
+	bool flush = false;
 	spinlock_t *ptl;
 	pgd_t *pgdp;
 	pud_t *pudp;
@@ -2377,7 +2400,16 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 	}
 
 	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
-	if (!pte_none(*ptep)) {
+	if (pte_present(*ptep)) {
+		unsigned long pfn = pte_pfn(*ptep);
+
+		if (!is_zero_pfn(pfn)) {
+			pte_unmap_unlock(ptep, ptl);
+			mem_cgroup_uncharge_page(page);
+			goto abort;
+		}
+		flush = true;
+	} else if (!pte_none(*ptep)) {
 		pte_unmap_unlock(ptep, ptl);
 		mem_cgroup_uncharge_page(page);
 		goto abort;
@@ -2393,15 +2425,20 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 		goto abort;
 	}
 
-	inc_mm_counter(mm, MM_ANONPAGES);
 	page_add_new_anon_rmap(page, vma, addr);
-	set_pte_at(mm, addr, ptep, entry);
-
-	/* Take a reference on the page */
+	inc_mm_counter(mm, MM_ANONPAGES);
 	get_page(page);
 
-	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(vma, addr, ptep);
+	if (flush) {
+		flush_cache_page(vma, addr, pte_pfn(*ptep));
+		ptep_clear_flush_notify(vma, addr, ptep);
+		set_pte_at_notify(mm, addr, ptep, entry);
+		update_mmu_cache(vma, addr, ptep);
+	} else {
+		/* No need to invalidate - it was non-present before */
+		update_mmu_cache(vma, addr, ptep);
+		set_pte_at(mm, addr, ptep, entry);
+	}
 	pte_unmap_unlock(ptep, ptl);
 	*src = MIGRATE_PFN_MIGRATE;
 	return;
@@ -2422,7 +2459,10 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 {
 	const unsigned long npages = migrate->npages;
 	const unsigned long start = migrate->start;
-	unsigned long addr, i;
+	struct vm_area_struct *vma = migrate->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long addr, i, mmu_start;
+	bool notified = false;
 
 	for (i = 0, addr = start; i < npages; addr += PAGE_SIZE, i++) {
 		struct page *newpage = migrate_pfn_to_page(migrate->dst[i]);
@@ -2434,18 +2474,24 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 		if (!newpage) {
 			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
 			continue;
-		} else if (!(migrate->src[i] & MIGRATE_PFN_MIGRATE)) {
-			if (!page)
-				migrate_vma_insert_page(migrate, addr, newpage,
-							&migrate->src[i],
-							&migrate->dst[i]);
-			continue;
 		}
 
-		newpage->index = page->index;
-		newpage->mapping = page->mapping;
-		if (PageSwapBacked(page))
-			SetPageSwapBacked(newpage);
+		if (!page) {
+			if (!(migrate->src[i] & MIGRATE_PFN_MIGRATE)) {
+				continue;
+			}
+			if (!notified) {
+				mmu_start = addr;
+				notified = true;
+				mmu_notifier_invalidate_range_start(mm,
+								mmu_start,
+								migrate->end);
+			}
+			migrate_vma_insert_page(migrate, addr, newpage,
+						&migrate->src[i],
+						&migrate->dst[i]);
+			continue;
+		}
 
 		mapping = page_mapping(page);
 
@@ -2469,6 +2515,11 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 			}
 		}
 
+		newpage->index = page->index;
+		newpage->mapping = page->mapping;
+		if (PageSwapBacked(page))
+			SetPageSwapBacked(newpage);
+
 		mem_cgroup_prepare_migration(page, newpage, &memcg);
 		r = migrate_page(mapping, newpage, page, MIGRATE_SYNC_NO_COPY);
 		mem_cgroup_end_migration(memcg, page, newpage,
@@ -2476,6 +2527,10 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 		if (r != MIGRATEPAGE_SUCCESS)
 			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
 	}
+
+	if (notified)
+		mmu_notifier_invalidate_range_end(mm, mmu_start,
+						  migrate->end);
 }
 
 /*

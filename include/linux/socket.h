@@ -312,6 +312,9 @@ extern int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 extern int memcpy_fromiovecend_partial_nocache(unsigned char *kdata,
 					       const struct iovec *iov,
 					       int offset, int len);
+extern int memcpy_fromiovecend_partial_flushcache(unsigned char *kdata,
+					       const struct iovec *iov,
+					       int offset, int len);
 extern int csum_partial_copy_fromiovecend(unsigned char *kdata, 
 					  struct iovec *iov, 
 					  int offset, 

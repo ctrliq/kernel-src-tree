@@ -1642,7 +1642,6 @@ static void team_destructor(struct net_device *dev)
 	struct team *team = netdev_priv(dev);
 
 	free_percpu(team->pcpu_stats);
-	free_netdev(dev);
 }
 
 static int team_open(struct net_device *dev)
@@ -1792,7 +1791,7 @@ unwind:
 	return err;
 }
 
-static struct rtnl_link_stats64 *
+static void
 team_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct team *team = netdev_priv(dev);
@@ -1829,7 +1828,6 @@ team_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 	stats->rx_dropped	= rx_dropped;
 	stats->tx_dropped	= tx_dropped;
 	stats->rx_nohandler	= rx_nohandler;
-	return stats;
 }
 
 static int team_vlan_rx_add_vid(struct net_device *dev, __be16 proto, u16 vid)
@@ -1993,7 +1991,7 @@ static const struct net_device_ops team_netdev_ops = {
 	.ndo_change_rx_flags	= team_change_rx_flags,
 	.ndo_set_rx_mode	= team_set_rx_mode,
 	.ndo_set_mac_address	= team_set_mac_address,
-	.ndo_change_mtu		= team_change_mtu,
+	.ndo_change_mtu_rh74	= team_change_mtu,
 	.ndo_get_stats64	= team_get_stats64,
 	.ndo_vlan_rx_add_vid	= team_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= team_vlan_rx_kill_vid,
@@ -2081,7 +2079,8 @@ static void team_setup(struct net_device *dev)
 
 	dev->netdev_ops = &team_netdev_ops;
 	dev->ethtool_ops = &team_ethtool_ops;
-	dev->destructor	= team_destructor;
+	dev->extended->needs_free_netdev = true;
+	dev->extended->priv_destructor = team_destructor;
 	dev->priv_flags &= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
 	dev->priv_flags |= IFF_NO_QUEUE;
 	dev->priv_flags |= IFF_TEAM;
@@ -2153,13 +2152,7 @@ static struct rtnl_link_ops team_link_ops __read_mostly = {
  * Generic netlink custom interface
  ***********************************/
 
-static struct genl_family team_nl_family = {
-	.id		= GENL_ID_GENERATE,
-	.name		= TEAM_GENL_NAME,
-	.version	= TEAM_GENL_VERSION,
-	.maxattr	= TEAM_ATTR_MAX,
-	.netnsok	= true,
-};
+static struct genl_family team_nl_family;
 
 static const struct nla_policy team_nl_policy[TEAM_ATTR_MAX + 1] = {
 	[TEAM_ATTR_UNSPEC]			= { .type = NLA_UNSPEC, },
@@ -2753,6 +2746,18 @@ static const struct genl_multicast_group team_nl_mcgrps[] = {
 	{ .name = TEAM_GENL_CHANGE_EVENT_MC_GRP_NAME, },
 };
 
+static struct genl_family team_nl_family = {
+	.name		= TEAM_GENL_NAME,
+	.version	= TEAM_GENL_VERSION,
+	.maxattr	= TEAM_ATTR_MAX,
+	.netnsok	= true,
+	.module		= THIS_MODULE,
+	.ops		= team_nl_ops,
+	.n_ops		= ARRAY_SIZE(team_nl_ops),
+	.mcgrps		= team_nl_mcgrps,
+	.n_mcgrps	= ARRAY_SIZE(team_nl_mcgrps),
+};
+
 static int team_nl_send_multicast(struct sk_buff *skb,
 				  struct team *team, u32 portid)
 {
@@ -2776,8 +2781,7 @@ static int team_nl_send_event_port_get(struct team *team,
 
 static int team_nl_init(void)
 {
-	return genl_register_family_with_ops_groups(&team_nl_family, team_nl_ops,
-						    team_nl_mcgrps);
+	return genl_register_family(&team_nl_family);
 }
 
 static void team_nl_fini(void)

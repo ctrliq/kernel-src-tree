@@ -19,6 +19,13 @@
 
 #define GHES_EDAC_REVISION " Ver: 1.0.0"
 
+/*
+ * RHEL only: we don't want to swap from other EDAC drivers into GHES during
+ * the same release.
+ */
+bool ghes_edac_enable;
+module_param_named(enable, ghes_edac_enable, bool, 0);
+
 struct ghes_edac_pvt {
 	struct list_head list;
 	struct ghes *ghes;
@@ -180,6 +187,9 @@ void ghes_edac_report_mem_error(struct ghes *ghes, int sev,
 	unsigned long flags;
 	char *p;
 	u8 grain_bits;
+
+	if (!ghes_edac_enable)
+		return;
 
 	if (!pvt) {
 		pr_err("Internal error: Can't find EDAC structure\n");
@@ -426,6 +436,9 @@ int ghes_edac_register(struct ghes *ghes, struct device *dev)
 	struct edac_mc_layer layers[1];
 	struct ghes_edac_dimm_fill dimm_fill;
 
+	if (!ghes_edac_enable)
+		return 0;
+
 	/*
 	 * We have only one logical memory controller to which all DIMMs belong.
 	 */
@@ -498,6 +511,7 @@ int ghes_edac_register(struct ghes *ghes, struct device *dev)
 		edac_mc_free(mci);
 		return -ENODEV;
 	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ghes_edac_register);
@@ -505,6 +519,9 @@ EXPORT_SYMBOL_GPL(ghes_edac_register);
 void ghes_edac_unregister(struct ghes *ghes)
 {
 	struct mem_ctl_info *mci;
+
+	if (!ghes_edac_enable)
+		return;
 
 	mci = ghes_pvt->mci;
 	edac_mc_del_mc(mci->pdev);

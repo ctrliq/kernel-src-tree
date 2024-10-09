@@ -15,6 +15,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/firmware.h>
@@ -203,7 +204,7 @@ static struct dw_dma_chip *dw_probe(struct device *dev, struct resource *mem,
 
 	chip->dev = dev;
 
-	err = dw_dma_probe(chip);
+	err = dw_dma_probe(chip, NULL);
 	if (err)
 		return ERR_PTR(err);
 

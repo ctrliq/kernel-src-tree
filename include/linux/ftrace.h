@@ -62,7 +62,7 @@ typedef void (*ftrace_func_t)(unsigned long ip, unsigned long parent_ip,
  * CONTROL, SAVE_REGS, SAVE_REGS_IF_SUPPORTED, RECURSION_SAFE, STUB and
  * IPMODIFY are a kind of attribute flags which can be set only before
  * registering the ftrace_ops, and can not be modified while registered.
- * Changing those attribute flags after regsitering ftrace_ops will
+ * Changing those attribute flags after registering ftrace_ops will
  * cause unexpected results.
  *
  * ENABLED - set/unset when ftrace_ops is registered/unregistered
@@ -279,6 +279,7 @@ extern int ftrace_nr_registered_ops(void);
  *  REGS    - the record wants the function to save regs
  *  REGS_EN - the function is set up to save regs.
  *  IPMODIFY - the record allows for the IP address to be changed.
+ *  DISABLED - the record is not ready to be touched yet
  *
  * When a new ftrace_ops is registered and wants a function to save
  * pt_regs, the rec->flag REGS is set. When the function has been
@@ -291,10 +292,11 @@ enum {
 	FTRACE_FL_REGS		= (1UL << 30),
 	FTRACE_FL_REGS_EN	= (1UL << 29),
 	FTRACE_FL_IPMODIFY	= (1UL << 28),
+	FTRACE_FL_DISABLED	= (1UL << 27),
 };
 
-#define FTRACE_REF_MAX_SHIFT	28
-#define FTRACE_FL_BITS		4
+#define FTRACE_REF_MAX_SHIFT	27
+#define FTRACE_FL_BITS		5
 #define FTRACE_FL_MASKED_BITS	((1UL << FTRACE_FL_BITS) - 1)
 #define FTRACE_FL_MASK		(FTRACE_FL_MASKED_BITS << FTRACE_REF_MAX_SHIFT)
 #define FTRACE_REF_MAX		((1UL << FTRACE_REF_MAX_SHIFT) - 1)
@@ -509,6 +511,7 @@ extern int ftrace_arch_read_dyn_info(char *buf, int size);
 
 extern int skip_trace(unsigned long ip);
 extern void ftrace_module_init(struct module *mod);
+extern void ftrace_module_enable(struct module *mod);
 extern void ftrace_release_mod(struct module *mod);
 
 extern void ftrace_disable_daemon(void);
@@ -518,8 +521,9 @@ static inline int skip_trace(unsigned long ip) { return 0; }
 static inline int ftrace_force_update(void) { return 0; }
 static inline void ftrace_disable_daemon(void) { }
 static inline void ftrace_enable_daemon(void) { }
-static inline void ftrace_release_mod(struct module *mod) {}
-static inline void ftrace_module_init(struct module *mod) {}
+static inline void ftrace_module_init(struct module *mod) { }
+static inline void ftrace_module_enable(struct module *mod) { }
+static inline void ftrace_release_mod(struct module *mod) { }
 static inline __init int register_ftrace_command(struct ftrace_func_command *cmd)
 {
 	return -EINVAL;
@@ -681,7 +685,7 @@ struct ftrace_ret_stack {
 	unsigned long func;
 	unsigned long long calltime;
 	unsigned long long subtime;
-	unsigned long fp;
+	RH_KABI_REPLACE(unsigned long fp, unsigned long *retp)
 };
 
 /*
@@ -693,7 +697,7 @@ extern void return_to_handler(void);
 
 extern int
 ftrace_push_return_trace(unsigned long ret, unsigned long func, int *depth,
-			 unsigned long frame_pointer);
+			 unsigned long frame_pointer, unsigned long *retp);
 
 unsigned long ftrace_graph_ret_addr(struct task_struct *task, int *idx,
 				    unsigned long ret, unsigned long *retp);

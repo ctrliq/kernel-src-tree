@@ -50,6 +50,9 @@ bool nf_ct_invert_tuple(struct nf_conntrack_tuple *inverse,
 			const struct nf_conntrack_l3proto *l3proto,
 			const struct nf_conntrack_l4proto *l4proto);
 
+void nf_conntrack_get_ht(struct net *net, struct hlist_nulls_head **hash,
+			 unsigned int *hsize);
+
 /* Find a connection corresponding to a tuple. */
 struct nf_conntrack_tuple_hash *
 nf_conntrack_find_get(struct net *net,
@@ -61,7 +64,7 @@ int __nf_conntrack_confirm(struct sk_buff *skb);
 /* Confirm a connection: returns NF_DROP if packet must be dropped. */
 static inline int nf_conntrack_confirm(struct sk_buff *skb)
 {
-	struct nf_conn *ct = (struct nf_conn *)skb->nfct;
+	struct nf_conn *ct = (struct nf_conn *)skb_nfct(skb);
 	int ret = NF_ACCEPT;
 
 	if (ct && !nf_ct_is_untracked(ct)) {

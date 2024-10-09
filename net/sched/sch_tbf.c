@@ -21,7 +21,6 @@
 #include <net/netlink.h>
 #include <net/sch_generic.h>
 #include <net/pkt_sched.h>
-#include <net/tcp.h>
 
 
 /*	Simple Token Bucket Filter.
@@ -147,22 +146,17 @@ static u64 psched_ns_t2l(const struct psched_ratecfg *r,
  * Return length of individual segments of a gso packet,
  * including all headers (MAC, IP, TCP/UDP)
  */
-static unsigned int skb_gso_seglen(const struct sk_buff *skb)
+static unsigned int skb_gso_mac_seglen(const struct sk_buff *skb)
 {
 	unsigned int hdr_len = skb_transport_header(skb) - skb_mac_header(skb);
-	const struct skb_shared_info *shinfo = skb_shinfo(skb);
-
-	if (likely(shinfo->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)))
-		hdr_len += tcp_hdrlen(skb);
-	else
-		hdr_len += sizeof(struct udphdr);
-	return hdr_len + shinfo->gso_size;
+	return hdr_len + skb_gso_transport_seglen(skb);
 }
 
 /* GSO packet is too big, segment it so that tbf can transmit
  * each segment in time
  */
-static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
+static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch,
+		       struct sk_buff **to_free)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 	struct sk_buff *segs, *nskb;
@@ -173,7 +167,7 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
 	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
 
 	if (IS_ERR_OR_NULL(segs))
-		return qdisc_drop(skb, sch);
+		return qdisc_drop(skb, sch, to_free);
 
 	nb = 0;
 	while (segs) {
@@ -181,7 +175,7 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
 		segs->next = NULL;
 		qdisc_skb_cb(segs)->pkt_len = segs->len;
 		len += segs->len;
-		ret = qdisc_enqueue(segs, q->qdisc);
+		ret = qdisc_enqueue(segs, q->qdisc, to_free);
 		if (ret != NET_XMIT_SUCCESS) {
 			if (net_xmit_drop_count(ret))
 				qdisc_qstats_drop(sch);
@@ -197,17 +191,18 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
 	return nb > 0 ? NET_XMIT_SUCCESS : NET_XMIT_DROP;
 }
 
-static int tbf_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+static int tbf_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+		       struct sk_buff **to_free)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 	int ret;
 
 	if (qdisc_pkt_len(skb) > q->max_size) {
-		if (skb_is_gso(skb) && skb_gso_seglen(skb) <= q->max_size)
-			return tbf_segment(skb, sch);
-		return qdisc_drop(skb, sch);
+		if (skb_is_gso(skb) && skb_gso_mac_seglen(skb) <= q->max_size)
+			return tbf_segment(skb, sch, to_free);
+		return qdisc_drop(skb, sch, to_free);
 	}
-	ret = qdisc_enqueue(skb, q->qdisc);
+	ret = qdisc_enqueue(skb, q->qdisc, to_free);
 	if (ret != NET_XMIT_SUCCESS) {
 		if (net_xmit_drop_count(ret))
 			qdisc_qstats_drop(sch);
@@ -217,19 +212,6 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	qdisc_qstats_backlog_inc(sch, skb);
 	sch->q.qlen++;
 	return NET_XMIT_SUCCESS;
-}
-
-static unsigned int tbf_drop(struct Qdisc *sch)
-{
-	struct tbf_sched_data *q = qdisc_priv(sch);
-	unsigned int len = 0;
-
-	if (q->qdisc->ops->drop && (len = q->qdisc->ops->drop(q->qdisc)) != 0) {
-		sch->qstats.backlog -= len;
-		sch->q.qlen--;
-		qdisc_qstats_drop(sch);
-	}
-	return len;
 }
 
 static bool tbf_peak_present(const struct tbf_sched_data *q)
@@ -414,6 +396,8 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
 					  q->qdisc->qstats.backlog);
 		qdisc_destroy(q->qdisc);
 		q->qdisc = child;
+		if (child != &noop_qdisc)
+			qdisc_hash_add(child, true);
 	}
 	q->limit = qopt->limit;
 	if (tb[TCA_TBF_PBURST])
@@ -527,13 +511,9 @@ static struct Qdisc *tbf_leaf(struct Qdisc *sch, unsigned long arg)
 	return q->qdisc;
 }
 
-static unsigned long tbf_get(struct Qdisc *sch, u32 classid)
+static unsigned long tbf_find(struct Qdisc *sch, u32 classid)
 {
 	return 1;
-}
-
-static void tbf_put(struct Qdisc *sch, unsigned long arg)
-{
 }
 
 static void tbf_walk(struct Qdisc *sch, struct qdisc_walker *walker)
@@ -551,8 +531,7 @@ static void tbf_walk(struct Qdisc *sch, struct qdisc_walker *walker)
 static const struct Qdisc_class_ops tbf_class_ops = {
 	.graft		=	tbf_graft,
 	.leaf		=	tbf_leaf,
-	.get		=	tbf_get,
-	.put		=	tbf_put,
+	.find		=	tbf_find,
 	.walk		=	tbf_walk,
 	.dump		=	tbf_dump_class,
 };
@@ -565,7 +544,6 @@ static struct Qdisc_ops tbf_qdisc_ops __read_mostly = {
 	.enqueue	=	tbf_enqueue,
 	.dequeue	=	tbf_dequeue,
 	.peek		=	qdisc_peek_dequeued,
-	.drop		=	tbf_drop,
 	.init		=	tbf_init,
 	.reset		=	tbf_reset,
 	.destroy	=	tbf_destroy,

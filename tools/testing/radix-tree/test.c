@@ -24,14 +24,21 @@ int item_tag_get(struct radix_tree_root *root, unsigned long index, int tag)
 	return radix_tree_tag_get(root, index, tag);
 }
 
-int __item_insert(struct radix_tree_root *root, struct item *item)
+int __item_insert(struct radix_tree_root *root, struct item *item,
+			unsigned order)
 {
-	return radix_tree_insert(root, item->index, item);
+	return __radix_tree_insert(root, item->index, order, item);
 }
 
 int item_insert(struct radix_tree_root *root, unsigned long index)
 {
-	return __item_insert(root, item_create(index));
+	return __item_insert(root, item_create(index), 0);
+}
+
+int item_insert_order(struct radix_tree_root *root, unsigned long index,
+			unsigned order)
+{
+	return __item_insert(root, item_create(index), order);
 }
 
 int item_delete(struct radix_tree_root *root, unsigned long index)
@@ -142,7 +149,7 @@ static int verify_node(struct radix_tree_node *slot, unsigned int tag,
 	int i;
 	int j;
 
-	slot = indirect_to_ptr(slot);
+	slot = entry_to_node(slot);
 
 	/* Verify consistency at this level */
 	for (i = 0; i < RADIX_TREE_TAG_LONGS; i++) {
@@ -186,7 +193,7 @@ static int verify_node(struct radix_tree_node *slot, unsigned int tag,
 void verify_tag_consistency(struct radix_tree_root *root, unsigned int tag)
 {
 	struct radix_tree_node *node = root->rnode;
-	if (!radix_tree_is_indirect_ptr(node))
+	if (!radix_tree_is_internal_node(node))
 		return;
 	verify_node(node, tag, !!root_tag_get(root, tag));
 }
@@ -215,12 +222,12 @@ void tree_verify_min_height(struct radix_tree_root *root, int maxindex)
 {
 	unsigned shift;
 	struct radix_tree_node *node = root->rnode;
-	if (!radix_tree_is_indirect_ptr(node)) {
+	if (!radix_tree_is_internal_node(node)) {
 		assert(maxindex == 0);
 		return;
 	}
 
-	node = indirect_to_ptr(node);
+	node = entry_to_node(node);
 	assert(maxindex <= node_maxindex(node));
 
 	shift = node->shift;

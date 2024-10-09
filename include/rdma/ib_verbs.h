@@ -55,11 +55,15 @@
 #include <net/ip.h>
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/netdevice.h>
 
 #include <linux/if_link.h>
 #include <linux/atomic.h>
 #include <linux/mmu_notifier.h>
 #include <asm/uaccess.h>
+#include <uapi/rdma/ib_user_verbs.h>
+
+#define IB_FW_VERSION_NAME_MAX	ETHTOOL_FWVERS_LEN
 
 extern struct workqueue_struct *ib_wq;
 extern struct workqueue_struct *ib_comp_wq;
@@ -165,7 +169,7 @@ enum ib_device_cap_flags {
 	IB_DEVICE_UD_AV_PORT_ENFORCE		= (1 << 6),
 	IB_DEVICE_CURR_QP_STATE_MOD		= (1 << 7),
 	IB_DEVICE_SHUTDOWN_PORT			= (1 << 8),
-	/* Not in use, former INIT_TYPE		= (1 << 9),*/
+	IB_DEVICE_INIT_TYPE			= (1 << 9),
 	IB_DEVICE_PORT_ACTIVE_EVENT		= (1 << 10),
 	IB_DEVICE_SYS_IMAGE_GUID		= (1 << 11),
 	IB_DEVICE_RC_RNR_NAK_GEN		= (1 << 12),
@@ -565,8 +569,8 @@ struct ib_port_attr {
 	u32			bad_pkey_cntr;
 	u32			qkey_viol_cntr;
 	u16			pkey_tbl_len;
-	u16			lid;
-	u16			sm_lid;
+	u32			sm_lid;
+	u32			lid;
 	u8			lmc;
 	u8			max_vl_num;
 	u8			sm_sl;
@@ -680,6 +684,8 @@ union rdma_network_hdr {
 		struct iphdr	roce4grh;
 	};
 };
+
+#define IB_QPN_MASK		0xFFFFFF
 
 enum {
 	IB_MULTICAST_QPN = 0xffffff
@@ -858,15 +864,39 @@ struct ib_mr_status {
  */
 __attribute_const__ enum ib_rate mult_to_ib_rate(int mult);
 
+enum rdma_ah_attr_type {
+	RDMA_AH_ATTR_TYPE_IB,
+	RDMA_AH_ATTR_TYPE_ROCE,
+	RDMA_AH_ATTR_TYPE_OPA,
+};
+
 struct ib_ah_attr {
-	struct ib_global_route	grh;
 	u16			dlid;
-	u8			sl;
 	u8			src_path_bits;
-	u8			static_rate;
-	u8			ah_flags;
-	u8			port_num;
+};
+
+struct roce_ah_attr {
 	u8			dmac[ETH_ALEN];
+};
+
+struct opa_ah_attr {
+	u32			dlid;
+	u8			src_path_bits;
+	bool			make_grd;
+};
+
+struct rdma_ah_attr {
+	struct ib_global_route	grh;
+	u8			sl;
+	u8			static_rate;
+	u8			port_num;
+	u8			ah_flags;
+	enum rdma_ah_attr_type type;
+	union {
+		struct ib_ah_attr ib;
+		struct roce_ah_attr roce;
+		struct opa_ah_attr opa;
+	};
 };
 
 enum ib_wc_status {
@@ -942,7 +972,7 @@ struct ib_wc {
 	u32			src_qp;
 	int			wc_flags;
 	u16			pkey_index;
-	u16			slid;
+	u32			slid;
 	u8			sl;
 	u8			dlid_path_bits;
 	u8			port_num;	/* valid only for DR SMPs on switches */
@@ -960,8 +990,15 @@ enum ib_cq_notify_flags {
 
 enum ib_srq_type {
 	IB_SRQT_BASIC,
-	IB_SRQT_XRC
+	IB_SRQT_XRC,
+	IB_SRQT_TM,
 };
+
+static inline bool ib_srq_has_cq(enum ib_srq_type srq_type)
+{
+	return srq_type == IB_SRQT_XRC ||
+	       srq_type == IB_SRQT_TM;
+}
 
 enum ib_srq_attr_mask {
 	IB_SRQ_MAX_WR	= 1 << 0,
@@ -980,11 +1017,17 @@ struct ib_srq_init_attr {
 	struct ib_srq_attr	attr;
 	enum ib_srq_type	srq_type;
 
-	union {
-		struct {
-			struct ib_xrcd *xrcd;
-			struct ib_cq   *cq;
-		} xrc;
+	struct {
+		struct ib_cq   *cq;
+		union {
+			struct {
+				struct ib_xrcd *xrcd;
+			} xrc;
+
+			struct {
+				u32		max_num_tags;
+			} tag_matching;
+		};
 	} ext;
 };
 
@@ -1187,8 +1230,8 @@ struct ib_qp_attr {
 	u32			dest_qp_num;
 	int			qp_access_flags;
 	struct ib_qp_cap	cap;
-	struct ib_ah_attr	ah_attr;
-	struct ib_ah_attr	alt_ah_attr;
+	struct rdma_ah_attr	ah_attr;
+	struct rdma_ah_attr	alt_ah_attr;
 	u16			pkey_index;
 	u16			alt_pkey_index;
 	u8			en_sqd_async_notify;
@@ -1382,20 +1425,28 @@ struct ib_fmr_attr {
 
 struct ib_umem;
 
+enum rdma_remove_reason {
+	/* Userspace requested uobject deletion. Call could fail */
+	RDMA_REMOVE_DESTROY,
+	/* Context deletion. This call should delete the actual object itself */
+	RDMA_REMOVE_CLOSE,
+	/* Driver is being hot-unplugged. This call should delete the actual object itself */
+	RDMA_REMOVE_DRIVER_REMOVE,
+	/* Context is being cleaned-up, but commit was just completed */
+	RDMA_REMOVE_DURING_CLEANUP,
+};
+
 struct ib_ucontext {
 	struct ib_device       *device;
-	struct list_head	pd_list;
-	struct list_head	mr_list;
-	struct list_head	mw_list;
-	struct list_head	cq_list;
-	struct list_head	qp_list;
-	struct list_head	srq_list;
-	struct list_head	ah_list;
-	struct list_head	xrcd_list;
-	struct list_head	rule_list;
-	struct list_head	wq_list;
-	struct list_head	rwq_ind_tbl_list;
+	struct ib_uverbs_file  *ufile;
 	int			closing;
+
+	/* locking the uobjects_list */
+	struct mutex		uobjects_lock;
+	struct list_head	uobjects;
+	/* protects cleanup process from other actions */
+	struct rw_semaphore	cleanup_rwsem;
+	enum rdma_remove_reason cleanup_reason;
 
 	struct pid             *tgid;
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
@@ -1423,9 +1474,16 @@ struct ib_uobject {
 	struct list_head	list;		/* link to context's list */
 	int			id;		/* index into kernel idr */
 	struct kref		ref;
-	struct rw_semaphore	mutex;		/* protects .live */
+	atomic_t		usecnt;		/* protects exclusive access */
 	struct rcu_head		rcu;		/* kfree_rcu() overhead */
-	int			live;
+
+	const struct uverbs_obj_type *type;
+};
+
+struct ib_uobject_file {
+	struct ib_uobject	uobj;
+	/* ufile contains the lock between context release and file close */
+	struct ib_uverbs_file	*ufile;
 };
 
 struct ib_udata {
@@ -1463,6 +1521,7 @@ struct ib_ah {
 	struct ib_device	*device;
 	struct ib_pd		*pd;
 	struct ib_uobject	*uobject;
+	enum rdma_ah_attr_type	type;
 };
 
 typedef void (*ib_comp_handler)(struct ib_cq *cq, void *cq_context);
@@ -1498,12 +1557,14 @@ struct ib_srq {
 	enum ib_srq_type	srq_type;
 	atomic_t		usecnt;
 
-	union {
-		struct {
-			struct ib_xrcd *xrcd;
-			struct ib_cq   *cq;
-			u32		srq_num;
-		} xrc;
+	struct {
+		struct ib_cq   *cq;
+		union {
+			struct {
+				struct ib_xrcd *xrcd;
+				u32		srq_num;
+			} xrc;
+		};
 	} ext;
 };
 
@@ -1590,6 +1651,45 @@ struct ib_rwq_ind_table_init_attr {
 	struct ib_wq	**ind_tbl;
 };
 
+enum port_pkey_state {
+	IB_PORT_PKEY_NOT_VALID = 0,
+	IB_PORT_PKEY_VALID = 1,
+	IB_PORT_PKEY_LISTED = 2,
+};
+
+struct ib_qp_security;
+
+struct ib_port_pkey {
+	enum port_pkey_state	state;
+	u16			pkey_index;
+	u8			port_num;
+	struct list_head	qp_list;
+	struct list_head	to_error_list;
+	struct ib_qp_security  *sec;
+};
+
+struct ib_ports_pkeys {
+	struct ib_port_pkey	main;
+	struct ib_port_pkey	alt;
+};
+
+struct ib_qp_security {
+	struct ib_qp	       *qp;
+	struct ib_device       *dev;
+	/* Hold this mutex when changing port and pkey settings. */
+	struct mutex		mutex;
+	struct ib_ports_pkeys  *ports_pkeys;
+	/* A list of all open shared QP handles.  Required to enforce security
+	 * properly for all users of a shared QP.
+	 */
+	struct list_head        shared_qp_list;
+	void                   *security;
+	bool			destroying;
+	atomic_t		error_list_count;
+	struct completion	error_complete;
+	int			error_comps_pending;
+};
+
 /*
  * @max_write_sge: Maximum SGE elements per RDMA WRITE request.
  * @max_read_sge:  Maximum SGE elements per RDMA READ request.
@@ -1619,6 +1719,8 @@ struct ib_qp {
 	u32			max_read_sge;
 	enum ib_qp_type		qp_type;
 	struct ib_rwq_ind_table *rwq_ind_tbl;
+	struct ib_qp_security  *qp_sec;
+	u8			port;
 };
 
 struct ib_mr {
@@ -1866,8 +1968,6 @@ enum ib_mad_result {
 	IB_MAD_RESULT_CONSUMED = 1 << 2  /* Packet consumed: stop processing */
 };
 
-#define IB_DEVICE_NAME_MAX 64
-
 struct ib_port_cache {
 	u64		      subnet_prefix;
 	struct ib_pkey_cache  *pkey;
@@ -1938,7 +2038,45 @@ struct ib_port_immutable {
 	u32                           max_mad_size;
 };
 
+/* rdma netdev type - specifies protocol type */
+enum rdma_netdev_t {
+	RDMA_NETDEV_OPA_VNIC,
+	RDMA_NETDEV_IPOIB,
+};
+
+/**
+ * struct rdma_netdev - rdma netdev
+ * For cases where netstack interfacing is required.
+ */
+struct rdma_netdev {
+	void              *clnt_priv;
+	struct ib_device  *hca;
+	u8                 port_num;
+
+	/* cleanup function must be specified */
+	void (*free_rdma_netdev)(struct net_device *netdev);
+
+	/* control functions */
+	void (*set_id)(struct net_device *netdev, int id);
+	/* send packet */
+	int (*send)(struct net_device *dev, struct sk_buff *skb,
+		    struct ib_ah *address, u32 dqpn);
+	/* multicast */
+	int (*attach_mcast)(struct net_device *dev, struct ib_device *hca,
+			    union ib_gid *gid, u16 mlid,
+			    int set_qkey, u32 qkey);
+	int (*detach_mcast)(struct net_device *dev, struct ib_device *hca,
+			    union ib_gid *gid, u16 mlid);
+};
+
+struct ib_port_pkey_list {
+	/* Lock to hold while modifying the list. */
+	spinlock_t                    list_lock;
+	struct list_head              pkey_list;
+};
+
 struct ib_device {
+	/* Do not access @dma_device directly from ULP nor from HW drivers. */
 	struct device                *dma_device;
 
 	char                          name[IB_DEVICE_NAME_MAX];
@@ -1959,6 +2097,8 @@ struct ib_device {
 	struct ib_port_immutable     *port_immutable;
 
 	int			      num_comp_vectors;
+
+	struct ib_port_pkey_list     *port_pkey_list;
 
 	struct iw_cm_verbs	     *iwcm;
 
@@ -2052,12 +2192,12 @@ struct ib_device {
 					       struct ib_udata *udata);
 	int                        (*dealloc_pd)(struct ib_pd *pd);
 	struct ib_ah *             (*create_ah)(struct ib_pd *pd,
-						struct ib_ah_attr *ah_attr,
+						struct rdma_ah_attr *ah_attr,
 						struct ib_udata *udata);
 	int                        (*modify_ah)(struct ib_ah *ah,
-						struct ib_ah_attr *ah_attr);
+						struct rdma_ah_attr *ah_attr);
 	int                        (*query_ah)(struct ib_ah *ah,
-					       struct ib_ah_attr *ah_attr);
+					       struct rdma_ah_attr *ah_attr);
 	int                        (*destroy_ah)(struct ib_ah *ah);
 	struct ib_srq *            (*create_srq)(struct ib_pd *pd,
 						 struct ib_srq_init_attr *srq_init_attr,
@@ -2188,6 +2328,19 @@ struct ib_device {
 							   struct ib_rwq_ind_table_init_attr *init_attr,
 							   struct ib_udata *udata);
 	int                        (*destroy_rwq_ind_table)(struct ib_rwq_ind_table *wq_ind_table);
+	/**
+	 * rdma netdev operation
+	 *
+	 * Driver implementing alloc_rdma_netdev must return -EOPNOTSUPP if it
+	 * doesn't support the specified rdma netdev type.
+	 */
+	struct net_device *(*alloc_rdma_netdev)(
+					struct ib_device *device,
+					u8 port_num,
+					enum rdma_netdev_t type,
+					const char *name,
+					unsigned char name_assign_type,
+					void (*setup)(struct net_device *));
 	void			   (*drain_rq)(struct ib_qp *qp);
 	void			   (*drain_sq)(struct ib_qp *qp);
 
@@ -2218,6 +2371,8 @@ struct ib_device {
 	struct attribute_group	     *hw_stats_ag;
 	struct rdma_hw_stats         *hw_stats;
 
+	u32                          index;
+
 	/**
 	 * The following mandatory functions are used only at device
 	 * registration.  Keep functions such as these at the end of this
@@ -2225,7 +2380,11 @@ struct ib_device {
 	 * in fast paths.
 	 */
 	int (*get_port_immutable)(struct ib_device *, u8, struct ib_port_immutable *);
-	void (*get_dev_fw_str)(struct ib_device *, char *str, size_t str_len);
+	void (*get_dev_fw_str)(struct ib_device *, char *str);
+	const struct cpumask *(*get_vector_affinity)(struct ib_device *ibdev,
+						     int comp_vector);
+
+	struct uverbs_root_spec		*specs_root;
 };
 
 struct ib_client {
@@ -2261,7 +2420,7 @@ struct ib_client {
 struct ib_device *ib_alloc_device(size_t size);
 void ib_dealloc_device(struct ib_device *device);
 
-void ib_get_device_fw_str(struct ib_device *device, char *str, size_t str_len);
+void ib_get_device_fw_str(struct ib_device *device, char *str);
 
 int ib_register_device(struct ib_device *device,
 		       int (*port_callback)(struct ib_device *,
@@ -2325,8 +2484,8 @@ int ib_modify_qp_is_ok(enum ib_qp_state cur_state, enum ib_qp_state next_state,
 		       enum ib_qp_type type, enum ib_qp_attr_mask mask,
 		       enum rdma_link_layer ll);
 
-int ib_register_event_handler  (struct ib_event_handler *event_handler);
-int ib_unregister_event_handler(struct ib_event_handler *event_handler);
+void ib_register_event_handler(struct ib_event_handler *event_handler);
+void ib_unregister_event_handler(struct ib_event_handler *event_handler);
 void ib_dispatch_event(struct ib_event *event);
 
 int ib_query_port(struct ib_device *device,
@@ -2724,14 +2883,14 @@ struct ib_pd *__ib_alloc_pd(struct ib_device *device, unsigned int flags,
 void ib_dealloc_pd(struct ib_pd *pd);
 
 /**
- * ib_create_ah - Creates an address handle for the given address vector.
+ * rdma_create_ah - Creates an address handle for the given address vector.
  * @pd: The protection domain associated with the address handle.
  * @ah_attr: The attributes of the address vector.
  *
  * The address handle is used to reference a local or global destination
  * in all UD QP post sends.
  */
-struct ib_ah *ib_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr);
+struct ib_ah *rdma_create_ah(struct ib_pd *pd, struct rdma_ah_attr *ah_attr);
 
 /**
  * ib_get_gids_from_rdma_hdr - Get sgid and dgid from GRH or IPv4 header
@@ -2764,7 +2923,7 @@ int ib_get_rdma_header_version(const union rdma_network_hdr *hdr);
  */
 int ib_init_ah_from_wc(struct ib_device *device, u8 port_num,
 		       const struct ib_wc *wc, const struct ib_grh *grh,
-		       struct ib_ah_attr *ah_attr);
+		       struct rdma_ah_attr *ah_attr);
 
 /**
  * ib_create_ah_from_wc - Creates an address handle associated with the
@@ -2782,28 +2941,28 @@ struct ib_ah *ib_create_ah_from_wc(struct ib_pd *pd, const struct ib_wc *wc,
 				   const struct ib_grh *grh, u8 port_num);
 
 /**
- * ib_modify_ah - Modifies the address vector associated with an address
+ * rdma_modify_ah - Modifies the address vector associated with an address
  *   handle.
  * @ah: The address handle to modify.
  * @ah_attr: The new address vector attributes to associate with the
  *   address handle.
  */
-int ib_modify_ah(struct ib_ah *ah, struct ib_ah_attr *ah_attr);
+int rdma_modify_ah(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
 
 /**
- * ib_query_ah - Queries the address vector associated with an address
+ * rdma_query_ah - Queries the address vector associated with an address
  *   handle.
  * @ah: The address handle to query.
  * @ah_attr: The address vector attributes associated with the address
  *   handle.
  */
-int ib_query_ah(struct ib_ah *ah, struct ib_ah_attr *ah_attr);
+int rdma_query_ah(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
 
 /**
- * ib_destroy_ah - Destroys an address handle.
+ * rdma_destroy_ah - Destroys an address handle.
  * @ah: The address handle to destroy.
  */
-int ib_destroy_ah(struct ib_ah *ah);
+int rdma_destroy_ah(struct ib_ah *ah);
 
 /**
  * ib_create_srq - Creates a SRQ associated with the specified protection
@@ -2876,6 +3035,22 @@ static inline int ib_post_srq_recv(struct ib_srq *srq,
  */
 struct ib_qp *ib_create_qp(struct ib_pd *pd,
 			   struct ib_qp_init_attr *qp_init_attr);
+
+/**
+ * ib_modify_qp_with_udata - Modifies the attributes for the specified QP.
+ * @qp: The QP to modify.
+ * @attr: On input, specifies the QP attributes to modify.  On output,
+ *   the current values of selected QP attributes are returned.
+ * @attr_mask: A bit-mask used to specify which attributes of the QP
+ *   are being modified.
+ * @udata: pointer to user's input output buffer information
+ *   are being modified.
+ * It returns 0 on success and returns appropriate error code on error.
+ */
+int ib_modify_qp_with_udata(struct ib_qp *qp,
+			    struct ib_qp_attr *attr,
+			    int attr_mask,
+			    struct ib_udata *udata);
 
 /**
  * ib_modify_qp - Modifies the attributes for the specified QP and then
@@ -3136,24 +3311,6 @@ static inline void ib_dma_unmap_single(struct ib_device *dev,
 		dma_unmap_single(dev->dma_device, addr, size, direction);
 }
 
-static inline u64 ib_dma_map_single_attrs(struct ib_device *dev,
-					  void *cpu_addr, size_t size,
-					  enum dma_data_direction direction,
-					  struct dma_attrs *attrs)
-{
-	return dma_map_single_attrs(dev->dma_device, cpu_addr, size,
-				    direction, attrs);
-}
-
-static inline void ib_dma_unmap_single_attrs(struct ib_device *dev,
-					     u64 addr, size_t size,
-					     enum dma_data_direction direction,
-					     struct dma_attrs *attrs)
-{
-	return dma_unmap_single_attrs(dev->dma_device, addr, size,
-				      direction, attrs);
-}
-
 /**
  * ib_dma_map_page - Map a physical page to DMA address
  * @dev: The device for which the dma_addr is to be created
@@ -3228,12 +3385,7 @@ static inline int ib_dma_map_sg_attrs(struct ib_device *dev,
 				      enum dma_data_direction direction,
 				      struct dma_attrs *attrs)
 {
-	if (dev->dma_ops)
-		return dev->dma_ops->map_sg_attrs(dev, sg, nents, direction,
-						  attrs);
-	else
-		return dma_map_sg_attrs(dev->dma_device, sg, nents, direction,
-					attrs);
+	return dma_map_sg_attrs(dev->dma_device, sg, nents, direction, attrs);
 }
 
 static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
@@ -3241,12 +3393,7 @@ static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
 					 enum dma_data_direction direction,
 					 struct dma_attrs *attrs)
 {
-	if (dev->dma_ops)
-		return dev->dma_ops->unmap_sg_attrs(dev, sg, nents, direction,
-						    attrs);
-	else
-		dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction,
-				   attrs);
+	dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction, attrs);
 }
 /**
  * ib_sg_dma_address - Return the DMA address from a scatter/gather entry
@@ -3529,5 +3676,219 @@ void ib_drain_sq(struct ib_qp *qp);
 void ib_drain_qp(struct ib_qp *qp);
 
 int ib_resolve_eth_dmac(struct ib_device *device,
-			struct ib_ah_attr *ah_attr);
+			struct rdma_ah_attr *ah_attr);
+int ib_get_eth_speed(struct ib_device *dev, u8 port_num, u8 *speed, u8 *width);
+
+static inline u8 *rdma_ah_retrieve_dmac(struct rdma_ah_attr *attr)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_ROCE)
+		return attr->roce.dmac;
+	return NULL;
+}
+
+static inline void rdma_ah_set_dlid(struct rdma_ah_attr *attr, u32 dlid)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
+		attr->ib.dlid = (u16)dlid;
+	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
+		attr->opa.dlid = dlid;
+}
+
+static inline u32 rdma_ah_get_dlid(const struct rdma_ah_attr *attr)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
+		return attr->ib.dlid;
+	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
+		return attr->opa.dlid;
+	return 0;
+}
+
+static inline void rdma_ah_set_sl(struct rdma_ah_attr *attr, u8 sl)
+{
+	attr->sl = sl;
+}
+
+static inline u8 rdma_ah_get_sl(const struct rdma_ah_attr *attr)
+{
+	return attr->sl;
+}
+
+static inline void rdma_ah_set_path_bits(struct rdma_ah_attr *attr,
+					 u8 src_path_bits)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
+		attr->ib.src_path_bits = src_path_bits;
+	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
+		attr->opa.src_path_bits = src_path_bits;
+}
+
+static inline u8 rdma_ah_get_path_bits(const struct rdma_ah_attr *attr)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
+		return attr->ib.src_path_bits;
+	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
+		return attr->opa.src_path_bits;
+	return 0;
+}
+
+static inline void rdma_ah_set_make_grd(struct rdma_ah_attr *attr,
+					bool make_grd)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
+		attr->opa.make_grd = make_grd;
+}
+
+static inline bool rdma_ah_get_make_grd(const struct rdma_ah_attr *attr)
+{
+	if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
+		return attr->opa.make_grd;
+	return false;
+}
+
+static inline void rdma_ah_set_port_num(struct rdma_ah_attr *attr, u8 port_num)
+{
+	attr->port_num = port_num;
+}
+
+static inline u8 rdma_ah_get_port_num(const struct rdma_ah_attr *attr)
+{
+	return attr->port_num;
+}
+
+static inline void rdma_ah_set_static_rate(struct rdma_ah_attr *attr,
+					   u8 static_rate)
+{
+	attr->static_rate = static_rate;
+}
+
+static inline u8 rdma_ah_get_static_rate(const struct rdma_ah_attr *attr)
+{
+	return attr->static_rate;
+}
+
+static inline void rdma_ah_set_ah_flags(struct rdma_ah_attr *attr,
+					enum ib_ah_flags flag)
+{
+	attr->ah_flags = flag;
+}
+
+static inline enum ib_ah_flags
+		rdma_ah_get_ah_flags(const struct rdma_ah_attr *attr)
+{
+	return attr->ah_flags;
+}
+
+static inline const struct ib_global_route
+		*rdma_ah_read_grh(const struct rdma_ah_attr *attr)
+{
+	return &attr->grh;
+}
+
+/*To retrieve and modify the grh */
+static inline struct ib_global_route
+		*rdma_ah_retrieve_grh(struct rdma_ah_attr *attr)
+{
+	return &attr->grh;
+}
+
+static inline void rdma_ah_set_dgid_raw(struct rdma_ah_attr *attr, void *dgid)
+{
+	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
+
+	memcpy(grh->dgid.raw, dgid, sizeof(grh->dgid));
+}
+
+static inline void rdma_ah_set_subnet_prefix(struct rdma_ah_attr *attr,
+					     __be64 prefix)
+{
+	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
+
+	grh->dgid.global.subnet_prefix = prefix;
+}
+
+static inline void rdma_ah_set_interface_id(struct rdma_ah_attr *attr,
+					    __be64 if_id)
+{
+	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
+
+	grh->dgid.global.interface_id = if_id;
+}
+
+static inline void rdma_ah_set_grh(struct rdma_ah_attr *attr,
+				   union ib_gid *dgid, u32 flow_label,
+				   u8 sgid_index, u8 hop_limit,
+				   u8 traffic_class)
+{
+	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
+
+	attr->ah_flags = IB_AH_GRH;
+	if (dgid)
+		grh->dgid = *dgid;
+	grh->flow_label = flow_label;
+	grh->sgid_index = sgid_index;
+	grh->hop_limit = hop_limit;
+	grh->traffic_class = traffic_class;
+}
+
+/*Get AH type */
+static inline enum rdma_ah_attr_type rdma_ah_find_type(struct ib_device *dev,
+						       u32 port_num)
+{
+	if ((rdma_protocol_roce(dev, port_num)) ||
+	    (rdma_protocol_iwarp(dev, port_num)))
+		return RDMA_AH_ATTR_TYPE_ROCE;
+	else if ((rdma_protocol_ib(dev, port_num)) &&
+		 (rdma_cap_opa_ah(dev, port_num)))
+		return RDMA_AH_ATTR_TYPE_OPA;
+	else
+		return RDMA_AH_ATTR_TYPE_IB;
+}
+
+/**
+ * ib_lid_cpu16 - Return lid in 16bit CPU encoding.
+ *     In the current implementation the only way to get
+ *     get the 32bit lid is from other sources for OPA.
+ *     For IB, lids will always be 16bits so cast the
+ *     value accordingly.
+ *
+ * @lid: A 32bit LID
+ */
+static inline u16 ib_lid_cpu16(u32 lid)
+{
+	WARN_ON_ONCE(lid & 0xFFFF0000);
+	return (u16)lid;
+}
+
+/**
+ * ib_lid_be16 - Return lid in 16bit BE encoding.
+ *
+ * @lid: A 32bit LID
+ */
+static inline __be16 ib_lid_be16(u32 lid)
+{
+	WARN_ON_ONCE(lid & 0xFFFF0000);
+	return cpu_to_be16((u16)lid);
+}
+
+/**
+ * ib_get_vector_affinity - Get the affinity mappings of a given completion
+ *   vector
+ * @device:         the rdma device
+ * @comp_vector:    index of completion vector
+ *
+ * Returns NULL on failure, otherwise a corresponding cpu map of the
+ * completion vector (returns all-cpus map if the device driver doesn't
+ * implement get_vector_affinity).
+ */
+static inline const struct cpumask *
+ib_get_vector_affinity(struct ib_device *device, int comp_vector)
+{
+	if (comp_vector < 0 || comp_vector >= device->num_comp_vectors ||
+	    !device->get_vector_affinity)
+		return NULL;
+
+	return device->get_vector_affinity(device, comp_vector);
+
+}
+
 #endif /* IB_VERBS_H */

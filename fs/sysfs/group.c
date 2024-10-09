@@ -18,7 +18,7 @@
 #include "sysfs.h"
 
 
-static void remove_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
+static void remove_files(struct kernfs_node *parent,
 			 const struct attribute_group *grp)
 {
 	struct attribute *const *attr;
@@ -26,13 +26,13 @@ static void remove_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
 
 	if (grp->attrs)
 		for (attr = grp->attrs; *attr; attr++)
-			sysfs_hash_and_remove(dir_sd, NULL, (*attr)->name);
+			kernfs_remove_by_name(parent, (*attr)->name);
 	if (grp->bin_attrs)
 		for (bin_attr = grp->bin_attrs; *bin_attr; bin_attr++)
-			sysfs_remove_bin_file(kobj, *bin_attr);
+			kernfs_remove_by_name(parent, (*bin_attr)->attr.name);
 }
 
-static int create_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
+static int create_files(struct kernfs_node *parent, struct kobject *kobj,
 			const struct attribute_group *grp, int update)
 {
 	struct attribute *const *attr;
@@ -41,7 +41,7 @@ static int create_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
 
 	if (grp->attrs) {
 		for (i = 0, attr = grp->attrs; *attr && !error; i++, attr++) {
-			umode_t mode = 0;
+			umode_t mode = (*attr)->mode;
 
 			/*
 			 * In update mode, we're changing the permissions or
@@ -49,21 +49,19 @@ static int create_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
 			 * re-adding (if required) the file.
 			 */
 			if (update)
-				sysfs_hash_and_remove(dir_sd, NULL,
-						      (*attr)->name);
+				kernfs_remove_by_name(parent, (*attr)->name);
 			if (grp->is_visible) {
 				mode = grp->is_visible(kobj, *attr, i);
 				if (!mode)
 					continue;
 			}
-			error = sysfs_add_file_mode(dir_sd, *attr,
-						    SYSFS_KOBJ_ATTR,
-						    (*attr)->mode | mode);
+			error = sysfs_add_file_mode_ns(parent, *attr, false,
+						       mode, NULL);
 			if (unlikely(error))
 				break;
 		}
 		if (error) {
-			remove_files(dir_sd, kobj, grp);
+			remove_files(parent, grp);
 			goto exit;
 		}
 	}
@@ -80,7 +78,7 @@ static int create_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
 				break;
 		}
 		if (error)
-			remove_files(dir_sd, kobj, grp);
+			remove_files(parent, grp);
 	}
 exit:
 	return error;
@@ -90,7 +88,7 @@ exit:
 static int internal_create_group(struct kobject *kobj, int update,
 				 const struct attribute_group *grp)
 {
-	struct sysfs_dirent *sd;
+	struct kernfs_node *kn;
 	int error;
 
 	BUG_ON(!kobj || (!update && !kobj->sd));
@@ -104,18 +102,22 @@ static int internal_create_group(struct kobject *kobj, int update,
 		return -EINVAL;
 	}
 	if (grp->name) {
-		error = sysfs_create_subdir(kobj, grp->name, &sd);
-		if (error)
-			return error;
+		kn = kernfs_create_dir(kobj->sd, grp->name,
+				       S_IRWXU | S_IRUGO | S_IXUGO, kobj);
+		if (IS_ERR(kn)) {
+			if (PTR_ERR(kn) == -EEXIST)
+				sysfs_warn_dup(kobj->sd, grp->name);
+			return PTR_ERR(kn);
+		}
 	} else
-		sd = kobj->sd;
-	sysfs_get(sd);
-	error = create_files(sd, kobj, grp, update);
+		kn = kobj->sd;
+	kernfs_get(kn);
+	error = create_files(kn, kobj, grp, update);
 	if (error) {
 		if (grp->name)
-			sysfs_remove_subdir(sd);
+			kernfs_remove(kn);
 	}
-	sysfs_put(sd);
+	kernfs_put(kn);
 	return error;
 }
 
@@ -205,25 +207,28 @@ EXPORT_SYMBOL_GPL(sysfs_update_group);
 void sysfs_remove_group(struct kobject *kobj,
 			const struct attribute_group *grp)
 {
-	struct sysfs_dirent *dir_sd = kobj->sd;
-	struct sysfs_dirent *sd;
+	struct kernfs_node *parent = kobj->sd;
+	struct kernfs_node *kn;
 
 	if (grp->name) {
-		sd = sysfs_get_dirent(dir_sd, NULL, grp->name);
-		if (!sd) {
-			WARN(!sd, KERN_WARNING
+		kn = kernfs_find_and_get(parent, grp->name);
+		if (!kn) {
+			WARN(atomic_read(&parent->active) != KN_DEACTIVATED_BIAS,
+			     KERN_WARNING
 			     "sysfs group %p not found for kobject '%s'\n",
 			     grp, kobject_name(kobj));
 			return;
 		}
-	} else
-		sd = sysfs_get(dir_sd);
+	} else {
+		kn = parent;
+		kernfs_get(kn);
+	}
 
-	remove_files(sd, kobj, grp);
+	remove_files(kn, grp);
 	if (grp->name)
-		sysfs_remove_subdir(sd);
+		kernfs_remove(kn);
 
-	sysfs_put(sd);
+	kernfs_put(kn);
 }
 EXPORT_SYMBOL_GPL(sysfs_remove_group);
 
@@ -259,22 +264,22 @@ EXPORT_SYMBOL_GPL(sysfs_remove_groups);
 int sysfs_merge_group(struct kobject *kobj,
 		       const struct attribute_group *grp)
 {
-	struct sysfs_dirent *dir_sd;
+	struct kernfs_node *parent;
 	int error = 0;
 	struct attribute *const *attr;
 	int i;
 
-	dir_sd = sysfs_get_dirent(kobj->sd, NULL, grp->name);
-	if (!dir_sd)
+	parent = kernfs_find_and_get(kobj->sd, grp->name);
+	if (!parent)
 		return -ENOENT;
 
 	for ((i = 0, attr = grp->attrs); *attr && !error; (++i, ++attr))
-		error = sysfs_add_file(dir_sd, *attr, SYSFS_KOBJ_ATTR);
+		error = sysfs_add_file(parent, *attr, false);
 	if (error) {
 		while (--i >= 0)
-			sysfs_hash_and_remove(dir_sd, NULL, (*--attr)->name);
+			kernfs_remove_by_name(parent, (*--attr)->name);
 	}
-	sysfs_put(dir_sd);
+	kernfs_put(parent);
 
 	return error;
 }
@@ -288,14 +293,14 @@ EXPORT_SYMBOL_GPL(sysfs_merge_group);
 void sysfs_unmerge_group(struct kobject *kobj,
 		       const struct attribute_group *grp)
 {
-	struct sysfs_dirent *dir_sd;
+	struct kernfs_node *parent;
 	struct attribute *const *attr;
 
-	dir_sd = sysfs_get_dirent(kobj->sd, NULL, grp->name);
-	if (dir_sd) {
+	parent = kernfs_find_and_get(kobj->sd, grp->name);
+	if (parent) {
 		for (attr = grp->attrs; *attr; ++attr)
-			sysfs_hash_and_remove(dir_sd, NULL, (*attr)->name);
-		sysfs_put(dir_sd);
+			kernfs_remove_by_name(parent, (*attr)->name);
+		kernfs_put(parent);
 	}
 }
 EXPORT_SYMBOL_GPL(sysfs_unmerge_group);
@@ -310,15 +315,15 @@ EXPORT_SYMBOL_GPL(sysfs_unmerge_group);
 int sysfs_add_link_to_group(struct kobject *kobj, const char *group_name,
 			    struct kobject *target, const char *link_name)
 {
-	struct sysfs_dirent *dir_sd;
+	struct kernfs_node *parent;
 	int error = 0;
 
-	dir_sd = sysfs_get_dirent(kobj->sd, NULL, group_name);
-	if (!dir_sd)
+	parent = kernfs_find_and_get(kobj->sd, group_name);
+	if (!parent)
 		return -ENOENT;
 
-	error = sysfs_create_link_sd(dir_sd, target, link_name);
-	sysfs_put(dir_sd);
+	error = sysfs_create_link_sd(parent, target, link_name);
+	kernfs_put(parent);
 
 	return error;
 }
@@ -333,12 +338,12 @@ EXPORT_SYMBOL_GPL(sysfs_add_link_to_group);
 void sysfs_remove_link_from_group(struct kobject *kobj, const char *group_name,
 				  const char *link_name)
 {
-	struct sysfs_dirent *dir_sd;
+	struct kernfs_node *parent;
 
-	dir_sd = sysfs_get_dirent(kobj->sd, NULL, group_name);
-	if (dir_sd) {
-		sysfs_hash_and_remove(dir_sd, NULL, link_name);
-		sysfs_put(dir_sd);
+	parent = kernfs_find_and_get(kobj->sd, group_name);
+	if (parent) {
+		kernfs_remove_by_name(parent, link_name);
+		kernfs_put(parent);
 	}
 }
 EXPORT_SYMBOL_GPL(sysfs_remove_link_from_group);
@@ -346,68 +351,43 @@ EXPORT_SYMBOL_GPL(sysfs_remove_link_from_group);
 /**
  * __compat_only_sysfs_link_entry_to_kobj - add a symlink to a kobject pointing
  * to a group or an attribute
- * @kobj:		The kobject to add link to.
- * @target_kobj:	The target kobject containing group to be linked.
+ * @kobj:		The kobject containing the group.
+ * @target_kobj:	The target kobject.
  * @target_name:	The name of the target group or attribute.
  */
 int __compat_only_sysfs_link_entry_to_kobj(struct kobject *kobj,
 				      struct kobject *target_kobj,
 				      const char *target_name)
 {
-	struct sysfs_dirent *target, *entry, *link;
-	struct sysfs_addrm_cxt acxt;
-	enum kobj_ns_type ns_type;
-	int rc;
+	struct kernfs_node *target;
+	struct kernfs_node *entry;
+	struct kernfs_node *link;
 
 	/*
 	 * We don't own @target_kobj and it may be removed at any time.
-	 * Synchronize using sysfs_assoc_lock.
+	 * Synchronize using sysfs_symlink_target_lock. See sysfs_remove_dir()
+	 * for details.
 	 */
-	spin_lock(&sysfs_assoc_lock);
+	spin_lock(&sysfs_symlink_target_lock);
 	target = target_kobj->sd;
 	if (target)
-		sysfs_get(target_kobj->sd);
-	spin_unlock(&sysfs_assoc_lock);
+		kernfs_get(target);
+	spin_unlock(&sysfs_symlink_target_lock);
 	if (!target)
 		return -ENOENT;
 
-	entry = sysfs_get_dirent(target_kobj->sd, NULL, target_name);
+	entry = kernfs_find_and_get(target_kobj->sd, target_name);
 	if (!entry) {
-		sysfs_put(target);
+		kernfs_put(target);
 		return -ENOENT;
 	}
 
-	link = sysfs_new_dirent(target_name, S_IFLNK|S_IRWXUGO, SYSFS_KOBJ_LINK);
-	if (!link) {
-		sysfs_put(entry);
-		sysfs_put(target);
-		return -ENOMEM;
-	}
+	link = kernfs_create_link(kobj->sd, target_name, entry);
+	if (IS_ERR(link) && PTR_ERR(link) == -EEXIST)
+		sysfs_warn_dup(kobj->sd, target_name);
 
-	ns_type = sysfs_ns_type(kobj->sd);
-	if (ns_type)
-		link->s_ns = target_kobj->ktype->namespace(target_kobj);
-	link->s_symlink.target_sd = entry;
-
-	sysfs_addrm_start(&acxt, kobj->sd);
-	if (!ns_type ||
-	    (ns_type == sysfs_ns_type(link->s_symlink.target_sd->s_parent))) {
-		rc = sysfs_add_one(&acxt, link);
-	} else {
-		rc = -EINVAL;
-		WARN(1, KERN_WARNING
-		     "sysfs: symlink across ns_types %s/%s -> %s/%s\n",
-		     kobj->sd->s_name,
-		     link->s_name,
-		     link->s_symlink.target_sd->s_parent->s_name,
-		     link->s_symlink.target_sd->s_name);
-	}
-	sysfs_addrm_finish(&acxt);
-
-	if (rc)
-		sysfs_put(link);
-
-	sysfs_put(target);
-	return rc;
+	kernfs_put(entry);
+	kernfs_put(target);
+	return IS_ERR(link) ? PTR_ERR(link) : 0;
 }
 EXPORT_SYMBOL_GPL(__compat_only_sysfs_link_entry_to_kobj);

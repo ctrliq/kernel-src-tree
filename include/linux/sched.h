@@ -962,6 +962,8 @@ static inline int cpu_numa_flags(void)
 }
 #endif
 
+extern int arch_asym_cpu_priority(int cpu);
+
 struct sched_domain_attr {
 	int relax_domain_level;
 };
@@ -1347,6 +1349,8 @@ struct task_struct {
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
 	struct hlist_head preempt_notifiers;
+#elif defined(CONFIG_S390)
+	RH_KABI_DEPRECATE(struct hlist_head, preempt_notifiers)
 #endif
 
 	/*
@@ -1763,13 +1767,21 @@ struct task_struct {
 #endif
 	/* This would be in rss_stat[MM_SHMEMPAGES] if not for kABI */
 	RH_KABI_USE(4, int mm_shmempages)
-#ifdef CONFIG_INTEL_RDT_A
-	RH_KABI_USE(5, int closid)
+#ifdef CONFIG_INTEL_RDT
+	RH_KABI_USE(5, u32 closid)
 #else
 	RH_KABI_RESERVE(5)
 #endif
+#ifdef CONFIG_LIVEPATCH
+	RH_KABI_USE(6, int patch_state)
+#else
 	RH_KABI_RESERVE(6)
+#endif
+#ifdef CONFIG_INTEL_RDT
+	RH_KABI_USE(7, u32 rmid)
+#else
 	RH_KABI_RESERVE(7)
+#endif
 	RH_KABI_RESERVE(8)
 #ifndef __GENKSYMS__
 #ifdef CONFIG_MEMCG
@@ -2098,6 +2110,7 @@ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, 
 #define used_math() tsk_used_math(current)
 
 /* Per-process atomic flags. */
+#define PFA_NO_NEW_PRIVS 0	/* May not gain new privileges. */
 #define PFA_SPREAD_PAGE  1      /* Spread page cache over cpuset */
 #define PFA_SPREAD_SLAB  2      /* Spread some slab caches over cpuset */
 
@@ -2110,6 +2123,9 @@ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, 
 #define TASK_PFA_CLEAR(name, func)                                     \
        static inline void task_clear_##func(struct task_struct *p)     \
        { clear_bit(PFA_##name, &p->atomic_flags); }
+
+TASK_PFA_TEST(NO_NEW_PRIVS, no_new_privs)
+TASK_PFA_SET(NO_NEW_PRIVS, no_new_privs)
 
 TASK_PFA_TEST(SPREAD_PAGE, spread_page)
 TASK_PFA_SET(SPREAD_PAGE, spread_page)
@@ -2892,7 +2908,7 @@ static inline int signal_pending_state(long state, struct task_struct *p)
 	return (state & TASK_INTERRUPTIBLE) || __fatal_signal_pending(p);
 }
 
-static inline int need_resched(void)
+static __always_inline int need_resched(void)
 {
 	return unlikely(test_thread_flag(TIF_NEED_RESCHED));
 }
@@ -3206,5 +3222,14 @@ static inline unsigned long rlimit_max(unsigned int limit)
 {
 	return task_rlimit_max(current, limit);
 }
+
+#ifdef CONFIG_CPU_FREQ
+struct update_util_data {
+	void (*func)(struct update_util_data *data,
+		     u64 time, unsigned long util, unsigned long max);
+};
+
+void cpufreq_set_update_util_data(int cpu, struct update_util_data *data);
+#endif /* CONFIG_CPU_FREQ */
 
 #endif

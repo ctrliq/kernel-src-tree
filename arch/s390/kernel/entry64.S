@@ -42,9 +42,10 @@ STACK_SIZE  = 1 << STACK_SHIFT
 STACK_INIT = STACK_SIZE - STACK_FRAME_OVERHEAD - __PT_SIZE
 
 _TIF_WORK_SVC = (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
-		 _TIF_MCCK_PENDING | _TIF_PER_TRAP | _TIF_ASCE | _TIF_UPROBE)
+		 _TIF_MCCK_PENDING | _TIF_PER_TRAP | _TIF_ASCE | \
+		 _TIF_UPROBE | _TIF_GUARDED_STORAGE)
 _TIF_WORK_INT = (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
-		 _TIF_MCCK_PENDING | _TIF_ASCE)
+		 _TIF_MCCK_PENDING | _TIF_ASCE | _TIF_GUARDED_STORAGE)
 _TIF_TRACE    = (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | _TIF_SECCOMP | \
 		 _TIF_SYSCALL_TRACEPOINT)
 
@@ -158,7 +159,40 @@ _TIF_TRACE    = (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | _TIF_SECCOMP | \
 #endif
 	.endm
 
+	.macro BPOFF
+	.pushsection .altinstr_replacement, "ax"
+660:	.long	0xb2e8c000
+	.popsection
+661:	.long	0x47000000
+	.pushsection .altnobp, "a"
+        .long 661b - .
+	.long 660b - .
+	.word 82
+	.byte 4
+	.byte 4
+	.popsection
+	.endm
+
+	.macro BPON
+	.pushsection .altinstr_replacement, "ax"
+662:	.long	0xb2e8d000
+	.popsection
+663:	.long	0x47000000
+	.pushsection .altnobp, "a"
+        .long 663b - .
+	.long 662b - .
+	.word 82
+	.byte 4
+	.byte 4
+	.popsection
+	.endm
+
 	.section .kprobes.text, "ax"
+
+ENTRY(__bpon)
+	.globl __bpon
+	BPON
+	br	%r14
 
 /*
  * Scheduler resume function, called by switch_to
@@ -201,6 +235,7 @@ ENTRY(system_call)
 	stpt	__LC_SYNC_ENTER_TIMER
 sysc_stmg:
 	stmg	%r8,%r15,__LC_SAVE_AREA_SYNC
+	BPOFF
 	lg	%r10,__LC_LAST_BREAK
 	lg	%r12,__LC_THREAD_INFO
 sysc_per:
@@ -214,7 +249,7 @@ sysc_vtime:
 	mvc	__PT_PSW(16,%r11),__LC_SVC_OLD_PSW
 	mvc	__PT_INT_CODE(4,%r11),__LC_SVC_ILC
 sysc_do_svc:
-	oi	__TI_flags+7(%r12),_TIF_SYSCALL
+	oi	__TI_flags+6(%r12),_TIF_SYSCALL>>8
 	lg	%r10,__TI_sysc_table(%r12)	# address of system call table
 	llgh	%r8,__PT_INT_CODE+2(%r11)
 	slag	%r8,%r8,2			# shift and test for svc 0
@@ -242,7 +277,8 @@ sysc_tif:
 	jno	sysc_restore
 	tm	__TI_flags+7(%r12),_TIF_WORK_SVC
 	jnz	sysc_work			# check for work
-	ni	__TI_flags+7(%r12),255-_TIF_SYSCALL
+	ni	__TI_flags+6(%r12),255-_TIF_SYSCALL>>8
+	BPON
 sysc_restore:
 	lg	%r14,__LC_VDSO_PER_CPU
 	lmg	%r0,%r10,__PT_R0(%r11)
@@ -265,6 +301,8 @@ sysc_work:
 	tm	__TI_flags+7(%r12),_TIF_UPROBE
 	jo	sysc_uprobe_notify
 #endif
+	tm	__TI_flags+7(%r12),_TIF_GUARDED_STORAGE
+	jo	sysc_guarded_storage
 	tm	__TI_flags+7(%r12),_TIF_PER_TRAP
 	jo	sysc_singlestep
 	tm	__TI_flags+7(%r12),_TIF_SIGPENDING
@@ -303,16 +341,12 @@ sysc_uaccess:
 sysc_sigpending:
 	lgr	%r2,%r11		# pass pointer to pt_regs
 	brasl	%r14,do_signal
-	tm	__TI_flags+7(%r12),_TIF_SYSCALL
+	tm	__TI_flags+6(%r12),_TIF_SYSCALL>>8
 	jno	sysc_return
+sysc_do_syscall:
 	lmg	%r2,%r7,__PT_R2(%r11)	# load svc arguments
-	lg	%r10,__TI_sysc_table(%r12)	# address of system call table
-	lghi	%r8,0			# svc 0 returns -ENOSYS
-	llgh	%r1,__PT_INT_CODE+2(%r11)	# load new svc number
-	cghi	%r1,NR_syscalls
-	jnl	sysc_nr_ok		# invalid svc number -> do svc 0
-	slag	%r8,%r1,2
-	j	sysc_nr_ok		# restart svc
+	lghi	%r1,0			# svc 0 returns -ENOSYS
+	j	sysc_do_svc
 
 #
 # _TIF_NOTIFY_RESUME is set, call do_notify_resume
@@ -330,6 +364,14 @@ sysc_uprobe_notify:
 	larl	%r14,sysc_return
 	jg	uprobe_notify_resume
 #endif
+
+#
+# _TIF_GUARDED_STORAGE is set, call guarded_storage_load
+#
+sysc_guarded_storage:
+	lgr	%r2,%r11		# pass pointer to pt_regs
+	larl	%r14,sysc_return
+	jg	gs_load_bc_cb
 
 #
 # _TIF_PER_TRAP is set, call do_per_trap
@@ -392,6 +434,7 @@ ENTRY(kernel_thread_starter)
 
 ENTRY(pgm_check_handler)
 	stpt	__LC_SYNC_ENTER_TIMER
+	BPOFF
 	stmg	%r8,%r15,__LC_SAVE_AREA_SYNC
 	lg	%r10,__LC_LAST_BREAK
 	lg	%r12,__LC_THREAD_INFO
@@ -436,11 +479,17 @@ ENTRY(pgm_check_handler)
 	llgh	%r10,__PT_INT_CODE+2(%r11)
 	nill	%r10,0x007f
 	sll	%r10,2
-	je	sysc_return
+	je	pgm_exit
 	lgf	%r1,0(%r10,%r1)		# load address of handler routine
 	lgr	%r2,%r11		# pass pointer to pt_regs
 	basr	%r14,%r1		# branch to interrupt-handler
-	j	sysc_return
+pgm_exit:
+	LOCKDEP_SYS_EXIT
+	tm	__PT_PSW+1(%r11),0x01	# returning to user ?
+	jno	sysc_restore
+	tm	__TI_flags+6(%r12),_TIF_SYSCALL>>8
+	jo	sysc_do_syscall
+	j	sysc_tif
 
 #
 # PER event in supervisor state, must be kprobes
@@ -450,7 +499,7 @@ pgm_kprobe:
 	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
 	lgr	%r2,%r11		# pass pointer to pt_regs
 	brasl	%r14,do_per_trap
-	j	sysc_return
+	j	pgm_exit
 
 #
 # single stepped system call
@@ -468,6 +517,7 @@ pgm_svcper:
 ENTRY(io_int_handler)
 	STCK	__LC_INT_CLOCK
 	stpt	__LC_ASYNC_ENTER_TIMER
+	BPOFF
 	stmg	%r8,%r15,__LC_SAVE_AREA_ASYNC
 	lg	%r10,__LC_LAST_BREAK
 	lg	%r12,__LC_THREAD_INFO
@@ -497,8 +547,12 @@ io_restore:
 	lg	%r14,__LC_VDSO_PER_CPU
 	lmg	%r0,%r10,__PT_R0(%r11)
 	mvc	__LC_RETURN_PSW(16),__PT_PSW(%r11)
+	tm	__PT_PSW+1(%r11),0x01	# returning to user ?
+	jno	io_exit_kernel
+	BPON
 	stpt	__LC_EXIT_TIMER
 	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
+io_exit_kernel:
 	lmg	%r11,%r15,__PT_R11(%r11)
 	lpswe	__LC_RETURN_PSW
 io_done:
@@ -561,6 +615,8 @@ io_work_tif:
 	jo	io_sigpending
 	tm	__TI_flags+7(%r12),_TIF_NOTIFY_RESUME
 	jo	io_notify_resume
+	tm	__TI_flags+7(%r12),_TIF_GUARDED_STORAGE
+	jo	io_guarded_storage
 	tm	__TI_flags+7(%r12),_TIF_ASCE
 	jo	io_uaccess
 	j	io_return		# beware of critical section cleanup
@@ -580,6 +636,18 @@ io_mcck_pending:
 io_uaccess:
 	ni	__TI_flags+7(%r12),255-_TIF_ASCE
 	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
+	j	io_return
+
+#
+# _TIF_GUARDED_STORAGE is set, call guarded_storage_load
+#
+io_guarded_storage:
+	# TRACE_IRQS_ON already done at .Lio_return
+	ssm	__LC_SVC_NEW_PSW	# reenable interrupts
+	lgr	%r2,%r11		# pass pointer to pt_regs
+	brasl	%r14,gs_load_bc_cb
+	ssm	__LC_PGM_NEW_PSW	# disable I/O and ext. interrupts
+	TRACE_IRQS_OFF
 	j	io_return
 
 #
@@ -623,6 +691,7 @@ io_notify_resume:
 ENTRY(ext_int_handler)
 	STCK	__LC_INT_CLOCK
 	stpt	__LC_ASYNC_ENTER_TIMER
+	BPOFF
 	stmg	%r8,%r15,__LC_SAVE_AREA_ASYNC
 	lg	%r10,__LC_LAST_BREAK
 	lg	%r12,__LC_THREAD_INFO
@@ -663,6 +732,7 @@ ENTRY(psw_idle)
 	.insn	rsy,0xeb0000000017,%r1,5,__SF_EMPTY+16(%r15)
 .Lpsw_idle_stcctm:
 #endif
+	BPON
 	STCK	__CLOCK_IDLE_ENTER(%r2)
 	stpt	__TIMER_IDLE_ENTER(%r2)
 psw_idle_lpsw:
@@ -677,6 +747,7 @@ __critical_end:
  */
 ENTRY(mcck_int_handler)
 	STCK	__LC_MCCK_CLOCK
+	BPOFF
 	la	%r1,4095		# revalidate r1
 	spt	__LC_CPU_TIMER_SAVE_AREA-4095(%r1)	# revalidate cpu timer
 	lmg	%r0,%r15,__LC_GPREGS_SAVE_AREA-4095(%r1)# revalidate gprs
@@ -737,6 +808,7 @@ mcck_return:
 	mvc	__LC_RETURN_MCCK_PSW(16),__PT_PSW(%r11) # move return PSW
 	tm	__LC_RETURN_MCCK_PSW+1,0x01 # returning to user ?
 	jno	0f
+	BPON
 	stpt	__LC_EXIT_TIMER
 	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
 0:	lmg	%r11,%r15,__PT_R11(%r11)
@@ -1011,9 +1083,12 @@ sie_gmap:
 	lg	%r14,__SF_EMPTY(%r15)		# get control block pointer
 	oi	__SIE_PROG0C+3(%r14),1		# we are going into SIE now
 	tm	__SIE_PROG20+3(%r14),1		# last exit...
-	jnz	sie_done
+	jnz	sie_skip
+	BPON
 	sie	0(%r14)
 sie_done:
+	BPOFF
+sie_skip:
 	ni	__SIE_PROG0C+3(%r14),0xfe	# no longer in SIE
 	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
 # some program checks are suppressing. C code (e.g. do_protection_exception)

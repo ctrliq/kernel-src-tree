@@ -16,6 +16,9 @@
 #define NF_LOG_PREFIXLEN		128
 #define NFLOGGER_NAME_LEN		64
 
+int sysctl_nf_log_all_netns __read_mostly;
+EXPORT_SYMBOL(sysctl_nf_log_all_netns);
+
 static struct nf_logger __rcu *loggers[NFPROTO_NUMPROTO][NF_LOG_TYPE_MAX] __read_mostly;
 static DEFINE_MUTEX(nf_log_mutex);
 
@@ -74,6 +77,7 @@ EXPORT_SYMBOL(nf_log_unset);
 /* return EEXIST if the same logger is registered, 0 on success. */
 int nf_log_register(u_int8_t pf, struct nf_logger *logger)
 {
+	struct nf_logger *existing;
 	int i;
 	int ret = 0;
 
@@ -84,7 +88,8 @@ int nf_log_register(u_int8_t pf, struct nf_logger *logger)
 
 	if (pf == NFPROTO_UNSPEC) {
 		for (i = NFPROTO_UNSPEC; i < NFPROTO_NUMPROTO; i++) {
-			if (rcu_access_pointer(loggers[i][logger->type])) {
+			existing = rcu_access_pointer(loggers[i][logger->type]);
+			if (existing) {
 				ret = -EEXIST;
 				goto unlock;
 			}
@@ -92,7 +97,8 @@ int nf_log_register(u_int8_t pf, struct nf_logger *logger)
 		for (i = NFPROTO_UNSPEC; i < NFPROTO_NUMPROTO; i++)
 			rcu_assign_pointer(loggers[i][logger->type], logger);
 	} else {
-		if (rcu_access_pointer(loggers[pf][logger->type])) {
+		existing = rcu_access_pointer(loggers[pf][logger->type]);
+		if (existing) {
 			ret = -EEXIST;
 			goto unlock;
 		}
@@ -100,6 +106,10 @@ int nf_log_register(u_int8_t pf, struct nf_logger *logger)
 	}
 
 unlock:
+	if (ret == -EEXIST)
+		pr_err("nf_log: can't load %s, conflicting %s already loaded\n",
+		       logger->name, existing->name);
+
 	mutex_unlock(&nf_log_mutex);
 	return ret;
 }
@@ -391,6 +401,18 @@ static const struct file_operations nflog_file_ops = {
 #ifdef CONFIG_SYSCTL
 static char nf_log_sysctl_fnames[NFPROTO_NUMPROTO-NFPROTO_UNSPEC][3];
 static struct ctl_table nf_log_sysctl_table[NFPROTO_NUMPROTO+1];
+static struct ctl_table_header *nf_log_sysctl_fhdr;
+
+static struct ctl_table nf_log_sysctl_ftable[] = {
+	{
+		.procname	= "nf_log_all_netns",
+		.data		= &sysctl_nf_log_all_netns,
+		.maxlen		= sizeof(sysctl_nf_log_all_netns),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{ }
+};
 
 static int nf_log_proc_dostring(struct ctl_table *table, int write,
 			 void __user *buffer, size_t *lenp, loff_t *ppos)
@@ -461,6 +483,10 @@ static int netfilter_log_sysctl_init(struct net *net)
 			nf_log_sysctl_table[i].extra1 =
 				(void *)(unsigned long) i;
 		}
+		nf_log_sysctl_fhdr = register_net_sysctl(net, "net/netfilter",
+							 nf_log_sysctl_ftable);
+		if (!nf_log_sysctl_fhdr)
+			goto err_freg;
 	}
 
 	net->nf.nf_log_dir_header = register_net_sysctl(net,
@@ -474,6 +500,9 @@ static int netfilter_log_sysctl_init(struct net *net)
 err_reg:
 	if (!net_eq(net, &init_net))
 		kfree(table);
+	else
+		unregister_net_sysctl_table(nf_log_sysctl_fhdr);
+err_freg:
 err_alloc:
 	return -ENOMEM;
 }
@@ -486,6 +515,8 @@ static void netfilter_log_sysctl_exit(struct net *net)
 	unregister_net_sysctl_table(net->nf.nf_log_dir_header);
 	if (!net_eq(net, &init_net))
 		kfree(table);
+	else
+		unregister_net_sysctl_table(nf_log_sysctl_fhdr);
 }
 #else
 static int netfilter_log_sysctl_init(struct net *net)

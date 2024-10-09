@@ -1414,8 +1414,9 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
 			inode->i_fop = &ext2_file_operations;
 		}
 	} else if (S_ISDIR(inode->i_mode)) {
-		inode->i_op = &ext2_dir_inode_operations;
+		inode->i_op = &ext2_dir_inode_operations.ops;
 		inode->i_fop = &ext2_dir_operations;
+		inode->i_flags |= S_IOPS_WRAPPER;
 		if (test_opt(inode->i_sb, NOBH))
 			inode->i_mapping->a_ops = &ext2_nobh_aops;
 		else

@@ -7759,7 +7759,7 @@ err_pm_runtime_put:
 	goto out;
 }
 
-static struct rtnl_link_stats64 *
+static void
 rtl8169_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct rtl8169_private *tp = netdev_priv(dev);
@@ -7813,8 +7813,6 @@ rtl8169_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 		le16_to_cpu(tp->tc_offset.tx_aborted);
 
 	pm_runtime_put_noidle(&pdev->dev);
-
-	return stats;
 }
 
 static void rtl8169_net_suspend(struct net_device *dev)
@@ -8040,7 +8038,7 @@ static const struct net_device_ops rtl_netdev_ops = {
 	.ndo_start_xmit		= rtl8169_start_xmit,
 	.ndo_tx_timeout		= rtl8169_tx_timeout,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_change_mtu		= rtl8169_change_mtu,
+	.ndo_change_mtu_rh74	= rtl8169_change_mtu,
 	.ndo_fix_features	= rtl8169_fix_features,
 	.ndo_set_features	= rtl8169_set_features,
 	.ndo_set_mac_address	= rtl_set_mac_address,

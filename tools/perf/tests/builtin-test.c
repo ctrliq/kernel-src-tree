@@ -3,8 +3,10 @@
  *
  * Builtin regression testing command: ever growing number of sanity tests
  */
+#include <errno.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/wait.h>
 #include "builtin.h"
 #include "hist.h"
 #include "intlist.h"
@@ -13,6 +15,7 @@
 #include "color.h"
 #include <subcmd/parse-options.h>
 #include "symbol.h"
+#include <linux/kernel.h>
 
 static bool dont_fork;
 
@@ -38,6 +41,10 @@ static struct test generic_tests[] = {
 	{
 		.desc = "Read samples using the mmap interface",
 		.func = test__basic_mmap,
+	},
+	{
+		.desc = "Test data source output",
+		.func = test__mem,
 	},
 	{
 		.desc = "Parse event definition strings",
@@ -210,6 +217,10 @@ static struct test generic_tests[] = {
 		.func = test__cpu_map_print,
 	},
 	{
+		.desc = "Test SDT event probing",
+		.func = test__sdt_event,
+	},
+	{
 		.desc = "is_printable_array",
 		.func = test__is_printable_array,
 	},
@@ -274,7 +285,7 @@ static int run_test(struct test *test, int subtest)
 		if (!dont_fork) {
 			pr_debug("test child forked, pid %d\n", getpid());
 
-			if (!verbose) {
+			if (verbose <= 0) {
 				int nullfd = open("/dev/null", O_WRONLY);
 
 				if (nullfd >= 0) {

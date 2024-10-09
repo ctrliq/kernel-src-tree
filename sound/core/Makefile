@@ -29,6 +29,7 @@ snd-timer-objs    := timer.o
 snd-hrtimer-objs  := hrtimer.o
 snd-rtctimer-objs := rtctimer.o
 snd-hwdep-objs    := hwdep.o
+snd-seq-device-objs := seq_device.o
 
 snd-compress-objs := compress_offload.o
 
@@ -37,6 +38,7 @@ obj-$(CONFIG_SND_HWDEP)		+= snd-hwdep.o
 obj-$(CONFIG_SND_TIMER)		+= snd-timer.o
 obj-$(CONFIG_SND_HRTIMER)	+= snd-hrtimer.o
 obj-$(CONFIG_SND_PCM)		+= snd-pcm.o
+obj-$(CONFIG_SND_SEQ_DEVICE)	+= snd-seq-device.o
 obj-$(CONFIG_SND_RAWMIDI)	+= snd-rawmidi.o
 
 obj-$(CONFIG_SND_OSSEMUL)	+= oss/

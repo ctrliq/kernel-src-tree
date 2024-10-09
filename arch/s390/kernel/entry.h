@@ -82,6 +82,10 @@ long sys_rt_sigreturn(void);
 long sys32_sigreturn(void);
 long sys32_rt_sigreturn(void);
 
+long sys_s390_guarded_storage(int command, struct gs_cb __user *);
 long sys_s390_pci_mmio_write(unsigned long, const void __user *, size_t);
 long sys_s390_pci_mmio_read(unsigned long, void __user *, size_t);
+
+void gs_load_bc_cb(struct pt_regs *regs);
+
 #endif /* _ENTRY_H */

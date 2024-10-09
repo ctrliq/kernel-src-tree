@@ -118,6 +118,7 @@
 #include <linux/spinlock.h>
 #include <linux/tcp.h>
 #include <linux/if_vlan.h>
+#include <linux/interrupt.h>
 #include <net/busy_poll.h>
 #include <linux/clk.h>
 #include <linux/if_ether.h>
@@ -1272,6 +1273,7 @@ static int xgbe_set_hwtstamp_settings(struct xgbe_prv_data *pdata,
 	case HWTSTAMP_FILTER_NONE:
 		break;
 
+	case HWTSTAMP_FILTER_NTP_ALL:
 	case HWTSTAMP_FILTER_ALL:
 		XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TSENALL, 1);
 		XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TSENA, 1);
@@ -1394,8 +1396,7 @@ static void xgbe_prep_tx_tstamp(struct xgbe_prv_data *pdata,
 		spin_unlock_irqrestore(&pdata->tstamp_lock, flags);
 	}
 
-	if (!XGMAC_GET_BITS(packet->attributes, TX_PACKET_ATTRIBUTES, PTP))
-		skb_tx_timestamp(skb);
+	skb_tx_timestamp(skb);
 }
 
 static void xgbe_prep_vlan(struct sk_buff *skb, struct xgbe_packet_data *packet)
@@ -1766,8 +1767,8 @@ static void xgbe_tx_timeout(struct net_device *netdev)
 	schedule_work(&pdata->restart_work);
 }
 
-static struct rtnl_link_stats64 *xgbe_get_stats64(struct net_device *netdev,
-						  struct rtnl_link_stats64 *s)
+static void xgbe_get_stats64(struct net_device *netdev,
+			     struct rtnl_link_stats64 *s)
 {
 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
 	struct xgbe_mmc_stats *pstats = &pdata->mmc_stats;
@@ -1793,8 +1794,6 @@ static struct rtnl_link_stats64 *xgbe_get_stats64(struct net_device *netdev,
 	s->tx_dropped = netdev->stats.tx_dropped;
 
 	DBGPR("<--%s\n", __func__);
-
-	return s;
 }
 
 static int xgbe_vlan_rx_add_vid(struct net_device *netdev, __be16 proto,
@@ -1852,16 +1851,18 @@ static void xgbe_poll_controller(struct net_device *netdev)
 }
 #endif /* End CONFIG_NET_POLL_CONTROLLER */
 
-static int xgbe_setup_tc(struct net_device *netdev, u32 handle, __be16 proto,
-			 struct tc_to_netdev *tc_to_netdev)
+static int xgbe_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+			 void *type_data)
 {
 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+	struct tc_mqprio_qopt *mqprio = type_data;
 	u8 tc;
 
-	if (tc_to_netdev->type != TC_SETUP_MQPRIO)
-		return -EINVAL;
+	if (type != TC_SETUP_MQPRIO)
+		return -EOPNOTSUPP;
 
-	tc = tc_to_netdev->tc;
+	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+	tc = mqprio->num_tc;
 
 	if (tc > pdata->hw_feat.tc_cnt)
 		return -EINVAL;
@@ -1915,6 +1916,7 @@ static int xgbe_set_features(struct net_device *netdev,
 }
 
 static const struct net_device_ops xgbe_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= xgbe_open,
 	.ndo_stop		= xgbe_close,
 	.ndo_start_xmit		= xgbe_xmit,
@@ -1922,7 +1924,7 @@ static const struct net_device_ops xgbe_netdev_ops = {
 	.ndo_set_mac_address	= xgbe_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_do_ioctl		= xgbe_ioctl,
-	.ndo_change_mtu		= xgbe_change_mtu,
+	.ndo_change_mtu_rh74	= xgbe_change_mtu,
 	.ndo_tx_timeout		= xgbe_tx_timeout,
 	.ndo_get_stats64	= xgbe_get_stats64,
 	.ndo_vlan_rx_add_vid	= xgbe_vlan_rx_add_vid,
@@ -1930,7 +1932,7 @@ static const struct net_device_ops xgbe_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= xgbe_poll_controller,
 #endif
-	.ndo_setup_tc		= xgbe_setup_tc,
+	.extended.ndo_setup_tc_rh = xgbe_setup_tc,
 	.ndo_set_features	= xgbe_set_features,
 };
 

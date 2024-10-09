@@ -218,9 +218,6 @@ struct qed_cxt_mngr {
 	 */
 	u32				vf_count;
 
-	/* total number of SRQ's for this hwfn */
-	u32 srq_count;
-
 	/* Acquired CIDs */
 	struct qed_cid_acquired_map	acquired[MAX_CONN_TYPES];
 
@@ -239,6 +236,12 @@ struct qed_cxt_mngr {
 	u32 t2_num_pages;
 	u64 first_free;
 	u64 last_free;
+
+	/* total number of SRQ's for this hwfn */
+	u32 srq_count;
+
+	/* Maximal number of L2 steering filters */
+	u32 arfs_count;
 };
 static bool src_proto(enum protocol_type type)
 {
@@ -295,6 +298,9 @@ static void qed_cxt_src_iids(struct qed_cxt_mngr *p_mngr,
 		iids->pf_cids += p_mngr->conn_cfg[i].cid_count;
 		iids->per_vf_cids += p_mngr->conn_cfg[i].cids_per_vf;
 	}
+
+	/* Add L2 filtering filters in addition */
+	iids->pf_cids += p_mngr->arfs_count;
 }
 
 /* counts the iids for the Timers block configuration */
@@ -849,7 +855,7 @@ u32 qed_cxt_cfg_ilt_compute_excess(struct qed_hwfn *p_hwfn, u32 used_lines)
 	if (!excess_lines)
 		return 0;
 
-	if (p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
+	if (!QED_IS_RDMA_PERSONALITY(p_hwfn))
 		return 0;
 
 	p_mngr = p_hwfn->p_cxt_mngr;
@@ -1029,7 +1035,7 @@ static int qed_ilt_blk_alloc(struct qed_hwfn *p_hwfn,
 	u32 lines, line, sz_left, lines_to_skip = 0;
 
 	/* Special handling for RoCE that supports dynamic allocation */
-	if ((p_hwfn->hw_info.personality == QED_PCI_ETH_ROCE) &&
+	if (QED_IS_RDMA_PERSONALITY(p_hwfn) &&
 	    ((ilt_client == ILT_CLI_CDUT) || ilt_client == ILT_CLI_TSDM))
 		return 0;
 
@@ -1829,7 +1835,7 @@ static void qed_tm_init_pf(struct qed_hwfn *p_hwfn)
 		tm_offset += tm_iids.pf_tids[i];
 	}
 
-	if (p_hwfn->hw_info.personality == QED_PCI_ETH_ROCE)
+	if (QED_IS_RDMA_PERSONALITY(p_hwfn))
 		active_seg_mask = 0;
 
 	STORE_RT_REG(p_hwfn, TM_REG_PF_ENABLE_TASK_RT_OFFSET, active_seg_mask);
@@ -2119,8 +2125,13 @@ int qed_cxt_set_pf_params(struct qed_hwfn *p_hwfn, u32 rdma_tasks)
 		struct qed_eth_pf_params *p_params =
 		    &p_hwfn->pf_params.eth_pf_params;
 
-		qed_cxt_set_proto_cid_count(p_hwfn, PROTOCOLID_ETH,
-					    p_params->num_cons, 1);
+			if (!p_params->num_vf_cons)
+				p_params->num_vf_cons =
+				    ETH_PF_PARAMS_VF_CONS_DEFAULT;
+			qed_cxt_set_proto_cid_count(p_hwfn, PROTOCOLID_ETH,
+						    p_params->num_cons,
+						    p_params->num_vf_cons);
+		p_hwfn->p_cxt_mngr->arfs_count = p_params->num_arfs_filters;
 		break;
 	}
 	case QED_PCI_FCOE:
@@ -2342,7 +2353,7 @@ qed_cxt_dynamic_ilt_alloc(struct qed_hwfn *p_hwfn,
 		       last_cid_allocated - 1);
 
 		if (!p_hwfn->b_rdma_enabled_in_prs) {
-			/* Enable RoCE search */
+			/* Enable RDMA search */
 			qed_wr(p_hwfn, p_ptt, p_hwfn->rdma_prs_search_reg, 1);
 			p_hwfn->b_rdma_enabled_in_prs = true;
 		}

@@ -352,25 +352,27 @@ static void shadow_lru_isolate(struct list_head *item,
 	 * no pages, so we expect to be able to remove them all and
 	 * delete and free the empty node afterwards.
 	 */
-
-	BUG_ON(!node->count);
-	BUG_ON(node->count & RADIX_TREE_COUNT_MASK);
-
+	if (WARN_ON_ONCE(!workingset_node_shadows(node)))
+		goto out_invalid;
+	if (WARN_ON_ONCE(workingset_node_pages(node)))
+		goto out_invalid;
 	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
 		if (node->slots[i]) {
-			BUG_ON(!radix_tree_exceptional_entry(node->slots[i]));
+			if (WARN_ON_ONCE(!radix_tree_exceptional_entry(node->slots[i])))
+				goto out_invalid;
+			if (WARN_ON_ONCE(!mapping->nrexceptional))
+				goto out_invalid;
 			node->slots[i] = NULL;
-			BUG_ON(node->count < (1U << RADIX_TREE_COUNT_SHIFT));
-			node->count -= 1U << RADIX_TREE_COUNT_SHIFT;
-			BUG_ON(!mapping->nrexceptional);
+			workingset_node_shadows_dec(node);
 			mapping->nrexceptional--;
 		}
 	}
-	BUG_ON(node->count);
+	if (WARN_ON_ONCE(workingset_node_shadows(node)))
+		goto out_invalid;
 	inc_zone_state(page_zone(virt_to_page(node)), WORKINGSET_NODERECLAIM);
-	if (!__radix_tree_delete_node(&mapping->page_tree, node))
-		BUG();
+	__radix_tree_delete_node(&mapping->page_tree, node);
 
+out_invalid:
 	spin_unlock(&mapping->tree_lock);
 out:
 	local_irq_enable();

@@ -23,6 +23,7 @@
 #include <linux/mutex.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 
 #include "book3s_hv_cma.h"
 
@@ -80,6 +81,7 @@ long __init kvm_cma_declare_contiguous(phys_addr_t size, phys_addr_t alignment)
 	 */
 	cma->base_pfn = base_pfn;
 	cma->count    = size >> PAGE_SHIFT;
+	totalcma_pages += cma->count;
 	pr_info("CMA: reserved %ld MiB\n", (unsigned long)size / SZ_1M);
 	return 0;
 err:

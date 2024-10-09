@@ -211,11 +211,13 @@ int iscsit_create_recovery_datain_values_datasequenceinorder_yes(
 		if ((dr->next_burst_len +
 		     conn->conn_ops->MaxRecvDataSegmentLength) <
 		     conn->sess->sess_ops->MaxBurstLength) {
+			gmb();
 			dr->read_data_done +=
 				conn->conn_ops->MaxRecvDataSegmentLength;
 			dr->next_burst_len +=
 				conn->conn_ops->MaxRecvDataSegmentLength;
 		} else {
+			gmb();
 			dr->read_data_done +=
 				(conn->sess->sess_ops->MaxBurstLength -
 				 dr->next_burst_len);

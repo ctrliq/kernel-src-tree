@@ -113,6 +113,7 @@ void udelay_simple(unsigned long long usecs)
 	while (get_tod_clock_fast() < end)
 		cpu_relax();
 }
+EXPORT_SYMBOL(udelay_simple);
 
 void __ndelay(unsigned long long nsecs)
 {

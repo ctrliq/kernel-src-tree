@@ -247,6 +247,7 @@ int __init dma_contiguous_reserve_area(phys_addr_t size, phys_addr_t base,
 	 */
 	cma->base_pfn = PFN_DOWN(base);
 	cma->count = size >> PAGE_SHIFT;
+	totalcma_pages += cma->count;
 	*res_cma = cma;
 	cma_area_count++;
 
@@ -272,7 +273,7 @@ err:
  * global one. Requires architecture specific get_dev_cma_area() helper
  * function.
  */
-struct page *dma_alloc_from_contiguous(struct device *dev, int count,
+struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
 				       unsigned int align)
 {
 	unsigned long mask, pfn, pageno, start = 0;

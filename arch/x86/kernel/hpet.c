@@ -11,7 +11,9 @@
 #include <linux/cpu.h>
 #include <linux/pm.h>
 #include <linux/io.h>
+#include <linux/kaiser.h>
 
+#include <asm/cpufeature.h>
 #include <asm/fixmap.h>
 #include <asm/hpet.h>
 #include <asm/time.h>
@@ -76,6 +78,8 @@ static inline void hpet_set_mapping(void)
 	hpet_virt_address = ioremap_nocache(hpet_address, HPET_MMAP_SIZE);
 #ifdef CONFIG_X86_64
 	__set_fixmap(VSYSCALL_HPET, hpet_address, PAGE_KERNEL_VVAR_NOCACHE);
+	kaiser_add_mapping(__fix_to_virt(VSYSCALL_HPET), PAGE_SIZE,
+			   __PAGE_KERNEL_VVAR_NOCACHE | _PAGE_GLOBAL);
 #endif
 }
 
@@ -774,7 +778,7 @@ static union hpet_lock hpet __cacheline_aligned = {
 	{ .lock = __ARCH_SPIN_LOCK_UNLOCKED, },
 };
 
-static cycle_t read_hpet(struct clocksource *cs)
+static u64 read_hpet(struct clocksource *cs)
 {
 	unsigned long flags;
 	union hpet_lock old, new;
@@ -785,7 +789,7 @@ static cycle_t read_hpet(struct clocksource *cs)
 	 * Read HPET directly if in NMI.
 	 */
 	if (in_nmi())
-		return (cycle_t)hpet_readl(HPET_COUNTER);
+		return (u64)hpet_readl(HPET_COUNTER);
 
 	/*
 	 * Read the current state of the lock and HPET value atomically.
@@ -804,7 +808,7 @@ static cycle_t read_hpet(struct clocksource *cs)
 		WRITE_ONCE(hpet.value, new.value);
 		arch_spin_unlock(&hpet.lock);
 		local_irq_restore(flags);
-		return (cycle_t)new.value;
+		return (u64)new.value;
 	}
 	local_irq_restore(flags);
 
@@ -826,15 +830,15 @@ contended:
 		new.lockval = READ_ONCE(hpet.lockval);
 	} while ((new.value == old.value) && arch_spin_is_locked(&new.lock));
 
-	return (cycle_t)new.value;
+	return (u64)new.value;
 }
 #else
 /*
  * For UP or 32-bit.
  */
-static cycle_t read_hpet(struct clocksource *cs)
+static u64 read_hpet(struct clocksource *cs)
 {
-	return (cycle_t)hpet_readl(HPET_COUNTER);
+	return (u64)hpet_readl(HPET_COUNTER);
 }
 #endif
 
@@ -853,7 +857,7 @@ static struct clocksource clocksource_hpet = {
 static int hpet_clocksource_register(void)
 {
 	u64 start, now;
-	cycle_t t1;
+	u64 t1;
 
 	/* Start the counter */
 	hpet_restart_counter();

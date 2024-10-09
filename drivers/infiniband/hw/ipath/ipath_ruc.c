@@ -437,7 +437,7 @@ again:
 	wc.byte_len = wqe->length;
 	wc.qp = &qp->ibqp;
 	wc.src_qp = qp->remote_qpn;
-	wc.slid = qp->remote_ah_attr.dlid;
+	wc.slid = rdma_ah_get_path_bits(&qp->remote_ah_attr);
 	wc.sl = qp->remote_ah_attr.sl;
 	wc.port_num = 1;
 	/* Signal completion event if the solicited bit is set. */
@@ -616,10 +616,10 @@ void ipath_make_ruc_header(struct ipath_ibdev *dev, struct ipath_qp *qp,
 	}
 	lrh0 |= qp->remote_ah_attr.sl << 4;
 	qp->s_hdr.lrh[0] = cpu_to_be16(lrh0);
-	qp->s_hdr.lrh[1] = cpu_to_be16(qp->remote_ah_attr.dlid);
+	qp->s_hdr.lrh[1] = cpu_to_be16(rdma_ah_get_dlid(&qp->remote_ah_attr));
 	qp->s_hdr.lrh[2] = cpu_to_be16(qp->s_hdrwords + nwords + SIZE_OF_CRC);
 	qp->s_hdr.lrh[3] = cpu_to_be16(dev->dd->ipath_lid |
-				       qp->remote_ah_attr.src_path_bits);
+				       rdma_ah_get_path_bits(&qp->remote_ah_attr));
 	bth0 |= ipath_get_pkey(dev->dd, qp->s_pkey_index);
 	bth0 |= extra_bytes << 20;
 	ohdr->bth[0] = cpu_to_be32(bth0 | (1 << 22));
@@ -644,7 +644,7 @@ void ipath_do_send(unsigned long data)
 
 	if ((qp->ibqp.qp_type == IB_QPT_RC ||
 	     qp->ibqp.qp_type == IB_QPT_UC) &&
-	    qp->remote_ah_attr.dlid == dev->dd->ipath_lid) {
+	    rdma_ah_get_dlid(&qp->remote_ah_attr) == dev->dd->ipath_lid) {
 		ipath_ruc_loopback(qp);
 		goto bail;
 	}

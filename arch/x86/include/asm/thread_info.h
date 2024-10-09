@@ -19,7 +19,7 @@
 #ifndef __ASSEMBLY__
 struct task_struct;
 struct exec_domain;
-#include <asm/processor.h>
+#include <asm/cpufeature.h>
 #include <linux/atomic.h>
 
 struct thread_info {
@@ -80,6 +80,7 @@ struct thread_info {
 #define TIF_SECCOMP		8	/* secure computing */
 #define TIF_USER_RETURN_NOTIFY	11	/* notify kernel of userspace return */
 #define TIF_UPROBE		12	/* breakpointed or singlestepping */
+#define TIF_PATCH_PENDING	13	/* pending live patching update */
 #define TIF_NOTSC		16	/* TSC is not accessible in userland */
 #define TIF_IA32		17	/* IA32 compatibility process */
 #define TIF_FORK		18	/* ret_from_fork */
@@ -105,6 +106,7 @@ struct thread_info {
 #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
 #define _TIF_USER_RETURN_NOTIFY	(1 << TIF_USER_RETURN_NOTIFY)
 #define _TIF_UPROBE		(1 << TIF_UPROBE)
+#define _TIF_PATCH_PENDING	(1 << TIF_PATCH_PENDING)
 #define _TIF_NOTSC		(1 << TIF_NOTSC)
 #define _TIF_IA32		(1 << TIF_IA32)
 #define _TIF_FORK		(1 << TIF_FORK)
@@ -141,12 +143,12 @@ struct thread_info {
 	(_TIF_SYSCALL_TRACE | _TIF_NOTIFY_RESUME | _TIF_SIGPENDING |	\
 	 _TIF_NEED_RESCHED | _TIF_SINGLESTEP | _TIF_SYSCALL_EMU |	\
 	 _TIF_SYSCALL_AUDIT | _TIF_USER_RETURN_NOTIFY | _TIF_UPROBE |	\
-	 _TIF_NOHZ | _TIF_SYSCALL_TRACEPOINT)
+	 _TIF_PATCH_PENDING | _TIF_NOHZ | _TIF_SYSCALL_TRACEPOINT)
 
 /* Only used for 64 bit */
 #define _TIF_DO_NOTIFY_MASK						\
 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME |				\
-	 _TIF_USER_RETURN_NOTIFY)
+	 _TIF_USER_RETURN_NOTIFY | _TIF_PATCH_PENDING)
 
 /* flags to check in __switch_to() */
 #define _TIF_WORK_CTXSW							\
@@ -203,6 +205,8 @@ static inline struct thread_info *current_thread_info(void)
 #ifndef __ASSEMBLY__
 DECLARE_PER_CPU(unsigned long, kernel_stack);
 DECLARE_PER_CPU(unsigned long, __kernel_stack_70__);
+DECLARE_PER_CPU_USER_MAPPED(unsigned int, kaiser_enabled_pcp);
+DECLARE_PER_CPU_USER_MAPPED(unsigned int, spec_ctrl_pcp);
 
 static inline struct thread_info *current_thread_info(void)
 {

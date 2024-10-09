@@ -73,7 +73,8 @@ struct wiimote_data {
 	struct led_classdev *leds[4];
 	struct input_dev *accel;
 	struct input_dev *ir;
-	struct power_supply battery;
+	struct power_supply *battery;
+	struct power_supply_desc battery_desc;
 	struct wiimote_ext *ext;
 	struct wiimote_debug *debug;
 

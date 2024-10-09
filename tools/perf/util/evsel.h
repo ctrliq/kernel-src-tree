@@ -128,6 +128,11 @@ struct perf_evsel {
 	char			*group_name;
 	bool			cmdline_group_boundary;
 	struct list_head	config_terms;
+	bool			merged_stat;
+	const char *		metric_expr;
+	const char *		metric_name;
+	struct perf_evsel	**metric_events;
+	bool			collect_stat;
 };
 
 union u64_swap {

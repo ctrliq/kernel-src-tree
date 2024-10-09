@@ -85,6 +85,7 @@ struct parse_events_term {
 	int type_term;
 	struct list_head list;
 	bool used;
+	bool no_value;
 
 	/* error string indexes for within parsed string */
 	int err_term;
@@ -112,6 +113,7 @@ void parse_events__shrink_config_terms(void);
 int parse_events__is_hardcoded_term(struct parse_events_term *term);
 int parse_events_term__num(struct parse_events_term **term,
 			   int type_term, char *config, u64 num,
+			   bool novalue,
 			   void *loc_term, void *loc_val);
 int parse_events_term__str(struct parse_events_term **term,
 			   int type_term, char *config, char *str,
@@ -142,6 +144,14 @@ int parse_events_add_breakpoint(struct list_head *list, int *idx,
 int parse_events_add_pmu(struct parse_events_evlist *data,
 			 struct list_head *list, char *name,
 			 struct list_head *head_config);
+
+int parse_events_multi_pmu_add(struct parse_events_evlist *data,
+			       char *str,
+			       struct list_head **listp);
+
+int parse_events_copy_term_list(struct list_head *old,
+				 struct list_head **new);
+
 enum perf_pmu_event_symbol_type
 perf_pmu__parse_check(const char *name);
 void parse_events__set_leader(char *name, struct list_head *list);
@@ -151,7 +161,7 @@ void parse_events_evlist_error(struct parse_events_evlist *data,
 			       int idx, const char *str);
 
 void print_events(const char *event_glob, bool name_only, bool quiet,
-		  bool long_desc);
+		  bool long_desc, bool details_flag);
 
 struct event_symbol {
 	const char	*symbol;

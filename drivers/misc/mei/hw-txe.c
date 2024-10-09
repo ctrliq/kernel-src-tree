@@ -1044,7 +1044,7 @@ irqreturn_t mei_txe_irq_thread_handler(int irq, void *dev_id)
 {
 	struct mei_device *dev = (struct mei_device *) dev_id;
 	struct mei_txe_hw *hw = to_txe_hw(dev);
-	struct mei_cl_cb complete_list;
+	struct list_head cmpl_list;
 	s32 slots;
 	int rets = 0;
 
@@ -1056,7 +1056,7 @@ irqreturn_t mei_txe_irq_thread_handler(int irq, void *dev_id)
 
 	/* initialize our complete list */
 	mutex_lock(&dev->device_lock);
-	mei_io_list_init(&complete_list);
+	INIT_LIST_HEAD(&cmpl_list);
 
 	if (pci_dev_msi_enabled(to_pci_dev(dev->dev)))
 		mei_txe_check_and_ack_intrs(dev, true);
@@ -1113,7 +1113,7 @@ irqreturn_t mei_txe_irq_thread_handler(int irq, void *dev_id)
 	slots = mei_count_full_read_slots(dev);
 	if (test_and_clear_bit(TXE_INTR_OUT_DB_BIT, &hw->intr_cause)) {
 		/* Read from TXE */
-		rets = mei_irq_read_handler(dev, &complete_list, &slots);
+		rets = mei_irq_read_handler(dev, &cmpl_list, &slots);
 		if (rets && dev->dev_state != MEI_DEV_RESETTING) {
 			dev_err(dev->dev,
 				"mei_irq_read_handler ret = %d.\n", rets);
@@ -1131,14 +1131,14 @@ irqreturn_t mei_txe_irq_thread_handler(int irq, void *dev_id)
 	if (hw->aliveness && dev->hbuf_is_ready) {
 		/* get the real register value */
 		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
-		rets = mei_irq_write_handler(dev, &complete_list);
+		rets = mei_irq_write_handler(dev, &cmpl_list);
 		if (rets && rets != -EMSGSIZE)
 			dev_err(dev->dev, "mei_irq_write_handler ret = %d.\n",
 				rets);
 		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
 	}
 
-	mei_irq_compl_handler(dev, &complete_list);
+	mei_irq_compl_handler(dev, &cmpl_list);
 
 end:
 	dev_dbg(dev->dev, "interrupt thread end ret = %d\n", rets);

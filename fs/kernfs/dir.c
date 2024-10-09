@@ -705,6 +705,7 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 		return ERR_PTR(-ENOMEM);
 
 	ida_init(&root->ino_ida);
+	INIT_LIST_HEAD(&root->supers);
 
 	kn = __kernfs_new_node(root, "", S_IFDIR | S_IRUGO | S_IXUGO,
 			       KERNFS_DIR);
@@ -1397,68 +1398,40 @@ static struct kernfs_node *kernfs_dir_next_pos(const void *ns,
 	return pos;
 }
 
-static int kernfs_fop_readdir(struct file *filp, void * dirent , filldir_t filldir)
+static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
 {
-	struct dentry *dentry = filp->f_path.dentry;
-	struct kernfs_node *parent_sd = dentry->d_fsdata;
-	struct kernfs_node *pos = filp->private_data;
+	struct dentry *dentry = file->f_path.dentry;
+	struct kernfs_node *parent = dentry->d_fsdata;
+	struct kernfs_node *pos = file->private_data;
 	const void *ns = NULL;
-	ino_t ino;
-	loff_t off;
 
-	if (filp->f_pos == 0) {
-		ino = parent_sd->ino;
-		if (filldir(dirent, ".", 1, filp->f_pos, ino, DT_DIR) == 0)
-			filp->f_pos++;
-		else
-			return 0;
-	}
-
-	if (filp->f_pos == 1) {
-		if (parent_sd->parent)
-			ino = parent_sd->parent->ino;
-		else
-			ino = parent_sd->ino;
-		if (filldir(dirent, "..", 2, filp->f_pos, ino, DT_DIR) == 0)
-			filp->f_pos++;
-		else
-			return 0;
-	}
+	if (!dir_emit_dots(file, ctx))
+		return 0;
 	mutex_lock(&kernfs_mutex);
 
-	if (kernfs_ns_enabled(parent_sd))
+	if (kernfs_ns_enabled(parent))
 		ns = kernfs_info(dentry->d_sb)->ns;
 
-	off = filp->f_pos;
-	for (pos = kernfs_dir_pos(ns, parent_sd, filp->f_pos, pos);
+	for (pos = kernfs_dir_pos(ns, parent, ctx->pos, pos);
 	     pos;
-	     pos = kernfs_dir_next_pos(ns, parent_sd, filp->f_pos, pos)) {
+	     pos = kernfs_dir_next_pos(ns, parent, ctx->pos, pos)) {
 		const char *name = pos->name;
 		unsigned int type = dt_type(pos);
 		int len = strlen(name);
-		int ret;
+		ino_t ino = pos->ino;
 
-		ino = pos->ino;
-		off = filp->f_pos = pos->hash;
-		filp->private_data = pos;
+		ctx->pos = pos->hash;
+		file->private_data = pos;
 		kernfs_get(pos);
 
 		mutex_unlock(&kernfs_mutex);
-		ret = filldir(dirent, name, len, off, ino, type);
+		if (!dir_emit(ctx, name, len, ino, type))
+			return 0;
 		mutex_lock(&kernfs_mutex);
-		if (ret < 0)
-			break;
 	}
 	mutex_unlock(&kernfs_mutex);
-
-	/* don't reference last entry if its refcount is dropped */
-	if (!pos) {
-		filp->private_data = NULL;
-
-		/* EOF and not changed as 0 or 1 in read/write path */
-		if (off == filp->f_pos && off > 1)
-			filp->f_pos = INT_MAX;
-	}
+	file->private_data = NULL;
+	ctx->pos = INT_MAX;
 	return 0;
 }
 
@@ -1475,9 +1448,17 @@ static loff_t kernfs_dir_fop_llseek(struct file *file, loff_t offset,
 	return ret;
 }
 
+static int kernfs_dir_open(struct inode *inode, struct file *file)
+{
+	/* Let the kernel safely know that iterate is present */
+	file->f_mode |= FMODE_KABI_ITERATE;
+	return 0;
+}
+
 const struct file_operations kernfs_dir_fops = {
+	.open		= kernfs_dir_open,
 	.read		= generic_read_dir,
-	.readdir	= kernfs_fop_readdir,
+	.iterate	= kernfs_fop_readdir,
 	.release	= kernfs_dir_fop_release,
 	.llseek		= kernfs_dir_fop_llseek,
 };

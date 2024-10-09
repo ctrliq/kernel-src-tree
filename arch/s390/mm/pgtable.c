@@ -76,7 +76,6 @@ int crst_table_upgrade(struct mm_struct *mm)
 	mm->context.asce_limit = 1UL << 53;
 	mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
 			   _ASCE_USER_BITS | _ASCE_TYPE_REGION2;
-	mm->task_size = mm->context.asce_limit;
 	spin_unlock_bh(&mm->page_table_lock);
 
 	on_each_cpu(__crst_table_upgrade, mm, 0);
@@ -98,7 +97,6 @@ void crst_table_downgrade(struct mm_struct *mm)
 	mm->context.asce_limit = 1UL << 31;
 	mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
 			   _ASCE_USER_BITS | _ASCE_TYPE_SEGMENT;
-	mm->task_size = mm->context.asce_limit;
 	crst_table_free(mm, (unsigned long *) pgd);
 
 	if (current->active_mm == mm)
@@ -324,7 +322,7 @@ int gmap_map_segment(struct gmap *gmap, unsigned long from,
 
 	if ((from | to | len) & (PMD_SIZE - 1))
 		return -EINVAL;
-	if (len == 0 || from + len > TASK_MAX_SIZE ||
+	if (len == 0 || from + len > TASK_SIZE_MAX ||
 	    from + len < from || to + len < to)
 		return -EINVAL;
 
@@ -1195,6 +1193,9 @@ int pmdp_set_access_flags(struct vm_area_struct *vma,
 {
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
+	entry = pmd_mkyoung(entry);
+	if (dirty)
+		entry = pmd_mkdirty(entry);
 	if (pmd_same(*pmdp, entry))
 		return 0;
 	pmdp_invalidate(vma, address, pmdp);

@@ -10,6 +10,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 
+#include <asm/cmdline.h>
 #include <asm/sigcontext.h>
 #include <asm/processor.h>
 #include <asm/math_emu.h>
@@ -115,6 +116,7 @@ void unlazy_fpu(struct task_struct *tsk)
 EXPORT_SYMBOL(unlazy_fpu);
 
 unsigned int mxcsr_feature_mask __read_mostly = 0xffffffffu;
+EXPORT_SYMBOL_GPL(mxcsr_feature_mask);
 unsigned int xstate_size;
 EXPORT_SYMBOL_GPL(xstate_size);
 static struct i387_fxsave_struct fx_scratch;
@@ -172,6 +174,23 @@ static void init_thread_xstate(void)
 	setup_clear_cpu_cap(X86_FEATURE_XSAVES);
 
 }
+
+/*
+ * We parse fpu parameters early because fpu_init() is executed
+ * before parse_early_param().
+ */
+static int __init x86_clearcpuid_setup(char *s)
+{
+	int bit;
+
+	if (get_option(&s, &bit) &&
+	    bit >= 0 &&
+	    bit < NCAPINTS * 32)
+		setup_clear_cpu_cap(bit);
+
+	return 0;
+}
+early_param("clearcpuid", x86_clearcpuid_setup);
 
 /*
  * Called at bootup to set up the initial FPU state that is later cloned

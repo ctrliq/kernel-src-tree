@@ -51,8 +51,8 @@ struct pcpu_dstats {
 	struct u64_stats_sync	syncp;
 };
 
-static struct rtnl_link_stats64 *dummy_get_stats64(struct net_device *dev,
-						   struct rtnl_link_stats64 *stats)
+static void dummy_get_stats64(struct net_device *dev,
+			      struct rtnl_link_stats64 *stats)
 {
 	int i;
 
@@ -70,7 +70,6 @@ static struct rtnl_link_stats64 *dummy_get_stats64(struct net_device *dev,
 		stats->tx_bytes += tbytes;
 		stats->tx_packets += tpackets;
 	}
-	return stats;
 }
 
 static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -126,7 +125,7 @@ static void dummy_setup(struct net_device *dev)
 
 	/* Initialize the device structure. */
 	dev->netdev_ops = &dummy_netdev_ops;
-	dev->destructor = free_netdev;
+	dev->extended->needs_free_netdev = true;
 
 	/* Fill in device structure with ethernet-generic values. */
 	dev->flags |= IFF_NOARP;
@@ -136,8 +135,8 @@ static void dummy_setup(struct net_device *dev)
 	dev->features	|= NETIF_F_HW_CSUM | NETIF_F_HIGHDMA | NETIF_F_LLTX;
 	eth_hw_addr_random(dev);
 
-	dev->min_mtu = 0;
-	dev->max_mtu = ETH_MAX_MTU;
+	dev->extended->min_mtu = 0;
+	dev->extended->max_mtu = 0;
 }
 
 static int dummy_validate(struct nlattr *tb[], struct nlattr *data[])

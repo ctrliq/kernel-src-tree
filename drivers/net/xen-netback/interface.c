@@ -158,7 +158,7 @@ static int xenvif_close(struct net_device *dev)
 static int xenvif_change_mtu(struct net_device *dev, int mtu)
 {
 	struct xenvif *vif = netdev_priv(dev);
-	int max = vif->can_sg ? 65535 - VLAN_ETH_HLEN : ETH_DATA_LEN;
+	int max = vif->can_sg ? ETH_MAX_MTU - VLAN_ETH_HLEN : ETH_DATA_LEN;
 
 	if (mtu > max)
 		return -EINVAL;
@@ -233,11 +233,12 @@ static const struct ethtool_ops xenvif_ethtool_ops = {
 };
 
 static const struct net_device_ops xenvif_netdev_ops = {
+	.ndo_size	= sizeof(struct net_device_ops),
 	.ndo_start_xmit	= xenvif_start_xmit,
 	.ndo_get_stats	= xenvif_get_stats,
 	.ndo_open	= xenvif_open,
 	.ndo_stop	= xenvif_close,
-	.ndo_change_mtu	= xenvif_change_mtu,
+	.extended.ndo_change_mtu = xenvif_change_mtu,
 	.ndo_fix_features = xenvif_fix_features,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr   = eth_validate_addr,
@@ -283,6 +284,9 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
 	SET_ETHTOOL_OPS(dev, &xenvif_ethtool_ops);
 
 	dev->tx_queue_len = XENVIF_QUEUE_LENGTH;
+
+	dev->min_mtu = ETH_MIN_MTU;
+	dev->max_mtu = ETH_MAX_MTU - VLAN_ETH_HLEN;
 
 	/*
 	 * Initialise a dummy MAC address. We choose the numerically

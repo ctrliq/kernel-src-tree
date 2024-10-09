@@ -204,9 +204,8 @@ extern void *kexec_purgatory_get_symbol_addr(struct kimage *image,
 extern void __crash_kexec(struct pt_regs *);
 extern void crash_kexec(struct pt_regs *);
 int kexec_should_crash(struct task_struct *);
+int kexec_crash_loaded(void);
 void crash_save_cpu(struct pt_regs *regs, int cpu);
-void crash_map_reserved_pages(void);
-void crash_unmap_reserved_pages(void);
 
 extern struct kimage *kexec_image;
 extern struct kimage *kexec_crash_image;
@@ -253,11 +252,20 @@ int __weak arch_kexec_apply_relocations(const Elf_Ehdr *ehdr, Elf_Shdr *sechdrs,
 void arch_kexec_protect_crashkres(void);
 void arch_kexec_unprotect_crashkres(void);
 
+#ifndef arch_kexec_post_alloc_pages
+static inline int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages, gfp_t gfp) { return 0; }
+#endif
+
+#ifndef arch_kexec_pre_free_pages
+static inline void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages) { }
+#endif
+
 #else /* !CONFIG_KEXEC_CORE */
 struct pt_regs;
 struct task_struct;
 static inline void __crash_kexec(struct pt_regs *regs) { }
 static inline void crash_kexec(struct pt_regs *regs) { }
 static inline int kexec_should_crash(struct task_struct *p) { return 0; }
+static inline int kexec_crash_loaded(void) { return 0; }
 #endif /* CONFIG_KEXEC_CORE */
 #endif /* LINUX_KEXEC_H */

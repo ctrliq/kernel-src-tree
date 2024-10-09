@@ -2,6 +2,9 @@
 #define _ASM_X86_MWAIT_H
 
 #include <linux/sched.h>
+#include <asm/spec_ctrl.h>
+
+#include <asm/cpufeature.h>
 
 #define MWAIT_SUBSTATE_MASK		0xf
 #define MWAIT_CSTATE_MASK		0xf
@@ -15,7 +18,7 @@
 
 #define MWAIT_ECX_INTERRUPT_BREAK	0x1
 
-static inline void __monitor(const void *eax, unsigned long ecx,
+static __always_inline void __monitor(const void *eax, unsigned long ecx,
 			     unsigned long edx)
 {
 	/* "monitor %eax, %ecx, %edx;" */
@@ -23,7 +26,7 @@ static inline void __monitor(const void *eax, unsigned long ecx,
 		     :: "a" (eax), "c" (ecx), "d"(edx));
 }
 
-static inline void __mwait(unsigned long eax, unsigned long ecx)
+static __always_inline void __mwait(unsigned long eax, unsigned long ecx)
 {
 	/* "mwait %eax, %ecx;" */
 	asm volatile(".byte 0x0f, 0x01, 0xc9;"
@@ -46,9 +49,16 @@ static inline void mwait_idle_with_hints(unsigned long eax, unsigned long ecx)
 		if (this_cpu_has(X86_FEATURE_CLFLUSH_MONITOR))
 			clflush((void *)&current_thread_info()->flags);
 
+		/*
+		 * IRQs must be disabled here and nmi uses the
+		 * save_paranoid model which always enables ibrs on
+		 * exception entry before any indirect jump can run.
+		 */
+		spec_ctrl_ibrs_off();
 		__monitor((void *)&current_thread_info()->flags, 0, 0);
 		if (!need_resched())
 			__mwait(eax, ecx);
+		spec_ctrl_ibrs_on();
 	}
 	__current_clr_polling();
 }

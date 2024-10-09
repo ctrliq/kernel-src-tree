@@ -24,7 +24,6 @@
 #include <linux/device.h>
 #include <linux/pm_runtime.h>
 #include <linux/pci_hotplug.h>
-#include <asm-generic/pci-bridge.h>
 #include <asm/setup.h>
 #include <linux/aer.h>
 #include "pci.h"
@@ -2486,7 +2485,7 @@ out:
 	return offset + ent_size;
 }
 
-/* Enhanced Allocation Initalization */
+/* Enhanced Allocation Initialization */
 void pci_ea_init(struct pci_dev *dev)
 {
 	int ea;
@@ -3479,18 +3478,6 @@ bool pci_check_and_unmask_intx(struct pci_dev *dev)
 	return pci_check_and_set_intx_mask(dev, false);
 }
 EXPORT_SYMBOL_GPL(pci_check_and_unmask_intx);
-
-int pci_set_dma_max_seg_size(struct pci_dev *dev, unsigned int size)
-{
-	return dma_set_max_seg_size(&dev->dev, size);
-}
-EXPORT_SYMBOL(pci_set_dma_max_seg_size);
-
-int pci_set_dma_seg_boundary(struct pci_dev *dev, unsigned long mask)
-{
-	return dma_set_seg_boundary(&dev->dev, mask);
-}
-EXPORT_SYMBOL(pci_set_dma_seg_boundary);
 
 /**
  * pci_wait_for_pending_transaction - waits for pending transaction

@@ -165,16 +165,49 @@ static inline void shmem_unacct_size(unsigned long flags, loff_t size)
  * shmem_getpage reports shmem_acct_block failure as -ENOSPC not -ENOMEM,
  * so that a failure on a sparse tmpfs mapping will give SIGBUS not OOM.
  */
-static inline int shmem_acct_block(unsigned long flags)
+static inline int shmem_acct_block(unsigned long flags, long pages)
 {
 	return (flags & VM_NORESERVE) ?
-		security_vm_enough_memory_mm(current->mm, VM_ACCT(PAGE_CACHE_SIZE)) : 0;
+		security_vm_enough_memory_mm(current->mm, pages *
+					     VM_ACCT(PAGE_CACHE_SIZE)) : 0;
 }
 
 static inline void shmem_unacct_blocks(unsigned long flags, long pages)
 {
 	if (flags & VM_NORESERVE)
 		vm_unacct_memory(pages * VM_ACCT(PAGE_CACHE_SIZE));
+}
+
+static inline bool shmem_inode_acct_block(struct inode *inode, long pages)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+
+	if (shmem_acct_block(info->flags, pages))
+		return false;
+
+	if (sbinfo->max_blocks) {
+		if (percpu_counter_compare(&sbinfo->used_blocks,
+					   sbinfo->max_blocks - pages) > 0)
+			goto unacct;
+		percpu_counter_add(&sbinfo->used_blocks, pages);
+	}
+
+	return true;
+
+unacct:
+	shmem_unacct_blocks(info->flags, pages);
+	return false;
+}
+
+static inline void shmem_inode_unacct_blocks(struct inode *inode, long pages)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+
+	if (sbinfo->max_blocks)
+		percpu_counter_sub(&sbinfo->used_blocks, pages);
+	shmem_unacct_blocks(info->flags, pages);
 }
 
 static const struct super_operations shmem_ops;
@@ -242,12 +275,9 @@ static void shmem_recalc_inode(struct inode *inode)
 
 	freed = info->alloced - info->swapped - inode->i_mapping->nrpages;
 	if (freed > 0) {
-		struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
-		if (sbinfo->max_blocks)
-			percpu_counter_add(&sbinfo->used_blocks, -freed);
 		info->alloced -= freed;
 		inode->i_blocks -= freed * BLOCKS_PER_PAGE;
-		shmem_unacct_blocks(info->flags, freed);
+		shmem_inode_unacct_blocks(inode, freed);
 	}
 }
 
@@ -384,13 +414,10 @@ unsigned long shmem_partial_swap_usage(struct address_space *mapping,
 
 		page = radix_tree_deref_slot(slot);
 
-		/*
-		 * This should only be possible to happen at index 0, so we
-		 * don't need to reset the counter, nor do we risk infinite
-		 * restarts.
-		 */
-		if (radix_tree_deref_retry(page))
-			goto restart;
+		if (radix_tree_deref_retry(page)) {
+			slot = radix_tree_iter_retry(&iter);
+			continue;
+		}
 
 		if (radix_tree_exceptional_entry(page))
 			swapped++;
@@ -1116,7 +1143,6 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info;
-	struct shmem_sb_info *sbinfo;
 	struct page *page;
 	swp_entry_t swap;
 	int error;
@@ -1157,7 +1183,6 @@ repeat:
 	 * bring it back from swap or allocate.
 	 */
 	info = SHMEM_I(inode);
-	sbinfo = SHMEM_SB(inode->i_sb);
 
 	if (swap.val) {
 		/* Look it up and read it in.. */
@@ -1226,25 +1251,14 @@ repeat:
 
 	} else {
 		if (vma && userfaultfd_missing(vma)) {
-			*fault_type = handle_userfault(vma,
-						       (unsigned long)
-						       vmf->virtual_address,
-						       vmf->flags,
+			*fault_type = handle_userfault(vmf,
 						       VM_UFFD_MISSING);
 			return 0;
 		}
-		if (shmem_acct_block(info->flags)) {
+		if (!shmem_inode_acct_block(inode, 1)) {
 			error = -ENOSPC;
 
 			goto failed;
-		}
-		if (sbinfo->max_blocks) {
-			if (percpu_counter_compare(&sbinfo->used_blocks,
-						sbinfo->max_blocks) >= 0) {
-				error = -ENOSPC;
-				goto unacct;
-			}
-			percpu_counter_inc(&sbinfo->used_blocks);
 		}
 
 		page = shmem_alloc_page(gfp, info, index);
@@ -1322,11 +1336,7 @@ trunc:
 	inode->i_blocks -= BLOCKS_PER_PAGE;
 	spin_unlock(&info->lock);
 decused:
-	sbinfo = SHMEM_SB(inode->i_sb);
-	if (sbinfo->max_blocks)
-		percpu_counter_add(&sbinfo->used_blocks, -1);
-unacct:
-	shmem_unacct_blocks(info->flags, 1);
+	shmem_inode_unacct_blocks(inode, 1);
 failed:
 	if (swap.val && error != -EINVAL &&
 	    !shmem_confirm_swap(mapping, index, swap))
@@ -1552,16 +1562,16 @@ bool shmem_mapping(struct address_space *mapping)
 	return mapping->backing_dev_info == &shmem_backing_dev_info;
 }
 
-int shmem_mcopy_atomic_pte(struct mm_struct *dst_mm,
-			   pmd_t *dst_pmd,
-			   struct vm_area_struct *dst_vma,
-			   unsigned long dst_addr,
-			   unsigned long src_addr,
-			   struct page **pagep)
+static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+				  pmd_t *dst_pmd,
+				  struct vm_area_struct *dst_vma,
+				  unsigned long dst_addr,
+				  unsigned long src_addr,
+				  bool zeropage,
+				  struct page **pagep)
 {
 	struct inode *inode = file_inode(dst_vma->vm_file);
 	struct shmem_inode_info *info = SHMEM_I(inode);
-	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
 	gfp_t gfp = mapping_gfp_mask(mapping);
 	pgoff_t pgoff = linear_page_index(dst_vma, dst_addr);
@@ -1572,33 +1582,30 @@ int shmem_mcopy_atomic_pte(struct mm_struct *dst_mm,
 	int ret;
 
 	ret = -ENOMEM;
-	if (shmem_acct_block(info->flags))
+	if (!shmem_inode_acct_block(inode, 1))
 		goto out;
-	if (sbinfo->max_blocks) {
-		if (percpu_counter_compare(&sbinfo->used_blocks,
-					   sbinfo->max_blocks) >= 0)
-			goto out_unacct_blocks;
-		percpu_counter_inc(&sbinfo->used_blocks);
-	}
 
 	if (!*pagep) {
 		page = shmem_alloc_page(gfp, info, pgoff);
 		if (!page)
-			goto out_dec_used_blocks;
+			goto out_unacct_blocks;
 
-		page_kaddr = kmap_atomic(page);
-		ret = copy_from_user(page_kaddr, (const void __user *)src_addr,
-				     PAGE_SIZE);
-		kunmap_atomic(page_kaddr);
+		if (!zeropage) {	/* mcopy_atomic */
+			page_kaddr = kmap_atomic(page);
+			ret = copy_from_user(page_kaddr,
+					     (const void __user *)src_addr,
+					     PAGE_SIZE);
+			kunmap_atomic(page_kaddr);
 
-		/* fallback to copy_from_user outside mmap_sem */
-		if (unlikely(ret)) {
-			*pagep = page;
-			if (sbinfo->max_blocks)
-				percpu_counter_add(&sbinfo->used_blocks, -1);
-			shmem_unacct_blocks(info->flags, 1);
-			/* don't free the page */
-			return -EFAULT;
+			/* fallback to copy_from_user outside mmap_sem */
+			if (unlikely(ret)) {
+				*pagep = page;
+				shmem_inode_unacct_blocks(inode, 1);
+				/* don't free the page */
+				return -EFAULT;
+			}
+		} else {		/* mfill_zeropage_atomic */
+			clear_highpage(page);
 		}
 	} else {
 		page = *pagep;
@@ -1658,12 +1665,31 @@ out_release_uncharge:
 out_release:
 	unlock_page(page);
 	put_page(page);
-out_dec_used_blocks:
-	if (sbinfo->max_blocks)
-		percpu_counter_add(&sbinfo->used_blocks, -1);
 out_unacct_blocks:
-	shmem_unacct_blocks(info->flags, 1);
+	shmem_inode_unacct_blocks(inode, 1);
 	goto out;
+}
+
+int shmem_mcopy_atomic_pte(struct mm_struct *dst_mm,
+			   pmd_t *dst_pmd,
+			   struct vm_area_struct *dst_vma,
+			   unsigned long dst_addr,
+			   unsigned long src_addr,
+			   struct page **pagep)
+{
+	return shmem_mfill_atomic_pte(dst_mm, dst_pmd, dst_vma,
+				      dst_addr, src_addr, false, pagep);
+}
+
+int shmem_mfill_zeropage_pte(struct mm_struct *dst_mm,
+			     pmd_t *dst_pmd,
+			     struct vm_area_struct *dst_vma,
+			     unsigned long dst_addr)
+{
+	struct page *page = NULL;
+
+	return shmem_mfill_atomic_pte(dst_mm, dst_pmd, dst_vma,
+				      dst_addr, 0, true, &page);
 }
 
 #ifdef CONFIG_TMPFS
@@ -2082,8 +2108,10 @@ static void shmem_tag_pins(struct address_space *mapping)
 	radix_tree_for_each_slot(slot, &mapping->page_tree, &iter, start) {
 		page = radix_tree_deref_slot(slot);
 		if (!page || radix_tree_exception(page)) {
-			if (radix_tree_deref_retry(page))
-				goto restart;
+			if (radix_tree_deref_retry(page)) {
+				slot = radix_tree_iter_retry(&iter);
+				continue;
+			}
 		} else if (page_count(page) - page_mapcount(page) > 1) {
 			spin_lock_irq(&mapping->tree_lock);
 			radix_tree_tag_set(&mapping->page_tree, iter.index,
@@ -2135,8 +2163,10 @@ static int shmem_wait_for_pins(struct address_space *mapping)
 
 			page = radix_tree_deref_slot(slot);
 			if (radix_tree_exception(page)) {
-				if (radix_tree_deref_retry(page))
-					goto restart;
+				if (radix_tree_deref_retry(page)) {
+					slot = radix_tree_iter_retry(&iter);
+					continue;
+				}
 
 				page = NULL;
 			}
@@ -2463,6 +2493,37 @@ shmem_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev)
 		dir->i_ctime = dir->i_mtime = CURRENT_TIME;
 		d_instantiate(dentry, inode);
 		dget(dentry); /* Extra count - pin the dentry in core */
+	}
+	return error;
+}
+
+static int
+shmem_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode;
+	int error = -ENOSPC;
+
+	inode = shmem_get_inode(dir->i_sb, dir, mode, 0, VM_NORESERVE);
+	if (inode) {
+		error = security_inode_init_security(inode, dir,
+						     NULL,
+						     shmem_initxattrs, NULL);
+		if (error) {
+			if (error != -EOPNOTSUPP) {
+				iput(inode);
+				return error;
+			}
+		}
+#ifdef CONFIG_TMPFS_POSIX_ACL
+		error = generic_acl_init(inode, dir);
+		if (error) {
+			iput(inode);
+			return error;
+		}
+#else
+		error = 0;
+#endif
+		d_tmpfile(dentry, inode);
 	}
 	return error;
 }
@@ -3257,7 +3318,7 @@ int shmem_fill_super(struct super_block *sb, void *data, int silent)
 #ifdef CONFIG_TMPFS_POSIX_ACL
 	sb->s_flags |= MS_POSIXACL;
 #endif
-	uuid_gen(&sb->s_uuid);
+	uuid_be_gen((uuid_be *) &sb->s_uuid);
 
 	inode = shmem_get_inode(sb, NULL, S_IFDIR | sbinfo->mode, 0, VM_NORESERVE);
 	if (!inode)
@@ -3378,6 +3439,7 @@ static const struct inode_operations_wrapper shmem_dir_inode_operations = {
 	},
 #ifdef CONFIG_TMPFS
 	.rename2	= shmem_rename2,
+	.tmpfile	= shmem_tmpfile,
 #endif
 };
 

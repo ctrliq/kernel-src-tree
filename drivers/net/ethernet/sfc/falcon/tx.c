@@ -425,22 +425,25 @@ void ef4_init_tx_queue_core_txq(struct ef4_tx_queue *tx_queue)
 				     efx->n_tx_channels : 0));
 }
 
-int ef4_setup_tc(struct net_device *net_dev, u32 handle, __be16 proto,
-		 struct tc_to_netdev *ntc)
+int ef4_setup_tc(struct net_device *net_dev, enum tc_setup_type type,
+		 void *type_data)
 {
 	struct ef4_nic *efx = netdev_priv(net_dev);
+	struct tc_mqprio_qopt *mqprio = type_data;
 	struct ef4_channel *channel;
 	struct ef4_tx_queue *tx_queue;
 	unsigned tc, num_tc;
 	int rc;
 
-	if (ntc->type != TC_SETUP_MQPRIO)
-		return -EINVAL;
+	if (type != TC_SETUP_MQPRIO)
+		return -EOPNOTSUPP;
 
-	num_tc = ntc->tc;
+	num_tc = mqprio->num_tc;
 
 	if (ef4_nic_rev(efx) < EF4_REV_FALCON_B0 || num_tc > EF4_MAX_TX_TC)
 		return -EINVAL;
+
+	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
 
 	if (num_tc == net_dev->num_tc)
 		return 0;
@@ -451,6 +454,7 @@ int ef4_setup_tc(struct net_device *net_dev, u32 handle, __be16 proto,
 	}
 
 	if (num_tc > net_dev->num_tc) {
+		gmb();
 		/* Initialise high-priority queues as necessary */
 		ef4_for_each_channel(channel, efx) {
 			ef4_for_each_possible_channel_tx_queue(tx_queue,
@@ -468,6 +472,7 @@ int ef4_setup_tc(struct net_device *net_dev, u32 handle, __be16 proto,
 			}
 		}
 	} else {
+		gmb();
 		/* Reduce number of classes before number of queues */
 		net_dev->num_tc = num_tc;
 	}

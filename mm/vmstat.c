@@ -500,7 +500,7 @@ static int refresh_cpu_vm_stats(bool do_pagesets)
 				continue;
 
 			if (__this_cpu_read(p->pcp.count)) {
-				drain_zone_pages(zone, __this_cpu_ptr(&p->pcp));
+				drain_zone_pages(zone, this_cpu_ptr(&p->pcp));
 				changes++;
 			}
 		}
@@ -1252,7 +1252,7 @@ static void vmstat_update(struct work_struct *w)
 		 */
 		if (!cpumask_test_and_clear_cpu(smp_processor_id(),
 						cpu_stat_off)) {
-			schedule_delayed_work(&__get_cpu_var(vmstat_work),
+			schedule_delayed_work(this_cpu_ptr(&vmstat_work),
 				round_jiffies_relative(sysctl_stat_interval));
 		}
 	} else {

@@ -1,20 +1,15 @@
-/**
- * Copyright (C) 2005 - 2016 Broadcom
- * All rights reserved.
+/*
+ * Copyright 2017 Broadcom. All Rights Reserved.
+ * The term "Broadcom" refers to Broadcom Limited and/or its subsidiaries.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.  The full GNU General
+ * as published by the Free Software Foundation. The full GNU General
  * Public License is included in this distribution in the file called COPYING.
- *
- * Written by: Jayamohan Kallickal (jayamohan.kallickal@broadcom.com)
  *
  * Contact Information:
  * linux-drivers@broadcom.com
  *
- * Emulex
- * 3333 Susan Street
- * Costa Mesa, CA 92626
  */
 
 #include <linux/reboot.h>
@@ -49,7 +44,6 @@ static unsigned int be_iopoll_budget = 10;
 static unsigned int be_max_phys_size = 64;
 static unsigned int enable_msix = 1;
 
-MODULE_DEVICE_TABLE(pci, beiscsi_pci_id_table);
 MODULE_DESCRIPTION(DRV_DESC " " BUILD_STR);
 MODULE_VERSION(BUILD_STR);
 MODULE_AUTHOR("Emulex Corporation");

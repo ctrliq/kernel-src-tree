@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2007-2013 Nicira, Inc.
+ * Copyright (c) 2007-2017 Nicira, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of version 2 of the GNU General Public
@@ -333,6 +333,8 @@ enum ovs_key_attr {
 	OVS_KEY_ATTR_CT_ZONE,	/* u16 connection tracking zone. */
 	OVS_KEY_ATTR_CT_MARK,	/* u32 connection tracking mark */
 	OVS_KEY_ATTR_CT_LABELS,	/* 16-octet connection tracking label */
+	OVS_KEY_ATTR_CT_ORIG_TUPLE_IPV4,   /* struct ovs_key_ct_tuple_ipv4 */
+	OVS_KEY_ATTR_CT_ORIG_TUPLE_IPV6,   /* struct ovs_key_ct_tuple_ipv6 */
 
 #ifdef __KERNEL__
 	OVS_KEY_ATTR_TUNNEL_INFO,  /* struct ip_tunnel_info */
@@ -475,6 +477,22 @@ struct ovs_key_ct_labels {
 
 #define OVS_CS_F_NAT_MASK (OVS_CS_F_SRC_NAT | OVS_CS_F_DST_NAT)
 
+struct ovs_key_ct_tuple_ipv4 {
+	__be32 ipv4_src;
+	__be32 ipv4_dst;
+	__be16 src_port;
+	__be16 dst_port;
+	__u8   ipv4_proto;
+};
+
+struct ovs_key_ct_tuple_ipv6 {
+	__be32 ipv6_src[4];
+	__be32 ipv6_dst[4];
+	__be16 src_port;
+	__be16 dst_port;
+	__u8   ipv6_proto;
+};
+
 /**
  * enum ovs_flow_attr - attributes for %OVS_FLOW_* commands.
  * @OVS_FLOW_ATTR_KEY: Nested %OVS_KEY_ATTR_* attributes specifying the flow
@@ -605,7 +623,7 @@ enum ovs_userspace_attr {
 #define OVS_USERSPACE_ATTR_MAX (__OVS_USERSPACE_ATTR_MAX - 1)
 
 struct ovs_action_trunc {
-	uint32_t max_len; /* Max packet size in bytes. */
+	__u32 max_len; /* Max packet size in bytes. */
 };
 
 /**
@@ -674,6 +692,21 @@ struct ovs_action_hash {
  * @OVS_CT_ATTR_HELPER: variable length string defining conntrack ALG.
  * @OVS_CT_ATTR_NAT: Nested OVS_NAT_ATTR_* for performing L3 network address
  * translation (NAT) on the packet.
+ * @OVS_CT_ATTR_FORCE_COMMIT: Like %OVS_CT_ATTR_COMMIT, but instead of doing
+ * nothing if the connection is already committed will check that the current
+ * packet is in conntrack entry's original direction.  If directionality does
+ * not match, will delete the existing conntrack entry and commit a new one.
+ * @OVS_CT_ATTR_EVENTMASK: Mask of bits indicating which conntrack event types
+ * (enum ip_conntrack_events IPCT_*) should be reported.  For any bit set to
+ * zero, the corresponding event type is not generated.  Default behavior
+ * depends on system configuration, but typically all event types are
+ * generated, hence listening on NFNLGRP_CONNTRACK_UPDATE events may get a lot
+ * of events.  Explicitly passing this attribute allows limiting the updates
+ * received to the events of interest.  The bit 1 << IPCT_NEW, 1 <<
+ * IPCT_RELATED, and 1 << IPCT_DESTROY must be set to ones for those events to
+ * be received on NFNLGRP_CONNTRACK_NEW and NFNLGRP_CONNTRACK_DESTROY groups,
+ * respectively.  Remaining bits control the changes for which an event is
+ * delivered on the NFNLGRP_CONNTRACK_UPDATE group.
  */
 enum ovs_ct_attr {
 	OVS_CT_ATTR_UNSPEC,
@@ -684,6 +717,8 @@ enum ovs_ct_attr {
 	OVS_CT_ATTR_HELPER,     /* netlink helper to assist detection of
 				   related connections. */
 	OVS_CT_ATTR_NAT,        /* Nested OVS_NAT_ATTR_* */
+	OVS_CT_ATTR_FORCE_COMMIT,  /* No argument */
+	OVS_CT_ATTR_EVENTMASK,  /* u32 mask of IPCT_* events. */
 	__OVS_CT_ATTR_MAX
 };
 
@@ -773,6 +808,7 @@ struct ovs_action_push_eth {
  * packet.
  * @OVS_ACTION_ATTR_POP_ETH: Pop the outermost Ethernet header off the
  * packet.
+ * @OVS_ACTION_ATTR_CT_CLEAR: Clear conntrack state from the packet.
  *
  * Only a single header can be set with a single %OVS_ACTION_ATTR_SET.  Not all
  * fields within a header are modifiable, e.g. the IPv4 protocol and fragment
@@ -802,6 +838,7 @@ enum ovs_action_attr {
 	OVS_ACTION_ATTR_TRUNC,        /* u32 struct ovs_action_trunc. */
 	OVS_ACTION_ATTR_PUSH_ETH,     /* struct ovs_action_push_eth. */
 	OVS_ACTION_ATTR_POP_ETH,      /* No argument. */
+	OVS_ACTION_ATTR_CT_CLEAR,     /* No argument. */
 
 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
 				       * from userspace. */

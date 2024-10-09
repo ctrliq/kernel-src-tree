@@ -72,6 +72,8 @@ void create_mem_hole(struct mem_chunk mem_chunk[], unsigned long addr,
 #define MACHINE_FLAG_TE		(1UL << 15)
 #define MACHINE_FLAG_RRBM	(1UL << 16)
 #define MACHINE_FLAG_VX		(1UL << 17)
+#define MACHINE_FLAG_GS		(1UL << 18)
+#define MACHINE_FLAG_NX		(1UL << 19)
 
 #define MACHINE_IS_VM		(S390_lowcore.machine_flags & MACHINE_FLAG_VM)
 #define MACHINE_IS_KVM		(S390_lowcore.machine_flags & MACHINE_FLAG_KVM)
@@ -95,6 +97,8 @@ void create_mem_hole(struct mem_chunk mem_chunk[], unsigned long addr,
 #define MACHINE_HAS_TE		(0)
 #define MACHINE_HAS_RRBM	(0)
 #define MACHINE_HAS_VX		(0)
+#define MACHINE_HAS_GS		(0)
+#define MACHINE_HAS_NX		(0)
 #else /* CONFIG_64BIT */
 #define MACHINE_HAS_IEEE	(1)
 #define MACHINE_HAS_CSP		(1)
@@ -108,6 +112,8 @@ void create_mem_hole(struct mem_chunk mem_chunk[], unsigned long addr,
 #define MACHINE_HAS_TE		(S390_lowcore.machine_flags & MACHINE_FLAG_TE)
 #define MACHINE_HAS_RRBM	(S390_lowcore.machine_flags & MACHINE_FLAG_RRBM)
 #define MACHINE_HAS_VX		(S390_lowcore.machine_flags & MACHINE_FLAG_VX)
+#define MACHINE_HAS_GS		(S390_lowcore.machine_flags & MACHINE_FLAG_GS)
+#define MACHINE_HAS_NX		(S390_lowcore.machine_flags & MACHINE_FLAG_NX)
 #endif /* CONFIG_64BIT */
 
 /*
