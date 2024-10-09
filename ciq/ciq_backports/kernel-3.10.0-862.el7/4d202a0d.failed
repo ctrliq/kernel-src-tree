@@ -1,0 +1,183 @@
+net_sched: generalize bulk dequeue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 4d202a0d31b96ab3324b21e7500d9a2da9ef57dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4d202a0d.failed
+
+When qdisc bulk dequeue was added in linux-3.18 (commit
+5772e9a3463b "qdisc: bulk dequeue support for qdiscs
+with TCQ_F_ONETXQUEUE"), it was constrained to some
+specific qdiscs.
+
+With some extra care, we can extend this to all qdiscs,
+so that typical traffic shaping solutions can benefit from
+small batches (8 packets in this patch).
+
+For example, HTB is often used on some multi queue device.
+And bonding/team are multi queue devices...
+
+Idea is to bulk-dequeue packets mapping to the same transmit queue.
+
+This brings between 35 and 80 % performance increase in HTB setup
+under pressure on a bonding setup :
+
+1) NUMA node contention :   610,000 pps -> 1,110,000 pps
+2) No node contention   : 1,380,000 pps -> 1,930,000 pps
+
+Now we should work to add batches on the enqueue() side ;)
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: John Fastabend <john.r.fastabend@intel.com>
+	Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Cc: Florian Westphal <fw@strlen.de>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4d202a0d31b96ab3324b21e7500d9a2da9ef57dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+diff --cc include/net/sch_generic.h
+index 71548842d47c,909aff2db2b3..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -79,11 -75,14 +79,18 @@@ struct Qdisc 
+  	/*
+  	 * For performance sake on SMP, we put highly modified fields at the end
+  	 */
+++<<<<<<< HEAD
+ +	unsigned long		state;
+++=======
++ 	struct sk_buff		*gso_skb ____cacheline_aligned_in_smp;
+++>>>>>>> 4d202a0d31b9 (net_sched: generalize bulk dequeue)
+  	struct sk_buff_head	q;
+  	struct gnet_stats_basic_packed bstats;
+ -	seqcount_t		running;
+ +	unsigned int		__state;
+  	struct gnet_stats_queue	qstats;
++ 	unsigned long		state;
++ 	struct Qdisc            *next_sched;
++ 	struct sk_buff		*skb_bad_txq;
+  	struct rcu_head		rcu_head;
+  	int			padded;
+  	atomic_t		refcnt;
+* Unmerged path include/net/sch_generic.h
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index e276704c5e88..463a1af47f5c 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -77,6 +77,34 @@ static void try_bulk_dequeue_skb(struct Qdisc *q,
+ 	skb->next = NULL;
+ }
+ 
++/* This variant of try_bulk_dequeue_skb() makes sure
++ * all skbs in the chain are for the same txq
++ */
++static void try_bulk_dequeue_skb_slow(struct Qdisc *q,
++				      struct sk_buff *skb,
++				      int *packets)
++{
++	int mapping = skb_get_queue_mapping(skb);
++	struct sk_buff *nskb;
++	int cnt = 0;
++
++	do {
++		nskb = q->dequeue(q);
++		if (!nskb)
++			break;
++		if (unlikely(skb_get_queue_mapping(nskb) != mapping)) {
++			q->skb_bad_txq = nskb;
++			qdisc_qstats_backlog_inc(q, nskb);
++			q->q.qlen++;
++			break;
++		}
++		skb->next = nskb;
++		skb = nskb;
++	} while (++cnt < 8);
++	(*packets) += cnt;
++	skb->next = NULL;
++}
++
+ /* Note that dequeue_skb can possibly return a SKB list (via skb->next).
+  * A requeued skb (via q->gso_skb) can also be a SKB list.
+  */
+@@ -87,8 +115,9 @@ static struct sk_buff *dequeue_skb(struct Qdisc *q, bool *validate,
+ 	const struct netdev_queue *txq = q->dev_queue;
+ 
+ 	*packets = 1;
+-	*validate = true;
+ 	if (unlikely(skb)) {
++		/* skb in gso_skb were already validated */
++		*validate = false;
+ 		/* check the reason of requeuing without tx lock first */
+ 		txq = skb_get_tx_queue(txq->dev, skb);
+ 		if (!netif_xmit_frozen_or_stopped(txq)) {
+@@ -97,15 +126,30 @@ static struct sk_buff *dequeue_skb(struct Qdisc *q, bool *validate,
+ 			q->q.qlen--;
+ 		} else
+ 			skb = NULL;
+-		/* skb in gso_skb were already validated */
+-		*validate = false;
+-	} else {
+-		if (!(q->flags & TCQ_F_ONETXQUEUE) ||
+-		    !netif_xmit_frozen_or_stopped(txq)) {
+-			skb = q->dequeue(q);
+-			if (skb && qdisc_may_bulk(q))
+-				try_bulk_dequeue_skb(q, skb, txq, packets);
++		return skb;
++	}
++	*validate = true;
++	skb = q->skb_bad_txq;
++	if (unlikely(skb)) {
++		/* check the reason of requeuing without tx lock first */
++		txq = skb_get_tx_queue(txq->dev, skb);
++		if (!netif_xmit_frozen_or_stopped(txq)) {
++			q->skb_bad_txq = NULL;
++			qdisc_qstats_backlog_dec(q, skb);
++			q->q.qlen--;
++			goto bulk;
+ 		}
++		return NULL;
++	}
++	if (!(q->flags & TCQ_F_ONETXQUEUE) ||
++	    !netif_xmit_frozen_or_stopped(txq))
++		skb = q->dequeue(q);
++	if (skb) {
++bulk:
++		if (qdisc_may_bulk(q))
++			try_bulk_dequeue_skb(q, skb, txq, packets);
++		else
++			try_bulk_dequeue_skb_slow(q, skb, packets);
+ 	}
+ 	return skb;
+ }
+@@ -650,11 +694,14 @@ void qdisc_reset(struct Qdisc *qdisc)
+ 	if (ops->reset)
+ 		ops->reset(qdisc);
+ 
++	kfree_skb(qdisc->skb_bad_txq);
++	qdisc->skb_bad_txq = NULL;
++
+ 	if (qdisc->gso_skb) {
+ 		kfree_skb_list(qdisc->gso_skb);
+ 		qdisc->gso_skb = NULL;
+-		qdisc->q.qlen = 0;
+ 	}
++	qdisc->q.qlen = 0;
+ }
+ EXPORT_SYMBOL(qdisc_reset);
+ 
+@@ -693,6 +740,7 @@ void qdisc_destroy(struct Qdisc *qdisc)
+ 	dev_put(qdisc_dev(qdisc));
+ 
+ 	kfree_skb_list(qdisc->gso_skb);
++	kfree_skb(qdisc->skb_bad_txq);
+ 	/*
+ 	 * gen_estimator est_timer() might access qdisc->q.lock,
+ 	 * wait a RCU grace period before freeing qdisc.
