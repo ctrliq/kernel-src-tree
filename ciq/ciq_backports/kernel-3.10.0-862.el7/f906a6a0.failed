@@ -1,0 +1,220 @@
+blk-mq: improve tag waiting setup for non-shared tags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit f906a6a0f42684715b552ccff9282b22cfe2b5a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f906a6a0.failed
+
+If we run out of driver tags, we currently treat shared and non-shared
+tags the same - both cases hook into the tag waitqueue. This is a bit
+more costly than it needs to be on unshared tags, since we have to both
+grab the hctx lock, and the waitqueue lock (and disable interrupts).
+For the non-shared case, we can simply mark the queue as needing a
+restart.
+
+Split blk_mq_dispatch_wait_add() to account for both cases, and
+rename it to blk_mq_mark_tag_wait() to better reflect what it
+does now.
+
+Without this patch, shared and non-shared performance is about the same
+with 4 fio thread hammering on a single null_blk device (~410K, at 75%
+sys). With the patch, the shared case is the same, but the non-shared
+tags case runs at 431K at 71% sys.
+
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f906a6a0f42684715b552ccff9282b22cfe2b5a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index d9bfe0c6bc0e,3295859f419d..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -825,28 -962,162 +825,174 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+ -bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
+ -			   bool wait)
+ +bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+  {
+++<<<<<<< HEAD
+ +	struct request_queue *q = hctx->queue;
+ +	struct request *rq;
+ +	LIST_HEAD(driver_list);
+ +	struct list_head *dptr;
+ +	int errors, queued, ret = BLK_MQ_RQ_QUEUE_OK;
+++=======
++ 	struct blk_mq_alloc_data data = {
++ 		.q = rq->q,
++ 		.hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu),
++ 		.flags = wait ? 0 : BLK_MQ_REQ_NOWAIT,
++ 	};
++ 
++ 	might_sleep_if(wait);
++ 
++ 	if (rq->tag != -1)
++ 		goto done;
++ 
++ 	if (blk_mq_tag_is_reserved(data.hctx->sched_tags, rq->internal_tag))
++ 		data.flags |= BLK_MQ_REQ_RESERVED;
++ 
++ 	rq->tag = blk_mq_get_tag(&data);
++ 	if (rq->tag >= 0) {
++ 		if (blk_mq_tag_busy(data.hctx)) {
++ 			rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 			atomic_inc(&data.hctx->nr_active);
++ 		}
++ 		data.hctx->tags->rqs[rq->tag] = rq;
++ 	}
++ 
++ done:
++ 	if (hctx)
++ 		*hctx = data.hctx;
++ 	return rq->tag != -1;
++ }
++ 
++ static int blk_mq_dispatch_wake(wait_queue_entry_t *wait, unsigned mode,
++ 				int flags, void *key)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	hctx = container_of(wait, struct blk_mq_hw_ctx, dispatch_wait);
++ 
++ 	list_del_init(&wait->entry);
++ 	blk_mq_run_hw_queue(hctx, true);
++ 	return 1;
++ }
++ 
++ /*
++  * Mark us waiting for a tag. For shared tags, this involves hooking us into
++  * the tag wakeups. For non-shared tags, we can simply mark us nedeing a
++  * restart. For both caes, take care to check the condition again after
++  * marking us as waiting.
++  */
++ static bool blk_mq_mark_tag_wait(struct blk_mq_hw_ctx **hctx,
++ 				 struct request *rq)
++ {
++ 	struct blk_mq_hw_ctx *this_hctx = *hctx;
++ 	bool shared_tags = (this_hctx->flags & BLK_MQ_F_TAG_SHARED) != 0;
++ 	struct sbq_wait_state *ws;
++ 	wait_queue_entry_t *wait;
++ 	bool ret;
++ 
++ 	if (!shared_tags) {
++ 		if (!test_bit(BLK_MQ_S_SCHED_RESTART, &this_hctx->state))
++ 			set_bit(BLK_MQ_S_SCHED_RESTART, &this_hctx->state);
++ 	} else {
++ 		wait = &this_hctx->dispatch_wait;
++ 		if (!list_empty_careful(&wait->entry))
++ 			return false;
++ 
++ 		spin_lock(&this_hctx->lock);
++ 		if (!list_empty(&wait->entry)) {
++ 			spin_unlock(&this_hctx->lock);
++ 			return false;
++ 		}
++ 
++ 		ws = bt_wait_ptr(&this_hctx->tags->bitmap_tags, this_hctx);
++ 		add_wait_queue(&ws->wait, wait);
++ 	}
+++>>>>>>> f906a6a0f426 (blk-mq: improve tag waiting setup for non-shared tags)
+  
+  	/*
+ -	 * It's possible that a tag was freed in the window between the
+ -	 * allocation failure and adding the hardware queue to the wait
+ -	 * queue.
+ +	 * Start off with dptr being NULL, so we start the first request
+ +	 * immediately, even if we have more pending.
+  	 */
+++<<<<<<< HEAD
+ +	dptr = NULL;
+++=======
++ 	ret = blk_mq_get_driver_tag(rq, hctx, false);
++ 
++ 	if (!shared_tags) {
++ 		/*
++ 		 * Don't clear RESTART here, someone else could have set it.
++ 		 * At most this will cost an extra queue run.
++ 		 */
++ 		return ret;
++ 	} else {
++ 		if (!ret) {
++ 			spin_unlock(&this_hctx->lock);
++ 			return false;
++ 		}
++ 
++ 		/*
++ 		 * We got a tag, remove ourselves from the wait queue to ensure
++ 		 * someone else gets the wakeup.
++ 		 */
++ 		spin_lock_irq(&ws->wait.lock);
++ 		list_del_init(&wait->entry);
++ 		spin_unlock_irq(&ws->wait.lock);
++ 		spin_unlock(&this_hctx->lock);
++ 		return true;
++ 	}
++ }
++ 
++ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
++ 			     bool got_budget)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	struct request *rq, *nxt;
++ 	bool no_tag = false;
++ 	int errors, queued;
++ 
++ 	if (list_empty(list))
++ 		return false;
++ 
++ 	WARN_ON(!list_is_singular(list) && got_budget);
+++>>>>>>> f906a6a0f426 (blk-mq: improve tag waiting setup for non-shared tags)
+  
+  	/*
+  	 * Now process all the entries, sending them to the driver.
+  	 */
+  	errors = queued = 0;
+ -	do {
+ +	while (!list_empty(list)) {
+  		struct blk_mq_queue_data bd;
+ -		blk_status_t ret;
+  
+  		rq = list_first_entry(list, struct request, queuelist);
+++<<<<<<< HEAD
+++=======
++ 		if (!blk_mq_get_driver_tag(rq, &hctx, false)) {
++ 			/*
++ 			 * The initial allocation attempt failed, so we need to
++ 			 * rerun the hardware queue when a tag is freed. The
++ 			 * waitqueue takes care of that. If the queue is run
++ 			 * before we add this entry back on the dispatch list,
++ 			 * we'll re-run it below.
++ 			 */
++ 			if (!blk_mq_mark_tag_wait(&hctx, rq)) {
++ 				if (got_budget)
++ 					blk_mq_put_dispatch_budget(hctx);
++ 				/*
++ 				 * For non-shared tags, the RESTART check
++ 				 * will suffice.
++ 				 */
++ 				if (hctx->flags & BLK_MQ_F_TAG_SHARED)
++ 					no_tag = true;
++ 				break;
++ 			}
++ 		}
++ 
++ 		if (!got_budget && !blk_mq_get_dispatch_budget(hctx)) {
++ 			blk_mq_put_driver_tag(rq);
++ 			break;
++ 		}
++ 
+++>>>>>>> f906a6a0f426 (blk-mq: improve tag waiting setup for non-shared tags)
+  		list_del_init(&rq->queuelist);
+  
+  		bd.rq = rq;
+* Unmerged path block/blk-mq.c
