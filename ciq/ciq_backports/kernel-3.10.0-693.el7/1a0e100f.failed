@@ -1,0 +1,198 @@
+RDS: TCP: Force every connection to be initiated by numerically smaller IP address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit 1a0e100fb2c9667cea2a7d755faaa83569942f05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1a0e100f.failed
+
+When 2 RDS peers initiate an RDS-TCP connection simultaneously,
+there is a potential for "duelling syns" on either/both sides.
+See commit 241b271952eb ("RDS-TCP: Reset tcp callbacks if re-using an
+outgoing socket in rds_tcp_accept_one()") for a description of this
+condition, and the arbitration logic which ensures that the
+numerically large IP address in the TCP connection is bound to the
+RDS_TCP_PORT ("canonical ordering").
+
+The rds_connection should not be marked as RDS_CONN_UP until the
+arbitration logic has converged for the following reason. The sender
+may start transmitting RDS datagrams as soon as RDS_CONN_UP is set,
+and since the sender removes all datagrams from the rds_connection's
+cp_retrans queue based on TCP acks. If the TCP ack was sent from
+a tcp socket that got reset as part of duel aribitration (but
+before data was delivered to the receivers RDS socket layer),
+the sender may end up prematurely freeing the datagram, and
+the datagram is no longer reliably deliverable.
+
+This patch remedies that condition by making sure that, upon
+receipt of 3WH completion state change notification of TCP_ESTABLISHED
+in rds_tcp_state_change, we mark the rds_connection as RDS_CONN_UP
+if, and only if, the IP addresses and ports for the connection are
+canonically ordered. In all other cases, rds_tcp_state_change will
+force an rds_conn_path_drop(), and rds_queue_reconnect() on
+both peers will restart the connection to ensure canonical ordering.
+
+A side-effect of enforcing this condition in rds_tcp_state_change()
+is that rds_tcp_accept_one_path() can now be refactored for simplicity.
+It is also no longer possible to encounter an RDS_CONN_UP connection in
+the arbitration logic in rds_tcp_accept_one().
+
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a0e100fb2c9667cea2a7d755faaa83569942f05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/tcp_connect.c
+#	net/rds/tcp_listen.c
+diff --cc net/rds/tcp_connect.c
+index a86fb96b1ae0,d6839d96d539..000000000000
+--- a/net/rds/tcp_connect.c
++++ b/net/rds/tcp_connect.c
+@@@ -54,22 -54,34 +54,50 @@@ void rds_tcp_state_change(struct sock *
+  
+  	rdsdebug("sock %p state_change to %d\n", tc->t_sock, sk->sk_state);
+  
+++<<<<<<< HEAD
+ +	switch(sk->sk_state) {
+ +		/* ignore connecting sockets as they make progress */
+ +		case TCP_SYN_SENT:
+ +		case TCP_SYN_RECV:
+ +			break;
+ +		case TCP_ESTABLISHED:
+ +			rds_connect_path_complete(conn, RDS_CONN_CONNECTING);
+ +			break;
+ +		case TCP_CLOSE_WAIT:
+ +		case TCP_CLOSE:
+ +			rds_conn_drop(conn);
+ +		default:
+ +			break;
+++=======
++ 	switch (sk->sk_state) {
++ 	/* ignore connecting sockets as they make progress */
++ 	case TCP_SYN_SENT:
++ 	case TCP_SYN_RECV:
++ 		break;
++ 	case TCP_ESTABLISHED:
++ 		/* Force the peer to reconnect so that we have the
++ 		 * TCP ports going from <smaller-ip>.<transient> to
++ 		 * <larger-ip>.<RDS_TCP_PORT>. We avoid marking the
++ 		 * RDS connection as RDS_CONN_UP until the reconnect,
++ 		 * to avoid RDS datagram loss.
++ 		 */
++ 		if (cp->cp_conn->c_laddr > cp->cp_conn->c_faddr &&
++ 		    rds_conn_path_transition(cp, RDS_CONN_CONNECTING,
++ 					     RDS_CONN_ERROR)) {
++ 			rds_conn_path_drop(cp);
++ 		} else {
++ 			rds_connect_path_complete(cp, RDS_CONN_CONNECTING);
++ 		}
++ 		break;
++ 	case TCP_CLOSE_WAIT:
++ 	case TCP_CLOSE:
++ 		rds_conn_path_drop(cp);
++ 	default:
++ 		break;
+++>>>>>>> 1a0e100fb2c9 (RDS: TCP: Force every connection to be initiated by numerically smaller IP address)
+  	}
+  out:
+ -	read_unlock_bh(&sk->sk_callback_lock);
+ +	read_unlock(&sk->sk_callback_lock);
+  	state_change(sk);
+  }
+  
+diff --cc net/rds/tcp_listen.c
+index ecfec7ecfd15,f74bab3ecdca..000000000000
+--- a/net/rds/tcp_listen.c
++++ b/net/rds/tcp_listen.c
+@@@ -70,6 -70,47 +70,50 @@@ bail
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* rds_tcp_accept_one_path(): if accepting on cp_index > 0, make sure the
++  * client's ipaddr < server's ipaddr. Otherwise, close the accepted
++  * socket and force a reconneect from smaller -> larger ip addr. The reason
++  * we special case cp_index 0 is to allow the rds probe ping itself to itself
++  * get through efficiently.
++  * Since reconnects are only initiated from the node with the numerically
++  * smaller ip address, we recycle conns in RDS_CONN_ERROR on the passive side
++  * by moving them to CONNECTING in this function.
++  */
++ struct rds_tcp_connection *rds_tcp_accept_one_path(struct rds_connection *conn)
++ {
++ 	int i;
++ 	bool peer_is_smaller = (conn->c_faddr < conn->c_laddr);
++ 	int npaths = max_t(int, 1, conn->c_npaths);
++ 
++ 	/* for mprds, all paths MUST be initiated by the peer
++ 	 * with the smaller address.
++ 	 */
++ 	if (!peer_is_smaller) {
++ 		/* Make sure we initiate at least one path if this
++ 		 * has not already been done; rds_start_mprds() will
++ 		 * take care of additional paths, if necessary.
++ 		 */
++ 		if (npaths == 1)
++ 			rds_conn_path_connect_if_down(&conn->c_path[0]);
++ 		return NULL;
++ 	}
++ 
++ 	for (i = 0; i < npaths; i++) {
++ 		struct rds_conn_path *cp = &conn->c_path[i];
++ 
++ 		if (rds_conn_path_transition(cp, RDS_CONN_DOWN,
++ 					     RDS_CONN_CONNECTING) ||
++ 		    rds_conn_path_transition(cp, RDS_CONN_ERROR,
++ 					     RDS_CONN_CONNECTING)) {
++ 			return cp->cp_transport_data;
++ 		}
++ 	}
++ 	return NULL;
++ }
++ 
+++>>>>>>> 1a0e100fb2c9 (RDS: TCP: Force every connection to be initiated by numerically smaller IP address)
+  int rds_tcp_accept_one(struct socket *sock)
+  {
+  	struct socket *new_sock = NULL;
+@@@ -118,11 -160,14 +162,22 @@@
+  	 * If the client reboots, this conn will need to be cleaned up.
+  	 * rds_tcp_state_change() will do that cleanup
+  	 */
+++<<<<<<< HEAD
+ +	rs_tcp = (struct rds_tcp_connection *)conn->c_transport_data;
+ +	rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING);
+ +	mutex_lock(&rs_tcp->t_conn_lock);
+ +	conn_state = rds_conn_state(conn);
+ +	if (conn_state != RDS_CONN_CONNECTING && conn_state != RDS_CONN_UP)
+++=======
++ 	rs_tcp = rds_tcp_accept_one_path(conn);
++ 	if (!rs_tcp)
++ 		goto rst_nsk;
++ 	mutex_lock(&rs_tcp->t_conn_path_lock);
++ 	cp = rs_tcp->t_cpath;
++ 	conn_state = rds_conn_path_state(cp);
++ 	WARN_ON(conn_state == RDS_CONN_UP);
++ 	if (conn_state != RDS_CONN_CONNECTING && conn_state != RDS_CONN_ERROR)
+++>>>>>>> 1a0e100fb2c9 (RDS: TCP: Force every connection to be initiated by numerically smaller IP address)
+  		goto rst_nsk;
+  	if (rs_tcp->t_sock) {
+  		/* Need to resolve a duelling SYN between peers.
+diff --git a/net/rds/connection.c b/net/rds/connection.c
+index c790f83d093b..8549bafe9474 100644
+--- a/net/rds/connection.c
++++ b/net/rds/connection.c
+@@ -649,6 +649,7 @@ void rds_conn_path_connect_if_down(struct rds_conn_path *cp)
+ 	    !test_and_set_bit(RDS_RECONNECT_PENDING, &cp->cp_flags))
+ 		queue_delayed_work(rds_wq, &cp->cp_conn_w, 0);
+ }
++EXPORT_SYMBOL_GPL(rds_conn_path_connect_if_down);
+ 
+ void rds_conn_connect_if_down(struct rds_connection *conn)
+ {
+* Unmerged path net/rds/tcp_connect.c
+* Unmerged path net/rds/tcp_listen.c
