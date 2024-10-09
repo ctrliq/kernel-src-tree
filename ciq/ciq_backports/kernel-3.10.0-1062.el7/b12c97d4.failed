@@ -1,0 +1,176 @@
+nfp: flower: fix cb_ident duplicate in indirect block register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit b12c97d45cd061862b79fe02aa41a73d685ec7a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b12c97d4.failed
+
+Previously the identifier used for indirect block callback registry and
+for block rule cb registry (when done via indirect blocks) was the pointer
+to the netdev we were interested in receiving updates on. This worked fine
+if a single app existed that registered one callback per netdev of
+interest. However, if multiple cards are in place and, in turn, multiple
+apps, then each app may register the same callback with the same
+identifier to both the netdev's indirect block cb list and to a block's cb
+list. This can lead to EEXIST errors and/or incorrect cb deletions.
+
+Prevent this conflict by using the app pointer as the identifier for
+netdev indirect block cb registry, allowing each app to register a unique
+callback per netdev. For block cb registry, the same app may register
+multiple cbs to the same block if using TC shared blocks. Instead of the
+app, use the pointer to the allocated cb_priv data as the identifier here.
+This means that there can be a unique block callback for each app/netdev
+combo.
+
+Fixes: 3166dd07a9cb ("nfp: flower: offload tunnel decap rules via indirect TC blocks")
+	Reported-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b12c97d45cd061862b79fe02aa41a73d685ec7a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 050fdefa9950,c642fd84eb02..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -695,3 -653,130 +695,133 @@@ int nfp_flower_setup_tc(struct nfp_app 
+  		return -EOPNOTSUPP;
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct nfp_flower_indr_block_cb_priv {
++ 	struct net_device *netdev;
++ 	struct nfp_app *app;
++ 	struct list_head list;
++ };
++ 
++ static struct nfp_flower_indr_block_cb_priv *
++ nfp_flower_indr_block_cb_priv_lookup(struct nfp_app *app,
++ 				     struct net_device *netdev)
++ {
++ 	struct nfp_flower_indr_block_cb_priv *cb_priv;
++ 	struct nfp_flower_priv *priv = app->priv;
++ 
++ 	/* All callback list access should be protected by RTNL. */
++ 	ASSERT_RTNL();
++ 
++ 	list_for_each_entry(cb_priv, &priv->indr_block_cb_priv, list)
++ 		if (cb_priv->netdev == netdev)
++ 			return cb_priv;
++ 
++ 	return NULL;
++ }
++ 
++ static int nfp_flower_setup_indr_block_cb(enum tc_setup_type type,
++ 					  void *type_data, void *cb_priv)
++ {
++ 	struct nfp_flower_indr_block_cb_priv *priv = cb_priv;
++ 	struct tc_cls_flower_offload *flower = type_data;
++ 
++ 	if (flower->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSFLOWER:
++ 		return nfp_flower_repr_offload(priv->app, priv->netdev,
++ 					       type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int
++ nfp_flower_setup_indr_tc_block(struct net_device *netdev, struct nfp_app *app,
++ 			       struct tc_block_offload *f)
++ {
++ 	struct nfp_flower_indr_block_cb_priv *cb_priv;
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int err;
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		cb_priv = kmalloc(sizeof(*cb_priv), GFP_KERNEL);
++ 		if (!cb_priv)
++ 			return -ENOMEM;
++ 
++ 		cb_priv->netdev = netdev;
++ 		cb_priv->app = app;
++ 		list_add(&cb_priv->list, &priv->indr_block_cb_priv);
++ 
++ 		err = tcf_block_cb_register(f->block,
++ 					    nfp_flower_setup_indr_block_cb,
++ 					    cb_priv, cb_priv, f->extack);
++ 		if (err) {
++ 			list_del(&cb_priv->list);
++ 			kfree(cb_priv);
++ 		}
++ 
++ 		return err;
++ 	case TC_BLOCK_UNBIND:
++ 		cb_priv = nfp_flower_indr_block_cb_priv_lookup(app, netdev);
++ 		if (!cb_priv)
++ 			return -ENOENT;
++ 
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_flower_setup_indr_block_cb,
++ 					cb_priv);
++ 		list_del(&cb_priv->list);
++ 		kfree(cb_priv);
++ 
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ nfp_flower_indr_setup_tc_cb(struct net_device *netdev, void *cb_priv,
++ 			    enum tc_setup_type type, void *type_data)
++ {
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		return nfp_flower_setup_indr_tc_block(netdev, cb_priv,
++ 						      type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
++ 				       struct net_device *netdev,
++ 				       unsigned long event)
++ {
++ 	int err;
++ 
++ 	if (!nfp_fl_is_netdev_to_offload(netdev))
++ 		return NOTIFY_OK;
++ 
++ 	if (event == NETDEV_REGISTER) {
++ 		err = __tc_indr_block_cb_register(netdev, app,
++ 						  nfp_flower_indr_setup_tc_cb,
++ 						  app);
++ 		if (err)
++ 			nfp_flower_cmsg_warn(app,
++ 					     "Indirect block reg failed - %s\n",
++ 					     netdev->name);
++ 	} else if (event == NETDEV_UNREGISTER) {
++ 		__tc_indr_block_cb_unregister(netdev,
++ 					      nfp_flower_indr_setup_tc_cb, app);
++ 	}
++ 
++ 	return NOTIFY_OK;
++ }
+++>>>>>>> b12c97d45cd0 (nfp: flower: fix cb_ident duplicate in indirect block register)
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
