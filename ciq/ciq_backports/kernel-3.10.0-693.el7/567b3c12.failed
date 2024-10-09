@@ -1,0 +1,182 @@
+qede: Revise state locking scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 567b3c127a79277bac31a9609734b355d30e7905
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/567b3c12.failed
+
+As qede utilizes an internal-reload sequence as result of various
+configuration changes, the netif state wouldn't always accurately describe
+the status of the configuration.
+To compensate, we're storing an internal state of the device, which should
+only be accessed under the qede_lock.
+
+This patch fixes and improves several state/lock interactions:
+  - The internal state should only be checked while locked.
+  - While holding lock, it's preferable to check state rather than
+    the netdevice's state.
+  - The reload sequence is not 'atomic' - unload and subsequent load
+    are not in the same critical section.
+
+This also add the 'locked' variant for the reload, which would later be
+used by XDP - useful in the case where the correct sequence is 'lock,
+check state and re-configure if good', instead of allowing the reload
+itself to make the decision regarding the configurability of the device.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 567b3c127a79277bac31a9609734b355d30e7905)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+index 4c5145c9f11a,ef8c3276065e..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@@ -759,24 -803,17 +766,30 @@@ static void qede_update_mtu(struct qede
+  int qede_change_mtu(struct net_device *ndev, int new_mtu)
+  {
+  	struct qede_dev *edev = netdev_priv(ndev);
+- 	union qede_reload_args args;
++ 	struct qede_reload_args args;
+  
+ +	if ((new_mtu > ETH_MAX_JUMBO_PACKET_SIZE) ||
+ +	    ((new_mtu + ETH_HLEN) < ETH_MIN_PACKET_SIZE)) {
+ +		DP_ERR(edev, "Can't support requested MTU size\n");
+ +		return -EINVAL;
+ +	}
+ +
+  	DP_VERBOSE(edev, (NETIF_MSG_IFUP | NETIF_MSG_IFDOWN),
+  		   "Configuring MTU size of %d\n", new_mtu);
+  
+- 	/* Set the mtu field and re-start the interface if needed*/
+- 	args.mtu = new_mtu;
++ 	/* Set the mtu field and re-start the interface if needed */
++ 	args.u.mtu = new_mtu;
++ 	args.func = &qede_update_mtu;
++ 	qede_reload(edev, &args, false);
+  
+++<<<<<<< HEAD
+ +	if (netif_running(edev->ndev))
+ +		qede_reload(edev, &qede_update_mtu, &args);
+ +
+ +	qede_update_mtu(edev, &args);
+++=======
++ 	edev->ops->common->update_mtu(edev->cdev, new_mtu);
+++>>>>>>> 567b3c127a79 (qede: Revise state locking scheme)
+  
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index a8dbc81cacdb,64c7f3b75283..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -104,8 -100,22 +104,21 @@@ static int qede_alloc_rx_buffer(struct 
+  				struct qede_rx_queue *rxq);
+  static void qede_link_update(void *dev, struct qed_link_output *link);
+  
++ /* The qede lock is used to protect driver state change and driver flows that
++  * are not reentrant.
++  */
++ void __qede_lock(struct qede_dev *edev)
++ {
++ 	mutex_lock(&edev->qede_lock);
++ }
++ 
++ void __qede_unlock(struct qede_dev *edev)
++ {
++ 	mutex_unlock(&edev->qede_lock);
++ }
++ 
+  #ifdef CONFIG_QED_SRIOV
+ -static int qede_set_vf_vlan(struct net_device *ndev, int vf, u16 vlan, u8 qos,
+ -			    __be16 vlan_proto)
+ +static int qede_set_vf_vlan(struct net_device *ndev, int vf, u16 vlan, u8 qos)
+  {
+  	struct qede_dev *edev = netdev_priv(ndev);
+  
+@@@ -3481,7 -3612,10 +3510,14 @@@ static void qede_unload(struct qede_de
+  
+  	DP_INFO(edev, "Starting qede unload\n");
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&edev->qede_lock);
+++=======
++ 	if (!is_locked)
++ 		__qede_lock(edev);
++ 
++ 	qede_roce_dev_event_close(edev);
+++>>>>>>> 567b3c127a79 (qede: Revise state locking scheme)
+  	edev->state = QEDE_STATE_CLOSED;
+  
+  	/* Close OS Tx */
+@@@ -3581,12 -3716,15 +3618,14 @@@ static int qede_load(struct qede_dev *e
+  	/* Query whether link is already-up */
+  	memset(&link_output, 0, sizeof(link_output));
+  	edev->ops->common->get_link(edev->cdev, &link_output);
+ -	qede_roce_dev_event_open(edev);
+  	qede_link_update(edev, &link_output);
+  
++ 	edev->state = QEDE_STATE_OPEN;
++ 
+  	DP_INFO(edev, "Ending successfully qede load\n");
+  
+- 	return 0;
+  
++ 	goto out;
+  err4:
+  	qede_sync_free_irqs(edev);
+  	memset(&edev->int_info.msix_cnt, 0, sizeof(struct qed_int_info));
+@@@ -3650,8 -3799,10 +3702,8 @@@ static int qede_close(struct net_devic
+  {
+  	struct qede_dev *edev = netdev_priv(ndev);
+  
+- 	qede_unload(edev, QEDE_UNLOAD_NORMAL);
++ 	qede_unload(edev, QEDE_UNLOAD_NORMAL, false);
+  
+ -	edev->ops->common->update_drv_state(edev->cdev, false);
+ -
+  	return 0;
+  }
+  
+diff --git a/drivers/net/ethernet/qlogic/qede/qede.h b/drivers/net/ethernet/qlogic/qede/qede.h
+index 5aa444d45a28..6abaca19af2c 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -327,8 +327,12 @@ struct qede_fastpath {
+ #define QEDE_SP_VXLAN_PORT_CONFIG	2
+ #define QEDE_SP_GENEVE_PORT_CONFIG	3
+ 
+-union qede_reload_args {
+-	u16 mtu;
++struct qede_reload_args {
++	void (*func)(struct qede_dev *edev, struct qede_reload_args *args);
++	union {
++		netdev_features_t features;
++		u16 mtu;
++	} u;
+ };
+ 
+ #ifdef CONFIG_DCB
+@@ -337,11 +341,11 @@ void qede_set_dcbnl_ops(struct net_device *ndev);
+ void qede_config_debug(uint debug, u32 *p_dp_module, u8 *p_dp_level);
+ void qede_set_ethtool_ops(struct net_device *netdev);
+ void qede_reload(struct qede_dev *edev,
+-		 void (*func)(struct qede_dev *edev,
+-			      union qede_reload_args *args),
+-		 union qede_reload_args *args);
++		 struct qede_reload_args *args, bool is_locked);
+ int qede_change_mtu(struct net_device *dev, int new_mtu);
+ void qede_fill_by_demand_stats(struct qede_dev *edev);
++void __qede_lock(struct qede_dev *edev);
++void __qede_unlock(struct qede_dev *edev);
+ bool qede_has_rx_work(struct qede_rx_queue *rxq);
+ int qede_txq_has_work(struct qede_tx_queue *txq);
+ void qede_recycle_rx_bd_ring(struct qede_rx_queue *rxq, struct qede_dev *edev,
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
