@@ -1,0 +1,120 @@
+vmbus: remove hv_event_tasklet_disable/enable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dexuan Cui <decui@microsoft.com>
+commit dad72a1d28442b03aac86836a42de2d00a1014ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dad72a1d.failed
+
+With the recent introduction of per-channel tasklet, we need to update
+the way we handle the 3 concurrency issues:
+
+1. hv_process_channel_removal -> percpu_channel_deq vs.
+   vmbus_chan_sched -> list_for_each_entry(..., percpu_list);
+
+2. vmbus_process_offer -> percpu_channel_enq/deq vs. vmbus_chan_sched.
+
+3. vmbus_close_internal vs. the per-channel tasklet vmbus_on_event;
+
+The first 2 issues can be handled by Stephen's recent patch
+"vmbus: use rcu for per-cpu channel list", and the third issue
+can be handled by calling tasklet_disable in vmbus_close_internal here.
+
+We don't need the original hv_event_tasklet_disable/enable since we
+now use per-channel tasklet instead of the previous per-CPU tasklet,
+and actually we must remove them due to the side effect now:
+vmbus_process_offer -> hv_event_tasklet_enable -> tasklet_schedule will
+start the per-channel callback prematurely, cauing NULL dereferencing
+(the channel may haven't been properly configured to run the callback yet).
+
+Fixes: 631e63a9f346 ("vmbus: change to per channel tasklet")
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+	Cc: Haiyang Zhang <haiyangz@microsoft.com>
+	Cc: Stephen Hemminger <sthemmin@microsoft.com>
+	Tested-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit dad72a1d28442b03aac86836a42de2d00a1014ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel.c
+#	drivers/hv/channel_mgmt.c
+diff --cc drivers/hv/channel.c
+index 2dc1bb035e9c,57b2958205c7..000000000000
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@@ -516,15 -530,13 +516,17 @@@ static int vmbus_close_internal(struct 
+  	int ret;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * process_chn_event(), running in the tasklet, can race
+++=======
++ 	 * vmbus_on_event(), running in the per-channel tasklet, can race
+++>>>>>>> dad72a1d2844 (vmbus: remove hv_event_tasklet_disable/enable)
+  	 * with vmbus_close_internal() in the case of SMP guest, e.g., when
+  	 * the former is accessing channel->inbound.ring_buffer, the latter
+- 	 * could be freeing the ring_buffer pages.
+- 	 *
+- 	 * To resolve the race, we can serialize them by disabling the
+- 	 * tasklet when the latter is running here.
++ 	 * could be freeing the ring_buffer pages, so here we must stop it
++ 	 * first.
+  	 */
+- 	hv_event_tasklet_disable(channel);
++ 	tasklet_disable(&channel->callback_event);
+  
+  	/*
+  	 * In case a device driver's probe() fails (e.g.,
+diff --cc drivers/hv/channel_mgmt.c
+index 8a209b718a7d,bf846d078d85..000000000000
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@@ -353,23 -382,6 +353,26 @@@ static void vmbus_release_relid(u32 rel
+  		       true);
+  }
+  
+++<<<<<<< HEAD
+ +void hv_event_tasklet_disable(struct vmbus_channel *channel)
+ +{
+ +	struct tasklet_struct *tasklet;
+ +	tasklet = hv_context.event_dpc[channel->target_cpu];
+ +	tasklet_disable(tasklet);
+ +}
+ +
+ +void hv_event_tasklet_enable(struct vmbus_channel *channel)
+ +{
+ +	struct tasklet_struct *tasklet;
+ +	tasklet = hv_context.event_dpc[channel->target_cpu];
+ +	tasklet_enable(tasklet);
+ +
+ +	/* In case there is any pending event */
+ +	tasklet_schedule(tasklet);
+ +}
+ +
+++=======
+++>>>>>>> dad72a1d2844 (vmbus: remove hv_event_tasklet_disable/enable)
+  void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
+  {
+  	unsigned long flags;
+* Unmerged path drivers/hv/channel.c
+* Unmerged path drivers/hv/channel_mgmt.c
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 2d127a5ad611..afce0a9ddafe 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -1471,9 +1471,6 @@ extern bool vmbus_prep_negotiate_resp(struct icmsg_hdr *icmsghdrp, u8 *buf,
+ 				const int *srv_version, int srv_vercnt,
+ 				int *nego_fw_version, int *nego_srv_version);
+ 
+-void hv_event_tasklet_disable(struct vmbus_channel *channel);
+-void hv_event_tasklet_enable(struct vmbus_channel *channel);
+-
+ void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid);
+ 
+ void vmbus_setevent(struct vmbus_channel *channel);
