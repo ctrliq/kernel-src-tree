@@ -1,0 +1,257 @@
+userfaultfd: non-cooperative: release all ctx in dup_userfaultfd_complete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 8c9e7bb7a41f2bbd54b2caefb274fb3de239819f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8c9e7bb7.failed
+
+Don't stop running dup_fctx() even if userfaultfd_event_wait_completion
+fails as it has to run userfaultfd_ctx_put on all ctx to pair against
+the userfaultfd_ctx_get that was run on all fctx->orig in
+dup_userfaultfd.
+
+Link: http://lkml.kernel.org/r/20170224181957.19736-4-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Acked-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8c9e7bb7a41f2bbd54b2caefb274fb3de239819f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+diff --cc fs/userfaultfd.c
+index a1a9eb332dc1,dd48052e086f..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -464,13 -527,9 +464,15 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int __maybe_unused userfaultfd_event_wait_completion(
+ +		struct userfaultfd_ctx *ctx,
+ +		struct userfaultfd_wait_queue *ewq)
+++=======
++ static void userfaultfd_event_wait_completion(struct userfaultfd_ctx *ctx,
++ 					      struct userfaultfd_wait_queue *ewq)
+++>>>>>>> 8c9e7bb7a41f (userfaultfd: non-cooperative: release all ctx in dup_userfaultfd_complete)
+  {
+- 	int ret;
+- 
+- 	ret = -1;
+  	if (WARN_ON_ONCE(current->flags & PF_EXITING))
+  		goto out;
+  
+@@@ -522,6 -578,200 +521,203 @@@ static void userfaultfd_event_complete(
+  	__remove_wait_queue(&ctx->event_wqh, &ewq->wq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
++ {
++ 	struct userfaultfd_ctx *ctx = NULL, *octx;
++ 	struct userfaultfd_fork_ctx *fctx;
++ 
++ 	octx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!octx || !(octx->features & UFFD_FEATURE_EVENT_FORK)) {
++ 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
++ 		vma->vm_flags &= ~(VM_UFFD_WP | VM_UFFD_MISSING);
++ 		return 0;
++ 	}
++ 
++ 	list_for_each_entry(fctx, fcs, list)
++ 		if (fctx->orig == octx) {
++ 			ctx = fctx->new;
++ 			break;
++ 		}
++ 
++ 	if (!ctx) {
++ 		fctx = kmalloc(sizeof(*fctx), GFP_KERNEL);
++ 		if (!fctx)
++ 			return -ENOMEM;
++ 
++ 		ctx = kmem_cache_alloc(userfaultfd_ctx_cachep, GFP_KERNEL);
++ 		if (!ctx) {
++ 			kfree(fctx);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		atomic_set(&ctx->refcount, 1);
++ 		ctx->flags = octx->flags;
++ 		ctx->state = UFFD_STATE_RUNNING;
++ 		ctx->features = octx->features;
++ 		ctx->released = false;
++ 		ctx->mm = vma->vm_mm;
++ 		atomic_inc(&ctx->mm->mm_count);
++ 
++ 		userfaultfd_ctx_get(octx);
++ 		fctx->orig = octx;
++ 		fctx->new = ctx;
++ 		list_add_tail(&fctx->list, fcs);
++ 	}
++ 
++ 	vma->vm_userfaultfd_ctx.ctx = ctx;
++ 	return 0;
++ }
++ 
++ static void dup_fctx(struct userfaultfd_fork_ctx *fctx)
++ {
++ 	struct userfaultfd_ctx *ctx = fctx->orig;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_FORK;
++ 	ewq.msg.arg.reserved.reserved1 = (unsigned long)fctx->new;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void dup_userfaultfd_complete(struct list_head *fcs)
++ {
++ 	struct userfaultfd_fork_ctx *fctx, *n;
++ 
++ 	list_for_each_entry_safe(fctx, n, fcs, list) {
++ 		dup_fctx(fctx);
++ 		list_del(&fctx->list);
++ 		kfree(fctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 			     struct vm_userfaultfd_ctx *vm_ctx)
++ {
++ 	struct userfaultfd_ctx *ctx;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (ctx && (ctx->features & UFFD_FEATURE_EVENT_REMAP)) {
++ 		vm_ctx->ctx = ctx;
++ 		userfaultfd_ctx_get(ctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *vm_ctx,
++ 				 unsigned long from, unsigned long to,
++ 				 unsigned long len)
++ {
++ 	struct userfaultfd_ctx *ctx = vm_ctx->ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	if (!ctx)
++ 		return;
++ 
++ 	if (to & ~PAGE_MASK) {
++ 		userfaultfd_ctx_put(ctx);
++ 		return;
++ 	}
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMAP;
++ 	ewq.msg.arg.remap.from = from;
++ 	ewq.msg.arg.remap.to = to;
++ 	ewq.msg.arg.remap.len = len;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void userfaultfd_remove(struct vm_area_struct *vma,
++ 			struct vm_area_struct **prev,
++ 			unsigned long start, unsigned long end)
++ {
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	struct userfaultfd_ctx *ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_REMOVE))
++ 		return;
++ 
++ 	userfaultfd_ctx_get(ctx);
++ 	up_read(&mm->mmap_sem);
++ 
++ 	*prev = NULL; /* We wait for ACK w/o the mmap semaphore */
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMOVE;
++ 	ewq.msg.arg.remove.start = start;
++ 	ewq.msg.arg.remove.end = end;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ 
++ 	down_read(&mm->mmap_sem);
++ }
++ 
++ static bool has_unmap_ctx(struct userfaultfd_ctx *ctx, struct list_head *unmaps,
++ 			  unsigned long start, unsigned long end)
++ {
++ 	struct userfaultfd_unmap_ctx *unmap_ctx;
++ 
++ 	list_for_each_entry(unmap_ctx, unmaps, list)
++ 		if (unmap_ctx->ctx == ctx && unmap_ctx->start == start &&
++ 		    unmap_ctx->end == end)
++ 			return true;
++ 
++ 	return false;
++ }
++ 
++ int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 			   unsigned long start, unsigned long end,
++ 			   struct list_head *unmaps)
++ {
++ 	for ( ; vma && vma->vm_start < end; vma = vma->vm_next) {
++ 		struct userfaultfd_unmap_ctx *unmap_ctx;
++ 		struct userfaultfd_ctx *ctx = vma->vm_userfaultfd_ctx.ctx;
++ 
++ 		if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_UNMAP) ||
++ 		    has_unmap_ctx(ctx, unmaps, start, end))
++ 			continue;
++ 
++ 		unmap_ctx = kzalloc(sizeof(*unmap_ctx), GFP_KERNEL);
++ 		if (!unmap_ctx)
++ 			return -ENOMEM;
++ 
++ 		userfaultfd_ctx_get(ctx);
++ 		unmap_ctx->ctx = ctx;
++ 		unmap_ctx->start = start;
++ 		unmap_ctx->end = end;
++ 		list_add_tail(&unmap_ctx->list, unmaps);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void userfaultfd_unmap_complete(struct mm_struct *mm, struct list_head *uf)
++ {
++ 	struct userfaultfd_unmap_ctx *ctx, *n;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	list_for_each_entry_safe(ctx, n, uf, list) {
++ 		msg_init(&ewq.msg);
++ 
++ 		ewq.msg.event = UFFD_EVENT_UNMAP;
++ 		ewq.msg.arg.remove.start = ctx->start;
++ 		ewq.msg.arg.remove.end = ctx->end;
++ 
++ 		userfaultfd_event_wait_completion(ctx->ctx, &ewq);
++ 
++ 		list_del(&ctx->list);
++ 		kfree(ctx);
++ 	}
++ }
++ 
+++>>>>>>> 8c9e7bb7a41f (userfaultfd: non-cooperative: release all ctx in dup_userfaultfd_complete)
+  static int userfaultfd_release(struct inode *inode, struct file *file)
+  {
+  	struct userfaultfd_ctx *ctx = file->private_data;
+* Unmerged path fs/userfaultfd.c
