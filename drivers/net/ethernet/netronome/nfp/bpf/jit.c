@@ -90,7 +90,9 @@ static void nfp_prog_free(struct nfp_prog *nfp_prog)
 
 static void nfp_prog_push(struct nfp_prog *nfp_prog, u64 insn)
 {
-	if (nfp_prog->__prog_alloc_len == nfp_prog->prog_len) {
+	if (nfp_prog->__prog_alloc_len / sizeof(u64) == nfp_prog->prog_len) {
+		pr_warn("instruction limit reached (%u NFP instructions)\n",
+			nfp_prog->prog_len);
 		nfp_prog->error = -ENOSPC;
 		return;
 	}
@@ -2102,6 +2104,8 @@ static int nfp_translate(struct nfp_prog *nfp_prog)
 		err = cb(nfp_prog, meta);
 		if (err)
 			return err;
+		if (nfp_prog->error)
+			return nfp_prog->error;
 
 		nfp_prog->n_translated++;
 	}
