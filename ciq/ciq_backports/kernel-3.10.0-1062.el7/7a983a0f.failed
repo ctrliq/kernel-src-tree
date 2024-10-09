@@ -1,0 +1,128 @@
+perf trace: Pass augmented args to the arg formatters when available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 7a983a0fe2a29ec849f6748d6bd86904d6e88eea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7a983a0f.failed
+
+If the tracepoint payload is bigger than what a syscall expected from
+what is in its format file in tracefs, then that will be used as
+augmented args, i.e. the expansion of syscall arg pointers, with things
+like a filename, structs, etc.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: https://lkml.kernel.org/n/tip-bsbqx7xi2ot4q9bf570f7tqs@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 7a983a0fe2a29ec849f6748d6bd86904d6e88eea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-trace.c
+diff --cc tools/perf/builtin-trace.c
+index 6364109feae1,7deae6c8cb25..000000000000
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@@ -1676,6 -1726,42 +1687,45 @@@ out_put
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int trace__fprintf_sys_enter(struct trace *trace, struct perf_evsel *evsel,
++ 				    struct perf_sample *sample)
++ {
++ 	struct thread_trace *ttrace;
++ 	struct thread *thread;
++ 	int id = perf_evsel__sc_tp_uint(evsel, id, sample), err = -1;
++ 	struct syscall *sc = trace__syscall_info(trace, evsel, id);
++ 	char msg[1024];
++ 	void *args, *augmented_args = NULL;
++ 	int augmented_args_size;
++ 
++ 	if (sc == NULL)
++ 		return -1;
++ 
++ 	thread = machine__findnew_thread(trace->host, sample->pid, sample->tid);
++ 	ttrace = thread__trace(thread, trace->output);
++ 	/*
++ 	 * We need to get ttrace just to make sure it is there when syscall__scnprintf_args()
++ 	 * and the rest of the beautifiers accessing it via struct syscall_arg touches it.
++ 	 */
++ 	if (ttrace == NULL)
++ 		goto out_put;
++ 
++ 	args = perf_evsel__sc_tp_ptr(evsel, args, sample);
++ 	augmented_args_size = sample->raw_size - sc->args_size;
++ 	if (augmented_args_size > 0)
++ 		augmented_args = sample->raw_data + sc->args_size;
++ 
++ 	syscall__scnprintf_args(sc, msg, sizeof(msg), args, augmented_args, augmented_args_size, trace, thread);
++ 	fprintf(trace->output, "%s", msg);
++ 	err = 0;
++ out_put:
++ 	thread__put(thread);
++ 	return err;
++ }
++ 
+++>>>>>>> 7a983a0fe2a2 (perf trace: Pass augmented args to the arg formatters when available)
+  static int trace__resolve_callchain(struct trace *trace, struct perf_evsel *evsel,
+  				    struct perf_sample *sample,
+  				    struct callchain_cursor *cursor)
+* Unmerged path tools/perf/builtin-trace.c
+diff --git a/tools/perf/trace/beauty/beauty.h b/tools/perf/trace/beauty/beauty.h
+index 192080ba2acd..ec0b6e15495f 100644
+--- a/tools/perf/trace/beauty/beauty.h
++++ b/tools/perf/trace/beauty/beauty.h
+@@ -29,9 +29,34 @@ struct thread;
+ 
+ size_t pid__scnprintf_fd(struct trace *trace, pid_t pid, int fd, char *bf, size_t size);
+ 
++/**
++ * augmented_arg: extra payload for syscall pointer arguments
++ 
++ * If perf_sample->raw_size is more than what a syscall sys_enter_FOO puts,
++ * then its the arguments contents, so that we can show more than just a
++ * pointer. This will be done initially with eBPF, the start of that is at the
++ * tools/perf/examples/bpf/augmented_syscalls.c example for the openat, but
++ * will eventually be done automagically caching the running kernel tracefs
++ * events data into an eBPF C script, that then gets compiled and its .o file
++ * cached for subsequent use. For char pointers like the ones for 'open' like
++ * syscalls its easy, for the rest we should use DWARF or better, BTF, much
++ * more compact.
++ *
++ * @size: 8 if all we need is an integer, otherwise all of the augmented arg.
++ * @int_arg: will be used for integer like pointer contents, like 'accept's 'upeer_addrlen'
++ * @value: u64 aligned, for structs, pathnames
++ */
++struct augmented_arg {
++	int  size;
++	int  int_arg;
++	u64  value[];
++};
++
+ /**
+  * @val: value of syscall argument being formatted
+  * @args: All the args, use syscall_args__val(arg, nth) to access one
++ * @augmented_args: Extra data that can be collected, for instance, with eBPF for expanding the pathname for open, etc
++ * @augmented_args_size: augmented_args total payload size
+  * @thread: tid state (maps, pid, tid, etc)
+  * @trace: 'perf trace' internals: all threads, etc
+  * @parm: private area, may be an strarray, for instance
+@@ -42,6 +67,10 @@ size_t pid__scnprintf_fd(struct trace *trace, pid_t pid, int fd, char *bf, size_
+ struct syscall_arg {
+ 	unsigned long val;
+ 	unsigned char *args;
++	struct {
++		struct augmented_arg *args;
++		int		     size;
++	} augmented;
+ 	struct thread *thread;
+ 	struct trace  *trace;
+ 	void	      *parm;
