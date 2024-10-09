@@ -1,0 +1,114 @@
+locks: Set FL_CLOSE when removing flock locks on close()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Benjamin Coddington <bcodding@redhat.com>
+commit 50f2112cf7a3e62a8d33838eb205d5fef306457a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/50f2112c.failed
+
+Set FL_CLOSE in fl_flags as in locks_remove_posix() when clearing locks.
+NFS will check for this flag to ensure an unlock is sent in a following
+patch.
+
+Fuse handles flock and posix locks differently for FL_CLOSE, and so
+requires a fixup to retain the existing behavior for flock.
+
+	Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+	Acked-by: Miklos Szeredi <miklos@szeredi.hu>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 50f2112cf7a3e62a8d33838eb205d5fef306457a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/locks.c
+diff --cc fs/locks.c
+index 698f674a522a,af2031a1fcff..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -2265,6 -2496,53 +2265,56 @@@ void locks_remove_posix(struct file *fi
+  
+  EXPORT_SYMBOL(locks_remove_posix);
+  
+++<<<<<<< HEAD
+++=======
++ /* The i_flctx must be valid when calling into here */
++ static void
++ locks_remove_flock(struct file *filp, struct file_lock_context *flctx)
++ {
++ 	struct file_lock fl = {
++ 		.fl_owner = filp,
++ 		.fl_pid = current->tgid,
++ 		.fl_file = filp,
++ 		.fl_flags = FL_FLOCK | FL_CLOSE,
++ 		.fl_type = F_UNLCK,
++ 		.fl_end = OFFSET_MAX,
++ 	};
++ 	struct inode *inode = locks_inode(filp);
++ 
++ 	if (list_empty(&flctx->flc_flock))
++ 		return;
++ 
++ 	if (filp->f_op->flock && is_remote_lock(filp))
++ 		filp->f_op->flock(filp, F_SETLKW, &fl);
++ 	else
++ 		flock_lock_inode(inode, &fl);
++ 
++ 	if (fl.fl_ops && fl.fl_ops->fl_release_private)
++ 		fl.fl_ops->fl_release_private(&fl);
++ }
++ 
++ /* The i_flctx must be valid when calling into here */
++ static void
++ locks_remove_lease(struct file *filp, struct file_lock_context *ctx)
++ {
++ 	struct file_lock *fl, *tmp;
++ 	LIST_HEAD(dispose);
++ 
++ 	if (list_empty(&ctx->flc_lease))
++ 		return;
++ 
++ 	percpu_down_read_preempt_disable(&file_rwsem);
++ 	spin_lock(&ctx->flc_lock);
++ 	list_for_each_entry_safe(fl, tmp, &ctx->flc_lease, fl_list)
++ 		if (filp == fl->fl_file)
++ 			lease_modify(fl, F_UNLCK, &dispose);
++ 	spin_unlock(&ctx->flc_lock);
++ 	percpu_up_read_preempt_enable(&file_rwsem);
++ 
++ 	locks_dispose_list(&dispose);
++ }
++ 
+++>>>>>>> 50f2112cf7a3 (locks: Set FL_CLOSE when removing flock locks on close())
+  /*
+   * This function is called on the last close of an open file.
+   */
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index ed212b08f7f8..9f7cf66f8a56 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1741,7 +1741,7 @@ static int fuse_setlk(struct file *file, struct file_lock *fl, int flock)
+ 	}
+ 
+ 	/* Unlock on close is handled by the flush method */
+-	if (fl->fl_flags & FL_CLOSE)
++	if ((fl->fl_flags & FL_CLOSE_POSIX) == FL_CLOSE_POSIX)
+ 		return 0;
+ 
+ 	req = fuse_get_req_nopages(fc);
+* Unmerged path fs/locks.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 8dc175024e03..2f8e6e5e507a 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -970,6 +970,8 @@ static inline int file_check_writeable(struct file *filp)
+ #define FL_UNLOCK_PENDING	512 /* Lease is being broken */
+ #define FL_LAYOUT	2048	/* outstanding pNFS layout */
+ 
++#define FL_CLOSE_POSIX (FL_POSIX | FL_CLOSE)
++
+ /*
+  * Special return value from posix_lock_file() and vfs_lock_file() for
+  * asynchronous locking.
