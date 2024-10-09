@@ -1,0 +1,83 @@
+raid10: check bio in r10buf_pool_free to void NULL pointer dereference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Guoqing Jiang <gqjiang@suse.com>
+commit eb81b328267b2d97d11441483f5ac9dccb505818
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/eb81b328.failed
+
+For recovery case, r10buf_pool_alloc only allocates 2 bios,
+so we can't access more than 2 bios in r10buf_pool_free.
+Otherwise, we can see NULL pointer dereference as follows:
+
+[   98.347009] BUG: unable to handle kernel NULL pointer dereference
+at 0000000000000050
+[   98.355783] IP: r10buf_pool_free+0x38/0xe0 [raid10]
+[...]
+[   98.543734] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   98.550161] CR2: 0000000000000050 CR3: 000000089500a001 CR4: 00000000001606f0
+[   98.558145] Call Trace:
+[   98.560881]  <IRQ>
+[   98.563136]  put_buf+0x19/0x20 [raid10]
+[   98.567426]  end_sync_request+0x6b/0x70 [raid10]
+[   98.572591]  end_sync_write+0x9b/0x160 [raid10]
+[   98.577662]  blk_update_request+0x78/0x2c0
+[   98.582254]  scsi_end_request+0x2c/0x1e0 [scsi_mod]
+[   98.587719]  scsi_io_completion+0x22f/0x610 [scsi_mod]
+[   98.593472]  blk_done_softirq+0x8e/0xc0
+[   98.597767]  __do_softirq+0xde/0x2b3
+[   98.601770]  irq_exit+0xae/0xb0
+[   98.605285]  do_IRQ+0x81/0xd0
+[   98.608606]  common_interrupt+0x7d/0x7d
+[   98.612898]  </IRQ>
+
+So we need to check the bio is valid or not before the bio is
+used in r10buf_pool_free. Another workable way is to free 2 bios
+for recovery case just like r10buf_pool_alloc.
+
+Fixes: f0250618361d ("md: raid10: don't use bio's vec table to manage resync pages")
+	Reported-by: Alexis Castilla <pencerval@gmail.com>
+	Tested-by: Alexis Castilla <pencerval@gmail.com>
+	Signed-off-by: Guoqing Jiang <gqjiang@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit eb81b328267b2d97d11441483f5ac9dccb505818)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid10.c
+index a7df690704b8,976ef8cae64c..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -222,16 -250,17 +222,26 @@@ static void r10buf_pool_free(void *__r1
+  	struct r10conf *conf = data;
+  	struct r10bio *r10bio = __r10_bio;
+  	int j;
+ -	struct resync_pages *rp = NULL;
+  
+ -	for (j = conf->copies; j--; ) {
+ +	for (j=0; j < conf->copies; j++) {
+  		struct bio *bio = r10bio->devs[j].bio;
+++<<<<<<< HEAD
+ +		if (bio) {
+ +			for (i = 0; i < RESYNC_PAGES; i++) {
+ +				safe_put_page(bio->bi_io_vec[i].bv_page);
+ +				bio->bi_io_vec[i].bv_page = NULL;
+ +			}
+ +			bio_put(bio);
+ +		}
+++=======
++ 
++ 		if (bio) {
++ 			rp = get_resync_pages(bio);
++ 			resync_free_pages(rp);
++ 			bio_put(bio);
++ 		}
++ 
+++>>>>>>> eb81b328267b (raid10: check bio in r10buf_pool_free to void NULL pointer dereference)
+  		bio = r10bio->devs[j].repl_bio;
+  		if (bio)
+  			bio_put(bio);
+* Unmerged path drivers/md/raid10.c
