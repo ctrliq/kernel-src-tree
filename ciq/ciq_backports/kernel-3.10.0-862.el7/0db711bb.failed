@@ -1,0 +1,228 @@
+qed: Create L2 queue database
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 0db711bb26209992da375730eab6b3cec1edee7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0db711bb.failed
+
+First step in allowing a single PF/VF to open multiple queues on
+the same queue zone is to add per-hwfn database of queue-cids
+as a two-dimensional array where entry would be according to
+[queue zone][internal index].
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0db711bb26209992da375730eab6b3cec1edee7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed.h
+#	drivers/net/ethernet/qlogic/qed/qed_dev.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed.h
+index 848905e401aa,cfb575859cc6..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@@ -503,6 -533,11 +503,14 @@@ struct qed_hwfn 
+  	u8 dcbx_no_edpm;
+  	u8 db_bar_no_edpm;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* L2-related */
++ 	struct qed_l2_info *p_l2_info;
++ 
++ 	struct qed_ptt *p_arfs_ptt;
++ 
+++>>>>>>> 0db711bb2620 (qed: Create L2 queue database)
+  	struct qed_simd_fp_handler	simd_proto_handler[64];
+  
+  #ifdef CONFIG_QED_SRIOV
+diff --cc drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 1b5a3d62b9f3,e983113d4558..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@@ -1030,7 -1047,8 +1047,12 @@@ void qed_resc_setup(struct qed_dev *cde
+  
+  		qed_int_setup(p_hwfn, p_hwfn->p_main_ptt);
+  
+++<<<<<<< HEAD
+ +		qed_iov_setup(p_hwfn, p_hwfn->p_main_ptt);
+++=======
++ 		qed_l2_setup(p_hwfn);
++ 		qed_iov_setup(p_hwfn);
+++>>>>>>> 0db711bb2620 (qed: Create L2 queue database)
+  #ifdef CONFIG_QED_LL2
+  		if (p_hwfn->using_ll2)
+  			qed_ll2_setup(p_hwfn);
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed.h
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_dev.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_l2.c b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+index f852981b5922..fd0f512274b8 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@ -65,6 +65,92 @@
+ #define QED_MAX_SGES_NUM 16
+ #define CRC32_POLY 0x1edc6f41
+ 
++struct qed_l2_info {
++	u32 queues;
++	unsigned long **pp_qid_usage;
++
++	/* The lock is meant to synchronize access to the qid usage */
++	struct mutex lock;
++};
++
++int qed_l2_alloc(struct qed_hwfn *p_hwfn)
++{
++	struct qed_l2_info *p_l2_info;
++	unsigned long **pp_qids;
++	u32 i;
++
++	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++		return 0;
++
++	p_l2_info = kzalloc(sizeof(*p_l2_info), GFP_KERNEL);
++	if (!p_l2_info)
++		return -ENOMEM;
++	p_hwfn->p_l2_info = p_l2_info;
++
++	if (IS_PF(p_hwfn->cdev)) {
++		p_l2_info->queues = RESC_NUM(p_hwfn, QED_L2_QUEUE);
++	} else {
++		u8 rx = 0, tx = 0;
++
++		qed_vf_get_num_rxqs(p_hwfn, &rx);
++		qed_vf_get_num_txqs(p_hwfn, &tx);
++
++		p_l2_info->queues = max_t(u8, rx, tx);
++	}
++
++	pp_qids = kzalloc(sizeof(unsigned long *) * p_l2_info->queues,
++			  GFP_KERNEL);
++	if (!pp_qids)
++		return -ENOMEM;
++	p_l2_info->pp_qid_usage = pp_qids;
++
++	for (i = 0; i < p_l2_info->queues; i++) {
++		pp_qids[i] = kzalloc(MAX_QUEUES_PER_QZONE / 8, GFP_KERNEL);
++		if (!pp_qids[i])
++			return -ENOMEM;
++	}
++
++	return 0;
++}
++
++void qed_l2_setup(struct qed_hwfn *p_hwfn)
++{
++	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++		return;
++
++	mutex_init(&p_hwfn->p_l2_info->lock);
++}
++
++void qed_l2_free(struct qed_hwfn *p_hwfn)
++{
++	u32 i;
++
++	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++		return;
++
++	if (!p_hwfn->p_l2_info)
++		return;
++
++	if (!p_hwfn->p_l2_info->pp_qid_usage)
++		goto out_l2_info;
++
++	/* Free until hit first uninitialized entry */
++	for (i = 0; i < p_hwfn->p_l2_info->queues; i++) {
++		if (!p_hwfn->p_l2_info->pp_qid_usage[i])
++			break;
++		kfree(p_hwfn->p_l2_info->pp_qid_usage[i]);
++	}
++
++	kfree(p_hwfn->p_l2_info->pp_qid_usage);
++
++out_l2_info:
++	kfree(p_hwfn->p_l2_info);
++	p_hwfn->p_l2_info = NULL;
++}
++
+ void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
+ 			       struct qed_queue_cid *p_cid)
+ {
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_l2.h b/drivers/net/ethernet/qlogic/qed/qed_l2.h
+index 93cb932ef663..c5f8e2e3fae4 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.h
+@@ -268,6 +268,8 @@ void qed_get_vport_stats(struct qed_dev *cdev, struct qed_eth_stats *stats);
+ 
+ void qed_reset_vport_stats(struct qed_dev *cdev);
+ 
++#define MAX_QUEUES_PER_QZONE    (sizeof(unsigned long) * 8)
++
+ struct qed_queue_cid {
+ 	/* 'Relative' is a relative term ;-). Usually the indices [not counting
+ 	 * SBs] would be PF-relative, but there are some cases where that isn't
+@@ -293,6 +295,10 @@ struct qed_queue_cid {
+ 	struct qed_hwfn *p_owner;
+ };
+ 
++int qed_l2_alloc(struct qed_hwfn *p_hwfn);
++void qed_l2_setup(struct qed_hwfn *p_hwfn);
++void qed_l2_free(struct qed_hwfn *p_hwfn);
++
+ void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
+ 			       struct qed_queue_cid *p_cid);
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.c b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+index f2954eb03b41..7a6b48756536 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@ -1193,6 +1193,11 @@ void qed_vf_get_num_rxqs(struct qed_hwfn *p_hwfn, u8 *num_rxqs)
+ 	*num_rxqs = p_hwfn->vf_iov_info->acquire_resp.resc.num_rxqs;
+ }
+ 
++void qed_vf_get_num_txqs(struct qed_hwfn *p_hwfn, u8 *num_txqs)
++{
++	*num_txqs = p_hwfn->vf_iov_info->acquire_resp.resc.num_txqs;
++}
++
+ void qed_vf_get_port_mac(struct qed_hwfn *p_hwfn, u8 *port_mac)
+ {
+ 	memcpy(port_mac,
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.h b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+index 105c0edd2a01..5bd00bed1395 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+@@ -633,6 +633,14 @@ void qed_vf_get_link_caps(struct qed_hwfn *p_hwfn,
+  */
+ void qed_vf_get_num_rxqs(struct qed_hwfn *p_hwfn, u8 *num_rxqs);
+ 
++/**
++ * @brief Get number of Rx queues allocated for VF by qed
++ *
++ *  @param p_hwfn
++ *  @param num_txqs - allocated RX queues
++ */
++void qed_vf_get_num_txqs(struct qed_hwfn *p_hwfn, u8 *num_txqs);
++
+ /**
+  * @brief Get port mac address for VF
+  *
+@@ -893,6 +901,10 @@ static inline void qed_vf_get_num_rxqs(struct qed_hwfn *p_hwfn, u8 *num_rxqs)
+ {
+ }
+ 
++static inline void qed_vf_get_num_txqs(struct qed_hwfn *p_hwfn, u8 *num_txqs)
++{
++}
++
+ static inline void qed_vf_get_port_mac(struct qed_hwfn *p_hwfn, u8 *port_mac)
+ {
+ }
