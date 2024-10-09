@@ -1,0 +1,103 @@
+target: Only reset specific dynamic entries during lun_group creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Only reset specific dynamic entries during lun_group creation (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.85%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit df9766ca9da5d9c1f2bb4eea9c9f16a2e7e8e1a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/df9766ca.failed
+
+This patch changes core_tpg_add_node_to_devs() to avoid unnecessarly
+resetting every se_dev_entry in se_node_acl->tpg_lun_hlist when the
+operation is driven by an explicit configfs se_lun->lun_group creation
+via core_dev_add_lun() to only update a single se_lun.
+
+Otherwise for the second core_tpg_check_initiator_node_acl() case, go
+ahead and continue to scan the full set of currently active se_lun in
+se_portal_group->tpg_lun_hlist.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit df9766ca9da5d9c1f2bb4eea9c9f16a2e7e8e1a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+diff --cc drivers/target/target_core_device.c
+index 53dcefb982bc,47a73609e277..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -1215,15 -1197,13 +1215,19 @@@ struct se_lun *core_dev_add_lun
+  			if (acl->dynamic_node_acl &&
+  			    (!tpg->se_tpg_tfo->tpg_check_demo_mode_login_only ||
+  			     !tpg->se_tpg_tfo->tpg_check_demo_mode_login_only(tpg))) {
+++<<<<<<< HEAD
+ +				spin_unlock_irq(&tpg->acl_node_lock);
+ +				core_tpg_add_node_to_devs(acl, tpg);
+ +				spin_lock_irq(&tpg->acl_node_lock);
+++=======
++ 				core_tpg_add_node_to_devs(acl, tpg, lun);
+++>>>>>>> df9766ca9da5 (target: Only reset specific dynamic entries during lun_group creation)
+  			}
+  		}
+ -		mutex_unlock(&tpg->acl_node_mutex);
+ +		spin_unlock_irq(&tpg->acl_node_lock);
+  	}
+  
+ -	return 0;
+ +	return lun;
+  }
+  
+  /*      core_dev_del_lun():
+* Unmerged path drivers/target/target_core_device.c
+diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
+index 874a9bc988d8..34eb8337400f 100644
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -56,7 +56,8 @@ extern struct se_device *g_lun0_dev;
+ 
+ struct se_node_acl *__core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
+ 		const char *);
+-void	core_tpg_add_node_to_devs(struct se_node_acl *, struct se_portal_group *);
++void	core_tpg_add_node_to_devs(struct se_node_acl *, struct se_portal_group *,
++				  struct se_lun *);
+ void	core_tpg_wait_for_nacl_pr_ref(struct se_node_acl *);
+ struct se_lun *core_tpg_alloc_lun(struct se_portal_group *, u32);
+ int	core_tpg_add_lun(struct se_portal_group *, struct se_lun *,
+diff --git a/drivers/target/target_core_tpg.c b/drivers/target/target_core_tpg.c
+index 0696de9553d3..4ab28b10f2d0 100644
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@ -125,7 +125,8 @@ EXPORT_SYMBOL(core_tpg_get_initiator_node_acl);
+  */
+ void core_tpg_add_node_to_devs(
+ 	struct se_node_acl *acl,
+-	struct se_portal_group *tpg)
++	struct se_portal_group *tpg,
++	struct se_lun *lun_orig)
+ {
+ 	int i = 0;
+ 	u32 lun_access = 0;
+@@ -137,6 +138,8 @@ void core_tpg_add_node_to_devs(
+ 		lun = tpg->tpg_lun_list[i];
+ 		if (lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE)
+ 			continue;
++		if (lun_orig && lun != lun_orig)
++			continue;
+ 
+ 		spin_unlock(&tpg->tpg_lun_lock);
+ 
+@@ -307,7 +310,7 @@ struct se_node_acl *core_tpg_check_initiator_node_acl(
+ 	 */
+ 	if ((tpg->se_tpg_tfo->tpg_check_demo_mode_login_only == NULL) ||
+ 	    (tpg->se_tpg_tfo->tpg_check_demo_mode_login_only(tpg) != 1))
+-		core_tpg_add_node_to_devs(acl, tpg);
++		core_tpg_add_node_to_devs(acl, tpg, NULL);
+ 
+ 	spin_lock_irq(&tpg->acl_node_lock);
+ 	list_add_tail(&acl->acl_list, &tpg->acl_node_list);
