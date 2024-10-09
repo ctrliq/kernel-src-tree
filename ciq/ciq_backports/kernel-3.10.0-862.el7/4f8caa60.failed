@@ -1,0 +1,127 @@
+ext4: fix data corruption with EXT4_GET_BLOCKS_ZERO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 4f8caa60a5a13a78f26198618f21774bd6aa6498
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4f8caa60.failed
+
+When ext4_map_blocks() is called with EXT4_GET_BLOCKS_ZERO to zero-out
+allocated blocks and these blocks are actually converted from unwritten
+extent the following race can happen:
+
+CPU0					CPU1
+
+page fault				page fault
+...					...
+ext4_map_blocks()
+  ext4_ext_map_blocks()
+    ext4_ext_handle_unwritten_extents()
+      ext4_ext_convert_to_initialized()
+	- zero out converted extent
+	ext4_zeroout_es()
+	  - inserts extent as initialized in status tree
+
+					ext4_map_blocks()
+					  ext4_es_lookup_extent()
+					    - finds initialized extent
+					write data
+  ext4_issue_zeroout()
+    - zeroes out new extent overwriting data
+
+This problem can be reproduced by generic/340 for the fallocated case
+for the last block in the file.
+
+Fix the problem by avoiding zeroing out the area we are mapping with
+ext4_map_blocks() in ext4_ext_convert_to_initialized(). It is pointless
+to zero out this area in the first place as the caller asked us to
+convert the area to initialized because he is just going to write data
+there before the transaction finishes. To achieve this we delete the
+special case of zeroing out full extent as that will be handled by the
+cases below zeroing only the part of the extent that needs it. We also
+instruct ext4_split_extent() that the middle of extent being split
+contains data so that ext4_split_extent_at() cannot zero out full extent
+in case of ENOSPC.
+
+CC: stable@vger.kernel.org
+Fixes: 12735f881952c32b31bc4e433768f18489f79ec9
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 4f8caa60a5a13a78f26198618f21774bd6aa6498)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/extents.c
+diff --cc fs/ext4/extents.c
+index c4b848721a8c,83a513efc824..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -3548,30 -3574,19 +3549,39 @@@ static int ext4_ext_convert_to_initiali
+  		max_zeroout = sbi->s_extent_max_zeroout_kb >>
+  			(inode->i_sb->s_blocksize_bits - 10);
+  
+++<<<<<<< HEAD
+ +	/* If extent is less than s_max_zeroout_kb, zeroout directly */
+ +	if (max_zeroout && (ee_len <= max_zeroout)) {
+ +		err = ext4_ext_zeroout(inode, ex);
+ +		if (err)
+ +			goto out;
+ +		zero_ex.ee_block = ex->ee_block;
+ +		zero_ex.ee_len = cpu_to_le16(ext4_ext_get_actual_len(ex));
+ +		ext4_ext_store_pblock(&zero_ex, ext4_ext_pblock(ex));
+ +
+ +		err = ext4_ext_get_access(handle, inode, path + depth);
+ +		if (err)
+ +			goto out;
+ +		ext4_ext_mark_initialized(ex);
+ +		ext4_ext_try_to_merge(handle, inode, path, ex);
+ +		err = ext4_ext_dirty(handle, inode, path + path->p_depth);
+ +		goto out;
+ +	}
+++=======
++ 	if (ext4_encrypted_inode(inode))
++ 		max_zeroout = 0;
+++>>>>>>> 4f8caa60a5a1 (ext4: fix data corruption with EXT4_GET_BLOCKS_ZERO)
+  
+  	/*
+- 	 * four cases:
++ 	 * five cases:
+  	 * 1. split the extent into three extents.
+- 	 * 2. split the extent into two extents, zeroout the first half.
+- 	 * 3. split the extent into two extents, zeroout the second half.
++ 	 * 2. split the extent into two extents, zeroout the head of the first
++ 	 *    extent.
++ 	 * 3. split the extent into two extents, zeroout the tail of the second
++ 	 *    extent.
+  	 * 4. split the extent into two extents with out zeroout.
++ 	 * 5. no splitting needed, just possibly zeroout the head and / or the
++ 	 *    tail of the extent.
+  	 */
+  	split_map.m_lblk = map->m_lblk;
+  	split_map.m_len = map->m_len;
+@@@ -3608,15 -3627,17 +3622,18 @@@
+  		}
+  	}
+  
+ -	err = ext4_split_extent(handle, inode, ppath, &split_map, split_flag,
+ -				flags);
+ +	err = ext4_split_extent(handle, inode, path,
+ +				      &split_map, split_flag, flags);
+  	if (err > 0)
+  		err = 0;
+ +
+  out:
+  	/* If we have gotten a failure, don't zero out status tree */
+- 	if (!err)
+- 		err = ext4_zeroout_es(inode, &zero_ex);
++ 	if (!err) {
++ 		err = ext4_zeroout_es(inode, &zero_ex1);
++ 		if (!err)
++ 			err = ext4_zeroout_es(inode, &zero_ex2);
++ 	}
+  	return err ? err : allocated;
+  }
+  
+* Unmerged path fs/ext4/extents.c
