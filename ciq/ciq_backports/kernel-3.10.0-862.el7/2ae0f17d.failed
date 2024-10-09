@@ -1,0 +1,485 @@
+genetlink: use idr to track families
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 2ae0f17df1cd52aafd1ab0415ea1f1dd56dc0e2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2ae0f17d.failed
+
+Since generic netlink family IDs are small integers, allocated
+densely, IDR is an ideal match for lookups. Replace the existing
+hand-written hash-table with IDR for allocation and lookup.
+
+This lets the families only be written to once, during register,
+since the list_head can be removed and removal of a family won't
+cause any writes.
+
+It also slightly reduces the code size (by about 1.3k on x86-64).
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2ae0f17df1cd52aafd1ab0415ea1f1dd56dc0e2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/genetlink.h
+#	net/netlink/genetlink.c
+diff --cc include/net/genetlink.h
+index f37e06abcb6d,3ec87bacc0f5..000000000000
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@@ -35,16 -33,22 +35,28 @@@ struct genl_info
+   *	do additional, common, filtering and return an error
+   * @post_doit: called after an operation's doit callback, it may
+   *	undo operations done by pre_doit, for example release locks
+++<<<<<<< HEAD
+ + * @attrbuf: buffer to store parsed attributes
+ + * @family_list: family list
+ + * @mcgrps: multicast groups used by this family (private)
+ + * @n_mcgrps: number of multicast groups (private)
+++=======
++  * @mcast_bind: a socket bound to the given multicast group (which
++  *	is given as the offset into the groups array)
++  * @mcast_unbind: a socket was unbound from the given multicast group.
++  *	Note that unbind() will not be called symmetrically if the
++  *	generic netlink family is removed while there are still open
++  *	sockets.
++  * @attrbuf: buffer to store parsed attributes (private)
++  * @mcgrps: multicast groups used by this family
++  * @n_mcgrps: number of multicast groups
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+   * @mcgrp_offset: starting number of multicast group IDs in this family
+ - *	(private)
+ - * @ops: the operations supported by this family
+ - * @n_ops: number of operations supported by this family
+ + * @ops: the operations supported by this family (private)
+ + * @n_ops: number of operations supported by this family (private)
+   */
+  struct genl_family {
+ -	unsigned int		id;		/* private */
+ +	unsigned int		id;
+  	unsigned int		hdrsize;
+  	char			name[GENL_NAMSIZ];
+  	unsigned int		version;
+@@@ -57,22 -61,18 +69,25 @@@
+  	void			(*post_doit)(const struct genl_ops *ops,
+  					     struct sk_buff *skb,
+  					     struct genl_info *info);
+ -	int			(*mcast_bind)(struct net *net, int group);
+ -	void			(*mcast_unbind)(struct net *net, int group);
+  	struct nlattr **	attrbuf;	/* private */
+ -	const struct genl_ops *	ops;
+ -	const struct genl_multicast_group *mcgrps;
+ -	unsigned int		n_ops;
+ -	unsigned int		n_mcgrps;
+ +	const struct genl_ops *	ops;		/* private */
+ +	const struct genl_multicast_group *mcgrps; /* private */
+ +	unsigned int		n_ops;		/* private */
+ +	unsigned int		n_mcgrps;	/* private */
+  	unsigned int		mcgrp_offset;	/* private */
+- 	struct list_head	family_list;	/* private */
+  	struct module		*module;
+ -};
+  
+++<<<<<<< HEAD
+ +	/* Reserved slots. For Red Hat usage only, modules are required to
+ +	 * set them to zero. */
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +};
+++=======
++ struct nlattr **genl_family_attrbuf(const struct genl_family *family);
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  
+  /**
+   * struct genl_info - receiving information
+@@@ -131,67 -131,13 +146,74 @@@ struct genl_ops 
+  	u8			flags;
+  };
+  
+++<<<<<<< HEAD
+ +int __genl_register_family(struct genl_family *family);
+++=======
++ int genl_register_family(struct genl_family *family);
++ int genl_unregister_family(const struct genl_family *family);
++ void genl_notify(const struct genl_family *family, struct sk_buff *skb,
++ 		 struct genl_info *info, u32 group, gfp_t flags);
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+ +
+ +static inline int genl_register_family(struct genl_family *family)
+ +{
+ +	family->module = THIS_MODULE;
+ +	return __genl_register_family(family);
+ +}
+ +
+ +/**
+ + * genl_register_family_with_ops - register a generic netlink family with ops
+ + * @family: generic netlink family
+ + * @ops: operations to be registered
+ + * @n_ops: number of elements to register
+ + *
+ + * Registers the specified family and operations from the specified table.
+ + * Only one family may be registered with the same family name or identifier.
+ + *
+ + * The family id may equal GENL_ID_GENERATE causing an unique id to
+ + * be automatically generated and assigned.
+ + *
+ + * Either a doit or dumpit callback must be specified for every registered
+ + * operation or the function will fail. Only one operation structure per
+ + * command identifier may be registered.
+ + *
+ + * See include/net/genetlink.h for more documenation on the operations
+ + * structure.
+ + *
+ + * Return 0 on success or a negative error code.
+ + */
+ +static inline int
+ +_genl_register_family_with_ops_grps(struct genl_family *family,
+ +				    const struct genl_ops *ops, size_t n_ops,
+ +				    const struct genl_multicast_group *mcgrps,
+ +				    size_t n_mcgrps)
+ +{
+ +	family->module = THIS_MODULE;
+ +	family->ops = ops;
+ +	family->n_ops = n_ops;
+ +	family->mcgrps = mcgrps;
+ +	family->n_mcgrps = n_mcgrps;
+ +	return __genl_register_family(family);
+ +}
+  
+ +#define genl_register_family_with_ops(family, ops)			\
+ +	_genl_register_family_with_ops_grps((family),			\
+ +					    (ops), ARRAY_SIZE(ops),	\
+ +					    NULL, 0)
+ +#define genl_register_family_with_ops_groups(family, ops, grps)	\
+ +	_genl_register_family_with_ops_grps((family),			\
+ +					    (ops), ARRAY_SIZE(ops),	\
+ +					    (grps), ARRAY_SIZE(grps))
+ +
+ +int genl_unregister_family(struct genl_family *family);
+ +void genl_notify(struct genl_family *family,
+ +		 struct sk_buff *skb, struct net *net, u32 portid,
+ +		 u32 group, struct nlmsghdr *nlh, gfp_t flags);
+ +
+ +struct sk_buff *genlmsg_new_unicast(size_t payload, struct genl_info *info,
+ +				    gfp_t flags);
+  void *genlmsg_put(struct sk_buff *skb, u32 portid, u32 seq,
+- 		  struct genl_family *family, int flags, u8 cmd);
++ 		  const struct genl_family *family, int flags, u8 cmd);
+  
+  /**
+   * genlmsg_nlhdr - Obtain netlink header from user specified header
+@@@ -411,9 -357,13 +433,10 @@@ static inline struct sk_buff *genlmsg_n
+   * This function returns the number of broadcast listeners that have set the
+   * NETLINK_RECV_NO_ENOBUFS socket option.
+   */
+- static inline int genl_set_err(struct genl_family *family, struct net *net,
+- 			       u32 portid, u32 group, int code)
++ static inline int genl_set_err(const struct genl_family *family,
++ 			       struct net *net, u32 portid,
++ 			       u32 group, int code)
+  {
+ -	if (WARN_ON_ONCE(group >= family->n_mcgrps))
+ -		return -EINVAL;
+ -	group = family->mcgrp_offset + group;
+  	return netlink_set_err(net->genl_sock, portid, group, code);
+  }
+  
+diff --cc net/netlink/genetlink.c
+index a93aabe188f7,85659921e7b2..000000000000
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@@ -354,15 -318,10 +317,20 @@@ static int genl_validate_ops(const stru
+   *
+   * Return 0 on success or a negative error code.
+   */
+ -int genl_register_family(struct genl_family *family)
+ +int __genl_register_family(struct genl_family *family)
+  {
+++<<<<<<< HEAD
+ +	int err = -EINVAL, i;
+ +
+ +	if (family->id && family->id < GENL_MIN_ID)
+ +		goto errout;
+ +
+ +	if (family->id > GENL_MAX_ID)
+ +		goto errout;
+++=======
++ 	int err, i;
++ 	int start = GENL_START_ALLOC, end = GENL_MAX_ID;
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  
+  	err = genl_validate_ops(family);
+  	if (err)
+@@@ -375,18 -334,20 +343,35 @@@
+  		goto errout_locked;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (family->id == GENL_ID_GENERATE) {
+ +		u16 newid = genl_generate_id();
+ +
+ +		if (!newid) {
+ +			err = -ENOMEM;
+ +			goto errout_locked;
+ +		}
+ +
+ +		family->id = newid;
+ +	} else if (genl_family_find_byid(family->id)) {
+ +		err = -EEXIST;
+ +		goto errout_locked;
+++=======
++ 	/*
++ 	 * Sadly, a few cases need to be special-cased
++ 	 * due to them having previously abused the API
++ 	 * and having used their family ID also as their
++ 	 * multicast group ID, so we use reserved IDs
++ 	 * for both to be sure we can do that mapping.
++ 	 */
++ 	if (family == &genl_ctrl) {
++ 		/* and this needs to be special for initial family lookups */
++ 		start = end = GENL_ID_CTRL;
++ 	} else if (strcmp(family->name, "pmcraid") == 0) {
++ 		start = end = GENL_ID_PMCRAID;
++ 	} else if (strcmp(family->name, "VFS_DQUOT") == 0) {
++ 		start = end = GENL_ID_VFS_DQUOT;
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  	}
+  
+  	if (family->maxattr && !family->parallel_ops) {
+@@@ -414,12 -379,13 +403,14 @@@
+  
+  	return 0;
+  
++ errout_remove:
++ 	idr_remove(&genl_fam_idr, family->id);
+  errout_locked:
+  	genl_unlock_all();
+ +errout:
+  	return err;
+  }
+ -EXPORT_SYMBOL(genl_register_family);
+ +EXPORT_SYMBOL(__genl_register_family);
+  
+  /**
+   * genl_unregister_family - unregister generic netlink family
+@@@ -429,30 -395,29 +420,45 @@@
+   *
+   * Returns 0 on success or a negative error code.
+   */
+- int genl_unregister_family(struct genl_family *family)
++ int genl_unregister_family(const struct genl_family *family)
+  {
+- 	struct genl_family *rc;
+- 
+  	genl_lock_all();
+  
+++<<<<<<< HEAD
+ +	genl_unregister_mc_groups(family);
+ +
+ +	list_for_each_entry(rc, genl_family_chain(family->id), family_list) {
+ +		if (family->id != rc->id || strcmp(rc->name, family->name))
+ +			continue;
+ +
+ +		list_del(&rc->family_list);
+ +		family->n_ops = 0;
+ +		genl_unlock_all();
+ +
+ +		kfree(family->attrbuf);
+ +		genl_ctrl_event(CTRL_CMD_DELFAMILY, family, NULL, 0);
+ +		return 0;
+++=======
++ 	if (genl_family_find_byid(family->id)) {
++ 		genl_unlock_all();
++ 		return -ENOENT;
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  	}
+  
+- 	genl_unlock_all();
++ 	genl_unregister_mc_groups(family);
++ 
++ 	idr_remove(&genl_fam_idr, family->id);
++ 
++ 	up_write(&cb_lock);
++ 	wait_event(genl_sk_destructing_waitq,
++ 		   atomic_read(&genl_sk_destructing_cnt) == 0);
++ 	genl_unlock();
+  
+- 	return -ENOENT;
++ 	kfree(family->attrbuf);
++ 
++ 	genl_ctrl_event(CTRL_CMD_DELFAMILY, family, NULL, 0);
++ 
++ 	return 0;
+  }
+  EXPORT_SYMBOL(genl_unregister_family);
+  
+@@@ -673,15 -633,9 +679,15 @@@ static void genl_rcv(struct sk_buff *sk
+   * Controller
+   **************************************************************************/
+  
+ -static struct genl_family genl_ctrl;
+ +static struct genl_family genl_ctrl = {
+ +	.id = GENL_ID_CTRL,
+ +	.name = "nlctrl",
+ +	.version = 0x2,
+ +	.maxattr = CTRL_ATTR_MAX,
+ +	.netnsok = true,
+ +};
+  
+- static int ctrl_fill_info(struct genl_family *family, u32 portid, u32 seq,
++ static int ctrl_fill_info(const struct genl_family *family, u32 portid, u32 seq,
+  			  u32 flags, struct sk_buff *skb, u8 cmd)
+  {
+  	void *hdr;
+@@@ -989,6 -936,66 +988,69 @@@ static struct genl_multicast_group genl
+  	{ .name = "notify", },
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct genl_family genl_ctrl = {
++ 	.module = THIS_MODULE,
++ 	.ops = genl_ctrl_ops,
++ 	.n_ops = ARRAY_SIZE(genl_ctrl_ops),
++ 	.mcgrps = genl_ctrl_groups,
++ 	.n_mcgrps = ARRAY_SIZE(genl_ctrl_groups),
++ 	.id = GENL_ID_CTRL,
++ 	.name = "nlctrl",
++ 	.version = 0x2,
++ 	.maxattr = CTRL_ATTR_MAX,
++ 	.netnsok = true,
++ };
++ 
++ static int genl_bind(struct net *net, int group)
++ {
++ 	struct genl_family *f;
++ 	int err = -ENOENT;
++ 	unsigned int id;
++ 
++ 	down_read(&cb_lock);
++ 
++ 	idr_for_each_entry(&genl_fam_idr, f, id) {
++ 		if (group >= f->mcgrp_offset &&
++ 		    group < f->mcgrp_offset + f->n_mcgrps) {
++ 			int fam_grp = group - f->mcgrp_offset;
++ 
++ 			if (!f->netnsok && net != &init_net)
++ 				err = -ENOENT;
++ 			else if (f->mcast_bind)
++ 				err = f->mcast_bind(net, fam_grp);
++ 			else
++ 				err = 0;
++ 			break;
++ 		}
++ 	}
++ 	up_read(&cb_lock);
++ 
++ 	return err;
++ }
++ 
++ static void genl_unbind(struct net *net, int group)
++ {
++ 	struct genl_family *f;
++ 	unsigned int id;
++ 
++ 	down_read(&cb_lock);
++ 
++ 	idr_for_each_entry(&genl_fam_idr, f, id) {
++ 		if (group >= f->mcgrp_offset &&
++ 		    group < f->mcgrp_offset + f->n_mcgrps) {
++ 			int fam_grp = group - f->mcgrp_offset;
++ 
++ 			if (f->mcast_unbind)
++ 				f->mcast_unbind(net, fam_grp);
++ 			break;
++ 		}
++ 	}
++ 	up_read(&cb_lock);
++ }
++ 
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  static int __net_init genl_pernet_init(struct net *net)
+  {
+  	struct netlink_kernel_cfg cfg = {
+@@@ -1021,13 -1030,9 +1083,10 @@@ static struct pernet_operations genl_pe
+  
+  static int __init genl_init(void)
+  {
+- 	int i, err;
+- 
+- 	for (i = 0; i < GENL_FAM_TAB_SIZE; i++)
+- 		INIT_LIST_HEAD(&family_ht[i]);
++ 	int err;
+  
+ -	err = genl_register_family(&genl_ctrl);
+ +	err = genl_register_family_with_ops_groups(&genl_ctrl, genl_ctrl_ops,
+ +						   genl_ctrl_groups);
+  	if (err < 0)
+  		goto problem;
+  
+@@@ -1043,6 -1048,25 +1102,28 @@@ problem
+  
+  subsys_initcall(genl_init);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * genl_family_attrbuf - return family's attrbuf
++  * @family: the family
++  *
++  * Return the family's attrbuf, while validating that it's
++  * actually valid to access it.
++  *
++  * You cannot use this function with a family that has parallel_ops
++  * and you can only use it within (pre/post) doit/dumpit callbacks.
++  */
++ struct nlattr **genl_family_attrbuf(const struct genl_family *family)
++ {
++ 	if (!WARN_ON(family->parallel_ops))
++ 		lockdep_assert_held(&genl_mutex);
++ 
++ 	return family->attrbuf;
++ }
++ EXPORT_SYMBOL(genl_family_attrbuf);
++ 
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  static int genlmsg_mcast(struct sk_buff *skb, u32 portid, unsigned long group,
+  			 gfp_t flags)
+  {
+@@@ -1082,10 -1107,10 +1164,15 @@@ int genlmsg_multicast_allns(const struc
+  }
+  EXPORT_SYMBOL(genlmsg_multicast_allns);
+  
+++<<<<<<< HEAD
+ +void genl_notify(struct genl_family *family,
+ +		 struct sk_buff *skb, struct net *net, u32 portid, u32 group,
+ +		 struct nlmsghdr *nlh, gfp_t flags)
+++=======
++ void genl_notify(const struct genl_family *family, struct sk_buff *skb,
++ 		 struct genl_info *info, u32 group, gfp_t flags)
+++>>>>>>> 2ae0f17df1cd (genetlink: use idr to track families)
+  {
+ -	struct net *net = genl_info_net(info);
+  	struct sock *sk = net->genl_sock;
+  	int report = 0;
+  
+* Unmerged path include/net/genetlink.h
+diff --git a/include/uapi/linux/genetlink.h b/include/uapi/linux/genetlink.h
+index 5512c90af7e3..814ac8ad33f7 100644
+--- a/include/uapi/linux/genetlink.h
++++ b/include/uapi/linux/genetlink.h
+@@ -30,6 +30,8 @@ struct genlmsghdr {
+ #define GENL_ID_CTRL		NLMSG_MIN_TYPE
+ #define GENL_ID_VFS_DQUOT	(NLMSG_MIN_TYPE + 1)
+ #define GENL_ID_PMCRAID		(NLMSG_MIN_TYPE + 2)
++/* must be last reserved + 1 */
++#define GENL_START_ALLOC	(NLMSG_MIN_TYPE + 3)
+ 
+ /**************************************************************************
+  * Controller
+* Unmerged path net/netlink/genetlink.c
