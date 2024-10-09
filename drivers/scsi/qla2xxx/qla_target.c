@@ -1105,6 +1105,8 @@ static void qlt_send_notify_ack(struct scsi_qla_host *vha,
 	    "qla_target(%d): Sending 24xx Notify Ack %d\n",
 	    vha->vp_idx, nack->u.isp24.status);
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 }
 
@@ -1182,6 +1184,8 @@ static void qlt_24xx_send_abts_resp(struct scsi_qla_host *vha,
 
 	ha->tgt.qla_tgt->abts_resp_expected++;
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 }
 
@@ -1226,6 +1230,8 @@ static void qlt_24xx_retry_term_exchange(struct scsi_qla_host *vha,
 					    CTIO7_FLAGS_TERMINATE);
 	ctio->u.status1.ox_id = cpu_to_le16(entry->fcp_hdr_le.ox_id);
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 
 	qlt_24xx_send_abts_resp(vha, (struct abts_recv_from_24xx *)entry,
@@ -1394,6 +1400,8 @@ static void qlt_24xx_send_task_mgmt_ctio(struct scsi_qla_host *ha,
 	ctio->u.status1.response_len = cpu_to_le16(8);
 	ctio->u.status1.sense_data[0] = resp_code;
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(ha, ha->req);
 }
 
@@ -2109,6 +2117,8 @@ int qlt_xmit_response(struct qla_tgt_cmd *cmd, int xmit_type,
 	    "Xmitting CTIO7 response pkt for 24xx: %p scsi_status: 0x%02x\n",
 	    pkt, scsi_status);
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
@@ -2167,6 +2177,8 @@ int qlt_rdy_to_xfer(struct qla_tgt_cmd *cmd)
 
 	cmd->state = QLA_TGT_STATE_NEED_DATA;
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
@@ -2237,6 +2249,8 @@ static int __qlt_send_term_exchange(struct scsi_qla_host *vha,
 	if (ctio24->u.status1.residual != 0)
 		ctio24->u.status1.scsi_status |= SS_RESIDUAL_UNDER;
 
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 	return ret;
 }
@@ -3618,6 +3632,8 @@ static void qlt_send_busy(struct scsi_qla_host *vha,
 	 */
 	ctio24->u.status1.ox_id = swab16(atio->u.isp24.fcp_hdr.ox_id);
 	ctio24->u.status1.scsi_status = cpu_to_le16(status);
+	/* Memory Barrier */
+	wmb();
 	qla2x00_start_iocbs(vha, vha->req);
 }
 
