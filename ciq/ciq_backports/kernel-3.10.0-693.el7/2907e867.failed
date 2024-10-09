@@ -1,0 +1,314 @@
+drm/nouveau/kms/nv50: fix double dma_fence_put() when destroying plane state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] nouveau/kms/nv50: fix double dma_fence_put() when destroying plane state (Rob Clark) [1422186]
+Rebuild_FUZZ: 97.30%
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 2907e8670b6ef253bffb33bf47fd2182969cf2a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2907e867.failed
+
+When the atomic support was added to nouveau, the DRM core did not do this.
+
+However, later in the same merge window, a commit (drm/fence: add in-fences
+support) was merged that added it, leading to use-after-frees of the fence
+object.
+
+	Cc: stable@vger.kernel.org	[4.10+]
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 2907e8670b6ef253bffb33bf47fd2182969cf2a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nv50_display.c
+diff --cc drivers/gpu/drm/nouveau/nv50_display.c
+index a43445caae60,a9182d5e6011..000000000000
+--- a/drivers/gpu/drm/nouveau/nv50_display.c
++++ b/drivers/gpu/drm/nouveau/nv50_display.c
+@@@ -487,28 -829,261 +487,256 @@@ evo_sync_wait(void *data
+  }
+  
+  static int
+ -nv50_wndw_atomic_check_acquire(struct nv50_wndw *wndw,
+ -			       struct nv50_wndw_atom *asyw,
+ -			       struct nv50_head_atom *asyh)
+ +evo_sync(struct drm_device *dev)
+  {
+ -	struct nouveau_framebuffer *fb = nouveau_framebuffer(asyw->state.fb);
+ -	struct nouveau_drm *drm = nouveau_drm(wndw->plane.dev);
+ -	int ret;
+ -
+ -	NV_ATOMIC(drm, "%s acquire\n", wndw->plane.name);
+ -	asyw->clip.x1 = 0;
+ -	asyw->clip.y1 = 0;
+ -	asyw->clip.x2 = asyh->state.mode.hdisplay;
+ -	asyw->clip.y2 = asyh->state.mode.vdisplay;
+ -
+ -	asyw->image.w = fb->base.width;
+ -	asyw->image.h = fb->base.height;
+ -	asyw->image.kind = (fb->nvbo->tile_flags & 0x0000ff00) >> 8;
+ -	if (asyw->image.kind) {
+ -		asyw->image.layout = 0;
+ -		if (drm->client.device.info.chipset >= 0xc0)
+ -			asyw->image.block = fb->nvbo->tile_mode >> 4;
+ -		else
+ -			asyw->image.block = fb->nvbo->tile_mode;
+ -		asyw->image.pitch = (fb->base.pitches[0] / 4) << 4;
+ -	} else {
+ -		asyw->image.layout = 1;
+ -		asyw->image.block  = 0;
+ -		asyw->image.pitch  = fb->base.pitches[0];
+ +	struct nvif_device *device = &nouveau_drm(dev)->device;
+ +	struct nv50_disp *disp = nv50_disp(dev);
+ +	struct nv50_mast *mast = nv50_mast(dev);
+ +	u32 *push = evo_wait(mast, 8);
+ +	if (push) {
+ +		nouveau_bo_wr32(disp->sync, EVO_MAST_NTFY, 0x00000000);
+ +		evo_mthd(push, 0x0084, 1);
+ +		evo_data(push, 0x80000000 | EVO_MAST_NTFY);
+ +		evo_mthd(push, 0x0080, 2);
+ +		evo_data(push, 0x00000000);
+ +		evo_data(push, 0x00000000);
+ +		evo_kick(push, mast);
+ +		if (nvif_msec(device, 2000,
+ +			if (evo_sync_wait(disp->sync))
+ +				break;
+ +		) >= 0)
+ +			return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	return -EBUSY;
+++=======
++ 	ret = wndw->func->acquire(wndw, asyw, asyh);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (asyw->set.image) {
++ 		if (!(asyw->image.mode = asyw->interval ? 0 : 1))
++ 			asyw->image.interval = asyw->interval;
++ 		else
++ 			asyw->image.interval = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nv50_wndw_atomic_check(struct drm_plane *plane, struct drm_plane_state *state)
++ {
++ 	struct nouveau_drm *drm = nouveau_drm(plane->dev);
++ 	struct nv50_wndw *wndw = nv50_wndw(plane);
++ 	struct nv50_wndw_atom *armw = nv50_wndw_atom(wndw->plane.state);
++ 	struct nv50_wndw_atom *asyw = nv50_wndw_atom(state);
++ 	struct nv50_head_atom *harm = NULL, *asyh = NULL;
++ 	bool varm = false, asyv = false, asym = false;
++ 	int ret;
++ 
++ 	NV_ATOMIC(drm, "%s atomic_check\n", plane->name);
++ 	if (asyw->state.crtc) {
++ 		asyh = nv50_head_atom_get(asyw->state.state, asyw->state.crtc);
++ 		if (IS_ERR(asyh))
++ 			return PTR_ERR(asyh);
++ 		asym = drm_atomic_crtc_needs_modeset(&asyh->state);
++ 		asyv = asyh->state.active;
++ 	}
++ 
++ 	if (armw->state.crtc) {
++ 		harm = nv50_head_atom_get(asyw->state.state, armw->state.crtc);
++ 		if (IS_ERR(harm))
++ 			return PTR_ERR(harm);
++ 		varm = harm->state.crtc->state->active;
++ 	}
++ 
++ 	if (asyv) {
++ 		asyw->point.x = asyw->state.crtc_x;
++ 		asyw->point.y = asyw->state.crtc_y;
++ 		if (memcmp(&armw->point, &asyw->point, sizeof(asyw->point)))
++ 			asyw->set.point = true;
++ 
++ 		if (!varm || asym || armw->state.fb != asyw->state.fb) {
++ 			ret = nv50_wndw_atomic_check_acquire(wndw, asyw, asyh);
++ 			if (ret)
++ 				return ret;
++ 		}
++ 	} else
++ 	if (varm) {
++ 		nv50_wndw_atomic_check_release(wndw, asyw, harm);
++ 	} else {
++ 		return 0;
++ 	}
++ 
++ 	if (!asyv || asym) {
++ 		asyw->clr.ntfy = armw->ntfy.handle != 0;
++ 		asyw->clr.sema = armw->sema.handle != 0;
++ 		if (wndw->func->image_clr)
++ 			asyw->clr.image = armw->image.handle != 0;
++ 		asyw->set.lut = wndw->func->lut && asyv;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void
++ nv50_wndw_cleanup_fb(struct drm_plane *plane, struct drm_plane_state *old_state)
++ {
++ 	struct nouveau_framebuffer *fb = nouveau_framebuffer(old_state->fb);
++ 	struct nouveau_drm *drm = nouveau_drm(plane->dev);
++ 
++ 	NV_ATOMIC(drm, "%s cleanup: %p\n", plane->name, old_state->fb);
++ 	if (!old_state->fb)
++ 		return;
++ 
++ 	nouveau_bo_unpin(fb->nvbo);
++ }
++ 
++ static int
++ nv50_wndw_prepare_fb(struct drm_plane *plane, struct drm_plane_state *state)
++ {
++ 	struct nouveau_framebuffer *fb = nouveau_framebuffer(state->fb);
++ 	struct nouveau_drm *drm = nouveau_drm(plane->dev);
++ 	struct nv50_wndw *wndw = nv50_wndw(plane);
++ 	struct nv50_wndw_atom *asyw = nv50_wndw_atom(state);
++ 	struct nv50_head_atom *asyh;
++ 	struct nv50_dmac_ctxdma *ctxdma;
++ 	int ret;
++ 
++ 	NV_ATOMIC(drm, "%s prepare: %p\n", plane->name, state->fb);
++ 	if (!asyw->state.fb)
++ 		return 0;
++ 
++ 	ret = nouveau_bo_pin(fb->nvbo, TTM_PL_FLAG_VRAM, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ctxdma = nv50_dmac_ctxdma_new(wndw->dmac, fb);
++ 	if (IS_ERR(ctxdma)) {
++ 		nouveau_bo_unpin(fb->nvbo);
++ 		return PTR_ERR(ctxdma);
++ 	}
++ 
++ 	asyw->state.fence = reservation_object_get_excl_rcu(fb->nvbo->bo.resv);
++ 	asyw->image.handle = ctxdma->object.handle;
++ 	asyw->image.offset = fb->nvbo->bo.offset;
++ 
++ 	if (wndw->func->prepare) {
++ 		asyh = nv50_head_atom_get(asyw->state.state, asyw->state.crtc);
++ 		if (IS_ERR(asyh))
++ 			return PTR_ERR(asyh);
++ 
++ 		wndw->func->prepare(wndw, asyh, asyw);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const struct drm_plane_helper_funcs
++ nv50_wndw_helper = {
++ 	.prepare_fb = nv50_wndw_prepare_fb,
++ 	.cleanup_fb = nv50_wndw_cleanup_fb,
++ 	.atomic_check = nv50_wndw_atomic_check,
++ };
++ 
++ static void
++ nv50_wndw_atomic_destroy_state(struct drm_plane *plane,
++ 			       struct drm_plane_state *state)
++ {
++ 	struct nv50_wndw_atom *asyw = nv50_wndw_atom(state);
++ 	__drm_atomic_helper_plane_destroy_state(&asyw->state);
++ 	kfree(asyw);
++ }
++ 
++ static struct drm_plane_state *
++ nv50_wndw_atomic_duplicate_state(struct drm_plane *plane)
++ {
++ 	struct nv50_wndw_atom *armw = nv50_wndw_atom(plane->state);
++ 	struct nv50_wndw_atom *asyw;
++ 	if (!(asyw = kmalloc(sizeof(*asyw), GFP_KERNEL)))
++ 		return NULL;
++ 	__drm_atomic_helper_plane_duplicate_state(plane, &asyw->state);
++ 	asyw->interval = 1;
++ 	asyw->sema = armw->sema;
++ 	asyw->ntfy = armw->ntfy;
++ 	asyw->image = armw->image;
++ 	asyw->point = armw->point;
++ 	asyw->lut = armw->lut;
++ 	asyw->clr.mask = 0;
++ 	asyw->set.mask = 0;
++ 	return &asyw->state;
++ }
++ 
++ static void
++ nv50_wndw_reset(struct drm_plane *plane)
++ {
++ 	struct nv50_wndw_atom *asyw;
++ 
++ 	if (WARN_ON(!(asyw = kzalloc(sizeof(*asyw), GFP_KERNEL))))
++ 		return;
++ 
++ 	if (plane->state)
++ 		plane->funcs->atomic_destroy_state(plane, plane->state);
++ 	plane->state = &asyw->state;
++ 	plane->state->plane = plane;
++ 	plane->state->rotation = DRM_ROTATE_0;
++ }
++ 
++ static void
++ nv50_wndw_destroy(struct drm_plane *plane)
++ {
++ 	struct nv50_wndw *wndw = nv50_wndw(plane);
++ 	void *data;
++ 	nvif_notify_fini(&wndw->notify);
++ 	data = wndw->func->dtor(wndw);
++ 	drm_plane_cleanup(&wndw->plane);
++ 	kfree(data);
++ }
++ 
++ static const struct drm_plane_funcs
++ nv50_wndw = {
++ 	.update_plane = drm_atomic_helper_update_plane,
++ 	.disable_plane = drm_atomic_helper_disable_plane,
++ 	.destroy = nv50_wndw_destroy,
++ 	.reset = nv50_wndw_reset,
++ 	.set_property = drm_atomic_helper_plane_set_property,
++ 	.atomic_duplicate_state = nv50_wndw_atomic_duplicate_state,
++ 	.atomic_destroy_state = nv50_wndw_atomic_destroy_state,
++ };
++ 
++ static void
++ nv50_wndw_fini(struct nv50_wndw *wndw)
++ {
++ 	nvif_notify_put(&wndw->notify);
++ }
++ 
++ static void
++ nv50_wndw_init(struct nv50_wndw *wndw)
++ {
++ 	nvif_notify_get(&wndw->notify);
++ }
++ 
++ static int
++ nv50_wndw_ctor(const struct nv50_wndw_func *func, struct drm_device *dev,
++ 	       enum drm_plane_type type, const char *name, int index,
++ 	       struct nv50_dmac *dmac, const u32 *format, int nformat,
++ 	       struct nv50_wndw *wndw)
++ {
++ 	int ret;
++ 
++ 	wndw->func = func;
++ 	wndw->dmac = dmac;
++ 
++ 	ret = drm_universal_plane_init(dev, &wndw->plane, 0, &nv50_wndw, format,
++ 				       nformat, type, "%s-%d", name, index);
++ 	if (ret)
++ 		return ret;
++ 
++ 	drm_plane_helper_add(&wndw->plane, &nv50_wndw_helper);
++ 	return 0;
+++>>>>>>> 2907e8670b6e (drm/nouveau/kms/nv50: fix double dma_fence_put() when destroying plane state)
+  }
+  
+  /******************************************************************************
+* Unmerged path drivers/gpu/drm/nouveau/nv50_display.c
