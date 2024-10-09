@@ -1,0 +1,198 @@
+bridge: fdb add and delete tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit b74fd306ef2d48781e807dd506cca818bb83d749
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b74fd306.failed
+
+A few useful tracepoints to trace bridge forwarding
+database updates.
+
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Acked-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b74fd306ef2d48781e807dd506cca818bb83d749)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_fdb.c
+#	net/core/net-traces.c
+diff --cc net/bridge/br_fdb.c
+index ee58945b0c94,be5e1da6d824..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -131,23 -170,10 +132,25 @@@ static void fdb_del_hw_addr(struct net_
+  	}
+  }
+  
+ +static void fdb_del_external_learn(struct net_bridge_fdb_entry *f)
+ +{
+ +	struct switchdev_obj_port_fdb fdb = {
+ +		.obj = {
+ +			.orig_dev = f->dst->dev,
+ +			.id = SWITCHDEV_OBJ_ID_PORT_FDB,
+ +			.flags = SWITCHDEV_F_DEFER,
+ +		},
+ +		.vid = f->vlan_id,
+ +	};
+ +
+ +	ether_addr_copy(fdb.addr, f->addr.addr);
+ +	switchdev_port_obj_del(f->dst->dev, &fdb.obj);
+ +}
+ +
+  static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+  {
++ 	trace_fdb_delete(br, f);
++ 
+  	if (f->is_static)
+  		fdb_del_hw_addr(br, f->addr.addr);
+  
+@@@ -1120,7 -1071,8 +1125,12 @@@ int br_fdb_external_learn_add(struct ne
+  	bool modified = false;
+  	int err = 0;
+  
+++<<<<<<< HEAD
+ +	ASSERT_RTNL();
+++=======
++ 	trace_br_fdb_external_learn_add(br, p, addr, vid);
++ 
+++>>>>>>> b74fd306ef2d (bridge: fdb add and delete tracepoints)
+  	spin_lock_bh(&br->hash_lock);
+  
+  	head = &br->hash[br_mac_hash(addr, vid)];
+diff --cc net/core/net-traces.c
+index ba3c0120786c,4a0292c97070..000000000000
+--- a/net/core/net-traces.c
++++ b/net/core/net-traces.c
+@@@ -31,6 -31,18 +31,21 @@@
+  #include <trace/events/napi.h>
+  #include <trace/events/sock.h>
+  #include <trace/events/udp.h>
+++<<<<<<< HEAD
+++=======
++ #include <trace/events/fib.h>
++ #include <trace/events/qdisc.h>
++ #if IS_ENABLED(CONFIG_IPV6)
++ #include <trace/events/fib6.h>
++ EXPORT_TRACEPOINT_SYMBOL_GPL(fib6_table_lookup);
++ #endif
++ #if IS_ENABLED(CONFIG_BRIDGE)
++ #include <trace/events/bridge.h>
++ EXPORT_TRACEPOINT_SYMBOL_GPL(br_fdb_add);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(br_fdb_external_learn_add);
++ EXPORT_TRACEPOINT_SYMBOL_GPL(fdb_delete);
++ #endif
+++>>>>>>> b74fd306ef2d (bridge: fdb add and delete tracepoints)
+  
+  EXPORT_TRACEPOINT_SYMBOL_GPL(kfree_skb);
+  
+diff --git a/include/trace/events/bridge.h b/include/trace/events/bridge.h
+new file mode 100644
+index 000000000000..0f1cde00af11
+--- /dev/null
++++ b/include/trace/events/bridge.h
+@@ -0,0 +1,98 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM bridge
++
++#if !defined(_TRACE_BRIDGE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_BRIDGE_H
++
++#include <linux/netdevice.h>
++#include <linux/tracepoint.h>
++
++#include "../../../net/bridge/br_private.h"
++
++TRACE_EVENT(br_fdb_add,
++
++	TP_PROTO(struct ndmsg *ndm, struct net_device *dev,
++		 const unsigned char *addr, u16 vid, u16 nlh_flags),
++
++	TP_ARGS(ndm, dev, addr, vid, nlh_flags),
++
++	TP_STRUCT__entry(
++		__field(u8, ndm_flags)
++		__string(dev, dev->name)
++		__array(unsigned char, addr, ETH_ALEN)
++		__field(u16, vid)
++		__field(u16, nlh_flags)
++	),
++
++	TP_fast_assign(
++		__assign_str(dev, dev->name);
++		memcpy(__entry->addr, addr, ETH_ALEN);
++		__entry->vid = vid;
++		__entry->nlh_flags = nlh_flags;
++		__entry->ndm_flags = ndm->ndm_flags;
++	),
++
++	TP_printk("dev %s addr %02x:%02x:%02x:%02x:%02x:%02x vid %u nlh_flags %04x ndm_flags %02x",
++		  __get_str(dev), __entry->addr[0], __entry->addr[1],
++		  __entry->addr[2], __entry->addr[3], __entry->addr[4],
++		  __entry->addr[5], __entry->vid,
++		  __entry->nlh_flags, __entry->ndm_flags)
++);
++
++TRACE_EVENT(br_fdb_external_learn_add,
++
++	TP_PROTO(struct net_bridge *br, struct net_bridge_port *p,
++		 const unsigned char *addr, u16 vid),
++
++	TP_ARGS(br, p, addr, vid),
++
++	TP_STRUCT__entry(
++		__string(br_dev, br->dev->name)
++		__string(dev, p ? p->dev->name : "null")
++		__array(unsigned char, addr, ETH_ALEN)
++		__field(u16, vid)
++	),
++
++	TP_fast_assign(
++		__assign_str(br_dev, br->dev->name);
++		__assign_str(dev, p ? p->dev->name : "null");
++		memcpy(__entry->addr, addr, ETH_ALEN);
++		__entry->vid = vid;
++	),
++
++	TP_printk("br_dev %s port %s addr %02x:%02x:%02x:%02x:%02x:%02x vid %u",
++		  __get_str(br_dev), __get_str(dev), __entry->addr[0],
++		  __entry->addr[1], __entry->addr[2], __entry->addr[3],
++		  __entry->addr[4], __entry->addr[5], __entry->vid)
++);
++
++TRACE_EVENT(fdb_delete,
++
++	TP_PROTO(struct net_bridge *br, struct net_bridge_fdb_entry *f),
++
++	TP_ARGS(br, f),
++
++	TP_STRUCT__entry(
++		__string(br_dev, br->dev->name)
++		__string(dev, f->dst ? f->dst->dev->name : "null")
++		__array(unsigned char, addr, ETH_ALEN)
++		__field(u16, vid)
++	),
++
++	TP_fast_assign(
++		__assign_str(br_dev, br->dev->name);
++		__assign_str(dev, f->dst ? f->dst->dev->name : "null");
++		memcpy(__entry->addr, f->addr.addr, ETH_ALEN);
++		__entry->vid = f->vlan_id;
++	),
++
++	TP_printk("br_dev %s dev %s addr %02x:%02x:%02x:%02x:%02x:%02x vid %u",
++		  __get_str(br_dev), __get_str(dev), __entry->addr[0],
++		  __entry->addr[1], __entry->addr[2], __entry->addr[3],
++		  __entry->addr[4], __entry->addr[5], __entry->vid)
++);
++
++#endif /* _TRACE_BRIDGE_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+* Unmerged path net/bridge/br_fdb.c
+* Unmerged path net/core/net-traces.c
