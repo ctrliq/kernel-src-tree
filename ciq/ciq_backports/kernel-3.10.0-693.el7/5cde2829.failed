@@ -1,0 +1,146 @@
+net: Separate the close_list and the unreg_list v2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] Separate the close_list and the unreg_list (Paolo Abeni) [1382175]
+Rebuild_FUZZ: 91.30%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 5cde282938915f36a2e6769b51c24c4159654859
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5cde2829.failed
+
+Separate the unreg_list and the close_list in dev_close_many preventing
+dev_close_many from permuting the unreg_list.  The permutations of the
+unreg_list have resulted in cases where the loopback device is accessed
+it has been freed in code such as dst_ifdown.  Resulting in subtle memory
+corruption.
+
+This is the second bug from sharing the storage between the close_list
+and the unreg_list.  The issues that crop up with sharing are
+apparently too subtle to show up in normal testing or usage, so let's
+forget about being clever and use two separate lists.
+
+v2: Make all callers pass in a close_list to dev_close_many
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5cde282938915f36a2e6769b51c24c4159654859)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index b6150f910ad9,6d77e0f3cc10..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1492,7 -1143,19 +1492,23 @@@ struct net_device 
+  	struct list_head	dev_list;
+  	struct list_head	napi_list;
+  	struct list_head	unreg_list;
+++<<<<<<< HEAD
+ +	struct list_head	upper_dev_list; /* List of upper devices */
+++=======
++ 	struct list_head	close_list;
++ 
++ 	/* directly linked devices, like slaves for bonding */
++ 	struct {
++ 		struct list_head upper;
++ 		struct list_head lower;
++ 	} adj_list;
++ 
++ 	/* all linked devices, *including* neighbours */
++ 	struct {
++ 		struct list_head upper;
++ 		struct list_head lower;
++ 	} all_adj_list;
+++>>>>>>> 5cde28293891 (net: Separate the close_list and the unreg_list v2)
+  
+  
+  	/* currently active device features */
+diff --cc net/core/dev.c
+index 72fb163d4c18,fa0b2b06c1a6..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -1412,11 -1349,9 +1412,11 @@@ static int __dev_close(struct net_devic
+  	LIST_HEAD(single);
+  
+  	/* Temporarily disable netpoll until the interface is down */
+ -	netpoll_rx_disable(dev);
+ +	retval = netpoll_rx_disable(dev);
+ +	if (retval)
+ +		return retval;
+  
+- 	list_add(&dev->unreg_list, &single);
++ 	list_add(&dev->close_list, &single);
+  	retval = __dev_close_many(&single);
+  	list_del(&single);
+  
+@@@ -1435,13 -1370,12 +1435,17 @@@ static int dev_close_many(struct list_h
+  
+  	__dev_close_many(head);
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(dev, head, unreg_list) {
+ +		rtmsg_ifinfo(RTM_NEWLINK, dev, IFF_UP|IFF_RUNNING, GFP_KERNEL);
+++=======
++ 	list_for_each_entry_safe(dev, tmp, head, close_list) {
++ 		rtmsg_ifinfo(RTM_NEWLINK, dev, IFF_UP|IFF_RUNNING);
+++>>>>>>> 5cde28293891 (net: Separate the close_list and the unreg_list v2)
+  		call_netdevice_notifiers(NETDEV_DOWN, dev);
++ 		list_del_init(&dev->close_list);
+  	}
+  
+- 	/* rollback_registered_many needs the complete original list */
+- 	list_splice(&tmp_list, head);
+  	return 0;
+  }
+  
+@@@ -1461,11 -1394,9 +1465,11 @@@ int dev_close(struct net_device *dev
+  		LIST_HEAD(single);
+  
+  		/* Block netpoll rx while the interface is going down */
+ -		netpoll_rx_disable(dev);
+ +		ret = netpoll_rx_disable(dev);
+ +		if (ret)
+ +			return ret;
+  
+- 		list_add(&dev->unreg_list, &single);
++ 		list_add(&dev->close_list, &single);
+  		dev_close_many(&single);
+  		list_del(&single);
+  
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 568bb49f9ed6..2b9462f3ab22 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -858,7 +858,7 @@ void dev_deactivate_many(struct list_head *head)
+ 	struct net_device *dev;
+ 	bool sync_needed = false;
+ 
+-	list_for_each_entry(dev, head, unreg_list) {
++	list_for_each_entry(dev, head, close_list) {
+ 		netdev_for_each_tx_queue(dev, dev_deactivate_queue,
+ 					 &noop_qdisc);
+ 		if (dev_ingress_queue(dev))
+@@ -877,7 +877,7 @@ void dev_deactivate_many(struct list_head *head)
+ 		synchronize_net();
+ 
+ 	/* Wait for outstanding qdisc_run calls. */
+-	list_for_each_entry(dev, head, unreg_list)
++	list_for_each_entry(dev, head, close_list)
+ 		while (some_qdisc_is_busy(dev))
+ 			yield();
+ }
+@@ -886,7 +886,7 @@ void dev_deactivate(struct net_device *dev)
+ {
+ 	LIST_HEAD(single);
+ 
+-	list_add(&dev->unreg_list, &single);
++	list_add(&dev->close_list, &single);
+ 	dev_deactivate_many(&single);
+ 	list_del(&single);
+ }
