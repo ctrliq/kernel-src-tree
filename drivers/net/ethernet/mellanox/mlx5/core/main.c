@@ -698,7 +698,6 @@ int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn,
 	int err = -ENOENT;
 	int i = 0;
 
-	spin_lock(&table->lock);
 	list_for_each_entry_safe(eq, n, &table->comp_eqs_list, list) {
 		if (i++ == vector) {
 			*eqn = eq->eqn;
@@ -707,7 +706,6 @@ int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn,
 			break;
 		}
 	}
-	spin_unlock(&table->lock);
 
 	return err;
 }
@@ -718,14 +716,11 @@ struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn)
 	struct mlx5_eq_table *table = &dev->priv.eq_table;
 	struct mlx5_eq *eq;
 
-	spin_lock(&table->lock);
-	list_for_each_entry(eq, &table->comp_eqs_list, list)
-		if (eq->eqn == eqn) {
-			spin_unlock(&table->lock);
+	list_for_each_entry(eq, &table->comp_eqs_list, list) {
+		if (eq->eqn == eqn)
 			return eq;
-		}
+	}
 
-	spin_unlock(&table->lock);
 
 	return ERR_PTR(-ENOENT);
 }
@@ -741,17 +736,13 @@ static void free_comp_eqs(struct mlx5_core_dev *dev)
 		dev->rmap = NULL;
 	}
 #endif
-	spin_lock(&table->lock);
 	list_for_each_entry_safe(eq, n, &table->comp_eqs_list, list) {
 		list_del(&eq->list);
-		spin_unlock(&table->lock);
 		if (mlx5_destroy_unmap_eq(dev, eq))
 			mlx5_core_warn(dev, "failed to destroy EQ 0x%x\n",
 				       eq->eqn);
 		kfree(eq);
-		spin_lock(&table->lock);
 	}
-	spin_unlock(&table->lock);
 }
 
 static int alloc_comp_eqs(struct mlx5_core_dev *dev)
@@ -792,9 +783,7 @@ static int alloc_comp_eqs(struct mlx5_core_dev *dev)
 			goto clean;
 		}
 		mlx5_core_dbg(dev, "allocated completion EQN %d\n", eq->eqn);
-		spin_lock(&table->lock);
 		list_add_tail(&eq->list, &table->comp_eqs_list);
-		spin_unlock(&table->lock);
 	}
 
 	return 0;
