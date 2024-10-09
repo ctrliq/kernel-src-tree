@@ -350,8 +350,9 @@ reclassify:
 #ifdef CONFIG_NET_CLS_ACT
 reset:
 	if (unlikely(limit++ >= max_reclassify_loop)) {
-		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
-				       tp->q->ops->id, tp->prio & 0xffff,
+		net_notice_ratelimited("%u: reclassify loop, rule prio %u, protocol %02x\n",
+				       tp->chain->block->index,
+				       tp->prio & 0xffff,
 				       ntohs(tp->protocol));
 		return TC_ACT_SHOT;
 	}
