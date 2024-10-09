@@ -1,0 +1,1006 @@
+bpf, s390x: remove obsolete exception handling from div/mod
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit a3212b8f15d88619520c2f9e98683e56ad3a649e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a3212b8f.failed
+
+Since we've changed div/mod exception handling for src_reg in
+eBPF verifier itself, remove the leftovers from s390x JIT.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit a3212b8f15d88619520c2f9e98683e56ad3a649e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/net/bpf_jit_comp.c
+diff --cc arch/s390/net/bpf_jit_comp.c
+index 15be4f92e665,78a19c93b380..000000000000
+--- a/arch/s390/net/bpf_jit_comp.c
++++ b/arch/s390/net/bpf_jit_comp.c
+@@@ -274,427 -474,584 +274,453 @@@ static void bpf_jit_epilogue(struct bpf
+  }
+  
+  /*
+ - * Compile one eBPF instruction into s390x code
+ - *
+ - * NOTE: Use noinline because for gcov (-fprofile-arcs) gcc allocates a lot of
+ - * stack space for the large switch statement.
+ + * make sure we dont leak kernel information to user
+   */
+ -static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp, int i)
+ +static void bpf_jit_noleaks(struct bpf_jit *jit, struct sock_filter *filter)
+  {
+ -	struct bpf_insn *insn = &fp->insnsi[i];
+ -	int jmp_off, last, insn_count = 1;
+ -	unsigned int func_addr, mask;
+ -	u32 dst_reg = insn->dst_reg;
+ -	u32 src_reg = insn->src_reg;
+ -	u32 *addrs = jit->addrs;
+ -	s32 imm = insn->imm;
+ -	s16 off = insn->off;
+ -
+ -	if (dst_reg == BPF_REG_AX || src_reg == BPF_REG_AX)
+ -		jit->seen |= SEEN_REG_AX;
+ -	switch (insn->code) {
+ -	/*
+ -	 * BPF_MOV
+ -	 */
+ -	case BPF_ALU | BPF_MOV | BPF_X: /* dst = (u32) src */
+ -		/* llgfr %dst,%src */
+ -		EMIT4(0xb9160000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_MOV | BPF_X: /* dst = src */
+ -		/* lgr %dst,%src */
+ -		EMIT4(0xb9040000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU | BPF_MOV | BPF_K: /* dst = (u32) imm */
+ -		/* llilf %dst,imm */
+ -		EMIT6_IMM(0xc00f0000, dst_reg, imm);
+ -		break;
+ -	case BPF_ALU64 | BPF_MOV | BPF_K: /* dst = imm */
+ -		/* lgfi %dst,imm */
+ -		EMIT6_IMM(0xc0010000, dst_reg, imm);
+ -		break;
+ -	/*
+ -	 * BPF_LD 64
+ -	 */
+ -	case BPF_LD | BPF_IMM | BPF_DW: /* dst = (u64) imm */
+ -	{
+ -		/* 16 byte instruction that uses two 'struct bpf_insn' */
+ -		u64 imm64;
+ -
+ -		imm64 = (u64)(u32) insn[0].imm | ((u64)(u32) insn[1].imm) << 32;
+ -		/* lg %dst,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0004, dst_reg, REG_0, REG_L,
+ -			      EMIT_CONST_U64(imm64));
+ -		insn_count = 2;
+ -		break;
+ +	/* Clear temporary memory if (seen & SEEN_MEM) */
+ +	if (jit->seen & SEEN_MEM)
+ +		/* xc 0(64,%r15),0(%r15) */
+ +		EMIT6(0xd73ff000, 0xf000);
+ +	/* Clear X if (seen & SEEN_XREG) */
+ +	if (jit->seen & SEEN_XREG)
+ +		/* lhi %r12,0 */
+ +		EMIT4(0xa7c80000);
+ +	/* Clear A if the first register does not set it. */
+ +	switch (filter[0].code) {
+ +	case BPF_S_LD_W_ABS:
+ +	case BPF_S_LD_H_ABS:
+ +	case BPF_S_LD_B_ABS:
+ +	case BPF_S_LD_W_LEN:
+ +	case BPF_S_LD_W_IND:
+ +	case BPF_S_LD_H_IND:
+ +	case BPF_S_LD_B_IND:
+ +	case BPF_S_LD_IMM:
+ +	case BPF_S_LD_MEM:
+ +	case BPF_S_MISC_TXA:
+ +	case BPF_S_ANC_PROTOCOL:
+ +	case BPF_S_ANC_PKTTYPE:
+ +	case BPF_S_ANC_IFINDEX:
+ +	case BPF_S_ANC_MARK:
+ +	case BPF_S_ANC_QUEUE:
+ +	case BPF_S_ANC_HATYPE:
+ +	case BPF_S_ANC_RXHASH:
+ +	case BPF_S_ANC_CPU:
+ +	case BPF_S_ANC_VLAN_TAG:
+ +	case BPF_S_ANC_VLAN_TAG_PRESENT:
+ +	case BPF_S_RET_K:
+ +		/* first instruction sets A register */
+ +		break;
+ +	default: /* A = 0 */
+ +		/* lhi %r5,0 */
+ +		EMIT4(0xa7580000);
+  	}
+ -	/*
+ -	 * BPF_ADD
+ -	 */
+ -	case BPF_ALU | BPF_ADD | BPF_X: /* dst = (u32) dst + (u32) src */
+ -		/* ar %dst,%src */
+ -		EMIT2(0x1a00, dst_reg, src_reg);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_ADD | BPF_X: /* dst = dst + src */
+ -		/* agr %dst,%src */
+ -		EMIT4(0xb9080000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU | BPF_ADD | BPF_K: /* dst = (u32) dst + (u32) imm */
+ -		if (!imm)
+ -			break;
+ -		/* alfi %dst,imm */
+ -		EMIT6_IMM(0xc20b0000, dst_reg, imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_ADD | BPF_K: /* dst = dst + imm */
+ -		if (!imm)
+ -			break;
+ -		/* agfi %dst,imm */
+ -		EMIT6_IMM(0xc2080000, dst_reg, imm);
+ -		break;
+ -	/*
+ -	 * BPF_SUB
+ -	 */
+ -	case BPF_ALU | BPF_SUB | BPF_X: /* dst = (u32) dst - (u32) src */
+ -		/* sr %dst,%src */
+ -		EMIT2(0x1b00, dst_reg, src_reg);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_SUB | BPF_X: /* dst = dst - src */
+ -		/* sgr %dst,%src */
+ -		EMIT4(0xb9090000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU | BPF_SUB | BPF_K: /* dst = (u32) dst - (u32) imm */
+ -		if (!imm)
+ -			break;
+ -		/* alfi %dst,-imm */
+ -		EMIT6_IMM(0xc20b0000, dst_reg, -imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_SUB | BPF_K: /* dst = dst - imm */
+ -		if (!imm)
+ -			break;
+ -		/* agfi %dst,-imm */
+ -		EMIT6_IMM(0xc2080000, dst_reg, -imm);
+ -		break;
+ -	/*
+ -	 * BPF_MUL
+ -	 */
+ -	case BPF_ALU | BPF_MUL | BPF_X: /* dst = (u32) dst * (u32) src */
+ -		/* msr %dst,%src */
+ -		EMIT4(0xb2520000, dst_reg, src_reg);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_MUL | BPF_X: /* dst = dst * src */
+ -		/* msgr %dst,%src */
+ -		EMIT4(0xb90c0000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU | BPF_MUL | BPF_K: /* dst = (u32) dst * (u32) imm */
+ -		if (imm == 1)
+ -			break;
+ -		/* msfi %r5,imm */
+ -		EMIT6_IMM(0xc2010000, dst_reg, imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_MUL | BPF_K: /* dst = dst * imm */
+ -		if (imm == 1)
+ -			break;
+ -		/* msgfi %dst,imm */
+ -		EMIT6_IMM(0xc2000000, dst_reg, imm);
+ -		break;
+ -	/*
+ -	 * BPF_DIV / BPF_MOD
+ -	 */
+ -	case BPF_ALU | BPF_DIV | BPF_X: /* dst = (u32) dst / (u32) src */
+ -	case BPF_ALU | BPF_MOD | BPF_X: /* dst = (u32) dst % (u32) src */
+ -	{
+ -		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
+ +}
+  
+++<<<<<<< HEAD
+ +static int bpf_jit_insn(struct bpf_jit *jit, struct sock_filter *filter,
+ +			unsigned int *addrs, int i, int last)
+ +{
+ +	unsigned int K;
+ +	int offset;
+ +	unsigned int mask;
+ +
+ +	K = filter->k;
+ +	switch (filter->code) {
+ +	case BPF_S_ALU_ADD_X: /* A += X */
+ +		jit->seen |= SEEN_XREG;
+ +		/* ar %r5,%r12 */
+ +		EMIT2(0x1a5c);
+++=======
++ 		/* lhi %w0,0 */
++ 		EMIT4_IMM(0xa7080000, REG_W0, 0);
++ 		/* lr %w1,%dst */
++ 		EMIT2(0x1800, REG_W1, dst_reg);
++ 		/* dlr %w0,%src */
++ 		EMIT4(0xb9970000, REG_W0, src_reg);
++ 		/* llgfr %dst,%rc */
++ 		EMIT4(0xb9160000, dst_reg, rc_reg);
++ 		break;
++ 	}
++ 	case BPF_ALU64 | BPF_DIV | BPF_X: /* dst = dst / src */
++ 	case BPF_ALU64 | BPF_MOD | BPF_X: /* dst = dst % src */
++ 	{
++ 		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
++ 
++ 		/* lghi %w0,0 */
++ 		EMIT4_IMM(0xa7090000, REG_W0, 0);
++ 		/* lgr %w1,%dst */
++ 		EMIT4(0xb9040000, REG_W1, dst_reg);
++ 		/* dlgr %w0,%dst */
++ 		EMIT4(0xb9870000, REG_W0, src_reg);
++ 		/* lgr %dst,%rc */
++ 		EMIT4(0xb9040000, dst_reg, rc_reg);
+++>>>>>>> a3212b8f15d8 (bpf, s390x: remove obsolete exception handling from div/mod)
+  		break;
+ -	}
+ -	case BPF_ALU | BPF_DIV | BPF_K: /* dst = (u32) dst / (u32) imm */
+ -	case BPF_ALU | BPF_MOD | BPF_K: /* dst = (u32) dst % (u32) imm */
+ -	{
+ -		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
+ -
+ -		if (imm == 1) {
+ -			if (BPF_OP(insn->code) == BPF_MOD)
+ -				/* lhgi %dst,0 */
+ -				EMIT4_IMM(0xa7090000, dst_reg, 0);
+ -			break;
+ -		}
+ -		/* lhi %w0,0 */
+ -		EMIT4_IMM(0xa7080000, REG_W0, 0);
+ -		/* lr %w1,%dst */
+ -		EMIT2(0x1800, REG_W1, dst_reg);
+ -		/* dl %w0,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0097, REG_W0, REG_0, REG_L,
+ -			      EMIT_CONST_U32(imm));
+ -		/* llgfr %dst,%rc */
+ -		EMIT4(0xb9160000, dst_reg, rc_reg);
+ -		break;
+ -	}
+ -	case BPF_ALU64 | BPF_DIV | BPF_K: /* dst = dst / imm */
+ -	case BPF_ALU64 | BPF_MOD | BPF_K: /* dst = dst % imm */
+ -	{
+ -		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
+ -
+ -		if (imm == 1) {
+ -			if (BPF_OP(insn->code) == BPF_MOD)
+ -				/* lhgi %dst,0 */
+ -				EMIT4_IMM(0xa7090000, dst_reg, 0);
+ +	case BPF_S_ALU_ADD_K: /* A += K */
+ +		if (!K)
+  			break;
+ -		}
+ -		/* lghi %w0,0 */
+ -		EMIT4_IMM(0xa7090000, REG_W0, 0);
+ -		/* lgr %w1,%dst */
+ -		EMIT4(0xb9040000, REG_W1, dst_reg);
+ -		/* dlg %w0,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0087, REG_W0, REG_0, REG_L,
+ -			      EMIT_CONST_U64(imm));
+ -		/* lgr %dst,%rc */
+ -		EMIT4(0xb9040000, dst_reg, rc_reg);
+ -		break;
+ -	}
+ -	/*
+ -	 * BPF_AND
+ -	 */
+ -	case BPF_ALU | BPF_AND | BPF_X: /* dst = (u32) dst & (u32) src */
+ -		/* nr %dst,%src */
+ -		EMIT2(0x1400, dst_reg, src_reg);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_AND | BPF_X: /* dst = dst & src */
+ -		/* ngr %dst,%src */
+ -		EMIT4(0xb9800000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU | BPF_AND | BPF_K: /* dst = (u32) dst & (u32) imm */
+ -		/* nilf %dst,imm */
+ -		EMIT6_IMM(0xc00b0000, dst_reg, imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_AND | BPF_K: /* dst = dst & imm */
+ -		/* ng %dst,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0080, dst_reg, REG_0, REG_L,
+ -			      EMIT_CONST_U64(imm));
+ -		break;
+ -	/*
+ -	 * BPF_OR
+ -	 */
+ -	case BPF_ALU | BPF_OR | BPF_X: /* dst = (u32) dst | (u32) src */
+ -		/* or %dst,%src */
+ -		EMIT2(0x1600, dst_reg, src_reg);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_OR | BPF_X: /* dst = dst | src */
+ -		/* ogr %dst,%src */
+ -		EMIT4(0xb9810000, dst_reg, src_reg);
+ -		break;
+ -	case BPF_ALU | BPF_OR | BPF_K: /* dst = (u32) dst | (u32) imm */
+ -		/* oilf %dst,imm */
+ -		EMIT6_IMM(0xc00d0000, dst_reg, imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_OR | BPF_K: /* dst = dst | imm */
+ -		/* og %dst,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0081, dst_reg, REG_0, REG_L,
+ -			      EMIT_CONST_U64(imm));
+ -		break;
+ -	/*
+ -	 * BPF_XOR
+ -	 */
+ -	case BPF_ALU | BPF_XOR | BPF_X: /* dst = (u32) dst ^ (u32) src */
+ -		/* xr %dst,%src */
+ -		EMIT2(0x1700, dst_reg, src_reg);
+ -		EMIT_ZERO(dst_reg);
+ +		if (K <= 16383)
+ +			/* ahi %r5,<K> */
+ +			EMIT4_IMM(0xa75a0000, K);
+ +		else if (test_facility(21))
+ +			/* alfi %r5,<K> */
+ +			EMIT6_IMM(0xc25b0000, K);
+ +		else
+ +			/* a %r5,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x5a50d000, EMIT_CONST(K));
+  		break;
+ -	case BPF_ALU64 | BPF_XOR | BPF_X: /* dst = dst ^ src */
+ -		/* xgr %dst,%src */
+ -		EMIT4(0xb9820000, dst_reg, src_reg);
+ +	case BPF_S_ALU_SUB_X: /* A -= X */
+ +		jit->seen |= SEEN_XREG;
+ +		/* sr %r5,%r12 */
+ +		EMIT2(0x1b5c);
+  		break;
+ -	case BPF_ALU | BPF_XOR | BPF_K: /* dst = (u32) dst ^ (u32) imm */
+ -		if (!imm)
+ +	case BPF_S_ALU_SUB_K: /* A -= K */
+ +		if (!K)
+  			break;
+ -		/* xilf %dst,imm */
+ -		EMIT6_IMM(0xc0070000, dst_reg, imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_XOR | BPF_K: /* dst = dst ^ imm */
+ -		/* xg %dst,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0082, dst_reg, REG_0, REG_L,
+ -			      EMIT_CONST_U64(imm));
+ -		break;
+ -	/*
+ -	 * BPF_LSH
+ -	 */
+ -	case BPF_ALU | BPF_LSH | BPF_X: /* dst = (u32) dst << (u32) src */
+ -		/* sll %dst,0(%src) */
+ -		EMIT4_DISP(0x89000000, dst_reg, src_reg, 0);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_LSH | BPF_X: /* dst = dst << src */
+ -		/* sllg %dst,%dst,0(%src) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000d, dst_reg, dst_reg, src_reg, 0);
+ -		break;
+ -	case BPF_ALU | BPF_LSH | BPF_K: /* dst = (u32) dst << (u32) imm */
+ -		if (imm == 0)
+ +		if (K <= 16384)
+ +			/* ahi %r5,-K */
+ +			EMIT4_IMM(0xa75a0000, -K);
+ +		else if (test_facility(21))
+ +			/* alfi %r5,-K */
+ +			EMIT6_IMM(0xc25b0000, -K);
+ +		else
+ +			/* s %r5,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x5b50d000, EMIT_CONST(K));
+ +		break;
+ +	case BPF_S_ALU_MUL_X: /* A *= X */
+ +		jit->seen |= SEEN_XREG;
+ +		/* msr %r5,%r12 */
+ +		EMIT4(0xb252005c);
+ +		break;
+ +	case BPF_S_ALU_MUL_K: /* A *= K */
+ +		if (K <= 16383)
+ +			/* mhi %r5,K */
+ +			EMIT4_IMM(0xa75c0000, K);
+ +		else if (test_facility(34))
+ +			/* msfi %r5,<K> */
+ +			EMIT6_IMM(0xc2510000, K);
+ +		else
+ +			/* ms %r5,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x7150d000, EMIT_CONST(K));
+ +		break;
+ +	case BPF_S_ALU_DIV_X: /* A /= X */
+ +		jit->seen |= SEEN_XREG | SEEN_RET0;
+ +		/* ltr %r12,%r12 */
+ +		EMIT2(0x12cc);
+ +		/* jz <ret0> */
+ +		EMIT4_PCREL(0xa7840000, (jit->ret0_ip - jit->prg));
+ +		/* lhi %r4,0 */
+ +		EMIT4(0xa7480000);
+ +		/* dlr %r4,%r12 */
+ +		EMIT4(0xb997004c);
+ +		break;
+ +	case BPF_S_ALU_DIV_K: /* A /= K */
+ +		if (K == 1)
+  			break;
+ -		/* sll %dst,imm(%r0) */
+ -		EMIT4_DISP(0x89000000, dst_reg, REG_0, imm);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_LSH | BPF_K: /* dst = dst << imm */
+ -		if (imm == 0)
+ +		/* lhi %r4,0 */
+ +		EMIT4(0xa7480000);
+ +		/* dl %r4,<d(K)>(%r13) */
+ +		EMIT6_DISP(0xe340d000, 0x0097, EMIT_CONST(K));
+ +		break;
+ +	case BPF_S_ALU_MOD_X: /* A %= X */
+ +		jit->seen |= SEEN_XREG | SEEN_RET0;
+ +		/* ltr %r12,%r12 */
+ +		EMIT2(0x12cc);
+ +		/* jz <ret0> */
+ +		EMIT4_PCREL(0xa7840000, (jit->ret0_ip - jit->prg));
+ +		/* lhi %r4,0 */
+ +		EMIT4(0xa7480000);
+ +		/* dlr %r4,%r12 */
+ +		EMIT4(0xb997004c);
+ +		/* lr %r5,%r4 */
+ +		EMIT2(0x1854);
+ +		break;
+ +	case BPF_S_ALU_MOD_K: /* A %= K */
+ +		if (K == 1) {
+ +			/* lhi %r5,0 */
+ +			EMIT4(0xa7580000);
+  			break;
+ -		/* sllg %dst,%dst,imm(%r0) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000d, dst_reg, dst_reg, REG_0, imm);
+ -		break;
+ -	/*
+ -	 * BPF_RSH
+ -	 */
+ -	case BPF_ALU | BPF_RSH | BPF_X: /* dst = (u32) dst >> (u32) src */
+ -		/* srl %dst,0(%src) */
+ -		EMIT4_DISP(0x88000000, dst_reg, src_reg, 0);
+ -		EMIT_ZERO(dst_reg);
+ -		break;
+ -	case BPF_ALU64 | BPF_RSH | BPF_X: /* dst = dst >> src */
+ -		/* srlg %dst,%dst,0(%src) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000c, dst_reg, dst_reg, src_reg, 0);
+ +		}
+ +		/* lhi %r4,0 */
+ +		EMIT4(0xa7480000);
+ +		/* dl %r4,<d(K)>(%r13) */
+ +		EMIT6_DISP(0xe340d000, 0x0097, EMIT_CONST(K));
+ +		/* lr %r5,%r4 */
+ +		EMIT2(0x1854);
+ +		break;
+ +	case BPF_S_ALU_AND_X: /* A &= X */
+ +		jit->seen |= SEEN_XREG;
+ +		/* nr %r5,%r12 */
+ +		EMIT2(0x145c);
+ +		break;
+ +	case BPF_S_ALU_AND_K: /* A &= K */
+ +		if (test_facility(21))
+ +			/* nilf %r5,<K> */
+ +			EMIT6_IMM(0xc05b0000, K);
+ +		else
+ +			/* n %r5,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x5450d000, EMIT_CONST(K));
+ +		break;
+ +	case BPF_S_ALU_OR_X: /* A |= X */
+ +		jit->seen |= SEEN_XREG;
+ +		/* or %r5,%r12 */
+ +		EMIT2(0x165c);
+ +		break;
+ +	case BPF_S_ALU_OR_K: /* A |= K */
+ +		if (test_facility(21))
+ +			/* oilf %r5,<K> */
+ +			EMIT6_IMM(0xc05d0000, K);
+ +		else
+ +			/* o %r5,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x5650d000, EMIT_CONST(K));
+  		break;
+ -	case BPF_ALU | BPF_RSH | BPF_K: /* dst = (u32) dst >> (u32) imm */
+ -		if (imm == 0)
+ -			break;
+ -		/* srl %dst,imm(%r0) */
+ -		EMIT4_DISP(0x88000000, dst_reg, REG_0, imm);
+ -		EMIT_ZERO(dst_reg);
+ +	case BPF_S_ANC_ALU_XOR_X: /* A ^= X; */
+ +	case BPF_S_ALU_XOR_X:
+ +		jit->seen |= SEEN_XREG;
+ +		/* xr %r5,%r12 */
+ +		EMIT2(0x175c);
+  		break;
+ -	case BPF_ALU64 | BPF_RSH | BPF_K: /* dst = dst >> imm */
+ -		if (imm == 0)
+ +	case BPF_S_ALU_XOR_K: /* A ^= K */
+ +		if (!K)
+  			break;
+ -		/* srlg %dst,%dst,imm(%r0) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000c, dst_reg, dst_reg, REG_0, imm);
+ +		/* x %r5,<d(K)>(%r13) */
+ +		EMIT4_DISP(0x5750d000, EMIT_CONST(K));
+  		break;
+ -	/*
+ -	 * BPF_ARSH
+ -	 */
+ -	case BPF_ALU64 | BPF_ARSH | BPF_X: /* ((s64) dst) >>= src */
+ -		/* srag %dst,%dst,0(%src) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000a, dst_reg, dst_reg, src_reg, 0);
+ +	case BPF_S_ALU_LSH_X: /* A <<= X; */
+ +		jit->seen |= SEEN_XREG;
+ +		/* sll %r5,0(%r12) */
+ +		EMIT4(0x8950c000);
+  		break;
+ -	case BPF_ALU64 | BPF_ARSH | BPF_K: /* ((s64) dst) >>= imm */
+ -		if (imm == 0)
+ +	case BPF_S_ALU_LSH_K: /* A <<= K */
+ +		if (K == 0)
+  			break;
+ -		/* srag %dst,%dst,imm(%r0) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000a, dst_reg, dst_reg, REG_0, imm);
+ -		break;
+ -	/*
+ -	 * BPF_NEG
+ -	 */
+ -	case BPF_ALU | BPF_NEG: /* dst = (u32) -dst */
+ -		/* lcr %dst,%dst */
+ -		EMIT2(0x1300, dst_reg, dst_reg);
+ -		EMIT_ZERO(dst_reg);
+ +		/* sll %r5,K */
+ +		EMIT4_DISP(0x89500000, K);
+  		break;
+ -	case BPF_ALU64 | BPF_NEG: /* dst = -dst */
+ -		/* lcgr %dst,%dst */
+ -		EMIT4(0xb9130000, dst_reg, dst_reg);
+ +	case BPF_S_ALU_RSH_X: /* A >>= X; */
+ +		jit->seen |= SEEN_XREG;
+ +		/* srl %r5,0(%r12) */
+ +		EMIT4(0x8850c000);
+  		break;
+ -	/*
+ -	 * BPF_FROM_BE/LE
+ -	 */
+ -	case BPF_ALU | BPF_END | BPF_FROM_BE:
+ -		/* s390 is big endian, therefore only clear high order bytes */
+ -		switch (imm) {
+ -		case 16: /* dst = (u16) cpu_to_be16(dst) */
+ -			/* llghr %dst,%dst */
+ -			EMIT4(0xb9850000, dst_reg, dst_reg);
+ -			break;
+ -		case 32: /* dst = (u32) cpu_to_be32(dst) */
+ -			/* llgfr %dst,%dst */
+ -			EMIT4(0xb9160000, dst_reg, dst_reg);
+ -			break;
+ -		case 64: /* dst = (u64) cpu_to_be64(dst) */
+ +	case BPF_S_ALU_RSH_K: /* A >>= K; */
+ +		if (K == 0)
+  			break;
+ +		/* srl %r5,K */
+ +		EMIT4_DISP(0x88500000, K);
+ +		break;
+ +	case BPF_S_ALU_NEG: /* A = -A */
+ +		/* lcr %r5,%r5 */
+ +		EMIT2(0x1355);
+ +		break;
+ +	case BPF_S_JMP_JA: /* ip += K */
+ +		offset = addrs[i + K] + jit->start - jit->prg;
+ +		EMIT4_PCREL(0xa7f40000, offset);
+ +		break;
+ +	case BPF_S_JMP_JGT_K: /* ip += (A > K) ? jt : jf */
+ +		mask = 0x200000; /* jh */
+ +		goto kbranch;
+ +	case BPF_S_JMP_JGE_K: /* ip += (A >= K) ? jt : jf */
+ +		mask = 0xa00000; /* jhe */
+ +		goto kbranch;
+ +	case BPF_S_JMP_JEQ_K: /* ip += (A == K) ? jt : jf */
+ +		mask = 0x800000; /* je */
+ +kbranch:	/* Emit compare if the branch targets are different */
+ +		if (filter->jt != filter->jf) {
+ +			if (test_facility(21))
+ +				/* clfi %r5,<K> */
+ +				EMIT6_IMM(0xc25f0000, K);
+ +			else
+ +				/* cl %r5,<d(K)>(%r13) */
+ +				EMIT4_DISP(0x5550d000, EMIT_CONST(K));
+  		}
+ -		break;
+ -	case BPF_ALU | BPF_END | BPF_FROM_LE:
+ -		switch (imm) {
+ -		case 16: /* dst = (u16) cpu_to_le16(dst) */
+ -			/* lrvr %dst,%dst */
+ -			EMIT4(0xb91f0000, dst_reg, dst_reg);
+ -			/* srl %dst,16(%r0) */
+ -			EMIT4_DISP(0x88000000, dst_reg, REG_0, 16);
+ -			/* llghr %dst,%dst */
+ -			EMIT4(0xb9850000, dst_reg, dst_reg);
+ -			break;
+ -		case 32: /* dst = (u32) cpu_to_le32(dst) */
+ -			/* lrvr %dst,%dst */
+ -			EMIT4(0xb91f0000, dst_reg, dst_reg);
+ -			/* llgfr %dst,%dst */
+ -			EMIT4(0xb9160000, dst_reg, dst_reg);
+ -			break;
+ -		case 64: /* dst = (u64) cpu_to_le64(dst) */
+ -			/* lrvgr %dst,%dst */
+ -			EMIT4(0xb90f0000, dst_reg, dst_reg);
+ +branch:		if (filter->jt == filter->jf) {
+ +			if (filter->jt == 0)
+ +				break;
+ +			/* j <jt> */
+ +			offset = addrs[i + filter->jt] + jit->start - jit->prg;
+ +			EMIT4_PCREL(0xa7f40000, offset);
+  			break;
+  		}
+ +		if (filter->jt != 0) {
+ +			/* brc	<mask>,<jt> */
+ +			offset = addrs[i + filter->jt] + jit->start - jit->prg;
+ +			EMIT4_PCREL(0xa7040000 | mask, offset);
+ +		}
+ +		if (filter->jf != 0) {
+ +			/* brc	<mask^15>,<jf> */
+ +			offset = addrs[i + filter->jf] + jit->start - jit->prg;
+ +			EMIT4_PCREL(0xa7040000 | (mask ^ 0xf00000), offset);
+ +		}
+  		break;
+ -	/*
+ -	 * BPF_ST(X)
+ -	 */
+ -	case BPF_STX | BPF_MEM | BPF_B: /* *(u8 *)(dst + off) = src_reg */
+ -		/* stcy %src,off(%dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0072, src_reg, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_STX | BPF_MEM | BPF_H: /* (u16 *)(dst + off) = src */
+ -		/* sthy %src,off(%dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0070, src_reg, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_STX | BPF_MEM | BPF_W: /* *(u32 *)(dst + off) = src */
+ -		/* sty %src,off(%dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0050, src_reg, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_STX | BPF_MEM | BPF_DW: /* (u64 *)(dst + off) = src */
+ -		/* stg %src,off(%dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0024, src_reg, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_ST | BPF_MEM | BPF_B: /* *(u8 *)(dst + off) = imm */
+ -		/* lhi %w0,imm */
+ -		EMIT4_IMM(0xa7080000, REG_W0, (u8) imm);
+ -		/* stcy %w0,off(dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0072, REG_W0, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_ST | BPF_MEM | BPF_H: /* (u16 *)(dst + off) = imm */
+ -		/* lhi %w0,imm */
+ -		EMIT4_IMM(0xa7080000, REG_W0, (u16) imm);
+ -		/* sthy %w0,off(dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0070, REG_W0, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_ST | BPF_MEM | BPF_W: /* *(u32 *)(dst + off) = imm */
+ -		/* llilf %w0,imm  */
+ -		EMIT6_IMM(0xc00f0000, REG_W0, (u32) imm);
+ -		/* sty %w0,off(%dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0050, REG_W0, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_ST | BPF_MEM | BPF_DW: /* *(u64 *)(dst + off) = imm */
+ -		/* lgfi %w0,imm */
+ -		EMIT6_IMM(0xc0010000, REG_W0, imm);
+ -		/* stg %w0,off(%dst) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0024, REG_W0, dst_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	/*
+ -	 * BPF_STX XADD (atomic_add)
+ -	 */
+ -	case BPF_STX | BPF_XADD | BPF_W: /* *(u32 *)(dst + off) += src */
+ -		/* laal %w0,%src,off(%dst) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x00fa, REG_W0, src_reg,
+ -			      dst_reg, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_STX | BPF_XADD | BPF_DW: /* *(u64 *)(dst + off) += src */
+ -		/* laalg %w0,%src,off(%dst) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x00ea, REG_W0, src_reg,
+ -			      dst_reg, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	/*
+ -	 * BPF_LDX
+ -	 */
+ -	case BPF_LDX | BPF_MEM | BPF_B: /* dst = *(u8 *)(ul) (src + off) */
+ -		/* llgc %dst,0(off,%src) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0090, dst_reg, src_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ -		break;
+ -	case BPF_LDX | BPF_MEM | BPF_H: /* dst = *(u16 *)(ul) (src + off) */
+ -		/* llgh %dst,0(off,%src) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0091, dst_reg, src_reg, REG_0, off);
+ -		jit->seen |= SEEN_MEM;
+ +	case BPF_S_JMP_JSET_K: /* ip += (A & K) ? jt : jf */
+ +		mask = 0x700000; /* jnz */
+ +		/* Emit test if the branch targets are different */
+ +		if (filter->jt != filter->jf) {
+ +			if (K > 65535) {
+ +				/* lr %r4,%r5 */
+ +				EMIT2(0x1845);
+ +				/* n %r4,<d(K)>(%r13) */
+ +				EMIT4_DISP(0x5440d000, EMIT_CONST(K));
+ +			} else
+ +				/* tmll %r5,K */
+ +				EMIT4_IMM(0xa7510000, K);
+ +		}
+ +		goto branch;
+ +	case BPF_S_JMP_JGT_X: /* ip += (A > X) ? jt : jf */
+ +		mask = 0x200000; /* jh */
+ +		goto xbranch;
+ +	case BPF_S_JMP_JGE_X: /* ip += (A >= X) ? jt : jf */
+ +		mask = 0xa00000; /* jhe */
+ +		goto xbranch;
+ +	case BPF_S_JMP_JEQ_X: /* ip += (A == X) ? jt : jf */
+ +		mask = 0x800000; /* je */
+ +xbranch:	/* Emit compare if the branch targets are different */
+ +		if (filter->jt != filter->jf) {
+ +			jit->seen |= SEEN_XREG;
+ +			/* clr %r5,%r12 */
+ +			EMIT2(0x155c);
+ +		}
+ +		goto branch;
+ +	case BPF_S_JMP_JSET_X: /* ip += (A & X) ? jt : jf */
+ +		mask = 0x700000; /* jnz */
+ +		/* Emit test if the branch targets are different */
+ +		if (filter->jt != filter->jf) {
+ +			jit->seen |= SEEN_XREG;
+ +			/* lr %r4,%r5 */
+ +			EMIT2(0x1845);
+ +			/* nr %r4,%r12 */
+ +			EMIT2(0x144c);
+ +		}
+ +		goto branch;
+ +	case BPF_S_LD_W_ABS: /* A = *(u32 *) (skb->data+K) */
+ +		jit->seen |= SEEN_DATAREF | SEEN_RET0 | SEEN_LOAD_WORD;
+ +		offset = jit->off_load_word;
+ +		goto load_abs;
+ +	case BPF_S_LD_H_ABS: /* A = *(u16 *) (skb->data+K) */
+ +		jit->seen |= SEEN_DATAREF | SEEN_RET0 | SEEN_LOAD_HALF;
+ +		offset = jit->off_load_half;
+ +		goto load_abs;
+ +	case BPF_S_LD_B_ABS: /* A = *(u8 *) (skb->data+K) */
+ +		jit->seen |= SEEN_DATAREF | SEEN_RET0 | SEEN_LOAD_BYTE;
+ +		offset = jit->off_load_byte;
+ +load_abs:	if ((int) K < 0)
+ +			goto out;
+ +call_fn:	/* lg %r1,<d(function)>(%r13) */
+ +		EMIT6_DISP(0xe310d000, 0x0004, offset);
+ +		/* l %r3,<d(K)>(%r13) */
+ +		EMIT4_DISP(0x5830d000, EMIT_CONST(K));
+ +		if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable) {
+ +			/* brasl %r8,__s390_indirect_jump_r1 */
+ +			EMIT6_PCREL_RILB(0xc0850000, jit->r1_thunk_ip);
+ +		} else {
+ +			/* basr %r8,%r1 */
+ +			EMIT2(0x0d81);
+ +		}
+ +		/* jnz <ret0> */
+ +		EMIT4_PCREL(0xa7740000, (jit->ret0_ip - jit->prg));
+  		break;
+ -	case BPF_LDX | BPF_MEM | BPF_W: /* dst = *(u32 *)(ul) (src + off) */
+ -		/* llgf %dst,off(%src) */
+ -		jit->seen |= SEEN_MEM;
+ -		EMIT6_DISP_LH(0xe3000000, 0x0016, dst_reg, src_reg, REG_0, off);
+ +	case BPF_S_LD_W_IND: /* A = *(u32 *) (skb->data+K+X) */
+ +		jit->seen |= SEEN_DATAREF | SEEN_RET0 | SEEN_LOAD_IWORD;
+ +		offset = jit->off_load_iword;
+ +		goto call_fn;
+ +	case BPF_S_LD_H_IND: /* A = *(u16 *) (skb->data+K+X) */
+ +		jit->seen |= SEEN_DATAREF | SEEN_RET0 | SEEN_LOAD_IHALF;
+ +		offset = jit->off_load_ihalf;
+ +		goto call_fn;
+ +	case BPF_S_LD_B_IND: /* A = *(u8 *) (skb->data+K+X) */
+ +		jit->seen |= SEEN_DATAREF | SEEN_RET0 | SEEN_LOAD_IBYTE;
+ +		offset = jit->off_load_ibyte;
+ +		goto call_fn;
+ +	case BPF_S_LDX_B_MSH:
+ +		/* X = (*(u8 *)(skb->data+K) & 0xf) << 2 */
+ +		jit->seen |= SEEN_RET0;
+ +		if ((int) K < 0) {
+ +			/* j <ret0> */
+ +			EMIT4_PCREL(0xa7f40000, (jit->ret0_ip - jit->prg));
+ +			break;
+ +		}
+ +		jit->seen |= SEEN_DATAREF | SEEN_LOAD_BMSH;
+ +		offset = jit->off_load_bmsh;
+ +		goto call_fn;
+ +	case BPF_S_LD_W_LEN: /*	A = skb->len; */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, len) != 4);
+ +		/* l %r5,<d(len)>(%r2) */
+ +		EMIT4_DISP(0x58502000, offsetof(struct sk_buff, len));
+ +		break;
+ +	case BPF_S_LDX_W_LEN: /* X = skb->len; */
+ +		jit->seen |= SEEN_XREG;
+ +		/* l %r12,<d(len)>(%r2) */
+ +		EMIT4_DISP(0x58c02000, offsetof(struct sk_buff, len));
+ +		break;
+ +	case BPF_S_LD_IMM: /* A = K */
+ +		if (K <= 16383)
+ +			/* lhi %r5,K */
+ +			EMIT4_IMM(0xa7580000, K);
+ +		else if (test_facility(21))
+ +			/* llilf %r5,<K> */
+ +			EMIT6_IMM(0xc05f0000, K);
+ +		else
+ +			/* l %r5,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x5850d000, EMIT_CONST(K));
+ +		break;
+ +	case BPF_S_LDX_IMM: /* X = K */
+ +		jit->seen |= SEEN_XREG;
+ +		if (K <= 16383)
+ +			/* lhi %r12,<K> */
+ +			EMIT4_IMM(0xa7c80000, K);
+ +		else if (test_facility(21))
+ +			/* llilf %r12,<K> */
+ +			EMIT6_IMM(0xc0cf0000, K);
+ +		else
+ +			/* l %r12,<d(K)>(%r13) */
+ +			EMIT4_DISP(0x58c0d000, EMIT_CONST(K));
+  		break;
+ -	case BPF_LDX | BPF_MEM | BPF_DW: /* dst = *(u64 *)(ul) (src + off) */
+ -		/* lg %dst,0(off,%src) */
+ +	case BPF_S_LD_MEM: /* A = mem[K] */
+  		jit->seen |= SEEN_MEM;
+ -		EMIT6_DISP_LH(0xe3000000, 0x0004, dst_reg, src_reg, REG_0, off);
+ -		break;
+ -	/*
+ -	 * BPF_JMP / CALL
+ -	 */
+ -	case BPF_JMP | BPF_CALL:
+ -	{
+ -		/*
+ -		 * b0 = (__bpf_call_base + imm)(b1, b2, b3, b4, b5)
+ -		 */
+ -		const u64 func = (u64)__bpf_call_base + imm;
+ -
+ -		REG_SET_SEEN(BPF_REG_5);
+ -		jit->seen |= SEEN_FUNC;
+ -		/* lg %w1,<d(imm)>(%l) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0004, REG_W1, REG_0, REG_L,
+ -			      EMIT_CONST_U64(func));
+ -		/* basr %r14,%w1 */
+ -		EMIT2(0x0d00, REG_14, REG_W1);
+ -		/* lgr %b0,%r2: load return value into %b0 */
+ -		EMIT4(0xb9040000, BPF_REG_0, REG_2);
+ -		if ((jit->seen & SEEN_SKB) &&
+ -		    bpf_helper_changes_pkt_data((void *)func)) {
+ -			/* lg %b1,ST_OFF_SKBP(%r15) */
+ -			EMIT6_DISP_LH(0xe3000000, 0x0004, BPF_REG_1, REG_0,
+ -				      REG_15, STK_OFF_SKBP);
+ -			emit_load_skb_data_hlen(jit);
+ +		/* l %r5,<K>(%r15) */
+ +		EMIT4_DISP(0x5850f000,
+ +			   (jit->seen & SEEN_DATAREF) ? 160 + K*4 : K*4);
+ +		break;
+ +	case BPF_S_LDX_MEM: /* X = mem[K] */
+ +		jit->seen |= SEEN_XREG | SEEN_MEM;
+ +		/* l %r12,<K>(%r15) */
+ +		EMIT4_DISP(0x58c0f000,
+ +			   (jit->seen & SEEN_DATAREF) ? 160 + K*4 : K*4);
+ +		break;
+ +	case BPF_S_MISC_TAX: /* X = A */
+ +		jit->seen |= SEEN_XREG;
+ +		/* lr %r12,%r5 */
+ +		EMIT2(0x18c5);
+ +		break;
+ +	case BPF_S_MISC_TXA: /* A = X */
+ +		jit->seen |= SEEN_XREG;
+ +		/* lr %r5,%r12 */
+ +		EMIT2(0x185c);
+ +		break;
+ +	case BPF_S_RET_K:
+ +		if (K == 0) {
+ +			jit->seen |= SEEN_RET0;
+ +			if (last)
+ +				break;
+ +			/* j <ret0> */
+ +			EMIT4_PCREL(0xa7f40000, jit->ret0_ip - jit->prg);
+ +		} else {
+ +			if (K <= 16383)
+ +				/* lghi %r2,K */
+ +				EMIT4_IMM(0xa7290000, K);
+ +			else
+ +				/* llgf %r2,<K>(%r13) */
+ +				EMIT6_DISP(0xe320d000, 0x0016, EMIT_CONST(K));
+ +			/* j <exit> */
+ +			if (last && !(jit->seen & SEEN_RET0))
+ +				break;
+ +			EMIT4_PCREL(0xa7f40000, jit->exit_ip - jit->prg);
+  		}
+  		break;
+ -	}
+ -	case BPF_JMP | BPF_TAIL_CALL:
+ -		/*
+ -		 * Implicit input:
+ -		 *  B1: pointer to ctx
+ -		 *  B2: pointer to bpf_array
+ -		 *  B3: index in bpf_array
+ -		 */
+ -		jit->seen |= SEEN_TAIL_CALL;
+ -
+ -		/*
+ -		 * if (index >= array->map.max_entries)
+ -		 *         goto out;
+ -		 */
+ -
+ -		/* llgf %w1,map.max_entries(%b2) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0016, REG_W1, REG_0, BPF_REG_2,
+ -			      offsetof(struct bpf_array, map.max_entries));
+ -		/* clgrj %b3,%w1,0xa,label0: if %b3 >= %w1 goto out */
+ -		EMIT6_PCREL_LABEL(0xec000000, 0x0065, BPF_REG_3,
+ -				  REG_W1, 0, 0xa);
+ -
+ -		/*
+ -		 * if (tail_call_cnt++ > MAX_TAIL_CALL_CNT)
+ -		 *         goto out;
+ -		 */
+ -
+ -		if (jit->seen & SEEN_STACK)
+ -			off = STK_OFF_TCCNT + STK_OFF + fp->aux->stack_depth;
+ -		else
+ -			off = STK_OFF_TCCNT;
+ -		/* lhi %w0,1 */
+ -		EMIT4_IMM(0xa7080000, REG_W0, 1);
+ -		/* laal %w1,%w0,off(%r15) */
+ -		EMIT6_DISP_LH(0xeb000000, 0x00fa, REG_W1, REG_W0, REG_15, off);
+ -		/* clij %w1,MAX_TAIL_CALL_CNT,0x2,label0 */
+ -		EMIT6_PCREL_IMM_LABEL(0xec000000, 0x007f, REG_W1,
+ -				      MAX_TAIL_CALL_CNT, 0, 0x2);
+ -
+ -		/*
+ -		 * prog = array->ptrs[index];
+ -		 * if (prog == NULL)
+ -		 *         goto out;
+ -		 */
+ -
+ -		/* sllg %r1,%b3,3: %r1 = index * 8 */
+ -		EMIT6_DISP_LH(0xeb000000, 0x000d, REG_1, BPF_REG_3, REG_0, 3);
+ -		/* lg %r1,prog(%b2,%r1) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0004, REG_1, BPF_REG_2,
+ -			      REG_1, offsetof(struct bpf_array, ptrs));
+ -		/* clgij %r1,0,0x8,label0 */
+ -		EMIT6_PCREL_IMM_LABEL(0xec000000, 0x007d, REG_1, 0, 0, 0x8);
+ -
+ -		/*
+ -		 * Restore registers before calling function
+ -		 */
+ -		save_restore_regs(jit, REGS_RESTORE, fp->aux->stack_depth);
+ -
+ -		/*
+ -		 * goto *(prog->bpf_func + tail_call_start);
+ -		 */
+ -
+ -		/* lg %r1,bpf_func(%r1) */
+ -		EMIT6_DISP_LH(0xe3000000, 0x0004, REG_1, REG_1, REG_0,
+ -			      offsetof(struct bpf_prog, bpf_func));
+ -		/* bc 0xf,tail_call_start(%r1) */
+ -		_EMIT4(0x47f01000 + jit->tail_call_start);
+ -		/* out: */
+ -		jit->labels[0] = jit->prg;
+ -		break;
+ -	case BPF_JMP | BPF_EXIT: /* return b0 */
+ -		last = (i == fp->len - 1) ? 1 : 0;
+ -		if (last && !(jit->seen & SEEN_RET0))
+ -			break;
+ +	case BPF_S_RET_A:
+ +		/* llgfr %r2,%r5 */
+ +		EMIT4(0xb9160025);
+  		/* j <exit> */
+  		EMIT4_PCREL(0xa7f40000, jit->exit_ip - jit->prg);
+  		break;
+* Unmerged path arch/s390/net/bpf_jit_comp.c
