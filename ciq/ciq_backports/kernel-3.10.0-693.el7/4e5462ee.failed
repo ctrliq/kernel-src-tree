@@ -1,0 +1,486 @@
+drm/i915: Store a permanent error in obj->mm.pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: Store a permanent error in obj->mm.pages (Rob Clark) [1422186]
+Rebuild_FUZZ: 95.83%
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 4e5462ee843c883790e9609cf560d88960ea4227
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4e5462ee.failed
+
+Once the object has been truncated, it is unrecoverable. To facilitate
+detection of this state store the error in obj->mm.pages.
+
+This is required for the next patch which should be applied to v4.10
+(via stable), so we also need to mark this patch for backporting. In
+that regard, let's consider this to be a fix/improvement too.
+
+v2: Avoid dereferencing the ERR_PTR when freeing the object.
+
+Fixes: 1233e2db199d ("drm/i915: Move object backing storage manipulation to its own locking")
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: <stable@vger.kernel.org> # v4.10+
+Link: http://patchwork.freedesktop.org/patch/msgid/20170307132031.32461-1-chris@chris-wilson.co.uk
+	Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+(cherry picked from commit 4e5462ee843c883790e9609cf560d88960ea4227)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem.c
+diff --cc drivers/gpu/drm/i915/i915_gem.c
+index 6fdaedc1cdbc,f8a5f5c598f1..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@@ -2148,7 -2129,8 +2148,12 @@@ i915_gem_object_truncate(struct drm_i91
+  	 * backing pages, *now*.
+  	 */
+  	shmem_truncate_range(file_inode(obj->base.filp), 0, (loff_t)-1);
+++<<<<<<< HEAD
+ +	obj->madv = __I915_MADV_PURGED;
+++=======
++ 	obj->mm.madv = __I915_MADV_PURGED;
++ 	obj->mm.pages = ERR_PTR(-EFAULT);
+++>>>>>>> 4e5462ee843c (drm/i915: Store a permanent error in obj->mm.pages)
+  }
+  
+  /* Try to discard unwanted pages */
+@@@ -2230,21 -2213,62 +2235,34 @@@ i915_gem_object_put_pages(struct drm_i9
+  	/* ->put_pages might need to allocate memory for the bit17 swizzle
+  	 * array, hence protect them from being reaped by removing them from gtt
+  	 * lists early. */
+ -	pages = fetch_and_zero(&obj->mm.pages);
+ -	GEM_BUG_ON(!pages);
+ +	list_del(&obj->global_list);
+  
+ -	if (obj->mm.mapping) {
+ -		void *ptr;
+ +	ops->put_pages(obj);
+ +	obj->pages = NULL;
+  
+ -		ptr = ptr_mask_bits(obj->mm.mapping);
+ -		if (is_vmalloc_addr(ptr))
+ -			vunmap(ptr);
+ -		else
+ -			kunmap(kmap_to_page(ptr));
+ +	i915_gem_object_invalidate(obj);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 		obj->mm.mapping = NULL;
++ 	}
++ 
++ 	__i915_gem_object_reset_page_iter(obj);
++ 
++ 	if (!IS_ERR(pages))
++ 		obj->ops->put_pages(obj, pages);
++ 
++ unlock:
++ 	mutex_unlock(&obj->mm.lock);
+++>>>>>>> 4e5462ee843c (drm/i915: Store a permanent error in obj->mm.pages)
+  }
+  
+ -static bool i915_sg_trim(struct sg_table *orig_st)
+ -{
+ -	struct sg_table new_st;
+ -	struct scatterlist *sg, *new_sg;
+ -	unsigned int i;
+ -
+ -	if (orig_st->nents == orig_st->orig_nents)
+ -		return false;
+ -
+ -	if (sg_alloc_table(&new_st, orig_st->nents, GFP_KERNEL | __GFP_NOWARN))
+ -		return false;
+ -
+ -	new_sg = new_st.sgl;
+ -	for_each_sg(orig_st->sgl, sg, orig_st->nents, i) {
+ -		sg_set_page(new_sg, sg_page(sg), sg->length, 0);
+ -		/* called before being DMA mapped, no need to copy sg->dma_* */
+ -		new_sg = sg_next(new_sg);
+ -	}
+ -	GEM_BUG_ON(new_sg); /* Should walk exactly nents and hit the end */
+ -
+ -	sg_free_table(orig_st);
+ -
+ -	*orig_st = new_st;
+ -	return true;
+ -}
+ -
+ -static struct sg_table *
+ +static int
+  i915_gem_object_get_pages_gtt(struct drm_i915_gem_object *obj)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
+ -	const unsigned long page_count = obj->base.size / PAGE_SIZE;
+ -	unsigned long i;
+ +	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ +	int page_count, i;
+  	struct address_space *mapping;
+  	struct sg_table *st;
+  	struct scatterlist *sg;
+@@@ -2325,325 -2346,30 +2343,341 @@@
+  		/* Check that the i965g/gm workaround works. */
+  		WARN_ON((gfp & __GFP_DMA32) && (last_pfn >= 0x00100000UL));
+  	}
+ -	if (sg) /* loop terminated early; short sg table */
+ +#ifdef CONFIG_SWIOTLB
+ +	if (!swiotlb_nr_tbl())
+ +#endif
+  		sg_mark_end(sg);
+ +	obj->pages = st;
+  
+ -	/* Trim unused sg entries to avoid wasting memory. */
+ -	i915_sg_trim(st);
+ +	ret = i915_gem_gtt_prepare_object(obj);
+ +	if (ret)
+ +		goto err_pages;
+  
+ -	ret = i915_gem_gtt_prepare_pages(obj, st);
+ -	if (ret) {
+ -		/* DMA remapping failed? One possible cause is that
+ -		 * it could not reserve enough large entries, asking
+ -		 * for PAGE_SIZE chunks instead may be helpful.
+ -		 */
+ -		if (max_segment > PAGE_SIZE) {
+ -			for_each_sgt_page(page, sgt_iter, st)
+ -				put_page(page);
+ -			sg_free_table(st);
+ +	if (i915_gem_object_needs_bit17_swizzle(obj))
+ +		i915_gem_object_do_bit_17_swizzle(obj);
+ +
+ +	if (obj->tiling_mode != I915_TILING_NONE &&
+ +	    dev_priv->quirks & QUIRK_PIN_SWIZZLED_PAGES)
+ +		i915_gem_object_pin_pages(obj);
+ +
+ +	return 0;
+ +
+ +err_pages:
+ +	sg_mark_end(sg);
+ +	for_each_sg_page(st->sgl, &sg_iter, st->nents, 0)
+ +		put_page(sg_page_iter_page(&sg_iter));
+ +	sg_free_table(st);
+ +	kfree(st);
+ +
+ +	/* shmemfs first checks if there is enough memory to allocate the page
+ +	 * and reports ENOSPC should there be insufficient, along with the usual
+ +	 * ENOMEM for a genuine allocation failure.
+ +	 *
+ +	 * We use ENOSPC in our driver to mean that we have run out of aperture
+ +	 * space and so want to translate the error from shmemfs back to our
+ +	 * usual understanding of ENOMEM.
+ +	 */
+ +	if (ret == -ENOSPC)
+ +		ret = -ENOMEM;
+ +
+ +	return ret;
+ +}
+ +
+ +/* Ensure that the associated pages are gathered from the backing storage
+ + * and pinned into our object. i915_gem_object_get_pages() may be called
+ + * multiple times before they are released by a single call to
+ + * i915_gem_object_put_pages() - once the pages are no longer referenced
+ + * either as a result of memory pressure (reaping pages under the shrinker)
+ + * or as the object is itself released.
+ + */
+ +int
+ +i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
+ +{
+ +	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ +	const struct drm_i915_gem_object_ops *ops = obj->ops;
+ +	int ret;
+ +
+ +	if (obj->pages)
+ +		return 0;
+ +
+ +	if (obj->madv != I915_MADV_WILLNEED) {
+ +		DRM_DEBUG("Attempting to obtain a purgeable object\n");
+ +		return -EFAULT;
+ +	}
+ +
+ +	BUG_ON(obj->pages_pin_count);
+ +
+ +	ret = ops->get_pages(obj);
+ +	if (ret)
+ +		return ret;
+ +
+ +	list_add_tail(&obj->global_list, &dev_priv->mm.unbound_list);
+ +
+ +	obj->get_page.sg = obj->pages->sgl;
+ +	obj->get_page.last = 0;
+ +
+ +	return 0;
+ +}
+ +
+ +void i915_vma_move_to_active(struct i915_vma *vma,
+ +			     struct drm_i915_gem_request *req)
+ +{
+ +	struct drm_i915_gem_object *obj = vma->obj;
+ +	struct intel_engine_cs *ring;
+ +
+ +	ring = i915_gem_request_get_ring(req);
+ +
+++<<<<<<< HEAD
+ +	/* Add a reference if we're newly entering the active list. */
+ +	if (obj->active == 0)
+ +		drm_gem_object_reference(&obj->base);
+ +	obj->active |= intel_ring_flag(ring);
+++=======
+++	if (unlikely(IS_ERR_OR_NULL(obj->mm.pages))) {
+++		err = ____i915_gem_object_get_pages(obj);
+++		if (err)
+++			goto unlock;
+++>>>>>>> 4e5462ee843c (drm/i915: Store a permanent error in obj->mm.pages)
+ +
+ +	list_move_tail(&obj->ring_list[ring->id], &ring->active_list);
+ +	i915_gem_request_assign(&obj->last_read_req[ring->id], req);
+ +
+ +	list_move_tail(&vma->vm_link, &vma->vm->active_list);
+ +}
+ +
+ +static void
+ +i915_gem_object_retire__write(struct drm_i915_gem_object *obj)
+ +{
+ +	RQ_BUG_ON(obj->last_write_req == NULL);
+ +	RQ_BUG_ON(!(obj->active & intel_ring_flag(obj->last_write_req->ring)));
+ +
+ +	i915_gem_request_assign(&obj->last_write_req, NULL);
+ +	intel_fb_obj_flush(obj, true, ORIGIN_CS);
+ +}
+ +
+ +static void
+ +i915_gem_object_retire__read(struct drm_i915_gem_object *obj, int ring)
+ +{
+ +	struct i915_vma *vma;
+ +
+ +	RQ_BUG_ON(obj->last_read_req[ring] == NULL);
+ +	RQ_BUG_ON(!(obj->active & (1 << ring)));
+ +
+ +	list_del_init(&obj->ring_list[ring]);
+ +	i915_gem_request_assign(&obj->last_read_req[ring], NULL);
+ +
+++<<<<<<< HEAD
+ +	if (obj->last_write_req && obj->last_write_req->ring->id == ring)
+ +		i915_gem_object_retire__write(obj);
+++=======
+++	pinned = true;
+++	if (!atomic_inc_not_zero(&obj->mm.pages_pin_count)) {
+++		if (unlikely(IS_ERR_OR_NULL(obj->mm.pages))) {
+++			ret = ____i915_gem_object_get_pages(obj);
+++			if (ret)
+++				goto err_unlock;
+++>>>>>>> 4e5462ee843c (drm/i915: Store a permanent error in obj->mm.pages)
+ +
+ +	obj->active &= ~(1 << ring);
+ +	if (obj->active)
+ +		return;
+ +
+ +	/* Bump our place on the bound list to keep it roughly in LRU order
+ +	 * so that we don't steal from recently used but inactive objects
+ +	 * (unless we are forced to ofc!)
+ +	 */
+ +	list_move_tail(&obj->global_list,
+ +		       &to_i915(obj->base.dev)->mm.bound_list);
+ +
+ +	list_for_each_entry(vma, &obj->vma_list, obj_link) {
+ +		if (!list_empty(&vma->vm_link))
+ +			list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
+ +	}
+ +
+ +	i915_gem_request_assign(&obj->last_fenced_req, NULL);
+ +	drm_gem_object_unreference(&obj->base);
+ +}
+ +
+ +static int
+ +i915_gem_init_seqno(struct drm_device *dev, u32 seqno)
+ +{
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_engine_cs *ring;
+ +	int ret, i, j;
+ +
+ +	/* Carefully retire all requests without writing to the rings */
+ +	for_each_ring(ring, dev_priv, i) {
+ +		ret = intel_ring_idle(ring);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +	i915_gem_retire_requests(dev);
+ +
+ +	/* Finally reset hw state */
+ +	for_each_ring(ring, dev_priv, i) {
+ +		intel_ring_init_seqno(ring, seqno);
+ +
+ +		for (j = 0; j < ARRAY_SIZE(ring->semaphore.sync_seqno); j++)
+ +			ring->semaphore.sync_seqno[j] = 0;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +int i915_gem_set_seqno(struct drm_device *dev, u32 seqno)
+ +{
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	int ret;
+ +
+ +	if (seqno == 0)
+ +		return -EINVAL;
+ +
+ +	/* HWS page needs to be set less than what we
+ +	 * will inject to ring
+ +	 */
+ +	ret = i915_gem_init_seqno(dev, seqno - 1);
+ +	if (ret)
+ +		return ret;
+ +
+ +	/* Carefully set the last_seqno value so that wrap
+ +	 * detection still works
+ +	 */
+ +	dev_priv->next_seqno = seqno;
+ +	dev_priv->last_seqno = seqno - 1;
+ +	if (dev_priv->last_seqno == 0)
+ +		dev_priv->last_seqno--;
+ +
+ +	return 0;
+ +}
+ +
+ +int
+ +i915_gem_get_seqno(struct drm_device *dev, u32 *seqno)
+ +{
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +
+ +	/* reserve 0 for non-seqno */
+ +	if (dev_priv->next_seqno == 0) {
+ +		int ret = i915_gem_init_seqno(dev, 0);
+ +		if (ret)
+ +			return ret;
+ +
+ +		dev_priv->next_seqno = 1;
+ +	}
+ +
+ +	*seqno = dev_priv->last_seqno = dev_priv->next_seqno++;
+ +	return 0;
+ +}
+ +
+ +/*
+ + * NB: This function is not allowed to fail. Doing so would mean the the
+ + * request is not being tracked for completion but the work itself is
+ + * going to happen on the hardware. This would be a Bad Thing(tm).
+ + */
+ +void __i915_add_request(struct drm_i915_gem_request *request,
+ +			struct drm_i915_gem_object *obj,
+ +			bool flush_caches)
+ +{
+ +	struct intel_engine_cs *ring;
+ +	struct drm_i915_private *dev_priv;
+ +	struct intel_ringbuffer *ringbuf;
+ +	u32 request_start;
+ +	int ret;
+ +
+ +	if (WARN_ON(request == NULL))
+ +		return;
+ +
+ +	ring = request->ring;
+ +	dev_priv = ring->dev->dev_private;
+ +	ringbuf = request->ringbuf;
+ +
+ +	/*
+ +	 * To ensure that this call will not fail, space for its emissions
+ +	 * should already have been reserved in the ring buffer. Let the ring
+ +	 * know that it is time to use that space up.
+ +	 */
+ +	intel_ring_reserved_space_use(ringbuf);
+ +
+ +	request_start = intel_ring_get_tail(ringbuf);
+ +	/*
+ +	 * Emit any outstanding flushes - execbuf can fail to emit the flush
+ +	 * after having emitted the batchbuffer command. Hence we need to fix
+ +	 * things up similar to emitting the lazy request. The difference here
+ +	 * is that the flush _must_ happen before the next request, no matter
+ +	 * what.
+ +	 */
+ +	if (flush_caches) {
+ +		if (i915.enable_execlists)
+ +			ret = logical_ring_flush_all_caches(request);
+ +		else
+ +			ret = intel_ring_flush_all_caches(request);
+ +		/* Not allowed to fail! */
+ +		WARN(ret, "*_ring_flush_all_caches failed: %d!\n", ret);
+ +	}
+ +
+ +	/* Record the position of the start of the request so that
+ +	 * should we detect the updated seqno part-way through the
+ +	 * GPU processing the request, we never over-estimate the
+ +	 * position of the head.
+ +	 */
+ +	request->postfix = intel_ring_get_tail(ringbuf);
+ +
+ +	if (i915.enable_execlists)
+ +		ret = ring->emit_request(request);
+ +	else {
+ +		ret = ring->add_request(request);
+ +
+ +		request->tail = intel_ring_get_tail(ringbuf);
+ +	}
+ +	/* Not allowed to fail! */
+ +	WARN(ret, "emit|add_request failed: %d!\n", ret);
+ +
+ +	request->head = request_start;
+ +
+ +	/* Whilst this request exists, batch_obj will be on the
+ +	 * active_list, and so will hold the active reference. Only when this
+ +	 * request is retired will the the batch_obj be moved onto the
+ +	 * inactive_list and lose its active reference. Hence we do not need
+ +	 * to explicitly hold another reference here.
+ +	 */
+ +	request->batch_obj = obj;
+ +
+ +	request->emitted_jiffies = jiffies;
+ +	request->previous_seqno = ring->last_submitted_seqno;
+ +	ring->last_submitted_seqno = request->seqno;
+ +	list_add_tail(&request->list, &ring->request_list);
+ +
+ +	trace_i915_gem_request_add(request);
+ +
+ +	i915_queue_hangcheck(ring->dev);
+ +
+ +	queue_delayed_work(dev_priv->wq,
+ +			   &dev_priv->mm.retire_work,
+ +			   round_jiffies_up_relative(HZ));
+ +	intel_mark_busy(dev_priv->dev);
+ +
+ +	/* Sanity check that the reserved size was large enough. */
+ +	intel_ring_reserved_space_end(ringbuf);
+ +}
+ +
+ +static bool i915_context_is_banned(struct drm_i915_private *dev_priv,
+ +				   const struct intel_context *ctx)
+ +{
+ +	unsigned long elapsed;
+ +
+ +	elapsed = get_seconds() - ctx->hang_stats.guilty_ts;
+ +
+ +	if (ctx->hang_stats.banned)
+ +		return true;
+  
+ -			max_segment = PAGE_SIZE;
+ -			goto rebuild_st;
+ -		} else {
+ -			dev_warn(&dev_priv->drm.pdev->dev,
+ -				 "Failed to DMA remap %lu pages\n",
+ -				 page_count);
+ -			goto err_pages;
+ +	if (ctx->hang_stats.ban_period_seconds &&
+ +	    elapsed <= ctx->hang_stats.ban_period_seconds) {
+ +		if (!i915_gem_context_is_default(ctx)) {
+ +			DRM_DEBUG("context hanging too fast, banning!\n");
+ +			return true;
+ +		} else if (i915_stop_ring_allow_ban(dev_priv)) {
+ +			if (i915_stop_ring_allow_warn(dev_priv))
+ +				DRM_ERROR("gpu hanging too fast, banning!\n");
+ +			return true;
+  		}
+  	}
+  
+* Unmerged path drivers/gpu/drm/i915/i915_gem.c
