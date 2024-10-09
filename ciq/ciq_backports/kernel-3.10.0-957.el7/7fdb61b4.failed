@@ -1,0 +1,358 @@
+net: sch: prio: Add offload ability to PRIO qdisc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: prio: Add offload ability to PRIO qdisc (Ivan Vecera) [1584297]
+Rebuild_FUZZ: 92.63%
+commit-author Nogah Frankel <nogahf@mellanox.com>
+commit 7fdb61b44c0c95d00f6c856d9fb61a9f647bc85f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7fdb61b4.failed
+
+Add the ability to offload PRIO qdisc by using ndo_setup_tc.
+There are three commands for PRIO offloading:
+* TC_PRIO_REPLACE: handles set and tune
+* TC_PRIO_DESTROY: handles qdisc destroy
+* TC_PRIO_STATS: updates the qdiscs counters (given as reference)
+
+Like RED qdisc, the indication of whether PRIO is being offloaded is being
+set and updated as part of the dump function. It is so because the driver
+could decide to offload or not based on the qdisc parent, which could
+change without notifying the qdisc.
+
+	Signed-off-by: Nogah Frankel <nogahf@mellanox.com>
+	Reviewed-by: Yuval Mintz <yuvalm@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7fdb61b44c0c95d00f6c856d9fb61a9f647bc85f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+diff --cc include/linux/netdevice.h
+index dbc794e21d64,6d95477b962c..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -814,176 -777,16 +814,183 @@@ enum tc_setup_type 
+  	TC_SETUP_CLSFLOWER,
+  	TC_SETUP_CLSMATCHALL,
+  	TC_SETUP_CLSBPF,
+++<<<<<<< HEAD
+++=======
++ 	TC_SETUP_BLOCK,
++ 	TC_SETUP_QDISC_CBS,
++ 	TC_SETUP_QDISC_RED,
++ 	TC_SETUP_QDISC_PRIO,
+++>>>>>>> 7fdb61b44c0c (net: sch: prio: Add offload ability to PRIO qdisc)
+  };
+  
+ -/* These structures hold the attributes of bpf state that are being passed
+ - * to the netdevice through the bpf op.
+ +/* Forward declaration of tc_to_netdev structure used by __rh_call_ndo_setup_tc
+ + * wrapper for out-of-tree drivers compiled against RHEL7.4.
+   */
+ -enum bpf_netdev_command {
+ +struct tc_to_netdev_rh74;
+ +
+ +struct tc_cls_u32_offload;
+ +
+ +struct tc_to_netdev {
+ +	unsigned int type;
+ +	union {
+ +		u8 tc;
+ +		struct tc_cls_u32_offload *cls_u32;
+ +		struct tc_cls_flower_offload *cls_flower;
+ +		struct tc_cls_matchall_offload *cls_mall;
+ +		struct tc_cls_bpf_offload *cls_bpf;
+ +	};
+ +	bool egress_dev;
+ +};
+ +
+ +/* This structure defines the management hooks for network devices.
+ + * It is an extension of net_device_ops. Drivers that want to use any of the
+ + * fields defined here must initialize net_device_ops->ndo_size to
+ + * sizeof(struct net_device_ops).
+ + *
+ + * void* (*ndo_dfwd_add_station)(struct net_device *pdev,
+ + *				 struct net_device *dev)
+ + *	Called by upper layer devices to accelerate switching or other
+ + *	station functionality into hardware. 'pdev is the lowerdev
+ + *	to use for the offload and 'dev' is the net device that will
+ + *	back the offload. Returns a pointer to the private structure
+ + *	the upper layer will maintain.
+ + * void (*ndo_dfwd_del_station)(struct net_device *pdev, void *priv)
+ + *	Called by upper layer device to delete the station created
+ + *	by 'ndo_dfwd_add_station'. 'pdev' is the net device backing
+ + *	the station and priv is the structure returned by the add
+ + *	operation.
+ + * int (*ndo_set_tx_maxrate)(struct net_device *dev,
+ + *			     int queue_index, u32 maxrate);
+ + *	Called when a user wants to set a max-rate limitation of specific
+ + *	TX queue.
+ + * void (*ndo_set_rx_headroom)(struct net_device *dev, int needed_headroom);
+ + *	This function is used to specify the headroom that the skb must
+ + *	consider when allocation skb during packet reception. Setting
+ + *	appropriate rx headroom value allows avoiding skb head copy on
+ + *	forward. Setting a negative value reset the rx headroom to the
+ + *	default value.
+ + * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
+ + *		       struct net_device *dev, struct net_device *filter_dev,
+ + *		       int *idx)
+ + *	Used to add FDB entries to dump requests. Implementers should add
+ + *	entries to skb and update idx with the number of entries.
+ + * void (*ndo_change_proto_down)(struct net_device *dev,
+ + *				 bool proto_down);
+ + *	This function is used to pass protocol port error state information
+ + *	to the switch driver. The switch driver can react to the proto_down
+ + *      by doing a phys down on the associated switch port.
+ + * void (*ndo_udp_tunnel_add)(struct net_device *dev,
+ + *			      struct udp_tunnel_info *ti);
+ + *	Called by UDP tunnel to notify a driver about the UDP port and socket
+ + *	address family that a UDP tunnel is listnening to. It is called only
+ + *	when a new port starts listening. The operation is protected by the
+ + *	RTNL.
+ + *
+ + * void (*ndo_udp_tunnel_del)(struct net_device *dev,
+ + *			      struct udp_tunnel_info *ti);
+ + *	Called by UDP tunnel to notify the driver about a UDP port and socket
+ + *	address family that the UDP tunnel is not listening to anymore. The
+ + *	operation is protected by the RTNL.
+ + *
+ + * int (*ndo_set_vf_vlan)(struct net_device *dev, int vf, u16 vlan,
+ + *			  u8 qos, __be16 proto);
+ + *
+ + * bool (*ndo_has_offload_stats)(const struct net_device *dev, int attr_id)
+ + *	Return true if this device supports offload stats of this attr_id.
+ + *
+ + * int (*ndo_get_offload_stats)(int attr_id, const struct net_device *dev,
+ + *	void *attr_data)
+ + *	Get statistics for offload operations by attr_id. Write it into the
+ + *	attr_data pointer.
+ + *
+ + * int (*ndo_change_mtu)(struct net_device *dev, int new_mtu);
+ + *	Called when a user wants to change the Maximum Transfer Unit
+ + *	of a device.
+ + *	RHEL: This is an entry point for network device drivers that
+ + *	      use central MTU range checking provided by network core.
+ + *
+ + * int (*ndo_setup_tc)(struct net_device *dev, enum tc_setup_type type,
+ + *		       void *type_data);
+ + *	Called to setup any 'tc' scheduler, classifier or action on @dev.
+ + *	This is always called from the stack with the rtnl lock held and netif
+ + *	tx queues stopped. This allows the netdevice to perform queue
+ + *	management safely.
+ + *	RHEL: Note that this callback is not part of kABI and its prototype
+ + *	and semantic can be changed across releases.
+ + * int (*ndo_xdp)(struct net_device *dev, struct netdev_xdp *xdp);
+ + *	This function is used to set or query state related to XDP on the
+ + *	netdevice. See definition of enum xdp_netdev_command for details.
+ + * int (*ndo_xdp_xmit)(struct net_device *dev, struct xdp_buff *xdp);
+ + *	This function is used to submit a XDP packet for transmit on a
+ + *	netdevice.
+ + * void (*ndo_xdp_flush)(struct net_device *dev);
+ + *	This function is used to inform the driver to flush a paticular
+ + *	xpd tx queue. Must be called on same CPU as xdp_xmit.
+ + */
+ +struct net_device_ops_extended {
+ +	int			(*ndo_set_vf_trust)(struct net_device *dev,
+ +						    int vf, bool setting);
+ +	void*			(*ndo_dfwd_add_station)(struct net_device *pdev,
+ +							struct net_device *dev);
+ +	void			(*ndo_dfwd_del_station)(struct net_device *pdev,
+ +							void *priv);
+ +	int			(*ndo_set_tx_maxrate)(struct net_device *dev,
+ +						      int queue_index,
+ +						      u32 maxrate);
+ +	void			(*ndo_set_rx_headroom)(struct net_device *dev,
+ +						       int needed_headroom);
+ +	int			(*ndo_set_vf_guid)(struct net_device *dev,
+ +						   int vf, u64 guid,
+ +						   int guid_type);
+ +	int			(*ndo_fdb_dump_rh73)(struct sk_buff *skb,
+ +						struct netlink_callback *cb,
+ +						struct net_device *dev,
+ +						struct net_device *filter_dev,
+ +						int idx);
+ +	int			(*ndo_get_phys_port_name)(struct net_device *dev,
+ +							  char *name, size_t len);
+ +	int			(*ndo_change_proto_down)(struct net_device *dev,
+ +							 bool proto_down);
+ +	void			(*ndo_udp_tunnel_add)(struct net_device *dev,
+ +						      struct udp_tunnel_info *ti);
+ +	void			(*ndo_udp_tunnel_del)(struct net_device *dev,
+ +						      struct udp_tunnel_info *ti);
+ +	int			(*ndo_neigh_construct)(struct net_device *dev,
+ +						       struct neighbour *n);
+ +	void			(*ndo_neigh_destroy)(struct net_device *dev,
+ +						     struct neighbour *n);
+ +	int			(*ndo_set_vf_vlan)(struct net_device *dev,
+ +						   int vf, u16 vlan, u8 qos,
+ +						   __be16 proto);
+ +	int			(*ndo_fdb_dump)(struct sk_buff *skb,
+ +						struct netlink_callback *cb,
+ +						struct net_device *dev,
+ +						struct net_device *filter_dev,
+ +						int *idx);
+ +	bool			(*ndo_has_offload_stats)(const struct net_device *dev, int attr_id);
+ +	int			(*ndo_get_offload_stats)(int attr_id,
+ +							 const struct net_device *dev,
+ +							 void *attr_data);
+ +	int			(*ndo_change_mtu)(struct net_device *dev,
+ +						  int new_mtu);
+ +	/*
+ +	 * RHEL: Note that this callback is not part of kABI and its prototype
+ +	 * and semantic can be changed across releases.
+ +	 */
+ +	int			(*ndo_setup_tc_rh)(struct net_device *dev,
+ +						   enum tc_setup_type type,
+ +						   void *type_data);
+ +	int			(*ndo_xdp)(struct net_device *dev,
+ +						  struct netdev_xdp *xdp);
+ +	int                     (*ndo_xdp_xmit)(struct net_device *dev,
+ +						struct xdp_buff *xdp);
+ +	void                    (*ndo_xdp_flush)(struct net_device *dev);
+ +};
+ +
+ +/* These structures hold the attributes of xdp state that are being passed
+ + * to the netdevice through the xdp op.
+ + */
+ +enum xdp_netdev_command {
+  	/* Set or clear a bpf program used in the earliest stages of packet
+  	 * rx. The prog will have been loaded as BPF_PROG_TYPE_XDP. The callee
+  	 * is responsible for calling bpf_prog_put on any old progs that are
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index bf70a6a4bd8a..e98fb7e4d1b5 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -613,4 +613,29 @@ struct tc_cls_bpf_offload {
+ 	bool exts_integrated;
+ };
+ 
++enum tc_prio_command {
++	TC_PRIO_REPLACE,
++	TC_PRIO_DESTROY,
++	TC_PRIO_STATS,
++};
++
++struct tc_prio_qopt_offload_params {
++	int bands;
++	u8 priomap[TC_PRIO_MAX + 1];
++	/* In case that a prio qdisc is offloaded and now is changed to a
++	 * non-offloadedable config, it needs to update the backlog & qlen
++	 * values to negate the HW backlog & qlen values (and only them).
++	 */
++	struct gnet_stats_queue *qstats;
++};
++
++struct tc_prio_qopt_offload {
++	enum tc_prio_command command;
++	u32 handle;
++	u32 parent;
++	union {
++		struct tc_prio_qopt_offload_params replace_params;
++		struct tc_qopt_offload_stats stats;
++	};
++};
+ #endif
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index 2dd6c68ae91e..f5d3f60bf6be 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -141,6 +141,31 @@ prio_reset(struct Qdisc *sch)
+ 	sch->q.qlen = 0;
+ }
+ 
++static int prio_offload(struct Qdisc *sch, bool enable)
++{
++	struct prio_sched_data *q = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_prio_qopt_offload opt = {
++		.handle = sch->handle,
++		.parent = sch->parent,
++	};
++
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	if (enable) {
++		opt.command = TC_PRIO_REPLACE;
++		opt.replace_params.bands = q->bands;
++		memcpy(&opt.replace_params.priomap, q->prio2band,
++		       TC_PRIO_MAX + 1);
++		opt.replace_params.qstats = &sch->qstats;
++	} else {
++		opt.command = TC_PRIO_DESTROY;
++	}
++
++	return dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_PRIO, &opt);
++}
++
+ static void
+ prio_destroy(struct Qdisc *sch)
+ {
+@@ -148,6 +173,7 @@ prio_destroy(struct Qdisc *sch)
+ 	struct prio_sched_data *q = qdisc_priv(sch);
+ 
+ 	tcf_block_put(q->block);
++	prio_offload(sch, false);
+ 	for (prio = 0; prio < q->bands; prio++)
+ 		qdisc_destroy(q->queues[prio]);
+ }
+@@ -201,6 +227,7 @@ static int prio_tune(struct Qdisc *sch, struct nlattr *opt)
+ 	}
+ 
+ 	sch_tree_unlock(sch);
++	prio_offload(sch, true);
+ 	return 0;
+ }
+ 
+@@ -219,15 +246,47 @@ static int prio_init(struct Qdisc *sch, struct nlattr *opt)
+ 	return prio_tune(sch, opt);
+ }
+ 
++static int prio_dump_offload(struct Qdisc *sch)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_prio_qopt_offload hw_stats = {
++		.handle = sch->handle,
++		.parent = sch->parent,
++		.command = TC_PRIO_STATS,
++		.stats.bstats = &sch->bstats,
++		.stats.qstats = &sch->qstats,
++	};
++	int err;
++
++	sch->flags &= ~TCQ_F_OFFLOADED;
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return 0;
++
++	err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_PRIO,
++					    &hw_stats);
++	if (err == -EOPNOTSUPP)
++		return 0;
++
++	if (!err)
++		sch->flags |= TCQ_F_OFFLOADED;
++
++	return err;
++}
++
+ static int prio_dump(struct Qdisc *sch, struct sk_buff *skb)
+ {
+ 	struct prio_sched_data *q = qdisc_priv(sch);
+ 	unsigned char *b = skb_tail_pointer(skb);
+ 	struct tc_prio_qopt opt;
++	int err;
+ 
+ 	opt.bands = q->bands;
+ 	memcpy(&opt.priomap, q->prio2band, TC_PRIO_MAX + 1);
+ 
++	err = prio_dump_offload(sch);
++	if (err)
++		goto nla_put_failure;
++
+ 	if (nla_put(skb, TCA_OPTIONS, sizeof(opt), &opt))
+ 		goto nla_put_failure;
+ 
