@@ -1,0 +1,175 @@
+blk-mq: fix schedule-under-preempt for blocking drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit bf4907c05e615f6a1811d61c58d56da52f7e9954
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bf4907c0.failed
+
+Commit a4d907b6a33b unified the single and multi queue request handlers,
+but in the process, it also screwed up the locking balance and calls
+blk_mq_try_issue_directly() with the ctx preempt lock held. This is a
+problem for drivers that have set BLK_MQ_F_BLOCKING, since now they
+can't reliably sleep.
+
+While in there, protect against similar issues in the future, by adding
+a might_sleep() trigger in the BLOCKING path for direct issue or queue
+run.
+
+	Reported-by: Josef Bacik <josef@toxicpanda.com>
+	Tested-by: Josef Bacik <josef@toxicpanda.com>
+Fixes: a4d907b6a33b ("blk-mq: streamline blk_mq_make_request")
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit bf4907c05e615f6a1811d61c58d56da52f7e9954)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1b06c94aa73d,061fc2cc88d3..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -951,11 -1118,13 +951,13 @@@ static void __blk_mq_run_hw_queue(struc
+  
+  	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+  		rcu_read_lock();
+ -		blk_mq_sched_dispatch_requests(hctx);
+ +		blk_mq_process_rq_list(hctx);
+  		rcu_read_unlock();
+  	} else {
++ 		might_sleep();
++ 
+  		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
+ -		blk_mq_sched_dispatch_requests(hctx);
+ +		blk_mq_process_rq_list(hctx);
+  		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
+  	}
+  }
+@@@ -1380,23 -1486,38 +1382,46 @@@ static void blk_mq_try_issue_directly(s
+  
+  	__blk_mq_requeue_request(rq);
+  insert:
+ -	blk_mq_sched_insert_request(rq, false, true, false, may_sleep);
+ +	blk_mq_insert_request(rq, false, true, true);
+  }
+  
+ -static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, blk_qc_t *cookie)
+ +/*
+ + * Multiple hardware queue variant. This will not use per-process plugs,
+ + * but will attempt to bypass the hctx queueing if we can go straight to
+ + * hardware for SYNC IO.
+ + */
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	struct blk_map_ctx data;
+++=======
++ 	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
++ 		rcu_read_lock();
++ 		__blk_mq_try_issue_directly(rq, cookie, false);
++ 		rcu_read_unlock();
++ 	} else {
++ 		unsigned int srcu_idx;
++ 
++ 		might_sleep();
++ 
++ 		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
++ 		__blk_mq_try_issue_directly(rq, cookie, true);
++ 		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
++ 	}
++ }
++ 
++ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
++ {
++ 	const int is_sync = op_is_sync(bio->bi_opf);
++ 	const int is_flush_fua = op_is_flush(bio->bi_opf);
++ 	struct blk_mq_alloc_data data = { .flags = 0 };
+++>>>>>>> bf4907c05e61 (blk-mq: fix schedule-under-preempt for blocking drivers)
+  	struct request *rq;
+ -	unsigned int request_count = 0;
+ +	unsigned int request_count = 0, srcu_idx;
+  	struct blk_plug *plug;
+  	struct request *same_queue_rq = NULL;
+ -	blk_qc_t cookie;
+ -	unsigned int wb_acct;
+  
+  	blk_queue_bounce(q, &bio);
+  
+@@@ -1543,34 -1585,46 +1568,60 @@@ static void blk_sq_make_request(struct 
+  		}
+  
+  		list_add_tail(&rq->queuelist, &plug->mq_list);
+ -	} else if (plug && !blk_queue_nomerges(q)) {
+ -		blk_mq_bio_to_request(rq, bio);
+ +		return;
+ +	}
+  
+ +	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+  		/*
+ -		 * We do limited plugging. If the bio can be merged, do that.
+ -		 * Otherwise the existing request in the plug list will be
+ -		 * issued. So the plug list will have one request at most
+ -		 * The plug list might get flushed before this. If that happens,
+ -		 * the plug list is empty, and same_queue_rq is invalid.
+ +		 * For a SYNC request, send it to the hardware immediately. For
+ +		 * an ASYNC request, just ensure that we run it later on. The
+ +		 * latter allows for merging opportunities and more efficient
+ +		 * dispatching.
+  		 */
+++<<<<<<< HEAD
+ +run_queue:
+ +		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ +	}
+++=======
++ 		if (list_empty(&plug->mq_list))
++ 			same_queue_rq = NULL;
++ 		if (same_queue_rq)
++ 			list_del_init(&same_queue_rq->queuelist);
++ 		list_add_tail(&rq->queuelist, &plug->mq_list);
++ 
++ 		blk_mq_put_ctx(data.ctx);
++ 
++ 		if (same_queue_rq)
++ 			blk_mq_try_issue_directly(data.hctx, same_queue_rq,
++ 					&cookie);
++ 
++ 		return cookie;
++ 	} else if (q->nr_hw_queues > 1 && is_sync) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_try_issue_directly(data.hctx, rq, &cookie);
++ 		return cookie;
++ 	} else if (q->elevator) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true, true, true);
++ 	} else if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio))
++ 		blk_mq_run_hw_queue(data.hctx, true);
+++>>>>>>> bf4907c05e61 (blk-mq: fix schedule-under-preempt for blocking drivers)
+  
+  	blk_mq_put_ctx(data.ctx);
+ -	return cookie;
+  }
+  
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx)
+ +/*
+ + * Default mapping to a software queue, since we use one per CPU.
+ + */
+ +struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ +{
+ +	return q->queue_hw_ctx[q->mq_map[cpu]];
+ +}
+ +EXPORT_SYMBOL(blk_mq_map_queue);
+ +
+ +static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ +		struct blk_mq_tags *tags, unsigned int hctx_idx)
+  {
+  	struct page *page;
+  
+* Unmerged path block/blk-mq.c
