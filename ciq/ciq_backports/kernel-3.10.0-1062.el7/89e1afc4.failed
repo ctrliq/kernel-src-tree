@@ -1,0 +1,216 @@
+qede: Correct XDP forward unmapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 89e1afc44765d8b9f509d15df096494f14463e17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/89e1afc4.failed
+
+Driver is currently using dma_unmap_single() with the address it
+passed to device for the purpose of forwarding, but the XDP
+transmission buffer was originally a page allocated for the rx-queue.
+The mapped address is likely to differ from the original mapped
+address due to the placement offset.
+
+This difference is going to get even bigger once we support headroom.
+
+Cache the original mapped address of the page, and use it for unmapping
+of the buffer when completion arrives for the XDP forwarded packet.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 89e1afc44765d8b9f509d15df096494f14463e17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede.h
+#	drivers/net/ethernet/qlogic/qede/qede_fp.c
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede.h
+index 6c41bda94cf1,7ab2201a43b2..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@@ -359,7 -349,13 +359,12 @@@ struct sw_tx_bd 
+  #define QEDE_TSO_SPLIT_BD		BIT(0)
+  };
+  
++ struct sw_tx_xdp {
++ 	struct page *page;
++ 	dma_addr_t mapping;
++ };
++ 
+  struct qede_tx_queue {
+ -	u8 is_xdp;
+  	bool is_legacy;
+  	u16 sw_tx_cons;
+  	u16 sw_tx_prod;
+@@@ -377,8 -372,18 +382,22 @@@
+  	void __iomem *doorbell_addr;
+  	union db_prod tx_db;
+  	int index; /* Slowpath only */
+++<<<<<<< HEAD
+++=======
++ #define QEDE_TXQ_XDP_TO_IDX(edev, txq)	((txq)->index - \
++ 					 QEDE_MAX_TSS_CNT(edev))
++ #define QEDE_TXQ_IDX_TO_XDP(edev, idx)	((idx) + QEDE_MAX_TSS_CNT(edev))
++ 
++ 	/* Regular Tx requires skb + metadata for release purpose,
++ 	 * while XDP requires the pages and the mapped address.
++ 	 */
++ 	union {
++ 		struct sw_tx_bd *skbs;
++ 		struct sw_tx_xdp *xdp;
++ 	} sw_tx_ring;
+++>>>>>>> 89e1afc44765 (qede: Correct XDP forward unmapping)
+  
+ +	struct sw_tx_bd *sw_tx_ring;
+  	struct qed_chain tx_pbl;
+  
+  	/* Slowpath; Should be kept in end [unless missing padding] */
+diff --cc drivers/net/ethernet/qlogic/qede/qede_fp.c
+index 6001b8e5a281,c61cfcfbbd56..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@@ -319,11 -319,55 +319,57 @@@ static inline void qede_update_tx_produ
+  	barrier();
+  	writel(txq->tx_db.raw, txq->doorbell_addr);
+  
+ -	/* mmiowb is needed to synchronize doorbell writes from more than one
+ -	 * processor. It guarantees that the write arrives to the device before
+ -	 * the queue lock is released and another start_xmit is called (possibly
+ -	 * on another CPU). Without this barrier, the next doorbell can bypass
+ -	 * this doorbell. This is applicable to IA64/Altix systems.
+ +	/* Fence required to flush the write combined buffer, since another
+ +	 * CPU may write to the same doorbell address and data may be lost
+ +	 * due to relaxed order nature of write combined bar.
+  	 */
+++<<<<<<< HEAD
+ +	wmb();
+++=======
++ 	mmiowb();
++ }
++ 
++ static int qede_xdp_xmit(struct qede_dev *edev, struct qede_fastpath *fp,
++ 			 struct sw_rx_data *metadata, u16 padding, u16 length)
++ {
++ 	struct qede_tx_queue *txq = fp->xdp_tx;
++ 	u16 idx = txq->sw_tx_prod & NUM_TX_BDS_MAX;
++ 	struct eth_tx_1st_bd *first_bd;
++ 
++ 	if (!qed_chain_get_elem_left(&txq->tx_pbl)) {
++ 		txq->stopped_cnt++;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	first_bd = (struct eth_tx_1st_bd *)qed_chain_produce(&txq->tx_pbl);
++ 
++ 	memset(first_bd, 0, sizeof(*first_bd));
++ 	first_bd->data.bd_flags.bitfields =
++ 	    BIT(ETH_TX_1ST_BD_FLAGS_START_BD_SHIFT);
++ 	first_bd->data.bitfields |=
++ 	    (length & ETH_TX_DATA_1ST_BD_PKT_LEN_MASK) <<
++ 	    ETH_TX_DATA_1ST_BD_PKT_LEN_SHIFT;
++ 	first_bd->data.nbds = 1;
++ 
++ 	/* We can safely ignore the offset, as it's 0 for XDP */
++ 	BD_SET_UNMAP_ADDR_LEN(first_bd, metadata->mapping + padding, length);
++ 
++ 	/* Synchronize the buffer back to device, as program [probably]
++ 	 * has changed it.
++ 	 */
++ 	dma_sync_single_for_device(&edev->pdev->dev,
++ 				   metadata->mapping + padding,
++ 				   length, PCI_DMA_TODEVICE);
++ 
++ 	txq->sw_tx_ring.xdp[idx].page = metadata->data;
++ 	txq->sw_tx_ring.xdp[idx].mapping = metadata->mapping;
++ 	txq->sw_tx_prod++;
++ 
++ 	/* Mark the fastpath for future XDP doorbell */
++ 	fp->xdp_xmit = 1;
++ 
++ 	return 0;
+++>>>>>>> 89e1afc44765 (qede: Correct XDP forward unmapping)
+  }
+  
+  int qede_txq_has_work(struct qede_tx_queue *txq)
+@@@ -339,6 -383,27 +385,30 @@@
+  	return hw_bd_cons != qed_chain_get_cons_idx(&txq->tx_pbl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qede_xdp_tx_int(struct qede_dev *edev, struct qede_tx_queue *txq)
++ {
++ 	u16 hw_bd_cons, idx;
++ 
++ 	hw_bd_cons = le16_to_cpu(*txq->hw_cons_ptr);
++ 	barrier();
++ 
++ 	while (hw_bd_cons != qed_chain_get_cons_idx(&txq->tx_pbl)) {
++ 		qed_chain_consume(&txq->tx_pbl);
++ 		idx = txq->sw_tx_cons & NUM_TX_BDS_MAX;
++ 
++ 		dma_unmap_page(&edev->pdev->dev,
++ 			       txq->sw_tx_ring.xdp[idx].mapping,
++ 			       PAGE_SIZE, DMA_BIDIRECTIONAL);
++ 		__free_page(txq->sw_tx_ring.xdp[idx].page);
++ 
++ 		txq->sw_tx_cons++;
++ 		txq->xmit_pkts++;
++ 	}
++ }
++ 
+++>>>>>>> 89e1afc44765 (qede: Correct XDP forward unmapping)
+  static int qede_tx_int(struct qede_dev *edev, struct qede_tx_queue *txq)
+  {
+  	struct netdev_queue *netdev_txq;
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index 121608beefab,fa62c37dac7a..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -1360,7 -1250,10 +1360,14 @@@ err
+  static void qede_free_mem_txq(struct qede_dev *edev, struct qede_tx_queue *txq)
+  {
+  	/* Free the parallel SW ring */
+++<<<<<<< HEAD
+ +	kfree(txq->sw_tx_ring);
+++=======
++ 	if (txq->is_xdp)
++ 		kfree(txq->sw_tx_ring.xdp);
++ 	else
++ 		kfree(txq->sw_tx_ring.skbs);
+++>>>>>>> 89e1afc44765 (qede: Correct XDP forward unmapping)
+  
+  	/* Free the real RQ ring used by FW */
+  	edev->ops->common->chain_free(edev->cdev, &txq->tx_pbl);
+@@@ -1375,11 -1268,16 +1382,24 @@@ static int qede_alloc_mem_txq(struct qe
+  	txq->num_tx_buffers = edev->q_num_tx_buffers;
+  
+  	/* Allocate the parallel driver ring for Tx buffers */
+++<<<<<<< HEAD
+ +	size = sizeof(*txq->sw_tx_ring) * txq->num_tx_buffers;
+ +	txq->sw_tx_ring = kzalloc(size, GFP_KERNEL);
+ +	if (!txq->sw_tx_ring) {
+ +		DP_NOTICE(edev, "Tx buffers ring allocation failed\n");
+ +		goto err;
+++=======
++ 	if (txq->is_xdp) {
++ 		size = sizeof(*txq->sw_tx_ring.xdp) * TX_RING_SIZE;
++ 		txq->sw_tx_ring.xdp = kzalloc(size, GFP_KERNEL);
++ 		if (!txq->sw_tx_ring.xdp)
++ 			goto err;
++ 	} else {
++ 		size = sizeof(*txq->sw_tx_ring.skbs) * TX_RING_SIZE;
++ 		txq->sw_tx_ring.skbs = kzalloc(size, GFP_KERNEL);
++ 		if (!txq->sw_tx_ring.skbs)
++ 			goto err;
+++>>>>>>> 89e1afc44765 (qede: Correct XDP forward unmapping)
+  	}
+  
+  	rc = edev->ops->common->chain_alloc(edev->cdev,
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede.h
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_fp.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
