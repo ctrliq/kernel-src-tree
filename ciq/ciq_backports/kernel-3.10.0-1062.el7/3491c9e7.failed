@@ -1,0 +1,305 @@
+qedr: Add support for kernel mode SRQ's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yuval Bason <yuval.bason@cavium.com>
+commit 3491c9e799fb96d909f22f3b39d8cca81e75c3a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3491c9e7.failed
+
+Implement the SRQ specific verbs and update the poll_cq verb to deal with
+SRQ completions.
+
+	Signed-off-by: Michal Kalderon <michal.kalderon@cavium.com>
+	Signed-off-by: Yuval Bason <yuval.bason@cavium.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 3491c9e799fb96d909f22f3b39d8cca81e75c3a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qedr/verbs.c
+diff --cc drivers/infiniband/hw/qedr/verbs.c
+index c505fbd86b17,7c75fc36e5ec..000000000000
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@@ -84,25 -88,17 +88,39 @@@ int qedr_iw_query_gid(struct ib_device 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int qedr_query_gid(struct ib_device *ibdev, u8 port, int index,
+ +		   union ib_gid *sgid)
+ +{
+ +	struct qedr_dev *dev = get_qedr_dev(ibdev);
+ +	int rc = 0;
+ +
+ +	if (!rdma_cap_roce_gid_table(ibdev, port))
+ +		return -ENODEV;
+ +
+ +	rc = ib_get_cached_gid(ibdev, port, index, sgid, NULL);
+ +	if (rc == -EAGAIN) {
+ +		memcpy(sgid, &zgid, sizeof(*sgid));
+ +		return 0;
+ +	}
+ +
+ +	DP_DEBUG(dev, QEDR_MSG_INIT, "query gid: index=%d %llx:%llx\n", index,
+ +		 sgid->global.interface_id, sgid->global.subnet_prefix);
+ +
+ +	return rc;
+++=======
++ int qedr_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *srq_attr)
++ {
++ 	struct qedr_dev *dev = get_qedr_dev(ibsrq->device);
++ 	struct qedr_device_attr *qattr = &dev->attr;
++ 	struct qedr_srq *srq = get_qedr_srq(ibsrq);
++ 
++ 	srq_attr->srq_limit = srq->srq_limit;
++ 	srq_attr->max_wr = qattr->max_srq_wr;
++ 	srq_attr->max_sge = qattr->max_sge;
++ 
++ 	return 0;
+++>>>>>>> 3491c9e799fb (qedr: Add support for kernel mode SRQ's)
+  }
+  
+  int qedr_query_device(struct ib_device *ibdev,
+@@@ -3256,8 -3470,104 +3503,109 @@@ int qedr_post_send(struct ib_qp *ibqp, 
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +int qedr_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+ +		   struct ib_recv_wr **bad_wr)
+++=======
++ static u32 qedr_srq_elem_left(struct qedr_srq_hwq_info *hw_srq)
++ {
++ 	u32 used;
++ 
++ 	/* Calculate number of elements used based on producer
++ 	 * count and consumer count and subtract it from max
++ 	 * work request supported so that we get elements left.
++ 	 */
++ 	used = hw_srq->wr_prod_cnt - hw_srq->wr_cons_cnt;
++ 
++ 	return hw_srq->max_wr - used;
++ }
++ 
++ int qedr_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++ 		       const struct ib_recv_wr **bad_wr)
++ {
++ 	struct qedr_srq *srq = get_qedr_srq(ibsrq);
++ 	struct qedr_srq_hwq_info *hw_srq;
++ 	struct qedr_dev *dev = srq->dev;
++ 	struct qed_chain *pbl;
++ 	unsigned long flags;
++ 	int status = 0;
++ 	u32 num_sge;
++ 	u32 offset;
++ 
++ 	spin_lock_irqsave(&srq->lock, flags);
++ 
++ 	hw_srq = &srq->hw_srq;
++ 	pbl = &srq->hw_srq.pbl;
++ 	while (wr) {
++ 		struct rdma_srq_wqe_header *hdr;
++ 		int i;
++ 
++ 		if (!qedr_srq_elem_left(hw_srq) ||
++ 		    wr->num_sge > srq->hw_srq.max_sges) {
++ 			DP_ERR(dev, "Can't post WR  (%d,%d) || (%d > %d)\n",
++ 			       hw_srq->wr_prod_cnt, hw_srq->wr_cons_cnt,
++ 			       wr->num_sge, srq->hw_srq.max_sges);
++ 			status = -ENOMEM;
++ 			*bad_wr = wr;
++ 			break;
++ 		}
++ 
++ 		hdr = qed_chain_produce(pbl);
++ 		num_sge = wr->num_sge;
++ 		/* Set number of sge and work request id in header */
++ 		SRQ_HDR_SET(hdr, wr->wr_id, num_sge);
++ 
++ 		srq->hw_srq.wr_prod_cnt++;
++ 		hw_srq->wqe_prod++;
++ 		hw_srq->sge_prod++;
++ 
++ 		DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 			 "SRQ WR: SGEs: %d with wr_id[%d] = %llx\n",
++ 			 wr->num_sge, hw_srq->wqe_prod, wr->wr_id);
++ 
++ 		for (i = 0; i < wr->num_sge; i++) {
++ 			struct rdma_srq_sge *srq_sge = qed_chain_produce(pbl);
++ 
++ 			/* Set SGE length, lkey and address */
++ 			SRQ_SGE_SET(srq_sge, wr->sg_list[i].addr,
++ 				    wr->sg_list[i].length, wr->sg_list[i].lkey);
++ 
++ 			DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 				 "[%d]: len %d key %x addr %x:%x\n",
++ 				 i, srq_sge->length, srq_sge->l_key,
++ 				 srq_sge->addr.hi, srq_sge->addr.lo);
++ 			hw_srq->sge_prod++;
++ 		}
++ 
++ 		/* Flush WQE and SGE information before
++ 		 * updating producer.
++ 		 */
++ 		wmb();
++ 
++ 		/* SRQ producer is 8 bytes. Need to update SGE producer index
++ 		 * in first 4 bytes and need to update WQE producer in
++ 		 * next 4 bytes.
++ 		 */
++ 		*srq->hw_srq.virt_prod_pair_addr = hw_srq->sge_prod;
++ 		offset = offsetof(struct rdma_srq_producers, wqe_prod);
++ 		*((u8 *)srq->hw_srq.virt_prod_pair_addr + offset) =
++ 			hw_srq->wqe_prod;
++ 
++ 		/* Flush producer after updating it. */
++ 		wmb();
++ 		wr = wr->next;
++ 	}
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ, "POST: Elements in S-RQ: %d\n",
++ 		 qed_chain_get_elem_left(pbl));
++ 	spin_unlock_irqrestore(&srq->lock, flags);
++ 
++ 	return status;
++ }
++ 
++ int qedr_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++ 		   const struct ib_recv_wr **bad_wr)
+++>>>>>>> 3491c9e799fb (qedr: Add support for kernel mode SRQ's)
+  {
+  	struct qedr_qp *qp = get_qedr_qp(ibqp);
+  	struct qedr_dev *dev = qp->dev;
+diff --git a/drivers/infiniband/hw/qedr/main.c b/drivers/infiniband/hw/qedr/main.c
+index bb34adfc0b07..d55ad9d01c41 100644
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -230,6 +230,11 @@ static int qedr_register_device(struct qedr_dev *dev)
+ 	dev->ibdev.query_qp = qedr_query_qp;
+ 	dev->ibdev.destroy_qp = qedr_destroy_qp;
+ 
++	dev->ibdev.create_srq = qedr_create_srq;
++	dev->ibdev.destroy_srq = qedr_destroy_srq;
++	dev->ibdev.modify_srq = qedr_modify_srq;
++	dev->ibdev.query_srq = qedr_query_srq;
++	dev->ibdev.post_srq_recv = qedr_post_srq_recv;
+ 	dev->ibdev.query_pkey = qedr_query_pkey;
+ 
+ 	dev->ibdev.create_ah = qedr_create_ah;
+diff --git a/drivers/infiniband/hw/qedr/qedr.h b/drivers/infiniband/hw/qedr/qedr.h
+index 5d0b75eaaa28..a2d708dceb8d 100644
+--- a/drivers/infiniband/hw/qedr/qedr.h
++++ b/drivers/infiniband/hw/qedr/qedr.h
+@@ -58,6 +58,7 @@
+ #define QEDR_MSG_RQ   "  RQ"
+ #define QEDR_MSG_SQ   "  SQ"
+ #define QEDR_MSG_QP   "  QP"
++#define QEDR_MSG_SRQ  " SRQ"
+ #define QEDR_MSG_GSI  " GSI"
+ #define QEDR_MSG_IWARP  " IW"
+ 
+@@ -171,6 +172,7 @@ struct qedr_dev {
+ 	struct qedr_qp		*gsi_qp;
+ 	enum qed_rdma_type	rdma_type;
+ 	struct qedr_idr		qpidr;
++	struct qedr_idr		srqidr;
+ 	struct workqueue_struct *iwarp_wq;
+ 	u16			iwarp_max_mtu;
+ 
+@@ -341,6 +343,34 @@ struct qedr_qp_hwq_info {
+ 				qed_chain_get_capacity(p_info->pbl)	\
+ 	} while (0)
+ 
++struct qedr_srq_hwq_info {
++	u32 max_sges;
++	u32 max_wr;
++	struct qed_chain pbl;
++	u64 p_phys_addr_tbl;
++	u32 wqe_prod;
++	u32 sge_prod;
++	u32 wr_prod_cnt;
++	u32 wr_cons_cnt;
++	u32 num_elems;
++
++	u32 *virt_prod_pair_addr;
++	dma_addr_t phy_prod_pair_addr;
++};
++
++struct qedr_srq {
++	struct ib_srq ibsrq;
++	struct qedr_dev *dev;
++
++	struct qedr_userq	usrq;
++	struct qedr_srq_hwq_info hw_srq;
++	struct ib_umem *prod_umem;
++	u16 srq_id;
++	u32 srq_limit;
++	/* lock to protect srq recv post */
++	spinlock_t lock;
++};
++
+ enum qedr_qp_err_bitmap {
+ 	QEDR_QP_ERR_SQ_FULL = 1,
+ 	QEDR_QP_ERR_RQ_FULL = 2,
+@@ -542,4 +572,9 @@ static inline struct qedr_mr *get_qedr_mr(struct ib_mr *ibmr)
+ {
+ 	return container_of(ibmr, struct qedr_mr, ibmr);
+ }
++
++static inline struct qedr_srq *get_qedr_srq(struct ib_srq *ibsrq)
++{
++	return container_of(ibsrq, struct qedr_srq, ibsrq);
++}
+ #endif
+diff --git a/drivers/infiniband/hw/qedr/qedr_hsi_rdma.h b/drivers/infiniband/hw/qedr/qedr_hsi_rdma.h
+index 7e1f7021396a..228dd7d49622 100644
+--- a/drivers/infiniband/hw/qedr/qedr_hsi_rdma.h
++++ b/drivers/infiniband/hw/qedr/qedr_hsi_rdma.h
+@@ -161,12 +161,23 @@ struct rdma_rq_sge {
+ #define RDMA_RQ_SGE_L_KEY_HI_SHIFT  29
+ };
+ 
++struct rdma_srq_wqe_header {
++	struct regpair wr_id;
++	u8 num_sges /* number of SGEs in WQE */;
++	u8 reserved2[7];
++};
++
+ struct rdma_srq_sge {
+ 	struct regpair addr;
+ 	__le32 length;
+ 	__le32 l_key;
+ };
+ 
++union rdma_srq_elm {
++	struct rdma_srq_wqe_header header;
++	struct rdma_srq_sge sge;
++};
++
+ /* Rdma doorbell data for flags update */
+ struct rdma_pwm_flags_data {
+ 	__le16 icid; /* internal CID */
+* Unmerged path drivers/infiniband/hw/qedr/verbs.c
+diff --git a/drivers/infiniband/hw/qedr/verbs.h b/drivers/infiniband/hw/qedr/verbs.h
+index b5330495bf7c..73c19af8b50d 100644
+--- a/drivers/infiniband/hw/qedr/verbs.h
++++ b/drivers/infiniband/hw/qedr/verbs.h
+@@ -67,6 +67,15 @@ int qedr_query_qp(struct ib_qp *, struct ib_qp_attr *qp_attr,
+ 		  int qp_attr_mask, struct ib_qp_init_attr *);
+ int qedr_destroy_qp(struct ib_qp *ibqp);
+ 
++struct ib_srq *qedr_create_srq(struct ib_pd *ibpd,
++			       struct ib_srq_init_attr *attr,
++			       struct ib_udata *udata);
++int qedr_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
++		    enum ib_srq_attr_mask attr_mask, struct ib_udata *udata);
++int qedr_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr);
++int qedr_destroy_srq(struct ib_srq *ibsrq);
++int qedr_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++		       const struct ib_recv_wr **bad_recv_wr);
+ struct ib_ah *qedr_create_ah(struct ib_pd *ibpd, struct rdma_ah_attr *attr,
+ 			     struct ib_udata *udata);
+ int qedr_destroy_ah(struct ib_ah *ibah);
