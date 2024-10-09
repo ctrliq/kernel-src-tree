@@ -1,0 +1,247 @@
+scsi: lpfc: Make ktime sampling more accurate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Make ktime sampling more accurate (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 92.86%
+commit-author Dick Kennedy <dick.kennedy@broadcom.com>
+commit c8a4ce0bf3aad1a73d5122a3781a0be83bc0d0a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c8a4ce0b.failed
+
+Need to make ktime samples more accurate
+
+If ktime is turned on in the middle of an IO, the max calculation could
+be misleading. Base sampling on the start time of the IO as opposed to
+ktime_on.
+
+Make ISR ktime timestamps be from when CQE is read instead of EQE.
+Added additional sanity checks when deciding whether to accept an IO
+sample or not.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c8a4ce0bf3aad1a73d5122a3781a0be83bc0d0a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_nvme.c
+#	drivers/scsi/lpfc/lpfc_nvmet.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index afe166ddbf5a,abd528266fdc..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -12303,14 -13064,22 +12303,27 @@@ lpfc_sli4_sp_handle_eqe(struct lpfc_hb
+  		break;
+  	case LPFC_WCQ:
+  		while ((cqe = lpfc_sli4_cq_get(cq))) {
+++<<<<<<< HEAD
+ +			if (cq->subtype == LPFC_FCP)
+ +				workposted |= lpfc_sli4_fp_handle_wcqe(phba, cq,
+++=======
++ 			if (cq->subtype == LPFC_FCP ||
++ 			    cq->subtype == LPFC_NVME) {
++ #ifdef CONFIG_SCSI_LPFC_DEBUG_FS
++ 				if (phba->ktime_on)
++ 					cq->isr_timestamp = ktime_get_ns();
++ 				else
++ 					cq->isr_timestamp = 0;
++ #endif
++ 				workposted |= lpfc_sli4_fp_handle_cqe(phba, cq,
+++>>>>>>> c8a4ce0bf3aa (scsi: lpfc: Make ktime sampling more accurate)
+  								       cqe);
+- 			else
++ 			} else {
+  				workposted |= lpfc_sli4_sp_handle_cqe(phba, cq,
+  								      cqe);
++ 			}
+  			if (!(++ecount % cq->entry_repost))
+ -				break;
+ +				lpfc_sli4_cq_release(cq, LPFC_QUEUE_NOARM);
+  		}
+  
+  		/* Track the max number of CQEs processed in 1 EQ */
+@@@ -12391,7 -13162,21 +12404,25 @@@ lpfc_sli4_fp_handle_fcp_wcqe(struct lpf
+  				bf_get(lpfc_wcqe_c_request_tag, wcqe));
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	if (unlikely(!cmdiocbq->iocb_cmpl)) {
+++=======
++ #ifdef CONFIG_SCSI_LPFC_DEBUG_FS
++ 	cmdiocbq->isr_timestamp = cq->isr_timestamp;
++ #endif
++ 	if (cmdiocbq->iocb_cmpl == NULL) {
++ 		if (cmdiocbq->wqe_cmpl) {
++ 			if (cmdiocbq->iocb_flag & LPFC_DRIVER_ABORTED) {
++ 				spin_lock_irqsave(&phba->hbalock, iflags);
++ 				cmdiocbq->iocb_flag &= ~LPFC_DRIVER_ABORTED;
++ 				spin_unlock_irqrestore(&phba->hbalock, iflags);
++ 			}
++ 
++ 			/* Pass the cmd_iocb and the wcqe to the upper layer */
++ 			(cmdiocbq->wqe_cmpl)(phba, cmdiocbq, wcqe);
++ 			return;
++ 		}
+++>>>>>>> c8a4ce0bf3aa (scsi: lpfc: Make ktime sampling more accurate)
+  		lpfc_printf_log(phba, KERN_WARNING, LOG_SLI,
+  				"0375 FCP cmdiocb not callback function "
+  				"iotag: (%d)\n",
+@@@ -12447,7 -13232,114 +12478,118 @@@ lpfc_sli4_fp_handle_rel_wcqe(struct lpf
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * lpfc_sli4_fp_handle_wcqe - Process fast-path work queue completion entry
+++=======
++  * lpfc_sli4_nvmet_handle_rcqe - Process a receive-queue completion queue entry
++  * @phba: Pointer to HBA context object.
++  * @rcqe: Pointer to receive-queue completion queue entry.
++  *
++  * This routine process a receive-queue completion queue entry.
++  *
++  * Return: true if work posted to worker thread, otherwise false.
++  **/
++ static bool
++ lpfc_sli4_nvmet_handle_rcqe(struct lpfc_hba *phba, struct lpfc_queue *cq,
++ 			    struct lpfc_rcqe *rcqe)
++ {
++ 	bool workposted = false;
++ 	struct lpfc_queue *hrq;
++ 	struct lpfc_queue *drq;
++ 	struct rqb_dmabuf *dma_buf;
++ 	struct fc_frame_header *fc_hdr;
++ 	struct lpfc_nvmet_tgtport *tgtp;
++ 	uint32_t status, rq_id;
++ 	unsigned long iflags;
++ 	uint32_t fctl, idx;
++ 
++ 	if ((phba->nvmet_support == 0) ||
++ 	    (phba->sli4_hba.nvmet_cqset == NULL))
++ 		return workposted;
++ 
++ 	idx = cq->queue_id - phba->sli4_hba.nvmet_cqset[0]->queue_id;
++ 	hrq = phba->sli4_hba.nvmet_mrq_hdr[idx];
++ 	drq = phba->sli4_hba.nvmet_mrq_data[idx];
++ 
++ 	/* sanity check on queue memory */
++ 	if (unlikely(!hrq) || unlikely(!drq))
++ 		return workposted;
++ 
++ 	if (bf_get(lpfc_cqe_code, rcqe) == CQE_CODE_RECEIVE_V1)
++ 		rq_id = bf_get(lpfc_rcqe_rq_id_v1, rcqe);
++ 	else
++ 		rq_id = bf_get(lpfc_rcqe_rq_id, rcqe);
++ 
++ 	if ((phba->nvmet_support == 0) ||
++ 	    (rq_id != hrq->queue_id))
++ 		return workposted;
++ 
++ 	status = bf_get(lpfc_rcqe_status, rcqe);
++ 	switch (status) {
++ 	case FC_STATUS_RQ_BUF_LEN_EXCEEDED:
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 				"6126 Receive Frame Truncated!!\n");
++ 		/* Drop thru */
++ 	case FC_STATUS_RQ_SUCCESS:
++ 		lpfc_sli4_rq_release(hrq, drq);
++ 		spin_lock_irqsave(&phba->hbalock, iflags);
++ 		dma_buf = lpfc_sli_rqbuf_get(phba, hrq);
++ 		if (!dma_buf) {
++ 			hrq->RQ_no_buf_found++;
++ 			spin_unlock_irqrestore(&phba->hbalock, iflags);
++ 			goto out;
++ 		}
++ 		spin_unlock_irqrestore(&phba->hbalock, iflags);
++ 		hrq->RQ_rcv_buf++;
++ 		hrq->RQ_buf_posted--;
++ 		fc_hdr = (struct fc_frame_header *)dma_buf->hbuf.virt;
++ 
++ 		/* Just some basic sanity checks on FCP Command frame */
++ 		fctl = (fc_hdr->fh_f_ctl[0] << 16 |
++ 		fc_hdr->fh_f_ctl[1] << 8 |
++ 		fc_hdr->fh_f_ctl[2]);
++ 		if (((fctl &
++ 		    (FC_FC_FIRST_SEQ | FC_FC_END_SEQ | FC_FC_SEQ_INIT)) !=
++ 		    (FC_FC_FIRST_SEQ | FC_FC_END_SEQ | FC_FC_SEQ_INIT)) ||
++ 		    (fc_hdr->fh_seq_cnt != 0)) /* 0 byte swapped is still 0 */
++ 			goto drop;
++ 
++ 		if (fc_hdr->fh_type == FC_TYPE_FCP) {
++ 			dma_buf->bytes_recv = bf_get(lpfc_rcqe_length,  rcqe);
++ 			lpfc_nvmet_unsol_fcp_event(
++ 				phba, idx, dma_buf,
++ 				cq->isr_timestamp);
++ 			return false;
++ 		}
++ drop:
++ 		lpfc_in_buf_free(phba, &dma_buf->dbuf);
++ 		break;
++ 	case FC_STATUS_INSUFF_BUF_FRM_DISC:
++ 		if (phba->nvmet_support) {
++ 			tgtp = phba->targetport->private;
++ 			lpfc_printf_log(phba, KERN_ERR, LOG_SLI | LOG_NVME,
++ 					"6401 RQE Error x%x, posted %d err_cnt "
++ 					"%d: %x %x %x\n",
++ 					status, hrq->RQ_buf_posted,
++ 					hrq->RQ_no_posted_buf,
++ 					atomic_read(&tgtp->rcv_fcp_cmd_in),
++ 					atomic_read(&tgtp->rcv_fcp_cmd_out),
++ 					atomic_read(&tgtp->xmt_fcp_release));
++ 		}
++ 		/* fallthrough */
++ 
++ 	case FC_STATUS_INSUFF_BUF_NEED_BUF:
++ 		hrq->RQ_no_posted_buf++;
++ 		/* Post more buffers if possible */
++ 		break;
++ 	}
++ out:
++ 	return workposted;
++ }
++ 
++ /**
++  * lpfc_sli4_fp_handle_cqe - Process fast-path work queue completion entry
+++>>>>>>> c8a4ce0bf3aa (scsi: lpfc: Make ktime sampling more accurate)
+   * @cq: Pointer to the completion queue.
+   * @eqe: Pointer to fast-path completion queue entry.
+   *
+@@@ -12556,14 -13476,23 +12698,24 @@@ lpfc_sli4_hba_handle_eqe(struct lpfc_hb
+  				"0368 Miss-matched fast-path completion "
+  				"queue identifier: eqcqid=%d, fcpcqid=%d\n",
+  				cqid, cq->queue_id);
+ -		return 0;
+ +		return;
+  	}
+  
+ -	/* Save EQ associated with this CQ */
+ -	cq->assoc_qp = phba->sli4_hba.hba_eq[qidx];
+ -
+  	/* Process all the entries to the CQ */
+  	while ((cqe = lpfc_sli4_cq_get(cq))) {
+++<<<<<<< HEAD
+ +		workposted |= lpfc_sli4_fp_handle_wcqe(phba, cq, cqe);
+++=======
++ #ifdef CONFIG_SCSI_LPFC_DEBUG_FS
++ 		if (phba->ktime_on)
++ 			cq->isr_timestamp = ktime_get_ns();
++ 		else
++ 			cq->isr_timestamp = 0;
++ #endif
++ 		workposted |= lpfc_sli4_fp_handle_cqe(phba, cq, cqe);
+++>>>>>>> c8a4ce0bf3aa (scsi: lpfc: Make ktime sampling more accurate)
+  		if (!(++ecount % cq->entry_repost))
+ -			break;
+ +			lpfc_sli4_cq_release(cq, LPFC_QUEUE_NOARM);
+  	}
+  
+  	/* Track the max number of CQEs processed in 1 EQ */
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
