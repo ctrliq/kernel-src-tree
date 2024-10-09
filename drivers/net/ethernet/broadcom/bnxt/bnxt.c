@@ -585,7 +585,7 @@ static inline u8 *__bnxt_alloc_rx_data(struct bnxt *bp, dma_addr_t *mapping,
 		return NULL;
 
 	*mapping = dma_map_single(&pdev->dev, data + BNXT_RX_DMA_OFFSET,
-				  bp->rx_buf_use_size, PCI_DMA_FROMDEVICE);
+				  bp->rx_buf_use_size, bp->rx_dir);
 
 	if (dma_mapping_error(&pdev->dev, *mapping)) {
 		kfree(data);
@@ -773,7 +773,7 @@ static struct sk_buff *bnxt_rx_skb(struct bnxt *bp,
 
 	skb = build_skb(data, 0);
 	dma_unmap_single(&bp->pdev->dev, dma_addr, bp->rx_buf_use_size,
-			 PCI_DMA_FROMDEVICE);
+			 bp->rx_dir);
 	if (!skb) {
 		kfree(data);
 		return NULL;
@@ -879,15 +879,14 @@ static inline struct sk_buff *bnxt_copy_skb(struct bnxt_napi *bnapi, u8 *data,
 	if (!skb)
 		return NULL;
 
-	dma_sync_single_for_cpu(&pdev->dev, mapping,
-				bp->rx_copy_thresh, PCI_DMA_FROMDEVICE);
+	dma_sync_single_for_cpu(&pdev->dev, mapping, bp->rx_copy_thresh,
+				bp->rx_dir);
 
 	memcpy(skb->data - NET_IP_ALIGN, data - NET_IP_ALIGN,
 	       len + NET_IP_ALIGN);
 
-	dma_sync_single_for_device(&pdev->dev, mapping,
-				   bp->rx_copy_thresh,
-				   PCI_DMA_FROMDEVICE);
+	dma_sync_single_for_device(&pdev->dev, mapping, bp->rx_copy_thresh,
+				   bp->rx_dir);
 
 	skb_put(skb, len);
 	return skb;
@@ -1262,7 +1261,7 @@ static inline struct sk_buff *bnxt_tpa_end(struct bnxt *bp,
 
 		skb = build_skb(data, 0);
 		dma_unmap_single(&bp->pdev->dev, mapping, bp->rx_buf_use_size,
-				 PCI_DMA_FROMDEVICE);
+				 bp->rx_dir);
 
 		if (!skb) {
 			kfree(data);
@@ -1879,11 +1878,9 @@ static void bnxt_free_rx_skbs(struct bnxt *bp)
 				if (!data)
 					continue;
 
-				dma_unmap_single(
-					&pdev->dev,
-					tpa_info->mapping,
-					bp->rx_buf_use_size,
-					PCI_DMA_FROMDEVICE);
+				dma_unmap_single(&pdev->dev, tpa_info->mapping,
+						 bp->rx_buf_use_size,
+						 bp->rx_dir);
 
 				tpa_info->data = NULL;
 
@@ -1899,8 +1896,7 @@ static void bnxt_free_rx_skbs(struct bnxt *bp)
 				continue;
 
 			dma_unmap_single(&pdev->dev, rx_buf->mapping,
-					 bp->rx_buf_use_size,
-					 PCI_DMA_FROMDEVICE);
+					 bp->rx_buf_use_size, bp->rx_dir);
 
 			rx_buf->data = NULL;
 
@@ -2576,6 +2572,7 @@ void bnxt_set_ring_params(struct bnxt *bp)
 
 static int bnxt_set_rx_skb_mode(struct bnxt *bp)
 {
+	bp->rx_dir = DMA_FROM_DEVICE;
 	bp->rx_skb_func = bnxt_rx_skb;
 	return 0;
 }
