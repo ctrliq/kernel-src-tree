@@ -839,7 +839,6 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
 		ifa->peer_addr = *peer_addr;
 
 	spin_lock_init(&ifa->lock);
-	spin_lock_init(&ifa->state_lock);
 	INIT_DELAYED_WORK(&ifa->dad_work, addrconf_dad_work);
 	INIT_HLIST_NODE(&ifa->addr_lst);
 	ifa->scope = scope;
@@ -982,10 +981,10 @@ static void ipv6_del_addr(struct inet6_ifaddr *ifp)
 
 	ASSERT_RTNL();
 
-	spin_lock_bh(&ifp->state_lock);
+	spin_lock_bh(&ifp->lock);
 	state = ifp->state;
 	ifp->state = INET6_IFADDR_STATE_DEAD;
-	spin_unlock_bh(&ifp->state_lock);
+	spin_unlock_bh(&ifp->lock);
 
 	if (state == INET6_IFADDR_STATE_DEAD)
 		goto out;
@@ -1612,12 +1611,12 @@ static int addrconf_dad_end(struct inet6_ifaddr *ifp)
 {
 	int err = -ENOENT;
 
-	spin_lock_bh(&ifp->state_lock);
+	spin_lock_bh(&ifp->lock);
 	if (ifp->state == INET6_IFADDR_STATE_DAD) {
 		ifp->state = INET6_IFADDR_STATE_POSTDAD;
 		err = 0;
 	}
-	spin_unlock_bh(&ifp->state_lock);
+	spin_unlock_bh(&ifp->lock);
 
 	return err;
 }
@@ -1650,10 +1649,10 @@ void addrconf_dad_failure(struct inet6_ifaddr *ifp)
 		}
 	}
 
-	spin_lock_bh(&ifp->state_lock);
+	spin_lock_bh(&ifp->lock);
 	/* transition from _POSTDAD to _ERRDAD */
 	ifp->state = INET6_IFADDR_STATE_ERRDAD;
-	spin_unlock_bh(&ifp->state_lock);
+	spin_unlock_bh(&ifp->lock);
 
 	addrconf_mod_dad_work(ifp, 0);
 	in6_ifa_put(ifp);
@@ -2262,7 +2261,7 @@ ok:
 			u32 stored_lft;
 
 			/* update lifetime (RFC2462 5.5.3 e) */
-			spin_lock(&ifp->lock);
+			spin_lock_bh(&ifp->lock);
 			now = jiffies;
 			if (ifp->valid_lft > (now - ifp->tstamp) / HZ)
 				stored_lft = ifp->valid_lft - (now - ifp->tstamp) / HZ;
@@ -2314,12 +2313,12 @@ ok:
 				ifp->tstamp = now;
 				flags = ifp->flags;
 				ifp->flags &= ~IFA_F_DEPRECATED;
-				spin_unlock(&ifp->lock);
+				spin_unlock_bh(&ifp->lock);
 
 				if (!(flags&IFA_F_TENTATIVE))
 					ipv6_ifa_notify(0, ifp);
 			} else
-				spin_unlock(&ifp->lock);
+				spin_unlock_bh(&ifp->lock);
 
 			manage_tempaddrs(in6_dev, ifp, valid_lft, prefered_lft,
 					 create, now);
@@ -3096,10 +3095,10 @@ static int addrconf_ifdown(struct net_device *dev, int how)
 
 		write_unlock_bh(&idev->lock);
 
-		spin_lock_bh(&ifa->state_lock);
+		spin_lock_bh(&ifa->lock);
 		state = ifa->state;
 		ifa->state = INET6_IFADDR_STATE_DEAD;
-		spin_unlock_bh(&ifa->state_lock);
+		spin_unlock_bh(&ifa->lock);
 
 		if (state != INET6_IFADDR_STATE_DEAD) {
 			__ipv6_ifa_notify(RTM_DELADDR, ifa);
@@ -3248,12 +3247,12 @@ static void addrconf_dad_start(struct inet6_ifaddr *ifp)
 {
 	bool begin_dad = false;
 
-	spin_lock_bh(&ifp->state_lock);
+	spin_lock_bh(&ifp->lock);
 	if (ifp->state != INET6_IFADDR_STATE_DEAD) {
 		ifp->state = INET6_IFADDR_STATE_PREDAD;
 		begin_dad = true;
 	}
-	spin_unlock_bh(&ifp->state_lock);
+	spin_unlock_bh(&ifp->lock);
 
 	if (begin_dad)
 		addrconf_mod_dad_work(ifp, 0);
@@ -3275,7 +3274,7 @@ static void addrconf_dad_work(struct work_struct *w)
 
 	rtnl_lock();
 
-	spin_lock_bh(&ifp->state_lock);
+	spin_lock_bh(&ifp->lock);
 	if (ifp->state == INET6_IFADDR_STATE_PREDAD) {
 		action = DAD_BEGIN;
 		ifp->state = INET6_IFADDR_STATE_DAD;
@@ -3283,7 +3282,7 @@ static void addrconf_dad_work(struct work_struct *w)
 		action = DAD_ABORT;
 		ifp->state = INET6_IFADDR_STATE_POSTDAD;
 	}
-	spin_unlock_bh(&ifp->state_lock);
+	spin_unlock_bh(&ifp->lock);
 
 	if (action == DAD_BEGIN) {
 		addrconf_dad_begin(ifp);
