@@ -1,0 +1,183 @@
+mlxsw: spectrum: Introduce Port-VLAN structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 31a08a523ae453f7eaf5ad6c1da99d6199141b14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/31a08a52.failed
+
+This is the first step in the transition from the vPort model to a
+unified Port-VLAN structure. The new structure is defined and created /
+destroyed upon invocation of the 8021q ndos, but it's not actually used
+throughout the code.
+
+Subsequent patches will initialize it correctly and also create /
+destroy it upon switchdev's VLAN object.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 31a08a523ae453f7eaf5ad6c1da99d6199141b14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index 280114e1ebf6,c4ac648f39bf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@@ -253,6 -196,20 +253,23 @@@ struct mlxsw_sp_port_pcpu_stats 
+  	u32			tx_dropped;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlxsw_sp_port_sample {
++ 	struct psample_group __rcu *psample_group;
++ 	u32 trunc_size;
++ 	u32 rate;
++ 	bool truncate;
++ };
++ 
++ struct mlxsw_sp_port_vlan {
++ 	struct list_head list;
++ 	struct mlxsw_sp_port *mlxsw_sp_port;
++ 	struct mlxsw_sp_fid *fid;
++ 	u16 vid;
++ };
++ 
+++>>>>>>> 31a08a523ae4 (mlxsw: spectrum: Introduce Port-VLAN structure)
+  struct mlxsw_sp_port {
+  	struct net_device *dev;
+  	struct mlxsw_sp_port_pcpu_stats __percpu *pcpu_stats;
+@@@ -302,6 -259,9 +319,12 @@@
+  		struct rtnl_link_stats64 *cache;
+  		struct delayed_work update_dw;
+  	} hw_stats;
+++<<<<<<< HEAD
+++=======
++ 	struct mlxsw_sp_port_sample *sample;
++ 	unsigned int nr_port_vid_map;  /* {Port, VID} => FID mappings */
++ 	struct list_head vlans_list;
+++>>>>>>> 31a08a523ae4 (mlxsw: spectrum: Introduce Port-VLAN structure)
+  };
+  
+  bool mlxsw_sp_port_dev_check(const struct net_device *dev);
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 4a2dd98ae919..e0d40c6af49c 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -1471,10 +1471,34 @@ static void mlxsw_sp_port_vport_destroy(struct mlxsw_sp_port *mlxsw_sp_vport)
+ 	kfree(mlxsw_sp_vport);
+ }
+ 
++static struct mlxsw_sp_port_vlan *
++mlxsw_sp_port_vlan_create(struct mlxsw_sp_port *mlxsw_sp_port, u16 vid)
++{
++	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
++
++	mlxsw_sp_port_vlan = kzalloc(sizeof(*mlxsw_sp_port_vlan), GFP_KERNEL);
++	if (!mlxsw_sp_port_vlan)
++		return ERR_PTR(-ENOMEM);
++
++	mlxsw_sp_port_vlan->mlxsw_sp_port = mlxsw_sp_port;
++	mlxsw_sp_port_vlan->vid = vid;
++	list_add(&mlxsw_sp_port_vlan->list, &mlxsw_sp_port->vlans_list);
++
++	return mlxsw_sp_port_vlan;
++}
++
++static void
++mlxsw_sp_port_vlan_destroy(struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan)
++{
++	list_del(&mlxsw_sp_port_vlan->list);
++	kfree(mlxsw_sp_port_vlan);
++}
++
+ static int mlxsw_sp_port_add_vid(struct net_device *dev,
+ 				 __be16 __always_unused proto, u16 vid)
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
++	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
+ 	struct mlxsw_sp_port *mlxsw_sp_vport;
+ 	bool untagged = vid == 1;
+ 	int err;
+@@ -1485,12 +1509,19 @@ static int mlxsw_sp_port_add_vid(struct net_device *dev,
+ 	if (!vid)
+ 		return 0;
+ 
+-	if (mlxsw_sp_port_vport_find(mlxsw_sp_port, vid))
++	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_vid(mlxsw_sp_port, vid);
++	if (mlxsw_sp_port_vlan)
+ 		return 0;
+ 
++	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_create(mlxsw_sp_port, vid);
++	if (IS_ERR(mlxsw_sp_port_vlan))
++		return PTR_ERR(mlxsw_sp_port_vlan);
++
+ 	mlxsw_sp_vport = mlxsw_sp_port_vport_create(mlxsw_sp_port, vid);
+-	if (!mlxsw_sp_vport)
+-		return -ENOMEM;
++	if (!mlxsw_sp_vport) {
++		err = -ENOMEM;
++		goto err_port_vport_create;
++	}
+ 
+ 	/* When adding the first VLAN interface on a bridged port we need to
+ 	 * transition all the active 802.1Q bridge VLANs to use explicit
+@@ -1513,6 +1544,8 @@ err_port_add_vid:
+ 		mlxsw_sp_port_vlan_mode_trans(mlxsw_sp_port);
+ err_port_vp_mode_trans:
+ 	mlxsw_sp_port_vport_destroy(mlxsw_sp_vport);
++err_port_vport_create:
++	mlxsw_sp_port_vlan_destroy(mlxsw_sp_port_vlan);
+ 	return err;
+ }
+ 
+@@ -1520,6 +1553,7 @@ static int mlxsw_sp_port_kill_vid(struct net_device *dev,
+ 				  __be16 __always_unused proto, u16 vid)
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
++	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
+ 	struct mlxsw_sp_port *mlxsw_sp_vport;
+ 	struct mlxsw_sp_fid *f;
+ 
+@@ -1529,6 +1563,10 @@ static int mlxsw_sp_port_kill_vid(struct net_device *dev,
+ 	if (!vid)
+ 		return 0;
+ 
++	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_vid(mlxsw_sp_port, vid);
++	if (WARN_ON(!mlxsw_sp_port_vlan))
++		return 0;
++
+ 	mlxsw_sp_vport = mlxsw_sp_port_vport_find(mlxsw_sp_port, vid);
+ 	if (WARN_ON(!mlxsw_sp_vport))
+ 		return 0;
+@@ -1551,6 +1589,8 @@ static int mlxsw_sp_port_kill_vid(struct net_device *dev,
+ 
+ 	mlxsw_sp_port_vport_destroy(mlxsw_sp_vport);
+ 
++	mlxsw_sp_port_vlan_destroy(mlxsw_sp_port_vlan);
++
+ 	return 0;
+ }
+ 
+@@ -2675,6 +2715,7 @@ static int __mlxsw_sp_port_create(struct mlxsw_sp *mlxsw_sp, u8 local_port,
+ 		err = -ENOMEM;
+ 		goto err_port_untagged_vlans_alloc;
+ 	}
++	INIT_LIST_HEAD(&mlxsw_sp_port->vlans_list);
+ 	INIT_LIST_HEAD(&mlxsw_sp_port->vports_list);
+ 	INIT_LIST_HEAD(&mlxsw_sp_port->mall_tc_list);
+ 
+@@ -2868,6 +2909,7 @@ static void __mlxsw_sp_port_remove(struct mlxsw_sp *mlxsw_sp, u8 local_port)
+ 	kfree(mlxsw_sp_port->untagged_vlans);
+ 	kfree(mlxsw_sp_port->active_vlans);
+ 	WARN_ON_ONCE(!list_empty(&mlxsw_sp_port->vports_list));
++	WARN_ON_ONCE(!list_empty(&mlxsw_sp_port->vlans_list));
+ 	free_netdev(mlxsw_sp_port->dev);
+ }
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.h
