@@ -1,0 +1,413 @@
+dev: advertise the new nsid when the netns iface changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] rtnetlink: advertise the new nsid when the netns iface changes (Jiri Benc) [1497774]
+Rebuild_FUZZ: 91.53%
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 6621dd29eb9b5e6774ec7a9a75161352fdea47fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6621dd29.failed
+
+x-netns interfaces are bound to two netns: the link netns and the upper
+netns. Usually, this kind of interfaces is created in the link netns and
+then moved to the upper netns. At the end, the interface is visible only
+in the upper netns. The link nsid is advertised via netlink in the upper
+netns, thus the user always knows where is the link part.
+
+There is no such mechanism in the link netns. When the interface is moved
+to another netns, the user cannot "follow" it.
+This patch adds a new netlink attribute which helps to follow an interface
+which moves to another netns. When the interface is unregistered, the new
+nsid is advertised. If the interface is a x-netns interface (ie
+rtnl_link_ops->get_link_net is defined), the nsid is allocated if needed.
+
+CC: Jason A. Donenfeld <Jason@zx2c4.com>
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6621dd29eb9b5e6774ec7a9a75161352fdea47fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rtnetlink.h
+#	include/uapi/linux/if_link.h
+#	net/core/dev.c
+#	net/core/rtnetlink.c
+diff --cc include/linux/rtnetlink.h
+index e5e3fc72eb1c,1251638e60d3..000000000000
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@@ -17,8 -17,11 +17,15 @@@ extern int rtnl_put_cacheinfo(struct sk
+  			      u32 id, long expires, u32 error);
+  
+  void rtmsg_ifinfo(int type, struct net_device *dev, unsigned change, gfp_t flags);
++ void rtmsg_ifinfo_newnet(int type, struct net_device *dev, unsigned int change,
++ 			 gfp_t flags, int *new_nsid);
+  struct sk_buff *rtmsg_ifinfo_build_skb(int type, struct net_device *dev,
+++<<<<<<< HEAD
+ +				       unsigned change, gfp_t flags);
+++=======
++ 				       unsigned change, u32 event,
++ 				       gfp_t flags, int *new_nsid);
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  void rtmsg_ifinfo_send(struct sk_buff *skb, struct net_device *dev,
+  		       gfp_t flags);
+  
+diff --cc include/uapi/linux/if_link.h
+index 996998dd2fff,cd580fc0e58f..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -160,6 -156,9 +160,12 @@@ enum 
+  	IFLA_GSO_MAX_SEGS,
+  	IFLA_GSO_MAX_SIZE,
+  	IFLA_PAD,
+++<<<<<<< HEAD
+++=======
++ 	IFLA_XDP,
++ 	IFLA_EVENT,
++ 	IFLA_NEW_NETNSID,
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  	__IFLA_MAX
+  };
+  
+diff --cc net/core/dev.c
+index 54ad82302512,bffc75429184..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -6801,8 -7204,8 +6802,13 @@@ static void rollback_registered_many(st
+  
+  		if (!dev->rtnl_link_ops ||
+  		    dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
+++<<<<<<< HEAD
+ +			skb = rtmsg_ifinfo_build_skb(RTM_DELLINK, dev, ~0U,
+ +						     GFP_KERNEL);
+++=======
++ 			skb = rtmsg_ifinfo_build_skb(RTM_DELLINK, dev, ~0U, 0,
++ 						     GFP_KERNEL, NULL);
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  
+  		/*
+  		 *	Flush the unicast and multicast chains
+diff --cc net/core/rtnetlink.c
+index 1df92b36501c,1ee98b1369d5..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -916,6 -913,9 +916,12 @@@ static noinline size_t if_nlmsg_size(co
+  	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_PORT_ID */
+  	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_SWITCH_ID */
+  	       + nla_total_size(IFNAMSIZ) /* IFLA_PHYS_PORT_NAME */
+++<<<<<<< HEAD
+++=======
++ 	       + rtnl_xdp_size() /* IFLA_XDP */
++ 	       + nla_total_size(4)  /* IFLA_EVENT */
++ 	       + nla_total_size(4)  /* IFLA_NEW_NETNSID */
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  	       + nla_total_size(1); /* IFLA_PROTO_DOWN */
+  
+  }
+@@@ -1219,9 -1252,140 +1225,14 @@@ static int rtnl_fill_link_ifmap(struct 
+  	return 0;
+  }
+  
+ -static u8 rtnl_xdp_attached_mode(struct net_device *dev, u32 *prog_id)
+ -{
+ -	const struct net_device_ops *ops = dev->netdev_ops;
+ -	const struct bpf_prog *generic_xdp_prog;
+ -
+ -	ASSERT_RTNL();
+ -
+ -	*prog_id = 0;
+ -	generic_xdp_prog = rtnl_dereference(dev->xdp_prog);
+ -	if (generic_xdp_prog) {
+ -		*prog_id = generic_xdp_prog->aux->id;
+ -		return XDP_ATTACHED_SKB;
+ -	}
+ -	if (!ops->ndo_xdp)
+ -		return XDP_ATTACHED_NONE;
+ -
+ -	return __dev_xdp_attached(dev, ops->ndo_xdp, prog_id);
+ -}
+ -
+ -static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
+ -{
+ -	struct nlattr *xdp;
+ -	u32 prog_id;
+ -	int err;
+ -
+ -	xdp = nla_nest_start(skb, IFLA_XDP);
+ -	if (!xdp)
+ -		return -EMSGSIZE;
+ -
+ -	err = nla_put_u8(skb, IFLA_XDP_ATTACHED,
+ -			 rtnl_xdp_attached_mode(dev, &prog_id));
+ -	if (err)
+ -		goto err_cancel;
+ -
+ -	if (prog_id) {
+ -		err = nla_put_u32(skb, IFLA_XDP_PROG_ID, prog_id);
+ -		if (err)
+ -			goto err_cancel;
+ -	}
+ -
+ -	nla_nest_end(skb, xdp);
+ -	return 0;
+ -
+ -err_cancel:
+ -	nla_nest_cancel(skb, xdp);
+ -	return err;
+ -}
+ -
+ -static u32 rtnl_get_event(unsigned long event)
+ -{
+ -	u32 rtnl_event_type = IFLA_EVENT_NONE;
+ -
+ -	switch (event) {
+ -	case NETDEV_REBOOT:
+ -		rtnl_event_type = IFLA_EVENT_REBOOT;
+ -		break;
+ -	case NETDEV_FEAT_CHANGE:
+ -		rtnl_event_type = IFLA_EVENT_FEATURES;
+ -		break;
+ -	case NETDEV_BONDING_FAILOVER:
+ -		rtnl_event_type = IFLA_EVENT_BONDING_FAILOVER;
+ -		break;
+ -	case NETDEV_NOTIFY_PEERS:
+ -		rtnl_event_type = IFLA_EVENT_NOTIFY_PEERS;
+ -		break;
+ -	case NETDEV_RESEND_IGMP:
+ -		rtnl_event_type = IFLA_EVENT_IGMP_RESEND;
+ -		break;
+ -	case NETDEV_CHANGEINFODATA:
+ -		rtnl_event_type = IFLA_EVENT_BONDING_OPTIONS;
+ -		break;
+ -	default:
+ -		break;
+ -	}
+ -
+ -	return rtnl_event_type;
+ -}
+ -
+ -static int put_master_ifindex(struct sk_buff *skb, struct net_device *dev)
+ -{
+ -	const struct net_device *upper_dev;
+ -	int ret = 0;
+ -
+ -	rcu_read_lock();
+ -
+ -	upper_dev = netdev_master_upper_dev_get_rcu(dev);
+ -	if (upper_dev)
+ -		ret = nla_put_u32(skb, IFLA_MASTER, upper_dev->ifindex);
+ -
+ -	rcu_read_unlock();
+ -	return ret;
+ -}
+ -
+ -static int nla_put_iflink(struct sk_buff *skb, const struct net_device *dev)
+ -{
+ -	int ifindex = dev_get_iflink(dev);
+ -
+ -	if (dev->ifindex == ifindex)
+ -		return 0;
+ -
+ -	return nla_put_u32(skb, IFLA_LINK, ifindex);
+ -}
+ -
+ -static noinline_for_stack int nla_put_ifalias(struct sk_buff *skb,
+ -					      struct net_device *dev)
+ -{
+ -	char buf[IFALIASZ];
+ -	int ret;
+ -
+ -	ret = dev_get_alias(dev, buf, sizeof(buf));
+ -	return ret > 0 ? nla_put_string(skb, IFLA_IFALIAS, buf) : 0;
+ -}
+ -
+ -static int rtnl_fill_link_netnsid(struct sk_buff *skb,
+ -				  const struct net_device *dev)
+ -{
+ -	if (dev->rtnl_link_ops && dev->rtnl_link_ops->get_link_net) {
+ -		struct net *link_net = dev->rtnl_link_ops->get_link_net(dev);
+ -
+ -		if (!net_eq(dev_net(dev), link_net)) {
+ -			int id = peernet2id_alloc(dev_net(dev), link_net);
+ -
+ -			if (nla_put_s32(skb, IFLA_LINK_NETNSID, id))
+ -				return -EMSGSIZE;
+ -		}
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+  static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+  			    int type, u32 pid, u32 seq, u32 change,
+++<<<<<<< HEAD
+ +			    unsigned int flags, u32 ext_filter_mask)
+++=======
++ 			    unsigned int flags, u32 ext_filter_mask,
++ 			    u32 event, int *new_nsid)
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  {
+  	struct ifinfomsg *ifm;
+  	struct nlmsghdr *nlh;
+@@@ -1320,18 -1470,13 +1331,22 @@@
+  			goto nla_put_failure;
+  	}
+  
+ -	if (rtnl_fill_link_netnsid(skb, dev))
+ -		goto nla_put_failure;
+ +	if (dev->rtnl_link_ops &&
+ +	    dev->rtnl_link_ops->get_link_net) {
+ +		struct net *link_net = dev->rtnl_link_ops->get_link_net(dev);
+ +
+ +		if (!net_eq(dev_net(dev), link_net)) {
+ +			int id = peernet2id_alloc(dev_net(dev), link_net);
+ +
+ +			if (nla_put_s32(skb, IFLA_LINK_NETNSID, id))
+ +				goto nla_put_failure;
+ +		}
+ +	}
+  
++ 	if (new_nsid &&
++ 	    nla_put_s32(skb, IFLA_NEW_NETNSID, *new_nsid) < 0)
++ 		goto nla_put_failure;
++ 
+  	if (!(af_spec = nla_nest_start(skb, IFLA_AF_SPEC)))
+  		goto nla_put_failure;
+  
+@@@ -1489,17 -1705,15 +1504,22 @@@ static int rtnl_dump_ifinfo(struct sk_b
+  			err = rtnl_fill_ifinfo(skb, dev, RTM_NEWLINK,
+  					       NETLINK_CB(cb->skb).portid,
+  					       cb->nlh->nlmsg_seq, 0,
+++<<<<<<< HEAD
+ +					       NLM_F_MULTI,
+ +					       ext_filter_mask);
+ +			/* If we ran out of room on the first message,
+ +			 * we're in trouble
+ +			 */
+ +			WARN_ON((err == -EMSGSIZE) && (skb->len == 0));
+++=======
++ 					       flags,
++ 					       ext_filter_mask, 0, NULL);
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  
+ -			if (err < 0) {
+ -				if (likely(skb->len))
+ -					goto out;
+ +			if (err < 0)
+ +				goto out;
+  
+ -				goto out_err;
+ -			}
+ +			nl_dump_check_consistent(cb, nlmsg_hdr(skb));
+  cont:
+  			idx++;
+  		}
+@@@ -2522,7 -2813,7 +2542,11 @@@ static int rtnl_getlink(struct sk_buff 
+  		return -ENOBUFS;
+  
+  	err = rtnl_fill_ifinfo(nskb, dev, RTM_NEWLINK, NETLINK_CB(skb).portid,
+++<<<<<<< HEAD
+ +			       nlh->nlmsg_seq, 0, 0, ext_filter_mask);
+++=======
++ 			       nlh->nlmsg_seq, 0, 0, ext_filter_mask, 0, NULL);
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  	if (err < 0) {
+  		/* -EMSGSIZE implies BUG in if_nlmsg_size */
+  		WARN_ON(err == -EMSGSIZE);
+@@@ -2594,7 -2897,8 +2618,12 @@@ static int rtnl_dump_all(struct sk_buf
+  }
+  
+  struct sk_buff *rtmsg_ifinfo_build_skb(int type, struct net_device *dev,
+++<<<<<<< HEAD
+ +				       unsigned int change, gfp_t flags)
+++=======
++ 				       unsigned int change,
++ 				       u32 event, gfp_t flags, int *new_nsid)
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  {
+  	struct net *net = dev_net(dev);
+  	struct sk_buff *skb;
+@@@ -2605,7 -2909,8 +2634,12 @@@
+  	if (skb == NULL)
+  		goto errout;
+  
+++<<<<<<< HEAD
+ +	err = rtnl_fill_ifinfo(skb, dev, type, 0, 0, change, 0, 0);
+++=======
++ 	err = rtnl_fill_ifinfo(skb, dev, type, 0, 0, change, 0, 0, event,
++ 			       new_nsid);
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  	if (err < 0) {
+  		/* -EMSGSIZE implies BUG in if_nlmsg_size() */
+  		WARN_ON(err == -EMSGSIZE);
+@@@ -2626,20 -2931,34 +2660,46 @@@ void rtmsg_ifinfo_send(struct sk_buff *
+  	rtnl_notify(skb, net, 0, RTNLGRP_LINK, NULL, flags);
+  }
+  
+++<<<<<<< HEAD
+ +void rtmsg_ifinfo(int type, struct net_device *dev, unsigned int change,
+ +		  gfp_t flags)
+++=======
++ static void rtmsg_ifinfo_event(int type, struct net_device *dev,
++ 			       unsigned int change, u32 event,
++ 			       gfp_t flags, int *new_nsid)
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  {
+  	struct sk_buff *skb;
+  
+  	if (dev->reg_state != NETREG_REGISTERED)
+  		return;
+  
+++<<<<<<< HEAD
+ +	skb = rtmsg_ifinfo_build_skb(type, dev, change, flags);
+ +	if (skb)
+ +		rtmsg_ifinfo_send(skb, dev, flags);
+ +}
+++=======
++ 	skb = rtmsg_ifinfo_build_skb(type, dev, change, event, flags, new_nsid);
++ 	if (skb)
++ 		rtmsg_ifinfo_send(skb, dev, flags);
++ }
++ 
++ void rtmsg_ifinfo(int type, struct net_device *dev, unsigned int change,
++ 		  gfp_t flags)
++ {
++ 	rtmsg_ifinfo_event(type, dev, change, rtnl_get_event(0), flags, NULL);
++ }
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  EXPORT_SYMBOL(rtmsg_ifinfo);
+  
++ void rtmsg_ifinfo_newnet(int type, struct net_device *dev, unsigned int change,
++ 			 gfp_t flags, int *new_nsid)
++ {
++ 	rtmsg_ifinfo_event(type, dev, change, rtnl_get_event(0), flags,
++ 			   new_nsid);
++ }
++ 
+  static int nlmsg_populate_fdb_fill(struct sk_buff *skb,
+  				   struct net_device *dev,
+  				   u8 *addr, u16 vid, u32 pid, u32 seq,
+@@@ -3923,12 -4330,11 +3983,17 @@@ static int rtnetlink_event(struct notif
+  	case NETDEV_CHANGENAME:
+  	case NETDEV_FEAT_CHANGE:
+  	case NETDEV_BONDING_FAILOVER:
+ +	case NETDEV_POST_TYPE_CHANGE:
+  	case NETDEV_NOTIFY_PEERS:
+ +	case NETDEV_CHANGEUPPER:
+  	case NETDEV_RESEND_IGMP:
+  	case NETDEV_CHANGEINFODATA:
+++<<<<<<< HEAD
+ +		rtmsg_ifinfo(RTM_NEWLINK, dev, 0, GFP_KERNEL);
+++=======
++ 		rtmsg_ifinfo_event(RTM_NEWLINK, dev, 0, rtnl_get_event(event),
++ 				   GFP_KERNEL, NULL);
+++>>>>>>> 6621dd29eb9b (dev: advertise the new nsid when the netns iface changes)
+  		break;
+  	default:
+  		break;
+* Unmerged path include/linux/rtnetlink.h
+* Unmerged path include/uapi/linux/if_link.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/rtnetlink.c
