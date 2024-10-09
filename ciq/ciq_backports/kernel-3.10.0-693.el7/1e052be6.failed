@@ -1,0 +1,507 @@
+net_sched: destroy proto tp when all filters are gone
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: destroy proto tp when all filters are gone (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 96.08%
+commit-author Cong Wang <cwang@twopensource.com>
+commit 1e052be69d045c8d0f82ff1116fd3e5a79661745
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1e052be6.failed
+
+Kernel automatically creates a tp for each
+(kind, protocol, priority) tuple, which has handle 0,
+when we add a new filter, but it still is left there
+after we remove our own, unless we don't specify the
+handle (literally means all the filters under
+the tuple). For example this one is left:
+
+  # tc filter show dev eth0
+  filter parent 8001: protocol arp pref 49152 basic
+
+The user-space is hard to clean up these for kernel
+because filters like u32 are organized in a complex way.
+So kernel is responsible to remove it after all filters
+are gone.  Each type of filter has its own way to
+store the filters, so each type has to provide its
+way to check if all filters are gone.
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <cwang@twopensource.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim<jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1e052be69d045c8d0f82ff1116fd3e5a79661745)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_bpf.c
+#	net/sched/cls_fw.c
+#	net/sched/cls_route.c
+#	net/sched/sch_api.c
+diff --cc include/net/sch_generic.h
+index 96bed6f81e99,6d778efcfdfd..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -397,8 -399,8 +397,13 @@@ struct Qdisc *qdisc_create_dflt(struct 
+  				const struct Qdisc_ops *ops, u32 parentid);
+  void __qdisc_calculate_pkt_len(struct sk_buff *skb,
+  			       const struct qdisc_size_table *stab);
+++<<<<<<< HEAD
+ +void tcf_destroy(struct tcf_proto *tp);
+ +void tcf_destroy_chain(struct tcf_proto **fl);
+++=======
++ bool tcf_destroy(struct tcf_proto *tp, bool force);
++ void tcf_destroy_chain(struct tcf_proto __rcu **fl);
+++>>>>>>> 1e052be69d04 (net_sched: destroy proto tp when all filters are gone)
+  
+  /* Reset all TX qdiscs greater then index of a device.  */
+  static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
+diff --cc net/sched/cls_bpf.c
+index 95b1641cf7a7,243c9f225a73..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -98,36 -119,41 +98,45 @@@ static void cls_bpf_delete_prog(struct 
+  	kfree(prog);
+  }
+  
+ -static void __cls_bpf_delete_prog(struct rcu_head *rcu)
+ -{
+ -	struct cls_bpf_prog *prog = container_of(rcu, struct cls_bpf_prog, rcu);
+ -
+ -	cls_bpf_delete_prog(prog->tp, prog);
+ -}
+ -
+  static int cls_bpf_delete(struct tcf_proto *tp, unsigned long arg)
+  {
+ -	struct cls_bpf_prog *prog = (struct cls_bpf_prog *) arg;
+ +	struct cls_bpf_head *head = tp->root;
+ +	struct cls_bpf_prog *prog, *todel = (struct cls_bpf_prog *) arg;
+  
+ -	list_del_rcu(&prog->link);
+ -	tcf_unbind_filter(tp, &prog->res);
+ -	call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+ +	list_for_each_entry(prog, &head->plist, link) {
+ +		if (prog == todel) {
+ +			tcf_tree_lock(tp);
+ +			list_del(&prog->link);
+ +			tcf_tree_unlock(tp);
+  
+ -	return 0;
+ +			cls_bpf_delete_prog(tp, prog);
+ +			return 0;
+ +		}
+ +	}
+ +
+ +	return -ENOENT;
+  }
+  
+- static void cls_bpf_destroy(struct tcf_proto *tp)
++ static bool cls_bpf_destroy(struct tcf_proto *tp, bool force)
+  {
+ -	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+ +	struct cls_bpf_head *head = tp->root;
+  	struct cls_bpf_prog *prog, *tmp;
+  
++ 	if (!force && !list_empty(&head->plist))
++ 		return false;
++ 
+  	list_for_each_entry_safe(prog, tmp, &head->plist, link) {
+ -		list_del_rcu(&prog->link);
+ -		tcf_unbind_filter(tp, &prog->res);
+ -		call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+ +		list_del(&prog->link);
+ +		cls_bpf_delete_prog(tp, prog);
+  	}
+  
+++<<<<<<< HEAD
+ +	kfree(head);
+++=======
++ 	RCU_INIT_POINTER(tp->root, NULL);
++ 	kfree_rcu(head, rcu);
++ 	return true;
+++>>>>>>> 1e052be69d04 (net_sched: destroy proto tp when all filters are gone)
+  }
+  
+  static unsigned long cls_bpf_get(struct tcf_proto *tp, u32 handle)
+diff --cc net/sched/cls_fw.c
+index 87e4b3371637,715e01e5910a..000000000000
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@@ -117,22 -133,32 +117,34 @@@ static void fw_delete_filter(struct tcf
+  	kfree(f);
+  }
+  
+- static void fw_destroy(struct tcf_proto *tp)
++ static bool fw_destroy(struct tcf_proto *tp, bool force)
+  {
+ -	struct fw_head *head = rtnl_dereference(tp->root);
+ +	struct fw_head *head = tp->root;
+  	struct fw_filter *f;
+  	int h;
+  
+  	if (head == NULL)
+- 		return;
++ 		return true;
++ 
++ 	if (!force) {
++ 		for (h = 0; h < HTSIZE; h++)
++ 			if (rcu_access_pointer(head->ht[h]))
++ 				return false;
++ 	}
+  
+  	for (h = 0; h < HTSIZE; h++) {
+ -		while ((f = rtnl_dereference(head->ht[h])) != NULL) {
+ -			RCU_INIT_POINTER(head->ht[h],
+ -					 rtnl_dereference(f->next));
+ -			tcf_unbind_filter(tp, &f->res);
+ -			call_rcu(&f->rcu, fw_delete_filter);
+ +		while ((f = head->ht[h]) != NULL) {
+ +			head->ht[h] = f->next;
+ +			fw_delete_filter(tp, f);
+  		}
+  	}
+++<<<<<<< HEAD
+ +	kfree(head);
+++=======
++ 	RCU_INIT_POINTER(tp->root, NULL);
++ 	kfree_rcu(head, rcu);
++ 	return true;
+++>>>>>>> 1e052be69d04 (net_sched: destroy proto tp when all filters are gone)
+  }
+  
+  static int fw_delete(struct tcf_proto *tp, unsigned long arg)
+diff --cc net/sched/cls_route.c
+index fa6aa85d5903,08a3b0a6f5ab..000000000000
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@@ -251,9 -277,9 +251,9 @@@ route4_delete_filter(struct tcf_proto *
+  	kfree(f);
+  }
+  
+- static void route4_destroy(struct tcf_proto *tp)
++ static bool route4_destroy(struct tcf_proto *tp, bool force)
+  {
+ -	struct route4_head *head = rtnl_dereference(tp->root);
+ +	struct route4_head *head = tp->root;
+  	int h1, h2;
+  
+  	if (head == NULL)
+@@@ -267,15 -300,22 +274,21 @@@
+  			for (h2 = 0; h2 <= 32; h2++) {
+  				struct route4_filter *f;
+  
+ -				while ((f = rtnl_dereference(b->ht[h2])) != NULL) {
+ -					struct route4_filter *next;
+ -
+ -					next = rtnl_dereference(f->next);
+ -					RCU_INIT_POINTER(b->ht[h2], next);
+ -					tcf_unbind_filter(tp, &f->res);
+ -					call_rcu(&f->rcu, route4_delete_filter);
+ +				while ((f = b->ht[h2]) != NULL) {
+ +					b->ht[h2] = f->next;
+ +					route4_delete_filter(tp, f);
+  				}
+  			}
+ -			RCU_INIT_POINTER(head->table[h1], NULL);
+ -			kfree_rcu(b, rcu);
+ +			kfree(b);
+  		}
+  	}
+++<<<<<<< HEAD
+ +	kfree(head);
+++=======
++ 	RCU_INIT_POINTER(tp->root, NULL);
++ 	kfree_rcu(head, rcu);
++ 	return true;
+++>>>>>>> 1e052be69d04 (net_sched: destroy proto tp when all filters are gone)
+  }
+  
+  static int route4_delete(struct tcf_proto *tp, unsigned long arg)
+diff --cc net/sched/sch_api.c
+index ba6b51bc1c21,ad9eed70bc8f..000000000000
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@@ -1826,20 -1858,24 +1826,36 @@@ reclassify
+  }
+  EXPORT_SYMBOL(tc_classify);
+  
+- void tcf_destroy(struct tcf_proto *tp)
++ bool tcf_destroy(struct tcf_proto *tp, bool force)
+  {
+++<<<<<<< HEAD
+ +	tp->ops->destroy(tp);
+ +	module_put(tp->ops->owner);
+ +	kfree(tp);
+++=======
++ 	if (tp->ops->destroy(tp, force)) {
++ 		module_put(tp->ops->owner);
++ 		kfree_rcu(tp, rcu);
++ 		return true;
++ 	}
++ 
++ 	return false;
+++>>>>>>> 1e052be69d04 (net_sched: destroy proto tp when all filters are gone)
+  }
+  
+ -void tcf_destroy_chain(struct tcf_proto __rcu **fl)
+ +void tcf_destroy_chain(struct tcf_proto **fl)
+  {
+  	struct tcf_proto *tp;
+  
+++<<<<<<< HEAD
+ +	while ((tp = *fl) != NULL) {
+ +		*fl = tp->next;
+ +		tcf_destroy(tp);
+++=======
++ 	while ((tp = rtnl_dereference(*fl)) != NULL) {
++ 		RCU_INIT_POINTER(*fl, tp->next);
++ 		tcf_destroy(tp, true);
+++>>>>>>> 1e052be69d04 (net_sched: destroy proto tp when all filters are gone)
+  	}
+  }
+  EXPORT_SYMBOL(tcf_destroy_chain);
+* Unmerged path include/net/sch_generic.h
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index a79e83e16a99..026773fe1b7c 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -289,7 +289,7 @@ replay:
+ 			spin_unlock_bh(root_lock);
+ 
+ 			tfilter_notify(net, skb, n, tp, fh, RTM_DELTFILTER);
+-			tcf_destroy(tp);
++			tcf_destroy(tp, true);
+ 			err = 0;
+ 			goto errout;
+ 		}
+@@ -304,14 +304,20 @@ replay:
+ 			err = -EEXIST;
+ 			if (n->nlmsg_flags & NLM_F_EXCL) {
+ 				if (tp_created)
+-					tcf_destroy(tp);
++					tcf_destroy(tp, true);
+ 				goto errout;
+ 			}
+ 			break;
+ 		case RTM_DELTFILTER:
+ 			err = tp->ops->delete(tp, fh);
+-			if (err == 0)
++			if (err == 0) {
+ 				tfilter_notify(net, skb, n, tp, fh, RTM_DELTFILTER);
++				if (tcf_destroy(tp, false)) {
++					struct tcf_proto *next = rtnl_dereference(tp->next);
++
++					RCU_INIT_POINTER(*back, next);
++				}
++			}
+ 			goto errout;
+ 		case RTM_GETTFILTER:
+ 			err = tfilter_notify(net, skb, n, tp, fh, RTM_NEWTFILTER);
+@@ -334,7 +340,7 @@ replay:
+ 		tfilter_notify(net, skb, n, tp, fh, RTM_NEWTFILTER);
+ 	} else {
+ 		if (tp_created)
+-			tcf_destroy(tp);
++			tcf_destroy(tp, true);
+ 	}
+ 
+ errout:
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+index 25b9d1f2b7da..f993a4719004 100644
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -95,17 +95,21 @@ static void basic_delete_filter(struct rcu_head *head)
+ 	kfree(f);
+ }
+ 
+-static void basic_destroy(struct tcf_proto *tp)
++static bool basic_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct basic_head *head = rtnl_dereference(tp->root);
+ 	struct basic_filter *f, *n;
+ 
++	if (!force && !list_empty(&head->flist))
++		return false;
++
+ 	list_for_each_entry_safe(f, n, &head->flist, link) {
+ 		list_del_rcu(&f->link);
+ 		call_rcu(&f->rcu, basic_delete_filter);
+ 	}
+ 	RCU_INIT_POINTER(tp->root, NULL);
+ 	kfree_rcu(head, rcu);
++	return true;
+ }
+ 
+ static int basic_delete(struct tcf_proto *tp, unsigned long arg)
+* Unmerged path net/sched/cls_bpf.c
+diff --git a/net/sched/cls_cgroup.c b/net/sched/cls_cgroup.c
+index 6b171a77e6b8..2050a0df319c 100644
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -236,16 +236,20 @@ errout:
+ 	return err;
+ }
+ 
+-static void cls_cgroup_destroy(struct tcf_proto *tp)
++static bool cls_cgroup_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct cls_cgroup_head *head = rtnl_dereference(tp->root);
+ 
++	if (!force)
++		return false;
++
+ 	if (head) {
+ 		tcf_exts_destroy(&head->exts);
+ 		tcf_em_tree_destroy(tp, &head->ematches);
+ 		RCU_INIT_POINTER(tp->root, NULL);
+ 		kfree_rcu(head, rcu);
+ 	}
++	return true;
+ }
+ 
+ static int cls_cgroup_delete(struct tcf_proto *tp, unsigned long arg)
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index c999e8f9936b..424fe96b3761 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -558,17 +558,21 @@ static int flow_init(struct tcf_proto *tp)
+ 	return 0;
+ }
+ 
+-static void flow_destroy(struct tcf_proto *tp)
++static bool flow_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct flow_head *head = rtnl_dereference(tp->root);
+ 	struct flow_filter *f, *next;
+ 
++	if (!force && !list_empty(&head->filters))
++		return false;
++
+ 	list_for_each_entry_safe(f, next, &head->filters, list) {
+ 		list_del_rcu(&f->list);
+ 		call_rcu(&f->rcu, flow_destroy_filter);
+ 	}
+ 	RCU_INIT_POINTER(tp->root, NULL);
+ 	kfree_rcu(head, rcu);
++	return true;
+ }
+ 
+ static unsigned long flow_get(struct tcf_proto *tp, u32 handle)
+* Unmerged path net/sched/cls_fw.c
+* Unmerged path net/sched/cls_route.c
+diff --git a/net/sched/cls_rsvp.h b/net/sched/cls_rsvp.h
+index 5ec718691e80..a7a9813893bd 100644
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -264,13 +264,20 @@ rsvp_delete_filter(struct tcf_proto *tp, struct rsvp_filter *f)
+ 	kfree_rcu(f, rcu);
+ }
+ 
+-static void rsvp_destroy(struct tcf_proto *tp)
++static bool rsvp_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct rsvp_head *data = rtnl_dereference(tp->root);
+ 	int h1, h2;
+ 
+ 	if (data == NULL)
+-		return;
++		return true;
++
++	if (!force) {
++		for (h1 = 0; h1 < 256; h1++) {
++			if (rcu_access_pointer(data->ht[h1]))
++				return false;
++		}
++	}
+ 
+ 	RCU_INIT_POINTER(tp->root, NULL);
+ 
+@@ -292,6 +299,7 @@ static void rsvp_destroy(struct tcf_proto *tp)
+ 		}
+ 	}
+ 	kfree_rcu(data, rcu);
++	return true;
+ }
+ 
+ static int rsvp_delete(struct tcf_proto *tp, unsigned long arg)
+diff --git a/net/sched/cls_tcindex.c b/net/sched/cls_tcindex.c
+index fcae64bf7721..e011edf8ff76 100644
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -462,11 +462,14 @@ static void tcindex_walk(struct tcf_proto *tp, struct tcf_walker *walker)
+ 	}
+ }
+ 
+-static void tcindex_destroy(struct tcf_proto *tp)
++static bool tcindex_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct tcindex_data *p = rtnl_dereference(tp->root);
+ 	struct tcf_walker walker;
+ 
++	if (!force)
++		return false;
++
+ 	pr_debug("tcindex_destroy(tp %p),p %p\n", tp, p);
+ 	walker.count = 0;
+ 	walker.skip = 0;
+@@ -475,6 +478,7 @@ static void tcindex_destroy(struct tcf_proto *tp)
+ 
+ 	RCU_INIT_POINTER(tp->root, NULL);
+ 	call_rcu(&p->rcu, __tcindex_destroy);
++	return true;
+ }
+ 
+ 
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+index 1311b04273a5..ca670d2c31da 100644
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -430,13 +430,35 @@ static int u32_destroy_hnode(struct tcf_proto *tp, struct tc_u_hnode *ht)
+ 	return -ENOENT;
+ }
+ 
+-static void u32_destroy(struct tcf_proto *tp)
++static bool ht_empty(struct tc_u_hnode *ht)
++{
++	unsigned int h;
++
++	for (h = 0; h <= ht->divisor; h++)
++		if (rcu_access_pointer(ht->ht[h]))
++			return false;
++
++	return true;
++}
++
++static bool u32_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct tc_u_common *tp_c = tp->data;
+ 	struct tc_u_hnode *root_ht = rtnl_dereference(tp->root);
+ 
+ 	WARN_ON(root_ht == NULL);
+ 
++	if (!force) {
++		if (root_ht) {
++			if (root_ht->refcnt > 1)
++				return false;
++			if (root_ht->refcnt == 1) {
++				if (!ht_empty(root_ht))
++					return false;
++			}
++		}
++	}
++
+ 	if (root_ht && --root_ht->refcnt == 0)
+ 		u32_destroy_hnode(tp, root_ht);
+ 
+@@ -461,6 +483,7 @@ static void u32_destroy(struct tcf_proto *tp)
+ 	}
+ 
+ 	tp->data = NULL;
++	return true;
+ }
+ 
+ static int u32_delete(struct tcf_proto *tp, unsigned long arg)
+* Unmerged path net/sched/sch_api.c
