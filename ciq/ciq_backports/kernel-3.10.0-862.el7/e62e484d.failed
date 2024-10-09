@@ -1,0 +1,291 @@
+net sched actions: add time filter for action dumping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: actions: add time filter for action dumping (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 95.15%
+commit-author Jamal Hadi Salim <jhs@mojatatu.com>
+commit e62e484df04964ac947c679ef4f00c54ae5395aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e62e484d.failed
+
+This patch adds support for filtering based on time since last used.
+When we are dumping a large number of actions it is useful to
+have the option of filtering based on when the action was last
+used to reduce the amount of data crossing to user space.
+
+With this patch the user space app sets the TCA_ROOT_TIME_DELTA
+attribute with the value in milliseconds with "time of interest
+since now".  The kernel converts this to jiffies and does the
+filtering comparison matching entries that have seen activity
+since then and returns them to user space.
+Old kernels and old tc continue to work in legacy mode since
+they dont specify this attribute.
+
+Some example (we have 400 actions bound to 400 filters); at
+installation time. Using updated when tc setting the time of
+interest to 120 seconds earlier (we see 400 actions):
+prompt$ hackedtc actions ls action gact since 120000| grep index | wc -l
+400
+
+go get some coffee and wait for > 120 seconds and try again:
+
+prompt$ hackedtc actions ls action gact since 120000 | grep index | wc -l
+0
+
+Lets see a filter bound to one of these actions:
+....
+filter pref 10 u32
+filter pref 10 u32 fh 800: ht divisor 1
+filter pref 10 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:10  (rule hit 2 success 1)
+  match 7f000002/ffffffff at 12 (success 1 )
+    action order 1: gact action pass
+     random type none pass val 0
+     index 23 ref 2 bind 1 installed 1145 sec used 802 sec
+    Action statistics:
+    Sent 84 bytes 1 pkt (dropped 0, overlimits 0 requeues 0)
+    backlog 0b 0p requeues 0
+....
+
+that coffee took long, no? It was good.
+
+Now lets ping -c 1 127.0.0.2, then run the actions again:
+prompt$ hackedtc actions ls action gact since 120 | grep index | wc -l
+1
+
+More details please:
+prompt$ hackedtc -s actions ls action gact since 120000
+
+    action order 0: gact action pass
+     random type none pass val 0
+     index 23 ref 2 bind 1 installed 1270 sec used 30 sec
+    Action statistics:
+    Sent 168 bytes 2 pkt (dropped 0, overlimits 0 requeues 0)
+    backlog 0b 0p requeues 0
+
+And the filter?
+
+filter pref 10 u32
+filter pref 10 u32 fh 800: ht divisor 1
+filter pref 10 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:10  (rule hit 4 success 2)
+  match 7f000002/ffffffff at 12 (success 2 )
+    action order 1: gact action pass
+     random type none pass val 0
+     index 23 ref 2 bind 1 installed 1324 sec used 84 sec
+    Action statistics:
+    Sent 168 bytes 2 pkt (dropped 0, overlimits 0 requeues 0)
+    backlog 0b 0p requeues 0
+
+	Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e62e484df04964ac947c679ef4f00c54ae5395aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/rtnetlink.h
+#	net/sched/act_api.c
+diff --cc include/uapi/linux/rtnetlink.h
+index d8701000036f,dab7dad9e01a..000000000000
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@@ -661,10 -683,29 +661,26 @@@ struct tcamsg 
+  	unsigned char	tca__pad1;
+  	unsigned short	tca__pad2;
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ enum {
++ 	TCA_ROOT_UNSPEC,
++ 	TCA_ROOT_TAB,
++ #define TCA_ACT_TAB TCA_ROOT_TAB
++ #define TCAA_MAX TCA_ROOT_TAB
++ 	TCA_ROOT_FLAGS,
++ 	TCA_ROOT_COUNT,
++ 	TCA_ROOT_TIME_DELTA, /* in msecs */
++ 	__TCA_ROOT_MAX,
++ #define	TCA_ROOT_MAX (__TCA_ROOT_MAX - 1)
++ };
++ 
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  #define TA_RTA(r)  ((struct rtattr*)(((char*)(r)) + NLMSG_ALIGN(sizeof(struct tcamsg))))
+  #define TA_PAYLOAD(n) NLMSG_PAYLOAD(n,sizeof(struct tcamsg))
+ -/* tcamsg flags stored in attribute TCA_ROOT_FLAGS
+ - *
+ - * TCA_FLAG_LARGE_DUMP_ON user->kernel to request for larger than TCA_ACT_MAX_PRIO
+ - * actions in a dump. All dump responses will contain the number of actions
+ - * being dumped stored in for user app's consumption in TCA_ROOT_COUNT
+ - *
+ - */
+ -#define TCA_FLAG_LARGE_DUMP_ON		(1 << 0)
+ +#define TCA_ACT_TAB 1 /* attr type must be >=1 */	
+ +#define TCAA_MAX 1
+  
+  /* New extended info filters for IFLA_EXT_MASK */
+  #define RTEXT_FILTER_VF		(1 << 0)
+diff --cc net/sched/act_api.c
+index f6d266c05d33,f19b118df414..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -84,13 -106,12 +84,18 @@@ int __tcf_hash_release(struct tc_actio
+  }
+  EXPORT_SYMBOL(__tcf_hash_release);
+  
+ -static int tcf_dump_walker(struct tcf_hashinfo *hinfo, struct sk_buff *skb,
+ -			   struct netlink_callback *cb)
+ +static int tcf_dump_walker(struct sk_buff *skb, struct netlink_callback *cb,
+ +			   struct tc_action *a)
+  {
+ +	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+ +	struct hlist_head *head;
+ +	struct tcf_common *p;
+  	int err = 0, index = -1, i = 0, s_i = 0, n_i = 0;
+++<<<<<<< HEAD
+++=======
++ 	u32 act_flags = cb->args[2];
++ 	unsigned long jiffy_since = cb->args[3];
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  	struct nlattr *nest;
+  
+  	spin_lock_bh(&hinfo->lock);
+@@@ -104,13 -128,16 +109,22 @@@
+  			index++;
+  			if (index < s_i)
+  				continue;
+ +			a->priv = p;
+ +			a->order = n_i;
+  
+++<<<<<<< HEAD
+ +			nest = nla_nest_start(skb, a->order);
+++=======
++ 			if (jiffy_since &&
++ 			    time_after(jiffy_since,
++ 				       (unsigned long)p->tcfa_tm.lastuse))
++ 				continue;
++ 
++ 			nest = nla_nest_start(skb, n_i);
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  			if (nest == NULL)
+  				goto nla_put_failure;
+ -			err = tcf_action_dump_1(skb, p, 0, 0);
+ +			err = tcf_action_dump_1(skb, a, 0, 0);
+  			if (err < 0) {
+  				index--;
+  				nlmsg_trim(skb, nest);
+@@@ -123,9 -151,14 +137,19 @@@
+  		}
+  	}
+  done:
++ 	if (index >= 0)
++ 		cb->args[0] = index + 1;
++ 
+  	spin_unlock_bh(&hinfo->lock);
+++<<<<<<< HEAD
+ +	if (n_i)
+ +		cb->args[0] += n_i;
+++=======
++ 	if (n_i) {
++ 		if (act_flags & TCA_FLAG_LARGE_DUMP_ON)
++ 			cb->args[1] = n_i;
++ 	}
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  	return n_i;
+  
+  nla_put_failure:
+@@@ -1056,10 -1081,18 +1080,22 @@@ static int tcf_action_add(struct net *n
+  	return tcf_add_notify(net, n, &actions, portid);
+  }
+  
+++<<<<<<< HEAD
+ +static int tc_ctl_action(struct sk_buff *skb, struct nlmsghdr *n)
+++=======
++ static u32 tcaa_root_flags_allowed = TCA_FLAG_LARGE_DUMP_ON;
++ static const struct nla_policy tcaa_policy[TCA_ROOT_MAX + 1] = {
++ 	[TCA_ROOT_FLAGS] = { .type = NLA_BITFIELD32,
++ 			     .validation_data = &tcaa_root_flags_allowed },
++ 	[TCA_ROOT_TIME_DELTA]      = { .type = NLA_U32 },
++ };
++ 
++ static int tc_ctl_action(struct sk_buff *skb, struct nlmsghdr *n,
++ 			 struct netlink_ext_ack *extack)
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  {
+  	struct net *net = sock_net(skb->sk);
+ -	struct nlattr *tca[TCA_ROOT_MAX + 1];
+ +	struct nlattr *tca[TCA_ACT_MAX + 1];
+  	u32 portid = skb ? NETLINK_CB(skb).portid : 0;
+  	int ret = 0, ovr = 0;
+  
+@@@ -1139,11 -1171,22 +1175,21 @@@ static int tc_dump_action(struct sk_buf
+  	unsigned char *b = skb_tail_pointer(skb);
+  	struct nlattr *nest;
+  	struct tc_action_ops *a_o;
+ +	struct tc_action a;
+  	int ret = 0;
+  	struct tcamsg *t = (struct tcamsg *) nlmsg_data(cb->nlh);
+++<<<<<<< HEAD
+ +	struct nlattr *kind = find_dump_kind(cb->nlh);
+++=======
++ 	struct nlattr *tb[TCA_ROOT_MAX + 1];
++ 	struct nlattr *count_attr = NULL;
++ 	unsigned long jiffy_since = 0;
++ 	struct nlattr *kind = NULL;
++ 	struct nla_bitfield32 bf;
++ 	u32 msecs_since = 0;
++ 	u32 act_count = 0;
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  
+ -	ret = nlmsg_parse(cb->nlh, sizeof(struct tcamsg), tb, TCA_ROOT_MAX,
+ -			  tcaa_policy, NULL);
+ -	if (ret < 0)
+ -		return ret;
+ -
+ -	kind = find_dump_kind(tb);
+  	if (kind == NULL) {
+  		pr_info("tc_dump_action: action bad kind\n");
+  		return 0;
+@@@ -1153,17 -1196,32 +1199,35 @@@
+  	if (a_o == NULL)
+  		return 0;
+  
+ -	cb->args[2] = 0;
+ -	if (tb[TCA_ROOT_FLAGS]) {
+ -		bf = nla_get_bitfield32(tb[TCA_ROOT_FLAGS]);
+ -		cb->args[2] = bf.value;
+ -	}
+ +	memset(&a, 0, sizeof(struct tc_action));
+ +	a.ops = a_o;
+  
++ 	if (tb[TCA_ROOT_TIME_DELTA]) {
++ 		msecs_since = nla_get_u32(tb[TCA_ROOT_TIME_DELTA]);
++ 	}
++ 
+  	nlh = nlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
+  			cb->nlh->nlmsg_type, sizeof(*t), 0);
+  	if (!nlh)
+  		goto out_module_put;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (msecs_since)
++ 		jiffy_since = jiffies - msecs_to_jiffies(msecs_since);
++ 
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  	t = nlmsg_data(nlh);
+  	t->tca_family = AF_UNSPEC;
+  	t->tca__pad1 = 0;
+  	t->tca__pad2 = 0;
+++<<<<<<< HEAD
+++=======
++ 	cb->args[3] = jiffy_since;
++ 	count_attr = nla_reserve(skb, TCA_ROOT_COUNT, sizeof(u32));
++ 	if (!count_attr)
++ 		goto out_module_put;
+++>>>>>>> e62e484df049 (net sched actions: add time filter for action dumping)
+  
+  	nest = nla_nest_start(skb, TCA_ACT_TAB);
+  	if (nest == NULL)
+* Unmerged path include/uapi/linux/rtnetlink.h
+* Unmerged path net/sched/act_api.c
