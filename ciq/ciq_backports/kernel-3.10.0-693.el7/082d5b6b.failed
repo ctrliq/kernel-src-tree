@@ -1,0 +1,181 @@
+mm/hugetlb: check for reserved hugepages during memory offline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hugetlb: check for reserved hugepages during memory offline (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 97.52%
+commit-author Gerald Schaefer <gerald.schaefer@de.ibm.com>
+commit 082d5b6b60e9f25e1511557fcfcb21eedd267446
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/082d5b6b.failed
+
+In dissolve_free_huge_pages(), free hugepages will be dissolved without
+making sure that there are enough of them left to satisfy hugepage
+reservations.
+
+Fix this by adding a return value to dissolve_free_huge_pages() and
+checking h->free_huge_pages vs.  h->resv_huge_pages.  Note that this may
+lead to the situation where dissolve_free_huge_page() returns an error
+and all free hugepages that were dissolved before that error are lost,
+while the memory block still cannot be set offline.
+
+Fixes: c8721bbb ("mm: memory-hotplug: enable memory hotplug to handle hugepage")
+Link: http://lkml.kernel.org/r/20160926172811.94033-3-gerald.schaefer@de.ibm.com
+	Signed-off-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Rui Teng <rui.teng@linux.vnet.ibm.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 082d5b6b60e9f25e1511557fcfcb21eedd267446)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+#	mm/hugetlb.c
+diff --cc include/linux/hugetlb.h
+index 8b5d86309d4f,fe99e6f956e2..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -410,9 -450,9 +410,15 @@@ static inline pgoff_t basepage_index(st
+  	return __basepage_index(page);
+  }
+  
+++<<<<<<< HEAD
+ +extern void dissolve_free_huge_pages(unsigned long start_pfn,
+ +				     unsigned long end_pfn);
+ +static inline int hugepage_migration_supported(struct hstate *h)
+++=======
++ extern int dissolve_free_huge_pages(unsigned long start_pfn,
++ 				    unsigned long end_pfn);
++ static inline bool hugepage_migration_supported(struct hstate *h)
+++>>>>>>> 082d5b6b60e9 (mm/hugetlb: check for reserved hugepages during memory offline)
+  {
+  #ifdef CONFIG_ARCH_ENABLE_HUGEPAGE_MIGRATION
+  	return huge_page_shift(h) == PMD_SHIFT;
+@@@ -468,8 -518,8 +474,13 @@@ static inline pgoff_t basepage_index(st
+  {
+  	return page->index;
+  }
+++<<<<<<< HEAD
+ +#define dissolve_free_huge_pages(s, e)	do {} while (0)
+ +#define hugepage_migration_supported(h)	0
+++=======
++ #define dissolve_free_huge_pages(s, e)	0
++ #define hugepage_migration_supported(h)	false
+++>>>>>>> 082d5b6b60e9 (mm/hugetlb: check for reserved hugepages during memory offline)
+  
+  static inline spinlock_t *huge_pte_lockptr(struct hstate *h,
+  					   struct mm_struct *mm, pte_t *pte)
+diff --cc mm/hugetlb.c
+index 2c12fc3891a9,91ae1f567997..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1165,41 -1437,55 +1165,78 @@@ static int free_pool_huge_page(struct h
+  
+  /*
+   * Dissolve a given free hugepage into free buddy pages. This function does
+-  * nothing for in-use (including surplus) hugepages.
++  * nothing for in-use (including surplus) hugepages. Returns -EBUSY if the
++  * number of free hugepages would be reduced below the number of reserved
++  * hugepages.
+   */
+- static void dissolve_free_huge_page(struct page *page)
++ static int dissolve_free_huge_page(struct page *page)
+  {
++ 	int rc = 0;
++ 
+  	spin_lock(&hugetlb_lock);
+  	if (PageHuge(page) && !page_count(page)) {
+++<<<<<<< HEAD
+ +		struct hstate *h = page_hstate(page);
+ +		int nid = page_to_nid(page);
+ +		list_del(&page->lru);
+++=======
++ 		struct page *head = compound_head(page);
++ 		struct hstate *h = page_hstate(head);
++ 		int nid = page_to_nid(head);
++ 		if (h->free_huge_pages - h->resv_huge_pages == 0) {
++ 			rc = -EBUSY;
++ 			goto out;
++ 		}
++ 		list_del(&head->lru);
+++>>>>>>> 082d5b6b60e9 (mm/hugetlb: check for reserved hugepages during memory offline)
+  		h->free_huge_pages--;
+  		h->free_huge_pages_node[nid]--;
+  		h->max_huge_pages--;
+ -		update_and_free_page(h, head);
+ +		update_and_free_page(h, page);
+  	}
++ out:
+  	spin_unlock(&hugetlb_lock);
++ 	return rc;
+  }
+  
+  /*
+   * Dissolve free hugepages in a given pfn range. Used by memory hotplug to
+   * make specified memory blocks removable from the system.
+++<<<<<<< HEAD
+ + * Note that start_pfn should aligned with (minimum) hugepage size.
+++=======
++  * Note that this will dissolve a free gigantic hugepage completely, if any
++  * part of it lies within the given range.
++  * Also note that if dissolve_free_huge_page() returns with an error, all
++  * free hugepages that were dissolved before that error are lost.
+++>>>>>>> 082d5b6b60e9 (mm/hugetlb: check for reserved hugepages during memory offline)
+   */
+- void dissolve_free_huge_pages(unsigned long start_pfn, unsigned long end_pfn)
++ int dissolve_free_huge_pages(unsigned long start_pfn, unsigned long end_pfn)
+  {
+ +	unsigned int order = 8 * sizeof(void *);
+  	unsigned long pfn;
+++<<<<<<< HEAD
+ +	struct hstate *h;
+ +
+ +	/* Set scan step to minimum hugepage size */
+ +	for_each_hstate(h)
+ +		if (order > huge_page_order(h))
+ +			order = huge_page_order(h);
+ +	VM_BUG_ON(!IS_ALIGNED(start_pfn, 1 << order));
+ +	for (pfn = start_pfn; pfn < end_pfn; pfn += 1 << order)
+ +		dissolve_free_huge_page(pfn_to_page(pfn));
+++=======
++ 	int rc = 0;
++ 
++ 	if (!hugepages_supported())
++ 		return rc;
++ 
++ 	for (pfn = start_pfn; pfn < end_pfn; pfn += 1 << minimum_order)
++ 		if (rc = dissolve_free_huge_page(pfn_to_page(pfn)))
++ 			break;
++ 
++ 	return rc;
+++>>>>>>> 082d5b6b60e9 (mm/hugetlb: check for reserved hugepages during memory offline)
+  }
+  
+  /*
+* Unmerged path include/linux/hugetlb.h
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 2e547c23b8a5..c2846dad1d2d 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1753,7 +1753,9 @@ repeat:
+ 	 * dissolve free hugepages in the memory block before doing offlining
+ 	 * actually in order to make hugetlbfs's object counting consistent.
+ 	 */
+-	dissolve_free_huge_pages(start_pfn, end_pfn);
++	ret = dissolve_free_huge_pages(start_pfn, end_pfn);
++	if (ret)
++		goto failed_removal;
+ 	/* check again */
+ 	offlined_pages = check_pages_isolated(start_pfn, end_pfn);
+ 	if (offlined_pages < 0) {
