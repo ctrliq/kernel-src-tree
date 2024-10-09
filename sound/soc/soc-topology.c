@@ -1540,6 +1540,7 @@ static void set_stream_info(struct snd_soc_pcm_stream *stream,
 	stream->rate_min = caps->rate_min;
 	stream->rate_max = caps->rate_max;
 	stream->formats = caps->formats;
+	stream->sig_bits = caps->sig_bits;
 }
 
 static int soc_tplg_dai_create(struct soc_tplg *tplg,
