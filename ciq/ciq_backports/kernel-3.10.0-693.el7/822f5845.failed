@@ -1,0 +1,157 @@
+efi/esrt: Cleanup bad memory map log messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Daniel Drake <drake@endlessm.com>
+commit 822f5845f710e57d7e2df1fd1ee00d6e19d334fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/822f5845.failed
+
+The Intel Compute Stick STCK1A8LFC and Weibu F3C platforms both
+log 2 error messages during boot:
+
+   efi: requested map not found.
+   esrt: ESRT header is not in the memory map.
+
+Searching the web, this seems to affect many other platforms too.
+Since these messages are logged as errors, they appear on-screen during
+the boot process even when using the "quiet" boot parameter used by
+distros.
+
+Demote the ESRT error to a warning so that it does not appear on-screen,
+and delete the error logging from efi_mem_desc_lookup; both callsites
+of that function log more specific messages upon failure.
+
+Out of curiosity I looked closer at the Weibu F3C. There is no entry in
+the UEFI-provided memory map which corresponds to the ESRT pointer, but
+hacking the code to map it anyway, the ESRT does appear to be valid with
+2 entries.
+
+	Signed-off-by: Daniel Drake <drake@endlessm.com>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Acked-by: Peter Jones <pjones@redhat.com>
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+(cherry picked from commit 822f5845f710e57d7e2df1fd1ee00d6e19d334fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/efi.c
+#	drivers/firmware/efi/esrt.c
+diff --cc drivers/firmware/efi/efi.c
+index 37d2dbb0efe2,b372aad3b449..000000000000
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@@ -209,37 -352,83 +209,80 @@@ err_put
+  
+  subsys_initcall(efisubsys_init);
+  
+ +
+  /*
+ - * Find the efi memory descriptor for a given physical address.  Given a
+ - * physical address, determine if it exists within an EFI Memory Map entry,
+ - * and if so, populate the supplied memory descriptor with the appropriate
+ - * data.
+ + * We can't ioremap data in EFI boot services RAM, because we've already mapped
+ + * it as RAM.  So, look it up in the existing EFI memory map instead.  Only
+ + * callable after efi_enter_virtual_mode and before efi_free_boot_services.
+   */
+ -int __init efi_mem_desc_lookup(u64 phys_addr, efi_memory_desc_t *out_md)
+ +void __iomem *efi_lookup_mapped_addr(u64 phys_addr)
+  {
+ -	efi_memory_desc_t *md;
+ -
+ -	if (!efi_enabled(EFI_MEMMAP)) {
+ -		pr_err_once("EFI_MEMMAP is not enabled.\n");
+ -		return -EINVAL;
+ -	}
+ -
+ -	if (!out_md) {
+ -		pr_err_once("out_md is null.\n");
+ -		return -EINVAL;
+ -        }
+ -
+ -	for_each_efi_memory_desc(md) {
+ -		u64 size;
+ -		u64 end;
+ -
+ +	struct efi_memory_map *map;
+ +	void *p;
+ +	map = efi.memmap;
+ +	if (!map)
+ +		return NULL;
+ +	if (WARN_ON(!map->map))
+ +		return NULL;
+ +	for (p = map->map; p < map->map_end; p += map->desc_size) {
+ +		efi_memory_desc_t *md = p;
+ +		u64 size = md->num_pages << EFI_PAGE_SHIFT;
+ +		u64 end = md->phys_addr + size;
+  		if (!(md->attribute & EFI_MEMORY_RUNTIME) &&
+ -		    md->type != EFI_BOOT_SERVICES_DATA &&
+ -		    md->type != EFI_RUNTIME_SERVICES_DATA) {
+ +		    md->type != EFI_BOOT_SERVICES_CODE &&
+ +		    md->type != EFI_BOOT_SERVICES_DATA)
+ +			continue;
+ +		if (!md->virt_addr)
+  			continue;
+ -		}
+ -
+ -		size = md->num_pages << EFI_PAGE_SHIFT;
+ -		end = md->phys_addr + size;
+  		if (phys_addr >= md->phys_addr && phys_addr < end) {
+ -			memcpy(out_md, md, sizeof(*out_md));
+ -			return 0;
+ +			phys_addr += md->virt_addr - md->phys_addr;
+ +			return (__force void __iomem *)(unsigned long)phys_addr;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	return NULL;
+++=======
++ 	return -ENOENT;
++ }
++ 
++ /*
++  * Calculate the highest address of an efi memory descriptor.
++  */
++ u64 __init efi_mem_desc_end(efi_memory_desc_t *md)
++ {
++ 	u64 size = md->num_pages << EFI_PAGE_SHIFT;
++ 	u64 end = md->phys_addr + size;
++ 	return end;
++ }
++ 
++ void __init __weak efi_arch_mem_reserve(phys_addr_t addr, u64 size) {}
++ 
++ /**
++  * efi_mem_reserve - Reserve an EFI memory region
++  * @addr: Physical address to reserve
++  * @size: Size of reservation
++  *
++  * Mark a region as reserved from general kernel allocation and
++  * prevent it being released by efi_free_boot_services().
++  *
++  * This function should be called drivers once they've parsed EFI
++  * configuration tables to figure out where their data lives, e.g.
++  * efi_esrt_init().
++  */
++ void __init efi_mem_reserve(phys_addr_t addr, u64 size)
++ {
++ 	if (!memblock_is_region_reserved(addr, size))
++ 		memblock_reserve(addr, size);
++ 
++ 	/*
++ 	 * Some architectures (x86) reserve all boot services ranges
++ 	 * until efi_free_boot_services() because of buggy firmware
++ 	 * implementations. This means the above memblock_reserve() is
++ 	 * superfluous on x86 and instead what it needs to do is
++ 	 * ensure the @start, @size is not freed.
++ 	 */
++ 	efi_arch_mem_reserve(addr, size);
+++>>>>>>> 822f5845f710 (efi/esrt: Cleanup bad memory map log messages)
+  }
+  
+  static __initdata efi_config_table_type_t common_tables[] = {
+* Unmerged path drivers/firmware/efi/esrt.c
+* Unmerged path drivers/firmware/efi/efi.c
+* Unmerged path drivers/firmware/efi/esrt.c
