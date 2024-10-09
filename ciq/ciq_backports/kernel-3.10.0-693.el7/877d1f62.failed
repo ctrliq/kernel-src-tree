@@ -1,0 +1,228 @@
+net: Set sk_txhash from a random number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] Set sk_txhash from a random number (Jonathan Toppins) [1428557]
+Rebuild_FUZZ: 93.15%
+commit-author Tom Herbert <tom@herbertland.com>
+commit 877d1f6291f8e391237e324be58479a3e3a7407c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/877d1f62.failed
+
+This patch creates sk_set_txhash and eliminates protocol specific
+inet_set_txhash and ip6_set_txhash. sk_set_txhash simply sets a
+random number instead of performing flow dissection. sk_set_txash
+is also allowed to be called multiple times for the same socket,
+we'll need this when redoing the hash for negative routing advice.
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 877d1f6291f8e391237e324be58479a3e3a7407c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+#	include/net/ipv6.h
+diff --cc include/net/ip.h
+index 5506ed81f7f4,bee5f3582e38..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -357,17 -356,18 +357,32 @@@ static inline __wsum inet_compute_pseud
+  				  skb->len, proto, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void inet_set_txhash(struct sock *sk)
+ +{
+ +	struct inet_sock *inet = inet_sk(sk);
+ +	struct flow_keys keys;
+ +
+ +	keys.src = inet->inet_saddr;
+ +	keys.dst = inet->inet_daddr;
+ +	keys.port16[0] = inet->inet_sport;
+ +	keys.port16[1] = inet->inet_dport;
+ +
+ +	sk->sk_txhash = flow_hash_from_keys(&keys);
+++=======
++ /* copy IPv4 saddr & daddr to flow_keys, possibly using 64bit load/store
++  * Equivalent to :	flow->v4addrs.src = iph->saddr;
++  *			flow->v4addrs.dst = iph->daddr;
++  */
++ static inline void iph_to_flow_copy_v4addrs(struct flow_keys *flow,
++ 					    const struct iphdr *iph)
++ {
++ 	BUILD_BUG_ON(offsetof(typeof(flow->addrs), v4addrs.dst) !=
++ 		     offsetof(typeof(flow->addrs), v4addrs.src) +
++ 			      sizeof(flow->addrs.v4addrs.src));
++ 	memcpy(&flow->addrs.v4addrs, &iph->saddr, sizeof(flow->addrs.v4addrs));
++ 	flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
+++>>>>>>> 877d1f6291f8 (net: Set sk_txhash from a random number)
+  }
+  
+  static inline __wsum inet_gro_compute_pseudo(struct sk_buff *skb, int proto)
+diff --cc include/net/ipv6.h
+index 9b1513b769fd,7c79798bcaab..000000000000
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@@ -698,19 -678,56 +698,43 @@@ void ipv6_proxy_select_ident(struct ne
+  
+  int ip6_dst_hoplimit(struct dst_entry *dst);
+  
+ -static inline int ip6_sk_dst_hoplimit(struct ipv6_pinfo *np, struct flowi6 *fl6,
+ -				      struct dst_entry *dst)
+ +#if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +static inline void ip6_set_txhash(struct sock *sk)
+  {
+ -	int hlimit;
+ +	struct inet_sock *inet = inet_sk(sk);
+ +	struct ipv6_pinfo *np = inet6_sk(sk);
+ +	struct flow_keys keys;
+  
+ -	if (ipv6_addr_is_multicast(&fl6->daddr))
+ -		hlimit = np->mcast_hops;
+ -	else
+ -		hlimit = np->hop_limit;
+ -	if (hlimit < 0)
+ -		hlimit = ip6_dst_hoplimit(dst);
+ -	return hlimit;
+ -}
+ +	keys.src = (__force __be32)ipv6_addr_hash(&np->saddr);
+ +	keys.dst = (__force __be32)ipv6_addr_hash(&sk->sk_v6_daddr);
+ +	keys.port16[0] = inet->inet_sport;
+ +	keys.port16[1] = inet->inet_dport;
+  
+ -/* copy IPv6 saddr & daddr to flow_keys, possibly using 64bit load/store
+ - * Equivalent to :	flow->v6addrs.src = iph->saddr;
+ - *			flow->v6addrs.dst = iph->daddr;
+ - */
+ -static inline void iph_to_flow_copy_v6addrs(struct flow_keys *flow,
+ -					    const struct ipv6hdr *iph)
+ -{
+ -	BUILD_BUG_ON(offsetof(typeof(flow->addrs), v6addrs.dst) !=
+ -		     offsetof(typeof(flow->addrs), v6addrs.src) +
+ -		     sizeof(flow->addrs.v6addrs.src));
+ -	memcpy(&flow->addrs.v6addrs, &iph->saddr, sizeof(flow->addrs.v6addrs));
+ -	flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
+ -}
+ -
+ -#if IS_ENABLED(CONFIG_IPV6)
+ +	sk->sk_txhash = flow_hash_from_keys(&keys);
+++=======
++ static inline __be32 ip6_make_flowlabel(struct net *net, struct sk_buff *skb,
++ 					__be32 flowlabel, bool autolabel)
++ {
++ 	if (!flowlabel && (autolabel || net->ipv6.sysctl.auto_flowlabels)) {
++ 		u32 hash;
++ 
++ 		hash = skb_get_hash(skb);
++ 
++ 		/* Since this is being sent on the wire obfuscate hash a bit
++ 		 * to minimize possbility that any useful information to an
++ 		 * attacker is leaked. Only lower 20 bits are relevant.
++ 		 */
++ 		hash ^= hash >> 12;
++ 
++ 		flowlabel = (__force __be32)hash & IPV6_FLOWLABEL_MASK;
++ 
++ 		if (net->ipv6.sysctl.flowlabel_state_ranges)
++ 			flowlabel |= IPV6_FLOWLABEL_STATELESS_FLAG;
++ 	}
++ 
++ 	return flowlabel;
+++>>>>>>> 877d1f6291f8 (net: Set sk_txhash from a random number)
+  }
+  #else
+  static inline void ip6_set_txhash(struct sock *sk) { }
+* Unmerged path include/net/ip.h
+* Unmerged path include/net/ipv6.h
+diff --git a/include/net/sock.h b/include/net/sock.h
+index bcec73d6d06c..e2fdc7ca6d30 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1810,6 +1810,14 @@ static inline void sock_graft(struct sock *sk, struct socket *parent)
+ extern kuid_t sock_i_uid(struct sock *sk);
+ extern unsigned long sock_i_ino(struct sock *sk);
+ 
++static inline void sk_set_txhash(struct sock *sk)
++{
++	sk->sk_txhash = prandom_u32();
++
++	if (unlikely(!sk->sk_txhash))
++		sk->sk_txhash = 1;
++}
++
+ static inline struct dst_entry *
+ __sk_dst_get(struct sock *sk)
+ {
+diff --git a/net/ipv4/datagram.c b/net/ipv4/datagram.c
+index 90c0e8386116..bcdd2ac9d950 100644
+--- a/net/ipv4/datagram.c
++++ b/net/ipv4/datagram.c
+@@ -76,7 +76,7 @@ int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 	inet->inet_daddr = fl4->daddr;
+ 	inet->inet_dport = usin->sin_port;
+ 	sk->sk_state = TCP_ESTABLISHED;
+-	inet_set_txhash(sk);
++	sk_set_txhash(sk);
+ 	inet->inet_id = jiffies;
+ 
+ 	sk_dst_set(sk, &rt->dst);
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index a3d98c6efc04..494fab4121a9 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -222,7 +222,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 	if (err)
+ 		goto failure;
+ 
+-	inet_set_txhash(sk);
++	sk_set_txhash(sk);
+ 
+ 	rt = ip_route_newports(fl4, rt, orig_sport, orig_dport,
+ 			       inet->inet_sport, inet->inet_dport, sk);
+@@ -1355,7 +1355,7 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+ 	newinet->mc_ttl	      = ip_hdr(skb)->ttl;
+ 	newinet->rcv_tos      = ip_hdr(skb)->tos;
+ 	inet_csk(newsk)->icsk_ext_hdr_len = 0;
+-	inet_set_txhash(newsk);
++	sk_set_txhash(newsk);
+ 	if (inet_opt)
+ 		inet_csk(newsk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
+ 	newinet->inet_id = newtp->write_seq ^ jiffies;
+diff --git a/net/ipv6/datagram.c b/net/ipv6/datagram.c
+index 053beb286c7e..51dd70d6de93 100644
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@ -248,7 +248,7 @@ ipv4_connected:
+ 		goto out;
+ 
+ 	sk->sk_state = TCP_ESTABLISHED;
+-	ip6_set_txhash(sk);
++	sk_set_txhash(sk);
+ out:
+ 	return err;
+ }
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index 57261a87d03d..e964ffa22ba9 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -295,7 +295,7 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
+ 	if (err)
+ 		goto late_failure;
+ 
+-	ip6_set_txhash(sk);
++	sk_set_txhash(sk);
+ 
+ 	if (!tp->write_seq && likely(!tp->repair))
+ 		tp->write_seq = secure_tcpv6_sequence_number(np->saddr.s6_addr32,
+@@ -1151,7 +1151,7 @@ static struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+ 	newsk->sk_v6_rcv_saddr = ireq->ir_v6_loc_addr;
+ 	newsk->sk_bound_dev_if = ireq->ir_iif;
+ 
+-	ip6_set_txhash(newsk);
++	sk_set_txhash(newsk);
+ 
+ 	/* Now IPv6 options...
+ 
