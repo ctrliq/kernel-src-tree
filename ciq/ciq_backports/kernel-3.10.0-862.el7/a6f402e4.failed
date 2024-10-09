@@ -1,0 +1,127 @@
+net/mlx5e: Tx, no inline copy on ConnectX-5
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] lx5e: Tx, no inline copy on ConnectX-5 (Don Dutile) [1385309 1385649 1386645 1409099 1456667 1456687]
+Rebuild_FUZZ: 93.83%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit a6f402e4990145252ce4fde59b273fa7e4f91e1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a6f402e4.failed
+
+ConnectX-5 and later HW generations will report min inline mode ==
+MLX5_INLINE_MODE_NONE, which means driver is not required to copy packet
+headers to inline fields of TX WQE.
+
+When inline is not required, vlan insertion will be handled in the
+TX descriptor rather than copy to inline.
+
+For LSO case driver is still required to copy headers, for the HW to
+duplicate on wire.
+
+This will improve CPU utilization and boost TX performance.
+
+Tested with pktgen burst single flow:
+CPU: Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+HCA: Mellanox Technologies MT28800 Family [ConnectX-5 Ex]
+
+Before: 15.1Mpps
+After:  17.2Mpps
+Improvement: 14%
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+(cherry picked from commit a6f402e4990145252ce4fde59b273fa7e4f91e1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 2a270903b57d,f193128bac4b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -283,24 -283,25 +285,44 @@@ static netdev_tx_t mlx5e_sq_xmit(struc
+  		num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
+  	}
+  
+ +	sq->stats.bytes += num_bytes;
+  	wi->num_bytes = num_bytes;
+  
+++<<<<<<< HEAD
+ +	if (skb_vlan_tag_present(skb)) {
+ +		mlx5e_insert_vlan(eseg->inline_hdr_start, skb, ihs, &skb_data,
+ +				  &skb_len);
+ +		ihs += VLAN_HLEN;
+ +	} else {
+ +		memcpy(eseg->inline_hdr_start, skb_data, ihs);
+ +		mlx5e_tx_skb_pull_inline(&skb_data, &skb_len, ihs);
+ +	}
+ +
+ +	eseg->inline_hdr_sz = cpu_to_be16(ihs);
+ +
+ +	ds_cnt  = sizeof(*wqe) / MLX5_SEND_WQE_DS;
+ +	ds_cnt += DIV_ROUND_UP(ihs - sizeof(eseg->inline_hdr_start),
+ +			       MLX5_SEND_WQE_DS);
+ +	dseg    = (struct mlx5_wqe_data_seg *)cseg + ds_cnt;
+++=======
++ 	ds_cnt = sizeof(*wqe) / MLX5_SEND_WQE_DS;
++ 	if (ihs) {
++ 		if (skb_vlan_tag_present(skb)) {
++ 			mlx5e_insert_vlan(eseg->inline_hdr.start, skb, ihs, &skb_data, &skb_len);
++ 			ihs += VLAN_HLEN;
++ 		} else {
++ 			memcpy(eseg->inline_hdr.start, skb_data, ihs);
++ 			mlx5e_tx_skb_pull_inline(&skb_data, &skb_len, ihs);
++ 		}
++ 		eseg->inline_hdr.sz = cpu_to_be16(ihs);
++ 		ds_cnt += DIV_ROUND_UP(ihs - sizeof(eseg->inline_hdr.start), MLX5_SEND_WQE_DS);
++ 	} else if (skb_vlan_tag_present(skb)) {
++ 		eseg->insert.type = cpu_to_be16(MLX5_ETH_WQE_INSERT_VLAN);
++ 		eseg->insert.vlan_tci = cpu_to_be16(skb_vlan_tag_get(skb));
++ 	}
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)cseg + ds_cnt;
+++>>>>>>> a6f402e49901 (net/mlx5e: Tx, no inline copy on ConnectX-5)
+  
+  	wi->num_dma = 0;
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 4d8101f8a7a0..2095ee48f4b5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -972,9 +972,7 @@ static int mlx5e_create_sq(struct mlx5e_channel *c,
+ 	}
+ 	sq->bf_buf_size = (1 << MLX5_CAP_GEN(mdev, log_bf_reg_size)) / 2;
+ 	sq->max_inline  = param->max_inline;
+-	sq->min_inline_mode =
+-		MLX5_CAP_ETH(mdev, wqe_inline_mode) == MLX5_CAP_INLINE_MODE_VPORT_CONTEXT ?
+-		param->min_inline_mode : 0;
++	sq->min_inline_mode = param->min_inline_mode;
+ 
+ 	err = mlx5e_alloc_sq_db(sq, cpu_to_node(c->cpu));
+ 	if (err)
+@@ -1042,7 +1040,10 @@ static int mlx5e_enable_sq(struct mlx5e_sq *sq, struct mlx5e_sq_param *param)
+ 	MLX5_SET(sqc,  sqc, tis_num_0, param->type == MLX5E_SQ_ICO ?
+ 				       0 : priv->tisn[sq->tc]);
+ 	MLX5_SET(sqc,  sqc, cqn,		sq->cq.mcq.cqn);
+-	MLX5_SET(sqc,  sqc, min_wqe_inline_mode, sq->min_inline_mode);
++
++	if (MLX5_CAP_ETH(mdev, wqe_inline_mode) == MLX5_CAP_INLINE_MODE_VPORT_CONTEXT)
++		MLX5_SET(sqc,  sqc, min_wqe_inline_mode, sq->min_inline_mode);
++
+ 	MLX5_SET(sqc,  sqc, state,		MLX5_SQC_STATE_RST);
+ 	MLX5_SET(sqc,  sqc, tis_lst_sz, param->type == MLX5E_SQ_ICO ? 0 : 1);
+ 
+@@ -3361,6 +3362,10 @@ static void mlx5e_build_nic_netdev_priv(struct mlx5_core_dev *mdev,
+ 		MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_PKTS;
+ 	priv->params.tx_max_inline         = mlx5e_get_max_inline_cap(mdev);
+ 	mlx5_query_min_inline(mdev, &priv->params.tx_min_inline_mode);
++	if (priv->params.tx_min_inline_mode == MLX5_INLINE_MODE_NONE &&
++	    !MLX5_CAP_ETH(mdev, wqe_vlan_insert))
++		priv->params.tx_min_inline_mode = MLX5_INLINE_MODE_L2;
++
+ 	priv->params.num_tc                = 1;
+ 	priv->params.rss_hfunc             = ETH_RSS_HASH_XOR;
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
