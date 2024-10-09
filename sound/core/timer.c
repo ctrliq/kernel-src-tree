@@ -1908,7 +1908,10 @@ static int snd_timer_user_start(struct file *file)
 	snd_timer_stop(tu->timeri);
 	tu->timeri->lost = 0;
 	tu->last_resolution = 0;
-	return (err = snd_timer_start(tu->timeri, tu->ticks)) < 0 ? err : 0;
+	err = snd_timer_start(tu->timeri, tu->ticks);
+	if (err < 0)
+		return err;
+	return 0;
 }
 
 static int snd_timer_user_stop(struct file *file)
@@ -1919,7 +1922,10 @@ static int snd_timer_user_stop(struct file *file)
 	tu = file->private_data;
 	if (!tu->timeri)
 		return -EBADFD;
-	return (err = snd_timer_stop(tu->timeri)) < 0 ? err : 0;
+	err = snd_timer_stop(tu->timeri);
+	if (err < 0)
+		return err;
+	return 0;
 }
 
 static int snd_timer_user_continue(struct file *file)
@@ -1934,7 +1940,10 @@ static int snd_timer_user_continue(struct file *file)
 	if (!(tu->timeri->flags & SNDRV_TIMER_IFLG_PAUSED))
 		return snd_timer_user_start(file);
 	tu->timeri->lost = 0;
-	return (err = snd_timer_continue(tu->timeri)) < 0 ? err : 0;
+	err = snd_timer_continue(tu->timeri);
+	if (err < 0)
+		return err;
+	return 0;
 }
 
 static int snd_timer_user_pause(struct file *file)
@@ -1945,7 +1954,10 @@ static int snd_timer_user_pause(struct file *file)
 	tu = file->private_data;
 	if (!tu->timeri)
 		return -EBADFD;
-	return (err = snd_timer_pause(tu->timeri)) < 0 ? err : 0;
+	err = snd_timer_pause(tu->timeri);
+	if (err < 0)
+		return err;
+	return 0;
 }
 
 enum {
