@@ -2798,6 +2798,12 @@ static inline void skb_frag_add_head(struct sk_buff *skb, struct sk_buff *frag)
 #define skb_walk_frags(skb, iter)	\
 	for (iter = skb_shinfo(skb)->frag_list; iter; iter = iter->next)
 
+
+int __skb_wait_for_more_packets(struct sock *sk, int *err, long *timeo_p,
+				const struct sk_buff *skb);
+struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned flags,
+					int *peeked, int *off, int *err,
+					struct sk_buff **last);
 struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned flags,
 				    int *peeked, int *off, int *err);
 struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned flags, int noblock,
