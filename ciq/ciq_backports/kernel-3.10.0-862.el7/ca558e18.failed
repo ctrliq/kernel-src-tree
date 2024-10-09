@@ -1,0 +1,166 @@
+net_sched: gen_estimator: fix scaling error in bytes/packets samples
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit ca558e185972d8ecd308760abf972f5d408bcff0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ca558e18.failed
+
+Denys reported wrong rate estimations with HTB classes.
+
+It appears the bug was added in linux-4.10, since my tests
+where using intervals of one second only.
+
+HTB using 4 sec default rate estimators, reported rates
+were 4x higher.
+
+We need to properly scale the bytes/packets samples before
+integrating them in EWMA.
+
+Tested:
+ echo 1 >/sys/module/sch_htb/parameters/htb_rate_est
+
+ Setup HTB with one class with a rate/cail of 5Gbit
+
+ Generate traffic on this class
+
+ tc -s -d cl sh dev eth0 classid 7002:11
+class htb 7002:11 parent 7002:1 prio 5 quantum 200000 rate 5Gbit ceil
+5Gbit linklayer ethernet burst 80000b/1 mpu 0b cburst 80000b/1 mpu 0b
+level 0 rate_handle 1
+ Sent 1488215421648 bytes 982969243 pkt (dropped 0, overlimits 0
+requeues 0)
+ rate 5Gbit 412814pps backlog 136260b 2p requeues 0
+ TCP pkts/rtx 982969327/45 bytes 1488215557414/68130
+ lended: 22732826 borrowed: 0 giants: 0
+ tokens: -1684 ctokens: -1684
+
+Fixes: 1c0d32fde5bd ("net_sched: gen_estimator: complete rewrite of rate estimators")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Denys Fedoryshchenko <nuclearcat@nuclearcat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ca558e185972d8ecd308760abf972f5d408bcff0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/gen_estimator.c
+diff --cc net/core/gen_estimator.c
+index 42d0720cfa94,7c1ffd6f9501..000000000000
+--- a/net/core/gen_estimator.c
++++ b/net/core/gen_estimator.c
+@@@ -112,89 -78,32 +112,98 @@@ static DEFINE_SPINLOCK(est_tree_lock)
+  
+  static void est_timer(unsigned long arg)
+  {
+ -	struct net_rate_estimator *est = (struct net_rate_estimator *)arg;
+ -	struct gnet_stats_basic_packed b;
+ -	u64 rate, brate;
+ +	int idx = (int)arg;
+ +	struct gen_estimator *e;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	list_for_each_entry_rcu(e, &elist[idx].list, list) {
+ +		struct gnet_stats_basic_packed b = {0};
+ +		unsigned long rate;
+ +		u64 brate;
+ +
+ +		if (e->stats_lock)
+ +			spin_lock(e->stats_lock);
+ +		read_lock(&est_lock);
+ +		if (e->bstats == NULL)
+ +			goto skip;
+++=======
++ 	est_fetch_counters(est, &b);
++ 	brate = (b.bytes - est->last_bytes) << (10 - est->ewma_log - est->intvl_log);
++ 	brate -= (est->avbps >> est->ewma_log);
++ 
++ 	rate = (u64)(b.packets - est->last_packets) << (10 - est->ewma_log - est->intvl_log);
++ 	rate -= (est->avpps >> est->ewma_log);
+++>>>>>>> ca558e185972 (net_sched: gen_estimator: fix scaling error in bytes/packets samples)
+ +
+ +		__gnet_stats_copy_basic(e->running, &b, e->cpu_bstats, e->bstats);
+ +
+ +		brate = (b.bytes - e->last_bytes)<<(7 - idx);
+ +		e->last_bytes = b.bytes;
+ +		e->avbps += (brate >> e->ewma_log) - (e->avbps >> e->ewma_log);
+ +		WRITE_ONCE(e->rate_est->bps, (e->avbps + 0xF) >> 5);
+ +
+ +		rate = b.packets - e->last_packets;
+ +		rate <<= (7 - idx);
+ +		e->last_packets = b.packets;
+ +		e->avpps += (rate >> e->ewma_log) - (e->avpps >> e->ewma_log);
+ +		WRITE_ONCE(e->rate_est->pps, (e->avpps + 0xF) >> 5);
+ +skip:
+ +		read_unlock(&est_lock);
+ +		if (e->stats_lock)
+ +			spin_unlock(e->stats_lock);
+ +	}
+  
+ -	write_seqcount_begin(&est->seq);
+ -	est->avbps += brate;
+ -	est->avpps += rate;
+ -	write_seqcount_end(&est->seq);
+ +	if (!list_empty(&elist[idx].list)) {
+ +		elist[idx].next_jiffies += ((HZ/4) << idx);
+  
+ -	est->last_bytes = b.bytes;
+ -	est->last_packets = b.packets;
+ +		if (unlikely(time_after_eq(jiffies, elist[idx].next_jiffies))) {
+ +			/* Ouch... timer was delayed. */
+ +			elist[idx].next_jiffies = jiffies + 1;
+ +		}
+ +		mod_timer(&elist[idx].timer, elist[idx].next_jiffies);
+ +	}
+ +	rcu_read_unlock();
+ +}
+ +
+ +static void gen_add_node(struct gen_estimator *est)
+ +{
+ +	struct rb_node **p = &est_root.rb_node, *parent = NULL;
+  
+ -	est->next_jiffies += ((HZ/4) << est->intvl_log);
+ +	while (*p) {
+ +		struct gen_estimator *e;
+  
+ -	if (unlikely(time_after_eq(jiffies, est->next_jiffies))) {
+ -		/* Ouch... timer was delayed. */
+ -		est->next_jiffies = jiffies + 1;
+ +		parent = *p;
+ +		e = rb_entry(parent, struct gen_estimator, node);
+ +
+ +		if (est->bstats > e->bstats)
+ +			p = &parent->rb_right;
+ +		else
+ +			p = &parent->rb_left;
+ +	}
+ +	rb_link_node(&est->node, parent, p);
+ +	rb_insert_color(&est->node, &est_root);
+ +}
+ +
+ +static
+ +struct gen_estimator *gen_find_node(const struct gnet_stats_basic_packed *bstats,
+ +				    const struct gnet_stats_rate_est64 *rate_est)
+ +{
+ +	struct rb_node *p = est_root.rb_node;
+ +
+ +	while (p) {
+ +		struct gen_estimator *e;
+ +
+ +		e = rb_entry(p, struct gen_estimator, node);
+ +
+ +		if (bstats > e->bstats)
+ +			p = p->rb_right;
+ +		else if (bstats < e->bstats || rate_est != e->rate_est)
+ +			p = p->rb_left;
+ +		else
+ +			return e;
+  	}
+ -	mod_timer(&est->timer, est->next_jiffies);
+ +	return NULL;
+  }
+  
+  /**
+* Unmerged path net/core/gen_estimator.c
