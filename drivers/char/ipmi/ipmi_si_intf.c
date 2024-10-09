@@ -844,7 +844,7 @@ static enum si_sm_result smi_event_handler(struct smi_info *smi_info,
 		smi_inc_stat(smi_info, complete_transactions);
 
 		handle_transaction_done(smi_info);
-		si_sm_result = smi_info->handlers->event(smi_info->si_sm, 0);
+		goto restart;
 	} else if (si_sm_result == SI_SM_HOSED) {
 		smi_inc_stat(smi_info, hosed_count);
 
@@ -861,7 +861,7 @@ static enum si_sm_result smi_event_handler(struct smi_info *smi_info,
 			 */
 			return_hosed_msg(smi_info, IPMI_ERR_UNSPECIFIED);
 		}
-		si_sm_result = smi_info->handlers->event(smi_info->si_sm, 0);
+		goto restart;
 	}
 
 	/*
