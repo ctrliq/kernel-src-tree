@@ -1,0 +1,245 @@
+scsi: cxlflash: Support SQ Command Mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Support SQ Command Mode (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 91.67%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 696d0b0c715360ce28fedd3c8b009d3771a5ddeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/696d0b0c.failed
+
+The SISLite specification outlines a new queuing model to improve
+over the MMIO-based IOARRIN model that exists today. This new model
+uses a submission queue that exists in host memory and is shared with
+the device. Each entry in the queue is an IOARCB that describes a
+transfer request. When requests are submitted, IOARCBs ('current'
+position tracked in host software) are populated and the submission
+queue tail pointer is then updated via MMIO to make the device aware
+of the requests.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 696d0b0c715360ce28fedd3c8b009d3771a5ddeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/common.h
+#	drivers/scsi/cxlflash/main.c
+#	drivers/scsi/cxlflash/sislite.h
+diff --cc drivers/scsi/cxlflash/common.h
+index 811927d91c5c,dee865735ac0..000000000000
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@@ -146,14 -143,23 +149,19 @@@ struct afu_cmd 
+  	 */
+  } __aligned(cache_line_size());
+  
+ -static inline struct afu_cmd *sc_to_afuc(struct scsi_cmnd *sc)
+ -{
+ -	return PTR_ALIGN(scsi_cmd_priv(sc), __alignof__(struct afu_cmd));
+ -}
+ -
+ -static inline struct afu_cmd *sc_to_afucz(struct scsi_cmnd *sc)
+ -{
+ -	struct afu_cmd *afuc = sc_to_afuc(sc);
+ -
+ -	memset(afuc, 0, sizeof(*afuc));
+ -	return afuc;
+ -}
+ -
+  struct afu {
+  	/* Stuff requiring alignment go first. */
+++<<<<<<< HEAD
+ +
+ +	u64 rrq_entry[NUM_RRQ_ENTRY];	/* 2K RRQ */
+ +	/*
+ +	 * Command & data for AFU commands.
+ +	 */
+ +	struct afu_cmd cmd[CXLFLASH_NUM_CMDS];
+++=======
++ 	struct sisl_ioarcb sq[NUM_SQ_ENTRY];		/* 16K SQ */
++ 	u64 rrq_entry[NUM_RRQ_ENTRY];			/* 2K RRQ */
+++>>>>>>> 696d0b0c7153 (scsi: cxlflash: Support SQ Command Mode)
+  
+  	/* Beware of alignment till here. Preferably introduce new
+  	 * fields after this point
+@@@ -165,7 -174,15 +173,13 @@@
+  	struct sisl_host_map __iomem *host_map;		/* MC host map */
+  	struct sisl_ctrl_map __iomem *ctrl_map;		/* MC control map */
+  
+ -	struct kref mapcount;
+ -
+  	ctx_hndl_t ctx_hndl;	/* master's context handle */
++ 
++ 	atomic_t hsq_credits;
++ 	spinlock_t hsq_slock;
++ 	struct sisl_ioarcb *hsq_start;
++ 	struct sisl_ioarcb *hsq_end;
++ 	struct sisl_ioarcb *hsq_curr;
+  	u64 *hrrq_start;
+  	u64 *hrrq_end;
+  	u64 *hrrq_curr;
+diff --cc drivers/scsi/cxlflash/main.c
+index d8aaf45b8306,d2bac4b7b85f..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -294,7 -216,29 +294,33 @@@ static void context_reset(struct afu_cm
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * send_cmd() - sends an AFU command
+++=======
++  * context_reset_ioarrin() - reset command owner context via IOARRIN register
++  * @cmd:	AFU command that timed out.
++  */
++ static void context_reset_ioarrin(struct afu_cmd *cmd)
++ {
++ 	struct afu *afu = cmd->parent;
++ 
++ 	context_reset(cmd, &afu->host_map->ioarrin);
++ }
++ 
++ /**
++  * context_reset_sq() - reset command owner context w/ SQ Context Reset register
++  * @cmd:	AFU command that timed out.
++  */
++ static void context_reset_sq(struct afu_cmd *cmd)
++ {
++ 	struct afu *afu = cmd->parent;
++ 
++ 	context_reset(cmd, &afu->host_map->sq_ctx_reset);
++ }
++ 
++ /**
++  * send_cmd_ioarrin() - sends an AFU command via IOARRIN register
+++>>>>>>> 696d0b0c7153 (scsi: cxlflash: Support SQ Command Mode)
+   * @afu:	AFU associated with the host.
+   * @cmd:	AFU command to send.
+   *
+@@@ -823,10 -791,9 +892,10 @@@ static void cxlflash_remove(struct pci_
+  static int alloc_mem(struct cxlflash_cfg *cfg)
+  {
+  	int rc = 0;
+ +	int i;
+  	struct device *dev = &cfg->dev->dev;
+  
+- 	/* AFU is ~12k, i.e. only one 64k page or up to four 4k pages */
++ 	/* AFU is ~28k, i.e. only one 64k page or up to seven 4k pages */
+  	cfg->afu = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+  					    get_order(sizeof(struct afu)));
+  	if (unlikely(!cfg->afu)) {
+@@@ -1746,9 -1721,17 +1844,20 @@@ static int init_afu(struct cxlflash_cf
+  		       "interface version 0x%llx\n", afu->version,
+  		       afu->interface_version);
+  		rc = -EINVAL;
+ -		goto err2;
+ +		goto err1;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (afu_is_sq_cmd_mode(afu)) {
++ 		afu->send_cmd = send_cmd_sq;
++ 		afu->context_reset = context_reset_sq;
++ 	} else {
++ 		afu->send_cmd = send_cmd_ioarrin;
++ 		afu->context_reset = context_reset_ioarrin;
++ 	}
++ 
+++>>>>>>> 696d0b0c7153 (scsi: cxlflash: Support SQ Command Mode)
+  	pr_debug("%s: afu version %s, interface version 0x%llX\n", __func__,
+  		 afu->version, afu->interface_version);
+  
+diff --cc drivers/scsi/cxlflash/sislite.h
+index 347fc1671975,a6e48a893fef..000000000000
+mode 100755,100644..100755
+--- a/drivers/scsi/cxlflash/sislite.h
++++ b/drivers/scsi/cxlflash/sislite.h
+@@@ -72,7 -72,10 +72,14 @@@ struct sisl_ioarcb 
+  	u16 timeout;		/* in units specified by req_flags */
+  	u32 rsvd1;
+  	u8 cdb[16];		/* must be in big endian */
+++<<<<<<< HEAD
+ +	struct scsi_cmnd *scp;
+++=======
++ 	union {
++ 		u64 reserved;			/* Reserved for IOARRIN mode */
++ 		struct sisl_ioasa *ioasa;	/* IOASA EA for SQ Mode */
++ 	};
+++>>>>>>> 696d0b0c7153 (scsi: cxlflash: Support SQ Command Mode)
+  } __packed;
+  
+  struct sisl_rc {
+* Unmerged path drivers/scsi/cxlflash/common.h
+* Unmerged path drivers/scsi/cxlflash/main.c
+* Unmerged path drivers/scsi/cxlflash/sislite.h
+diff --git a/drivers/scsi/cxlflash/superpipe.c b/drivers/scsi/cxlflash/superpipe.c
+index a4dd3ca7c750..f87cac2e65d1 100644
+--- a/drivers/scsi/cxlflash/superpipe.c
++++ b/drivers/scsi/cxlflash/superpipe.c
+@@ -1287,6 +1287,7 @@ static int cxlflash_disk_attach(struct scsi_device *sdev,
+ 	int rc = 0;
+ 	u32 perms;
+ 	int ctxid = -1;
++	u64 flags = 0UL;
+ 	u64 rctxid = 0UL;
+ 	struct file *file = NULL;
+ 
+@@ -1426,10 +1427,11 @@ static int cxlflash_disk_attach(struct scsi_device *sdev,
+ 
+ out_attach:
+ 	if (fd != -1)
+-		attach->hdr.return_flags = DK_CXLFLASH_APP_CLOSE_ADAP_FD;
+-	else
+-		attach->hdr.return_flags = 0;
++		flags |= DK_CXLFLASH_APP_CLOSE_ADAP_FD;
++	if (afu_is_sq_cmd_mode(afu))
++		flags |= DK_CXLFLASH_CONTEXT_SQ_CMD_MODE;
+ 
++	attach->hdr.return_flags = flags;
+ 	attach->context_id = ctxi->ctxid;
+ 	attach->block_size = gli->blk_len;
+ 	attach->mmio_size = sizeof(afu->afu_map->hosts[0].harea);
+@@ -1617,6 +1619,7 @@ static int cxlflash_afu_recover(struct scsi_device *sdev,
+ 	struct afu *afu = cfg->afu;
+ 	struct ctx_info *ctxi = NULL;
+ 	struct mutex *mutex = &cfg->ctx_recovery_mutex;
++	u64 flags;
+ 	u64 ctxid = DECODE_CTXID(recover->context_id),
+ 	    rctxid = recover->context_id;
+ 	long reg;
+@@ -1672,11 +1675,16 @@ retry_recover:
+ 		}
+ 
+ 		ctxi->err_recovery_active = false;
++
++		flags = DK_CXLFLASH_APP_CLOSE_ADAP_FD |
++			DK_CXLFLASH_RECOVER_AFU_CONTEXT_RESET;
++		if (afu_is_sq_cmd_mode(afu))
++			flags |= DK_CXLFLASH_CONTEXT_SQ_CMD_MODE;
++
++		recover->hdr.return_flags = flags;
+ 		recover->context_id = ctxi->ctxid;
+ 		recover->adap_fd = new_adap_fd;
+ 		recover->mmio_size = sizeof(afu->afu_map->hosts[0].harea);
+-		recover->hdr.return_flags = DK_CXLFLASH_APP_CLOSE_ADAP_FD |
+-			DK_CXLFLASH_RECOVER_AFU_CONTEXT_RESET;
+ 		goto out;
+ 	}
+ 
+diff --git a/include/uapi/scsi/cxlflash_ioctl.h b/include/uapi/scsi/cxlflash_ioctl.h
+index 6bf1f8a022b1..e9fdc12ad984 100644
+--- a/include/uapi/scsi/cxlflash_ioctl.h
++++ b/include/uapi/scsi/cxlflash_ioctl.h
+@@ -40,6 +40,7 @@ struct dk_cxlflash_hdr {
+  */
+ #define DK_CXLFLASH_ALL_PORTS_ACTIVE	0x0000000000000001ULL
+ #define DK_CXLFLASH_APP_CLOSE_ADAP_FD	0x0000000000000002ULL
++#define DK_CXLFLASH_CONTEXT_SQ_CMD_MODE	0x0000000000000004ULL
+ 
+ /*
+  * General Notes:
