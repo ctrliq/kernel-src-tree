@@ -1,0 +1,614 @@
+ibmvnic: Split initialization of scrqs to its own routine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit d346b9bc4f652ddaf29b2d80ec7fc75d3b07124e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d346b9bc.failed
+
+Split the sending of capability request crqs and the initialization
+of sub crqs into their own routines. This is a first step to moving
+the allocation of sub-crqs out of interrupt context.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d346b9bc4f652ddaf29b2d80ec7fc75d3b07124e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 8b65bfc1f714,c2e260ce45bb..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -1550,33 -1687,6 +1549,36 @@@ static int init_sub_crqs(struct ibmvnic
+  	int more = 0;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (!retry) {
+ +		/* Sub-CRQ entries are 32 byte long */
+ +		int entries_page = 4 * PAGE_SIZE / (sizeof(u64) * 4);
+ +
+ +		if (adapter->min_tx_entries_per_subcrq > entries_page ||
+ +		    adapter->min_rx_add_entries_per_subcrq > entries_page) {
+ +			dev_err(dev, "Fatal, invalid entries per sub-crq\n");
+ +			goto allqueues_failed;
+ +		}
+ +
+ +		/* Get the minimum between the queried max and the entries
+ +		 * that fit in our PAGE_SIZE
+ +		 */
+ +		adapter->req_tx_entries_per_subcrq =
+ +		    adapter->max_tx_entries_per_subcrq > entries_page ?
+ +		    entries_page : adapter->max_tx_entries_per_subcrq;
+ +		adapter->req_rx_add_entries_per_subcrq =
+ +		    adapter->max_rx_add_entries_per_subcrq > entries_page ?
+ +		    entries_page : adapter->max_rx_add_entries_per_subcrq;
+ +
+ +		adapter->req_tx_queues = adapter->opt_tx_comp_sub_queues;
+ +		adapter->req_rx_queues = adapter->opt_rx_comp_queues;
+ +		adapter->req_rx_add_queues = adapter->max_rx_add_queues;
+ +
+ +		adapter->req_mtu = adapter->max_mtu;
+ +	}
+ +
+++=======
+++>>>>>>> d346b9bc4f65 (ibmvnic: Split initialization of scrqs to its own routine)
+  	total_queues = adapter->req_tx_queues + adapter->req_rx_queues;
+  
+  	allqueues = kcalloc(total_queues, sizeof(*allqueues), GFP_ATOMIC);
+@@@ -2481,9 -2574,9 +2519,9 @@@ static void handle_request_cap_rsp(unio
+  			 *req_value,
+  			 (long int)be64_to_cpu(crq->request_capability_rsp.
+  					       number), name);
+ -		release_sub_crqs(adapter);
+ +		release_sub_crqs_no_irqs(adapter);
+  		*req_value = be64_to_cpu(crq->request_capability_rsp.number);
+- 		init_sub_crqs(adapter, 1);
++ 		ibmvnic_send_req_caps(adapter, 1);
+  		return;
+  	default:
+  		dev_err(dev, "Error %d in request cap rsp\n",
+@@@ -2793,531 -2882,15 +2831,530 @@@ static void handle_query_cap_rsp(union 
+  		break;
+  
+  	default:
+ -		netdev_err(netdev, "Got invalid cap rsp %d\n",
+ -			   crq->query_capability.capability);
+ +		netdev_err(netdev, "Got invalid cap rsp %d\n",
+ +			   crq->query_capability.capability);
+ +	}
+ +
+ +out:
+ +	if (atomic_read(&adapter->running_cap_crqs) == 0) {
+ +		adapter->wait_capability = false;
+- 		init_sub_crqs(adapter, 0);
+- 		/* We're done querying the capabilities, initialize sub-crqs */
+++		ibmvnic_send_req_caps(adapter, 0);
+ +	}
+ +}
+ +
+ +static void handle_control_ras_rsp(union ibmvnic_crq *crq,
+ +				   struct ibmvnic_adapter *adapter)
+ +{
+ +	u8 correlator = crq->control_ras_rsp.correlator;
+ +	struct device *dev = &adapter->vdev->dev;
+ +	bool found = false;
+ +	int i;
+ +
+ +	if (crq->control_ras_rsp.rc.code) {
+ +		dev_warn(dev, "Control ras failed rc=%d\n",
+ +			 crq->control_ras_rsp.rc.code);
+ +		return;
+ +	}
+ +
+ +	for (i = 0; i < adapter->ras_comp_num; i++) {
+ +		if (adapter->ras_comps[i].correlator == correlator) {
+ +			found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (!found) {
+ +		dev_warn(dev, "Correlator not found on control_ras_rsp\n");
+ +		return;
+ +	}
+ +
+ +	switch (crq->control_ras_rsp.op) {
+ +	case IBMVNIC_TRACE_LEVEL:
+ +		adapter->ras_comps[i].trace_level = crq->control_ras.level;
+ +		break;
+ +	case IBMVNIC_ERROR_LEVEL:
+ +		adapter->ras_comps[i].error_check_level =
+ +		    crq->control_ras.level;
+ +		break;
+ +	case IBMVNIC_TRACE_PAUSE:
+ +		adapter->ras_comp_int[i].paused = 1;
+ +		break;
+ +	case IBMVNIC_TRACE_RESUME:
+ +		adapter->ras_comp_int[i].paused = 0;
+ +		break;
+ +	case IBMVNIC_TRACE_ON:
+ +		adapter->ras_comps[i].trace_on = 1;
+ +		break;
+ +	case IBMVNIC_TRACE_OFF:
+ +		adapter->ras_comps[i].trace_on = 0;
+ +		break;
+ +	case IBMVNIC_CHG_TRACE_BUFF_SZ:
+ +		/* trace_buff_sz is 3 bytes, stuff it into an int */
+ +		((u8 *)(&adapter->ras_comps[i].trace_buff_size))[0] = 0;
+ +		((u8 *)(&adapter->ras_comps[i].trace_buff_size))[1] =
+ +		    crq->control_ras_rsp.trace_buff_sz[0];
+ +		((u8 *)(&adapter->ras_comps[i].trace_buff_size))[2] =
+ +		    crq->control_ras_rsp.trace_buff_sz[1];
+ +		((u8 *)(&adapter->ras_comps[i].trace_buff_size))[3] =
+ +		    crq->control_ras_rsp.trace_buff_sz[2];
+ +		break;
+ +	default:
+ +		dev_err(dev, "invalid op %d on control_ras_rsp",
+ +			crq->control_ras_rsp.op);
+  	}
+ +}
+  
+ -out:
+ -	if (atomic_read(&adapter->running_cap_crqs) == 0) {
+ -		adapter->wait_capability = false;
+ -		ibmvnic_send_req_caps(adapter, 0);
+ +static ssize_t trace_read(struct file *file, char __user *user_buf, size_t len,
+ +			  loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	struct device *dev = &adapter->vdev->dev;
+ +	struct ibmvnic_fw_trace_entry *trace;
+ +	int num = ras_comp_int->num;
+ +	union ibmvnic_crq crq;
+ +	dma_addr_t trace_tok;
+ +
+ +	if (*ppos >= be32_to_cpu(adapter->ras_comps[num].trace_buff_size))
+ +		return 0;
+ +
+ +	trace =
+ +	    dma_alloc_coherent(dev,
+ +			       be32_to_cpu(adapter->ras_comps[num].
+ +					   trace_buff_size), &trace_tok,
+ +			       GFP_KERNEL);
+ +	if (!trace) {
+ +		dev_err(dev, "Couldn't alloc trace buffer\n");
+ +		return 0;
+ +	}
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.collect_fw_trace.first = IBMVNIC_CRQ_CMD;
+ +	crq.collect_fw_trace.cmd = COLLECT_FW_TRACE;
+ +	crq.collect_fw_trace.correlator = adapter->ras_comps[num].correlator;
+ +	crq.collect_fw_trace.ioba = cpu_to_be32(trace_tok);
+ +	crq.collect_fw_trace.len = adapter->ras_comps[num].trace_buff_size;
+ +
+ +	init_completion(&adapter->fw_done);
+ +	ibmvnic_send_crq(adapter, &crq);
+ +	wait_for_completion(&adapter->fw_done);
+ +
+ +	if (*ppos + len > be32_to_cpu(adapter->ras_comps[num].trace_buff_size))
+ +		len =
+ +		    be32_to_cpu(adapter->ras_comps[num].trace_buff_size) -
+ +		    *ppos;
+ +
+ +	copy_to_user(user_buf, &((u8 *)trace)[*ppos], len);
+ +
+ +	dma_free_coherent(dev,
+ +			  be32_to_cpu(adapter->ras_comps[num].trace_buff_size),
+ +			  trace, trace_tok);
+ +	*ppos += len;
+ +	return len;
+ +}
+ +
+ +static const struct file_operations trace_ops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= simple_open,
+ +	.read		= trace_read,
+ +};
+ +
+ +static ssize_t paused_read(struct file *file, char __user *user_buf, size_t len,
+ +			   loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	char buff[5]; /*  1 or 0 plus \n and \0 */
+ +	int size;
+ +
+ +	size = sprintf(buff, "%d\n", adapter->ras_comp_int[num].paused);
+ +
+ +	if (*ppos >= size)
+ +		return 0;
+ +
+ +	copy_to_user(user_buf, buff, size);
+ +	*ppos += size;
+ +	return size;
+ +}
+ +
+ +static ssize_t paused_write(struct file *file, const char __user *user_buf,
+ +			    size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	union ibmvnic_crq crq;
+ +	unsigned long val;
+ +	char buff[9]; /* decimal max int plus \n and \0 */
+ +
+ +	copy_from_user(buff, user_buf, sizeof(buff));
+ +	val = kstrtoul(buff, 10, NULL);
+ +
+ +	adapter->ras_comp_int[num].paused = val ? 1 : 0;
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.control_ras.first = IBMVNIC_CRQ_CMD;
+ +	crq.control_ras.cmd = CONTROL_RAS;
+ +	crq.control_ras.correlator = adapter->ras_comps[num].correlator;
+ +	crq.control_ras.op = val ? IBMVNIC_TRACE_PAUSE : IBMVNIC_TRACE_RESUME;
+ +	ibmvnic_send_crq(adapter, &crq);
+ +
+ +	return len;
+ +}
+ +
+ +static const struct file_operations paused_ops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= simple_open,
+ +	.read		= paused_read,
+ +	.write		= paused_write,
+ +};
+ +
+ +static ssize_t tracing_read(struct file *file, char __user *user_buf,
+ +			    size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	char buff[5]; /*  1 or 0 plus \n and \0 */
+ +	int size;
+ +
+ +	size = sprintf(buff, "%d\n", adapter->ras_comps[num].trace_on);
+ +
+ +	if (*ppos >= size)
+ +		return 0;
+ +
+ +	copy_to_user(user_buf, buff, size);
+ +	*ppos += size;
+ +	return size;
+ +}
+ +
+ +static ssize_t tracing_write(struct file *file, const char __user *user_buf,
+ +			     size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	union ibmvnic_crq crq;
+ +	unsigned long val;
+ +	char buff[9]; /* decimal max int plus \n and \0 */
+ +
+ +	copy_from_user(buff, user_buf, sizeof(buff));
+ +	val = kstrtoul(buff, 10, NULL);
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.control_ras.first = IBMVNIC_CRQ_CMD;
+ +	crq.control_ras.cmd = CONTROL_RAS;
+ +	crq.control_ras.correlator = adapter->ras_comps[num].correlator;
+ +	crq.control_ras.op = val ? IBMVNIC_TRACE_ON : IBMVNIC_TRACE_OFF;
+ +
+ +	return len;
+ +}
+ +
+ +static const struct file_operations tracing_ops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= simple_open,
+ +	.read		= tracing_read,
+ +	.write		= tracing_write,
+ +};
+ +
+ +static ssize_t error_level_read(struct file *file, char __user *user_buf,
+ +				size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	char buff[5]; /* decimal max char plus \n and \0 */
+ +	int size;
+ +
+ +	size = sprintf(buff, "%d\n", adapter->ras_comps[num].error_check_level);
+ +
+ +	if (*ppos >= size)
+ +		return 0;
+ +
+ +	copy_to_user(user_buf, buff, size);
+ +	*ppos += size;
+ +	return size;
+ +}
+ +
+ +static ssize_t error_level_write(struct file *file, const char __user *user_buf,
+ +				 size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	union ibmvnic_crq crq;
+ +	unsigned long val;
+ +	char buff[9]; /* decimal max int plus \n and \0 */
+ +
+ +	copy_from_user(buff, user_buf, sizeof(buff));
+ +	val = kstrtoul(buff, 10, NULL);
+ +
+ +	if (val > 9)
+ +		val = 9;
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.control_ras.first = IBMVNIC_CRQ_CMD;
+ +	crq.control_ras.cmd = CONTROL_RAS;
+ +	crq.control_ras.correlator = adapter->ras_comps[num].correlator;
+ +	crq.control_ras.op = IBMVNIC_ERROR_LEVEL;
+ +	crq.control_ras.level = val;
+ +	ibmvnic_send_crq(adapter, &crq);
+ +
+ +	return len;
+ +}
+ +
+ +static const struct file_operations error_level_ops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= simple_open,
+ +	.read		= error_level_read,
+ +	.write		= error_level_write,
+ +};
+ +
+ +static ssize_t trace_level_read(struct file *file, char __user *user_buf,
+ +				size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	char buff[5]; /* decimal max char plus \n and \0 */
+ +	int size;
+ +
+ +	size = sprintf(buff, "%d\n", adapter->ras_comps[num].trace_level);
+ +	if (*ppos >= size)
+ +		return 0;
+ +
+ +	copy_to_user(user_buf, buff, size);
+ +	*ppos += size;
+ +	return size;
+ +}
+ +
+ +static ssize_t trace_level_write(struct file *file, const char __user *user_buf,
+ +				 size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	union ibmvnic_crq crq;
+ +	unsigned long val;
+ +	char buff[9]; /* decimal max int plus \n and \0 */
+ +
+ +	copy_from_user(buff, user_buf, sizeof(buff));
+ +	val = kstrtoul(buff, 10, NULL);
+ +	if (val > 9)
+ +		val = 9;
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.control_ras.first = IBMVNIC_CRQ_CMD;
+ +	crq.control_ras.cmd = CONTROL_RAS;
+ +	crq.control_ras.correlator =
+ +	    adapter->ras_comps[ras_comp_int->num].correlator;
+ +	crq.control_ras.op = IBMVNIC_TRACE_LEVEL;
+ +	crq.control_ras.level = val;
+ +	ibmvnic_send_crq(adapter, &crq);
+ +
+ +	return len;
+ +}
+ +
+ +static const struct file_operations trace_level_ops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= simple_open,
+ +	.read		= trace_level_read,
+ +	.write		= trace_level_write,
+ +};
+ +
+ +static ssize_t trace_buff_size_read(struct file *file, char __user *user_buf,
+ +				    size_t len, loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	int num = ras_comp_int->num;
+ +	char buff[9]; /* decimal max int plus \n and \0 */
+ +	int size;
+ +
+ +	size = sprintf(buff, "%d\n", adapter->ras_comps[num].trace_buff_size);
+ +	if (*ppos >= size)
+ +		return 0;
+ +
+ +	copy_to_user(user_buf, buff, size);
+ +	*ppos += size;
+ +	return size;
+ +}
+ +
+ +static ssize_t trace_buff_size_write(struct file *file,
+ +				     const char __user *user_buf, size_t len,
+ +				     loff_t *ppos)
+ +{
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int = file->private_data;
+ +	struct ibmvnic_adapter *adapter = ras_comp_int->adapter;
+ +	union ibmvnic_crq crq;
+ +	unsigned long val;
+ +	char buff[9]; /* decimal max int plus \n and \0 */
+ +
+ +	copy_from_user(buff, user_buf, sizeof(buff));
+ +	val = kstrtoul(buff, 10, NULL);
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.control_ras.first = IBMVNIC_CRQ_CMD;
+ +	crq.control_ras.cmd = CONTROL_RAS;
+ +	crq.control_ras.correlator =
+ +	    adapter->ras_comps[ras_comp_int->num].correlator;
+ +	crq.control_ras.op = IBMVNIC_CHG_TRACE_BUFF_SZ;
+ +	/* trace_buff_sz is 3 bytes, stuff an int into it */
+ +	crq.control_ras.trace_buff_sz[0] = ((u8 *)(&val))[5];
+ +	crq.control_ras.trace_buff_sz[1] = ((u8 *)(&val))[6];
+ +	crq.control_ras.trace_buff_sz[2] = ((u8 *)(&val))[7];
+ +	ibmvnic_send_crq(adapter, &crq);
+ +
+ +	return len;
+ +}
+ +
+ +static const struct file_operations trace_size_ops = {
+ +	.owner		= THIS_MODULE,
+ +	.open		= simple_open,
+ +	.read		= trace_buff_size_read,
+ +	.write		= trace_buff_size_write,
+ +};
+ +
+ +static void handle_request_ras_comps_rsp(union ibmvnic_crq *crq,
+ +					 struct ibmvnic_adapter *adapter)
+ +{
+ +	struct device *dev = &adapter->vdev->dev;
+ +	struct dentry *dir_ent;
+ +	struct dentry *ent;
+ +	int i;
+ +
+ +	debugfs_remove_recursive(adapter->ras_comps_ent);
+ +
+ +	adapter->ras_comps_ent = debugfs_create_dir("ras_comps",
+ +						    adapter->debugfs_dir);
+ +	if (!adapter->ras_comps_ent || IS_ERR(adapter->ras_comps_ent)) {
+ +		dev_info(dev, "debugfs create ras_comps dir failed\n");
+ +		return;
+ +	}
+ +
+ +	for (i = 0; i < adapter->ras_comp_num; i++) {
+ +		dir_ent = debugfs_create_dir(adapter->ras_comps[i].name,
+ +					     adapter->ras_comps_ent);
+ +		if (!dir_ent || IS_ERR(dir_ent)) {
+ +			dev_info(dev, "debugfs create %s dir failed\n",
+ +				 adapter->ras_comps[i].name);
+ +			continue;
+ +		}
+ +
+ +		adapter->ras_comp_int[i].adapter = adapter;
+ +		adapter->ras_comp_int[i].num = i;
+ +		adapter->ras_comp_int[i].desc_blob.data =
+ +		    &adapter->ras_comps[i].description;
+ +		adapter->ras_comp_int[i].desc_blob.size =
+ +		    sizeof(adapter->ras_comps[i].description);
+ +
+ +		/* Don't need to remember the dentry's because the debugfs dir
+ +		 * gets removed recursively
+ +		 */
+ +		ent = debugfs_create_blob("description", S_IRUGO, dir_ent,
+ +					  &adapter->ras_comp_int[i].desc_blob);
+ +		ent = debugfs_create_file("trace_buf_size", S_IRUGO | S_IWUSR,
+ +					  dir_ent, &adapter->ras_comp_int[i],
+ +					  &trace_size_ops);
+ +		ent = debugfs_create_file("trace_level",
+ +					  S_IRUGO |
+ +					  (adapter->ras_comps[i].trace_level !=
+ +					   0xFF  ? S_IWUSR : 0),
+ +					   dir_ent, &adapter->ras_comp_int[i],
+ +					   &trace_level_ops);
+ +		ent = debugfs_create_file("error_level",
+ +					  S_IRUGO |
+ +					  (adapter->
+ +					   ras_comps[i].error_check_level !=
+ +					   0xFF ? S_IWUSR : 0),
+ +					  dir_ent, &adapter->ras_comp_int[i],
+ +					  &trace_level_ops);
+ +		ent = debugfs_create_file("tracing", S_IRUGO | S_IWUSR,
+ +					  dir_ent, &adapter->ras_comp_int[i],
+ +					  &tracing_ops);
+ +		ent = debugfs_create_file("paused", S_IRUGO | S_IWUSR,
+ +					  dir_ent, &adapter->ras_comp_int[i],
+ +					  &paused_ops);
+ +		ent = debugfs_create_file("trace", S_IRUGO, dir_ent,
+ +					  &adapter->ras_comp_int[i],
+ +					  &trace_ops);
+ +	}
+ +}
+ +
+ +static void handle_request_ras_comp_num_rsp(union ibmvnic_crq *crq,
+ +					    struct ibmvnic_adapter *adapter)
+ +{
+ +	int len = adapter->ras_comp_num * sizeof(struct ibmvnic_fw_component);
+ +	struct device *dev = &adapter->vdev->dev;
+ +	union ibmvnic_crq newcrq;
+ +
+ +	adapter->ras_comps = dma_alloc_coherent(dev, len,
+ +						&adapter->ras_comps_tok,
+ +						GFP_KERNEL);
+ +	if (!adapter->ras_comps) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(dev, "Couldn't alloc fw comps buffer\n");
+ +		return;
+ +	}
+ +
+ +	adapter->ras_comp_int = kmalloc(adapter->ras_comp_num *
+ +					sizeof(struct ibmvnic_fw_comp_internal),
+ +					GFP_KERNEL);
+ +	if (!adapter->ras_comp_int)
+ +		dma_free_coherent(dev, len, adapter->ras_comps,
+ +				  adapter->ras_comps_tok);
+ +
+ +	memset(&newcrq, 0, sizeof(newcrq));
+ +	newcrq.request_ras_comps.first = IBMVNIC_CRQ_CMD;
+ +	newcrq.request_ras_comps.cmd = REQUEST_RAS_COMPS;
+ +	newcrq.request_ras_comps.ioba = cpu_to_be32(adapter->ras_comps_tok);
+ +	newcrq.request_ras_comps.len = cpu_to_be32(len);
+ +	ibmvnic_send_crq(adapter, &newcrq);
+ +}
+ +
+ +static void ibmvnic_free_inflight(struct ibmvnic_adapter *adapter)
+ +{
+ +	struct ibmvnic_inflight_cmd *inflight_cmd, *tmp1;
+ +	struct device *dev = &adapter->vdev->dev;
+ +	struct ibmvnic_error_buff *error_buff, *tmp2;
+ +	unsigned long flags;
+ +	unsigned long flags2;
+ +
+ +	spin_lock_irqsave(&adapter->inflight_lock, flags);
+ +	list_for_each_entry_safe(inflight_cmd, tmp1, &adapter->inflight, list) {
+ +		switch (inflight_cmd->crq.generic.cmd) {
+ +		case LOGIN:
+ +			dma_unmap_single(dev, adapter->login_buf_token,
+ +					 adapter->login_buf_sz,
+ +					 DMA_BIDIRECTIONAL);
+ +			dma_unmap_single(dev, adapter->login_rsp_buf_token,
+ +					 adapter->login_rsp_buf_sz,
+ +					 DMA_BIDIRECTIONAL);
+ +			kfree(adapter->login_rsp_buf);
+ +			kfree(adapter->login_buf);
+ +			break;
+ +		case REQUEST_DUMP:
+ +			complete(&adapter->fw_done);
+ +			break;
+ +		case REQUEST_ERROR_INFO:
+ +			spin_lock_irqsave(&adapter->error_list_lock, flags2);
+ +			list_for_each_entry_safe(error_buff, tmp2,
+ +						 &adapter->errors, list) {
+ +				dma_unmap_single(dev, error_buff->dma,
+ +						 error_buff->len,
+ +						 DMA_FROM_DEVICE);
+ +				kfree(error_buff->buff);
+ +				list_del(&error_buff->list);
+ +				kfree(error_buff);
+ +			}
+ +			spin_unlock_irqrestore(&adapter->error_list_lock,
+ +					       flags2);
+ +			break;
+ +		}
+ +		list_del(&inflight_cmd->list);
+ +		kfree(inflight_cmd);
+  	}
+ +	spin_unlock_irqrestore(&adapter->inflight_lock, flags);
+  }
+  
+  static void ibmvnic_xport_event(struct work_struct *work)
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
