@@ -1,0 +1,306 @@
+x86/speculation/mds: Clear CPU buffers on exit to user
+
+jira LE-1907
+cve CVE-2019-11091
+cve CVE-2018-12130
+cve CVE-2018-12127
+cve CVE-2018-12126
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] speculation/mds: Clear CPU buffers on exit to user (Waiman Long) [1709296 1690358 1690348 1690335] {CVE-2018-12126 CVE-2018-12127 CVE-2018-12130 CVE-2019-11091}
+Rebuild_FUZZ: 96.15%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 04dcbdb8057827b043b3c71aa397c4c63e67d086
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/04dcbdb8.failed
+
+Add a static key which controls the invocation of the CPU buffer clear
+mechanism on exit to user space and add the call into
+prepare_exit_to_usermode() and do_nmi() right before actually returning.
+
+Add documentation which kernel to user space transition this covers and
+explain why some corner cases are not mitigated.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+	Reviewed-by: Jon Masters <jcm@redhat.com>
+	Tested-by: Jon Masters <jcm@redhat.com>
+
+(cherry picked from commit 04dcbdb8057827b043b3c71aa397c4c63e67d086)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/x86/mds.rst
+#	arch/x86/entry/common.c
+#	arch/x86/include/asm/nospec-branch.h
+#	arch/x86/kernel/nmi.c
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/include/asm/nospec-branch.h
+index 5dd73594c0d2,65b747286d96..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -218,16 -252,108 +218,107 @@@ extern u64 x86_amd_ls_cfg_ssbd_mask
+   * On VMEXIT we must ensure that no RSB predictions learned in the guest
+   * can be followed in the host, by overwriting the RSB completely. Both
+   * retpoline and IBRS mitigations for Spectre v2 need this; only on future
+ - * CPUs with IBRS_ALL *might* it be avoided.
+ + * CPUs with IBRS_ATT *might* it be avoided.
+   */
+ -static inline void vmexit_fill_RSB(void)
+ +static inline void fill_RSB(void)
+  {
+ -#ifdef CONFIG_RETPOLINE
+  	unsigned long loops;
+ +	register unsigned long sp asm(_ASM_SP);
+  
+ -	asm volatile (ANNOTATE_NOSPEC_ALTERNATIVE
+ -		      ALTERNATIVE("jmp 910f",
+ -				  __stringify(__FILL_RETURN_BUFFER(%0, RSB_CLEAR_LOOPS, %1)),
+ -				  X86_FEATURE_RETPOLINE)
+ -		      "910:"
+ -		      : "=r" (loops), ASM_CALL_CONSTRAINT
+ +	asm volatile (__stringify(__FILL_RETURN_BUFFER(%0, RSB_CLEAR_LOOPS, %1))
+ +		      : "=r" (loops), "+r" (sp)
+  		      : : "memory" );
+++<<<<<<< HEAD
+++=======
++ #endif
++ }
++ 
++ static __always_inline
++ void alternative_msr_write(unsigned int msr, u64 val, unsigned int feature)
++ {
++ 	asm volatile(ALTERNATIVE("", "wrmsr", %c[feature])
++ 		: : "c" (msr),
++ 		    "a" ((u32)val),
++ 		    "d" ((u32)(val >> 32)),
++ 		    [feature] "i" (feature)
++ 		: "memory");
++ }
++ 
++ static inline void indirect_branch_prediction_barrier(void)
++ {
++ 	u64 val = PRED_CMD_IBPB;
++ 
++ 	alternative_msr_write(MSR_IA32_PRED_CMD, val, X86_FEATURE_USE_IBPB);
++ }
++ 
++ /* The Intel SPEC CTRL MSR base value cache */
++ extern u64 x86_spec_ctrl_base;
++ 
++ /*
++  * With retpoline, we must use IBRS to restrict branch prediction
++  * before calling into firmware.
++  *
++  * (Implemented as CPP macros due to header hell.)
++  */
++ #define firmware_restrict_branch_speculation_start()			\
++ do {									\
++ 	u64 val = x86_spec_ctrl_base | SPEC_CTRL_IBRS;			\
++ 									\
++ 	preempt_disable();						\
++ 	alternative_msr_write(MSR_IA32_SPEC_CTRL, val,			\
++ 			      X86_FEATURE_USE_IBRS_FW);			\
++ } while (0)
++ 
++ #define firmware_restrict_branch_speculation_end()			\
++ do {									\
++ 	u64 val = x86_spec_ctrl_base;					\
++ 									\
++ 	alternative_msr_write(MSR_IA32_SPEC_CTRL, val,			\
++ 			      X86_FEATURE_USE_IBRS_FW);			\
++ 	preempt_enable();						\
++ } while (0)
++ 
++ DECLARE_STATIC_KEY_FALSE(switch_to_cond_stibp);
++ DECLARE_STATIC_KEY_FALSE(switch_mm_cond_ibpb);
++ DECLARE_STATIC_KEY_FALSE(switch_mm_always_ibpb);
++ 
++ DECLARE_STATIC_KEY_FALSE(mds_user_clear);
++ 
++ #include <asm/segment.h>
++ 
++ /**
++  * mds_clear_cpu_buffers - Mitigation for MDS vulnerability
++  *
++  * This uses the otherwise unused and obsolete VERW instruction in
++  * combination with microcode which triggers a CPU buffer flush when the
++  * instruction is executed.
++  */
++ static inline void mds_clear_cpu_buffers(void)
++ {
++ 	static const u16 ds = __KERNEL_DS;
++ 
++ 	/*
++ 	 * Has to be the memory-operand variant because only that
++ 	 * guarantees the CPU buffer flush functionality according to
++ 	 * documentation. The register-operand variant does not.
++ 	 * Works with any segment selector, but a valid writable
++ 	 * data segment is the fastest variant.
++ 	 *
++ 	 * "cc" clobber is required because VERW modifies ZF.
++ 	 */
++ 	asm volatile("verw %[ds]" : : [ds] "m" (ds) : "cc");
+++>>>>>>> 04dcbdb80578 (x86/speculation/mds: Clear CPU buffers on exit to user)
++ }
++ 
++ /**
++  * mds_user_clear_cpu_buffers - Mitigation for MDS vulnerability
++  *
++  * Clear CPU buffers if the corresponding static key is enabled
++  */
++ static inline void mds_user_clear_cpu_buffers(void)
++ {
++ 	if (static_branch_likely(&mds_user_clear))
++ 		mds_clear_cpu_buffers();
+  }
+  
+  #endif /* __ASSEMBLY__ */
+diff --cc arch/x86/kernel/nmi.c
+index dffffa5903a7,086cf1d1d71d..000000000000
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@@ -30,6 -33,11 +30,14 @@@
+  #include <asm/nmi.h>
+  #include <asm/x86_init.h>
+  #include <asm/reboot.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/cache.h>
++ #include <asm/nospec-branch.h>
++ 
++ #define CREATE_TRACE_POINTS
++ #include <trace/events/nmi.h>
+++>>>>>>> 04dcbdb80578 (x86/speculation/mds: Clear CPU buffers on exit to user)
+  
+  struct nmi_desc {
+  	raw_spinlock_t lock;
+@@@ -519,7 -534,11 +527,10 @@@ nmi_restart
+  		write_cr2(this_cpu_read(nmi_cr2));
+  	if (this_cpu_dec_return(nmi_state))
+  		goto nmi_restart;
++ 
++ 	if (user_mode(regs))
++ 		mds_user_clear_cpu_buffers();
+  }
+ -NOKPROBE_SYMBOL(do_nmi);
+  
+  void stop_nmi(void)
+  {
+diff --cc arch/x86/kernel/traps.c
+index a8f6f42edf9f,85fe1870f873..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -58,11 -55,13 +58,12 @@@
+  #include <asm/mce.h>
+  #include <asm/fixmap.h>
+  #include <asm/mach_traps.h>
+ -#include <asm/alternative.h>
+ -#include <asm/fpu/xstate.h>
+ +#include <asm/xsave.h>
+  #include <asm/trace/mpx.h>
++ #include <asm/nospec-branch.h>
+  #include <asm/mpx.h>
+ -#include <asm/vm86.h>
+  #include <asm/umip.h>
+ +#include <asm/alternative.h>
+  
+  #ifdef CONFIG_X86_64
+  #include <asm/x86_init.h>
+@@@ -234,9 -317,68 +235,70 @@@ dotraplinkage void do_double_fault(stru
+  {
+  	static const char str[] = "double fault";
+  	struct task_struct *tsk = current;
+ -#ifdef CONFIG_VMAP_STACK
+ -	unsigned long cr2;
+ -#endif
+  
+++<<<<<<< HEAD
+ +	exception_enter();
+ +	/* Return not checked because double check cannot be ignored */
+++=======
++ #ifdef CONFIG_X86_ESPFIX64
++ 	extern unsigned char native_irq_return_iret[];
++ 
++ 	/*
++ 	 * If IRET takes a non-IST fault on the espfix64 stack, then we
++ 	 * end up promoting it to a doublefault.  In that case, take
++ 	 * advantage of the fact that we're not using the normal (TSS.sp0)
++ 	 * stack right now.  We can write a fake #GP(0) frame at TSS.sp0
++ 	 * and then modify our own IRET frame so that, when we return,
++ 	 * we land directly at the #GP(0) vector with the stack already
++ 	 * set up according to its expectations.
++ 	 *
++ 	 * The net result is that our #GP handler will think that we
++ 	 * entered from usermode with the bad user context.
++ 	 *
++ 	 * No need for ist_enter here because we don't use RCU.
++ 	 */
++ 	if (((long)regs->sp >> P4D_SHIFT) == ESPFIX_PGD_ENTRY &&
++ 		regs->cs == __KERNEL_CS &&
++ 		regs->ip == (unsigned long)native_irq_return_iret)
++ 	{
++ 		struct pt_regs *gpregs = (struct pt_regs *)this_cpu_read(cpu_tss_rw.x86_tss.sp0) - 1;
++ 
++ 		/*
++ 		 * regs->sp points to the failing IRET frame on the
++ 		 * ESPFIX64 stack.  Copy it to the entry stack.  This fills
++ 		 * in gpregs->ss through gpregs->ip.
++ 		 *
++ 		 */
++ 		memmove(&gpregs->ip, (void *)regs->sp, 5*8);
++ 		gpregs->orig_ax = 0;  /* Missing (lost) #GP error code */
++ 
++ 		/*
++ 		 * Adjust our frame so that we return straight to the #GP
++ 		 * vector with the expected RSP value.  This is safe because
++ 		 * we won't enable interupts or schedule before we invoke
++ 		 * general_protection, so nothing will clobber the stack
++ 		 * frame we just set up.
++ 		 *
++ 		 * We will enter general_protection with kernel GSBASE,
++ 		 * which is what the stub expects, given that the faulting
++ 		 * RIP will be the IRET instruction.
++ 		 */
++ 		regs->ip = (unsigned long)general_protection;
++ 		regs->sp = (unsigned long)&gpregs->orig_ax;
++ 
++ 		/*
++ 		 * This situation can be triggered by userspace via
++ 		 * modify_ldt(2) and the return does not take the regular
++ 		 * user space exit, so a CPU buffer clear is required when
++ 		 * MDS mitigation is enabled.
++ 		 */
++ 		mds_user_clear_cpu_buffers();
++ 		return;
++ 	}
++ #endif
++ 
++ 	ist_enter(regs);
+++>>>>>>> 04dcbdb80578 (x86/speculation/mds: Clear CPU buffers on exit to user)
+  	notify_die(DIE_TRAP, str, regs, error_code, X86_TRAP_DF, SIGSEGV);
+  
+  	tsk->thread.error_code = error_code;
+* Unmerged path Documentation/x86/mds.rst
+* Unmerged path arch/x86/entry/common.c
+* Unmerged path Documentation/x86/mds.rst
+* Unmerged path arch/x86/entry/common.c
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index 6ec1d2da76d1..6aa4906002e9 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -32,6 +32,9 @@ void ssb_select_mitigation(void);
+ static void __init l1tf_select_mitigation(void);
+ extern void spec_ctrl_save_msr(void);
+ 
++/* Control MDS CPU buffer clear before returning to user space */
++DEFINE_STATIC_KEY_FALSE(mds_user_clear);
++
+ void __init check_bugs(void)
+ {
+ 	identify_boot_cpu();
+* Unmerged path arch/x86/kernel/nmi.c
+* Unmerged path arch/x86/kernel/traps.c
