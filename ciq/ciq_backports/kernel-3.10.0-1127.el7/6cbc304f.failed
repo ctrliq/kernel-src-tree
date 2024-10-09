@@ -1,0 +1,234 @@
+perf/x86/intel: Fix unwind errors from PEBS entries (mk-II)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6cbc304f2f360f25cc8607817239d6f4a2fd3dc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/6cbc304f.failed
+
+Vince reported the perf_fuzzer giving various unwinder warnings and
+Josh reported:
+
+> Deja vu.  Most of these are related to perf PEBS, similar to the
+> following issue:
+>
+>   b8000586c90b ("perf/x86/intel: Cure bogus unwind from PEBS entries")
+>
+> This is basically the ORC version of that.  setup_pebs_sample_data() is
+> assembling a franken-pt_regs which ORC isn't happy about.  RIP is
+> inconsistent with some of the other registers (like RSP and RBP).
+
+And where the previous unwinder only needed BP,SP ORC also requires
+IP. But we cannot spoof IP because then the sample will get displaced,
+entirely negating the point of PEBS.
+
+So cure the whole thing differently by doing the unwind early; this
+does however require a means to communicate we did the unwind early.
+We (ab)use an unused sample_type bit for this, which we set on events
+that fill out the data->callchain before the normal
+perf_prepare_sample().
+
+	Debugged-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Reported-by: Vince Weaver <vincent.weaver@maine.edu>
+	Tested-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Tested-by: Prashant Bhole <bhole_prashant_q7@lab.ntt.co.jp>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6cbc304f2f360f25cc8607817239d6f4a2fd3dc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index 1c6d0613d0a3,87f6db437e4a..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -1021,18 -1125,37 +1021,24 @@@ extern void perf_event_fork(struct task
+  /* Callchains */
+  DECLARE_PER_CPU(struct perf_callchain_entry, perf_callchain_entry);
+  
+ -extern void perf_callchain_user(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs);
+ -extern void perf_callchain_kernel(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs);
+ +extern void perf_callchain_user(struct perf_callchain_entry *entry, struct pt_regs *regs);
+ +extern void perf_callchain_kernel(struct perf_callchain_entry *entry, struct pt_regs *regs);
+  extern struct perf_callchain_entry *
+  get_perf_callchain(struct pt_regs *regs, u32 init_nr, bool kernel, bool user,
+++<<<<<<< HEAD
+ +		   bool crosstask, bool add_mark);
+ +extern int get_callchain_buffers(void);
+++=======
++ 		   u32 max_stack, bool crosstask, bool add_mark);
++ extern struct perf_callchain_entry *perf_callchain(struct perf_event *event, struct pt_regs *regs);
++ extern int get_callchain_buffers(int max_stack);
+++>>>>>>> 6cbc304f2f36 (perf/x86/intel: Fix unwind errors from PEBS entries (mk-II))
+  extern void put_callchain_buffers(void);
+  
+ -extern int sysctl_perf_event_max_stack;
+ -extern int sysctl_perf_event_max_contexts_per_stack;
+ -
+ -static inline int perf_callchain_store_context(struct perf_callchain_entry_ctx *ctx, u64 ip)
+ +static inline int perf_callchain_store(struct perf_callchain_entry *entry, u64 ip)
+  {
+ -	if (ctx->contexts < sysctl_perf_event_max_contexts_per_stack) {
+ -		struct perf_callchain_entry *entry = ctx->entry;
+ +	if (entry->nr < PERF_MAX_STACK_DEPTH) {
+  		entry->ip[entry->nr++] = ip;
+ -		++ctx->contexts;
+ -		return 0;
+ -	} else {
+ -		ctx->contexts_maxed = true;
+ -		return -1; /* no more room, stop walking the stack */
+ -	}
+ -}
+ -
+ -static inline int perf_callchain_store(struct perf_callchain_entry_ctx *ctx, u64 ip)
+ -{
+ -	if (ctx->nr < ctx->max_stack && !ctx->contexts_maxed) {
+ -		struct perf_callchain_entry *entry = ctx->entry;
+ -		entry->ip[entry->nr++] = ip;
+ -		++ctx->nr;
+  		return 0;
+  	} else {
+  		return -1; /* no more room, stop walking the stack */
+diff --cc kernel/events/core.c
+index 559f40f24854,cdb32cf8e33c..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -6188,6 -6341,26 +6188,29 @@@ static u64 perf_virt_to_phys(u64 virt
+  	return phys_addr;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct perf_callchain_entry __empty_callchain = { .nr = 0, };
++ 
++ struct perf_callchain_entry *
++ perf_callchain(struct perf_event *event, struct pt_regs *regs)
++ {
++ 	bool kernel = !event->attr.exclude_callchain_kernel;
++ 	bool user   = !event->attr.exclude_callchain_user;
++ 	/* Disallow cross-task user callchains. */
++ 	bool crosstask = event->ctx->task && event->ctx->task != current;
++ 	const u32 max_stack = event->attr.sample_max_stack;
++ 	struct perf_callchain_entry *callchain;
++ 
++ 	if (!kernel && !user)
++ 		return &__empty_callchain;
++ 
++ 	callchain = get_perf_callchain(regs, 0, kernel, user,
++ 				       max_stack, crosstask, true);
++ 	return callchain ?: &__empty_callchain;
++ }
++ 
+++>>>>>>> 6cbc304f2f36 (perf/x86/intel: Fix unwind errors from PEBS entries (mk-II))
+  void perf_prepare_sample(struct perf_event_header *header,
+  			 struct perf_sample_data *data,
+  			 struct perf_event *event,
+@@@ -6209,10 -6382,10 +6232,17 @@@
+  	if (sample_type & PERF_SAMPLE_CALLCHAIN) {
+  		int size = 1;
+  
+++<<<<<<< HEAD
+ +		data->callchain = perf_callchain(event, regs);
+ +
+ +		if (data->callchain)
+ +			size += data->callchain->nr;
+++=======
++ 		if (!(sample_type & __PERF_SAMPLE_CALLCHAIN_EARLY))
++ 			data->callchain = perf_callchain(event, regs);
++ 
++ 		size += data->callchain->nr;
+++>>>>>>> 6cbc304f2f36 (perf/x86/intel: Fix unwind errors from PEBS entries (mk-II))
+  
+  		header->size += size * sizeof(u64);
+  	}
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 9266ff826d65..743ea76c9361 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -3137,6 +3137,9 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 		}
+ 		if (x86_pmu.pebs_aliases)
+ 			x86_pmu.pebs_aliases(event);
++
++		if (event->attr.sample_type & PERF_SAMPLE_CALLCHAIN)
++			event->attr.sample_type |= __PERF_SAMPLE_CALLCHAIN_EARLY;
+ 	}
+ 
+ 	if (needs_branch_stack(event)) {
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 722756c9e89d..2ce270ea0cef 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -1136,17 +1136,21 @@ static void setup_pebs_sample_data(struct perf_event *event,
+ 	if (sample_type & PERF_SAMPLE_DATA_SRC)
+ 		data->data_src.val = get_data_src(event, pebs->dse);
+ 
++	/*
++	 * We must however always use iregs for the unwinder to stay sane; the
++	 * record BP,SP,IP can point into thin air when the record is from a
++	 * previous PMI context or an (I)RET happend between the record and
++	 * PMI.
++	 */
++	if (sample_type & PERF_SAMPLE_CALLCHAIN)
++		data->callchain = perf_callchain(event, iregs);
++
+ 	/*
+ 	 * We use the interrupt regs as a base because the PEBS record does not
+ 	 * contain a full regs set, specifically it seems to lack segment
+ 	 * descriptors, which get used by things like user_mode().
+ 	 *
+ 	 * In the simple case fix up only the IP for PERF_SAMPLE_IP.
+-	 *
+-	 * We must however always use BP,SP from iregs for the unwinder to stay
+-	 * sane; the record BP,SP can point into thin air when the record is
+-	 * from a previous PMI context or an (I)RET happend between the record
+-	 * and PMI.
+ 	 */
+ 	*regs = *iregs;
+ 
+@@ -1165,15 +1169,8 @@ static void setup_pebs_sample_data(struct perf_event *event,
+ 		regs->si = pebs->si;
+ 		regs->di = pebs->di;
+ 
+-		/*
+-		 * Per the above; only set BP,SP if we don't need callchains.
+-		 *
+-		 * XXX: does this make sense?
+-		 */
+-		if (!(sample_type & PERF_SAMPLE_CALLCHAIN)) {
+-			regs->bp = pebs->bp;
+-			regs->sp = pebs->sp;
+-		}
++		regs->bp = pebs->bp;
++		regs->sp = pebs->sp;
+ 
+ #ifndef CONFIG_X86_32
+ 		regs->r8 = pebs->r8;
+* Unmerged path include/linux/perf_event.h
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 08325451457c..4f1cac19c3df 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -142,6 +142,8 @@ enum perf_event_sample_format {
+ 	PERF_SAMPLE_PHYS_ADDR			= 1U << 19,
+ 
+ 	PERF_SAMPLE_MAX = 1U << 20,		/* non-ABI */
++
++	__PERF_SAMPLE_CALLCHAIN_EARLY		= 1ULL << 63,
+ };
+ 
+ /*
+* Unmerged path kernel/events/core.c
