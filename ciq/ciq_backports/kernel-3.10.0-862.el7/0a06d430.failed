@@ -1,0 +1,725 @@
+target: simplify backend driver registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] simplify backend driver registration (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 90.00%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0a06d4309dc168dfa70cec3cf0cd9eb7fc15a2fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0a06d430.failed
+
+Rewrite the backend driver registration based on what we did to the fabric
+drivers:  introduce a read-only struct target_bakckend_ops that the driver
+registers, which is then instanciate as a struct target_backend by the
+core.  This allows the ops vector to be smaller and allows us to mark it
+const.  At the same time the registration function can set up the
+configfs attributes, avoiding the need to add additional boilerplate code
+for that to the drivers.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 0a06d4309dc168dfa70cec3cf0cd9eb7fc15a2fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_internal.h
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_internal.h
+index 874a9bc988d8,01181aed67dc..000000000000
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@@ -41,6 -53,18 +54,21 @@@ struct se_device *target_alloc_device(s
+  int	target_configure_device(struct se_device *dev);
+  void	target_free_device(struct se_device *);
+  
+++<<<<<<< HEAD
+++=======
++ /* target_core_configfs.c */
++ void	target_setup_backend_cits(struct target_backend *);
++ 
++ /* target_core_fabric_lib.c */
++ int	target_get_pr_transport_id_len(struct se_node_acl *nacl,
++ 		struct t10_pr_registration *pr_reg, int *format_code);
++ int	target_get_pr_transport_id(struct se_node_acl *nacl,
++ 		struct t10_pr_registration *pr_reg, int *format_code,
++ 		unsigned char *buf);
++ const char *target_parse_pr_out_transport_id(struct se_portal_group *tpg,
++ 		const char *buf, u32 *out_tid_len, char **port_nexus_ptr);
++ 
+++>>>>>>> 0a06d4309dc1 (target: simplify backend driver registration)
+  /* target_core_hba.c */
+  struct se_hba *core_alloc_hba(const char *, u32, u32);
+  int	core_delete_hba(struct se_hba *);
+diff --cc drivers/target/target_core_user.c
+index 7dc2f05f8e5e,fb67e313dc4f..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1479,8 -1115,10 +1479,8 @@@ static struct configfs_attribute *tcmu_
+  	NULL,
+  };
+  
+- static struct se_subsystem_api tcmu_template = {
++ static const struct target_backend_ops tcmu_ops = {
+  	.name			= "user",
+ -	.inquiry_prod		= "USER",
+ -	.inquiry_rev		= TCMU_VERSION,
+  	.owner			= THIS_MODULE,
+  	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH,
+  	.attach_hba		= tcmu_attach_hba,
+@@@ -1544,8 -1176,7 +1541,12 @@@ out_free_cache
+  
+  static void __exit tcmu_module_exit(void)
+  {
+++<<<<<<< HEAD
+ +	idr_destroy(&devices_idr);
+ +	transport_subsystem_release(&tcmu_template);
+++=======
++ 	target_backend_unregister(&tcmu_ops);
+++>>>>>>> 0a06d4309dc1 (target: simplify backend driver registration)
+  	genl_unregister_family(&tcmu_genl_family);
+  	root_device_unregister(tcmu_root_device);
+  	kmem_cache_destroy(tcmu_cmd_cache);
+diff --git a/drivers/target/target_core_configfs.c b/drivers/target/target_core_configfs.c
+index 5a4ad5ca14f6..0fd6c2bd9d24 100644
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -51,15 +51,26 @@
+ #include "target_core_xcopy.h"
+ 
+ #define TB_CIT_SETUP(_name, _item_ops, _group_ops, _attrs)		\
+-static void target_core_setup_##_name##_cit(struct se_subsystem_api *sa) \
++static void target_core_setup_##_name##_cit(struct target_backend *tb)	\
+ {									\
+-	struct target_backend_cits *tbc = &sa->tb_cits;			\
+-	struct config_item_type *cit = &tbc->tb_##_name##_cit;		\
++	struct config_item_type *cit = &tb->tb_##_name##_cit;		\
+ 									\
+ 	cit->ct_item_ops = _item_ops;					\
+ 	cit->ct_group_ops = _group_ops;					\
+ 	cit->ct_attrs = _attrs;						\
+-	cit->ct_owner = sa->owner;					\
++	cit->ct_owner = tb->ops->owner;					\
++	pr_debug("Setup generic %s\n", __stringify(_name));		\
++}
++
++#define TB_CIT_SETUP_DRV(_name, _item_ops, _group_ops)			\
++static void target_core_setup_##_name##_cit(struct target_backend *tb)	\
++{									\
++	struct config_item_type *cit = &tb->tb_##_name##_cit;		\
++									\
++	cit->ct_item_ops = _item_ops;					\
++	cit->ct_group_ops = _group_ops;					\
++	cit->ct_attrs = tb->ops->tb_##_name##_attrs;			\
++	cit->ct_owner = tb->ops->owner;					\
+ 	pr_debug("Setup generic %s\n", __stringify(_name));		\
+ }
+ 
+@@ -594,7 +605,7 @@ static struct configfs_item_operations target_core_dev_attrib_ops = {
+ 	.store_attribute	= target_core_dev_attrib_attr_store,
+ };
+ 
+-TB_CIT_SETUP(dev_attrib, &target_core_dev_attrib_ops, NULL, NULL);
++TB_CIT_SETUP_DRV(dev_attrib, &target_core_dev_attrib_ops, NULL);
+ 
+ /* End functions for struct config_item_type tb_dev_attrib_cit */
+ 
+@@ -1301,13 +1312,13 @@ TB_CIT_SETUP(dev_pr, &target_core_dev_pr_ops, NULL, target_core_dev_pr_attrs);
+ static ssize_t target_core_show_dev_info(void *p, char *page)
+ {
+ 	struct se_device *dev = p;
+-	struct se_subsystem_api *t = dev->transport;
+ 	int bl = 0;
+ 	ssize_t read_bytes = 0;
+ 
+ 	transport_dump_dev_state(dev, page, &bl);
+ 	read_bytes += bl;
+-	read_bytes += t->show_configfs_dev_params(dev, page+read_bytes);
++	read_bytes += dev->transport->show_configfs_dev_params(dev,
++			page+read_bytes);
+ 	return read_bytes;
+ }
+ 
+@@ -1325,9 +1336,8 @@ static ssize_t target_core_store_dev_control(
+ 	size_t count)
+ {
+ 	struct se_device *dev = p;
+-	struct se_subsystem_api *t = dev->transport;
+ 
+-	return t->set_configfs_dev_params(dev, page, count);
++	return dev->transport->set_configfs_dev_params(dev, page, count);
+ }
+ 
+ static struct target_core_configfs_attribute target_core_attr_dev_control = {
+@@ -2604,9 +2614,9 @@ static struct config_group *target_core_make_subdev(
+ 	const char *name)
+ {
+ 	struct t10_alua_tg_pt_gp *tg_pt_gp;
+-	struct se_subsystem_api *t;
+ 	struct config_item *hba_ci = &group->cg_item;
+ 	struct se_hba *hba = item_to_hba(hba_ci);
++	struct target_backend *tb = hba->backend;
+ 	struct se_device *dev;
+ 	struct config_group *dev_cg = NULL, *tg_pt_gp_cg = NULL;
+ 	struct config_group *dev_stat_grp = NULL;
+@@ -2615,10 +2625,6 @@ static struct config_group *target_core_make_subdev(
+ 	ret = mutex_lock_interruptible(&hba->hba_access_mutex);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+-	/*
+-	 * Locate the struct se_subsystem_api from parent's struct se_hba.
+-	 */
+-	t = hba->transport;
+ 
+ 	dev = target_alloc_device(hba, name);
+ 	if (!dev)
+@@ -2631,17 +2637,17 @@ static struct config_group *target_core_make_subdev(
+ 	if (!dev_cg->default_groups)
+ 		goto out_free_device;
+ 
+-	config_group_init_type_name(dev_cg, name, &t->tb_cits.tb_dev_cit);
++	config_group_init_type_name(dev_cg, name, &tb->tb_dev_cit);
+ 	config_group_init_type_name(&dev->dev_attrib.da_group, "attrib",
+-			&t->tb_cits.tb_dev_attrib_cit);
++			&tb->tb_dev_attrib_cit);
+ 	config_group_init_type_name(&dev->dev_pr_group, "pr",
+-			&t->tb_cits.tb_dev_pr_cit);
++			&tb->tb_dev_pr_cit);
+ 	config_group_init_type_name(&dev->t10_wwn.t10_wwn_group, "wwn",
+-			&t->tb_cits.tb_dev_wwn_cit);
++			&tb->tb_dev_wwn_cit);
+ 	config_group_init_type_name(&dev->t10_alua.alua_tg_pt_gps_group,
+-			"alua", &t->tb_cits.tb_dev_alua_tg_pt_gps_cit);
++			"alua", &tb->tb_dev_alua_tg_pt_gps_cit);
+ 	config_group_init_type_name(&dev->dev_stat_grps.stat_group,
+-			"statistics", &t->tb_cits.tb_dev_stat_cit);
++			"statistics", &tb->tb_dev_stat_cit);
+ 
+ 	dev_cg->default_groups[0] = &dev->dev_attrib.da_group;
+ 	dev_cg->default_groups[1] = &dev->dev_pr_group;
+@@ -2771,7 +2777,7 @@ static ssize_t target_core_hba_show_attr_hba_info(
+ 	char *page)
+ {
+ 	return sprintf(page, "HBA Index: %d plugin: %s version: %s\n",
+-			hba->hba_id, hba->transport->name,
++			hba->hba_id, hba->backend->ops->name,
+ 			TARGET_CORE_CONFIGFS_VERSION);
+ }
+ 
+@@ -2791,11 +2797,10 @@ static ssize_t target_core_hba_show_attr_hba_mode(struct se_hba *hba,
+ static ssize_t target_core_hba_store_attr_hba_mode(struct se_hba *hba,
+ 				const char *page, size_t count)
+ {
+-	struct se_subsystem_api *transport = hba->transport;
+ 	unsigned long mode_flag;
+ 	int ret;
+ 
+-	if (transport->pmode_enable_hba == NULL)
++	if (hba->backend->ops->pmode_enable_hba == NULL)
+ 		return -EINVAL;
+ 
+ 	ret = kstrtoul(page, 0, &mode_flag);
+@@ -2809,7 +2814,7 @@ static ssize_t target_core_hba_store_attr_hba_mode(struct se_hba *hba,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = transport->pmode_enable_hba(hba, mode_flag);
++	ret = hba->backend->ops->pmode_enable_hba(hba, mode_flag);
+ 	if (ret < 0)
+ 		return -EINVAL;
+ 	if (ret > 0)
+@@ -2935,16 +2940,15 @@ static struct config_item_type target_core_cit = {
+ 
+ /* Stop functions for struct config_item_type target_core_hba_cit */
+ 
+-void target_core_setup_sub_cits(struct se_subsystem_api *sa)
++void target_setup_backend_cits(struct target_backend *tb)
+ {
+-	target_core_setup_dev_cit(sa);
+-	target_core_setup_dev_attrib_cit(sa);
+-	target_core_setup_dev_pr_cit(sa);
+-	target_core_setup_dev_wwn_cit(sa);
+-	target_core_setup_dev_alua_tg_pt_gps_cit(sa);
+-	target_core_setup_dev_stat_cit(sa);
++	target_core_setup_dev_cit(tb);
++	target_core_setup_dev_attrib_cit(tb);
++	target_core_setup_dev_pr_cit(tb);
++	target_core_setup_dev_wwn_cit(tb);
++	target_core_setup_dev_alua_tg_pt_gps_cit(tb);
++	target_core_setup_dev_stat_cit(tb);
+ }
+-EXPORT_SYMBOL(target_core_setup_sub_cits);
+ 
+ static int __init target_core_init_configfs(void)
+ {
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 53dcefb982bc..31394bc99e86 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -1473,13 +1473,13 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
+ 	struct se_device *dev;
+ 	struct se_lun *xcopy_lun;
+ 
+-	dev = hba->transport->alloc_device(hba, name);
++	dev = hba->backend->ops->alloc_device(hba, name);
+ 	if (!dev)
+ 		return NULL;
+ 
+ 	dev->dev_link_magic = SE_DEV_LINK_MAGIC;
+ 	dev->se_hba = hba;
+-	dev->transport = hba->transport;
++	dev->transport = hba->backend->ops;
+ 	dev->prot_length = sizeof(struct se_dif_v1_tuple);
+ 
+ 	INIT_LIST_HEAD(&dev->dev_list);
+@@ -1682,7 +1682,7 @@ int core_dev_setup_virtual_lun0(void)
+ 		goto out_free_hba;
+ 	}
+ 
+-	hba->transport->set_configfs_dev_params(dev, buf, sizeof(buf));
++	hba->backend->ops->set_configfs_dev_params(dev, buf, sizeof(buf));
+ 
+ 	ret = target_configure_device(dev);
+ 	if (ret)
+diff --git a/drivers/target/target_core_file.c b/drivers/target/target_core_file.c
+index 909f66aed985..ff776bd7781e 100644
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@ -46,10 +46,6 @@ static inline struct fd_dev *FD_DEV(struct se_device *dev)
+ 	return container_of(dev, struct fd_dev, dev);
+ }
+ 
+-/*	fd_attach_hba(): (Part of se_subsystem_api_t template)
+- *
+- *
+- */
+ static int fd_attach_hba(struct se_hba *hba, u32 host_id)
+ {
+ 	struct fd_host *fd_host;
+@@ -1014,7 +1010,7 @@ static struct configfs_attribute *fileio_backend_dev_attrs[] = {
+ 	NULL,
+ };
+ 
+-static struct se_subsystem_api fileio_template = {
++static const struct target_backend_ops fileio_ops = {
+ 	.name			= "fileio",
+ 	.inquiry_prod		= "FILEIO",
+ 	.inquiry_rev		= FD_VERSION,
+@@ -1032,21 +1028,17 @@ static struct se_subsystem_api fileio_template = {
+ 	.init_prot		= fd_init_prot,
+ 	.format_prot		= fd_format_prot,
+ 	.free_prot		= fd_free_prot,
++	.tb_dev_attrib_attrs	= fileio_backend_dev_attrs,
+ };
+ 
+ static int __init fileio_module_init(void)
+ {
+-	struct target_backend_cits *tbc = &fileio_template.tb_cits;
+-
+-	target_core_setup_sub_cits(&fileio_template);
+-	tbc->tb_dev_attrib_cit.ct_attrs = fileio_backend_dev_attrs;
+-
+-	return transport_subsystem_register(&fileio_template);
++	return transport_backend_register(&fileio_ops);
+ }
+ 
+ static void __exit fileio_module_exit(void)
+ {
+-	transport_subsystem_release(&fileio_template);
++	target_backend_unregister(&fileio_ops);
+ }
+ 
+ MODULE_DESCRIPTION("TCM FILEIO subsystem plugin");
+diff --git a/drivers/target/target_core_hba.c b/drivers/target/target_core_hba.c
+index ff95f95dcd13..55142a431ed6 100644
+--- a/drivers/target/target_core_hba.c
++++ b/drivers/target/target_core_hba.c
+@@ -40,63 +40,75 @@
+ 
+ #include "target_core_internal.h"
+ 
+-static LIST_HEAD(subsystem_list);
+-static DEFINE_MUTEX(subsystem_mutex);
++static LIST_HEAD(backend_list);
++static DEFINE_MUTEX(backend_mutex);
+ 
+ static u32 hba_id_counter;
+ 
+ static DEFINE_SPINLOCK(hba_lock);
+ static LIST_HEAD(hba_list);
+ 
+-int transport_subsystem_register(struct se_subsystem_api *sub_api)
+-{
+-	struct se_subsystem_api *s;
+-
+-	INIT_LIST_HEAD(&sub_api->sub_api_list);
+ 
+-	mutex_lock(&subsystem_mutex);
+-	list_for_each_entry(s, &subsystem_list, sub_api_list) {
+-		if (!strcmp(s->name, sub_api->name)) {
+-			pr_err("%p is already registered with"
+-				" duplicate name %s, unable to process"
+-				" request\n", s, s->name);
+-			mutex_unlock(&subsystem_mutex);
++int transport_backend_register(const struct target_backend_ops *ops)
++{
++	struct target_backend *tb, *old;
++
++	tb = kzalloc(sizeof(*tb), GFP_KERNEL);
++	if (!tb)
++		return -ENOMEM;
++	tb->ops = ops;
++
++	mutex_lock(&backend_mutex);
++	list_for_each_entry(old, &backend_list, list) {
++		if (!strcmp(old->ops->name, ops->name)) {
++			pr_err("backend %s already registered.\n", ops->name);
++			mutex_unlock(&backend_mutex);
++			kfree(tb);
+ 			return -EEXIST;
+ 		}
+ 	}
+-	list_add_tail(&sub_api->sub_api_list, &subsystem_list);
+-	mutex_unlock(&subsystem_mutex);
++	target_setup_backend_cits(tb);
++	list_add_tail(&tb->list, &backend_list);
++	mutex_unlock(&backend_mutex);
+ 
+-	pr_debug("TCM: Registered subsystem plugin: %s struct module:"
+-			" %p\n", sub_api->name, sub_api->owner);
++	pr_debug("TCM: Registered subsystem plugin: %s struct module: %p\n",
++			ops->name, ops->owner);
+ 	return 0;
+ }
+-EXPORT_SYMBOL(transport_subsystem_register);
++EXPORT_SYMBOL(transport_backend_register);
+ 
+-void transport_subsystem_release(struct se_subsystem_api *sub_api)
++void target_backend_unregister(const struct target_backend_ops *ops)
+ {
+-	mutex_lock(&subsystem_mutex);
+-	list_del(&sub_api->sub_api_list);
+-	mutex_unlock(&subsystem_mutex);
++	struct target_backend *tb;
++
++	mutex_lock(&backend_mutex);
++	list_for_each_entry(tb, &backend_list, list) {
++		if (tb->ops == ops) {
++			list_del(&tb->list);
++			kfree(tb);
++			break;
++		}
++	}
++	mutex_unlock(&backend_mutex);
+ }
+-EXPORT_SYMBOL(transport_subsystem_release);
++EXPORT_SYMBOL(target_backend_unregister);
+ 
+-static struct se_subsystem_api *core_get_backend(const char *sub_name)
++static struct target_backend *core_get_backend(const char *name)
+ {
+-	struct se_subsystem_api *s;
++	struct target_backend *tb;
+ 
+-	mutex_lock(&subsystem_mutex);
+-	list_for_each_entry(s, &subsystem_list, sub_api_list) {
+-		if (!strcmp(s->name, sub_name))
++	mutex_lock(&backend_mutex);
++	list_for_each_entry(tb, &backend_list, list) {
++		if (!strcmp(tb->ops->name, name))
+ 			goto found;
+ 	}
+-	mutex_unlock(&subsystem_mutex);
++	mutex_unlock(&backend_mutex);
+ 	return NULL;
+ found:
+-	if (s->owner && !try_module_get(s->owner))
+-		s = NULL;
+-	mutex_unlock(&subsystem_mutex);
+-	return s;
++	if (tb->ops->owner && !try_module_get(tb->ops->owner))
++		tb = NULL;
++	mutex_unlock(&backend_mutex);
++	return tb;
+ }
+ 
+ struct se_hba *
+@@ -117,13 +129,13 @@ core_alloc_hba(const char *plugin_name, u32 plugin_dep_id, u32 hba_flags)
+ 	hba->hba_index = scsi_get_new_index(SCSI_INST_INDEX);
+ 	hba->hba_flags |= hba_flags;
+ 
+-	hba->transport = core_get_backend(plugin_name);
+-	if (!hba->transport) {
++	hba->backend = core_get_backend(plugin_name);
++	if (!hba->backend) {
+ 		ret = -EINVAL;
+ 		goto out_free_hba;
+ 	}
+ 
+-	ret = hba->transport->attach_hba(hba, plugin_dep_id);
++	ret = hba->backend->ops->attach_hba(hba, plugin_dep_id);
+ 	if (ret < 0)
+ 		goto out_module_put;
+ 
+@@ -138,8 +150,8 @@ core_alloc_hba(const char *plugin_name, u32 plugin_dep_id, u32 hba_flags)
+ 	return hba;
+ 
+ out_module_put:
+-	module_put(hba->transport->owner);
+-	hba->transport = NULL;
++	module_put(hba->backend->ops->owner);
++	hba->backend = NULL;
+ out_free_hba:
+ 	kfree(hba);
+ 	return ERR_PTR(ret);
+@@ -150,7 +162,7 @@ core_delete_hba(struct se_hba *hba)
+ {
+ 	WARN_ON(hba->dev_count);
+ 
+-	hba->transport->detach_hba(hba);
++	hba->backend->ops->detach_hba(hba);
+ 
+ 	spin_lock(&hba_lock);
+ 	list_del(&hba->hba_node);
+@@ -159,9 +171,9 @@ core_delete_hba(struct se_hba *hba)
+ 	pr_debug("CORE_HBA[%d] - Detached HBA from Generic Target"
+ 			" Core\n", hba->hba_id);
+ 
+-	module_put(hba->transport->owner);
++	module_put(hba->backend->ops->owner);
+ 
+-	hba->transport = NULL;
++	hba->backend = NULL;
+ 	kfree(hba);
+ 	return 0;
+ }
+diff --git a/drivers/target/target_core_iblock.c b/drivers/target/target_core_iblock.c
+index 4ff1c8404aab..69c58fd46d32 100644
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@ -54,12 +54,6 @@ static inline struct iblock_dev *IBLOCK_DEV(struct se_device *dev)
+ }
+ 
+ 
+-static struct se_subsystem_api iblock_template;
+-
+-/*	iblock_attach_hba(): (Part of se_subsystem_api_t template)
+- *
+- *
+- */
+ static int iblock_attach_hba(struct se_hba *hba, u32 host_id)
+ {
+ 	pr_debug("CORE_HBA[%d] - TCM iBlock HBA Driver %s on"
+@@ -899,7 +893,7 @@ static struct configfs_attribute *iblock_backend_dev_attrs[] = {
+ 	NULL,
+ };
+ 
+-static struct se_subsystem_api iblock_template = {
++static const struct target_backend_ops iblock_ops = {
+ 	.name			= "iblock",
+ 	.inquiry_prod		= "IBLOCK",
+ 	.inquiry_rev		= IBLOCK_VERSION,
+@@ -919,21 +913,17 @@ static struct se_subsystem_api iblock_template = {
+ 	.get_io_min		= iblock_get_io_min,
+ 	.get_io_opt		= iblock_get_io_opt,
+ 	.get_write_cache	= iblock_get_write_cache,
++	.tb_dev_attrib_attrs	= iblock_backend_dev_attrs,
+ };
+ 
+ static int __init iblock_module_init(void)
+ {
+-	struct target_backend_cits *tbc = &iblock_template.tb_cits;
+-
+-	target_core_setup_sub_cits(&iblock_template);
+-	tbc->tb_dev_attrib_cit.ct_attrs = iblock_backend_dev_attrs;
+-
+-	return transport_subsystem_register(&iblock_template);
++	return transport_backend_register(&iblock_ops);
+ }
+ 
+ static void __exit iblock_module_exit(void)
+ {
+-	transport_subsystem_release(&iblock_template);
++	target_backend_unregister(&iblock_ops);
+ }
+ 
+ MODULE_DESCRIPTION("TCM IBLOCK subsystem plugin");
+* Unmerged path drivers/target/target_core_internal.h
+diff --git a/drivers/target/target_core_pscsi.c b/drivers/target/target_core_pscsi.c
+index 59a8a2963c0e..b8de49b5b052 100644
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@ -56,8 +56,6 @@ static inline struct pscsi_dev_virt *PSCSI_DEV(struct se_device *dev)
+ 	return container_of(dev, struct pscsi_dev_virt, dev);
+ }
+ 
+-static struct se_subsystem_api pscsi_template;
+-
+ static sense_reason_t pscsi_execute_cmd(struct se_cmd *cmd);
+ static void pscsi_req_done(struct request *, int);
+ 
+@@ -1189,7 +1187,7 @@ static struct configfs_attribute *pscsi_backend_dev_attrs[] = {
+ 	NULL,
+ };
+ 
+-static struct se_subsystem_api pscsi_template = {
++static const struct target_backend_ops pscsi_ops = {
+ 	.name			= "pscsi",
+ 	.owner			= THIS_MODULE,
+ 	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH |
+@@ -1206,21 +1204,17 @@ static struct se_subsystem_api pscsi_template = {
+ 	.show_configfs_dev_params = pscsi_show_configfs_dev_params,
+ 	.get_device_type	= pscsi_get_device_type,
+ 	.get_blocks		= pscsi_get_blocks,
++	.tb_dev_attrib_attrs	= pscsi_backend_dev_attrs,
+ };
+ 
+ static int __init pscsi_module_init(void)
+ {
+-	struct target_backend_cits *tbc = &pscsi_template.tb_cits;
+-
+-	target_core_setup_sub_cits(&pscsi_template);
+-	tbc->tb_dev_attrib_cit.ct_attrs = pscsi_backend_dev_attrs;
+-
+-	return transport_subsystem_register(&pscsi_template);
++	return transport_backend_register(&pscsi_ops);
+ }
+ 
+ static void __exit pscsi_module_exit(void)
+ {
+-	transport_subsystem_release(&pscsi_template);
++	target_backend_unregister(&pscsi_ops);
+ }
+ 
+ MODULE_DESCRIPTION("TCM PSCSI subsystem plugin");
+diff --git a/drivers/target/target_core_rd.c b/drivers/target/target_core_rd.c
+index 55315fd0f5d3..cf443a8a3cbe 100644
+--- a/drivers/target/target_core_rd.c
++++ b/drivers/target/target_core_rd.c
+@@ -43,10 +43,6 @@ static inline struct rd_dev *RD_DEV(struct se_device *dev)
+ 	return container_of(dev, struct rd_dev, dev);
+ }
+ 
+-/*	rd_attach_hba(): (Part of se_subsystem_api_t template)
+- *
+- *
+- */
+ static int rd_attach_hba(struct se_hba *hba, u32 host_id)
+ {
+ 	struct rd_host *rd_host;
+@@ -735,7 +731,7 @@ static struct configfs_attribute *rd_mcp_backend_dev_attrs[] = {
+ 	NULL,
+ };
+ 
+-static struct se_subsystem_api rd_mcp_template = {
++static const struct target_backend_ops rd_mcp_ops = {
+ 	.name			= "rd_mcp",
+ 	.inquiry_prod		= "RAMDISK-MCP",
+ 	.inquiry_rev		= RD_MCP_VERSION,
+@@ -751,25 +747,15 @@ static struct se_subsystem_api rd_mcp_template = {
+ 	.get_blocks		= rd_get_blocks,
+ 	.init_prot		= rd_init_prot,
+ 	.free_prot		= rd_free_prot,
++	.tb_dev_attrib_attrs	= rd_mcp_backend_dev_attrs,
+ };
+ 
+ int __init rd_module_init(void)
+ {
+-	struct target_backend_cits *tbc = &rd_mcp_template.tb_cits;
+-	int ret;
+-
+-	target_core_setup_sub_cits(&rd_mcp_template);
+-	tbc->tb_dev_attrib_cit.ct_attrs = rd_mcp_backend_dev_attrs;
+-
+-	ret = transport_subsystem_register(&rd_mcp_template);
+-	if (ret < 0) {
+-		return ret;
+-	}
+-
+-	return 0;
++	return transport_backend_register(&rd_mcp_ops);
+ }
+ 
+ void rd_module_exit(void)
+ {
+-	transport_subsystem_release(&rd_mcp_template);
++	target_backend_unregister(&rd_mcp_ops);
+ }
+* Unmerged path drivers/target/target_core_user.c
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index b898a92cae3d..01b61720a6d5 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -8,18 +8,7 @@
+  */
+ #define TRANSPORT_FLAG_PASSTHROUGH_ALUA		0x2
+ 
+-struct target_backend_cits {
+-	struct config_item_type tb_dev_cit;
+-	struct config_item_type tb_dev_attrib_cit;
+-	struct config_item_type tb_dev_pr_cit;
+-	struct config_item_type tb_dev_wwn_cit;
+-	struct config_item_type tb_dev_alua_tg_pt_gps_cit;
+-	struct config_item_type tb_dev_stat_cit;
+-};
+-
+-struct se_subsystem_api {
+-	struct list_head sub_api_list;
+-
++struct target_backend_ops {
+ 	char name[16];
+ 	char inquiry_prod[16];
+ 	char inquiry_rev[4];
+@@ -58,7 +47,7 @@ struct se_subsystem_api {
+ 	int (*format_prot)(struct se_device *);
+ 	void (*free_prot)(struct se_device *);
+ 
+-	struct target_backend_cits tb_cits;
++	struct configfs_attribute **tb_dev_attrib_attrs;
+ };
+ 
+ struct sbc_ops {
+@@ -70,8 +59,8 @@ struct sbc_ops {
+ 	sense_reason_t (*execute_unmap)(struct se_cmd *cmd);
+ };
+ 
+-int	transport_subsystem_register(struct se_subsystem_api *);
+-void	transport_subsystem_release(struct se_subsystem_api *);
++int	transport_backend_register(const struct target_backend_ops *);
++void	target_backend_unregister(const struct target_backend_ops *);
+ 
+ void	target_complete_cmd(struct se_cmd *, u8);
+ void	target_complete_cmd_with_length(struct se_cmd *, u8, int);
+@@ -110,9 +99,6 @@ sense_reason_t	transport_generic_map_mem_to_cmd(struct se_cmd *,
+ 
+ void	array_free(void *array, int n);
+ 
+-/* From target_core_configfs.c to setup default backend config_item_types */
+-void	target_core_setup_sub_cits(struct se_subsystem_api *);
+-
+ /* attribute helpers from target_core_device.c for backend drivers */
+ bool	se_dev_check_wce(struct se_device *);
+ int	se_dev_set_max_unmap_lba_count(struct se_device *, u32);
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 7bcf92529421..47e61807a483 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -811,7 +811,7 @@ struct se_device {
+ #define SE_UDEV_PATH_LEN 512		/* must be less than PAGE_SIZE */
+ 	unsigned char		udev_path[SE_UDEV_PATH_LEN];
+ 	/* Pointer to template of function pointers for transport */
+-	struct se_subsystem_api *transport;
++	const struct target_backend_ops *transport;
+ 	/* Linked list for struct se_hba struct se_device list */
+ 	struct list_head	dev_list;
+ 	struct se_lun		xcopy_lun;
+@@ -833,7 +833,7 @@ struct se_hba {
+ 	spinlock_t		device_lock;
+ 	struct config_group	hba_group;
+ 	struct mutex		hba_access_mutex;
+-	struct se_subsystem_api *transport;
++	struct target_backend	*backend;
+ };
+ 
+ struct scsi_port_stats {
