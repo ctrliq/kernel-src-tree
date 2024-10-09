@@ -1,0 +1,147 @@
+IB/ipoib: Log sysfs 'dev_id' accesses from userspace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Arseny Maslennikov <ar@cs.msu.ru>
+commit f6350da41dc728da5a27044bde6f770525ba97d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f6350da4.failed
+
+Some tools may currently be using only the deprecated attribute;
+let's print an elaborate and clear deprecation notice to kmsg.
+
+To do that, we have to replace the whole sysfs file, since we inherit
+the original one from netdev.
+
+	Signed-off-by: Arseny Maslennikov <ar@cs.msu.ru>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f6350da41dc728da5a27044bde6f770525ba97d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 7e4e2a9adc93,1df90f0d9e64..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -2222,18 -2387,33 +2222,48 @@@ int ipoib_add_pkey_attr(struct net_devi
+  	return device_create_file(&dev->dev, &dev_attr_pkey);
+  }
+  
+++<<<<<<< HEAD
+ +void ipoib_set_dev_features(struct ipoib_dev_priv *priv, struct ib_device *hca)
+ +{
+ +	priv->hca_caps = hca->attrs.device_cap_flags;
+ +
+ +	if (priv->hca_caps & IB_DEVICE_UD_IP_CSUM) {
+ +		priv->dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_RXCSUM;
+ +
+ +		if (priv->hca_caps & IB_DEVICE_UD_TSO)
+ +			priv->dev->hw_features |= NETIF_F_TSO;
+ +
+ +		priv->dev->features |= priv->dev->hw_features;
+ +	}
+++=======
++ /*
++  * We erroneously exposed the iface's port number in the dev_id
++  * sysfs field long after dev_port was introduced for that purpose[1],
++  * and we need to stop everyone from relying on that.
++  * Let's overload the shower routine for the dev_id file here
++  * to gently bring the issue up.
++  *
++  * [1] https://www.spinics.net/lists/netdev/msg272123.html
++  */
++ static ssize_t dev_id_show(struct device *dev,
++ 			   struct device_attribute *attr, char *buf)
++ {
++ 	struct net_device *ndev = to_net_dev(dev);
++ 
++ 	if (ndev->dev_id == ndev->dev_port)
++ 		netdev_info_once(ndev,
++ 			"\"%s\" wants to know my dev_id. Should it look at dev_port instead? See Documentation/ABI/testing/sysfs-class-net for more info.\n",
++ 			current->comm);
++ 
++ 	return sprintf(buf, "%#x\n", ndev->dev_id);
++ }
++ static DEVICE_ATTR_RO(dev_id);
++ 
++ int ipoib_intercept_dev_id_attr(struct net_device *dev)
++ {
++ 	device_remove_file(&dev->dev, &dev_attr_dev_id);
++ 	return device_create_file(&dev->dev, &dev_attr_dev_id);
+++>>>>>>> f6350da41dc7 (IB/ipoib: Log sysfs 'dev_id' accesses from userspace)
+  }
+  
+  static struct net_device *ipoib_add_port(const char *format,
+@@@ -2314,41 -2441,41 +2344,55 @@@
+  	if (result) {
+  		pr_warn("%s: couldn't register ipoib port %d; error %d\n",
+  			hca->name, port, result);
+ -
+ -		ipoib_parent_unregister_pre(ndev);
+ -		ipoib_intf_free(ndev);
+ -		free_netdev(ndev);
+ -
+ -		return ERR_PTR(result);
+ +		goto register_failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	result = -ENOMEM;
+ +	if (ipoib_cm_add_mode_attr(priv->dev))
+++=======
++ 	/*
++ 	 * We cannot set priv_destructor before register_netdev because we
++ 	 * need priv to be always valid during the error flow to execute
++ 	 * ipoib_parent_unregister_pre(). Instead handle it manually and only
++ 	 * enter priv_destructor mode once we are completely registered.
++ 	 */
++ 	ndev->priv_destructor = ipoib_intf_free;
++ 
++ 	if (ipoib_intercept_dev_id_attr(ndev))
++ 		goto sysfs_failed;
++ 	if (ipoib_cm_add_mode_attr(ndev))
+++>>>>>>> f6350da41dc7 (IB/ipoib: Log sysfs 'dev_id' accesses from userspace)
+  		goto sysfs_failed;
+ -	if (ipoib_add_pkey_attr(ndev))
+ +	if (ipoib_add_pkey_attr(priv->dev))
+  		goto sysfs_failed;
+ -	if (ipoib_add_umcast_attr(ndev))
+ +	if (ipoib_add_umcast_attr(priv->dev))
+  		goto sysfs_failed;
+ -	if (device_create_file(&ndev->dev, &dev_attr_create_child))
+ +	if (device_create_file(&priv->dev->dev, &dev_attr_create_child))
+  		goto sysfs_failed;
+ -	if (device_create_file(&ndev->dev, &dev_attr_delete_child))
+ +	if (device_create_file(&priv->dev->dev, &dev_attr_delete_child))
+  		goto sysfs_failed;
+  
+ -	return ndev;
+ +	return priv->dev;
+  
+  sysfs_failed:
+ -	ipoib_parent_unregister_pre(ndev);
+ -	unregister_netdev(ndev);
+ -	return ERR_PTR(-ENOMEM);
+ +	unregister_netdev(priv->dev);
+ +
+ +register_failed:
+ +	ib_unregister_event_handler(&priv->event_handler);
+ +	flush_workqueue(ipoib_workqueue);
+ +	/* Stop GC if started before flush */
+ +	cancel_delayed_work_sync(&priv->neigh_reap_task);
+ +	flush_workqueue(priv->wq);
+ +	ipoib_dev_cleanup(priv->dev);
+ +
+ +device_init_failed:
+ +	rn = netdev_priv(priv->dev);
+ +	rn->free_rdma_netdev(priv->dev);
+ +	kfree(priv);
+ +
+ +alloc_mem_failed:
+ +	return ERR_PTR(result);
+  }
+  
+  static void ipoib_add_one(struct ib_device *device)
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
