@@ -1,0 +1,229 @@
+netfilter: xt_socket: check sk before checking for netns.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Flavio Leitner <fbl@redhat.com>
+commit 40e4f26e6a14fc1496eabb8b0004a547303114e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/40e4f26e.failed
+
+Only check for the network namespace if the socket is available.
+
+Fixes: f564650106a6 ("netfilter: check if the socket netns is correct.")
+	Reported-by: Guenter Roeck <linux@roeck-us.net>
+	Tested-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Flavio Leitner <fbl@redhat.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 40e4f26e6a14fc1496eabb8b0004a547303114e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/xt_socket.c
+diff --cc net/netfilter/xt_socket.c
+index 1ba67931eb1b,ada144e5645b..000000000000
+--- a/net/netfilter/xt_socket.c
++++ b/net/netfilter/xt_socket.c
+@@@ -133,60 -53,15 +133,65 @@@ static boo
+  socket_match(const struct sk_buff *skb, struct xt_action_param *par,
+  	     const struct xt_socket_mtinfo1 *info)
+  {
+ -	struct sk_buff *pskb = (struct sk_buff *)skb;
+ +	const struct iphdr *iph = ip_hdr(skb);
+ +	struct udphdr _hdr, *hp = NULL;
+  	struct sock *sk = skb->sk;
+ +	__be32 uninitialized_var(daddr), uninitialized_var(saddr);
+ +	__be16 uninitialized_var(dport), uninitialized_var(sport);
+ +	u8 uninitialized_var(protocol);
+ +#ifdef XT_SOCKET_HAVE_CONNTRACK
+ +	struct nf_conn const *ct;
+ +	enum ip_conntrack_info ctinfo;
+ +#endif
+ +
+++<<<<<<< HEAD
+ +	if (iph->protocol == IPPROTO_UDP || iph->protocol == IPPROTO_TCP) {
+ +		hp = skb_header_pointer(skb, ip_hdrlen(skb),
+ +					sizeof(_hdr), &_hdr);
+ +		if (hp == NULL)
+ +			return false;
+ +
+ +		protocol = iph->protocol;
+ +		saddr = iph->saddr;
+ +		sport = hp->source;
+ +		daddr = iph->daddr;
+ +		dport = hp->dest;
+ +
+ +	} else if (iph->protocol == IPPROTO_ICMP) {
+ +		if (extract_icmp4_fields(skb, &protocol, &saddr, &daddr,
+ +					&sport, &dport))
+ +			return false;
+ +	} else {
+ +		return false;
+ +	}
+  
+ +#ifdef XT_SOCKET_HAVE_CONNTRACK
+ +	/* Do the lookup with the original socket address in case this is a
+ +	 * reply packet of an established SNAT-ted connection. */
+ +
+ +	ct = nf_ct_get(skb, &ctinfo);
+ +	if (ct && !nf_ct_is_untracked(ct) &&
+ +	    ((iph->protocol != IPPROTO_ICMP &&
+ +	      ctinfo == IP_CT_ESTABLISHED_REPLY) ||
+ +	     (iph->protocol == IPPROTO_ICMP &&
+ +	      ctinfo == IP_CT_RELATED_REPLY)) &&
+ +	    (ct->status & IPS_SRC_NAT_DONE)) {
+ +
+ +		daddr = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip;
+ +		dport = (iph->protocol == IPPROTO_TCP) ?
+ +			ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.tcp.port :
+ +			ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.udp.port;
+ +	}
+ +#endif
+++=======
++ 	if (sk && !net_eq(xt_net(par), sock_net(sk)))
++ 		sk = NULL;
+++>>>>>>> 40e4f26e6a14 (netfilter: xt_socket: check sk before checking for netns.)
+  
+  	if (!sk)
+ -		sk = nf_sk_lookup_slow_v4(xt_net(par), skb, xt_in(par));
+ -
+ +		sk = xt_socket_get_sock_v4(dev_net(skb->dev), protocol,
+ +					   saddr, daddr, sport, dport,
+ +					   par->in);
+  	if (sk) {
+  		bool wildcard;
+  		bool transparent = true;
+@@@ -237,121 -109,20 +242,126 @@@ socket_mt4_v1_v2(const struct sk_buff *
+  	return socket_match(skb, par, par->matchinfo);
+  }
+  
+ -#if IS_ENABLED(CONFIG_IP6_NF_IPTABLES)
+ +#ifdef XT_SOCKET_HAVE_IPV6
+ +
+++<<<<<<< HEAD
+ +static int
+ +extract_icmp6_fields(const struct sk_buff *skb,
+ +		     unsigned int outside_hdrlen,
+ +		     int *protocol,
+ +		     struct in6_addr **raddr,
+ +		     struct in6_addr **laddr,
+ +		     __be16 *rport,
+ +		     __be16 *lport)
+ +{
+ +	struct ipv6hdr *inside_iph, _inside_iph;
+ +	struct icmp6hdr *icmph, _icmph;
+ +	__be16 *ports, _ports[2];
+ +	u8 inside_nexthdr;
+ +	__be16 inside_fragoff;
+ +	int inside_hdrlen;
+ +
+ +	icmph = skb_header_pointer(skb, outside_hdrlen,
+ +				   sizeof(_icmph), &_icmph);
+ +	if (icmph == NULL)
+ +		return 1;
+ +
+ +	if (icmph->icmp6_type & ICMPV6_INFOMSG_MASK)
+ +		return 1;
+ +
+ +	inside_iph = skb_header_pointer(skb, outside_hdrlen + sizeof(_icmph), sizeof(_inside_iph), &_inside_iph);
+ +	if (inside_iph == NULL)
+ +		return 1;
+ +	inside_nexthdr = inside_iph->nexthdr;
+ +
+ +	inside_hdrlen = ipv6_skip_exthdr(skb, outside_hdrlen + sizeof(_icmph) + sizeof(_inside_iph),
+ +					 &inside_nexthdr, &inside_fragoff);
+ +	if (inside_hdrlen < 0)
+ +		return 1; /* hjm: Packet has no/incomplete transport layer headers. */
+ +
+ +	if (inside_nexthdr != IPPROTO_TCP &&
+ +	    inside_nexthdr != IPPROTO_UDP)
+ +		return 1;
+ +
+ +	ports = skb_header_pointer(skb, inside_hdrlen,
+ +				   sizeof(_ports), &_ports);
+ +	if (ports == NULL)
+ +		return 1;
+ +
+ +	/* the inside IP packet is the one quoted from our side, thus
+ +	 * its saddr is the local address */
+ +	*protocol = inside_nexthdr;
+ +	*laddr = &inside_iph->saddr;
+ +	*lport = ports[0];
+ +	*raddr = &inside_iph->daddr;
+ +	*rport = ports[1];
+ +
+ +	return 0;
+ +}
+ +
+ +static struct sock *
+ +xt_socket_get_sock_v6(struct net *net, const u8 protocol,
+ +		      const struct in6_addr *saddr, const struct in6_addr *daddr,
+ +		      const __be16 sport, const __be16 dport,
+ +		      const struct net_device *in)
+ +{
+ +	switch (protocol) {
+ +	case IPPROTO_TCP:
+ +		return inet6_lookup(net, &tcp_hashinfo,
+ +				    saddr, sport, daddr, dport,
+ +				    in->ifindex);
+ +	case IPPROTO_UDP:
+ +		return udp6_lib_lookup(net, saddr, sport, daddr, dport,
+ +				       in->ifindex);
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+  static bool
+ -socket_mt6_v1_v2_v3(const struct sk_buff *skb, struct xt_action_param *par)
+ +socket_mt6_v1_v2(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+ -	const struct xt_socket_mtinfo1 *info = (struct xt_socket_mtinfo1 *) par->matchinfo;
+ -	struct sk_buff *pskb = (struct sk_buff *)skb;
+ +	struct ipv6hdr *iph = ipv6_hdr(skb);
+ +	struct udphdr _hdr, *hp = NULL;
+  	struct sock *sk = skb->sk;
+ +	struct in6_addr *daddr = NULL, *saddr = NULL;
+ +	__be16 uninitialized_var(dport), uninitialized_var(sport);
+ +	int thoff = 0, uninitialized_var(tproto);
+ +	const struct xt_socket_mtinfo1 *info = (struct xt_socket_mtinfo1 *) par->matchinfo;
+  
+ +	tproto = ipv6_find_hdr(skb, &thoff, -1, NULL, NULL);
+ +	if (tproto < 0) {
+ +		pr_debug("unable to find transport header in IPv6 packet, dropping\n");
+ +		return NF_DROP;
+ +	}
+ +
+ +	if (tproto == IPPROTO_UDP || tproto == IPPROTO_TCP) {
+ +		hp = skb_header_pointer(skb, thoff,
+ +					sizeof(_hdr), &_hdr);
+ +		if (hp == NULL)
+ +			return false;
+ +
+ +		saddr = &iph->saddr;
+ +		sport = hp->source;
+ +		daddr = &iph->daddr;
+ +		dport = hp->dest;
+ +
+ +	} else if (tproto == IPPROTO_ICMPV6) {
+ +		if (extract_icmp6_fields(skb, thoff, &tproto, &saddr, &daddr,
+ +					 &sport, &dport))
+ +			return false;
+ +	} else {
+ +		return false;
+ +	}
+++=======
++ 	if (sk && !net_eq(xt_net(par), sock_net(sk)))
++ 		sk = NULL;
+++>>>>>>> 40e4f26e6a14 (netfilter: xt_socket: check sk before checking for netns.)
+  
+  	if (!sk)
+ -		sk = nf_sk_lookup_slow_v6(xt_net(par), skb, xt_in(par));
+ -
+ +		sk = xt_socket_get_sock_v6(dev_net(skb->dev), tproto,
+ +					   saddr, daddr, sport, dport,
+ +					   par->in);
+  	if (sk) {
+  		bool wildcard;
+  		bool transparent = true;
+* Unmerged path net/netfilter/xt_socket.c
