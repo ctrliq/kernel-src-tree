@@ -1,0 +1,857 @@
+net: sched: keep track of offloaded filters and check tc offload feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: keep track of offloaded filters and check tc offload feature (Ivan Vecera) [1584592]
+Rebuild_FUZZ: 96.40%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit caa7260156eb3a1496348a2c69fa68e85183d5d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/caa72601.failed
+
+During block bind, we need to check tc offload feature. If it is
+disabled yet still the block contains offloaded filters, forbid the
+bind. Also forbid to register callback for a block that already
+contains offloaded filters, as the play back is not supported now.
+For keeping track of offloaded filters there is a new counter
+introduced, alongside with couple of helpers called from cls_* code.
+These helpers set and clear TCA_CLS_FLAGS_IN_HW flag.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit caa7260156eb3a1496348a2c69fa68e85183d5d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+#	net/sched/cls_bpf.c
+#	net/sched/cls_flower.c
+#	net/sched/cls_matchall.c
+#	net/sched/cls_u32.c
+diff --cc include/net/sch_generic.h
+index f3bdb46c430b,bf5cc0a1d0f6..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -284,8 -282,33 +284,36 @@@ struct tcf_chain 
+  
+  struct tcf_block {
+  	struct list_head chain_list;
+++<<<<<<< HEAD
+++=======
++ 	u32 index; /* block index for shared blocks */
++ 	unsigned int refcnt;
++ 	struct net *net;
++ 	struct Qdisc *q;
++ 	struct list_head cb_list;
++ 	struct list_head owner_list;
++ 	bool keep_dst;
++ 	unsigned int offloadcnt; /* Number of oddloaded filters */
++ 	unsigned int nooffloaddevcnt; /* Number of devs unable to do offload */
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  };
+  
++ static inline void tcf_block_offload_inc(struct tcf_block *block, u32 *flags)
++ {
++ 	if (*flags & TCA_CLS_FLAGS_IN_HW)
++ 		return;
++ 	*flags |= TCA_CLS_FLAGS_IN_HW;
++ 	block->offloadcnt++;
++ }
++ 
++ static inline void tcf_block_offload_dec(struct tcf_block *block, u32 *flags)
++ {
++ 	if (!(*flags & TCA_CLS_FLAGS_IN_HW))
++ 		return;
++ 	*flags &= ~TCA_CLS_FLAGS_IN_HW;
++ 	block->offloadcnt--;
++ }
++ 
+  static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+  {
+  	struct qdisc_skb_cb *qcb;
+diff --cc net/sched/cls_api.c
+index a56916c8abe9,03e2fa092d9e..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -244,11 -265,309 +244,316 @@@ void tcf_chain_put(struct tcf_chain *ch
+  }
+  EXPORT_SYMBOL(tcf_chain_put);
+  
+++<<<<<<< HEAD
+++=======
++ static bool tcf_block_offload_in_use(struct tcf_block *block)
++ {
++ 	return block->offloadcnt;
++ }
++ 
++ static int tcf_block_offload_cmd(struct tcf_block *block,
++ 				 struct net_device *dev,
++ 				 struct tcf_block_ext_info *ei,
++ 				 enum tc_block_command command)
++ {
++ 	struct tc_block_offload bo = {};
++ 
++ 	bo.command = command;
++ 	bo.binder_type = ei->binder_type;
++ 	bo.block = block;
++ 	return dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_BLOCK, &bo);
++ }
++ 
++ static int tcf_block_offload_bind(struct tcf_block *block, struct Qdisc *q,
++ 				  struct tcf_block_ext_info *ei)
++ {
++ 	struct net_device *dev = q->dev_queue->dev;
++ 	int err;
++ 
++ 	if (!dev->netdev_ops->ndo_setup_tc)
++ 		goto no_offload_dev_inc;
++ 
++ 	/* If tc offload feature is disabled and the block we try to bind
++ 	 * to already has some offloaded filters, forbid to bind.
++ 	 */
++ 	if (!tc_can_offload(dev) && tcf_block_offload_in_use(block))
++ 		return -EOPNOTSUPP;
++ 
++ 	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_BIND);
++ 	if (err == -EOPNOTSUPP)
++ 		goto no_offload_dev_inc;
++ 	return err;
++ 
++ no_offload_dev_inc:
++ 	if (tcf_block_offload_in_use(block))
++ 		return -EOPNOTSUPP;
++ 	block->nooffloaddevcnt++;
++ 	return 0;
++ }
++ 
++ static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
++ 				     struct tcf_block_ext_info *ei)
++ {
++ 	struct net_device *dev = q->dev_queue->dev;
++ 	int err;
++ 
++ 	if (!dev->netdev_ops->ndo_setup_tc)
++ 		goto no_offload_dev_dec;
++ 	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_UNBIND);
++ 	if (err == -EOPNOTSUPP)
++ 		goto no_offload_dev_dec;
++ 	return;
++ 
++ no_offload_dev_dec:
++ 	WARN_ON(block->nooffloaddevcnt-- == 0);
++ }
++ 
++ static int
++ tcf_chain_head_change_cb_add(struct tcf_chain *chain,
++ 			     struct tcf_block_ext_info *ei,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_filter_chain_list_item *item;
++ 
++ 	item = kmalloc(sizeof(*item), GFP_KERNEL);
++ 	if (!item) {
++ 		NL_SET_ERR_MSG(extack, "Memory allocation for head change callback item failed");
++ 		return -ENOMEM;
++ 	}
++ 	item->chain_head_change = ei->chain_head_change;
++ 	item->chain_head_change_priv = ei->chain_head_change_priv;
++ 	if (chain->filter_chain)
++ 		tcf_chain_head_change_item(item, chain->filter_chain);
++ 	list_add(&item->list, &chain->filter_chain_list);
++ 	return 0;
++ }
++ 
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  static void
+ -tcf_chain_head_change_cb_del(struct tcf_chain *chain,
+ -			     struct tcf_block_ext_info *ei)
+ +tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
+ +			       struct tcf_proto __rcu **p_filter_chain)
+  {
+++<<<<<<< HEAD
+ +	chain->p_filter_chain = p_filter_chain;
+++=======
++ 	struct tcf_filter_chain_list_item *item;
++ 
++ 	list_for_each_entry(item, &chain->filter_chain_list, list) {
++ 		if ((!ei->chain_head_change && !ei->chain_head_change_priv) ||
++ 		    (item->chain_head_change == ei->chain_head_change &&
++ 		     item->chain_head_change_priv == ei->chain_head_change_priv)) {
++ 			tcf_chain_head_change_item(item, NULL);
++ 			list_del(&item->list);
++ 			kfree(item);
++ 			return;
++ 		}
++ 	}
++ 	WARN_ON(1);
++ }
++ 
++ struct tcf_net {
++ 	struct idr idr;
++ };
++ 
++ static unsigned int tcf_net_id;
++ 
++ static int tcf_block_insert(struct tcf_block *block, struct net *net,
++ 			    u32 block_index, struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_net *tn = net_generic(net, tcf_net_id);
++ 	int err;
++ 
++ 	err = idr_alloc_ext(&tn->idr, block, NULL, block_index,
++ 			    block_index + 1, GFP_KERNEL);
++ 	if (err)
++ 		return err;
++ 	block->index = block_index;
++ 	return 0;
++ }
++ 
++ static void tcf_block_remove(struct tcf_block *block, struct net *net)
++ {
++ 	struct tcf_net *tn = net_generic(net, tcf_net_id);
++ 
++ 	idr_remove_ext(&tn->idr, block->index);
++ }
++ 
++ static struct tcf_block *tcf_block_create(struct net *net, struct Qdisc *q,
++ 					  struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_block *block;
++ 	struct tcf_chain *chain;
++ 	int err;
++ 
++ 	block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	if (!block) {
++ 		NL_SET_ERR_MSG(extack, "Memory allocation for block failed");
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 	INIT_LIST_HEAD(&block->chain_list);
++ 	INIT_LIST_HEAD(&block->cb_list);
++ 	INIT_LIST_HEAD(&block->owner_list);
++ 
++ 	/* Create chain 0 by default, it has to be always present. */
++ 	chain = tcf_chain_create(block, 0);
++ 	if (!chain) {
++ 		NL_SET_ERR_MSG(extack, "Failed to create new tcf chain");
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	block->net = qdisc_net(q);
++ 	block->refcnt = 1;
++ 	block->net = net;
++ 	block->q = q;
++ 	return block;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return ERR_PTR(err);
++ }
++ 
++ static struct tcf_block *tcf_block_lookup(struct net *net, u32 block_index)
++ {
++ 	struct tcf_net *tn = net_generic(net, tcf_net_id);
++ 
++ 	return idr_find_ext(&tn->idr, block_index);
++ }
++ 
++ static struct tcf_chain *tcf_block_chain_zero(struct tcf_block *block)
++ {
++ 	return list_first_entry(&block->chain_list, struct tcf_chain, list);
++ }
++ 
++ struct tcf_block_owner_item {
++ 	struct list_head list;
++ 	struct Qdisc *q;
++ 	enum tcf_block_binder_type binder_type;
++ };
++ 
++ static void
++ tcf_block_owner_netif_keep_dst(struct tcf_block *block,
++ 			       struct Qdisc *q,
++ 			       enum tcf_block_binder_type binder_type)
++ {
++ 	if (block->keep_dst &&
++ 	    binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS &&
++ 	    binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS)
++ 		netif_keep_dst(qdisc_dev(q));
++ }
++ 
++ void tcf_block_netif_keep_dst(struct tcf_block *block)
++ {
++ 	struct tcf_block_owner_item *item;
++ 
++ 	block->keep_dst = true;
++ 	list_for_each_entry(item, &block->owner_list, list)
++ 		tcf_block_owner_netif_keep_dst(block, item->q,
++ 					       item->binder_type);
++ }
++ EXPORT_SYMBOL(tcf_block_netif_keep_dst);
++ 
++ static int tcf_block_owner_add(struct tcf_block *block,
++ 			       struct Qdisc *q,
++ 			       enum tcf_block_binder_type binder_type)
++ {
++ 	struct tcf_block_owner_item *item;
++ 
++ 	item = kmalloc(sizeof(*item), GFP_KERNEL);
++ 	if (!item)
++ 		return -ENOMEM;
++ 	item->q = q;
++ 	item->binder_type = binder_type;
++ 	list_add(&item->list, &block->owner_list);
++ 	return 0;
++ }
++ 
++ static void tcf_block_owner_del(struct tcf_block *block,
++ 				struct Qdisc *q,
++ 				enum tcf_block_binder_type binder_type)
++ {
++ 	struct tcf_block_owner_item *item;
++ 
++ 	list_for_each_entry(item, &block->owner_list, list) {
++ 		if (item->q == q && item->binder_type == binder_type) {
++ 			list_del(&item->list);
++ 			kfree(item);
++ 			return;
++ 		}
++ 	}
++ 	WARN_ON(1);
++ }
++ 
++ int tcf_block_get_ext(struct tcf_block **p_block, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei,
++ 		      struct netlink_ext_ack *extack)
++ {
++ 	struct net *net = qdisc_net(q);
++ 	struct tcf_block *block = NULL;
++ 	bool created = false;
++ 	int err;
++ 
++ 	if (ei->block_index) {
++ 		/* block_index not 0 means the shared block is requested */
++ 		block = tcf_block_lookup(net, ei->block_index);
++ 		if (block)
++ 			block->refcnt++;
++ 	}
++ 
++ 	if (!block) {
++ 		block = tcf_block_create(net, q, extack);
++ 		if (IS_ERR(block))
++ 			return PTR_ERR(block);
++ 		created = true;
++ 		if (ei->block_index) {
++ 			err = tcf_block_insert(block, net,
++ 					       ei->block_index, extack);
++ 			if (err)
++ 				goto err_block_insert;
++ 		}
++ 	}
++ 
++ 	err = tcf_block_owner_add(block, q, ei->binder_type);
++ 	if (err)
++ 		goto err_block_owner_add;
++ 
++ 	tcf_block_owner_netif_keep_dst(block, q, ei->binder_type);
++ 
++ 	err = tcf_chain_head_change_cb_add(tcf_block_chain_zero(block),
++ 					   ei, extack);
++ 	if (err)
++ 		goto err_chain_head_change_cb_add;
++ 
++ 	err = tcf_block_offload_bind(block, q, ei);
++ 	if (err)
++ 		goto err_block_offload_bind;
++ 
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_block_offload_bind:
++ 	tcf_chain_head_change_cb_del(tcf_block_chain_zero(block), ei);
++ err_chain_head_change_cb_add:
++ 	tcf_block_owner_del(block, q, ei->binder_type);
++ err_block_owner_add:
++ 	if (created) {
++ 		if (tcf_block_shared(block))
++ 			tcf_block_remove(block, net);
++ err_block_insert:
++ 		kfree(tcf_block_chain_zero(block));
++ 		kfree(block);
++ 	} else {
++ 		block->refcnt--;
++ 	}
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get_ext);
++ 
++ static void tcf_chain_head_change_dflt(struct tcf_proto *tp_head, void *priv)
++ {
++ 	struct tcf_proto __rcu **p_filter_chain = priv;
++ 
++ 	rcu_assign_pointer(*p_filter_chain, tp_head);
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  }
+  
+  int tcf_block_get(struct tcf_block **p_block,
+@@@ -286,26 -594,161 +591,143 @@@ void tcf_block_put(struct tcf_block *bl
+  
+  	if (!block)
+  		return;
+ -	tcf_chain_head_change_cb_del(tcf_block_chain_zero(block), ei);
+ -	tcf_block_owner_del(block, q, ei->binder_type);
+ -
+ -	if (--block->refcnt == 0) {
+ -		if (tcf_block_shared(block))
+ -			tcf_block_remove(block, block->net);
+  
+ -		/* Hold a refcnt for all chains, so that they don't disappear
+ -		 * while we are iterating.
+ -		 */
+ -		list_for_each_entry(chain, &block->chain_list, list)
+ -			tcf_chain_hold(chain);
+ -
+ -		list_for_each_entry(chain, &block->chain_list, list)
+ -			tcf_chain_flush(chain);
+ -	}
+ -
+ -	tcf_block_offload_unbind(block, q, ei);
+ -
+ -	if (block->refcnt == 0) {
+ -		/* At this point, all the chains should have refcnt >= 1. */
+ -		list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+ -			tcf_chain_put(chain);
+ +	/* Hold a refcnt for all chains, so that they don't disappear
+ +	 * while we are iterating.
+ +	 */
+ +	list_for_each_entry(chain, &block->chain_list, list)
+ +		tcf_chain_hold(chain);
+  
+ -		/* Finally, put chain 0 and allow block to be freed. */
+ -		tcf_chain_put(tcf_block_chain_zero(block));
+ -	}
+ -}
+ -EXPORT_SYMBOL(tcf_block_put_ext);
+ +	list_for_each_entry(chain, &block->chain_list, list)
+ +		tcf_chain_flush(chain);
+  
+ -void tcf_block_put(struct tcf_block *block)
+ -{
+ -	struct tcf_block_ext_info ei = {0, };
+ +	/* At this point, all the chains should have refcnt >= 1. */
+ +	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+ +		tcf_chain_put(chain);
+  
+ -	if (!block)
+ -		return;
+ -	tcf_block_put_ext(block, block->q, &ei);
+ +	/* Finally, put chain 0 and allow block to be freed. */
+ +	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
+ +	tcf_chain_put(chain);
+  }
+ -
+  EXPORT_SYMBOL(tcf_block_put);
+  
+++<<<<<<< HEAD
+++=======
++ struct tcf_block_cb {
++ 	struct list_head list;
++ 	tc_setup_cb_t *cb;
++ 	void *cb_ident;
++ 	void *cb_priv;
++ 	unsigned int refcnt;
++ };
++ 
++ void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
++ {
++ 	return block_cb->cb_priv;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_priv);
++ 
++ struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
++ 					 tc_setup_cb_t *cb, void *cb_ident)
++ {	struct tcf_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list)
++ 		if (block_cb->cb == cb && block_cb->cb_ident == cb_ident)
++ 			return block_cb;
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_lookup);
++ 
++ void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
++ {
++ 	block_cb->refcnt++;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_incref);
++ 
++ unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
++ {
++ 	return --block_cb->refcnt;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_decref);
++ 
++ struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
++ 					     tc_setup_cb_t *cb, void *cb_ident,
++ 					     void *cb_priv)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 
++ 	/* At this point, playback of previous block cb calls is not supported,
++ 	 * so forbid to register to block which already has some offloaded
++ 	 * filters present.
++ 	 */
++ 	if (tcf_block_offload_in_use(block))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
++ 	if (!block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 	block_cb->cb = cb;
++ 	block_cb->cb_ident = cb_ident;
++ 	block_cb->cb_priv = cb_priv;
++ 	list_add(&block_cb->list, &block->cb_list);
++ 	return block_cb;
++ }
++ EXPORT_SYMBOL(__tcf_block_cb_register);
++ 
++ int tcf_block_cb_register(struct tcf_block *block,
++ 			  tc_setup_cb_t *cb, void *cb_ident,
++ 			  void *cb_priv)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 
++ 	block_cb = __tcf_block_cb_register(block, cb, cb_ident, cb_priv);
++ 	return IS_ERR(block_cb) ? PTR_ERR(block_cb) : 0;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_register);
++ 
++ void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
++ {
++ 	list_del(&block_cb->list);
++ 	kfree(block_cb);
++ }
++ EXPORT_SYMBOL(__tcf_block_cb_unregister);
++ 
++ void tcf_block_cb_unregister(struct tcf_block *block,
++ 			     tc_setup_cb_t *cb, void *cb_ident)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 
++ 	block_cb = tcf_block_cb_lookup(block, cb, cb_ident);
++ 	if (!block_cb)
++ 		return;
++ 	__tcf_block_cb_unregister(block_cb);
++ }
++ EXPORT_SYMBOL(tcf_block_cb_unregister);
++ 
++ static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
++ 			     void *type_data, bool err_stop)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 	int ok_count = 0;
++ 	int err;
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop)
++ 		return -EOPNOTSUPP;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list) {
++ 		err = block_cb->cb(type, type_data, block_cb->cb_priv);
++ 		if (err) {
++ 			if (err_stop)
++ 				return err;
++ 		} else {
++ 			ok_count++;
++ 		}
++ 	}
++ 	return ok_count;
++ }
++ 
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  /* Main classifier routine: scans classifier chain attached
+   * to this qdisc, (optionally) tests for protocol and asks
+   * specific classifiers.
+diff --cc net/sched/cls_bpf.c
+index c7a7c00a2b7c,cf72aefcf98d..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -73,17 -134,72 +73,64 @@@ static int cls_bpf_classify(struct sk_b
+  		if (ret < 0)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		return ret;
+++=======
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static bool cls_bpf_is_ebpf(const struct cls_bpf_prog *prog)
++ {
++ 	return !prog->bpf_ops;
++ }
++ 
++ static int cls_bpf_offload_cmd(struct tcf_proto *tp, struct cls_bpf_prog *prog,
++ 			       struct cls_bpf_prog *oldprog)
++ {
++ 	struct tcf_block *block = tp->chain->block;
++ 	struct tc_cls_bpf_offload cls_bpf = {};
++ 	struct cls_bpf_prog *obj;
++ 	bool skip_sw;
++ 	int err;
++ 
++ 	skip_sw = prog && tc_skip_sw(prog->gen_flags);
++ 	obj = prog ?: oldprog;
++ 
++ 	tc_cls_common_offload_init(&cls_bpf.common, tp);
++ 	cls_bpf.command = TC_CLSBPF_OFFLOAD;
++ 	cls_bpf.exts = &obj->exts;
++ 	cls_bpf.prog = prog ? prog->filter : NULL;
++ 	cls_bpf.oldprog = oldprog ? oldprog->filter : NULL;
++ 	cls_bpf.name = obj->bpf_name;
++ 	cls_bpf.exts_integrated = obj->exts_integrated;
++ 	cls_bpf.gen_flags = obj->gen_flags;
++ 
++ 	if (oldprog)
++ 		tcf_block_offload_dec(block, &oldprog->gen_flags);
++ 
++ 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf, skip_sw);
++ 	if (prog) {
++ 		if (err < 0) {
++ 			cls_bpf_offload_cmd(tp, oldprog, prog);
++ 			return err;
++ 		} else if (err > 0) {
++ 			tcf_block_offload_inc(block, &prog->gen_flags);
++ 		}
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  	}
+  
+ -	if (prog && skip_sw && !(prog->gen_flags & TCA_CLS_FLAGS_IN_HW))
+ -		return -EINVAL;
+ -
+ -	return 0;
+ +	return -1;
+  }
+  
+ -static int cls_bpf_offload(struct tcf_proto *tp, struct cls_bpf_prog *prog,
+ -			   struct cls_bpf_prog *oldprog)
+ -{
+ -	if (prog && oldprog && prog->gen_flags != oldprog->gen_flags)
+ -		return -EINVAL;
+ -
+ -	if (prog && tc_skip_hw(prog->gen_flags))
+ -		prog = NULL;
+ -	if (oldprog && tc_skip_hw(oldprog->gen_flags))
+ -		oldprog = NULL;
+ -	if (!prog && !oldprog)
+ -		return 0;
+  
+ -	return cls_bpf_offload_cmd(tp, prog, oldprog);
+ +static void cls_bpf_offload(struct tcf_proto *tp, struct cls_bpf_prog *prog,
+ +			    struct cls_bpf_prog *oldprog)
+ +{
+ +	return;
+  }
+  
+  static void cls_bpf_stop_offload(struct tcf_proto *tp,
+diff --cc net/sched/cls_flower.c
+index 0f196b560aec,f61df19b1026..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -253,9 -226,10 +253,15 @@@ static void fl_hw_destroy_filter(struc
+  	tc_cls_common_offload_init(&cls_flower.common, tp);
+  	cls_flower.command = TC_CLSFLOWER_DESTROY;
+  	cls_flower.cookie = (unsigned long) f;
+ +	cls_flower.egress_dev = f->hw_dev != tp->q->dev_queue->dev;
+  
+++<<<<<<< HEAD
+ +	__rh_call_ndo_setup_tc(dev, TC_SETUP_CLSFLOWER, &cls_flower);
+++=======
++ 	tc_setup_cb_call(block, &f->exts, TC_SETUP_CLSFLOWER,
++ 			 &cls_flower, false);
++ 	tcf_block_offload_dec(block, &f->flags);
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  }
+  
+  static int fl_hw_replace_filter(struct tcf_proto *tp,
+@@@ -286,13 -249,20 +292,27 @@@
+  	cls_flower.mask = mask;
+  	cls_flower.key = &f->mkey;
+  	cls_flower.exts = &f->exts;
+ -	cls_flower.classid = f->res.classid;
+  
+++<<<<<<< HEAD
+ +	err = __rh_call_ndo_setup_tc(dev, TC_SETUP_CLSFLOWER, &cls_flower);
+ +	if (!err)
+ +		f->flags |= TCA_CLS_FLAGS_IN_HW;
+++=======
++ 	err = tc_setup_cb_call(block, &f->exts, TC_SETUP_CLSFLOWER,
++ 			       &cls_flower, skip_sw);
++ 	if (err < 0) {
++ 		fl_hw_destroy_filter(tp, f);
++ 		return err;
++ 	} else if (err > 0) {
++ 		tcf_block_offload_inc(block, &f->flags);
++ 	}
++ 
++ 	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW))
++ 		return -EINVAL;
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  
+ +	if (tc_skip_sw(f->flags))
+ +		return err;
+  	return 0;
+  }
+  
+diff --cc net/sched/cls_matchall.c
+index f0adbab7f7c3,d0e57c86636f..000000000000
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@@ -69,6 -69,21 +69,24 @@@ static void mall_destroy_rcu(struct rcu
+  	tcf_queue_work(&head->work);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mall_destroy_hw_filter(struct tcf_proto *tp,
++ 				   struct cls_mall_head *head,
++ 				   unsigned long cookie)
++ {
++ 	struct tc_cls_matchall_offload cls_mall = {};
++ 	struct tcf_block *block = tp->chain->block;
++ 
++ 	tc_cls_common_offload_init(&cls_mall.common, tp);
++ 	cls_mall.command = TC_CLSMATCHALL_DESTROY;
++ 	cls_mall.cookie = cookie;
++ 
++ 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL, &cls_mall, false);
++ 	tcf_block_offload_dec(block, &head->flags);
++ }
++ 
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  static int mall_replace_hw_filter(struct tcf_proto *tp,
+  				  struct cls_mall_head *head,
+  				  unsigned long cookie)
+@@@ -82,25 -98,19 +100,36 @@@
+  	cls_mall.exts = &head->exts;
+  	cls_mall.cookie = cookie;
+  
+++<<<<<<< HEAD
+ +	err = __rh_call_ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL, &cls_mall);
+ +	if (!err)
+ +		head->flags |= TCA_CLS_FLAGS_IN_HW;
+++=======
++ 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL,
++ 			       &cls_mall, skip_sw);
++ 	if (err < 0) {
++ 		mall_destroy_hw_filter(tp, head, cookie);
++ 		return err;
++ 	} else if (err > 0) {
++ 		tcf_block_offload_inc(block, &head->flags);
++ 	}
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  
+ -	if (skip_sw && !(head->flags & TCA_CLS_FLAGS_IN_HW))
+ -		return -EINVAL;
+ +	return err;
+ +}
+  
+ -	return 0;
+ +static void mall_destroy_hw_filter(struct tcf_proto *tp,
+ +				   struct cls_mall_head *head,
+ +				   unsigned long cookie)
+ +{
+ +	struct net_device *dev = tp->q->dev_queue->dev;
+ +	struct tc_cls_matchall_offload cls_mall = {};
+ +
+ +	tc_cls_common_offload_init(&cls_mall.common, tp);
+ +	cls_mall.command = TC_CLSMATCHALL_DESTROY;
+ +	cls_mall.cookie = cookie;
+ +
+ +	__rh_call_ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL, &cls_mall);
+  }
+  
+  static void mall_destroy(struct tcf_proto *tp)
+diff --cc net/sched/cls_u32.c
+index 42766c25ee6a,020d328d0afd..000000000000
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@@ -526,19 -529,17 +526,24 @@@ static int u32_replace_hw_hnode(struct 
+  	return 0;
+  }
+  
+- static void u32_remove_hw_knode(struct tcf_proto *tp, u32 handle)
++ static void u32_remove_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n)
+  {
+ -	struct tcf_block *block = tp->chain->block;
+ +	struct net_device *dev = tp->q->dev_queue->dev;
+  	struct tc_cls_u32_offload cls_u32 = {};
+  
+ +	if (!tc_should_offload(dev, 0))
+ +		return;
+ +
+  	tc_cls_common_offload_init(&cls_u32.common, tp);
+  	cls_u32.command = TC_CLSU32_DELETE_KNODE;
+- 	cls_u32.knode.handle = handle;
++ 	cls_u32.knode.handle = n->handle;
+  
+++<<<<<<< HEAD
+ +	__rh_call_ndo_setup_tc(dev, TC_SETUP_CLSU32, &cls_u32);
+++=======
++ 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, false);
++ 	tcf_block_offload_dec(block, &n->flags);
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  }
+  
+  static int u32_replace_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n,
+@@@ -567,13 -566,16 +572,23 @@@
+  	if (n->ht_down)
+  		cls_u32.knode.link_handle = n->ht_down->handle;
+  
+++<<<<<<< HEAD
+ +	err = __rh_call_ndo_setup_tc(dev, TC_SETUP_CLSU32, &cls_u32);
+++=======
++ 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, skip_sw);
++ 	if (err < 0) {
++ 		u32_remove_hw_knode(tp, n);
++ 		return err;
++ 	} else if (err > 0) {
++ 		tcf_block_offload_inc(block, &n->flags);
++ 	}
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  
+ -	if (skip_sw && !(n->flags & TCA_CLS_FLAGS_IN_HW))
+ -		return -EINVAL;
+ +	if (!err)
+ +		n->flags |= TCA_CLS_FLAGS_IN_HW;
+ +
+ +	if (tc_skip_sw(flags))
+ +		return err;
+  
+  	return 0;
+  }
+@@@ -588,7 -590,8 +603,12 @@@ static void u32_clear_hnode(struct tcf_
+  			RCU_INIT_POINTER(ht->ht[h],
+  					 rtnl_dereference(n->next));
+  			tcf_unbind_filter(tp, &n->res);
+++<<<<<<< HEAD
+ +			u32_remove_hw_knode(tp, n->handle);
+++=======
++ 			u32_remove_hw_knode(tp, n);
++ 			idr_remove_ext(&ht->handle_idr, n->handle);
+++>>>>>>> caa7260156eb (net: sched: keep track of offloaded filters and check tc offload feature)
+  			if (tcf_exts_get_net(&n->exts))
+  				call_rcu(&n->rcu, u32_delete_key_freepf_rcu);
+  			else
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
+* Unmerged path net/sched/cls_bpf.c
+* Unmerged path net/sched/cls_flower.c
+* Unmerged path net/sched/cls_matchall.c
+* Unmerged path net/sched/cls_u32.c
