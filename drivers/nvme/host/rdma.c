@@ -302,6 +302,7 @@ static int __nvme_rdma_init_request(struct nvme_rdma_ctrl *ctrl,
 	struct ib_device *ibdev = dev->dev;
 	int ret;
 
+	nvme_req(rq)->ctrl = &ctrl->ctrl;
 	ret = nvme_rdma_alloc_qe(ibdev, &req->sqe, sizeof(struct nvme_command),
 			DMA_TO_DEVICE);
 	if (ret)

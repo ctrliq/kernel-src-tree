@@ -1748,6 +1748,7 @@ nvme_fc_init_admin_request(struct blk_mq_tag_set *set, struct request *rq,
 	struct nvme_fc_fcp_op *op = blk_mq_rq_to_pdu(rq);
 	struct nvme_fc_queue *queue = &ctrl->queues[0];
 
+	nvme_req(rq)->ctrl = &ctrl->ctrl;
 	return __nvme_fc_init_request(ctrl, queue, op, rq, queue->rqcnt++);
 }
 
