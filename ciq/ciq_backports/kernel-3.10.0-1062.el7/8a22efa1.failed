@@ -1,0 +1,362 @@
+ovl: do not try to reconnect a disconnected origin dentry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 8a22efa15b46d524577cac79da63cebca8e8307f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8a22efa1.failed
+
+On lookup of non directory, we try to decode the origin file handle
+stored in upper inode. The origin file handle is supposed to be decoded
+to a disconnected non-dir dentry, which is fine, because we only need
+the lower inode of a copy up origin.
+
+However, if the origin file handle somehow turns out to be a directory
+we pay the expensive cost of reconnecting the directory dentry, only to
+get a mismatch file type and drop the dentry.
+
+Optimize this case by explicitly opting out of reconnecting the dentry.
+Opting-out of reconnect is done by passing a NULL acceptable callback
+to exportfs_decode_fh().
+
+While the case described above is a strange corner case that does not
+really need to be optimized, the API added for this optimization will
+be used by a following patch to optimize a more common case of decoding
+an overlayfs file handle.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 8a22efa15b46d524577cac79da63cebca8e8307f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exportfs/expfs.c
+#	fs/overlayfs/export.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+diff --cc fs/exportfs/expfs.c
+index 6c8ef1dd4bdf,645158dc33f1..000000000000
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@@ -392,12 -430,21 +392,25 @@@ struct dentry *exportfs_decode_fh(struc
+  	if (!nop || !nop->fh_to_dentry)
+  		return ERR_PTR(-ESTALE);
+  	result = nop->fh_to_dentry(mnt->mnt_sb, fid, fh_len, fileid_type);
+ -	if (PTR_ERR(result) == -ENOMEM)
+ -		return ERR_CAST(result);
+ -	if (IS_ERR_OR_NULL(result))
+ -		return ERR_PTR(-ESTALE);
+ +	if (!result)
+ +		result = ERR_PTR(-ESTALE);
+ +	if (IS_ERR(result))
+ +		return result;
+  
+++<<<<<<< HEAD
+ +	if (S_ISDIR(result->d_inode->i_mode)) {
+++=======
++ 	/*
++ 	 * If no acceptance criteria was specified by caller, a disconnected
++ 	 * dentry is also accepatable. Callers may use this mode to query if
++ 	 * file handle is stale or to get a reference to an inode without
++ 	 * risking the high overhead caused by directory reconnect.
++ 	 */
++ 	if (!acceptable)
++ 		return result;
++ 
++ 	if (d_is_dir(result)) {
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  		/*
+  		 * This request is for a directory.
+  		 *
+diff --cc fs/overlayfs/namei.c
+index bc8556692f97,810a333d2221..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -148,47 -180,42 +148,69 @@@ invalid
+  	goto out;
+  }
+  
+++<<<<<<< HEAD
+ +static struct dentry *ovl_get_origin(struct dentry *dentry,
+ +				     struct vfsmount *mnt)
+++=======
++ struct dentry *ovl_decode_real_fh(struct ovl_fh *fh, struct vfsmount *mnt,
++ 				  bool connected)
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  {
+ -	struct dentry *real;
+ +	struct dentry *origin = NULL;
+ +	struct ovl_fh *fh = ovl_get_origin_fh(dentry);
+  	int bytes;
+  
+ +	if (IS_ERR_OR_NULL(fh))
+ +		return (struct dentry *)fh;
+ +
+  	/*
+  	 * Make sure that the stored uuid matches the uuid of the lower
+  	 * layer where file handle will be decoded.
+  	 */
+ -	if (!uuid_equal(&fh->uuid, &mnt->mnt_sb->s_uuid))
+ -		return NULL;
+ +	if (uuid_be_cmp(fh->uuid, *(uuid_be *) &mnt->mnt_sb->s_uuid))
+ +		goto out;
+  
+  	bytes = (fh->len - offsetof(struct ovl_fh, fid));
+++<<<<<<< HEAD
+ +	origin = exportfs_decode_fh(mnt, (struct fid *)fh->fid,
+ +				    bytes >> 2, (int)fh->type,
+ +				    ovl_acceptable, NULL);
+ +	if (IS_ERR(origin)) {
+ +		/* Treat stale file handle as "origin unknown" */
+ +		if (origin == ERR_PTR(-ESTALE))
+ +			origin = NULL;
+ +		goto out;
+++=======
++ 	real = exportfs_decode_fh(mnt, (struct fid *)fh->fid,
++ 				  bytes >> 2, (int)fh->type,
++ 				  connected ? ovl_acceptable : NULL, mnt);
++ 	if (IS_ERR(real)) {
++ 		/*
++ 		 * Treat stale file handle to lower file as "origin unknown".
++ 		 * upper file handle could become stale when upper file is
++ 		 * unlinked and this information is needed to handle stale
++ 		 * index entries correctly.
++ 		 */
++ 		if (real == ERR_PTR(-ESTALE) &&
++ 		    !(fh->flags & OVL_FH_FLAG_PATH_UPPER))
++ 			real = NULL;
++ 		return real;
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  	}
+  
+ -	if (ovl_dentry_weird(real)) {
+ -		dput(real);
+ -		return NULL;
+ -	}
+ +	if (ovl_dentry_weird(origin) ||
+ +	    ((d_inode(origin)->i_mode ^ d_inode(dentry)->i_mode) & S_IFMT))
+ +		goto invalid;
+  
+ -	return real;
+ +out:
+ +	kfree(fh);
+ +	return origin;
+ +
+ +invalid:
+ +	pr_warn_ratelimited("overlayfs: invalid origin (%pd2)\n", origin);
+ +	dput(origin);
+ +	origin = NULL;
+ +	goto out;
+  }
+  
+  static bool ovl_is_opaquedir(struct dentry *dentry)
+@@@ -293,21 -320,15 +315,32 @@@ static int ovl_lookup_layer(struct dent
+  }
+  
+  
+++<<<<<<< HEAD
+ +static int ovl_check_origin(struct dentry *upperdentry,
+ +			    struct path *lowerstack, unsigned int numlower,
+ +			    struct path **stackp, unsigned int *ctrp)
+++=======
++ int ovl_check_origin_fh(struct ovl_fs *ofs, struct ovl_fh *fh, bool connected,
++ 			struct dentry *upperdentry, struct ovl_path **stackp)
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  {
+ +	struct vfsmount *mnt;
+  	struct dentry *origin = NULL;
+  	int i;
+  
+++<<<<<<< HEAD
+ +
+ +	for (i = 0; i < numlower; i++) {
+ +		mnt = lowerstack[i].mnt;
+ +		origin = ovl_get_origin(upperdentry, mnt);
+ +		if (IS_ERR(origin))
+ +			return PTR_ERR(origin);
+ +
+++=======
++ 	for (i = 0; i < ofs->numlower; i++) {
++ 		origin = ovl_decode_real_fh(fh, ofs->lower_layers[i].mnt,
++ 					    connected);
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  		if (origin)
+  			break;
+  	}
+@@@ -322,9 -348,43 +355,48 @@@
+  		dput(origin);
+  		return -ENOMEM;
+  	}
+++<<<<<<< HEAD
+ +	**stackp = (struct path) { .dentry = origin, .mnt = mnt };
+++=======
++ 	**stackp = (struct ovl_path){
++ 		.dentry = origin,
++ 		.layer = &ofs->lower_layers[i]
++ 	};
++ 
++ 	return 0;
++ 
++ invalid:
++ 	pr_warn_ratelimited("overlayfs: invalid origin (%pd2, ftype=%x, origin ftype=%x).\n",
++ 			    upperdentry, d_inode(upperdentry)->i_mode & S_IFMT,
++ 			    d_inode(origin)->i_mode & S_IFMT);
++ 	dput(origin);
++ 	return -EIO;
++ }
++ 
++ static int ovl_check_origin(struct ovl_fs *ofs, struct dentry *upperdentry,
++ 			    struct ovl_path **stackp, unsigned int *ctrp)
++ {
++ 	struct ovl_fh *fh = ovl_get_fh(upperdentry, OVL_XATTR_ORIGIN);
++ 	int err;
++ 
++ 	if (IS_ERR_OR_NULL(fh))
++ 		return PTR_ERR(fh);
++ 
++ 	err = ovl_check_origin_fh(ofs, fh, false, upperdentry, stackp);
++ 	kfree(fh);
++ 
++ 	if (err) {
++ 		if (err == -ESTALE)
++ 			return 0;
++ 		return err;
++ 	}
++ 
++ 	if (WARN_ON(*ctrp))
++ 		return -EIO;
++ 
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  	*ctrp = 1;
+ +
+  	return 0;
+  }
+  
+@@@ -387,6 -449,41 +459,44 @@@ fail
+  	goto out;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Get upper dentry from index */
++ struct dentry *ovl_index_upper(struct ovl_fs *ofs, struct dentry *index)
++ {
++ 	struct ovl_fh *fh;
++ 	struct dentry *upper;
++ 
++ 	if (!d_is_dir(index))
++ 		return dget(index);
++ 
++ 	fh = ovl_get_fh(index, OVL_XATTR_UPPER);
++ 	if (IS_ERR_OR_NULL(fh))
++ 		return ERR_CAST(fh);
++ 
++ 	upper = ovl_decode_real_fh(fh, ofs->upper_mnt, true);
++ 	kfree(fh);
++ 
++ 	if (IS_ERR_OR_NULL(upper))
++ 		return upper ?: ERR_PTR(-ESTALE);
++ 
++ 	if (!d_is_dir(upper)) {
++ 		pr_warn_ratelimited("overlayfs: invalid index upper (%pd2, upper=%pd2).\n",
++ 				    index, upper);
++ 		dput(upper);
++ 		return ERR_PTR(-EIO);
++ 	}
++ 
++ 	return upper;
++ }
++ 
++ /* Is this a leftover from create/whiteout of directory index entry? */
++ static bool ovl_is_temp_index(struct dentry *index)
++ {
++ 	return index->d_name.name[0] == '#';
++ }
++ 
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  /*
+   * Verify that an index entry name matches the origin file handle stored in
+   * OVL_XATTR_ORIGIN and that origin file handle can be decoded to lower path.
+@@@ -443,13 -567,18 +553,21 @@@ int ovl_verify_index(struct dentry *ind
+  	if (err)
+  		goto fail;
+  
+++<<<<<<< HEAD
+ +	/* Check if index is orphan and don't warn before cleaning it */
+ +	if (d_inode(index)->i_nlink == 1 &&
+ +	    ovl_get_nlink(origin.dentry, index, 0) == 0)
+ +		err = -ENOENT;
+++=======
++ 	/* Check if non-dir index is orphan and don't warn before cleaning it */
++ 	if (!d_is_dir(index) && d_inode(index)->i_nlink == 1) {
++ 		err = ovl_check_origin_fh(ofs, fh, false, index, &stack);
++ 		if (err)
++ 			goto fail;
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  
+ -		if (ovl_get_nlink(origin.dentry, index, 0) == 0)
+ -			goto orphan;
+ -	}
+ -
+ -out:
+  	dput(origin.dentry);
+ +out:
+  	kfree(fh);
+  	return err;
+  
+diff --cc fs/overlayfs/overlayfs.h
+index 403c48960f89,b51613b355c5..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -247,15 -265,36 +247,27 @@@ static inline bool ovl_is_impuredir(str
+  
+  
+  /* namei.c */
+++<<<<<<< HEAD
+ +int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
+ +		      struct dentry *origin, bool is_upper, bool set);
+ +int ovl_verify_index(struct dentry *index, struct path *lowerstack,
+ +		     unsigned int numlower);
+++=======
++ int ovl_check_fh_len(struct ovl_fh *fh, int fh_len);
++ struct dentry *ovl_decode_real_fh(struct ovl_fh *fh, struct vfsmount *mnt,
++ 				  bool connected);
++ int ovl_check_origin_fh(struct ovl_fs *ofs, struct ovl_fh *fh, bool connected,
++ 			struct dentry *upperdentry, struct ovl_path **stackp);
++ int ovl_verify_set_fh(struct dentry *dentry, const char *name,
++ 		      struct dentry *real, bool is_upper, bool set);
++ struct dentry *ovl_index_upper(struct ovl_fs *ofs, struct dentry *index);
++ int ovl_verify_index(struct ovl_fs *ofs, struct dentry *index);
+++>>>>>>> 8a22efa15b46 (ovl: do not try to reconnect a disconnected origin dentry)
+  int ovl_get_index_name(struct dentry *origin, struct qstr *name);
+ -struct dentry *ovl_get_index_fh(struct ovl_fs *ofs, struct ovl_fh *fh);
+ -struct dentry *ovl_lookup_index(struct ovl_fs *ofs, struct dentry *upper,
+ -				struct dentry *origin, bool verify);
+  int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
+ -struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ -			  unsigned int flags);
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+  bool ovl_lower_positive(struct dentry *dentry);
+  
+ -static inline int ovl_verify_origin(struct dentry *upper,
+ -				    struct dentry *origin, bool set)
+ -{
+ -	return ovl_verify_set_fh(upper, OVL_XATTR_ORIGIN, origin, false, set);
+ -}
+ -
+ -static inline int ovl_verify_upper(struct dentry *index,
+ -				    struct dentry *upper, bool set)
+ -{
+ -	return ovl_verify_set_fh(index, OVL_XATTR_UPPER, upper, true, set);
+ -}
+ -
+  /* readdir.c */
+  extern const struct file_operations ovl_dir_operations;
+  int ovl_check_empty_dir(struct dentry *dentry, struct list_head *list);
+* Unmerged path fs/overlayfs/export.c
+* Unmerged path fs/exportfs/expfs.c
+* Unmerged path fs/overlayfs/export.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
