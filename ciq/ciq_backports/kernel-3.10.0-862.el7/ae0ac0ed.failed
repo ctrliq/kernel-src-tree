@@ -1,0 +1,242 @@
+netfilter: x_tables: pack percpu counter allocations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit ae0ac0ed6fcf5af3be0f63eb935f483f44a402d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ae0ac0ed.failed
+
+instead of allocating each xt_counter individually, allocate 4k chunks
+and then use these for counter allocation requests.
+
+This should speed up rule evaluation by increasing data locality,
+also speeds up ruleset loading because we reduce calls to the percpu
+allocator.
+
+As Eric points out we can't use PAGE_SIZE, page_allocator would fail on
+arches with 64k page size.
+
+	Suggested-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit ae0ac0ed6fcf5af3be0f63eb935f483f44a402d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter/x_tables.h
+#	net/ipv4/netfilter/arp_tables.c
+#	net/ipv4/netfilter/ip_tables.c
+#	net/ipv6/netfilter/ip6_tables.c
+#	net/netfilter/x_tables.c
+diff --cc include/linux/netfilter/x_tables.h
+index d08f0ed1fa64,5117e4d2ddfa..000000000000
+--- a/include/linux/netfilter/x_tables.h
++++ b/include/linux/netfilter/x_tables.h
+@@@ -368,38 -403,14 +368,48 @@@ static inline unsigned long ifname_comp
+  	return ret;
+  }
+  
++ struct xt_percpu_counter_alloc_state {
++ 	unsigned int off;
++ 	const char __percpu *mem;
++ };
+  
+++<<<<<<< HEAD
+ +/* On SMP, ip(6)t_entry->counters.pcnt holds address of the
+ + * real (percpu) counter.  On !SMP, its just the packet count,
+ + * so nothing needs to be done there.
+ + *
+ + * xt_percpu_counter_alloc returns the address of the percpu
+ + * counter, or 0 on !SMP. We force an alignment of 16 bytes
+ + * so that bytes/packets share a common cache line.
+ + *
+ + * Hence caller must use IS_ERR_VALUE to check for error, this
+ + * allows us to return 0 for single core systems without forcing
+ + * callers to deal with SMP vs. NONSMP issues.
+ + */
+ +static inline u64 xt_percpu_counter_alloc(void)
+ +{
+ +	if (nr_cpu_ids > 1) {
+ +		void __percpu *res = __alloc_percpu(sizeof(struct xt_counters),
+ +						    sizeof(struct xt_counters));
+ +
+ +		if (res == NULL)
+ +			return (u64) -ENOMEM;
+ +
+ +		return (__force u64) res;
+ +	}
+ +
+ +	return 0;
+ +}
+ +static inline void xt_percpu_counter_free(u64 pcnt)
+ +{
+ +	if (nr_cpu_ids > 1)
+ +		free_percpu((void __percpu *) pcnt);
+ +}
+++=======
++ bool xt_percpu_counter_alloc(struct xt_percpu_counter_alloc_state *state,
++ 			     struct xt_counters *counter);
++ void xt_percpu_counter_free(struct xt_counters *cnt);
+++>>>>>>> ae0ac0ed6fcf (netfilter: x_tables: pack percpu counter allocations)
+  
+  static inline struct xt_counters *
+  xt_get_this_cpu_counter(struct xt_counters *cnt)
+diff --cc net/ipv4/netfilter/arp_tables.c
+index 19bc9997cf1c,1258a9ab62ef..000000000000
+--- a/net/ipv4/netfilter/arp_tables.c
++++ b/net/ipv4/netfilter/arp_tables.c
+@@@ -517,8 -418,7 +518,12 @@@ find_check_entry(struct arpt_entry *e, 
+  	struct xt_target *target;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	e->counters.pcnt = xt_percpu_counter_alloc();
+ +	if (IS_ERR_VALUE(e->counters.pcnt))
+++=======
++ 	if (!xt_percpu_counter_alloc(alloc_state, &e->counters))
+++>>>>>>> ae0ac0ed6fcf (netfilter: x_tables: pack percpu counter allocations)
+  		return -ENOMEM;
+  
+  	t = arpt_get_target(e);
+@@@ -633,8 -524,9 +638,9 @@@ static inline void cleanup_entry(struc
+   * newinfo).
+   */
+  static int translate_table(struct xt_table_info *newinfo, void *entry0,
+ -			   const struct arpt_replace *repl)
+ +                           const struct arpt_replace *repl)
+  {
++ 	struct xt_percpu_counter_alloc_state alloc_state = { 0 };
+  	struct arpt_entry *iter;
+  	unsigned int *offsets;
+  	unsigned int i;
+diff --cc net/ipv4/netfilter/ip_tables.c
+index 4bc05ad14eb5,308b456723f0..000000000000
+--- a/net/ipv4/netfilter/ip_tables.c
++++ b/net/ipv4/netfilter/ip_tables.c
+@@@ -649,8 -541,7 +650,12 @@@ find_check_entry(struct ipt_entry *e, s
+  	struct xt_mtchk_param mtpar;
+  	struct xt_entry_match *ematch;
+  
+++<<<<<<< HEAD
+ +	e->counters.pcnt = xt_percpu_counter_alloc();
+ +	if (IS_ERR_VALUE(e->counters.pcnt))
+++=======
++ 	if (!xt_percpu_counter_alloc(alloc_state, &e->counters))
+++>>>>>>> ae0ac0ed6fcf (netfilter: x_tables: pack percpu counter allocations)
+  		return -ENOMEM;
+  
+  	j = 0;
+@@@ -793,8 -675,9 +798,9 @@@ cleanup_entry(struct ipt_entry *e, stru
+     newinfo) */
+  static int
+  translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ -		const struct ipt_replace *repl)
+ +                const struct ipt_replace *repl)
+  {
++ 	struct xt_percpu_counter_alloc_state alloc_state = { 0 };
+  	struct ipt_entry *iter;
+  	unsigned int *offsets;
+  	unsigned int i;
+diff --cc net/ipv6/netfilter/ip6_tables.c
+index 66312651ddc5,d56d8ac09a94..000000000000
+--- a/net/ipv6/netfilter/ip6_tables.c
++++ b/net/ipv6/netfilter/ip6_tables.c
+@@@ -660,8 -572,7 +661,12 @@@ find_check_entry(struct ip6t_entry *e, 
+  	struct xt_mtchk_param mtpar;
+  	struct xt_entry_match *ematch;
+  
+++<<<<<<< HEAD
+ +	e->counters.pcnt = xt_percpu_counter_alloc();
+ +	if (IS_ERR_VALUE(e->counters.pcnt))
+++=======
++ 	if (!xt_percpu_counter_alloc(alloc_state, &e->counters))
+++>>>>>>> ae0ac0ed6fcf (netfilter: x_tables: pack percpu counter allocations)
+  		return -ENOMEM;
+  
+  	j = 0;
+@@@ -803,8 -704,9 +808,9 @@@ static void cleanup_entry(struct ip6t_e
+     newinfo) */
+  static int
+  translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ -		const struct ip6t_replace *repl)
+ +                const struct ip6t_replace *repl)
+  {
++ 	struct xt_percpu_counter_alloc_state alloc_state = { 0 };
+  	struct ip6t_entry *iter;
+  	unsigned int *offsets;
+  	unsigned int i;
+diff --cc net/netfilter/x_tables.c
+index 551407ae5911,f6ce4a7036e6..000000000000
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@@ -1625,6 -1616,59 +1626,62 @@@ void xt_proto_fini(struct net *net, u_i
+  }
+  EXPORT_SYMBOL_GPL(xt_proto_fini);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * xt_percpu_counter_alloc - allocate x_tables rule counter
++  *
++  * @state: pointer to xt_percpu allocation state
++  * @counter: pointer to counter struct inside the ip(6)/arpt_entry struct
++  *
++  * On SMP, the packet counter [ ip(6)t_entry->counters.pcnt ] will then
++  * contain the address of the real (percpu) counter.
++  *
++  * Rule evaluation needs to use xt_get_this_cpu_counter() helper
++  * to fetch the real percpu counter.
++  *
++  * To speed up allocation and improve data locality, a 4kb block is
++  * allocated.
++  *
++  * xt_percpu_counter_alloc_state contains the base address of the
++  * allocated page and the current sub-offset.
++  *
++  * returns false on error.
++  */
++ bool xt_percpu_counter_alloc(struct xt_percpu_counter_alloc_state *state,
++ 			     struct xt_counters *counter)
++ {
++ 	BUILD_BUG_ON(XT_PCPU_BLOCK_SIZE < (sizeof(*counter) * 2));
++ 
++ 	if (nr_cpu_ids <= 1)
++ 		return true;
++ 
++ 	if (!state->mem) {
++ 		state->mem = __alloc_percpu(XT_PCPU_BLOCK_SIZE,
++ 					    XT_PCPU_BLOCK_SIZE);
++ 		if (!state->mem)
++ 			return false;
++ 	}
++ 	counter->pcnt = (__force unsigned long)(state->mem + state->off);
++ 	state->off += sizeof(*counter);
++ 	if (state->off > (XT_PCPU_BLOCK_SIZE - sizeof(*counter))) {
++ 		state->mem = NULL;
++ 		state->off = 0;
++ 	}
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(xt_percpu_counter_alloc);
++ 
++ void xt_percpu_counter_free(struct xt_counters *counters)
++ {
++ 	unsigned long pcnt = counters->pcnt;
++ 
++ 	if (nr_cpu_ids > 1 && (pcnt & (XT_PCPU_BLOCK_SIZE - 1)) == 0)
++ 		free_percpu((void __percpu *)pcnt);
++ }
++ EXPORT_SYMBOL_GPL(xt_percpu_counter_free);
++ 
+++>>>>>>> ae0ac0ed6fcf (netfilter: x_tables: pack percpu counter allocations)
+  static int __net_init xt_net_init(struct net *net)
+  {
+  	int i;
+* Unmerged path include/linux/netfilter/x_tables.h
+* Unmerged path net/ipv4/netfilter/arp_tables.c
+* Unmerged path net/ipv4/netfilter/ip_tables.c
+* Unmerged path net/ipv6/netfilter/ip6_tables.c
+* Unmerged path net/netfilter/x_tables.c
