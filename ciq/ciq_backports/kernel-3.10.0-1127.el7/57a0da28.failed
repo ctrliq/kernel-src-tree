@@ -1,0 +1,110 @@
+ext4: fix data corruption caused by overlapping unaligned and aligned IO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Lukas Czerner <lczerner@redhat.com>
+commit 57a0da28ced8707cb9f79f071a016b9d005caf5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/57a0da28.failed
+
+Unaligned AIO must be serialized because the zeroing of partial blocks
+of unaligned AIO can result in data corruption in case it's overlapping
+another in flight IO.
+
+Currently we wait for all unwritten extents before we submit unaligned
+AIO which protects data in case of unaligned AIO is following overlapping
+IO. However if a unaligned AIO is followed by overlapping aligned AIO we
+can still end up corrupting data.
+
+To fix this, we must make sure that the unaligned AIO is the only IO in
+flight by waiting for unwritten extents conversion not just before the
+IO submission, but right after it as well.
+
+This problem can be reproduced by xfstest generic/538
+
+	Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: stable@kernel.org
+(cherry picked from commit 57a0da28ced8707cb9f79f071a016b9d005caf5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+diff --cc fs/ext4/file.c
+index 4dfdbd00d3b7,2c5baa5e8291..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -257,15 -224,62 +257,63 @@@ ext4_file_write(struct kiocb *iocb, con
+  
+  #ifdef CONFIG_FS_DAX
+  	if (IS_DAX(inode))
+ -		return ext4_dax_write_iter(iocb, from);
+ +		return ext4_file_dax_write(iocb, iov, nr_segs, pos);
+  #endif
+ -	if (!o_direct && (iocb->ki_flags & IOCB_NOWAIT))
+ -		return -EOPNOTSUPP;
+  
+ -	if (!inode_trylock(inode)) {
+ -		if (iocb->ki_flags & IOCB_NOWAIT)
+ -			return -EAGAIN;
+ -		inode_lock(inode);
+ -	}
+ +	iocb->private = &overwrite; /* RHEL7 only - prevent DIO race */
+ +	if (unlikely(io_is_direct(iocb->ki_filp)))
+ +		ret = ext4_file_dio_write(iocb, iov, nr_segs, pos);
+ +	else
+ +		ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = ext4_write_checks(iocb, from);
++ 	if (ret <= 0)
++ 		goto out;
++ 
++ 	/*
++ 	 * Unaligned direct AIO must be serialized among each other as zeroing
++ 	 * of partial blocks of two competing unaligned AIOs can result in data
++ 	 * corruption.
++ 	 */
++ 	if (o_direct && ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS) &&
++ 	    !is_sync_kiocb(iocb) &&
++ 	    ext4_unaligned_aio(inode, from, iocb->ki_pos)) {
++ 		unaligned_aio = 1;
++ 		ext4_unwritten_wait(inode);
++ 	}
++ 
++ 	iocb->private = &overwrite;
++ 	/* Check whether we do a DIO overwrite or not */
++ 	if (o_direct && !unaligned_aio) {
++ 		if (ext4_overwrite_io(inode, iocb->ki_pos, iov_iter_count(from))) {
++ 			if (ext4_should_dioread_nolock(inode))
++ 				overwrite = 1;
++ 		} else if (iocb->ki_flags & IOCB_NOWAIT) {
++ 			ret = -EAGAIN;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	ret = __generic_file_write_iter(iocb, from);
++ 	/*
++ 	 * Unaligned direct AIO must be the only IO in flight. Otherwise
++ 	 * overlapping aligned IO after unaligned might result in data
++ 	 * corruption.
++ 	 */
++ 	if (ret == -EIOCBQUEUED && unaligned_aio)
++ 		ext4_unwritten_wait(inode);
++ 	inode_unlock(inode);
++ 
++ 	if (ret > 0)
++ 		ret = generic_write_sync(iocb, ret);
++ 
++ 	return ret;
++ 
++ out:
++ 	inode_unlock(inode);
+++>>>>>>> 57a0da28ced8 (ext4: fix data corruption caused by overlapping unaligned and aligned IO)
+  	return ret;
+  }
+  
+* Unmerged path fs/ext4/file.c
