@@ -1,0 +1,239 @@
+vfs: update ovl inode before relatime check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 598e3c8f72f5b77c84d2cb26cfd936ffb3cfdbaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/598e3c8f.failed
+
+On overlayfs relatime_need_update() needs inode times to be correct on
+overlay inode.  But i_mtime and i_ctime are updated by filesystem code on
+underlying inode only, so they will be out-of-date on the overlay inode.
+
+This patch copies the times from the underlying inode if needed.  This
+can't be done if called from RCU lookup (link following) but link m/ctime
+are not updated by fs, so this is all right.
+
+This patch doesn't change functionality for anything but overlayfs.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 598e3c8f72f5b77c84d2cb26cfd936ffb3cfdbaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+#	fs/namei.c
+#	include/linux/fs.h
+diff --cc fs/inode.c
+index 50ca9758e8ff,4a1fc1631e00..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -1570,10 -1632,10 +1590,15 @@@ static int update_time(struct inode *in
+   *	This function automatically handles read only file systems and media,
+   *	as well as the "noatime" flag and inode specific "noatime" markers.
+   */
+++<<<<<<< HEAD
+ +void touch_atime(struct path *path)
+++=======
++ bool __atime_needs_update(const struct path *path, struct inode *inode,
++ 			  bool rcu)
+++>>>>>>> 598e3c8f72f5 (vfs: update ovl inode before relatime check)
+  {
+  	struct vfsmount *mnt = path->mnt;
+ +	struct inode *inode = path->dentry->d_inode;
+  	struct timespec now;
+  
+  	if (inode->i_flags & S_NOATIME)
+@@@ -1590,10 -1659,22 +1615,29 @@@
+  
+  	now = current_fs_time(inode->i_sb);
+  
+++<<<<<<< HEAD
+ +	if (!relatime_need_update(mnt, inode, now))
+ +		return;
+ +
+ +	if (timespec_equal(&inode->i_atime, &now))
+++=======
++ 	if (!relatime_need_update(path, inode, now, rcu))
++ 		return false;
++ 
++ 	if (timespec_equal(&inode->i_atime, &now))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ void touch_atime(const struct path *path)
++ {
++ 	struct vfsmount *mnt = path->mnt;
++ 	struct inode *inode = d_inode(path->dentry);
++ 	struct timespec now;
++ 
++ 	if (!__atime_needs_update(path, inode, false))
+++>>>>>>> 598e3c8f72f5 (vfs: update ovl inode before relatime check)
+  		return;
+  
+  	if (!sb_start_write_trylock(inode->i_sb))
+diff --cc fs/namei.c
+index ecd45d98e937,4bbcae1ba58e..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -877,68 -1003,59 +877,79 @@@ static int may_linkat(struct path *link
+  	return -EPERM;
+  }
+  
+ -static __always_inline
+ -const char *get_link(struct nameidata *nd)
+ +static __always_inline int
+ +follow_link(struct path *link, struct nameidata *nd, void **p)
+  {
+ -	struct saved *last = nd->stack + nd->depth - 1;
+ -	struct dentry *dentry = last->link.dentry;
+ -	struct inode *inode = nd->link_inode;
+ +	struct dentry *dentry = link->dentry;
+  	int error;
+ -	const char *res;
+ +	char *s;
+  
+++<<<<<<< HEAD
+ +	BUG_ON(nd->flags & LOOKUP_RCU);
+++=======
++ 	if (!(nd->flags & LOOKUP_RCU)) {
++ 		touch_atime(&last->link);
++ 		cond_resched();
++ 	} else if (atime_needs_update_rcu(&last->link, inode)) {
++ 		if (unlikely(unlazy_walk(nd, NULL, 0)))
++ 			return ERR_PTR(-ECHILD);
++ 		touch_atime(&last->link);
++ 	}
+++>>>>>>> 598e3c8f72f5 (vfs: update ovl inode before relatime check)
+  
+ -	error = security_inode_follow_link(dentry, inode,
+ -					   nd->flags & LOOKUP_RCU);
+ -	if (unlikely(error))
+ -		return ERR_PTR(error);
+ +	if (link->mnt == nd->path.mnt)
+ +		mntget(link->mnt);
+ +
+ +	error = -ELOOP;
+ +	if (unlikely(current->total_link_count >= 40))
+ +		goto out_put_nd_path;
+ +
+ +	cond_resched();
+ +	current->total_link_count++;
+ +
+ +	touch_atime(link);
+ +	nd_set_link(nd, NULL);
+ +
+ +	error = security_inode_follow_link(link->dentry, nd);
+ +	if (error)
+ +		goto out_put_nd_path;
+  
+  	nd->last_type = LAST_BIND;
+ -	res = inode->i_link;
+ -	if (!res) {
+ -		const char * (*get)(struct dentry *, struct inode *,
+ -				struct delayed_call *);
+ -		get = inode->i_op->get_link;
+ -		if (nd->flags & LOOKUP_RCU) {
+ -			res = get(NULL, inode, &last->done);
+ -			if (res == ERR_PTR(-ECHILD)) {
+ -				if (unlikely(unlazy_walk(nd, NULL, 0)))
+ -					return ERR_PTR(-ECHILD);
+ -				res = get(dentry, inode, &last->done);
+ -			}
+ -		} else {
+ -			res = get(dentry, inode, &last->done);
+ -		}
+ -		if (IS_ERR_OR_NULL(res))
+ -			return res;
+ -	}
+ -	if (*res == '/') {
+ -		if (!nd->root.mnt)
+ -			set_root(nd);
+ -		if (unlikely(nd_jump_root(nd)))
+ -			return ERR_PTR(-ECHILD);
+ -		while (unlikely(*++res == '/'))
+ -			;
+ +	*p = dentry->d_inode->i_op->follow_link(dentry, nd);
+ +	error = PTR_ERR(*p);
+ +	if (IS_ERR(*p))
+ +		goto out_put_nd_path;
+ +
+ +	error = 0;
+ +	s = nd_get_link(nd);
+ +	if (s) {
+ +		error = __vfs_follow_link(nd, s);
+ +		if (unlikely(error))
+ +			put_link(nd, link, *p);
+  	}
+ -	if (!*res)
+ -		res = NULL;
+ -	return res;
+ +
+ +	return error;
+ +
+ +out_put_nd_path:
+ +	*p = NULL;
+ +	path_put(&nd->path);
+ +	path_put(link);
+ +	return error;
+ +}
+ +
+ +static int follow_up_rcu(struct path *path)
+ +{
+ +	struct mount *mnt = real_mount(path->mnt);
+ +	struct mount *parent;
+ +	struct dentry *mountpoint;
+ +
+ +	parent = mnt->mnt_parent;
+ +	if (&parent->mnt == path->mnt)
+ +		return 0;
+ +	mountpoint = mnt->mnt_mountpoint;
+ +	path->dentry = mountpoint;
+ +	path->mnt = &parent->mnt;
+ +	return 1;
+  }
+  
+  /*
+diff --cc include/linux/fs.h
+index e5f546c9e338,7db097d673a8..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1992,7 -2007,7 +1992,11 @@@ enum file_time_flags 
+  	S_VERSION = 8,
+  };
+  
+++<<<<<<< HEAD
+ +extern void touch_atime(struct path *);
+++=======
++ extern void touch_atime(const struct path *);
+++>>>>>>> 598e3c8f72f5 (vfs: update ovl inode before relatime check)
+  static inline void file_accessed(struct file *file)
+  {
+  	if (!(file->f_flags & O_NOATIME))
+* Unmerged path fs/inode.c
+diff --git a/fs/internal.h b/fs/internal.h
+index 3b41f3e8a80a..9ee933600164 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -111,6 +111,15 @@ extern int open_check_o_direct(struct file *f);
+ extern spinlock_t inode_sb_list_lock;
+ extern void inode_add_lru(struct inode *inode);
+ 
++extern bool __atime_needs_update(const struct path *, struct inode *, bool);
++static inline bool atime_needs_update_rcu(const struct path *path,
++					  struct inode *inode)
++{
++	return __atime_needs_update(path, inode, true);
++}
++
++extern bool atime_needs_update_rcu(const struct path *, struct inode *);
++
+ /*
+  * fs-writeback.c
+  */
+* Unmerged path fs/namei.c
+* Unmerged path include/linux/fs.h
