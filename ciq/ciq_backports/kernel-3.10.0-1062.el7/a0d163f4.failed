@@ -1,0 +1,394 @@
+nfp: add shared buffer configuration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit a0d163f4327febeae2c98c4b1aaff3552e5b1667
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a0d163f4.failed
+
+Allow app FW to advertise its shared buffer pool information.
+Use the per-PF mailbox to configure them from devlink.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a0d163f4327febeae2c98c4b1aaff3552e5b1667)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 8263e9c4bc8d,595b3dc280e3..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -46,9 -46,10 +46,14 @@@
+  #include <linux/mutex.h>
+  #include <linux/pci.h>
+  #include <linux/workqueue.h>
++ #include <net/devlink.h>
+  
+  struct dentry;
+++<<<<<<< HEAD
+ +struct devlink_ops;
+++=======
++ struct device;
+++>>>>>>> a0d163f4327f (nfp: add shared buffer configuration)
+  struct pci_dev;
+  
+  struct nfp_cpp;
+diff --git a/drivers/net/ethernet/netronome/nfp/Makefile b/drivers/net/ethernet/netronome/nfp/Makefile
+index 4b7e5dadd022..26bf6a602a21 100644
+--- a/drivers/net/ethernet/netronome/nfp/Makefile
++++ b/drivers/net/ethernet/netronome/nfp/Makefile
+@@ -28,6 +28,7 @@ nfp-objs := \
+ 	    nfp_net_sriov.o \
+ 	    nfp_netvf_main.o \
+ 	    nfp_port.o \
++	    nfp_shared_buf.o \
+ 	    nic/main.o
+ 
+ ifeq ($(CONFIG_NFP_APP_FLOWER),y)
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_abi.h b/drivers/net/ethernet/netronome/nfp/nfp_abi.h
+index ce3935d6729b..7ffa6e6a9d1c 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_abi.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_abi.h
+@@ -51,9 +51,79 @@
+  *
+  * @NFP_MBOX_NO_CMD:	null command
+  * Used to indicate previous command has finished.
++ *
++ * @NFP_MBOX_POOL_GET:	get shared buffer pool info/config
++ * Input  - struct nfp_shared_buf_pool_id
++ * Output - struct nfp_shared_buf_pool_info_get
++ *
++ * @NFP_MBOX_POOL_SET:	set shared buffer pool info/config
++ * Input  - struct nfp_shared_buf_pool_info_set
++ * Output - None
+  */
+ enum nfp_mbox_cmd {
+ 	NFP_MBOX_NO_CMD			= 0x00,
++
++	NFP_MBOX_POOL_GET		= 0x01,
++	NFP_MBOX_POOL_SET		= 0x02,
++};
++
++#define NFP_SHARED_BUF_COUNT_SYM_NAME	"_abi_nfd_pf%u_sb_cnt"
++#define NFP_SHARED_BUF_TABLE_SYM_NAME	"_abi_nfd_pf%u_sb_tbl"
++
++/**
++ * struct nfp_shared_buf - NFP shared buffer description
++ * @id:				numerical user-visible id of the shared buffer
++ * @size:			size in bytes of the buffer
++ * @ingress_pools_count:	number of ingress pools
++ * @egress_pools_count:		number of egress pools
++ * @ingress_tc_count:		number of ingress trafic classes
++ * @egress_tc_count:		number of egress trafic classes
++ * @pool_size_unit:		pool size may be in credits, each credit is
++ *				@pool_size_unit bytes
++ */
++struct nfp_shared_buf {
++	__le32 id;
++	__le32 size;
++	__le16 ingress_pools_count;
++	__le16 egress_pools_count;
++	__le16 ingress_tc_count;
++	__le16 egress_tc_count;
++
++	__le32 pool_size_unit;
++};
++
++/**
++ * struct nfp_shared_buf_pool_id - shared buffer pool identification
++ * @shared_buf:		shared buffer id
++ * @pool:		pool index
++ */
++struct nfp_shared_buf_pool_id {
++	__le32 shared_buf;
++	__le32 pool;
++};
++
++/**
++ * struct nfp_shared_buf_pool_info_get - struct devlink_sb_pool_info mirror
++ * @pool_type:		one of enum devlink_sb_pool_type
++ * @size:		pool size in units of SB's @pool_size_unit
++ * @threshold_type:	one of enum devlink_sb_threshold_type
++ */
++struct nfp_shared_buf_pool_info_get {
++	__le32 pool_type;
++	__le32 size;
++	__le32 threshold_type;
++};
++
++/**
++ * struct nfp_shared_buf_pool_info_set - packed args of sb_pool_set
++ * @id:			pool identification info
++ * @size:		pool size in units of SB's @pool_size_unit
++ * @threshold_type:	one of enum devlink_sb_threshold_type
++ */
++struct nfp_shared_buf_pool_info_set {
++	struct nfp_shared_buf_pool_id id;
++	__le32 size;
++	__le32 threshold_type;
+ };
+ 
+ #endif
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_devlink.c b/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+index b1e67cf4257a..73c7fcc820ac 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+@@ -149,6 +149,26 @@ out:
+ 	return ret;
+ }
+ 
++static int
++nfp_devlink_sb_pool_get(struct devlink *devlink, unsigned int sb_index,
++			u16 pool_index, struct devlink_sb_pool_info *pool_info)
++{
++	struct nfp_pf *pf = devlink_priv(devlink);
++
++	return nfp_shared_buf_pool_get(pf, sb_index, pool_index, pool_info);
++}
++
++static int
++nfp_devlink_sb_pool_set(struct devlink *devlink, unsigned int sb_index,
++			u16 pool_index,
++			u32 size, enum devlink_sb_threshold_type threshold_type)
++{
++	struct nfp_pf *pf = devlink_priv(devlink);
++
++	return nfp_shared_buf_pool_set(pf, sb_index, pool_index,
++				       size, threshold_type);
++}
++
+ static int nfp_devlink_eswitch_mode_get(struct devlink *devlink, u16 *mode)
+ {
+ 	struct nfp_pf *pf = devlink_priv(devlink);
+@@ -159,6 +179,8 @@ static int nfp_devlink_eswitch_mode_get(struct devlink *devlink, u16 *mode)
+ const struct devlink_ops nfp_devlink_ops = {
+ 	.port_split		= nfp_devlink_port_split,
+ 	.port_unsplit		= nfp_devlink_port_unsplit,
++	.sb_pool_get		= nfp_devlink_sb_pool_get,
++	.sb_pool_set		= nfp_devlink_sb_pool_set,
+ 	.eswitch_mode_get	= nfp_devlink_eswitch_mode_get,
+ };
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 65db3bc15a10..c169edfb129d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@ -723,6 +723,10 @@ int nfp_net_pci_probe(struct nfp_pf *pf)
+ 	if (err)
+ 		goto err_app_clean;
+ 
++	err = nfp_shared_buf_register(pf);
++	if (err)
++		goto err_devlink_unreg;
++
+ 	mutex_lock(&pf->lock);
+ 	pf->ddir = nfp_net_debugfs_device_add(pf->pdev);
+ 
+@@ -756,6 +760,8 @@ err_free_vnics:
+ err_clean_ddir:
+ 	nfp_net_debugfs_dir_clean(&pf->ddir);
+ 	mutex_unlock(&pf->lock);
++	nfp_shared_buf_unregister(pf);
++err_devlink_unreg:
+ 	cancel_work_sync(&pf->port_refresh_work);
+ 	devlink_unregister(devlink);
+ err_app_clean:
+@@ -783,6 +789,7 @@ void nfp_net_pci_remove(struct nfp_pf *pf)
+ 
+ 	mutex_unlock(&pf->lock);
+ 
++	nfp_shared_buf_unregister(pf);
+ 	devlink_unregister(priv_to_devlink(pf));
+ 
+ 	nfp_net_pf_free_irqs(pf);
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_shared_buf.c b/drivers/net/ethernet/netronome/nfp/nfp_shared_buf.c
+new file mode 100644
+index 000000000000..0ecd83705368
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/nfp_shared_buf.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
++/*
++ * Copyright (C) 2018 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/kernel.h>
++#include <net/devlink.h>
++
++#include "nfpcore/nfp_cpp.h"
++#include "nfpcore/nfp_nffw.h"
++#include "nfp_abi.h"
++#include "nfp_app.h"
++#include "nfp_main.h"
++
++static u32 nfp_shared_buf_pool_unit(struct nfp_pf *pf, unsigned int sb)
++{
++	__le32 sb_id = cpu_to_le32(sb);
++	unsigned int i;
++
++	for (i = 0; i < pf->num_shared_bufs; i++)
++		if (pf->shared_bufs[i].id == sb_id)
++			return le32_to_cpu(pf->shared_bufs[i].pool_size_unit);
++
++	WARN_ON_ONCE(1);
++	return 0;
++}
++
++int nfp_shared_buf_pool_get(struct nfp_pf *pf, unsigned int sb, u16 pool_index,
++			    struct devlink_sb_pool_info *pool_info)
++{
++	struct nfp_shared_buf_pool_info_get get_data;
++	struct nfp_shared_buf_pool_id id = {
++		.shared_buf	= cpu_to_le32(sb),
++		.pool		= cpu_to_le32(pool_index),
++	};
++	unsigned int unit_size;
++	int n;
++
++	unit_size = nfp_shared_buf_pool_unit(pf, sb);
++	if (!unit_size)
++		return -EINVAL;
++
++	n = nfp_mbox_cmd(pf, NFP_MBOX_POOL_GET, &id, sizeof(id),
++			 &get_data, sizeof(get_data));
++	if (n < 0)
++		return n;
++	if (n < sizeof(get_data))
++		return -EIO;
++
++	pool_info->pool_type = le32_to_cpu(get_data.pool_type);
++	pool_info->threshold_type = le32_to_cpu(get_data.threshold_type);
++	pool_info->size = le32_to_cpu(get_data.size) * unit_size;
++
++	return 0;
++}
++
++int nfp_shared_buf_pool_set(struct nfp_pf *pf, unsigned int sb,
++			    u16 pool_index, u32 size,
++			    enum devlink_sb_threshold_type threshold_type)
++{
++	struct nfp_shared_buf_pool_info_set set_data = {
++		.id = {
++			.shared_buf	= cpu_to_le32(sb),
++			.pool		= cpu_to_le32(pool_index),
++		},
++		.threshold_type	= cpu_to_le32(threshold_type),
++	};
++	unsigned int unit_size;
++
++	unit_size = nfp_shared_buf_pool_unit(pf, sb);
++	if (!unit_size || size % unit_size)
++		return -EINVAL;
++	set_data.size = cpu_to_le32(size / unit_size);
++
++	return nfp_mbox_cmd(pf, NFP_MBOX_POOL_SET, &set_data, sizeof(set_data),
++			    NULL, 0);
++}
++
++int nfp_shared_buf_register(struct nfp_pf *pf)
++{
++	struct devlink *devlink = priv_to_devlink(pf);
++	unsigned int i, num_entries, entry_sz;
++	struct nfp_cpp_area *sb_desc_area;
++	u8 __iomem *sb_desc;
++	int n, err;
++
++	if (!pf->mbox)
++		return 0;
++
++	n = nfp_pf_rtsym_read_optional(pf, NFP_SHARED_BUF_COUNT_SYM_NAME, 0);
++	if (n <= 0)
++		return n;
++	num_entries = n;
++
++	sb_desc = nfp_pf_map_rtsym(pf, "sb_tbl", NFP_SHARED_BUF_TABLE_SYM_NAME,
++				   num_entries * sizeof(pf->shared_bufs[0]),
++				   &sb_desc_area);
++	if (IS_ERR(sb_desc))
++		return PTR_ERR(sb_desc);
++
++	entry_sz = nfp_cpp_area_size(sb_desc_area) / num_entries;
++
++	pf->shared_bufs = kmalloc_array(num_entries, sizeof(pf->shared_bufs[0]),
++					GFP_KERNEL);
++	if (!pf->shared_bufs) {
++		err = -ENOMEM;
++		goto err_release_area;
++	}
++
++	for (i = 0; i < num_entries; i++) {
++		struct nfp_shared_buf *sb = &pf->shared_bufs[i];
++
++		/* Entries may be larger in future FW */
++		memcpy_fromio(sb, sb_desc + i * entry_sz, sizeof(*sb));
++
++		err = devlink_sb_register(devlink,
++					  le32_to_cpu(sb->id),
++					  le32_to_cpu(sb->size),
++					  le16_to_cpu(sb->ingress_pools_count),
++					  le16_to_cpu(sb->egress_pools_count),
++					  le16_to_cpu(sb->ingress_tc_count),
++					  le16_to_cpu(sb->egress_tc_count));
++		if (err)
++			goto err_unreg_prev;
++	}
++	pf->num_shared_bufs = num_entries;
++
++	nfp_cpp_area_release_free(sb_desc_area);
++
++	return 0;
++
++err_unreg_prev:
++	while (i--)
++		devlink_sb_unregister(devlink,
++				      le32_to_cpu(pf->shared_bufs[i].id));
++	kfree(pf->shared_bufs);
++err_release_area:
++	nfp_cpp_area_release_free(sb_desc_area);
++	return err;
++}
++
++void nfp_shared_buf_unregister(struct nfp_pf *pf)
++{
++	struct devlink *devlink = priv_to_devlink(pf);
++	unsigned int i;
++
++	for (i = 0; i < pf->num_shared_bufs; i++)
++		devlink_sb_unregister(devlink,
++				      le32_to_cpu(pf->shared_bufs[i].id));
++	kfree(pf->shared_bufs);
++}
