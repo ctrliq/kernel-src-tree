@@ -1,0 +1,204 @@
+xfrm: Reinject transport-mode packets through tasklet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit acf568ee859f098279eadf551612f103afdacb4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/acf568ee.failed
+
+This is an old bugbear of mine:
+
+https://www.mail-archive.com/netdev@vger.kernel.org/msg03894.html
+
+By crafting special packets, it is possible to cause recursion
+in our kernel when processing transport-mode packets at levels
+that are only limited by packet size.
+
+The easiest one is with DNAT, but an even worse one is where
+UDP encapsulation is used in which case you just have to insert
+an UDP encapsulation header in between each level of recursion.
+
+This patch avoids this problem by reinjecting tranport-mode packets
+through a tasklet.
+
+Fixes: b05e106698d9 ("[IPV4/6]: Netfilter IPsec input hooks")
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit acf568ee859f098279eadf551612f103afdacb4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/xfrm4_input.c
+#	net/ipv6/xfrm6_input.c
+#	net/xfrm/xfrm_input.c
+diff --cc net/ipv4/xfrm4_input.c
+index 07235806abf9,bcfc00e88756..000000000000
+--- a/net/ipv4/xfrm4_input.c
++++ b/net/ipv4/xfrm4_input.c
+@@@ -22,9 -23,16 +22,20 @@@ int xfrm4_extract_input(struct xfrm_sta
+  	return xfrm4_extract_header(skb);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int xfrm4_rcv_encap_finish(struct sock *sk, struct sk_buff *skb)
+++=======
++ static int xfrm4_rcv_encap_finish2(struct net *net, struct sock *sk,
++ 				   struct sk_buff *skb)
++ {
++ 	return dst_input(skb);
++ }
++ 
++ static inline int xfrm4_rcv_encap_finish(struct net *net, struct sock *sk,
++ 					 struct sk_buff *skb)
+++>>>>>>> acf568ee859f (xfrm: Reinject transport-mode packets through tasklet)
+  {
+ -	if (!skb_dst(skb)) {
+ +	if (skb_dst(skb) == NULL) {
+  		const struct iphdr *iph = ip_hdr(skb);
+  
+  		if (ip_route_input_noref(skb, iph->daddr, iph->saddr,
+diff --cc net/ipv6/xfrm6_input.c
+index f2fde0617787,841f4a07438e..000000000000
+--- a/net/ipv6/xfrm6_input.c
++++ b/net/ipv6/xfrm6_input.c
+@@@ -31,8 -32,19 +31,16 @@@ int xfrm6_rcv_spi(struct sk_buff *skb, 
+  }
+  EXPORT_SYMBOL(xfrm6_rcv_spi);
+  
++ static int xfrm6_transport_finish2(struct net *net, struct sock *sk,
++ 				   struct sk_buff *skb)
++ {
++ 	if (xfrm_trans_queue(skb, ip6_rcv_finish))
++ 		__kfree_skb(skb);
++ 	return -1;
++ }
++ 
+  int xfrm6_transport_finish(struct sk_buff *skb, int async)
+  {
+ -	struct xfrm_offload *xo = xfrm_offload(skb);
+ -	int nhlen = skb->data - skb_network_header(skb);
+ -
+  	skb_network_header(skb)[IP6CB(skb)->nhoff] =
+  		XFRM_MODE_SKB_CB(skb)->protocol;
+  
+@@@ -41,12 -53,18 +49,23 @@@
+  		return 1;
+  #endif
+  
+ -	__skb_push(skb, nhlen);
+ -	ipv6_hdr(skb)->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+ -	skb_postpush_rcsum(skb, skb_network_header(skb), nhlen);
+ +	ipv6_hdr(skb)->payload_len = htons(skb->len);
+ +	__skb_push(skb, skb->data - skb_network_header(skb));
+  
+++<<<<<<< HEAD
+ +	NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING, NULL, skb,
+ +		skb->dev, NULL,
+ +		ip6_rcv_finish);
+++=======
++ 	if (xo && (xo->flags & XFRM_GRO)) {
++ 		skb_mac_header_rebuild(skb);
++ 		return -1;
++ 	}
++ 
++ 	NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING,
++ 		dev_net(skb->dev), NULL, skb, skb->dev, NULL,
++ 		xfrm6_transport_finish2);
+++>>>>>>> acf568ee859f (xfrm: Reinject transport-mode packets through tasklet)
+  	return -1;
+  }
+  
+diff --cc net/xfrm/xfrm_input.c
+index f7368e09f8ad,3f6f6f8c9fa5..000000000000
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@@ -19,9 -34,14 +33,18 @@@ struct xfrm_trans_cb 
+  static struct kmem_cache *secpath_cachep __read_mostly;
+  
+  static DEFINE_SPINLOCK(xfrm_input_afinfo_lock);
+ -static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[AF_INET6 + 1];
+ +static struct xfrm_input_afinfo __rcu *xfrm_input_afinfo[NPROTO];
+  
+++<<<<<<< HEAD
+ +int xfrm_input_register_afinfo(struct xfrm_input_afinfo *afinfo)
+++=======
++ static struct gro_cells gro_cells;
++ static struct net_device xfrm_napi_dev;
++ 
++ static DEFINE_PER_CPU(struct xfrm_trans_tasklet, xfrm_trans_tasklet);
++ 
++ int xfrm_input_register_afinfo(const struct xfrm_input_afinfo *afinfo)
+++>>>>>>> acf568ee859f (xfrm: Reinject transport-mode packets through tasklet)
+  {
+  	int err = 0;
+  
+@@@ -387,8 -493,47 +410,50 @@@ int xfrm_input_resume(struct sk_buff *s
+  }
+  EXPORT_SYMBOL(xfrm_input_resume);
+  
++ static void xfrm_trans_reinject(unsigned long data)
++ {
++ 	struct xfrm_trans_tasklet *trans = (void *)data;
++ 	struct sk_buff_head queue;
++ 	struct sk_buff *skb;
++ 
++ 	__skb_queue_head_init(&queue);
++ 	skb_queue_splice_init(&trans->queue, &queue);
++ 
++ 	while ((skb = __skb_dequeue(&queue)))
++ 		XFRM_TRANS_SKB_CB(skb)->finish(dev_net(skb->dev), NULL, skb);
++ }
++ 
++ int xfrm_trans_queue(struct sk_buff *skb,
++ 		     int (*finish)(struct net *, struct sock *,
++ 				   struct sk_buff *))
++ {
++ 	struct xfrm_trans_tasklet *trans;
++ 
++ 	trans = this_cpu_ptr(&xfrm_trans_tasklet);
++ 
++ 	if (skb_queue_len(&trans->queue) >= netdev_max_backlog)
++ 		return -ENOBUFS;
++ 
++ 	XFRM_TRANS_SKB_CB(skb)->finish = finish;
++ 	skb_queue_tail(&trans->queue, skb);
++ 	tasklet_schedule(&trans->tasklet);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(xfrm_trans_queue);
++ 
+  void __init xfrm_input_init(void)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int err;
++ 	int i;
++ 
++ 	init_dummy_netdev(&xfrm_napi_dev);
++ 	err = gro_cells_init(&gro_cells, &xfrm_napi_dev);
++ 	if (err)
++ 		gro_cells.cells = NULL;
++ 
+++>>>>>>> acf568ee859f (xfrm: Reinject transport-mode packets through tasklet)
+  	secpath_cachep = kmem_cache_create("secpath_cache",
+  					   sizeof(struct sec_path),
+  					   0, SLAB_HWCACHE_ALIGN|SLAB_PANIC,
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index c77c6a154074..99644a577e6f 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -1513,6 +1513,9 @@ int xfrm_init_state(struct xfrm_state *x);
+ int xfrm_prepare_input(struct xfrm_state *x, struct sk_buff *skb);
+ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type);
+ int xfrm_input_resume(struct sk_buff *skb, int nexthdr);
++int xfrm_trans_queue(struct sk_buff *skb,
++		     int (*finish)(struct net *, struct sock *,
++				   struct sk_buff *));
+ int xfrm_output_resume(struct sk_buff *skb, int err);
+ int xfrm_output(struct sock *sk, struct sk_buff *skb);
+ int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb);
+* Unmerged path net/ipv4/xfrm4_input.c
+* Unmerged path net/ipv6/xfrm6_input.c
+* Unmerged path net/xfrm/xfrm_input.c
