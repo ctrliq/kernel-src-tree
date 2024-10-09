@@ -1,0 +1,950 @@
+ALSA: x86: Properly manage PCM substream lifetype
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 313d9f28c1d5e0254ca16f2df0f1b737e30c0993
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/313d9f28.failed
+
+The PCM substream is referred not only in the PCM callbacks but also
+in the irq handler and in the hotplug/unplug codes.  The latter code
+paths don't take the PCM lock, thus the PCM may be released
+unexpectedly while calling PCM helper functions or accessing
+pcm->runtime fields.
+
+This patch implements a simple refcount to assure the PCM substream
+accessibility while the other codes are accessing.  It needed some
+code refactoring in the relevant functions for avoiding the doubly
+spinlocks.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 313d9f28c1d5e0254ca16f2df0f1b737e30c0993)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+#	sound/x86/intel_hdmi_audio.h
+diff --cc sound/x86/intel_hdmi_audio.c
+index 063e2be94d05,c209d9498c0e..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -154,81 -154,101 +154,119 @@@ static const struct snd_pcm_hardware sn
+  	.fifo_size = HAD_FIFO_SIZE,
+  };
+  
++ /* Get the active PCM substream;
++  * Call had_substream_put() for unreferecing.
++  * Don't call this inside had_spinlock, as it takes by itself
++  */
++ static struct snd_pcm_substream *
++ had_substream_get(struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_substream *substream;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&intelhaddata->had_spinlock, flags);
++ 	substream = intelhaddata->stream_info.substream;
++ 	if (substream)
++ 		intelhaddata->stream_info.substream_refcount++;
++ 	spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ 	return substream;
++ }
++ 
++ /* Unref the active PCM substream;
++  * Don't call this inside had_spinlock, as it takes by itself
++  */
++ static void had_substream_put(struct snd_intelhad *intelhaddata)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&intelhaddata->had_spinlock, flags);
++ 	intelhaddata->stream_info.substream_refcount--;
++ 	spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ }
++ 
+  /* Register access functions */
+ -static inline void
+ -mid_hdmi_audio_read(struct snd_intelhad *ctx, u32 reg, u32 *val)
+ +
+ +int had_get_hwstate(struct snd_intelhad *intelhaddata)
+  {
+ -	*val = ioread32(ctx->mmio_start + ctx->had_config_offset + reg);
+ +	/* Check for device presence -SW state */
+ +	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED) {
+ +		pr_debug("%s:Device not connected:%d\n", __func__,
+ +				intelhaddata->drv_status);
+ +		return -ENODEV;
+ +	}
+ +
+ +	return 0;
+  }
+  
+ -static inline void
+ -mid_hdmi_audio_write(struct snd_intelhad *ctx, u32 reg, u32 val)
+ +int had_get_caps(struct snd_intelhad *intelhaddata,
+ +		 enum had_caps_list query, void *caps)
+  {
+ -	iowrite32(val, ctx->mmio_start + ctx->had_config_offset + reg);
+ +	int retval;
+ +
+ +	retval = had_get_hwstate(intelhaddata);
+ +	if (!retval)
+ +		retval = mid_hdmi_audio_get_caps(query, caps);
+ +
+ +	return retval;
+  }
+  
+ -static int had_read_register(struct snd_intelhad *intelhaddata,
+ -			     u32 offset, u32 *data)
+++<<<<<<< HEAD
+ +int had_set_caps(struct snd_intelhad *intelhaddata,
+ +		 enum had_caps_list set_element, void *caps)
+  {
+ -	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED)
+ -		return -ENODEV;
+ +	int retval;
+  
+ -	mid_hdmi_audio_read(intelhaddata, offset, data);
+ -	return 0;
+ +	retval = had_get_hwstate(intelhaddata);
+ +	if (!retval)
+ +		retval = mid_hdmi_audio_set_caps(set_element, caps);
+ +
+ +	return retval;
+  }
+  
+ -static void fixup_dp_config(struct snd_intelhad *intelhaddata,
+ -			    u32 offset, u32 *data)
+ +int had_read_register(struct snd_intelhad *intelhaddata, u32 offset, u32 *data)
+  {
+ -	if (intelhaddata->dp_output) {
+ -		if (offset == AUD_CONFIG && (*data & AUD_CONFIG_VALID_BIT))
+ -			*data |= AUD_CONFIG_DP_MODE | AUD_CONFIG_BLOCK_BIT;
+ -	}
+ +	int retval;
+ +
+ +	retval = had_get_hwstate(intelhaddata);
+ +	if (!retval)
+ +		retval = mid_hdmi_audio_read(offset, data);
+ +
+ +	return retval;
+  }
+  
+ -static int had_write_register(struct snd_intelhad *intelhaddata,
+ -			      u32 offset, u32 data)
+ +int had_write_register(struct snd_intelhad *intelhaddata, u32 offset, u32 data)
+  {
+ -	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED)
+ -		return -ENODEV;
+ +	int retval;
+  
+ -	fixup_dp_config(intelhaddata, offset, &data);
+ -	mid_hdmi_audio_write(intelhaddata, offset, data);
+ -	return 0;
+ +	retval = had_get_hwstate(intelhaddata);
+ +	if (!retval)
+ +		retval = mid_hdmi_audio_write(offset, data);
+ +
+ +	return retval;
+  }
+  
+ -static int had_read_modify(struct snd_intelhad *intelhaddata, u32 offset,
+ -			   u32 data, u32 mask)
+ +int had_read_modify(struct snd_intelhad *intelhaddata, u32 offset,
+ +		    u32 data, u32 mask)
+  {
+ -	u32 val_tmp;
+ -
+ -	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED)
+ -		return -ENODEV;
+ +	int retval;
+  
+ -	mid_hdmi_audio_read(intelhaddata, offset, &val_tmp);
+ -	val_tmp &= ~mask;
+ -	val_tmp |= (data & mask);
+ +	retval = had_get_hwstate(intelhaddata);
+ +	if (!retval)
+ +		retval = mid_hdmi_audio_rmw(offset, data, mask);
+  
+ -	fixup_dp_config(intelhaddata, offset, &val_tmp);
+ -	mid_hdmi_audio_write(intelhaddata, offset, val_tmp);
+ -	return 0;
+ +	return retval;
+  }
+ -
+ +/**
+ + * function to read-modify
+ + * AUD_CONFIG register on VLV2.The had_read_modify() function should not
+ + * directly be used on VLV2 for updating AUD_CONFIG register.
+++=======
++ /*
++  * enable / disable audio configuration
++  *
++  * The had_read_modify() function should not directly be used on VLV2 for
++  * updating AUD_CONFIG register.
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+   * This is because:
+   * Bit6 of AUD_CONFIG register is writeonly due to a silicon bug on VLV2
+   * HDMI IP. As a result a read-modify of AUD_CONFIG regiter will always
+@@@ -238,40 -258,43 +276,66 @@@
+   * causes the "channels" field to be updated as 0xy binary resulting in
+   * bad audio. The fix is to always write the AUD_CONFIG[6:4] with
+   * appropriate value when doing read-modify of AUD_CONFIG register.
+-  *
+-  * @substream: the current substream or NULL if no active substream
+-  * @data : data to be written
+-  * @mask : mask
+-  *
+   */
+++<<<<<<< HEAD
+ +static int had_read_modify_aud_config_v2(struct snd_pcm_substream *substream,
+ +					u32 data, u32 mask)
+ +{
+ +	struct snd_intelhad *intelhaddata = snd_pcm_substream_chip(substream);
+++=======
++ static void snd_intelhad_enable_audio(struct snd_pcm_substream *substream,
++ 				      struct snd_intelhad *intelhaddata,
++ 				      bool enable)
++ {
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  	union aud_cfg cfg_val = {.cfg_regval = 0};
+- 	u8 channels;
++ 	u8 channels, data, mask;
+  
+  	/*
+  	 * If substream is NULL, there is no active stream.
+  	 * In this case just set channels to 2
+  	 */
+++<<<<<<< HEAD
+ +	if (substream)
+ +		channels = substream->runtime->channels;
+ +	else
+ +		channels = 2;
+ +	cfg_val.cfg_regx_v2.num_ch = channels - 2;
+ +
+ +	data = data | cfg_val.cfg_regval;
+ +	mask = mask | AUD_CONFIG_CH_MASK_V2;
+++=======
++ 	channels = substream ? substream->runtime->channels : 2;
++ 	cfg_val.cfg_regx.num_ch = channels - 2;
++ 
++ 	data = cfg_val.cfg_regval;
++ 	if (enable)
++ 		data |= 1;
++ 	mask = AUD_CONFIG_CH_MASK | 1;
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  
+ -	dev_dbg(intelhaddata->dev, "%s : data = %x, mask =%x\n",
+ -		__func__, data, mask);
+ +	pr_debug("%s : data = %x, mask =%x\n", __func__, data, mask);
+  
+- 	return had_read_modify(intelhaddata, AUD_CONFIG, data, mask);
++ 	had_read_modify(intelhaddata, AUD_CONFIG, data, mask);
+  }
+  
+++<<<<<<< HEAD
+ +void snd_intelhad_enable_audio(struct snd_pcm_substream *substream, u8 enable)
+ +{
+ +	had_read_modify_aud_config_v2(substream, enable, BIT(0));
+++=======
++ /* enable / disable the audio interface */
++ static void snd_intelhad_enable_audio_int(struct snd_intelhad *ctx, bool enable)
++ {
++ 	u32 status_reg;
++ 
++ 	if (enable) {
++ 		mid_hdmi_audio_read(ctx, AUD_HDMI_STATUS, &status_reg);
++ 		status_reg |= HDMI_AUDIO_BUFFER_DONE | HDMI_AUDIO_UNDERRUN;
++ 		mid_hdmi_audio_write(ctx, AUD_HDMI_STATUS, status_reg);
++ 		mid_hdmi_audio_read(ctx, AUD_HDMI_STATUS, &status_reg);
++ 	}
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  }
+  
+  static void snd_intelhad_reset_audio(struct snd_intelhad *intelhaddata,
+@@@ -644,28 -663,19 +708,44 @@@ static void snd_intelhad_prog_dip(struc
+  	had_write_register(intelhaddata, AUD_CNTL_ST, ctrl_state.ctrl_val);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * snd_intelhad_prog_buffer - programs buffer
+ + * address and length registers
+ + *
+ + * @substream:substream for which the prepare function is called
+ + * @intelhaddata:substream private data
+ + *
+ + * This function programs ring buffer address and length into registers.
+ + */
+ +int snd_intelhad_prog_buffer(struct snd_intelhad *intelhaddata,
+ +					int start, int end)
+ +{
+ +	u32 ring_buf_addr, ring_buf_size, period_bytes;
+ +	u8 i, num_periods;
+ +	struct snd_pcm_substream *substream;
+ +
+ +	substream = intelhaddata->stream_info.had_substream;
+ +	if (!substream) {
+ +		pr_err("substream is NULL\n");
+ +		dump_stack();
+ +		return 0;
+ +	}
+++=======
++ /*
++  * snd_intelhad_prog_buffer - programs buffer address and length registers
++  * @substream: substream for which the prepare function is called
++  * @intelhaddata: substream private data
++  *
++  * This function programs ring buffer address and length into registers.
++  */
++ static int snd_intelhad_prog_buffer(struct snd_pcm_substream *substream,
++ 				    struct snd_intelhad *intelhaddata,
++ 				    int start, int end)
++ {
++ 	u32 ring_buf_addr, ring_buf_size, period_bytes;
++ 	u8 i, num_periods;
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  
+  	ring_buf_addr = substream->runtime->dma_addr;
+  	ring_buf_size = snd_pcm_lib_buffer_bytes(substream);
+@@@ -1002,65 -998,24 +1082,75 @@@ static int snd_intelhad_open(struct snd
+  	retval = snd_pcm_hw_constraint_step(substream->runtime, 0,
+  			SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 64);
+  	if (retval < 0) {
+ -		dev_dbg(intelhaddata->dev, "%s:step_size=64 failed,err=%d\n",
+ -			__func__, retval);
+ -		goto error;
+ +		pr_err("%s:step_size=64 failed,err=%d\n", __func__, retval);
+ +		goto exit_err;
+  	}
+  
++ 	spin_lock_irq(&intelhaddata->had_spinlock);
++ 	intelhaddata->stream_info.substream = substream;
++ 	intelhaddata->stream_info.substream_refcount++;
++ 	spin_unlock_irq(&intelhaddata->had_spinlock);
++ 
+  	return retval;
+ - error:
+ +exit_err:
+ +	kfree(stream);
+ +exit_put_handle:
+  	pm_runtime_put(intelhaddata->dev);
+ +	runtime->private_data = NULL;
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * had_period_elapsed - updates the hardware pointer status
+ + * @had_substream:substream for which the stream function is called
+ + *
+ + */
+ +static void had_period_elapsed(void *had_substream)
+ +{
+ +	struct snd_pcm_substream *substream = had_substream;
+ +	struct had_stream_pvt *stream;
+ +
+ +	/* pr_debug("had_period_elapsed called\n"); */
+ +
+ +	if (!substream || !substream->runtime)
+ +		return;
+ +	stream = substream->runtime->private_data;
+ +	if (!stream)
+ +		return;
+ +
+ +	if (stream->stream_status != STREAM_RUNNING)
+ +		return;
+ +	snd_pcm_period_elapsed(substream);
+ +}
+ +
+ +/**
+ + * snd_intelhad_init_stream - internal function to initialize stream info
+ + * @substream:substream for which the stream function is called
+ + *
+ + */
+ +static int snd_intelhad_init_stream(struct snd_pcm_substream *substream)
+ +{
+ +	struct snd_intelhad *intelhaddata = snd_pcm_substream_chip(substream);
+ +
+ +	pr_debug("snd_intelhad_init_stream called\n");
+ +
+ +	pr_debug("setting buffer ptr param\n");
+ +	intelhaddata->stream_info.period_elapsed = had_period_elapsed;
+ +	intelhaddata->stream_info.had_substream = substream;
+ +	intelhaddata->stream_info.buffer_ptr = 0;
+ +	intelhaddata->stream_info.buffer_rendered = 0;
+ +	intelhaddata->stream_info.sfreq = substream->runtime->rate;
+ +	return 0;
+ +}
+ +
+ +/**
+ + * snd_intelhad_close- to free parameteres when stream is stopped
+ + *
+++=======
++ /*
++  * snd_intelhad_close - to free parameteres when stream is stopped
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+   * @substream:  substream for which the function is called
+   *
+   * This function is called by ALSA framework when stream is stopped
+@@@ -1068,22 -1023,19 +1158,34 @@@
+  static int snd_intelhad_close(struct snd_pcm_substream *substream)
+  {
+  	struct snd_intelhad *intelhaddata;
+ +	struct snd_pcm_runtime *runtime;
+ +
+ +	pr_debug("snd_intelhad_close called\n");
+  
+  	intelhaddata = snd_pcm_substream_chip(substream);
+ +	runtime = substream->runtime;
+ +
+ +	if (!runtime->private_data) {
+ +		pr_debug("close() might have called after failed open");
+ +		return 0;
+ +	}
+  
+  	intelhaddata->stream_info.buffer_rendered = 0;
+++<<<<<<< HEAD
+ +	intelhaddata->stream_info.buffer_ptr = 0;
+ +	intelhaddata->stream_info.str_id = 0;
+ +	intelhaddata->stream_info.had_substream = NULL;
+++=======
++ 	spin_lock_irq(&intelhaddata->had_spinlock);
++ 	intelhaddata->stream_info.substream = NULL;
++ 	intelhaddata->stream_info.substream_refcount--;
++ 	while (intelhaddata->stream_info.substream_refcount > 0) {
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		cpu_relax();
++ 		spin_lock_irq(&intelhaddata->had_spinlock);
++ 	}
++ 	spin_unlock_irq(&intelhaddata->had_spinlock);
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  
+  	/* Check if following drv_status modification is required - VA */
+  	if (intelhaddata->drv_status != HAD_DRV_DISCONNECTED) {
+@@@ -1198,38 -1140,21 +1300,48 @@@ static int snd_intelhad_pcm_trigger(str
+  		had_stream->stream_type = HAD_RUNNING_STREAM;
+  
+  		/* Enable Audio */
+++<<<<<<< HEAD
+ +		/*
+ +		 * ToDo: Need to enable UNDERRUN interrupts as well
+ +		 *   caps = HDMI_AUDIO_UNDERRUN | HDMI_AUDIO_BUFFER_DONE;
+ +		 */
+ +		caps = HDMI_AUDIO_BUFFER_DONE;
+ +		retval = had_set_caps(intelhaddata, HAD_SET_ENABLE_AUDIO_INT,
+ +				      &caps);
+ +		retval = had_set_caps(intelhaddata, HAD_SET_ENABLE_AUDIO, NULL);
+ +		snd_intelhad_enable_audio(substream, 1);
+ +
+ +		pr_debug("Processed _Start\n");
+ +
+++=======
++ 		snd_intelhad_enable_audio_int(intelhaddata, true);
++ 		snd_intelhad_enable_audio(substream, intelhaddata, true);
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  		break;
+  
+  	case SNDRV_PCM_TRIGGER_STOP:
+ -		spin_lock(&intelhaddata->had_spinlock);
+ +		pr_debug("Trigger Stop\n");
+ +		spin_lock_irqsave(&intelhaddata->had_spinlock, flag_irq);
+ +		intelhaddata->stream_info.str_id = 0;
+  		intelhaddata->curr_buf = 0;
+  
+ -		/* Stop reporting BUFFER_DONE/UNDERRUN to above layers */
+ +		/* Stop reporting BUFFER_DONE/UNDERRUN to above layers*/
+  
+  		had_stream->stream_type = HAD_INIT;
+ -		spin_unlock(&intelhaddata->had_spinlock);
+ +		spin_unlock_irqrestore(&intelhaddata->had_spinlock, flag_irq);
+  		/* Disable Audio */
+++<<<<<<< HEAD
+ +		/*
+ +		 * ToDo: Need to disable UNDERRUN interrupts as well
+ +		 *   caps = HDMI_AUDIO_UNDERRUN | HDMI_AUDIO_BUFFER_DONE;
+ +		 */
+ +		caps = HDMI_AUDIO_BUFFER_DONE;
+ +		had_set_caps(intelhaddata, HAD_SET_DISABLE_AUDIO_INT, &caps);
+ +		snd_intelhad_enable_audio(substream, 0);
+++=======
++ 		snd_intelhad_enable_audio_int(intelhaddata, false);
++ 		snd_intelhad_enable_audio(substream, intelhaddata, false);
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  		/* Reset buffer pointers */
+  		snd_intelhad_reset_audio(intelhaddata, 1);
+  		snd_intelhad_reset_audio(intelhaddata, 0);
+@@@ -1271,36 -1193,18 +1383,40 @@@ static int snd_intelhad_pcm_prepare(str
+  		goto prep_end;
+  	}
+  
+ -	dev_dbg(intelhaddata->dev, "period_size=%d\n",
+ +	pr_debug("period_size=%d\n",
+  		(int)frames_to_bytes(runtime, runtime->period_size));
+ -	dev_dbg(intelhaddata->dev, "periods=%d\n", runtime->periods);
+ -	dev_dbg(intelhaddata->dev, "buffer_size=%d\n",
+ -		(int)snd_pcm_lib_buffer_bytes(substream));
+ -	dev_dbg(intelhaddata->dev, "rate=%d\n", runtime->rate);
+ -	dev_dbg(intelhaddata->dev, "channels=%d\n", runtime->channels);
+ +	pr_debug("periods=%d\n", runtime->periods);
+ +	pr_debug("buffer_size=%d\n", (int)snd_pcm_lib_buffer_bytes(substream));
+ +	pr_debug("rate=%d\n", runtime->rate);
+ +	pr_debug("channels=%d\n", runtime->channels);
+ +
+ +	if (intelhaddata->stream_info.str_id) {
+ +		pr_debug("_prepare is called for existing str_id#%d\n",
+ +					intelhaddata->stream_info.str_id);
+ +		retval = snd_intelhad_pcm_trigger(substream,
+ +						SNDRV_PCM_TRIGGER_STOP);
+ +		return retval;
+ +	}
+ +
+ +	retval = snd_intelhad_init_stream(substream);
+ +	if (retval)
+ +		goto prep_end;
+  
+++<<<<<<< HEAD
+++=======
++ 	intelhaddata->stream_info.buffer_rendered = 0;
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  
+  	/* Get N value in KHz */
+ -	disp_samp_freq = intelhaddata->tmds_clock_speed;
+ +	retval = had_get_caps(intelhaddata, HAD_GET_DISPLAY_RATE,
+ +			      &disp_samp_freq);
+ +	if (retval) {
+ +		pr_err("querying display sampling freq failed %#x\n", retval);
+ +		goto prep_end;
+ +	}
+ +
+ +	had_get_caps(intelhaddata, HAD_GET_ELD, &intelhaddata->eeld);
+ +	had_get_caps(intelhaddata, HAD_GET_DP_OUTPUT, &intelhaddata->dp_output);
+  
+  	retval = snd_intelhad_prog_n(substream->runtime->rate, &n_param,
+  				     intelhaddata);
+@@@ -1425,20 -1319,17 +1541,29 @@@ int hdmi_audio_mode_change(struct snd_p
+  	int retval = 0;
+  	u32 disp_samp_freq, n_param;
+  	u32 link_rate = 0;
+ +	struct snd_intelhad *intelhaddata;
+ +
+++<<<<<<< HEAD
+ +	intelhaddata = snd_pcm_substream_chip(substream);
+  
+ +	/* Disable Audio */
+ +	snd_intelhad_enable_audio(substream, 0);
+++=======
++ 	substream = had_substream_get(intelhaddata);
++ 	if (!substream)
++ 		return 0;
++ 
++ 	/* Disable Audio */
++ 	snd_intelhad_enable_audio(substream, intelhaddata, false);
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  
+  	/* Update CTS value */
+ -	disp_samp_freq = intelhaddata->tmds_clock_speed;
+ +	retval = had_get_caps(intelhaddata, HAD_GET_DISPLAY_RATE,
+ +			      &disp_samp_freq);
+ +	if (retval) {
+ +		pr_err("querying display sampling freq failed %#x\n", retval);
+ +		goto out;
+ +	}
+  
+  	retval = snd_intelhad_prog_n(substream->runtime->rate, &n_param,
+  				     intelhaddata);
+@@@ -1455,14 -1347,352 +1580,361 @@@
+  			      n_param, intelhaddata);
+  
+  	/* Enable Audio */
+++<<<<<<< HEAD
+ +	snd_intelhad_enable_audio(substream, 1);
+++=======
++ 	snd_intelhad_enable_audio(substream, intelhaddata, true);
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  
+  out:
++ 	had_substream_put(intelhaddata);
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+ +/*PCM operations structure and the calls back for the same */
+ +struct snd_pcm_ops snd_intelhad_playback_ops = {
+++=======
++ /*
++  * hdmi_lpe_audio_suspend - power management suspend function
++  * @pdev: platform device
++  *
++  * This function is called to suspend the hdmi audio.
++  */
++ static int hdmi_lpe_audio_suspend(struct platform_device *pdev,
++ 				  pm_message_t state)
++ {
++ 	struct had_stream_data *had_stream;
++ 	struct snd_intelhad *intelhaddata = platform_get_drvdata(pdev);
++ 
++ 	had_stream = &intelhaddata->stream_data;
++ 
++ 	if (!pm_runtime_status_suspended(intelhaddata->dev)) {
++ 		dev_err(intelhaddata->dev, "audio stream is active\n");
++ 		return -EAGAIN;
++ 	}
++ 
++ 	spin_lock_irq(&intelhaddata->had_spinlock);
++ 	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED) {
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		dev_dbg(intelhaddata->dev, "had not connected\n");
++ 		return 0;
++ 	}
++ 
++ 	if (intelhaddata->drv_status == HAD_DRV_SUSPENDED) {
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		dev_dbg(intelhaddata->dev, "had already suspended\n");
++ 		return 0;
++ 	}
++ 
++ 	intelhaddata->drv_status = HAD_DRV_SUSPENDED;
++ 	dev_dbg(intelhaddata->dev,
++ 		"%s @ %d:DEBUG PLUG/UNPLUG : HAD_DRV_SUSPENDED\n",
++ 			__func__, __LINE__);
++ 
++ 	spin_unlock_irq(&intelhaddata->had_spinlock);
++ 	snd_intelhad_enable_audio_int(intelhaddata, false);
++ 	return 0;
++ }
++ 
++ /*
++  * hdmi_lpe_audio_resume - power management resume function
++  * @pdev: platform device
++  *
++  * This function is called to resume the hdmi audio.
++  */
++ static int hdmi_lpe_audio_resume(struct platform_device *pdev)
++ {
++ 	struct snd_intelhad *intelhaddata = platform_get_drvdata(pdev);
++ 
++ 	spin_lock_irq(&intelhaddata->had_spinlock);
++ 	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED) {
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		dev_dbg(intelhaddata->dev, "had not connected\n");
++ 		return 0;
++ 	}
++ 
++ 	if (intelhaddata->drv_status != HAD_DRV_SUSPENDED) {
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		dev_dbg(intelhaddata->dev, "had is not in suspended state\n");
++ 		return 0;
++ 	}
++ 
++ 	intelhaddata->drv_status = HAD_DRV_CONNECTED;
++ 	dev_dbg(intelhaddata->dev,
++ 		"%s @ %d:DEBUG PLUG/UNPLUG : HAD_DRV_DISCONNECTED\n",
++ 			__func__, __LINE__);
++ 	spin_unlock_irq(&intelhaddata->had_spinlock);
++ 	snd_intelhad_enable_audio_int(intelhaddata, true);
++ 	return 0;
++ }
++ 
++ static inline int had_chk_intrmiss(struct snd_intelhad *intelhaddata,
++ 		enum intel_had_aud_buf_type buf_id)
++ {
++ 	int i, intr_count = 0;
++ 	enum intel_had_aud_buf_type buff_done;
++ 	u32 buf_size, buf_addr;
++ 	struct had_stream_data *had_stream;
++ 
++ 	had_stream = &intelhaddata->stream_data;
++ 
++ 	buff_done = buf_id;
++ 
++ 	intr_count = snd_intelhad_read_len(intelhaddata);
++ 	if (intr_count > 1) {
++ 		/* In case of active playback */
++ 		dev_err(intelhaddata->dev,
++ 			"Driver detected %d missed buffer done interrupt(s)\n",
++ 			(intr_count - 1));
++ 		if (intr_count > 3)
++ 			return intr_count;
++ 
++ 		buf_id += (intr_count - 1);
++ 		/* Reprogram registers*/
++ 		for (i = buff_done; i < buf_id; i++) {
++ 			int j = i % 4;
++ 
++ 			buf_size = intelhaddata->buf_info[j].buf_size;
++ 			buf_addr = intelhaddata->buf_info[j].buf_addr;
++ 			had_write_register(intelhaddata,
++ 					   AUD_BUF_A_LENGTH +
++ 					   (j * HAD_REG_WIDTH), buf_size);
++ 			had_write_register(intelhaddata,
++ 					   AUD_BUF_A_ADDR+(j * HAD_REG_WIDTH),
++ 					   (buf_addr | BIT(0) | BIT(1)));
++ 		}
++ 		buf_id = buf_id % 4;
++ 		intelhaddata->buff_done = buf_id;
++ 	}
++ 
++ 	return intr_count;
++ }
++ 
++ /* called from irq handler */
++ static int had_process_buffer_done(struct snd_intelhad *intelhaddata)
++ {
++ 	u32 len = 1;
++ 	enum intel_had_aud_buf_type buf_id;
++ 	enum intel_had_aud_buf_type buff_done;
++ 	struct pcm_stream_info *stream;
++ 	struct snd_pcm_substream *substream;
++ 	u32 buf_size;
++ 	struct had_stream_data *had_stream;
++ 	int intr_count;
++ 	unsigned long flags;
++ 
++ 	had_stream = &intelhaddata->stream_data;
++ 	stream = &intelhaddata->stream_info;
++ 	intr_count = 1;
++ 
++ 	spin_lock_irqsave(&intelhaddata->had_spinlock, flags);
++ 	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED) {
++ 		spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ 		dev_dbg(intelhaddata->dev,
++ 			"%s:Device already disconnected\n", __func__);
++ 		return 0;
++ 	}
++ 	buf_id = intelhaddata->curr_buf;
++ 	intelhaddata->buff_done = buf_id;
++ 	buff_done = intelhaddata->buff_done;
++ 	buf_size = intelhaddata->buf_info[buf_id].buf_size;
++ 
++ 	/* Every debug statement has an implication
++ 	 * of ~5msec. Thus, avoid having >3 debug statements
++ 	 * for each buffer_done handling.
++ 	 */
++ 
++ 	/* Check for any intr_miss in case of active playback */
++ 	if (had_stream->stream_type == HAD_RUNNING_STREAM) {
++ 		intr_count = had_chk_intrmiss(intelhaddata, buf_id);
++ 		if (!intr_count || (intr_count > 3)) {
++ 			spin_unlock_irqrestore(&intelhaddata->had_spinlock,
++ 					       flags);
++ 			dev_err(intelhaddata->dev,
++ 				"HAD SW state in non-recoverable mode\n");
++ 			return 0;
++ 		}
++ 		buf_id += (intr_count - 1);
++ 		buf_id = buf_id % 4;
++ 	}
++ 
++ 	intelhaddata->buf_info[buf_id].is_valid = true;
++ 	if (intelhaddata->valid_buf_cnt-1 == buf_id) {
++ 		if (had_stream->stream_type >= HAD_RUNNING_STREAM)
++ 			intelhaddata->curr_buf = HAD_BUF_TYPE_A;
++ 	} else
++ 		intelhaddata->curr_buf = buf_id + 1;
++ 
++ 	spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ 
++ 	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED) {
++ 		dev_dbg(intelhaddata->dev, "HDMI cable plugged-out\n");
++ 		return 0;
++ 	}
++ 
++ 	/* Reprogram the registers with addr and length */
++ 	had_write_register(intelhaddata,
++ 			   AUD_BUF_A_LENGTH + (buf_id * HAD_REG_WIDTH),
++ 			   buf_size);
++ 	had_write_register(intelhaddata,
++ 			   AUD_BUF_A_ADDR + (buf_id * HAD_REG_WIDTH),
++ 			   intelhaddata->buf_info[buf_id].buf_addr |
++ 			   BIT(0) | BIT(1));
++ 
++ 	had_read_register(intelhaddata,
++ 			  AUD_BUF_A_LENGTH + (buf_id * HAD_REG_WIDTH),
++ 			  &len);
++ 	dev_dbg(intelhaddata->dev, "%s:Enabled buf[%d]\n", __func__, buf_id);
++ 
++ 	/* In case of actual data,
++ 	 * report buffer_done to above ALSA layer
++ 	 */
++ 	substream = had_substream_get(intelhaddata);
++ 	if (substream) {
++ 		buf_size = intelhaddata->buf_info[buf_id].buf_size;
++ 		intelhaddata->stream_info.buffer_rendered +=
++ 			(intr_count * buf_size);
++ 		snd_pcm_period_elapsed(substream);
++ 		had_substream_put(intelhaddata);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /* called from irq handler */
++ static int had_process_buffer_underrun(struct snd_intelhad *intelhaddata)
++ {
++ 	enum intel_had_aud_buf_type buf_id;
++ 	struct pcm_stream_info *stream;
++ 	struct had_stream_data *had_stream;
++ 	struct snd_pcm_substream *substream;
++ 	enum had_status_stream stream_type;
++ 	unsigned long flags;
++ 	int drv_status;
++ 
++ 	had_stream = &intelhaddata->stream_data;
++ 	stream = &intelhaddata->stream_info;
++ 
++ 	spin_lock_irqsave(&intelhaddata->had_spinlock, flags);
++ 	buf_id = intelhaddata->curr_buf;
++ 	stream_type = had_stream->stream_type;
++ 	intelhaddata->buff_done = buf_id;
++ 	drv_status = intelhaddata->drv_status;
++ 	if (stream_type == HAD_RUNNING_STREAM)
++ 		intelhaddata->curr_buf = HAD_BUF_TYPE_A;
++ 
++ 	spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ 
++ 	dev_dbg(intelhaddata->dev, "Enter:%s buf_id=%d, stream_type=%d\n",
++ 			__func__, buf_id, stream_type);
++ 
++ 	snd_intelhad_handle_underrun(intelhaddata);
++ 
++ 	if (drv_status == HAD_DRV_DISCONNECTED) {
++ 		dev_dbg(intelhaddata->dev,
++ 			"%s:Device already disconnected\n", __func__);
++ 		return 0;
++ 	}
++ 
++ 	if (stream_type == HAD_RUNNING_STREAM) {
++ 		/* Report UNDERRUN error to above layers */
++ 		substream = had_substream_get(intelhaddata);
++ 		if (substream) {
++ 			snd_pcm_stop_xrun(substream);
++ 			had_substream_put(intelhaddata);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /* process hot plug, called from wq with mutex locked */
++ static void had_process_hot_plug(struct snd_intelhad *intelhaddata)
++ {
++ 	enum intel_had_aud_buf_type buf_id;
++ 	struct snd_pcm_substream *substream;
++ 	struct had_stream_data *had_stream;
++ 
++ 	had_stream = &intelhaddata->stream_data;
++ 
++ 	spin_lock_irq(&intelhaddata->had_spinlock);
++ 	if (intelhaddata->drv_status == HAD_DRV_CONNECTED) {
++ 		dev_dbg(intelhaddata->dev, "Device already connected\n");
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		return;
++ 	}
++ 
++ 	buf_id = intelhaddata->curr_buf;
++ 	intelhaddata->buff_done = buf_id;
++ 	intelhaddata->drv_status = HAD_DRV_CONNECTED;
++ 	dev_dbg(intelhaddata->dev,
++ 		"%s @ %d:DEBUG PLUG/UNPLUG : HAD_DRV_CONNECTED\n",
++ 			__func__, __LINE__);
++ 	spin_unlock_irq(&intelhaddata->had_spinlock);
++ 
++ 	dev_dbg(intelhaddata->dev, "Processing HOT_PLUG, buf_id = %d\n",
++ 		buf_id);
++ 
++ 	/* Safety check */
++ 	substream = had_substream_get(intelhaddata);
++ 	if (substream) {
++ 		dev_dbg(intelhaddata->dev,
++ 			"Force to stop the active stream by disconnection\n");
++ 		/* Set runtime->state to hw_params done */
++ 		snd_pcm_stop(substream, SNDRV_PCM_STATE_SETUP);
++ 		had_substream_put(intelhaddata);
++ 	}
++ 
++ 	had_build_channel_allocation_map(intelhaddata);
++ }
++ 
++ /* process hot unplug, called from wq with mutex locked */
++ static void had_process_hot_unplug(struct snd_intelhad *intelhaddata)
++ {
++ 	enum intel_had_aud_buf_type buf_id;
++ 	struct had_stream_data *had_stream;
++ 	struct snd_pcm_substream *substream;
++ 
++ 	had_stream = &intelhaddata->stream_data;
++ 	buf_id = intelhaddata->curr_buf;
++ 
++ 	substream = had_substream_get(intelhaddata);
++ 
++ 	spin_lock_irq(&intelhaddata->had_spinlock);
++ 
++ 	if (intelhaddata->drv_status == HAD_DRV_DISCONNECTED) {
++ 		dev_dbg(intelhaddata->dev, "Device already disconnected\n");
++ 		spin_unlock_irq(&intelhaddata->had_spinlock);
++ 		goto out;
++ 
++ 	}
++ 
++ 	/* Disable Audio */
++ 	snd_intelhad_enable_audio_int(intelhaddata, false);
++ 	snd_intelhad_enable_audio(substream, intelhaddata, false);
++ 
++ 	intelhaddata->drv_status = HAD_DRV_DISCONNECTED;
++ 	dev_dbg(intelhaddata->dev,
++ 		"%s @ %d:DEBUG PLUG/UNPLUG : HAD_DRV_DISCONNECTED\n",
++ 			__func__, __LINE__);
++ 	had_stream->stream_type = HAD_INIT;
++ 	spin_unlock_irq(&intelhaddata->had_spinlock);
++ 
++ 	/* Report to above ALSA layer */
++ 	if (substream)
++ 		snd_pcm_stop(substream, SNDRV_PCM_STATE_SETUP);
++ 
++  out:
++ 	if (substream)
++ 		had_substream_put(intelhaddata);
++ 	kfree(intelhaddata->chmap->chmap);
++ 	intelhaddata->chmap->chmap = NULL;
++ }
++ 
++ /* PCM operations structure and the calls back for the same */
++ static struct snd_pcm_ops snd_intelhad_playback_ops = {
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  	.open =		snd_intelhad_open,
+  	.close =	snd_intelhad_close,
+  	.ioctl =	snd_pcm_lib_ioctl,
+diff --cc sound/x86/intel_hdmi_audio.h
+index 32a2fb766e47,6e5a1978e9c7..000000000000
+--- a/sound/x86/intel_hdmi_audio.h
++++ b/sound/x86/intel_hdmi_audio.h
+@@@ -71,16 -69,13 +71,23 @@@ struct platform_device
+  #define LAYOUT0			0
+  #define LAYOUT1			1
+  #define SWAP_LFE_CENTER		0x00fac4c8
+ -#define AUD_CONFIG_CH_MASK	0x70
+ +#define AUD_CONFIG_CH_MASK_V2	0x70
+  
+  struct pcm_stream_info {
+++<<<<<<< HEAD
+ +	int		str_id;
+ +	void	*had_substream;
+ +	void	(*period_elapsed)(void *had_substream);
+ +	u32		buffer_ptr;
+ +	u64		buffer_rendered;
+ +	u32		ring_buf_size;
+ +	int		sfreq;
+++=======
++ 	struct snd_pcm_substream *substream;
++ 	u64		buffer_rendered;
++ 	u32		ring_buf_size;
++ 	int substream_refcount;
+++>>>>>>> 313d9f28c1d5 (ALSA: x86: Properly manage PCM substream lifetype)
+  };
+  
+  struct ring_buf_info {
+* Unmerged path sound/x86/intel_hdmi_audio.c
+* Unmerged path sound/x86/intel_hdmi_audio.h
