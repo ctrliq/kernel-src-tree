@@ -5370,7 +5370,8 @@ int bnxt_hwrm_fw_set_time(struct bnxt *bp)
 	struct rtc_time tm;
 	struct timeval tv;
 
-	if (bp->hwrm_spec_code < 0x10400)
+	if ((BNXT_VF(bp) && bp->hwrm_spec_code < 0x10901) ||
+	    bp->hwrm_spec_code < 0x10400)
 		return -EOPNOTSUPP;
 
 	do_gettimeofday(&tv);
