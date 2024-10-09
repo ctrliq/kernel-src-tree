@@ -1,0 +1,967 @@
+IB/hfi1: Prepare for new HFI1 MSIx API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 09e71899b9cf5ed7495118b3023db41575013fe2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/09e71899.failed
+
+The current HFI1 MSIx API is difficult to follow, change, or add to.
+
+In anticipation of moving to an more flexible API, move the current
+MSIx functionality to the new msix.c module.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Sadanand Warrier <sadanand.warrier@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 09e71899b9cf5ed7495118b3023db41575013fe2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/Makefile
+#	drivers/infiniband/hw/hfi1/chip.c
+#	drivers/infiniband/hw/hfi1/hfi.h
+#	drivers/infiniband/hw/hfi1/pcie.c
+diff --cc drivers/infiniband/hw/hfi1/Makefile
+index 66d538c033b0,a8dcf82ab7cb..000000000000
+--- a/drivers/infiniband/hw/hfi1/Makefile
++++ b/drivers/infiniband/hw/hfi1/Makefile
+@@@ -7,13 -8,50 +7,60 @@@
+  #
+  obj-$(CONFIG_INFINIBAND_HFI1) += hfi1.o
+  
+++<<<<<<< HEAD
+ +hfi1-y := affinity.o chip.o device.o driver.o efivar.o \
+ +	eprom.o exp_rcv.o file_ops.o firmware.o \
+ +	init.o intr.o mad.o mmu_rb.o pcie.o pio.o pio_copy.o platform.o \
+ +	qp.o qsfp.o rc.o ruc.o sdma.o sysfs.o trace.o \
+ +	uc.o ud.o user_exp_rcv.o user_pages.o user_sdma.o verbs.o \
+ +	verbs_txreq.o vnic_main.o vnic_sdma.o
+ +hfi1-$(CONFIG_DEBUG_FS) += debugfs.o
+++=======
++ hfi1-y := \
++ 	affinity.o \
++ 	chip.o \
++ 	device.o \
++ 	driver.o \
++ 	efivar.o \
++ 	eprom.o \
++ 	exp_rcv.o \
++ 	file_ops.o \
++ 	firmware.o \
++ 	init.o \
++ 	intr.o \
++ 	mad.o \
++ 	mmu_rb.o \
++ 	msix.o \
++ 	pcie.o \
++ 	pio.o \
++ 	pio_copy.o \
++ 	platform.o \
++ 	qp.o \
++ 	qsfp.o \
++ 	rc.o \
++ 	ruc.o \
++ 	sdma.o \
++ 	sysfs.o \
++ 	trace.o \
++ 	uc.o \
++ 	ud.o \
++ 	user_exp_rcv.o \
++ 	user_pages.o \
++ 	user_sdma.o \
++ 	verbs.o \
++ 	verbs_txreq.o \
++ 	vnic_main.o \
++ 	vnic_sdma.o
++ 
++ ifdef CONFIG_DEBUG_FS
++ hfi1-y += debugfs.o
++ ifdef CONFIG_FAULT_INJECTION
++ ifdef CONFIG_FAULT_INJECTION_DEBUG_FS
++ hfi1-y += fault.o
++ endif
++ endif
++ endif
+++>>>>>>> 09e71899b9cf (IB/hfi1: Prepare for new HFI1 MSIx API)
+  
+  CFLAGS_trace.o = -I$(src)
+  ifdef MVERSION
+diff --cc drivers/infiniband/hw/hfi1/chip.c
+index 82f2710fc5bc,6d81a955ef8e..000000000000
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@@ -8266,11 -8262,16 +8266,11 @@@ static void is_interrupt(struct hfi1_de
+  	dd_dev_err(dd, "invalid interrupt source %u\n", source);
+  }
+  
+ -/**
+ - * gerneral_interrupt() -  General interrupt handler
+ - * @irq: MSIx IRQ vector
+ - * @data: hfi1 devdata
+ - *
+ - * This is able to correctly handle all non-threaded interrupts.  Receive
+ - * context DATA IRQs are threaded and are not supported by this handler.
+ - *
+ +/*
+ + * General interrupt handler.  This is able to correctly handle
+ + * all interrupts in case INTx is used.
+   */
+- static irqreturn_t general_interrupt(int irq, void *data)
++ irqreturn_t general_interrupt(int irq, void *data)
+  {
+  	struct hfi1_devdata *dd = data;
+  	u64 regs[CCE_NUM_INT_CSRS];
+@@@ -13036,51 -13037,6 +13036,54 @@@ void clear_all_interrupts(struct hfi1_d
+  	write_csr(dd, DC_DC8051_ERR_CLR, ~(u64)0);
+  }
+  
+++<<<<<<< HEAD
+ +/* Move to pcie.c? */
+ +static void disable_intx(struct pci_dev *pdev)
+ +{
+ +	pci_intx(pdev, 0);
+ +}
+ +
+ +/**
+ + * hfi1_clean_up_interrupts() - Free all IRQ resources
+ + * @dd: valid device data data structure
+ + *
+ + * Free the MSI or INTx IRQs and assoicated PCI resources,
+ + * if they have been allocated.
+ + */
+ +void hfi1_clean_up_interrupts(struct hfi1_devdata *dd)
+ +{
+ +	int i;
+ +
+ +	/* remove irqs - must happen before disabling/turning off */
+ +	if (dd->num_msix_entries) {
+ +		/* MSI-X */
+ +		struct hfi1_msix_entry *me = dd->msix_entries;
+ +
+ +		for (i = 0; i < dd->num_msix_entries; i++, me++) {
+ +			if (!me->arg) /* => no irq, no affinity */
+ +				continue;
+ +			hfi1_put_irq_affinity(dd, me);
+ +			free_irq(me->irq, me->arg);
+ +		}
+ +
+ +		/* clean structures */
+ +		kfree(dd->msix_entries);
+ +		dd->msix_entries = NULL;
+ +		dd->num_msix_entries = 0;
+ +	} else {
+ +		/* INTx */
+ +		if (dd->requested_intx_irq) {
+ +			free_irq(dd->pcidev->irq, dd);
+ +			dd->requested_intx_irq = 0;
+ +		}
+ +		disable_intx(dd->pcidev);
+ +	}
+ +
+ +	pci_free_irq_vectors(dd->pcidev);
+ +}
+ +
+++=======
+++>>>>>>> 09e71899b9cf (IB/hfi1: Prepare for new HFI1 MSIx API)
+  /*
+   * Remap the interrupt source from the general handler to the given MSI-X
+   * interrupt.
+@@@ -13127,226 -13082,6 +13129,229 @@@ void remap_sdma_interrupts(struct hfi1_
+  		   msix_intr);
+  }
+  
+++<<<<<<< HEAD
+ +static int request_intx_irq(struct hfi1_devdata *dd)
+ +{
+ +	int ret;
+ +
+ +	snprintf(dd->intx_name, sizeof(dd->intx_name), DRIVER_NAME "_%d",
+ +		 dd->unit);
+ +	ret = request_irq(dd->pcidev->irq, general_interrupt,
+ +			  IRQF_SHARED, dd->intx_name, dd);
+ +	if (ret)
+ +		dd_dev_err(dd, "unable to request INTx interrupt, err %d\n",
+ +			   ret);
+ +	else
+ +		dd->requested_intx_irq = 1;
+ +	return ret;
+ +}
+ +
+ +static int request_msix_irqs(struct hfi1_devdata *dd)
+ +{
+ +	int first_general, last_general;
+ +	int first_sdma, last_sdma;
+ +	int first_rx, last_rx;
+ +	int i, ret = 0;
+ +
+ +	/* calculate the ranges we are going to use */
+ +	first_general = 0;
+ +	last_general = first_general + 1;
+ +	first_sdma = last_general;
+ +	last_sdma = first_sdma + dd->num_sdma;
+ +	first_rx = last_sdma;
+ +	last_rx = first_rx + dd->n_krcv_queues + dd->num_vnic_contexts;
+ +
+ +	/* VNIC MSIx interrupts get mapped when VNIC contexts are created */
+ +	dd->first_dyn_msix_idx = first_rx + dd->n_krcv_queues;
+ +
+ +	/*
+ +	 * Sanity check - the code expects all SDMA chip source
+ +	 * interrupts to be in the same CSR, starting at bit 0.  Verify
+ +	 * that this is true by checking the bit location of the start.
+ +	 */
+ +	BUILD_BUG_ON(IS_SDMA_START % 64);
+ +
+ +	for (i = 0; i < dd->num_msix_entries; i++) {
+ +		struct hfi1_msix_entry *me = &dd->msix_entries[i];
+ +		const char *err_info;
+ +		irq_handler_t handler;
+ +		irq_handler_t thread = NULL;
+ +		void *arg = NULL;
+ +		int idx;
+ +		struct hfi1_ctxtdata *rcd = NULL;
+ +		struct sdma_engine *sde = NULL;
+ +
+ +		/* obtain the arguments to request_irq */
+ +		if (first_general <= i && i < last_general) {
+ +			idx = i - first_general;
+ +			handler = general_interrupt;
+ +			arg = dd;
+ +			snprintf(me->name, sizeof(me->name),
+ +				 DRIVER_NAME "_%d", dd->unit);
+ +			err_info = "general";
+ +			me->type = IRQ_GENERAL;
+ +		} else if (first_sdma <= i && i < last_sdma) {
+ +			idx = i - first_sdma;
+ +			sde = &dd->per_sdma[idx];
+ +			handler = sdma_interrupt;
+ +			arg = sde;
+ +			snprintf(me->name, sizeof(me->name),
+ +				 DRIVER_NAME "_%d sdma%d", dd->unit, idx);
+ +			err_info = "sdma";
+ +			remap_sdma_interrupts(dd, idx, i);
+ +			me->type = IRQ_SDMA;
+ +		} else if (first_rx <= i && i < last_rx) {
+ +			idx = i - first_rx;
+ +			rcd = hfi1_rcd_get_by_index_safe(dd, idx);
+ +			if (rcd) {
+ +				/*
+ +				 * Set the interrupt register and mask for this
+ +				 * context's interrupt.
+ +				 */
+ +				rcd->ireg = (IS_RCVAVAIL_START + idx) / 64;
+ +				rcd->imask = ((u64)1) <<
+ +					  ((IS_RCVAVAIL_START + idx) % 64);
+ +				handler = receive_context_interrupt;
+ +				thread = receive_context_thread;
+ +				arg = rcd;
+ +				snprintf(me->name, sizeof(me->name),
+ +					 DRIVER_NAME "_%d kctxt%d",
+ +					 dd->unit, idx);
+ +				err_info = "receive context";
+ +				remap_intr(dd, IS_RCVAVAIL_START + idx, i);
+ +				me->type = IRQ_RCVCTXT;
+ +				rcd->msix_intr = i;
+ +				hfi1_rcd_put(rcd);
+ +			}
+ +		} else {
+ +			/* not in our expected range - complain, then
+ +			 * ignore it
+ +			 */
+ +			dd_dev_err(dd,
+ +				   "Unexpected extra MSI-X interrupt %d\n", i);
+ +			continue;
+ +		}
+ +		/* no argument, no interrupt */
+ +		if (!arg)
+ +			continue;
+ +		/* make sure the name is terminated */
+ +		me->name[sizeof(me->name) - 1] = 0;
+ +		me->irq = pci_irq_vector(dd->pcidev, i);
+ +		/*
+ +		 * On err return me->irq.  Don't need to clear this
+ +		 * because 'arg' has not been set, and cleanup will
+ +		 * do the right thing.
+ +		 */
+ +		if (me->irq < 0)
+ +			return me->irq;
+ +
+ +		ret = request_threaded_irq(me->irq, handler, thread, 0,
+ +					   me->name, arg);
+ +		if (ret) {
+ +			dd_dev_err(dd,
+ +				   "unable to allocate %s interrupt, irq %d, index %d, err %d\n",
+ +				   err_info, me->irq, idx, ret);
+ +			return ret;
+ +		}
+ +		/*
+ +		 * assign arg after request_irq call, so it will be
+ +		 * cleaned up
+ +		 */
+ +		me->arg = arg;
+ +
+ +		ret = hfi1_get_irq_affinity(dd, me);
+ +		if (ret)
+ +			dd_dev_err(dd, "unable to pin IRQ %d\n", ret);
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +void hfi1_vnic_synchronize_irq(struct hfi1_devdata *dd)
+ +{
+ +	int i;
+ +
+ +	if (!dd->num_msix_entries) {
+ +		synchronize_irq(dd->pcidev->irq);
+ +		return;
+ +	}
+ +
+ +	for (i = 0; i < dd->vnic.num_ctxt; i++) {
+ +		struct hfi1_ctxtdata *rcd = dd->vnic.ctxt[i];
+ +		struct hfi1_msix_entry *me = &dd->msix_entries[rcd->msix_intr];
+ +
+ +		synchronize_irq(me->irq);
+ +	}
+ +}
+ +
+ +void hfi1_reset_vnic_msix_info(struct hfi1_ctxtdata *rcd)
+ +{
+ +	struct hfi1_devdata *dd = rcd->dd;
+ +	struct hfi1_msix_entry *me = &dd->msix_entries[rcd->msix_intr];
+ +
+ +	if (!me->arg) /* => no irq, no affinity */
+ +		return;
+ +
+ +	hfi1_put_irq_affinity(dd, me);
+ +	free_irq(me->irq, me->arg);
+ +
+ +	me->arg = NULL;
+ +}
+ +
+ +void hfi1_set_vnic_msix_info(struct hfi1_ctxtdata *rcd)
+ +{
+ +	struct hfi1_devdata *dd = rcd->dd;
+ +	struct hfi1_msix_entry *me;
+ +	int idx = rcd->ctxt;
+ +	void *arg = rcd;
+ +	int ret;
+ +
+ +	rcd->msix_intr = dd->vnic.msix_idx++;
+ +	me = &dd->msix_entries[rcd->msix_intr];
+ +
+ +	/*
+ +	 * Set the interrupt register and mask for this
+ +	 * context's interrupt.
+ +	 */
+ +	rcd->ireg = (IS_RCVAVAIL_START + idx) / 64;
+ +	rcd->imask = ((u64)1) <<
+ +		  ((IS_RCVAVAIL_START + idx) % 64);
+ +
+ +	snprintf(me->name, sizeof(me->name),
+ +		 DRIVER_NAME "_%d kctxt%d", dd->unit, idx);
+ +	me->name[sizeof(me->name) - 1] = 0;
+ +	me->type = IRQ_RCVCTXT;
+ +	me->irq = pci_irq_vector(dd->pcidev, rcd->msix_intr);
+ +	if (me->irq < 0) {
+ +		dd_dev_err(dd, "vnic irq vector request (idx %d) fail %d\n",
+ +			   idx, me->irq);
+ +		return;
+ +	}
+ +	remap_intr(dd, IS_RCVAVAIL_START + idx, rcd->msix_intr);
+ +
+ +	ret = request_threaded_irq(me->irq, receive_context_interrupt,
+ +				   receive_context_thread, 0, me->name, arg);
+ +	if (ret) {
+ +		dd_dev_err(dd, "vnic irq request (irq %d, idx %d) fail %d\n",
+ +			   me->irq, idx, ret);
+ +		return;
+ +	}
+ +	/*
+ +	 * assign arg after request_irq call, so it will be
+ +	 * cleaned up
+ +	 */
+ +	me->arg = arg;
+ +
+ +	ret = hfi1_get_irq_affinity(dd, me);
+ +	if (ret) {
+ +		dd_dev_err(dd,
+ +			   "unable to pin IRQ %d\n", ret);
+ +		free_irq(me->irq, me->arg);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 09e71899b9cf (IB/hfi1: Prepare for new HFI1 MSIx API)
+  /*
+   * Set the general handler to accept all interrupts, remap all
+   * chip interrupts back to MSI-X 0.
+@@@ -13364,72 -13099,6 +13369,75 @@@ void reset_interrupts(struct hfi1_devda
+  		write_csr(dd, CCE_INT_MAP + (8 * i), 0);
+  }
+  
+++<<<<<<< HEAD
+ +static int set_up_interrupts(struct hfi1_devdata *dd)
+ +{
+ +	u32 total;
+ +	int ret, request;
+ +	int single_interrupt = 0; /* we expect to have all the interrupts */
+ +
+ +	/*
+ +	 * Interrupt count:
+ +	 *	1 general, "slow path" interrupt (includes the SDMA engines
+ +	 *		slow source, SDMACleanupDone)
+ +	 *	N interrupts - one per used SDMA engine
+ +	 *	M interrupt - one per kernel receive context
+ +	 *	V interrupt - one for each VNIC context
+ +	 */
+ +	total = 1 + dd->num_sdma + dd->n_krcv_queues + dd->num_vnic_contexts;
+ +
+ +	/* ask for MSI-X interrupts */
+ +	request = request_msix(dd, total);
+ +	if (request < 0) {
+ +		ret = request;
+ +		goto fail;
+ +	} else if (request == 0) {
+ +		/* using INTx */
+ +		/* dd->num_msix_entries already zero */
+ +		single_interrupt = 1;
+ +		dd_dev_err(dd, "MSI-X failed, using INTx interrupts\n");
+ +	} else if (request < total) {
+ +		/* using MSI-X, with reduced interrupts */
+ +		dd_dev_err(dd, "reduced interrupt found, wanted %u, got %u\n",
+ +			   total, request);
+ +		ret = -EINVAL;
+ +		goto fail;
+ +	} else {
+ +		dd->msix_entries = kcalloc(total, sizeof(*dd->msix_entries),
+ +					   GFP_KERNEL);
+ +		if (!dd->msix_entries) {
+ +			ret = -ENOMEM;
+ +			goto fail;
+ +		}
+ +		/* using MSI-X */
+ +		dd->num_msix_entries = total;
+ +		dd_dev_info(dd, "%u MSI-X interrupts allocated\n", total);
+ +	}
+ +
+ +	/* mask all interrupts */
+ +	set_intr_state(dd, 0);
+ +	/* clear all pending interrupts */
+ +	clear_all_interrupts(dd);
+ +
+ +	/* reset general handler mask, chip MSI-X mappings */
+ +	reset_interrupts(dd);
+ +
+ +	if (single_interrupt)
+ +		ret = request_intx_irq(dd);
+ +	else
+ +		ret = request_msix_irqs(dd);
+ +	if (ret)
+ +		goto fail;
+ +
+ +	return 0;
+ +
+ +fail:
+ +	hfi1_clean_up_interrupts(dd);
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 09e71899b9cf (IB/hfi1: Prepare for new HFI1 MSIx API)
+  /*
+   * Set up context values in dd.  Sets:
+   *
+diff --cc drivers/infiniband/hw/hfi1/hfi.h
+index d83062c16532,6c5f2c2b7e7e..000000000000
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@@ -1991,8 -1970,7 +1989,12 @@@ void hfi1_verbs_unregister_sysfs(struc
+  /* Hook for sysfs read of QSFP */
+  int qsfp_dump(struct hfi1_pportdata *ppd, char *buf, int len);
+  
+++<<<<<<< HEAD
+ +int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent);
+ +void hfi1_clean_up_interrupts(struct hfi1_devdata *dd);
+++=======
++ int hfi1_pcie_init(struct hfi1_devdata *dd);
+++>>>>>>> 09e71899b9cf (IB/hfi1: Prepare for new HFI1 MSIx API)
+  void hfi1_pcie_cleanup(struct pci_dev *pdev);
+  int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev);
+  void hfi1_pcie_ddcleanup(struct hfi1_devdata *);
+diff --cc drivers/infiniband/hw/hfi1/pcie.c
+index 87bd6b60cb53,577d7479a845..000000000000
+--- a/drivers/infiniband/hw/hfi1/pcie.c
++++ b/drivers/infiniband/hw/hfi1/pcie.c
+@@@ -348,32 -332,6 +348,35 @@@ int pcie_speeds(struct hfi1_devdata *dd
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Returns:
+ + *	- actual number of interrupts allocated or
+ + *	- 0 if fell back to INTx.
+ + *      - error
+ + */
+ +int request_msix(struct hfi1_devdata *dd, u32 msireq)
+ +{
+ +	int nvec;
+ +
+ +	nvec = pci_alloc_irq_vectors(dd->pcidev, 1, msireq,
+ +				     PCI_IRQ_MSIX | PCI_IRQ_LEGACY);
+ +	if (nvec < 0) {
+ +		dd_dev_err(dd, "pci_alloc_irq_vectors() failed: %d\n", nvec);
+ +		return nvec;
+ +	}
+ +
+ +	tune_pcie_caps(dd);
+ +
+ +	/* check for legacy IRQ */
+ +	if (nvec == 1 && !dd->pcidev->msix_enabled)
+ +		return 0;
+ +
+ +	return nvec;
+ +}
+ +
+++=======
+++>>>>>>> 09e71899b9cf (IB/hfi1: Prepare for new HFI1 MSIx API)
+  /* restore command and BARs after a reset has wiped them out */
+  int restore_pci_variables(struct hfi1_devdata *dd)
+  {
+* Unmerged path drivers/infiniband/hw/hfi1/Makefile
+* Unmerged path drivers/infiniband/hw/hfi1/chip.c
+diff --git a/drivers/infiniband/hw/hfi1/chip.h b/drivers/infiniband/hw/hfi1/chip.h
+index fdf389e46e19..6b4f9ed02283 100644
+--- a/drivers/infiniband/hw/hfi1/chip.h
++++ b/drivers/infiniband/hw/hfi1/chip.h
+@@ -1386,6 +1386,16 @@ void hfi1_read_link_quality(struct hfi1_devdata *dd, u8 *link_quality);
+ void hfi1_init_vnic_rsm(struct hfi1_devdata *dd);
+ void hfi1_deinit_vnic_rsm(struct hfi1_devdata *dd);
+ 
++irqreturn_t general_interrupt(int irq, void *data);
++irqreturn_t sdma_interrupt(int irq, void *data);
++irqreturn_t receive_context_interrupt(int irq, void *data);
++irqreturn_t receive_context_thread(int irq, void *data);
++
++void clear_all_interrupts(struct hfi1_devdata *dd);
++void remap_intr(struct hfi1_devdata *dd, int isrc, int msix_intr);
++void remap_sdma_interrupts(struct hfi1_devdata *dd, int engine, int msix_intr);
++void reset_interrupts(struct hfi1_devdata *dd);
++
+ /*
+  * Interrupt source table.
+  *
+* Unmerged path drivers/infiniband/hw/hfi1/hfi.h
+diff --git a/drivers/infiniband/hw/hfi1/msix.c b/drivers/infiniband/hw/hfi1/msix.c
+new file mode 100644
+index 000000000000..bea6e657ae17
+--- /dev/null
++++ b/drivers/infiniband/hw/hfi1/msix.c
+@@ -0,0 +1,330 @@
++// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
++/*
++ * Copyright(c) 2018 Intel Corporation.
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * BSD LICENSE
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  - Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *  - Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *  - Neither the name of Intel Corporation nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++
++#include "hfi.h"
++#include "sdma.h"
++
++/*
++ * Returns:
++ *	- actual number of interrupts allocated or
++ *      - error
++ */
++int request_msix(struct hfi1_devdata *dd, u32 msireq)
++{
++	int nvec;
++
++	nvec = pci_alloc_irq_vectors(dd->pcidev, msireq, msireq, PCI_IRQ_MSIX);
++	if (nvec < 0) {
++		dd_dev_err(dd, "pci_alloc_irq_vectors() failed: %d\n", nvec);
++		return nvec;
++	}
++
++	return nvec;
++}
++
++int set_up_interrupts(struct hfi1_devdata *dd)
++{
++	u32 total;
++	int ret, request;
++
++	/*
++	 * Interrupt count:
++	 *	1 general, "slow path" interrupt (includes the SDMA engines
++	 *		slow source, SDMACleanupDone)
++	 *	N interrupts - one per used SDMA engine
++	 *	M interrupt - one per kernel receive context
++	 *	V interrupt - one for each VNIC context
++	 */
++	total = 1 + dd->num_sdma + dd->n_krcv_queues + dd->num_vnic_contexts;
++
++	/* ask for MSI-X interrupts */
++	request = request_msix(dd, total);
++	if (request < 0) {
++		ret = request;
++		goto fail;
++	} else {
++		dd->msix_entries = kcalloc(total, sizeof(*dd->msix_entries),
++					   GFP_KERNEL);
++		if (!dd->msix_entries) {
++			ret = -ENOMEM;
++			goto fail;
++		}
++		/* using MSI-X */
++		dd->num_msix_entries = total;
++		dd_dev_info(dd, "%u MSI-X interrupts allocated\n", total);
++	}
++
++	/* mask all interrupts */	set_intr_state(dd, 0);
++	/* clear all pending interrupts */
++	clear_all_interrupts(dd);
++
++	/* reset general handler mask, chip MSI-X mappings */
++	reset_interrupts(dd);
++
++	ret = request_msix_irqs(dd);
++	if (ret)
++		goto fail;
++
++	return 0;
++
++fail:
++	hfi1_clean_up_interrupts(dd);
++	return ret;
++}
++
++int request_msix_irqs(struct hfi1_devdata *dd)
++{
++	int first_general, last_general;
++	int first_sdma, last_sdma;
++	int first_rx, last_rx;
++	int i, ret = 0;
++
++	/* calculate the ranges we are going to use */
++	first_general = 0;
++	last_general = first_general + 1;
++	first_sdma = last_general;
++	last_sdma = first_sdma + dd->num_sdma;
++	first_rx = last_sdma;
++	last_rx = first_rx + dd->n_krcv_queues + dd->num_vnic_contexts;
++
++	/* VNIC MSIx interrupts get mapped when VNIC contexts are created */
++	dd->first_dyn_msix_idx = first_rx + dd->n_krcv_queues;
++
++	/*
++	 * Sanity check - the code expects all SDMA chip source
++	 * interrupts to be in the same CSR, starting at bit 0.  Verify
++	 * that this is true by checking the bit location of the start.
++	 */
++	BUILD_BUG_ON(IS_SDMA_START % 64);
++
++	for (i = 0; i < dd->num_msix_entries; i++) {
++		struct hfi1_msix_entry *me = &dd->msix_entries[i];
++		const char *err_info;
++		irq_handler_t handler;
++		irq_handler_t thread = NULL;
++		void *arg = NULL;
++		int idx;
++		struct hfi1_ctxtdata *rcd = NULL;
++		struct sdma_engine *sde = NULL;
++		char name[MAX_NAME_SIZE];
++
++		/* obtain the arguments to pci_request_irq */
++		if (first_general <= i && i < last_general) {
++			idx = i - first_general;
++			handler = general_interrupt;
++			arg = dd;
++			snprintf(name, sizeof(name),
++				 DRIVER_NAME "_%d", dd->unit);
++			err_info = "general";
++			me->type = IRQ_GENERAL;
++		} else if (first_sdma <= i && i < last_sdma) {
++			idx = i - first_sdma;
++			sde = &dd->per_sdma[idx];
++			handler = sdma_interrupt;
++			arg = sde;
++			snprintf(name, sizeof(name),
++				 DRIVER_NAME "_%d sdma%d", dd->unit, idx);
++			err_info = "sdma";
++			remap_sdma_interrupts(dd, idx, i);
++			me->type = IRQ_SDMA;
++		} else if (first_rx <= i && i < last_rx) {
++			idx = i - first_rx;
++			rcd = hfi1_rcd_get_by_index_safe(dd, idx);
++			if (rcd) {
++				/*
++				 * Set the interrupt register and mask for this
++				 * context's interrupt.
++				 */
++				rcd->ireg = (IS_RCVAVAIL_START + idx) / 64;
++				rcd->imask = ((u64)1) <<
++					  ((IS_RCVAVAIL_START + idx) % 64);
++				handler = receive_context_interrupt;
++				thread = receive_context_thread;
++				arg = rcd;
++				snprintf(name, sizeof(name),
++					 DRIVER_NAME "_%d kctxt%d",
++					 dd->unit, idx);
++				err_info = "receive context";
++				remap_intr(dd, IS_RCVAVAIL_START + idx, i);
++				me->type = IRQ_RCVCTXT;
++				rcd->msix_intr = i;
++				hfi1_rcd_put(rcd);
++			}
++		} else {
++			/* not in our expected range - complain, then
++			 * ignore it
++			 */
++			dd_dev_err(dd,
++				   "Unexpected extra MSI-X interrupt %d\n", i);
++			continue;
++		}
++		/* no argument, no interrupt */
++		if (!arg)
++			continue;
++		/* make sure the name is terminated */
++		name[sizeof(name) - 1] = 0;
++		me->irq = pci_irq_vector(dd->pcidev, i);
++		ret = pci_request_irq(dd->pcidev, i, handler, thread, arg,
++				      name);
++		if (ret) {
++			dd_dev_err(dd,
++				   "unable to allocate %s interrupt, irq %d, index %d, err %d\n",
++				   err_info, me->irq, idx, ret);
++			return ret;
++		}
++		/*
++		 * assign arg after pci_request_irq call, so it will be
++		 * cleaned up
++		 */
++		me->arg = arg;
++
++		ret = hfi1_get_irq_affinity(dd, me);
++		if (ret)
++			dd_dev_err(dd, "unable to pin IRQ %d\n", ret);
++	}
++
++	return ret;
++}
++
++void hfi1_vnic_synchronize_irq(struct hfi1_devdata *dd)
++{
++	int i;
++
++	for (i = 0; i < dd->vnic.num_ctxt; i++) {
++		struct hfi1_ctxtdata *rcd = dd->vnic.ctxt[i];
++		struct hfi1_msix_entry *me = &dd->msix_entries[rcd->msix_intr];
++
++		synchronize_irq(me->irq);
++	}
++}
++
++void hfi1_reset_vnic_msix_info(struct hfi1_ctxtdata *rcd)
++{
++	struct hfi1_devdata *dd = rcd->dd;
++	struct hfi1_msix_entry *me = &dd->msix_entries[rcd->msix_intr];
++
++	if (!me->arg) /* => no irq, no affinity */
++		return;
++
++	hfi1_put_irq_affinity(dd, me);
++	pci_free_irq(dd->pcidev, rcd->msix_intr, me->arg);
++
++	me->arg = NULL;
++}
++
++void hfi1_set_vnic_msix_info(struct hfi1_ctxtdata *rcd)
++{
++	struct hfi1_devdata *dd = rcd->dd;
++	struct hfi1_msix_entry *me;
++	int idx = rcd->ctxt;
++	void *arg = rcd;
++	int ret;
++
++	rcd->msix_intr = dd->vnic.msix_idx++;
++	me = &dd->msix_entries[rcd->msix_intr];
++
++	/*
++	 * Set the interrupt register and mask for this
++	 * context's interrupt.
++	 */
++	rcd->ireg = (IS_RCVAVAIL_START + idx) / 64;
++	rcd->imask = ((u64)1) <<
++		  ((IS_RCVAVAIL_START + idx) % 64);
++	me->type = IRQ_RCVCTXT;
++	me->irq = pci_irq_vector(dd->pcidev, rcd->msix_intr);
++	remap_intr(dd, IS_RCVAVAIL_START + idx, rcd->msix_intr);
++
++	ret = pci_request_irq(dd->pcidev, rcd->msix_intr,
++			      receive_context_interrupt,
++			      receive_context_thread, arg,
++			      DRIVER_NAME "_%d kctxt%d", dd->unit, idx);
++	if (ret) {
++		dd_dev_err(dd, "vnic irq request (irq %d, idx %d) fail %d\n",
++			   me->irq, idx, ret);
++		return;
++	}
++	/*
++	 * assign arg after pci_request_irq call, so it will be
++	 * cleaned up
++	 */
++	me->arg = arg;
++
++	ret = hfi1_get_irq_affinity(dd, me);
++	if (ret) {
++		dd_dev_err(dd,
++			   "unable to pin IRQ %d\n", ret);
++		pci_free_irq(dd->pcidev, rcd->msix_intr, me->arg);
++	}
++}
++
++/**
++ * hfi1_clean_up_interrupts() - Free all IRQ resources
++ * @dd: valid device data data structure
++ *
++ * Free the MSIx and associated PCI resources, if they have been allocated.
++ */
++void hfi1_clean_up_interrupts(struct hfi1_devdata *dd)
++{
++	int i;
++	struct hfi1_msix_entry *me = dd->msix_entries;
++
++	/* remove irqs - must happen before disabling/turning off */
++	for (i = 0; i < dd->num_msix_entries; i++, me++) {
++		if (!me->arg) /* => no irq, no affinity */
++			continue;
++		hfi1_put_irq_affinity(dd, me);
++		pci_free_irq(dd->pcidev, i, me->arg);
++	}
++
++	/* clean structures */
++	kfree(dd->msix_entries);
++	dd->msix_entries = NULL;
++	dd->num_msix_entries = 0;
++
++	pci_free_irq_vectors(dd->pcidev);
++}
+diff --git a/drivers/infiniband/hw/hfi1/msix.h b/drivers/infiniband/hw/hfi1/msix.h
+new file mode 100644
+index 000000000000..45cadd56fef9
+--- /dev/null
++++ b/drivers/infiniband/hw/hfi1/msix.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
++/*
++ * Copyright(c) 2018 Intel Corporation.
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * BSD LICENSE
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  - Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *  - Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *  - Neither the name of Intel Corporation nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++#ifndef _HFI1_MSIX_H
++#define _HFI1_MSIX_H
++
++#include "hfi.h"
++
++/* MSIx interface */
++int request_msix(struct hfi1_devdata *dd, u32 msireq);
++int set_up_interrupts(struct hfi1_devdata *dd);
++int request_msix_irqs(struct hfi1_devdata *dd);
++void hfi1_clean_up_interrupts(struct hfi1_devdata *dd);
++
++/* VNIC interface */
++void hfi1_vnic_synchronize_irq(struct hfi1_devdata *dd);
++void hfi1_set_vnic_msix_info(struct hfi1_ctxtdata *rcd);
++void hfi1_reset_vnic_msix_info(struct hfi1_ctxtdata *rcd);
++
++#endif
+* Unmerged path drivers/infiniband/hw/hfi1/pcie.c
