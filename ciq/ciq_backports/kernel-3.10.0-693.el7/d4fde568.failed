@@ -1,0 +1,157 @@
+powerpc/64: Use optimized checksum routines on little-endian
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit d4fde568a34a93897dfb9ae64cfe9dda9d5c908c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d4fde568.failed
+
+Currently we have optimized hand-coded assembly checksum routines for
+big-endian 64-bit systems, but for little-endian we use the generic C
+routines. This modifies the optimized routines to work for
+little-endian. With this, we no longer need to enable
+CONFIG_GENERIC_CSUM. This also fixes a couple of comments in
+checksum_64.S so they accurately reflect what the associated instruction
+does.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+[mpe: Use the more common __BIG_ENDIAN__]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit d4fde568a34a93897dfb9ae64cfe9dda9d5c908c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/checksum.h
+#	arch/powerpc/lib/Makefile
+diff --cc arch/powerpc/include/asm/checksum.h
+index 0ffd793cff0f,4e63787dc3be..000000000000
+--- a/arch/powerpc/include/asm/checksum.h
++++ b/arch/powerpc/include/asm/checksum.h
+@@@ -102,9 -70,12 +102,17 @@@ static inline __wsum csum_tcpudp_nofold
+  
+  	s += (__force u32)saddr;
+  	s += (__force u32)daddr;
++ #ifdef __BIG_ENDIAN__
+  	s += proto + len;
+++<<<<<<< HEAD
+ +	s += (s >> 32);
+ +	return (__force __wsum) s;
+++=======
++ #else
++ 	s += (proto + len) << 8;
++ #endif
++ 	return (__force __wsum) from64to32(s);
+++>>>>>>> d4fde568a34a (powerpc/64: Use optimized checksum routines on little-endian)
+  #else
+      __asm__("\n\
+  	addc %0,%0,%1 \n\
+diff --cc arch/powerpc/lib/Makefile
+index 27b9877e86de,0e649d72fe8d..000000000000
+--- a/arch/powerpc/lib/Makefile
++++ b/arch/powerpc/lib/Makefile
+@@@ -6,23 -6,22 +6,34 @@@ subdir-ccflags-$(CONFIG_PPC_WERROR) := 
+  
+  ccflags-$(CONFIG_PPC64)	:= $(NO_MINIMAL_TOC)
+  
+ -CFLAGS_REMOVE_code-patching.o = $(CC_FLAGS_FTRACE)
+ -CFLAGS_REMOVE_feature-fixups.o = $(CC_FLAGS_FTRACE)
+ -
+ -obj-y += string.o alloc.o crtsavres.o code-patching.o \
+ -	 feature-fixups.o
+ +CFLAGS_REMOVE_code-patching.o = -pg
+ +CFLAGS_REMOVE_feature-fixups.o = -pg
+  
+ +obj-y			:= string.o alloc.o \
+ +			   crtsavres.o
+  obj-$(CONFIG_PPC32)	+= div64.o copy_32.o
+ -
+ +obj-$(CONFIG_HAS_IOMEM)	+= devres.o
+ +
+++<<<<<<< HEAD
+ +obj-$(CONFIG_PPC64)	+= copypage_64.o copyuser_64.o \
+ +			   usercopy_64.o mem_64.o string.o \
+ +			   hweight_64.o \
+ +			   copyuser_power7.o string_64.o copypage_power7.o
+ +ifeq ($(CONFIG_GENERIC_CSUM),)
+ +obj-y			+= checksum_$(CONFIG_WORD_SIZE).o checksum_wrappers.o
+ +endif
+++=======
++ obj64-y	+= copypage_64.o copyuser_64.o usercopy_64.o mem_64.o hweight_64.o \
++ 	   copyuser_power7.o string_64.o copypage_power7.o memcpy_power7.o \
++ 	   memcpy_64.o memcmp_64.o
++ 
++ obj64-$(CONFIG_SMP)	+= locks.o
++ obj64-$(CONFIG_ALTIVEC)	+= vmx-helper.o
++ 
++ obj-y			+= checksum_$(BITS).o checksum_wrappers.o
+++>>>>>>> d4fde568a34a (powerpc/64: Use optimized checksum routines on little-endian)
+ +
+ +obj-$(CONFIG_PPC64)		+= memcpy_power7.o memcpy_64.o 
+  
+  obj-$(CONFIG_PPC_EMULATE_SSTEP)	+= sstep.o ldstfp.o
+  
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index e42024f8779d..d7da0ff95e39 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -151,7 +151,7 @@ config PPC
+ 	select HAVE_ARCH_SECCOMP_FILTER
+ 
+ config GENERIC_CSUM
+-	def_bool CPU_LITTLE_ENDIAN
++	def_bool n
+ 
+ config EARLY_PRINTK
+ 	bool
+* Unmerged path arch/powerpc/include/asm/checksum.h
+* Unmerged path arch/powerpc/lib/Makefile
+diff --git a/arch/powerpc/lib/checksum_64.S b/arch/powerpc/lib/checksum_64.S
+index e8edf6376e23..e822d19bdd1a 100644
+--- a/arch/powerpc/lib/checksum_64.S
++++ b/arch/powerpc/lib/checksum_64.S
+@@ -83,7 +83,7 @@ _GLOBAL(csum_partial)
+ 	 * work to calculate the correct checksum, we ignore that case
+ 	 * and take the potential slowdown of unaligned loads.
+ 	 */
+-	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 & 0x3) >> 1 */
++	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 >> 1) & 0x3 */
+ 	beq	.Lcsum_aligned
+ 
+ 	li	r7,4
+@@ -215,8 +215,12 @@ _GLOBAL(csum_partial)
+ 	beq	.Lcsum_finish
+ 
+ 	lbz	r6,0(r3)
++#ifdef __BIG_ENDIAN__
+ 	sldi	r9,r6,8			/* Pad the byte out to 16 bits */
+ 	adde	r0,r0,r9
++#else
++	adde	r0,r0,r6
++#endif
+ 
+ .Lcsum_finish:
+ 	addze	r0,r0			/* add in final carry */
+@@ -282,7 +286,7 @@ _GLOBAL(csum_partial_copy_generic)
+ 	 * If the source and destination are relatively unaligned we only
+ 	 * align the source. This keeps things simple.
+ 	 */
+-	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 & 0x3) >> 1 */
++	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 >> 1) & 0x3 */
+ 	beq	.Lcopy_aligned
+ 
+ 	li	r9,4
+@@ -444,8 +448,12 @@ dstnr;	sth	r6,0(r4)
+ 	beq	.Lcopy_finish
+ 
+ srcnr;	lbz	r6,0(r3)
++#ifdef __BIG_ENDIAN__
+ 	sldi	r9,r6,8			/* Pad the byte out to 16 bits */
+ 	adde	r0,r0,r9
++#else
++	adde	r0,r0,r6
++#endif
+ dstnr;	stb	r6,0(r4)
+ 
+ .Lcopy_finish:
