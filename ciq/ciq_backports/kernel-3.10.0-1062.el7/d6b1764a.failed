@@ -1,0 +1,195 @@
+RDMA/core: Introduce rdma_read_gid_attr_ndev_rcu() to check GID attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit d6b1764a8c5ac0ad3a66c6d11d24c4fe067fe933
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d6b1764a.failed
+
+Introduce an API rdma_read_gid_attr_ndev_rcu() to return GID attribute
+netdevice which is in UP state for accessing netdevice's fields such as
+net namespace and ifindex.
+
+This is useful for users who intent to access netdevice fields under rcu
+lock.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d6b1764a8c5ac0ad3a66c6d11d24c4fe067fe933)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 36d3478f5cc1,8957d31d60ca..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -1092,6 -1171,150 +1092,153 @@@ int ib_get_cached_port_state(struct ib_
+  }
+  EXPORT_SYMBOL(ib_get_cached_port_state);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * rdma_get_gid_attr - Returns GID attributes for a port of a device
++  * at a requested gid_index, if a valid GID entry exists.
++  * @device:		The device to query.
++  * @port_num:		The port number on the device where the GID value
++  *			is to be queried.
++  * @index:		Index of the GID table entry whose attributes are to
++  *                      be queried.
++  *
++  * rdma_get_gid_attr() acquires reference count of gid attributes from the
++  * cached GID table. Caller must invoke rdma_put_gid_attr() to release
++  * reference to gid attribute regardless of link layer.
++  *
++  * Returns pointer to valid gid attribute or ERR_PTR for the appropriate error
++  * code.
++  */
++ const struct ib_gid_attr *
++ rdma_get_gid_attr(struct ib_device *device, u8 port_num, int index)
++ {
++ 	const struct ib_gid_attr *attr = ERR_PTR(-EINVAL);
++ 	struct ib_gid_table *table;
++ 	unsigned long flags;
++ 
++ 	if (!rdma_is_port_valid(device, port_num))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	table = rdma_gid_table(device, port_num);
++ 	if (index < 0 || index >= table->sz)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	read_lock_irqsave(&table->rwlock, flags);
++ 	if (!is_gid_entry_valid(table->data_vec[index]))
++ 		goto done;
++ 
++ 	get_gid_entry(table->data_vec[index]);
++ 	attr = &table->data_vec[index]->attr;
++ done:
++ 	read_unlock_irqrestore(&table->rwlock, flags);
++ 	return attr;
++ }
++ EXPORT_SYMBOL(rdma_get_gid_attr);
++ 
++ /**
++  * rdma_put_gid_attr - Release reference to the GID attribute
++  * @attr:		Pointer to the GID attribute whose reference
++  *			needs to be released.
++  *
++  * rdma_put_gid_attr() must be used to release reference whose
++  * reference is acquired using rdma_get_gid_attr() or any APIs
++  * which returns a pointer to the ib_gid_attr regardless of link layer
++  * of IB or RoCE.
++  *
++  */
++ void rdma_put_gid_attr(const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry =
++ 		container_of(attr, struct ib_gid_table_entry, attr);
++ 
++ 	put_gid_entry(entry);
++ }
++ EXPORT_SYMBOL(rdma_put_gid_attr);
++ 
++ /**
++  * rdma_hold_gid_attr - Get reference to existing GID attribute
++  *
++  * @attr:		Pointer to the GID attribute whose reference
++  *			needs to be taken.
++  *
++  * Increase the reference count to a GID attribute to keep it from being
++  * freed. Callers are required to already be holding a reference to attribute.
++  *
++  */
++ void rdma_hold_gid_attr(const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry =
++ 		container_of(attr, struct ib_gid_table_entry, attr);
++ 
++ 	get_gid_entry(entry);
++ }
++ EXPORT_SYMBOL(rdma_hold_gid_attr);
++ 
++ /**
++  * rdma_read_gid_attr_ndev_rcu - Read GID attribute netdevice
++  * which must be in UP state.
++  *
++  * @attr:Pointer to the GID attribute
++  *
++  * Returns pointer to netdevice if the netdevice was attached to GID and
++  * netdevice is in UP state. Caller must hold RCU lock as this API
++  * reads the netdev flags which can change while netdevice migrates to
++  * different net namespace. Returns ERR_PTR with error code otherwise.
++  *
++  */
++ struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry =
++ 			container_of(attr, struct ib_gid_table_entry, attr);
++ 	struct ib_device *device = entry->attr.device;
++ 	struct net_device *ndev = ERR_PTR(-ENODEV);
++ 	u8 port_num = entry->attr.port_num;
++ 	struct ib_gid_table *table;
++ 	unsigned long flags;
++ 	bool valid;
++ 
++ 	table = rdma_gid_table(device, port_num);
++ 
++ 	read_lock_irqsave(&table->rwlock, flags);
++ 	valid = is_gid_entry_valid(table->data_vec[attr->index]);
++ 	if (valid && attr->ndev && (READ_ONCE(attr->ndev->flags) & IFF_UP))
++ 		ndev = attr->ndev;
++ 	read_unlock_irqrestore(&table->rwlock, flags);
++ 	return ndev;
++ }
++ 
++ static int config_non_roce_gid_cache(struct ib_device *device,
++ 				     u8 port, int gid_tbl_len)
++ {
++ 	struct ib_gid_attr gid_attr = {};
++ 	struct ib_gid_table *table;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	gid_attr.device = device;
++ 	gid_attr.port_num = port;
++ 	table = rdma_gid_table(device, port);
++ 
++ 	mutex_lock(&table->lock);
++ 	for (i = 0; i < gid_tbl_len; ++i) {
++ 		if (!device->query_gid)
++ 			continue;
++ 		ret = device->query_gid(device, port, i, &gid_attr.gid);
++ 		if (ret) {
++ 			pr_warn("query_gid failed (%d) for %s (index %d)\n",
++ 				ret, device->name, i);
++ 			goto err;
++ 		}
++ 		gid_attr.index = i;
++ 		add_modify_gid(table, &gid_attr);
++ 	}
++ err:
++ 	mutex_unlock(&table->lock);
++ 	return ret;
++ }
++ 
+++>>>>>>> d6b1764a8c5a (RDMA/core: Introduce rdma_read_gid_attr_ndev_rcu() to check GID attribute)
+  static void ib_cache_update(struct ib_device *device,
+  			    u8                port,
+  			    bool	      enforce_security)
+* Unmerged path drivers/infiniband/core/cache.c
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 695c109b0df7..df6812e188b0 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -311,4 +311,6 @@ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
+ struct sa_path_rec;
+ int roce_resolve_route_from_path(struct sa_path_rec *rec,
+ 				 const struct ib_gid_attr *attr);
++
++struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr);
+ #endif /* _CORE_PRIV_H */
