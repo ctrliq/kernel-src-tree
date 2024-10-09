@@ -1,0 +1,820 @@
+s390/dasd: Add new ioctl BIODASDCHECKFMT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] dasd: Add new ioctl BIODASDCHECKFMT (Hendrik Brueckner) [1380773]
+Rebuild_FUZZ: 93.33%
+commit-author Jan Höppner <hoeppner@linux.vnet.ibm.com>
+commit 8fd575200db5b53f6ea6818dd017f1b43190db12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8fd57520.failed
+
+Implement new DASD IOCTL BIODASDCHECKFMT to check a range of tracks on a
+DASD volume for correct formatting. The following characteristics are
+checked:
+- Block size
+- ECKD key length
+- ECKD record ID
+- Number of records per track
+
+	Signed-off-by: Jan Höppner <hoeppner@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 8fd575200db5b53f6ea6818dd017f1b43190db12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/block/dasd_eckd.c
+#	drivers/s390/block/dasd_int.h
+diff --cc drivers/s390/block/dasd_eckd.c
+index 75d5d21ad443,42b34cd1f002..000000000000
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@@ -110,6 -115,17 +110,20 @@@ struct path_verification_work_data 
+  static struct path_verification_work_data *path_verification_worker;
+  static DEFINE_MUTEX(dasd_path_verification_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ struct check_attention_work_data {
++ 	struct work_struct worker;
++ 	struct dasd_device *device;
++ 	__u8 lpum;
++ };
++ 
++ static int prepare_itcw(struct itcw *, unsigned int, unsigned int, int,
++ 			struct dasd_device *, struct dasd_device *,
++ 			unsigned int, int, unsigned int, unsigned int,
++ 			unsigned int, unsigned int);
++ 
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  /* initial attempt at a probe function. this can be simplified once
+   * the other detection code is gone */
+  static int
+@@@ -2344,23 -2543,39 +2538,50 @@@ dasd_eckd_build_format(struct dasd_devi
+  	return fcp;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +dasd_eckd_format_device(struct dasd_device *base,
+ +			struct format_data_t *fdata,
+ +			int enable_PAV)
+ +{
+ +	struct dasd_ccw_req *cqr, *n;
+ +	struct dasd_block *block;
+ +	struct dasd_eckd_private *private;
+ +	struct list_head format_queue;
+ +	struct dasd_device *device;
+ +	int old_stop, format_step;
+ +	int step, rc = 0, sleep_rc;
+++=======
++ /*
++  * Wrapper function to build a CCW request depending on input data
++  */
++ static struct dasd_ccw_req *
++ dasd_eckd_format_build_ccw_req(struct dasd_device *base,
++ 			       struct format_data_t *fdata, int enable_pav,
++ 			       int tpm, struct eckd_count *fmt_buffer, int rpt)
++ {
++ 	struct dasd_ccw_req *ccw_req;
++ 
++ 	if (!fmt_buffer) {
++ 		ccw_req = dasd_eckd_build_format(base, fdata, enable_pav);
++ 	} else {
++ 		if (tpm)
++ 			ccw_req = dasd_eckd_build_check_tcw(base, fdata,
++ 							    enable_pav,
++ 							    fmt_buffer, rpt);
++ 		else
++ 			ccw_req = dasd_eckd_build_check(base, fdata, enable_pav,
++ 							fmt_buffer, rpt);
++ 	}
++ 
++ 	return ccw_req;
++ }
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  
+ -/*
+ - * Sanity checks on format_data
+ - */
+ -static int dasd_eckd_format_sanity_checks(struct dasd_device *base,
+ -					  struct format_data_t *fdata)
+ -{
+ -	struct dasd_eckd_private *private = base->private;
+ +	block = base->block;
+ +	private = (struct dasd_eckd_private *) base->private;
+  
+ +	/* Sanity checks. */
+  	if (fdata->start_unit >=
+  	    (private->real_cyl * private->rdc_data.trk_per_cyl)) {
+  		dev_warn(&base->cdev->dev,
+@@@ -2387,77 -2602,366 +2608,423 @@@
+  			 fdata->blksize);
+  		return -EINVAL;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ }
++ 
++ /*
++  * This function will process format_data originally coming from an IOCTL
++  */
++ static int dasd_eckd_format_process_data(struct dasd_device *base,
++ 					 struct format_data_t *fdata,
++ 					 int enable_pav, int tpm,
++ 					 struct eckd_count *fmt_buffer, int rpt,
++ 					 struct irb *irb)
++ {
++ 	struct dasd_eckd_private *private = base->private;
++ 	struct dasd_ccw_req *cqr, *n;
++ 	struct list_head format_queue;
++ 	struct dasd_device *device;
++ 	char *sense = NULL;
++ 	int old_start, old_stop, format_step;
++ 	int step, retry;
++ 	int rc;
++ 
++ 	rc = dasd_eckd_format_sanity_checks(base, fdata);
++ 	if (rc)
++ 		return rc;
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  
+  	INIT_LIST_HEAD(&format_queue);
+  
+ -	old_start = fdata->start_unit;
+  	old_stop = fdata->stop_unit;
+ -
+ +	while (fdata->start_unit <= 1) {
+ +		fdata->stop_unit = fdata->start_unit;
+ +		cqr = dasd_eckd_build_format(base, fdata, enable_PAV);
+ +		list_add(&cqr->blocklist, &format_queue);
+ +
+++<<<<<<< HEAD
+ +		fdata->stop_unit = old_stop;
+ +		fdata->start_unit++;
+ +
+ +		if (fdata->start_unit > fdata->stop_unit)
+ +			goto sleep;
+ +	}
+ +
+ +retry:
+ +	format_step = 255 / recs_per_track(&private->rdc_data, 0,
+ +					   fdata->blksize);
+ +	while (fdata->start_unit <= old_stop) {
+ +		step = fdata->stop_unit - fdata->start_unit + 1;
+ +		if (step > format_step)
+ +			fdata->stop_unit = fdata->start_unit + format_step - 1;
+ +
+ +		cqr = dasd_eckd_build_format(base, fdata, enable_PAV);
+ +		if (IS_ERR(cqr)) {
+ +			if (PTR_ERR(cqr) == -ENOMEM) {
+ +				/*
+ +				 * not enough memory available
+ +				 * go to out and start requests
+ +				 * retry after first requests were finished
+ +				 */
+ +				fdata->stop_unit = old_stop;
+ +				goto sleep;
+ +			} else
+ +				return PTR_ERR(cqr);
+++=======
++ 	if (!tpm && fmt_buffer != NULL) {
++ 		/* Command Mode / Format Check */
++ 		format_step = 1;
++ 	} else if (tpm && fmt_buffer != NULL) {
++ 		/* Transport Mode / Format Check */
++ 		format_step = DASD_CQR_MAX_CCW / rpt;
++ 	} else {
++ 		/* Normal Formatting */
++ 		format_step = DASD_CQR_MAX_CCW /
++ 			recs_per_track(&private->rdc_data, 0, fdata->blksize);
++ 	}
++ 
++ 	do {
++ 		retry = 0;
++ 		while (fdata->start_unit <= old_stop) {
++ 			step = fdata->stop_unit - fdata->start_unit + 1;
++ 			if (step > format_step) {
++ 				fdata->stop_unit =
++ 					fdata->start_unit + format_step - 1;
++ 			}
++ 
++ 			cqr = dasd_eckd_format_build_ccw_req(base, fdata,
++ 							     enable_pav, tpm,
++ 							     fmt_buffer, rpt);
++ 			if (IS_ERR(cqr)) {
++ 				rc = PTR_ERR(cqr);
++ 				if (rc == -ENOMEM) {
++ 					if (list_empty(&format_queue))
++ 						goto out;
++ 					/*
++ 					 * not enough memory available, start
++ 					 * requests retry after first requests
++ 					 * were finished
++ 					 */
++ 					retry = 1;
++ 					break;
++ 				}
++ 				goto out_err;
++ 			}
++ 			list_add_tail(&cqr->blocklist, &format_queue);
++ 
++ 			if (fmt_buffer) {
++ 				step = fdata->stop_unit - fdata->start_unit + 1;
++ 				fmt_buffer += rpt * step;
++ 			}
++ 			fdata->start_unit = fdata->stop_unit + 1;
++ 			fdata->stop_unit = old_stop;
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  		}
+ +		list_add(&cqr->blocklist, &format_queue);
+  
+ -		rc = dasd_sleep_on_queue(&format_queue);
+ +		fdata->start_unit = fdata->stop_unit + 1;
+ +		fdata->stop_unit = old_stop;
+ +	}
+ +
+++<<<<<<< HEAD
+ +sleep:
+ +	sleep_rc = dasd_sleep_on_queue(&format_queue);
+  
+ +	list_for_each_entry_safe(cqr, n, &format_queue, blocklist) {
+ +		device = cqr->startdev;
+ +		private = (struct dasd_eckd_private *) device->private;
+ +		if (cqr->status == DASD_CQR_FAILED)
+ +			rc = -EIO;
+ +		list_del_init(&cqr->blocklist);
+ +		dasd_sfree_request(cqr, device);
+ +		private->count--;
+ +	}
+++=======
++ out_err:
++ 		list_for_each_entry_safe(cqr, n, &format_queue, blocklist) {
++ 			device = cqr->startdev;
++ 			private = device->private;
++ 
++ 			if (cqr->status == DASD_CQR_FAILED) {
++ 				/*
++ 				 * Only get sense data if called by format
++ 				 * check
++ 				 */
++ 				if (fmt_buffer && irb) {
++ 					sense = dasd_get_sense(&cqr->irb);
++ 					memcpy(irb, &cqr->irb, sizeof(*irb));
++ 				}
++ 				rc = -EIO;
++ 			}
++ 			list_del_init(&cqr->blocklist);
++ 			dasd_sfree_request(cqr, device);
++ 			private->count--;
++ 		}
++ 
++ 		if (rc && rc != -EIO)
++ 			goto out;
++ 		if (rc == -EIO) {
++ 			/*
++ 			 * In case fewer than the expected records are on the
++ 			 * track, we will most likely get a 'No Record Found'
++ 			 * error (in command mode) or a 'File Protected' error
++ 			 * (in transport mode). Those particular cases shouldn't
++ 			 * pass the -EIO to the IOCTL, therefore reset the rc
++ 			 * and continue.
++ 			 */
++ 			if (sense &&
++ 			    (sense[1] & SNS1_NO_REC_FOUND ||
++ 			     sense[1] & SNS1_FILE_PROTECTED))
++ 				retry = 1;
++ 			else
++ 				goto out;
++ 		}
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  
+ -	} while (retry);
+ +	if (sleep_rc)
+ +		return sleep_rc;
+  
+ -out:
+ -	fdata->start_unit = old_start;
+ -	fdata->stop_unit = old_stop;
+ +	/*
+ +	 * in case of ENOMEM we need to retry after
+ +	 * first requests are finished
+ +	 */
+ +	if (fdata->start_unit <= fdata->stop_unit)
+ +		goto retry;
+  
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dasd_eckd_format_device(struct dasd_device *base,
++ 				   struct format_data_t *fdata, int enable_pav)
++ {
++ 	return dasd_eckd_format_process_data(base, fdata, enable_pav, 0, NULL,
++ 					     0, NULL);
++ }
++ 
++ /*
++  * Helper function to count consecutive records of a single track.
++  */
++ static int dasd_eckd_count_records(struct eckd_count *fmt_buffer, int start,
++ 				   int max)
++ {
++ 	int head;
++ 	int i;
++ 
++ 	head = fmt_buffer[start].head;
++ 
++ 	/*
++ 	 * There are 3 conditions where we stop counting:
++ 	 * - if data reoccurs (same head and record may reoccur), which may
++ 	 *   happen due to the way DASD_ECKD_CCW_READ_COUNT works
++ 	 * - when the head changes, because we're iterating over several tracks
++ 	 *   then (DASD_ECKD_CCW_READ_COUNT_MT)
++ 	 * - when we've reached the end of sensible data in the buffer (the
++ 	 *   record will be 0 then)
++ 	 */
++ 	for (i = start; i < max; i++) {
++ 		if (i > start) {
++ 			if ((fmt_buffer[i].head == head &&
++ 			    fmt_buffer[i].record == 1) ||
++ 			    fmt_buffer[i].head != head ||
++ 			    fmt_buffer[i].record == 0)
++ 				break;
++ 		}
++ 	}
++ 
++ 	return i - start;
++ }
++ 
++ /*
++  * Evaluate a given range of tracks. Data like number of records, blocksize,
++  * record ids, and key length are compared with expected data.
++  *
++  * If a mismatch occurs, the corresponding error bit is set, as well as
++  * additional information, depending on the error.
++  */
++ static void dasd_eckd_format_evaluate_tracks(struct eckd_count *fmt_buffer,
++ 					     struct format_check_t *cdata,
++ 					     int rpt_max, int rpt_exp,
++ 					     int trk_per_cyl, int tpm)
++ {
++ 	struct ch_t geo;
++ 	int max_entries;
++ 	int count = 0;
++ 	int trkcount;
++ 	int blksize;
++ 	int pos = 0;
++ 	int i, j;
++ 	int kl;
++ 
++ 	trkcount = cdata->expect.stop_unit - cdata->expect.start_unit + 1;
++ 	max_entries = trkcount * rpt_max;
++ 
++ 	for (i = cdata->expect.start_unit; i <= cdata->expect.stop_unit; i++) {
++ 		/* Calculate the correct next starting position in the buffer */
++ 		if (tpm) {
++ 			while (fmt_buffer[pos].record == 0 &&
++ 			       fmt_buffer[pos].dl == 0) {
++ 				if (pos++ > max_entries)
++ 					break;
++ 			}
++ 		} else {
++ 			if (i != cdata->expect.start_unit)
++ 				pos += rpt_max - count;
++ 		}
++ 
++ 		/* Calculate the expected geo values for the current track */
++ 		set_ch_t(&geo, i / trk_per_cyl, i % trk_per_cyl);
++ 
++ 		/* Count and check number of records */
++ 		count = dasd_eckd_count_records(fmt_buffer, pos, pos + rpt_max);
++ 
++ 		if (count < rpt_exp) {
++ 			cdata->result = DASD_FMT_ERR_TOO_FEW_RECORDS;
++ 			break;
++ 		}
++ 		if (count > rpt_exp) {
++ 			cdata->result = DASD_FMT_ERR_TOO_MANY_RECORDS;
++ 			break;
++ 		}
++ 
++ 		for (j = 0; j < count; j++, pos++) {
++ 			blksize = cdata->expect.blksize;
++ 			kl = 0;
++ 
++ 			/*
++ 			 * Set special values when checking CDL formatted
++ 			 * devices.
++ 			 */
++ 			if ((cdata->expect.intensity & 0x08) &&
++ 			    geo.cyl == 0 && geo.head == 0) {
++ 				if (j < 3) {
++ 					blksize = sizes_trk0[j] - 4;
++ 					kl = 4;
++ 				}
++ 			}
++ 			if ((cdata->expect.intensity & 0x08) &&
++ 			    geo.cyl == 0 && geo.head == 1) {
++ 				blksize = LABEL_SIZE - 44;
++ 				kl = 44;
++ 			}
++ 
++ 			/* Check blocksize */
++ 			if (fmt_buffer[pos].dl != blksize) {
++ 				cdata->result = DASD_FMT_ERR_BLKSIZE;
++ 				goto out;
++ 			}
++ 			/* Check if key length is 0 */
++ 			if (fmt_buffer[pos].kl != kl) {
++ 				cdata->result = DASD_FMT_ERR_KEY_LENGTH;
++ 				goto out;
++ 			}
++ 			/* Check if record_id is correct */
++ 			if (fmt_buffer[pos].cyl != geo.cyl ||
++ 			    fmt_buffer[pos].head != geo.head ||
++ 			    fmt_buffer[pos].record != (j + 1)) {
++ 				cdata->result = DASD_FMT_ERR_RECORD_ID;
++ 				goto out;
++ 			}
++ 		}
++ 	}
++ 
++ out:
++ 	/*
++ 	 * In case of no errors, we need to decrease by one
++ 	 * to get the correct positions.
++ 	 */
++ 	if (!cdata->result) {
++ 		i--;
++ 		pos--;
++ 	}
++ 
++ 	cdata->unit = i;
++ 	cdata->num_records = count;
++ 	cdata->rec = fmt_buffer[pos].record;
++ 	cdata->blksize = fmt_buffer[pos].dl;
++ 	cdata->key_length = fmt_buffer[pos].kl;
++ }
++ 
++ /*
++  * Check the format of a range of tracks of a DASD.
++  */
++ static int dasd_eckd_check_device_format(struct dasd_device *base,
++ 					 struct format_check_t *cdata,
++ 					 int enable_pav)
++ {
++ 	struct dasd_eckd_private *private = base->private;
++ 	struct eckd_count *fmt_buffer;
++ 	struct irb irb;
++ 	int rpt_max, rpt_exp;
++ 	int fmt_buffer_size;
++ 	int trk_per_cyl;
++ 	int trkcount;
++ 	int tpm = 0;
++ 	int rc;
++ 
++ 	trk_per_cyl = private->rdc_data.trk_per_cyl;
++ 
++ 	/* Get maximum and expected amount of records per track */
++ 	rpt_max = recs_per_track(&private->rdc_data, 0, 512) + 1;
++ 	rpt_exp = recs_per_track(&private->rdc_data, 0, cdata->expect.blksize);
++ 
++ 	trkcount = cdata->expect.stop_unit - cdata->expect.start_unit + 1;
++ 	fmt_buffer_size = trkcount * rpt_max * sizeof(struct eckd_count);
++ 
++ 	fmt_buffer = kzalloc(fmt_buffer_size, GFP_KERNEL | GFP_DMA);
++ 	if (!fmt_buffer)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * A certain FICON feature subset is needed to operate in transport
++ 	 * mode. Additionally, the support for transport mode is implicitly
++ 	 * checked by comparing the buffer size with fcx_max_data. As long as
++ 	 * the buffer size is smaller we can operate in transport mode and
++ 	 * process multiple tracks. If not, only one track at once is being
++ 	 * processed using command mode.
++ 	 */
++ 	if ((private->features.feature[40] & 0x04) &&
++ 	    fmt_buffer_size <= private->fcx_max_data)
++ 		tpm = 1;
++ 
++ 	rc = dasd_eckd_format_process_data(base, &cdata->expect, enable_pav,
++ 					   tpm, fmt_buffer, rpt_max, &irb);
++ 	if (rc && rc != -EIO)
++ 		goto out;
++ 	if (rc == -EIO) {
++ 		/*
++ 		 * If our first attempt with transport mode enabled comes back
++ 		 * with an incorrect length error, we're going to retry the
++ 		 * check with command mode.
++ 		 */
++ 		if (tpm && scsw_cstat(&irb.scsw) == 0x40) {
++ 			tpm = 0;
++ 			rc = dasd_eckd_format_process_data(base, &cdata->expect,
++ 							   enable_pav, tpm,
++ 							   fmt_buffer, rpt_max,
++ 							   &irb);
++ 			if (rc)
++ 				goto out;
++ 		} else {
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	dasd_eckd_format_evaluate_tracks(fmt_buffer, cdata, rpt_max, rpt_exp,
++ 					 trk_per_cyl, tpm);
++ 
++ out:
++ 	kfree(fmt_buffer);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  static void dasd_eckd_handle_terminated_request(struct dasd_ccw_req *cqr)
+  {
+ -	if (cqr->retries < 0) {
+ -		cqr->status = DASD_CQR_FAILED;
+ -		return;
+ -	}
+  	cqr->status = DASD_CQR_FILLED;
+  	if (cqr->block && (cqr->startdev != cqr->block->base)) {
+  		dasd_eckd_reset_ccw_to_base_io(cqr);
+diff --cc drivers/s390/block/dasd_int.h
+index aa498f7fe95b,ac7027e6d52b..000000000000
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@@ -320,7 -337,9 +328,13 @@@ struct dasd_discipline 
+  	int (*term_IO) (struct dasd_ccw_req *);
+  	void (*handle_terminated_request) (struct dasd_ccw_req *);
+  	int (*format_device) (struct dasd_device *,
+++<<<<<<< HEAD
+ +			      struct format_data_t *, int enable_PAV);
+++=======
++ 			      struct format_data_t *, int);
++ 	int (*check_device_format)(struct dasd_device *,
++ 				   struct format_check_t *, int);
+++>>>>>>> 8fd575200db5 (s390/dasd: Add new ioctl BIODASDCHECKFMT)
+  	int (*free_cp) (struct dasd_ccw_req *, struct request *);
+  
+  	/*
+diff --git a/arch/s390/include/uapi/asm/dasd.h b/arch/s390/include/uapi/asm/dasd.h
+index 38eca3ba40e2..1aefa1d4ea99 100644
+--- a/arch/s390/include/uapi/asm/dasd.h
++++ b/arch/s390/include/uapi/asm/dasd.h
+@@ -187,6 +187,36 @@ typedef struct format_data_t {
+ #define DASD_FMT_INT_INVAL  4 /* invalidate tracks */
+ #define DASD_FMT_INT_COMPAT 8 /* use OS/390 compatible disk layout */
+ 
++/*
++ * struct format_check_t
++ * represents all data necessary to evaluate the format of
++ * different tracks of a dasd
++ */
++typedef struct format_check_t {
++	/* Input */
++	struct format_data_t expect;
++
++	/* Output */
++	unsigned int result;		/* Error indication (DASD_FMT_ERR_*) */
++	unsigned int unit;		/* Track that is in error */
++	unsigned int rec;		/* Record that is in error */
++	unsigned int num_records;	/* Records in the track in error */
++	unsigned int blksize;		/* Blocksize of first record in error */
++	unsigned int key_length;	/* Key length of first record in error */
++} format_check_t;
++
++/* Values returned in format_check_t when a format error is detected: */
++/* Too few records were found on a single track */
++#define DASD_FMT_ERR_TOO_FEW_RECORDS	1
++/* Too many records were found on a single track */
++#define DASD_FMT_ERR_TOO_MANY_RECORDS	2
++/* Blocksize/data-length of a record was wrong */
++#define DASD_FMT_ERR_BLKSIZE		3
++/* A record ID is defined by cylinder, head, and record number (CHR). */
++/* On mismatch, this error is set */
++#define DASD_FMT_ERR_RECORD_ID		4
++/* If key-length was != 0 */
++#define DASD_FMT_ERR_KEY_LENGTH		5
+ 
+ /* 
+  * struct attrib_data_t
+@@ -284,6 +314,8 @@ struct dasd_snid_ioctl_data {
+ 
+ /* Get Sense Path Group ID (SNID) data */
+ #define BIODASDSNID    _IOWR(DASD_IOCTL_LETTER, 1, struct dasd_snid_ioctl_data)
++/* Check device format according to format_check_t */
++#define BIODASDCHECKFMT _IOWR(DASD_IOCTL_LETTER, 2, format_check_t)
+ 
+ #define BIODASDSYMMIO  _IOWR(DASD_IOCTL_LETTER, 240, dasd_symmio_parms_t)
+ 
+diff --git a/drivers/s390/block/dasd.c b/drivers/s390/block/dasd.c
+index 5f422bc676a9..180f22a1bb91 100644
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -1617,6 +1617,9 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
+ 	struct dasd_ccw_req *cqr, *next;
+ 	struct dasd_device *device;
+ 	unsigned long long now;
++	int nrf_suppressed = 0;
++	int fp_suppressed = 0;
++	u8 *sense = NULL;
+ 	int expires;
+ 
+ 	cqr = (struct dasd_ccw_req *) intparm;
+@@ -1660,7 +1663,23 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
+ 			dasd_put_device(device);
+ 			return;
+ 		}
+-		device->discipline->dump_sense_dbf(device, irb, "int");
++
++		/*
++		 * In some cases 'File Protected' or 'No Record Found' errors
++		 * might be expected and debug log messages for the
++		 * corresponding interrupts shouldn't be written then.
++		 * Check if either of the according suppress bits is set.
++		 */
++		sense = dasd_get_sense(irb);
++		if (sense) {
++			fp_suppressed = (sense[1] & SNS1_FILE_PROTECTED) &&
++				test_bit(DASD_CQR_SUPPRESS_FP, &cqr->flags);
++			nrf_suppressed = (sense[1] & SNS1_NO_REC_FOUND) &&
++				test_bit(DASD_CQR_SUPPRESS_NRF, &cqr->flags);
++		}
++		if (!(fp_suppressed || nrf_suppressed))
++			device->discipline->dump_sense_dbf(device, irb, "int");
++
+ 		if (device->features & DASD_FEATURE_ERPLOG)
+ 			device->discipline->dump_sense(device, cqr, irb);
+ 		device->discipline->check_for_device_change(device, cqr, irb);
+@@ -2286,6 +2305,7 @@ static int _dasd_sleep_on_queue(struct list_head *ccw_queue, int interruptible)
+ {
+ 	struct dasd_device *device;
+ 	struct dasd_ccw_req *cqr, *n;
++	u8 *sense = NULL;
+ 	int rc;
+ 
+ retry:
+@@ -2331,6 +2351,20 @@ retry:
+ 
+ 	rc = 0;
+ 	list_for_each_entry_safe(cqr, n, ccw_queue, blocklist) {
++		/*
++		 * In some cases the 'File Protected' or 'Incorrect Length'
++		 * error might be expected and error recovery would be
++		 * unnecessary in these cases.	Check if the according suppress
++		 * bit is set.
++		 */
++		sense = dasd_get_sense(&cqr->irb);
++		if (sense && sense[1] & SNS1_FILE_PROTECTED &&
++		    test_bit(DASD_CQR_SUPPRESS_FP, &cqr->flags))
++			continue;
++		if (scsw_cstat(&cqr->irb.scsw) == 0x40 &&
++		    test_bit(DASD_CQR_SUPPRESS_IL, &cqr->flags))
++			continue;
++
+ 		/*
+ 		 * for alias devices simplify error recovery and
+ 		 * return to upper layer
+diff --git a/drivers/s390/block/dasd_3990_erp.c b/drivers/s390/block/dasd_3990_erp.c
+index d26134713682..8305ab688d57 100644
+--- a/drivers/s390/block/dasd_3990_erp.c
++++ b/drivers/s390/block/dasd_3990_erp.c
+@@ -1367,8 +1367,14 @@ dasd_3990_erp_no_rec(struct dasd_ccw_req * default_erp, char *sense)
+ 
+ 	struct dasd_device *device = default_erp->startdev;
+ 
+-	dev_err(&device->cdev->dev,
+-		    "The specified record was not found\n");
++	/*
++	 * In some cases the 'No Record Found' error might be expected and
++	 * log messages shouldn't be written then.
++	 * Check if the according suppress bit is set.
++	 */
++	if (!test_bit(DASD_CQR_SUPPRESS_NRF, &default_erp->flags))
++		dev_err(&device->cdev->dev,
++			"The specified record was not found\n");
+ 
+ 	return dasd_3990_erp_cleanup(default_erp, DASD_CQR_FAILED);
+ 
+@@ -1393,8 +1399,14 @@ dasd_3990_erp_file_prot(struct dasd_ccw_req * erp)
+ 
+ 	struct dasd_device *device = erp->startdev;
+ 
+-	dev_err(&device->cdev->dev, "Accessing the DASD failed because of "
+-		"a hardware error\n");
++	/*
++	 * In some cases the 'File Protected' error might be expected and
++	 * log messages shouldn't be written then.
++	 * Check if the according suppress bit is set.
++	 */
++	if (!test_bit(DASD_CQR_SUPPRESS_FP, &erp->flags))
++		dev_err(&device->cdev->dev,
++			"Accessing the DASD failed because of a hardware error\n");
+ 
+ 	return dasd_3990_erp_cleanup(erp, DASD_CQR_FAILED);
+ 
+* Unmerged path drivers/s390/block/dasd_eckd.c
+diff --git a/drivers/s390/block/dasd_eckd.h b/drivers/s390/block/dasd_eckd.h
+index 2555e494591f..dbe0b1f8ff53 100644
+--- a/drivers/s390/block/dasd_eckd.h
++++ b/drivers/s390/block/dasd_eckd.h
+@@ -35,6 +35,7 @@
+ #define DASD_ECKD_CCW_READ_MT		 0x86
+ #define DASD_ECKD_CCW_WRITE_KD_MT	 0x8d
+ #define DASD_ECKD_CCW_READ_KD_MT	 0x8e
++#define DASD_ECKD_CCW_READ_COUNT_MT	 0x92
+ #define DASD_ECKD_CCW_RELEASE		 0x94
+ #define DASD_ECKD_CCW_WRITE_FULL_TRACK	 0x95
+ #define DASD_ECKD_CCW_READ_CKD_MT	 0x9e
+* Unmerged path drivers/s390/block/dasd_int.h
+diff --git a/drivers/s390/block/dasd_ioctl.c b/drivers/s390/block/dasd_ioctl.c
+index 01c4ca98fd2d..72da45827a2c 100644
+--- a/drivers/s390/block/dasd_ioctl.c
++++ b/drivers/s390/block/dasd_ioctl.c
+@@ -206,6 +206,23 @@ dasd_format(struct dasd_block *block, struct format_data_t *fdata)
+ 		return 0;
+ }
+ 
++static int dasd_check_format(struct dasd_block *block,
++			     struct format_check_t *cdata)
++{
++	struct dasd_device *base;
++	int rc;
++
++	base = block->base;
++	if (!base->discipline->check_device_format)
++		return -ENOTTY;
++
++	rc = base->discipline->check_device_format(base, cdata, 1);
++	if (rc == -EAGAIN)
++		rc = base->discipline->check_device_format(base, cdata, 0);
++
++	return rc;
++}
++
+ /*
+  * Format device.
+  */
+@@ -241,6 +258,47 @@ dasd_ioctl_format(struct block_device *bdev, void __user *argp)
+ 	}
+ 	rc = dasd_format(base->block, &fdata);
+ 	dasd_put_device(base);
++
++	return rc;
++}
++
++/*
++ * Check device format
++ */
++static int dasd_ioctl_check_format(struct block_device *bdev, void __user *argp)
++{
++	struct format_check_t cdata;
++	struct dasd_device *base;
++	int rc = 0;
++
++	if (!argp)
++		return -EINVAL;
++
++	base = dasd_device_from_gendisk(bdev->bd_disk);
++	if (!base)
++		return -ENODEV;
++	if (bdev != bdev->bd_contains) {
++		pr_warn("%s: The specified DASD is a partition and cannot be checked\n",
++			dev_name(&base->cdev->dev));
++		rc = -EINVAL;
++		goto out_err;
++	}
++
++	if (copy_from_user(&cdata, argp, sizeof(cdata))) {
++		rc = -EFAULT;
++		goto out_err;
++	}
++
++	rc = dasd_check_format(base->block, &cdata);
++	if (rc)
++		goto out_err;
++
++	if (copy_to_user(argp, &cdata, sizeof(cdata)))
++		rc = -EFAULT;
++
++out_err:
++	dasd_put_device(base);
++
+ 	return rc;
+ }
+ 
+@@ -482,6 +540,9 @@ int dasd_ioctl(struct block_device *bdev, fmode_t mode,
+ 	case BIODASDFMT:
+ 		rc = dasd_ioctl_format(bdev, argp);
+ 		break;
++	case BIODASDCHECKFMT:
++		rc = dasd_ioctl_check_format(bdev, argp);
++		break;
+ 	case BIODASDINFO:
+ 		rc = dasd_ioctl_information(block, cmd, argp);
+ 		break;
