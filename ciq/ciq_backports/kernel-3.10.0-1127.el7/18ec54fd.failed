@@ -1,0 +1,208 @@
+x86/speculation: Prepare entry code for Spectre v1 swapgs mitigations
+
+jira LE-1907
+cve CVE-2019-1125
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 18ec54fdd6d18d92025af097cd042a75cf0ea24c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/18ec54fd.failed
+
+
+Spectre v1 isn't only about array bounds checks.  It can affect any
+conditional checks.  The kernel entry code interrupt, exception, and NMI
+handlers all have conditional swapgs checks.  Those may be problematic in
+the context of Spectre v1, as kernel code can speculatively run with a user
+GS.
+
+For example:
+
+	if (coming from user space)
+		swapgs
+	mov %gs:<percpu_offset>, %reg
+	mov (%reg), %reg1
+
+When coming from user space, the CPU can speculatively skip the swapgs, and
+then do a speculative percpu load using the user GS value.  So the user can
+speculatively force a read of any kernel value.  If a gadget exists which
+uses the percpu value as an address in another load/store, then the
+contents of the kernel value may become visible via an L1 side channel
+attack.
+
+A similar attack exists when coming from kernel space.  The CPU can
+speculatively do the swapgs, causing the user GS to get used for the rest
+of the speculative window.
+
+The mitigation is similar to a traditional Spectre v1 mitigation, except:
+
+  a) index masking isn't possible; because the index (percpu offset)
+     isn't user-controlled; and
+
+  b) an lfence is needed in both the "from user" swapgs path and the
+     "from kernel" non-swapgs path (because of the two attacks described
+     above).
+
+The user entry swapgs paths already have SWITCH_TO_KERNEL_CR3, which has a
+CR3 write when PTI is enabled.  Since CR3 writes are serializing, the
+lfences can be skipped in those cases.
+
+On the other hand, the kernel entry swapgs paths don't depend on PTI.
+
+To avoid unnecessary lfences for the user entry case, create two separate
+features for alternative patching:
+
+  X86_FEATURE_FENCE_SWAPGS_USER
+  X86_FEATURE_FENCE_SWAPGS_KERNEL
+
+Use these features in entry code to patch in lfences where needed.
+
+The features aren't enabled yet, so there's no functional change.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+
+(cherry picked from commit 18ec54fdd6d18d92025af097cd042a75cf0ea24c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/calling.h
+#	arch/x86/entry/entry_64.S
+#	arch/x86/include/asm/cpufeatures.h
+diff --cc arch/x86/include/asm/cpufeatures.h
+index dbaf1dd9cc7a,4393278666d9..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -219,60 -223,75 +219,78 @@@
+  #define X86_FEATURE_IBRS_ENHANCED	( 7*32+30) /* Enhanced IBRS */
+  
+  /* Virtualization flags: Linux defined, word 8 */
+ -#define X86_FEATURE_TPR_SHADOW		( 8*32+ 0) /* Intel TPR Shadow */
+ -#define X86_FEATURE_VNMI		( 8*32+ 1) /* Intel Virtual NMI */
+ -#define X86_FEATURE_FLEXPRIORITY	( 8*32+ 2) /* Intel FlexPriority */
+ -#define X86_FEATURE_EPT			( 8*32+ 3) /* Intel Extended Page Table */
+ -#define X86_FEATURE_VPID		( 8*32+ 4) /* Intel Virtual Processor ID */
+ +#define X86_FEATURE_TPR_SHADOW  (8*32+ 0) /* Intel TPR Shadow */
+ +#define X86_FEATURE_VNMI        (8*32+ 1) /* Intel Virtual NMI */
+ +#define X86_FEATURE_FLEXPRIORITY (8*32+ 2) /* Intel FlexPriority */
+ +#define X86_FEATURE_EPT         (8*32+ 3) /* Intel Extended Page Table */
+ +#define X86_FEATURE_VPID        (8*32+ 4) /* Intel Virtual Processor ID */
+ +#define X86_FEATURE_VMMCALL     (8*32+15) /* Prefer vmmcall to vmcall */
+  
+ -#define X86_FEATURE_VMMCALL		( 8*32+15) /* Prefer VMMCALL to VMCALL */
+ -#define X86_FEATURE_XENPV		( 8*32+16) /* "" Xen paravirtual guest */
+ -#define X86_FEATURE_EPT_AD		( 8*32+17) /* Intel Extended Page Table access-dirty bit */
+ +/* Intel-defined CPU features, CPUID level 0x00000007:0 (ebx), word 9 */
+ +#define X86_FEATURE_FSGSBASE	(9*32+ 0) /* {RD/WR}{FS/GS}BASE instructions*/
+ +#define X86_FEATURE_TSC_ADJUST	(9*32+ 1) /* TSC adjustment MSR 0x3b */
+ +#define X86_FEATURE_BMI1	(9*32+ 3) /* 1st group bit manipulation extensions */
+ +#define X86_FEATURE_HLE		(9*32+ 4) /* Hardware Lock Elision */
+ +#define X86_FEATURE_AVX2	(9*32+ 5) /* AVX2 instructions */
+ +#define X86_FEATURE_SMEP	(9*32+ 7) /* Supervisor Mode Execution Protection */
+ +#define X86_FEATURE_BMI2	(9*32+ 8) /* 2nd group bit manipulation extensions */
+ +#define X86_FEATURE_ERMS	(9*32+ 9) /* Enhanced REP MOVSB/STOSB */
+ +#define X86_FEATURE_INVPCID	(9*32+10) /* Invalidate Processor Context ID */
+ +#define X86_FEATURE_RTM		(9*32+11) /* Restricted Transactional Memory */
+ +#define X86_FEATURE_CQM		(9*32+12) /* Cache QoS Monitoring */
+ +#define X86_FEATURE_MPX		(9*32+14) /* Memory Protection Extension */
+ +#define X86_FEATURE_RDT_A	(9*32+15) /* Resource Director Technology Allocation */
+ +#define X86_FEATURE_AVX512F	(9*32+16) /* AVX-512 Foundation */
+ +#define X86_FEATURE_AVX512DQ	( 9*32+17) /* AVX-512 DQ (Double/Quad granular) Instructions */
+ +#define X86_FEATURE_RDSEED	(9*32+18) /* The RDSEED instruction */
+ +#define X86_FEATURE_ADX		(9*32+19) /* The ADCX and ADOX instructions */
+ +#define X86_FEATURE_SMAP	(9*32+20) /* Supervisor Mode Access Prevention */
+ +#define X86_FEATURE_AVX512IFMA	( 9*32+21) /* AVX-512 Integer Fused Multiply-Add instructions */
+ +#define X86_FEATURE_CLFLUSHOPT	(9*32+23) /* CLFLUSHOPT instruction */
+ +#define X86_FEATURE_CLWB	( 9*32+24) /* CLWB instruction */
+ +#define X86_FEATURE_AVX512PF	(9*32+26) /* AVX-512 Prefetch */
+ +#define X86_FEATURE_AVX512ER	(9*32+27) /* AVX-512 Exponential and Reciprocal */
+ +#define X86_FEATURE_AVX512CD	(9*32+28) /* AVX-512 Conflict Detection */
+ +#define X86_FEATURE_SHA_NI	( 9*32+29) /* SHA1/SHA256 Instruction Extensions */
+ +#define X86_FEATURE_AVX512BW	( 9*32+30) /* AVX-512 BW (Byte/Word granular) Instructions */
+ +#define X86_FEATURE_AVX512VL	( 9*32+31) /* AVX-512 VL (128/256 Vector Length) Extensions */
+  
+ -/* Intel-defined CPU features, CPUID level 0x00000007:0 (EBX), word 9 */
+ -#define X86_FEATURE_FSGSBASE		( 9*32+ 0) /* RDFSBASE, WRFSBASE, RDGSBASE, WRGSBASE instructions*/
+ -#define X86_FEATURE_TSC_ADJUST		( 9*32+ 1) /* TSC adjustment MSR 0x3B */
+ -#define X86_FEATURE_BMI1		( 9*32+ 3) /* 1st group bit manipulation extensions */
+ -#define X86_FEATURE_HLE			( 9*32+ 4) /* Hardware Lock Elision */
+ -#define X86_FEATURE_AVX2		( 9*32+ 5) /* AVX2 instructions */
+ -#define X86_FEATURE_FDP_EXCPTN_ONLY	( 9*32+ 6) /* "" FPU data pointer updated only on x87 exceptions */
+ -#define X86_FEATURE_SMEP		( 9*32+ 7) /* Supervisor Mode Execution Protection */
+ -#define X86_FEATURE_BMI2		( 9*32+ 8) /* 2nd group bit manipulation extensions */
+ -#define X86_FEATURE_ERMS		( 9*32+ 9) /* Enhanced REP MOVSB/STOSB instructions */
+ -#define X86_FEATURE_INVPCID		( 9*32+10) /* Invalidate Processor Context ID */
+ -#define X86_FEATURE_RTM			( 9*32+11) /* Restricted Transactional Memory */
+ -#define X86_FEATURE_CQM			( 9*32+12) /* Cache QoS Monitoring */
+ -#define X86_FEATURE_ZERO_FCS_FDS	( 9*32+13) /* "" Zero out FPU CS and FPU DS */
+ -#define X86_FEATURE_MPX			( 9*32+14) /* Memory Protection Extension */
+ -#define X86_FEATURE_RDT_A		( 9*32+15) /* Resource Director Technology Allocation */
+ -#define X86_FEATURE_AVX512F		( 9*32+16) /* AVX-512 Foundation */
+ -#define X86_FEATURE_AVX512DQ		( 9*32+17) /* AVX-512 DQ (Double/Quad granular) Instructions */
+ -#define X86_FEATURE_RDSEED		( 9*32+18) /* RDSEED instruction */
+ -#define X86_FEATURE_ADX			( 9*32+19) /* ADCX and ADOX instructions */
+ -#define X86_FEATURE_SMAP		( 9*32+20) /* Supervisor Mode Access Prevention */
+ -#define X86_FEATURE_AVX512IFMA		( 9*32+21) /* AVX-512 Integer Fused Multiply-Add instructions */
+ -#define X86_FEATURE_CLFLUSHOPT		( 9*32+23) /* CLFLUSHOPT instruction */
+ -#define X86_FEATURE_CLWB		( 9*32+24) /* CLWB instruction */
+ -#define X86_FEATURE_INTEL_PT		( 9*32+25) /* Intel Processor Trace */
+ -#define X86_FEATURE_AVX512PF		( 9*32+26) /* AVX-512 Prefetch */
+ -#define X86_FEATURE_AVX512ER		( 9*32+27) /* AVX-512 Exponential and Reciprocal */
+ -#define X86_FEATURE_AVX512CD		( 9*32+28) /* AVX-512 Conflict Detection */
+ -#define X86_FEATURE_SHA_NI		( 9*32+29) /* SHA1/SHA256 Instruction Extensions */
+ -#define X86_FEATURE_AVX512BW		( 9*32+30) /* AVX-512 BW (Byte/Word granular) Instructions */
+ -#define X86_FEATURE_AVX512VL		( 9*32+31) /* AVX-512 VL (128/256 Vector Length) Extensions */
+ +/* Extended state features, CPUID level 0x0000000d:1 (eax), word 10 */
+ +#define X86_FEATURE_XSAVEOPT   (10*32+ 0) /* XSAVEOPT */
+ +#define X86_FEATURE_XSAVEC     (10*32+ 1) /* XSAVEC */
+ +#define X86_FEATURE_XGETBV1    (10*32+ 2) /* XGETBV with ECX = 1 */
+ +#define X86_FEATURE_XSAVES     (10*32+ 3) /* XSAVES/XRSTORS */
+  
+ -/* Extended state features, CPUID level 0x0000000d:1 (EAX), word 10 */
+ -#define X86_FEATURE_XSAVEOPT		(10*32+ 0) /* XSAVEOPT instruction */
+ -#define X86_FEATURE_XSAVEC		(10*32+ 1) /* XSAVEC instruction */
+ -#define X86_FEATURE_XGETBV1		(10*32+ 2) /* XGETBV with ECX = 1 instruction */
+ -#define X86_FEATURE_XSAVES		(10*32+ 3) /* XSAVES/XRSTORS instructions */
+ +/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:0 (edx), word 11 */
+ +#define X86_FEATURE_CQM_LLC	(11*32+ 1) /* LLC QoS if 1 */
+  
+++<<<<<<< HEAD
+ +/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:1 (edx), word 12 */
+ +#define X86_FEATURE_CQM_OCCUP_LLC (12*32+ 0) /* LLC occupancy monitoring if 1 */
+ +#define X86_FEATURE_CQM_MBM_TOTAL (12*32+ 1) /* LLC Total MBM monitoring */
+ +#define X86_FEATURE_CQM_MBM_LOCAL (12*32+ 2) /* LLC Local MBM monitoring */
+++=======
++ /*
++  * Extended auxiliary flags: Linux defined - for features scattered in various
++  * CPUID levels like 0xf, etc.
++  *
++  * Reuse free bits when adding new feature flags!
++  */
++ #define X86_FEATURE_CQM_LLC		(11*32+ 0) /* LLC QoS if 1 */
++ #define X86_FEATURE_CQM_OCCUP_LLC	(11*32+ 1) /* LLC occupancy monitoring */
++ #define X86_FEATURE_CQM_MBM_TOTAL	(11*32+ 2) /* LLC Total MBM monitoring */
++ #define X86_FEATURE_CQM_MBM_LOCAL	(11*32+ 3) /* LLC Local MBM monitoring */
++ #define X86_FEATURE_FENCE_SWAPGS_USER	(11*32+ 4) /* "" LFENCE in user entry SWAPGS path */
++ #define X86_FEATURE_FENCE_SWAPGS_KERNEL	(11*32+ 5) /* "" LFENCE in kernel entry SWAPGS path */
++ 
++ /* Intel-defined CPU features, CPUID level 0x00000007:1 (EAX), word 12 */
++ #define X86_FEATURE_AVX512_BF16		(12*32+ 5) /* AVX512 BFLOAT16 instructions */
+++>>>>>>> 18ec54fdd6d1 (x86/speculation: Prepare entry code for Spectre v1 swapgs mitigations)
+  
+  /* AMD-defined CPU features, CPUID level 0x80000008 (EBX), word 13 */
+ -#define X86_FEATURE_CLZERO		(13*32+ 0) /* CLZERO instruction */
+ -#define X86_FEATURE_IRPERF		(13*32+ 1) /* Instructions Retired Count */
+ -#define X86_FEATURE_XSAVEERPTR		(13*32+ 2) /* Always save/restore FP error pointers */
+ -#define X86_FEATURE_WBNOINVD		(13*32+ 9) /* WBNOINVD instruction */
+ +#define X86_FEATURE_CLZERO              (13*32+ 0) /* CLZERO instruction */
+ +#define X86_FEATURE_IRPERF              (13*32+ 1) /* Instructions Retired Count */
+ +#define X86_FEATURE_XSAVEERPTR          (13*32+ 2) /* Always save/restore FP error pointers */
+  #define X86_FEATURE_AMD_IBPB		(13*32+12) /* "" Indirect Branch Prediction Barrier */
+  #define X86_FEATURE_AMD_IBRS		(13*32+14) /* "" Indirect Branch Restricted Speculation */
+  #define X86_FEATURE_AMD_STIBP		(13*32+15) /* "" Single Thread Indirect Branch Predictors */
+* Unmerged path arch/x86/entry/calling.h
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/entry/calling.h
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/include/asm/cpufeatures.h
