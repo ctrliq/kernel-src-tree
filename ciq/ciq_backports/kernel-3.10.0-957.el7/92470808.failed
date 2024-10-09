@@ -1,0 +1,171 @@
+ixgbe: add XDP support for pass and drop actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author John Fastabend <john.r.fastabend@intel.com>
+commit 9247080816297de4e31abb684939c0e53e3a8a67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/92470808.failed
+
+Basic XDP drop support for ixgbe. Uses READ_ONCE/xchg semantics on XDP
+programs instead of RCU primitives as suggested by Daniel Borkmann and
+Alex Duyck.
+
+v2: fix the build issues seen w/ XDP when page sizes are larger than 4K
+    and made minor fixes based on feedback from Jakub Kicinski
+
+	Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+	Acked-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 9247080816297de4e31abb684939c0e53e3a8a67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 90f60ed0b65b,99b5357c3e00..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -49,9 -49,11 +49,12 @@@
+  #include <linux/if_macvlan.h>
+  #include <linux/if_bridge.h>
+  #include <linux/prefetch.h>
++ #include <linux/bpf.h>
++ #include <linux/bpf_trace.h>
++ #include <linux/atomic.h>
+  #include <scsi/fc/fc_fcoe.h>
+  #include <net/udp_tunnel.h>
+ +#include <net/vxlan.h>
+  #include <net/pkt_cls.h>
+  #include <net/tc_act/tc_gact.h>
+  #include <net/tc_act/tc_mirred.h>
+@@@ -9574,8 -9536,55 +9642,56 @@@ ixgbe_features_check(struct sk_buff *sk
+  	return features;
+  }
+  
++ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	int i, frame_size = dev->mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct bpf_prog *old_prog;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED)
++ 		return -EINVAL;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_DCB_ENABLED)
++ 		return -EINVAL;
++ 
++ 	/* verify ixgbe ring attributes are sufficient for XDP */
++ 	for (i = 0; i < adapter->num_rx_queues; i++) {
++ 		struct ixgbe_ring *ring = adapter->rx_ring[i];
++ 
++ 		if (ring_is_rsc_enabled(ring))
++ 			return -EINVAL;
++ 
++ 		if (frame_size > ixgbe_rx_bufsz(ring))
++ 			return -EINVAL;
++ 	}
++ 
++ 	old_prog = xchg(&adapter->xdp_prog, prog);
++ 	for (i = 0; i < adapter->num_rx_queues; i++)
++ 		xchg(&adapter->rx_ring[i]->xdp_prog, adapter->xdp_prog);
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int ixgbe_xdp(struct net_device *dev, struct netdev_xdp *xdp)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return ixgbe_xdp_setup(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!(adapter->xdp_prog);
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+  static const struct net_device_ops ixgbe_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= ixgbe_open,
+  	.ndo_stop		= ixgbe_close,
+  	.ndo_start_xmit		= ixgbe_xmit_frame,
+@@@ -9615,11 -9624,12 +9731,15 @@@
+  	.ndo_fdb_add		= ixgbe_ndo_fdb_add,
+  	.ndo_bridge_setlink	= ixgbe_ndo_bridge_setlink,
+  	.ndo_bridge_getlink	= ixgbe_ndo_bridge_getlink,
+ -	.ndo_dfwd_add_station	= ixgbe_fwd_add,
+ -	.ndo_dfwd_del_station	= ixgbe_fwd_del,
+ -	.ndo_udp_tunnel_add	= ixgbe_add_udp_tunnel_port,
+ -	.ndo_udp_tunnel_del	= ixgbe_del_udp_tunnel_port,
+ +	.extended.ndo_udp_tunnel_add	= ixgbe_add_udp_tunnel_port,
+ +	.extended.ndo_udp_tunnel_del	= ixgbe_del_udp_tunnel_port,
+  	.ndo_features_check	= ixgbe_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_dfwd_add_station	= ixgbe_fwd_add,
+ +	.extended.ndo_dfwd_del_station	= ixgbe_fwd_del,
+++=======
++ 	.ndo_xdp		= ixgbe_xdp,
+++>>>>>>> 924708081629 (ixgbe: add XDP support for pass and drop actions)
+  };
+  
+  /**
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index 2896714bbe3c..597b9d3ba159 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -318,6 +318,7 @@ struct ixgbe_ring {
+ 	struct ixgbe_ring *next;	/* pointer to next ring in q_vector */
+ 	struct ixgbe_q_vector *q_vector; /* backpointer to host q_vector */
+ 	struct net_device *netdev;	/* netdev ring belongs to */
++	struct bpf_prog *xdp_prog;
+ 	struct device *dev;		/* device for DMA mapping */
+ 	struct ixgbe_fwd_adapter *l2_accel_priv;
+ 	void *desc;			/* descriptor ring memory */
+@@ -556,6 +557,7 @@ struct ixgbe_adapter {
+ 	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
+ 	/* OS defined structs */
+ 	struct net_device *netdev;
++	struct bpf_prog *xdp_prog;
+ 	struct pci_dev *pdev;
+ 
+ 	unsigned long state;
+@@ -839,7 +841,7 @@ void ixgbe_down(struct ixgbe_adapter *adapter);
+ void ixgbe_reinit_locked(struct ixgbe_adapter *adapter);
+ void ixgbe_reset(struct ixgbe_adapter *adapter);
+ void ixgbe_set_ethtool_ops(struct net_device *netdev);
+-int ixgbe_setup_rx_resources(struct ixgbe_ring *);
++int ixgbe_setup_rx_resources(struct ixgbe_adapter *, struct ixgbe_ring *);
+ int ixgbe_setup_tx_resources(struct ixgbe_ring *);
+ void ixgbe_free_rx_resources(struct ixgbe_ring *);
+ void ixgbe_free_tx_resources(struct ixgbe_ring *);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+index 96974a5d7ded..7512fadbc48a 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+@@ -1131,7 +1131,7 @@ static int ixgbe_set_ringparam(struct net_device *netdev,
+ 			       sizeof(struct ixgbe_ring));
+ 
+ 			temp_ring[i].count = new_rx_count;
+-			err = ixgbe_setup_rx_resources(&temp_ring[i]);
++			err = ixgbe_setup_rx_resources(adapter, &temp_ring[i]);
+ 			if (err) {
+ 				while (i) {
+ 					i--;
+@@ -1769,7 +1769,7 @@ static int ixgbe_setup_desc_rings(struct ixgbe_adapter *adapter)
+ 	rx_ring->netdev = adapter->netdev;
+ 	rx_ring->reg_idx = adapter->rx_ring[0]->reg_idx;
+ 
+-	err = ixgbe_setup_rx_resources(rx_ring);
++	err = ixgbe_setup_rx_resources(adapter, rx_ring);
+ 	if (err) {
+ 		ret_val = 4;
+ 		goto err_nomem;
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
