@@ -1,0 +1,91 @@
+netfilter: ipset: Fix race between dump and swap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Lagerwall <ross.lagerwall@citrix.com>
+commit e5173418ac597cebe9f7a39adf10be470000b518
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e5173418.failed
+
+Fix a race between ip_set_dump_start() and ip_set_swap().
+The race is as follows:
+* Without holding the ref lock, ip_set_swap() checks ref_netlink of the
+  set and it is 0.
+* ip_set_dump_start() takes a reference on the set.
+* ip_set_swap() does the swap (even though it now has a non-zero
+  reference count).
+* ip_set_dump_start() gets the set from ip_set_list again which is now a
+  different set since it has been swapped.
+* ip_set_dump_start() calls __ip_set_put_netlink() and hits a BUG_ON due
+  to the reference count being 0.
+
+Fix this race by extending the critical region in which the ref lock is
+held to include checking the ref counts.
+
+The race can be reproduced with the following script:
+  while :; do
+    ipset destroy hash_ip1
+    ipset destroy hash_ip2
+    ipset create hash_ip1 hash:ip family inet hashsize 1024 \
+        maxelem 500000
+    ipset create hash_ip2 hash:ip family inet hashsize 300000 \
+        maxelem 500000
+    ipset create hash_ip3 hash:ip family inet hashsize 1024 \
+        maxelem 500000
+    ipset save &
+    ipset swap hash_ip3 hash_ip2
+    ipset destroy hash_ip3
+    wait
+  done
+
+	Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+	Acked-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit e5173418ac597cebe9f7a39adf10be470000b518)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_core.c
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 98b197a78f1a,cf84f7b37cd9..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -1022,20 -1184,27 +1022,29 @@@ ip_set_swap(struct sock *ctnl, struct s
+  		return -IPSET_ERR_EXIST_SETNAME2;
+  
+  	/* Features must not change.
+ -	 * Not an artifical restriction anymore, as we must prevent
+ -	 * possible loops created by swapping in setlist type of sets.
+ -	 */
+ +	 * Not an artificial restriction anymore, as we must prevent
+ +	 * possible loops created by swapping in setlist type of sets. */
+  	if (!(from->type->features == to->type->features &&
+ -	      from->family == to->family))
+ +	      from->type->family == to->type->family))
+  		return -IPSET_ERR_TYPE_MISMATCH;
+  
+++<<<<<<< HEAD
+++=======
++ 	write_lock_bh(&ip_set_ref_lock);
++ 
++ 	if (from->ref_netlink || to->ref_netlink) {
++ 		write_unlock_bh(&ip_set_ref_lock);
++ 		return -EBUSY;
++ 	}
++ 
+++>>>>>>> e5173418ac59 (netfilter: ipset: Fix race between dump and swap)
+  	strncpy(from_name, from->name, IPSET_MAXNAMELEN);
+  	strncpy(from->name, to->name, IPSET_MAXNAMELEN);
+  	strncpy(to->name, from_name, IPSET_MAXNAMELEN);
+  
+- 	write_lock_bh(&ip_set_ref_lock);
+  	swap(from->ref, to->ref);
+ -	ip_set(inst, from_id) = to;
+ -	ip_set(inst, to_id) = from;
+ +	ip_set(from_id) = to;
+ +	ip_set(to_id) = from;
+  	write_unlock_bh(&ip_set_ref_lock);
+  
+  	return 0;
+* Unmerged path net/netfilter/ipset/ip_set_core.c
