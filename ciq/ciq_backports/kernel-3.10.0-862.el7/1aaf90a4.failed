@@ -1,0 +1,172 @@
+sched: Move CFS tasks to CPUs with higher capacity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vincent Guittot <vincent.guittot@linaro.org>
+commit 1aaf90a4b88aae26a4535ba01dacab520a310d17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1aaf90a4.failed
+
+When a CPU is used to handle a lot of IRQs or some RT tasks, the remaining
+capacity for CFS tasks can be significantly reduced. Once we detect such
+situation by comparing cpu_capacity_orig and cpu_capacity, we trig an idle
+load balance to check if it's worth moving its tasks on an idle CPU.
+
+It's worth trying to move the task before the CPU is fully utilized to
+minimize the preemption by irq or RT tasks.
+
+Once the idle load_balance has selected the busiest CPU, it will look for an
+active load balance for only two cases:
+
+  - There is only 1 task on the busiest CPU.
+
+  - We haven't been able to move a task of the busiest rq.
+
+A CPU with a reduced capacity is included in the 1st case, and it's worth to
+actively migrate its task if the idle CPU has got more available capacity for
+CFS tasks. This test has been added in need_active_balance.
+
+As a sidenote, this will not generate more spurious ilb because we already
+trig an ilb if there is more than 1 busy cpu. If this cpu is the only one that
+has a task, we will trig the ilb once for migrating the task.
+
+The nohz_kick_needed function has been cleaned up a bit while adding the new
+test
+
+env.src_cpu and env.src_rq must be set unconditionnally because they are used
+in need_active_balance which is called even if busiest->nr_running equals 1
+
+	Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Morten.Rasmussen@arm.com
+	Cc: dietmar.eggemann@arm.com
+	Cc: efault@gmx.de
+	Cc: kamalesh@linux.vnet.ibm.com
+	Cc: linaro-kernel@lists.linaro.org
+	Cc: nicolas.pitre@linaro.org
+	Cc: preeti@linux.vnet.ibm.com
+	Cc: riel@redhat.com
+Link: http://lkml.kernel.org/r/1425052454-25797-12-git-send-email-vincent.guittot@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1aaf90a4b88aae26a4535ba01dacab520a310d17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 38afc41c3538,0576ce0e0af2..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -6501,14 -6979,10 +6517,12 @@@ redo
+  		 * correctly treated as an imbalance.
+  		 */
+  		env.flags |= LBF_ALL_PINNED;
+- 		env.src_cpu   = busiest->cpu;
+- 		env.src_rq    = busiest;
+  		env.loop_max  = min(sysctl_sched_nr_migrate, busiest->nr_running);
+  
+ +		update_h_load(env.src_cpu);
+  more_balance:
+ -		raw_spin_lock_irqsave(&busiest->lock, flags);
+ +		local_irq_save(flags);
+ +		double_rq_lock(env.dst_rq, busiest);
+  
+  		/*
+  		 * cur_ld_moved - load moved in current iteration
+@@@ -7163,22 -7678,25 +7177,42 @@@ end
+  
+  /*
+   * Current heuristic for kicking the idle load balancer in the presence
+-  * of an idle cpu is the system.
++  * of an idle cpu in the system.
+   *   - This rq has more than one task.
+++<<<<<<< HEAD
+ + *   - At any scheduler domain level, this cpu's scheduler group has multiple
+ + *     busy cpu's exceeding the group's power.
+ + *   - For SD_ASYM_PACKING, if the lower numbered cpu's in the scheduler
+ + *     domain span are idle.
+ + */
+ +static inline int nohz_kick_needed(struct rq *rq, int cpu)
+ +{
+ +	unsigned long now = jiffies;
+ +	struct sched_domain *sd;
+ +	struct sched_group_power *sgp;
+ +	int nr_busy;
+ +
+ +	if (unlikely(idle_cpu(cpu)))
+ +		return 0;
+++=======
++  *   - This rq has at least one CFS task and the capacity of the CPU is
++  *     significantly reduced because of RT tasks or IRQs.
++  *   - At parent of LLC scheduler domain level, this cpu's scheduler group has
++  *     multiple busy cpu.
++  *   - For SD_ASYM_PACKING, if the lower numbered cpu's in the scheduler
++  *     domain span are idle.
++  */
++ static inline bool nohz_kick_needed(struct rq *rq)
++ {
++ 	unsigned long now = jiffies;
++ 	struct sched_domain *sd;
++ 	struct sched_group_capacity *sgc;
++ 	int nr_busy, cpu = rq->cpu;
++ 	bool kick = false;
++ 
++ 	if (unlikely(rq->idle_balance))
++ 		return false;
+++>>>>>>> 1aaf90a4b88a (sched: Move CFS tasks to CPUs with higher capacity)
+  
+         /*
+  	* We may be recently in ticked or tickless idle mode. At the first
+@@@ -7202,28 -7720,36 +7236,36 @@@
+  
+  	rcu_read_lock();
+  	sd = rcu_dereference(per_cpu(sd_busy, cpu));
+- 
+  	if (sd) {
+ -		sgc = sd->groups->sgc;
+ -		nr_busy = atomic_read(&sgc->nr_busy_cpus);
+ +		sgp = sd->groups->sgp;
+ +		nr_busy = atomic_read(&sgp->nr_busy_cpus);
+  
+- 		if (nr_busy > 1)
+- 			goto need_kick_unlock;
++ 		if (nr_busy > 1) {
++ 			kick = true;
++ 			goto unlock;
++ 		}
++ 
+  	}
+  
+- 	sd = rcu_dereference(per_cpu(sd_asym, cpu));
++ 	sd = rcu_dereference(rq->sd);
++ 	if (sd) {
++ 		if ((rq->cfs.h_nr_running >= 1) &&
++ 				check_cpu_capacity(rq, sd)) {
++ 			kick = true;
++ 			goto unlock;
++ 		}
++ 	}
+  
++ 	sd = rcu_dereference(per_cpu(sd_asym, cpu));
+  	if (sd && (cpumask_first_and(nohz.idle_cpus_mask,
+- 				  sched_domain_span(sd)) < cpu))
+- 		goto need_kick_unlock;
+- 
+- 	rcu_read_unlock();
+- 	return 0;
++ 				  sched_domain_span(sd)) < cpu)) {
++ 		kick = true;
++ 		goto unlock;
++ 	}
+  
+- need_kick_unlock:
++ unlock:
+  	rcu_read_unlock();
+- need_kick:
+- 	return 1;
++ 	return kick;
+  }
+  #else
+  static void nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle) { }
+* Unmerged path kernel/sched/fair.c
