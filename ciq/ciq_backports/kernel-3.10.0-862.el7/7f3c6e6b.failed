@@ -1,0 +1,177 @@
+ibmvnic: Set real number of rx queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+commit 7f3c6e6b905018d07228fe0f43f0ef1359e7196d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7f3c6e6b.failed
+
+Along with 5 TX queues, 5 RX queues are allocated at the beginning of
+device probe. However, only the real number of TX queues is set. Configure
+the real number of RX queues as well.
+
+	Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7f3c6e6b905018d07228fe0f43f0ef1359e7196d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index bc20d23f0376,7f4cecbb4b5a..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -441,20 -498,135 +441,134 @@@ static int ibmvnic_open(struct net_devi
+  		tx_pool->consumer_index = 0;
+  		tx_pool->producer_index = 0;
+  	}
+ +	adapter->bounce_buffer_size =
+ +	    (netdev->mtu + ETH_HLEN - 1) / PAGE_SIZE + 1;
+ +	adapter->bounce_buffer = kmalloc(adapter->bounce_buffer_size,
+ +					 GFP_KERNEL);
+ +	if (!adapter->bounce_buffer)
+ +		goto bounce_alloc_failed;
+  
+ -	return 0;
+ -}
+ -
+ -static void release_error_buffers(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct device *dev = &adapter->vdev->dev;
+ -	struct ibmvnic_error_buff *error_buff, *tmp;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&adapter->error_list_lock, flags);
+ -	list_for_each_entry_safe(error_buff, tmp, &adapter->errors, list) {
+ -		list_del(&error_buff->list);
+ -		dma_unmap_single(dev, error_buff->dma, error_buff->len,
+ -				 DMA_FROM_DEVICE);
+ -		kfree(error_buff->buff);
+ -		kfree(error_buff);
+ +	adapter->bounce_buffer_dma = dma_map_single(dev, adapter->bounce_buffer,
+ +						    adapter->bounce_buffer_size,
+ +						    DMA_TO_DEVICE);
+ +	if (dma_mapping_error(dev, adapter->bounce_buffer_dma)) {
+ +		dev_err(dev, "Couldn't map tx bounce buffer\n");
+ +		goto bounce_map_failed;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
++ }
++ 
++ static int ibmvnic_login(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	struct device *dev = &adapter->vdev->dev;
++ 
++ 	do {
++ 		if (adapter->renegotiate) {
++ 			adapter->renegotiate = false;
++ 			release_sub_crqs(adapter);
++ 
++ 			reinit_completion(&adapter->init_done);
++ 			send_cap_queries(adapter);
++ 			if (!wait_for_completion_timeout(&adapter->init_done,
++ 							 timeout)) {
++ 				dev_err(dev, "Capabilities query timeout\n");
++ 				return -1;
++ 			}
++ 		}
++ 
++ 		reinit_completion(&adapter->init_done);
++ 		send_login(adapter);
++ 		if (!wait_for_completion_timeout(&adapter->init_done,
++ 						 timeout)) {
++ 			dev_err(dev, "Login timeout\n");
++ 			return -1;
++ 		}
++ 	} while (adapter->renegotiate);
++ 
++ 	return 0;
++ }
++ 
++ static void release_resources(struct ibmvnic_adapter *adapter)
++ {
++ 	release_tx_pools(adapter);
++ 	release_rx_pools(adapter);
++ 
++ 	release_stats_token(adapter);
++ 	release_error_buffers(adapter);
++ }
++ 
++ static int set_real_num_queues(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	int rc;
++ 
++ 	rc = netif_set_real_num_tx_queues(netdev, adapter->req_tx_queues);
++ 	if (rc) {
++ 		netdev_err(netdev, "failed to set the number of tx queues\n");
++ 		return rc;
++ 	}
++ 
++ 	rc = netif_set_real_num_rx_queues(netdev, adapter->req_rx_queues);
++ 	if (rc)
++ 		netdev_err(netdev, "failed to set the number of rx queues\n");
++ 
++ 	return rc;
++ }
++ 
++ static int ibmvnic_open(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	struct device *dev = &adapter->vdev->dev;
++ 	union ibmvnic_crq crq;
++ 	int rc = 0;
++ 	int i;
++ 
++ 	if (adapter->is_closed) {
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = ibmvnic_login(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = set_real_num_queues(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = init_sub_crq_irqs(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "failed to initialize sub crq irqs\n");
++ 		return -1;
++ 	}
++ 
++ 	adapter->map_id = 1;
++ 	adapter->napi = kcalloc(adapter->req_rx_queues,
++ 				sizeof(struct napi_struct), GFP_KERNEL);
++ 	if (!adapter->napi)
++ 		goto ibmvnic_open_fail;
++ 	for (i = 0; i < adapter->req_rx_queues; i++) {
++ 		netif_napi_add(netdev, &adapter->napi[i], ibmvnic_poll,
++ 			       NAPI_POLL_WEIGHT);
++ 		napi_enable(&adapter->napi[i]);
++ 	}
++ 
++ 	send_map_query(adapter);
++ 
++ 	rc = init_rx_pools(netdev);
++ 	if (rc)
++ 		goto ibmvnic_open_fail;
++ 
++ 	rc = init_tx_pools(netdev);
++ 	if (rc)
++ 		goto ibmvnic_open_fail;
++ 
+++>>>>>>> 7f3c6e6b9050 (ibmvnic: Set real number of rx queues)
+  	replenish_pools(adapter);
+  
+  	/* We're ready to receive frames, enable the sub-crq interrupts and
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
