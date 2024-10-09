@@ -1,0 +1,622 @@
+qed: Multiple qzone queues for VFs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 08bc8f15e69cbd9f8e3d7bbba4814cec50d51cfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/08bc8f15.failed
+
+This adds the infrastructure for supporting VFs that want to open
+multiple transmission queues on the same queue-zone.
+At this point, there are no VFs that actually request this functionality,
+but later patches would remedy that.
+
+ a. VF and PF would communicate the capability during ACQUIRE;
+    Legacy VFs would continue on behaving as they do today
+
+ b. PF would communicate number of supported CIDs to the VF
+    and would enforce said limitation
+
+ c. Whenever VF passes a request for a given queue configuration
+    it would also pass an associated index within said queue-zone
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 08bc8f15e69cbd9f8e3d7bbba4814cec50d51cfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_cxt.c
+#	drivers/net/ethernet/qlogic/qed/qed_l2.c
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.c
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.h
+#	drivers/net/ethernet/qlogic/qed/qed_vf.h
+#	include/linux/qed/qed_if.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed_cxt.c
+index 642f498d1845,e201214764db..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_cxt.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_cxt.c
+@@@ -2110,8 -2116,13 +2110,18 @@@ int qed_cxt_set_pf_params(struct qed_hw
+  		struct qed_eth_pf_params *p_params =
+  		    &p_hwfn->pf_params.eth_pf_params;
+  
+++<<<<<<< HEAD
+ +		qed_cxt_set_proto_cid_count(p_hwfn, PROTOCOLID_ETH,
+ +					    p_params->num_cons, 1);
+++=======
++ 			if (!p_params->num_vf_cons)
++ 				p_params->num_vf_cons =
++ 				    ETH_PF_PARAMS_VF_CONS_DEFAULT;
++ 			qed_cxt_set_proto_cid_count(p_hwfn, PROTOCOLID_ETH,
++ 						    p_params->num_cons,
++ 						    p_params->num_vf_cons);
++ 		p_hwfn->p_cxt_mngr->arfs_count = p_params->num_arfs_filters;
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  		break;
+  	}
+  	case QED_PCI_FCOE:
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.c
+index f852981b5922,cffa8e7e539b..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@@ -68,9 -68,145 +68,21 @@@
+  void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
+  			       struct qed_queue_cid *p_cid)
+  {
+++<<<<<<< HEAD
+ +	/* VFs' CIDs are 0-based in PF-view, and uninitialized on VF */
+ +	if (!p_cid->is_vf && IS_PF(p_hwfn->cdev))
+ +		qed_cxt_release_cid(p_hwfn, p_cid->cid);
+++=======
++ 	bool b_legacy_vf = !!(p_cid->vf_legacy & QED_QCID_LEGACY_VF_CID);
++ 
++ 	if (IS_PF(p_hwfn->cdev) && !b_legacy_vf)
++ 		_qed_cxt_release_cid(p_hwfn, p_cid->cid, p_cid->vfid);
++ 
++ 	/* For PF's VFs we maintain the index inside queue-zone in IOV */
++ 	if (p_cid->vfid == QED_QUEUE_CID_SELF)
++ 		qed_eth_queue_qid_usage_del(p_hwfn, p_cid);
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	vfree(p_cid);
+  }
+  
+@@@ -158,28 -311,47 +170,61 @@@ fail
+  	return NULL;
+  }
+  
+ -struct qed_queue_cid *
+ -qed_eth_queue_to_cid(struct qed_hwfn *p_hwfn,
+ -		     u16 opaque_fid,
+ -		     struct qed_queue_start_common_params *p_params,
+ -		     bool b_is_rx,
+ -		     struct qed_queue_cid_vf_params *p_vf_params)
+ +static struct qed_queue_cid *qed_eth_queue_to_cid(struct qed_hwfn *p_hwfn,
+ +						  u16 opaque_fid, struct
+ +						  qed_queue_start_common_params
+ +						  *p_params)
+  {
+  	struct qed_queue_cid *p_cid;
+++<<<<<<< HEAD
+++	u32 cid = 0;
+++
+++=======
++ 	u8 vfid = QED_CXT_PF_CID;
++ 	bool b_legacy_vf = false;
+  	u32 cid = 0;
+  
++ 	/* In case of legacy VFs, The CID can be derived from the additional
++ 	 * VF parameters - the VF assumes queue X uses CID X, so we can simply
++ 	 * use the vf_qid for this purpose as well.
++ 	 */
++ 	if (p_vf_params) {
++ 		vfid = p_vf_params->vfid;
++ 
++ 		if (p_vf_params->vf_legacy & QED_QCID_LEGACY_VF_CID) {
++ 			b_legacy_vf = true;
++ 			cid = p_vf_params->vf_qid;
++ 		}
++ 	}
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	/* Get a unique firmware CID for this queue, in case it's a PF.
+  	 * VF's don't need a CID as the queue configuration will be done
+  	 * by PF.
+  	 */
+++<<<<<<< HEAD
+ +	if (IS_PF(p_hwfn->cdev)) {
+ +		if (qed_cxt_acquire_cid(p_hwfn, PROTOCOLID_ETH, &cid)) {
+++=======
++ 	if (IS_PF(p_hwfn->cdev) && !b_legacy_vf) {
++ 		if (_qed_cxt_acquire_cid(p_hwfn, PROTOCOLID_ETH,
++ 					 &cid, vfid)) {
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  			DP_NOTICE(p_hwfn, "Failed to acquire cid\n");
+  			return NULL;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	p_cid = _qed_eth_queue_to_cid(p_hwfn, opaque_fid, cid, 0, p_params);
+ +	if (!p_cid && IS_PF(p_hwfn->cdev))
+ +		qed_cxt_release_cid(p_hwfn, cid);
+++=======
++ 	p_cid = _qed_eth_queue_to_cid(p_hwfn, opaque_fid, cid,
++ 				      p_params, b_is_rx, p_vf_params);
++ 	if (!p_cid && IS_PF(p_hwfn->cdev) && !b_legacy_vf)
++ 		_qed_cxt_release_cid(p_hwfn, cid, vfid);
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  
+  	return p_cid;
+  }
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.c
+index c231e788de76,c620a5fa250b..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@@ -45,6 -45,21 +45,24 @@@
+  #include "qed_sriov.h"
+  #include "qed_vf.h"
+  
+++<<<<<<< HEAD
+++=======
++ static u8 qed_vf_calculate_legacy(struct qed_vf_info *p_vf)
++ {
++ 	u8 legacy = 0;
++ 
++ 	if (p_vf->acquire.vfdev_info.eth_fp_hsi_minor ==
++ 	    ETH_HSI_VER_NO_PKT_LEN_TUNN)
++ 		legacy |= QED_QCID_LEGACY_VF_RX_PROD;
++ 
++ 	if (!(p_vf->acquire.vfdev_info.capabilities &
++ 	      VFPF_ACQUIRE_CAP_QUEUE_QIDS))
++ 		legacy |= QED_QCID_LEGACY_VF_CID;
++ 
++ 	return legacy;
++ }
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  /* IOV ramrods */
+  static int qed_sp_vf_start(struct qed_hwfn *p_hwfn, struct qed_vf_info *p_vf)
+  {
+@@@ -1978,6 -1991,42 +2009,45 @@@ static void qed_iov_vf_mbx_start_rxq_re
+  	qed_iov_send_response(p_hwfn, p_ptt, vf, length, status);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u8 qed_iov_vf_mbx_qid(struct qed_hwfn *p_hwfn,
++ 			     struct qed_vf_info *p_vf, bool b_is_tx)
++ {
++ 	struct qed_iov_vf_mbx *p_mbx = &p_vf->vf_mbx;
++ 	struct vfpf_qid_tlv *p_qid_tlv;
++ 
++ 	/* Search for the qid if the VF published its going to provide it */
++ 	if (!(p_vf->acquire.vfdev_info.capabilities &
++ 	      VFPF_ACQUIRE_CAP_QUEUE_QIDS)) {
++ 		if (b_is_tx)
++ 			return QED_IOV_LEGACY_QID_TX;
++ 		else
++ 			return QED_IOV_LEGACY_QID_RX;
++ 	}
++ 
++ 	p_qid_tlv = (struct vfpf_qid_tlv *)
++ 		    qed_iov_search_list_tlvs(p_hwfn, p_mbx->req_virt,
++ 					     CHANNEL_TLV_QID);
++ 	if (!p_qid_tlv) {
++ 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 			   "VF[%2x]: Failed to provide qid\n",
++ 			   p_vf->relative_vf_id);
++ 
++ 		return QED_IOV_QID_INVALID;
++ 	}
++ 
++ 	if (p_qid_tlv->qid >= MAX_QUEUES_PER_QZONE) {
++ 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 			   "VF[%02x]: Provided qid out-of-bounds %02x\n",
++ 			   p_vf->relative_vf_id, p_qid_tlv->qid);
++ 		return QED_IOV_QID_INVALID;
++ 	}
++ 
++ 	return p_qid_tlv->qid;
++ }
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  static void qed_iov_vf_mbx_start_rxq(struct qed_hwfn *p_hwfn,
+  				     struct qed_ptt *p_ptt,
+  				     struct qed_vf_info *vf)
+@@@ -1997,9 -2049,17 +2067,18 @@@
+  	    !qed_iov_validate_sb(p_hwfn, vf, req->hw_sb))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	/* Acquire a new queue-cid */
+++=======
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, false);
++ 	if (qid_usage_idx == QED_IOV_QID_INVALID)
++ 		goto out;
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	p_queue = &vf->vf_queues[req->rx_qid];
++ 	if (p_queue->cids[qid_usage_idx].p_cid)
++ 		goto out;
+  
+ -	vf_legacy = qed_vf_calculate_legacy(vf);
+ -
+ -	/* Acquire a new queue-cid */
+  	memset(&params, 0, sizeof(params));
+  	params.queue_id = p_queue->fw_rx_qid;
+  	params.vport_id = vf->vport_id;
+@@@ -2106,9 -2385,17 +2185,18 @@@ static void qed_iov_vf_mbx_start_txq(st
+  	    !qed_iov_validate_sb(p_hwfn, vf, req->hw_sb))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	/* Acquire a new queue-cid */
+++=======
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, true);
++ 	if (qid_usage_idx == QED_IOV_QID_INVALID)
++ 		goto out;
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	p_queue = &vf->vf_queues[req->tx_qid];
++ 	if (p_queue->cids[qid_usage_idx].p_cid)
++ 		goto out;
+  
+ -	vf_legacy = qed_vf_calculate_legacy(vf);
+ -
+ -	/* Acquire a new queue-cid */
+  	params.queue_id = p_queue->fw_tx_qid;
+  	params.vport_id = vf->vport_id;
+  	params.stats_id = vf->abs_vf_id + 0x10;
+@@@ -2139,24 -2436,41 +2227,40 @@@ out
+  
+  static int qed_iov_vf_stop_rxqs(struct qed_hwfn *p_hwfn,
+  				struct qed_vf_info *vf,
+ -				u16 rxq_id,
+ -				u8 qid_usage_idx, bool cqe_completion)
+ +				u16 rxq_id, bool cqe_completion)
+  {
+ -	struct qed_vf_queue *p_queue;
+ +	struct qed_vf_q_info *p_queue;
+  	int rc = 0;
+  
+- 	if (!qed_iov_validate_rxq(p_hwfn, vf, rxq_id,
+- 				  QED_IOV_VALIDATE_Q_ENABLE)) {
++ 	if (!qed_iov_validate_rxq(p_hwfn, vf, rxq_id, QED_IOV_VALIDATE_Q_NA)) {
+  		DP_VERBOSE(p_hwfn,
+  			   QED_MSG_IOV,
+- 			   "VF[%d] Tried Closing Rx 0x%04x which is inactive\n",
+- 			   vf->relative_vf_id, rxq_id);
++ 			   "VF[%d] Tried Closing Rx 0x%04x.%02x which is inactive\n",
++ 			   vf->relative_vf_id, rxq_id, qid_usage_idx);
+  		return -EINVAL;
+  	}
+  
+  	p_queue = &vf->vf_queues[rxq_id];
+  
++ 	/* We've validated the index and the existence of the active RXQ -
++ 	 * now we need to make sure that it's using the correct qid.
++ 	 */
++ 	if (!p_queue->cids[qid_usage_idx].p_cid ||
++ 	    p_queue->cids[qid_usage_idx].b_is_tx) {
++ 		struct qed_queue_cid *p_cid;
++ 
++ 		p_cid = qed_iov_get_vf_rx_queue_cid(p_queue);
++ 		DP_VERBOSE(p_hwfn,
++ 			   QED_MSG_IOV,
++ 			   "VF[%d] - Tried Closing Rx 0x%04x.%02x, but Rx is at %04x.%02x\n",
++ 			   vf->relative_vf_id,
++ 			   rxq_id, qid_usage_idx, rxq_id, p_cid->qid_usage_idx);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Now that we know we have a valid Rx-queue - close it */
+  	rc = qed_eth_rx_queue_stop(p_hwfn,
+ -				   p_queue->cids[qid_usage_idx].p_cid,
+ +				   p_queue->p_rx_cid,
+  				   false, cqe_completion);
+  	if (rc)
+  		return rc;
+@@@ -2168,18 -2482,21 +2272,20 @@@
+  }
+  
+  static int qed_iov_vf_stop_txqs(struct qed_hwfn *p_hwfn,
+ -				struct qed_vf_info *vf,
+ -				u16 txq_id, u8 qid_usage_idx)
+ +				struct qed_vf_info *vf, u16 txq_id)
+  {
+ -	struct qed_vf_queue *p_queue;
+ +	struct qed_vf_q_info *p_queue;
+  	int rc = 0;
+  
+- 	if (!qed_iov_validate_txq(p_hwfn, vf, txq_id,
+- 				  QED_IOV_VALIDATE_Q_ENABLE))
++ 	if (!qed_iov_validate_txq(p_hwfn, vf, txq_id, QED_IOV_VALIDATE_Q_NA))
+  		return -EINVAL;
+  
+  	p_queue = &vf->vf_queues[txq_id];
++ 	if (!p_queue->cids[qid_usage_idx].p_cid ||
++ 	    !p_queue->cids[qid_usage_idx].b_is_tx)
++ 		return -EINVAL;
+  
+ -	rc = qed_eth_tx_queue_stop(p_hwfn, p_queue->cids[qid_usage_idx].p_cid);
+ +	rc = qed_eth_tx_queue_stop(p_hwfn, p_queue->p_tx_cid);
+  	if (rc)
+  		return rc;
+  
+@@@ -2211,8 -2528,13 +2317,16 @@@ static void qed_iov_vf_mbx_stop_rxqs(st
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Find which qid-index is associated with the queue */
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, false);
++ 	if (qid_usage_idx == QED_IOV_QID_INVALID)
++ 		goto out;
++ 
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	rc = qed_iov_vf_stop_rxqs(p_hwfn, vf, req->rx_qid,
+ -				  qid_usage_idx, req->cqe_completion);
+ +				  req->cqe_completion);
+  	if (!rc)
+  		status = PFVF_STATUS_SUCCESS;
+  out:
+@@@ -2242,7 -2565,13 +2356,17 @@@ static void qed_iov_vf_mbx_stop_txqs(st
+  		status = PFVF_STATUS_NOT_SUPPORTED;
+  		goto out;
+  	}
+++<<<<<<< HEAD
+ +	rc = qed_iov_vf_stop_txqs(p_hwfn, vf, req->tx_qid);
+++=======
++ 
++ 	/* Find which qid-index is associated with the queue */
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, true);
++ 	if (qid_usage_idx == QED_IOV_QID_INVALID)
++ 		goto out;
++ 
++ 	rc = qed_iov_vf_stop_txqs(p_hwfn, vf, req->tx_qid, qid_usage_idx);
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	if (!rc)
+  		status = PFVF_STATUS_SUCCESS;
+  
+@@@ -2270,14 -2599,36 +2394,41 @@@ static void qed_iov_vf_mbx_update_rxqs(
+  	complete_cqe_flg = !!(req->flags & VFPF_RXQ_UPD_COMPLETE_CQE_FLAG);
+  	complete_event_flg = !!(req->flags & VFPF_RXQ_UPD_COMPLETE_EVENT_FLAG);
+  
+++<<<<<<< HEAD
+ +	/* Validate inputs */
+ +	for (i = req->rx_qid; i < req->rx_qid + req->num_rxqs; i++)
+++=======
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, false);
++ 	if (qid_usage_idx == QED_IOV_QID_INVALID)
++ 		goto out;
++ 
++ 	/* There shouldn't exist a VF that uses queue-qids yet uses this
++ 	 * API with multiple Rx queues. Validate this.
++ 	 */
++ 	if ((vf->acquire.vfdev_info.capabilities &
++ 	     VFPF_ACQUIRE_CAP_QUEUE_QIDS) && req->num_rxqs != 1) {
++ 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 			   "VF[%d] supports QIDs but sends multiple queues\n",
++ 			   vf->relative_vf_id);
++ 		goto out;
++ 	}
++ 
++ 	/* Validate inputs - for the legacy case this is still true since
++ 	 * qid_usage_idx for each Rx queue would be LEGACY_QID_RX.
++ 	 */
++ 	for (i = req->rx_qid; i < req->rx_qid + req->num_rxqs; i++) {
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  		if (!qed_iov_validate_rxq(p_hwfn, vf, i,
+- 					  QED_IOV_VALIDATE_Q_ENABLE)) {
+- 			DP_INFO(p_hwfn, "VF[%d]: Incorrect Rxqs [%04x, %02x]\n",
+- 				vf->relative_vf_id, req->rx_qid, req->num_rxqs);
++ 					  QED_IOV_VALIDATE_Q_NA) ||
++ 		    !vf->vf_queues[i].cids[qid_usage_idx].p_cid ||
++ 		    vf->vf_queues[i].cids[qid_usage_idx].b_is_tx) {
++ 			DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 				   "VF[%d]: Incorrect Rxqs [%04x, %02x]\n",
++ 				   vf->relative_vf_id, req->rx_qid,
++ 				   req->num_rxqs);
+  			goto out;
+  		}
++ 	}
+  
+  	/* Prepare the handlers */
+  	for (i = 0; i < req->num_rxqs; i++) {
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.h
+index bcff13a4692b,95f55ae2ee8b..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.h
+@@@ -141,12 -149,21 +141,26 @@@ struct qed_iov_vf_mbx 
+  	struct vfpf_first_tlv first_tlv;
+  };
+  
+++<<<<<<< HEAD
+ +struct qed_vf_q_info {
+++=======
++ #define QED_IOV_LEGACY_QID_RX (0)
++ #define QED_IOV_LEGACY_QID_TX (1)
++ #define QED_IOV_QID_INVALID (0xFE)
++ 
++ struct qed_vf_queue_cid {
++ 	bool b_is_tx;
++ 	struct qed_queue_cid *p_cid;
++ };
++ 
++ /* Describes a qzone associated with the VF */
++ struct qed_vf_queue {
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	u16 fw_rx_qid;
+ +	struct qed_queue_cid *p_rx_cid;
+  	u16 fw_tx_qid;
+ -
+ -	struct qed_vf_queue_cid cids[MAX_QUEUES_PER_QZONE];
+ +	struct qed_queue_cid *p_tx_cid;
+ +	u8 fw_cid;
+  };
+  
+  enum vf_state {
+diff --cc drivers/net/ethernet/qlogic/qed/qed_vf.h
+index 105c0edd2a01,9588ae779267..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+@@@ -555,6 -616,9 +575,12 @@@ enum 
+  	CHANNEL_TLV_VPORT_UPDATE_RSS,
+  	CHANNEL_TLV_VPORT_UPDATE_ACCEPT_ANY_VLAN,
+  	CHANNEL_TLV_VPORT_UPDATE_SGE_TPA,
+++<<<<<<< HEAD
+++=======
++ 	CHANNEL_TLV_UPDATE_TUNN_PARAM,
++ 	CHANNEL_TLV_RESERVED,
++ 	CHANNEL_TLV_QID,
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  	CHANNEL_TLV_MAX,
+  
+  	/* Required for iterating over vport-update tlvs.
+diff --cc include/linux/qed/qed_if.h
+index cbe538f3b78a,74f6b99754aa..000000000000
+--- a/include/linux/qed/qed_if.h
++++ b/include/linux/qed/qed_if.h
+@@@ -179,6 -184,16 +179,19 @@@ struct qed_eth_pf_params 
+  	 * to update_pf_params routine invoked before slowpath start
+  	 */
+  	u16 num_cons;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* per-VF number of CIDs */
++ 	u8 num_vf_cons;
++ #define ETH_PF_PARAMS_VF_CONS_DEFAULT	(32)
++ 
++ 	/* To enable arfs, previous to HW-init a positive number needs to be
++ 	 * set [as filters require allocated searcher ILT memory].
++ 	 * This will set the maximal number of configured steering-filters.
++ 	 */
++ 	u32 num_arfs_filters;
+++>>>>>>> 08bc8f15e69c (qed: Multiple qzone queues for VFs)
+  };
+  
+  struct qed_fcoe_pf_params {
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_cxt.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.h
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.c b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+index f2954eb03b41..d2af777e1cde 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@ -153,6 +153,22 @@ static int qed_send_msg2pf(struct qed_hwfn *p_hwfn, u8 *done, u32 resp_size)
+ 	return rc;
+ }
+ 
++static void qed_vf_pf_add_qid(struct qed_hwfn *p_hwfn,
++			      struct qed_queue_cid *p_cid)
++{
++	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
++	struct vfpf_qid_tlv *p_qid_tlv;
++
++	/* Only add QIDs for the queue if it was negotiated with PF */
++	if (!(p_iov->acquire_resp.pfdev_info.capabilities &
++	      PFVF_ACQUIRE_CAP_QUEUE_QIDS))
++		return;
++
++	p_qid_tlv = qed_add_tlv(p_hwfn, &p_iov->offset,
++				CHANNEL_TLV_QID, sizeof(*p_qid_tlv));
++	p_qid_tlv->qid = p_cid->qid_usage_idx;
++}
++
+ #define VF_ACQUIRE_THRESH 3
+ static void qed_vf_pf_acquire_reduce_resc(struct qed_hwfn *p_hwfn,
+ 					  struct vf_pf_resc_request *p_req,
+@@ -160,7 +176,7 @@ static void qed_vf_pf_acquire_reduce_resc(struct qed_hwfn *p_hwfn,
+ {
+ 	DP_VERBOSE(p_hwfn,
+ 		   QED_MSG_IOV,
+-		   "PF unwilling to fullill resource request: rxq [%02x/%02x] txq [%02x/%02x] sbs [%02x/%02x] mac [%02x/%02x] vlan [%02x/%02x] mc [%02x/%02x]. Try PF recommended amount\n",
++		   "PF unwilling to fullill resource request: rxq [%02x/%02x] txq [%02x/%02x] sbs [%02x/%02x] mac [%02x/%02x] vlan [%02x/%02x] mc [%02x/%02x] cids [%02x/%02x]. Try PF recommended amount\n",
+ 		   p_req->num_rxqs,
+ 		   p_resp->num_rxqs,
+ 		   p_req->num_rxqs,
+@@ -171,7 +187,8 @@ static void qed_vf_pf_acquire_reduce_resc(struct qed_hwfn *p_hwfn,
+ 		   p_resp->num_mac_filters,
+ 		   p_req->num_vlan_filters,
+ 		   p_resp->num_vlan_filters,
+-		   p_req->num_mc_filters, p_resp->num_mc_filters);
++		   p_req->num_mc_filters,
++		   p_resp->num_mc_filters, p_req->num_cids, p_resp->num_cids);
+ 
+ 	/* humble our request */
+ 	p_req->num_txqs = p_resp->num_txqs;
+@@ -180,6 +197,7 @@ static void qed_vf_pf_acquire_reduce_resc(struct qed_hwfn *p_hwfn,
+ 	p_req->num_mac_filters = p_resp->num_mac_filters;
+ 	p_req->num_vlan_filters = p_resp->num_vlan_filters;
+ 	p_req->num_mc_filters = p_resp->num_mc_filters;
++	p_req->num_cids = p_resp->num_cids;
+ }
+ 
+ static int qed_vf_pf_acquire(struct qed_hwfn *p_hwfn)
+@@ -204,6 +222,7 @@ static int qed_vf_pf_acquire(struct qed_hwfn *p_hwfn)
+ 	p_resc->num_sbs = QED_MAX_VF_CHAINS_PER_PF;
+ 	p_resc->num_mac_filters = QED_ETH_VF_NUM_MAC_FILTERS;
+ 	p_resc->num_vlan_filters = QED_ETH_VF_NUM_VLAN_FILTERS;
++	p_resc->num_cids = QED_ETH_VF_DEFAULT_NUM_CIDS;
+ 
+ 	req->vfdev_info.os_type = VFPF_ACQUIRE_OS_LINUX;
+ 	req->vfdev_info.fw_major = FW_MAJOR_VERSION;
+@@ -307,6 +326,13 @@ static int qed_vf_pf_acquire(struct qed_hwfn *p_hwfn)
+ 	if (req->vfdev_info.capabilities & VFPF_ACQUIRE_CAP_PRE_FP_HSI)
+ 		p_iov->b_pre_fp_hsi = true;
+ 
++	/* In case PF doesn't support multi-queue Tx, update the number of
++	 * CIDs to reflect the number of queues [older PFs didn't fill that
++	 * field].
++	 */
++	if (!(resp->pfdev_info.capabilities & PFVF_ACQUIRE_CAP_QUEUE_QIDS))
++		resp->resc.num_cids = resp->resc.num_rxqs + resp->resc.num_txqs;
++
+ 	/* Update bulletin board size with response from PF */
+ 	p_iov->bulletin.size = resp->bulletin_size;
+ 
+@@ -460,6 +486,9 @@ qed_vf_pf_rxq_start(struct qed_hwfn *p_hwfn,
+ 		__internal_ram_wr(p_hwfn, *pp_prod, sizeof(u32),
+ 				  (u32 *)(&init_prod_val));
+ 	}
++
++	qed_vf_pf_add_qid(p_hwfn, p_cid);
++
+ 	/* add list termination tlv */
+ 	qed_add_tlv(p_hwfn, &p_iov->offset,
+ 		    CHANNEL_TLV_LIST_END, sizeof(struct channel_list_end_tlv));
+@@ -508,6 +537,8 @@ int qed_vf_pf_rxq_stop(struct qed_hwfn *p_hwfn,
+ 	req->num_rxqs = 1;
+ 	req->cqe_completion = cqe_completion;
+ 
++	qed_vf_pf_add_qid(p_hwfn, p_cid);
++
+ 	/* add list termination tlv */
+ 	qed_add_tlv(p_hwfn, &p_iov->offset,
+ 		    CHANNEL_TLV_LIST_END, sizeof(struct channel_list_end_tlv));
+@@ -551,6 +582,8 @@ qed_vf_pf_txq_start(struct qed_hwfn *p_hwfn,
+ 	req->hw_sb = p_cid->rel.sb;
+ 	req->sb_index = p_cid->rel.sb_idx;
+ 
++	qed_vf_pf_add_qid(p_hwfn, p_cid);
++
+ 	/* add list termination tlv */
+ 	qed_add_tlv(p_hwfn, &p_iov->offset,
+ 		    CHANNEL_TLV_LIST_END, sizeof(struct channel_list_end_tlv));
+@@ -600,6 +633,8 @@ int qed_vf_pf_txq_stop(struct qed_hwfn *p_hwfn, struct qed_queue_cid *p_cid)
+ 	req->tx_qid = p_cid->rel.queue_id;
+ 	req->num_txqs = 1;
+ 
++	qed_vf_pf_add_qid(p_hwfn, p_cid);
++
+ 	/* add list termination tlv */
+ 	qed_add_tlv(p_hwfn, &p_iov->offset,
+ 		    CHANNEL_TLV_LIST_END, sizeof(struct channel_list_end_tlv));
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_vf.h
+* Unmerged path include/linux/qed/qed_if.h
