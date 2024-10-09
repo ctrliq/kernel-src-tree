@@ -1,0 +1,190 @@
+vfs: Fix EOVERFLOW testing in put_compat_statfs64
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Eric Sandeen <sandeen@redhat.com>
+commit cc3a7bfe62b947b423fcb2cfe89fcba92bf48fa3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/cc3a7bfe.failed
+
+Today, put_compat_statfs64() disallows nearly any field value over
+2^32 if f_bsize is only 32 bits, but that makes no sense.
+compat_statfs64 is there for the explicit purpose of providing 64-bit
+fields for f_files, f_ffree, etc.  And f_bsize is always only 32 bits.
+
+As a result, 32-bit userspace gets -EOVERFLOW for i.e.  large file
+counts even with -D_FILE_OFFSET_BITS=64 set.
+
+In reality, only f_bsize and f_frsize can legitimately overflow
+(fields like f_type and f_namelen should never be large), so test
+only those fields.
+
+This bug was discussed at length some time ago, and this is the proposal
+Al suggested at https://lkml.org/lkml/2018/8/6/640.  It seemed to get
+dropped amid the discussion of other related changes, but this
+part seems obviously correct on its own, so I've picked it up and
+sent it, for expediency.
+
+Fixes: 64d2ab32efe3 ("vfs: fix put_compat_statfs64() does not handle errors")
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cc3a7bfe62b947b423fcb2cfe89fcba92bf48fa3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/statfs.c
+diff --cc fs/statfs.c
+index f4d3f4a03129,2616424012ea..000000000000
+--- a/fs/statfs.c
++++ b/fs/statfs.c
+@@@ -241,3 -257,145 +241,148 @@@ SYSCALL_DEFINE2(ustat, unsigned, dev, s
+  
+  	return copy_to_user(ubuf, &tmp, sizeof(struct ustat)) ? -EFAULT : 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_COMPAT
++ static int put_compat_statfs(struct compat_statfs __user *ubuf, struct kstatfs *kbuf)
++ {
++ 	struct compat_statfs buf;
++ 	if (sizeof ubuf->f_blocks == 4) {
++ 		if ((kbuf->f_blocks | kbuf->f_bfree | kbuf->f_bavail |
++ 		     kbuf->f_bsize | kbuf->f_frsize) & 0xffffffff00000000ULL)
++ 			return -EOVERFLOW;
++ 		/* f_files and f_ffree may be -1; it's okay
++ 		 * to stuff that into 32 bits */
++ 		if (kbuf->f_files != 0xffffffffffffffffULL
++ 		 && (kbuf->f_files & 0xffffffff00000000ULL))
++ 			return -EOVERFLOW;
++ 		if (kbuf->f_ffree != 0xffffffffffffffffULL
++ 		 && (kbuf->f_ffree & 0xffffffff00000000ULL))
++ 			return -EOVERFLOW;
++ 	}
++ 	memset(&buf, 0, sizeof(struct compat_statfs));
++ 	buf.f_type = kbuf->f_type;
++ 	buf.f_bsize = kbuf->f_bsize;
++ 	buf.f_blocks = kbuf->f_blocks;
++ 	buf.f_bfree = kbuf->f_bfree;
++ 	buf.f_bavail = kbuf->f_bavail;
++ 	buf.f_files = kbuf->f_files;
++ 	buf.f_ffree = kbuf->f_ffree;
++ 	buf.f_namelen = kbuf->f_namelen;
++ 	buf.f_fsid.val[0] = kbuf->f_fsid.val[0];
++ 	buf.f_fsid.val[1] = kbuf->f_fsid.val[1];
++ 	buf.f_frsize = kbuf->f_frsize;
++ 	buf.f_flags = kbuf->f_flags;
++ 	if (copy_to_user(ubuf, &buf, sizeof(struct compat_statfs)))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
++ /*
++  * The following statfs calls are copies of code from fs/statfs.c and
++  * should be checked against those from time to time
++  */
++ COMPAT_SYSCALL_DEFINE2(statfs, const char __user *, pathname, struct compat_statfs __user *, buf)
++ {
++ 	struct kstatfs tmp;
++ 	int error = user_statfs(pathname, &tmp);
++ 	if (!error)
++ 		error = put_compat_statfs(buf, &tmp);
++ 	return error;
++ }
++ 
++ COMPAT_SYSCALL_DEFINE2(fstatfs, unsigned int, fd, struct compat_statfs __user *, buf)
++ {
++ 	struct kstatfs tmp;
++ 	int error = fd_statfs(fd, &tmp);
++ 	if (!error)
++ 		error = put_compat_statfs(buf, &tmp);
++ 	return error;
++ }
++ 
++ static int put_compat_statfs64(struct compat_statfs64 __user *ubuf, struct kstatfs *kbuf)
++ {
++ 	struct compat_statfs64 buf;
++ 
++ 	if ((kbuf->f_bsize | kbuf->f_frsize) & 0xffffffff00000000ULL)
++ 		return -EOVERFLOW;
++ 
++ 	memset(&buf, 0, sizeof(struct compat_statfs64));
++ 	buf.f_type = kbuf->f_type;
++ 	buf.f_bsize = kbuf->f_bsize;
++ 	buf.f_blocks = kbuf->f_blocks;
++ 	buf.f_bfree = kbuf->f_bfree;
++ 	buf.f_bavail = kbuf->f_bavail;
++ 	buf.f_files = kbuf->f_files;
++ 	buf.f_ffree = kbuf->f_ffree;
++ 	buf.f_namelen = kbuf->f_namelen;
++ 	buf.f_fsid.val[0] = kbuf->f_fsid.val[0];
++ 	buf.f_fsid.val[1] = kbuf->f_fsid.val[1];
++ 	buf.f_frsize = kbuf->f_frsize;
++ 	buf.f_flags = kbuf->f_flags;
++ 	if (copy_to_user(ubuf, &buf, sizeof(struct compat_statfs64)))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
++ int kcompat_sys_statfs64(const char __user * pathname, compat_size_t sz, struct compat_statfs64 __user * buf)
++ {
++ 	struct kstatfs tmp;
++ 	int error;
++ 
++ 	if (sz != sizeof(*buf))
++ 		return -EINVAL;
++ 
++ 	error = user_statfs(pathname, &tmp);
++ 	if (!error)
++ 		error = put_compat_statfs64(buf, &tmp);
++ 	return error;
++ }
++ 
++ COMPAT_SYSCALL_DEFINE3(statfs64, const char __user *, pathname, compat_size_t, sz, struct compat_statfs64 __user *, buf)
++ {
++ 	return kcompat_sys_statfs64(pathname, sz, buf);
++ }
++ 
++ int kcompat_sys_fstatfs64(unsigned int fd, compat_size_t sz, struct compat_statfs64 __user * buf)
++ {
++ 	struct kstatfs tmp;
++ 	int error;
++ 
++ 	if (sz != sizeof(*buf))
++ 		return -EINVAL;
++ 
++ 	error = fd_statfs(fd, &tmp);
++ 	if (!error)
++ 		error = put_compat_statfs64(buf, &tmp);
++ 	return error;
++ }
++ 
++ COMPAT_SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, compat_size_t, sz, struct compat_statfs64 __user *, buf)
++ {
++ 	return kcompat_sys_fstatfs64(fd, sz, buf);
++ }
++ 
++ /*
++  * This is a copy of sys_ustat, just dealing with a structure layout.
++  * Given how simple this syscall is that apporach is more maintainable
++  * than the various conversion hacks.
++  */
++ COMPAT_SYSCALL_DEFINE2(ustat, unsigned, dev, struct compat_ustat __user *, u)
++ {
++ 	struct compat_ustat tmp;
++ 	struct kstatfs sbuf;
++ 	int err = vfs_ustat(new_decode_dev(dev), &sbuf);
++ 	if (err)
++ 		return err;
++ 
++ 	memset(&tmp, 0, sizeof(struct compat_ustat));
++ 	tmp.f_tfree = sbuf.f_bfree;
++ 	tmp.f_tinode = sbuf.f_ffree;
++ 	if (copy_to_user(u, &tmp, sizeof(struct compat_ustat)))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ #endif
+++>>>>>>> cc3a7bfe62b9 (vfs: Fix EOVERFLOW testing in put_compat_statfs64)
+* Unmerged path fs/statfs.c
