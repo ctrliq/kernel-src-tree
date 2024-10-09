@@ -3181,6 +3181,7 @@ int devlink_resource_register(struct devlink *devlink,
 			resource_list = &parent_resource->resource_list;
 			resource->parent = parent_resource;
 		} else {
+			kfree(resource);
 			err = -EINVAL;
 			goto out;
 		}
