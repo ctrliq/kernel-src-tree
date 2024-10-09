@@ -1,0 +1,593 @@
+geneve: Unify LWT and netdev handling.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] geneve: Unify LWT and netdev handling (Jakub Sitnicki) [1467288]
+Rebuild_FUZZ: 98.67%
+commit-author pravin shelar <pshelar@ovn.org>
+commit 9b4437a5b870cb3875a63beceae5d1984ee19a22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9b4437a5.failed
+
+Current geneve implementation has two separate cases to handle.
+1. netdev xmit
+2. LWT xmit.
+
+In case of netdev, geneve configuration is stored in various
+struct geneve_dev members. For example geneve_addr, ttl, tos,
+label, flags, dst_cache, etc. For LWT ip_tunnel_info is passed
+to the device in ip_tunnel_info.
+
+Following patch uses ip_tunnel_info struct to store almost all
+of configuration of a geneve netdevice. This allows us to unify
+most of geneve driver code around ip_tunnel_info struct.
+This dramatically simplify geneve code, since it does not
+need to handle two different configuration cases. Removes
+duplicate code, single code path can handle either type
+of geneve devices.
+
+	Signed-off-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9b4437a5b870cb3875a63beceae5d1984ee19a22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+diff --cc drivers/net/geneve.c
+index c4c93ccffa85,70f2a32804cb..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -43,51 -43,24 +43,47 @@@ struct geneve_net 
+  	struct list_head	sock_list;
+  };
+  
+ -static unsigned int geneve_net_id;
+ +static int geneve_net_id;
+  
+++<<<<<<< HEAD
+ +union geneve_addr {
+ +	struct sockaddr_in sin;
+ +	struct sockaddr_in6 sin6;
+ +	struct sockaddr sa;
+ +};
+ +
+ +static union geneve_addr geneve_remote_unspec = { .sa.sa_family = AF_UNSPEC, };
+ +
+ +struct geneve_dev_node {
+ +	struct hlist_node hlist;
+ +	struct geneve_dev *geneve;
+ +};
+ +
+++=======
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  /* Pseudo network device */
+  struct geneve_dev {
+ -	struct hlist_node  hlist;	/* vni hash table */
+ +	struct geneve_dev_node hlist4;	/* vni hash table for IPv4 socket */
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	struct geneve_dev_node hlist6;	/* vni hash table for IPv6 socket */
+ +#endif
+  	struct net	   *net;	/* netns for packet i/o */
+  	struct net_device  *dev;	/* netdev for geneve tunnel */
+++<<<<<<< HEAD
+ +	struct geneve_sock *sock4;	/* IPv4 socket used for geneve tunnel */
+++=======
++ 	struct ip_tunnel_info info;
++ 	struct geneve_sock __rcu *sock4;	/* IPv4 socket used for geneve tunnel */
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  #if IS_ENABLED(CONFIG_IPV6)
+ -	struct geneve_sock __rcu *sock6;	/* IPv6 socket used for geneve tunnel */
+ +	struct geneve_sock *sock6;	/* IPv6 socket used for geneve tunnel */
+  #endif
+- 	u8                 vni[3];	/* virtual network ID for tunnel */
+- 	u8                 ttl;		/* TTL override */
+- 	u8                 tos;		/* TOS override */
+- 	union geneve_addr  remote;	/* IP address for link partner */
+  	struct list_head   next;	/* geneve's per namespace list */
+- 	__be32		   label;	/* IPv6 flowlabel override */
+- 	__be16		   dst_port;
+- 	bool		   collect_md;
+  	struct gro_cells   gro_cells;
+- 	u32		   flags;
+- 	struct dst_cache   dst_cache;
++ 	bool		   collect_md;
++ 	bool		   use_udp6_rx_checksums;
+  };
+  
+- /* Geneve device flags */
+- #define GENEVE_F_UDP_ZERO_CSUM_TX	BIT(0)
+- #define GENEVE_F_UDP_ZERO_CSUM6_TX	BIT(1)
+- #define GENEVE_F_UDP_ZERO_CSUM6_RX	BIT(2)
+- 
+  struct geneve_sock {
+  	bool			collect_md;
+  	struct list_head	list;
+@@@ -125,17 -111,18 +134,25 @@@ static sa_family_t geneve_get_sk_family
+  static struct geneve_dev *geneve_lookup(struct geneve_sock *gs,
+  					__be32 addr, u8 vni[])
+  {
++ 	__be64 id = vni_to_tunnel_id(vni);
+  	struct hlist_head *vni_list_head;
+ -	struct geneve_dev *geneve;
+ +	struct geneve_dev_node *node;
+  	__u32 hash;
+  
+  	/* Find the device for this VNI */
+  	hash = geneve_net_vni_hash(vni);
+  	vni_list_head = &gs->vni_list[hash];
+++<<<<<<< HEAD
+ +	hlist_for_each_entry_rcu(node, vni_list_head, hlist) {
+ +		if (!memcmp(vni, node->geneve->vni, sizeof(node->geneve->vni)) &&
+ +		    addr == node->geneve->remote.sin.sin_addr.s_addr)
+ +			return node->geneve;
+++=======
++ 	hlist_for_each_entry_rcu(geneve, vni_list_head, hlist) {
++ 		if (!memcmp(&id, &geneve->info.key.tun_id, sizeof(id)) &&
++ 		    addr == geneve->info.key.u.ipv4.dst)
++ 			return geneve;
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	}
+  	return NULL;
+  }
+@@@ -144,17 -131,18 +161,25 @@@
+  static struct geneve_dev *geneve6_lookup(struct geneve_sock *gs,
+  					 struct in6_addr addr6, u8 vni[])
+  {
++ 	__be64 id = vni_to_tunnel_id(vni);
+  	struct hlist_head *vni_list_head;
+ -	struct geneve_dev *geneve;
+ +	struct geneve_dev_node *node;
+  	__u32 hash;
+  
+  	/* Find the device for this VNI */
+  	hash = geneve_net_vni_hash(vni);
+  	vni_list_head = &gs->vni_list[hash];
+++<<<<<<< HEAD
+ +	hlist_for_each_entry_rcu(node, vni_list_head, hlist) {
+ +		if (!memcmp(vni, node->geneve->vni, sizeof(node->geneve->vni)) &&
+ +		    ipv6_addr_equal(&addr6, &node->geneve->remote.sin6.sin6_addr))
+ +			return node->geneve;
+++=======
++ 	hlist_for_each_entry_rcu(geneve, vni_list_head, hlist) {
++ 		if (!memcmp(&id, &geneve->info.key.tun_id, sizeof(id)) &&
++ 		    ipv6_addr_equal(&addr6, &geneve->info.key.u.ipv6.dst))
++ 			return geneve;
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	}
+  	return NULL;
+  }
+@@@ -576,11 -570,11 +597,12 @@@ static int geneve_sock_add(struct genev
+  {
+  	struct net *net = geneve->net;
+  	struct geneve_net *gn = net_generic(net, geneve_net_id);
+ +	struct geneve_dev_node *node;
+  	struct geneve_sock *gs;
++ 	__u8 vni[3];
+  	__u32 hash;
+  
+- 	gs = geneve_find_sock(gn, ipv6 ? AF_INET6 : AF_INET, geneve->dst_port);
++ 	gs = geneve_find_sock(gn, ipv6 ? AF_INET6 : AF_INET, geneve->info.key.tp_dst);
+  	if (gs) {
+  		gs->refcnt++;
+  		goto out;
+@@@ -592,21 -587,16 +615,26 @@@
+  
+  out:
+  	gs->collect_md = geneve->collect_md;
+- 	gs->flags = geneve->flags;
+  #if IS_ENABLED(CONFIG_IPV6)
+ -	if (ipv6)
+ -		rcu_assign_pointer(geneve->sock6, gs);
+ -	else
+ +	if (ipv6) {
+ +		geneve->sock6 = gs;
+ +		node = &geneve->hlist6;
+ +	} else
+  #endif
+ -		rcu_assign_pointer(geneve->sock4, gs);
+ +	{
+ +		geneve->sock4 = gs;
+ +		node = &geneve->hlist4;
+ +	}
+ +	node->geneve = geneve;
+  
+++<<<<<<< HEAD
+ +	hash = geneve_net_vni_hash(geneve->vni);
+ +	hlist_add_head_rcu(&node->hlist, &gs->vni_list[hash]);
+++=======
++ 	tunnel_id_to_vni(geneve->info.key.tun_id, vni);
++ 	hash = geneve_net_vni_hash(vni);
++ 	hlist_add_head_rcu(&geneve->hlist, &gs->vni_list[hash]);
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	return 0;
+  }
+  
+@@@ -840,191 -811,101 +846,217 @@@ static struct dst_entry *geneve_get_v6_
+  }
+  #endif
+  
+- /* Convert 64 bit tunnel ID to 24 bit VNI. */
+- static void tunnel_id_to_vni(__be64 tun_id, __u8 *vni)
++ static int geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
++ 			   struct geneve_dev *geneve, struct ip_tunnel_info *info)
+  {
+++<<<<<<< HEAD
+ +#ifdef __BIG_ENDIAN
+ +	vni[0] = (__force __u8)(tun_id >> 16);
+ +	vni[1] = (__force __u8)(tun_id >> 8);
+ +	vni[2] = (__force __u8)tun_id;
+ +#else
+ +	vni[0] = (__force __u8)((__force u64)tun_id >> 40);
+ +	vni[1] = (__force __u8)((__force u64)tun_id >> 48);
+ +	vni[2] = (__force __u8)((__force u64)tun_id >> 56);
+ +#endif
+ +}
+ +
+ +static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ +				   struct ip_tunnel_info *info)
+ +{
+ +	struct geneve_dev *geneve = netdev_priv(dev);
+ +	struct geneve_sock *gs4 = geneve->sock4;
+ +	struct rtable *rt = NULL;
+++=======
++ 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
++ 	struct geneve_sock *gs4 = rcu_dereference(geneve->sock4);
++ 	const struct ip_tunnel_key *key = &info->key;
++ 	struct rtable *rt;
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	int err = -EINVAL;
+  	struct flowi4 fl4;
++ 	u8 *opts = NULL;
+  	__u8 tos, ttl;
+  	__be16 sport;
+  	__be16 df;
+- 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
+- 	u32 flags = geneve->flags;
++ 	u8 vni[3];
+  
+++<<<<<<< HEAD
+ +	if (geneve->collect_md) {
+ +		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
+ +			netdev_dbg(dev, "no tunnel metadata\n");
+ +			goto tx_error;
+ +		}
+ +		if (info && ip_tunnel_info_af(info) != AF_INET)
+ +			goto tx_error;
+ +	}
+++=======
++ 	if (!gs4)
++ 		return err;
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  
+  	rt = geneve_get_v4_rt(skb, dev, &fl4, info);
+- 	if (IS_ERR(rt)) {
+- 		err = PTR_ERR(rt);
+- 		goto tx_error;
+- 	}
++ 	if (IS_ERR(rt))
++ 		return PTR_ERR(rt);
+  
+  	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+++<<<<<<< HEAD
+ +	skb_reset_mac_header(skb);
+ +
+ +	if (info) {
+ +		const struct ip_tunnel_key *key = &info->key;
+ +		u8 *opts = NULL;
+ +		u8 vni[3];
+ +
+ +		tunnel_id_to_vni(key->tun_id, vni);
+ +		if (info->options_len)
+ +			opts = ip_tunnel_info_opts(info);
+ +
+ +		if (key->tun_flags & TUNNEL_CSUM)
+ +			flags &= ~GENEVE_F_UDP_ZERO_CSUM_TX;
+ +		else
+ +			flags |= GENEVE_F_UDP_ZERO_CSUM_TX;
+ +
+ +		err = geneve_build_skb(rt, skb, key->tun_flags, vni,
+ +				       info->options_len, opts, flags, xnet);
+ +		if (unlikely(err))
+ +			goto tx_error;
+ +
+++=======
++ 	if (geneve->collect_md) {
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  		tos = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
+  		ttl = key->ttl;
+- 		df = key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+  	} else {
+++<<<<<<< HEAD
+ +		err = geneve_build_skb(rt, skb, 0, geneve->vni,
+ +				       0, NULL, flags, xnet);
+ +		if (unlikely(err))
+ +			goto tx_error;
+ +
+ +		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, ip_hdr(skb), skb);
+ +		ttl = geneve->ttl;
+ +		if (!ttl && IN_MULTICAST(ntohl(fl4.daddr)))
+ +			ttl = 1;
+ +		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ +		df = 0;
+++=======
++ 		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, ip_hdr(skb), skb);
++ 		ttl = key->ttl ? : ip4_dst_hoplimit(&rt->dst);
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	}
+- 	udp_tunnel_xmit_skb(rt, gs4->sock->sk, skb, fl4.saddr, fl4.daddr,
+- 			    tos, ttl, df, sport, geneve->dst_port,
+- 			    !net_eq(geneve->net, dev_net(geneve->dev)),
+- 			    !!(flags & GENEVE_F_UDP_ZERO_CSUM_TX));
+- 
+- 	return NETDEV_TX_OK;
++ 	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+  
+- tx_error:
+- 	dev_kfree_skb(skb);
++ 	tunnel_id_to_vni(key->tun_id, vni);
++ 	if (info->options_len)
++ 		opts = ip_tunnel_info_opts(info);
+  
+- 	if (err == -ELOOP)
+- 		dev->stats.collisions++;
+- 	else if (err == -ENETUNREACH)
+- 		dev->stats.tx_carrier_errors++;
++ 	skb_reset_mac_header(skb);
++ 	err = geneve_build_skb(rt, skb, key->tun_flags, vni,
++ 			       info->options_len, opts, xnet);
++ 	if (unlikely(err))
++ 		return err;
+  
+- 	dev->stats.tx_errors++;
+- 	return NETDEV_TX_OK;
++ 	udp_tunnel_xmit_skb(rt, gs4->sock->sk, skb, fl4.saddr, fl4.daddr,
++ 			    tos, ttl, df, sport, geneve->info.key.tp_dst,
++ 			    !net_eq(geneve->net, dev_net(geneve->dev)),
++ 			    !(info->key.tun_flags & TUNNEL_CSUM));
++ 	return 0;
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+- static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+- 				    struct ip_tunnel_info *info)
++ static int geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
++ 			    struct geneve_dev *geneve, struct ip_tunnel_info *info)
+  {
+++<<<<<<< HEAD
+ +	struct geneve_dev *geneve = netdev_priv(dev);
+ +	struct geneve_sock *gs6 = geneve->sock6;
+++=======
++ 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
++ 	struct geneve_sock *gs6 = rcu_dereference(geneve->sock6);
++ 	const struct ip_tunnel_key *key = &info->key;
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	struct dst_entry *dst = NULL;
+  	int err = -EINVAL;
+  	struct flowi6 fl6;
++ 	u8 *opts = NULL;
+  	__u8 prio, ttl;
+  	__be16 sport;
+- 	__be32 label;
+- 	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
+- 	u32 flags = geneve->flags;
++ 	u8 vni[3];
+  
+++<<<<<<< HEAD
+ +	if (geneve->collect_md) {
+ +		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
+ +			netdev_dbg(dev, "no tunnel metadata\n");
+ +			goto tx_error;
+ +		}
+ +	}
+++=======
++ 	if (!gs6)
++ 		return err;
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  
+  	dst = geneve_get_v6_dst(skb, dev, &fl6, info);
+- 	if (IS_ERR(dst)) {
+- 		err = PTR_ERR(dst);
+- 		goto tx_error;
+- 	}
++ 	if (IS_ERR(dst))
++ 		return PTR_ERR(dst);
+  
+  	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+++<<<<<<< HEAD
+ +	skb_reset_mac_header(skb);
+ +
+ +	if (info) {
+ +		const struct ip_tunnel_key *key = &info->key;
+ +		u8 *opts = NULL;
+ +		u8 vni[3];
+ +
+ +		tunnel_id_to_vni(key->tun_id, vni);
+ +		if (info->options_len)
+ +			opts = ip_tunnel_info_opts(info);
+ +
+ +		if (key->tun_flags & TUNNEL_CSUM)
+ +			flags &= ~GENEVE_F_UDP_ZERO_CSUM6_TX;
+ +		else
+ +			flags |= GENEVE_F_UDP_ZERO_CSUM6_TX;
+ +
+ +		err = geneve6_build_skb(dst, skb, key->tun_flags, vni,
+ +					info->options_len, opts,
+ +					flags, xnet);
+ +		if (unlikely(err))
+ +			goto tx_error;
+ +
+++=======
++ 	if (geneve->collect_md) {
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  		prio = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
+  		ttl = key->ttl;
+- 		label = info->key.label;
+  	} else {
+- 		err = geneve6_build_skb(dst, skb, 0, geneve->vni,
+- 					0, NULL, flags, xnet);
+- 		if (unlikely(err))
+- 			goto tx_error;
+- 
+  		prio = ip_tunnel_ecn_encap(ip6_tclass(fl6.flowlabel),
+  					   ip_hdr(skb), skb);
+++<<<<<<< HEAD
+ +		ttl = geneve->ttl;
+ +		if (!ttl && ipv6_addr_is_multicast(&fl6.daddr))
+ +			ttl = 1;
+ +		ttl = ttl ? : ip6_dst_hoplimit(dst);
+ +		label = geneve->label;
+++=======
++ 		ttl = key->ttl ? : ip6_dst_hoplimit(dst);
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  	}
++ 	tunnel_id_to_vni(key->tun_id, vni);
++ 	if (info->options_len)
++ 		opts = ip_tunnel_info_opts(info);
+  
+- 	udp_tunnel6_xmit_skb(dst, gs6->sock->sk, skb, dev,
+- 			     &fl6.saddr, &fl6.daddr, prio, ttl, label,
+- 			     sport, geneve->dst_port,
+- 			     !!(flags & GENEVE_F_UDP_ZERO_CSUM6_TX));
+- 	return NETDEV_TX_OK;
+- 
+- tx_error:
+- 	dev_kfree_skb(skb);
+- 
+- 	if (err == -ELOOP)
+- 		dev->stats.collisions++;
+- 	else if (err == -ENETUNREACH)
+- 		dev->stats.tx_carrier_errors++;
++ 	skb_reset_mac_header(skb);
++ 	err = geneve6_build_skb(dst, skb, key->tun_flags, vni,
++ 				info->options_len, opts, xnet);
++ 	if (unlikely(err))
++ 		return err;
+  
+- 	dev->stats.tx_errors++;
+- 	return NETDEV_TX_OK;
++ 	udp_tunnel6_xmit_skb(dst, gs6->sock->sk, skb, dev,
++ 			     &fl6.saddr, &fl6.daddr, prio, ttl,
++ 			     info->key.label, sport, geneve->info.key.tp_dst,
++ 			     !(info->key.tun_flags & TUNNEL_CSUM));
++ 	return 0;
+  }
+  #endif
+  
+@@@ -1032,41 -913,47 +1064,63 @@@ static netdev_tx_t geneve_xmit(struct s
+  {
+  	struct geneve_dev *geneve = netdev_priv(dev);
+  	struct ip_tunnel_info *info = NULL;
++ 	int err;
+  
+- 	if (geneve->collect_md)
++ 	if (geneve->collect_md) {
+  		info = skb_tunnel_info(skb);
++ 		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
++ 			err = -EINVAL;
++ 			netdev_dbg(dev, "no tunnel metadata\n");
++ 			goto tx_error;
++ 		}
++ 	} else {
++ 		info = &geneve->info;
++ 	}
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+- 	if ((info && ip_tunnel_info_af(info) == AF_INET6) ||
+- 	    (!info && geneve->remote.sa.sa_family == AF_INET6))
+- 		return geneve6_xmit_skb(skb, dev, info);
++ 	if (info->mode & IP_TUNNEL_INFO_IPV6)
++ 		err = geneve6_xmit_skb(skb, dev, geneve, info);
++ 	else
+  #endif
+- 	return geneve_xmit_skb(skb, dev, info);
++ 		err = geneve_xmit_skb(skb, dev, geneve, info);
++ 
++ 	if (likely(!err))
++ 		return NETDEV_TX_OK;
++ tx_error:
++ 	dev_kfree_skb(skb);
++ 
++ 	if (err == -ELOOP)
++ 		dev->stats.collisions++;
++ 	else if (err == -ENETUNREACH)
++ 		dev->stats.tx_carrier_errors++;
++ 
++ 	dev->stats.tx_errors++;
++ 	return NETDEV_TX_OK;
+  }
+  
+ -static int geneve_change_mtu(struct net_device *dev, int new_mtu)
+ +static int __geneve_change_mtu(struct net_device *dev, int new_mtu, bool strict)
+  {
+ -	/* Only possible if called internally, ndo_change_mtu path's new_mtu
+ -	 * is guaranteed to be between dev->min_mtu and dev->max_mtu.
+ +	struct geneve_dev *geneve = netdev_priv(dev);
+ +	/* The max_mtu calculation does not take account of GENEVE
+ +	 * options, to avoid excluding potentially valid
+ +	 * configurations.
+  	 */
+ -	if (new_mtu > dev->max_mtu)
+ -		new_mtu = dev->max_mtu;
+ +	int max_mtu = IP_MAX_MTU - GENEVE_BASE_HLEN - dev->hard_header_len;
+ +
+ +	if (geneve->remote.sa.sa_family == AF_INET6)
+ +		max_mtu -= sizeof(struct ipv6hdr);
+ +	else
+ +		max_mtu -= sizeof(struct iphdr);
+ +
+ +	if (new_mtu < 68)
+ +		return -EINVAL;
+ +
+ +	if (new_mtu > max_mtu) {
+ +		if (strict)
+ +			return -EINVAL;
+ +
+ +		new_mtu = max_mtu;
+ +	}
+  
+  	dev->mtu = new_mtu;
+  	return 0;
+@@@ -1295,10 -1176,13 +1340,14 @@@ static int geneve_configure(struct net 
+  
+  	/* make enough headroom for basic scenario */
+  	encap_len = GENEVE_BASE_HLEN + ETH_HLEN;
+++<<<<<<< HEAD
+ +	if (remote->sa.sa_family == AF_INET)
+++=======
++ 	if (ip_tunnel_info_af(info) == AF_INET) {
+++>>>>>>> 9b4437a5b870 (geneve: Unify LWT and netdev handling.)
+  		encap_len += sizeof(struct iphdr);
+ -		dev->max_mtu -= sizeof(struct iphdr);
+ -	} else {
+ +	else
+  		encap_len += sizeof(struct ipv6hdr);
+ -		dev->max_mtu -= sizeof(struct ipv6hdr);
+ -	}
+  	dev->needed_headroom = encap_len + ETH_HLEN;
+  
+  	if (metadata) {
+@@@ -1474,9 -1393,10 +1558,10 @@@ static struct rtnl_link_ops geneve_link
+  };
+  
+  struct net_device *geneve_dev_create_fb(struct net *net, const char *name,
+ -					u8 name_assign_type, u16 dst_port)
+ +					u16 dst_port)
+  {
+  	struct nlattr *tb[IFLA_MAX + 1];
++ 	struct ip_tunnel_info info;
+  	struct net_device *dev;
+  	LIST_HEAD(list_kill);
+  	int err;
+@@@ -1592,9 -1509,8 +1675,8 @@@ static int __init geneve_init_module(vo
+  		goto out3;
+  
+  	return 0;
+- 
+  out3:
+ -	unregister_netdevice_notifier(&geneve_notifier_block);
+ +	unregister_netdevice_notifier_rh(&geneve_notifier_block);
+  out2:
+  	unregister_pernet_subsys(&geneve_net_ops);
+  out1:
+* Unmerged path drivers/net/geneve.c
