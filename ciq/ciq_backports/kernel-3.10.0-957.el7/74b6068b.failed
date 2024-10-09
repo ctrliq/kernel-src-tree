@@ -1,0 +1,127 @@
+drm/nouveau/gr/gf100-: add missing reset sequence before golden context init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 74b6068bd660a806e801ae039dbab58dc284301e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/74b6068b.failed
+
+RM and NVGPU both have a variant of this, we probably should too.
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 74b6068bd660a806e801ae039dbab58dc284301e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
+diff --cc drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
+index 1c2f5b3c5f8f,4c25389fe80a..000000000000
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
+@@@ -1454,49 -1456,65 +1454,74 @@@ gf100_grctx_generate(struct gf100_gr *g
+  	int ret, i;
+  	u64 addr;
+  
+++<<<<<<< HEAD
+ +	/* allocate memory to for a "channel", which we'll use to generate
+ +	 * the default context values
+++=======
++ 	/* NV_PGRAPH_FE_PWR_MODE_FORCE_ON. */
++ 	nvkm_wr32(device, 0x404170, 0x00000012);
++ 	nvkm_msec(device, 2000,
++ 		if (!(nvkm_rd32(device, 0x404170) & 0x00000010))
++ 			break;
++ 	);
++ 
++ 	/* Reset FECS. */
++ 	nvkm_wr32(device, 0x409614, 0x00000070);
++ 	nvkm_usec(device, 10, NVKM_DELAY);
++ 	nvkm_mask(device, 0x409614, 0x00000700, 0x00000700);
++ 	nvkm_usec(device, 10, NVKM_DELAY);
++ 	nvkm_rd32(device, 0x409614);
++ 
++ 	/* NV_PGRAPH_FE_PWR_MODE_AUTO. */
++ 	nvkm_wr32(device, 0x404170, 0x00000010);
++ 
++ 	/* Init SCC RAM. */
++ 	nvkm_wr32(device, 0x40802c, 0x00000001);
++ 
++ 	/* Allocate memory to for a "channel", which we'll use to generate
++ 	 * the default context values.
+++>>>>>>> 74b6068bd660 (drm/nouveau/gr/gf100-: add missing reset sequence before golden context init)
+  	 */
+ -	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST,
+ -			      0x1000, 0x1000, true, &inst);
+ -	if (ret)
+ -		goto done;
+ -
+ -	ret = nvkm_vmm_new(device, 0, 0, NULL, 0, NULL, "grctx", &vmm);
+ -	if (ret)
+ -		goto done;
+ -
+ -	vmm->debug = subdev->debug;
+ +	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST, 0x80000 + gr->size,
+ +			      0x1000, true, &chan);
+ +	if (ret) {
+ +		nvkm_error(subdev, "failed to allocate chan memory, %d\n", ret);
+ +		return ret;
+ +	}
+  
+ -	ret = nvkm_vmm_join(vmm, inst);
+ -	if (ret)
+ -		goto done;
+ +	addr = nvkm_memory_addr(chan);
+  
+ -	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST,
+ -			      CB_RESERVED + gr->size, 0, true, &data);
+ -	if (ret)
+ -		goto done;
+ +	/* PGD pointer */
+ +	nvkm_kmap(chan);
+ +	nvkm_wo32(chan, 0x0200, lower_32_bits(addr + 0x1000));
+ +	nvkm_wo32(chan, 0x0204, upper_32_bits(addr + 0x1000));
+ +	nvkm_wo32(chan, 0x0208, 0xffffffff);
+ +	nvkm_wo32(chan, 0x020c, 0x000000ff);
+  
+ -	ret = nvkm_vmm_get(vmm, 0, nvkm_memory_size(data), &ctx);
+ -	if (ret)
+ -		goto done;
+ +	/* PGT[0] pointer */
+ +	nvkm_wo32(chan, 0x1000, 0x00000000);
+ +	nvkm_wo32(chan, 0x1004, 0x00000001 | (addr + 0x2000) >> 8);
+  
+ -	ret = nvkm_memory_map(data, 0, vmm, ctx, NULL, 0);
+ -	if (ret)
+ -		goto done;
+ +	/* identity-map the whole "channel" into its own vm */
+ +	for (i = 0; i < nvkm_memory_size(chan) / 4096; i++) {
+ +		u64 addr = ((nvkm_memory_addr(chan) + (i * 4096)) >> 8) | 1;
+ +		nvkm_wo32(chan, 0x2000 + (i * 8), lower_32_bits(addr));
+ +		nvkm_wo32(chan, 0x2004 + (i * 8), upper_32_bits(addr));
+ +	}
+  
+ +	/* context pointer (virt) */
+ +	nvkm_wo32(chan, 0x0210, 0x00080004);
+ +	nvkm_wo32(chan, 0x0214, 0x00000000);
+ +	nvkm_done(chan);
+  
+ -	/* Setup context pointer. */
+ -	nvkm_kmap(inst);
+ -	nvkm_wo32(inst, 0x0210, lower_32_bits(ctx->addr + CB_RESERVED) | 4);
+ -	nvkm_wo32(inst, 0x0214, upper_32_bits(ctx->addr + CB_RESERVED));
+ -	nvkm_done(inst);
+ +	nvkm_wr32(device, 0x100cb8, (addr + 0x1000) >> 8);
+ +	nvkm_wr32(device, 0x100cbc, 0x80000001);
+ +	nvkm_msec(device, 2000,
+ +		if (nvkm_rd32(device, 0x100c80) & 0x00008000)
+ +			break;
+ +	);
+  
+ -	/* Setup default state for mmio list construction. */
+ +	/* setup default state for mmio list construction */
+  	info.gr = gr;
+  	info.data = gr->mmio_data;
+  	info.mmio = gr->mmio_list;
+* Unmerged path drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
