@@ -1,0 +1,237 @@
+cpufreq: intel_pstate: Add locking around HWP requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Add locking around HWP requests (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 90.91%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit b59fe540539623767cf18045a78fb672b40270d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b59fe540.failed
+
+To avoid race conditions from multiple threads, increase the scope
+of intel_pstate_limits_lock to include HWP requests also.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+[ rjw: Subject ]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit b59fe540539623767cf18045a78fb672b40270d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index e7b574938221,c7f596f7b8cc..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -731,8 -880,7 +733,12 @@@ static ssize_t store_max_perf_pct(struc
+  				   limits->max_perf_pct);
+  	limits->max_perf_pct = max(limits->min_perf_pct,
+  				   limits->max_perf_pct);
+++<<<<<<< HEAD
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+++=======
++ 	limits->max_perf = div_ext_fp(limits->max_perf_pct, 100);
+++>>>>>>> b59fe5405396 (cpufreq: intel_pstate: Add locking around HWP requests)
+  
+  	if (hwp_active)
+  		intel_pstate_hwp_set_online_cpus();
+@@@ -756,8 -909,7 +765,12 @@@ static ssize_t store_min_perf_pct(struc
+  				   limits->min_perf_pct);
+  	limits->min_perf_pct = min(limits->max_perf_pct,
+  				   limits->min_perf_pct);
+++<<<<<<< HEAD
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+++=======
++ 	limits->min_perf = div_ext_fp(limits->min_perf_pct, 100);
+++>>>>>>> b59fe5405396 (cpufreq: intel_pstate: Add locking around HWP requests)
+  
+  	if (hwp_active)
+  		intel_pstate_hwp_set_online_cpus();
+@@@ -1406,40 -1633,66 +1422,80 @@@ static int intel_pstate_init_cpu(unsign
+  
+  static unsigned int intel_pstate_get(unsigned int cpu_num)
+  {
+ -	struct cpudata *cpu = all_cpu_data[cpu_num];
+ +	struct sample *sample;
+ +	struct cpudata *cpu;
+  
+ -	return cpu ? get_avg_frequency(cpu) : 0;
+ +	cpu = all_cpu_data[cpu_num];
+ +	if (!cpu)
+ +		return 0;
+ +	sample = &cpu->sample;
+ +	return sample->freq;
+  }
+  
+ -static void intel_pstate_set_update_util_hook(unsigned int cpu_num)
+ +static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+  {
+ -	struct cpudata *cpu = all_cpu_data[cpu_num];
+ +	if (!policy->cpuinfo.max_freq)
+ +		return -ENODEV;
+  
+ -	if (cpu->update_util_set)
+ -		return;
+ +	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
+ +		 policy->cpuinfo.max_freq, policy->max);
+  
+++<<<<<<< HEAD
+ +	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
+ +	    policy->max >= policy->cpuinfo.max_freq) {
+ +		pr_debug("intel_pstate: set performance\n");
+ +		limits = &performance_limits;
+ +		if (hwp_active)
+ +			intel_pstate_hwp_set(policy->cpus);
+ +		return 0;
+ +	}
+ +
+ +	pr_debug("intel_pstate: set powersave\n");
+ +	limits = &powersave_limits;
+ +	limits->min_policy_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+ +	limits->min_policy_pct = clamp_t(int, limits->min_policy_pct, 0 , 100);
+++=======
++ 	/* Prevent intel_pstate_update_util() from using stale data. */
++ 	cpu->sample.time = 0;
++ 	cpufreq_add_update_util_hook(cpu_num, &cpu->update_util,
++ 				     intel_pstate_update_util);
++ 	cpu->update_util_set = true;
++ }
++ 
++ static void intel_pstate_clear_update_util_hook(unsigned int cpu)
++ {
++ 	struct cpudata *cpu_data = all_cpu_data[cpu];
++ 
++ 	if (!cpu_data->update_util_set)
++ 		return;
++ 
++ 	cpufreq_remove_update_util_hook(cpu);
++ 	cpu_data->update_util_set = false;
++ 	synchronize_sched();
++ }
++ 
++ static void intel_pstate_set_performance_limits(struct perf_limits *limits)
++ {
++ 	limits->no_turbo = 0;
++ 	limits->turbo_disabled = 0;
++ 	limits->max_perf_pct = 100;
++ 	limits->max_perf = int_ext_tofp(1);
++ 	limits->min_perf_pct = 100;
++ 	limits->min_perf = int_ext_tofp(1);
++ 	limits->max_policy_pct = 100;
++ 	limits->max_sysfs_pct = 100;
++ 	limits->min_policy_pct = 0;
++ 	limits->min_sysfs_pct = 0;
++ }
++ 
++ static void intel_pstate_update_perf_limits(struct cpufreq_policy *policy,
++ 					    struct perf_limits *limits)
++ {
++ 
+++>>>>>>> b59fe5405396 (cpufreq: intel_pstate: Add locking around HWP requests)
+  	limits->max_policy_pct = DIV_ROUND_UP(policy->max * 100,
+  					      policy->cpuinfo.max_freq);
+ -	limits->max_policy_pct = clamp_t(int, limits->max_policy_pct, 0, 100);
+ -	if (policy->max == policy->min) {
+ -		limits->min_policy_pct = limits->max_policy_pct;
+ -	} else {
+ -		limits->min_policy_pct = DIV_ROUND_UP(policy->min * 100,
+ -						      policy->cpuinfo.max_freq);
+ -		limits->min_policy_pct = clamp_t(int, limits->min_policy_pct,
+ -						 0, 100);
+ -	}
+ +	limits->max_policy_pct = clamp_t(int, limits->max_policy_pct, 0 , 100);
+  
+  	/* Normalize user input to [min_policy_pct, max_policy_pct] */
+  	limits->min_perf_pct = max(limits->min_policy_pct,
+@@@ -1454,14 -1707,76 +1510,82 @@@
+  	/* Make sure min_perf_pct <= max_perf_pct */
+  	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
+  
+ -	limits->min_perf = div_ext_fp(limits->min_perf_pct, 100);
+ -	limits->max_perf = div_ext_fp(limits->max_perf_pct, 100);
+ -	limits->max_perf = round_up(limits->max_perf, EXT_FRAC_BITS);
+ -	limits->min_perf = round_up(limits->min_perf, EXT_FRAC_BITS);
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
+  
+++<<<<<<< HEAD
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set(policy->cpus);
+++=======
++ 	pr_debug("cpu:%d max_perf_pct:%d min_perf_pct:%d\n", policy->cpu,
++ 		 limits->max_perf_pct, limits->min_perf_pct);
++ }
++ 
++ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 	struct perf_limits *perf_limits = NULL;
++ 
++ 	if (!policy->cpuinfo.max_freq)
++ 		return -ENODEV;
++ 
++ 	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
++ 		 policy->cpuinfo.max_freq, policy->max);
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 	cpu->policy = policy->policy;
++ 
++ 	if (cpu->pstate.max_pstate_physical > cpu->pstate.max_pstate &&
++ 	    policy->max < policy->cpuinfo.max_freq &&
++ 	    policy->max > cpu->pstate.max_pstate * cpu->pstate.scaling) {
++ 		pr_debug("policy->max > max non turbo frequency\n");
++ 		policy->max = policy->cpuinfo.max_freq;
++ 	}
++ 
++ 	if (per_cpu_limits)
++ 		perf_limits = cpu->perf_limits;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		if (!perf_limits) {
++ 			limits = &performance_limits;
++ 			perf_limits = limits;
++ 		}
++ 		if (policy->max >= policy->cpuinfo.max_freq) {
++ 			pr_debug("set performance\n");
++ 			intel_pstate_set_performance_limits(perf_limits);
++ 			goto out;
++ 		}
++ 	} else {
++ 		pr_debug("set powersave\n");
++ 		if (!perf_limits) {
++ 			limits = &powersave_limits;
++ 			perf_limits = limits;
++ 		}
++ 
++ 	}
++ 
++ 	intel_pstate_update_perf_limits(policy, perf_limits);
++  out:
++ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		/*
++ 		 * NOHZ_FULL CPUs need this as the governor callback may not
++ 		 * be invoked on them.
++ 		 */
++ 		intel_pstate_clear_update_util_hook(policy->cpu);
++ 		intel_pstate_max_within_limits(cpu);
++ 	}
++ 
++ 	intel_pstate_set_update_util_hook(policy->cpu);
++ 
++ 	intel_pstate_hwp_set_policy(policy);
+++>>>>>>> b59fe5405396 (cpufreq: intel_pstate: Add locking around HWP requests)
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
+  
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/intel_pstate.c
