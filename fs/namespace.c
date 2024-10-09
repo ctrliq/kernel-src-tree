@@ -3358,6 +3358,8 @@ static int mntns_install(struct nsproxy *nsproxy, void *ns)
 	while(d_mountpoint(root.dentry) && follow_down_one(&root))
 		;
 
+	put_mnt_ns(old_mnt_ns);
+
 	/* Update the pwd and root */
 	set_fs_pwd(fs, &root);
 	set_fs_root(fs, &root);
