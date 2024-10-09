@@ -1,0 +1,124 @@
+sched/core: Fix endless loop in pick_next_task()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Kirill Tkhai <ktkhai@parallels.com>
+commit 4c6c4e38c4e9a454889298dcc498174968d14a09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/4c6c4e38.failed
+
+1) Single cpu machine case.
+
+When rq has only RT tasks, but no one of them can be picked
+because of throttling, we enter in endless loop.
+
+pick_next_task_{dl,rt} return NULL.
+
+In pick_next_task_fair() we permanently go to retry
+
+	if (rq->nr_running != rq->cfs.h_nr_running)
+		return RETRY_TASK;
+
+(rq->nr_running is not being decremented when rt_rq becomes
+throttled).
+
+No chances to unthrottle any rt_rq or to wake fair here,
+because of rq is locked permanently and interrupts are
+disabled.
+
+2) In case of SMP this can cause a hang too. Although we unlock
+   rq in idle_balance(), interrupts are still disabled.
+
+The solution is to check for available tasks in DL and RT
+classes instead of checking for sum.
+
+	Signed-off-by: Kirill Tkhai <ktkhai@parallels.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1394098321.19290.11.camel@tkhai
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4c6c4e38c4e9a454889298dcc498174968d14a09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index c5d4b4242380,10db4a87ad72..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -7032,6 -6724,21 +7032,23 @@@ out
+  
+  	if (curr_cost > this_rq->max_idle_balance_cost)
+  		this_rq->max_idle_balance_cost = curr_cost;
+++<<<<<<< HEAD
+++=======
++ 
++ out:
++ 	/* Is there a task of a high priority class? */
++ 	if (this_rq->nr_running != this_rq->cfs.h_nr_running &&
++ 	    (this_rq->dl.dl_nr_running ||
++ 	     (this_rq->rt.rt_nr_running && !rt_rq_throttled(&this_rq->rt))))
++ 		pulled_task = -1;
++ 
++ 	if (pulled_task) {
++ 		idle_exit_fair(this_rq);
++ 		this_rq->idle_stamp = 0;
++ 	}
++ 
++ 	return pulled_task;
+++>>>>>>> 4c6c4e38c4e9 (sched/core: Fix endless loop in pick_next_task())
+  }
+  
+  /*
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 6b68ceb9a68d..01dc5651e41d 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -453,11 +453,6 @@ static void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
+ 		dequeue_rt_entity(rt_se);
+ }
+ 
+-static inline int rt_rq_throttled(struct rt_rq *rt_rq)
+-{
+-	return rt_rq->rt_throttled && !rt_rq->rt_nr_boosted;
+-}
+-
+ static int rt_se_boosted(struct sched_rt_entity *rt_se)
+ {
+ 	struct rt_rq *rt_rq = group_rt_rq(rt_se);
+@@ -539,11 +534,6 @@ static inline void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
+ {
+ }
+ 
+-static inline int rt_rq_throttled(struct rt_rq *rt_rq)
+-{
+-	return rt_rq->rt_throttled;
+-}
+-
+ static inline const struct cpumask *sched_rt_period_mask(void)
+ {
+ 	return cpu_online_mask;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 38c9ae998b34..b74022ee1e8d 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -496,6 +496,18 @@ struct rt_rq {
+ #endif
+ };
+ 
++#ifdef CONFIG_RT_GROUP_SCHED
++static inline int rt_rq_throttled(struct rt_rq *rt_rq)
++{
++	return rt_rq->rt_throttled && !rt_rq->rt_nr_boosted;
++}
++#else
++static inline int rt_rq_throttled(struct rt_rq *rt_rq)
++{
++	return rt_rq->rt_throttled;
++}
++#endif
++
+ /* Deadline class' related fields in a runqueue */
+ struct dl_rq {
+ 	/* runqueue is an rbtree, ordered by deadline */
