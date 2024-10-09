@@ -1,0 +1,105 @@
+perf/core: Fix perf_event_read()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0c1cbc18df9e38182a0604b15535699c84d7342a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0c1cbc18.failed
+
+perf_event_read() has a number of issues regarding the timekeeping bits.
+
+ - The IPI didn't update group times when it found INACTIVE
+
+ - The direct call would not re-check ->state after taking ctx->lock
+   which can result in ->count and timestamps getting out of sync.
+
+And we can make use of the ordering introduced for perf_event_stop()
+to make it more accurate for ACTIVE.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0c1cbc18df9e38182a0604b15535699c84d7342a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e490cd411934,6f74f9c35490..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -3679,18 -3752,38 +3683,50 @@@ u64 perf_event_read_local(struct perf_e
+  
+  static int perf_event_read(struct perf_event *event, bool group)
+  {
+++<<<<<<< HEAD
+ +	int ret = 0, cpu_to_read, local_cpu;
+++=======
++ 	enum perf_event_state state = READ_ONCE(event->state);
++ 	int event_cpu, ret = 0;
+++>>>>>>> 0c1cbc18df9e (perf/core: Fix perf_event_read())
+  
+  	/*
+  	 * If event is enabled and currently active on a CPU, update the
+  	 * value in the event structure:
+  	 */
+++<<<<<<< HEAD
+ +	if (event->state == PERF_EVENT_STATE_ACTIVE) {
+ +		struct perf_read_data data = {
+++=======
++ again:
++ 	if (state == PERF_EVENT_STATE_ACTIVE) {
++ 		struct perf_read_data data;
++ 
++ 		/*
++ 		 * Orders the ->state and ->oncpu loads such that if we see
++ 		 * ACTIVE we must also see the right ->oncpu.
++ 		 *
++ 		 * Matches the smp_wmb() from event_sched_in().
++ 		 */
++ 		smp_rmb();
++ 
++ 		event_cpu = READ_ONCE(event->oncpu);
++ 		if ((unsigned)event_cpu >= nr_cpu_ids)
++ 			return 0;
++ 
++ 		data = (struct perf_read_data){
+++>>>>>>> 0c1cbc18df9e (perf/core: Fix perf_event_read())
+  			.event = event,
+  			.group = group,
+  			.ret = 0,
+  		};
+++<<<<<<< HEAD
+++=======
++ 
++ 		preempt_disable();
++ 		event_cpu = __perf_event_read_cpu(event, event_cpu);
++ 
+++>>>>>>> 0c1cbc18df9e (perf/core: Fix perf_event_read())
+  		/*
+  		 * Purposely ignore the smp_call_function_single() return
+  		 * value.
+@@@ -3701,14 -3794,11 +3737,15 @@@
+  		 * Therefore, either way, we'll have an up-to-date event count
+  		 * after this.
+  		 */
+ -		(void)smp_call_function_single(event_cpu, __perf_event_read, &data, 1);
+ -		preempt_enable();
+ +
+ +		local_cpu = get_cpu();
+ +		cpu_to_read = find_cpu_to_read(event, local_cpu);
+ +		put_cpu();
+ +
+ +		(void)smp_call_function_single(cpu_to_read, __perf_event_read, &data, 1);
+  		ret = data.ret;
+- 	} else if (event->state == PERF_EVENT_STATE_INACTIVE) {
++ 
++ 	} else if (state == PERF_EVENT_STATE_INACTIVE) {
+  		struct perf_event_context *ctx = event->ctx;
+  		unsigned long flags;
+  
+* Unmerged path kernel/events/core.c
