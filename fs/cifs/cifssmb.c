@@ -1228,7 +1228,6 @@ OldOpenRetry:
 	inc_rfc1001_len(pSMB, count);
 
 	pSMB->ByteCount = cpu_to_le16(count);
-	/* long_op set to 1 to allow for oplock break timeouts */
 	rc = SendReceive(xid, tcon->ses, (struct smb_hdr *) pSMB,
 			(struct smb_hdr *)pSMBr, &bytes_returned, 0);
 	cifs_stats_inc(&tcon->stats.cifs_stats.num_opens);
@@ -1771,8 +1770,7 @@ CIFSSMBRead(const unsigned int xid, struct cifs_io_parms *io_parms,
 
 int
 CIFSSMBWrite(const unsigned int xid, struct cifs_io_parms *io_parms,
-	     unsigned int *nbytes, const char *buf,
-	     const char __user *ubuf, const int long_op)
+	     unsigned int *nbytes, const char *buf)
 {
 	int rc = -EACCES;
 	WRITE_REQ *pSMB = NULL;
@@ -1841,12 +1839,7 @@ CIFSSMBWrite(const unsigned int xid, struct cifs_io_parms *io_parms,
 		cpu_to_le16(offsetof(struct smb_com_write_req, Data) - 4);
 	if (buf)
 		memcpy(pSMB->Data, buf, bytes_sent);
-	else if (ubuf) {
-		if (copy_from_user(pSMB->Data, ubuf, bytes_sent)) {
-			cifs_buf_release(pSMB);
-			return -EFAULT;
-		}
-	} else if (count != 0) {
+	else if (count != 0) {
 		/* No buffer */
 		cifs_buf_release(pSMB);
 		return -EINVAL;
@@ -1870,7 +1863,7 @@ CIFSSMBWrite(const unsigned int xid, struct cifs_io_parms *io_parms,
 	}
 
 	rc = SendReceive(xid, tcon->ses, (struct smb_hdr *) pSMB,
-			 (struct smb_hdr *) pSMBr, &bytes_returned, long_op);
+			 (struct smb_hdr *) pSMBr, &bytes_returned, 0);
 	cifs_stats_inc(&tcon->stats.cifs_stats.num_writes);
 	if (rc) {
 		cifs_dbg(FYI, "Send error in write = %d\n", rc);
