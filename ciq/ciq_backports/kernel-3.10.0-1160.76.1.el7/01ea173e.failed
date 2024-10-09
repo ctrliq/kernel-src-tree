@@ -1,0 +1,245 @@
+xfs: fix up non-directory creation in SGID directories
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.76.1.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 01ea173e103edd5ec41acec65b9261b87e123fc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.76.1.el7/01ea173e.failed
+
+XFS always inherits the SGID bit if it is set on the parent inode, while
+the generic inode_init_owner does not do this in a few cases where it can
+create a possible security problem, see commit 0fa3ecd87848
+("Fix up non-directory creation in SGID directories") for details.
+
+Switch XFS to use the generic helper for the normal path to fix this,
+just keeping the simple field inheritance open coded for the case of the
+non-sgid case with the bsdgrpid mount option.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Reported-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 01ea173e103edd5ec41acec65b9261b87e123fc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_inode.c
+index bd3be776db7e,e2a1db4cee43..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -686,69 -698,90 +686,79 @@@ out_unlock
+  	return error;
+  }
+  
+ -/* Propagate di_flags from a parent inode to a child inode. */
+ -static void
+ -xfs_inode_inherit_flags(
+ -	struct xfs_inode	*ip,
+ -	const struct xfs_inode	*pip)
+ -{
+ -	unsigned int		di_flags = 0;
+ -	umode_t			mode = VFS_I(ip)->i_mode;
+ -
+ -	if (S_ISDIR(mode)) {
+ -		if (pip->i_d.di_flags & XFS_DIFLAG_RTINHERIT)
+ -			di_flags |= XFS_DIFLAG_RTINHERIT;
+ -		if (pip->i_d.di_flags & XFS_DIFLAG_EXTSZINHERIT) {
+ -			di_flags |= XFS_DIFLAG_EXTSZINHERIT;
+ -			ip->i_d.di_extsize = pip->i_d.di_extsize;
+ -		}
+ -		if (pip->i_d.di_flags & XFS_DIFLAG_PROJINHERIT)
+ -			di_flags |= XFS_DIFLAG_PROJINHERIT;
+ -	} else if (S_ISREG(mode)) {
+ -		if ((pip->i_d.di_flags & XFS_DIFLAG_RTINHERIT) &&
+ -		    xfs_sb_version_hasrealtime(&ip->i_mount->m_sb))
+ -			di_flags |= XFS_DIFLAG_REALTIME;
+ -		if (pip->i_d.di_flags & XFS_DIFLAG_EXTSZINHERIT) {
+ -			di_flags |= XFS_DIFLAG_EXTSIZE;
+ -			ip->i_d.di_extsize = pip->i_d.di_extsize;
+ -		}
+ -	}
+ -	if ((pip->i_d.di_flags & XFS_DIFLAG_NOATIME) &&
+ -	    xfs_inherit_noatime)
+ -		di_flags |= XFS_DIFLAG_NOATIME;
+ -	if ((pip->i_d.di_flags & XFS_DIFLAG_NODUMP) &&
+ -	    xfs_inherit_nodump)
+ -		di_flags |= XFS_DIFLAG_NODUMP;
+ -	if ((pip->i_d.di_flags & XFS_DIFLAG_SYNC) &&
+ -	    xfs_inherit_sync)
+ -		di_flags |= XFS_DIFLAG_SYNC;
+ -	if ((pip->i_d.di_flags & XFS_DIFLAG_NOSYMLINKS) &&
+ -	    xfs_inherit_nosymlinks)
+ -		di_flags |= XFS_DIFLAG_NOSYMLINKS;
+ -	if ((pip->i_d.di_flags & XFS_DIFLAG_NODEFRAG) &&
+ -	    xfs_inherit_nodefrag)
+ -		di_flags |= XFS_DIFLAG_NODEFRAG;
+ -	if (pip->i_d.di_flags & XFS_DIFLAG_FILESTREAM)
+ -		di_flags |= XFS_DIFLAG_FILESTREAM;
+ -
+ -	ip->i_d.di_flags |= di_flags;
+ -}
+ -
+ -/* Propagate di_flags2 from a parent inode to a child inode. */
+ -static void
+ -xfs_inode_inherit_flags2(
+ -	struct xfs_inode	*ip,
+ -	const struct xfs_inode	*pip)
+ -{
+ -	if (pip->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE) {
+ -		ip->i_d.di_flags2 |= XFS_DIFLAG2_COWEXTSIZE;
+ -		ip->i_d.di_cowextsize = pip->i_d.di_cowextsize;
+ -	}
+ -	if (pip->i_d.di_flags2 & XFS_DIFLAG2_DAX)
+ -		ip->i_d.di_flags2 |= XFS_DIFLAG2_DAX;
+ -}
+ -
+  /*
+ - * Initialise a newly allocated inode and return the in-core inode to the
+ - * caller locked exclusively.
+ + * Allocate an inode on disk and return a copy of its in-core version.
+ + * The in-core inode is locked exclusively.  Set mode, nlink, and rdev
+ + * appropriately within the inode.  The uid and gid for the inode are
+ + * set according to the contents of the given cred structure.
+ + *
+ + * Use xfs_dialloc() to allocate the on-disk inode. If xfs_dialloc()
+ + * has a free inode available, call xfs_iget() to obtain the in-core
+ + * version of the allocated inode.  Finally, fill in the inode and
+ + * log its initial contents.  In this case, ialloc_context would be
+ + * set to NULL.
+ + *
+ + * If xfs_dialloc() does not have an available inode, it will replenish
+ + * its supply by doing an allocation. Since we can only do one
+ + * allocation within a transaction without deadlocks, we must commit
+ + * the current transaction before returning the inode itself.
+ + * In this case, therefore, we will set ialloc_context and return.
+ + * The caller should then commit the current transaction, start a new
+ + * transaction, and call xfs_ialloc() again to actually get the inode.
+ + *
+ + * To ensure that some other process does not grab the inode that
+ + * was allocated during the first call to xfs_ialloc(), this routine
+ + * also returns the [locked] bp pointing to the head of the freelist
+ + * as ialloc_context.  The caller should hold this buffer across
+ + * the commit and pass it back into this routine on the second call.
+ + *
+ + * If we are allocating quota inodes, we do not have a parent inode
+ + * to attach to or associate with (i.e. pip == NULL) because they
+ + * are not linked into the directory structure - they are attached
+ + * directly to the superblock - and so have no parent.
+   */
+  static int
+ -xfs_init_new_inode(
+ -	struct xfs_trans	*tp,
+ -	struct xfs_inode	*pip,
+ -	xfs_ino_t		ino,
+ -	umode_t			mode,
+ -	xfs_nlink_t		nlink,
+ -	dev_t			rdev,
+ -	prid_t			prid,
+ -	struct xfs_inode	**ipp)
+ -{
+ +xfs_ialloc(
+ +	xfs_trans_t	*tp,
+ +	xfs_inode_t	*pip,
+ +	umode_t		mode,
+ +	xfs_nlink_t	nlink,
+ +	dev_t		rdev,
+ +	prid_t		prid,
+ +	xfs_buf_t	**ialloc_context,
+ +	xfs_inode_t	**ipp)
+ +{
+++<<<<<<< HEAD
+ +	struct xfs_mount *mp = tp->t_mountp;
+ +	xfs_ino_t	ino;
+ +	xfs_inode_t	*ip;
+ +	uint		flags;
+ +	int		error;
+ +	struct timespec	tv;
+ +	struct inode	*inode;
+ +
+ +	/*
+ +	 * Call the space management code to pick
+ +	 * the on-disk inode to be allocated.
+ +	 */
+ +	error = xfs_dialloc(tp, pip ? pip->i_ino : 0, mode,
+ +			    ialloc_context, &ino);
+ +	if (error)
+ +		return error;
+ +	if (*ialloc_context || ino == NULLFSINO) {
+ +		*ipp = NULL;
+ +		return 0;
+ +	}
+ +	ASSERT(*ialloc_context == NULL);
+++=======
++ 	struct inode		*dir = pip ? VFS_I(pip) : NULL;
++ 	struct xfs_mount	*mp = tp->t_mountp;
++ 	struct xfs_inode	*ip;
++ 	unsigned int		flags;
++ 	int			error;
++ 	struct timespec64	tv;
++ 	struct inode		*inode;
+++>>>>>>> 01ea173e103e (xfs: fix up non-directory creation in SGID directories)
+  
+  	/*
+  	 * Protect against obviously corrupt allocation btree records. Later
+@@@ -763,36 -796,26 +773,50 @@@
+  	}
+  
+  	/*
+ -	 * Get the in-core inode with the lock held exclusively to prevent
+ -	 * others from looking at until we're done.
+ +	 * Get the in-core inode with the lock held exclusively.
+ +	 * This is because we're setting fields here we need
+ +	 * to prevent others from looking at until we're done.
+  	 */
+ -	error = xfs_iget(mp, tp, ino, XFS_IGET_CREATE, XFS_ILOCK_EXCL, &ip);
+ +	error = xfs_iget(mp, tp, ino, XFS_IGET_CREATE,
+ +			 XFS_ILOCK_EXCL, &ip);
+  	if (error)
+  		return error;
+ -
+  	ASSERT(ip != NULL);
+  	inode = VFS_I(ip);
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * We always convert v1 inodes to v2 now - we only support filesystems
+ +	 * with >= v2 inode capability, so there is no reason for ever leaving
+ +	 * an inode in v1 format.
+ +	 */
+ +	if (ip->i_d.di_version == 1)
+ +		ip->i_d.di_version = 2;
+ +
+ +	inode->i_mode = mode;
+  	set_nlink(inode, nlink);
+ +	ip->i_d.di_uid = xfs_kuid_to_uid(current_fsuid());
+ +	ip->i_d.di_gid = xfs_kgid_to_gid(current_fsgid());
+++=======
+++	set_nlink(inode, nlink);
+++>>>>>>> 01ea173e103e (xfs: fix up non-directory creation in SGID directories)
+  	inode->i_rdev = rdev;
+ -	ip->i_d.di_projid = prid;
+ -
+ +	xfs_set_projid(ip, prid);
+ +
+++<<<<<<< HEAD
+ +	if (pip && XFS_INHERIT_GID(pip)) {
+ +		ip->i_d.di_gid = pip->i_d.di_gid;
+ +		if ((VFS_I(pip)->i_mode & S_ISGID) && S_ISDIR(mode))
+ +			inode->i_mode |= S_ISGID;
+++=======
++ 	if (dir && !(dir->i_mode & S_ISGID) &&
++ 	    (mp->m_flags & XFS_MOUNT_GRPID)) {
++ 		inode->i_uid = current_fsuid();
++ 		inode->i_gid = dir->i_gid;
++ 		inode->i_mode = mode;
++ 	} else {
++ 		inode_init_owner(inode, dir, mode);
+++>>>>>>> 01ea173e103e (xfs: fix up non-directory creation in SGID directories)
+  	}
+  
+  	/*
+* Unmerged path fs/xfs/xfs_inode.c
