@@ -58,6 +58,16 @@ bool ins__is_fused(struct arch *arch, const char *ins1, const char *ins2);
 
 struct annotation;
 
+struct sym_hist_entry {
+	u64		nr_samples;
+	u64		period;
+};
+
+struct annotation_data {
+	double			 percent;
+	struct sym_hist_entry	 he;
+};
+
 struct annotation_line {
 	struct list_head	 node;
 	struct rb_node		 rb_node;
@@ -67,6 +77,8 @@ struct annotation_line {
 	float			 ipc;
 	u64			 cycles;
 	size_t			 privsize;
+	int			 samples_nr;
+	struct annotation_data	 samples[0];
 };
 
 struct disasm_line {
@@ -86,11 +98,6 @@ static inline bool disasm_line__has_offset(const struct disasm_line *dl)
 {
 	return dl->ops.target.offset_avail;
 }
-
-struct sym_hist_entry {
-	u64		nr_samples;
-	u64		period;
-};
 
 void disasm_line__free(struct disasm_line *dl);
 struct annotation_line *
