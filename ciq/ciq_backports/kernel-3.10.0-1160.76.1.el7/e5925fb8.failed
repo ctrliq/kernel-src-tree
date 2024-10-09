@@ -1,0 +1,301 @@
+x86/bugs: Group MDS, TAA & Processor MMIO Stale Data mitigations
+
+jira LE-1907
+cve CVE-2022-21166
+cve CVE-2022-21125
+cve CVE-2022-21123
+Rebuild_History Non-Buildable kernel-3.10.0-1160.76.1.el7
+commit-author Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+commit e5925fb867290ee924fcf2fe3ca887b792714366
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.76.1.el7/e5925fb8.failed
+
+MDS, TAA and Processor MMIO Stale Data mitigations rely on clearing CPU
+buffers. Moreover, status of these mitigations affects each other.
+During boot, it is important to maintain the order in which these
+mitigations are selected. This is especially true for
+md_clear_update_mitigation() that needs to be called after MDS, TAA and
+Processor MMIO Stale Data mitigation selection is done.
+
+Introduce md_clear_select_mitigation(), and select all these mitigations
+from there. This reflects relationships between these mitigations and
+ensures proper ordering.
+
+	Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit e5925fb867290ee924fcf2fe3ca887b792714366)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index eed1e0c03c19,d2cc7dbba5e2..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -33,24 -38,59 +33,29 @@@
+  
+  static void __init spectre_v1_select_mitigation(void);
+  static void __init spectre_v2_select_mitigation(void);
+ -static void __init ssb_select_mitigation(void);
+ +static void __init ssb_parse_cmdline(void);
+ +void ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+  static void __init mds_select_mitigation(void);
+++<<<<<<< HEAD
+++=======
++ static void __init md_clear_update_mitigation(void);
++ static void __init md_clear_select_mitigation(void);
+++>>>>>>> e5925fb86729 (x86/bugs: Group MDS, TAA & Processor MMIO Stale Data mitigations)
+  static void __init taa_select_mitigation(void);
+ -static void __init mmio_select_mitigation(void);
+  static void __init srbds_select_mitigation(void);
+ -static void __init l1d_flush_select_mitigation(void);
+  
+ -/* The base value of the SPEC_CTRL MSR that always has to be preserved. */
+ -u64 x86_spec_ctrl_base;
+ -EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
+ -static DEFINE_MUTEX(spec_ctrl_mutex);
+ -
+ -/*
+ - * The vendor and possibly platform specific bits which can be modified in
+ - * x86_spec_ctrl_base.
+ - */
+ -static u64 __ro_after_init x86_spec_ctrl_mask = SPEC_CTRL_IBRS;
+ -
+ -/*
+ - * AMD specific MSR info for Speculative Store Bypass control.
+ - * x86_amd_ls_cfg_ssbd_mask is initialized in identify_boot_cpu().
+ - */
+ -u64 __ro_after_init x86_amd_ls_cfg_base;
+ -u64 __ro_after_init x86_amd_ls_cfg_ssbd_mask;
+ +extern void spec_ctrl_save_msr(void);
+  
+ -/* Control conditional STIBP in switch_to() */
+ -DEFINE_STATIC_KEY_FALSE(switch_to_cond_stibp);
+ -/* Control conditional IBPB in switch_mm() */
+ -DEFINE_STATIC_KEY_FALSE(switch_mm_cond_ibpb);
+ -/* Control unconditional IBPB in switch_mm() */
+ -DEFINE_STATIC_KEY_FALSE(switch_mm_always_ibpb);
+ +static DEFINE_MUTEX(spec_ctrl_mutex);
+  
+  /* Control MDS CPU buffer clear before returning to user space */
+ -DEFINE_STATIC_KEY_FALSE(mds_user_clear);
+ +struct static_key mds_user_clear = STATIC_KEY_INIT_FALSE;
+  EXPORT_SYMBOL_GPL(mds_user_clear);
+  /* Control MDS CPU buffer clear before idling (halt, mwait) */
+ -DEFINE_STATIC_KEY_FALSE(mds_idle_clear);
+ +struct static_key mds_idle_clear = STATIC_KEY_INIT_FALSE;
+  EXPORT_SYMBOL_GPL(mds_idle_clear);
+  
+ -/*
+ - * Controls whether l1d flush based mitigations are enabled,
+ - * based on hw features and admin setting via boot parameter
+ - * defaults to false
+ - */
+ -DEFINE_STATIC_KEY_FALSE(switch_mm_cond_l1d_flush);
+ -
+ -/* Controls CPU Fill buffer clear before KVM guest MMIO accesses */
+ -DEFINE_STATIC_KEY_FALSE(mmio_stale_data_clear);
+ -EXPORT_SYMBOL_GPL(mmio_stale_data_clear);
+ -
+  void __init check_bugs(void)
+  {
+  	identify_boot_cpu();
+@@@ -69,31 -107,26 +74,38 @@@
+  	}
+  
+  	/*
+ -	 * Read the SPEC_CTRL MSR to account for reserved bits which may
+ -	 * have unknown values. AMD64_LS_CFG MSR is cached in the early AMD
+ -	 * init code as it is not enumerated and depends on the family.
+ +	 * Select proper mitigation for any exposure to the Speculative Store
+ +	 * Bypass vulnerability (exposed as a bug in "Memory Disambiguation")
+ +	 * This has to be done before spec_ctrl_init() to make sure that its
+ +	 * SPEC_CTRL MSR value is properly set up.
+  	 */
+ -	if (boot_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
+ -		rdmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ +	ssb_parse_cmdline();
+  
+ -	/* Allow STIBP in MSR_SPEC_CTRL if supported */
+ -	if (boot_cpu_has(X86_FEATURE_STIBP))
+ -		x86_spec_ctrl_mask |= SPEC_CTRL_STIBP;
+ +	spec_ctrl_init();
+  
+ -	/* Select the proper CPU mitigations before patching alternatives: */
+ +	/* Select the proper CPU mitigations before patching alternatives */
+  	spectre_v1_select_mitigation();
+  	spectre_v2_select_mitigation();
+ +	spec_ctrl_cpu_init();
+  	ssb_select_mitigation();
+  	l1tf_select_mitigation();
+++<<<<<<< HEAD
+ +	mds_select_mitigation();
+ +	taa_select_mitigation();
+++=======
++ 	md_clear_select_mitigation();
+++>>>>>>> e5925fb86729 (x86/bugs: Group MDS, TAA & Processor MMIO Stale Data mitigations)
+  	srbds_select_mitigation();
+ -	l1d_flush_select_mitigation();
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * As MDS and TAA mitigations are inter-related, print MDS
+ +	 * mitigation until after TAA mitigation selection is done.
+ +	 */
+ +	mds_print_mitigation();
+ +
+++=======
+++>>>>>>> e5925fb86729 (x86/bugs: Group MDS, TAA & Processor MMIO Stale Data mitigations)
+  	arch_smt_update();
+  
+  #ifdef CONFIG_X86_32
+@@@ -337,6 -390,143 +349,146 @@@ static int __init tsx_async_abort_parse
+  early_param("tsx_async_abort", tsx_async_abort_parse_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)	"MMIO Stale Data: " fmt
++ 
++ enum mmio_mitigations {
++ 	MMIO_MITIGATION_OFF,
++ 	MMIO_MITIGATION_UCODE_NEEDED,
++ 	MMIO_MITIGATION_VERW,
++ };
++ 
++ /* Default mitigation for Processor MMIO Stale Data vulnerabilities */
++ static enum mmio_mitigations mmio_mitigation __ro_after_init = MMIO_MITIGATION_VERW;
++ static bool mmio_nosmt __ro_after_init = false;
++ 
++ static const char * const mmio_strings[] = {
++ 	[MMIO_MITIGATION_OFF]		= "Vulnerable",
++ 	[MMIO_MITIGATION_UCODE_NEEDED]	= "Vulnerable: Clear CPU buffers attempted, no microcode",
++ 	[MMIO_MITIGATION_VERW]		= "Mitigation: Clear CPU buffers",
++ };
++ 
++ static void __init mmio_select_mitigation(void)
++ {
++ 	u64 ia32_cap;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA) ||
++ 	    cpu_mitigations_off()) {
++ 		mmio_mitigation = MMIO_MITIGATION_OFF;
++ 		return;
++ 	}
++ 
++ 	if (mmio_mitigation == MMIO_MITIGATION_OFF)
++ 		return;
++ 
++ 	ia32_cap = x86_read_arch_cap_msr();
++ 
++ 	/*
++ 	 * Enable CPU buffer clear mitigation for host and VMM, if also affected
++ 	 * by MDS or TAA. Otherwise, enable mitigation for VMM only.
++ 	 */
++ 	if (boot_cpu_has_bug(X86_BUG_MDS) || (boot_cpu_has_bug(X86_BUG_TAA) &&
++ 					      boot_cpu_has(X86_FEATURE_RTM)))
++ 		static_branch_enable(&mds_user_clear);
++ 	else
++ 		static_branch_enable(&mmio_stale_data_clear);
++ 
++ 	/*
++ 	 * Check if the system has the right microcode.
++ 	 *
++ 	 * CPU Fill buffer clear mitigation is enumerated by either an explicit
++ 	 * FB_CLEAR or by the presence of both MD_CLEAR and L1D_FLUSH on MDS
++ 	 * affected systems.
++ 	 */
++ 	if ((ia32_cap & ARCH_CAP_FB_CLEAR) ||
++ 	    (boot_cpu_has(X86_FEATURE_MD_CLEAR) &&
++ 	     boot_cpu_has(X86_FEATURE_FLUSH_L1D) &&
++ 	     !(ia32_cap & ARCH_CAP_MDS_NO)))
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 	else
++ 		mmio_mitigation = MMIO_MITIGATION_UCODE_NEEDED;
++ 
++ 	if (mmio_nosmt || cpu_mitigations_auto_nosmt())
++ 		cpu_smt_disable(false);
++ }
++ 
++ static int __init mmio_stale_data_parse_cmdline(char *str)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
++ 		return 0;
++ 
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!strcmp(str, "off")) {
++ 		mmio_mitigation = MMIO_MITIGATION_OFF;
++ 	} else if (!strcmp(str, "full")) {
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 	} else if (!strcmp(str, "full,nosmt")) {
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 		mmio_nosmt = true;
++ 	}
++ 
++ 	return 0;
++ }
++ early_param("mmio_stale_data", mmio_stale_data_parse_cmdline);
++ 
++ #undef pr_fmt
++ #define pr_fmt(fmt)     "" fmt
++ 
++ static void __init md_clear_update_mitigation(void)
++ {
++ 	if (cpu_mitigations_off())
++ 		return;
++ 
++ 	if (!static_key_enabled(&mds_user_clear))
++ 		goto out;
++ 
++ 	/*
++ 	 * mds_user_clear is now enabled. Update MDS, TAA and MMIO Stale Data
++ 	 * mitigation, if necessary.
++ 	 */
++ 	if (mds_mitigation == MDS_MITIGATION_OFF &&
++ 	    boot_cpu_has_bug(X86_BUG_MDS)) {
++ 		mds_mitigation = MDS_MITIGATION_FULL;
++ 		mds_select_mitigation();
++ 	}
++ 	if (taa_mitigation == TAA_MITIGATION_OFF &&
++ 	    boot_cpu_has_bug(X86_BUG_TAA)) {
++ 		taa_mitigation = TAA_MITIGATION_VERW;
++ 		taa_select_mitigation();
++ 	}
++ 	if (mmio_mitigation == MMIO_MITIGATION_OFF &&
++ 	    boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA)) {
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 		mmio_select_mitigation();
++ 	}
++ out:
++ 	if (boot_cpu_has_bug(X86_BUG_MDS))
++ 		pr_info("MDS: %s\n", mds_strings[mds_mitigation]);
++ 	if (boot_cpu_has_bug(X86_BUG_TAA))
++ 		pr_info("TAA: %s\n", taa_strings[taa_mitigation]);
++ 	if (boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
++ 		pr_info("MMIO Stale Data: %s\n", mmio_strings[mmio_mitigation]);
++ }
++ 
++ static void __init md_clear_select_mitigation(void)
++ {
++ 	mds_select_mitigation();
++ 	taa_select_mitigation();
++ 	mmio_select_mitigation();
++ 
++ 	/*
++ 	 * As MDS, TAA and MMIO Stale Data mitigations are inter-related, update
++ 	 * and print their mitigation after MDS, TAA and MMIO Stale Data
++ 	 * mitigation selection is done.
++ 	 */
++ 	md_clear_update_mitigation();
++ }
++ 
++ #undef pr_fmt
+++>>>>>>> e5925fb86729 (x86/bugs: Group MDS, TAA & Processor MMIO Stale Data mitigations)
+  #define pr_fmt(fmt)	"SRBDS: " fmt
+  
+  enum srbds_mitigations {
+* Unmerged path arch/x86/kernel/cpu/bugs.c
