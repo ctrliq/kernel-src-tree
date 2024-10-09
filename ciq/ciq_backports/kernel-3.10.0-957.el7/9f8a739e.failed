@@ -1,0 +1,652 @@
+act_mirred: get rid of tcfm_ifindex from struct tcf_mirred
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 9f8a739e72f1546fb0f8c518af1193522c45be12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9f8a739e.failed
+
+tcfm_dev always points to the correct netdev and we already
+hold a refcnt, so no need to use tcfm_ifindex to lookup again.
+
+If we would support moving target netdev across netns, using
+pointer would be better than ifindex.
+
+This also fixes dumping obsolete ifindex, now after the
+target device is gone we just dump 0 as ifindex.
+
+	Cc: Jiri Pirko <jiri@mellanox.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9f8a739e72f1546fb0f8c518af1193522c45be12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/dsa/slave.c
+diff --cc net/dsa/slave.c
+index f3efc3546e20,895db05d8c82..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -290,12 -568,366 +290,366 @@@ static int dsa_slave_get_sset_count(str
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dsa_slave_get_wol(struct net_device *dev, struct ethtool_wolinfo *w)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (ds->ops->get_wol)
++ 		ds->ops->get_wol(ds, dp->index, w);
++ }
++ 
++ static int dsa_slave_set_wol(struct net_device *dev, struct ethtool_wolinfo *w)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->ops->set_wol)
++ 		ret = ds->ops->set_wol(ds, dp->index, w);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_set_eee(struct net_device *dev, struct ethtool_eee *e)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	int ret;
++ 
++ 	/* Port's PHY and MAC both need to be EEE capable */
++ 	if (!dev->phydev)
++ 		return -ENODEV;
++ 
++ 	if (!ds->ops->set_mac_eee)
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = ds->ops->set_mac_eee(ds, dp->index, e);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (e->eee_enabled) {
++ 		ret = phy_init_eee(dev->phydev, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return phy_ethtool_set_eee(dev->phydev, e);
++ }
++ 
++ static int dsa_slave_get_eee(struct net_device *dev, struct ethtool_eee *e)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	int ret;
++ 
++ 	/* Port's PHY and MAC both need to be EEE capable */
++ 	if (!dev->phydev)
++ 		return -ENODEV;
++ 
++ 	if (!ds->ops->get_mac_eee)
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = ds->ops->get_mac_eee(ds, dp->index, e);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return phy_ethtool_get_eee(dev->phydev, e);
++ }
++ 
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ static int dsa_slave_netpoll_setup(struct net_device *dev,
++ 				   struct netpoll_info *ni)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct netpoll *netpoll;
++ 	int err = 0;
++ 
++ 	netpoll = kzalloc(sizeof(*netpoll), GFP_KERNEL);
++ 	if (!netpoll)
++ 		return -ENOMEM;
++ 
++ 	err = __netpoll_setup(netpoll, master);
++ 	if (err) {
++ 		kfree(netpoll);
++ 		goto out;
++ 	}
++ 
++ 	p->netpoll = netpoll;
++ out:
++ 	return err;
++ }
++ 
++ static void dsa_slave_netpoll_cleanup(struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct netpoll *netpoll = p->netpoll;
++ 
++ 	if (!netpoll)
++ 		return;
++ 
++ 	p->netpoll = NULL;
++ 
++ 	__netpoll_free_async(netpoll);
++ }
++ 
++ static void dsa_slave_poll_controller(struct net_device *dev)
++ {
++ }
++ #endif
++ 
++ static int dsa_slave_get_phys_port_name(struct net_device *dev,
++ 					char *name, size_t len)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 
++ 	if (snprintf(name, len, "p%d", dp->index) >= len)
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static struct dsa_mall_tc_entry *
++ dsa_slave_mall_tc_entry_find(struct net_device *dev, unsigned long cookie)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_mall_tc_entry *mall_tc_entry;
++ 
++ 	list_for_each_entry(mall_tc_entry, &p->mall_tc_list, list)
++ 		if (mall_tc_entry->cookie == cookie)
++ 			return mall_tc_entry;
++ 
++ 	return NULL;
++ }
++ 
++ static int dsa_slave_add_cls_matchall(struct net_device *dev,
++ 				      struct tc_cls_matchall_offload *cls,
++ 				      bool ingress)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_mall_tc_entry *mall_tc_entry;
++ 	__be16 protocol = cls->common.protocol;
++ 	struct dsa_switch *ds = dp->ds;
++ 	struct net_device *to_dev;
++ 	const struct tc_action *a;
++ 	struct dsa_port *to_dp;
++ 	int err = -EOPNOTSUPP;
++ 	LIST_HEAD(actions);
++ 
++ 	if (!ds->ops->port_mirror_add)
++ 		return err;
++ 
++ 	if (!tcf_exts_has_one_action(cls->exts))
++ 		return err;
++ 
++ 	tcf_exts_to_list(cls->exts, &actions);
++ 	a = list_first_entry(&actions, struct tc_action, list);
++ 
++ 	if (is_tcf_mirred_egress_mirror(a) && protocol == htons(ETH_P_ALL)) {
++ 		struct dsa_mall_mirror_tc_entry *mirror;
++ 
++ 		to_dev = tcf_mirred_dev(a);
++ 		if (!to_dev)
++ 			return -EINVAL;
++ 
++ 		if (!dsa_slave_dev_check(to_dev))
++ 			return -EOPNOTSUPP;
++ 
++ 		mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
++ 		if (!mall_tc_entry)
++ 			return -ENOMEM;
++ 
++ 		mall_tc_entry->cookie = cls->cookie;
++ 		mall_tc_entry->type = DSA_PORT_MALL_MIRROR;
++ 		mirror = &mall_tc_entry->mirror;
++ 
++ 		to_dp = dsa_slave_to_port(to_dev);
++ 
++ 		mirror->to_local_port = to_dp->index;
++ 		mirror->ingress = ingress;
++ 
++ 		err = ds->ops->port_mirror_add(ds, dp->index, mirror, ingress);
++ 		if (err) {
++ 			kfree(mall_tc_entry);
++ 			return err;
++ 		}
++ 
++ 		list_add_tail(&mall_tc_entry->list, &p->mall_tc_list);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void dsa_slave_del_cls_matchall(struct net_device *dev,
++ 				       struct tc_cls_matchall_offload *cls)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_mall_tc_entry *mall_tc_entry;
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->port_mirror_del)
++ 		return;
++ 
++ 	mall_tc_entry = dsa_slave_mall_tc_entry_find(dev, cls->cookie);
++ 	if (!mall_tc_entry)
++ 		return;
++ 
++ 	list_del(&mall_tc_entry->list);
++ 
++ 	switch (mall_tc_entry->type) {
++ 	case DSA_PORT_MALL_MIRROR:
++ 		ds->ops->port_mirror_del(ds, dp->index, &mall_tc_entry->mirror);
++ 		break;
++ 	default:
++ 		WARN_ON(1);
++ 	}
++ 
++ 	kfree(mall_tc_entry);
++ }
++ 
++ static int dsa_slave_setup_tc_cls_matchall(struct net_device *dev,
++ 					   struct tc_cls_matchall_offload *cls,
++ 					   bool ingress)
++ {
++ 	if (cls->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (cls->command) {
++ 	case TC_CLSMATCHALL_REPLACE:
++ 		return dsa_slave_add_cls_matchall(dev, cls, ingress);
++ 	case TC_CLSMATCHALL_DESTROY:
++ 		dsa_slave_del_cls_matchall(dev, cls);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int dsa_slave_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++ 				       void *cb_priv, bool ingress)
++ {
++ 	struct net_device *dev = cb_priv;
++ 
++ 	if (!tc_can_offload(dev))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSMATCHALL:
++ 		return dsa_slave_setup_tc_cls_matchall(dev, type_data, ingress);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int dsa_slave_setup_tc_block_cb_ig(enum tc_setup_type type,
++ 					  void *type_data, void *cb_priv)
++ {
++ 	return dsa_slave_setup_tc_block_cb(type, type_data, cb_priv, true);
++ }
++ 
++ static int dsa_slave_setup_tc_block_cb_eg(enum tc_setup_type type,
++ 					  void *type_data, void *cb_priv)
++ {
++ 	return dsa_slave_setup_tc_block_cb(type, type_data, cb_priv, false);
++ }
++ 
++ static int dsa_slave_setup_tc_block(struct net_device *dev,
++ 				    struct tc_block_offload *f)
++ {
++ 	tc_setup_cb_t *cb;
++ 
++ 	if (f->binder_type == TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		cb = dsa_slave_setup_tc_block_cb_ig;
++ 	else if (f->binder_type == TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS)
++ 		cb = dsa_slave_setup_tc_block_cb_eg;
++ 	else
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block, cb, dev, dev);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block, cb, dev);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int dsa_slave_setup_tc(struct net_device *dev, enum tc_setup_type type,
++ 			      void *type_data)
++ {
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		return dsa_slave_setup_tc_block(dev, type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static void dsa_slave_get_stats64(struct net_device *dev,
++ 				  struct rtnl_link_stats64 *stats)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct pcpu_sw_netstats *s;
++ 	unsigned int start;
++ 	int i;
++ 
++ 	netdev_stats_to_stats64(stats, &dev->stats);
++ 	for_each_possible_cpu(i) {
++ 		u64 tx_packets, tx_bytes, rx_packets, rx_bytes;
++ 
++ 		s = per_cpu_ptr(p->stats64, i);
++ 		do {
++ 			start = u64_stats_fetch_begin_irq(&s->syncp);
++ 			tx_packets = s->tx_packets;
++ 			tx_bytes = s->tx_bytes;
++ 			rx_packets = s->rx_packets;
++ 			rx_bytes = s->rx_bytes;
++ 		} while (u64_stats_fetch_retry_irq(&s->syncp, start));
++ 
++ 		stats->tx_packets += tx_packets;
++ 		stats->tx_bytes += tx_bytes;
++ 		stats->rx_packets += rx_packets;
++ 		stats->rx_bytes += rx_bytes;
++ 	}
++ }
++ 
++ static int dsa_slave_get_rxnfc(struct net_device *dev,
++ 			       struct ethtool_rxnfc *nfc, u32 *rule_locs)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->get_rxnfc)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ds->ops->get_rxnfc(ds, dp->index, nfc, rule_locs);
++ }
++ 
++ static int dsa_slave_set_rxnfc(struct net_device *dev,
++ 			       struct ethtool_rxnfc *nfc)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->set_rxnfc)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ds->ops->set_rxnfc(ds, dp->index, nfc);
++ }
++ 
+++>>>>>>> 9f8a739e72f1 (act_mirred: get rid of tcfm_ifindex from struct tcf_mirred)
+  static const struct ethtool_ops dsa_slave_ethtool_ops = {
+ +	.get_settings		= dsa_slave_get_settings,
+ +	.set_settings		= dsa_slave_set_settings,
+  	.get_drvinfo		= dsa_slave_get_drvinfo,
+ -	.get_regs_len		= dsa_slave_get_regs_len,
+ -	.get_regs		= dsa_slave_get_regs,
+ -	.nway_reset		= phy_ethtool_nway_reset,
+ +	.nway_reset		= dsa_slave_nway_reset,
+  	.get_link		= dsa_slave_get_link,
+ -	.get_eeprom_len		= dsa_slave_get_eeprom_len,
+ -	.get_eeprom		= dsa_slave_get_eeprom,
+ -	.set_eeprom		= dsa_slave_set_eeprom,
+  	.get_strings		= dsa_slave_get_strings,
+  	.get_ethtool_stats	= dsa_slave_get_ethtool_stats,
+  	.get_sset_count		= dsa_slave_get_sset_count,
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+index 03aa6546acde..2b96b9b40184 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+@@ -54,12 +54,10 @@ static int bnxt_tc_parse_redir(struct bnxt *bp,
+ 			       struct bnxt_tc_actions *actions,
+ 			       const struct tc_action *tc_act)
+ {
+-	int ifindex = tcf_mirred_ifindex(tc_act);
+-	struct net_device *dev;
++	struct net_device *dev = tcf_mirred_dev(tc_act);
+ 
+-	dev = __dev_get_by_index(dev_net(bp->dev), ifindex);
+ 	if (!dev) {
+-		netdev_info(bp->dev, "no dev for ifindex=%d", ifindex);
++		netdev_info(bp->dev, "no dev in mirred action");
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+index 571b3394ea3a..9b13eeba697c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+@@ -412,9 +412,7 @@ static void cxgb4_process_flow_actions(struct net_device *in,
+ 		} else if (is_tcf_gact_shot(a)) {
+ 			fs->action = FILTER_DROP;
+ 		} else if (is_tcf_mirred_egress_redirect(a)) {
+-			int ifindex = tcf_mirred_ifindex(a);
+-			struct net_device *out = __dev_get_by_index(dev_net(in),
+-								    ifindex);
++			struct net_device *out = tcf_mirred_dev(a);
+ 			struct port_info *pi = netdev_priv(out);
+ 
+ 			fs->action = FILTER_SWITCH;
+@@ -589,14 +587,14 @@ static int cxgb4_validate_flow_actions(struct net_device *dev,
+ 			/* Do nothing */
+ 		} else if (is_tcf_mirred_egress_redirect(a)) {
+ 			struct adapter *adap = netdev2adap(dev);
+-			struct net_device *n_dev;
+-			unsigned int i, ifindex;
++			struct net_device *n_dev, *target_dev;
++			unsigned int i;
+ 			bool found = false;
+ 
+-			ifindex = tcf_mirred_ifindex(a);
++			target_dev = tcf_mirred_dev(a);
+ 			for_each_port(adap, i) {
+ 				n_dev = adap->port[i];
+-				if (ifindex == n_dev->ifindex) {
++				if (target_dev == n_dev) {
+ 					found = true;
+ 					break;
+ 				}
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
+index 48970ba08bdc..2051a3da3ce7 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
+@@ -114,14 +114,14 @@ static int fill_action_fields(struct adapter *adap,
+ 
+ 		/* Re-direct to specified port in hardware. */
+ 		if (is_tcf_mirred_egress_redirect(a)) {
+-			struct net_device *n_dev;
+-			unsigned int i, index;
++			struct net_device *n_dev, *target_dev;
+ 			bool found = false;
++			unsigned int i;
+ 
+-			index = tcf_mirred_ifindex(a);
++			target_dev = tcf_mirred_dev(a);
+ 			for_each_port(adap, i) {
+ 				n_dev = adap->port[i];
+-				if (index == n_dev->ifindex) {
++				if (target_dev == n_dev) {
+ 					fs->action = FILTER_SWITCH;
+ 					fs->eport = i;
+ 					found = true;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index bc2d9678add4..d4e98c60180e 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -8862,9 +8862,11 @@ static int parse_tc_actions(struct ixgbe_adapter *adapter,
+ 
+ 		/* Redirect to a VF or a offloaded macvlan */
+ 		if (is_tcf_mirred_egress_redirect(a)) {
+-			int ifindex = tcf_mirred_ifindex(a);
++			struct net_device *dev = tcf_mirred_dev(a);
+ 
+-			err = handle_redirect_action(adapter, ifindex, queue,
++			if (!dev)
++				return -EINVAL;
++			err = handle_redirect_action(adapter, dev->ifindex, queue,
+ 						     action);
+ 			if (err == 0)
+ 				return err;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 6d96a2447540..7bc7790ff9d2 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -2484,11 +2484,10 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
+ 		}
+ 
+ 		if (is_tcf_mirred_egress_redirect(a)) {
+-			int ifindex = tcf_mirred_ifindex(a);
+ 			struct net_device *out_dev;
+ 			struct mlx5e_priv *out_priv;
+ 
+-			out_dev = __dev_get_by_index(dev_net(priv->netdev), ifindex);
++			out_dev = tcf_mirred_dev(a);
+ 
+ 			if (switchdev_port_same_parent_id(priv->netdev,
+ 							  out_dev)) {
+@@ -2498,7 +2497,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
+ 				rpriv = out_priv->ppriv;
+ 				attr->out_rep = rpriv->rep;
+ 			} else if (encap) {
+-				parse_attr->mirred_ifindex = ifindex;
++				parse_attr->mirred_ifindex = out_dev->ifindex;
+ 				parse_attr->tun_info = *info;
+ 				attr->parse_attr = parse_attr;
+ 				attr->action |= MLX5_FLOW_CONTEXT_ACTION_ENCAP |
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 6957213219f7..bf4d965465e9 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -1536,14 +1536,11 @@ mlxsw_sp_port_add_cls_matchall_mirror(struct mlxsw_sp_port *mlxsw_sp_port,
+ 				      const struct tc_action *a,
+ 				      bool ingress)
+ {
+-	struct net *net = dev_net(mlxsw_sp_port->dev);
+ 	enum mlxsw_sp_span_type span_type;
+ 	struct mlxsw_sp_port *to_port;
+ 	struct net_device *to_dev;
+-	int ifindex;
+ 
+-	ifindex = tcf_mirred_ifindex(a);
+-	to_dev = __dev_get_by_index(net, ifindex);
++	to_dev = tcf_mirred_dev(a);
+ 	if (!to_dev) {
+ 		netdev_err(mlxsw_sp_port->dev, "Could not find requested device\n");
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+index 8aace9a06a5d..0e1be41732f1 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+@@ -86,7 +86,6 @@ static int mlxsw_sp_flower_parse_actions(struct mlxsw_sp *mlxsw_sp,
+ 			group_id = mlxsw_sp_acl_ruleset_group_id(ruleset);
+ 			mlxsw_sp_acl_rulei_act_jump(rulei, group_id);
+ 		} else if (is_tcf_mirred_egress_redirect(a)) {
+-			int ifindex = tcf_mirred_ifindex(a);
+ 			struct net_device *out_dev;
+ 			struct mlxsw_sp_fid *fid;
+ 			u16 fid_index;
+@@ -98,7 +97,7 @@ static int mlxsw_sp_flower_parse_actions(struct mlxsw_sp *mlxsw_sp,
+ 			if (err)
+ 				return err;
+ 
+-			out_dev = __dev_get_by_index(dev_net(dev), ifindex);
++			out_dev = tcf_mirred_dev(a);
+ 			if (out_dev == dev)
+ 				out_dev = NULL;
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/action.c b/drivers/net/ethernet/netronome/nfp/flower/action.c
+index 10a787df6e6f..b3567a596fc1 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/action.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/action.c
+@@ -96,13 +96,11 @@ nfp_fl_output(struct nfp_fl_output *output, const struct tc_action *action,
+ 	size_t act_size = sizeof(struct nfp_fl_output);
+ 	struct net_device *out_dev;
+ 	u16 tmp_flags;
+-	int ifindex;
+ 
+ 	output->head.jump_id = NFP_FL_ACTION_OPCODE_OUTPUT;
+ 	output->head.len_lw = act_size >> NFP_FL_LW_SIZ;
+ 
+-	ifindex = tcf_mirred_ifindex(action);
+-	out_dev = __dev_get_by_index(dev_net(in_dev), ifindex);
++	out_dev = tcf_mirred_dev(action);
+ 	if (!out_dev)
+ 		return -EOPNOTSUPP;
+ 
+diff --git a/include/net/tc_act/tc_mirred.h b/include/net/tc_act/tc_mirred.h
+index 21a656569840..399ffa46a166 100644
+--- a/include/net/tc_act/tc_mirred.h
++++ b/include/net/tc_act/tc_mirred.h
+@@ -7,10 +7,8 @@
+ struct tcf_mirred {
+ 	struct tc_action	common;
+ 	int			tcfm_eaction;
+-	int			tcfm_ifindex;
+ 	bool			tcfm_mac_header_xmit;
+ 	struct net_device __rcu	*tcfm_dev;
+-	struct net		*net;
+ 	struct list_head	tcfm_list;
+ };
+ #define to_mirred(a) ((struct tcf_mirred *)a)
+@@ -33,9 +31,9 @@ static inline bool is_tcf_mirred_egress_mirror(const struct tc_action *a)
+ 	return false;
+ }
+ 
+-static inline int tcf_mirred_ifindex(const struct tc_action *a)
++static inline struct net_device *tcf_mirred_dev(const struct tc_action *a)
+ {
+-	return to_mirred(a)->tcfm_ifindex;
++	return rtnl_dereference(to_mirred(a)->tcfm_dev);
+ }
+ 
+ #endif /* __NET_TC_MIR_H */
+* Unmerged path net/dsa/slave.c
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 6f0d74423a84..6dae7461a73c 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -139,8 +139,6 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 	m->tcf_action = parm->action;
+ 	m->tcfm_eaction = parm->eaction;
+ 	if (dev != NULL) {
+-		m->tcfm_ifindex = parm->ifindex;
+-		m->net = net;
+ 		if (ret != ACT_P_CREATED)
+ 			dev_put(rcu_dereference_protected(m->tcfm_dev, 1));
+ 		dev_hold(dev);
+@@ -247,13 +245,14 @@ static int tcf_mirred_dump(struct sk_buff *skb, struct tc_action *a, int bind,
+ {
+ 	unsigned char *b = skb_tail_pointer(skb);
+ 	struct tcf_mirred *m = to_mirred(a);
++	struct net_device *dev = rtnl_dereference(m->tcfm_dev);
+ 	struct tc_mirred opt = {
+ 		.index   = m->tcf_index,
+ 		.action  = m->tcf_action,
+ 		.refcnt  = m->tcf_refcnt - ref,
+ 		.bindcnt = m->tcf_bindcnt - bind,
+ 		.eaction = m->tcfm_eaction,
+-		.ifindex = m->tcfm_ifindex,
++		.ifindex = dev ? dev->ifindex : 0,
+ 	};
+ 	struct tcf_t t;
+ 
+@@ -318,7 +317,7 @@ static struct net_device *tcf_mirred_get_dev(const struct tc_action *a)
+ {
+ 	struct tcf_mirred *m = to_mirred(a);
+ 
+-	return __dev_get_by_index(m->net, m->tcfm_ifindex);
++	return rtnl_dereference(m->tcfm_dev);
+ }
+ 
+ static struct tc_action_ops act_mirred_ops = {
