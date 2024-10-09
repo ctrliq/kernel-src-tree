@@ -1,0 +1,112 @@
+ip_tunnel: Emit events for post-register MTU changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit f6cc9c054e77b9a28d4594bcc201697edb21dfd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f6cc9c05.failed
+
+For tunnels created with IFLA_MTU, MTU of the netdevice is set by
+rtnl_create_link() (called from rtnl_newlink()) before the device is
+registered. However without IFLA_MTU that's not done.
+
+rtnl_newlink() proceeds by calling struct rtnl_link_ops.newlink, which
+via ip_tunnel_newlink() calls register_netdevice(), and that emits
+NETDEV_REGISTER. Thus any listeners that inspect the netdevice get the
+MTU of 0.
+
+After ip_tunnel_newlink() corrects the MTU after registering the
+netdevice, but since there's no event, the listeners don't get to know
+about the MTU until something else happens--such as a NETDEV_UP event.
+That's not ideal.
+
+So instead of setting the MTU directly, go through dev_set_mtu(), which
+takes care of distributing the necessary NETDEV_PRECHANGEMTU and
+NETDEV_CHANGEMTU events.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f6cc9c054e77b9a28d4594bcc201697edb21dfd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/ip_tunnel.c
+index 3a8988c09fa8,7b85ffad5d74..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -353,20 -359,32 +353,33 @@@ static struct ip_tunnel *ip_tunnel_crea
+  					  struct ip_tunnel_net *itn,
+  					  struct ip_tunnel_parm *parms)
+  {
+ -	struct ip_tunnel *nt;
+ +	struct ip_tunnel *nt, *fbt;
+  	struct net_device *dev;
+++<<<<<<< HEAD
+++=======
++ 	int t_hlen;
++ 	int mtu;
++ 	int err;
+++>>>>>>> f6cc9c054e77 (ip_tunnel: Emit events for post-register MTU changes)
+  
+  	BUG_ON(!itn->fb_tunnel_dev);
+ +	fbt = netdev_priv(itn->fb_tunnel_dev);
+  	dev = __ip_tunnel_create(net, itn->fb_tunnel_dev->rtnl_link_ops, parms);
+  	if (IS_ERR(dev))
+  		return ERR_CAST(dev);
+  
+- 	dev->mtu = ip_tunnel_bind_dev(dev);
++ 	mtu = ip_tunnel_bind_dev(dev);
++ 	err = dev_set_mtu(dev, mtu);
++ 	if (err)
++ 		goto err_dev_set_mtu;
+  
+  	nt = netdev_priv(dev);
+ -	t_hlen = nt->hlen + sizeof(struct iphdr);
+ -	dev->min_mtu = ETH_MIN_MTU;
+ -	dev->max_mtu = 0xFFF8 - dev->hard_header_len - t_hlen;
+  	ip_tunnel_add(itn, nt);
+  	return nt;
++ 
++ err_dev_set_mtu:
++ 	unregister_netdevice(dev);
++ 	return ERR_PTR(err);
+  }
+  
+  int ip_tunnel_rcv(struct ip_tunnel *tunnel, struct sk_buff *skb,
+@@@ -1053,21 -1108,19 +1066,28 @@@ int ip_tunnel_newlink(struct net_devic
+  
+  	nt->net = net;
+  	nt->parms = *p;
+ -	nt->fwmark = fwmark;
+  	err = register_netdevice(dev);
+  	if (err)
+- 		goto out;
++ 		goto err_register_netdevice;
+  
+  	if (dev->type == ARPHRD_ETHER && !tb[IFLA_ADDRESS])
+  		eth_hw_addr_random(dev);
+  
+  	mtu = ip_tunnel_bind_dev(dev);
+++<<<<<<< HEAD
+ +	if (tb[IFLA_MTU]) {
+ +		unsigned int max = 0xfff8 - dev->hard_header_len - nt->hlen;
+ +
+ +		dev->mtu = clamp(dev->mtu, (unsigned int)ETH_MIN_MTU,
+ +				 (unsigned int)(max - sizeof(struct iphdr)));
+ +	} else {
+ +		dev->mtu = mtu;
+++=======
++ 	if (!tb[IFLA_MTU]) {
++ 		err = dev_set_mtu(dev, mtu);
++ 		if (err)
++ 			goto err_dev_set_mtu;
+++>>>>>>> f6cc9c054e77 (ip_tunnel: Emit events for post-register MTU changes)
+  	}
+  
+  	ip_tunnel_add(itn, nt);
+* Unmerged path net/ipv4/ip_tunnel.c
