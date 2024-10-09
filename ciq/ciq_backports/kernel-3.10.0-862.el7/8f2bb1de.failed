@@ -1,0 +1,139 @@
+hv_netvsc: avoid unnecessary wakeups on subchannel creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit 8f2bb1de73344dbedd4195016b782bee7bf3598f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8f2bb1de.failed
+
+Only need to wakeup the initiator after all sub-channels
+are opened.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8f2bb1de73344dbedd4195016b782bee7bf3598f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/rndis_filter.c
+index b6bc44dd1f92,065b204d8e17..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -925,22 -1037,99 +925,27 @@@ static void netvsc_sc_open(struct vmbus
+  	 */
+  	set_channel_read_mode(new_sc, HV_CALL_ISR);
+  
+ -	/* Set the channel before opening.*/
+ -	nvchan->channel = new_sc;
+ -
+  	ret = vmbus_open(new_sc, nvscdev->ring_size * PAGE_SIZE,
+  			 nvscdev->ring_size * PAGE_SIZE, NULL, 0,
+ -			 netvsc_channel_cb, nvchan);
+ -	if (ret == 0)
+ -		napi_enable(&nvchan->napi);
+ -	else
+ -		netdev_notice(ndev, "sub channel open failed: %d\n", ret);
+ +			 netvsc_channel_cb, new_sc);
+  
+ +	if (ret == 0)
+ +		nvscdev->chn_table[chn_index] = new_sc;
+ +
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&nvscdev->sc_lock, flags);
+ +	nvscdev->num_sc_offered--;
+ +	spin_unlock_irqrestore(&nvscdev->sc_lock, flags);
+ +	if (nvscdev->num_sc_offered == 0)
+ +		complete(&nvscdev->channel_init_wait);
+++=======
++ 	if (atomic_inc_return(&nvscdev->open_chn) == nvscdev->num_chn)
++ 		wake_up(&nvscdev->subchan_open);
+++>>>>>>> 8f2bb1de7334 (hv_netvsc: avoid unnecessary wakeups on subchannel creation)
+  }
+  
+ -/* Open sub-channels after completing the handling of the device probe.
+ - * This breaks overlap of processing the host message for the
+ - * new primary channel with the initialization of sub-channels.
+ - */
+ -void rndis_set_subchannel(struct work_struct *w)
+ -{
+ -	struct netvsc_device *nvdev
+ -		= container_of(w, struct netvsc_device, subchan_work);
+ -	struct nvsp_message *init_packet = &nvdev->channel_init_pkt;
+ -	struct net_device_context *ndev_ctx;
+ -	struct rndis_device *rdev;
+ -	struct net_device *ndev;
+ -	struct hv_device *hv_dev;
+ -	int i, ret;
+ -
+ -	if (!rtnl_trylock()) {
+ -		schedule_work(w);
+ -		return;
+ -	}
+ -
+ -	rdev = nvdev->extension;
+ -	if (!rdev)
+ -		goto unlock;	/* device was removed */
+ -
+ -	ndev = rdev->ndev;
+ -	ndev_ctx = netdev_priv(ndev);
+ -	hv_dev = ndev_ctx->device_ctx;
+ -
+ -	memset(init_packet, 0, sizeof(struct nvsp_message));
+ -	init_packet->hdr.msg_type = NVSP_MSG5_TYPE_SUBCHANNEL;
+ -	init_packet->msg.v5_msg.subchn_req.op = NVSP_SUBCHANNEL_ALLOCATE;
+ -	init_packet->msg.v5_msg.subchn_req.num_subchannels =
+ -						nvdev->num_chn - 1;
+ -	ret = vmbus_sendpacket(hv_dev->channel, init_packet,
+ -			       sizeof(struct nvsp_message),
+ -			       (unsigned long)init_packet,
+ -			       VM_PKT_DATA_INBAND,
+ -			       VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
+ -	if (ret) {
+ -		netdev_err(ndev, "sub channel allocate send failed: %d\n", ret);
+ -		goto failed;
+ -	}
+ -
+ -	wait_for_completion(&nvdev->channel_init_wait);
+ -	if (init_packet->msg.v5_msg.subchn_comp.status != NVSP_STAT_SUCCESS) {
+ -		netdev_err(ndev, "sub channel request failed\n");
+ -		goto failed;
+ -	}
+ -
+ -	nvdev->num_chn = 1 +
+ -		init_packet->msg.v5_msg.subchn_comp.num_subchannels;
+ -
+ -	/* wait for all sub channels to open */
+ -	wait_event(nvdev->subchan_open,
+ -		   atomic_read(&nvdev->open_chn) == nvdev->num_chn);
+ -
+ -	/* ignore failues from setting rss parameters, still have channels */
+ -	rndis_filter_set_rss_param(rdev, netvsc_hash_key);
+ -
+ -	netif_set_real_num_tx_queues(ndev, nvdev->num_chn);
+ -	netif_set_real_num_rx_queues(ndev, nvdev->num_chn);
+ -
+ -	rtnl_unlock();
+ -	return;
+ -
+ -failed:
+ -	/* fallback to only primary channel */
+ -	for (i = 1; i < nvdev->num_chn; i++)
+ -		netif_napi_del(&nvdev->chan_table[i].napi);
+ -
+ -	nvdev->max_chn = 1;
+ -	nvdev->num_chn = 1;
+ -unlock:
+ -	rtnl_unlock();
+ -}
+ -
+ -struct netvsc_device *rndis_filter_device_add(struct hv_device *dev,
+ -				      struct netvsc_device_info *device_info)
+ +int rndis_filter_device_add(struct hv_device *dev,
+ +			    void *additional_info)
+  {
+  	struct net_device *net = hv_get_drvdata(dev);
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+* Unmerged path drivers/net/hyperv/rndis_filter.c
