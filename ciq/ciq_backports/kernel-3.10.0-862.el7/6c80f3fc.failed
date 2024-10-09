@@ -1,0 +1,179 @@
+netvsc: report per-channel stats in ethtool statistics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Simon Xiao <sixiao@microsoft.com>
+commit 6c80f3fc2398aef22798e8ac4258454b1062f3fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6c80f3fc.failed
+
+Report packets and bytes transferred through a vmbus channel via ethtool.
+This supersedes need for per-cpu statistics.
+
+Example:
+$ ethtool -S eth0
+NIC statistics:
+...
+     tx_queue_0_packets: 3523179
+     tx_queue_0_bytes: 505370920
+     rx_queue_0_packets: 41430490
+     rx_queue_0_bytes: 62714661254
+     tx_queue_1_packets: 0
+     tx_queue_1_bytes: 0
+     rx_queue_1_packets: 0
+     rx_queue_1_bytes: 0
+...
+
+	Reviewed-by: Long Li <longli@microsoft.com>
+	Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: Simon Xiao <sixiao@microsoft.com>
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6c80f3fc2398aef22798e8ac4258454b1062f3fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 2fcad1f01688,d3e73ac158ae..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -695,8 -698,7 +695,12 @@@ struct net_device_context 
+  	struct work_struct work;
+  	u32 msg_enable; /* debug level */
+  
+++<<<<<<< HEAD
+ +	struct netvsc_stats __percpu *tx_stats;
+ +	struct netvsc_stats __percpu *rx_stats;
+++=======
++ 	u32 tx_checksum_mask;
+++>>>>>>> 6c80f3fc2398 (netvsc: report per-channel stats in ethtool statistics)
+  
+  	/* Ethtool settings */
+  	u8 duplex;
+@@@ -715,6 -717,17 +719,20 @@@
+  	u32 vf_serial;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Per channel data */
++ struct netvsc_channel {
++ 	struct vmbus_channel *channel;
++ 	struct multi_send_data msd;
++ 	struct multi_recv_comp mrc;
++ 	atomic_t queue_sends;
++ 
++ 	struct netvsc_stats tx_stats;
++ 	struct netvsc_stats rx_stats;
++ };
++ 
+++>>>>>>> 6c80f3fc2398 (netvsc: report per-channel stats in ethtool statistics)
+  /* Per netvsc device */
+  struct netvsc_device {
+  	u32 nvsp_version;
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index d6591d7a4086,fe0df72532a3..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -931,38 -880,43 +933,43 @@@ out
+  	return ret;
+  }
+  
+ -static void netvsc_get_stats64(struct net_device *net,
+ -			       struct rtnl_link_stats64 *t)
+ +static struct rtnl_link_stats64 *netvsc_get_stats64(struct net_device *net,
+ +						    struct rtnl_link_stats64 *t)
+  {
+  	struct net_device_context *ndev_ctx = netdev_priv(net);
+- 	int cpu;
+- 
+- 	for_each_possible_cpu(cpu) {
+- 		struct netvsc_stats *tx_stats = per_cpu_ptr(ndev_ctx->tx_stats,
+- 							    cpu);
+- 		struct netvsc_stats *rx_stats = per_cpu_ptr(ndev_ctx->rx_stats,
+- 							    cpu);
+- 		u64 tx_packets, tx_bytes, rx_packets, rx_bytes, rx_multicast;
++ 	struct netvsc_device *nvdev = ndev_ctx->nvdev;
++ 	int i;
++ 
++ 	if (!nvdev)
++ 		return;
++ 
++ 	for (i = 0; i < nvdev->num_chn; i++) {
++ 		const struct netvsc_channel *nvchan = &nvdev->chan_table[i];
++ 		const struct netvsc_stats *stats;
++ 		u64 packets, bytes, multicast;
+  		unsigned int start;
+  
++ 		stats = &nvchan->tx_stats;
+  		do {
+- 			start = u64_stats_fetch_begin_irq(&tx_stats->syncp);
+- 			tx_packets = tx_stats->packets;
+- 			tx_bytes = tx_stats->bytes;
+- 		} while (u64_stats_fetch_retry_irq(&tx_stats->syncp, start));
++ 			start = u64_stats_fetch_begin_irq(&stats->syncp);
++ 			packets = stats->packets;
++ 			bytes = stats->bytes;
++ 		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
++ 
++ 		t->tx_bytes	+= bytes;
++ 		t->tx_packets	+= packets;
+  
++ 		stats = &nvchan->rx_stats;
+  		do {
+- 			start = u64_stats_fetch_begin_irq(&rx_stats->syncp);
+- 			rx_packets = rx_stats->packets;
+- 			rx_bytes = rx_stats->bytes;
+- 			rx_multicast = rx_stats->multicast + rx_stats->broadcast;
+- 		} while (u64_stats_fetch_retry_irq(&rx_stats->syncp, start));
+- 
+- 		t->tx_bytes	+= tx_bytes;
+- 		t->tx_packets	+= tx_packets;
+- 		t->rx_bytes	+= rx_bytes;
+- 		t->rx_packets	+= rx_packets;
+- 		t->multicast	+= rx_multicast;
++ 			start = u64_stats_fetch_begin_irq(&stats->syncp);
++ 			packets = stats->packets;
++ 			bytes = stats->bytes;
++ 			multicast = stats->multicast + stats->broadcast;
++ 		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
++ 
++ 		t->rx_bytes	+= bytes;
++ 		t->rx_packets	+= packets;
++ 		t->multicast	+= multicast;
+  	}
+  
+  	t->tx_dropped	= net->stats.tx_dropped;
+@@@ -1532,8 -1521,8 +1567,13 @@@ static int netvsc_probe(struct hv_devic
+  	ret = register_netdev(net);
+  	if (ret != 0) {
+  		pr_err("Unable to register netdev.\n");
+++<<<<<<< HEAD
+ +		rndis_filter_device_remove(dev);
+ +		netvsc_free_netdev(net);
+++=======
++ 		rndis_filter_device_remove(dev, nvdev);
++ 		free_netdev(net);
+++>>>>>>> 6c80f3fc2398 (netvsc: report per-channel stats in ethtool statistics)
+  	}
+  
+  	return ret;
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 0a187d70b206..496f3fdd4c24 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -636,7 +636,7 @@ static void netvsc_send_tx_complete(struct netvsc_device *net_device,
+ 		q_idx = packet->q_idx;
+ 		channel = incoming_channel;
+ 
+-		tx_stats = this_cpu_ptr(net_device_ctx->tx_stats);
++		tx_stats = &net_device->chan_table[q_idx].tx_stats;
+ 
+ 		u64_stats_update_begin(&tx_stats->syncp);
+ 		tx_stats->packets += packet->total_packets;
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
