@@ -850,6 +850,9 @@ struct net_device *hfi1_vnic_alloc_rn(struct ib_device *device,
 	struct rdma_netdev *rn;
 	int i, size, rc;
 
+	if (!dd->num_vnic_contexts)
+		return ERR_PTR(-ENOMEM);
+
 	if (!port_num || (port_num > dd->num_pports))
 		return ERR_PTR(-EINVAL);
 
@@ -858,7 +861,7 @@ struct net_device *hfi1_vnic_alloc_rn(struct ib_device *device,
 
 	size = sizeof(struct opa_vnic_rdma_netdev) + sizeof(*vinfo);
 	netdev = alloc_netdev_mqs(size, name, name_assign_type, setup,
-				  dd->chip_sdma_engines, HFI1_NUM_VNIC_CTXT);
+				  dd->chip_sdma_engines, dd->num_vnic_contexts);
 	if (!netdev)
 		return ERR_PTR(-ENOMEM);
 
@@ -866,7 +869,7 @@ struct net_device *hfi1_vnic_alloc_rn(struct ib_device *device,
 	vinfo = opa_vnic_dev_priv(netdev);
 	vinfo->dd = dd;
 	vinfo->num_tx_q = dd->chip_sdma_engines;
-	vinfo->num_rx_q = HFI1_NUM_VNIC_CTXT;
+	vinfo->num_rx_q = dd->num_vnic_contexts;
 	vinfo->netdev = netdev;
 	rn->set_id = hfi1_vnic_set_vesw_id;
 
