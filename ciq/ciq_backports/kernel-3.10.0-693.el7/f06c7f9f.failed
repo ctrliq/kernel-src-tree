@@ -1,0 +1,264 @@
+vlan: rename __vlan_find_dev_deep() to __vlan_find_dev_deep_rcu()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author dingtianhong <dingtianhong@huawei.com>
+commit f06c7f9f92295faf701a9628b383156c4efb6119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f06c7f9f.failed
+
+The __vlan_find_dev_deep should always called in RCU, according
+David's suggestion, rename to __vlan_find_dev_deep_rcu looks more
+reasonable.
+
+	Signed-off-by: Ding Tianhong <dingtianhong@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f06c7f9f92295faf701a9628b383156c4efb6119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+#	include/linux/if_vlan.h
+#	net/bridge/br_netfilter_hooks.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 66dc3822a941,0f1e886d89e3..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -2688,6 -4030,55 +2688,58 @@@ static struct notifier_block cxgb4_inet
+  	.notifier_call = cxgb4_inet6addr_handler
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Retrieves IPv6 addresses from a root device (bond, vlan) associated with
++  * a physical device.
++  * The physical device reference is needed to send the actul CLIP command.
++  */
++ static int update_dev_clip(struct net_device *root_dev, struct net_device *dev)
++ {
++ 	struct inet6_dev *idev = NULL;
++ 	struct inet6_ifaddr *ifa;
++ 	int ret = 0;
++ 
++ 	idev = __in6_dev_get(root_dev);
++ 	if (!idev)
++ 		return ret;
++ 
++ 	read_lock_bh(&idev->lock);
++ 	list_for_each_entry(ifa, &idev->addr_list, if_list) {
++ 		ret = cxgb4_clip_get(dev,
++ 				(const struct in6_addr *)ifa->addr.s6_addr);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 	read_unlock_bh(&idev->lock);
++ 
++ 	return ret;
++ }
++ 
++ static int update_root_dev_clip(struct net_device *dev)
++ {
++ 	struct net_device *root_dev = NULL;
++ 	int i, ret = 0;
++ 
++ 	/* First populate the real net device's IPv6 addresses */
++ 	ret = update_dev_clip(dev, dev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Parse all bond and vlan devices layered on top of the physical dev */
++ 	for (i = 0; i < VLAN_N_VID; i++) {
++ 		root_dev = __vlan_find_dev_deep_rcu(dev, htons(ETH_P_8021Q), i);
++ 		if (!root_dev)
++ 			continue;
++ 
++ 		ret = update_dev_clip(root_dev, dev);
++ 		if (ret)
++ 			break;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> f06c7f9f9229 (vlan: rename __vlan_find_dev_deep() to __vlan_find_dev_deep_rcu())
+  static void update_clip(const struct adapter *adap)
+  {
+  	int i;
+diff --cc include/linux/if_vlan.h
+index 5af613815030,8c0fb7f3a9a5..000000000000
+--- a/include/linux/if_vlan.h
++++ b/include/linux/if_vlan.h
+@@@ -124,6 -104,26 +124,29 @@@ struct vlan_pcpu_stats 
+  	u32			tx_dropped;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
++ 
++ extern struct net_device *__vlan_find_dev_deep_rcu(struct net_device *real_dev,
++ 					       __be16 vlan_proto, u16 vlan_id);
++ extern struct net_device *vlan_dev_real_dev(const struct net_device *dev);
++ extern u16 vlan_dev_vlan_id(const struct net_device *dev);
++ extern __be16 vlan_dev_vlan_proto(const struct net_device *dev);
++ 
++ /**
++  *	struct vlan_priority_tci_mapping - vlan egress priority mappings
++  *	@priority: skb priority
++  *	@vlan_qos: vlan priority: (skb->priority << 13) & 0xE000
++  *	@next: pointer to next struct
++  */
++ struct vlan_priority_tci_mapping {
++ 	u32					priority;
++ 	u16					vlan_qos;
++ 	struct vlan_priority_tci_mapping	*next;
++ };
++ 
+++>>>>>>> f06c7f9f9229 (vlan: rename __vlan_find_dev_deep() to __vlan_find_dev_deep_rcu())
+  struct proc_dir_entry;
+  struct netpoll;
+  
+diff --cc net/bridge/br_netfilter_hooks.c
+index 91eb423bf588,a615264cf01a..000000000000
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@@ -424,11 -532,11 +424,16 @@@ static struct net_device *brnf_get_logi
+  	struct net_device *vlan, *br;
+  
+  	br = bridge_parent(dev);
+ -	if (brnf_pass_vlan_indev == 0 || !vlan_tx_tag_present(skb))
+ +	if (brnf_pass_vlan_indev == 0 || !skb_vlan_tag_present(skb))
+  		return br;
+  
+++<<<<<<< HEAD:net/bridge/br_netfilter_hooks.c
+ +	vlan = __vlan_find_dev_deep(br, skb->vlan_proto,
+ +				    skb_vlan_tag_get(skb) & VLAN_VID_MASK);
+++=======
++ 	vlan = __vlan_find_dev_deep_rcu(br, skb->vlan_proto,
++ 				    vlan_tx_tag_get(skb) & VLAN_VID_MASK);
+++>>>>>>> f06c7f9f9229 (vlan: rename __vlan_find_dev_deep() to __vlan_find_dev_deep_rcu()):net/bridge/br_netfilter.c
+  
+  	return vlan ? vlan : br;
+  }
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
+index b40ff0ce9006..c560f5f30f73 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
+@@ -185,7 +185,7 @@ static struct net_device *get_iff_from_mac(struct adapter *adapter,
+ 		if (!memcmp(dev->dev_addr, mac, ETH_ALEN)) {
+ 			rcu_read_lock();
+ 			if (vlan && vlan != VLAN_VID_MASK) {
+-				dev = __vlan_find_dev_deep(dev, htons(ETH_P_8021Q), vlan);
++				dev = __vlan_find_dev_deep_rcu(dev, htons(ETH_P_8021Q), vlan);
+ 			} else if (netif_is_bond_slave(dev)) {
+ 				struct net_device *upper_dev;
+ 
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index bd6ea0956388..e92ea05bd01e 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -4197,7 +4197,7 @@ void qlcnic_restore_indev_addr(struct net_device *netdev, unsigned long event)
+ 
+ 	rcu_read_lock();
+ 	for_each_set_bit(vid, adapter->vlans, VLAN_N_VID) {
+-		dev = __vlan_find_dev_deep(netdev, htons(ETH_P_8021Q), vid);
++		dev = __vlan_find_dev_deep_rcu(netdev, htons(ETH_P_8021Q), vid);
+ 		if (!dev)
+ 			continue;
+ 		qlcnic_config_indev_addr(adapter, dev, event);
+diff --git a/drivers/net/usb/cdc_mbim.c b/drivers/net/usb/cdc_mbim.c
+index 551dffb78814..24b0b1a98572 100644
+--- a/drivers/net/usb/cdc_mbim.c
++++ b/drivers/net/usb/cdc_mbim.c
+@@ -323,8 +323,8 @@ static void do_neigh_solicit(struct usbnet *dev, u8 *buf, u16 tci)
+ 	/* need to send the NA on the VLAN dev, if any */
+ 	rcu_read_lock();
+ 	if (tci) {
+-		netdev = __vlan_find_dev_deep(dev->net, htons(ETH_P_8021Q),
+-					      tci);
++		netdev = __vlan_find_dev_deep_rcu(dev->net, htons(ETH_P_8021Q),
++						  tci);
+ 		if (!netdev) {
+ 			rcu_read_unlock();
+ 			return;
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index 67a4baae2420..41afafd8432d 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -1659,7 +1659,7 @@ static void qeth_l3_add_vlan_mc(struct qeth_card *card)
+ 	for_each_set_bit(vid, card->active_vlans, VLAN_N_VID) {
+ 		struct net_device *netdev;
+ 
+-		netdev = __vlan_find_dev_deep(card->dev, htons(ETH_P_8021Q),
++		netdev = __vlan_find_dev_deep_rcu(card->dev, htons(ETH_P_8021Q),
+ 					      vid);
+ 		if (netdev == NULL ||
+ 		    !(netdev->flags & IFF_UP))
+@@ -1721,7 +1721,7 @@ static void qeth_l3_add_vlan_mc6(struct qeth_card *card)
+ 	for_each_set_bit(vid, card->active_vlans, VLAN_N_VID) {
+ 		struct net_device *netdev;
+ 
+-		netdev = __vlan_find_dev_deep(card->dev, htons(ETH_P_8021Q),
++		netdev = __vlan_find_dev_deep_rcu(card->dev, htons(ETH_P_8021Q),
+ 					      vid);
+ 		if (netdev == NULL ||
+ 		    !(netdev->flags & IFF_UP))
+@@ -1766,7 +1766,7 @@ static void qeth_l3_free_vlan_addresses4(struct qeth_card *card,
+ 
+ 	QETH_CARD_TEXT(card, 4, "frvaddr4");
+ 
+-	netdev = __vlan_find_dev_deep(card->dev, htons(ETH_P_8021Q), vid);
++	netdev = __vlan_find_dev_deep_rcu(card->dev, htons(ETH_P_8021Q), vid);
+ 	if (!netdev)
+ 		return;
+ 	in_dev = in_dev_get(netdev);
+@@ -1796,7 +1796,7 @@ static void qeth_l3_free_vlan_addresses6(struct qeth_card *card,
+ 
+ 	QETH_CARD_TEXT(card, 4, "frvaddr6");
+ 
+-	netdev = __vlan_find_dev_deep(card->dev, htons(ETH_P_8021Q), vid);
++	netdev = __vlan_find_dev_deep_rcu(card->dev, htons(ETH_P_8021Q), vid);
+ 	if (!netdev)
+ 		return;
+ 	in6_dev = in6_dev_get(netdev);
+@@ -2089,7 +2089,7 @@ static int qeth_l3_verify_vlan_dev(struct net_device *dev,
+ 		struct net_device *netdev;
+ 
+ 		rcu_read_lock();
+-		netdev = __vlan_find_dev_deep(card->dev, htons(ETH_P_8021Q),
++		netdev = __vlan_find_dev_deep_rcu(card->dev, htons(ETH_P_8021Q),
+ 					      vid);
+ 		rcu_read_unlock();
+ 		if (netdev == dev) {
+* Unmerged path include/linux/if_vlan.h
+diff --git a/net/8021q/vlan_core.c b/net/8021q/vlan_core.c
+index adc304a5da9b..818d784952f4 100644
+--- a/net/8021q/vlan_core.c
++++ b/net/8021q/vlan_core.c
+@@ -65,7 +65,7 @@ bool vlan_do_receive(struct sk_buff **skbp)
+ }
+ 
+ /* Must be invoked with rcu_read_lock. */
+-struct net_device *__vlan_find_dev_deep(struct net_device *dev,
++struct net_device *__vlan_find_dev_deep_rcu(struct net_device *dev,
+ 					__be16 vlan_proto, u16 vlan_id)
+ {
+ 	struct vlan_info *vlan_info = rcu_dereference(dev->vlan_info);
+@@ -83,13 +83,13 @@ struct net_device *__vlan_find_dev_deep(struct net_device *dev,
+ 
+ 		upper_dev = netdev_master_upper_dev_get_rcu(dev);
+ 		if (upper_dev)
+-			return __vlan_find_dev_deep(upper_dev,
++			return __vlan_find_dev_deep_rcu(upper_dev,
+ 						    vlan_proto, vlan_id);
+ 	}
+ 
+ 	return NULL;
+ }
+-EXPORT_SYMBOL(__vlan_find_dev_deep);
++EXPORT_SYMBOL(__vlan_find_dev_deep_rcu);
+ 
+ struct net_device *vlan_dev_real_dev(const struct net_device *dev)
+ {
+* Unmerged path net/bridge/br_netfilter_hooks.c
