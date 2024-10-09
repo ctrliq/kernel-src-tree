@@ -1,0 +1,688 @@
+IB/hfi1: Create common expected receive verbs/PSM code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit 9c1a99c3882beb9e88ed41d914e75bab2d593926
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9c1a99c3.failed
+
+Declarations and code in common between verbs and PSM are now moved
+to exp_rcv.[ch].
+
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Reviewed-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9c1a99c3882beb9e88ed41d914e75bab2d593926)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+#	drivers/infiniband/hw/hfi1/user_exp_rcv.c
+#	drivers/infiniband/hw/hfi1/user_exp_rcv.h
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 32dd4a920494,2dd8758f0644..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -1222,54 -1243,37 +1222,77 @@@ static int setup_ctxt(struct file *fp
+  	struct hfi1_devdata *dd = uctxt->dd;
+  	int ret = 0;
+  
+ -	hfi1_init_ctxt(uctxt->sc);
+ +	/*
+ +	 * Context should be set up only once, including allocation and
+ +	 * programming of eager buffers. This is done if context sharing
+ +	 * is not requested or by the master process.
+ +	 */
+ +	if (!uctxt->subctxt_cnt || !fd->subctxt) {
+ +		ret = hfi1_init_ctxt(uctxt->sc);
+ +		if (ret)
+ +			goto done;
+  
+ -	/* Now allocate the RcvHdr queue and eager buffers. */
+ -	ret = hfi1_create_rcvhdrq(dd, uctxt);
+ -	if (ret)
+ -		return ret;
+ +		/* Now allocate the RcvHdr queue and eager buffers. */
+ +		ret = hfi1_create_rcvhdrq(dd, uctxt);
+ +		if (ret)
+ +			goto done;
+ +		ret = hfi1_setup_eagerbufs(uctxt);
+ +		if (ret)
+ +			goto done;
+ +		if (uctxt->subctxt_cnt && !fd->subctxt) {
+ +			ret = setup_subctxt(uctxt);
+ +			if (ret)
+ +				goto done;
+ +		}
+ +	} else {
+ +		ret = wait_event_interruptible(uctxt->wait, !test_bit(
+ +					       HFI1_CTXT_MASTER_UNINIT,
+ +					       &uctxt->event_flags));
+ +		if (ret)
+ +			goto done;
+ +	}
+  
+ -	ret = hfi1_setup_eagerbufs(uctxt);
+ +	ret = hfi1_user_sdma_alloc_queues(uctxt, fp);
+  	if (ret)
+ -		goto setup_failed;
+ +		goto done;
+ +	/*
+ +	 * Expected receive has to be setup for all processes (including
+ +	 * shared contexts). However, it has to be done after the master
+ +	 * context has been fully configured as it depends on the
+ +	 * eager/expected split of the RcvArray entries.
+ +	 * Setting it up here ensures that the subcontexts will be waiting
+ +	 * (due to the above wait_event_interruptible() until the master
+ +	 * is setup.
+ +	 */
+ +	ret = hfi1_user_exp_rcv_init(fp);
+ +	if (ret)
+ +		goto done;
+  
+++<<<<<<< HEAD
+ +	set_bit(HFI1_CTXT_SETUP_DONE, &uctxt->event_flags);
+ +done:
+++=======
++ 	/* If sub-contexts are enabled, do the appropriate setup */
++ 	if (uctxt->subctxt_cnt)
++ 		ret = setup_subctxt(uctxt);
++ 	if (ret)
++ 		goto setup_failed;
++ 
++ 	ret = hfi1_alloc_ctxt_rcv_groups(uctxt);
++ 	if (ret)
++ 		goto setup_failed;
++ 
++ 	ret = init_user_ctxt(fd);
++ 	if (ret)
++ 		goto setup_failed;
++ 
++ 	user_init(uctxt);
++ 
++ 	return 0;
++ 
++ setup_failed:
++ 	hfi1_free_ctxtdata(dd, uctxt);
+++>>>>>>> 9c1a99c3882b (IB/hfi1: Create common expected receive verbs/PSM code)
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/hfi1/user_exp_rcv.c
+index c7f13df471c4,6318e6ca1b18..000000000000
+--- a/drivers/infiniband/hw/hfi1/user_exp_rcv.c
++++ b/drivers/infiniband/hw/hfi1/user_exp_rcv.c
+@@@ -51,14 -51,6 +51,17 @@@
+  #include "trace.h"
+  #include "mmu_rb.h"
+  
+++<<<<<<< HEAD
+ +struct tid_group {
+ +	struct list_head list;
+ +	unsigned base;
+ +	u8 size;
+ +	u8 used;
+ +	u8 map;
+ +};
+ +
+++=======
+++>>>>>>> 9c1a99c3882b (IB/hfi1: Create common expected receive verbs/PSM code)
+  struct tid_rb_node {
+  	struct mmu_rb_node mmu;
+  	unsigned long phys;
+@@@ -104,51 -99,6 +105,54 @@@ static struct mmu_rb_ops tid_rb_ops = 
+  	.invalidate = tid_rb_invalidate
+  };
+  
+++<<<<<<< HEAD
+ +static inline u32 rcventry2tidinfo(u32 rcventry)
+ +{
+ +	u32 pair = rcventry & ~0x1;
+ +
+ +	return EXP_TID_SET(IDX, pair >> 1) |
+ +		EXP_TID_SET(CTRL, 1 << (rcventry - pair));
+ +}
+ +
+ +static inline void exp_tid_group_init(struct exp_tid_set *set)
+ +{
+ +	INIT_LIST_HEAD(&set->list);
+ +	set->count = 0;
+ +}
+ +
+ +static inline void tid_group_remove(struct tid_group *grp,
+ +				    struct exp_tid_set *set)
+ +{
+ +	list_del_init(&grp->list);
+ +	set->count--;
+ +}
+ +
+ +static inline void tid_group_add_tail(struct tid_group *grp,
+ +				      struct exp_tid_set *set)
+ +{
+ +	list_add_tail(&grp->list, &set->list);
+ +	set->count++;
+ +}
+ +
+ +static inline struct tid_group *tid_group_pop(struct exp_tid_set *set)
+ +{
+ +	struct tid_group *grp =
+ +		list_first_entry(&set->list, struct tid_group, list);
+ +	list_del_init(&grp->list);
+ +	set->count--;
+ +	return grp;
+ +}
+ +
+ +static inline void tid_group_move(struct tid_group *group,
+ +				  struct exp_tid_set *s1,
+ +				  struct exp_tid_set *s2)
+ +{
+ +	tid_group_remove(group, s1);
+ +	tid_group_add_tail(group, s2);
+ +}
+ +
+++=======
+++>>>>>>> 9c1a99c3882b (IB/hfi1: Create common expected receive verbs/PSM code)
+  /*
+   * Initialize context and file private data needed for Expected
+   * receive caching. This needs to be done after the context has
+@@@ -252,19 -174,7 +256,23 @@@ done
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void hfi1_user_exp_rcv_grp_free(struct hfi1_ctxtdata *uctxt)
+ +{
+ +	struct tid_group *grp, *gptr;
+ +
+ +	list_for_each_entry_safe(grp, gptr, &uctxt->tid_group_list.list,
+ +				 list) {
+ +		list_del_init(&grp->list);
+ +		kfree(grp);
+ +	}
+ +	hfi1_clear_tids(uctxt);
+ +}
+ +
+ +int hfi1_user_exp_rcv_free(struct hfi1_filedata *fd)
+++=======
++ void hfi1_user_exp_rcv_free(struct hfi1_filedata *fd)
+++>>>>>>> 9c1a99c3882b (IB/hfi1: Create common expected receive verbs/PSM code)
+  {
+  	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+  
+@@@ -286,26 -196,8 +294,9 @@@
+  
+  	kfree(fd->entry_to_rb);
+  	fd->entry_to_rb = NULL;
+ +	return 0;
+  }
+  
+- /*
+-  * Write an "empty" RcvArray entry.
+-  * This function exists so the TID registaration code can use it
+-  * to write to unused/unneeded entries and still take advantage
+-  * of the WC performance improvements. The HFI will ignore this
+-  * write to the RcvArray entry.
+-  */
+- static inline void rcv_array_wc_fill(struct hfi1_devdata *dd, u32 index)
+- {
+- 	/*
+- 	 * Doing the WC fill writes only makes sense if the device is
+- 	 * present and the RcvArray has been mapped as WC memory.
+- 	 */
+- 	if ((dd->flags & HFI1_PRESENT) && dd->rcvarray_wc)
+- 		writeq(0, dd->rcvarray_wc + (index * 8));
+- }
+- 
+  /*
+   * RcvArray entry allocation for Expected Receives is done by the
+   * following algorithm:
+diff --cc drivers/infiniband/hw/hfi1/user_exp_rcv.h
+index d1d7d3d3bd44,1bdc61be53cb..000000000000
+--- a/drivers/infiniband/hw/hfi1/user_exp_rcv.h
++++ b/drivers/infiniband/hw/hfi1/user_exp_rcv.h
+@@@ -49,32 -49,15 +49,36 @@@
+  
+  #include "hfi.h"
+  
+- #define EXP_TID_TIDLEN_MASK   0x7FFULL
+- #define EXP_TID_TIDLEN_SHIFT  0
+- #define EXP_TID_TIDCTRL_MASK  0x3ULL
+- #define EXP_TID_TIDCTRL_SHIFT 20
+- #define EXP_TID_TIDIDX_MASK   0x3FFULL
+- #define EXP_TID_TIDIDX_SHIFT  22
+- #define EXP_TID_GET(tid, field)	\
+- 	(((tid) >> EXP_TID_TID##field##_SHIFT) & EXP_TID_TID##field##_MASK)
++ #include "exp_rcv.h"
+  
+++<<<<<<< HEAD
+ +#define EXP_TID_SET(field, value)			\
+ +	(((value) & EXP_TID_TID##field##_MASK) <<	\
+ +	 EXP_TID_TID##field##_SHIFT)
+ +#define EXP_TID_CLEAR(tid, field) ({					\
+ +		(tid) &= ~(EXP_TID_TID##field##_MASK <<			\
+ +			   EXP_TID_TID##field##_SHIFT);			\
+ +		})
+ +#define EXP_TID_RESET(tid, field, value) do {				\
+ +		EXP_TID_CLEAR(tid, field);				\
+ +		(tid) |= EXP_TID_SET(field, (value));			\
+ +	} while (0)
+ +
+ +void hfi1_user_exp_rcv_grp_free(struct hfi1_ctxtdata *uctxt);
+ +int hfi1_user_exp_rcv_init(struct file *);
+ +int hfi1_user_exp_rcv_free(struct hfi1_filedata *);
+ +int hfi1_user_exp_rcv_setup(struct file *, struct hfi1_tid_info *);
+ +int hfi1_user_exp_rcv_clear(struct file *, struct hfi1_tid_info *);
+ +int hfi1_user_exp_rcv_invalid(struct file *, struct hfi1_tid_info *);
+++=======
++ int hfi1_user_exp_rcv_init(struct hfi1_filedata *fd);
++ void hfi1_user_exp_rcv_free(struct hfi1_filedata *fd);
++ int hfi1_user_exp_rcv_setup(struct hfi1_filedata *fd,
++ 			    struct hfi1_tid_info *tinfo);
++ int hfi1_user_exp_rcv_clear(struct hfi1_filedata *fd,
++ 			    struct hfi1_tid_info *tinfo);
++ int hfi1_user_exp_rcv_invalid(struct hfi1_filedata *fd,
++ 			      struct hfi1_tid_info *tinfo);
+++>>>>>>> 9c1a99c3882b (IB/hfi1: Create common expected receive verbs/PSM code)
+  
+  #endif /* _HFI1_USER_EXP_RCV_H */
+diff --git a/drivers/infiniband/hw/hfi1/Makefile b/drivers/infiniband/hw/hfi1/Makefile
+index 88085f65432e..66d538c033b0 100644
+--- a/drivers/infiniband/hw/hfi1/Makefile
++++ b/drivers/infiniband/hw/hfi1/Makefile
+@@ -8,7 +8,7 @@
+ obj-$(CONFIG_INFINIBAND_HFI1) += hfi1.o
+ 
+ hfi1-y := affinity.o chip.o device.o driver.o efivar.o \
+-	eprom.o file_ops.o firmware.o \
++	eprom.o exp_rcv.o file_ops.o firmware.o \
+ 	init.o intr.o mad.o mmu_rb.o pcie.o pio.o pio_copy.o platform.o \
+ 	qp.o qsfp.o rc.o ruc.o sdma.o sysfs.o trace.o \
+ 	uc.o ud.o user_exp_rcv.o user_pages.o user_sdma.o verbs.o \
+diff --git a/drivers/infiniband/hw/hfi1/exp_rcv.c b/drivers/infiniband/hw/hfi1/exp_rcv.c
+new file mode 100644
+index 000000000000..08d13ed1b574
+--- /dev/null
++++ b/drivers/infiniband/hw/hfi1/exp_rcv.c
+@@ -0,0 +1,118 @@
++/*
++ * Copyright(c) 2017 Intel Corporation.
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * BSD LICENSE
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  - Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *  - Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *  - Neither the name of Intel Corporation nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++
++#include "exp_rcv.h"
++#include "trace.h"
++
++/**
++ * exp_tid_group_init - initialize exp_tid_set
++ * @set - the set
++ */
++void hfi1_exp_tid_group_init(struct exp_tid_set *set)
++{
++	INIT_LIST_HEAD(&set->list);
++	set->count = 0;
++}
++
++/**
++ * alloc_ctxt_rcv_groups - initialize expected receive groups
++ * @rcd - the context to add the groupings to
++ */
++int hfi1_alloc_ctxt_rcv_groups(struct hfi1_ctxtdata *rcd)
++{
++	struct hfi1_devdata *dd = rcd->dd;
++	u32 tidbase;
++	struct tid_group *grp;
++	int i;
++
++	hfi1_exp_tid_group_init(&rcd->tid_group_list);
++	hfi1_exp_tid_group_init(&rcd->tid_used_list);
++	hfi1_exp_tid_group_init(&rcd->tid_full_list);
++
++	tidbase = rcd->expected_base;
++	for (i = 0; i < rcd->expected_count /
++		     dd->rcv_entries.group_size; i++) {
++		grp = kzalloc(sizeof(*grp), GFP_KERNEL);
++		if (!grp)
++			goto bail;
++		grp->size = dd->rcv_entries.group_size;
++		grp->base = tidbase;
++		tid_group_add_tail(grp, &rcd->tid_group_list);
++		tidbase += dd->rcv_entries.group_size;
++	}
++
++	return 0;
++bail:
++	hfi1_free_ctxt_rcv_groups(rcd);
++	return -ENOMEM;
++}
++
++/**
++ * free_ctxt_rcv_groups - free  expected receive groups
++ * @rcd - the context to free
++ *
++ * The routine dismantles the expect receive linked
++ * list and clears any tids associated with the receive
++ * context.
++ *
++ * This should only be called for kernel contexts and the
++ * a base user context.
++ */
++void hfi1_free_ctxt_rcv_groups(struct hfi1_ctxtdata *rcd)
++{
++	struct tid_group *grp, *gptr;
++
++	WARN_ON(!EXP_TID_SET_EMPTY(rcd->tid_full_list));
++	WARN_ON(!EXP_TID_SET_EMPTY(rcd->tid_used_list));
++
++	list_for_each_entry_safe(grp, gptr, &rcd->tid_group_list.list, list) {
++		tid_group_remove(grp, &rcd->tid_group_list);
++		kfree(grp);
++	}
++
++	hfi1_clear_tids(rcd);
++}
+diff --git a/drivers/infiniband/hw/hfi1/exp_rcv.h b/drivers/infiniband/hw/hfi1/exp_rcv.h
+new file mode 100644
+index 000000000000..c7d02bcddded
+--- /dev/null
++++ b/drivers/infiniband/hw/hfi1/exp_rcv.h
+@@ -0,0 +1,187 @@
++#ifndef _HFI1_EXP_RCV_H
++#define _HFI1_EXP_RCV_H
++/*
++ * Copyright(c) 2017 Intel Corporation.
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * BSD LICENSE
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  - Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *  - Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *  - Neither the name of Intel Corporation nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++
++#include "hfi.h"
++
++#define EXP_TID_SET_EMPTY(set) (set.count == 0 && list_empty(&set.list))
++
++#define EXP_TID_TIDLEN_MASK   0x7FFULL
++#define EXP_TID_TIDLEN_SHIFT  0
++#define EXP_TID_TIDCTRL_MASK  0x3ULL
++#define EXP_TID_TIDCTRL_SHIFT 20
++#define EXP_TID_TIDIDX_MASK   0x3FFULL
++#define EXP_TID_TIDIDX_SHIFT  22
++#define EXP_TID_GET(tid, field)	\
++	(((tid) >> EXP_TID_TID##field##_SHIFT) & EXP_TID_TID##field##_MASK)
++
++#define EXP_TID_SET(field, value)			\
++	(((value) & EXP_TID_TID##field##_MASK) <<	\
++	 EXP_TID_TID##field##_SHIFT)
++#define EXP_TID_CLEAR(tid, field) ({					\
++		(tid) &= ~(EXP_TID_TID##field##_MASK <<			\
++			   EXP_TID_TID##field##_SHIFT);			\
++		})
++#define EXP_TID_RESET(tid, field, value) do {				\
++		EXP_TID_CLEAR(tid, field);				\
++		(tid) |= EXP_TID_SET(field, (value));			\
++	} while (0)
++
++/*
++ * Define fields in the KDETH header so we can update the header
++ * template.
++ */
++#define KDETH_OFFSET_SHIFT        0
++#define KDETH_OFFSET_MASK         0x7fff
++#define KDETH_OM_SHIFT            15
++#define KDETH_OM_MASK             0x1
++#define KDETH_TID_SHIFT           16
++#define KDETH_TID_MASK            0x3ff
++#define KDETH_TIDCTRL_SHIFT       26
++#define KDETH_TIDCTRL_MASK        0x3
++#define KDETH_INTR_SHIFT          28
++#define KDETH_INTR_MASK           0x1
++#define KDETH_SH_SHIFT            29
++#define KDETH_SH_MASK             0x1
++#define KDETH_KVER_SHIFT          30
++#define KDETH_KVER_MASK           0x3
++#define KDETH_JKEY_SHIFT          0x0
++#define KDETH_JKEY_MASK           0xff
++#define KDETH_HCRC_UPPER_SHIFT    16
++#define KDETH_HCRC_UPPER_MASK     0xff
++#define KDETH_HCRC_LOWER_SHIFT    24
++#define KDETH_HCRC_LOWER_MASK     0xff
++
++#define KDETH_GET(val, field)						\
++	(((le32_to_cpu((val))) >> KDETH_##field##_SHIFT) & KDETH_##field##_MASK)
++#define KDETH_SET(dw, field, val) do {					\
++		u32 dwval = le32_to_cpu(dw);				\
++		dwval &= ~(KDETH_##field##_MASK << KDETH_##field##_SHIFT); \
++		dwval |= (((val) & KDETH_##field##_MASK) << \
++			  KDETH_##field##_SHIFT);			\
++		dw = cpu_to_le32(dwval);				\
++	} while (0)
++
++#define KDETH_RESET(dw, field, val) ({ dw = 0; KDETH_SET(dw, field, val); })
++
++/* KDETH OM multipliers and switch over point */
++#define KDETH_OM_SMALL     4
++#define KDETH_OM_SMALL_SHIFT     2
++#define KDETH_OM_LARGE     64
++#define KDETH_OM_LARGE_SHIFT     6
++#define KDETH_OM_MAX_SIZE  (1 << ((KDETH_OM_LARGE / KDETH_OM_SMALL) + 1))
++
++struct tid_group {
++	struct list_head list;
++	u32 base;
++	u8 size;
++	u8 used;
++	u8 map;
++};
++
++/*
++ * Write an "empty" RcvArray entry.
++ * This function exists so the TID registaration code can use it
++ * to write to unused/unneeded entries and still take advantage
++ * of the WC performance improvements. The HFI will ignore this
++ * write to the RcvArray entry.
++ */
++static inline void rcv_array_wc_fill(struct hfi1_devdata *dd, u32 index)
++{
++	/*
++	 * Doing the WC fill writes only makes sense if the device is
++	 * present and the RcvArray has been mapped as WC memory.
++	 */
++	if ((dd->flags & HFI1_PRESENT) && dd->rcvarray_wc)
++		writeq(0, dd->rcvarray_wc + (index * 8));
++}
++
++static inline void tid_group_add_tail(struct tid_group *grp,
++				      struct exp_tid_set *set)
++{
++	list_add_tail(&grp->list, &set->list);
++	set->count++;
++}
++
++static inline void tid_group_remove(struct tid_group *grp,
++				    struct exp_tid_set *set)
++{
++	list_del_init(&grp->list);
++	set->count--;
++}
++
++static inline void tid_group_move(struct tid_group *group,
++				  struct exp_tid_set *s1,
++				  struct exp_tid_set *s2)
++{
++	tid_group_remove(group, s1);
++	tid_group_add_tail(group, s2);
++}
++
++static inline struct tid_group *tid_group_pop(struct exp_tid_set *set)
++{
++	struct tid_group *grp =
++		list_first_entry(&set->list, struct tid_group, list);
++	list_del_init(&grp->list);
++	set->count--;
++	return grp;
++}
++
++static inline u32 rcventry2tidinfo(u32 rcventry)
++{
++	u32 pair = rcventry & ~0x1;
++
++	return EXP_TID_SET(IDX, pair >> 1) |
++		EXP_TID_SET(CTRL, 1 << (rcventry - pair));
++}
++
++int hfi1_alloc_ctxt_rcv_groups(struct hfi1_ctxtdata *rcd);
++void hfi1_free_ctxt_rcv_groups(struct hfi1_ctxtdata *rcd);
++void hfi1_exp_tid_group_init(struct exp_tid_set *set);
++
++#endif /* _HFI1_EXP_RCV_H */
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.c
+* Unmerged path drivers/infiniband/hw/hfi1/user_exp_rcv.h
+diff --git a/drivers/infiniband/hw/hfi1/user_sdma.c b/drivers/infiniband/hw/hfi1/user_sdma.c
+index 44eb867b91f4..23cc71b81c63 100644
+--- a/drivers/infiniband/hw/hfi1/user_sdma.c
++++ b/drivers/infiniband/hw/hfi1/user_sdma.c
+@@ -94,27 +94,6 @@ MODULE_PARM_DESC(sdma_comp_size, "Size of User SDMA completion ring. Default: 12
+ /* Number of BTH.PSN bits used for sequence number in expected rcvs */
+ #define BTH_SEQ_MASK 0x7ffull
+ 
+-/*
+- * Define fields in the KDETH header so we can update the header
+- * template.
+- */
+-#define KDETH_OFFSET_SHIFT        0
+-#define KDETH_OFFSET_MASK         0x7fff
+-#define KDETH_OM_SHIFT            15
+-#define KDETH_OM_MASK             0x1
+-#define KDETH_TID_SHIFT           16
+-#define KDETH_TID_MASK            0x3ff
+-#define KDETH_TIDCTRL_SHIFT       26
+-#define KDETH_TIDCTRL_MASK        0x3
+-#define KDETH_INTR_SHIFT          28
+-#define KDETH_INTR_MASK           0x1
+-#define KDETH_SH_SHIFT            29
+-#define KDETH_SH_MASK             0x1
+-#define KDETH_HCRC_UPPER_SHIFT    16
+-#define KDETH_HCRC_UPPER_MASK     0xff
+-#define KDETH_HCRC_LOWER_SHIFT    24
+-#define KDETH_HCRC_LOWER_MASK     0xff
+-
+ #define AHG_KDETH_INTR_SHIFT 12
+ #define AHG_KDETH_SH_SHIFT   13
+ #define AHG_KDETH_ARRAY_SIZE  9
+@@ -122,16 +101,6 @@ MODULE_PARM_DESC(sdma_comp_size, "Size of User SDMA completion ring. Default: 12
+ #define PBC2LRH(x) ((((x) & 0xfff) << 2) - 4)
+ #define LRH2PBC(x) ((((x) >> 2) + 1) & 0xfff)
+ 
+-#define KDETH_GET(val, field)						\
+-	(((le32_to_cpu((val))) >> KDETH_##field##_SHIFT) & KDETH_##field##_MASK)
+-#define KDETH_SET(dw, field, val) do {					\
+-		u32 dwval = le32_to_cpu(dw);				\
+-		dwval &= ~(KDETH_##field##_MASK << KDETH_##field##_SHIFT); \
+-		dwval |= (((val) & KDETH_##field##_MASK) << \
+-			  KDETH_##field##_SHIFT);			\
+-		dw = cpu_to_le32(dwval);				\
+-	} while (0)
+-
+ #define AHG_HEADER_SET(arr, idx, dw, bit, width, value)			\
+ 	do {								\
+ 		if ((idx) < ARRAY_SIZE((arr)))				\
+@@ -142,13 +111,6 @@ MODULE_PARM_DESC(sdma_comp_size, "Size of User SDMA completion ring. Default: 12
+ 			return -ERANGE;					\
+ 	} while (0)
+ 
+-/* KDETH OM multipliers and switch over point */
+-#define KDETH_OM_SMALL     4
+-#define KDETH_OM_SMALL_SHIFT     2
+-#define KDETH_OM_LARGE     64
+-#define KDETH_OM_LARGE_SHIFT     6
+-#define KDETH_OM_MAX_SIZE  (1 << ((KDETH_OM_LARGE / KDETH_OM_SMALL) + 1))
+-
+ /* Tx request flag bits */
+ #define TXREQ_FLAGS_REQ_ACK   BIT(0)      /* Set the ACK bit in the header */
+ #define TXREQ_FLAGS_REQ_DISABLE_SH BIT(1) /* Disable header suppression */
