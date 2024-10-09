@@ -1,0 +1,170 @@
+s390/zcrypt: fix suspend/resume of AP bus devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: fix suspend/resume of AP bus devices (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 94.62%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 83e9d5d2d45e518deb8cb843bd2e41548c6bb9b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/83e9d5d2.failed
+
+If there are no devices on the AP bus there will not be a single
+call to the per-device ap_bus_suspend function. Even worse,
+there will not be a call to the per-device ap_bus_resume either
+and the AP will fail so resume correctly.
+
+Introduce a bus specific dev_pm_ops to suspend / resume the AP
+bus related things. While we are at it, simplify the power management
+code of the AP bus.
+
+Reviewd-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 83e9d5d2d45e518deb8cb843bd2e41548c6bb9b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,8dfd1c9163a7..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -871,10 -911,6 +928,13 @@@ static int ap_dev_suspend(struct devic
+  		spin_unlock_bh(&ap_dev->lock);
+  	} while ((flags & 1) || (flags & 2));
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&ap_dev->lock);
+ +	ap_dev->unregistered = AP_DEV_UNREGISTERED;
+ +	spin_unlock_bh(&ap_dev->lock);
+ +
+++=======
+++>>>>>>> 83e9d5d2d45e (s390/zcrypt: fix suspend/resume of AP bus devices)
+  	return 0;
+  }
+  
+@@@ -1453,9 -1414,9 +1533,13 @@@ static void ap_scan_bus(struct work_str
+  	int rc, i;
+  
+  	ap_query_configuration();
+- 	if (ap_select_domain() != 0) {
++ 	if (ap_select_domain() != 0)
+  		return;
+++<<<<<<< HEAD
+ +	}
+++=======
++ 
+++>>>>>>> 83e9d5d2d45e (s390/zcrypt: fix suspend/resume of AP bus devices)
+  	for (i = 0; i < AP_DEVICES; i++) {
+  		qid = AP_MKQID(i, ap_domain_index);
+  		dev = bus_find_device(&ap_bus_type, NULL,
+@@@ -1915,84 -1852,6 +2001,87 @@@ static void ap_poll_all(unsigned long d
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ap_poll_thread(): Thread that polls for finished requests.
+ + * @data: Unused pointer
+ + *
+ + * AP bus poll thread. The purpose of this thread is to poll for
+ + * finished requests in a loop if there is a "free" cpu - that is
+ + * a cpu that doesn't have anything better to do. The polling stops
+ + * as soon as there is another task or if all messages have been
+ + * delivered.
+ + */
+ +static int ap_poll_thread(void *data)
+ +{
+ +	DECLARE_WAITQUEUE(wait, current);
+ +	unsigned long flags;
+ +	int requests;
+ +	struct ap_device *ap_dev;
+ +
+ +	set_user_nice(current, 19);
+ +	while (1) {
+ +		if (ap_suspend_flag)
+ +			return 0;
+ +		if (need_resched()) {
+ +			schedule();
+ +			continue;
+ +		}
+ +		add_wait_queue(&ap_poll_wait, &wait);
+ +		set_current_state(TASK_INTERRUPTIBLE);
+ +		if (kthread_should_stop())
+ +			break;
+ +		requests = atomic_read(&ap_poll_requests);
+ +		if (requests <= 0)
+ +			schedule();
+ +		set_current_state(TASK_RUNNING);
+ +		remove_wait_queue(&ap_poll_wait, &wait);
+ +
+ +		flags = 0;
+ +		spin_lock_bh(&ap_device_list_lock);
+ +		list_for_each_entry(ap_dev, &ap_device_list, list) {
+ +			spin_lock(&ap_dev->lock);
+ +			__ap_poll_device(ap_dev, &flags);
+ +			spin_unlock(&ap_dev->lock);
+ +		}
+ +		spin_unlock_bh(&ap_device_list_lock);
+ +	}
+ +	set_current_state(TASK_RUNNING);
+ +	remove_wait_queue(&ap_poll_wait, &wait);
+ +	return 0;
+ +}
+ +
+ +static int ap_poll_thread_start(void)
+ +{
+ +	int rc;
+ +
+ +	if (ap_using_interrupts() || ap_suspend_flag)
+ +		return 0;
+ +	mutex_lock(&ap_poll_thread_mutex);
+ +	if (!ap_poll_kthread) {
+ +		ap_poll_kthread = kthread_run(ap_poll_thread, NULL, "appoll");
+ +		rc = IS_ERR(ap_poll_kthread) ? PTR_ERR(ap_poll_kthread) : 0;
+ +		if (rc)
+ +			ap_poll_kthread = NULL;
+ +	}
+ +	else
+ +		rc = 0;
+ +	mutex_unlock(&ap_poll_thread_mutex);
+ +	return rc;
+ +}
+ +
+ +static void ap_poll_thread_stop(void)
+ +{
+ +	mutex_lock(&ap_poll_thread_mutex);
+ +	if (ap_poll_kthread) {
+ +		kthread_stop(ap_poll_kthread);
+ +		ap_poll_kthread = NULL;
+ +	}
+ +	mutex_unlock(&ap_poll_thread_mutex);
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 83e9d5d2d45e (s390/zcrypt: fix suspend/resume of AP bus devices)
+   * ap_request_timeout(): Handling of request timeouts
+   * @data: Holds the AP device.
+   *
+@@@ -2159,16 -2029,13 +2250,12 @@@ void ap_module_exit(void
+  	hrtimer_cancel(&ap_poll_timer);
+  	destroy_workqueue(ap_work_queue);
+  	tasklet_kill(&ap_tasklet);
+- 	while ((dev = bus_find_device(&ap_bus_type, NULL, NULL,
+- 		    __ap_match_all)))
+- 	{
+- 		device_unregister(dev);
+- 		put_device(dev);
+- 	}
++ 	bus_for_each_dev(&ap_bus_type, NULL, NULL, __ap_devices_unregister);
+  	for (i = 0; ap_bus_attrs[i]; i++)
+  		bus_remove_file(&ap_bus_type, ap_bus_attrs[i]);
++ 	unregister_pm_notifier(&ap_power_notifier);
+  	root_device_unregister(ap_root_device);
+  	bus_unregister(&ap_bus_type);
+ -	kfree(ap_configuration);
+  	unregister_reset_call(&ap_reset_call);
+  	if (ap_using_interrupts())
+  		unregister_adapter_interrupt(&ap_airq);
+* Unmerged path drivers/s390/crypto/ap_bus.c
