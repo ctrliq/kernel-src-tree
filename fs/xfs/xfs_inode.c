@@ -915,10 +915,8 @@ xfs_dir_ialloc(
 	xfs_nlink_t	nlink,
 	dev_t		rdev,
 	prid_t		prid,		/* project id */
-	xfs_inode_t	**ipp,		/* pointer to inode; it will be
+	xfs_inode_t	**ipp)		/* pointer to inode; it will be
 					   locked. */
-	int		*committed)
-
 {
 	xfs_trans_t	*tp;
 	xfs_inode_t	*ip;
@@ -993,8 +991,6 @@ xfs_dir_ialloc(
 		}
 
 		code = xfs_trans_roll(&tp);
-		if (committed != NULL)
-			*committed = 1;
 
 		/*
 		 * Re-attach the quota info that we detached from prev trx.
@@ -1031,9 +1027,6 @@ xfs_dir_ialloc(
 		}
 		ASSERT(!ialloc_context && ip);
 
-	} else {
-		if (committed != NULL)
-			*committed = 0;
 	}
 
 	*ipp = ip;
@@ -1162,8 +1155,7 @@ xfs_create(
 	 * entry pointing to them, but a directory also the "." entry
 	 * pointing to itself.
 	 */
-	error = xfs_dir_ialloc(&tp, dp, mode, is_dir ? 2 : 1, rdev, prid, &ip,
-			NULL);
+	error = xfs_dir_ialloc(&tp, dp, mode, is_dir ? 2 : 1, rdev, prid, &ip);
 	if (error)
 		goto out_trans_cancel;
 
@@ -1296,7 +1288,7 @@ xfs_create_tmpfile(
 	if (error)
 		goto out_trans_cancel;
 
-	error = xfs_dir_ialloc(&tp, dp, mode, 1, 0, prid, &ip, NULL);
+	error = xfs_dir_ialloc(&tp, dp, mode, 1, 0, prid, &ip);
 	if (error)
 		goto out_trans_cancel;
 
