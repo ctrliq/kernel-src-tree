@@ -1,0 +1,529 @@
+net/mlx5e: XDP TX forwarding support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: XDP TX forwarding support (Don Dutile) [1456694 1499362]
+Rebuild_FUZZ: 94.12%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit b5503b994ed5ed8dbfe821317e7b5b38acb065c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b5503b99.failed
+
+Adding support for XDP_TX forwarding from xdp program.
+Using XDP, now user can loop packets out of the same port.
+
+We create a dedicated TX SQ for each channel that will serve
+XDP programs that return XDP_TX action to loop packets back to
+the wire directly from the channel RQ RX path.
+
+For that RX pages will now need to be mapped bi-directionally,
+and on XDP_TX action we will sync the page back to device then
+queue it into SQ for transmission.  The XDP xmit frame function will
+report back to the RX path if the page was consumed (transmitted), if so,
+RX path will forget about that page as if it were released to the stack.
+Later on, on XDP TX completion, the page will be released back to the
+page cache.
+
+For simplicity this patch will hit a doorbell on every XDP TX packet.
+
+Next patch will introduce a xmit more like mechanism that will
+queue up more than one packet into SQ w/o notifying the hardware,
+once RX napi loop is done we will hit doorbell once for all XDP TX
+packets form the previous loop.  This should drastically improve
+XDP TX performance.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b5503b994ed5ed8dbfe821317e7b5b38acb065c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index edb21d8194bc,a9fc9d4c6af4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -183,6 -180,9 +184,12 @@@ static void mlx5e_update_sw_counters(st
+  		s->rx_csum_none	+= rq_stats->csum_none;
+  		s->rx_csum_complete += rq_stats->csum_complete;
+  		s->rx_csum_unnecessary_inner += rq_stats->csum_unnecessary_inner;
+++<<<<<<< HEAD
+++=======
++ 		s->rx_xdp_drop += rq_stats->xdp_drop;
++ 		s->rx_xdp_tx += rq_stats->xdp_tx;
++ 		s->rx_xdp_tx_full += rq_stats->xdp_tx_full;
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  		s->rx_wqe_err   += rq_stats->wqe_err;
+  		s->rx_mpwqe_filler += rq_stats->mpwqe_filler;
+  		s->rx_buff_alloc_err += rq_stats->buff_alloc_err;
+@@@ -564,14 -479,14 +571,18 @@@ static int mlx5e_create_rq(struct mlx5e
+  	rq->channel = c;
+  	rq->ix      = c->ix;
+  	rq->priv    = c->priv;
+ -	rq->xdp_prog = priv->xdp_prog;
+  
++ 	rq->buff.map_dir = DMA_FROM_DEVICE;
++ 	if (rq->xdp_prog)
++ 		rq->buff.map_dir = DMA_BIDIRECTIONAL;
++ 
+  	switch (priv->params.rq_wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ +		if (mlx5e_is_vf_vport_rep(priv)) {
+ +			err = -EINVAL;
+ +			goto err_rq_wq_destroy;
+ +		}
+ +
+  		rq->handle_rx_cqe = mlx5e_handle_rx_cqe_mpwrq;
+  		rq->alloc_wqe = mlx5e_alloc_rx_mpwqe;
+  		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index e8c9b2d23033,57d49513a87a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -634,31 -629,134 +634,148 @@@ static inline void mlx5e_complete_rx_cq
+  	rq->stats.packets++;
+  	rq->stats.bytes += cqe_bcnt;
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+ -	napi_gro_receive(rq->cq.napi, skb);
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+ +			     u16 wqe_counter, u32 cqe_bcnt)
+ +{
+++=======
++ static inline void mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
++ 					struct mlx5e_dma_info *di,
++ 					unsigned int data_offset,
++ 					int len)
++ {
++ 	struct mlx5e_sq          *sq   = &rq->channel->xdp_sq;
++ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
++ 	u16                      pi    = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 	struct mlx5e_sq_wqe_info *wi   = &sq->db.xdp.wqe_info[pi];
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 	struct mlx5_wqe_data_seg *dseg;
++ 
++ 	dma_addr_t dma_addr  = di->addr + data_offset + MLX5E_XDP_MIN_INLINE;
++ 	unsigned int dma_len = len - MLX5E_XDP_MIN_INLINE;
++ 	void *data           = page_address(di->page) + data_offset;
++ 
++ 	if (unlikely(!mlx5e_sq_has_room_for(sq, MLX5E_XDP_TX_WQEBBS))) {
++ 		rq->stats.xdp_tx_full++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return;
++ 	}
++ 
++ 	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len,
++ 				   PCI_DMA_TODEVICE);
++ 
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ 	/* copy the inline part */
++ 	memcpy(eseg->inline_hdr_start, data, MLX5E_XDP_MIN_INLINE);
++ 	eseg->inline_hdr_sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)cseg + (MLX5E_XDP_TX_DS_COUNT - 1);
++ 
++ 	/* write the dma part */
++ 	dseg->addr       = cpu_to_be64(dma_addr);
++ 	dseg->byte_count = cpu_to_be32(dma_len);
++ 	dseg->lkey       = sq->mkey_be;
++ 
++ 	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++ 	cseg->qpn_ds = cpu_to_be32((sq->sqn << 8) | MLX5E_XDP_TX_DS_COUNT);
++ 
++ 	sq->db.xdp.di[pi] = *di;
++ 	wi->opcode     = MLX5_OPCODE_SEND;
++ 	wi->num_wqebbs = MLX5E_XDP_TX_WQEBBS;
++ 	sq->pc += MLX5E_XDP_TX_WQEBBS;
++ 
++ 	wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
++ 	mlx5e_tx_notify_hw(sq, &wqe->ctrl, 0);
++ 
++ 	/* fill sq edge with nops to avoid wqe wrap around */
++ 	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
++ 		sq->db.xdp.wqe_info[pi].opcode = MLX5_OPCODE_NOP;
++ 		mlx5e_send_nop(sq, false);
++ 	}
++ 	rq->stats.xdp_tx++;
++ }
++ 
++ /* returns true if packet was consumed by xdp */
++ static inline bool mlx5e_xdp_handle(struct mlx5e_rq *rq,
++ 				    const struct bpf_prog *prog,
++ 				    struct mlx5e_dma_info *di,
++ 				    void *data, u16 len)
++ {
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 
++ 	if (!prog)
++ 		return false;
++ 
++ 	xdp.data = data;
++ 	xdp.data_end = xdp.data + len;
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		return false;
++ 	case XDP_TX:
++ 		mlx5e_xmit_xdp_frame(rq, di, MLX5_RX_HEADROOM, len);
++ 		return true;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 	case XDP_DROP:
++ 		rq->stats.xdp_drop++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return true;
++ 	}
++ }
++ 
++ void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct bpf_prog *xdp_prog = READ_ONCE(rq->xdp_prog);
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  	struct mlx5e_dma_info *di;
+ -	struct mlx5e_rx_wqe *wqe;
+ -	__be16 wqe_counter_be;
+  	struct sk_buff *skb;
+++<<<<<<< HEAD
+ +	void *va;
+++=======
++ 	u16 wqe_counter;
++ 	void *va, *data;
++ 	u32 cqe_bcnt;
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  
+ -	wqe_counter_be = cqe->wqe_counter;
+ -	wqe_counter    = be16_to_cpu(wqe_counter_be);
+ -	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+  	di             = &rq->dma_info[wqe_counter];
+  	va             = page_address(di->page);
++ 	data           = va + MLX5_RX_HEADROOM;
+  
+  	dma_sync_single_range_for_cpu(rq->pdev,
+  				      di->addr,
+  				      MLX5_RX_HEADROOM,
+  				      rq->buff.wqe_sz,
+  				      DMA_FROM_DEVICE);
+++<<<<<<< HEAD
+ +	prefetch(va + MLX5_RX_HEADROOM);
+++=======
++ 	prefetch(data);
++ 	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  
+  	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
+  		rq->stats.wqe_err++;
+  		mlx5e_page_release(rq, di, true);
+++<<<<<<< HEAD
+ +		return NULL;
+ +	}
+++=======
++ 		goto wq_ll_pop;
++ 	}
++ 
++ 	if (mlx5e_xdp_handle(rq, xdp_prog, di, data, cqe_bcnt))
++ 		goto wq_ll_pop; /* page/packet was consumed by XDP */
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  
+  	skb = build_skb(va, RQ_PAGE_SIZE(rq));
+  	if (unlikely(!skb)) {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 4d5a10b7db9a,57452fdc5154..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@@ -65,6 -65,9 +65,12 @@@ struct mlx5e_sw_stats 
+  	u64 rx_csum_none;
+  	u64 rx_csum_complete;
+  	u64 rx_csum_unnecessary_inner;
+++<<<<<<< HEAD
+++=======
++ 	u64 rx_xdp_drop;
++ 	u64 rx_xdp_tx;
++ 	u64 rx_xdp_tx_full;
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  	u64 tx_csum_partial;
+  	u64 tx_csum_partial_inner;
+  	u64 tx_queue_stopped;
+@@@ -100,6 -103,9 +106,12 @@@ static const struct counter_desc sw_sta
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_none) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_complete) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_unnecessary_inner) },
+++<<<<<<< HEAD
+++=======
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_drop) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_full) },
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_partial) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_partial_inner) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_queue_stopped) },
+@@@ -305,6 -284,9 +317,12 @@@ struct mlx5e_rq_stats 
+  	u64 csum_none;
+  	u64 lro_packets;
+  	u64 lro_bytes;
+++<<<<<<< HEAD
+++=======
++ 	u64 xdp_drop;
++ 	u64 xdp_tx;
++ 	u64 xdp_tx_full;
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  	u64 wqe_err;
+  	u64 mpwqe_filler;
+  	u64 buff_alloc_err;
+@@@ -322,6 -304,9 +340,12 @@@ static const struct counter_desc rq_sta
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_complete) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_unnecessary_inner) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_none) },
+++<<<<<<< HEAD
+++=======
++ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, xdp_drop) },
++ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, xdp_tx) },
++ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, xdp_tx_full) },
+++>>>>>>> b5503b994ed5 (net/mlx5e: XDP TX forwarding support)
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, lro_packets) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, lro_bytes) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, wqe_err) },
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 16c2c2d53ebb..c9e74097b116 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -112,6 +112,15 @@
+ #define MLX5E_ICOSQ_MAX_WQEBBS \
+ 	(DIV_ROUND_UP(sizeof(struct mlx5e_umr_wqe), MLX5_SEND_WQE_BB))
+ 
++#define MLX5E_XDP_MIN_INLINE (ETH_HLEN + VLAN_HLEN)
++#define MLX5E_XDP_IHS_DS_COUNT \
++	DIV_ROUND_UP(MLX5E_XDP_MIN_INLINE - 2, MLX5_SEND_WQE_DS)
++#define MLX5E_XDP_TX_DS_COUNT \
++	(MLX5E_XDP_IHS_DS_COUNT + \
++	 (sizeof(struct mlx5e_tx_wqe) / MLX5_SEND_WQE_DS) + 1 /* SG DS */)
++#define MLX5E_XDP_TX_WQEBBS \
++	DIV_ROUND_UP(MLX5E_XDP_TX_DS_COUNT, MLX5_SEND_WQEBB_NUM_DS)
++
+ #define MLX5E_NUM_MAIN_GROUPS 9
+ 
+ static inline u16 mlx5_min_rx_wqes(int wq_type, u32 wq_size)
+@@ -349,6 +358,7 @@ struct mlx5e_rq {
+ 	struct {
+ 		u8             page_order;
+ 		u32            wqe_sz;    /* wqe data buffer size */
++		u8             map_dir;   /* dma map direction */
+ 	} buff;
+ 	__be32                 mkey_be;
+ 
+@@ -414,14 +424,15 @@ enum {
+ 	MLX5E_SQ_STATE_BF_ENABLE,
+ };
+ 
+-struct mlx5e_ico_wqe_info {
++struct mlx5e_sq_wqe_info {
+ 	u8  opcode;
+ 	u8  num_wqebbs;
+ };
+ 
+ enum mlx5e_sq_type {
+ 	MLX5E_SQ_TXQ,
+-	MLX5E_SQ_ICO
++	MLX5E_SQ_ICO,
++	MLX5E_SQ_XDP
+ };
+ 
+ struct mlx5e_sq {
+@@ -448,7 +459,11 @@ struct mlx5e_sq {
+ 			struct mlx5e_sq_dma       *dma_fifo;
+ 			struct mlx5e_tx_wqe_info  *wqe_info;
+ 		} txq;
+-		struct mlx5e_ico_wqe_info *ico_wqe;
++		struct mlx5e_sq_wqe_info *ico_wqe;
++		struct {
++			struct mlx5e_sq_wqe_info  *wqe_info;
++			struct mlx5e_dma_info     *di;
++		} xdp;
+ 	} db;
+ 
+ 	/* read only */
+@@ -488,8 +503,10 @@ enum channel_flags {
+ struct mlx5e_channel {
+ 	/* data path */
+ 	struct mlx5e_rq            rq;
++	struct mlx5e_sq            xdp_sq;
+ 	struct mlx5e_sq            sq[MLX5E_MAX_NUM_TC];
+ 	struct mlx5e_sq            icosq;   /* internal control operations */
++	bool                       xdp;
+ 	struct napi_struct         napi;
+ 	struct device             *pdev;
+ 	struct net_device         *netdev;
+@@ -720,7 +737,7 @@ void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event);
+ int mlx5e_napi_poll(struct napi_struct *napi, int budget);
+ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget);
+ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget);
+-void mlx5e_free_tx_descs(struct mlx5e_sq *sq);
++void mlx5e_free_sq_descs(struct mlx5e_sq *sq);
+ 
+ void mlx5e_page_release(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info,
+ 			bool recycle);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 2a270903b57d..574311018e6f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -496,16 +496,13 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+ 	return (i == MLX5E_TX_CQ_POLL_BUDGET);
+ }
+ 
+-void mlx5e_free_tx_descs(struct mlx5e_sq *sq)
++static void mlx5e_free_txq_sq_descs(struct mlx5e_sq *sq)
+ {
+ 	struct mlx5e_tx_wqe_info *wi;
+ 	struct sk_buff *skb;
+ 	u16 ci;
+ 	int i;
+ 
+-	if (sq->type != MLX5E_SQ_TXQ)
+-		return;
+-
+ 	while (sq->cc != sq->pc) {
+ 		ci = sq->cc & sq->wq.sz_m1;
+ 		skb = sq->db.txq.skb[ci];
+@@ -527,3 +524,37 @@ void mlx5e_free_tx_descs(struct mlx5e_sq *sq)
+ 		sq->cc += wi->num_wqebbs;
+ 	}
+ }
++
++static void mlx5e_free_xdp_sq_descs(struct mlx5e_sq *sq)
++{
++	struct mlx5e_sq_wqe_info *wi;
++	struct mlx5e_dma_info *di;
++	u16 ci;
++
++	while (sq->cc != sq->pc) {
++		ci = sq->cc & sq->wq.sz_m1;
++		di = &sq->db.xdp.di[ci];
++		wi = &sq->db.xdp.wqe_info[ci];
++
++		if (wi->opcode == MLX5_OPCODE_NOP) {
++			sq->cc++;
++			continue;
++		}
++
++		sq->cc += wi->num_wqebbs;
++
++		mlx5e_page_release(&sq->channel->rq, di, false);
++	}
++}
++
++void mlx5e_free_sq_descs(struct mlx5e_sq *sq)
++{
++	switch (sq->type) {
++	case MLX5E_SQ_TXQ:
++		mlx5e_free_txq_sq_descs(sq);
++		break;
++	case MLX5E_SQ_XDP:
++		mlx5e_free_xdp_sq_descs(sq);
++		break;
++	}
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index 8689b7bebc3c..fd0a31c76ea3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -72,7 +72,7 @@ static void mlx5e_poll_ico_cq(struct mlx5e_cq *cq)
+ 
+ 	do {
+ 		u16 ci = be16_to_cpu(cqe->wqe_counter) & wq->sz_m1;
+-		struct mlx5e_ico_wqe_info *icowi = &sq->db.ico_wqe[ci];
++		struct mlx5e_sq_wqe_info *icowi = &sq->db.ico_wqe[ci];
+ 
+ 		mlx5_cqwq_pop(&cq->wq);
+ 		sqcc += icowi->num_wqebbs;
+@@ -105,6 +105,66 @@ static void mlx5e_poll_ico_cq(struct mlx5e_cq *cq)
+ 	sq->cc = sqcc;
+ }
+ 
++static inline bool mlx5e_poll_xdp_tx_cq(struct mlx5e_cq *cq)
++{
++	struct mlx5e_sq *sq;
++	u16 sqcc;
++	int i;
++
++	sq = container_of(cq, struct mlx5e_sq, cq);
++
++	if (unlikely(test_bit(MLX5E_SQ_STATE_FLUSH, &sq->state)))
++		return false;
++
++	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
++	 * otherwise a cq overrun may occur
++	 */
++	sqcc = sq->cc;
++
++	for (i = 0; i < MLX5E_TX_CQ_POLL_BUDGET; i++) {
++		struct mlx5_cqe64 *cqe;
++		u16 wqe_counter;
++		bool last_wqe;
++
++		cqe = mlx5e_get_cqe(cq);
++		if (!cqe)
++			break;
++
++		mlx5_cqwq_pop(&cq->wq);
++
++		wqe_counter = be16_to_cpu(cqe->wqe_counter);
++
++		do {
++			struct mlx5e_sq_wqe_info *wi;
++			struct mlx5e_dma_info *di;
++			u16 ci;
++
++			last_wqe = (sqcc == wqe_counter);
++
++			ci = sqcc & sq->wq.sz_m1;
++			di = &sq->db.xdp.di[ci];
++			wi = &sq->db.xdp.wqe_info[ci];
++
++			if (unlikely(wi->opcode == MLX5_OPCODE_NOP)) {
++				sqcc++;
++				continue;
++			}
++
++			sqcc += wi->num_wqebbs;
++			/* Recycle RX page */
++			mlx5e_page_release(&sq->channel->rq, di, true);
++		} while (!last_wqe);
++	}
++
++	mlx5_cqwq_update_db_record(&cq->wq);
++
++	/* ensure cq space is freed before enabling more cqes */
++	wmb();
++
++	sq->cc = sqcc;
++	return (i == MLX5E_TX_CQ_POLL_BUDGET);
++}
++
+ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct mlx5e_channel *c = container_of(napi, struct mlx5e_channel,
+@@ -121,6 +181,9 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	work_done = mlx5e_poll_rx_cq(&c->rq.cq, budget);
+ 	busy |= work_done == budget;
+ 
++	if (c->xdp)
++		busy |= mlx5e_poll_xdp_tx_cq(&c->xdp_sq.cq);
++
+ 	mlx5e_poll_ico_cq(&c->icosq.cq);
+ 
+ 	busy |= mlx5e_post_rx_wqes(&c->rq);
