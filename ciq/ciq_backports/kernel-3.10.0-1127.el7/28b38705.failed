@@ -1,0 +1,266 @@
+cxgb4: Re-work the logic for mps refcounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Raju Rangoju <rajur@chelsio.com>
+commit 28b3870578ef403000c99d54c40fffb0210ff70d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/28b38705.failed
+
+Remove existing mps refcounting code which was
+added only for encap filters and add necessary
+data structures/functions to support mps reference
+counting for all the mac filters. Also add wrapper
+functions for allocating and freeing encap mac
+filters.
+
+	Signed-off-by: Raju Rangoju <rajur@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 28b3870578ef403000c99d54c40fffb0210ff70d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index fcc54fe9426b,4632827f05ba..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -5815,12 -5968,6 +5811,15 @@@ static int init_one(struct pci_dev *pde
+  		adapter->params.offload = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	adapter->mps_encap = kvzalloc(sizeof(struct mps_encap_entry) *
+ +					  adapter->params.arch.mps_tcam_size,
+ +				      GFP_KERNEL);
+ +	if (!adapter->mps_encap)
+ +		dev_warn(&pdev->dev, "could not allocate MPS Encap entries, continuing\n");
+ +
+++=======
+++>>>>>>> 28b3870578ef (cxgb4: Re-work the logic for mps refcounting)
+  #if IS_ENABLED(CONFIG_IPV6)
+  	if (chip_ver <= CHELSIO_T5 &&
+  	    (!(t4_read_reg(adapter, LE_DB_CONFIG_A) & ASLIPCOMPEN_F))) {
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/Makefile b/drivers/net/ethernet/chelsio/cxgb4/Makefile
+index 4e1927ebfa20..c7e4263ab563 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/Makefile
++++ b/drivers/net/ethernet/chelsio/cxgb4/Makefile
+@@ -6,7 +6,7 @@ obj-$(CONFIG_CHELSIO_T4) += cxgb4.o
+ 
+ cxgb4-objs := cxgb4_main.o l2t.o smt.o t4_hw.o sge.o clip_tbl.o cxgb4_ethtool.o \
+ 	      cxgb4_uld.o srq.o sched.o cxgb4_filter.o cxgb4_tc_u32.o \
+-	      cxgb4_ptp.o cxgb4_tc_flower.o cxgb4_cudbg.o \
++	      cxgb4_ptp.o cxgb4_tc_flower.o cxgb4_cudbg.o cxgb4_mps.o \
+ 	      cudbg_common.o cudbg_lib.o cudbg_zlib.o
+ cxgb4-$(CONFIG_CHELSIO_T4_DCB) +=  cxgb4_dcb.o
+ cxgb4-$(CONFIG_DEBUG_FS) += cxgb4_debugfs.o
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 295572f2890b..342ad59774c5 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -890,10 +890,6 @@ struct mbox_list {
+ 	struct list_head list;
+ };
+ 
+-struct mps_encap_entry {
+-	atomic_t refcnt;
+-};
+-
+ #if IS_ENABLED(CONFIG_THERMAL)
+ struct ch_thermal {
+ 	struct thermal_zone_device *tzdev;
+@@ -902,6 +898,14 @@ struct ch_thermal {
+ };
+ #endif
+ 
++struct mps_entries_ref {
++	struct list_head list;
++	u8 addr[ETH_ALEN];
++	u8 mask[ETH_ALEN];
++	u16 idx;
++	refcount_t refcnt;
++};
++
+ struct adapter {
+ 	void __iomem *regs;
+ 	void __iomem *bar2;
+@@ -953,7 +957,6 @@ struct adapter {
+ 	unsigned int rawf_start;
+ 	unsigned int rawf_cnt;
+ 	struct smt_data *smt;
+-	struct mps_encap_entry *mps_encap;
+ 	struct cxgb4_uld_info *uld;
+ 	void *uld_handle[CXGB4_ULD_MAX];
+ 	unsigned int num_uld;
+@@ -961,6 +964,8 @@ struct adapter {
+ 	struct list_head list_node;
+ 	struct list_head rcu_node;
+ 	struct list_head mac_hlist; /* list of MAC addresses in MPS Hash */
++	struct list_head mps_ref;
++	spinlock_t mps_ref_lock; /* lock for syncing mps ref/def activities */
+ 
+ 	void *iscsi_ppm;
+ 
+@@ -1881,4 +1886,13 @@ int cxgb4_dcb_enabled(const struct net_device *dev);
+ int cxgb4_thermal_init(struct adapter *adap);
+ int cxgb4_thermal_remove(struct adapter *adap);
+ 
++int cxgb4_init_mps_ref_entries(struct adapter *adap);
++void cxgb4_free_mps_ref_entries(struct adapter *adap);
++int cxgb4_alloc_encap_mac_filt(struct adapter *adap, unsigned int viid,
++			       const u8 *addr, const u8 *mask,
++			       unsigned int vni, unsigned int vni_mask,
++			       u8 dip_hit, u8 lookup_type, bool sleep_ok);
++int cxgb4_free_encap_mac_filt(struct adapter *adap, unsigned int viid,
++			      int idx, bool sleep_ok);
++
+ #endif /* __CXGB4_H__ */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+index 4155ef18050c..4dae8d08b4ad 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+@@ -727,10 +727,8 @@ void clear_filter(struct adapter *adap, struct filter_entry *f)
+ 		cxgb4_smt_release(f->smt);
+ 
+ 	if (f->fs.val.encap_vld && f->fs.val.ovlan_vld)
+-		if (atomic_dec_and_test(&adap->mps_encap[f->fs.val.ovlan &
+-							 0x1ff].refcnt))
+-			t4_free_encap_mac_filt(adap, pi->viid,
+-					       f->fs.val.ovlan & 0x1ff, 0);
++		t4_free_encap_mac_filt(adap, pi->viid,
++				       f->fs.val.ovlan & 0x1ff, 0);
+ 
+ 	if ((f->fs.hash || is_t6(adap->params.chip)) && f->fs.type)
+ 		cxgb4_clip_release(f->dev, (const u32 *)&f->fs.val.lip, 1);
+@@ -1153,7 +1151,6 @@ static int cxgb4_set_hash_filter(struct net_device *dev,
+ 			if (ret < 0)
+ 				goto free_atid;
+ 
+-			atomic_inc(&adapter->mps_encap[ret].refcnt);
+ 			f->fs.val.ovlan = ret;
+ 			f->fs.mask.ovlan = 0xffff;
+ 			f->fs.val.ovlan_vld = 1;
+@@ -1396,7 +1393,6 @@ int __cxgb4_set_filter(struct net_device *dev, int filter_id,
+ 			if (ret < 0)
+ 				goto free_clip;
+ 
+-			atomic_inc(&adapter->mps_encap[ret].refcnt);
+ 			f->fs.val.ovlan = ret;
+ 			f->fs.mask.ovlan = 0x1ff;
+ 			f->fs.val.ovlan_vld = 1;
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_mps.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_mps.c
+new file mode 100644
+index 000000000000..b8a5375bf64d
+--- /dev/null
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_mps.c
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2019 Chelsio Communications, Inc. All rights reserved. */
++
++#include "cxgb4.h"
++
++static int cxgb4_mps_ref_dec(struct adapter *adap, u16 idx)
++{
++	struct mps_entries_ref *mps_entry, *tmp;
++	int ret = -EINVAL;
++
++	spin_lock(&adap->mps_ref_lock);
++	list_for_each_entry_safe(mps_entry, tmp, &adap->mps_ref, list) {
++		if (mps_entry->idx == idx) {
++			if (!refcount_dec_and_test(&mps_entry->refcnt)) {
++				spin_unlock(&adap->mps_ref_lock);
++				return -EBUSY;
++			}
++			list_del(&mps_entry->list);
++			kfree(mps_entry);
++			ret = 0;
++			break;
++		}
++	}
++	spin_unlock(&adap->mps_ref_lock);
++	return ret;
++}
++
++static int cxgb4_mps_ref_inc(struct adapter *adap, const u8 *mac_addr,
++			     u16 idx, const u8 *mask)
++{
++	u8 bitmask[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++	struct mps_entries_ref *mps_entry;
++	int ret = 0;
++
++	spin_lock_bh(&adap->mps_ref_lock);
++	list_for_each_entry(mps_entry, &adap->mps_ref, list) {
++		if (mps_entry->idx == idx) {
++			refcount_inc(&mps_entry->refcnt);
++			goto unlock;
++		}
++	}
++	mps_entry = kzalloc(sizeof(*mps_entry), GFP_ATOMIC);
++	if (!mps_entry) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	ether_addr_copy(mps_entry->mask, mask ? mask : bitmask);
++	ether_addr_copy(mps_entry->addr, mac_addr);
++	mps_entry->idx = idx;
++	refcount_set(&mps_entry->refcnt, 1);
++	list_add_tail(&mps_entry->list, &adap->mps_ref);
++unlock:
++	spin_unlock_bh(&adap->mps_ref_lock);
++	return ret;
++}
++
++int cxgb4_free_encap_mac_filt(struct adapter *adap, unsigned int viid,
++			      int idx, bool sleep_ok)
++{
++	int ret = 0;
++
++	if (!cxgb4_mps_ref_dec(adap, idx))
++		ret = t4_free_encap_mac_filt(adap, viid, idx, sleep_ok);
++
++	return ret;
++}
++
++int cxgb4_alloc_encap_mac_filt(struct adapter *adap, unsigned int viid,
++			       const u8 *addr, const u8 *mask,
++			       unsigned int vni, unsigned int vni_mask,
++			       u8 dip_hit, u8 lookup_type, bool sleep_ok)
++{
++	int ret;
++
++	ret = t4_alloc_encap_mac_filt(adap, viid, addr, mask, vni, vni_mask,
++				      dip_hit, lookup_type, sleep_ok);
++	if (ret < 0)
++		return ret;
++
++	if (cxgb4_mps_ref_inc(adap, addr, ret, mask)) {
++		ret = -ENOMEM;
++		t4_free_encap_mac_filt(adap, viid, ret, sleep_ok);
++	}
++	return ret;
++}
++
++int cxgb4_init_mps_ref_entries(struct adapter *adap)
++{
++	spin_lock_init(&adap->mps_ref_lock);
++	INIT_LIST_HEAD(&adap->mps_ref);
++
++	return 0;
++}
++
++void cxgb4_free_mps_ref_entries(struct adapter *adap)
++{
++	struct mps_entries_ref *mps_entry, *tmp;
++
++	if (!list_empty(&adap->mps_ref))
++		return;
++
++	spin_lock(&adap->mps_ref_lock);
++	list_for_each_entry_safe(mps_entry, tmp, &adap->mps_ref, list) {
++		list_del(&mps_entry->list);
++		kfree(mps_entry);
++	}
++	spin_unlock(&adap->mps_ref_lock);
++}
