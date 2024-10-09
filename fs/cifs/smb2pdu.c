@@ -1183,15 +1183,12 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 	int rc = 0;
 	int resp_buftype;
 	int unc_path_len;
-	struct TCP_Server_Info *server;
 	__le16 *unc_path = NULL;
 	int flags = 0;
 
 	cifs_dbg(FYI, "TCON\n");
 
-	if ((ses->server) && tree)
-		server = ses->server;
-	else
+	if (!(ses->server) || !tree)
 		return -EIO;
 
 	unc_path = kmalloc(MAX_SHARENAME_LENGTH * 2, GFP_KERNEL);
@@ -1310,15 +1307,12 @@ SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon)
 {
 	struct smb2_tree_disconnect_req *req; /* response is trivial */
 	int rc = 0;
-	struct TCP_Server_Info *server;
 	struct cifs_ses *ses = tcon->ses;
 	int flags = 0;
 
 	cifs_dbg(FYI, "Tree Disconnect\n");
 
-	if (ses && (ses->server))
-		server = ses->server;
-	else
+	if (!ses || !(ses->server))
 		return -EIO;
 
 	if ((tcon->need_reconnect) || (tcon->ses->need_reconnect))
@@ -1810,7 +1804,6 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 	struct smb2_ioctl_req *req;
 	struct smb2_ioctl_rsp *rsp;
 	struct smb2_sync_hdr *shdr;
-	struct TCP_Server_Info *server;
 	struct cifs_ses *ses;
 	struct kvec iov[2];
 	struct kvec rsp_iov;
@@ -1833,9 +1826,7 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 	else
 		return -EIO;
 
-	if (ses && (ses->server))
-		server = ses->server;
-	else
+	if (!ses || !(ses->server))
 		return -EIO;
 
 	rc = small_smb2_init(SMB2_IOCTL, tcon, (void **) &req);
@@ -1993,7 +1984,6 @@ SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
 {
 	struct smb2_close_req *req;
 	struct smb2_close_rsp *rsp;
-	struct TCP_Server_Info *server;
 	struct cifs_ses *ses = tcon->ses;
 	struct kvec iov[1];
 	struct kvec rsp_iov;
@@ -2003,9 +1993,7 @@ SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
 
 	cifs_dbg(FYI, "Close\n");
 
-	if (ses && (ses->server))
-		server = ses->server;
-	else
+	if (!ses || !(ses->server))
 		return -EIO;
 
 	rc = small_smb2_init(SMB2_CLOSE, tcon, (void **) &req);
@@ -2107,15 +2095,12 @@ query_info(const unsigned int xid, struct cifs_tcon *tcon,
 	struct kvec rsp_iov;
 	int rc = 0;
 	int resp_buftype;
-	struct TCP_Server_Info *server;
 	struct cifs_ses *ses = tcon->ses;
 	int flags = 0;
 
 	cifs_dbg(FYI, "Query Info\n");
 
-	if (ses && (ses->server))
-		server = ses->server;
-	else
+	if (!ses || !(ses->server))
 		return -EIO;
 
 	rc = small_smb2_init(SMB2_QUERY_INFO, tcon, (void **) &req);
@@ -2339,7 +2324,6 @@ SMB2_flush(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 	   u64 volatile_fid)
 {
 	struct smb2_flush_req *req;
-	struct TCP_Server_Info *server;
 	struct cifs_ses *ses = tcon->ses;
 	struct kvec iov[1];
 	struct kvec rsp_iov;
@@ -2349,9 +2333,7 @@ SMB2_flush(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 
 	cifs_dbg(FYI, "Flush\n");
 
-	if (ses && (ses->server))
-		server = ses->server;
-	else
+	if (!ses || !(ses->server))
 		return -EIO;
 
 	rc = small_smb2_init(SMB2_FLUSH, tcon, (void **) &req);
@@ -3039,13 +3021,10 @@ send_set_info(const unsigned int xid, struct cifs_tcon *tcon,
 	int rc = 0;
 	int resp_buftype;
 	unsigned int i;
-	struct TCP_Server_Info *server;
 	struct cifs_ses *ses = tcon->ses;
 	int flags = 0;
 
-	if (ses && (ses->server))
-		server = ses->server;
-	else
+	if (!ses || !(ses->server))
 		return -EIO;
 
 	if (!num)
