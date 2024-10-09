@@ -1,0 +1,148 @@
+netfilter: ipset: Properly calculate extensions offsets and total length
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Sergey Popovich <popovich_sergei@mail.ua>
+commit caed0ed35b1e3f3f05dfcb386bcb26df7d47f0ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/caed0ed3.failed
+
+Offsets and total length returned by the ip_set_elem_len()
+calculated incorrectly as initial set element length (i.e.
+len parameter) is used multiple times in offset calculations,
+also affecting set element total length.
+
+Use initial set element length as start offset, do not add aligned
+extension offset to the offset. Return offset as total length of
+the set element.
+
+This reduces memory requirements on per element basic for the
+hash:* type of sets.
+
+For example output from 'ipset -terse list test-1' on 64-bit PC,
+where test-1 is generated via following script:
+
+  #!/bin/bash
+
+  set_name='test-1'
+
+  ipset create "$set_name" hash:net family inet \
+              timeout 10800 counters comment \
+              hashsize 65536 maxelem 65536
+
+  declare -i o3 o4
+  fmt="add $set_name 192.168.%u.%u\n"
+
+  for ((o3 = 0; o3 < 256; o3++)); do
+      for ((o4 = 0; o4 < 256; o4++)); do
+          printf "$fmt" $o3 $o4
+      done
+  done |ipset -exist restore
+
+BEFORE this patch is applied
+
+  # ipset -terse list test-1
+  Name: test-1
+  Type: hash:net
+  Revision: 6
+  Header: family inet hashsize 65536 maxelem 65536
+timeout 10800 counters comment
+  Size in memory: 26348440
+
+and AFTER applying patch
+
+  # ipset -terse list test-1
+  Name: test-1
+  Type: hash:net
+  Revision: 6
+  Header: family inet hashsize 65536 maxelem 65536
+timeout 10800 counters comment
+  Size in memory: 7706392
+  References: 0
+
+	Signed-off-by: Sergey Popovich <popovich_sergei@mail.ua>
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit caed0ed35b1e3f3f05dfcb386bcb26df7d47f0ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_core.c
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 1b9673fde81c,7f9c0565e715..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -324,6 -322,68 +324,71 @@@ ip_set_get_ipaddr6(struct nlattr *nla, 
+  }
+  EXPORT_SYMBOL_GPL(ip_set_get_ipaddr6);
+  
+++<<<<<<< HEAD
+++=======
++ typedef void (*destroyer)(void *);
++ /* ipset data extension types, in size order */
++ 
++ const struct ip_set_ext_type ip_set_extensions[] = {
++ 	[IPSET_EXT_ID_COUNTER] = {
++ 		.type	= IPSET_EXT_COUNTER,
++ 		.flag	= IPSET_FLAG_WITH_COUNTERS,
++ 		.len	= sizeof(struct ip_set_counter),
++ 		.align	= __alignof__(struct ip_set_counter),
++ 	},
++ 	[IPSET_EXT_ID_TIMEOUT] = {
++ 		.type	= IPSET_EXT_TIMEOUT,
++ 		.len	= sizeof(unsigned long),
++ 		.align	= __alignof__(unsigned long),
++ 	},
++ 	[IPSET_EXT_ID_SKBINFO] = {
++ 		.type	= IPSET_EXT_SKBINFO,
++ 		.flag	= IPSET_FLAG_WITH_SKBINFO,
++ 		.len	= sizeof(struct ip_set_skbinfo),
++ 		.align	= __alignof__(struct ip_set_skbinfo),
++ 	},
++ 	[IPSET_EXT_ID_COMMENT] = {
++ 		.type	 = IPSET_EXT_COMMENT | IPSET_EXT_DESTROY,
++ 		.flag	 = IPSET_FLAG_WITH_COMMENT,
++ 		.len	 = sizeof(struct ip_set_comment),
++ 		.align	 = __alignof__(struct ip_set_comment),
++ 		.destroy = (destroyer) ip_set_comment_free,
++ 	},
++ };
++ EXPORT_SYMBOL_GPL(ip_set_extensions);
++ 
++ static inline bool
++ add_extension(enum ip_set_ext_id id, u32 flags, struct nlattr *tb[])
++ {
++ 	return ip_set_extensions[id].flag ?
++ 		(flags & ip_set_extensions[id].flag) :
++ 		!!tb[IPSET_ATTR_TIMEOUT];
++ }
++ 
++ size_t
++ ip_set_elem_len(struct ip_set *set, struct nlattr *tb[], size_t len)
++ {
++ 	enum ip_set_ext_id id;
++ 	size_t offset = len;
++ 	u32 cadt_flags = 0;
++ 
++ 	if (tb[IPSET_ATTR_CADT_FLAGS])
++ 		cadt_flags = ip_set_get_h32(tb[IPSET_ATTR_CADT_FLAGS]);
++ 	if (cadt_flags & IPSET_FLAG_WITH_FORCEADD)
++ 		set->flags |= IPSET_CREATE_FLAG_FORCEADD;
++ 	for (id = 0; id < IPSET_EXT_ID_MAX; id++) {
++ 		if (!add_extension(id, cadt_flags, tb))
++ 			continue;
++ 		offset = ALIGN(offset, ip_set_extensions[id].align);
++ 		set->offset[id] = offset;
++ 		set->extensions |= ip_set_extensions[id].type;
++ 		offset += ip_set_extensions[id].len;
++ 	}
++ 	return offset;
++ }
++ EXPORT_SYMBOL_GPL(ip_set_elem_len);
++ 
+++>>>>>>> caed0ed35b1e (netfilter: ipset: Properly calculate extensions offsets and total length)
+  int
+  ip_set_get_extensions(struct ip_set *set, struct nlattr *tb[],
+  		      struct ip_set_ext *ext)
+* Unmerged path net/netfilter/ipset/ip_set_core.c
