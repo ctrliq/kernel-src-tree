@@ -1,0 +1,291 @@
+tcmu: fix unmap thread race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 9972cebb59a653cca735178a70c8ab09a5f4de1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9972cebb.failed
+
+If the unmap thread has already run find_free_blocks
+but not yet run prepare_to_wait when a wake_up(&unmap_wait)
+call is done, the unmap thread is going to miss the wake
+call. Instead of adding checks for if new waiters were added
+this just has us use a work queue which will run us again
+in this type of case.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9972cebb59a653cca735178a70c8ab09a5f4de1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,a9f5c52e8b1d..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -25,11 -26,16 +25,16 @@@
+  #include <linux/parser.h>
+  #include <linux/vmalloc.h>
+  #include <linux/uio_driver.h>
+ -#include <linux/radix-tree.h>
+  #include <linux/stringify.h>
+  #include <linux/bitops.h>
+ -#include <linux/highmem.h>
+  #include <linux/configfs.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/mutex.h>
++ #include <linux/workqueue.h>
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  #include <net/genetlink.h>
+ -#include <scsi/scsi_common.h>
+ -#include <scsi/scsi_proto.h>
+ +#include <asm/unaligned.h>
+  #include <target/target_core_base.h>
+  #include <target/target_core_fabric.h>
+  #include <target/target_core_backend.h>
+@@@ -155,11 -176,14 +160,20 @@@ struct tcmu_cmd 
+  	unsigned long flags;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static DEFINE_MUTEX(root_udev_mutex);
++ static LIST_HEAD(root_udev);
++ 
++ static atomic_t global_db_count = ATOMIC_INIT(0);
++ static struct work_struct tcmu_unmap_work;
++ 
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  static struct kmem_cache *tcmu_cmd_cache;
+  
+ +static DEFINE_IDR(devices_idr);
+ +static DEFINE_MUTEX(device_mutex);
+ +
+  /* multicast group */
+  enum tcmu_multicast_groups {
+  	TCMU_MCGRP_CONFIG,
+@@@ -292,6 -317,93 +306,96 @@@ static struct genl_family tcmu_genl_fam
+  	.n_ops = ARRAY_SIZE(tcmu_genl_ops),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define tcmu_cmd_set_dbi_cur(cmd, index) ((cmd)->dbi_cur = (index))
++ #define tcmu_cmd_reset_dbi_cur(cmd) tcmu_cmd_set_dbi_cur(cmd, 0)
++ #define tcmu_cmd_set_dbi(cmd, index) ((cmd)->dbi[(cmd)->dbi_cur++] = (index))
++ #define tcmu_cmd_get_dbi(cmd) ((cmd)->dbi[(cmd)->dbi_cur++])
++ 
++ static void tcmu_cmd_free_data(struct tcmu_cmd *tcmu_cmd, uint32_t len)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	uint32_t i;
++ 
++ 	for (i = 0; i < len; i++)
++ 		clear_bit(tcmu_cmd->dbi[i], udev->data_bitmap);
++ }
++ 
++ static inline bool tcmu_get_empty_block(struct tcmu_dev *udev,
++ 					struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct page *page;
++ 	int ret, dbi;
++ 
++ 	dbi = find_first_zero_bit(udev->data_bitmap, udev->dbi_thresh);
++ 	if (dbi == udev->dbi_thresh)
++ 		return false;
++ 
++ 	page = radix_tree_lookup(&udev->data_blocks, dbi);
++ 	if (!page) {
++ 		if (atomic_add_return(1, &global_db_count) >
++ 					TCMU_GLOBAL_MAX_BLOCKS) {
++ 			atomic_dec(&global_db_count);
++ 			return false;
++ 		}
++ 
++ 		/* try to get new page from the mm */
++ 		page = alloc_page(GFP_KERNEL);
++ 		if (!page)
++ 			goto err_alloc;
++ 
++ 		ret = radix_tree_insert(&udev->data_blocks, dbi, page);
++ 		if (ret)
++ 			goto err_insert;
++ 	}
++ 
++ 	if (dbi > udev->dbi_max)
++ 		udev->dbi_max = dbi;
++ 
++ 	set_bit(dbi, udev->data_bitmap);
++ 	tcmu_cmd_set_dbi(tcmu_cmd, dbi);
++ 
++ 	return true;
++ err_insert:
++ 	__free_page(page);
++ err_alloc:
++ 	atomic_dec(&global_db_count);
++ 	return false;
++ }
++ 
++ static bool tcmu_get_empty_blocks(struct tcmu_dev *udev,
++ 				  struct tcmu_cmd *tcmu_cmd)
++ {
++ 	int i;
++ 
++ 	udev->waiting_global = false;
++ 
++ 	for (i = tcmu_cmd->dbi_cur; i < tcmu_cmd->dbi_cnt; i++) {
++ 		if (!tcmu_get_empty_block(udev, tcmu_cmd))
++ 			goto err;
++ 	}
++ 	return true;
++ 
++ err:
++ 	udev->waiting_global = true;
++ 	schedule_work(&tcmu_unmap_work);
++ 	return false;
++ }
++ 
++ static inline struct page *
++ tcmu_get_block_page(struct tcmu_dev *udev, uint32_t dbi)
++ {
++ 	return radix_tree_lookup(&udev->data_blocks, dbi);
++ }
++ 
++ static inline void tcmu_free_cmd(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	kfree(tcmu_cmd->dbi);
++ 	kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
++ }
++ 
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  static inline size_t tcmu_cmd_get_data_length(struct tcmu_cmd *tcmu_cmd)
+  {
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -910,6 -1063,8 +1014,11 @@@ static void tcmu_device_timedout(unsign
+  	idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
+  	spin_unlock_irqrestore(&udev->commands_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	schedule_work(&tcmu_unmap_work);
++ 
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  	/*
+  	 * We don't need to wakeup threads on wait_cmdr since they have their
+  	 * own timeout.
+@@@ -1650,6 -1970,83 +1759,86 @@@ static struct target_backend_ops tcmu_o
+  	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void find_free_blocks(void)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	uint32_t start, end, block;
++ 
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 
++ 		/* Try to complete the finished commands first */
++ 		tcmu_handle_completions(udev);
++ 
++ 		/* Skip the udevs waiting the global pool or in idle */
++ 		if (udev->waiting_global || !udev->dbi_thresh) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		end = udev->dbi_max + 1;
++ 		block = find_last_bit(udev->data_bitmap, end);
++ 		if (block == udev->dbi_max) {
++ 			/*
++ 			 * The last bit is dbi_max, so there is
++ 			 * no need to shrink any blocks.
++ 			 */
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		} else if (block == end) {
++ 			/* The current udev will goto idle state */
++ 			udev->dbi_thresh = start = 0;
++ 			udev->dbi_max = 0;
++ 		} else {
++ 			udev->dbi_thresh = start = block + 1;
++ 			udev->dbi_max = block;
++ 		}
++ 
++ 		/* Here will truncate the data area from off */
++ 		off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 		/* Release the block pages */
++ 		tcmu_blocks_release(&udev->data_blocks, start, end);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ }
++ 
++ static void run_cmdr_queues(void)
++ {
++ 	struct tcmu_dev *udev;
++ 
++ 	/*
++ 	 * Try to wake up the udevs who are waiting
++ 	 * for the global data block pool.
++ 	 */
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 		if (!udev->waiting_global) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			break;
++ 		}
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		wake_up(&udev->wait_cmdr);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ }
++ 
++ static void tcmu_unmap_work_fn(struct work_struct *work)
++ {
++ 	find_free_blocks();
++ 	run_cmdr_queues();
++ }
++ 
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+@@@ -1701,8 -2100,6 +1892,11 @@@
+  	if (ret)
+  		goto out_attrs;
+  
+++<<<<<<< HEAD
+ +	idr_init(&devices_idr);
+ +
+++=======
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  	return 0;
+  
+  out_attrs:
+@@@ -1719,7 -2116,7 +1913,11 @@@ out_free_cache
+  
+  static void __exit tcmu_module_exit(void)
+  {
+++<<<<<<< HEAD
+ +	idr_destroy(&devices_idr);
+++=======
++ 	cancel_work_sync(&tcmu_unmap_work);
+++>>>>>>> 9972cebb59a6 (tcmu: fix unmap thread race)
+  	target_backend_unregister(&tcmu_ops);
+  	kfree(tcmu_attrs);
+  	genl_unregister_family(&tcmu_genl_family);
+* Unmerged path drivers/target/target_core_user.c
