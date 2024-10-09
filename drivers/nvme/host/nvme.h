@@ -205,6 +205,12 @@ static inline void nvme_setup_rw(struct nvme_ns *ns, struct request *req,
 	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
 }
 
+static inline void nvme_cleanup_cmd(struct request *req)
+{
+	if (req->cmd_flags & REQ_DISCARD)
+		kfree(req->completion_data);
+}
+
 static inline int nvme_error_status(u16 status)
 {
 	switch (status & 0x7ff) {
