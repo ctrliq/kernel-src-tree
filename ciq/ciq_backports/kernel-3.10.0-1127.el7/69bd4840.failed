@@ -1,0 +1,406 @@
+net/sched: Remove egdev mechanism
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [net] sched: Remove egdev mechanism (Ivan Vecera) [1660900]
+Rebuild_FUZZ: 93.55%
+commit-author Oz Shlomo <ozsh@mellanox.com>
+commit 69bd48404f251b9c45a15799fdcfc87a7ad6ab8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/69bd4840.failed
+
+The egdev mechanism was replaced by the TC indirect block notifications
+platform.
+
+	Signed-off-by: Oz Shlomo <ozsh@mellanox.com>
+	Reviewed-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Cc: John Hurley <john.hurley@netronome.com>
+	Cc: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 69bd48404f251b9c45a15799fdcfc87a7ad6ab8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/act_api.c
+#	net/sched/cls_api.c
+diff --cc include/net/act_api.h
+index 62f040b7791c,dbc795ec659e..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -178,38 -194,5 +178,41 @@@ static inline void tcf_action_stats_upd
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +typedef int tc_setup_cb_t(enum tc_setup_type type,
+ +			  void *type_data, void *cb_priv);
+ +
+ +#ifdef CONFIG_NET_CLS_ACT
+ +int tc_setup_cb_egdev_register(const struct net_device *dev,
+ +			       tc_setup_cb_t *cb, void *cb_priv);
+ +void tc_setup_cb_egdev_unregister(const struct net_device *dev,
+ +				  tc_setup_cb_t *cb, void *cb_priv);
+ +int tc_setup_cb_egdev_call(const struct net_device *dev,
+ +			   enum tc_setup_type type, void *type_data,
+ +			   bool err_stop);
+ +#else
+ +static inline
+ +int tc_setup_cb_egdev_register(const struct net_device *dev,
+ +			       tc_setup_cb_t *cb, void *cb_priv)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline
+ +void tc_setup_cb_egdev_unregister(const struct net_device *dev,
+ +				  tc_setup_cb_t *cb, void *cb_priv)
+ +{
+ +}
+ +
+ +static inline
+ +int tc_setup_cb_egdev_call(const struct net_device *dev,
+ +			   enum tc_setup_type type, void *type_data,
+ +			   bool err_stop)
+ +{
+ +	return 0;
+ +}
+ +#endif
+++=======
+++>>>>>>> 69bd48404f25 (net/sched: Remove egdev mechanism)
+  
+  #endif
+diff --cc net/sched/act_api.c
+index 4a6e8a4173e6,d4b8355737d8..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -1260,231 -1520,12 +1258,23 @@@ out_module_put
+  	return skb->len;
+  }
+  
+- struct tcf_action_net {
+- 	struct rhashtable egdev_ht;
+- };
+- 
+- static unsigned int tcf_action_net_id;
+- 
+- struct tcf_action_egdev_cb {
+- 	struct list_head list;
+- 	tc_setup_cb_t *cb;
+- 	void *cb_priv;
+- };
+- 
+- struct tcf_action_egdev {
+- 	struct rhash_head ht_node;
+- 	const struct net_device *dev;
+- 	unsigned int refcnt;
+- 	struct list_head cb_list;
+- };
+- 
+- static const struct rhashtable_params tcf_action_egdev_ht_params = {
+- 	.key_offset = offsetof(struct tcf_action_egdev, dev),
+- 	.head_offset = offsetof(struct tcf_action_egdev, ht_node),
+- 	.key_len = sizeof(const struct net_device *),
+- };
+- 
+- static struct tcf_action_egdev *
+- tcf_action_egdev_lookup(const struct net_device *dev)
+- {
+- 	struct net *net = dev_net(dev);
+- 	struct tcf_action_net *tan = net_generic(net, tcf_action_net_id);
+- 
+- 	return rhashtable_lookup_fast(&tan->egdev_ht, &dev,
+- 				      tcf_action_egdev_ht_params);
+- }
+- 
+- static struct tcf_action_egdev *
+- tcf_action_egdev_get(const struct net_device *dev)
+- {
+- 	struct tcf_action_egdev *egdev;
+- 	struct tcf_action_net *tan;
+- 
+- 	egdev = tcf_action_egdev_lookup(dev);
+- 	if (egdev)
+- 		goto inc_ref;
+- 
+- 	egdev = kzalloc(sizeof(*egdev), GFP_KERNEL);
+- 	if (!egdev)
+- 		return NULL;
+- 	INIT_LIST_HEAD(&egdev->cb_list);
+- 	egdev->dev = dev;
+- 	tan = net_generic(dev_net(dev), tcf_action_net_id);
+- 	rhashtable_insert_fast(&tan->egdev_ht, &egdev->ht_node,
+- 			       tcf_action_egdev_ht_params);
+- 
+- inc_ref:
+- 	egdev->refcnt++;
+- 	return egdev;
+- }
+- 
+- static void tcf_action_egdev_put(struct tcf_action_egdev *egdev)
+- {
+- 	struct tcf_action_net *tan;
+- 
+- 	if (--egdev->refcnt)
+- 		return;
+- 	tan = net_generic(dev_net(egdev->dev), tcf_action_net_id);
+- 	rhashtable_remove_fast(&tan->egdev_ht, &egdev->ht_node,
+- 			       tcf_action_egdev_ht_params);
+- 	kfree(egdev);
+- }
+- 
+- static struct tcf_action_egdev_cb *
+- tcf_action_egdev_cb_lookup(struct tcf_action_egdev *egdev,
+- 			   tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	struct tcf_action_egdev_cb *egdev_cb;
+- 
+- 	list_for_each_entry(egdev_cb, &egdev->cb_list, list)
+- 		if (egdev_cb->cb == cb && egdev_cb->cb_priv == cb_priv)
+- 			return egdev_cb;
+- 	return NULL;
+- }
+- 
+- static int tcf_action_egdev_cb_call(struct tcf_action_egdev *egdev,
+- 				    enum tc_setup_type type,
+- 				    void *type_data, bool err_stop)
+- {
+- 	struct tcf_action_egdev_cb *egdev_cb;
+- 	int ok_count = 0;
+- 	int err;
+- 
+- 	list_for_each_entry(egdev_cb, &egdev->cb_list, list) {
+- 		err = egdev_cb->cb(type, type_data, egdev_cb->cb_priv);
+- 		if (err) {
+- 			if (err_stop)
+- 				return err;
+- 		} else {
+- 			ok_count++;
+- 		}
+- 	}
+- 	return ok_count;
+- }
+- 
+- static int tcf_action_egdev_cb_add(struct tcf_action_egdev *egdev,
+- 				   tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	struct tcf_action_egdev_cb *egdev_cb;
+- 
+- 	egdev_cb = tcf_action_egdev_cb_lookup(egdev, cb, cb_priv);
+- 	if (WARN_ON(egdev_cb))
+- 		return -EEXIST;
+- 	egdev_cb = kzalloc(sizeof(*egdev_cb), GFP_KERNEL);
+- 	if (!egdev_cb)
+- 		return -ENOMEM;
+- 	egdev_cb->cb = cb;
+- 	egdev_cb->cb_priv = cb_priv;
+- 	list_add(&egdev_cb->list, &egdev->cb_list);
+- 	return 0;
+- }
+- 
+- static void tcf_action_egdev_cb_del(struct tcf_action_egdev *egdev,
+- 				    tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	struct tcf_action_egdev_cb *egdev_cb;
+- 
+- 	egdev_cb = tcf_action_egdev_cb_lookup(egdev, cb, cb_priv);
+- 	if (WARN_ON(!egdev_cb))
+- 		return;
+- 	list_del(&egdev_cb->list);
+- 	kfree(egdev_cb);
+- }
+- 
+- static int __tc_setup_cb_egdev_register(const struct net_device *dev,
+- 					tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	struct tcf_action_egdev *egdev = tcf_action_egdev_get(dev);
+- 	int err;
+- 
+- 	if (!egdev)
+- 		return -ENOMEM;
+- 	err = tcf_action_egdev_cb_add(egdev, cb, cb_priv);
+- 	if (err)
+- 		goto err_cb_add;
+- 	return 0;
+- 
+- err_cb_add:
+- 	tcf_action_egdev_put(egdev);
+- 	return err;
+- }
+- int tc_setup_cb_egdev_register(const struct net_device *dev,
+- 			       tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	int err;
+- 
+- 	rtnl_lock();
+- 	err = __tc_setup_cb_egdev_register(dev, cb, cb_priv);
+- 	rtnl_unlock();
+- 	return err;
+- }
+- EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_register);
+- 
+- static void __tc_setup_cb_egdev_unregister(const struct net_device *dev,
+- 					   tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	struct tcf_action_egdev *egdev = tcf_action_egdev_lookup(dev);
+- 
+- 	if (WARN_ON(!egdev))
+- 		return;
+- 	tcf_action_egdev_cb_del(egdev, cb, cb_priv);
+- 	tcf_action_egdev_put(egdev);
+- }
+- void tc_setup_cb_egdev_unregister(const struct net_device *dev,
+- 				  tc_setup_cb_t *cb, void *cb_priv)
+- {
+- 	rtnl_lock();
+- 	__tc_setup_cb_egdev_unregister(dev, cb, cb_priv);
+- 	rtnl_unlock();
+- }
+- EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_unregister);
+- 
+- int tc_setup_cb_egdev_call(const struct net_device *dev,
+- 			   enum tc_setup_type type, void *type_data,
+- 			   bool err_stop)
+- {
+- 	struct tcf_action_egdev *egdev = tcf_action_egdev_lookup(dev);
+- 
+- 	if (!egdev)
+- 		return 0;
+- 	return tcf_action_egdev_cb_call(egdev, type, type_data, err_stop);
+- }
+- EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_call);
+- 
+- static __net_init int tcf_action_net_init(struct net *net)
+- {
+- 	struct tcf_action_net *tan = net_generic(net, tcf_action_net_id);
+- 
+- 	return rhashtable_init(&tan->egdev_ht, &tcf_action_egdev_ht_params);
+- }
+- 
+- static void __net_exit tcf_action_net_exit(struct net *net)
+- {
+- 	struct tcf_action_net *tan = net_generic(net, tcf_action_net_id);
+- 
+- 	rhashtable_destroy(&tan->egdev_ht);
+- }
+- 
+- static struct pernet_operations tcf_action_net_ops = {
+- 	.init = tcf_action_net_init,
+- 	.exit = tcf_action_net_exit,
+- 	.id = &tcf_action_net_id,
+- 	.size = sizeof(struct tcf_action_net),
+- };
+- 
+  static int __init tc_action_init(void)
+  {
+++<<<<<<< HEAD
+ +	int err;
+ +
+ +	err = register_pernet_subsys(&tcf_action_net_ops);
+ +	if (err)
+ +		return err;
+ +
+ +	rtnl_register(PF_UNSPEC, RTM_NEWACTION, tc_ctl_action, NULL, NULL);
+ +	rtnl_register(PF_UNSPEC, RTM_DELACTION, tc_ctl_action, NULL, NULL);
+++=======
++ 	rtnl_register(PF_UNSPEC, RTM_NEWACTION, tc_ctl_action, NULL, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_DELACTION, tc_ctl_action, NULL, 0);
+++>>>>>>> 69bd48404f25 (net/sched: Remove egdev mechanism)
+  	rtnl_register(PF_UNSPEC, RTM_GETACTION, tc_ctl_action, tc_dump_action,
+ -		      0);
+ +		      NULL);
+  
+  	return 0;
+  }
+diff --cc net/sched/cls_api.c
+index 3e3407968838,6207f265b87c..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -1744,75 -2515,10 +1744,82 @@@ int tcf_exts_dump_stats(struct sk_buff 
+  }
+  EXPORT_SYMBOL(tcf_exts_dump_stats);
+  
+++<<<<<<< HEAD
+ +static int tc_exts_setup_cb_egdev_call(struct tcf_exts *exts,
+ +				       enum tc_setup_type type,
+ +				       void *type_data, bool err_stop)
+ +{
+ +	int ok_count = 0;
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	const struct tc_action *a;
+ +	struct net_device *dev;
+ +	int i, ret;
+ +
+ +	if (!tcf_exts_has_actions(exts))
+ +		return 0;
+ +
+ +	for (i = 0; i < exts->nr_actions; i++) {
+ +		a = exts->actions[i];
+ +		if (!a->ops->get_dev)
+ +			continue;
+ +		dev = a->ops->get_dev(a);
+ +		if (!dev)
+ +			continue;
+ +		ret = tc_setup_cb_egdev_call(dev, type, type_data, err_stop);
+ +		if (ret < 0)
+ +			return ret;
+ +		ok_count += ret;
+ +	}
+ +#endif
+ +	return ok_count;
+ +}
+ +
+ +int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
+ +		     enum tc_setup_type type, void *type_data, bool err_stop)
+ +{
+ +	int ok_count;
+ +	int ret;
+ +
+ +	/*
+ +	 * RHEL: Older drivers compiled against RHEL 7.4 and older don't
+ +	 * use TC setup callback infrastructure. We need to call their
+ +	 * .ndo_setup_tc() callback for types used by classifiers in RHEL 7.4
+ +	 * TC_SETUP_{MQPRIO,CLS*}.
+ +	 * For newer drivers and such types the __rh_call_ndo_setup_tc()
+ +	 * does nothing and immediately returns 0.
+ +	 *
+ +	 * Note that the compatibility for older external drivers is preserved
+ +	 * only when TC block is not shared. For such drivers we need to
+ +	 * provide qdisc handle but only non-shared blocks have exactly one
+ +	 * qdisc.
+ +	 */
+ +	if (!tcf_block_shared(block)) {
+ +		ret = __rh_call_ndo_setup_tc(tcf_block_dev(block),
+ +					     tcf_block_q(block)->handle, type,
+ +					     type_data);
+ +		if (ret < 0 && err_stop)
+ +			return ret;
+ +	}
+ +
+ +	ret = tcf_block_cb_call(block, type, type_data, err_stop);
+ +	if (ret < 0)
+ +		return ret;
+ +	ok_count = ret;
+ +
+ +	if (!exts || ok_count)
+ +		return ok_count;
+ +	ret = tc_exts_setup_cb_egdev_call(exts, type, type_data, err_stop);
+ +	if (ret < 0)
+ +		return ret;
+ +	ok_count += ret;
+ +
+ +	return ok_count;
+++=======
++ int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
++ 		     enum tc_setup_type type, void *type_data, bool err_stop)
++ {
++ 	return tcf_block_cb_call(block, type, type_data, err_stop);
+++>>>>>>> 69bd48404f25 (net/sched: Remove egdev mechanism)
+  }
+  EXPORT_SYMBOL(tc_setup_cb_call);
+  
+* Unmerged path include/net/act_api.h
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/cls_api.c
