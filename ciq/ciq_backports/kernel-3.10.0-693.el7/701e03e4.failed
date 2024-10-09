@@ -1,0 +1,823 @@
+dm cache: track all IO to the cache rather than just the origin device's IO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit 701e03e4e180f0cd97d4139a32e2b2d879d12da2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/701e03e4.failed
+
+IO tracking used to throttle writebacks when the origin device is busy.
+
+Even if all the IO is going to the fast device, writebacks can
+significantly degrade performance.  So track all IO to gauge whether the
+cache is busy or not.
+
+Otherwise, synthetic IO tests (e.g. fio) that might send all IO to the
+fast device wouldn't cause writebacks to get throttled.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 701e03e4e180f0cd97d4139a32e2b2d879d12da2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+diff --cc drivers/md/dm-cache-target.c
+index b3668b4f4fd1,232078e48167..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -332,7 -477,12 +332,16 @@@ struct cache 
+  	spinlock_t invalidation_lock;
+  	struct list_head invalidation_requests;
+  
+++<<<<<<< HEAD
+ +	struct io_tracker origin_tracker;
+++=======
++ 	struct io_tracker tracker;
++ 
++ 	struct work_struct commit_ws;
++ 	struct batcher committer;
++ 
++ 	struct rw_semaphore background_work_lock;
+++>>>>>>> 701e03e4e180 (dm cache: track all IO to the cache rather than just the origin device's IO)
+  };
+  
+  struct per_bio_data {
+@@@ -831,31 -902,9 +840,35 @@@ static dm_oblock_t get_bio_block(struc
+  	return to_oblock(block_nr);
+  }
+  
+ +static int bio_triggers_commit(struct cache *cache, struct bio *bio)
+ +{
+ +	return bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +}
+ +
+ +/*
+ + * You must increment the deferred set whilst the prison cell is held.  To
+ + * encourage this, we ask for 'cell' to be passed in.
+ + */
+ +static void inc_ds(struct cache *cache, struct bio *bio,
+ +		   struct dm_bio_prison_cell *cell)
+ +{
+ +	size_t pb_data_size = get_per_bio_data_size(cache);
+ +	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
+ +
+ +	BUG_ON(!cell);
+ +	BUG_ON(pb->all_io_entry);
+ +
+ +	pb->all_io_entry = dm_deferred_entry_inc(cache->all_io_ds);
+ +}
+ +
+  static bool accountable_bio(struct cache *cache, struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	return ((bio->bi_bdev == cache->origin_dev->bdev) &&
+ +		!(bio->bi_rw & REQ_DISCARD));
+++=======
++ 	return bio_op(bio) != REQ_OP_DISCARD;
+++>>>>>>> 701e03e4e180 (dm cache: track all IO to the cache rather than just the origin device's IO)
+  }
+  
+  static void accounted_begin(struct cache *cache, struct bio *bio)
+@@@ -1321,337 -1288,450 +1334,341 @@@ static void issue_overwrite(struct dm_c
+  	accounted_request(mg->cache, bio);
+  }
+  
+ -/*
+ - * Migration steps:
+ - *
+ - * 1) exclusive lock preventing WRITEs
+ - * 2) quiesce
+ - * 3) copy or issue overwrite bio
+ - * 4) upgrade to exclusive lock preventing READs and WRITEs
+ - * 5) quiesce
+ - * 6) update metadata and commit
+ - * 7) unlock
+ - */
+ -static void mg_complete(struct dm_cache_migration *mg, bool success)
+ +static bool bio_writes_complete_block(struct cache *cache, struct bio *bio)
+  {
+ -	struct bio_list bios;
+ -	struct cache *cache = mg->cache;
+ -	struct policy_work *op = mg->op;
+ -	dm_cblock_t cblock = op->cblock;
+ -
+ -	if (success)
+ -		update_stats(&cache->stats, op->op);
+ -
+ -	switch (op->op) {
+ -	case POLICY_PROMOTE:
+ -		clear_discard(cache, oblock_to_dblock(cache, op->oblock));
+ -		policy_complete_background_work(cache->policy, op, success);
+ -
+ -		if (mg->overwrite_bio) {
+ -			if (success)
+ -				force_set_dirty(cache, cblock);
+ -			else
+ -				mg->overwrite_bio->bi_error = (mg->k.input ? : -EIO);
+ -			bio_endio(mg->overwrite_bio);
+ -		} else {
+ -			if (success)
+ -				force_clear_dirty(cache, cblock);
+ -			dec_io_migrations(cache);
+ -		}
+ -		break;
+ -
+ -	case POLICY_DEMOTE:
+ -		/*
+ -		 * We clear dirty here to update the nr_dirty counter.
+ -		 */
+ -		if (success)
+ -			force_clear_dirty(cache, cblock);
+ -		policy_complete_background_work(cache->policy, op, success);
+ -		dec_io_migrations(cache);
+ -		break;
+ +	return (bio_data_dir(bio) == WRITE) &&
+ +		(bio->bi_size == (cache->sectors_per_block << SECTOR_SHIFT));
+ +}
+  
+ -	case POLICY_WRITEBACK:
+ -		if (success)
+ -			force_clear_dirty(cache, cblock);
+ -		policy_complete_background_work(cache->policy, op, success);
+ -		dec_io_migrations(cache);
+ -		break;
+ -	}
+ +static void avoid_copy(struct dm_cache_migration *mg)
+ +{
+ +	atomic_inc(&mg->cache->stats.copies_avoided);
+ +	migration_success_pre_commit(mg);
+ +}
+  
+ -	bio_list_init(&bios);
+ -	if (mg->cell) {
+ -		if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
+ -			free_prison_cell(cache, mg->cell);
+ -	}
+ +static void calc_discard_block_range(struct cache *cache, struct bio *bio,
+ +				     dm_dblock_t *b, dm_dblock_t *e)
+ +{
+ +	sector_t sb = bio->bi_sector;
+ +	sector_t se = bio_end_sector(bio);
+  
+ -	free_migration(mg);
+ -	defer_bios(cache, &bios);
+ -	wake_migration_worker(cache);
+ +	*b = to_dblock(dm_sector_div_up(sb, cache->discard_block_size));
+  
+ -	background_work_end(cache);
+ +	if (se - sb < cache->discard_block_size)
+ +		*e = *b;
+ +	else
+ +		*e = to_dblock(block_div(se, cache->discard_block_size));
+  }
+  
+ -static void mg_success(struct work_struct *ws)
+ +static void issue_discard(struct dm_cache_migration *mg)
+  {
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ -	mg_complete(mg, mg->k.input == 0);
+ +	dm_dblock_t b, e;
+ +	struct bio *bio = mg->new_ocell->holder;
+ +	struct cache *cache = mg->cache;
+ +
+ +	calc_discard_block_range(cache, bio, &b, &e);
+ +	while (b != e) {
+ +		set_discard(cache, b);
+ +		b = to_dblock(from_dblock(b) + 1);
+ +	}
+ +
+ +	bio_endio(bio, 0);
+ +	cell_defer(cache, mg->new_ocell, false);
+ +	free_migration(mg);
+ +	wake_worker(cache);
+  }
+  
+ -static void mg_update_metadata(struct work_struct *ws)
+ +static void issue_copy_or_discard(struct dm_cache_migration *mg)
+  {
+ -	int r;
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ +	bool avoid;
+  	struct cache *cache = mg->cache;
+ -	struct policy_work *op = mg->op;
+  
+ -	switch (op->op) {
+ -	case POLICY_PROMOTE:
+ -		r = dm_cache_insert_mapping(cache->cmd, op->cblock, op->oblock);
+ -		if (r) {
+ -			DMERR_LIMIT("%s: migration failed; couldn't insert mapping",
+ -				    cache_device_name(cache));
+ -			metadata_operation_failed(cache, "dm_cache_insert_mapping", r);
+ +	if (mg->discard) {
+ +		issue_discard(mg);
+ +		return;
+ +	}
+  
+ -			mg_complete(mg, false);
+ -			return;
+ -		}
+ -		mg_complete(mg, true);
+ -		break;
+ +	if (mg->writeback || mg->demote)
+ +		avoid = !is_dirty(cache, mg->cblock) ||
+ +			is_discarded_oblock(cache, mg->old_oblock);
+ +	else {
+ +		struct bio *bio = mg->new_ocell->holder;
+  
+ -	case POLICY_DEMOTE:
+ -		r = dm_cache_remove_mapping(cache->cmd, op->cblock);
+ -		if (r) {
+ -			DMERR_LIMIT("%s: migration failed; couldn't update on disk metadata",
+ -				    cache_device_name(cache));
+ -			metadata_operation_failed(cache, "dm_cache_remove_mapping", r);
+ +		avoid = is_discarded_oblock(cache, mg->new_oblock);
+  
+ -			mg_complete(mg, false);
+ +		if (writeback_mode(&cache->features) &&
+ +		    !avoid && bio_writes_complete_block(cache, bio)) {
+ +			issue_overwrite(mg, bio);
+  			return;
+  		}
+ -
+ -		/*
+ -		 * It would be nice if we only had to commit when a REQ_FLUSH
+ -		 * comes through.  But there's one scenario that we have to
+ -		 * look out for:
+ -		 *
+ -		 * - vblock x in a cache block
+ -		 * - domotion occurs
+ -		 * - cache block gets reallocated and over written
+ -		 * - crash
+ -		 *
+ -		 * When we recover, because there was no commit the cache will
+ -		 * rollback to having the data for vblock x in the cache block.
+ -		 * But the cache block has since been overwritten, so it'll end
+ -		 * up pointing to data that was never in 'x' during the history
+ -		 * of the device.
+ -		 *
+ -		 * To avoid this issue we require a commit as part of the
+ -		 * demotion operation.
+ -		 */
+ -		init_continuation(&mg->k, mg_success);
+ -		continue_after_commit(&cache->committer, &mg->k);
+ -		schedule_commit(&cache->committer);
+ -		break;
+ -
+ -	case POLICY_WRITEBACK:
+ -		mg_complete(mg, true);
+ -		break;
+  	}
+ +
+ +	avoid ? avoid_copy(mg) : issue_copy(mg);
+  }
+  
+ -static void mg_update_metadata_after_copy(struct work_struct *ws)
+ +static void complete_migration(struct dm_cache_migration *mg)
+  {
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ -
+ -	/*
+ -	 * Did the copy succeed?
+ -	 */
+ -	if (mg->k.input)
+ -		mg_complete(mg, false);
+ +	if (mg->err)
+ +		migration_failure(mg);
+  	else
+ -		mg_update_metadata(ws);
+ +		migration_success_pre_commit(mg);
+  }
+  
+ -static void mg_upgrade_lock(struct work_struct *ws)
+ +static void process_migrations(struct cache *cache, struct list_head *head,
+ +			       void (*fn)(struct dm_cache_migration *))
+  {
+ -	int r;
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ -
+ -	/*
+ -	 * Did the copy succeed?
+ -	 */
+ -	if (mg->k.input)
+ -		mg_complete(mg, false);
+ -
+ -	else {
+ -		/*
+ -		 * Now we want the lock to prevent both reads and writes.
+ -		 */
+ -		r = dm_cell_lock_promote_v2(mg->cache->prison, mg->cell,
+ -					    READ_WRITE_LOCK_LEVEL);
+ -		if (r < 0)
+ -			mg_complete(mg, false);
+ +	unsigned long flags;
+ +	struct list_head list;
+ +	struct dm_cache_migration *mg, *tmp;
+  
+ -		else if (r)
+ -			quiesce(mg, mg_update_metadata);
+ +	INIT_LIST_HEAD(&list);
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	list_splice_init(head, &list);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+  
+ -		else
+ -			mg_update_metadata(ws);
+ -	}
+ +	list_for_each_entry_safe(mg, tmp, &list, list)
+ +		fn(mg);
+  }
+  
+ -static void mg_copy(struct work_struct *ws)
+ +static void __queue_quiesced_migration(struct dm_cache_migration *mg)
+  {
+ -	int r;
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ -
+ -	if (mg->overwrite_bio) {
+ -		/*
+ -		 * It's safe to do this here, even though it's new data
+ -		 * because all IO has been locked out of the block.
+ -		 *
+ -		 * mg_lock_writes() already took READ_WRITE_LOCK_LEVEL
+ -		 * so _not_ using mg_upgrade_lock() as continutation.
+ -		 */
+ -		overwrite(mg, mg_update_metadata_after_copy);
+ -
+ -	} else {
+ -		struct cache *cache = mg->cache;
+ -		struct policy_work *op = mg->op;
+ -		bool is_policy_promote = (op->op == POLICY_PROMOTE);
+ -
+ -		if ((!is_policy_promote && !is_dirty(cache, op->cblock)) ||
+ -		    is_discarded_oblock(cache, op->oblock)) {
+ -			mg_upgrade_lock(ws);
+ -			return;
+ -		}
+ -
+ -		init_continuation(&mg->k, mg_upgrade_lock);
+ -
+ -		r = copy(mg, is_policy_promote);
+ -		if (r) {
+ -			DMERR_LIMIT("%s: migration copy failed", cache_device_name(cache));
+ -			mg->k.input = -EIO;
+ -			mg_complete(mg, false);
+ -		}
+ -	}
+ +	list_add_tail(&mg->list, &mg->cache->quiesced_migrations);
+  }
+  
+ -static int mg_lock_writes(struct dm_cache_migration *mg)
+ +static void queue_quiesced_migration(struct dm_cache_migration *mg)
+  {
+ -	int r;
+ -	struct dm_cell_key_v2 key;
+ +	unsigned long flags;
+  	struct cache *cache = mg->cache;
+ -	struct dm_bio_prison_cell_v2 *prealloc;
+  
+ -	prealloc = alloc_prison_cell(cache);
+ -	if (!prealloc) {
+ -		DMERR_LIMIT("%s: alloc_prison_cell failed", cache_device_name(cache));
+ -		mg_complete(mg, false);
+ -		return -ENOMEM;
+ -	}
+ -
+ -	/*
+ -	 * Prevent writes to the block, but allow reads to continue.
+ -	 * Unless we're using an overwrite bio, in which case we lock
+ -	 * everything.
+ -	 */
+ -	build_key(mg->op->oblock, oblock_succ(mg->op->oblock), &key);
+ -	r = dm_cell_lock_v2(cache->prison, &key,
+ -			    mg->overwrite_bio ?  READ_WRITE_LOCK_LEVEL : WRITE_LOCK_LEVEL,
+ -			    prealloc, &mg->cell);
+ -	if (r < 0) {
+ -		free_prison_cell(cache, prealloc);
+ -		mg_complete(mg, false);
+ -		return r;
+ -	}
+ -
+ -	if (mg->cell != prealloc)
+ -		free_prison_cell(cache, prealloc);
+ -
+ -	if (r == 0)
+ -		mg_copy(&mg->k.ws);
+ -	else
+ -		quiesce(mg, mg_copy);
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	__queue_quiesced_migration(mg);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+  
+ -	return 0;
+ +	wake_worker(cache);
+  }
+  
+ -static int mg_start(struct cache *cache, struct policy_work *op, struct bio *bio)
+ +static void queue_quiesced_migrations(struct cache *cache, struct list_head *work)
+  {
+ -	struct dm_cache_migration *mg;
+ +	unsigned long flags;
+ +	struct dm_cache_migration *mg, *tmp;
+  
+ -	if (!background_work_begin(cache)) {
+ -		policy_complete_background_work(cache->policy, op, false);
+ -		return -EPERM;
+ -	}
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	list_for_each_entry_safe(mg, tmp, work, list)
+ +		__queue_quiesced_migration(mg);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+  
+ -	mg = alloc_migration(cache);
+ -	if (!mg) {
+ -		policy_complete_background_work(cache->policy, op, false);
+ -		background_work_end(cache);
+ -		return -ENOMEM;
+ -	}
+ +	wake_worker(cache);
+ +}
+  
+ -	memset(mg, 0, sizeof(*mg));
+ +static void check_for_quiesced_migrations(struct cache *cache,
+ +					  struct per_bio_data *pb)
+ +{
+ +	struct list_head work;
+  
+ -	mg->cache = cache;
+ -	mg->op = op;
+ -	mg->overwrite_bio = bio;
+ +	if (!pb->all_io_entry)
+ +		return;
+  
+ -	if (!bio)
+ -		inc_io_migrations(cache);
+ +	INIT_LIST_HEAD(&work);
+ +	dm_deferred_entry_dec(pb->all_io_entry, &work);
+  
+ -	return mg_lock_writes(mg);
+ +	if (!list_empty(&work))
+ +		queue_quiesced_migrations(cache, &work);
+  }
+  
+ -/*----------------------------------------------------------------
+ - * invalidation processing
+ - *--------------------------------------------------------------*/
+ -
+ -static void invalidate_complete(struct dm_cache_migration *mg, bool success)
+ +static void quiesce_migration(struct dm_cache_migration *mg)
+  {
+ -	struct bio_list bios;
+ -	struct cache *cache = mg->cache;
+ -
+ -	bio_list_init(&bios);
+ -	if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
+ -		free_prison_cell(cache, mg->cell);
+ +	if (!dm_deferred_set_add_work(mg->cache->all_io_ds, &mg->list))
+ +		queue_quiesced_migration(mg);
+ +}
+  
+ -	if (!success && mg->overwrite_bio)
+ -		bio_io_error(mg->overwrite_bio);
+ +static void promote(struct cache *cache, struct prealloc *structs,
+ +		    dm_oblock_t oblock, dm_cblock_t cblock,
+ +		    struct dm_bio_prison_cell *cell)
+ +{
+ +	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+  
+ -	free_migration(mg);
+ -	defer_bios(cache, &bios);
+ +	mg->err = false;
+ +	mg->discard = false;
+ +	mg->writeback = false;
+ +	mg->demote = false;
+ +	mg->promote = true;
+ +	mg->requeue_holder = true;
+ +	mg->invalidate = false;
+ +	mg->cache = cache;
+ +	mg->new_oblock = oblock;
+ +	mg->cblock = cblock;
+ +	mg->old_ocell = NULL;
+ +	mg->new_ocell = cell;
+ +	mg->start_jiffies = jiffies;
+  
+ -	background_work_end(cache);
+ +	inc_io_migrations(cache);
+ +	quiesce_migration(mg);
+  }
+  
+ -static void invalidate_completed(struct work_struct *ws)
+ +static void writeback(struct cache *cache, struct prealloc *structs,
+ +		      dm_oblock_t oblock, dm_cblock_t cblock,
+ +		      struct dm_bio_prison_cell *cell)
+  {
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ -	invalidate_complete(mg, !mg->k.input);
+ -}
+ +	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+  
+ -static int invalidate_cblock(struct cache *cache, dm_cblock_t cblock)
+ -{
+ -	int r = policy_invalidate_mapping(cache->policy, cblock);
+ -	if (!r) {
+ -		r = dm_cache_remove_mapping(cache->cmd, cblock);
+ -		if (r) {
+ -			DMERR_LIMIT("%s: invalidation failed; couldn't update on disk metadata",
+ -				    cache_device_name(cache));
+ -			metadata_operation_failed(cache, "dm_cache_remove_mapping", r);
+ -		}
+ +	mg->err = false;
+ +	mg->discard = false;
+ +	mg->writeback = true;
+ +	mg->demote = false;
+ +	mg->promote = false;
+ +	mg->requeue_holder = true;
+ +	mg->invalidate = false;
+ +	mg->cache = cache;
+ +	mg->old_oblock = oblock;
+ +	mg->cblock = cblock;
+ +	mg->old_ocell = cell;
+ +	mg->new_ocell = NULL;
+ +	mg->start_jiffies = jiffies;
+ +
+ +	inc_io_migrations(cache);
+ +	quiesce_migration(mg);
+ +}
+ +
+ +static void demote_then_promote(struct cache *cache, struct prealloc *structs,
+ +				dm_oblock_t old_oblock, dm_oblock_t new_oblock,
+ +				dm_cblock_t cblock,
+ +				struct dm_bio_prison_cell *old_ocell,
+ +				struct dm_bio_prison_cell *new_ocell)
+ +{
+ +	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+ +
+ +	mg->err = false;
+ +	mg->discard = false;
+ +	mg->writeback = false;
+ +	mg->demote = true;
+ +	mg->promote = true;
+ +	mg->requeue_holder = true;
+ +	mg->invalidate = false;
+ +	mg->cache = cache;
+ +	mg->old_oblock = old_oblock;
+ +	mg->new_oblock = new_oblock;
+ +	mg->cblock = cblock;
+ +	mg->old_ocell = old_ocell;
+ +	mg->new_ocell = new_ocell;
+ +	mg->start_jiffies = jiffies;
+  
+ -	} else if (r == -ENODATA) {
+ -		/*
+ -		 * Harmless, already unmapped.
+ -		 */
+ -		r = 0;
+ +	inc_io_migrations(cache);
+ +	quiesce_migration(mg);
+ +}
+  
+ -	} else
+ -		DMERR("%s: policy_invalidate_mapping failed", cache_device_name(cache));
+ +/*
+ + * Invalidate a cache entry.  No writeback occurs; any changes in the cache
+ + * block are thrown away.
+ + */
+ +static void invalidate(struct cache *cache, struct prealloc *structs,
+ +		       dm_oblock_t oblock, dm_cblock_t cblock,
+ +		       struct dm_bio_prison_cell *cell)
+ +{
+ +	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+ +
+ +	mg->err = false;
+ +	mg->discard = false;
+ +	mg->writeback = false;
+ +	mg->demote = true;
+ +	mg->promote = false;
+ +	mg->requeue_holder = true;
+ +	mg->invalidate = true;
+ +	mg->cache = cache;
+ +	mg->old_oblock = oblock;
+ +	mg->cblock = cblock;
+ +	mg->old_ocell = cell;
+ +	mg->new_ocell = NULL;
+ +	mg->start_jiffies = jiffies;
+  
+ -	return r;
+ +	inc_io_migrations(cache);
+ +	quiesce_migration(mg);
+  }
+  
+ -static void invalidate_remove(struct work_struct *ws)
+ +static void discard(struct cache *cache, struct prealloc *structs,
+ +		    struct dm_bio_prison_cell *cell)
+  {
+ -	int r;
+ -	struct dm_cache_migration *mg = ws_to_mg(ws);
+ -	struct cache *cache = mg->cache;
+ +	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+  
+ -	r = invalidate_cblock(cache, mg->invalidate_cblock);
+ -	if (r) {
+ -		invalidate_complete(mg, false);
+ -		return;
+ -	}
+ +	mg->err = false;
+ +	mg->discard = true;
+ +	mg->writeback = false;
+ +	mg->demote = false;
+ +	mg->promote = false;
+ +	mg->requeue_holder = false;
+ +	mg->invalidate = false;
+ +	mg->cache = cache;
+ +	mg->old_ocell = NULL;
+ +	mg->new_ocell = cell;
+ +	mg->start_jiffies = jiffies;
+  
+ -	init_continuation(&mg->k, invalidate_completed);
+ -	continue_after_commit(&cache->committer, &mg->k);
+ -	remap_to_origin_clear_discard(cache, mg->overwrite_bio, mg->invalidate_oblock);
+ -	mg->overwrite_bio = NULL;
+ -	schedule_commit(&cache->committer);
+ +	quiesce_migration(mg);
+  }
+  
+ -static int invalidate_lock(struct dm_cache_migration *mg)
+ +/*----------------------------------------------------------------
+ + * bio processing
+ + *--------------------------------------------------------------*/
+ +static void defer_bio(struct cache *cache, struct bio *bio)
+  {
+ -	int r;
+ -	struct dm_cell_key_v2 key;
+ -	struct cache *cache = mg->cache;
+ -	struct dm_bio_prison_cell_v2 *prealloc;
+ -
+ -	prealloc = alloc_prison_cell(cache);
+ -	if (!prealloc) {
+ -		invalidate_complete(mg, false);
+ -		return -ENOMEM;
+ -	}
+ +	unsigned long flags;
+  
+ -	build_key(mg->invalidate_oblock, oblock_succ(mg->invalidate_oblock), &key);
+ -	r = dm_cell_lock_v2(cache->prison, &key,
+ -			    READ_WRITE_LOCK_LEVEL, prealloc, &mg->cell);
+ -	if (r < 0) {
+ -		free_prison_cell(cache, prealloc);
+ -		invalidate_complete(mg, false);
+ -		return r;
+ -	}
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	bio_list_add(&cache->deferred_bios, bio);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+  
+ -	if (mg->cell != prealloc)
+ -		free_prison_cell(cache, prealloc);
+ +	wake_worker(cache);
+ +}
+  
+ -	if (r)
+ -		quiesce(mg, invalidate_remove);
+ +static void process_flush_bio(struct cache *cache, struct bio *bio)
+ +{
+ +	size_t pb_data_size = get_per_bio_data_size(cache);
+ +	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
+  
+ -	else {
+ -		/*
+ -		 * We can't call invalidate_remove() directly here because we
+ -		 * might still be in request context.
+ -		 */
+ -		init_continuation(&mg->k, invalidate_remove);
+ -		queue_work(cache->wq, &mg->k.ws);
+ -	}
+ +	BUG_ON(bio->bi_size);
+ +	if (!pb->req_nr)
+ +		remap_to_origin(cache, bio);
+ +	else
+ +		remap_to_cache(cache, bio, 0);
+  
+ -	return 0;
+ +	/*
+ +	 * REQ_FLUSH is not directed at any particular block so we don't
+ +	 * need to inc_ds().  REQ_FUA's are split into a write + REQ_FLUSH
+ +	 * by dm-core.
+ +	 */
+ +	issue(cache, bio);
+  }
+  
+ -static int invalidate_start(struct cache *cache, dm_cblock_t cblock,
+ -			    dm_oblock_t oblock, struct bio *bio)
+ +static void process_discard_bio(struct cache *cache, struct prealloc *structs,
+ +				struct bio *bio)
+  {
+ -	struct dm_cache_migration *mg;
+ -
+ -	if (!background_work_begin(cache))
+ -		return -EPERM;
+ +	int r;
+ +	dm_dblock_t b, e;
+ +	struct dm_bio_prison_cell *cell_prealloc, *new_ocell;
+  
+ -	mg = alloc_migration(cache);
+ -	if (!mg) {
+ -		background_work_end(cache);
+ -		return -ENOMEM;
+ +	calc_discard_block_range(cache, bio, &b, &e);
+ +	if (b == e) {
+ +		bio_endio(bio, 0);
+ +		return;
+  	}
+  
+ -	memset(mg, 0, sizeof(*mg));
+ -
+ -	mg->cache = cache;
+ -	mg->overwrite_bio = bio;
+ -	mg->invalidate_cblock = cblock;
+ -	mg->invalidate_oblock = oblock;
+ +	cell_prealloc = prealloc_get_cell(structs);
+ +	r = bio_detain_range(cache, dblock_to_oblock(cache, b), dblock_to_oblock(cache, e), bio, cell_prealloc,
+ +			     (cell_free_fn) prealloc_put_cell,
+ +			     structs, &new_ocell);
+ +	if (r > 0)
+ +		return;
+  
+ -	return invalidate_lock(mg);
+ +	discard(cache, structs, new_ocell);
+  }
+  
+ -/*----------------------------------------------------------------
+ - * bio processing
+ - *--------------------------------------------------------------*/
+ -
+ -enum busy {
+ -	IDLE,
+ -	MODERATE,
+ -	BUSY
+ -};
+ -
+ -static enum busy spare_migration_bandwidth(struct cache *cache)
+ +static bool spare_migration_bandwidth(struct cache *cache)
+  {
+++<<<<<<< HEAD
+++=======
++ 	bool idle = iot_idle_for(&cache->tracker, HZ);
+++>>>>>>> 701e03e4e180 (dm cache: track all IO to the cache rather than just the origin device's IO)
+  	sector_t current_volume = (atomic_read(&cache->nr_io_migrations) + 1) *
+  		cache->sectors_per_block;
+ -
+ -	if (current_volume <= cache->migration_threshold)
+ -		return idle ? IDLE : MODERATE;
+ -	else
+ -		return idle ? MODERATE : BUSY;
+ +	return current_volume < cache->migration_threshold;
+  }
+  
+  static void inc_hit_counter(struct cache *cache, struct bio *bio)
+@@@ -2953,7 -2717,12 +2970,13 @@@ static int cache_create(struct cache_ar
+  	spin_lock_init(&cache->invalidation_lock);
+  	INIT_LIST_HEAD(&cache->invalidation_requests);
+  
+++<<<<<<< HEAD
+ +	iot_init(&cache->origin_tracker);
+++=======
++ 	batcher_init(&cache->committer, commit_op, cache,
++ 		     issue_op, cache, cache->wq);
++ 	iot_init(&cache->tracker);
+ -
+ -	init_rwsem(&cache->background_work_lock);
+ -	prevent_background_work(cache);
+++>>>>>>> 701e03e4e180 (dm cache: track all IO to the cache rather than just the origin device's IO)
+  
+  	*result = cache;
+  	return 0;
+@@@ -3269,12 -2938,18 +3292,26 @@@ static void cache_postsuspend(struct dm
+  {
+  	struct cache *cache = ti->private;
+  
+++<<<<<<< HEAD
+ +	start_quiescing(cache);
+ +	wait_for_migrations(cache);
+ +	stop_worker(cache);
+++=======
++ 	prevent_background_work(cache);
++ 	BUG_ON(atomic_read(&cache->nr_io_migrations));
++ 
++ 	cancel_delayed_work(&cache->waker);
++ 	flush_workqueue(cache->wq);
++ 	WARN_ON(cache->tracker.in_flight);
++ 
++ 	/*
++ 	 * If it's a flush suspend there won't be any deferred bios, so this
++ 	 * call is harmless.
++ 	 */
+++>>>>>>> 701e03e4e180 (dm cache: track all IO to the cache rather than just the origin device's IO)
+  	requeue_deferred_bios(cache);
+ +	requeue_deferred_cells(cache);
+ +	stop_quiescing(cache);
+  
+  	if (get_cache_mode(cache) == CM_WRITE)
+  		(void) sync_metadata(cache);
+* Unmerged path drivers/md/dm-cache-target.c
