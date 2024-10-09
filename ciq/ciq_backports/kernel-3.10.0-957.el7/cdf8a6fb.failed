@@ -1,0 +1,523 @@
+mmc: block: Introduce queue semantics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Introduce queue semantics (Gopal Tiwari) [1549495]
+Rebuild_FUZZ: 92.75%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit cdf8a6fb48882651049e468e6b16956fb83db86c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cdf8a6fb.failed
+
+Change from viewing the requests in progress as 'current' and 'previous',
+to viewing them as a queue. The current request is allocated to the first
+free slot. The presence of incomplete requests is determined from the
+count (mq->qcnt) of entries in the queue. Non-read-write requests (i.e.
+discards and flushes) are not added to the queue at all and require no
+special handling. Also no special handling is needed for the
+MMC_BLK_NEW_REQUEST case.
+
+As well as allowing an arbitrarily sized queue, the queue thread function
+is significantly simpler.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit cdf8a6fb48882651049e468e6b16956fb83db86c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.c
+#	drivers/mmc/core/queue.h
+diff --cc drivers/mmc/core/block.c
+index 49dc294d6eb1,16c313a62129..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1574,46 -1582,93 +1581,109 @@@ static int mmc_blk_cmd_err(struct mmc_b
+  		int err;
+  
+  		err = mmc_sd_num_wr_blocks(card, &blocks);
+ -		if (err)
+ -			req_pending = old_req_pending;
+ -		else
+ -			req_pending = blk_end_request(req, 0, blocks << 9);
+ +		if (!err) {
+ +			ret = blk_end_request(req, 0, blocks << 9);
+ +		}
+  	} else {
+ -		req_pending = blk_end_request(req, 0, brq->data.bytes_xfered);
+ +		ret = blk_end_request(req, 0, brq->data.bytes_xfered);
+  	}
+ -	return req_pending;
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+++=======
++ static void mmc_blk_rw_cmd_abort(struct mmc_queue *mq, struct mmc_card *card,
++ 				 struct request *req,
++ 				 struct mmc_queue_req *mqrq)
++ {
++ 	if (mmc_card_removed(card))
++ 		req->rq_flags |= RQF_QUIET;
++ 	while (blk_end_request(req, -EIO, blk_rq_cur_bytes(req)));
++ 	mmc_queue_req_free(mq, mqrq);
++ }
++ 
++ /**
++  * mmc_blk_rw_try_restart() - tries to restart the current async request
++  * @mq: the queue with the card and host to restart
++  * @req: a new request that want to be started after the current one
++  */
++ static void mmc_blk_rw_try_restart(struct mmc_queue *mq, struct request *req,
++ 				   struct mmc_queue_req *mqrq)
++ {
++ 	if (!req)
++ 		return;
++ 
++ 	/*
++ 	 * If the card was removed, just cancel everything and return.
++ 	 */
++ 	if (mmc_card_removed(mq->card)) {
++ 		req->rq_flags |= RQF_QUIET;
++ 		blk_end_request_all(req, -EIO);
++ 		mmc_queue_req_free(mq, mqrq);
++ 		return;
++ 	}
++ 	/* Else proceed and try to restart the current async request */
++ 	mmc_blk_rw_rq_prep(mqrq, mq->card, 0, mq);
++ 	mmc_start_areq(mq->card->host, &mqrq->areq, NULL);
++ }
++ 
++ static void mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *new_req)
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+  	struct mmc_blk_request *brq;
+ -	int disable_multi = 0, retry = 0, type, retune_retry_done = 0;
+ +	int ret = 1, disable_multi = 0, retry = 0, type, retune_retry_done = 0;
+  	enum mmc_blk_status status;
+++<<<<<<< HEAD
+++=======
++ 	struct mmc_queue_req *mqrq_cur = NULL;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  	struct mmc_queue_req *mq_rq;
+ -	struct request *old_req;
+ +	struct request *req;
+  	struct mmc_async_req *new_areq;
+  	struct mmc_async_req *old_areq;
+ -	bool req_pending = true;
+  
+++<<<<<<< HEAD
+ +	if (!rqc && !mq->mqrq_prev->req)
+ +		return 0;
+++=======
++ 	if (new_req) {
++ 		mqrq_cur = mmc_queue_req_find(mq, new_req);
++ 		if (!mqrq_cur) {
++ 			WARN_ON(1);
++ 			mmc_blk_requeue(mq->queue, new_req);
++ 			new_req = NULL;
++ 		}
++ 	}
++ 
++ 	if (!mq->qcnt)
++ 		return;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  
+  	do {
+ -		if (new_req) {
+ +		if (rqc) {
+  			/*
+  			 * When 4KB native sector is enabled, only 8 blocks
+  			 * multiple read or write is allowed
+  			 */
+  			if (mmc_large_sector(card) &&
+ -				!IS_ALIGNED(blk_rq_sectors(new_req), 8)) {
+ +				!IS_ALIGNED(blk_rq_sectors(rqc), 8)) {
+  				pr_err("%s: Transfer size is not 4KB sector size aligned\n",
+++<<<<<<< HEAD
+ +					rqc->rq_disk->disk_name);
+ +				mmc_blk_rw_cmd_abort(card, rqc);
+ +				return 0;
+++=======
++ 					new_req->rq_disk->disk_name);
++ 				mmc_blk_rw_cmd_abort(mq, card, new_req, mqrq_cur);
++ 				return;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  			}
+  
+ -			mmc_blk_rw_rq_prep(mqrq_cur, card, 0, mq);
+ -			new_areq = &mqrq_cur->areq;
+ +			mmc_blk_rw_rq_prep(mq->mqrq_cur, card, 0, mq);
+ +			new_areq = &mq->mqrq_cur->mmc_active;
+  		} else
+  			new_areq = NULL;
+  
+@@@ -1624,9 -1679,7 +1694,13 @@@
+  			 * and there is nothing more to do until it is
+  			 * complete.
+  			 */
+++<<<<<<< HEAD
+ +			if (status == MMC_BLK_NEW_REQUEST)
+ +				mq->flags |= MMC_QUEUE_NEW_REQUEST;
+ +			return 0;
+++=======
++ 			return;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		}
+  
+  		/*
+@@@ -1655,20 -1707,29 +1729,42 @@@
+  			 * though all data has been transferred and no errors
+  			 * were returned by the host controller, it's a bug.
+  			 */
+ -			if (status == MMC_BLK_SUCCESS && req_pending) {
+ +			if (status == MMC_BLK_SUCCESS && ret) {
+  				pr_err("%s BUG rq_tot %d d_xfer %d\n",
+ -				       __func__, blk_rq_bytes(old_req),
+ +				       __func__, blk_rq_bytes(req),
+  				       brq->data.bytes_xfered);
+++<<<<<<< HEAD
+ +				mmc_blk_rw_cmd_abort(card, req);
+ +				return 0;
+ +			}
+ +			break;
+ +		case MMC_BLK_CMD_ERR:
+ +			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
+ +			if (mmc_blk_reset(md, card->host, type))
+ +				goto cmd_abort;
+ +			if (!ret)
+ +				goto start_new_req;
+++=======
++ 				mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 				return;
++ 			}
++ 			break;
++ 		case MMC_BLK_CMD_ERR:
++ 			req_pending = mmc_blk_rw_cmd_err(md, card, brq, old_req, req_pending);
++ 			if (mmc_blk_reset(md, card->host, type)) {
++ 				if (req_pending)
++ 					mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 				else
++ 					mmc_queue_req_free(mq, mq_rq);
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
++ 			if (!req_pending) {
++ 				mmc_queue_req_free(mq, mq_rq);
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  			break;
+  		case MMC_BLK_RETRY:
+  			retune_retry_done = brq->retune_retry_done;
+@@@ -1678,15 -1739,20 +1774,29 @@@
+  		case MMC_BLK_ABORT:
+  			if (!mmc_blk_reset(md, card->host, type))
+  				break;
+++<<<<<<< HEAD
+ +			goto cmd_abort;
+++=======
++ 			mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 			mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 			return;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		case MMC_BLK_DATA_ERR: {
+  			int err;
+  
+  			err = mmc_blk_reset(md, card->host, type);
+  			if (!err)
+  				break;
+++<<<<<<< HEAD
+ +			if (err == -ENODEV)
+ +				goto cmd_abort;
+++=======
++ 			if (err == -ENODEV) {
++ 				mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  			/* Fall through */
+  		}
+  		case MMC_BLK_ECC_ERR:
+@@@ -1702,64 -1768,49 +1812,94 @@@
+  			 * time, so we only reach here after trying to
+  			 * read a single sector.
+  			 */
+++<<<<<<< HEAD
+ +			ret = blk_end_request(req, -EIO,
+ +						brq->data.blksz);
+ +			if (!ret)
+ +				goto start_new_req;
+ +			break;
+ +		case MMC_BLK_NOMEDIUM:
+ +			goto cmd_abort;
+ +		default:
+ +			pr_err("%s: Unhandled return value (%d)",
+ +					req->rq_disk->disk_name, status);
+ +			goto cmd_abort;
+++=======
++ 			req_pending = blk_end_request(old_req, -EIO,
++ 						      brq->data.blksz);
++ 			if (!req_pending) {
++ 				mmc_queue_req_free(mq, mq_rq);
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
++ 			break;
++ 		case MMC_BLK_NOMEDIUM:
++ 			mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 			mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 			return;
++ 		default:
++ 			pr_err("%s: Unhandled return value (%d)",
++ 					old_req->rq_disk->disk_name, status);
++ 			mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 			mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 			return;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		}
+  
+ -		if (req_pending) {
+ +		if (ret) {
+  			/*
+  			 * In case of a incomplete request
+  			 * prepare it again and resend.
+  			 */
+  			mmc_blk_rw_rq_prep(mq_rq, card,
+  					disable_multi, mq);
+ -			mmc_start_areq(card->host,
+ -					&mq_rq->areq, NULL);
+ +			mmc_start_req(card->host,
+ +					&mq_rq->mmc_active, NULL);
+  			mq_rq->brq.retune_retry_done = retune_retry_done;
+  		}
+++<<<<<<< HEAD
+ +	} while (ret);
+ +
+ +	return 1;
+ +
+ + cmd_abort:
+ +	if (mmc_card_removed(card))
+ +		req->cmd_flags |= REQ_QUIET;
+ +	while (ret)
+ +		ret = blk_end_request(req, -EIO,
+ +				blk_rq_cur_bytes(req));
+ +
+ + start_new_req:
+ +	if (rqc) {
+ +		if (mmc_card_removed(card)) {
+ +			rqc->cmd_flags |= REQ_QUIET;
+ +			blk_end_request_all(rqc, -EIO);
+ +		} else {
+ +			mmc_blk_rw_rq_prep(mq->mqrq_cur, card, 0, mq);
+ +			mmc_start_req(card->host,
+ +				      &mq->mqrq_cur->mmc_active, NULL);
+ +		}
+ +	}
+ +
+ +	return 0;
+++=======
++ 	} while (req_pending);
++ 
++ 	mmc_queue_req_free(mq, mq_rq);
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  }
+  
+ -void mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ +int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+  {
+  	int ret;
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+++<<<<<<< HEAD
+ +	unsigned int cmd_flags = req ? req->cmd_flags : 0;
+++=======
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  
+- 	if (req && !mq->mqrq_prev->req)
++ 	if (req && !mq->qcnt)
+  		/* claim host only for the first request */
+  		mmc_get_card(card);
+  
+@@@ -1772,35 -1822,29 +1912,53 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	mq->flags &= ~MMC_QUEUE_NEW_REQUEST;
+ +	if (cmd_flags & REQ_DISCARD) {
+++=======
++ 	if (req && req_op(req) == REQ_OP_DISCARD) {
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		/* complete ongoing async transfer before issuing discard */
+- 		if (card->host->areq)
++ 		if (mq->qcnt)
+  			mmc_blk_issue_rw_rq(mq, NULL);
+++<<<<<<< HEAD
+ +		if (req->cmd_flags & REQ_SECURE)
+ +			ret = mmc_blk_issue_secdiscard_rq(mq, req);
+ +		else
+ +			ret = mmc_blk_issue_discard_rq(mq, req);
+ +	} else if (cmd_flags & REQ_FLUSH) {
+++=======
++ 		mmc_blk_issue_discard_rq(mq, req);
++ 	} else if (req && req_op(req) == REQ_OP_SECURE_ERASE) {
++ 		/* complete ongoing async transfer before issuing secure erase*/
++ 		if (mq->qcnt)
++ 			mmc_blk_issue_rw_rq(mq, NULL);
++ 		mmc_blk_issue_secdiscard_rq(mq, req);
++ 	} else if (req && req_op(req) == REQ_OP_FLUSH) {
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		/* complete ongoing async transfer before issuing flush */
+- 		if (card->host->areq)
++ 		if (mq->qcnt)
+  			mmc_blk_issue_rw_rq(mq, NULL);
+ -		mmc_blk_issue_flush(mq, req);
+ +		ret = mmc_blk_issue_flush(mq, req);
+  	} else {
+ -		mmc_blk_issue_rw_rq(mq, req);
+ -		card->host->context_info.is_waiting_last_req = false;
+ +		ret = mmc_blk_issue_rw_rq(mq, req);
+  	}
+  
+  out:
+++<<<<<<< HEAD
+ +	if ((!req && !(mq->flags & MMC_QUEUE_NEW_REQUEST)) ||
+ +	     (cmd_flags & MMC_REQ_SPECIAL_MASK))
+ +		/*
+ +		 * Release host when there are no more requests
+ +		 * and after special request(discard, flush) is done.
+ +		 * In case sepecial request, there is no reentry to
+ +		 * the 'mmc_blk_issue_rq' with 'mqrq_prev->req'.
+ +		 */
+++=======
++ 	if (!mq->qcnt)
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		mmc_put_card(card);
+ +	return ret;
+  }
+  
+  static inline int mmc_blk_readonly(struct mmc_card *card)
+diff --cc drivers/mmc/core/queue.c
+index b0ae9d688e28,4a2045527b62..000000000000
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@@ -57,8 -79,7 +86,12 @@@ static int mmc_queue_thread(void *d
+  
+  	down(&mq->thread_sem);
+  	do {
+++<<<<<<< HEAD
+ +		struct request *req = NULL;
+ +		unsigned int cmd_flags = 0;
+++=======
++ 		struct request *req;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  
+  		spin_lock_irq(q->queue_lock);
+  		set_current_state(TASK_INTERRUPTIBLE);
+@@@ -76,32 -97,12 +109,38 @@@
+  			else
+  				mq->asleep = true;
+  		}
+- 		mq->mqrq_cur->req = req;
+  		spin_unlock_irq(q->queue_lock);
+  
+++<<<<<<< HEAD
+ +		if (req || mq->mqrq_prev->req) {
+++=======
++ 		if (req || mq->qcnt) {
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  			set_current_state(TASK_RUNNING);
+ +			cmd_flags = req ? req->cmd_flags : 0;
+  			mmc_blk_issue_rq(mq, req);
+  			cond_resched();
+++<<<<<<< HEAD
+ +			if (mq->flags & MMC_QUEUE_NEW_REQUEST) {
+ +				mq->flags &= ~MMC_QUEUE_NEW_REQUEST;
+ +				continue; /* fetch again */
+ +			}
+ +
+ +			/*
+ +			 * Current request becomes previous request
+ +			 * and vice versa.
+ +			 * In case of special requests, current request
+ +			 * has been finished. Do not assign it to previous
+ +			 * request.
+ +			 */
+ +			if (cmd_flags & MMC_REQ_SPECIAL_MASK)
+ +				mq->mqrq_cur->req = NULL;
+ +
+ +			mq->mqrq_prev->brq.mrq.data = NULL;
+ +			mq->mqrq_prev->req = NULL;
+ +			swap(mq->mqrq_prev, mq->mqrq_cur);
+++=======
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  		} else {
+  			if (kthread_should_stop()) {
+  				set_current_state(TASK_RUNNING);
+@@@ -179,9 -182,23 +218,23 @@@ static void mmc_queue_setup_discard(str
+  	if (card->pref_erase > max_discard)
+  		q->limits.discard_granularity = 0;
+  	if (mmc_can_secure_erase_trim(card))
+ -		queue_flag_set_unlocked(QUEUE_FLAG_SECERASE, q);
+ +		queue_flag_set_unlocked(QUEUE_FLAG_SECDISCARD, q);
+  }
+  
++ static struct mmc_queue_req *mmc_queue_alloc_mqrqs(int qdepth)
++ {
++ 	struct mmc_queue_req *mqrq;
++ 	int i;
++ 
++ 	mqrq = kcalloc(qdepth, sizeof(*mqrq), GFP_KERNEL);
++ 	if (mqrq) {
++ 		for (i = 0; i < qdepth; i++)
++ 			mqrq[i].task_id = i;
++ 	}
++ 
++ 	return mqrq;
++ }
++ 
+  #ifdef CONFIG_MMC_BLOCK_BOUNCE
+  static bool mmc_queue_alloc_bounce_bufs(struct mmc_queue *mq,
+  					unsigned int bouncesz)
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,967808df45b8..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -23,16 -33,15 +23,25 @@@ struct mmc_queue_req 
+  	char			*bounce_buf;
+  	struct scatterlist	*bounce_sg;
+  	unsigned int		bounce_sg_len;
+++<<<<<<< HEAD
+ +	struct mmc_async_req	mmc_active;
+++=======
++ 	struct mmc_async_req	areq;
++ 	int			task_id;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  };
+  
+  struct mmc_queue {
+  	struct mmc_card		*card;
+  	struct task_struct	*thread;
+  	struct semaphore	thread_sem;
+++<<<<<<< HEAD
+ +	unsigned int		flags;
+ +#define MMC_QUEUE_SUSPENDED	(1 << 0)
+ +#define MMC_QUEUE_NEW_REQUEST	(1 << 1)
+++=======
++ 	bool			suspended;
+++>>>>>>> cdf8a6fb4888 (mmc: block: Introduce queue semantics)
+  	bool			asleep;
+  	struct mmc_blk_data	*blkdata;
+  	struct request_queue	*queue;
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.c
+* Unmerged path drivers/mmc/core/queue.h
