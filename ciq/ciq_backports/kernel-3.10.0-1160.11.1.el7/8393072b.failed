@@ -1,0 +1,112 @@
+CIFS: make 'nodfs' mount opt a superblock flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.11.1.el7
+commit-author Aurelien Aptel <aaptel@suse.com>
+commit 8393072bab060f0a05888ee31543175d44b5dde0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.11.1.el7/8393072b.failed
+
+tcon->Flags is only used by SMB1 code and changing it is not permanent
+(you lose the setting on tcon reconnect).
+
+* Move the setting to superblock flags (per mount-points).
+* Make automount callback exit early when flag present
+* Make dfs resolving happening in mount syscall exit early if flag present
+
+	Signed-off-by: Aurelien Aptel <aaptel@suse.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+	Acked-by: Pavel Shilovsky <pshilov@microsoft.com>
+(cherry picked from commit 8393072bab060f0a05888ee31543175d44b5dde0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_fs_sb.h
+diff --cc fs/cifs/cifs_fs_sb.h
+index 07ed81cf1552,63d7530f2e1d..000000000000
+--- a/fs/cifs/cifs_fs_sb.h
++++ b/fs/cifs/cifs_fs_sb.h
+@@@ -50,6 -50,8 +50,11 @@@
+  					      * root mountable
+  					      */
+  #define CIFS_MOUNT_UID_FROM_ACL 0x2000000 /* try to get UID via special SID */
+++<<<<<<< HEAD
+++=======
++ #define CIFS_MOUNT_NO_HANDLE_CACHE 0x4000000 /* disable caching dir handles */
++ #define CIFS_MOUNT_NO_DFS 0x8000000 /* disable DFS resolving */
+++>>>>>>> 8393072bab06 (CIFS: make 'nodfs' mount opt a superblock flag)
+  
+  struct cifs_sb_info {
+  	struct rb_root tlink_tree;
+diff --git a/fs/cifs/cifs_dfs_ref.c b/fs/cifs/cifs_dfs_ref.c
+index 6b61df117fd4..b97c74efd04a 100644
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@ -304,12 +304,17 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ 	 */
+ 	mnt = ERR_PTR(-ENOMEM);
+ 
++	cifs_sb = CIFS_SB(mntpt->d_sb);
++	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_DFS) {
++		mnt = ERR_PTR(-EREMOTE);
++		goto cdda_exit;
++	}
++
+ 	/* always use tree name prefix */
+ 	full_path = build_path_from_dentry_optional_prefix(mntpt, true);
+ 	if (full_path == NULL)
+ 		goto cdda_exit;
+ 
+-	cifs_sb = CIFS_SB(mntpt->d_sb);
+ 	tlink = cifs_sb_tlink(cifs_sb);
+ 	if (IS_ERR(tlink)) {
+ 		mnt = ERR_CAST(tlink);
+* Unmerged path fs/cifs/cifs_fs_sb.h
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index dedb4a411c4e..677efa2cc108 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -464,6 +464,8 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
+ 		seq_puts(s, ",unix");
+ 	else
+ 		seq_puts(s, ",nounix");
++	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_DFS)
++		seq_puts(s, ",nodfs");
+ 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS)
+ 		seq_puts(s, ",posixpaths");
+ 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SET_UID)
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 7fa5d5585f85..0cd747b655ca 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -2999,10 +2999,6 @@ cifs_get_tcon(struct cifs_ses *ses, struct smb_vol *volume_info)
+ 	if (rc)
+ 		goto out_fail;
+ 
+-	if (volume_info->nodfs) {
+-		tcon->Flags &= ~SMB_SHARE_IS_IN_DFS;
+-		cifs_dbg(FYI, "DFS disabled (%d)\n", tcon->Flags);
+-	}
+ 	tcon->use_persistent = false;
+ 	/* check if SMB2 or later, CIFS does not support persistent handles */
+ 	if (volume_info->persistent) {
+@@ -3600,6 +3596,8 @@ int cifs_setup_cifs_sb(struct smb_vol *pvolume_info,
+ 	cifs_sb->actimeo = pvolume_info->actimeo;
+ 	cifs_sb->local_nls = pvolume_info->local_nls;
+ 
++	if (pvolume_info->nodfs)
++		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_DFS;
+ 	if (pvolume_info->noperm)
+ 		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_PERM;
+ 	if (pvolume_info->setuids)
+@@ -3754,6 +3752,9 @@ expand_dfs_referral(const unsigned int xid, struct cifs_ses *ses,
+ 	struct dfs_info3_param *referrals = NULL;
+ 	char *full_path = NULL, *ref_path = NULL, *mdata = NULL;
+ 
++	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_DFS)
++		return -EREMOTE;
++
+ 	full_path = build_unc_path_to_root(volume_info, cifs_sb);
+ 	if (IS_ERR(full_path))
+ 		return PTR_ERR(full_path);
