@@ -1,0 +1,239 @@
+thunderbolt: Allocate ring HopID automatically if requested
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [thunderbolt] Allocate ring HopID automatically if requested (Jarod Wilson) [1495229]
+Rebuild_FUZZ: 87.62%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 9a01c7c26cf7cbd1f58d06319e798833e85ff550
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9a01c7c2.failed
+
+Thunderbolt services should not care which HopID (ring) they use for
+sending and receiving packets over the high-speed DMA path, so make
+tb_ring_alloc_rx() and tb_ring_alloc_tx() accept negative HopID. This
+means that the NHI will allocate next available HopID for the caller
+automatically.
+
+These HopIDs will be allocated from the range which is not reserved for
+the Thunderbolt protocol (8 .. hop_count - 1).
+
+The allocated HopID can be retrieved from ring->hop field after the ring
+has been allocated successfully if needed.
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Reviewed-by: Michael Jamet <michael.jamet@intel.com>
+	Reviewed-by: Yehezkel Bernat <yehezkel.bernat@intel.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9a01c7c26cf7cbd1f58d06319e798833e85ff550)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thunderbolt/nhi.c
+diff --cc drivers/thunderbolt/nhi.c
+index 8a7a3d0133f9,0e79eebfcbb7..000000000000
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@@ -22,6 -22,14 +22,17 @@@
+  #define RING_TYPE(ring) ((ring)->is_tx ? "TX ring" : "RX ring")
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Used to enable end-to-end workaround for missing RX packets. Do not
++  * use this ring for anything else.
++  */
++ #define RING_E2E_UNUSED_HOPID	2
++ /* HopIDs 0-7 are reserved by the Thunderbolt protocol */
++ #define RING_FIRST_USABLE_HOPID	8
++ 
++ /*
+++>>>>>>> 9a01c7c26cf7 (thunderbolt: Allocate ring HopID automatically if requested)
+   * Minimal number of vectors when we use MSI-X. Two for control channel
+   * Rx/Tx and the rest four are for cross domain DMA paths.
+   */
+@@@ -320,8 -413,67 +331,72 @@@ static void ring_release_msix(struct tb
+  	ring->irq = 0;
+  }
+  
+++<<<<<<< HEAD
+ +static struct tb_ring *ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ +				  bool transmit, unsigned int flags)
+++=======
++ static int nhi_alloc_hop(struct tb_nhi *nhi, struct tb_ring *ring)
++ {
++ 	int ret = 0;
++ 
++ 	spin_lock_irq(&nhi->lock);
++ 
++ 	if (ring->hop < 0) {
++ 		unsigned int i;
++ 
++ 		/*
++ 		 * Automatically allocate HopID from the non-reserved
++ 		 * range 8 .. hop_count - 1.
++ 		 */
++ 		for (i = RING_FIRST_USABLE_HOPID; i < nhi->hop_count; i++) {
++ 			if (ring->is_tx) {
++ 				if (!nhi->tx_rings[i]) {
++ 					ring->hop = i;
++ 					break;
++ 				}
++ 			} else {
++ 				if (!nhi->rx_rings[i]) {
++ 					ring->hop = i;
++ 					break;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	if (ring->hop < 0 || ring->hop >= nhi->hop_count) {
++ 		dev_warn(&nhi->pdev->dev, "invalid hop: %d\n", ring->hop);
++ 		ret = -EINVAL;
++ 		goto err_unlock;
++ 	}
++ 	if (ring->is_tx && nhi->tx_rings[ring->hop]) {
++ 		dev_warn(&nhi->pdev->dev, "TX hop %d already allocated\n",
++ 			 ring->hop);
++ 		ret = -EBUSY;
++ 		goto err_unlock;
++ 	} else if (!ring->is_tx && nhi->rx_rings[ring->hop]) {
++ 		dev_warn(&nhi->pdev->dev, "RX hop %d already allocated\n",
++ 			 ring->hop);
++ 		ret = -EBUSY;
++ 		goto err_unlock;
++ 	}
++ 
++ 	if (ring->is_tx)
++ 		nhi->tx_rings[ring->hop] = ring;
++ 	else
++ 		nhi->rx_rings[ring->hop] = ring;
++ 
++ err_unlock:
++ 	spin_unlock_irq(&nhi->lock);
++ 
++ 	return ret;
++ }
++ 
++ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
++ 				     bool transmit, unsigned int flags,
++ 				     u16 sof_mask, u16 eof_mask,
++ 				     void (*start_poll)(void *),
++ 				     void *poll_data)
+++>>>>>>> 9a01c7c26cf7 (thunderbolt: Allocate ring HopID automatically if requested)
+  {
+  	struct tb_ring *ring = NULL;
+  	dev_info(&nhi->pdev->dev, "allocating %s ring %d of size %d\n",
+@@@ -364,44 -509,76 +439,88 @@@
+  			size * sizeof(*ring->descriptors),
+  			&ring->descriptors_dma, GFP_KERNEL | __GFP_ZERO);
+  	if (!ring->descriptors)
+ -		goto err_free_ring;
+ +		goto err;
+  
+++<<<<<<< HEAD
+ +	if (transmit)
+ +		nhi->tx_rings[hop] = ring;
+ +	else
+ +		nhi->rx_rings[hop] = ring;
+ +	mutex_unlock(&nhi->lock);
+ +	return ring;
+ +
+ +err:
+ +	if (ring)
+ +		mutex_destroy(&ring->lock);
+++=======
++ 	if (ring_request_msix(ring, flags & RING_FLAG_NO_SUSPEND))
++ 		goto err_free_descs;
++ 
++ 	if (nhi_alloc_hop(nhi, ring))
++ 		goto err_release_msix;
++ 
++ 	return ring;
++ 
++ err_release_msix:
++ 	ring_release_msix(ring);
++ err_free_descs:
++ 	dma_free_coherent(&ring->nhi->pdev->dev,
++ 			  ring->size * sizeof(*ring->descriptors),
++ 			  ring->descriptors, ring->descriptors_dma);
++ err_free_ring:
+++>>>>>>> 9a01c7c26cf7 (thunderbolt: Allocate ring HopID automatically if requested)
+  	kfree(ring);
+ -
+ +	mutex_unlock(&nhi->lock);
+  	return NULL;
+  }
+  
+ -/**
+ - * tb_ring_alloc_tx() - Allocate DMA ring for transmit
+ - * @nhi: Pointer to the NHI the ring is to be allocated
+ - * @hop: HopID (ring) to allocate
+ - * @size: Number of entries in the ring
+ - * @flags: Flags for the ring
+ - */
+ -struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
+ -				 unsigned int flags)
+ +struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
+ +			      unsigned int flags)
+ +{
+ +	return ring_alloc(nhi, hop, size, true, flags);
+ +}
+ +
+ +struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
+ +			      unsigned int flags)
+  {
+ -	return tb_ring_alloc(nhi, hop, size, true, flags, 0, 0, NULL, NULL);
+ +	return ring_alloc(nhi, hop, size, false, flags);
+  }
+ -EXPORT_SYMBOL_GPL(tb_ring_alloc_tx);
+  
+  /**
+++<<<<<<< HEAD
+ + * ring_start() - enable a ring
+++=======
++  * tb_ring_alloc_rx() - Allocate DMA ring for receive
++  * @nhi: Pointer to the NHI the ring is to be allocated
++  * @hop: HopID (ring) to allocate. Pass %-1 for automatic allocation.
++  * @size: Number of entries in the ring
++  * @flags: Flags for the ring
++  * @sof_mask: Mask of PDF values that start a frame
++  * @eof_mask: Mask of PDF values that end a frame
++  * @start_poll: If not %NULL the ring will call this function when an
++  *		interrupt is triggered and masked, instead of callback
++  *		in each Rx frame.
++  * @poll_data: Optional data passed to @start_poll
++  */
++ struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
++ 				 unsigned int flags, u16 sof_mask, u16 eof_mask,
++ 				 void (*start_poll)(void *), void *poll_data)
++ {
++ 	return tb_ring_alloc(nhi, hop, size, false, flags, sof_mask, eof_mask,
++ 			     start_poll, poll_data);
++ }
++ EXPORT_SYMBOL_GPL(tb_ring_alloc_rx);
++ 
++ /**
++  * tb_ring_start() - enable a ring
+++>>>>>>> 9a01c7c26cf7 (thunderbolt: Allocate ring HopID automatically if requested)
+   *
+ - * Must not be invoked in parallel with tb_ring_stop().
+ + * Must not be invoked in parallel with ring_stop().
+   */
+ -void tb_ring_start(struct tb_ring *ring)
+ +void ring_start(struct tb_ring *ring)
+  {
+ -	u16 frame_size;
+ -	u32 flags;
+ -
+ -	spin_lock_irq(&ring->nhi->lock);
+ -	spin_lock(&ring->lock);
+ +	mutex_lock(&ring->nhi->lock);
+ +	mutex_lock(&ring->lock);
+  	if (ring->nhi->going_away)
+  		goto err;
+  	if (ring->running) {
+* Unmerged path drivers/thunderbolt/nhi.c
