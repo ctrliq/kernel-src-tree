@@ -1,0 +1,351 @@
+scsi: cxlflash: Reset hardware queue context via specified register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Reset hardware queue context via specified register (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 95.31%
+commit-author Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+commit a96851d3372bf8ee7023712163ad3da9a3e30a29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a96851d3.failed
+
+Per the SISLite specification, context_reset() writes 0x1 to the LSB of the
+reset register. When the AFU processes this reset request, it is expected
+to clear the bit after reset is complete. The current implementation simply
+checks that the entire value read back is not 1, instead of masking off the
+LSB and evaluating it for a change to 0. Should the AFU manipulate other
+bits during the reset (reading back a value of 0xF for example), successful
+completion will be prematurely indicated given the existing logic.
+
+Additionally, in the event that the context reset operation fails, there
+does not currently exist a way to provide feedback to the initiator of the
+reset. This poses a problem for the rare case that a context reset fails as
+the caller will proceed on the assumption that all is well.
+
+To remedy these issues, refactor the context reset routine to only mask off
+the LSB when evaluating for success and return status to the caller. Also
+update the context reset handler parameters to pass a hardware queue
+reference instead of a single command to better reflect that the entire
+queue associated with the context is impacted by the reset.
+
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a96851d3372bf8ee7023712163ad3da9a3e30a29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/common.h
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/common.h
+index 811927d91c5c,75decf671743..000000000000
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@@ -170,12 -202,29 +170,28 @@@ struct afu 
+  	u64 *hrrq_end;
+  	u64 *hrrq_curr;
+  	bool toggle;
+ -
+  	s64 room;
+++<<<<<<< HEAD
+ +	spinlock_t rrin_slock; /* Lock to rrin queuing and cmd_room updates */
+++=======
++ 
++ 	struct irq_poll irqpoll;
++ } __aligned(cache_line_size());
++ 
++ struct afu {
++ 	struct hwq hwqs[CXLFLASH_MAX_HWQS];
++ 	int (*send_cmd)(struct afu *, struct afu_cmd *);
++ 	int (*context_reset)(struct hwq *);
++ 
++ 	/* AFU HW */
++ 	struct cxlflash_afu_map __iomem *afu_map;	/* entire MMIO map */
++ 
++ 	atomic_t cmds_active;	/* Number of currently active AFU commands */
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+  	u64 hb;
+ +	u32 cmd_couts;		/* Number of command checkouts */
+  	u32 internal_lun;	/* User-desired LUN mode for this AFU */
+  
+ -	u32 num_hwqs;		/* Number of hardware queues */
+ -	u32 desired_hwqs;	/* Desired h/w queues, effective on AFU reset */
+ -	enum cxlflash_hwq_mode hwq_mode; /* Steering mode for h/w queues */
+ -	u32 hwq_rr_count;	/* Count to distribute traffic for roundrobin */
+ -
+  	char version[16];
+  	u64 interface_version;
+  
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,b8dc379227f0..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -253,48 -189,63 +253,103 @@@ static void cmd_complete(struct afu_cm
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * context_reset() - timeout handler for AFU commands
+ + * @cmd:	AFU command that timed out.
+ + *
+ + * Sends a reset to the AFU.
+ + */
+ +static void context_reset(struct afu_cmd *cmd)
+++=======
++  * context_reset() - reset context via specified register
++  * @hwq:	Hardware queue owning the context to be reset.
++  * @reset_reg:	MMIO register to perform reset.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ static int context_reset(struct hwq *hwq, __be64 __iomem *reset_reg)
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+  {
+- 	int nretry = 0;
+- 	u64 rrin = 0x1;
+- 	struct afu *afu = cmd->parent;
+- 	struct cxlflash_cfg *cfg = afu->parent;
++ 	struct cxlflash_cfg *cfg = hwq->afu->parent;
+  	struct device *dev = &cfg->dev->dev;
+++<<<<<<< HEAD
+ +	ulong lock_flags;
+ +
+ +	pr_debug("%s: cmd=%p\n", __func__, cmd);
+ +
+ +	spin_lock_irqsave(&cmd->slock, lock_flags);
+ +
+ +	/* Already completed? */
+ +	if (cmd->sa.host_use_b[0] & B_DONE) {
+ +		spin_unlock_irqrestore(&cmd->slock, lock_flags);
+ +		return;
+ +	}
+ +
+ +	cmd->sa.host_use_b[0] |= (B_DONE | B_ERROR | B_TIMEOUT);
+ +	spin_unlock_irqrestore(&cmd->slock, lock_flags);
+ +
+ +	writeq_be(rrin, &afu->host_map->ioarrin);
+ +	do {
+ +		rrin = readq_be(&afu->host_map->ioarrin);
+ +		if (rrin != 0x1)
+++=======
++ 	int rc = -ETIMEDOUT;
++ 	int nretry = 0;
++ 	u64 val = 0x1;
++ 
++ 	dev_dbg(dev, "%s: hwq=%p\n", __func__, hwq);
++ 
++ 	writeq_be(val, reset_reg);
++ 	do {
++ 		val = readq_be(reset_reg);
++ 		if ((val & 0x1) == 0x0) {
++ 			rc = 0;
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+  			break;
++ 		}
++ 
+  		/* Double delay each time */
+  		udelay(1 << nretry);
+  	} while (nretry++ < MC_ROOM_RETRY_CNT);
+  
+++<<<<<<< HEAD
+ +	dev_dbg(dev, "%s: returning rrin=0x%016llX nretry=%d\n",
+ +		__func__, rrin, nretry);
+ +}
+ +
+ +/**
+ + * send_cmd() - sends an AFU command
+++=======
++ 	dev_dbg(dev, "%s: returning rc=%d, val=%016llx nretry=%d\n",
++ 		__func__, rc, val, nretry);
++ 	return rc;
++ }
++ 
++ /**
++  * context_reset_ioarrin() - reset context via IOARRIN register
++  * @hwq:	Hardware queue owning the context to be reset.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ static int context_reset_ioarrin(struct hwq *hwq)
++ {
++ 	return context_reset(hwq, &hwq->host_map->ioarrin);
++ }
++ 
++ /**
++  * context_reset_sq() - reset context via SQ_CONTEXT_RESET register
++  * @hwq:	Hardware queue owning the context to be reset.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ static int context_reset_sq(struct hwq *hwq)
++ {
++ 	return context_reset(hwq, &hwq->host_map->sq_ctx_reset);
++ }
++ 
++ /**
++  * send_cmd_ioarrin() - sends an AFU command via IOARRIN register
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+   * @afu:	AFU associated with the host.
+   * @cmd:	AFU command to send.
+   *
+@@@ -339,20 -335,64 +394,74 @@@ out
+   * wait_resp() - polls for a response or timeout to a sent AFU command
+   * @afu:	AFU associated with the host.
+   * @cmd:	AFU command that was sent.
+++<<<<<<< HEAD
+++=======
++  *
++  * Return: 0 on success, -errno on failure
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+   */
+ -static int wait_resp(struct afu *afu, struct afu_cmd *cmd)
+ +static void wait_resp(struct afu *afu, struct afu_cmd *cmd)
+  {
+ -	struct cxlflash_cfg *cfg = afu->parent;
+ -	struct device *dev = &cfg->dev->dev;
+ -	int rc = 0;
+  	ulong timeout = msecs_to_jiffies(cmd->rcb.timeout * 2 * 1000);
+  
+  	timeout = wait_for_completion_timeout(&cmd->cevent, timeout);
+  	if (!timeout)
+++<<<<<<< HEAD
+ +		context_reset(cmd);
+ +
+ +	if (unlikely(cmd->sa.ioasc != 0))
+ +		pr_err("%s: CMD 0x%X failed, IOASC: flags 0x%X, afu_rc 0x%X, "
+ +		       "scsi_rc 0x%X, fc_rc 0x%X\n", __func__, cmd->rcb.cdb[0],
+ +		       cmd->sa.rc.flags, cmd->sa.rc.afu_rc, cmd->sa.rc.scsi_rc,
+ +		       cmd->sa.rc.fc_rc);
+++=======
++ 		rc = -ETIMEDOUT;
++ 
++ 	if (unlikely(cmd->sa.ioasc != 0)) {
++ 		dev_err(dev, "%s: cmd %02x failed, ioasc=%08x\n",
++ 			__func__, cmd->rcb.cdb[0], cmd->sa.ioasc);
++ 		rc = -EIO;
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * cmd_to_target_hwq() - selects a target hardware queue for a SCSI command
++  * @host:	SCSI host associated with device.
++  * @scp:	SCSI command to send.
++  * @afu:	SCSI command to send.
++  *
++  * Hashes a command based upon the hardware queue mode.
++  *
++  * Return: Trusted index of target hardware queue
++  */
++ static u32 cmd_to_target_hwq(struct Scsi_Host *host, struct scsi_cmnd *scp,
++ 			     struct afu *afu)
++ {
++ 	u32 tag;
++ 	u32 hwq = 0;
++ 
++ 	if (afu->num_hwqs == 1)
++ 		return 0;
++ 
++ 	switch (afu->hwq_mode) {
++ 	case HWQ_MODE_RR:
++ 		hwq = afu->hwq_rr_count++ % afu->num_hwqs;
++ 		break;
++ 	case HWQ_MODE_TAG:
++ 		tag = blk_mq_unique_tag(scp->request);
++ 		hwq = blk_mq_unique_tag_to_hwq(tag);
++ 		break;
++ 	case HWQ_MODE_CPU:
++ 		hwq = smp_processor_id() % afu->num_hwqs;
++ 		break;
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 	}
++ 
++ 	return hwq;
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+  }
+  
+  /**
+@@@ -1803,8 -2031,10 +1912,9 @@@ int cxlflash_afu_sync(struct afu *afu, 
+  	struct cxlflash_cfg *cfg = afu->parent;
+  	struct device *dev = &cfg->dev->dev;
+  	struct afu_cmd *cmd = NULL;
+ -	struct hwq *hwq = get_hwq(afu, PRIMARY_HWQ);
+  	char *buf = NULL;
+  	int rc = 0;
++ 	int nretry = 0;
+  	static DEFINE_MUTEX(sync_active);
+  
+  	if (cfg->state != STATE_NORMAL) {
+@@@ -1821,19 -2053,18 +1931,26 @@@
+  	}
+  
+  	cmd = (struct afu_cmd *)PTR_ALIGN(buf, __alignof__(*cmd));
++ 
++ retry:
+  	init_completion(&cmd->cevent);
+ +	spin_lock_init(&cmd->slock);
+  	cmd->parent = afu;
+ -	cmd->hwq_index = hwq->index;
+  
+++<<<<<<< HEAD
+ +	pr_debug("%s: afu=%p cmd=%p %d\n", __func__, afu, cmd, ctx_hndl_u);
+++=======
++ 	dev_dbg(dev, "%s: afu=%p cmd=%p ctx=%d nretry=%d\n",
++ 		__func__, afu, cmd, ctx_hndl_u, nretry);
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+  
+  	cmd->rcb.req_flags = SISL_REQ_FLAGS_AFU_CMD;
+ -	cmd->rcb.ctx_id = hwq->ctx_hndl;
+ +	cmd->rcb.ctx_id = afu->ctx_hndl;
+  	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
+ +	cmd->rcb.port_sel = 0x0;	/* NA */
+ +	cmd->rcb.lun_id = 0x0;	/* NA */
+ +	cmd->rcb.data_len = 0x0;
+ +	cmd->rcb.data_ea = 0x0;
+  	cmd->rcb.timeout = MC_AFU_SYNC_TIMEOUT;
+  
+  	cmd->rcb.cdb[0] = 0xC0;	/* AFU Sync */
+@@@ -1843,20 -2074,24 +1960,36 @@@
+  	*((__be16 *)&cmd->rcb.cdb[2]) = cpu_to_be16(ctx_hndl_u);
+  	*((__be32 *)&cmd->rcb.cdb[4]) = cpu_to_be32(res_hndl_u);
+  
+++<<<<<<< HEAD
+ +	rc = send_cmd(afu, cmd);
+ +	if (unlikely(rc))
+ +		goto out;
+ +
+ +	wait_resp(afu, cmd);
+ +
+ +	/* Set on timeout */
+ +	if (unlikely((cmd->sa.ioasc != 0) ||
+ +		     (cmd->sa.host_use_b[0] & B_ERROR)))
+ +		rc = -1;
+++=======
++ 	rc = afu->send_cmd(afu, cmd);
++ 	if (unlikely(rc)) {
++ 		rc = -ENOBUFS;
++ 		goto out;
++ 	}
++ 
++ 	rc = wait_resp(afu, cmd);
++ 	if (rc == -ETIMEDOUT) {
++ 		rc = afu->context_reset(hwq);
++ 		if (!rc && ++nretry < 2)
++ 			goto retry;
++ 	}
++ 
+++>>>>>>> a96851d3372b (scsi: cxlflash: Reset hardware queue context via specified register)
+  out:
+ -	atomic_dec(&afu->cmds_active);
+  	mutex_unlock(&sync_active);
+  	kfree(buf);
+ -	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  }
+  
+* Unmerged path drivers/scsi/cxlflash/common.h
+* Unmerged path drivers/scsi/cxlflash/main.c
