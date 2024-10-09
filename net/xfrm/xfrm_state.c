@@ -386,7 +386,7 @@ static inline unsigned long make_jiffies(long secs)
 		return secs*HZ;
 }
 
-static enum hrtimer_restart xfrm_timer_handler(struct hrtimer * me)
+static enum hrtimer_restart xfrm_timer_handler(struct hrtimer *me)
 {
 	struct tasklet_hrtimer *thr = container_of(me, struct tasklet_hrtimer, timer);
 	struct xfrm_state *x = container_of(thr, struct xfrm_state, mtimer);
@@ -1264,8 +1264,8 @@ struct xfrm_state *xfrm_migrate_state_find(struct xfrm_migrate *m, struct net *n
 }
 EXPORT_SYMBOL(xfrm_migrate_state_find);
 
-struct xfrm_state * xfrm_state_migrate(struct xfrm_state *x,
-				       struct xfrm_migrate *m)
+struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+				      struct xfrm_migrate *m)
 {
 	struct xfrm_state *xc;
 	int err;
@@ -1657,7 +1657,7 @@ EXPORT_SYMBOL(xfrm_state_walk_done);
 
 static void xfrm_replay_timer_handler(unsigned long data)
 {
-	struct xfrm_state *x = (struct xfrm_state*)data;
+	struct xfrm_state *x = (struct xfrm_state *)data;
 
 	spin_lock(&x->lock);
 
