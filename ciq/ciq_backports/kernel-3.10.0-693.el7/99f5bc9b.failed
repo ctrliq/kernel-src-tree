@@ -1,0 +1,497 @@
+perf/core: Enable mapping of the stop filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mathieu Poirier <mathieu.poirier@linaro.org>
+commit 99f5bc9bfa9094e7c264a8e09f9507b391a3d1d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/99f5bc9b.failed
+
+At this time the perf_addr_filter_needs_mmap() function will _not_
+return true on a user space 'stop' filter.  But stop filters need
+exactly the same kind of mapping that range and start filters get.
+
+	Signed-off-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: http://lkml.kernel.org/r/1468860187-318-4-git-send-email-mathieu.poirier@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 99f5bc9bfa9094e7c264a8e09f9507b391a3d1d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 40e87d6a2b06,a5fc5c8cdfb0..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -6270,6 -6619,85 +6270,88 @@@ got_name
+  	kfree(buf);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Check whether inode and address range match filter criteria.
++  */
++ static bool perf_addr_filter_match(struct perf_addr_filter *filter,
++ 				     struct file *file, unsigned long offset,
++ 				     unsigned long size)
++ {
++ 	if (filter->inode != file->f_inode)
++ 		return false;
++ 
++ 	if (filter->offset > offset + size)
++ 		return false;
++ 
++ 	if (filter->offset + filter->size < offset)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void __perf_addr_filters_adjust(struct perf_event *event, void *data)
++ {
++ 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
++ 	struct vm_area_struct *vma = data;
++ 	unsigned long off = vma->vm_pgoff << PAGE_SHIFT, flags;
++ 	struct file *file = vma->vm_file;
++ 	struct perf_addr_filter *filter;
++ 	unsigned int restart = 0, count = 0;
++ 
++ 	if (!has_addr_filter(event))
++ 		return;
++ 
++ 	if (!file)
++ 		return;
++ 
++ 	raw_spin_lock_irqsave(&ifh->lock, flags);
++ 	list_for_each_entry(filter, &ifh->list, entry) {
++ 		if (perf_addr_filter_match(filter, file, off,
++ 					     vma->vm_end - vma->vm_start)) {
++ 			event->addr_filters_offs[count] = vma->vm_start;
++ 			restart++;
++ 		}
++ 
++ 		count++;
++ 	}
++ 
++ 	if (restart)
++ 		event->addr_filters_gen++;
++ 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
++ 
++ 	if (restart)
++ 		perf_event_restart(event);
++ }
++ 
++ /*
++  * Adjust all task's events' filters to the new vma
++  */
++ static void perf_addr_filters_adjust(struct vm_area_struct *vma)
++ {
++ 	struct perf_event_context *ctx;
++ 	int ctxn;
++ 
++ 	/*
++ 	 * Data tracing isn't supported yet and as such there is no need
++ 	 * to keep track of anything that isn't related to executable code:
++ 	 */
++ 	if (!(vma->vm_flags & VM_EXEC))
++ 		return;
++ 
++ 	rcu_read_lock();
++ 	for_each_task_context_nr(ctxn) {
++ 		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
++ 		if (!ctx)
++ 			continue;
++ 
++ 		perf_iterate_ctx(ctx, __perf_addr_filters_adjust, vma, true);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
+++>>>>>>> 99f5bc9bfa90 (perf/core: Enable mapping of the stop filters)
+  void perf_event_mmap(struct vm_area_struct *vma)
+  {
+  	struct perf_mmap_event mmap_event;
+@@@ -7208,6 -7724,368 +7290,371 @@@ void perf_bp_event(struct perf_event *b
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Allocate a new address filter
++  */
++ static struct perf_addr_filter *
++ perf_addr_filter_new(struct perf_event *event, struct list_head *filters)
++ {
++ 	int node = cpu_to_node(event->cpu == -1 ? 0 : event->cpu);
++ 	struct perf_addr_filter *filter;
++ 
++ 	filter = kzalloc_node(sizeof(*filter), GFP_KERNEL, node);
++ 	if (!filter)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&filter->entry);
++ 	list_add_tail(&filter->entry, filters);
++ 
++ 	return filter;
++ }
++ 
++ static void free_filters_list(struct list_head *filters)
++ {
++ 	struct perf_addr_filter *filter, *iter;
++ 
++ 	list_for_each_entry_safe(filter, iter, filters, entry) {
++ 		if (filter->inode)
++ 			iput(filter->inode);
++ 		list_del(&filter->entry);
++ 		kfree(filter);
++ 	}
++ }
++ 
++ /*
++  * Free existing address filters and optionally install new ones
++  */
++ static void perf_addr_filters_splice(struct perf_event *event,
++ 				     struct list_head *head)
++ {
++ 	unsigned long flags;
++ 	LIST_HEAD(list);
++ 
++ 	if (!has_addr_filter(event))
++ 		return;
++ 
++ 	/* don't bother with children, they don't have their own filters */
++ 	if (event->parent)
++ 		return;
++ 
++ 	raw_spin_lock_irqsave(&event->addr_filters.lock, flags);
++ 
++ 	list_splice_init(&event->addr_filters.list, &list);
++ 	if (head)
++ 		list_splice(head, &event->addr_filters.list);
++ 
++ 	raw_spin_unlock_irqrestore(&event->addr_filters.lock, flags);
++ 
++ 	free_filters_list(&list);
++ }
++ 
++ /*
++  * Scan through mm's vmas and see if one of them matches the
++  * @filter; if so, adjust filter's address range.
++  * Called with mm::mmap_sem down for reading.
++  */
++ static unsigned long perf_addr_filter_apply(struct perf_addr_filter *filter,
++ 					    struct mm_struct *mm)
++ {
++ 	struct vm_area_struct *vma;
++ 
++ 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
++ 		struct file *file = vma->vm_file;
++ 		unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
++ 		unsigned long vma_size = vma->vm_end - vma->vm_start;
++ 
++ 		if (!file)
++ 			continue;
++ 
++ 		if (!perf_addr_filter_match(filter, file, off, vma_size))
++ 			continue;
++ 
++ 		return vma->vm_start;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Update event's address range filters based on the
++  * task's existing mappings, if any.
++  */
++ static void perf_event_addr_filters_apply(struct perf_event *event)
++ {
++ 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
++ 	struct task_struct *task = READ_ONCE(event->ctx->task);
++ 	struct perf_addr_filter *filter;
++ 	struct mm_struct *mm = NULL;
++ 	unsigned int count = 0;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * We may observe TASK_TOMBSTONE, which means that the event tear-down
++ 	 * will stop on the parent's child_mutex that our caller is also holding
++ 	 */
++ 	if (task == TASK_TOMBSTONE)
++ 		return;
++ 
++ 	mm = get_task_mm(event->ctx->task);
++ 	if (!mm)
++ 		goto restart;
++ 
++ 	down_read(&mm->mmap_sem);
++ 
++ 	raw_spin_lock_irqsave(&ifh->lock, flags);
++ 	list_for_each_entry(filter, &ifh->list, entry) {
++ 		event->addr_filters_offs[count] = 0;
++ 
++ 		/*
++ 		 * Adjust base offset if the filter is associated to a binary
++ 		 * that needs to be mapped:
++ 		 */
++ 		if (filter->inode)
++ 			event->addr_filters_offs[count] =
++ 				perf_addr_filter_apply(filter, mm);
++ 
++ 		count++;
++ 	}
++ 
++ 	event->addr_filters_gen++;
++ 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
++ 
++ 	up_read(&mm->mmap_sem);
++ 
++ 	mmput(mm);
++ 
++ restart:
++ 	perf_event_restart(event);
++ }
++ 
++ /*
++  * Address range filtering: limiting the data to certain
++  * instruction address ranges. Filters are ioctl()ed to us from
++  * userspace as ascii strings.
++  *
++  * Filter string format:
++  *
++  * ACTION RANGE_SPEC
++  * where ACTION is one of the
++  *  * "filter": limit the trace to this region
++  *  * "start": start tracing from this address
++  *  * "stop": stop tracing at this address/region;
++  * RANGE_SPEC is
++  *  * for kernel addresses: <start address>[/<size>]
++  *  * for object files:     <start address>[/<size>]@</path/to/object/file>
++  *
++  * if <size> is not specified, the range is treated as a single address.
++  */
++ enum {
++ 	IF_ACT_FILTER,
++ 	IF_ACT_START,
++ 	IF_ACT_STOP,
++ 	IF_SRC_FILE,
++ 	IF_SRC_KERNEL,
++ 	IF_SRC_FILEADDR,
++ 	IF_SRC_KERNELADDR,
++ };
++ 
++ enum {
++ 	IF_STATE_ACTION = 0,
++ 	IF_STATE_SOURCE,
++ 	IF_STATE_END,
++ };
++ 
++ static const match_table_t if_tokens = {
++ 	{ IF_ACT_FILTER,	"filter" },
++ 	{ IF_ACT_START,		"start" },
++ 	{ IF_ACT_STOP,		"stop" },
++ 	{ IF_SRC_FILE,		"%u/%u@%s" },
++ 	{ IF_SRC_KERNEL,	"%u/%u" },
++ 	{ IF_SRC_FILEADDR,	"%u@%s" },
++ 	{ IF_SRC_KERNELADDR,	"%u" },
++ };
++ 
++ /*
++  * Address filter string parser
++  */
++ static int
++ perf_event_parse_addr_filter(struct perf_event *event, char *fstr,
++ 			     struct list_head *filters)
++ {
++ 	struct perf_addr_filter *filter = NULL;
++ 	char *start, *orig, *filename = NULL;
++ 	struct path path;
++ 	substring_t args[MAX_OPT_ARGS];
++ 	int state = IF_STATE_ACTION, token;
++ 	unsigned int kernel = 0;
++ 	int ret = -EINVAL;
++ 
++ 	orig = fstr = kstrdup(fstr, GFP_KERNEL);
++ 	if (!fstr)
++ 		return -ENOMEM;
++ 
++ 	while ((start = strsep(&fstr, " ,\n")) != NULL) {
++ 		ret = -EINVAL;
++ 
++ 		if (!*start)
++ 			continue;
++ 
++ 		/* filter definition begins */
++ 		if (state == IF_STATE_ACTION) {
++ 			filter = perf_addr_filter_new(event, filters);
++ 			if (!filter)
++ 				goto fail;
++ 		}
++ 
++ 		token = match_token(start, if_tokens, args);
++ 		switch (token) {
++ 		case IF_ACT_FILTER:
++ 		case IF_ACT_START:
++ 			filter->filter = 1;
++ 
++ 		case IF_ACT_STOP:
++ 			if (state != IF_STATE_ACTION)
++ 				goto fail;
++ 
++ 			state = IF_STATE_SOURCE;
++ 			break;
++ 
++ 		case IF_SRC_KERNELADDR:
++ 		case IF_SRC_KERNEL:
++ 			kernel = 1;
++ 
++ 		case IF_SRC_FILEADDR:
++ 		case IF_SRC_FILE:
++ 			if (state != IF_STATE_SOURCE)
++ 				goto fail;
++ 
++ 			if (token == IF_SRC_FILE || token == IF_SRC_KERNEL)
++ 				filter->range = 1;
++ 
++ 			*args[0].to = 0;
++ 			ret = kstrtoul(args[0].from, 0, &filter->offset);
++ 			if (ret)
++ 				goto fail;
++ 
++ 			if (filter->range) {
++ 				*args[1].to = 0;
++ 				ret = kstrtoul(args[1].from, 0, &filter->size);
++ 				if (ret)
++ 					goto fail;
++ 			}
++ 
++ 			if (token == IF_SRC_FILE || token == IF_SRC_FILEADDR) {
++ 				int fpos = filter->range ? 2 : 1;
++ 
++ 				filename = match_strdup(&args[fpos]);
++ 				if (!filename) {
++ 					ret = -ENOMEM;
++ 					goto fail;
++ 				}
++ 			}
++ 
++ 			state = IF_STATE_END;
++ 			break;
++ 
++ 		default:
++ 			goto fail;
++ 		}
++ 
++ 		/*
++ 		 * Filter definition is fully parsed, validate and install it.
++ 		 * Make sure that it doesn't contradict itself or the event's
++ 		 * attribute.
++ 		 */
++ 		if (state == IF_STATE_END) {
++ 			if (kernel && event->attr.exclude_kernel)
++ 				goto fail;
++ 
++ 			if (!kernel) {
++ 				if (!filename)
++ 					goto fail;
++ 
++ 				/* look up the path and grab its inode */
++ 				ret = kern_path(filename, LOOKUP_FOLLOW, &path);
++ 				if (ret)
++ 					goto fail_free_name;
++ 
++ 				filter->inode = igrab(d_inode(path.dentry));
++ 				path_put(&path);
++ 				kfree(filename);
++ 				filename = NULL;
++ 
++ 				ret = -EINVAL;
++ 				if (!filter->inode ||
++ 				    !S_ISREG(filter->inode->i_mode))
++ 					/* free_filters_list() will iput() */
++ 					goto fail;
++ 			}
++ 
++ 			/* ready to consume more filters */
++ 			state = IF_STATE_ACTION;
++ 			filter = NULL;
++ 		}
++ 	}
++ 
++ 	if (state != IF_STATE_ACTION)
++ 		goto fail;
++ 
++ 	kfree(orig);
++ 
++ 	return 0;
++ 
++ fail_free_name:
++ 	kfree(filename);
++ fail:
++ 	free_filters_list(filters);
++ 	kfree(orig);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ perf_event_set_addr_filter(struct perf_event *event, char *filter_str)
++ {
++ 	LIST_HEAD(filters);
++ 	int ret;
++ 
++ 	/*
++ 	 * Since this is called in perf_ioctl() path, we're already holding
++ 	 * ctx::mutex.
++ 	 */
++ 	lockdep_assert_held(&event->ctx->mutex);
++ 
++ 	if (WARN_ON_ONCE(event->parent))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * For now, we only support filtering in per-task events; doing so
++ 	 * for CPU-wide events requires additional context switching trickery,
++ 	 * since same object code will be mapped at different virtual
++ 	 * addresses in different processes.
++ 	 */
++ 	if (!event->ctx->task)
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = perf_event_parse_addr_filter(event, filter_str, &filters);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = event->pmu->addr_filters_validate(&filters);
++ 	if (ret) {
++ 		free_filters_list(&filters);
++ 		return ret;
++ 	}
++ 
++ 	/* remove existing filters, if any */
++ 	perf_addr_filters_splice(event, &filters);
++ 
++ 	/* install new filters */
++ 	perf_event_for_each_child(event, perf_event_addr_filters_apply);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 99f5bc9bfa90 (perf/core: Enable mapping of the stop filters)
+  static int perf_event_set_filter(struct perf_event *event, void __user *arg)
+  {
+  	char *filter_str;
+* Unmerged path kernel/events/core.c
