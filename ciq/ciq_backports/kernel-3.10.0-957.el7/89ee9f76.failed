@@ -1,0 +1,135 @@
+PCI: Add device disconnected state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [pci] Add device disconnected state (Myron Stowe) [1517629]
+Rebuild_FUZZ: 92.06%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 89ee9f7680031d7df91a1a27abac69e034c2e892
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/89ee9f76.failed
+
+Add a new state to pci_dev to be set when it is unexpectedly disconnected.
+The PCI driver tear down functions can observe this new device state so
+they may skip operations that will fail.
+
+The pciehp and pcie-dpc drivers are aware when the link is down, so these
+set the flag when their handlers detect the device is disconnected.
+
+	Tested-by: Krishna Dhulipala <krishnad@fb.com>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Wei Zhang <wzhang@fb.com>
+(cherry picked from commit 89ee9f7680031d7df91a1a27abac69e034c2e892)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pci.h
+diff --cc include/linux/pci.h
+index 01fedc3091e5,2887933329a2..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -391,29 -395,9 +391,35 @@@ struct pci_dev 
+  #endif
+  	phys_addr_t rom; /* Physical address of ROM if it's not from the BAR */
+  	size_t romlen; /* Length of ROM if it's not from the BAR */
+++<<<<<<< HEAD
+ +
+ +	/* Extension to accomodate future upstream changes to this structure
+ +	 * yet maintain RHEL7 KABI.  For Red Hat internal use only!
+ +	 */
+ +	struct pci_dev_rh  *pci_dev_rh;
+ +};
+ +
+ +/*
+ + * RHEL7 specific 'struct pci_dev' shadow structure to help maintain KABI
+ + * going forward.  This structure will never be under KABI restrictions.
+ + */
+ +struct pci_dev_rh {
+ +	RH_KABI_EXTEND(unsigned long *dma_alias_mask) /* mask of enabled devfn aliases */
+ +	RH_KABI_EXTEND(char *driver_override) /* Driver name to force a match */
+ +#ifdef CONFIG_PPC64
+ +	RH_KABI_EXTEND(struct pci_dn *pci_data) /* PCI device node*/
+ +#endif
+ +	RH_KABI_EXTEND(unsigned int ats_enabled:1) /* Address Translation Svc */
+ +#ifdef CONFIG_PCI_ATS
+ +	RH_KABI_EXTEND(u16 ats_cap)	/* ATS Capability offset */
+ +	RH_KABI_EXTEND(u8 ats_stu)	/* ATS Smallest Translation Unit */
+ +	RH_KABI_EXTEND(atomic_t ats_ref_cnt)  /* num of VFs with ATS enabled */
+ +#endif
+++=======
++ 	char *driver_override; /* Driver name to force a match */
++ 
++ 	unsigned long priv_flags; /* Private flags for the pci driver */
+++>>>>>>> 89ee9f768003 (PCI: Add device disconnected state)
+  };
+  
+  static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
+diff --git a/drivers/pci/hotplug/pciehp_pci.c b/drivers/pci/hotplug/pciehp_pci.c
+index f4a89ee38af4..2a1ca020cf5a 100644
+--- a/drivers/pci/hotplug/pciehp_pci.c
++++ b/drivers/pci/hotplug/pciehp_pci.c
+@@ -112,6 +112,12 @@ int pciehp_unconfigure_device(struct slot *p_slot)
+ 				break;
+ 			}
+ 		}
++		if (!presence) {
++			pci_dev_set_disconnected(dev, NULL);
++			if (pci_has_subordinate(dev))
++				pci_walk_bus(dev->subordinate,
++					     pci_dev_set_disconnected, NULL);
++		}
+ 		pci_stop_and_remove_bus_device(dev);
+ 		/*
+ 		 * Ensure that no new Requests will be generated from
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index b527a1ee3584..07386d692c5d 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -272,6 +272,20 @@ struct pci_sriov {
+ 	RH_KABI_EXTEND(u8 max_VF_buses)	/* max buses consumed by VFs */
+ };
+ 
++/* pci_dev priv_flags */
++#define PCI_DEV_DISCONNECTED 0
++
++static inline int pci_dev_set_disconnected(struct pci_dev *dev, void *unused)
++{
++	set_bit(PCI_DEV_DISCONNECTED, &dev->priv_flags);
++	return 0;
++}
++
++static inline bool pci_dev_is_disconnected(const struct pci_dev *dev)
++{
++	return test_bit(PCI_DEV_DISCONNECTED, &dev->priv_flags);
++}
++
+ #ifdef CONFIG_PCI_ATS
+ void pci_restore_ats_state(struct pci_dev *dev);
+ #else
+diff --git a/drivers/pci/pcie/pcie-dpc.c b/drivers/pci/pcie/pcie-dpc.c
+index dfd90cdeccfe..2d976a623ddc 100644
+--- a/drivers/pci/pcie/pcie-dpc.c
++++ b/drivers/pci/pcie/pcie-dpc.c
+@@ -14,6 +14,7 @@
+ #include <linux/init.h>
+ #include <linux/pci.h>
+ #include <linux/pcieport_if.h>
++#include "../pci.h"
+ 
+ struct rp_pio_header_log_regs {
+ 	u32 dw0;
+@@ -113,6 +114,10 @@ static void interrupt_event_handler(struct work_struct *work)
+ 	list_for_each_entry_safe_reverse(dev, temp, &parent->devices,
+ 					 bus_list) {
+ 		pci_dev_get(dev);
++		pci_dev_set_disconnected(dev, NULL);
++		if (pci_has_subordinate(dev))
++			pci_walk_bus(dev->subordinate,
++				     pci_dev_set_disconnected, NULL);
+ 		pci_stop_and_remove_bus_device(dev);
+ 		pci_dev_put(dev);
+ 	}
+* Unmerged path include/linux/pci.h
