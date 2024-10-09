@@ -1,0 +1,816 @@
+iscsi-target: remove support for obsolete markers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christophe Vu-Brugier <cvubrugier@fastmail.fm>
+commit c04a6091c951c88636a569cdd29feb65fb5003af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c04a6091.failed
+
+Support for markers is currently broken because of a bug in
+iscsi_enforce_integrity_rules(): the "IFMarkInt_Reject" and
+"OFMarkInt_Reject" variables are always equal to 1 in
+iscsi_enforce_integrity_rules().
+
+Moreover, fixed interval markers keys (IFMarker, OFMarker, IFMarkInt
+and OFMarkInt) are obsolete according to iSCSI RFC 7143:
+
+>From http://tools.ietf.org/html/rfc7143#section-13.25:
+
+   13.25.  Obsoleted Keys
+
+   This document obsoletes the following keys defined in [RFC3720]:
+   IFMarker, OFMarker, OFMarkInt, and IFMarkInt.  However, iSCSI
+   implementations compliant to this document may still receive these
+   obsoleted keys -- i.e., in a responder role -- in a text negotiation.
+
+   When an IFMarker or OFMarker key is received, a compliant iSCSI
+   implementation SHOULD respond with the constant "Reject" value.  The
+   implementation MAY alternatively respond with a "No" value.
+
+   However, the implementation MUST NOT respond with a "NotUnderstood"
+   value for either of these keys.
+
+   When an IFMarkInt or OFMarkInt key is received, a compliant iSCSI
+   implementation MUST respond with the constant "Reject" value.  The
+   implementation MUST NOT respond with a "NotUnderstood" value for
+   either of these keys.
+
+This patch disables markers by turning the corresponding parameters to
+read-only. The default value of IFMarker and OFMarker remains "No" but
+the user cannot change it to "Yes" anymore. The new value of IFMarkInt
+and OFMarkInt is "Reject".
+
+(Drop left-over iscsi_get_value_from_number_range + make configfs
+ parameters attrs R/W nops - nab)
+
+	Signed-off-by: Christophe Vu-Brugier <cvubrugier@fastmail.fm>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit c04a6091c951c88636a569cdd29feb65fb5003af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target.c
+#	include/target/iscsi/iscsi_target_core.h
+diff --cc drivers/target/iscsi/iscsi_target.c
+index 656b0401c6e2,21620c751071..000000000000
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@@ -2841,9 -2686,64 +2841,68 @@@ static int iscsit_send_datain(struct is
+  
+  	iscsit_build_datain_pdu(cmd, conn, &datain, hdr, set_statsn);
+  
+++<<<<<<< HEAD
+ +	ret = conn->conn_transport->iscsit_xmit_pdu(conn, cmd, dr, &datain, 0);
+ +	if (ret < 0)
+++=======
++ 	iov = &cmd->iov_data[0];
++ 	iov[iov_count].iov_base	= cmd->pdu;
++ 	iov[iov_count++].iov_len	= ISCSI_HDR_LEN;
++ 	tx_size += ISCSI_HDR_LEN;
++ 
++ 	if (conn->conn_ops->HeaderDigest) {
++ 		u32 *header_digest = (u32 *)&cmd->pdu[ISCSI_HDR_LEN];
++ 
++ 		iscsit_do_crypto_hash_buf(&conn->conn_tx_hash, cmd->pdu,
++ 				ISCSI_HDR_LEN, 0, NULL, (u8 *)header_digest);
++ 
++ 		iov[0].iov_len += ISCSI_CRC_LEN;
++ 		tx_size += ISCSI_CRC_LEN;
++ 
++ 		pr_debug("Attaching CRC32 HeaderDigest"
++ 			" for DataIN PDU 0x%08x\n", *header_digest);
++ 	}
++ 
++ 	iov_ret = iscsit_map_iovec(cmd, &cmd->iov_data[1],
++ 				datain.offset, datain.length);
++ 	if (iov_ret < 0)
++ 		return -1;
++ 
++ 	iov_count += iov_ret;
++ 	tx_size += datain.length;
++ 
++ 	cmd->padding = ((-datain.length) & 3);
++ 	if (cmd->padding) {
++ 		iov[iov_count].iov_base		= cmd->pad_bytes;
++ 		iov[iov_count++].iov_len	= cmd->padding;
++ 		tx_size += cmd->padding;
++ 
++ 		pr_debug("Attaching %u padding bytes\n",
++ 				cmd->padding);
++ 	}
++ 	if (conn->conn_ops->DataDigest) {
++ 		cmd->data_crc = iscsit_do_crypto_hash_sg(&conn->conn_tx_hash, cmd,
++ 			 datain.offset, datain.length, cmd->padding, cmd->pad_bytes);
++ 
++ 		iov[iov_count].iov_base	= &cmd->data_crc;
++ 		iov[iov_count++].iov_len = ISCSI_CRC_LEN;
++ 		tx_size += ISCSI_CRC_LEN;
++ 
++ 		pr_debug("Attached CRC32C DataDigest %d bytes, crc"
++ 			" 0x%08x\n", datain.length+cmd->padding, cmd->data_crc);
++ 	}
++ 
++ 	cmd->iov_data_count = iov_count;
++ 	cmd->tx_size = tx_size;
++ 
++ 	ret = iscsit_fe_sendpage_sg(cmd, conn);
++ 
++ 	iscsit_unmap_iovec(cmd);
++ 
++ 	if (ret < 0) {
++ 		iscsit_tx_thread_wait_for_tcp(conn);
+++>>>>>>> c04a6091c951 (iscsi-target: remove support for obsolete markers)
+  		return ret;
+ -	}
+  
+  	if (dr->dr_complete) {
+  		eodr = (cmd->se_cmd.se_cmd_flags & SCF_TRANSPORT_TASK_SENSE) ?
+diff --cc include/target/iscsi/iscsi_target_core.h
+index 85a93f1e5dc5,39f3d181d39d..000000000000
+--- a/include/target/iscsi/iscsi_target_core.h
++++ b/include/target/iscsi/iscsi_target_core.h
+@@@ -533,14 -528,9 +529,20 @@@ struct iscsi_conn 
+  	u32			exp_statsn;
+  	/* Per connection status sequence number */
+  	u32			stat_sn;
+++<<<<<<< HEAD
+ +	/* IFMarkInt's Current Value */
+ +	u32			if_marker;
+ +	/* OFMarkInt's Current Value */
+ +	u32			of_marker;
+ +	/* Used for calculating OFMarker offset to next PDU */
+ +	u32			of_marker_offset;
+ +	struct sockaddr_storage login_sockaddr;
+ +	struct sockaddr_storage local_sockaddr;
+++=======
++ #define IPV6_ADDRESS_SPACE				48
++ 	unsigned char		login_ip[IPV6_ADDRESS_SPACE];
++ 	unsigned char		local_ip[IPV6_ADDRESS_SPACE];
+++>>>>>>> c04a6091c951 (iscsi-target: remove support for obsolete markers)
+  	int			conn_usage_count;
+  	int			conn_waiting_on_uc;
+  	atomic_t		check_immediate_queue;
+* Unmerged path drivers/target/iscsi/iscsi_target.c
+diff --git a/drivers/target/iscsi/iscsi_target_erl0.c b/drivers/target/iscsi/iscsi_target_erl0.c
+index 10c81298eb0a..0cba7783eda0 100644
+--- a/drivers/target/iscsi/iscsi_target_erl0.c
++++ b/drivers/target/iscsi/iscsi_target_erl0.c
+@@ -954,56 +954,3 @@ void iscsit_take_action_for_connection_exit(struct iscsi_conn *conn)
+ 
+ 	iscsit_handle_connection_cleanup(conn);
+ }
+-
+-/*
+- *	This is the simple function that makes the magic of
+- *	sync and steering happen in the follow paradoxical order:
+- *
+- *	0) Receive conn->of_marker (bytes left until next OFMarker)
+- *	   bytes into an offload buffer.  When we pass the exact number
+- *	   of bytes in conn->of_marker, iscsit_dump_data_payload() and hence
+- *	   rx_data() will automatically receive the identical u32 marker
+- *	   values and store it in conn->of_marker_offset;
+- *	1) Now conn->of_marker_offset will contain the offset to the start
+- *	   of the next iSCSI PDU.  Dump these remaining bytes into another
+- *	   offload buffer.
+- *	2) We are done!
+- *	   Next byte in the TCP stream will contain the next iSCSI PDU!
+- *	   Cool Huh?!
+- */
+-int iscsit_recover_from_unknown_opcode(struct iscsi_conn *conn)
+-{
+-	/*
+-	 * Make sure the remaining bytes to next maker is a sane value.
+-	 */
+-	if (conn->of_marker > (conn->conn_ops->OFMarkInt * 4)) {
+-		pr_err("Remaining bytes to OFMarker: %u exceeds"
+-			" OFMarkInt bytes: %u.\n", conn->of_marker,
+-				conn->conn_ops->OFMarkInt * 4);
+-		return -1;
+-	}
+-
+-	pr_debug("Advancing %u bytes in TCP stream to get to the"
+-			" next OFMarker.\n", conn->of_marker);
+-
+-	if (iscsit_dump_data_payload(conn, conn->of_marker, 0) < 0)
+-		return -1;
+-
+-	/*
+-	 * Make sure the offset marker we retrived is a valid value.
+-	 */
+-	if (conn->of_marker_offset > (ISCSI_HDR_LEN + (ISCSI_CRC_LEN * 2) +
+-	    conn->conn_ops->MaxRecvDataSegmentLength)) {
+-		pr_err("OfMarker offset value: %u exceeds limit.\n",
+-			conn->of_marker_offset);
+-		return -1;
+-	}
+-
+-	pr_debug("Discarding %u bytes of TCP stream to get to the"
+-			" next iSCSI Opcode.\n", conn->of_marker_offset);
+-
+-	if (iscsit_dump_data_payload(conn, conn->of_marker_offset, 0) < 0)
+-		return -1;
+-
+-	return 0;
+-}
+diff --git a/drivers/target/iscsi/iscsi_target_erl0.h b/drivers/target/iscsi/iscsi_target_erl0.h
+index 21acc9a06376..a9e2f9497fb2 100644
+--- a/drivers/target/iscsi/iscsi_target_erl0.h
++++ b/drivers/target/iscsi/iscsi_target_erl0.h
+@@ -10,6 +10,5 @@ extern void iscsit_connection_reinstatement_rcfr(struct iscsi_conn *);
+ extern void iscsit_cause_connection_reinstatement(struct iscsi_conn *, int);
+ extern void iscsit_fall_back_to_erl0(struct iscsi_session *);
+ extern void iscsit_take_action_for_connection_exit(struct iscsi_conn *);
+-extern int iscsit_recover_from_unknown_opcode(struct iscsi_conn *);
+ 
+ #endif   /*** ISCSI_TARGET_ERL0_H ***/
+diff --git a/drivers/target/iscsi/iscsi_target_login.c b/drivers/target/iscsi/iscsi_target_login.c
+index 0a02b41fd3f8..7b00871aaa7f 100644
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -421,8 +421,6 @@ static int iscsi_login_zero_tsih_s2(
+ 	if (iscsi_change_param_sprintf(conn, "ErrorRecoveryLevel=%d", na->default_erl))
+ 		return -1;
+ 
+-	if (iscsi_login_disable_FIM_keys(conn->param_list, conn) < 0)
+-		return -1;
+ 	/*
+ 	 * Set RDMAExtensions=Yes by default for iSER enabled network portals
+ 	 */
+@@ -488,59 +486,6 @@ check_prot:
+ 	return 0;
+ }
+ 
+-/*
+- * Remove PSTATE_NEGOTIATE for the four FIM related keys.
+- * The Initiator node will be able to enable FIM by proposing them itself.
+- */
+-int iscsi_login_disable_FIM_keys(
+-	struct iscsi_param_list *param_list,
+-	struct iscsi_conn *conn)
+-{
+-	struct iscsi_param *param;
+-
+-	param = iscsi_find_param_from_key("OFMarker", param_list);
+-	if (!param) {
+-		pr_err("iscsi_find_param_from_key() for"
+-				" OFMarker failed\n");
+-		iscsit_tx_login_rsp(conn, ISCSI_STATUS_CLS_TARGET_ERR,
+-				ISCSI_LOGIN_STATUS_NO_RESOURCES);
+-		return -1;
+-	}
+-	param->state &= ~PSTATE_NEGOTIATE;
+-
+-	param = iscsi_find_param_from_key("OFMarkInt", param_list);
+-	if (!param) {
+-		pr_err("iscsi_find_param_from_key() for"
+-				" IFMarker failed\n");
+-		iscsit_tx_login_rsp(conn, ISCSI_STATUS_CLS_TARGET_ERR,
+-				ISCSI_LOGIN_STATUS_NO_RESOURCES);
+-		return -1;
+-	}
+-	param->state &= ~PSTATE_NEGOTIATE;
+-
+-	param = iscsi_find_param_from_key("IFMarker", param_list);
+-	if (!param) {
+-		pr_err("iscsi_find_param_from_key() for"
+-				" IFMarker failed\n");
+-		iscsit_tx_login_rsp(conn, ISCSI_STATUS_CLS_TARGET_ERR,
+-				ISCSI_LOGIN_STATUS_NO_RESOURCES);
+-		return -1;
+-	}
+-	param->state &= ~PSTATE_NEGOTIATE;
+-
+-	param = iscsi_find_param_from_key("IFMarkInt", param_list);
+-	if (!param) {
+-		pr_err("iscsi_find_param_from_key() for"
+-				" IFMarker failed\n");
+-		iscsit_tx_login_rsp(conn, ISCSI_STATUS_CLS_TARGET_ERR,
+-				ISCSI_LOGIN_STATUS_NO_RESOURCES);
+-		return -1;
+-	}
+-	param->state &= ~PSTATE_NEGOTIATE;
+-
+-	return 0;
+-}
+-
+ static int iscsi_login_non_zero_tsih_s1(
+ 	struct iscsi_conn *conn,
+ 	unsigned char *buf)
+@@ -627,7 +572,7 @@ static int iscsi_login_non_zero_tsih_s2(
+ 	if (iscsi_change_param_sprintf(conn, "TargetPortalGroupTag=%hu", sess->tpg->tpgt))
+ 		return -1;
+ 
+-	return iscsi_login_disable_FIM_keys(conn->param_list, conn);
++	return 0;
+ }
+ 
+ int iscsi_login_post_auth_non_zero_tsih(
+@@ -776,7 +721,6 @@ void iscsi_post_login_handler(
+ 	conn->conn_state = TARG_CONN_STATE_LOGGED_IN;
+ 
+ 	iscsi_set_connection_parameters(conn->conn_ops, conn->param_list);
+-	iscsit_set_sync_and_steering_values(conn);
+ 	/*
+ 	 * SCSI Initiator -> SCSI Target Port Mapping
+ 	 */
+diff --git a/drivers/target/iscsi/iscsi_target_login.h b/drivers/target/iscsi/iscsi_target_login.h
+index 32efaed96691..b597aa2c61a1 100644
+--- a/drivers/target/iscsi/iscsi_target_login.h
++++ b/drivers/target/iscsi/iscsi_target_login.h
+@@ -17,6 +17,5 @@ extern void iscsi_post_login_handler(struct iscsi_np *, struct iscsi_conn *, u8)
+ extern void iscsi_target_login_sess_out(struct iscsi_conn *, struct iscsi_np *,
+ 				bool, bool);
+ extern int iscsi_target_login_thread(void *);
+-extern int iscsi_login_disable_FIM_keys(struct iscsi_param_list *, struct iscsi_conn *);
+ 
+ #endif   /*** ISCSI_TARGET_LOGIN_H ***/
+diff --git a/drivers/target/iscsi/iscsi_target_parameters.c b/drivers/target/iscsi/iscsi_target_parameters.c
+index f4e6f709a0a2..1e77fb56f1d2 100644
+--- a/drivers/target/iscsi/iscsi_target_parameters.c
++++ b/drivers/target/iscsi/iscsi_target_parameters.c
+@@ -34,13 +34,6 @@ int iscsi_login_rx_data(
+ 	iov.iov_len	= length;
+ 	iov.iov_base	= buf;
+ 
+-	/*
+-	 * Initial Marker-less Interval.
+-	 * Add the values regardless of IFMarker/OFMarker, considering
+-	 * it may not be negoitated yet.
+-	 */
+-	conn->of_marker += length;
+-
+ 	rx_got = rx_data(conn, &iov, 1, length);
+ 	if (rx_got != length) {
+ 		pr_err("rx_data returned %d, expecting %d.\n",
+@@ -72,13 +65,6 @@ int iscsi_login_tx_data(
+ 		iov_cnt++;
+ 	}
+ 
+-	/*
+-	 * Initial Marker-less Interval.
+-	 * Add the values regardless of IFMarker/OFMarker, considering
+-	 * it may not be negoitated yet.
+-	 */
+-	conn->if_marker += length;
+-
+ 	tx_sent = tx_data(conn, &iov[0], iov_cnt, length);
+ 	if (tx_sent != length) {
+ 		pr_err("tx_data returned %d, expecting %d.\n",
+@@ -97,12 +83,6 @@ void iscsi_dump_conn_ops(struct iscsi_conn_ops *conn_ops)
+ 				"CRC32C" : "None");
+ 	pr_debug("MaxRecvDataSegmentLength: %u\n",
+ 				conn_ops->MaxRecvDataSegmentLength);
+-	pr_debug("OFMarker: %s\n", (conn_ops->OFMarker) ? "Yes" : "No");
+-	pr_debug("IFMarker: %s\n", (conn_ops->IFMarker) ? "Yes" : "No");
+-	if (conn_ops->OFMarker)
+-		pr_debug("OFMarkInt: %u\n", conn_ops->OFMarkInt);
+-	if (conn_ops->IFMarker)
+-		pr_debug("IFMarkInt: %u\n", conn_ops->IFMarkInt);
+ }
+ 
+ void iscsi_dump_sess_ops(struct iscsi_sess_ops *sess_ops)
+@@ -194,10 +174,6 @@ static struct iscsi_param *iscsi_set_default_param(struct iscsi_param_list *para
+ 	case TYPERANGE_DIGEST:
+ 		param->type = TYPE_VALUE_LIST | TYPE_STRING;
+ 		break;
+-	case TYPERANGE_MARKINT:
+-		param->type = TYPE_NUMBER_RANGE;
+-		param->type_range |= TYPERANGE_1_TO_65535;
+-		break;
+ 	case TYPERANGE_ISCSINAME:
+ 	case TYPERANGE_SESSIONTYPE:
+ 	case TYPERANGE_TARGETADDRESS:
+@@ -422,13 +398,13 @@ int iscsi_create_default_params(struct iscsi_param_list **param_list_ptr)
+ 
+ 	param = iscsi_set_default_param(pl, IFMARKINT, INITIAL_IFMARKINT,
+ 			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
+-			TYPERANGE_MARKINT, USE_INITIAL_ONLY);
++			TYPERANGE_UTF8, USE_INITIAL_ONLY);
+ 	if (!param)
+ 		goto out;
+ 
+ 	param = iscsi_set_default_param(pl, OFMARKINT, INITIAL_OFMARKINT,
+ 			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
+-			TYPERANGE_MARKINT, USE_INITIAL_ONLY);
++			TYPERANGE_UTF8, USE_INITIAL_ONLY);
+ 	if (!param)
+ 		goto out;
+ 	/*
+@@ -524,9 +500,9 @@ int iscsi_set_keys_to_negotiate(
+ 		} else if (!strcmp(param->name, OFMARKER)) {
+ 			SET_PSTATE_NEGOTIATE(param);
+ 		} else if (!strcmp(param->name, IFMARKINT)) {
+-			SET_PSTATE_NEGOTIATE(param);
++			SET_PSTATE_REJECT(param);
+ 		} else if (!strcmp(param->name, OFMARKINT)) {
+-			SET_PSTATE_NEGOTIATE(param);
++			SET_PSTATE_REJECT(param);
+ 		} else if (!strcmp(param->name, RDMAEXTENSIONS)) {
+ 			if (iser)
+ 				SET_PSTATE_NEGOTIATE(param);
+@@ -907,91 +883,6 @@ static int iscsi_check_numerical_value(struct iscsi_param *param, char *value_pt
+ 	return 0;
+ }
+ 
+-static int iscsi_check_numerical_range_value(struct iscsi_param *param, char *value)
+-{
+-	char *left_val_ptr = NULL, *right_val_ptr = NULL;
+-	char *tilde_ptr = NULL;
+-	u32 left_val, right_val, local_left_val;
+-
+-	if (strcmp(param->name, IFMARKINT) &&
+-	    strcmp(param->name, OFMARKINT)) {
+-		pr_err("Only parameters \"%s\" or \"%s\" may contain a"
+-		       " numerical range value.\n", IFMARKINT, OFMARKINT);
+-		return -1;
+-	}
+-
+-	if (IS_PSTATE_PROPOSER(param))
+-		return 0;
+-
+-	tilde_ptr = strchr(value, '~');
+-	if (!tilde_ptr) {
+-		pr_err("Unable to locate numerical range indicator"
+-			" \"~\" for \"%s\".\n", param->name);
+-		return -1;
+-	}
+-	*tilde_ptr = '\0';
+-
+-	left_val_ptr = value;
+-	right_val_ptr = value + strlen(left_val_ptr) + 1;
+-
+-	if (iscsi_check_numerical_value(param, left_val_ptr) < 0)
+-		return -1;
+-	if (iscsi_check_numerical_value(param, right_val_ptr) < 0)
+-		return -1;
+-
+-	left_val = simple_strtoul(left_val_ptr, NULL, 0);
+-	right_val = simple_strtoul(right_val_ptr, NULL, 0);
+-	*tilde_ptr = '~';
+-
+-	if (right_val < left_val) {
+-		pr_err("Numerical range for parameter \"%s\" contains"
+-			" a right value which is less than the left.\n",
+-				param->name);
+-		return -1;
+-	}
+-
+-	/*
+-	 * For now,  enforce reasonable defaults for [I,O]FMarkInt.
+-	 */
+-	tilde_ptr = strchr(param->value, '~');
+-	if (!tilde_ptr) {
+-		pr_err("Unable to locate numerical range indicator"
+-			" \"~\" for \"%s\".\n", param->name);
+-		return -1;
+-	}
+-	*tilde_ptr = '\0';
+-
+-	left_val_ptr = param->value;
+-	right_val_ptr = param->value + strlen(left_val_ptr) + 1;
+-
+-	local_left_val = simple_strtoul(left_val_ptr, NULL, 0);
+-	*tilde_ptr = '~';
+-
+-	if (param->set_param) {
+-		if ((left_val < local_left_val) ||
+-		    (right_val < local_left_val)) {
+-			pr_err("Passed value range \"%u~%u\" is below"
+-				" minimum left value \"%u\" for key \"%s\","
+-				" rejecting.\n", left_val, right_val,
+-				local_left_val, param->name);
+-			return -1;
+-		}
+-	} else {
+-		if ((left_val < local_left_val) &&
+-		    (right_val < local_left_val)) {
+-			pr_err("Received value range \"%u~%u\" is"
+-				" below minimum left value \"%u\" for key"
+-				" \"%s\", rejecting.\n", left_val, right_val,
+-				local_left_val, param->name);
+-			SET_PSTATE_REJECT(param);
+-			if (iscsi_update_param_value(param, REJECT) < 0)
+-				return -1;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ static int iscsi_check_string_or_list_value(struct iscsi_param *param, char *value)
+ {
+ 	if (IS_PSTATE_PROPOSER(param))
+@@ -1028,33 +919,6 @@ static int iscsi_check_string_or_list_value(struct iscsi_param *param, char *val
+ 	return 0;
+ }
+ 
+-/*
+- *	This function is used to pick a value range number,  currently just
+- *	returns the lesser of both right values.
+- */
+-static char *iscsi_get_value_from_number_range(
+-	struct iscsi_param *param,
+-	char *value)
+-{
+-	char *end_ptr, *tilde_ptr1 = NULL, *tilde_ptr2 = NULL;
+-	u32 acceptor_right_value, proposer_right_value;
+-
+-	tilde_ptr1 = strchr(value, '~');
+-	if (!tilde_ptr1)
+-		return NULL;
+-	*tilde_ptr1++ = '\0';
+-	proposer_right_value = simple_strtoul(tilde_ptr1, &end_ptr, 0);
+-
+-	tilde_ptr2 = strchr(param->value, '~');
+-	if (!tilde_ptr2)
+-		return NULL;
+-	*tilde_ptr2++ = '\0';
+-	acceptor_right_value = simple_strtoul(tilde_ptr2, &end_ptr, 0);
+-
+-	return (acceptor_right_value >= proposer_right_value) ?
+-		tilde_ptr1 : tilde_ptr2;
+-}
+-
+ static char *iscsi_check_valuelist_for_support(
+ 	struct iscsi_param *param,
+ 	char *value)
+@@ -1204,14 +1068,6 @@ static int iscsi_check_acceptor_state(struct iscsi_param *param, char *value,
+ 			pr_debug("Updated %s to target MXDSL value: %s\n",
+ 					param->name, param->value);
+ 		}
+-
+-	} else if (IS_TYPE_NUMBER_RANGE(param)) {
+-		negoitated_value = iscsi_get_value_from_number_range(
+-					param, value);
+-		if (!negoitated_value)
+-			return -1;
+-		if (iscsi_update_param_value(param, negoitated_value) < 0)
+-			return -1;
+ 	} else if (IS_TYPE_VALUE_LIST(param)) {
+ 		negoitated_value = iscsi_check_valuelist_for_support(
+ 					param, value);
+@@ -1240,47 +1096,7 @@ static int iscsi_check_proposer_state(struct iscsi_param *param, char *value)
+ 		return -1;
+ 	}
+ 
+-	if (IS_TYPE_NUMBER_RANGE(param)) {
+-		u32 left_val = 0, right_val = 0, recieved_value = 0;
+-		char *left_val_ptr = NULL, *right_val_ptr = NULL;
+-		char *tilde_ptr = NULL;
+-
+-		if (!strcmp(value, IRRELEVANT) || !strcmp(value, REJECT)) {
+-			if (iscsi_update_param_value(param, value) < 0)
+-				return -1;
+-			return 0;
+-		}
+-
+-		tilde_ptr = strchr(value, '~');
+-		if (tilde_ptr) {
+-			pr_err("Illegal \"~\" in response for \"%s\".\n",
+-					param->name);
+-			return -1;
+-		}
+-		tilde_ptr = strchr(param->value, '~');
+-		if (!tilde_ptr) {
+-			pr_err("Unable to locate numerical range"
+-				" indicator \"~\" for \"%s\".\n", param->name);
+-			return -1;
+-		}
+-		*tilde_ptr = '\0';
+-
+-		left_val_ptr = param->value;
+-		right_val_ptr = param->value + strlen(left_val_ptr) + 1;
+-		left_val = simple_strtoul(left_val_ptr, NULL, 0);
+-		right_val = simple_strtoul(right_val_ptr, NULL, 0);
+-		recieved_value = simple_strtoul(value, NULL, 0);
+-
+-		*tilde_ptr = '~';
+-
+-		if ((recieved_value < left_val) ||
+-		    (recieved_value > right_val)) {
+-			pr_err("Illegal response \"%s=%u\", value must"
+-				" be between %u and %u.\n", param->name,
+-				recieved_value, left_val, right_val);
+-			return -1;
+-		}
+-	} else if (IS_TYPE_VALUE_LIST(param)) {
++	if (IS_TYPE_VALUE_LIST(param)) {
+ 		char *comma_ptr = NULL, *tmp_ptr = NULL;
+ 
+ 		comma_ptr = strchr(value, ',');
+@@ -1362,9 +1178,6 @@ static int iscsi_check_value(struct iscsi_param *param, char *value)
+ 		} else if (IS_TYPE_NUMBER(param)) {
+ 			if (iscsi_check_numerical_value(param, value) < 0)
+ 				return -1;
+-		} else if (IS_TYPE_NUMBER_RANGE(param)) {
+-			if (iscsi_check_numerical_range_value(param, value) < 0)
+-				return -1;
+ 		} else if (IS_TYPE_STRING(param) || IS_TYPE_VALUE_LIST(param)) {
+ 			if (iscsi_check_string_or_list_value(param, value) < 0)
+ 				return -1;
+@@ -1484,8 +1297,6 @@ static int iscsi_enforce_integrity_rules(
+ 	char *tmpptr;
+ 	u8 DataSequenceInOrder = 0;
+ 	u8 ErrorRecoveryLevel = 0, SessionType = 0;
+-	u8 IFMarker = 0, OFMarker = 0;
+-	u8 IFMarkInt_Reject = 1, OFMarkInt_Reject = 1;
+ 	u32 FirstBurstLength = 0, MaxBurstLength = 0;
+ 	struct iscsi_param *param = NULL;
+ 
+@@ -1504,28 +1315,12 @@ static int iscsi_enforce_integrity_rules(
+ 		if (!strcmp(param->name, MAXBURSTLENGTH))
+ 			MaxBurstLength = simple_strtoul(param->value,
+ 					&tmpptr, 0);
+-		if (!strcmp(param->name, IFMARKER))
+-			if (!strcmp(param->value, YES))
+-				IFMarker = 1;
+-		if (!strcmp(param->name, OFMARKER))
+-			if (!strcmp(param->value, YES))
+-				OFMarker = 1;
+-		if (!strcmp(param->name, IFMARKINT))
+-			if (!strcmp(param->value, REJECT))
+-				IFMarkInt_Reject = 1;
+-		if (!strcmp(param->name, OFMARKINT))
+-			if (!strcmp(param->value, REJECT))
+-				OFMarkInt_Reject = 1;
+ 	}
+ 
+ 	list_for_each_entry(param, &param_list->param_list, p_list) {
+ 		if (!(param->phase & phase))
+ 			continue;
+-		if (!SessionType && (!IS_PSTATE_ACCEPTOR(param) &&
+-		     (strcmp(param->name, IFMARKER) &&
+-		      strcmp(param->name, OFMARKER) &&
+-		      strcmp(param->name, IFMARKINT) &&
+-		      strcmp(param->name, OFMARKINT))))
++		if (!SessionType && !IS_PSTATE_ACCEPTOR(param))
+ 			continue;
+ 		if (!strcmp(param->name, MAXOUTSTANDINGR2T) &&
+ 		    DataSequenceInOrder && (ErrorRecoveryLevel > 0)) {
+@@ -1557,38 +1352,6 @@ static int iscsi_enforce_integrity_rules(
+ 					param->name, param->value);
+ 			}
+ 		}
+-		if (!strcmp(param->name, IFMARKER) && IFMarkInt_Reject) {
+-			if (iscsi_update_param_value(param, NO) < 0)
+-				return -1;
+-			IFMarker = 0;
+-			pr_debug("Reset \"%s\" to \"%s\".\n",
+-					param->name, param->value);
+-		}
+-		if (!strcmp(param->name, OFMARKER) && OFMarkInt_Reject) {
+-			if (iscsi_update_param_value(param, NO) < 0)
+-				return -1;
+-			OFMarker = 0;
+-			pr_debug("Reset \"%s\" to \"%s\".\n",
+-					 param->name, param->value);
+-		}
+-		if (!strcmp(param->name, IFMARKINT) && !IFMarker) {
+-			if (!strcmp(param->value, REJECT))
+-				continue;
+-			param->state &= ~PSTATE_NEGOTIATE;
+-			if (iscsi_update_param_value(param, IRRELEVANT) < 0)
+-				return -1;
+-			pr_debug("Reset \"%s\" to \"%s\".\n",
+-					param->name, param->value);
+-		}
+-		if (!strcmp(param->name, OFMARKINT) && !OFMarker) {
+-			if (!strcmp(param->value, REJECT))
+-				continue;
+-			param->state &= ~PSTATE_NEGOTIATE;
+-			if (iscsi_update_param_value(param, IRRELEVANT) < 0)
+-				return -1;
+-			pr_debug("Reset \"%s\" to \"%s\".\n",
+-					param->name, param->value);
+-		}
+ 	}
+ 
+ 	return 0;
+@@ -1825,24 +1588,6 @@ void iscsi_set_connection_parameters(
+ 			 */
+ 			pr_debug("MaxRecvDataSegmentLength:     %u\n",
+ 				ops->MaxRecvDataSegmentLength);
+-		} else if (!strcmp(param->name, OFMARKER)) {
+-			ops->OFMarker = !strcmp(param->value, YES);
+-			pr_debug("OFMarker:                     %s\n",
+-				param->value);
+-		} else if (!strcmp(param->name, IFMARKER)) {
+-			ops->IFMarker = !strcmp(param->value, YES);
+-			pr_debug("IFMarker:                     %s\n",
+-				param->value);
+-		} else if (!strcmp(param->name, OFMARKINT)) {
+-			ops->OFMarkInt =
+-				simple_strtoul(param->value, &tmpptr, 0);
+-			pr_debug("OFMarkInt:                    %s\n",
+-				param->value);
+-		} else if (!strcmp(param->name, IFMARKINT)) {
+-			ops->IFMarkInt =
+-				simple_strtoul(param->value, &tmpptr, 0);
+-			pr_debug("IFMarkInt:                    %s\n",
+-				param->value);
+ 		} else if (!strcmp(param->name, INITIATORRECVDATASEGMENTLENGTH)) {
+ 			ops->InitiatorRecvDataSegmentLength =
+ 				simple_strtoul(param->value, &tmpptr, 0);
+diff --git a/drivers/target/iscsi/iscsi_target_parameters.h b/drivers/target/iscsi/iscsi_target_parameters.h
+index a47046a752aa..a0751e3f0813 100644
+--- a/drivers/target/iscsi/iscsi_target_parameters.h
++++ b/drivers/target/iscsi/iscsi_target_parameters.h
+@@ -138,8 +138,8 @@ extern void iscsi_set_session_parameters(struct iscsi_sess_ops *,
+ #define INITIAL_SESSIONTYPE			NORMAL
+ #define INITIAL_IFMARKER			NO
+ #define INITIAL_OFMARKER			NO
+-#define INITIAL_IFMARKINT			"2048~65535"
+-#define INITIAL_OFMARKINT			"2048~65535"
++#define INITIAL_IFMARKINT			REJECT
++#define INITIAL_OFMARKINT			REJECT
+ 
+ /*
+  * Initial values for iSER parameters following RFC-5046 Section 6
+@@ -239,10 +239,9 @@ extern void iscsi_set_session_parameters(struct iscsi_sess_ops *,
+ #define TYPERANGE_AUTH			0x0200
+ #define TYPERANGE_DIGEST		0x0400
+ #define TYPERANGE_ISCSINAME		0x0800
+-#define TYPERANGE_MARKINT		0x1000
+-#define TYPERANGE_SESSIONTYPE		0x2000
+-#define TYPERANGE_TARGETADDRESS		0x4000
+-#define TYPERANGE_UTF8			0x8000
++#define TYPERANGE_SESSIONTYPE		0x1000
++#define TYPERANGE_TARGETADDRESS		0x2000
++#define TYPERANGE_UTF8			0x4000
+ 
+ #define IS_TYPERANGE_0_TO_2(p)		((p)->type_range & TYPERANGE_0_TO_2)
+ #define IS_TYPERANGE_0_TO_3600(p)	((p)->type_range & TYPERANGE_0_TO_3600)
+diff --git a/drivers/target/iscsi/iscsi_target_util.c b/drivers/target/iscsi/iscsi_target_util.c
+index 786f636be2fe..fa75c97b914d 100644
+--- a/drivers/target/iscsi/iscsi_target_util.c
++++ b/drivers/target/iscsi/iscsi_target_util.c
+@@ -816,54 +816,6 @@ void iscsit_inc_session_usage_count(struct iscsi_session *sess)
+ 	spin_unlock_bh(&sess->session_usage_lock);
+ }
+ 
+-/*
+- *	Setup conn->if_marker and conn->of_marker values based upon
+- *	the initial marker-less interval. (see iSCSI v19 A.2)
+- */
+-int iscsit_set_sync_and_steering_values(struct iscsi_conn *conn)
+-{
+-	int login_ifmarker_count = 0, login_ofmarker_count = 0, next_marker = 0;
+-	/*
+-	 * IFMarkInt and OFMarkInt are negotiated as 32-bit words.
+-	 */
+-	u32 IFMarkInt = (conn->conn_ops->IFMarkInt * 4);
+-	u32 OFMarkInt = (conn->conn_ops->OFMarkInt * 4);
+-
+-	if (conn->conn_ops->OFMarker) {
+-		/*
+-		 * Account for the first Login Command received not
+-		 * via iscsi_recv_msg().
+-		 */
+-		conn->of_marker += ISCSI_HDR_LEN;
+-		if (conn->of_marker <= OFMarkInt) {
+-			conn->of_marker = (OFMarkInt - conn->of_marker);
+-		} else {
+-			login_ofmarker_count = (conn->of_marker / OFMarkInt);
+-			next_marker = (OFMarkInt * (login_ofmarker_count + 1)) +
+-					(login_ofmarker_count * MARKER_SIZE);
+-			conn->of_marker = (next_marker - conn->of_marker);
+-		}
+-		conn->of_marker_offset = 0;
+-		pr_debug("Setting OFMarker value to %u based on Initial"
+-			" Markerless Interval.\n", conn->of_marker);
+-	}
+-
+-	if (conn->conn_ops->IFMarker) {
+-		if (conn->if_marker <= IFMarkInt) {
+-			conn->if_marker = (IFMarkInt - conn->if_marker);
+-		} else {
+-			login_ifmarker_count = (conn->if_marker / IFMarkInt);
+-			next_marker = (IFMarkInt * (login_ifmarker_count + 1)) +
+-					(login_ifmarker_count * MARKER_SIZE);
+-			conn->if_marker = (next_marker - conn->if_marker);
+-		}
+-		pr_debug("Setting IFMarker value to %u based on Initial"
+-			" Markerless Interval.\n", conn->if_marker);
+-	}
+-
+-	return 0;
+-}
+-
+ struct iscsi_conn *iscsit_get_conn_from_cid(struct iscsi_session *sess, u16 cid)
+ {
+ 	struct iscsi_conn *conn;
+diff --git a/drivers/target/iscsi/iscsi_target_util.h b/drivers/target/iscsi/iscsi_target_util.h
+index fbe9428d9e9f..d96ec7d3f348 100644
+--- a/drivers/target/iscsi/iscsi_target_util.h
++++ b/drivers/target/iscsi/iscsi_target_util.h
+@@ -34,7 +34,6 @@ extern void iscsit_free_cmd(struct iscsi_cmd *, bool);
+ extern int iscsit_check_session_usage_count(struct iscsi_session *);
+ extern void iscsit_dec_session_usage_count(struct iscsi_session *);
+ extern void iscsit_inc_session_usage_count(struct iscsi_session *);
+-extern int iscsit_set_sync_and_steering_values(struct iscsi_conn *);
+ extern struct iscsi_conn *iscsit_get_conn_from_cid(struct iscsi_session *, u16);
+ extern struct iscsi_conn *iscsit_get_conn_from_cid_rcfr(struct iscsi_session *, u16);
+ extern void iscsit_check_conn_usage_count(struct iscsi_conn *);
+* Unmerged path include/target/iscsi/iscsi_target_core.h
