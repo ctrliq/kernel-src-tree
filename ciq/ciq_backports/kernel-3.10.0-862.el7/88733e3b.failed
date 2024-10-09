@@ -1,0 +1,814 @@
+IB/hfi1: Add 16B UD support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Don Hiatt <don.hiatt@intel.com>
+commit 88733e3b845024cb2324a68469a4a25fdd9c0a6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/88733e3b.failed
+
+Add 16B bypass packet support for UD traffic types.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+	Signed-off-by: Don Hiatt <don.hiatt@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 88733e3b845024cb2324a68469a4a25fdd9c0a6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/driver.c
+#	drivers/infiniband/hw/hfi1/hfi.h
+#	drivers/infiniband/hw/hfi1/mad.c
+#	drivers/infiniband/hw/hfi1/ud.c
+#	drivers/infiniband/hw/hfi1/verbs.h
+#	include/rdma/opa_addr.h
+diff --cc drivers/infiniband/hw/hfi1/driver.c
+index e4e01e0fe2d8,fc7085d6cf3f..000000000000
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@@ -458,29 -437,36 +458,46 @@@ void hfi1_process_ecn_slowpath(struct r
+  			       bool do_cnp)
+  {
+  	struct hfi1_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+- 	struct ib_header *hdr = pkt->hdr;
+  	struct ib_other_headers *ohdr = pkt->ohdr;
+ -	struct ib_grh *grh = pkt->grh;
+ +	struct ib_grh *grh = NULL;
+  	u32 rqpn = 0, bth1;
+- 	u16 rlid, dlid = ib_get_dlid(hdr);
+- 	u8 sc, svc_type;
++ 	u16 pkey, rlid, dlid = ib_get_dlid(pkt->hdr);
++ 	u8 hdr_type, sc, svc_type;
+  	bool is_mcast = false;
+  
+++<<<<<<< HEAD
+ +	if (pkt->rcv_flags & HFI1_HAS_GRH)
+ +		grh = &hdr->u.l.grh;
+++=======
++ 	if (pkt->etype == RHF_RCV_TYPE_BYPASS) {
++ 		is_mcast = hfi1_is_16B_mcast(dlid);
++ 		pkey = hfi1_16B_get_pkey(pkt->hdr);
++ 		sc = hfi1_16B_get_sc(pkt->hdr);
++ 		hdr_type = HFI1_PKT_TYPE_16B;
++ 	} else {
++ 		is_mcast = (dlid > be16_to_cpu(IB_MULTICAST_LID_BASE)) &&
++ 			   (dlid != be16_to_cpu(IB_LID_PERMISSIVE));
++ 		pkey = ib_bth_get_pkey(ohdr);
++ 		sc = hfi1_9B_get_sc5(pkt->hdr, pkt->rhf);
++ 		hdr_type = HFI1_PKT_TYPE_9B;
++ 	}
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  
+  	switch (qp->ibqp.qp_type) {
+  	case IB_QPT_SMI:
+  	case IB_QPT_GSI:
+  	case IB_QPT_UD:
+++<<<<<<< HEAD
+ +		rlid = ib_get_slid(hdr);
+ +		rqpn = be32_to_cpu(ohdr->u.ud.deth[1]) & RVT_QPN_MASK;
+++=======
++ 		rlid = ib_get_slid(pkt->hdr);
++ 		rqpn = ib_get_sqpn(pkt->ohdr);
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  		svc_type = IB_CC_SVCTYPE_UD;
+- 		is_mcast = (dlid > be16_to_cpu(IB_MULTICAST_LID_BASE)) &&
+- 			(dlid != be16_to_cpu(IB_LID_PERMISSIVE));
+  		break;
+  	case IB_QPT_UC:
+ -		rlid = rdma_ah_get_dlid(&qp->remote_ah_attr);
+ +		rlid = qp->remote_ah_attr.dlid;
+  		rqpn = qp->remote_qpn;
+  		svc_type = IB_CC_SVCTYPE_UC;
+  		break;
+@@@ -493,14 -479,11 +510,19 @@@
+  		return;
+  	}
+  
+- 	sc = hfi1_9B_get_sc5(hdr, pkt->rhf);
+- 
+  	bth1 = be32_to_cpu(ohdr->bth[1]);
+++<<<<<<< HEAD
+ +	if (do_cnp && (bth1 & IB_FECN_SMASK)) {
+ +		u16 pkey = (u16)be32_to_cpu(ohdr->bth[0]);
+ +
+ +		return_cnp(ibp, qp, rqpn, pkey, dlid, rlid, sc, grh);
+ +	}
+++=======
++ 	/* Call appropriate CNP handler */
++ 	if (do_cnp && (bth1 & IB_FECN_SMASK))
++ 		hfi1_handle_cnp_tbl[hdr_type](ibp, qp, rqpn, pkey,
++ 					      dlid, rlid, sc, grh);
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  
+  	if (!is_mcast && (bth1 & IB_BECN_SMASK)) {
+  		struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+diff --cc drivers/infiniband/hw/hfi1/hfi.h
+index 9719cf207532,7e21192da8e1..000000000000
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@@ -2093,4 -2207,221 +2126,224 @@@ int hfi1_tempsense_rd(struct hfi1_devda
+  
+  #define DD_DEV_ENTRY(dd)       __string(dev, dev_name(&(dd)->pcidev->dev))
+  #define DD_DEV_ASSIGN(dd)      __assign_str(dev, dev_name(&(dd)->pcidev->dev))
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void hfi1_update_ah_attr(struct ib_device *ibdev,
++ 				       struct rdma_ah_attr *attr)
++ {
++ 	struct hfi1_pportdata *ppd;
++ 	struct hfi1_ibport *ibp;
++ 	u32 dlid = rdma_ah_get_dlid(attr);
++ 
++ 	/*
++ 	 * Kernel clients may not have setup GRH information
++ 	 * Set that here.
++ 	 */
++ 	ibp = to_iport(ibdev, rdma_ah_get_port_num(attr));
++ 	ppd = ppd_from_ibp(ibp);
++ 	if ((((dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) ||
++ 	      (ppd->lid >= be16_to_cpu(IB_MULTICAST_LID_BASE))) &&
++ 	    (dlid != be32_to_cpu(OPA_LID_PERMISSIVE)) &&
++ 	    (dlid != be16_to_cpu(IB_LID_PERMISSIVE)) &&
++ 	    (!(rdma_ah_get_ah_flags(attr) & IB_AH_GRH))) ||
++ 	    (rdma_ah_get_make_grd(attr))) {
++ 		rdma_ah_set_ah_flags(attr, IB_AH_GRH);
++ 		rdma_ah_set_interface_id(attr, OPA_MAKE_ID(dlid));
++ 		rdma_ah_set_subnet_prefix(attr, ibp->rvp.gid_prefix);
++ 	}
++ }
++ 
++ /*
++  * hfi1_check_mcast- Check if the given lid is
++  * in the OPA multicast range.
++  *
++  * The LID might either reside in ah.dlid or might be
++  * in the GRH of the address handle as DGID if extended
++  * addresses are in use.
++  */
++ static inline bool hfi1_check_mcast(u32 lid)
++ {
++ 	return ((lid >= opa_get_mcast_base(OPA_MCAST_NR)) &&
++ 		(lid != be32_to_cpu(OPA_LID_PERMISSIVE)));
++ }
++ 
++ #define opa_get_lid(lid, format)	\
++ 	__opa_get_lid(lid, OPA_PORT_PACKET_FORMAT_##format)
++ 
++ /* Convert a lid to a specific lid space */
++ static inline u32 __opa_get_lid(u32 lid, u8 format)
++ {
++ 	bool is_mcast = hfi1_check_mcast(lid);
++ 
++ 	switch (format) {
++ 	case OPA_PORT_PACKET_FORMAT_8B:
++ 	case OPA_PORT_PACKET_FORMAT_10B:
++ 		if (is_mcast)
++ 			return (lid - opa_get_mcast_base(OPA_MCAST_NR) +
++ 				0xF0000);
++ 		return lid & 0xFFFFF;
++ 	case OPA_PORT_PACKET_FORMAT_16B:
++ 		if (is_mcast)
++ 			return (lid - opa_get_mcast_base(OPA_MCAST_NR) +
++ 				0xF00000);
++ 		return lid & 0xFFFFFF;
++ 	case OPA_PORT_PACKET_FORMAT_9B:
++ 		if (is_mcast)
++ 			return (lid -
++ 				opa_get_mcast_base(OPA_MCAST_NR) +
++ 				be16_to_cpu(IB_MULTICAST_LID_BASE));
++ 		else
++ 			return lid & 0xFFFF;
++ 	default:
++ 		return lid;
++ 	}
++ }
++ 
++ /* Return true if the given lid is the OPA 16B multicast range */
++ static inline bool hfi1_is_16B_mcast(u32 lid)
++ {
++ 	return ((lid >=
++ 		opa_get_lid(opa_get_mcast_base(OPA_MCAST_NR), 16B)) &&
++ 		(lid != opa_get_lid(be32_to_cpu(OPA_LID_PERMISSIVE), 16B)));
++ }
++ 
++ static inline void hfi1_make_opa_lid(struct rdma_ah_attr *attr)
++ {
++ 	const struct ib_global_route *grh = rdma_ah_read_grh(attr);
++ 	u32 dlid = rdma_ah_get_dlid(attr);
++ 
++ 	/* Modify ah_attr.dlid to be in the 32 bit LID space.
++ 	 * This is how the address will be laid out:
++ 	 * Assuming MCAST_NR to be 4,
++ 	 * 32 bit permissive LID = 0xFFFFFFFF
++ 	 * Multicast LID range = 0xFFFFFFFE to 0xF0000000
++ 	 * Unicast LID range = 0xEFFFFFFF to 1
++ 	 * Invalid LID = 0
++ 	 */
++ 	if (ib_is_opa_gid(&grh->dgid))
++ 		dlid = opa_get_lid_from_gid(&grh->dgid);
++ 	else if ((dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) &&
++ 		 (dlid != be16_to_cpu(IB_LID_PERMISSIVE)) &&
++ 		 (dlid != be32_to_cpu(OPA_LID_PERMISSIVE)))
++ 		dlid = dlid - be16_to_cpu(IB_MULTICAST_LID_BASE) +
++ 			opa_get_mcast_base(OPA_MCAST_NR);
++ 	else if (dlid == be16_to_cpu(IB_LID_PERMISSIVE))
++ 		dlid = be32_to_cpu(OPA_LID_PERMISSIVE);
++ 
++ 	rdma_ah_set_dlid(attr, dlid);
++ }
++ 
++ static inline u8 hfi1_get_packet_type(u32 lid)
++ {
++ 	/* 9B if lid > 0xF0000000 */
++ 	if (lid >= opa_get_mcast_base(OPA_MCAST_NR))
++ 		return HFI1_PKT_TYPE_9B;
++ 
++ 	/* 16B if lid > 0xC000 */
++ 	if (lid >= opa_get_lid(opa_get_mcast_base(OPA_MCAST_NR), 9B))
++ 		return HFI1_PKT_TYPE_16B;
++ 
++ 	return HFI1_PKT_TYPE_9B;
++ }
++ 
++ static inline bool hfi1_get_hdr_type(u32 lid, struct rdma_ah_attr *attr)
++ {
++ 	/*
++ 	 * If there was an incoming 16B packet with permissive
++ 	 * LIDs, OPA GIDs would have been programmed when those
++ 	 * packets were received. A 16B packet will have to
++ 	 * be sent in response to that packet. Return a 16B
++ 	 * header type if that's the case.
++ 	 */
++ 	if (rdma_ah_get_dlid(attr) == be32_to_cpu(OPA_LID_PERMISSIVE))
++ 		return (ib_is_opa_gid(&rdma_ah_read_grh(attr)->dgid)) ?
++ 			HFI1_PKT_TYPE_16B : HFI1_PKT_TYPE_9B;
++ 
++ 	/*
++ 	 * Return a 16B header type if either the the destination
++ 	 * or source lid is extended.
++ 	 */
++ 	if (hfi1_get_packet_type(rdma_ah_get_dlid(attr)) == HFI1_PKT_TYPE_16B)
++ 		return HFI1_PKT_TYPE_16B;
++ 
++ 	return hfi1_get_packet_type(lid);
++ }
++ 
++ static inline void hfi1_make_ext_grh(struct hfi1_packet *packet,
++ 				     struct ib_grh *grh, u32 slid,
++ 				     u32 dlid)
++ {
++ 	struct hfi1_ibport *ibp = &packet->rcd->ppd->ibport_data;
++ 	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
++ 
++ 	if (!ibp)
++ 		return;
++ 
++ 	grh->hop_limit = 1;
++ 	grh->sgid.global.subnet_prefix = ibp->rvp.gid_prefix;
++ 	if (slid == opa_get_lid(be32_to_cpu(OPA_LID_PERMISSIVE), 16B))
++ 		grh->sgid.global.interface_id =
++ 			OPA_MAKE_ID(be32_to_cpu(OPA_LID_PERMISSIVE));
++ 	else
++ 		grh->sgid.global.interface_id = OPA_MAKE_ID(slid);
++ 
++ 	/*
++ 	 * Upper layers (like mad) may compare the dgid in the
++ 	 * wc that is obtained here with the sgid_index in
++ 	 * the wr. Since sgid_index in wr is always 0 for
++ 	 * extended lids, set the dgid here to the default
++ 	 * IB gid.
++ 	 */
++ 	grh->dgid.global.subnet_prefix = ibp->rvp.gid_prefix;
++ 	grh->dgid.global.interface_id =
++ 		cpu_to_be64(ppd->guids[HFI1_PORT_GUID_INDEX]);
++ }
++ 
++ static inline int hfi1_get_16b_padding(u32 hdr_size, u32 payload)
++ {
++ 	return -(hdr_size + payload + (SIZE_OF_CRC << 2) +
++ 		     SIZE_OF_LT) & 0x7;
++ }
++ 
++ static inline void hfi1_make_ib_hdr(struct ib_header *hdr,
++ 				    u16 lrh0, u16 len,
++ 				    u16 dlid, u16 slid)
++ {
++ 	hdr->lrh[0] = cpu_to_be16(lrh0);
++ 	hdr->lrh[1] = cpu_to_be16(dlid);
++ 	hdr->lrh[2] = cpu_to_be16(len);
++ 	hdr->lrh[3] = cpu_to_be16(slid);
++ }
++ 
++ static inline void hfi1_make_16b_hdr(struct hfi1_16b_header *hdr,
++ 				     u32 slid, u32 dlid,
++ 				     u16 len, u16 pkey,
++ 				     u8 becn, u8 fecn, u8 l4,
++ 				     u8 sc)
++ {
++ 	u32 lrh0 = 0;
++ 	u32 lrh1 = 0x40000000;
++ 	u32 lrh2 = 0;
++ 	u32 lrh3 = 0;
++ 
++ 	lrh0 = (lrh0 & ~OPA_16B_BECN_MASK) | (becn << OPA_16B_BECN_SHIFT);
++ 	lrh0 = (lrh0 & ~OPA_16B_LEN_MASK) | (len << OPA_16B_LEN_SHIFT);
++ 	lrh0 = (lrh0 & ~OPA_16B_LID_MASK)  | (slid & OPA_16B_LID_MASK);
++ 	lrh1 = (lrh1 & ~OPA_16B_FECN_MASK) | (fecn << OPA_16B_FECN_SHIFT);
++ 	lrh1 = (lrh1 & ~OPA_16B_SC_MASK) | (sc << OPA_16B_SC_SHIFT);
++ 	lrh1 = (lrh1 & ~OPA_16B_LID_MASK) | (dlid & OPA_16B_LID_MASK);
++ 	lrh2 = (lrh2 & ~OPA_16B_SLID_MASK) |
++ 		((slid >> OPA_16B_SLID_SHIFT) << OPA_16B_SLID_HIGH_SHIFT);
++ 	lrh2 = (lrh2 & ~OPA_16B_DLID_MASK) |
++ 		((dlid >> OPA_16B_DLID_SHIFT) << OPA_16B_DLID_HIGH_SHIFT);
++ 	lrh2 = (lrh2 & ~OPA_16B_PKEY_MASK) | (pkey << OPA_16B_PKEY_SHIFT);
++ 	lrh2 = (lrh2 & ~OPA_16B_L4_MASK) | l4;
++ 
++ 	hdr->lrh[0] = lrh0;
++ 	hdr->lrh[1] = lrh1;
++ 	hdr->lrh[2] = lrh2;
++ 	hdr->lrh[3] = lrh3;
++ }
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  #endif                          /* _HFI1_KERNEL_H */
+diff --cc drivers/infiniband/hw/hfi1/mad.c
+index d59426fb9866,1509bc6b76d8..000000000000
+--- a/drivers/infiniband/hw/hfi1/mad.c
++++ b/drivers/infiniband/hw/hfi1/mad.c
+@@@ -180,37 -349,53 +180,49 @@@ static void send_trap(struct hfi1_ibpor
+  }
+  
+  /*
+ - * Send a bad P_Key trap (ch. 14.3.8).
+ + * Send a bad [PQ]_Key trap (ch. 14.3.8).
+   */
+++<<<<<<< HEAD
+ +void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+ +		    u32 qp1, u32 qp2, u16 lid1, u16 lid2)
+++=======
++ void hfi1_bad_pkey(struct hfi1_ibport *ibp, u32 key, u32 sl,
++ 		   u32 qp1, u32 qp2, u32 lid1, u32 lid2)
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  {
+ -	struct trap_node *trap;
+ +	struct opa_mad_notice_attr data;
+  	u32 lid = ppd_from_ibp(ibp)->lid;
+- 	u32 _lid1 = lid1;
+- 	u32 _lid2 = lid2;
+  
+ -	ibp->rvp.n_pkt_drops++;
+ -	ibp->rvp.pkey_violations++;
+ +	memset(&data, 0, sizeof(data));
+  
+ -	trap = create_trap_node(IB_NOTICE_TYPE_SECURITY, OPA_TRAP_BAD_P_KEY,
+ -				lid);
+ -	if (!trap)
+ -		return;
+ +	if (trap_num == OPA_TRAP_BAD_P_KEY)
+ +		ibp->rvp.pkey_violations++;
+ +	else
+ +		ibp->rvp.qkey_violations++;
+ +	ibp->rvp.n_pkt_drops++;
+  
+  	/* Send violation trap */
+++<<<<<<< HEAD
+ +	data.generic_type = IB_NOTICE_TYPE_SECURITY;
+ +	data.prod_type_lsb = IB_NOTICE_PROD_CA;
+ +	data.trap_num = trap_num;
+ +	data.issuer_lid = cpu_to_be32(lid);
+ +	data.ntc_257_258.lid1 = cpu_to_be32(_lid1);
+ +	data.ntc_257_258.lid2 = cpu_to_be32(_lid2);
+ +	data.ntc_257_258.key = cpu_to_be32(key);
+ +	data.ntc_257_258.sl = sl << 3;
+ +	data.ntc_257_258.qp1 = cpu_to_be32(qp1);
+ +	data.ntc_257_258.qp2 = cpu_to_be32(qp2);
+++=======
++ 	trap->data.ntc_257_258.lid1 = cpu_to_be32(lid1);
++ 	trap->data.ntc_257_258.lid2 = cpu_to_be32(lid2);
++ 	trap->data.ntc_257_258.key = cpu_to_be32(key);
++ 	trap->data.ntc_257_258.sl = sl << 3;
++ 	trap->data.ntc_257_258.qp1 = cpu_to_be32(qp1);
++ 	trap->data.ntc_257_258.qp2 = cpu_to_be32(qp2);
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  
+ -	trap->len = sizeof(trap->data);
+ -	send_trap(ibp, trap);
+ +	send_trap(ibp, &data, sizeof(data));
+  }
+  
+  /*
+diff --cc drivers/infiniband/hw/hfi1/ud.c
+index 45bc3f04793e,2ba74fdd6f15..000000000000
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@@ -67,8 -73,9 +73,9 @@@ static void ud_loopback(struct rvt_qp *
+  {
+  	struct hfi1_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+  	struct hfi1_pportdata *ppd;
++ 	struct hfi1_qp_priv *priv = sqp->priv;
+  	struct rvt_qp *qp;
+ -	struct rdma_ah_attr *ah_attr;
+ +	struct ib_ah_attr *ah_attr;
+  	unsigned long flags;
+  	struct rvt_sge_state ssge;
+  	struct rvt_sge *sge;
+@@@ -102,18 -109,19 +109,23 @@@
+  
+  	if (qp->ibqp.qp_num > 1) {
+  		u16 pkey;
+++<<<<<<< HEAD
+ +		u16 slid;
+ +		u8 sc5 = ibp->sl_to_sc[ah_attr->sl];
+++=======
++ 		u32 slid;
++ 		u8 sc5 = ibp->sl_to_sc[rdma_ah_get_sl(ah_attr)];
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  
+  		pkey = hfi1_get_pkey(ibp, sqp->s_pkey_index);
+ -		slid = ppd->lid | (rdma_ah_get_path_bits(ah_attr) &
+ +		slid = ppd->lid | (ah_attr->src_path_bits &
+  				   ((1 << ppd->lmc) - 1));
+  		if (unlikely(ingress_pkey_check(ppd, pkey, sc5,
+ -						qp->s_pkey_index,
+ -						slid, false))) {
+ -			hfi1_bad_pkey(ibp, pkey,
+ -				      rdma_ah_get_sl(ah_attr),
+ -				      sqp->ibqp.qp_num, qp->ibqp.qp_num,
+ -				      slid, rdma_ah_get_dlid(ah_attr));
+ +						qp->s_pkey_index, slid))) {
+ +			hfi1_bad_pqkey(ibp, OPA_TRAP_BAD_P_KEY, pkey,
+ +				       ah_attr->sl,
+ +				       sqp->ibqp.qp_num, qp->ibqp.qp_num,
+ +				       slid, ah_attr->dlid);
+  			goto drop;
+  		}
+  	}
+@@@ -183,10 -181,34 +195,39 @@@
+  		goto bail_unlock;
+  	}
+  
+ -	if (rdma_ah_get_ah_flags(ah_attr) & IB_AH_GRH) {
+ +	if (ah_attr->ah_flags & IB_AH_GRH) {
+  		struct ib_grh grh;
+++<<<<<<< HEAD
+ +		struct ib_global_route grd = ah_attr->grh;
+ +
+++=======
++ 		struct ib_global_route grd = *(rdma_ah_read_grh(ah_attr));
++ 
++ 		/*
++ 		 * For loopback packets with extended LIDs, the
++ 		 * sgid_index in the GRH is 0 and the dgid is
++ 		 * OPA GID of the sender. While creating a response
++ 		 * to the loopback packet, IB core creates the new
++ 		 * sgid_index from the DGID and that will be the
++ 		 * OPA_GID_INDEX. The new dgid is from the sgid
++ 		 * index and that will be in the IB GID format.
++ 		 *
++ 		 * We now have a case where the sent packet had a
++ 		 * different sgid_index and dgid compared to the
++ 		 * one that was received in response.
++ 		 *
++ 		 * Fix this inconsistency.
++ 		 */
++ 		if (priv->hdr_type == HFI1_PKT_TYPE_16B) {
++ 			if (grd.sgid_index == 0)
++ 				grd.sgid_index = OPA_GID_INDEX;
++ 
++ 			if (ib_is_opa_gid(&grd.dgid))
++ 				grd.dgid.global.interface_id =
++ 				cpu_to_be64(ppd->guids[HFI1_PORT_GUID_INDEX]);
++ 		}
++ 
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  		hfi1_make_grh(ibp, &grh, &grd, 0, 0);
+  		hfi1_copy_sge(&qp->r_sge, &grh,
+  			      sizeof(grh), true, false);
+@@@ -243,7 -265,8 +284,12 @@@
+  	} else {
+  		wc.pkey_index = 0;
+  	}
+++<<<<<<< HEAD
+ +	wc.slid = ppd->lid | (ah_attr->src_path_bits & ((1 << ppd->lmc) - 1));
+++=======
++ 	wc.slid = ppd->lid | (rdma_ah_get_path_bits(ah_attr) &
++ 				   ((1 << ppd->lmc) - 1));
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  	/* Check for loopback when the port lid is not set */
+  	if (wc.slid == 0 && sqp->ibqp.qp_type == IB_QPT_GSI)
+  		wc.slid = be16_to_cpu(IB_LID_PERMISSIVE);
+@@@ -271,8 -471,7 +494,12 @@@ void hfi1_make_ud_req_16B(struct rvt_q
+  int hfi1_make_ud_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+  {
+  	struct hfi1_qp_priv *priv = qp->priv;
+++<<<<<<< HEAD
+ +	struct ib_other_headers *ohdr;
+ +	struct ib_ah_attr *ah_attr;
+++=======
++ 	struct rdma_ah_attr *ah_attr;
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  	struct hfi1_pportdata *ppd;
+  	struct hfi1_ibport *ibp;
+  	struct rvt_swqe *wqe;
+@@@ -319,13 -513,14 +541,20 @@@
+  	ibp = to_iport(qp->ibqp.device, qp->port_num);
+  	ppd = ppd_from_ibp(ibp);
+  	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
+++<<<<<<< HEAD
+ +	if (ah_attr->dlid < be16_to_cpu(IB_MULTICAST_LID_BASE) ||
+ +	    ah_attr->dlid == be16_to_cpu(IB_LID_PERMISSIVE)) {
+ +		lid = ah_attr->dlid & ~((1 << ppd->lmc) - 1);
+++=======
++ 	priv->hdr_type = hfi1_get_hdr_type(ppd->lid, ah_attr);
++ 	if ((!hfi1_check_mcast(rdma_ah_get_dlid(ah_attr))) ||
++ 	    (rdma_ah_get_dlid(ah_attr) == be32_to_cpu(OPA_LID_PERMISSIVE))) {
++ 		lid = rdma_ah_get_dlid(ah_attr) & ~((1 << ppd->lmc) - 1);
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  		if (unlikely(!loopback &&
+- 			     (lid == ppd->lid ||
+- 			      (lid == be16_to_cpu(IB_LID_PERMISSIVE) &&
+- 			      qp->ibqp.qp_type == IB_QPT_GSI)))) {
++ 			     ((lid == ppd->lid) ||
++ 			      ((lid == be32_to_cpu(OPA_LID_PERMISSIVE)) &&
++ 			       (qp->ibqp.qp_type == IB_QPT_GSI))))) {
+  			unsigned long tflags = ps->flags;
+  			/*
+  			 * If DMAs are in progress, we can't generate
+@@@ -349,14 -544,9 +578,9 @@@
+  	}
+  
+  	qp->s_cur = next_cur;
+- 	extra_bytes = -wqe->length & 3;
+- 	nwords = (wqe->length + extra_bytes) >> 2;
+- 
+- 	/* header size in 32-bit words LRH+BTH+DETH = (8+12+8)/4. */
+- 	qp->s_hdrwords = 7;
+  	ps->s_txreq->s_cur_size = wqe->length;
+  	ps->s_txreq->ss = &qp->s_sge;
+ -	qp->s_srate = rdma_ah_get_static_rate(ah_attr);
+ +	qp->s_srate = ah_attr->static_rate;
+  	qp->srate_mbps = ib_rate_to_mbps(qp->s_srate);
+  	qp->s_wqe = wqe;
+  	qp->s_sge.sge = wqe->sg_list[0];
+@@@ -364,75 -554,12 +588,83 @@@
+  	qp->s_sge.num_sge = wqe->wr.num_sge;
+  	qp->s_sge.total_len = wqe->length;
+  
+++<<<<<<< HEAD
+ +	if (ah_attr->ah_flags & IB_AH_GRH) {
+ +		/* Header size in 32-bit words. */
+ +		qp->s_hdrwords += hfi1_make_grh(ibp,
+ +						&ps->s_txreq->phdr.hdr.u.l.grh,
+ +						&ah_attr->grh,
+ +						qp->s_hdrwords, nwords);
+ +		lrh0 = HFI1_LRH_GRH;
+ +		ohdr = &ps->s_txreq->phdr.hdr.u.l.oth;
+ +		/*
+ +		 * Don't worry about sending to locally attached multicast
+ +		 * QPs.  It is unspecified by the spec. what happens.
+ +		 */
+ +	} else {
+ +		/* Header size in 32-bit words. */
+ +		lrh0 = HFI1_LRH_BTH;
+ +		ohdr = &ps->s_txreq->phdr.hdr.u.oth;
+ +	}
+ +	if (wqe->wr.opcode == IB_WR_SEND_WITH_IMM) {
+ +		qp->s_hdrwords++;
+ +		ohdr->u.ud.imm_data = wqe->wr.ex.imm_data;
+ +		bth0 = IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE << 24;
+ +	} else {
+ +		bth0 = IB_OPCODE_UD_SEND_ONLY << 24;
+ +	}
+ +	sc5 = ibp->sl_to_sc[ah_attr->sl];
+ +	lrh0 |= (ah_attr->sl & 0xf) << 4;
+ +	if (qp->ibqp.qp_type == IB_QPT_SMI) {
+ +		lrh0 |= 0xF000; /* Set VL (see ch. 13.5.3.1) */
+ +		priv->s_sc = 0xf;
+ +	} else {
+ +		lrh0 |= (sc5 & 0xf) << 12;
+ +		priv->s_sc = sc5;
+ +	}
+++=======
++ 	/* Make the appropriate header */
++ 	hfi1_make_ud_req_tbl[priv->hdr_type](qp, ps, qp->s_wqe);
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  	priv->s_sde = qp_to_sdma_engine(qp, priv->s_sc);
+  	ps->s_txreq->sde = priv->s_sde;
+  	priv->s_sendcontext = qp_to_send_context(qp, priv->s_sc);
+  	ps->s_txreq->psc = priv->s_sendcontext;
+++<<<<<<< HEAD
+ +	ps->s_txreq->phdr.hdr.lrh[0] = cpu_to_be16(lrh0);
+ +	ps->s_txreq->phdr.hdr.lrh[1] = cpu_to_be16(ah_attr->dlid);
+ +	ps->s_txreq->phdr.hdr.lrh[2] =
+ +		cpu_to_be16(qp->s_hdrwords + nwords + SIZE_OF_CRC);
+ +	if (ah_attr->dlid == be16_to_cpu(IB_LID_PERMISSIVE)) {
+ +		ps->s_txreq->phdr.hdr.lrh[3] = IB_LID_PERMISSIVE;
+ +	} else {
+ +		lid = ppd->lid;
+ +		if (lid) {
+ +			lid |= ah_attr->src_path_bits & ((1 << ppd->lmc) - 1);
+ +			ps->s_txreq->phdr.hdr.lrh[3] = cpu_to_be16(lid);
+ +		} else {
+ +			ps->s_txreq->phdr.hdr.lrh[3] = IB_LID_PERMISSIVE;
+ +		}
+ +	}
+ +	if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+ +		bth0 |= IB_BTH_SOLICITED;
+ +	bth0 |= extra_bytes << 20;
+ +	if (qp->ibqp.qp_type == IB_QPT_GSI || qp->ibqp.qp_type == IB_QPT_SMI)
+ +		bth0 |= hfi1_get_pkey(ibp, wqe->ud_wr.pkey_index);
+ +	else
+ +		bth0 |= hfi1_get_pkey(ibp, qp->s_pkey_index);
+ +	ohdr->bth[0] = cpu_to_be32(bth0);
+ +	ohdr->bth[1] = cpu_to_be32(wqe->ud_wr.remote_qpn);
+ +	ohdr->bth[2] = cpu_to_be32(mask_psn(wqe->psn));
+ +	/*
+ +	 * Qkeys with the high order bit set mean use the
+ +	 * qkey from the QP context instead of the WR (see 10.2.5).
+ +	 */
+ +	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
+ +					 qp->qkey : wqe->ud_wr.remote_qkey);
+ +	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+++=======
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  	/* disarm any ahg */
+  	priv->s_ahg->ahgcount = 0;
+  	priv->s_ahg->ahgidx = 0;
+@@@ -540,13 -725,9 +830,9 @@@ void return_cnp(struct hfi1_ibport *ibp
+  	ohdr->bth[1] = cpu_to_be32(remote_qpn | (1 << IB_BECN_SHIFT));
+  	ohdr->bth[2] = 0; /* PSN 0 */
+  
+- 	hdr.lrh[0] = cpu_to_be16(lrh0);
+- 	hdr.lrh[1] = cpu_to_be16(dlid);
+- 	hdr.lrh[2] = cpu_to_be16(hwords + SIZE_OF_CRC);
+- 	hdr.lrh[3] = cpu_to_be16(slid);
+- 
++ 	hfi1_make_ib_hdr(&hdr, lrh0, hwords + SIZE_OF_CRC, dlid, slid);
+  	plen = 2 /* PBC */ + hwords;
+ -	pbc_flags |= (ib_is_sc5(sc5) << PBC_DC_INFO_SHIFT);
+ +	pbc_flags |= (!!(sc5 & 0x10)) << PBC_DC_INFO_SHIFT;
+  	vl = sc_to_vlt(ppd->dd, sc5);
+  	pbc = create_pbc(ppd, pbc_flags, qp->srate_mbps, vl, plen);
+  	if (ctxt) {
+@@@ -675,27 -855,36 +961,57 @@@ void hfi1_ud_rcv(struct hfi1_packet *pa
+  	struct hfi1_ibport *ibp = rcd_to_iport(packet->rcd);
+  	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+  	struct ib_header *hdr = packet->hdr;
+ -	void *data = packet->payload;
+ +	u32 rcv_flags = packet->rcv_flags;
+ +	void *data = packet->ebuf;
+  	u32 tlen = packet->tlen;
+  	struct rvt_qp *qp = packet->qp;
+++<<<<<<< HEAD
+ +	bool has_grh = rcv_flags & HFI1_HAS_GRH;
+ +	u8 sc5 = hfi1_9B_get_sc5(hdr, packet->rhf);
+ +	u32 bth1;
+ +	u8 sl_from_sc, sl;
+ +	u16 slid;
+ +	u8 extra_bytes;
+ +
+ +	qkey = be32_to_cpu(ohdr->u.ud.deth[0]);
+ +	src_qp = be32_to_cpu(ohdr->u.ud.deth[1]) & RVT_QPN_MASK;
+ +	dlid = ib_get_dlid(hdr);
+ +	bth1 = be32_to_cpu(ohdr->bth[1]);
+ +	slid = ib_get_slid(hdr);
+ +	pkey = ib_bth_get_pkey(ohdr);
+ +	opcode = ib_bth_get_opcode(ohdr);
+ +	sl = ib_get_sl(hdr);
+ +	extra_bytes = ib_bth_get_pad(ohdr);
+ +	extra_bytes += (SIZE_OF_CRC << 2);
+++=======
++ 	u8 sc5 = packet->sc;
++ 	u8 sl_from_sc;
++ 	u8 opcode = packet->opcode;
++ 	u8 sl = packet->sl;
++ 	u32 dlid = packet->dlid;
++ 	u32 slid = packet->slid;
++ 	u8 extra_bytes;
++ 	bool dlid_is_permissive;
++ 	bool slid_is_permissive;
++ 
++ 	extra_bytes = packet->pad + packet->extra_byte + (SIZE_OF_CRC << 2);
++ 	qkey = ib_get_qkey(ohdr);
++ 	src_qp = ib_get_sqpn(ohdr);
++ 
++ 	if (packet->etype == RHF_RCV_TYPE_BYPASS) {
++ 		u32 permissive_lid =
++ 			opa_get_lid(be32_to_cpu(OPA_LID_PERMISSIVE), 16B);
++ 
++ 		pkey = hfi1_16B_get_pkey(packet->hdr);
++ 		dlid_is_permissive = (dlid == permissive_lid);
++ 		slid_is_permissive = (slid == permissive_lid);
++ 	} else {
++ 		hdr = packet->hdr;
++ 		pkey = ib_bth_get_pkey(ohdr);
++ 		dlid_is_permissive = (dlid == be16_to_cpu(IB_LID_PERMISSIVE));
++ 		slid_is_permissive = (slid == be16_to_cpu(IB_LID_PERMISSIVE));
++ 	}
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  	sl_from_sc = ibp->sc_to_sl[sc5];
+  
+  	process_ecn(qp, packet, (opcode != IB_OPCODE_CNP));
+@@@ -808,8 -992,19 +1122,24 @@@
+  		qp->r_flags |= RVT_R_REUSE_SGE;
+  		goto drop;
+  	}
+++<<<<<<< HEAD
+ +	if (has_grh) {
+ +		hfi1_copy_sge(&qp->r_sge, &hdr->u.l.grh,
+++=======
++ 	if (packet->grh) {
++ 		hfi1_copy_sge(&qp->r_sge, packet->grh,
++ 			      sizeof(struct ib_grh), true, false);
++ 		wc.wc_flags |= IB_WC_GRH;
++ 	} else if (packet->etype == RHF_RCV_TYPE_BYPASS) {
++ 		struct ib_grh grh;
++ 		/*
++ 		 * Assuming we only created 16B on the send side
++ 		 * if we want to use large LIDs, since GRH was stripped
++ 		 * out when creating 16B, add back the GRH here.
++ 		 */
++ 		hfi1_make_ext_grh(packet, &grh, slid, dlid);
++ 		hfi1_copy_sge(&qp->r_sge, &grh,
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  			      sizeof(struct ib_grh), true, false);
+  		wc.wc_flags |= IB_WC_GRH;
+  	} else {
+diff --cc drivers/infiniband/hw/hfi1/verbs.h
+index 76081f770f70,4928ee4f92c1..000000000000
+--- a/drivers/infiniband/hw/hfi1/verbs.h
++++ b/drivers/infiniband/hw/hfi1/verbs.h
+@@@ -236,8 -258,8 +236,13 @@@ static inline int hfi1_send_ok(struct r
+  /*
+   * This must be called with s_lock held.
+   */
+++<<<<<<< HEAD
+ +void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+ +		    u32 qp1, u32 qp2, u16 lid1, u16 lid2);
+++=======
++ void hfi1_bad_pkey(struct hfi1_ibport *ibp, u32 key, u32 sl,
++ 		   u32 qp1, u32 qp2, u32 lid1, u32 lid2);
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  void hfi1_cap_mask_chg(struct rvt_dev_info *rdi, u8 port_num);
+  void hfi1_sys_guid_chg(struct hfi1_ibport *ibp);
+  void hfi1_node_desc_chg(struct hfi1_ibport *ibp);
+diff --cc include/rdma/opa_addr.h
+index eace28f1555d,e6e90f18e6d5..000000000000
+--- a/include/rdma/opa_addr.h
++++ b/include/rdma/opa_addr.h
+@@@ -48,8 -48,21 +48,22 @@@
+  #ifndef OPA_ADDR_H
+  #define OPA_ADDR_H
+  
+ -#include <rdma/opa_smi.h>
+ -
+  #define	OPA_SPECIAL_OUI		(0x00066AULL)
+  #define OPA_MAKE_ID(x)          (cpu_to_be64(OPA_SPECIAL_OUI << 40 | (x)))
+++<<<<<<< HEAD
+++=======
++ #define OPA_TO_IB_UCAST_LID(x) (((x) >= be16_to_cpu(IB_MULTICAST_LID_BASE)) \
++ 				? 0 : x)
++ #define OPA_GID_INDEX		0x1
++ /**
++  * 0xF8 - 4 bits of multicast range and 1 bit for collective range
++  * Example: For 24 bit LID space,
++  * Multicast range: 0xF00000 to 0xF7FFFF
++  * Collective range: 0xF80000 to 0xFFFFFE
++  */
++ #define OPA_MCAST_NR 0x4 /* Number of top bits set */
++ #define OPA_COLLECTIVE_NR 0x1 /* Number of bits after MCAST_NR */
+++>>>>>>> 88733e3b8450 (IB/hfi1: Add 16B UD support)
+  
+  /**
+   * ib_is_opa_gid: Returns true if the top 24 bits of the gid
+* Unmerged path drivers/infiniband/hw/hfi1/driver.c
+* Unmerged path drivers/infiniband/hw/hfi1/hfi.h
+* Unmerged path drivers/infiniband/hw/hfi1/mad.c
+diff --git a/drivers/infiniband/hw/hfi1/ruc.c b/drivers/infiniband/hw/hfi1/ruc.c
+index 675f4ef89dc3..8321e415451b 100644
+--- a/drivers/infiniband/hw/hfi1/ruc.c
++++ b/drivers/infiniband/hw/hfi1/ruc.c
+@@ -633,7 +633,7 @@ done:
+  * @ibp: a pointer to the IB port
+  * @hdr: a pointer to the GRH header being constructed
+  * @grh: the global route address to send to
+- * @hwords: the number of 32 bit words of header being sent
++ * @hwords: size of header after grh being sent in dwords
+  * @nwords: the number of 32 bit words of data being sent
+  *
+  * Return the size of the header in 32 bit words.
+@@ -645,7 +645,7 @@ u32 hfi1_make_grh(struct hfi1_ibport *ibp, struct ib_grh *hdr,
+ 		cpu_to_be32((IB_GRH_VERSION << IB_GRH_VERSION_SHIFT) |
+ 			    (grh->traffic_class << IB_GRH_TCLASS_SHIFT) |
+ 			    (grh->flow_label << IB_GRH_FLOW_SHIFT));
+-	hdr->paylen = cpu_to_be16((hwords - 2 + nwords + SIZE_OF_CRC) << 2);
++	hdr->paylen = cpu_to_be16((hwords + nwords) << 2);
+ 	/* next_hdr is defined by C8-7 in ch. 8.4.1 */
+ 	hdr->next_hdr = IB_GRH_NEXT_HDR;
+ 	hdr->hop_limit = grh->hop_limit;
+* Unmerged path drivers/infiniband/hw/hfi1/ud.c
+* Unmerged path drivers/infiniband/hw/hfi1/verbs.h
+* Unmerged path include/rdma/opa_addr.h
