@@ -1,0 +1,245 @@
+NTB: Address out of DMA descriptor issue with NTB
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] Address out of DMA descriptor issue with NTB (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 94.62%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 8c874cc140d667f84ae4642bb5b5e0d6396d2ca4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8c874cc1.failed
+
+The transport right now does not handle the case where we run out of DMA
+descriptors. We just fail when we do not succeed. Adding code to retry for
+a bit attempting to use the DMA engine instead of instantly fail to CPU
+copy.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Reviewed-by: Allen Hubbe <Allen.Hubbe@emc.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit 8c874cc140d667f84ae4642bb5b5e0d6396d2ca4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index cc39efa77597,ec4775f0ec16..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -200,11 -242,24 +202,13 @@@ enum 
+  	MAX_SPAD,
+  };
+  
+ -#define dev_client_dev(__dev) \
+ -	container_of((__dev), struct ntb_transport_client_dev, dev)
+ -
+ -#define drv_client(__drv) \
+ -	container_of((__drv), struct ntb_transport_client, driver)
+ -
+ -#define QP_TO_MW(nt, qp)	((qp) % nt->mw_count)
+ +#define QP_TO_MW(ndev, qp)	((qp) % ntb_max_mw(ndev))
+  #define NTB_QP_DEF_NUM_ENTRIES	100
+  #define NTB_LINK_DOWN_TIMEOUT	10
++ #define DMA_RETRIES		20
++ #define DMA_OUT_RESOURCE_TO	50
+  
+ -static void ntb_transport_rxc_db(unsigned long data);
+ -static const struct ntb_ctx_ops ntb_transport_ops;
+ -static struct ntb_client ntb_transport_client;
+ -
+ -static int ntb_transport_bus_match(struct device *dev,
+ -				   struct device_driver *drv)
+ +static int ntb_match_bus(struct device *dev, struct device_driver *drv)
+  {
+  	return !strncmp(dev_name(dev), drv->name, strlen(drv->name));
+  }
+@@@ -449,15 -494,38 +453,27 @@@ static ssize_t debugfs_read(struct fil
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+  			       "tx_err_no_buf - %llu\n", qp->tx_err_no_buf);
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "tx_mw - \t0x%p\n", qp->tx_mw);
+ +			       "tx_mw - \t%p\n", qp->tx_mw);
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "tx_index (H) - \t%u\n", qp->tx_index);
+ -	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "RRI (T) - \t%u\n",
+ -			       qp->remote_rx_info->entry);
+ +			       "tx_index - \t%u\n", qp->tx_index);
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+  			       "tx_max_entry - \t%u\n", qp->tx_max_entry);
+++<<<<<<< HEAD
+++=======
++ 	out_offset += snprintf(buf + out_offset, out_count - out_offset,
++ 			       "free tx - \t%u\n",
++ 			       ntb_transport_tx_free_entry(qp));
++ 	out_offset += snprintf(buf + out_offset, out_count - out_offset,
++ 			       "DMA tx prep err - \t%llu\n",
++ 			       qp->dma_tx_prep_err);
++ 	out_offset += snprintf(buf + out_offset, out_count - out_offset,
++ 			       "DMA rx prep err - \t%llu\n",
++ 			       qp->dma_rx_prep_err);
+++>>>>>>> 8c874cc140d6 (NTB: Address out of DMA descriptor issue with NTB)
+  
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "\n");
+ -	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "Using TX DMA - \t%s\n",
+ -			       qp->tx_dma_chan ? "Yes" : "No");
+ -	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "Using RX DMA - \t%s\n",
+ -			       qp->rx_dma_chan ? "Yes" : "No");
+ -	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "QP Link - \t%s\n",
+ -			       qp->link_is_up ? "Up" : "Down");
+ -	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+ -			       "\n");
+ -
+ +			       "\nQP Link %s\n", (qp->qp_link == NTB_LINK_UP) ?
+ +			       "Up" : "Down");
+  	if (out_offset > out_count)
+  		out_offset = out_count;
+  
+@@@ -599,21 -716,42 +615,48 @@@ static int ntb_set_mw(struct ntb_transp
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ntb_qp_link_down_reset(struct ntb_transport_qp *qp)
++ {
++ 	qp->link_is_up = false;
++ 
++ 	qp->tx_index = 0;
++ 	qp->rx_index = 0;
++ 	qp->rx_bytes = 0;
++ 	qp->rx_pkts = 0;
++ 	qp->rx_ring_empty = 0;
++ 	qp->rx_err_no_buf = 0;
++ 	qp->rx_err_oflow = 0;
++ 	qp->rx_err_ver = 0;
++ 	qp->rx_memcpy = 0;
++ 	qp->rx_async = 0;
++ 	qp->tx_bytes = 0;
++ 	qp->tx_pkts = 0;
++ 	qp->tx_ring_full = 0;
++ 	qp->tx_err_no_buf = 0;
++ 	qp->tx_memcpy = 0;
++ 	qp->tx_async = 0;
++ 	qp->dma_tx_prep_err = 0;
++ 	qp->dma_rx_prep_err = 0;
++ }
++ 
+++>>>>>>> 8c874cc140d6 (NTB: Address out of DMA descriptor issue with NTB)
+  static void ntb_qp_link_cleanup(struct ntb_transport_qp *qp)
+  {
+ -	struct ntb_transport_ctx *nt = qp->transport;
+ -	struct pci_dev *pdev = nt->ndev->pdev;
+ -
+ -	dev_info(&pdev->dev, "qp %d: Link Cleanup\n", qp->qp_num);
+ +	struct ntb_transport *nt = qp->transport;
+ +	struct pci_dev *pdev = ntb_query_pdev(nt->ndev);
+  
+ -	cancel_delayed_work_sync(&qp->link_work);
+ -	ntb_qp_link_down_reset(qp);
+ +	if (qp->qp_link == NTB_LINK_DOWN) {
+ +		cancel_delayed_work_sync(&qp->link_work);
+ +		return;
+ +	}
+  
+  	if (qp->event_handler)
+ -		qp->event_handler(qp->cb_data, qp->link_is_up);
+ +		qp->event_handler(qp->cb_data, NTB_LINK_DOWN);
+ +
+ +	dev_info(&pdev->dev, "qp %d: Link Down\n", qp->qp_num);
+ +	qp->qp_link = NTB_LINK_DOWN;
+  }
+  
+  static void ntb_qp_link_cleanup_work(struct work_struct *work)
+@@@ -1068,9 -1240,9 +1111,13 @@@ static void ntb_async_rx(struct ntb_que
+  	struct dmaengine_unmap_data *unmap;
+  	dma_cookie_t cookie;
+  	void *buf = entry->buf;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
++ 	int retries = 0;
+++>>>>>>> 8c874cc140d6 (NTB: Address out of DMA descriptor issue with NTB)
+  
+ -	len = entry->len;
+ +	entry->len = len;
+  
+  	if (!chan)
+  		goto err;
+@@@ -1104,12 -1276,21 +1151,29 @@@
+  
+  	unmap->from_cnt = 1;
+  
+++<<<<<<< HEAD
+ +	flags = DMA_COMPL_SKIP_SRC_UNMAP | DMA_COMPL_SKIP_DEST_UNMAP |
+ +		DMA_PREP_INTERRUPT;
+ +	txd = device->device_prep_dma_memcpy(chan, unmap->addr[1],
+ +					     unmap->addr[0], len, flags);
+ +	if (!txd)
+++=======
++ 	for (retries = 0; retries < DMA_RETRIES; retries++) {
++ 		txd = device->device_prep_dma_memcpy(chan, unmap->addr[1],
++ 						     unmap->addr[0], len,
++ 						     DMA_PREP_INTERRUPT);
++ 		if (txd)
++ 			break;
++ 
++ 		set_current_state(TASK_INTERRUPTIBLE);
++ 		schedule_timeout(DMA_OUT_RESOURCE_TO);
++ 	}
++ 
++ 	if (!txd) {
++ 		qp->dma_rx_prep_err++;
+++>>>>>>> 8c874cc140d6 (NTB: Address out of DMA descriptor issue with NTB)
+  		goto err_get_unmap;
++ 	}
+  
+  	txd->callback = ntb_rx_copy_callback;
+  	txd->callback_param = entry;
+@@@ -1292,7 -1483,7 +1356,11 @@@ static void ntb_async_tx(struct ntb_tra
+  	void __iomem *offset;
+  	size_t len = entry->len;
+  	void *buf = entry->buf;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
++ 	int retries = 0;
+++>>>>>>> 8c874cc140d6 (NTB: Address out of DMA descriptor issue with NTB)
+  
+  	offset = qp->tx_mw + qp->tx_max_frame * qp->tx_index;
+  	hdr = offset + qp->tx_max_frame - sizeof(struct ntb_payload_header);
+@@@ -1327,12 -1518,20 +1395,28 @@@
+  
+  	unmap->to_cnt = 1;
+  
+++<<<<<<< HEAD
+ +	flags = DMA_COMPL_SKIP_SRC_UNMAP | DMA_COMPL_SKIP_DEST_UNMAP |
+ +		DMA_PREP_INTERRUPT;
+ +	txd = device->device_prep_dma_memcpy(chan, dest, unmap->addr[0], len,
+ +					    flags);
+ +	if (!txd)
+++=======
++ 	for (retries = 0; retries < DMA_RETRIES; retries++) {
++ 		txd = device->device_prep_dma_memcpy(chan, dest, unmap->addr[0],
++ 						     len, DMA_PREP_INTERRUPT);
++ 		if (txd)
++ 			break;
++ 
++ 		set_current_state(TASK_INTERRUPTIBLE);
++ 		schedule_timeout(DMA_OUT_RESOURCE_TO);
++ 	}
++ 
++ 	if (!txd) {
++ 		qp->dma_tx_prep_err++;
+++>>>>>>> 8c874cc140d6 (NTB: Address out of DMA descriptor issue with NTB)
+  		goto err_get_unmap;
++ 	}
+  
+  	txd->callback = ntb_tx_copy_callback;
+  	txd->callback_param = entry;
+* Unmerged path drivers/ntb/ntb_transport.c
