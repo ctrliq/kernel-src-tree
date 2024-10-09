@@ -1,0 +1,182 @@
+cpuset: use effective cpumask to build sched domains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Li Zefan <lizefan@huawei.com>
+commit 8b5f1c52dcd1accd3a940cfcb148bef6de589524
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8b5f1c52.failed
+
+We're going to have separate user-configured masks and effective ones.
+
+Eventually configured masks can only be changed by writing cpuset.cpus
+and cpuset.mems, and they won't be restricted by parent cpuset. While
+effective masks reflect cpu/memory hotplug and hierachical restriction,
+and these are the real masks that apply to the tasks in the cpuset.
+
+We calculate effective mask this way:
+  - top cpuset's effective_mask == online_mask, otherwise
+  - cpuset's effective_mask == configured_mask & parent effective_mask,
+    if the result is empty, it inherits parent effective mask.
+
+Those behavior changes are for default hierarchy only. For legacy
+hierarchy, effective_mask and configured_mask are the same, so we won't
+break old interfaces.
+
+We should partition sched domains according to effective_cpus, which
+is the real cpulist that takes effects on tasks in the cpuset.
+
+This won't introduce behavior change.
+
+v2:
+- Add a comment for the call of rebuild_sched_domains(), suggested
+by Tejun.
+
+	Signed-off-by: Li Zefan <lizefan@huawei.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 8b5f1c52dcd1accd3a940cfcb148bef6de589524)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cpuset.c
+diff --cc kernel/cpuset.c
+index 650413f2caa8,60577ccdbfc7..000000000000
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@@ -629,8 -615,7 +629,12 @@@ static int generate_sched_domains(cpuma
+  			*dattr = SD_ATTR_INIT;
+  			update_domain_attr_tree(dattr, &top_cpuset);
+  		}
+++<<<<<<< HEAD
+ +		cpumask_and(doms[0], top_cpuset.cpus_allowed,
+ +				     non_isolated_cpus);
+++=======
++ 		cpumask_copy(doms[0], top_cpuset.effective_cpus);
+++>>>>>>> 8b5f1c52dcd1 (cpuset: use effective cpumask to build sched domains)
+  
+  		goto done;
+  	}
+@@@ -736,8 -719,7 +740,12 @@@ restart
+  			struct cpuset *b = csa[j];
+  
+  			if (apn == b->pn) {
+++<<<<<<< HEAD
+ +				cpumask_or(dp, dp, b->cpus_allowed);
+ +				cpumask_and(dp, dp, non_isolated_cpus);
+++=======
++ 				cpumask_or(dp, dp, b->effective_cpus);
+++>>>>>>> 8b5f1c52dcd1 (cpuset: use effective cpumask to build sched domains)
+  				if (dattr)
+  					update_domain_attr_tree(dattr + nslot, b);
+  
+@@@ -866,28 -866,52 +874,41 @@@ static void update_tasks_cpumask(struc
+   *
+   * Called with cpuset_mutex held
+   */
+ -static void update_cpumasks_hier(struct cpuset *cs, struct cpumask *new_cpus)
+ +static void update_tasks_cpumask_hier(struct cpuset *root_cs,
+ +				      bool update_root, struct ptr_heap *heap)
+  {
+  	struct cpuset *cp;
+++<<<<<<< HEAD
+ +	struct cgroup *pos_cgrp;
+ +
+ +	if (update_root)
+ +		update_tasks_cpumask(root_cs, heap);
+++=======
++ 	struct cgroup_subsys_state *pos_css;
++ 	bool need_rebuild_sched_domains = false;
+++>>>>>>> 8b5f1c52dcd1 (cpuset: use effective cpumask to build sched domains)
+  
+  	rcu_read_lock();
+ -	cpuset_for_each_descendant_pre(cp, pos_css, cs) {
+ -		struct cpuset *parent = parent_cs(cp);
+ -
+ -		cpumask_and(new_cpus, cp->cpus_allowed, parent->effective_cpus);
+ -
+ -		/*
+ -		 * If it becomes empty, inherit the effective mask of the
+ -		 * parent, which is guaranteed to have some CPUs.
+ -		 */
+ -		if (cpumask_empty(new_cpus))
+ -			cpumask_copy(new_cpus, parent->effective_cpus);
+ -
+ -		/* Skip the whole subtree if the cpumask remains the same. */
+ -		if (cpumask_equal(new_cpus, cp->effective_cpus)) {
+ -			pos_css = css_rightmost_descendant(pos_css);
+ +	cpuset_for_each_descendant_pre(cp, pos_cgrp, root_cs) {
+ +		/* skip the whole subtree if @cp have some CPU */
+ +		if (!cpumask_empty(cp->cpus_allowed)) {
+ +			pos_cgrp = cgroup_rightmost_descendant(pos_cgrp);
+  			continue;
+  		}
+ -
+ -		if (!css_tryget_online(&cp->css))
+ +		if (!css_tryget(&cp->css))
+  			continue;
+  		rcu_read_unlock();
+  
+ -		mutex_lock(&callback_mutex);
+ -		cpumask_copy(cp->effective_cpus, new_cpus);
+ -		mutex_unlock(&callback_mutex);
+ -
+ -		WARN_ON(!cgroup_on_dfl(cp->css.cgroup) &&
+ -			!cpumask_equal(cp->cpus_allowed, cp->effective_cpus));
+ -
+ -		update_tasks_cpumask(cp);
+ +		update_tasks_cpumask(cp, heap);
+  
++ 		/*
++ 		 * If the effective cpumask of any non-empty cpuset is changed,
++ 		 * we need to rebuild sched domains.
++ 		 */
++ 		if (!cpumask_empty(cp->cpus_allowed) &&
++ 		    is_sched_load_balance(cp))
++ 			need_rebuild_sched_domains = true;
++ 
+  		rcu_read_lock();
+  		css_put(&cp->css);
+  	}
+@@@ -902,9 -930,7 +926,8 @@@
+  static int update_cpumask(struct cpuset *cs, struct cpuset *trialcs,
+  			  const char *buf)
+  {
+ +	struct ptr_heap heap;
+  	int retval;
+- 	int is_load_balanced;
+  
+  	/* top_cpuset.cpus_allowed tracks cpu_online_mask; it's read-only */
+  	if (cs == &top_cpuset)
+@@@ -935,22 -961,12 +958,30 @@@
+  	if (retval < 0)
+  		return retval;
+  
+++<<<<<<< HEAD
+ +	retval = heap_init(&heap, PAGE_SIZE, GFP_KERNEL, NULL);
+ +	if (retval)
+ +		return retval;
+ +
+ +	is_load_balanced = is_sched_load_balance(trialcs);
+ +
+++=======
+++>>>>>>> 8b5f1c52dcd1 (cpuset: use effective cpumask to build sched domains)
+  	mutex_lock(&callback_mutex);
+  	cpumask_copy(cs->cpus_allowed, trialcs->cpus_allowed);
+  	mutex_unlock(&callback_mutex);
+  
+++<<<<<<< HEAD
+ +	update_tasks_cpumask_hier(cs, true, &heap);
+ +
+ +	heap_free(&heap);
+ +
+ +	if (is_load_balanced)
+ +		rebuild_sched_domains_locked();
+++=======
++ 	/* use trialcs->cpus_allowed as a temp variable */
++ 	update_cpumasks_hier(cs, trialcs->cpus_allowed);
+++>>>>>>> 8b5f1c52dcd1 (cpuset: use effective cpumask to build sched domains)
+  	return 0;
+  }
+  
+* Unmerged path kernel/cpuset.c
