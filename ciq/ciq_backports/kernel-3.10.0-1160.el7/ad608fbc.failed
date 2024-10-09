@@ -1,0 +1,273 @@
+media: v4l: event: Prevent freeing event subscriptions while accessed
+
+jira LE-1907
+cve CVE-2019-9458
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Sakari Ailus <sakari.ailus@linux.intel.com>
+commit ad608fbcf166fec809e402d548761768f602702c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/ad608fbc.failed
+
+The event subscriptions are added to the subscribed event list while
+holding a spinlock, but that lock is subsequently released while still
+accessing the subscription object. This makes it possible to unsubscribe
+the event --- and freeing the subscription object's memory --- while
+the subscription object is simultaneously accessed.
+
+Prevent this by adding a mutex to serialise the event subscription and
+unsubscription. This also gives a guarantee to the callback ops that the
+add op has returned before the del op is called.
+
+This change also results in making the elems field less special:
+subscriptions are only added to the event list once they are fully
+initialised.
+
+	Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+	Reviewed-by: Hans Verkuil <hans.verkuil@cisco.com>
+	Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+	Cc: stable@vger.kernel.org # for 4.14 and up
+Fixes: c3b5b0241f62 ("V4L/DVB: V4L: Events: Add backend")
+	Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+(cherry picked from commit ad608fbcf166fec809e402d548761768f602702c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/v4l2-core/v4l2-event.c
+#	include/media/v4l2-fh.h
+diff --cc drivers/media/v4l2-core/v4l2-event.c
+index 86dcb5483c42,a3ef1f50a4b3..000000000000
+--- a/drivers/media/v4l2-core/v4l2-event.c
++++ b/drivers/media/v4l2-core/v4l2-event.c
+@@@ -232,10 -227,9 +228,14 @@@ int v4l2_event_subscribe(struct v4l2_f
+  	spin_unlock_irqrestore(&fh->vdev->fh_lock, flags);
+  
+  	if (found_ev) {
+++<<<<<<< HEAD
+ +		kfree(sev);
+ +		return 0; /* Already listening */
+++=======
++ 		/* Already listening */
++ 		kvfree(sev);
++ 		goto out_unlock;
+++>>>>>>> ad608fbcf166 (media: v4l: event: Prevent freeing event subscriptions while accessed)
+  	}
+  
+  	if (sev->ops && sev->ops->add) {
+@@@ -306,7 -305,9 +311,13 @@@ int v4l2_event_unsubscribe(struct v4l2_
+  	if (sev && sev->ops && sev->ops->del)
+  		sev->ops->del(sev);
+  
+++<<<<<<< HEAD
+ +	kfree(sev);
+++=======
++ 	mutex_unlock(&fh->subscribe_lock);
++ 
++ 	kvfree(sev);
+++>>>>>>> ad608fbcf166 (media: v4l: event: Prevent freeing event subscriptions while accessed)
+  
+  	return 0;
+  }
+diff --cc include/media/v4l2-fh.h
+index a62ee18cb7b7,8586cfb49828..000000000000
+--- a/include/media/v4l2-fh.h
++++ b/include/media/v4l2-fh.h
+@@@ -31,6 -29,24 +31,27 @@@
+  struct video_device;
+  struct v4l2_ctrl_handler;
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct v4l2_fh - Describes a V4L2 file handler
++  *
++  * @list: list of file handlers
++  * @vdev: pointer to &struct video_device
++  * @ctrl_handler: pointer to &struct v4l2_ctrl_handler
++  * @prio: priority of the file handler, as defined by &enum v4l2_priority
++  *
++  * @wait: event' s wait queue
++  * @subscribe_lock: serialise changes to the subscribed list; guarantee that
++  *		    the add and del event callbacks are orderly called
++  * @subscribed: list of subscribed events
++  * @available: list of events waiting to be dequeued
++  * @navailable: number of available events at @available list
++  * @sequence: event sequence number
++  *
++  * @m2m_ctx: pointer to &struct v4l2_m2m_ctx
++  */
+++>>>>>>> ad608fbcf166 (media: v4l: event: Prevent freeing event subscriptions while accessed)
+  struct v4l2_fh {
+  	struct list_head	list;
+  	struct video_device	*vdev;
+@@@ -39,59 -55,113 +60,65 @@@
+  
+  	/* Events */
+  	wait_queue_head_t	wait;
+++<<<<<<< HEAD
+ +	struct list_head	subscribed; /* Subscribed events */
+ +	struct list_head	available; /* Dequeueable event */
+++=======
++ 	struct mutex		subscribe_lock;
++ 	struct list_head	subscribed;
++ 	struct list_head	available;
+++>>>>>>> ad608fbcf166 (media: v4l: event: Prevent freeing event subscriptions while accessed)
+  	unsigned int		navailable;
+  	u32			sequence;
+ -
+ -#if IS_ENABLED(CONFIG_V4L2_MEM2MEM_DEV)
+ -	struct v4l2_m2m_ctx	*m2m_ctx;
+ -#endif
+  };
+  
+ -/**
+ - * v4l2_fh_init - Initialise the file handle.
+ - *
+ - * @fh: pointer to &struct v4l2_fh
+ - * @vdev: pointer to &struct video_device
+ - *
+ - * Parts of the V4L2 framework using the
+ +/*
+ + * Initialise the file handle. Parts of the V4L2 framework using the
+   * file handles should be initialised in this function. Must be called
+ - * from driver's v4l2_file_operations->open\(\) handler if the driver
+ - * uses &struct v4l2_fh.
+ + * from driver's v4l2_file_operations->open() handler if the driver
+ + * uses v4l2_fh.
+   */
+  void v4l2_fh_init(struct v4l2_fh *fh, struct video_device *vdev);
+ -
+ -/**
+ - * v4l2_fh_add - Add the fh to the list of file handles on a video_device.
+ - *
+ - * @fh: pointer to &struct v4l2_fh
+ - *
+ - * .. note::
+ - *    The @fh file handle must be initialised first.
+ +/*
+ + * Add the fh to the list of file handles on a video_device. The file
+ + * handle must be initialised first.
+   */
+  void v4l2_fh_add(struct v4l2_fh *fh);
+ -
+ -/**
+ - * v4l2_fh_open - Ancillary routine that can be used as the open\(\) op
+ - *	of v4l2_file_operations.
+ - *
+ - * @filp: pointer to struct file
+ - *
+ - * It allocates a v4l2_fh and inits and adds it to the &struct video_device
+ - * associated with the file pointer.
+ +/*
+ + * Can be used as the open() op of v4l2_file_operations.
+ + * It allocates a v4l2_fh and inits and adds it to the video_device associated
+ + * with the file pointer.
+   */
+  int v4l2_fh_open(struct file *filp);
+ -
+ -/**
+ - * v4l2_fh_del - Remove file handle from the list of file handles.
+ - *
+ - * @fh: pointer to &struct v4l2_fh
+ - *
+ - * On error filp->private_data will be %NULL, otherwise it will point to
+ - * the &struct v4l2_fh.
+ - *
+ - * .. note::
+ - *    Must be called in v4l2_file_operations->release\(\) handler if the driver
+ - *    uses &struct v4l2_fh.
+ +/*
+ + * Remove file handle from the list of file handles. Must be called in
+ + * v4l2_file_operations->release() handler if the driver uses v4l2_fh.
+ + * On error filp->private_data will be NULL, otherwise it will point to
+ + * the v4l2_fh struct.
+   */
+  void v4l2_fh_del(struct v4l2_fh *fh);
+ -
+ -/**
+ - * v4l2_fh_exit - Release resources related to a file handle.
+ - *
+ - * @fh: pointer to &struct v4l2_fh
+ - *
+ - * Parts of the V4L2 framework using the v4l2_fh must release their
+ - * resources here, too.
+ - *
+ - * .. note::
+ - *    Must be called in v4l2_file_operations->release\(\) handler if the
+ - *    driver uses &struct v4l2_fh.
+ +/*
+ + * Release resources related to a file handle. Parts of the V4L2
+ + * framework using the v4l2_fh must release their resources here, too.
+ + * Must be called in v4l2_file_operations->release() handler if the
+ + * driver uses v4l2_fh.
+   */
+  void v4l2_fh_exit(struct v4l2_fh *fh);
+ -
+ -/**
+ - * v4l2_fh_release - Ancillary routine that can be used as the release\(\) op
+ - *	of v4l2_file_operations.
+ - *
+ - * @filp: pointer to struct file
+ - *
+ +/*
+ + * Can be used as the release() op of v4l2_file_operations.
+   * It deletes and exits the v4l2_fh associated with the file pointer and
+   * frees it. It will do nothing if filp->private_data (the pointer to the
+ - * v4l2_fh struct) is %NULL.
+ - *
+ - * This function always returns 0.
+ + * v4l2_fh struct) is NULL. This function always returns 0.
+   */
+  int v4l2_fh_release(struct file *filp);
+ -
+ -/**
+ - * v4l2_fh_is_singular - Returns 1 if this filehandle is the only filehandle
+ - *	 opened for the associated video_device.
+ - *
+ - * @fh: pointer to &struct v4l2_fh
+ - *
+ - * If @fh is NULL, then it returns 0.
+ +/*
+ + * Returns 1 if this filehandle is the only filehandle opened for the
+ + * associated video_device. If fh is NULL, then it returns 0.
+   */
+  int v4l2_fh_is_singular(struct v4l2_fh *fh);
+ -
+ -/**
+ - * v4l2_fh_is_singular_file - Returns 1 if this filehandle is the only
+ - *	filehandle opened for the associated video_device.
+ - *
+ - * @filp: pointer to struct file
+ - *
+ - * This is a helper function variant of v4l2_fh_is_singular() with uses
+ - * struct file as argument.
+ - *
+ - * If filp->private_data is %NULL, then it will return 0.
+ +/*
+ + * Helper function with struct file as argument. If filp->private_data is
+ + * NULL, then it will return 0.
+   */
+  static inline int v4l2_fh_is_singular_file(struct file *filp)
+  {
+* Unmerged path drivers/media/v4l2-core/v4l2-event.c
+diff --git a/drivers/media/v4l2-core/v4l2-fh.c b/drivers/media/v4l2-core/v4l2-fh.c
+index e57c002b4150..573ec2f192d4 100644
+--- a/drivers/media/v4l2-core/v4l2-fh.c
++++ b/drivers/media/v4l2-core/v4l2-fh.c
+@@ -42,6 +42,7 @@ void v4l2_fh_init(struct v4l2_fh *fh, struct video_device *vdev)
+ 	INIT_LIST_HEAD(&fh->available);
+ 	INIT_LIST_HEAD(&fh->subscribed);
+ 	fh->sequence = -1;
++	mutex_init(&fh->subscribe_lock);
+ }
+ EXPORT_SYMBOL_GPL(v4l2_fh_init);
+ 
+@@ -88,6 +89,7 @@ void v4l2_fh_exit(struct v4l2_fh *fh)
+ 	if (fh->vdev == NULL)
+ 		return;
+ 	v4l2_event_unsubscribe_all(fh);
++	mutex_destroy(&fh->subscribe_lock);
+ 	fh->vdev = NULL;
+ }
+ EXPORT_SYMBOL_GPL(v4l2_fh_exit);
+* Unmerged path include/media/v4l2-fh.h
