@@ -1,0 +1,82 @@
+ipvs: don't alter conntrack in OPS mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Marco Angaroni <marcoangaroni@gmail.com>
+commit 8fb04d9fc70a67ccabf71dbabf92d7f6fca64a16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8fb04d9f.failed
+
+When using OPS mode in conjunction with SIP persistent-engine, packets
+originating from the same ip-address/port could be balanced to different
+real servers, and (to properly handle SIP responses) OPS connections
+are created in the in-out direction too, where ip_vs_update_conntrack()
+is called to modify the reply tuple.
+
+As a result, there can be collision of conntrack tuples, causing random
+packet drops, as explained below:
+
+conntrack1: orig=CIP->VIP, reply=RIP1->CIP
+conntrack2: orig=RIP2->CIP, reply=CIP->VIP
+
+Tuple CIP->VIP is both in orig of conntrack1 and reply of conntrack2.
+The collision triggers packet drop inside nf_conntrack processing.
+
+In addition, the current implementation deletes the conntrack object at
+every expire of an OPS connection (once every forwarded packet), to have
+it recreated from scratch at next packet traversing IPVS.
+
+Since in OPS mode, by definition, we don't expect any associated
+response, the choices implemented in this patch are:
+a) don't call nf_conntrack_alter_reply() for OPS connections inside
+   ip_vs_update_conntrack().
+b) don't delete the conntrack object at OPS connection expire.
+
+The result is that created conntrack objects for each tuple CIP->VIP,
+RIP-N->CIP, etc. are left in UNREPLIED state and not modified by IPVS
+OPS connection management. This eliminates packet drops and leaves
+a single conntrack object for each tuple packets are sent from.
+
+	Signed-off-by: Marco Angaroni <marcoangaroni@gmail.com>
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit 8fb04d9fc70a67ccabf71dbabf92d7f6fca64a16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_conn.c
+diff --cc net/netfilter/ipvs/ip_vs_conn.c
+index 69b1996c49f4,292365ffa4f0..000000000000
+--- a/net/netfilter/ipvs/ip_vs_conn.c
++++ b/net/netfilter/ipvs/ip_vs_conn.c
+@@@ -813,8 -836,8 +813,13 @@@ static void ip_vs_conn_expire(unsigned 
+  		if (cp->control)
+  			ip_vs_control_del(cp);
+  
+++<<<<<<< HEAD
+ +		if (cp->flags & IP_VS_CONN_F_NFCT) {
+ +			ip_vs_conn_drop_conntrack(cp);
+++=======
++ 		if ((cp->flags & IP_VS_CONN_F_NFCT) &&
++ 		    !(cp->flags & IP_VS_CONN_F_ONE_PACKET)) {
+++>>>>>>> 8fb04d9fc70a (ipvs: don't alter conntrack in OPS mode)
+  			/* Do not access conntracks during subsys cleanup
+  			 * because nf_conntrack_find_get can not be used after
+  			 * conntrack cleanup for the net.
+* Unmerged path net/netfilter/ipvs/ip_vs_conn.c
+diff --git a/net/netfilter/ipvs/ip_vs_nfct.c b/net/netfilter/ipvs/ip_vs_nfct.c
+index 09d800b72939..0cc826e7102c 100644
+--- a/net/netfilter/ipvs/ip_vs_nfct.c
++++ b/net/netfilter/ipvs/ip_vs_nfct.c
+@@ -94,6 +94,10 @@ ip_vs_update_conntrack(struct sk_buff *skb, struct ip_vs_conn *cp, int outin)
+ 	if (IP_VS_FWD_METHOD(cp) != IP_VS_CONN_F_MASQ)
+ 		return;
+ 
++	/* Never alter conntrack for OPS conns (no reply is expected) */
++	if (cp->flags & IP_VS_CONN_F_ONE_PACKET)
++		return;
++
+ 	/* Alter reply only in original direction */
+ 	if (CTINFO2DIR(ctinfo) != IP_CT_DIR_ORIGINAL)
+ 		return;
