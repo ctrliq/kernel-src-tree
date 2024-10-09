@@ -1,0 +1,625 @@
+RAID1: avoid unnecessary spin locks in I/O barrier code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author colyli@suse.de <colyli@suse.de>
+commit 824e47daddbfc6ebe1006b8659f080620472a136
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/824e47da.failed
+
+When I run a parallel reading performan testing on a md raid1 device with
+two NVMe SSDs, I observe very bad throughput in supprise: by fio with 64KB
+block size, 40 seq read I/O jobs, 128 iodepth, overall throughput is
+only 2.7GB/s, this is around 50% of the idea performance number.
+
+The perf reports locking contention happens at allow_barrier() and
+wait_barrier() code,
+ - 41.41%  fio [kernel.kallsyms]     [k] _raw_spin_lock_irqsave
+   - _raw_spin_lock_irqsave
+         + 89.92% allow_barrier
+         + 9.34% __wake_up
+ - 37.30%  fio [kernel.kallsyms]     [k] _raw_spin_lock_irq
+   - _raw_spin_lock_irq
+         - 100.00% wait_barrier
+
+The reason is, in these I/O barrier related functions,
+ - raise_barrier()
+ - lower_barrier()
+ - wait_barrier()
+ - allow_barrier()
+They always hold conf->resync_lock firstly, even there are only regular
+reading I/Os and no resync I/O at all. This is a huge performance penalty.
+
+The solution is a lockless-like algorithm in I/O barrier code, and only
+holding conf->resync_lock when it has to.
+
+The original idea is from Hannes Reinecke, and Neil Brown provides
+comments to improve it. I continue to work on it, and make the patch into
+current form.
+
+In the new simpler raid1 I/O barrier implementation, there are two
+wait barrier functions,
+ - wait_barrier()
+   Which calls _wait_barrier(), is used for regular write I/O. If there is
+   resync I/O happening on the same I/O barrier bucket, or the whole
+   array is frozen, task will wait until no barrier on same barrier bucket,
+   or the whold array is unfreezed.
+ - wait_read_barrier()
+   Since regular read I/O won't interfere with resync I/O (read_balance()
+   will make sure only uptodate data will be read out), it is unnecessary
+   to wait for barrier in regular read I/Os, waiting in only necessary
+   when the whole array is frozen.
+
+The operations on conf->nr_pending[idx], conf->nr_waiting[idx], conf->
+barrier[idx] are very carefully designed in raise_barrier(),
+lower_barrier(), _wait_barrier() and wait_read_barrier(), in order to
+avoid unnecessary spin locks in these functions. Once conf->
+nr_pengding[idx] is increased, a resync I/O with same barrier bucket index
+has to wait in raise_barrier(). Then in _wait_barrier() if no barrier
+raised in same barrier bucket index and array is not frozen, the regular
+I/O doesn't need to hold conf->resync_lock, it can just increase
+conf->nr_pending[idx], and return to its caller. wait_read_barrier() is
+very similar to _wait_barrier(), the only difference is it only waits when
+array is frozen. For heavy parallel reading I/Os, the lockless I/O barrier
+code almostly gets rid of all spin lock cost.
+
+This patch significantly improves raid1 reading peroformance. From my
+testing, a raid1 device built by two NVMe SSD, runs fio with 64KB
+blocksize, 40 seq read I/O jobs, 128 iodepth, overall throughput
+increases from 2.7GB/s to 4.6GB/s (+70%).
+
+Changelog
+V4:
+- Change conf->nr_queued[] to atomic_t.
+- Define BARRIER_BUCKETS_NR_BITS by (PAGE_SHIFT - ilog2(sizeof(atomic_t)))
+V3:
+- Add smp_mb__after_atomic() as Shaohua and Neil suggested.
+- Change conf->nr_queued[] from atomic_t to int.
+- Change conf->array_frozen from atomic_t back to int, and use
+  READ_ONCE(conf->array_frozen) to check value of conf->array_frozen
+  in _wait_barrier() and wait_read_barrier().
+- In _wait_barrier() and wait_read_barrier(), add a call to
+  wake_up(&conf->wait_barrier) after atomic_dec(&conf->nr_pending[idx]),
+  to fix a deadlock between  _wait_barrier()/wait_read_barrier and
+  freeze_array().
+V2:
+- Remove a spin_lock/unlock pair in raid1d().
+- Add more code comments to explain why there is no racy when checking two
+  atomic_t variables at same time.
+V1:
+- Original RFC patch for comments.
+
+	Signed-off-by: Coly Li <colyli@suse.de>
+	Cc: Shaohua Li <shli@fb.com>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Johannes Thumshirn <jthumshirn@suse.de>
+	Cc: Guoqing Jiang <gqjiang@suse.com>
+	Reviewed-by: Neil Brown <neilb@suse.de>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 824e47daddbfc6ebe1006b8659f080620472a136)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+#	drivers/md/raid1.h
+diff --cc drivers/md/raid1.c
+index e588c32492da,fefbbfdb440b..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -217,10 -221,12 +217,14 @@@ static void reschedule_retry(struct r1b
+  	unsigned long flags;
+  	struct mddev *mddev = r1_bio->mddev;
+  	struct r1conf *conf = mddev->private;
+ -	int idx;
+  
+ -	idx = sector_to_idx(r1_bio->sector);
+  	spin_lock_irqsave(&conf->device_lock, flags);
+  	list_add(&r1_bio->retry_list, &conf->retry_list);
+++<<<<<<< HEAD
+ +	conf->nr_queued ++;
+++=======
++ 	atomic_inc(&conf->nr_queued[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  	spin_unlock_irqrestore(&conf->device_lock, flags);
+  
+  	wake_up(&conf->wait_barrier);
+@@@ -817,12 -834,23 +821,30 @@@ static void raise_barrier(struct r1con
+  	spin_lock_irq(&conf->resync_lock);
+  
+  	/* Wait until no block IO is waiting */
+++<<<<<<< HEAD
+ +	wait_event_lock_irq(conf->wait_barrier, !conf->nr_waiting,
+ +			    conf->resync_lock);
+ +
+ +	/* block any new IO from starting */
+ +	conf->barrier++;
+ +	conf->next_resync = sector_nr;
+++=======
++ 	wait_event_lock_irq(conf->wait_barrier,
++ 			    !atomic_read(&conf->nr_waiting[idx]),
++ 			    conf->resync_lock);
++ 
++ 	/* block any new IO from starting */
++ 	atomic_inc(&conf->barrier[idx]);
++ 	/*
++ 	 * In raise_barrier() we firstly increase conf->barrier[idx] then
++ 	 * check conf->nr_pending[idx]. In _wait_barrier() we firstly
++ 	 * increase conf->nr_pending[idx] then check conf->barrier[idx].
++ 	 * A memory barrier here to make sure conf->nr_pending[idx] won't
++ 	 * be fetched before conf->barrier[idx] is increased. Otherwise
++ 	 * there will be a race between raise_barrier() and _wait_barrier().
++ 	 */
++ 	smp_mb__after_atomic();
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  
+  	/* For these conditions we must wait:
+  	 * A: while the array is in frozen state
+@@@ -835,138 -861,189 +857,276 @@@
+  	 */
+  	wait_event_lock_irq(conf->wait_barrier,
+  			    !conf->array_frozen &&
+++<<<<<<< HEAD
+ +			    conf->barrier < RESYNC_DEPTH &&
+ +			    conf->current_window_requests == 0 &&
+ +			    (conf->start_next_window >=
+ +			     conf->next_resync + RESYNC_SECTORS),
+ +			    conf->resync_lock);
+ +
+ +	conf->nr_pending++;
+++=======
++ 			     !atomic_read(&conf->nr_pending[idx]) &&
++ 			     atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH,
++ 			    conf->resync_lock);
++ 
++ 	atomic_inc(&conf->nr_pending[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  	spin_unlock_irq(&conf->resync_lock);
+  }
+  
+ -static void lower_barrier(struct r1conf *conf, sector_t sector_nr)
+ +static void lower_barrier(struct r1conf *conf)
+  {
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +	BUG_ON(conf->barrier <= 0);
+ +	spin_lock_irqsave(&conf->resync_lock, flags);
+ +	conf->barrier--;
+ +	conf->nr_pending--;
+ +	spin_unlock_irqrestore(&conf->resync_lock, flags);
+++=======
++ 	int idx = sector_to_idx(sector_nr);
++ 
++ 	BUG_ON(atomic_read(&conf->barrier[idx]) <= 0);
++ 
++ 	atomic_dec(&conf->barrier[idx]);
++ 	atomic_dec(&conf->nr_pending[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  	wake_up(&conf->wait_barrier);
+  }
+  
+ -static void _wait_barrier(struct r1conf *conf, int idx)
+ +static bool need_to_wait_for_sync(struct r1conf *conf, struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	bool wait = false;
+ +
+ +	if (conf->array_frozen || !bio)
+ +		wait = true;
+ +	else if (conf->barrier && bio_data_dir(bio) == WRITE) {
+ +		if ((conf->mddev->curr_resync_completed
+ +		     >= bio_end_sector(bio)) ||
+ +		    (conf->next_resync + NEXT_NORMALIO_DISTANCE
+ +		     <= bio->bi_sector))
+ +			wait = false;
+ +		else
+ +			wait = true;
+ +	}
+ +
+ +	return wait;
+++=======
++ 	/*
++ 	 * We need to increase conf->nr_pending[idx] very early here,
++ 	 * then raise_barrier() can be blocked when it waits for
++ 	 * conf->nr_pending[idx] to be 0. Then we can avoid holding
++ 	 * conf->resync_lock when there is no barrier raised in same
++ 	 * barrier unit bucket. Also if the array is frozen, I/O
++ 	 * should be blocked until array is unfrozen.
++ 	 */
++ 	atomic_inc(&conf->nr_pending[idx]);
++ 	/*
++ 	 * In _wait_barrier() we firstly increase conf->nr_pending[idx], then
++ 	 * check conf->barrier[idx]. In raise_barrier() we firstly increase
++ 	 * conf->barrier[idx], then check conf->nr_pending[idx]. A memory
++ 	 * barrier is necessary here to make sure conf->barrier[idx] won't be
++ 	 * fetched before conf->nr_pending[idx] is increased. Otherwise there
++ 	 * will be a race between _wait_barrier() and raise_barrier().
++ 	 */
++ 	smp_mb__after_atomic();
++ 
++ 	/*
++ 	 * Don't worry about checking two atomic_t variables at same time
++ 	 * here. If during we check conf->barrier[idx], the array is
++ 	 * frozen (conf->array_frozen is 1), and chonf->barrier[idx] is
++ 	 * 0, it is safe to return and make the I/O continue. Because the
++ 	 * array is frozen, all I/O returned here will eventually complete
++ 	 * or be queued, no race will happen. See code comment in
++ 	 * frozen_array().
++ 	 */
++ 	if (!READ_ONCE(conf->array_frozen) &&
++ 	    !atomic_read(&conf->barrier[idx]))
++ 		return;
++ 
++ 	/*
++ 	 * After holding conf->resync_lock, conf->nr_pending[idx]
++ 	 * should be decreased before waiting for barrier to drop.
++ 	 * Otherwise, we may encounter a race condition because
++ 	 * raise_barrer() might be waiting for conf->nr_pending[idx]
++ 	 * to be 0 at same time.
++ 	 */
++ 	spin_lock_irq(&conf->resync_lock);
++ 	atomic_inc(&conf->nr_waiting[idx]);
++ 	atomic_dec(&conf->nr_pending[idx]);
++ 	/*
++ 	 * In case freeze_array() is waiting for
++ 	 * get_unqueued_pending() == extra
++ 	 */
++ 	wake_up(&conf->wait_barrier);
++ 	/* Wait for the barrier in same barrier unit bucket to drop. */
++ 	wait_event_lock_irq(conf->wait_barrier,
++ 			    !conf->array_frozen &&
++ 			     !atomic_read(&conf->barrier[idx]),
++ 			    conf->resync_lock);
++ 	atomic_inc(&conf->nr_pending[idx]);
++ 	atomic_dec(&conf->nr_waiting[idx]);
++ 	spin_unlock_irq(&conf->resync_lock);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  }
+  
+ -static void wait_read_barrier(struct r1conf *conf, sector_t sector_nr)
+ +static sector_t wait_barrier(struct r1conf *conf, struct bio *bio)
+  {
+ -	int idx = sector_to_idx(sector_nr);
+ +	sector_t sector = 0;
+ +
+++<<<<<<< HEAD
+ +	spin_lock_irq(&conf->resync_lock);
+ +	if (need_to_wait_for_sync(conf, bio)) {
+ +		conf->nr_waiting++;
+ +		/* Wait for the barrier to drop.
+ +		 * However if there are already pending
+ +		 * requests (preventing the barrier from
+ +		 * rising completely), and the
+ +		 * per-process bio queue isn't empty,
+ +		 * then don't wait, as we need to empty
+ +		 * that queue to allow conf->start_next_window
+ +		 * to increase.
+ +		 */
+ +		wait_event_lock_irq(conf->wait_barrier,
+ +				    !conf->array_frozen &&
+ +				    (!conf->barrier ||
+ +				     ((conf->start_next_window <
+ +				       conf->next_resync + RESYNC_SECTORS) &&
+ +				      current->bio_list &&
+ +				      !bio_list_empty(current->bio_list))),
+ +				    conf->resync_lock);
+ +		conf->nr_waiting--;
+ +	}
+ +
+ +	if (bio && bio_data_dir(bio) == WRITE) {
+ +		if (bio->bi_sector >= conf->next_resync) {
+ +			if (conf->start_next_window == MaxSector)
+ +				conf->start_next_window =
+ +					conf->next_resync +
+ +					NEXT_NORMALIO_DISTANCE;
+ +
+ +			if ((conf->start_next_window + NEXT_NORMALIO_DISTANCE)
+ +			    <= bio->bi_sector)
+ +				conf->next_window_requests++;
+ +			else
+ +				conf->current_window_requests++;
+ +			sector = conf->start_next_window;
+ +		}
+ +	}
+  
+ +	conf->nr_pending++;
+++=======
++ 	/*
++ 	 * Very similar to _wait_barrier(). The difference is, for read
++ 	 * I/O we don't need wait for sync I/O, but if the whole array
++ 	 * is frozen, the read I/O still has to wait until the array is
++ 	 * unfrozen. Since there is no ordering requirement with
++ 	 * conf->barrier[idx] here, memory barrier is unnecessary as well.
++ 	 */
++ 	atomic_inc(&conf->nr_pending[idx]);
++ 
++ 	if (!READ_ONCE(conf->array_frozen))
++ 		return;
++ 
++ 	spin_lock_irq(&conf->resync_lock);
++ 	atomic_inc(&conf->nr_waiting[idx]);
++ 	atomic_dec(&conf->nr_pending[idx]);
++ 	/*
++ 	 * In case freeze_array() is waiting for
++ 	 * get_unqueued_pending() == extra
++ 	 */
++ 	wake_up(&conf->wait_barrier);
++ 	/* Wait for array to be unfrozen */
++ 	wait_event_lock_irq(conf->wait_barrier,
++ 			    !conf->array_frozen,
++ 			    conf->resync_lock);
++ 	atomic_inc(&conf->nr_pending[idx]);
++ 	atomic_dec(&conf->nr_waiting[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  	spin_unlock_irq(&conf->resync_lock);
+ +	return sector;
+  }
+  
+ -static void wait_barrier(struct r1conf *conf, sector_t sector_nr)
+ -{
+ -	int idx = sector_to_idx(sector_nr);
+ -
+ -	_wait_barrier(conf, idx);
+ -}
+ -
+ -static void wait_all_barriers(struct r1conf *conf)
+ +static void allow_barrier(struct r1conf *conf, sector_t start_next_window,
+ +			  sector_t bi_sector)
+  {
+ -	int idx;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+  
+ -	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
+ -		_wait_barrier(conf, idx);
+ +	spin_lock_irqsave(&conf->resync_lock, flags);
+ +	conf->nr_pending--;
+ +	if (start_next_window) {
+ +		if (start_next_window == conf->start_next_window) {
+ +			if (conf->start_next_window + NEXT_NORMALIO_DISTANCE
+ +			    <= bi_sector)
+ +				conf->next_window_requests--;
+ +			else
+ +				conf->current_window_requests--;
+ +		} else
+ +			conf->current_window_requests--;
+ +
+ +		if (!conf->current_window_requests) {
+ +			if (conf->next_window_requests) {
+ +				conf->current_window_requests =
+ +					conf->next_window_requests;
+ +				conf->next_window_requests = 0;
+ +				conf->start_next_window +=
+ +					NEXT_NORMALIO_DISTANCE;
+ +			} else
+ +				conf->start_next_window = MaxSector;
+ +		}
+ +	}
+ +	spin_unlock_irqrestore(&conf->resync_lock, flags);
+ +	wake_up(&conf->wait_barrier);
+  }
+  
+ -static void _allow_barrier(struct r1conf *conf, int idx)
+ -{
+++=======
++ 	atomic_dec(&conf->nr_pending[idx]);
++ 	wake_up(&conf->wait_barrier);
++ }
++ 
++ static void allow_barrier(struct r1conf *conf, sector_t sector_nr)
++ {
++ 	int idx = sector_to_idx(sector_nr);
++ 
++ 	_allow_barrier(conf, idx);
++ }
++ 
++ static void allow_all_barriers(struct r1conf *conf)
++ {
++ 	int idx;
++ 
++ 	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
++ 		_allow_barrier(conf, idx);
++ }
++ 
++ /* conf->resync_lock should be held */
++ static int get_unqueued_pending(struct r1conf *conf)
++ {
++ 	int idx, ret;
++ 
++ 	for (ret = 0, idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
++ 		ret += atomic_read(&conf->nr_pending[idx]) -
++ 			atomic_read(&conf->nr_queued[idx]);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  static void freeze_array(struct r1conf *conf, int extra)
+  {
+ -	/* Stop sync I/O and normal I/O and wait for everything to
+ +	/* stop syncio and normal IO and wait for everything to
+  	 * go quite.
+ -	 * This is called in two situations:
+ -	 * 1) management command handlers (reshape, remove disk, quiesce).
+ -	 * 2) one normal I/O request failed.
+ -
+ -	 * After array_frozen is set to 1, new sync IO will be blocked at
+ -	 * raise_barrier(), and new normal I/O will blocked at _wait_barrier()
+ -	 * or wait_read_barrier(). The flying I/Os will either complete or be
+ -	 * queued. When everything goes quite, there are only queued I/Os left.
+ -
+ -	 * Every flying I/O contributes to a conf->nr_pending[idx], idx is the
+ -	 * barrier bucket index which this I/O request hits. When all sync and
+ -	 * normal I/O are queued, sum of all conf->nr_pending[] will match sum
+ -	 * of all conf->nr_queued[]. But normal I/O failure is an exception,
+ -	 * in handle_read_error(), we may call freeze_array() before trying to
+ -	 * fix the read error. In this case, the error read I/O is not queued,
+ -	 * so get_unqueued_pending() == 1.
+ -	 *
+ -	 * Therefore before this function returns, we need to wait until
+ -	 * get_unqueued_pendings(conf) gets equal to extra. For
+ -	 * normal I/O context, extra is 1, in rested situations extra is 0.
+ +	 * We wait until nr_pending match nr_queued+extra
+ +	 * This is called in the context of one normal IO request
+ +	 * that has failed. Thus any sync request that might be pending
+ +	 * will be blocked by nr_pending, and we need to wait for
+ +	 * pending IO requests to complete or be queued for re-try.
+ +	 * Thus the number queued (nr_queued) plus this request (extra)
+ +	 * must match the number of pending IOs (nr_pending) before
+ +	 * we continue.
+  	 */
+  	spin_lock_irq(&conf->resync_lock);
+  	conf->array_frozen = 1;
+@@@ -2302,8 -2450,14 +2462,18 @@@ static void handle_write_finished(struc
+  	if (fail) {
+  		spin_lock_irq(&conf->device_lock);
+  		list_add(&r1_bio->retry_list, &conf->bio_end_io_list);
+++<<<<<<< HEAD
+ +		conf->nr_queued++;
+++=======
++ 		idx = sector_to_idx(r1_bio->sector);
++ 		atomic_inc(&conf->nr_queued[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  		spin_unlock_irq(&conf->device_lock);
++ 		/*
++ 		 * In case freeze_array() is waiting for condition
++ 		 * get_unqueued_pending() == extra to be true.
++ 		 */
++ 		wake_up(&conf->wait_barrier);
+  		md_wakeup_thread(conf->mddev->thread);
+  	} else {
+  		if (test_bit(R1BIO_WriteError, &r1_bio->state))
+@@@ -2428,6 -2587,8 +2598,11 @@@ static void raid1d(struct md_thread *th
+  			r1_bio = list_first_entry(&tmp, struct r1bio,
+  						  retry_list);
+  			list_del(&r1_bio->retry_list);
+++<<<<<<< HEAD
+++=======
++ 			idx = sector_to_idx(r1_bio->sector);
++ 			atomic_dec(&conf->nr_queued[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  			if (mddev->degraded)
+  				set_bit(R1BIO_Degraded, &r1_bio->state);
+  			if (test_bit(R1BIO_WriteError, &r1_bio->state))
+@@@ -2448,7 -2609,8 +2623,12 @@@
+  		}
+  		r1_bio = list_entry(head->prev, struct r1bio, retry_list);
+  		list_del(head->prev);
+++<<<<<<< HEAD
+ +		conf->nr_queued--;
+++=======
++ 		idx = sector_to_idx(r1_bio->sector);
++ 		atomic_dec(&conf->nr_queued[idx]);
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  		spin_unlock_irqrestore(&conf->device_lock, flags);
+  
+  		mddev = r1_bio->mddev;
+@@@ -2560,10 -2727,15 +2740,14 @@@ static sector_t raid1_sync_request(stru
+  	 * If there is non-resync activity waiting for a turn, then let it
+  	 * though before starting on this new sync request.
+  	 */
+++<<<<<<< HEAD
+ +	if (conf->nr_waiting)
+++=======
++ 	if (atomic_read(&conf->nr_waiting[idx]))
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  		schedule_timeout_uninterruptible(1);
+  
+ -	/* we are incrementing sector_nr below. To be safe, we check against
+ -	 * sector_nr + two times RESYNC_SECTORS
+ -	 */
+ -
+ -	bitmap_cond_end_sync(mddev->bitmap, sector_nr,
+ -		mddev_is_clustered(mddev) && (sector_nr + 2 * RESYNC_SECTORS > conf->cluster_sync_high));
+ +	bitmap_cond_end_sync(mddev->bitmap, sector_nr);
+  	r1_bio = mempool_alloc(conf->r1buf_pool, GFP_NOIO);
+  
+  	raise_barrier(conf, sector_nr);
+@@@ -2796,6 -2986,26 +2980,29 @@@ static struct r1conf *setup_conf(struc
+  	if (!conf)
+  		goto abort;
+  
+++<<<<<<< HEAD
+++=======
++ 	conf->nr_pending = kcalloc(BARRIER_BUCKETS_NR,
++ 				   sizeof(atomic_t), GFP_KERNEL);
++ 	if (!conf->nr_pending)
++ 		goto abort;
++ 
++ 	conf->nr_waiting = kcalloc(BARRIER_BUCKETS_NR,
++ 				   sizeof(atomic_t), GFP_KERNEL);
++ 	if (!conf->nr_waiting)
++ 		goto abort;
++ 
++ 	conf->nr_queued = kcalloc(BARRIER_BUCKETS_NR,
++ 				  sizeof(atomic_t), GFP_KERNEL);
++ 	if (!conf->nr_queued)
++ 		goto abort;
++ 
++ 	conf->barrier = kcalloc(BARRIER_BUCKETS_NR,
++ 				sizeof(atomic_t), GFP_KERNEL);
++ 	if (!conf->barrier)
++ 		goto abort;
++ 
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  	conf->mirrors = kzalloc(sizeof(struct raid1_info)
+  				* mddev->raid_disks * 2,
+  				 GFP_KERNEL);
+diff --cc drivers/md/raid1.h
+index c52d7139c5d7,dd22a37d0d83..000000000000
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@@ -1,6 -1,30 +1,33 @@@
+  #ifndef _RAID1_H
+  #define _RAID1_H
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * each barrier unit size is 64MB fow now
++  * note: it must be larger than RESYNC_DEPTH
++  */
++ #define BARRIER_UNIT_SECTOR_BITS	17
++ #define BARRIER_UNIT_SECTOR_SIZE	(1<<17)
++ /*
++  * In struct r1conf, the following members are related to I/O barrier
++  * buckets,
++  *	atomic_t	*nr_pending;
++  *	atomic_t	*nr_waiting;
++  *	atomic_t	*nr_queued;
++  *	atomic_t	*barrier;
++  * Each of them points to array of atomic_t variables, each array is
++  * designed to have BARRIER_BUCKETS_NR elements and occupy a single
++  * memory page. The data width of atomic_t variables is 4 bytes, equal
++  * to 1<<(ilog2(sizeof(atomic_t))), BARRIER_BUCKETS_NR_BITS is defined
++  * as (PAGE_SHIFT - ilog2(sizeof(int))) to make sure an array of
++  * atomic_t variables with BARRIER_BUCKETS_NR elements just exactly
++  * occupies a single memory page.
++  */
++ #define BARRIER_BUCKETS_NR_BITS		(PAGE_SHIFT - ilog2(sizeof(atomic_t)))
++ #define BARRIER_BUCKETS_NR		(1<<BARRIER_BUCKETS_NR_BITS)
++ 
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  struct raid1_info {
+  	struct md_rdev	*rdev;
+  	sector_t	head_position;
+@@@ -79,10 -84,10 +106,17 @@@ struct r1conf 
+  	 */
+  	wait_queue_head_t	wait_barrier;
+  	spinlock_t		resync_lock;
+++<<<<<<< HEAD
+ +	int			nr_pending;
+ +	int			nr_waiting;
+ +	int			nr_queued;
+ +	int			barrier;
+++=======
++ 	atomic_t		*nr_pending;
++ 	atomic_t		*nr_waiting;
++ 	atomic_t		*nr_queued;
++ 	atomic_t		*barrier;
+++>>>>>>> 824e47daddbf (RAID1: avoid unnecessary spin locks in I/O barrier code)
+  	int			array_frozen;
+  
+  	/* Set to 1 if a full sync is needed, (fresh device added).
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid1.h
