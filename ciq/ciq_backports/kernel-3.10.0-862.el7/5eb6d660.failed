@@ -1,0 +1,135 @@
+PCI: Add pci_msix_desc_addr() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [pci] Add pci_msix_desc_addr() helper (Ming Lei) [1389540]
+Rebuild_FUZZ: 92.54%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5eb6d660193ccc471b415d6f31e17312a63de167
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5eb6d660.failed
+
+Add a pci_msix_desc_addr() helper to factor out the calculation of the base
+address for a given MSI-X vector.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Alexander Gordeev <agordeev@redhat.com>
+(cherry picked from commit 5eb6d660193ccc471b415d6f31e17312a63de167)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/msi.c
+diff --cc drivers/pci/msi.c
+index 3127b0433131,0d94fbf95ba6..000000000000
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@@ -161,16 -202,17 +161,22 @@@ u32 default_msi_mask_irq(struct msi_des
+  	return mask_bits;
+  }
+  
+ +__weak u32 arch_msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag)
+ +{
+ +	return default_msi_mask_irq(desc, mask, flag);
+ +}
+ +
+  static void msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag)
+  {
+ -	desc->masked = __pci_msi_desc_mask_irq(desc, mask, flag);
+ +	desc->masked = arch_msi_mask_irq(desc, mask, flag);
+  }
+  
++ static void __iomem *pci_msix_desc_addr(struct msi_desc *desc)
++ {
++ 	return desc->mask_base +
++ 		desc->msi_attrib.entry_nr * PCI_MSIX_ENTRY_SIZE;
++ }
++ 
+  /*
+   * This internal function does not flush PCI writes to the device.
+   * All users must ensure that they read from the device before either
+@@@ -178,11 -220,13 +184,18 @@@
+   * file.  This saves a few milliseconds when initialising devices with lots
+   * of MSI-X interrupts.
+   */
+ -u32 __pci_msix_desc_mask_irq(struct msi_desc *desc, u32 flag)
+ +u32 default_msix_mask_irq(struct msi_desc *desc, u32 flag)
+  {
+  	u32 mask_bits = desc->masked;
+++<<<<<<< HEAD
+ +	unsigned offset = desc->msi_attrib.entry_nr * PCI_MSIX_ENTRY_SIZE +
+ +						PCI_MSIX_ENTRY_VECTOR_CTRL;
+++=======
++ 
++ 	if (pci_msi_ignore_mask)
++ 		return 0;
++ 
+++>>>>>>> 5eb6d660193c (PCI: Add pci_msix_desc_addr() helper)
+  	mask_bits &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
+  	if (flag)
+  		mask_bits |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
+@@@ -236,13 -281,14 +249,12 @@@ void default_restore_msi_irqs(struct pc
+  		default_restore_msi_irq(dev, entry->irq);
+  }
+  
+ -void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ +void __read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+  {
+ -	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
+ -
+ -	BUG_ON(dev->current_state != PCI_D0);
+ +	BUG_ON(entry->dev->current_state != PCI_D0);
+  
+  	if (entry->msi_attrib.is_msix) {
+- 		void __iomem *base = entry->mask_base +
+- 			entry->msi_attrib.entry_nr * PCI_MSIX_ENTRY_SIZE;
++ 		void __iomem *base = pci_msix_desc_addr(entry);
+  
+  		msg->address_lo = readl(base + PCI_MSIX_ENTRY_LOWER_ADDR);
+  		msg->address_hi = readl(base + PCI_MSIX_ENTRY_UPPER_ADDR);
+@@@ -266,39 -311,14 +278,37 @@@
+  	}
+  }
+  
+ -void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ +void read_msi_msg(unsigned int irq, struct msi_msg *msg)
+ +{
+ +	struct msi_desc *entry = irq_get_msi_desc(irq);
+ +
+ +	__read_msi_msg(entry, msg);
+ +}
+ +
+ +void __get_cached_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ +{
+ +	/* Assert that the cache is valid, assuming that
+ +	 * valid messages are not all-zeroes. */
+ +	BUG_ON(!(entry->msg.address_hi | entry->msg.address_lo |
+ +		 entry->msg.data));
+ +
+ +	*msg = entry->msg;
+ +}
+ +
+ +void get_cached_msi_msg(unsigned int irq, struct msi_msg *msg)
+  {
+ -	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
+ +	struct msi_desc *entry = irq_get_msi_desc(irq);
+  
+ -	if (dev->current_state != PCI_D0) {
+ +	__get_cached_msi_msg(entry, msg);
+ +}
+ +EXPORT_SYMBOL_GPL(get_cached_msi_msg);
+ +
+ +void __write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ +{
+ +	if (entry->dev->current_state != PCI_D0) {
+  		/* Don't touch the hardware now */
+  	} else if (entry->msi_attrib.is_msix) {
+- 		void __iomem *base;
+- 		base = entry->mask_base +
+- 			entry->msi_attrib.entry_nr * PCI_MSIX_ENTRY_SIZE;
++ 		void __iomem *base = pci_msix_desc_addr(entry);
+  
+  		writel(msg->address_lo, base + PCI_MSIX_ENTRY_LOWER_ADDR);
+  		writel(msg->address_hi, base + PCI_MSIX_ENTRY_UPPER_ADDR);
+* Unmerged path drivers/pci/msi.c
