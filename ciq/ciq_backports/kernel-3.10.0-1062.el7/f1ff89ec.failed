@@ -1,0 +1,350 @@
+kvm: x86: hyperv: avoid livelock in oneshot SynIC timers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Roman Kagan <rkagan@virtuozzo.com>
+commit f1ff89ec4447c4e39d275a1ca3de43eed2a92745
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f1ff89ec.failed
+
+If the SynIC timer message delivery fails due to SINT message slot being
+busy, there's no point to attempt starting the timer again until we're
+notified of the slot being released by the guest (via EOM or EOI).
+
+Even worse, when a oneshot timer fails to deliver its message, its
+re-arming with an expiration time in the past leads to immediate retry
+of the delivery, and so on, without ever letting the guest vcpu to run
+and release the slot, which results in a livelock.
+
+To avoid that, only start the timer when there's no timer message
+pending delivery.  When there is, meaning the slot is busy, the
+processing will be restarted upon notification from the guest that the
+slot is released.
+
+	Signed-off-by: Roman Kagan <rkagan@virtuozzo.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit f1ff89ec4447c4e39d275a1ca3de43eed2a92745)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/hyperv.c
+diff --cc arch/x86/kvm/hyperv.c
+index a44fd11c98a7,337b6d2730fa..000000000000
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@@ -49,6 -420,310 +49,313 @@@ static u64 get_time_ref_counter(struct 
+  		+ hv->tsc_ref.tsc_offset;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void stimer_mark_pending(struct kvm_vcpu_hv_stimer *stimer,
++ 				bool vcpu_kick)
++ {
++ 	struct kvm_vcpu *vcpu = stimer_to_vcpu(stimer);
++ 
++ 	set_bit(stimer->index,
++ 		vcpu_to_hv_vcpu(vcpu)->stimer_pending_bitmap);
++ 	kvm_make_request(KVM_REQ_HV_STIMER, vcpu);
++ 	if (vcpu_kick)
++ 		kvm_vcpu_kick(vcpu);
++ }
++ 
++ static void stimer_cleanup(struct kvm_vcpu_hv_stimer *stimer)
++ {
++ 	struct kvm_vcpu *vcpu = stimer_to_vcpu(stimer);
++ 
++ 	trace_kvm_hv_stimer_cleanup(stimer_to_vcpu(stimer)->vcpu_id,
++ 				    stimer->index);
++ 
++ 	hrtimer_cancel(&stimer->timer);
++ 	clear_bit(stimer->index,
++ 		  vcpu_to_hv_vcpu(vcpu)->stimer_pending_bitmap);
++ 	stimer->msg_pending = false;
++ 	stimer->exp_time = 0;
++ }
++ 
++ static enum hrtimer_restart stimer_timer_callback(struct hrtimer *timer)
++ {
++ 	struct kvm_vcpu_hv_stimer *stimer;
++ 
++ 	stimer = container_of(timer, struct kvm_vcpu_hv_stimer, timer);
++ 	trace_kvm_hv_stimer_callback(stimer_to_vcpu(stimer)->vcpu_id,
++ 				     stimer->index);
++ 	stimer_mark_pending(stimer, true);
++ 
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ /*
++  * stimer_start() assumptions:
++  * a) stimer->count is not equal to 0
++  * b) stimer->config has HV_STIMER_ENABLE flag
++  */
++ static int stimer_start(struct kvm_vcpu_hv_stimer *stimer)
++ {
++ 	u64 time_now;
++ 	ktime_t ktime_now;
++ 
++ 	time_now = get_time_ref_counter(stimer_to_vcpu(stimer)->kvm);
++ 	ktime_now = ktime_get();
++ 
++ 	if (stimer->config & HV_STIMER_PERIODIC) {
++ 		if (stimer->exp_time) {
++ 			if (time_now >= stimer->exp_time) {
++ 				u64 remainder;
++ 
++ 				div64_u64_rem(time_now - stimer->exp_time,
++ 					      stimer->count, &remainder);
++ 				stimer->exp_time =
++ 					time_now + (stimer->count - remainder);
++ 			}
++ 		} else
++ 			stimer->exp_time = time_now + stimer->count;
++ 
++ 		trace_kvm_hv_stimer_start_periodic(
++ 					stimer_to_vcpu(stimer)->vcpu_id,
++ 					stimer->index,
++ 					time_now, stimer->exp_time);
++ 
++ 		hrtimer_start(&stimer->timer,
++ 			      ktime_add_ns(ktime_now,
++ 					   100 * (stimer->exp_time - time_now)),
++ 			      HRTIMER_MODE_ABS);
++ 		return 0;
++ 	}
++ 	stimer->exp_time = stimer->count;
++ 	if (time_now >= stimer->count) {
++ 		/*
++ 		 * Expire timer according to Hypervisor Top-Level Functional
++ 		 * specification v4(15.3.1):
++ 		 * "If a one shot is enabled and the specified count is in
++ 		 * the past, it will expire immediately."
++ 		 */
++ 		stimer_mark_pending(stimer, false);
++ 		return 0;
++ 	}
++ 
++ 	trace_kvm_hv_stimer_start_one_shot(stimer_to_vcpu(stimer)->vcpu_id,
++ 					   stimer->index,
++ 					   time_now, stimer->count);
++ 
++ 	hrtimer_start(&stimer->timer,
++ 		      ktime_add_ns(ktime_now, 100 * (stimer->count - time_now)),
++ 		      HRTIMER_MODE_ABS);
++ 	return 0;
++ }
++ 
++ static int stimer_set_config(struct kvm_vcpu_hv_stimer *stimer, u64 config,
++ 			     bool host)
++ {
++ 	trace_kvm_hv_stimer_set_config(stimer_to_vcpu(stimer)->vcpu_id,
++ 				       stimer->index, config, host);
++ 
++ 	stimer_cleanup(stimer);
++ 	if ((stimer->config & HV_STIMER_ENABLE) && HV_STIMER_SINT(config) == 0)
++ 		config &= ~HV_STIMER_ENABLE;
++ 	stimer->config = config;
++ 	stimer_mark_pending(stimer, false);
++ 	return 0;
++ }
++ 
++ static int stimer_set_count(struct kvm_vcpu_hv_stimer *stimer, u64 count,
++ 			    bool host)
++ {
++ 	trace_kvm_hv_stimer_set_count(stimer_to_vcpu(stimer)->vcpu_id,
++ 				      stimer->index, count, host);
++ 
++ 	stimer_cleanup(stimer);
++ 	stimer->count = count;
++ 	if (stimer->count == 0)
++ 		stimer->config &= ~HV_STIMER_ENABLE;
++ 	else if (stimer->config & HV_STIMER_AUTOENABLE)
++ 		stimer->config |= HV_STIMER_ENABLE;
++ 	stimer_mark_pending(stimer, false);
++ 	return 0;
++ }
++ 
++ static int stimer_get_config(struct kvm_vcpu_hv_stimer *stimer, u64 *pconfig)
++ {
++ 	*pconfig = stimer->config;
++ 	return 0;
++ }
++ 
++ static int stimer_get_count(struct kvm_vcpu_hv_stimer *stimer, u64 *pcount)
++ {
++ 	*pcount = stimer->count;
++ 	return 0;
++ }
++ 
++ static int synic_deliver_msg(struct kvm_vcpu_hv_synic *synic, u32 sint,
++ 			     struct hv_message *src_msg)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	struct page *page;
++ 	gpa_t gpa;
++ 	struct hv_message *dst_msg;
++ 	int r;
++ 	struct hv_message_page *msg_page;
++ 
++ 	if (!(synic->msg_page & HV_SYNIC_SIMP_ENABLE))
++ 		return -ENOENT;
++ 
++ 	gpa = synic->msg_page & PAGE_MASK;
++ 	page = kvm_vcpu_gfn_to_page(vcpu, gpa >> PAGE_SHIFT);
++ 	if (is_error_page(page))
++ 		return -EFAULT;
++ 
++ 	msg_page = kmap_atomic(page);
++ 	dst_msg = &msg_page->sint_message[sint];
++ 	if (sync_cmpxchg(&dst_msg->header.message_type, HVMSG_NONE,
++ 			 src_msg->header.message_type) != HVMSG_NONE) {
++ 		dst_msg->header.message_flags.msg_pending = 1;
++ 		r = -EAGAIN;
++ 	} else {
++ 		memcpy(&dst_msg->u.payload, &src_msg->u.payload,
++ 		       src_msg->header.payload_size);
++ 		dst_msg->header.message_type = src_msg->header.message_type;
++ 		dst_msg->header.payload_size = src_msg->header.payload_size;
++ 		r = synic_set_irq(synic, sint);
++ 		if (r >= 1)
++ 			r = 0;
++ 		else if (r == 0)
++ 			r = -EFAULT;
++ 	}
++ 	kunmap_atomic(msg_page);
++ 	kvm_release_page_dirty(page);
++ 	kvm_vcpu_mark_page_dirty(vcpu, gpa >> PAGE_SHIFT);
++ 	return r;
++ }
++ 
++ static int stimer_send_msg(struct kvm_vcpu_hv_stimer *stimer)
++ {
++ 	struct kvm_vcpu *vcpu = stimer_to_vcpu(stimer);
++ 	struct hv_message *msg = &stimer->msg;
++ 	struct hv_timer_message_payload *payload =
++ 			(struct hv_timer_message_payload *)&msg->u.payload;
++ 
++ 	payload->expiration_time = stimer->exp_time;
++ 	payload->delivery_time = get_time_ref_counter(vcpu->kvm);
++ 	return synic_deliver_msg(vcpu_to_synic(vcpu),
++ 				 HV_STIMER_SINT(stimer->config), msg);
++ }
++ 
++ static void stimer_expiration(struct kvm_vcpu_hv_stimer *stimer)
++ {
++ 	int r;
++ 
++ 	stimer->msg_pending = true;
++ 	r = stimer_send_msg(stimer);
++ 	trace_kvm_hv_stimer_expiration(stimer_to_vcpu(stimer)->vcpu_id,
++ 				       stimer->index, r);
++ 	if (!r) {
++ 		stimer->msg_pending = false;
++ 		if (!(stimer->config & HV_STIMER_PERIODIC))
++ 			stimer->config &= ~HV_STIMER_ENABLE;
++ 	}
++ }
++ 
++ void kvm_hv_process_stimers(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_vcpu_hv *hv_vcpu = vcpu_to_hv_vcpu(vcpu);
++ 	struct kvm_vcpu_hv_stimer *stimer;
++ 	u64 time_now, exp_time;
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(hv_vcpu->stimer); i++)
++ 		if (test_and_clear_bit(i, hv_vcpu->stimer_pending_bitmap)) {
++ 			stimer = &hv_vcpu->stimer[i];
++ 			if (stimer->config & HV_STIMER_ENABLE) {
++ 				exp_time = stimer->exp_time;
++ 
++ 				if (exp_time) {
++ 					time_now =
++ 						get_time_ref_counter(vcpu->kvm);
++ 					if (time_now >= exp_time)
++ 						stimer_expiration(stimer);
++ 				}
++ 
++ 				if ((stimer->config & HV_STIMER_ENABLE) &&
++ 				    stimer->count) {
++ 					if (!stimer->msg_pending)
++ 						stimer_start(stimer);
++ 				} else
++ 					stimer_cleanup(stimer);
++ 			}
++ 		}
++ }
++ 
++ void kvm_hv_vcpu_uninit(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_vcpu_hv *hv_vcpu = vcpu_to_hv_vcpu(vcpu);
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(hv_vcpu->stimer); i++)
++ 		stimer_cleanup(&hv_vcpu->stimer[i]);
++ }
++ 
++ static void stimer_prepare_msg(struct kvm_vcpu_hv_stimer *stimer)
++ {
++ 	struct hv_message *msg = &stimer->msg;
++ 	struct hv_timer_message_payload *payload =
++ 			(struct hv_timer_message_payload *)&msg->u.payload;
++ 
++ 	memset(&msg->header, 0, sizeof(msg->header));
++ 	msg->header.message_type = HVMSG_TIMER_EXPIRED;
++ 	msg->header.payload_size = sizeof(*payload);
++ 
++ 	payload->timer_index = stimer->index;
++ 	payload->expiration_time = 0;
++ 	payload->delivery_time = 0;
++ }
++ 
++ static void stimer_init(struct kvm_vcpu_hv_stimer *stimer, int timer_index)
++ {
++ 	memset(stimer, 0, sizeof(*stimer));
++ 	stimer->index = timer_index;
++ 	hrtimer_init(&stimer->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++ 	stimer->timer.function = stimer_timer_callback;
++ 	stimer_prepare_msg(stimer);
++ }
++ 
++ void kvm_hv_vcpu_init(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_vcpu_hv *hv_vcpu = vcpu_to_hv_vcpu(vcpu);
++ 	int i;
++ 
++ 	synic_init(&hv_vcpu->synic);
++ 
++ 	bitmap_zero(hv_vcpu->stimer_pending_bitmap, HV_SYNIC_STIMER_COUNT);
++ 	for (i = 0; i < ARRAY_SIZE(hv_vcpu->stimer); i++)
++ 		stimer_init(&hv_vcpu->stimer[i], i);
++ }
++ 
++ void kvm_hv_vcpu_postcreate(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_vcpu_hv *hv_vcpu = vcpu_to_hv_vcpu(vcpu);
++ 
++ 	hv_vcpu->vp_index = kvm_vcpu_get_idx(vcpu);
++ }
++ 
++ int kvm_hv_activate_synic(struct kvm_vcpu *vcpu, bool dont_zero_synic_pages)
++ {
++ 	struct kvm_vcpu_hv_synic *synic = vcpu_to_synic(vcpu);
++ 
++ 	/*
++ 	 * Hyper-V SynIC auto EOI SINT's are
++ 	 * not compatible with APICV, so deactivate APICV
++ 	 */
++ 	kvm_vcpu_deactivate_apicv(vcpu);
++ 	synic->active = true;
++ 	synic->dont_zero_synic_pages = dont_zero_synic_pages;
++ 	return 0;
++ }
++ 
+++>>>>>>> f1ff89ec4447 (kvm: x86: hyperv: avoid livelock in oneshot SynIC timers)
+  static bool kvm_hv_msr_partition_wide(u32 msr)
+  {
+  	bool r = false;
+* Unmerged path arch/x86/kvm/hyperv.c
