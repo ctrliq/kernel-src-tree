@@ -1,0 +1,135 @@
+autofs: add strictexpire mount option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Ian Kent <raven@themaw.net>
+commit f5162216b7dab0c07e070b8b7f98891a85047f59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f5162216.failed
+
+Commit 092a53452bb7 ("autofs: take more care to not update last_used on
+path walk") helped to (partially) resolve a problem where automounts
+were not expiring due to aggressive accesses from user space.
+
+This patch was later reverted because, for very large environments, it
+meant more mount requests from clients and when there are a lot of
+clients this caused a fairly significant increase in server load.
+
+But there is a need for both types of expire check, depending on use
+case, so add a mount option to allow for strict update of last use of
+autofs dentrys (which just means not updating the last use on path walk
+access).
+
+Link: http://lkml.kernel.org/r/154296973880.9889.14085372741514507967.stgit@pluto-themaw-net
+	Signed-off-by: Ian Kent <raven@themaw.net>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f5162216b7dab0c07e070b8b7f98891a85047f59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/autofs4/autofs_i.h
+#	include/uapi/linux/auto_fs.h
+diff --cc fs/autofs4/autofs_i.h
+index 7e44fa72be46,3e59f0ed777b..000000000000
+--- a/fs/autofs4/autofs_i.h
++++ b/fs/autofs4/autofs_i.h
+@@@ -98,6 -103,9 +98,12 @@@ struct autofs_wait_queue 
+  
+  #define AUTOFS_SBI_MAGIC 0x6d4a556d
+  
+++<<<<<<< HEAD:fs/autofs4/autofs_i.h
+++=======
++ #define AUTOFS_SBI_CATATONIC	0x0001
++ #define AUTOFS_SBI_STRICTEXPIRE 0x0002
++ 
+++>>>>>>> f5162216b7da (autofs: add strictexpire mount option):fs/autofs/autofs_i.h
+  struct autofs_sb_info {
+  	u32 magic;
+  	int pipefd;
+diff --cc include/uapi/linux/auto_fs.h
+index aa63451ef20a,082119630b49..000000000000
+--- a/include/uapi/linux/auto_fs.h
++++ b/include/uapi/linux/auto_fs.h
+@@@ -17,13 -19,11 +17,17 @@@
+  #include <sys/ioctl.h>
+  #endif /* __KERNEL__ */
+  
+ -#define AUTOFS_PROTO_VERSION		5
+ -#define AUTOFS_MIN_PROTO_VERSION	3
+ -#define AUTOFS_MAX_PROTO_VERSION	5
+  
+++<<<<<<< HEAD
+ +/* This file describes autofs v3 */
+ +#define AUTOFS_PROTO_VERSION	3
+ +
+ +/* Range of protocol versions defined */
+ +#define AUTOFS_MAX_PROTO_VERSION	AUTOFS_PROTO_VERSION
+ +#define AUTOFS_MIN_PROTO_VERSION	AUTOFS_PROTO_VERSION
+++=======
++ #define AUTOFS_PROTO_SUBVERSION		4
+++>>>>>>> f5162216b7da (autofs: add strictexpire mount option)
+  
+  /*
+   * The wait_queue_token (autofs_wqt_t) is part of a structure which is passed
+* Unmerged path fs/autofs4/autofs_i.h
+diff --git a/fs/autofs4/inode.c b/fs/autofs4/inode.c
+index daa9be09297c..0d046a3eafcf 100644
+--- a/fs/autofs4/inode.c
++++ b/fs/autofs4/inode.c
+@@ -92,6 +92,8 @@ static int autofs4_show_options(struct seq_file *m, struct dentry *root)
+ 		seq_printf(m, ",direct");
+ 	else
+ 		seq_printf(m, ",indirect");
++	if (sbi->flags & AUTOFS_SBI_STRICTEXPIRE)
++		seq_printf(m, ",strictexpire");
+ #ifdef CONFIG_CHECKPOINT_RESTORE
+ 	if (sbi->pipe)
+ 		seq_printf(m, ",pipe_ino=%ld", sbi->pipe->f_inode->i_ino);
+@@ -114,7 +116,7 @@ static const struct super_operations autofs4_sops = {
+ };
+ 
+ enum {Opt_err, Opt_fd, Opt_uid, Opt_gid, Opt_pgrp, Opt_minproto, Opt_maxproto,
+-	Opt_indirect, Opt_direct, Opt_offset};
++	Opt_indirect, Opt_direct, Opt_offset, Opt_strictexpire};
+ 
+ static const match_table_t tokens = {
+ 	{Opt_fd, "fd=%u"},
+@@ -126,6 +128,7 @@ static const match_table_t tokens = {
+ 	{Opt_indirect, "indirect"},
+ 	{Opt_direct, "direct"},
+ 	{Opt_offset, "offset"},
++	{Opt_strictexpire, "strictexpire"},
+ 	{Opt_err, NULL}
+ };
+ 
+@@ -205,6 +208,9 @@ static int parse_options(char *options,
+ 		case Opt_offset:
+ 			set_autofs_type_offset(&sbi->type);
+ 			break;
++		case Opt_strictexpire:
++			sbi->flags |= AUTOFS_SBI_STRICTEXPIRE;
++			break;
+ 		default:
+ 			return 1;
+ 		}
+diff --git a/fs/autofs4/root.c b/fs/autofs4/root.c
+index 4975f663a9f2..b51f9fbbbe92 100644
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -281,8 +281,11 @@ static int autofs4_mount_wait(const struct path *path, bool rcu_walk)
+ 		pr_debug("waiting for mount name=%pd\n", path->dentry);
+ 		status = autofs4_wait(sbi, path, NFY_MOUNT);
+ 		pr_debug("mount wait done status=%d\n", status);
++		ino->last_used = jiffies;
++		return status;
+ 	}
+-	ino->last_used = jiffies;
++	if (!(sbi->flags & AUTOFS_SBI_STRICTEXPIRE))
++		ino->last_used = jiffies;
+ 	return status;
+ }
+ 
+* Unmerged path include/uapi/linux/auto_fs.h
