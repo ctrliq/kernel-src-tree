@@ -1,0 +1,380 @@
+net/mlx5e: Enable adaptive-TX moderation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Enable adaptive-TX moderation (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 94.74%
+commit-author Tal Gilboa <talgi@mellanox.com>
+commit cbce4f44479856cd4621e3dce531cfb078357b1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cbce4f44.failed
+
+Add support for adaptive TX moderation. This greatly reduces TX interrupt
+rate and increases bandwidth, mostly for TCP bandwidth over ARM
+architecture (below). There is a slight single stream TCP with very large
+message sizes degradation (x86). In this case if there's any moderation on
+transmitted packets the bandwidth would reduce due to hitting TCP output limit.
+Since this is a synthetic case, this is still worth doing.
+
+Performance improvement (ConnectX-4Lx 40GbE, ARM)
+TCP 64B bandwidth with 1-50 streams increased 6-35%.
+TCP 64B bandwidth with 100-500 streams increased 20-70%.
+
+Performance improvement (ConnectX-5 100GbE, x86)
+Bandwidth: increased up to 40% (1024B with 10s of streams).
+Interrupt rate: reduced up to 50% (1024B with 1000s of streams).
+
+Performance degradation (ConnectX-5 100GbE, x86)
+Bandwidth: up to 10% decrease single stream TCP (1MB message size from
+51Gb/s to 47Gb/s).
+
+	Signed-off-by: Tal Gilboa <talgi@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Acked-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cbce4f44479856cd4621e3dce531cfb078357b1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index b54d059b5bf3,900661d45c8a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@@ -38,12 -37,37 +38,36 @@@ static inline bool mlx5e_channel_no_aff
+  {
+  	int current_cpu = smp_processor_id();
+  	const struct cpumask *aff;
+ -	struct irq_data *idata;
+  
+ -	idata = irq_desc_get_irq_data(c->irq_desc);
+ -	aff = irq_data_get_affinity_mask(idata);
+ +	aff = irq_desc_get_irq_data(c->irq_desc)->affinity;
+  	return cpumask_test_cpu(current_cpu, aff);
+  }
+ +#endif
+  
++ static void mlx5e_handle_tx_dim(struct mlx5e_txqsq *sq)
++ {
++ 	struct net_dim_sample dim_sample;
++ 
++ 	if (unlikely(!MLX5E_TEST_BIT(sq->state, MLX5E_SQ_STATE_AM)))
++ 		return;
++ 
++ 	net_dim_sample(sq->cq.event_ctr, sq->stats.packets, sq->stats.bytes,
++ 		       &dim_sample);
++ 	net_dim(&sq->dim, dim_sample);
++ }
++ 
++ static void mlx5e_handle_rx_dim(struct mlx5e_rq *rq)
++ {
++ 	struct net_dim_sample dim_sample;
++ 
++ 	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_AM)))
++ 		return;
++ 
++ 	net_dim_sample(rq->cq.event_ctr, rq->stats.packets, rq->stats.bytes,
++ 		       &dim_sample);
++ 	net_dim(&rq->dim, dim_sample);
++ }
++ 
+  int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+  {
+  	struct mlx5e_channel *c = container_of(napi, struct mlx5e_channel,
+@@@ -77,18 -99,13 +101,24 @@@
+  	if (unlikely(!napi_complete_done(napi, work_done)))
+  		return work_done;
+  
+- 	for (i = 0; i < c->num_tc; i++)
++ 	for (i = 0; i < c->num_tc; i++) {
++ 		mlx5e_handle_tx_dim(&c->sq[i]);
+  		mlx5e_cq_arm(&c->sq[i].cq);
+++<<<<<<< HEAD
+ +
+ +	if (MLX5E_TEST_BIT(c->rq.state, MLX5E_RQ_STATE_AM)) {
+ +		struct net_dim_sample dim_sample;
+ +		net_dim_sample(c->rq.cq.event_ctr,
+ +			       c->rq.stats->packets,
+ +			       c->rq.stats->bytes,
+ +			       &dim_sample);
+ +		net_dim(&c->rq.dim, dim_sample);
+++=======
+++>>>>>>> cbce4f444798 (net/mlx5e: Enable adaptive-TX moderation)
+  	}
+  
++ 	mlx5e_handle_rx_dim(&c->rq);
++ 
+  	mlx5e_cq_arm(&c->rq.cq);
+  	mlx5e_cq_arm(&c->icosq.cq);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 13394c230883..9c434991a9a7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -247,6 +247,7 @@ struct mlx5e_params {
+ 	bool vlan_strip_disable;
+ 	bool scatter_fcs_en;
+ 	bool rx_dim_enabled;
++	bool tx_dim_enabled;
+ 	u32 lro_timeout;
+ 	u32 pflags;
+ 	struct bpf_prog *xdp_prog;
+@@ -335,6 +336,7 @@ struct mlx5e_sq_dma {
+ enum {
+ 	MLX5E_SQ_STATE_ENABLED,
+ 	MLX5E_SQ_STATE_IPSEC,
++	MLX5E_SQ_STATE_AM,
+ };
+ 
+ struct mlx5e_sq_wqe_info {
+@@ -347,6 +349,7 @@ struct mlx5e_txqsq {
+ 	/* dirtied @completion */
+ 	u16                        cc;
+ 	u32                        dma_fifo_cc;
++	struct net_dim             dim; /* Adaptive Moderation */
+ 
+ 	/* dirtied @xmit */
+ 	u16                        pc ____cacheline_aligned_in_smp;
+@@ -1120,4 +1123,5 @@ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+ 			    u16 max_channels, u16 mtu);
+ u8 mlx5e_params_calculate_tx_min_inline(struct mlx5_core_dev *mdev);
+ void mlx5e_rx_dim_work(struct work_struct *work);
++void mlx5e_tx_dim_work(struct work_struct *work);
+ #endif /* __MLX5_EN_H__ */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_dim.c b/drivers/net/ethernet/mellanox/mlx5/core/en_dim.c
+index 1b286e1985d2..d67adf70a97b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_dim.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_dim.c
+@@ -33,16 +33,30 @@
+ #include <linux/net_dim.h>
+ #include "en.h"
+ 
++static void
++mlx5e_complete_dim_work(struct net_dim *dim, struct net_dim_cq_moder moder,
++			struct mlx5_core_dev *mdev, struct mlx5_core_cq *mcq)
++{
++	mlx5_core_modify_cq_moderation(mdev, mcq, moder.usec, moder.pkts);
++	dim->state = NET_DIM_START_MEASURE;
++}
++
+ void mlx5e_rx_dim_work(struct work_struct *work)
+ {
+-	struct net_dim *dim = container_of(work, struct net_dim,
+-					   work);
++	struct net_dim *dim = container_of(work, struct net_dim, work);
+ 	struct mlx5e_rq *rq = container_of(dim, struct mlx5e_rq, dim);
+ 	struct net_dim_cq_moder cur_moder =
+ 		net_dim_get_rx_moderation(dim->mode, dim->profile_ix);
+ 
+-	mlx5_core_modify_cq_moderation(rq->mdev, &rq->cq.mcq,
+-				       cur_moder.usec, cur_moder.pkts);
++	mlx5e_complete_dim_work(dim, cur_moder, rq->mdev, &rq->cq.mcq);
++}
+ 
+-	dim->state = NET_DIM_START_MEASURE;
++void mlx5e_tx_dim_work(struct work_struct *work)
++{
++	struct net_dim *dim = container_of(work, struct net_dim, work);
++	struct mlx5e_txqsq *sq = container_of(dim, struct mlx5e_txqsq, dim);
++	struct net_dim_cq_moder cur_moder =
++		net_dim_get_tx_moderation(dim->mode, dim->profile_ix);
++
++	mlx5e_complete_dim_work(dim, cur_moder, sq->cq.mdev, &sq->cq.mcq);
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 79aa7ade1ade..bb861365aefc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -454,14 +454,20 @@ static int mlx5e_set_channels(struct net_device *dev,
+ int mlx5e_ethtool_get_coalesce(struct mlx5e_priv *priv,
+ 			       struct ethtool_coalesce *coal)
+ {
++	struct net_dim_cq_moder *rx_moder, *tx_moder;
++
+ 	if (!MLX5_CAP_GEN(priv->mdev, cq_moderation))
+ 		return -EOPNOTSUPP;
+ 
+-	coal->rx_coalesce_usecs       = priv->channels.params.rx_cq_moderation.usec;
+-	coal->rx_max_coalesced_frames = priv->channels.params.rx_cq_moderation.pkts;
+-	coal->tx_coalesce_usecs       = priv->channels.params.tx_cq_moderation.usec;
+-	coal->tx_max_coalesced_frames = priv->channels.params.tx_cq_moderation.pkts;
+-	coal->use_adaptive_rx_coalesce = priv->channels.params.rx_dim_enabled;
++	rx_moder = &priv->channels.params.rx_cq_moderation;
++	coal->rx_coalesce_usecs		= rx_moder->usec;
++	coal->rx_max_coalesced_frames	= rx_moder->pkts;
++	coal->use_adaptive_rx_coalesce	= priv->channels.params.rx_dim_enabled;
++
++	tx_moder = &priv->channels.params.tx_cq_moderation;
++	coal->tx_coalesce_usecs		= tx_moder->usec;
++	coal->tx_max_coalesced_frames	= tx_moder->pkts;
++	coal->use_adaptive_tx_coalesce	= priv->channels.params.tx_dim_enabled;
+ 
+ 	return 0;
+ }
+@@ -503,6 +509,7 @@ mlx5e_set_priv_channels_coalesce(struct mlx5e_priv *priv, struct ethtool_coalesc
+ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
+ 			       struct ethtool_coalesce *coal)
+ {
++	struct net_dim_cq_moder *rx_moder, *tx_moder;
+ 	struct mlx5_core_dev *mdev = priv->mdev;
+ 	struct mlx5e_channels new_channels = {};
+ 	int err = 0;
+@@ -528,11 +535,15 @@ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
+ 	mutex_lock(&priv->state_lock);
+ 	new_channels.params = priv->channels.params;
+ 
+-	new_channels.params.tx_cq_moderation.usec = coal->tx_coalesce_usecs;
+-	new_channels.params.tx_cq_moderation.pkts = coal->tx_max_coalesced_frames;
+-	new_channels.params.rx_cq_moderation.usec = coal->rx_coalesce_usecs;
+-	new_channels.params.rx_cq_moderation.pkts = coal->rx_max_coalesced_frames;
+-	new_channels.params.rx_dim_enabled        = !!coal->use_adaptive_rx_coalesce;
++	rx_moder          = &new_channels.params.rx_cq_moderation;
++	rx_moder->usec    = coal->rx_coalesce_usecs;
++	rx_moder->pkts    = coal->rx_max_coalesced_frames;
++	new_channels.params.rx_dim_enabled = !!coal->use_adaptive_rx_coalesce;
++
++	tx_moder          = &new_channels.params.tx_cq_moderation;
++	tx_moder->usec    = coal->tx_coalesce_usecs;
++	tx_moder->pkts    = coal->tx_max_coalesced_frames;
++	new_channels.params.tx_dim_enabled = !!coal->use_adaptive_tx_coalesce;
+ 
+ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ 		priv->channels.params = new_channels.params;
+@@ -540,7 +551,9 @@ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
+ 	}
+ 	/* we are opened */
+ 
+-	reset = !!coal->use_adaptive_rx_coalesce != priv->channels.params.rx_dim_enabled;
++	reset = (!!coal->use_adaptive_rx_coalesce != priv->channels.params.rx_dim_enabled) ||
++		(!!coal->use_adaptive_tx_coalesce != priv->channels.params.tx_dim_enabled);
++
+ 	if (!reset) {
+ 		mlx5e_set_priv_channels_coalesce(priv, coal);
+ 		priv->channels.params = new_channels.params;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a685c1b39acc..8b53adf64d07 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -999,6 +999,9 @@ static int mlx5e_alloc_txqsq(struct mlx5e_channel *c,
+ 	if (err)
+ 		goto err_sq_wq_destroy;
+ 
++	INIT_WORK(&sq->dim.work, mlx5e_tx_dim_work);
++	sq->dim.mode = params->tx_cq_moderation.cq_period_mode;
++
+ 	sq->edge = (sq->wq.sz_m1 + 1) - MLX5_SEND_WQE_MAX_WQEBBS;
+ 
+ 	return 0;
+@@ -1162,6 +1165,9 @@ static int mlx5e_open_txqsq(struct mlx5e_channel *c,
+ 	if (tx_rate)
+ 		mlx5e_set_sq_maxrate(c->netdev, sq, tx_rate);
+ 
++	if (params->tx_dim_enabled)
++		sq->state |= BIT(MLX5E_SQ_STATE_AM);
++
+ 	return 0;
+ 
+ err_free_txqsq:
+@@ -3975,18 +3981,48 @@ static bool slow_pci_heuristic(struct mlx5_core_dev *mdev)
+ 		link_speed > MLX5E_SLOW_PCI_RATIO * pci_bw;
+ }
+ 
+-void mlx5e_set_tx_cq_mode_params(struct mlx5e_params *params, u8 cq_period_mode)
++static struct net_dim_cq_moder mlx5e_get_def_tx_moderation(u8 cq_period_mode)
+ {
+-	params->tx_cq_moderation.cq_period_mode = cq_period_mode;
++	struct net_dim_cq_moder moder;
++
++	moder.cq_period_mode = cq_period_mode;
++	moder.pkts = MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_PKTS;
++	moder.usec = MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_USEC;
++	if (cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE)
++		moder.usec = MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_USEC_FROM_CQE;
++
++	return moder;
++}
+ 
+-	params->tx_cq_moderation.pkts =
+-		MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_PKTS;
+-	params->tx_cq_moderation.usec =
+-		MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_USEC;
++static struct net_dim_cq_moder mlx5e_get_def_rx_moderation(u8 cq_period_mode)
++{
++	struct net_dim_cq_moder moder;
+ 
++	moder.cq_period_mode = cq_period_mode;
++	moder.pkts = MLX5E_PARAMS_DEFAULT_RX_CQ_MODERATION_PKTS;
++	moder.usec = MLX5E_PARAMS_DEFAULT_RX_CQ_MODERATION_USEC;
+ 	if (cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE)
+-		params->tx_cq_moderation.usec =
+-			MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_USEC_FROM_CQE;
++		moder.usec = MLX5E_PARAMS_DEFAULT_RX_CQ_MODERATION_USEC_FROM_CQE;
++
++	return moder;
++}
++
++static u8 mlx5_to_net_dim_cq_period_mode(u8 cq_period_mode)
++{
++	return cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE ?
++		NET_DIM_CQ_PERIOD_MODE_START_FROM_CQE :
++		NET_DIM_CQ_PERIOD_MODE_START_FROM_EQE;
++}
++
++void mlx5e_set_tx_cq_mode_params(struct mlx5e_params *params, u8 cq_period_mode)
++{
++	if (params->tx_dim_enabled) {
++		u8 dim_period_mode = mlx5_to_net_dim_cq_period_mode(cq_period_mode);
++
++		params->tx_cq_moderation = net_dim_get_def_tx_moderation(dim_period_mode);
++	} else {
++		params->tx_cq_moderation = mlx5e_get_def_tx_moderation(cq_period_mode);
++	}
+ 
+ 	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_TX_CQE_BASED_MODER,
+ 			params->tx_cq_moderation.cq_period_mode ==
+@@ -3995,30 +4031,12 @@ void mlx5e_set_tx_cq_mode_params(struct mlx5e_params *params, u8 cq_period_mode)
+ 
+ void mlx5e_set_rx_cq_mode_params(struct mlx5e_params *params, u8 cq_period_mode)
+ {
+-	params->rx_cq_moderation.cq_period_mode = cq_period_mode;
+-
+-	params->rx_cq_moderation.pkts =
+-		MLX5E_PARAMS_DEFAULT_RX_CQ_MODERATION_PKTS;
+-	params->rx_cq_moderation.usec =
+-		MLX5E_PARAMS_DEFAULT_RX_CQ_MODERATION_USEC;
+-
+-	if (cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE)
+-		params->rx_cq_moderation.usec =
+-			MLX5E_PARAMS_DEFAULT_RX_CQ_MODERATION_USEC_FROM_CQE;
+-
+ 	if (params->rx_dim_enabled) {
+-		switch (cq_period_mode) {
+-		case MLX5_CQ_PERIOD_MODE_START_FROM_CQE:
+-			params->rx_cq_moderation =
+-				net_dim_get_def_rx_moderation(
+-					NET_DIM_CQ_PERIOD_MODE_START_FROM_CQE);
+-			break;
+-		case MLX5_CQ_PERIOD_MODE_START_FROM_EQE:
+-		default:
+-			params->rx_cq_moderation =
+-				net_dim_get_def_rx_moderation(
+-					NET_DIM_CQ_PERIOD_MODE_START_FROM_EQE);
+-		}
++		u8 dim_period_mode = mlx5_to_net_dim_cq_period_mode(cq_period_mode);
++
++		params->rx_cq_moderation = net_dim_get_def_rx_moderation(dim_period_mode);
++	} else {
++		params->rx_cq_moderation = mlx5e_get_def_rx_moderation(cq_period_mode);
+ 	}
+ 
+ 	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_CQE_BASED_MODER,
+@@ -4082,6 +4100,7 @@ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+ 			MLX5_CQ_PERIOD_MODE_START_FROM_CQE :
+ 			MLX5_CQ_PERIOD_MODE_START_FROM_EQE;
+ 	params->rx_dim_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
++	params->tx_dim_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
+ 	mlx5e_set_rx_cq_mode_params(params, rx_cq_period_mode);
+ 	mlx5e_set_tx_cq_mode_params(params, MLX5_CQ_PERIOD_MODE_START_FROM_EQE);
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
