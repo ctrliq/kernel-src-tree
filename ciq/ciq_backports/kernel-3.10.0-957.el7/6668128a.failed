@@ -1,0 +1,493 @@
+perf/core: Optimize ctx_sched_out()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6668128a9e25f7a11d25359e46df2541e6b43fc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6668128a.failed
+
+When an event group contains more events than can be scheduled on the
+hardware, iterating the full event group for ctx_sched_out is a waste
+of time.
+
+Keep track of the events that got programmed on the hardware, such
+that we can iterate this smaller list in order to schedule them out.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Carrillo-Cisneros <davidcc@google.com>
+	Cc: Dmitri Prokhorov <Dmitry.Prohorov@intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Valery Cherepennikov <valery.cherepennikov@intel.com>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6668128a9e25f7a11d25359e46df2541e6b43fc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index c93e5f6b30d7,2bb200e1bbea..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -459,8 -547,27 +459,24 @@@ struct perf_event 
+  	 *   RCU safe iterations.
+  	 */
+  	struct list_head		event_entry;
+ -
+ -	/*
+ -	 * Locked for modification by both ctx->mutex and ctx->lock; holding
+ -	 * either sufficies for read.
+ -	 */
+  	struct list_head		sibling_list;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head		active_list;
++ 	/*
++ 	 * Node on the pinned or flexible tree located at the event context;
++ 	 */
++ 	struct rb_node			group_node;
++ 	u64				group_index;
++ 	/*
++ 	 * We need storage to track the entries in perf_pmu_migrate_context; we
++ 	 * cannot use the event_entry because of RCU and we want to keep the
++ 	 * group in tact which avoids us using the other two entries.
++ 	 */
++ 	struct list_head		migrate_entry;
++ 
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  	struct hlist_node		hlist_entry;
+ -	struct list_head		active_entry;
+  	int				nr_siblings;
+  
+  	/* Not serialized. Only written during event initialization. */
+@@@ -628,9 -715,14 +644,13 @@@ struct perf_event_context 
+  	 */
+  	struct mutex			mutex;
+  
+ -	struct list_head		active_ctx_list;
+ -	struct perf_event_groups	pinned_groups;
+ -	struct perf_event_groups	flexible_groups;
+ +	struct list_head		pinned_groups;
+ +	struct list_head		flexible_groups;
+  	struct list_head		event_list;
++ 
++ 	struct list_head		pinned_active;
++ 	struct list_head		flexible_active;
++ 
+  	int				nr_events;
+  	int				nr_active;
+  	int				is_active;
+diff --cc kernel/events/core.c
+index e490cd411934,4d601c06074f..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -1440,6 -1483,172 +1440,175 @@@ ctx_group_list(struct perf_event *event
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Helper function to initializes perf_event_group trees.
++  */
++ static void perf_event_groups_init(struct perf_event_groups *groups)
++ {
++ 	groups->tree = RB_ROOT;
++ 	groups->index = 0;
++ }
++ 
++ /*
++  * Compare function for event groups;
++  *
++  * Implements complex key that first sorts by CPU and then by virtual index
++  * which provides ordering when rotating groups for the same CPU.
++  */
++ static bool
++ perf_event_groups_less(struct perf_event *left, struct perf_event *right)
++ {
++ 	if (left->cpu < right->cpu)
++ 		return true;
++ 	if (left->cpu > right->cpu)
++ 		return false;
++ 
++ 	if (left->group_index < right->group_index)
++ 		return true;
++ 	if (left->group_index > right->group_index)
++ 		return false;
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Insert @event into @groups' tree; using {@event->cpu, ++@groups->index} for
++  * key (see perf_event_groups_less). This places it last inside the CPU
++  * subtree.
++  */
++ static void
++ perf_event_groups_insert(struct perf_event_groups *groups,
++ 			 struct perf_event *event)
++ {
++ 	struct perf_event *node_event;
++ 	struct rb_node *parent;
++ 	struct rb_node **node;
++ 
++ 	event->group_index = ++groups->index;
++ 
++ 	node = &groups->tree.rb_node;
++ 	parent = *node;
++ 
++ 	while (*node) {
++ 		parent = *node;
++ 		node_event = container_of(*node, struct perf_event, group_node);
++ 
++ 		if (perf_event_groups_less(event, node_event))
++ 			node = &parent->rb_left;
++ 		else
++ 			node = &parent->rb_right;
++ 	}
++ 
++ 	rb_link_node(&event->group_node, parent, node);
++ 	rb_insert_color(&event->group_node, &groups->tree);
++ }
++ 
++ /*
++  * Helper function to insert event into the pinned or flexible groups.
++  */
++ static void
++ add_event_to_groups(struct perf_event *event, struct perf_event_context *ctx)
++ {
++ 	struct perf_event_groups *groups;
++ 
++ 	groups = get_event_groups(event, ctx);
++ 	perf_event_groups_insert(groups, event);
++ }
++ 
++ /*
++  * Delete a group from a tree.
++  */
++ static void
++ perf_event_groups_delete(struct perf_event_groups *groups,
++ 			 struct perf_event *event)
++ {
++ 	WARN_ON_ONCE(RB_EMPTY_NODE(&event->group_node) ||
++ 		     RB_EMPTY_ROOT(&groups->tree));
++ 
++ 	rb_erase(&event->group_node, &groups->tree);
++ 	init_event_group(event);
++ }
++ 
++ /*
++  * Helper function to delete event from its groups.
++  */
++ static void
++ del_event_from_groups(struct perf_event *event, struct perf_event_context *ctx)
++ {
++ 	struct perf_event_groups *groups;
++ 
++ 	groups = get_event_groups(event, ctx);
++ 	perf_event_groups_delete(groups, event);
++ }
++ 
++ /*
++  * Get the leftmost event in the @cpu subtree.
++  */
++ static struct perf_event *
++ perf_event_groups_first(struct perf_event_groups *groups, int cpu)
++ {
++ 	struct perf_event *node_event = NULL, *match = NULL;
++ 	struct rb_node *node = groups->tree.rb_node;
++ 
++ 	while (node) {
++ 		node_event = container_of(node, struct perf_event, group_node);
++ 
++ 		if (cpu < node_event->cpu) {
++ 			node = node->rb_left;
++ 		} else if (cpu > node_event->cpu) {
++ 			node = node->rb_right;
++ 		} else {
++ 			match = node_event;
++ 			node = node->rb_left;
++ 		}
++ 	}
++ 
++ 	return match;
++ }
++ 
++ /*
++  * Like rb_entry_next_safe() for the @cpu subtree.
++  */
++ static struct perf_event *
++ perf_event_groups_next(struct perf_event *event)
++ {
++ 	struct perf_event *next;
++ 
++ 	next = rb_entry_safe(rb_next(&event->group_node), typeof(*event), group_node);
++ 	if (next && next->cpu == event->cpu)
++ 		return next;
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * Rotate the @cpu subtree.
++  *
++  * Re-insert the leftmost event at the tail of the subtree.
++  */
++ static void
++ perf_event_groups_rotate(struct perf_event_groups *groups, int cpu)
++ {
++ 	struct perf_event *event = perf_event_groups_first(groups, cpu);
++ 
++ 	if (event) {
++ 		perf_event_groups_delete(groups, event);
++ 		perf_event_groups_insert(groups, event);
++ 	}
++ }
++ 
++ /*
++  * Iterate through the whole groups tree.
++  */
++ #define perf_event_groups_for_each(event, groups, node)		\
++ 	for (event = rb_entry_safe(rb_first(&((groups)->tree)),	\
++ 				typeof(*event), node); event;	\
++ 		event = rb_entry_safe(rb_next(&event->node),	\
++ 				typeof(*event), node))
++ 
++ /*
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+   * Add a event from the lists for its context.
+   * Must be called with ctx->mutex and ctx->lock held.
+   */
+@@@ -1689,9 -1881,9 +1858,13 @@@ list_del_event(struct perf_event *event
+  static void perf_group_detach(struct perf_event *event)
+  {
+  	struct perf_event *sibling, *tmp;
+++<<<<<<< HEAD
+ +	struct list_head *list = NULL;
+++=======
++ 	struct perf_event_context *ctx = event->ctx;
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  
+- 	lockdep_assert_held(&event->ctx->lock);
++ 	lockdep_assert_held(&ctx->lock);
+  
+  	/*
+  	 * We can have double detach due to exit/hot-unplug + close.
+@@@ -1726,6 -1914,18 +1899,21 @@@
+  		/* Inherit group flags from the previous leader */
+  		sibling->group_caps = event->group_caps;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (!RB_EMPTY_NODE(&event->group_node)) {
++ 			list_del_init(&sibling->sibling_list);
++ 			add_event_to_groups(sibling, event->ctx);
++ 
++ 			if (sibling->state == PERF_EVENT_STATE_ACTIVE) {
++ 				struct list_head *list = sibling->attr.pinned ?
++ 					&ctx->pinned_active : &ctx->flexible_active;
++ 
++ 				list_add_tail(&sibling->active_list, list);
++ 			}
++ 		}
++ 
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  		WARN_ON_ONCE(sibling->ctx != event->ctx);
+  	}
+  
+@@@ -1775,16 -1988,23 +1963,23 @@@ event_sched_out(struct perf_event *even
+  	if (event->state != PERF_EVENT_STATE_ACTIVE)
+  		return;
+  
++ 	/*
++ 	 * Asymmetry; we only schedule events _IN_ through ctx_sched_in(), but
++ 	 * we can schedule events _OUT_ individually through things like
++ 	 * __perf_remove_from_context().
++ 	 */
++ 	list_del_init(&event->active_list);
++ 
+  	perf_pmu_disable(event->pmu);
+  
+ +	event->tstamp_stopped = tstamp;
+  	event->pmu->del(event, 0);
+  	event->oncpu = -1;
+ -
+ +	event->state = PERF_EVENT_STATE_INACTIVE;
+  	if (event->pending_disable) {
+  		event->pending_disable = 0;
+ -		state = PERF_EVENT_STATE_OFF;
+ +		event->state = PERF_EVENT_STATE_OFF;
+  	}
+ -	perf_event_set_state(event, state);
+  
+  	if (!is_software_event(event))
+  		cpuctx->active_oncpu--;
+@@@ -2698,8 -2842,8 +2893,11 @@@ static void ctx_sched_out(struct perf_e
+  			  struct perf_cpu_context *cpuctx,
+  			  enum event_type_t event_type)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct perf_event *event, *tmp;
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  	int is_active = ctx->is_active;
+- 	struct perf_event *event;
+  
+  	lockdep_assert_held(&ctx->lock);
+  
+@@@ -2746,12 -2890,12 +2944,20 @@@
+  
+  	perf_pmu_disable(ctx->pmu);
+  	if (is_active & EVENT_PINNED) {
+++<<<<<<< HEAD
+ +		list_for_each_entry(event, &ctx->pinned_groups, group_entry)
+++=======
++ 		list_for_each_entry_safe(event, tmp, &ctx->pinned_active, active_list)
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  			group_sched_out(event, cpuctx, ctx);
+  	}
+  
+  	if (is_active & EVENT_FLEXIBLE) {
+++<<<<<<< HEAD
+ +		list_for_each_entry(event, &ctx->flexible_groups, group_entry)
+++=======
++ 		list_for_each_entry_safe(event, tmp, &ctx->flexible_active, active_list)
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  			group_sched_out(event, cpuctx, ctx);
+  	}
+  	perf_pmu_enable(ctx->pmu);
+@@@ -3043,6 -3182,88 +3249,91 @@@ static void cpu_ctx_sched_out(struct pe
+  	ctx_sched_out(&cpuctx->ctx, cpuctx, event_type);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int visit_groups_merge(struct perf_event_groups *groups, int cpu,
++ 			      int (*func)(struct perf_event *, void *), void *data)
++ {
++ 	struct perf_event **evt, *evt1, *evt2;
++ 	int ret;
++ 
++ 	evt1 = perf_event_groups_first(groups, -1);
++ 	evt2 = perf_event_groups_first(groups, cpu);
++ 
++ 	while (evt1 || evt2) {
++ 		if (evt1 && evt2) {
++ 			if (evt1->group_index < evt2->group_index)
++ 				evt = &evt1;
++ 			else
++ 				evt = &evt2;
++ 		} else if (evt1) {
++ 			evt = &evt1;
++ 		} else {
++ 			evt = &evt2;
++ 		}
++ 
++ 		ret = func(*evt, data);
++ 		if (ret)
++ 			return ret;
++ 
++ 		*evt = perf_event_groups_next(*evt);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ struct sched_in_data {
++ 	struct perf_event_context *ctx;
++ 	struct perf_cpu_context *cpuctx;
++ 	int can_add_hw;
++ };
++ 
++ static int pinned_sched_in(struct perf_event *event, void *data)
++ {
++ 	struct sched_in_data *sid = data;
++ 
++ 	if (event->state <= PERF_EVENT_STATE_OFF)
++ 		return 0;
++ 
++ 	if (!event_filter_match(event))
++ 		return 0;
++ 
++ 	if (group_can_go_on(event, sid->cpuctx, sid->can_add_hw)) {
++ 		if (!group_sched_in(event, sid->cpuctx, sid->ctx))
++ 			list_add_tail(&event->active_list, &sid->ctx->pinned_active);
++ 	}
++ 
++ 	/*
++ 	 * If this pinned group hasn't been scheduled,
++ 	 * put it in error state.
++ 	 */
++ 	if (event->state == PERF_EVENT_STATE_INACTIVE)
++ 		perf_event_set_state(event, PERF_EVENT_STATE_ERROR);
++ 
++ 	return 0;
++ }
++ 
++ static int flexible_sched_in(struct perf_event *event, void *data)
++ {
++ 	struct sched_in_data *sid = data;
++ 
++ 	if (event->state <= PERF_EVENT_STATE_OFF)
++ 		return 0;
++ 
++ 	if (!event_filter_match(event))
++ 		return 0;
++ 
++ 	if (group_can_go_on(event, sid->cpuctx, sid->can_add_hw)) {
++ 		if (!group_sched_in(event, sid->cpuctx, sid->ctx))
++ 			list_add_tail(&event->active_list, &sid->ctx->flexible_active);
++ 		else
++ 			sid->can_add_hw = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  static void
+  ctx_pinned_sched_in(struct perf_event_context *ctx,
+  		    struct perf_cpu_context *cpuctx)
+@@@ -3740,9 -3972,11 +4031,11 @@@ static void __perf_event_init_context(s
+  	raw_spin_lock_init(&ctx->lock);
+  	mutex_init(&ctx->mutex);
+  	INIT_LIST_HEAD(&ctx->active_ctx_list);
+ -	perf_event_groups_init(&ctx->pinned_groups);
+ -	perf_event_groups_init(&ctx->flexible_groups);
+ +	INIT_LIST_HEAD(&ctx->pinned_groups);
+ +	INIT_LIST_HEAD(&ctx->flexible_groups);
+  	INIT_LIST_HEAD(&ctx->event_list);
++ 	INIT_LIST_HEAD(&ctx->pinned_active);
++ 	INIT_LIST_HEAD(&ctx->flexible_active);
+  	atomic_set(&ctx->refcount, 1);
+  }
+  
+@@@ -9001,9 -9817,10 +9294,14 @@@ perf_event_alloc(struct perf_event_att
+  	mutex_init(&event->child_mutex);
+  	INIT_LIST_HEAD(&event->child_list);
+  
+ +	INIT_LIST_HEAD(&event->group_entry);
+  	INIT_LIST_HEAD(&event->event_entry);
+  	INIT_LIST_HEAD(&event->sibling_list);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&event->active_list);
++ 	init_event_group(event);
+++>>>>>>> 6668128a9e25 (perf/core: Optimize ctx_sched_out())
+  	INIT_LIST_HEAD(&event->rb_entry);
+  	INIT_LIST_HEAD(&event->active_entry);
+  	INIT_LIST_HEAD(&event->addr_filters.list);
+* Unmerged path include/linux/perf_event.h
+* Unmerged path kernel/events/core.c
