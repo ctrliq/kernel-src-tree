@@ -1,0 +1,133 @@
+mm: fix get_user_pages() vs device-dax pud mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] fix get_user_pages() vs device-dax pud mappings (Larry Woodman) [1457572 1457561]
+Rebuild_FUZZ: 95.92%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 220ced1676c490c3192dd9bc1a06be86dee88a56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/220ced16.failed
+
+A new unit test for the device-dax 1GB enabling currently fails with
+this warning before hanging the test thread:
+
+ WARNING: CPU: 0 PID: 21 at lib/percpu-refcount.c:155 percpu_ref_switch_to_atomic_rcu+0x1e3/0x1f0
+ percpu ref (dax_pmem_percpu_release [dax_pmem]) <= 0 (0) after switching to atomic
+ [..]
+ CPU: 0 PID: 21 Comm: rcuos/1 Tainted: G           O    4.10.0-rc7-next-20170207+ #944
+ [..]
+ Call Trace:
+  dump_stack+0x86/0xc3
+  __warn+0xcb/0xf0
+  warn_slowpath_fmt+0x5f/0x80
+  ? rcu_nocb_kthread+0x27a/0x510
+  ? dax_pmem_percpu_exit+0x50/0x50 [dax_pmem]
+  percpu_ref_switch_to_atomic_rcu+0x1e3/0x1f0
+  ? percpu_ref_exit+0x60/0x60
+  rcu_nocb_kthread+0x339/0x510
+  ? rcu_nocb_kthread+0x27a/0x510
+  kthread+0x101/0x140
+
+The get_user_pages() path needs to arrange for references to be taken
+against the dev_pagemap instance backing the pud mapping.  Refactor the
+existing __gup_device_huge_pmd() to also account for the pud case.
+
+Link: http://lkml.kernel.org/r/148653181153.38226.9605457830505509385.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Jiang <dave.jiang@intel.com>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Nilesh Choudhury <nilesh.choudhury@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 220ced1676c490c3192dd9bc1a06be86dee88a56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/gup.c
+diff --cc arch/x86/mm/gup.c
+index 0f64b85f7bb2,99c7805a9693..000000000000
+--- a/arch/x86/mm/gup.c
++++ b/arch/x86/mm/gup.c
+@@@ -153,6 -154,48 +153,51 @@@ static inline void get_head_page_multip
+  	SetPageReferenced(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __gup_device_huge(unsigned long pfn, unsigned long addr,
++ 		unsigned long end, struct page **pages, int *nr)
++ {
++ 	int nr_start = *nr;
++ 	struct dev_pagemap *pgmap = NULL;
++ 
++ 	do {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		pgmap = get_dev_pagemap(pfn, pgmap);
++ 		if (unlikely(!pgmap)) {
++ 			undo_dev_pagemap(nr, nr_start, pages);
++ 			return 0;
++ 		}
++ 		SetPageReferenced(page);
++ 		pages[*nr] = page;
++ 		get_page(page);
++ 		put_dev_pagemap(pgmap);
++ 		(*nr)++;
++ 		pfn++;
++ 	} while (addr += PAGE_SIZE, addr != end);
++ 	return 1;
++ }
++ 
++ static int __gup_device_huge_pmd(pmd_t pmd, unsigned long addr,
++ 		unsigned long end, struct page **pages, int *nr)
++ {
++ 	unsigned long fault_pfn;
++ 
++ 	fault_pfn = pmd_pfn(pmd) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
++ 	return __gup_device_huge(fault_pfn, addr, end, pages, nr);
++ }
++ 
++ static int __gup_device_huge_pud(pud_t pud, unsigned long addr,
++ 		unsigned long end, struct page **pages, int *nr)
++ {
++ 	unsigned long fault_pfn;
++ 
++ 	fault_pfn = pud_pfn(pud) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
++ 	return __gup_device_huge(fault_pfn, addr, end, pages, nr);
++ }
++ 
+++>>>>>>> 220ced1676c4 (mm: fix get_user_pages() vs device-dax pud mappings)
+  static noinline int gup_huge_pmd(pmd_t pmd, unsigned long addr,
+  		unsigned long end, int write, struct page **pages, int *nr)
+  {
+@@@ -233,14 -265,18 +278,23 @@@ static noinline int gup_huge_pud(pud_t 
+  	struct page *head, *page;
+  	int refs;
+  
+ -	if (!pte_allows_gup(pud_val(pud), write))
+ +	if (!pte_allows_gup(pte_val(pte), write))
+  		return 0;
++ 
++ 	VM_BUG_ON(!pfn_valid(pud_pfn(pud)));
++ 	if (pud_devmap(pud))
++ 		return __gup_device_huge_pud(pud, addr, end, pages, nr);
++ 
+  	/* hugepages are never "special" */
+++<<<<<<< HEAD
+ +	VM_BUG_ON(pte_flags(pte) & _PAGE_SPECIAL);
+ +	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
+++=======
++ 	VM_BUG_ON(pud_flags(pud) & _PAGE_SPECIAL);
+++>>>>>>> 220ced1676c4 (mm: fix get_user_pages() vs device-dax pud mappings)
+  
+  	refs = 0;
+ -	head = pud_page(pud);
+ +	head = pte_page(pte);
+  	page = head + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
+  	do {
+  		VM_BUG_ON_PAGE(compound_head(page) != head, page);
+* Unmerged path arch/x86/mm/gup.c
