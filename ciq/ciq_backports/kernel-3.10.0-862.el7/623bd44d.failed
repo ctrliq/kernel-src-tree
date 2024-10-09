@@ -1,0 +1,127 @@
+s390/pci: improve pci hotplug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] pci: improve pci hotplug (Hendrik Brueckner) [1486403]
+Rebuild_FUZZ: 90.57%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 623bd44d3f277b7bbe16e0e091bd361e75964b5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/623bd44d.failed
+
+PCI hotplug events basically notify about the new state of a
+function. Unfortunately some hypervisors implement hotplug
+events in a way where it is not clear what the new state of
+the function should be.
+
+Use clp_get_state to find the current state of the function
+and handle accordingly.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 623bd44d3f277b7bbe16e0e091bd361e75964b5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 833b01424c9d,f4928bc57773..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -968,10 -855,23 +968,24 @@@ void zpci_stop_device(struct zpci_dev *
+  }
+  EXPORT_SYMBOL_GPL(zpci_stop_device);
+  
+++<<<<<<< HEAD
+ +static inline int barsize(u8 size)
+++=======
++ void zpci_remove_device(struct zpci_dev *zdev)
++ {
++ 	if (!zdev->bus)
++ 		return;
++ 
++ 	pci_stop_root_bus(zdev->bus);
++ 	pci_remove_root_bus(zdev->bus);
++ }
++ 
++ int zpci_report_error(struct pci_dev *pdev,
++ 		      struct zpci_report_error_header *report)
+++>>>>>>> 623bd44d3f27 (s390/pci: improve pci hotplug)
+  {
+ -	struct zpci_dev *zdev = to_zpci(pdev);
+ -
+ -	return sclp_pci_report(report, zdev->fh, zdev->fid);
+ +	return (size) ? (1 << size) >> 10 : 0;
+  }
+ -EXPORT_SYMBOL(zpci_report_error);
+  
+  static int zpci_mem_init(void)
+  {
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index e484e6910e9d..904301cec9fe 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -162,6 +162,7 @@ extern const struct attribute_group *zpci_attr_groups[];
+ ----------------------------------------------------------------------------- */
+ /* Base stuff */
+ int zpci_create_device(struct zpci_dev *);
++void zpci_remove_device(struct zpci_dev *zdev);
+ int zpci_enable_device(struct zpci_dev *);
+ int zpci_disable_device(struct zpci_dev *);
+ void zpci_stop_device(struct zpci_dev *);
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_event.c b/arch/s390/pci/pci_event.c
+index a08917d4984c..4b076d52ff2b 100644
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@ -73,6 +73,7 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ {
+ 	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+ 	struct pci_dev *pdev = NULL;
++	enum zpci_state state;
+ 	int ret;
+ 
+ 	if (zdev)
+@@ -107,6 +108,8 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 			clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
+ 		break;
+ 	case 0x0303: /* Deconfiguration requested */
++		if (!zdev)
++			break;
+ 		if (pdev)
+ 			pci_stop_and_remove_bus_device_locked(pdev);
+ 
+@@ -120,7 +123,9 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 			zdev->state = ZPCI_FN_STATE_STANDBY;
+ 
+ 		break;
+-	case 0x0304: /* Configured -> Standby */
++	case 0x0304: /* Configured -> Standby|Reserved */
++		if (!zdev)
++			break;
+ 		if (pdev) {
+ 			/* Give the driver a hint that the function is
+ 			 * already unusable. */
+@@ -131,6 +136,10 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 		zdev->fh = ccdf->fh;
+ 		zpci_disable_device(zdev);
+ 		zdev->state = ZPCI_FN_STATE_STANDBY;
++		if (!clp_get_state(ccdf->fid, &state) &&
++		    state == ZPCI_FN_STATE_RESERVED) {
++			zpci_remove_device(zdev);
++		}
+ 		break;
+ 	case 0x0306: /* 0x308 or 0x302 for multiple devices */
+ 		clp_rescan_pci_devices();
+@@ -138,8 +147,7 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 	case 0x0308: /* Standby -> Reserved */
+ 		if (!zdev)
+ 			break;
+-		pci_stop_root_bus(zdev->bus);
+-		pci_remove_root_bus(zdev->bus);
++		zpci_remove_device(zdev);
+ 		break;
+ 	default:
+ 		break;
