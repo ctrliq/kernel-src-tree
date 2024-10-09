@@ -1,0 +1,363 @@
+net: fix two sparse warnings introduced by IGMP/MLD parsing exports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] fix two sparse warnings introduced by IGMP/MLD parsing exports (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 96.12%
+commit-author Linus Lüssing <linus.luessing@c0d3.blue>
+commit fcba67c94abe83e0e69a65737000ccbb16a4fa03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fcba67c9.failed
+
+> net/core/skbuff.c:4108:13: sparse: incorrect type in assignment (different base types)
+> net/ipv6/mcast_snoop.c:63 ipv6_mc_check_exthdrs() warn: unsigned 'offset' is never less than zero.
+
+Introduced by 9afd85c9e4552b276e2f4cfefd622bdeeffbbf26
+("net: Export IGMP/MLD message validation code")
+
+	Reported-by: kbuild test robot <fengguang.wu@intel.com>
+	Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fcba67c94abe83e0e69a65737000ccbb16a4fa03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+#	net/ipv6/mcast_snoop.c
+diff --cc net/core/skbuff.c
+index c7043c783fdb,b9eb90b39ac7..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3770,6 -3798,325 +3770,328 @@@ bool skb_partial_csum_set(struct sk_buf
+  }
+  EXPORT_SYMBOL_GPL(skb_partial_csum_set);
+  
+++<<<<<<< HEAD
+++=======
++ static int skb_maybe_pull_tail(struct sk_buff *skb, unsigned int len,
++ 			       unsigned int max)
++ {
++ 	if (skb_headlen(skb) >= len)
++ 		return 0;
++ 
++ 	/* If we need to pullup then pullup to the max, so we
++ 	 * won't need to do it again.
++ 	 */
++ 	if (max > skb->len)
++ 		max = skb->len;
++ 
++ 	if (__pskb_pull_tail(skb, max - skb_headlen(skb)) == NULL)
++ 		return -ENOMEM;
++ 
++ 	if (skb_headlen(skb) < len)
++ 		return -EPROTO;
++ 
++ 	return 0;
++ }
++ 
++ #define MAX_TCP_HDR_LEN (15 * 4)
++ 
++ static __sum16 *skb_checksum_setup_ip(struct sk_buff *skb,
++ 				      typeof(IPPROTO_IP) proto,
++ 				      unsigned int off)
++ {
++ 	switch (proto) {
++ 		int err;
++ 
++ 	case IPPROTO_TCP:
++ 		err = skb_maybe_pull_tail(skb, off + sizeof(struct tcphdr),
++ 					  off + MAX_TCP_HDR_LEN);
++ 		if (!err && !skb_partial_csum_set(skb, off,
++ 						  offsetof(struct tcphdr,
++ 							   check)))
++ 			err = -EPROTO;
++ 		return err ? ERR_PTR(err) : &tcp_hdr(skb)->check;
++ 
++ 	case IPPROTO_UDP:
++ 		err = skb_maybe_pull_tail(skb, off + sizeof(struct udphdr),
++ 					  off + sizeof(struct udphdr));
++ 		if (!err && !skb_partial_csum_set(skb, off,
++ 						  offsetof(struct udphdr,
++ 							   check)))
++ 			err = -EPROTO;
++ 		return err ? ERR_PTR(err) : &udp_hdr(skb)->check;
++ 	}
++ 
++ 	return ERR_PTR(-EPROTO);
++ }
++ 
++ /* This value should be large enough to cover a tagged ethernet header plus
++  * maximally sized IP and TCP or UDP headers.
++  */
++ #define MAX_IP_HDR_LEN 128
++ 
++ static int skb_checksum_setup_ipv4(struct sk_buff *skb, bool recalculate)
++ {
++ 	unsigned int off;
++ 	bool fragment;
++ 	__sum16 *csum;
++ 	int err;
++ 
++ 	fragment = false;
++ 
++ 	err = skb_maybe_pull_tail(skb,
++ 				  sizeof(struct iphdr),
++ 				  MAX_IP_HDR_LEN);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	if (ip_hdr(skb)->frag_off & htons(IP_OFFSET | IP_MF))
++ 		fragment = true;
++ 
++ 	off = ip_hdrlen(skb);
++ 
++ 	err = -EPROTO;
++ 
++ 	if (fragment)
++ 		goto out;
++ 
++ 	csum = skb_checksum_setup_ip(skb, ip_hdr(skb)->protocol, off);
++ 	if (IS_ERR(csum))
++ 		return PTR_ERR(csum);
++ 
++ 	if (recalculate)
++ 		*csum = ~csum_tcpudp_magic(ip_hdr(skb)->saddr,
++ 					   ip_hdr(skb)->daddr,
++ 					   skb->len - off,
++ 					   ip_hdr(skb)->protocol, 0);
++ 	err = 0;
++ 
++ out:
++ 	return err;
++ }
++ 
++ /* This value should be large enough to cover a tagged ethernet header plus
++  * an IPv6 header, all options, and a maximal TCP or UDP header.
++  */
++ #define MAX_IPV6_HDR_LEN 256
++ 
++ #define OPT_HDR(type, skb, off) \
++ 	(type *)(skb_network_header(skb) + (off))
++ 
++ static int skb_checksum_setup_ipv6(struct sk_buff *skb, bool recalculate)
++ {
++ 	int err;
++ 	u8 nexthdr;
++ 	unsigned int off;
++ 	unsigned int len;
++ 	bool fragment;
++ 	bool done;
++ 	__sum16 *csum;
++ 
++ 	fragment = false;
++ 	done = false;
++ 
++ 	off = sizeof(struct ipv6hdr);
++ 
++ 	err = skb_maybe_pull_tail(skb, off, MAX_IPV6_HDR_LEN);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	nexthdr = ipv6_hdr(skb)->nexthdr;
++ 
++ 	len = sizeof(struct ipv6hdr) + ntohs(ipv6_hdr(skb)->payload_len);
++ 	while (off <= len && !done) {
++ 		switch (nexthdr) {
++ 		case IPPROTO_DSTOPTS:
++ 		case IPPROTO_HOPOPTS:
++ 		case IPPROTO_ROUTING: {
++ 			struct ipv6_opt_hdr *hp;
++ 
++ 			err = skb_maybe_pull_tail(skb,
++ 						  off +
++ 						  sizeof(struct ipv6_opt_hdr),
++ 						  MAX_IPV6_HDR_LEN);
++ 			if (err < 0)
++ 				goto out;
++ 
++ 			hp = OPT_HDR(struct ipv6_opt_hdr, skb, off);
++ 			nexthdr = hp->nexthdr;
++ 			off += ipv6_optlen(hp);
++ 			break;
++ 		}
++ 		case IPPROTO_AH: {
++ 			struct ip_auth_hdr *hp;
++ 
++ 			err = skb_maybe_pull_tail(skb,
++ 						  off +
++ 						  sizeof(struct ip_auth_hdr),
++ 						  MAX_IPV6_HDR_LEN);
++ 			if (err < 0)
++ 				goto out;
++ 
++ 			hp = OPT_HDR(struct ip_auth_hdr, skb, off);
++ 			nexthdr = hp->nexthdr;
++ 			off += ipv6_authlen(hp);
++ 			break;
++ 		}
++ 		case IPPROTO_FRAGMENT: {
++ 			struct frag_hdr *hp;
++ 
++ 			err = skb_maybe_pull_tail(skb,
++ 						  off +
++ 						  sizeof(struct frag_hdr),
++ 						  MAX_IPV6_HDR_LEN);
++ 			if (err < 0)
++ 				goto out;
++ 
++ 			hp = OPT_HDR(struct frag_hdr, skb, off);
++ 
++ 			if (hp->frag_off & htons(IP6_OFFSET | IP6_MF))
++ 				fragment = true;
++ 
++ 			nexthdr = hp->nexthdr;
++ 			off += sizeof(struct frag_hdr);
++ 			break;
++ 		}
++ 		default:
++ 			done = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	err = -EPROTO;
++ 
++ 	if (!done || fragment)
++ 		goto out;
++ 
++ 	csum = skb_checksum_setup_ip(skb, nexthdr, off);
++ 	if (IS_ERR(csum))
++ 		return PTR_ERR(csum);
++ 
++ 	if (recalculate)
++ 		*csum = ~csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
++ 					 &ipv6_hdr(skb)->daddr,
++ 					 skb->len - off, nexthdr, 0);
++ 	err = 0;
++ 
++ out:
++ 	return err;
++ }
++ 
++ /**
++  * skb_checksum_setup - set up partial checksum offset
++  * @skb: the skb to set up
++  * @recalculate: if true the pseudo-header checksum will be recalculated
++  */
++ int skb_checksum_setup(struct sk_buff *skb, bool recalculate)
++ {
++ 	int err;
++ 
++ 	switch (skb->protocol) {
++ 	case htons(ETH_P_IP):
++ 		err = skb_checksum_setup_ipv4(skb, recalculate);
++ 		break;
++ 
++ 	case htons(ETH_P_IPV6):
++ 		err = skb_checksum_setup_ipv6(skb, recalculate);
++ 		break;
++ 
++ 	default:
++ 		err = -EPROTO;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL(skb_checksum_setup);
++ 
++ /**
++  * skb_checksum_maybe_trim - maybe trims the given skb
++  * @skb: the skb to check
++  * @transport_len: the data length beyond the network header
++  *
++  * Checks whether the given skb has data beyond the given transport length.
++  * If so, returns a cloned skb trimmed to this transport length.
++  * Otherwise returns the provided skb. Returns NULL in error cases
++  * (e.g. transport_len exceeds skb length or out-of-memory).
++  *
++  * Caller needs to set the skb transport header and release the returned skb.
++  * Provided skb is consumed.
++  */
++ static struct sk_buff *skb_checksum_maybe_trim(struct sk_buff *skb,
++ 					       unsigned int transport_len)
++ {
++ 	struct sk_buff *skb_chk;
++ 	unsigned int len = skb_transport_offset(skb) + transport_len;
++ 	int ret;
++ 
++ 	if (skb->len < len) {
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	} else if (skb->len == len) {
++ 		return skb;
++ 	}
++ 
++ 	skb_chk = skb_clone(skb, GFP_ATOMIC);
++ 	kfree_skb(skb);
++ 
++ 	if (!skb_chk)
++ 		return NULL;
++ 
++ 	ret = pskb_trim_rcsum(skb_chk, len);
++ 	if (ret) {
++ 		kfree_skb(skb_chk);
++ 		return NULL;
++ 	}
++ 
++ 	return skb_chk;
++ }
++ 
++ /**
++  * skb_checksum_trimmed - validate checksum of an skb
++  * @skb: the skb to check
++  * @transport_len: the data length beyond the network header
++  * @skb_chkf: checksum function to use
++  *
++  * Applies the given checksum function skb_chkf to the provided skb.
++  * Returns a checked and maybe trimmed skb. Returns NULL on error.
++  *
++  * If the skb has data beyond the given transport length, then a
++  * trimmed & cloned skb is checked and returned.
++  *
++  * Caller needs to set the skb transport header and release the returned skb.
++  * Provided skb is consumed.
++  */
++ struct sk_buff *skb_checksum_trimmed(struct sk_buff *skb,
++ 				     unsigned int transport_len,
++ 				     __sum16(*skb_chkf)(struct sk_buff *skb))
++ {
++ 	struct sk_buff *skb_chk;
++ 	unsigned int offset = skb_transport_offset(skb);
++ 	__sum16 ret;
++ 
++ 	skb_chk = skb_checksum_maybe_trim(skb, transport_len);
++ 	if (!skb_chk)
++ 		return NULL;
++ 
++ 	if (!pskb_may_pull(skb_chk, offset)) {
++ 		kfree_skb(skb_chk);
++ 		return NULL;
++ 	}
++ 
++ 	__skb_pull(skb_chk, offset);
++ 	ret = skb_chkf(skb_chk);
++ 	__skb_push(skb_chk, offset);
++ 
++ 	if (ret) {
++ 		kfree_skb(skb_chk);
++ 		return NULL;
++ 	}
++ 
++ 	return skb_chk;
++ }
++ EXPORT_SYMBOL(skb_checksum_trimmed);
++ 
+++>>>>>>> fcba67c94abe (net: fix two sparse warnings introduced by IGMP/MLD parsing exports)
+  void __skb_warn_lro_forwarding(const struct sk_buff *skb)
+  {
+  	net_warn_ratelimited("%s: received packets cannot be forwarded while LRO is enabled\n",
+* Unmerged path net/ipv6/mcast_snoop.c
+* Unmerged path net/core/skbuff.c
+* Unmerged path net/ipv6/mcast_snoop.c
