@@ -1,0 +1,243 @@
+net/mlx5e: Have a clear separation between different SQ types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Have a clear separation between different SQ types (Don Dutile) [1385330 1417285]
+Rebuild_FUZZ: 96.61%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit f10b7cc7707f7d598e3ddacd848080b18ba4cbff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f10b7cc7.failed
+
+Make a clear separate between Regular SQ (TXQ) and ICO SQ creation,
+destruction and union their mutual information structures.
+
+Don't allocate redundant TXQ skb/wqe_info/dma_fifo arrays for ICO SQ.
+And have a different SQ edge for ICO SQ than TXQ SQ, to be more
+accurate.
+
+In preparation for XDP TX support.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f10b7cc7707f7d598e3ddacd848080b18ba4cbff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index b01f5bb32ed7,5917f5e609ae..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -376,7 -441,8 +389,12 @@@ struct mlx5e_sq 
+  	struct mlx5_uar            uar;
+  	struct mlx5e_channel      *channel;
+  	int                        tc;
+++<<<<<<< HEAD
+ +	struct mlx5e_ico_wqe_info *ico_wqe_info;
+++=======
++ 	u32                        rate_limit;
++ 	u8                         type;
+++>>>>>>> f10b7cc7707f (net/mlx5e: Have a clear separation between different SQ types)
+  } ____cacheline_aligned_in_smp;
+  
+  static inline bool mlx5e_sq_has_room_for(struct mlx5e_sq *sq, u16 n)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 98d2ea9b4528,632de09e69cf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -52,7 -50,8 +52,12 @@@ struct mlx5e_sq_param 
+  	u32                        sqc[MLX5_ST_SZ_DW(sqc)];
+  	struct mlx5_wq_param       wq;
+  	u16                        max_inline;
+++<<<<<<< HEAD
+ +	bool                       icosq;
+++=======
++ 	u8                         min_inline_mode;
++ 	enum mlx5e_sq_type         type;
+++>>>>>>> f10b7cc7707f (net/mlx5e: Have a clear separation between different SQ types)
+  };
+  
+  struct mlx5e_cq_param {
+@@@ -519,10 -737,11 +524,10 @@@ static int mlx5e_open_rq(struct mlx5e_c
+  	if (err)
+  		goto err_disable_rq;
+  
+ -	if (param->am_enabled)
+ -		set_bit(MLX5E_RQ_STATE_AM, &c->rq.state);
+ +	set_bit(MLX5E_RQ_STATE_POST_WQES_ENABLE, &rq->state);
+  
+- 	sq->ico_wqe_info[pi].opcode     = MLX5_OPCODE_NOP;
+- 	sq->ico_wqe_info[pi].num_wqebbs = 1;
++ 	sq->db.ico_wqe[pi].opcode     = MLX5_OPCODE_NOP;
++ 	sq->db.ico_wqe[pi].num_wqebbs = 1;
+  	mlx5e_send_nop(sq, true); /* trigger mlx5e_post_rx_wqes() */
+  
+  	return 0;
+@@@ -699,10 -941,12 +737,11 @@@ static int mlx5e_enable_sq(struct mlx5e
+  
+  	memcpy(sqc, param->sqc, sizeof(param->sqc));
+  
+- 	MLX5_SET(sqc,  sqc, tis_num_0, param->icosq ? 0 : priv->tisn[sq->tc]);
++ 	MLX5_SET(sqc,  sqc, tis_num_0, param->type == MLX5E_SQ_ICO ?
++ 				       0 : priv->tisn[sq->tc]);
+  	MLX5_SET(sqc,  sqc, cqn,		sq->cq.mcq.cqn);
+ -	MLX5_SET(sqc,  sqc, min_wqe_inline_mode, sq->min_inline_mode);
+  	MLX5_SET(sqc,  sqc, state,		MLX5_SQC_STATE_RST);
+- 	MLX5_SET(sqc,  sqc, tis_lst_sz,		param->icosq ? 0 : 1);
++ 	MLX5_SET(sqc,  sqc, tis_lst_sz, param->type == MLX5E_SQ_ICO ? 0 : 1);
+  	MLX5_SET(sqc,  sqc, flush_in_error_en,	1);
+  
+  	MLX5_SET(wq,   wq, wq_type,       MLX5_WQ_TYPE_CYCLIC);
+@@@ -802,38 -1053,22 +841,46 @@@ static inline void netif_tx_disable_que
+  
+  static void mlx5e_close_sq(struct mlx5e_sq *sq)
+  {
+ -	set_bit(MLX5E_SQ_STATE_FLUSH, &sq->state);
+ -	/* prevent netif_tx_wake_queue */
+ -	napi_synchronize(&sq->channel->napi);
+ +	int tout = 0;
+ +	int err;
+  
+  	if (sq->txq) {
+ +		clear_bit(MLX5E_SQ_STATE_WAKE_TXQ_ENABLE, &sq->state);
+ +		/* prevent netif_tx_wake_queue */
+ +		napi_synchronize(&sq->channel->napi);
+  		netif_tx_disable_queue(sq->txq);
+  
+++<<<<<<< HEAD
+ +		/* ensure hw is notified of all pending wqes */
+ +		if (mlx5e_sq_has_room_for(sq, 1))
+ +			mlx5e_send_nop(sq, true);
+ +
+ +		err = mlx5e_modify_sq(sq, MLX5_SQC_STATE_RDY,
+ +				      MLX5_SQC_STATE_ERR);
+ +		if (err)
+ +			set_bit(MLX5E_SQ_STATE_TX_TIMEOUT, &sq->state);
+++=======
++ 		/* last doorbell out, godspeed .. */
++ 		if (mlx5e_sq_has_room_for(sq, 1)) {
++ 			sq->db.txq.skb[(sq->pc & sq->wq.sz_m1)] = NULL;
++ 			mlx5e_send_nop(sq, true);
++ 		}
+++>>>>>>> f10b7cc7707f (net/mlx5e: Have a clear separation between different SQ types)
+  	}
+  
+ -	mlx5e_disable_sq(sq);
+ +	/* wait till sq is empty, unless a TX timeout occurred on this SQ */
+ +	while (sq->cc != sq->pc &&
+ +	       !test_bit(MLX5E_SQ_STATE_TX_TIMEOUT, &sq->state)) {
+ +		msleep(MLX5_EN_QP_FLUSH_MSLEEP_QUANT);
+ +		if (tout++ > MLX5_EN_QP_FLUSH_MAX_ITER)
+ +			set_bit(MLX5E_SQ_STATE_TX_TIMEOUT, &sq->state);
+ +	}
+ +
+ +	/* avoid destroying sq before mlx5e_poll_tx_cq() is done with it */
+ +	napi_synchronize(&sq->channel->napi);
+ +
+  	mlx5e_free_tx_descs(sq);
+ +	mlx5e_disable_sq(sq);
+  	mlx5e_destroy_sq(sq);
+  }
+  
+@@@ -1212,6 -1540,8 +1259,11 @@@ static void mlx5e_build_sq_param(struc
+  	MLX5_SET(wq, wq, log_wq_sz,     priv->params.log_sq_size);
+  
+  	param->max_inline = priv->params.tx_max_inline;
+++<<<<<<< HEAD
+++=======
++ 	param->min_inline_mode = priv->params.tx_min_inline_mode;
++ 	param->type = MLX5E_SQ_TXQ;
+++>>>>>>> f10b7cc7707f (net/mlx5e: Have a clear separation between different SQ types)
+  }
+  
+  static void mlx5e_build_common_cq_param(struct mlx5e_priv *priv,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d795e95774bc,941e53169838..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -378,9 -343,13 +378,19 @@@ static void mlx5e_post_umr_wqe(struct m
+  	}
+  
+  	wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+++<<<<<<< HEAD
+ +	mlx5e_build_umr_wqe(rq, sq, wqe, ix);
+ +	sq->ico_wqe_info[pi].opcode = MLX5_OPCODE_UMR;
+ +	sq->ico_wqe_info[pi].num_wqebbs = num_wqebbs;
+++=======
++ 	memcpy(wqe, &wi->umr.wqe, sizeof(*wqe));
++ 	wqe->ctrl.opmod_idx_opcode =
++ 		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
++ 			    MLX5_OPCODE_UMR);
++ 
++ 	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
++ 	sq->db.ico_wqe[pi].num_wqebbs = num_wqebbs;
+++>>>>>>> f10b7cc7707f (net/mlx5e: Have a clear separation between different SQ types)
+  	sq->pc += num_wqebbs;
+  	mlx5e_tx_notify_hw(sq, &wqe->ctrl, 0);
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 4cd4781ab384,f02f24cfcb7a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -521,3 -494,35 +524,38 @@@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *
+  
+  	return (i == MLX5E_TX_CQ_POLL_BUDGET);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void mlx5e_free_tx_descs(struct mlx5e_sq *sq)
++ {
++ 	struct mlx5e_tx_wqe_info *wi;
++ 	struct sk_buff *skb;
++ 	u16 ci;
++ 	int i;
++ 
++ 	if (sq->type != MLX5E_SQ_TXQ)
++ 		return;
++ 
++ 	while (sq->cc != sq->pc) {
++ 		ci = sq->cc & sq->wq.sz_m1;
++ 		skb = sq->db.txq.skb[ci];
++ 		wi = &sq->db.txq.wqe_info[ci];
++ 
++ 		if (!skb) { /* nop */
++ 			sq->cc++;
++ 			continue;
++ 		}
++ 
++ 		for (i = 0; i < wi->num_dma; i++) {
++ 			struct mlx5e_sq_dma *dma =
++ 				mlx5e_dma_get(sq, sq->dma_fifo_cc++);
++ 
++ 			mlx5e_tx_dma_unmap(sq->pdev, dma);
++ 		}
++ 
++ 		dev_kfree_skb_any(skb);
++ 		sq->cc += wi->num_wqebbs;
++ 	}
++ }
+++>>>>>>> f10b7cc7707f (net/mlx5e: Have a clear separation between different SQ types)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index c38781fa567d..ddbc7965fd3f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -70,7 +70,7 @@ static void mlx5e_poll_ico_cq(struct mlx5e_cq *cq)
+ 
+ 	do {
+ 		u16 ci = be16_to_cpu(cqe->wqe_counter) & wq->sz_m1;
+-		struct mlx5e_ico_wqe_info *icowi = &sq->ico_wqe_info[ci];
++		struct mlx5e_ico_wqe_info *icowi = &sq->db.ico_wqe[ci];
+ 
+ 		mlx5_cqwq_pop(&cq->wq);
+ 		sqcc += icowi->num_wqebbs;
