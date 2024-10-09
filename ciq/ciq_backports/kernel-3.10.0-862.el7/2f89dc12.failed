@@ -1,0 +1,145 @@
+dax: protect PTE modification on WP fault by radix tree entry lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 2f89dc12a25ddf995b9acd7b6543fe892e3473d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2f89dc12.failed
+
+Currently PTE gets updated in wp_pfn_shared() after dax_pfn_mkwrite()
+has released corresponding radix tree entry lock.  When we want to
+writeprotect PTE on cache flush, we need PTE modification to happen
+under radix tree entry lock to ensure consistent updates of PTE and
+radix tree (standard faults use page lock to ensure this consistency).
+So move update of PTE bit into dax_pfn_mkwrite().
+
+Link: http://lkml.kernel.org/r/1479460644-25076-20-git-send-email-jack@suse.cz
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2f89dc12a25ddf995b9acd7b6543fe892e3473d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index 14270187456b,57d0bd1bd2c4..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2276,53 -2305,31 +2276,60 @@@ oom
+   * Handle write page faults for VM_MIXEDMAP or VM_PFNMAP for a VM_SHARED
+   * mapping
+   */
+ -static int wp_pfn_shared(struct vm_fault *vmf)
+ -{
+ -	struct vm_area_struct *vma = vmf->vma;
+ -
+ -	if (vma->vm_ops && vma->vm_ops->pfn_mkwrite) {
+ +static int wp_pfn_shared(struct mm_struct *mm,
+ +			struct vm_area_struct *vma, unsigned long address,
+ +			pte_t *page_table, spinlock_t *ptl, pte_t orig_pte,
+ +			pmd_t *pmd)
+ +{
+ +	if (vma->vm_ops && (vma->vm_flags2 & VM_PFN_MKWRITE) && vma->vm_ops->pfn_mkwrite) {
+ +		struct vm_fault vmf = {
+ +			.page = NULL,
+ +			.pgoff = linear_page_index(vma, address),
+ +			.virtual_address = (void __user *)(address & PAGE_MASK),
+ +			.flags = FAULT_FLAG_WRITE | FAULT_FLAG_MKWRITE,
+ +		};
+  		int ret;
+  
+++<<<<<<< HEAD
+ +		pte_unmap_unlock(page_table, ptl);
+ +		ret = vma->vm_ops->pfn_mkwrite(vma, &vmf);
+ +		if (ret & VM_FAULT_ERROR)
+++=======
++ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
++ 		vmf->flags |= FAULT_FLAG_MKWRITE;
++ 		ret = vma->vm_ops->pfn_mkwrite(vma, vmf);
++ 		if (ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE))
+++>>>>>>> 2f89dc12a25d (dax: protect PTE modification on WP fault by radix tree entry lock)
+  			return ret;
+ -		return finish_mkwrite_fault(vmf);
+ +		page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+ +		/*
+ +		 * We might have raced with another page fault while we
+ +		 * released the pte_offset_map_lock.
+ +		 */
+ +		if (!pte_same(*page_table, orig_pte)) {
+ +			pte_unmap_unlock(page_table, ptl);
+ +			return 0;
+ +		}
+  	}
+ -	wp_page_reuse(vmf);
+ -	return VM_FAULT_WRITE;
+ +	return wp_page_reuse(mm, vma, address, page_table, ptl, orig_pte,
+ +			     NULL, 0, 0);
+  }
+  
+ -static int wp_page_shared(struct vm_fault *vmf)
+ -	__releases(vmf->ptl)
+ +static int wp_page_shared(struct mm_struct *mm, struct vm_area_struct *vma,
+ +			  unsigned long address, pte_t *page_table,
+ +			  pmd_t *pmd, spinlock_t *ptl, pte_t orig_pte,
+ +			  struct page *old_page)
+ +	__releases(ptl)
+  {
+ -	struct vm_area_struct *vma = vmf->vma;
+ +	int page_mkwrite = 0;
+  
+ -	get_page(vmf->page);
+ +	page_cache_get(old_page);
+  
+ +	/*
+ +	 * Only catch write-faults on shared writable pages,
+ +	 * read-only shared pages can get COWed by
+ +	 * get_user_pages(.write=1, .force=1).
+ +	 */
+  	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
+  		int tmp;
+  
+diff --git a/fs/dax.c b/fs/dax.c
+index 1dfecdfb6245..e90934b026fa 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -933,17 +933,27 @@ int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+ {
+ 	struct file *file = vma->vm_file;
+ 	struct address_space *mapping = file->f_mapping;
+-	void *entry;
++	void *entry, **slot;
+ 	pgoff_t index = vmf->pgoff;
+ 
+ 	spin_lock_irq(&mapping->tree_lock);
+-	entry = get_unlocked_mapping_entry(mapping, index, NULL);
+-	if (!entry || !radix_tree_exceptional_entry(entry))
+-		goto out;
++	entry = get_unlocked_mapping_entry(mapping, index, &slot);
++	if (!entry || !radix_tree_exceptional_entry(entry)) {
++		if (entry)
++			put_unlocked_mapping_entry(mapping, index, entry);
++		spin_unlock_irq(&mapping->tree_lock);
++		return VM_FAULT_NOPAGE;
++	}
+ 	radix_tree_tag_set(&mapping->page_tree, index, PAGECACHE_TAG_DIRTY);
+-	put_unlocked_mapping_entry(mapping, index, entry);
+-out:
++	entry = lock_slot(mapping, slot);
+ 	spin_unlock_irq(&mapping->tree_lock);
++	/*
++	 * If we race with somebody updating the PTE and finish_mkwrite_fault()
++	 * fails, we don't care. We need to return VM_FAULT_NOPAGE and retry
++	 * the fault in either case.
++	 */
++	finish_mkwrite_fault(vmf);
++	put_locked_mapping_entry(mapping, index, entry);
+ 	return VM_FAULT_NOPAGE;
+ }
+ EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
+* Unmerged path mm/memory.c
