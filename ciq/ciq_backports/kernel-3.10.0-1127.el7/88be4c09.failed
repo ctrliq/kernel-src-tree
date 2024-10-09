@@ -1,0 +1,117 @@
+netfilter: ctnetlink: fix deadlock due to acquire _expect_lock twice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Liping Zhang <zlpnobody@gmail.com>
+commit 88be4c09d9008f9ff337cbf48c5d0f06c8f872e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/88be4c09.failed
+
+Currently, ctnetlink_change_conntrack is always protected by _expect_lock,
+but this will cause a deadlock when deleting the helper from a conntrack,
+as the _expect_lock will be acquired again by nf_ct_remove_expectations:
+
+         CPU0
+        ----
+  lock(nf_conntrack_expect_lock);
+  lock(nf_conntrack_expect_lock);
+
+  *** DEADLOCK ***
+  May be due to missing lock nesting notation
+
+  2 locks held by lt-conntrack_gr/12853:
+  #0:  (&table[i].mutex){+.+.+.}, at: [<ffffffffa05e2009>]
+       nfnetlink_rcv_msg+0x399/0x6a9 [nfnetlink]
+  #1:  (nf_conntrack_expect_lock){+.....}, at: [<ffffffffa05f2c1f>]
+       ctnetlink_new_conntrack+0x17f/0x408 [nf_conntrack_netlink]
+
+  Call Trace:
+   dump_stack+0x85/0xc2
+   __lock_acquire+0x1608/0x1680
+   ? ctnetlink_parse_tuple_proto+0x10f/0x1c0 [nf_conntrack_netlink]
+   lock_acquire+0x100/0x1f0
+   ? nf_ct_remove_expectations+0x32/0x90 [nf_conntrack]
+   _raw_spin_lock_bh+0x3f/0x50
+   ? nf_ct_remove_expectations+0x32/0x90 [nf_conntrack]
+   nf_ct_remove_expectations+0x32/0x90 [nf_conntrack]
+   ctnetlink_change_helper+0xc6/0x190 [nf_conntrack_netlink]
+   ctnetlink_new_conntrack+0x1b2/0x408 [nf_conntrack_netlink]
+   nfnetlink_rcv_msg+0x60a/0x6a9 [nfnetlink]
+   ? nfnetlink_rcv_msg+0x1b9/0x6a9 [nfnetlink]
+   ? nfnetlink_bind+0x1a0/0x1a0 [nfnetlink]
+   netlink_rcv_skb+0xa4/0xc0
+   nfnetlink_rcv+0x87/0x770 [nfnetlink]
+
+Since the operations are unrelated to nf_ct_expect, so we can drop the
+_expect_lock. Also note, after removing the _expect_lock protection,
+another CPU may invoke nf_conntrack_helper_unregister, so we should
+use rcu_read_lock to protect __nf_conntrack_helper_find invoked by
+ctnetlink_change_helper.
+
+Fixes: ca7433df3a67 ("netfilter: conntrack: seperate expect locking from nf_conntrack_lock")
+	Signed-off-by: Liping Zhang <zlpnobody@gmail.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 88be4c09d9008f9ff337cbf48c5d0f06c8f872e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index ab490ad8e397,e5f97777b1f4..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -1467,17 -1523,20 +1470,20 @@@ ctnetlink_change_helper(struct nf_conn 
+  			/* update private helper data if allowed. */
+  			if (helper->from_nlattr)
+  				helper->from_nlattr(helpinfo, ct);
+- 			return 0;
++ 			err = 0;
+  		} else
+- 			return -EBUSY;
++ 			err = -EBUSY;
++ 	} else {
++ 		/* we cannot set a helper for an existing conntrack */
++ 		err = -EOPNOTSUPP;
+  	}
+  
+- 	/* we cannot set a helper for an existing conntrack */
+- 	return -EOPNOTSUPP;
++ 	rcu_read_unlock();
++ 	return err;
+  }
+  
+ -static int ctnetlink_change_timeout(struct nf_conn *ct,
+ -				    const struct nlattr * const cda[])
+ +static inline int
+ +ctnetlink_change_timeout(struct nf_conn *ct, const struct nlattr * const cda[])
+  {
+  	u_int32_t timeout = ntohl(nla_get_be32(cda[CTA_TIMEOUT]));
+  
+@@@ -2227,17 -2346,13 +2231,21 @@@ ctnetlink_nfqueue_parse(const struct nl
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&nf_conntrack_expect_lock);
+ +	ret = ctnetlink_nfqueue_parse_ct((const struct nlattr **)cda, ct);
+ +	spin_unlock_bh(&nf_conntrack_expect_lock);
+ +
+ +	return ret;
+++=======
++ 	return ctnetlink_glue_parse_ct((const struct nlattr **)cda, ct);
+++>>>>>>> 88be4c09d900 (netfilter: ctnetlink: fix deadlock due to acquire _expect_lock twice)
+  }
+  
+ -static int ctnetlink_glue_exp_parse(const struct nlattr * const *cda,
+ -				    const struct nf_conn *ct,
+ -				    struct nf_conntrack_tuple *tuple,
+ -				    struct nf_conntrack_tuple *mask)
+ +static int ctnetlink_nfqueue_exp_parse(const struct nlattr * const *cda,
+ +				       const struct nf_conn *ct,
+ +				       struct nf_conntrack_tuple *tuple,
+ +				       struct nf_conntrack_tuple *mask)
+  {
+  	int err;
+  
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
