@@ -1,0 +1,208 @@
+netfilter: ipset: Prepare the ipset core to use RCU at set level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit b57b2d1fa53fe8563bdfc66a33b844463b9af285
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b57b2d1f.failed
+
+Replace rwlock_t with spinlock_t in "struct ip_set" and change the locking
+accordingly. Convert the comment extension into an rcu-avare object. Also,
+simplify the timeout routines.
+
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit b57b2d1fa53fe8563bdfc66a33b844463b9af285)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter/ipset/ip_set.h
+#	include/linux/netfilter/ipset/ip_set_comment.h
+#	net/netfilter/ipset/ip_set_core.c
+diff --cc include/linux/netfilter/ipset/ip_set.h
+index 3e9c90cf5227,19b4969a25fe..000000000000
+--- a/include/linux/netfilter/ipset/ip_set.h
++++ b/include/linux/netfilter/ipset/ip_set.h
+@@@ -72,6 -96,32 +72,35 @@@ struct ip_set_ext 
+  	u64 packets;
+  	u64 bytes;
+  	u32 timeout;
+++<<<<<<< HEAD
+++=======
++ 	u32 skbmark;
++ 	u32 skbmarkmask;
++ 	u32 skbprio;
++ 	u16 skbqueue;
++ 	char *comment;
++ };
++ 
++ struct ip_set_counter {
++ 	atomic64_t bytes;
++ 	atomic64_t packets;
++ };
++ 
++ struct ip_set_comment_rcu {
++ 	struct rcu_head rcu;
++ 	char str[0];
++ };
++ 
++ struct ip_set_comment {
++ 	struct ip_set_comment_rcu __rcu *c;
++ };
++ 
++ struct ip_set_skbinfo {
++ 	u32 skbmark;
++ 	u32 skbmarkmask;
++ 	u32 skbprio;
++ 	u16 skbqueue;
+++>>>>>>> b57b2d1fa53f (netfilter: ipset: Prepare the ipset core to use RCU at set level)
+  };
+  
+  struct ip_set;
+@@@ -169,13 -231,9 +198,13 @@@ struct ip_set 
+  	/* The name of the set */
+  	char name[IPSET_MAXNAMELEN];
+  	/* Lock protecting the set data */
+- 	rwlock_t lock;
++ 	spinlock_t lock;
+  	/* References to the set */
+  	u32 ref;
+ +	/* References to the set for netlink events like dump,
+ +	 * ref can be swapped out by ip_set_swap
+ +	 */
+ +	u32 ref_netlink;
+  	/* The core set type */
+  	struct ip_set_type *type;
+  	/* The type variant doing the real job */
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 1b9673fde81c,2b21a1983a98..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -207,11 -206,11 +207,19 @@@ ip_set_type_register(struct ip_set_typ
+  	ip_set_type_lock();
+  	if (find_set_type(type->name, type->family, type->revision_min)) {
+  		/* Duplicate! */
+++<<<<<<< HEAD
+ +		pr_warning("ip_set type %s, family %s with revision min %u "
+ +			   "already registered!\n", type->name,
+ +			   family_name(type->family), type->revision_min);
+ +		ret = -EINVAL;
+ +		goto unlock;
+++=======
++ 		pr_warn("ip_set type %s, family %s with revision min %u already registered!\n",
++ 			type->name, family_name(type->family),
++ 			type->revision_min);
++ 		ip_set_type_unlock();
++ 		return -EINVAL;
+++>>>>>>> b57b2d1fa53f (netfilter: ipset: Prepare the ipset core to use RCU at set level)
+  	}
+  	list_add_rcu(&type->list, &ip_set_type_list);
+  	pr_debug("type %s, family %s, revision %u:%u registered.\n",
+@@@ -229,10 -228,11 +237,18 @@@ ip_set_type_unregister(struct ip_set_ty
+  {
+  	ip_set_type_lock();
+  	if (!find_set_type(type->name, type->family, type->revision_min)) {
+++<<<<<<< HEAD
+ +		pr_warning("ip_set type %s, family %s with revision min %u "
+ +			   "not registered\n", type->name,
+ +			   family_name(type->family), type->revision_min);
+ +		goto unlock;
+++=======
++ 		pr_warn("ip_set type %s, family %s with revision min %u not registered\n",
++ 			type->name, family_name(type->family),
++ 			type->revision_min);
++ 		ip_set_type_unlock();
++ 		return;
+++>>>>>>> b57b2d1fa53f (netfilter: ipset: Prepare the ipset core to use RCU at set level)
+  	}
+  	list_del_rcu(&type->list);
+  	pr_debug("type %s, family %s with revision min %u unregistered.\n",
+@@@ -437,10 -537,10 +452,15 @@@ ip_set_test(ip_set_id_t index, const st
+  
+  	if (ret == -EAGAIN) {
+  		/* Type requests element to be completed */
+++<<<<<<< HEAD
+ +		pr_debug("element must be competed, ADD is triggered\n");
+ +		write_lock_bh(&set->lock);
+++=======
++ 		pr_debug("element must be completed, ADD is triggered\n");
++ 		spin_lock_bh(&set->lock);
+++>>>>>>> b57b2d1fa53f (netfilter: ipset: Prepare the ipset core to use RCU at set level)
+  		set->variant->kadt(set, skb, par, IPSET_ADD, opt);
+- 		write_unlock_bh(&set->lock);
++ 		spin_unlock_bh(&set->lock);
+  		ret = 1;
+  	} else {
+  		/* --return-nomatch: invert matched element */
+@@@ -1277,12 -1373,14 +1297,17 @@@ dump_last
+  				goto release_refcount;
+  			if (dump_flags & IPSET_FLAG_LIST_HEADER)
+  				goto next_set;
+ -			if (set->variant->uref)
+ -				set->variant->uref(set, cb, true);
+  			/* Fall through and add elements */
+  		default:
+- 			read_lock_bh(&set->lock);
++ 			rcu_read_lock_bh();
+  			ret = set->variant->list(set, skb, cb);
+++<<<<<<< HEAD
+ +			read_unlock_bh(&set->lock);
+ +			if (!cb->args[2])
+++=======
++ 			rcu_read_unlock_bh();
++ 			if (!cb->args[IPSET_CB_ARG0])
+++>>>>>>> b57b2d1fa53f (netfilter: ipset: Prepare the ipset core to use RCU at set level)
+  				/* Set is done, proceed with next one */
+  				goto next_set;
+  			goto release_refcount;
+* Unmerged path include/linux/netfilter/ipset/ip_set_comment.h
+* Unmerged path include/linux/netfilter/ipset/ip_set.h
+* Unmerged path include/linux/netfilter/ipset/ip_set_comment.h
+diff --git a/include/linux/netfilter/ipset/ip_set_timeout.h b/include/linux/netfilter/ipset/ip_set_timeout.h
+index 1755cf80a6fc..bedc0d0cd3ff 100644
+--- a/include/linux/netfilter/ipset/ip_set_timeout.h
++++ b/include/linux/netfilter/ipset/ip_set_timeout.h
+@@ -40,31 +40,26 @@ ip_set_timeout_uget(struct nlattr *tb)
+ }
+ 
+ static inline bool
+-ip_set_timeout_test(unsigned long timeout)
++ip_set_timeout_expired(unsigned long *t)
+ {
+-	return timeout == IPSET_ELEM_PERMANENT ||
+-	       time_is_after_jiffies(timeout);
+-}
+-
+-static inline bool
+-ip_set_timeout_expired(unsigned long *timeout)
+-{
+-	return *timeout != IPSET_ELEM_PERMANENT &&
+-	       time_is_before_jiffies(*timeout);
++	return *t != IPSET_ELEM_PERMANENT && time_is_before_jiffies(*t);
+ }
+ 
+ static inline void
+-ip_set_timeout_set(unsigned long *timeout, u32 t)
++ip_set_timeout_set(unsigned long *timeout, u32 value)
+ {
+-	if (!t) {
++	unsigned long t;
++
++	if (!value) {
+ 		*timeout = IPSET_ELEM_PERMANENT;
+ 		return;
+ 	}
+ 
+-	*timeout = msecs_to_jiffies(t * MSEC_PER_SEC) + jiffies;
+-	if (*timeout == IPSET_ELEM_PERMANENT)
++	t = msecs_to_jiffies(value * MSEC_PER_SEC) + jiffies;
++	if (t == IPSET_ELEM_PERMANENT)
+ 		/* Bingo! :-) */
+-		(*timeout)--;
++		t--;
++	*timeout = t;
+ }
+ 
+ static inline u32
+* Unmerged path net/netfilter/ipset/ip_set_core.c
