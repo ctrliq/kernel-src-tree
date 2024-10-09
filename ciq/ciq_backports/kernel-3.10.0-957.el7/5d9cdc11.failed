@@ -1,0 +1,658 @@
+perf events parse: Rename parse_events_parse arguments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 5d9cdc1181c34f959e9fb8e24624223172071871
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5d9cdc11.failed
+
+Calling them just "data" is too vague, call it 'perf_state', to make it
+clearer, for instance, when looking at patch hunks.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/n/tip-rnhk5yb05wem77rjpclrh7so@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 5d9cdc1181c34f959e9fb8e24624223172071871)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/tests/bpf.c
+#	tools/perf/util/parse-events.c
+#	tools/perf/util/parse-events.h
+#	tools/perf/util/parse-events.y
+diff --cc tools/perf/util/parse-events.c
+index eb476984ddca,f44aeba51d1f..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -583,6 -588,227 +583,230 @@@ static int add_tracepoint_multi_sys(str
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct __add_bpf_event_param {
++ 	struct parse_events_state *parse_state;
++ 	struct list_head *list;
++ 	struct list_head *head_config;
++ };
++ 
++ static int add_bpf_event(const char *group, const char *event, int fd,
++ 			 void *_param)
++ {
++ 	LIST_HEAD(new_evsels);
++ 	struct __add_bpf_event_param *param = _param;
++ 	struct parse_events_state *parse_state = param->parse_state;
++ 	struct list_head *list = param->list;
++ 	struct perf_evsel *pos;
++ 	int err;
++ 
++ 	pr_debug("add bpf event %s:%s and attach bpf program %d\n",
++ 		 group, event, fd);
++ 
++ 	err = parse_events_add_tracepoint(&new_evsels, &parse_state->idx, group,
++ 					  event, parse_state->error,
++ 					  param->head_config);
++ 	if (err) {
++ 		struct perf_evsel *evsel, *tmp;
++ 
++ 		pr_debug("Failed to add BPF event %s:%s\n",
++ 			 group, event);
++ 		list_for_each_entry_safe(evsel, tmp, &new_evsels, node) {
++ 			list_del(&evsel->node);
++ 			perf_evsel__delete(evsel);
++ 		}
++ 		return err;
++ 	}
++ 	pr_debug("adding %s:%s\n", group, event);
++ 
++ 	list_for_each_entry(pos, &new_evsels, node) {
++ 		pr_debug("adding %s:%s to %p\n",
++ 			 group, event, pos);
++ 		pos->bpf_fd = fd;
++ 	}
++ 	list_splice(&new_evsels, list);
++ 	return 0;
++ }
++ 
++ int parse_events_load_bpf_obj(struct parse_events_state *parse_state,
++ 			      struct list_head *list,
++ 			      struct bpf_object *obj,
++ 			      struct list_head *head_config)
++ {
++ 	int err;
++ 	char errbuf[BUFSIZ];
++ 	struct __add_bpf_event_param param = {parse_state, list, head_config};
++ 	static bool registered_unprobe_atexit = false;
++ 
++ 	if (IS_ERR(obj) || !obj) {
++ 		snprintf(errbuf, sizeof(errbuf),
++ 			 "Internal error: load bpf obj with NULL");
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
++ 
++ 	/*
++ 	 * Register atexit handler before calling bpf__probe() so
++ 	 * bpf__probe() don't need to unprobe probe points its already
++ 	 * created when failure.
++ 	 */
++ 	if (!registered_unprobe_atexit) {
++ 		atexit(bpf__clear);
++ 		registered_unprobe_atexit = true;
++ 	}
++ 
++ 	err = bpf__probe(obj);
++ 	if (err) {
++ 		bpf__strerror_probe(obj, err, errbuf, sizeof(errbuf));
++ 		goto errout;
++ 	}
++ 
++ 	err = bpf__load(obj);
++ 	if (err) {
++ 		bpf__strerror_load(obj, err, errbuf, sizeof(errbuf));
++ 		goto errout;
++ 	}
++ 
++ 	err = bpf__foreach_event(obj, add_bpf_event, &param);
++ 	if (err) {
++ 		snprintf(errbuf, sizeof(errbuf),
++ 			 "Attach events in BPF object failed");
++ 		goto errout;
++ 	}
++ 
++ 	return 0;
++ errout:
++ 	parse_state->error->help = strdup("(add -v to see detail)");
++ 	parse_state->error->str = strdup(errbuf);
++ 	return err;
++ }
++ 
++ static int
++ parse_events_config_bpf(struct parse_events_state *parse_state,
++ 			struct bpf_object *obj,
++ 			struct list_head *head_config)
++ {
++ 	struct parse_events_term *term;
++ 	int error_pos;
++ 
++ 	if (!head_config || list_empty(head_config))
++ 		return 0;
++ 
++ 	list_for_each_entry(term, head_config, list) {
++ 		char errbuf[BUFSIZ];
++ 		int err;
++ 
++ 		if (term->type_term != PARSE_EVENTS__TERM_TYPE_USER) {
++ 			snprintf(errbuf, sizeof(errbuf),
++ 				 "Invalid config term for BPF object");
++ 			errbuf[BUFSIZ - 1] = '\0';
++ 
++ 			parse_state->error->idx = term->err_term;
++ 			parse_state->error->str = strdup(errbuf);
++ 			return -EINVAL;
++ 		}
++ 
++ 		err = bpf__config_obj(obj, term, parse_state->evlist, &error_pos);
++ 		if (err) {
++ 			bpf__strerror_config_obj(obj, term, parse_state->evlist,
++ 						 &error_pos, err, errbuf,
++ 						 sizeof(errbuf));
++ 			parse_state->error->help = strdup(
++ "Hint:\tValid config terms:\n"
++ "     \tmap:[<arraymap>].value<indices>=[value]\n"
++ "     \tmap:[<eventmap>].event<indices>=[event]\n"
++ "\n"
++ "     \twhere <indices> is something like [0,3...5] or [all]\n"
++ "     \t(add -v to see detail)");
++ 			parse_state->error->str = strdup(errbuf);
++ 			if (err == -BPF_LOADER_ERRNO__OBJCONF_MAP_VALUE)
++ 				parse_state->error->idx = term->err_val;
++ 			else
++ 				parse_state->error->idx = term->err_term + error_pos;
++ 			return err;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Split config terms:
++  * perf record -e bpf.c/call-graph=fp,map:array.value[0]=1/ ...
++  *  'call-graph=fp' is 'evt config', should be applied to each
++  *  events in bpf.c.
++  * 'map:array.value[0]=1' is 'obj config', should be processed
++  * with parse_events_config_bpf.
++  *
++  * Move object config terms from the first list to obj_head_config.
++  */
++ static void
++ split_bpf_config_terms(struct list_head *evt_head_config,
++ 		       struct list_head *obj_head_config)
++ {
++ 	struct parse_events_term *term, *temp;
++ 
++ 	/*
++ 	 * Currectly, all possible user config term
++ 	 * belong to bpf object. parse_events__is_hardcoded_term()
++ 	 * happends to be a good flag.
++ 	 *
++ 	 * See parse_events_config_bpf() and
++ 	 * config_term_tracepoint().
++ 	 */
++ 	list_for_each_entry_safe(term, temp, evt_head_config, list)
++ 		if (!parse_events__is_hardcoded_term(term))
++ 			list_move_tail(&term->list, obj_head_config);
++ }
++ 
++ int parse_events_load_bpf(struct parse_events_state *parse_state,
++ 			  struct list_head *list,
++ 			  char *bpf_file_name,
++ 			  bool source,
++ 			  struct list_head *head_config)
++ {
++ 	int err;
++ 	struct bpf_object *obj;
++ 	LIST_HEAD(obj_head_config);
++ 
++ 	if (head_config)
++ 		split_bpf_config_terms(head_config, &obj_head_config);
++ 
++ 	obj = bpf__prepare_load(bpf_file_name, source);
++ 	if (IS_ERR(obj)) {
++ 		char errbuf[BUFSIZ];
++ 
++ 		err = PTR_ERR(obj);
++ 
++ 		if (err == -ENOTSUP)
++ 			snprintf(errbuf, sizeof(errbuf),
++ 				 "BPF support is not compiled");
++ 		else
++ 			bpf__strerror_prepare_load(bpf_file_name,
++ 						   source,
++ 						   -err, errbuf,
++ 						   sizeof(errbuf));
++ 
++ 		parse_state->error->help = strdup("(add -v to see detail)");
++ 		parse_state->error->str = strdup(errbuf);
++ 		return err;
++ 	}
++ 
++ 	err = parse_events_load_bpf_obj(parse_state, list, obj, head_config);
++ 	if (err)
++ 		return err;
++ 	err = parse_events_config_bpf(parse_state, obj, &obj_head_config);
++ 
++ 	/*
++ 	 * Caller doesn't know anything about obj_head_config,
++ 	 * so combine them together again before returnning.
++ 	 */
++ 	if (head_config)
++ 		list_splice_tail(&obj_head_config, head_config);
++ 	return err;
++ }
++ 
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  static int
+  parse_breakpoint_type(const char *type, struct perf_event_attr *attr)
+  {
+@@@ -950,7 -1184,7 +1174,11 @@@ int parse_events_add_tracepoint(struct 
+  					    err, head_config);
+  }
+  
+++<<<<<<< HEAD
+ +int parse_events_add_numeric(struct parse_events_evlist *data,
+++=======
++ int parse_events_add_numeric(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			     struct list_head *list,
+  			     u32 type, u64 config,
+  			     struct list_head *head_config)
+@@@ -975,7 -1209,7 +1203,11 @@@
+  			 get_config_name(head_config), &config_terms);
+  }
+  
+++<<<<<<< HEAD
+ +int parse_events_add_pmu(struct parse_events_evlist *data,
+++=======
++ int parse_events_add_pmu(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			 struct list_head *list, char *name,
+  			 struct list_head *head_config)
+  {
+@@@ -1033,7 -1267,7 +1265,11 @@@
+  	return evsel ? 0 : -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +int parse_events_multi_pmu_add(struct parse_events_evlist *data,
+++=======
++ int parse_events_multi_pmu_add(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			       char *str, struct list_head **listp)
+  {
+  	struct list_head *head;
+@@@ -1422,7 -1656,7 +1658,11 @@@ static int parse_events__scanner(const 
+   */
+  int parse_events_terms(struct list_head *terms, const char *str)
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_terms data = {
+++=======
++ 	struct parse_events_state parse_state = {
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  		.terms = NULL,
+  	};
+  	int ret;
+@@@ -1441,10 -1675,11 +1681,18 @@@
+  int parse_events(struct perf_evlist *evlist, const char *str,
+  		 struct parse_events_error *err)
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist data = {
+ +		.list  = LIST_HEAD_INIT(data.list),
+ +		.idx   = evlist->nr_entries,
+ +		.error = err,
+++=======
++ 	struct parse_events_state parse_state = {
++ 		.list   = LIST_HEAD_INIT(parse_state.list),
++ 		.idx    = evlist->nr_entries,
++ 		.error  = err,
++ 		.evlist = evlist,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	};
+  	int ret;
+  
+@@@ -2278,10 -2515,15 +2526,19 @@@ void parse_events_terms__delete(struct 
+  	free(terms);
+  }
+  
+++<<<<<<< HEAD
+ +void parse_events_evlist_error(struct parse_events_evlist *data,
+++=======
++ void parse_events__clear_array(struct parse_events_array *a)
++ {
++ 	zfree(&a->ranges);
++ }
++ 
++ void parse_events_evlist_error(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			       int idx, const char *str)
+  {
+- 	struct parse_events_error *err = data->error;
++ 	struct parse_events_error *err = parse_state->error;
+  
+  	if (!err)
+  		return;
+diff --cc tools/perf/util/parse-events.h
+index 43b505fd3102,635135125111..000000000000
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@@ -131,7 -140,18 +131,22 @@@ int parse_events_add_tracepoint(struct 
+  				const char *sys, const char *event,
+  				struct parse_events_error *error,
+  				struct list_head *head_config);
+++<<<<<<< HEAD
+ +int parse_events_add_numeric(struct parse_events_evlist *data,
+++=======
++ int parse_events_load_bpf(struct parse_events_state *parse_state,
++ 			  struct list_head *list,
++ 			  char *bpf_file_name,
++ 			  bool source,
++ 			  struct list_head *head_config);
++ /* Provide this function for perf test */
++ struct bpf_object;
++ int parse_events_load_bpf_obj(struct parse_events_state *parse_state,
++ 			      struct list_head *list,
++ 			      struct bpf_object *obj,
++ 			      struct list_head *head_config);
++ int parse_events_add_numeric(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			     struct list_head *list,
+  			     u32 type, u64 config,
+  			     struct list_head *head_config);
+@@@ -141,11 -161,11 +156,19 @@@ int parse_events_add_cache(struct list_
+  			   struct list_head *head_config);
+  int parse_events_add_breakpoint(struct list_head *list, int *idx,
+  				void *ptr, char *type, u64 len);
+++<<<<<<< HEAD
+ +int parse_events_add_pmu(struct parse_events_evlist *data,
+ +			 struct list_head *list, char *name,
+ +			 struct list_head *head_config);
+ +
+ +int parse_events_multi_pmu_add(struct parse_events_evlist *data,
+++=======
++ int parse_events_add_pmu(struct parse_events_state *parse_state,
++ 			 struct list_head *list, char *name,
++ 			 struct list_head *head_config);
++ 
++ int parse_events_multi_pmu_add(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			       char *str,
+  			       struct list_head **listp);
+  
+@@@ -157,7 -177,7 +180,11 @@@ perf_pmu__parse_check(const char *name)
+  void parse_events__set_leader(char *name, struct list_head *list);
+  void parse_events_update_lists(struct list_head *list_event,
+  			       struct list_head *list_all);
+++<<<<<<< HEAD
+ +void parse_events_evlist_error(struct parse_events_evlist *data,
+++=======
++ void parse_events_evlist_error(struct parse_events_state *parse_state,
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  			       int idx, const char *str);
+  
+  void print_events(const char *event_glob, bool name_only, bool quiet,
+diff --cc tools/perf/util/parse-events.y
+index 945e22e508d8,e81a20ea8d7d..000000000000
+--- a/tools/perf/util/parse-events.y
++++ b/tools/perf/util/parse-events.y
+@@@ -33,7 -33,7 +33,11 @@@ do { 
+  } while (0)
+  
+  static void inc_group_count(struct list_head *list,
+++<<<<<<< HEAD
+ +		       struct parse_events_evlist *data)
+++=======
++ 		       struct parse_events_state *parse_state)
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  {
+  	/* Count groups only have more than 1 members */
+  	if (!list_is_last(list->next, list))
+@@@ -106,9 -115,9 +110,13 @@@ PE_START_TERMS  start_term
+  
+  start_events: groups
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  
+- 	parse_events_update_lists($1, &data->list);
++ 	parse_events_update_lists($1, &parse_state->list);
+  }
+  
+  groups:
+@@@ -222,7 -231,7 +230,11 @@@ PE_NAME opt_event_confi
+  		YYABORT;
+  
+  	ALLOC_LIST(list);
+++<<<<<<< HEAD
+ +	if (parse_events_add_pmu(data, list, $1, $2)) {
+++=======
++ 	if (parse_events_add_pmu(_parse_state, list, $1, $2)) {
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  		struct perf_pmu *pmu = NULL;
+  		int ok = 0;
+  
+@@@ -235,7 -244,7 +247,11 @@@
+  			if (!strncmp($1, name, strlen($1))) {
+  				if (parse_events_copy_term_list(orig_terms, &terms))
+  					YYABORT;
+++<<<<<<< HEAD
+ +				if (!parse_events_add_pmu(data, list, pmu->name, terms))
+++=======
++ 				if (!parse_events_add_pmu(_parse_state, list, pmu->name, terms))
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  					ok++;
+  				parse_events_terms__delete(terms);
+  			}
+@@@ -282,7 -290,7 +298,11 @@@ value_sym '/' event_config '/
+  	int config = $1 & 255;
+  
+  	ALLOC_LIST(list);
+++<<<<<<< HEAD
+ +	ABORT_ON(parse_events_add_numeric(data, list, type, config, $3));
+++=======
++ 	ABORT_ON(parse_events_add_numeric(_parse_state, list, type, config, $3));
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	parse_events_terms__delete($3);
+  	$$ = list;
+  }
+@@@ -295,15 -302,15 +315,24 @@@ value_sym sep_slash_d
+  	int config = $1 & 255;
+  
+  	ALLOC_LIST(list);
+++<<<<<<< HEAD
+ +	ABORT_ON(parse_events_add_numeric(data, list, type, config, NULL));
+++=======
++ 	ABORT_ON(parse_events_add_numeric(_parse_state, list, type, config, NULL));
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	$$ = list;
+  }
+  
+  event_legacy_cache:
+  PE_NAME_CACHE_TYPE '-' PE_NAME_CACHE_OP_RESULT '-' PE_NAME_CACHE_OP_RESULT opt_event_config
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+ +	struct parse_events_error *error = data->error;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
++ 	struct parse_events_error *error = parse_state->error;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -314,8 -321,8 +343,13 @@@
+  |
+  PE_NAME_CACHE_TYPE '-' PE_NAME_CACHE_OP_RESULT opt_event_config
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+ +	struct parse_events_error *error = data->error;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
++ 	struct parse_events_error *error = parse_state->error;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -326,8 -333,8 +360,13 @@@
+  |
+  PE_NAME_CACHE_TYPE opt_event_config
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+ +	struct parse_events_error *error = data->error;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
++ 	struct parse_events_error *error = parse_state->error;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -339,7 -346,7 +378,11 @@@
+  event_legacy_mem:
+  PE_PREFIX_MEM PE_VALUE '/' PE_VALUE ':' PE_MODIFIER_BP sep_dc
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -350,7 -357,7 +393,11 @@@
+  |
+  PE_PREFIX_MEM PE_VALUE '/' PE_VALUE sep_dc
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -361,7 -368,7 +408,11 @@@
+  |
+  PE_PREFIX_MEM PE_VALUE ':' PE_MODIFIER_BP sep_dc
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -372,7 -379,7 +423,11 @@@
+  |
+  PE_PREFIX_MEM PE_VALUE sep_dc
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -384,8 -391,8 +439,13 @@@
+  event_legacy_tracepoint:
+  tracepoint_name opt_event_config
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_evlist *data = _data;
+ +	struct parse_events_error *error = data->error;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
++ 	struct parse_events_error *error = parse_state->error;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+@@@ -426,7 -432,7 +486,11 @@@ PE_VALUE ':' PE_VALUE opt_event_confi
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+++<<<<<<< HEAD
+ +	ABORT_ON(parse_events_add_numeric(data, list, (u32)$1, $3, $4));
+++=======
++ 	ABORT_ON(parse_events_add_numeric(_parse_state, list, (u32)$1, $3, $4));
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	parse_events_terms__delete($4);
+  	$$ = list;
+  }
+@@@ -438,7 -443,30 +502,34 @@@ PE_RAW opt_event_confi
+  	struct list_head *list;
+  
+  	ALLOC_LIST(list);
+++<<<<<<< HEAD
+ +	ABORT_ON(parse_events_add_numeric(data, list, PERF_TYPE_RAW, $1, $2));
+++=======
++ 	ABORT_ON(parse_events_add_numeric(_parse_state, list, PERF_TYPE_RAW, $1, $2));
++ 	parse_events_terms__delete($2);
++ 	$$ = list;
++ }
++ 
++ event_bpf_file:
++ PE_BPF_OBJECT opt_event_config
++ {
++ 	struct parse_events_state *parse_state = _parse_state;
++ 	struct parse_events_error *error = parse_state->error;
++ 	struct list_head *list;
++ 
++ 	ALLOC_LIST(list);
++ 	ABORT_ON(parse_events_load_bpf(parse_state, list, $1, false, $2));
++ 	parse_events_terms__delete($2);
++ 	$$ = list;
++ }
++ |
++ PE_BPF_SOURCE opt_event_config
++ {
++ 	struct list_head *list;
++ 
++ 	ALLOC_LIST(list);
++ 	ABORT_ON(parse_events_load_bpf(_parse_state, list, $1, true, $2));
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  	parse_events_terms__delete($2);
+  	$$ = list;
+  }
+@@@ -460,8 -488,8 +551,13 @@@ opt_event_config
+  
+  start_terms: event_config
+  {
+++<<<<<<< HEAD
+ +	struct parse_events_terms *data = _data;
+ +	data->terms = $1;
+++=======
++ 	struct parse_events_state *parse_state = _parse_state;
++ 	parse_state->terms = $1;
+++>>>>>>> 5d9cdc1181c3 (perf events parse: Rename parse_events_parse arguments)
+  }
+  
+  event_config:
+* Unmerged path tools/perf/tests/bpf.c
+* Unmerged path tools/perf/tests/bpf.c
+* Unmerged path tools/perf/util/parse-events.c
+* Unmerged path tools/perf/util/parse-events.h
+* Unmerged path tools/perf/util/parse-events.y
