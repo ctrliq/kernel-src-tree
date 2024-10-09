@@ -1,0 +1,162 @@
+scsi: lpfc: Fix SCSI io host reset causing kernel crash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix SCSI io host reset causing kernel crash (Dick Kennedy) [1530120]
+Rebuild_FUZZ: 94.23%
+commit-author James Smart <jsmart2021@gmail.com>
+commit c1dd9111b7f78a90bccd2e4abb9b9bb6319a4c64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c1dd9111.failed
+
+During SCSI error handling escalation to host reset, the SCSI io
+routines were moved off the txcmplq, but the individual io's ON_CMPLQ
+flag wasn't cleared.  Thus, a background thread saw the io and attempted
+to access it as if on the txcmplq.
+
+Clear the flag upon removal.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c1dd9111b7f78a90bccd2e4abb9b9bb6319a4c64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index 522a643d327a,aa7872a7b493..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -947,29 -957,44 +947,56 @@@ lpfc_hba_clean_txcmplq(struct lpfc_hba 
+  	struct lpfc_sli_ring *pring;
+  	LIST_HEAD(completions);
+  	int i;
++ 	struct lpfc_iocbq *piocb, *next_iocb;
+  
+ -	if (phba->sli_rev != LPFC_SLI_REV4) {
+ -		for (i = 0; i < psli->num_rings; i++) {
+ -			pring = &psli->sli3_ring[i];
+ +	for (i = 0; i < psli->num_rings; i++) {
+ +		pring = &psli->ring[i];
+ +		if (phba->sli_rev >= LPFC_SLI_REV4)
+ +			spin_lock_irq(&pring->ring_lock);
+ +		else
+  			spin_lock_irq(&phba->hbalock);
+++<<<<<<< HEAD
+ +		/* At this point in time the HBA is either reset or DOA. Either
+ +		 * way, nothing should be on txcmplq as it will NEVER complete.
+ +		 */
+++=======
++ 			/* At this point in time the HBA is either reset or DOA
++ 			 * Nothing should be on txcmplq as it will
++ 			 * NEVER complete.
++ 			 */
++ 			list_splice_init(&pring->txcmplq, &completions);
++ 			pring->txcmplq_cnt = 0;
++ 			spin_unlock_irq(&phba->hbalock);
++ 
++ 			lpfc_sli_abort_iocb_ring(phba, pring);
++ 		}
++ 		/* Cancel all the IOCBs from the completions list */
++ 		lpfc_sli_cancel_iocbs(phba, &completions,
++ 				      IOSTAT_LOCAL_REJECT, IOERR_SLI_ABORTED);
++ 		return;
++ 	}
++ 	list_for_each_entry(qp, &phba->sli4_hba.lpfc_wq_list, wq_list) {
++ 		pring = qp->pring;
++ 		if (!pring)
++ 			continue;
++ 		spin_lock_irq(&pring->ring_lock);
++ 		list_for_each_entry_safe(piocb, next_iocb,
++ 					 &pring->txcmplq, list)
++ 			piocb->iocb_flag &= ~LPFC_IO_ON_TXCMPLQ;
+++>>>>>>> c1dd9111b7f7 (scsi: lpfc: Fix SCSI io host reset causing kernel crash)
+  		list_splice_init(&pring->txcmplq, &completions);
+  		pring->txcmplq_cnt = 0;
+ -		spin_unlock_irq(&pring->ring_lock);
+ +
+ +		if (phba->sli_rev >= LPFC_SLI_REV4)
+ +			spin_unlock_irq(&pring->ring_lock);
+ +		else
+ +			spin_unlock_irq(&phba->hbalock);
+ +
+ +		/* Cancel all the IOCBs from the completions list */
+ +		lpfc_sli_cancel_iocbs(phba, &completions, IOSTAT_LOCAL_REJECT,
+ +				      IOERR_SLI_ABORTED);
+  		lpfc_sli_abort_iocb_ring(phba, pring);
+  	}
+ -	/* Cancel all the IOCBs from the completions list */
+ -	lpfc_sli_cancel_iocbs(phba, &completions,
+ -			      IOSTAT_LOCAL_REJECT, IOERR_SLI_ABORTED);
+  }
+  
+  /**
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index 0b70d1cd6093,d597e15a1974..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -3678,6 -3836,55 +3685,58 @@@ lpfc_sli_flush_fcp_rings(struct lpfc_hb
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_sli_flush_nvme_rings - flush all wqes in the nvme rings
++  * @phba: Pointer to HBA context object.
++  *
++  * This function flushes all wqes in the nvme rings and frees all resources
++  * in the txcmplq. This function does not issue abort wqes for the IO
++  * commands in txcmplq, they will just be returned with
++  * IOERR_SLI_DOWN. This function is invoked with EEH when device's PCI
++  * slot has been permanently disabled.
++  **/
++ void
++ lpfc_sli_flush_nvme_rings(struct lpfc_hba *phba)
++ {
++ 	LIST_HEAD(txcmplq);
++ 	struct lpfc_sli_ring  *pring;
++ 	uint32_t i;
++ 	struct lpfc_iocbq *piocb, *next_iocb;
++ 
++ 	if (phba->sli_rev < LPFC_SLI_REV4)
++ 		return;
++ 
++ 	/* Hint to other driver operations that a flush is in progress. */
++ 	spin_lock_irq(&phba->hbalock);
++ 	phba->hba_flag |= HBA_NVME_IOQ_FLUSH;
++ 	spin_unlock_irq(&phba->hbalock);
++ 
++ 	/* Cycle through all NVME rings and complete each IO with
++ 	 * a local driver reason code.  This is a flush so no
++ 	 * abort exchange to FW.
++ 	 */
++ 	for (i = 0; i < phba->cfg_nvme_io_channel; i++) {
++ 		pring = phba->sli4_hba.nvme_wq[i]->pring;
++ 
++ 		spin_lock_irq(&pring->ring_lock);
++ 		list_for_each_entry_safe(piocb, next_iocb,
++ 					 &pring->txcmplq, list)
++ 			piocb->iocb_flag &= ~LPFC_IO_ON_TXCMPLQ;
++ 		/* Retrieve everything on the txcmplq */
++ 		list_splice_init(&pring->txcmplq, &txcmplq);
++ 		pring->txcmplq_cnt = 0;
++ 		spin_unlock_irq(&pring->ring_lock);
++ 
++ 		/* Flush the txcmpq &&&PAE */
++ 		lpfc_sli_cancel_iocbs(phba, &txcmplq,
++ 				      IOSTAT_LOCAL_REJECT,
++ 				      IOERR_SLI_DOWN);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> c1dd9111b7f7 (scsi: lpfc: Fix SCSI io host reset causing kernel crash)
+   * lpfc_sli_brdready_s3 - Check for sli3 host ready status
+   * @phba: Pointer to HBA context object.
+   * @mask: Bit mask to be checked.
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
