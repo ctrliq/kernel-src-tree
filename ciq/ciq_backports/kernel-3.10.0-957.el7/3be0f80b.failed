@@ -1,0 +1,178 @@
+NFSv4.1: Fix up replays of interrupted requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 3be0f80b5fe9c16eca2d538f799b94ca8aa59433
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3be0f80b.failed
+
+If the previous request on a slot was interrupted before it was
+processed by the server, then our slot sequence number may be out of whack,
+and so we try the next operation using the old sequence number.
+
+The problem with this, is that not all servers check to see that the
+client is replaying the same operations as previously when they decide
+to go to the replay cache, and so instead of the expected error of
+NFS4ERR_SEQ_FALSE_RETRY, we get a replay of the old reply, which could
+(if the operations match up) be mistaken by the client for a new reply.
+
+To fix this, we attempt to send a COMPOUND containing only the SEQUENCE op
+in order to resync our slot sequence number.
+
+	Cc: Olga Kornievskaia <olga.kornievskaia@gmail.com>
+[olga.kornievskaia@gmail.com: fix an Oops]
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3be0f80b5fe9c16eca2d538f799b94ca8aa59433)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4_fs.h
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4_fs.h
+index 07fa9ae73d4a,b547d935aaf0..000000000000
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@@ -455,7 -464,7 +455,11 @@@ extern void nfs_increment_open_seqid(in
+  extern void nfs_increment_lock_seqid(int status, struct nfs_seqid *seqid);
+  extern void nfs_release_seqid(struct nfs_seqid *seqid);
+  extern void nfs_free_seqid(struct nfs_seqid *seqid);
+++<<<<<<< HEAD
+ +extern int nfs40_setup_sequence(struct nfs4_slot_table *tbl,
+++=======
++ extern int nfs4_setup_sequence(struct nfs_client *client,
+++>>>>>>> 3be0f80b5fe9 (NFSv4.1: Fix up replays of interrupted requests)
+  				struct nfs4_sequence_args *args,
+  				struct nfs4_sequence_res *res,
+  				struct rpc_task *task);
+diff --cc fs/nfs/nfs4proc.c
+index 0a1efaa4e649,d0fd96b67640..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -984,17 -866,19 +993,28 @@@ static const struct rpc_call_ops nfs41_
+  	.rpc_call_done = nfs41_call_sync_done,
+  };
+  
++ static void
++ nfs4_sequence_process_interrupted(struct nfs_client *client,
++ 		struct nfs4_slot *slot, struct rpc_cred *cred)
++ {
++ 	struct rpc_task *task;
++ 
++ 	task = _nfs41_proc_sequence(client, cred, slot, true);
++ 	if (!IS_ERR(task))
++ 		rpc_put_task_async(task);
++ }
++ 
+  #else	/* !CONFIG_NFS_V4_1 */
+  
+ +static int nfs4_setup_sequence(const struct nfs_server *server,
+ +			       struct nfs4_sequence_args *args,
+ +			       struct nfs4_sequence_res *res,
+ +			       struct rpc_task *task)
+ +{
+ +	return nfs40_setup_sequence(server->nfs_client->cl_slot_tbl,
+ +				    args, res, task);
+ +}
+ +
+  static int nfs4_sequence_process(struct rpc_task *task, struct nfs4_sequence_res *res)
+  {
+  	return nfs40_sequence_done(task, res);
+@@@ -1013,8 -897,90 +1033,93 @@@ int nfs4_sequence_done(struct rpc_task 
+  }
+  EXPORT_SYMBOL_GPL(nfs4_sequence_done);
+  
++ static void
++ nfs4_sequence_process_interrupted(struct nfs_client *client,
++ 		struct nfs4_slot *slot, struct rpc_cred *cred)
++ {
++ 	WARN_ON_ONCE(1);
++ 	slot->interrupted = 0;
++ }
++ 
+  #endif	/* !CONFIG_NFS_V4_1 */
+  
+++<<<<<<< HEAD
+++=======
++ static
++ void nfs4_sequence_attach_slot(struct nfs4_sequence_args *args,
++ 		struct nfs4_sequence_res *res,
++ 		struct nfs4_slot *slot)
++ {
++ 	if (!slot)
++ 		return;
++ 	slot->privileged = args->sa_privileged ? 1 : 0;
++ 	args->sa_slot = slot;
++ 
++ 	res->sr_slot = slot;
++ 	res->sr_timestamp = jiffies;
++ 	res->sr_status_flags = 0;
++ 	res->sr_status = 1;
++ 
++ }
++ 
++ int nfs4_setup_sequence(struct nfs_client *client,
++ 			struct nfs4_sequence_args *args,
++ 			struct nfs4_sequence_res *res,
++ 			struct rpc_task *task)
++ {
++ 	struct nfs4_session *session = nfs4_get_session(client);
++ 	struct nfs4_slot_table *tbl  = client->cl_slot_tbl;
++ 	struct nfs4_slot *slot;
++ 
++ 	/* slot already allocated? */
++ 	if (res->sr_slot != NULL)
++ 		goto out_start;
++ 
++ 	if (session) {
++ 		tbl = &session->fc_slot_table;
++ 		task->tk_timeout = 0;
++ 	}
++ 
++ 	for (;;) {
++ 		spin_lock(&tbl->slot_tbl_lock);
++ 		/* The state manager will wait until the slot table is empty */
++ 		if (nfs4_slot_tbl_draining(tbl) && !args->sa_privileged)
++ 			goto out_sleep;
++ 
++ 		slot = nfs4_alloc_slot(tbl);
++ 		if (IS_ERR(slot)) {
++ 			/* Try again in 1/4 second */
++ 			if (slot == ERR_PTR(-ENOMEM))
++ 				task->tk_timeout = HZ >> 2;
++ 			goto out_sleep;
++ 		}
++ 		spin_unlock(&tbl->slot_tbl_lock);
++ 
++ 		if (likely(!slot->interrupted))
++ 			break;
++ 		nfs4_sequence_process_interrupted(client,
++ 				slot, task->tk_msg.rpc_cred);
++ 	}
++ 
++ 	nfs4_sequence_attach_slot(args, res, slot);
++ 
++ 	trace_nfs4_setup_sequence(session, args);
++ out_start:
++ 	rpc_call_start(task);
++ 	return 0;
++ 
++ out_sleep:
++ 	if (args->sa_privileged)
++ 		rpc_sleep_on_priority(&tbl->slot_tbl_waitq, task,
++ 				NULL, RPC_PRIORITY_PRIVILEGED);
++ 	else
++ 		rpc_sleep_on(&tbl->slot_tbl_waitq, task, NULL);
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 	return -EAGAIN;
++ }
++ EXPORT_SYMBOL_GPL(nfs4_setup_sequence);
++ 
+++>>>>>>> 3be0f80b5fe9 (NFSv4.1: Fix up replays of interrupted requests)
+  static void nfs40_call_sync_prepare(struct rpc_task *task, void *calldata)
+  {
+  	struct nfs4_call_sync_data *data = calldata;
+* Unmerged path fs/nfs/nfs4_fs.h
+* Unmerged path fs/nfs/nfs4proc.c
