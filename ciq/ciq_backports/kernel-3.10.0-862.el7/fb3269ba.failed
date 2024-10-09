@@ -1,0 +1,130 @@
+qla2xxx: Add selective command queuing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@qlogic.com>
+commit fb3269baf4ecc2ce6d17d4eb537080035bdf6d5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fb3269ba.failed
+
+queue work element to specific process lessen cache miss
+
+	Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit fb3269baf4ecc2ce6d17d4eb537080035bdf6d5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+#	include/target/target_core_base.h
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4244f37d5d93,d3cd271eb127..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2744,15 -3979,27 +2744,31 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&cmd->cmd_list);
+++=======
++ 	cmd->cmd_in_wq = 1;
++ 	cmd->cmd_flags |= BIT_0;
++ 	cmd->se_cmd.cpuid = -1;
+++>>>>>>> fb3269baf4ec (qla2xxx: Add selective command queuing)
+  
+ -	spin_lock(&vha->cmd_list_lock);
+ -	list_add_tail(&cmd->cmd_list, &vha->qla_cmd_list);
+ -	spin_unlock(&vha->cmd_list_lock);
+ +	memcpy(&cmd->atio, atio, sizeof(*atio));
+ +	cmd->state = QLA_TGT_STATE_NEW;
+ +	cmd->tgt = ha->tgt.qla_tgt;
+ +	cmd->vha = vha;
+  
+  	INIT_WORK(&cmd->work, qlt_do_work);
+- 	queue_work(qla_tgt_wq, &cmd->work);
++ 	if (ha->msix_count) {
++ 		cmd->se_cmd.cpuid = ha->tgt.rspq_vector_cpuid;
++ 		if (cmd->atio.u.isp24.fcp_cmnd.rddata)
++ 			queue_work_on(smp_processor_id(), qla_tgt_wq,
++ 			    &cmd->work);
++ 		else
++ 			queue_work_on(cmd->se_cmd.cpuid, qla_tgt_wq,
++ 			    &cmd->work);
++ 	} else {
++ 		queue_work(qla_tgt_wq, &cmd->work);
++ 	}
+  	return 0;
+  
+  }
+diff --cc include/target/target_core_base.h
+index 6a27f0cf6579,4b258fcc7d6f..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -569,7 -528,7 +569,11 @@@ struct se_cmd 
+  	unsigned int		t_prot_nents;
+  	sense_reason_t		pi_err;
+  	sector_t		bad_sector;
+++<<<<<<< HEAD
+ +	bool			prot_pto;
+++=======
++ 	int			cpuid;
+++>>>>>>> fb3269baf4ec (qla2xxx: Add selective command queuing)
+  };
+  
+  struct se_ua {
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 99f5a88cc283..481dbddd3450 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -3323,7 +3323,7 @@ static void qla_irq_affinity_notify(struct irq_affinity_notify *notify,
+ 	}
+ }
+ 
+-void qla_irq_affinity_release(struct kref *ref)
++static void qla_irq_affinity_release(struct kref *ref)
+ {
+ 	struct irq_affinity_notify *notify =
+ 		container_of(ref, struct irq_affinity_notify, kref);
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 14250fcfe054..de8c5158c4e4 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -414,7 +414,7 @@ static void tcm_qla2xxx_complete_free(struct work_struct *work)
+ static void tcm_qla2xxx_free_cmd(struct qla_tgt_cmd *cmd)
+ {
+ 	INIT_WORK(&cmd->work, tcm_qla2xxx_complete_free);
+-	queue_work(tcm_qla2xxx_free_wq, &cmd->work);
++	queue_work_on(smp_processor_id(), tcm_qla2xxx_free_wq, &cmd->work);
+ }
+ 
+ /*
+@@ -629,7 +629,7 @@ static void tcm_qla2xxx_handle_data_work(struct work_struct *work)
+ static void tcm_qla2xxx_handle_data(struct qla_tgt_cmd *cmd)
+ {
+ 	INIT_WORK(&cmd->work, tcm_qla2xxx_handle_data_work);
+-	queue_work(tcm_qla2xxx_free_wq, &cmd->work);
++	queue_work_on(smp_processor_id(), tcm_qla2xxx_free_wq, &cmd->work);
+ }
+ 
+ /*
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index c170951cb91c..4a8998b5628c 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -755,7 +755,10 @@ void target_complete_cmd(struct se_cmd *cmd, u8 scsi_status)
+ 	cmd->transport_state |= (CMD_T_COMPLETE | CMD_T_ACTIVE);
+ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ 
+-	queue_work(target_completion_wq, &cmd->work);
++	if (cmd->cpuid == -1)
++		queue_work(target_completion_wq, &cmd->work);
++	else
++		queue_work_on(cmd->cpuid, target_completion_wq, &cmd->work);
+ }
+ EXPORT_SYMBOL(target_complete_cmd);
+ 
+* Unmerged path include/target/target_core_base.h
