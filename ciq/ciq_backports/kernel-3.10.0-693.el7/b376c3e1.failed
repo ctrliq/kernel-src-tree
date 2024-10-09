@@ -1,0 +1,190 @@
+userns: Add a limit on the number of user namespaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit b376c3e1b6770ddcb4f0782be16358095fcea0b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b376c3e1.failed
+
+Export the export the maximum number of user namespaces as
+/proc/sys/userns/max_user_namespaces.
+
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit b376c3e1b6770ddcb4f0782be16358095fcea0b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	kernel/ucount.c
+#	kernel/user_namespace.c
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,6421cca2daa9..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -39,8 -39,13 +39,18 @@@ struct user_namespace 
+  	struct key		*persistent_keyring_register;
+  	struct rw_semaphore	persistent_keyring_register_sem;
+  #endif
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(int level)
+ +	RH_KABI_EXTEND(unsigned long flags)
+++=======
++ 	struct work_struct	work;
++ #ifdef CONFIG_SYSCTL
++ 	struct ctl_table_set	set;
++ 	struct ctl_table_header *sysctls;
++ #endif
++ 	int max_user_namespaces;
++ 	atomic_t user_namespaces;
+++>>>>>>> b376c3e1b677 (userns: Add a limit on the number of user namespaces)
+  };
+  
+  extern struct user_namespace init_user_ns;
+diff --cc kernel/user_namespace.c
+index 57f036cb8f03,7d87017a0040..000000000000
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@@ -22,7 -22,6 +22,10 @@@
+  #include <linux/ctype.h>
+  #include <linux/projid.h>
+  #include <linux/fs_struct.h>
+++<<<<<<< HEAD
+ +#include <linux/moduleparam.h>
+++=======
+++>>>>>>> b376c3e1b677 (userns: Add a limit on the number of user namespaces)
+  
+  static struct kmem_cache *user_ns_cachep __read_mostly;
+  static DEFINE_MUTEX(userns_state_mutex);
+@@@ -30,7 -29,9 +33,8 @@@
+  static bool new_idmap_permitted(const struct file *file,
+  				struct user_namespace *ns, int cap_setid,
+  				struct uid_gid_map *map);
+ -static void free_user_ns(struct work_struct *work);
+  
++ 
+  static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
+  {
+  	/* Start with the same capabilities as init but useless for doing
+@@@ -69,16 -65,13 +73,20 @@@ int create_user_ns(struct cred *new
+  	kuid_t owner = new->euid;
+  	kgid_t group = new->egid;
+  	int ret;
+ +	static int __read_mostly called_mark_tech_preview = 0;
+ +
+ +	if (!enable_user_ns_creation)
+ +		return -EINVAL;
+ +
+ +	if (!called_mark_tech_preview && !xchg(&called_mark_tech_preview, 1))
+ +		mark_tech_preview("user namespace", NULL);
+  
++ 	ret = -EUSERS;
+  	if (parent_ns->level > 32)
+- 		return -EUSERS;
++ 		goto fail;
++ 
++ 	if (!inc_user_namespaces(parent_ns))
++ 		goto fail;
+  
+  	/*
+  	 * Verify that we can not violate the policy of which files
+@@@ -93,19 -87,20 +102,28 @@@
+  	 * or else we won't be able to reasonably tell userspace who
+  	 * created a user_namespace.
+  	 */
++ 	ret = -EPERM;
+  	if (!kuid_has_mapping(parent_ns, owner) ||
+  	    !kgid_has_mapping(parent_ns, group))
+- 		return -EPERM;
++ 		goto fail_dec;
+  
++ 	ret = -ENOMEM;
+  	ns = kmem_cache_zalloc(user_ns_cachep, GFP_KERNEL);
+  	if (!ns)
+- 		return -ENOMEM;
++ 		goto fail_dec;
+  
+++<<<<<<< HEAD
+ +	ret = proc_alloc_inum(&ns->proc_inum);
+ +	if (ret) {
+ +		kmem_cache_free(user_ns_cachep, ns);
+ +		return ret;
+ +	}
+++=======
++ 	ret = ns_alloc_inum(&ns->ns);
++ 	if (ret)
++ 		goto fail_free;
++ 	ns->ns.ops = &userns_operations;
+++>>>>>>> b376c3e1b677 (userns: Add a limit on the number of user namespaces)
+  
+  	atomic_set(&ns->count, 1);
+  	/* Leave the new->user_ns reference with the new user namespace. */
+@@@ -113,6 -108,8 +131,11 @@@
+  	ns->level = parent_ns->level + 1;
+  	ns->owner = owner;
+  	ns->group = group;
+++<<<<<<< HEAD
+++=======
++ 	INIT_WORK(&ns->work, free_user_ns);
++ 	ns->max_user_namespaces = INT_MAX;
+++>>>>>>> b376c3e1b677 (userns: Add a limit on the number of user namespaces)
+  
+  	/* Inherit USERNS_SETGROUPS_ALLOWED from our parent */
+  	mutex_lock(&userns_state_mutex);
+@@@ -126,7 -119,23 +149,21 @@@
+  #ifdef CONFIG_PERSISTENT_KEYRINGS
+  	init_rwsem(&ns->persistent_keyring_register_sem);
+  #endif
+ -	ret = -ENOMEM;
+ -	if (!setup_userns_sysctls(ns))
+ -		goto fail_keyring;
+ -
+ -	set_cred_user_ns(new, ns);
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ fail_keyring:
++ #ifdef CONFIG_PERSISTENT_KEYRINGS
++ 	key_put(ns->persistent_keyring_register);
++ #endif
++ 	ns_free_inum(&ns->ns);
++ fail_free:
++ 	kmem_cache_free(user_ns_cachep, ns);
++ fail_dec:
++ 	dec_user_namespaces(parent_ns);
++ fail:
++ 	return ret;
+++>>>>>>> b376c3e1b677 (userns: Add a limit on the number of user namespaces)
+  }
+  
+  int unshare_userns(unsigned long unshare_flags, struct cred **new_cred)
+@@@ -158,8 -168,10 +195,9 @@@ void free_user_ns(struct user_namespac
+  #ifdef CONFIG_PERSISTENT_KEYRINGS
+  		key_put(ns->persistent_keyring_register);
+  #endif
+ -		ns_free_inum(&ns->ns);
+ +		proc_free_inum(ns->proc_inum);
+  		kmem_cache_free(user_ns_cachep, ns);
++ 		dec_user_namespaces(parent);
+  		ns = parent;
+  	} while (atomic_dec_and_test(&parent->count));
+  }
+* Unmerged path kernel/ucount.c
+* Unmerged path include/linux/user_namespace.h
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 4d1b25f88335..7e0fa4a9858e 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -309,6 +309,8 @@ void __init fork_init(unsigned long mempages)
+ 	init_task.signal->rlim[RLIMIT_NPROC].rlim_max = max_threads/2;
+ 	init_task.signal->rlim[RLIMIT_SIGPENDING] =
+ 		init_task.signal->rlim[RLIMIT_NPROC];
++
++	init_user_ns.max_user_namespaces = max_threads;
+ }
+ 
+ int __attribute__((weak)) arch_dup_task_struct(struct task_struct *dst,
+* Unmerged path kernel/ucount.c
+* Unmerged path kernel/user_namespace.c
