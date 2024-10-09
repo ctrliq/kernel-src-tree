@@ -1,0 +1,148 @@
+ceph: search cache postion for dcache readdir
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit c530cd24c23818af8da35fe556f9a7754211e50a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c530cd24.failed
+
+use binary search to find cache index that corresponds to readdir
+postion.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit c530cd24c23818af8da35fe556f9a7754211e50a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+diff --cc fs/ceph/dir.c
+index f5abab663b08,cdea450c5902..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -121,71 -165,65 +165,97 @@@ __dcache_find_get_entry(struct dentry *
+   * defined IFF we hold CEPH_CAP_FILE_SHARED (which will be revoked by
+   * the MDS if/when the directory is modified).
+   */
+ -static int __dcache_readdir(struct file *file,  struct dir_context *ctx,
+ +static int __dcache_readdir(struct file *filp,
+ +			    void *dirent, filldir_t filldir,
+  			    u32 shared_gen)
+  {
+ -	struct ceph_file_info *fi = file->private_data;
+ -	struct dentry *parent = file->f_path.dentry;
+ -	struct inode *dir = d_inode(parent);
+ +	struct ceph_file_info *fi = filp->private_data;
+ +	struct dentry *parent = filp->f_dentry;
+ +	struct inode *dir = parent->d_inode;
+  	struct dentry *dentry, *last = NULL;
+  	struct ceph_dentry_info *di;
+++<<<<<<< HEAD
+ +	unsigned nsize = PAGE_CACHE_SIZE / sizeof(struct dentry *);
+ +	int err = 0;
+ +	loff_t ptr_pos = 0;
+++=======
+++>>>>>>> c530cd24c238 (ceph: search cache postion for dcache readdir)
+  	struct ceph_readdir_cache_control cache_ctl = {};
++ 	u64 idx = 0;
++ 	int err = 0;
+  
+ -	dout("__dcache_readdir %p v%u at %llu\n", dir, shared_gen, ctx->pos);
+ +	dout("__dcache_readdir %p v%u at %llu\n", dir, shared_gen, filp->f_pos);
+  
+++<<<<<<< HEAD
+ +	/* we can calculate cache index for the first dirfrag */
+ +	if (ceph_frag_is_leftmost(fpos_frag(filp->f_pos))) {
+ +		cache_ctl.index = fpos_off(filp->f_pos) - 2;
+ +		BUG_ON(cache_ctl.index < 0);
+ +		ptr_pos = cache_ctl.index * sizeof(struct dentry *);
+++=======
++ 	/* search start position */
++ 	if (ctx->pos > 2) {
++ 		u64 count = div_u64(i_size_read(dir), sizeof(struct dentry *));
++ 		while (count > 0) {
++ 			u64 step = count >> 1;
++ 			dentry = __dcache_find_get_entry(parent, idx + step,
++ 							 &cache_ctl);
++ 			if (!dentry) {
++ 				/* use linar search */
++ 				idx = 0;
++ 				break;
++ 			}
++ 			if (IS_ERR(dentry)) {
++ 				err = PTR_ERR(dentry);
++ 				goto out;
++ 			}
++ 			di = ceph_dentry(dentry);
++ 			spin_lock(&dentry->d_lock);
++ 			if (fpos_cmp(di->offset, ctx->pos) < 0) {
++ 				idx += step + 1;
++ 				count -= step + 1;
++ 			} else {
++ 				count = step;
++ 			}
++ 			spin_unlock(&dentry->d_lock);
++ 			dput(dentry);
++ 		}
++ 
++ 		dout("__dcache_readdir %p cache idx %llu\n", dir, idx);
+++>>>>>>> c530cd24c238 (ceph: search cache postion for dcache readdir)
+  	}
+  
+- 	while (true) {
+- 		pgoff_t pgoff;
+- 		bool emit_dentry;
+  
+- 		if (ptr_pos >= i_size_read(dir)) {
++ 	for (;;) {
++ 		bool emit_dentry = false;
++ 		dentry = __dcache_find_get_entry(parent, idx++, &cache_ctl);
++ 		if (!dentry) {
+  			fi->flags |= CEPH_F_ATEND;
+  			err = 0;
+  			break;
+  		}
+++<<<<<<< HEAD
+ +
+ +		err = -EAGAIN;
+ +		pgoff = ptr_pos >> PAGE_CACHE_SHIFT;
+ +		if (!cache_ctl.page || pgoff != page_index(cache_ctl.page)) {
+ +			ceph_readdir_cache_release(&cache_ctl);
+ +			cache_ctl.page = find_lock_page(&dir->i_data, pgoff);
+ +			if (!cache_ctl.page) {
+ +				dout(" page %lu not found\n", pgoff);
+ +				break;
+ +			}
+ +			/* reading/filling the cache are serialized by
+ +			 * i_mutex, no need to use page lock */
+ +			unlock_page(cache_ctl.page);
+ +			cache_ctl.dentries = kmap(cache_ctl.page);
+++=======
++ 		if (IS_ERR(dentry)) {
++ 			err = PTR_ERR(dentry);
++ 			goto out;
+++>>>>>>> c530cd24c238 (ceph: search cache postion for dcache readdir)
+  		}
+  
+- 		rcu_read_lock();
+- 		spin_lock(&parent->d_lock);
+- 		/* check i_size again here, because empty directory can be
+- 		 * marked as complete while not holding the i_mutex. */
+- 		if (ceph_dir_is_complete_ordered(dir) &&
+- 		    ptr_pos < i_size_read(dir))
+- 			dentry = cache_ctl.dentries[cache_ctl.index % nsize];
+- 		else
+- 			dentry = NULL;
+- 		spin_unlock(&parent->d_lock);
+- 		if (dentry && !lockref_get_not_dead(&dentry->d_lockref))
+- 			dentry = NULL;
+- 		rcu_read_unlock();
+- 		if (!dentry)
+- 			break;
+- 
+- 		emit_dentry = false;
+  		di = ceph_dentry(dentry);
+  		spin_lock(&dentry->d_lock);
+  		if (di->lease_shared_gen == shared_gen &&
+* Unmerged path fs/ceph/dir.c
