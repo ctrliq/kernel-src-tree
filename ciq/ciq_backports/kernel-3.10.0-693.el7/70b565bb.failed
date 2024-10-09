@@ -1,0 +1,287 @@
+cxl: Prevent adapter reset if an active context exists
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+commit 70b565bbdb911023373e035225ab10077e4ab937
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/70b565bb.failed
+
+This patch prevents resetting the cxl adapter via sysfs in presence of
+one or more active cxl_context on it. This protects against an
+unrecoverable error caused by PSL owning a dirty cache line even after
+reset and host tries to touch the same cache line. In case a force reset
+of the card is required irrespective of any active contexts, the int
+value -1 can be stored in the 'reset' sysfs attribute of the card.
+
+The patch introduces a new atomic_t member named contexts_num inside
+struct cxl that holds the number of active context attached to the card
+, which is checked against '0' before proceeding with the reset. To
+prevent against a race condition where a context is activated just after
+reset check is performed, the contexts_num is atomically set to '-1'
+after reset-check to indicate that no more contexts can be activated on
+the card anymore.
+
+Before activating a context we atomically test if contexts_num is
+non-negative and if so, increment its value by one. In case the value of
+contexts_num is negative then it indicates that the card is about to be
+reset and context activation is error-ed out at that point.
+
+Fixes: 62fa19d4b4fd ("cxl: Add ability to reset the card")
+	Cc: stable@vger.kernel.org # v4.0+
+	Acked-by: Frederic Barrat <fbarrat@linux.vnet.ibm.com>
+	Reviewed-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+	Signed-off-by: Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 70b565bbdb911023373e035225ab10077e4ab937)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/cxl/cxl.h
+diff --cc drivers/misc/cxl/cxl.h
+index 0838e0ea880e,a144073593fa..000000000000
+--- a/drivers/misc/cxl/cxl.h
++++ b/drivers/misc/cxl/cxl.h
+@@@ -892,4 -949,23 +900,26 @@@ extern const struct cxl_backend_ops *cx
+  
+  /* check if the given pci_dev is on the the cxl vphb bus */
+  bool cxl_pci_is_vphb_device(struct pci_dev *dev);
+++<<<<<<< HEAD
+++=======
++ 
++ /* decode AFU error bits in the PSL register PSL_SERR_An */
++ void cxl_afu_decode_psl_serr(struct cxl_afu *afu, u64 serr);
++ 
++ /*
++  * Increments the number of attached contexts on an adapter.
++  * In case an adapter_context_lock is taken the return -EBUSY.
++  */
++ int cxl_adapter_context_get(struct cxl *adapter);
++ 
++ /* Decrements the number of attached contexts on an adapter */
++ void cxl_adapter_context_put(struct cxl *adapter);
++ 
++ /* If no active contexts then prevents contexts from being attached */
++ int cxl_adapter_context_lock(struct cxl *adapter);
++ 
++ /* Unlock the contexts-lock if taken. Warn and force unlock otherwise */
++ void cxl_adapter_context_unlock(struct cxl *adapter);
++ 
+++>>>>>>> 70b565bbdb91 (cxl: Prevent adapter reset if an active context exists)
+  #endif
+diff --git a/Documentation/ABI/testing/sysfs-class-cxl b/Documentation/ABI/testing/sysfs-class-cxl
+index 4ba0a2a61926..640f65e79ef1 100644
+--- a/Documentation/ABI/testing/sysfs-class-cxl
++++ b/Documentation/ABI/testing/sysfs-class-cxl
+@@ -220,8 +220,11 @@ What:           /sys/class/cxl/<card>/reset
+ Date:           October 2014
+ Contact:        linuxppc-dev@lists.ozlabs.org
+ Description:    write only
+-                Writing 1 will issue a PERST to card which may cause the card
+-                to reload the FPGA depending on load_image_on_perst.
++                Writing 1 will issue a PERST to card provided there are no
++                contexts active on any one of the card AFUs. This may cause
++                the card to reload the FPGA depending on load_image_on_perst.
++                Writing -1 will do a force PERST irrespective of any active
++                contexts on the card AFUs.
+ Users:		https://github.com/ibm-capi/libcxl
+ 
+ What:		/sys/class/cxl/<card>/perst_reloads_same_image (not in a guest)
+diff --git a/drivers/misc/cxl/api.c b/drivers/misc/cxl/api.c
+index 2107c948406d..18927c9a75d0 100644
+--- a/drivers/misc/cxl/api.c
++++ b/drivers/misc/cxl/api.c
+@@ -188,6 +188,14 @@ int cxl_start_context(struct cxl_context *ctx, u64 wed,
+ 	if (ctx->status == STARTED)
+ 		goto out; /* already started */
+ 
++	/*
++	 * Increment the mapped context count for adapter. This also checks
++	 * if adapter_context_lock is taken.
++	 */
++	rc = cxl_adapter_context_get(ctx->afu->adapter);
++	if (rc)
++		goto out;
++
+ 	if (task) {
+ 		ctx->pid = get_task_pid(task, PIDTYPE_PID);
+ 		ctx->glpid = get_task_pid(task->group_leader, PIDTYPE_PID);
+@@ -198,6 +206,7 @@ int cxl_start_context(struct cxl_context *ctx, u64 wed,
+ 
+ 	if ((rc = cxl_ops->attach_process(ctx, kernel, wed, 0))) {
+ 		put_pid(ctx->pid);
++		cxl_adapter_context_put(ctx->afu->adapter);
+ 		cxl_ctx_put();
+ 		goto out;
+ 	}
+diff --git a/drivers/misc/cxl/context.c b/drivers/misc/cxl/context.c
+index 7edea9c19199..ab75787426d6 100644
+--- a/drivers/misc/cxl/context.c
++++ b/drivers/misc/cxl/context.c
+@@ -235,6 +235,9 @@ int __detach_context(struct cxl_context *ctx)
+ 	put_pid(ctx->glpid);
+ 
+ 	cxl_ctx_put();
++
++	/* Decrease the attached context count on the adapter */
++	cxl_adapter_context_put(ctx->afu->adapter);
+ 	return 0;
+ }
+ 
+* Unmerged path drivers/misc/cxl/cxl.h
+diff --git a/drivers/misc/cxl/file.c b/drivers/misc/cxl/file.c
+index eec468f1612f..a22efd4887ab 100644
+--- a/drivers/misc/cxl/file.c
++++ b/drivers/misc/cxl/file.c
+@@ -205,11 +205,22 @@ static long afu_ioctl_start_work(struct cxl_context *ctx,
+ 	ctx->pid = get_task_pid(current, PIDTYPE_PID);
+ 	ctx->glpid = get_task_pid(current->group_leader, PIDTYPE_PID);
+ 
++	/*
++	 * Increment the mapped context count for adapter. This also checks
++	 * if adapter_context_lock is taken.
++	 */
++	rc = cxl_adapter_context_get(ctx->afu->adapter);
++	if (rc) {
++		afu_release_irqs(ctx, ctx);
++		goto out;
++	}
++
+ 	trace_cxl_attach(ctx, work.work_element_descriptor, work.num_interrupts, amr);
+ 
+ 	if ((rc = cxl_ops->attach_process(ctx, false, work.work_element_descriptor,
+ 							amr))) {
+ 		afu_release_irqs(ctx, ctx);
++		cxl_adapter_context_put(ctx->afu->adapter);
+ 		goto out;
+ 	}
+ 
+diff --git a/drivers/misc/cxl/guest.c b/drivers/misc/cxl/guest.c
+index 60f2e83c2f6f..8972a74f5c3c 100644
+--- a/drivers/misc/cxl/guest.c
++++ b/drivers/misc/cxl/guest.c
+@@ -1132,6 +1132,9 @@ struct cxl *cxl_guest_init_adapter(struct device_node *np, struct platform_devic
+ 	if ((rc = cxl_sysfs_adapter_add(adapter)))
+ 		goto err_put1;
+ 
++	/* release the context lock as the adapter is configured */
++	cxl_adapter_context_unlock(adapter);
++
+ 	return adapter;
+ 
+ err_put1:
+diff --git a/drivers/misc/cxl/main.c b/drivers/misc/cxl/main.c
+index ae68c3201156..8ae168f9d3c4 100644
+--- a/drivers/misc/cxl/main.c
++++ b/drivers/misc/cxl/main.c
+@@ -238,8 +238,10 @@ struct cxl *cxl_alloc_adapter(void)
+ 	if (dev_set_name(&adapter->dev, "card%i", adapter->adapter_num))
+ 		goto err2;
+ 
+-	return adapter;
++	/* start with context lock taken */
++	atomic_set(&adapter->contexts_num, -1);
+ 
++	return adapter;
+ err2:
+ 	cxl_remove_adapter_nr(adapter);
+ err1:
+@@ -281,6 +283,44 @@ int cxl_afu_select_best_mode(struct cxl_afu *afu)
+ 	return 0;
+ }
+ 
++int cxl_adapter_context_get(struct cxl *adapter)
++{
++	int rc;
++
++	rc = atomic_inc_unless_negative(&adapter->contexts_num);
++	return rc >= 0 ? 0 : -EBUSY;
++}
++
++void cxl_adapter_context_put(struct cxl *adapter)
++{
++	atomic_dec_if_positive(&adapter->contexts_num);
++}
++
++int cxl_adapter_context_lock(struct cxl *adapter)
++{
++	int rc;
++	/* no active contexts -> contexts_num == 0 */
++	rc = atomic_cmpxchg(&adapter->contexts_num, 0, -1);
++	return rc ? -EBUSY : 0;
++}
++
++void cxl_adapter_context_unlock(struct cxl *adapter)
++{
++	int val = atomic_cmpxchg(&adapter->contexts_num, -1, 0);
++
++	/*
++	 * contexts lock taken -> contexts_num == -1
++	 * If not true then show a warning and force reset the lock.
++	 * This will happen when context_unlock was requested without
++	 * doing a context_lock.
++	 */
++	if (val != -1) {
++		atomic_set(&adapter->contexts_num, 0);
++		WARN(1, "Adapter context unlocked with %d active contexts",
++		     val);
++	}
++}
++
+ static int __init init_cxl(void)
+ {
+ 	int rc = 0;
+diff --git a/drivers/misc/cxl/pci.c b/drivers/misc/cxl/pci.c
+index 65f037712088..3b84754bf838 100644
+--- a/drivers/misc/cxl/pci.c
++++ b/drivers/misc/cxl/pci.c
+@@ -1201,6 +1201,8 @@ static int cxl_configure_adapter(struct cxl *adapter, struct pci_dev *dev)
+ 	if ((rc = cxl_native_register_psl_err_irq(adapter)))
+ 		goto err;
+ 
++	/* Release the context lock as adapter is configured */
++	cxl_adapter_context_unlock(adapter);
+ 	return 0;
+ 
+ err:
+diff --git a/drivers/misc/cxl/sysfs.c b/drivers/misc/cxl/sysfs.c
+index b043c20f158f..a8b6d6a635e9 100644
+--- a/drivers/misc/cxl/sysfs.c
++++ b/drivers/misc/cxl/sysfs.c
+@@ -75,12 +75,31 @@ static ssize_t reset_adapter_store(struct device *device,
+ 	int val;
+ 
+ 	rc = sscanf(buf, "%i", &val);
+-	if ((rc != 1) || (val != 1))
++	if ((rc != 1) || (val != 1 && val != -1))
+ 		return -EINVAL;
+ 
+-	if ((rc = cxl_ops->adapter_reset(adapter)))
+-		return rc;
+-	return count;
++	/*
++	 * See if we can lock the context mapping that's only allowed
++	 * when there are no contexts attached to the adapter. Once
++	 * taken this will also prevent any context from getting activated.
++	 */
++	if (val == 1) {
++		rc =  cxl_adapter_context_lock(adapter);
++		if (rc)
++			goto out;
++
++		rc = cxl_ops->adapter_reset(adapter);
++		/* In case reset failed release context lock */
++		if (rc)
++			cxl_adapter_context_unlock(adapter);
++
++	} else if (val == -1) {
++		/* Perform a forced adapter reset */
++		rc = cxl_ops->adapter_reset(adapter);
++	}
++
++out:
++	return rc ? rc : count;
+ }
+ 
+ static ssize_t load_image_on_perst_show(struct device *device,
