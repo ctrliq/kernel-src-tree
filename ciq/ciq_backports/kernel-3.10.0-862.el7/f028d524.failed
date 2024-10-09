@@ -1,0 +1,209 @@
+ACPI / GPIO: Driver GPIO mappings for ACPI GPIOs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [sound] alsa: acpi / gpio: Driver GPIO mappings for ACPI GPIOs (Jaroslav Kysela) [1463624]
+Rebuild_FUZZ: 94.12%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit f028d5242d7ecb0a1bfc80e7bd292201c8612641
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f028d524.failed
+
+Provide a way for device drivers using GPIOs described by ACPI
+GpioIo resources in _CRS to tell the GPIO subsystem what names
+(connection IDs) to associate with specific GPIO pins defined
+in there.
+
+To do that, a driver needs to define a mapping table as a
+NULL-terminated array of struct acpi_gpio_mapping objects
+that each contain a name, a pointer to an array of line data
+(struct acpi_gpio_params) objects and the size of that array.
+
+Each struct acpi_gpio_params object consists of three fields,
+crs_entry_index, line_index, active_low, representing the index of
+the target GpioIo()/GpioInt() resource in _CRS starting from zero,
+the index of the target line in that resource starting from zero,
+and the active-low flag for that line, respectively.
+
+Next, the mapping table needs to be passed as the second
+argument to acpi_dev_add_driver_gpios() that will register it with
+the ACPI device object pointed to by its first argument.  That
+should be done in the driver's .probe() routine.
+
+On removal, the driver should unregister its GPIO mapping table
+by calling acpi_dev_remove_driver_gpios() on the ACPI device
+object where that table was previously registered.
+
+Included are fixes from Mika Westerberg.
+
+	Acked-by: Alexandre Courbot <acourbot@nvidia.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit f028d5242d7ecb0a1bfc80e7bd292201c8612641)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib-acpi.c
+#	include/linux/acpi.h
+diff --cc drivers/gpio/gpiolib-acpi.c
+index 76b6a9644a3a,5a4d061e787e..000000000000
+--- a/drivers/gpio/gpiolib-acpi.c
++++ b/drivers/gpio/gpiolib-acpi.c
+@@@ -223,16 -273,55 +223,51 @@@ static void acpi_gpiochip_free_interrup
+  	if (ACPI_FAILURE(status))
+  		return;
+  
+ -	list_for_each_entry_safe_reverse(event, ep, &acpi_gpio->events, node) {
+ -		struct gpio_desc *desc;
+ -
+ -		free_irq(event->irq, event);
+ -		desc = event->desc;
+ -		if (WARN_ON(IS_ERR(desc)))
+ -			continue;
+ -		gpio_unlock_as_irq(chip, event->pin);
+ -		gpiochip_free_own_desc(desc);
+ -		list_del(&event->node);
+ -		kfree(event);
+ +	list_for_each_entry_safe_reverse(evt_pin, ep, evt_pins, node) {
+ +		devm_free_irq(chip->dev, evt_pin->irq, evt_pin);
+ +		list_del(&evt_pin->node);
+ +		kfree(evt_pin);
+  	}
+ +
+ +	acpi_detach_data(handle, acpi_gpio_evt_dh);
+ +	kfree(evt_pins);
+  }
+  
++ int acpi_dev_add_driver_gpios(struct acpi_device *adev,
++ 			      const struct acpi_gpio_mapping *gpios)
++ {
++ 	if (adev && gpios) {
++ 		adev->driver_gpios = gpios;
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL_GPL(acpi_dev_add_driver_gpios);
++ 
++ static bool acpi_get_driver_gpio_data(struct acpi_device *adev,
++ 				      const char *name, int index,
++ 				      struct acpi_reference_args *args)
++ {
++ 	const struct acpi_gpio_mapping *gm;
++ 
++ 	if (!adev->driver_gpios)
++ 		return false;
++ 
++ 	for (gm = adev->driver_gpios; gm->name; gm++)
++ 		if (!strcmp(name, gm->name) && gm->data && index < gm->size) {
++ 			const struct acpi_gpio_params *par = gm->data + index;
++ 
++ 			args->adev = adev;
++ 			args->args[0] = par->crs_entry_index;
++ 			args->args[1] = par->line_index;
++ 			args->args[2] = par->active_low;
++ 			args->nargs = 3;
++ 			return true;
++ 		}
++ 
++ 	return false;
++ }
++ 
+  struct acpi_gpio_lookup {
+  	struct acpi_gpio_info info;
+  	int index;
+@@@ -316,10 -405,14 +351,21 @@@ struct gpio_desc *acpi_get_gpiod_by_ind
+  		dev_dbg(&adev->dev, "GPIO: looking up %s\n", propname);
+  
+  		memset(&args, 0, sizeof(args));
+++<<<<<<< HEAD
+ +		ret = acpi_node_get_property_reference(acpi_fwnode_handle(adev),
+ +						       propname, index, &args);
+ +		if (ret)
+ +			return ERR_PTR(ret);
+++=======
++ 		ret = acpi_dev_get_property_reference(adev, propname, NULL,
++ 						      index, &args);
++ 		if (ret) {
++ 			bool found = acpi_get_driver_gpio_data(adev, propname,
++ 							       index, &args);
++ 			if (!found)
++ 				return ERR_PTR(ret);
++ 		}
+++>>>>>>> f028d5242d7e (ACPI / GPIO: Driver GPIO mappings for ACPI GPIOs)
+  
+  		/*
+  		 * The property was found and resolved so need to
+diff --cc include/linux/acpi.h
+index 0ab4b0e3a549,0902426c4521..000000000000
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@@ -691,13 -673,34 +691,44 @@@ do {									
+  #endif
+  #endif
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)
+ +int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index);
+ +#else
+ +static inline int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index)
+ +{
+ +	return -ENXIO;
+ +}
+++=======
++ struct acpi_gpio_params {
++ 	unsigned int crs_entry_index;
++ 	unsigned int line_index;
++ 	bool active_low;
++ };
++ 
++ struct acpi_gpio_mapping {
++ 	const char *name;
++ 	const struct acpi_gpio_params *data;
++ 	unsigned int size;
++ };
++ 
++ #if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)
++ int acpi_dev_add_driver_gpios(struct acpi_device *adev,
++ 			      const struct acpi_gpio_mapping *gpios);
++ 
++ static inline void acpi_dev_remove_driver_gpios(struct acpi_device *adev)
++ {
++ 	if (adev)
++ 		adev->driver_gpios = NULL;
++ }
++ #else
++ static inline int acpi_dev_add_driver_gpios(struct acpi_device *adev,
++ 			      const struct acpi_gpio_mapping *gpios)
++ {
++ 	return -ENXIO;
++ }
++ static inline void acpi_dev_remove_driver_gpios(struct acpi_device *adev) {}
+++>>>>>>> f028d5242d7e (ACPI / GPIO: Driver GPIO mappings for ACPI GPIOs)
+  #endif
+  
+  /* Device properties */
+* Unmerged path drivers/gpio/gpiolib-acpi.c
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index a1d6fc503b68..28f76b351775 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -349,6 +349,8 @@ struct acpi_device_data {
+ 	struct list_head subnodes;
+ };
+ 
++struct acpi_gpio_mapping;
++
+ /* Device */
+ struct acpi_device {
+ 	int device_type;
+@@ -370,6 +372,7 @@ struct acpi_device {
+ 	struct acpi_scan_handler *handler;
+ 	struct acpi_hotplug_context *hp;
+ 	struct acpi_driver *driver;
++	const struct acpi_gpio_mapping *driver_gpios;
+ 	void *driver_data;
+ 	struct device dev;
+ 	unsigned int physical_node_count;
+* Unmerged path include/linux/acpi.h
