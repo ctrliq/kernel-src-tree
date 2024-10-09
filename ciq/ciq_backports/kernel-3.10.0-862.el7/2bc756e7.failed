@@ -1,0 +1,276 @@
+cpufreq: intel_pstate: Do not use performance_limits in passive mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Do not use performance_limits in passive mode (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 92.91%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 2bc756e7dde20972300bb8e2e46dd430d6d2d5db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2bc756e7.failed
+
+Using performance_limits in the passive mode doesn't make
+sense, because in that mode the global limits are applied to the
+frequency selected by the scaling governor.
+
+The maximum and minimum P-state limits in performance_limits are both
+set to 100 percent which will put all CPUs into the turbo range
+regardless of what governor is used and what frequencies are
+selected by it (that is particularly undesirable on CPUs with the
+generic powersave governor attached).
+
+For this reason, make intel_pstate_register_driver() always point
+limits to powersave_limits in the passive mode.
+
+Fixes: 001c76f05b01 (cpufreq: intel_pstate: Generic governors support)
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 2bc756e7dde20972300bb8e2e46dd430d6d2d5db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index b681c02dda0f,7fc1f8a0ef44..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1573,6 -2303,235 +1573,238 @@@ static struct cpufreq_driver intel_psta
+  	.name		= "intel_pstate",
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int intel_cpufreq_verify_policy(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu = all_cpu_data[policy->cpu];
++ 	struct perf_limits *perf_limits = limits;
++ 
++ 	update_turbo_state();
++ 	policy->cpuinfo.max_freq = limits->turbo_disabled ?
++ 			cpu->pstate.max_freq : cpu->pstate.turbo_freq;
++ 
++ 	cpufreq_verify_within_cpu_limits(policy);
++ 
++ 	if (per_cpu_limits)
++ 		perf_limits = cpu->perf_limits;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	intel_pstate_update_perf_limits(policy, perf_limits);
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int intel_cpufreq_turbo_update(struct cpudata *cpu,
++ 					       struct cpufreq_policy *policy,
++ 					       unsigned int target_freq)
++ {
++ 	unsigned int max_freq;
++ 
++ 	update_turbo_state();
++ 
++ 	max_freq = limits->no_turbo || limits->turbo_disabled ?
++ 			cpu->pstate.max_freq : cpu->pstate.turbo_freq;
++ 	policy->cpuinfo.max_freq = max_freq;
++ 	if (policy->max > max_freq)
++ 		policy->max = max_freq;
++ 
++ 	if (target_freq > max_freq)
++ 		target_freq = max_freq;
++ 
++ 	return target_freq;
++ }
++ 
++ static int intel_cpufreq_target(struct cpufreq_policy *policy,
++ 				unsigned int target_freq,
++ 				unsigned int relation)
++ {
++ 	struct cpudata *cpu = all_cpu_data[policy->cpu];
++ 	struct cpufreq_freqs freqs;
++ 	int target_pstate;
++ 
++ 	freqs.old = policy->cur;
++ 	freqs.new = intel_cpufreq_turbo_update(cpu, policy, target_freq);
++ 
++ 	cpufreq_freq_transition_begin(policy, &freqs);
++ 	switch (relation) {
++ 	case CPUFREQ_RELATION_L:
++ 		target_pstate = DIV_ROUND_UP(freqs.new, cpu->pstate.scaling);
++ 		break;
++ 	case CPUFREQ_RELATION_H:
++ 		target_pstate = freqs.new / cpu->pstate.scaling;
++ 		break;
++ 	default:
++ 		target_pstate = DIV_ROUND_CLOSEST(freqs.new, cpu->pstate.scaling);
++ 		break;
++ 	}
++ 	target_pstate = intel_pstate_prepare_request(cpu, target_pstate);
++ 	if (target_pstate != cpu->pstate.current_pstate) {
++ 		cpu->pstate.current_pstate = target_pstate;
++ 		wrmsrl_on_cpu(policy->cpu, MSR_IA32_PERF_CTL,
++ 			      pstate_funcs.get_val(cpu, target_pstate));
++ 	}
++ 	cpufreq_freq_transition_end(policy, &freqs, false);
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int intel_cpufreq_fast_switch(struct cpufreq_policy *policy,
++ 					      unsigned int target_freq)
++ {
++ 	struct cpudata *cpu = all_cpu_data[policy->cpu];
++ 	int target_pstate;
++ 
++ 	target_freq = intel_cpufreq_turbo_update(cpu, policy, target_freq);
++ 	target_pstate = DIV_ROUND_UP(target_freq, cpu->pstate.scaling);
++ 	intel_pstate_update_pstate(cpu, target_pstate);
++ 	return target_freq;
++ }
++ 
++ static int intel_cpufreq_cpu_init(struct cpufreq_policy *policy)
++ {
++ 	int ret = __intel_pstate_cpu_init(policy);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	policy->cpuinfo.transition_latency = INTEL_CPUFREQ_TRANSITION_LATENCY;
++ 	/* This reflects the intel_pstate_get_cpu_pstates() setting. */
++ 	policy->cur = policy->cpuinfo.min_freq;
++ 
++ 	return 0;
++ }
++ 
++ static struct cpufreq_driver intel_cpufreq = {
++ 	.flags		= CPUFREQ_CONST_LOOPS,
++ 	.verify		= intel_cpufreq_verify_policy,
++ 	.target		= intel_cpufreq_target,
++ 	.fast_switch	= intel_cpufreq_fast_switch,
++ 	.init		= intel_cpufreq_cpu_init,
++ 	.exit		= intel_pstate_cpu_exit,
++ 	.stop_cpu	= intel_cpufreq_stop_cpu,
++ 	.name		= "intel_cpufreq",
++ };
++ 
++ static struct cpufreq_driver *intel_pstate_driver = &intel_pstate;
++ 
++ static void intel_pstate_driver_cleanup(void)
++ {
++ 	unsigned int cpu;
++ 
++ 	get_online_cpus();
++ 	for_each_online_cpu(cpu) {
++ 		if (all_cpu_data[cpu]) {
++ 			if (intel_pstate_driver == &intel_pstate)
++ 				intel_pstate_clear_update_util_hook(cpu);
++ 
++ 			kfree(all_cpu_data[cpu]);
++ 			all_cpu_data[cpu] = NULL;
++ 		}
++ 	}
++ 	put_online_cpus();
++ }
++ 
++ static int intel_pstate_register_driver(void)
++ {
++ 	int ret;
++ 
++ 	intel_pstate_init_limits(&powersave_limits);
++ 	intel_pstate_set_performance_limits(&performance_limits);
++ 	if (IS_ENABLED(CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE) &&
++ 	    intel_pstate_driver == &intel_pstate)
++ 		limits = &performance_limits;
++ 	else
++ 		limits = &powersave_limits;
++ 
++ 	ret = cpufreq_register_driver(intel_pstate_driver);
++ 	if (ret) {
++ 		intel_pstate_driver_cleanup();
++ 		return ret;
++ 	}
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 	driver_registered = true;
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	if (intel_pstate_driver == &intel_pstate && !hwp_active &&
++ 	    pstate_funcs.get_target_pstate != get_target_pstate_use_cpu_load)
++ 		intel_pstate_debug_expose_params();
++ 
++ 	return 0;
++ }
++ 
++ static int intel_pstate_unregister_driver(void)
++ {
++ 	if (hwp_active)
++ 		return -EBUSY;
++ 
++ 	if (intel_pstate_driver == &intel_pstate && !hwp_active &&
++ 	    pstate_funcs.get_target_pstate != get_target_pstate_use_cpu_load)
++ 		intel_pstate_debug_hide_params();
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 	driver_registered = false;
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	cpufreq_unregister_driver(intel_pstate_driver);
++ 	intel_pstate_driver_cleanup();
++ 
++ 	return 0;
++ }
++ 
++ static ssize_t intel_pstate_show_status(char *buf)
++ {
++ 	if (!driver_registered)
++ 		return sprintf(buf, "off\n");
++ 
++ 	return sprintf(buf, "%s\n", intel_pstate_driver == &intel_pstate ?
++ 					"active" : "passive");
++ }
++ 
++ static int intel_pstate_update_status(const char *buf, size_t size)
++ {
++ 	int ret;
++ 
++ 	if (size == 3 && !strncmp(buf, "off", size))
++ 		return driver_registered ?
++ 			intel_pstate_unregister_driver() : -EINVAL;
++ 
++ 	if (size == 6 && !strncmp(buf, "active", size)) {
++ 		if (driver_registered) {
++ 			if (intel_pstate_driver == &intel_pstate)
++ 				return 0;
++ 
++ 			ret = intel_pstate_unregister_driver();
++ 			if (ret)
++ 				return ret;
++ 		}
++ 
++ 		intel_pstate_driver = &intel_pstate;
++ 		return intel_pstate_register_driver();
++ 	}
++ 
++ 	if (size == 7 && !strncmp(buf, "passive", size)) {
++ 		if (driver_registered) {
++ 			if (intel_pstate_driver != &intel_pstate)
++ 				return 0;
++ 
++ 			ret = intel_pstate_unregister_driver();
++ 			if (ret)
++ 				return ret;
++ 		}
++ 
++ 		intel_pstate_driver = &intel_cpufreq;
++ 		return intel_pstate_register_driver();
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
+++>>>>>>> 2bc756e7dde2 (cpufreq: intel_pstate: Do not use performance_limits in passive mode)
+  static int no_load __initdata;
+  static int no_hwp __initdata;
+  static int hwp_only __initdata;
+* Unmerged path drivers/cpufreq/intel_pstate.c
