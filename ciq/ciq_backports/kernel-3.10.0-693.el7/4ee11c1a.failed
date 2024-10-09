@@ -1,0 +1,467 @@
+powerpc/powernv: Provide facilities for EOI, usable from real mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] powernv: Provide facilities for EOI, usable from real mode (David Gibson) [1430371]
+Rebuild_FUZZ: 93.55%
+commit-author Suresh Warrier <warrier@linux.vnet.ibm.com>
+commit 4ee11c1a9f7cc20026bb66ac624533310a605312
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4ee11c1a.failed
+
+This adds a new function pnv_opal_pci_msi_eoi() which does the part of
+end-of-interrupt (EOI) handling of an MSI which involves doing an
+OPAL call.  This function can be called in real mode.  This doesn't
+just export pnv_ioda2_msi_eoi() because that does a call to
+icp_native_eoi(), which does not work in real mode.
+
+This also adds a function, is_pnv_opal_msi(), which KVM can call to
+check whether an interrupt is one for which we should be calling
+pnv_opal_pci_msi_eoi() when we need to do an EOI.
+
+[paulus@ozlabs.org - split out the addition of pnv_opal_pci_msi_eoi()
+ from Suresh's patch "KVM: PPC: Book3S HV: Handle passthrough
+ interrupts in guest"; added is_pnv_opal_msi(); wrote description.]
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 4ee11c1a9f7cc20026bb66ac624533310a605312)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/pnv-pci.h
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+diff --cc arch/powerpc/include/asm/pnv-pci.h
+index 6f77f71ee964,1b46b52d3212..000000000000
+--- a/arch/powerpc/include/asm/pnv-pci.h
++++ b/arch/powerpc/include/asm/pnv-pci.h
+@@@ -11,7 -11,21 +11,12 @@@
+  #define _ASM_PNV_PCI_H
+  
+  #include <linux/pci.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/pci_hotplug.h>
++ #include <linux/irq.h>
+++>>>>>>> 4ee11c1a9f7c (powerpc/powernv: Provide facilities for EOI, usable from real mode)
+  #include <misc/cxl-base.h>
+ -#include <asm/opal-api.h>
+ -
+ -#define PCI_SLOT_ID_PREFIX	0x8000000000000000
+ -#define PCI_SLOT_ID(phb_id, bdfn)	\
+ -	(PCI_SLOT_ID_PREFIX | ((uint64_t)(bdfn) << 16) | (phb_id))
+ -
+ -extern int pnv_pci_get_slot_id(struct device_node *np, uint64_t *id);
+ -extern int pnv_pci_get_device_tree(uint32_t phandle, void *buf, uint64_t len);
+ -extern int pnv_pci_get_presence_state(uint64_t id, uint8_t *state);
+ -extern int pnv_pci_get_power_state(uint64_t id, uint8_t *state);
+ -extern int pnv_pci_set_power_state(uint64_t id, uint8_t state,
+ -				   struct opal_msg *msg);
+  
+  int pnv_phb_to_cxl_mode(struct pci_dev *dev, uint64_t mode);
+  int pnv_cxl_ioda_msi_setup(struct pci_dev *dev, unsigned int hwirq,
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index 009ef30c1de2,9ce48ae55062..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -2501,88 -2709,22 +2501,94 @@@ static void pnv_pci_ioda2_setup_dma_pe(
+  		pnv_ioda_setup_bus_dma(pe, pe->pbus);
+  }
+  
+ +static void pnv_ioda_setup_dma(struct pnv_phb *phb)
+ +{
+ +	struct pci_controller *hose = phb->hose;
+ +	unsigned int residual, remaining, segs, tw, base;
+ +	struct pnv_ioda_pe *pe;
+ +
+ +	/* If we have more PE# than segments available, hand out one
+ +	 * per PE until we run out and let the rest fail. If not,
+ +	 * then we assign at least one segment per PE, plus more based
+ +	 * on the amount of devices under that PE
+ +	 */
+ +	if (phb->ioda.dma_pe_count > phb->ioda.tce32_count)
+ +		residual = 0;
+ +	else
+ +		residual = phb->ioda.tce32_count -
+ +			phb->ioda.dma_pe_count;
+ +
+ +	pr_info("PCI: Domain %04x has %ld available 32-bit DMA segments\n",
+ +		hose->global_number, phb->ioda.tce32_count);
+ +	pr_info("PCI: %d PE# for a total weight of %d\n",
+ +		phb->ioda.dma_pe_count, phb->ioda.dma_weight);
+ +
+ +	pnv_pci_ioda_setup_opal_tce_kill(phb);
+ +
+ +	/* Walk our PE list and configure their DMA segments, hand them
+ +	 * out one base segment plus any residual segments based on
+ +	 * weight
+ +	 */
+ +	remaining = phb->ioda.tce32_count;
+ +	tw = phb->ioda.dma_weight;
+ +	base = 0;
+ +	list_for_each_entry(pe, &phb->ioda.pe_dma_list, dma_link) {
+ +		if (!pe->dma_weight)
+ +			continue;
+ +		if (!remaining) {
+ +			pe_warn(pe, "No DMA32 resources available\n");
+ +			continue;
+ +		}
+ +		segs = 1;
+ +		if (residual) {
+ +			segs += ((pe->dma_weight * residual)  + (tw / 2)) / tw;
+ +			if (segs > remaining)
+ +				segs = remaining;
+ +		}
+ +
+ +		/*
+ +		 * For IODA2 compliant PHB3, we needn't care about the weight.
+ +		 * The all available 32-bits DMA space will be assigned to
+ +		 * the specific PE.
+ +		 */
+ +		if (phb->type == PNV_PHB_IODA1) {
+ +			pe_info(pe, "DMA weight %d, assigned %d DMA32 segments\n",
+ +				pe->dma_weight, segs);
+ +			pnv_pci_ioda_setup_dma_pe(phb, pe, base, segs);
+ +		} else if (phb->type == PNV_PHB_IODA2) {
+ +			pe_info(pe, "Assign DMA32 space\n");
+ +			segs = 0;
+ +			pnv_pci_ioda2_setup_dma_pe(phb, pe);
+ +		} else if (phb->type == PNV_PHB_NPU) {
+ +			/*
+ +			 * We initialise the DMA space for an NPU PHB
+ +			 * after setup of the PHB is complete as we
+ +			 * point the NPU TVT to the the same location
+ +			 * as the PHB3 TVT.
+ +			 */
+ +		}
+ +
+ +		remaining -= segs;
+ +		base += segs;
+ +	}
+ +}
+ +
+  #ifdef CONFIG_PCI_MSI
+- static void pnv_ioda2_msi_eoi(struct irq_data *d)
++ int64_t pnv_opal_pci_msi_eoi(struct irq_chip *chip, unsigned int hw_irq)
+  {
+- 	unsigned int hw_irq = (unsigned int)irqd_to_hwirq(d);
+- 	struct irq_chip *chip = irq_data_get_irq_chip(d);
+  	struct pnv_phb *phb = container_of(chip, struct pnv_phb,
+  					   ioda.irq_chip);
++ 
++ 	return opal_pci_msi_eoi(phb->opal_id, hw_irq);
++ }
++ 
++ static void pnv_ioda2_msi_eoi(struct irq_data *d)
++ {
+  	int64_t rc;
++ 	unsigned int hw_irq = (unsigned int)irqd_to_hwirq(d);
++ 	struct irq_chip *chip = irq_data_get_irq_chip(d);
+  
+- 	rc = opal_pci_msi_eoi(phb->opal_id, hw_irq);
++ 	rc = pnv_opal_pci_msi_eoi(chip, hw_irq);
+  	WARN_ON_ONCE(rc);
+  
+  	icp_native_eoi(d);
+@@@ -2611,224 -2754,83 +2617,236 @@@ static void set_msi_irq_chip(struct pnv
+  	irq_set_chip(virq, &phb->ioda.irq_chip);
+  }
+  
+ -/*
+ - * Returns true iff chip is something that we could call
+ - * pnv_opal_pci_msi_eoi for.
+ - */
+ -bool is_pnv_opal_msi(struct irq_chip *chip)
+++<<<<<<< HEAD
+ +#ifdef CONFIG_CXL_BASE
+ +
+ +struct device_node *pnv_pci_get_phb_node(struct pci_dev *dev)
+  {
+ -	return chip->irq_eoi == pnv_ioda2_msi_eoi;
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +
+ +	return of_node_get(hose->dn);
+  }
+ -EXPORT_SYMBOL_GPL(is_pnv_opal_msi);
+ +EXPORT_SYMBOL(pnv_pci_get_phb_node);
+  
+ -static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
+ -				  unsigned int hwirq, unsigned int virq,
+ -				  unsigned int is_64, struct msi_msg *msg)
+ +int pnv_phb_to_cxl_mode(struct pci_dev *dev, uint64_t mode)
+  {
+ -	struct pnv_ioda_pe *pe = pnv_ioda_get_pe(dev);
+ -	unsigned int xive_num = hwirq - phb->msi_base;
+ -	__be32 data;
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +	struct pnv_ioda_pe *pe;
+  	int rc;
+  
+ -	/* No PE assigned ? bail out ... no MSI for you ! */
+ -	if (pe == NULL)
+ -		return -ENXIO;
+ -
+ -	/* Check if we have an MVE */
+ -	if (pe->mve_number < 0)
+ -		return -ENXIO;
+ +	pe = pnv_ioda_get_pe(dev);
+ +	if (!pe)
+ +		return -ENODEV;
+  
+ -	/* Force 32-bit MSI on some broken devices */
+ -	if (dev->no_64bit_msi)
+ -		is_64 = 0;
+ +	pe_info(pe, "Switching PHB to CXL\n");
+  
+ -	/* Assign XIVE to PE */
+ -	rc = opal_pci_set_xive_pe(phb->opal_id, pe->pe_number, xive_num);
+ -	if (rc) {
+ -		pr_warn("%s: OPAL error %d setting XIVE %d PE\n",
+ -			pci_name(dev), rc, xive_num);
+ -		return -EIO;
+ -	}
+ +	rc = opal_pci_set_phb_cxl_mode(phb->opal_id, mode, pe->pe_number);
+ +	if (rc)
+ +		dev_err(&dev->dev, "opal_pci_set_phb_cxl_mode failed: %i\n", rc);
+  
+ -	if (is_64) {
+ -		__be64 addr64;
+ +	return rc;
+ +}
+ +EXPORT_SYMBOL(pnv_phb_to_cxl_mode);
+  
+ -		rc = opal_get_msi_64(phb->opal_id, pe->mve_number, xive_num, 1,
+ -				     &addr64, &data);
+ -		if (rc) {
+ -			pr_warn("%s: OPAL error %d getting 64-bit MSI data\n",
+ -				pci_name(dev), rc);
+ -			return -EIO;
+ -		}
+ -		msg->address_hi = be64_to_cpu(addr64) >> 32;
+ -		msg->address_lo = be64_to_cpu(addr64) & 0xfffffffful;
+ -	} else {
+ -		__be32 addr32;
+ +/* Find PHB for cxl dev and allocate MSI hwirqs?
+ + * Returns the absolute hardware IRQ number
+ + */
+ +int pnv_cxl_alloc_hwirqs(struct pci_dev *dev, int num)
+ +{
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +	int hwirq = msi_bitmap_alloc_hwirqs(&phb->msi_bmp, num);
+  
+ -		rc = opal_get_msi_32(phb->opal_id, pe->mve_number, xive_num, 1,
+ -				     &addr32, &data);
+ -		if (rc) {
+ -			pr_warn("%s: OPAL error %d getting 32-bit MSI data\n",
+ -				pci_name(dev), rc);
+ -			return -EIO;
+ -		}
+ -		msg->address_hi = 0;
+ -		msg->address_lo = be32_to_cpu(addr32);
+ +	if (hwirq < 0) {
+ +		dev_warn(&dev->dev, "Failed to find a free MSI\n");
+ +		return -ENOSPC;
+  	}
+ -	msg->data = be32_to_cpu(data);
+  
+ -	pnv_set_msi_irq_chip(phb, virq);
+ -
+ -	pr_devel("%s: %s-bit MSI on hwirq %x (xive #%d),"
+ -		 " address=%x_%08x data=%x PE# %d\n",
+ -		 pci_name(dev), is_64 ? "64" : "32", hwirq, xive_num,
+ -		 msg->address_hi, msg->address_lo, data, pe->pe_number);
+ -
+ -	return 0;
+ +	return phb->msi_base + hwirq;
+  }
+ +EXPORT_SYMBOL(pnv_cxl_alloc_hwirqs);
+  
+ -static void pnv_pci_init_ioda_msis(struct pnv_phb *phb)
+ +void pnv_cxl_release_hwirqs(struct pci_dev *dev, int hwirq, int num)
+ +{
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +
+ +	msi_bitmap_free_hwirqs(&phb->msi_bmp, hwirq - phb->msi_base, num);
+ +}
+ +EXPORT_SYMBOL(pnv_cxl_release_hwirqs);
+ +
+ +void pnv_cxl_release_hwirq_ranges(struct cxl_irq_ranges *irqs,
+ +				  struct pci_dev *dev)
+ +{
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +	int i, hwirq;
+ +
+ +	for (i = 1; i < CXL_IRQ_RANGES; i++) {
+ +		if (!irqs->range[i])
+ +			continue;
+ +		pr_devel("cxl release irq range 0x%x: offset: 0x%lx  limit: %ld\n",
+ +			 i, irqs->offset[i],
+ +			 irqs->range[i]);
+ +		hwirq = irqs->offset[i] - phb->msi_base;
+ +		msi_bitmap_free_hwirqs(&phb->msi_bmp, hwirq,
+ +				       irqs->range[i]);
+ +	}
+ +}
+ +EXPORT_SYMBOL(pnv_cxl_release_hwirq_ranges);
+ +
+ +int pnv_cxl_alloc_hwirq_ranges(struct cxl_irq_ranges *irqs,
+ +			       struct pci_dev *dev, int num)
+ +{
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +	int i, hwirq, try;
+ +
+ +	memset(irqs, 0, sizeof(struct cxl_irq_ranges));
+ +
+ +	/* 0 is reserved for the multiplexed PSL DSI interrupt */
+ +	for (i = 1; i < CXL_IRQ_RANGES && num; i++) {
+ +		try = num;
+ +		while (try) {
+ +			hwirq = msi_bitmap_alloc_hwirqs(&phb->msi_bmp, try);
+ +			if (hwirq >= 0)
+ +				break;
+ +			try /= 2;
+ +		}
+ +		if (!try)
+ +			goto fail;
+ +
+ +		irqs->offset[i] = phb->msi_base + hwirq;
+ +		irqs->range[i] = try;
+ +		pr_devel("cxl alloc irq range 0x%x: offset: 0x%lx  limit: %li\n",
+ +			 i, irqs->offset[i], irqs->range[i]);
+ +		num -= try;
+ +	}
+ +	if (num)
+ +		goto fail;
+ +
+ +	return 0;
+ +fail:
+ +	pnv_cxl_release_hwirq_ranges(irqs, dev);
+ +	return -ENOSPC;
+ +}
+ +EXPORT_SYMBOL(pnv_cxl_alloc_hwirq_ranges);
+ +
+ +int pnv_cxl_get_irq_count(struct pci_dev *dev)
+ +{
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +
+ +	return phb->msi_bmp.irq_count;
+ +}
+ +EXPORT_SYMBOL(pnv_cxl_get_irq_count);
+ +
+ +int pnv_cxl_ioda_msi_setup(struct pci_dev *dev, unsigned int hwirq,
+ +			   unsigned int virq)
+ +{
+ +	struct pci_controller *hose = pci_bus_to_host(dev->bus);
+ +	struct pnv_phb *phb = hose->private_data;
+ +	unsigned int xive_num = hwirq - phb->msi_base;
+ +	struct pnv_ioda_pe *pe;
+ +	int rc;
+ +
+ +	if (!(pe = pnv_ioda_get_pe(dev)))
+ +		return -ENODEV;
+ +
+ +	/* Assign XIVE to PE */
+ +	rc = opal_pci_set_xive_pe(phb->opal_id, pe->pe_number, xive_num);
+ +	if (rc) {
+ +		pe_warn(pe, "%s: OPAL error %d setting msi_base 0x%x "
+ +			"hwirq 0x%x XIVE 0x%x PE\n",
+ +			pci_name(dev), rc, phb->msi_base, hwirq, xive_num);
+ +		return -EIO;
+ +	}
+ +	set_msi_irq_chip(phb, virq);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(pnv_cxl_ioda_msi_setup);
+ +#endif
+++=======
+++/*
+++ * Returns true iff chip is something that we could call
+++ * pnv_opal_pci_msi_eoi for.
+++ */
+++bool is_pnv_opal_msi(struct irq_chip *chip)
+++{
+++	return chip->irq_eoi == pnv_ioda2_msi_eoi;
+++}
+++EXPORT_SYMBOL_GPL(is_pnv_opal_msi);
+++>>>>>>> 4ee11c1a9f7c (powerpc/powernv: Provide facilities for EOI, usable from real mode)
+ +
+ +static int pnv_pci_ioda_msi_setup(struct pnv_phb *phb, struct pci_dev *dev,
+ +				  unsigned int hwirq, unsigned int virq,
+ +				  unsigned int is_64, struct msi_msg *msg)
+ +{
+ +	struct pnv_ioda_pe *pe = pnv_ioda_get_pe(dev);
+ +	unsigned int xive_num = hwirq - phb->msi_base;
+ +	__be32 data;
+ +	int rc;
+ +
+ +	/* No PE assigned ? bail out ... no MSI for you ! */
+ +	if (pe == NULL)
+ +		return -ENXIO;
+ +
+ +	/* Check if we have an MVE */
+ +	if (pe->mve_number < 0)
+ +		return -ENXIO;
+ +
+ +	/* Force 32-bit MSI on some broken devices */
+ +	if (dev->no_64bit_msi)
+ +		is_64 = 0;
+ +
+ +	/* Assign XIVE to PE */
+ +	rc = opal_pci_set_xive_pe(phb->opal_id, pe->pe_number, xive_num);
+ +	if (rc) {
+ +		pr_warn("%s: OPAL error %d setting XIVE %d PE\n",
+ +			pci_name(dev), rc, xive_num);
+ +		return -EIO;
+ +	}
+ +
+ +	if (is_64) {
+ +		__be64 addr64;
+ +
+ +		rc = opal_get_msi_64(phb->opal_id, pe->mve_number, xive_num, 1,
+ +				     &addr64, &data);
+ +		if (rc) {
+ +			pr_warn("%s: OPAL error %d getting 64-bit MSI data\n",
+ +				pci_name(dev), rc);
+ +			return -EIO;
+ +		}
+ +		msg->address_hi = be64_to_cpu(addr64) >> 32;
+ +		msg->address_lo = be64_to_cpu(addr64) & 0xfffffffful;
+ +	} else {
+ +		__be32 addr32;
+ +
+ +		rc = opal_get_msi_32(phb->opal_id, pe->mve_number, xive_num, 1,
+ +				     &addr32, &data);
+ +		if (rc) {
+ +			pr_warn("%s: OPAL error %d getting 32-bit MSI data\n",
+ +				pci_name(dev), rc);
+ +			return -EIO;
+ +		}
+ +		msg->address_hi = 0;
+ +		msg->address_lo = be32_to_cpu(addr32);
+ +	}
+ +	msg->data = be32_to_cpu(data);
+ +
+ +	set_msi_irq_chip(phb, virq);
+ +
+ +	pr_devel("%s: %s-bit MSI on hwirq %x (xive #%d),"
+ +		 " address=%x_%08x data=%x PE# %d\n",
+ +		 pci_name(dev), is_64 ? "64" : "32", hwirq, xive_num,
+ +		 msg->address_hi, msg->address_lo, data, pe->pe_number);
+ +
+ +	return 0;
+ +}
+ +
+ +static void pnv_pci_init_ioda_msis(struct pnv_phb *phb)
+  {
+  	unsigned int count;
+  	const __be32 *prop = of_get_property(phb->hose->dn,
+* Unmerged path arch/powerpc/include/asm/pnv-pci.h
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
