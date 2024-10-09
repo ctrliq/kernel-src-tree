@@ -1,0 +1,241 @@
+x86/retpoline: Use -mfunction-return
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0b53c374b9eff2255a386f1f1cfb9a928e52a5ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/0b53c374.failed
+
+Utilize -mfunction-return=thunk-extern when available to have the
+compiler replace RET instructions with direct JMPs to the symbol
+__x86_return_thunk. This does not affect assembler (.S) sources, only C
+sources.
+
+-mfunction-return=thunk-extern has been available since gcc 7.3 and
+clang 15.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Nick Desaulniers <ndesaulniers@google.com>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Tested-by: Nick Desaulniers <ndesaulniers@google.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 0b53c374b9eff2255a386f1f1cfb9a928e52a5ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Makefile
+#	arch/x86/include/asm/nospec-branch.h
+#	arch/x86/lib/retpoline.S
+diff --cc arch/x86/Makefile
+index 2a304906b4be,6e16057737e5..000000000000
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@@ -11,6 -12,44 +11,47 @@@ els
+          KBUILD_DEFCONFIG := $(ARCH)_defconfig
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ ifdef CONFIG_CC_IS_GCC
++ RETPOLINE_CFLAGS	:= $(call cc-option,-mindirect-branch=thunk-extern -mindirect-branch-register)
++ RETPOLINE_CFLAGS	+= $(call cc-option,-mindirect-branch-cs-prefix)
++ RETPOLINE_CFLAGS	+= $(call cc-option,-mfunction-return=thunk-extern)
++ RETPOLINE_VDSO_CFLAGS	:= $(call cc-option,-mindirect-branch=thunk-inline -mindirect-branch-register)
++ endif
++ ifdef CONFIG_CC_IS_CLANG
++ RETPOLINE_CFLAGS	:= -mretpoline-external-thunk
++ RETPOLINE_VDSO_CFLAGS	:= -mretpoline
++ RETPOLINE_CFLAGS	+= $(call cc-option,-mfunction-return=thunk-extern)
++ endif
++ export RETPOLINE_CFLAGS
++ export RETPOLINE_VDSO_CFLAGS
++ 
++ # For gcc stack alignment is specified with -mpreferred-stack-boundary,
++ # clang has the option -mstack-alignment for that purpose.
++ ifneq ($(call cc-option, -mpreferred-stack-boundary=4),)
++       cc_stack_align4 := -mpreferred-stack-boundary=2
++       cc_stack_align8 := -mpreferred-stack-boundary=3
++ else ifneq ($(call cc-option, -mstack-alignment=16),)
++       cc_stack_align4 := -mstack-alignment=4
++       cc_stack_align8 := -mstack-alignment=8
++ endif
++ 
++ # How to compile the 16-bit code.  Note we always compile for -march=i386;
++ # that way we can complain to the user if the CPU is insufficient.
++ REALMODE_CFLAGS	:= -m16 -g -Os -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS \
++ 		   -Wall -Wstrict-prototypes -march=i386 -mregparm=3 \
++ 		   -fno-strict-aliasing -fomit-frame-pointer -fno-pic \
++ 		   -mno-mmx -mno-sse $(call cc-option,-fcf-protection=none)
++ 
++ REALMODE_CFLAGS += -ffreestanding
++ REALMODE_CFLAGS += -fno-stack-protector
++ REALMODE_CFLAGS += -Wno-address-of-packed-member
++ REALMODE_CFLAGS += $(cc_stack_align4)
++ REALMODE_CFLAGS += $(CLANG_FLAGS)
++ export REALMODE_CFLAGS
++ 
+++>>>>>>> 0b53c374b9ef (x86/retpoline: Use -mfunction-return)
+  # BITS is used as extension for files which are available in a 32 bit
+  # and a 64 bit version to simplify shared Makefiles.
+  # e.g.: obj-y += foo_$(BITS).o
+diff --cc arch/x86/include/asm/nospec-branch.h
+index 7f927c4692a2,829c9f827a96..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -168,15 -114,73 +168,38 @@@
+  
+  #else /* __ASSEMBLY__ */
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_X86_64) && defined(RETPOLINE)
+++=======
++ #define ANNOTATE_RETPOLINE_SAFE					\
++ 	"999:\n\t"						\
++ 	".pushsection .discard.retpoline_safe\n\t"		\
++ 	_ASM_PTR " 999b\n\t"					\
++ 	".popsection\n\t"
++ 
++ typedef u8 retpoline_thunk_t[RETPOLINE_THUNK_SIZE];
++ extern retpoline_thunk_t __x86_indirect_thunk_array[];
++ 
++ extern void __x86_return_thunk(void);
++ 
++ #ifdef CONFIG_RETPOLINE
++ 
++ #define GEN(reg) \
++ 	extern retpoline_thunk_t __x86_indirect_thunk_ ## reg;
++ #include <asm/GEN-for-each-reg.h>
++ #undef GEN
++ 
++ #ifdef CONFIG_X86_64
++ 
+++>>>>>>> 0b53c374b9ef (x86/retpoline: Use -mfunction-return)
+  /*
+ - * Inline asm uses the %V modifier which is only in newer GCC
+ - * which is ensured when CONFIG_RETPOLINE is defined.
+ + * Since the inline asm uses the %V modifier which is only in newer GCC,
+ + * the 64-bit one is dependent on RETPOLINE not CONFIG_RETPOLINE.
+   */
+ -# define CALL_NOSPEC						\
+ -	ALTERNATIVE_2(						\
+ -	ANNOTATE_RETPOLINE_SAFE					\
+ -	"call *%[thunk_target]\n",				\
+ -	"call __x86_indirect_thunk_%V[thunk_target]\n",		\
+ -	X86_FEATURE_RETPOLINE,					\
+ -	"lfence;\n"						\
+ -	ANNOTATE_RETPOLINE_SAFE					\
+ -	"call *%[thunk_target]\n",				\
+ -	X86_FEATURE_RETPOLINE_LFENCE)
+ -
+ -# define THUNK_TARGET(addr) [thunk_target] "r" (addr)
+ -
+ -#else /* CONFIG_X86_32 */
+ -/*
+ - * For i386 we use the original ret-equivalent retpoline, because
+ - * otherwise we'll run out of registers. We don't care about CET
+ - * here, anyway.
+ - */
+ -# define CALL_NOSPEC						\
+ -	ALTERNATIVE_2(						\
+ -	ANNOTATE_RETPOLINE_SAFE					\
+ -	"call *%[thunk_target]\n",				\
+ -	"       jmp    904f;\n"					\
+ -	"       .align 16\n"					\
+ -	"901:	call   903f;\n"					\
+ -	"902:	pause;\n"					\
+ -	"    	lfence;\n"					\
+ -	"       jmp    902b;\n"					\
+ -	"       .align 16\n"					\
+ -	"903:	lea    4(%%esp), %%esp;\n"			\
+ -	"       pushl  %[thunk_target];\n"			\
+ -	"       ret;\n"						\
+ -	"       .align 16\n"					\
+ -	"904:	call   901b;\n",				\
+ -	X86_FEATURE_RETPOLINE,					\
+ -	"lfence;\n"						\
+ -	ANNOTATE_RETPOLINE_SAFE					\
+ -	"call *%[thunk_target]\n",				\
+ -	X86_FEATURE_RETPOLINE_LFENCE)
+ +#define CALL_NOSPEC						\
+ +	"call __x86_indirect_thunk_%V[thunk_target]\n"
+ +#define THUNK_TARGET(addr) [thunk_target] "r" (addr)
+  
+ -# define THUNK_TARGET(addr) [thunk_target] "rm" (addr)
+ -#endif
+  #else /* No retpoline for C / inline asm */
+  # define CALL_NOSPEC "call *%[thunk_target]\n"
+  # define THUNK_TARGET(addr) [thunk_target] "rm" (addr)
+diff --cc arch/x86/lib/retpoline.S
+index b3bec3619100,4467c21215f4..000000000000
+--- a/arch/x86/lib/retpoline.S
++++ b/arch/x86/lib/retpoline.S
+@@@ -21,23 -45,38 +21,55 @@@ ENDPROC(__x86_indirect_thunk_\reg
+   * only see one instance of "__x86_indirect_thunk_\reg" rather
+   * than one per register with the correct names. So we do it
+   * the simple and nasty way...
+ - *
+ - * Worse, you can only have a single EXPORT_SYMBOL per line,
+ - * and CPP can't insert newlines, so we have to repeat everything
+ - * at least twice.
+   */
+ +#define GENERATE_THUNK(reg) THUNK reg
+  
+++<<<<<<< HEAD
+ +GENERATE_THUNK(_ASM_AX)
+ +GENERATE_THUNK(_ASM_BX)
+ +GENERATE_THUNK(_ASM_CX)
+ +GENERATE_THUNK(_ASM_DX)
+ +GENERATE_THUNK(_ASM_SI)
+ +GENERATE_THUNK(_ASM_DI)
+ +GENERATE_THUNK(_ASM_BP)
+ +#ifdef CONFIG_64BIT
+ +GENERATE_THUNK(r8)
+ +GENERATE_THUNK(r9)
+ +GENERATE_THUNK(r10)
+ +GENERATE_THUNK(r11)
+ +GENERATE_THUNK(r12)
+ +GENERATE_THUNK(r13)
+ +GENERATE_THUNK(r14)
+ +GENERATE_THUNK(r15)
+ +#endif
+++=======
++ #define __EXPORT_THUNK(sym)	_ASM_NOKPROBE(sym); EXPORT_SYMBOL(sym)
++ #define EXPORT_THUNK(reg)	__EXPORT_THUNK(__x86_indirect_thunk_ ## reg)
++ 
++ 	.align RETPOLINE_THUNK_SIZE
++ SYM_CODE_START(__x86_indirect_thunk_array)
++ 
++ #define GEN(reg) THUNK reg
++ #include <asm/GEN-for-each-reg.h>
++ #undef GEN
++ 
++ 	.align RETPOLINE_THUNK_SIZE
++ SYM_CODE_END(__x86_indirect_thunk_array)
++ 
++ #define GEN(reg) EXPORT_THUNK(reg)
++ #include <asm/GEN-for-each-reg.h>
++ #undef GEN
++ 
++ /*
++  * This function name is magical and is used by -mfunction-return=thunk-extern
++  * for the compiler to generate JMPs to it.
++  */
++ SYM_CODE_START(__x86_return_thunk)
++ 	UNWIND_HINT_EMPTY
++ 	ANNOTATE_NOENDBR
++ 	ret
++ 	int3
++ SYM_CODE_END(__x86_return_thunk)
++ 
++ __EXPORT_THUNK(__x86_return_thunk)
+++>>>>>>> 0b53c374b9ef (x86/retpoline: Use -mfunction-return)
+* Unmerged path arch/x86/Makefile
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+* Unmerged path arch/x86/lib/retpoline.S
