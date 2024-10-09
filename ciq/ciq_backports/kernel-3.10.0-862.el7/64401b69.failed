@@ -1,0 +1,124 @@
+RDMA/netlink: Remove redundant owner option for netlink callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] netlink: Remove redundant owner option for netlink callbacks (Don Dutile) [1499364]
+Rebuild_FUZZ: 96.00%
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit 64401b69b29164c5731018cc44fc9b144ac9c5ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/64401b69.failed
+
+Owner field is not needed to be set because netlink is part of ib_core
+which will be unloaded last after all other modules are unloaded.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 64401b69b29164c5731018cc44fc9b144ac9c5ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/netlink.c
+diff --cc drivers/infiniband/core/netlink.c
+index e57919353a80,cd9b7e7b7d2c..000000000000
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@@ -146,47 -159,32 +146,64 @@@ nla_put_failure
+  }
+  EXPORT_SYMBOL(ibnl_put_attr);
+  
+ -static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ -			struct netlink_ext_ack *extack)
+ +static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+  {
+ +	struct ibnl_client *client;
+  	int type = nlh->nlmsg_type;
+ -	unsigned int index = RDMA_NL_GET_CLIENT(type);
+ +	int index = RDMA_NL_GET_CLIENT(type);
+  	unsigned int op = RDMA_NL_GET_OP(type);
+ -	struct netlink_callback cb = {};
+ -	struct netlink_dump_control c = {};
+  
+ -	if (!is_nl_valid(index, op))
+ -		return -EINVAL;
+ +	list_for_each_entry(client, &client_list, list) {
+ +		if (client->index == index) {
+ +			if (op >= client->nops || !client->cb_table[op].dump)
+ +				return -EINVAL;
+ +
+++<<<<<<< HEAD
+ +			/*
+ +			 * For response or local service set_timeout request,
+ +			 * there is no need to use netlink_dump_start.
+ +			 */
+ +			if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
+ +			    (index == RDMA_NL_LS &&
+ +			     op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
+ +				struct netlink_callback cb = {
+ +					.skb = skb,
+ +					.nlh = nlh,
+ +					.dump = client->cb_table[op].dump,
+ +					.module = client->cb_table[op].module,
+ +				};
+ +
+ +				return cb.dump(skb, &cb);
+ +			}
+ +
+ +			{
+ +				struct netlink_dump_control c = {
+ +					.dump = client->cb_table[op].dump,
+ +					.module = client->cb_table[op].module,
+ +				};
+ +				return netlink_dump_start(nls, skb, nlh, &c);
+ +			}
+ +		}
+ +	}
+  
+ +	pr_info("Index %d wasn't found in client list\n", index);
+ +	return -EINVAL;
+++=======
++ 	/*
++ 	 * For response or local service set_timeout request,
++ 	 * there is no need to use netlink_dump_start.
++ 	 */
++ 	if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
++ 	    (index == RDMA_NL_LS && op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
++ 		cb.skb = skb;
++ 		cb.nlh = nlh;
++ 		cb.dump = rdma_nl_types[index].cb_table[op].dump;
++ 		return cb.dump(skb, &cb);
++ 	}
++ 
++ 	c.dump = rdma_nl_types[index].cb_table[op].dump;
++ 	return netlink_dump_start(nls, skb, nlh, &c);
+++>>>>>>> 64401b69b291 (RDMA/netlink: Remove redundant owner option for netlink callbacks)
+  }
+  
+  static void ibnl_rcv_reply_skb(struct sk_buff *skb)
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index ae818a6311c2..fdf4ec1c4cee 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -4535,8 +4535,7 @@ out:
+ }
+ 
+ static const struct ibnl_client_cbs cma_cb_table[] = {
+-	[RDMA_NL_RDMA_CM_ID_STATS] = { .dump = cma_get_id_stats,
+-				       .module = THIS_MODULE },
++	[RDMA_NL_RDMA_CM_ID_STATS] = { .dump = cma_get_id_stats},
+ };
+ 
+ static int cma_init_net(struct net *net)
+* Unmerged path drivers/infiniband/core/netlink.c
+diff --git a/include/rdma/rdma_netlink.h b/include/rdma/rdma_netlink.h
+index 5b1466770917..806139277230 100644
+--- a/include/rdma/rdma_netlink.h
++++ b/include/rdma/rdma_netlink.h
+@@ -7,7 +7,6 @@
+ 
+ struct ibnl_client_cbs {
+ 	int (*dump)(struct sk_buff *skb, struct netlink_callback *nlcb);
+-	struct module *module;
+ };
+ 
+ /**
