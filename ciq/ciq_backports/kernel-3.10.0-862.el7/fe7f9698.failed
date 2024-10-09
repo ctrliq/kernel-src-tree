@@ -1,0 +1,160 @@
+scsi: cxlflash: Migrate scsi command pointer to AFU command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Migrate scsi command pointer to AFU command (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 94.64%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit fe7f96982a4e7103ffab45fba34c57ee19b62639
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fe7f9698.failed
+
+Currently, when sending a SCSI command, the pointer is stored in a
+reserved field of the AFU command descriptor for retrieval once the
+SCSI command has completed. In order to support new descriptor formats
+that make use of the reserved field, the pointer is migrated to outside
+the descriptor where it can still be found during completion processing.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Acked-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fe7f96982a4e7103ffab45fba34c57ee19b62639)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/common.h
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/common.h
+index 811927d91c5c,0e9de5d62da2..000000000000
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@@ -132,11 -128,9 +132,16 @@@ struct cxlflash_cfg 
+  struct afu_cmd {
+  	struct sisl_ioarcb rcb;	/* IOARCB (cache line aligned) */
+  	struct sisl_ioasa sa;	/* IOASA must follow IOARCB */
+++<<<<<<< HEAD
+ +	spinlock_t slock;
+++=======
++ 	struct afu *parent;
++ 	struct scsi_cmnd *scp;
+++>>>>>>> fe7f96982a4e (scsi: cxlflash: Migrate scsi command pointer to AFU command)
+  	struct completion cevent;
+ +	struct afu *parent;
+ +	int slot;
+ +	atomic_t free;
+  
+  	u8 cmd_tmf:1;
+  
+diff --cc drivers/scsi/cxlflash/main.c
+index d8aaf45b8306,b17ebf6d0a7e..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -221,12 -161,8 +221,17 @@@ static void cmd_complete(struct afu_cm
+  	struct cxlflash_cfg *cfg = afu->parent;
+  	bool cmd_is_tmf;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&cmd->slock, lock_flags);
+ +	cmd->sa.host_use_b[0] |= B_DONE;
+ +	spin_unlock_irqrestore(&cmd->slock, lock_flags);
+ +
+ +	if (cmd->rcb.scp) {
+ +		scp = cmd->rcb.scp;
+++=======
++ 	if (cmd->scp) {
++ 		scp = cmd->scp;
+++>>>>>>> fe7f96982a4e (scsi: cxlflash: Migrate scsi command pointer to AFU command)
+  		if (unlikely(cmd->sa.ioasc))
+  			process_cmd_err(cmd, scp);
+  		else
+@@@ -391,28 -313,23 +396,35 @@@ static int send_tmf(struct afu *afu, st
+  						  !cfg->tmf_active,
+  						  cfg->tmf_slock);
+  	cfg->tmf_active = true;
+ +	cmd->cmd_tmf = true;
+  	spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	cmd->scp = scp;
++ 	cmd->parent = afu;
++ 	cmd->cmd_tmf = true;
++ 
+++>>>>>>> fe7f96982a4e (scsi: cxlflash: Migrate scsi command pointer to AFU command)
+  	cmd->rcb.ctx_id = afu->ctx_hndl;
+ -	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
+  	cmd->rcb.port_sel = port_sel;
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+ +
+ +	lflag = SISL_REQ_FLAGS_TMF_CMD;
+ +
+  	cmd->rcb.req_flags = (SISL_REQ_FLAGS_PORT_LUN_ID |
+ -			      SISL_REQ_FLAGS_SUP_UNDERRUN |
+ -			      SISL_REQ_FLAGS_TMF_CMD);
+ +			      SISL_REQ_FLAGS_SUP_UNDERRUN | lflag);
+ +
+ +	/* Stash the scp in the reserved field, for reuse during interrupt */
+ +	cmd->rcb.scp = scp;
+ +
+ +	/* Copy the CDB from the cmd passed in */
+  	memcpy(cmd->rcb.cdb, &tmfcmd, sizeof(tmfcmd));
+  
+ -	rc = afu->send_cmd(afu, cmd);
+ +	/* Send the command */
+ +	rc = send_cmd(afu, cmd);
+  	if (unlikely(rc)) {
+ +		cmd_checkin(cmd);
+  		spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
+  		cfg->tmf_active = false;
+  		spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+@@@ -502,14 -430,26 +514,20 @@@ static int cxlflash_queuecommand(struc
+  		break;
+  	}
+  
+ -	kref_get(&cfg->afu->mapcount);
+ -	kref_got = 1;
+ -
+ -	if (likely(sg)) {
+ -		nseg = scsi_dma_map(scp);
+ -		if (unlikely(nseg < 0)) {
+ -			dev_err(dev, "%s: Fail DMA map!\n", __func__);
+ -			rc = SCSI_MLQUEUE_HOST_BUSY;
+ -			goto out;
+ -		}
+ -
+ -		cmd->rcb.data_len = sg_dma_len(sg);
+ -		cmd->rcb.data_ea = sg_dma_address(sg);
+ +	cmd = cmd_checkout(afu);
+ +	if (unlikely(!cmd)) {
+ +		dev_err(dev, "%s: could not get a free command\n", __func__);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	cmd->scp = scp;
++ 	cmd->parent = afu;
++ 
+++>>>>>>> fe7f96982a4e (scsi: cxlflash: Migrate scsi command pointer to AFU command)
+  	cmd->rcb.ctx_id = afu->ctx_hndl;
+ -	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
+  	cmd->rcb.port_sel = port_sel;
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+  
+* Unmerged path drivers/scsi/cxlflash/common.h
+* Unmerged path drivers/scsi/cxlflash/main.c
+diff --git a/drivers/scsi/cxlflash/sislite.h b/drivers/scsi/cxlflash/sislite.h
+index 347fc1671975..1a2d09c148b3 100755
+--- a/drivers/scsi/cxlflash/sislite.h
++++ b/drivers/scsi/cxlflash/sislite.h
+@@ -72,7 +72,7 @@ struct sisl_ioarcb {
+ 	u16 timeout;		/* in units specified by req_flags */
+ 	u32 rsvd1;
+ 	u8 cdb[16];		/* must be in big endian */
+-	struct scsi_cmnd *scp;
++	u64 reserved;		/* Reserved area */
+ } __packed;
+ 
+ struct sisl_rc {
