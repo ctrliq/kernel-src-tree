@@ -1,0 +1,932 @@
+IB/core: Let IB core distribute cache update events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 6b57cea9221b0247ad5111b348522625e489a8e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/6b57cea9.failed
+
+Currently when the low level driver notifies Pkey, GID, and port change
+events they are notified to the registered handlers in the order they are
+registered.
+
+IB core and other ULPs such as IPoIB are interested in GID, LID, Pkey
+change events.
+
+Since all GID queries done by ULPs are serviced by IB core, and the IB
+core deferes cache updates to a work queue, it is possible for other
+clients to see stale cache data when they handle their own events.
+
+For example, the below call tree shows how ipoib will call
+rdma_query_gid() concurrently with the update to the cache sitting in the
+WQ.
+
+mlx5_ib_handle_event()
+  ib_dispatch_event()
+    ib_cache_event()
+       queue_work() -> slow cache update
+
+    [..]
+    ipoib_event()
+     queue_work()
+       [..]
+       work handler
+         ipoib_ib_dev_flush_light()
+           __ipoib_ib_dev_flush()
+              ipoib_dev_addr_changed_valid()
+                rdma_query_gid() <- Returns old GID, cache not updated.
+
+Move all the event dispatch to a work queue so that the cache update is
+always done before any clients are notified.
+
+Fixes: f35faa4ba956 ("IB/core: Simplify ib_query_gid to always refer to cache")
+Link: https://lore.kernel.org/r/20191212113024.336702-3-leon@kernel.org
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6b57cea9221b0247ad5111b348522625e489a8e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/device.c
+index 2447c58da9f5,c38b2b0b078a..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -293,11 -588,18 +293,24 @@@ struct ib_device *ib_alloc_device(size_
+  
+  	INIT_LIST_HEAD(&device->event_handler_list);
+  	spin_lock_init(&device->event_handler_lock);
+++<<<<<<< HEAD
+ +	rwlock_init(&device->client_data_lock);
+ +	INIT_LIST_HEAD(&device->client_data_list);
+ +	INIT_LIST_HEAD(&device->port_list);
+ +	refcount_set(&device->refcount, 1);
+++=======
++ 	init_rwsem(&device->event_handler_rwsem);
++ 	mutex_init(&device->unregistration_lock);
++ 	/*
++ 	 * client_data needs to be alloc because we don't want our mark to be
++ 	 * destroyed if the user stores NULL in the client data.
++ 	 */
++ 	xa_init_flags(&device->client_data, XA_FLAGS_ALLOC);
++ 	init_rwsem(&device->client_data_rwsem);
++ 	xa_init_flags(&device->compat_devs, XA_FLAGS_ALLOC);
++ 	mutex_init(&device->compat_devs_mutex);
+++>>>>>>> 6b57cea9221b (IB/core: Let IB core distribute cache update events)
+  	init_completion(&device->unreg_completion);
+ -	INIT_WORK(&device->unregistration_work, ib_unregister_work);
+  
+  	return device;
+  }
+@@@ -868,10 -1968,78 +868,9 @@@ void ib_dispatch_event_clients(struct i
+  	list_for_each_entry(handler, &event->device->event_handler_list, list)
+  		handler->handler(handler, event);
+  
+- 	spin_unlock_irqrestore(&event->device->event_handler_lock, flags);
++ 	up_read(&event->device->event_handler_rwsem);
+  }
+- EXPORT_SYMBOL(ib_dispatch_event);
+  
+ -static int iw_query_port(struct ib_device *device,
+ -			   u8 port_num,
+ -			   struct ib_port_attr *port_attr)
+ -{
+ -	struct in_device *inetdev;
+ -	struct net_device *netdev;
+ -	int err;
+ -
+ -	memset(port_attr, 0, sizeof(*port_attr));
+ -
+ -	netdev = ib_device_get_netdev(device, port_num);
+ -	if (!netdev)
+ -		return -ENODEV;
+ -
+ -	port_attr->max_mtu = IB_MTU_4096;
+ -	port_attr->active_mtu = ib_mtu_int_to_enum(netdev->mtu);
+ -
+ -	if (!netif_carrier_ok(netdev)) {
+ -		port_attr->state = IB_PORT_DOWN;
+ -		port_attr->phys_state = IB_PORT_PHYS_STATE_DISABLED;
+ -	} else {
+ -		rcu_read_lock();
+ -		inetdev = __in_dev_get_rcu(netdev);
+ -
+ -		if (inetdev && inetdev->ifa_list) {
+ -			port_attr->state = IB_PORT_ACTIVE;
+ -			port_attr->phys_state = IB_PORT_PHYS_STATE_LINK_UP;
+ -		} else {
+ -			port_attr->state = IB_PORT_INIT;
+ -			port_attr->phys_state =
+ -				IB_PORT_PHYS_STATE_PORT_CONFIGURATION_TRAINING;
+ -		}
+ -
+ -		rcu_read_unlock();
+ -	}
+ -
+ -	dev_put(netdev);
+ -	err = device->ops.query_port(device, port_num, port_attr);
+ -	if (err)
+ -		return err;
+ -
+ -	return 0;
+ -}
+ -
+ -static int __ib_query_port(struct ib_device *device,
+ -			   u8 port_num,
+ -			   struct ib_port_attr *port_attr)
+ -{
+ -	union ib_gid gid = {};
+ -	int err;
+ -
+ -	memset(port_attr, 0, sizeof(*port_attr));
+ -
+ -	err = device->ops.query_port(device, port_num, port_attr);
+ -	if (err || port_attr->subnet_prefix)
+ -		return err;
+ -
+ -	if (rdma_port_get_link_layer(device, port_num) !=
+ -	    IB_LINK_LAYER_INFINIBAND)
+ -		return 0;
+ -
+ -	err = device->ops.query_gid(device, port_num, 0, &gid);
+ -	if (err)
+ -		return err;
+ -
+ -	port_attr->subnet_prefix = be64_to_cpu(gid.global.subnet_prefix);
+ -	return 0;
+ -}
+ -
+  /**
+   * ib_query_port - Query IB port attributes
+   * @device:Device to query
+diff --cc include/rdma/ib_verbs.h
+index 9a729592c56c,f36fb657518f..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2159,59 -2154,8 +2159,62 @@@ struct ib_port_cache 
+  
+  struct ib_cache {
+  	rwlock_t                lock;
+++<<<<<<< HEAD
+ +	struct ib_event_handler event_handler;
+ +	struct ib_port_cache   *ports;
+++=======
+++>>>>>>> 6b57cea9221b (IB/core: Let IB core distribute cache update events)
+ +};
+ +
+ +struct ib_dma_mapping_ops {
+ +	int		(*mapping_error)(struct ib_device *dev,
+ +					 u64 dma_addr);
+ +	u64		(*map_single)(struct ib_device *dev,
+ +				      void *ptr, size_t size,
+ +				      enum dma_data_direction direction);
+ +	void		(*unmap_single)(struct ib_device *dev,
+ +					u64 addr, size_t size,
+ +					enum dma_data_direction direction);
+ +	u64		(*map_page)(struct ib_device *dev,
+ +				    struct page *page, unsigned long offset,
+ +				    size_t size,
+ +				    enum dma_data_direction direction);
+ +	void		(*unmap_page)(struct ib_device *dev,
+ +				      u64 addr, size_t size,
+ +				      enum dma_data_direction direction);
+ +	int		(*map_sg)(struct ib_device *dev,
+ +				  struct scatterlist *sg, int nents,
+ +				  enum dma_data_direction direction);
+ +	void		(*unmap_sg)(struct ib_device *dev,
+ +				    struct scatterlist *sg, int nents,
+ +				    enum dma_data_direction direction);
+ +	int		(*map_sg_attrs)(struct ib_device *dev,
+ +					struct scatterlist *sg, int nents,
+ +					enum dma_data_direction direction,
+ +					struct dma_attrs *attrs);
+ +	void		(*unmap_sg_attrs)(struct ib_device *dev,
+ +					  struct scatterlist *sg, int nents,
+ +					  enum dma_data_direction direction,
+ +					  struct dma_attrs *attrs);
+ +	void		(*sync_single_for_cpu)(struct ib_device *dev,
+ +					       u64 dma_handle,
+ +					       size_t size,
+ +					       enum dma_data_direction dir);
+ +	void		(*sync_single_for_device)(struct ib_device *dev,
+ +						  u64 dma_handle,
+ +						  size_t size,
+ +						  enum dma_data_direction dir);
+ +	void		*(*alloc_coherent)(struct ib_device *dev,
+ +					   size_t size,
+ +					   u64 *dma_handle,
+ +					   gfp_t flag);
+ +	void		(*free_coherent)(struct ib_device *dev,
+ +					 size_t size, void *cpu_addr,
+ +					 u64 dma_handle);
+  };
+  
+ +struct iw_cm_verbs;
+ +
+  struct ib_port_immutable {
+  	int                           pkey_tbl_len;
+  	int                           gid_tbl_len;
+@@@ -2381,209 -2382,278 +2384,306 @@@ struct ib_device 
+  	 * allocated memory. The caller will clear @context afterwards.
+  	 * This function is only called when roce_gid_table is used.
+  	 */
+ -	int (*del_gid)(const struct ib_gid_attr *attr, void **context);
+ -	int (*query_pkey)(struct ib_device *device, u8 port_num, u16 index,
+ -			  u16 *pkey);
+ -	int (*alloc_ucontext)(struct ib_ucontext *context,
+ -			      struct ib_udata *udata);
+ -	void (*dealloc_ucontext)(struct ib_ucontext *context);
+ -	int (*mmap)(struct ib_ucontext *context, struct vm_area_struct *vma);
+ -	/**
+ -	 * This will be called once refcount of an entry in mmap_xa reaches
+ -	 * zero. The type of the memory that was mapped may differ between
+ -	 * entries and is opaque to the rdma_user_mmap interface.
+ -	 * Therefore needs to be implemented by the driver in mmap_free.
+ -	 */
+ -	void (*mmap_free)(struct rdma_user_mmap_entry *entry);
+ -	void (*disassociate_ucontext)(struct ib_ucontext *ibcontext);
+ -	int (*alloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
+ -	void (*dealloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
+ -	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_attr *ah_attr,
+ -			 u32 flags, struct ib_udata *udata);
+ -	int (*modify_ah)(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
+ -	int (*query_ah)(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
+ -	void (*destroy_ah)(struct ib_ah *ah, u32 flags);
+ -	int (*create_srq)(struct ib_srq *srq,
+ -			  struct ib_srq_init_attr *srq_init_attr,
+ -			  struct ib_udata *udata);
+ -	int (*modify_srq)(struct ib_srq *srq, struct ib_srq_attr *srq_attr,
+ -			  enum ib_srq_attr_mask srq_attr_mask,
+ -			  struct ib_udata *udata);
+ -	int (*query_srq)(struct ib_srq *srq, struct ib_srq_attr *srq_attr);
+ -	void (*destroy_srq)(struct ib_srq *srq, struct ib_udata *udata);
+ -	struct ib_qp *(*create_qp)(struct ib_pd *pd,
+ -				   struct ib_qp_init_attr *qp_init_attr,
+ -				   struct ib_udata *udata);
+ -	int (*modify_qp)(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
+ -			 int qp_attr_mask, struct ib_udata *udata);
+ -	int (*query_qp)(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
+ -			int qp_attr_mask, struct ib_qp_init_attr *qp_init_attr);
+ -	int (*destroy_qp)(struct ib_qp *qp, struct ib_udata *udata);
+ -	int (*create_cq)(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
+ -			 struct ib_udata *udata);
+ -	int (*modify_cq)(struct ib_cq *cq, u16 cq_count, u16 cq_period);
+ -	void (*destroy_cq)(struct ib_cq *cq, struct ib_udata *udata);
+ -	int (*resize_cq)(struct ib_cq *cq, int cqe, struct ib_udata *udata);
+ -	struct ib_mr *(*get_dma_mr)(struct ib_pd *pd, int mr_access_flags);
+ -	struct ib_mr *(*reg_user_mr)(struct ib_pd *pd, u64 start, u64 length,
+ -				     u64 virt_addr, int mr_access_flags,
+ -				     struct ib_udata *udata);
+ -	int (*rereg_user_mr)(struct ib_mr *mr, int flags, u64 start, u64 length,
+ -			     u64 virt_addr, int mr_access_flags,
+ -			     struct ib_pd *pd, struct ib_udata *udata);
+ -	int (*dereg_mr)(struct ib_mr *mr, struct ib_udata *udata);
+ -	struct ib_mr *(*alloc_mr)(struct ib_pd *pd, enum ib_mr_type mr_type,
+ -				  u32 max_num_sg, struct ib_udata *udata);
+ -	struct ib_mr *(*alloc_mr_integrity)(struct ib_pd *pd,
+ -					    u32 max_num_data_sg,
+ -					    u32 max_num_meta_sg);
+ -	int (*advise_mr)(struct ib_pd *pd,
+ -			 enum ib_uverbs_advise_mr_advice advice, u32 flags,
+ -			 struct ib_sge *sg_list, u32 num_sge,
+ -			 struct uverbs_attr_bundle *attrs);
+ -	int (*map_mr_sg)(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
+ -			 unsigned int *sg_offset);
+ -	int (*check_mr_status)(struct ib_mr *mr, u32 check_mask,
+ -			       struct ib_mr_status *mr_status);
+ -	struct ib_mw *(*alloc_mw)(struct ib_pd *pd, enum ib_mw_type type,
+ -				  struct ib_udata *udata);
+ -	int (*dealloc_mw)(struct ib_mw *mw);
+ -	struct ib_fmr *(*alloc_fmr)(struct ib_pd *pd, int mr_access_flags,
+ -				    struct ib_fmr_attr *fmr_attr);
+ -	int (*map_phys_fmr)(struct ib_fmr *fmr, u64 *page_list, int list_len,
+ -			    u64 iova);
+ -	int (*unmap_fmr)(struct list_head *fmr_list);
+ -	int (*dealloc_fmr)(struct ib_fmr *fmr);
+ -	int (*attach_mcast)(struct ib_qp *qp, union ib_gid *gid, u16 lid);
+ -	int (*detach_mcast)(struct ib_qp *qp, union ib_gid *gid, u16 lid);
+ -	struct ib_xrcd *(*alloc_xrcd)(struct ib_device *device,
+ -				      struct ib_udata *udata);
+ -	int (*dealloc_xrcd)(struct ib_xrcd *xrcd, struct ib_udata *udata);
+ -	struct ib_flow *(*create_flow)(struct ib_qp *qp,
+ -				       struct ib_flow_attr *flow_attr,
+ -				       int domain, struct ib_udata *udata);
+ -	int (*destroy_flow)(struct ib_flow *flow_id);
+ -	struct ib_flow_action *(*create_flow_action_esp)(
+ -		struct ib_device *device,
+ -		const struct ib_flow_action_attrs_esp *attr,
+ -		struct uverbs_attr_bundle *attrs);
+ -	int (*destroy_flow_action)(struct ib_flow_action *action);
+ -	int (*modify_flow_action_esp)(
+ -		struct ib_flow_action *action,
+ -		const struct ib_flow_action_attrs_esp *attr,
+ -		struct uverbs_attr_bundle *attrs);
+ -	int (*set_vf_link_state)(struct ib_device *device, int vf, u8 port,
+ -				 int state);
+ -	int (*get_vf_config)(struct ib_device *device, int vf, u8 port,
+ -			     struct ifla_vf_info *ivf);
+ -	int (*get_vf_stats)(struct ib_device *device, int vf, u8 port,
+ -			    struct ifla_vf_stats *stats);
+ -	int (*get_vf_guid)(struct ib_device *device, int vf, u8 port,
+ -			    struct ifla_vf_guid *node_guid,
+ -			    struct ifla_vf_guid *port_guid);
+ -	int (*set_vf_guid)(struct ib_device *device, int vf, u8 port, u64 guid,
+ -			   int type);
+ -	struct ib_wq *(*create_wq)(struct ib_pd *pd,
+ -				   struct ib_wq_init_attr *init_attr,
+ -				   struct ib_udata *udata);
+ -	void (*destroy_wq)(struct ib_wq *wq, struct ib_udata *udata);
+ -	int (*modify_wq)(struct ib_wq *wq, struct ib_wq_attr *attr,
+ -			 u32 wq_attr_mask, struct ib_udata *udata);
+ -	struct ib_rwq_ind_table *(*create_rwq_ind_table)(
+ -		struct ib_device *device,
+ -		struct ib_rwq_ind_table_init_attr *init_attr,
+ -		struct ib_udata *udata);
+ -	int (*destroy_rwq_ind_table)(struct ib_rwq_ind_table *wq_ind_table);
+ -	struct ib_dm *(*alloc_dm)(struct ib_device *device,
+ -				  struct ib_ucontext *context,
+ -				  struct ib_dm_alloc_attr *attr,
+ -				  struct uverbs_attr_bundle *attrs);
+ -	int (*dealloc_dm)(struct ib_dm *dm, struct uverbs_attr_bundle *attrs);
+ -	struct ib_mr *(*reg_dm_mr)(struct ib_pd *pd, struct ib_dm *dm,
+ -				   struct ib_dm_mr_attr *attr,
+ -				   struct uverbs_attr_bundle *attrs);
+ -	struct ib_counters *(*create_counters)(
+ -		struct ib_device *device, struct uverbs_attr_bundle *attrs);
+ -	int (*destroy_counters)(struct ib_counters *counters);
+ -	int (*read_counters)(struct ib_counters *counters,
+ -			     struct ib_counters_read_attr *counters_read_attr,
+ -			     struct uverbs_attr_bundle *attrs);
+ -	int (*map_mr_sg_pi)(struct ib_mr *mr, struct scatterlist *data_sg,
+ -			    int data_sg_nents, unsigned int *data_sg_offset,
+ -			    struct scatterlist *meta_sg, int meta_sg_nents,
+ -			    unsigned int *meta_sg_offset);
+ +	int		           (*del_gid)(const struct ib_gid_attr *attr,
+ +					      void **context);
+ +	int		           (*query_pkey)(struct ib_device *device,
+ +						 u8 port_num, u16 index, u16 *pkey);
+ +	int		           (*modify_device)(struct ib_device *device,
+ +						    int device_modify_mask,
+ +						    struct ib_device_modify *device_modify);
+ +	int		           (*modify_port)(struct ib_device *device,
+ +						  u8 port_num, int port_modify_mask,
+ +						  struct ib_port_modify *port_modify);
+ +	struct ib_ucontext *       (*alloc_ucontext)(struct ib_device *device,
+ +						     struct ib_udata *udata);
+ +	int                        (*dealloc_ucontext)(struct ib_ucontext *context);
+ +	int                        (*mmap)(struct ib_ucontext *context,
+ +					   struct vm_area_struct *vma);
+ +	struct ib_pd *             (*alloc_pd)(struct ib_device *device,
+ +					       struct ib_ucontext *context,
+ +					       struct ib_udata *udata);
+ +	int                        (*dealloc_pd)(struct ib_pd *pd);
+ +	struct ib_ah *             (*create_ah)(struct ib_pd *pd,
+ +						struct rdma_ah_attr *ah_attr,
+ +						struct ib_udata *udata);
+ +	int                        (*modify_ah)(struct ib_ah *ah,
+ +						struct rdma_ah_attr *ah_attr);
+ +	int                        (*query_ah)(struct ib_ah *ah,
+ +					       struct rdma_ah_attr *ah_attr);
+ +	int                        (*destroy_ah)(struct ib_ah *ah);
+ +	struct ib_srq *            (*create_srq)(struct ib_pd *pd,
+ +						 struct ib_srq_init_attr *srq_init_attr,
+ +						 struct ib_udata *udata);
+ +	int                        (*modify_srq)(struct ib_srq *srq,
+ +						 struct ib_srq_attr *srq_attr,
+ +						 enum ib_srq_attr_mask srq_attr_mask,
+ +						 struct ib_udata *udata);
+ +	int                        (*query_srq)(struct ib_srq *srq,
+ +						struct ib_srq_attr *srq_attr);
+ +	int                        (*destroy_srq)(struct ib_srq *srq);
+ +	int                        (*post_srq_recv)(struct ib_srq *srq,
+ +						    const struct ib_recv_wr *recv_wr,
+ +						    const struct ib_recv_wr **bad_recv_wr);
+ +	struct ib_qp *             (*create_qp)(struct ib_pd *pd,
+ +						struct ib_qp_init_attr *qp_init_attr,
+ +						struct ib_udata *udata);
+ +	int                        (*modify_qp)(struct ib_qp *qp,
+ +						struct ib_qp_attr *qp_attr,
+ +						int qp_attr_mask,
+ +						struct ib_udata *udata);
+ +	int                        (*query_qp)(struct ib_qp *qp,
+ +					       struct ib_qp_attr *qp_attr,
+ +					       int qp_attr_mask,
+ +					       struct ib_qp_init_attr *qp_init_attr);
+ +	int                        (*destroy_qp)(struct ib_qp *qp);
+ +	int                        (*post_send)(struct ib_qp *qp,
+ +						const struct ib_send_wr *send_wr,
+ +						const struct ib_send_wr **bad_send_wr);
+ +	int                        (*post_recv)(struct ib_qp *qp,
+ +						const struct ib_recv_wr *recv_wr,
+ +						const struct ib_recv_wr **bad_recv_wr);
+ +	struct ib_cq *             (*create_cq)(struct ib_device *device,
+ +						const struct ib_cq_init_attr *attr,
+ +						struct ib_ucontext *context,
+ +						struct ib_udata *udata);
+ +	int                        (*modify_cq)(struct ib_cq *cq, u16 cq_count,
+ +						u16 cq_period);
+ +	int                        (*destroy_cq)(struct ib_cq *cq);
+ +	int                        (*resize_cq)(struct ib_cq *cq, int cqe,
+ +						struct ib_udata *udata);
+ +	int                        (*poll_cq)(struct ib_cq *cq, int num_entries,
+ +					      struct ib_wc *wc);
+ +	int                        (*peek_cq)(struct ib_cq *cq, int wc_cnt);
+ +	int                        (*req_notify_cq)(struct ib_cq *cq,
+ +						    enum ib_cq_notify_flags flags);
+ +	int                        (*req_ncomp_notif)(struct ib_cq *cq,
+ +						      int wc_cnt);
+ +	struct ib_mr *             (*get_dma_mr)(struct ib_pd *pd,
+ +						 int mr_access_flags);
+ +	struct ib_mr *             (*reg_user_mr)(struct ib_pd *pd,
+ +						  u64 start, u64 length,
+ +						  u64 virt_addr,
+ +						  int mr_access_flags,
+ +						  struct ib_udata *udata);
+ +	int			   (*rereg_user_mr)(struct ib_mr *mr,
+ +						    int flags,
+ +						    u64 start, u64 length,
+ +						    u64 virt_addr,
+ +						    int mr_access_flags,
+ +						    struct ib_pd *pd,
+ +						    struct ib_udata *udata);
+ +	int                        (*dereg_mr)(struct ib_mr *mr);
+ +	struct ib_mr *		   (*alloc_mr)(struct ib_pd *pd,
+ +					       enum ib_mr_type mr_type,
+ +					       u32 max_num_sg);
+ +	int                        (*map_mr_sg)(struct ib_mr *mr,
+ +						struct scatterlist *sg,
+ +						int sg_nents,
+ +						unsigned int *sg_offset);
+ +	struct ib_mw *             (*alloc_mw)(struct ib_pd *pd,
+ +					       enum ib_mw_type type,
+ +					       struct ib_udata *udata);
+ +	int                        (*dealloc_mw)(struct ib_mw *mw);
+ +	struct ib_fmr *	           (*alloc_fmr)(struct ib_pd *pd,
+ +						int mr_access_flags,
+ +						struct ib_fmr_attr *fmr_attr);
+ +	int		           (*map_phys_fmr)(struct ib_fmr *fmr,
+ +						   u64 *page_list, int list_len,
+ +						   u64 iova);
+ +	int		           (*unmap_fmr)(struct list_head *fmr_list);
+ +	int		           (*dealloc_fmr)(struct ib_fmr *fmr);
+ +	int                        (*attach_mcast)(struct ib_qp *qp,
+ +						   union ib_gid *gid,
+ +						   u16 lid);
+ +	int                        (*detach_mcast)(struct ib_qp *qp,
+ +						   union ib_gid *gid,
+ +						   u16 lid);
+ +	int                        (*process_mad)(struct ib_device *device,
+ +						  int process_mad_flags,
+ +						  u8 port_num,
+ +						  const struct ib_wc *in_wc,
+ +						  const struct ib_grh *in_grh,
+ +						  const struct ib_mad_hdr *in_mad,
+ +						  size_t in_mad_size,
+ +						  struct ib_mad_hdr *out_mad,
+ +						  size_t *out_mad_size,
+ +						  u16 *out_mad_pkey_index);
+ +	struct ib_xrcd *	   (*alloc_xrcd)(struct ib_device *device,
+ +						 struct ib_ucontext *ucontext,
+ +						 struct ib_udata *udata);
+ +	int			   (*dealloc_xrcd)(struct ib_xrcd *xrcd);
+ +	struct ib_flow *	   (*create_flow)(struct ib_qp *qp,
+ +						  struct ib_flow_attr
+ +						  *flow_attr,
+ +						  int domain,
+ +						  struct ib_udata *udata);
+ +	int			   (*destroy_flow)(struct ib_flow *flow_id);
+ +	int			   (*check_mr_status)(struct ib_mr *mr, u32 check_mask,
+ +						      struct ib_mr_status *mr_status);
+ +	void			   (*disassociate_ucontext)(struct ib_ucontext *ibcontext);
+ +	int			   (*set_vf_link_state)(struct ib_device *device, int vf, u8 port,
+ +							int state);
+ +	int			   (*get_vf_config)(struct ib_device *device, int vf, u8 port,
+ +						   struct ifla_vf_info *ivf);
+ +	int			   (*get_vf_stats)(struct ib_device *device, int vf, u8 port,
+ +						   struct ifla_vf_stats *stats);
+ +	int			   (*set_vf_guid)(struct ib_device *device, int vf, u8 port, u64 guid,
+ +						  int type);
+ +	struct ib_wq *		   (*create_wq)(struct ib_pd *pd,
+ +						struct ib_wq_init_attr *init_attr,
+ +						struct ib_udata *udata);
+ +	int			   (*destroy_wq)(struct ib_wq *wq);
+ +	int			   (*modify_wq)(struct ib_wq *wq,
+ +						struct ib_wq_attr *attr,
+ +						u32 wq_attr_mask,
+ +						struct ib_udata *udata);
+ +	struct ib_rwq_ind_table *  (*create_rwq_ind_table)(struct ib_device *device,
+ +							   struct ib_rwq_ind_table_init_attr *init_attr,
+ +							   struct ib_udata *udata);
+ +	int                        (*destroy_rwq_ind_table)(struct ib_rwq_ind_table *wq_ind_table);
+ +	struct ib_flow_action *	   (*create_flow_action_esp)(struct ib_device *device,
+ +							     const struct ib_flow_action_attrs_esp *attr,
+ +							     struct uverbs_attr_bundle *attrs);
+ +	int			   (*destroy_flow_action)(struct ib_flow_action *action);
+ +	int			   (*modify_flow_action_esp)(struct ib_flow_action *action,
+ +							     const struct ib_flow_action_attrs_esp *attr,
+ +							     struct uverbs_attr_bundle *attrs);
+ +	struct ib_dm *             (*alloc_dm)(struct ib_device *device,
+ +					       struct ib_ucontext *context,
+ +					       struct ib_dm_alloc_attr *attr,
+ +					       struct uverbs_attr_bundle *attrs);
+ +	int                        (*dealloc_dm)(struct ib_dm *dm);
+ +	struct ib_mr *             (*reg_dm_mr)(struct ib_pd *pd, struct ib_dm *dm,
+ +						struct ib_dm_mr_attr *attr,
+ +						struct uverbs_attr_bundle *attrs);
+ +	struct ib_counters *	(*create_counters)(struct ib_device *device,
+ +						   struct uverbs_attr_bundle *attrs);
+ +	int	(*destroy_counters)(struct ib_counters	*counters);
+ +	int	(*read_counters)(struct ib_counters *counters,
+ +				 struct ib_counters_read_attr *counters_read_attr,
+ +				 struct uverbs_attr_bundle *attrs);
+  
+  	/**
+ -	 * alloc_hw_stats - Allocate a struct rdma_hw_stats and fill in the
+ -	 *   driver initialized data.  The struct is kfree()'ed by the sysfs
+ -	 *   core when the device is removed.  A lifespan of -1 in the return
+ -	 *   struct tells the core to set a default lifespan.
+ -	 */
+ -	struct rdma_hw_stats *(*alloc_hw_stats)(struct ib_device *device,
+ -						u8 port_num);
+ -	/**
+ -	 * get_hw_stats - Fill in the counter value(s) in the stats struct.
+ -	 * @index - The index in the value array we wish to have updated, or
+ -	 *   num_counters if we want all stats updated
+ -	 * Return codes -
+ -	 *   < 0 - Error, no counters updated
+ -	 *   index - Updated the single counter pointed to by index
+ -	 *   num_counters - Updated all counters (will reset the timestamp
+ -	 *     and prevent further calls for lifespan milliseconds)
+ -	 * Drivers are allowed to update all counters in leiu of just the
+ -	 *   one given in index at their option
+ -	 */
+ -	int (*get_hw_stats)(struct ib_device *device,
+ -			    struct rdma_hw_stats *stats, u8 port, int index);
+ -	/*
+ -	 * This function is called once for each port when a ib device is
+ -	 * registered.
+ -	 */
+ -	int (*init_port)(struct ib_device *device, u8 port_num,
+ -			 struct kobject *port_sysfs);
+ -	/**
+ -	 * Allows rdma drivers to add their own restrack attributes.
+ -	 */
+ -	int (*fill_res_entry)(struct sk_buff *msg,
+ -			      struct rdma_restrack_entry *entry);
+ -
+ -	/* Device lifecycle callbacks */
+ -	/*
+ -	 * Called after the device becomes registered, before clients are
+ -	 * attached
+ -	 */
+ -	int (*enable_driver)(struct ib_device *dev);
+ -	/*
+ -	 * This is called as part of ib_dealloc_device().
+ +	 * rdma netdev operation
+ +	 *
+ +	 * Driver implementing alloc_rdma_netdev or rdma_netdev_get_params
+ +	 * must return -EOPNOTSUPP if it doesn't support the specified type.
+  	 */
+ -	void (*dealloc_driver)(struct ib_device *dev);
+ -
+ +	struct net_device *(*alloc_rdma_netdev)(
+ +					struct ib_device *device,
+ +					u8 port_num,
+ +					enum rdma_netdev_t type,
+ +					const char *name,
+ +					unsigned char name_assign_type,
+ +					void (*setup)(struct net_device *));
+ +	void			   (*drain_rq)(struct ib_qp *qp);
+ +	void			   (*drain_sq)(struct ib_qp *qp);
+ +
+ +	struct ib_dma_mapping_ops   *dma_ops;
+ +
+++<<<<<<< HEAD
+ +	int (*rdma_netdev_get_params)(struct ib_device *device, u8 port_num,
+ +				      enum rdma_netdev_t type,
+ +				      struct rdma_netdev_alloc_params *params);
+++=======
++ 	/* iWarp CM callbacks */
++ 	void (*iw_add_ref)(struct ib_qp *qp);
++ 	void (*iw_rem_ref)(struct ib_qp *qp);
++ 	struct ib_qp *(*iw_get_qp)(struct ib_device *device, int qpn);
++ 	int (*iw_connect)(struct iw_cm_id *cm_id,
++ 			  struct iw_cm_conn_param *conn_param);
++ 	int (*iw_accept)(struct iw_cm_id *cm_id,
++ 			 struct iw_cm_conn_param *conn_param);
++ 	int (*iw_reject)(struct iw_cm_id *cm_id, const void *pdata,
++ 			 u8 pdata_len);
++ 	int (*iw_create_listen)(struct iw_cm_id *cm_id, int backlog);
++ 	int (*iw_destroy_listen)(struct iw_cm_id *cm_id);
++ 	/**
++ 	 * counter_bind_qp - Bind a QP to a counter.
++ 	 * @counter - The counter to be bound. If counter->id is zero then
++ 	 *   the driver needs to allocate a new counter and set counter->id
++ 	 */
++ 	int (*counter_bind_qp)(struct rdma_counter *counter, struct ib_qp *qp);
++ 	/**
++ 	 * counter_unbind_qp - Unbind the qp from the dynamically-allocated
++ 	 *   counter and bind it onto the default one
++ 	 */
++ 	int (*counter_unbind_qp)(struct ib_qp *qp);
++ 	/**
++ 	 * counter_dealloc -De-allocate the hw counter
++ 	 */
++ 	int (*counter_dealloc)(struct rdma_counter *counter);
++ 	/**
++ 	 * counter_alloc_stats - Allocate a struct rdma_hw_stats and fill in
++ 	 * the driver initialized data.
++ 	 */
++ 	struct rdma_hw_stats *(*counter_alloc_stats)(
++ 		struct rdma_counter *counter);
++ 	/**
++ 	 * counter_update_stats - Query the stats value of this counter
++ 	 */
++ 	int (*counter_update_stats)(struct rdma_counter *counter);
++ 
++ 	/**
++ 	 * Allows rdma drivers to add their own restrack attributes
++ 	 * dumped via 'rdma stat' iproute2 command.
++ 	 */
++ 	int (*fill_stat_entry)(struct sk_buff *msg,
++ 			       struct rdma_restrack_entry *entry);
++ 
++ 	DECLARE_RDMA_OBJ_SIZE(ib_ah);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_cq);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_pd);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_srq);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_ucontext);
++ };
++ 
++ struct ib_core_device {
++ 	/* device must be the first element in structure until,
++ 	 * union of ib_core_device and device exists in ib_device.
++ 	 */
++ 	struct device dev;
++ 	possible_net_t rdma_net;
++ 	struct kobject *ports_kobj;
++ 	struct list_head port_list;
++ 	struct ib_device *owner; /* reach back to owner ib_device */
++ };
++ 
++ struct rdma_restrack_root;
++ struct ib_device {
++ 	/* Do not access @dma_device directly from ULP nor from HW drivers. */
++ 	struct device                *dma_device;
++ 	struct ib_device_ops	     ops;
++ 	char                          name[IB_DEVICE_NAME_MAX];
++ 	struct rcu_head rcu_head;
++ 
++ 	struct list_head              event_handler_list;
++ 	/* Protects event_handler_list */
++ 	struct rw_semaphore event_handler_rwsem;
++ 
++ 	/* Protects QP's event_handler calls and open_qp list */
++ 	spinlock_t event_handler_lock;
++ 
++ 	struct rw_semaphore	      client_data_rwsem;
++ 	struct xarray                 client_data;
++ 	struct mutex                  unregistration_lock;
++ 
++ 	struct ib_cache               cache;
++ 	/**
++ 	 * port_data is indexed by port number
++ 	 */
++ 	struct ib_port_data *port_data;
++ 
++ 	int			      num_comp_vectors;
++ 
++ 	union {
++ 		struct device		dev;
++ 		struct ib_core_device	coredev;
++ 	};
+++>>>>>>> 6b57cea9221b (IB/core: Let IB core distribute cache update events)
+  
+ +	struct module               *owner;
+ +	struct device                dev;
+  	/* First group for device attributes,
+  	 * Second group for driver provided attributes (optional).
+  	 * It is NULL terminated array.
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index 60aa7a022de0..fb84a72270b5 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -51,9 +51,8 @@ struct ib_pkey_cache {
+ 
+ struct ib_update_work {
+ 	struct work_struct work;
+-	struct ib_device  *device;
+-	u8                 port_num;
+-	bool		   enforce_security;
++	struct ib_event event;
++	bool enforce_security;
+ };
+ 
+ union ib_gid zgid;
+@@ -119,7 +118,7 @@ static void dispatch_gid_change_event(struct ib_device *ib_dev, u8 port)
+ 	event.element.port_num	= port;
+ 	event.event		= IB_EVENT_GID_CHANGE;
+ 
+-	ib_dispatch_event(&event);
++	ib_dispatch_event_clients(&event);
+ }
+ 
+ static const char * const gid_type_str[] = {
+@@ -1312,9 +1311,8 @@ err:
+ 	return ret;
+ }
+ 
+-static void ib_cache_update(struct ib_device *device,
+-			    u8                port,
+-			    bool	      enforce_security)
++static int
++ib_cache_update(struct ib_device *device, u8 port, bool enforce_security)
+ {
+ 	struct ib_port_attr       *tprops = NULL;
+ 	struct ib_pkey_cache      *pkey_cache = NULL, *old_pkey_cache;
+@@ -1322,11 +1320,11 @@ static void ib_cache_update(struct ib_device *device,
+ 	int                        ret;
+ 
+ 	if (!rdma_is_port_valid(device, port))
+-		return;
++		return -EINVAL;
+ 
+ 	tprops = kmalloc(sizeof *tprops, GFP_KERNEL);
+ 	if (!tprops)
+-		return;
++		return -ENOMEM;
+ 
+ 	ret = ib_query_port(device, port, tprops);
+ 	if (ret) {
+@@ -1344,8 +1342,10 @@ static void ib_cache_update(struct ib_device *device,
+ 	pkey_cache = kmalloc(struct_size(pkey_cache, table,
+ 					 tprops->pkey_tbl_len),
+ 			     GFP_KERNEL);
+-	if (!pkey_cache)
++	if (!pkey_cache) {
++		ret = -ENOMEM;
+ 		goto err;
++	}
+ 
+ 	pkey_cache->table_len = tprops->pkey_tbl_len;
+ 
+@@ -1380,50 +1380,84 @@ static void ib_cache_update(struct ib_device *device,
+ 
+ 	kfree(old_pkey_cache);
+ 	kfree(tprops);
+-	return;
++	return 0;
+ 
+ err:
+ 	kfree(pkey_cache);
+ 	kfree(tprops);
++	return ret;
++}
++
++static void ib_cache_event_task(struct work_struct *_work)
++{
++	struct ib_update_work *work =
++		container_of(_work, struct ib_update_work, work);
++	int ret;
++
++	/* Before distributing the cache update event, first sync
++	 * the cache.
++	 */
++	ret = ib_cache_update(work->event.device, work->event.element.port_num,
++			      work->enforce_security);
++
++	/* GID event is notified already for individual GID entries by
++	 * dispatch_gid_change_event(). Hence, notifiy for rest of the
++	 * events.
++	 */
++	if (!ret && work->event.event != IB_EVENT_GID_CHANGE)
++		ib_dispatch_event_clients(&work->event);
++
++	kfree(work);
+ }
+ 
+-static void ib_cache_task(struct work_struct *_work)
++static void ib_generic_event_task(struct work_struct *_work)
+ {
+ 	struct ib_update_work *work =
+ 		container_of(_work, struct ib_update_work, work);
+ 
+-	ib_cache_update(work->device,
+-			work->port_num,
+-			work->enforce_security);
++	ib_dispatch_event_clients(&work->event);
+ 	kfree(work);
+ }
+ 
+-static void ib_cache_event(struct ib_event_handler *handler,
+-			   struct ib_event *event)
++static bool is_cache_update_event(const struct ib_event *event)
++{
++	return (event->event == IB_EVENT_PORT_ERR    ||
++		event->event == IB_EVENT_PORT_ACTIVE ||
++		event->event == IB_EVENT_LID_CHANGE  ||
++		event->event == IB_EVENT_PKEY_CHANGE ||
++		event->event == IB_EVENT_CLIENT_REREGISTER ||
++		event->event == IB_EVENT_GID_CHANGE);
++}
++
++/**
++ * ib_dispatch_event - Dispatch an asynchronous event
++ * @event:Event to dispatch
++ *
++ * Low-level drivers must call ib_dispatch_event() to dispatch the
++ * event to all registered event handlers when an asynchronous event
++ * occurs.
++ */
++void ib_dispatch_event(const struct ib_event *event)
+ {
+ 	struct ib_update_work *work;
+ 
+-	if (event->event == IB_EVENT_PORT_ERR    ||
+-	    event->event == IB_EVENT_PORT_ACTIVE ||
+-	    event->event == IB_EVENT_LID_CHANGE  ||
+-	    event->event == IB_EVENT_PKEY_CHANGE ||
+-	    event->event == IB_EVENT_CLIENT_REREGISTER ||
+-	    event->event == IB_EVENT_GID_CHANGE) {
+-		work = kmalloc(sizeof *work, GFP_ATOMIC);
+-		if (work) {
+-			INIT_WORK(&work->work, ib_cache_task);
+-			work->device   = event->device;
+-			work->port_num = event->element.port_num;
+-			if (event->event == IB_EVENT_PKEY_CHANGE ||
+-			    event->event == IB_EVENT_GID_CHANGE)
+-				work->enforce_security = true;
+-			else
+-				work->enforce_security = false;
+-
+-			queue_work(ib_wq, &work->work);
+-		}
+-	}
++	work = kzalloc(sizeof(*work), GFP_ATOMIC);
++	if (!work)
++		return;
++
++	if (is_cache_update_event(event))
++		INIT_WORK(&work->work, ib_cache_event_task);
++	else
++		INIT_WORK(&work->work, ib_generic_event_task);
++
++	work->event = *event;
++	if (event->event == IB_EVENT_PKEY_CHANGE ||
++	    event->event == IB_EVENT_GID_CHANGE)
++		work->enforce_security = true;
++
++	queue_work(ib_wq, &work->work);
+ }
++EXPORT_SYMBOL(ib_dispatch_event);
+ 
+ int ib_cache_setup_one(struct ib_device *device)
+ {
+@@ -1449,9 +1483,6 @@ int ib_cache_setup_one(struct ib_device *device)
+ 	for (p = 0; p <= rdma_end_port(device) - rdma_start_port(device); ++p)
+ 		ib_cache_update(device, p + rdma_start_port(device), true);
+ 
+-	INIT_IB_EVENT_HANDLER(&device->cache.event_handler,
+-			      device, ib_cache_event);
+-	ib_register_event_handler(&device->cache.event_handler);
+ 	return 0;
+ }
+ 
+@@ -1477,14 +1508,12 @@ void ib_cache_release_one(struct ib_device *device)
+ 
+ void ib_cache_cleanup_one(struct ib_device *device)
+ {
+-	/* The cleanup function unregisters the event handler,
+-	 * waits for all in-progress workqueue elements and cleans
+-	 * up the GID cache. This function should be called after
+-	 * the device was removed from the devices list and all
+-	 * clients were removed, so the cache exists but is
++	/* The cleanup function waits for all in-progress workqueue
++	 * elements and cleans up the GID cache. This function should be
++	 * called after the device was removed from the devices list and
++	 * all clients were removed, so the cache exists but is
+ 	 * non-functional and shouldn't be updated anymore.
+ 	 */
+-	ib_unregister_event_handler(&device->cache.event_handler);
+ 	flush_workqueue(ib_wq);
+ 	gid_table_cleanup_one(device);
+ 
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index c55106640b7d..f86f6e7931f8 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -143,6 +143,7 @@ unsigned long roce_gid_type_mask_support(struct ib_device *ib_dev, u8 port);
+ int ib_cache_setup_one(struct ib_device *device);
+ void ib_cache_cleanup_one(struct ib_device *device);
+ void ib_cache_release_one(struct ib_device *device);
++void ib_dispatch_event_clients(struct ib_event *event);
+ 
+ static inline bool rdma_is_upper_dev_rcu(struct net_device *dev,
+ 					 struct net_device *upper)
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path include/rdma/ib_verbs.h
