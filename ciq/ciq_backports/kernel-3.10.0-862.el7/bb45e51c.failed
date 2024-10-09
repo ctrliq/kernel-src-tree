@@ -1,0 +1,278 @@
+nfp: move bpf offload code to the BPF app
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit bb45e51cb0f8fea496eb2d6a9ef2ffb5da564048
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bb45e51c.failed
+
+Move bulk of the eBPF offload code out of common vNIC code into
+app-specific callbacks.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bb45e51cb0f8fea496eb2d6a9ef2ffb5da564048)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_app.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,883cc6be02c1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -794,4 -867,6 +794,9 @@@ static inline void nfp_net_debugfs_dir_
+  }
+  #endif /* CONFIG_NFP_DEBUG */
+  
+++<<<<<<< HEAD
+++=======
++ void nfp_net_filter_stats_timer(unsigned long data);
++ 
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  #endif /* _NFP_NET_H_ */
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,e0ece2de5841..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -63,8 -66,11 +63,13 @@@
+  
+  #include <net/vxlan.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include "nfpcore/nfp_nsp.h"
++ #include "nfp_app.h"
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  #include "nfp_net_ctrl.h"
+  #include "nfp_net.h"
+ -#include "nfp_port.h"
+  
+  /**
+   * nfp_net_get_fw_version() - Read and parse the FW version
+@@@ -2398,8 -2679,15 +2403,18 @@@ static struct rtnl_link_stats64 *nfp_ne
+  		stats->tx_bytes += data[1];
+  		stats->tx_errors += data[2];
+  	}
+ -}
+  
+++<<<<<<< HEAD
+ +	return stats;
+++=======
++ static int
++ nfp_net_setup_tc(struct net_device *netdev, u32 handle, __be16 proto,
++ 		 struct tc_to_netdev *tc)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	return nfp_app_setup_tc(nn->app, netdev, handle, proto, tc);
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  }
+  
+  static int nfp_net_set_features(struct net_device *netdev,
+@@@ -2456,6 -2745,11 +2471,14 @@@
+  			new_ctrl &= ~NFP_NET_CFG_CTRL_GATHER;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (changed & NETIF_F_HW_TC && nfp_app_tc_busy(nn->app, nn)) {
++ 		nn_err(nn, "Cannot disable HW TC offload while in use\n");
++ 		return -EBUSY;
++ 	}
++ 
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  	nn_dbg(nn, "Feature change 0x%llx -> 0x%llx (changed=0x%llx)\n",
+  	       netdev->features, features, changed);
+  
+@@@ -2600,8 -2894,81 +2623,86 @@@ static void nfp_net_del_vxlan_port(stru
+  		nfp_net_set_vxlan_port(nn, idx, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct net_device_ops nfp_net_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+++=======
++ static int nfp_net_xdp_setup(struct nfp_net *nn, struct netdev_xdp *xdp)
++ {
++ 	struct bpf_prog *old_prog = nn->dp.xdp_prog;
++ 	struct bpf_prog *prog = xdp->prog;
++ 	struct nfp_net_dp *dp;
++ 	int err;
++ 
++ 	if (!prog && !nn->dp.xdp_prog)
++ 		return 0;
++ 	if (prog && nn->dp.xdp_prog) {
++ 		prog = xchg(&nn->dp.xdp_prog, prog);
++ 		bpf_prog_put(prog);
++ 		nfp_app_xdp_offload(nn->app, nn, nn->dp.xdp_prog);
++ 		return 0;
++ 	}
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->xdp_prog = prog;
++ 	dp->num_tx_rings += prog ? nn->dp.num_rx_rings : -nn->dp.num_rx_rings;
++ 	dp->rx_dma_dir = prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
++ 	dp->rx_dma_off = prog ? XDP_PACKET_HEADROOM - nn->dp.rx_offset : 0;
++ 
++ 	/* We need RX reconfig to remap the buffers (BIDIR vs FROM_DEV) */
++ 	err = nfp_net_ring_reconfig(nn, dp, xdp->extack);
++ 	if (err)
++ 		return err;
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	nfp_app_xdp_offload(nn->app, nn, nn->dp.xdp_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return nfp_net_xdp_setup(nn, xdp);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!nn->dp.xdp_prog;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int nfp_net_set_mac_address(struct net_device *netdev, void *addr)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	struct sockaddr *saddr = addr;
++ 	int err;
++ 
++ 	err = eth_prepare_mac_addr_change(netdev, addr);
++ 	if (err)
++ 		return err;
++ 
++ 	nfp_net_write_mac_addr(nn, saddr->sa_data);
++ 
++ 	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_MACADDR);
++ 	if (err)
++ 		return err;
++ 
++ 	eth_commit_mac_addr_change(netdev, addr);
++ 
++ 	return 0;
++ }
++ 
++ const struct net_device_ops nfp_net_netdev_ops = {
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  	.ndo_open		= nfp_net_netdev_open,
+  	.ndo_stop		= nfp_net_netdev_close,
+  	.ndo_start_xmit		= nfp_net_tx,
+@@@ -2647,7 -3019,11 +2748,15 @@@ void nfp_net_info(struct nfp_net *nn
+  		nn->cap & NFP_NET_CFG_CTRL_MSIXAUTO ? "AUTOMASK " : "",
+  		nn->cap & NFP_NET_CFG_CTRL_IRQMOD   ? "IRQMOD "   : "",
+  		nn->cap & NFP_NET_CFG_CTRL_VXLAN    ? "VXLAN "    : "",
+++<<<<<<< HEAD
+ +		nn->cap & NFP_NET_CFG_CTRL_NVGRE    ? "NVGRE "	  : "");
+++=======
++ 		nn->cap & NFP_NET_CFG_CTRL_NVGRE    ? "NVGRE "	  : "",
++ 		nn->cap & NFP_NET_CFG_CTRL_CSUM_COMPLETE ?
++ 						      "RXCSUM_COMPLETE " : "",
++ 		nn->cap & NFP_NET_CFG_CTRL_LIVE_ADDR ? "LIVE_ADDR " : "",
++ 		nfp_app_extra_cap(nn->app, nn));
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  }
+  
+  /**
+@@@ -2820,9 -3268,12 +2929,15 @@@ int nfp_net_netdev_init(struct net_devi
+  
+  	netdev->features = netdev->hw_features;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (nfp_app_has_tc(nn->app))
++ 		netdev->hw_features |= NETIF_F_HW_TC;
++ 
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  	/* Advertise but disable TSO by default. */
+  	netdev->features &= ~(NETIF_F_TSO | NETIF_F_TSO6);
+ -	nn->dp.ctrl &= ~NFP_NET_CFG_CTRL_LSO_ANY;
+ +	nn->dp.ctrl &= ~NFP_NET_CFG_CTRL_LSO;
+  
+  	/* Allow L2 Broadcast and Multicast through by default, if supported */
+  	if (nn->cap & NFP_NET_CFG_CTRL_L2BC)
+@@@ -2860,10 -3316,13 +2975,17 @@@
+  }
+  
+  /**
+ - * nfp_net_clean() - Undo what nfp_net_init() did.
+ - * @nn:		NFP Net device structure
+ + * nfp_net_netdev_clean() - Undo what nfp_net_netdev_init() did.
+ + * @netdev:      netdev structure
+   */
+ -void nfp_net_clean(struct nfp_net *nn)
+ +void nfp_net_netdev_clean(struct net_device *netdev)
+  {
+++<<<<<<< HEAD
+ +	unregister_netdev(netdev);
+++=======
++ 	unregister_netdev(nn->dp.netdev);
++ 
++ 	if (nn->dp.xdp_prog)
++ 		bpf_prog_put(nn->dp.xdp_prog);
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  }
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index acc8cfe284f3,7dd310911d9f..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -373,13 -421,22 +373,25 @@@ err_free_prev
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nfp_net_pf_clean_vnic(struct nfp_pf *pf, struct nfp_net *nn)
++ {
++ 	if (nn->port)
++ 		nfp_devlink_port_unregister(nn->port);
++ 	nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
++ 	nfp_net_clean(nn);
++ 	nfp_app_vnic_clean(pf->app, nn);
++ }
++ 
+++>>>>>>> bb45e51cb0f8 (nfp: move bpf offload code to the BPF app)
+  static int
+ -nfp_net_pf_spawn_vnics(struct nfp_pf *pf,
+ -		       void __iomem *ctrl_bar, void __iomem *tx_bar,
+ -		       void __iomem *rx_bar, int stride,
+ -		       struct nfp_net_fw_version *fw_ver)
+ +nfp_net_pf_spawn_netdevs(struct nfp_pf *pf,
+ +			 void __iomem *ctrl_bar, void __iomem *tx_bar,
+ +			 void __iomem *rx_bar, int stride,
+ +			 struct nfp_net_fw_version *fw_ver)
+  {
+ -	unsigned int id, wanted_irqs, num_irqs, vnics_left, irqs_left;
+ +	unsigned int id, wanted_irqs, num_irqs, ports_left, irqs_left;
+  	struct nfp_net *nn;
+  	int err;
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
