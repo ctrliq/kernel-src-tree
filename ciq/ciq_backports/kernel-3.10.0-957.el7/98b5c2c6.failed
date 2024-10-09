@@ -1,0 +1,636 @@
+perf, bpf: allow bpf programs attach to tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 98b5c2c65c2951772a8fc661f50d675e450e8bce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/98b5c2c6.failed
+
+introduce BPF_PROG_TYPE_TRACEPOINT program type and allow it to be attached
+to the perf tracepoint handler, which will copy the arguments into
+the per-cpu buffer and pass it to the bpf program as its first argument.
+The layout of the fields can be discovered by doing
+'cat /sys/kernel/debug/tracing/events/sched/sched_switch/format'
+prior to the compilation of the program with exception that first 8 bytes
+are reserved and not accessible to the program. This area is used to store
+the pointer to 'struct pt_regs' which some of the bpf helpers will use:
++---------+
+| 8 bytes | hidden 'struct pt_regs *' (inaccessible to bpf program)
++---------+
+| N bytes | static tracepoint fields defined in tracepoint/format (bpf readonly)
++---------+
+| dynamic | __dynamic_array bytes of tracepoint (inaccessible to bpf yet)
++---------+
+
+Not that all of the fields are already dumped to user space via perf ring buffer
+and broken application access it directly without consulting tracepoint/format.
+Same rule applies here: static tracepoint fields should only be accessed
+in a format defined in tracepoint/format. The order of fields and
+field sizes are not an ABI.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 98b5c2c65c2951772a8fc661f50d675e450e8bce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/perf.h
+#	include/uapi/linux/bpf.h
+#	kernel/events/core.c
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,70eda5aeb304..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -115,8 -88,22 +115,16 @@@ enum bpf_map_type 
+  
+  enum bpf_prog_type {
+  	BPF_PROG_TYPE_UNSPEC,
+++<<<<<<< HEAD
+++=======
++ 	BPF_PROG_TYPE_SOCKET_FILTER,
++ 	BPF_PROG_TYPE_KPROBE,
++ 	BPF_PROG_TYPE_SCHED_CLS,
++ 	BPF_PROG_TYPE_SCHED_ACT,
++ 	BPF_PROG_TYPE_TRACEPOINT,
+++>>>>>>> 98b5c2c65c29 (perf, bpf: allow bpf programs attach to tracepoints)
+  };
+  
+ -#define BPF_PSEUDO_MAP_FD	1
+ -
+ -/* flags for BPF_MAP_UPDATE_ELEM command */
+ -#define BPF_ANY		0 /* create new element or update existing */
+ -#define BPF_NOEXIST	1 /* create new element if it didn't exist */
+ -#define BPF_EXIST	2 /* update existing element */
+ -
+ -#define BPF_F_NO_PREALLOC	(1U << 0)
+ -
+  union bpf_attr {
+  	struct { /* anonymous struct used by BPF_MAP_CREATE command */
+  		__u32	map_type;	/* one of enum bpf_map_type */
+diff --cc kernel/events/core.c
+index 3da42ad5a6b0,e5ffe97d6166..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -7382,9 -6725,9 +7382,9 @@@ int perf_swevent_get_recursion_context(
+  }
+  EXPORT_SYMBOL_GPL(perf_swevent_get_recursion_context);
+  
+- inline void perf_swevent_put_recursion_context(int rctx)
++ void perf_swevent_put_recursion_context(int rctx)
+  {
+ -	struct swevent_htable *swhash = this_cpu_ptr(&swevent_htable);
+ +	struct swevent_htable *swhash = &__get_cpu_var(swevent_htable);
+  
+  	put_recursion_context(swhash->recursion, rctx);
+  }
+@@@ -7742,456 -7105,90 +7743,506 @@@ static void perf_event_free_filter(stru
+  	ftrace_profile_free_filter(event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
++ {
++ 	bool is_kprobe, is_tracepoint;
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return -EINVAL;
++ 
++ 	if (event->tp_event->prog)
++ 		return -EEXIST;
++ 
++ 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_UKPROBE;
++ 	is_tracepoint = event->tp_event->flags & TRACE_EVENT_FL_TRACEPOINT;
++ 	if (!is_kprobe && !is_tracepoint)
++ 		/* bpf programs can only be attached to u/kprobe or tracepoint */
++ 		return -EINVAL;
++ 
++ 	prog = bpf_prog_get(prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if ((is_kprobe && prog->type != BPF_PROG_TYPE_KPROBE) ||
++ 	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
++ 		/* valid fd, but invalid bpf program type */
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	event->tp_event->prog = prog;
++ 
+ -	return 0;
+ -}
+++	return 0;
+++}
+++
+++static void perf_event_free_bpf_prog(struct perf_event *event)
+++{
+++	struct bpf_prog *prog;
+++
+++	if (!event->tp_event)
+++		return;
+++
+++	prog = event->tp_event->prog;
+++	if (prog) {
+++		event->tp_event->prog = NULL;
+++		bpf_prog_put(prog);
+++	}
+++}
+++
+++>>>>>>> 98b5c2c65c29 (perf, bpf: allow bpf programs attach to tracepoints)
+ +#else
+ +
+ +static inline void perf_tp_register(void)
+ +{
+ +}
+ +
+ +static void perf_event_free_filter(struct perf_event *event)
+ +{
+ +}
+ +
+ +#endif /* CONFIG_EVENT_TRACING */
+ +
+ +#ifdef CONFIG_HAVE_HW_BREAKPOINT
+ +void perf_bp_event(struct perf_event *bp, void *data)
+ +{
+ +	struct perf_sample_data sample;
+ +	struct pt_regs *regs = data;
+ +
+ +	perf_sample_data_init(&sample, bp->attr.bp_addr, 0);
+ +
+ +	if (!bp->hw.state && !perf_exclude_event(bp, regs))
+ +		perf_swevent_event(bp, 1, &sample, regs);
+ +}
+ +#endif
+ +
+ +/*
+ + * Allocate a new address filter
+ + */
+ +static struct perf_addr_filter *
+ +perf_addr_filter_new(struct perf_event *event, struct list_head *filters)
+ +{
+ +	int node = cpu_to_node(event->cpu == -1 ? 0 : event->cpu);
+ +	struct perf_addr_filter *filter;
+ +
+ +	filter = kzalloc_node(sizeof(*filter), GFP_KERNEL, node);
+ +	if (!filter)
+ +		return NULL;
+ +
+ +	INIT_LIST_HEAD(&filter->entry);
+ +	list_add_tail(&filter->entry, filters);
+ +
+ +	return filter;
+ +}
+ +
+ +static void free_filters_list(struct list_head *filters)
+ +{
+ +	struct perf_addr_filter *filter, *iter;
+ +
+ +	list_for_each_entry_safe(filter, iter, filters, entry) {
+ +		if (filter->inode)
+ +			iput(filter->inode);
+ +		list_del(&filter->entry);
+ +		kfree(filter);
+ +	}
+ +}
+ +
+ +/*
+ + * Free existing address filters and optionally install new ones
+ + */
+ +static void perf_addr_filters_splice(struct perf_event *event,
+ +				     struct list_head *head)
+ +{
+ +	unsigned long flags;
+ +	LIST_HEAD(list);
+ +
+ +	if (!has_addr_filter(event))
+ +		return;
+ +
+ +	/* don't bother with children, they don't have their own filters */
+ +	if (event->parent)
+ +		return;
+ +
+ +	raw_spin_lock_irqsave(&event->addr_filters.lock, flags);
+ +
+ +	list_splice_init(&event->addr_filters.list, &list);
+ +	if (head)
+ +		list_splice(head, &event->addr_filters.list);
+ +
+ +	raw_spin_unlock_irqrestore(&event->addr_filters.lock, flags);
+ +
+ +	free_filters_list(&list);
+ +}
+ +
+ +/*
+ + * Scan through mm's vmas and see if one of them matches the
+ + * @filter; if so, adjust filter's address range.
+ + * Called with mm::mmap_sem down for reading.
+ + */
+ +static unsigned long perf_addr_filter_apply(struct perf_addr_filter *filter,
+ +					    struct mm_struct *mm)
+ +{
+ +	struct vm_area_struct *vma;
+ +
+ +	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+ +		struct file *file = vma->vm_file;
+ +		unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
+ +		unsigned long vma_size = vma->vm_end - vma->vm_start;
+ +
+ +		if (!file)
+ +			continue;
+ +
+ +		if (!perf_addr_filter_match(filter, file, off, vma_size))
+ +			continue;
+ +
+ +		return vma->vm_start;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Update event's address range filters based on the
+ + * task's existing mappings, if any.
+ + */
+ +static void perf_event_addr_filters_apply(struct perf_event *event)
+ +{
+ +	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
+ +	struct task_struct *task = READ_ONCE(event->ctx->task);
+ +	struct perf_addr_filter *filter;
+ +	struct mm_struct *mm = NULL;
+ +	unsigned int count = 0;
+ +	unsigned long flags;
+ +
+ +	/*
+ +	 * We may observe TASK_TOMBSTONE, which means that the event tear-down
+ +	 * will stop on the parent's child_mutex that our caller is also holding
+ +	 */
+ +	if (task == TASK_TOMBSTONE)
+ +		return;
+ +
+ +	if (!ifh->nr_file_filters)
+ +		return;
+ +
+ +	mm = get_task_mm(event->ctx->task);
+ +	if (!mm)
+ +		goto restart;
+ +
+ +	down_read(&mm->mmap_sem);
+ +
+ +	raw_spin_lock_irqsave(&ifh->lock, flags);
+ +	list_for_each_entry(filter, &ifh->list, entry) {
+ +		event->addr_filters_offs[count] = 0;
+ +
+ +		/*
+ +		 * Adjust base offset if the filter is associated to a binary
+ +		 * that needs to be mapped:
+ +		 */
+ +		if (filter->inode)
+ +			event->addr_filters_offs[count] =
+ +				perf_addr_filter_apply(filter, mm);
+ +
+ +		count++;
+ +	}
+ +
+ +	event->addr_filters_gen++;
+ +	raw_spin_unlock_irqrestore(&ifh->lock, flags);
+ +
+ +	up_read(&mm->mmap_sem);
+ +
+ +	mmput(mm);
+ +
+ +restart:
+ +	perf_event_restart(event);
+ +}
+ +
+ +/*
+ + * Address range filtering: limiting the data to certain
+ + * instruction address ranges. Filters are ioctl()ed to us from
+ + * userspace as ascii strings.
+ + *
+ + * Filter string format:
+ + *
+ + * ACTION RANGE_SPEC
+ + * where ACTION is one of the
+ + *  * "filter": limit the trace to this region
+ + *  * "start": start tracing from this address
+ + *  * "stop": stop tracing at this address/region;
+ + * RANGE_SPEC is
+ + *  * for kernel addresses: <start address>[/<size>]
+ + *  * for object files:     <start address>[/<size>]@</path/to/object/file>
+ + *
+ + * if <size> is not specified, the range is treated as a single address.
+ + */
+ +enum {
+ +	IF_ACT_NONE = -1,
+ +	IF_ACT_FILTER,
+ +	IF_ACT_START,
+ +	IF_ACT_STOP,
+ +	IF_SRC_FILE,
+ +	IF_SRC_KERNEL,
+ +	IF_SRC_FILEADDR,
+ +	IF_SRC_KERNELADDR,
+ +};
+ +
+ +enum {
+ +	IF_STATE_ACTION = 0,
+ +	IF_STATE_SOURCE,
+ +	IF_STATE_END,
+ +};
+ +
+ +static const match_table_t if_tokens = {
+ +	{ IF_ACT_FILTER,	"filter" },
+ +	{ IF_ACT_START,		"start" },
+ +	{ IF_ACT_STOP,		"stop" },
+ +	{ IF_SRC_FILE,		"%u/%u@%s" },
+ +	{ IF_SRC_KERNEL,	"%u/%u" },
+ +	{ IF_SRC_FILEADDR,	"%u@%s" },
+ +	{ IF_SRC_KERNELADDR,	"%u" },
+ +	{ IF_ACT_NONE,		NULL },
+ +};
+ +
+ +/*
+ + * Address filter string parser
+ + */
+ +static int
+ +perf_event_parse_addr_filter(struct perf_event *event, char *fstr,
+ +			     struct list_head *filters)
+ +{
+ +	struct perf_addr_filter *filter = NULL;
+ +	char *start, *orig, *filename = NULL;
+ +	struct path path;
+ +	substring_t args[MAX_OPT_ARGS];
+ +	int state = IF_STATE_ACTION, token;
+ +	unsigned int kernel = 0;
+ +	int ret = -EINVAL;
+ +
+ +	orig = fstr = kstrdup(fstr, GFP_KERNEL);
+ +	if (!fstr)
+ +		return -ENOMEM;
+ +
+ +	while ((start = strsep(&fstr, " ,\n")) != NULL) {
+ +		ret = -EINVAL;
+ +
+ +		if (!*start)
+ +			continue;
+ +
+ +		/* filter definition begins */
+ +		if (state == IF_STATE_ACTION) {
+ +			filter = perf_addr_filter_new(event, filters);
+ +			if (!filter)
+ +				goto fail;
+ +		}
+ +
+ +		token = match_token(start, if_tokens, args);
+ +		switch (token) {
+ +		case IF_ACT_FILTER:
+ +		case IF_ACT_START:
+ +			filter->filter = 1;
+ +
+ +		case IF_ACT_STOP:
+ +			if (state != IF_STATE_ACTION)
+ +				goto fail;
+ +
+ +			state = IF_STATE_SOURCE;
+ +			break;
+ +
+ +		case IF_SRC_KERNELADDR:
+ +		case IF_SRC_KERNEL:
+ +			kernel = 1;
+ +
+ +		case IF_SRC_FILEADDR:
+ +		case IF_SRC_FILE:
+ +			if (state != IF_STATE_SOURCE)
+ +				goto fail;
+ +
+ +			if (token == IF_SRC_FILE || token == IF_SRC_KERNEL)
+ +				filter->range = 1;
+ +
+ +			*args[0].to = 0;
+ +			ret = kstrtoul(args[0].from, 0, &filter->offset);
+ +			if (ret)
+ +				goto fail;
+ +
+ +			if (filter->range) {
+ +				*args[1].to = 0;
+ +				ret = kstrtoul(args[1].from, 0, &filter->size);
+ +				if (ret)
+ +					goto fail;
+ +			}
+ +
+ +			if (token == IF_SRC_FILE || token == IF_SRC_FILEADDR) {
+ +				int fpos = filter->range ? 2 : 1;
+ +
+ +				filename = match_strdup(&args[fpos]);
+ +				if (!filename) {
+ +					ret = -ENOMEM;
+ +					goto fail;
+ +				}
+ +			}
+ +
+ +			state = IF_STATE_END;
+ +			break;
+ +
+ +		default:
+ +			goto fail;
+ +		}
+ +
+ +		/*
+ +		 * Filter definition is fully parsed, validate and install it.
+ +		 * Make sure that it doesn't contradict itself or the event's
+ +		 * attribute.
+ +		 */
+ +		if (state == IF_STATE_END) {
+ +			ret = -EINVAL;
+ +			if (kernel && event->attr.exclude_kernel)
+ +				goto fail;
+ +
+ +			if (!kernel) {
+ +				if (!filename)
+ +					goto fail;
+ +
+ +				/*
+ +				 * For now, we only support file-based filters
+ +				 * in per-task events; doing so for CPU-wide
+ +				 * events requires additional context switching
+ +				 * trickery, since same object code will be
+ +				 * mapped at different virtual addresses in
+ +				 * different processes.
+ +				 */
+ +				ret = -EOPNOTSUPP;
+ +				if (!event->ctx->task)
+ +					goto fail_free_name;
+ +
+ +				/* look up the path and grab its inode */
+ +				ret = kern_path(filename, LOOKUP_FOLLOW, &path);
+ +				if (ret)
+ +					goto fail_free_name;
+ +
+ +				filter->inode = igrab(d_inode(path.dentry));
+ +				path_put(&path);
+ +				kfree(filename);
+ +				filename = NULL;
+ +
+ +				ret = -EINVAL;
+ +				if (!filter->inode ||
+ +				    !S_ISREG(filter->inode->i_mode))
+ +					/* free_filters_list() will iput() */
+ +					goto fail;
+ +
+ +				event->addr_filters.nr_file_filters++;
+ +			}
+ +
+ +			/* ready to consume more filters */
+ +			state = IF_STATE_ACTION;
+ +			filter = NULL;
+ +		}
+ +	}
+ +
+ +	if (state != IF_STATE_ACTION)
+ +		goto fail;
+ +
+ +	kfree(orig);
+ +
+ +	return 0;
+ +
+ +fail_free_name:
+ +	kfree(filename);
+ +fail:
+ +	free_filters_list(filters);
+ +	kfree(orig);
+ +
+ +	return ret;
+ +}
+ +
+ +static int
+ +perf_event_set_addr_filter(struct perf_event *event, char *filter_str)
+ +{
+ +	LIST_HEAD(filters);
+ +	int ret;
+ +
+ +	/*
+ +	 * Since this is called in perf_ioctl() path, we're already holding
+ +	 * ctx::mutex.
+ +	 */
+ +	lockdep_assert_held(&event->ctx->mutex);
+ +
+ +	if (WARN_ON_ONCE(event->parent))
+ +		return -EINVAL;
+ +
+ +	ret = perf_event_parse_addr_filter(event, filter_str, &filters);
+ +	if (ret)
+ +		goto fail_clear_files;
+ +
+ +	ret = event->pmu->addr_filters_validate(&filters);
+ +	if (ret)
+ +		goto fail_free_filters;
+ +
+ +	/* remove existing filters, if any */
+ +	perf_addr_filters_splice(event, &filters);
+  
+ -static void perf_event_free_bpf_prog(struct perf_event *event)
+ -{
+ -	struct bpf_prog *prog;
+ +	/* install new filters */
+ +	perf_event_for_each_child(event, perf_event_addr_filters_apply);
+  
+ -	if (!event->tp_event)
+ -		return;
+ +	return ret;
+  
+ -	prog = event->tp_event->prog;
+ -	if (prog) {
+ -		event->tp_event->prog = NULL;
+ -		bpf_prog_put(prog);
+ -	}
+ -}
+ +fail_free_filters:
+ +	free_filters_list(&filters);
+  
+ -#else
+ +fail_clear_files:
+ +	event->addr_filters.nr_file_filters = 0;
+  
+ -static inline void perf_tp_register(void)
+ -{
+ +	return ret;
+  }
+  
+ -static int perf_event_set_filter(struct perf_event *event, void __user *arg)
+ +static int
+ +perf_tracepoint_set_filter(struct perf_event *event, char *filter_str)
+  {
+ -	return -ENOENT;
+ -}
+ +	struct perf_event_context *ctx = event->ctx;
+ +	int ret;
+  
+ -static void perf_event_free_filter(struct perf_event *event)
+ -{
+ -}
+ +	/*
+ +	 * Beware, here be dragons!!
+ +	 *
+ +	 * the tracepoint muck will deadlock against ctx->mutex, but the tracepoint
+ +	 * stuff does not actually need it. So temporarily drop ctx->mutex. As per
+ +	 * perf_event_ctx_lock() we already have a reference on ctx.
+ +	 *
+ +	 * This can result in event getting moved to a different ctx, but that
+ +	 * does not affect the tracepoint state.
+ +	 */
+ +	mutex_unlock(&ctx->mutex);
+ +	ret = ftrace_profile_set_filter(event, event->attr.config, filter_str);
+ +	mutex_lock(&ctx->mutex);
+  
+ -static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
+ -{
+ -	return -ENOENT;
+ +	return ret;
+  }
+  
+ -static void perf_event_free_bpf_prog(struct perf_event *event)
+ +static int perf_event_set_filter(struct perf_event *event, void __user *arg)
+  {
+ -}
+ -#endif /* CONFIG_EVENT_TRACING */
+ +	char *filter_str;
+ +	int ret = -EINVAL;
+  
+ -#ifdef CONFIG_HAVE_HW_BREAKPOINT
+ -void perf_bp_event(struct perf_event *bp, void *data)
+ -{
+ -	struct perf_sample_data sample;
+ -	struct pt_regs *regs = data;
+ +	if ((event->attr.type != PERF_TYPE_TRACEPOINT ||
+ +	    !IS_ENABLED(CONFIG_EVENT_TRACING)) &&
+ +	    !has_addr_filter(event))
+ +		return -EINVAL;
+  
+ -	perf_sample_data_init(&sample, bp->attr.bp_addr, 0);
+ +	filter_str = strndup_user(arg, PAGE_SIZE);
+ +	if (IS_ERR(filter_str))
+ +		return PTR_ERR(filter_str);
+  
+ -	if (!bp->hw.state && !perf_exclude_event(bp, regs))
+ -		perf_swevent_event(bp, 1, &sample, regs);
+ +	if (IS_ENABLED(CONFIG_EVENT_TRACING) &&
+ +	    event->attr.type == PERF_TYPE_TRACEPOINT)
+ +		ret = perf_tracepoint_set_filter(event, filter_str);
+ +	else if (has_addr_filter(event))
+ +		ret = perf_event_set_addr_filter(event, filter_str);
+ +
+ +	kfree(filter_str);
+ +	return ret;
+  }
+ -#endif
+  
+  /*
+   * hrtimer based swevent callback
+* Unmerged path include/trace/perf.h
+* Unmerged path include/trace/perf.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/events/core.c
