@@ -182,6 +182,11 @@ static void veth_get_stats64(struct net_device *dev,
 	rcu_read_unlock();
 }
 
+/* fake multicast ability */
+static void veth_set_multicast_list(struct net_device *dev)
+{
+}
+
 static int veth_open(struct net_device *dev)
 {
 	struct veth_priv *priv = netdev_priv(dev);
@@ -280,6 +285,7 @@ static const struct net_device_ops veth_netdev_ops = {
 	.ndo_start_xmit      = veth_xmit,
 	.ndo_change_mtu_rh74 = veth_change_mtu,
 	.ndo_get_stats64     = veth_get_stats64,
+	.ndo_set_rx_mode     = veth_set_multicast_list,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_get_iflink		= veth_get_iflink,
 	.ndo_size		= sizeof(struct net_device_ops),
