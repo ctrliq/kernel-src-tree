@@ -1,0 +1,112 @@
+md: fix md io stats accounting broken
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.31.1.el7
+commit-author Gu Zheng <guz.fnst@cn.fujitsu.com>
+commit 74672d069b298b03e9f657fd70915e055739882e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.31.1.el7/74672d06.failed
+
+Simon reported the md io stats accounting issue:
+"
+I'm seeing "iostat -x -k 1" print this after a RAID1 rebuild on 4.0-rc5.
+It's not abnormal other than it's 3-disk, with one being SSD (sdc) and
+the other two being write-mostly:
+
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sda               0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00   0.00   0.00
+sdb               0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00   0.00   0.00
+sdc               0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00   0.00   0.00
+md0               0.00     0.00    0.00    0.00     0.00     0.00     0.00   345.00    0.00    0.00    0.00   0.00 100.00
+md2               0.00     0.00    0.00    0.00     0.00     0.00     0.00 58779.00    0.00    0.00    0.00   0.00 100.00
+md1               0.00     0.00    0.00    0.00     0.00     0.00     0.00    12.00    0.00    0.00    0.00   0.00 100.00
+"
+The cause is commit "18c0b223cf9901727ef3b02da6711ac930b4e5d4" uses the
+generic_start_io_acct to account the disk stats rather than the open code,
+but it also introduced the increase to .in_flight[rw] which is needless to
+md. So we re-use the open code here to fix it.
+
+	Reported-by: Simon Kirby <sim@hostway.ca>
+	Cc: <stable@vger.kernel.org> 3.19
+	Signed-off-by: Gu Zheng <guz.fnst@cn.fujitsu.com>
+	Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 74672d069b298b03e9f657fd70915e055739882e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index eed071de0dff,e6178787ce3d..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -265,26 -244,25 +265,33 @@@ static DEFINE_SPINLOCK(all_mddevs_lock)
+   * call has finished, the bio has been linked into some internal structure
+   * and so is visible to ->quiesce(), so we don't need the refcount any more.
+   */
+ -static void md_make_request(struct request_queue *q, struct bio *bio)
+ +static bool is_suspended(struct mddev *mddev, struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	if (mddev->suspended)
+ +		return true;
+ +	if (bio_data_dir(bio) != WRITE)
+ +		return false;
+ +	if (mddev->suspend_lo >= mddev->suspend_hi)
+ +		return false;
+ +	if (bio->bi_sector >= mddev->suspend_hi)
+ +		return false;
+ +	if (bio_end_sector(bio) < mddev->suspend_lo)
+ +		return false;
+ +	return true;
+ +}
+++=======
++ 	const int rw = bio_data_dir(bio);
++ 	struct mddev *mddev = q->queuedata;
++ 	unsigned int sectors;
++ 	int cpu;
+++>>>>>>> 74672d069b29 (md: fix md io stats accounting broken)
+  
+ -	if (mddev == NULL || mddev->pers == NULL
+ -	    || !mddev->ready) {
+ -		bio_io_error(bio);
+ -		return;
+ -	}
+ -	if (mddev->ro == 1 && unlikely(rw == WRITE)) {
+ -		bio_endio(bio, bio_sectors(bio) == 0 ? 0 : -EROFS);
+ -		return;
+ -	}
+ -	smp_rmb(); /* Ensure implications of  'active' are visible */
+ +void md_handle_request(struct mddev *mddev, struct bio *bio)
+ +{
+ +check_suspended:
+  	rcu_read_lock();
+ -	if (mddev->suspended) {
+ +	if (is_suspended(mddev, bio)) {
+  		DEFINE_WAIT(__wait);
+  		for (;;) {
+  			prepare_to_wait(&mddev->sb_wait, &__wait,
+@@@ -331,11 -283,15 +338,21 @@@ static void md_make_request(struct requ
+  	 * go away inside make_request
+  	 */
+  	sectors = bio_sectors(bio);
+ -	mddev->pers->make_request(mddev, bio);
+ +	/* bio could be mergeable after passing to underlayer */
+ +	bio->bi_rw &= ~REQ_NOMERGE;
+ +	md_handle_request(mddev, bio);
+  
+++<<<<<<< HEAD
+ +	generic_start_io_acct(q, rw, sectors, &mddev->gendisk->part0);
+++=======
++ 	cpu = part_stat_lock();
++ 	part_stat_inc(cpu, &mddev->gendisk->part0, ios[rw]);
++ 	part_stat_add(cpu, &mddev->gendisk->part0, sectors[rw], sectors);
++ 	part_stat_unlock();
++ 
++ 	if (atomic_dec_and_test(&mddev->active_io) && mddev->suspended)
++ 		wake_up(&mddev->sb_wait);
+++>>>>>>> 74672d069b29 (md: fix md io stats accounting broken)
+  }
+  
+  /* mddev_suspend makes sure no new requests are submitted
+* Unmerged path drivers/md/md.c
