@@ -1,0 +1,202 @@
+vxlan: lock RCU on TX path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 56de859e9967c070464a9a9f4f18d73f9447298e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/56de859e.failed
+
+There is no guarantees that callers of the TX path will hold
+the RCU lock.  Grab it explicitly.
+
+Fixes: c6fcc4fc5f8b ("vxlan: avoid using stale vxlan socket.")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56de859e9967c070464a9a9f4f18d73f9447298e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 2de3754e14e0,e375560cc74e..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1980,65 -2101,47 +1980,77 @@@ static void vxlan_xmit_one(struct sk_bu
+  		tos = info->key.tos;
+  		label = info->key.label;
+  		udp_sum = !!(info->key.tun_flags & TUNNEL_CSUM);
+ +
+ +		if (info->options_len)
+ +			md = ip_tunnel_info_opts(info);
+ +	} else {
+ +		md->gbp = skb->mark;
+  	}
+ -	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->cfg.port_min,
+ -				     vxlan->cfg.port_max, true);
+  
++ 	rcu_read_lock();
+  	if (dst->sa.sa_family == AF_INET) {
+ -		struct vxlan_sock *sock4 = rcu_dereference(vxlan->vn4_sock);
+ -		struct rtable *rt;
+ -		__be16 df = 0;
+ +		if (!vxlan->vn4_sock)
+ +			goto drop;
+ +		sk = vxlan->vn4_sock->sock->sk;
+  
+ -		rt = vxlan_get_route(vxlan, dev, sock4, skb,
+ +		rt = vxlan_get_route(vxlan, skb,
+  				     rdst ? rdst->remote_ifindex : 0, tos,
+  				     dst->sin.sin_addr.s_addr,
+ -				     &local_ip.sin.sin_addr.s_addr,
+ -				     dst_port, src_port,
+ +				     &src->sin.sin_addr.s_addr,
+  				     dst_cache, info);
+  		if (IS_ERR(rt)) {
+ -			err = PTR_ERR(rt);
+ +			netdev_dbg(dev, "no route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.tx_carrier_errors++;
+  			goto tx_error;
+  		}
+  
+ +		if (rt->dst.dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.collisions++;
+ +			goto rt_tx_error;
+ +		}
+ +
+  		/* Bypass encapsulation if the destination is local */
+++<<<<<<< HEAD
+ +		if (!info && rt->rt_flags & RTCF_LOCAL &&
+ +		    !(rt->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))) {
+ +			struct vxlan_dev *dst_vxlan;
+ +
+ +			ip_rt_put(rt);
+ +			dst_vxlan = vxlan_find_vni(vxlan->net, vni,
+ +						   dst->sa.sa_family, dst_port,
+ +						   vxlan->flags);
+ +			if (!dst_vxlan)
+ +				goto tx_error;
+ +			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
+ +			return;
+++=======
++ 		if (!info) {
++ 			err = encap_bypass_if_local(skb, dev, vxlan, dst,
++ 						    dst_port, vni, &rt->dst,
++ 						    rt->rt_flags);
++ 			if (err)
++ 				goto out_unlock;
++ 		} else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT) {
++ 			df = htons(IP_DF);
+++>>>>>>> 56de859e9967 (vxlan: lock RCU on TX path)
+  		}
+  
+ -		ndst = &rt->dst;
+ +		if (!info)
+ +			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM_TX);
+ +		else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT)
+ +			df = htons(IP_DF);
+ +
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ -		err = vxlan_build_skb(skb, ndst, sizeof(struct iphdr),
+ +		err = vxlan_build_skb(skb, &rt->dst, sizeof(struct iphdr),
+  				      vni, md, flags, udp_sum);
+  		if (err < 0)
+ -			goto tx_error;
+ +			goto xmit_tx_error;
+  
+ -		udp_tunnel_xmit_skb(rt, sock4->sock->sk, skb, local_ip.sin.sin_addr.s_addr,
+ +		udp_tunnel_xmit_skb(rt, sk, skb, src->sin.sin_addr.s_addr,
+  				    dst->sin.sin_addr.s_addr, tos, ttl, df,
+  				    src_port, dst_port, xnet, !udp_sum);
+  #if IS_ENABLED(CONFIG_IPV6)
+@@@ -2062,33 -2160,16 +2074,44 @@@
+  			goto tx_error;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (ndst->dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dst_release(ndst);
+ +			dev->stats.collisions++;
+ +			goto tx_error;
+++=======
++ 		if (!info) {
++ 			u32 rt6i_flags = ((struct rt6_info *)ndst)->rt6i_flags;
++ 
++ 			err = encap_bypass_if_local(skb, dev, vxlan, dst,
++ 						    dst_port, vni, ndst,
++ 						    rt6i_flags);
++ 			if (err)
++ 				goto out_unlock;
+++>>>>>>> 56de859e9967 (vxlan: lock RCU on TX path)
+ +		}
+ +
+ +		/* Bypass encapsulation if the destination is local */
+ +		rt6i_flags = ((struct rt6_info *)ndst)->rt6i_flags;
+ +		if (!info && rt6i_flags & RTF_LOCAL &&
+ +		    !(rt6i_flags & (RTCF_BROADCAST | RTCF_MULTICAST))) {
+ +			struct vxlan_dev *dst_vxlan;
+ +
+ +			dst_release(ndst);
+ +			dst_vxlan = vxlan_find_vni(vxlan->net, vni,
+ +						   dst->sa.sa_family, dst_port,
+ +						   vxlan->flags);
+ +			if (!dst_vxlan)
+ +				goto tx_error;
+ +			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
+ +			return;
+  		}
+  
+ +		if (!info)
+ +			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+ +
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+  		skb_scrub_packet(skb, xnet);
+@@@ -2105,22 -2184,24 +2128,36 @@@
+  				     label, src_port, dst_port, !udp_sum);
+  #endif
+  	}
+++<<<<<<< HEAD
+ +
+++=======
++ out_unlock:
++ 	rcu_read_unlock();
+++>>>>>>> 56de859e9967 (vxlan: lock RCU on TX path)
+  	return;
+  
+  drop:
+  	dev->stats.tx_dropped++;
+ -	dev_kfree_skb(skb);
+ -	return;
+ +	goto tx_free;
+  
+ +xmit_tx_error:
+ +	/* skb is already freed. */
+ +	skb = NULL;
+ +rt_tx_error:
+ +	ip_rt_put(rt);
+  tx_error:
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_unlock();
++ 	if (err == -ELOOP)
++ 		dev->stats.collisions++;
++ 	else if (err == -ENETUNREACH)
++ 		dev->stats.tx_carrier_errors++;
++ 	dst_release(ndst);
+++>>>>>>> 56de859e9967 (vxlan: lock RCU on TX path)
+  	dev->stats.tx_errors++;
+ -	kfree_skb(skb);
+ +tx_free:
+ +	dev_kfree_skb(skb);
+  }
+  
+  /* Transmit local packets over Vxlan
+* Unmerged path drivers/net/vxlan.c
