@@ -1,0 +1,297 @@
+dm: add infrastructure for DAX support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Toshi Kani <toshi.kani@hpe.com>
+commit 545ed20e6df68a4d2584a29a2a28ee8b2f7e9547
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/545ed20e.failed
+
+Change mapped device to implement direct_access function,
+dm_blk_direct_access(), which calls a target direct_access function.
+'struct target_type' is extended to have target direct_access interface.
+This function limits direct accessible size to the dm_target's limit
+with max_io_len().
+
+Add dm_table_supports_dax() to iterate all targets and associated block
+devices to check for DAX support.  To add DAX support to a DM target the
+target must only implement the direct_access function.
+
+Add a new dm type, DM_TYPE_DAX_BIO_BASED, which indicates that mapped
+device supports DAX and is bio based.  This new type is used to assure
+that all target devices have DAX support and remain that way after
+QUEUE_FLAG_DAX is set in mapped device.
+
+At initial table load, QUEUE_FLAG_DAX is set to mapped device when setting
+DM_TYPE_DAX_BIO_BASED to the type.  Any subsequent table load to the
+mapped device must have the same type, or else it fails per the check in
+table_load().
+
+	Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 545ed20e6df68a4d2584a29a2a28ee8b2f7e9547)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-table.c
+#	drivers/md/dm.c
+#	include/linux/device-mapper.h
+diff --cc drivers/md/dm-table.c
+index 15241060f605,ee6f37eafbc3..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -839,16 -839,58 +845,65 @@@ static bool __table_type_request_based(
+  		table_type == DM_TYPE_MQ_REQUEST_BASED);
+  }
+  
+++<<<<<<< HEAD
+ +static int dm_table_set_type(struct dm_table *t)
+++=======
++ void dm_table_set_type(struct dm_table *t, unsigned type)
++ {
++ 	t->type = type;
++ }
++ EXPORT_SYMBOL_GPL(dm_table_set_type);
++ 
++ static int device_supports_dax(struct dm_target *ti, struct dm_dev *dev,
++ 			       sector_t start, sector_t len, void *data)
++ {
++ 	struct request_queue *q = bdev_get_queue(dev->bdev);
++ 
++ 	return q && blk_queue_dax(q);
++ }
++ 
++ static bool dm_table_supports_dax(struct dm_table *t)
++ {
++ 	struct dm_target *ti;
++ 	unsigned i = 0;
++ 
++ 	/* Ensure that all targets support DAX. */
++ 	while (i < dm_table_get_num_targets(t)) {
++ 		ti = dm_table_get_target(t, i++);
++ 
++ 		if (!ti->type->direct_access)
++ 			return false;
++ 
++ 		if (!ti->type->iterate_devices ||
++ 		    !ti->type->iterate_devices(ti, device_supports_dax, NULL))
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int dm_table_determine_type(struct dm_table *t)
+++>>>>>>> 545ed20e6df6 (dm: add infrastructure for DAX support)
+  {
+  	unsigned i;
+  	unsigned bio_based = 0, request_based = 0, hybrid = 0;
+ -	bool verify_blk_mq = false;
+ +	bool use_blk_mq = false;
+  	struct dm_target *tgt;
+  	struct dm_dev_internal *dd;
+ -	struct list_head *devices = dm_table_get_devices(t);
+ +	struct list_head *devices;
+  	unsigned live_md_type = dm_get_md_type(t->md);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (t->type != DM_TYPE_NONE) {
++ 		/* target already set the table's type */
++ 		if (t->type == DM_TYPE_BIO_BASED)
++ 			return 0;
++ 		BUG_ON(t->type == DM_TYPE_DAX_BIO_BASED);
++ 		goto verify_rq_based;
++ 	}
++ 
+++>>>>>>> 545ed20e6df6 (dm: add infrastructure for DAX support)
+  	for (i = 0; i < t->num_targets; i++) {
+  		tgt = t->targets + i;
+  		if (dm_target_hybrid(tgt))
+diff --cc drivers/md/dm.c
+index ec8896186c46,4dca5a792e4b..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -908,6 -905,73 +908,76 @@@ int dm_set_target_max_io_len(struct dm_
+  }
+  EXPORT_SYMBOL_GPL(dm_set_target_max_io_len);
+  
+++<<<<<<< HEAD
+++=======
++ static long dm_blk_direct_access(struct block_device *bdev, sector_t sector,
++ 				 void __pmem **kaddr, pfn_t *pfn, long size)
++ {
++ 	struct mapped_device *md = bdev->bd_disk->private_data;
++ 	struct dm_table *map;
++ 	struct dm_target *ti;
++ 	int srcu_idx;
++ 	long len, ret = -EIO;
++ 
++ 	map = dm_get_live_table(md, &srcu_idx);
++ 	if (!map)
++ 		goto out;
++ 
++ 	ti = dm_table_find_target(map, sector);
++ 	if (!dm_target_is_valid(ti))
++ 		goto out;
++ 
++ 	len = max_io_len(sector, ti) << SECTOR_SHIFT;
++ 	size = min(len, size);
++ 
++ 	if (ti->type->direct_access)
++ 		ret = ti->type->direct_access(ti, sector, kaddr, pfn, size);
++ out:
++ 	dm_put_live_table(md, srcu_idx);
++ 	return min(ret, size);
++ }
++ 
++ /*
++  * A target may call dm_accept_partial_bio only from the map routine.  It is
++  * allowed for all bio types except REQ_PREFLUSH.
++  *
++  * dm_accept_partial_bio informs the dm that the target only wants to process
++  * additional n_sectors sectors of the bio and the rest of the data should be
++  * sent in a next bio.
++  *
++  * A diagram that explains the arithmetics:
++  * +--------------------+---------------+-------+
++  * |         1          |       2       |   3   |
++  * +--------------------+---------------+-------+
++  *
++  * <-------------- *tio->len_ptr --------------->
++  *                      <------- bi_size ------->
++  *                      <-- n_sectors -->
++  *
++  * Region 1 was already iterated over with bio_advance or similar function.
++  *	(it may be empty if the target doesn't use bio_advance)
++  * Region 2 is the remaining bio size that the target wants to process.
++  *	(it may be empty if region 1 is non-empty, although there is no reason
++  *	 to make it empty)
++  * The target requires that region 3 is to be sent in the next bio.
++  *
++  * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
++  * the partially processed part (the sum of regions 1+2) must be the same for all
++  * copies of the bio.
++  */
++ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
++ {
++ 	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
++ 	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
++ 	BUG_ON(bio->bi_rw & REQ_PREFLUSH);
++ 	BUG_ON(bi_size > *tio->len_ptr);
++ 	BUG_ON(n_sectors > bi_size);
++ 	*tio->len_ptr -= bi_size - n_sectors;
++ 	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
++ }
++ EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
++ 
+++>>>>>>> 545ed20e6df6 (dm: add infrastructure for DAX support)
+  static void __map_bio(struct dm_target_io *tio)
+  {
+  	int r;
+@@@ -1981,9 -1771,9 +2051,15 @@@ static unsigned filter_md_type(unsigne
+  int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
+  {
+  	int r;
+++<<<<<<< HEAD
+ +	unsigned md_type = filter_md_type(dm_get_md_type(md), md);
+ +
+ +	switch (md_type) {
+++=======
++ 	unsigned type = dm_get_md_type(md);
++ 
++ 	switch (type) {
+++>>>>>>> 545ed20e6df6 (dm: add infrastructure for DAX support)
+  	case DM_TYPE_REQUEST_BASED:
+  		r = dm_old_init_request_queue(md);
+  		if (r) {
+@@@ -1999,9 -1789,18 +2075,22 @@@
+  		}
+  		break;
+  	case DM_TYPE_BIO_BASED:
++ 	case DM_TYPE_DAX_BIO_BASED:
+  		dm_init_normal_md_queue(md);
+  		blk_queue_make_request(md->queue, dm_make_request);
+++<<<<<<< HEAD
+ +		blk_queue_merge_bvec(md->queue, dm_merge_bvec);
+++=======
++ 		/*
++ 		 * DM handles splitting bios as needed.  Free the bio_split bioset
++ 		 * since it won't be used (saves 1 process per bio-based DM device).
++ 		 */
++ 		bioset_free(md->queue->bio_split);
++ 		md->queue->bio_split = NULL;
++ 
++ 		if (type == DM_TYPE_DAX_BIO_BASED)
++ 			queue_flag_set_unlocked(QUEUE_FLAG_DAX, md->queue);
+++>>>>>>> 545ed20e6df6 (dm: add infrastructure for DAX support)
+  		break;
+  	}
+  
+@@@ -2708,10 -2495,9 +2797,11 @@@ struct dm_md_mempools *dm_alloc_md_memp
+  	if (!pools)
+  		return NULL;
+  
+ +	type = filter_md_type(type, md);
+ +
+  	switch (type) {
+  	case DM_TYPE_BIO_BASED:
++ 	case DM_TYPE_DAX_BIO_BASED:
+  		cachep = _io_cache;
+  		pool_size = dm_get_reserved_bio_based_ios();
+  		front_pad = roundup(per_io_data_size, __alignof__(struct dm_target_io)) + offsetof(struct dm_target_io, clone);
+diff --cc include/linux/device-mapper.h
+index 6f8845076ca7,b0db857f334b..000000000000
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@@ -19,6 -19,15 +19,18 @@@ struct dm_table
+  struct mapped_device;
+  struct bio_vec;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Type of table, mapped_device's mempool and request_queue
++  */
++ #define DM_TYPE_NONE			0
++ #define DM_TYPE_BIO_BASED		1
++ #define DM_TYPE_REQUEST_BASED		2
++ #define DM_TYPE_MQ_REQUEST_BASED	3
++ #define DM_TYPE_DAX_BIO_BASED		4
++ 
+++>>>>>>> 545ed20e6df6 (dm: add infrastructure for DAX support)
+  typedef enum { STATUSTYPE_INFO, STATUSTYPE_TABLE } status_type_t;
+  
+  union map_info {
+* Unmerged path drivers/md/dm-table.c
+* Unmerged path drivers/md/dm.c
+diff --git a/drivers/md/dm.h b/drivers/md/dm.h
+index 4c193bce7da9..5029c715905d 100644
+--- a/drivers/md/dm.h
++++ b/drivers/md/dm.h
+@@ -75,6 +75,7 @@ unsigned dm_table_get_type(struct dm_table *t);
+ struct target_type *dm_table_get_immutable_target_type(struct dm_table *t);
+ struct dm_target *dm_table_get_immutable_target(struct dm_table *t);
+ struct dm_target *dm_table_get_wildcard_target(struct dm_table *t);
++bool dm_table_bio_based(struct dm_table *t);
+ bool dm_table_request_based(struct dm_table *t);
+ bool dm_table_mq_request_based(struct dm_table *t);
+ void dm_table_free_md_mempools(struct dm_table *t);
+* Unmerged path include/linux/device-mapper.h
+diff --git a/include/uapi/linux/dm-ioctl.h b/include/uapi/linux/dm-ioctl.h
+index 30afd0a23c4b..4bf9f1eabffc 100644
+--- a/include/uapi/linux/dm-ioctl.h
++++ b/include/uapi/linux/dm-ioctl.h
+@@ -267,9 +267,9 @@ enum {
+ #define DM_DEV_SET_GEOMETRY	_IOWR(DM_IOCTL, DM_DEV_SET_GEOMETRY_CMD, struct dm_ioctl)
+ 
+ #define DM_VERSION_MAJOR	4
+-#define DM_VERSION_MINOR	34
++#define DM_VERSION_MINOR	35
+ #define DM_VERSION_PATCHLEVEL	0
+-#define DM_VERSION_EXTRA	"-ioctl (2015-10-28)"
++#define DM_VERSION_EXTRA	"-ioctl (2016-06-23)"
+ 
+ /* Status bits */
+ #define DM_READONLY_FLAG	(1 << 0) /* In/Out */
