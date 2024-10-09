@@ -1,0 +1,132 @@
+IB/ipoib: Move all uninit code into ndo_uninit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 7cbee87c17965ede0eba2e7ba41d0a38ebd2249c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7cbee87c.failed
+
+Currently uninit is sometimes done twice in error flows, and is sprinkled
+a bit all over the place.
+
+Improve the clarity of the design by moving all uninit only into
+ndo_uinit.
+
+Some duplication is removed:
+ - Sometimes IPOIB_STOP_NEIGH_GC was done before unregister, but
+   this duplicates the process in ipoib_neigh_hash_init
+ - Flushing priv->wq was sometimes done before unregister,
+   but that duplicates what has been done in ndo_uninit
+
+Uniniting the IB event queue must remain before unregister_netdev as it
+requires the RTNL lock to be dropped, this is moved to a helper to make
+that flow really clear and remove some duplication in error flows.
+
+If register_netdev fails (and ndo_init is NULL) then it almost always
+calls ndo_uninit, which lets us remove all the extra code from the error
+unwinds. The next patch in the series will close the 'almost always' hole
+by pairing a proper ndo_init with ndo_uninit.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 7cbee87c17965ede0eba2e7ba41d0a38ebd2249c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 2f3832daed34,d4e9951dc539..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1890,11 -1909,10 +1911,15 @@@ static const struct header_ops ipoib_he
+  };
+  
+  static const struct net_device_ops ipoib_netdev_ops_pf = {
+++<<<<<<< HEAD
+ +	.ndo_size		 = sizeof(struct net_device_ops),
+ +	.ndo_uninit		 = ipoib_uninit,
+++=======
++ 	.ndo_uninit		 = ipoib_ndo_uninit,
+++>>>>>>> 7cbee87c1796 (IB/ipoib: Move all uninit code into ndo_uninit)
+  	.ndo_open		 = ipoib_open,
+  	.ndo_stop		 = ipoib_stop,
+ -	.ndo_change_mtu		 = ipoib_change_mtu,
+ +	.ndo_change_mtu_rh74	 = ipoib_change_mtu,
+  	.ndo_fix_features	 = ipoib_fix_features,
+  	.ndo_start_xmit		 = ipoib_start_xmit,
+  	.ndo_tx_timeout		 = ipoib_timeout,
+@@@ -1910,10 -1928,10 +1935,10 @@@
+  };
+  
+  static const struct net_device_ops ipoib_netdev_ops_vf = {
+- 	.ndo_uninit		 = ipoib_uninit,
++ 	.ndo_uninit		 = ipoib_ndo_uninit,
+  	.ndo_open		 = ipoib_open,
+  	.ndo_stop		 = ipoib_stop,
+ -	.ndo_change_mtu		 = ipoib_change_mtu,
+ +	.ndo_change_mtu_rh74	 = ipoib_change_mtu,
+  	.ndo_fix_features	 = ipoib_fix_features,
+  	.ndo_start_xmit	 	 = ipoib_start_xmit,
+  	.ndo_tx_timeout		 = ipoib_timeout,
+@@@ -2394,19 -2406,7 +2413,23 @@@ static void ipoib_remove_one(struct ib_
+  	list_for_each_entry_safe(priv, tmp, dev_list, list) {
+  		struct rdma_netdev *parent_rn = netdev_priv(priv->dev);
+  
+++<<<<<<< HEAD
+ +		ib_unregister_event_handler(&priv->event_handler);
+ +		flush_workqueue(ipoib_workqueue);
+ +
+ +		/* mark interface in the middle of destruction */
+ +		set_bit(IPOIB_FLAG_GOING_DOWN, &priv->flags);
+ +
+ +		rtnl_lock();
+ +		dev_change_flags(priv->dev, priv->dev->flags & ~IFF_UP);
+ +		rtnl_unlock();
+ +
+ +		/* Stop GC */
+ +		cancel_delayed_work_sync(&priv->neigh_reap_task);
+ +		flush_workqueue(priv->wq);
+++=======
++ 		ipoib_parent_unregister_pre(priv->dev);
+++>>>>>>> 7cbee87c1796 (IB/ipoib: Move all uninit code into ndo_uninit)
+  
+  		/* Wrap rtnl_lock/unlock with mutex to protect sysfs calls */
+  		mutex_lock(&priv->sysfs_mutex);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 072bd9d297b1..e871b741c50f 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -510,7 +510,6 @@ int ipoib_ib_dev_stop_default(struct net_device *dev);
+ void ipoib_pkey_dev_check_presence(struct net_device *dev);
+ 
+ int ipoib_dev_init(struct net_device *dev, struct ib_device *ca, int port);
+-void ipoib_dev_cleanup(struct net_device *dev);
+ 
+ void ipoib_mcast_join_task(struct work_struct *work);
+ void ipoib_mcast_carrier_on_task(struct work_struct *work);
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index 0c8d87a40f23..1baf1f3c1fa2 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@ -82,7 +82,7 @@ int __ipoib_vlan_add(struct ipoib_dev_priv *ppriv, struct ipoib_dev_priv *priv,
+ 	result = register_netdevice(priv->dev);
+ 	if (result) {
+ 		ipoib_warn(priv, "failed to initialize; error %i", result);
+-		goto register_failed;
++		goto err;
+ 	}
+ 
+ 	/* RTNL childs don't need proprietary sysfs entries */
+@@ -107,9 +107,6 @@ sysfs_failed:
+ 	result = -ENOMEM;
+ 	unregister_netdevice(priv->dev);
+ 
+-register_failed:
+-	ipoib_dev_cleanup(priv->dev);
+-
+ err:
+ 	return result;
+ }
