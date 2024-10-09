@@ -1,0 +1,111 @@
+net/ibmvnic: prevent more than one thread from running in reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Juliet Kim <julietk@linux.vnet.ibm.com>
+commit 7ed5b31f4a6695a21f617df07646e9b15c6c1d29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/7ed5b31f.failed
+
+The current code allows more than one thread to run in reset. This can
+corrupt struct adapter data. Check adapter->resetting before performing
+a reset, if there is another reset running delay (100 msec) before trying
+again.
+
+	Signed-off-by: Juliet Kim <julietk@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7ed5b31f4a6695a21f617df07646e9b15c6c1d29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 91fa8c864aa9,2b073a3c0b84..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -1440,9 -1426,9 +1440,9 @@@ static int ibmvnic_xmit(struct sk_buff 
+  	u64 *handle_array;
+  	int index = 0;
+  	u8 proto = 0;
+ -	netdev_tx_t ret = NETDEV_TX_OK;
+ +	int ret = 0;
+  
+- 	if (adapter->resetting) {
++ 	if (test_bit(0, &adapter->resetting)) {
+  		if (!netif_subqueue_stopped(netdev, skb))
+  			netif_stop_subqueue(netdev, queue_num);
+  		dev_kfree_skb_any(skb);
+@@@ -1985,16 -2053,13 +1985,25 @@@ static void __ibmvnic_reset(struct work
+  	int rc = 0;
+  
+  	adapter = container_of(work, struct ibmvnic_adapter, ibmvnic_reset);
+ +	netdev = adapter->netdev;
+  
+++<<<<<<< HEAD
+ +	/* netif_set_real_num_xx_queues needs to take rtnl lock here
+ +	 * unless wait_for_reset is set, in which case the rtnl lock
+ +	 * has already been taken before initializing the reset
+ +	 */
+ +	if (!adapter->wait_for_reset) {
+ +		rtnl_lock();
+ +		we_lock_rtnl = true;
+ +	}
+++=======
++ 	if (test_and_set_bit_lock(0, &adapter->resetting)) {
++ 		schedule_delayed_work(&adapter->ibmvnic_delayed_reset,
++ 				      IBMVNIC_RESET_DELAY);
++ 		return;
++ 	}
++ 
+++>>>>>>> 7ed5b31f4a66 (net/ibmvnic: prevent more than one thread from running in reset)
+  	reset_state = adapter->state;
+  
+  	rwi = get_next_rwi(adapter);
+@@@ -2031,9 -2117,16 +2044,22 @@@
+  		free_all_rwi(adapter);
+  	}
+  
+++<<<<<<< HEAD
+ +	adapter->resetting = false;
+ +	if (we_lock_rtnl)
+ +		rtnl_unlock();
+++=======
++ 	clear_bit_unlock(0, &adapter->resetting);
++ }
++ 
++ static void __ibmvnic_delayed_reset(struct work_struct *work)
++ {
++ 	struct ibmvnic_adapter *adapter;
++ 
++ 	adapter = container_of(work, struct ibmvnic_adapter,
++ 			       ibmvnic_delayed_reset.work);
++ 	__ibmvnic_reset(&adapter->ibmvnic_reset);
+++>>>>>>> 7ed5b31f4a66 (net/ibmvnic: prevent more than one thread from running in reset)
+  }
+  
+  static int ibmvnic_reset(struct ibmvnic_adapter *adapter,
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.h b/drivers/net/ethernet/ibm/ibmvnic.h
+index 9cba0bbb056f..f2d9f24e35d2 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@ -49,6 +49,8 @@
+ #define IBMVNIC_MAX_LTB_SIZE ((1 << (MAX_ORDER - 1)) * PAGE_SIZE)
+ #define IBMVNIC_BUFFER_HLEN 500
+ 
++#define IBMVNIC_RESET_DELAY 100
++
+ static const char ibmvnic_priv_flags[][ETH_GSTRING_LEN] = {
+ #define IBMVNIC_USE_SERVER_MAXES 0x1
+ 	"use-server-maxes"
+@@ -1085,7 +1087,8 @@ struct ibmvnic_adapter {
+ 	spinlock_t rwi_lock;
+ 	struct list_head rwi_list;
+ 	struct work_struct ibmvnic_reset;
+-	bool resetting;
++	struct delayed_work ibmvnic_delayed_reset;
++	unsigned long resetting;
+ 	bool napi_enabled, from_passive_init;
+ 
+ 	bool failover_pending;
