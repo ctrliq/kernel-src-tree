@@ -1,0 +1,153 @@
+net_sched: fix a refcount_t issue with noop_qdisc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 551143d8d954fe398324a5caa276f518466c428b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/551143d8.failed
+
+syzkaller reported a refcount_t warning [1]
+
+Issue here is that noop_qdisc refcnt was never really considered as
+a true refcount, since qdisc_destroy() found TCQ_F_BUILTIN set :
+
+if (qdisc->flags & TCQ_F_BUILTIN ||
+    !refcount_dec_and_test(&qdisc->refcnt)))
+	return;
+
+Meaning that all atomic_inc() we did on noop_qdisc.refcnt were not
+really needed, but harmless until refcount_t came.
+
+To fix this problem, we simply need to not increment noop_qdisc.refcnt,
+since we never decrement it.
+
+[1]
+refcount_t: increment on 0; use-after-free.
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 21754 at lib/refcount.c:152 refcount_inc+0x47/0x50 lib/refcount.c:152
+Kernel panic - not syncing: panic_on_warn set ...
+
+CPU: 0 PID: 21754 Comm: syz-executor7 Not tainted 4.13.0-rc6+ #20
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Call Trace:
+ __dump_stack lib/dump_stack.c:16 [inline]
+ dump_stack+0x194/0x257 lib/dump_stack.c:52
+ panic+0x1e4/0x417 kernel/panic.c:180
+ __warn+0x1c4/0x1d9 kernel/panic.c:541
+ report_bug+0x211/0x2d0 lib/bug.c:183
+ fixup_bug+0x40/0x90 arch/x86/kernel/traps.c:190
+ do_trap_no_signal arch/x86/kernel/traps.c:224 [inline]
+ do_trap+0x260/0x390 arch/x86/kernel/traps.c:273
+ do_error_trap+0x120/0x390 arch/x86/kernel/traps.c:310
+ do_invalid_op+0x1b/0x20 arch/x86/kernel/traps.c:323
+ invalid_op+0x1e/0x30 arch/x86/entry/entry_64.S:846
+RIP: 0010:refcount_inc+0x47/0x50 lib/refcount.c:152
+RSP: 0018:ffff8801c43477a0 EFLAGS: 00010282
+RAX: 000000000000002b RBX: ffffffff86093c14 RCX: 0000000000000000
+RDX: 000000000000002b RSI: ffffffff8159314e RDI: ffffed0038868ee8
+RBP: ffff8801c43477a8 R08: 0000000000000001 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000000 R12: ffffffff86093ac0
+R13: 0000000000000001 R14: ffff8801d0f3bac0 R15: dffffc0000000000
+ attach_default_qdiscs net/sched/sch_generic.c:792 [inline]
+ dev_activate+0x7d3/0xaa0 net/sched/sch_generic.c:833
+ __dev_open+0x227/0x330 net/core/dev.c:1380
+ __dev_change_flags+0x695/0x990 net/core/dev.c:6726
+ dev_change_flags+0x88/0x140 net/core/dev.c:6792
+ dev_ifsioc+0x5a6/0x930 net/core/dev_ioctl.c:256
+ dev_ioctl+0x2bc/0xf90 net/core/dev_ioctl.c:554
+ sock_do_ioctl+0x94/0xb0 net/socket.c:968
+ sock_ioctl+0x2c2/0x440 net/socket.c:1058
+ vfs_ioctl fs/ioctl.c:45 [inline]
+ do_vfs_ioctl+0x1b1/0x1520 fs/ioctl.c:685
+ SYSC_ioctl fs/ioctl.c:700 [inline]
+ SyS_ioctl+0x8f/0xc0 fs/ioctl.c:691
+
+Fixes: 7b9364050246 ("net, sched: convert Qdisc.refcnt from atomic_t to refcount_t")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Reshetova, Elena <elena.reshetova@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 551143d8d954fe398324a5caa276f518466c428b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_api.c
+#	net/sched/sch_generic.c
+diff --cc net/sched/sch_api.c
+index 0fd3de4f5fdb,4fb5a3222d0d..000000000000
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@@ -831,7 -836,7 +831,11 @@@ static int qdisc_graft(struct net_devic
+  
+  			old = dev_graft_qdisc(dev_queue, new);
+  			if (new && i > 0)
+++<<<<<<< HEAD
+ +				atomic_inc(&new->refcnt);
+++=======
++ 				qdisc_refcount_inc(new);
+++>>>>>>> 551143d8d954 (net_sched: fix a refcount_t issue with noop_qdisc)
+  
+  			if (!ingress)
+  				qdisc_destroy(old);
+@@@ -842,7 -847,7 +846,11 @@@ skip
+  			notify_and_destroy(net, skb, n, classid,
+  					   dev->qdisc, new);
+  			if (new && !new->ops->attach)
+++<<<<<<< HEAD
+ +				atomic_inc(&new->refcnt);
+++=======
++ 				qdisc_refcount_inc(new);
+++>>>>>>> 551143d8d954 (net_sched: fix a refcount_t issue with noop_qdisc)
+  			dev->qdisc = new ? : &noop_qdisc;
+  
+  			if (new && new->ops->attach)
+@@@ -1248,7 -1256,7 +1256,11 @@@ replay
+  				if (q == p ||
+  				    (p && check_loop(q, p, 0)))
+  					return -ELOOP;
+++<<<<<<< HEAD
+ +				atomic_inc(&q->refcnt);
+++=======
++ 				qdisc_refcount_inc(q);
+++>>>>>>> 551143d8d954 (net_sched: fix a refcount_t issue with noop_qdisc)
+  				goto graft;
+  			} else {
+  				if (!q)
+diff --cc net/sched/sch_generic.c
+index 57cbfa322683,4ba6da5fb254..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -759,7 -785,7 +759,11 @@@ static void attach_default_qdiscs(struc
+  	    dev->priv_flags & IFF_NO_QUEUE) {
+  		netdev_for_each_tx_queue(dev, attach_one_default_qdisc, NULL);
+  		dev->qdisc = txq->qdisc_sleeping;
+++<<<<<<< HEAD
+ +		atomic_inc(&dev->qdisc->refcnt);
+++=======
++ 		qdisc_refcount_inc(dev->qdisc);
+++>>>>>>> 551143d8d954 (net_sched: fix a refcount_t issue with noop_qdisc)
+  	} else {
+  		qdisc = qdisc_create_dflt(txq, &mq_qdisc_ops, TC_H_ROOT);
+  		if (qdisc) {
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 7b71e43efef9..65649329e38e 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -95,6 +95,13 @@ struct Qdisc {
+ 	spinlock_t		busylock ____cacheline_aligned_in_smp;
+ };
+ 
++static inline void qdisc_refcount_inc(struct Qdisc *qdisc)
++{
++	if (qdisc->flags & TCQ_F_BUILTIN)
++		return;
++	refcount_inc(&qdisc->refcnt);
++}
++
+ static inline bool qdisc_is_running(const struct Qdisc *qdisc)
+ {
+ 	return (qdisc->__state & __QDISC___STATE_RUNNING) ? true : false;
+* Unmerged path net/sched/sch_api.c
+* Unmerged path net/sched/sch_generic.c
