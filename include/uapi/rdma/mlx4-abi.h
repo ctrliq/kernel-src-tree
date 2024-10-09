@@ -169,6 +169,14 @@ enum query_device_resp_mask {
 	MLX4_IB_QUERY_DEV_RESP_MASK_CORE_CLOCK_OFFSET = 1UL << 0,
 };
 
+struct mlx4_ib_tso_caps {
+	__u32 max_tso; /* Maximum tso payload size in bytes */
+	/* Corresponding bit will be set if qp type from
+	 * 'enum ib_qp_type' is supported.
+	 */
+	__u32 supported_qpts;
+};
+
 struct mlx4_uverbs_ex_query_device_resp {
 	__u32			comp_mask;
 	__u32			response_length;
@@ -176,6 +184,7 @@ struct mlx4_uverbs_ex_query_device_resp {
 	__u32			max_inl_recv_sz;
 	__u32			reserved;
 	struct mlx4_ib_rss_caps	rss_caps;
+	struct mlx4_ib_tso_caps tso_caps;
 };
 
 #endif /* MLX4_ABI_USER_H */
