@@ -1,0 +1,596 @@
+nfp: flower: allow offloading of matches on 'internal' ports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 4d12ba42787b5c1eb41375bc6cc70ad8dd7aa0e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4d12ba42.failed
+
+Recent FW modifications allow the offloading of non repr ports. These
+ports exist internally on the NFP. So if a rule outputs to an 'internal'
+port, then the packet will recirculate back into the system but will now
+have this internal port as it's incoming port. These ports are indicated
+by a specific type field combined with an 8 bit port id.
+
+Add private app data to assign additional port ids for use in offloads.
+Provide functions to lookup or create new ids when a rule attempts to
+match on an internal netdev - the only internal netdevs currently
+supported are of type openvswitch. Have a netdev notifier to release
+port ids on netdev unregister.
+
+OvS offloads rules that match on internal ports as TC egress filters.
+Ensure that such rules are accepted by the driver.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4d12ba42787b5c1eb41375bc6cc70ad8dd7aa0e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+#	drivers/net/ethernet/netronome/nfp/flower/match.c
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.c
+index 171014032993,d0d8c56cd84a..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@@ -62,6 -35,165 +65,168 @@@ static enum devlink_eswitch_mode eswitc
+  	return DEVLINK_ESWITCH_MODE_SWITCHDEV;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nfp_flower_lookup_internal_port_id(struct nfp_flower_priv *priv,
++ 				   struct net_device *netdev)
++ {
++ 	struct net_device *entry;
++ 	int i, id = 0;
++ 
++ 	rcu_read_lock();
++ 	idr_for_each_entry(&priv->internal_ports.port_ids, entry, i)
++ 		if (entry == netdev) {
++ 			id = i;
++ 			break;
++ 		}
++ 	rcu_read_unlock();
++ 
++ 	return id;
++ }
++ 
++ static int
++ nfp_flower_get_internal_port_id(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int id;
++ 
++ 	id = nfp_flower_lookup_internal_port_id(priv, netdev);
++ 	if (id > 0)
++ 		return id;
++ 
++ 	idr_preload(GFP_ATOMIC);
++ 	spin_lock_bh(&priv->internal_ports.lock);
++ 	id = idr_alloc(&priv->internal_ports.port_ids, netdev,
++ 		       NFP_MIN_INT_PORT_ID, NFP_MAX_INT_PORT_ID, GFP_ATOMIC);
++ 	spin_unlock_bh(&priv->internal_ports.lock);
++ 	idr_preload_end();
++ 
++ 	return id;
++ }
++ 
++ u32 nfp_flower_get_port_id_from_netdev(struct nfp_app *app,
++ 				       struct net_device *netdev)
++ {
++ 	int ext_port;
++ 
++ 	if (nfp_netdev_is_nfp_repr(netdev)) {
++ 		return nfp_repr_get_port_id(netdev);
++ 	} else if (nfp_flower_internal_port_can_offload(app, netdev)) {
++ 		ext_port = nfp_flower_get_internal_port_id(app, netdev);
++ 		if (ext_port < 0)
++ 			return 0;
++ 
++ 		return nfp_flower_internal_port_get_port_id(ext_port);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void
++ nfp_flower_free_internal_port_id(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int id;
++ 
++ 	id = nfp_flower_lookup_internal_port_id(priv, netdev);
++ 	if (!id)
++ 		return;
++ 
++ 	spin_lock_bh(&priv->internal_ports.lock);
++ 	idr_remove(&priv->internal_ports.port_ids, id);
++ 	spin_unlock_bh(&priv->internal_ports.lock);
++ }
++ 
++ static int
++ nfp_flower_internal_port_event_handler(struct nfp_app *app,
++ 				       struct net_device *netdev,
++ 				       unsigned long event)
++ {
++ 	if (event == NETDEV_UNREGISTER &&
++ 	    nfp_flower_internal_port_can_offload(app, netdev))
++ 		nfp_flower_free_internal_port_id(app, netdev);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ static void nfp_flower_internal_port_init(struct nfp_flower_priv *priv)
++ {
++ 	spin_lock_init(&priv->internal_ports.lock);
++ 	idr_init(&priv->internal_ports.port_ids);
++ }
++ 
++ static void nfp_flower_internal_port_cleanup(struct nfp_flower_priv *priv)
++ {
++ 	idr_destroy(&priv->internal_ports.port_ids);
++ }
++ 
++ static struct nfp_flower_non_repr_priv *
++ nfp_flower_non_repr_priv_lookup(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	struct nfp_flower_non_repr_priv *entry;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	list_for_each_entry(entry, &priv->non_repr_priv, list)
++ 		if (entry->netdev == netdev)
++ 			return entry;
++ 
++ 	return NULL;
++ }
++ 
++ void
++ __nfp_flower_non_repr_priv_get(struct nfp_flower_non_repr_priv *non_repr_priv)
++ {
++ 	non_repr_priv->ref_count++;
++ }
++ 
++ struct nfp_flower_non_repr_priv *
++ nfp_flower_non_repr_priv_get(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	struct nfp_flower_non_repr_priv *entry;
++ 
++ 	entry = nfp_flower_non_repr_priv_lookup(app, netdev);
++ 	if (entry)
++ 		goto inc_ref;
++ 
++ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		return NULL;
++ 
++ 	entry->netdev = netdev;
++ 	list_add(&entry->list, &priv->non_repr_priv);
++ 
++ inc_ref:
++ 	__nfp_flower_non_repr_priv_get(entry);
++ 	return entry;
++ }
++ 
++ void
++ __nfp_flower_non_repr_priv_put(struct nfp_flower_non_repr_priv *non_repr_priv)
++ {
++ 	if (--non_repr_priv->ref_count)
++ 		return;
++ 
++ 	list_del(&non_repr_priv->list);
++ 	kfree(non_repr_priv);
++ }
++ 
++ void
++ nfp_flower_non_repr_priv_put(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_flower_non_repr_priv *entry;
++ 
++ 	entry = nfp_flower_non_repr_priv_lookup(app, netdev);
++ 	if (!entry)
++ 		return;
++ 
++ 	__nfp_flower_non_repr_priv_put(entry);
++ }
++ 
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  static enum nfp_repr_type
+  nfp_flower_repr_get_type_and_port(struct nfp_app *app, u32 port_id, u8 *port)
+  {
+@@@ -586,8 -738,30 +751,30 @@@ static int nfp_flower_init(struct nfp_a
+  		goto err_cleanup_metadata;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (app_priv->flower_ext_feats & NFP_FL_FEATS_FLOW_MOD) {
++ 		/* Tell the firmware that the driver supports flow merging. */
++ 		err = nfp_rtsym_write_le(app->pf->rtbl,
++ 					 "_abi_flower_merge_hint_enable", 1);
++ 		if (!err) {
++ 			app_priv->flower_ext_feats |= NFP_FL_FEATS_FLOW_MERGE;
++ 			nfp_flower_internal_port_init(app_priv);
++ 		} else if (err == -ENOENT) {
++ 			nfp_warn(app->cpp, "Flow merge not supported by FW.\n");
++ 		} else {
++ 			goto err_lag_clean;
++ 		}
++ 	} else {
++ 		nfp_warn(app->cpp, "Flow mod/merge not supported by FW.\n");
++ 	}
++ 
++ 	INIT_LIST_HEAD(&app_priv->indr_block_cb_priv);
++ 	INIT_LIST_HEAD(&app_priv->non_repr_priv);
++ 
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  	return 0;
+  
+ -err_lag_clean:
+ -	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG)
+ -		nfp_flower_lag_cleanup(&app_priv->nfp_lag);
+  err_cleanup_metadata:
+  	nfp_flower_metadata_cleanup(app);
+  err_free_app_priv:
+@@@ -689,13 -860,32 +879,25 @@@ static int nfp_flower_start(struct nfp_
+  }
+  
+  static void nfp_flower_stop(struct nfp_app *app)
+ -{
+ -	nfp_tunnel_config_stop(app);
+ -}
+ -
+ -static int
+ -nfp_flower_netdev_event(struct nfp_app *app, struct net_device *netdev,
+ -			unsigned long event, void *ptr)
+  {
+  	struct nfp_flower_priv *app_priv = app->priv;
+ -	int ret;
+  
+ -	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
+ -		ret = nfp_flower_lag_netdev_event(app_priv, netdev, event, ptr);
+ -		if (ret & NOTIFY_STOP_MASK)
+ -			return ret;
+ -	}
+ +	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG)
+ +		unregister_netdevice_notifier(&app_priv->nfp_lag.lag_nb);
+  
+++<<<<<<< HEAD
+ +	nfp_tunnel_config_stop(app);
+++=======
++ 	ret = nfp_flower_reg_indir_block_handler(app, netdev, event);
++ 	if (ret & NOTIFY_STOP_MASK)
++ 		return ret;
++ 
++ 	ret = nfp_flower_internal_port_event_handler(app, netdev, event);
++ 	if (ret & NOTIFY_STOP_MASK)
++ 		return ret;
++ 
++ 	return nfp_tunnel_mac_event_handler(app, netdev, event, ptr);
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  }
+  
+  const struct nfp_app_type app_flower = {
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4,485bdc0e1c20..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -163,6 -151,11 +173,14 @@@ struct nfp_fl_internal_ports 
+   * @reify_wait_queue:	wait queue for repr reify response counting
+   * @mtu_conf:		Configuration of repr MTU value
+   * @nfp_lag:		Link aggregation data block
+++<<<<<<< HEAD
+++=======
++  * @indr_block_cb_priv:	List of priv data passed to indirect block cbs
++  * @non_repr_priv:	List of offloaded non-repr ports and their priv data
++  * @active_mem_unit:	Current active memory unit for flower rules
++  * @total_mem_units:	Total number of available memory units for flower rules
++  * @internal_ports:	Internal port ids used in offloaded rules
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+   */
+  struct nfp_flower_priv {
+  	struct nfp_app *app;
+@@@ -193,6 -178,11 +211,14 @@@
+  	wait_queue_head_t reify_wait_queue;
+  	struct nfp_mtu_conf mtu_conf;
+  	struct nfp_fl_lag nfp_lag;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head indr_block_cb_priv;
++ 	struct list_head non_repr_priv;
++ 	unsigned int active_mem_unit;
++ 	unsigned int total_mem_units;
++ 	struct nfp_fl_internal_ports internal_ports;
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  };
+  
+  /**
+@@@ -246,16 -261,24 +272,37 @@@ struct nfp_fl_stats_frame 
+  	__be64 stats_cookie;
+  };
+  
+++<<<<<<< HEAD
+ +static inline unsigned long nfp_flower_fl_key(unsigned long tc_flower_cookie)
+ +{
+ +#if BITS_PER_LONG == 64
+ +	return tc_flower_cookie * NFP_FLOWER_GOLDEN_RATIO_64;
+ +#else
+ +	return tc_flower_cookie * NFP_FLOWER_GOLDEN_RATIO_32;
+ +#endif
+ +}
+ +
+ +int nfp_flower_metadata_init(struct nfp_app *app);
+++=======
++ static inline bool
++ nfp_flower_internal_port_can_offload(struct nfp_app *app,
++ 				     struct net_device *netdev)
++ {
++ 	struct nfp_flower_priv *app_priv = app->priv;
++ 
++ 	if (!(app_priv->flower_ext_feats & NFP_FL_FEATS_FLOW_MERGE))
++ 		return false;
++ 	if (!netdev->rtnl_link_ops)
++ 		return false;
++ 	if (!strcmp(netdev->rtnl_link_ops->kind, "openvswitch"))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ int nfp_flower_metadata_init(struct nfp_app *app, u64 host_ctx_count,
++ 			     unsigned int host_ctx_split);
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  void nfp_flower_metadata_cleanup(struct nfp_app *app);
+  
+  int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+@@@ -293,6 -320,27 +340,19 @@@ int nfp_flower_setup_tc_egress_cb(enum 
+  void nfp_flower_lag_init(struct nfp_fl_lag *lag);
+  void nfp_flower_lag_cleanup(struct nfp_fl_lag *lag);
+  int nfp_flower_lag_reset(struct nfp_fl_lag *lag);
+ -int nfp_flower_lag_netdev_event(struct nfp_flower_priv *priv,
+ -				struct net_device *netdev,
+ -				unsigned long event, void *ptr);
+  bool nfp_flower_lag_unprocessed_msg(struct nfp_app *app, struct sk_buff *skb);
+ -int nfp_flower_lag_populate_pre_action(struct nfp_app *app,
+ -				       struct net_device *master,
+ -				       struct nfp_fl_pre_lag *pre_act);
+ -int nfp_flower_lag_get_output_id(struct nfp_app *app,
+ -				 struct net_device *master);
+ -int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
+ -				       struct net_device *netdev,
+ -				       unsigned long event);
+  
+++<<<<<<< HEAD
+++=======
++ void
++ __nfp_flower_non_repr_priv_get(struct nfp_flower_non_repr_priv *non_repr_priv);
++ struct nfp_flower_non_repr_priv *
++ nfp_flower_non_repr_priv_get(struct nfp_app *app, struct net_device *netdev);
++ void
++ __nfp_flower_non_repr_priv_put(struct nfp_flower_non_repr_priv *non_repr_priv);
++ void
++ nfp_flower_non_repr_priv_put(struct nfp_app *app, struct net_device *netdev);
++ u32 nfp_flower_get_port_id_from_netdev(struct nfp_app *app,
++ 				       struct net_device *netdev);
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  #endif
+diff --cc drivers/net/ethernet/netronome/nfp/flower/match.c
+index 17acb8cc6044,bfa4bf34911d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/match.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/match.c
+@@@ -325,11 -326,13 +325,20 @@@ int nfp_flower_compile_flow_match(struc
+  				  struct nfp_fl_payload *nfp_flow,
+  				  enum nfp_flower_tun_type tun_type)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_repr *netdev_repr;
+++=======
++ 	u32 port_id;
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  	int err;
+  	u8 *ext;
+  	u8 *msk;
+  
+++<<<<<<< HEAD
+++=======
++ 	port_id = nfp_flower_get_port_id_from_netdev(app, netdev);
++ 
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  	memset(nfp_flow->unmasked_data, 0, key_ls->key_size);
+  	memset(nfp_flow->mask_data, 0, key_ls->key_size);
+  
+@@@ -357,15 -357,13 +366,23 @@@
+  
+  	/* Populate Exact Port data. */
+  	err = nfp_flower_compile_port((struct nfp_flower_in_port *)ext,
+++<<<<<<< HEAD
+ +				      nfp_repr_get_port_id(netdev),
+ +				      false, tun_type);
+++=======
++ 				      port_id, false, tun_type);
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  	if (err)
+  		return err;
+  
+  	/* Populate Mask Port Data. */
+  	err = nfp_flower_compile_port((struct nfp_flower_in_port *)msk,
+++<<<<<<< HEAD
+ +				      nfp_repr_get_port_id(netdev),
+ +				      true, tun_type);
+++=======
++ 				      port_id, true, tun_type);
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+  	if (err)
+  		return err;
+  
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 050fdefa9950,af406e6cff98..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -695,3 -632,132 +695,135 @@@ int nfp_flower_setup_tc(struct nfp_app 
+  		return -EOPNOTSUPP;
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct nfp_flower_indr_block_cb_priv {
++ 	struct net_device *netdev;
++ 	struct nfp_app *app;
++ 	struct list_head list;
++ };
++ 
++ static struct nfp_flower_indr_block_cb_priv *
++ nfp_flower_indr_block_cb_priv_lookup(struct nfp_app *app,
++ 				     struct net_device *netdev)
++ {
++ 	struct nfp_flower_indr_block_cb_priv *cb_priv;
++ 	struct nfp_flower_priv *priv = app->priv;
++ 
++ 	/* All callback list access should be protected by RTNL. */
++ 	ASSERT_RTNL();
++ 
++ 	list_for_each_entry(cb_priv, &priv->indr_block_cb_priv, list)
++ 		if (cb_priv->netdev == netdev)
++ 			return cb_priv;
++ 
++ 	return NULL;
++ }
++ 
++ static int nfp_flower_setup_indr_block_cb(enum tc_setup_type type,
++ 					  void *type_data, void *cb_priv)
++ {
++ 	struct nfp_flower_indr_block_cb_priv *priv = cb_priv;
++ 	struct tc_cls_flower_offload *flower = type_data;
++ 
++ 	if (flower->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSFLOWER:
++ 		return nfp_flower_repr_offload(priv->app, priv->netdev,
++ 					       type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int
++ nfp_flower_setup_indr_tc_block(struct net_device *netdev, struct nfp_app *app,
++ 			       struct tc_block_offload *f)
++ {
++ 	struct nfp_flower_indr_block_cb_priv *cb_priv;
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int err;
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS &&
++ 	    !(f->binder_type == TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS &&
++ 	      nfp_flower_internal_port_can_offload(app, netdev)))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		cb_priv = kmalloc(sizeof(*cb_priv), GFP_KERNEL);
++ 		if (!cb_priv)
++ 			return -ENOMEM;
++ 
++ 		cb_priv->netdev = netdev;
++ 		cb_priv->app = app;
++ 		list_add(&cb_priv->list, &priv->indr_block_cb_priv);
++ 
++ 		err = tcf_block_cb_register(f->block,
++ 					    nfp_flower_setup_indr_block_cb,
++ 					    cb_priv, cb_priv, f->extack);
++ 		if (err) {
++ 			list_del(&cb_priv->list);
++ 			kfree(cb_priv);
++ 		}
++ 
++ 		return err;
++ 	case TC_BLOCK_UNBIND:
++ 		cb_priv = nfp_flower_indr_block_cb_priv_lookup(app, netdev);
++ 		if (!cb_priv)
++ 			return -ENOENT;
++ 
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_flower_setup_indr_block_cb,
++ 					cb_priv);
++ 		list_del(&cb_priv->list);
++ 		kfree(cb_priv);
++ 
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ nfp_flower_indr_setup_tc_cb(struct net_device *netdev, void *cb_priv,
++ 			    enum tc_setup_type type, void *type_data)
++ {
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		return nfp_flower_setup_indr_tc_block(netdev, cb_priv,
++ 						      type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
++ 				       struct net_device *netdev,
++ 				       unsigned long event)
++ {
++ 	int err;
++ 
++ 	if (!nfp_fl_is_netdev_to_offload(netdev))
++ 		return NOTIFY_OK;
++ 
++ 	if (event == NETDEV_REGISTER) {
++ 		err = __tc_indr_block_cb_register(netdev, app,
++ 						  nfp_flower_indr_setup_tc_cb,
++ 						  app);
++ 		if (err)
++ 			nfp_flower_cmsg_warn(app,
++ 					     "Indirect block reg failed - %s\n",
++ 					     netdev->name);
++ 	} else if (event == NETDEV_UNREGISTER) {
++ 		__tc_indr_block_cb_unregister(netdev,
++ 					      nfp_flower_indr_setup_tc_cb, app);
++ 	}
++ 
++ 	return NOTIFY_OK;
++ }
+++>>>>>>> 4d12ba42787b (nfp: flower: allow offloading of matches on 'internal' ports)
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 062d7040a0dc..e29ce3210be3 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -463,6 +463,13 @@ enum nfp_flower_cmsg_port_vnic_type {
+ #define NFP_FLOWER_CMSG_PORT_PCIE_Q		GENMASK(5, 0)
+ #define NFP_FLOWER_CMSG_PORT_PHYS_PORT_NUM	GENMASK(7, 0)
+ 
++static inline u32 nfp_flower_internal_port_get_port_id(u8 internal_port)
++{
++	return FIELD_PREP(NFP_FLOWER_CMSG_PORT_PHYS_PORT_NUM, internal_port) |
++		FIELD_PREP(NFP_FLOWER_CMSG_PORT_TYPE,
++			   NFP_FLOWER_CMSG_PORT_TYPE_OTHER_PORT);
++}
++
+ static inline u32 nfp_flower_cmsg_phys_port(u8 phys_port)
+ {
+ 	return FIELD_PREP(NFP_FLOWER_CMSG_PORT_PHYS_PORT_NUM, phys_port) |
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/match.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
