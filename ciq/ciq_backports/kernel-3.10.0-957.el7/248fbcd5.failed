@@ -1,0 +1,138 @@
+x86/efi-bgrt: Switch pr_err() to pr_debug() for invalid BGRT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] efi-bgrt: Switch pr_err() to pr_debug() for invalid BGRT (Lenny Szubowicz) [1464241]
+Rebuild_FUZZ: 96.55%
+commit-author Matt Fleming <matt.fleming@intel.com>
+commit 248fbcd5aee00f6519a12c5ed3bc3dc0f5e84de5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/248fbcd5.failed
+
+It's totally legitimate, per the ACPI spec, for the firmware to
+set the BGRT 'status' field to zero to indicate that the BGRT
+image isn't being displayed, and we shouldn't be printing an
+error message in that case because it's just noise for users. So
+swap pr_err() for pr_debug().
+
+However, Josh points that out it still makes sense to test the
+validity of the upper 7 bits of the 'status' field, since
+they're marked as "reserved" in the spec and must be zero. If
+firmware violates this it really *is* an error.
+
+	Reported-by: Tom Yan <tom.ty89@gmail.com>
+	Tested-by: Tom Yan <tom.ty89@gmail.com>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+	Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matthew Garrett <mjg59@srcf.ucam.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1438936621-5215-2-git-send-email-matt@codeblueprint.co.uk
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 248fbcd5aee00f6519a12c5ed3bc3dc0f5e84de5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi-bgrt.c
+diff --cc arch/x86/platform/efi/efi-bgrt.c
+index d39e7aeea75f,ea48449b2e63..000000000000
+--- a/arch/x86/platform/efi/efi-bgrt.c
++++ b/arch/x86/platform/efi/efi-bgrt.c
+@@@ -39,35 -40,71 +39,58 @@@ void __init efi_bgrt_init(void
+  	if (ACPI_FAILURE(status))
+  		return;
+  
+ -	if (bgrt_tab->header.length < sizeof(*bgrt_tab)) {
+ -		pr_err("Ignoring BGRT: invalid length %u (expected %zu)\n",
+ -		       bgrt_tab->header.length, sizeof(*bgrt_tab));
+ +	if (bgrt_tab->header.length < sizeof(*bgrt_tab))
+  		return;
+ -	}
+ -	if (bgrt_tab->version != 1) {
+ -		pr_err("Ignoring BGRT: invalid version %u (expected 1)\n",
+ -		       bgrt_tab->version);
+ +	if (bgrt_tab->version != 1 || bgrt_tab->status != 1)
+ +		return;
+++<<<<<<< HEAD
+ +	if (bgrt_tab->image_type != 0 || !bgrt_tab->image_address)
+  		return;
+++=======
++ 	}
++ 	if (bgrt_tab->status & 0xfe) {
++ 		pr_err("Ignoring BGRT: reserved status bits are non-zero %u\n",
++ 		       bgrt_tab->status);
++ 		return;
++ 	}
++ 	if (bgrt_tab->status != 1) {
++ 		pr_debug("Ignoring BGRT: invalid status %u (expected 1)\n",
++ 			 bgrt_tab->status);
++ 		return;
++ 	}
++ 	if (bgrt_tab->image_type != 0) {
++ 		pr_err("Ignoring BGRT: invalid image type %u (expected 0)\n",
++ 		       bgrt_tab->image_type);
++ 		return;
++ 	}
++ 	if (!bgrt_tab->image_address) {
++ 		pr_err("Ignoring BGRT: null image address\n");
++ 		return;
++ 	}
+++>>>>>>> 248fbcd5aee0 (x86/efi-bgrt: Switch pr_err() to pr_debug() for invalid BGRT)
+  
+ -	image = efi_lookup_mapped_addr(bgrt_tab->image_address);
+ +	image = ioremap(bgrt_tab->image_address, sizeof(bmp_header));
+  	if (!image) {
+ -		image = early_ioremap(bgrt_tab->image_address,
+ -				       sizeof(bmp_header));
+ -		ioremapped = true;
+ -		if (!image) {
+ -			pr_err("Ignoring BGRT: failed to map image header memory\n");
+ -			return;
+ -		}
+ +		pr_err("Ignoring BGRT: failed to map image header memory\n");
+ +		return;
+  	}
+  
+ -	memcpy_fromio(&bmp_header, image, sizeof(bmp_header));
+ -	if (ioremapped)
+ -		early_iounmap(image, sizeof(bmp_header));
+ +	memcpy(&bmp_header, image, sizeof(bmp_header));
+ +	iounmap(image);
+  	bgrt_image_size = bmp_header.size;
+  
+ -	bgrt_image = kmalloc(bgrt_image_size, GFP_KERNEL | __GFP_NOWARN);
+ -	if (!bgrt_image) {
+ -		pr_err("Ignoring BGRT: failed to allocate memory for image (wanted %zu bytes)\n",
+ -		       bgrt_image_size);
+ +	bgrt_image = kmalloc(bgrt_image_size, GFP_KERNEL);
+ +	if (!bgrt_image)
+  		return;
+ -	}
+  
+ -	if (ioremapped) {
+ -		image = early_ioremap(bgrt_tab->image_address,
+ -				       bmp_header.size);
+ -		if (!image) {
+ -			pr_err("Ignoring BGRT: failed to map image memory\n");
+ -			kfree(bgrt_image);
+ -			bgrt_image = NULL;
+ -			return;
+ -		}
+ +	image = ioremap(bgrt_tab->image_address, bmp_header.size);
+ +	if (!image) {
+ +		pr_err("Ignoring BGRT: failed to map image memory\n");
+ +		kfree(bgrt_image);
+ +		bgrt_image = NULL;
+ +		return;
+  	}
+  
+ -	memcpy_fromio(bgrt_image, image, bgrt_image_size);
+ -	if (ioremapped)
+ -		early_iounmap(image, bmp_header.size);
+ +	memcpy(bgrt_image, image, bgrt_image_size);
+ +	iounmap(image);
+  }
+* Unmerged path arch/x86/platform/efi/efi-bgrt.c
