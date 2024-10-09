@@ -1,0 +1,570 @@
+timer: Reduce timer migration overhead if disabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit bc7a34b8b9ebfb0f4b8a35a72a0b134fd6c5ef50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bc7a34b8.failed
+
+Eric reported that the timer_migration sysctl is not really nice
+performance wise as it needs to check at every timer insertion whether
+the feature is enabled or not. Further the check does not live in the
+timer code, so we have an extra function call which checks an extra
+cache line to figure out that it is disabled.
+
+We can do better and store that information in the per cpu (hr)timer
+bases. I pondered to use a static key, but that's a nightmare to
+update from the nohz code and the timer base cache line is hot anyway
+when we select a timer base.
+
+The old logic enabled the timer migration unconditionally if
+CONFIG_NO_HZ was set even if nohz was disabled on the kernel command
+line.
+
+With this modification, we start off with migration disabled. The user
+visible sysctl is still set to enabled. If the kernel switches to NOHZ
+migration is enabled, if the user did not disable it via the sysctl
+prior to the switch. If nohz=off is on the kernel command line,
+migration stays disabled no matter what.
+
+Before:
+  47.76%  hog       [.] main
+  14.84%  [kernel]  [k] _raw_spin_lock_irqsave
+   9.55%  [kernel]  [k] _raw_spin_unlock_irqrestore
+   6.71%  [kernel]  [k] mod_timer
+   6.24%  [kernel]  [k] lock_timer_base.isra.38
+   3.76%  [kernel]  [k] detach_if_pending
+   3.71%  [kernel]  [k] del_timer
+   2.50%  [kernel]  [k] internal_add_timer
+   1.51%  [kernel]  [k] get_nohz_timer_target
+   1.28%  [kernel]  [k] __internal_add_timer
+   0.78%  [kernel]  [k] timerfn
+   0.48%  [kernel]  [k] wake_up_nohz_cpu
+
+After:
+  48.10%  hog       [.] main
+  15.25%  [kernel]  [k] _raw_spin_lock_irqsave
+   9.76%  [kernel]  [k] _raw_spin_unlock_irqrestore
+   6.50%  [kernel]  [k] mod_timer
+   6.44%  [kernel]  [k] lock_timer_base.isra.38
+   3.87%  [kernel]  [k] detach_if_pending
+   3.80%  [kernel]  [k] del_timer
+   2.67%  [kernel]  [k] internal_add_timer
+   1.33%  [kernel]  [k] __internal_add_timer
+   0.73%  [kernel]  [k] timerfn
+   0.54%  [kernel]  [k] wake_up_nohz_cpu
+
+
+	Reported-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Joonwoo Park <joonwoop@codeaurora.org>
+	Cc: Wenbo Wang <wenbo.wang@memblaze.com>
+Link: http://lkml.kernel.org/r/20150526224512.127050787@linutronix.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit bc7a34b8b9ebfb0f4b8a35a72a0b134fd6c5ef50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hrtimer.h
+#	kernel/hrtimer.c
+#	kernel/sched/core.c
+#	kernel/sysctl.c
+#	kernel/time/tick-internal.h
+#	kernel/time/tick-sched.c
+#	kernel/timer.c
+diff --cc include/linux/hrtimer.h
+index cc981460a2c7,69551020bb97..000000000000
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@@ -164,12 -158,16 +164,17 @@@ enum  hrtimer_base_type 
+   * struct hrtimer_cpu_base - the per cpu clock bases
+   * @lock:		lock protecting the base and associated clock bases
+   *			and timers
+ - * @seq:		seqcount around __run_hrtimer
+ - * @running:		pointer to the currently running hrtimer
+ - * @cpu:		cpu number
+   * @active_bases:	Bitfield to mark bases with active timers
+++<<<<<<< HEAD
+ + * @clock_was_set:	Sequence counter of clock was set events
+ + *			Note that in RHEL7 clock_was_set is upstream's
+ + *			clock_was_set_seq (KABI).
+++=======
++  * @clock_was_set_seq:	Sequence counter of clock was set events
++  * @migration_enabled:	The migration of hrtimers to other cpus is enabled
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+   * @expires_next:	absolute time of the next event which was scheduled
+   *			via clock_set_next_event()
+ - * @next_timer:		Pointer to the first expiring timer
+ - * @in_hrtirq:		hrtimer_interrupt() is currently executing
+   * @hres_active:	State of high resolution mode
+   * @hang_detected:	The last hrtimer interrupt detected a hang
+   * @nr_events:		Total number of hrtimer interrupt events
+@@@ -182,21 -182,25 +187,26 @@@
+   */
+  struct hrtimer_cpu_base {
+  	raw_spinlock_t			lock;
+ -	seqcount_t			seq;
+ -	struct hrtimer			*running;
+ -	unsigned int			cpu;
+  	unsigned int			active_bases;
+++<<<<<<< HEAD
+ +	unsigned int			clock_was_set; /* clock_was_set_seq */
+++=======
++ 	unsigned int			clock_was_set_seq;
++ 	bool				migration_enabled;
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+  #ifdef CONFIG_HIGH_RES_TIMERS
+ -	unsigned int			in_hrtirq	: 1,
+ -					hres_active	: 1,
+ -					hang_detected	: 1;
+  	ktime_t				expires_next;
+ -	struct hrtimer			*next_timer;
+ -	unsigned int			nr_events;
+ -	unsigned int			nr_retries;
+ -	unsigned int			nr_hangs;
+ -	unsigned int			max_hang_time;
+ +	int				hres_active;
+ +	int				hang_detected;
+ +	unsigned long			nr_events;
+ +	unsigned long			nr_retries;
+ +	unsigned long			nr_hangs;
+ +	ktime_t				max_hang_time;
+  #endif
+  	struct hrtimer_clock_base	clock_base[HRTIMER_MAX_CLOCK_BASES];
+ -} ____cacheline_aligned;
+ +	RH_KABI_EXTEND(int cpu)
+ +	RH_KABI_EXTEND(int in_hrtirq)
+ +};
+  
+  static inline void hrtimer_set_expires(struct hrtimer *timer, ktime_t time)
+  {
+diff --cc kernel/hrtimer.c
+index ecbe27cbadd0,6115f4df119b..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -189,14 -202,13 +207,19 @@@ static inline struct hrtimer_clock_bas
+  switch_hrtimer_base(struct hrtimer *timer, struct hrtimer_clock_base *base,
+  		    int pinned)
+  {
++ 	struct hrtimer_cpu_base *new_cpu_base, *this_base;
+  	struct hrtimer_clock_base *new_base;
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +	struct hrtimer_cpu_base *new_cpu_base;
+ +	int this_cpu = smp_processor_id();
+ +	int cpu = hrtimer_get_target(this_cpu, pinned);
+++=======
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled):kernel/time/hrtimer.c
+  	int basenum = base->index;
+  
++ 	this_base = this_cpu_ptr(&hrtimer_bases);
++ 	new_cpu_base = get_target_base(this_base, pinned);
+  again:
+- 	new_cpu_base = &per_cpu(hrtimer_bases, cpu);
+  	new_base = &new_cpu_base->clock_base[basenum];
+  
+  	if (base != new_base) {
+diff --cc kernel/sched/core.c
+index 1a5e18b224eb,e9f25ce70c77..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -636,11 -574,10 +636,14 @@@ void resched_cpu(int cpu
+   */
+  int get_nohz_timer_target(void)
+  {
+- 	int cpu = smp_processor_id();
+- 	int i;
++ 	int i, cpu = smp_processor_id();
+  	struct sched_domain *sd;
+  
+++<<<<<<< HEAD
+ +	if (!idle_cpu(cpu) && is_housekeeping_cpu(cpu))
+++=======
++ 	if (!idle_cpu(cpu))
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+  		return cpu;
+  
+  	rcu_read_lock();
+diff --cc kernel/sysctl.c
+index 85160497ef48,b13e9d2de302..000000000000
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@@ -376,26 -349,6 +376,29 @@@ static struct ctl_table kern_table[] = 
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec,
+  	},
+++<<<<<<< HEAD
+ +	{
+ +		.procname	= "timer_migration",
+ +		.data		= &sysctl_timer_migration,
+ +		.maxlen		= sizeof(unsigned int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec_minmax,
+ +		.extra1		= &zero,
+ +		.extra2		= &one,
+ +	},
+ +#ifdef CONFIG_SCHEDSTATS
+ +	{
+ +		.procname	= "sched_schedstats",
+ +		.data		= NULL,
+ +		.maxlen		= sizeof(unsigned int),
+ +		.mode		= 0644,
+ +		.proc_handler	= sysctl_schedstats,
+ +		.extra1		= &zero,
+ +		.extra2		= &one,
+ +	},
+ +#endif /* CONFIG_SCHEDSTATS */
+++=======
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+  #endif /* CONFIG_SMP */
+  #ifdef CONFIG_NUMA_BALANCING
+  	{
+diff --cc kernel/time/tick-internal.h
+index 74ad669ea929,2edde84744df..000000000000
+--- a/kernel/time/tick-internal.h
++++ b/kernel/time/tick-internal.h
+@@@ -147,20 -89,78 +147,36 @@@ static inline void tick_set_periodic_ha
+  {
+  	dev->event_handler = tick_handle_periodic;
+  }
+ -# endif /* !CONFIG_GENERIC_CLOCKEVENTS_BROADCAST */
+ +#endif /* !BROADCAST */
+  
+ -#else /* !GENERIC_CLOCKEVENTS: */
+ -static inline void tick_suspend(void) { }
+ -static inline void tick_resume(void) { }
+ -#endif /* !GENERIC_CLOCKEVENTS */
+ +/*
+ + * Check, if the device is functional or a dummy for broadcast
+ + */
+ +static inline int tick_device_is_functional(struct clock_event_device *dev)
+ +{
+ +	return !(dev->features & CLOCK_EVT_FEAT_DUMMY);
+ +}
+  
+ -/* Oneshot related functions */
+ -#ifdef CONFIG_TICK_ONESHOT
+ -extern void tick_setup_oneshot(struct clock_event_device *newdev,
+ -			       void (*handler)(struct clock_event_device *),
+ -			       ktime_t nextevt);
+ -extern int tick_program_event(ktime_t expires, int force);
+ -extern void tick_oneshot_notify(void);
+ -extern int tick_switch_to_oneshot(void (*handler)(struct clock_event_device *));
+ -extern void tick_resume_oneshot(void);
+ -static inline bool tick_oneshot_possible(void) { return true; }
+ -extern int tick_oneshot_mode_active(void);
+ -extern void tick_clock_notify(void);
+ -extern int tick_check_oneshot_change(int allow_nohz);
+ -extern int tick_init_highres(void);
+ -#else /* !CONFIG_TICK_ONESHOT: */
+ -static inline
+ -void tick_setup_oneshot(struct clock_event_device *newdev,
+ -			void (*handler)(struct clock_event_device *),
+ -			ktime_t nextevt) { BUG(); }
+ -static inline void tick_resume_oneshot(void) { BUG(); }
+ -static inline int tick_program_event(ktime_t expires, int force) { return 0; }
+ -static inline void tick_oneshot_notify(void) { }
+ -static inline bool tick_oneshot_possible(void) { return false; }
+ -static inline int tick_oneshot_mode_active(void) { return 0; }
+ -static inline void tick_clock_notify(void) { }
+ -static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
+ -#endif /* !CONFIG_TICK_ONESHOT */
+ -
+ -/* Functions related to oneshot broadcasting */
+ -#if defined(CONFIG_GENERIC_CLOCKEVENTS_BROADCAST) && defined(CONFIG_TICK_ONESHOT)
+ -extern void tick_broadcast_setup_oneshot(struct clock_event_device *bc);
+ -extern void tick_broadcast_switch_to_oneshot(void);
+ -extern void tick_shutdown_broadcast_oneshot(unsigned int cpu);
+ -extern int tick_broadcast_oneshot_active(void);
+ -extern void tick_check_oneshot_broadcast_this_cpu(void);
+ -bool tick_broadcast_oneshot_available(void);
+ -extern struct cpumask *tick_get_broadcast_oneshot_mask(void);
+ -#else /* !(BROADCAST && ONESHOT): */
+ -static inline void tick_broadcast_setup_oneshot(struct clock_event_device *bc) { BUG(); }
+ -static inline void tick_broadcast_switch_to_oneshot(void) { }
+ -static inline void tick_shutdown_broadcast_oneshot(unsigned int cpu) { }
+ -static inline int tick_broadcast_oneshot_active(void) { return 0; }
+ -static inline void tick_check_oneshot_broadcast_this_cpu(void) { }
+ -static inline bool tick_broadcast_oneshot_available(void) { return tick_oneshot_possible(); }
+ -#endif /* !(BROADCAST && ONESHOT) */
+ -
+ -/* NO_HZ_FULL internal */
+ -#ifdef CONFIG_NO_HZ_FULL
+ -extern void tick_nohz_init(void);
+ -# else
+ -static inline void tick_nohz_init(void) { }
+  #endif
+  
+++<<<<<<< HEAD
+ +int __clockevents_update_freq(struct clock_event_device *dev, u32 freq);
+ +extern void do_timer(unsigned long ticks);
+ +extern void update_wall_time(void);
+++=======
++ #ifdef CONFIG_NO_HZ_COMMON
++ extern unsigned long tick_nohz_active;
++ #else
++ #define tick_nohz_active (0)
++ #endif
++ 
++ #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
++ extern void timers_update_migration(void);
++ #else
++ static inline void timers_update_migration(void) { }
++ #endif
++ 
++ DECLARE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases);
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+  
+  extern u64 get_next_timer_interrupt(unsigned long basej, u64 basem);
+diff --cc kernel/time/tick-sched.c
+index 85c7fe06eace,b1cb01699355..000000000000
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@@ -397,8 -398,8 +397,13 @@@ void __init tick_nohz_init(void
+  /*
+   * NO HZ enabled ?
+   */
+++<<<<<<< HEAD
+ +static bool tick_nohz_enabled __read_mostly  = true;
+ +int tick_nohz_active  __read_mostly;
+++=======
++ static int tick_nohz_enabled __read_mostly  = 1;
++ unsigned long tick_nohz_active  __read_mostly;
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+  /*
+   * Enable / Disable tickless mode
+   */
+@@@ -1044,7 -1042,8 +1057,12 @@@ static inline void tick_check_nohz_this
+  #else
+  
+  static inline void tick_nohz_switch_to_nohz(void) { }
+++<<<<<<< HEAD
+ +static inline void tick_check_nohz_this_cpu(void) { }
+++=======
++ static inline void tick_nohz_irq_enter(void) { }
++ static inline void tick_nohz_activate(struct tick_sched *ts, int mode) { }
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled)
+  
+  #endif /* CONFIG_NO_HZ_COMMON */
+  
+diff --cc kernel/timer.c
+index 032a9a53e430,343142ed996a..000000000000
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@@ -81,42 -83,67 +81,96 @@@ struct tvec_base 
+  	unsigned long timer_jiffies;
+  	unsigned long next_timer;
+  	unsigned long active_timers;
+++<<<<<<< HEAD:kernel/timer.c
+++=======
++ 	unsigned long all_timers;
++ 	int cpu;
++ 	bool migration_enabled;
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled):kernel/time/timer.c
+  	struct tvec_root tv1;
+  	struct tvec tv2;
+  	struct tvec tv3;
+  	struct tvec tv4;
+  	struct tvec tv5;
+ +	RH_KABI_EXTEND(unsigned long all_timers)
+  } ____cacheline_aligned;
+  
+ +struct tvec_base boot_tvec_bases;
+ +EXPORT_SYMBOL(boot_tvec_bases);
+ +static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;
+  
+ -static DEFINE_PER_CPU(struct tvec_base, tvec_bases);
+ +/* Functions below help us manage 'deferrable' flag */
+ +static inline unsigned int tbase_get_deferrable(struct tvec_base *base)
+ +{
+ +	return ((unsigned int)(unsigned long)base & TIMER_DEFERRABLE);
+ +}
+ +
+ +static inline unsigned int tbase_get_irqsafe(struct tvec_base *base)
+ +{
+ +	return ((unsigned int)(unsigned long)base & TIMER_IRQSAFE);
+ +}
+ +
+ +static inline struct tvec_base *tbase_get_base(struct tvec_base *base)
+ +{
+ +	return ((struct tvec_base *)((unsigned long)base & ~TIMER_FLAG_MASK));
+ +}
+ +
+ +static inline void
+ +timer_set_base(struct timer_list *timer, struct tvec_base *new_base)
+ +{
+ +	unsigned long flags = (unsigned long)timer->base & TIMER_FLAG_MASK;
+ +
+ +	timer->base = (struct tvec_base *)((unsigned long)(new_base) | flags);
+ +}
+  
++ #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
++ unsigned int sysctl_timer_migration = 1;
++ 
++ void timers_update_migration(void)
++ {
++ 	bool on = sysctl_timer_migration && tick_nohz_active;
++ 	unsigned int cpu;
++ 
++ 	/* Avoid the loop, if nothing to update */
++ 	if (this_cpu_read(tvec_bases.migration_enabled) == on)
++ 		return;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		per_cpu(tvec_bases.migration_enabled, cpu) = on;
++ 		per_cpu(hrtimer_bases.migration_enabled, cpu) = on;
++ 	}
++ }
++ 
++ int timer_migration_handler(struct ctl_table *table, int write,
++ 			    void __user *buffer, size_t *lenp,
++ 			    loff_t *ppos)
++ {
++ 	static DEFINE_MUTEX(mutex);
++ 	int ret;
++ 
++ 	mutex_lock(&mutex);
++ 	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++ 	if (!ret && write)
++ 		timers_update_migration();
++ 	mutex_unlock(&mutex);
++ 	return ret;
++ }
++ 
++ static inline struct tvec_base *get_target_base(struct tvec_base *base,
++ 						int pinned)
++ {
++ 	if (pinned || !base->migration_enabled)
++ 		return this_cpu_ptr(&tvec_bases);
++ 	return per_cpu_ptr(&tvec_bases, get_nohz_timer_target());
++ }
++ #else
++ static inline struct tvec_base *get_target_base(struct tvec_base *base,
++ 						int pinned)
++ {
++ 	return this_cpu_ptr(&tvec_bases);
++ }
++ #endif
++ 
+  static unsigned long round_jiffies_common(unsigned long j, int cpu,
+  		bool force_up)
+  {
+@@@ -762,13 -782,7 +816,17 @@@ __mod_timer(struct timer_list *timer, u
+  
+  	debug_activate(timer, expires);
+  
+++<<<<<<< HEAD:kernel/timer.c
+ +	cpu = smp_processor_id();
+ +
+ +#if defined(CONFIG_NO_HZ_COMMON) && defined(CONFIG_SMP)
+ +	if (!pinned && get_sysctl_timer_migration())
+ +		cpu = get_nohz_timer_target();
+ +#endif
+ +	new_base = per_cpu(tvec_bases, cpu);
+++=======
++ 	new_base = get_target_base(base, pinned);
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled):kernel/time/timer.c
+  
+  	if (base != new_base) {
+  		/*
+@@@ -784,7 -799,8 +842,12 @@@
+  			spin_unlock(&base->lock);
+  			base = new_base;
+  			spin_lock(&base->lock);
+++<<<<<<< HEAD:kernel/timer.c
+ +			timer_set_base(timer, base);
+++=======
++ 			timer->flags &= ~TIMER_BASEMASK;
++ 			timer->flags |= base->cpu;
+++>>>>>>> bc7a34b8b9eb (timer: Reduce timer migration overhead if disabled):kernel/time/timer.c
+  		}
+  	}
+  
+* Unmerged path include/linux/hrtimer.h
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index 48954842f052..02ab10e978ba 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -54,24 +54,12 @@ extern unsigned int sysctl_numa_balancing_settle_count;
+ extern unsigned int sysctl_sched_migration_cost;
+ extern unsigned int sysctl_sched_nr_migrate;
+ extern unsigned int sysctl_sched_time_avg;
+-extern unsigned int sysctl_timer_migration;
+ extern unsigned int sysctl_sched_shares_window;
+ 
+ int sched_proc_update_handler(struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *length,
+ 		loff_t *ppos);
+ #endif
+-#ifdef CONFIG_SCHED_DEBUG
+-static inline unsigned int get_sysctl_timer_migration(void)
+-{
+-	return sysctl_timer_migration;
+-}
+-#else
+-static inline unsigned int get_sysctl_timer_migration(void)
+-{
+-	return 1;
+-}
+-#endif
+ 
+ /*
+  *  control realtime throttling:
+diff --git a/include/linux/timer.h b/include/linux/timer.h
+index aa5c4bb3d285..f6fb75a5e7f5 100644
+--- a/include/linux/timer.h
++++ b/include/linux/timer.h
+@@ -263,6 +263,15 @@ extern void run_local_timers(void);
+ struct hrtimer;
+ extern enum hrtimer_restart it_real_fn(struct hrtimer *);
+ 
++#if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
++#include <linux/sysctl.h>
++
++extern unsigned int sysctl_timer_migration;
++int timer_migration_handler(struct ctl_table *table, int write,
++			    void __user *buffer, size_t *lenp,
++			    loff_t *ppos);
++#endif
++
+ unsigned long __round_jiffies(unsigned long j, int cpu);
+ unsigned long __round_jiffies_relative(unsigned long j, int cpu);
+ unsigned long round_jiffies(unsigned long j);
+* Unmerged path kernel/hrtimer.c
+diff --git a/kernel/rcutree_plugin.h b/kernel/rcutree_plugin.h
+index 7eab8601304e..9011190990b8 100644
+--- a/kernel/rcutree_plugin.h
++++ b/kernel/rcutree_plugin.h
+@@ -1574,8 +1574,6 @@ module_param(rcu_idle_gp_delay, int, 0644);
+ static int rcu_idle_lazy_gp_delay = RCU_IDLE_LAZY_GP_DELAY;
+ module_param(rcu_idle_lazy_gp_delay, int, 0644);
+ 
+-extern int tick_nohz_active;
+-
+ /*
+  * Try to advance callbacks for all flavors of RCU on the current CPU.
+  * Afterwards, if there are any callbacks ready for immediate invocation,
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sysctl.c
+* Unmerged path kernel/time/tick-internal.h
+* Unmerged path kernel/time/tick-sched.c
+diff --git a/kernel/time/timer_list.c b/kernel/time/timer_list.c
+index 9174c0a7c787..fd4f602b1070 100644
+--- a/kernel/time/timer_list.c
++++ b/kernel/time/timer_list.c
+@@ -29,8 +29,6 @@ struct timer_list_iter {
+ 
+ typedef void (*print_fn_t)(struct seq_file *m, unsigned int *classes);
+ 
+-DECLARE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases);
+-
+ /*
+  * This allows printing both to /proc/timer_list and
+  * to the console (on SysRq-Q):
+* Unmerged path kernel/timer.c
