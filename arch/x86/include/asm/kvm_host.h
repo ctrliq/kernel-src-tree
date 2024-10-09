@@ -173,6 +173,13 @@ enum {
 #define PFERR_FETCH_MASK (1U << PFERR_FETCH_BIT)
 #define PFERR_PK_MASK (1U << PFERR_PK_BIT)
 
+/*
+ * The mask used to denote special SPTEs, which can be either MMIO SPTEs or
+ * Access Tracking SPTEs. We use bit 62 instead of bit 63 to avoid conflicting
+ * with the SVE bit in EPT PTEs.
+ */
+#define SPTE_SPECIAL_MASK (1ULL << 62)
+
 /* apic attention bits */
 #define KVM_APIC_CHECK_VAPIC	0
 /*
