@@ -1,0 +1,149 @@
+bpf: get kernel symbol addresses via syscall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sandipan Das <sandipan@linux.vnet.ibm.com>
+commit dbecd7388476aedeb66389febea84d5450d28773
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dbecd738.failed
+
+This adds new two new fields to struct bpf_prog_info. For
+multi-function programs, these fields can be used to pass
+a list of kernel symbol addresses for all functions in a
+given program to userspace using the bpf system call with
+the BPF_OBJ_GET_INFO_BY_FD command.
+
+When bpf_jit_kallsyms is enabled, we can get the address
+of the corresponding kernel symbol for a callee function
+and resolve the symbol's name. The address is determined
+by adding the value of the call instruction's imm field
+to __bpf_call_base. This offset gets assigned to the imm
+field by the verifier.
+
+For some architectures, such as powerpc64, the imm field
+is not large enough to hold this offset.
+
+We resolve this by:
+
+[1] Assigning the subprog id to the imm field of a call
+    instruction in the verifier instead of the offset of
+    the callee's symbol's address from __bpf_call_base.
+
+[2] Determining the address of a callee's corresponding
+    symbol by using the imm field as an index for the
+    list of kernel symbol addresses now available from
+    the program info.
+
+	Suggested-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Sandipan Das <sandipan@linux.vnet.ibm.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit dbecd7388476aedeb66389febea84d5450d28773)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/uapi/linux/bpf.h
+index 000f5ce2d064,0be90965867d..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -670,6 -2203,10 +670,13 @@@ struct bpf_prog_info 
+  	char name[BPF_OBJ_NAME_LEN];
+  	__u32 ifindex;
+  	__u32 gpl_compatible:1;
+++<<<<<<< HEAD
+++=======
++ 	__u64 netns_dev;
++ 	__u64 netns_ino;
++ 	__u32 nr_jited_ksyms;
++ 	__aligned_u64 jited_ksyms;
+++>>>>>>> dbecd7388476 (bpf: get kernel symbol addresses via syscall)
+  } __attribute__((aligned(8)));
+  
+  struct bpf_map_info {
+diff --cc kernel/bpf/syscall.c
+index f8f3ed8bef67,068a4fc79ddb..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1625,6 -1958,54 +1626,57 @@@ static int bpf_prog_get_info_by_fd(stru
+  			return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (bpf_prog_is_dev_bound(prog->aux)) {
++ 		err = bpf_prog_offload_info_fill(&info, prog);
++ 		if (err)
++ 			return err;
++ 		goto done;
++ 	}
++ 
++ 	/* NOTE: the following code is supposed to be skipped for offload.
++ 	 * bpf_prog_offload_info_fill() is the place to fill similar fields
++ 	 * for offload.
++ 	 */
++ 	ulen = info.jited_prog_len;
++ 	info.jited_prog_len = prog->jited_len;
++ 	if (info.jited_prog_len && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			uinsns = u64_to_user_ptr(info.jited_prog_insns);
++ 			ulen = min_t(u32, info.jited_prog_len, ulen);
++ 			if (copy_to_user(uinsns, prog->bpf_func, ulen))
++ 				return -EFAULT;
++ 		} else {
++ 			info.jited_prog_insns = 0;
++ 		}
++ 	}
++ 
++ 	ulen = info.nr_jited_ksyms;
++ 	info.nr_jited_ksyms = prog->aux->func_cnt;
++ 	if (info.nr_jited_ksyms && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			u64 __user *user_ksyms;
++ 			ulong ksym_addr;
++ 			u32 i;
++ 
++ 			/* copy the address of the kernel symbol
++ 			 * corresponding to each function
++ 			 */
++ 			ulen = min_t(u32, info.nr_jited_ksyms, ulen);
++ 			user_ksyms = u64_to_user_ptr(info.jited_ksyms);
++ 			for (i = 0; i < ulen; i++) {
++ 				ksym_addr = (ulong) prog->aux->func[i]->bpf_func;
++ 				ksym_addr &= PAGE_MASK;
++ 				if (put_user((u64) ksym_addr, &user_ksyms[i]))
++ 					return -EFAULT;
++ 			}
++ 		} else {
++ 			info.jited_ksyms = 0;
++ 		}
++ 	}
++ 
+++>>>>>>> dbecd7388476 (bpf: get kernel symbol addresses via syscall)
+  done:
+  	if (copy_to_user(uinfo, &info, info_len) ||
+  	    put_user(info_len, &uattr->info.info_len))
+diff --cc kernel/bpf/verifier.c
+index 30b85f23685a,8c4d9d0fd3ab..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -5395,10 -5431,7 +5393,14 @@@ static int jit_subprogs(struct bpf_veri
+  			continue;
+  		insn->off = env->insn_aux_data[i].call_imm;
+  		subprog = find_subprog(env, i + insn->off + 1);
+++<<<<<<< HEAD
+ +		addr  = (unsigned long)func[subprog + 1]->bpf_func;
+ +		addr &= PAGE_MASK;
+ +		insn->imm = (u64 (*)(u64, u64, u64, u64, u64))
+ +			    addr - __bpf_call_base;
+++=======
++ 		insn->imm = subprog;
+++>>>>>>> dbecd7388476 (bpf: get kernel symbol addresses via syscall)
+  	}
+  
+  	prog->jited = 1;
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
