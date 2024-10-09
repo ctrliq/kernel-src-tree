@@ -1,0 +1,1049 @@
+drm/i915: Use a mask when applying WaProgramL3SqcReg1Default
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Oscar Mateo <oscar.mateo@intel.com>
+commit 930a784d02339be437fec07b3bb7213bde0ed53b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/930a784d.failed
+
+Otherwise we are blasting other bits in GEN8_L3SQCREG1 that might be important
+(although we probably aren't at the moment because 0 seems to be the default
+for all the other bits).
+
+v2: Extra parentheses (Michel)
+
+Fixes: 050fc46 ("drm/i915:bxt: implement WaProgramL3SqcReg1DefaultForPerf")
+Fixes: 450174f ("drm/i915/chv: Tune L3 SQC credits based on actual latencies")
+	Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Imre Deak <imre.deak@intel.com>
+	Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/1508271945-14961-1-git-send-email-oscar.mateo@intel.com
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 930a784d02339be437fec07b3bb7213bde0ed53b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_engine_cs.c
+diff --cc drivers/gpu/drm/i915/intel_engine_cs.c
+index 958176de4eb5,a47a9c6bea52..000000000000
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@@ -509,3 -817,972 +509,975 @@@ void intel_engine_get_instdone(struct i
+  		break;
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int wa_add(struct drm_i915_private *dev_priv,
++ 		  i915_reg_t addr,
++ 		  const u32 mask, const u32 val)
++ {
++ 	const u32 idx = dev_priv->workarounds.count;
++ 
++ 	if (WARN_ON(idx >= I915_MAX_WA_REGS))
++ 		return -ENOSPC;
++ 
++ 	dev_priv->workarounds.reg[idx].addr = addr;
++ 	dev_priv->workarounds.reg[idx].value = val;
++ 	dev_priv->workarounds.reg[idx].mask = mask;
++ 
++ 	dev_priv->workarounds.count++;
++ 
++ 	return 0;
++ }
++ 
++ #define WA_REG(addr, mask, val) do { \
++ 		const int r = wa_add(dev_priv, (addr), (mask), (val)); \
++ 		if (r) \
++ 			return r; \
++ 	} while (0)
++ 
++ #define WA_SET_BIT_MASKED(addr, mask) \
++ 	WA_REG(addr, (mask), _MASKED_BIT_ENABLE(mask))
++ 
++ #define WA_CLR_BIT_MASKED(addr, mask) \
++ 	WA_REG(addr, (mask), _MASKED_BIT_DISABLE(mask))
++ 
++ #define WA_SET_FIELD_MASKED(addr, mask, value) \
++ 	WA_REG(addr, mask, _MASKED_FIELD(mask, value))
++ 
++ static int wa_ring_whitelist_reg(struct intel_engine_cs *engine,
++ 				 i915_reg_t reg)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	struct i915_workarounds *wa = &dev_priv->workarounds;
++ 	const uint32_t index = wa->hw_whitelist_count[engine->id];
++ 
++ 	if (WARN_ON(index >= RING_MAX_NONPRIV_SLOTS))
++ 		return -EINVAL;
++ 
++ 	I915_WRITE(RING_FORCE_TO_NONPRIV(engine->mmio_base, index),
++ 		   i915_mmio_reg_offset(reg));
++ 	wa->hw_whitelist_count[engine->id]++;
++ 
++ 	return 0;
++ }
++ 
++ static int gen8_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 
++ 	WA_SET_BIT_MASKED(INSTPM, INSTPM_FORCE_ORDERING);
++ 
++ 	/* WaDisableAsyncFlipPerfMode:bdw,chv */
++ 	WA_SET_BIT_MASKED(MI_MODE, ASYNC_FLIP_PERF_DISABLE);
++ 
++ 	/* WaDisablePartialInstShootdown:bdw,chv */
++ 	WA_SET_BIT_MASKED(GEN8_ROW_CHICKEN,
++ 			  PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE);
++ 
++ 	/* Use Force Non-Coherent whenever executing a 3D context. This is a
++ 	 * workaround for for a possible hang in the unlikely event a TLB
++ 	 * invalidation occurs during a PSD flush.
++ 	 */
++ 	/* WaForceEnableNonCoherent:bdw,chv */
++ 	/* WaHdcDisableFetchWhenMasked:bdw,chv */
++ 	WA_SET_BIT_MASKED(HDC_CHICKEN0,
++ 			  HDC_DONOT_FETCH_MEM_WHEN_MASKED |
++ 			  HDC_FORCE_NON_COHERENT);
++ 
++ 	/* From the Haswell PRM, Command Reference: Registers, CACHE_MODE_0:
++ 	 * "The Hierarchical Z RAW Stall Optimization allows non-overlapping
++ 	 *  polygons in the same 8x4 pixel/sample area to be processed without
++ 	 *  stalling waiting for the earlier ones to write to Hierarchical Z
++ 	 *  buffer."
++ 	 *
++ 	 * This optimization is off by default for BDW and CHV; turn it on.
++ 	 */
++ 	WA_CLR_BIT_MASKED(CACHE_MODE_0_GEN7, HIZ_RAW_STALL_OPT_DISABLE);
++ 
++ 	/* Wa4x4STCOptimizationDisable:bdw,chv */
++ 	WA_SET_BIT_MASKED(CACHE_MODE_1, GEN8_4x4_STC_OPTIMIZATION_DISABLE);
++ 
++ 	/*
++ 	 * BSpec recommends 8x4 when MSAA is used,
++ 	 * however in practice 16x4 seems fastest.
++ 	 *
++ 	 * Note that PS/WM thread counts depend on the WIZ hashing
++ 	 * disable bit, which we don't touch here, but it's good
++ 	 * to keep in mind (see 3DSTATE_PS and 3DSTATE_WM).
++ 	 */
++ 	WA_SET_FIELD_MASKED(GEN7_GT_MODE,
++ 			    GEN6_WIZ_HASHING_MASK,
++ 			    GEN6_WIZ_HASHING_16x4);
++ 
++ 	return 0;
++ }
++ 
++ static int bdw_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen8_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaDisableThreadStallDopClockGating:bdw (pre-production) */
++ 	WA_SET_BIT_MASKED(GEN8_ROW_CHICKEN, STALL_DOP_GATING_DISABLE);
++ 
++ 	/* WaDisableDopClockGating:bdw
++ 	 *
++ 	 * Also see the related UCGTCL1 write in broadwell_init_clock_gating()
++ 	 * to disable EUTC clock gating.
++ 	 */
++ 	WA_SET_BIT_MASKED(GEN7_ROW_CHICKEN2,
++ 			  DOP_CLOCK_GATING_DISABLE);
++ 
++ 	WA_SET_BIT_MASKED(HALF_SLICE_CHICKEN3,
++ 			  GEN8_SAMPLER_POWER_BYPASS_DIS);
++ 
++ 	WA_SET_BIT_MASKED(HDC_CHICKEN0,
++ 			  /* WaForceContextSaveRestoreNonCoherent:bdw */
++ 			  HDC_FORCE_CONTEXT_SAVE_RESTORE_NON_COHERENT |
++ 			  /* WaDisableFenceDestinationToSLM:bdw (pre-prod) */
++ 			  (IS_BDW_GT3(dev_priv) ? HDC_FENCE_DEST_SLM_DISABLE : 0));
++ 
++ 	return 0;
++ }
++ 
++ static int chv_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen8_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaDisableThreadStallDopClockGating:chv */
++ 	WA_SET_BIT_MASKED(GEN8_ROW_CHICKEN, STALL_DOP_GATING_DISABLE);
++ 
++ 	/* Improve HiZ throughput on CHV. */
++ 	WA_SET_BIT_MASKED(HIZ_CHICKEN, CHV_HZ_8X8_MODE_IN_1X);
++ 
++ 	return 0;
++ }
++ 
++ static int gen9_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	/* WaConextSwitchWithConcurrentTLBInvalidate:skl,bxt,kbl,glk,cfl */
++ 	I915_WRITE(GEN9_CSFE_CHICKEN1_RCS, _MASKED_BIT_ENABLE(GEN9_PREEMPT_GPGPU_SYNC_SWITCH_DISABLE));
++ 
++ 	/* WaEnableLbsSlaRetryTimerDecrement:skl,bxt,kbl,glk,cfl */
++ 	I915_WRITE(BDW_SCRATCH1, I915_READ(BDW_SCRATCH1) |
++ 		   GEN9_LBS_SLA_RETRY_TIMER_DECREMENT_ENABLE);
++ 
++ 	/* WaDisableKillLogic:bxt,skl,kbl */
++ 	if (!IS_COFFEELAKE(dev_priv))
++ 		I915_WRITE(GAM_ECOCHK, I915_READ(GAM_ECOCHK) |
++ 			   ECOCHK_DIS_TLB);
++ 
++ 	if (HAS_LLC(dev_priv)) {
++ 		/* WaCompressedResourceSamplerPbeMediaNewHashMode:skl,kbl
++ 		 *
++ 		 * Must match Display Engine. See
++ 		 * WaCompressedResourceDisplayNewHashMode.
++ 		 */
++ 		WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 				  GEN9_PBE_COMPRESSED_HASH_SELECTION);
++ 		WA_SET_BIT_MASKED(GEN9_HALF_SLICE_CHICKEN7,
++ 				  GEN9_SAMPLER_HASH_COMPRESSED_READ_ADDR);
++ 
++ 		I915_WRITE(MMCD_MISC_CTRL,
++ 			   I915_READ(MMCD_MISC_CTRL) |
++ 			   MMCD_PCLA |
++ 			   MMCD_HOTSPOT_EN);
++ 	}
++ 
++ 	/* WaClearFlowControlGpgpuContextSave:skl,bxt,kbl,glk,cfl */
++ 	/* WaDisablePartialInstShootdown:skl,bxt,kbl,glk,cfl */
++ 	WA_SET_BIT_MASKED(GEN8_ROW_CHICKEN,
++ 			  FLOW_CONTROL_ENABLE |
++ 			  PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE);
++ 
++ 	/* Syncing dependencies between camera and graphics:skl,bxt,kbl */
++ 	if (!IS_COFFEELAKE(dev_priv))
++ 		WA_SET_BIT_MASKED(HALF_SLICE_CHICKEN3,
++ 				  GEN9_DISABLE_OCL_OOB_SUPPRESS_LOGIC);
++ 
++ 	/* WaDisableDgMirrorFixInHalfSliceChicken5:bxt */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1))
++ 		WA_CLR_BIT_MASKED(GEN9_HALF_SLICE_CHICKEN5,
++ 				  GEN9_DG_MIRROR_FIX_ENABLE);
++ 
++ 	/* WaSetDisablePixMaskCammingAndRhwoInCommonSliceChicken:bxt */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1)) {
++ 		WA_SET_BIT_MASKED(GEN7_COMMON_SLICE_CHICKEN1,
++ 				  GEN9_RHWO_OPTIMIZATION_DISABLE);
++ 		/*
++ 		 * WA also requires GEN9_SLICE_COMMON_ECO_CHICKEN0[14:14] to be set
++ 		 * but we do that in per ctx batchbuffer as there is an issue
++ 		 * with this register not getting restored on ctx restore
++ 		 */
++ 	}
++ 
++ 	/* WaEnableYV12BugFixInHalfSliceChicken7:skl,bxt,kbl,glk,cfl */
++ 	/* WaEnableSamplerGPGPUPreemptionSupport:skl,bxt,kbl,cfl */
++ 	WA_SET_BIT_MASKED(GEN9_HALF_SLICE_CHICKEN7,
++ 			  GEN9_ENABLE_YV12_BUGFIX |
++ 			  GEN9_ENABLE_GPGPU_PREEMPTION);
++ 
++ 	/* Wa4x4STCOptimizationDisable:skl,bxt,kbl,glk,cfl */
++ 	/* WaDisablePartialResolveInVc:skl,bxt,kbl,cfl */
++ 	WA_SET_BIT_MASKED(CACHE_MODE_1, (GEN8_4x4_STC_OPTIMIZATION_DISABLE |
++ 					 GEN9_PARTIAL_RESOLVE_IN_VC_DISABLE));
++ 
++ 	/* WaCcsTlbPrefetchDisable:skl,bxt,kbl,glk,cfl */
++ 	WA_CLR_BIT_MASKED(GEN9_HALF_SLICE_CHICKEN5,
++ 			  GEN9_CCS_TLB_PREFETCH_ENABLE);
++ 
++ 	/* WaDisableMaskBasedCammingInRCC:bxt */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1))
++ 		WA_SET_BIT_MASKED(SLICE_ECO_CHICKEN0,
++ 				  PIXEL_MASK_CAMMING_DISABLE);
++ 
++ 	/* WaForceContextSaveRestoreNonCoherent:skl,bxt,kbl,cfl */
++ 	WA_SET_BIT_MASKED(HDC_CHICKEN0,
++ 			  HDC_FORCE_CONTEXT_SAVE_RESTORE_NON_COHERENT |
++ 			  HDC_FORCE_CSR_NON_COHERENT_OVR_DISABLE);
++ 
++ 	/* WaForceEnableNonCoherent and WaDisableHDCInvalidation are
++ 	 * both tied to WaForceContextSaveRestoreNonCoherent
++ 	 * in some hsds for skl. We keep the tie for all gen9. The
++ 	 * documentation is a bit hazy and so we want to get common behaviour,
++ 	 * even though there is no clear evidence we would need both on kbl/bxt.
++ 	 * This area has been source of system hangs so we play it safe
++ 	 * and mimic the skl regardless of what bspec says.
++ 	 *
++ 	 * Use Force Non-Coherent whenever executing a 3D context. This
++ 	 * is a workaround for a possible hang in the unlikely event
++ 	 * a TLB invalidation occurs during a PSD flush.
++ 	 */
++ 
++ 	/* WaForceEnableNonCoherent:skl,bxt,kbl,cfl */
++ 	WA_SET_BIT_MASKED(HDC_CHICKEN0,
++ 			  HDC_FORCE_NON_COHERENT);
++ 
++ 	/* WaDisableHDCInvalidation:skl,bxt,kbl,cfl */
++ 	I915_WRITE(GAM_ECOCHK, I915_READ(GAM_ECOCHK) |
++ 		   BDW_DISABLE_HDC_INVALIDATION);
++ 
++ 	/* WaDisableSamplerPowerBypassForSOPingPong:skl,bxt,kbl,cfl */
++ 	if (IS_SKYLAKE(dev_priv) ||
++ 	    IS_KABYLAKE(dev_priv) ||
++ 	    IS_COFFEELAKE(dev_priv) ||
++ 	    IS_BXT_REVID(dev_priv, 0, BXT_REVID_B0))
++ 		WA_SET_BIT_MASKED(HALF_SLICE_CHICKEN3,
++ 				  GEN8_SAMPLER_POWER_BYPASS_DIS);
++ 
++ 	/* WaDisableSTUnitPowerOptimization:skl,bxt,kbl,glk,cfl */
++ 	WA_SET_BIT_MASKED(HALF_SLICE_CHICKEN2, GEN8_ST_PO_DISABLE);
++ 
++ 	/* WaOCLCoherentLineFlush:skl,bxt,kbl,cfl */
++ 	I915_WRITE(GEN8_L3SQCREG4, (I915_READ(GEN8_L3SQCREG4) |
++ 				    GEN8_LQSC_FLUSH_COHERENT_LINES));
++ 
++ 	/*
++ 	 * Supporting preemption with fine-granularity requires changes in the
++ 	 * batch buffer programming. Since we can't break old userspace, we
++ 	 * need to set our default preemption level to safe value. Userspace is
++ 	 * still able to use more fine-grained preemption levels, since in
++ 	 * WaEnablePreemptionGranularityControlByUMD we're whitelisting the
++ 	 * per-ctx register. As such, WaDisable{3D,GPGPU}MidCmdPreemption are
++ 	 * not real HW workarounds, but merely a way to start using preemption
++ 	 * while maintaining old contract with userspace.
++ 	 */
++ 
++ 	/* WaDisable3DMidCmdPreemption:skl,bxt,glk,cfl,[cnl] */
++ 	WA_CLR_BIT_MASKED(GEN8_CS_CHICKEN1, GEN9_PREEMPT_3D_OBJECT_LEVEL);
++ 
++ 	/* WaDisableGPGPUMidCmdPreemption:skl,bxt,blk,cfl,[cnl] */
++ 	WA_SET_FIELD_MASKED(GEN8_CS_CHICKEN1, GEN9_PREEMPT_GPGPU_LEVEL_MASK,
++ 			    GEN9_PREEMPT_GPGPU_COMMAND_LEVEL);
++ 
++ 	/* WaVFEStateAfterPipeControlwithMediaStateClear:skl,bxt,glk,cfl */
++ 	ret = wa_ring_whitelist_reg(engine, GEN9_CTX_PREEMPT_REG);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaEnablePreemptionGranularityControlByUMD:skl,bxt,kbl,cfl,[cnl] */
++ 	I915_WRITE(GEN7_FF_SLICE_CS_CHICKEN1,
++ 		   _MASKED_BIT_ENABLE(GEN9_FFSC_PERCTX_PREEMPT_CTRL));
++ 	ret = wa_ring_whitelist_reg(engine, GEN8_CS_CHICKEN1);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaAllowUMDToModifyHDCChicken1:skl,bxt,kbl,glk,cfl */
++ 	ret = wa_ring_whitelist_reg(engine, GEN8_HDC_CHICKEN1);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return 0;
++ }
++ 
++ static int skl_tune_iz_hashing(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	u8 vals[3] = { 0, 0, 0 };
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < 3; i++) {
++ 		u8 ss;
++ 
++ 		/*
++ 		 * Only consider slices where one, and only one, subslice has 7
++ 		 * EUs
++ 		 */
++ 		if (!is_power_of_2(INTEL_INFO(dev_priv)->sseu.subslice_7eu[i]))
++ 			continue;
++ 
++ 		/*
++ 		 * subslice_7eu[i] != 0 (because of the check above) and
++ 		 * ss_max == 4 (maximum number of subslices possible per slice)
++ 		 *
++ 		 * ->    0 <= ss <= 3;
++ 		 */
++ 		ss = ffs(INTEL_INFO(dev_priv)->sseu.subslice_7eu[i]) - 1;
++ 		vals[i] = 3 - ss;
++ 	}
++ 
++ 	if (vals[0] == 0 && vals[1] == 0 && vals[2] == 0)
++ 		return 0;
++ 
++ 	/* Tune IZ hashing. See intel_device_info_runtime_init() */
++ 	WA_SET_FIELD_MASKED(GEN7_GT_MODE,
++ 			    GEN9_IZ_HASHING_MASK(2) |
++ 			    GEN9_IZ_HASHING_MASK(1) |
++ 			    GEN9_IZ_HASHING_MASK(0),
++ 			    GEN9_IZ_HASHING(2, vals[2]) |
++ 			    GEN9_IZ_HASHING(1, vals[1]) |
++ 			    GEN9_IZ_HASHING(0, vals[0]));
++ 
++ 	return 0;
++ }
++ 
++ static int skl_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen9_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaEnableGapsTsvCreditFix:skl */
++ 	I915_WRITE(GEN8_GARBCNTL, (I915_READ(GEN8_GARBCNTL) |
++ 				   GEN9_GAPS_TSV_CREDIT_DISABLE));
++ 
++ 	/* WaDisableGafsUnitClkGating:skl */
++ 	I915_WRITE(GEN7_UCGCTL4, (I915_READ(GEN7_UCGCTL4) |
++ 				  GEN8_EU_GAUNIT_CLOCK_GATE_DISABLE));
++ 
++ 	/* WaInPlaceDecompressionHang:skl */
++ 	if (IS_SKL_REVID(dev_priv, SKL_REVID_H0, REVID_FOREVER))
++ 		I915_WRITE(GEN9_GAMT_ECO_REG_RW_IA,
++ 			   (I915_READ(GEN9_GAMT_ECO_REG_RW_IA) |
++ 			    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS));
++ 
++ 	/* WaDisableLSQCROPERFforOCL:skl */
++ 	ret = wa_ring_whitelist_reg(engine, GEN8_L3SQCREG4);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return skl_tune_iz_hashing(engine);
++ }
++ 
++ static int bxt_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen9_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaStoreMultiplePTEenable:bxt */
++ 	/* This is a requirement according to Hardware specification */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1))
++ 		I915_WRITE(TILECTL, I915_READ(TILECTL) | TILECTL_TLBPF);
++ 
++ 	/* WaSetClckGatingDisableMedia:bxt */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1)) {
++ 		I915_WRITE(GEN7_MISCCPCTL, (I915_READ(GEN7_MISCCPCTL) &
++ 					    ~GEN8_DOP_CLOCK_GATE_MEDIA_ENABLE));
++ 	}
++ 
++ 	/* WaDisableThreadStallDopClockGating:bxt */
++ 	WA_SET_BIT_MASKED(GEN8_ROW_CHICKEN,
++ 			  STALL_DOP_GATING_DISABLE);
++ 
++ 	/* WaDisablePooledEuLoadBalancingFix:bxt */
++ 	if (IS_BXT_REVID(dev_priv, BXT_REVID_B0, REVID_FOREVER)) {
++ 		I915_WRITE(FF_SLICE_CS_CHICKEN2,
++ 			   _MASKED_BIT_ENABLE(GEN9_POOLED_EU_LOAD_BALANCING_FIX_DISABLE));
++ 	}
++ 
++ 	/* WaDisableSbeCacheDispatchPortSharing:bxt */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_B0)) {
++ 		WA_SET_BIT_MASKED(
++ 			GEN7_HALF_SLICE_CHICKEN1,
++ 			GEN7_SBE_SS_CACHE_DISPATCH_PORT_SHARING_DISABLE);
++ 	}
++ 
++ 	/* WaDisableObjectLevelPreemptionForTrifanOrPolygon:bxt */
++ 	/* WaDisableObjectLevelPreemptionForInstancedDraw:bxt */
++ 	/* WaDisableObjectLevelPreemtionForInstanceId:bxt */
++ 	/* WaDisableLSQCROPERFforOCL:bxt */
++ 	if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1)) {
++ 		ret = wa_ring_whitelist_reg(engine, GEN9_CS_DEBUG_MODE1);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = wa_ring_whitelist_reg(engine, GEN8_L3SQCREG4);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/* WaProgramL3SqcReg1DefaultForPerf:bxt */
++ 	if (IS_BXT_REVID(dev_priv, BXT_REVID_B0, REVID_FOREVER)) {
++ 		u32 val = I915_READ(GEN8_L3SQCREG1);
++ 		val &= ~L3_PRIO_CREDITS_MASK;
++ 		val |= L3_GENERAL_PRIO_CREDITS(62) | L3_HIGH_PRIO_CREDITS(2);
++ 		I915_WRITE(GEN8_L3SQCREG1, val);
++ 	}
++ 
++ 	/* WaToEnableHwFixForPushConstHWBug:bxt */
++ 	if (IS_BXT_REVID(dev_priv, BXT_REVID_C0, REVID_FOREVER))
++ 		WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 				  GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION);
++ 
++ 	/* WaInPlaceDecompressionHang:bxt */
++ 	if (IS_BXT_REVID(dev_priv, BXT_REVID_C0, REVID_FOREVER))
++ 		I915_WRITE(GEN9_GAMT_ECO_REG_RW_IA,
++ 			   (I915_READ(GEN9_GAMT_ECO_REG_RW_IA) |
++ 			    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS));
++ 
++ 	return 0;
++ }
++ 
++ static int cnl_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	/* WaDisableI2mCycleOnWRPort:cnl (pre-prod) */
++ 	if (IS_CNL_REVID(dev_priv, CNL_REVID_B0, CNL_REVID_B0))
++ 		I915_WRITE(GAMT_CHKN_BIT_REG,
++ 			   (I915_READ(GAMT_CHKN_BIT_REG) |
++ 			    GAMT_CHKN_DISABLE_I2M_CYCLE_ON_WR_PORT));
++ 
++ 	/* WaForceContextSaveRestoreNonCoherent:cnl */
++ 	WA_SET_BIT_MASKED(CNL_HDC_CHICKEN0,
++ 			  HDC_FORCE_CONTEXT_SAVE_RESTORE_NON_COHERENT);
++ 
++ 	/* WaThrottleEUPerfToAvoidTDBackPressure:cnl(pre-prod) */
++ 	if (IS_CNL_REVID(dev_priv, CNL_REVID_B0, CNL_REVID_B0))
++ 		WA_SET_BIT_MASKED(GEN8_ROW_CHICKEN, THROTTLE_12_5);
++ 
++ 	/* WaDisableReplayBufferBankArbitrationOptimization:cnl */
++ 	WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 			  GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION);
++ 
++ 	/* WaDisableEnhancedSBEVertexCaching:cnl (pre-prod) */
++ 	if (IS_CNL_REVID(dev_priv, 0, CNL_REVID_B0))
++ 		WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 				  GEN8_CSC2_SBE_VUE_CACHE_CONSERVATIVE);
++ 
++ 	/* WaInPlaceDecompressionHang:cnl */
++ 	I915_WRITE(GEN9_GAMT_ECO_REG_RW_IA,
++ 		   (I915_READ(GEN9_GAMT_ECO_REG_RW_IA) |
++ 		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS));
++ 
++ 	/* WaPushConstantDereferenceHoldDisable:cnl */
++ 	WA_SET_BIT_MASKED(GEN7_ROW_CHICKEN2, PUSH_CONSTANT_DEREF_DISABLE);
++ 
++ 	/* FtrEnableFastAnisoL1BankingFix: cnl */
++ 	WA_SET_BIT_MASKED(HALF_SLICE_CHICKEN3, CNL_FAST_ANISO_L1_BANKING_FIX);
++ 
++ 	/* WaDisable3DMidCmdPreemption:cnl */
++ 	WA_CLR_BIT_MASKED(GEN8_CS_CHICKEN1, GEN9_PREEMPT_3D_OBJECT_LEVEL);
++ 
++ 	/* WaDisableGPGPUMidCmdPreemption:cnl */
++ 	WA_SET_FIELD_MASKED(GEN8_CS_CHICKEN1, GEN9_PREEMPT_GPGPU_LEVEL_MASK,
++ 			    GEN9_PREEMPT_GPGPU_COMMAND_LEVEL);
++ 
++ 	/* WaEnablePreemptionGranularityControlByUMD:cnl */
++ 	I915_WRITE(GEN7_FF_SLICE_CS_CHICKEN1,
++ 		   _MASKED_BIT_ENABLE(GEN9_FFSC_PERCTX_PREEMPT_CTRL));
++ 	ret= wa_ring_whitelist_reg(engine, GEN8_CS_CHICKEN1);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return 0;
++ }
++ 
++ static int kbl_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen9_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaEnableGapsTsvCreditFix:kbl */
++ 	I915_WRITE(GEN8_GARBCNTL, (I915_READ(GEN8_GARBCNTL) |
++ 				   GEN9_GAPS_TSV_CREDIT_DISABLE));
++ 
++ 	/* WaDisableDynamicCreditSharing:kbl */
++ 	if (IS_KBL_REVID(dev_priv, 0, KBL_REVID_B0))
++ 		I915_WRITE(GAMT_CHKN_BIT_REG,
++ 			   (I915_READ(GAMT_CHKN_BIT_REG) |
++ 			    GAMT_CHKN_DISABLE_DYNAMIC_CREDIT_SHARING));
++ 
++ 	/* WaDisableFenceDestinationToSLM:kbl (pre-prod) */
++ 	if (IS_KBL_REVID(dev_priv, KBL_REVID_A0, KBL_REVID_A0))
++ 		WA_SET_BIT_MASKED(HDC_CHICKEN0,
++ 				  HDC_FENCE_DEST_SLM_DISABLE);
++ 
++ 	/* WaToEnableHwFixForPushConstHWBug:kbl */
++ 	if (IS_KBL_REVID(dev_priv, KBL_REVID_C0, REVID_FOREVER))
++ 		WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 				  GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION);
++ 
++ 	/* WaDisableGafsUnitClkGating:kbl */
++ 	I915_WRITE(GEN7_UCGCTL4, (I915_READ(GEN7_UCGCTL4) |
++ 				  GEN8_EU_GAUNIT_CLOCK_GATE_DISABLE));
++ 
++ 	/* WaDisableSbeCacheDispatchPortSharing:kbl */
++ 	WA_SET_BIT_MASKED(
++ 		GEN7_HALF_SLICE_CHICKEN1,
++ 		GEN7_SBE_SS_CACHE_DISPATCH_PORT_SHARING_DISABLE);
++ 
++ 	/* WaInPlaceDecompressionHang:kbl */
++ 	I915_WRITE(GEN9_GAMT_ECO_REG_RW_IA,
++ 		   (I915_READ(GEN9_GAMT_ECO_REG_RW_IA) |
++ 		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS));
++ 
++ 	/* WaDisableLSQCROPERFforOCL:kbl */
++ 	ret = wa_ring_whitelist_reg(engine, GEN8_L3SQCREG4);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return 0;
++ }
++ 
++ static int glk_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen9_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaToEnableHwFixForPushConstHWBug:glk */
++ 	WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 			  GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION);
++ 
++ 	return 0;
++ }
++ 
++ static int cfl_init_workarounds(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int ret;
++ 
++ 	ret = gen9_init_workarounds(engine);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* WaEnableGapsTsvCreditFix:cfl */
++ 	I915_WRITE(GEN8_GARBCNTL, (I915_READ(GEN8_GARBCNTL) |
++ 				   GEN9_GAPS_TSV_CREDIT_DISABLE));
++ 
++ 	/* WaToEnableHwFixForPushConstHWBug:cfl */
++ 	WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN2,
++ 			  GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION);
++ 
++ 	/* WaDisableGafsUnitClkGating:cfl */
++ 	I915_WRITE(GEN7_UCGCTL4, (I915_READ(GEN7_UCGCTL4) |
++ 				  GEN8_EU_GAUNIT_CLOCK_GATE_DISABLE));
++ 
++ 	/* WaDisableSbeCacheDispatchPortSharing:cfl */
++ 	WA_SET_BIT_MASKED(
++ 		GEN7_HALF_SLICE_CHICKEN1,
++ 		GEN7_SBE_SS_CACHE_DISPATCH_PORT_SHARING_DISABLE);
++ 
++ 	/* WaInPlaceDecompressionHang:cfl */
++ 	I915_WRITE(GEN9_GAMT_ECO_REG_RW_IA,
++ 		   (I915_READ(GEN9_GAMT_ECO_REG_RW_IA) |
++ 		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS));
++ 
++ 	return 0;
++ }
++ 
++ int init_workarounds_ring(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	int err;
++ 
++ 	WARN_ON(engine->id != RCS);
++ 
++ 	dev_priv->workarounds.count = 0;
++ 	dev_priv->workarounds.hw_whitelist_count[engine->id] = 0;
++ 
++ 	if (IS_BROADWELL(dev_priv))
++ 		err = bdw_init_workarounds(engine);
++ 	else if (IS_CHERRYVIEW(dev_priv))
++ 		err = chv_init_workarounds(engine);
++ 	else if (IS_SKYLAKE(dev_priv))
++ 		err =  skl_init_workarounds(engine);
++ 	else if (IS_BROXTON(dev_priv))
++ 		err = bxt_init_workarounds(engine);
++ 	else if (IS_KABYLAKE(dev_priv))
++ 		err = kbl_init_workarounds(engine);
++ 	else if (IS_GEMINILAKE(dev_priv))
++ 		err =  glk_init_workarounds(engine);
++ 	else if (IS_COFFEELAKE(dev_priv))
++ 		err = cfl_init_workarounds(engine);
++ 	else if (IS_CANNONLAKE(dev_priv))
++ 		err = cnl_init_workarounds(engine);
++ 	else
++ 		err = 0;
++ 	if (err)
++ 		return err;
++ 
++ 	DRM_DEBUG_DRIVER("%s: Number of context specific w/a: %d\n",
++ 			 engine->name, dev_priv->workarounds.count);
++ 	return 0;
++ }
++ 
++ int intel_ring_workarounds_emit(struct drm_i915_gem_request *req)
++ {
++ 	struct i915_workarounds *w = &req->i915->workarounds;
++ 	u32 *cs;
++ 	int ret, i;
++ 
++ 	if (w->count == 0)
++ 		return 0;
++ 
++ 	ret = req->engine->emit_flush(req, EMIT_BARRIER);
++ 	if (ret)
++ 		return ret;
++ 
++ 	cs = intel_ring_begin(req, (w->count * 2 + 2));
++ 	if (IS_ERR(cs))
++ 		return PTR_ERR(cs);
++ 
++ 	*cs++ = MI_LOAD_REGISTER_IMM(w->count);
++ 	for (i = 0; i < w->count; i++) {
++ 		*cs++ = i915_mmio_reg_offset(w->reg[i].addr);
++ 		*cs++ = w->reg[i].value;
++ 	}
++ 	*cs++ = MI_NOOP;
++ 
++ 	intel_ring_advance(req, cs);
++ 
++ 	ret = req->engine->emit_flush(req, EMIT_BARRIER);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return 0;
++ }
++ 
++ static bool ring_is_idle(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	bool idle = true;
++ 
++ 	intel_runtime_pm_get(dev_priv);
++ 
++ 	/* First check that no commands are left in the ring */
++ 	if ((I915_READ_HEAD(engine) & HEAD_ADDR) !=
++ 	    (I915_READ_TAIL(engine) & TAIL_ADDR))
++ 		idle = false;
++ 
++ 	/* No bit for gen2, so assume the CS parser is idle */
++ 	if (INTEL_GEN(dev_priv) > 2 && !(I915_READ_MODE(engine) & MODE_IDLE))
++ 		idle = false;
++ 
++ 	intel_runtime_pm_put(dev_priv);
++ 
++ 	return idle;
++ }
++ 
++ /**
++  * intel_engine_is_idle() - Report if the engine has finished process all work
++  * @engine: the intel_engine_cs
++  *
++  * Return true if there are no requests pending, nothing left to be submitted
++  * to hardware, and that the engine is idle.
++  */
++ bool intel_engine_is_idle(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 
++ 	/* More white lies, if wedged, hw state is inconsistent */
++ 	if (i915_terminally_wedged(&dev_priv->gpu_error))
++ 		return true;
++ 
++ 	/* Any inflight/incomplete requests? */
++ 	if (!i915_seqno_passed(intel_engine_get_seqno(engine),
++ 			       intel_engine_last_submit(engine)))
++ 		return false;
++ 
++ 	if (I915_SELFTEST_ONLY(engine->breadcrumbs.mock))
++ 		return true;
++ 
++ 	/* Interrupt/tasklet pending? */
++ 	if (test_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted))
++ 		return false;
++ 
++ 	/* Both ports drained, no more ELSP submission? */
++ 	if (port_request(&engine->execlists.port[0]))
++ 		return false;
++ 
++ 	/* ELSP is empty, but there are ready requests? */
++ 	if (READ_ONCE(engine->execlists.first))
++ 		return false;
++ 
++ 	/* Ring stopped? */
++ 	if (!ring_is_idle(engine))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ bool intel_engines_are_idle(struct drm_i915_private *dev_priv)
++ {
++ 	struct intel_engine_cs *engine;
++ 	enum intel_engine_id id;
++ 
++ 	if (READ_ONCE(dev_priv->gt.active_requests))
++ 		return false;
++ 
++ 	/* If the driver is wedged, HW state may be very inconsistent and
++ 	 * report that it is still busy, even though we have stopped using it.
++ 	 */
++ 	if (i915_terminally_wedged(&dev_priv->gpu_error))
++ 		return true;
++ 
++ 	for_each_engine(engine, dev_priv, id) {
++ 		if (!intel_engine_is_idle(engine))
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ void intel_engines_reset_default_submission(struct drm_i915_private *i915)
++ {
++ 	struct intel_engine_cs *engine;
++ 	enum intel_engine_id id;
++ 
++ 	for_each_engine(engine, i915, id)
++ 		engine->set_default_submission(engine);
++ }
++ 
++ void intel_engines_mark_idle(struct drm_i915_private *i915)
++ {
++ 	struct intel_engine_cs *engine;
++ 	enum intel_engine_id id;
++ 
++ 	for_each_engine(engine, i915, id) {
++ 		intel_engine_disarm_breadcrumbs(engine);
++ 		i915_gem_batch_pool_fini(&engine->batch_pool);
++ 		tasklet_kill(&engine->execlists.irq_tasklet);
++ 		engine->execlists.no_priolist = false;
++ 	}
++ }
++ 
++ bool intel_engine_can_store_dword(struct intel_engine_cs *engine)
++ {
++ 	switch (INTEL_GEN(engine->i915)) {
++ 	case 2:
++ 		return false; /* uses physical not virtual addresses */
++ 	case 3:
++ 		/* maybe only uses physical not virtual addresses */
++ 		return !(IS_I915G(engine->i915) || IS_I915GM(engine->i915));
++ 	case 6:
++ 		return engine->class != VIDEO_DECODE_CLASS; /* b0rked */
++ 	default:
++ 		return true;
++ 	}
++ }
++ 
++ static void print_request(struct drm_printer *m,
++ 			  struct drm_i915_gem_request *rq,
++ 			  const char *prefix)
++ {
++ 	drm_printf(m, "%s%x%s [%x:%x] prio=%d @ %dms: %s\n", prefix,
++ 		   rq->global_seqno,
++ 		   i915_gem_request_completed(rq) ? "!" : "",
++ 		   rq->ctx->hw_id, rq->fence.seqno,
++ 		   rq->priotree.priority,
++ 		   jiffies_to_msecs(jiffies - rq->emitted_jiffies),
++ 		   rq->timeline->common->name);
++ }
++ 
++ void intel_engine_dump(struct intel_engine_cs *engine, struct drm_printer *m)
++ {
++ 	struct intel_breadcrumbs * const b = &engine->breadcrumbs;
++ 	const struct intel_engine_execlists * const execlists = &engine->execlists;
++ 	struct i915_gpu_error * const error = &engine->i915->gpu_error;
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	struct drm_i915_gem_request *rq;
++ 	struct rb_node *rb;
++ 	u64 addr;
++ 
++ 	drm_printf(m, "%s\n", engine->name);
++ 	drm_printf(m, "\tcurrent seqno %x, last %x, hangcheck %x [%d ms], inflight %d\n",
++ 		   intel_engine_get_seqno(engine),
++ 		   intel_engine_last_submit(engine),
++ 		   engine->hangcheck.seqno,
++ 		   jiffies_to_msecs(jiffies - engine->hangcheck.action_timestamp),
++ 		   engine->timeline->inflight_seqnos);
++ 	drm_printf(m, "\tReset count: %d\n",
++ 		   i915_reset_engine_count(error, engine));
++ 
++ 	rcu_read_lock();
++ 
++ 	drm_printf(m, "\tRequests:\n");
++ 
++ 	rq = list_first_entry(&engine->timeline->requests,
++ 			      struct drm_i915_gem_request, link);
++ 	if (&rq->link != &engine->timeline->requests)
++ 		print_request(m, rq, "\t\tfirst  ");
++ 
++ 	rq = list_last_entry(&engine->timeline->requests,
++ 			     struct drm_i915_gem_request, link);
++ 	if (&rq->link != &engine->timeline->requests)
++ 		print_request(m, rq, "\t\tlast   ");
++ 
++ 	rq = i915_gem_find_active_request(engine);
++ 	if (rq) {
++ 		print_request(m, rq, "\t\tactive ");
++ 		drm_printf(m,
++ 			   "\t\t[head %04x, postfix %04x, tail %04x, batch 0x%08x_%08x]\n",
++ 			   rq->head, rq->postfix, rq->tail,
++ 			   rq->batch ? upper_32_bits(rq->batch->node.start) : ~0u,
++ 			   rq->batch ? lower_32_bits(rq->batch->node.start) : ~0u);
++ 	}
++ 
++ 	drm_printf(m, "\tRING_START: 0x%08x [0x%08x]\n",
++ 		   I915_READ(RING_START(engine->mmio_base)),
++ 		   rq ? i915_ggtt_offset(rq->ring->vma) : 0);
++ 	drm_printf(m, "\tRING_HEAD:  0x%08x [0x%08x]\n",
++ 		   I915_READ(RING_HEAD(engine->mmio_base)) & HEAD_ADDR,
++ 		   rq ? rq->ring->head : 0);
++ 	drm_printf(m, "\tRING_TAIL:  0x%08x [0x%08x]\n",
++ 		   I915_READ(RING_TAIL(engine->mmio_base)) & TAIL_ADDR,
++ 		   rq ? rq->ring->tail : 0);
++ 	drm_printf(m, "\tRING_CTL:   0x%08x [%s]\n",
++ 		   I915_READ(RING_CTL(engine->mmio_base)),
++ 		   I915_READ(RING_CTL(engine->mmio_base)) & (RING_WAIT | RING_WAIT_SEMAPHORE) ? "waiting" : "");
++ 
++ 	rcu_read_unlock();
++ 
++ 	addr = intel_engine_get_active_head(engine);
++ 	drm_printf(m, "\tACTHD:  0x%08x_%08x\n",
++ 		   upper_32_bits(addr), lower_32_bits(addr));
++ 	addr = intel_engine_get_last_batch_head(engine);
++ 	drm_printf(m, "\tBBADDR: 0x%08x_%08x\n",
++ 		   upper_32_bits(addr), lower_32_bits(addr));
++ 
++ 	if (i915_modparams.enable_execlists) {
++ 		const u32 *hws = &engine->status_page.page_addr[I915_HWS_CSB_BUF0_INDEX];
++ 		u32 ptr, read, write;
++ 		unsigned int idx;
++ 
++ 		drm_printf(m, "\tExeclist status: 0x%08x %08x\n",
++ 			   I915_READ(RING_EXECLIST_STATUS_LO(engine)),
++ 			   I915_READ(RING_EXECLIST_STATUS_HI(engine)));
++ 
++ 		ptr = I915_READ(RING_CONTEXT_STATUS_PTR(engine));
++ 		read = GEN8_CSB_READ_PTR(ptr);
++ 		write = GEN8_CSB_WRITE_PTR(ptr);
++ 		drm_printf(m, "\tExeclist CSB read %d [%d cached], write %d [%d from hws], interrupt posted? %s\n",
++ 			   read, execlists->csb_head,
++ 			   write,
++ 			   intel_read_status_page(engine, intel_hws_csb_write_index(engine->i915)),
++ 			   yesno(test_bit(ENGINE_IRQ_EXECLIST,
++ 					  &engine->irq_posted)));
++ 		if (read >= GEN8_CSB_ENTRIES)
++ 			read = 0;
++ 		if (write >= GEN8_CSB_ENTRIES)
++ 			write = 0;
++ 		if (read > write)
++ 			write += GEN8_CSB_ENTRIES;
++ 		while (read < write) {
++ 			idx = ++read % GEN8_CSB_ENTRIES;
++ 			drm_printf(m, "\tExeclist CSB[%d]: 0x%08x [0x%08x in hwsp], context: %d [%d in hwsp]\n",
++ 				   idx,
++ 				   I915_READ(RING_CONTEXT_STATUS_BUF_LO(engine, idx)),
++ 				   hws[idx * 2],
++ 				   I915_READ(RING_CONTEXT_STATUS_BUF_HI(engine, idx)),
++ 				   hws[idx * 2 + 1]);
++ 		}
++ 
++ 		rcu_read_lock();
++ 		for (idx = 0; idx < execlists_num_ports(execlists); idx++) {
++ 			unsigned int count;
++ 
++ 			rq = port_unpack(&execlists->port[idx], &count);
++ 			if (rq) {
++ 				drm_printf(m, "\t\tELSP[%d] count=%d, ",
++ 					   idx, count);
++ 				print_request(m, rq, "rq: ");
++ 			} else {
++ 				drm_printf(m, "\t\tELSP[%d] idle\n",
++ 					   idx);
++ 			}
++ 		}
++ 		rcu_read_unlock();
++ 	} else if (INTEL_GEN(dev_priv) > 6) {
++ 		drm_printf(m, "\tPP_DIR_BASE: 0x%08x\n",
++ 			   I915_READ(RING_PP_DIR_BASE(engine)));
++ 		drm_printf(m, "\tPP_DIR_BASE_READ: 0x%08x\n",
++ 			   I915_READ(RING_PP_DIR_BASE_READ(engine)));
++ 		drm_printf(m, "\tPP_DIR_DCLV: 0x%08x\n",
++ 			   I915_READ(RING_PP_DIR_DCLV(engine)));
++ 	}
++ 
++ 	spin_lock_irq(&engine->timeline->lock);
++ 	list_for_each_entry(rq, &engine->timeline->requests, link)
++ 		print_request(m, rq, "\t\tE ");
++ 	for (rb = execlists->first; rb; rb = rb_next(rb)) {
++ 		struct i915_priolist *p =
++ 			rb_entry(rb, typeof(*p), node);
++ 
++ 		list_for_each_entry(rq, &p->requests, priotree.link)
++ 			print_request(m, rq, "\t\tQ ");
++ 	}
++ 	spin_unlock_irq(&engine->timeline->lock);
++ 
++ 	spin_lock_irq(&b->rb_lock);
++ 	for (rb = rb_first(&b->waiters); rb; rb = rb_next(rb)) {
++ 		struct intel_wait *w = rb_entry(rb, typeof(*w), node);
++ 
++ 		drm_printf(m, "\t%s [%d] waiting for %x\n",
++ 			   w->tsk->comm, w->tsk->pid, w->seqno);
++ 	}
++ 	spin_unlock_irq(&b->rb_lock);
++ 
++ 	drm_printf(m, "\n");
++ }
++ 
++ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++ #include "selftests/mock_engine.c"
++ #endif
+++>>>>>>> 930a784d0233 (drm/i915: Use a mask when applying WaProgramL3SqcReg1Default)
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index c70c07a7b586..6daa93e9dca1 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -6137,6 +6137,7 @@ enum {
+  */
+ #define  L3_GENERAL_PRIO_CREDITS(x)		(((x) >> 1) << 19)
+ #define  L3_HIGH_PRIO_CREDITS(x)		(((x) >> 1) << 14)
++#define  L3_PRIO_CREDITS_MASK			((0x1f << 19) | (0x1f << 14))
+ 
+ #define GEN7_L3CNTLREG1				_MMIO(0xB01C)
+ #define  GEN7_WA_FOR_GEN7_L3_CONTROL			0x3C47FF8C
+* Unmerged path drivers/gpu/drm/i915/intel_engine_cs.c
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 3af22cf865f4..261e3c8f76d2 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -7145,14 +7145,17 @@ static void gen8_set_l3sqc_credits(struct drm_i915_private *dev_priv,
+ 				   int high_prio_credits)
+ {
+ 	u32 misccpctl;
++	u32 val;
+ 
+ 	/* WaTempDisableDOPClkGating:bdw */
+ 	misccpctl = I915_READ(GEN7_MISCCPCTL);
+ 	I915_WRITE(GEN7_MISCCPCTL, misccpctl & ~GEN7_DOP_CLOCK_GATE_ENABLE);
+ 
+-	I915_WRITE(GEN8_L3SQCREG1,
+-		   L3_GENERAL_PRIO_CREDITS(general_prio_credits) |
+-		   L3_HIGH_PRIO_CREDITS(high_prio_credits));
++	val = I915_READ(GEN8_L3SQCREG1);
++	val &= ~L3_PRIO_CREDITS_MASK;
++	val |= L3_GENERAL_PRIO_CREDITS(general_prio_credits);
++	val |= L3_HIGH_PRIO_CREDITS(high_prio_credits);
++	I915_WRITE(GEN8_L3SQCREG1, val);
+ 
+ 	/*
+ 	 * Wait at least 100 clocks before re-enabling clock gating.
