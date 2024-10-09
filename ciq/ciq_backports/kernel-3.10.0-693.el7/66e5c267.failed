@@ -1,0 +1,245 @@
+ieee802154: add netns support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Alexander Aring <aar@pengutronix.de>
+commit 66e5c2672cd11b9310008099faf6a4ffb9dfb6d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/66e5c267.failed
+
+This patch adds netns support for 802.15.4 subsystem. Most parts are
+copy&pasted from wireless subsystem, it has the identically userspace
+API.
+
+	Cc: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Reviewed-by: Stefan Schmidt <stefan@osg.samsung.com>
+	Signed-off-by: Alexander Aring <aar@pengutronix.de>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 66e5c2672cd11b9310008099faf6a4ffb9dfb6d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ieee802154/core.c
+diff --cc net/ieee802154/core.c
+index 8f134f68e35d,cb7176cd4cd6..000000000000
+--- a/net/ieee802154/core.c
++++ b/net/ieee802154/core.c
+@@@ -294,7 -355,11 +355,15 @@@ static int __init wpan_phy_class_init(v
+  	if (rc)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	rc = register_netdevice_notifier_rh(&cfg802154_netdev_notifier);
+++=======
++ 	rc = wpan_phy_sysfs_init();
++ 	if (rc)
++ 		goto err_sysfs;
++ 
++ 	rc = register_netdevice_notifier(&cfg802154_netdev_notifier);
+++>>>>>>> 66e5c2672cd1 (ieee802154: add netns support)
+  	if (rc)
+  		goto err_nl;
+  
+@@@ -312,9 -377,11 +381,11 @@@ err_ieee802154_nl
+  	ieee802154_nl_exit();
+  
+  err_notifier:
+ -	unregister_netdevice_notifier(&cfg802154_netdev_notifier);
+ +	unregister_netdevice_notifier_rh(&cfg802154_netdev_notifier);
+  err_nl:
+  	wpan_phy_sysfs_exit();
++ err_sysfs:
++ 	unregister_pernet_device(&cfg802154_pernet_ops);
+  err:
+  	return rc;
+  }
+@@@ -324,8 -391,9 +395,9 @@@ static void __exit wpan_phy_class_exit(
+  {
+  	nl802154_exit();
+  	ieee802154_nl_exit();
+ -	unregister_netdevice_notifier(&cfg802154_netdev_notifier);
+ +	unregister_netdevice_notifier_rh(&cfg802154_netdev_notifier);
+  	wpan_phy_sysfs_exit();
++ 	unregister_pernet_device(&cfg802154_pernet_ops);
+  }
+  module_exit(wpan_phy_class_exit);
+  
+diff --git a/include/net/cfg802154.h b/include/net/cfg802154.h
+index 74005be70eaf..c1d658ebe7de 100644
+--- a/include/net/cfg802154.h
++++ b/include/net/cfg802154.h
+@@ -217,9 +217,22 @@ struct wpan_phy {
+ 
+ 	struct device dev;
+ 
++	/* the network namespace this phy lives in currently */
++	possible_net_t _net;
++
+ 	char priv[0] __aligned(NETDEV_ALIGN);
+ };
+ 
++static inline struct net *wpan_phy_net(struct wpan_phy *wpan_phy)
++{
++	return read_pnet(&wpan_phy->_net);
++}
++
++static inline void wpan_phy_net_set(struct wpan_phy *wpan_phy, struct net *net)
++{
++	write_pnet(&wpan_phy->_net, net);
++}
++
+ struct ieee802154_addr {
+ 	u8 mode;
+ 	__le16 pan_id;
+diff --git a/include/net/nl802154.h b/include/net/nl802154.h
+index 7aad2fdfd16a..ddcee128f5d9 100644
+--- a/include/net/nl802154.h
++++ b/include/net/nl802154.h
+@@ -54,6 +54,8 @@ enum nl802154_commands {
+ 
+ 	NL802154_CMD_SET_ACKREQ_DEFAULT,
+ 
++	NL802154_CMD_SET_WPAN_PHY_NETNS,
++
+ 	/* add new commands above here */
+ 
+ #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
+@@ -126,6 +128,9 @@ enum nl802154_attrs {
+ 
+ 	NL802154_ATTR_PAD,
+ 
++	NL802154_ATTR_PID,
++	NL802154_ATTR_NETNS_FD,
++
+ 	/* add attributes here, update the policy in nl802154.c */
+ 
+ #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
+* Unmerged path net/ieee802154/core.c
+diff --git a/net/ieee802154/core.h b/net/ieee802154/core.h
+index 231fade959f3..81141f58d079 100644
+--- a/net/ieee802154/core.h
++++ b/net/ieee802154/core.h
+@@ -38,6 +38,8 @@ wpan_phy_to_rdev(struct wpan_phy *wpan_phy)
+ extern struct list_head cfg802154_rdev_list;
+ extern int cfg802154_rdev_list_generation;
+ 
++int cfg802154_switch_netns(struct cfg802154_registered_device *rdev,
++			   struct net *net);
+ /* free object */
+ void cfg802154_dev_free(struct cfg802154_registered_device *rdev);
+ struct cfg802154_registered_device *
+diff --git a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
+index 074831a06ec5..0a289ced1d31 100644
+--- a/net/ieee802154/nl802154.c
++++ b/net/ieee802154/nl802154.c
+@@ -80,7 +80,8 @@ __cfg802154_wpan_dev_from_attrs(struct net *netns, struct nlattr **attrs)
+ 	list_for_each_entry(rdev, &cfg802154_rdev_list, list) {
+ 		struct wpan_dev *wpan_dev;
+ 
+-		/* TODO netns compare */
++		if (wpan_phy_net(&rdev->wpan_phy) != netns)
++			continue;
+ 
+ 		if (have_wpan_dev_id && rdev->wpan_phy_idx != wpan_phy_idx)
+ 			continue;
+@@ -175,7 +176,8 @@ __cfg802154_rdev_from_attrs(struct net *netns, struct nlattr **attrs)
+ 	if (!rdev)
+ 		return ERR_PTR(-ENODEV);
+ 
+-	/* TODO netns compare */
++	if (netns != wpan_phy_net(&rdev->wpan_phy))
++		return ERR_PTR(-ENODEV);
+ 
+ 	return rdev;
+ }
+@@ -233,6 +235,8 @@ static const struct nla_policy nl802154_policy[NL802154_ATTR_MAX+1] = {
+ 
+ 	[NL802154_ATTR_ACKREQ_DEFAULT] = { .type = NLA_U8 },
+ 
++	[NL802154_ATTR_PID] = { .type = NLA_U32 },
++	[NL802154_ATTR_NETNS_FD] = { .type = NLA_U32 },
+ #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
+ 	[NL802154_ATTR_SEC_ENABLED] = { .type = NLA_U8, },
+ 	[NL802154_ATTR_SEC_OUT_LEVEL] = { .type = NLA_U32, },
+@@ -590,7 +594,6 @@ static int nl802154_dump_wpan_phy_parse(struct sk_buff *skb,
+ 		struct cfg802154_registered_device *rdev;
+ 		int ifidx = nla_get_u32(tb[NL802154_ATTR_IFINDEX]);
+ 
+-		/* TODO netns */
+ 		netdev = __dev_get_by_index(&init_net, ifidx);
+ 		if (!netdev)
+ 			return -ENODEV;
+@@ -629,7 +632,8 @@ nl802154_dump_wpan_phy(struct sk_buff *skb, struct netlink_callback *cb)
+ 	}
+ 
+ 	list_for_each_entry(rdev, &cfg802154_rdev_list, list) {
+-		/* TODO net ns compare */
++		if (!net_eq(wpan_phy_net(&rdev->wpan_phy), sock_net(skb->sk)))
++			continue;
+ 		if (++idx <= state->start)
+ 			continue;
+ 		if (state->filter_wpan_phy != -1 &&
+@@ -871,7 +875,8 @@ nl802154_dump_interface(struct sk_buff *skb, struct netlink_callback *cb)
+ 
+ 	rtnl_lock();
+ 	list_for_each_entry(rdev, &cfg802154_rdev_list, list) {
+-		/* TODO netns compare */
++		if (!net_eq(wpan_phy_net(&rdev->wpan_phy), sock_net(skb->sk)))
++			continue;
+ 		if (wp_idx < wp_start) {
+ 			wp_idx++;
+ 			continue;
+@@ -1271,6 +1276,37 @@ nl802154_set_ackreq_default(struct sk_buff *skb, struct genl_info *info)
+ 	return rdev_set_ackreq_default(rdev, wpan_dev, ackreq);
+ }
+ 
++static int nl802154_wpan_phy_netns(struct sk_buff *skb, struct genl_info *info)
++{
++	struct cfg802154_registered_device *rdev = info->user_ptr[0];
++	struct net *net;
++	int err;
++
++	if (info->attrs[NL802154_ATTR_PID]) {
++		u32 pid = nla_get_u32(info->attrs[NL802154_ATTR_PID]);
++
++		net = get_net_ns_by_pid(pid);
++	} else if (info->attrs[NL802154_ATTR_NETNS_FD]) {
++		u32 fd = nla_get_u32(info->attrs[NL802154_ATTR_NETNS_FD]);
++
++		net = get_net_ns_by_fd(fd);
++	} else {
++		return -EINVAL;
++	}
++
++	if (IS_ERR(net))
++		return PTR_ERR(net);
++
++	err = 0;
++
++	/* check if anything to do */
++	if (!net_eq(wpan_phy_net(&rdev->wpan_phy), net))
++		err = cfg802154_switch_netns(rdev, net);
++
++	put_net(net);
++	return err;
++}
++
+ #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
+ static const struct nla_policy nl802154_dev_addr_policy[NL802154_DEV_ADDR_ATTR_MAX + 1] = {
+ 	[NL802154_DEV_ADDR_ATTR_PAN_ID] = { .type = NLA_U16 },
+@@ -2261,6 +2297,14 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+ 	},
++	{
++		.cmd = NL802154_CMD_SET_WPAN_PHY_NETNS,
++		.doit = nl802154_wpan_phy_netns,
++		.policy = nl802154_policy,
++		.flags = GENL_ADMIN_PERM,
++		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
++				  NL802154_FLAG_NEED_RTNL,
++	},
+ 	{
+ 		.cmd = NL802154_CMD_SET_PAN_ID,
+ 		.doit = nl802154_set_pan_id,
