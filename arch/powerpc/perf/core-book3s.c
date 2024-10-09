@@ -1227,7 +1227,7 @@ static void power_pmu_enable(struct pmu *pmu)
 	 * Compute MMCR* values for the new set of events
 	 */
 	if (ppmu->compute_mmcr(cpuhw->events, cpuhw->n_events, hwc_index,
-			       cpuhw->mmcr)) {
+			       cpuhw->mmcr, cpuhw->event)) {
 		/* shouldn't ever get here */
 		printk(KERN_ERR "oops compute_mmcr failed\n");
 		goto out;
