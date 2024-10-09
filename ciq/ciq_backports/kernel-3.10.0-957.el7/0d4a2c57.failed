@@ -1,0 +1,387 @@
+drm/nouveau/kms: move display class instantiation to library
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 0d4a2c5767dc6136079b11ed45934143d309026e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0d4a2c57.failed
+
+This function is useful outside of DRM code.
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 0d4a2c5767dc6136079b11ed45934143d309026e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nv50_display.c
+diff --cc drivers/gpu/drm/nouveau/nv50_display.c
+index b4bd2b5f0988,f2156c8ca90f..000000000000
+--- a/drivers/gpu/drm/nouveau/nv50_display.c
++++ b/drivers/gpu/drm/nouveau/nv50_display.c
+@@@ -2042,6 -2085,37 +2042,40 @@@ nv50_head_atomic_check_view(struct nv50
+  }
+  
+  static void
+++<<<<<<< HEAD
+++=======
++ nv50_head_atomic_check_lut(struct nv50_head *head,
++ 			   struct nv50_head_atom *armh,
++ 			   struct nv50_head_atom *asyh)
++ {
++ 	struct nv50_disp *disp = nv50_disp(head->base.base.dev);
++ 
++ 	/* An I8 surface without an input LUT makes no sense, and
++ 	 * EVO will throw an error if you try.
++ 	 *
++ 	 * Legacy clients actually cause this due to the order in
++ 	 * which they call ioctls, so we will enable the LUT with
++ 	 * whatever contents the buffer already contains to avoid
++ 	 * triggering the error check.
++ 	 */
++ 	if (!asyh->state.gamma_lut && asyh->base.cpp != 1) {
++ 		asyh->lut.handle = 0;
++ 		asyh->clr.ilut = armh->lut.visible;
++ 		return;
++ 	}
++ 
++ 	if (disp->disp->object.oclass < GF110_DISP) {
++ 		asyh->lut.mode = (asyh->base.cpp == 1) ? 0 : 1;
++ 		asyh->set.ilut = true;
++ 	} else {
++ 		asyh->lut.mode = 7;
++ 		asyh->set.ilut = asyh->state.color_mgmt_changed;
++ 	}
++ 	asyh->lut.handle = disp->mast.base.vram.handle;
++ }
++ 
++ static void
+++>>>>>>> 0d4a2c5767dc (drm/nouveau/kms: move display class instantiation to library)
+  nv50_head_atomic_check_mode(struct nv50_head *head, struct nv50_head_atom *asyh)
+  {
+  	struct drm_display_mode *mode = &asyh->state.adjusted_mode;
+@@@ -2353,24 -2395,16 +2387,24 @@@ nv50_head_create(struct drm_device *dev
+  	drm_crtc_helper_add(crtc, &nv50_head_help);
+  	drm_mode_crtc_set_gamma_size(crtc, 256);
+  
+ -	for (i = 0; i < ARRAY_SIZE(head->lut.nvbo); i++) {
+ -		ret = nouveau_bo_new_pin_map(&drm->client, 1025 * 8, 0x100,
+ -					     TTM_PL_FLAG_VRAM,
+ -					     &head->lut.nvbo[i]);
+ +	ret = nouveau_bo_new(&drm->client, 8192, 0x100, TTM_PL_FLAG_VRAM,
+ +			     0, 0x0000, NULL, NULL, &head->base.lut.nvbo);
+ +	if (!ret) {
+ +		ret = nouveau_bo_pin(head->base.lut.nvbo, TTM_PL_FLAG_VRAM, true);
+ +		if (!ret) {
+ +			ret = nouveau_bo_map(head->base.lut.nvbo);
+ +			if (ret)
+ +				nouveau_bo_unpin(head->base.lut.nvbo);
+ +		}
+  		if (ret)
+ -			goto out;
+ +			nouveau_bo_ref(NULL, &head->base.lut.nvbo);
+  	}
+  
+ +	if (ret)
+ +		goto out;
+ +
+  	/* allocate overlay resources */
+- 	ret = nv50_oimm_create(device, disp->disp, index, &head->oimm);
++ 	ret = nv50_oimm_create(device, &disp->disp->object, index, &head->oimm);
+  	if (ret)
+  		goto out;
+  
+@@@ -2688,10 -2722,9 +2722,10 @@@ nv50_audio_enable(struct drm_encoder *e
+  	if (!drm_detect_monitor_audio(nv_connector->edid))
+  		return;
+  
+ +	drm_edid_to_eld(&nv_connector->base, nv_connector->edid);
+  	memcpy(args.data, nv_connector->base.eld, sizeof(args.data));
+  
+- 	nvif_mthd(disp->disp, 0, &args,
++ 	nvif_mthd(&disp->disp->object, 0, &args,
+  		  sizeof(args.base) + drm_eld_size(args.data));
+  }
+  
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/disp.h b/drivers/gpu/drm/nouveau/include/nvif/disp.h
+new file mode 100644
+index 000000000000..7c0eda375c01
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/include/nvif/disp.h
+@@ -0,0 +1,12 @@
++#ifndef __NVIF_DISP_H__
++#define __NVIF_DISP_H__
++#include <nvif/object.h>
++struct nvif_device;
++
++struct nvif_disp {
++	struct nvif_object object;
++};
++
++int nvif_disp_ctor(struct nvif_device *, s32 oclass, struct nvif_disp *);
++void nvif_disp_dtor(struct nvif_disp *);
++#endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/object.h b/drivers/gpu/drm/nouveau/include/nvif/object.h
+index 9e58b305b020..4d0460d5c800 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/object.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/object.h
+@@ -95,6 +95,22 @@ struct nvif_mclass {
+ 	ret;                                                                   \
+ })
+ 
++#define nvif_sclass(o,m,u) ({                                                  \
++	const typeof(m[0]) *_mclass = (m);                                     \
++	s32 _oclass = (u);                                                     \
++	int _cid;                                                              \
++	if (_oclass) {                                                         \
++		for (_cid = 0; _mclass[_cid].oclass; _cid++) {                 \
++			if (_mclass[_cid].oclass == _oclass)                   \
++				break;                                         \
++		}                                                              \
++		_cid = _mclass[_cid].oclass ? _cid : -ENOSYS;                  \
++	} else {                                                               \
++		_cid = nvif_mclass((o), _mclass);                              \
++	}                                                                      \
++	_cid;                                                                  \
++})
++
+ /*XXX*/
+ #include <core/object.h>
+ #define nvxx_object(a) ({                                                      \
+diff --git a/drivers/gpu/drm/nouveau/nouveau_connector.c b/drivers/gpu/drm/nouveau/nouveau_connector.c
+index c902a851eb51..ad169f3b7383 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_connector.c
++++ b/drivers/gpu/drm/nouveau/nouveau_connector.c
+@@ -151,7 +151,7 @@ nouveau_conn_atomic_set_property(struct drm_connector *connector,
+ 				/* ... except prior to G80, where the code
+ 				 * doesn't support such things.
+ 				 */
+-				if (disp->disp.oclass < NV50_DISP)
++				if (disp->disp.object.oclass < NV50_DISP)
+ 					return -EINVAL;
+ 				break;
+ 			default:
+@@ -260,7 +260,7 @@ nouveau_conn_reset(struct drm_connector *connector)
+ 	asyc->procamp.color_vibrance = 150;
+ 	asyc->procamp.vibrant_hue = 90;
+ 
+-	if (nouveau_display(connector->dev)->disp.oclass < NV50_DISP) {
++	if (nouveau_display(connector->dev)->disp.object.oclass < NV50_DISP) {
+ 		switch (connector->connector_type) {
+ 		case DRM_MODE_CONNECTOR_LVDS:
+ 			/* See note in nouveau_conn_atomic_set_property(). */
+@@ -314,7 +314,7 @@ nouveau_conn_attach_properties(struct drm_connector *connector)
+ 	case DRM_MODE_CONNECTOR_TV:
+ 		break;
+ 	case DRM_MODE_CONNECTOR_VGA:
+-		if (disp->disp.oclass < NV50_DISP)
++		if (disp->disp.object.oclass < NV50_DISP)
+ 			break; /* Can only scale on DFPs. */
+ 		/* Fall-through. */
+ 	default:
+@@ -1321,7 +1321,7 @@ nouveau_connector_create(struct drm_device *dev, int index)
+ 	}
+ 
+ 	/* HDMI 3D support */
+-	if ((disp->disp.oclass >= G82_DISP)
++	if ((disp->disp.object.oclass >= G82_DISP)
+ 	    && ((type == DRM_MODE_CONNECTOR_DisplayPort)
+ 		|| (type == DRM_MODE_CONNECTOR_eDP)
+ 		|| (type == DRM_MODE_CONNECTOR_HDMIA)))
+@@ -1343,7 +1343,7 @@ nouveau_connector_create(struct drm_device *dev, int index)
+ 	case DCB_CONNECTOR_LVDS_SPWG:
+ 	case DCB_CONNECTOR_eDP:
+ 		/* see note in nouveau_connector_set_property() */
+-		if (disp->disp.oclass < NV50_DISP) {
++		if (disp->disp.object.oclass < NV50_DISP) {
+ 			nv_connector->scaling_mode = DRM_MODE_SCALE_FULLSCREEN;
+ 			break;
+ 		}
+@@ -1366,8 +1366,8 @@ nouveau_connector_create(struct drm_device *dev, int index)
+ 		break;
+ 	}
+ 
+-	ret = nvif_notify_init(&disp->disp, nouveau_connector_hotplug, true,
+-			       NV04_DISP_NTFY_CONN,
++	ret = nvif_notify_init(&disp->disp.object, nouveau_connector_hotplug,
++			       true, NV04_DISP_NTFY_CONN,
+ 			       &(struct nvif_notify_conn_req_v0) {
+ 				.mask = NVIF_NOTIFY_CONN_V0_ANY,
+ 				.conn = index,
+diff --git a/drivers/gpu/drm/nouveau/nouveau_display.c b/drivers/gpu/drm/nouveau/nouveau_display.c
+index 2e7785f49e6d..261b5b71fdd2 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_display.c
++++ b/drivers/gpu/drm/nouveau/nouveau_display.c
+@@ -115,7 +115,7 @@ nouveau_display_scanoutpos_head(struct drm_crtc *crtc, int *vpos, int *hpos,
+ 	bool ret = false;
+ 
+ 	do {
+-		ret = nvif_mthd(&disp->disp, 0, &args, sizeof(args));
++		ret = nvif_mthd(&disp->disp.object, 0, &args, sizeof(args));
+ 		if (ret != 0)
+ 			return false;
+ 
+@@ -174,7 +174,7 @@ nouveau_display_vblank_init(struct drm_device *dev)
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+ 		struct nouveau_crtc *nv_crtc = nouveau_crtc(crtc);
+-		ret = nvif_notify_init(&disp->disp,
++		ret = nvif_notify_init(&disp->disp.object,
+ 				       nouveau_display_vblank_handler, false,
+ 				       NV04_DISP_NTFY_VBLANK,
+ 				       &(struct nvif_notify_head_req_v0) {
+@@ -455,10 +455,10 @@ nouveau_display_create_properties(struct drm_device *dev)
+ 	struct nouveau_display *disp = nouveau_display(dev);
+ 	int gen;
+ 
+-	if (disp->disp.oclass < NV50_DISP)
++	if (disp->disp.object.oclass < NV50_DISP)
+ 		gen = 0;
+ 	else
+-	if (disp->disp.oclass < GF110_DISP)
++	if (disp->disp.object.oclass < GF110_DISP)
+ 		gen = 1;
+ 	else
+ 		gen = 2;
+@@ -534,31 +534,10 @@ nouveau_display_create(struct drm_device *dev)
+ 	drm_kms_helper_poll_disable(dev);
+ 
+ 	if (nouveau_modeset != 2 && drm->vbios.dcb.entries) {
+-		static const u16 oclass[] = {
+-			GP102_DISP,
+-			GP100_DISP,
+-			GM200_DISP,
+-			GM107_DISP,
+-			GK110_DISP,
+-			GK104_DISP,
+-			GF110_DISP,
+-			GT214_DISP,
+-			GT206_DISP,
+-			GT200_DISP,
+-			G82_DISP,
+-			NV50_DISP,
+-			NV04_DISP,
+-		};
+-		int i;
+-
+-		for (i = 0, ret = -ENODEV; ret && i < ARRAY_SIZE(oclass); i++) {
+-			ret = nvif_object_init(&drm->client.device.object, 0,
+-					       oclass[i], NULL, 0, &disp->disp);
+-		}
+-
++		ret = nvif_disp_ctor(&drm->client.device, 0, &disp->disp);
+ 		if (ret == 0) {
+ 			nouveau_display_create_properties(dev);
+-			if (disp->disp.oclass < NV50_DISP)
++			if (disp->disp.object.oclass < NV50_DISP)
+ 				ret = nv04_display_create(dev);
+ 			else
+ 				ret = nv50_display_create(dev);
+@@ -612,7 +591,7 @@ nouveau_display_destroy(struct drm_device *dev)
+ 	if (disp->dtor)
+ 		disp->dtor(dev);
+ 
+-	nvif_object_fini(&disp->disp);
++	nvif_disp_dtor(&disp->disp);
+ 
+ 	nouveau_drm(dev)->display = NULL;
+ 	kfree(disp);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_display.h b/drivers/gpu/drm/nouveau/nouveau_display.h
+index 201aec2ea5b8..d00c54a76a85 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_display.h
++++ b/drivers/gpu/drm/nouveau/nouveau_display.h
+@@ -4,6 +4,7 @@
+ #include <subdev/mmu.h>
+ 
+ #include "nouveau_drv.h"
++#include <nvif/disp.h>
+ 
+ struct nouveau_framebuffer {
+ 	struct drm_framebuffer base;
+@@ -40,7 +41,7 @@ struct nouveau_display {
+ 	int  (*init)(struct drm_device *);
+ 	void (*fini)(struct drm_device *);
+ 
+-	struct nvif_object disp;
++	struct nvif_disp disp;
+ 
+ 	struct drm_property *dithering_mode;
+ 	struct drm_property *dithering_depth;
+* Unmerged path drivers/gpu/drm/nouveau/nv50_display.c
+diff --git a/drivers/gpu/drm/nouveau/nvif/Kbuild b/drivers/gpu/drm/nouveau/nvif/Kbuild
+index 067b5e9f5ec1..8c7f0b3f9866 100644
+--- a/drivers/gpu/drm/nouveau/nvif/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvif/Kbuild
+@@ -1,5 +1,6 @@
+ nvif-y := nvif/object.o
+ nvif-y += nvif/client.o
+ nvif-y += nvif/device.o
++nvif-y += nvif/disp.o
+ nvif-y += nvif/driver.o
+ nvif-y += nvif/notify.o
+diff --git a/drivers/gpu/drm/nouveau/nvif/disp.c b/drivers/gpu/drm/nouveau/nvif/disp.c
+new file mode 100644
+index 000000000000..7006482e8e29
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvif/disp.c
+@@ -0,0 +1,59 @@
++/*
++ * Copyright 2018 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include <nvif/disp.h>
++#include <nvif/device.h>
++
++#include <nvif/class.h>
++
++void
++nvif_disp_dtor(struct nvif_disp *disp)
++{
++	nvif_object_fini(&disp->object);
++}
++
++int
++nvif_disp_ctor(struct nvif_device *device, s32 oclass, struct nvif_disp *disp)
++{
++	static const struct nvif_mclass disps[] = {
++		{ GP102_DISP, -1 },
++		{ GP100_DISP, -1 },
++		{ GM200_DISP, -1 },
++		{ GM107_DISP, -1 },
++		{ GK110_DISP, -1 },
++		{ GK104_DISP, -1 },
++		{ GF110_DISP, -1 },
++		{ GT214_DISP, -1 },
++		{ GT206_DISP, -1 },
++		{ GT200_DISP, -1 },
++		{   G82_DISP, -1 },
++		{  NV50_DISP, -1 },
++		{  NV04_DISP, -1 },
++		{}
++	};
++	int cid = nvif_sclass(&device->object, disps, oclass);
++	disp->object.client = NULL;
++	if (cid < 0)
++		return cid;
++
++	return nvif_object_init(&device->object, 0, disps[cid].oclass,
++				NULL, 0, &disp->object);
++}
