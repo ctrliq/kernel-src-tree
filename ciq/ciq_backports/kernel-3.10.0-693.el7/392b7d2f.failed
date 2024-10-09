@@ -1,0 +1,394 @@
+scsi: be2iscsi: Set WRB invalid bit for SkyHawk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Set WRB invalid bit for SkyHawk (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 93.18%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 392b7d2f122210da594671606321223167a5a85c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/392b7d2f.failed
+
+invalid bit in WRB indicates to FW that IO was invalidated before WRB
+was fetched from host memory.
+
+For SkyHawk, this invalid bit in WRB is at a different offset.
+Use amap_iscsi_wrb_v2 to mark invalid bit for SkyHawk.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 392b7d2f122210da594671606321223167a5a85c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index ff265d59e294,b509acd33772..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -234,56 -231,36 +234,70 @@@ static int beiscsi_eh_abort(struct scsi
+  	cls_session = starget_to_session(scsi_target(sc->device));
+  	session = cls_session->dd_data;
+  
+ -	/* check if we raced, task just got cleaned up under us */
+ -	spin_lock_bh(&session->back_lock);
+ -	if (!abrt_task || !abrt_task->sc) {
+ -		spin_unlock_bh(&session->back_lock);
+ +	spin_lock_bh(&session->lock);
+ +	if (!aborted_task || !aborted_task->sc) {
+ +		/* we raced */
+ +		spin_unlock_bh(&session->lock);
+ +		return SUCCESS;
+ +	}
+ +
+ +	aborted_io_task = aborted_task->dd_data;
+ +	if (!aborted_io_task->scsi_cmnd) {
+ +		/* raced or invalid command */
+ +		spin_unlock_bh(&session->lock);
+  		return SUCCESS;
+  	}
+ -	/* get a task ref till FW processes the req for the ICD used */
+ -	__iscsi_get_task(abrt_task);
+ -	abrt_io_task = abrt_task->dd_data;
+ -	conn = abrt_task->conn;
+ +	spin_unlock_bh(&session->lock);
+ +	/* Invalidate WRB Posted for this Task */
+ +	AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
+ +		      aborted_io_task->pwrb_handle->pwrb,
+ +		      1);
+ +
+ +	conn = aborted_task->conn;
+  	beiscsi_conn = conn->dd_data;
+  	phba = beiscsi_conn->phba;
+++<<<<<<< HEAD
+++=======
++ 	/* mark WRB invalid which have been not processed by FW yet */
++ 	if (is_chip_be2_be3r(phba)) {
++ 		AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
++ 			      abrt_io_task->pwrb_handle->pwrb, 1);
++ 	} else {
++ 		AMAP_SET_BITS(struct amap_iscsi_wrb_v2, invld,
++ 			      abrt_io_task->pwrb_handle->pwrb, 1);
++ 	}
++ 	inv_tbl.cid = beiscsi_conn->beiscsi_conn_cid;
++ 	inv_tbl.icd = abrt_io_task->psgl_handle->sgl_index;
++ 	spin_unlock_bh(&session->back_lock);
+++>>>>>>> 392b7d2f1222 (scsi: be2iscsi: Set WRB invalid bit for SkyHawk)
+ +
+ +	/* invalidate iocb */
+ +	cid = beiscsi_conn->beiscsi_conn_cid;
+ +	inv_tbl = phba->inv_tbl;
+ +	memset(inv_tbl, 0x0, sizeof(*inv_tbl));
+ +	inv_tbl->cid = cid;
+ +	inv_tbl->icd = aborted_io_task->psgl_handle->sgl_index;
+ +	num_invalidate = 1;
+ +	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+ +				sizeof(struct invalidate_commands_params_in),
+ +				&nonemb_cmd.dma);
+ +	if (nonemb_cmd.va == NULL) {
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ +			    "BM_%d : Failed to allocate memory for"
+ +			    "mgmt_invalidate_icds\n");
+ +		return FAILED;
+ +	}
+ +	nonemb_cmd.size = sizeof(struct invalidate_commands_params_in);
+  
+ -	rc = beiscsi_mgmt_invalidate_icds(phba, &inv_tbl, 1);
+ -	iscsi_put_task(abrt_task);
+ -	if (rc) {
+ +	tag = mgmt_invalidate_icds(phba, inv_tbl, num_invalidate,
+ +				   cid, &nonemb_cmd);
+ +	if (!tag) {
+  		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_EH,
+ -			    "BM_%d : sc %p invalidation failed %d\n",
+ -			    sc, rc);
+ +			    "BM_%d : mgmt_invalidate_icds could not be"
+ +			    "submitted\n");
+ +		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+ +				    nonemb_cmd.va, nonemb_cmd.dma);
+ +
+  		return FAILED;
+  	}
+  
+@@@ -320,204 -294,79 +334,218 @@@ static int beiscsi_eh_device_reset(stru
+  	conn = session->leadconn;
+  	beiscsi_conn = conn->dd_data;
+  	phba = beiscsi_conn->phba;
+ -
+ -	inv_tbl = kzalloc(sizeof(*inv_tbl), GFP_KERNEL);
+ -	if (!inv_tbl) {
+ -		spin_unlock_bh(&session->frwd_lock);
+ -		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ -			    "BM_%d : invldt_cmd_tbl alloc failed\n");
+ -		return FAILED;
+ -	}
+ -	nents = 0;
+ -	/* take back_lock to prevent task from getting cleaned up under us */
+ -	spin_lock(&session->back_lock);
+ +	cid = beiscsi_conn->beiscsi_conn_cid;
+ +	inv_tbl = phba->inv_tbl;
+ +	memset(inv_tbl, 0x0, sizeof(*inv_tbl) * BE2_CMDS_PER_CXN);
+ +	num_invalidate = 0;
+  	for (i = 0; i < conn->session->cmds_max; i++) {
+ -		task = conn->session->cmds[i];
+ -		if (!task->sc)
+ +		abrt_task = conn->session->cmds[i];
+ +		abrt_io_task = abrt_task->dd_data;
+ +		if (!abrt_task->sc || abrt_task->state == ISCSI_TASK_FREE)
+  			continue;
+  
+ -		if (sc->device->lun != task->sc->device->lun)
+ +		if (sc->device->lun != abrt_task->sc->device->lun)
+  			continue;
+ -		/**
+ -		 * Can't fit in more cmds? Normally this won't happen b'coz
+ -		 * BEISCSI_CMD_PER_LUN is same as BE_INVLDT_CMD_TBL_SZ.
+ -		 */
+ -		if (nents == BE_INVLDT_CMD_TBL_SZ) {
+ -			more = 1;
+ -			break;
+ -		}
+  
+++<<<<<<< HEAD
+ +		/* Invalidate WRB Posted for this Task */
+ +		AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
+ +			      abrt_io_task->pwrb_handle->pwrb,
+ +			      1);
+++=======
++ 		/* get a task ref till FW processes the req for the ICD used */
++ 		__iscsi_get_task(task);
++ 		io_task = task->dd_data;
++ 		/* mark WRB invalid which have been not processed by FW yet */
++ 		if (is_chip_be2_be3r(phba)) {
++ 			AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
++ 				      io_task->pwrb_handle->pwrb, 1);
++ 		} else {
++ 			AMAP_SET_BITS(struct amap_iscsi_wrb_v2, invld,
++ 				      io_task->pwrb_handle->pwrb, 1);
++ 		}
+++>>>>>>> 392b7d2f1222 (scsi: be2iscsi: Set WRB invalid bit for SkyHawk)
+  
+ -		inv_tbl->tbl[nents].cid = beiscsi_conn->beiscsi_conn_cid;
+ -		inv_tbl->tbl[nents].icd = io_task->psgl_handle->sgl_index;
+ -		inv_tbl->task[nents] = task;
+ -		nents++;
+ +		inv_tbl->cid = cid;
+ +		inv_tbl->icd = abrt_io_task->psgl_handle->sgl_index;
+ +		num_invalidate++;
+ +		inv_tbl++;
+  	}
+ -	spin_unlock_bh(&session->back_lock);
+ -	spin_unlock_bh(&session->frwd_lock);
+ -
+ -	rc = SUCCESS;
+ -	if (!nents)
+ -		goto end_reset;
+ +	spin_unlock_bh(&session->lock);
+ +	inv_tbl = phba->inv_tbl;
+  
+ -	if (more) {
+ +	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+ +				sizeof(struct invalidate_commands_params_in),
+ +				&nonemb_cmd.dma);
+ +	if (nonemb_cmd.va == NULL) {
+  		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ -			    "BM_%d : number of cmds exceeds size of invalidation table\n");
+ -		rc = FAILED;
+ -		goto end_reset;
+ +			    "BM_%d : Failed to allocate memory for"
+ +			    "mgmt_invalidate_icds\n");
+ +		return FAILED;
+  	}
+ -
+ -	if (beiscsi_mgmt_invalidate_icds(phba, &inv_tbl->tbl[0], nents)) {
+ +	nonemb_cmd.size = sizeof(struct invalidate_commands_params_in);
+ +	memset(nonemb_cmd.va, 0, nonemb_cmd.size);
+ +	tag = mgmt_invalidate_icds(phba, inv_tbl, num_invalidate,
+ +				   cid, &nonemb_cmd);
+ +	if (!tag) {
+  		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_EH,
+ -			    "BM_%d : cid %u scmds invalidation failed\n",
+ -			    beiscsi_conn->beiscsi_conn_cid);
+ -		rc = FAILED;
+ +			    "BM_%d : mgmt_invalidate_icds could not be"
+ +			    " submitted\n");
+ +		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+ +				    nonemb_cmd.va, nonemb_cmd.dma);
+ +		return FAILED;
+ +	}
+ +
+ +	rc = beiscsi_mccq_compl_wait(phba, tag, NULL, &nonemb_cmd);
+ +	if (rc != -EBUSY)
+ +		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+ +				    nonemb_cmd.va, nonemb_cmd.dma);
+ +	return iscsi_eh_device_reset(sc);
+ +}
+ +
+ +static ssize_t beiscsi_show_boot_tgt_info(void *data, int type, char *buf)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +	struct mgmt_session_info *boot_sess = &phba->boot_sess;
+ +	struct mgmt_conn_info *boot_conn = &boot_sess->conn_list[0];
+ +	char *str = buf;
+ +	int rc = -EPERM;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_TGT_NAME:
+ +		rc = sprintf(buf, "%.*s\n",
+ +			    (int)strlen(boot_sess->target_name),
+ +			    (char *)&boot_sess->target_name);
+ +		break;
+ +	case ISCSI_BOOT_TGT_IP_ADDR:
+ +		if (boot_conn->dest_ipaddr.ip_type == BEISCSI_IP_TYPE_V4)
+ +			rc = sprintf(buf, "%pI4\n",
+ +				(char *)&boot_conn->dest_ipaddr.addr);
+ +		else
+ +			rc = sprintf(str, "%pI6\n",
+ +				(char *)&boot_conn->dest_ipaddr.addr);
+ +		break;
+ +	case ISCSI_BOOT_TGT_PORT:
+ +		rc = sprintf(str, "%d\n", boot_conn->dest_port);
+ +		break;
+ +
+ +	case ISCSI_BOOT_TGT_CHAP_NAME:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     target_chap_name_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.target_chap_name);
+ +		break;
+ +	case ISCSI_BOOT_TGT_CHAP_SECRET:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     target_secret_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.target_secret);
+ +		break;
+ +	case ISCSI_BOOT_TGT_REV_CHAP_NAME:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     intr_chap_name_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.intr_chap_name);
+ +		break;
+ +	case ISCSI_BOOT_TGT_REV_CHAP_SECRET:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     intr_secret_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.intr_secret);
+ +		break;
+ +	case ISCSI_BOOT_TGT_FLAGS:
+ +		rc = sprintf(str, "2\n");
+ +		break;
+ +	case ISCSI_BOOT_TGT_NIC_ASSOC:
+ +		rc = sprintf(str, "0\n");
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +static ssize_t beiscsi_show_boot_ini_info(void *data, int type, char *buf)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +	char *str = buf;
+ +	int rc = -EPERM;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_INI_INITIATOR_NAME:
+ +		rc = sprintf(str, "%s\n", phba->boot_sess.initiator_iscsiname);
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +static ssize_t beiscsi_show_boot_eth_info(void *data, int type, char *buf)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +	char *str = buf;
+ +	int rc = -EPERM;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_ETH_FLAGS:
+ +		rc = sprintf(str, "2\n");
+ +		break;
+ +	case ISCSI_BOOT_ETH_INDEX:
+ +		rc = sprintf(str, "0\n");
+ +		break;
+ +	case ISCSI_BOOT_ETH_MAC:
+ +		rc  = beiscsi_get_macaddr(str, phba);
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +
+ +static umode_t beiscsi_tgt_get_attr_visibility(void *data, int type)
+ +{
+ +	umode_t rc = 0;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_TGT_NAME:
+ +	case ISCSI_BOOT_TGT_IP_ADDR:
+ +	case ISCSI_BOOT_TGT_PORT:
+ +	case ISCSI_BOOT_TGT_CHAP_NAME:
+ +	case ISCSI_BOOT_TGT_CHAP_SECRET:
+ +	case ISCSI_BOOT_TGT_REV_CHAP_NAME:
+ +	case ISCSI_BOOT_TGT_REV_CHAP_SECRET:
+ +	case ISCSI_BOOT_TGT_NIC_ASSOC:
+ +	case ISCSI_BOOT_TGT_FLAGS:
+ +		rc = S_IRUGO;
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +static umode_t beiscsi_ini_get_attr_visibility(void *data, int type)
+ +{
+ +	umode_t rc = 0;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_INI_INITIATOR_NAME:
+ +		rc = S_IRUGO;
+ +		break;
+  	}
+ +	return rc;
+ +}
+ +
+  
+ -end_reset:
+ -	for (i = 0; i < nents; i++)
+ -		iscsi_put_task(inv_tbl->task[i]);
+ -	kfree(inv_tbl);
+ +static umode_t beiscsi_eth_get_attr_visibility(void *data, int type)
+ +{
+ +	umode_t rc = 0;
+  
+ -	if (rc == SUCCESS)
+ -		rc = iscsi_eh_device_reset(sc);
+ +	switch (type) {
+ +	case ISCSI_BOOT_ETH_FLAGS:
+ +	case ISCSI_BOOT_ETH_MAC:
+ +	case ISCSI_BOOT_ETH_INDEX:
+ +		rc = S_IRUGO;
+ +		break;
+ +	}
+  	return rc;
+  }
+  
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+diff --git a/drivers/scsi/be2iscsi/be_main.h b/drivers/scsi/be2iscsi/be_main.h
+index 9df49b3c0177..f80009f40496 100644
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@ -824,7 +824,7 @@ struct amap_iscsi_wrb_v2 {
+ 	u8 diff_enbl;   /* DWORD 11 */
+ 	u8 u_run;       /* DWORD 11 */
+ 	u8 o_run;       /* DWORD 11 */
+-	u8 invalid;     /* DWORD 11 */
++	u8 invld;     /* DWORD 11 */
+ 	u8 dsp;         /* DWORD 11 */
+ 	u8 dmsg;        /* DWORD 11 */
+ 	u8 rsvd4;       /* DWORD 11 */
