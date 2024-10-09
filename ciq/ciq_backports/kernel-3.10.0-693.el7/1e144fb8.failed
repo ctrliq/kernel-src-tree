@@ -1,0 +1,104 @@
+Btrfs: wire up the free space tree to the extent tree
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit 1e144fb8f4a4d6d6d88c58f87e4366e3cd02ab72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1e144fb8.failed
+
+The free space tree is updated in tandem with the extent tree. There are
+only a handful of places where we need to hook in:
+
+1. Block group creation
+2. Block group deletion
+3. Delayed refs (extent creation and deletion)
+4. Block group caching
+
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 1e144fb8f4a4d6d6d88c58f87e4366e3cd02ab72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/extent-tree.c
+index b97c9bf3b189,a4a4f593ec71..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -534,41 -498,41 +535,70 @@@ next
+  	total_found += add_new_free_space(block_group, fs_info, last,
+  					  block_group->key.objectid +
+  					  block_group->key.offset);
+++<<<<<<< HEAD
+++=======
++ 	caching_ctl->progress = (u64)-1;
++ 
++ out:
++ 	btrfs_free_path(path);
++ 	return ret;
++ }
++ 
++ static noinline void caching_thread(struct btrfs_work *work)
++ {
++ 	struct btrfs_block_group_cache *block_group;
++ 	struct btrfs_fs_info *fs_info;
++ 	struct btrfs_caching_control *caching_ctl;
++ 	int ret;
++ 
++ 	caching_ctl = container_of(work, struct btrfs_caching_control, work);
++ 	block_group = caching_ctl->block_group;
++ 	fs_info = block_group->fs_info;
++ 
++ 	mutex_lock(&caching_ctl->mutex);
++ 	down_read(&fs_info->commit_root_sem);
++ 
++ 	if (btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE))
++ 		ret = load_free_space_tree(caching_ctl);
++ 	else
++ 		ret = load_extent_tree_free(caching_ctl);
++ 
+++>>>>>>> 1e144fb8f4a4 (Btrfs: wire up the free space tree to the extent tree)
+  	spin_lock(&block_group->lock);
+  	block_group->caching_ctl = NULL;
+ -	block_group->cached = ret ? BTRFS_CACHE_ERROR : BTRFS_CACHE_FINISHED;
+ +	block_group->cached = BTRFS_CACHE_FINISHED;
+  	spin_unlock(&block_group->lock);
+  
+ +#ifdef CONFIG_BTRFS_DEBUG
+ +	if (btrfs_should_fragment_free_space(extent_root, block_group)) {
+ +		u64 bytes_used;
+ +
+ +		spin_lock(&block_group->space_info->lock);
+ +		spin_lock(&block_group->lock);
+ +		bytes_used = block_group->key.offset -
+ +			btrfs_block_group_used(&block_group->item);
+ +		block_group->space_info->bytes_used += bytes_used >> 1;
+ +		spin_unlock(&block_group->lock);
+ +		spin_unlock(&block_group->space_info->lock);
+ +		fragment_free_space(extent_root, block_group);
+ +	}
+ +#endif
+ +
+ +	caching_ctl->progress = (u64)-1;
+ +err:
+ +	btrfs_free_path(path);
+  	up_read(&fs_info->commit_root_sem);
+ -	free_excluded_extents(fs_info->extent_root, block_group);
+ -	mutex_unlock(&caching_ctl->mutex);
+  
+ +	free_excluded_extents(extent_root, block_group);
+ +
+ +	mutex_unlock(&caching_ctl->mutex);
+ +out:
+ +	if (ret) {
+ +		spin_lock(&block_group->lock);
+ +		block_group->caching_ctl = NULL;
+ +		block_group->cached = BTRFS_CACHE_ERROR;
+ +		spin_unlock(&block_group->lock);
+ +	}
+  	wake_up(&caching_ctl->wait);
+  
+  	put_caching_control(caching_ctl);
+* Unmerged path fs/btrfs/extent-tree.c
