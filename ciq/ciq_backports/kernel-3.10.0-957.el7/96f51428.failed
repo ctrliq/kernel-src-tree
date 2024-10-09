@@ -1,0 +1,260 @@
+netfilter: ipset: Introduce RCU locking in bitmap:* types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit 96f51428c43de20723630f0d756a7a9a42cbd974
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/96f51428.failed
+
+There's nothing much required because the bitmap types use atomic
+bit operations. However the logic of adding elements slightly changed:
+first the MAC address updated (which is not atomic), then the element
+activated (added). The extensions may call kfree_rcu() therefore we
+call rcu_barrier() at module removal.
+
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit 96f51428c43de20723630f0d756a7a9a42cbd974)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_bitmap_gen.h
+#	net/netfilter/ipset/ip_set_bitmap_ipmac.c
+diff --cc net/netfilter/ipset/ip_set_bitmap_gen.h
+index 01a340ce9e94,86429f369128..000000000000
+--- a/net/netfilter/ipset/ip_set_bitmap_gen.h
++++ b/net/netfilter/ipset/ip_set_bitmap_gen.h
+@@@ -132,10 -144,14 +132,21 @@@ mtype_add(struct ip_set *set, void *val
+  
+  	if (ret == IPSET_ADD_FAILED) {
+  		if (SET_WITH_TIMEOUT(set) &&
+++<<<<<<< HEAD
+ +		    ip_set_timeout_expired(ext_timeout(x, map)))
+++=======
++ 		    ip_set_timeout_expired(ext_timeout(x, set))) {
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  			ret = 0;
+- 		else if (!(flags & IPSET_FLAG_EXIST))
++ 		} else if (!(flags & IPSET_FLAG_EXIST)) {
++ 			set_bit(e->id, map->members);
+  			return -IPSET_ERR_EXIST;
+++<<<<<<< HEAD
+++=======
++ 		}
++ 		/* Element is re-added, cleanup extensions */
++ 		ip_set_ext_destroy(set, x);
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  	}
+  
+  	if (SET_WITH_TIMEOUT(set))
+@@@ -146,7 -162,15 +157,19 @@@
+  #endif
+  
+  	if (SET_WITH_COUNTER(set))
+++<<<<<<< HEAD
+ +		ip_set_init_counter(ext_counter(x, map), ext);
+++=======
++ 		ip_set_init_counter(ext_counter(x, set), ext);
++ 	if (SET_WITH_COMMENT(set))
++ 		ip_set_init_comment(ext_comment(x, set), ext);
++ 	if (SET_WITH_SKBINFO(set))
++ 		ip_set_init_skbinfo(ext_skbinfo(x, set), ext);
++ 
++ 	/* Activate element */
++ 	set_bit(e->id, map->members);
++ 
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  	return 0;
+  }
+  
+@@@ -173,14 -208,18 +196,28 @@@ mtype_list(const struct ip_set *set
+  	struct mtype *map = set->data;
+  	struct nlattr *adt, *nested;
+  	void *x;
+++<<<<<<< HEAD
+ +	u32 id, first = cb->args[2];
+++=======
++ 	u32 id, first = cb->args[IPSET_CB_ARG0];
++ 	int ret = 0;
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  
+  	adt = ipset_nest_start(skb, IPSET_ATTR_ADT);
+  	if (!adt)
+  		return -EMSGSIZE;
+++<<<<<<< HEAD
+ +	for (; cb->args[2] < map->elements; cb->args[2]++) {
+ +		id = cb->args[2];
+ +		x = get_ext(map, id);
+++=======
++ 	/* Extensions may be replaced */
++ 	rcu_read_lock();
++ 	for (; cb->args[IPSET_CB_ARG0] < map->elements;
++ 	     cb->args[IPSET_CB_ARG0]++) {
++ 		id = cb->args[IPSET_CB_ARG0];
++ 		x = get_ext(set, map, id);
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  		if (!test_bit(id, map->members) ||
+  		    (SET_WITH_TIMEOUT(set) &&
+  #ifdef IP_SET_BITMAP_STORED_TIMEOUT
+@@@ -192,45 -231,36 +229,54 @@@
+  		if (!nested) {
+  			if (id == first) {
+  				nla_nest_cancel(skb, adt);
+- 				return -EMSGSIZE;
+- 			} else
+- 				goto nla_put_failure;
++ 				ret = -EMSGSIZE;
++ 				goto out;
++ 			}
++ 
++ 			goto nla_put_failure;
+  		}
+ -		if (mtype_do_list(skb, map, id, set->dsize))
+ +		if (mtype_do_list(skb, map, id))
+  			goto nla_put_failure;
+ -		if (ip_set_put_extensions(skb, set, x,
+ -		    mtype_is_filled((const struct mtype_elem *) x)))
+ +		if (SET_WITH_TIMEOUT(set)) {
+ +#ifdef IP_SET_BITMAP_STORED_TIMEOUT
+ +			if (nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
+ +					  htonl(ip_set_timeout_stored(map, id,
+ +							ext_timeout(x, map)))))
+ +				goto nla_put_failure;
+ +#else
+ +			if (nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
+ +					  htonl(ip_set_timeout_get(
+ +							ext_timeout(x, map)))))
+ +				goto nla_put_failure;
+ +#endif
+ +		}
+ +		if (SET_WITH_COUNTER(set) &&
+ +		    ip_set_put_counter(skb, ext_counter(x, map)))
+  			goto nla_put_failure;
+  		ipset_nest_end(skb, nested);
+  	}
+  	ipset_nest_end(skb, adt);
+  
+  	/* Set listing finished */
+ -	cb->args[IPSET_CB_ARG0] = 0;
+ +	cb->args[2] = 0;
+  
+- 	return 0;
++ 	goto out;
+  
+  nla_put_failure:
+  	nla_nest_cancel(skb, nested);
+  	if (unlikely(id == first)) {
+++<<<<<<< HEAD
+ +		cb->args[2] = 0;
+ +		return -EMSGSIZE;
+++=======
++ 		cb->args[IPSET_CB_ARG0] = 0;
++ 		ret = -EMSGSIZE;
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  	}
+  	ipset_nest_end(skb, adt);
+- 	return 0;
++ out:
++ 	rcu_read_unlock();
++ 	return ret;
+  }
+  
+  static void
+@@@ -243,16 -273,18 +289,16 @@@ mtype_gc(unsigned long ul_set
+  
+  	/* We run parallel with other readers (test element)
+  	 * but adding/deleting new entries is locked out */
+- 	read_lock_bh(&set->lock);
++ 	spin_lock_bh(&set->lock);
+  	for (id = 0; id < map->elements; id++)
+ -		if (mtype_gc_test(id, map, set->dsize)) {
+ -			x = get_ext(set, map, id);
+ -			if (ip_set_timeout_expired(ext_timeout(x, set))) {
+ +		if (mtype_gc_test(id, map)) {
+ +			x = get_ext(map, id);
+ +			if (ip_set_timeout_expired(ext_timeout(x, map)))
+  				clear_bit(id, map->members);
+ -				ip_set_ext_destroy(set, x);
+ -			}
+  		}
+- 	read_unlock_bh(&set->lock);
++ 	spin_unlock_bh(&set->lock);
+  
+ -	map->gc.expires = jiffies + IPSET_GC_PERIOD(set->timeout) * HZ;
+ +	map->gc.expires = jiffies + IPSET_GC_PERIOD(map->timeout) * HZ;
+  	add_timer(&map->gc);
+  }
+  
+diff --cc net/netfilter/ipset/ip_set_bitmap_ipmac.c
+index b2a7bea3f7b6,fe00e87decc8..000000000000
+--- a/net/netfilter/ipset/ip_set_bitmap_ipmac.c
++++ b/net/netfilter/ipset/ip_set_bitmap_ipmac.c
+@@@ -147,11 -146,17 +147,22 @@@ bitmap_ipmac_do_add(const struct bitmap
+  {
+  	struct bitmap_ipmac_elem *elem;
+  
+++<<<<<<< HEAD
+ +	elem = get_elem(map->extensions, e->id, map->dsize);
+ +	if (test_and_set_bit(e->id, map->members)) {
+++=======
++ 	elem = get_elem(map->extensions, e->id, dsize);
++ 	if (test_bit(e->id, map->members)) {
+++>>>>>>> 96f51428c43d (netfilter: ipset: Introduce RCU locking in bitmap:* types)
+  		if (elem->filled == MAC_FILLED) {
+- 			if (e->ether && (flags & IPSET_FLAG_EXIST))
++ 			if (e->ether &&
++ 			    (flags & IPSET_FLAG_EXIST) &&
++ 			    !ether_addr_equal(e->ether, elem->ether)) {
++ 				/* memcpy isn't atomic */
++ 				clear_bit(e->id, map->members);
++ 				smp_mb__after_atomic();
+  				memcpy(elem->ether, e->ether, ETH_ALEN);
++ 			}
+  			return IPSET_ADD_FAILED;
+  		} else if (!e->ether)
+  			/* Already added without ethernet address */
+* Unmerged path net/netfilter/ipset/ip_set_bitmap_gen.h
+diff --git a/net/netfilter/ipset/ip_set_bitmap_ip.c b/net/netfilter/ipset/ip_set_bitmap_ip.c
+index faaca51bf3fa..de5724c40e9d 100644
+--- a/net/netfilter/ipset/ip_set_bitmap_ip.c
++++ b/net/netfilter/ipset/ip_set_bitmap_ip.c
+@@ -81,7 +81,7 @@ static inline int
+ bitmap_ip_do_add(const struct bitmap_ip_adt_elem *e, struct bitmap_ip *map,
+ 		 u32 flags)
+ {
+-	return !!test_and_set_bit(e->id, map->members);
++	return !!test_bit(e->id, map->members);
+ }
+ 
+ static inline int
+@@ -435,6 +435,7 @@ bitmap_ip_init(void)
+ static void __exit
+ bitmap_ip_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&bitmap_ip_type);
+ }
+ 
+* Unmerged path net/netfilter/ipset/ip_set_bitmap_ipmac.c
+diff --git a/net/netfilter/ipset/ip_set_bitmap_port.c b/net/netfilter/ipset/ip_set_bitmap_port.c
+index 3fcb6e11fac3..d87f175b8ca1 100644
+--- a/net/netfilter/ipset/ip_set_bitmap_port.c
++++ b/net/netfilter/ipset/ip_set_bitmap_port.c
+@@ -74,7 +74,7 @@ static inline int
+ bitmap_port_do_add(const struct bitmap_port_adt_elem *e,
+ 		   struct bitmap_port *map, u32 flags)
+ {
+-	return !!test_and_set_bit(e->id, map->members);
++	return !!test_bit(e->id, map->members);
+ }
+ 
+ static inline int
+@@ -363,6 +363,7 @@ bitmap_port_init(void)
+ static void __exit
+ bitmap_port_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&bitmap_port_type);
+ }
+ 
