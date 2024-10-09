@@ -1,0 +1,190 @@
+x86/topology: Avoid wasting 128k for package id array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 30bb9811856f667042e746d8033883b1091a46ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/30bb9811.failed
+
+Analyzing large early boot allocations unveiled the logical package id
+storage as a prominent memory waste. Since commit 1f12e32f4cd5
+("x86/topology: Create logical package id") every 64-bit system allocates a
+128k array to convert logical package ids.
+
+This happens because the array is sized for MAX_LOCAL_APIC which is always
+32k on 64bit systems, and it needs 4 bytes for each entry.
+
+This is fairly wasteful, especially for the common case of having only one
+socket, which uses exactly 4 byte out of 128K.
+
+There is no user of the package id map which is performance critical, so
+the lookup is not required to be O(1). Store the logical processor id in
+cpu_data and use a loop based lookup.
+
+To keep the mapping stable accross cpu hotplug operations, add a flag to
+cpu_data which is set when the CPU is brought up the first time. When the
+flag is set, then cpu_data is not reinitialized by copying boot_cpu_data on
+subsequent bringups.
+
+[ tglx: Rename the flag to 'initialized', use proper pointers instead of
+  	repeated cpu_data(x) evaluation and massage changelog. ]
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Prarit Bhargava <prarit@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: He Chen <he.chen@linux.intel.com>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Piotr Luc <piotr.luc@intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arvind Yadav <arvind.yadav.cs@gmail.com>
+	Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Mathias Krause <minipli@googlemail.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Link: https://lkml.kernel.org/r/20171114124257.22013-3-prarit@redhat.com
+
+(cherry picked from commit 30bb9811856f667042e746d8033883b1091a46ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/processor.h
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/include/asm/processor.h
+index 5023ca6231a6,cc16fa882e3e..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -136,7 -132,8 +136,12 @@@ struct cpuinfo_x86 
+  	/* Index into per_cpu list: */
+  	u16			cpu_index;
+  	u32			microcode;
+++<<<<<<< HEAD
+ +} __attribute__((__aligned__(SMP_CACHE_BYTES)));
+++=======
++ 	unsigned		initialized : 1;
++ } __randomize_layout;
+++>>>>>>> 30bb9811856f (x86/topology: Avoid wasting 128k for package id array)
+  
+  struct cpuid_regs {
+  	u32 eax, ebx, ecx, edx;
+diff --cc arch/x86/kernel/smpboot.c
+index 92e0aea4e8c8,da5e162636fd..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -102,16 -97,10 +102,13 @@@ EXPORT_PER_CPU_SYMBOL(cpu_core_map)
+  DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_llc_shared_map);
+  
+  /* Per CPU bogomips and other parameters */
+ -DEFINE_PER_CPU_READ_MOSTLY(struct cpuinfo_x86, cpu_info);
+ +DEFINE_PER_CPU_SHARED_ALIGNED(struct cpuinfo_x86, cpu_info);
+  EXPORT_PER_CPU_SYMBOL(cpu_info);
+ +DEFINE_PER_CPU_SHARED_ALIGNED(struct rh_cpuinfo_x86, rh_cpu_info);
+ +EXPORT_PER_CPU_SYMBOL(rh_cpu_info);
+  
+ +atomic_t init_deasserted;
+  /* Logical package management. We might want to allocate that dynamically */
+- static int *physical_to_logical_pkg __read_mostly;
+- static unsigned long *physical_package_map __read_mostly;;
+- static unsigned int max_physical_pkg_id __read_mostly;
+  unsigned int __max_logical_packages __read_mostly;
+  EXPORT_SYMBOL(__max_logical_packages);
+  static unsigned int logical_packages __read_mostly;
+@@@ -242,9 -274,28 +239,28 @@@ static void notrace start_secondary(voi
+  	x86_cpuinit.setup_percpu_clockev();
+  
+  	wmb();
+ -	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
+ +	cpu_startup_entry(CPUHP_ONLINE);
+  }
+  
++ /**
++  * topology_phys_to_logical_pkg - Map a physical package id to a logical
++  *
++  * Returns logical package id or -1 if not found
++  */
++ int topology_phys_to_logical_pkg(unsigned int phys_pkg)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct cpuinfo_x86 *c = &cpu_data(cpu);
++ 
++ 		if (c->initialized && c->phys_proc_id == phys_pkg)
++ 			return c->logical_proc_id;
++ 	}
++ 	return -1;
++ }
++ EXPORT_SYMBOL(topology_phys_to_logical_pkg);
++ 
+  /**
+   * topology_update_package_map - Update the physical to logical package map
+   * @pkg:	The physical package id as retrieved via CPUID
+@@@ -276,10 -321,8 +286,12 @@@ int topology_update_package_map(unsigne
+  		pr_info("CPU %u Converting physical %u to logical package %u\n",
+  			cpu, pkg, new);
+  	}
+- 	physical_to_logical_pkg[pkg] = new;
+- 
+  found:
+++<<<<<<< HEAD
+ +	rh_cpu_data(cpu).logical_proc_id = physical_to_logical_pkg[pkg];
+++=======
++ 	cpu_data(cpu).logical_proc_id = new;
+++>>>>>>> 30bb9811856f (x86/topology: Avoid wasting 128k for package id array)
+  	return 0;
+  }
+  
+@@@ -330,31 -359,6 +328,34 @@@ static void __init smp_init_package_map
+  	}
+  
+  	__max_logical_packages = DIV_ROUND_UP(total_cpus, ncpus);
+++<<<<<<< HEAD
+ +	logical_packages = 0;
+ +
+ +	/*
+ +	 * Possibly larger than what we need as the number of apic ids per
+ +	 * package can be smaller than the actual used apic ids.
+ +	 */
+ +	max_physical_pkg_id = DIV_ROUND_UP(MAX_LOCAL_APIC, ncpus);
+ +
+ +	if (x86_hyper == &x86_hyper_xen_hvm) {
+ +		/*
+ +		 * RHEL-only. Each logical package has not more than
+ +		 * x86_max_cores CPUs but it can happen that it has less, e.g.
+ +		 * we may have 1 CPU per logical package regardless of what's
+ +		 * in x86_max_cores. This is seen on some Xen setups with AMD
+ +		 * processors.
+ +		 */
+ +		__max_logical_packages = min(max_physical_pkg_id, total_cpus);
+ +	}
+ +
+ +	size = max_physical_pkg_id * sizeof(unsigned int);
+ +	physical_to_logical_pkg = kmalloc(size, GFP_KERNEL);
+ +	memset(physical_to_logical_pkg, 0xff, size);
+ +	size = BITS_TO_LONGS(max_physical_pkg_id) * sizeof(unsigned long);
+ +	physical_package_map = kzalloc(size, GFP_KERNEL);
+ +
+++=======
+++>>>>>>> 30bb9811856f (x86/topology: Avoid wasting 128k for package id array)
+  	pr_info("Max logical packages: %u\n", __max_logical_packages);
+  
+  	topology_update_package_map(c->phys_proc_id, cpu);
+@@@ -368,8 -371,8 +369,9 @@@ void __init smp_store_boot_cpu_info(voi
+  
+  	*c = boot_cpu_data;
+  	c->cpu_index = id;
+ +	*rh_c = rh_boot_cpu_data;
+  	smp_init_package_map(c, id);
++ 	c->initialized = true;
+  }
+  
+  /*
+* Unmerged path arch/x86/include/asm/processor.h
+* Unmerged path arch/x86/kernel/smpboot.c
