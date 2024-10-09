@@ -1,0 +1,130 @@
+xfs: don't unlock invalidated buf on aborted tx commit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit d9183105caa926522a4bc8a40e162de7019f1a21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/d9183105.failed
+
+xfstests generic/388,475 occasionally reproduce assertion failures
+in xfs_buf_item_unpin() when the final bli reference is dropped on
+an invalidated buffer and the buffer is not locked as it is expected
+to be. Invalidated buffers should remain locked on transaction
+commit until the final unpin, at which point the buffer is removed
+from the AIL and the bli is freed since stale buffers are not
+written back.
+
+The assert failures are associated with filesystem shutdown,
+typically due to log I/O errors injected by the test. The
+problematic situation can occur if the shutdown happens to cause a
+race between an active transaction that has invalidated a particular
+buffer and an I/O error on a log buffer that contains the bli
+associated with the same (now stale) buffer.
+
+Both transaction and log contexts acquire a bli reference. If the
+transaction has already invalidated the buffer by the time the I/O
+error occurs and ends up aborting due to shutdown, the transaction
+and log hold the last two references to a stale bli. If the
+transaction cancel occurs first, it treats the buffer as non-stale
+due to the aborted state: the bli reference is dropped and the
+buffer is released/unlocked. The log buffer I/O error handling
+eventually calls into xfs_buf_item_unpin(), drops the final
+reference to the bli and treats it as stale. The buffer wasn't left
+locked by xfs_buf_item_unlock(), however, so the assert fails and
+the buffer is double unlocked. The latter problem is mitigated by
+the fact that the fs is shutdown and no further damage is possible.
+
+->iop_unlock() of an invalidated buffer should behave consistently
+with respect to the bli refcount, regardless of aborted state. If
+the refcount remains elevated on commit, we know the bli is awaiting
+an unpin (since it can't be in another transaction) and will be
+handled appropriately on log buffer completion. If the final bli
+reference of an invalidated buffer is dropped in ->iop_unlock(), we
+can assume the transaction has aborted because invalidation implies
+a dirty transaction. In the non-abort case, the log would have
+acquired a bli reference in ->iop_pin() and prevented bli release at
+->iop_unlock() time. In the abort case the item must be freed and
+buffer unlocked because it wasn't pinned by the log.
+
+Rework xfs_buf_item_unlock() to simplify the currently circuitous
+and duplicate logic and leave invalidated buffers locked based on
+bli refcount, regardless of aborted state. This ensures that a
+pinned, stale buffer is always found locked when eventually
+unpinned.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit d9183105caa926522a4bc8a40e162de7019f1a21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf_item.c
+diff --cc fs/xfs/xfs_buf_item.c
+index 8afcfa3ed976,42fce70b474d..000000000000
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@@ -567,36 -556,15 +567,47 @@@ xfs_buf_item_unlock
+  {
+  	struct xfs_buf_log_item	*bip = BUF_ITEM(lip);
+  	struct xfs_buf		*bp = bip->bli_buf;
+++<<<<<<< HEAD
+ +	bool			aborted = !!(lip->li_flags & XFS_LI_ABORTED);
+ +	bool			hold = !!(bip->bli_flags & XFS_BLI_HOLD);
+ +	bool			dirty = !!(bip->bli_flags & XFS_BLI_DIRTY);
+++=======
++ 	bool			freed;
++ 	bool			aborted;
++ 	bool			hold = bip->bli_flags & XFS_BLI_HOLD;
++ 	bool			dirty = bip->bli_flags & XFS_BLI_DIRTY;
++ 	bool			stale = bip->bli_flags & XFS_BLI_STALE;
+++>>>>>>> d9183105caa9 (xfs: don't unlock invalidated buf on aborted tx commit)
+  #if defined(DEBUG) || defined(XFS_WARN)
+- 	bool			ordered = !!(bip->bli_flags & XFS_BLI_ORDERED);
++ 	bool			ordered = bip->bli_flags & XFS_BLI_ORDERED;
+  #endif
+  
+++<<<<<<< HEAD
+ +	/* Clear the buffer's association with this transaction. */
+ +	bp->b_transp = NULL;
+ +
+ +	/*
+ +	 * The per-transaction state has been copied above so clear it from the
+ +	 * bli.
+ +	 */
+ +	bip->bli_flags &= ~(XFS_BLI_LOGGED | XFS_BLI_HOLD | XFS_BLI_ORDERED);
+ +
+ +	/*
+ +	 * If the buf item is marked stale, then don't do anything.  We'll
+ +	 * unlock the buffer and free the buf item when the buffer is unpinned
+ +	 * for the last time.
+ +	 */
+ +	if (bip->bli_flags & XFS_BLI_STALE) {
+ +		trace_xfs_buf_item_unlock_stale(bip);
+ +		ASSERT(bip->__bli_format.blf_flags & XFS_BLF_CANCEL);
+ +		if (!aborted) {
+ +			atomic_dec(&bip->bli_refcount);
+ +			return;
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> d9183105caa9 (xfs: don't unlock invalidated buf on aborted tx commit)
+  	trace_xfs_buf_item_unlock(bip);
+  
+  	/*
+* Unmerged path fs/xfs/xfs_buf_item.c
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index dbcbabcee284..d34fbd60b150 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -483,7 +483,6 @@ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_pin);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unpin);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unpin_stale);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unlock);
+-DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unlock_stale);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_committed);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_push);
+ DEFINE_BUF_ITEM_EVENT(xfs_trans_get_buf);
