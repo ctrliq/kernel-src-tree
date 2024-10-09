@@ -1,0 +1,542 @@
+nfp: move area mapping helper into nfpcore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 064dc3196ebd2587ad9a4ca2d26629a20f819352
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/064dc319.failed
+
+nfp_net_map_area() is a helper for mapping areas of NFP memory
+defined in nfp_net_main.c.  Move it to nfpcore to allow reuse
+and rename accordingly.  Create an additional helper -
+nfp_cpp_area_alloc_acquire() the opposite of already existing
+nfp_cpp_area_release_free().
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 064dc3196ebd2587ad9a4ca2d26629a20f819352)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 092c7d18f2ec,16ee904db0cd..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -79,61 -81,18 +79,74 @@@ static int nfp_is_ready(struct nfp_cpp 
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * nfp_net_map_area() - Help function to map an area
+ + * @cpp:    NFP CPP handler
+ + * @name:   Name for the area
+ + * @target: CPP target
+ + * @addr:   CPP address
+ + * @size:   Size of the area
+ + * @area:   Area handle (returned).
+ + *
+ + * This function is primarily to simplify the code in the main probe
+ + * function. To undo the effect of this functions call
+ + * @nfp_cpp_area_release_free(*area);
+ + *
+ + * Return: Pointer to memory mapped area or ERR_PTR
+ + */
+ +static u8 __iomem *nfp_net_map_area(struct nfp_cpp *cpp,
+ +				    const char *name, int isl, int target,
+ +				    unsigned long long addr, unsigned long size,
+ +				    struct nfp_cpp_area **area)
+ +{
+ +	u8 __iomem *res;
+ +	u32 dest;
+ +	int err;
+ +
+ +	dest = NFP_CPP_ISLAND_ID(target, NFP_CPP_ACTION_RW, 0, isl);
+ +
+ +	*area = nfp_cpp_area_alloc_with_name(cpp, dest, name, addr, size);
+ +	if (!*area) {
+ +		err = -EIO;
+ +		goto err_area;
+ +	}
+ +
+ +	err = nfp_cpp_area_acquire(*area);
+ +	if (err < 0)
+ +		goto err_acquire;
+ +
+ +	res = nfp_cpp_area_iomem(*area);
+ +	if (!res) {
+ +		err = -EIO;
+ +		goto err_map;
+ +	}
+ +
+ +	return res;
+ +
+ +err_map:
+ +	nfp_cpp_area_release(*area);
+ +err_acquire:
+ +	nfp_cpp_area_free(*area);
+ +err_area:
+ +	return (u8 __iomem *)ERR_PTR(err);
+ +}
+ +
+ +static void
+ +nfp_net_get_mac_addr_hwinfo(struct nfp_net *nn, struct nfp_cpp *cpp,
+ +			    unsigned int id)
+++=======
++  * nfp_net_get_mac_addr() - Get the MAC address.
++  * @pf:       NFP PF handle
++  * @port:     NFP port structure
++  * @id:	      NFP port id
++  *
++  * First try to get the MAC address from NSP ETH table. If that
++  * fails try HWInfo.  As a last resort generate a random address.
++  */
++ void
++ nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port, unsigned int id)
+++>>>>>>> 064dc3196ebd (nfp: move area mapping helper into nfpcore)
+  {
+ -	struct nfp_eth_table_port *eth_port;
+  	u8 mac_addr[ETH_ALEN];
+  	const char *mac_str;
+  	char name[32];
+@@@ -207,77 -159,63 +220,86 @@@ static unsigned int nfp_net_pf_get_num_
+  	return val;
+  }
+  
+ -static int nfp_net_pf_get_num_ports(struct nfp_pf *pf)
+ +static unsigned int
+ +nfp_net_pf_total_qcs(struct nfp_pf *pf, void __iomem *ctrl_bar,
+ +		     unsigned int stride, u32 start_off, u32 num_off)
+  {
+ -	return nfp_net_pf_rtsym_read_optional(pf, "nfd_cfg_pf%u_num_ports", 1);
+ -}
+ +	unsigned int i, min_qc, max_qc;
+  
+ -static int nfp_net_pf_get_app_id(struct nfp_pf *pf)
+ -{
+ -	return nfp_net_pf_rtsym_read_optional(pf, "_pf%u_net_app_id",
+ -					      NFP_APP_CORE_NIC);
+ +	min_qc = readl(ctrl_bar + start_off);
+ +	max_qc = min_qc;
+ +
+ +	for (i = 0; i < pf->num_ports; i++) {
+ +		/* To make our lives simpler only accept configuration where
+ +		 * queues are allocated to PFs in order (queues of PFn all have
+ +		 * indexes lower than PFn+1).
+ +		 */
+ +		if (max_qc > readl(ctrl_bar + start_off))
+ +			return 0;
+ +
+ +		max_qc = readl(ctrl_bar + start_off);
+ +		max_qc += readl(ctrl_bar + num_off) * stride;
+ +		ctrl_bar += NFP_PF_CSR_SLICE_SIZE;
+ +	}
+ +
+ +	return max_qc - min_qc;
+  }
+  
+ -static u8 __iomem *
+ -nfp_net_pf_map_rtsym(struct nfp_pf *pf, const char *name, const char *sym_fmt,
+ -		     unsigned int min_size, struct nfp_cpp_area **area)
+ +static u8 __iomem *nfp_net_pf_map_ctrl_bar(struct nfp_pf *pf)
+  {
+ -	const struct nfp_rtsym *sym;
+ +	const struct nfp_rtsym *ctrl_sym;
+ +	u8 __iomem *ctrl_bar;
+  	char pf_symbol[256];
+ -	u8 __iomem *mem;
+  
+ -	snprintf(pf_symbol, sizeof(pf_symbol), sym_fmt,
+ +	snprintf(pf_symbol, sizeof(pf_symbol), "_pf%u_net_bar0",
+  		 nfp_cppcore_pcie_unit(pf->cpp));
+  
+ -	sym = nfp_rtsym_lookup(pf->rtbl, pf_symbol);
+ -	if (!sym)
+ -		return (u8 __iomem *)ERR_PTR(-ENOENT);
+ -
+ -	if (sym->size < min_size) {
+ -		nfp_err(pf->cpp, "PF symbol %s too small\n", pf_symbol);
+ -		return (u8 __iomem *)ERR_PTR(-EINVAL);
+ +	ctrl_sym = nfp_rtsym_lookup(pf->cpp, pf_symbol);
+ +	if (!ctrl_sym) {
+ +		dev_err(&pf->pdev->dev,
+ +			"Failed to find PF BAR0 symbol %s\n", pf_symbol);
+ +		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ctrl_sym->size < pf->num_ports * NFP_PF_CSR_SLICE_SIZE) {
+ +		dev_err(&pf->pdev->dev,
+ +			"PF BAR0 too small to contain %d ports\n",
+ +			pf->num_ports);
+ +		return NULL;
+++=======
++ 	mem = nfp_cpp_map_area(pf->cpp, name, sym->domain, sym->target,
++ 			       sym->addr, sym->size, area);
++ 	if (IS_ERR(mem)) {
++ 		nfp_err(pf->cpp, "Failed to map PF symbol %s: %ld\n",
++ 			pf_symbol, PTR_ERR(mem));
++ 		return mem;
+++>>>>>>> 064dc3196ebd (nfp: move area mapping helper into nfpcore)
+  	}
+  
+ -	return mem;
+ -}
+ +	ctrl_bar = nfp_net_map_area(pf->cpp, "net.ctrl",
+ +				    ctrl_sym->domain, ctrl_sym->target,
+ +				    ctrl_sym->addr, ctrl_sym->size,
+ +				    &pf->ctrl_area);
+ +	if (IS_ERR(ctrl_bar)) {
+ +		dev_err(&pf->pdev->dev, "Failed to map PF BAR0: %ld\n",
+ +			PTR_ERR(ctrl_bar));
+ +		return NULL;
+ +	}
+  
+ -static void nfp_net_pf_free_vnic(struct nfp_pf *pf, struct nfp_net *nn)
+ -{
+ -	nfp_port_free(nn->port);
+ -	list_del(&nn->vnic_list);
+ -	pf->num_vnics--;
+ -	nfp_net_free(nn);
+ +	return ctrl_bar;
+  }
+  
+ -static void nfp_net_pf_free_vnics(struct nfp_pf *pf)
+ +static void nfp_net_pf_free_netdevs(struct nfp_pf *pf)
+  {
+ -	struct nfp_net *nn, *next;
+ +	struct nfp_net *nn;
+  
+ -	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list)
+ -		if (nfp_net_is_data_vnic(nn))
+ -			nfp_net_pf_free_vnic(pf, nn);
+ +	while (!list_empty(&pf->ports)) {
+ +		nn = list_first_entry(&pf->ports, struct nfp_net, port_list);
+ +		list_del(&nn->port_list);
+ +
+ +		nfp_net_netdev_free(nn);
+ +	}
+  }
+  
+  static struct nfp_net *
+@@@ -435,15 -404,186 +457,167 @@@ nfp_net_pf_spawn_netdevs(struct nfp_pf 
+  	return 0;
+  
+  err_prev_deinit:
+ -	list_for_each_entry_continue_reverse(nn, &pf->vnics, vnic_list)
+ -		if (nfp_net_is_data_vnic(nn))
+ -			nfp_net_pf_clean_vnic(pf, nn);
+ -	return err;
+ -}
+ -
+ -static int
+ -nfp_net_pf_app_init(struct nfp_pf *pf, u8 __iomem *qc_bar, unsigned int stride)
+ -{
+ -	u8 __iomem *ctrl_bar;
+ -	int err;
+ -
+ -	pf->app = nfp_app_alloc(pf, nfp_net_pf_get_app_id(pf));
+ -	if (IS_ERR(pf->app))
+ -		return PTR_ERR(pf->app);
+ -
+ -	err = nfp_app_init(pf->app);
+ -	if (err)
+ -		goto err_free;
+ -
+ -	if (!nfp_app_needs_ctrl_vnic(pf->app))
+ -		return 0;
+ -
+ -	ctrl_bar = nfp_net_pf_map_rtsym(pf, "net.ctrl", "_pf%u_net_ctrl_bar",
+ -					NFP_PF_CSR_SLICE_SIZE,
+ -					&pf->ctrl_vnic_bar);
+ -	if (IS_ERR(ctrl_bar)) {
+ -		nfp_err(pf->cpp, "Failed to find data vNIC memory symbol\n");
+ -		err = PTR_ERR(ctrl_bar);
+ -		goto err_free;
+ +	list_for_each_entry_continue_reverse(nn, &pf->ports, port_list) {
+ +		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ +		nfp_net_netdev_clean(nn->netdev);
+  	}
+++<<<<<<< HEAD
+ +	nfp_net_irqs_disable(pf->pdev);
+ +err_vec_free:
+ +	kfree(pf->irq_entries);
+ +err_nn_free:
+ +	nfp_net_pf_free_netdevs(pf);
+++=======
++ 
++ 	pf->ctrl_vnic =	nfp_net_pf_alloc_vnic(pf, false, ctrl_bar, qc_bar,
++ 					      stride, 0);
++ 	if (IS_ERR(pf->ctrl_vnic)) {
++ 		err = PTR_ERR(pf->ctrl_vnic);
++ 		goto err_unmap;
++ 	}
++ 
++ 	return 0;
++ 
++ err_unmap:
++ 	nfp_cpp_area_release_free(pf->ctrl_vnic_bar);
++ err_free:
++ 	nfp_app_free(pf->app);
++ 	return err;
++ }
++ 
++ static void nfp_net_pf_app_clean(struct nfp_pf *pf)
++ {
++ 	if (pf->ctrl_vnic) {
++ 		nfp_net_pf_free_vnic(pf, pf->ctrl_vnic);
++ 		nfp_cpp_area_release_free(pf->ctrl_vnic_bar);
++ 	}
++ 	nfp_app_free(pf->app);
++ 	pf->app = NULL;
++ }
++ 
++ static int nfp_net_pf_app_start_ctrl(struct nfp_pf *pf)
++ {
++ 	int err;
++ 
++ 	if (!pf->ctrl_vnic)
++ 		return 0;
++ 	err = nfp_net_pf_init_vnic(pf, pf->ctrl_vnic, 0);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_ctrl_open(pf->ctrl_vnic);
++ 	if (err)
++ 		goto err_clean_ctrl;
++ 
++ 	return 0;
++ 
++ err_clean_ctrl:
++ 	nfp_net_pf_clean_vnic(pf, pf->ctrl_vnic);
++ 	return err;
++ }
++ 
++ static void nfp_net_pf_app_stop_ctrl(struct nfp_pf *pf)
++ {
++ 	if (!pf->ctrl_vnic)
++ 		return;
++ 	nfp_ctrl_close(pf->ctrl_vnic);
++ 	nfp_net_pf_clean_vnic(pf, pf->ctrl_vnic);
++ }
++ 
++ static int nfp_net_pf_app_start(struct nfp_pf *pf)
++ {
++ 	int err;
++ 
++ 	err = nfp_net_pf_app_start_ctrl(pf);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_app_start(pf->app, pf->ctrl_vnic);
++ 	if (err)
++ 		goto err_ctrl_stop;
++ 
++ 	return 0;
++ 
++ err_ctrl_stop:
++ 	nfp_net_pf_app_stop_ctrl(pf);
++ 	return err;
++ }
++ 
++ static void nfp_net_pf_app_stop(struct nfp_pf *pf)
++ {
++ 	nfp_app_stop(pf->app);
++ 	nfp_net_pf_app_stop_ctrl(pf);
++ }
++ 
++ static void nfp_net_pci_unmap_mem(struct nfp_pf *pf)
++ {
++ 	if (pf->vf_cfg_bar)
++ 		nfp_cpp_area_release_free(pf->vf_cfg_bar);
++ 	if (pf->mac_stats_bar)
++ 		nfp_cpp_area_release_free(pf->mac_stats_bar);
++ 	nfp_cpp_area_release_free(pf->qc_area);
++ 	nfp_cpp_area_release_free(pf->data_vnic_bar);
++ }
++ 
++ static int nfp_net_pci_map_mem(struct nfp_pf *pf)
++ {
++ 	u32 ctrl_bar_sz;
++ 	u8 __iomem *mem;
++ 	int err;
++ 
++ 	ctrl_bar_sz = pf->max_data_vnics * NFP_PF_CSR_SLICE_SIZE;
++ 	mem = nfp_net_pf_map_rtsym(pf, "net.ctrl", "_pf%d_net_bar0",
++ 				   ctrl_bar_sz, &pf->data_vnic_bar);
++ 	if (IS_ERR(mem)) {
++ 		nfp_err(pf->cpp, "Failed to find data vNIC memory symbol\n");
++ 		return PTR_ERR(mem);
++ 	}
++ 
++ 	pf->mac_stats_mem = nfp_net_pf_map_rtsym(pf, "net.macstats",
++ 						 "_mac_stats",
++ 						 NFP_MAC_STATS_SIZE *
++ 						 (pf->eth_tbl->max_index + 1),
++ 						 &pf->mac_stats_bar);
++ 	if (IS_ERR(pf->mac_stats_mem)) {
++ 		if (PTR_ERR(pf->mac_stats_mem) != -ENOENT) {
++ 			err = PTR_ERR(pf->mac_stats_mem);
++ 			goto err_unmap_ctrl;
++ 		}
++ 		pf->mac_stats_mem = NULL;
++ 	}
++ 
++ 	pf->vf_cfg_mem = nfp_net_pf_map_rtsym(pf, "net.vfcfg",
++ 					      "_pf%d_net_vf_bar",
++ 					      NFP_NET_CFG_BAR_SZ *
++ 					      pf->limit_vfs, &pf->vf_cfg_bar);
++ 	if (IS_ERR(pf->vf_cfg_mem)) {
++ 		if (PTR_ERR(pf->vf_cfg_mem) != -ENOENT) {
++ 			err = PTR_ERR(pf->vf_cfg_mem);
++ 			goto err_unmap_mac_stats;
++ 		}
++ 		pf->vf_cfg_mem = NULL;
++ 	}
++ 
++ 	mem = nfp_cpp_map_area(pf->cpp, "net.qc", 0, 0,
++ 			       NFP_PCIE_QUEUE(0), NFP_QCP_QUEUE_AREA_SZ,
++ 			       &pf->qc_area);
++ 	if (IS_ERR(mem)) {
++ 		nfp_err(pf->cpp, "Failed to map Queue Controller area.\n");
++ 		err = PTR_ERR(mem);
++ 		goto err_unmap_vf_cfg;
++ 	}
++ 
++ 	return 0;
++ 
++ err_unmap_vf_cfg:
++ 	if (pf->vf_cfg_bar)
++ 		nfp_cpp_area_release_free(pf->vf_cfg_bar);
++ err_unmap_mac_stats:
++ 	if (pf->mac_stats_bar)
++ 		nfp_cpp_area_release_free(pf->mac_stats_bar);
++ err_unmap_ctrl:
++ 	nfp_cpp_area_release_free(pf->data_vnic_bar);
+++>>>>>>> 064dc3196ebd (nfp: move area mapping helper into nfpcore)
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+index 2aa8e5566012..bc18549b7078 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+@@ -235,6 +235,9 @@ struct nfp_cpp_area *nfp_cpp_area_alloc_with_name(struct nfp_cpp *cpp,
+ struct nfp_cpp_area *nfp_cpp_area_alloc(struct nfp_cpp *cpp, u32 cpp_id,
+ 					unsigned long long address,
+ 					unsigned long size);
++struct nfp_cpp_area *
++nfp_cpp_area_alloc_acquire(struct nfp_cpp *cpp, const char *name, u32 cpp_id,
++			   unsigned long long address, unsigned long size);
+ void nfp_cpp_area_free(struct nfp_cpp_area *area);
+ int nfp_cpp_area_acquire(struct nfp_cpp_area *area);
+ int nfp_cpp_area_acquire_nonblocking(struct nfp_cpp_area *area);
+@@ -283,6 +286,10 @@ int nfp_cpp_readq(struct nfp_cpp *cpp, u32 cpp_id,
+ int nfp_cpp_writeq(struct nfp_cpp *cpp, u32 cpp_id,
+ 		   unsigned long long address, u64 value);
+ 
++u8 __iomem *
++nfp_cpp_map_area(struct nfp_cpp *cpp, const char *name, int domain, int target,
++		 u64 addr, unsigned long size, struct nfp_cpp_area **area);
++
+ struct nfp_cpp_mutex;
+ 
+ int nfp_cpp_mutex_init(struct nfp_cpp *cpp, int target,
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
+index d56f0eb94c21..d3d67ab4da47 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
+@@ -404,6 +404,41 @@ nfp_cpp_area_alloc(struct nfp_cpp *cpp, u32 dest,
+ 	return nfp_cpp_area_alloc_with_name(cpp, dest, NULL, address, size);
+ }
+ 
++/**
++ * nfp_cpp_area_alloc_acquire() - allocate a new CPP area and lock it down
++ * @cpp:	CPP handle
++ * @name:	Name of region
++ * @dest:	CPP id
++ * @address:	Start address on CPP target
++ * @size:	Size of area
++ *
++ * Allocate and initialize a CPP area structure, and lock it down so
++ * that it can be accessed directly.
++ *
++ * NOTE: @address and @size must be 32-bit aligned values.
++ *
++ * NOTE: The area must also be 'released' when the structure is freed.
++ *
++ * Return: NFP CPP Area handle, or NULL
++ */
++struct nfp_cpp_area *
++nfp_cpp_area_alloc_acquire(struct nfp_cpp *cpp, const char *name, u32 dest,
++			   unsigned long long address, unsigned long size)
++{
++	struct nfp_cpp_area *area;
++
++	area = nfp_cpp_area_alloc_with_name(cpp, dest, name, address, size);
++	if (!area)
++		return NULL;
++
++	if (nfp_cpp_area_acquire(area)) {
++		nfp_cpp_area_free(area);
++		return NULL;
++	}
++
++	return area;
++}
++
+ /**
+  * nfp_cpp_area_free() - free up the CPP area
+  * @area:	CPP area handle
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpplib.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpplib.c
+index 0ba0379b8f75..ab86bceb93f2 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpplib.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpplib.c
+@@ -279,3 +279,43 @@ exit_release:
+ 
+ 	return err;
+ }
++
++/**
++ * nfp_cpp_map_area() - Helper function to map an area
++ * @cpp:    NFP CPP handler
++ * @name:   Name for the area
++ * @domain: CPP domain
++ * @target: CPP target
++ * @addr:   CPP address
++ * @size:   Size of the area
++ * @area:   Area handle (output)
++ *
++ * Map an area of IOMEM access.  To undo the effect of this function call
++ * @nfp_cpp_area_release_free(*area).
++ *
++ * Return: Pointer to memory mapped area or ERR_PTR
++ */
++u8 __iomem *
++nfp_cpp_map_area(struct nfp_cpp *cpp, const char *name, int domain, int target,
++		 u64 addr, unsigned long size, struct nfp_cpp_area **area)
++{
++	u8 __iomem *res;
++	u32 dest;
++
++	dest = NFP_CPP_ISLAND_ID(target, NFP_CPP_ACTION_RW, 0, domain);
++
++	*area = nfp_cpp_area_alloc_acquire(cpp, name, dest, addr, size);
++	if (!*area)
++		goto err_eio;
++
++	res = nfp_cpp_area_iomem(*area);
++	if (!res)
++		goto err_release_free;
++
++	return res;
++
++err_release_free:
++	nfp_cpp_area_release_free(*area);
++err_eio:
++	return (u8 __iomem *)ERR_PTR(-EIO);
++}
