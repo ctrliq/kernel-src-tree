@@ -1,0 +1,315 @@
+qed: Chain support for external PBL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 1a4a69751f4d24ffd3530f5a9694636db1566a3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1a4a6975.failed
+
+iWARP would require the chains to allocate/free their PBL memory
+independently, so add the infrastructure to provide it externally.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a4a69751f4d24ffd3530f5a9694636db1566a3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index 523f28dc8301,37ad79917770..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -1289,8 -1385,9 +1288,14 @@@ static int qede_alloc_mem_txq(struct qe
+  					    QED_CHAIN_USE_TO_CONSUME_PRODUCE,
+  					    QED_CHAIN_MODE_PBL,
+  					    QED_CHAIN_CNT_TYPE_U16,
+++<<<<<<< HEAD
+ +					    TX_RING_SIZE,
+ +					    sizeof(*p_virt), &txq->tx_pbl);
+++=======
++ 					    txq->num_tx_buffers,
++ 					    sizeof(*p_virt),
++ 					    &txq->tx_pbl, NULL);
+++>>>>>>> 1a4a69751f4d (qed: Chain support for external PBL)
+  	if (rc)
+  		goto err;
+  
+diff --git a/drivers/infiniband/hw/qedr/main.c b/drivers/infiniband/hw/qedr/main.c
+index ef11e770f822..499c225729cd 100644
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -275,7 +275,7 @@ static int qedr_alloc_resources(struct qedr_dev *dev)
+ 						   QED_CHAIN_CNT_TYPE_U16,
+ 						   n_entries,
+ 						   sizeof(struct regpair *),
+-						   &cnq->pbl);
++						   &cnq->pbl, NULL);
+ 		if (rc)
+ 			goto err4;
+ 
+diff --git a/drivers/infiniband/hw/qedr/verbs.c b/drivers/infiniband/hw/qedr/verbs.c
+index 37fe28d21ada..69045385c217 100644
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -925,7 +925,7 @@ struct ib_cq *qedr_create_cq(struct ib_device *ibdev,
+ 						   QED_CHAIN_CNT_TYPE_U32,
+ 						   chain_entries,
+ 						   sizeof(union rdma_cqe),
+-						   &cq->pbl);
++						   &cq->pbl, NULL);
+ 		if (rc)
+ 			goto err1;
+ 
+@@ -1411,7 +1411,7 @@ qedr_roce_create_kernel_qp(struct qedr_dev *dev,
+ 					   QED_CHAIN_CNT_TYPE_U32,
+ 					   n_sq_elems,
+ 					   QEDR_SQE_ELEMENT_SIZE,
+-					   &qp->sq.pbl);
++					   &qp->sq.pbl, NULL);
+ 
+ 	if (rc)
+ 		return rc;
+@@ -1425,7 +1425,7 @@ qedr_roce_create_kernel_qp(struct qedr_dev *dev,
+ 					   QED_CHAIN_CNT_TYPE_U32,
+ 					   n_rq_elems,
+ 					   QEDR_RQE_ELEMENT_SIZE,
+-					   &qp->rq.pbl);
++					   &qp->rq.pbl, NULL);
+ 	if (rc)
+ 		return rc;
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev.c b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 1b5a3d62b9f3..95903c2f04d7 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -2970,12 +2970,15 @@ static void qed_chain_free_pbl(struct qed_dev *cdev, struct qed_chain *p_chain)
+ 	}
+ 
+ 	pbl_size = page_cnt * QED_CHAIN_PBL_ENTRY_SIZE;
+-	dma_free_coherent(&cdev->pdev->dev,
+-			  pbl_size,
+-			  p_chain->pbl_sp.p_virt_table,
+-			  p_chain->pbl_sp.p_phys_table);
++
++	if (!p_chain->b_external_pbl)
++		dma_free_coherent(&cdev->pdev->dev,
++				  pbl_size,
++				  p_chain->pbl_sp.p_virt_table,
++				  p_chain->pbl_sp.p_phys_table);
+ out:
+ 	vfree(p_chain->pbl.pp_virt_addr_tbl);
++	p_chain->pbl.pp_virt_addr_tbl = NULL;
+ }
+ 
+ void qed_chain_free(struct qed_dev *cdev, struct qed_chain *p_chain)
+@@ -3069,7 +3072,10 @@ qed_chain_alloc_single(struct qed_dev *cdev, struct qed_chain *p_chain)
+ 	return 0;
+ }
+ 
+-static int qed_chain_alloc_pbl(struct qed_dev *cdev, struct qed_chain *p_chain)
++static int
++qed_chain_alloc_pbl(struct qed_dev *cdev,
++		    struct qed_chain *p_chain,
++		    struct qed_chain_ext_pbl *ext_pbl)
+ {
+ 	u32 page_cnt = p_chain->page_cnt, size, i;
+ 	dma_addr_t p_phys = 0, p_pbl_phys = 0;
+@@ -3089,8 +3095,16 @@ static int qed_chain_alloc_pbl(struct qed_dev *cdev, struct qed_chain *p_chain)
+ 	 * should be saved to allow its freeing during the error flow.
+ 	 */
+ 	size = page_cnt * QED_CHAIN_PBL_ENTRY_SIZE;
+-	p_pbl_virt = dma_alloc_coherent(&cdev->pdev->dev,
+-					size, &p_pbl_phys, GFP_KERNEL);
++
++	if (!ext_pbl) {
++		p_pbl_virt = dma_alloc_coherent(&cdev->pdev->dev,
++						size, &p_pbl_phys, GFP_KERNEL);
++	} else {
++		p_pbl_virt = ext_pbl->p_pbl_virt;
++		p_pbl_phys = ext_pbl->p_pbl_phys;
++		p_chain->b_external_pbl = true;
++	}
++
+ 	qed_chain_init_pbl_mem(p_chain, p_pbl_virt, p_pbl_phys,
+ 			       pp_virt_addr_tbl);
+ 	if (!p_pbl_virt)
+@@ -3123,7 +3137,10 @@ int qed_chain_alloc(struct qed_dev *cdev,
+ 		    enum qed_chain_use_mode intended_use,
+ 		    enum qed_chain_mode mode,
+ 		    enum qed_chain_cnt_type cnt_type,
+-		    u32 num_elems, size_t elem_size, struct qed_chain *p_chain)
++		    u32 num_elems,
++		    size_t elem_size,
++		    struct qed_chain *p_chain,
++		    struct qed_chain_ext_pbl *ext_pbl)
+ {
+ 	u32 page_cnt;
+ 	int rc = 0;
+@@ -3154,7 +3171,7 @@ int qed_chain_alloc(struct qed_dev *cdev,
+ 		rc = qed_chain_alloc_single(cdev, p_chain);
+ 		break;
+ 	case QED_CHAIN_MODE_PBL:
+-		rc = qed_chain_alloc_pbl(cdev, p_chain);
++		rc = qed_chain_alloc_pbl(cdev, p_chain, ext_pbl);
+ 		break;
+ 	}
+ 	if (rc)
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+index b4aee25d860f..e285eba53e90 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+@@ -283,6 +283,7 @@ int qed_dmae_host2host(struct qed_hwfn *p_hwfn,
+  * @param num_elems
+  * @param elem_size
+  * @param p_chain
++ * @param ext_pbl - a possible external PBL
+  *
+  * @return int
+  */
+@@ -291,7 +292,9 @@ qed_chain_alloc(struct qed_dev *cdev,
+ 		enum qed_chain_use_mode intended_use,
+ 		enum qed_chain_mode mode,
+ 		enum qed_chain_cnt_type cnt_type,
+-		u32 num_elems, size_t elem_size, struct qed_chain *p_chain);
++		u32 num_elems,
++		size_t elem_size,
++		struct qed_chain *p_chain, struct qed_chain_ext_pbl *ext_pbl);
+ 
+ /**
+  * @brief qed_chain_free - Free chain DMA memory
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_iscsi.c b/drivers/net/ethernet/qlogic/qed/qed_iscsi.c
+index 25cb9950a6ff..7ea8fc6fd198 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_iscsi.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_iscsi.c
+@@ -746,7 +746,7 @@ static int qed_iscsi_allocate_connection(struct qed_hwfn *p_hwfn,
+ 			     QED_CHAIN_USE_TO_CONSUME_PRODUCE,
+ 			     QED_CHAIN_MODE_PBL,
+ 			     QED_CHAIN_CNT_TYPE_U16,
+-			     r2tq_num_elements, 0x80, &p_conn->r2tq);
++			     r2tq_num_elements, 0x80, &p_conn->r2tq, NULL);
+ 	if (rc)
+ 		goto nomem_r2tq;
+ 
+@@ -757,7 +757,7 @@ static int qed_iscsi_allocate_connection(struct qed_hwfn *p_hwfn,
+ 			     QED_CHAIN_MODE_PBL,
+ 			     QED_CHAIN_CNT_TYPE_U16,
+ 			     uhq_num_elements,
+-			     sizeof(struct iscsi_uhqe), &p_conn->uhq);
++			     sizeof(struct iscsi_uhqe), &p_conn->uhq, NULL);
+ 	if (rc)
+ 		goto nomem_uhq;
+ 
+@@ -767,7 +767,7 @@ static int qed_iscsi_allocate_connection(struct qed_hwfn *p_hwfn,
+ 			     QED_CHAIN_MODE_PBL,
+ 			     QED_CHAIN_CNT_TYPE_U16,
+ 			     xhq_num_elements,
+-			     sizeof(struct iscsi_xhqe), &p_conn->xhq);
++			     sizeof(struct iscsi_xhqe), &p_conn->xhq, NULL);
+ 	if (rc)
+ 		goto nomem;
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_ll2.c b/drivers/net/ethernet/qlogic/qed/qed_ll2.c
+index 6b0af0a3aa1a..4d8ccfcb46e5 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_ll2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_ll2.c
+@@ -1249,7 +1249,7 @@ qed_ll2_acquire_connection_rx(struct qed_hwfn *p_hwfn,
+ 			     QED_CHAIN_CNT_TYPE_U16,
+ 			     rx_num_desc,
+ 			     sizeof(struct core_rx_bd),
+-			     &p_ll2_info->rx_queue.rxq_chain);
++			     &p_ll2_info->rx_queue.rxq_chain, NULL);
+ 	if (rc) {
+ 		DP_NOTICE(p_hwfn, "Failed to allocate ll2 rxq chain\n");
+ 		goto out;
+@@ -1271,7 +1271,7 @@ qed_ll2_acquire_connection_rx(struct qed_hwfn *p_hwfn,
+ 			     QED_CHAIN_CNT_TYPE_U16,
+ 			     rx_num_desc,
+ 			     sizeof(struct core_rx_fast_path_cqe),
+-			     &p_ll2_info->rx_queue.rcq_chain);
++			     &p_ll2_info->rx_queue.rcq_chain, NULL);
+ 	if (rc) {
+ 		DP_NOTICE(p_hwfn, "Failed to allocate ll2 rcq chain\n");
+ 		goto out;
+@@ -1302,7 +1302,7 @@ static int qed_ll2_acquire_connection_tx(struct qed_hwfn *p_hwfn,
+ 			     QED_CHAIN_CNT_TYPE_U16,
+ 			     tx_num_desc,
+ 			     sizeof(struct core_tx_bd),
+-			     &p_ll2_info->tx_queue.txq_chain);
++			     &p_ll2_info->tx_queue.txq_chain, NULL);
+ 	if (rc)
+ 		goto out;
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_spq.c b/drivers/net/ethernet/qlogic/qed/qed_spq.c
+index dede73f41e61..a971916af7cc 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_spq.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_spq.c
+@@ -419,7 +419,7 @@ int qed_eq_alloc(struct qed_hwfn *p_hwfn, u16 num_elem)
+ 			    QED_CHAIN_CNT_TYPE_U16,
+ 			    num_elem,
+ 			    sizeof(union event_ring_element),
+-			    &p_eq->chain))
++			    &p_eq->chain, NULL))
+ 		goto eq_allocate_fail;
+ 
+ 	/* register EQ completion on the SP SB */
+@@ -547,7 +547,7 @@ int qed_spq_alloc(struct qed_hwfn *p_hwfn)
+ 			    QED_CHAIN_CNT_TYPE_U16,
+ 			    0,   /* N/A when the mode is SINGLE */
+ 			    sizeof(struct slow_path_element),
+-			    &p_spq->chain))
++			    &p_spq->chain, NULL))
+ 		goto spq_allocate_fail;
+ 
+ 	/* allocate and fill the SPQ elements (incl. ramrod data list) */
+@@ -953,7 +953,7 @@ int qed_consq_alloc(struct qed_hwfn *p_hwfn)
+ 			    QED_CHAIN_MODE_PBL,
+ 			    QED_CHAIN_CNT_TYPE_U16,
+ 			    QED_CHAIN_PAGE_SIZE / 0x80,
+-			    0x80, &p_consq->chain))
++			    0x80, &p_consq->chain, NULL))
+ 		goto consq_allocate_fail;
+ 
+ 	p_hwfn->p_consq = p_consq;
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --git a/include/linux/qed/qed_chain.h b/include/linux/qed/qed_chain.h
+index 5cd7a4608c9b..59ddf9af909e 100644
+--- a/include/linux/qed/qed_chain.h
++++ b/include/linux/qed/qed_chain.h
+@@ -80,6 +80,11 @@ struct qed_chain_pbl_u32 {
+ 	u32 cons_page_idx;
+ };
+ 
++struct qed_chain_ext_pbl {
++	dma_addr_t p_pbl_phys;
++	void *p_pbl_virt;
++};
++
+ struct qed_chain_u16 {
+ 	/* Cyclic index of next element to produce/consme */
+ 	u16 prod_idx;
+@@ -155,6 +160,8 @@ struct qed_chain {
+ 	u32 size;
+ 
+ 	u8 intended_use;
++
++	bool b_external_pbl;
+ };
+ 
+ #define QED_CHAIN_PBL_ENTRY_SIZE        (8)
+diff --git a/include/linux/qed/qed_if.h b/include/linux/qed/qed_if.h
+index cbe538f3b78a..3bcbd247a8e2 100644
+--- a/include/linux/qed/qed_if.h
++++ b/include/linux/qed/qed_if.h
+@@ -611,7 +611,8 @@ struct qed_common_ops {
+ 				       enum qed_chain_cnt_type cnt_type,
+ 				       u32 num_elems,
+ 				       size_t elem_size,
+-				       struct qed_chain *p_chain);
++				       struct qed_chain *p_chain,
++				       struct qed_chain_ext_pbl *ext_pbl);
+ 
+ 	void		(*chain_free)(struct qed_dev *cdev,
+ 				      struct qed_chain *p_chain);
