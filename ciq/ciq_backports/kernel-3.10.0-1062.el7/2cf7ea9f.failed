@@ -1,0 +1,154 @@
+KVM: VMX: hide flexpriority from guest when disabled at the module level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 2cf7ea9f40fabee0f8b40db4eb2d1e85cc6c0a95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2cf7ea9f.failed
+
+As of commit 8d860bbeedef ("kvm: vmx: Basic APIC virtualization controls
+have three settings"), KVM will disable VIRTUALIZE_APIC_ACCESSES when
+a nested guest writes APIC_BASE MSR and kvm-intel.flexpriority=0,
+whereas previously KVM would allow a nested guest to enable
+VIRTUALIZE_APIC_ACCESSES so long as it's supported in hardware.  That is,
+KVM now advertises VIRTUALIZE_APIC_ACCESSES to a guest but doesn't
+(always) allow setting it when kvm-intel.flexpriority=0, and may even
+initially allow the control and then clear it when the nested guest
+writes APIC_BASE MSR, which is decidedly odd even if it doesn't cause
+functional issues.
+
+Hide the control completely when the module parameter is cleared.
+
+reported-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Fixes: 8d860bbeedef ("kvm: vmx: Basic APIC virtualization controls have three settings")
+	Cc: Jim Mattson <jmattson@google.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2cf7ea9f40fabee0f8b40db4eb2d1e85cc6c0a95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,55b62760b694..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -2936,16 -3585,22 +2936,33 @@@ static void nested_vmx_setup_ctls_msrs(
+  	 * depend on CPUID bits, they are added later by vmx_cpuid_update.
+  	 */
+  	rdmsr(MSR_IA32_VMX_PROCBASED_CTLS2,
+++<<<<<<< HEAD
+ +		vmx->nested.nested_vmx_secondary_ctls_low,
+ +		vmx->nested.nested_vmx_secondary_ctls_high);
+ +	vmx->nested.nested_vmx_secondary_ctls_low = 0;
+ +	vmx->nested.nested_vmx_secondary_ctls_high &=
+ +		SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES |
+++=======
++ 		msrs->secondary_ctls_low,
++ 		msrs->secondary_ctls_high);
++ 	msrs->secondary_ctls_low = 0;
++ 	msrs->secondary_ctls_high &=
+++>>>>>>> 2cf7ea9f40fa (KVM: VMX: hide flexpriority from guest when disabled at the module level)
+  		SECONDARY_EXEC_DESC |
+  		SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
+  		SECONDARY_EXEC_APIC_REGISTER_VIRT |
+  		SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY |
+  		SECONDARY_EXEC_WBINVD_EXITING;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * We can emulate "VMCS shadowing," even if the hardware
++ 	 * doesn't support it.
++ 	 */
++ 	msrs->secondary_ctls_high |=
++ 		SECONDARY_EXEC_SHADOW_VMCS;
+++>>>>>>> 2cf7ea9f40fa (KVM: VMX: hide flexpriority from guest when disabled at the module level)
+  
+  	if (enable_ept) {
+  		/* nested EPT: emulate EPT also to L1 */
+@@@ -2975,26 -3641,71 +2992,30 @@@
+  	 * not failing the single-context invvpid, and it is worse.
+  	 */
+  	if (enable_vpid) {
+ -		msrs->secondary_ctls_high |=
+ +		vmx->nested.nested_vmx_secondary_ctls_high |=
+  			SECONDARY_EXEC_ENABLE_VPID;
+ -		msrs->vpid_caps = VMX_VPID_INVVPID_BIT |
+ +		vmx->nested.nested_vmx_vpid_caps = VMX_VPID_INVVPID_BIT |
+  			VMX_VPID_EXTENT_SUPPORTED_MASK;
+ -	}
+ +	} else
+ +		vmx->nested.nested_vmx_vpid_caps = 0;
+  
+  	if (enable_unrestricted_guest)
+ -		msrs->secondary_ctls_high |=
+ +		vmx->nested.nested_vmx_secondary_ctls_high |=
+  			SECONDARY_EXEC_UNRESTRICTED_GUEST;
+  
++ 	if (flexpriority_enabled)
++ 		msrs->secondary_ctls_high |=
++ 			SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
++ 
+  	/* miscellaneous data */
+  	rdmsr(MSR_IA32_VMX_MISC,
+ -		msrs->misc_low,
+ -		msrs->misc_high);
+ -	msrs->misc_low &= VMX_MISC_SAVE_EFER_LMA;
+ -	msrs->misc_low |=
+ -		MSR_IA32_VMX_MISC_VMWRITE_SHADOW_RO_FIELDS |
+ +		vmx->nested.nested_vmx_misc_low,
+ +		vmx->nested.nested_vmx_misc_high);
+ +	vmx->nested.nested_vmx_misc_low &= VMX_MISC_SAVE_EFER_LMA;
+ +	vmx->nested.nested_vmx_misc_low |=
+  		VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE |
+  		VMX_MISC_ACTIVITY_HLT;
+ -	msrs->misc_high = 0;
+ -
+ -	/*
+ -	 * This MSR reports some information about VMX support. We
+ -	 * should return information about the VMX we emulate for the
+ -	 * guest, and the VMCS structure we give it - not about the
+ -	 * VMX support of the underlying hardware.
+ -	 */
+ -	msrs->basic =
+ -		VMCS12_REVISION |
+ -		VMX_BASIC_TRUE_CTLS |
+ -		((u64)VMCS12_SIZE << VMX_BASIC_VMCS_SIZE_SHIFT) |
+ -		(VMX_BASIC_MEM_TYPE_WB << VMX_BASIC_MEM_TYPE_SHIFT);
+ -
+ -	if (cpu_has_vmx_basic_inout())
+ -		msrs->basic |= VMX_BASIC_INOUT;
+ -
+ -	/*
+ -	 * These MSRs specify bits which the guest must keep fixed on
+ -	 * while L1 is in VMXON mode (in L1's root mode, or running an L2).
+ -	 * We picked the standard core2 setting.
+ -	 */
+ -#define VMXON_CR0_ALWAYSON     (X86_CR0_PE | X86_CR0_PG | X86_CR0_NE)
+ -#define VMXON_CR4_ALWAYSON     X86_CR4_VMXE
+ -	msrs->cr0_fixed0 = VMXON_CR0_ALWAYSON;
+ -	msrs->cr4_fixed0 = VMXON_CR4_ALWAYSON;
+ -
+ -	/* These MSRs specify bits which the guest must keep fixed off. */
+ -	rdmsrl(MSR_IA32_VMX_CR0_FIXED1, msrs->cr0_fixed1);
+ -	rdmsrl(MSR_IA32_VMX_CR4_FIXED1, msrs->cr4_fixed1);
+ -
+ -	/* highest index: VMX_PREEMPTION_TIMER_VALUE */
+ -	msrs->vmcs_enum = VMCS12_MAX_FIELD_INDEX << 1;
+ -}
+ -
+ -/*
+ - * if fixed0[i] == 1: val[i] must be 1
+ - * if fixed1[i] == 0: val[i] must be 0
+ - */
+ -static inline bool fixed_bits_valid(u64 val, u64 fixed0, u64 fixed1)
+ -{
+ -	return ((val & fixed1) | fixed0) == val;
+ +	vmx->nested.nested_vmx_misc_high = 0;
+  }
+  
+  static inline bool vmx_control_verify(u32 control, u32 low, u32 high)
+* Unmerged path arch/x86/kvm/vmx.c
