@@ -993,6 +993,8 @@ add:
 		nsiblings = iter->rt6i_nsiblings;
 		iter->rt6i_node = NULL;
 		fib6_purge_rt(iter, fn, info->nl_net);
+		if (fn->rr_ptr == iter)
+			fn->rr_ptr = NULL;
 		rt6_release(iter);
 
 		if (nsiblings) {
@@ -1006,6 +1008,8 @@ add:
 					*ins = iter->dst.rt6_next;
 					iter->rt6i_node = NULL;
 					fib6_purge_rt(iter, fn, info->nl_net);
+					if (fn->rr_ptr == iter)
+						fn->rr_ptr = NULL;
 					rt6_release(iter);
 					nsiblings--;
 				} else {
