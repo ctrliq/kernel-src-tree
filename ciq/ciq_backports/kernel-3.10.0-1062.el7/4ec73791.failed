@@ -1,0 +1,115 @@
+PCI: Work around Pericom PCIe-to-PCI bridge Retrain Link erratum
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [pci] Work around Pericom PCIe-to-PCI bridge Retrain Link erratum (Myron Stowe) [1677010]
+Rebuild_FUZZ: 95.93%
+commit-author Stefan Mätje <stefan.maetje@esd.eu>
+commit 4ec73791a64bab25cabf16a6067ee478692e506d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4ec73791.failed
+
+Due to an erratum in some Pericom PCIe-to-PCI bridges in reverse mode
+(conventional PCI on primary side, PCIe on downstream side), the Retrain
+Link bit needs to be cleared manually to allow the link training to
+complete successfully.
+
+If it is not cleared manually, the link training is continuously restarted
+and no devices below the PCI-to-PCIe bridge can be accessed.  That means
+drivers for devices below the bridge will be loaded but won't work and may
+even crash because the driver is only reading 0xffff.
+
+See the Pericom Errata Sheet PI7C9X111SLB_errata_rev1.2_102711.pdf for
+details.  Devices known as affected so far are: PI7C9X110, PI7C9X111SL,
+PI7C9X130.
+
+Add a new flag, clear_retrain_link, in struct pci_dev.  Quirks for affected
+devices set this bit.
+
+Note that pcie_retrain_link() lives in aspm.c because that's currently the
+only place we use it, but this erratum is not specific to ASPM, and we may
+retrain links for other reasons in the future.
+
+	Signed-off-by: Stefan Mätje <stefan.maetje@esd.eu>
+[bhelgaas: apply regardless of CONFIG_PCIEASPM]
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+CC: stable@vger.kernel.org
+(cherry picked from commit 4ec73791a64bab25cabf16a6067ee478692e506d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pci.h
+diff --cc include/linux/pci.h
+index 33410ddbcbe9,2c056a7a728a..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -322,9 -344,12 +322,18 @@@ struct pci_dev 
+  						   D3cold, not set for devices
+  						   powered on/off by the
+  						   corresponding bridge */
+++<<<<<<< HEAD
+ +	RH_KABI_FILL_HOLE(unsigned int  ignore_hotplug:1)
+ +	RH_KABI_FILL_HOLE(unsigned int  hotplug_user_indicators:1)
+ +	RH_KABI_FILL_HOLE(unsigned int  bridge_d3:1)  /* Allow D3 for bridge*/
+++=======
++ 	unsigned int	ignore_hotplug:1;	/* Ignore hotplug events */
++ 	unsigned int	hotplug_user_indicators:1; /* SlotCtl indicators
++ 						      controlled exclusively by
++ 						      user sysfs */
++ 	unsigned int	clear_retrain_link:1;	/* Need to clear Retrain Link
++ 						   bit manually */
+++>>>>>>> 4ec73791a64b (PCI: Work around Pericom PCIe-to-PCI bridge Retrain Link erratum)
+  	unsigned int	d3_delay;	/* D3->D0 transition time in ms */
+  	unsigned int	d3cold_delay;	/* D3cold->D0 transition time in ms */
+  
+diff --git a/drivers/pci/pcie/aspm.c b/drivers/pci/pcie/aspm.c
+index d64d17cfaec9..7768ee274b25 100644
+--- a/drivers/pci/pcie/aspm.c
++++ b/drivers/pci/pcie/aspm.c
+@@ -181,6 +181,15 @@ static bool pcie_retrain_link(struct pcie_link_state *link)
+ 	pcie_capability_read_word(parent, PCI_EXP_LNKCTL, &reg16);
+ 	reg16 |= PCI_EXP_LNKCTL_RL;
+ 	pcie_capability_write_word(parent, PCI_EXP_LNKCTL, reg16);
++	if (parent->clear_retrain_link) {
++		/*
++		 * Due to an erratum in some devices the Retrain Link bit
++		 * needs to be cleared again manually to allow the link
++		 * training to succeed.
++		 */
++		reg16 &= ~PCI_EXP_LNKCTL_RL;
++		pcie_capability_write_word(parent, PCI_EXP_LNKCTL, reg16);
++	}
+ 
+ 	/* Wait for link training end. Break out after waiting for timeout */
+ 	start_jiffies = jiffies;
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 6a123dc287f4..26af54e67785 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -2024,6 +2024,23 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x10f1, quirk_disable_aspm_l0s);
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x10f4, quirk_disable_aspm_l0s);
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x1508, quirk_disable_aspm_l0s);
+ 
++/*
++ * Some Pericom PCIe-to-PCI bridges in reverse mode need the PCIe Retrain
++ * Link bit cleared after starting the link retrain process to allow this
++ * process to finish.
++ *
++ * Affected devices: PI7C9X110, PI7C9X111SL, PI7C9X130.  See also the
++ * Pericom Errata Sheet PI7C9X111SLB_errata_rev1.2_102711.pdf.
++ */
++static void quirk_enable_clear_retrain_link(struct pci_dev *dev)
++{
++	dev->clear_retrain_link = 1;
++	pci_info(dev, "Enable PCIe Retrain Link quirk\n");
++}
++DECLARE_PCI_FIXUP_HEADER(0x12d8, 0xe110, quirk_enable_clear_retrain_link);
++DECLARE_PCI_FIXUP_HEADER(0x12d8, 0xe111, quirk_enable_clear_retrain_link);
++DECLARE_PCI_FIXUP_HEADER(0x12d8, 0xe130, quirk_enable_clear_retrain_link);
++
+ static void fixup_rev1_53c810(struct pci_dev *dev)
+ {
+ 	u32 class = dev->class;
+* Unmerged path include/linux/pci.h
