@@ -1,0 +1,831 @@
+blk-mq-sched: add flush insertion into blk_mq_sched_insert_request()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit bd6737f1ae92e2f1c6e8362efe96dbe7f18fa07d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bd6737f1.failed
+
+Instead of letting the caller check this and handle the details
+of inserting a flush request, put the logic in the scheduler
+insertion function. This fixes direct flush insertion outside
+of the usual make_request_fn calls, like from dm via
+blk_insert_cloned_request().
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit bd6737f1ae92e2f1c6e8362efe96dbe7f18fa07d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-exec.c
+#	block/blk-flush.c
+#	block/blk-mq-sched.c
+#	block/blk-mq-sched.h
+#	block/blk-mq-tag.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-core.c
+index 9db4ccd0b9a5,4bfd8674afd0..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2179,7 -2129,7 +2179,11 @@@ int blk_insert_cloned_request(struct re
+  	if (q->mq_ops) {
+  		if (blk_queue_io_stat(q))
+  			blk_account_io_start(rq, true);
+++<<<<<<< HEAD
+ +		blk_mq_insert_request(rq, false, true, false);
+++=======
++ 		blk_mq_sched_insert_request(rq, false, true, false, false);
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  		return 0;
+  	}
+  
+diff --cc block/blk-exec.c
+index 9924725fa50d,ed1f10165268..000000000000
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@@ -63,10 -63,10 +63,14 @@@ void blk_execute_rq_nowait(struct reque
+  
+  	/*
+  	 * don't check dying flag for MQ because the request won't
+ -	 * be reused after dying flag is set
+ +	 * be resued after dying flag is set
+  	 */
+  	if (q->mq_ops) {
+++<<<<<<< HEAD
+ +		blk_mq_insert_request(rq, at_head, true, false);
+++=======
++ 		blk_mq_sched_insert_request(rq, at_head, true, false, false);
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  		return;
+  	}
+  
+diff --cc block/blk-flush.c
+index 5ab2a59b3f9c,4427896641ac..000000000000
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@@ -416,9 -455,9 +416,15 @@@ void blk_insert_flush(struct request *r
+  	 */
+  	if ((policy & REQ_FSEQ_DATA) &&
+  	    !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
+++<<<<<<< HEAD
+ +		if (q->mq_ops) {
+ +			blk_mq_insert_request(rq, false, true, false);
+ +		} else
+++=======
++ 		if (q->mq_ops)
++ 			blk_mq_sched_insert_request(rq, false, true, false, false);
++ 		else
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  			list_add_tail(&rq->queuelist, &q->queue_head);
+  		return;
+  	}
+diff --cc block/blk-mq-tag.c
+index 7e6885bccaac,54c84363c1b2..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -144,134 -90,50 +144,156 @@@ static inline bool hctx_may_queue(struc
+  	return atomic_read(&hctx->nr_active) < depth;
+  }
+  
+ -static int __blk_mq_get_tag(struct blk_mq_alloc_data *data,
+ -			    struct sbitmap_queue *bt)
+ +static int __bt_get_word(struct blk_align_bitmap *bm, unsigned int last_tag)
+  {
+ -	if (!(data->flags & BLK_MQ_REQ_INTERNAL) &&
+ -	    !hctx_may_queue(data->hctx, bt))
+ -		return -1;
+ -	return __sbitmap_queue_get(bt);
+ -}
+ -
+ +	int tag, org_last_tag = last_tag;
+ +
+++<<<<<<< HEAD
+ +	while (1) {
+ +		tag = find_next_zero_bit(&bm->word, bm->depth, last_tag);
+ +		if (unlikely(tag >= bm->depth)) {
+ +			/*
+ +			 * We started with an offset, and we didn't reset the
+ +			 * offset to 0 in a failure case, so start from 0 to
+ +			 * exhaust the map.
+ +			 */
+ +			if (org_last_tag && last_tag) {
+ +				last_tag = org_last_tag = 0;
+ +				continue;
+ +			}
+ +			return -1;
+++=======
++ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
++ {
++ 	struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
++ 	struct sbitmap_queue *bt;
++ 	struct sbq_wait_state *ws;
++ 	DEFINE_WAIT(wait);
++ 	unsigned int tag_offset;
++ 	bool drop_ctx;
++ 	int tag;
++ 
++ 	if (data->flags & BLK_MQ_REQ_RESERVED) {
++ 		if (unlikely(!tags->nr_reserved_tags)) {
++ 			WARN_ON_ONCE(1);
++ 			return BLK_MQ_TAG_FAIL;
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+ +		}
+ +
+ +		if (!test_and_set_bit(tag, &bm->word))
+ +			break;
+ +
+ +		last_tag = tag + 1;
+ +		if (last_tag >= bm->depth - 1)
+ +			last_tag = 0;
+ +	}
+ +
+ +	return tag;
+ +}
+ +
+ +/*
+ + * Straight forward bitmap tag implementation, where each bit is a tag
+ + * (cleared == free, and set == busy). The small twist is using per-cpu
+ + * last_tag caches, which blk-mq stores in the blk_mq_ctx software queue
+ + * contexts. This enables us to drastically limit the space searched,
+ + * without dirtying an extra shared cacheline like we would if we stored
+ + * the cache value inside the shared blk_mq_bitmap_tags structure. On top
+ + * of that, each word of tags is in a separate cacheline. This means that
+ + * multiple users will tend to stick to different cachelines, at least
+ + * until the map is exhausted.
+ + */
+ +static int __bt_get(struct blk_mq_hw_ctx *hctx, struct blk_mq_bitmap_tags *bt,
+ +		    unsigned int *tag_cache)
+ +{
+ +	unsigned int last_tag, org_last_tag;
+ +	int index, i, tag;
+ +
+ +	if (!hctx_may_queue(hctx, bt))
+ +		return -1;
+ +
+ +	last_tag = org_last_tag = *tag_cache;
+ +	index = TAG_TO_INDEX(bt, last_tag);
+ +
+ +	for (i = 0; i < bt->map_nr; i++) {
+ +		tag = __bt_get_word(&bt->map[index], TAG_TO_BIT(bt, last_tag));
+ +		if (tag != -1) {
+ +			tag += (index << bt->bits_per_word);
+ +			goto done;
+ +		}
+ +
+ +		/*
+ +		 * Jump to next index, and reset the last tag to be the
+ +		 * first tag of that index
+ +		 */
+ +		index++;
+ +		last_tag = (index << bt->bits_per_word);
+ +
+ +		if (index >= bt->map_nr) {
+ +			index = 0;
+ +			last_tag = 0;
+  		}
+ -		bt = &tags->breserved_tags;
+ -		tag_offset = 0;
+ -	} else {
+ -		bt = &tags->bitmap_tags;
+ -		tag_offset = tags->nr_reserved_tags;
+  	}
+  
+ -	tag = __blk_mq_get_tag(data, bt);
+ +	*tag_cache = 0;
+ +	return -1;
+ +
+ +	/*
+ +	 * Only update the cache from the allocation path, if we ended
+ +	 * up using the specific cached tag.
+ +	 */
+ +done:
+ +	if (tag == org_last_tag) {
+ +		last_tag = tag + 1;
+ +		if (last_tag >= bt->depth - 1)
+ +			last_tag = 0;
+ +
+ +		*tag_cache = last_tag;
+ +	}
+ +
+ +	return tag;
+ +}
+ +
+ +static struct bt_wait_state *bt_wait_ptr(struct blk_mq_bitmap_tags *bt,
+ +					 struct blk_mq_hw_ctx *hctx)
+ +{
+ +	struct bt_wait_state *bs;
+ +	int wait_index;
+ +
+ +	if (!hctx)
+ +		return &bt->bs[0];
+ +
+ +	wait_index = atomic_read(&hctx->wait_index);
+ +	bs = &bt->bs[wait_index];
+ +	bt_index_atomic_inc(&hctx->wait_index);
+ +	return bs;
+ +}
+ +
+ +static int bt_get(struct blk_mq_alloc_data *data,
+ +		struct blk_mq_bitmap_tags *bt,
+ +		struct blk_mq_hw_ctx *hctx,
+ +		unsigned int *last_tag)
+ +{
+ +	struct bt_wait_state *bs;
+ +	DEFINE_WAIT(wait);
+ +	int tag;
+ +
+ +	tag = __bt_get(hctx, bt, last_tag);
+  	if (tag != -1)
+ -		goto found_tag;
+ +		return tag;
+  
+  	if (data->flags & BLK_MQ_REQ_NOWAIT)
+ -		return BLK_MQ_TAG_FAIL;
+ +		return -1;
+  
+++<<<<<<< HEAD
+ +	bs = bt_wait_ptr(bt, hctx);
+++=======
++ 	ws = bt_wait_ptr(bt, data->hctx);
++ 	drop_ctx = data->ctx == NULL;
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  	do {
+ -		prepare_to_wait(&ws->wait, &wait, TASK_UNINTERRUPTIBLE);
+ +		prepare_to_wait(&bs->wait, &wait, TASK_UNINTERRUPTIBLE);
+  
+ -		tag = __blk_mq_get_tag(data, bt);
+ +		tag = __bt_get(hctx, bt, last_tag);
+  		if (tag != -1)
+  			break;
+  
+@@@ -297,165 -158,111 +320,175 @@@
+  		io_schedule();
+  
+  		data->ctx = blk_mq_get_ctx(data->q);
+ -		data->hctx = blk_mq_map_queue(data->q, data->ctx->cpu);
+ -		tags = blk_mq_tags_from_data(data);
+ -		if (data->flags & BLK_MQ_REQ_RESERVED)
+ -			bt = &tags->breserved_tags;
+ -		else
+ -			bt = &tags->bitmap_tags;
+ -
+ -		finish_wait(&ws->wait, &wait);
+ -		ws = bt_wait_ptr(bt, data->hctx);
+ +		data->hctx = data->q->mq_ops->map_queue(data->q,
+ +				data->ctx->cpu);
+ +		if (data->flags & BLK_MQ_REQ_RESERVED) {
+ +			bt = &data->hctx->tags->breserved_tags;
+ +		} else {
+ +			last_tag = &data->ctx->last_tag;
+ +			hctx = data->hctx;
+ +			bt = &hctx->tags->bitmap_tags;
+ +		}
+ +		finish_wait(&bs->wait, &wait);
+ +		bs = bt_wait_ptr(bt, hctx);
+  	} while (1);
+  
+++<<<<<<< HEAD
+ +	finish_wait(&bs->wait, &wait);
+ +	return tag;
+++=======
++ 	if (drop_ctx && data->ctx)
++ 		blk_mq_put_ctx(data->ctx);
++ 
++ 	finish_wait(&ws->wait, &wait);
++ 
++ found_tag:
++ 	return tag + tag_offset;
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  }
+  
+ -void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, struct blk_mq_tags *tags,
+ -		    struct blk_mq_ctx *ctx, unsigned int tag)
+ +static unsigned int __blk_mq_get_tag(struct blk_mq_alloc_data *data)
+  {
+ -	if (tag >= tags->nr_reserved_tags) {
+ -		const int real_tag = tag - tags->nr_reserved_tags;
+ +	int tag;
+  
+ -		BUG_ON(real_tag >= tags->nr_tags);
+ -		sbitmap_queue_clear(&tags->bitmap_tags, real_tag, ctx->cpu);
+ -	} else {
+ -		BUG_ON(tag >= tags->nr_reserved_tags);
+ -		sbitmap_queue_clear(&tags->breserved_tags, tag, ctx->cpu);
+ +	tag = bt_get(data, &data->hctx->tags->bitmap_tags, data->hctx,
+ +			&data->ctx->last_tag);
+ +	if (tag >= 0)
+ +		return tag + data->hctx->tags->nr_reserved_tags;
+ +
+ +	return BLK_MQ_TAG_FAIL;
+ +}
+ +
+ +static unsigned int __blk_mq_get_reserved_tag(struct blk_mq_alloc_data *data)
+ +{
+ +	int tag, zero = 0;
+ +
+ +	if (unlikely(!data->hctx->tags->nr_reserved_tags)) {
+ +		WARN_ON_ONCE(1);
+ +		return BLK_MQ_TAG_FAIL;
+  	}
+ +
+ +	tag = bt_get(data, &data->hctx->tags->breserved_tags, NULL, &zero);
+ +	if (tag < 0)
+ +		return BLK_MQ_TAG_FAIL;
+ +
+ +	return tag;
+  }
+  
+ -struct bt_iter_data {
+ -	struct blk_mq_hw_ctx *hctx;
+ -	busy_iter_fn *fn;
+ -	void *data;
+ -	bool reserved;
+ -};
+ +unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ +{
+ +	if (data->flags & BLK_MQ_REQ_RESERVED)
+ +		return __blk_mq_get_reserved_tag(data);
+ +	return __blk_mq_get_tag(data);
+ +}
+  
+ -static bool bt_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
+ +static struct bt_wait_state *bt_wake_ptr(struct blk_mq_bitmap_tags *bt)
+  {
+ -	struct bt_iter_data *iter_data = data;
+ -	struct blk_mq_hw_ctx *hctx = iter_data->hctx;
+ -	struct blk_mq_tags *tags = hctx->tags;
+ -	bool reserved = iter_data->reserved;
+ -	struct request *rq;
+ +	int i, wake_index;
+  
+ -	if (!reserved)
+ -		bitnr += tags->nr_reserved_tags;
+ -	rq = tags->rqs[bitnr];
+ +	wake_index = atomic_read(&bt->wake_index);
+ +	for (i = 0; i < BT_WAIT_QUEUES; i++) {
+ +		struct bt_wait_state *bs = &bt->bs[wake_index];
+  
+ -	if (rq->q == hctx->queue)
+ -		iter_data->fn(hctx, rq, iter_data->data, reserved);
+ -	return true;
+ +		if (waitqueue_active(&bs->wait)) {
+ +			int o = atomic_read(&bt->wake_index);
+ +			if (wake_index != o)
+ +				atomic_cmpxchg(&bt->wake_index, o, wake_index);
+ +
+ +			return bs;
+ +		}
+ +
+ +		wake_index = bt_index_inc(wake_index);
+ +	}
+ +
+ +	return NULL;
+  }
+  
+ -static void bt_for_each(struct blk_mq_hw_ctx *hctx, struct sbitmap_queue *bt,
+ -			busy_iter_fn *fn, void *data, bool reserved)
+ +static void bt_clear_tag(struct blk_mq_bitmap_tags *bt, unsigned int tag)
+  {
+ -	struct bt_iter_data iter_data = {
+ -		.hctx = hctx,
+ -		.fn = fn,
+ -		.data = data,
+ -		.reserved = reserved,
+ -	};
+ +	const int index = TAG_TO_INDEX(bt, tag);
+ +	struct bt_wait_state *bs;
+ +	int wait_cnt;
+ +
+ +	clear_bit(TAG_TO_BIT(bt, tag), &bt->map[index].word);
+  
+ -	sbitmap_for_each_set(&bt->sb, bt_iter, &iter_data);
+ +	/* Ensure that the wait list checks occur after clear_bit(). */
+ +	smp_mb();
+ +
+ +	bs = bt_wake_ptr(bt);
+ +	if (!bs)
+ +		return;
+ +
+ +	wait_cnt = atomic_dec_return(&bs->wait_cnt);
+ +	if (unlikely(wait_cnt < 0))
+ +		wait_cnt = atomic_inc_return(&bs->wait_cnt);
+ +	if (wait_cnt == 0) {
+ +		atomic_add(bt->wake_cnt, &bs->wait_cnt);
+ +		bt_index_atomic_inc(&bt->wake_index);
+ +		wake_up(&bs->wait);
+ +	}
+  }
+  
+ -struct bt_tags_iter_data {
+ -	struct blk_mq_tags *tags;
+ -	busy_tag_iter_fn *fn;
+ -	void *data;
+ -	bool reserved;
+ -};
+ +void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, unsigned int tag,
+ +		    unsigned int *last_tag)
+ +{
+ +	struct blk_mq_tags *tags = hctx->tags;
+  
+ -static bool bt_tags_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
+ +	if (tag >= tags->nr_reserved_tags) {
+ +		const int real_tag = tag - tags->nr_reserved_tags;
+ +
+ +		BUG_ON(real_tag >= tags->nr_tags);
+ +		bt_clear_tag(&tags->bitmap_tags, real_tag);
+ +		*last_tag = real_tag;
+ +	} else {
+ +		BUG_ON(tag >= tags->nr_reserved_tags);
+ +		bt_clear_tag(&tags->breserved_tags, tag);
+ +	}
+ +}
+ +
+ +static void bt_for_each(struct blk_mq_hw_ctx *hctx,
+ +		struct blk_mq_bitmap_tags *bt, unsigned int off,
+ +		busy_iter_fn *fn, void *data, bool reserved)
+  {
+ -	struct bt_tags_iter_data *iter_data = data;
+ -	struct blk_mq_tags *tags = iter_data->tags;
+ -	bool reserved = iter_data->reserved;
+  	struct request *rq;
+ +	int bit, i;
+  
+ -	if (!reserved)
+ -		bitnr += tags->nr_reserved_tags;
+ -	rq = tags->rqs[bitnr];
+ +	for (i = 0; i < bt->map_nr; i++) {
+ +		struct blk_align_bitmap *bm = &bt->map[i];
+  
+ -	iter_data->fn(rq, iter_data->data, reserved);
+ -	return true;
+ +		for (bit = find_first_bit(&bm->word, bm->depth);
+ +		     bit < bm->depth;
+ +		     bit = find_next_bit(&bm->word, bm->depth, bit + 1)) {
+ +			rq = hctx->tags->rqs[off + bit];
+ +			if (rq->q == hctx->queue)
+ +				fn(hctx, rq, data, reserved);
+ +		}
+ +
+ +		off += (1 << bt->bits_per_word);
+ +	}
+  }
+  
+ -static void bt_tags_for_each(struct blk_mq_tags *tags, struct sbitmap_queue *bt,
+ -			     busy_tag_iter_fn *fn, void *data, bool reserved)
+ +static void bt_tags_for_each(struct blk_mq_tags *tags,
+ +		struct blk_mq_bitmap_tags *bt, unsigned int off,
+ +		busy_tag_iter_fn *fn, void *data, bool reserved)
+  {
+ -	struct bt_tags_iter_data iter_data = {
+ -		.tags = tags,
+ -		.fn = fn,
+ -		.data = data,
+ -		.reserved = reserved,
+ -	};
+ +	struct request *rq;
+ +	int bit, i;
+ +
+ +	if (!tags->rqs)
+ +		return;
+ +	for (i = 0; i < bt->map_nr; i++) {
+ +		struct blk_align_bitmap *bm = &bt->map[i];
+ +
+ +		for (bit = find_first_bit(&bm->word, bm->depth);
+ +		     bit < bm->depth;
+ +		     bit = find_next_bit(&bm->word, bm->depth, bit + 1)) {
+ +			rq = tags->rqs[off + bit];
+ +			fn(rq, data, reserved);
+ +		}
+  
+ -	if (tags->rqs)
+ -		sbitmap_for_each_set(&bt->sb, bt_tags_iter, &iter_data);
+ +		off += (1 << bt->bits_per_word);
+ +	}
+  }
+  
+  static void blk_mq_all_tag_busy_iter(struct blk_mq_tags *tags,
+diff --cc block/blk-mq.c
+index 3b21482b7f01,60dac10228fe..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -563,18 -563,18 +563,26 @@@ static void blk_mq_requeue_work(struct 
+  	spin_unlock_irqrestore(&q->requeue_lock, flags);
+  
+  	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
+ -		if (!(rq->rq_flags & RQF_SOFTBARRIER))
+ +		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
+  			continue;
+  
+ -		rq->rq_flags &= ~RQF_SOFTBARRIER;
+ +		rq->cmd_flags &= ~REQ_SOFTBARRIER;
+  		list_del_init(&rq->queuelist);
+++<<<<<<< HEAD
+ +		blk_mq_insert_request(rq, true, false, false);
+++=======
++ 		blk_mq_sched_insert_request(rq, true, false, false, true);
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  	}
+  
+  	while (!list_empty(&rq_list)) {
+  		rq = list_entry(rq_list.next, struct request, queuelist);
+  		list_del_init(&rq->queuelist);
+++<<<<<<< HEAD
+ +		blk_mq_insert_request(rq, false, false, false);
+++=======
++ 		blk_mq_sched_insert_request(rq, false, false, false, true);
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  	}
+  
+  	blk_mq_run_hw_queues(q, false);
+@@@ -824,6 -847,77 +832,80 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
++ 			   bool wait)
++ {
++ 	struct blk_mq_alloc_data data = {
++ 		.q = rq->q,
++ 		.hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu),
++ 		.flags = wait ? 0 : BLK_MQ_REQ_NOWAIT,
++ 	};
++ 
++ 	if (blk_mq_hctx_stopped(data.hctx))
++ 		return false;
++ 
++ 	if (rq->tag != -1) {
++ done:
++ 		if (hctx)
++ 			*hctx = data.hctx;
++ 		return true;
++ 	}
++ 
++ 	rq->tag = blk_mq_get_tag(&data);
++ 	if (rq->tag >= 0) {
++ 		if (blk_mq_tag_busy(data.hctx)) {
++ 			rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 			atomic_inc(&data.hctx->nr_active);
++ 		}
++ 		data.hctx->tags->rqs[rq->tag] = rq;
++ 		goto done;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void blk_mq_put_driver_tag(struct blk_mq_hw_ctx *hctx,
++ 				  struct request *rq)
++ {
++ 	if (rq->tag == -1 || rq->internal_tag == -1)
++ 		return;
++ 
++ 	blk_mq_put_tag(hctx, hctx->tags, rq->mq_ctx, rq->tag);
++ 	rq->tag = -1;
++ 
++ 	if (rq->rq_flags & RQF_MQ_INFLIGHT) {
++ 		rq->rq_flags &= ~RQF_MQ_INFLIGHT;
++ 		atomic_dec(&hctx->nr_active);
++ 	}
++ }
++ 
++ /*
++  * If we fail getting a driver tag because all the driver tags are already
++  * assigned and on the dispatch list, BUT the first entry does not have a
++  * tag, then we could deadlock. For that case, move entries with assigned
++  * driver tags to the front, leaving the set of tagged requests in the
++  * same order, and the untagged set in the same order.
++  */
++ static bool reorder_tags_to_front(struct list_head *list)
++ {
++ 	struct request *rq, *tmp, *first = NULL;
++ 
++ 	list_for_each_entry_safe_reverse(rq, tmp, list, queuelist) {
++ 		if (rq == first)
++ 			break;
++ 		if (rq->tag != -1) {
++ 			list_move(&rq->queuelist, list);
++ 			if (!first)
++ 				first = rq;
++ 		}
++ 	}
++ 
++ 	return first != NULL;
++ }
++ 
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+  {
+  	struct request_queue *q = hctx->queue;
+@@@ -1380,7 -1394,7 +1462,11 @@@ static void blk_mq_try_issue_directly(s
+  	}
+  
+  insert:
+++<<<<<<< HEAD
+ +	blk_mq_insert_request(rq, false, true, true);
+++=======
++ 	blk_mq_sched_insert_request(rq, false, true, true, false);
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  }
+  
+  /*
+@@@ -1401,22 -1417,40 +1487,24 @@@ static void blk_mq_make_request(struct 
+  	blk_queue_bounce(q, &bio);
+  
+  	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ +		bio_endio(bio, -EIO);
+ +		return;
+  	}
+  
+ -	blk_queue_split(q, &bio, q->bio_split);
+ -
+  	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+  	    blk_attempt_plug_merge(q, bio, &request_count, &same_queue_rq))
+ -		return BLK_QC_T_NONE;
+ -
+ -	if (blk_mq_sched_bio_merge(q, bio))
+ -		return BLK_QC_T_NONE;
+ -
+ -	wb_acct = wbt_wait(q->rq_wb, bio, NULL);
+ -
+ -	trace_block_getrq(q, bio, bio->bi_opf);
+ -
+ -	rq = blk_mq_sched_get_request(q, bio, bio->bi_opf, &data);
+ -	if (unlikely(!rq)) {
+ -		__wbt_done(q->rq_wb, wb_acct);
+ -		return BLK_QC_T_NONE;
+ -	}
+ -
+ -	wbt_track(&rq->issue_stat, wb_acct);
+ +		return;
+  
+ -	cookie = request_to_qc_t(data.hctx, rq);
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+  
+  	if (unlikely(is_flush_fua)) {
++ 		blk_mq_put_ctx(data.ctx);
+  		blk_mq_bio_to_request(rq, bio);
+ -		blk_mq_get_driver_tag(rq, NULL, true);
+  		blk_insert_flush(rq);
+- 		goto run_queue;
++ 		blk_mq_run_hw_queue(data.hctx, true);
++ 		goto done;
+  	}
+  
+  	plug = current->plug;
+@@@ -1459,12 -1493,19 +1547,22 @@@
+  			rcu_read_unlock();
+  		} else {
+  			srcu_idx = srcu_read_lock(&data.hctx->queue_rq_srcu);
+ -			blk_mq_try_issue_directly(old_rq, &cookie);
+ +			blk_mq_try_issue_directly(old_rq);
+  			srcu_read_unlock(&data.hctx->queue_rq_srcu, srcu_idx);
+  		}
+ -		goto done;
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (q->elevator) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true,
++ 						!is_sync || is_flush_fua, true);
++ 		goto done;
++ 	}
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+  		/*
+  		 * For a SYNC request, send it to the hardware immediately. For
+@@@ -1494,22 -1538,42 +1591,24 @@@ static void blk_sq_make_request(struct 
+  	blk_queue_bounce(q, &bio);
+  
+  	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ -	}
+ -
+ -	blk_queue_split(q, &bio, q->bio_split);
+ -
+ -	if (!is_flush_fua && !blk_queue_nomerges(q)) {
+ -		if (blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ -			return BLK_QC_T_NONE;
+ -	} else
+ -		request_count = blk_plug_queued_count(q);
+ -
+ -	if (blk_mq_sched_bio_merge(q, bio))
+ -		return BLK_QC_T_NONE;
+ -
+ -	wb_acct = wbt_wait(q->rq_wb, bio, NULL);
+ -
+ -	trace_block_getrq(q, bio, bio->bi_opf);
+ -
+ -	rq = blk_mq_sched_get_request(q, bio, bio->bi_opf, &data);
+ -	if (unlikely(!rq)) {
+ -		__wbt_done(q->rq_wb, wb_acct);
+ -		return BLK_QC_T_NONE;
+ +		bio_endio(bio, -EIO);
+ +		return;
+  	}
+  
+ -	wbt_track(&rq->issue_stat, wb_acct);
+ +	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ +		return;
+  
+ -	cookie = request_to_qc_t(data.hctx, rq);
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+  
+  	if (unlikely(is_flush_fua)) {
++ 		blk_mq_put_ctx(data.ctx);
+  		blk_mq_bio_to_request(rq, bio);
+ -		blk_mq_get_driver_tag(rq, NULL, true);
+  		blk_insert_flush(rq);
+- 		goto run_queue;
++ 		blk_mq_run_hw_queue(data.hctx, true);
++ 		goto done;
+  	}
+  
+  	/*
+@@@ -1531,9 -1607,16 +1630,19 @@@
+  		}
+  
+  		list_add_tail(&rq->queuelist, &plug->mq_list);
+ -		return cookie;
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (q->elevator) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true,
++ 						!is_sync || is_flush_fua, true);
++ 		goto done;
++ 	}
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+  		/*
+  		 * For a SYNC request, send it to the hardware immediately. For
+diff --cc block/blk-mq.h
+index 2d50f02667c4,57cdbf6c0cee..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -34,7 -32,31 +34,14 @@@ void blk_mq_free_queue(struct request_q
+  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  void blk_mq_wake_waiters(struct request_queue *q);
+  bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *, struct list_head *);
+++<<<<<<< HEAD
+++=======
++ void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
++ bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx);
++ bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
++ 				bool wait);
+++>>>>>>> bd6737f1ae92 (blk-mq-sched: add flush insertion into blk_mq_sched_insert_request())
+  
+ -/*
+ - * Internal helpers for allocating/freeing the request map
+ - */
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx);
+ -void blk_mq_free_rq_map(struct blk_mq_tags *tags);
+ -struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
+ -					unsigned int hctx_idx,
+ -					unsigned int nr_tags,
+ -					unsigned int reserved_tags);
+ -int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx, unsigned int depth);
+ -
+ -/*
+ - * Internal helpers for request insertion into sw queues
+ - */
+ -void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+ -				bool at_head);
+ -void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+ -				struct list_head *list);
+  /*
+   * CPU hotplug helpers
+   */
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-exec.c
+* Unmerged path block/blk-flush.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
