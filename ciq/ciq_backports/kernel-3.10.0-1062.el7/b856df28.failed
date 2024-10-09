@@ -1,0 +1,145 @@
+net/mlx5e: Allow reporting of checksum unnecessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Allow reporting of checksum unnecessary (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.83%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit b856df28f9230a47669efbdd57896084caadb2b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b856df28.failed
+
+Currently we practically never report checksum unnecessary, because
+for all IP packets we take the checksum complete path.
+
+Enable non-default runs with reprorting checksum unnecessary, using
+an ethtool private flag. This can be useful for performance evals
+and other explorations.
+
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b856df28f9230a47669efbdd57896084caadb2b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index a60ee24e6b99,f19067c94272..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -661,7 -782,13 +661,17 @@@ static inline void mlx5e_handle_csum(st
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (likely(is_last_ethertype_ip(skb, &network_depth))) {
+++=======
++ 	if (unlikely(test_bit(MLX5E_RQ_STATE_NO_CSUM_COMPLETE, &rq->state)))
++ 		goto csum_unnecessary;
++ 
++ 	if (likely(is_last_ethertype_ip(skb, &network_depth, &proto))) {
++ 		if (unlikely(get_ip_proto(skb, proto) == IPPROTO_SCTP))
++ 			goto csum_unnecessary;
++ 
+++>>>>>>> b856df28f923 (net/mlx5e: Allow reporting of checksum unnecessary)
+  		skb->ip_summed = CHECKSUM_COMPLETE;
+  		skb->csum = csum_unfold((__force __sum16)cqe->check_sum);
+  		if (network_depth > ETH_HLEN)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 4a9c2819d01c..3ec2c5008799 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -206,6 +206,7 @@ enum mlx5e_priv_flag {
+ 	MLX5E_PFLAG_TX_CQE_BASED_MODER = (1 << 1),
+ 	MLX5E_PFLAG_RX_CQE_COMPRESS = (1 << 2),
+ 	MLX5E_PFLAG_RX_STRIDING_RQ = (1 << 3),
++	MLX5E_PFLAG_RX_NO_CSUM_COMPLETE = (1 << 4),
+ };
+ 
+ #define MLX5E_SET_PFLAG(params, pflag, enable)			\
+@@ -281,6 +282,7 @@ struct mlx5e_dcbx_dp {
+ enum {
+ 	MLX5E_RQ_STATE_ENABLED,
+ 	MLX5E_RQ_STATE_AM,
++	MLX5E_RQ_STATE_NO_CSUM_COMPLETE,
+ };
+ 
+ #define MLX5E_TEST_BIT(state, nr) (state & BIT(nr))
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index d848872fc3b4..737bc5300256 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -140,6 +140,7 @@ static const char mlx5e_priv_flags[][ETH_GSTRING_LEN] = {
+ 	"tx_cqe_moder",
+ 	"rx_cqe_compress",
+ 	"rx_striding_rq",
++	"rx_no_csum_complete",
+ };
+ 
+ int mlx5e_ethtool_get_sset_count(struct mlx5e_priv *priv, int sset)
+@@ -1611,6 +1612,27 @@ static int set_pflag_rx_striding_rq(struct net_device *netdev, bool enable)
+ 	return 0;
+ }
+ 
++static int set_pflag_rx_no_csum_complete(struct net_device *netdev, bool enable)
++{
++	struct mlx5e_priv *priv = netdev_priv(netdev);
++	struct mlx5e_channels *channels = &priv->channels;
++	struct mlx5e_channel *c;
++	int i;
++
++	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
++		return 0;
++
++	for (i = 0; i < channels->num; i++) {
++		c = channels->c[i];
++		if (enable)
++			__set_bit(MLX5E_RQ_STATE_NO_CSUM_COMPLETE, &c->rq.state);
++		else
++			__clear_bit(MLX5E_RQ_STATE_NO_CSUM_COMPLETE, &c->rq.state);
++	}
++
++	return 0;
++}
++
+ static int mlx5e_handle_pflag(struct net_device *netdev,
+ 			      u32 wanted_flags,
+ 			      enum mlx5e_priv_flag flag,
+@@ -1662,6 +1684,12 @@ static int mlx5e_set_priv_flags(struct net_device *netdev, u32 pflags)
+ 	err = mlx5e_handle_pflag(netdev, pflags,
+ 				 MLX5E_PFLAG_RX_STRIDING_RQ,
+ 				 set_pflag_rx_striding_rq);
++	if (err)
++		goto out;
++
++	err = mlx5e_handle_pflag(netdev, pflags,
++				 MLX5E_PFLAG_RX_NO_CSUM_COMPLETE,
++				 set_pflag_rx_no_csum_complete);
+ 
+ out:
+ 	mutex_unlock(&priv->state_lock);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 489704305daa..76d7e35369c7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -795,6 +795,9 @@ static int mlx5e_open_rq(struct mlx5e_channel *c,
+ 	if (params->rx_dim_enabled)
+ 		__set_bit(MLX5E_RQ_STATE_AM, &c->rq.state);
+ 
++	if (params->pflags & MLX5E_PFLAG_RX_NO_CSUM_COMPLETE)
++		__set_bit(MLX5E_RQ_STATE_NO_CSUM_COMPLETE, &c->rq.state);
++
+ 	return 0;
+ 
+ err_destroy_rq:
+@@ -4124,6 +4127,7 @@ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+ 		params->rx_cqe_compress_def = slow_pci_heuristic(mdev);
+ 
+ 	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS, params->rx_cqe_compress_def);
++	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_NO_CSUM_COMPLETE, false);
+ 
+ 	/* RQ */
+ 	/* Prefer Striding RQ, unless any of the following holds:
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
