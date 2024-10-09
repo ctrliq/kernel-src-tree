@@ -1,0 +1,469 @@
+target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.55%
+commit-author Christoph Hellwig <hch@lst.de>
+commit d588cf8f618d7b316743a0bc99fede20f7a01bb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d588cf8f.failed
+
+There is just one configfs subsystem in the target code, so we might as
+well add two helpers to reference / unreference it from the core code
+instead of passing pointers to it around.
+
+This fixes a regression introduced for v4.1-rc1 with commit 9ac8928e6,
+where configfs_depend_item() callers using se_tpg_tfo->tf_subsys would
+fail, because the assignment from the original target_core_subsystem[]
+is no longer happening at target_register_template() time.
+
+(Fix target_core_exit_configfs pointer dereference - Sagi)
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reported-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit d588cf8f618d7b316743a0bc99fede20f7a01bb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+#	drivers/target/target_core_configfs.c
+#	drivers/vhost/scsi.c
+#	include/target/target_core_fabric.h
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 14250fcfe054,5c9e680aa375..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -972,6 -1013,34 +972,37 @@@ static ssize_t tcm_qla2xxx_tpg_show_ena
+  			atomic_read(&tpg->lport_tpg_enabled));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcm_qla2xxx_depend_tpg(struct work_struct *work)
++ {
++ 	struct tcm_qla2xxx_tpg *base_tpg = container_of(work,
++ 				struct tcm_qla2xxx_tpg, tpg_base_work);
++ 	struct se_portal_group *se_tpg = &base_tpg->se_tpg;
++ 	struct scsi_qla_host *base_vha = base_tpg->lport->qla_vha;
++ 
++ 	if (!target_depend_item(&se_tpg->tpg_group.cg_item)) {
++ 		atomic_set(&base_tpg->lport_tpg_enabled, 1);
++ 		qlt_enable_vha(base_vha);
++ 	}
++ 	complete(&base_tpg->tpg_base_comp);
++ }
++ 
++ static void tcm_qla2xxx_undepend_tpg(struct work_struct *work)
++ {
++ 	struct tcm_qla2xxx_tpg *base_tpg = container_of(work,
++ 				struct tcm_qla2xxx_tpg, tpg_base_work);
++ 	struct se_portal_group *se_tpg = &base_tpg->se_tpg;
++ 	struct scsi_qla_host *base_vha = base_tpg->lport->qla_vha;
++ 
++ 	if (!qlt_stop_phase1(base_vha->vha_tgt.qla_tgt)) {
++ 		atomic_set(&base_tpg->lport_tpg_enabled, 0);
++ 		target_undepend_item(&se_tpg->tpg_group.cg_item);
++ 	}
++ 	complete(&base_tpg->tpg_base_comp);
++ }
++ 
+++>>>>>>> d588cf8f618d (target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem)
+  static ssize_t tcm_qla2xxx_tpg_store_enable(
+  	struct se_portal_group *se_tpg,
+  	const char *page,
+diff --cc drivers/target/target_core_configfs.c
+index 372df6e87bcb,1580077971f8..000000000000
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@@ -508,77 -447,58 +511,103 @@@ static int target_fabric_tf_ops_check
+  	return 0;
+  }
+  
+ -int target_register_template(const struct target_core_fabric_ops *fo)
+ +/*
+ + * Called 2nd from fabric module with returned parameter of
+ + * struct target_fabric_configfs * from target_fabric_configfs_init().
+ + *
+ + * Upon a successful registration, the new fabric's struct config_item is
+ + * return.  Also, a pointer to this struct is set in the passed
+ + * struct target_fabric_configfs.
+ + */
+ +int target_fabric_configfs_register(
+ +	struct target_fabric_configfs *tf)
+  {
+ -	struct target_fabric_configfs *tf;
+  	int ret;
+  
+ -	ret = target_fabric_tf_ops_check(fo);
+ -	if (ret)
+ +	if (!tf) {
+ +		pr_err("Unable to locate target_fabric_configfs"
+ +			" pointer\n");
+ +		return -EINVAL;
+ +	}
+ +	if (!tf->tf_subsys) {
+ +		pr_err("Unable to target struct config_subsystem"
+ +			" pointer\n");
+ +		return -EINVAL;
+ +	}
+ +	ret = target_fabric_tf_ops_check(tf);
+ +	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	pr_debug("<<<<<<<<<<<<<<<<<<<<<< END FABRIC API >>>>>>>>>>>>"
+ +		">>>>>>>>>>\n");
+++=======
++ 	tf = kzalloc(sizeof(struct target_fabric_configfs), GFP_KERNEL);
++ 	if (!tf) {
++ 		pr_err("%s: could not allocate memory!\n", __func__);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	INIT_LIST_HEAD(&tf->tf_list);
++ 	atomic_set(&tf->tf_access_cnt, 0);
++ 
++ 	/*
++ 	 * Setup the default generic struct config_item_type's (cits) in
++ 	 * struct target_fabric_configfs->tf_cit_tmpl
++ 	 */
++ 	tf->tf_module = fo->module;
++ 	snprintf(tf->tf_name, TARGET_FABRIC_NAME_SIZE, "%s", fo->name);
++ 
++ 	tf->tf_ops = *fo;
++ 	target_fabric_setup_cits(tf);
++ 
++ 	mutex_lock(&g_tf_lock);
++ 	list_add_tail(&tf->tf_list, &g_tf_list);
++ 	mutex_unlock(&g_tf_lock);
++ 
+++>>>>>>> d588cf8f618d (target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem)
+  	return 0;
+  }
+ -EXPORT_SYMBOL(target_register_template);
+ +EXPORT_SYMBOL(target_fabric_configfs_register);
+  
+ -void target_unregister_template(const struct target_core_fabric_ops *fo)
+ +void target_fabric_configfs_deregister(
+ +	struct target_fabric_configfs *tf)
+  {
+ -	struct target_fabric_configfs *t;
+ +	struct configfs_subsystem *su;
+  
+ +	if (!tf) {
+ +		pr_err("Unable to locate passed target_fabric_"
+ +			"configfs\n");
+ +		return;
+ +	}
+ +	su = tf->tf_subsys;
+ +	if (!su) {
+ +		pr_err("Unable to locate passed tf->tf_subsys"
+ +			" pointer\n");
+ +		return;
+ +	}
+ +	pr_debug("<<<<<<<<<<<<<<<<<<<<<< BEGIN FABRIC API >>>>>>>>>>"
+ +			">>>>>>>>>>>>\n");
+  	mutex_lock(&g_tf_lock);
+ -	list_for_each_entry(t, &g_tf_list, tf_list) {
+ -		if (!strcmp(t->tf_name, fo->name)) {
+ -			BUG_ON(atomic_read(&t->tf_access_cnt));
+ -			list_del(&t->tf_list);
+ -			kfree(t);
+ -			break;
+ -		}
+ +	if (atomic_read(&tf->tf_access_cnt)) {
+ +		mutex_unlock(&g_tf_lock);
+ +		pr_err("Non zero tf->tf_access_cnt for fabric %s\n",
+ +			tf->tf_name);
+ +		BUG();
+  	}
+ +	list_del(&tf->tf_list);
+  	mutex_unlock(&g_tf_lock);
+ +
+ +	pr_debug("Target_Core_ConfigFS: DEREGISTER -> Releasing tf:"
+ +			" %s\n", tf->tf_name);
+ +	tf->tf_module = NULL;
+ +	tf->tf_subsys = NULL;
+ +	kfree(tf);
+ +
+ +	pr_debug("<<<<<<<<<<<<<<<<<<<<<< END FABRIC API >>>>>>>>>>>>>>>>>"
+ +			">>>>>\n");
+  }
+ -EXPORT_SYMBOL(target_unregister_template);
+ +EXPORT_SYMBOL(target_fabric_configfs_deregister);
+  
+  /*##############################################################################
+  // Stop functions called by external Target Fabrics Modules
+diff --cc drivers/vhost/scsi.c
+index 65142d377371,ea32b386797f..000000000000
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@@ -1193,13 -1402,27 +1193,34 @@@ static int vhost_scsi_set_endpoint
+  				ret = -EEXIST;
+  				goto out;
+  			}
+++<<<<<<< HEAD
+ +			tv_tpg->tv_tpg_vhost_count++;
+ +			tv_tpg->vhost_scsi = vs;
+ +			vs_tpg[tv_tpg->tport_tpgt] = tv_tpg;
+ +			smp_mb__after_atomic_inc();
+++=======
++ 			/*
++ 			 * In order to ensure individual vhost-scsi configfs
++ 			 * groups cannot be removed while in use by vhost ioctl,
++ 			 * go ahead and take an explicit se_tpg->tpg_group.cg_item
++ 			 * dependency now.
++ 			 */
++ 			se_tpg = &tpg->se_tpg;
++ 			ret = target_depend_item(&se_tpg->tpg_group.cg_item);
++ 			if (ret) {
++ 				pr_warn("configfs_depend_item() failed: %d\n", ret);
++ 				kfree(vs_tpg);
++ 				mutex_unlock(&tpg->tv_tpg_mutex);
++ 				goto out;
++ 			}
++ 			tpg->tv_tpg_vhost_count++;
++ 			tpg->vhost_scsi = vs;
++ 			vs_tpg[tpg->tport_tpgt] = tpg;
++ 			smp_mb__after_atomic();
+++>>>>>>> d588cf8f618d (target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem)
+  			match = true;
+  		}
+ -		mutex_unlock(&tpg->tv_tpg_mutex);
+ +		mutex_unlock(&tv_tpg->tv_tpg_mutex);
+  	}
+  
+  	if (match) {
+@@@ -1278,11 -1502,17 +1299,21 @@@ static int vhost_scsi_clear_endpoint
+  			ret = -EINVAL;
+  			goto err_tpg;
+  		}
+ -		tpg->tv_tpg_vhost_count--;
+ -		tpg->vhost_scsi = NULL;
+ +		tv_tpg->tv_tpg_vhost_count--;
+ +		tv_tpg->vhost_scsi = NULL;
+  		vs->vs_tpg[target] = NULL;
+  		match = true;
+++<<<<<<< HEAD
+ +		mutex_unlock(&tv_tpg->tv_tpg_mutex);
+++=======
++ 		mutex_unlock(&tpg->tv_tpg_mutex);
++ 		/*
++ 		 * Release se_tpg->tpg_group.cg_item configfs dependency now
++ 		 * to allow vhost-scsi WWPN se_tpg->tpg_group shutdown to occur.
++ 		 */
++ 		se_tpg = &tpg->se_tpg;
++ 		target_undepend_item(&se_tpg->tpg_group.cg_item);
+++>>>>>>> d588cf8f618d (target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem)
+  	}
+  	if (match) {
+  		for (i = 0; i < VHOST_SCSI_MAX_VQ; i++) {
+diff --cc include/target/target_core_fabric.h
+index c9a57a197803,0f4dc3768587..000000000000
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@@ -2,7 -2,8 +2,12 @@@
+  #define TARGET_CORE_FABRIC_H
+  
+  struct target_core_fabric_ops {
+++<<<<<<< HEAD
+ +	struct configfs_subsystem *tf_subsys;
+++=======
++ 	struct module *module;
++ 	const char *name;
+++>>>>>>> d588cf8f618d (target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem)
+  	char *(*get_fabric_name)(void);
+  	u8 (*get_fabric_proto_ident)(struct se_portal_group *);
+  	char *(*tpg_get_wwn)(struct se_portal_group *);
+@@@ -90,8 -91,26 +95,17 @@@
+  	struct se_node_acl *(*fabric_make_nodeacl)(struct se_portal_group *,
+  				struct config_group *, const char *);
+  	void (*fabric_drop_nodeacl)(struct se_node_acl *);
+ -
+ -	struct configfs_attribute **tfc_discovery_attrs;
+ -	struct configfs_attribute **tfc_wwn_attrs;
+ -	struct configfs_attribute **tfc_tpg_base_attrs;
+ -	struct configfs_attribute **tfc_tpg_np_base_attrs;
+ -	struct configfs_attribute **tfc_tpg_attrib_attrs;
+ -	struct configfs_attribute **tfc_tpg_auth_attrs;
+ -	struct configfs_attribute **tfc_tpg_param_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_base_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_attrib_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_auth_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_param_attrs;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ int target_register_template(const struct target_core_fabric_ops *fo);
++ void target_unregister_template(const struct target_core_fabric_ops *fo);
++ 
++ int target_depend_item(struct config_item *item);
++ void target_undepend_item(struct config_item *item);
++ 
+++>>>>>>> d588cf8f618d (target: Fix se_tpg_tfo->tf_subsys regression + remove tf_subsystem)
+  struct se_session *transport_init_session(enum target_prot_op);
+  int transport_alloc_session_tags(struct se_session *, unsigned int,
+  		unsigned int);
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
+* Unmerged path drivers/target/target_core_configfs.c
+diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
+index 874a9bc988d8..68bd7f5d9f73 100644
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -4,9 +4,6 @@
+ /* target_core_alua.c */
+ extern struct t10_alua_lu_gp *default_lu_gp;
+ 
+-/* target_core_configfs.c */
+-extern struct configfs_subsystem *target_core_subsystem[];
+-
+ /* target_core_device.c */
+ extern struct mutex g_device_mutex;
+ extern struct list_head g_device_list;
+diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
+index a255afc452a9..d431574f7916 100644
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@ -1365,41 +1365,26 @@ void core_scsi3_free_all_registrations(
+ 
+ static int core_scsi3_tpg_depend_item(struct se_portal_group *tpg)
+ {
+-	return configfs_depend_item(tpg->se_tpg_tfo->tf_subsys,
+-			&tpg->tpg_group.cg_item);
++	return target_depend_item(&tpg->tpg_group.cg_item);
+ }
+ 
+ static void core_scsi3_tpg_undepend_item(struct se_portal_group *tpg)
+ {
+-	configfs_undepend_item(tpg->se_tpg_tfo->tf_subsys,
+-			&tpg->tpg_group.cg_item);
+-
++	target_undepend_item(&tpg->tpg_group.cg_item);
+ 	atomic_dec_mb(&tpg->tpg_pr_ref_count);
+ }
+ 
+ static int core_scsi3_nodeacl_depend_item(struct se_node_acl *nacl)
+ {
+-	struct se_portal_group *tpg = nacl->se_tpg;
+-
+ 	if (nacl->dynamic_node_acl)
+ 		return 0;
+-
+-	return configfs_depend_item(tpg->se_tpg_tfo->tf_subsys,
+-			&nacl->acl_group.cg_item);
++	return target_depend_item(&nacl->acl_group.cg_item);
+ }
+ 
+ static void core_scsi3_nodeacl_undepend_item(struct se_node_acl *nacl)
+ {
+-	struct se_portal_group *tpg = nacl->se_tpg;
+-
+-	if (nacl->dynamic_node_acl) {
+-		atomic_dec_mb(&nacl->acl_pr_ref_count);
+-		return;
+-	}
+-
+-	configfs_undepend_item(tpg->se_tpg_tfo->tf_subsys,
+-			&nacl->acl_group.cg_item);
+-
++	if (!nacl->dynamic_node_acl)
++		target_undepend_item(&nacl->acl_group.cg_item);
+ 	atomic_dec_mb(&nacl->acl_pr_ref_count);
+ }
+ 
+@@ -1417,8 +1402,7 @@ static int core_scsi3_lunacl_depend_item(struct se_dev_entry *se_deve)
+ 	nacl = lun_acl->se_lun_nacl;
+ 	tpg = nacl->se_tpg;
+ 
+-	return configfs_depend_item(tpg->se_tpg_tfo->tf_subsys,
+-			&lun_acl->se_lun_group.cg_item);
++	return target_depend_item(&lun_acl->se_lun_group.cg_item);
+ }
+ 
+ static void core_scsi3_lunacl_undepend_item(struct se_dev_entry *se_deve)
+@@ -1436,9 +1420,7 @@ static void core_scsi3_lunacl_undepend_item(struct se_dev_entry *se_deve)
+ 	nacl = lun_acl->se_lun_nacl;
+ 	tpg = nacl->se_tpg;
+ 
+-	configfs_undepend_item(tpg->se_tpg_tfo->tf_subsys,
+-			&lun_acl->se_lun_group.cg_item);
+-
++	target_undepend_item(&lun_acl->se_lun_group.cg_item);
+ 	atomic_dec_mb(&se_deve->pr_ref_count);
+ }
+ 
+diff --git a/drivers/target/target_core_xcopy.c b/drivers/target/target_core_xcopy.c
+index 32a82dc5ac30..b87421ba836c 100644
+--- a/drivers/target/target_core_xcopy.c
++++ b/drivers/target/target_core_xcopy.c
+@@ -58,7 +58,6 @@ static int target_xcopy_locate_se_dev_e4(struct se_cmd *se_cmd, struct xcopy_op
+ 					bool src)
+ {
+ 	struct se_device *se_dev;
+-	struct configfs_subsystem *subsys = target_core_subsystem[0];
+ 	unsigned char tmp_dev_wwn[XCOPY_NAA_IEEE_REGEX_LEN], *dev_wwn;
+ 	int rc;
+ 
+@@ -90,8 +89,7 @@ static int target_xcopy_locate_se_dev_e4(struct se_cmd *se_cmd, struct xcopy_op
+ 				" se_dev\n", xop->src_dev);
+ 		}
+ 
+-		rc = configfs_depend_item(subsys,
+-				&se_dev->dev_group.cg_item);
++		rc = target_depend_item(&se_dev->dev_group.cg_item);
+ 		if (rc != 0) {
+ 			pr_err("configfs_depend_item attempt failed:"
+ 				" %d for se_dev: %p\n", rc, se_dev);
+@@ -99,8 +97,8 @@ static int target_xcopy_locate_se_dev_e4(struct se_cmd *se_cmd, struct xcopy_op
+ 			return rc;
+ 		}
+ 
+-		pr_debug("Called configfs_depend_item for subsys: %p se_dev: %p"
+-			" se_dev->se_dev_group: %p\n", subsys, se_dev,
++		pr_debug("Called configfs_depend_item for se_dev: %p"
++			" se_dev->se_dev_group: %p\n", se_dev,
+ 			&se_dev->dev_group);
+ 
+ 		mutex_unlock(&g_device_mutex);
+@@ -373,7 +371,6 @@ static int xcopy_pt_get_cmd_state(struct se_cmd *se_cmd)
+ 
+ static void xcopy_pt_undepend_remotedev(struct xcopy_op *xop)
+ {
+-	struct configfs_subsystem *subsys = target_core_subsystem[0];
+ 	struct se_device *remote_dev;
+ 
+ 	if (xop->op_origin == XCOL_SOURCE_RECV_OP)
+@@ -381,11 +378,11 @@ static void xcopy_pt_undepend_remotedev(struct xcopy_op *xop)
+ 	else
+ 		remote_dev = xop->src_dev;
+ 
+-	pr_debug("Calling configfs_undepend_item for subsys: %p"
++	pr_debug("Calling configfs_undepend_item for"
+ 		  " remote_dev: %p remote_dev->dev_group: %p\n",
+-		  subsys, remote_dev, &remote_dev->dev_group.cg_item);
++		  remote_dev, &remote_dev->dev_group.cg_item);
+ 
+-	configfs_undepend_item(subsys, &remote_dev->dev_group.cg_item);
++	target_undepend_item(&remote_dev->dev_group.cg_item);
+ }
+ 
+ static void xcopy_pt_release_cmd(struct se_cmd *se_cmd)
+* Unmerged path drivers/vhost/scsi.c
+diff --git a/include/target/target_core_configfs.h b/include/target/target_core_configfs.h
+index e0801386e4dc..d2e344a50cff 100644
+--- a/include/target/target_core_configfs.h
++++ b/include/target/target_core_configfs.h
+@@ -46,8 +46,6 @@ struct target_fabric_configfs {
+ 	struct config_item	*tf_fabric;
+ 	/* Passed from fabric modules */
+ 	struct config_item_type	*tf_fabric_cit;
+-	/* Pointer to target core subsystem */
+-	struct configfs_subsystem *tf_subsys;
+ 	/* Pointer to fabric's struct module */
+ 	struct module *tf_module;
+ 	struct target_core_fabric_ops tf_ops;
+* Unmerged path include/target/target_core_fabric.h
