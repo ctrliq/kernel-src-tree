@@ -1,0 +1,227 @@
+KVM: PPC: Book3S HV: Allow KVM_PPC_ALLOCATE_HTAB ioctl() to change HPT size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author David Gibson <david@gibson.dropbear.id.au>
+commit f98a8bf9ee201b7e22fc05e27150b1e481d4949f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f98a8bf9.failed
+
+The KVM_PPC_ALLOCATE_HTAB ioctl() is used to set the size of hashed page
+table (HPT) that userspace expects a guest VM to have, and is also used to
+clear that HPT when necessary (e.g. guest reboot).
+
+At present, once the ioctl() is called for the first time, the HPT size can
+never be changed thereafter - it will be cleared but always sized as from
+the first call.
+
+With upcoming HPT resize implementation, we're going to need to allow
+userspace to resize the HPT at reset (to change it back to the default size
+if the guest changed it).
+
+So, we need to allow this ioctl() to change the HPT size.
+
+This patch also updates Documentation/virtual/kvm/api.txt to reflect
+the new behaviour.  In fact the documentation was already slightly
+incorrect since 572abd5 "KVM: PPC: Book3S HV: Don't fall back to
+smaller HPT size in allocation ioctl"
+
+	Signed-off-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit f98a8bf9ee201b7e22fc05e27150b1e481d4949f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_ppc.h
+#	arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index 4fff076a809b,cf3ef8d75910..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -156,9 -155,10 +156,16 @@@ extern void kvmppc_core_destroy_mmu(str
+  extern int kvmppc_kvm_pv(struct kvm_vcpu *vcpu);
+  extern void kvmppc_map_magic(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+ +extern long kvmppc_alloc_hpt(struct kvm *kvm, u32 *htab_orderp);
+ +extern long kvmppc_alloc_reset_hpt(struct kvm *kvm, u32 *htab_orderp);
+ +extern void kvmppc_free_hpt(struct kvm *kvm);
+++=======
++ extern int kvmppc_allocate_hpt(struct kvm_hpt_info *info, u32 order);
++ extern void kvmppc_set_hpt(struct kvm *kvm, struct kvm_hpt_info *info);
++ extern long kvmppc_alloc_reset_hpt(struct kvm *kvm, int order);
++ extern void kvmppc_free_hpt(struct kvm_hpt_info *info);
+++>>>>>>> f98a8bf9ee20 (KVM: PPC: Book3S HV: Allow KVM_PPC_ALLOCATE_HTAB ioctl() to change HPT size)
+  extern long kvmppc_prepare_vrma(struct kvm *kvm,
+  				struct kvm_userspace_memory_region *mem);
+  extern void kvmppc_map_vrma(struct kvm_vcpu *vcpu,
+diff --cc arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 283e37e10f56,3a607faf0f9f..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@@ -82,42 -70,46 +82,42 @@@ long kvmppc_alloc_hpt(struct kvm *kvm, 
+  	if (!hpt)
+  		return -ENOMEM;
+  
+ +	kvm->arch.hpt_virt = hpt;
+ +	kvm->arch.hpt_order = order;
+  	/* HPTEs are 2**4 bytes long */
+ -	npte = 1ul << (order - 4);
+ +	kvm->arch.hpt_npte = 1ul << (order - 4);
+ +	/* 128 (2**7) bytes in each HPTEG */
+ +	kvm->arch.hpt_mask = (1ul << (order - 7)) - 1;
+  
+  	/* Allocate reverse map array */
+ -	rev = vmalloc(sizeof(struct revmap_entry) * npte);
+ +	rev = vmalloc(sizeof(struct revmap_entry) * kvm->arch.hpt_npte);
+  	if (!rev) {
+ -		pr_err("kvmppc_allocate_hpt: Couldn't alloc reverse map array\n");
+ -		if (cma)
+ -			kvm_free_hpt_cma(page, 1 << (order - PAGE_SHIFT));
+ -		else
+ -			free_pages(hpt, order - PAGE_SHIFT);
+ -		return -ENOMEM;
+ +		pr_err("kvmppc_alloc_hpt: Couldn't alloc reverse map array\n");
+ +		goto out_freehpt;
+  	}
+ +	kvm->arch.revmap = rev;
+ +	kvm->arch.sdr1 = __pa(hpt) | (order - 18);
+  
+ -	info->order = order;
+ -	info->virt = hpt;
+ -	info->cma = cma;
+ -	info->rev = rev;
+ +	pr_info("KVM guest htab at %lx (order %ld), LPID %x\n",
+ +		hpt, order, kvm->arch.lpid);
+  
+ +	if (htab_orderp)
+ +		*htab_orderp = order;
+  	return 0;
+ -}
+ -
+ -void kvmppc_set_hpt(struct kvm *kvm, struct kvm_hpt_info *info)
+ -{
+ -	atomic64_set(&kvm->arch.mmio_update, 0);
+ -	kvm->arch.hpt = *info;
+ -	kvm->arch.sdr1 = __pa(info->virt) | (info->order - 18);
+  
+ -	pr_info("KVM guest htab at %lx (order %ld), LPID %x\n",
+ -		info->virt, (long)info->order, kvm->arch.lpid);
+ + out_freehpt:
+ +	if (kvm->arch.hpt_cma_alloc)
+ +		kvm_release_hpt(page, 1 << (order - PAGE_SHIFT));
+ +	else
+ +		free_pages(hpt, order - PAGE_SHIFT);
+ +	return -ENOMEM;
+  }
+  
+- long kvmppc_alloc_reset_hpt(struct kvm *kvm, u32 *htab_orderp)
++ long kvmppc_alloc_reset_hpt(struct kvm *kvm, int order)
+  {
+  	long err = -EBUSY;
+- 	long order;
++ 	struct kvm_hpt_info info;
+  
+ -	if (kvm_is_radix(kvm))
+ -		return -EINVAL;
+ -
+  	mutex_lock(&kvm->lock);
+  	if (kvm->arch.hpte_setup_done) {
+  		kvm->arch.hpte_setup_done = 0;
+@@@ -128,23 -120,30 +128,41 @@@
+  			goto out;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	if (kvm->arch.hpt_virt) {
+ +		order = kvm->arch.hpt_order;
+++=======
++ 	if (kvm->arch.hpt.order == order) {
++ 		/* We already have a suitable HPT */
++ 
+++>>>>>>> f98a8bf9ee20 (KVM: PPC: Book3S HV: Allow KVM_PPC_ALLOCATE_HTAB ioctl() to change HPT size)
+  		/* Set the entire HPT to 0, i.e. invalid HPTEs */
+ -		memset((void *)kvm->arch.hpt.virt, 0, 1ul << order);
+ +		memset((void *)kvm->arch.hpt_virt, 0, 1ul << order);
+  		/*
+  		 * Reset all the reverse-mapping chains for all memslots
+  		 */
+  		kvmppc_rmap_reset(kvm);
+  		/* Ensure that each vcpu will flush its TLB on next entry. */
+  		cpumask_setall(&kvm->arch.need_tlb_flush);
+- 		*htab_orderp = order;
+  		err = 0;
+++<<<<<<< HEAD
+ +	} else {
+ +		err = kvmppc_alloc_hpt(kvm, htab_orderp);
+ +		order = *htab_orderp;
+++=======
++ 		goto out;
+++>>>>>>> f98a8bf9ee20 (KVM: PPC: Book3S HV: Allow KVM_PPC_ALLOCATE_HTAB ioctl() to change HPT size)
+  	}
+-  out:
++ 
++ 	if (kvm->arch.hpt.virt)
++ 		kvmppc_free_hpt(&kvm->arch.hpt);
++ 
++ 	err = kvmppc_allocate_hpt(&info, order);
++ 	if (err < 0)
++ 		goto out;
++ 	kvmppc_set_hpt(kvm, &info);
++ 
++ out:
+  	mutex_unlock(&kvm->lock);
+  	return err;
+  }
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 9f3193affa20..83e224ffbff7 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -2255,18 +2255,20 @@ are, it will do nothing and return an EBUSY error.
+ The parameter is a pointer to a 32-bit unsigned integer variable
+ containing the order (log base 2) of the desired size of the hash
+ table, which must be between 18 and 46.  On successful return from the
+-ioctl, it will have been updated with the order of the hash table that
+-was allocated.
++ioctl, the value will not be changed by the kernel.
+ 
+ If no hash table has been allocated when any vcpu is asked to run
+ (with the KVM_RUN ioctl), the host kernel will allocate a
+ default-sized hash table (16 MB).
+ 
+ If this ioctl is called when a hash table has already been allocated,
+-the kernel will clear out the existing hash table (zero all HPTEs) and
+-return the hash table order in the parameter.  (If the guest is using
+-the virtualized real-mode area (VRMA) facility, the kernel will
+-re-create the VMRA HPTEs on the next KVM_RUN of any vcpu.)
++with a different order from the existing hash table, the existing hash
++table will be freed and a new one allocated.  If this is ioctl is
++called when a hash table has already been allocated of the same order
++as specified, the kernel will clear out the existing hash table (zero
++all HPTEs).  In either case, if the guest is using the virtualized
++real-mode area (VRMA) facility, the kernel will re-create the VMRA
++HPTEs on the next KVM_RUN of any vcpu.
+ 
+ 4.77 KVM_S390_INTERRUPT
+ 
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 92357b82799a..78541a156271 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -3481,12 +3481,9 @@ static long kvm_arch_vm_ioctl_hv(struct file *filp,
+ 		r = -EFAULT;
+ 		if (get_user(htab_order, (u32 __user *)argp))
+ 			break;
+-		r = kvmppc_alloc_reset_hpt(kvm, &htab_order);
++		r = kvmppc_alloc_reset_hpt(kvm, htab_order);
+ 		if (r)
+ 			break;
+-		r = -EFAULT;
+-		if (put_user(htab_order, (u32 __user *)argp))
+-			break;
+ 		r = 0;
+ 		break;
+ 	}
