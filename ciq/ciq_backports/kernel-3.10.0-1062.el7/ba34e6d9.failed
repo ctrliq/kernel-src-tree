@@ -1,0 +1,91 @@
+tcp: make sure skb is not shared before using skb_get()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit ba34e6d9d346fe4e05d7e417b9edf5140772d34c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ba34e6d9.failed
+
+IPv6 can keep a copy of SYN message using skb_get() in
+tcp_v6_conn_request() so that caller wont free the skb when calling
+kfree_skb() later.
+
+Therefore TCP fast open has to clone the skb it is queuing in
+child->sk_receive_queue, as all skbs consumed from receive_queue are
+freed using __kfree_skb() (ie assuming skb->users == 1)
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+Fixes: 5b7ed0892f2af ("tcp: move fastopen functions to tcp_fastopen.c")
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ba34e6d9d346fe4e05d7e417b9edf5140772d34c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_fastopen.c
+diff --cc net/ipv4/tcp_fastopen.c
+index 39316c1633b4,ea82fd492c1b..000000000000
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@@ -131,9 -131,10 +131,10 @@@ static bool tcp_fastopen_create_child(s
+  				      struct dst_entry *dst,
+  				      struct request_sock *req)
+  {
+ -	struct tcp_sock *tp;
+ +	struct tcp_sock *tp = tcp_sk(sk);
+  	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
+  	struct sock *child;
++ 	u32 end_seq;
+  
+  	req->num_retrans = 0;
+  	req->num_timeout = 0;
+@@@ -190,22 -195,27 +195,46 @@@
+  	 * (any reason not to?) but no need to queue the skb since
+  	 * there is no data. How about SYN+FIN?
+  	 */
+++<<<<<<< HEAD
+ +	if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1) {
+ +		skb = skb_get(skb);
+ +		skb_dst_drop(skb);
+ +		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
+ +		skb_set_owner_r(skb, child);
+ +		__skb_queue_tail(&child->sk_receive_queue, skb);
+ +		tp->syn_data_acked = 1;
+ +
+ +		/* u64_stats_update_begin(&tp->syncp) not needed here,
+ +		 * as we certainly are not changing upper 32bit value (0)
+ +		 */
+ +		tp->bytes_received = TCP_SKB_CB(skb)->end_seq -
+ +				     TCP_SKB_CB(skb)->seq - 1;
+ +	}
+ +	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +	sk->sk_data_ready(sk, 0);
+++=======
++ 	end_seq = TCP_SKB_CB(skb)->end_seq;
++ 	if (end_seq != TCP_SKB_CB(skb)->seq + 1) {
++ 		struct sk_buff *skb2;
++ 
++ 		if (unlikely(skb_shared(skb)))
++ 			skb2 = skb_clone(skb, GFP_ATOMIC);
++ 		else
++ 			skb2 = skb_get(skb);
++ 
++ 		if (likely(skb2)) {
++ 			skb_dst_drop(skb2);
++ 			__skb_pull(skb2, tcp_hdrlen(skb));
++ 			skb_set_owner_r(skb2, child);
++ 			__skb_queue_tail(&child->sk_receive_queue, skb2);
++ 			tp->syn_data_acked = 1;
++ 		} else {
++ 			end_seq = TCP_SKB_CB(skb)->seq + 1;
++ 		}
++ 	}
++ 	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = end_seq;
++ 	sk->sk_data_ready(sk);
+++>>>>>>> ba34e6d9d346 (tcp: make sure skb is not shared before using skb_get())
+  	bh_unlock_sock(child);
+  	sock_put(child);
+  	WARN_ON(req->sk == NULL);
+* Unmerged path net/ipv4/tcp_fastopen.c
