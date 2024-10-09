@@ -1086,7 +1086,7 @@ ip_set_swap(struct sock *ctnl, struct sk_buff *skb,
 	 * Not an artificial restriction anymore, as we must prevent
 	 * possible loops created by swapping in setlist type of sets. */
 	if (!(from->type->features == to->type->features &&
-	      from->type->family == to->type->family))
+	      from->family == to->family))
 		return -IPSET_ERR_TYPE_MISMATCH;
 
 	write_lock_bh(&ip_set_ref_lock);
