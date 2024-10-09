@@ -1,0 +1,258 @@
+IB/IPoIB: Disable bottom half when dealing with device address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mark Bloch <markb@mellanox.com>
+commit 9b29953bf8ca23944c5e00dcc15ad7bd9fecdd4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9b29953b.failed
+
+Align locking usage when touching device address with rest
+of the kernel. Lock the bottom half when doing so using
+netif_addr_lock_bh.
+
+This also solves the following case as reported by lockdep:
+	CPU0                    CPU1
+	----                    ----
+lock(_xmit_INFINIBAND);
+				local_irq_disable();
+				lock(&(&mc->mca_lock)->rlock);
+				lock(_xmit_INFINIBAND);
+<Interrupt>
+lock(&(&mc->mca_lock)->rlock);
+
+*** DEADLOCK ***
+
+Fixes: 492a7e67ff83 ("IB/IPoIB: Allow setting the device address")
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9b29953bf8ca23944c5e00dcc15ad7bd9fecdd4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_ib.c
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index b5ff0e81b73d,dc6d241b9406..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@@ -997,6 -997,106 +997,109 @@@ static inline int update_child_pkey(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * returns true if the device address of the ipoib interface has changed and the
++  * new address is a valid one (i.e in the gid table), return false otherwise.
++  */
++ static bool ipoib_dev_addr_changed_valid(struct ipoib_dev_priv *priv)
++ {
++ 	union ib_gid search_gid;
++ 	union ib_gid gid0;
++ 	union ib_gid *netdev_gid;
++ 	int err;
++ 	u16 index;
++ 	u8 port;
++ 	bool ret = false;
++ 
++ 	netdev_gid = (union ib_gid *)(priv->dev->dev_addr + 4);
++ 	if (ib_query_gid(priv->ca, priv->port, 0, &gid0, NULL))
++ 		return false;
++ 
++ 	netif_addr_lock_bh(priv->dev);
++ 
++ 	/* The subnet prefix may have changed, update it now so we won't have
++ 	 * to do it later
++ 	 */
++ 	priv->local_gid.global.subnet_prefix = gid0.global.subnet_prefix;
++ 	netdev_gid->global.subnet_prefix = gid0.global.subnet_prefix;
++ 	search_gid.global.subnet_prefix = gid0.global.subnet_prefix;
++ 
++ 	search_gid.global.interface_id = priv->local_gid.global.interface_id;
++ 
++ 	netif_addr_unlock_bh(priv->dev);
++ 
++ 	err = ib_find_gid(priv->ca, &search_gid, IB_GID_TYPE_IB,
++ 			  priv->dev, &port, &index);
++ 
++ 	netif_addr_lock_bh(priv->dev);
++ 
++ 	if (search_gid.global.interface_id !=
++ 	    priv->local_gid.global.interface_id)
++ 		/* There was a change while we were looking up the gid, bail
++ 		 * here and let the next work sort this out
++ 		 */
++ 		goto out;
++ 
++ 	/* The next section of code needs some background:
++ 	 * Per IB spec the port GUID can't change if the HCA is powered on.
++ 	 * port GUID is the basis for GID at index 0 which is the basis for
++ 	 * the default device address of a ipoib interface.
++ 	 *
++ 	 * so it seems the flow should be:
++ 	 * if user_changed_dev_addr && gid in gid tbl
++ 	 *	set bit dev_addr_set
++ 	 *	return true
++ 	 * else
++ 	 *	return false
++ 	 *
++ 	 * The issue is that there are devices that don't follow the spec,
++ 	 * they change the port GUID when the HCA is powered, so in order
++ 	 * not to break userspace applications, We need to check if the
++ 	 * user wanted to control the device address and we assume that
++ 	 * if he sets the device address back to be based on GID index 0,
++ 	 * he no longer wishs to control it.
++ 	 *
++ 	 * If the user doesn't control the the device address,
++ 	 * IPOIB_FLAG_DEV_ADDR_SET is set and ib_find_gid failed it means
++ 	 * the port GUID has changed and GID at index 0 has changed
++ 	 * so we need to change priv->local_gid and priv->dev->dev_addr
++ 	 * to reflect the new GID.
++ 	 */
++ 	if (!test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
++ 		if (!err && port == priv->port) {
++ 			set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
++ 			if (index == 0)
++ 				clear_bit(IPOIB_FLAG_DEV_ADDR_CTRL,
++ 					  &priv->flags);
++ 			else
++ 				set_bit(IPOIB_FLAG_DEV_ADDR_CTRL, &priv->flags);
++ 			ret = true;
++ 		} else {
++ 			ret = false;
++ 		}
++ 	} else {
++ 		if (!err && port == priv->port) {
++ 			ret = true;
++ 		} else {
++ 			if (!test_bit(IPOIB_FLAG_DEV_ADDR_CTRL, &priv->flags)) {
++ 				memcpy(&priv->local_gid, &gid0,
++ 				       sizeof(priv->local_gid));
++ 				memcpy(priv->dev->dev_addr + 4, &gid0,
++ 				       sizeof(priv->local_gid));
++ 				ret = true;
++ 			}
++ 		}
++ 	}
++ 
++ out:
++ 	netif_addr_unlock_bh(priv->dev);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 9b29953bf8ca (IB/IPoIB: Disable bottom half when dealing with device address)
+  static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+  				enum ipoib_flush_level level,
+  				int nesting)
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 379887a88961,248da5015093..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1857,6 -1846,70 +1857,73 @@@ int ipoib_add_umcast_attr(struct net_de
+  	return device_create_file(&dev->dev, &dev_attr_umcast);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void set_base_guid(struct ipoib_dev_priv *priv, union ib_gid *gid)
++ {
++ 	struct ipoib_dev_priv *child_priv;
++ 	struct net_device *netdev = priv->dev;
++ 
++ 	netif_addr_lock_bh(netdev);
++ 
++ 	memcpy(&priv->local_gid.global.interface_id,
++ 	       &gid->global.interface_id,
++ 	       sizeof(gid->global.interface_id));
++ 	memcpy(netdev->dev_addr + 4, &priv->local_gid, sizeof(priv->local_gid));
++ 	clear_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
++ 
++ 	netif_addr_unlock_bh(netdev);
++ 
++ 	if (!test_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags)) {
++ 		down_read(&priv->vlan_rwsem);
++ 		list_for_each_entry(child_priv, &priv->child_intfs, list)
++ 			set_base_guid(child_priv, gid);
++ 		up_read(&priv->vlan_rwsem);
++ 	}
++ }
++ 
++ static int ipoib_check_lladdr(struct net_device *dev,
++ 			      struct sockaddr_storage *ss)
++ {
++ 	union ib_gid *gid = (union ib_gid *)(ss->__data + 4);
++ 	int ret = 0;
++ 
++ 	netif_addr_lock_bh(dev);
++ 
++ 	/* Make sure the QPN, reserved and subnet prefix match the current
++ 	 * lladdr, it also makes sure the lladdr is unicast.
++ 	 */
++ 	if (memcmp(dev->dev_addr, ss->__data,
++ 		   4 + sizeof(gid->global.subnet_prefix)) ||
++ 	    gid->global.interface_id == 0)
++ 		ret = -EINVAL;
++ 
++ 	netif_addr_unlock_bh(dev);
++ 
++ 	return ret;
++ }
++ 
++ static int ipoib_set_mac(struct net_device *dev, void *addr)
++ {
++ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
++ 	struct sockaddr_storage *ss = addr;
++ 	int ret;
++ 
++ 	if (!(dev->priv_flags & IFF_LIVE_ADDR_CHANGE) && netif_running(dev))
++ 		return -EBUSY;
++ 
++ 	ret = ipoib_check_lladdr(dev, ss);
++ 	if (ret)
++ 		return ret;
++ 
++ 	set_base_guid(priv, (union ib_gid *)(ss->__data + 4));
++ 
++ 	queue_work(ipoib_workqueue, &priv->flush_light);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 9b29953bf8ca (IB/IPoIB: Disable bottom half when dealing with device address)
+  static ssize_t create_child(struct device *dev,
+  			    struct device_attribute *attr,
+  			    const char *buf, size_t count)
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index c0a90dd9a218,d3394b6add24..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@@ -582,11 -582,13 +582,21 @@@ void ipoib_mcast_join_task(struct work_
+  		return;
+  	}
+  	priv->local_lid = port_attr.lid;
+++<<<<<<< HEAD
+ +
+ +	if (ib_query_gid(priv->ca, priv->port, 0, &priv->local_gid, NULL))
+ +		ipoib_warn(priv, "ib_query_gid() failed\n");
+ +	else
+ +		memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw, sizeof (union ib_gid));
+++=======
++ 	netif_addr_lock_bh(dev);
++ 
++ 	if (!test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
++ 		netif_addr_unlock_bh(dev);
++ 		return;
++ 	}
++ 	netif_addr_unlock_bh(dev);
+++>>>>>>> 9b29953bf8ca (IB/IPoIB: Disable bottom half when dealing with device address)
+  
+  	spin_lock_irq(&priv->lock);
+  	if (!test_bit(IPOIB_FLAG_OPER_UP, &priv->flags))
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_ib.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_multicast.c
