@@ -1,0 +1,184 @@
+mm, vmstat: hide /proc/pagetypeinfo from normal users
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Michal Hocko <mhocko@suse.com>
+commit abaed0112c1db08be15a784a2c5c8a8b3063cdd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/abaed011.failed
+
+/proc/pagetypeinfo is a debugging tool to examine internal page
+allocator state wrt to fragmentation.  It is not very useful for any
+other use so normal users really do not need to read this file.
+
+Waiman Long has noticed that reading this file can have negative side
+effects because zone->lock is necessary for gathering data and that a)
+interferes with the page allocator and its users and b) can lead to hard
+lockups on large machines which have very long free_list.
+
+Reduce both issues by simply not exporting the file to regular users.
+
+Link: http://lkml.kernel.org/r/20191025072610.18526-2-mhocko@kernel.org
+Fixes: 467c996c1e19 ("Print out statistics in relation to fragmentation avoidance to /proc/pagetypeinfo")
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Reported-by: Waiman Long <longman@redhat.com>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Waiman Long <longman@redhat.com>
+	Acked-by: Rafael Aquini <aquini@redhat.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Song Liu <songliubraving@fb.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit abaed0112c1db08be15a784a2c5c8a8b3063cdd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmstat.c
+diff --cc mm/vmstat.c
+index 159239a33985,4e885ecd44d1..000000000000
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@@ -1393,68 -1903,82 +1393,75 @@@ static void __init start_shepherd_timer
+  		round_jiffies_relative(sysctl_stat_interval));
+  }
+  
+ -static void __init init_cpu_node_state(void)
+ -{
+ -	int node;
+ -
+ -	for_each_online_node(node) {
+ -		if (cpumask_weight(cpumask_of_node(node)) > 0)
+ -			node_set_state(node, N_CPU);
+ +/*
+ + * Use the cpu notifier to insure that the thresholds are recalculated
+ + * when necessary.
+ + */
+ +static int vmstat_cpuup_callback(struct notifier_block *nfb,
+ +		unsigned long action,
+ +		void *hcpu)
+ +{
+ +	long cpu = (long)hcpu;
+ +
+ +	switch (action) {
+ +	case CPU_ONLINE:
+ +	case CPU_ONLINE_FROZEN:
+ +		refresh_zone_stat_thresholds();
+ +		node_set_state(cpu_to_node(cpu), N_CPU);
+ +		cpumask_set_cpu(cpu, cpu_stat_off);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +	case CPU_DOWN_PREPARE_FROZEN:
+ +		cancel_delayed_work_sync(&per_cpu(vmstat_work, cpu));
+ +		cpumask_clear_cpu(cpu, cpu_stat_off);
+ +		break;
+ +	case CPU_DOWN_FAILED:
+ +	case CPU_DOWN_FAILED_FROZEN:
+ +		cpumask_set_cpu(cpu, cpu_stat_off);
+ +		break;
+ +	case CPU_DEAD:
+ +	case CPU_DEAD_FROZEN:
+ +		refresh_zone_stat_thresholds();
+ +		break;
+ +	default:
+ +		break;
+  	}
+ +	return NOTIFY_OK;
+  }
+  
+ -static int vmstat_cpu_online(unsigned int cpu)
+ -{
+ -	refresh_zone_stat_thresholds();
+ -	node_set_state(cpu_to_node(cpu), N_CPU);
+ -	return 0;
+ -}
+ -
+ -static int vmstat_cpu_down_prep(unsigned int cpu)
+ -{
+ -	cancel_delayed_work_sync(&per_cpu(vmstat_work, cpu));
+ -	return 0;
+ -}
+ -
+ -static int vmstat_cpu_dead(unsigned int cpu)
+ -{
+ -	const struct cpumask *node_cpus;
+ -	int node;
+ -
+ -	node = cpu_to_node(cpu);
+ -
+ -	refresh_zone_stat_thresholds();
+ -	node_cpus = cpumask_of_node(node);
+ -	if (cpumask_weight(node_cpus) > 0)
+ -		return 0;
+ -
+ -	node_clear_state(node, N_CPU);
+ -	return 0;
+ -}
+ -
+ +static struct notifier_block vmstat_notifier =
+ +	{ &vmstat_cpuup_callback, NULL, 0 };
+  #endif
+  
+ -struct workqueue_struct *mm_percpu_wq;
+ -
+ -void __init init_mm_internals(void)
+ +static int __init setup_vmstat(void)
+  {
+ -	int ret __maybe_unused;
+ -
+ -	mm_percpu_wq = alloc_workqueue("mm_percpu_wq", WQ_MEM_RECLAIM, 0);
+ -
+  #ifdef CONFIG_SMP
+ -	ret = cpuhp_setup_state_nocalls(CPUHP_MM_VMSTAT_DEAD, "mm/vmstat:dead",
+ -					NULL, vmstat_cpu_dead);
+ -	if (ret < 0)
+ -		pr_err("vmstat: failed to register 'dead' hotplug state\n");
+ -
+ -	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "mm/vmstat:online",
+ -					vmstat_cpu_online,
+ -					vmstat_cpu_down_prep);
+ -	if (ret < 0)
+ -		pr_err("vmstat: failed to register 'online' hotplug state\n");
+ -
+ -	get_online_cpus();
+ -	init_cpu_node_state();
+ -	put_online_cpus();
+ +	cpu_notifier_register_begin();
+ +	__register_cpu_notifier(&vmstat_notifier);
+  
+  	start_shepherd_timer();
+ +	cpu_notifier_register_done();
+  #endif
+  #ifdef CONFIG_PROC_FS
+++<<<<<<< HEAD
+ +	proc_create("buddyinfo", S_IRUGO, NULL, &fragmentation_file_operations);
+ +	proc_create("pagetypeinfo", S_IRUGO, NULL, &pagetypeinfo_file_ops);
+ +	proc_create("vmstat", S_IRUGO, NULL, &proc_vmstat_file_operations);
+ +	proc_create("zoneinfo", S_IRUGO, NULL, &proc_zoneinfo_file_operations);
+++=======
++ 	proc_create_seq("buddyinfo", 0444, NULL, &fragmentation_op);
++ 	proc_create_seq("pagetypeinfo", 0400, NULL, &pagetypeinfo_op);
++ 	proc_create_seq("vmstat", 0444, NULL, &vmstat_op);
++ 	proc_create_seq("zoneinfo", 0444, NULL, &zoneinfo_op);
+++>>>>>>> abaed0112c1d (mm, vmstat: hide /proc/pagetypeinfo from normal users)
+  #endif
+ +	return 0;
+  }
+ +module_init(setup_vmstat)
+  
+  #if defined(CONFIG_DEBUG_FS) && defined(CONFIG_COMPACTION)
+ +#include <linux/debugfs.h>
+ +
+  
+  /*
+   * Return an index indicating how much of the available free memory is
+* Unmerged path mm/vmstat.c
