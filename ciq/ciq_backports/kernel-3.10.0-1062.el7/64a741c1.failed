@@ -1,0 +1,114 @@
+nvme-rdma: support up to 4 segments of inline data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Steve Wise <swise@opengridcomputing.com>
+commit 64a741c1eaa83e34a8846c7196feb8e45785bebc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/64a741c1.failed
+
+Allow up to 4 segments of inline data for NVMF WRITE operations. This
+reduces latency for small WRITEs by removing the need for the target to
+issue a READ WR for IB, or a REG_MR + READ WR chain for iWarp.
+
+Also cap the inline segments used based on the limitations of the
+device.
+
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 64a741c1eaa83e34a8846c7196feb8e45785bebc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index c89621cbb07f,363f73fe549c..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -116,16 -114,11 +117,17 @@@ struct nvme_rdma_ctrl 
+  
+  	u32			max_fr_pages;
+  
+ -	struct sockaddr_storage addr;
+ -	struct sockaddr_storage src_addr;
+ +	union {
+ +		struct sockaddr addr;
+ +		struct sockaddr_in addr_in;
+ +	};
+ +	union {
+ +		struct sockaddr src_addr;
+ +		struct sockaddr_in src_addr_in;
+ +	};
+  
+  	struct nvme_ctrl	ctrl;
++ 	bool			use_inline_data;
+  };
+  
+  static inline struct nvme_rdma_ctrl *to_rdma_ctrl(struct nvme_ctrl *ctrl)
+@@@ -1211,28 -1201,44 +1226,44 @@@ static int nvme_rdma_map_data(struct nv
+  	if (ret)
+  		return -ENOMEM;
+  
+ -	req->nents = blk_rq_map_sg(rq->q, rq, req->sg_table.sgl);
+ +	nents = blk_rq_map_sg(rq->q, rq, req->sg_table.sgl);
+ +	BUG_ON(nents > rq->nr_phys_segments);
+ +	req->nents = nents;
+  
+ -	count = ib_dma_map_sg(ibdev, req->sg_table.sgl, req->nents,
+ +	count = ib_dma_map_sg(ibdev, req->sg_table.sgl, nents,
+  		    rq_data_dir(rq) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+  	if (unlikely(count <= 0)) {
+ -		ret = -EIO;
+ -		goto out_free_table;
+ +		sg_free_table_chained(&req->sg_table, true);
+ +		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (count == 1) {
+ +		if (rq_data_dir(rq) == WRITE &&
+ +		    map_len <= nvme_rdma_inline_data_size(queue) &&
+ +		    nvme_rdma_queue_idx(queue))
+ +			return nvme_rdma_map_sg_inline(queue, req, c);
+ +
+ +		if (dev->pd->flags & IB_PD_UNSAFE_GLOBAL_RKEY)
+ +			return nvme_rdma_map_sg_single(queue, req, c);
+++=======
++ 	if (count <= dev->num_inline_segments) {
++ 		if (rq_data_dir(rq) == WRITE && nvme_rdma_queue_idx(queue) &&
++ 		    queue->ctrl->use_inline_data &&
++ 		    blk_rq_payload_bytes(rq) <=
++ 				nvme_rdma_inline_data_size(queue)) {
++ 			ret = nvme_rdma_map_sg_inline(queue, req, c, count);
++ 			goto out;
++ 		}
++ 
++ 		if (count == 1 && dev->pd->flags & IB_PD_UNSAFE_GLOBAL_RKEY) {
++ 			ret = nvme_rdma_map_sg_single(queue, req, c);
++ 			goto out;
++ 		}
+++>>>>>>> 64a741c1eaa8 (nvme-rdma: support up to 4 segments of inline data)
+  	}
+  
+ -	ret = nvme_rdma_map_sg_fr(queue, req, c, count);
+ -out:
+ -	if (unlikely(ret))
+ -		goto out_unmap_sg;
+ -
+ -	return 0;
+ -
+ -out_unmap_sg:
+ -	ib_dma_unmap_sg(ibdev, req->sg_table.sgl,
+ -			req->nents, rq_data_dir(rq) ==
+ -			WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+ -out_free_table:
+ -	sg_free_table_chained(&req->sg_table, true);
+ -	return ret;
+ +	return nvme_rdma_map_sg_fr(queue, req, c, count);
+  }
+  
+  static void nvme_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
+* Unmerged path drivers/nvme/host/rdma.c
