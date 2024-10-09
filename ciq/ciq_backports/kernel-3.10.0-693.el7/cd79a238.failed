@@ -1,0 +1,467 @@
+flow_dissector: Add flags argument to skb_flow_dissector functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit cd79a2382aa5dcefa6e21a7c59bb1bb19e53b74d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cd79a238.failed
+
+The flags argument will allow control of the dissection process (for
+instance whether to parse beyond L3).
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cd79a2382aa5dcefa6e21a7c59bb1bb19e53b74d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+#	drivers/net/ethernet/cisco/enic/enic_clsf.c
+#	drivers/net/hyperv/netvsc_drv.c
+#	include/linux/skbuff.h
+#	net/core/flow_dissector.c
+#	net/ethernet/eth.c
+#	net/sched/cls_flow.c
+#	net/sched/cls_flower.c
+#	net/sched/sch_choke.c
+diff --cc drivers/net/bonding/bond_main.c
+index 0fd8f39dab0c,771a449d2f56..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -3094,9 -3095,9 +3094,13 @@@ static bool bond_flow_dissect(struct bo
+  	int noff, proto = -1;
+  
+  	if (bond->params.xmit_policy > BOND_XMIT_POLICY_LAYER23)
+++<<<<<<< HEAD
+ +		return skb_flow_dissect(skb, fk);
+++=======
++ 		return skb_flow_dissect_flow_keys(skb, fk, 0);
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  
+ -	fk->ports.ports = 0;
+ +	fk->ports = 0;
+  	noff = skb_network_offset(skb);
+  	if (skb->protocol == htons(ETH_P_IP)) {
+  		if (unlikely(!pskb_may_pull(skb, noff + sizeof(*iph))))
+diff --cc drivers/net/ethernet/cisco/enic/enic_clsf.c
+index e2fbefe5772f,3c677ed3c29e..000000000000
+--- a/drivers/net/ethernet/cisco/enic/enic_clsf.c
++++ b/drivers/net/ethernet/cisco/enic/enic_clsf.c
+@@@ -177,9 -177,10 +177,16 @@@ int enic_rx_flow_steer(struct net_devic
+  	int res, i;
+  
+  	enic = netdev_priv(dev);
+++<<<<<<< HEAD
+ +	res = skb_flow_dissect(skb, &keys);
+ +	if (!res || keys.n_proto != htons(ETH_P_IP) ||
+ +	    (keys.ip_proto != IPPROTO_TCP && keys.ip_proto != IPPROTO_UDP))
+++=======
++ 	res = skb_flow_dissect_flow_keys(skb, &keys, 0);
++ 	if (!res || keys.basic.n_proto != htons(ETH_P_IP) ||
++ 	    (keys.basic.ip_proto != IPPROTO_TCP &&
++ 	     keys.basic.ip_proto != IPPROTO_UDP))
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  		return -EPROTONOSUPPORT;
+  
+  	tbl_idx = skb_get_hash_raw(skb) & ENIC_RFS_FLW_MASK;
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 2e3746e1a2e8,409b48e1e589..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -203,11 -195,71 +203,73 @@@ static void *init_ppi_data(struct rndis
+  	return ppi;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ union sub_key {
++ 	u64 k;
++ 	struct {
++ 		u8 pad[3];
++ 		u8 kb;
++ 		u32 ka;
++ 	};
++ };
++ 
++ /* Toeplitz hash function
++  * data: network byte order
++  * return: host byte order
++  */
++ static u32 comp_hash(u8 *key, int klen, void *data, int dlen)
++ {
++ 	union sub_key subk;
++ 	int k_next = 4;
++ 	u8 dt;
++ 	int i, j;
++ 	u32 ret = 0;
++ 
++ 	subk.k = 0;
++ 	subk.ka = ntohl(*(u32 *)key);
++ 
++ 	for (i = 0; i < dlen; i++) {
++ 		subk.kb = key[k_next];
++ 		k_next = (k_next + 1) % klen;
++ 		dt = ((u8 *)data)[i];
++ 		for (j = 0; j < 8; j++) {
++ 			if (dt & 0x80)
++ 				ret ^= subk.ka;
++ 			dt <<= 1;
++ 			subk.k <<= 1;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static bool netvsc_set_hash(u32 *hash, struct sk_buff *skb)
++ {
++ 	struct flow_keys flow;
++ 	int data_len;
++ 
++ 	if (!skb_flow_dissect_flow_keys(skb, &flow, 0) ||
++ 	    !(flow.basic.n_proto == htons(ETH_P_IP) ||
++ 	      flow.basic.n_proto == htons(ETH_P_IPV6)))
++ 		return false;
++ 
++ 	if (flow.basic.ip_proto == IPPROTO_TCP)
++ 		data_len = 12;
++ 	else
++ 		data_len = 8;
++ 
++ 	*hash = comp_hash(netvsc_hash_key, HASH_KEYLEN, &flow, data_len);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  static u16 netvsc_select_queue(struct net_device *ndev, struct sk_buff *skb,
+ -			void *accel_priv, select_queue_fallback_t fallback)
+ +		       void *accel_priv, select_queue_fallback_t fallback)
+  {
+  	struct net_device_context *net_device_ctx = netdev_priv(ndev);
+ -	struct hv_device *hdev =  net_device_ctx->device_ctx;
+ -	struct netvsc_device *nvsc_dev = hv_get_drvdata(hdev);
+ +	struct netvsc_device *nvsc_dev = net_device_ctx->nvdev;
+  	u32 hash;
+  	u16 q_idx = 0;
+  
+diff --cc include/linux/skbuff.h
+index dcb8575fa615,9e62687c70f3..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -1001,6 -950,120 +1001,123 @@@ static inline void skb_clear_hash_if_no
+  		skb_clear_hash(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void
++ __skb_set_hash(struct sk_buff *skb, __u32 hash, bool is_sw, bool is_l4)
++ {
++ 	skb->l4_hash = is_l4;
++ 	skb->sw_hash = is_sw;
++ 	skb->hash = hash;
++ }
++ 
++ static inline void
++ skb_set_hash(struct sk_buff *skb, __u32 hash, enum pkt_hash_types type)
++ {
++ 	/* Used by drivers to set hash from HW */
++ 	__skb_set_hash(skb, hash, false, type == PKT_HASH_TYPE_L4);
++ }
++ 
++ static inline void
++ __skb_set_sw_hash(struct sk_buff *skb, __u32 hash, bool is_l4)
++ {
++ 	__skb_set_hash(skb, hash, true, is_l4);
++ }
++ 
++ void __skb_get_hash(struct sk_buff *skb);
++ u32 skb_get_poff(const struct sk_buff *skb);
++ u32 __skb_get_poff(const struct sk_buff *skb, void *data,
++ 		   const struct flow_keys *keys, int hlen);
++ __be32 __skb_flow_get_ports(const struct sk_buff *skb, int thoff, u8 ip_proto,
++ 			    void *data, int hlen_proto);
++ 
++ static inline __be32 skb_flow_get_ports(const struct sk_buff *skb,
++ 					int thoff, u8 ip_proto)
++ {
++ 	return __skb_flow_get_ports(skb, thoff, ip_proto, NULL, 0);
++ }
++ 
++ void skb_flow_dissector_init(struct flow_dissector *flow_dissector,
++ 			     const struct flow_dissector_key *key,
++ 			     unsigned int key_count);
++ 
++ bool __skb_flow_dissect(const struct sk_buff *skb,
++ 			struct flow_dissector *flow_dissector,
++ 			void *target_container,
++ 			void *data, __be16 proto, int nhoff, int hlen,
++ 			unsigned int flags);
++ 
++ static inline bool skb_flow_dissect(const struct sk_buff *skb,
++ 				    struct flow_dissector *flow_dissector,
++ 				    void *target_container, unsigned int flags)
++ {
++ 	return __skb_flow_dissect(skb, flow_dissector, target_container,
++ 				  NULL, 0, 0, 0, flags);
++ }
++ 
++ static inline bool skb_flow_dissect_flow_keys(const struct sk_buff *skb,
++ 					      struct flow_keys *flow,
++ 					      unsigned int flags)
++ {
++ 	memset(flow, 0, sizeof(*flow));
++ 	return __skb_flow_dissect(skb, &flow_keys_dissector, flow,
++ 				  NULL, 0, 0, 0, flags);
++ }
++ 
++ static inline bool skb_flow_dissect_flow_keys_buf(struct flow_keys *flow,
++ 						  void *data, __be16 proto,
++ 						  int nhoff, int hlen,
++ 						  unsigned int flags)
++ {
++ 	memset(flow, 0, sizeof(*flow));
++ 	return __skb_flow_dissect(NULL, &flow_keys_buf_dissector, flow,
++ 				  data, proto, nhoff, hlen, flags);
++ }
++ 
++ static inline __u32 skb_get_hash(struct sk_buff *skb)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash)
++ 		__skb_get_hash(skb);
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 __skb_get_hash_flowi6(struct sk_buff *skb, struct flowi6 *fl6);
++ 
++ static inline __u32 skb_get_hash_flowi6(struct sk_buff *skb, struct flowi6 *fl6)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash) {
++ 		struct flow_keys keys;
++ 
++ 		__skb_set_sw_hash(skb, __get_hash_from_flowi6(fl6, &keys),
++ 				  flow_keys_have_l4(&keys));
++ 	}
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 __skb_get_hash_flowi4(struct sk_buff *skb, struct flowi4 *fl);
++ 
++ static inline __u32 skb_get_hash_flowi4(struct sk_buff *skb, struct flowi4 *fl4)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash) {
++ 		struct flow_keys keys;
++ 
++ 		__skb_set_sw_hash(skb, __get_hash_from_flowi4(fl4, &keys),
++ 				  flow_keys_have_l4(&keys));
++ 	}
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 skb_get_hash_perturb(const struct sk_buff *skb, u32 perturb);
++ 
++ static inline __u32 skb_get_hash_raw(const struct sk_buff *skb)
++ {
++ 	return skb->hash;
++ }
++ 
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  static inline void skb_copy_hash(struct sk_buff *to, const struct sk_buff *from)
+  {
+  	to->hash = from->hash;
+@@@ -1984,8 -2049,8 +2101,13 @@@ static inline void skb_probe_transport_
+  
+  	if (skb_transport_header_was_set(skb))
+  		return;
+++<<<<<<< HEAD
+ +	else if (skb_flow_dissect(skb, &keys))
+ +		skb_set_transport_header(skb, keys.thoff);
+++=======
++ 	else if (skb_flow_dissect_flow_keys(skb, &keys, 0))
++ 		skb_set_transport_header(skb, keys.control.thoff);
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  	else
+  		skb_set_transport_header(skb, offset_hint);
+  }
+diff --cc net/core/flow_dissector.c
+index c177964713d3,c3d9807cb34e..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -116,13 -112,26 +116,21 @@@ EXPORT_SYMBOL(__skb_flow_get_ports)
+   * @nhoff: network header offset, if @data is NULL use skb_network_offset(skb)
+   * @hlen: packet header length, if @data is NULL use skb_headlen(skb)
+   *
+ - * The function will try to retrieve individual keys into target specified
+ - * by flow_dissector from either the skbuff or a raw buffer specified by the
+ - * rest parameters.
+ - *
+ - * Caller must take care of zeroing target container memory.
+ + * The function will try to retrieve the struct flow_keys from either the skbuff
+ + * or a raw buffer specified by the rest parameters
+   */
+++<<<<<<< HEAD
+ +bool __skb_flow_dissect(const struct sk_buff *skb, struct flow_keys *flow,
+ +			void *data, __be16 proto, int nhoff, int hlen)
+++=======
++ bool __skb_flow_dissect(const struct sk_buff *skb,
++ 			struct flow_dissector *flow_dissector,
++ 			void *target_container,
++ 			void *data, __be16 proto, int nhoff, int hlen,
++ 			unsigned int flags)
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  {
+ -	struct flow_dissector_key_control *key_control;
+ -	struct flow_dissector_key_basic *key_basic;
+ -	struct flow_dissector_key_addrs *key_addrs;
+ -	struct flow_dissector_key_ports *key_ports;
+ -	struct flow_dissector_key_tags *key_tags;
+ -	struct flow_dissector_key_keyid *key_keyid;
+ -	u8 ip_proto = 0;
+ -	bool ret = false;
+ +	u8 ip_proto;
+  
+  	if (!data) {
+  		data = skb->data;
+@@@ -342,8 -554,47 +350,52 @@@ u32 flow_hash_from_keys(struct flow_key
+  }
+  EXPORT_SYMBOL(flow_hash_from_keys);
+  
+++<<<<<<< HEAD
+ +/*
+ + * __skb_get_hash: calculate a flow hash based on src/dst addresses
+++=======
++ static inline u32 ___skb_get_hash(const struct sk_buff *skb,
++ 				  struct flow_keys *keys, u32 keyval)
++ {
++ 	if (!skb_flow_dissect_flow_keys(skb, keys, 0))
++ 		return 0;
++ 
++ 	return __flow_hash_from_keys(keys, keyval);
++ }
++ 
++ struct _flow_keys_digest_data {
++ 	__be16	n_proto;
++ 	u8	ip_proto;
++ 	u8	padding;
++ 	__be32	ports;
++ 	__be32	src;
++ 	__be32	dst;
++ };
++ 
++ void make_flow_keys_digest(struct flow_keys_digest *digest,
++ 			   const struct flow_keys *flow)
++ {
++ 	struct _flow_keys_digest_data *data =
++ 	    (struct _flow_keys_digest_data *)digest;
++ 
++ 	BUILD_BUG_ON(sizeof(*data) > sizeof(*digest));
++ 
++ 	memset(digest, 0, sizeof(*digest));
++ 
++ 	data->n_proto = flow->basic.n_proto;
++ 	data->ip_proto = flow->basic.ip_proto;
++ 	data->ports = flow->ports.ports;
++ 	data->src = flow->addrs.v4addrs.src;
++ 	data->dst = flow->addrs.v4addrs.dst;
++ }
++ EXPORT_SYMBOL(make_flow_keys_digest);
++ 
++ /**
++  * __skb_get_hash: calculate a flow hash
++  * @skb: sk_buff to calculate flow hash from
++  *
++  * This function calculates a flow hash based on src/dst addresses
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+   * and src/dst port numbers.  Sets hash in skb to non-zero hash value
+   * on success, zero indicates no valid hash.  Also, sets l4_hash in skb
+   * if hash is a canonical 4-tuple hash over transport ports.
+@@@ -448,7 -727,7 +500,11 @@@ u32 skb_get_poff(const struct sk_buff *
+  {
+  	struct flow_keys keys;
+  
+++<<<<<<< HEAD
+ +	if (!skb_flow_dissect(skb, &keys))
+++=======
++ 	if (!skb_flow_dissect_flow_keys(skb, &keys, 0))
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  		return 0;
+  
+  	return __skb_get_poff(skb, skb->data, &keys, skb_headlen(skb));
+diff --cc net/ethernet/eth.c
+index de86b55317f9,d850fdc828f9..000000000000
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@@ -167,9 -131,9 +167,15 @@@ u32 eth_get_headlen(void *data, unsigne
+  		return len;
+  
+  	/* parse any remaining L2/L3 headers, check for L4 */
+++<<<<<<< HEAD
+ +	if (!__skb_flow_dissect(NULL, &keys, data,
+ +				eth->h_proto, sizeof(*eth), len))
+ +		return max_t(u32, keys.thoff, sizeof(*eth));
+++=======
++ 	if (!skb_flow_dissect_flow_keys_buf(&keys, data, eth->h_proto,
++ 					    sizeof(*eth), len, 0))
++ 		return max_t(u32, keys.control.thoff, sizeof(*eth));
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  
+  	/* parse for any L4 headers */
+  	return min_t(u32, __skb_get_poff(NULL, data, &keys, len), len);
+diff --cc net/sched/cls_flow.c
+index c999e8f9936b,536838b657bf..000000000000
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@@ -295,7 -301,7 +295,11 @@@ static int flow_classify(struct sk_buf
+  
+  		keymask = f->keymask;
+  		if (keymask & FLOW_KEYS_NEEDED)
+++<<<<<<< HEAD
+ +			skb_flow_dissect(skb, &flow_keys);
+++=======
++ 			skb_flow_dissect_flow_keys(skb, &flow_keys, 0);
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  
+  		for (n = 0; n < f->nkeys; n++) {
+  			key = ffs(keymask) - 1;
+diff --cc net/sched/sch_choke.c
+index ecb70f411ff4,02bfd3d1c4f0..000000000000
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@@ -170,13 -170,13 +170,21 @@@ static bool choke_match_flow(struct sk_
+  
+  	if (!choke_skb_cb(skb1)->keys_valid) {
+  		choke_skb_cb(skb1)->keys_valid = 1;
+++<<<<<<< HEAD
+ +		skb_flow_dissect(skb1, &temp);
+++=======
++ 		skb_flow_dissect_flow_keys(skb1, &temp, 0);
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  		make_flow_keys_digest(&choke_skb_cb(skb1)->keys, &temp);
+  	}
+  
+  	if (!choke_skb_cb(skb2)->keys_valid) {
+  		choke_skb_cb(skb2)->keys_valid = 1;
+++<<<<<<< HEAD
+ +		skb_flow_dissect(skb2, &temp);
+++=======
++ 		skb_flow_dissect_flow_keys(skb2, &temp, 0);
+++>>>>>>> cd79a2382aa5 (flow_dissector: Add flags argument to skb_flow_dissector functions)
+  		make_flow_keys_digest(&choke_skb_cb(skb2)->keys, &temp);
+  	}
+  
+* Unmerged path net/sched/cls_flower.c
+* Unmerged path drivers/net/bonding/bond_main.c
+* Unmerged path drivers/net/ethernet/cisco/enic/enic_clsf.c
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/flow_dissector.c
+* Unmerged path net/ethernet/eth.c
+* Unmerged path net/sched/cls_flow.c
+* Unmerged path net/sched/cls_flower.c
+* Unmerged path net/sched/sch_choke.c
