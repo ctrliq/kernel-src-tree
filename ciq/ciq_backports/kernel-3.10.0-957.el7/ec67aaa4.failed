@@ -1,0 +1,331 @@
+sysvipc/sem: mitigate semnum index against spectre v1
+
+jira LE-1907
+cve CVE-2018-3693
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [ipc] sem: mitigate semnum index against spectre v1 (Lauro Ramos Venancio) [1589035] {CVE-2018-3693}
+Rebuild_FUZZ: 91.84%
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit ec67aaa46dce26d671b46c94ac674ad0b67d044c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ec67aaa4.failed
+
+Both smatch and coverity are reporting potential issues with spectre
+variant 1 with the 'semnum' index within the sma->sems array, ie:
+
+  ipc/sem.c:388 sem_lock() warn: potential spectre issue 'sma->sems'
+  ipc/sem.c:641 perform_atomic_semop_slow() warn: potential spectre issue 'sma->sems'
+  ipc/sem.c:721 perform_atomic_semop() warn: potential spectre issue 'sma->sems'
+
+Avoid any possible speculation by using array_index_nospec() thus
+ensuring the semnum value is bounded to [0, sma->sem_nsems).  With the
+exception of sem_lock() all of these are slowpaths.
+
+Link: http://lkml.kernel.org/r/20180423171131.njs4rfm2yzyeg6do@linux-n805
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: "Gustavo A. R. Silva" <gustavo@embeddedor.com>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ec67aaa46dce26d671b46c94ac674ad0b67d044c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/sem.c
+diff --cc ipc/sem.c
+index 9d482b450160,5af1943ad782..000000000000
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@@ -86,8 -84,10 +86,13 @@@
+  #include <linux/rwsem.h>
+  #include <linux/nsproxy.h>
+  #include <linux/ipc_namespace.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/sched/wake_q.h>
++ #include <linux/nospec.h>
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  #include "util.h"
+  
+  /* One semaphore structure for each semaphore in the system. */
+@@@ -302,22 -382,19 +308,27 @@@ static inline int sem_lock(struct sem_a
+  
+  	/*
+  	 * Only one semaphore affected - try to optimize locking.
+ -	 * Optimized locking is possible if no complex operation
+ -	 * is either enqueued or processed right now.
+ -	 *
+ -	 * Both facts are tracked by use_global_mode.
+ +	 * The rules are:
+ +	 * - optimized locking is possible if no complex operation
+ +	 *   is either enqueued or processed right now.
+ +	 * - The test for enqueued complex ops is simple:
+ +	 *      sma->complex_count != 0
+ +	 * - Testing for complex ops that are processed right now is
+ +	 *   a bit more difficult. Complex ops acquire the full lock
+ +	 *   and first wait that the running simple ops have completed.
+ +	 *   (see above)
+ +	 *   Thus: If we own a simple lock and the global lock is free
+ +	 *	and complex_count is now 0, then it will stay 0 and
+ +	 *	thus just locking sem->lock is sufficient.
+  	 */
+++<<<<<<< HEAD
+ +	sem = sma->sem_base + sops->sem_num;
+++=======
++ 	idx = array_index_nospec(sops->sem_num, sma->sem_nsems);
++ 	sem = &sma->sems[idx];
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  
+ -	/*
+ -	 * Initial check for use_global_lock. Just an optimization,
+ -	 * no locking, no memory barrier.
+ -	 */
+ -	if (!sma->use_global_lock) {
+ +	if (sma->complex_count == 0) {
+  		/*
+  		 * It appears that no complex operation is around.
+  		 * Acquire the per-semaphore lock.
+@@@ -593,21 -625,27 +604,26 @@@ SYSCALL_DEFINE3(semget, key_t, key, int
+   *
+   * Returns 0 if the operation was possible.
+   * Returns 1 if the operation is impossible, the caller must sleep.
+ - * Returns <0 for error codes.
+ + * Negative values are error codes.
+   */
+ -static int perform_atomic_semop_slow(struct sem_array *sma, struct sem_queue *q)
+ +
+ +static int perform_atomic_semop(struct sem_array *sma, struct sembuf *sops,
+ +			     int nsops, struct sem_undo *un, int pid)
+  {
+ -	int result, sem_op, nsops;
+ -	struct pid *pid;
+ +	int result, sem_op;
+  	struct sembuf *sop;
+ -	struct sem *curr;
+ -	struct sembuf *sops;
+ -	struct sem_undo *un;
+ -
+ -	sops = q->sops;
+ -	nsops = q->nsops;
+ -	un = q->undo;
+ +	struct sem * curr;
+  
+  	for (sop = sops; sop < sops + nsops; sop++) {
+++<<<<<<< HEAD
+ +		curr = sma->sem_base + sop->sem_num;
+++=======
++ 		int idx = array_index_nospec(sop->sem_num, sma->sem_nsems);
++ 		curr = &sma->sems[idx];
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  		sem_op = sop->sem_op;
+  		result = curr->semval;
+ -
+ +  
+  		if (!sem_op && result)
+  			goto would_block;
+  
+@@@ -657,51 -700,86 +673,97 @@@ undo
+  	return result;
+  }
+  
+ -static int perform_atomic_semop(struct sem_array *sma, struct sem_queue *q)
+ +/** wake_up_sem_queue_prepare(q, error): Prepare wake-up
+ + * @q: queue entry that must be signaled
+ + * @error: Error value for the signal
+ + *
+ + * Prepare the wake-up of the queue entry q.
+ + */
+ +static void wake_up_sem_queue_prepare(struct list_head *pt,
+ +				struct sem_queue *q, int error)
+  {
+++<<<<<<< HEAD
+ +	if (list_empty(pt)) {
+ +		/*
+ +		 * Hold preempt off so that we don't get preempted and have the
+ +		 * wakee busy-wait until we're scheduled back on.
+ +		 */
+ +		preempt_disable();
+++=======
++ 	int result, sem_op, nsops;
++ 	struct sembuf *sop;
++ 	struct sem *curr;
++ 	struct sembuf *sops;
++ 	struct sem_undo *un;
++ 
++ 	sops = q->sops;
++ 	nsops = q->nsops;
++ 	un = q->undo;
++ 
++ 	if (unlikely(q->dupsop))
++ 		return perform_atomic_semop_slow(sma, q);
++ 
++ 	/*
++ 	 * We scan the semaphore set twice, first to ensure that the entire
++ 	 * operation can succeed, therefore avoiding any pointless writes
++ 	 * to shared memory and having to undo such changes in order to block
++ 	 * until the operations can go through.
++ 	 */
++ 	for (sop = sops; sop < sops + nsops; sop++) {
++ 		int idx = array_index_nospec(sop->sem_num, sma->sem_nsems);
++ 
++ 		curr = &sma->sems[idx];
++ 		sem_op = sop->sem_op;
++ 		result = curr->semval;
++ 
++ 		if (!sem_op && result)
++ 			goto would_block; /* wait-for-zero */
++ 
++ 		result += sem_op;
++ 		if (result < 0)
++ 			goto would_block;
++ 
++ 		if (result > SEMVMX)
++ 			return -ERANGE;
++ 
++ 		if (sop->sem_flg & SEM_UNDO) {
++ 			int undo = un->semadj[sop->sem_num] - sem_op;
++ 
++ 			/* Exceeding the undo range is an error. */
++ 			if (undo < (-SEMAEM - 1) || undo > SEMAEM)
++ 				return -ERANGE;
++ 		}
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  	}
+ +	q->status = IN_WAKEUP;
+ +	q->pid = error;
+  
+ -	for (sop = sops; sop < sops + nsops; sop++) {
+ -		curr = &sma->sems[sop->sem_num];
+ -		sem_op = sop->sem_op;
+ -		result = curr->semval;
+ -
+ -		if (sop->sem_flg & SEM_UNDO) {
+ -			int undo = un->semadj[sop->sem_num] - sem_op;
+ -
+ -			un->semadj[sop->sem_num] = undo;
+ -		}
+ -		curr->semval += sem_op;
+ -		ipc_update_pid(&curr->sempid, q->pid);
+ -	}
+ -
+ -	return 0;
+ -
+ -would_block:
+ -	q->blocking = sop;
+ -	return sop->sem_flg & IPC_NOWAIT ? -EAGAIN : 1;
+ +	list_add_tail(&q->list, pt);
+  }
+  
+ -static inline void wake_up_sem_queue_prepare(struct sem_queue *q, int error,
+ -					     struct wake_q_head *wake_q)
+ +/**
+ + * wake_up_sem_queue_do(pt) - do the actual wake-up
+ + * @pt: list of tasks to be woken up
+ + *
+ + * Do the actual wake-up.
+ + * The function is called without any locks held, thus the semaphore array
+ + * could be destroyed already and the tasks can disappear as soon as the
+ + * status is set to the actual return code.
+ + */
+ +static void wake_up_sem_queue_do(struct list_head *pt)
+  {
+ -	wake_q_add(wake_q, q->sleeper);
+ -	/*
+ -	 * Rely on the above implicit barrier, such that we can
+ -	 * ensure that we hold reference to the task before setting
+ -	 * q->status. Otherwise we could race with do_exit if the
+ -	 * task is awoken by an external event before calling
+ -	 * wake_up_process().
+ -	 */
+ -	WRITE_ONCE(q->status, error);
+ +	struct sem_queue *q, *t;
+ +	int did_something;
+ +
+ +	did_something = !list_empty(pt);
+ +	list_for_each_entry_safe(q, t, pt, list) {
+ +		wake_up_process(q->sleeper);
+ +		/* q can disappear immediately after writing q->status. */
+ +		smp_wmb();
+ +		q->status = q->pid;
+ +	}
+ +	if (did_something)
+ +		preempt_enable();
+  }
+  
+  static void unlink_queue(struct sem_array *sma, struct sem_queue *q)
+@@@ -1288,7 -1362,8 +1350,12 @@@ static int semctl_setval(struct ipc_nam
+  		return -EIDRM;
+  	}
+  
+++<<<<<<< HEAD
+ +	curr = &sma->sem_base[semnum];
+++=======
++ 	semnum = array_index_nospec(semnum, sma->sem_nsems);
++ 	curr = &sma->sems[semnum];
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  
+  	ipc_assert_locked_object(&sma->sem_perm);
+  	list_for_each_entry(un, &sma->list_id, list_id)
+@@@ -1439,7 -1516,9 +1506,13 @@@ static int semctl_main(struct ipc_names
+  		err = -EIDRM;
+  		goto out_unlock;
+  	}
+++<<<<<<< HEAD
+ +	curr = &sma->sem_base[semnum];
+++=======
++ 
++ 	semnum = array_index_nospec(semnum, nsems);
++ 	curr = &sma->sems[semnum];
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  
+  	switch (cmd) {
+  	case GETVAL:
+@@@ -1873,26 -2071,27 +1946,31 @@@ SYSCALL_DEFINE4(semtimedop, int, semid
+  		 * the required updates.
+  		 */
+  		if (alter)
+ -			do_smart_update(sma, sops, nsops, 1, &wake_q);
+ +			do_smart_update(sma, sops, nsops, 1, &tasks);
+  		else
+  			set_semotime(sma, sops);
+ -
+ -		sem_unlock(sma, locknum);
+ -		rcu_read_unlock();
+ -		wake_up_q(&wake_q);
+ -
+ -		goto out_free;
+  	}
+ -	if (error < 0) /* non-blocking error path */
+ +	if (error <= 0)
+  		goto out_unlock_free;
+  
+ -	/*
+ -	 * We need to sleep on this operation, so we put the current
+ +	/* We need to sleep on this operation, so we put the current
+  	 * task into the pending queue and go to sleep.
+  	 */
+ +		
+ +	queue.sops = sops;
+ +	queue.nsops = nsops;
+ +	queue.undo = un;
+ +	queue.pid = task_tgid_vnr(current);
+ +	queue.alter = alter;
+ +
+  	if (nsops == 1) {
+  		struct sem *curr;
+++<<<<<<< HEAD
+ +		curr = &sma->sem_base[sops->sem_num];
+++=======
++ 		int idx = array_index_nospec(sops->sem_num, sma->sem_nsems);
++ 		curr = &sma->sems[idx];
+++>>>>>>> ec67aaa46dce (sysvipc/sem: mitigate semnum index against spectre v1)
+  
+  		if (alter) {
+  			if (sma->complex_count) {
+* Unmerged path ipc/sem.c
