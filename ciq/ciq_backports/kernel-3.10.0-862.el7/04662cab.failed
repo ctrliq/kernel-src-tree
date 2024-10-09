@@ -1,0 +1,324 @@
+fsnotify: Lock object list with connector lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 04662cab59fc3e8421fd7a0539d304d51d2750a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/04662cab.failed
+
+So far list of marks attached to an object (inode / vfsmount) was
+protected by i_lock or mnt_root->d_lock. This dictates that the list
+must be empty before the object can be destroyed although the list is
+now anchored in the fsnotify_mark_connector structure. Protect the list
+by a spinlock in the fsnotify_mark_connector structure to decouple
+lifetime of a list of marks from a lifetime of the object. This also
+simplifies the code quite a bit since we don't have to differentiate
+between inode and vfsmount lists in quite a few places anymore.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 04662cab59fc3e8421fd7a0539d304d51d2750a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/mark.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/notify/mark.c
+index 44836e539169,bfb415d0d757..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -109,9 -112,50 +111,56 @@@ u32 fsnotify_recalc_mask(struct hlist_h
+  	u32 new_mask = 0;
+  	struct fsnotify_mark *mark;
+  
+++<<<<<<< HEAD
+ +	hlist_for_each_entry(mark, head, obj_list)
+ +		new_mask |= mark->mask;
+ +	return new_mask;
+++=======
++ 	assert_spin_locked(&conn->lock);
++ 	hlist_for_each_entry(mark, &conn->list, obj_list)
++ 		new_mask |= mark->mask;
++ 
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		conn->inode->i_fsnotify_mask = new_mask;
++ 	else if (conn->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++ 		real_mount(conn->mnt)->mnt_fsnotify_mask = new_mask;
++ }
++ 
++ /*
++  * Calculate mask of events for a list of marks. The caller must make sure
++  * connector cannot disappear under us (usually by holding a mark->lock or
++  * mark->group->mark_mutex for a mark on this list).
++  */
++ void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
++ {
++ 	if (!conn)
++ 		return;
++ 
++ 	spin_lock(&conn->lock);
++ 	__fsnotify_recalc_mask(conn);
++ 	spin_unlock(&conn->lock);
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		__fsnotify_update_child_dentry_flags(conn->inode);
++ }
++ 
++ static struct inode *fsnotify_detach_from_object(struct fsnotify_mark *mark)
++ {
++ 	struct fsnotify_mark_connector *conn;
++ 	struct inode *inode = NULL;
++ 
++ 	conn = mark->connector;
++ 	spin_lock(&conn->lock);
++ 	hlist_del_init_rcu(&mark->obj_list);
++ 	if (hlist_empty(&conn->list)) {
++ 		if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 			inode = conn->inode;
++ 	}
++ 	__fsnotify_recalc_mask(conn);
++ 	mark->connector = NULL;
++ 	spin_unlock(&conn->lock);
++ 
++ 	return inode;
+++>>>>>>> 04662cab59fc (fsnotify: Lock object list with connector lock)
+  }
+  
+  /*
+@@@ -304,17 -317,75 +353,89 @@@ int fsnotify_compare_groups(struct fsno
+  	return -1;
+  }
+  
+++<<<<<<< HEAD
+ +/* Add mark into proper place in given list of marks */
+ +int fsnotify_add_mark_list(struct hlist_head *head, struct fsnotify_mark *mark,
+ +			   int allow_dups)
+ +{
+ +	struct fsnotify_mark *lmark, *last = NULL;
+ +	int cmp;
+ +
+ +	/* is mark the first mark? */
+ +	if (hlist_empty(head)) {
+ +		hlist_add_head_rcu(&mark->obj_list, head);
+ +		return 0;
+++=======
++ static int fsnotify_attach_connector_to_object(
++ 					struct fsnotify_mark_connector **connp,
++ 					struct inode *inode,
++ 					struct vfsmount *mnt)
++ {
++ 	struct fsnotify_mark_connector *conn;
++ 
++ 	conn = kmem_cache_alloc(fsnotify_mark_connector_cachep, GFP_KERNEL);
++ 	if (!conn)
++ 		return -ENOMEM;
++ 	spin_lock_init(&conn->lock);
++ 	INIT_HLIST_HEAD(&conn->list);
++ 	if (inode) {
++ 		conn->flags = FSNOTIFY_OBJ_TYPE_INODE;
++ 		conn->inode = inode;
++ 	} else {
++ 		conn->flags = FSNOTIFY_OBJ_TYPE_VFSMOUNT;
++ 		conn->mnt = mnt;
++ 	}
++ 	/*
++ 	 * cmpxchg() provides the barrier so that readers of *connp can see
++ 	 * only initialized structure
++ 	 */
++ 	if (cmpxchg(connp, NULL, conn)) {
++ 		/* Someone else created list structure for us */
++ 		kmem_cache_free(fsnotify_mark_connector_cachep, conn);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Add mark into proper place in given list of marks. These marks may be used
++  * for the fsnotify backend to determine which event types should be delivered
++  * to which group and for which inodes. These marks are ordered according to
++  * priority, highest number first, and then by the group's location in memory.
++  */
++ static int fsnotify_add_mark_list(struct fsnotify_mark *mark,
++ 				  struct inode *inode, struct vfsmount *mnt,
++ 				  int allow_dups)
++ {
++ 	struct fsnotify_mark *lmark, *last = NULL;
++ 	struct fsnotify_mark_connector *conn;
++ 	struct fsnotify_mark_connector **connp;
++ 	int cmp;
++ 	int err = 0;
++ 
++ 	if (WARN_ON(!inode && !mnt))
++ 		return -EINVAL;
++ 	if (inode)
++ 		connp = &inode->i_fsnotify_marks;
++ 	else
++ 		connp = &real_mount(mnt)->mnt_fsnotify_marks;
++ 
++ 	if (!*connp) {
++ 		err = fsnotify_attach_connector_to_object(connp, inode, mnt);
++ 		if (err)
++ 			return err;
++ 	}
++ 	spin_lock(&mark->lock);
++ 	conn = *connp;
++ 	spin_lock(&conn->lock);
++ 
++ 	/* is mark the first mark? */
++ 	if (hlist_empty(&conn->list)) {
++ 		hlist_add_head_rcu(&mark->obj_list, &conn->list);
++ 		if (inode)
++ 			igrab(inode);
++ 		goto added;
+++>>>>>>> 04662cab59fc (fsnotify: Lock object list with connector lock)
+  	}
+  
+  	/* should mark be in the middle of the current list? */
+@@@ -334,7 -407,12 +455,16 @@@
+  	BUG_ON(last == NULL);
+  	/* mark should be the last entry.  last is the current last entry */
+  	hlist_add_behind_rcu(&mark->obj_list, &last->obj_list);
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ added:
++ 	mark->connector = conn;
++ out_err:
++ 	spin_unlock(&conn->lock);
++ 	spin_unlock(&mark->lock);
++ 	return err;
+++>>>>>>> 04662cab59fc (fsnotify: Lock object list with connector lock)
+  }
+  
+  /*
+@@@ -424,12 -491,18 +554,27 @@@ struct fsnotify_mark *fsnotify_find_mar
+  {
+  	struct fsnotify_mark *mark;
+  
+++<<<<<<< HEAD
+ +	hlist_for_each_entry(mark, head, obj_list) {
+ +		if (mark->group == group) {
+ +			fsnotify_get_mark(mark);
+ +			return mark;
+ +		}
+ +	}
+++=======
++ 	if (!conn)
++ 		return NULL;
++ 
++ 	spin_lock(&conn->lock);
++ 	hlist_for_each_entry(mark, &conn->list, obj_list) {
++ 		if (mark->group == group) {
++ 			fsnotify_get_mark(mark);
++ 			spin_unlock(&conn->lock);
++ 			return mark;
++ 		}
++ 	}
++ 	spin_unlock(&conn->lock);
+++>>>>>>> 04662cab59fc (fsnotify: Lock object list with connector lock)
+  	return NULL;
+  }
+  
+@@@ -499,6 -572,35 +644,38 @@@ void fsnotify_detach_group_marks(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void fsnotify_destroy_marks(struct fsnotify_mark_connector *conn)
++ {
++ 	struct fsnotify_mark *mark;
++ 
++ 	if (!conn)
++ 		return;
++ 
++ 	while (1) {
++ 		/*
++ 		 * We have to be careful since we can race with e.g.
++ 		 * fsnotify_clear_marks_by_group() and once we drop 'lock',
++ 		 * mark can get removed from the obj_list and destroyed. But
++ 		 * we are holding mark reference so mark cannot be freed and
++ 		 * calling fsnotify_destroy_mark() more than once is fine.
++ 		 */
++ 		spin_lock(&conn->lock);
++ 		if (hlist_empty(&conn->list)) {
++ 			spin_unlock(&conn->lock);
++ 			break;
++ 		}
++ 		mark = hlist_entry(conn->list.first, struct fsnotify_mark,
++ 				   obj_list);
++ 		fsnotify_get_mark(mark);
++ 		spin_unlock(&conn->lock);
++ 		fsnotify_destroy_mark(mark, mark->group);
++ 		fsnotify_put_mark(mark);
++ 	}
++ }
++ 
+++>>>>>>> 04662cab59fc (fsnotify: Lock object list with connector lock)
+  /*
+   * Nothing fancy, just initialize lists and locks and counters.
+   */
+diff --cc include/linux/fsnotify_backend.h
+index 0256909191e5,02c6fac652a4..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -195,6 -195,24 +195,27 @@@ struct fsnotify_group 
+  #define FSNOTIFY_EVENT_INODE	2
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Inode / vfsmount point to this structure which tracks all marks attached to
++  * the inode / vfsmount. The reference to inode / vfsmount is held by this
++  * structure whenever the list is non-empty. The structure is freed only when
++  * inode / vfsmount gets freed.
++  */
++ struct fsnotify_mark_connector {
++ 	spinlock_t lock;
++ #define FSNOTIFY_OBJ_TYPE_INODE		0x01
++ #define FSNOTIFY_OBJ_TYPE_VFSMOUNT	0x02
++ 	unsigned int flags;	/* Type of object [lock] */
++ 	union {	/* Object pointer [lock] */
++ 		struct inode *inode;
++ 		struct vfsmount *mnt;
++ 	};
++ 	struct hlist_head list;
++ };
++ 
++ /*
+++>>>>>>> 04662cab59fc (fsnotify: Lock object list with connector lock)
+   * A mark is simply an object attached to an in core inode which allows an
+   * fsnotify listener to indicate they are either no longer interested in events
+   * of a type matching mask or only interested in those events.
+@@@ -223,20 -241,15 +244,20 @@@ struct fsnotify_mark 
+  	struct list_head g_list;
+  	/* Protects inode / mnt pointers, flags, masks */
+  	spinlock_t lock;
+- 	/* List of marks for inode / vfsmount [obj_lock] */
++ 	/* List of marks for inode / vfsmount [connector->lock] */
+  	struct hlist_node obj_list;
+ -	/* Head of list of marks for an object [mark->lock, group->mark_mutex] */
+ -	struct fsnotify_mark_connector *connector;
+ +	union {	/* Object pointer [mark->lock, group->mark_mutex] */
+ +		struct inode *inode;	/* inode this mark is associated with */
+ +		struct vfsmount *mnt;	/* vfsmount this mark is associated with */
+ +	};
+  	/* Events types to ignore [mark->lock, group->mark_mutex] */
+  	__u32 ignored_mask;
+ -#define FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY	0x01
+ -#define FSNOTIFY_MARK_FLAG_ALIVE		0x02
+ -#define FSNOTIFY_MARK_FLAG_ATTACHED		0x04
+ +#define FSNOTIFY_MARK_FLAG_INODE		0x01
+ +#define FSNOTIFY_MARK_FLAG_VFSMOUNT		0x02
+ +#define FSNOTIFY_MARK_FLAG_OBJECT_PINNED	0x04
+ +#define FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY	0x08
+ +#define FSNOTIFY_MARK_FLAG_ALIVE		0x10
+ +#define FSNOTIFY_MARK_FLAG_ATTACHED		0x20
+  	unsigned int flags;		/* flags [mark->lock] */
+  	void (*free_mark)(struct fsnotify_mark *mark); /* called on final put+free */
+  };
+* Unmerged path fs/notify/mark.c
+* Unmerged path include/linux/fsnotify_backend.h
