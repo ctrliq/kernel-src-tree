@@ -1,0 +1,169 @@
+ALSA: line6: fix a crash in line6_hwdep_write()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit fdd8218d7d1bd0ccb9a3f4c58bf77773691a56cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fdd8218d.failed
+
+The error checking here is messed up so we could end up dereferencing
+-EFAULT.
+
+Fixes: a16039cbf1a1 ('ALSA: line6: Add hwdep interface to access the POD control messages')
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit fdd8218d7d1bd0ccb9a3f4c58bf77773691a56cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/usb/line6/driver.c
+diff --cc sound/usb/line6/driver.c
+index 68424d91b068,90009c0b3a92..000000000000
+--- a/sound/usb/line6/driver.c
++++ b/sound/usb/line6/driver.c
+@@@ -522,6 -528,138 +522,141 @@@ static void line6_get_interval(struct u
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /* Enable buffering of incoming messages, flush the buffer */
++ static int line6_hwdep_open(struct snd_hwdep *hw, struct file *file)
++ {
++ 	struct usb_line6 *line6 = hw->private_data;
++ 
++ 	/* NOTE: hwdep layer provides atomicity here */
++ 
++ 	line6->messages.active = 1;
++ 
++ 	return 0;
++ }
++ 
++ /* Stop buffering */
++ static int line6_hwdep_release(struct snd_hwdep *hw, struct file *file)
++ {
++ 	struct usb_line6 *line6 = hw->private_data;
++ 
++ 	line6->messages.active = 0;
++ 
++ 	return 0;
++ }
++ 
++ /* Read from circular buffer, return to user */
++ static long
++ line6_hwdep_read(struct snd_hwdep *hwdep, char __user *buf, long count,
++ 					loff_t *offset)
++ {
++ 	struct usb_line6 *line6 = hwdep->private_data;
++ 	long rv = 0;
++ 	unsigned int out_count;
++ 
++ 	if (mutex_lock_interruptible(&line6->messages.read_lock))
++ 		return -ERESTARTSYS;
++ 
++ 	while (kfifo_len(&line6->messages.fifo) == 0) {
++ 		mutex_unlock(&line6->messages.read_lock);
++ 
++ 		rv = wait_event_interruptible(
++ 			line6->messages.wait_queue,
++ 			kfifo_len(&line6->messages.fifo) != 0);
++ 		if (rv < 0)
++ 			return rv;
++ 
++ 		if (mutex_lock_interruptible(&line6->messages.read_lock))
++ 			return -ERESTARTSYS;
++ 	}
++ 
++ 	if (kfifo_peek_len(&line6->messages.fifo) > count) {
++ 		/* Buffer too small; allow re-read of the current item... */
++ 		rv = -EINVAL;
++ 	} else {
++ 		rv = kfifo_to_user(&line6->messages.fifo, buf, count, &out_count);
++ 		if (rv == 0)
++ 			rv = out_count;
++ 	}
++ 
++ 	mutex_unlock(&line6->messages.read_lock);
++ 	return rv;
++ }
++ 
++ /* Write directly (no buffering) to device by user*/
++ static long
++ line6_hwdep_write(struct snd_hwdep *hwdep, const char __user *data, long count,
++ 					loff_t *offset)
++ {
++ 	struct usb_line6 *line6 = hwdep->private_data;
++ 	int rv;
++ 	char *data_copy;
++ 
++ 	if (count > line6->max_packet_size * LINE6_RAW_MESSAGES_MAXCOUNT) {
++ 		/* This is an arbitrary limit - still better than nothing... */
++ 		return -EINVAL;
++ 	}
++ 
++ 	data_copy = memdup_user(data, count);
++ 	if (IS_ERR(data_copy))
++ 		return PTR_ERR(data_copy);
++ 
++ 	rv = line6_send_raw_message(line6, data_copy, count);
++ 
++ 	kfree(data_copy);
++ 	return rv;
++ }
++ 
++ static const struct snd_hwdep_ops hwdep_ops = {
++ 	.open    = line6_hwdep_open,
++ 	.release = line6_hwdep_release,
++ 	.read    = line6_hwdep_read,
++ 	.write   = line6_hwdep_write,
++ };
++ 
++ /* Insert into circular buffer */
++ static void line6_hwdep_push_message(struct usb_line6 *line6)
++ {
++ 	if (!line6->messages.active)
++ 		return;
++ 
++ 	if (kfifo_avail(&line6->messages.fifo) >= line6->message_length) {
++ 		/* No race condition here, there's only one writer */
++ 		kfifo_in(&line6->messages.fifo,
++ 			line6->buffer_message, line6->message_length);
++ 	} /* else TODO: signal overflow */
++ 
++ 	wake_up_interruptible(&line6->messages.wait_queue);
++ }
++ 
++ static int line6_hwdep_init(struct usb_line6 *line6)
++ {
++ 	int err;
++ 	struct snd_hwdep *hwdep;
++ 
++ 	/* TODO: usb_driver_claim_interface(); */
++ 	line6->process_message = line6_hwdep_push_message;
++ 	line6->messages.active = 0;
++ 	init_waitqueue_head(&line6->messages.wait_queue);
++ 	mutex_init(&line6->messages.read_lock);
++ 	INIT_KFIFO(line6->messages.fifo);
++ 
++ 	err = snd_hwdep_new(line6->card, "config", 0, &hwdep);
++ 	if (err < 0)
++ 		goto end;
++ 	strcpy(hwdep->name, "config");
++ 	hwdep->iface = SNDRV_HWDEP_IFACE_LINE6;
++ 	hwdep->ops = hwdep_ops;
++ 	hwdep->private_data = line6;
++ 	hwdep->exclusive = true;
++ 
++ end:
++ 	return err;
++ }
++ 
+++>>>>>>> fdd8218d7d1b (ALSA: line6: fix a crash in line6_hwdep_write())
+  static int line6_init_cap_control(struct usb_line6 *line6)
+  {
+  	int ret;
+* Unmerged path sound/usb/line6/driver.c
