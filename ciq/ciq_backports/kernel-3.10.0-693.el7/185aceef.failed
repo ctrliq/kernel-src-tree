@@ -1,0 +1,230 @@
+alx: work around hardware bug in interrupt fallback path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tobias Regnery <tobias.regnery@gmail.com>
+commit 185aceefd80f98dc5b9d73eb6cbb70739a5ce4ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/185aceef.failed
+
+If requesting msi-x interrupts fails in alx_request_irq we fall back to
+a single tx queue and msi or legacy interrupts.
+
+Currently the adapter stops working in this case and we get tx watchdog
+timeouts. For reasons unknown the adapter gets confused when we load the
+dma adresses to the chip in alx_init_ring_ptrs twice: the first time with
+multiple queues and the second time in the fallback case with a single
+queue.
+
+To fix this move the the call to alx_reinit_rings (which calls
+alx_init_ring_ptrs) after alx_request_irq. At this time it is clear how
+much tx queues we have and which dma addresses we use.
+
+Fixes: d768319cd427 ("alx: enable multiple tx queues")
+	Signed-off-by: Tobias Regnery <tobias.regnery@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 185aceefd80f98dc5b9d73eb6cbb70739a5ce4ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/alx/main.c
+diff --cc drivers/net/ethernet/atheros/alx/main.c
+index b165b9e58ad3,7dcc907a449d..000000000000
+--- a/drivers/net/ethernet/atheros/alx/main.c
++++ b/drivers/net/ethernet/atheros/alx/main.c
+@@@ -646,55 -671,140 +646,58 @@@ static int alx_alloc_rings(struct alx_p
+  	BUILD_BUG_ON(sizeof(struct alx_txd) % 8);
+  	BUILD_BUG_ON(sizeof(struct alx_rrd) % 8);
+  
+ -	for (i = 0; i < alx->num_txq; i++) {
+ -		offset = alx_alloc_tx_ring(alx, alx->qnapi[i]->txq, offset);
+ -		if (offset < 0) {
+ -			netdev_err(alx->dev, "Allocation of tx buffer failed!\n");
+ -			return -ENOMEM;
+ -		}
+ +	offset = alx_alloc_tx_ring(alx, &alx->txq, offset);
+ +	if (offset < 0) {
+ +		netdev_err(alx->dev, "Allocation of tx buffer failed!\n");
+ +		goto out_free;
+  	}
+  
+ -	offset = alx_alloc_rx_ring(alx, alx->qnapi[0]->rxq, offset);
+ +	offset = alx_alloc_rx_ring(alx, &alx->rxq, offset);
+  	if (offset < 0) {
+  		netdev_err(alx->dev, "Allocation of rx buffer failed!\n");
+ -		return -ENOMEM;
+ +		goto out_free;
+  	}
+  
+ -	return 0;
+ -}
+ -
+ -static void alx_free_rings(struct alx_priv *alx)
+ -{
+ -	int i;
+ -
+ -	alx_free_buffers(alx);
+ -
+ -	for (i = 0; i < alx->num_txq; i++)
+ -		if (alx->qnapi[i] && alx->qnapi[i]->txq)
+ -			kfree(alx->qnapi[i]->txq->bufs);
+ -
+ -	if (alx->qnapi[0] && alx->qnapi[0]->rxq)
+ -		kfree(alx->qnapi[0]->rxq->bufs);
+++<<<<<<< HEAD
+ +	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
+ +	alx->int_mask |= ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0;
+  
+ -	if (alx->descmem.virt)
+ -		dma_free_coherent(&alx->hw.pdev->dev,
+ -				  alx->descmem.size,
+ -				  alx->descmem.virt,
+ -				  alx->descmem.dma);
+ -}
+ +	netif_napi_add(alx->dev, &alx->napi, alx_poll, 64);
+  
+ -static void alx_free_napis(struct alx_priv *alx)
+ -{
+ -	struct alx_napi *np;
+ -	int i;
+ -
+ -	for (i = 0; i < alx->num_napi; i++) {
+ -		np = alx->qnapi[i];
+ -		if (!np)
+ -			continue;
+ +	alx_reinit_rings(alx);
+  
+ -		netif_napi_del(&np->napi);
+ -		kfree(np->txq);
+ -		kfree(np->rxq);
+ -		kfree(np);
+ -		alx->qnapi[i] = NULL;
+ -	}
+++=======
+++>>>>>>> 185aceefd80f (alx: work around hardware bug in interrupt fallback path)
+ +	return 0;
+ +out_free:
+ +	kfree(alx->txq.bufs);
+ +	kfree(alx->rxq.bufs);
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+ +	return -ENOMEM;
+  }
+  
+ -static const u16 tx_pidx_reg[] = {ALX_TPD_PRI0_PIDX, ALX_TPD_PRI1_PIDX,
+ -				  ALX_TPD_PRI2_PIDX, ALX_TPD_PRI3_PIDX};
+ -static const u16 tx_cidx_reg[] = {ALX_TPD_PRI0_CIDX, ALX_TPD_PRI1_CIDX,
+ -				  ALX_TPD_PRI2_CIDX, ALX_TPD_PRI3_CIDX};
+ -static const u32 tx_vect_mask[] = {ALX_ISR_TX_Q0, ALX_ISR_TX_Q1,
+ -				   ALX_ISR_TX_Q2, ALX_ISR_TX_Q3};
+ -static const u32 rx_vect_mask[] = {ALX_ISR_RX_Q0, ALX_ISR_RX_Q1,
+ -				   ALX_ISR_RX_Q2, ALX_ISR_RX_Q3,
+ -				   ALX_ISR_RX_Q4, ALX_ISR_RX_Q5,
+ -				   ALX_ISR_RX_Q6, ALX_ISR_RX_Q7};
+ -
+ -static int alx_alloc_napis(struct alx_priv *alx)
+ +static void alx_free_rings(struct alx_priv *alx)
+  {
+ -	struct alx_napi *np;
+ -	struct alx_rx_queue *rxq;
+ -	struct alx_tx_queue *txq;
+ -	int i;
+ -
+ -	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
+ -
+ -	/* allocate alx_napi structures */
+ -	for (i = 0; i < alx->num_napi; i++) {
+ -		np = kzalloc(sizeof(struct alx_napi), GFP_KERNEL);
+ -		if (!np)
+ -			goto err_out;
+ +	netif_napi_del(&alx->napi);
+ +	alx_free_buffers(alx);
+  
+ -		np->alx = alx;
+ -		netif_napi_add(alx->dev, &np->napi, alx_poll, 64);
+ -		alx->qnapi[i] = np;
+ -	}
+ +	kfree(alx->txq.bufs);
+ +	kfree(alx->rxq.bufs);
+  
+ -	/* allocate tx queues */
+ -	for (i = 0; i < alx->num_txq; i++) {
+ -		np = alx->qnapi[i];
+ -		txq = kzalloc(sizeof(*txq), GFP_KERNEL);
+ -		if (!txq)
+ -			goto err_out;
+ -
+ -		np->txq = txq;
+ -		txq->p_reg = tx_pidx_reg[i];
+ -		txq->c_reg = tx_cidx_reg[i];
+ -		txq->queue_idx = i;
+ -		txq->count = alx->tx_ringsz;
+ -		txq->netdev = alx->dev;
+ -		txq->dev = &alx->hw.pdev->dev;
+ -		np->vec_mask |= tx_vect_mask[i];
+ -		alx->int_mask |= tx_vect_mask[i];
+ +	if (alx->rx_page) {
+ +		put_page(alx->rx_page);
+ +		alx->rx_page = NULL;
+  	}
+  
+ -	/* allocate rx queues */
+ -	np = alx->qnapi[0];
+ -	rxq = kzalloc(sizeof(*rxq), GFP_KERNEL);
+ -	if (!rxq)
+ -		goto err_out;
+ -
+ -	np->rxq = rxq;
+ -	rxq->np = alx->qnapi[0];
+ -	rxq->queue_idx = 0;
+ -	rxq->count = alx->rx_ringsz;
+ -	rxq->netdev = alx->dev;
+ -	rxq->dev = &alx->hw.pdev->dev;
+ -	np->vec_mask |= rx_vect_mask[0];
+ -	alx->int_mask |= rx_vect_mask[0];
+ -
+ -	return 0;
+ -
+ -err_out:
+ -	netdev_err(alx->dev, "error allocating internal structures\n");
+ -	alx_free_napis(alx);
+ -	return -ENOMEM;
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+  }
+  
+ -static const int txq_vec_mapping_shift[] = {
+ -	0, ALX_MSI_MAP_TBL1_TXQ0_SHIFT,
+ -	0, ALX_MSI_MAP_TBL1_TXQ1_SHIFT,
+ -	1, ALX_MSI_MAP_TBL2_TXQ2_SHIFT,
+ -	1, ALX_MSI_MAP_TBL2_TXQ3_SHIFT,
+ -};
+ -
+  static void alx_config_vector_mapping(struct alx_priv *alx)
+  {
+  	struct alx_hw *hw = &alx->hw;
+@@@ -1078,6 -1240,15 +1081,18 @@@ static int __alx_open(struct alx_priv *
+  	if (err)
+  		goto out_free_rings;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* must be called after alx_request_irq because the chip stops working
++ 	 * if we copy the dma addresses in alx_init_ring_ptrs twice when
++ 	 * requesting msi-x interrupts failed
++ 	 */
++ 	alx_reinit_rings(alx);
++ 
++ 	netif_set_real_num_tx_queues(alx->dev, alx->num_txq);
++ 	netif_set_real_num_rx_queues(alx->dev, alx->num_rxq);
++ 
+++>>>>>>> 185aceefd80f (alx: work around hardware bug in interrupt fallback path)
+  	/* clear old interrupts */
+  	alx_write_mem32(&alx->hw, ALX_ISR, ~(u32)ALX_ISR_DIS);
+  
+* Unmerged path drivers/net/ethernet/atheros/alx/main.c
