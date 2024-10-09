@@ -1923,7 +1923,10 @@ gf100_gr_init(struct gf100_gr *gr)
 	nvkm_wr32(device, GPC_BCAST(0x08b4), nvkm_memory_addr(fb->mmu_wr) >> 8);
 	nvkm_wr32(device, GPC_BCAST(0x08b8), nvkm_memory_addr(fb->mmu_rd) >> 8);
 
-	gf100_gr_mmio(gr, gr->func->mmio);
+	if (gr->fuc_sw_nonctx)
+		gf100_gr_mmio(gr, gr->fuc_sw_nonctx);
+	else
+		gf100_gr_mmio(gr, gr->func->mmio);
 
 	nvkm_mask(device, TPC_UNIT(0, 0, 0x05c), 0x00000001, 0x00000001);
 
