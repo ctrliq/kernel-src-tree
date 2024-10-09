@@ -1,0 +1,97 @@
+RDMA/restrack: don't use uaccess_kernel()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Steve Wise <swise@opengridcomputing.com>
+commit 2f08ee363fe097bc6dc01aac53e1798b16c00986
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2f08ee36.failed
+
+uaccess_kernel() isn't sufficient to determine if an rdma resource is
+user-mode or not.  For example, resources allocated in the add_one()
+function of an ib_client get falsely labeled as user mode, when they
+are kernel mode allocations.  EG: mad qps.
+
+The result is that these qps are skipped over during a nldev query
+because of an erroneous namespace mismatch.
+
+So now we determine if the resource is user-mode by looking at the object
+struct's uobject or similar pointer to know if it was allocated for user
+mode applications.
+
+Fixes: 02d8883f520e ("RDMA/restrack: Add general infrastructure to track RDMA resources")
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2f08ee363fe097bc6dc01aac53e1798b16c00986)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/restrack.c
+* Unmerged path drivers/infiniband/core/restrack.c
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 0314ffb9b4d2..1a05d4605c4f 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -279,7 +279,8 @@ void nldev_exit(void);
+ static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
+ 					  struct ib_pd *pd,
+ 					  struct ib_qp_init_attr *attr,
+-					  struct ib_udata *udata)
++					  struct ib_udata *udata,
++					  struct ib_uobject *uobj)
+ {
+ 	struct ib_qp *qp;
+ 
+@@ -292,6 +293,7 @@ static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
+ 
+ 	qp->device = dev;
+ 	qp->pd = pd;
++	qp->uobject = uobj;
+ 	/*
+ 	 * We don't track XRC QPs for now, because they don't have PD
+ 	 * and more importantly they are created internaly by driver,
+* Unmerged path drivers/infiniband/core/restrack.c
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index c7c11b1be727..56487b02ac6f 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -1511,7 +1511,8 @@ static int create_qp(struct ib_uverbs_file *file,
+ 	if (cmd->qp_type == IB_QPT_XRC_TGT)
+ 		qp = ib_create_qp(pd, &attr);
+ 	else
+-		qp = _ib_create_qp(device, pd, &attr, uhw);
++		qp = _ib_create_qp(device, pd, &attr, uhw,
++				   &obj->uevent.uobject);
+ 
+ 	if (IS_ERR(qp)) {
+ 		ret = PTR_ERR(qp);
+@@ -1544,7 +1545,6 @@ static int create_qp(struct ib_uverbs_file *file,
+ 		if (ind_tbl)
+ 			atomic_inc(&ind_tbl->usecnt);
+ 	}
+-	qp->uobject = &obj->uevent.uobject;
+ 
+ 	obj->uevent.uobject.object = qp;
+ 
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 7c9a05986f55..caca3d724bdf 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -884,7 +884,7 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
+ 	if (qp_init_attr->cap.max_rdma_ctxs)
+ 		rdma_rw_init_qp(device, qp_init_attr);
+ 
+-	qp = _ib_create_qp(device, pd, qp_init_attr, NULL);
++	qp = _ib_create_qp(device, pd, qp_init_attr, NULL, NULL);
+ 	if (IS_ERR(qp))
+ 		return qp;
+ 
+@@ -895,7 +895,6 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
+ 	}
+ 
+ 	qp->real_qp    = qp;
+-	qp->uobject    = NULL;
+ 	qp->qp_type    = qp_init_attr->qp_type;
+ 	qp->rwq_ind_tbl = qp_init_attr->rwq_ind_tbl;
+ 
