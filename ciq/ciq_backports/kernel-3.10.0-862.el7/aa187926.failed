@@ -1,0 +1,130 @@
+ceph: limit osd read size to CEPH_MSG_MAX_DATA_LEN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit aa187926b739fb391f153335c7552c7a10d60e82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/aa187926.failed
+
+libceph returns -EIO when read size > CEPH_MSG_MAX_DATA_LEN.
+
+Link: http://tracker.ceph.com/issues/20528
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit aa187926b739fb391f153335c7552c7a10d60e82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/super.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/addr.c
+index 52cadab86b2b,63ca1732570b..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -388,13 -449,15 +388,25 @@@ static int ceph_readpages(struct file *
+  	if (ceph_inode(inode)->i_inline_version != CEPH_INLINE_NONE)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (fsc->mount_options->rsize >= PAGE_CACHE_SIZE)
+ +		max = (fsc->mount_options->rsize + PAGE_CACHE_SIZE - 1)
+ +			>> PAGE_SHIFT;
+ +
+ +	dout("readpages %p file %p nr_pages %d max %d\n", inode,
+ +		file, nr_pages,
+ +	     max);
+++=======
++ 	rc = ceph_readpages_from_fscache(mapping->host, mapping, page_list,
++ 					 &nr_pages);
++ 
++ 	if (rc == 0)
++ 		goto out;
++ 
++ 	max = fsc->mount_options->rsize >> PAGE_SHIFT;
++ 	dout("readpages %p file %p nr_pages %d max %d\n",
++ 	     inode, file, nr_pages, max);
+++>>>>>>> aa187926b739 (ceph: limit osd read size to CEPH_MSG_MAX_DATA_LEN)
+  	while (!list_empty(page_list)) {
+  		rc = start_read(inode, page_list, max);
+  		if (rc < 0)
+diff --cc fs/ceph/super.c
+index a004bf036482,2b2a260acb24..000000000000
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@@ -921,20 -937,23 +923,27 @@@ static int ceph_register_bdi(struct sup
+  {
+  	int err;
+  
+ -	err = super_setup_bdi_name(sb, "ceph-%ld",
+ -				   atomic_long_inc_return(&bdi_seq));
+ -	if (err)
+ -		return err;
+ -
+  	/* set ra_pages based on rasize mount option? */
+ -	if (fsc->mount_options->rasize >= PAGE_SIZE)
+ -		sb->s_bdi->ra_pages =
+ -			(fsc->mount_options->rasize + PAGE_SIZE - 1)
+ +	if (fsc->mount_options->rasize >= PAGE_CACHE_SIZE)
+ +		fsc->backing_dev_info.ra_pages =
+ +			(fsc->mount_options->rasize + PAGE_CACHE_SIZE - 1)
+  			>> PAGE_SHIFT;
+  	else
+ -		sb->s_bdi->ra_pages = VM_MAX_READAHEAD * 1024 / PAGE_SIZE;
+ -
+ +		fsc->backing_dev_info.ra_pages =
+ +			default_backing_dev_info.ra_pages;
+ +
+++<<<<<<< HEAD
+ +	err = bdi_register(&fsc->backing_dev_info, NULL, "ceph-%ld",
+ +			   atomic_long_inc_return(&bdi_seq));
+ +	if (!err)
+ +		sb->s_bdi = &fsc->backing_dev_info;
+ +	return err;
+++=======
++ 	/* set io_pages based on max osd read size */
++ 	sb->s_bdi->io_pages = fsc->mount_options->rsize >> PAGE_SHIFT;
++ 
++ 	return 0;
+++>>>>>>> aa187926b739 (ceph: limit osd read size to CEPH_MSG_MAX_DATA_LEN)
+  }
+  
+  static struct dentry *ceph_mount(struct file_system_type *fs_type,
+diff --cc fs/ceph/super.h
+index 94689dd0d932,2b1b021ad6b8..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -40,8 -46,9 +40,14 @@@
+  #define ceph_test_mount_opt(fsc, opt) \
+  	(!!((fsc)->mount_options->flags & CEPH_MOUNT_OPT_##opt))
+  
+++<<<<<<< HEAD
+ +#define CEPH_RSIZE_DEFAULT             0           /* max read size */
+ +#define CEPH_RASIZE_DEFAULT            (8192*1024) /* readahead */
+++=======
++ /* max size of osd read request, limited by libceph */
++ #define CEPH_MAX_READ_SIZE              CEPH_MSG_MAX_DATA_LEN
++ #define CEPH_RASIZE_DEFAULT             (8192*1024)    /* max readahead */
+++>>>>>>> aa187926b739 (ceph: limit osd read size to CEPH_MSG_MAX_DATA_LEN)
+  #define CEPH_MAX_READDIR_DEFAULT        1024
+  #define CEPH_MAX_READDIR_BYTES_DEFAULT  (512*1024)
+  #define CEPH_SNAPDIRNAME_DEFAULT        ".snap"
+* Unmerged path fs/ceph/addr.c
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index e5cb3c326d43..f40f972b6abc 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -862,6 +862,9 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
+ 			break;
+ 		}
+ 
++		if (!write)
++			size = min_t(u64, size, fsc->mount_options->rsize);
++
+ 		len = size;
+ 		pages = dio_get_pages_alloc(iter, len, !write,
+ 					    &start, &num_pages);
+* Unmerged path fs/ceph/super.c
+* Unmerged path fs/ceph/super.h
