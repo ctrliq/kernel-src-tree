@@ -1,0 +1,257 @@
+KVM: PPC: Book3S HV: Implement halt polling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+commit 0cda69dd7cd64fdd54bdf584b5d6ba53767ba422
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0cda69dd.failed
+
+This patch introduces new halt polling functionality into the kvm_hv kernel
+module. When a vcore is idle it will poll for some period of time before
+scheduling itself out.
+
+When all of the runnable vcpus on a vcore have ceded (and thus the vcore is
+idle) we schedule ourselves out to allow something else to run. In the
+event that we need to wake up very quickly (for example an interrupt
+arrives), we are required to wait until we get scheduled again.
+
+Implement halt polling so that when a vcore is idle, and before scheduling
+ourselves, we poll for vcpus in the runnable_threads list which have
+pending exceptions or which leave the ceded state. If we poll successfully
+then we can get back into the guest very quickly without ever scheduling
+ourselves, otherwise we schedule ourselves out as before.
+
+There exists generic halt_polling code in virt/kvm_main.c, however on
+powerpc the polling conditions are different to the generic case. It would
+be nice if we could just implement an arch specific kvm_check_block()
+function, but there is still other arch specific things which need to be
+done for kvm_hv (for example manipulating vcore states) which means that a
+separate implementation is the best option.
+
+Testing of this patch with a TCP round robin test between two guests with
+virtio network interfaces has found a decrease in round trip time of ~15us
+on average. A performance gain is only seen when going out of and
+back into the guest often and quickly, otherwise there is no net benefit
+from the polling. The polling interval is adjusted such that when we are
+often scheduled out for long periods of time it is reduced, and when we
+often poll successfully it is increased. The rate at which the polling
+interval increases or decreases, and the maximum polling interval, can
+be set through module parameters.
+
+Based on the implementation in the generic kvm module by Wanpeng Li and
+Paolo Bonzini, and on direction from Paul Mackerras.
+
+	Signed-off-by: Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 0cda69dd7cd64fdd54bdf584b5d6ba53767ba422)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s.h
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/include/asm/kvm_book3s.h
+index 8f39796c9da8,c261f52f6a55..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@@ -69,6 -69,42 +69,45 @@@ struct hpte_cache 
+  	int pagesize;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Struct for a virtual core.
++  * Note: entry_exit_map combines a bitmap of threads that have entered
++  * in the bottom 8 bits and a bitmap of threads that have exited in the
++  * next 8 bits.  This is so that we can atomically set the entry bit
++  * iff the exit map is 0 without taking a lock.
++  */
++ struct kvmppc_vcore {
++ 	int n_runnable;
++ 	int num_threads;
++ 	int entry_exit_map;
++ 	int napping_threads;
++ 	int first_vcpuid;
++ 	u16 pcpu;
++ 	u16 last_cpu;
++ 	u8 vcore_state;
++ 	u8 in_guest;
++ 	struct kvmppc_vcore *master_vcore;
++ 	struct kvm_vcpu *runnable_threads[MAX_SMT_THREADS];
++ 	struct list_head preempt_list;
++ 	spinlock_t lock;
++ 	struct swait_queue_head wq;
++ 	spinlock_t stoltb_lock;	/* protects stolen_tb and preempt_tb */
++ 	u64 stolen_tb;
++ 	u64 preempt_tb;
++ 	struct kvm_vcpu *runner;
++ 	struct kvm *kvm;
++ 	u64 tb_offset;		/* guest timebase - host timebase */
++ 	ulong lpcr;
++ 	u32 arch_compat;
++ 	ulong pcr;
++ 	ulong dpdes;		/* doorbell state (POWER8) */
++ 	ulong conferring_threads;
++ 	unsigned int halt_poll_ns;
++ };
++ 
+++>>>>>>> 0cda69dd7cd6 (KVM: PPC: Book3S HV: Implement halt polling)
+  struct kvmppc_vcpu_book3s {
+  	struct kvmppc_sid_map sid_map[SID_MAP_NUM];
+  	struct {
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 32dd0caea96b,3c85c3b28fc5..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -87,6 -84,34 +87,37 @@@ static int target_smt_mode
+  module_param(target_smt_mode, int, S_IRUGO | S_IWUSR);
+  MODULE_PARM_DESC(target_smt_mode, "Target threads per core (0 = max)");
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_XICS
++ static struct kernel_param_ops module_param_ops = {
++ 	.set = param_set_int,
++ 	.get = param_get_int,
++ };
++ 
++ module_param_cb(h_ipi_redirect, &module_param_ops, &h_ipi_redirect,
++ 							S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(h_ipi_redirect, "Redirect H_IPI wakeup to a free host core");
++ #endif
++ 
++ /* Maximum halt poll interval defaults to KVM_HALT_POLL_NS_DEFAULT */
++ static unsigned int halt_poll_max_ns = KVM_HALT_POLL_NS_DEFAULT;
++ module_param(halt_poll_max_ns, uint, S_IRUGO | S_IWUSR);
++ MODULE_PARM_DESC(halt_poll_max_ns, "Maximum halt poll time in ns");
++ 
++ /* Factor by which the vcore halt poll interval is grown, default is to double
++  */
++ static unsigned int halt_poll_ns_grow = 2;
++ module_param(halt_poll_ns_grow, int, S_IRUGO);
++ MODULE_PARM_DESC(halt_poll_ns_grow, "Factor halt poll time is grown by");
++ 
++ /* Factor by which the vcore halt poll interval is shrunk, default is to reset
++  */
++ static unsigned int halt_poll_ns_shrink;
++ module_param(halt_poll_ns_shrink, int, S_IRUGO);
++ MODULE_PARM_DESC(halt_poll_ns_shrink, "Factor halt poll time is shrunk by");
++ 
+++>>>>>>> 0cda69dd7cd6 (KVM: PPC: Book3S HV: Implement halt polling)
+  static void kvmppc_end_cede(struct kvm_vcpu *vcpu);
+  static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu);
+  
+@@@ -2585,27 -2680,40 +2652,64 @@@ static int kvmppc_vcore_check_block(str
+   */
+  static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_vcpu *vcpu;
+ +	int do_sleep = 1;
+ +
+ +	DEFINE_WAIT(wait);
+ +
+ +	prepare_to_wait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+ +
+ +	/*
+ +	 * Check one last time for pending exceptions and ceded state after
+ +	 * we put ourselves on the wait queue
+ +	 */
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		if (vcpu->arch.pending_exceptions || !vcpu->arch.ceded) {
+ +			do_sleep = 0;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (!do_sleep) {
+ +		finish_wait(&vc->wq, &wait);
+ +		return;
+++=======
++ 	int do_sleep = 1;
++ 	ktime_t cur, start;
++ 	u64 block_ns;
++ 	DECLARE_SWAITQUEUE(wait);
++ 
++ 	/* Poll for pending exceptions and ceded state */
++ 	cur = start = ktime_get();
++ 	if (vc->halt_poll_ns) {
++ 		ktime_t stop = ktime_add_ns(start, vc->halt_poll_ns);
++ 
++ 		vc->vcore_state = VCORE_POLLING;
++ 		spin_unlock(&vc->lock);
++ 
++ 		do {
++ 			if (kvmppc_vcore_check_block(vc)) {
++ 				do_sleep = 0;
++ 				break;
++ 			}
++ 			cur = ktime_get();
++ 		} while (single_task_running() && ktime_before(cur, stop));
++ 
++ 		spin_lock(&vc->lock);
++ 		vc->vcore_state = VCORE_INACTIVE;
++ 
++ 		if (!do_sleep)
++ 			goto out;
++ 	}
++ 
++ 	prepare_to_swait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
++ 
++ 	if (kvmppc_vcore_check_block(vc)) {
++ 		finish_swait(&vc->wq, &wait);
++ 		do_sleep = 0;
++ 		goto out;
+++>>>>>>> 0cda69dd7cd6 (KVM: PPC: Book3S HV: Implement halt polling)
+  	}
+  
+  	vc->vcore_state = VCORE_SLEEPING;
+* Unmerged path arch/powerpc/include/asm/kvm_book3s.h
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 8841a038084f..68f4e5a41ed1 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -324,6 +324,7 @@ struct kvmppc_vcore {
+ #define VCORE_SLEEPING	3
+ #define VCORE_RUNNING	4
+ #define VCORE_EXITING	5
++#define VCORE_POLLING	6
+ 
+ /*
+  * Struct used to manage memory for a virtual processor area
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/trace_hv.h b/arch/powerpc/kvm/trace_hv.h
+index 33d9daff5783..fb21990c0fb4 100644
+--- a/arch/powerpc/kvm/trace_hv.h
++++ b/arch/powerpc/kvm/trace_hv.h
+@@ -432,6 +432,28 @@ TRACE_EVENT(kvmppc_vcore_blocked,
+ 		   __entry->runner_vcpu, __entry->n_runnable, __entry->tgid)
+ );
+ 
++TRACE_EVENT(kvmppc_vcore_wakeup,
++	TP_PROTO(int do_sleep, __u64 ns),
++
++	TP_ARGS(do_sleep, ns),
++
++	TP_STRUCT__entry(
++		__field(__u64,  ns)
++		__field(int,    waited)
++		__field(pid_t,  tgid)
++	),
++
++	TP_fast_assign(
++		__entry->ns     = ns;
++		__entry->waited = do_sleep;
++		__entry->tgid   = current->tgid;
++	),
++
++	TP_printk("%s time %lld ns, tgid=%d",
++		__entry->waited ? "wait" : "poll",
++		__entry->ns, __entry->tgid)
++);
++
+ TRACE_EVENT(kvmppc_run_vcpu_enter,
+ 	TP_PROTO(struct kvm_vcpu *vcpu),
+ 
