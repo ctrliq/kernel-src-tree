@@ -1,0 +1,177 @@
+x86/mce/AMD: Fix logic to obtain block address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] mce/amd: Fix logic to obtain block address (David Arcari) [1389383]
+Rebuild_FUZZ: 95.45%
+commit-author Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+commit 8dd1e17a55b0bb1206c71c7a4344c5e3037cdf65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8dd1e17a.failed
+
+In upcoming processors, the BLKPTR field is no longer used to indicate
+the MSR number of the additional register. Insted, it simply indicates
+the prescence of additional MSRs.
+
+Fix the logic here to gather MSR address from MSR_AMD64_SMCA_MCx_MISC()
+for newer processors and fall back to existing logic for older
+processors.
+
+[ Drop nextaddr_out label; style cleanups. ]
+	Signed-off-by: Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/1457021458-2522-4-git-send-email-Aravind.Gopalakrishnan@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8dd1e17a55b0bb1206c71c7a4344c5e3037cdf65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mce.h
+diff --cc arch/x86/include/asm/mce.h
+index 539b24ee777f,72f86882d62a..000000000000
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@@ -92,8 -104,14 +92,18 @@@
+  #define MCE_LOG_SIGNATURE	"MACHINECHECK"
+  
+  /* AMD Scalable MCA */
++ #define MSR_AMD64_SMCA_MC0_MISC0	0xc0002003
+  #define MSR_AMD64_SMCA_MC0_CONFIG	0xc0002004
+++<<<<<<< HEAD
+ +#define MSR_AMD64_SMCA_MCx_CONFIG(x)	(MSR_AMD64_SMCA_MC0_CONFIG + 0x10*(x))
+++=======
++ #define MSR_AMD64_SMCA_MC0_IPID		0xc0002005
++ #define MSR_AMD64_SMCA_MC0_MISC1	0xc000200a
++ #define MSR_AMD64_SMCA_MCx_MISC(x)	(MSR_AMD64_SMCA_MC0_MISC0 + 0x10*(x))
++ #define MSR_AMD64_SMCA_MCx_CONFIG(x)	(MSR_AMD64_SMCA_MC0_CONFIG + 0x10*(x))
++ #define MSR_AMD64_SMCA_MCx_IPID(x)	(MSR_AMD64_SMCA_MC0_IPID + 0x10*(x))
++ #define MSR_AMD64_SMCA_MCx_MISCy(x, y)	((MSR_AMD64_SMCA_MC0_MISC1 + y) + (0x10*(x)))
+++>>>>>>> 8dd1e17a55b0 (x86/mce/AMD: Fix logic to obtain block address)
+  
+  /*
+   * This structure contains all data related to the MCE log.  Also
+* Unmerged path arch/x86/include/asm/mce.h
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_amd.c b/arch/x86/kernel/cpu/mcheck/mce_amd.c
+index 575b2d601c94..7b5d8aa59bca 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_amd.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_amd.c
+@@ -275,6 +275,51 @@ static void deferred_error_interrupt_enable(struct cpuinfo_x86 *c)
+ 	wrmsr(MSR_CU_DEF_ERR, low, high);
+ }
+ 
++static u32 get_block_address(u32 current_addr, u32 low, u32 high,
++			     unsigned int bank, unsigned int block)
++{
++	u32 addr = 0, offset = 0;
++
++	if (mce_flags.smca) {
++		if (!block) {
++			addr = MSR_AMD64_SMCA_MCx_MISC(bank);
++		} else {
++			/*
++			 * For SMCA enabled processors, BLKPTR field of the
++			 * first MISC register (MCx_MISC0) indicates presence of
++			 * additional MISC register set (MISC1-4).
++			 */
++			u32 low, high;
++
++			if (rdmsr_safe(MSR_AMD64_SMCA_MCx_CONFIG(bank), &low, &high))
++				return addr;
++
++			if (!(low & MCI_CONFIG_MCAX))
++				return addr;
++
++			if (!rdmsr_safe(MSR_AMD64_SMCA_MCx_MISC(bank), &low, &high) &&
++			    (low & MASK_BLKPTR_LO))
++				addr = MSR_AMD64_SMCA_MCx_MISCy(bank, block - 1);
++		}
++		return addr;
++	}
++
++	/* Fall back to method we used for older processors: */
++	switch (block) {
++	case 0:
++		addr = MSR_IA32_MCx_MISC(bank);
++		break;
++	case 1:
++		offset = ((low & MASK_BLKPTR_LO) >> 21);
++		if (offset)
++			addr = MCG_XBLK_ADDR + offset;
++		break;
++	default:
++		addr = ++current_addr;
++	}
++	return addr;
++}
++
+ static int
+ prepare_threshold_block(unsigned int bank, unsigned int block, u32 addr,
+ 			int offset, u32 misc_high)
+@@ -337,16 +382,9 @@ void mce_amd_feature_init(struct cpuinfo_x86 *c)
+ 
+ 	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+ 		for (block = 0; block < NR_BLOCKS; ++block) {
+-			if (block == 0)
+-				address = MSR_IA32_MCx_MISC(bank);
+-			else if (block == 1) {
+-				address = (low & MASK_BLKPTR_LO) >> 21;
+-				if (!address)
+-					break;
+-
+-				address += MCG_XBLK_ADDR;
+-			} else
+-				++address;
++			address = get_block_address(address, low, high, bank, block);
++			if (!address)
++				break;
+ 
+ 			if (rdmsr_safe(address, &low, &high))
+ 				break;
+@@ -451,16 +489,9 @@ static void amd_threshold_interrupt(void)
+ 		if (!(per_cpu(bank_map, cpu) & (1 << bank)))
+ 			continue;
+ 		for (block = 0; block < NR_BLOCKS; ++block) {
+-			if (block == 0) {
+-				address = MSR_IA32_MCx_MISC(bank);
+-			} else if (block == 1) {
+-				address = (low & MASK_BLKPTR_LO) >> 21;
+-				if (!address)
+-					break;
+-				address += MCG_XBLK_ADDR;
+-			} else {
+-				++address;
+-			}
++			address = get_block_address(address, low, high, bank, block);
++			if (!address)
++				break;
+ 
+ 			if (rdmsr_safe(address, &low, &high))
+ 				break;
+@@ -680,16 +711,11 @@ static int allocate_threshold_blocks(unsigned int cpu, unsigned int bank,
+ 	if (err)
+ 		goto out_free;
+ recurse:
+-	if (!block) {
+-		address = (low & MASK_BLKPTR_LO) >> 21;
+-		if (!address)
+-			return 0;
+-		address += MCG_XBLK_ADDR;
+-	} else {
+-		++address;
+-	}
++	address = get_block_address(address, low, high, bank, ++block);
++	if (!address)
++		return 0;
+ 
+-	err = allocate_threshold_blocks(cpu, bank, ++block, address);
++	err = allocate_threshold_blocks(cpu, bank, block, address);
+ 	if (err)
+ 		goto out_free;
+ 
