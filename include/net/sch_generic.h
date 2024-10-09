@@ -69,7 +69,6 @@ struct Qdisc {
 	struct list_head	list;
 	u32			handle;
 	u32			parent;
-	void			*u32_node;
 
 	struct netdev_queue	*dev_queue;
 
