@@ -1,0 +1,518 @@
+sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit a7dc66dfb4c6d6c1d7c14d5106ce467f1dbd4eba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a7dc66df.failed
+
+After kernfs_ops and sysfs_dirent->s_attr.size addition, the
+distinction between SYSFS_KOBJ_BIN_ATTR and SYSFS_KOBJ_ATTR is only
+necessary while creating files to decide which kernfs_ops to use.
+Afterwards, they behave exactly the same.
+
+This patch removes SYSFS_KOBJ_BIN_ATTR along with sysfs_is_bin().
+sysfs_add_file[_mode_ns]() are updated to take bool @is_bin instead of
+@type.
+
+This patch doesn't introduce any behavior changes.  This completely
+isolates the distinction between the two sysfs file types in the sysfs
+layer proper.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a7dc66dfb4c6d6c1d7c14d5106ce467f1dbd4eba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+#	fs/sysfs/group.c
+#	fs/sysfs/inode.c
+#	fs/sysfs/sysfs.h
+diff --cc fs/sysfs/file.c
+index d8887c896abc,e2ce6743113a..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -41,52 -44,67 +41,63 @@@ struct sysfs_open_dirent 
+  	atomic_t		refcnt;
+  	atomic_t		event;
+  	wait_queue_head_t	poll;
+ -	struct list_head	files; /* goes through sysfs_open_file.list */
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+  };
+  
+++<<<<<<< HEAD
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+ +	struct mutex		mutex;
+ +	int			needs_read_fill;
+ +	int			event;
+ +	struct list_head	list;
+ +};
+ +
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's
+ + *	data.
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+++=======
++ static struct sysfs_open_file *sysfs_of(struct file *file)
++ {
++ 	return ((struct seq_file *)file->private_data)->private;
++ }
++ 
++ /*
++  * Determine the kernfs_ops for the given sysfs_dirent.  This function must
++  * be called while holding an active reference.
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+   */
+ -static const struct kernfs_ops *kernfs_ops(struct sysfs_dirent *sd)
+ -{
+ -	if (!sysfs_ignore_lockdep(sd))
+ -		lockdep_assert_held(sd);
+ -	return sd->s_attr.ops;
+ -}
+ -
+ -/*
+ - * Determine ktype->sysfs_ops for the given sysfs_dirent.  This function
+ - * must be called while holding an active reference.
+ - */
+ -static const struct sysfs_ops *sysfs_file_ops(struct sysfs_dirent *sd)
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+  {
+ -	struct kobject *kobj = sd->s_parent->priv;
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+ +	ssize_t count;
+  
+ -	if (!sysfs_ignore_lockdep(sd))
+ -		lockdep_assert_held(sd);
+ -	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
+ -}
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+ -/*
+ - * Reads on sysfs are handled through seq_file, which takes care of hairy
+ - * details like buffering and seeking.  The following function pipes
+ - * sysfs_ops->show() result through seq_file.
+ - */
+ -static int sysfs_kf_seq_show(struct seq_file *sf, void *v)
+ -{
+ -	struct sysfs_open_file *of = sf->private;
+ -	struct kobject *kobj = of->sd->s_parent->priv;
+ -	const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+ -	ssize_t count;
+ -	char *buf;
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+  
+ -	/* acquire buffer and ensure that it's >= PAGE_SIZE */
+ -	count = seq_get_buf(sf, &buf);
+ -	if (count < PAGE_SIZE) {
+ -		seq_commit(sf, -1);
+ -		return 0;
+ -	}
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+  
+ -	/*
+ -	 * Invoke show().  Control may reach here via seq file lseek even
+ -	 * if @ops->show() isn't implemented.
+ -	 */
+ -	if (ops->show) {
+ -		count = ops->show(kobj, of->sd->priv, buf);
+ -		if (count < 0)
+ -			return count;
+ -	}
+ +	sysfs_put_active(attr_sd);
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+@@@ -483,68 -870,93 +494,121 @@@ void sysfs_notify(struct kobject *k, co
+  }
+  EXPORT_SYMBOL_GPL(sysfs_notify);
+  
+ -const struct file_operations kernfs_file_operations = {
+ -	.read		= kernfs_file_read,
+ -	.write		= kernfs_file_write,
+ +const struct file_operations sysfs_file_operations = {
+ +	.read		= sysfs_read_file,
+ +	.write		= sysfs_write_file,
+  	.llseek		= generic_file_llseek,
+ -	.mmap		= kernfs_file_mmap,
+ -	.open		= kernfs_file_open,
+ -	.release	= kernfs_file_release,
+ -	.poll		= kernfs_file_poll,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_empty = {
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_ro = {
+ -	.seq_show	= sysfs_kf_seq_show,
+ +	.open		= sysfs_open_file,
+ +	.release	= sysfs_release,
+ +	.poll		= sysfs_poll,
+  };
+  
+ -static const struct kernfs_ops sysfs_file_kfops_wo = {
+ -	.write		= sysfs_kf_write,
+ -};
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+ +{
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+  
+ -static const struct kernfs_ops sysfs_file_kfops_rw = {
+ -	.seq_show	= sysfs_kf_seq_show,
+ -	.write		= sysfs_kf_write,
+ -};
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+ +	}
+  
+ -static const struct kernfs_ops sysfs_bin_kfops_ro = {
+ -	.read		= sysfs_kf_bin_read,
+ -};
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+ +
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs namespace attribute operation for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +	}
+ +	*pns = ns;
+ +	return err;
+ +}
+  
+++<<<<<<< HEAD
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+++=======
++ static const struct kernfs_ops sysfs_bin_kfops_wo = {
++ 	.write		= sysfs_kf_bin_write,
++ };
++ 
++ static const struct kernfs_ops sysfs_bin_kfops_rw = {
++ 	.read		= sysfs_kf_bin_read,
++ 	.write		= sysfs_kf_bin_write,
++ 	.mmap		= sysfs_kf_bin_mmap,
++ };
++ 
++ int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
++ 			   const struct attribute *attr, bool is_bin,
++ 			   umode_t amode, const void *ns)
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  {
+  	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+ -	const struct kernfs_ops *ops;
+  	struct sysfs_addrm_cxt acxt;
+  	struct sysfs_dirent *sd;
+ -	loff_t size;
+ +	const void *ns;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	rc = sysfs_attr_ns(dir_sd->s_dir.kobj, attr, &ns);
+ +	if (rc)
+ +		return rc;
+++=======
++ 	if (!is_bin) {
++ 		struct kobject *kobj = dir_sd->priv;
++ 		const struct sysfs_ops *sysfs_ops = kobj->ktype->sysfs_ops;
++ 
++ 		/* every kobject with an attribute needs a ktype assigned */
++ 		if (WARN(!sysfs_ops, KERN_ERR
++ 			 "missing sysfs attribute operations for kobject: %s\n",
++ 			 kobject_name(kobj)))
++ 			return -EINVAL;
++ 
++ 		if (sysfs_ops->show && sysfs_ops->store)
++ 			ops = &sysfs_file_kfops_rw;
++ 		else if (sysfs_ops->show)
++ 			ops = &sysfs_file_kfops_ro;
++ 		else if (sysfs_ops->store)
++ 			ops = &sysfs_file_kfops_wo;
++ 		else
++ 			ops = &sysfs_file_kfops_empty;
++ 
++ 		size = PAGE_SIZE;
++ 	} else {
++ 		struct bin_attribute *battr = (void *)attr;
++ 
++ 		if ((battr->read && battr->write) || battr->mmap)
++ 			ops = &sysfs_bin_kfops_rw;
++ 		else if (battr->read)
++ 			ops = &sysfs_bin_kfops_ro;
++ 		else if (battr->write)
++ 			ops = &sysfs_bin_kfops_wo;
++ 		else
++ 			ops = &sysfs_file_kfops_empty;
++ 
++ 		size = battr->size;
++ 	}
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  
+- 	sd = sysfs_new_dirent(attr->name, mode, type);
++ 	sd = sysfs_new_dirent(attr->name, mode, SYSFS_KOBJ_ATTR);
+  	if (!sd)
+  		return -ENOMEM;
+  
+@@@ -562,27 -986,27 +626,34 @@@
+  	return rc;
+  }
+  
+- 
+  int sysfs_add_file(struct sysfs_dirent *dir_sd, const struct attribute *attr,
+- 		   int type)
++ 		   bool is_bin)
+  {
+++<<<<<<< HEAD
+ +	return sysfs_add_file_mode(dir_sd, attr, type, attr->mode);
+++=======
++ 	return sysfs_add_file_mode_ns(dir_sd, attr, is_bin, attr->mode, NULL);
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  }
+  
+ +
+  /**
+ - * sysfs_create_file_ns - create an attribute file for an object with custom ns
+ - * @kobj: object we're creating for
+ - * @attr: attribute descriptor
+ - * @ns: namespace the new file should belong to
+ + *	sysfs_create_file - create an attribute file for an object.
+ + *	@kobj:	object we're creating for.
+ + *	@attr:	attribute descriptor.
+   */
+ -int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
+ -			 const void *ns)
+ +int sysfs_create_file(struct kobject * kobj, const struct attribute * attr)
+  {
+  	BUG_ON(!kobj || !kobj->sd || !attr);
+  
+++<<<<<<< HEAD
+ +	return sysfs_add_file(kobj->sd, attr, SYSFS_KOBJ_ATTR);
+++=======
++ 	return sysfs_add_file_mode_ns(kobj->sd, attr, false, attr->mode, ns);
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  
+  }
+ -EXPORT_SYMBOL_GPL(sysfs_create_file_ns);
+ +EXPORT_SYMBOL_GPL(sysfs_create_file);
+  
+  int sysfs_create_files(struct kobject *kobj, const struct attribute **ptr)
+  {
+@@@ -709,6 -1124,32 +780,35 @@@ void sysfs_remove_file_from_group(struc
+  }
+  EXPORT_SYMBOL_GPL(sysfs_remove_file_from_group);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  *	sysfs_create_bin_file - create binary file for object.
++  *	@kobj:	object.
++  *	@attr:	attribute descriptor.
++  */
++ int sysfs_create_bin_file(struct kobject *kobj,
++ 			  const struct bin_attribute *attr)
++ {
++ 	BUG_ON(!kobj || !kobj->sd || !attr);
++ 
++ 	return sysfs_add_file(kobj->sd, &attr->attr, true);
++ }
++ EXPORT_SYMBOL_GPL(sysfs_create_bin_file);
++ 
++ /**
++  *	sysfs_remove_bin_file - remove binary file for object.
++  *	@kobj:	object.
++  *	@attr:	attribute descriptor.
++  */
++ void sysfs_remove_bin_file(struct kobject *kobj,
++ 			   const struct bin_attribute *attr)
++ {
++ 	kernfs_remove_by_name(kobj->sd, attr->attr.name);
++ }
++ EXPORT_SYMBOL_GPL(sysfs_remove_bin_file);
++ 
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  struct sysfs_schedule_callback_struct {
+  	struct list_head	workq_list;
+  	struct kobject		*kobj;
+diff --cc fs/sysfs/group.c
+index 1a6e16c0db91,9f65cd97a2d7..000000000000
+--- a/fs/sysfs/group.c
++++ b/fs/sysfs/group.c
+@@@ -56,9 -55,9 +56,15 @@@ static int create_files(struct sysfs_di
+  				if (!mode)
+  					continue;
+  			}
+++<<<<<<< HEAD
+ +			error = sysfs_add_file_mode(dir_sd, *attr,
+ +						    SYSFS_KOBJ_ATTR,
+ +						    (*attr)->mode | mode);
+++=======
++ 			error = sysfs_add_file_mode_ns(dir_sd, *attr, false,
++ 						       (*attr)->mode | mode,
++ 						       NULL);
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  			if (unlikely(error))
+  				break;
+  		}
+@@@ -266,10 -268,10 +272,10 @@@ int sysfs_merge_group(struct kobject *k
+  		return -ENOENT;
+  
+  	for ((i = 0, attr = grp->attrs); *attr && !error; (++i, ++attr))
+- 		error = sysfs_add_file(dir_sd, *attr, SYSFS_KOBJ_ATTR);
++ 		error = sysfs_add_file(dir_sd, *attr, false);
+  	if (error) {
+  		while (--i >= 0)
+ -			kernfs_remove_by_name(dir_sd, (*--attr)->name);
+ +			sysfs_hash_and_remove(dir_sd, NULL, (*--attr)->name);
+  	}
+  	sysfs_put(dir_sd);
+  
+diff --cc fs/sysfs/inode.c
+index 15a606d56f5d,b3c717ab3496..000000000000
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@@ -252,13 -269,8 +252,18 @@@ static void sysfs_init_inode(struct sys
+  		inode->i_fop = &sysfs_dir_operations;
+  		break;
+  	case SYSFS_KOBJ_ATTR:
+++<<<<<<< HEAD
+ +		inode->i_size = PAGE_SIZE;
+ +		inode->i_fop = &sysfs_file_operations;
+ +		break;
+ +	case SYSFS_KOBJ_BIN_ATTR:
+ +		bin_attr = sd->s_bin_attr.bin_attr;
+ +		inode->i_size = bin_attr->size;
+ +		inode->i_fop = &bin_fops;
+++=======
++ 		inode->i_size = sd->s_attr.size;
++ 		inode->i_fop = &kernfs_file_operations;
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  		break;
+  	case SYSFS_KOBJ_LINK:
+  		inode->i_op = &sysfs_symlink_inode_operations;
+diff --cc fs/sysfs/sysfs.h
+index e18c3f38727c,28898fa551c6..000000000000
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@@ -88,17 -83,15 +88,16 @@@ struct sysfs_dirent 
+  #define SYSFS_TYPE_MASK			0x00ff
+  #define SYSFS_DIR			0x0001
+  #define SYSFS_KOBJ_ATTR			0x0002
+- #define SYSFS_KOBJ_BIN_ATTR		0x0004
+  #define SYSFS_KOBJ_LINK			0x0008
+  #define SYSFS_COPY_NAME			(SYSFS_DIR | SYSFS_KOBJ_LINK)
+- #define SYSFS_ACTIVE_REF		(SYSFS_KOBJ_ATTR | SYSFS_KOBJ_BIN_ATTR)
++ #define SYSFS_ACTIVE_REF		SYSFS_KOBJ_ATTR
+  
+ -#define SYSFS_FLAG_MASK			~SYSFS_TYPE_MASK
+ -#define SYSFS_FLAG_NS			0x01000
+ +/* identify any namespace tag on sysfs_dirents */
+ +#define SYSFS_NS_TYPE_MASK		0xf00
+ +#define SYSFS_NS_TYPE_SHIFT		8
+ +
+ +#define SYSFS_FLAG_MASK			~(SYSFS_NS_TYPE_MASK|SYSFS_TYPE_MASK)
+  #define SYSFS_FLAG_REMOVED		0x02000
+ -#define SYSFS_FLAG_HAS_SEQ_SHOW		0x04000
+ -#define SYSFS_FLAG_HAS_MMAP		0x08000
+  
+  static inline unsigned int sysfs_type(struct sysfs_dirent *sd)
+  {
+@@@ -124,8 -109,24 +123,20 @@@ do {								
+  								\
+  	lockdep_init_map(&sd->dep_map, "s_active", key, 0);	\
+  } while (0)
+++<<<<<<< HEAD
+++=======
++ 
++ /* Test for attributes that want to ignore lockdep for read-locking */
++ static inline bool sysfs_ignore_lockdep(struct sysfs_dirent *sd)
++ {
++ 	struct attribute *attr = sd->priv;
++ 
++ 	return sysfs_type(sd) == SYSFS_KOBJ_ATTR && attr->ignore_lockdep;
++ }
++ 
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  #else
+ -
+  #define sysfs_dirent_init_lockdep(sd) do {} while (0)
+ -
+ -static inline bool sysfs_ignore_lockdep(struct sysfs_dirent *sd)
+ -{
+ -	return true;
+ -}
+ -
+  #endif
+  
+  /*
+@@@ -224,18 -213,15 +235,25 @@@ int sysfs_inode_init(void)
+  /*
+   * file.c
+   */
+ -extern const struct file_operations kernfs_file_operations;
+ +extern const struct file_operations sysfs_file_operations;
+  
+  int sysfs_add_file(struct sysfs_dirent *dir_sd,
+- 		   const struct attribute *attr, int type);
++ 		   const struct attribute *attr, bool is_bin);
+  
+++<<<<<<< HEAD
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode);
+ +/*
+ + * bin.c
+ + */
+ +extern const struct file_operations bin_fops;
+ +void unmap_bin_file(struct sysfs_dirent *attr_sd);
+++=======
++ int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
++ 			   const struct attribute *attr, bool is_bin,
++ 			   umode_t amode, const void *ns);
++ void sysfs_unmap_bin_file(struct sysfs_dirent *sd);
+++>>>>>>> a7dc66dfb4c6 (sysfs, kernfs: remove SYSFS_KOBJ_BIN_ATTR)
+  
+  /*
+   * symlink.c
+* Unmerged path fs/sysfs/file.c
+* Unmerged path fs/sysfs/group.c
+* Unmerged path fs/sysfs/inode.c
+* Unmerged path fs/sysfs/sysfs.h
