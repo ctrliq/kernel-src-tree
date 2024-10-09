@@ -1,0 +1,527 @@
+target: Convert ACL change queue_depth se_session reference usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Convert ACL change queue_depth se_session reference usage (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.44%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit d36ad77f702356afb1009d2987b0ab55da4c7d57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d36ad77f.failed
+
+This patch converts core_tpg_set_initiator_node_queue_depth()
+to use struct se_node_acl->acl_sess_list when performing
+explicit se_tpg_tfo->shutdown_session() for active sessions,
+in order for new se_node_acl->queue_depth to take effect.
+
+This follows how core_tpg_del_initiator_node_acl() currently
+works when invoking se_tpg_tfo->shutdown-session(), and ahead
+of the next patch to take se_node_acl->acl_kref during lookup,
+the extra get_initiator_node_acl() can go away. In order to
+achieve this, go ahead and change target_get_session() to use
+kref_get_unless_zero() and propigate up the return value
+to know when a session is already being released.
+
+This is because se_node_acl->acl_group is already protecting
+se_node_acl->acl_group reference via configfs, and shutdown
+within core_tpg_del_initiator_node_acl() won't occur until
+sys_write() to core_tpg_set_initiator_node_queue_depth()
+attribute returns back to user-space.
+
+Also, drop the left-over iscsi-target hack, and obtain
+se_portal_group->session_lock in lio_tpg_shutdown_session()
+internally. Remove iscsi-target wrapper and unused se_tpg +
+force parameters and associated code.
+
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Cc: Mike Christie <michaelc@cs.wisc.edu>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit d36ad77f702356afb1009d2987b0ab55da4c7d57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tpg.c
+#	include/target/target_core_fabric.h
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,67be44da29ff..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -174,90 -153,77 +174,117 @@@ void core_tpg_add_node_to_devs
+  		 */
+  		core_scsi3_check_aptpl_registration(dev, tpg, lun, acl,
+  						    lun->unpacked_lun);
+ +		spin_lock(&tpg->tpg_lun_lock);
+  	}
+ -	mutex_unlock(&tpg->tpg_lun_mutex);
+ +	spin_unlock(&tpg->tpg_lun_lock);
+  }
+  
+- /*      core_set_queue_depth_for_node():
+-  *
+-  *
+-  */
+- static int core_set_queue_depth_for_node(
+- 	struct se_portal_group *tpg,
+- 	struct se_node_acl *acl)
++ static void
++ target_set_nacl_queue_depth(struct se_portal_group *tpg,
++ 			    struct se_node_acl *acl, u32 queue_depth)
+  {
++ 	acl->queue_depth = queue_depth;
++ 
+  	if (!acl->queue_depth) {
+- 		pr_err("Queue depth for %s Initiator Node: %s is 0,"
++ 		pr_warn("Queue depth for %s Initiator Node: %s is 0,"
+  			"defaulting to 1.\n", tpg->se_tpg_tfo->get_fabric_name(),
+  			acl->initiatorname);
+  		acl->queue_depth = 1;
+  	}
+- 
+- 	return 0;
+  }
+  
+ -static struct se_node_acl *target_alloc_node_acl(struct se_portal_group *tpg,
+ -		const unsigned char *initiatorname)
+ +void array_free(void *array, int n)
+  {
+++<<<<<<< HEAD
+ +	void **a = array;
+ +	int i;
+++=======
++ 	struct se_node_acl *acl;
++ 	u32 queue_depth;
+++>>>>>>> d36ad77f7023 (target: Convert ACL change queue_depth se_session reference usage)
+  
+ -	acl = kzalloc(max(sizeof(*acl), tpg->se_tpg_tfo->node_acl_size),
+ -			GFP_KERNEL);
+ -	if (!acl)
+ +	for (i = 0; i < n; i++)
+ +		kfree(a[i]);
+ +	kfree(a);
+ +}
+ +
+ +static void *array_zalloc(int n, size_t size, gfp_t flags)
+ +{
+ +	void **a;
+ +	int i;
+ +
+ +	a = kzalloc(n * sizeof(void*), flags);
+ +	if (!a)
+  		return NULL;
+++<<<<<<< HEAD
+ +	for (i = 0; i < n; i++) {
+ +		a[i] = kzalloc(size, flags);
+ +		if (!a[i]) {
+ +			array_free(a, n);
+ +			return NULL;
+ +		}
+ +	}
+ +	return a;
+++=======
++ 
++ 	INIT_LIST_HEAD(&acl->acl_list);
++ 	INIT_LIST_HEAD(&acl->acl_sess_list);
++ 	INIT_HLIST_HEAD(&acl->lun_entry_hlist);
++ 	kref_init(&acl->acl_kref);
++ 	init_completion(&acl->acl_free_comp);
++ 	spin_lock_init(&acl->nacl_sess_lock);
++ 	mutex_init(&acl->lun_entry_mutex);
++ 	atomic_set(&acl->acl_pr_ref_count, 0);
++ 
++ 	if (tpg->se_tpg_tfo->tpg_get_default_depth)
++ 		queue_depth = tpg->se_tpg_tfo->tpg_get_default_depth(tpg);
++ 	else
++ 		queue_depth = 1;
++ 	target_set_nacl_queue_depth(tpg, acl, queue_depth);
++ 
++ 	snprintf(acl->initiatorname, TRANSPORT_IQN_LEN, "%s", initiatorname);
++ 	acl->se_tpg = tpg;
++ 	acl->acl_index = scsi_get_new_index(SCSI_AUTH_INTR_INDEX);
++ 
++ 	tpg->se_tpg_tfo->set_default_node_attributes(acl);
++ 
++ 	return acl;
+++>>>>>>> d36ad77f7023 (target: Convert ACL change queue_depth se_session reference usage)
+  }
+  
+ -static void target_add_node_acl(struct se_node_acl *acl)
+ +/*      core_create_device_list_for_node():
+ + *
+ + *
+ + */
+ +static int core_create_device_list_for_node(struct se_node_acl *nacl)
+  {
+ -	struct se_portal_group *tpg = acl->se_tpg;
+ +	struct se_dev_entry *deve;
+ +	int i;
+ +
+ +	nacl->device_list = array_zalloc(TRANSPORT_MAX_LUNS_PER_TPG,
+ +			sizeof(struct se_dev_entry), GFP_KERNEL);
+ +	if (!nacl->device_list) {
+ +		pr_err("Unable to allocate memory for"
+ +			" struct se_node_acl->device_list\n");
+ +		return -ENOMEM;
+ +	}
+ +	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +		deve = nacl->device_list[i];
+ +
+ +		atomic_set(&deve->ua_count, 0);
+ +		atomic_set(&deve->pr_ref_count, 0);
+ +		spin_lock_init(&deve->ua_lock);
+ +		INIT_LIST_HEAD(&deve->alua_port_list);
+ +		INIT_LIST_HEAD(&deve->ua_list);
+ +	}
+  
+ -	mutex_lock(&tpg->acl_node_mutex);
+ -	list_add_tail(&acl->acl_list, &tpg->acl_node_list);
+ -	mutex_unlock(&tpg->acl_node_mutex);
+ -
+ -	pr_debug("%s_TPG[%hu] - Added %s ACL with TCQ Depth: %d for %s"
+ -		" Initiator Node: %s\n",
+ -		tpg->se_tpg_tfo->get_fabric_name(),
+ -		tpg->se_tpg_tfo->tpg_get_tag(tpg),
+ -		acl->dynamic_node_acl ? "DYNAMIC" : "",
+ -		acl->queue_depth,
+ -		tpg->se_tpg_tfo->get_fabric_name(),
+ -		acl->initiatorname);
+ +	return 0;
+  }
+  
+ +/*	core_tpg_check_initiator_node_acl()
+ + *
+ + *
+ + */
+  struct se_node_acl *core_tpg_check_initiator_node_acl(
+  	struct se_portal_group *tpg,
+  	unsigned char *initiatorname)
+@@@ -511,108 -358,52 +539,121 @@@ EXPORT_SYMBOL(core_tpg_del_initiator_no
+   *
+   */
+  int core_tpg_set_initiator_node_queue_depth(
+- 	struct se_portal_group *tpg,
+- 	unsigned char *initiatorname,
+- 	u32 queue_depth,
+- 	int force)
++ 	struct se_node_acl *acl,
++ 	u32 queue_depth)
+  {
+- 	struct se_session *sess, *init_sess = NULL;
+- 	struct se_node_acl *acl;
++ 	LIST_HEAD(sess_list);
++ 	struct se_portal_group *tpg = acl->se_tpg;
++ 	struct se_session *sess, *sess_tmp;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	int dynamic_acl = 0;
+ +
+ +	spin_lock_irq(&tpg->acl_node_lock);
+ +	acl = __core_tpg_get_initiator_node_acl(tpg, initiatorname);
+ +	if (!acl) {
+ +		pr_err("Access Control List entry for %s Initiator"
+ +			" Node %s does not exists for TPG %hu, ignoring"
+ +			" request.\n", tpg->se_tpg_tfo->get_fabric_name(),
+ +			initiatorname, tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ +		spin_unlock_irq(&tpg->acl_node_lock);
+ +		return -ENODEV;
+ +	}
+ +	if (acl->dynamic_node_acl) {
+ +		acl->dynamic_node_acl = 0;
+ +		dynamic_acl = 1;
+ +	}
+ +	spin_unlock_irq(&tpg->acl_node_lock);
+ +
+ +	spin_lock_irqsave(&tpg->session_lock, flags);
+ +	list_for_each_entry(sess, &tpg->tpg_sess_list, sess_list) {
+ +		if (sess->se_node_acl != acl)
+ +			continue;
+ +
+ +		if (!force) {
+ +			pr_err("Unable to change queue depth for %s"
+ +				" Initiator Node: %s while session is"
+ +				" operational.  To forcefully change the queue"
+ +				" depth and force session reinstatement"
+ +				" use the \"force=1\" parameter.\n",
+ +				tpg->se_tpg_tfo->get_fabric_name(), initiatorname);
+ +			spin_unlock_irqrestore(&tpg->session_lock, flags);
+ +
+ +			spin_lock_irq(&tpg->acl_node_lock);
+ +			if (dynamic_acl)
+ +				acl->dynamic_node_acl = 1;
+ +			spin_unlock_irq(&tpg->acl_node_lock);
+ +			return -EEXIST;
+ +		}
+ +		/*
+ +		 * Determine if the session needs to be closed by our context.
+ +		 */
+ +		if (!tpg->se_tpg_tfo->shutdown_session(sess))
+ +			continue;
+ +
+ +		init_sess = sess;
+ +		break;
+ +	}
+++=======
++ 	int rc;
+++>>>>>>> d36ad77f7023 (target: Convert ACL change queue_depth se_session reference usage)
+  
+  	/*
+  	 * User has requested to change the queue depth for a Initiator Node.
+  	 * Change the value in the Node's struct se_node_acl, and call
+- 	 * core_set_queue_depth_for_node() to add the requested queue depth.
+- 	 *
+- 	 * Finally call  tpg->se_tpg_tfo->close_session() to force session
+- 	 * reinstatement to occur if there is an active session for the
+- 	 * $FABRIC_MOD Initiator Node in question.
++ 	 * target_set_nacl_queue_depth() to set the new queue depth.
+  	 */
+- 	acl->queue_depth = queue_depth;
++ 	target_set_nacl_queue_depth(tpg, acl, queue_depth);
++ 
++ 	spin_lock_irqsave(&acl->nacl_sess_lock, flags);
++ 	list_for_each_entry_safe(sess, sess_tmp, &acl->acl_sess_list,
++ 				 sess_acl_list) {
++ 		if (sess->sess_tearing_down != 0)
++ 			continue;
++ 		if (!target_get_session(sess))
++ 			continue;
++ 		spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
+  
+- 	if (core_set_queue_depth_for_node(tpg, acl) < 0) {
+- 		spin_unlock_irqrestore(&tpg->session_lock, flags);
+  		/*
+- 		 * Force session reinstatement if
+- 		 * core_set_queue_depth_for_node() failed, because we assume
+- 		 * the $FABRIC_MOD has already the set session reinstatement
+- 		 * bit from tpg->se_tpg_tfo->shutdown_session() called above.
++ 		 * Finally call tpg->se_tpg_tfo->close_session() to force session
++ 		 * reinstatement to occur if there is an active session for the
++ 		 * $FABRIC_MOD Initiator Node in question.
+  		 */
+++<<<<<<< HEAD
+ +		if (init_sess)
+ +			tpg->se_tpg_tfo->close_session(init_sess);
+ +
+ +		spin_lock_irq(&tpg->acl_node_lock);
+ +		if (dynamic_acl)
+ +			acl->dynamic_node_acl = 1;
+ +		spin_unlock_irq(&tpg->acl_node_lock);
+ +		return -EINVAL;
+++=======
++ 		rc = tpg->se_tpg_tfo->shutdown_session(sess);
++ 		target_put_session(sess);
++ 		if (!rc) {
++ 			spin_lock_irqsave(&acl->nacl_sess_lock, flags);
++ 			continue;
++ 		}
++ 		target_put_session(sess);
++ 		spin_lock_irqsave(&acl->nacl_sess_lock, flags);
+++>>>>>>> d36ad77f7023 (target: Convert ACL change queue_depth se_session reference usage)
+  	}
+- 	spin_unlock_irqrestore(&tpg->session_lock, flags);
+- 	/*
+- 	 * If the $FABRIC_MOD session for the Initiator Node ACL exists,
+- 	 * forcefully shutdown the $FABRIC_MOD session/nexus.
+- 	 */
+- 	if (init_sess)
+- 		tpg->se_tpg_tfo->close_session(init_sess);
++ 	spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
+  
+  	pr_debug("Successfully changed queue depth to: %d for Initiator"
+- 		" Node: %s on %s Target Portal Group: %u\n", queue_depth,
+- 		initiatorname, tpg->se_tpg_tfo->get_fabric_name(),
++ 		" Node: %s on %s Target Portal Group: %u\n", acl->queue_depth,
++ 		acl->initiatorname, tpg->se_tpg_tfo->get_fabric_name(),
+  		tpg->se_tpg_tfo->tpg_get_tag(tpg));
+  
+++<<<<<<< HEAD
+ +	spin_lock_irq(&tpg->acl_node_lock);
+ +	if (dynamic_acl)
+ +		acl->dynamic_node_acl = 1;
+ +	spin_unlock_irq(&tpg->acl_node_lock);
+ +
+++=======
+++>>>>>>> d36ad77f7023 (target: Convert ACL change queue_depth se_session reference usage)
+  	return 0;
+  }
+  EXPORT_SYMBOL(core_tpg_set_initiator_node_queue_depth);
+diff --cc include/target/target_core_fabric.h
+index 990942f22016,48e002f86893..000000000000
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@@ -153,50 -171,12 +153,54 @@@ struct se_node_acl *core_tpg_get_initia
+  		unsigned char *);
+  struct se_node_acl *core_tpg_check_initiator_node_acl(struct se_portal_group *,
+  		unsigned char *);
+++<<<<<<< HEAD
+ +void	core_tpg_clear_object_luns(struct se_portal_group *);
+ +struct se_node_acl *core_tpg_add_initiator_node_acl(struct se_portal_group *,
+ +		struct se_node_acl *, const char *, u32);
+ +int	core_tpg_del_initiator_node_acl(struct se_portal_group *,
+ +		struct se_node_acl *, int);
+ +int	core_tpg_set_initiator_node_queue_depth(struct se_portal_group *,
+ +		unsigned char *, u32, int);
+++=======
++ int	core_tpg_set_initiator_node_queue_depth(struct se_node_acl *, u32);
+++>>>>>>> d36ad77f7023 (target: Convert ACL change queue_depth se_session reference usage)
+  int	core_tpg_set_initiator_node_tag(struct se_portal_group *,
+  		struct se_node_acl *, const char *);
+ -int	core_tpg_register(struct se_wwn *, struct se_portal_group *, int);
+ +int	core_tpg_register(struct target_core_fabric_ops *, struct se_wwn *,
+ +		struct se_portal_group *, void *, int);
+  int	core_tpg_deregister(struct se_portal_group *);
+  
+ +/* SAS helpers */
+ +u8	sas_get_fabric_proto_ident(struct se_portal_group *);
+ +u32	sas_get_pr_transport_id(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *, unsigned char *);
+ +u32	sas_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *);
+ +char	*sas_parse_pr_out_transport_id(struct se_portal_group *, const char *,
+ +		u32 *, char **);
+ +
+ +/* FC helpers */
+ +u8	fc_get_fabric_proto_ident(struct se_portal_group *);
+ +u32	fc_get_pr_transport_id(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *, unsigned char *);
+ +u32	fc_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *);
+ +char	*fc_parse_pr_out_transport_id(struct se_portal_group *, const char *,
+ +		u32 *, char **);
+ +
+ +/* iSCSI helpers */
+ +u8	iscsi_get_fabric_proto_ident(struct se_portal_group *);
+ +u32	iscsi_get_pr_transport_id(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *, unsigned char *);
+ +u32	iscsi_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *);
+ +char	*iscsi_parse_pr_out_transport_id(struct se_portal_group *, const char *,
+ +		u32 *, char **);
+ +
+ +int	target_alloc_sgl(struct scatterlist **sgl, unsigned int *nents,
+ +		u32 length, bool zero_page, bool chainable);
+ +void	target_free_sgl(struct scatterlist *sgl, int nents);
+ +
+  /*
+   * The LIO target core uses DMA_TO_DEVICE to mean that data is going
+   * to the target (eg handling a WRITE) and DMA_FROM_DEVICE to mean
+diff --git a/drivers/target/iscsi/iscsi_target_configfs.c b/drivers/target/iscsi/iscsi_target_configfs.c
+index 7bdf7a03b311..5de3b52a92ce 100644
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@ -903,11 +903,8 @@ static ssize_t lio_target_nacl_store_cmdsn_depth(
+ 
+ 	if (iscsit_get_tpg(tpg) < 0)
+ 		return -EINVAL;
+-	/*
+-	 * iscsit_tpg_set_initiator_node_queue_depth() assumes force=1
+-	 */
+-	ret = iscsit_tpg_set_initiator_node_queue_depth(tpg,
+-				config_item_name(acl_ci), cmdsn_depth, 1);
++
++	ret = core_tpg_set_initiator_node_queue_depth(se_nacl, cmdsn_depth);
+ 
+ 	pr_debug("LIO_Target_ConfigFS: %s/%s Set CmdSN Window: %u for"
+ 		"InitiatorName: %s\n", config_item_name(wwn_ci),
+@@ -1982,42 +1979,30 @@ static void lio_tpg_release_fabric_acl(
+ }
+ 
+ /*
+- * Called with spin_lock_irq(struct se_portal_group->session_lock) held
+- * or not held.
+- *
+- * Also, this function calls iscsit_inc_session_usage_count() on the
++ * This function calls iscsit_inc_session_usage_count() on the
+  * struct iscsi_session in question.
+  */
+ static int lio_tpg_shutdown_session(struct se_session *se_sess)
+ {
+ 	struct iscsi_session *sess = se_sess->fabric_sess_ptr;
+-	struct se_portal_group *se_tpg = se_sess->se_tpg;
+-	bool local_lock = false;
+-
+-	if (!spin_is_locked(&se_tpg->session_lock)) {
+-		spin_lock_irq(&se_tpg->session_lock);
+-		local_lock = true;
+-	}
++	struct se_portal_group *se_tpg = &sess->tpg->tpg_se_tpg;
+ 
++	spin_lock_bh(&se_tpg->session_lock);
+ 	spin_lock(&sess->conn_lock);
+ 	if (atomic_read(&sess->session_fall_back_to_erl0) ||
+ 	    atomic_read(&sess->session_logout) ||
+ 	    (sess->time2retain_timer_flags & ISCSI_TF_EXPIRED)) {
+ 		spin_unlock(&sess->conn_lock);
+-		if (local_lock)
+-			spin_unlock_irq(&sess->conn_lock);
++		spin_unlock_bh(&se_tpg->session_lock);
+ 		return 0;
+ 	}
+ 	atomic_set(&sess->session_reinstatement, 1);
+ 	spin_unlock(&sess->conn_lock);
+ 
+ 	iscsit_stop_time2retain_timer(sess);
+-	spin_unlock_irq(&se_tpg->session_lock);
++	spin_unlock_bh(&se_tpg->session_lock);
+ 
+ 	iscsit_stop_session(sess, 1, 1);
+-	if (!local_lock)
+-		spin_lock_irq(&se_tpg->session_lock);
+-
+ 	return 1;
+ }
+ 
+diff --git a/drivers/target/iscsi/iscsi_target_tpg.c b/drivers/target/iscsi/iscsi_target_tpg.c
+index 7005d3d54fdd..157f661c5014 100644
+--- a/drivers/target/iscsi/iscsi_target_tpg.c
++++ b/drivers/target/iscsi/iscsi_target_tpg.c
+@@ -591,16 +591,6 @@ int iscsit_tpg_del_network_portal(
+ 	return iscsit_tpg_release_np(tpg_np, tpg, np);
+ }
+ 
+-int iscsit_tpg_set_initiator_node_queue_depth(
+-	struct iscsi_portal_group *tpg,
+-	unsigned char *initiatorname,
+-	u32 queue_depth,
+-	int force)
+-{
+-	return core_tpg_set_initiator_node_queue_depth(&tpg->tpg_se_tpg,
+-		initiatorname, queue_depth, force);
+-}
+-
+ int iscsit_ta_authentication(struct iscsi_portal_group *tpg, u32 authentication)
+ {
+ 	unsigned char buf1[256], buf2[256], *none = NULL;
+diff --git a/drivers/target/iscsi/iscsi_target_tpg.h b/drivers/target/iscsi/iscsi_target_tpg.h
+index b2f49c0fd13a..369a33b3f9ec 100644
+--- a/drivers/target/iscsi/iscsi_target_tpg.h
++++ b/drivers/target/iscsi/iscsi_target_tpg.h
+@@ -26,8 +26,6 @@ extern struct iscsi_tpg_np *iscsit_tpg_add_network_portal(struct iscsi_portal_gr
+ 			int);
+ extern int iscsit_tpg_del_network_portal(struct iscsi_portal_group *,
+ 			struct iscsi_tpg_np *);
+-extern int iscsit_tpg_set_initiator_node_queue_depth(struct iscsi_portal_group *,
+-			unsigned char *, u32, int);
+ extern int iscsit_ta_authentication(struct iscsi_portal_group *, u32);
+ extern int iscsit_ta_login_timeout(struct iscsi_portal_group *, u32);
+ extern int iscsit_ta_netif_timeout(struct iscsi_portal_group *, u32);
+* Unmerged path drivers/target/target_core_tpg.c
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index cf7ad6dd6620..2f2406552764 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -399,9 +399,9 @@ static void target_release_session(struct kref *kref)
+ 	se_tpg->se_tpg_tfo->close_session(se_sess);
+ }
+ 
+-void target_get_session(struct se_session *se_sess)
++int target_get_session(struct se_session *se_sess)
+ {
+-	kref_get(&se_sess->sess_kref);
++	return kref_get_unless_zero(&se_sess->sess_kref);
+ }
+ EXPORT_SYMBOL(target_get_session);
+ 
+* Unmerged path include/target/target_core_fabric.h
