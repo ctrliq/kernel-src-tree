@@ -1,0 +1,338 @@
+crypto: ccp - CCP versioning support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [crypto] ccp - CCP versioning support (Suravee Suthikulpanit) [1390820]
+Rebuild_FUZZ: 87.50%
+commit-author Gary R Hook <gary.hook@amd.com>
+commit c7019c4d739e79d7baaa13c86dcaaedec8113d70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c7019c4d.failed
+
+Future hardware may introduce new algorithms wherein the
+driver will need to manage resources for different versions
+of the cryptographic coprocessor. This precursor patch
+determines the version of the available device, and marks
+and registers algorithms accordingly. A structure is added
+which manages the version-specific data.
+
+	Signed-off-by: Gary R Hook <gary.hook@amd.com>
+	Acked-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit c7019c4d739e79d7baaa13c86dcaaedec8113d70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/ccp/ccp-crypto-aes.c
+#	drivers/crypto/ccp/ccp-crypto-sha.c
+#	drivers/crypto/ccp/ccp-dev.c
+#	drivers/crypto/ccp/ccp-dev.h
+#	drivers/crypto/ccp/ccp-pci.c
+#	drivers/crypto/ccp/ccp-platform.c
+#	include/linux/ccp.h
+diff --cc drivers/crypto/ccp/ccp-dev.c
+index 2777dc97b570,5348512da643..000000000000
+--- a/drivers/crypto/ccp/ccp-dev.c
++++ b/drivers/crypto/ccp/ccp-dev.c
+@@@ -35,23 -39,139 +35,46 @@@ struct ccp_tasklet_data 
+  	struct ccp_cmd *cmd;
+  };
+  
+ -/* List of CCPs, CCP count, read-write access lock, and access functions
+ - *
+ - * Lock structure: get ccp_unit_lock for reading whenever we need to
+ - * examine the CCP list. While holding it for reading we can acquire
+ - * the RR lock to update the round-robin next-CCP pointer. The unit lock
+ - * must be acquired before the RR lock.
+ - *
+ - * If the unit-lock is acquired for writing, we have total control over
+ - * the list, so there's no value in getting the RR lock.
+ - */
+ -static DEFINE_RWLOCK(ccp_unit_lock);
+ -static LIST_HEAD(ccp_units);
+ -
+ -/* Round-robin counter */
+ -static DEFINE_RWLOCK(ccp_rr_lock);
+ -static struct ccp_device *ccp_rr;
+  
+ -/* Ever-increasing value to produce unique unit numbers */
+ -static atomic_t ccp_unit_ordinal;
+ -unsigned int ccp_increment_unit_ordinal(void)
+ +static struct ccp_device *ccp_dev;
+ +static inline struct ccp_device *ccp_get_device(void)
+  {
+ -	return atomic_inc_return(&ccp_unit_ordinal);
+ +	return ccp_dev;
+  }
+  
+ -/*
+ - * Put this CCP on the unit list, which makes it available
+ - * for use.
+ - */
+  static inline void ccp_add_device(struct ccp_device *ccp)
+  {
+ -	unsigned long flags;
+ -
+ -	write_lock_irqsave(&ccp_unit_lock, flags);
+ -	list_add_tail(&ccp->entry, &ccp_units);
+ -	if (!ccp_rr)
+ -		/* We already have the list lock (we're first) so this
+ -		 * pointer can't change on us. Set its initial value.
+ -		 */
+ -		ccp_rr = ccp;
+ -	write_unlock_irqrestore(&ccp_unit_lock, flags);
+ +	ccp_dev = ccp;
+  }
+  
+ -/* Remove this unit from the list of devices. If the next device
+ - * up for use is this one, adjust the pointer. If this is the last
+ - * device, NULL the pointer.
+ - */
+  static inline void ccp_del_device(struct ccp_device *ccp)
+  {
+ -	unsigned long flags;
+ -
+ -	write_lock_irqsave(&ccp_unit_lock, flags);
+ -	if (ccp_rr == ccp) {
+ -		/* ccp_unit_lock is read/write; any read access
+ -		 * will be suspended while we make changes to the
+ -		 * list and RR pointer.
+ -		 */
+ -		if (list_is_last(&ccp_rr->entry, &ccp_units))
+ -			ccp_rr = list_first_entry(&ccp_units, struct ccp_device,
+ -						  entry);
+ -		else
+ -			ccp_rr = list_next_entry(ccp_rr, entry);
+ -	}
+ -	list_del(&ccp->entry);
+ -	if (list_empty(&ccp_units))
+ -		ccp_rr = NULL;
+ -	write_unlock_irqrestore(&ccp_unit_lock, flags);
+ -}
+ -
+ -static struct ccp_device *ccp_get_device(void)
+ -{
+ -	unsigned long flags;
+ -	struct ccp_device *dp = NULL;
+ -
+ -	/* We round-robin through the unit list.
+ -	 * The (ccp_rr) pointer refers to the next unit to use.
+ -	 */
+ -	read_lock_irqsave(&ccp_unit_lock, flags);
+ -	if (!list_empty(&ccp_units)) {
+ -		write_lock_irqsave(&ccp_rr_lock, flags);
+ -		dp = ccp_rr;
+ -		if (list_is_last(&ccp_rr->entry, &ccp_units))
+ -			ccp_rr = list_first_entry(&ccp_units, struct ccp_device,
+ -						  entry);
+ -		else
+ -			ccp_rr = list_next_entry(ccp_rr, entry);
+ -		write_unlock_irqrestore(&ccp_rr_lock, flags);
+ -	}
+ -	read_unlock_irqrestore(&ccp_unit_lock, flags);
+ -
+ -	return dp;
+ -}
+ -
+ -/**
+ - * ccp_present - check if a CCP device is present
+ - *
+ - * Returns zero if a CCP device is present, -ENODEV otherwise.
+ - */
+ -int ccp_present(void)
+ -{
+ -	unsigned long flags;
+ -	int ret;
+ -
+ -	read_lock_irqsave(&ccp_unit_lock, flags);
+ -	ret = list_empty(&ccp_units);
+ -	read_unlock_irqrestore(&ccp_unit_lock, flags);
+ -
+ -	return ret ? -ENODEV : 0;
+ +	ccp_dev = NULL;
+  }
+ -EXPORT_SYMBOL_GPL(ccp_present);
+  
++ /**
++  * ccp_version - get the version of the CCP device
++  *
++  * Returns the version from the first unit on the list;
++  * otherwise a zero if no CCP device is present
++  */
++ unsigned int ccp_version(void)
++ {
++ 	struct ccp_device *dp;
++ 	unsigned long flags;
++ 	int ret = 0;
++ 
++ 	read_lock_irqsave(&ccp_unit_lock, flags);
++ 	if (!list_empty(&ccp_units)) {
++ 		dp = list_first_entry(&ccp_units, struct ccp_device, entry);
++ 		ret = dp->vdata->version;
++ 	}
++ 	read_unlock_irqrestore(&ccp_unit_lock, flags);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(ccp_version);
++ 
+  /**
+   * ccp_enqueue_cmd - queue an operation for processing by the CCP
+   *
+@@@ -558,9 -687,8 +581,14 @@@ bool ccp_queues_suspended(struct ccp_de
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static const struct x86_cpu_id ccp_support[] = {
+ +	{ X86_VENDOR_AMD, 22, },
+ +	{ },
+++=======
++ struct ccp_vdata ccpv3 = {
++ 	.version = CCP_VERSION(3, 0),
+++>>>>>>> c7019c4d739e (crypto: ccp - CCP versioning support)
+  };
+  
+  static int __init ccp_mod_init(void)
+diff --cc drivers/crypto/ccp/ccp-dev.h
+index 72bf1536b653,90a8cc8c7d46..000000000000
+--- a/drivers/crypto/ccp/ccp-dev.h
++++ b/drivers/crypto/ccp/ccp-dev.h
+@@@ -139,6 -141,12 +139,15 @@@
+  #define CCP_ECC_RESULT_OFFSET		60
+  #define CCP_ECC_RESULT_SUCCESS		0x0001
+  
+++<<<<<<< HEAD
+++=======
++ /* Structure to hold CCP version-specific values */
++ struct ccp_vdata {
++ 	unsigned int version;
++ };
++ 
++ extern struct ccp_vdata ccpv3;
+++>>>>>>> c7019c4d739e (crypto: ccp - CCP versioning support)
+  
+  struct ccp_device;
+  struct ccp_cmd;
+@@@ -184,6 -192,13 +193,16 @@@ struct ccp_cmd_queue 
+  } ____cacheline_aligned;
+  
+  struct ccp_device {
+++<<<<<<< HEAD
+++=======
++ 	struct list_head entry;
++ 
++ 	struct ccp_vdata *vdata;
++ 	unsigned int ord;
++ 	char name[MAX_CCP_NAME_LEN];
++ 	char rngname[MAX_CCP_NAME_LEN];
++ 
+++>>>>>>> c7019c4d739e (crypto: ccp - CCP versioning support)
+  	struct device *dev;
+  
+  	/*
+diff --cc drivers/crypto/ccp/ccp-pci.c
+index 15741de944bc,d1a36af44012..000000000000
+--- a/drivers/crypto/ccp/ccp-pci.c
++++ b/drivers/crypto/ccp/ccp-pci.c
+@@@ -175,12 -175,17 +175,18 @@@ static int ccp_pci_probe(struct pci_de
+  	if (!ccp)
+  		goto e_err;
+  
+ -	ccp_pci = devm_kzalloc(dev, sizeof(*ccp_pci), GFP_KERNEL);
+ -	if (!ccp_pci)
+ -		goto e_err;
+ -
+ +	ccp_pci = kzalloc(sizeof(*ccp_pci), GFP_KERNEL);
+ +	if (!ccp_pci) {
+ +		ret = -ENOMEM;
+ +		goto e_free1;
+ +	}
+  	ccp->dev_specific = ccp_pci;
++ 	ccp->vdata = (struct ccp_vdata *)id->driver_data;
++ 	if (!ccp->vdata || !ccp->vdata->version) {
++ 		ret = -ENODEV;
++ 		dev_err(dev, "missing driver data\n");
++ 		goto e_err;
++ 	}
+  	ccp->get_irq = ccp_get_irqs;
+  	ccp->free_irq = ccp_free_irqs;
+  
+@@@ -323,8 -318,8 +329,13 @@@ static int ccp_pci_resume(struct pci_de
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static DEFINE_PCI_DEVICE_TABLE(ccp_pci_table) = {
+ +	{ PCI_VDEVICE(AMD, 0x1537), },
+++=======
++ static const struct pci_device_id ccp_pci_table[] = {
++ 	{ PCI_VDEVICE(AMD, 0x1537), (kernel_ulong_t)&ccpv3 },
+++>>>>>>> c7019c4d739e (crypto: ccp - CCP versioning support)
+  	/* Last entry must be zero */
+  	{ 0, }
+  };
+diff --cc include/linux/ccp.h
+index e643e293eaee,915af3095b39..000000000000
+--- a/include/linux/ccp.h
++++ b/include/linux/ccp.h
+@@@ -27,6 -27,25 +27,28 @@@ struct ccp_cmd
+  	defined(CONFIG_CRYPTO_DEV_CCP_DD_MODULE)
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ccp_present - check if a CCP device is present
++  *
++  * Returns zero if a CCP device is present, -ENODEV otherwise.
++  */
++ int ccp_present(void);
++ 
++ #define	CCP_VSIZE 16
++ #define	CCP_VMASK		((unsigned int)((1 << CCP_VSIZE) - 1))
++ #define	CCP_VERSION(v, r)	((unsigned int)((v << CCP_VSIZE) \
++ 					       | (r & CCP_VMASK)))
++ 
++ /**
++  * ccp_version - get the version of the CCP
++  *
++  * Returns a positive version number, or zero if no CCP
++  */
++ unsigned int ccp_version(void);
++ 
++ /**
+++>>>>>>> c7019c4d739e (crypto: ccp - CCP versioning support)
+   * ccp_enqueue_cmd - queue an operation for processing by the CCP
+   *
+   * @cmd: ccp_cmd struct to be processed
+@@@ -53,6 -72,16 +75,19 @@@ int ccp_enqueue_cmd(struct ccp_cmd *cmd
+  
+  #else /* CONFIG_CRYPTO_DEV_CCP_DD is not enabled */
+  
+++<<<<<<< HEAD
+++=======
++ static inline int ccp_present(void)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline unsigned int ccp_version(void)
++ {
++ 	return 0;
++ }
++ 
+++>>>>>>> c7019c4d739e (crypto: ccp - CCP versioning support)
+  static inline int ccp_enqueue_cmd(struct ccp_cmd *cmd)
+  {
+  	return -ENODEV;
+* Unmerged path drivers/crypto/ccp/ccp-crypto-aes.c
+* Unmerged path drivers/crypto/ccp/ccp-crypto-sha.c
+* Unmerged path drivers/crypto/ccp/ccp-platform.c
+* Unmerged path drivers/crypto/ccp/ccp-crypto-aes.c
+* Unmerged path drivers/crypto/ccp/ccp-crypto-sha.c
+* Unmerged path drivers/crypto/ccp/ccp-dev.c
+* Unmerged path drivers/crypto/ccp/ccp-dev.h
+* Unmerged path drivers/crypto/ccp/ccp-pci.c
+* Unmerged path drivers/crypto/ccp/ccp-platform.c
+* Unmerged path include/linux/ccp.h
