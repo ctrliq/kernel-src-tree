@@ -1,0 +1,195 @@
+btrfs: use filemap_check_errors()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit f0312210010bf063c29efe112b0d9accbc9191b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f0312210.failed
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Cc: Chris Mason <clm@fb.com>
+(cherry picked from commit f0312210010bf063c29efe112b0d9accbc9191b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/file.c
+#	fs/btrfs/inode.c
+#	fs/btrfs/tree-log.c
+diff --cc fs/btrfs/file.c
+index 52c64ec4acda,4843cb994835..000000000000
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@@ -2059,7 -2033,15 +2059,19 @@@ int btrfs_sync_file(struct file *file, 
+  		 */
+  		clear_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+  			  &BTRFS_I(inode)->runtime_flags);
+++<<<<<<< HEAD
+ +		mutex_unlock(&inode->i_mutex);
+++=======
++ 		/*
++ 		 * An ordered extent might have started before and completed
++ 		 * already with io errors, in which case the inode was not
++ 		 * updated and we end up here. So check the inode's mapping
++ 		 * flags for any errors that might have happened while doing
++ 		 * writeback of file data.
++ 		 */
++ 		ret = filemap_check_errors(inode->i_mapping);
++ 		inode_unlock(inode);
+++>>>>>>> f0312210010b (btrfs: use filemap_check_errors())
+  		goto out;
+  	}
+  
+diff --cc fs/btrfs/inode.c
+index 3fafb48a6ff7,0207622ec622..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -10135,23 -10472,78 +10135,98 @@@ static int btrfs_permission(struct inod
+  	return generic_permission(inode, mask);
+  }
+  
+++<<<<<<< HEAD
+ +/* Inspired by filemap_check_errors() */
+ +int btrfs_inode_check_errors(struct inode *inode)
+ +{
+ +	int ret = 0;
+ +
+ +	if (test_bit(AS_ENOSPC, &inode->i_mapping->flags) &&
+ +	    test_and_clear_bit(AS_ENOSPC, &inode->i_mapping->flags))
+ +		ret = -ENOSPC;
+ +	if (test_bit(AS_EIO, &inode->i_mapping->flags) &&
+ +	    test_and_clear_bit(AS_EIO, &inode->i_mapping->flags))
+ +		ret = -EIO;
+ +
+ +	return ret;
+ +}
+ +
+ +static const struct inode_operations_wrapper btrfs_dir_inode_operations = {
+ +	.ops = {
+++=======
++ static int btrfs_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
++ {
++ 	struct btrfs_trans_handle *trans;
++ 	struct btrfs_root *root = BTRFS_I(dir)->root;
++ 	struct inode *inode = NULL;
++ 	u64 objectid;
++ 	u64 index;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * 5 units required for adding orphan entry
++ 	 */
++ 	trans = btrfs_start_transaction(root, 5);
++ 	if (IS_ERR(trans))
++ 		return PTR_ERR(trans);
++ 
++ 	ret = btrfs_find_free_ino(root, &objectid);
++ 	if (ret)
++ 		goto out;
++ 
++ 	inode = btrfs_new_inode(trans, root, dir, NULL, 0,
++ 				btrfs_ino(dir), objectid, mode, &index);
++ 	if (IS_ERR(inode)) {
++ 		ret = PTR_ERR(inode);
++ 		inode = NULL;
++ 		goto out;
++ 	}
++ 
++ 	inode->i_fop = &btrfs_file_operations;
++ 	inode->i_op = &btrfs_file_inode_operations;
++ 
++ 	inode->i_mapping->a_ops = &btrfs_aops;
++ 	BTRFS_I(inode)->io_tree.ops = &btrfs_extent_io_ops;
++ 
++ 	ret = btrfs_init_inode_security(trans, inode, dir, NULL);
++ 	if (ret)
++ 		goto out_inode;
++ 
++ 	ret = btrfs_update_inode(trans, root, inode);
++ 	if (ret)
++ 		goto out_inode;
++ 	ret = btrfs_orphan_add(trans, inode);
++ 	if (ret)
++ 		goto out_inode;
++ 
++ 	/*
++ 	 * We set number of links to 0 in btrfs_new_inode(), and here we set
++ 	 * it to 1 because d_tmpfile() will issue a warning if the count is 0,
++ 	 * through:
++ 	 *
++ 	 *    d_tmpfile() -> inode_dec_link_count() -> drop_nlink()
++ 	 */
++ 	set_nlink(inode, 1);
++ 	unlock_new_inode(inode);
++ 	d_tmpfile(dentry, inode);
++ 	mark_inode_dirty(inode);
++ 
++ out:
++ 	btrfs_end_transaction(trans, root);
++ 	if (ret)
++ 		iput(inode);
++ 	btrfs_balance_delayed_items(root);
++ 	btrfs_btree_balance_dirty(root);
++ 	return ret;
++ 
++ out_inode:
++ 	unlock_new_inode(inode);
++ 	goto out;
++ 
++ }
++ 
++ static const struct inode_operations btrfs_dir_inode_operations = {
+++>>>>>>> f0312210010b (btrfs: use filemap_check_errors())
+  	.getattr	= btrfs_getattr,
+  	.lookup		= btrfs_lookup,
+  	.create		= btrfs_create,
+diff --cc fs/btrfs/tree-log.c
+index e9ec22a26cf6,8a84ebd8e7cc..000000000000
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@@ -4186,13 -4187,20 +4186,19 @@@ static int btrfs_log_changed_extents(st
+  	}
+  
+  	list_sort(NULL, &extents, extent_cmp);
+ -	btrfs_get_logged_extents(inode, logged_list, start, end);
+  	/*
+ -	 * Some ordered extents started by fsync might have completed
+ -	 * before we could collect them into the list logged_list, which
+ -	 * means they're gone, not in our logged_list nor in the inode's
+ -	 * ordered tree. We want the application/user space to know an
+ -	 * error happened while attempting to persist file data so that
+ -	 * it can take proper action. If such error happened, we leave
+ -	 * without writing to the log tree and the fsync must report the
+ -	 * file data write error and not commit the current transaction.
+ +	 * Collect any new ordered extents within the range. This is to
+ +	 * prevent logging file extent items without waiting for the disk
+ +	 * location they point to being written. We do this only to deal
+ +	 * with races against concurrent lockless direct IO writes.
+  	 */
+++<<<<<<< HEAD
+ +	btrfs_get_logged_extents(inode, logged_list, start, end);
+++=======
++ 	ret = filemap_check_errors(inode->i_mapping);
++ 	if (ret)
++ 		ctx->io_err = ret;
+++>>>>>>> f0312210010b (btrfs: use filemap_check_errors())
+  process:
+  	while (!list_empty(&extents)) {
+  		em = list_entry(extents.next, struct extent_map, list);
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 48f38b765f55..061119370874 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3104,7 +3104,6 @@ int btrfs_prealloc_file_range_trans(struct inode *inode,
+ 				    struct btrfs_trans_handle *trans, int mode,
+ 				    u64 start, u64 num_bytes, u64 min_size,
+ 				    loff_t actual_len, u64 *alloc_hint);
+-int btrfs_inode_check_errors(struct inode *inode);
+ extern const struct dentry_operations btrfs_dentry_operations;
+ #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+ void btrfs_test_inode_set_ops(struct inode *inode);
+* Unmerged path fs/btrfs/file.c
+* Unmerged path fs/btrfs/inode.c
+* Unmerged path fs/btrfs/tree-log.c
