@@ -614,7 +614,7 @@ static void xgbe_stop(struct xgbe_prv_data *pdata)
 	DBGPR("<--xgbe_stop\n");
 }
 
-static void xgbe_restart_dev(struct xgbe_prv_data *pdata, unsigned int reset)
+static void xgbe_restart_dev(struct xgbe_prv_data *pdata)
 {
 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
 
@@ -630,9 +630,8 @@ static void xgbe_restart_dev(struct xgbe_prv_data *pdata, unsigned int reset)
 	xgbe_free_tx_skbuff(pdata);
 	xgbe_free_rx_skbuff(pdata);
 
-	/* Issue software reset to device if requested */
-	if (reset)
-		hw_if->exit(pdata);
+	/* Issue software reset to device */
+	hw_if->exit(pdata);
 
 	xgbe_start(pdata);
 
@@ -647,7 +646,7 @@ static void xgbe_restart(struct work_struct *work)
 
 	rtnl_lock();
 
-	xgbe_restart_dev(pdata, 1);
+	xgbe_restart_dev(pdata);
 
 	rtnl_unlock();
 }
@@ -974,7 +973,7 @@ static int xgbe_change_mtu(struct net_device *netdev, int mtu)
 	pdata->rx_buf_size = ret;
 	netdev->mtu = mtu;
 
-	xgbe_restart_dev(pdata, 0);
+	xgbe_restart_dev(pdata);
 
 	DBGPR("<--xgbe_change_mtu\n");
 
