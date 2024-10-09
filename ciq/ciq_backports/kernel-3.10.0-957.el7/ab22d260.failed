@@ -1,0 +1,128 @@
+tcmu: Fix possible overwrite of t_data_sg's last iov[]
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Xiubo Li <lixiubo@cmss.chinamobile.com>
+commit ab22d2604c86ceb01bb2725c9860b88a7dd383bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ab22d260.failed
+
+If there has BIDI data, its first iov[] will overwrite the last
+iov[] for se_cmd->t_data_sg.
+
+To fix this, we can just increase the iov pointer, but this may
+introuduce a new memory leakage bug: If the se_cmd->data_length
+and se_cmd->t_bidi_data_sg->length are all not aligned up to the
+DATA_BLOCK_SIZE, the actual length needed maybe larger than just
+sum of them.
+
+So, this could be avoided by rounding all the data lengthes up
+to DATA_BLOCK_SIZE.
+
+	Reviewed-by: Mike Christie <mchristi@redhat.com>
+	Tested-by: Ilias Tsitsimpis <iliastsi@arrikto.com>
+	Reviewed-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+	Signed-off-by: Xiubo Li <lixiubo@cmss.chinamobile.com>
+	Cc: stable@vger.kernel.org # 3.18+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit ab22d2604c86ceb01bb2725c9860b88a7dd383bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,e58dfd4fe448..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -566,25 -394,18 +566,40 @@@ static bool is_ring_space_avail(struct 
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static inline size_t tcmu_cmd_get_base_cmd_size(size_t iov_cnt)
+ +{
+ +	return max(offsetof(struct tcmu_cmd_entry, req.iov[iov_cnt]),
+ +			sizeof(struct tcmu_cmd_entry));
+ +}
+ +
+ +static inline size_t tcmu_cmd_get_cmd_size(struct tcmu_cmd *tcmu_cmd,
+ +					   size_t base_command_size)
+ +{
+ +	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+ +	size_t command_size;
+ +
+ +	command_size = base_command_size +
+ +		round_up(scsi_command_size(se_cmd->t_task_cdb),
+ +				TCMU_OP_ALIGN_SIZE);
+ +
+ +	WARN_ON(command_size & (TCMU_OP_ALIGN_SIZE-1));
+ +
+ +	return command_size;
+++=======
++ static inline size_t tcmu_cmd_get_data_length(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
++ 	size_t data_length = round_up(se_cmd->data_length, DATA_BLOCK_SIZE);
++ 
++ 	if (se_cmd->se_cmd_flags & SCF_BIDI) {
++ 		BUG_ON(!(se_cmd->t_bidi_data_sg && se_cmd->t_bidi_data_nents));
++ 		data_length += round_up(se_cmd->t_bidi_data_sg->length,
++ 				DATA_BLOCK_SIZE);
++ 	}
++ 
++ 	return data_length;
+++>>>>>>> ab22d2604c86 (tcmu: Fix possible overwrite of t_data_sg's last iov[])
+  }
+  
+  static sense_reason_t
+@@@ -600,7 -421,8 +615,12 @@@ tcmu_queue_cmd_ring(struct tcmu_cmd *tc
+  	uint32_t cmd_head;
+  	uint64_t cdb_off;
+  	bool copy_to_data_area;
+++<<<<<<< HEAD
+ +	size_t data_length;
+++=======
++ 	size_t data_length = tcmu_cmd_get_data_length(tcmu_cmd);
++ 	DECLARE_BITMAP(old_bitmap, DATA_BLOCK_BITS);
+++>>>>>>> ab22d2604c86 (tcmu: Fix possible overwrite of t_data_sg's last iov[])
+  
+  	if (test_bit(TCMU_DEV_BIT_BROKEN, &udev->flags))
+  		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+@@@ -712,21 -520,17 +727,35 @@@
+  	entry->req.iov_dif_cnt = 0;
+  
+  	/* Handle BIDI commands */
+++<<<<<<< HEAD
+ +	iov_cnt = 0;
+ +	alloc_and_scatter_data_area(udev, tcmu_cmd->data_bitmap,
+ +		se_cmd->t_bidi_data_sg, se_cmd->t_bidi_data_nents, &iov,
+ +		&iov_cnt, false);
+ +	entry->req.iov_bidi_cnt = iov_cnt;
+ +
+ +	/*
+ +	 * Recalaulate the command's base size and size according
+ +	 * to the actual needs
+ +	 */
+ +	base_command_size = tcmu_cmd_get_base_cmd_size(entry->req.iov_cnt +
+ +						       entry->req.iov_bidi_cnt);
+ +	command_size = tcmu_cmd_get_cmd_size(tcmu_cmd, base_command_size);
+ +
+ +	tcmu_hdr_set_len(&entry->hdr.len_op, command_size);
+++=======
++ 	if (se_cmd->se_cmd_flags & SCF_BIDI) {
++ 		iov_cnt = 0;
++ 		iov++;
++ 		alloc_and_scatter_data_area(udev, se_cmd->t_bidi_data_sg,
++ 				se_cmd->t_bidi_data_nents, &iov, &iov_cnt,
++ 				false);
++ 		entry->req.iov_bidi_cnt = iov_cnt;
++ 	}
++ 	/* cmd's data_bitmap is what changed in process */
++ 	bitmap_xor(tcmu_cmd->data_bitmap, old_bitmap, udev->data_bitmap,
++ 			DATA_BLOCK_BITS);
+++>>>>>>> ab22d2604c86 (tcmu: Fix possible overwrite of t_data_sg's last iov[])
+  
+  	/* All offsets relative to mb_addr, not start of entry! */
+  	cdb_off = CMDR_OFF + cmd_head + base_command_size;
+* Unmerged path drivers/target/target_core_user.c
