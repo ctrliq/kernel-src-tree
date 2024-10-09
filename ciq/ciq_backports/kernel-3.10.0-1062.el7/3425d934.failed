@@ -1,0 +1,484 @@
+efi/x86: Handle page faults occurring while running EFI runtime services
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sai Praneeth <sai.praneeth.prakhya@intel.com>
+commit 3425d934fc0312f62024163736a7afe4de20c10f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3425d934.failed
+
+Memory accesses performed by UEFI runtime services should be limited to:
+- reading/executing from EFI_RUNTIME_SERVICES_CODE memory regions
+- reading/writing from/to EFI_RUNTIME_SERVICES_DATA memory regions
+- reading/writing by-ref arguments
+- reading/writing from/to the stack.
+
+Accesses outside these regions may cause the kernel to hang because the
+memory region requested by the firmware isn't mapped in efi_pgd, which
+causes a page fault in ring 0 and the kernel fails to handle it, leading
+to die(). To save kernel from hanging, add an EFI specific page fault
+handler which recovers from such faults by
+1. If the efi runtime service is efi_reset_system(), reboot the machine
+   through BIOS.
+2. If the efi runtime service is _not_ efi_reset_system(), then freeze
+   efi_rts_wq and schedule a new process.
+
+The EFI page fault handler offers us two advantages:
+1. Avoid potential hangs caused by buggy firmware.
+2. Shout loud that the firmware is buggy and hence is not a kernel bug.
+
+	Tested-by: Bhupesh Sharma <bhsharma@redhat.com>
+	Suggested-by: Matt Fleming <matt@codeblueprint.co.uk>
+Based-on-code-from: Ricardo Neri <ricardo.neri@intel.com>
+	Signed-off-by: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+[ardb: clarify commit log]
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+(cherry picked from commit 3425d934fc0312f62024163736a7afe4de20c10f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/mm/fault.c
+#	arch/x86/platform/efi/quirks.c
+#	drivers/firmware/efi/runtime-wrappers.c
+#	include/linux/efi.h
+diff --cc arch/x86/include/asm/efi.h
+index b2df06f6136e,eea40d52ca78..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -131,6 -139,8 +131,11 @@@ extern void __init efi_dump_pagetable(v
+  extern void __init efi_apply_memmap_quirks(void);
+  extern int __init efi_reuse_config(u64 tables, int nr_tables);
+  extern void efi_delete_dummy_variable(void);
+++<<<<<<< HEAD
+++=======
++ extern void efi_switch_mm(struct mm_struct *mm);
++ extern void efi_recover_from_page_fault(unsigned long phys_addr);
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+  
+  struct efi_setup_data {
+  	u64 fw_vendor;
+diff --cc arch/x86/mm/fault.c
+index afbf23e0599d,a5b9ddb0f1fe..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -14,13 -15,18 +14,20 @@@
+  #include <linux/hugetlb.h>		/* hstate_index_to_shift	*/
+  #include <linux/prefetch.h>		/* prefetchw			*/
+  #include <linux/context_tracking.h>	/* exception_enter(), ...	*/
+++<<<<<<< HEAD
+++=======
++ #include <linux/uaccess.h>		/* faulthandler_disabled()	*/
++ #include <linux/efi.h>			/* efi_recover_from_page_fault()*/
++ #include <linux/mm_types.h>
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+  
+  #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
+  #include <asm/traps.h>			/* dotraplinkage, ...		*/
+  #include <asm/pgalloc.h>		/* pgd_*(), ...			*/
+ -#include <asm/fixmap.h>			/* VSYSCALL_ADDR		*/
+ -#include <asm/vsyscall.h>		/* emulate_vsyscall		*/
+ -#include <asm/vm86.h>			/* struct vm86			*/
+ +#include <asm/kmemcheck.h>		/* kmemcheck_*(), ...		*/
+ +#include <asm/fixmap.h>			/* VSYSCALL_START		*/
+  #include <asm/mmu_context.h>		/* vma_pkey()			*/
++ #include <asm/efi.h>			/* efi_recover_from_page_fault()*/
+  
+  #define CREATE_TRACE_POINTS
+  #include <asm/trace/exceptions.h>
+diff --cc arch/x86/platform/efi/quirks.c
+index 8678178b5929,669babcaf245..000000000000
+--- a/arch/x86/platform/efi/quirks.c
++++ b/arch/x86/platform/efi/quirks.c
+@@@ -11,8 -11,12 +11,13 @@@
+  #include <linux/bootmem.h>
+  #include <linux/acpi.h>
+  #include <linux/dmi.h>
+ -
+ -#include <asm/e820/api.h>
+  #include <asm/efi.h>
+  #include <asm/uv/uv.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/cpu_device_id.h>
++ #include <asm/reboot.h>
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+  
+  #define EFI_MIN_RESERVE 5120
+  
+@@@ -324,3 -539,196 +329,199 @@@ void __init efi_apply_memmap_quirks(voi
+  	if (dmi_check_system(sgi_uv1_dmi))
+  		set_bit(EFI_OLD_MEMMAP, &efi.flags);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * For most modern platforms the preferred method of powering off is via
++  * ACPI. However, there are some that are known to require the use of
++  * EFI runtime services and for which ACPI does not work at all.
++  *
++  * Using EFI is a last resort, to be used only if no other option
++  * exists.
++  */
++ bool efi_reboot_required(void)
++ {
++ 	if (!acpi_gbl_reduced_hardware)
++ 		return false;
++ 
++ 	efi_reboot_quirk_mode = EFI_RESET_WARM;
++ 	return true;
++ }
++ 
++ bool efi_poweroff_required(void)
++ {
++ 	return acpi_gbl_reduced_hardware || acpi_no_s5;
++ }
++ 
++ #ifdef CONFIG_EFI_CAPSULE_QUIRK_QUARK_CSH
++ 
++ static int qrk_capsule_setup_info(struct capsule_info *cap_info, void **pkbuff,
++ 				  size_t hdr_bytes)
++ {
++ 	struct quark_security_header *csh = *pkbuff;
++ 
++ 	/* Only process data block that is larger than the security header */
++ 	if (hdr_bytes < sizeof(struct quark_security_header))
++ 		return 0;
++ 
++ 	if (csh->csh_signature != QUARK_CSH_SIGNATURE ||
++ 	    csh->headersize != QUARK_SECURITY_HEADER_SIZE)
++ 		return 1;
++ 
++ 	/* Only process data block if EFI header is included */
++ 	if (hdr_bytes < QUARK_SECURITY_HEADER_SIZE +
++ 			sizeof(efi_capsule_header_t))
++ 		return 0;
++ 
++ 	pr_debug("Quark security header detected\n");
++ 
++ 	if (csh->rsvd_next_header != 0) {
++ 		pr_err("multiple Quark security headers not supported\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	*pkbuff += csh->headersize;
++ 	cap_info->total_size = csh->headersize;
++ 
++ 	/*
++ 	 * Update the first page pointer to skip over the CSH header.
++ 	 */
++ 	cap_info->phys[0] += csh->headersize;
++ 
++ 	/*
++ 	 * cap_info->capsule should point at a virtual mapping of the entire
++ 	 * capsule, starting at the capsule header. Our image has the Quark
++ 	 * security header prepended, so we cannot rely on the default vmap()
++ 	 * mapping created by the generic capsule code.
++ 	 * Given that the Quark firmware does not appear to care about the
++ 	 * virtual mapping, let's just point cap_info->capsule at our copy
++ 	 * of the capsule header.
++ 	 */
++ 	cap_info->capsule = &cap_info->header;
++ 
++ 	return 1;
++ }
++ 
++ #define ICPU(family, model, quirk_handler) \
++ 	{ X86_VENDOR_INTEL, family, model, X86_FEATURE_ANY, \
++ 	  (unsigned long)&quirk_handler }
++ 
++ static const struct x86_cpu_id efi_capsule_quirk_ids[] = {
++ 	ICPU(5, 9, qrk_capsule_setup_info),	/* Intel Quark X1000 */
++ 	{ }
++ };
++ 
++ int efi_capsule_setup_info(struct capsule_info *cap_info, void *kbuff,
++ 			   size_t hdr_bytes)
++ {
++ 	int (*quirk_handler)(struct capsule_info *, void **, size_t);
++ 	const struct x86_cpu_id *id;
++ 	int ret;
++ 
++ 	if (hdr_bytes < sizeof(efi_capsule_header_t))
++ 		return 0;
++ 
++ 	cap_info->total_size = 0;
++ 
++ 	id = x86_match_cpu(efi_capsule_quirk_ids);
++ 	if (id) {
++ 		/*
++ 		 * The quirk handler is supposed to return
++ 		 *  - a value > 0 if the setup should continue, after advancing
++ 		 *    kbuff as needed
++ 		 *  - 0 if not enough hdr_bytes are available yet
++ 		 *  - a negative error code otherwise
++ 		 */
++ 		quirk_handler = (typeof(quirk_handler))id->driver_data;
++ 		ret = quirk_handler(cap_info, &kbuff, hdr_bytes);
++ 		if (ret <= 0)
++ 			return ret;
++ 	}
++ 
++ 	memcpy(&cap_info->header, kbuff, sizeof(cap_info->header));
++ 
++ 	cap_info->total_size += cap_info->header.imagesize;
++ 
++ 	return __efi_capsule_setup_info(cap_info);
++ }
++ 
++ #endif
++ 
++ /*
++  * If any access by any efi runtime service causes a page fault, then,
++  * 1. If it's efi_reset_system(), reboot through BIOS.
++  * 2. If any other efi runtime service, then
++  *    a. Return error status to the efi caller process.
++  *    b. Disable EFI Runtime Services forever and
++  *    c. Freeze efi_rts_wq and schedule new process.
++  *
++  * @return: Returns, if the page fault is not handled. This function
++  * will never return if the page fault is handled successfully.
++  */
++ void efi_recover_from_page_fault(unsigned long phys_addr)
++ {
++ 	if (!IS_ENABLED(CONFIG_X86_64))
++ 		return;
++ 
++ 	/*
++ 	 * Make sure that an efi runtime service caused the page fault.
++ 	 * "efi_mm" cannot be used to check if the page fault had occurred
++ 	 * in the firmware context because efi=old_map doesn't use efi_pgd.
++ 	 */
++ 	if (efi_rts_work.efi_rts_id == NONE)
++ 		return;
++ 
++ 	/*
++ 	 * Address range 0x0000 - 0x0fff is always mapped in the efi_pgd, so
++ 	 * page faulting on these addresses isn't expected.
++ 	 */
++ 	if (phys_addr >= 0x0000 && phys_addr <= 0x0fff)
++ 		return;
++ 
++ 	/*
++ 	 * Print stack trace as it might be useful to know which EFI Runtime
++ 	 * Service is buggy.
++ 	 */
++ 	WARN(1, FW_BUG "Page fault caused by firmware at PA: 0x%lx\n",
++ 	     phys_addr);
++ 
++ 	/*
++ 	 * Buggy efi_reset_system() is handled differently from other EFI
++ 	 * Runtime Services as it doesn't use efi_rts_wq. Although,
++ 	 * native_machine_emergency_restart() says that machine_real_restart()
++ 	 * could fail, it's better not to compilcate this fault handler
++ 	 * because this case occurs *very* rarely and hence could be improved
++ 	 * on a need by basis.
++ 	 */
++ 	if (efi_rts_work.efi_rts_id == RESET_SYSTEM) {
++ 		pr_info("efi_reset_system() buggy! Reboot through BIOS\n");
++ 		machine_real_restart(MRR_BIOS);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Before calling EFI Runtime Service, the kernel has switched the
++ 	 * calling process to efi_mm. Hence, switch back to task_mm.
++ 	 */
++ 	arch_efi_call_virt_teardown();
++ 
++ 	/* Signal error status to the efi caller process */
++ 	efi_rts_work.status = EFI_ABORTED;
++ 	complete(&efi_rts_work.efi_rts_comp);
++ 
++ 	clear_bit(EFI_RUNTIME_SERVICES, &efi.flags);
++ 	pr_info("Froze efi_rts_wq and disabled EFI Runtime Services\n");
++ 
++ 	/*
++ 	 * Call schedule() in an infinite loop, so that any spurious wake ups
++ 	 * will never run efi_rts_wq again.
++ 	 */
++ 	for (;;) {
++ 		set_current_state(TASK_IDLE);
++ 		schedule();
++ 	}
++ 
++ 	return;
++ }
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+diff --cc drivers/firmware/efi/runtime-wrappers.c
+index dcc976822484,a19d845bdb06..000000000000
+--- a/drivers/firmware/efi/runtime-wrappers.c
++++ b/drivers/firmware/efi/runtime-wrappers.c
+@@@ -27,6 -45,50 +27,53 @@@
+  #define __efi_call_virt(f, args...) \
+  	__efi_call_virt_pointer(efi.systab->runtime, f, args)
+  
+++<<<<<<< HEAD
+++=======
++ struct efi_runtime_work efi_rts_work;
++ 
++ /*
++  * efi_queue_work:	Queue efi_runtime_service() and wait until it's done
++  * @rts:		efi_runtime_service() function identifier
++  * @rts_arg<1-5>:	efi_runtime_service() function arguments
++  *
++  * Accesses to efi_runtime_services() are serialized by a binary
++  * semaphore (efi_runtime_lock) and caller waits until the work is
++  * finished, hence _only_ one work is queued at a time and the caller
++  * thread waits for completion.
++  */
++ #define efi_queue_work(_rts, _arg1, _arg2, _arg3, _arg4, _arg5)		\
++ ({									\
++ 	efi_rts_work.status = EFI_ABORTED;				\
++ 									\
++ 	if (!efi_enabled(EFI_RUNTIME_SERVICES)) {			\
++ 		pr_warn_once("EFI Runtime Services are disabled!\n");	\
++ 		goto exit;						\
++ 	}								\
++ 									\
++ 	init_completion(&efi_rts_work.efi_rts_comp);			\
++ 	INIT_WORK_ONSTACK(&efi_rts_work.work, efi_call_rts);		\
++ 	efi_rts_work.arg1 = _arg1;					\
++ 	efi_rts_work.arg2 = _arg2;					\
++ 	efi_rts_work.arg3 = _arg3;					\
++ 	efi_rts_work.arg4 = _arg4;					\
++ 	efi_rts_work.arg5 = _arg5;					\
++ 	efi_rts_work.efi_rts_id = _rts;					\
++ 									\
++ 	/*								\
++ 	 * queue_work() returns 0 if work was already on queue,         \
++ 	 * _ideally_ this should never happen.                          \
++ 	 */								\
++ 	if (queue_work(efi_rts_wq, &efi_rts_work.work))			\
++ 		wait_for_completion(&efi_rts_work.efi_rts_comp);	\
++ 	else								\
++ 		pr_err("Failed to queue work to efi_rts_wq.\n");	\
++ 									\
++ exit:									\
++ 	efi_rts_work.efi_rts_id = NONE;					\
++ 	efi_rts_work.status;						\
++ })
++ 
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+  void efi_call_virt_check_flags(unsigned long flags, const char *call)
+  {
+  	unsigned long cur_flags, mismatch;
+@@@ -182,7 -395,14 +229,16 @@@ static void virt_efi_reset_system(int r
+  				  unsigned long data_size,
+  				  efi_char16_t *data)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (down_interruptible(&efi_runtime_lock)) {
++ 		pr_warn("failed to invoke the reset_system() runtime service:\n"
++ 			"could not get exclusive access to the firmware\n");
++ 		return;
++ 	}
++ 	efi_rts_work.efi_rts_id = RESET_SYSTEM;
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+  	__efi_call_virt(reset_system, reset_type, status, data_size, data);
+ -	up(&efi_runtime_lock);
+  }
+  
+  static efi_status_t virt_efi_update_capsule(efi_capsule_header_t **capsules,
+diff --cc include/linux/efi.h
+index ce99ad24fa74,845174e113ce..000000000000
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@@ -1334,7 -1633,84 +1334,87 @@@ extern void efi_call_virt_check_flags(u
+  	arch_efi_call_virt(p, f, args);					\
+  	efi_call_virt_check_flags(__flags, __stringify(f));		\
+  									\
+ -	arch_efi_call_virt_teardown();					\
+ +	arch_efi_call_virt_teardown(ibrs_on);				\
+  })
+  
+++<<<<<<< HEAD
+++=======
++ typedef efi_status_t (*efi_exit_boot_map_processing)(
++ 	efi_system_table_t *sys_table_arg,
++ 	struct efi_boot_memmap *map,
++ 	void *priv);
++ 
++ efi_status_t efi_exit_boot_services(efi_system_table_t *sys_table,
++ 				    void *handle,
++ 				    struct efi_boot_memmap *map,
++ 				    void *priv,
++ 				    efi_exit_boot_map_processing priv_func);
++ 
++ #define EFI_RANDOM_SEED_SIZE		64U
++ 
++ struct linux_efi_random_seed {
++ 	u32	size;
++ 	u8	bits[];
++ };
++ 
++ struct linux_efi_tpm_eventlog {
++ 	u32	size;
++ 	u8	version;
++ 	u8	log[];
++ };
++ 
++ extern int efi_tpm_eventlog_init(void);
++ 
++ /*
++  * efi_runtime_service() function identifiers.
++  * "NONE" is used by efi_recover_from_page_fault() to check if the page
++  * fault happened while executing an efi runtime service.
++  */
++ enum efi_rts_ids {
++ 	NONE,
++ 	GET_TIME,
++ 	SET_TIME,
++ 	GET_WAKEUP_TIME,
++ 	SET_WAKEUP_TIME,
++ 	GET_VARIABLE,
++ 	GET_NEXT_VARIABLE,
++ 	SET_VARIABLE,
++ 	QUERY_VARIABLE_INFO,
++ 	GET_NEXT_HIGH_MONO_COUNT,
++ 	RESET_SYSTEM,
++ 	UPDATE_CAPSULE,
++ 	QUERY_CAPSULE_CAPS,
++ };
++ 
++ /*
++  * efi_runtime_work:	Details of EFI Runtime Service work
++  * @arg<1-5>:		EFI Runtime Service function arguments
++  * @status:		Status of executing EFI Runtime Service
++  * @efi_rts_id:		EFI Runtime Service function identifier
++  * @efi_rts_comp:	Struct used for handling completions
++  */
++ struct efi_runtime_work {
++ 	void *arg1;
++ 	void *arg2;
++ 	void *arg3;
++ 	void *arg4;
++ 	void *arg5;
++ 	efi_status_t status;
++ 	struct work_struct work;
++ 	enum efi_rts_ids efi_rts_id;
++ 	struct completion efi_rts_comp;
++ };
++ 
++ extern struct efi_runtime_work efi_rts_work;
++ 
++ /* Workqueue to queue EFI Runtime Services */
++ extern struct workqueue_struct *efi_rts_wq;
++ 
++ struct linux_efi_memreserve {
++ 	phys_addr_t	next;
++ 	phys_addr_t	base;
++ 	phys_addr_t	size;
++ };
++ 
+++>>>>>>> 3425d934fc03 (efi/x86: Handle page faults occurring while running EFI runtime services)
+  #endif /* _LINUX_EFI_H */
+* Unmerged path arch/x86/include/asm/efi.h
+* Unmerged path arch/x86/mm/fault.c
+* Unmerged path arch/x86/platform/efi/quirks.c
+* Unmerged path drivers/firmware/efi/runtime-wrappers.c
+* Unmerged path include/linux/efi.h
