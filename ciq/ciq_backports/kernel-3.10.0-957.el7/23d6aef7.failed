@@ -1,0 +1,135 @@
+kernel/sys.c: fix potential Spectre v1 issue
+
+jira LE-1907
+cve CVE-2018-3693
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [kernel] sys.c: fix potential Spectre v1 issue (Lauro Ramos Venancio) [1589035] {CVE-2018-3693}
+Rebuild_FUZZ: 91.36%
+commit-author Gustavo A. R. Silva <gustavo@embeddedor.com>
+commit 23d6aef74da86a33fa6bb75f79565e0a16ee97c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/23d6aef7.failed
+
+`resource' can be controlled by user-space, hence leading to a potential
+exploitation of the Spectre variant 1 vulnerability.
+
+This issue was detected with the help of Smatch:
+
+  kernel/sys.c:1474 __do_compat_sys_old_getrlimit() warn: potential spectre issue 'get_current()->signal->rlim' (local cap)
+  kernel/sys.c:1455 __do_sys_old_getrlimit() warn: potential spectre issue 'get_current()->signal->rlim' (local cap)
+
+Fix this by sanitizing *resource* before using it to index
+current->signal->rlim
+
+Notice that given that speculation windows are large, the policy is to
+kill the speculation on the first load and not worry if it can be
+completed with a dependent load/store [1].
+
+[1] https://marc.info/?l=linux-kernel&m=152449131114778&w=2
+
+Link: http://lkml.kernel.org/r/20180515030038.GA11822@embeddedor.com
+	Signed-off-by: Gustavo A. R. Silva <gustavo@embeddedor.com>
+	Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 23d6aef74da86a33fa6bb75f79565e0a16ee97c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sys.c
+diff --cc kernel/sys.c
+index 113961cf6711,d1b2b8d934bb..000000000000
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@@ -62,29 -71,34 +62,37 @@@
+  #include <asm/io.h>
+  #include <asm/unistd.h>
+  
+++<<<<<<< HEAD
+++=======
++ /* Hardening for Spectre-v1 */
++ #include <linux/nospec.h>
++ 
++ #include "uid16.h"
++ 
+++>>>>>>> 23d6aef74da8 (kernel/sys.c: fix potential Spectre v1 issue)
+  #ifndef SET_UNALIGN_CTL
+ -# define SET_UNALIGN_CTL(a, b)	(-EINVAL)
+ +# define SET_UNALIGN_CTL(a,b)	(-EINVAL)
+  #endif
+  #ifndef GET_UNALIGN_CTL
+ -# define GET_UNALIGN_CTL(a, b)	(-EINVAL)
+ +# define GET_UNALIGN_CTL(a,b)	(-EINVAL)
+  #endif
+  #ifndef SET_FPEMU_CTL
+ -# define SET_FPEMU_CTL(a, b)	(-EINVAL)
+ +# define SET_FPEMU_CTL(a,b)	(-EINVAL)
+  #endif
+  #ifndef GET_FPEMU_CTL
+ -# define GET_FPEMU_CTL(a, b)	(-EINVAL)
+ +# define GET_FPEMU_CTL(a,b)	(-EINVAL)
+  #endif
+  #ifndef SET_FPEXC_CTL
+ -# define SET_FPEXC_CTL(a, b)	(-EINVAL)
+ +# define SET_FPEXC_CTL(a,b)	(-EINVAL)
+  #endif
+  #ifndef GET_FPEXC_CTL
+ -# define GET_FPEXC_CTL(a, b)	(-EINVAL)
+ +# define GET_FPEXC_CTL(a,b)	(-EINVAL)
+  #endif
+  #ifndef GET_ENDIAN
+ -# define GET_ENDIAN(a, b)	(-EINVAL)
+ +# define GET_ENDIAN(a,b)	(-EINVAL)
+  #endif
+  #ifndef SET_ENDIAN
+ -# define SET_ENDIAN(a, b)	(-EINVAL)
+ +# define SET_ENDIAN(a,b)	(-EINVAL)
+  #endif
+  #ifndef GET_TSC_CTL
+  # define GET_TSC_CTL(a)		(-EINVAL)
+@@@ -1568,9 -1464,34 +1577,37 @@@ SYSCALL_DEFINE2(old_getrlimit, unsigne
+  		x.rlim_cur = 0x7FFFFFFF;
+  	if (x.rlim_max > 0x7FFFFFFF)
+  		x.rlim_max = 0x7FFFFFFF;
+ -	return copy_to_user(rlim, &x, sizeof(x)) ? -EFAULT : 0;
+ +	return copy_to_user(rlim, &x, sizeof(x))?-EFAULT:0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_COMPAT
++ COMPAT_SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
++ 		       struct compat_rlimit __user *, rlim)
++ {
++ 	struct rlimit r;
++ 
++ 	if (resource >= RLIM_NLIMITS)
++ 		return -EINVAL;
++ 
++ 	resource = array_index_nospec(resource, RLIM_NLIMITS);
++ 	task_lock(current->group_leader);
++ 	r = current->signal->rlim[resource];
++ 	task_unlock(current->group_leader);
++ 	if (r.rlim_cur > 0x7FFFFFFF)
++ 		r.rlim_cur = 0x7FFFFFFF;
++ 	if (r.rlim_max > 0x7FFFFFFF)
++ 		r.rlim_max = 0x7FFFFFFF;
++ 
++ 	if (put_user(r.rlim_cur, &rlim->rlim_cur) ||
++ 	    put_user(r.rlim_max, &rlim->rlim_max))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> 23d6aef74da8 (kernel/sys.c: fix potential Spectre v1 issue)
+  #endif
+  
+  static inline bool rlim64_is_infinity(__u64 rlim64)
+* Unmerged path kernel/sys.c
