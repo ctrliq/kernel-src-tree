@@ -1,0 +1,1699 @@
+bpf: fix bpf_tail_call() x64 JIT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 90caccdd8cc0215705f18b92771b449b01e2474a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/90caccdd.failed
+
+- bpf prog_array just like all other types of bpf array accepts 32-bit index.
+  Clarify that in the comment.
+- fix x64 JIT of bpf_tail_call which was incorrectly loading 8 instead of 4 bytes
+- tighten corresponding check in the interpreter to stay consistent
+
+The JIT bug can be triggered after introduction of BPF_F_NUMA_NODE flag
+in commit 96eabe7a40aa in 4.14. Before that the map_flags would stay zero and
+though JIT code is wrong it will check bounds correctly.
+Hence two fixes tags. All other JITs don't have this problem.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Fixes: 96eabe7a40aa ("bpf: Allow selecting numa node during map creation")
+Fixes: b52f00e6a715 ("x86: bpf_jit: implement bpf_tail_call() helper")
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90caccdd8cc0215705f18b92771b449b01e2474a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/net/bpf_jit_comp.c
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/core.c
+diff --cc arch/x86/net/bpf_jit_comp.c
+index 76c7b3a140ad,0554e8aef4d5..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -124,48 -112,1034 +124,1010 @@@ static inline void bpf_flush_icache(voi
+  #define CHOOSE_LOAD_FUNC(K, func) \
+  	((int)K < 0 ? ((int)K >= SKF_LL_OFF ? func##_negative_offset : func) : func##_positive_offset)
+  
+ -/* pick a register outside of BPF range for JIT internal work */
+ -#define AUX_REG (MAX_BPF_JIT_REG + 1)
+ -
+ -/* The following table maps BPF registers to x64 registers.
+ - *
+ - * x64 register r12 is unused, since if used as base address
+ - * register in load/store instructions, it always needs an
+ - * extra byte of encoding and is callee saved.
+ - *
+ - *  r9 caches skb->len - skb->data_len
+ - * r10 caches skb->data, and used for blinding (if enabled)
+ - */
+ -static const int reg2hex[] = {
+ -	[BPF_REG_0] = 0,  /* rax */
+ -	[BPF_REG_1] = 7,  /* rdi */
+ -	[BPF_REG_2] = 6,  /* rsi */
+ -	[BPF_REG_3] = 2,  /* rdx */
+ -	[BPF_REG_4] = 1,  /* rcx */
+ -	[BPF_REG_5] = 0,  /* r8 */
+ -	[BPF_REG_6] = 3,  /* rbx callee saved */
+ -	[BPF_REG_7] = 5,  /* r13 callee saved */
+ -	[BPF_REG_8] = 6,  /* r14 callee saved */
+ -	[BPF_REG_9] = 7,  /* r15 callee saved */
+ -	[BPF_REG_FP] = 5, /* rbp readonly */
+ -	[BPF_REG_AX] = 2, /* r10 temp register */
+ -	[AUX_REG] = 3,    /* r11 temp register */
+ -};
+ -
+ -/* is_ereg() == true if BPF register 'reg' maps to x64 r8..r15
+ - * which need extra byte of encoding.
+ - * rax,rcx,...,rbp have simpler encoding
+ +/* Helper to find the offset of pkt_type in sk_buff
+ + * We want to make sure its still a 3bit field starting at a byte boundary.
+   */
+ -static bool is_ereg(u32 reg)
+ +#define PKT_TYPE_MAX 7
+ +static int pkt_type_offset(void)
+  {
+++<<<<<<< HEAD
+ +	struct sk_buff skb_probe = {
+ +		.pkt_type = ~0,
+ +	};
+ +	char *ct = (char *)&skb_probe;
+ +	unsigned int off;
+ +
+ +	for (off = 0; off < sizeof(struct sk_buff); off++) {
+ +		if (ct[off] == PKT_TYPE_MAX)
+ +			return off;
+++=======
++ 	return (1 << reg) & (BIT(BPF_REG_5) |
++ 			     BIT(AUX_REG) |
++ 			     BIT(BPF_REG_7) |
++ 			     BIT(BPF_REG_8) |
++ 			     BIT(BPF_REG_9) |
++ 			     BIT(BPF_REG_AX));
++ }
++ 
++ /* add modifiers if 'reg' maps to x64 registers r8..r15 */
++ static u8 add_1mod(u8 byte, u32 reg)
++ {
++ 	if (is_ereg(reg))
++ 		byte |= 1;
++ 	return byte;
++ }
++ 
++ static u8 add_2mod(u8 byte, u32 r1, u32 r2)
++ {
++ 	if (is_ereg(r1))
++ 		byte |= 1;
++ 	if (is_ereg(r2))
++ 		byte |= 4;
++ 	return byte;
++ }
++ 
++ /* encode 'dst_reg' register into x64 opcode 'byte' */
++ static u8 add_1reg(u8 byte, u32 dst_reg)
++ {
++ 	return byte + reg2hex[dst_reg];
++ }
++ 
++ /* encode 'dst_reg' and 'src_reg' registers into x64 opcode 'byte' */
++ static u8 add_2reg(u8 byte, u32 dst_reg, u32 src_reg)
++ {
++ 	return byte + reg2hex[dst_reg] + (reg2hex[src_reg] << 3);
++ }
++ 
++ static void jit_fill_hole(void *area, unsigned int size)
++ {
++ 	/* fill whole space with int3 instructions */
++ 	memset(area, 0xcc, size);
++ }
++ 
++ struct jit_context {
++ 	int cleanup_addr; /* epilogue code offset */
++ 	bool seen_ld_abs;
++ 	bool seen_ax_reg;
++ };
++ 
++ /* maximum number of bytes emitted while JITing one eBPF insn */
++ #define BPF_MAX_INSN_SIZE	128
++ #define BPF_INSN_SAFETY		64
++ 
++ #define AUX_STACK_SPACE \
++ 	(32 /* space for rbx, r13, r14, r15 */ + \
++ 	 8 /* space for skb_copy_bits() buffer */)
++ 
++ #define PROLOGUE_SIZE 37
++ 
++ /* emit x64 prologue code for BPF program and check it's size.
++  * bpf_tail_call helper will skip it while jumping into another program
++  */
++ static void emit_prologue(u8 **pprog, u32 stack_depth)
++ {
++ 	u8 *prog = *pprog;
++ 	int cnt = 0;
++ 
++ 	EMIT1(0x55); /* push rbp */
++ 	EMIT3(0x48, 0x89, 0xE5); /* mov rbp,rsp */
++ 
++ 	/* sub rsp, rounded_stack_depth + AUX_STACK_SPACE */
++ 	EMIT3_off32(0x48, 0x81, 0xEC,
++ 		    round_up(stack_depth, 8) + AUX_STACK_SPACE);
++ 
++ 	/* sub rbp, AUX_STACK_SPACE */
++ 	EMIT4(0x48, 0x83, 0xED, AUX_STACK_SPACE);
++ 
++ 	/* all classic BPF filters use R6(rbx) save it */
++ 
++ 	/* mov qword ptr [rbp+0],rbx */
++ 	EMIT4(0x48, 0x89, 0x5D, 0);
++ 
++ 	/* bpf_convert_filter() maps classic BPF register X to R7 and uses R8
++ 	 * as temporary, so all tcpdump filters need to spill/fill R7(r13) and
++ 	 * R8(r14). R9(r15) spill could be made conditional, but there is only
++ 	 * one 'bpf_error' return path out of helper functions inside bpf_jit.S
++ 	 * The overhead of extra spill is negligible for any filter other
++ 	 * than synthetic ones. Therefore not worth adding complexity.
++ 	 */
++ 
++ 	/* mov qword ptr [rbp+8],r13 */
++ 	EMIT4(0x4C, 0x89, 0x6D, 8);
++ 	/* mov qword ptr [rbp+16],r14 */
++ 	EMIT4(0x4C, 0x89, 0x75, 16);
++ 	/* mov qword ptr [rbp+24],r15 */
++ 	EMIT4(0x4C, 0x89, 0x7D, 24);
++ 
++ 	/* Clear the tail call counter (tail_call_cnt): for eBPF tail calls
++ 	 * we need to reset the counter to 0. It's done in two instructions,
++ 	 * resetting rax register to 0 (xor on eax gets 0 extended), and
++ 	 * moving it to the counter location.
++ 	 */
++ 
++ 	/* xor eax, eax */
++ 	EMIT2(0x31, 0xc0);
++ 	/* mov qword ptr [rbp+32], rax */
++ 	EMIT4(0x48, 0x89, 0x45, 32);
++ 
++ 	BUILD_BUG_ON(cnt != PROLOGUE_SIZE);
++ 	*pprog = prog;
++ }
++ 
++ /* generate the following code:
++  * ... bpf_tail_call(void *ctx, struct bpf_array *array, u64 index) ...
++  *   if (index >= array->map.max_entries)
++  *     goto out;
++  *   if (++tail_call_cnt > MAX_TAIL_CALL_CNT)
++  *     goto out;
++  *   prog = array->ptrs[index];
++  *   if (prog == NULL)
++  *     goto out;
++  *   goto *(prog->bpf_func + prologue_size);
++  * out:
++  */
++ static void emit_bpf_tail_call(u8 **pprog)
++ {
++ 	u8 *prog = *pprog;
++ 	int label1, label2, label3;
++ 	int cnt = 0;
++ 
++ 	/* rdi - pointer to ctx
++ 	 * rsi - pointer to bpf_array
++ 	 * rdx - index in bpf_array
++ 	 */
++ 
++ 	/* if (index >= array->map.max_entries)
++ 	 *   goto out;
++ 	 */
++ 	EMIT2(0x89, 0xD2);                        /* mov edx, edx */
++ 	EMIT3(0x39, 0x56,                         /* cmp dword ptr [rsi + 16], edx */
++ 	      offsetof(struct bpf_array, map.max_entries));
++ #define OFFSET1 43 /* number of bytes to jump */
++ 	EMIT2(X86_JBE, OFFSET1);                  /* jbe out */
++ 	label1 = cnt;
++ 
++ 	/* if (tail_call_cnt > MAX_TAIL_CALL_CNT)
++ 	 *   goto out;
++ 	 */
++ 	EMIT2_off32(0x8B, 0x85, 36);              /* mov eax, dword ptr [rbp + 36] */
++ 	EMIT3(0x83, 0xF8, MAX_TAIL_CALL_CNT);     /* cmp eax, MAX_TAIL_CALL_CNT */
++ #define OFFSET2 32
++ 	EMIT2(X86_JA, OFFSET2);                   /* ja out */
++ 	label2 = cnt;
++ 	EMIT3(0x83, 0xC0, 0x01);                  /* add eax, 1 */
++ 	EMIT2_off32(0x89, 0x85, 36);              /* mov dword ptr [rbp + 36], eax */
++ 
++ 	/* prog = array->ptrs[index]; */
++ 	EMIT4_off32(0x48, 0x8B, 0x84, 0xD6,       /* mov rax, [rsi + rdx * 8 + offsetof(...)] */
++ 		    offsetof(struct bpf_array, ptrs));
++ 
++ 	/* if (prog == NULL)
++ 	 *   goto out;
++ 	 */
++ 	EMIT3(0x48, 0x85, 0xC0);		  /* test rax,rax */
++ #define OFFSET3 10
++ 	EMIT2(X86_JE, OFFSET3);                   /* je out */
++ 	label3 = cnt;
++ 
++ 	/* goto *(prog->bpf_func + prologue_size); */
++ 	EMIT4(0x48, 0x8B, 0x40,                   /* mov rax, qword ptr [rax + 32] */
++ 	      offsetof(struct bpf_prog, bpf_func));
++ 	EMIT4(0x48, 0x83, 0xC0, PROLOGUE_SIZE);   /* add rax, prologue_size */
++ 
++ 	/* now we're ready to jump into next BPF program
++ 	 * rdi == ctx (1st arg)
++ 	 * rax == prog->bpf_func + prologue_size
++ 	 */
++ 	EMIT2(0xFF, 0xE0);                        /* jmp rax */
++ 
++ 	/* out: */
++ 	BUILD_BUG_ON(cnt - label1 != OFFSET1);
++ 	BUILD_BUG_ON(cnt - label2 != OFFSET2);
++ 	BUILD_BUG_ON(cnt - label3 != OFFSET3);
++ 	*pprog = prog;
++ }
++ 
++ 
++ static void emit_load_skb_data_hlen(u8 **pprog)
++ {
++ 	u8 *prog = *pprog;
++ 	int cnt = 0;
++ 
++ 	/* r9d = skb->len - skb->data_len (headlen)
++ 	 * r10 = skb->data
++ 	 */
++ 	/* mov %r9d, off32(%rdi) */
++ 	EMIT3_off32(0x44, 0x8b, 0x8f, offsetof(struct sk_buff, len));
++ 
++ 	/* sub %r9d, off32(%rdi) */
++ 	EMIT3_off32(0x44, 0x2b, 0x8f, offsetof(struct sk_buff, data_len));
++ 
++ 	/* mov %r10, off32(%rdi) */
++ 	EMIT3_off32(0x4c, 0x8b, 0x97, offsetof(struct sk_buff, data));
++ 	*pprog = prog;
++ }
++ 
++ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,
++ 		  int oldproglen, struct jit_context *ctx)
++ {
++ 	struct bpf_insn *insn = bpf_prog->insnsi;
++ 	int insn_cnt = bpf_prog->len;
++ 	bool seen_ld_abs = ctx->seen_ld_abs | (oldproglen == 0);
++ 	bool seen_ax_reg = ctx->seen_ax_reg | (oldproglen == 0);
++ 	bool seen_exit = false;
++ 	u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];
++ 	int i, cnt = 0;
++ 	int proglen = 0;
++ 	u8 *prog = temp;
++ 
++ 	emit_prologue(&prog, bpf_prog->aux->stack_depth);
++ 
++ 	if (seen_ld_abs)
++ 		emit_load_skb_data_hlen(&prog);
++ 
++ 	for (i = 0; i < insn_cnt; i++, insn++) {
++ 		const s32 imm32 = insn->imm;
++ 		u32 dst_reg = insn->dst_reg;
++ 		u32 src_reg = insn->src_reg;
++ 		u8 b1 = 0, b2 = 0, b3 = 0;
++ 		s64 jmp_offset;
++ 		u8 jmp_cond;
++ 		bool reload_skb_data;
++ 		int ilen;
++ 		u8 *func;
++ 
++ 		if (dst_reg == BPF_REG_AX || src_reg == BPF_REG_AX)
++ 			ctx->seen_ax_reg = seen_ax_reg = true;
++ 
++ 		switch (insn->code) {
++ 			/* ALU */
++ 		case BPF_ALU | BPF_ADD | BPF_X:
++ 		case BPF_ALU | BPF_SUB | BPF_X:
++ 		case BPF_ALU | BPF_AND | BPF_X:
++ 		case BPF_ALU | BPF_OR | BPF_X:
++ 		case BPF_ALU | BPF_XOR | BPF_X:
++ 		case BPF_ALU64 | BPF_ADD | BPF_X:
++ 		case BPF_ALU64 | BPF_SUB | BPF_X:
++ 		case BPF_ALU64 | BPF_AND | BPF_X:
++ 		case BPF_ALU64 | BPF_OR | BPF_X:
++ 		case BPF_ALU64 | BPF_XOR | BPF_X:
++ 			switch (BPF_OP(insn->code)) {
++ 			case BPF_ADD: b2 = 0x01; break;
++ 			case BPF_SUB: b2 = 0x29; break;
++ 			case BPF_AND: b2 = 0x21; break;
++ 			case BPF_OR: b2 = 0x09; break;
++ 			case BPF_XOR: b2 = 0x31; break;
++ 			}
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				EMIT1(add_2mod(0x48, dst_reg, src_reg));
++ 			else if (is_ereg(dst_reg) || is_ereg(src_reg))
++ 				EMIT1(add_2mod(0x40, dst_reg, src_reg));
++ 			EMIT2(b2, add_2reg(0xC0, dst_reg, src_reg));
++ 			break;
++ 
++ 			/* mov dst, src */
++ 		case BPF_ALU64 | BPF_MOV | BPF_X:
++ 			EMIT_mov(dst_reg, src_reg);
++ 			break;
++ 
++ 			/* mov32 dst, src */
++ 		case BPF_ALU | BPF_MOV | BPF_X:
++ 			if (is_ereg(dst_reg) || is_ereg(src_reg))
++ 				EMIT1(add_2mod(0x40, dst_reg, src_reg));
++ 			EMIT2(0x89, add_2reg(0xC0, dst_reg, src_reg));
++ 			break;
++ 
++ 			/* neg dst */
++ 		case BPF_ALU | BPF_NEG:
++ 		case BPF_ALU64 | BPF_NEG:
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				EMIT1(add_1mod(0x48, dst_reg));
++ 			else if (is_ereg(dst_reg))
++ 				EMIT1(add_1mod(0x40, dst_reg));
++ 			EMIT2(0xF7, add_1reg(0xD8, dst_reg));
++ 			break;
++ 
++ 		case BPF_ALU | BPF_ADD | BPF_K:
++ 		case BPF_ALU | BPF_SUB | BPF_K:
++ 		case BPF_ALU | BPF_AND | BPF_K:
++ 		case BPF_ALU | BPF_OR | BPF_K:
++ 		case BPF_ALU | BPF_XOR | BPF_K:
++ 		case BPF_ALU64 | BPF_ADD | BPF_K:
++ 		case BPF_ALU64 | BPF_SUB | BPF_K:
++ 		case BPF_ALU64 | BPF_AND | BPF_K:
++ 		case BPF_ALU64 | BPF_OR | BPF_K:
++ 		case BPF_ALU64 | BPF_XOR | BPF_K:
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				EMIT1(add_1mod(0x48, dst_reg));
++ 			else if (is_ereg(dst_reg))
++ 				EMIT1(add_1mod(0x40, dst_reg));
++ 
++ 			switch (BPF_OP(insn->code)) {
++ 			case BPF_ADD: b3 = 0xC0; break;
++ 			case BPF_SUB: b3 = 0xE8; break;
++ 			case BPF_AND: b3 = 0xE0; break;
++ 			case BPF_OR: b3 = 0xC8; break;
++ 			case BPF_XOR: b3 = 0xF0; break;
++ 			}
++ 
++ 			if (is_imm8(imm32))
++ 				EMIT3(0x83, add_1reg(b3, dst_reg), imm32);
++ 			else
++ 				EMIT2_off32(0x81, add_1reg(b3, dst_reg), imm32);
++ 			break;
++ 
++ 		case BPF_ALU64 | BPF_MOV | BPF_K:
++ 			/* optimization: if imm32 is positive,
++ 			 * use 'mov eax, imm32' (which zero-extends imm32)
++ 			 * to save 2 bytes
++ 			 */
++ 			if (imm32 < 0) {
++ 				/* 'mov rax, imm32' sign extends imm32 */
++ 				b1 = add_1mod(0x48, dst_reg);
++ 				b2 = 0xC7;
++ 				b3 = 0xC0;
++ 				EMIT3_off32(b1, b2, add_1reg(b3, dst_reg), imm32);
++ 				break;
++ 			}
++ 
++ 		case BPF_ALU | BPF_MOV | BPF_K:
++ 			/* optimization: if imm32 is zero, use 'xor <dst>,<dst>'
++ 			 * to save 3 bytes.
++ 			 */
++ 			if (imm32 == 0) {
++ 				if (is_ereg(dst_reg))
++ 					EMIT1(add_2mod(0x40, dst_reg, dst_reg));
++ 				b2 = 0x31; /* xor */
++ 				b3 = 0xC0;
++ 				EMIT2(b2, add_2reg(b3, dst_reg, dst_reg));
++ 				break;
++ 			}
++ 
++ 			/* mov %eax, imm32 */
++ 			if (is_ereg(dst_reg))
++ 				EMIT1(add_1mod(0x40, dst_reg));
++ 			EMIT1_off32(add_1reg(0xB8, dst_reg), imm32);
++ 			break;
++ 
++ 		case BPF_LD | BPF_IMM | BPF_DW:
++ 			/* optimization: if imm64 is zero, use 'xor <dst>,<dst>'
++ 			 * to save 7 bytes.
++ 			 */
++ 			if (insn[0].imm == 0 && insn[1].imm == 0) {
++ 				b1 = add_2mod(0x48, dst_reg, dst_reg);
++ 				b2 = 0x31; /* xor */
++ 				b3 = 0xC0;
++ 				EMIT3(b1, b2, add_2reg(b3, dst_reg, dst_reg));
++ 
++ 				insn++;
++ 				i++;
++ 				break;
++ 			}
++ 
++ 			/* movabsq %rax, imm64 */
++ 			EMIT2(add_1mod(0x48, dst_reg), add_1reg(0xB8, dst_reg));
++ 			EMIT(insn[0].imm, 4);
++ 			EMIT(insn[1].imm, 4);
++ 
++ 			insn++;
++ 			i++;
++ 			break;
++ 
++ 			/* dst %= src, dst /= src, dst %= imm32, dst /= imm32 */
++ 		case BPF_ALU | BPF_MOD | BPF_X:
++ 		case BPF_ALU | BPF_DIV | BPF_X:
++ 		case BPF_ALU | BPF_MOD | BPF_K:
++ 		case BPF_ALU | BPF_DIV | BPF_K:
++ 		case BPF_ALU64 | BPF_MOD | BPF_X:
++ 		case BPF_ALU64 | BPF_DIV | BPF_X:
++ 		case BPF_ALU64 | BPF_MOD | BPF_K:
++ 		case BPF_ALU64 | BPF_DIV | BPF_K:
++ 			EMIT1(0x50); /* push rax */
++ 			EMIT1(0x52); /* push rdx */
++ 
++ 			if (BPF_SRC(insn->code) == BPF_X)
++ 				/* mov r11, src_reg */
++ 				EMIT_mov(AUX_REG, src_reg);
++ 			else
++ 				/* mov r11, imm32 */
++ 				EMIT3_off32(0x49, 0xC7, 0xC3, imm32);
++ 
++ 			/* mov rax, dst_reg */
++ 			EMIT_mov(BPF_REG_0, dst_reg);
++ 
++ 			/* xor edx, edx
++ 			 * equivalent to 'xor rdx, rdx', but one byte less
++ 			 */
++ 			EMIT2(0x31, 0xd2);
++ 
++ 			if (BPF_SRC(insn->code) == BPF_X) {
++ 				/* if (src_reg == 0) return 0 */
++ 
++ 				/* cmp r11, 0 */
++ 				EMIT4(0x49, 0x83, 0xFB, 0x00);
++ 
++ 				/* jne .+9 (skip over pop, pop, xor and jmp) */
++ 				EMIT2(X86_JNE, 1 + 1 + 2 + 5);
++ 				EMIT1(0x5A); /* pop rdx */
++ 				EMIT1(0x58); /* pop rax */
++ 				EMIT2(0x31, 0xc0); /* xor eax, eax */
++ 
++ 				/* jmp cleanup_addr
++ 				 * addrs[i] - 11, because there are 11 bytes
++ 				 * after this insn: div, mov, pop, pop, mov
++ 				 */
++ 				jmp_offset = ctx->cleanup_addr - (addrs[i] - 11);
++ 				EMIT1_off32(0xE9, jmp_offset);
++ 			}
++ 
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				/* div r11 */
++ 				EMIT3(0x49, 0xF7, 0xF3);
++ 			else
++ 				/* div r11d */
++ 				EMIT3(0x41, 0xF7, 0xF3);
++ 
++ 			if (BPF_OP(insn->code) == BPF_MOD)
++ 				/* mov r11, rdx */
++ 				EMIT3(0x49, 0x89, 0xD3);
++ 			else
++ 				/* mov r11, rax */
++ 				EMIT3(0x49, 0x89, 0xC3);
++ 
++ 			EMIT1(0x5A); /* pop rdx */
++ 			EMIT1(0x58); /* pop rax */
++ 
++ 			/* mov dst_reg, r11 */
++ 			EMIT_mov(dst_reg, AUX_REG);
++ 			break;
++ 
++ 		case BPF_ALU | BPF_MUL | BPF_K:
++ 		case BPF_ALU | BPF_MUL | BPF_X:
++ 		case BPF_ALU64 | BPF_MUL | BPF_K:
++ 		case BPF_ALU64 | BPF_MUL | BPF_X:
++ 			EMIT1(0x50); /* push rax */
++ 			EMIT1(0x52); /* push rdx */
++ 
++ 			/* mov r11, dst_reg */
++ 			EMIT_mov(AUX_REG, dst_reg);
++ 
++ 			if (BPF_SRC(insn->code) == BPF_X)
++ 				/* mov rax, src_reg */
++ 				EMIT_mov(BPF_REG_0, src_reg);
++ 			else
++ 				/* mov rax, imm32 */
++ 				EMIT3_off32(0x48, 0xC7, 0xC0, imm32);
++ 
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				EMIT1(add_1mod(0x48, AUX_REG));
++ 			else if (is_ereg(AUX_REG))
++ 				EMIT1(add_1mod(0x40, AUX_REG));
++ 			/* mul(q) r11 */
++ 			EMIT2(0xF7, add_1reg(0xE0, AUX_REG));
++ 
++ 			/* mov r11, rax */
++ 			EMIT_mov(AUX_REG, BPF_REG_0);
++ 
++ 			EMIT1(0x5A); /* pop rdx */
++ 			EMIT1(0x58); /* pop rax */
++ 
++ 			/* mov dst_reg, r11 */
++ 			EMIT_mov(dst_reg, AUX_REG);
++ 			break;
++ 
++ 			/* shifts */
++ 		case BPF_ALU | BPF_LSH | BPF_K:
++ 		case BPF_ALU | BPF_RSH | BPF_K:
++ 		case BPF_ALU | BPF_ARSH | BPF_K:
++ 		case BPF_ALU64 | BPF_LSH | BPF_K:
++ 		case BPF_ALU64 | BPF_RSH | BPF_K:
++ 		case BPF_ALU64 | BPF_ARSH | BPF_K:
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				EMIT1(add_1mod(0x48, dst_reg));
++ 			else if (is_ereg(dst_reg))
++ 				EMIT1(add_1mod(0x40, dst_reg));
++ 
++ 			switch (BPF_OP(insn->code)) {
++ 			case BPF_LSH: b3 = 0xE0; break;
++ 			case BPF_RSH: b3 = 0xE8; break;
++ 			case BPF_ARSH: b3 = 0xF8; break;
++ 			}
++ 			EMIT3(0xC1, add_1reg(b3, dst_reg), imm32);
++ 			break;
++ 
++ 		case BPF_ALU | BPF_LSH | BPF_X:
++ 		case BPF_ALU | BPF_RSH | BPF_X:
++ 		case BPF_ALU | BPF_ARSH | BPF_X:
++ 		case BPF_ALU64 | BPF_LSH | BPF_X:
++ 		case BPF_ALU64 | BPF_RSH | BPF_X:
++ 		case BPF_ALU64 | BPF_ARSH | BPF_X:
++ 
++ 			/* check for bad case when dst_reg == rcx */
++ 			if (dst_reg == BPF_REG_4) {
++ 				/* mov r11, dst_reg */
++ 				EMIT_mov(AUX_REG, dst_reg);
++ 				dst_reg = AUX_REG;
++ 			}
++ 
++ 			if (src_reg != BPF_REG_4) { /* common case */
++ 				EMIT1(0x51); /* push rcx */
++ 
++ 				/* mov rcx, src_reg */
++ 				EMIT_mov(BPF_REG_4, src_reg);
++ 			}
++ 
++ 			/* shl %rax, %cl | shr %rax, %cl | sar %rax, %cl */
++ 			if (BPF_CLASS(insn->code) == BPF_ALU64)
++ 				EMIT1(add_1mod(0x48, dst_reg));
++ 			else if (is_ereg(dst_reg))
++ 				EMIT1(add_1mod(0x40, dst_reg));
++ 
++ 			switch (BPF_OP(insn->code)) {
++ 			case BPF_LSH: b3 = 0xE0; break;
++ 			case BPF_RSH: b3 = 0xE8; break;
++ 			case BPF_ARSH: b3 = 0xF8; break;
++ 			}
++ 			EMIT2(0xD3, add_1reg(b3, dst_reg));
++ 
++ 			if (src_reg != BPF_REG_4)
++ 				EMIT1(0x59); /* pop rcx */
++ 
++ 			if (insn->dst_reg == BPF_REG_4)
++ 				/* mov dst_reg, r11 */
++ 				EMIT_mov(insn->dst_reg, AUX_REG);
++ 			break;
++ 
++ 		case BPF_ALU | BPF_END | BPF_FROM_BE:
++ 			switch (imm32) {
++ 			case 16:
++ 				/* emit 'ror %ax, 8' to swap lower 2 bytes */
++ 				EMIT1(0x66);
++ 				if (is_ereg(dst_reg))
++ 					EMIT1(0x41);
++ 				EMIT3(0xC1, add_1reg(0xC8, dst_reg), 8);
++ 
++ 				/* emit 'movzwl eax, ax' */
++ 				if (is_ereg(dst_reg))
++ 					EMIT3(0x45, 0x0F, 0xB7);
++ 				else
++ 					EMIT2(0x0F, 0xB7);
++ 				EMIT1(add_2reg(0xC0, dst_reg, dst_reg));
++ 				break;
++ 			case 32:
++ 				/* emit 'bswap eax' to swap lower 4 bytes */
++ 				if (is_ereg(dst_reg))
++ 					EMIT2(0x41, 0x0F);
++ 				else
++ 					EMIT1(0x0F);
++ 				EMIT1(add_1reg(0xC8, dst_reg));
++ 				break;
++ 			case 64:
++ 				/* emit 'bswap rax' to swap 8 bytes */
++ 				EMIT3(add_1mod(0x48, dst_reg), 0x0F,
++ 				      add_1reg(0xC8, dst_reg));
++ 				break;
++ 			}
++ 			break;
++ 
++ 		case BPF_ALU | BPF_END | BPF_FROM_LE:
++ 			switch (imm32) {
++ 			case 16:
++ 				/* emit 'movzwl eax, ax' to zero extend 16-bit
++ 				 * into 64 bit
++ 				 */
++ 				if (is_ereg(dst_reg))
++ 					EMIT3(0x45, 0x0F, 0xB7);
++ 				else
++ 					EMIT2(0x0F, 0xB7);
++ 				EMIT1(add_2reg(0xC0, dst_reg, dst_reg));
++ 				break;
++ 			case 32:
++ 				/* emit 'mov eax, eax' to clear upper 32-bits */
++ 				if (is_ereg(dst_reg))
++ 					EMIT1(0x45);
++ 				EMIT2(0x89, add_2reg(0xC0, dst_reg, dst_reg));
++ 				break;
++ 			case 64:
++ 				/* nop */
++ 				break;
++ 			}
++ 			break;
++ 
++ 			/* ST: *(u8*)(dst_reg + off) = imm */
++ 		case BPF_ST | BPF_MEM | BPF_B:
++ 			if (is_ereg(dst_reg))
++ 				EMIT2(0x41, 0xC6);
++ 			else
++ 				EMIT1(0xC6);
++ 			goto st;
++ 		case BPF_ST | BPF_MEM | BPF_H:
++ 			if (is_ereg(dst_reg))
++ 				EMIT3(0x66, 0x41, 0xC7);
++ 			else
++ 				EMIT2(0x66, 0xC7);
++ 			goto st;
++ 		case BPF_ST | BPF_MEM | BPF_W:
++ 			if (is_ereg(dst_reg))
++ 				EMIT2(0x41, 0xC7);
++ 			else
++ 				EMIT1(0xC7);
++ 			goto st;
++ 		case BPF_ST | BPF_MEM | BPF_DW:
++ 			EMIT2(add_1mod(0x48, dst_reg), 0xC7);
++ 
++ st:			if (is_imm8(insn->off))
++ 				EMIT2(add_1reg(0x40, dst_reg), insn->off);
++ 			else
++ 				EMIT1_off32(add_1reg(0x80, dst_reg), insn->off);
++ 
++ 			EMIT(imm32, bpf_size_to_x86_bytes(BPF_SIZE(insn->code)));
++ 			break;
++ 
++ 			/* STX: *(u8*)(dst_reg + off) = src_reg */
++ 		case BPF_STX | BPF_MEM | BPF_B:
++ 			/* emit 'mov byte ptr [rax + off], al' */
++ 			if (is_ereg(dst_reg) || is_ereg(src_reg) ||
++ 			    /* have to add extra byte for x86 SIL, DIL regs */
++ 			    src_reg == BPF_REG_1 || src_reg == BPF_REG_2)
++ 				EMIT2(add_2mod(0x40, dst_reg, src_reg), 0x88);
++ 			else
++ 				EMIT1(0x88);
++ 			goto stx;
++ 		case BPF_STX | BPF_MEM | BPF_H:
++ 			if (is_ereg(dst_reg) || is_ereg(src_reg))
++ 				EMIT3(0x66, add_2mod(0x40, dst_reg, src_reg), 0x89);
++ 			else
++ 				EMIT2(0x66, 0x89);
++ 			goto stx;
++ 		case BPF_STX | BPF_MEM | BPF_W:
++ 			if (is_ereg(dst_reg) || is_ereg(src_reg))
++ 				EMIT2(add_2mod(0x40, dst_reg, src_reg), 0x89);
++ 			else
++ 				EMIT1(0x89);
++ 			goto stx;
++ 		case BPF_STX | BPF_MEM | BPF_DW:
++ 			EMIT2(add_2mod(0x48, dst_reg, src_reg), 0x89);
++ stx:			if (is_imm8(insn->off))
++ 				EMIT2(add_2reg(0x40, dst_reg, src_reg), insn->off);
++ 			else
++ 				EMIT1_off32(add_2reg(0x80, dst_reg, src_reg),
++ 					    insn->off);
++ 			break;
++ 
++ 			/* LDX: dst_reg = *(u8*)(src_reg + off) */
++ 		case BPF_LDX | BPF_MEM | BPF_B:
++ 			/* emit 'movzx rax, byte ptr [rax + off]' */
++ 			EMIT3(add_2mod(0x48, src_reg, dst_reg), 0x0F, 0xB6);
++ 			goto ldx;
++ 		case BPF_LDX | BPF_MEM | BPF_H:
++ 			/* emit 'movzx rax, word ptr [rax + off]' */
++ 			EMIT3(add_2mod(0x48, src_reg, dst_reg), 0x0F, 0xB7);
++ 			goto ldx;
++ 		case BPF_LDX | BPF_MEM | BPF_W:
++ 			/* emit 'mov eax, dword ptr [rax+0x14]' */
++ 			if (is_ereg(dst_reg) || is_ereg(src_reg))
++ 				EMIT2(add_2mod(0x40, src_reg, dst_reg), 0x8B);
++ 			else
++ 				EMIT1(0x8B);
++ 			goto ldx;
++ 		case BPF_LDX | BPF_MEM | BPF_DW:
++ 			/* emit 'mov rax, qword ptr [rax+0x14]' */
++ 			EMIT2(add_2mod(0x48, src_reg, dst_reg), 0x8B);
++ ldx:			/* if insn->off == 0 we can save one extra byte, but
++ 			 * special case of x86 r13 which always needs an offset
++ 			 * is not worth the hassle
++ 			 */
++ 			if (is_imm8(insn->off))
++ 				EMIT2(add_2reg(0x40, src_reg, dst_reg), insn->off);
++ 			else
++ 				EMIT1_off32(add_2reg(0x80, src_reg, dst_reg),
++ 					    insn->off);
++ 			break;
++ 
++ 			/* STX XADD: lock *(u32*)(dst_reg + off) += src_reg */
++ 		case BPF_STX | BPF_XADD | BPF_W:
++ 			/* emit 'lock add dword ptr [rax + off], eax' */
++ 			if (is_ereg(dst_reg) || is_ereg(src_reg))
++ 				EMIT3(0xF0, add_2mod(0x40, dst_reg, src_reg), 0x01);
++ 			else
++ 				EMIT2(0xF0, 0x01);
++ 			goto xadd;
++ 		case BPF_STX | BPF_XADD | BPF_DW:
++ 			EMIT3(0xF0, add_2mod(0x48, dst_reg, src_reg), 0x01);
++ xadd:			if (is_imm8(insn->off))
++ 				EMIT2(add_2reg(0x40, dst_reg, src_reg), insn->off);
++ 			else
++ 				EMIT1_off32(add_2reg(0x80, dst_reg, src_reg),
++ 					    insn->off);
++ 			break;
++ 
++ 			/* call */
++ 		case BPF_JMP | BPF_CALL:
++ 			func = (u8 *) __bpf_call_base + imm32;
++ 			jmp_offset = func - (image + addrs[i]);
++ 			if (seen_ld_abs) {
++ 				reload_skb_data = bpf_helper_changes_pkt_data(func);
++ 				if (reload_skb_data) {
++ 					EMIT1(0x57); /* push %rdi */
++ 					jmp_offset += 22; /* pop, mov, sub, mov */
++ 				} else {
++ 					EMIT2(0x41, 0x52); /* push %r10 */
++ 					EMIT2(0x41, 0x51); /* push %r9 */
++ 					/* need to adjust jmp offset, since
++ 					 * pop %r9, pop %r10 take 4 bytes after call insn
++ 					 */
++ 					jmp_offset += 4;
++ 				}
++ 			}
++ 			if (!imm32 || !is_simm32(jmp_offset)) {
++ 				pr_err("unsupported bpf func %d addr %p image %p\n",
++ 				       imm32, func, image);
++ 				return -EINVAL;
++ 			}
++ 			EMIT1_off32(0xE8, jmp_offset);
++ 			if (seen_ld_abs) {
++ 				if (reload_skb_data) {
++ 					EMIT1(0x5F); /* pop %rdi */
++ 					emit_load_skb_data_hlen(&prog);
++ 				} else {
++ 					EMIT2(0x41, 0x59); /* pop %r9 */
++ 					EMIT2(0x41, 0x5A); /* pop %r10 */
++ 				}
++ 			}
++ 			break;
++ 
++ 		case BPF_JMP | BPF_TAIL_CALL:
++ 			emit_bpf_tail_call(&prog);
++ 			break;
++ 
++ 			/* cond jump */
++ 		case BPF_JMP | BPF_JEQ | BPF_X:
++ 		case BPF_JMP | BPF_JNE | BPF_X:
++ 		case BPF_JMP | BPF_JGT | BPF_X:
++ 		case BPF_JMP | BPF_JLT | BPF_X:
++ 		case BPF_JMP | BPF_JGE | BPF_X:
++ 		case BPF_JMP | BPF_JLE | BPF_X:
++ 		case BPF_JMP | BPF_JSGT | BPF_X:
++ 		case BPF_JMP | BPF_JSLT | BPF_X:
++ 		case BPF_JMP | BPF_JSGE | BPF_X:
++ 		case BPF_JMP | BPF_JSLE | BPF_X:
++ 			/* cmp dst_reg, src_reg */
++ 			EMIT3(add_2mod(0x48, dst_reg, src_reg), 0x39,
++ 			      add_2reg(0xC0, dst_reg, src_reg));
++ 			goto emit_cond_jmp;
++ 
++ 		case BPF_JMP | BPF_JSET | BPF_X:
++ 			/* test dst_reg, src_reg */
++ 			EMIT3(add_2mod(0x48, dst_reg, src_reg), 0x85,
++ 			      add_2reg(0xC0, dst_reg, src_reg));
++ 			goto emit_cond_jmp;
++ 
++ 		case BPF_JMP | BPF_JSET | BPF_K:
++ 			/* test dst_reg, imm32 */
++ 			EMIT1(add_1mod(0x48, dst_reg));
++ 			EMIT2_off32(0xF7, add_1reg(0xC0, dst_reg), imm32);
++ 			goto emit_cond_jmp;
++ 
++ 		case BPF_JMP | BPF_JEQ | BPF_K:
++ 		case BPF_JMP | BPF_JNE | BPF_K:
++ 		case BPF_JMP | BPF_JGT | BPF_K:
++ 		case BPF_JMP | BPF_JLT | BPF_K:
++ 		case BPF_JMP | BPF_JGE | BPF_K:
++ 		case BPF_JMP | BPF_JLE | BPF_K:
++ 		case BPF_JMP | BPF_JSGT | BPF_K:
++ 		case BPF_JMP | BPF_JSLT | BPF_K:
++ 		case BPF_JMP | BPF_JSGE | BPF_K:
++ 		case BPF_JMP | BPF_JSLE | BPF_K:
++ 			/* cmp dst_reg, imm8/32 */
++ 			EMIT1(add_1mod(0x48, dst_reg));
++ 
++ 			if (is_imm8(imm32))
++ 				EMIT3(0x83, add_1reg(0xF8, dst_reg), imm32);
++ 			else
++ 				EMIT2_off32(0x81, add_1reg(0xF8, dst_reg), imm32);
++ 
++ emit_cond_jmp:		/* convert BPF opcode to x86 */
++ 			switch (BPF_OP(insn->code)) {
++ 			case BPF_JEQ:
++ 				jmp_cond = X86_JE;
++ 				break;
++ 			case BPF_JSET:
++ 			case BPF_JNE:
++ 				jmp_cond = X86_JNE;
++ 				break;
++ 			case BPF_JGT:
++ 				/* GT is unsigned '>', JA in x86 */
++ 				jmp_cond = X86_JA;
++ 				break;
++ 			case BPF_JLT:
++ 				/* LT is unsigned '<', JB in x86 */
++ 				jmp_cond = X86_JB;
++ 				break;
++ 			case BPF_JGE:
++ 				/* GE is unsigned '>=', JAE in x86 */
++ 				jmp_cond = X86_JAE;
++ 				break;
++ 			case BPF_JLE:
++ 				/* LE is unsigned '<=', JBE in x86 */
++ 				jmp_cond = X86_JBE;
++ 				break;
++ 			case BPF_JSGT:
++ 				/* signed '>', GT in x86 */
++ 				jmp_cond = X86_JG;
++ 				break;
++ 			case BPF_JSLT:
++ 				/* signed '<', LT in x86 */
++ 				jmp_cond = X86_JL;
++ 				break;
++ 			case BPF_JSGE:
++ 				/* signed '>=', GE in x86 */
++ 				jmp_cond = X86_JGE;
++ 				break;
++ 			case BPF_JSLE:
++ 				/* signed '<=', LE in x86 */
++ 				jmp_cond = X86_JLE;
++ 				break;
++ 			default: /* to silence gcc warning */
++ 				return -EFAULT;
++ 			}
++ 			jmp_offset = addrs[i + insn->off] - addrs[i];
++ 			if (is_imm8(jmp_offset)) {
++ 				EMIT2(jmp_cond, jmp_offset);
++ 			} else if (is_simm32(jmp_offset)) {
++ 				EMIT2_off32(0x0F, jmp_cond + 0x10, jmp_offset);
++ 			} else {
++ 				pr_err("cond_jmp gen bug %llx\n", jmp_offset);
++ 				return -EFAULT;
++ 			}
++ 
++ 			break;
++ 
++ 		case BPF_JMP | BPF_JA:
++ 			jmp_offset = addrs[i + insn->off] - addrs[i];
++ 			if (!jmp_offset)
++ 				/* optimize out nop jumps */
++ 				break;
++ emit_jmp:
++ 			if (is_imm8(jmp_offset)) {
++ 				EMIT2(0xEB, jmp_offset);
++ 			} else if (is_simm32(jmp_offset)) {
++ 				EMIT1_off32(0xE9, jmp_offset);
++ 			} else {
++ 				pr_err("jmp gen bug %llx\n", jmp_offset);
++ 				return -EFAULT;
++ 			}
++ 			break;
++ 
++ 		case BPF_LD | BPF_IND | BPF_W:
++ 			func = sk_load_word;
++ 			goto common_load;
++ 		case BPF_LD | BPF_ABS | BPF_W:
++ 			func = CHOOSE_LOAD_FUNC(imm32, sk_load_word);
++ common_load:
++ 			ctx->seen_ld_abs = seen_ld_abs = true;
++ 			jmp_offset = func - (image + addrs[i]);
++ 			if (!func || !is_simm32(jmp_offset)) {
++ 				pr_err("unsupported bpf func %d addr %p image %p\n",
++ 				       imm32, func, image);
++ 				return -EINVAL;
++ 			}
++ 			if (BPF_MODE(insn->code) == BPF_ABS) {
++ 				/* mov %esi, imm32 */
++ 				EMIT1_off32(0xBE, imm32);
++ 			} else {
++ 				/* mov %rsi, src_reg */
++ 				EMIT_mov(BPF_REG_2, src_reg);
++ 				if (imm32) {
++ 					if (is_imm8(imm32))
++ 						/* add %esi, imm8 */
++ 						EMIT3(0x83, 0xC6, imm32);
++ 					else
++ 						/* add %esi, imm32 */
++ 						EMIT2_off32(0x81, 0xC6, imm32);
++ 				}
++ 			}
++ 			/* skb pointer is in R6 (%rbx), it will be copied into
++ 			 * %rdi if skb_copy_bits() call is necessary.
++ 			 * sk_load_* helpers also use %r10 and %r9d.
++ 			 * See bpf_jit.S
++ 			 */
++ 			if (seen_ax_reg)
++ 				/* r10 = skb->data, mov %r10, off32(%rbx) */
++ 				EMIT3_off32(0x4c, 0x8b, 0x93,
++ 					    offsetof(struct sk_buff, data));
++ 			EMIT1_off32(0xE8, jmp_offset); /* call */
++ 			break;
++ 
++ 		case BPF_LD | BPF_IND | BPF_H:
++ 			func = sk_load_half;
++ 			goto common_load;
++ 		case BPF_LD | BPF_ABS | BPF_H:
++ 			func = CHOOSE_LOAD_FUNC(imm32, sk_load_half);
++ 			goto common_load;
++ 		case BPF_LD | BPF_IND | BPF_B:
++ 			func = sk_load_byte;
++ 			goto common_load;
++ 		case BPF_LD | BPF_ABS | BPF_B:
++ 			func = CHOOSE_LOAD_FUNC(imm32, sk_load_byte);
++ 			goto common_load;
++ 
++ 		case BPF_JMP | BPF_EXIT:
++ 			if (seen_exit) {
++ 				jmp_offset = ctx->cleanup_addr - addrs[i];
++ 				goto emit_jmp;
++ 			}
++ 			seen_exit = true;
++ 			/* update cleanup_addr */
++ 			ctx->cleanup_addr = proglen;
++ 			/* mov rbx, qword ptr [rbp+0] */
++ 			EMIT4(0x48, 0x8B, 0x5D, 0);
++ 			/* mov r13, qword ptr [rbp+8] */
++ 			EMIT4(0x4C, 0x8B, 0x6D, 8);
++ 			/* mov r14, qword ptr [rbp+16] */
++ 			EMIT4(0x4C, 0x8B, 0x75, 16);
++ 			/* mov r15, qword ptr [rbp+24] */
++ 			EMIT4(0x4C, 0x8B, 0x7D, 24);
++ 
++ 			/* add rbp, AUX_STACK_SPACE */
++ 			EMIT4(0x48, 0x83, 0xC5, AUX_STACK_SPACE);
++ 			EMIT1(0xC9); /* leave */
++ 			EMIT1(0xC3); /* ret */
++ 			break;
++ 
++ 		default:
++ 			/* By design x64 JIT should support all BPF instructions
++ 			 * This error will be seen if new instruction was added
++ 			 * to interpreter, but not to JIT
++ 			 * or if there is junk in bpf_prog
++ 			 */
++ 			pr_err("bpf_jit: unknown opcode %02x\n", insn->code);
++ 			return -EINVAL;
++ 		}
++ 
++ 		ilen = prog - temp;
++ 		if (ilen > BPF_MAX_INSN_SIZE) {
++ 			pr_err("bpf_jit: fatal insn size error\n");
++ 			return -EFAULT;
++ 		}
++ 
++ 		if (image) {
++ 			if (unlikely(proglen + ilen > oldproglen)) {
++ 				pr_err("bpf_jit: fatal error\n");
++ 				return -EFAULT;
++ 			}
++ 			memcpy(image + proglen, temp, ilen);
++ 		}
++ 		proglen += ilen;
++ 		addrs[i] = proglen;
++ 		prog = temp;
+++>>>>>>> 90caccdd8cc0 (bpf: fix bpf_tail_call() x64 JIT)
+  	}
+ -	return proglen;
+ +	pr_err_once("Please fix pkt_type_offset(), as pkt_type couldn't be found\n");
+ +	return -1;
+  }
+  
+ -struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ +void bpf_jit_compile(struct sk_filter *fp)
+  {
+ -	struct bpf_binary_header *header = NULL;
+ -	struct bpf_prog *tmp, *orig_prog = prog;
+ -	int proglen, oldproglen = 0;
+ -	struct jit_context ctx = {};
+ -	bool tmp_blinded = false;
+ +	u8 temp[64];
+ +	u8 *prog;
+ +	unsigned int proglen, oldproglen = 0;
+ +	int ilen, i;
+ +	int t_offset, f_offset;
+ +	u8 t_op, f_op, seen = 0, pass;
+  	u8 *image = NULL;
+ -	int *addrs;
+ -	int pass;
+ -	int i;
+ +	u8 *func;
+ +	int pc_ret0 = -1; /* bpf index of first RET #0 instruction (if any) */
+ +	unsigned int cleanup_addr; /* epilogue code offset */
+ +	unsigned int *addrs;
+ +	const struct sock_filter *filter = fp->insns;
+ +	int flen = fp->len;
+  
+  	if (!bpf_jit_enable)
+ -		return orig_prog;
+ +		return;
+  
+ -	tmp = bpf_jit_blind_constants(prog);
+ -	/* If blinding was requested and we failed during blinding,
+ -	 * we must fall back to the interpreter.
+ -	 */
+ -	if (IS_ERR(tmp))
+ -		return orig_prog;
+ -	if (tmp != prog) {
+ -		tmp_blinded = true;
+ -		prog = tmp;
+ -	}
+ -
+ -	addrs = kmalloc(prog->len * sizeof(*addrs), GFP_KERNEL);
+ -	if (!addrs) {
+ -		prog = orig_prog;
+ -		goto out;
+ -	}
+ +	addrs = kmalloc(flen * sizeof(*addrs), GFP_KERNEL);
+ +	if (addrs == NULL)
+ +		return;
+  
+  	/* Before first pass, make a rough estimation of addrs[]
+  	 * each bpf instruction is translated to less than 64 bytes
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,f90860d1f897..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -132,13 -197,577 +132,529 @@@ union bpf_attr 
+  			__aligned_u64 value;
+  			__aligned_u64 next_key;
+  		};
+ -		__u64		flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_LOAD command */
+ -		__u32		prog_type;	/* one of enum bpf_prog_type */
+ -		__u32		insn_cnt;
+ -		__aligned_u64	insns;
+ -		__aligned_u64	license;
+ -		__u32		log_level;	/* verbosity level of verifier */
+ -		__u32		log_size;	/* size of user buffer */
+ -		__aligned_u64	log_buf;	/* user supplied buffer */
+ -		__u32		kern_version;	/* checked when prog_type=kprobe */
+ -		__u32		prog_flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_OBJ_* commands */
+ -		__aligned_u64	pathname;
+ -		__u32		bpf_fd;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_ATTACH/DETACH commands */
+ -		__u32		target_fd;	/* container object to attach to */
+ -		__u32		attach_bpf_fd;	/* eBPF program to attach */
+ -		__u32		attach_type;
+ -		__u32		attach_flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_TEST_RUN command */
+ -		__u32		prog_fd;
+ -		__u32		retval;
+ -		__u32		data_size_in;
+ -		__u32		data_size_out;
+ -		__aligned_u64	data_in;
+ -		__aligned_u64	data_out;
+ -		__u32		repeat;
+ -		__u32		duration;
+ -	} test;
+ -
+ -	struct { /* anonymous struct used by BPF_*_GET_*_ID */
+ -		union {
+ -			__u32		start_id;
+ -			__u32		prog_id;
+ -			__u32		map_id;
+ -		};
+ -		__u32		next_id;
+  	};
+ -
+ -	struct { /* anonymous struct used by BPF_OBJ_GET_INFO_BY_FD */
+ -		__u32		bpf_fd;
+ -		__u32		info_len;
+ -		__aligned_u64	info;
+ -	} info;
+  } __attribute__((aligned(8)));
+  
+++<<<<<<< HEAD
+++=======
++ /* BPF helper function descriptions:
++  *
++  * void *bpf_map_lookup_elem(&map, &key)
++  *     Return: Map value or NULL
++  *
++  * int bpf_map_update_elem(&map, &key, &value, flags)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_map_delete_elem(&map, &key)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_probe_read(void *dst, int size, void *src)
++  *     Return: 0 on success or negative error
++  *
++  * u64 bpf_ktime_get_ns(void)
++  *     Return: current ktime
++  *
++  * int bpf_trace_printk(const char *fmt, int fmt_size, ...)
++  *     Return: length of buffer written or negative error
++  *
++  * u32 bpf_prandom_u32(void)
++  *     Return: random value
++  *
++  * u32 bpf_raw_smp_processor_id(void)
++  *     Return: SMP processor ID
++  *
++  * int bpf_skb_store_bytes(skb, offset, from, len, flags)
++  *     store bytes into packet
++  *     @skb: pointer to skb
++  *     @offset: offset within packet from skb->mac_header
++  *     @from: pointer where to copy bytes from
++  *     @len: number of bytes to store into packet
++  *     @flags: bit 0 - if true, recompute skb->csum
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_l3_csum_replace(skb, offset, from, to, flags)
++  *     recompute IP checksum
++  *     @skb: pointer to skb
++  *     @offset: offset within packet where IP checksum is located
++  *     @from: old value of header field
++  *     @to: new value of header field
++  *     @flags: bits 0-3 - size of header field
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_l4_csum_replace(skb, offset, from, to, flags)
++  *     recompute TCP/UDP checksum
++  *     @skb: pointer to skb
++  *     @offset: offset within packet where TCP/UDP checksum is located
++  *     @from: old value of header field
++  *     @to: new value of header field
++  *     @flags: bits 0-3 - size of header field
++  *             bit 4 - is pseudo header
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_tail_call(ctx, prog_array_map, index)
++  *     jump into another BPF program
++  *     @ctx: context pointer passed to next program
++  *     @prog_array_map: pointer to map which type is BPF_MAP_TYPE_PROG_ARRAY
++  *     @index: 32-bit index inside array that selects specific program to run
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_clone_redirect(skb, ifindex, flags)
++  *     redirect to another netdev
++  *     @skb: pointer to skb
++  *     @ifindex: ifindex of the net device
++  *     @flags: bit 0 - if set, redirect to ingress instead of egress
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * u64 bpf_get_current_pid_tgid(void)
++  *     Return: current->tgid << 32 | current->pid
++  *
++  * u64 bpf_get_current_uid_gid(void)
++  *     Return: current_gid << 32 | current_uid
++  *
++  * int bpf_get_current_comm(char *buf, int size_of_buf)
++  *     stores current->comm into buf
++  *     Return: 0 on success or negative error
++  *
++  * u32 bpf_get_cgroup_classid(skb)
++  *     retrieve a proc's classid
++  *     @skb: pointer to skb
++  *     Return: classid if != 0
++  *
++  * int bpf_skb_vlan_push(skb, vlan_proto, vlan_tci)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_vlan_pop(skb)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_get_tunnel_key(skb, key, size, flags)
++  * int bpf_skb_set_tunnel_key(skb, key, size, flags)
++  *     retrieve or populate tunnel metadata
++  *     @skb: pointer to skb
++  *     @key: pointer to 'struct bpf_tunnel_key'
++  *     @size: size of 'struct bpf_tunnel_key'
++  *     @flags: room for future extensions
++  *     Return: 0 on success or negative error
++  *
++  * u64 bpf_perf_event_read(map, flags)
++  *     read perf event counter value
++  *     @map: pointer to perf_event_array map
++  *     @flags: index of event in the map or bitmask flags
++  *     Return: value of perf event counter read or error code
++  *
++  * int bpf_redirect(ifindex, flags)
++  *     redirect to another netdev
++  *     @ifindex: ifindex of the net device
++  *     @flags:
++  *	  cls_bpf:
++  *          bit 0 - if set, redirect to ingress instead of egress
++  *          other bits - reserved
++  *	  xdp_bpf:
++  *	    all bits - reserved
++  *     Return: cls_bpf: TC_ACT_REDIRECT on success or TC_ACT_SHOT on error
++  *	       xdp_bfp: XDP_REDIRECT on success or XDP_ABORT on error
++  * int bpf_redirect_map(map, key, flags)
++  *     redirect to endpoint in map
++  *     @map: pointer to dev map
++  *     @key: index in map to lookup
++  *     @flags: --
++  *     Return: XDP_REDIRECT on success or XDP_ABORT on error
++  *
++  * u32 bpf_get_route_realm(skb)
++  *     retrieve a dst's tclassid
++  *     @skb: pointer to skb
++  *     Return: realm if != 0
++  *
++  * int bpf_perf_event_output(ctx, map, flags, data, size)
++  *     output perf raw sample
++  *     @ctx: struct pt_regs*
++  *     @map: pointer to perf_event_array map
++  *     @flags: index of event in the map or bitmask flags
++  *     @data: data on stack to be output as raw data
++  *     @size: size of data
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_get_stackid(ctx, map, flags)
++  *     walk user or kernel stack and return id
++  *     @ctx: struct pt_regs*
++  *     @map: pointer to stack_trace map
++  *     @flags: bits 0-7 - numer of stack frames to skip
++  *             bit 8 - collect user stack instead of kernel
++  *             bit 9 - compare stacks by hash only
++  *             bit 10 - if two different stacks hash into the same stackid
++  *                      discard old
++  *             other bits - reserved
++  *     Return: >= 0 stackid on success or negative error
++  *
++  * s64 bpf_csum_diff(from, from_size, to, to_size, seed)
++  *     calculate csum diff
++  *     @from: raw from buffer
++  *     @from_size: length of from buffer
++  *     @to: raw to buffer
++  *     @to_size: length of to buffer
++  *     @seed: optional seed
++  *     Return: csum result or negative error code
++  *
++  * int bpf_skb_get_tunnel_opt(skb, opt, size)
++  *     retrieve tunnel options metadata
++  *     @skb: pointer to skb
++  *     @opt: pointer to raw tunnel option data
++  *     @size: size of @opt
++  *     Return: option size
++  *
++  * int bpf_skb_set_tunnel_opt(skb, opt, size)
++  *     populate tunnel options metadata
++  *     @skb: pointer to skb
++  *     @opt: pointer to raw tunnel option data
++  *     @size: size of @opt
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_change_proto(skb, proto, flags)
++  *     Change protocol of the skb. Currently supported is v4 -> v6,
++  *     v6 -> v4 transitions. The helper will also resize the skb. eBPF
++  *     program is expected to fill the new headers via skb_store_bytes
++  *     and lX_csum_replace.
++  *     @skb: pointer to skb
++  *     @proto: new skb->protocol type
++  *     @flags: reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_change_type(skb, type)
++  *     Change packet type of skb.
++  *     @skb: pointer to skb
++  *     @type: new skb->pkt_type type
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_under_cgroup(skb, map, index)
++  *     Check cgroup2 membership of skb
++  *     @skb: pointer to skb
++  *     @map: pointer to bpf_map in BPF_MAP_TYPE_CGROUP_ARRAY type
++  *     @index: index of the cgroup in the bpf_map
++  *     Return:
++  *       == 0 skb failed the cgroup2 descendant test
++  *       == 1 skb succeeded the cgroup2 descendant test
++  *        < 0 error
++  *
++  * u32 bpf_get_hash_recalc(skb)
++  *     Retrieve and possibly recalculate skb->hash.
++  *     @skb: pointer to skb
++  *     Return: hash
++  *
++  * u64 bpf_get_current_task(void)
++  *     Returns current task_struct
++  *     Return: current
++  *
++  * int bpf_probe_write_user(void *dst, void *src, int len)
++  *     safely attempt to write to a location
++  *     @dst: destination address in userspace
++  *     @src: source address on stack
++  *     @len: number of bytes to copy
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_current_task_under_cgroup(map, index)
++  *     Check cgroup2 membership of current task
++  *     @map: pointer to bpf_map in BPF_MAP_TYPE_CGROUP_ARRAY type
++  *     @index: index of the cgroup in the bpf_map
++  *     Return:
++  *       == 0 current failed the cgroup2 descendant test
++  *       == 1 current succeeded the cgroup2 descendant test
++  *        < 0 error
++  *
++  * int bpf_skb_change_tail(skb, len, flags)
++  *     The helper will resize the skb to the given new size, to be used f.e.
++  *     with control messages.
++  *     @skb: pointer to skb
++  *     @len: new skb length
++  *     @flags: reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_pull_data(skb, len)
++  *     The helper will pull in non-linear data in case the skb is non-linear
++  *     and not all of len are part of the linear section. Only needed for
++  *     read/write with direct packet access.
++  *     @skb: pointer to skb
++  *     @len: len to make read/writeable
++  *     Return: 0 on success or negative error
++  *
++  * s64 bpf_csum_update(skb, csum)
++  *     Adds csum into skb->csum in case of CHECKSUM_COMPLETE.
++  *     @skb: pointer to skb
++  *     @csum: csum to add
++  *     Return: csum on success or negative error
++  *
++  * void bpf_set_hash_invalid(skb)
++  *     Invalidate current skb->hash.
++  *     @skb: pointer to skb
++  *
++  * int bpf_get_numa_node_id()
++  *     Return: Id of current NUMA node.
++  *
++  * int bpf_skb_change_head()
++  *     Grows headroom of skb and adjusts MAC header offset accordingly.
++  *     Will extends/reallocae as required automatically.
++  *     May change skb data pointer and will thus invalidate any check
++  *     performed for direct packet access.
++  *     @skb: pointer to skb
++  *     @len: length of header to be pushed in front
++  *     @flags: Flags (unused for now)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_xdp_adjust_head(xdp_md, delta)
++  *     Adjust the xdp_md.data by delta
++  *     @xdp_md: pointer to xdp_md
++  *     @delta: An positive/negative integer to be added to xdp_md.data
++  *     Return: 0 on success or negative on error
++  *
++  * int bpf_probe_read_str(void *dst, int size, const void *unsafe_ptr)
++  *     Copy a NUL terminated string from unsafe address. In case the string
++  *     length is smaller than size, the target is not padded with further NUL
++  *     bytes. In case the string length is larger than size, just count-1
++  *     bytes are copied and the last byte is set to NUL.
++  *     @dst: destination address
++  *     @size: maximum number of bytes to copy, including the trailing NUL
++  *     @unsafe_ptr: unsafe address
++  *     Return:
++  *       > 0 length of the string including the trailing NUL on success
++  *       < 0 error
++  *
++  * u64 bpf_get_socket_cookie(skb)
++  *     Get the cookie for the socket stored inside sk_buff.
++  *     @skb: pointer to skb
++  *     Return: 8 Bytes non-decreasing number on success or 0 if the socket
++  *     field is missing inside sk_buff
++  *
++  * u32 bpf_get_socket_uid(skb)
++  *     Get the owner uid of the socket stored inside sk_buff.
++  *     @skb: pointer to skb
++  *     Return: uid of the socket owner on success or overflowuid if failed.
++  *
++  * u32 bpf_set_hash(skb, hash)
++  *     Set full skb->hash.
++  *     @skb: pointer to skb
++  *     @hash: hash to set
++  *
++  * int bpf_setsockopt(bpf_socket, level, optname, optval, optlen)
++  *     Calls setsockopt. Not all opts are available, only those with
++  *     integer optvals plus TCP_CONGESTION.
++  *     Supported levels: SOL_SOCKET and IPROTO_TCP
++  *     @bpf_socket: pointer to bpf_socket
++  *     @level: SOL_SOCKET or IPROTO_TCP
++  *     @optname: option name
++  *     @optval: pointer to option value
++  *     @optlen: length of optval in byes
++  *     Return: 0 or negative error
++  *
++  * int bpf_skb_adjust_room(skb, len_diff, mode, flags)
++  *     Grow or shrink room in sk_buff.
++  *     @skb: pointer to skb
++  *     @len_diff: (signed) amount of room to grow/shrink
++  *     @mode: operation mode (enum bpf_adj_room_mode)
++  *     @flags: reserved for future use
++  *     Return: 0 on success or negative error code
++  *
++  * int bpf_sk_redirect_map(map, key, flags)
++  *     Redirect skb to a sock in map using key as a lookup key for the
++  *     sock in map.
++  *     @map: pointer to sockmap
++  *     @key: key to lookup sock in map
++  *     @flags: reserved for future use
++  *     Return: SK_REDIRECT
++  *
++  * int bpf_sock_map_update(skops, map, key, flags)
++  *	@skops: pointer to bpf_sock_ops
++  *	@map: pointer to sockmap to update
++  *	@key: key to insert/update sock in map
++  *	@flags: same flags as map update elem
++  */
++ #define __BPF_FUNC_MAPPER(FN)		\
++ 	FN(unspec),			\
++ 	FN(map_lookup_elem),		\
++ 	FN(map_update_elem),		\
++ 	FN(map_delete_elem),		\
++ 	FN(probe_read),			\
++ 	FN(ktime_get_ns),		\
++ 	FN(trace_printk),		\
++ 	FN(get_prandom_u32),		\
++ 	FN(get_smp_processor_id),	\
++ 	FN(skb_store_bytes),		\
++ 	FN(l3_csum_replace),		\
++ 	FN(l4_csum_replace),		\
++ 	FN(tail_call),			\
++ 	FN(clone_redirect),		\
++ 	FN(get_current_pid_tgid),	\
++ 	FN(get_current_uid_gid),	\
++ 	FN(get_current_comm),		\
++ 	FN(get_cgroup_classid),		\
++ 	FN(skb_vlan_push),		\
++ 	FN(skb_vlan_pop),		\
++ 	FN(skb_get_tunnel_key),		\
++ 	FN(skb_set_tunnel_key),		\
++ 	FN(perf_event_read),		\
++ 	FN(redirect),			\
++ 	FN(get_route_realm),		\
++ 	FN(perf_event_output),		\
++ 	FN(skb_load_bytes),		\
++ 	FN(get_stackid),		\
++ 	FN(csum_diff),			\
++ 	FN(skb_get_tunnel_opt),		\
++ 	FN(skb_set_tunnel_opt),		\
++ 	FN(skb_change_proto),		\
++ 	FN(skb_change_type),		\
++ 	FN(skb_under_cgroup),		\
++ 	FN(get_hash_recalc),		\
++ 	FN(get_current_task),		\
++ 	FN(probe_write_user),		\
++ 	FN(current_task_under_cgroup),	\
++ 	FN(skb_change_tail),		\
++ 	FN(skb_pull_data),		\
++ 	FN(csum_update),		\
++ 	FN(set_hash_invalid),		\
++ 	FN(get_numa_node_id),		\
++ 	FN(skb_change_head),		\
++ 	FN(xdp_adjust_head),		\
++ 	FN(probe_read_str),		\
++ 	FN(get_socket_cookie),		\
++ 	FN(get_socket_uid),		\
++ 	FN(set_hash),			\
++ 	FN(setsockopt),			\
++ 	FN(skb_adjust_room),		\
++ 	FN(redirect_map),		\
++ 	FN(sk_redirect_map),		\
++ 	FN(sock_map_update),		\
++ 
++ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
++  * function eBPF program intends to call
++  */
++ #define __BPF_ENUM_FN(x) BPF_FUNC_ ## x
++ enum bpf_func_id {
++ 	__BPF_FUNC_MAPPER(__BPF_ENUM_FN)
++ 	__BPF_FUNC_MAX_ID,
++ };
++ #undef __BPF_ENUM_FN
++ 
++ /* All flags used by eBPF helper functions, placed here. */
++ 
++ /* BPF_FUNC_skb_store_bytes flags. */
++ #define BPF_F_RECOMPUTE_CSUM		(1ULL << 0)
++ #define BPF_F_INVALIDATE_HASH		(1ULL << 1)
++ 
++ /* BPF_FUNC_l3_csum_replace and BPF_FUNC_l4_csum_replace flags.
++  * First 4 bits are for passing the header field size.
++  */
++ #define BPF_F_HDR_FIELD_MASK		0xfULL
++ 
++ /* BPF_FUNC_l4_csum_replace flags. */
++ #define BPF_F_PSEUDO_HDR		(1ULL << 4)
++ #define BPF_F_MARK_MANGLED_0		(1ULL << 5)
++ #define BPF_F_MARK_ENFORCE		(1ULL << 6)
++ 
++ /* BPF_FUNC_clone_redirect and BPF_FUNC_redirect flags. */
++ #define BPF_F_INGRESS			(1ULL << 0)
++ 
++ /* BPF_FUNC_skb_set_tunnel_key and BPF_FUNC_skb_get_tunnel_key flags. */
++ #define BPF_F_TUNINFO_IPV6		(1ULL << 0)
++ 
++ /* BPF_FUNC_get_stackid flags. */
++ #define BPF_F_SKIP_FIELD_MASK		0xffULL
++ #define BPF_F_USER_STACK		(1ULL << 8)
++ #define BPF_F_FAST_STACK_CMP		(1ULL << 9)
++ #define BPF_F_REUSE_STACKID		(1ULL << 10)
++ 
++ /* BPF_FUNC_skb_set_tunnel_key flags. */
++ #define BPF_F_ZERO_CSUM_TX		(1ULL << 1)
++ #define BPF_F_DONT_FRAGMENT		(1ULL << 2)
++ 
++ /* BPF_FUNC_perf_event_output and BPF_FUNC_perf_event_read flags. */
++ #define BPF_F_INDEX_MASK		0xffffffffULL
++ #define BPF_F_CURRENT_CPU		BPF_F_INDEX_MASK
++ /* BPF_FUNC_perf_event_output for sk_buff input context. */
++ #define BPF_F_CTXLEN_MASK		(0xfffffULL << 32)
++ 
++ /* Mode for BPF_FUNC_skb_adjust_room helper. */
++ enum bpf_adj_room_mode {
++ 	BPF_ADJ_ROOM_NET,
++ };
++ 
++ /* user accessible mirror of in-kernel sk_buff.
++  * new fields can only be added to the end of this structure
++  */
++ struct __sk_buff {
++ 	__u32 len;
++ 	__u32 pkt_type;
++ 	__u32 mark;
++ 	__u32 queue_mapping;
++ 	__u32 protocol;
++ 	__u32 vlan_present;
++ 	__u32 vlan_tci;
++ 	__u32 vlan_proto;
++ 	__u32 priority;
++ 	__u32 ingress_ifindex;
++ 	__u32 ifindex;
++ 	__u32 tc_index;
++ 	__u32 cb[5];
++ 	__u32 hash;
++ 	__u32 tc_classid;
++ 	__u32 data;
++ 	__u32 data_end;
++ 	__u32 napi_id;
++ 
++ 	/* accessed by BPF_PROG_TYPE_sk_skb types */
++ 	__u32 family;
++ 	__u32 remote_ip4;	/* Stored in network byte order */
++ 	__u32 local_ip4;	/* Stored in network byte order */
++ 	__u32 remote_ip6[4];	/* Stored in network byte order */
++ 	__u32 local_ip6[4];	/* Stored in network byte order */
++ 	__u32 remote_port;	/* Stored in network byte order */
++ 	__u32 local_port;	/* stored in host byte order */
++ };
++ 
++ struct bpf_tunnel_key {
++ 	__u32 tunnel_id;
++ 	union {
++ 		__u32 remote_ipv4;
++ 		__u32 remote_ipv6[4];
++ 	};
++ 	__u8 tunnel_tos;
++ 	__u8 tunnel_ttl;
++ 	__u16 tunnel_ext;
++ 	__u32 tunnel_label;
++ };
++ 
++ /* Generic BPF return codes which all BPF program types may support.
++  * The values are binary compatible with their TC_ACT_* counter-part to
++  * provide backwards compatibility with existing SCHED_CLS and SCHED_ACT
++  * programs.
++  *
++  * XDP is handled seprately, see XDP_*.
++  */
++ enum bpf_ret_code {
++ 	BPF_OK = 0,
++ 	/* 1 reserved */
++ 	BPF_DROP = 2,
++ 	/* 3-6 reserved */
++ 	BPF_REDIRECT = 7,
++ 	/* >127 are reserved for prog type specific return codes */
++ };
++ 
++ struct bpf_sock {
++ 	__u32 bound_dev_if;
++ 	__u32 family;
++ 	__u32 type;
++ 	__u32 protocol;
++ 	__u32 mark;
++ 	__u32 priority;
++ };
++ 
++ #define XDP_PACKET_HEADROOM 256
++ 
+++>>>>>>> 90caccdd8cc0 (bpf: fix bpf_tail_call() x64 JIT)
+  /* User return codes for XDP prog type.
+   * A valid XDP program must return one of these defined values. All other
+ - * return codes are reserved for future use. Unknown return codes will
+ - * result in packet drops and a warning via bpf_warn_invalid_xdp_action().
+ + * return codes are reserved for future use. Unknown return codes will result
+ + * in packet drop.
+   */
+  enum xdp_action {
+  	XDP_ABORTED = 0,
+* Unmerged path kernel/bpf/core.c
+* Unmerged path arch/x86/net/bpf_jit_comp.c
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/core.c
