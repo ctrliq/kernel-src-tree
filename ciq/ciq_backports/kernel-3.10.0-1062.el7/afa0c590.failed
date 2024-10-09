@@ -1,0 +1,132 @@
+s390/qeth: fix use-after-free in error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] qeth: fix use-after-free in error path (Hendrik Brueckner) [1686041]
+Rebuild_FUZZ: 93.83%
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit afa0c5904ba16d59b0454f7ee4c807dae350f432
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/afa0c590.failed
+
+The error path in qeth_alloc_qdio_buffers() that takes care of
+cleaning up the Output Queues is buggy. It first frees the queue, but
+then calls qeth_clear_outq_buffers() with that very queue struct.
+
+Make the call to qeth_clear_outq_buffers() part of the free action
+(in the correct order), and while at it fix the naming of the helper.
+
+Fixes: 0da9581ddb0f ("qeth: exploit asynchronous delivery of storage blocks")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Alexandra Winter <wintera@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit afa0c5904ba16d59b0454f7ee4c807dae350f432)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 88e60ed5028a,30679bfc8a1b..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -2420,18 -2392,33 +2420,44 @@@ static int qeth_init_qdio_out_buf(struc
+  	newbuf->next_pending = q->bufs[bidx];
+  	atomic_set(&newbuf->state, QETH_QDIO_BUF_EMPTY);
+  	q->bufs[bidx] = newbuf;
+++<<<<<<< HEAD
+ +	if (q->bufstates) {
+ +		q->bufstates[bidx].user = newbuf;
+ +		QETH_CARD_TEXT_(q->card, 2, "nbs%d", bidx);
+ +		QETH_CARD_TEXT_(q->card, 2, "%lx", (long) newbuf);
+ +		QETH_CARD_TEXT_(q->card, 2, "%lx",
+ +				(long) newbuf->next_pending);
+++=======
++ 	return 0;
++ }
++ 
++ static void qeth_free_output_queue(struct qeth_qdio_out_q *q)
++ {
++ 	if (!q)
++ 		return;
++ 
++ 	qeth_clear_outq_buffers(q, 1);
++ 	qdio_free_buffers(q->qdio_bufs, QDIO_MAX_BUFFERS_PER_Q);
++ 	kfree(q);
++ }
++ 
++ static struct qeth_qdio_out_q *qeth_alloc_qdio_out_buf(void)
++ {
++ 	struct qeth_qdio_out_q *q = kzalloc(sizeof(*q), GFP_KERNEL);
++ 
++ 	if (!q)
++ 		return NULL;
++ 
++ 	if (qdio_alloc_buffers(q->qdio_bufs, QDIO_MAX_BUFFERS_PER_Q)) {
++ 		kfree(q);
++ 		return NULL;
+++>>>>>>> afa0c5904ba1 (s390/qeth: fix use-after-free in error path)
+  	}
+ -	return q;
+ +out:
+ +	return rc;
+  }
+  
+ +
+  static int qeth_alloc_qdio_buffers(struct qeth_card *card)
+  {
+  	int i, j;
+@@@ -2495,10 -2474,8 +2521,15 @@@ out_freeoutqbufs
+  		card->qdio.out_qs[i]->bufs[j] = NULL;
+  	}
+  out_freeoutq:
+++<<<<<<< HEAD
+ +	while (i > 0) {
+ +		kfree(card->qdio.out_qs[--i]);
+ +		qeth_clear_outq_buffers(card->qdio.out_qs[i], 1);
+ +	}
+++=======
++ 	while (i > 0)
++ 		qeth_free_output_queue(card->qdio.out_qs[--i]);
+++>>>>>>> afa0c5904ba1 (s390/qeth: fix use-after-free in error path)
+  	kfree(card->qdio.out_qs);
+  	card->qdio.out_qs = NULL;
+  out_freepool:
+@@@ -2511,6 -2488,33 +2542,36 @@@ out_nomem
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qeth_free_qdio_buffers(struct qeth_card *card)
++ {
++ 	int i, j;
++ 
++ 	if (atomic_xchg(&card->qdio.state, QETH_QDIO_UNINITIALIZED) ==
++ 		QETH_QDIO_UNINITIALIZED)
++ 		return;
++ 
++ 	qeth_free_cq(card);
++ 	cancel_delayed_work_sync(&card->buffer_reclaim_work);
++ 	for (j = 0; j < QDIO_MAX_BUFFERS_PER_Q; ++j) {
++ 		if (card->qdio.in_q->bufs[j].rx_skb)
++ 			dev_kfree_skb_any(card->qdio.in_q->bufs[j].rx_skb);
++ 	}
++ 	qeth_free_qdio_queue(card->qdio.in_q);
++ 	card->qdio.in_q = NULL;
++ 	/* inbound buffer pool */
++ 	qeth_free_buffer_pool(card);
++ 	/* free outbound qdio_qs */
++ 	if (card->qdio.out_qs) {
++ 		for (i = 0; i < card->qdio.no_out_queues; i++)
++ 			qeth_free_output_queue(card->qdio.out_qs[i]);
++ 		kfree(card->qdio.out_qs);
++ 		card->qdio.out_qs = NULL;
++ 	}
++ }
++ 
+++>>>>>>> afa0c5904ba1 (s390/qeth: fix use-after-free in error path)
+  static void qeth_create_qib_param_field(struct qeth_card *card,
+  		char *param_field)
+  {
+* Unmerged path drivers/s390/net/qeth_core_main.c
