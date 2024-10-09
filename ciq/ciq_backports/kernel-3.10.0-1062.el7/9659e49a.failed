@@ -1,0 +1,151 @@
+net/mlx5e: Separate between ethtool and netdev software stats folding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Separate between ethtool and netdev software stats folding (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 97.01%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 9659e49a6db45474000e4df1a2875bd0d5ab2390
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9659e49a.failed
+
+mlx5e_grp_sw_update_stats can be called from two threads,
+1) ndo_get_stats64
+2) get_ethtool_stats
+
+For this reason and to minimize concurrency issue impact on 64bit machines
+mlx5e_grp_sw_update_stats folds the software stats into a temporary
+variable then copies it to the global driver stats, both ethtool and ndo
+statistics callbacks will use the global software stats variable to report
+whatever stats they need.
+
+Actually ndo_get_stats64 doesn't need to fold the whole software stats
+(mlx5e_grp_sw_update_stats), all it needs is five counters to fill the
+rtnl_link_stats64 relevant stats parameter.
+
+Hence this patch introduces a simpler helper function to fold software
+stats for ndo_get_stats64 which will work directly on rtnl_link_stats64
+stats parameter and not on the global or even temporary mlx5e_sw_stats
+variable.
+
+Since now mlx5e_grp_sw_update_stats is not called by ndo_get_stats64 we
+can make it static and remove the temp var.
+
+Unlike mlx5e_grp_sw_update_stats the new fold stats function doesn't
+need to zero out the output statistics parameter since it is already
+done by the stack @dev_get_stats().
+
+This patch is fixing stack usage of mlx5e_grp_sw_update_stats on
+x86 gcc-4.9 and higher, the concurrency issue between mlx5's
+ndo_get_stats64 and get_ethtool_stats is resolved as well.
+
+Fixes: 8bfaf07f7806 ("net/mlx5e: Present SW stats when state is not opened")
+	Reported-by: Arnd Bergmann <arnd@arndb.de>
+	Reported-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 9659e49a6db45474000e4df1a2875bd0d5ab2390)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 48dde39aa588,01d0895b6264..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3064,7 -3521,29 +3064,33 @@@ static int mlx5e_setup_tc(struct net_de
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void
+++=======
++ static void mlx5e_fold_sw_stats64(struct mlx5e_priv *priv, struct rtnl_link_stats64 *s)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < mlx5e_get_netdev_max_channels(priv->netdev); i++) {
++ 		struct mlx5e_channel_stats *channel_stats = &priv->channel_stats[i];
++ 		struct mlx5e_rq_stats *rq_stats = &channel_stats->rq;
++ 		int j;
++ 
++ 		s->rx_packets   += rq_stats->packets;
++ 		s->rx_bytes     += rq_stats->bytes;
++ 
++ 		for (j = 0; j < priv->max_opened_tc; j++) {
++ 			struct mlx5e_sq_stats *sq_stats = &channel_stats->sq[j];
++ 
++ 			s->tx_packets    += sq_stats->packets;
++ 			s->tx_bytes      += sq_stats->bytes;
++ 			s->tx_dropped    += sq_stats->dropped;
++ 		}
++ 	}
++ }
++ 
++ void
+++>>>>>>> 9659e49a6db4 (net/mlx5e: Separate between ethtool and netdev software stats folding)
+  mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(dev);
+@@@ -3078,11 -3561,7 +3103,15 @@@
+  		stats->tx_packets = PPORT_802_3_GET(pstats, a_frames_transmitted_ok);
+  		stats->tx_bytes   = PPORT_802_3_GET(pstats, a_octets_transmitted_ok);
+  	} else {
+++<<<<<<< HEAD
+ +		stats->rx_packets = sstats->rx_packets;
+ +		stats->rx_bytes   = sstats->rx_bytes;
+ +		stats->tx_packets = sstats->tx_packets;
+ +		stats->tx_bytes   = sstats->tx_bytes;
+ +		stats->tx_dropped = sstats->tx_queue_dropped;
+++=======
++ 		mlx5e_fold_sw_stats64(priv, stats);
+++>>>>>>> 9659e49a6db4 (net/mlx5e: Separate between ethtool and netdev software stats folding)
+  	}
+  
+  	stats->rx_dropped = priv->stats.qcnt.rx_out_of_buffer;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 525df44c9b3c,1a78e05cbba8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@@ -161,13 -205,13 +161,16 @@@ static void mlx5e_grp_sw_update_stats(s
+  			s->tx_csum_partial_inner += sq_stats->csum_partial_inner;
+  			s->tx_csum_none		+= sq_stats->csum_none;
+  			s->tx_csum_partial	+= sq_stats->csum_partial;
+ -#ifdef CONFIG_MLX5_EN_TLS
+ -			s->tx_tls_ooo		+= sq_stats->tls_ooo;
+ -			s->tx_tls_resync_bytes	+= sq_stats->tls_resync_bytes;
+ -#endif
+ -			s->tx_cqes		+= sq_stats->cqes;
+  		}
+  	}
+++<<<<<<< HEAD
+ +
+ +	s->link_down_events_phy = MLX5_GET(ppcnt_reg,
+ +				priv->stats.pport.phy_counters,
+ +				counter_set.phys_layer_cntrs.link_down_events);
+ +	memcpy(&priv->stats.sw, s, sizeof(*s));
+++=======
+++>>>>>>> 9659e49a6db4 (net/mlx5e: Separate between ethtool and netdev software stats folding)
+  }
+  
+  static const struct counter_desc q_stats_desc[] = {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 9c603217203a,4640d4f986f8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@@ -235,4 -277,6 +235,9 @@@ struct mlx5e_stats_grp 
+  extern const struct mlx5e_stats_grp mlx5e_stats_grps[];
+  extern const int mlx5e_num_stats_grps;
+  
+++<<<<<<< HEAD
+++=======
++ void mlx5e_grp_802_3_update_stats(struct mlx5e_priv *priv);
++ 
+++>>>>>>> 9659e49a6db4 (net/mlx5e: Separate between ethtool and netdev software stats folding)
+  #endif /* __MLX5_EN_STATS_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
