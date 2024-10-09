@@ -1,0 +1,170 @@
+md: fix some issues with alloc_disk_sb()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] fix some issues with alloc_disk_sb() (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 94.74%
+commit-author NeilBrown <neilb@suse.com>
+commit 7f0f0d87fa172c71f74ea916d70765862ee2d53a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7f0f0d87.failed
+
+1/ don't print a warning if allocation fails.
+ page_alloc() does that already.
+2/ always check return status for error.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 7f0f0d87fa172c71f74ea916d70765862ee2d53a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index ba8c742c55f6,88c182190151..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -8431,6 -8718,138 +8428,141 @@@ err_wq
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void check_sb_changes(struct mddev *mddev, struct md_rdev *rdev)
++ {
++ 	struct mdp_superblock_1 *sb = page_address(rdev->sb_page);
++ 	struct md_rdev *rdev2;
++ 	int role, ret;
++ 	char b[BDEVNAME_SIZE];
++ 
++ 	/* Check for change of roles in the active devices */
++ 	rdev_for_each(rdev2, mddev) {
++ 		if (test_bit(Faulty, &rdev2->flags))
++ 			continue;
++ 
++ 		/* Check if the roles changed */
++ 		role = le16_to_cpu(sb->dev_roles[rdev2->desc_nr]);
++ 
++ 		if (test_bit(Candidate, &rdev2->flags)) {
++ 			if (role == 0xfffe) {
++ 				pr_info("md: Removing Candidate device %s because add failed\n", bdevname(rdev2->bdev,b));
++ 				md_kick_rdev_from_array(rdev2);
++ 				continue;
++ 			}
++ 			else
++ 				clear_bit(Candidate, &rdev2->flags);
++ 		}
++ 
++ 		if (role != rdev2->raid_disk) {
++ 			/* got activated */
++ 			if (rdev2->raid_disk == -1 && role != 0xffff) {
++ 				rdev2->saved_raid_disk = role;
++ 				ret = remove_and_add_spares(mddev, rdev2);
++ 				pr_info("Activated spare: %s\n",
++ 						bdevname(rdev2->bdev,b));
++ 				/* wakeup mddev->thread here, so array could
++ 				 * perform resync with the new activated disk */
++ 				set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
++ 				md_wakeup_thread(mddev->thread);
++ 
++ 			}
++ 			/* device faulty
++ 			 * We just want to do the minimum to mark the disk
++ 			 * as faulty. The recovery is performed by the
++ 			 * one who initiated the error.
++ 			 */
++ 			if ((role == 0xfffe) || (role == 0xfffd)) {
++ 				md_error(mddev, rdev2);
++ 				clear_bit(Blocked, &rdev2->flags);
++ 			}
++ 		}
++ 	}
++ 
++ 	if (mddev->raid_disks != le32_to_cpu(sb->raid_disks))
++ 		update_raid_disks(mddev, le32_to_cpu(sb->raid_disks));
++ 
++ 	/* Finally set the event to be up to date */
++ 	mddev->events = le64_to_cpu(sb->events);
++ }
++ 
++ static int read_rdev(struct mddev *mddev, struct md_rdev *rdev)
++ {
++ 	int err;
++ 	struct page *swapout = rdev->sb_page;
++ 	struct mdp_superblock_1 *sb;
++ 
++ 	/* Store the sb page of the rdev in the swapout temporary
++ 	 * variable in case we err in the future
++ 	 */
++ 	rdev->sb_page = NULL;
++ 	err = alloc_disk_sb(rdev);
++ 	if (err == 0) {
++ 		ClearPageUptodate(rdev->sb_page);
++ 		rdev->sb_loaded = 0;
++ 		err = super_types[mddev->major_version].
++ 			load_super(rdev, NULL, mddev->minor_version);
++ 	}
++ 	if (err < 0) {
++ 		pr_warn("%s: %d Could not reload rdev(%d) err: %d. Restoring old values\n",
++ 				__func__, __LINE__, rdev->desc_nr, err);
++ 		if (rdev->sb_page)
++ 			put_page(rdev->sb_page);
++ 		rdev->sb_page = swapout;
++ 		rdev->sb_loaded = 1;
++ 		return err;
++ 	}
++ 
++ 	sb = page_address(rdev->sb_page);
++ 	/* Read the offset unconditionally, even if MD_FEATURE_RECOVERY_OFFSET
++ 	 * is not set
++ 	 */
++ 
++ 	if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_RECOVERY_OFFSET))
++ 		rdev->recovery_offset = le64_to_cpu(sb->recovery_offset);
++ 
++ 	/* The other node finished recovery, call spare_active to set
++ 	 * device In_sync and mddev->degraded
++ 	 */
++ 	if (rdev->recovery_offset == MaxSector &&
++ 	    !test_bit(In_sync, &rdev->flags) &&
++ 	    mddev->pers->spare_active(mddev))
++ 		sysfs_notify(&mddev->kobj, NULL, "degraded");
++ 
++ 	put_page(swapout);
++ 	return 0;
++ }
++ 
++ void md_reload_sb(struct mddev *mddev, int nr)
++ {
++ 	struct md_rdev *rdev;
++ 	int err;
++ 
++ 	/* Find the rdev */
++ 	rdev_for_each_rcu(rdev, mddev) {
++ 		if (rdev->desc_nr == nr)
++ 			break;
++ 	}
++ 
++ 	if (!rdev || rdev->desc_nr != nr) {
++ 		pr_warn("%s: %d Could not find rdev with nr %d\n", __func__, __LINE__, nr);
++ 		return;
++ 	}
++ 
++ 	err = read_rdev(mddev, rdev);
++ 	if (err < 0)
++ 		return;
++ 
++ 	check_sb_changes(mddev, rdev);
++ 
++ 	/* Read all rdev's to update recovery_offset */
++ 	rdev_for_each_rcu(rdev, mddev)
++ 		read_rdev(mddev, rdev);
++ }
++ EXPORT_SYMBOL(md_reload_sb);
++ 
+++>>>>>>> 7f0f0d87fa17 (md: fix some issues with alloc_disk_sb())
+  #ifndef MODULE
+  
+  /*
+* Unmerged path drivers/md/md.c
