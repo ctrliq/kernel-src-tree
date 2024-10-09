@@ -1,0 +1,291 @@
+dm: add ->copy_from_iter() dax operation support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 7e026c8c0a4200da86bc51edeaad79dcdccf78ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7e026c8c.failed
+
+Allow device-mapper to route copy_from_iter operations to the
+per-target implementation. In order for the device stacking to work we
+need a dax_dev and a pgoff relative to that device. This gives each
+layer of the stack the information it needs to look up the operation
+pointer for the next level.
+
+This conceptually allows for an array of mixed device drivers with
+varying copy_from_iter implementations.
+
+	Reviewed-by: Toshi Kani <toshi.kani@hpe.com>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 7e026c8c0a4200da86bc51edeaad79dcdccf78ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dax.h
+diff --cc include/linux/dax.h
+index b7b81d6cc271,28e398f8c59e..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,6 -6,81 +6,84 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ 	/* copy_from_iter: dax-driver override for default copy_from_iter */
++ 	size_t (*copy_from_iter)(struct dax_device *, pgoff_t, void *, size_t,
++ 			struct iov_iter *);
++ };
++ 
++ #if IS_ENABLED(CONFIG_DAX)
++ struct dax_device *dax_get_by_host(const char *host);
++ void put_dax(struct dax_device *dax_dev);
++ #else
++ static inline struct dax_device *dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
++ #if IS_ENABLED(CONFIG_FS_DAX)
++ int __bdev_dax_supported(struct super_block *sb, int blocksize);
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return __bdev_dax_supported(sb, blocksize);
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return dax_get_by_host(host);
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ 	put_dax(dax_dev);
++ }
++ 
++ #else
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
++ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
++ 		void **kaddr, pfn_t *pfn);
++ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i);
++ 
+++>>>>>>> 7e026c8c0a42 (dm: add ->copy_from_iter() dax operation support)
+  /*
+   * We use lowest available bit in exceptional entry for locking, one bit for
+   * the entry size (PMD) and two more to tell us if the entry is a huge zero
+diff --git a/drivers/dax/super.c b/drivers/dax/super.c
+index 41efc362f7f7..cf3a002cfb3a 100644
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -19,6 +19,7 @@
+ #include <linux/cdev.h>
+ #include <linux/hash.h>
+ #include <linux/slab.h>
++#include <linux/uio.h>
+ #include <linux/dax.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
+@@ -184,6 +185,18 @@ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+ }
+ EXPORT_SYMBOL_GPL(dax_direct_access);
+ 
++size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++		size_t bytes, struct iov_iter *i)
++{
++	if (!dax_alive(dax_dev))
++		return 0;
++
++	if (!dax_dev->ops->copy_from_iter)
++		return copy_from_iter(addr, bytes, i);
++	return dax_dev->ops->copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++}
++EXPORT_SYMBOL_GPL(dax_copy_from_iter);
++
+ bool dax_alive(struct dax_device *dax_dev)
+ {
+ 	lockdep_assert_held(&dax_srcu);
+diff --git a/drivers/md/dm-linear.c b/drivers/md/dm-linear.c
+index d40e867fe4c7..0e176cc3e2ce 100644
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@ -172,6 +172,20 @@ static long linear_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
+ 	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+ }
+ 
++static size_t linear_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
++		void *addr, size_t bytes, struct iov_iter *i)
++{
++	struct linear_c *lc = ti->private;
++	struct block_device *bdev = lc->dev->bdev;
++	struct dax_device *dax_dev = lc->dev->dax_dev;
++	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++
++	dev_sector = linear_map_sector(ti, sector);
++	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++		return 0;
++	return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++}
++
+ static struct target_type linear_target = {
+ 	.name   = "linear",
+ 	.version = {1, 3, 0},
+@@ -184,6 +198,7 @@ static struct target_type linear_target = {
+ 	.merge  = linear_merge,
+ 	.iterate_devices = linear_iterate_devices,
+ 	.direct_access = linear_dax_direct_access,
++	.dax_copy_from_iter = linear_dax_copy_from_iter,
+ };
+ 
+ int __init dm_linear_init(void)
+diff --git a/drivers/md/dm-stripe.c b/drivers/md/dm-stripe.c
+index db56c81ef539..510cadd1a474 100644
+--- a/drivers/md/dm-stripe.c
++++ b/drivers/md/dm-stripe.c
+@@ -327,6 +327,25 @@ static long stripe_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
+ 	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+ }
+ 
++static size_t stripe_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
++		void *addr, size_t bytes, struct iov_iter *i)
++{
++	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++	struct stripe_c *sc = ti->private;
++	struct dax_device *dax_dev;
++	struct block_device *bdev;
++	uint32_t stripe;
++
++	stripe_map_sector(sc, sector, &stripe, &dev_sector);
++	dev_sector += sc->stripe[stripe].physical_start;
++	dax_dev = sc->stripe[stripe].dev->dax_dev;
++	bdev = sc->stripe[stripe].dev->bdev;
++
++	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++		return 0;
++	return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++}
++
+ /*
+  * Stripe status:
+  *
+@@ -466,6 +485,7 @@ static struct target_type stripe_target = {
+ 	.io_hints = stripe_io_hints,
+ 	.merge  = stripe_merge,
+ 	.direct_access = stripe_dax_direct_access,
++	.dax_copy_from_iter = stripe_dax_copy_from_iter,
+ };
+ 
+ int __init dm_stripe_init(void)
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 14d7215727e9..1716afdd0f09 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -18,6 +18,7 @@
+ #include <linux/dax.h>
+ #include <linux/slab.h>
+ #include <linux/idr.h>
++#include <linux/uio.h>
+ #include <linux/hdreg.h>
+ #include <linux/delay.h>
+ #include <linux/wait.h>
+@@ -963,6 +964,30 @@ static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+ 	return ret;
+ }
+ 
++static size_t dm_dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff,
++		void *addr, size_t bytes, struct iov_iter *i)
++{
++	struct mapped_device *md = dax_get_private(dax_dev);
++	sector_t sector = pgoff * PAGE_SECTORS;
++	struct dm_target *ti;
++	long ret = 0;
++	int srcu_idx;
++
++	ti = dm_dax_get_live_target(md, sector, &srcu_idx);
++
++	if (!ti)
++		goto out;
++	if (!ti->type->dax_copy_from_iter) {
++		ret = copy_from_iter(addr, bytes, i);
++		goto out;
++	}
++	ret = ti->type->dax_copy_from_iter(ti, pgoff, addr, bytes, i);
++ out:
++	dm_put_live_table(md, srcu_idx);
++
++	return ret;
++}
++
+ /*
+  * Flush current->bio_list when the target map method blocks.
+  * This fixes deadlocks in snapshot and possibly in other targets.
+@@ -3093,6 +3118,7 @@ static const struct block_device_operations dm_blk_dops = {
+ 
+ static const struct dax_operations dm_dax_ops = {
+ 	.direct_access = dm_dax_direct_access,
++	.copy_from_iter = dm_dax_copy_from_iter,
+ };
+ 
+ /*
+* Unmerged path include/linux/dax.h
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index eca858277b1d..4a66eebeafcf 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -137,6 +137,8 @@ typedef int (*dm_busy_fn) (struct dm_target *ti);
+  */
+ typedef long (*dm_dax_direct_access_fn) (struct dm_target *ti, pgoff_t pgoff,
+ 		long nr_pages, void **kaddr, pfn_t *pfn);
++typedef size_t (*dm_dax_copy_from_iter_fn)(struct dm_target *ti, pgoff_t pgoff,
++		void *addr, size_t bytes, struct iov_iter *i);
+ #define PAGE_SECTORS (PAGE_SIZE / 512)
+ 
+ void dm_error(const char *message);
+@@ -188,6 +190,7 @@ struct target_type {
+ 	dm_iterate_devices_fn iterate_devices;
+ 	dm_io_hints_fn io_hints;
+ 	dm_dax_direct_access_fn direct_access;
++	dm_dax_copy_from_iter_fn dax_copy_from_iter;
+ 
+ 	/* For internal device-mapper use. */
+ 	struct list_head list;
