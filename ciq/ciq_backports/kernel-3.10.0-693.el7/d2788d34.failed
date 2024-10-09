@@ -1,0 +1,249 @@
+net: sched: further simplify handle_ing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: further simplify handle_ing (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 93.15%
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit d2788d34885d4ce5ba17a8996fd95d28942e574e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d2788d34.failed
+
+Ingress qdisc has no other purpose than calling into tc_classify()
+that executes attached classifier(s) and action(s).
+
+It has a 1:1 relationship to dev->ingress_queue. After having commit
+087c1a601ad7 ("net: sched: run ingress qdisc without locks") removed
+the central ingress lock, one major contention point is gone.
+
+The extra indirection layers however, are not necessary for calling
+into ingress qdisc. pktgen calling locally into netif_receive_skb()
+with a dummy u32, single CPU result on a Supermicro X10SLM-F, Xeon
+E3-1240: before ~21,1 Mpps, after patch ~22,9 Mpps.
+
+We can redirect the private classifier list to the netdev directly,
+without changing any classifier API bits (!) and execute on that from
+handle_ing() side. The __QDISC_STATE_DEACTIVATE test can be removed,
+ingress qdisc doesn't have a queue and thus dev_deactivate_queue()
+is also not applicable, ingress_cl_list provides similar behaviour.
+In other words, ingress qdisc acts like TCQ_F_BUILTIN qdisc.
+
+One next possible step is the removal of the dev's ingress (dummy)
+netdev_queue, and to only have the list member in the netdevice
+itself.
+
+Note, the filter chain is RCU protected and individual filter elements
+are being kfree'd by sched subsystem after RCU grace period. RCU read
+lock is being held by __netif_receive_skb_core().
+
+Joint work with Alexei Starovoitov.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d2788d34885d4ce5ba17a8996fd95d28942e574e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/sched/sch_ingress.c
+diff --cc include/linux/netdevice.h
+index 381d98dab175,c4e1caf6056f..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1626,9 -1654,17 +1626,21 @@@ struct net_device 
+  	rx_handler_func_t __rcu	*rx_handler;
+  	void __rcu		*rx_handler_data;
+  
++ #if CONFIG_NET_CLS_ACT
++ 	struct tcf_proto __rcu  *ingress_cl_list;
++ #endif
+  	struct netdev_queue __rcu *ingress_queue;
+++<<<<<<< HEAD
+ +	unsigned char		broadcast[MAX_ADDR_LEN];	/* hw bcast add	*/
+ +
+++=======
++ 
++ 	unsigned char		broadcast[MAX_ADDR_LEN];
++ #ifdef CONFIG_RFS_ACCEL
++ 	struct cpu_rmap		*rx_cpu_rmap;
++ #endif
++ 	struct hlist_node	index_hlist;
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  
+  /*
+   * Cache lines mostly used on transmit path
+diff --cc net/core/dev.c
+index f531f8664bdd,e5f77c40bbd1..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3650,25 -3525,39 +3650,57 @@@ static inline struct sk_buff *handle_in
+  					 struct packet_type **pt_prev,
+  					 int *ret, struct net_device *orig_dev)
+  {
+++<<<<<<< HEAD
+ +	struct netdev_queue *rxq = rcu_dereference(skb->dev->ingress_queue);
+ +
+ +	if (!rxq || rcu_access_pointer(rxq->qdisc) == &noop_qdisc)
+ +		goto out;
+ +
+++=======
++ 	struct tcf_proto *cl = rcu_dereference_bh(skb->dev->ingress_cl_list);
++ 	struct tcf_result cl_res;
++ 
++ 	/* If there's at least one ingress present somewhere (so
++ 	 * we get here via enabled static key), remaining devices
++ 	 * that are not configured with an ingress qdisc will bail
++ 	 * out here.
++ 	 */
++ 	if (!cl)
++ 		return skb;
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  	if (*pt_prev) {
+  		*ret = deliver_skb(skb, *pt_prev, orig_dev);
+  		*pt_prev = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	switch (ing_filter(skb, rxq)) {
+ +	case TC_ACT_SHOT:
+ +	case TC_ACT_STOLEN:
+ +		kfree_skb(skb);
+ +		return NULL;
+++=======
++ 	qdisc_bstats_update_cpu(cl->q, skb);
++ 	skb->tc_verd = SET_TC_AT(skb->tc_verd, AT_INGRESS);
++ 
++ 	switch (tc_classify(skb, cl, &cl_res)) {
++ 	case TC_ACT_OK:
++ 	case TC_ACT_RECLASSIFY:
++ 		skb->tc_index = TC_H_MIN(cl_res.classid);
++ 		break;
++ 	case TC_ACT_SHOT:
++ 		qdisc_qstats_drop_cpu(cl->q);
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	default:
++ 		break;
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  	}
+  
+ +out:
+ +	skb->tc_verd = 0;
+  	return skb;
+  }
+  #endif
+diff --cc net/sched/sch_ingress.c
+index f92df45a3719,e7c648fa9dc3..000000000000
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@@ -15,13 -16,6 +16,16 @@@
+  #include <net/netlink.h>
+  #include <net/pkt_sched.h>
+  
+++<<<<<<< HEAD
+ +
+ +struct ingress_qdisc_data {
+ +	struct tcf_proto	*filter_list;
+ +};
+ +
+ +/* ------------------------- Class/flow operations ------------------------- */
+ +
+++=======
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  static struct Qdisc *ingress_leaf(struct Qdisc *sch, unsigned long arg)
+  {
+  	return NULL;
+@@@ -46,51 -40,28 +50,67 @@@ static void ingress_walk(struct Qdisc *
+  {
+  }
+  
+ -static struct tcf_proto __rcu **ingress_find_tcf(struct Qdisc *sch,
+ -						 unsigned long cl)
+ +static struct tcf_proto **ingress_find_tcf(struct Qdisc *sch, unsigned long cl)
+  {
+- 	struct ingress_qdisc_data *p = qdisc_priv(sch);
++ 	struct net_device *dev = qdisc_dev(sch);
+  
+- 	return &p->filter_list;
++ 	return &dev->ingress_cl_list;
+  }
+  
+++<<<<<<< HEAD
+ +/* --------------------------- Qdisc operations ---------------------------- */
+ +
+ +static int ingress_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ +{
+ +	struct ingress_qdisc_data *p = qdisc_priv(sch);
+ +	struct tcf_result res;
+ +	int result;
+ +
+ +	result = tc_classify(skb, p->filter_list, &res);
+ +
+ +	qdisc_bstats_update(sch, skb);
+ +	switch (result) {
+ +	case TC_ACT_SHOT:
+ +		result = TC_ACT_SHOT;
+ +		qdisc_qstats_drop(sch);
+ +		break;
+ +	case TC_ACT_STOLEN:
+ +	case TC_ACT_QUEUED:
+ +		result = TC_ACT_STOLEN;
+ +		break;
+ +	case TC_ACT_RECLASSIFY:
+ +	case TC_ACT_OK:
+ +		skb->tc_index = TC_H_MIN(res.classid);
+ +	default:
+ +		result = TC_ACT_OK;
+ +		break;
+ +	}
+ +
+ +	return result;
+ +}
+ +
+ +/* ------------------------------------------------------------- */
+ +
+++=======
++ static int ingress_init(struct Qdisc *sch, struct nlattr *opt)
++ {
++ 	net_inc_ingress_queue();
++ 	sch->flags |= TCQ_F_CPUSTATS;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  static void ingress_destroy(struct Qdisc *sch)
+  {
+- 	struct ingress_qdisc_data *p = qdisc_priv(sch);
++ 	struct net_device *dev = qdisc_dev(sch);
+  
+++<<<<<<< HEAD
+ +	tcf_destroy_chain(&p->filter_list);
+++=======
++ 	tcf_destroy_chain(&dev->ingress_cl_list);
++ 	net_dec_ingress_queue();
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  }
+  
+  static int ingress_dump(struct Qdisc *sch, struct sk_buff *skb)
+@@@ -120,8 -92,7 +141,12 @@@ static const struct Qdisc_class_ops ing
+  static struct Qdisc_ops ingress_qdisc_ops __read_mostly = {
+  	.cl_ops		=	&ingress_class_ops,
+  	.id		=	"ingress",
+++<<<<<<< HEAD
+ +	.priv_size	=	sizeof(struct ingress_qdisc_data),
+ +	.enqueue	=	ingress_enqueue,
+++=======
++ 	.init		=	ingress_init,
+++>>>>>>> d2788d34885d (net: sched: further simplify handle_ing)
+  	.destroy	=	ingress_destroy,
+  	.dump		=	ingress_dump,
+  	.owner		=	THIS_MODULE,
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/sched/sch_ingress.c
