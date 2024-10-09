@@ -1,0 +1,108 @@
+fsnotify: Drop inode_mark.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit ebb3b47e37a4ccef33e6388589a21a5c23d6b40b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ebb3b47e.failed
+
+inode_mark.c now contains only a single function. Move it to
+fs/notify/fsnotify.c and remove inode_mark.c.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit ebb3b47e37a4ccef33e6388589a21a5c23d6b40b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/Makefile
+#	fs/notify/inode_mark.c
+diff --cc fs/notify/Makefile
+index 96d3420d0242,3e969ae91b60..000000000000
+--- a/fs/notify/Makefile
++++ b/fs/notify/Makefile
+@@@ -1,5 -1,5 +1,10 @@@
+++<<<<<<< HEAD
+ +obj-$(CONFIG_FSNOTIFY)		+= fsnotify.o notification.o group.o inode_mark.o \
+ +				   mark.o vfsmount_mark.o fdinfo.o
+++=======
++ obj-$(CONFIG_FSNOTIFY)		+= fsnotify.o notification.o group.o mark.o \
++ 				   fdinfo.o
+++>>>>>>> ebb3b47e37a4 (fsnotify: Drop inode_mark.c)
+  
+  obj-y			+= dnotify/
+  obj-y			+= inotify/
+* Unmerged path fs/notify/inode_mark.c
+* Unmerged path fs/notify/Makefile
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 0378955136d1..cc42b7bb9f6f 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -41,6 +41,63 @@ void __fsnotify_vfsmount_delete(struct vfsmount *mnt)
+ 	fsnotify_clear_marks_by_mount(mnt);
+ }
+ 
++/**
++ * fsnotify_unmount_inodes - an sb is unmounting.  handle any watched inodes.
++ * @sb: superblock being unmounted.
++ *
++ * Called during unmount with no locks held, so needs to be safe against
++ * concurrent modifiers. We temporarily drop sb->s_inode_list_lock and CAN block.
++ */
++void fsnotify_unmount_inodes(struct super_block *sb)
++{
++	struct inode *inode, *iput_inode = NULL;
++
++	spin_lock(&sb->s_inode_list_lock);
++	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
++		/*
++		 * We cannot __iget() an inode in state I_FREEING,
++		 * I_WILL_FREE, or I_NEW which is fine because by that point
++		 * the inode cannot have any associated watches.
++		 */
++		spin_lock(&inode->i_lock);
++		if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW)) {
++			spin_unlock(&inode->i_lock);
++			continue;
++		}
++
++		/*
++		 * If i_count is zero, the inode cannot have any watches and
++		 * doing an __iget/iput with MS_ACTIVE clear would actually
++		 * evict all inodes with zero i_count from icache which is
++		 * unnecessarily violent and may in fact be illegal to do.
++		 */
++		if (!atomic_read(&inode->i_count)) {
++			spin_unlock(&inode->i_lock);
++			continue;
++		}
++
++		__iget(inode);
++		spin_unlock(&inode->i_lock);
++		spin_unlock(&sb->s_inode_list_lock);
++
++		if (iput_inode)
++			iput(iput_inode);
++
++		/* for each watch, send FS_UNMOUNT and then remove it */
++		fsnotify(inode, FS_UNMOUNT, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
++
++		fsnotify_inode_delete(inode);
++
++		iput_inode = inode;
++
++		spin_lock(&sb->s_inode_list_lock);
++	}
++	spin_unlock(&sb->s_inode_list_lock);
++
++	if (iput_inode)
++		iput(iput_inode);
++}
++
+ /*
+  * Given an inode, first check if we care what happens to our children.  Inotify
+  * and dnotify both tell their parents about events.  If we care about any event
+* Unmerged path fs/notify/inode_mark.c
