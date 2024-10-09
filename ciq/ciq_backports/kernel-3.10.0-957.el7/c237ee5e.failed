@@ -1,0 +1,225 @@
+bpf: add bpf_patch_insn_single helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit c237ee5eb33bf19fe0591c04ff8db19da7323a83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c237ee5e.failed
+
+Move the functionality to patch instructions out of the verifier
+code and into the core as the new bpf_patch_insn_single() helper
+will be needed later on for blinding as well. No changes in
+functionality.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c237ee5eb33bf19fe0591c04ff8db19da7323a83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	kernel/bpf/core.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/filter.h
+index d322ed880333,c4aae496f376..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -49,51 -360,157 +49,134 @@@ struct xdp_buff 
+  /* compute the linear packet data range [data, data_end) which
+   * will be accessed by cls_bpf and act_bpf programs
+   */
+ -static inline void bpf_compute_data_end(struct sk_buff *skb)
+ +static inline unsigned int sk_filter_len(const struct sk_filter *fp)
+  {
+ -	struct bpf_skb_data_end *cb = (struct bpf_skb_data_end *)skb->cb;
+ -
+ -	BUILD_BUG_ON(sizeof(*cb) > FIELD_SIZEOF(struct sk_buff, cb));
+ -	cb->data_end = skb->data + skb_headlen(skb);
+ +	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
+  }
+  
+ -static inline u8 *bpf_skb_cb(struct sk_buff *skb)
+ +static inline void bpf_compute_data_end(struct sk_buff *skb)
+  {
+ -	/* eBPF programs may read/write skb->cb[] area to transfer meta
+ -	 * data between tail calls. Since this also needs to work with
+ -	 * tc, that scratch memory is mapped to qdisc_skb_cb's data area.
+ -	 *
+ -	 * In some socket filter cases, the cb unfortunately needs to be
+ -	 * saved/restored so that protocol specific skb->cb[] data won't
+ -	 * be lost. In any case, due to unpriviledged eBPF programs
+ -	 * attached to sockets, we need to clear the bpf_skb_cb() area
+ -	 * to not leak previous contents to user space.
+ -	 */
+ -	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) != BPF_SKB_CB_LEN);
+ -	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) !=
+ -		     FIELD_SIZEOF(struct qdisc_skb_cb, data));
+ -
+ -	return qdisc_skb_cb(skb)->data;
+ +	return;
+  }
+  
+ -static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
+ -				       struct sk_buff *skb)
+ +int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
+ +static inline int sk_filter(struct sock *sk, struct sk_buff *skb)
+  {
+ -	u8 *cb_data = bpf_skb_cb(skb);
+ -	u8 cb_saved[BPF_SKB_CB_LEN];
+ -	u32 res;
+ -
+ -	if (unlikely(prog->cb_access)) {
+ -		memcpy(cb_saved, cb_data, sizeof(cb_saved));
+ -		memset(cb_data, 0, sizeof(cb_saved));
+ -	}
+ -
+ -	res = BPF_PROG_RUN(prog, skb);
+ -
+ -	if (unlikely(prog->cb_access))
+ -		memcpy(cb_data, cb_saved, sizeof(cb_saved));
+ -
+ -	return res;
+ +	return sk_filter_trim_cap(sk, skb, 1);
+  }
+  
+ -static inline u32 bpf_prog_run_clear_cb(const struct bpf_prog *prog,
+ -					struct sk_buff *skb)
+ +extern unsigned int sk_run_filter(const struct sk_buff *skb,
+ +				  const struct sock_filter *filter);
+ +extern int sk_unattached_filter_create(struct sk_filter **pfp,
+ +				       struct sock_fprog *fprog);
+ +extern void sk_unattached_filter_destroy(struct sk_filter *fp);
+ +extern int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ +extern int sk_detach_filter(struct sock *sk);
+ +extern int sk_chk_filter(struct sock_filter *filter, unsigned int flen);
+ +extern int sk_get_filter(struct sock *sk, struct sock_filter __user *filter, unsigned len);
+ +extern void sk_decode_filter(struct sock_filter *filt, struct sock_filter *to);
+ +
+ +static inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+ +				   struct xdp_buff *xdp)
+  {
+ -	u8 *cb_data = bpf_skb_cb(skb);
+ -
+ -	if (unlikely(prog->cb_access))
+ -		memset(cb_data, 0, BPF_SKB_CB_LEN);
+ +	return 0;
+ +}
+  
+ -	return BPF_PROG_RUN(prog, skb);
+ +static inline void bpf_warn_invalid_xdp_action(u32 act)
+ +{
+ +	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned int bpf_prog_size(unsigned int proglen)
++ {
++ 	return max(sizeof(struct bpf_prog),
++ 		   offsetof(struct bpf_prog, insns[proglen]));
++ }
++ 
++ static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
++ {
++ 	/* When classic BPF programs have been loaded and the arch
++ 	 * does not have a classic BPF JIT (anymore), they have been
++ 	 * converted via bpf_migrate_filter() to eBPF and thus always
++ 	 * have an unspec program type.
++ 	 */
++ 	return prog->type == BPF_PROG_TYPE_UNSPEC;
++ }
++ 
++ #define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
++ 
++ #ifdef CONFIG_DEBUG_SET_MODULE_RONX
++ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
++ {
++ 	set_memory_ro((unsigned long)fp, fp->pages);
++ }
++ 
++ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
++ {
++ 	set_memory_rw((unsigned long)fp, fp->pages);
++ }
++ #else
++ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
++ {
++ }
++ 
++ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
++ {
++ }
++ #endif /* CONFIG_DEBUG_SET_MODULE_RONX */
++ 
++ int sk_filter(struct sock *sk, struct sk_buff *skb);
++ 
++ int bpf_prog_select_runtime(struct bpf_prog *fp);
++ void bpf_prog_free(struct bpf_prog *fp);
++ 
++ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
++ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
++ 				  gfp_t gfp_extra_flags);
++ void __bpf_prog_free(struct bpf_prog *fp);
++ 
++ static inline void bpf_prog_unlock_free(struct bpf_prog *fp)
++ {
++ 	bpf_prog_unlock_ro(fp);
++ 	__bpf_prog_free(fp);
++ }
++ 
++ typedef int (*bpf_aux_classic_check_t)(struct sock_filter *filter,
++ 				       unsigned int flen);
++ 
++ int bpf_prog_create(struct bpf_prog **pfp, struct sock_fprog_kern *fprog);
++ int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
++ 			      bpf_aux_classic_check_t trans, bool save_orig);
++ void bpf_prog_destroy(struct bpf_prog *fp);
++ 
++ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
++ int sk_attach_bpf(u32 ufd, struct sock *sk);
++ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);
++ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk);
++ int sk_detach_filter(struct sock *sk);
++ int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
++ 		  unsigned int len);
++ 
++ bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
++ void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
++ 
++ u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ void bpf_int_jit_compile(struct bpf_prog *fp);
++ bool bpf_helper_changes_skb_data(void *func);
++ 
++ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
++ 				       const struct bpf_insn *patch, u32 len);
++ 
+++>>>>>>> c237ee5eb33b (bpf: add bpf_patch_insn_single helper)
+  #ifdef CONFIG_BPF_JIT
+ -extern int bpf_jit_enable;
+ -
+ -typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+ -
+ -struct bpf_binary_header *
+ -bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
+ -		     unsigned int alignment,
+ -		     bpf_jit_fill_hole_t bpf_fill_ill_insns);
+ -void bpf_jit_binary_free(struct bpf_binary_header *hdr);
+ +#include <stdarg.h>
+ +#include <linux/linkage.h>
+ +#include <linux/printk.h>
+  
+ -void bpf_jit_compile(struct bpf_prog *fp);
+ -void bpf_jit_free(struct bpf_prog *fp);
+ +extern void bpf_jit_compile(struct sk_filter *fp);
+ +extern void bpf_jit_free(struct sk_filter *fp);
+  
+  static inline void bpf_jit_dump(unsigned int flen, unsigned int proglen,
+  				u32 pass, void *image)
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/verifier.c
