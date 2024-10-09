@@ -1,0 +1,180 @@
+fuse: add support for SEEK_HOLE and SEEK_DATA in lseek
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ravishankar N <ravishankar@redhat.com>
+commit 0b5da8db145bfd44266ac964a2636a0cf8d7c286
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0b5da8db.failed
+
+A useful performance improvement for accessing virtual machine images
+via FUSE mount.
+
+See https://bugzilla.redhat.com/show_bug.cgi?id=1220173 for a use-case
+for glusterFS.
+
+	Signed-off-by: Ravishankar N <ravishankar@redhat.com>
+	Signed-off-by: Miklos Szeredi <miklos@szeredi.hu>
+(cherry picked from commit 0b5da8db145bfd44266ac964a2636a0cf8d7c286)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/fuse.h
+diff --cc include/uapi/linux/fuse.h
+index 3069fc14ea12,5974fae54e12..000000000000
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@@ -101,6 -101,10 +101,13 @@@
+   *  - add FATTR_CTIME
+   *  - add ctime and ctimensec to fuse_setattr_in
+   *  - add FUSE_RENAME2 request
+++<<<<<<< HEAD
+++=======
++  *  - add FUSE_NO_OPEN_SUPPORT flag
++  *
++  *  7.24
++  *  - add FUSE_LSEEK for SEEK_HOLE and SEEK_DATA support
+++>>>>>>> 0b5da8db145b (fuse: add support for SEEK_HOLE and SEEK_DATA in lseek)
+   */
+  
+  #ifndef _LINUX_FUSE_H
+@@@ -136,7 -140,7 +143,11 @@@
+  #define FUSE_KERNEL_VERSION 7
+  
+  /** Minor version number of this interface */
+++<<<<<<< HEAD
+ +#define FUSE_KERNEL_MINOR_VERSION 22
+++=======
++ #define FUSE_KERNEL_MINOR_VERSION 24
+++>>>>>>> 0b5da8db145b (fuse: add support for SEEK_HOLE and SEEK_DATA in lseek)
+  
+  /** The node ID of the root inode */
+  #define FUSE_ROOT_ID 1
+@@@ -744,4 -759,18 +756,21 @@@ struct fuse_notify_retrieve_in 
+  	uint64_t	dummy4;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Device ioctls: */
++ #define FUSE_DEV_IOC_CLONE	_IOR(229, 0, uint32_t)
++ 
++ struct fuse_lseek_in {
++ 	uint64_t	fh;
++ 	uint64_t	offset;
++ 	uint32_t	whence;
++ 	uint32_t	padding;
++ };
++ 
++ struct fuse_lseek_out {
++ 	uint64_t	offset;
++ };
++ 
+++>>>>>>> 0b5da8db145b (fuse: add support for SEEK_HOLE and SEEK_DATA in lseek)
+  #endif /* _LINUX_FUSE_H */
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index ed212b08f7f8..b29cad4c20b7 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1837,20 +1837,77 @@ static sector_t fuse_bmap(struct address_space *mapping, sector_t block)
+ 	return err ? 0 : outarg.block;
+ }
+ 
++static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
++{
++	struct inode *inode = file->f_mapping->host;
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_file *ff = file->private_data;
++	FUSE_ARGS(args);
++	struct fuse_lseek_in inarg = {
++		.fh = ff->fh,
++		.offset = offset,
++		.whence = whence
++	};
++	struct fuse_lseek_out outarg;
++	int err;
++
++	if (fc->no_lseek)
++		goto fallback;
++
++	args.in.h.opcode = FUSE_LSEEK;
++	args.in.h.nodeid = ff->nodeid;
++	args.in.numargs = 1;
++	args.in.args[0].size = sizeof(inarg);
++	args.in.args[0].value = &inarg;
++	args.out.numargs = 1;
++	args.out.args[0].size = sizeof(outarg);
++	args.out.args[0].value = &outarg;
++	err = fuse_simple_request(fc, &args);
++	if (err) {
++		if (err == -ENOSYS) {
++			fc->no_lseek = 1;
++			goto fallback;
++		}
++		return err;
++	}
++
++	return vfs_setpos(file, outarg.offset, inode->i_sb->s_maxbytes);
++
++fallback:
++	err = fuse_update_attributes(inode, NULL, file, NULL);
++	if (!err)
++		return generic_file_llseek(file, offset, whence);
++	else
++		return err;
++}
++
+ static loff_t fuse_file_llseek(struct file *file, loff_t offset, int whence)
+ {
+ 	loff_t retval;
+ 	struct inode *inode = file_inode(file);
+ 
+-	/* No i_mutex protection necessary for SEEK_CUR and SEEK_SET */
+-	if (whence == SEEK_CUR || whence == SEEK_SET)
+-		return generic_file_llseek(file, offset, whence);
+-
+-	mutex_lock(&inode->i_mutex);
+-	retval = fuse_update_attributes(inode, NULL, file, NULL);
+-	if (!retval)
++	switch (whence) {
++	case SEEK_SET:
++	case SEEK_CUR:
++		 /* No i_mutex protection necessary for SEEK_CUR and SEEK_SET */
+ 		retval = generic_file_llseek(file, offset, whence);
+-	mutex_unlock(&inode->i_mutex);
++		break;
++	case SEEK_END:
++		mutex_lock(&inode->i_mutex);
++		retval = fuse_update_attributes(inode, NULL, file, NULL);
++		if (!retval)
++			retval = generic_file_llseek(file, offset, whence);
++		mutex_unlock(&inode->i_mutex);
++		break;
++	case SEEK_HOLE:
++	case SEEK_DATA:
++		mutex_lock(&inode->i_mutex);
++		retval = fuse_lseek(file, offset, whence);
++		mutex_unlock(&inode->i_mutex);
++		break;
++	default:
++		retval = -EINVAL;
++	}
+ 
+ 	return retval;
+ }
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 9704cb134cca..bdbc5113fba7 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -549,6 +549,9 @@ struct fuse_conn {
+ 	/** Does the filesystem support asynchronous direct-IO submission? */
+ 	unsigned async_dio:1;
+ 
++	/** Is lseek not implemented by fs? */
++	unsigned no_lseek:1;
++
+ 	/** The number of requests waiting for completion */
+ 	atomic_t num_waiting;
+ 
+* Unmerged path include/uapi/linux/fuse.h
