@@ -1,0 +1,136 @@
+bnxt_en: Allocate/Free CP rings for 57500 series chips.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Allocate/Free CP rings for 57500 series chips (Jonathan Toppins) [1623230 1643317]
+Rebuild_FUZZ: 99.08%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 3e08b1841bc8debf6b3d722b9d355093a1537b1e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3e08b184.failed
+
+On the new 57500 chips, we allocate/free one CP ring for each RX ring or
+TX ring separately.  Using separate CP rings for RX/TX is an improvement
+as TX events will no longer be stuck behind RX events.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3e08b1841bc8debf6b3d722b9d355093a1537b1e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 32307681362b,7952100e0171..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -4588,30 -4719,65 +4599,69 @@@ static int bnxt_hwrm_ring_alloc(struct 
+  		}
+  	}
+  
+ -	type = HWRM_RING_ALLOC_TX;
+  	for (i = 0; i < bp->tx_nr_rings; i++) {
+  		struct bnxt_tx_ring_info *txr = &bp->tx_ring[i];
+- 		struct bnxt_ring_struct *ring = &txr->tx_ring_struct;
+- 		u32 map_idx = i;
++ 		struct bnxt_ring_struct *ring;
++ 		u32 map_idx;
+  
+++<<<<<<< HEAD
+ +		rc = hwrm_ring_alloc_send_msg(bp, ring, HWRM_RING_ALLOC_TX,
+ +					      map_idx);
+++=======
++ 		if (bp->flags & BNXT_FLAG_CHIP_P5) {
++ 			struct bnxt_napi *bnapi = txr->bnapi;
++ 			struct bnxt_cp_ring_info *cpr, *cpr2;
++ 			u32 type2 = HWRM_RING_ALLOC_CMPL;
++ 
++ 			cpr = &bnapi->cp_ring;
++ 			cpr2 = cpr->cp_ring_arr[BNXT_TX_HDL];
++ 			ring = &cpr2->cp_ring_struct;
++ 			ring->handle = BNXT_TX_HDL;
++ 			map_idx = bnapi->index;
++ 			rc = hwrm_ring_alloc_send_msg(bp, ring, type2, map_idx);
++ 			if (rc)
++ 				goto err_out;
++ 			bnxt_set_db(bp, &cpr2->cp_db, type2, map_idx,
++ 				    ring->fw_ring_id);
++ 			bnxt_db_cq(bp, &cpr2->cp_db, cpr2->cp_raw_cons);
++ 		}
++ 		ring = &txr->tx_ring_struct;
++ 		map_idx = i;
++ 		rc = hwrm_ring_alloc_send_msg(bp, ring, type, map_idx);
+++>>>>>>> 3e08b1841bc8 (bnxt_en: Allocate/Free CP rings for 57500 series chips.)
+  		if (rc)
+  			goto err_out;
+ -		bnxt_set_db(bp, &txr->tx_db, type, map_idx, ring->fw_ring_id);
+ +		txr->tx_doorbell = bp->bar1 + map_idx * 0x80;
+  	}
+  
+ -	type = HWRM_RING_ALLOC_RX;
+  	for (i = 0; i < bp->rx_nr_rings; i++) {
+  		struct bnxt_rx_ring_info *rxr = &bp->rx_ring[i];
+  		struct bnxt_ring_struct *ring = &rxr->rx_ring_struct;
+- 		u32 map_idx = rxr->bnapi->index;
++ 		struct bnxt_napi *bnapi = rxr->bnapi;
++ 		u32 map_idx = bnapi->index;
+  
+ -		rc = hwrm_ring_alloc_send_msg(bp, ring, type, map_idx);
+ +		rc = hwrm_ring_alloc_send_msg(bp, ring, HWRM_RING_ALLOC_RX,
+ +					      map_idx);
+  		if (rc)
+  			goto err_out;
+ -		bnxt_set_db(bp, &rxr->rx_db, type, map_idx, ring->fw_ring_id);
+ -		bnxt_db_write(bp, &rxr->rx_db, rxr->rx_prod);
+ +		rxr->rx_doorbell = bp->bar1 + map_idx * 0x80;
+ +		writel(DB_KEY_RX | rxr->rx_prod, rxr->rx_doorbell);
+  		bp->grp_info[map_idx].rx_fw_ring_id = ring->fw_ring_id;
++ 		if (bp->flags & BNXT_FLAG_CHIP_P5) {
++ 			struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
++ 			u32 type2 = HWRM_RING_ALLOC_CMPL;
++ 			struct bnxt_cp_ring_info *cpr2;
++ 
++ 			cpr2 = cpr->cp_ring_arr[BNXT_RX_HDL];
++ 			ring = &cpr2->cp_ring_struct;
++ 			ring->handle = BNXT_RX_HDL;
++ 			rc = hwrm_ring_alloc_send_msg(bp, ring, type2, map_idx);
++ 			if (rc)
++ 				goto err_out;
++ 			bnxt_set_db(bp, &cpr2->cp_db, type2, map_idx,
++ 				    ring->fw_ring_id);
++ 			bnxt_db_cq(bp, &cpr2->cp_db, cpr2->cp_raw_cons);
++ 		}
+  	}
+  
+  	if (bp->flags & BNXT_FLAG_AGG_RINGS) {
+@@@ -4731,11 -4900,29 +4781,26 @@@ static void bnxt_hwrm_ring_free(struct 
+  	for (i = 0; i < bp->cp_nr_rings; i++) {
+  		struct bnxt_napi *bnapi = bp->bnapi[i];
+  		struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
+- 		struct bnxt_ring_struct *ring = &cpr->cp_ring_struct;
++ 		struct bnxt_ring_struct *ring;
++ 		int j;
++ 
++ 		for (j = 0; j < 2; j++) {
++ 			struct bnxt_cp_ring_info *cpr2 = cpr->cp_ring_arr[j];
+  
++ 			if (cpr2) {
++ 				ring = &cpr2->cp_ring_struct;
++ 				if (ring->fw_ring_id == INVALID_HW_RING_ID)
++ 					continue;
++ 				hwrm_ring_free_send_msg(bp, ring,
++ 					RING_FREE_REQ_RING_TYPE_L2_CMPL,
++ 					INVALID_HW_RING_ID);
++ 				ring->fw_ring_id = INVALID_HW_RING_ID;
++ 			}
++ 		}
++ 		ring = &cpr->cp_ring_struct;
+  		if (ring->fw_ring_id != INVALID_HW_RING_ID) {
+ -			hwrm_ring_free_send_msg(bp, ring, type,
+ +			hwrm_ring_free_send_msg(bp, ring,
+ +						RING_FREE_REQ_RING_TYPE_L2_CMPL,
+  						INVALID_HW_RING_ID);
+  			ring->fw_ring_id = INVALID_HW_RING_ID;
+  			bp->grp_info[i].cp_fw_ring_id = INVALID_HW_RING_ID;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
