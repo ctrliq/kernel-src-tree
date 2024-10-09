@@ -1,0 +1,187 @@
+perf/core: Update filters only on executable mmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mathieu Poirier <mathieu.poirier@linaro.org>
+commit 12b40a2393719a37ff86a0b43bece6d28a75cbfc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/12b40a23.failed
+
+Function perf_event_mmap() is called by the MM subsystem each time
+part of a binary is loaded in memory.  There can be several mapping
+for a binary, many times unrelated to the code section.
+
+Each time a section of a binary is mapped address filters are
+updated, event when the map doesn't pertain to the code section.
+The end result is that filters are configured based on the last map
+event that was received rather than the last mapping of the code
+segment.
+
+For example if we have an executable 'main' that calls library
+'libcstest.so.1.0', and that we want to collect traces on code
+that is in that library.  The perf cmd line for this scenario
+would be:
+
+  perf record -e cs_etm// --filter 'filter 0x72c/0x40@/opt/lib/libcstest.so.1.0' --per-thread ./main
+
+Resulting in binaries being mapped this way:
+
+  root@linaro-nano:~# cat /proc/1950/maps
+  00400000-00401000 r-xp 00000000 08:02 33169     /home/linaro/main
+  00410000-00411000 r--p 00000000 08:02 33169     /home/linaro/main
+  00411000-00412000 rw-p 00001000 08:02 33169     /home/linaro/main
+  7fa2464000-7fa2474000 rw-p 00000000 00:00 0
+  7fa2474000-7fa25a4000 r-xp 00000000 08:02 543   /lib/aarch64-linux-gnu/libc-2.21.so
+  7fa25a4000-7fa25b3000 ---p 00130000 08:02 543   /lib/aarch64-linux-gnu/libc-2.21.so
+  7fa25b3000-7fa25b7000 r--p 0012f000 08:02 543   /lib/aarch64-linux-gnu/libc-2.21.so
+  7fa25b7000-7fa25b9000 rw-p 00133000 08:02 543   /lib/aarch64-linux-gnu/libc-2.21.so
+  7fa25b9000-7fa25bd000 rw-p 00000000 00:00 0
+  7fa25bd000-7fa25be000 r-xp 00000000 08:02 38308 /opt/lib/libcstest.so.1.0
+  7fa25be000-7fa25cd000 ---p 00001000 08:02 38308 /opt/lib/libcstest.so.1.0
+  7fa25cd000-7fa25ce000 r--p 00000000 08:02 38308 /opt/lib/libcstest.so.1.0
+  7fa25ce000-7fa25cf000 rw-p 00001000 08:02 38308 /opt/lib/libcstest.so.1.0
+  7fa25cf000-7fa25eb000 r-xp 00000000 08:02 574   /lib/aarch64-linux-gnu/ld-2.21.so
+  7fa25ef000-7fa25f2000 rw-p 00000000 00:00 0
+  7fa25f7000-7fa25f9000 rw-p 00000000 00:00 0
+  7fa25f9000-7fa25fa000 r--p 00000000 00:00 0     [vvar]
+  7fa25fa000-7fa25fb000 r-xp 00000000 00:00 0     [vdso]
+  7fa25fb000-7fa25fc000 r--p 0001c000 08:02 574   /lib/aarch64-linux-gnu/ld-2.21.so
+  7fa25fc000-7fa25fe000 rw-p 0001d000 08:02 574   /lib/aarch64-linux-gnu/ld-2.21.so
+  7ff2ea8000-7ff2ec9000 rw-p 00000000 00:00 0     [stack]
+  root@linaro-nano:~#
+
+Before 'main()' can execute 'libcstest.so.1.0' has to be loaded in
+memory.  Once that has been done perf_event_mmap() has been called
+4 times, with the last map starting at address 0x7fa25ce000 and
+the address filter configured to start filtering when the
+IP has passed over address 0x0x7fa25ce72c (0x7fa25ce000 + 0x72c).
+
+But that is wrong since the code segment for library 'libcstest.so.1.0'
+as been mapped at 0x7fa25bd000, resulting in traces not being
+collected.
+
+This patch corrects the situation by requesting that address
+filters be updated only if the mapped event is for a code
+segment.
+
+	Signed-off-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: http://lkml.kernel.org/r/1468860187-318-3-git-send-email-mathieu.poirier@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 12b40a2393719a37ff86a0b43bece6d28a75cbfc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 40e87d6a2b06,9a030a96bc1f..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -6270,6 -6619,94 +6270,97 @@@ got_name
+  	kfree(buf);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Whether this @filter depends on a dynamic object which is not loaded
++  * yet or its load addresses are not known.
++  */
++ static bool perf_addr_filter_needs_mmap(struct perf_addr_filter *filter)
++ {
++ 	return filter->filter && filter->inode;
++ }
++ 
++ /*
++  * Check whether inode and address range match filter criteria.
++  */
++ static bool perf_addr_filter_match(struct perf_addr_filter *filter,
++ 				     struct file *file, unsigned long offset,
++ 				     unsigned long size)
++ {
++ 	if (filter->inode != file->f_inode)
++ 		return false;
++ 
++ 	if (filter->offset > offset + size)
++ 		return false;
++ 
++ 	if (filter->offset + filter->size < offset)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void __perf_addr_filters_adjust(struct perf_event *event, void *data)
++ {
++ 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
++ 	struct vm_area_struct *vma = data;
++ 	unsigned long off = vma->vm_pgoff << PAGE_SHIFT, flags;
++ 	struct file *file = vma->vm_file;
++ 	struct perf_addr_filter *filter;
++ 	unsigned int restart = 0, count = 0;
++ 
++ 	if (!has_addr_filter(event))
++ 		return;
++ 
++ 	if (!file)
++ 		return;
++ 
++ 	raw_spin_lock_irqsave(&ifh->lock, flags);
++ 	list_for_each_entry(filter, &ifh->list, entry) {
++ 		if (perf_addr_filter_match(filter, file, off,
++ 					     vma->vm_end - vma->vm_start)) {
++ 			event->addr_filters_offs[count] = vma->vm_start;
++ 			restart++;
++ 		}
++ 
++ 		count++;
++ 	}
++ 
++ 	if (restart)
++ 		event->addr_filters_gen++;
++ 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
++ 
++ 	if (restart)
++ 		perf_event_restart(event);
++ }
++ 
++ /*
++  * Adjust all task's events' filters to the new vma
++  */
++ static void perf_addr_filters_adjust(struct vm_area_struct *vma)
++ {
++ 	struct perf_event_context *ctx;
++ 	int ctxn;
++ 
++ 	/*
++ 	 * Data tracing isn't supported yet and as such there is no need
++ 	 * to keep track of anything that isn't related to executable code:
++ 	 */
++ 	if (!(vma->vm_flags & VM_EXEC))
++ 		return;
++ 
++ 	rcu_read_lock();
++ 	for_each_task_context_nr(ctxn) {
++ 		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
++ 		if (!ctx)
++ 			continue;
++ 
++ 		perf_iterate_ctx(ctx, __perf_addr_filters_adjust, vma, true);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
+++>>>>>>> 12b40a239371 (perf/core: Update filters only on executable mmap)
+  void perf_event_mmap(struct vm_area_struct *vma)
+  {
+  	struct perf_mmap_event mmap_event;
+* Unmerged path kernel/events/core.c
