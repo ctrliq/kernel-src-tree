@@ -609,6 +609,10 @@ static int get_fixed_ipv6_csum(__wsum hw_checksum, struct sk_buff *skb,
 	return 0;
 }
 #endif
+
+/* We reach this function only after checking that any of
+ * the (IPv4 | IPv6) bits are set in cqe->status.
+ */
 static int check_csum(struct mlx4_cqe *cqe, struct sk_buff *skb, void *va,
 		      netdev_features_t dev_features)
 {
@@ -624,13 +628,11 @@ static int check_csum(struct mlx4_cqe *cqe, struct sk_buff *skb, void *va,
 		hdr += sizeof(struct vlan_hdr);
 	}
 
-	if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV4))
-		return get_fixed_ipv4_csum(hw_checksum, skb, hdr);
 #if IS_ENABLED(CONFIG_IPV6)
 	if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV6))
 		return get_fixed_ipv6_csum(hw_checksum, skb, hdr);
 #endif
-	return 0;
+	return get_fixed_ipv4_csum(hw_checksum, skb, hdr);
 }
 
 int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int budget)
@@ -766,7 +768,11 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 			} else {
 				if (priv->flags & MLX4_EN_FLAG_RX_CSUM_NON_TCP_UDP &&
 				    (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV4 |
+#if IS_ENABLED(CONFIG_IPV6)
 							       MLX4_CQE_STATUS_IPV6))) {
+#else
+							       0))) {
+#endif
 					if (check_csum(cqe, skb, va, dev->features)) {
 						goto csum_none;
 					} else {
