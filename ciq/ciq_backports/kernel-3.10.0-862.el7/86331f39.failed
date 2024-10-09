@@ -1,0 +1,196 @@
+dm mpath: make it easier to detect unintended I/O request flushes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] dm mpath: make it easier to detect unintended I_O request flushes (Mike Snitzer) [1492250]
+Rebuild_FUZZ: 98.46%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 86331f39a5935b092d3ea59446d416563ed05d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/86331f39.failed
+
+I/O errors triggered by multipathd incorrectly not enabling the no-flush
+flag for DM_DEVICE_SUSPEND or DM_DEVICE_RESUME are hard to debug.  Add
+more logging to make it easier to debug this.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 86331f39a5935b092d3ea59446d416563ed05d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index 745e8192f19b,fd7cdc4ce2a5..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -496,58 -442,36 +496,79 @@@ failed
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Check whether bios must be queued in the device-mapper core rather
+ + * than here in the target.
+ + *
+ + * If m->queue_if_no_path and m->saved_queue_if_no_path hold the
+ + * same value then we are not between multipath_presuspend()
+ + * and multipath_resume() calls and we have no need to check
+ + * for the DMF_NOFLUSH_SUSPENDING flag.
+++=======
++  * dm_report_EIO() is a macro instead of a function to make pr_debug()
++  * report the function name and line number of the function from which
++  * it has been invoked.
++  */
++ #define dm_report_EIO(m)						\
++ ({									\
++ 	struct mapped_device *md = dm_table_get_md((m)->ti->table);	\
++ 									\
++ 	pr_debug("%s: returning EIO; QIFNP = %d; SQIFNP = %d; DNFS = %d\n", \
++ 		 dm_device_name(md),					\
++ 		 test_bit(MPATHF_QUEUE_IF_NO_PATH, &(m)->flags),	\
++ 		 test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &(m)->flags),	\
++ 		 dm_noflush_suspending((m)->ti));			\
++ 	-EIO;								\
++ })
++ 
++ /*
++  * Map cloned requests (request-based multipath)
+++>>>>>>> 86331f39a593 (dm mpath: make it easier to detect unintended I/O request flushes)
+   */
+ -static int multipath_clone_and_map(struct dm_target *ti, struct request *rq,
+ -				   union map_info *map_context,
+ -				   struct request **__clone)
+ +static bool __must_push_back(struct multipath *m)
+ +{
+ +	return ((test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) !=
+ +		 test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &m->flags)) &&
+ +		dm_noflush_suspending(m->ti));
+ +}
+ +
+ +static bool must_push_back_rq(struct multipath *m)
+ +{
+ +	bool r;
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&m->lock, flags);
+ +	r = (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) ||
+ +	     __must_push_back(m));
+ +	spin_unlock_irqrestore(&m->lock, flags);
+ +
+ +	return r;
+ +}
+ +
+ +static bool must_push_back_bio(struct multipath *m)
+ +{
+ +	bool r;
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&m->lock, flags);
+ +	r = __must_push_back(m);
+ +	spin_unlock_irqrestore(&m->lock, flags);
+ +
+ +	return r;
+ +}
+ +
+ +/*
+ + * Map cloned requests
+ + */
+ +static int __multipath_map(struct dm_target *ti, struct request *clone,
+ +			   union map_info *map_context,
+ +			   struct request *rq, struct request **__clone)
+  {
+  	struct multipath *m = ti->private;
+ -	size_t nr_bytes = blk_rq_bytes(rq);
+ +	size_t nr_bytes = clone ? blk_rq_bytes(clone) : blk_rq_bytes(rq);
+  	struct pgpath *pgpath;
+  	struct block_device *bdev;
+ -	struct dm_mpath_io *mpio = get_mpio(map_context);
+ -	struct request_queue *q;
+ -	struct request *clone;
+ +	struct dm_mpath_io *mpio;
+  
+  	/* Do we need to select a new pgpath? */
+  	pgpath = lockless_dereference(m->current_pgpath);
+@@@ -555,9 -479,9 +576,9 @@@
+  		pgpath = choose_pgpath(m, nr_bytes);
+  
+  	if (!pgpath) {
+ -		if (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))
+ +		if (must_push_back_rq(m))
+  			return DM_MAPIO_DELAY_REQUEUE;
+- 		return -EIO;	/* Failed */
++ 		return dm_report_EIO(m);	/* Failed */
+  	} else if (test_bit(MPATHF_QUEUE_IO, &m->flags) ||
+  		   test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags)) {
+  		if (pg_init_all_paths(m))
+@@@ -658,9 -556,9 +679,15 @@@ static int __multipath_map_bio(struct m
+  	}
+  
+  	if (!pgpath) {
+++<<<<<<< HEAD
+ +		if (!must_push_back_bio(m))
+ +			return -EIO;
+ +		return DM_MAPIO_REQUEUE;
+++=======
++ 		if (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))
++ 			return DM_MAPIO_REQUEUE;
++ 		return dm_report_EIO(m);
+++>>>>>>> 86331f39a593 (dm mpath: make it easier to detect unintended I/O request flushes)
+  	}
+  
+  	mpio->pgpath = pgpath;
+@@@ -1608,12 -1491,9 +1635,18 @@@ static int do_end_io(struct multipath *
+  	if (mpio->pgpath)
+  		fail_path(mpio->pgpath);
+  
+++<<<<<<< HEAD
+ +	if (!atomic_read(&m->nr_valid_paths)) {
+ +		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
+ +			if (!must_push_back_rq(m))
+ +				r = -EIO;
+ +		}
+ +	}
+++=======
++ 	if (atomic_read(&m->nr_valid_paths) == 0 &&
++ 	    !test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))
++ 		r = dm_report_EIO(m);
+++>>>>>>> 86331f39a593 (dm mpath: make it easier to detect unintended I/O request flushes)
+  
+  	return r;
+  }
+@@@ -1655,13 -1534,9 +1688,19 @@@ static int do_end_io_bio(struct multipa
+  	if (mpio->pgpath)
+  		fail_path(mpio->pgpath);
+  
+++<<<<<<< HEAD
+ +	if (!atomic_read(&m->nr_valid_paths)) {
+ +		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
+ +			if (!must_push_back_bio(m))
+ +				return -EIO;
+ +			return DM_ENDIO_REQUEUE;
+ +		}
+ +	}
+++=======
++ 	if (atomic_read(&m->nr_valid_paths) == 0 &&
++ 	    !test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))
++ 		return dm_report_EIO(m);
+++>>>>>>> 86331f39a593 (dm mpath: make it easier to detect unintended I/O request flushes)
+  
+  	/* Queue for the daemon to resubmit */
+  	dm_bio_restore(get_bio_details_from_bio(clone), clone);
+* Unmerged path drivers/md/dm-mpath.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 879ca5c36262..decd17dc7c19 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -2392,6 +2392,8 @@ static int __dm_suspend(struct mapped_device *md, struct dm_table *map,
+ 	 */
+ 	if (noflush)
+ 		set_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
++	else
++		pr_debug("%s: suspending with flush\n", dm_device_name(md));
+ 
+ 	/*
+ 	 * This gets reverted if there's an error later and the targets
