@@ -3579,7 +3579,6 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	if (!mdsc)
 		return -ENOMEM;
 	mdsc->fsc = fsc;
-	fsc->mdsc = mdsc;
 	mutex_init(&mdsc->mutex);
 	mdsc->mdsmap = kzalloc(sizeof(*mdsc->mdsmap), GFP_NOFS);
 	if (!mdsc->mdsmap) {
@@ -3587,6 +3586,7 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 		return -ENOMEM;
 	}
 
+	fsc->mdsc = mdsc;
 	init_completion(&mdsc->safe_umount_waiters);
 	init_waitqueue_head(&mdsc->session_close_wq);
 	INIT_LIST_HEAD(&mdsc->waiting_for_map);
@@ -3864,6 +3864,9 @@ void ceph_mdsc_destroy(struct ceph_fs_client *fsc)
 {
 	struct ceph_mds_client *mdsc = fsc->mdsc;
 	dout("mdsc_destroy %p\n", mdsc);
+
+	if (!mdsc)
+		return;
 
 	/* flush out any connection work with references to us */
 	ceph_msgr_flush();
