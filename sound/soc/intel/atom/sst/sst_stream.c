@@ -42,7 +42,6 @@ int sst_alloc_stream_mrfld(struct intel_sst_drv *sst_drv_ctx, void *params)
 	int i, num_ch, str_id;
 
 	dev_dbg(sst_drv_ctx->dev, "Enter\n");
-	BUG_ON(!params);
 
 	str_params = (struct snd_sst_params *)params;
 	str_id = str_params->stream_id;
