@@ -1,0 +1,876 @@
+s390/zcrypt: tracepoint definitions for zcrypt device driver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: tracepoint definitions for zcrypt device driver (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 94.83%
+commit-author Harald Freudenberger <freude@linux.vnet.ibm.com>
+commit 13b251bdc8b97c45cc8b1d57193ab05ec0fe97e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/13b251bd.failed
+
+This patch introduces tracepoint definitions and tracepoint
+event invocations for the s390 zcrypt device.
+
+Currently there are just two tracepoint events defined.
+An s390_zcrypt_req request event occurs as soon as the
+request is recognized by the zcrypt ioctl function. This
+event may act as some kind of request-processing-starts-now
+indication.
+As late as possible within the zcrypt ioctl function there
+occurs the s390_zcrypt_rep event which may act as the point
+in time where the request has been processed by the kernel
+and the result is about to be transferred back to userspace.
+The glue which binds together request and reply event is the
+ptr parameter, which is the local buffer address where the
+request from userspace has been stored by the ioctl function.
+
+The main purpose of this zcrypt tracepoint patch is to get
+some data for performance measurements together with
+information about the kind of request and on which card and
+queue the request has been processed. It is not an ffdc
+interface as there is already code in the zcrypt device
+driver to serve the s390 debug feature interface.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 13b251bdc8b97c45cc8b1d57193ab05ec0fe97e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/zcrypt_api.c
+diff --cc drivers/s390/crypto/zcrypt_api.c
+index 0d5282ef176d,854a6e58dfea..000000000000
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@@ -41,10 -41,14 +41,17 @@@
+  #include <linux/debugfs.h>
+  #include <asm/debug.h>
+  
+++<<<<<<< HEAD
+++=======
++ #define CREATE_TRACE_POINTS
++ #include <asm/trace/zcrypt.h>
++ 
++ #include "zcrypt_api.h"
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  #include "zcrypt_debug.h"
+ +#include "zcrypt_api.h"
+  
+  #include "zcrypt_msgtype6.h"
+ -#include "zcrypt_msgtype50.h"
+  
+  /*
+   * Module description.
+@@@ -54,9 -58,20 +61,26 @@@ MODULE_DESCRIPTION("Cryptographic Copro
+  		   "Copyright IBM Corp. 2001, 2012");
+  MODULE_LICENSE("GPL");
+  
+++<<<<<<< HEAD
+ +static DEFINE_SPINLOCK(zcrypt_device_lock);
+ +static LIST_HEAD(zcrypt_device_list);
+ +static int zcrypt_device_count = 0;
+++=======
++ /*
++  * zcrypt tracepoint functions
++  */
++ EXPORT_TRACEPOINT_SYMBOL(s390_zcrypt_req);
++ EXPORT_TRACEPOINT_SYMBOL(s390_zcrypt_rep);
++ 
++ static int zcrypt_hwrng_seed = 1;
++ module_param_named(hwrng_seed, zcrypt_hwrng_seed, int, S_IRUSR|S_IRGRP);
++ MODULE_PARM_DESC(hwrng_seed, "Turn on/off hwrng auto seed, default is 1 (on).");
++ 
++ DEFINE_SPINLOCK(zcrypt_list_lock);
++ LIST_HEAD(zcrypt_card_list);
++ int zcrypt_device_count;
++ 
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  static atomic_t zcrypt_open_count = ATOMIC_INIT(0);
+  static atomic_t zcrypt_rescan_count = ATOMIC_INIT(0);
+  
+@@@ -420,11 -229,19 +444,24 @@@ static int zcrypt_release(struct inode 
+   */
+  static long zcrypt_rsa_modexpo(struct ica_rsa_modexpo *mex)
+  {
+++<<<<<<< HEAD
+ +	struct zcrypt_device *zdev;
+ +	int rc;
+++=======
++ 	struct zcrypt_card *zc, *pref_zc;
++ 	struct zcrypt_queue *zq, *pref_zq;
++ 	unsigned int weight, pref_weight;
++ 	unsigned int func_code;
++ 	int qid = 0, rc = -ENODEV;
++ 
++ 	trace_s390_zcrypt_req(mex, TP_ICARSAMODEXPO);
++ 
++ 	if (mex->outputdatalength < mex->inputdatalength) {
++ 		rc = -EINVAL;
++ 		goto out;
++ 	}
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  
+- 	if (mex->outputdatalength < mex->inputdatalength)
+- 		return -EINVAL;
+  	/*
+  	 * As long as outputdatalength is big enough, we can set the
+  	 * outputdatalength equal to the inputdatalength, since that is the
+@@@ -432,44 -249,73 +469,92 @@@
+  	 */
+  	mex->outputdatalength = mex->inputdatalength;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online ||
+ +		    !zdev->ops->rsa_modexpo ||
+ +		    zdev->min_mod_size > mex->inputdatalength ||
+ +		    zdev->max_mod_size < mex->inputdatalength)
+++=======
++ 	rc = get_rsa_modex_fc(mex, &func_code);
++ 	if (rc)
++ 		goto out;
++ 
++ 	pref_zc = NULL;
++ 	pref_zq = NULL;
++ 	spin_lock(&zcrypt_list_lock);
++ 	for_each_zcrypt_card(zc) {
++ 		/* Check for online accelarator and CCA cards */
++ 		if (!zc->online || !(zc->card->functions & 0x18000000))
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  			continue;
+ -		/* Check for size limits */
+ -		if (zc->min_mod_size > mex->inputdatalength ||
+ -		    zc->max_mod_size < mex->inputdatalength)
+ -			continue;
+ -		/* get weight index of the card device	*/
+ -		weight = zc->speed_rating[func_code];
+ -		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ -			continue;
+ -		for_each_zcrypt_queue(zq, zc) {
+ -			/* check if device is online and eligible */
+ -			if (!zq->online || !zq->ops->rsa_modexpo)
+ -				continue;
+ -			if (zcrypt_queue_compare(zq, pref_zq,
+ -						 weight, pref_weight))
+ -				continue;
+ -			pref_zc = zc;
+ -			pref_zq = zq;
+ -			pref_weight = weight;
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->rsa_modexpo(zdev, mex);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+  		}
+ +		else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+++=======
++ 	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ 	if (!pref_zq) {
++ 		rc = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	qid = pref_zq->queue->qid;
++ 	rc = pref_zq->ops->rsa_modexpo(pref_zq, mex);
++ 
++ 	spin_lock(&zcrypt_list_lock);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ out:
++ 	trace_s390_zcrypt_rep(mex, func_code, rc,
++ 			      AP_QID_CARD(qid), AP_QID_QUEUE(qid));
++ 	return rc;
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  }
+  
+  static long zcrypt_rsa_crt(struct ica_rsa_modexpo_crt *crt)
+  {
+++<<<<<<< HEAD
+ +	struct zcrypt_device *zdev;
+ +	unsigned long long z1, z2, z3;
+ +	int rc, copied;
+++=======
++ 	struct zcrypt_card *zc, *pref_zc;
++ 	struct zcrypt_queue *zq, *pref_zq;
++ 	unsigned int weight, pref_weight;
++ 	unsigned int func_code;
++ 	int qid = 0, rc = -ENODEV;
++ 
++ 	trace_s390_zcrypt_req(crt, TP_ICARSACRT);
++ 
++ 	if (crt->outputdatalength < crt->inputdatalength) {
++ 		rc = -EINVAL;
++ 		goto out;
++ 	}
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  
+- 	if (crt->outputdatalength < crt->inputdatalength)
+- 		return -EINVAL;
+  	/*
+  	 * As long as outputdatalength is big enough, we can set the
+  	 * outputdatalength equal to the inputdatalength, since that is the
+@@@ -477,227 -323,304 +562,424 @@@
+  	 */
+  	crt->outputdatalength = crt->inputdatalength;
+  
+++<<<<<<< HEAD
+ +	copied = 0;
+ + restart:
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online ||
+ +		    !zdev->ops->rsa_modexpo_crt ||
+ +		    zdev->min_mod_size > crt->inputdatalength ||
+ +		    zdev->max_mod_size < crt->inputdatalength)
+++=======
++ 	rc = get_rsa_crt_fc(crt, &func_code);
++ 	if (rc)
++ 		goto out;
++ 
++ 	pref_zc = NULL;
++ 	pref_zq = NULL;
++ 	spin_lock(&zcrypt_list_lock);
++ 	for_each_zcrypt_card(zc) {
++ 		/* Check for online accelarator and CCA cards */
++ 		if (!zc->online || !(zc->card->functions & 0x18000000))
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  			continue;
+ -		/* Check for size limits */
+ -		if (zc->min_mod_size > crt->inputdatalength ||
+ -		    zc->max_mod_size < crt->inputdatalength)
+ -			continue;
+ -		/* get weight index of the card device	*/
+ -		weight = zc->speed_rating[func_code];
+ -		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ -			continue;
+ -		for_each_zcrypt_queue(zq, zc) {
+ -			/* check if device is online and eligible */
+ -			if (!zq->online || !zq->ops->rsa_modexpo_crt)
+ -				continue;
+ -			if (zcrypt_queue_compare(zq, pref_zq,
+ -						 weight, pref_weight))
+ +		if (zdev->short_crt && crt->inputdatalength > 240) {
+ +			/*
+ +			 * Check inputdata for leading zeros for cards
+ +			 * that can't handle np_prime, bp_key, or
+ +			 * u_mult_inv > 128 bytes.
+ +			 */
+ +			if (copied == 0) {
+ +				unsigned int len;
+ +				spin_unlock_bh(&zcrypt_device_lock);
+ +				/* len is max 256 / 2 - 120 = 8
+ +				 * For bigger device just assume len of leading
+ +				 * 0s is 8 as stated in the requirements for
+ +				 * ica_rsa_modexpo_crt struct in zcrypt.h.
+ +				 */
+ +				if (crt->inputdatalength <= 256)
+ +					len = crt->inputdatalength / 2 - 120;
+ +				else
+ +					len = 8;
+ +				if (len > sizeof(z1))
+ +					return -EFAULT;
+ +				z1 = z2 = z3 = 0;
+ +				if (copy_from_user(&z1, crt->np_prime, len) ||
+ +				    copy_from_user(&z2, crt->bp_key, len) ||
+ +				    copy_from_user(&z3, crt->u_mult_inv, len))
+ +					return -EFAULT;
+ +				z1 = z2 = z3 = 0;
+ +				copied = 1;
+ +				/*
+ +				 * We have to restart device lookup -
+ +				 * the device list may have changed by now.
+ +				 */
+ +				goto restart;
+ +			}
+ +			if (z1 != 0ULL || z2 != 0ULL || z3 != 0ULL)
+ +				/* The device can't handle this request. */
+  				continue;
+ -			pref_zc = zc;
+ -			pref_zq = zq;
+ -			pref_weight = weight;
+  		}
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->rsa_modexpo_crt(zdev, crt);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+ +		}
+ +		else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+++=======
++ 	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ 	if (!pref_zq) {
++ 		rc = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	qid = pref_zq->queue->qid;
++ 	rc = pref_zq->ops->rsa_modexpo_crt(pref_zq, crt);
++ 
++ 	spin_lock(&zcrypt_list_lock);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ out:
++ 	trace_s390_zcrypt_rep(crt, func_code, rc,
++ 			      AP_QID_CARD(qid), AP_QID_QUEUE(qid));
++ 	return rc;
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  }
+  
+ -static long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+ +long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+  {
+++<<<<<<< HEAD
+ +	struct zcrypt_device *zdev;
+ +	int rc;
+ +
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online || !zdev->ops->send_cprb ||
+ +		   (zdev->ops->variant == MSGTYPE06_VARIANT_EP11) ||
+ +		   (xcRB->user_defined != AUTOSELECT &&
+ +		    AP_QID_DEVICE(zdev->ap_dev->qid) != xcRB->user_defined))
+++=======
++ 	struct zcrypt_card *zc, *pref_zc;
++ 	struct zcrypt_queue *zq, *pref_zq;
++ 	struct ap_message ap_msg;
++ 	unsigned int weight, pref_weight;
++ 	unsigned int func_code;
++ 	unsigned short *domain;
++ 	int qid = 0, rc = -ENODEV;
++ 
++ 	trace_s390_zcrypt_req(xcRB, TB_ZSECSENDCPRB);
++ 
++ 	rc = get_cprb_fc(xcRB, &ap_msg, &func_code, &domain);
++ 	if (rc)
++ 		goto out;
++ 
++ 	pref_zc = NULL;
++ 	pref_zq = NULL;
++ 	spin_lock(&zcrypt_list_lock);
++ 	for_each_zcrypt_card(zc) {
++ 		/* Check for online CCA cards */
++ 		if (!zc->online || !(zc->card->functions & 0x10000000))
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  			continue;
+ -		/* Check for user selected CCA card */
+ -		if (xcRB->user_defined != AUTOSELECT &&
+ -		    xcRB->user_defined != zc->card->id)
+ -			continue;
+ -		/* get weight index of the card device	*/
+ -		weight = speed_idx_cca(func_code) * zc->speed_rating[SECKEY];
+ -		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ -			continue;
+ -		for_each_zcrypt_queue(zq, zc) {
+ -			/* check if device is online and eligible */
+ -			if (!zq->online ||
+ -			    !zq->ops->send_cprb ||
+ -			    ((*domain != (unsigned short) AUTOSELECT) &&
+ -			     (*domain != AP_QID_QUEUE(zq->queue->qid))))
+ -				continue;
+ -			if (zcrypt_queue_compare(zq, pref_zq,
+ -						 weight, pref_weight))
+ -				continue;
+ -			pref_zc = zc;
+ -			pref_zq = zq;
+ -			pref_weight = weight;
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->send_cprb(zdev, xcRB);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+  		}
+ +		else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+++=======
++ 	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ 	if (!pref_zq) {
++ 		rc = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	/* in case of auto select, provide the correct domain */
++ 	qid = pref_zq->queue->qid;
++ 	if (*domain == (unsigned short) AUTOSELECT)
++ 		*domain = AP_QID_QUEUE(qid);
++ 
++ 	rc = pref_zq->ops->send_cprb(pref_zq, xcRB, &ap_msg);
++ 
++ 	spin_lock(&zcrypt_list_lock);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ out:
++ 	trace_s390_zcrypt_rep(xcRB, func_code, rc,
++ 			      AP_QID_CARD(qid), AP_QID_QUEUE(qid));
++ 	return rc;
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  }
+ +EXPORT_SYMBOL(zcrypt_send_cprb);
+  
+ -static bool is_desired_ep11_card(unsigned int dev_id,
+ -				 unsigned short target_num,
+ -				 struct ep11_target_dev *targets)
+ -{
+ -	while (target_num-- > 0) {
+ -		if (dev_id == targets->ap_id)
+ -			return true;
+ -		targets++;
+ -	}
+ -	return false;
+ -}
+ +struct ep11_target_dev_list {
+ +	unsigned short		targets_num;
+ +	struct ep11_target_dev	*targets;
+ +};
+  
+ -static bool is_desired_ep11_queue(unsigned int dev_qid,
+ -				  unsigned short target_num,
+ -				  struct ep11_target_dev *targets)
+ +static bool is_desired_ep11dev(unsigned int dev_qid,
+ +			       struct ep11_target_dev_list dev_list)
+  {
+ -	while (target_num-- > 0) {
+ -		if (AP_MKQID(targets->ap_id, targets->dom_id) == dev_qid)
+ +	int n;
+ +
+ +	for (n = 0; n < dev_list.targets_num; n++, dev_list.targets++) {
+ +		if ((AP_QID_DEVICE(dev_qid) == dev_list.targets->ap_id) &&
+ +		    (AP_QID_QUEUE(dev_qid) == dev_list.targets->dom_id)) {
+  			return true;
+ -		targets++;
+ +		}
+  	}
+  	return false;
+  }
+  
+  static long zcrypt_send_ep11_cprb(struct ep11_urb *xcrb)
+  {
+++<<<<<<< HEAD
+ +	struct zcrypt_device *zdev;
+ +	bool autoselect = false;
+ +	int rc;
+ +	struct ep11_target_dev_list ep11_dev_list = {
+ +		.targets_num	=  0x00,
+ +		.targets	=  NULL,
+ +	};
+++=======
++ 	struct zcrypt_card *zc, *pref_zc;
++ 	struct zcrypt_queue *zq, *pref_zq;
++ 	struct ep11_target_dev *targets;
++ 	unsigned short target_num;
++ 	unsigned int weight, pref_weight;
++ 	unsigned int func_code;
++ 	struct ap_message ap_msg;
++ 	int qid = 0, rc = -ENODEV;
++ 
++ 	trace_s390_zcrypt_req(xcrb, TP_ZSENDEP11CPRB);
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  
+ -	target_num = (unsigned short) xcrb->targets_num;
+ +	ep11_dev_list.targets_num = (unsigned short) xcrb->targets_num;
+  
+  	/* empty list indicates autoselect (all available targets) */
+++<<<<<<< HEAD
+ +	if (ep11_dev_list.targets_num == 0)
+ +		autoselect = true;
+ +	else {
+ +		ep11_dev_list.targets = kcalloc((unsigned short)
+ +						xcrb->targets_num,
+ +						sizeof(struct ep11_target_dev),
+ +						GFP_KERNEL);
+ +		if (!ep11_dev_list.targets)
+ +			return -ENOMEM;
+ +
+ +		if (copy_from_user(ep11_dev_list.targets,
+ +				   (struct ep11_target_dev __force __user *)
+ +				   xcrb->targets, xcrb->targets_num *
+ +				   sizeof(struct ep11_target_dev)))
+ +			return -EFAULT;
+++=======
++ 	targets = NULL;
++ 	if (target_num != 0) {
++ 		struct ep11_target_dev __user *uptr;
++ 
++ 		targets = kcalloc(target_num, sizeof(*targets), GFP_KERNEL);
++ 		if (!targets) {
++ 			rc = -ENOMEM;
++ 			goto out;
++ 		}
++ 
++ 		uptr = (struct ep11_target_dev __force __user *) xcrb->targets;
++ 		if (copy_from_user(targets, uptr,
++ 				   target_num * sizeof(*targets))) {
++ 			rc = -EFAULT;
++ 			goto out;
++ 		}
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  	}
+  
+ -	rc = get_ep11cprb_fc(xcrb, &ap_msg, &func_code);
+ -	if (rc)
+ -		goto out_free;
+ -
+ -	pref_zc = NULL;
+ -	pref_zq = NULL;
+ -	spin_lock(&zcrypt_list_lock);
+ -	for_each_zcrypt_card(zc) {
+ -		/* Check for online EP11 cards */
+ -		if (!zc->online || !(zc->card->functions & 0x04000000))
+ -			continue;
+ -		/* Check for user selected EP11 card */
+ -		if (targets &&
+ -		    !is_desired_ep11_card(zc->card->id, target_num, targets))
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		/* check if device is eligible */
+ +		if (!zdev->online ||
+ +		    zdev->ops->variant != MSGTYPE06_VARIANT_EP11)
+  			continue;
+ -		/* get weight index of the card device	*/
+ -		weight = speed_idx_ep11(func_code) * zc->speed_rating[SECKEY];
+ -		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ +
+ +		/* check if device is selected as valid target */
+ +		if (!is_desired_ep11dev(zdev->ap_dev->qid, ep11_dev_list) &&
+ +		    !autoselect)
+  			continue;
+ -		for_each_zcrypt_queue(zq, zc) {
+ -			/* check if device is online and eligible */
+ -			if (!zq->online ||
+ -			    !zq->ops->send_ep11_cprb ||
+ -			    (targets &&
+ -			     !is_desired_ep11_queue(zq->queue->qid,
+ -						    target_num, targets)))
+ -				continue;
+ -			if (zcrypt_queue_compare(zq, pref_zq,
+ -						 weight, pref_weight))
+ -				continue;
+ -			pref_zc = zc;
+ -			pref_zq = zq;
+ -			pref_weight = weight;
+ -		}
+ +
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->send_ep11_cprb(zdev, xcrb);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+ +		} else {
+ +			rc = -EAGAIN;
+ +		  }
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+++=======
++ 	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ 	if (!pref_zq) {
++ 		rc = -ENODEV;
++ 		goto out_free;
++ 	}
++ 
++ 	qid = pref_zq->queue->qid;
++ 	rc = pref_zq->ops->send_ep11_cprb(pref_zq, xcrb, &ap_msg);
++ 
++ 	spin_lock(&zcrypt_list_lock);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ out_free:
++ 	kfree(targets);
++ out:
++ 	trace_s390_zcrypt_rep(xcrb, func_code, rc,
++ 			      AP_QID_CARD(qid), AP_QID_QUEUE(qid));
++ 	return rc;
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  }
+  
+  static long zcrypt_rng(char *buffer)
+  {
+++<<<<<<< HEAD
+ +	struct zcrypt_device *zdev;
+ +	int rc;
+ +
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online || !zdev->ops->rng)
+ +			continue;
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->rng(zdev, buffer);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+ +		} else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+ +	}
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+++=======
++ 	struct zcrypt_card *zc, *pref_zc;
++ 	struct zcrypt_queue *zq, *pref_zq;
++ 	unsigned int weight, pref_weight;
++ 	unsigned int func_code;
++ 	struct ap_message ap_msg;
++ 	unsigned int domain;
++ 	int qid = 0, rc = -ENODEV;
++ 
++ 	trace_s390_zcrypt_req(buffer, TP_HWRNGCPRB);
++ 
++ 	rc = get_rng_fc(&ap_msg, &func_code, &domain);
++ 	if (rc)
++ 		goto out;
++ 
++ 	pref_zc = NULL;
++ 	pref_zq = NULL;
++ 	spin_lock(&zcrypt_list_lock);
++ 	for_each_zcrypt_card(zc) {
++ 		/* Check for online CCA cards */
++ 		if (!zc->online || !(zc->card->functions & 0x10000000))
++ 			continue;
++ 		/* get weight index of the card device	*/
++ 		weight = zc->speed_rating[func_code];
++ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
++ 			continue;
++ 		for_each_zcrypt_queue(zq, zc) {
++ 			/* check if device is online and eligible */
++ 			if (!zq->online || !zq->ops->rng)
++ 				continue;
++ 			if (zcrypt_queue_compare(zq, pref_zq,
++ 						 weight, pref_weight))
++ 				continue;
++ 			pref_zc = zc;
++ 			pref_zq = zq;
++ 			pref_weight = weight;
++ 		}
++ 	}
++ 	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ 	if (!pref_zq)
++ 		return -ENODEV;
++ 
++ 	qid = pref_zq->queue->qid;
++ 	rc = pref_zq->ops->rng(pref_zq, buffer, &ap_msg);
++ 
++ 	spin_lock(&zcrypt_list_lock);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, weight);
++ 	spin_unlock(&zcrypt_list_lock);
++ 
++ out:
++ 	trace_s390_zcrypt_rep(buffer, func_code, rc,
++ 			      AP_QID_CARD(qid), AP_QID_QUEUE(qid));
++ 	return rc;
+++>>>>>>> 13b251bdc8b9 (s390/zcrypt: tracepoint definitions for zcrypt device driver.)
+  }
+  
+ -static void zcrypt_device_status_mask(struct zcrypt_device_matrix *matrix)
+ +void zcrypt_device_status_mask(struct zcrypt_device_matrix *matrix)
+  {
+  	struct zcrypt_card *zc;
+  	struct zcrypt_queue *zq;
+diff --git a/arch/s390/include/asm/trace/zcrypt.h b/arch/s390/include/asm/trace/zcrypt.h
+new file mode 100644
+index 000000000000..adcb77fafa9d
+--- /dev/null
++++ b/arch/s390/include/asm/trace/zcrypt.h
+@@ -0,0 +1,122 @@
++/*
++ * Tracepoint definitions for the s390 zcrypt device driver
++ *
++ * Copyright IBM Corp. 2016
++ * Author(s): Harald Freudenberger <freude@de.ibm.com>
++ *
++ * Currently there are two tracepoint events defined here.
++ * An s390_zcrypt_req request event occurs as soon as the request is
++ * recognized by the zcrypt ioctl function. This event may act as some kind
++ * of request-processing-starts-now indication.
++ * As late as possible within the zcrypt ioctl function there occurs the
++ * s390_zcrypt_rep event which may act as the point in time where the
++ * request has been processed by the kernel and the result is about to be
++ * transferred back to userspace.
++ * The glue which binds together request and reply event is the ptr
++ * parameter, which is the local buffer address where the request from
++ * userspace has been stored by the ioctl function.
++ *
++ * The main purpose of this zcrypt tracepoint api is to get some data for
++ * performance measurements together with information about on which card
++ * and queue the request has been processed. It is not an ffdc interface as
++ * there is already code in the zcrypt device driver to serve the s390
++ * debug feature interface.
++ */
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM s390
++
++#if !defined(_TRACE_S390_ZCRYPT_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_S390_ZCRYPT_H
++
++#include <linux/tracepoint.h>
++
++#define TP_ICARSAMODEXPO  0x0001
++#define TP_ICARSACRT	  0x0002
++#define TB_ZSECSENDCPRB   0x0003
++#define TP_ZSENDEP11CPRB  0x0004
++#define TP_HWRNGCPRB	  0x0005
++
++#define show_zcrypt_tp_type(type)				\
++	__print_symbolic(type,					\
++			 { TP_ICARSAMODEXPO, "ICARSAMODEXPO" }, \
++			 { TP_ICARSACRT, "ICARSACRT" },		\
++			 { TB_ZSECSENDCPRB, "ZSECSENDCPRB" },	\
++			 { TP_ZSENDEP11CPRB, "ZSENDEP11CPRB" }, \
++			 { TP_HWRNGCPRB, "HWRNGCPRB" })
++
++/**
++ * trace_s390_zcrypt_req - zcrypt request tracepoint function
++ * @ptr:  Address of the local buffer where the request from userspace
++ *	  is stored. Can be used as a unique id to relate together
++ *	  request and reply.
++ * @type: One of the TP_ defines above.
++ *
++ * Called when a request from userspace is recognised within the ioctl
++ * function of the zcrypt device driver and may act as an entry
++ * timestamp.
++ */
++TRACE_EVENT(s390_zcrypt_req,
++	    TP_PROTO(void *ptr, u32 type),
++	    TP_ARGS(ptr, type),
++	    TP_STRUCT__entry(
++		    __field(void *, ptr)
++		    __field(u32, type)),
++	    TP_fast_assign(
++		    __entry->ptr = ptr;
++		    __entry->type = type;),
++	    TP_printk("ptr=%p type=%s",
++		      __entry->ptr,
++		      show_zcrypt_tp_type(__entry->type))
++);
++
++/**
++ * trace_s390_zcrypt_rep - zcrypt reply tracepoint function
++ * @ptr:  Address of the local buffer where the request from userspace
++ *	  is stored. Can be used as a unique id to match together
++ *	  request and reply.
++ * @fc:   Function code.
++ * @rc:   The bare returncode as returned by the device driver ioctl
++ *	  function.
++ * @dev:  The adapter nr where this request was actually processed.
++ * @dom:  Domain id of the device where this request was processed.
++ *
++ * Called upon recognising the reply from the crypto adapter. This
++ * message may act as the exit timestamp for the request but also
++ * carries some info about on which adapter the request was processed
++ * and the returncode from the device driver.
++ */
++TRACE_EVENT(s390_zcrypt_rep,
++	    TP_PROTO(void *ptr, u32 fc, u32 rc, u16 dev, u16 dom),
++	    TP_ARGS(ptr, fc, rc, dev, dom),
++	    TP_STRUCT__entry(
++		    __field(void *, ptr)
++		    __field(u32, fc)
++		    __field(u32, rc)
++		    __field(u16, device)
++		    __field(u16, domain)),
++	    TP_fast_assign(
++		    __entry->ptr = ptr;
++		    __entry->fc = fc;
++		    __entry->rc = rc;
++		    __entry->device = dev;
++		    __entry->domain = dom;),
++	    TP_printk("ptr=%p fc=0x%04x rc=%d dev=0x%02hx domain=0x%04hx",
++		      __entry->ptr,
++		      (unsigned int) __entry->fc,
++		      (int) __entry->rc,
++		      (unsigned short) __entry->device,
++		      (unsigned short) __entry->domain)
++);
++
++#endif /* _TRACE_S390_ZCRYPT_H */
++
++/* This part must be outside protection */
++
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++
++#define TRACE_INCLUDE_PATH asm/trace
++#define TRACE_INCLUDE_FILE zcrypt
++
++#include <trace/define_trace.h>
+* Unmerged path drivers/s390/crypto/zcrypt_api.c
