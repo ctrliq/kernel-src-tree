@@ -1,0 +1,179 @@
+inet: add IP_BIND_ADDRESS_NO_PORT to overcome bind(0) limitations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 90c337da1524863838658078ec34241f45d8394d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/90c337da.failed
+
+When an application needs to force a source IP on an active TCP socket
+it has to use bind(IP, port=x).
+
+As most applications do not want to deal with already used ports, x is
+often set to 0, meaning the kernel is in charge to find an available
+port.
+But kernel does not know yet if this socket is going to be a listener or
+be connected.
+It has very limited choices (no full knowledge of final 4-tuple for a
+connect())
+
+With limited ephemeral port range (about 32K ports), it is very easy to
+fill the space.
+
+This patch adds a new SOL_IP socket option, asking kernel to ignore
+the 0 port provided by application in bind(IP, port=0) and only
+remember the given IP address.
+
+The port will be automatically chosen at connect() time, in a way
+that allows sharing a source port as long as the 4-tuples are unique.
+
+This new feature is available for both IPv4 and IPv6 (Thanks Neal)
+
+Tested:
+
+Wrote a test program and checked its behavior on IPv4 and IPv6.
+
+strace(1) shows sequences of bind(IP=127.0.0.2, port=0) followed by
+connect().
+Also getsockname() show that the port is still 0 right after bind()
+but properly allocated after connect().
+
+socket(PF_INET, SOCK_STREAM, IPPROTO_IP) = 5
+setsockopt(5, SOL_IP, IP_BIND_ADDRESS_NO_PORT, [1], 4) = 0
+bind(5, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.2")}, 16) = 0
+getsockname(5, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.2")}, [16]) = 0
+connect(5, {sa_family=AF_INET, sin_port=htons(53174), sin_addr=inet_addr("127.0.0.3")}, 16) = 0
+getsockname(5, {sa_family=AF_INET, sin_port=htons(38050), sin_addr=inet_addr("127.0.0.2")}, [16]) = 0
+
+IPv6 test :
+
+socket(PF_INET6, SOCK_STREAM, IPPROTO_IP) = 7
+setsockopt(7, SOL_IP, IP_BIND_ADDRESS_NO_PORT, [1], 4) = 0
+bind(7, {sa_family=AF_INET6, sin6_port=htons(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_flowinfo=0, sin6_scope_id=0}, 28) = 0
+getsockname(7, {sa_family=AF_INET6, sin6_port=htons(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_flowinfo=0, sin6_scope_id=0}, [28]) = 0
+connect(7, {sa_family=AF_INET6, sin6_port=htons(57300), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_flowinfo=0, sin6_scope_id=0}, 28) = 0
+getsockname(7, {sa_family=AF_INET6, sin6_port=htons(60964), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_flowinfo=0, sin6_scope_id=0}, [28]) = 0
+
+I was able to bind()/connect() a million concurrent IPv4 sockets,
+instead of ~32000 before patch.
+
+lpaa23:~# ulimit -n 1000010
+lpaa23:~# ./bind --connect --num-flows=1000000 &
+1000000 sockets
+
+lpaa23:~# grep TCP /proc/net/sockstat
+TCP: inuse 2000063 orphan 0 tw 47 alloc 2000157 mem 66
+
+Check that a given source port is indeed used by many different
+connections :
+
+lpaa23:~# ss -t src :40000 | head -10
+State      Recv-Q Send-Q   Local Address:Port          Peer Address:Port
+ESTAB      0      0           127.0.0.2:40000         127.0.202.33:44983
+ESTAB      0      0           127.0.0.2:40000         127.2.27.240:44983
+ESTAB      0      0           127.0.0.2:40000           127.2.98.5:44983
+ESTAB      0      0           127.0.0.2:40000        127.0.124.196:44983
+ESTAB      0      0           127.0.0.2:40000         127.2.139.38:44983
+ESTAB      0      0           127.0.0.2:40000          127.1.59.80:44983
+ESTAB      0      0           127.0.0.2:40000          127.3.6.228:44983
+ESTAB      0      0           127.0.0.2:40000          127.0.38.53:44983
+ESTAB      0      0           127.0.0.2:40000         127.1.197.10:44983
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90c337da1524863838658078ec34241f45d8394d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/in.h
+diff --cc include/uapi/linux/in.h
+index c33a65e3d62c,83d6236a2f08..000000000000
+--- a/include/uapi/linux/in.h
++++ b/include/uapi/linux/in.h
+@@@ -109,6 -111,8 +109,11 @@@ struct in_addr 
+  
+  #define IP_MINTTL       21
+  #define IP_NODEFRAG     22
+++<<<<<<< HEAD
+++=======
++ #define IP_CHECKSUM	23
++ #define IP_BIND_ADDRESS_NO_PORT	24
+++>>>>>>> 90c337da1524 (inet: add IP_BIND_ADDRESS_NO_PORT to overcome bind(0) limitations)
+  
+  /* IP_MTU_DISCOVER values */
+  #define IP_PMTUDISC_DONT		0	/* Never send DF frames */
+diff --git a/include/net/inet_sock.h b/include/net/inet_sock.h
+index ec3da9f4566d..adb8a8b50c3e 100644
+--- a/include/net/inet_sock.h
++++ b/include/net/inet_sock.h
+@@ -175,6 +175,7 @@ struct inet_sock {
+ 				transparent:1,
+ 				mc_all:1,
+ 				nodefrag:1;
++	__u8			bind_address_no_port:1;
+ 	__u8			rcv_tos;
+ 	__u8			convert_csum;
+ 	int			uc_index;
+* Unmerged path include/uapi/linux/in.h
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 3068a0e54f0b..43b9d5233255 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -496,7 +496,8 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 		inet->inet_saddr = 0;  /* Use device */
+ 
+ 	/* Make sure we are allowed to bind here. */
+-	if (sk->sk_prot->get_port(sk, snum)) {
++	if ((snum || !inet->bind_address_no_port) &&
++	    sk->sk_prot->get_port(sk, snum)) {
+ 		inet->inet_saddr = inet->inet_rcv_saddr = 0;
+ 		err = -EADDRINUSE;
+ 		goto out_release_sock;
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index d6fc784f4ff8..4fe5ebc6c325 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -515,6 +515,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+ 	case IP_TRANSPARENT:
+ 	case IP_MINTTL:
+ 	case IP_NODEFRAG:
++	case IP_BIND_ADDRESS_NO_PORT:
+ 	case IP_UNICAST_IF:
+ 	case IP_MULTICAST_TTL:
+ 	case IP_MULTICAST_ALL:
+@@ -651,6 +652,9 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+ 		}
+ 		inet->nodefrag = val ? 1 : 0;
+ 		break;
++	case IP_BIND_ADDRESS_NO_PORT:
++		inet->bind_address_no_port = val ? 1 : 0;
++		break;
+ 	case IP_MTU_DISCOVER:
+ 		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_OMIT)
+ 			goto e_inval;
+@@ -1239,6 +1243,9 @@ static int do_ip_getsockopt(struct sock *sk, int level, int optname,
+ 	case IP_NODEFRAG:
+ 		val = inet->nodefrag;
+ 		break;
++	case IP_BIND_ADDRESS_NO_PORT:
++		val = inet->bind_address_no_port;
++		break;
+ 	case IP_MTU_DISCOVER:
+ 		val = inet->pmtudisc;
+ 		break;
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index 0476df8c5c76..c093fec5ac8b 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -367,7 +367,8 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 		np->saddr = addr->sin6_addr;
+ 
+ 	/* Make sure we are allowed to bind here. */
+-	if (sk->sk_prot->get_port(sk, snum)) {
++	if ((snum || !inet->bind_address_no_port) &&
++	    sk->sk_prot->get_port(sk, snum)) {
+ 		inet_reset_saddr(sk);
+ 		err = -EADDRINUSE;
+ 		goto out;
