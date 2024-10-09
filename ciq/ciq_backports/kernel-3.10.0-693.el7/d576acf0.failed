@@ -1,0 +1,260 @@
+net/mlx4_en: add page recycle to prepare rx ring for tx support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: add page recycle to prepare rx ring for tx support (Don Dutile) [1385329 1417285]
+Rebuild_FUZZ: 96.72%
+commit-author Brenden Blanco <bblanco@plumgrid.com>
+commit d576acf0a22890cf3f8f7a9b035f1558077f6770
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d576acf0.failed
+
+The mlx4 driver by default allocates order-3 pages for the ring to
+consume in multiple fragments. When the device has an xdp program, this
+behavior will prevent tx actions since the page must be re-mapped in
+TODEVICE mode, which cannot be done if the page is still shared.
+
+Start by making the allocator configurable based on whether xdp is
+running, such that order-0 pages are always used and never shared.
+
+Since this will stress the page allocator, add a simple page cache to
+each rx ring. Pages in the cache are left dma-mapped, and in drop-only
+stress tests the page allocator is eliminated from the perf report.
+
+Note that setting an xdp program will now require the rings to be
+reconfigured.
+
+Before:
+ 26.91%  ksoftirqd/0  [mlx4_en]         [k] mlx4_en_process_rx_cq
+ 17.88%  ksoftirqd/0  [mlx4_en]         [k] mlx4_en_alloc_frags
+  6.00%  ksoftirqd/0  [mlx4_en]         [k] mlx4_en_free_frag
+  4.49%  ksoftirqd/0  [kernel.vmlinux]  [k] get_page_from_freelist
+  3.21%  swapper      [kernel.vmlinux]  [k] intel_idle
+  2.73%  ksoftirqd/0  [kernel.vmlinux]  [k] bpf_map_lookup_elem
+  2.57%  swapper      [mlx4_en]         [k] mlx4_en_process_rx_cq
+
+After:
+ 31.72%  swapper      [kernel.vmlinux]       [k] intel_idle
+  8.79%  swapper      [mlx4_en]              [k] mlx4_en_process_rx_cq
+  7.54%  swapper      [kernel.vmlinux]       [k] poll_idle
+  6.36%  swapper      [mlx4_core]            [k] mlx4_eq_int
+  4.21%  swapper      [kernel.vmlinux]       [k] tasklet_action
+  4.03%  swapper      [kernel.vmlinux]       [k] cpuidle_enter_state
+  3.43%  swapper      [mlx4_en]              [k] mlx4_en_prepare_rx_desc
+  2.18%  swapper      [kernel.vmlinux]       [k] native_irq_return_iret
+  1.37%  swapper      [kernel.vmlinux]       [k] menu_select
+  1.09%  swapper      [kernel.vmlinux]       [k] bpf_map_lookup_elem
+
+	Signed-off-by: Brenden Blanco <bblanco@plumgrid.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d576acf0a22890cf3f8f7a9b035f1558077f6770)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 5e3b15bcd2e7,47ae2a211300..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -2575,8 -2526,95 +2575,99 @@@ static int mlx4_en_set_tx_maxrate(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_dev *mdev = priv->mdev;
++ 	struct bpf_prog *old_prog;
++ 	int xdp_ring_num;
++ 	int port_up = 0;
++ 	int err;
++ 	int i;
++ 
++ 	xdp_ring_num = prog ? ALIGN(priv->rx_ring_num, MLX4_EN_NUM_UP) : 0;
++ 
++ 	/* No need to reconfigure buffers when simply swapping the
++ 	 * program for a new one.
++ 	 */
++ 	if (priv->xdp_ring_num == xdp_ring_num) {
++ 		if (prog) {
++ 			prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 			if (IS_ERR(prog))
++ 				return PTR_ERR(prog);
++ 		}
++ 		for (i = 0; i < priv->rx_ring_num; i++) {
++ 			/* This xchg is paired with READ_ONCE in the fastpath */
++ 			old_prog = xchg(&priv->rx_ring[i]->xdp_prog, prog);
++ 			if (old_prog)
++ 				bpf_prog_put(old_prog);
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	if (priv->num_frags > 1) {
++ 		en_err(priv, "Cannot set XDP if MTU requires multiple frags\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 		if (IS_ERR(prog))
++ 			return PTR_ERR(prog);
++ 	}
++ 
++ 	mutex_lock(&mdev->state_lock);
++ 	if (priv->port_up) {
++ 		port_up = 1;
++ 		mlx4_en_stop_port(dev, 1);
++ 	}
++ 
++ 	priv->xdp_ring_num = xdp_ring_num;
++ 
++ 	for (i = 0; i < priv->rx_ring_num; i++) {
++ 		old_prog = xchg(&priv->rx_ring[i]->xdp_prog, prog);
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 	}
++ 
++ 	if (port_up) {
++ 		err = mlx4_en_start_port(dev);
++ 		if (err) {
++ 			en_err(priv, "Failed starting port %d for XDP change\n",
++ 			       priv->port);
++ 			queue_work(mdev->workqueue, &priv->watchdog_task);
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&mdev->state_lock);
++ 	return 0;
++ }
++ 
++ static bool mlx4_xdp_attached(struct net_device *dev)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 
++ 	return !!priv->xdp_ring_num;
++ }
++ 
++ static int mlx4_xdp(struct net_device *dev, struct netdev_xdp *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return mlx4_xdp_set(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = mlx4_xdp_attached(dev);
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> d576acf0a228 (net/mlx4_en: add page recycle to prepare rx ring for tx support)
+  static const struct net_device_ops mlx4_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= mlx4_en_open,
+  	.ndo_stop		= mlx4_en_close,
+  	.ndo_start_xmit		= mlx4_en_xmit,
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index f3f26c698f6a,9dd5dc19a537..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -142,9 -144,10 +143,13 @@@ static void mlx4_en_free_frag(struct ml
+  	const struct mlx4_en_frag_info *frag_info = &priv->frag_info[i];
+  	u32 next_frag_end = frags[i].page_offset + 2 * frag_info->frag_stride;
+  
+ -
+  	if (next_frag_end > frags[i].page_size)
+  		dma_unmap_page(priv->ddev, frags[i].dma, frags[i].page_size,
+++<<<<<<< HEAD
+ +					 PCI_DMA_FROMDEVICE);
+++=======
++ 			       frag_info->dma_dir);
+++>>>>>>> d576acf0a228 (net/mlx4_en: add page recycle to prepare rx ring for tx support)
+  
+  	if (frags[i].page)
+  		put_page(frags[i].page);
+@@@ -831,6 -877,37 +871,40 @@@ int mlx4_en_process_rx_cq(struct net_de
+  		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
+  			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+  
+++<<<<<<< HEAD
+++=======
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			u32 act;
++ 
++ 			dma = be64_to_cpu(rx_desc->data[0].addr);
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data = page_address(frags[0].page) +
++ 							frags[0].page_offset;
++ 			xdp.data_end = xdp.data + length;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 			case XDP_DROP:
++ 				if (mlx4_en_rx_recycle(ring, frags))
++ 					goto consumed;
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> d576acf0a228 (net/mlx4_en: add page recycle to prepare rx ring for tx support)
+  		if (likely(dev->features & NETIF_F_RXCSUM)) {
+  			if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_TCP |
+  						      MLX4_CQE_STATUS_UDP)) {
+@@@ -1071,11 -1135,11 +1146,18 @@@ static const int frag_sizes[] = 
+  
+  void mlx4_en_calc_rx_buf(struct net_device *dev)
+  {
++ 	enum dma_data_direction dma_dir = PCI_DMA_FROMDEVICE;
+  	struct mlx4_en_priv *priv = netdev_priv(dev);
+++<<<<<<< HEAD
+ +	/* VLAN_HLEN is added twice,to support skb vlan tagged with multiple
+ +	 * headers. (For example: ETH_P_8021Q and ETH_P_8021AD).
+ +	 */
+ +	int eff_mtu = dev->mtu + ETH_HLEN + (2 * VLAN_HLEN);
+++=======
++ 	int eff_mtu = MLX4_EN_EFF_MTU(dev->mtu);
++ 	int order = MLX4_EN_ALLOC_PREFER_ORDER;
++ 	u32 align = SMP_CACHE_BYTES;
+++>>>>>>> d576acf0a228 (net/mlx4_en: add page recycle to prepare rx ring for tx support)
+  	int buf_size = 0;
+  	int i = 0;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 54b1e1a61da0,eff4be0279e6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -324,6 -329,8 +330,11 @@@ struct mlx4_en_rx_ring 
+  	u8  fcs_del;
+  	void *buf;
+  	void *rx_info;
+++<<<<<<< HEAD
+++=======
++ 	struct bpf_prog *xdp_prog;
++ 	struct mlx4_en_page_cache page_cache;
+++>>>>>>> d576acf0a228 (net/mlx4_en: add page recycle to prepare rx ring for tx support)
+  	unsigned long bytes;
+  	unsigned long packets;
+  	unsigned long csum_ok;
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
