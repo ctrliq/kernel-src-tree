@@ -1,0 +1,197 @@
+memcg, slab: kmem_cache_create_memcg(): fix memleak on fail path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 363a044f739b0f07a8c063b838c5528d10720e02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/363a044f.failed
+
+We do not free the cache's memcg_params if __kmem_cache_create fails.
+Fix this.
+
+Plus, rename memcg_register_cache() to memcg_alloc_cache_params(),
+because it actually does not register the cache anywhere, but simply
+initialize kmem_cache::memcg_params.
+
+[akpm@linux-foundation.org: fix build]
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Christoph Lameter <cl@linux.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 363a044f739b0f07a8c063b838c5528d10720e02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab_common.c
+diff --cc mm/slab_common.c
+index e13d227ed0ab,70f9e249ac30..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -209,40 -190,34 +209,46 @@@ kmem_cache_create_memcg(struct mem_cgro
+  
+  	s = __kmem_cache_alias(memcg, name, size, align, flags, ctor);
+  	if (s)
+ -		goto out_unlock;
+ +		goto out_locked;
+  
+ -	err = -ENOMEM;
+  	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+ -	if (!s)
+ -		goto out_unlock;
+ +	if (s) {
+ +		s->object_size = s->size = size;
+ +		s->align = calculate_alignment(flags, align, size);
+ +		s->ctor = ctor;
+  
+ -	s->object_size = s->size = size;
+ -	s->align = calculate_alignment(flags, align, size);
+ -	s->ctor = ctor;
+ +		if (memcg_register_cache(memcg, s, parent_cache)) {
+ +			kmem_cache_free(kmem_cache, s);
+ +			err = -ENOMEM;
+ +			goto out_locked;
+ +		}
+  
+ -	s->name = kstrdup(name, GFP_KERNEL);
+ -	if (!s->name)
+ -		goto out_free_cache;
+ +		s->name = kstrdup(name, GFP_KERNEL);
+ +		if (!s->name) {
+ +			kmem_cache_free(kmem_cache, s);
+ +			err = -ENOMEM;
+ +			goto out_locked;
+ +		}
+  
+++<<<<<<< HEAD
+ +		err = __kmem_cache_create(s, flags);
+ +		if (!err) {
+ +			s->refcount = 1;
+ +			list_add(&s->list, &slab_caches);
+ +			memcg_cache_list_add(memcg, s);
+ +		} else {
+ +			kfree(s->name);
+ +			kmem_cache_free(kmem_cache, s);
+ +		}
+ +	} else
+ +		err = -ENOMEM;
+++=======
++ 	err = memcg_alloc_cache_params(memcg, s, parent_cache);
++ 	if (err)
++ 		goto out_free_cache;
+++>>>>>>> 363a044f739b (memcg, slab: kmem_cache_create_memcg(): fix memleak on fail path)
+  
+ -	err = __kmem_cache_create(s, flags);
+ -	if (err)
+ -		goto out_free_cache;
+ -
+ -	s->refcount = 1;
+ -	list_add(&s->list, &slab_caches);
+ -	memcg_cache_list_add(memcg, s);
+ -
+ -out_unlock:
+ +out_locked:
+  	mutex_unlock(&slab_mutex);
+  	put_online_cpus();
+  
+@@@ -256,11 -230,15 +262,19 @@@
+  				name, err);
+  			dump_stack();
+  		}
+ +
+  		return NULL;
+  	}
+ -	return s;
+  
+++<<<<<<< HEAD
+ +	return s;
+++=======
++ out_free_cache:
++ 	memcg_free_cache_params(s);
++ 	kfree(s->name);
++ 	kmem_cache_free(kmem_cache, s);
++ 	goto out_unlock;
+++>>>>>>> 363a044f739b (memcg, slab: kmem_cache_create_memcg(): fix memleak on fail path)
+  }
+  
+  struct kmem_cache *
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 584b3a91b9fd..f266f480ca03 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -484,8 +484,9 @@ void __memcg_kmem_commit_charge(struct page *page,
+ void __memcg_kmem_uncharge_pages(struct page *page, int order);
+ 
+ int memcg_cache_id(struct mem_cgroup *memcg);
+-int memcg_register_cache(struct mem_cgroup *memcg, struct kmem_cache *s,
+-			 struct kmem_cache *root_cache);
++int memcg_alloc_cache_params(struct mem_cgroup *memcg, struct kmem_cache *s,
++			     struct kmem_cache *root_cache);
++void memcg_free_cache_params(struct kmem_cache *s);
+ void memcg_release_cache(struct kmem_cache *cachep);
+ void memcg_cache_list_add(struct mem_cgroup *memcg, struct kmem_cache *cachep);
+ 
+@@ -626,13 +627,16 @@ static inline int memcg_cache_id(struct mem_cgroup *memcg)
+ 	return -1;
+ }
+ 
+-static inline int
+-memcg_register_cache(struct mem_cgroup *memcg, struct kmem_cache *s,
+-		     struct kmem_cache *root_cache)
++static inline int memcg_alloc_cache_params(struct mem_cgroup *memcg,
++		struct kmem_cache *s, struct kmem_cache *root_cache)
+ {
+ 	return 0;
+ }
+ 
++static inline void memcg_free_cache_params(struct kmem_cache *s)
++{
++}
++
+ static inline void memcg_release_cache(struct kmem_cache *cachep)
+ {
+ }
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 23e6528af2de..71d7ab294970 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3201,8 +3201,8 @@ int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
+ 	return 0;
+ }
+ 
+-int memcg_register_cache(struct mem_cgroup *memcg, struct kmem_cache *s,
+-			 struct kmem_cache *root_cache)
++int memcg_alloc_cache_params(struct mem_cgroup *memcg, struct kmem_cache *s,
++			     struct kmem_cache *root_cache)
+ {
+ 	size_t size = sizeof(struct memcg_cache_params);
+ 
+@@ -3227,6 +3227,11 @@ int memcg_register_cache(struct mem_cgroup *memcg, struct kmem_cache *s,
+ 	return 0;
+ }
+ 
++void memcg_free_cache_params(struct kmem_cache *s)
++{
++	kfree(s->memcg_params);
++}
++
+ void memcg_release_cache(struct kmem_cache *s)
+ {
+ 	struct kmem_cache *root;
+@@ -3255,7 +3260,7 @@ void memcg_release_cache(struct kmem_cache *s)
+ 
+ 	mem_cgroup_put(memcg);
+ out:
+-	kfree(s->memcg_params);
++	memcg_free_cache_params(s);
+ }
+ 
+ /*
+* Unmerged path mm/slab_common.c
