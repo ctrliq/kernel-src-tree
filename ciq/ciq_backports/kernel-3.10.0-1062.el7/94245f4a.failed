@@ -1,0 +1,266 @@
+iw_cxgb4: Support FW write completion WR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Potnuri Bharat Teja <bharat@chelsio.com>
+commit 94245f4ad9e10c161affaa4763136d29fbe91cb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/94245f4a.failed
+
+To optimize NVME-oF READ IOPs, use a specialized WQE that combines
+the RDMA WRITE and SEND_INV WR chain submitted by the NVME-oF target
+driver.
+
+This reduces uP overhead per NVME-oF IO, and results in over 10%
+improvement in NVME-oF 4K READ IOPs.
+
+	Signed-off-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 94245f4ad9e10c161affaa4763136d29fbe91cb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/device.c
+#	drivers/infiniband/hw/cxgb4/qp.c
+diff --cc drivers/infiniband/hw/cxgb4/device.c
+index aca5bf2747f9,c13c0ba30f63..000000000000
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@@ -870,9 -866,12 +870,14 @@@ static int c4iw_rdev_open(struct c4iw_r
+  	rdev->status_page->qp_size = rdev->lldi.vr->qp.size;
+  	rdev->status_page->cq_start = rdev->lldi.vr->cq.start;
+  	rdev->status_page->cq_size = rdev->lldi.vr->cq.size;
+++<<<<<<< HEAD
+++=======
++ 	rdev->status_page->write_cmpl_supported = rdev->lldi.write_cmpl_support;
++ 
+++>>>>>>> 94245f4ad9e1 (iw_cxgb4: Support FW write completion WR)
+  	if (c4iw_wr_log) {
+ -		rdev->wr_log = kcalloc(1 << c4iw_wr_log_size_order,
+ -				       sizeof(*rdev->wr_log),
+ -				       GFP_KERNEL);
+ +		rdev->wr_log = kzalloc((1 << c4iw_wr_log_size_order) *
+ +				       sizeof(*rdev->wr_log), GFP_KERNEL);
+  		if (rdev->wr_log) {
+  			rdev->wr_log_size = 1 << c4iw_wr_log_size_order;
+  			atomic_set(&rdev->wr_log_idx, 0);
+diff --cc drivers/infiniband/hw/cxgb4/qp.c
+index 4106eed1b8fb,b3203afa3b1d..000000000000
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@@ -561,7 -602,58 +566,62 @@@ static int build_rdma_write(struct t4_s
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int build_rdma_read(union t4_wr *wqe, struct ib_send_wr *wr, u8 *len16)
+++=======
++ static void build_immd_cmpl(struct t4_sq *sq, struct fw_ri_immd_cmpl *immdp,
++ 			    struct ib_send_wr *wr)
++ {
++ 	memcpy((u8 *)immdp->data, (u8 *)(uintptr_t)wr->sg_list->addr, 16);
++ 	memset(immdp->r1, 0, 6);
++ 	immdp->op = FW_RI_DATA_IMMD;
++ 	immdp->immdlen = 16;
++ }
++ 
++ static void build_rdma_write_cmpl(struct t4_sq *sq,
++ 				  struct fw_ri_rdma_write_cmpl_wr *wcwr,
++ 				  const struct ib_send_wr *wr, u8 *len16)
++ {
++ 	u32 plen;
++ 	int size;
++ 
++ 	/*
++ 	 * This code assumes the struct fields preceding the write isgl
++ 	 * fit in one 64B WR slot.  This is because the WQE is built
++ 	 * directly in the dma queue, and wrapping is only handled
++ 	 * by the code buildling sgls.  IE the "fixed part" of the wr
++ 	 * structs must all fit in 64B.  The WQE build code should probably be
++ 	 * redesigned to avoid this restriction, but for now just add
++ 	 * the BUILD_BUG_ON() to catch if this WQE struct gets too big.
++ 	 */
++ 	BUILD_BUG_ON(offsetof(struct fw_ri_rdma_write_cmpl_wr, u) > 64);
++ 
++ 	wcwr->stag_sink = cpu_to_be32(rdma_wr(wr)->rkey);
++ 	wcwr->to_sink = cpu_to_be64(rdma_wr(wr)->remote_addr);
++ 	wcwr->stag_inv = cpu_to_be32(wr->next->ex.invalidate_rkey);
++ 	wcwr->r2 = 0;
++ 	wcwr->r3 = 0;
++ 
++ 	/* SEND_INV SGL */
++ 	if (wr->next->send_flags & IB_SEND_INLINE)
++ 		build_immd_cmpl(sq, &wcwr->u_cmpl.immd_src, wr->next);
++ 	else
++ 		build_isgl((__be64 *)sq->queue, (__be64 *)&sq->queue[sq->size],
++ 			   &wcwr->u_cmpl.isgl_src, wr->next->sg_list, 1, NULL);
++ 
++ 	/* WRITE SGL */
++ 	build_isgl((__be64 *)sq->queue, (__be64 *)&sq->queue[sq->size],
++ 		   wcwr->u.isgl_src, wr->sg_list, wr->num_sge, &plen);
++ 
++ 	size = sizeof(*wcwr) + sizeof(struct fw_ri_isgl) +
++ 		wr->num_sge * sizeof(struct fw_ri_sge);
++ 	wcwr->plen = cpu_to_be32(plen);
++ 	*len16 = DIV_ROUND_UP(size, 16);
++ }
++ 
++ static int build_rdma_read(union t4_wr *wqe, const struct ib_send_wr *wr,
++ 			   u8 *len16)
+++>>>>>>> 94245f4ad9e1 (iw_cxgb4: Support FW write completion WR)
+  {
+  	if (wr->num_sge > 1)
+  		return -EINVAL;
+@@@ -590,8 -682,74 +650,74 @@@
+  	return 0;
+  }
+  
++ static void post_write_cmpl(struct c4iw_qp *qhp, const struct ib_send_wr *wr)
++ {
++ 	bool send_signaled = (wr->next->send_flags & IB_SEND_SIGNALED) ||
++ 			     qhp->sq_sig_all;
++ 	bool write_signaled = (wr->send_flags & IB_SEND_SIGNALED) ||
++ 			      qhp->sq_sig_all;
++ 	struct t4_swsqe *swsqe;
++ 	union t4_wr *wqe;
++ 	u16 write_wrid;
++ 	u8 len16;
++ 	u16 idx;
++ 
++ 	/*
++ 	 * The sw_sq entries still look like a WRITE and a SEND and consume
++ 	 * 2 slots. The FW WR, however, will be a single uber-WR.
++ 	 */
++ 	wqe = (union t4_wr *)((u8 *)qhp->wq.sq.queue +
++ 	       qhp->wq.sq.wq_pidx * T4_EQ_ENTRY_SIZE);
++ 	build_rdma_write_cmpl(&qhp->wq.sq, &wqe->write_cmpl, wr, &len16);
++ 
++ 	/* WRITE swsqe */
++ 	swsqe = &qhp->wq.sq.sw_sq[qhp->wq.sq.pidx];
++ 	swsqe->opcode = FW_RI_RDMA_WRITE;
++ 	swsqe->idx = qhp->wq.sq.pidx;
++ 	swsqe->complete = 0;
++ 	swsqe->signaled = write_signaled;
++ 	swsqe->flushed = 0;
++ 	swsqe->wr_id = wr->wr_id;
++ 	if (c4iw_wr_log) {
++ 		swsqe->sge_ts =
++ 			cxgb4_read_sge_timestamp(qhp->rhp->rdev.lldi.ports[0]);
++ 		swsqe->host_time = ktime_get();
++ 	}
++ 
++ 	write_wrid = qhp->wq.sq.pidx;
++ 
++ 	/* just bump the sw_sq */
++ 	qhp->wq.sq.in_use++;
++ 	if (++qhp->wq.sq.pidx == qhp->wq.sq.size)
++ 		qhp->wq.sq.pidx = 0;
++ 
++ 	/* SEND_WITH_INV swsqe */
++ 	swsqe = &qhp->wq.sq.sw_sq[qhp->wq.sq.pidx];
++ 	swsqe->opcode = FW_RI_SEND_WITH_INV;
++ 	swsqe->idx = qhp->wq.sq.pidx;
++ 	swsqe->complete = 0;
++ 	swsqe->signaled = send_signaled;
++ 	swsqe->flushed = 0;
++ 	swsqe->wr_id = wr->next->wr_id;
++ 	if (c4iw_wr_log) {
++ 		swsqe->sge_ts =
++ 			cxgb4_read_sge_timestamp(qhp->rhp->rdev.lldi.ports[0]);
++ 		swsqe->host_time = ktime_get();
++ 	}
++ 
++ 	wqe->write_cmpl.flags_send = send_signaled ? FW_RI_COMPLETION_FLAG : 0;
++ 	wqe->write_cmpl.wrid_send = qhp->wq.sq.pidx;
++ 
++ 	init_wr_hdr(wqe, write_wrid, FW_RI_RDMA_WRITE_CMPL_WR,
++ 		    write_signaled ? FW_RI_COMPLETION_FLAG : 0, len16);
++ 	t4_sq_produce(&qhp->wq, len16);
++ 	idx = DIV_ROUND_UP(len16 * 16, T4_EQ_ENTRY_SIZE);
++ 
++ 	t4_ring_sq_db(&qhp->wq, idx, wqe);
++ }
++ 
+  static int build_rdma_recv(struct c4iw_qp *qhp, union t4_recv_wr *wqe,
+ -			   const struct ib_recv_wr *wr, u8 *len16)
+ +			   struct ib_recv_wr *wr, u8 *len16)
+  {
+  	int ret;
+  
+* Unmerged path drivers/infiniband/hw/cxgb4/device.c
+* Unmerged path drivers/infiniband/hw/cxgb4/qp.c
+diff --git a/drivers/infiniband/hw/cxgb4/t4.h b/drivers/infiniband/hw/cxgb4/t4.h
+index 29a4dd5053f2..b84891285c02 100644
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -91,6 +91,9 @@ static inline int t4_max_fr_depth(int use_dsgl)
+ #define T4_RQ_NUM_BYTES (T4_EQ_ENTRY_SIZE * T4_RQ_NUM_SLOTS)
+ #define T4_MAX_RECV_SGE 4
+ 
++#define T4_WRITE_CMPL_MAX_SGL 4
++#define T4_WRITE_CMPL_MAX_CQE 16
++
+ union t4_wr {
+ 	struct fw_ri_res_wr res;
+ 	struct fw_ri_wr ri;
+@@ -101,6 +104,7 @@ union t4_wr {
+ 	struct fw_ri_fr_nsmr_wr fr;
+ 	struct fw_ri_fr_nsmr_tpte_wr fr_tpte;
+ 	struct fw_ri_inv_lstag_wr inv;
++	struct fw_ri_rdma_write_cmpl_wr write_cmpl;
+ 	struct t4_status_page status;
+ 	__be64 flits[T4_EQ_ENTRY_SIZE / sizeof(__be64) * T4_SQ_NUM_SLOTS];
+ };
+@@ -836,7 +840,7 @@ static inline void t4_set_cq_in_error(struct t4_cq *cq)
+ 
+ struct t4_dev_status_page {
+ 	u8 db_off;
+-	u8 pad1;
++	u8 write_cmpl_supported;
+ 	u16 pad2;
+ 	u32 pad3;
+ 	u64 qp_start;
+diff --git a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+index 0f4f86b004d6..57f14d85a5b3 100644
+--- a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
++++ b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+@@ -583,6 +583,37 @@ struct fw_ri_send_wr {
+ #define FW_RI_SEND_WR_SENDOP_G(x)	\
+ 	(((x) >> FW_RI_SEND_WR_SENDOP_S) & FW_RI_SEND_WR_SENDOP_M)
+ 
++struct fw_ri_rdma_write_cmpl_wr {
++	__u8   opcode;
++	__u8   flags;
++	__u16  wrid;
++	__u8   r1[3];
++	__u8   len16;
++	__u8   r2;
++	__u8   flags_send;
++	__u16  wrid_send;
++	__be32 stag_inv;
++	__be32 plen;
++	__be32 stag_sink;
++	__be64 to_sink;
++	union fw_ri_cmpl {
++		struct fw_ri_immd_cmpl {
++			__u8   op;
++			__u8   r1[6];
++			__u8   immdlen;
++			__u8   data[16];
++		} immd_src;
++		struct fw_ri_isgl isgl_src;
++	} u_cmpl;
++	__be64 r3;
++#ifndef C99_NOT_SUPPORTED
++	union fw_ri_write {
++		struct fw_ri_immd immd_src[0];
++		struct fw_ri_isgl isgl_src[0];
++	} u;
++#endif
++};
++
+ struct fw_ri_rdma_read_wr {
+ 	__u8   opcode;
+ 	__u8   flags;
