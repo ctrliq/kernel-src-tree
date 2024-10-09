@@ -1,0 +1,366 @@
+cxgb4: implement udp tunnel callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ganesh Goudar <ganeshgr@chelsio.com>
+commit 846eac3fccec85d464211ecb7aa53b3a33c69c4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/846eac3f.failed
+
+Implement ndo_udp_tunnel_add and ndo_udp_tunnel_del
+to support vxlan tunnelling.
+
+Original work by: Santosh Rastapur <santosh@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 846eac3fccec85d464211ecb7aa53b3a33c69c4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 28baa6f532a1,f56e893feace..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -862,6 -874,10 +868,13 @@@ struct adapter 
+  	unsigned int clipt_start;
+  	unsigned int clipt_end;
+  	struct clip_tbl *clipt;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int rawf_start;
++ 	unsigned int rawf_cnt;
++ 	struct smt_data *smt;
++ 	struct mps_encap_entry *mps_encap;
+++>>>>>>> 846eac3fccec (cxgb4: implement udp tunnel callbacks)
+  	struct cxgb4_uld_info *uld;
+  	void *uld_handle[CXGB4_ULD_MAX];
+  	unsigned int num_uld;
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 78a568c4dc20,8097762c2bdd..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -63,9 -63,9 +63,13 @@@
+  #include <net/addrconf.h>
+  #include <net/bonding.h>
+  #include <net/addrconf.h>
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  #include <linux/crash_dump.h>
+++<<<<<<< HEAD
+ +#include <linux/ip.h>
+++=======
++ #include <net/udp_tunnel.h>
+++>>>>>>> 846eac3fccec (cxgb4: implement udp tunnel callbacks)
+  
+  #include "cxgb4.h"
+  #include "cxgb4_filter.h"
+@@@ -2939,6 -2957,164 +2943,167 @@@ static int cxgb_setup_tc(struct net_dev
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int cxgb_setup_tc_block(struct net_device *dev,
++ 			       struct tc_block_offload *f)
++ {
++ 	struct port_info *pi = netdev2pinfo(dev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block, cxgb_setup_tc_block_cb,
++ 					     pi, dev);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block, cxgb_setup_tc_block_cb, pi);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int cxgb_setup_tc(struct net_device *dev, enum tc_setup_type type,
++ 			 void *type_data)
++ {
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		return cxgb_setup_tc_block(dev, type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static void cxgb_del_udp_tunnel(struct net_device *netdev,
++ 				struct udp_tunnel_info *ti)
++ {
++ 	struct port_info *pi = netdev_priv(netdev);
++ 	struct adapter *adapter = pi->adapter;
++ 	unsigned int chip_ver = CHELSIO_CHIP_VERSION(adapter->params.chip);
++ 	u8 match_all_mac[] = { 0, 0, 0, 0, 0, 0 };
++ 	int ret = 0, i;
++ 
++ 	if (chip_ver < CHELSIO_T6)
++ 		return;
++ 
++ 	switch (ti->type) {
++ 	case UDP_TUNNEL_TYPE_VXLAN:
++ 		if (!adapter->vxlan_port_cnt ||
++ 		    adapter->vxlan_port != ti->port)
++ 			return; /* Invalid VxLAN destination port */
++ 
++ 		adapter->vxlan_port_cnt--;
++ 		if (adapter->vxlan_port_cnt)
++ 			return;
++ 
++ 		adapter->vxlan_port = 0;
++ 		t4_write_reg(adapter, MPS_RX_VXLAN_TYPE_A, 0);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	/* Matchall mac entries can be deleted only after all tunnel ports
++ 	 * are brought down or removed.
++ 	 */
++ 	if (!adapter->rawf_cnt)
++ 		return;
++ 	for_each_port(adapter, i) {
++ 		pi = adap2pinfo(adapter, i);
++ 		ret = t4_free_raw_mac_filt(adapter, pi->viid,
++ 					   match_all_mac, match_all_mac,
++ 					   adapter->rawf_start +
++ 					    pi->port_id,
++ 					   1, pi->port_id, true);
++ 		if (ret < 0) {
++ 			netdev_info(netdev, "Failed to free mac filter entry, for port %d\n",
++ 				    i);
++ 			return;
++ 		}
++ 		atomic_dec(&adapter->mps_encap[adapter->rawf_start +
++ 			   pi->port_id].refcnt);
++ 	}
++ }
++ 
++ static void cxgb_add_udp_tunnel(struct net_device *netdev,
++ 				struct udp_tunnel_info *ti)
++ {
++ 	struct port_info *pi = netdev_priv(netdev);
++ 	struct adapter *adapter = pi->adapter;
++ 	unsigned int chip_ver = CHELSIO_CHIP_VERSION(adapter->params.chip);
++ 	u8 match_all_mac[] = { 0, 0, 0, 0, 0, 0 };
++ 	int i, ret;
++ 
++ 	if (chip_ver < CHELSIO_T6)
++ 		return;
++ 
++ 	switch (ti->type) {
++ 	case UDP_TUNNEL_TYPE_VXLAN:
++ 		/* For T6 fw reserves last 2 entries for
++ 		 * storing match all mac filter (config file entry).
++ 		 */
++ 		if (!adapter->rawf_cnt)
++ 			return;
++ 
++ 		/* Callback for adding vxlan port can be called with the same
++ 		 * port for both IPv4 and IPv6. We should not disable the
++ 		 * offloading when the same port for both protocols is added
++ 		 * and later one of them is removed.
++ 		 */
++ 		if (adapter->vxlan_port_cnt &&
++ 		    adapter->vxlan_port == ti->port) {
++ 			adapter->vxlan_port_cnt++;
++ 			return;
++ 		}
++ 
++ 		/* We will support only one VxLAN port */
++ 		if (adapter->vxlan_port_cnt) {
++ 			netdev_info(netdev, "UDP port %d already offloaded, not adding port %d\n",
++ 				    be16_to_cpu(adapter->vxlan_port),
++ 				    be16_to_cpu(ti->port));
++ 			return;
++ 		}
++ 
++ 		adapter->vxlan_port = ti->port;
++ 		adapter->vxlan_port_cnt = 1;
++ 
++ 		t4_write_reg(adapter, MPS_RX_VXLAN_TYPE_A,
++ 			     VXLAN_V(be16_to_cpu(ti->port)) | VXLAN_EN_F);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	/* Create a 'match all' mac filter entry for inner mac,
++ 	 * if raw mac interface is supported. Once the linux kernel provides
++ 	 * driver entry points for adding/deleting the inner mac addresses,
++ 	 * we will remove this 'match all' entry and fallback to adding
++ 	 * exact match filters.
++ 	 */
++ 	if (adapter->rawf_cnt) {
++ 		for_each_port(adapter, i) {
++ 			pi = adap2pinfo(adapter, i);
++ 
++ 			ret = t4_alloc_raw_mac_filt(adapter, pi->viid,
++ 						    match_all_mac,
++ 						    match_all_mac,
++ 						    adapter->rawf_start +
++ 						    pi->port_id,
++ 						    1, pi->port_id, true);
++ 			if (ret < 0) {
++ 				netdev_info(netdev, "Failed to allocate a mac filter entry, not adding port %d\n",
++ 					    be16_to_cpu(ti->port));
++ 				cxgb_del_udp_tunnel(netdev, ti);
++ 				return;
++ 			}
++ 			atomic_inc(&adapter->mps_encap[ret].refcnt);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 846eac3fccec (cxgb4: implement udp tunnel callbacks)
+  static netdev_features_t cxgb_fix_features(struct net_device *dev,
+  					   netdev_features_t features)
+  {
+@@@ -2965,8 -3140,14 +3130,19 @@@ static const struct net_device_ops cxgb
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller  = cxgb_netpoll,
+  #endif
+++<<<<<<< HEAD
+ +	.extended.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
+ +	.extended.ndo_setup_tc_rh      = cxgb_setup_tc,
+++=======
++ #ifdef CONFIG_CHELSIO_T4_FCOE
++ 	.ndo_fcoe_enable      = cxgb_fcoe_enable,
++ 	.ndo_fcoe_disable     = cxgb_fcoe_disable,
++ #endif /* CONFIG_CHELSIO_T4_FCOE */
++ 	.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
++ 	.ndo_setup_tc         = cxgb_setup_tc,
++ 	.ndo_udp_tunnel_add   = cxgb_add_udp_tunnel,
++ 	.ndo_udp_tunnel_del   = cxgb_del_udp_tunnel,
+++>>>>>>> 846eac3fccec (cxgb4: implement udp tunnel callbacks)
+  	.ndo_fix_features     = cxgb_fix_features,
+  };
+  
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index ada619a41f33..0e12f8eec606 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -7524,6 +7524,112 @@ int t4_set_rxmode(struct adapter *adap, unsigned int mbox, unsigned int viid,
+ 	return t4_wr_mbox_meat(adap, mbox, &c, sizeof(c), NULL, sleep_ok);
+ }
+ 
++/**
++ *	t4_free_raw_mac_filt - Frees a raw mac entry in mps tcam
++ *	@adap: the adapter
++ *	@viid: the VI id
++ *	@addr: the MAC address
++ *	@mask: the mask
++ *	@idx: index of the entry in mps tcam
++ *	@lookup_type: MAC address for inner (1) or outer (0) header
++ *	@port_id: the port index
++ *	@sleep_ok: call is allowed to sleep
++ *
++ *	Removes the mac entry at the specified index using raw mac interface.
++ *
++ *	Returns a negative error number on failure.
++ */
++int t4_free_raw_mac_filt(struct adapter *adap, unsigned int viid,
++			 const u8 *addr, const u8 *mask, unsigned int idx,
++			 u8 lookup_type, u8 port_id, bool sleep_ok)
++{
++	struct fw_vi_mac_cmd c;
++	struct fw_vi_mac_raw *p = &c.u.raw;
++	u32 val;
++
++	memset(&c, 0, sizeof(c));
++	c.op_to_viid = cpu_to_be32(FW_CMD_OP_V(FW_VI_MAC_CMD) |
++				   FW_CMD_REQUEST_F | FW_CMD_WRITE_F |
++				   FW_CMD_EXEC_V(0) |
++				   FW_VI_MAC_CMD_VIID_V(viid));
++	val = FW_CMD_LEN16_V(1) |
++	      FW_VI_MAC_CMD_ENTRY_TYPE_V(FW_VI_MAC_TYPE_RAW);
++	c.freemacs_to_len16 = cpu_to_be32(FW_VI_MAC_CMD_FREEMACS_V(0) |
++					  FW_CMD_LEN16_V(val));
++
++	p->raw_idx_pkd = cpu_to_be32(FW_VI_MAC_CMD_RAW_IDX_V(idx) |
++				     FW_VI_MAC_ID_BASED_FREE);
++
++	/* Lookup Type. Outer header: 0, Inner header: 1 */
++	p->data0_pkd = cpu_to_be32(DATALKPTYPE_V(lookup_type) |
++				   DATAPORTNUM_V(port_id));
++	/* Lookup mask and port mask */
++	p->data0m_pkd = cpu_to_be64(DATALKPTYPE_V(DATALKPTYPE_M) |
++				    DATAPORTNUM_V(DATAPORTNUM_M));
++
++	/* Copy the address and the mask */
++	memcpy((u8 *)&p->data1[0] + 2, addr, ETH_ALEN);
++	memcpy((u8 *)&p->data1m[0] + 2, mask, ETH_ALEN);
++
++	return t4_wr_mbox_meat(adap, adap->mbox, &c, sizeof(c), &c, sleep_ok);
++}
++
++/**
++ *	t4_alloc_raw_mac_filt - Adds a mac entry in mps tcam
++ *	@adap: the adapter
++ *	@viid: the VI id
++ *	@mac: the MAC address
++ *	@mask: the mask
++ *	@idx: index at which to add this entry
++ *	@port_id: the port index
++ *	@lookup_type: MAC address for inner (1) or outer (0) header
++ *	@sleep_ok: call is allowed to sleep
++ *
++ *	Adds the mac entry at the specified index using raw mac interface.
++ *
++ *	Returns a negative error number or the allocated index for this mac.
++ */
++int t4_alloc_raw_mac_filt(struct adapter *adap, unsigned int viid,
++			  const u8 *addr, const u8 *mask, unsigned int idx,
++			  u8 lookup_type, u8 port_id, bool sleep_ok)
++{
++	int ret = 0;
++	struct fw_vi_mac_cmd c;
++	struct fw_vi_mac_raw *p = &c.u.raw;
++	u32 val;
++
++	memset(&c, 0, sizeof(c));
++	c.op_to_viid = cpu_to_be32(FW_CMD_OP_V(FW_VI_MAC_CMD) |
++				   FW_CMD_REQUEST_F | FW_CMD_WRITE_F |
++				   FW_VI_MAC_CMD_VIID_V(viid));
++	val = FW_CMD_LEN16_V(1) |
++	      FW_VI_MAC_CMD_ENTRY_TYPE_V(FW_VI_MAC_TYPE_RAW);
++	c.freemacs_to_len16 = cpu_to_be32(val);
++
++	/* Specify that this is an inner mac address */
++	p->raw_idx_pkd = cpu_to_be32(FW_VI_MAC_CMD_RAW_IDX_V(idx));
++
++	/* Lookup Type. Outer header: 0, Inner header: 1 */
++	p->data0_pkd = cpu_to_be32(DATALKPTYPE_V(lookup_type) |
++				   DATAPORTNUM_V(port_id));
++	/* Lookup mask and port mask */
++	p->data0m_pkd = cpu_to_be64(DATALKPTYPE_V(DATALKPTYPE_M) |
++				    DATAPORTNUM_V(DATAPORTNUM_M));
++
++	/* Copy the address and the mask */
++	memcpy((u8 *)&p->data1[0] + 2, addr, ETH_ALEN);
++	memcpy((u8 *)&p->data1m[0] + 2, mask, ETH_ALEN);
++
++	ret = t4_wr_mbox_meat(adap, adap->mbox, &c, sizeof(c), &c, sleep_ok);
++	if (ret == 0) {
++		ret = FW_VI_MAC_CMD_RAW_IDX_G(be32_to_cpu(p->raw_idx_pkd));
++		if (ret != idx)
++			ret = -ENOMEM;
++	}
++
++	return ret;
++}
++
+ /**
+  *	t4_alloc_mac_filt - allocates exact-match filters for MAC addresses
+  *	@adap: the adapter
