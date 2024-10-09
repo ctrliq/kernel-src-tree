@@ -1,0 +1,356 @@
+userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Pavel Emelyanov <xemul@parallels.com>
+commit 05ce77249d5068b057082d24ec22d3824f4816ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/05ce7724.failed
+
+If the page is punched out of the address space the uffd reader should
+know this and zeromap the respective area in case of the #PF event.
+
+Link: http://lkml.kernel.org/r/20161216144821.5183-14-aarcange@redhat.com
+	Signed-off-by: Pavel Emelyanov <xemul@parallels.com>
+	Signed-off-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Michael Rapoport <RAPOPORT@il.ibm.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 05ce77249d5068b057082d24ec22d3824f4816ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+#	include/linux/userfaultfd_k.h
+#	include/uapi/linux/userfaultfd.h
+#	mm/madvise.c
+diff --cc fs/userfaultfd.c
+index 30b4fae4cd64,ea9008254df4..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -516,6 -523,144 +516,147 @@@ static void userfaultfd_event_complete(
+  	__remove_wait_queue(&ctx->event_wqh, &ewq->wq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
++ {
++ 	struct userfaultfd_ctx *ctx = NULL, *octx;
++ 	struct userfaultfd_fork_ctx *fctx;
++ 
++ 	octx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!octx || !(octx->features & UFFD_FEATURE_EVENT_FORK)) {
++ 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
++ 		vma->vm_flags &= ~(VM_UFFD_WP | VM_UFFD_MISSING);
++ 		return 0;
++ 	}
++ 
++ 	list_for_each_entry(fctx, fcs, list)
++ 		if (fctx->orig == octx) {
++ 			ctx = fctx->new;
++ 			break;
++ 		}
++ 
++ 	if (!ctx) {
++ 		fctx = kmalloc(sizeof(*fctx), GFP_KERNEL);
++ 		if (!fctx)
++ 			return -ENOMEM;
++ 
++ 		ctx = kmem_cache_alloc(userfaultfd_ctx_cachep, GFP_KERNEL);
++ 		if (!ctx) {
++ 			kfree(fctx);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		atomic_set(&ctx->refcount, 1);
++ 		ctx->flags = octx->flags;
++ 		ctx->state = UFFD_STATE_RUNNING;
++ 		ctx->features = octx->features;
++ 		ctx->released = false;
++ 		ctx->mm = vma->vm_mm;
++ 		atomic_inc(&ctx->mm->mm_count);
++ 
++ 		userfaultfd_ctx_get(octx);
++ 		fctx->orig = octx;
++ 		fctx->new = ctx;
++ 		list_add_tail(&fctx->list, fcs);
++ 	}
++ 
++ 	vma->vm_userfaultfd_ctx.ctx = ctx;
++ 	return 0;
++ }
++ 
++ static int dup_fctx(struct userfaultfd_fork_ctx *fctx)
++ {
++ 	struct userfaultfd_ctx *ctx = fctx->orig;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_FORK;
++ 	ewq.msg.arg.reserved.reserved1 = (unsigned long)fctx->new;
++ 
++ 	return userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void dup_userfaultfd_complete(struct list_head *fcs)
++ {
++ 	int ret = 0;
++ 	struct userfaultfd_fork_ctx *fctx, *n;
++ 
++ 	list_for_each_entry_safe(fctx, n, fcs, list) {
++ 		if (!ret)
++ 			ret = dup_fctx(fctx);
++ 		list_del(&fctx->list);
++ 		kfree(fctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 			     struct vm_userfaultfd_ctx *vm_ctx)
++ {
++ 	struct userfaultfd_ctx *ctx;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (ctx && (ctx->features & UFFD_FEATURE_EVENT_REMAP)) {
++ 		vm_ctx->ctx = ctx;
++ 		userfaultfd_ctx_get(ctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *vm_ctx,
++ 				 unsigned long from, unsigned long to,
++ 				 unsigned long len)
++ {
++ 	struct userfaultfd_ctx *ctx = vm_ctx->ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	if (!ctx)
++ 		return;
++ 
++ 	if (to & ~PAGE_MASK) {
++ 		userfaultfd_ctx_put(ctx);
++ 		return;
++ 	}
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMAP;
++ 	ewq.msg.arg.remap.from = from;
++ 	ewq.msg.arg.remap.to = to;
++ 	ewq.msg.arg.remap.len = len;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void madvise_userfault_dontneed(struct vm_area_struct *vma,
++ 				struct vm_area_struct **prev,
++ 				unsigned long start, unsigned long end)
++ {
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	struct userfaultfd_ctx *ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_MADVDONTNEED))
++ 		return;
++ 
++ 	userfaultfd_ctx_get(ctx);
++ 	up_read(&mm->mmap_sem);
++ 
++ 	*prev = NULL; /* We wait for ACK w/o the mmap semaphore */
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_MADVDONTNEED;
++ 	ewq.msg.arg.madv_dn.start = start;
++ 	ewq.msg.arg.madv_dn.end = end;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ 
++ 	down_read(&mm->mmap_sem);
++ }
++ 
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  static int userfaultfd_release(struct inode *inode, struct file *file)
+  {
+  	struct userfaultfd_ctx *ctx = file->private_data;
+diff --cc include/linux/userfaultfd_k.h
+index 587480ad41b7,f431861f22f1..000000000000
+--- a/include/linux/userfaultfd_k.h
++++ b/include/linux/userfaultfd_k.h
+@@@ -53,6 -52,20 +53,23 @@@ static inline bool userfaultfd_armed(st
+  	return vma->vm_flags & (VM_UFFD_MISSING | VM_UFFD_WP);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);
++ extern void dup_userfaultfd_complete(struct list_head *);
++ 
++ extern void mremap_userfaultfd_prep(struct vm_area_struct *,
++ 				    struct vm_userfaultfd_ctx *);
++ extern void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *,
++ 					unsigned long from, unsigned long to,
++ 					unsigned long len);
++ 
++ extern void madvise_userfault_dontneed(struct vm_area_struct *vma,
++ 				       struct vm_area_struct **prev,
++ 				       unsigned long start,
++ 				       unsigned long end);
++ 
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  #else /* CONFIG_USERFAULTFD */
+  
+  /* mm helpers */
+@@@ -80,6 -90,34 +97,37 @@@ static inline bool userfaultfd_armed(st
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int dup_userfaultfd(struct vm_area_struct *vma,
++ 				  struct list_head *l)
++ {
++ 	return 0;
++ }
++ 
++ static inline void dup_userfaultfd_complete(struct list_head *l)
++ {
++ }
++ 
++ static inline void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 					   struct vm_userfaultfd_ctx *ctx)
++ {
++ }
++ 
++ static inline void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *ctx,
++ 					       unsigned long from,
++ 					       unsigned long to,
++ 					       unsigned long len)
++ {
++ }
++ 
++ static inline void madvise_userfault_dontneed(struct vm_area_struct *vma,
++ 					      struct vm_area_struct **prev,
++ 					      unsigned long start,
++ 					      unsigned long end)
++ {
++ }
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  #endif /* CONFIG_USERFAULTFD */
+  
+  #endif /* _LINUX_USERFAULTFD_K_H */
+diff --cc include/uapi/linux/userfaultfd.h
+index d9111d5b3ae2,2bbf32319cf5..000000000000
+--- a/include/uapi/linux/userfaultfd.h
++++ b/include/uapi/linux/userfaultfd.h
+@@@ -18,12 -18,9 +18,18 @@@
+   * means the userland is reading).
+   */
+  #define UFFD_API ((__u64)0xAA)
+++<<<<<<< HEAD
+ +/*
+ + * After implementing the respective features it will become:
+ + * #define UFFD_API_FEATURES (UFFD_FEATURE_PAGEFAULT_FLAG_WP | \
+ + *			      UFFD_FEATURE_EVENT_FORK)
+ + */
+ +#define UFFD_API_FEATURES (0)
+++=======
++ #define UFFD_API_FEATURES (UFFD_FEATURE_EVENT_FORK |	    \
++ 			   UFFD_FEATURE_EVENT_REMAP |	    \
++ 			   UFFD_FEATURE_EVENT_MADVDONTNEED)
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  #define UFFD_API_IOCTLS				\
+  	((__u64)1 << _UFFDIO_REGISTER |		\
+  	 (__u64)1 << _UFFDIO_UNREGISTER |	\
+@@@ -78,6 -75,21 +84,24 @@@ struct uffd_msg 
+  		} pagefault;
+  
+  		struct {
+++<<<<<<< HEAD
+++=======
++ 			__u32	ufd;
++ 		} fork;
++ 
++ 		struct {
++ 			__u64	from;
++ 			__u64	to;
++ 			__u64	len;
++ 		} remap;
++ 
++ 		struct {
++ 			__u64	start;
++ 			__u64	end;
++ 		} madv_dn;
++ 
++ 		struct {
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  			/* unused reserved fields */
+  			__u64	reserved1;
+  			__u64	reserved2;
+@@@ -90,9 -102,9 +114,14 @@@
+   * Start at 0x12 and not at 0 to be more strict against bugs.
+   */
+  #define UFFD_EVENT_PAGEFAULT	0x12
+ +#if 0 /* not available yet */
+  #define UFFD_EVENT_FORK		0x13
+++<<<<<<< HEAD
+ +#endif
+++=======
++ #define UFFD_EVENT_REMAP	0x14
++ #define UFFD_EVENT_MADVDONTNEED	0x15
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  
+  /* flags for UFFD_EVENT_PAGEFAULT */
+  #define UFFD_PAGEFAULT_FLAG_WRITE	(1<<0)	/* If this was a write fault */
+@@@ -111,10 -123,10 +140,15 @@@ struct uffdio_api 
+  	 * are to be considered implicitly always enabled in all kernels as
+  	 * long as the uffdio_api.api requested matches UFFD_API.
+  	 */
+ +#if 0 /* not available yet */
+  #define UFFD_FEATURE_PAGEFAULT_FLAG_WP		(1<<0)
+  #define UFFD_FEATURE_EVENT_FORK			(1<<1)
+++<<<<<<< HEAD
+ +#endif
+++=======
++ #define UFFD_FEATURE_EVENT_REMAP		(1<<2)
++ #define UFFD_FEATURE_EVENT_MADVDONTNEED		(1<<3)
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  	__u64 features;
+  
+  	__u64 ioctls;
+diff --cc mm/madvise.c
+index 73378fb832b8,06ffb5a170de..000000000000
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@@ -279,14 -477,8 +280,19 @@@ static long madvise_dontneed(struct vm_
+  	if (vma->vm_flags & (VM_LOCKED|VM_HUGETLB|VM_PFNMAP))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(vma->vm_flags & VM_NONLINEAR)) {
+ +		struct zap_details details = {
+ +			.nonlinear_vma = vma,
+ +			.last_index = ULONG_MAX,
+ +		};
+ +		zap_page_range(vma, start, end - start, &details);
+ +	} else
+ +		zap_page_range(vma, start, end - start, NULL);
+++=======
++ 	zap_page_range(vma, start, end - start, NULL);
++ 	madvise_userfault_dontneed(vma, prev, start, end);
+++>>>>>>> 05ce77249d50 (userfaultfd: non-cooperative: add madvise() event for MADV_DONTNEED request)
+  	return 0;
+  }
+  
+* Unmerged path fs/userfaultfd.c
+* Unmerged path include/linux/userfaultfd_k.h
+* Unmerged path include/uapi/linux/userfaultfd.h
+* Unmerged path mm/madvise.c
