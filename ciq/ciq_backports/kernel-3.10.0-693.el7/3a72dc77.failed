@@ -1,0 +1,150 @@
+xprtrdma: Relocate connection helper functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3a72dc771cc38e4d6e441a86256a3d7788a84c01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3a72dc77.failed
+
+Clean up: Disentangle connection helpers from RPC-over-RDMA reply
+decoding functions.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3a72dc771cc38e4d6e441a86256a3d7788a84c01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index ae3921a9fec6,e35efd4ac1e4..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -492,17 -550,23 +493,21 @@@ rpcrdma_data_dir(bool writing
+  }
+  
+  /*
+ - * RPC/RDMA protocol calls - xprtrdma/rpc_rdma.c
+++<<<<<<< HEAD
+ + * RPC/RDMA connection management calls - xprtrdma/rpc_rdma.c
+   */
+ +void rpcrdma_connect_worker(struct work_struct *);
+ +void rpcrdma_conn_func(struct rpcrdma_ep *);
+ +void rpcrdma_reply_handler(struct rpcrdma_rep *);
+  
+ -enum rpcrdma_chunktype {
+ -	rpcrdma_noch = 0,
+ -	rpcrdma_readch,
+ -	rpcrdma_areadch,
+ -	rpcrdma_writech,
+ -	rpcrdma_replych
+ -};
+ -
+ -bool rpcrdma_prepare_send_sges(struct rpcrdma_ia *, struct rpcrdma_req *,
+ -			       u32, struct xdr_buf *, enum rpcrdma_chunktype);
+ -void rpcrdma_unmap_sges(struct rpcrdma_ia *, struct rpcrdma_req *);
+ +/*
+++=======
+++>>>>>>> 3a72dc771cc3 (xprtrdma: Relocate connection helper functions)
+ + * RPC/RDMA protocol calls - xprtrdma/rpc_rdma.c
+ + */
+  int rpcrdma_marshal_req(struct rpc_rqst *);
+  void rpcrdma_set_max_header_sizes(struct rpcrdma_xprt *);
++ void rpcrdma_reply_handler(struct work_struct *work);
+  
+  /* RPC/RDMA module init - xprtrdma/transport.c
+   */
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index cff6dfa72553..d709f2c1a4bd 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -1002,28 +1002,6 @@ rpcrdma_inline_fixup(struct rpc_rqst *rqst, char *srcp, int copy_len, int pad)
+ 	return fixup_copy_count;
+ }
+ 
+-void
+-rpcrdma_connect_worker(struct work_struct *work)
+-{
+-	struct rpcrdma_ep *ep =
+-		container_of(work, struct rpcrdma_ep, rep_connect_worker.work);
+-	struct rpcrdma_xprt *r_xprt =
+-		container_of(ep, struct rpcrdma_xprt, rx_ep);
+-	struct rpc_xprt *xprt = &r_xprt->rx_xprt;
+-
+-	spin_lock_bh(&xprt->transport_lock);
+-	if (++xprt->connect_cookie == 0)	/* maintain a reserved value */
+-		++xprt->connect_cookie;
+-	if (ep->rep_connected > 0) {
+-		if (!xprt_test_and_set_connected(xprt))
+-			xprt_wake_pending_tasks(xprt, 0);
+-	} else {
+-		if (xprt_test_and_clear_connected(xprt))
+-			xprt_wake_pending_tasks(xprt, -ENOTCONN);
+-	}
+-	spin_unlock_bh(&xprt->transport_lock);
+-}
+-
+ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+ /* By convention, backchannel calls arrive via rdma_msg type
+  * messages, and never populate the chunk lists. This makes
+@@ -1055,18 +1033,6 @@ rpcrdma_is_bcall(struct rpcrdma_msg *headerp)
+ }
+ #endif	/* CONFIG_SUNRPC_BACKCHANNEL */
+ 
+-/*
+- * This function is called when an async event is posted to
+- * the connection which changes the connection state. All it
+- * does at this point is mark the connection up/down, the rpc
+- * timers do the rest.
+- */
+-void
+-rpcrdma_conn_func(struct rpcrdma_ep *ep)
+-{
+-	schedule_delayed_work(&ep->rep_connect_worker, 0);
+-}
+-
+ /* Process received RPC/RDMA messages.
+  *
+  * Errors must result in the RPC task either being awakened, or
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index f834dfd7d240..5e56c078eea1 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -219,6 +219,34 @@ xprt_rdma_free_addresses(struct rpc_xprt *xprt)
+ 		}
+ }
+ 
++void
++rpcrdma_conn_func(struct rpcrdma_ep *ep)
++{
++	schedule_delayed_work(&ep->rep_connect_worker, 0);
++}
++
++void
++rpcrdma_connect_worker(struct work_struct *work)
++{
++	struct rpcrdma_ep *ep =
++		container_of(work, struct rpcrdma_ep, rep_connect_worker.work);
++	struct rpcrdma_xprt *r_xprt =
++		container_of(ep, struct rpcrdma_xprt, rx_ep);
++	struct rpc_xprt *xprt = &r_xprt->rx_xprt;
++
++	spin_lock_bh(&xprt->transport_lock);
++	if (++xprt->connect_cookie == 0)	/* maintain a reserved value */
++		++xprt->connect_cookie;
++	if (ep->rep_connected > 0) {
++		if (!xprt_test_and_set_connected(xprt))
++			xprt_wake_pending_tasks(xprt, 0);
++	} else {
++		if (xprt_test_and_clear_connected(xprt))
++			xprt_wake_pending_tasks(xprt, -ENOTCONN);
++	}
++	spin_unlock_bh(&xprt->transport_lock);
++}
++
+ static void
+ xprt_rdma_connect_worker(struct work_struct *work)
+ {
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
