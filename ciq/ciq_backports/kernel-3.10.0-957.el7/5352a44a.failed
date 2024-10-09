@@ -1,0 +1,238 @@
+PCI: pciehp: Make pciehp_is_native() stricter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [pci] pciehp: Make pciehp_is_native() stricter (Jarod Wilson) [1495223]
+Rebuild_FUZZ: 94.12%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 5352a44a561d708f1a975a90f5ce16a054fe265c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5352a44a.failed
+
+Previously pciehp_is_native() returned true for any PCI device in a
+hierarchy where _OSC says we can use pciehp.  This is incorrect because
+bridges without PCI_EXP_SLTCAP_HPC capability should be managed by acpiphp
+instead.
+
+Improve pciehp_is_native() to return true only when PCI_EXP_SLTCAP_HPC is
+set and the pciehp driver is present.  In any other case return false
+to let acpiphp handle those.
+
+	Suggested-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+[bhelgaas: remove NULL pointer check]
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 5352a44a561d708f1a975a90f5ce16a054fe265c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pcie/portdrv.h
+#	include/linux/pci.h
+diff --cc drivers/pci/pcie/portdrv.h
+index 587aef36030d,aa542dc10d23..000000000000
+--- a/drivers/pci/pcie/portdrv.h
++++ b/drivers/pci/pcie/portdrv.h
+@@@ -11,12 -11,70 +11,73 @@@
+  
+  #include <linux/compiler.h>
+  
+++<<<<<<< HEAD
+ +#define PCIE_PORT_DEVICE_MAXSERVICES   5
+++=======
++ /* Service Type */
++ #define PCIE_PORT_SERVICE_PME_SHIFT	0	/* Power Management Event */
++ #define PCIE_PORT_SERVICE_PME		(1 << PCIE_PORT_SERVICE_PME_SHIFT)
++ #define PCIE_PORT_SERVICE_AER_SHIFT	1	/* Advanced Error Reporting */
++ #define PCIE_PORT_SERVICE_AER		(1 << PCIE_PORT_SERVICE_AER_SHIFT)
++ #define PCIE_PORT_SERVICE_HP_SHIFT	2	/* Native Hotplug */
++ #define PCIE_PORT_SERVICE_HP		(1 << PCIE_PORT_SERVICE_HP_SHIFT)
++ #define PCIE_PORT_SERVICE_DPC_SHIFT	3	/* Downstream Port Containment */
++ #define PCIE_PORT_SERVICE_DPC		(1 << PCIE_PORT_SERVICE_DPC_SHIFT)
++ 
++ #define PCIE_PORT_DEVICE_MAXSERVICES   4
++ 
++ /* Port Type */
++ #define PCIE_ANY_PORT			(~0)
++ 
++ struct pcie_device {
++ 	int		irq;	    /* Service IRQ/MSI/MSI-X Vector */
++ 	struct pci_dev *port;	    /* Root/Upstream/Downstream Port */
++ 	u32		service;    /* Port service this device represents */
++ 	void		*priv_data; /* Service Private Data */
++ 	struct device	device;     /* Generic Device Interface */
++ };
++ #define to_pcie_device(d) container_of(d, struct pcie_device, device)
++ 
++ static inline void set_service_data(struct pcie_device *dev, void *data)
++ {
++ 	dev->priv_data = data;
++ }
++ 
++ static inline void *get_service_data(struct pcie_device *dev)
++ {
++ 	return dev->priv_data;
++ }
++ 
++ struct pcie_port_service_driver {
++ 	const char *name;
++ 	int (*probe) (struct pcie_device *dev);
++ 	void (*remove) (struct pcie_device *dev);
++ 	int (*suspend) (struct pcie_device *dev);
++ 	int (*resume) (struct pcie_device *dev);
++ 
++ 	/* Device driver may resume normal operations */
++ 	void (*error_resume)(struct pci_dev *dev);
++ 
++ 	/* Link Reset Capability - AER service driver specific */
++ 	pci_ers_result_t (*reset_link) (struct pci_dev *dev);
++ 
++ 	int port_type;  /* Type of the port this driver can handle */
++ 	u32 service;    /* Port service this device represents */
++ 
++ 	struct device_driver driver;
++ };
++ #define to_service_driver(d) \
++ 	container_of(d, struct pcie_port_service_driver, driver)
++ 
++ int pcie_port_service_register(struct pcie_port_service_driver *new);
++ void pcie_port_service_unregister(struct pcie_port_service_driver *new);
++ 
+++>>>>>>> 5352a44a561d (PCI: pciehp: Make pciehp_is_native() stricter)
+  /*
+ - * The PCIe Capability Interrupt Message Number (PCIe r3.1, sec 7.8.2) must
+ - * be one of the first 32 MSI-X entries.  Per PCI r3.0, sec 6.8.3.1, MSI
+ - * supports a maximum of 32 vectors per function.
+ + * According to the PCI Express Base Specification 2.0, the indices of
+ + * the MSI-X table entries used by port services must not exceed 31
+   */
+ -#define PCIE_PORT_MAX_MSI_ENTRIES	32
+ +#define PCIE_PORT_MAX_MSIX_ENTRIES	32
+  
+  #define get_descriptor_id(type, service) (((type - 4) << 8) | service)
+  
+diff --cc include/linux/pci.h
+index 2d20a9a169fc,3f009003706a..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -1395,12 -1420,44 +1395,19 @@@ pci_alloc_irq_vectors(struct pci_dev *d
+  					      NULL);
+  }
+  
+ -/**
+ - * pci_irqd_intx_xlate() - Translate PCI INTx value to an IRQ domain hwirq
+ - * @d: the INTx IRQ domain
+ - * @node: the DT node for the device whose interrupt we're translating
+ - * @intspec: the interrupt specifier data from the DT
+ - * @intsize: the number of entries in @intspec
+ - * @out_hwirq: pointer at which to write the hwirq number
+ - * @out_type: pointer at which to write the interrupt type
+ - *
+ - * Translate a PCI INTx interrupt number from device tree in the range 1-4, as
+ - * stored in the standard PCI_INTERRUPT_PIN register, to a value in the range
+ - * 0-3 suitable for use in a 4 entry IRQ domain. That is, subtract one from the
+ - * INTx value to obtain the hwirq number.
+ - *
+ - * Returns 0 on success, or -EINVAL if the interrupt specifier is out of range.
+ - */
+ -static inline int pci_irqd_intx_xlate(struct irq_domain *d,
+ -				      struct device_node *node,
+ -				      const u32 *intspec,
+ -				      unsigned int intsize,
+ -				      unsigned long *out_hwirq,
+ -				      unsigned int *out_type)
+ -{
+ -	const u32 intx = intspec[0];
+ -
+ -	if (intx < PCI_INTERRUPT_INTA || intx > PCI_INTERRUPT_INTD)
+ -		return -EINVAL;
+ -
+ -	*out_hwirq = intx - PCI_INTERRUPT_INTA;
+ -	return 0;
+ -}
+ -
+  #ifdef CONFIG_PCIEPORTBUS
+  extern bool pcie_ports_disabled;
+++<<<<<<< HEAD
+ +extern bool pcie_ports_auto;
+ +#else
+ +#define pcie_ports_disabled	true
+ +#define pcie_ports_auto		false
+++=======
++ extern bool pcie_ports_native;
++ #else
++ #define pcie_ports_disabled	true
++ #define pcie_ports_native	false
+++>>>>>>> 5352a44a561d (PCI: pciehp: Make pciehp_is_native() stricter)
+  #endif
+  
+  #ifdef CONFIG_PCIEASPM
+diff --git a/drivers/pci/pci-acpi.c b/drivers/pci/pci-acpi.c
+index f8c71f6ccc20..a270d4ae9bfe 100644
+--- a/drivers/pci/pci-acpi.c
++++ b/drivers/pci/pci-acpi.c
+@@ -293,26 +293,28 @@ EXPORT_SYMBOL_GPL(pci_get_hp_params);
+ 
+ /**
+  * pciehp_is_native - Check whether a hotplug port is handled by the OS
+- * @pdev: Hotplug port to check
++ * @bridge: Hotplug port to check
+  *
+- * Walk up from @pdev to the host bridge, obtain its cached _OSC Control Field
+- * and return the value of the "PCI Express Native Hot Plug control" bit.
+- * On failure to obtain the _OSC Control Field return %false.
++ * Returns true if the given @bridge is handled by the native PCIe hotplug
++ * driver.
+  */
+-bool pciehp_is_native(struct pci_dev *pdev)
++bool pciehp_is_native(struct pci_dev *bridge)
+ {
+-	struct acpi_pci_root *root;
+-	acpi_handle handle;
++	const struct pci_host_bridge *host;
++	u32 slot_cap;
+ 
+-	handle = acpi_find_root_bridge_handle(pdev);
+-	if (!handle)
++	if (!IS_ENABLED(CONFIG_HOTPLUG_PCI_PCIE))
+ 		return false;
+ 
+-	root = acpi_pci_find_root(handle);
+-	if (!root)
++	pcie_capability_read_dword(bridge, PCI_EXP_SLTCAP, &slot_cap);
++	if (!(slot_cap & PCI_EXP_SLTCAP_HPC))
+ 		return false;
+ 
+-	return root->osc_control_set & OSC_PCI_EXPRESS_NATIVE_HP_CONTROL;
++	if (pcie_ports_native)
++		return true;
++
++	host = pci_find_host_bridge(bridge->bus);
++	return host->native_pcie_hotplug;
+ }
+ 
+ /**
+* Unmerged path drivers/pci/pcie/portdrv.h
+* Unmerged path include/linux/pci.h
+diff --git a/include/linux/pci_hotplug.h b/include/linux/pci_hotplug.h
+index 2e855afa0212..a9eecb1c298a 100644
+--- a/include/linux/pci_hotplug.h
++++ b/include/linux/pci_hotplug.h
+@@ -176,7 +176,7 @@ struct hotplug_params {
+ #ifdef CONFIG_ACPI
+ #include <linux/acpi.h>
+ int pci_get_hp_params(struct pci_dev *dev, struct hotplug_params *hpp);
+-bool pciehp_is_native(struct pci_dev *pdev);
++bool pciehp_is_native(struct pci_dev *bridge);
+ int acpi_get_hp_hw_control_from_firmware(struct pci_dev *dev, u32 flags);
+ int acpi_pci_check_ejectable(struct pci_bus *pbus, acpi_handle handle);
+ int acpi_pci_detect_ejectable(acpi_handle handle);
+@@ -186,6 +186,6 @@ static inline int pci_get_hp_params(struct pci_dev *dev,
+ {
+ 	return -ENODEV;
+ }
+-static inline bool pciehp_is_native(struct pci_dev *pdev) { return true; }
++static inline bool pciehp_is_native(struct pci_dev *bridge) { return true; }
+ #endif
+ #endif
