@@ -1363,6 +1363,7 @@ static int cxlflash_disk_attach(struct scsi_device *sdev,
 	if (unlikely(!ctxi)) {
 		dev_err(dev, "%s: Failed to create context! (%d)\n",
 			__func__, ctxid);
+		rc = -ENOMEM;
 		goto err;
 	}
 
