@@ -52,6 +52,7 @@ struct qedr_alloc_ucontext_resp {
 	__u8 dpm_enabled;
 	__u8 wids_enabled;
 	__u16 wid_count;
+	__u32 reserved;
 };
 
 struct qedr_alloc_pd_ureq {
@@ -60,6 +61,7 @@ struct qedr_alloc_pd_ureq {
 
 struct qedr_alloc_pd_uresp {
 	__u32 pd_id;
+	__u32 reserved;
 };
 
 struct qedr_create_cq_ureq {
@@ -70,6 +72,7 @@ struct qedr_create_cq_ureq {
 struct qedr_create_cq_uresp {
 	__u32 db_offset;
 	__u16 icid;
+	__u16 reserved;
 };
 
 struct qedr_create_qp_ureq {
@@ -104,6 +107,7 @@ struct qedr_create_qp_uresp {
 	__u16 rq_icid;
 
 	__u32 rq_db2_offset;
+	__u32 reserved;
 };
 
 #endif /* __QEDR_USER_H__ */
