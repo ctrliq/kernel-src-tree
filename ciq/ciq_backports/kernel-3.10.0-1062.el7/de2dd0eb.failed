@@ -1,0 +1,196 @@
+genalloc:support memory-allocation with bytes-alignment to genalloc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Zhao Qiang <qiang.zhao@freescale.com>
+commit de2dd0eb30af55d3893979d5641c50c7a8969c99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/de2dd0eb.failed
+
+Bytes alignment is required to manage some special RAM,
+so add gen_pool_first_fit_align to genalloc,
+meanwhile add gen_pool_alloc_algo to pass algo in case user
+layer using more than one algo, and pass data to
+gen_pool_first_fit_align(modify gen_pool_alloc as a wrapper)
+
+	Signed-off-by: Zhao Qiang <qiang.zhao@freescale.com>
+	Signed-off-by: Scott Wood <scottwood@freescale.com>
+(cherry picked from commit de2dd0eb30af55d3893979d5641c50c7a8969c99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/genalloc.h
+diff --cc include/linux/genalloc.h
+index edc51cbf631c,3c676ce46ee0..000000000000
+--- a/include/linux/genalloc.h
++++ b/include/linux/genalloc.h
+@@@ -96,6 -107,10 +105,13 @@@ static inline int gen_pool_add(struct g
+  }
+  extern void gen_pool_destroy(struct gen_pool *);
+  extern unsigned long gen_pool_alloc(struct gen_pool *, size_t);
+++<<<<<<< HEAD
+++=======
++ extern unsigned long gen_pool_alloc_algo(struct gen_pool *, size_t,
++ 		genpool_algo_t algo, void *data);
++ extern void *gen_pool_dma_alloc(struct gen_pool *pool, size_t size,
++ 		dma_addr_t *dma);
+++>>>>>>> de2dd0eb30af (genalloc:support memory-allocation with bytes-alignment to genalloc)
+  extern void gen_pool_free(struct gen_pool *, unsigned long, size_t);
+  extern void gen_pool_for_each_chunk(struct gen_pool *,
+  	void (*)(struct gen_pool *, struct gen_pool_chunk *, void *), void *);
+@@@ -110,20 -131,25 +132,22 @@@ extern unsigned long gen_pool_first_fit
+  
+  extern unsigned long gen_pool_first_fit_order_align(unsigned long *map,
+  		unsigned long size, unsigned long start, unsigned int nr,
+- 		void *data);
++ 		void *data, struct gen_pool *pool);
+  
+  extern unsigned long gen_pool_best_fit(unsigned long *map, unsigned long size,
+- 		unsigned long start, unsigned int nr, void *data);
++ 		unsigned long start, unsigned int nr, void *data,
++ 		struct gen_pool *pool);
++ 
+  
+  extern struct gen_pool *devm_gen_pool_create(struct device *dev,
+ -		int min_alloc_order, int nid, const char *name);
+ -extern struct gen_pool *gen_pool_get(struct device *dev, const char *name);
+ -
+ -bool addr_in_gen_pool(struct gen_pool *pool, unsigned long start,
+ -			size_t size);
+ +		int min_alloc_order, int nid);
+ +extern struct gen_pool *dev_get_gen_pool(struct device *dev);
+  
+  #ifdef CONFIG_OF
+ -extern struct gen_pool *of_gen_pool_get(struct device_node *np,
+ +extern struct gen_pool *of_get_named_gen_pool(struct device_node *np,
+  	const char *propname, int index);
+  #else
+ -static inline struct gen_pool *of_gen_pool_get(struct device_node *np,
+ +static inline struct gen_pool *of_get_named_gen_pool(struct device_node *np,
+  	const char *propname, int index)
+  {
+  	return NULL;
+* Unmerged path include/linux/genalloc.h
+diff --git a/lib/genalloc.c b/lib/genalloc.c
+index 1895fd49d6a3..e9f531ff2c95 100644
+--- a/lib/genalloc.c
++++ b/lib/genalloc.c
+@@ -269,6 +269,25 @@ EXPORT_SYMBOL(gen_pool_destroy);
+  * NMI-safe cmpxchg implementation.
+  */
+ unsigned long gen_pool_alloc(struct gen_pool *pool, size_t size)
++{
++	return gen_pool_alloc_algo(pool, size, pool->algo, pool->data);
++}
++EXPORT_SYMBOL(gen_pool_alloc);
++
++/**
++ * gen_pool_alloc_algo - allocate special memory from the pool
++ * @pool: pool to allocate from
++ * @size: number of bytes to allocate from the pool
++ * @algo: algorithm passed from caller
++ * @data: data passed to algorithm
++ *
++ * Allocate the requested number of bytes from the specified pool.
++ * Uses the pool allocation function (with first-fit algorithm by default).
++ * Can not be used in NMI handler on architectures without
++ * NMI-safe cmpxchg implementation.
++ */
++unsigned long gen_pool_alloc_algo(struct gen_pool *pool, size_t size,
++		genpool_algo_t algo, void *data)
+ {
+ 	struct gen_pool_chunk *chunk;
+ 	unsigned long addr = 0;
+@@ -290,8 +309,8 @@ unsigned long gen_pool_alloc(struct gen_pool *pool, size_t size)
+ 
+ 		end_bit = chunk_size(chunk) >> order;
+ retry:
+-		start_bit = pool->algo(chunk->bits, end_bit, start_bit, nbits,
+-				pool->data);
++		start_bit = algo(chunk->bits, end_bit, start_bit,
++				 nbits, data, pool);
+ 		if (start_bit >= end_bit)
+ 			continue;
+ 		remain = bitmap_set_ll(chunk->bits, start_bit, nbits);
+@@ -310,7 +329,7 @@ retry:
+ 	rcu_read_unlock();
+ 	return addr;
+ }
+-EXPORT_SYMBOL(gen_pool_alloc);
++EXPORT_SYMBOL(gen_pool_alloc_algo);
+ 
+ /**
+  * gen_pool_free - free allocated special memory back to the pool
+@@ -443,14 +462,41 @@ EXPORT_SYMBOL(gen_pool_set_algo);
+  * @start: The bitnumber to start searching at
+  * @nr: The number of zeroed bits we're looking for
+  * @data: additional data - unused
++ * @pool: pool to find the fit region memory from
+  */
+ unsigned long gen_pool_first_fit(unsigned long *map, unsigned long size,
+-		unsigned long start, unsigned int nr, void *data)
++		unsigned long start, unsigned int nr, void *data,
++		struct gen_pool *pool)
+ {
+ 	return bitmap_find_next_zero_area(map, size, start, nr, 0);
+ }
+ EXPORT_SYMBOL(gen_pool_first_fit);
+ 
++/**
++ * gen_pool_first_fit_align - find the first available region
++ * of memory matching the size requirement (alignment constraint)
++ * @map: The address to base the search on
++ * @size: The bitmap size in bits
++ * @start: The bitnumber to start searching at
++ * @nr: The number of zeroed bits we're looking for
++ * @data: data for alignment
++ * @pool: pool to get order from
++ */
++unsigned long gen_pool_first_fit_align(unsigned long *map, unsigned long size,
++		unsigned long start, unsigned int nr, void *data,
++		struct gen_pool *pool)
++{
++	struct genpool_data_align *alignment;
++	unsigned long align_mask;
++	int order;
++
++	alignment = data;
++	order = pool->min_alloc_order;
++	align_mask = ((alignment->align + (1UL << order) - 1) >> order) - 1;
++	return bitmap_find_next_zero_area(map, size, start, nr, align_mask);
++}
++EXPORT_SYMBOL(gen_pool_first_fit_align);
++
+ /**
+  * gen_pool_first_fit_order_align - find the first available region
+  * of memory matching the size requirement. The region will be aligned
+@@ -460,10 +506,11 @@ EXPORT_SYMBOL(gen_pool_first_fit);
+  * @start: The bitnumber to start searching at
+  * @nr: The number of zeroed bits we're looking for
+  * @data: additional data - unused
++ * @pool: pool to find the fit region memory from
+  */
+ unsigned long gen_pool_first_fit_order_align(unsigned long *map,
+ 		unsigned long size, unsigned long start,
+-		unsigned int nr, void *data)
++		unsigned int nr, void *data, struct gen_pool *pool)
+ {
+ 	unsigned long align_mask = roundup_pow_of_two(nr) - 1;
+ 
+@@ -479,12 +526,14 @@ EXPORT_SYMBOL(gen_pool_first_fit_order_align);
+  * @start: The bitnumber to start searching at
+  * @nr: The number of zeroed bits we're looking for
+  * @data: additional data - unused
++ * @pool: pool to find the fit region memory from
+  *
+  * Iterate over the bitmap to find the smallest free region
+  * which we can allocate the memory.
+  */
+ unsigned long gen_pool_best_fit(unsigned long *map, unsigned long size,
+-		unsigned long start, unsigned int nr, void *data)
++		unsigned long start, unsigned int nr, void *data,
++		struct gen_pool *pool)
+ {
+ 	unsigned long start_bit = size;
+ 	unsigned long len = size + 1;
