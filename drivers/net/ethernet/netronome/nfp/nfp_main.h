@@ -44,6 +44,7 @@
 #include <linux/msi.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/workqueue.h>
 
 struct dentry;
 struct pci_dev;
@@ -68,6 +69,7 @@ struct nfp_eth_table;
  * @num_ports:		Number of adapter ports
  * @ports:		Linked list of port structures (struct nfp_net)
  * @port_lock:		Protects @ports, @num_ports, @num_netdevs
+ * @port_refresh_work:	Work entry for taking netdevs out
  */
 struct nfp_pf {
 	struct pci_dev *pdev;
@@ -91,6 +93,7 @@ struct nfp_pf {
 
 	unsigned int num_ports;
 	struct list_head ports;
+	struct work_struct port_refresh_work;
 	struct mutex port_lock;
 };
 
