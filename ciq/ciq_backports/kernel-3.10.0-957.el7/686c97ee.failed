@@ -1,0 +1,134 @@
+s390/qeth: fix error handling in adapter command callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] qeth: fix error handling in adapter command callbacks (Hendrik Brueckner) [1603170]
+Rebuild_FUZZ: 95.50%
+commit-author Julian Wiedmann <jwi@linux.vnet.ibm.com>
+commit 686c97ee29c886ee07d17987d0059874c5c3b5af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/686c97ee.failed
+
+Make sure to check both return code fields before(!) processing the
+command response. Otherwise we risk operating on invalid data.
+
+This matches an earlier fix for SETASSPARMS commands, see
+commit ad3cbf613329 ("s390/qeth: fix error handling in checksum cmd callback").
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 686c97ee29c886ee07d17987d0059874c5c3b5af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 467355a4d78a,36bc94088de1..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -2940,20 -3030,15 +2940,14 @@@ int qeth_send_startlan(struct qeth_car
+  	rc = qeth_send_ipa_cmd(card, iob, NULL, NULL);
+  	return rc;
+  }
+ +EXPORT_SYMBOL_GPL(qeth_send_startlan);
+  
+- static int qeth_default_setadapterparms_cb(struct qeth_card *card,
+- 		struct qeth_reply *reply, unsigned long data)
++ static int qeth_setadpparms_inspect_rc(struct qeth_ipa_cmd *cmd)
+  {
+- 	struct qeth_ipa_cmd *cmd;
+- 
+- 	QETH_CARD_TEXT(card, 4, "defadpcb");
+- 
+- 	cmd = (struct qeth_ipa_cmd *) data;
+- 	if (cmd->hdr.return_code == 0)
++ 	if (!cmd->hdr.return_code)
+  		cmd->hdr.return_code =
+  			cmd->data.setadapterparms.hdr.return_code;
+- 	return 0;
++ 	return cmd->hdr.return_code;
+  }
+  
+  static int qeth_query_setadapterparms_cb(struct qeth_card *card,
+@@@ -4108,12 -4205,9 +4101,16 @@@ static int qeth_setadp_promisc_mode_cb(
+  
+  	QETH_CARD_TEXT(card, 4, "prmadpcb");
+  
+- 	cmd = (struct qeth_ipa_cmd *) data;
+  	setparms = &(cmd->data.setadapterparms);
+++<<<<<<< HEAD
+ +
+ +	qeth_default_setadapterparms_cb(card, reply, (unsigned long)cmd);
+ +	if (cmd->hdr.return_code) {
+ +		QETH_CARD_TEXT_(card, 4, "prmrc%2.2x", cmd->hdr.return_code);
+++=======
++ 	if (qeth_setadpparms_inspect_rc(cmd)) {
++ 		QETH_CARD_TEXT_(card, 4, "prmrc%x", cmd->hdr.return_code);
+++>>>>>>> 686c97ee29c8 (s390/qeth: fix error handling in adapter command callbacks)
+  		setparms->data.mode = SET_PROMISC_MODE_OFF;
+  	}
+  	card->info.promisc_mode = setparms->data.mode;
+@@@ -4185,19 -4276,18 +4182,19 @@@ EXPORT_SYMBOL_GPL(qeth_get_stats)
+  static int qeth_setadpparms_change_macaddr_cb(struct qeth_card *card,
+  		struct qeth_reply *reply, unsigned long data)
+  {
+- 	struct qeth_ipa_cmd *cmd;
++ 	struct qeth_ipa_cmd *cmd = (struct qeth_ipa_cmd *) data;
+  
+  	QETH_CARD_TEXT(card, 4, "chgmaccb");
++ 	if (qeth_setadpparms_inspect_rc(cmd))
++ 		return 0;
+  
+- 	cmd = (struct qeth_ipa_cmd *) data;
+  	if (!card->options.layer2 ||
+  	    !(card->info.mac_bits & QETH_LAYER2_MAC_READ)) {
+ -		ether_addr_copy(card->dev->dev_addr,
+ -				cmd->data.setadapterparms.data.change_addr.addr);
+ +		memcpy(card->dev->dev_addr,
+ +		       &cmd->data.setadapterparms.data.change_addr.addr,
+ +		       OSA_ADDR_LEN);
+  		card->info.mac_bits |= QETH_LAYER2_MAC_READ;
+  	}
+- 	qeth_default_setadapterparms_cb(card, reply, (unsigned long) cmd);
+  	return 0;
+  }
+  
+@@@ -4681,26 -4784,22 +4680,23 @@@ out_free
+  out:
+  	return rc;
+  }
+ +EXPORT_SYMBOL_GPL(qeth_query_oat_command);
+  
+ -static int qeth_query_card_info_cb(struct qeth_card *card,
+ -				   struct qeth_reply *reply, unsigned long data)
+ +int qeth_query_card_info_cb(struct qeth_card *card,
+ +			struct qeth_reply *reply, unsigned long data)
+  {
+- 	struct qeth_ipa_cmd *cmd;
++ 	struct carrier_info *carrier_info = (struct carrier_info *)reply->param;
++ 	struct qeth_ipa_cmd *cmd = (struct qeth_ipa_cmd *)data;
+  	struct qeth_query_card_info *card_info;
+- 	struct carrier_info *carrier_info;
+  
+  	QETH_CARD_TEXT(card, 2, "qcrdincb");
+- 	carrier_info = (struct carrier_info *)reply->param;
+- 	cmd = (struct qeth_ipa_cmd *)data;
+- 	card_info = &cmd->data.setadapterparms.data.card_info;
+- 	if (cmd->data.setadapterparms.hdr.return_code == 0) {
+- 		carrier_info->card_type = card_info->card_type;
+- 		carrier_info->port_mode = card_info->port_mode;
+- 		carrier_info->port_speed = card_info->port_speed;
+- 	}
++ 	if (qeth_setadpparms_inspect_rc(cmd))
++ 		return 0;
+  
+- 	qeth_default_setadapterparms_cb(card, reply, (unsigned long) cmd);
++ 	card_info = &cmd->data.setadapterparms.data.card_info;
++ 	carrier_info->card_type = card_info->card_type;
++ 	carrier_info->port_mode = card_info->port_mode;
++ 	carrier_info->port_speed = card_info->port_speed;
+  	return 0;
+  }
+  
+* Unmerged path drivers/s390/net/qeth_core_main.c
