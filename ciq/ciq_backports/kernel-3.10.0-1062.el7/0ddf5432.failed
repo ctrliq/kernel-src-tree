@@ -1,0 +1,112 @@
+xdp/mlx5: setup xdp_rxq_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 0ddf543226acacfb9f521dafc6c817d5b04c7b1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0ddf5432.failed
+
+The mlx5 driver have a special drop-RQ queue (one per interface) that
+simply drops all incoming traffic. It helps driver keep other HW
+objects (flow steering) alive upon down/up operations.  It is
+temporarily pointed by flow steering objects during the interface
+setup, and when interface is down. It lacks many fields that are set
+in a regular RQ (for example its state is never switched to
+MLX5_RQC_STATE_RDY). (Thanks to Tariq Toukan for explanation).
+
+The XDP RX-queue info for this drop-RQ marked as unused, which
+allow us to use the same takedown/free code path as other RX-queues.
+
+Driver hook points for xdp_rxq_info:
+ * reg   : mlx5e_alloc_rq()
+ * unused: mlx5e_alloc_drop_rq()
+ * unreg : mlx5e_free_rq()
+
+Tested on actual hardware with samples/bpf program
+
+	Cc: Saeed Mahameed <saeedm@mellanox.com>
+	Cc: Matan Barak <matanb@mellanox.com>
+	Cc: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 0ddf543226acacfb9f521dafc6c817d5b04c7b1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 6d4141fee140,5299310f2481..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -44,11 -44,9 +44,15 @@@
+  #include <linux/mlx5/port.h>
+  #include <linux/mlx5/vport.h>
+  #include <linux/mlx5/transobj.h>
+ +#include <linux/mlx5/fs.h>
+  #include <linux/rhashtable.h>
+  #include <net/switchdev.h>
+++<<<<<<< HEAD
+ +#include <linux/net_dim.h>
+ +#include <linux/refcount.h>
+++=======
++ #include <net/xdp.h>
+++>>>>>>> 0ddf543226ac (xdp/mlx5: setup xdp_rxq_info)
+  #include "wq.h"
+  #include "mlx5_core.h"
+  #include "en_stats.h"
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 1548bb7d3381..27906e5f6a70 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -432,6 +432,9 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
+ 		goto err_rq_wq_destroy;
+ 	}
+ 
++	if (xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq->ix) < 0)
++		goto err_rq_wq_destroy;
++
+ 	rq->buff.map_dir = rq->xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+ 	rq->buff.headroom = params->rq_headroom;
+ 
+@@ -546,6 +549,7 @@ err_destroy_umr_mkey:
+ err_rq_wq_destroy:
+ 	if (rq->xdp_prog)
+ 		bpf_prog_put(rq->xdp_prog);
++	xdp_rxq_info_unreg(&rq->xdp_rxq);
+ 	mlx5_wq_destroy(&rq->wq_ctrl);
+ 
+ 	return err;
+@@ -558,6 +562,8 @@ static void mlx5e_free_rq(struct mlx5e_rq *rq)
+ 	if (rq->xdp_prog)
+ 		bpf_prog_put(rq->xdp_prog);
+ 
++	xdp_rxq_info_unreg(&rq->xdp_rxq);
++
+ 	switch (rq->wq_type) {
+ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ 		mlx5e_rq_free_mpwqe_info(rq);
+@@ -2644,6 +2650,9 @@ static int mlx5e_alloc_drop_rq(struct mlx5_core_dev *mdev,
+ 	if (err)
+ 		return err;
+ 
++	/* Mark as unused given "Drop-RQ" packets never reach XDP */
++	xdp_rxq_info_unused(&rq->xdp_rxq);
++
+ 	rq->mdev = mdev;
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index fe49cb7b028d..0c07b7f92c92 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -838,6 +838,7 @@ static inline bool mlx5e_xdp_handle(struct mlx5e_rq *rq,
+ 	xdp.data = va + *rx_headroom;
+ 	xdp.data_end = xdp.data + *len;
+ 	xdp.data_hard_start = va;
++	xdp.rxq = &rq->xdp_rxq;
+ 
+ 	act = bpf_prog_run_xdp(prog, &xdp);
+ 	switch (act) {
