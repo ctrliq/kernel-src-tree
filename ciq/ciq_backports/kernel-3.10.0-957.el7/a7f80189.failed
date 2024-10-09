@@ -1,0 +1,117 @@
+sfc: pass the correctly bogus filter_id to rps_may_expire_flow()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit a7f80189e41c96c0c6210e9198a31859c91eb3e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a7f80189.failed
+
+When we inserted an ARFS filter for ndo_rx_flow_steer(), we didn't know
+ what the filter ID would be, so we just returned 0.  Thus, we must also
+ pass 0 as the filter ID when calling rps_may_expire_flow() for it, and
+ rely on the flow_id to identify what we're talking about.
+
+Fixes: 3af0f34290f6 ("sfc: replace asynchronous filter operations")
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a7f80189e41c96c0c6210e9198a31859c91eb3e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index bc121665446f,36f24c7e553a..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -4836,50 -4762,31 +4836,65 @@@ efx_ef10_filter_rfs_expire_complete(str
+  static bool efx_ef10_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+  					   unsigned int filter_idx)
+  {
+ -	struct efx_ef10_filter_table *table;
+ -	struct efx_filter_spec *spec;
+ -	bool ret;
+ +	struct efx_ef10_filter_table *table = efx->filter_state;
+ +	struct efx_filter_spec *spec =
+ +		efx_ef10_filter_entry_spec(table, filter_idx);
+ +	MCDI_DECLARE_BUF(inbuf,
+ +			 MC_CMD_FILTER_OP_IN_HANDLE_OFST +
+ +			 MC_CMD_FILTER_OP_IN_HANDLE_LEN);
+  
+ -	down_read(&efx->filter_sem);
+ -	table = efx->filter_state;
+ -	down_write(&table->lock);
+ -	spec = efx_ef10_filter_entry_spec(table, filter_idx);
+ +	if (!spec ||
+ +	    (table->entry[filter_idx].spec & EFX_EF10_FILTER_FLAG_BUSY) ||
+ +	    spec->priority != EFX_FILTER_PRI_HINT ||
+ +	    !rps_may_expire_flow(efx->net_dev, spec->dmaq_id,
+ +				 flow_id, filter_idx))
+ +		return false;
+  
+ -	if (!spec || spec->priority != EFX_FILTER_PRI_HINT) {
+ -		ret = true;
+ -		goto out_unlock;
+ +	MCDI_SET_DWORD(inbuf, FILTER_OP_IN_OP,
+ +		       MC_CMD_FILTER_OP_IN_OP_REMOVE);
+ +	MCDI_SET_QWORD(inbuf, FILTER_OP_IN_HANDLE,
+ +		       table->entry[filter_idx].handle);
+ +	if (efx_mcdi_rpc_async(efx, MC_CMD_FILTER_OP, inbuf, sizeof(inbuf), 0,
+ +			       efx_ef10_filter_rfs_expire_complete, filter_idx))
+ +		return false;
+ +
+ +	table->entry[filter_idx].spec |= EFX_EF10_FILTER_FLAG_BUSY;
+ +	return true;
+ +}
+ +
+ +static void
+ +efx_ef10_filter_rfs_expire_complete(struct efx_nic *efx,
+ +				    unsigned long filter_idx,
+ +				    int rc, efx_dword_t *outbuf,
+ +				    size_t outlen_actual)
+ +{
+ +	struct efx_ef10_filter_table *table = efx->filter_state;
+ +	struct efx_filter_spec *spec =
+ +		efx_ef10_filter_entry_spec(table, filter_idx);
+ +
+ +	spin_lock_bh(&efx->filter_lock);
+ +	if (rc == 0) {
+ +		kfree(spec);
+ +		efx_ef10_filter_set_entry(table, filter_idx, NULL, 0);
+  	}
+++<<<<<<< HEAD
+ +	table->entry[filter_idx].spec &= ~EFX_EF10_FILTER_FLAG_BUSY;
+ +	wake_up_all(&table->waitq);
+ +	spin_unlock_bh(&efx->filter_lock);
+++=======
++ 
++ 	if (!rps_may_expire_flow(efx->net_dev, spec->dmaq_id, flow_id, 0)) {
++ 		ret = false;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ret = efx_ef10_filter_remove_internal(efx, 1U << spec->priority,
++ 					      filter_idx, true) == 0;
++ out_unlock:
++ 	up_write(&table->lock);
++ 	up_read(&efx->filter_sem);
++ 	return ret;
+++>>>>>>> a7f80189e41c (sfc: pass the correctly bogus filter_id to rps_may_expire_flow())
+  }
+  
+  #endif /* CONFIG_RFS_ACCEL */
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+diff --git a/drivers/net/ethernet/sfc/farch.c b/drivers/net/ethernet/sfc/farch.c
+index 1f1b062a8d89..4f033c7e2501 100644
+--- a/drivers/net/ethernet/sfc/farch.c
++++ b/drivers/net/ethernet/sfc/farch.c
+@@ -2927,7 +2927,7 @@ bool efx_farch_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+ 	if (test_bit(index, table->used_bitmap) &&
+ 	    table->spec[index].priority == EFX_FILTER_PRI_HINT &&
+ 	    rps_may_expire_flow(efx->net_dev, table->spec[index].dmaq_id,
+-				flow_id, index)) {
++				flow_id, 0)) {
+ 		efx_farch_filter_table_clear_entry(efx, table, index);
+ 		return true;
+ 	}
