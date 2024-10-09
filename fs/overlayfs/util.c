@@ -18,7 +18,6 @@
 #include <linux/namei.h>
 #include <linux/ratelimit.h>
 #include "overlayfs.h"
-#include "ovl_entry.h"
 
 int ovl_want_write(struct dentry *dentry)
 {

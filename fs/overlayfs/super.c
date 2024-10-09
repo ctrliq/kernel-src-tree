@@ -19,7 +19,6 @@
 #include <linux/posix_acl_xattr.h>
 #include <linux/cred.h>
 #include "overlayfs.h"
-#include "ovl_entry.h"
 
 MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Overlay filesystem");
