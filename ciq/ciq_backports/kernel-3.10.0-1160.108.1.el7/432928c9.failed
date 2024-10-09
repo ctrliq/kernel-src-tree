@@ -1,0 +1,169 @@
+gfs2: Add quota_change type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.108.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 432928c9377959684c748a9bc6553ed2d3c2ea4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.108.1.el7/432928c9.failed
+
+Function do_qc has two main uses: (1) to re-sync the local quota changes
+(qd) to the master quotas, and (2) normal quota changes. In the case of
+normal quota changes, the change can be positive or negative, as the
+quota usage goes up and down.
+
+Before this patch function do_qc was distinguishing one from another by
+whether the resulting value is or isn't zero: In the case of a re-sync
+(called do_sync) the quota value is moved from the temporary value to a
+master value, so the amount is added to one and subtracted from the
+other. The problem is that since the values can be positive or negative
+we can occasionally run into situations where we are not doing a re-sync
+but the quota change just happens to cancel out the previous value.
+
+In the case of a re-sync extra references and locks are taken, and so
+do_qc needs to release them. In the case of a normal quota change, no
+extra references and locks are taken, so it must not try to release
+them.
+
+The problem is: if the quota change is not a re-sync but the value just
+happens to cancel out the original quota change, the resulting zero
+value fools do_qc into thinking this is a re-sync and therefore it must
+release the extra references. This results in problems, mainly having to
+do with slot reference numbers going smaller than zero.
+
+This patch introduces new constants, QC_SYNC and QC_CHANGE so do_qc can
+really tell the difference. For QC_SYNC calls it must release the extra
+references acquired by gfs2_quota_unlock's call to qd_check_sync. For
+QC_CHANGE calls it does not have extra references to put.
+
+Note that this allows quota changes back to a value of zero, and so I
+removed an assert warning related to that.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 432928c9377959684c748a9bc6553ed2d3c2ea4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/util.c
+index 539cabad9cfe,dac22b1c1a2e..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -94,12 -92,35 +94,37 @@@ out_unlock
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * gfs2_freeze_lock_shared - hold the freeze glock
++  * @sdp: the superblock
++  */
++ int gfs2_freeze_lock_shared(struct gfs2_sbd *sdp)
++ {
++ 	int error;
++ 
++ 	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_SHARED,
++ 				   LM_FLAG_NOEXP | GL_EXACT,
++ 				   &sdp->sd_freeze_gh);
++ 	if (error)
++ 		fs_err(sdp, "can't lock the freeze glock: %d\n", error);
++ 	return error;
++ }
++ 
++ void gfs2_freeze_unlock(struct gfs2_holder *freeze_gh)
++ {
++ 	if (gfs2_holder_initialized(freeze_gh))
++ 		gfs2_glock_dq_uninit(freeze_gh);
++ }
++ 
+++>>>>>>> 432928c93779 (gfs2: Add quota_change type)
+  static void signal_our_withdraw(struct gfs2_sbd *sdp)
+  {
+ -	struct gfs2_glock *live_gl = sdp->sd_live_gh.gh_gl;
+ -	struct inode *inode;
+ -	struct gfs2_inode *ip;
+ -	struct gfs2_glock *i_gl;
+ -	u64 no_formal_ino;
+ +	struct gfs2_glock *gl = sdp->sd_live_gh.gh_gl;
+ +	struct inode *inode = sdp->sd_jdesc->jd_inode;
+ +	struct gfs2_inode *ip = GFS2_I(inode);
+ +	u64 no_formal_ino = ip->i_no_formal_ino;
+  	int ret = 0;
+  	int tries;
+  
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index ffbdb85ffe96..76678e2ab27e 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -78,6 +78,9 @@
+ #define GFS2_QD_HASH_SIZE       (1 << GFS2_QD_HASH_SHIFT)
+ #define GFS2_QD_HASH_MASK       (GFS2_QD_HASH_SIZE - 1)
+ 
++#define QC_CHANGE 0
++#define QC_SYNC 1
++
+ /* Lock order: qd_lock -> bucket lock -> qd->lockref.lock -> lru lock */
+ /*                     -> sd_bitmap_lock                              */
+ static DEFINE_SPINLOCK(qd_lock);
+@@ -459,7 +462,6 @@ static int qd_fish(struct gfs2_sbd *sdp, struct gfs2_quota_data **qdp)
+ 	spin_unlock(&qd_lock);
+ 
+ 	if (qd) {
+-		gfs2_assert_warn(sdp, qd->qd_change_sync);
+ 		error = bh_get(qd);
+ 		if (error) {
+ 			clear_bit(QDF_LOCKED, &qd->qd_flags);
+@@ -642,7 +644,7 @@ static int sort_qd(const void *a, const void *b)
+ 	return 0;
+ }
+ 
+-static void do_qc(struct gfs2_quota_data *qd, s64 change)
++static void do_qc(struct gfs2_quota_data *qd, s64 change, int qc_type)
+ {
+ 	struct gfs2_sbd *sdp = qd->qd_gl->gl_name.ln_sbd;
+ 	struct gfs2_inode *ip = GFS2_I(sdp->sd_qc_inode);
+@@ -667,16 +669,18 @@ static void do_qc(struct gfs2_quota_data *qd, s64 change)
+ 	qd->qd_change = x;
+ 	spin_unlock(&qd_lock);
+ 
+-	if (!x) {
++	if (qc_type == QC_CHANGE) {
++		if (!test_and_set_bit(QDF_CHANGE, &qd->qd_flags)) {
++			qd_hold(qd);
++			slot_hold(qd);
++		}
++	} else {
+ 		gfs2_assert_warn(sdp, test_bit(QDF_CHANGE, &qd->qd_flags));
+ 		clear_bit(QDF_CHANGE, &qd->qd_flags);
+ 		qc->qc_flags = 0;
+ 		qc->qc_id = 0;
+ 		slot_put(qd);
+ 		qd_put(qd);
+-	} else if (!test_and_set_bit(QDF_CHANGE, &qd->qd_flags)) {
+-		qd_hold(qd);
+-		slot_hold(qd);
+ 	}
+ 
+ 	if (change < 0) /* Reset quiet flag if we freed some blocks */
+@@ -943,7 +947,7 @@ static int do_sync(unsigned int num_qd, struct gfs2_quota_data **qda)
+ 		if (error)
+ 			goto out_end_trans;
+ 
+-		do_qc(qd, -qd->qd_change_sync);
++		do_qc(qd, -qd->qd_change_sync, QC_SYNC);
+ 		set_bit(QDF_REFRESH, &qd->qd_flags);
+ 	}
+ 
+@@ -1269,7 +1273,7 @@ void gfs2_quota_change(struct gfs2_inode *ip, s64 change,
+ 
+ 		if (qid_eq(qd->qd_id, make_kqid_uid(uid)) ||
+ 		    qid_eq(qd->qd_id, make_kqid_gid(gid))) {
+-			do_qc(qd, change);
++			do_qc(qd, change, QC_CHANGE);
+ 		}
+ 	}
+ }
+* Unmerged path fs/gfs2/util.c
