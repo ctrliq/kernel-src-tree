@@ -1,0 +1,104 @@
+net/mlx5e: Non-atomic RQ state indicator for UMR WQE in progress
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Non-atomic RQ state indicator for UMR WQE in progress (Kamal Heib) [1456694]
+Rebuild_FUZZ: 96.77%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit a071cb9f25bef32ec309ca9d123022c52175341b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a071cb9f.failed
+
+The indication for a UMR WQE in progress is needed only within
+the NAPI context, and hence no races possible and no need for
+the use of atomic operations.
+The only place the flag is read outside of NAPI context is
+in closure flow, after RQ is disabled flag is no more accessed
+in NAPI.
+Use a boolean instead of a bit in ring state, so that its
+non-atomic set operations do not race with the atomic sets of
+the other bits.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a071cb9f25bef32ec309ca9d123022c52175341b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 819a88f4cbad,bce2080eb86a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -356,6 -536,9 +355,12 @@@ struct mlx5e_rq 
+  		struct {
+  			struct mlx5e_mpw_info *info;
+  			void                  *mtt_no_align;
+++<<<<<<< HEAD
+++=======
++ 			u16                    num_strides;
++ 			u8                     log_stride_sz;
++ 			bool                   umr_in_progress;
+++>>>>>>> a071cb9f25be (net/mlx5e: Non-atomic RQ state indicator for UMR WQE in progress)
+  		} mpwqe;
+  	};
+  	struct {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d6a4d3219a46,11dba9940029..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -405,9 -422,9 +405,9 @@@ void mlx5e_post_rx_mpwqe(struct mlx5e_r
+  	struct mlx5_wq_ll *wq = &rq->wq;
+  	struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+  
+- 	clear_bit(MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS, &rq->state);
++ 	rq->mpwqe.umr_in_progress = false;
+  
+ -	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED))) {
+ +	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state))) {
+  		mlx5e_free_rx_mpwqe(rq, &rq->mpwqe.info[wq->head]);
+  		return;
+  	}
+@@@ -442,16 -462,16 +445,20 @@@ void mlx5e_dealloc_rx_mpwqe(struct mlx5
+  bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
+  {
+  	struct mlx5_wq_ll *wq = &rq->wq;
+ -	int err;
+  
+ -	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED)))
+ +	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
+  		return false;
+  
+ -	if (mlx5_wq_ll_is_full(wq))
+ -		return false;
+++<<<<<<< HEAD
+ +	if (test_bit(MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS, &rq->state))
+ +		return true;
+  
+ +	while (!mlx5_wq_ll_is_full(wq)) {
+++=======
++ 	do {
+++>>>>>>> a071cb9f25be (net/mlx5e: Non-atomic RQ state indicator for UMR WQE in progress)
+  		struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+ +		int err;
+  
+  		err = rq->alloc_wqe(rq, wqe, wq->head);
+  		if (err == -EBUSY)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d8b64a5a33e7..cb28fe4794e8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -812,7 +812,8 @@ static void mlx5e_free_rx_descs(struct mlx5e_rq *rq)
+ 	u16 wqe_ix;
+ 
+ 	/* UMR WQE (if in progress) is always at wq->head */
+-	if (test_bit(MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS, &rq->state))
++	if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ &&
++	    rq->mpwqe.umr_in_progress)
+ 		mlx5e_free_rx_mpwqe(rq, &rq->mpwqe.info[wq->head]);
+ 
+ 	while (!mlx5_wq_ll_is_empty(wq)) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
