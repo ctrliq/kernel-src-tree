@@ -2153,8 +2153,7 @@ static int dm_wait_for_completion(struct mapped_device *md, long task_state)
 		if (!md_in_flight(md))
 			break;
 
-		if (task_state == TASK_INTERRUPTIBLE &&
-		    signal_pending(current)) {
+		if (signal_pending_state(task_state, current)) {
 			r = -EINTR;
 			break;
 		}
