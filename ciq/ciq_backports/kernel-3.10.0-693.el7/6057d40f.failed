@@ -1,0 +1,377 @@
+gpio: driver for AMD Promontory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [gpio] driver for AMD Promontory (Suravee Suthikulpanit) [1329005]
+Rebuild_FUZZ: 89.29%
+commit-author YD Tseng <ltyu101@gmail.com>
+commit 6057d40f41a30f234533e5cf28810dd3fd2b6995
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6057d40f.failed
+
+This patch adds a new GPIO driver for AMD Promontory chip.
+
+This GPIO controller is enumerated by ACPI and the ACPI compliant
+hardware ID is AMDF030.
+
+Change history:
+
+v2: 1. fix coding style
+    2. registers renaming
+v3: 1. change include file
+    2. fix coding style
+    3. remove module_init/exit, add module_platform_driver
+    4. remove MODULE_ALIAS
+v4: 1. change TOTAL_GPIO_PINS to PT_TOTAL_GPIO
+    2. remove PCI dependency in Kconfig
+    3. fix subject line
+
+	Signed-off-by: YD Tseng <Yd_Tseng@asmedia.com.tw>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 6057d40f41a30f234533e5cf28810dd3fd2b6995)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/Kconfig
+diff --cc drivers/gpio/Kconfig
+index c89d66420bf2,6fed6fc5ffc8..000000000000
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@@ -106,7 -94,52 +106,56 @@@ config GPIO_DA905
+  config GPIO_MAX730X
+  	tristate
+  
+++<<<<<<< HEAD
+ +comment "Memory mapped GPIO drivers:"
+++=======
++ menu "Memory mapped GPIO drivers"
++ 
++ config GPIO_74XX_MMIO
++ 	tristate "GPIO driver for 74xx-ICs with MMIO access"
++ 	depends on OF_GPIO
++ 	select GPIO_GENERIC
++ 	help
++ 	  Say yes here to support GPIO functionality for 74xx-compatible ICs
++ 	  with MMIO access. Compatible models include:
++ 	    1 bit:	741G125 (Input), 741G74 (Output)
++ 	    2 bits:	742G125 (Input), 7474 (Output)
++ 	    4 bits:	74125 (Input), 74175 (Output)
++ 	    6 bits:	74365 (Input), 74174 (Output)
++ 	    8 bits:	74244 (Input), 74273 (Output)
++ 	    16 bits:	741624 (Input), 7416374 (Output)
++ 
++ config GPIO_ALTERA
++ 	tristate "Altera GPIO"
++ 	depends on OF_GPIO
++ 	select GPIOLIB_IRQCHIP
++ 	help
++ 	  Say Y or M here to build support for the Altera PIO device.
++ 
++ 	  If driver is built as a module it will be called gpio-altera.
++ 
++ config GPIO_AMDPT
++ 	tristate "AMD Promontory GPIO support"
++ 	depends on ACPI
++ 	help
++ 	  driver for GPIO functionality on Promontory IOHub
++ 	  Require ACPI ASL code to enumerate as a platform device.
++ 
++ config GPIO_BCM_KONA
++ 	bool "Broadcom Kona GPIO"
++ 	depends on OF_GPIO && (ARCH_BCM_MOBILE || COMPILE_TEST)
++ 	help
++ 	  Turn on GPIO support for Broadcom "Kona" chips.
++ 
++ config GPIO_BRCMSTB
++ 	tristate "BRCMSTB GPIO support"
++ 	default y if ARCH_BRCMSTB
++ 	depends on OF_GPIO && (ARCH_BRCMSTB || COMPILE_TEST)
++ 	select GPIO_GENERIC
++ 	select GPIOLIB_IRQCHIP
++ 	help
++ 	  Say yes here to enable GPIO support for Broadcom STB (BCM7XXX) SoCs.
+++>>>>>>> 6057d40f41a3 (gpio: driver for AMD Promontory)
+  
+  config GPIO_CLPS711X
+  	tristate "CLPS711X GPIO support"
+* Unmerged path drivers/gpio/Kconfig
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index 032deaf33aad..aa1302eee569 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -15,6 +15,7 @@ obj-$(CONFIG_GPIO_ADNP)		+= gpio-adnp.o
+ obj-$(CONFIG_GPIO_ADP5520)	+= gpio-adp5520.o
+ obj-$(CONFIG_GPIO_ADP5588)	+= gpio-adp5588.o
+ obj-$(CONFIG_GPIO_AMD8111)	+= gpio-amd8111.o
++obj-$(CONFIG_GPIO_AMDPT)	+= gpio-amdpt.o
+ obj-$(CONFIG_GPIO_ARIZONA)	+= gpio-arizona.o
+ obj-$(CONFIG_GPIO_BT8XX)	+= gpio-bt8xx.o
+ obj-$(CONFIG_GPIO_CLPS711X)	+= gpio-clps711x.o
+diff --git a/drivers/gpio/gpio-amdpt.c b/drivers/gpio/gpio-amdpt.c
+new file mode 100644
+index 000000000000..cbbb966d4fc0
+--- /dev/null
++++ b/drivers/gpio/gpio-amdpt.c
+@@ -0,0 +1,261 @@
++/*
++ * AMD Promontory GPIO driver
++ *
++ * Copyright (C) 2015 ASMedia Technology Inc.
++ * Author: YD Tseng <yd_tseng@asmedia.com.tw>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/gpio/driver.h>
++#include <linux/spinlock.h>
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++
++#define PT_TOTAL_GPIO 8
++
++/* PCI-E MMIO register offsets */
++#define PT_DIRECTION_REG   0x00
++#define PT_INPUTDATA_REG   0x04
++#define PT_OUTPUTDATA_REG  0x08
++#define PT_CLOCKRATE_REG   0x0C
++#define PT_SYNC_REG        0x28
++
++struct pt_gpio_chip {
++	struct gpio_chip         gc;
++	void __iomem             *reg_base;
++	spinlock_t               lock;
++};
++
++#define to_pt_gpio(c)	container_of(c, struct pt_gpio_chip, gc)
++
++static int pt_gpio_request(struct gpio_chip *gc, unsigned offset)
++{
++	struct pt_gpio_chip *pt_gpio = to_pt_gpio(gc);
++	unsigned long flags;
++	u32 using_pins;
++
++	dev_dbg(gc->dev, "pt_gpio_request offset=%x\n", offset);
++
++	spin_lock_irqsave(&pt_gpio->lock, flags);
++
++	using_pins = readl(pt_gpio->reg_base + PT_SYNC_REG);
++	if (using_pins & BIT(offset)) {
++		dev_warn(gc->dev, "PT GPIO pin %x reconfigured\n",
++			offset);
++		spin_unlock_irqrestore(&pt_gpio->lock, flags);
++		return -EINVAL;
++	}
++
++	writel(using_pins | BIT(offset), pt_gpio->reg_base + PT_SYNC_REG);
++
++	spin_unlock_irqrestore(&pt_gpio->lock, flags);
++
++	return 0;
++}
++
++static void pt_gpio_free(struct gpio_chip *gc, unsigned offset)
++{
++	struct pt_gpio_chip *pt_gpio = to_pt_gpio(gc);
++	unsigned long flags;
++	u32 using_pins;
++
++	spin_lock_irqsave(&pt_gpio->lock, flags);
++
++	using_pins = readl(pt_gpio->reg_base + PT_SYNC_REG);
++	using_pins &= ~BIT(offset);
++	writel(using_pins, pt_gpio->reg_base + PT_SYNC_REG);
++
++	spin_unlock_irqrestore(&pt_gpio->lock, flags);
++
++	dev_dbg(gc->dev, "pt_gpio_free offset=%x\n", offset);
++}
++
++static void pt_gpio_set_value(struct gpio_chip *gc, unsigned offset, int value)
++{
++	struct pt_gpio_chip *pt_gpio = to_pt_gpio(gc);
++	unsigned long flags;
++	u32 data;
++
++	dev_dbg(gc->dev, "pt_gpio_set_value offset=%x, value=%x\n",
++		offset, value);
++
++	spin_lock_irqsave(&pt_gpio->lock, flags);
++
++	data = readl(pt_gpio->reg_base + PT_OUTPUTDATA_REG);
++	data &= ~BIT(offset);
++	if (value)
++		data |= BIT(offset);
++	writel(data, pt_gpio->reg_base + PT_OUTPUTDATA_REG);
++
++	spin_unlock_irqrestore(&pt_gpio->lock, flags);
++}
++
++static int pt_gpio_get_value(struct gpio_chip *gc, unsigned offset)
++{
++	struct pt_gpio_chip *pt_gpio = to_pt_gpio(gc);
++	unsigned long flags;
++	u32 data;
++
++	spin_lock_irqsave(&pt_gpio->lock, flags);
++
++	data = readl(pt_gpio->reg_base + PT_DIRECTION_REG);
++
++	/* configure as output */
++	if (data & BIT(offset))
++		data = readl(pt_gpio->reg_base + PT_OUTPUTDATA_REG);
++	else	/* configure as input */
++		data = readl(pt_gpio->reg_base + PT_INPUTDATA_REG);
++
++	spin_unlock_irqrestore(&pt_gpio->lock, flags);
++
++	data >>= offset;
++	data &= 1;
++
++	dev_dbg(gc->dev, "pt_gpio_get_value offset=%x, value=%x\n",
++		offset, data);
++
++	return data;
++}
++
++static int pt_gpio_direction_input(struct gpio_chip *gc, unsigned offset)
++{
++	struct pt_gpio_chip *pt_gpio = to_pt_gpio(gc);
++	unsigned long flags;
++	u32 data;
++
++	dev_dbg(gc->dev, "pt_gpio_dirction_input offset=%x\n", offset);
++
++	spin_lock_irqsave(&pt_gpio->lock, flags);
++
++	data = readl(pt_gpio->reg_base + PT_DIRECTION_REG);
++	data &= ~BIT(offset);
++	writel(data, pt_gpio->reg_base + PT_DIRECTION_REG);
++
++	spin_unlock_irqrestore(&pt_gpio->lock, flags);
++
++	return 0;
++}
++
++static int pt_gpio_direction_output(struct gpio_chip *gc,
++					unsigned offset, int value)
++{
++	struct pt_gpio_chip *pt_gpio = to_pt_gpio(gc);
++	unsigned long flags;
++	u32 data;
++
++	dev_dbg(gc->dev, "pt_gpio_direction_output offset=%x, value=%x\n",
++		offset, value);
++
++	spin_lock_irqsave(&pt_gpio->lock, flags);
++
++	data = readl(pt_gpio->reg_base + PT_OUTPUTDATA_REG);
++	if (value)
++		data |= BIT(offset);
++	else
++		data &= ~BIT(offset);
++	writel(data, pt_gpio->reg_base + PT_OUTPUTDATA_REG);
++
++	data = readl(pt_gpio->reg_base + PT_DIRECTION_REG);
++	data |= BIT(offset);
++	writel(data, pt_gpio->reg_base + PT_DIRECTION_REG);
++
++	spin_unlock_irqrestore(&pt_gpio->lock, flags);
++
++	return 0;
++}
++
++static int pt_gpio_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct acpi_device *acpi_dev;
++	acpi_handle handle = ACPI_HANDLE(dev);
++	struct pt_gpio_chip *pt_gpio;
++	struct resource *res_mem;
++	int ret = 0;
++
++	if (acpi_bus_get_device(handle, &acpi_dev)) {
++		dev_err(dev, "PT GPIO device node not found\n");
++		return -ENODEV;
++	}
++
++	pt_gpio = devm_kzalloc(dev, sizeof(struct pt_gpio_chip), GFP_KERNEL);
++	if (!pt_gpio)
++		return -ENOMEM;
++
++	res_mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res_mem) {
++		dev_err(&pdev->dev, "Failed to get MMIO resource for PT GPIO.\n");
++		return -EINVAL;
++	}
++	pt_gpio->reg_base = devm_ioremap_resource(dev, res_mem);
++	if (IS_ERR(pt_gpio->reg_base)) {
++		dev_err(&pdev->dev, "Failed to map MMIO resource for PT GPIO.\n");
++		return PTR_ERR(pt_gpio->reg_base);
++	}
++
++	spin_lock_init(&pt_gpio->lock);
++
++	pt_gpio->gc.label            = pdev->name;
++	pt_gpio->gc.owner            = THIS_MODULE;
++	pt_gpio->gc.dev              = dev;
++	pt_gpio->gc.request          = pt_gpio_request;
++	pt_gpio->gc.free             = pt_gpio_free;
++	pt_gpio->gc.direction_input  = pt_gpio_direction_input;
++	pt_gpio->gc.direction_output = pt_gpio_direction_output;
++	pt_gpio->gc.get              = pt_gpio_get_value;
++	pt_gpio->gc.set              = pt_gpio_set_value;
++	pt_gpio->gc.base             = -1;
++	pt_gpio->gc.ngpio            = PT_TOTAL_GPIO;
++#if defined(CONFIG_OF_GPIO)
++	pt_gpio->gc.of_node          = pdev->dev.of_node;
++#endif
++	ret = gpiochip_add(&pt_gpio->gc);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to register GPIO lib\n");
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, pt_gpio);
++
++	/* initialize register setting */
++	writel(0, pt_gpio->reg_base + PT_SYNC_REG);
++	writel(0, pt_gpio->reg_base + PT_CLOCKRATE_REG);
++
++	dev_dbg(&pdev->dev, "PT GPIO driver loaded\n");
++	return ret;
++}
++
++static int pt_gpio_remove(struct platform_device *pdev)
++{
++	struct pt_gpio_chip *pt_gpio = platform_get_drvdata(pdev);
++
++	gpiochip_remove(&pt_gpio->gc);
++
++	return 0;
++}
++
++static const struct acpi_device_id pt_gpio_acpi_match[] = {
++	{ "AMDF030", 0 },
++	{ },
++};
++MODULE_DEVICE_TABLE(acpi, pt_gpio_acpi_match);
++
++static struct platform_driver pt_gpio_driver = {
++	.driver = {
++		.name = "pt-gpio",
++		.acpi_match_table = ACPI_PTR(pt_gpio_acpi_match),
++	},
++	.probe = pt_gpio_probe,
++	.remove = pt_gpio_remove,
++};
++
++module_platform_driver(pt_gpio_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("YD Tseng <yd_tseng@asmedia.com.tw>");
++MODULE_DESCRIPTION("AMD Promontory GPIO Driver");
