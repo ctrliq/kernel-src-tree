@@ -1,0 +1,240 @@
+mm: allow GFP_{FS,IO} for page_cache_read page cache allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] allow GFP_{FS, IO} for page_cache_read page cache allocation (Larry Woodman) [1457572 1383493]
+Rebuild_FUZZ: 95.93%
+commit-author Michal Hocko <mhocko@suse.com>
+commit c20cd45eb01748f0fba77a504f956b000df4ea73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c20cd45e.failed
+
+page_cache_read has been historically using page_cache_alloc_cold to
+allocate a new page.  This means that mapping_gfp_mask is used as the
+base for the gfp_mask.  Many filesystems are setting this mask to
+GFP_NOFS to prevent from fs recursion issues.  page_cache_read is called
+from the vm_operations_struct::fault() context during the page fault.
+This context doesn't need the reclaim protection normally.
+
+ceph and ocfs2 which call filemap_fault from their fault handlers seem
+to be OK because they are not taking any fs lock before invoking generic
+implementation.  xfs which takes XFS_MMAPLOCK_SHARED is safe from the
+reclaim recursion POV because this lock serializes truncate and punch
+hole with the page faults and it doesn't get involved in the reclaim.
+
+There is simply no reason to deliberately use a weaker allocation
+context when a __GFP_FS | __GFP_IO can be used.  The GFP_NOFS protection
+might be even harmful.  There is a push to fail GFP_NOFS allocations
+rather than loop within allocator indefinitely with a very limited
+reclaim ability.  Once we start failing those requests the OOM killer
+might be triggered prematurely because the page cache allocation failure
+is propagated up the page fault path and end up in
+pagefault_out_of_memory.
+
+We cannot play with mapping_gfp_mask directly because that would be racy
+wrt.  parallel page faults and it might interfere with other users who
+really rely on NOFS semantic from the stored gfp_mask.  The mask is also
+inode proper so it would even be a layering violation.  What we can do
+instead is to push the gfp_mask into struct vm_fault and allow fs layer
+to overwrite it should the callback need to be called with a different
+allocation context.
+
+Initialize the default to (mapping_gfp_mask | __GFP_FS | __GFP_IO)
+because this should be safe from the page fault path normally.  Why do
+we care about mapping_gfp_mask at all then? Because this doesn't hold
+only reclaim protection flags but it also might contain zone and
+movability restrictions (GFP_DMA32, __GFP_MOVABLE and others) so we have
+to respect those.
+
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Acked-by: Jan Kara <jack@suse.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Mark Fasheh <mfasheh@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c20cd45eb01748f0fba77a504f956b000df4ea73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+#	mm/filemap.c
+#	mm/memory.c
+diff --cc include/linux/mm.h
+index 3416fff96060,ec9d4559514d..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -231,8 -236,10 +231,15 @@@ extern pgprot_t protection_map[16]
+   * ->fault function. The vma's ->fault is responsible for returning a bitmask
+   * of VM_FAULT_xxx flags that give details about how the fault was handled.
+   *
+++<<<<<<< HEAD
+ + * pgoff should be used in favour of virtual_address, if possible. If pgoff
+ + * is used, one may implement ->remap_pages to get nonlinear mapping support.
+++=======
++  * MM layer fills up gfp_mask for page allocations but fault handler might
++  * alter it if its implementation requires a different allocation context.
++  *
++  * pgoff should be used in favour of virtual_address, if possible.
+++>>>>>>> c20cd45eb017 (mm: allow GFP_{FS,IO} for page_cache_read page cache allocation)
+   */
+  struct vm_fault {
+  	unsigned int flags;		/* FAULT_FLAG_xxx flags */
+diff --cc mm/filemap.c
+index 685e2bed3093,ff42d31c891a..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -2144,10 -1812,10 +2144,10 @@@ EXPORT_SYMBOL(generic_file_aio_read)
+   * This adds the requested page to the page cache if it isn't already there,
+   * and schedules an I/O to read in its contents from disk.
+   */
+- static int page_cache_read(struct file *file, pgoff_t offset)
++ static int page_cache_read(struct file *file, pgoff_t offset, gfp_t gfp_mask)
+  {
+  	struct address_space *mapping = file->f_mapping;
+ -	struct page *page;
+ +	struct page *page; 
+  	int ret;
+  
+  	do {
+@@@ -2155,7 -1823,7 +2155,11 @@@
+  		if (!page)
+  			return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +		ret = add_to_page_cache_lru(page, mapping, offset, GFP_KERNEL);
+++=======
++ 		ret = add_to_page_cache_lru(page, mapping, offset, gfp_mask & GFP_KERNEL);
+++>>>>>>> c20cd45eb017 (mm: allow GFP_{FS,IO} for page_cache_read page cache allocation)
+  		if (ret == 0)
+  			ret = mapping->a_ops->readpage(file, page);
+  		else if (ret == -EEXIST)
+diff --cc mm/memory.c
+index 14270187456b,d4e4d37c1989..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2883,6 -2835,114 +2899,117 @@@ static void do_set_pte(struct vm_area_s
+  	update_mmu_cache(vma, address, pte);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned long fault_around_bytes __read_mostly =
++ 	rounddown_pow_of_two(65536);
++ 
++ #ifdef CONFIG_DEBUG_FS
++ static int fault_around_bytes_get(void *data, u64 *val)
++ {
++ 	*val = fault_around_bytes;
++ 	return 0;
++ }
++ 
++ /*
++  * fault_around_pages() and fault_around_mask() expects fault_around_bytes
++  * rounded down to nearest page order. It's what do_fault_around() expects to
++  * see.
++  */
++ static int fault_around_bytes_set(void *data, u64 val)
++ {
++ 	if (val / PAGE_SIZE > PTRS_PER_PTE)
++ 		return -EINVAL;
++ 	if (val > PAGE_SIZE)
++ 		fault_around_bytes = rounddown_pow_of_two(val);
++ 	else
++ 		fault_around_bytes = PAGE_SIZE; /* rounddown_pow_of_two(0) is undefined */
++ 	return 0;
++ }
++ DEFINE_SIMPLE_ATTRIBUTE(fault_around_bytes_fops,
++ 		fault_around_bytes_get, fault_around_bytes_set, "%llu\n");
++ 
++ static int __init fault_around_debugfs(void)
++ {
++ 	void *ret;
++ 
++ 	ret = debugfs_create_file("fault_around_bytes", 0644, NULL, NULL,
++ 			&fault_around_bytes_fops);
++ 	if (!ret)
++ 		pr_warn("Failed to create fault_around_bytes in debugfs");
++ 	return 0;
++ }
++ late_initcall(fault_around_debugfs);
++ #endif
++ 
++ /*
++  * do_fault_around() tries to map few pages around the fault address. The hope
++  * is that the pages will be needed soon and this will lower the number of
++  * faults to handle.
++  *
++  * It uses vm_ops->map_pages() to map the pages, which skips the page if it's
++  * not ready to be mapped: not up-to-date, locked, etc.
++  *
++  * This function is called with the page table lock taken. In the split ptlock
++  * case the page table lock only protects only those entries which belong to
++  * the page table corresponding to the fault address.
++  *
++  * This function doesn't cross the VMA boundaries, in order to call map_pages()
++  * only once.
++  *
++  * fault_around_pages() defines how many pages we'll try to map.
++  * do_fault_around() expects it to return a power of two less than or equal to
++  * PTRS_PER_PTE.
++  *
++  * The virtual address of the area that we map is naturally aligned to the
++  * fault_around_pages() value (and therefore to page order).  This way it's
++  * easier to guarantee that we don't cross page table boundaries.
++  */
++ static void do_fault_around(struct vm_area_struct *vma, unsigned long address,
++ 		pte_t *pte, pgoff_t pgoff, unsigned int flags)
++ {
++ 	unsigned long start_addr, nr_pages, mask;
++ 	pgoff_t max_pgoff;
++ 	struct vm_fault vmf;
++ 	int off;
++ 
++ 	nr_pages = READ_ONCE(fault_around_bytes) >> PAGE_SHIFT;
++ 	mask = ~(nr_pages * PAGE_SIZE - 1) & PAGE_MASK;
++ 
++ 	start_addr = max(address & mask, vma->vm_start);
++ 	off = ((address - start_addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++ 	pte -= off;
++ 	pgoff -= off;
++ 
++ 	/*
++ 	 *  max_pgoff is either end of page table or end of vma
++ 	 *  or fault_around_pages() from pgoff, depending what is nearest.
++ 	 */
++ 	max_pgoff = pgoff - ((start_addr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1)) +
++ 		PTRS_PER_PTE - 1;
++ 	max_pgoff = min3(max_pgoff, vma_pages(vma) + vma->vm_pgoff - 1,
++ 			pgoff + nr_pages - 1);
++ 
++ 	/* Check if it makes any sense to call ->map_pages */
++ 	while (!pte_none(*pte)) {
++ 		if (++pgoff > max_pgoff)
++ 			return;
++ 		start_addr += PAGE_SIZE;
++ 		if (start_addr >= vma->vm_end)
++ 			return;
++ 		pte++;
++ 	}
++ 
++ 	vmf.virtual_address = (void __user *) start_addr;
++ 	vmf.pte = pte;
++ 	vmf.pgoff = pgoff;
++ 	vmf.max_pgoff = max_pgoff;
++ 	vmf.flags = flags;
++ 	vmf.gfp_mask = __get_fault_gfp_mask(vma);
++ 	vma->vm_ops->map_pages(vma, &vmf);
++ }
++ 
+++>>>>>>> c20cd45eb017 (mm: allow GFP_{FS,IO} for page_cache_read page cache allocation)
+  static int do_read_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+  		unsigned long address, pmd_t *pmd,
+  		pgoff_t pgoff, unsigned int flags, pte_t orig_pte)
+* Unmerged path include/linux/mm.h
+* Unmerged path mm/filemap.c
+* Unmerged path mm/memory.c
