@@ -1,0 +1,716 @@
+dax: use common 4k zero page for dax mmap reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 91d25ba8a6b0d810dc844cebeedc53029118ce3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/91d25ba8.failed
+
+When servicing mmap() reads from file holes the current DAX code
+allocates a page cache page of all zeroes and places the struct page
+pointer in the mapping->page_tree radix tree.
+
+This has three major drawbacks:
+
+1) It consumes memory unnecessarily. For every 4k page that is read via
+   a DAX mmap() over a hole, we allocate a new page cache page. This
+   means that if you read 1GiB worth of pages, you end up using 1GiB of
+   zeroed memory. This is easily visible by looking at the overall
+   memory consumption of the system or by looking at /proc/[pid]/smaps:
+
+	7f62e72b3000-7f63272b3000 rw-s 00000000 103:00 12   /root/dax/data
+	Size:            1048576 kB
+	Rss:             1048576 kB
+	Pss:             1048576 kB
+	Shared_Clean:          0 kB
+	Shared_Dirty:          0 kB
+	Private_Clean:   1048576 kB
+	Private_Dirty:         0 kB
+	Referenced:      1048576 kB
+	Anonymous:             0 kB
+	LazyFree:              0 kB
+	AnonHugePages:         0 kB
+	ShmemPmdMapped:        0 kB
+	Shared_Hugetlb:        0 kB
+	Private_Hugetlb:       0 kB
+	Swap:                  0 kB
+	SwapPss:               0 kB
+	KernelPageSize:        4 kB
+	MMUPageSize:           4 kB
+	Locked:                0 kB
+
+2) It is slower than using a common zero page because each page fault
+   has more work to do. Instead of just inserting a common zero page we
+   have to allocate a page cache page, zero it, and then insert it. Here
+   are the average latencies of dax_load_hole() as measured by ftrace on
+   a random test box:
+
+    Old method, using zeroed page cache pages:	3.4 us
+    New method, using the common 4k zero page:	0.8 us
+
+   This was the average latency over 1 GiB of sequential reads done by
+   this simple fio script:
+
+     [global]
+     size=1G
+     filename=/root/dax/data
+     fallocate=none
+     [io]
+     rw=read
+     ioengine=mmap
+
+3) The fact that we had to check for both DAX exceptional entries and
+   for page cache pages in the radix tree made the DAX code more
+   complex.
+
+Solve these issues by following the lead of the DAX PMD code and using a
+common 4k zero page instead.  As with the PMD code we will now insert a
+DAX exceptional entry into the radix tree instead of a struct page
+pointer which allows us to remove all the special casing in the DAX
+code.
+
+Note that we do still pretty aggressively check for regular pages in the
+DAX radix tree, especially where we take action based on the bits set in
+the page.  If we ever find a regular page in our radix tree now that
+most likely means that someone besides DAX is inserting pages (which has
+happened lots of times in the past), and we want to find that out early
+and fail loudly.
+
+This solution also removes the extra memory consumption.  Here is that
+same /proc/[pid]/smaps after 1GiB of reading from a hole with the new
+code:
+
+	7f2054a74000-7f2094a74000 rw-s 00000000 103:00 12   /root/dax/data
+	Size:            1048576 kB
+	Rss:                   0 kB
+	Pss:                   0 kB
+	Shared_Clean:          0 kB
+	Shared_Dirty:          0 kB
+	Private_Clean:         0 kB
+	Private_Dirty:         0 kB
+	Referenced:            0 kB
+	Anonymous:             0 kB
+	LazyFree:              0 kB
+	AnonHugePages:         0 kB
+	ShmemPmdMapped:        0 kB
+	Shared_Hugetlb:        0 kB
+	Private_Hugetlb:       0 kB
+	Swap:                  0 kB
+	SwapPss:               0 kB
+	KernelPageSize:        4 kB
+	MMUPageSize:           4 kB
+	Locked:                0 kB
+
+Overall system memory consumption is similarly improved.
+
+Another major change is that we remove dax_pfn_mkwrite() from our fault
+flow, and instead rely on the page fault itself to make the PTE dirty
+and writeable.  The following description from the patch adding the
+vm_insert_mixed_mkwrite() call explains this a little more:
+
+   "To be able to use the common 4k zero page in DAX we need to have our
+    PTE fault path look more like our PMD fault path where a PTE entry
+    can be marked as dirty and writeable as it is first inserted rather
+    than waiting for a follow-up dax_pfn_mkwrite() =>
+    finish_mkwrite_fault() call.
+
+    Right now we can rely on having a dax_pfn_mkwrite() call because we
+    can distinguish between these two cases in do_wp_page():
+
+            case 1: 4k zero page => writable DAX storage
+            case 2: read-only DAX storage => writeable DAX storage
+
+    This distinction is made by via vm_normal_page(). vm_normal_page()
+    returns false for the common 4k zero page, though, just as it does
+    for DAX ptes. Instead of special casing the DAX + 4k zero page case
+    we will simplify our DAX PTE page fault sequence so that it matches
+    our DAX PMD sequence, and get rid of the dax_pfn_mkwrite() helper.
+    We will instead use dax_iomap_fault() to handle write-protection
+    faults.
+
+    This means that insert_pfn() needs to follow the lead of
+    insert_pfn_pmd() and allow us to pass in a 'mkwrite' flag. If
+    'mkwrite' is set insert_pfn() will do the work that was previously
+    done by wp_page_reuse() as part of the dax_pfn_mkwrite() call path"
+
+Link: http://lkml.kernel.org/r/20170724170616.25810-4-ross.zwisler@linux.intel.com
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 91d25ba8a6b0d810dc844cebeedc53029118ce3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/ext2/file.c
+#	fs/ext4/file.c
+#	fs/xfs/xfs_file.c
+#	include/linux/dax.h
+diff --cc fs/dax.c
+index 679214f8898b,ab67ae30ccbf..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -236,14 -242,9 +237,18 @@@ static void dax_unlock_mapping_entry(st
+  }
+  
+  static void put_locked_mapping_entry(struct address_space *mapping,
+- 				     pgoff_t index, void *entry)
++ 		pgoff_t index)
+  {
+++<<<<<<< HEAD
+ +	if (!radix_tree_exceptional_entry(entry)) {
+ +		unlock_page(entry);
+ +		page_cache_release(entry);
+ +	} else {
+ +		dax_unlock_mapping_entry(mapping, index);
+ +	}
+++=======
++ 	dax_unlock_mapping_entry(mapping, index);
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  }
+  
+  /*
+@@@ -391,21 -395,6 +399,24 @@@ restart
+  		spin_unlock_irq(&mapping->tree_lock);
+  		return entry;
+  	}
+++<<<<<<< HEAD
+ +	/* Normal page in radix tree? */
+ +	if (!radix_tree_exceptional_entry(entry)) {
+ +		struct page *page = entry;
+ +
+ +		get_page(page);
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		lock_page(page);
+ +		/* Page got truncated? Retry... */
+ +		if (unlikely(page->mapping != mapping)) {
+ +			unlock_page(page);
+ +			page_cache_release(page);
+ +			goto restart;
+ +		}
+ +		return page;
+ +	}
+++=======
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  	entry = lock_slot(mapping, slot);
+   out_unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+@@@ -580,41 -498,21 +589,57 @@@ static void *dax_insert_mapping_entry(s
+  	if (vmf->flags & FAULT_FLAG_WRITE)
+  		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+  
+++<<<<<<< HEAD
+ +	/* Replacing hole page with block mapping? */
+ +	if (!radix_tree_exceptional_entry(entry)) {
+ +		hole_fill = true;
+ +		/*
+ +		 * Unmap the page now before we remove it from page cache below.
+ +		 * The page is locked so it cannot be faulted in again.
+ +		 */
+ +		unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
+ +				    PAGE_SIZE, 0);
+ +		error = radix_tree_preload(mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
+ +		if (error)
+ +			return ERR_PTR(error);
+ +	} else if (dax_is_zero_entry(entry) && !(flags & RADIX_DAX_HZP)) {
+ +		/* replacing huge zero page with PMD block mapping */
+ +		unmap_mapping_range(mapping,
+ +			(vmf->pgoff << PAGE_SHIFT) & PMD_MASK, PMD_SIZE, 0);
+ +
+++=======
++ 	if (dax_is_zero_entry(entry) && !(flags & RADIX_DAX_ZERO_PAGE)) {
++ 		/* we are replacing a zero page with block mapping */
++ 		if (dax_is_pmd_entry(entry))
++ 			unmap_mapping_range(mapping,
++ 					(vmf->pgoff << PAGE_SHIFT) & PMD_MASK,
++ 					PMD_SIZE, 0);
++ 		else /* pte entry */
++ 			unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
++ 					PAGE_SIZE, 0);
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  	}
+  
+  	spin_lock_irq(&mapping->tree_lock);
+  	new_entry = dax_radix_locked_entry(sector, flags);
+  
+++<<<<<<< HEAD
+ +	if (hole_fill) {
+ +		__delete_from_page_cache(entry, NULL);
+ +		mem_cgroup_uncharge_page(entry);
+ +		/* Drop pagecache reference */
+ +		page_cache_release(entry);
+ +		error = __radix_tree_insert(page_tree, index,
+ +				dax_radix_order(new_entry), new_entry);
+ +		if (error) {
+ +			new_entry = ERR_PTR(error);
+ +			goto unlock;
+ +		}
+ +		mapping->nrexceptional++;
+ +	} else if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
+++=======
++ 	if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  		/*
+  		 * Only swap our new entry into the radix tree if the current
+  		 * entry is a zero page or an empty entry.  If a normal PTE or
+@@@ -626,27 -524,19 +651,38 @@@
+  		void **slot;
+  		void *ret;
+  
+ -		ret = __radix_tree_lookup(page_tree, index, &node, &slot);
+ +		ret = __radix_tree_lookup(page_tree, index, NULL, &slot);
+  		WARN_ON_ONCE(ret != entry);
+++<<<<<<< HEAD
+ +		radix_tree_replace_slot(slot, new_entry);
+++=======
++ 		__radix_tree_replace(page_tree, node, slot,
++ 				     new_entry, NULL, NULL);
++ 		entry = new_entry;
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  	}
++ 
+  	if (vmf->flags & FAULT_FLAG_WRITE)
+  		radix_tree_tag_set(page_tree, index, PAGECACHE_TAG_DIRTY);
+-  unlock:
++ 
+  	spin_unlock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+ +	if (hole_fill) {
+ +		radix_tree_preload_end();
+ +		/*
+ +		 * We don't need hole page anymore, it has been replaced with
+ +		 * locked radix tree entry now.
+ +		 */
+ +		if (mapping->a_ops->freepage)
+ +			mapping->a_ops->freepage(entry);
+ +		unlock_page(entry);
+ +		page_cache_release(entry);
+ +	}
+ +	return new_entry;
+ +
+++=======
++ 	return entry;
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  }
+  
+  static inline unsigned long
+@@@ -898,11 -785,10 +934,15 @@@ EXPORT_SYMBOL_GPL(dax_writeback_mapping
+  
+  static int dax_insert_mapping(struct address_space *mapping,
+  		struct block_device *bdev, struct dax_device *dax_dev,
+- 		sector_t sector, size_t size, void **entryp,
++ 		sector_t sector, size_t size, void *entry,
+  		struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+++<<<<<<< HEAD
+ +	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+ +	void *entry = *entryp;
+++=======
++ 	unsigned long vaddr = vmf->address;
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  	void *ret, *kaddr;
+  	pgoff_t pgoff;
+  	int id, rc;
+@@@ -923,48 -809,48 +963,87 @@@
+  	ret = dax_insert_mapping_entry(mapping, vmf, entry, sector, 0);
+  	if (IS_ERR(ret))
+  		return PTR_ERR(ret);
+- 	*entryp = ret;
+  
+  	trace_dax_insert_mapping(mapping->host, vmf, ret);
+- 	return vm_insert_mixed(vma, vaddr, pfn);
++ 	if (vmf->flags & FAULT_FLAG_WRITE)
++ 		return vm_insert_mixed_mkwrite(vma, vaddr, pfn);
++ 	else
++ 		return vm_insert_mixed(vma, vaddr, pfn);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * dax_pfn_mkwrite - handle first write to DAX page
+ + * @vma: The virtual memory area where the fault occurred
+ + * @vmf: The description of the fault
+ + */
+ +int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+ +{
+ +	struct file *file = vma->vm_file;
+ +	struct address_space *mapping = file->f_mapping;
+ +	struct inode *inode = mapping->host;
+ +	void *entry, **slot;
+ +	pgoff_t index = vmf->pgoff;
+ +
+ +	spin_lock_irq(&mapping->tree_lock);
+ +	entry = get_unlocked_mapping_entry(mapping, index, &slot);
+ +	if (!entry || !radix_tree_exceptional_entry(entry)) {
+ +		if (entry)
+ +			put_unlocked_mapping_entry(mapping, index, entry);
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		trace_dax_pfn_mkwrite_no_entry(inode, vmf, VM_FAULT_NOPAGE);
+ +		return VM_FAULT_NOPAGE;
+ +	}
+ +	radix_tree_tag_set(&mapping->page_tree, index, PAGECACHE_TAG_DIRTY);
+ +	entry = lock_slot(mapping, slot);
+ +	spin_unlock_irq(&mapping->tree_lock);
+ +	/*
+ +	 * If we race with somebody updating the PTE and finish_mkwrite_fault()
+ +	 * fails, we don't care. We need to return VM_FAULT_NOPAGE and retry
+ +	 * the fault in either case.
+ +	 */
+ +	finish_mkwrite_fault(vmf);
+ +	put_locked_mapping_entry(mapping, index, entry);
+ +	trace_dax_pfn_mkwrite(inode, vmf, VM_FAULT_NOPAGE);
+ +	return VM_FAULT_NOPAGE;
+ +}
+ +EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
+++=======
++ /*
++  * The user has performed a load from a hole in the file.  Allocating a new
++  * page in the file would cause excessive storage usage for workloads with
++  * sparse files.  Instead we insert a read-only mapping of the 4k zero page.
++  * If this page is ever written to we will re-fault and change the mapping to
++  * point to real DAX storage instead.
++  */
++ static int dax_load_hole(struct address_space *mapping, void *entry,
++ 			 struct vm_fault *vmf)
++ {
++ 	struct inode *inode = mapping->host;
++ 	unsigned long vaddr = vmf->address;
++ 	int ret = VM_FAULT_NOPAGE;
++ 	struct page *zero_page;
++ 	void *entry2;
++ 
++ 	zero_page = ZERO_PAGE(0);
++ 	if (unlikely(!zero_page)) {
++ 		ret = VM_FAULT_OOM;
++ 		goto out;
++ 	}
++ 
++ 	entry2 = dax_insert_mapping_entry(mapping, vmf, entry, 0,
++ 			RADIX_DAX_ZERO_PAGE);
++ 	if (IS_ERR(entry2)) {
++ 		ret = VM_FAULT_SIGBUS;
++ 		goto out;
++ 	}
++ 
++ 	vm_insert_mixed(vmf->vma, vaddr, page_to_pfn_t(zero_page));
++ out:
++ 	trace_dax_load_hole(inode, vmf, ret);
++ 	return ret;
++ }
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  
+  static bool dax_range_is_aligned(struct block_device *bdev,
+  				 unsigned int offset, unsigned int length)
+@@@ -1324,9 -1183,8 +1403,9 @@@ static int dax_iomap_pte_fault(struct v
+  #define PG_PMD_COLOUR	((PMD_SIZE >> PAGE_SHIFT) - 1)
+  
+  static int dax_pmd_insert_mapping(struct vm_fault *vmf, struct iomap *iomap,
+- 		loff_t pos, void **entryp)
++ 		loff_t pos, void *entry)
+  {
+ +	unsigned long address = (unsigned long)vmf->virtual_address;
+  	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+  	const sector_t sector = dax_iomap_sector(iomap, pos);
+  	struct dax_device *dax_dev = iomap->dax_dev;
+@@@ -1360,10 -1218,9 +1439,9 @@@
+  			RADIX_DAX_PMD);
+  	if (IS_ERR(ret))
+  		goto fallback;
+- 	*entryp = ret;
+  
+  	trace_dax_pmd_insert_mapping(inode, vmf, length, pfn, ret);
+ -	return vmf_insert_pfn_pmd(vmf->vma, vmf->address, vmf->pmd,
+ +	return vmf_insert_pfn_pmd(vmf->vma, address, vmf->pmd,
+  			pfn, vmf->flags & FAULT_FLAG_WRITE);
+  
+  unlock_fallback:
+@@@ -1374,11 -1231,10 +1452,11 @@@ fallback
+  }
+  
+  static int dax_pmd_load_hole(struct vm_fault *vmf, struct iomap *iomap,
+- 		void **entryp)
++ 		void *entry)
+  {
+ +	unsigned long address = (unsigned long)vmf->virtual_address;
+  	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+ -	unsigned long pmd_addr = vmf->address & PMD_MASK;
+ +	unsigned long pmd_addr = address & PMD_MASK;
+  	struct inode *inode = mapping->host;
+  	struct page *zero_page;
+  	void *ret = NULL;
+@@@ -1390,14 -1246,13 +1468,13 @@@
+  	if (unlikely(!zero_page))
+  		goto fallback;
+  
+- 	ret = dax_insert_mapping_entry(mapping, vmf, *entryp, 0,
+- 			RADIX_DAX_PMD | RADIX_DAX_HZP);
++ 	ret = dax_insert_mapping_entry(mapping, vmf, entry, 0,
++ 			RADIX_DAX_PMD | RADIX_DAX_ZERO_PAGE);
+  	if (IS_ERR(ret))
+  		goto fallback;
+- 	*entryp = ret;
+  
+  	ptl = pmd_lock(vmf->vma->vm_mm, vmf->pmd);
+ -	if (!pmd_none(*(vmf->pmd))) {
+ +	if (!pmd_none(*vmf->pmd)) {
+  		spin_unlock(ptl);
+  		goto fallback;
+  	}
+@@@ -1536,10 -1390,10 +1613,10 @@@ static int dax_iomap_pmd_fault(struct v
+  				&iomap);
+  	}
+   unlock_entry:
+- 	put_locked_mapping_entry(mapping, pgoff, entry);
++ 	put_locked_mapping_entry(mapping, pgoff);
+   fallback:
+  	if (result == VM_FAULT_FALLBACK) {
+ -		split_huge_pmd(vma, vmf->pmd, vmf->address);
+ +		split_huge_page_pmd(vma, address, vmf->pmd);
+  		count_vm_event(THP_FAULT_FALLBACK);
+  	}
+  out:
+diff --cc fs/ext2/file.c
+index 4d0447eb265d,ff3a3636a5ca..000000000000
+--- a/fs/ext2/file.c
++++ b/fs/ext2/file.c
+@@@ -59,56 -107,15 +59,59 @@@ static int ext2_dax_fault(struct vm_are
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int ext2_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
+ +						pmd_t *pmd, unsigned int flags)
+ +{
+ +	struct inode *inode = file_inode(vma->vm_file);
+ +	struct ext2_inode_info *ei = EXT2_I(inode);
+ +	int ret;
+ +
+ +	if (flags & FAULT_FLAG_WRITE) {
+ +		sb_start_pagefault(inode->i_sb);
+ +		file_update_time(vma->vm_file);
+ +	}
+ +	down_read(&ei->dax_sem);
+ +
+ +	ret = dax_pmd_fault(vma, addr, pmd, flags, ext2_get_block);
+ +
+ +	up_read(&ei->dax_sem);
+ +	if (flags & FAULT_FLAG_WRITE)
+ +		sb_end_pagefault(inode->i_sb);
+ +	return ret;
+ +}
+ +
+ +static int ext2_dax_pfn_mkwrite(struct vm_area_struct *vma,
+ +		struct vm_fault *vmf)
+ +{
+ +	struct inode *inode = file_inode(vma->vm_file);
+ +	struct ext2_inode_info *ei = EXT2_I(inode);
+ +	loff_t size;
+ +	int ret;
+ +
+ +	sb_start_pagefault(inode->i_sb);
+ +	file_update_time(vma->vm_file);
+ +	down_read(&ei->dax_sem);
+ +
+ +	/* check that the faulting page hasn't raced with truncate */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (vmf->pgoff >= size)
+ +		ret = VM_FAULT_SIGBUS;
+ +	else
+ +		ret = dax_pfn_mkwrite(vma, vmf);
+ +
+ +	up_read(&ei->dax_sem);
+ +	sb_end_pagefault(inode->i_sb);
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  static const struct vm_operations_struct ext2_dax_vm_ops = {
+  	.fault		= ext2_dax_fault,
+ -	/*
+ -	 * .huge_fault is not supported for DAX because allocation in ext2
+ -	 * cannot be reliably aligned to huge page sizes and so pmd faults
+ -	 * will always fail and fail back to regular faults.
+ -	 */
+ +	.pmd_fault	= ext2_dax_pmd_fault,
+  	.page_mkwrite	= ext2_dax_fault,
+- 	.pfn_mkwrite	= ext2_dax_pfn_mkwrite,
++ 	.pfn_mkwrite	= ext2_dax_fault,
+  };
+  
+  static int ext2_file_mmap(struct file *file, struct vm_area_struct *vma)
+diff --cc fs/ext4/file.c
+index feb7f54458b2,f28ac999dfba..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -322,43 -311,11 +322,50 @@@ static inline int ext4_dax_fault(struc
+  	return ext4_dax_huge_fault(vmf, PE_SIZE_PTE);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Handle write fault for VM_MIXEDMAP mappings. Similarly to ext4_dax_fault()
+ + * handler we check for races agaist truncate. Note that since we cycle through
+ + * i_mmap_sem, we are sure that also any hole punching that began before we
+ + * were called is finished by now and so if it included part of the file we
+ + * are working on, our pte will get unmapped and the check for pte_same() in
+ + * wp_pfn_shared() fails. Thus fault gets retried and things work out as
+ + * desired.
+ + */
+ +static int ext4_dax_pfn_mkwrite(struct vm_area_struct *vma,
+ +				struct vm_fault *vmf)
+ +{
+ +	struct inode *inode = file_inode(vma->vm_file);
+ +	struct super_block *sb = inode->i_sb;
+ +	loff_t size;
+ +	int ret;
+ +
+ +	sb_start_pagefault(sb);
+ +	file_update_time(vma->vm_file);
+ +	down_read(&EXT4_I(inode)->i_mmap_sem);
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (vmf->pgoff >= size)
+ +		ret = VM_FAULT_SIGBUS;
+ +	else
+ +		ret = dax_pfn_mkwrite(vma, vmf);
+ +	up_read(&EXT4_I(inode)->i_mmap_sem);
+ +	sb_end_pagefault(sb);
+ +
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  static const struct vm_operations_struct ext4_dax_vm_ops = {
+  	.fault		= ext4_dax_fault,
+  	.huge_fault	= ext4_dax_huge_fault,
+  	.page_mkwrite	= ext4_dax_fault,
+++<<<<<<< HEAD
+ +	.pfn_mkwrite	= ext4_dax_pfn_mkwrite,
+ +	.remap_pages	= generic_file_remap_pages,
+++=======
++ 	.pfn_mkwrite	= ext4_dax_fault,
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  };
+  #else
+  #define ext4_dax_vm_ops	ext4_file_vm_ops
+diff --cc fs/xfs/xfs_file.c
+index cea567087acc,62db8ffa83b9..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1235,7 -1130,7 +1235,11 @@@ xfs_filemap_pfn_mkwrite
+  	if (vmf->pgoff >= size)
+  		ret = VM_FAULT_SIGBUS;
+  	else if (IS_DAX(inode))
+++<<<<<<< HEAD
+ +		ret = dax_pfn_mkwrite(vma, vmf);
+++=======
++ 		ret = dax_iomap_fault(vmf, PE_SIZE_PTE, &xfs_iomap_ops);
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  	xfs_iunlock(ip, XFS_MMAPLOCK_SHARED);
+  	sb_end_pagefault(inode->i_sb);
+  	return ret;
+diff --cc include/linux/dax.h
+index b7b81d6cc271,b3518559f0da..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,34 -6,6 +6,33 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+ +/*
+ + * We use lowest available bit in exceptional entry for locking, one bit for
+-  * the entry size (PMD) and two more to tell us if the entry is a huge zero
+-  * page (HZP) or an empty entry that is just used for locking.  In total four
+-  * special bits.
+++ * the entry size (PMD) and two more to tell us if the entry is a zero page or
+++ * an empty entry that is just used for locking.  In total four special bits.
+ + *
+-  * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+-  * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+++ * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the ZERO_PAGE
+++ * and EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ + * block allocation.
+ + */
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+- #define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+++#define RADIX_DAX_ZERO_PAGE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ +
+ +static inline unsigned long dax_radix_sector(void *entry)
+ +{
+ +	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ +}
+ +
+ +static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ +{
+ +	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ +			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ +			RADIX_DAX_ENTRY_LOCK);
+ +}
+ +
+  struct iomap_ops;
+  struct dax_device;
+  struct dax_operations {
+@@@ -124,7 -152,6 +123,10 @@@ static inline unsigned int dax_radix_or
+  	return 0;
+  }
+  #endif
+++<<<<<<< HEAD
+ +int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
+++=======
+++>>>>>>> 91d25ba8a6b0 (dax: use common 4k zero page for dax mmap reads)
+  
+  static inline bool dax_mapping(struct address_space *mapping)
+  {
+diff --git a/Documentation/filesystems/dax.txt b/Documentation/filesystems/dax.txt
+index 27d77531cbc7..ae482ffed3cd 100644
+--- a/Documentation/filesystems/dax.txt
++++ b/Documentation/filesystems/dax.txt
+@@ -60,9 +60,8 @@ Filesystem support consists of
+ - implementing an mmap file operation for DAX files which sets the
+   VM_MIXEDMAP and VM_HUGEPAGE flags on the VMA, and setting the vm_ops to
+   include handlers for fault, pmd_fault, page_mkwrite, pfn_mkwrite. These
+-  handlers should probably call dax_iomap_fault() (for fault and page_mkwrite
+-  handlers), dax_iomap_pmd_fault(), dax_pfn_mkwrite() passing the appropriate
+-  iomap operations.
++  handlers should probably call dax_iomap_fault() passing the appropriate
++  fault size and iomap operations.
+ - calling iomap_zero_range() passing appropriate iomap operations instead of
+   block_truncate_page() for DAX files
+ - ensuring that there is sufficient locking between reads, writes,
+* Unmerged path fs/dax.c
+* Unmerged path fs/ext2/file.c
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path include/linux/dax.h
+diff --git a/include/trace/events/fs_dax.h b/include/trace/events/fs_dax.h
+index bb37a1fc4e75..da748e937ce7 100644
+--- a/include/trace/events/fs_dax.h
++++ b/include/trace/events/fs_dax.h
+@@ -189,8 +189,6 @@ DEFINE_EVENT(dax_pte_fault_class, name, \
+ 
+ DEFINE_PTE_FAULT_EVENT(dax_pte_fault);
+ DEFINE_PTE_FAULT_EVENT(dax_pte_fault_done);
+-DEFINE_PTE_FAULT_EVENT(dax_pfn_mkwrite_no_entry);
+-DEFINE_PTE_FAULT_EVENT(dax_pfn_mkwrite);
+ DEFINE_PTE_FAULT_EVENT(dax_load_hole);
+ 
+ TRACE_EVENT(dax_insert_mapping,
