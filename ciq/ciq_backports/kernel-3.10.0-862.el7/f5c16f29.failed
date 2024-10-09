@@ -1,0 +1,158 @@
+sysfs: make sure read buffer is zeroed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit f5c16f29bf5e57ba4051fc7785ba7f035f798c71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f5c16f29.failed
+
+13c589d5b0ac ("sysfs: use seq_file when reading regular files")
+switched sysfs from custom read implementation to seq_file to enable
+later transition to kernfs.  After the change, the buffer passed to
+->show() is acquired through seq_get_buf(); unfortunately, this
+introduces a subtle behavior change.  Before the commit, the buffer
+passed to ->show() was always zero as it was allocated using
+get_zeroed_page().  Because seq_file doesn't clear buffers on
+allocation and neither does seq_get_buf(), after the commit, depending
+on the behavior of ->show(), we may end up exposing uninitialized data
+to userland thus possibly altering userland visible behavior and
+leaking information.
+
+Fix it by explicitly clearing the buffer.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Reported-by: Ron <ron@debian.org>
+Fixes: 13c589d5b0ac ("sysfs: use seq_file when reading regular files")
+	Cc: stable <stable@vger.kernel.org> # 3.13+
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit f5c16f29bf5e57ba4051fc7785ba7f035f798c71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,e9ef59b3abb1..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -14,79 -14,56 +14,89 @@@
+  #include <linux/kobject.h>
+  #include <linux/kallsyms.h>
+  #include <linux/slab.h>
+ +#include <linux/fsnotify.h>
+ +#include <linux/namei.h>
+ +#include <linux/poll.h>
+  #include <linux/list.h>
+  #include <linux/mutex.h>
+ -#include <linux/seq_file.h>
+ +#include <linux/limits.h>
+ +#include <linux/uaccess.h>
+  
+  #include "sysfs.h"
+ -#include "../kernfs/kernfs-internal.h"
+  
+  /*
+ - * Determine ktype->sysfs_ops for the given kernfs_node.  This function
+ - * must be called while holding an active reference.
+ + * There's one sysfs_buffer for each open file and one sysfs_open_dirent
+ + * for each sysfs_dirent with one or more open files.
+ + *
+ + * sysfs_dirent->s_attr.open points to sysfs_open_dirent.  s_attr.open is
+ + * protected by sysfs_open_dirent_lock.
+ + *
+ + * filp->private_data points to sysfs_buffer which is chained at
+ + * sysfs_open_dirent->buffers, which is protected by sysfs_open_file_mutex.
+   */
+ -static const struct sysfs_ops *sysfs_file_ops(struct kernfs_node *kn)
+ -{
+ -	struct kobject *kobj = kn->parent->priv;
+ +static DEFINE_SPINLOCK(sysfs_open_dirent_lock);
+ +static DEFINE_MUTEX(sysfs_open_file_mutex);
+ +
+ +struct sysfs_open_dirent {
+ +	atomic_t		refcnt;
+ +	atomic_t		event;
+ +	wait_queue_head_t	poll;
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+ +};
+  
+ -	if (kn->flags & KERNFS_LOCKDEP)
+ -		lockdep_assert_held(kn);
+ -	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
+ -}
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+ +	struct mutex		mutex;
+ +	int			needs_read_fill;
+ +	int			event;
+ +	struct list_head	list;
+ +};
+  
+ -/*
+ - * Reads on sysfs are handled through seq_file, which takes care of hairy
+ - * details like buffering and seeking.  The following function pipes
+ - * sysfs_ops->show() result through seq_file.
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's
+ + *	data.
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+   */
+ -static int sysfs_kf_seq_show(struct seq_file *sf, void *v)
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+  {
+ -	struct kernfs_open_file *of = sf->private;
+ -	struct kobject *kobj = of->kn->parent->priv;
+ -	const struct sysfs_ops *ops = sysfs_file_ops(of->kn);
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+  	ssize_t count;
+ -	char *buf;
+  
+++<<<<<<< HEAD
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+++=======
++ 	/* acquire buffer and ensure that it's >= PAGE_SIZE and clear */
++ 	count = seq_get_buf(sf, &buf);
++ 	if (count < PAGE_SIZE) {
++ 		seq_commit(sf, -1);
++ 		return 0;
++ 	}
++ 	memset(buf, 0, PAGE_SIZE);
+++>>>>>>> f5c16f29bf5e (sysfs: make sure read buffer is zeroed)
+  
+ -	/*
+ -	 * Invoke show().  Control may reach here via seq file lseek even
+ -	 * if @ops->show() isn't implemented.
+ -	 */
+ -	if (ops->show) {
+ -		count = ops->show(kobj, of->kn->priv, buf);
+ -		if (count < 0)
+ -			return count;
+ -	}
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+ +
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+ +
+ +	sysfs_put_active(attr_sd);
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+* Unmerged path fs/sysfs/file.c
