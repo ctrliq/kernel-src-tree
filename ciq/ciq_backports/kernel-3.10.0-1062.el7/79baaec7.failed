@@ -1,0 +1,181 @@
+net/mlx5e: Allow association of a flow to multiple encaps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Allow association of a flow to multiple encaps (Alaa Hleihel) [1642383 1642498]
+Rebuild_FUZZ: 96.36%
+commit-author Eli Britstein <elibr@mellanox.com>
+commit 79baaec71989afa805a0f2dd532451a6103e11b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/79baaec7.failed
+
+Currently a flow can be associated with a single encap entry. The
+extended destination feature enables the driver to configure multiple
+encap entries per flow.
+
+Change the encap flow association field to array as a pre-step towards
+supporting multiple encap destinations. Use only the first array
+element, with no functional change.
+
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Oz Shlomo <ozsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 79baaec71989afa805a0f2dd532451a6103e11b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index fbb4f1b36627,58b83489a6d6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -72,15 -73,44 +72,52 @@@ enum 
+  	MLX5E_TC_FLOW_OFFLOADED	= BIT(MLX5E_TC_FLOW_BASE + 2),
+  	MLX5E_TC_FLOW_HAIRPIN	= BIT(MLX5E_TC_FLOW_BASE + 3),
+  	MLX5E_TC_FLOW_HAIRPIN_RSS = BIT(MLX5E_TC_FLOW_BASE + 4),
+ -	MLX5E_TC_FLOW_SLOW	  = BIT(MLX5E_TC_FLOW_BASE + 5),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX5E_TC_MAX_SPLITS 1
++ 
++ /* Helper struct for accessing a struct containing list_head array.
++  * Containing struct
++  *   |- Helper array
++  *      [0] Helper item 0
++  *          |- list_head item 0
++  *          |- index (0)
++  *      [1] Helper item 1
++  *          |- list_head item 1
++  *          |- index (1)
++  * To access the containing struct from one of the list_head items:
++  * 1. Get the helper item from the list_head item using
++  *    helper item =
++  *        container_of(list_head item, helper struct type, list_head field)
++  * 2. Get the contining struct from the helper item and its index in the array:
++  *    containing struct =
++  *        container_of(helper item, containing struct type, helper field[index])
++  */
++ struct encap_flow_item {
++ 	struct list_head list;
++ 	int index;
++ };
++ 
+++>>>>>>> 79baaec71989 (net/mlx5e: Allow association of a flow to multiple encaps)
+  struct mlx5e_tc_flow {
+  	struct rhash_head	node;
+  	struct mlx5e_priv	*priv;
+  	u64			cookie;
+++<<<<<<< HEAD
+ +	u8			flags;
+ +	struct mlx5_flow_handle *rule;
+ +	struct list_head	encap;   /* flows sharing the same encap ID */
+++=======
++ 	u16			flags;
++ 	struct mlx5_flow_handle *rule[MLX5E_TC_MAX_SPLITS + 1];
++ 	/* Flow can be associated with multiple encap IDs.
++ 	 * The number of encaps is bounded by the number of supported
++ 	 * destinations.
++ 	 */
++ 	struct encap_flow_item encaps[MLX5_MAX_FLOW_FWD_VPORTS];
+++>>>>>>> 79baaec71989 (net/mlx5e: Allow association of a flow to multiple encaps)
+  	struct list_head	mod_hdr; /* flows sharing the same mod hdr ID */
+  	struct list_head	hairpin; /* flows sharing the same hairpin */
+  	union {
+@@@ -905,7 -1066,10 +942,14 @@@ void mlx5e_tc_encap_flows_add(struct ml
+  			      struct mlx5e_encap_entry *e)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+++<<<<<<< HEAD
+ +	struct mlx5_esw_flow_attr *esw_attr;
+++=======
++ 	struct mlx5_esw_flow_attr slow_attr, *esw_attr;
++ 	struct mlx5_flow_handle *rule;
++ 	struct mlx5_flow_spec *spec;
++ 	struct encap_flow_item *efi;
+++>>>>>>> 79baaec71989 (net/mlx5e: Allow association of a flow to multiple encaps)
+  	struct mlx5e_tc_flow *flow;
+  	int err;
+  
+@@@ -920,12 -1086,16 +964,13 @@@
+  	e->flags |= MLX5_ENCAP_ENTRY_VALID;
+  	mlx5e_rep_queue_neigh_stats_work(priv);
+  
+- 	list_for_each_entry(flow, &e->flows, encap) {
++ 	list_for_each_entry(efi, &e->flows, list) {
++ 		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
+  		esw_attr = flow->esw_attr;
+  		esw_attr->encap_id = e->encap_id;
+ -		spec = &esw_attr->parse_attr->spec;
+ -
+ -		/* update from slow path rule to encap rule */
+ -		rule = mlx5e_tc_offload_fdb_rules(esw, flow, spec, esw_attr);
+ -		if (IS_ERR(rule)) {
+ -			err = PTR_ERR(rule);
+ +		flow->rule = mlx5_eswitch_add_offloaded_rule(esw, &esw_attr->parse_attr->spec, esw_attr);
+ +		if (IS_ERR(flow->rule)) {
+ +			err = PTR_ERR(flow->rule);
+  			mlx5_core_warn(priv->mdev, "Failed to update cached encapsulation flow, %d\n",
+  				       err);
+  			continue;
+@@@ -938,13 -1111,30 +983,35 @@@ void mlx5e_tc_encap_flows_del(struct ml
+  			      struct mlx5e_encap_entry *e)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_esw_flow_attr slow_attr;
++ 	struct mlx5_flow_handle *rule;
++ 	struct mlx5_flow_spec *spec;
++ 	struct encap_flow_item *efi;
+++>>>>>>> 79baaec71989 (net/mlx5e: Allow association of a flow to multiple encaps)
+  	struct mlx5e_tc_flow *flow;
+ -	int err;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(flow, &e->flows, encap) {
+ +		if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+ +			flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+ +			mlx5_eswitch_del_offloaded_rule(esw, flow->rule, flow->esw_attr);
+++=======
++ 	list_for_each_entry(efi, &e->flows, list) {
++ 		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
++ 		spec = &flow->esw_attr->parse_attr->spec;
++ 
++ 		/* update from encap rule to slow path rule */
++ 		rule = mlx5e_tc_offload_to_slow_path(esw, flow, spec, &slow_attr);
++ 
++ 		if (IS_ERR(rule)) {
++ 			err = PTR_ERR(rule);
++ 			mlx5_core_warn(priv->mdev, "Failed to update slow path (encap) flow, %d\n",
++ 				       err);
++ 			continue;
+++>>>>>>> 79baaec71989 (net/mlx5e: Allow association of a flow to multiple encaps)
+  		}
+ -
+ -		mlx5e_tc_unoffload_fdb_rules(esw, flow, flow->esw_attr);
+ -		flow->flags |= MLX5E_TC_FLOW_OFFLOADED; /* was unset when fast path rule removed */
+ -		flow->rule[0] = rule;
+  	}
+  
+  	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
+@@@ -974,11 -1172,14 +1041,14 @@@ void mlx5e_tc_update_neigh_used_value(s
+  		return;
+  
+  	list_for_each_entry(e, &nhe->encap_list, encap_list) {
++ 		struct encap_flow_item *efi;
+  		if (!(e->flags & MLX5_ENCAP_ENTRY_VALID))
+  			continue;
+- 		list_for_each_entry(flow, &e->flows, encap) {
++ 		list_for_each_entry(efi, &e->flows, list) {
++ 			flow = container_of(efi, struct mlx5e_tc_flow,
++ 					    encaps[efi->index]);
+  			if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+ -				counter = mlx5e_tc_get_counter(flow);
+ +				counter = mlx5_flow_rule_counter(flow->rule);
+  				mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
+  				if (time_after((unsigned long)lastuse, nhe->reported_lastuse)) {
+  					neigh_used = true;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
