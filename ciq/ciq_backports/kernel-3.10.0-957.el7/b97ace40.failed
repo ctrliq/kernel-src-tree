@@ -1,0 +1,234 @@
+drm/nouveau/kms/nv50-: modify cursor allocation so the code can be split
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit b97ace4072267ea44a254ef2c3b001d2122313dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b97ace40.failed
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit b97ace4072267ea44a254ef2c3b001d2122313dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/dispnv50/disp.c
+diff --cc drivers/gpu/drm/nouveau/dispnv50/disp.c
+index a2ea42f947c7,33cb358ebeeb..000000000000
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@@ -773,11 -617,84 +773,87 @@@ struct nv50_wndw_func 
+  	void (*image_set)(struct nv50_wndw *, struct nv50_wndw_atom *);
+  	void (*image_clr)(struct nv50_wndw *);
+  	void (*lut)(struct nv50_wndw *, struct nv50_wndw_atom *);
++ 
++ 	u32 (*update)(struct nv50_wndw *, u32 interlock);
++ };
++ 
+++<<<<<<< HEAD
+++=======
++ struct nv50_wimm_func {
+  	void (*point)(struct nv50_wndw *, struct nv50_wndw_atom *);
+  
+  	u32 (*update)(struct nv50_wndw *, u32 interlock);
+  };
+  
++ static void
++ nv50_wndw_ctxdma_del(struct nv50_wndw_ctxdma *ctxdma)
++ {
++ 	nvif_object_fini(&ctxdma->object);
++ 	list_del(&ctxdma->head);
++ 	kfree(ctxdma);
++ }
++ 
++ static struct nv50_wndw_ctxdma *
++ nv50_wndw_ctxdma_new(struct nv50_wndw *wndw, struct nouveau_framebuffer *fb)
++ {
++ 	struct nouveau_drm *drm = nouveau_drm(fb->base.dev);
++ 	struct nv50_wndw_ctxdma *ctxdma;
++ 	const u8    kind = fb->nvbo->kind;
++ 	const u32 handle = 0xfb000000 | kind;
++ 	struct {
++ 		struct nv_dma_v0 base;
++ 		union {
++ 			struct nv50_dma_v0 nv50;
++ 			struct gf100_dma_v0 gf100;
++ 			struct gf119_dma_v0 gf119;
++ 		};
++ 	} args = {};
++ 	u32 argc = sizeof(args.base);
++ 	int ret;
++ 
++ 	list_for_each_entry(ctxdma, &wndw->ctxdma.list, head) {
++ 		if (ctxdma->object.handle == handle)
++ 			return ctxdma;
++ 	}
++ 
++ 	if (!(ctxdma = kzalloc(sizeof(*ctxdma), GFP_KERNEL)))
++ 		return ERR_PTR(-ENOMEM);
++ 	list_add(&ctxdma->head, &wndw->ctxdma.list);
++ 
++ 	args.base.target = NV_DMA_V0_TARGET_VRAM;
++ 	args.base.access = NV_DMA_V0_ACCESS_RDWR;
++ 	args.base.start  = 0;
++ 	args.base.limit  = drm->client.device.info.ram_user - 1;
++ 
++ 	if (drm->client.device.info.chipset < 0x80) {
++ 		args.nv50.part = NV50_DMA_V0_PART_256;
++ 		argc += sizeof(args.nv50);
++ 	} else
++ 	if (drm->client.device.info.chipset < 0xc0) {
++ 		args.nv50.part = NV50_DMA_V0_PART_256;
++ 		args.nv50.kind = kind;
++ 		argc += sizeof(args.nv50);
++ 	} else
++ 	if (drm->client.device.info.chipset < 0xd0) {
++ 		args.gf100.kind = kind;
++ 		argc += sizeof(args.gf100);
++ 	} else {
++ 		args.gf119.page = GF119_DMA_V0_PAGE_LP;
++ 		args.gf119.kind = kind;
++ 		argc += sizeof(args.gf119);
++ 	}
++ 
++ 	ret = nvif_object_init(wndw->ctxdma.parent, handle, NV_DMA_IN_MEMORY,
++ 			       &args, argc, &ctxdma->object);
++ 	if (ret) {
++ 		nv50_wndw_ctxdma_del(ctxdma);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	return ctxdma;
++ }
++ 
+++>>>>>>> b97ace407226 (drm/nouveau/kms/nv50-: modify cursor allocation so the code can be split)
+  static int
+  nv50_wndw_wait_armed(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
+  {
+@@@ -1193,53 -1274,66 +1262,90 @@@ nv50_curs = 
+  };
+  
+  static int
+- nv50_curs_new(struct nouveau_drm *drm, struct nv50_head *head,
+- 	      struct nv50_curs **pcurs)
+- {
+- 	static const struct nvif_mclass curses[] = {
+- 		{ GK104_DISP_CURSOR, 0 },
+- 		{ GF110_DISP_CURSOR, 0 },
+- 		{ GT214_DISP_CURSOR, 0 },
+- 		{   G82_DISP_CURSOR, 0 },
+- 		{  NV50_DISP_CURSOR, 0 },
+- 		{}
+- 	};
++ curs507a_new_(const struct nv50_wimm_func *func, struct nouveau_drm *drm,
++ 	      int head, s32 oclass, struct nv50_wndw **pwndw)
++ {
+  	struct nv50_disp_cursor_v0 args = {
+- 		.head = head->base.index,
++ 		.head = head,
+  	};
+  	struct nv50_disp *disp = nv50_disp(drm->dev);
+- 	struct nv50_curs *curs;
+- 	int cid, ret;
++ 	struct nv50_wndw *wndw;
++ 	int ret;
++ 
++ 	ret = nv50_wndw_new_(&nv50_curs, drm->dev, DRM_PLANE_TYPE_CURSOR,
++ 			     "curs", head, nv50_curs_format, &wndw);
++ 	if (*pwndw = wndw, ret)
++ 		return ret;
++ 
++ 	ret = nvif_object_init(&disp->disp->object, 0, oclass, &args,
++ 			       sizeof(args), &wndw->wimm.base.user);
++ 	if (ret) {
++ 		NV_ERROR(drm, "curs%04x allocation failed: %d\n", oclass, ret);
++ 		return ret;
++ 	}
++ 
++ 	nvif_object_map(&wndw->wimm.base.user, NULL, 0);
++ 	wndw->immd = func;
++ 	wndw->ctxdma.parent = &disp->mast.base.base.user;
++ 	return 0;
++ }
++ 
++ static int
++ curs507a_new(struct nouveau_drm *drm, int head, s32 oclass,
++ 	     struct nv50_wndw **pwndw)
++ {
++ 	return curs507a_new_(&curs507a, drm, head, oclass, pwndw);
++ }
++ 
++ static int
++ nv50_curs_new(struct nouveau_drm *drm, int head, struct nv50_wndw **pwndw)
++ {
++ 	struct {
++ 		s32 oclass;
++ 		int version;
++ 		int (*new)(struct nouveau_drm *, int, s32, struct nv50_wndw **);
++ 	} curses[] = {
++ 		{ GK104_DISP_CURSOR, 0, curs507a_new },
++ 		{ GF110_DISP_CURSOR, 0, curs507a_new },
++ 		{ GT214_DISP_CURSOR, 0, curs507a_new },
++ 		{   G82_DISP_CURSOR, 0, curs507a_new },
++ 		{  NV50_DISP_CURSOR, 0, curs507a_new },
++ 		{}
++ 	};
++ 	struct nv50_disp *disp = nv50_disp(drm->dev);
++ 	int cid;
+  
+ -	cid = nvif_mclass(&disp->disp->object, curses);
+ +	cid = nvif_mclass(disp->disp, curses);
+  	if (cid < 0) {
+  		NV_ERROR(drm, "No supported cursor immediate class\n");
+  		return cid;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!(curs = *pcurs = kzalloc(sizeof(*curs), GFP_KERNEL)))
+ +		return -ENOMEM;
+ +
+ +	ret = nv50_wndw_ctor(&nv50_curs, drm->dev, DRM_PLANE_TYPE_CURSOR,
+ +			     "curs", head->base.index, &disp->mast.base,
+ +			     nv50_curs_format, ARRAY_SIZE(nv50_curs_format),
+ +			     &curs->wndw);
+ +	if (ret) {
+ +		kfree(curs);
+ +		return ret;
+ +	}
+ +
+ +	ret = nvif_object_init(disp->disp, 0, curses[cid].oclass, &args,
+ +			       sizeof(args), &curs->chan);
+ +	if (ret) {
+ +		NV_ERROR(drm, "curs%04x allocation failed: %d\n",
+ +			 curses[cid].oclass, ret);
+ +		return ret;
+ +	}
+ +
+ +	return 0;
+++=======
++ 	return curses[cid].new(drm, head, curses[cid].oclass, pwndw);
+++>>>>>>> b97ace407226 (drm/nouveau/kms/nv50-: modify cursor allocation so the code can be split)
+  }
+  
+  /******************************************************************************
+@@@ -2325,13 -2470,11 +2431,17 @@@ static in
+  nv50_head_create(struct drm_device *dev, int index)
+  {
+  	struct nouveau_drm *drm = nouveau_drm(dev);
+ +	struct nvif_device *device = &drm->client.device;
+ +	struct nv50_disp *disp = nv50_disp(dev);
+  	struct nv50_head *head;
+  	struct nv50_base *base;
+++<<<<<<< HEAD
+ +	struct nv50_curs *curs;
+++=======
++ 	struct nv50_wndw *curs, *wndw;
+++>>>>>>> b97ace407226 (drm/nouveau/kms/nv50-: modify cursor allocation so the code can be split)
+  	struct drm_crtc *crtc;
+ -	int ret, i;
+ +	int ret;
+  
+  	head = kzalloc(sizeof(*head), GFP_KERNEL);
+  	if (!head)
+* Unmerged path drivers/gpu/drm/nouveau/dispnv50/disp.c
