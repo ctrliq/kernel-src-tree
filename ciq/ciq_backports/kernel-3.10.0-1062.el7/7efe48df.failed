@@ -1,0 +1,262 @@
+vmcore: append device dumps to vmcore as elf notes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+commit 7efe48df8a3df6d089d2e9a1d429c82cc5dcf2de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7efe48df.failed
+
+Update read and mmap logic to append device dumps as additional notes
+before the other elf notes. We add device dumps before other elf notes
+because the other elf notes may not fill the elf notes buffer
+completely and we will end up with zero-filled data between the elf
+notes and the device dumps. Tools will then try to decode this
+zero-filled data as valid notes and we don't want that. Hence, adding
+device dumps before the other elf notes ensure that zero-filled data
+can be avoided. This also ensures that the device dumps and the
+other elf notes can be properly mmaped at page aligned address.
+
+Incorporate device dump size into the total vmcore size. Also update
+offsets for other program headers after the device dumps are added.
+
+	Suggested-by: Eric Biederman <ebiederm@xmission.com>.
+	Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7efe48df8a3df6d089d2e9a1d429c82cc5dcf2de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/vmcore.c
+diff --cc fs/proc/vmcore.c
+index 662a93a80c88,247c3499e5bd..000000000000
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@@ -42,8 -45,17 +44,11 @@@ static size_t elfnotes_orig_sz
+  /* Total size of vmcore file. */
+  static u64 vmcore_size;
+  
+ -static struct proc_dir_entry *proc_vmcore;
+ -
+ -#ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
+ -/* Device Dump list and mutex to synchronize access to list */
+ -static LIST_HEAD(vmcoredd_list);
+ -static DEFINE_MUTEX(vmcoredd_mutex);
+ -#endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
+ +static struct proc_dir_entry *proc_vmcore = NULL;
+  
++ /* Device Dump Size */
++ static size_t vmcoredd_orig_sz;
++ 
+  /*
+   * Returns > 0 for RAM pages, 0 for non-RAM pages, < 0 on error
+   * The called function has to take care of module refcounting.
+@@@ -1066,6 -1302,202 +1218,205 @@@ static int __init parse_crash_elf_heade
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++ /**
++  * vmcoredd_write_header - Write vmcore device dump header at the
++  * beginning of the dump's buffer.
++  * @buf: Output buffer where the note is written
++  * @data: Dump info
++  * @size: Size of the dump
++  *
++  * Fills beginning of the dump's buffer with vmcore device dump header.
++  */
++ static void vmcoredd_write_header(void *buf, struct vmcoredd_data *data,
++ 				  u32 size)
++ {
++ 	struct vmcoredd_header *vdd_hdr = (struct vmcoredd_header *)buf;
++ 
++ 	vdd_hdr->n_namesz = sizeof(vdd_hdr->name);
++ 	vdd_hdr->n_descsz = size + sizeof(vdd_hdr->dump_name);
++ 	vdd_hdr->n_type = NT_VMCOREDD;
++ 
++ 	strncpy((char *)vdd_hdr->name, VMCOREDD_NOTE_NAME,
++ 		sizeof(vdd_hdr->name));
++ 	memcpy(vdd_hdr->dump_name, data->dump_name, sizeof(vdd_hdr->dump_name));
++ }
++ 
++ /**
++  * vmcoredd_update_program_headers - Update all Elf program headers
++  * @elfptr: Pointer to elf header
++  * @elfnotesz: Size of elf notes aligned to page size
++  * @vmcoreddsz: Size of device dumps to be added to elf note header
++  *
++  * Determine type of Elf header (Elf64 or Elf32) and update the elf note size.
++  * Also update the offsets of all the program headers after the elf note header.
++  */
++ static void vmcoredd_update_program_headers(char *elfptr, size_t elfnotesz,
++ 					    size_t vmcoreddsz)
++ {
++ 	unsigned char *e_ident = (unsigned char *)elfptr;
++ 	u64 start, end, size;
++ 	loff_t vmcore_off;
++ 	u32 i;
++ 
++ 	vmcore_off = elfcorebuf_sz + elfnotesz;
++ 
++ 	if (e_ident[EI_CLASS] == ELFCLASS64) {
++ 		Elf64_Ehdr *ehdr = (Elf64_Ehdr *)elfptr;
++ 		Elf64_Phdr *phdr = (Elf64_Phdr *)(elfptr + sizeof(Elf64_Ehdr));
++ 
++ 		/* Update all program headers */
++ 		for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++ 			if (phdr->p_type == PT_NOTE) {
++ 				/* Update note size */
++ 				phdr->p_memsz = elfnotes_orig_sz + vmcoreddsz;
++ 				phdr->p_filesz = phdr->p_memsz;
++ 				continue;
++ 			}
++ 
++ 			start = rounddown(phdr->p_offset, PAGE_SIZE);
++ 			end = roundup(phdr->p_offset + phdr->p_memsz,
++ 				      PAGE_SIZE);
++ 			size = end - start;
++ 			phdr->p_offset = vmcore_off + (phdr->p_offset - start);
++ 			vmcore_off += size;
++ 		}
++ 	} else {
++ 		Elf32_Ehdr *ehdr = (Elf32_Ehdr *)elfptr;
++ 		Elf32_Phdr *phdr = (Elf32_Phdr *)(elfptr + sizeof(Elf32_Ehdr));
++ 
++ 		/* Update all program headers */
++ 		for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++ 			if (phdr->p_type == PT_NOTE) {
++ 				/* Update note size */
++ 				phdr->p_memsz = elfnotes_orig_sz + vmcoreddsz;
++ 				phdr->p_filesz = phdr->p_memsz;
++ 				continue;
++ 			}
++ 
++ 			start = rounddown(phdr->p_offset, PAGE_SIZE);
++ 			end = roundup(phdr->p_offset + phdr->p_memsz,
++ 				      PAGE_SIZE);
++ 			size = end - start;
++ 			phdr->p_offset = vmcore_off + (phdr->p_offset - start);
++ 			vmcore_off += size;
++ 		}
++ 	}
++ }
++ 
++ /**
++  * vmcoredd_update_size - Update the total size of the device dumps and update
++  * Elf header
++  * @dump_size: Size of the current device dump to be added to total size
++  *
++  * Update the total size of all the device dumps and update the Elf program
++  * headers. Calculate the new offsets for the vmcore list and update the
++  * total vmcore size.
++  */
++ static void vmcoredd_update_size(size_t dump_size)
++ {
++ 	vmcoredd_orig_sz += dump_size;
++ 	elfnotes_sz = roundup(elfnotes_orig_sz, PAGE_SIZE) + vmcoredd_orig_sz;
++ 	vmcoredd_update_program_headers(elfcorebuf, elfnotes_sz,
++ 					vmcoredd_orig_sz);
++ 
++ 	/* Update vmcore list offsets */
++ 	set_vmcore_list_offsets(elfcorebuf_sz, elfnotes_sz, &vmcore_list);
++ 
++ 	vmcore_size = get_vmcore_size(elfcorebuf_sz, elfnotes_sz,
++ 				      &vmcore_list);
++ 	proc_vmcore->size = vmcore_size;
++ }
++ 
++ /**
++  * vmcore_add_device_dump - Add a buffer containing device dump to vmcore
++  * @data: dump info.
++  *
++  * Allocate a buffer and invoke the calling driver's dump collect routine.
++  * Write Elf note at the beginning of the buffer to indicate vmcore device
++  * dump and add the dump to global list.
++  */
++ int vmcore_add_device_dump(struct vmcoredd_data *data)
++ {
++ 	struct vmcoredd_node *dump;
++ 	void *buf = NULL;
++ 	size_t data_size;
++ 	int ret;
++ 
++ 	if (!data || !strlen(data->dump_name) ||
++ 	    !data->vmcoredd_callback || !data->size)
++ 		return -EINVAL;
++ 
++ 	dump = vzalloc(sizeof(*dump));
++ 	if (!dump) {
++ 		ret = -ENOMEM;
++ 		goto out_err;
++ 	}
++ 
++ 	/* Keep size of the buffer page aligned so that it can be mmaped */
++ 	data_size = roundup(sizeof(struct vmcoredd_header) + data->size,
++ 			    PAGE_SIZE);
++ 
++ 	/* Allocate buffer for driver's to write their dumps */
++ 	buf = vmcore_alloc_buf(data_size);
++ 	if (!buf) {
++ 		ret = -ENOMEM;
++ 		goto out_err;
++ 	}
++ 
++ 	vmcoredd_write_header(buf, data, data_size -
++ 			      sizeof(struct vmcoredd_header));
++ 
++ 	/* Invoke the driver's dump collection routing */
++ 	ret = data->vmcoredd_callback(data, buf +
++ 				      sizeof(struct vmcoredd_header));
++ 	if (ret)
++ 		goto out_err;
++ 
++ 	dump->buf = buf;
++ 	dump->size = data_size;
++ 
++ 	/* Add the dump to driver sysfs list */
++ 	mutex_lock(&vmcoredd_mutex);
++ 	list_add_tail(&dump->list, &vmcoredd_list);
++ 	mutex_unlock(&vmcoredd_mutex);
++ 
++ 	vmcoredd_update_size(data_size);
++ 	return 0;
++ 
++ out_err:
++ 	if (buf)
++ 		vfree(buf);
++ 
++ 	if (dump)
++ 		vfree(dump);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(vmcore_add_device_dump);
++ #endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++ 
++ /* Free all dumps in vmcore device dump list */
++ static void vmcore_free_device_dumps(void)
++ {
++ #ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++ 	mutex_lock(&vmcoredd_mutex);
++ 	while (!list_empty(&vmcoredd_list)) {
++ 		struct vmcoredd_node *dump;
++ 
++ 		dump = list_first_entry(&vmcoredd_list, struct vmcoredd_node,
++ 					list);
++ 		list_del(&dump->list);
++ 		vfree(dump->buf);
++ 		vfree(dump);
++ 	}
++ 	mutex_unlock(&vmcoredd_mutex);
++ #endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++ }
++ 
+++>>>>>>> 7efe48df8a3d (vmcore: append device dumps to vmcore as elf notes)
+  /* Init function for vmcore module. */
+  static int __init vmcore_init(void)
+  {
+* Unmerged path fs/proc/vmcore.c
