@@ -1,0 +1,168 @@
+ACPI / scan: fix enumeration (visited) flags for bus rescans
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Octavian Purdila <octavian.purdila@intel.com>
+commit 10c7e20b2ff3caa5a8c0e7d60aef5a9c86e60ce8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/10c7e20b.failed
+
+If the ACPI tables change as a result of a dinamically loaded table
+and a bus rescan is required the enumeration/visited flag are not
+consistent.
+
+I2C/SPI are not directly enumerated in acpi_bus_attach(), however
+the visited flag is set. This makes it impossible to check if an
+ACPI device has already been enumerated by the I2C and SPI
+subsystems. To fix this issue we only set the visited flags if
+the device is not I2C or SPI.
+
+With this change we also need to remove setting visited to false
+from acpi_bus_attach(), otherwise if we rescan already enumerated
+I2C/SPI devices we try to re-enumerate them.
+
+Note that I2C/SPI devices can be enumerated either via a scan handler
+(when using PRP0001) or via regular device_attach(). In either case
+the flow goes through acpi_default_enumeration() which makes it the
+ideal place to mark the ACPI device as enumerated.
+
+	Signed-off-by: Octavian Purdila <octavian.purdila@intel.com>
+	Reviewed-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 10c7e20b2ff3caa5a8c0e7d60aef5a9c86e60ce8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/scan.c
+diff --cc drivers/acpi/scan.c
+index f22337d9eb20,f80f8a747294..000000000000
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@@ -1576,9 -1406,10 +1576,9 @@@ void acpi_init_device_object(struct acp
+  	acpi_bus_get_flags(device);
+  	device->flags.match_driver = false;
+  	device->flags.initialized = true;
+- 	device->flags.visited = false;
++ 	acpi_device_clear_enumerated(device);
+  	device_initialize(&device->dev);
+  	dev_set_uevent_suppress(&device->dev, true);
+ -	acpi_init_coherency(device);
+  }
+  
+  void acpi_device_add_finalize(struct acpi_device *device)
+@@@ -1801,10 -1683,35 +1801,12 @@@ static void acpi_default_enumeration(st
+  	acpi_dev_get_resources(device, &resource_list, acpi_check_spi_i2c_slave,
+  			       &is_spi_i2c_slave);
+  	acpi_dev_free_resource_list(&resource_list);
+- 	if (!is_spi_i2c_slave)
++ 	if (!is_spi_i2c_slave) {
+  		acpi_create_platform_device(device);
++ 		acpi_device_set_enumerated(device);
++ 	}
+  }
+  
+ -static const struct acpi_device_id generic_device_ids[] = {
+ -	{ACPI_DT_NAMESPACE_HID, },
+ -	{"", },
+ -};
+ -
+ -static int acpi_generic_device_attach(struct acpi_device *adev,
+ -				      const struct acpi_device_id *not_used)
+ -{
+ -	/*
+ -	 * Since ACPI_DT_NAMESPACE_HID is the only ID handled here, the test
+ -	 * below can be unconditional.
+ -	 */
+ -	if (adev->data.of_compatible)
+ -		acpi_default_enumeration(adev);
+ -
+ -	return 1;
+ -}
+ -
+ -static struct acpi_scan_handler generic_device_handler = {
+ -	.ids = generic_device_ids,
+ -	.attach = acpi_generic_device_attach,
+ -};
+ -
+  static int acpi_scan_attach_handler(struct acpi_device *device)
+  {
+  	struct acpi_hardware_id *hwid;
+@@@ -1844,17 -1753,22 +1846,22 @@@ static void acpi_bus_attach(struct acpi
+  	acpi_bus_get_status(device);
+  	/* Skip devices that are not present. */
+  	if (!acpi_device_is_present(device)) {
+++<<<<<<< HEAD
+ +		device->flags.visited = false;
+++=======
++ 		acpi_device_clear_enumerated(device);
++ 		device->flags.power_manageable = 0;
+++>>>>>>> 10c7e20b2ff3 (ACPI / scan: fix enumeration (visited) flags for bus rescans)
+  		return;
+  	}
+  	if (device->handler)
+  		goto ok;
+  
+  	if (!device->flags.initialized) {
+ -		device->flags.power_manageable =
+ -			device->power.states[ACPI_STATE_D0].flags.valid;
+ -		if (acpi_bus_init_power(device))
+ -			device->flags.power_manageable = 0;
+ -
+ +		acpi_bus_update_power(device, NULL);
+  		device->flags.initialized = true;
+  	}
+- 	device->flags.visited = false;
++ 
+  	ret = acpi_scan_attach_handler(device);
+  	if (ret < 0)
+  		return;
+@@@ -1864,8 -1778,10 +1871,7 @@@
+  		ret = device_attach(&device->dev);
+  		if (ret < 0)
+  			return;
+ -
+ -		if (!ret && device->pnp.type.platform_id)
+ -			acpi_default_enumeration(device);
+  	}
+- 	device->flags.visited = true;
+  
+   ok:
+  	list_for_each_entry(child, &device->children, node)
+* Unmerged path drivers/acpi/scan.c
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 33441e6bdf2b..2cbe2dda4a8b 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -457,6 +457,16 @@ extern bool acpi_driver_match_device(struct device *dev,
+ struct platform_device *acpi_create_platform_device(struct acpi_device *);
+ #define ACPI_PTR(_ptr)	(_ptr)
+ 
++static inline void acpi_device_set_enumerated(struct acpi_device *adev)
++{
++	adev->flags.visited = true;
++}
++
++static inline void acpi_device_clear_enumerated(struct acpi_device *adev)
++{
++	adev->flags.visited = false;
++}
++
+ #else	/* !CONFIG_ACPI */
+ 
+ #define acpi_disabled 1
+@@ -573,6 +583,14 @@ static inline bool acpi_driver_match_device(struct device *dev,
+ 
+ #define ACPI_PTR(_ptr)	(NULL)
+ 
++static inline void acpi_device_set_enumerated(struct acpi_device *adev)
++{
++}
++
++static inline void acpi_device_clear_enumerated(struct acpi_device *adev)
++{
++}
++
+ #endif	/* !CONFIG_ACPI */
+ 
+ #ifdef CONFIG_ACPI
