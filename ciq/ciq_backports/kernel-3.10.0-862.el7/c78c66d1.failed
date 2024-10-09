@@ -1,0 +1,297 @@
+radix-tree: implement radix_tree_maybe_preload_order()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit c78c66d1ddfdbd2353f3fcfeba0268524537b096
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c78c66d1.failed
+
+The new helper is similar to radix_tree_maybe_preload(), but tries to
+preload number of nodes required to insert (1 << order) continuous
+naturally-aligned elements.
+
+This is required to push huge pages into pagecache.
+
+Link: http://lkml.kernel.org/r/1466021202-61880-24-git-send-email-kirill.shutemov@linux.intel.com
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c78c66d1ddfdbd2353f3fcfeba0268524537b096)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/radix-tree.c
+diff --cc lib/radix-tree.c
+index 31edcb4c659f,61b8fb529cef..000000000000
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@@ -34,15 -35,12 +34,18 @@@
+  #include <linux/string.h>
+  #include <linux/bitops.h>
+  #include <linux/rcupdate.h>
+ -#include <linux/preempt.h>		/* in_interrupt() */
+ +#include <linux/preempt_mask.h>		/* in_interrupt() */
+  
+  
++ /* Number of nodes in fully populated tree of given height */
++ static unsigned long height_to_maxnodes[RADIX_TREE_MAX_PATH + 1] __read_mostly;
++ 
+ +/*
+ + * The height_to_maxindex array needs to be one deeper than the maximum
+ + * path as height 0 holds only 1 entry.
+ + */
+ +static unsigned long height_to_maxindex[RADIX_TREE_MAX_PATH + 1] __read_mostly;
+ +
+  /*
+   * Radix tree node cache.
+   */
+@@@ -328,27 -343,30 +331,41 @@@ radix_tree_node_free(struct radix_tree_
+   * with preemption not disabled.
+   *
+   * To make use of this facility, the radix tree must be initialised without
+ - * __GFP_DIRECT_RECLAIM being passed to INIT_RADIX_TREE().
+ + * __GFP_WAIT being passed to INIT_RADIX_TREE().
+   */
+- static int __radix_tree_preload(gfp_t gfp_mask)
++ static int __radix_tree_preload(gfp_t gfp_mask, int nr)
+  {
+  	struct radix_tree_preload *rtp;
+  	struct radix_tree_node *node;
+  	int ret = -ENOMEM;
+  
+  	preempt_disable();
+++<<<<<<< HEAD
+ +	rtp = &__get_cpu_var(radix_tree_preloads);
+ +	while (rtp->nr < ARRAY_SIZE(rtp->nodes)) {
+++=======
++ 	rtp = this_cpu_ptr(&radix_tree_preloads);
++ 	while (rtp->nr < nr) {
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+  		preempt_enable();
+  		node = kmem_cache_alloc(radix_tree_node_cachep, gfp_mask);
+  		if (node == NULL)
+  			goto out;
+  		preempt_disable();
+++<<<<<<< HEAD
+ +		rtp = &__get_cpu_var(radix_tree_preloads);
+ +		if (rtp->nr < ARRAY_SIZE(rtp->nodes))
+ +			rtp->nodes[rtp->nr++] = node;
+ +		else
+++=======
++ 		rtp = this_cpu_ptr(&radix_tree_preloads);
++ 		if (rtp->nr < nr) {
++ 			node->private_data = rtp->nodes;
++ 			rtp->nodes = node;
++ 			rtp->nr++;
++ 		} else {
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+  			kmem_cache_free(radix_tree_node_cachep, node);
+ -		}
+  	}
+  	ret = 0;
+  out:
+@@@ -367,8 -385,8 +384,13 @@@
+  int radix_tree_preload(gfp_t gfp_mask)
+  {
+  	/* Warn on non-sensical use... */
+++<<<<<<< HEAD
+ +	WARN_ON_ONCE(!(gfp_mask & __GFP_WAIT));
+ +	return __radix_tree_preload(gfp_mask);
+++=======
++ 	WARN_ON_ONCE(!gfpflags_allow_blocking(gfp_mask));
++ 	return __radix_tree_preload(gfp_mask, RADIX_TREE_PRELOAD_SIZE);
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+  }
+  EXPORT_SYMBOL(radix_tree_preload);
+  
+@@@ -379,8 -397,8 +401,13 @@@
+   */
+  int radix_tree_maybe_preload(gfp_t gfp_mask)
+  {
+++<<<<<<< HEAD
+ +	if (gfp_mask & __GFP_WAIT)
+ +		return __radix_tree_preload(gfp_mask);
+++=======
++ 	if (gfpflags_allow_blocking(gfp_mask))
++ 		return __radix_tree_preload(gfp_mask, RADIX_TREE_PRELOAD_SIZE);
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+  	/* Preloading doesn't help anything with this gfp mask, skip it */
+  	preempt_disable();
+  	return 0;
+@@@ -388,12 -406,56 +415,61 @@@
+  EXPORT_SYMBOL(radix_tree_maybe_preload);
+  
+  /*
+++<<<<<<< HEAD
+ + *	Return the maximum key which can be store into a
+ + *	radix tree with height HEIGHT.
+++=======
++  * The same as function above, but preload number of nodes required to insert
++  * (1 << order) continuous naturally-aligned elements.
++  */
++ int radix_tree_maybe_preload_order(gfp_t gfp_mask, int order)
++ {
++ 	unsigned long nr_subtrees;
++ 	int nr_nodes, subtree_height;
++ 
++ 	/* Preloading doesn't help anything with this gfp mask, skip it */
++ 	if (!gfpflags_allow_blocking(gfp_mask)) {
++ 		preempt_disable();
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Calculate number and height of fully populated subtrees it takes to
++ 	 * store (1 << order) elements.
++ 	 */
++ 	nr_subtrees = 1 << order;
++ 	for (subtree_height = 0; nr_subtrees > RADIX_TREE_MAP_SIZE;
++ 			subtree_height++)
++ 		nr_subtrees >>= RADIX_TREE_MAP_SHIFT;
++ 
++ 	/*
++ 	 * The worst case is zero height tree with a single item at index 0 and
++ 	 * then inserting items starting at ULONG_MAX - (1 << order).
++ 	 *
++ 	 * This requires RADIX_TREE_MAX_PATH nodes to build branch from root to
++ 	 * 0-index item.
++ 	 */
++ 	nr_nodes = RADIX_TREE_MAX_PATH;
++ 
++ 	/* Plus branch to fully populated subtrees. */
++ 	nr_nodes += RADIX_TREE_MAX_PATH - subtree_height;
++ 
++ 	/* Root node is shared. */
++ 	nr_nodes--;
++ 
++ 	/* Plus nodes required to build subtrees. */
++ 	nr_nodes += nr_subtrees * height_to_maxnodes[subtree_height];
++ 
++ 	return __radix_tree_preload(gfp_mask, nr_nodes);
++ }
++ 
++ /*
++  * The maximum index which can be stored in a radix tree
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+   */
+ -static inline unsigned long shift_maxindex(unsigned int shift)
+ +static inline unsigned long radix_tree_maxindex(unsigned int height)
+  {
+ -	return (RADIX_TREE_MAP_SIZE << shift) - 1;
+ +	return height_to_maxindex[height];
+  }
+  
+  static inline unsigned long node_maxindex(struct radix_tree_node *node)
+@@@ -1610,43 -1620,48 +1686,72 @@@ radix_tree_node_ctor(void *arg
+  }
+  
+  static __init unsigned long __maxindex(unsigned int height)
+++<<<<<<< HEAD
+++=======
++ {
++ 	unsigned int width = height * RADIX_TREE_MAP_SHIFT;
++ 	int shift = RADIX_TREE_INDEX_BITS - width;
++ 
++ 	if (shift < 0)
++ 		return ~0UL;
++ 	if (shift >= BITS_PER_LONG)
++ 		return 0UL;
++ 	return ~0UL >> shift;
++ }
++ 
++ static __init void radix_tree_init_maxnodes(void)
++ {
++ 	unsigned long height_to_maxindex[RADIX_TREE_MAX_PATH + 1];
++ 	unsigned int i, j;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(height_to_maxindex); i++)
++ 		height_to_maxindex[i] = __maxindex(i);
++ 	for (i = 0; i < ARRAY_SIZE(height_to_maxnodes); i++) {
++ 		for (j = i; j > 0; j--)
++ 			height_to_maxnodes[i] += height_to_maxindex[j - 1] + 1;
++ 	}
++ }
++ 
++ static int radix_tree_callback(struct notifier_block *nfb,
++ 				unsigned long action, void *hcpu)
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+  {
+ -	int cpu = (long)hcpu;
+ -	struct radix_tree_preload *rtp;
+ -	struct radix_tree_node *node;
+ +	unsigned int width = height * RADIX_TREE_MAP_SHIFT;
+ +	int shift = RADIX_TREE_INDEX_BITS - width;
+  
+ -	/* Free per-cpu pool of preloaded nodes */
+ -	if (action == CPU_DEAD || action == CPU_DEAD_FROZEN) {
+ -		rtp = &per_cpu(radix_tree_preloads, cpu);
+ -		while (rtp->nr) {
+ -			node = rtp->nodes;
+ -			rtp->nodes = node->private_data;
+ -			kmem_cache_free(radix_tree_node_cachep, node);
+ -			rtp->nr--;
+ -		}
+ -	}
+ -	return NOTIFY_OK;
+ +	if (shift < 0)
+ +		return ~0UL;
+ +	if (shift >= BITS_PER_LONG)
+ +		return 0UL;
+ +	return ~0UL >> shift;
+ +}
+ +
+ +static __init void radix_tree_init_maxindex(void)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < ARRAY_SIZE(height_to_maxindex); i++)
+ +		height_to_maxindex[i] = __maxindex(i);
+ +}
+ +
+ +static int radix_tree_callback(struct notifier_block *nfb,
+ +                            unsigned long action,
+ +                            void *hcpu)
+ +{
+ +       int cpu = (long)hcpu;
+ +       struct radix_tree_preload *rtp;
+ +
+ +       /* Free per-cpu pool of perloaded nodes */
+ +       if (action == CPU_DEAD || action == CPU_DEAD_FROZEN) {
+ +               rtp = &per_cpu(radix_tree_preloads, cpu);
+ +               while (rtp->nr) {
+ +                       kmem_cache_free(radix_tree_node_cachep,
+ +                                       rtp->nodes[rtp->nr-1]);
+ +                       rtp->nodes[rtp->nr-1] = NULL;
+ +                       rtp->nr--;
+ +               }
+ +       }
+ +       return NOTIFY_OK;
+  }
+  
+  void __init radix_tree_init(void)
+@@@ -1655,6 -1670,6 +1760,10 @@@
+  			sizeof(struct radix_tree_node), 0,
+  			SLAB_PANIC | SLAB_RECLAIM_ACCOUNT,
+  			radix_tree_node_ctor);
+++<<<<<<< HEAD
+ +	radix_tree_init_maxindex();
+++=======
++ 	radix_tree_init_maxnodes();
+++>>>>>>> c78c66d1ddfd (radix-tree: implement radix_tree_maybe_preload_order())
+  	hotcpu_notifier(radix_tree_callback, 0);
+  }
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index 497bd1a32159..388a43e11d9e 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -290,6 +290,7 @@ unsigned int radix_tree_gang_lookup_slot(struct radix_tree_root *root,
+ 			unsigned long first_index, unsigned int max_items);
+ int radix_tree_preload(gfp_t gfp_mask);
+ int radix_tree_maybe_preload(gfp_t gfp_mask);
++int radix_tree_maybe_preload_order(gfp_t gfp_mask, int order);
+ void radix_tree_init(void);
+ void *radix_tree_tag_set(struct radix_tree_root *root,
+ 			unsigned long index, unsigned int tag);
+* Unmerged path lib/radix-tree.c
