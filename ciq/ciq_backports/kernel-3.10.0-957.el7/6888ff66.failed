@@ -1,0 +1,174 @@
+perf evlist: Remove stale mmap read for backward
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit 6888ff66c44ffa3077ed69e978902d0ff4b84ae1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6888ff66.failed
+
+perf_evlist__mmap_read_catchup() and perf_evlist__mmap_read_backward()
+are only for overwrite mode.
+
+But they read the evlist->mmap buffer which is for non-overwrite mode.
+
+It did not bring any serious problem yet, because there is no one use
+it.
+
+Remove the unused interfaces.
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Acked-by: Wang Nan <wangnan0@huawei.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jin Yao <yao.jin@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1516310792-208685-2-git-send-email-kan.liang@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 6888ff66c44ffa3077ed69e978902d0ff4b84ae1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evlist.c
+diff --cc tools/perf/util/evlist.c
+index 0abcf97f8546,e5fc14e53c05..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -837,114 -712,17 +837,105 @@@ union perf_event *perf_evlist__mmap_rea
+  	 * No need for read-write ring buffer: kernel stop outputting when
+  	 * it hit md->prev (perf_mmap__consume()).
+  	 */
+ -	return perf_mmap__read_forward(md);
+ +	return perf_mmap__read_forward(md, evlist->overwrite);
+  }
+  
+- union perf_event *perf_evlist__mmap_read_backward(struct perf_evlist *evlist, int idx)
+- {
+- 	struct perf_mmap *md = &evlist->mmap[idx];
+- 
+- 	/*
+- 	 * No need to check messup for backward ring buffer:
+- 	 * We can always read arbitrary long data from a backward
+- 	 * ring buffer unless we forget to pause it before reading.
+- 	 */
+- 	return perf_mmap__read_backward(md);
+- }
+- 
+  union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
+  {
+  	return perf_evlist__mmap_read_forward(evlist, idx);
+  }
+  
+++<<<<<<< HEAD
+ +void perf_mmap__read_catchup(struct perf_mmap *md)
+ +{
+ +	u64 head;
+ +
+ +	if (!refcount_read(&md->refcnt))
+ +		return;
+ +
+ +	head = perf_mmap__read_head(md);
+ +	md->prev = head;
+ +}
+ +
+ +void perf_evlist__mmap_read_catchup(struct perf_evlist *evlist, int idx)
+ +{
+ +	perf_mmap__read_catchup(&evlist->mmap[idx]);
+ +}
+ +
+ +static bool perf_mmap__empty(struct perf_mmap *md)
+ +{
+ +	return perf_mmap__read_head(md) == md->prev && !md->auxtrace_mmap.base;
+ +}
+ +
+ +static void perf_mmap__get(struct perf_mmap *map)
+ +{
+ +	refcount_inc(&map->refcnt);
+ +}
+ +
+ +static void perf_mmap__put(struct perf_mmap *md)
+ +{
+ +	BUG_ON(md->base && refcount_read(&md->refcnt) == 0);
+ +
+ +	if (refcount_dec_and_test(&md->refcnt))
+ +		perf_mmap__munmap(md);
+ +}
+ +
+ +void perf_mmap__consume(struct perf_mmap *md, bool overwrite)
+ +{
+ +	if (!overwrite) {
+ +		u64 old = md->prev;
+ +
+ +		perf_mmap__write_tail(md, old);
+ +	}
+ +
+ +	if (refcount_read(&md->refcnt) == 1 && perf_mmap__empty(md))
+ +		perf_mmap__put(md);
+ +}
+ +
+++=======
+++>>>>>>> 6888ff66c44f (perf evlist: Remove stale mmap read for backward)
+  void perf_evlist__mmap_consume(struct perf_evlist *evlist, int idx)
+  {
+ -	perf_mmap__consume(&evlist->mmap[idx], false);
+ +	perf_mmap__consume(&evlist->mmap[idx], evlist->overwrite);
+ +}
+ +
+ +int __weak auxtrace_mmap__mmap(struct auxtrace_mmap *mm __maybe_unused,
+ +			       struct auxtrace_mmap_params *mp __maybe_unused,
+ +			       void *userpg __maybe_unused,
+ +			       int fd __maybe_unused)
+ +{
+ +	return 0;
+ +}
+ +
+ +void __weak auxtrace_mmap__munmap(struct auxtrace_mmap *mm __maybe_unused)
+ +{
+ +}
+ +
+ +void __weak auxtrace_mmap_params__init(
+ +			struct auxtrace_mmap_params *mp __maybe_unused,
+ +			off_t auxtrace_offset __maybe_unused,
+ +			unsigned int auxtrace_pages __maybe_unused,
+ +			bool auxtrace_overwrite __maybe_unused)
+ +{
+ +}
+ +
+ +void __weak auxtrace_mmap_params__set_idx(
+ +			struct auxtrace_mmap_params *mp __maybe_unused,
+ +			struct perf_evlist *evlist __maybe_unused,
+ +			int idx __maybe_unused,
+ +			bool per_cpu __maybe_unused)
+ +{
+ +}
+ +
+ +static void perf_mmap__munmap(struct perf_mmap *map)
+ +{
+ +	if (map->base != NULL) {
+ +		munmap(map->base, perf_mmap__mmap_len(map));
+ +		map->base = NULL;
+ +		map->fd = -1;
+ +		refcount_set(&map->refcnt, 0);
+ +	}
+ +	auxtrace_mmap__munmap(&map->auxtrace_mmap);
+  }
+  
+  static void perf_evlist__munmap_nofree(struct perf_evlist *evlist)
+* Unmerged path tools/perf/util/evlist.c
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 8cb6e907ffcd..c5a0158ba5ad 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -185,10 +185,6 @@ union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx);
+ 
+ union perf_event *perf_evlist__mmap_read_forward(struct perf_evlist *evlist,
+ 						 int idx);
+-union perf_event *perf_evlist__mmap_read_backward(struct perf_evlist *evlist,
+-						  int idx);
+-void perf_evlist__mmap_read_catchup(struct perf_evlist *evlist, int idx);
+-
+ void perf_evlist__mmap_consume(struct perf_evlist *evlist, int idx);
+ 
+ int perf_evlist__open(struct perf_evlist *evlist);
