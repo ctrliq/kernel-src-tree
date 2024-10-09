@@ -1,0 +1,320 @@
+nfp: bpf: prepare for parsing BPF FW capabilities
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 77a844ee650cdafd82d13c40f587892c79e77c77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/77a844ee.failed
+
+BPF FW creates a run time symbol called bpf_capabilities which
+contains TLV-formatted capability information.  Allocate app
+private structure to store parsed capabilities and add a skeleton
+of parsing logic.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 77a844ee650cdafd82d13c40f587892c79e77c77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index de79faf0874b,fa2905e67b07..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@@ -51,81 -52,98 +52,119 @@@
+  #include "../nfp_net_ctrl.h"
+  #include "../nfp_net.h"
+  
+ -static int
+ -nfp_prog_prepare(struct nfp_prog *nfp_prog, const struct bpf_insn *prog,
+ -		 unsigned int cnt)
+ +void nfp_net_filter_stats_timer(unsigned long data)
+  {
+ -	struct nfp_insn_meta *meta;
+ -	unsigned int i;
+ +	struct nfp_net *nn = (void *)data;
+ +	struct nfp_net_bpf_priv *priv;
+ +	struct nfp_stat_pair latest;
+  
+ -	for (i = 0; i < cnt; i++) {
+ -		meta = kzalloc(sizeof(*meta), GFP_KERNEL);
+ -		if (!meta)
+ -			return -ENOMEM;
+ +	priv = nn->app_priv;
+  
+ -		meta->insn = prog[i];
+ -		meta->n = i;
+ +	spin_lock_bh(&priv->rx_filter_lock);
+  
+ -		list_add_tail(&meta->l, &nfp_prog->insns);
+ -	}
+ +	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ +		mod_timer(&priv->rx_filter_stats_timer,
+ +			  jiffies + NFP_NET_STAT_POLL_IVL);
+  
+ -	/* Another pass to record jump information. */
+ -	list_for_each_entry(meta, &nfp_prog->insns, l) {
+ -		u64 code = meta->insn.code;
+ +	spin_unlock_bh(&priv->rx_filter_lock);
+  
+ -		if (BPF_CLASS(code) == BPF_JMP && BPF_OP(code) != BPF_EXIT &&
+ -		    BPF_OP(code) != BPF_CALL) {
+ -			struct nfp_insn_meta *dst_meta;
+ -			unsigned short dst_indx;
+ +	latest.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	latest.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+  
+ -			dst_indx = meta->n + 1 + meta->insn.off;
+ -			dst_meta = nfp_bpf_goto_meta(nfp_prog, meta, dst_indx,
+ -						     cnt);
+ +	if (latest.pkts != priv->rx_filter.pkts)
+ +		priv->rx_filter_change = jiffies;
+  
+ -			meta->jmp_dst = dst_meta;
+ -			dst_meta->flags |= FLAG_INSN_IS_JUMP_DST;
+ -		}
+ -	}
+ +	priv->rx_filter = latest;
+ +}
+  
+ -	return 0;
+ +#if 0 /* Not in RHEL7 */
+ +static void nfp_net_bpf_stats_reset(struct nfp_net *nn)
+ +{
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +
+ +	priv->rx_filter.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	priv->rx_filter.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +	priv->rx_filter_prev = priv->rx_filter;
+ +	priv->rx_filter_change = jiffies;
+  }
+  
+ -static void nfp_prog_free(struct nfp_prog *nfp_prog)
+ +static int
+ +nfp_net_bpf_stats_update(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+ -	struct nfp_insn_meta *meta, *tmp;
+ +	struct tc_action *a;
+ +	LIST_HEAD(actions);
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +	u64 bytes, pkts;
+  
+ -	list_for_each_entry_safe(meta, tmp, &nfp_prog->insns, l) {
+ -		list_del(&meta->l);
+ -		kfree(meta);
+ -	}
+ -	kfree(nfp_prog);
+ +	pkts = priv->rx_filter.pkts - priv->rx_filter_prev.pkts;
+ +	bytes = priv->rx_filter.bytes - priv->rx_filter_prev.bytes;
+ +	bytes -= pkts * ETH_HLEN;
+ +
+ +	priv->rx_filter_prev = priv->rx_filter;
+ +
+ +	preempt_disable();
+ +
+ +	tcf_exts_to_list(cls_bpf->exts, &actions);
+ +	list_for_each_entry(a, &actions, list)
+ +		tcf_action_stats_update(a, bytes, pkts, nn->rx_filter_change);
+ +
+ +	preempt_enable();
+ +
+ +	return 0;
+  }
+  
+ -int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
+ -			  struct netdev_bpf *bpf)
+ +static int
+ +nfp_net_bpf_get_act(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+ -	struct bpf_prog *prog = bpf->verifier.prog;
+ -	struct nfp_prog *nfp_prog;
+ -	int ret;
+ +	const struct tc_action *a;
+ +	LIST_HEAD(actions);
+ +
+ +	if (!cls_bpf->exts)
+ +		return NN_ACT_XDP;
+ +
+ +	/* TC direct action */
+ +	if (cls_bpf->exts_integrated) {
+ +		if (tc_no_actions(cls_bpf->exts))
+ +			return NN_ACT_DIRECT;
+  
+++<<<<<<< HEAD
+++=======
++ 	nfp_prog = kzalloc(sizeof(*nfp_prog), GFP_KERNEL);
++ 	if (!nfp_prog)
++ 		return -ENOMEM;
++ 	prog->aux->offload->dev_priv = nfp_prog;
++ 
++ 	INIT_LIST_HEAD(&nfp_prog->insns);
++ 	nfp_prog->type = prog->type;
++ 	nfp_prog->bpf = app->priv;
++ 
++ 	ret = nfp_prog_prepare(nfp_prog, prog->insnsi, prog->len);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	nfp_prog->verifier_meta = nfp_prog_first_meta(nfp_prog);
++ 	bpf->verifier.ops = &nfp_bpf_analyzer_ops;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	nfp_prog_free(nfp_prog);
++ 
++ 	return ret;
++ }
++ 
++ int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
++ 		      struct bpf_prog *prog)
++ {
++ 	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
++ 	unsigned int stack_size;
++ 	unsigned int max_instr;
++ 
++ 	stack_size = nn_readb(nn, NFP_NET_CFG_BPF_STACK_SZ) * 64;
++ 	if (prog->aux->stack_depth > stack_size) {
++ 		nn_info(nn, "stack too large: program %dB > FW stack %dB\n",
++ 			prog->aux->stack_depth, stack_size);
+++>>>>>>> 77a844ee650c (nfp: bpf: prepare for parsing BPF FW capabilities)
+  		return -EOPNOTSUPP;
+  	}
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.c b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 4ca14182b178..277fbcd6817e 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -34,6 +34,7 @@
+ #include <net/pkt_cls.h>
+ 
+ #include "../nfpcore/nfp_cpp.h"
++#include "../nfpcore/nfp_nffw.h"
+ #include "../nfp_app.h"
+ #include "../nfp_main.h"
+ #include "../nfp_net.h"
+@@ -141,10 +142,84 @@ static bool nfp_bpf_tc_busy(struct nfp_app *app, struct nfp_net *nn)
+ 	return nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF;
+ }
+ 
++static int nfp_bpf_parse_capabilities(struct nfp_app *app)
++{
++	struct nfp_cpp *cpp = app->pf->cpp;
++	struct nfp_cpp_area *area;
++	u8 __iomem *mem, *start;
++
++	mem = nfp_rtsym_map(app->pf->rtbl, "_abi_bpf_capabilities", "bpf.cap",
++			    8, &area);
++	if (IS_ERR(mem))
++		return PTR_ERR(mem) == -ENOENT ? 0 : PTR_ERR(mem);
++
++	start = mem;
++	while (mem - start + 8 < nfp_cpp_area_size(area)) {
++		u32 type, length;
++
++		type = readl(mem);
++		length = readl(mem + 4);
++
++		mem += 8 + length;
++		if (mem - start > nfp_cpp_area_size(area))
++			goto err_release_free;
++
++		switch (type) {
++		default:
++			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
++			break;
++		}
++	}
++	if (mem - start != nfp_cpp_area_size(area)) {
++		nfp_err(cpp, "BPF capabilities left after parsing, parsed:%lu total length:%lu\n",
++			mem - start, nfp_cpp_area_size(area));
++		goto err_release_free;
++	}
++
++	nfp_cpp_area_release_free(area);
++
++	return 0;
++
++err_release_free:
++	nfp_err(cpp, "invalid BPF capabilities at offset:%ld\n", mem - start);
++	nfp_cpp_area_release_free(area);
++	return -EINVAL;
++}
++
++static int nfp_bpf_init(struct nfp_app *app)
++{
++	struct nfp_app_bpf *bpf;
++	int err;
++
++	bpf = kzalloc(sizeof(*bpf), GFP_KERNEL);
++	if (!bpf)
++		return -ENOMEM;
++	bpf->app = app;
++	app->priv = bpf;
++
++	err = nfp_bpf_parse_capabilities(app);
++	if (err)
++		goto err_free_bpf;
++
++	return 0;
++
++err_free_bpf:
++	kfree(bpf);
++	return err;
++}
++
++static void nfp_bpf_clean(struct nfp_app *app)
++{
++	kfree(app->priv);
++}
++
+ const struct nfp_app_type app_bpf = {
+ 	.id		= NFP_APP_BPF_NIC,
+ 	.name		= "ebpf",
+ 
++	.init		= nfp_bpf_init,
++	.clean		= nfp_bpf_clean,
++
+ 	.extra_cap	= nfp_bpf_extra_cap,
+ 
+ 	.vnic_alloc	= nfp_bpf_vnic_alloc,
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7..e89307a66fe2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -85,6 +85,14 @@ enum nfp_bpf_action_type {
+ #define NFP_BPF_ABI_FLAGS	reg_imm(0)
+ #define   NFP_BPF_ABI_FLAG_MARK	1
+ 
++/**
++ * struct nfp_app_bpf - bpf app priv structure
++ * @app:		backpointer to the app
++ */
++struct nfp_app_bpf {
++	struct nfp_app *app;
++};
++
+ struct nfp_prog;
+ struct nfp_insn_meta;
+ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+@@ -143,6 +151,7 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+ 
+ /**
+  * struct nfp_prog - nfp BPF program
++ * @bpf: backpointer to the bpf app priv structure
+  * @prog: machine code
+  * @prog_len: number of valid instructions in @prog array
+  * @__prog_alloc_len: alloc size of @prog array
+@@ -160,6 +169,8 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
++	struct nfp_app_bpf *bpf;
++
+ 	u64 *prog;
+ 	unsigned int prog_len;
+ 	unsigned int __prog_alloc_len;
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/offload.c
