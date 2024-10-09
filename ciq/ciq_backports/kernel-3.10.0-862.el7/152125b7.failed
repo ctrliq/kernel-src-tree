@@ -1,0 +1,402 @@
+s390/mm: implement dirty bits for large segment table entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] mm: implement dirty bits for large segment table entries (Hendrik Brueckner) [1489742]
+Rebuild_FUZZ: 95.73%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 152125b7a882df36a55a8eadbea6d0edf1461ee7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/152125b7.failed
+
+The large segment table entry format has block of bits for the
+ACC/F values for the large page. These bits are valid only if
+another bit (AV bit 0x10000) of the segment table entry is set.
+The ACC/F bits do not have a meaning if the AV bit is off.
+This allows to put the THP splitting bit, the segment young bit
+and the new segment dirty bit into the ACC/F bits as long as
+the AV bit stays off. The dirty and young information is only
+available if the pmd is large.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 152125b7a882df36a55a8eadbea6d0edf1461ee7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pgtable.h
+#	arch/s390/mm/hugetlbpage.c
+diff --cc arch/s390/include/asm/pgtable.h
+index cff6ed1e6f32,b76317c1f3eb..000000000000
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@@ -352,12 -355,9 +359,12 @@@ extern unsigned long MODULES_END
+  #define _REGION3_ENTRY_RO	0x200	/* page protection bit		    */
+  #define _REGION3_ENTRY_CO	0x100	/* change-recording override	    */
+  
+ +#define _REGION_ENTRY_BITS	0xfffffffffffff227UL
+ +#define _REGION_ENTRY_BITS_LARGE 0xffffffff8000fe27UL
+ +
+  /* Bits in the segment table entry */
+  #define _SEGMENT_ENTRY_BITS	0xfffffffffffffe33UL
+- #define _SEGMENT_ENTRY_BITS_LARGE 0xfffffffffff1ff33UL
++ #define _SEGMENT_ENTRY_BITS_LARGE 0xfffffffffff0ff33UL
+  #define _SEGMENT_ENTRY_ORIGIN_LARGE ~0xfffffUL /* large page address	    */
+  #define _SEGMENT_ENTRY_ORIGIN	~0x7ffUL/* segment table origin		    */
+  #define _SEGMENT_ENTRY_PROTECT	0x200	/* page protection bit		    */
+@@@ -455,21 -466,25 +466,22 @@@
+   * Segment entry (large page) protection definitions.
+   */
+  #define SEGMENT_NONE	__pgprot(_SEGMENT_ENTRY_INVALID | \
+- 				 _SEGMENT_ENTRY_NONE)
+- #define SEGMENT_READ	__pgprot(_SEGMENT_ENTRY_INVALID | \
+  				 _SEGMENT_ENTRY_PROTECT)
+- #define SEGMENT_WRITE	__pgprot(_SEGMENT_ENTRY_INVALID)
++ #define SEGMENT_READ	__pgprot(_SEGMENT_ENTRY_PROTECT | \
++ 				 _SEGMENT_ENTRY_READ)
++ #define SEGMENT_WRITE	__pgprot(_SEGMENT_ENTRY_READ | \
++ 				 _SEGMENT_ENTRY_WRITE)
+  
+ -static inline int mm_has_pgste(struct mm_struct *mm)
+ +static inline int mm_exclusive(struct mm_struct *mm)
+  {
+ -#ifdef CONFIG_PGSTE
+ -	if (unlikely(mm->context.has_pgste))
+ -		return 1;
+ -#endif
+ -	return 0;
+ +	return likely(mm == current->active_mm &&
+ +		      atomic_read(&mm->context.attach_count) <= 1);
+  }
+  
+ -static inline int mm_use_skey(struct mm_struct *mm)
+ +static inline int mm_has_pgste(struct mm_struct *mm)
+  {
+  #ifdef CONFIG_PGSTE
+ -	if (mm->context.use_skey)
+ +	if (unlikely(mm->context.has_pgste))
+  		return 1;
+  #endif
+  	return 0;
+@@@ -1348,8 -1403,7 +1360,12 @@@ static inline pmd_t *pmd_offset(pud_t *
+  #define pte_pfn(x) (pte_val(x) >> PAGE_SHIFT)
+  #define pte_page(x) pfn_to_page(pte_pfn(x))
+  
+++<<<<<<< HEAD
+ +#define pmd_page(pmd) pfn_to_page(pmd_val(pmd) >> PAGE_SHIFT)
+ +#define pud_page(pud) pfn_to_page(pud_pfn(pud))
+++=======
++ #define pmd_page(pmd) pfn_to_page(pmd_pfn(pmd))
+++>>>>>>> 152125b7a882 (s390/mm: implement dirty bits for large segment table entries)
+  
+  /* Find an entry in the lowest level page table.. */
+  #define pte_offset(pmd, addr) ((pte_t *) pmd_deref(*(pmd)) + pte_index(addr))
+@@@ -1457,18 -1501,69 +1507,11 @@@ static inline pmd_t mk_pmd_phys(unsigne
+  {
+  	pmd_t __pmd;
+  	pmd_val(__pmd) = physpage + massage_pgprot_pmd(pgprot);
+- 	return pmd_mkyoung(__pmd);
++ 	return __pmd;
+  }
+  
+- static inline pmd_t pmd_mkwrite(pmd_t pmd)
+- {
+- 	/* Do not clobber PROT_NONE segments! */
+- 	if (!pmd_prot_none(pmd))
+- 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_PROTECT;
+- 	return pmd;
+- }
+  #endif /* CONFIG_TRANSPARENT_HUGEPAGE || CONFIG_HUGETLB_PAGE */
+  
+ -static inline void __pmdp_csp(pmd_t *pmdp)
+ -{
+ -	register unsigned long reg2 asm("2") = pmd_val(*pmdp);
+ -	register unsigned long reg3 asm("3") = pmd_val(*pmdp) |
+ -					       _SEGMENT_ENTRY_INVALID;
+ -	register unsigned long reg4 asm("4") = ((unsigned long) pmdp) + 5;
+ -
+ -	asm volatile(
+ -		"	csp %1,%3"
+ -		: "=m" (*pmdp)
+ -		: "d" (reg2), "d" (reg3), "d" (reg4), "m" (*pmdp) : "cc");
+ -}
+ -
+ -static inline void __pmdp_idte(unsigned long address, pmd_t *pmdp)
+ -{
+ -	unsigned long sto;
+ -
+ -	sto = (unsigned long) pmdp - pmd_index(address) * sizeof(pmd_t);
+ -	asm volatile(
+ -		"	.insn	rrf,0xb98e0000,%2,%3,0,0"
+ -		: "=m" (*pmdp)
+ -		: "m" (*pmdp), "a" (sto), "a" ((address & HPAGE_MASK))
+ -		: "cc" );
+ -}
+ -
+ -static inline void __pmdp_idte_local(unsigned long address, pmd_t *pmdp)
+ -{
+ -	unsigned long sto;
+ -
+ -	sto = (unsigned long) pmdp - pmd_index(address) * sizeof(pmd_t);
+ -	asm volatile(
+ -		"	.insn	rrf,0xb98e0000,%2,%3,0,1"
+ -		: "=m" (*pmdp)
+ -		: "m" (*pmdp), "a" (sto), "a" ((address & HPAGE_MASK))
+ -		: "cc" );
+ -}
+ -
+ -static inline void pmdp_flush_direct(struct mm_struct *mm,
+ -				     unsigned long address, pmd_t *pmdp)
+ -{
+ -	int active, count;
+ -
+ -	if (pmd_val(*pmdp) & _SEGMENT_ENTRY_INVALID)
+ -		return;
+ -	if (!MACHINE_HAS_IDTE) {
+ -		__pmdp_csp(pmdp);
+ -		return;
+ -	}
+ -	active = (mm == current->active_mm) ? 1 : 0;
+ -	count = atomic_add_return(0x10000, &mm->context.attach_count);
+ -	if (MACHINE_HAS_TLB_LC && (count & 0xffff) <= active &&
+ -	    cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id())))
+ -		__pmdp_idte_local(address, pmdp);
+ -	else
+ -		__pmdp_idte(address, pmdp);
+ -	atomic_sub(0x10000, &mm->context.attach_count);
+ -}
+ -
+  static inline void pmdp_flush_lazy(struct mm_struct *mm,
+  				   unsigned long address, pmd_t *pmdp)
+  {
+diff --cc arch/s390/mm/hugetlbpage.c
+index 7b7d88b8af33,389bc17934b7..000000000000
+--- a/arch/s390/mm/hugetlbpage.c
++++ b/arch/s390/mm/hugetlbpage.c
+@@@ -8,88 -8,70 +8,146 @@@
+  #include <linux/mm.h>
+  #include <linux/hugetlb.h>
+  
+ -static inline pmd_t __pte_to_pmd(pte_t pte)
+ +static inline unsigned long __pte_to_rste(pte_t pte)
+  {
+++<<<<<<< HEAD
+ +	int none, young, prot;
+ +	unsigned long rste;
+ +
+ +	/*
+ +	 * Convert encoding		  pte bits	pmd/pud bits
+ +	 *				.IR...wrdytp	..R...I...y.
+ +	 * empty			.10...000000 -> ..0...1...0.
+ +	 * prot-none, clean, old	.11...000001 -> ..0...1...1.
+ +	 * prot-none, clean, young	.11...000101 -> ..1...1...1.
+ +	 * prot-none, dirty, old	.10...001001 -> ..0...1...1.
+ +	 * prot-none, dirty, young	.10...001101 -> ..1...1...1.
+ +	 * read-only, clean, old	.11...010001 -> ..1...1...0.
+ +	 * read-only, clean, young	.01...010101 -> ..1...0...1.
+ +	 * read-only, dirty, old	.11...011001 -> ..1...1...0.
+ +	 * read-only, dirty, young	.01...011101 -> ..1...0...1.
+ +	 * read-write, clean, old	.11...110001 -> ..0...1...0.
+ +	 * read-write, clean, young	.01...110101 -> ..0...0...1.
+ +	 * read-write, dirty, old	.10...111001 -> ..0...1...0.
+ +	 * read-write, dirty, young	.00...111101 -> ..0...0...1.
+ +	 * Huge ptes are dirty by definition, a clean pte is made dirty
+ +	 * by the conversion.
+ +	 */
+ +	if (pte_present(pte)) {
+ +		rste = pte_val(pte) & PAGE_MASK;
+ +		if (pte_val(pte) & _PAGE_INVALID)
+ +			rste |= _SEGMENT_ENTRY_INVALID;
+ +		none = (pte_val(pte) & _PAGE_PRESENT) &&
+ +			!(pte_val(pte) & _PAGE_READ) &&
+ +			!(pte_val(pte) & _PAGE_WRITE);
+ +		prot = (pte_val(pte) & _PAGE_PROTECT) &&
+ +			!(pte_val(pte) & _PAGE_WRITE);
+ +		young = pte_val(pte) & _PAGE_YOUNG;
+ +		if (none || young)
+ +			rste |= _SEGMENT_ENTRY_YOUNG;
+ +		if (prot || (none && young))
+ +			rste |= _SEGMENT_ENTRY_PROTECT;
+++=======
++ 	pmd_t pmd;
++ 
++ 	/*
++ 	 * Convert encoding		  pte bits	   pmd bits
++ 	 *				.IR...wrdytp	dy..R...I...wr
++ 	 * empty			.10...000000 -> 00..0...1...00
++ 	 * prot-none, clean, old	.11...000001 -> 00..1...1...00
++ 	 * prot-none, clean, young	.11...000101 -> 01..1...1...00
++ 	 * prot-none, dirty, old	.10...001001 -> 10..1...1...00
++ 	 * prot-none, dirty, young	.10...001101 -> 11..1...1...00
++ 	 * read-only, clean, old	.11...010001 -> 00..1...1...01
++ 	 * read-only, clean, young	.01...010101 -> 01..1...0...01
++ 	 * read-only, dirty, old	.11...011001 -> 10..1...1...01
++ 	 * read-only, dirty, young	.01...011101 -> 11..1...0...01
++ 	 * read-write, clean, old	.11...110001 -> 00..0...1...11
++ 	 * read-write, clean, young	.01...110101 -> 01..0...0...11
++ 	 * read-write, dirty, old	.10...111001 -> 10..0...1...11
++ 	 * read-write, dirty, young	.00...111101 -> 11..0...0...11
++ 	 */
++ 	if (pte_present(pte)) {
++ 		pmd_val(pmd) = pte_val(pte) & PAGE_MASK;
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_READ) >> 4;
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_WRITE) >> 4;
++ 		pmd_val(pmd) |=	(pte_val(pte) & _PAGE_INVALID) >> 5;
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_PROTECT);
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_DIRTY) << 10;
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_YOUNG) << 10;
+++>>>>>>> 152125b7a882 (s390/mm: implement dirty bits for large segment table entries)
+  	} else
+ -		pmd_val(pmd) = _SEGMENT_ENTRY_INVALID;
+ -	return pmd;
+ +		rste = _SEGMENT_ENTRY_INVALID;
+ +	return rste;
+  }
+  
+ -static inline pte_t __pmd_to_pte(pmd_t pmd)
+ +static inline pte_t __rste_to_pte(unsigned long rste)
+  {
+ +	int present;
+  	pte_t pte;
+  
+ +	if ((rste & _REGION_ENTRY_TYPE_MASK) == _REGION_ENTRY_TYPE_R3)
+ +		present = pud_present(__pud(rste));
+ +	else
+ +		present = pmd_present(__pmd(rste));
+ +
+  	/*
+++<<<<<<< HEAD
+ +	 * Convert encoding	pmd/pud bits	  pte bits
+ +	 *			..R...I...y.	.IR...wrdytp
+ +	 * empty		..0...1...0. -> .10...000000
+ +	 * prot-none, old	..0...1...1. -> .10...001001
+ +	 * prot-none, young	..1...1...1. -> .10...001101
+ +	 * read-only, old	..1...1...0. -> .11...011001
+ +	 * read-only, young	..1...0...1. -> .01...011101
+ +	 * read-write, old	..0...1...0. -> .10...111001
+ +	 * read-write, young	..0...0...1. -> .00...111101
+ +	 * Huge ptes are dirty by definition
+ +	 */
+ +	if (present) {
+ +		pte_val(pte) = _PAGE_PRESENT | _PAGE_LARGE | _PAGE_DIRTY |
+ +			       (rste & PAGE_MASK);
+ +		if (rste & _SEGMENT_ENTRY_INVALID)
+ +			pte_val(pte) |= _PAGE_INVALID;
+ +		if (pmd_prot_none(__pmd(rste))) {
+ +			if (rste & _SEGMENT_ENTRY_PROTECT)
+ +				pte_val(pte) |= _PAGE_YOUNG;
+ +		} else {
+ +			pte_val(pte) |= _PAGE_READ;
+ +			if (rste & _SEGMENT_ENTRY_PROTECT)
+ +				pte_val(pte) |= _PAGE_PROTECT;
+ +			else
+ +				pte_val(pte) |= _PAGE_WRITE;
+ +			if (rste & _SEGMENT_ENTRY_YOUNG)
+ +				pte_val(pte) |= _PAGE_YOUNG;
+ +		}
+++=======
++ 	 * Convert encoding		   pmd bits	    pte bits
++ 	 *				dy..R...I...wr	  .IR...wrdytp
++ 	 * empty			00..0...1...00 -> .10...001100
++ 	 * prot-none, clean, old	00..0...1...00 -> .10...000001
++ 	 * prot-none, clean, young	01..0...1...00 -> .10...000101
++ 	 * prot-none, dirty, old	10..0...1...00 -> .10...001001
++ 	 * prot-none, dirty, young	11..0...1...00 -> .10...001101
++ 	 * read-only, clean, old	00..1...1...01 -> .11...010001
++ 	 * read-only, clean, young	01..1...1...01 -> .11...010101
++ 	 * read-only, dirty, old	10..1...1...01 -> .11...011001
++ 	 * read-only, dirty, young	11..1...1...01 -> .11...011101
++ 	 * read-write, clean, old	00..0...1...11 -> .10...110001
++ 	 * read-write, clean, young	01..0...1...11 -> .10...110101
++ 	 * read-write, dirty, old	10..0...1...11 -> .10...111001
++ 	 * read-write, dirty, young	11..0...1...11 -> .10...111101
++ 	 */
++ 	if (pmd_present(pmd)) {
++ 		pte_val(pte) = pmd_val(pmd) & _SEGMENT_ENTRY_ORIGIN_LARGE;
++ 		pte_val(pte) |= _PAGE_LARGE | _PAGE_PRESENT;
++ 		pte_val(pte) |= (pmd_val(pmd) & _SEGMENT_ENTRY_READ) << 4;
++ 		pte_val(pte) |= (pmd_val(pmd) & _SEGMENT_ENTRY_WRITE) << 4;
++ 		pte_val(pte) |= (pmd_val(pmd) & _SEGMENT_ENTRY_INVALID) << 5;
++ 		pte_val(pte) |= (pmd_val(pmd) & _SEGMENT_ENTRY_PROTECT);
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_DIRTY) << 10;
++ 		pmd_val(pmd) |= (pte_val(pte) & _PAGE_YOUNG) << 10;
+++>>>>>>> 152125b7a882 (s390/mm: implement dirty bits for large segment table entries)
+  	} else
+  		pte_val(pte) = _PAGE_INVALID;
+  	return pte;
+@@@ -98,33 -80,32 +156,56 @@@
+  void set_huge_pte_at(struct mm_struct *mm, unsigned long addr,
+  		     pte_t *ptep, pte_t pte)
+  {
+ -	pmd_t pmd;
+ +	unsigned long rste = __pte_to_rste(pte);
+  
+++<<<<<<< HEAD
+ +	/* Set correct table type for 2G hugepages */
+ +	if ((pte_val(*ptep) & _REGION_ENTRY_TYPE_MASK) == _REGION_ENTRY_TYPE_R3)
+ +		rste |= _REGION_ENTRY_TYPE_R3 | _REGION3_ENTRY_LARGE;
+ +	else {
+ +		if (!MACHINE_HAS_HPAGE) {
+ +			rste &= ~_SEGMENT_ENTRY_ORIGIN;
+ +			rste |= pte_page(pte)[1].index;
+ +		} else
+ +			rste |= _SEGMENT_ENTRY_LARGE | _SEGMENT_ENTRY_CO;
+ +	}
+ +	pte_val(*ptep) = rste;
+++=======
++ 	pmd = __pte_to_pmd(pte);
++ 	if (!MACHINE_HAS_HPAGE) {
++ 		/* Emulated huge ptes loose the dirty and young bit */
++ 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_ORIGIN;
++ 		pmd_val(pmd) |= pte_page(pte)[1].index;
++ 	} else
++ 		pmd_val(pmd) |= _SEGMENT_ENTRY_LARGE | _SEGMENT_ENTRY_CO;
++ 	*(pmd_t *) ptep = pmd;
+++>>>>>>> 152125b7a882 (s390/mm: implement dirty bits for large segment table entries)
+  }
+  
+  pte_t huge_ptep_get(pte_t *ptep)
+  {
+ -	unsigned long origin;
+ -	pmd_t pmd;
+ +	unsigned long origin, rste;
+  
+++<<<<<<< HEAD
+ +	rste = pte_val(*ptep);
+ +	if ((pte_val(*ptep) & _REGION_ENTRY_TYPE_MASK) < _REGION_ENTRY_TYPE_R3)
+ +		if (!MACHINE_HAS_HPAGE && pmd_present(__pmd(rste))) {
+ +			origin = rste & _SEGMENT_ENTRY_ORIGIN;
+ +			rste &= ~_SEGMENT_ENTRY_ORIGIN;
+ +			rste |= *(unsigned long *) origin;
+ +		}
+ +	return __rste_to_pte(rste);
+++=======
++ 	pmd = *(pmd_t *) ptep;
++ 	if (!MACHINE_HAS_HPAGE && pmd_present(pmd)) {
++ 		origin = pmd_val(pmd) & _SEGMENT_ENTRY_ORIGIN;
++ 		pmd_val(pmd) &= ~_SEGMENT_ENTRY_ORIGIN;
++ 		pmd_val(pmd) |= *(unsigned long *) origin;
++ 		/* Emulated huge ptes are young and dirty by definition */
++ 		pmd_val(pmd) |= _SEGMENT_ENTRY_YOUNG | _SEGMENT_ENTRY_DIRTY;
++ 	}
++ 	return __pmd_to_pte(pmd);
+++>>>>>>> 152125b7a882 (s390/mm: implement dirty bits for large segment table entries)
+  }
+  
+  pte_t huge_ptep_get_and_clear(struct mm_struct *mm,
+* Unmerged path arch/s390/include/asm/pgtable.h
+* Unmerged path arch/s390/mm/hugetlbpage.c
+diff --git a/arch/s390/mm/pgtable.c b/arch/s390/mm/pgtable.c
+index 21b9a3a53e9d..ea084ae7ff1c 100644
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@ -1195,6 +1195,9 @@ int pmdp_set_access_flags(struct vm_area_struct *vma,
+ {
+ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+ 
++	entry = pmd_mkyoung(entry);
++	if (dirty)
++		entry = pmd_mkdirty(entry);
+ 	if (pmd_same(*pmdp, entry))
+ 		return 0;
+ 	pmdp_invalidate(vma, address, pmdp);
