@@ -1,0 +1,994 @@
+qed: Read per queue coalesce from hardware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rahul Verma <Rahul.Verma@cavium.com>
+commit bf5a94bfe26a9fcd4af91ae6bccd4f3d600d2262
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bf5a94bf.failed
+
+Retrieve the actual coalesce value from hardware for every Rx/Tx
+queue, instead of Rx/Tx coalesce value cached during set coalesce.
+
+	Signed-off-by: Rahul Verma <Rahul.Verma@cavium.com>
+	Signed-off-by: Yuval Mintz <yuval.mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bf5a94bfe26a9fcd4af91ae6bccd4f3d600d2262)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+#	drivers/net/ethernet/qlogic/qed/qed_l2.c
+#	drivers/net/ethernet/qlogic/qed/qed_l2.h
+#	drivers/net/ethernet/qlogic/qed/qed_main.c
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.c
+#	drivers/net/ethernet/qlogic/qed/qed_vf.c
+#	drivers/net/ethernet/qlogic/qed/qed_vf.h
+#	include/linux/qed/qed_eth_if.h
+#	include/linux/qed/qed_if.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+index b4aee25d860f,defdda1ffaa2..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+@@@ -416,36 -443,35 +416,58 @@@ int qed_final_cleanup(struct qed_hwfn *
+  		      struct qed_ptt *p_ptt, u16 id, bool is_vf);
+  
+  /**
+++<<<<<<< HEAD
+ + * @brief qed_set_rxq_coalesce - Configure coalesce parameters for an Rx queue
+ + * The fact that we can configure coalescing to up to 511, but on varying
+ + * accuracy [the bigger the value the less accurate] up to a mistake of 3usec
+ + * for the highest values.
+++=======
++  * @brief qed_get_queue_coalesce - Retrieve coalesce value for a given queue.
++  *
++  * @param p_hwfn
++  * @param p_coal - store coalesce value read from the hardware.
++  * @param p_handle
++  *
++  * @return int
++  **/
++ int qed_get_queue_coalesce(struct qed_hwfn *p_hwfn, u16 *coal, void *handle);
++ 
++ /**
++  * @brief qed_set_queue_coalesce - Configure coalesce parameters for Rx and
++  *    Tx queue. The fact that we can configure coalescing to up to 511, but on
++  *    varying accuracy [the bigger the value the less accurate] up to a mistake
++  *    of 3usec for the highest values.
++  *    While the API allows setting coalescing per-qid, all queues sharing a SB
++  *    should be in same range [i.e., either 0-0x7f, 0x80-0xff or 0x100-0x1ff]
++  *    otherwise configuration would break.
++  *
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+   *
+ - * @param rx_coal - Rx Coalesce value in micro seconds.
+ - * @param tx_coal - TX Coalesce value in micro seconds.
+ - * @param p_handle
+ + * @param p_hwfn
+ + * @param p_ptt
+ + * @param coalesce - Coalesce value in micro seconds.
+ + * @param qid - Queue index.
+ + * @param qid - SB Id
+   *
+   * @return int
+ - **/
+ -int
+ -qed_set_queue_coalesce(u16 rx_coal, u16 tx_coal, void *p_handle);
+ -
+ + */
+ +int qed_set_rxq_coalesce(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
+ +			 u16 coalesce, u8 qid, u16 sb_id);
+  
+ -const char *qed_hw_get_resc_name(enum qed_resources res_id);
+ +/**
+ + * @brief qed_set_txq_coalesce - Configure coalesce parameters for a Tx queue
+ + * While the API allows setting coalescing per-qid, all tx queues sharing a
+ + * SB should be in same range [i.e., either 0-0x7f, 0x80-0xff or 0x100-0x1ff]
+ + * otherwise configuration would break.
+ + *
+ + * @param p_hwfn
+ + * @param p_ptt
+ + * @param coalesce - Coalesce value in micro seconds.
+ + * @param qid - Queue index.
+ + * @param qid - SB Id
+ + *
+ + * @return int
+ + */
+ +int qed_set_txq_coalesce(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
+ +			 u16 coalesce, u8 qid, u16 sb_id);
+  #endif
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.c
+index f852981b5922,9a1645852015..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@@ -1797,6 -1969,184 +1797,187 @@@ void qed_reset_vport_stats(struct qed_d
+  		_qed_get_vport_stats(cdev, cdev->reset_stats);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ qed_arfs_mode_configure(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
++ 			struct qed_arfs_config_params *p_cfg_params)
++ {
++ 	if (p_cfg_params->arfs_enable) {
++ 		qed_set_rfs_mode_enable(p_hwfn, p_ptt, p_hwfn->rel_pf_id,
++ 					p_cfg_params->tcp, p_cfg_params->udp,
++ 					p_cfg_params->ipv4, p_cfg_params->ipv6);
++ 		DP_VERBOSE(p_hwfn, QED_MSG_SP,
++ 			   "tcp = %s, udp = %s, ipv4 = %s, ipv6 =%s\n",
++ 			   p_cfg_params->tcp ? "Enable" : "Disable",
++ 			   p_cfg_params->udp ? "Enable" : "Disable",
++ 			   p_cfg_params->ipv4 ? "Enable" : "Disable",
++ 			   p_cfg_params->ipv6 ? "Enable" : "Disable");
++ 	} else {
++ 		qed_set_rfs_mode_disable(p_hwfn, p_ptt, p_hwfn->rel_pf_id);
++ 	}
++ 
++ 	DP_VERBOSE(p_hwfn, QED_MSG_SP, "Configured ARFS mode : %s\n",
++ 		   p_cfg_params->arfs_enable ? "Enable" : "Disable");
++ }
++ 
++ static int
++ qed_configure_rfs_ntuple_filter(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
++ 				struct qed_spq_comp_cb *p_cb,
++ 				dma_addr_t p_addr, u16 length, u16 qid,
++ 				u8 vport_id, bool b_is_add)
++ {
++ 	struct rx_update_gft_filter_data *p_ramrod = NULL;
++ 	struct qed_spq_entry *p_ent = NULL;
++ 	struct qed_sp_init_data init_data;
++ 	u16 abs_rx_q_id = 0;
++ 	u8 abs_vport_id = 0;
++ 	int rc = -EINVAL;
++ 
++ 	rc = qed_fw_vport(p_hwfn, vport_id, &abs_vport_id);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = qed_fw_l2_queue(p_hwfn, qid, &abs_rx_q_id);
++ 	if (rc)
++ 		return rc;
++ 
++ 	/* Get SPQ entry */
++ 	memset(&init_data, 0, sizeof(init_data));
++ 	init_data.cid = qed_spq_get_cid(p_hwfn);
++ 
++ 	init_data.opaque_fid = p_hwfn->hw_info.opaque_fid;
++ 
++ 	if (p_cb) {
++ 		init_data.comp_mode = QED_SPQ_MODE_CB;
++ 		init_data.p_comp_data = p_cb;
++ 	} else {
++ 		init_data.comp_mode = QED_SPQ_MODE_EBLOCK;
++ 	}
++ 
++ 	rc = qed_sp_init_request(p_hwfn, &p_ent,
++ 				 ETH_RAMROD_GFT_UPDATE_FILTER,
++ 				 PROTOCOLID_ETH, &init_data);
++ 	if (rc)
++ 		return rc;
++ 
++ 	p_ramrod = &p_ent->ramrod.rx_update_gft;
++ 	DMA_REGPAIR_LE(p_ramrod->pkt_hdr_addr, p_addr);
++ 	p_ramrod->pkt_hdr_length = cpu_to_le16(length);
++ 	p_ramrod->rx_qid_or_action_icid = cpu_to_le16(abs_rx_q_id);
++ 	p_ramrod->vport_id = abs_vport_id;
++ 	p_ramrod->filter_type = RFS_FILTER_TYPE;
++ 	p_ramrod->filter_action = b_is_add ? GFT_ADD_FILTER : GFT_DELETE_FILTER;
++ 
++ 	DP_VERBOSE(p_hwfn, QED_MSG_SP,
++ 		   "V[%0x], Q[%04x] - %s filter from 0x%llx [length %04xb]\n",
++ 		   abs_vport_id, abs_rx_q_id,
++ 		   b_is_add ? "Adding" : "Removing", (u64)p_addr, length);
++ 
++ 	return qed_spq_post(p_hwfn, p_ent, NULL);
++ }
++ 
++ int qed_get_rxq_coalesce(struct qed_hwfn *p_hwfn,
++ 			 struct qed_ptt *p_ptt,
++ 			 struct qed_queue_cid *p_cid, u16 *p_rx_coal)
++ {
++ 	u32 coalesce, address, is_valid;
++ 	struct cau_sb_entry sb_entry;
++ 	u8 timer_res;
++ 	int rc;
++ 
++ 	rc = qed_dmae_grc2host(p_hwfn, p_ptt, CAU_REG_SB_VAR_MEMORY +
++ 			       p_cid->sb_igu_id * sizeof(u64),
++ 			       (u64)(uintptr_t)&sb_entry, 2, 0);
++ 	if (rc) {
++ 		DP_ERR(p_hwfn, "dmae_grc2host failed %d\n", rc);
++ 		return rc;
++ 	}
++ 
++ 	timer_res = GET_FIELD(sb_entry.params, CAU_SB_ENTRY_TIMER_RES0);
++ 
++ 	address = BAR0_MAP_REG_USDM_RAM +
++ 		  USTORM_ETH_QUEUE_ZONE_OFFSET(p_cid->abs.queue_id);
++ 	coalesce = qed_rd(p_hwfn, p_ptt, address);
++ 
++ 	is_valid = GET_FIELD(coalesce, COALESCING_TIMESET_VALID);
++ 	if (!is_valid)
++ 		return -EINVAL;
++ 
++ 	coalesce = GET_FIELD(coalesce, COALESCING_TIMESET_TIMESET);
++ 	*p_rx_coal = (u16)(coalesce << timer_res);
++ 
++ 	return 0;
++ }
++ 
++ int qed_get_txq_coalesce(struct qed_hwfn *p_hwfn,
++ 			 struct qed_ptt *p_ptt,
++ 			 struct qed_queue_cid *p_cid, u16 *p_tx_coal)
++ {
++ 	u32 coalesce, address, is_valid;
++ 	struct cau_sb_entry sb_entry;
++ 	u8 timer_res;
++ 	int rc;
++ 
++ 	rc = qed_dmae_grc2host(p_hwfn, p_ptt, CAU_REG_SB_VAR_MEMORY +
++ 			       p_cid->sb_igu_id * sizeof(u64),
++ 			       (u64)(uintptr_t)&sb_entry, 2, 0);
++ 	if (rc) {
++ 		DP_ERR(p_hwfn, "dmae_grc2host failed %d\n", rc);
++ 		return rc;
++ 	}
++ 
++ 	timer_res = GET_FIELD(sb_entry.params, CAU_SB_ENTRY_TIMER_RES1);
++ 
++ 	address = BAR0_MAP_REG_XSDM_RAM +
++ 		  XSTORM_ETH_QUEUE_ZONE_OFFSET(p_cid->abs.queue_id);
++ 	coalesce = qed_rd(p_hwfn, p_ptt, address);
++ 
++ 	is_valid = GET_FIELD(coalesce, COALESCING_TIMESET_VALID);
++ 	if (!is_valid)
++ 		return -EINVAL;
++ 
++ 	coalesce = GET_FIELD(coalesce, COALESCING_TIMESET_TIMESET);
++ 	*p_tx_coal = (u16)(coalesce << timer_res);
++ 
++ 	return 0;
++ }
++ 
++ int qed_get_queue_coalesce(struct qed_hwfn *p_hwfn, u16 *p_coal, void *handle)
++ {
++ 	struct qed_queue_cid *p_cid = handle;
++ 	struct qed_ptt *p_ptt;
++ 	int rc = 0;
++ 
++ 	if (IS_VF(p_hwfn->cdev)) {
++ 		rc = qed_vf_pf_get_coalesce(p_hwfn, p_coal, p_cid);
++ 		if (rc)
++ 			DP_NOTICE(p_hwfn, "Unable to read queue coalescing\n");
++ 
++ 		return rc;
++ 	}
++ 
++ 	p_ptt = qed_ptt_acquire(p_hwfn);
++ 	if (!p_ptt)
++ 		return -EAGAIN;
++ 
++ 	if (p_cid->b_is_rx) {
++ 		rc = qed_get_rxq_coalesce(p_hwfn, p_ptt, p_cid, p_coal);
++ 		if (rc)
++ 			goto out;
++ 	} else {
++ 		rc = qed_get_txq_coalesce(p_hwfn, p_ptt, p_cid, p_coal);
++ 		if (rc)
++ 			goto out;
++ 	}
++ 
++ out:
++ 	qed_ptt_release(p_hwfn, p_ptt);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  static int qed_fill_eth_dev_info(struct qed_dev *cdev,
+  				 struct qed_dev_eth_info *info)
+  {
+@@@ -2352,6 -2743,73 +2533,76 @@@ static int qed_configure_filter(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qed_configure_arfs_searcher(struct qed_dev *cdev, bool en_searcher)
++ {
++ 	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
++ 	struct qed_arfs_config_params arfs_config_params;
++ 
++ 	memset(&arfs_config_params, 0, sizeof(arfs_config_params));
++ 	arfs_config_params.tcp = true;
++ 	arfs_config_params.udp = true;
++ 	arfs_config_params.ipv4 = true;
++ 	arfs_config_params.ipv6 = true;
++ 	arfs_config_params.arfs_enable = en_searcher;
++ 
++ 	qed_arfs_mode_configure(p_hwfn, p_hwfn->p_arfs_ptt,
++ 				&arfs_config_params);
++ 	return 0;
++ }
++ 
++ static void
++ qed_arfs_sp_response_handler(struct qed_hwfn *p_hwfn,
++ 			     void *cookie, union event_ring_data *data,
++ 			     u8 fw_return_code)
++ {
++ 	struct qed_common_cb_ops *op = p_hwfn->cdev->protocol_ops.common;
++ 	void *dev = p_hwfn->cdev->ops_cookie;
++ 
++ 	op->arfs_filter_op(dev, cookie, fw_return_code);
++ }
++ 
++ static int qed_ntuple_arfs_filter_config(struct qed_dev *cdev, void *cookie,
++ 					 dma_addr_t mapping, u16 length,
++ 					 u16 vport_id, u16 rx_queue_id,
++ 					 bool add_filter)
++ {
++ 	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
++ 	struct qed_spq_comp_cb cb;
++ 	int rc = -EINVAL;
++ 
++ 	cb.function = qed_arfs_sp_response_handler;
++ 	cb.cookie = cookie;
++ 
++ 	rc = qed_configure_rfs_ntuple_filter(p_hwfn, p_hwfn->p_arfs_ptt,
++ 					     &cb, mapping, length, rx_queue_id,
++ 					     vport_id, add_filter);
++ 	if (rc)
++ 		DP_NOTICE(p_hwfn,
++ 			  "Failed to issue a-RFS filter configuration\n");
++ 	else
++ 		DP_VERBOSE(p_hwfn, NETIF_MSG_DRV,
++ 			   "Successfully issued a-RFS filter configuration\n");
++ 
++ 	return rc;
++ }
++ 
++ static int qed_get_coalesce(struct qed_dev *cdev, u16 *coal, void *handle)
++ {
++ 	struct qed_queue_cid *p_cid = handle;
++ 	struct qed_hwfn *p_hwfn;
++ 	int rc;
++ 
++ 	p_hwfn = p_cid->p_owner;
++ 	rc = qed_get_queue_coalesce(p_hwfn, coal, handle);
++ 	if (rc)
++ 		DP_NOTICE(p_hwfn, "Unable to read queue calescing\n");
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  static int qed_fp_cqe_completion(struct qed_dev *dev,
+  				 u8 rss_id, struct eth_slow_path_rx_cqe *cqe)
+  {
+@@@ -2390,6 -2851,9 +2641,12 @@@ static const struct qed_eth_ops qed_eth
+  	.eth_cqe_completion = &qed_fp_cqe_completion,
+  	.get_vport_stats = &qed_get_vport_stats,
+  	.tunn_config = &qed_tunn_configure,
+++<<<<<<< HEAD
+++=======
++ 	.ntuple_filter_config = &qed_ntuple_arfs_filter_config,
++ 	.configure_arfs_searcher = &qed_configure_arfs_searcher,
++ 	.get_coalesce = &qed_get_coalesce,
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  };
+  
+  const struct qed_eth_ops *qed_get_eth_ops(void)
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.h
+index 93cb932ef663,cc1f248551c9..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.h
+@@@ -344,4 -400,20 +344,24 @@@ qed_eth_txq_start_ramrod(struct qed_hwf
+  
+  u8 qed_mcast_bin_from_mac(u8 *mac);
+  
+++<<<<<<< HEAD
+ +#endif /* _QED_L2_H */
+++=======
++ int qed_set_rxq_coalesce(struct qed_hwfn *p_hwfn,
++ 			 struct qed_ptt *p_ptt,
++ 			 u16 coalesce, struct qed_queue_cid *p_cid);
++ 
++ int qed_set_txq_coalesce(struct qed_hwfn *p_hwfn,
++ 			 struct qed_ptt *p_ptt,
++ 			 u16 coalesce, struct qed_queue_cid *p_cid);
++ 
++ int qed_get_rxq_coalesce(struct qed_hwfn *p_hwfn,
++ 			 struct qed_ptt *p_ptt,
++ 			 struct qed_queue_cid *p_cid, u16 *p_hw_coal);
++ 
++ int qed_get_txq_coalesce(struct qed_hwfn *p_hwfn,
++ 			 struct qed_ptt *p_ptt,
++ 			 struct qed_queue_cid *p_cid, u16 *p_hw_coal);
++ 
++ #endif
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+diff --cc drivers/net/ethernet/qlogic/qed/qed_main.c
+index 545e79f7504c,27832885a87f..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@@ -1449,10 -1553,19 +1449,26 @@@ static int qed_drain(struct qed_dev *cd
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void qed_get_coalesce(struct qed_dev *cdev, u16 *rx_coal, u16 *tx_coal)
+ +{
+ +	*rx_coal = cdev->rx_coalesce_usecs;
+ +	*tx_coal = cdev->tx_coalesce_usecs;
+++=======
++ static int qed_nvm_get_image(struct qed_dev *cdev, enum qed_nvm_images type,
++ 			     u8 *buf, u16 len)
++ {
++ 	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
++ 	struct qed_ptt *ptt = qed_ptt_acquire(hwfn);
++ 	int rc;
++ 
++ 	if (!ptt)
++ 		return -EAGAIN;
++ 
++ 	rc = qed_mcp_get_nvm_image(hwfn, ptt, type, buf, len);
++ 	qed_ptt_release(hwfn, ptt);
++ 	return rc;
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  }
+  
+  static int qed_set_coalesce(struct qed_dev *cdev, u16 rx_coal, u16 tx_coal,
+@@@ -1626,7 -1719,7 +1642,11 @@@ const struct qed_common_ops qed_common_
+  	.dbg_all_data_size = &qed_dbg_all_data_size,
+  	.chain_alloc = &qed_chain_alloc,
+  	.chain_free = &qed_chain_free,
+++<<<<<<< HEAD
+ +	.get_coalesce = &qed_get_coalesce,
+++=======
++ 	.nvm_get_image = &qed_nvm_get_image,
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  	.set_coalesce = &qed_set_coalesce,
+  	.set_led = &qed_set_led,
+  	.update_drv_state = &qed_update_drv_state,
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.c
+index c231e788de76,3f40b1de7957..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@@ -2941,6 -3400,157 +2941,160 @@@ static void qed_iov_vf_mbx_release(stru
+  			     length, status);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qed_iov_vf_pf_get_coalesce(struct qed_hwfn *p_hwfn,
++ 				       struct qed_ptt *p_ptt,
++ 				       struct qed_vf_info *p_vf)
++ {
++ 	struct qed_iov_vf_mbx *mbx = &p_vf->vf_mbx;
++ 	struct pfvf_read_coal_resp_tlv *p_resp;
++ 	struct vfpf_read_coal_req_tlv *req;
++ 	u8 status = PFVF_STATUS_FAILURE;
++ 	struct qed_vf_queue *p_queue;
++ 	struct qed_queue_cid *p_cid;
++ 	u16 coal = 0, qid, i;
++ 	bool b_is_rx;
++ 	int rc = 0;
++ 
++ 	mbx->offset = (u8 *)mbx->reply_virt;
++ 	req = &mbx->req_virt->read_coal_req;
++ 
++ 	qid = req->qid;
++ 	b_is_rx = req->is_rx ? true : false;
++ 
++ 	if (b_is_rx) {
++ 		if (!qed_iov_validate_rxq(p_hwfn, p_vf, qid,
++ 					  QED_IOV_VALIDATE_Q_ENABLE)) {
++ 			DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 				   "VF[%d]: Invalid Rx queue_id = %d\n",
++ 				   p_vf->abs_vf_id, qid);
++ 			goto send_resp;
++ 		}
++ 
++ 		p_cid = qed_iov_get_vf_rx_queue_cid(&p_vf->vf_queues[qid]);
++ 		rc = qed_get_rxq_coalesce(p_hwfn, p_ptt, p_cid, &coal);
++ 		if (rc)
++ 			goto send_resp;
++ 	} else {
++ 		if (!qed_iov_validate_txq(p_hwfn, p_vf, qid,
++ 					  QED_IOV_VALIDATE_Q_ENABLE)) {
++ 			DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 				   "VF[%d]: Invalid Tx queue_id = %d\n",
++ 				   p_vf->abs_vf_id, qid);
++ 			goto send_resp;
++ 		}
++ 		for (i = 0; i < MAX_QUEUES_PER_QZONE; i++) {
++ 			p_queue = &p_vf->vf_queues[qid];
++ 			if ((!p_queue->cids[i].p_cid) ||
++ 			    (!p_queue->cids[i].b_is_tx))
++ 				continue;
++ 
++ 			p_cid = p_queue->cids[i].p_cid;
++ 
++ 			rc = qed_get_txq_coalesce(p_hwfn, p_ptt, p_cid, &coal);
++ 			if (rc)
++ 				goto send_resp;
++ 			break;
++ 		}
++ 	}
++ 
++ 	status = PFVF_STATUS_SUCCESS;
++ 
++ send_resp:
++ 	p_resp = qed_add_tlv(p_hwfn, &mbx->offset, CHANNEL_TLV_COALESCE_READ,
++ 			     sizeof(*p_resp));
++ 	p_resp->coal = coal;
++ 
++ 	qed_add_tlv(p_hwfn, &mbx->offset, CHANNEL_TLV_LIST_END,
++ 		    sizeof(struct channel_list_end_tlv));
++ 
++ 	qed_iov_send_response(p_hwfn, p_ptt, p_vf, sizeof(*p_resp), status);
++ }
++ 
++ static void qed_iov_vf_pf_set_coalesce(struct qed_hwfn *p_hwfn,
++ 				       struct qed_ptt *p_ptt,
++ 				       struct qed_vf_info *vf)
++ {
++ 	struct qed_iov_vf_mbx *mbx = &vf->vf_mbx;
++ 	struct vfpf_update_coalesce *req;
++ 	u8 status = PFVF_STATUS_FAILURE;
++ 	struct qed_queue_cid *p_cid;
++ 	u16 rx_coal, tx_coal;
++ 	int rc = 0, i;
++ 	u16 qid;
++ 
++ 	req = &mbx->req_virt->update_coalesce;
++ 
++ 	rx_coal = req->rx_coal;
++ 	tx_coal = req->tx_coal;
++ 	qid = req->qid;
++ 
++ 	if (!qed_iov_validate_rxq(p_hwfn, vf, qid,
++ 				  QED_IOV_VALIDATE_Q_ENABLE) && rx_coal) {
++ 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 			   "VF[%d]: Invalid Rx queue_id = %d\n",
++ 			   vf->abs_vf_id, qid);
++ 		goto out;
++ 	}
++ 
++ 	if (!qed_iov_validate_txq(p_hwfn, vf, qid,
++ 				  QED_IOV_VALIDATE_Q_ENABLE) && tx_coal) {
++ 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++ 			   "VF[%d]: Invalid Tx queue_id = %d\n",
++ 			   vf->abs_vf_id, qid);
++ 		goto out;
++ 	}
++ 
++ 	DP_VERBOSE(p_hwfn,
++ 		   QED_MSG_IOV,
++ 		   "VF[%d]: Setting coalesce for VF rx_coal = %d, tx_coal = %d at queue = %d\n",
++ 		   vf->abs_vf_id, rx_coal, tx_coal, qid);
++ 
++ 	if (rx_coal) {
++ 		p_cid = qed_iov_get_vf_rx_queue_cid(&vf->vf_queues[qid]);
++ 
++ 		rc = qed_set_rxq_coalesce(p_hwfn, p_ptt, rx_coal, p_cid);
++ 		if (rc) {
++ 			DP_VERBOSE(p_hwfn,
++ 				   QED_MSG_IOV,
++ 				   "VF[%d]: Unable to set rx queue = %d coalesce\n",
++ 				   vf->abs_vf_id, vf->vf_queues[qid].fw_rx_qid);
++ 			goto out;
++ 		}
++ 		vf->rx_coal = rx_coal;
++ 	}
++ 
++ 	if (tx_coal) {
++ 		struct qed_vf_queue *p_queue = &vf->vf_queues[qid];
++ 
++ 		for (i = 0; i < MAX_QUEUES_PER_QZONE; i++) {
++ 			if (!p_queue->cids[i].p_cid)
++ 				continue;
++ 
++ 			if (!p_queue->cids[i].b_is_tx)
++ 				continue;
++ 
++ 			rc = qed_set_txq_coalesce(p_hwfn, p_ptt, tx_coal,
++ 						  p_queue->cids[i].p_cid);
++ 
++ 			if (rc) {
++ 				DP_VERBOSE(p_hwfn,
++ 					   QED_MSG_IOV,
++ 					   "VF[%d]: Unable to set tx queue coalesce\n",
++ 					   vf->abs_vf_id);
++ 				goto out;
++ 			}
++ 		}
++ 		vf->tx_coal = tx_coal;
++ 	}
++ 
++ 	status = PFVF_STATUS_SUCCESS;
++ out:
++ 	qed_iov_prepare_resp(p_hwfn, p_ptt, vf, CHANNEL_TLV_COALESCE_UPDATE,
++ 			     sizeof(struct pfvf_def_resp_tlv), status);
++ }
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  static int
+  qed_iov_vf_flr_poll_dorq(struct qed_hwfn *p_hwfn,
+  			 struct qed_vf_info *p_vf, struct qed_ptt *p_ptt)
+@@@ -3263,6 -3873,15 +3417,18 @@@ static void qed_iov_process_mbx_req(str
+  		case CHANNEL_TLV_RELEASE:
+  			qed_iov_vf_mbx_release(p_hwfn, p_ptt, p_vf);
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case CHANNEL_TLV_UPDATE_TUNN_PARAM:
++ 			qed_iov_vf_mbx_update_tunn_param(p_hwfn, p_ptt, p_vf);
++ 			break;
++ 		case CHANNEL_TLV_COALESCE_UPDATE:
++ 			qed_iov_vf_pf_set_coalesce(p_hwfn, p_ptt, p_vf);
++ 			break;
++ 		case CHANNEL_TLV_COALESCE_READ:
++ 			qed_iov_vf_pf_get_coalesce(p_hwfn, p_ptt, p_vf);
++ 			break;
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  		}
+  	} else if (qed_iov_tlv_supported(mbx->first_tlv.tl.type)) {
+  		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
+diff --cc drivers/net/ethernet/qlogic/qed/qed_vf.c
+index f2954eb03b41,91b5e9f02a62..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@@ -1079,6 -1343,81 +1079,84 @@@ exit
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int qed_vf_pf_get_coalesce(struct qed_hwfn *p_hwfn,
++ 			   u16 *p_coal, struct qed_queue_cid *p_cid)
++ {
++ 	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
++ 	struct pfvf_read_coal_resp_tlv *resp;
++ 	struct vfpf_read_coal_req_tlv *req;
++ 	int rc;
++ 
++ 	/* clear mailbox and prep header tlv */
++ 	req = qed_vf_pf_prep(p_hwfn, CHANNEL_TLV_COALESCE_READ, sizeof(*req));
++ 	req->qid = p_cid->rel.queue_id;
++ 	req->is_rx = p_cid->b_is_rx ? 1 : 0;
++ 
++ 	qed_add_tlv(p_hwfn, &p_iov->offset, CHANNEL_TLV_LIST_END,
++ 		    sizeof(struct channel_list_end_tlv));
++ 	resp = &p_iov->pf2vf_reply->read_coal_resp;
++ 
++ 	rc = qed_send_msg2pf(p_hwfn, &resp->hdr.status, sizeof(*resp));
++ 	if (rc)
++ 		goto exit;
++ 
++ 	if (resp->hdr.status != PFVF_STATUS_SUCCESS)
++ 		goto exit;
++ 
++ 	*p_coal = resp->coal;
++ exit:
++ 	qed_vf_pf_req_end(p_hwfn, rc);
++ 
++ 	return rc;
++ }
++ 
++ int
++ qed_vf_pf_set_coalesce(struct qed_hwfn *p_hwfn,
++ 		       u16 rx_coal, u16 tx_coal, struct qed_queue_cid *p_cid)
++ {
++ 	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
++ 	struct vfpf_update_coalesce *req;
++ 	struct pfvf_def_resp_tlv *resp;
++ 	int rc;
++ 
++ 	/* clear mailbox and prep header tlv */
++ 	req = qed_vf_pf_prep(p_hwfn, CHANNEL_TLV_COALESCE_UPDATE, sizeof(*req));
++ 
++ 	req->rx_coal = rx_coal;
++ 	req->tx_coal = tx_coal;
++ 	req->qid = p_cid->rel.queue_id;
++ 
++ 	DP_VERBOSE(p_hwfn,
++ 		   QED_MSG_IOV,
++ 		   "Setting coalesce rx_coal = %d, tx_coal = %d at queue = %d\n",
++ 		   rx_coal, tx_coal, req->qid);
++ 
++ 	/* add list termination tlv */
++ 	qed_add_tlv(p_hwfn, &p_iov->offset, CHANNEL_TLV_LIST_END,
++ 		    sizeof(struct channel_list_end_tlv));
++ 
++ 	resp = &p_iov->pf2vf_reply->default_resp;
++ 	rc = qed_send_msg2pf(p_hwfn, &resp->hdr.status, sizeof(*resp));
++ 	if (rc)
++ 		goto exit;
++ 
++ 	if (resp->hdr.status != PFVF_STATUS_SUCCESS)
++ 		goto exit;
++ 
++ 	if (rx_coal)
++ 		p_hwfn->cdev->rx_coalesce_usecs = rx_coal;
++ 
++ 	if (tx_coal)
++ 		p_hwfn->cdev->tx_coalesce_usecs = tx_coal;
++ 
++ exit:
++ 	qed_vf_pf_req_end(p_hwfn, rc);
++ 	return rc;
++ }
++ 
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  u16 qed_vf_get_igu_sb_id(struct qed_hwfn *p_hwfn, u16 sb_id)
+  {
+  	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
+diff --cc drivers/net/ethernet/qlogic/qed/qed_vf.h
+index 4b1e7ae5c823,97d44dfb38ca..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+@@@ -433,6 -497,27 +433,30 @@@ struct tlv_buffer_size 
+  	u8 tlv_buffer[TLV_BUFFER_SIZE];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfpf_update_coalesce {
++ 	struct vfpf_first_tlv first_tlv;
++ 	u16 rx_coal;
++ 	u16 tx_coal;
++ 	u16 qid;
++ 	u8 padding[2];
++ };
++ 
++ struct vfpf_read_coal_req_tlv {
++ 	struct vfpf_first_tlv first_tlv;
++ 	u16 qid;
++ 	u8 is_rx;
++ 	u8 padding[5];
++ };
++ 
++ struct pfvf_read_coal_resp_tlv {
++ 	struct pfvf_tlv hdr;
++ 	u16 coal;
++ 	u8 padding[6];
++ };
++ 
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  union vfpf_tlvs {
+  	struct vfpf_first_tlv first_tlv;
+  	struct vfpf_acquire_tlv acquire;
+@@@ -444,7 -529,9 +468,13 @@@
+  	struct vfpf_vport_start_tlv start_vport;
+  	struct vfpf_vport_update_tlv vport_update;
+  	struct vfpf_ucast_filter_tlv ucast_filter;
+++<<<<<<< HEAD
+ +	struct channel_list_end_tlv list_end;
+++=======
++ 	struct vfpf_update_tunn_param_tlv tunn_param_update;
++ 	struct vfpf_update_coalesce update_coalesce;
++ 	struct vfpf_read_coal_req_tlv read_coal_req;
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  	struct tlv_buffer_size tlv_buf_size;
+  };
+  
+@@@ -453,6 -540,8 +483,11 @@@ union pfvf_tlvs 
+  	struct pfvf_acquire_resp_tlv acquire_resp;
+  	struct tlv_buffer_size tlv_buf_size;
+  	struct pfvf_start_queue_resp_tlv queue_start;
+++<<<<<<< HEAD
+++=======
++ 	struct pfvf_update_tunn_param_tlv tunn_param_resp;
++ 	struct pfvf_read_coal_resp_tlv read_coal_resp;
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  };
+  
+  enum qed_bulletin_bit {
+@@@ -555,6 -646,10 +590,13 @@@ enum 
+  	CHANNEL_TLV_VPORT_UPDATE_RSS,
+  	CHANNEL_TLV_VPORT_UPDATE_ACCEPT_ANY_VLAN,
+  	CHANNEL_TLV_VPORT_UPDATE_SGE_TPA,
+++<<<<<<< HEAD
+++=======
++ 	CHANNEL_TLV_UPDATE_TUNN_PARAM,
++ 	CHANNEL_TLV_COALESCE_UPDATE,
++ 	CHANNEL_TLV_QID,
++ 	CHANNEL_TLV_COALESCE_READ,
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  	CHANNEL_TLV_MAX,
+  
+  	/* Required for iterating over vport-update tlvs.
+@@@ -585,8 -686,46 +627,36 @@@ struct qed_vf_iov 
+  	 * this has to be propagated as it affects the fastpath.
+  	 */
+  	bool b_pre_fp_hsi;
+ -
+ -	/* Current day VFs are passing the SBs physical address on vport
+ -	 * start, and as they lack an IGU mapping they need to store the
+ -	 * addresses of previously registered SBs.
+ -	 * Even if we were to change configuration flow, due to backward
+ -	 * compatibility [with older PFs] we'd still need to store these.
+ -	 */
+ -	struct qed_sb_info *sbs_info[PFVF_MAX_SBS_PER_VF];
+ -
+ -	/* Determines whether VF utilizes doorbells via limited register
+ -	 * bar or via the doorbell bar.
+ -	 */
+ -	bool b_doorbell_bar;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * @brief VF - Set Rx/Tx coalesce per VF's relative queue.
++  *             Coalesce value '0' will omit the configuration.
++  *
++  * @param p_hwfn
++  * @param rx_coal - coalesce value in micro second for rx queue
++  * @param tx_coal - coalesce value in micro second for tx queue
++  * @param p_cid   - queue cid
++  *
++  **/
++ int qed_vf_pf_set_coalesce(struct qed_hwfn *p_hwfn,
++ 			   u16 rx_coal,
++ 			   u16 tx_coal, struct qed_queue_cid *p_cid);
++ 
++ /**
++  * @brief VF - Get coalesce per VF's relative queue.
++  *
++  * @param p_hwfn
++  * @param p_coal - coalesce value in micro second for VF queues.
++  * @param p_cid  - queue cid
++  *
++  **/
++ int qed_vf_pf_get_coalesce(struct qed_hwfn *p_hwfn,
++ 			   u16 *p_coal, struct qed_queue_cid *p_cid);
++ 
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  #ifdef CONFIG_QED_SRIOV
+  /**
+   * @brief Read the VF bulletin and act on it if needed
+diff --cc include/linux/qed/qed_eth_if.h
+index 3613d63cd5d0,d60de4a39810..000000000000
+--- a/include/linux/qed/qed_eth_if.h
++++ b/include/linux/qed/qed_eth_if.h
+@@@ -279,6 -315,15 +279,18 @@@ struct qed_eth_ops 
+  
+  	int (*tunn_config)(struct qed_dev *cdev,
+  			   struct qed_tunn_params *params);
+++<<<<<<< HEAD
+++=======
++ 
++ 	int (*ntuple_filter_config)(struct qed_dev *cdev, void *cookie,
++ 				    dma_addr_t mapping, u16 length,
++ 				    u16 vport_id, u16 rx_queue_id,
++ 				    bool add_filter);
++ 
++ 	int (*configure_arfs_searcher)(struct qed_dev *cdev,
++ 				       bool en_searcher);
++ 	int (*get_coalesce)(struct qed_dev *cdev, u16 *coal, void *handle);
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  };
+  
+  const struct qed_eth_ops *qed_get_eth_ops(void);
+diff --cc include/linux/qed/qed_if.h
+index cbe538f3b78a,2b4720bb8b40..000000000000
+--- a/include/linux/qed/qed_if.h
++++ b/include/linux/qed/qed_if.h
+@@@ -617,14 -662,17 +618,28 @@@ struct qed_common_ops 
+  				      struct qed_chain *p_chain);
+  
+  /**
+++<<<<<<< HEAD
+ + * @brief get_coalesce - Get coalesce parameters in usec
+ + *
+ + * @param cdev
+ + * @param rx_coal - Rx coalesce value in usec
+ + * @param tx_coal - Tx coalesce value in usec
+ + *
+ + */
+ +	void (*get_coalesce)(struct qed_dev *cdev, u16 *rx_coal, u16 *tx_coal);
+++=======
++  * @brief nvm_get_image - reads an entire image from nvram
++  *
++  * @param cdev
++  * @param type - type of the request nvram image
++  * @param buf - preallocated buffer to fill with the image
++  * @param len - length of the allocated buffer
++  *
++  * @return 0 on success, error otherwise
++  */
++ 	int (*nvm_get_image)(struct qed_dev *cdev,
++ 			     enum qed_nvm_images type, u8 *buf, u16 len);
+++>>>>>>> bf5a94bfe26a (qed: Read per queue coalesce from hardware)
+  
+  /**
+   * @brief set_coalesce - Configure Rx coalesce value in usec
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.h
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_main.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_sriov.h b/drivers/net/ethernet/qlogic/qed/qed_sriov.h
+index bcff13a4692b..9d91002331a3 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.h
+@@ -200,6 +200,9 @@ struct qed_vf_info {
+ 	u8 num_rxqs;
+ 	u8 num_txqs;
+ 
++	u16 rx_coal;
++	u16 tx_coal;
++
+ 	u8 num_sbs;
+ 
+ 	u8 num_mac_filters;
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_vf.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_vf.h
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+index 64750d8870db..97211b04e866 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@ -687,16 +687,53 @@ static u32 qede_get_link(struct net_device *dev)
+ static int qede_get_coalesce(struct net_device *dev,
+ 			     struct ethtool_coalesce *coal)
+ {
++	void *rx_handle = NULL, *tx_handle = NULL;
+ 	struct qede_dev *edev = netdev_priv(dev);
+-	u16 rxc, txc;
++	u16 rx_coal, tx_coal, i, rc = 0;
++	struct qede_fastpath *fp;
++
++	rx_coal = QED_DEFAULT_RX_USECS;
++	tx_coal = QED_DEFAULT_TX_USECS;
+ 
+ 	memset(coal, 0, sizeof(struct ethtool_coalesce));
+-	edev->ops->common->get_coalesce(edev->cdev, &rxc, &txc);
+ 
+-	coal->rx_coalesce_usecs = rxc;
+-	coal->tx_coalesce_usecs = txc;
++	__qede_lock(edev);
++	if (edev->state == QEDE_STATE_OPEN) {
++		for_each_queue(i) {
++			fp = &edev->fp_array[i];
+ 
+-	return 0;
++			if (fp->type & QEDE_FASTPATH_RX) {
++				rx_handle = fp->rxq->handle;
++				break;
++			}
++		}
++
++		rc = edev->ops->get_coalesce(edev->cdev, &rx_coal, rx_handle);
++		if (rc) {
++			DP_INFO(edev, "Read Rx coalesce error\n");
++			goto out;
++		}
++
++		for_each_queue(i) {
++			fp = &edev->fp_array[i];
++			if (fp->type & QEDE_FASTPATH_TX) {
++				tx_handle = fp->txq->handle;
++				break;
++			}
++		}
++
++		rc = edev->ops->get_coalesce(edev->cdev, &tx_coal, tx_handle);
++		if (rc)
++			DP_INFO(edev, "Read Tx coalesce error\n");
++	}
++
++out:
++	__qede_unlock(edev);
++
++	coal->rx_coalesce_usecs = rx_coal;
++	coal->tx_coalesce_usecs = tx_coal;
++
++	return rc;
+ }
+ 
+ static int qede_set_coalesce(struct net_device *dev,
+* Unmerged path include/linux/qed/qed_eth_if.h
+* Unmerged path include/linux/qed/qed_if.h
