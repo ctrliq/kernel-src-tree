@@ -1,0 +1,888 @@
+nfp: switch to using data path structures for reconfiguration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 892a7f700b361882105739632ccbd6ceb848c21d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/892a7f70.failed
+
+Instead of passing around sets of rings and their parameters just
+store all information in the data path structure.
+
+We will no longer user xchg() on XDP programs when we swap programs
+while the traffic is guaranteed not to be flowing.  This allows us
+to simply assign the entire data path structures instead of copying
+field by field.
+
+The optimization to reallocate only the rings on the side (RX/TX)
+which has been changed is also removed since it seems like it's not
+worth the code complexity.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 892a7f700b361882105739632ccbd6ceb848c21d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da,5a92f6e41dae..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -552,16 -605,12 +552,19 @@@ struct nfp_net 
+  
+  	struct list_head port_list;
+  
+ -	struct pci_dev *pdev;
+  	struct nfp_cpp *cpp;
+ +};
+  
+ -	struct nfp_eth_table_port *eth_port;
+++<<<<<<< HEAD
+ +struct nfp_net_ring_set {
+ +	unsigned int n_rings;
+ +	unsigned int mtu;
+ +	unsigned int dcnt;
+ +	void *rings;
+  };
+  
+++=======
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  /* Functions to read/write from/to a BAR
+   * Performs any endian conversion necessary.
+   */
+@@@ -755,9 -805,9 +758,15 @@@ void nfp_net_irqs_disable(struct pci_de
+  void
+  nfp_net_irqs_assign(struct nfp_net *nn, struct msix_entry *irq_entries,
+  		    unsigned int n);
+++<<<<<<< HEAD
+ +int
+ +nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
+ +		      struct nfp_net_ring_set *tx);
+++=======
++ 
++ struct nfp_net_dp *nfp_net_clone_dp(struct nfp_net *nn);
++ int nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_dp *new);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  
+  #ifdef CONFIG_NFP_DEBUG
+  void nfp_net_debugfs_create(void);
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index e0a7eb1db7a9,a9359da64f80..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1512,22 -1740,23 +1512,35 @@@ static void nfp_net_tx_ring_free(struc
+  
+  /**
+   * nfp_net_tx_ring_alloc() - Allocate resource for a TX ring
++  * @dp:        NFP Net data path struct
+   * @tx_ring:   TX Ring structure to allocate
+++<<<<<<< HEAD
+ + * @cnt:       Ring buffer count
+ + *
+ + * Return: 0 on success, negative errno otherwise.
+ + */
+ +static int nfp_net_tx_ring_alloc(struct nfp_net_tx_ring *tx_ring, u32 cnt)
+ +{
+ +	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
+ +	struct nfp_net *nn = r_vec->nfp_net;
+ +	struct pci_dev *pdev = nn->pdev;
+++=======
++  * @is_xdp:    True if ring will be used for XDP
++  *
++  * Return: 0 on success, negative errno otherwise.
++  */
++ static int
++ nfp_net_tx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring,
++ 		      bool is_xdp)
++ {
++ 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	int sz;
+  
+- 	tx_ring->cnt = cnt;
++ 	tx_ring->cnt = dp->txd_cnt;
+  
+  	tx_ring->size = sizeof(*tx_ring->txds) * tx_ring->cnt;
+ -	tx_ring->txds = dma_zalloc_coherent(dp->dev, tx_ring->size,
+ +	tx_ring->txds = dma_zalloc_coherent(&pdev->dev, tx_ring->size,
+  					    &tx_ring->dma, GFP_KERNEL);
+  	if (!tx_ring->txds)
+  		goto err_alloc;
+@@@ -1550,20 -1777,25 +1563,37 @@@ err_alloc
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static struct nfp_net_tx_ring *
+ +nfp_net_tx_ring_set_prepare(struct nfp_net *nn, struct nfp_net_ring_set *s)
+++=======
++ static int nfp_net_tx_rings_prepare(struct nfp_net *nn, struct nfp_net_dp *dp)
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  {
+- 	struct nfp_net_tx_ring *rings;
+  	unsigned int r;
+  
+- 	rings = kcalloc(s->n_rings, sizeof(*rings), GFP_KERNEL);
+- 	if (!rings)
+- 		return NULL;
++ 	dp->tx_rings = kcalloc(dp->num_tx_rings, sizeof(*dp->tx_rings),
++ 			       GFP_KERNEL);
++ 	if (!dp->tx_rings)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	for (r = 0; r < s->n_rings; r++) {
+ +		nfp_net_tx_ring_init(&rings[r], &nn->r_vecs[r], r);
+ +
+ +		if (nfp_net_tx_ring_alloc(&rings[r], s->dcnt))
+++=======
++ 	for (r = 0; r < dp->num_tx_rings; r++) {
++ 		int bias = 0;
++ 
++ 		if (r >= dp->num_stack_tx_rings)
++ 			bias = dp->num_stack_tx_rings;
++ 
++ 		nfp_net_tx_ring_init(&dp->tx_rings[r], &nn->r_vecs[r - bias],
++ 				     r);
++ 
++ 		if (nfp_net_tx_ring_alloc(dp, &dp->tx_rings[r], bias))
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  			goto err_free_prev;
+  	}
+  
+@@@ -1571,35 -1803,19 +1601,37 @@@
+  
+  err_free_prev:
+  	while (r--)
+- 		nfp_net_tx_ring_free(&rings[r]);
+- 	kfree(rings);
+- 	return NULL;
++ 		nfp_net_tx_ring_free(&dp->tx_rings[r]);
++ 	kfree(dp->tx_rings);
++ 	return -ENOMEM;
+  }
+  
+- static void
+- nfp_net_tx_ring_set_swap(struct nfp_net *nn, struct nfp_net_ring_set *s)
++ static void nfp_net_tx_rings_free(struct nfp_net_dp *dp)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_net_ring_set new = *s;
+ +
+ +	s->dcnt = nn->txd_cnt;
+ +	s->rings = nn->tx_rings;
+ +	s->n_rings = nn->num_tx_rings;
+ +
+ +	nn->txd_cnt = new.dcnt;
+ +	nn->tx_rings = new.rings;
+ +	nn->num_tx_rings = new.n_rings;
+ +}
+ +
+ +static void
+ +nfp_net_tx_ring_set_free(struct nfp_net *nn, struct nfp_net_ring_set *s)
+ +{
+ +	struct nfp_net_tx_ring *rings = s->rings;
+++=======
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	unsigned int r;
+  
+- 	for (r = 0; r < s->n_rings; r++)
+- 		nfp_net_tx_ring_free(&rings[r]);
++ 	for (r = 0; r < dp->num_tx_rings; r++)
++ 		nfp_net_tx_ring_free(&dp->tx_rings[r]);
+  
+- 	kfree(rings);
++ 	kfree(dp->tx_rings);
+  }
+  
+  /**
+@@@ -1627,26 -1842,19 +1659,37 @@@ static void nfp_net_rx_ring_free(struc
+  
+  /**
+   * nfp_net_rx_ring_alloc() - Allocate resource for a RX ring
+ - * @dp:	      NFP Net data path struct
+   * @rx_ring:  RX ring to allocate
+++<<<<<<< HEAD
+ + * @fl_bufsz: Size of buffers to allocate
+ + * @cnt:      Ring buffer count
+++=======
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+   *
+   * Return: 0 on success, negative errno otherwise.
+   */
+  static int
+++<<<<<<< HEAD
+ +nfp_net_rx_ring_alloc(struct nfp_net_rx_ring *rx_ring, unsigned int fl_bufsz,
+ +		      u32 cnt)
+++=======
++ nfp_net_rx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring)
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  {
+ +	struct nfp_net_r_vector *r_vec = rx_ring->r_vec;
+ +	struct nfp_net *nn = r_vec->nfp_net;
+ +	struct pci_dev *pdev = nn->pdev;
+  	int sz;
+  
+++<<<<<<< HEAD
+ +	rx_ring->cnt = cnt;
+ +	rx_ring->bufsz = fl_bufsz;
+ +
+++=======
++ 	rx_ring->cnt = dp->rxd_cnt;
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	rx_ring->size = sizeof(*rx_ring->rxds) * rx_ring->cnt;
+ -	rx_ring->rxds = dma_zalloc_coherent(dp->dev, rx_ring->size,
+ +	rx_ring->rxds = dma_zalloc_coherent(&pdev->dev, rx_ring->size,
+  					    &rx_ring->dma, GFP_KERNEL);
+  	if (!rx_ring->rxds)
+  		goto err_alloc;
+@@@ -1667,24 -1871,22 +1710,37 @@@ err_alloc
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static struct nfp_net_rx_ring *
+ +nfp_net_rx_ring_set_prepare(struct nfp_net *nn, struct nfp_net_ring_set *s)
+ +{
+ +	unsigned int fl_bufsz =	nfp_net_calc_fl_bufsz(nn, s->mtu);
+ +	struct nfp_net_rx_ring *rings;
+++=======
++ static int nfp_net_rx_rings_prepare(struct nfp_net *nn, struct nfp_net_dp *dp)
++ {
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	unsigned int r;
+  
+- 	rings = kcalloc(s->n_rings, sizeof(*rings), GFP_KERNEL);
+- 	if (!rings)
+- 		return NULL;
++ 	dp->rx_rings = kcalloc(dp->num_rx_rings, sizeof(*dp->rx_rings),
++ 			       GFP_KERNEL);
++ 	if (!dp->rx_rings)
++ 		return -ENOMEM;
+  
+- 	for (r = 0; r < s->n_rings; r++) {
+- 		nfp_net_rx_ring_init(&rings[r], &nn->r_vecs[r], r);
++ 	for (r = 0; r < dp->num_rx_rings; r++) {
++ 		nfp_net_rx_ring_init(&dp->rx_rings[r], &nn->r_vecs[r], r);
+  
+++<<<<<<< HEAD
+ +		if (nfp_net_rx_ring_alloc(&rings[r], fl_bufsz, s->dcnt))
+ +			goto err_free_prev;
+ +
+ +		if (nfp_net_rx_ring_bufs_alloc(nn, &rings[r]))
+++=======
++ 		if (nfp_net_rx_ring_alloc(dp, &dp->rx_rings[r]))
++ 			goto err_free_prev;
++ 
++ 		if (nfp_net_rx_ring_bufs_alloc(dp, &dp->rx_rings[r]))
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  			goto err_free_ring;
+  	}
+  
+@@@ -1692,43 -1894,24 +1748,57 @@@
+  
+  err_free_prev:
+  	while (r--) {
+++<<<<<<< HEAD
+ +		nfp_net_rx_ring_bufs_free(nn, &rings[r]);
+++=======
++ 		nfp_net_rx_ring_bufs_free(dp, &dp->rx_rings[r]);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  err_free_ring:
+- 		nfp_net_rx_ring_free(&rings[r]);
++ 		nfp_net_rx_ring_free(&dp->rx_rings[r]);
+  	}
+- 	kfree(rings);
+- 	return NULL;
++ 	kfree(dp->rx_rings);
++ 	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +nfp_net_rx_ring_set_swap(struct nfp_net *nn, struct nfp_net_ring_set *s)
+ +{
+ +	struct nfp_net_ring_set new = *s;
+ +
+ +	s->mtu = nn->netdev->mtu;
+ +	s->dcnt = nn->rxd_cnt;
+ +	s->rings = nn->rx_rings;
+ +	s->n_rings = nn->num_rx_rings;
+ +
+ +	nn->netdev->mtu = new.mtu;
+ +	nn->fl_bufsz = nfp_net_calc_fl_bufsz(nn, new.mtu);
+ +	nn->rxd_cnt = new.dcnt;
+ +	nn->rx_rings = new.rings;
+ +	nn->num_rx_rings = new.n_rings;
+ +}
+ +
+ +static void
+ +nfp_net_rx_ring_set_free(struct nfp_net *nn, struct nfp_net_ring_set *s)
+ +{
+ +	struct nfp_net_rx_ring *rings = s->rings;
+ +	unsigned int r;
+ +
+ +	for (r = 0; r < s->n_rings; r++) {
+ +		nfp_net_rx_ring_bufs_free(nn, &rings[r]);
+ +		nfp_net_rx_ring_free(&rings[r]);
+++=======
++ static void nfp_net_rx_rings_free(struct nfp_net_dp *dp)
++ {
++ 	unsigned int r;
++ 
++ 	for (r = 0; r < dp->num_rx_rings; r++) {
++ 		nfp_net_rx_ring_bufs_free(dp, &dp->rx_rings[r]);
++ 		nfp_net_rx_ring_free(&dp->rx_rings[r]);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	}
+  
+- 	kfree(rings);
++ 	kfree(dp->rx_rings);
+  }
+  
+  static void
+@@@ -2018,19 -2205,10 +2088,22 @@@ static void nfp_net_open_stack(struct n
+  static int nfp_net_netdev_open(struct net_device *netdev)
+  {
+  	struct nfp_net *nn = netdev_priv(netdev);
+++<<<<<<< HEAD
+ +	struct nfp_net_ring_set rx = {
+ +		.n_rings = nn->num_rx_rings,
+ +		.mtu = nn->netdev->mtu,
+ +		.dcnt = nn->rxd_cnt,
+ +	};
+ +	struct nfp_net_ring_set tx = {
+ +		.n_rings = nn->num_tx_rings,
+ +		.dcnt = nn->txd_cnt,
+ +	};
+++=======
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	int err, r;
+  
+ -	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_ENABLE) {
+ -		nn_err(nn, "Dev is already enabled: 0x%08x\n", nn->dp.ctrl);
+ +	if (nn->ctrl & NFP_NET_CFG_CTRL_ENABLE) {
+ +		nn_err(nn, "Dev is already enabled: 0x%08x\n", nn->ctrl);
+  		return -EBUSY;
+  	}
+  
+@@@ -2057,22 -2235,18 +2130,30 @@@
+  			goto err_cleanup_vec_p;
+  	}
+  
+++<<<<<<< HEAD
+ +	nn->rx_rings = nfp_net_rx_ring_set_prepare(nn, &rx);
+ +	if (!nn->rx_rings) {
+ +		err = -ENOMEM;
+++=======
++ 	err = nfp_net_rx_rings_prepare(nn, &nn->dp);
++ 	if (err)
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  		goto err_cleanup_vec;
+- 	}
+  
+++<<<<<<< HEAD
+ +	nn->tx_rings = nfp_net_tx_ring_set_prepare(nn, &tx);
+ +	if (!nn->tx_rings) {
+ +		err = -ENOMEM;
+++=======
++ 	err = nfp_net_tx_rings_prepare(nn, &nn->dp);
++ 	if (err)
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  		goto err_free_rx_rings;
+- 	}
+  
+  	for (r = 0; r < nn->max_r_vecs; r++)
+ -		nfp_net_vector_assign_rings(&nn->dp, &nn->r_vecs[r], r);
+ +		nfp_net_vector_assign_rings(nn, &nn->r_vecs[r], r);
+  
+ -	err = netif_set_real_num_tx_queues(netdev, nn->dp.num_stack_tx_rings);
+ +	err = netif_set_real_num_tx_queues(netdev, nn->num_tx_rings);
+  	if (err)
+  		goto err_free_rings;
+  
+@@@ -2102,11 -2276,11 +2183,17 @@@
+  	return 0;
+  
+  err_free_rings:
+++<<<<<<< HEAD
+ +	nfp_net_tx_ring_set_free(nn, &tx);
+ +err_free_rx_rings:
+ +	nfp_net_rx_ring_set_free(nn, &rx);
+++=======
++ 	nfp_net_tx_rings_free(&nn->dp);
++ err_free_rx_rings:
++ 	nfp_net_rx_rings_free(&nn->dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  err_cleanup_vec:
+ -	r = nn->dp.num_r_vecs;
+ +	r = nn->num_r_vecs;
+  err_cleanup_vec_p:
+  	while (r--)
+  		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
+@@@ -2220,32 -2394,33 +2307,60 @@@ static void nfp_net_rss_init_itbl(struc
+  
+  	for (i = 0; i < sizeof(nn->rss_itbl); i++)
+  		nn->rss_itbl[i] =
+++<<<<<<< HEAD
+ +			ethtool_rxfh_indir_default(i, nn->num_rx_rings);
+ +}
+ +
+ +static int
+ +nfp_net_ring_swap_enable(struct nfp_net *nn, unsigned int *num_vecs,
+ +			 struct nfp_net_ring_set *rx,
+ +			 struct nfp_net_ring_set *tx)
+++=======
++ 			ethtool_rxfh_indir_default(i, nn->dp.num_rx_rings);
++ }
++ 
++ static void nfp_net_dp_swap(struct nfp_net *nn, struct nfp_net_dp *dp)
++ {
++ 	struct nfp_net_dp new_dp = *dp;
++ 
++ 	*dp = nn->dp;
++ 	nn->dp = new_dp;
++ 
++ 	nn->dp.netdev->mtu = new_dp.mtu;
++ 
++ 	if (!netif_is_rxfh_configured(nn->dp.netdev))
++ 		nfp_net_rss_init_itbl(nn);
++ }
++ 
++ static int nfp_net_dp_swap_enable(struct nfp_net *nn, struct nfp_net_dp *dp)
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  {
+  	unsigned int r;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (rx)
+ +		nfp_net_rx_ring_set_swap(nn, rx);
+ +	if (tx)
+ +		nfp_net_tx_ring_set_swap(nn, tx);
+ +
+ +	swap(*num_vecs, nn->num_r_vecs);
+++=======
++ 	nfp_net_dp_swap(nn, dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  
+  	for (r = 0; r <	nn->max_r_vecs; r++)
+ -		nfp_net_vector_assign_rings(&nn->dp, &nn->r_vecs[r], r);
+ +		nfp_net_vector_assign_rings(nn, &nn->r_vecs[r], r);
+ +
+++<<<<<<< HEAD
+ +	if (!netif_is_rxfh_configured(nn->netdev))
+ +		nfp_net_rss_init_itbl(nn);
+  
+ +	err = netif_set_real_num_rx_queues(nn->netdev,
+ +					   nn->num_rx_rings);
+++=======
++ 	err = netif_set_real_num_rx_queues(nn->dp.netdev, nn->dp.num_rx_rings);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	if (err)
+  		return err;
+  
+@@@ -2259,111 -2434,135 +2374,209 @@@
+  	return __nfp_net_set_config_and_enable(nn);
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +nfp_net_ring_reconfig_down(struct nfp_net *nn,
+ +			   struct nfp_net_ring_set *rx,
+ +			   struct nfp_net_ring_set *tx,
+ +			   unsigned int num_vecs)
+ +{
+ +	nn->netdev->mtu = rx ? rx->mtu : nn->netdev->mtu;
+ +	nn->fl_bufsz = nfp_net_calc_fl_bufsz(nn, nn->netdev->mtu);
+ +	nn->rxd_cnt = rx ? rx->dcnt : nn->rxd_cnt;
+ +	nn->txd_cnt = tx ? tx->dcnt : nn->txd_cnt;
+ +	nn->num_rx_rings = rx ? rx->n_rings : nn->num_rx_rings;
+ +	nn->num_tx_rings = tx ? tx->n_rings : nn->num_tx_rings;
+ +	nn->num_r_vecs = num_vecs;
+ +
+ +	if (!netif_is_rxfh_configured(nn->netdev))
+ +		nfp_net_rss_init_itbl(nn);
+ +}
+ +
+ +int
+ +nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
+ +		      struct nfp_net_ring_set *tx)
+++=======
++ struct nfp_net_dp *nfp_net_clone_dp(struct nfp_net *nn)
++ {
++ 	struct nfp_net_dp *new;
++ 
++ 	new = kmalloc(sizeof(*new), GFP_KERNEL);
++ 	if (!new)
++ 		return NULL;
++ 
++ 	*new = nn->dp;
++ 
++ 	/* Clear things which need to be recomputed */
++ 	new->fl_bufsz = 0;
++ 	new->tx_rings = NULL;
++ 	new->rx_rings = NULL;
++ 	new->num_r_vecs = 0;
++ 	new->num_stack_tx_rings = 0;
++ 
++ 	return new;
++ }
++ 
++ static int nfp_net_check_config(struct nfp_net *nn, struct nfp_net_dp *dp)
++ {
++ 	/* XDP-enabled tests */
++ 	if (!dp->xdp_prog)
++ 		return 0;
++ 	if (dp->fl_bufsz > PAGE_SIZE) {
++ 		nn_warn(nn, "MTU too large w/ XDP enabled\n");
++ 		return -EINVAL;
++ 	}
++ 	if (dp->num_tx_rings > nn->max_tx_rings) {
++ 		nn_warn(nn, "Insufficient number of TX rings w/ XDP enabled\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_dp *dp)
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  {
+ -	int r, err;
+ +	unsigned int num_vecs, r;
+ +	int err;
+  
+ -	dp->fl_bufsz = nfp_net_calc_fl_bufsz(dp);
+ +	num_vecs = max(rx ? rx->n_rings : nn->num_rx_rings,
+ +		       tx ? tx->n_rings : nn->num_tx_rings);
+  
+++<<<<<<< HEAD
+ +	if (!netif_running(nn->netdev)) {
+ +		nfp_net_ring_reconfig_down(nn, rx, tx, num_vecs);
+ +		return 0;
+++=======
++ 	dp->num_stack_tx_rings = dp->num_tx_rings;
++ 	if (dp->xdp_prog)
++ 		dp->num_stack_tx_rings -= dp->num_rx_rings;
++ 
++ 	dp->num_r_vecs = max(dp->num_rx_rings, dp->num_stack_tx_rings);
++ 
++ 	err = nfp_net_check_config(nn, dp);
++ 	if (err)
++ 		goto exit_free_dp;
++ 
++ 	if (!netif_running(dp->netdev)) {
++ 		nfp_net_dp_swap(nn, dp);
++ 		err = 0;
++ 		goto exit_free_dp;
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	}
+  
+  	/* Prepare new rings */
+ -	for (r = nn->dp.num_r_vecs; r < dp->num_r_vecs; r++) {
+ +	for (r = nn->num_r_vecs; r < num_vecs; r++) {
+  		err = nfp_net_prepare_vector(nn, &nn->r_vecs[r], r);
+  		if (err) {
+ -			dp->num_r_vecs = r;
+ +			num_vecs = r;
+ +			goto err_cleanup_vecs;
+ +		}
+ +	}
+++<<<<<<< HEAD
+ +	if (rx) {
+ +		if (!nfp_net_rx_ring_set_prepare(nn, rx)) {
+ +			err = -ENOMEM;
+  			goto err_cleanup_vecs;
+  		}
+  	}
+ +	if (tx) {
+ +		if (!nfp_net_tx_ring_set_prepare(nn, tx)) {
+ +			err = -ENOMEM;
+ +			goto err_free_rx;
+ +		}
+ +	}
+++=======
++ 
++ 	err = nfp_net_rx_rings_prepare(nn, dp);
++ 	if (err)
++ 		goto err_cleanup_vecs;
++ 
++ 	err = nfp_net_tx_rings_prepare(nn, dp);
++ 	if (err)
++ 		goto err_free_rx;
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  
+  	/* Stop device, swap in new rings, try to start the firmware */
+  	nfp_net_close_stack(nn);
+  	nfp_net_clear_config_and_disable(nn);
+  
+++<<<<<<< HEAD
+ +	err = nfp_net_ring_swap_enable(nn, &num_vecs, rx, tx);
+++=======
++ 	err = nfp_net_dp_swap_enable(nn, dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  	if (err) {
+  		int err2;
+  
+  		nfp_net_clear_config_and_disable(nn);
+  
+  		/* Try with old configuration and old rings */
+++<<<<<<< HEAD
+ +		err2 = nfp_net_ring_swap_enable(nn, &num_vecs, rx, tx);
+++=======
++ 		err2 = nfp_net_dp_swap_enable(nn, dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  		if (err2)
+  			nn_err(nn, "Can't restore ring config - FW communication failed (%d,%d)\n",
+  			       err, err2);
+  	}
+ -	for (r = dp->num_r_vecs - 1; r >= nn->dp.num_r_vecs; r--)
+ +	for (r = num_vecs - 1; r >= nn->num_r_vecs; r--)
+  		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
+  
+++<<<<<<< HEAD
+ +	if (rx)
+ +		nfp_net_rx_ring_set_free(nn, rx);
+ +	if (tx)
+ +		nfp_net_tx_ring_set_free(nn, tx);
+++=======
++ 	nfp_net_rx_rings_free(dp);
++ 	nfp_net_tx_rings_free(dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  
+  	nfp_net_open_stack(nn);
+ -exit_free_dp:
+ -	kfree(dp);
+  
+  	return err;
+  
+  err_free_rx:
+++<<<<<<< HEAD
+ +	if (rx)
+ +		nfp_net_rx_ring_set_free(nn, rx);
+++=======
++ 	nfp_net_rx_rings_free(dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  err_cleanup_vecs:
+ -	for (r = dp->num_r_vecs - 1; r >= nn->dp.num_r_vecs; r--)
+ +	for (r = num_vecs - 1; r >= nn->num_r_vecs; r--)
+  		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
+ -	kfree(dp);
+  	return err;
+  }
+  
+  static int nfp_net_change_mtu(struct net_device *netdev, int new_mtu)
+  {
+  	struct nfp_net *nn = netdev_priv(netdev);
+++<<<<<<< HEAD
+ +	struct nfp_net_ring_set rx = {
+ +		.n_rings = nn->num_rx_rings,
+ +		.mtu = new_mtu,
+ +		.dcnt = nn->rxd_cnt,
+ +	};
+ +
+ +	return nfp_net_ring_reconfig(nn, &rx, NULL);
+++=======
++ 	struct nfp_net_dp *dp;
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->mtu = new_mtu;
++ 
++ 	return nfp_net_ring_reconfig(nn, dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  }
+  
+ -static void nfp_net_stat64(struct net_device *netdev,
+ -			   struct rtnl_link_stats64 *stats)
+ +static struct rtnl_link_stats64 *nfp_net_stat64(struct net_device *netdev,
+ +						struct rtnl_link_stats64 *stats)
+  {
+  	struct nfp_net *nn = netdev_priv(netdev);
+  	int r;
+@@@ -2595,8 -2846,89 +2808,93 @@@ static void nfp_net_del_vxlan_port(stru
+  		nfp_net_set_vxlan_port(nn, idx, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nfp_net_xdp_offload(struct nfp_net *nn, struct bpf_prog *prog)
++ {
++ 	struct tc_cls_bpf_offload cmd = {
++ 		.prog = prog,
++ 	};
++ 	int ret;
++ 
++ 	if (!nfp_net_ebpf_capable(nn))
++ 		return -EINVAL;
++ 
++ 	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF) {
++ 		if (!nn->dp.bpf_offload_xdp)
++ 			return prog ? -EBUSY : 0;
++ 		cmd.command = prog ? TC_CLSBPF_REPLACE : TC_CLSBPF_DESTROY;
++ 	} else {
++ 		if (!prog)
++ 			return 0;
++ 		cmd.command = TC_CLSBPF_ADD;
++ 	}
++ 
++ 	ret = nfp_net_bpf_offload(nn, &cmd);
++ 	/* Stop offload if replace not possible */
++ 	if (ret && cmd.command == TC_CLSBPF_REPLACE)
++ 		nfp_net_xdp_offload(nn, NULL);
++ 	nn->dp.bpf_offload_xdp = prog && !ret;
++ 	return ret;
++ }
++ 
++ static int nfp_net_xdp_setup(struct nfp_net *nn, struct bpf_prog *prog)
++ {
++ 	struct bpf_prog *old_prog = nn->dp.xdp_prog;
++ 	struct nfp_net_dp *dp;
++ 	int err;
++ 
++ 	if (prog && prog->xdp_adjust_head) {
++ 		nn_err(nn, "Does not support bpf_xdp_adjust_head()\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (!prog && !nn->dp.xdp_prog)
++ 		return 0;
++ 	if (prog && nn->dp.xdp_prog) {
++ 		prog = xchg(&nn->dp.xdp_prog, prog);
++ 		bpf_prog_put(prog);
++ 		nfp_net_xdp_offload(nn, nn->dp.xdp_prog);
++ 		return 0;
++ 	}
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->xdp_prog = prog;
++ 	dp->num_tx_rings += prog ? nn->dp.num_rx_rings : -nn->dp.num_rx_rings;
++ 
++ 	/* We need RX reconfig to remap the buffers (BIDIR vs FROM_DEV) */
++ 	err = nfp_net_ring_reconfig(nn, dp);
++ 	if (err)
++ 		return err;
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	nfp_net_xdp_offload(nn, nn->dp.xdp_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return nfp_net_xdp_setup(nn, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!nn->dp.xdp_prog;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  static const struct net_device_ops nfp_net_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= nfp_net_netdev_open,
+  	.ndo_stop		= nfp_net_netdev_close,
+  	.ndo_start_xmit		= nfp_net_tx,
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index dfbf6b94ff5b,ed22a813e579..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@@ -173,23 -186,16 +173,36 @@@ static void nfp_net_get_ringparam(struc
+  
+  static int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_net_ring_set *reconfig_rx = NULL, *reconfig_tx = NULL;
+ +	struct nfp_net_ring_set rx = {
+ +		.n_rings = nn->num_rx_rings,
+ +		.mtu = nn->netdev->mtu,
+ +		.dcnt = rxd_cnt,
+ +	};
+ +	struct nfp_net_ring_set tx = {
+ +		.n_rings = nn->num_tx_rings,
+ +		.dcnt = txd_cnt,
+ +	};
+ +
+ +	if (nn->rxd_cnt != rxd_cnt)
+ +		reconfig_rx = &rx;
+ +	if (nn->txd_cnt != txd_cnt)
+ +		reconfig_tx = &tx;
+ +
+ +	return nfp_net_ring_reconfig(nn, reconfig_rx, reconfig_tx);
+++=======
++ 	struct nfp_net_dp *dp;
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->rxd_cnt = rxd_cnt;
++ 	dp->txd_cnt = txd_cnt;
++ 
++ 	return nfp_net_ring_reconfig(nn, dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  }
+  
+  static int nfp_net_set_ringparam(struct net_device *netdev,
+@@@ -735,23 -754,19 +748,39 @@@ static void nfp_net_get_channels(struc
+  static int nfp_net_set_num_rings(struct nfp_net *nn, unsigned int total_rx,
+  				 unsigned int total_tx)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_net_ring_set *reconfig_rx = NULL, *reconfig_tx = NULL;
+ +	struct nfp_net_ring_set rx = {
+ +		.n_rings = total_rx,
+ +		.mtu = nn->netdev->mtu,
+ +		.dcnt = nn->rxd_cnt,
+ +	};
+ +	struct nfp_net_ring_set tx = {
+ +		.n_rings = total_tx,
+ +		.dcnt = nn->txd_cnt,
+ +	};
+ +
+ +	if (nn->num_rx_rings != total_rx)
+ +		reconfig_rx = &rx;
+ +	if (nn->num_tx_rings != total_tx)
+ +		reconfig_tx = &tx;
+ +
+ +	return nfp_net_ring_reconfig(nn, reconfig_rx, reconfig_tx);
+++=======
++ 	struct nfp_net_dp *dp;
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->num_rx_rings = total_rx;
++ 	dp->num_tx_rings = total_tx;
++ 	/* nfp_net_check_config() will catch num_tx_rings > nn->max_tx_rings */
++ 	if (dp->xdp_prog)
++ 		dp->num_tx_rings += total_rx;
++ 
++ 	return nfp_net_ring_reconfig(nn, dp);
+++>>>>>>> 892a7f700b36 (nfp: switch to using data path structures for reconfiguration)
+  }
+  
+  static int nfp_net_set_channels(struct net_device *netdev,
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
