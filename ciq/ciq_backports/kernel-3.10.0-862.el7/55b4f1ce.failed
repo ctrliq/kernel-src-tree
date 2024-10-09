@@ -1,0 +1,227 @@
+drm/i915: Fix eviction when the GGTT is idle but full
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 55b4f1ce2f23692c57205b9974fba61baa4b9321
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/55b4f1ce.failed
+
+In the full-ppgtt world, we can fill the GGTT full of context objects.
+These context objects are currently implicitly tracked by the requests
+that pin them i.e. they are only unpinned when the request is completed
+and retired, but we do not have the link from the vma to the request
+(anymore). In order to unpin those contexts, we have to issue another
+request and wait upon the switch to the kernel context.
+
+The bug during eviction was that we assumed that a full GGTT meant we
+would have requests on the GGTT timeline, and so we missed situations
+where those requests where merely in flight (and when even they have not
+yet been submitted to hw yet). The fix employed here is to change the
+already-is-idle test to no look at the execution timeline, but count the
+outstanding requests and then check that we have switched to the kernel
+context. Erring on the side of overkill here just means that we stall a
+little longer than may be strictly required, but we only expect to hit
+this path in extreme corner cases where returning an erroneous error is
+worse than the delay.
+
+v2: Logical inversion when swapping over branches.
+
+Fixes: 80b204bce8f2 ("drm/i915: Enable multiple timelines")
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171012125726.14736-1-chris@chris-wilson.co.uk
+(cherry picked from commit 55b4f1ce2f23692c57205b9974fba61baa4b9321)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_evict.c
+diff --cc drivers/gpu/drm/i915/i915_gem_evict.c
+index d534a316a16e,ee4811ffb7aa..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@@ -33,25 -33,50 +33,24 @@@
+  #include "intel_drv.h"
+  #include "i915_trace.h"
+  
+- static bool ggtt_is_idle(struct drm_i915_private *dev_priv)
++ static bool ggtt_is_idle(struct drm_i915_private *i915)
+  {
+- 	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+- 	struct intel_engine_cs *engine;
+- 	enum intel_engine_id id;
++        struct intel_engine_cs *engine;
++        enum intel_engine_id id;
+  
+- 	for_each_engine(engine, dev_priv, id) {
+- 		struct intel_timeline *tl;
++        if (i915->gt.active_requests)
++ 	       return false;
+  
+- 		tl = &ggtt->base.timeline.engine[engine->id];
+- 		if (i915_gem_active_isset(&tl->last_request))
+- 			return false;
+- 	}
++        for_each_engine(engine, i915, id) {
++ 	       if (engine->last_retired_context != i915->kernel_context)
++ 		       return false;
++        }
+  
+- 	return true;
++        return true;
+  }
+  
+ -static int ggtt_flush(struct drm_i915_private *i915)
+ -{
+ -	int err;
+ -
+ -	/* Not everything in the GGTT is tracked via vma (otherwise we
+ -	 * could evict as required with minimal stalling) so we are forced
+ -	 * to idle the GPU and explicitly retire outstanding requests in
+ -	 * the hopes that we can then remove contexts and the like only
+ -	 * bound by their active reference.
+ -	 */
+ -	err = i915_gem_switch_to_kernel_context(i915);
+ -	if (err)
+ -		return err;
+ -
+ -	err = i915_gem_wait_for_idle(i915,
+ -				     I915_WAIT_INTERRUPTIBLE |
+ -				     I915_WAIT_LOCKED);
+ -	if (err)
+ -		return err;
+ -
+ -	return 0;
+ -}
+ -
+  static bool
+ -mark_free(struct drm_mm_scan *scan,
+ -	  struct i915_vma *vma,
+ -	  unsigned int flags,
+ -	  struct list_head *unwind)
+ +mark_free(struct i915_vma *vma, unsigned int flags, struct list_head *unwind)
+  {
+  	if (i915_vma_is_pinned(vma))
+  		return false;
+@@@ -122,14 -147,24 +121,26 @@@ i915_gem_evict_something(struct i915_ad
+  	 * On each list, the oldest objects lie at the HEAD with the freshest
+  	 * object on the TAIL.
+  	 */
+ -	mode = DRM_MM_INSERT_BEST;
+ -	if (flags & PIN_HIGH)
+ -		mode = DRM_MM_INSERT_HIGH;
+ -	if (flags & PIN_MAPPABLE)
+ -		mode = DRM_MM_INSERT_LOW;
+ -	drm_mm_scan_init_with_range(&scan, &vm->mm,
+ -				    min_size, alignment, cache_level,
+ -				    start, end, mode);
+ -
+ +	if (start != 0 || end != vm->total) {
+ +		drm_mm_init_scan_with_range(&vm->mm, min_size,
+ +					    alignment, cache_level,
+ +					    start, end);
+ +	} else
+ +		drm_mm_init_scan(&vm->mm, min_size, alignment, cache_level);
+ +
+++<<<<<<< HEAD
+ +	if (flags & PIN_NONBLOCK)
+++=======
++ 	/*
++ 	 * Retire before we search the active list. Although we have
++ 	 * reasonable accuracy in our retirement lists, we may have
++ 	 * a stray pin (preventing eviction) that can only be resolved by
++ 	 * retiring.
++ 	 */
++ 	if (!(flags & PIN_NONBLOCK))
++ 		i915_gem_retire_requests(dev_priv);
++ 	else
+++>>>>>>> 55b4f1ce2f23 (drm/i915: Fix eviction when the GGTT is idle but full)
+  		phases[1] = NULL;
+  
+  search_again:
+@@@ -142,14 -177,13 +153,15 @@@
+  	} while (*++phase);
+  
+  	/* Nothing found, clean up and bail out! */
+ -	list_for_each_entry_safe(vma, next, &eviction_list, evict_link) {
+ -		ret = drm_mm_scan_remove_block(&scan, &vma->node);
+ +	list_for_each_entry_safe(vma, next, &eviction_list, exec_list) {
+ +		ret = drm_mm_scan_remove_block(&vma->node);
+  		BUG_ON(ret);
+ +
+ +		INIT_LIST_HEAD(&vma->exec_list);
+  	}
+  
+- 	/* Can we unpin some objects such as idle hw contents,
++ 	/*
++ 	 * Can we unpin some objects such as idle hw contents,
+  	 * or pending flips? But since only the GGTT has global entries
+  	 * such as scanouts, rinbuffers and contexts, we can skip the
+  	 * purge when inspecting per-process local address spaces.
+@@@ -157,32 -191,33 +169,62 @@@
+  	if (!i915_is_ggtt(vm) || flags & PIN_NONBLOCK)
+  		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	if (ggtt_is_idle(dev_priv)) {
+ +		/* If we still have pending pageflip completions, drop
+ +		 * back to userspace to give our workqueues time to
+ +		 * acquire our locks and unpin the old scanouts.
+ +		 */
+ +		return intel_has_pending_fb_unpin(vm->dev) ? -EAGAIN : -ENOSPC;
+ +	}
+ +
+ +	/* Not everything in the GGTT is tracked via vma (otherwise we
+ +	 * could evict as required with minimal stalling) so we are forced
+ +	 * to idle the GPU and explicitly retire outstanding requests in
+ +	 * the hopes that we can then remove contexts and the like only
+ +	 * bound by their active reference.
+ +	 */
+ +	ret = i915_gem_switch_to_kernel_context(dev_priv);
+ +	if (ret)
+ +		return ret;
+ +
+ +	ret = i915_gem_wait_for_idle(dev_priv,
+ +				     I915_WAIT_INTERRUPTIBLE |
+ +				     I915_WAIT_LOCKED);
+ +	if (ret)
+ +		return ret;
+ +
+ +	i915_gem_retire_requests(dev_priv);
+ +	goto search_again;
+++=======
++ 	/*
++ 	 * Not everything in the GGTT is tracked via VMA using
++ 	 * i915_vma_move_to_active(), otherwise we could evict as required
++ 	 * with minimal stalling. Instead we are forced to idle the GPU and
++ 	 * explicitly retire outstanding requests which will then remove
++ 	 * the pinning for active objects such as contexts and ring,
++ 	 * enabling us to evict them on the next iteration.
++ 	 *
++ 	 * To ensure that all user contexts are evictable, we perform
++ 	 * a switch to the perma-pinned kernel context. This all also gives
++ 	 * us a termination condition, when the last retired context is
++ 	 * the kernel's there is no more we can evict.
++ 	 */
++ 	if (!ggtt_is_idle(dev_priv)) {
++ 		ret = ggtt_flush(dev_priv);
++ 		if (ret)
++ 			return ret;
++ 
++ 		goto search_again;
++ 	}
++ 
++ 	/*
++ 	 * If we still have pending pageflip completions, drop
++ 	 * back to userspace to give our workqueues time to
++ 	 * acquire our locks and unpin the old scanouts.
++ 	 */
++ 	return intel_has_pending_fb_unpin(dev_priv) ? -EAGAIN : -ENOSPC;
+++>>>>>>> 55b4f1ce2f23 (drm/i915: Fix eviction when the GGTT is idle but full)
+  
+  found:
+  	/* drm_mm doesn't allow any other other operations while
+* Unmerged path drivers/gpu/drm/i915/i915_gem_evict.c
