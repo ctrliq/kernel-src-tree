@@ -1,0 +1,329 @@
+scsi: mpt3sas: For NVME device, issue a protocol level reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: For NVME device, issue a protocol level reset (Tomas Henzl) [1513855]
+Rebuild_FUZZ: 94.74%
+commit-author Chaitra P B <chaitra.basappa@broadcom.com>
+commit c1a6c5ac4278d406c112cc2f038e6e506feadff9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c1a6c5ac.failed
+
+1) Manufacturing Page 11 contains parameters to control internal
+   firmware behavior. Based on AddlFlags2 field FW/Driver behaviour can
+   be changed, (flag tm_custom_handling is used for this)
+
+a) For PCIe device, protocol level reset should be used if flag
+   tm_custom_handling is 0.  Since Abort Task Set, LUN reset and Target
+   reset will result in a protocol level reset. Drivers should issue
+   only one type of this reset, if that fails then it should escalate to
+   a controller reset (diag reset/OCR).
+
+b) If the driver has control over the TM reset timeout value, then
+   driver should use the value exposed in PCIe Device Page 2 for pcie
+   device (field ControllerResetTO).
+
+	Signed-off-by: Chaitra P B <chaitra.basappa@broadcom.com>
+	Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c1a6c5ac4278d406c112cc2f038e6e506feadff9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.h
+#	drivers/scsi/mpt3sas/mpt3sas_ctl.c
+#	drivers/scsi/mpt3sas/mpt3sas_scsih.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.h
+index 1182f6bb1693,7a9f0ac30359..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@@ -136,6 -140,19 +136,22 @@@
+  
+  #define FW_IMG_HDR_READ_TIMEOUT	15
+  /*
+++<<<<<<< HEAD
+++=======
++  * NVMe defines
++  */
++ #define	NVME_PRP_SIZE			8	/* PRP size */
++ #define	NVME_CMD_PRP1_OFFSET		24	/* PRP1 offset in NVMe cmd */
++ #define	NVME_CMD_PRP2_OFFSET		32	/* PRP2 offset in NVMe cmd */
++ #define	NVME_ERROR_RESPONSE_SIZE	16	/* Max NVME Error Response */
++ #define NVME_TASK_ABORT_MIN_TIMEOUT	6
++ #define NVME_TASK_ABORT_MAX_TIMEOUT	60
++ #define NVME_TASK_MNGT_CUSTOM_MASK	(0x0010)
++ #define	NVME_PRP_PAGE_SIZE		4096	/* Page size */
++ 
++ 
++ /*
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+   * reset phases
+   */
+  #define MPT3_IOC_PRE_RESET		1 /* prior to host reset */
+@@@ -1414,12 -1490,11 +1443,20 @@@ u8 mpt3sas_scsih_event_callback(struct 
+  	u32 reply);
+  void mpt3sas_scsih_reset_handler(struct MPT3SAS_ADAPTER *ioc, int reset_phase);
+  
+++<<<<<<< HEAD
+ +int mpt3sas_scsih_issue_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle,
+ +	uint channel, uint id, uint lun, u8 type, u16 smid_task,
+ +	ulong timeout);
+ +int mpt3sas_scsih_issue_locked_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle,
+ +	uint channel, uint id, uint lun, u8 type, u16 smid_task,
+ +	ulong timeout);
+++=======
++ int mpt3sas_scsih_issue_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle, u64 lun,
++ 	u8 type, u16 smid_task, u16 msix_task, u8 timeout, u8 tr_method);
++ int mpt3sas_scsih_issue_locked_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle,
++ 	u64 lun, u8 type, u16 smid_task, u16 msix_task,
++ 	u8 timeout, u8 tr_method);
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  
+  void mpt3sas_scsih_set_tm_flag(struct MPT3SAS_ADAPTER *ioc, u16 handle);
+  void mpt3sas_scsih_clear_tm_flag(struct MPT3SAS_ADAPTER *ioc, u16 handle);
+diff --cc drivers/scsi/mpt3sas/mpt3sas_ctl.c
+index a6a5ecb79a3a,3269ef43f07e..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_ctl.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_ctl.c
+@@@ -630,11 -643,13 +630,16 @@@ _ctl_do_mpt_command(struct MPT3SAS_ADAP
+  {
+  	MPI2RequestHeader_t *mpi_request = NULL, *request;
+  	MPI2DefaultReply_t *mpi_reply;
+++<<<<<<< HEAD
+++=======
++ 	Mpi26NVMeEncapsulatedRequest_t *nvme_encap_request = NULL;
++ 	struct _pcie_device *pcie_device = NULL;
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  	u32 ioc_state;
+  	u16 smid;
+- 	unsigned long timeout;
++ 	u8 timeout;
+  	u8 issue_reset;
+ -	u32 sz, sz_arg;
+ +	u32 sz;
+  	void *psge;
+  	void *data_out = NULL;
+  	dma_addr_t data_out_dma = 0;
+@@@ -1016,9 -1076,19 +1022,25 @@@
+  				ioc->name,
+  				le16_to_cpu(mpi_request->FunctionDependent1));
+  			mpt3sas_halt_firmware(ioc);
+++<<<<<<< HEAD
+ +			mpt3sas_scsih_issue_locked_tm(ioc,
+ +			    le16_to_cpu(mpi_request->FunctionDependent1), 0, 0,
+ +			    0, MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0, 30);
+++=======
++ 			pcie_device = mpt3sas_get_pdev_by_handle(ioc,
++ 				le16_to_cpu(mpi_request->FunctionDependent1));
++ 			if (pcie_device && (!ioc->tm_custom_handling))
++ 				mpt3sas_scsih_issue_locked_tm(ioc,
++ 				  le16_to_cpu(mpi_request->FunctionDependent1),
++ 				  0, MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0,
++ 				  0, pcie_device->reset_timeout,
++ 				  tr_method);
++ 			else
++ 				mpt3sas_scsih_issue_locked_tm(ioc,
++ 				  le16_to_cpu(mpi_request->FunctionDependent1),
++ 				  0, MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0,
++ 				  0, 30, MPI2_SCSITASKMGMT_MSGFLAGS_LINK_RESET);
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  		} else
+  			mpt3sas_base_hard_reset_handler(ioc, FORCE_BIG_HAMMER);
+  	}
+diff --cc drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index 56509c7a0096,3dd70de58132..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@@ -2739,7 -2630,9 +2739,8 @@@ mpt3sas_scsih_clear_tm_flag(struct MPT3
+   * @lun: lun number
+   * @type: MPI2_SCSITASKMGMT_TASKTYPE__XXX (defined in mpi2_init.h)
+   * @smid_task: smid assigned to the task
+ - * @msix_task: MSIX table index supplied by the OS
+   * @timeout: timeout in seconds
++  * @tr_method: Target Reset Method
+   * Context: user
+   *
+   * A generic API for sending task management requests to firmware.
+@@@ -2749,8 -2643,8 +2750,13 @@@
+   * Return SUCCESS or FAILED.
+   */
+  int
+++<<<<<<< HEAD
+ +mpt3sas_scsih_issue_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle, uint channel,
+ +	uint id, uint lun, u8 type, u16 smid_task, ulong timeout)
+++=======
++ mpt3sas_scsih_issue_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle, u64 lun,
++ 	u8 type, u16 smid_task, u16 msix_task, u8 timeout, u8 tr_method)
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  {
+  	Mpi2SCSITaskManagementRequest_t *mpi_request;
+  	Mpi2SCSITaskManagementReply_t *mpi_reply;
+@@@ -2896,13 -2747,14 +2903,23 @@@ out
+  }
+  
+  int mpt3sas_scsih_issue_locked_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle,
+++<<<<<<< HEAD
+ +	uint channel, uint id, uint lun, u8 type, u16 smid_task, ulong timeout)
+++=======
++ 		u64 lun, u8 type, u16 smid_task, u16 msix_task,
++ 		u8 timeout, u8 tr_method)
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  {
+  	int ret;
+  
+  	mutex_lock(&ioc->tm_cmds.mutex);
+++<<<<<<< HEAD
+ +	ret = mpt3sas_scsih_issue_tm(ioc, handle, channel, id, lun, type,
+ +			smid_task, timeout);
+++=======
++ 	ret = mpt3sas_scsih_issue_tm(ioc, handle, lun, type, smid_task,
++ 			msix_task, timeout, tr_method);
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  	mutex_unlock(&ioc->tm_cmds.mutex);
+  
+  	return ret;
+@@@ -3040,10 -2893,15 +3059,22 @@@ scsih_abort(struct scsi_cmnd *scmd
+  	mpt3sas_halt_firmware(ioc);
+  
+  	handle = sas_device_priv_data->sas_target->handle;
+++<<<<<<< HEAD
+ +	r = mpt3sas_scsih_issue_locked_tm(ioc, handle, scmd->device->channel,
+ +	    scmd->device->id, scmd->device->lun,
+ +	    MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK, smid, 30);
+ +
+++=======
++ 	pcie_device = mpt3sas_get_pdev_by_handle(ioc, handle);
++ 	if (pcie_device && (!ioc->tm_custom_handling))
++ 		timeout = ioc->nvme_abort_timeout;
++ 	r = mpt3sas_scsih_issue_locked_tm(ioc, handle, scmd->device->lun,
++ 		MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK,
++ 		st->smid, st->msix_io, timeout, 0);
++ 	/* Command must be cleared after abort */
++ 	if (r == SUCCESS && st->cb_idx != 0xFF)
++ 		r = FAILED;
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+   out:
+  	sdev_printk(KERN_INFO, scmd->device, "task abort: %s scmd(%p)\n",
+  	    ((r == SUCCESS) ? "SUCCESS" : "FAILED"), scmd);
+@@@ -3100,10 -2963,19 +3136,26 @@@ scsih_dev_reset(struct scsi_cmnd *scmd
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	r = mpt3sas_scsih_issue_locked_tm(ioc, handle, scmd->device->channel,
+ +	    scmd->device->id, scmd->device->lun,
+ +	    MPI2_SCSITASKMGMT_TASKTYPE_LOGICAL_UNIT_RESET, 0, 30);
+ +
+++=======
++ 	pcie_device = mpt3sas_get_pdev_by_handle(ioc, handle);
++ 
++ 	if (pcie_device && (!ioc->tm_custom_handling)) {
++ 		tr_timeout = pcie_device->reset_timeout;
++ 		tr_method = MPI26_SCSITASKMGMT_MSGFLAGS_PROTOCOL_LVL_RST_PCIE;
++ 	} else
++ 		tr_method = MPI2_SCSITASKMGMT_MSGFLAGS_LINK_RESET;
++ 	r = mpt3sas_scsih_issue_locked_tm(ioc, handle, scmd->device->lun,
++ 		MPI2_SCSITASKMGMT_TASKTYPE_LOGICAL_UNIT_RESET, 0, 0,
++ 		tr_timeout, tr_method);
++ 	/* Check for busy commands after reset */
++ 	if (r == SUCCESS && atomic_read(&scmd->device->device_busy))
++ 		r = FAILED;
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+   out:
+  	sdev_printk(KERN_INFO, scmd->device, "device reset: %s scmd(%p)\n",
+  	    ((r == SUCCESS) ? "SUCCESS" : "FAILED"), scmd);
+@@@ -3163,10 -3040,19 +3220,26 @@@ scsih_target_reset(struct scsi_cmnd *sc
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	r = mpt3sas_scsih_issue_locked_tm(ioc, handle, scmd->device->channel,
+ +	    scmd->device->id, 0, MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0,
+ +	    30);
+ +
+++=======
++ 	pcie_device = mpt3sas_get_pdev_by_handle(ioc, handle);
++ 
++ 	if (pcie_device && (!ioc->tm_custom_handling)) {
++ 		tr_timeout = pcie_device->reset_timeout;
++ 		tr_method = MPI26_SCSITASKMGMT_MSGFLAGS_PROTOCOL_LVL_RST_PCIE;
++ 	} else
++ 		tr_method = MPI2_SCSITASKMGMT_MSGFLAGS_LINK_RESET;
++ 	r = mpt3sas_scsih_issue_locked_tm(ioc, handle, 0,
++ 		MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0, 0,
++ 	    tr_timeout, tr_method);
++ 	/* Check for busy commands after reset */
++ 	if (r == SUCCESS && atomic_read(&starget->target_busy))
++ 		r = FAILED;
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+   out:
+  	starget_printk(KERN_INFO, starget, "target reset: %s scmd(%p)\n",
+  	    ((r == SUCCESS) ? "SUCCESS" : "FAILED"), scmd);
+@@@ -7591,8 -7492,9 +7680,14 @@@ _scsih_sas_broadcast_primitive_event(st
+  			goto out;
+  
+  		spin_unlock_irqrestore(&ioc->scsi_lookup_lock, flags);
+++<<<<<<< HEAD
+ +		r = mpt3sas_scsih_issue_tm(ioc, handle, 0, 0, lun,
+ +		    MPI2_SCSITASKMGMT_TASKTYPE_QUERY_TASK, smid, 30);
+++=======
++ 		r = mpt3sas_scsih_issue_tm(ioc, handle, lun,
++ 			MPI2_SCSITASKMGMT_TASKTYPE_QUERY_TASK, st->smid,
++ 			st->msix_io, 30, 0);
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  		if (r == FAILED) {
+  			sdev_printk(KERN_WARNING, sdev,
+  			    "mpt3sas_scsih_issue_tm: FAILED when sending "
+@@@ -7631,10 -7533,10 +7726,17 @@@
+  		if (ioc->shost_recovery)
+  			goto out_no_lock;
+  
+++<<<<<<< HEAD
+ +		r = mpt3sas_scsih_issue_tm(ioc, handle, sdev->channel, sdev->id,
+ +		    sdev->lun, MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK, smid,
+ +		    30);
+ +		if (r == FAILED) {
+++=======
++ 		r = mpt3sas_scsih_issue_tm(ioc, handle, sdev->lun,
++ 			MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK, st->smid,
++ 			st->msix_io, 30, 0);
++ 		if (r == FAILED || st->cb_idx != 0xFF) {
+++>>>>>>> c1a6c5ac4278 (scsi: mpt3sas: For NVME device, issue a protocol level reset)
+  			sdev_printk(KERN_WARNING, sdev,
+  			    "mpt3sas_scsih_issue_tm: ABORT_TASK: FAILED : "
+  			    "scmd(%p)\n", scmd);
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index 3f49dd06aaac..678f2f2ba1ed 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -3271,6 +3271,7 @@ _base_static_config_pages(struct MPT3SAS_ADAPTER *ioc)
+ 	Mpi2ConfigReply_t mpi_reply;
+ 	u32 iounit_pg1_flags;
+ 
++	ioc->nvme_abort_timeout = 30;
+ 	mpt3sas_config_get_manufacturing_pg0(ioc, &mpi_reply, &ioc->manu_pg0);
+ 	if (ioc->ir_firmware)
+ 		mpt3sas_config_get_manufacturing_pg10(ioc, &mpi_reply,
+@@ -3289,6 +3290,18 @@ _base_static_config_pages(struct MPT3SAS_ADAPTER *ioc)
+ 		mpt3sas_config_set_manufacturing_pg11(ioc, &mpi_reply,
+ 		    &ioc->manu_pg11);
+ 	}
++	if (ioc->manu_pg11.AddlFlags2 & NVME_TASK_MNGT_CUSTOM_MASK)
++		ioc->tm_custom_handling = 1;
++	else {
++		ioc->tm_custom_handling = 0;
++		if (ioc->manu_pg11.NVMeAbortTO < NVME_TASK_ABORT_MIN_TIMEOUT)
++			ioc->nvme_abort_timeout = NVME_TASK_ABORT_MIN_TIMEOUT;
++		else if (ioc->manu_pg11.NVMeAbortTO >
++					NVME_TASK_ABORT_MAX_TIMEOUT)
++			ioc->nvme_abort_timeout = NVME_TASK_ABORT_MAX_TIMEOUT;
++		else
++			ioc->nvme_abort_timeout = ioc->manu_pg11.NVMeAbortTO;
++	}
+ 
+ 	mpt3sas_config_get_bios_pg2(ioc, &mpi_reply, &ioc->bios_pg2);
+ 	mpt3sas_config_get_bios_pg3(ioc, &mpi_reply, &ioc->bios_pg3);
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.h
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_ctl.c
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_scsih.c
