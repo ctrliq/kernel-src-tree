@@ -1,0 +1,247 @@
+IB/uverbs: Always propagate errors from rdma_alloc_commit_uobject()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 2c96eb7d62de5048aa08e9ee4fbb607f29e2638c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2c96eb7d.failed
+
+The ioctl framework already does this correctly, but the write path did
+not. This is trivially fixed by simply using a standard pattern to return
+uobj_alloc_commit() as the last statement in every function.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2c96eb7d62de5048aa08e9ee4fbb607f29e2638c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,2aab8cd2ca6b..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -521,20 -518,29 +521,29 @@@ static void alloc_commit_idr_uobject(st
+  
+  static void alloc_commit_fd_uobject(struct ib_uobject *uobj)
+  {
+ -	int fd = uobj->id;
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+  
+ +	fd_install(uobj_file->uobj.id, uobj->object);
+  	/* This shouldn't be used anymore. Use the file object instead */
+ -	uobj->id = 0;
+ -
+ -	/*
+ -	 * NOTE: Once we install the file we loose ownership of our kref on
+ -	 * uobj. It will be put by uverbs_close_fd()
+ -	 */
+ -	fd_install(fd, uobj->object);
+ +	uobj_file->uobj.id = 0;
+ +	/* Get another reference as we export this to the fops */
+ +	uverbs_uobject_get(&uobj_file->uobj);
+  }
+  
+++<<<<<<< HEAD
+ +int rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+++=======
++ /*
++  * In all cases rdma_alloc_commit_uobject() consumes the kref to uobj and the
++  * caller can no longer assume uobj is valid. If this function fails it
++  * destroys the uboject, including the attached HW object.
++  */
++ int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+++>>>>>>> 2c96eb7d62de (IB/uverbs: Always propagate errors from rdma_alloc_commit_uobject())
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+ -
+  	/* Cleanup is running. Calling this should have been impossible */
+ -	if (!down_read_trylock(&ufile->hw_destroy_rwsem)) {
+ +	if (!down_read_trylock(&uobj->context->cleanup_rwsem)) {
+  		int ret;
+  
+  		WARN(true, "ib_uverbs: Cleanup is running while allocating an uobject\n");
+* Unmerged path drivers/infiniband/core/rdma_core.c
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index f1558e6f86c4..80cce29ef4ae 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -339,9 +339,7 @@ ssize_t ib_uverbs_alloc_pd(struct ib_uverbs_file *file,
+ 		goto err_copy;
+ 	}
+ 
+-	uobj_alloc_commit(uobj);
+-
+-	return in_len;
++	return uobj_alloc_commit(uobj, in_len);
+ 
+ err_copy:
+ 	ib_dealloc_pd(pd);
+@@ -547,9 +545,7 @@ ssize_t ib_uverbs_open_xrcd(struct ib_uverbs_file *file,
+ 
+ 	mutex_unlock(&file->device->xrcd_tree_mutex);
+ 
+-	uobj_alloc_commit(&obj->uobject);
+-
+-	return in_len;
++	return uobj_alloc_commit(&obj->uobject, in_len);
+ 
+ err_copy:
+ 	if (inode) {
+@@ -685,9 +681,7 @@ ssize_t ib_uverbs_reg_mr(struct ib_uverbs_file *file,
+ 
+ 	uobj_put_obj_read(pd);
+ 
+-	uobj_alloc_commit(uobj);
+-
+-	return in_len;
++	return uobj_alloc_commit(uobj, in_len);
+ 
+ err_copy:
+ 	ib_dereg_mr(mr);
+@@ -863,9 +857,7 @@ ssize_t ib_uverbs_alloc_mw(struct ib_uverbs_file *file,
+ 	}
+ 
+ 	uobj_put_obj_read(pd);
+-	uobj_alloc_commit(uobj);
+-
+-	return in_len;
++	return uobj_alloc_commit(uobj, in_len);
+ 
+ err_copy:
+ 	uverbs_dealloc_mw(mw);
+@@ -921,8 +913,7 @@ ssize_t ib_uverbs_create_comp_channel(struct ib_uverbs_file *file,
+ 		return -EFAULT;
+ 	}
+ 
+-	uobj_alloc_commit(uobj);
+-	return in_len;
++	return uobj_alloc_commit(uobj, in_len);
+ }
+ 
+ static struct ib_ucq_object *create_cq(struct ib_uverbs_file *file,
+@@ -1006,7 +997,9 @@ static struct ib_ucq_object *create_cq(struct ib_uverbs_file *file,
+ 	if (ret)
+ 		goto err_cb;
+ 
+-	uobj_alloc_commit(&obj->uobject);
++	ret = uobj_alloc_commit(&obj->uobject, 0);
++	if (ret)
++		return ERR_PTR(ret);
+ 	return obj;
+ 
+ err_cb:
+@@ -1561,9 +1554,7 @@ static int create_qp(struct ib_uverbs_file *file,
+ 	if (ind_tbl)
+ 		uobj_put_obj_read(ind_tbl);
+ 
+-	uobj_alloc_commit(&obj->uevent.uobject);
+-
+-	return 0;
++	return uobj_alloc_commit(&obj->uevent.uobject, 0);
+ err_cb:
+ 	ib_destroy_qp(qp);
+ 
+@@ -1768,10 +1759,7 @@ ssize_t ib_uverbs_open_qp(struct ib_uverbs_file *file,
+ 	qp->uobject = &obj->uevent.uobject;
+ 	uobj_put_read(xrcd_uobj);
+ 
+-
+-	uobj_alloc_commit(&obj->uevent.uobject);
+-
+-	return in_len;
++	return uobj_alloc_commit(&obj->uevent.uobject, in_len);
+ 
+ err_destroy:
+ 	ib_destroy_qp(qp);
+@@ -2624,9 +2612,7 @@ ssize_t ib_uverbs_create_ah(struct ib_uverbs_file *file,
+ 	}
+ 
+ 	uobj_put_obj_read(pd);
+-	uobj_alloc_commit(uobj);
+-
+-	return in_len;
++	return uobj_alloc_commit(uobj, in_len);
+ 
+ err_copy:
+ 	rdma_destroy_ah(ah);
+@@ -3173,8 +3159,7 @@ int ib_uverbs_ex_create_wq(struct ib_uverbs_file *file,
+ 
+ 	uobj_put_obj_read(pd);
+ 	uobj_put_obj_read(cq);
+-	uobj_alloc_commit(&obj->uevent.uobject);
+-	return 0;
++	return uobj_alloc_commit(&obj->uevent.uobject, 0);
+ 
+ err_copy:
+ 	ib_destroy_wq(wq);
+@@ -3422,8 +3407,7 @@ int ib_uverbs_ex_create_rwq_ind_table(struct ib_uverbs_file *file,
+ 	for (j = 0; j < num_read_wqs; j++)
+ 		uobj_put_obj_read(wqs[j]);
+ 
+-	uobj_alloc_commit(uobj);
+-	return 0;
++	return uobj_alloc_commit(uobj, 0);
+ 
+ err_copy:
+ 	ib_destroy_rwq_ind_table(rwq_ind_tbl);
+@@ -3626,11 +3610,10 @@ int ib_uverbs_ex_create_flow(struct ib_uverbs_file *file,
+ 		goto err_copy;
+ 
+ 	uobj_put_obj_read(qp);
+-	uobj_alloc_commit(uobj);
+ 	kfree(flow_attr);
+ 	if (cmd.flow_attr.num_of_specs)
+ 		kfree(kern_flow_attr);
+-	return 0;
++	return uobj_alloc_commit(uobj, 0);
+ err_copy:
+ 	if (!qp->device->destroy_flow(flow_id))
+ 		atomic_dec(&qp->usecnt);
+@@ -3783,9 +3766,7 @@ static int __uverbs_create_xsrq(struct ib_uverbs_file *file,
+ 		uobj_put_obj_read(attr.ext.cq);
+ 
+ 	uobj_put_obj_read(pd);
+-	uobj_alloc_commit(&obj->uevent.uobject);
+-
+-	return 0;
++	return uobj_alloc_commit(&obj->uevent.uobject, 0);
+ 
+ err_copy:
+ 	ib_destroy_srq(srq);
+diff --git a/include/rdma/uverbs_std_types.h b/include/rdma/uverbs_std_types.h
+index 6e389a6b0382..cbfae32d296d 100644
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@ -94,9 +94,14 @@ static inline int __must_check uobj_remove_commit(struct ib_uobject *uobj)
+ 	return rdma_remove_commit_uobject(uobj);
+ }
+ 
+-static inline void uobj_alloc_commit(struct ib_uobject *uobj)
++static inline int __must_check uobj_alloc_commit(struct ib_uobject *uobj,
++						 int success_res)
+ {
+-	rdma_alloc_commit_uobject(uobj);
++	int ret = rdma_alloc_commit_uobject(uobj);
++
++	if (ret)
++		return ret;
++	return success_res;
+ }
+ 
+ static inline void uobj_alloc_abort(struct ib_uobject *uobj)
+diff --git a/include/rdma/uverbs_types.h b/include/rdma/uverbs_types.h
+index cc04ec65588d..acc0dfbf8f0e 100644
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -128,7 +128,7 @@ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ 					    struct ib_ucontext *ucontext);
+ void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+ int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj);
+-int rdma_alloc_commit_uobject(struct ib_uobject *uobj);
++int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+ int rdma_explicit_destroy(struct ib_uobject *uobject);
+ 
+ struct uverbs_obj_fd_type {
