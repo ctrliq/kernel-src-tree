@@ -1,0 +1,641 @@
+x86/bugs/intel: Set proper CPU features and setup RDS
+
+jira LE-1907
+cve CVE-2018-3639
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] bugs/intel: Set proper CPU features and setup RDS (Waiman Long) [1584569] {CVE-2018-3639}
+Rebuild_FUZZ: 96.08%
+commit-author Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+commit 772439717dbf703b39990be58d8d4e3e4ad0598a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/77243971.failed
+
+Intel CPUs expose methods to:
+
+ - Detect whether RDS capability is available via CPUID.7.0.EDX[31],
+
+ - The SPEC_CTRL MSR(0x48), bit 2 set to enable RDS.
+
+ - MSR_IA32_ARCH_CAPABILITIES, Bit(4) no need to enable RRS.
+
+With that in mind if spec_store_bypass_disable=[auto,on] is selected set at
+boot-time the SPEC_CTRL MSR to enable RDS if the platform requires it.
+
+Note that this does not fix the KVM case where the SPEC_CTRL is exposed to
+guests which can muck with it, see patch titled :
+ KVM/SVM/VMX/x86/spectre_v2: Support the combination of guest and host IBRS.
+
+And for the firmware (IBRS to be set), see patch titled:
+ x86/spectre_v2: Read SPEC_CTRL MSR during boot and re-use reserved bits
+
+[ tglx: Distangled it from the intel implementation and kept the call order ]
+
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+
+(cherry picked from commit 772439717dbf703b39990be58d8d4e3e4ad0598a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr-index.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/cpu/cpu.h
+#	arch/x86/kernel/cpu/intel.c
+diff --cc arch/x86/include/asm/msr-index.h
+index e2029f6c9386,21e1a6df9907..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -33,8 -39,13 +33,18 @@@
+  
+  /* Intel MSRs. Some also available on other CPUs */
+  
+++<<<<<<< HEAD
+ +#define MSR_IA32_SPEC_CTRL		0x00000048
+ +#define MSR_IA32_PRED_CMD		0x00000049
+++=======
++ #define MSR_IA32_SPEC_CTRL		0x00000048 /* Speculation Control */
++ #define SPEC_CTRL_IBRS			(1 << 0)   /* Indirect Branch Restricted Speculation */
++ #define SPEC_CTRL_STIBP			(1 << 1)   /* Single Thread Indirect Branch Predictors */
++ #define SPEC_CTRL_RDS			(1 << 2)   /* Reduced Data Speculation */
++ 
++ #define MSR_IA32_PRED_CMD		0x00000049 /* Prediction Command */
++ #define PRED_CMD_IBPB			(1 << 0)   /* Indirect Branch Prediction Barrier */
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  
+  #define MSR_PPIN_CTL			0x0000004e
+  #define MSR_PPIN			0x0000004f
+@@@ -52,8 -64,17 +62,21 @@@
+  #define SNB_C1_AUTO_UNDEMOTE		(1UL << 27)
+  #define SNB_C3_AUTO_UNDEMOTE		(1UL << 28)
+  
+ +#define MSR_PLATFORM_INFO		0x000000ce
+  #define MSR_MTRRcap			0x000000fe
+++<<<<<<< HEAD
+++=======
++ 
++ #define MSR_IA32_ARCH_CAPABILITIES	0x0000010a
++ #define ARCH_CAP_RDCL_NO		(1 << 0)   /* Not susceptible to Meltdown */
++ #define ARCH_CAP_IBRS_ALL		(1 << 1)   /* Enhanced IBRS support */
++ #define ARCH_CAP_RDS_NO			(1 << 4)   /*
++ 						    * Not susceptible to Speculative Store Bypass
++ 						    * attack, so no Reduced Data Speculation control
++ 						    * required.
++ 						    */
++ 
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  #define MSR_IA32_BBL_CR_CTL		0x00000119
+  #define MSR_IA32_BBL_CR_CTL3		0x0000011e
+  
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 29b8876b1f95,17edf5bdc361..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -104,6 -113,79 +104,82 @@@ enum spectre_v2_mitigation_cmd spectre_
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+++<<<<<<< HEAD
+++=======
++ static enum spectre_v2_mitigation spectre_v2_enabled = SPECTRE_V2_NONE;
++ 
++ void x86_spec_ctrl_set(u64 val)
++ {
++ 	if (val & ~(SPEC_CTRL_IBRS | SPEC_CTRL_RDS))
++ 		WARN_ONCE(1, "SPEC_CTRL MSR value 0x%16llx is unknown.\n", val);
++ 	else
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base | val);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set);
++ 
++ u64 x86_spec_ctrl_get_default(void)
++ {
++ 	return x86_spec_ctrl_base;
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_get_default);
++ 
++ void x86_spec_ctrl_set_guest(u64 guest_spec_ctrl)
++ {
++ 	if (!boot_cpu_has(X86_FEATURE_IBRS))
++ 		return;
++ 	if (x86_spec_ctrl_base != guest_spec_ctrl)
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, guest_spec_ctrl);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set_guest);
++ 
++ void x86_spec_ctrl_restore_host(u64 guest_spec_ctrl)
++ {
++ 	if (!boot_cpu_has(X86_FEATURE_IBRS))
++ 		return;
++ 	if (x86_spec_ctrl_base != guest_spec_ctrl)
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_restore_host);
++ 
++ #ifdef RETPOLINE
++ static bool spectre_v2_bad_module;
++ 
++ bool retpoline_module_ok(bool has_retpoline)
++ {
++ 	if (spectre_v2_enabled == SPECTRE_V2_NONE || has_retpoline)
++ 		return true;
++ 
++ 	pr_err("System may be vulnerable to spectre v2\n");
++ 	spectre_v2_bad_module = true;
++ 	return false;
++ }
++ 
++ static inline const char *spectre_v2_module_string(void)
++ {
++ 	return spectre_v2_bad_module ? " - vulnerable module loaded" : "";
++ }
++ #else
++ static inline const char *spectre_v2_module_string(void) { return ""; }
++ #endif
++ 
++ static void __init spec2_print_if_insecure(const char *reason)
++ {
++ 	if (boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++ 		pr_info("%s selected on command line.\n", reason);
++ }
++ 
++ static void __init spec2_print_if_secure(const char *reason)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++ 		pr_info("%s selected on command line.\n", reason);
++ }
++ 
++ static inline bool retp_compiler(void)
++ {
++ 	return __is_defined(RETPOLINE);
++ }
++ 
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  static inline bool match_option(const char *arg, int arglen, const char *opt)
+  {
+  	int len = strlen(opt);
+@@@ -153,61 -290,232 +229,93 @@@ void __spectre_v2_select_mitigation(voi
+  
+  	case SPECTRE_V2_CMD_FORCE:
+  	case SPECTRE_V2_CMD_AUTO:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_AMD:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_amd;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_generic;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+  		break;
+ -	}
+ -	pr_err("Spectre mitigation: kernel not compiled with retpoline; no mitigation available!");
+ -	return;
+ -
+ -retpoline_auto:
+ -	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+ -	retpoline_amd:
+ -		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
+ -			pr_err("Spectre mitigation: LFENCE not serializing, switching to generic retpoline\n");
+ -			goto retpoline_generic;
+ -		}
+ -		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_AMD :
+ -					 SPECTRE_V2_RETPOLINE_MINIMAL_AMD;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	} else {
+ -	retpoline_generic:
+ -		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_GENERIC :
+ -					 SPECTRE_V2_RETPOLINE_MINIMAL;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	}
+ -
+ -	spectre_v2_enabled = mode;
+ -	pr_info("%s\n", spectre_v2_strings[mode]);
+ -
+ -	/*
+ -	 * If neither SMEP nor PTI are available, there is a risk of
+ -	 * hitting userspace addresses in the RSB after a context switch
+ -	 * from a shallow call stack to a deeper one. To prevent this fill
+ -	 * the entire RSB, even when using IBRS.
+ -	 *
+ -	 * Skylake era CPUs have a separate issue with *underflow* of the
+ -	 * RSB, when they will predict 'ret' targets from the generic BTB.
+ -	 * The proper mitigation for this is IBRS. If IBRS is not supported
+ -	 * or deactivated in favour of retpolines the RSB fill on context
+ -	 * switch is required.
+ -	 */
+ -	if ((!boot_cpu_has(X86_FEATURE_PTI) &&
+ -	     !boot_cpu_has(X86_FEATURE_SMEP)) || is_skylake_era()) {
+ -		setup_force_cpu_cap(X86_FEATURE_RSB_CTXSW);
+ -		pr_info("Spectre v2 mitigation: Filling RSB on context switch\n");
+ -	}
+  
+ -	/* Initialize Indirect Branch Prediction Barrier if supported */
+ -	if (boot_cpu_has(X86_FEATURE_IBPB)) {
+ -		setup_force_cpu_cap(X86_FEATURE_USE_IBPB);
+ -		pr_info("Spectre v2 mitigation: Enabling Indirect Branch Prediction Barrier\n");
+ -	}
+ -
+ -	/*
+ -	 * Retpoline means the kernel is safe because it has no indirect
+ -	 * branches. But firmware isn't, so use IBRS to protect that.
+ -	 */
+ -	if (boot_cpu_has(X86_FEATURE_IBRS)) {
+ -		setup_force_cpu_cap(X86_FEATURE_USE_IBRS_FW);
+ -		pr_info("Enabling Restricted Speculation for firmware calls\n");
+ -	}
+ -}
+ -
+ -#undef pr_fmt
+ -#define pr_fmt(fmt)	"Speculative Store Bypass: " fmt
+ -
+ -static enum ssb_mitigation ssb_mode = SPEC_STORE_BYPASS_NONE;
+ -
+ -/* The kernel command line selection */
+ -enum ssb_mitigation_cmd {
+ -	SPEC_STORE_BYPASS_CMD_NONE,
+ -	SPEC_STORE_BYPASS_CMD_AUTO,
+ -	SPEC_STORE_BYPASS_CMD_ON,
+ -};
+ -
+ -static const char *ssb_strings[] = {
+ -	[SPEC_STORE_BYPASS_NONE]	= "Vulnerable",
+ -	[SPEC_STORE_BYPASS_DISABLE]	= "Mitigation: Speculative Store Bypass disabled"
+ -};
+ -
+ -static const struct {
+ -	const char *option;
+ -	enum ssb_mitigation_cmd cmd;
+ -} ssb_mitigation_options[] = {
+ -	{ "auto",	SPEC_STORE_BYPASS_CMD_AUTO }, /* Platform decides */
+ -	{ "on",		SPEC_STORE_BYPASS_CMD_ON },   /* Disable Speculative Store Bypass */
+ -	{ "off",	SPEC_STORE_BYPASS_CMD_NONE }, /* Don't touch Speculative Store Bypass */
+ -};
+ -
+ -static enum ssb_mitigation_cmd __init ssb_parse_cmdline(void)
+ -{
+ -	enum ssb_mitigation_cmd cmd = SPEC_STORE_BYPASS_CMD_AUTO;
+ -	char arg[20];
+ -	int ret, i;
+ -
+ -	if (cmdline_find_option_bool(boot_command_line, "nospec_store_bypass_disable")) {
+ -		return SPEC_STORE_BYPASS_CMD_NONE;
+ -	} else {
+ -		ret = cmdline_find_option(boot_command_line, "spec_store_bypass_disable",
+ -					  arg, sizeof(arg));
+ -		if (ret < 0)
+ -			return SPEC_STORE_BYPASS_CMD_AUTO;
+ +	case SPECTRE_V2_CMD_RETPOLINE:
+ +		spec_ctrl_enable_retpoline();
+ +		return;
+  
+ -		for (i = 0; i < ARRAY_SIZE(ssb_mitigation_options); i++) {
+ -			if (!match_option(arg, ret, ssb_mitigation_options[i].option))
+ -				continue;
+ +	case SPECTRE_V2_CMD_IBRS:
+ +		if (spec_ctrl_force_enable_ibrs())
+ +			return;
+ +		break;
+  
+ -			cmd = ssb_mitigation_options[i].cmd;
+ -			break;
+ -		}
+ +	case SPECTRE_V2_CMD_IBRS_ALWAYS:
+ +		if (spec_ctrl_enable_ibrs_always() ||
+ +		    spec_ctrl_force_enable_ibp_disabled())
+ +			return;
+ +		break;
+  
+ -		if (i >= ARRAY_SIZE(ssb_mitigation_options)) {
+ -			pr_err("unknown option (%s). Switching to AUTO select\n", arg);
+ -			return SPEC_STORE_BYPASS_CMD_AUTO;
+ -		}
+ +	case SPECTRE_V2_CMD_RETPOLINE_IBRS_USER:
+ +		if (spec_ctrl_enable_retpoline_ibrs_user())
+ +			return;
+ +		break;
+  	}
+  
+ -	return cmd;
+ -}
+ -
+ -static enum ssb_mitigation_cmd __init __ssb_select_mitigation(void)
+ -{
+ -	enum ssb_mitigation mode = SPEC_STORE_BYPASS_NONE;
+ -	enum ssb_mitigation_cmd cmd;
+ -
+ -	if (!boot_cpu_has(X86_FEATURE_RDS))
+ -		return mode;
+ -
+ -	cmd = ssb_parse_cmdline();
+ -	if (!boot_cpu_has_bug(X86_BUG_SPEC_STORE_BYPASS) &&
+ -	    (cmd == SPEC_STORE_BYPASS_CMD_NONE ||
+ -	     cmd == SPEC_STORE_BYPASS_CMD_AUTO))
+ -		return mode;
+++<<<<<<< HEAD
+ +	if (spec_ctrl_cond_enable_ibrs(full_retpoline))
+ +		return;
+  
+ -	switch (cmd) {
+ -	case SPEC_STORE_BYPASS_CMD_AUTO:
+ -	case SPEC_STORE_BYPASS_CMD_ON:
+ -		mode = SPEC_STORE_BYPASS_DISABLE;
+ -		break;
+ -	case SPEC_STORE_BYPASS_CMD_NONE:
+ -		break;
+ -	}
+ +	if (spec_ctrl_cond_enable_ibp_disabled())
+ +		return;
+  
+ +	spec_ctrl_enable_retpoline();
+++=======
++ 	/*
++ 	 * We have three CPU feature flags that are in play here:
++ 	 *  - X86_BUG_SPEC_STORE_BYPASS - CPU is susceptible.
++ 	 *  - X86_FEATURE_RDS - CPU is able to turn off speculative store bypass
++ 	 *  - X86_FEATURE_SPEC_STORE_BYPASS_DISABLE - engage the mitigation
++ 	 */
++ 	if (mode != SPEC_STORE_BYPASS_NONE) {
++ 		setup_force_cpu_cap(X86_FEATURE_SPEC_STORE_BYPASS_DISABLE);
++ 		/*
++ 		 * Intel uses the SPEC CTRL MSR Bit(2) for this, while AMD uses
++ 		 * a completely different MSR and bit dependent on family.
++ 		 */
++ 		switch (boot_cpu_data.x86_vendor) {
++ 		case X86_VENDOR_INTEL:
++ 			x86_spec_ctrl_base |= SPEC_CTRL_RDS;
++ 			x86_spec_ctrl_set(SPEC_CTRL_RDS);
++ 			break;
++ 		case X86_VENDOR_AMD:
++ 			break;
++ 		}
++ 	}
++ 
++ 	return mode;
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  }
+  
+ -static void ssb_select_mitigation()
+ +void spectre_v2_print_mitigation(void)
+  {
+ -	ssb_mode = __ssb_select_mitigation();
+  
+ -	if (boot_cpu_has_bug(X86_BUG_SPEC_STORE_BYPASS))
+ -		pr_info("%s\n", ssb_strings[ssb_mode]);
+ +	pr_info("%s\n", spectre_v2_strings[spec_ctrl_get_mitigation()]);
+ +}
+ +
+ +static void __init spectre_v2_select_mitigation(void)
+ +{
+ +	spectre_v2_cmd = spectre_v2_parse_cmdline();
+ +	__spectre_v2_select_mitigation();
+ +	spectre_v2_print_mitigation();
+  }
+  
+  #undef pr_fmt
+  
++ void x86_spec_ctrl_setup_ap(void)
++ {
++ 	if (boot_cpu_has(X86_FEATURE_IBRS))
++ 		x86_spec_ctrl_set(x86_spec_ctrl_base & (SPEC_CTRL_IBRS | SPEC_CTRL_RDS));
++ }
++ 
+  #ifdef CONFIG_SYSFS
+ -
+ -ssize_t cpu_show_common(struct device *dev, struct device_attribute *attr,
+ -			char *buf, unsigned int bug)
+ +ssize_t cpu_show_meltdown(struct device *dev,
+ +			  struct device_attribute *attr, char *buf)
+  {
+ -	if (!boot_cpu_has_bug(bug))
+ +	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD)
+  		return sprintf(buf, "Not affected\n");
+ -
+ -	switch (bug) {
+ -	case X86_BUG_CPU_MELTDOWN:
+ -		if (boot_cpu_has(X86_FEATURE_PTI))
+ -			return sprintf(buf, "Mitigation: PTI\n");
+ -
+ -		break;
+ -
+ -	case X86_BUG_SPECTRE_V1:
+ -		return sprintf(buf, "Mitigation: __user pointer sanitization\n");
+ -
+ -	case X86_BUG_SPECTRE_V2:
+ -		return sprintf(buf, "%s%s%s%s\n", spectre_v2_strings[spectre_v2_enabled],
+ -			       boot_cpu_has(X86_FEATURE_USE_IBPB) ? ", IBPB" : "",
+ -			       boot_cpu_has(X86_FEATURE_USE_IBRS_FW) ? ", IBRS_FW" : "",
+ -			       spectre_v2_module_string());
+ -
+ -	case X86_BUG_SPEC_STORE_BYPASS:
+ -		return sprintf(buf, "%s\n", ssb_strings[ssb_mode]);
+ -
+ -	default:
+ -		break;
+ -	}
+ -
+ +	if (kaiser_enabled)
+ +		return sprintf(buf, "Mitigation: PTI\n");
+  	return sprintf(buf, "Vulnerable\n");
+  }
+  
+diff --cc arch/x86/kernel/cpu/common.c
+index 49cb90f121df,d6dc71d616ea..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -853,6 -909,71 +853,74 @@@ static void identify_cpu_without_cpuid(
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const __initconst struct x86_cpu_id cpu_no_speculation[] = {
++ 	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CEDARVIEW,	X86_FEATURE_ANY },
++ 	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CLOVERVIEW,	X86_FEATURE_ANY },
++ 	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_LINCROFT,	X86_FEATURE_ANY },
++ 	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PENWELL,	X86_FEATURE_ANY },
++ 	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PINEVIEW,	X86_FEATURE_ANY },
++ 	{ X86_VENDOR_CENTAUR,	5 },
++ 	{ X86_VENDOR_INTEL,	5 },
++ 	{ X86_VENDOR_NSC,	5 },
++ 	{ X86_VENDOR_ANY,	4 },
++ 	{}
++ };
++ 
++ static const __initconst struct x86_cpu_id cpu_no_meltdown[] = {
++ 	{ X86_VENDOR_AMD },
++ 	{}
++ };
++ 
++ static const __initconst struct x86_cpu_id cpu_no_spec_store_bypass[] = {
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_PINEVIEW	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_LINCROFT	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_PENWELL		},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_CLOVERVIEW	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_CEDARVIEW	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_SILVERMONT1	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_AIRMONT		},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_SILVERMONT2	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_ATOM_MERRIFIELD	},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_CORE_YONAH		},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_XEON_PHI_KNL		},
++ 	{ X86_VENDOR_INTEL,	6,	INTEL_FAM6_XEON_PHI_KNM		},
++ 	{ X86_VENDOR_CENTAUR,	5,					},
++ 	{ X86_VENDOR_INTEL,	5,					},
++ 	{ X86_VENDOR_NSC,	5,					},
++ 	{ X86_VENDOR_ANY,	4,					},
++ 	{}
++ };
++ 
++ static void __init cpu_set_bug_bits(struct cpuinfo_x86 *c)
++ {
++ 	u64 ia32_cap = 0;
++ 
++ 	if (cpu_has(c, X86_FEATURE_ARCH_CAPABILITIES))
++ 		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, ia32_cap);
++ 
++ 	if (!x86_match_cpu(cpu_no_spec_store_bypass) &&
++ 	   !(ia32_cap & ARCH_CAP_RDS_NO))
++ 		setup_force_cpu_bug(X86_BUG_SPEC_STORE_BYPASS);
++ 
++ 	if (x86_match_cpu(cpu_no_speculation))
++ 		return;
++ 
++ 	setup_force_cpu_bug(X86_BUG_SPECTRE_V1);
++ 	setup_force_cpu_bug(X86_BUG_SPECTRE_V2);
++ 
++ 	if (x86_match_cpu(cpu_no_meltdown))
++ 		return;
++ 
++ 	/* Rogue Data Cache Load? No! */
++ 	if (ia32_cap & ARCH_CAP_RDCL_NO)
++ 		return;
++ 
++ 	setup_force_cpu_bug(X86_BUG_CPU_MELTDOWN);
++ }
++ 
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  /*
+   * Do minimum CPU detection early.
+   * Fields really needed: vendor, cpuid_level, family, model, mask,
+@@@ -1185,53 -1384,9 +1253,54 @@@ void identify_secondary_cpu(struct cpui
+  #endif
+  	mtrr_ap_init();
+  	validate_apic_and_package_id(c);
++ 	x86_spec_ctrl_setup_ap();
+  }
+  
+ +struct msr_range {
+ +	unsigned	min;
+ +	unsigned	max;
+ +};
+ +
+ +static const struct msr_range msr_range_array[] = {
+ +	{ 0x00000000, 0x00000418},
+ +	{ 0xc0000000, 0xc000040b},
+ +	{ 0xc0010000, 0xc0010142},
+ +	{ 0xc0011000, 0xc001103b},
+ +};
+ +
+ +static void __print_cpu_msr(void)
+ +{
+ +	unsigned index_min, index_max;
+ +	unsigned index;
+ +	u64 val;
+ +	int i;
+ +
+ +	for (i = 0; i < ARRAY_SIZE(msr_range_array); i++) {
+ +		index_min = msr_range_array[i].min;
+ +		index_max = msr_range_array[i].max;
+ +
+ +		for (index = index_min; index < index_max; index++) {
+ +			if (rdmsrl_safe(index, &val))
+ +				continue;
+ +			printk(KERN_INFO " MSR%08x: %016llx\n", index, val);
+ +		}
+ +	}
+ +}
+ +
+ +static int show_msr;
+ +
+ +static __init int setup_show_msr(char *arg)
+ +{
+ +	int num;
+ +
+ +	get_option(&arg, &num);
+ +
+ +	if (num > 0)
+ +		show_msr = num;
+ +	return 1;
+ +}
+ +__setup("show_msr=", setup_show_msr);
+ +
+  static __init int setup_noclflush(char *arg)
+  {
+  	setup_clear_cpu_cap(X86_FEATURE_CLFLUSH);
+diff --cc arch/x86/kernel/cpu/cpu.h
+index 4041c24ae7db,37672d299e35..000000000000
+--- a/arch/x86/kernel/cpu/cpu.h
++++ b/arch/x86/kernel/cpu/cpu.h
+@@@ -43,4 -47,9 +43,12 @@@ extern const struct cpu_dev *const __x8
+  
+  extern void get_cpu_cap(struct cpuinfo_x86 *c);
+  extern void cpu_detect_cache_sizes(struct cpuinfo_x86 *c);
+++<<<<<<< HEAD
+++=======
++ 
++ unsigned int aperfmperf_get_khz(int cpu);
++ 
++ extern void x86_spec_ctrl_setup_ap(void);
++ 
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  #endif /* ARCH_X86_CPU_H */
+diff --cc arch/x86/kernel/cpu/intel.c
+index 9ac0d10cb29f,ef3f9c01c274..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -123,13 -175,21 +123,28 @@@ static void early_init_intel(struct cpu
+  		(c->x86 == 0x6 && c->x86_model >= 0x0e))
+  		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
+  
+ -	if (c->x86 >= 6 && !cpu_has(c, X86_FEATURE_IA64))
+ -		c->microcode = intel_get_microcode_revision();
+ +	if (c->x86 >= 6 && !cpu_has(c, X86_FEATURE_IA64)) {
+ +		unsigned lower_word;
+  
+++<<<<<<< HEAD
+ +		wrmsr(MSR_IA32_UCODE_REV, 0, 0);
+ +		/* Required by the SDM */
+ +		sync_core();
+ +		rdmsr(MSR_IA32_UCODE_REV, lower_word, c->microcode);
+++=======
++ 	/* Now if any of them are set, check the blacklist and clear the lot */
++ 	if ((cpu_has(c, X86_FEATURE_SPEC_CTRL) ||
++ 	     cpu_has(c, X86_FEATURE_INTEL_STIBP) ||
++ 	     cpu_has(c, X86_FEATURE_IBRS) || cpu_has(c, X86_FEATURE_IBPB) ||
++ 	     cpu_has(c, X86_FEATURE_STIBP)) && bad_spectre_microcode(c)) {
++ 		pr_warn("Intel Spectre v2 broken microcode detected; disabling Speculation Control\n");
++ 		setup_clear_cpu_cap(X86_FEATURE_IBRS);
++ 		setup_clear_cpu_cap(X86_FEATURE_IBPB);
++ 		setup_clear_cpu_cap(X86_FEATURE_STIBP);
++ 		setup_clear_cpu_cap(X86_FEATURE_SPEC_CTRL);
++ 		setup_clear_cpu_cap(X86_FEATURE_INTEL_STIBP);
++ 		setup_clear_cpu_cap(X86_FEATURE_RDS);
+++>>>>>>> 772439717dbf (x86/bugs/intel: Set proper CPU features and setup RDS)
+  	}
+  
+  	/*
+* Unmerged path arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/cpu/cpu.h
+* Unmerged path arch/x86/kernel/cpu/intel.c
