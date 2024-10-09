@@ -1,0 +1,166 @@
+iser-target: Fix queue-full response handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 555a65f66c3c4d9dd46a565418b0b655d861a723
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/555a65f6.failed
+
+This patch addresses two queue-full handling bugs in iser-target.
+
+The first is propagating isert_rdma_rw_ctx_post() return back
+to target-core via isert_put_datain() + isert_get_dataout()
+callbacks, in order to trigger queue-full logic in target-core.
+Note target-core expects -EAGAIN or -ENOMEM error to signal
+RDMA WRITE/READ data-transfer callbacks should be retried,
+after queue-full logic been invoked.
+
+Other types of errors propagated up from RDMA RW API will result
+in target-core generating internal CHECK_CONDITION status,
+avoiding subsequent isert_put_datain() and isert_get_dataout()
+iscsit_transport callback retry attempts.
+
+The second is to use transport_generic_request_failure()
+during T10-PI hw-offload errors in isert_rdma_write_done()
+and isert_rdma_read_done(), so CHECK_CONDITION queue-full
+is handled internally by target-core.
+
+Also add isert_put_response() T10-PI failure case fixme in
+isert_rdma_write_done(), which is currently not internally
+retried or released until session reinstatement.
+
+	Reported-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Reviewed-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Tested-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Cc: Potnuri Bharat Teja <bharat@chelsio.com>
+	Reported-by: Steve Wise <swise@opengridcomputing.com>
+	Cc: Steve Wise <swise@opengridcomputing.com>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 555a65f66c3c4d9dd46a565418b0b655d861a723)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 6cd51eab0ed2,9b33c0c97468..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -1922,17 -1656,26 +1922,37 @@@ isert_rdma_write_done(struct ib_cq *cq
+  
+  	isert_dbg("Cmd %p\n", isert_cmd);
+  
+ -	ret = isert_check_pi_status(cmd, isert_cmd->rw.sig->sig_mr);
+ -	isert_rdma_rw_ctx_destroy(isert_cmd, isert_conn);
+ +	if (wr->fr_desc && wr->fr_desc->ind & ISERT_PROTECTED) {
+ +		ret = isert_check_pi_status(cmd, wr->fr_desc->pi_ctx->sig_mr);
+ +		wr->fr_desc->ind &= ~ISERT_PROTECTED;
+ +	}
+  
+++<<<<<<< HEAD
+ +	device->unreg_rdma_mem(isert_cmd, isert_conn);
+ +	wr->rdma_wr_num = 0;
+ +	if (ret)
+ +		transport_send_check_condition_and_sense(cmd, cmd->pi_err, 0);
+ +	else
+ +		isert_put_response(isert_conn->conn, isert_cmd->iscsi_cmd);
+++=======
++ 	if (ret) {
++ 		/*
++ 		 * transport_generic_request_failure() expects to have
++ 		 * plus two references to handle queue-full, so re-add
++ 		 * one here as target-core will have already dropped
++ 		 * it after the first isert_put_datain() callback.
++ 		 */
++ 		kref_get(&cmd->cmd_kref);
++ 		transport_generic_request_failure(cmd, cmd->pi_err);
++ 	} else {
++ 		/*
++ 		 * XXX: isert_put_response() failure is not retried.
++ 		 */
++ 		ret = isert_put_response(isert_conn->conn, isert_cmd->iscsi_cmd);
++ 		if (ret)
++ 			pr_warn_ratelimited("isert_put_response() ret: %d\n", ret);
++ 	}
+++>>>>>>> 555a65f66c3c (iser-target: Fix queue-full response handling)
+  }
+  
+  static void
+@@@ -2847,50 -2182,32 +2869,71 @@@ isert_put_datain(struct iscsi_conn *con
+  			isert_err("ib_post_recv failed with %d\n", rc);
+  			return rc;
+  		}
+ -
+ -		chain_wr = &isert_cmd->tx_desc.send_wr;
+  	}
+  
+++<<<<<<< HEAD
+ +	rc = ib_post_send(isert_conn->qp, &wr->rdma_wr->wr, &wr_failed);
+ +	if (rc)
+ +		isert_warn("ib_post_send() failed for IB_WR_RDMA_WRITE\n");
+ +
+ +	if (!isert_prot_cmd(isert_conn, se_cmd))
+ +		isert_dbg("Cmd: %p posted RDMA_WRITE + Response for iSER Data "
+ +			 "READ\n", isert_cmd);
+ +	else
+ +		isert_dbg("Cmd: %p posted RDMA_WRITE for iSER Data READ\n",
+ +			 isert_cmd);
+ +
+ +	return 1;
+++=======
++ 	rc = isert_rdma_rw_ctx_post(isert_cmd, isert_conn, cqe, chain_wr);
++ 	isert_dbg("Cmd: %p posted RDMA_WRITE for iSER Data READ rc: %d\n",
++ 		  isert_cmd, rc);
++ 	return rc;
+++>>>>>>> 555a65f66c3c (iser-target: Fix queue-full response handling)
+  }
+  
+  static int
+  isert_get_dataout(struct iscsi_conn *conn, struct iscsi_cmd *cmd, bool recovery)
+  {
+ +	struct se_cmd *se_cmd = &cmd->se_cmd;
+  	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+++<<<<<<< HEAD
+ +	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+ +	struct isert_conn *isert_conn = conn->context;
+ +	struct isert_device *device = isert_conn->device;
+ +	struct ib_send_wr *wr_failed;
+ +	int rc;
+++=======
++ 	int ret;
+++>>>>>>> 555a65f66c3c (iser-target: Fix queue-full response handling)
+  
+  	isert_dbg("Cmd: %p RDMA_READ data_length: %u write_data_done: %u\n",
+ -		 isert_cmd, cmd->se_cmd.data_length, cmd->write_data_done);
+ +		 isert_cmd, se_cmd->data_length, cmd->write_data_done);
+ +	wr->iser_ib_op = ISER_IB_RDMA_READ;
+ +	rc = device->reg_rdma_mem(conn, cmd, wr);
+ +	if (rc) {
+ +		isert_err("Cmd: %p failed to prepare RDMA res\n", isert_cmd);
+ +		return rc;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	rc = ib_post_send(isert_conn->qp, &wr->rdma_wr->wr, &wr_failed);
+ +	if (rc)
+ +		isert_warn("ib_post_send() failed for IB_WR_RDMA_READ\n");
+  
+ +	isert_dbg("Cmd: %p posted RDMA_READ memory for ISER Data WRITE\n",
+ +		 isert_cmd);
+ +
+ +	return 0;
+++=======
++ 	isert_cmd->tx_desc.tx_cqe.done = isert_rdma_read_done;
++ 	ret = isert_rdma_rw_ctx_post(isert_cmd, conn->context,
++ 				     &isert_cmd->tx_desc.tx_cqe, NULL);
++ 
++ 	isert_dbg("Cmd: %p posted RDMA_READ memory for ISER Data WRITE rc: %d\n",
++ 		 isert_cmd, ret);
++ 	return ret;
+++>>>>>>> 555a65f66c3c (iser-target: Fix queue-full response handling)
+  }
+  
+  static int
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
