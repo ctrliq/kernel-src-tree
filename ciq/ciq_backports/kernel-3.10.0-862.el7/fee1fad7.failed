@@ -1,0 +1,160 @@
+vxlan: simplify RTF_LOCAL handling.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] vxlan: simplify RTF_LOCAL handling (Jiri Benc) [1467280]
+Rebuild_FUZZ: 98.55%
+commit-author pravin shelar <pshelar@ovn.org>
+commit fee1fad7c73dd006f50115ddc538a2e20f3b0c6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fee1fad7.failed
+
+Avoid code duplicate code for handling RTF_LOCAL routes.
+
+	Signed-off-by: Pravin B Shelar <pshelar@ovn.org>
+	Acked-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fee1fad7c73dd006f50115ddc538a2e20f3b0c6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index f909b180e18b,3f952cfc5a2c..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1994,97 -2070,58 +2028,104 @@@ static void vxlan_xmit_one(struct sk_bu
+  				     dst->sin.sin_addr.s_addr,
+  				     &src->sin.sin_addr.s_addr,
+  				     dst_cache, info);
+ -		if (IS_ERR(rt))
+ +		if (IS_ERR(rt)) {
+ +			netdev_dbg(dev, "no route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.tx_carrier_errors++;
+  			goto tx_error;
+++<<<<<<< HEAD
+ +		}
+ +
+ +		if (rt->dst.dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.collisions++;
+ +			goto rt_tx_error;
+ +		}
+ +
+- 		/* Bypass encapsulation if the destination is local */
+- 		if (!info && rt->rt_flags & RTCF_LOCAL &&
+- 		    !(rt->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))) {
+- 			struct vxlan_dev *dst_vxlan;
+- 
+- 			ip_rt_put(rt);
+- 			dst_vxlan = vxlan_find_vni(vxlan->net, vni,
+- 						   dst->sa.sa_family, dst_port,
+- 						   vxlan->flags);
+- 			if (!dst_vxlan)
+- 				goto tx_error;
+- 			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
+- 			return;
+- 		}
+++=======
+  
+- 		if (!info)
++ 		sk = sock4->sock->sk;
+++>>>>>>> fee1fad7c73d (vxlan: simplify RTF_LOCAL handling.)
++ 		/* Bypass encapsulation if the destination is local */
++ 		if (!info) {
++ 			err = encap_bypass_if_local(skb, dev, vxlan, dst,
++ 						    dst_port, vni, &rt->dst,
++ 						    rt->rt_flags);
++ 			if (err)
++ 				return;
+  			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM_TX);
+- 		else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT)
++ 		} else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT) {
+  			df = htons(IP_DF);
++ 		}
+  
+ -		ndst = &rt->dst;
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ -		err = vxlan_build_skb(skb, ndst, sizeof(struct iphdr),
+ +		err = vxlan_build_skb(skb, &rt->dst, sizeof(struct iphdr),
+  				      vni, md, flags, udp_sum);
+  		if (err < 0)
+ -			goto tx_error;
+ +			goto xmit_tx_error;
+  
+  		udp_tunnel_xmit_skb(rt, sk, skb, src->sin.sin_addr.s_addr,
+  				    dst->sin.sin_addr.s_addr, tos, ttl, df,
+  				    src_port, dst_port, xnet, !udp_sum);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+++<<<<<<< HEAD
+ +		struct dst_entry *ndst;
+ +		u32 rt6i_flags;
+++=======
++ 		struct vxlan_sock *sock6 = rcu_dereference(vxlan->vn6_sock);
+++>>>>>>> fee1fad7c73d (vxlan: simplify RTF_LOCAL handling.)
+ +
+ +		if (!vxlan->vn6_sock)
+ +			goto drop;
+ +		sk = vxlan->vn6_sock->sock->sk;
+  
+ -		ndst = vxlan6_get_route(vxlan, dev, sock6, skb,
+ +		ndst = vxlan6_get_route(vxlan, skb,
+  					rdst ? rdst->remote_ifindex : 0, tos,
+  					label, &dst->sin6.sin6_addr,
+  					&src->sin6.sin6_addr,
+  					dst_cache, info);
+  		if (IS_ERR(ndst)) {
+ -			ndst = NULL;
+ +			netdev_dbg(dev, "no route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dev->stats.tx_carrier_errors++;
+ +			goto tx_error;
+ +		}
+ +
+ +		if (ndst->dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dst_release(ndst);
+ +			dev->stats.collisions++;
+  			goto tx_error;
+  		}
+ -		sk = sock6->sock->sk;
+  
+- 		/* Bypass encapsulation if the destination is local */
+- 		rt6i_flags = ((struct rt6_info *)ndst)->rt6i_flags;
+- 		if (!info && rt6i_flags & RTF_LOCAL &&
+- 		    !(rt6i_flags & (RTCF_BROADCAST | RTCF_MULTICAST))) {
+- 			struct vxlan_dev *dst_vxlan;
++ 		if (!info) {
++ 			u32 rt6i_flags = ((struct rt6_info *)ndst)->rt6i_flags;
+  
+++<<<<<<< HEAD
+ +			dst_release(ndst);
+ +			dst_vxlan = vxlan_find_vni(vxlan->net, vni,
+ +						   dst->sa.sa_family, dst_port,
+ +						   vxlan->flags);
+ +			if (!dst_vxlan)
+ +				goto tx_error;
+ +			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
+ +			return;
+ +		}
+ +
+ +		if (!info)
+++=======
++ 			err = encap_bypass_if_local(skb, dev, vxlan, dst,
++ 						    dst_port, vni, ndst,
++ 						    rt6i_flags);
++ 			if (err)
++ 				return;
+++>>>>>>> fee1fad7c73d (vxlan: simplify RTF_LOCAL handling.)
+  			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM6_TX);
++ 		}
+  
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+* Unmerged path drivers/net/vxlan.c
