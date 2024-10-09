@@ -1,0 +1,127 @@
+nvme-fabrics: introduce init command check for a queue that is not alive
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme-fabrics] introduce init command check for a queue that is not alive (Ewan Milne) [1549232]
+Rebuild_FUZZ: 89.23%
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 48832f8d58cfedb2f9bee11bbfbb657efb42e7e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/48832f8d.failed
+
+When the fabrics queue is not alive and fully functional, no commands
+should be allowed to pass but connect (which moves the queue to a fully
+functional state). Any other command should be failed, with either
+temporary status BLK_STS_RESOUCE or permanent status BLK_STS_IOERR.
+
+This is shared across all fabrics, hence move the check to fabrics
+library.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 48832f8d58cfedb2f9bee11bbfbb657efb42e7e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index 073a7b113e99,2c597105a6bf..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -1450,33 -1590,15 +1450,42 @@@ nvme_rdma_timeout(struct request *rq, b
+  /*
+   * We cannot accept any other command until the Connect command has completed.
+   */
+++<<<<<<< HEAD
+ +static inline int nvme_rdma_queue_is_ready(struct nvme_rdma_queue *queue,
+ +		struct request *rq)
+ +{
+ +	if (unlikely(!test_bit(NVME_RDMA_Q_LIVE, &queue->flags))) {
+ +		struct nvme_command *cmd = nvme_req(rq)->cmd;
+ +
+ +		if (rq->cmd_type != REQ_TYPE_DRV_PRIV ||
+ +		    cmd->common.opcode != nvme_fabrics_command ||
+ +		    cmd->fabrics.fctype != nvme_fabrics_type_connect) {
+ +			/*
+ +			 * reconnecting state means transport disruption, which
+ +			 * can take a long time and even might fail permanently,
+ +			 * so we can't let incoming I/O be requeued forever.
+ +			 * fail it fast to allow upper layers a chance to
+ +			 * failover.
+ +			 */
+ +			if (queue->ctrl->ctrl.state == NVME_CTRL_RECONNECTING)
+ +				return -EIO;
+ +			else
+ +				return -EAGAIN;
+ +		}
+ +	}
+ +
+ +	return 0;
+++=======
++ static inline blk_status_t
++ nvme_rdma_is_ready(struct nvme_rdma_queue *queue, struct request *rq)
++ {
++ 	if (unlikely(!test_bit(NVME_RDMA_Q_LIVE, &queue->flags)))
++ 		return nvmf_check_init_req(&queue->ctrl->ctrl, rq);
++ 	return BLK_STS_OK;
+++>>>>>>> 48832f8d58cf (nvme-fabrics: introduce init command check for a queue that is not alive)
+  }
+  
+ -static blk_status_t nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+ +static int nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+  		const struct blk_mq_queue_data *bd)
+  {
+  	struct nvme_ns *ns = hctx->queue->queuedata;
+@@@ -1492,9 -1614,9 +1501,9 @@@
+  
+  	WARN_ON_ONCE(rq->tag < 0);
+  
+- 	ret = nvme_rdma_queue_is_ready(queue, rq);
++ 	ret = nvme_rdma_is_ready(queue, rq);
+  	if (unlikely(ret))
+ -		return ret;
+ +		goto err;
+  
+  	dev = queue->device->dev;
+  	ib_dma_sync_single_for_cpu(dev, sqe->dma,
+diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
+index 5a20948e5609..2618a40d8715 100644
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -156,4 +156,34 @@ void nvmf_free_options(struct nvmf_ctrl_options *opts);
+ int nvmf_get_address(struct nvme_ctrl *ctrl, char *buf, int size);
+ bool nvmf_should_reconnect(struct nvme_ctrl *ctrl);
+ 
++static inline blk_status_t nvmf_check_init_req(struct nvme_ctrl *ctrl,
++		struct request *rq)
++{
++	struct nvme_command *cmd = nvme_req(rq)->cmd;
++
++	/*
++	 * We cannot accept any other command until the connect command has
++	 * completed, so only allow connect to pass.
++	 */
++	if (!blk_rq_is_passthrough(rq) ||
++	    cmd->common.opcode != nvme_fabrics_command ||
++	    cmd->fabrics.fctype != nvme_fabrics_type_connect) {
++		/*
++		 * Reconnecting state means transport disruption, which can take
++		 * a long time and even might fail permanently, fail fast to
++		 * give upper layers a chance to failover.
++		 * Deleting state means that the ctrl will never accept commands
++		 * again, fail it permanently.
++		 */
++		if (ctrl->state == NVME_CTRL_RECONNECTING ||
++		    ctrl->state == NVME_CTRL_DELETING) {
++			nvme_req(rq)->status = NVME_SC_ABORT_REQ;
++			return BLK_STS_IOERR;
++		}
++		return BLK_STS_RESOURCE; /* try again later */
++	}
++
++	return BLK_STS_OK;
++}
++
+ #endif /* _NVME_FABRICS_H */
+* Unmerged path drivers/nvme/host/rdma.c
