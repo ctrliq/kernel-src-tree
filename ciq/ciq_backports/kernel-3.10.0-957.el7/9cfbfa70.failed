@@ -1,0 +1,388 @@
+ixgbe: cleanup sparse warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Cathy Zhou <cathy.zhou@oracle.com>
+commit 9cfbfa701b55868cda4d638164887d5c74c7bfdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9cfbfa70.failed
+
+Sparse complains valid conversions between restricted types, force
+attribute is used to avoid those warnings.
+
+	Signed-off-by: Cathy Zhou <cathy.zhou@oracle.com>
+	Reviewed-by: Shannon Nelson <shannon.nelson@oracle.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 9cfbfa701b55868cda4d638164887d5c74c7bfdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 1e6ef77c0966,163b34a9572d..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -9713,8 -9957,119 +9717,123 @@@ ixgbe_features_check(struct sk_buff *sk
+  	return features;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	int i, frame_size = dev->mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct bpf_prog *old_prog;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED)
++ 		return -EINVAL;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_DCB_ENABLED)
++ 		return -EINVAL;
++ 
++ 	/* verify ixgbe ring attributes are sufficient for XDP */
++ 	for (i = 0; i < adapter->num_rx_queues; i++) {
++ 		struct ixgbe_ring *ring = adapter->rx_ring[i];
++ 
++ 		if (ring_is_rsc_enabled(ring))
++ 			return -EINVAL;
++ 
++ 		if (frame_size > ixgbe_rx_bufsz(ring))
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (nr_cpu_ids > MAX_XDP_QUEUES)
++ 		return -ENOMEM;
++ 
++ 	old_prog = xchg(&adapter->xdp_prog, prog);
++ 
++ 	/* If transitioning XDP modes reconfigure rings */
++ 	if (!!prog != !!old_prog) {
++ 		int err = ixgbe_setup_tc(dev, adapter->hw_tcs);
++ 
++ 		if (err) {
++ 			rcu_assign_pointer(adapter->xdp_prog, old_prog);
++ 			return -EINVAL;
++ 		}
++ 	} else {
++ 		for (i = 0; i < adapter->num_rx_queues; i++)
++ 			(void)xchg(&adapter->rx_ring[i]->xdp_prog,
++ 			    adapter->xdp_prog);
++ 	}
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int ixgbe_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return ixgbe_xdp_setup(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!(adapter->xdp_prog);
++ 		xdp->prog_id = adapter->xdp_prog ?
++ 			adapter->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int ixgbe_xdp_xmit(struct net_device *dev, struct xdp_frame *xdpf)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_ring *ring;
++ 	int err;
++ 
++ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
++ 		return -ENETDOWN;
++ 
++ 	/* During program transitions its possible adapter->xdp_prog is assigned
++ 	 * but ring has not been configured yet. In this case simply abort xmit.
++ 	 */
++ 	ring = adapter->xdp_prog ? adapter->xdp_ring[smp_processor_id()] : NULL;
++ 	if (unlikely(!ring))
++ 		return -ENXIO;
++ 
++ 	err = ixgbe_xmit_xdp_ring(adapter, xdpf);
++ 	if (err != IXGBE_XDP_TX)
++ 		return -ENOSPC;
++ 
++ 	return 0;
++ }
++ 
++ static void ixgbe_xdp_flush(struct net_device *dev)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_ring *ring;
++ 
++ 	/* Its possible the device went down between xdp xmit and flush so
++ 	 * we need to ensure device is still up.
++ 	 */
++ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
++ 		return;
++ 
++ 	ring = adapter->xdp_prog ? adapter->xdp_ring[smp_processor_id()] : NULL;
++ 	if (unlikely(!ring))
++ 		return;
++ 
++ 	/* Force memory writes to complete before letting h/w know there
++ 	 * are new descriptors to fetch.
++ 	 */
++ 	wmb();
++ 	writel(ring->next_to_use, ring->tail);
++ 
++ 	return;
++ }
++ 
+++>>>>>>> 9cfbfa701b55 (ixgbe: cleanup sparse warnings)
+  static const struct net_device_ops ixgbe_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= ixgbe_open,
+  	.ndo_stop		= ixgbe_close,
+  	.ndo_start_xmit		= ixgbe_xmit_frame,
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
+index 4dfc81dbee4b..6d804a81f31d 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_82599.c
+@@ -1461,7 +1461,8 @@ void ixgbe_atr_compute_perfect_hash_82599(union ixgbe_atr_input *input,
+ {
+ 
+ 	u32 hi_hash_dword, lo_hash_dword, flow_vm_vlan;
+-	u32 bucket_hash = 0, hi_dword = 0;
++	u32 bucket_hash = 0;
++	__be32 hi_dword = 0;
+ 	int i;
+ 
+ 	/* Apply masks to input data */
+@@ -1500,7 +1501,7 @@ void ixgbe_atr_compute_perfect_hash_82599(union ixgbe_atr_input *input,
+ 	 * Limit hash to 13 bits since max bucket count is 8K.
+ 	 * Store result at the end of the input stream.
+ 	 */
+-	input->formatted.bkt_hash = bucket_hash & 0x1FFF;
++	input->formatted.bkt_hash = (__force __be16)(bucket_hash & 0x1FFF);
+ }
+ 
+ /**
+@@ -1609,7 +1610,7 @@ s32 ixgbe_fdir_set_input_mask_82599(struct ixgbe_hw *hw,
+ 		return IXGBE_ERR_CONFIG;
+ 	}
+ 
+-	switch (input_mask->formatted.flex_bytes & 0xFFFF) {
++	switch ((__force u16)input_mask->formatted.flex_bytes & 0xFFFF) {
+ 	case 0x0000:
+ 		/* Mask Flex Bytes */
+ 		fdirm |= IXGBE_FDIRM_FLEX;
+@@ -1679,13 +1680,13 @@ s32 ixgbe_fdir_write_perfect_filter_82599(struct ixgbe_hw *hw,
+ 	IXGBE_WRITE_REG(hw, IXGBE_FDIRPORT, fdirport);
+ 
+ 	/* record vlan (little-endian) and flex_bytes(big-endian) */
+-	fdirvlan = IXGBE_STORE_AS_BE16(input->formatted.flex_bytes);
++	fdirvlan = IXGBE_STORE_AS_BE16((__force u16)input->formatted.flex_bytes);
+ 	fdirvlan <<= IXGBE_FDIRVLAN_FLEX_SHIFT;
+ 	fdirvlan |= ntohs(input->formatted.vlan_id);
+ 	IXGBE_WRITE_REG(hw, IXGBE_FDIRVLAN, fdirvlan);
+ 
+ 	/* configure FDIRHASH register */
+-	fdirhash = input->formatted.bkt_hash;
++	fdirhash = (__force u32)input->formatted.bkt_hash;
+ 	fdirhash |= soft_id << IXGBE_FDIRHASH_SIG_SW_INDEX_SHIFT;
+ 	IXGBE_WRITE_REG(hw, IXGBE_FDIRHASH, fdirhash);
+ 
+@@ -1723,7 +1724,7 @@ s32 ixgbe_fdir_erase_perfect_filter_82599(struct ixgbe_hw *hw,
+ 	s32 err;
+ 
+ 	/* configure FDIRHASH register */
+-	fdirhash = input->formatted.bkt_hash;
++	fdirhash = (__force u32)input->formatted.bkt_hash;
+ 	fdirhash |= soft_id << IXGBE_FDIRHASH_SIG_SW_INDEX_SHIFT;
+ 	IXGBE_WRITE_REG(hw, IXGBE_FDIRHASH, fdirhash);
+ 
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+index 61188f343955..afe0e36de6ee 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+@@ -3651,7 +3651,7 @@ s32 ixgbe_hic_unlocked(struct ixgbe_hw *hw, u32 *buffer, u32 length,
+ 	 */
+ 	for (i = 0; i < dword_len; i++)
+ 		IXGBE_WRITE_REG_ARRAY(hw, IXGBE_FLEX_MNG,
+-				      i, cpu_to_le32(buffer[i]));
++				      i, (__force u32)cpu_to_le32(buffer[i]));
+ 
+ 	/* Setting this bit tells the ARC that a new command is pending. */
+ 	IXGBE_WRITE_REG(hw, IXGBE_HICR, hicr | IXGBE_HICR_C);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
+index 45afa1dc9074..b24f7c1eb450 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_fcoe.c
+@@ -465,7 +465,7 @@ int ixgbe_fcoe_ddp(struct ixgbe_adapter *adapter,
+ 	case cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_FCPRSP):
+ 		dma_unmap_sg(&adapter->pdev->dev, ddp->sgl,
+ 			     ddp->sgc, DMA_FROM_DEVICE);
+-		ddp->err = ddp_err;
++		ddp->err = (__force u32)ddp_err;
+ 		ddp->sgl = NULL;
+ 		ddp->sgc = 0;
+ 		/* fall through */
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+index cead23e3db0c..71d4f9c9d42e 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+@@ -43,8 +43,9 @@ static void ixgbe_ipsec_set_tx_sa(struct ixgbe_hw *hw, u16 idx,
+ 	int i;
+ 
+ 	for (i = 0; i < 4; i++)
+-		IXGBE_WRITE_REG(hw, IXGBE_IPSTXKEY(i), cpu_to_be32(key[3 - i]));
+-	IXGBE_WRITE_REG(hw, IXGBE_IPSTXSALT, cpu_to_be32(salt));
++		IXGBE_WRITE_REG(hw, IXGBE_IPSTXKEY(i),
++				(__force u32)cpu_to_be32(key[3 - i]));
++	IXGBE_WRITE_REG(hw, IXGBE_IPSTXSALT, (__force u32)cpu_to_be32(salt));
+ 	IXGBE_WRITE_FLUSH(hw);
+ 
+ 	reg = IXGBE_READ_REG(hw, IXGBE_IPSTXIDX);
+@@ -93,7 +94,8 @@ static void ixgbe_ipsec_set_rx_sa(struct ixgbe_hw *hw, u16 idx, __be32 spi,
+ 	int i;
+ 
+ 	/* store the SPI (in bigendian) and IPidx */
+-	IXGBE_WRITE_REG(hw, IXGBE_IPSRXSPI, cpu_to_le32(spi));
++	IXGBE_WRITE_REG(hw, IXGBE_IPSRXSPI,
++			(__force u32)cpu_to_le32((__force u32)spi));
+ 	IXGBE_WRITE_REG(hw, IXGBE_IPSRXIPIDX, ip_idx);
+ 	IXGBE_WRITE_FLUSH(hw);
+ 
+@@ -101,8 +103,9 @@ static void ixgbe_ipsec_set_rx_sa(struct ixgbe_hw *hw, u16 idx, __be32 spi,
+ 
+ 	/* store the key, salt, and mode */
+ 	for (i = 0; i < 4; i++)
+-		IXGBE_WRITE_REG(hw, IXGBE_IPSRXKEY(i), cpu_to_be32(key[3 - i]));
+-	IXGBE_WRITE_REG(hw, IXGBE_IPSRXSALT, cpu_to_be32(salt));
++		IXGBE_WRITE_REG(hw, IXGBE_IPSRXKEY(i),
++				(__force u32)cpu_to_be32(key[3 - i]));
++	IXGBE_WRITE_REG(hw, IXGBE_IPSRXSALT, (__force u32)cpu_to_be32(salt));
+ 	IXGBE_WRITE_REG(hw, IXGBE_IPSRXMOD, mode);
+ 	IXGBE_WRITE_FLUSH(hw);
+ 
+@@ -121,7 +124,8 @@ static void ixgbe_ipsec_set_rx_ip(struct ixgbe_hw *hw, u16 idx, __be32 addr[])
+ 
+ 	/* store the ip address */
+ 	for (i = 0; i < 4; i++)
+-		IXGBE_WRITE_REG(hw, IXGBE_IPSRXIPADDR(i), cpu_to_le32(addr[i]));
++		IXGBE_WRITE_REG(hw, IXGBE_IPSRXIPADDR(i),
++				(__force u32)cpu_to_le32((__force u32)addr[i]));
+ 	IXGBE_WRITE_FLUSH(hw);
+ 
+ 	ixgbe_ipsec_set_rx_item(hw, idx, ips_rx_ip_tbl);
+@@ -391,7 +395,8 @@ static struct xfrm_state *ixgbe_ipsec_find_rx_state(struct ixgbe_ipsec *ipsec,
+ 	struct xfrm_state *ret = NULL;
+ 
+ 	rcu_read_lock();
+-	hash_for_each_possible_rcu(ipsec->rx_sa_list, rsa, hlist, spi)
++	hash_for_each_possible_rcu(ipsec->rx_sa_list, rsa, hlist,
++				   (__force u32)spi) {
+ 		if (spi == rsa->xs->id.spi &&
+ 		    ((ip4 && *daddr == rsa->xs->id.daddr.a4) ||
+ 		      (!ip4 && !memcmp(daddr, &rsa->xs->id.daddr.a6,
+@@ -401,6 +406,7 @@ static struct xfrm_state *ixgbe_ipsec_find_rx_state(struct ixgbe_ipsec *ipsec,
+ 			xfrm_state_hold(ret);
+ 			break;
+ 		}
++	}
+ 	rcu_read_unlock();
+ 	return ret;
+ }
+@@ -593,7 +599,7 @@ static int ixgbe_ipsec_add_sa(struct xfrm_state *xs)
+ 
+ 		/* hash the new entry for faster search in Rx path */
+ 		hash_add_rcu(ipsec->rx_sa_list, &ipsec->rx_tbl[sa_idx].hlist,
+-			     rsa.xs->id.spi);
++			     (__force u64)rsa.xs->id.spi);
+ 	} else {
+ 		struct tx_sa tsa;
+ 
+@@ -677,7 +683,8 @@ static void ixgbe_ipsec_del_sa(struct xfrm_state *xs)
+ 			if (!ipsec->ip_tbl[ipi].ref_cnt) {
+ 				memset(&ipsec->ip_tbl[ipi], 0,
+ 				       sizeof(struct rx_ip_sa));
+-				ixgbe_ipsec_set_rx_ip(hw, ipi, zerobuf);
++				ixgbe_ipsec_set_rx_ip(hw, ipi,
++						      (__force __be32 *)zerobuf);
+ 			}
+ 		}
+ 
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_model.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_model.h
+index 538a1c5475b6..01523ac8a15f 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_model.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_model.h
+@@ -52,8 +52,8 @@ static inline int ixgbe_mat_prgm_sip(struct ixgbe_fdir_filter *input,
+ 				     union ixgbe_atr_input *mask,
+ 				     u32 val, u32 m)
+ {
+-	input->filter.formatted.src_ip[0] = val;
+-	mask->formatted.src_ip[0] = m;
++	input->filter.formatted.src_ip[0] = (__force __be32)val;
++	mask->formatted.src_ip[0] = (__force __be32)m;
+ 	return 0;
+ }
+ 
+@@ -61,8 +61,8 @@ static inline int ixgbe_mat_prgm_dip(struct ixgbe_fdir_filter *input,
+ 				     union ixgbe_atr_input *mask,
+ 				     u32 val, u32 m)
+ {
+-	input->filter.formatted.dst_ip[0] = val;
+-	mask->formatted.dst_ip[0] = m;
++	input->filter.formatted.dst_ip[0] = (__force __be32)val;
++	mask->formatted.dst_ip[0] = (__force __be32)m;
+ 	return 0;
+ }
+ 
+@@ -78,10 +78,10 @@ static inline int ixgbe_mat_prgm_ports(struct ixgbe_fdir_filter *input,
+ 				       union ixgbe_atr_input *mask,
+ 				       u32 val, u32 m)
+ {
+-	input->filter.formatted.src_port = val & 0xffff;
+-	mask->formatted.src_port = m & 0xffff;
+-	input->filter.formatted.dst_port = val >> 16;
+-	mask->formatted.dst_port = m >> 16;
++	input->filter.formatted.src_port = (__force __be16)(val & 0xffff);
++	mask->formatted.src_port = (__force __be16)(m & 0xffff);
++	input->filter.formatted.dst_port = (__force __be16)(val >> 16);
++	mask->formatted.dst_port = (__force __be16)(m >> 16);
+ 
+ 	return 0;
+ };
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_x550.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_x550.c
+index 9592f3e3e42e..33d017318986 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_x550.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_x550.c
+@@ -898,8 +898,9 @@ static s32 ixgbe_read_ee_hostif_buffer_X550(struct ixgbe_hw *hw,
+ 		buffer.hdr.req.checksum = FW_DEFAULT_CHECKSUM;
+ 
+ 		/* convert offset from words to bytes */
+-		buffer.address = cpu_to_be32((offset + current_word) * 2);
+-		buffer.length = cpu_to_be16(words_to_read * 2);
++		buffer.address = (__force u32)cpu_to_be32((offset +
++							   current_word) * 2);
++		buffer.length = (__force u16)cpu_to_be16(words_to_read * 2);
+ 		buffer.pad2 = 0;
+ 		buffer.pad3 = 0;
+ 
+@@ -1109,9 +1110,9 @@ static s32 ixgbe_read_ee_hostif_X550(struct ixgbe_hw *hw, u16 offset, u16 *data)
+ 	buffer.hdr.req.checksum = FW_DEFAULT_CHECKSUM;
+ 
+ 	/* convert offset from words to bytes */
+-	buffer.address = cpu_to_be32(offset * 2);
++	buffer.address = (__force u32)cpu_to_be32(offset * 2);
+ 	/* one word */
+-	buffer.length = cpu_to_be16(sizeof(u16));
++	buffer.length = (__force u16)cpu_to_be16(sizeof(u16));
+ 
+ 	status = hw->mac.ops.acquire_swfw_sync(hw, mask);
+ 	if (status)
