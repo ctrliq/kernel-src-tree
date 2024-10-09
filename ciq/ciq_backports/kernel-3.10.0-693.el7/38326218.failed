@@ -1,0 +1,340 @@
+i40e: recalculate vsi->active_filters from hash contents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 38326218acce336d99cd128a11ecc69f6512f8e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/38326218.failed
+
+Previous code refactors have accidentally caused issues with the
+counting of active_filters. Avoid similar issues in the future by simply
+re-counting the active filters every time after we handle add and delete
+of all the filters. Additionally this allows us to simplify the check
+for when we exit promiscuous mode since we can combine the check for
+failed filters at the same time.
+
+Additionally since we recount filters at the end we need to set
+vsi->promisc_threshold as well.
+
+The resulting code takes a bit longer since we do have to loop over
+filters again. However, the result is more readable and less likely to
+become incorrect due to failed accounting of filters in the future.
+Finally, this ensures that it is not possible for vsi->active_filters to
+ever underflow since we never decrement it.
+
+Change-ID: Ib4f3a377e60eb1fa6c91ea86cc02238c08edd102
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 38326218acce336d99cd128a11ecc69f6512f8e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 2f00e31ef630,2ccf376adcfe..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1782,6 -1810,119 +1782,122 @@@ i40e_update_filter_state(int count
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * i40e_aqc_del_filters - Request firmware to delete a set of filters
++  * @vsi: ptr to the VSI
++  * @vsi_name: name to display in messages
++  * @list: the list of filters to send to firmware
++  * @num_del: the number of filters to delete
++  * @retval: Set to -EIO on failure to delete
++  *
++  * Send a request to firmware via AdminQ to delete a set of filters. Uses
++  * *retval instead of a return value so that success does not force ret_val to
++  * be set to 0. This ensures that a sequence of calls to this function
++  * preserve the previous value of *retval on successful delete.
++  */
++ static
++ void i40e_aqc_del_filters(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_aqc_remove_macvlan_element_data *list,
++ 			  int num_del, int *retval)
++ {
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 	int aq_err;
++ 
++ 	aq_ret = i40e_aq_remove_macvlan(hw, vsi->seid, list, num_del, NULL);
++ 	aq_err = hw->aq.asq_last_status;
++ 
++ 	/* Explicitly ignore and do not report when firmware returns ENOENT */
++ 	if (aq_ret && !(aq_err == I40E_AQ_RC_ENOENT)) {
++ 		*retval = -EIO;
++ 		dev_info(&vsi->back->pdev->dev,
++ 			 "ignoring delete macvlan error on %s, err %s, aq_err %s\n",
++ 			 vsi_name, i40e_stat_str(hw, aq_ret),
++ 			 i40e_aq_str(hw, aq_err));
++ 	}
++ }
++ 
++ /**
++  * i40e_aqc_add_filters - Request firmware to add a set of filters
++  * @vsi: ptr to the VSI
++  * @vsi_name: name to display in messages
++  * @list: the list of filters to send to firmware
++  * @add_head: Position in the add hlist
++  * @num_add: the number of filters to add
++  * @promisc_change: set to true on exit if promiscuous mode was forced on
++  *
++  * Send a request to firmware via AdminQ to add a chunk of filters. Will set
++  * promisc_changed to true if the firmware has run out of space for more
++  * filters.
++  */
++ static
++ void i40e_aqc_add_filters(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_aqc_add_macvlan_element_data *list,
++ 			  struct i40e_mac_filter *add_head,
++ 			  int num_add, bool *promisc_changed)
++ {
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 	int aq_err, fcnt;
++ 
++ 	aq_ret = i40e_aq_add_macvlan(hw, vsi->seid, list, num_add, NULL);
++ 	aq_err = hw->aq.asq_last_status;
++ 	fcnt = i40e_update_filter_state(num_add, list, add_head, aq_ret);
++ 
++ 	if (fcnt != num_add) {
++ 		*promisc_changed = true;
++ 		set_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state);
++ 		dev_warn(&vsi->back->pdev->dev,
++ 			 "Error %s adding RX filters on %s, promiscuous mode forced on\n",
++ 			 i40e_aq_str(hw, aq_err),
++ 			 vsi_name);
++ 	}
++ }
++ 
++ /**
++  * i40e_aqc_broadcast_filter - Set promiscuous broadcast flags
++  * @vsi: pointer to the VSI
++  * @f: filter data
++  *
++  * This function sets or clears the promiscuous broadcast flags for VLAN
++  * filters in order to properly receive broadcast frames. Assumes that only
++  * broadcast filters are passed.
++  **/
++ static
++ void i40e_aqc_broadcast_filter(struct i40e_vsi *vsi, const char *vsi_name,
++ 			       struct i40e_mac_filter *f)
++ {
++ 	bool enable = f->state == I40E_FILTER_NEW;
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 
++ 	if (f->vlan == I40E_VLAN_ANY) {
++ 		aq_ret = i40e_aq_set_vsi_broadcast(hw,
++ 						   vsi->seid,
++ 						   enable,
++ 						   NULL);
++ 	} else {
++ 		aq_ret = i40e_aq_set_vsi_bc_promisc_on_vlan(hw,
++ 							    vsi->seid,
++ 							    enable,
++ 							    f->vlan,
++ 							    NULL);
++ 	}
++ 
++ 	if (aq_ret) {
++ 		dev_warn(&vsi->back->pdev->dev,
++ 			 "Error %s setting broadcast promiscuous mode on %s\n",
++ 			 i40e_aq_str(hw, hw->aq.asq_last_status),
++ 			 vsi_name);
++ 		f->state = I40E_FILTER_FAILED;
++ 	} else if (enable) {
++ 		f->state = I40E_FILTER_ACTIVE;
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 38326218acce (i40e: recalculate vsi->active_filters from hash contents)
+   * i40e_sync_vsi_filters - Update the VSI filter list to the HW
+   * @vsi: ptr to the VSI
+   *
+@@@ -1791,9 -1932,13 +1907,16 @@@
+   **/
+  int i40e_sync_vsi_filters(struct i40e_vsi *vsi)
+  {
+ -	struct hlist_head tmp_add_list, tmp_del_list;
+ -	struct i40e_mac_filter *f, *add_head = NULL;
+ +	struct i40e_mac_filter *f, *ftmp, *add_head = NULL;
+ +	struct list_head tmp_add_list, tmp_del_list;
+  	struct i40e_hw *hw = &vsi->back->hw;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int vlan_any_filters = 0;
++ 	unsigned int non_vlan_filters = 0;
++ 	unsigned int failed_filters = 0;
++ 	unsigned int vlan_filters = 0;
+++>>>>>>> 38326218acce (i40e: recalculate vsi->active_filters from hash contents)
+  	bool promisc_changed = false;
+  	char vsi_name[16] = "PF";
+  	int filter_list_len = 0;
+@@@ -1832,22 -1977,83 +1955,83 @@@
+  	if (vsi->flags & I40E_VSI_FLAG_FILTER_CHANGED) {
+  		vsi->flags &= ~I40E_VSI_FLAG_FILTER_CHANGED;
+  
+ -		spin_lock_bh(&vsi->mac_filter_hash_lock);
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+  		/* Create a list of filters to delete. */
+ -		hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
+ +		list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+  			if (f->state == I40E_FILTER_REMOVE) {
+ +				WARN_ON(f->counter != 0);
+  				/* Move the element into temporary del_list */
+++<<<<<<< HEAD
+ +				list_move_tail(&f->list, &tmp_del_list);
+ +				vsi->active_filters--;
+++=======
++ 				hash_del(&f->hlist);
++ 				hlist_add_head(&f->hlist, &tmp_del_list);
++ 
++ 				/* Avoid counting removed filters */
++ 				continue;
+++>>>>>>> 38326218acce (i40e: recalculate vsi->active_filters from hash contents)
+  			}
+  			if (f->state == I40E_FILTER_NEW) {
+ -				hash_del(&f->hlist);
+ -				hlist_add_head(&f->hlist, &tmp_add_list);
+ +				WARN_ON(f->counter == 0);
+ +				/* Move the element into temporary add_list */
+ +				list_move_tail(&f->list, &tmp_add_list);
+  			}
+ -
+ -			/* Count the number of each type of filter we have
+ -			 * remaining, ignoring any filters we're about to
+ -			 * delete.
+ -			 */
+ -			if (f->vlan > 0)
+ -				vlan_filters++;
+ -			else if (!f->vlan)
+ -				non_vlan_filters++;
+ -			else
+ -				vlan_any_filters++;
+  		}
+++<<<<<<< HEAD
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+++=======
++ 
++ 		/* We should never have VLAN=-1 filters at the same time as we
++ 		 * have either VLAN=0 or VLAN>0 filters, so warn about this
++ 		 * case here to help catch any issues.
++ 		 */
++ 		WARN_ON(vlan_any_filters && (vlan_filters + non_vlan_filters));
++ 
++ 		/* If we only have VLAN=0 filters remaining, and don't have
++ 		 * any other VLAN filters, we need to convert these VLAN=0
++ 		 * filters into VLAN=-1 (I40E_VLAN_ANY) so that we operate
++ 		 * correctly in non-VLAN mode and receive all traffic tagged
++ 		 * or untagged.
++ 		 */
++ 		if (non_vlan_filters && !vlan_filters) {
++ 			hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f,
++ 					   hlist) {
++ 				/* Only replace VLAN=0 filters */
++ 				if (f->vlan)
++ 					continue;
++ 
++ 				/* Allocate a replacement element */
++ 				add_head = kzalloc(sizeof(*add_head),
++ 						   GFP_KERNEL);
++ 				if (!add_head)
++ 					goto err_no_memory_locked;
++ 
++ 				/* Copy the filter, with new state and VLAN */
++ 				*add_head = *f;
++ 				add_head->state = I40E_FILTER_NEW;
++ 				add_head->vlan = I40E_VLAN_ANY;
++ 
++ 				/* Move the replacement to the add list */
++ 				INIT_HLIST_NODE(&add_head->hlist);
++ 				hlist_add_head(&add_head->hlist,
++ 					       &tmp_add_list);
++ 
++ 				/* Move the original to the delete list */
++ 				f->state = I40E_FILTER_REMOVE;
++ 				hash_del(&f->hlist);
++ 				hlist_add_head(&f->hlist, &tmp_del_list);
++ 			}
++ 
++ 			/* Also update any filters on the tmp_add list */
++ 			hlist_for_each_entry(f, &tmp_add_list, hlist) {
++ 				if (!f->vlan)
++ 					f->vlan = I40E_VLAN_ANY;
++ 			}
++ 			add_head = NULL;
++ 		}
++ 		spin_unlock_bh(&vsi->mac_filter_hash_lock);
+++>>>>>>> 38326218acce (i40e: recalculate vsi->active_filters from hash contents)
+  	}
+  
+  	/* Now process 'del_list' outside the lock */
+@@@ -2026,27 -2200,36 +2210,57 @@@
+  		add_list = NULL;
+  	}
+  
+- 	/* Check to see if we can drop out of overflow promiscuous mode. */
++ 	/* Determine the number of active and failed filters. */
++ 	spin_lock_bh(&vsi->mac_filter_hash_lock);
++ 	vsi->active_filters = 0;
++ 	hash_for_each(vsi->mac_filter_hash, bkt, f, hlist) {
++ 		if (f->state == I40E_FILTER_ACTIVE)
++ 			vsi->active_filters++;
++ 		else if (f->state == I40E_FILTER_FAILED)
++ 			failed_filters++;
++ 	}
++ 	spin_unlock_bh(&vsi->mac_filter_hash_lock);
++ 
++ 	/* If promiscuous mode has changed, we need to calculate a new
++ 	 * threshold for when we are safe to exit
++ 	 */
++ 	if (promisc_changed)
++ 		vsi->promisc_threshold = (vsi->active_filters * 3) / 4;
++ 
++ 	/* Check if we are able to exit overflow promiscuous mode. We can
++ 	 * safely exit if we didn't just enter, we no longer have any failed
++ 	 * filters, and we have reduced filters below the threshold value.
++ 	 */
+  	if (test_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state) &&
++ 	    !promisc_changed && !failed_filters &&
+  	    (vsi->active_filters < vsi->promisc_threshold)) {
+++<<<<<<< HEAD
+ +		int failed_count = 0;
+ +		/* See if we have any failed filters. We can't drop out of
+ +		 * promiscuous until these have all been deleted.
+ +		 */
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+ +		list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +			if (f->state == I40E_FILTER_FAILED)
+ +				failed_count++;
+ +		}
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +		if (!failed_count) {
+ +			dev_info(&pf->pdev->dev,
+ +				 "filter logjam cleared on %s, leaving overflow promiscuous mode\n",
+ +				 vsi_name);
+ +			clear_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state);
+ +			promisc_changed = true;
+ +			vsi->promisc_threshold = 0;
+ +		}
+++=======
++ 		dev_info(&pf->pdev->dev,
++ 			 "filter logjam cleared on %s, leaving overflow promiscuous mode\n",
++ 			 vsi_name);
++ 		clear_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state);
++ 		promisc_changed = true;
++ 		vsi->promisc_threshold = 0;
+++>>>>>>> 38326218acce (i40e: recalculate vsi->active_filters from hash contents)
+  	}
+  
+  	/* if the VF is not trusted do not do promisc */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
