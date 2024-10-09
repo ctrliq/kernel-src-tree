@@ -1,0 +1,5530 @@
+bpf: add meta pointer for direct access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit de8f3a83b0a0fddb2cf56e7a718127e9619ea3da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/de8f3a83.failed
+
+This work enables generic transfer of metadata from XDP into skb. The
+basic idea is that we can make use of the fact that the resulting skb
+must be linear and already comes with a larger headroom for supporting
+bpf_xdp_adjust_head(), which mangles xdp->data. Here, we base our work
+on a similar principle and introduce a small helper bpf_xdp_adjust_meta()
+for adjusting a new pointer called xdp->data_meta. Thus, the packet has
+a flexible and programmable room for meta data, followed by the actual
+packet data. struct xdp_buff is therefore laid out that we first point
+to data_hard_start, then data_meta directly prepended to data followed
+by data_end marking the end of packet. bpf_xdp_adjust_head() takes into
+account whether we have meta data already prepended and if so, memmove()s
+this along with the given offset provided there's enough room.
+
+xdp->data_meta is optional and programs are not required to use it. The
+rationale is that when we process the packet in XDP (e.g. as DoS filter),
+we can push further meta data along with it for the XDP_PASS case, and
+give the guarantee that a clsact ingress BPF program on the same device
+can pick this up for further post-processing. Since we work with skb
+there, we can also set skb->mark, skb->priority or other skb meta data
+out of BPF, thus having this scratch space generic and programmable
+allows for more flexibility than defining a direct 1:1 transfer of
+potentially new XDP members into skb (it's also more efficient as we
+don't need to initialize/handle each of such new members). The facility
+also works together with GRO aggregation. The scratch space at the head
+of the packet can be multiple of 4 byte up to 32 byte large. Drivers not
+yet supporting xdp->data_meta can simply be set up with xdp->data_meta
+as xdp->data + 1 as bpf_xdp_adjust_meta() will detect this and bail out,
+such that the subsequent match against xdp->data for later access is
+guaranteed to fail.
+
+The verifier treats xdp->data_meta/xdp->data the same way as we treat
+xdp->data/xdp->data_end pointer comparisons. The requirement for doing
+the compare against xdp->data is that it hasn't been modified from it's
+original address we got from ctx access. It may have a range marking
+already from prior successful xdp->data/xdp->data_end pointer comparisons
+though.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit de8f3a83b0a0fddb2cf56e7a718127e9619ea3da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/thunder/nicvf_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/qlogic/qede/qede_fp.c
+#	drivers/net/tun.c
+#	drivers/net/virtio_net.c
+#	include/linux/bpf.h
+#	include/linux/filter.h
+#	include/linux/skbuff.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/verifier.c
+#	net/bpf/test_run.c
+#	net/core/dev.c
+#	net/core/filter.c
+#	net/core/skbuff.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 86e07b397743,f426762bd83a..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -2023,12 -2104,33 +2023,36 @@@ static int i40e_clean_rx_irq(struct i40
+  		rx_buffer = i40e_get_rx_buffer(rx_ring, size);
+  
+  		/* retrieve a buffer from the ring */
+++<<<<<<< HEAD
+ +		if (skb)
+++=======
++ 		if (!skb) {
++ 			xdp.data = page_address(rx_buffer->page) +
++ 				   rx_buffer->page_offset;
++ 			xdp_set_data_meta_invalid(&xdp);
++ 			xdp.data_hard_start = xdp.data -
++ 					      i40e_rx_offset(rx_ring);
++ 			xdp.data_end = xdp.data + size;
++ 
++ 			skb = i40e_run_xdp(rx_ring, &xdp);
++ 		}
++ 
++ 		if (IS_ERR(skb)) {
++ 			if (PTR_ERR(skb) == -I40E_XDP_TX) {
++ 				xdp_xmit = true;
++ 				i40e_rx_buffer_flip(rx_ring, rx_buffer, size);
++ 			} else {
++ 				rx_buffer->pagecnt_bias++;
++ 			}
++ 			total_rx_bytes += size;
++ 			total_rx_packets++;
++ 		} else if (skb) {
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  			i40e_add_rx_frag(rx_ring, rx_buffer, skb, size);
+ -		} else if (ring_uses_build_skb(rx_ring)) {
+ -			skb = i40e_build_skb(rx_ring, rx_buffer, &xdp);
+ -		} else {
+ -			skb = i40e_construct_skb(rx_ring, rx_buffer, &xdp);
+ -		}
+ +		else if (ring_uses_build_skb(rx_ring))
+ +			skb = i40e_build_skb(rx_ring, rx_buffer, size);
+ +		else
+ +			skb = i40e_construct_skb(rx_ring, rx_buffer, size);
+  
+  		/* exit if we failed to retrieve a buffer */
+  		if (!skb) {
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index bc2d9678add4,04bb03bda1cd..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -2249,14 -2323,35 +2249,38 @@@ static int ixgbe_clean_rx_irq(struct ix
+  		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
+  
+  		/* retrieve a buffer from the ring */
+++<<<<<<< HEAD
+ +		if (skb)
+++=======
++ 		if (!skb) {
++ 			xdp.data = page_address(rx_buffer->page) +
++ 				   rx_buffer->page_offset;
++ 			xdp_set_data_meta_invalid(&xdp);
++ 			xdp.data_hard_start = xdp.data -
++ 					      ixgbe_rx_offset(rx_ring);
++ 			xdp.data_end = xdp.data + size;
++ 
++ 			skb = ixgbe_run_xdp(adapter, rx_ring, &xdp);
++ 		}
++ 
++ 		if (IS_ERR(skb)) {
++ 			if (PTR_ERR(skb) == -IXGBE_XDP_TX) {
++ 				xdp_xmit = true;
++ 				ixgbe_rx_buffer_flip(rx_ring, rx_buffer, size);
++ 			} else {
++ 				rx_buffer->pagecnt_bias++;
++ 			}
++ 			total_rx_packets++;
++ 			total_rx_bytes += size;
++ 		} else if (skb) {
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
+ -		} else if (ring_uses_build_skb(rx_ring)) {
+ +		else if (ring_uses_build_skb(rx_ring))
+  			skb = ixgbe_build_skb(rx_ring, rx_buffer,
+ -					      &xdp, rx_desc);
+ -		} else {
+ +					      rx_desc, size);
+ +		else
+  			skb = ixgbe_construct_skb(rx_ring, rx_buffer,
+ -						  &xdp, rx_desc);
+ -		}
+ +						  rx_desc, size);
+  
+  		/* exit if we failed to retrieve a buffer */
+  		if (!skb) {
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index bfba89f7da62,8f9cb8abc497..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -734,6 -745,59 +734,62 @@@ int mlx4_en_process_rx_cq(struct net_de
+  		 */
+  		length = be32_to_cpu(cqe->byte_cnt);
+  		length -= ring->fcs_del;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			void *orig_data;
++ 			u32 act;
++ 
++ 			dma = frags[0].dma + frags[0].page_offset;
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data_hard_start = va - frags[0].page_offset;
++ 			xdp.data = va;
++ 			xdp_set_data_meta_invalid(&xdp);
++ 			xdp.data_end = xdp.data + length;
++ 			orig_data = xdp.data;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 			if (xdp.data != orig_data) {
++ 				length = xdp.data_end - xdp.data;
++ 				frags[0].page_offset = xdp.data -
++ 					xdp.data_hard_start;
++ 				va = xdp.data;
++ 			}
++ 
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (likely(!mlx4_en_xmit_frame(ring, frags, dev,
++ 							length, cq_ring,
++ 							&doorbell_pending))) {
++ 					frags[0].page = NULL;
++ 					goto next;
++ 				}
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 				goto xdp_drop_no_cnt; /* Drop on xmit failure */
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				ring->xdp_drop++;
++ xdp_drop_no_cnt:
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  		ring->bytes += length;
+  		ring->packets++;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index f75f2c655534,30b3f3fbd719..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -733,6 -701,123 +733,126 @@@ static inline void mlx5e_complete_rx_cq
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_tx_wqe *wqe;
++ 	u16 pi = (sq->pc - 1) & wq->sz_m1; /* last pi */
++ 
++ 	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &wqe->ctrl);
++ }
++ 
++ static inline bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
++ 					struct mlx5e_dma_info *di,
++ 					const struct xdp_buff *xdp)
++ {
++ 	struct mlx5e_xdpsq       *sq   = &rq->xdpsq;
++ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
++ 	u16                       pi   = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 	struct mlx5_wqe_data_seg *dseg;
++ 
++ 	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
++ 	dma_addr_t dma_addr  = di->addr + data_offset;
++ 	unsigned int dma_len = xdp->data_end - xdp->data;
++ 
++ 	prefetchw(wqe);
++ 
++ 	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE ||
++ 		     MLX5E_SW2HW_MTU(rq->channel->priv, rq->netdev->mtu) < dma_len)) {
++ 		rq->stats.xdp_drop++;
++ 		return false;
++ 	}
++ 
++ 	if (unlikely(!mlx5e_wqc_has_room_for(wq, sq->cc, sq->pc, 1))) {
++ 		if (sq->db.doorbell) {
++ 			/* SQ is full, ring doorbell */
++ 			mlx5e_xmit_xdp_doorbell(sq);
++ 			sq->db.doorbell = false;
++ 		}
++ 		rq->stats.xdp_tx_full++;
++ 		return false;
++ 	}
++ 
++ 	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len, PCI_DMA_TODEVICE);
++ 
++ 	cseg->fm_ce_se = 0;
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
++ 
++ 	/* copy the inline part if required */
++ 	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
++ 		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
++ 		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++ 		dma_len  -= MLX5E_XDP_MIN_INLINE;
++ 		dma_addr += MLX5E_XDP_MIN_INLINE;
++ 		dseg++;
++ 	}
++ 
++ 	/* write the dma part */
++ 	dseg->addr       = cpu_to_be64(dma_addr);
++ 	dseg->byte_count = cpu_to_be32(dma_len);
++ 
++ 	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++ 
++ 	/* move page to reference to sq responsibility,
++ 	 * and mark so it's not put back in page-cache.
++ 	 */
++ 	rq->wqe.xdp_xmit = true;
++ 	sq->db.di[pi] = *di;
++ 	sq->pc++;
++ 
++ 	sq->db.doorbell = true;
++ 
++ 	rq->stats.xdp_tx++;
++ 	return true;
++ }
++ 
++ /* returns true if packet was consumed by xdp */
++ static inline int mlx5e_xdp_handle(struct mlx5e_rq *rq,
++ 				   struct mlx5e_dma_info *di,
++ 				   void *va, u16 *rx_headroom, u32 *len)
++ {
++ 	const struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 
++ 	if (!prog)
++ 		return false;
++ 
++ 	xdp.data = va + *rx_headroom;
++ 	xdp_set_data_meta_invalid(&xdp);
++ 	xdp.data_end = xdp.data + *len;
++ 	xdp.data_hard_start = va;
++ 
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		*rx_headroom = xdp.data - xdp.data_hard_start;
++ 		*len = xdp.data_end - xdp.data;
++ 		return false;
++ 	case XDP_TX:
++ 		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
++ 			trace_xdp_exception(rq->netdev, prog, act);
++ 		return true;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(rq->netdev, prog, act);
++ 	case XDP_DROP:
++ 		rq->stats.xdp_drop++;
++ 		return true;
++ 	}
++ }
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  static inline
+  struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+  			     struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+diff --cc drivers/net/ethernet/qlogic/qede/qede_fp.c
+index 976acf1028af,48ec4c56cddf..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@@ -921,6 -990,75 +921,78 @@@ static bool qede_pkt_is_ip_fragmented(s
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return true iff packet is to be passed to stack */
++ static bool qede_rx_xdp(struct qede_dev *edev,
++ 			struct qede_fastpath *fp,
++ 			struct qede_rx_queue *rxq,
++ 			struct bpf_prog *prog,
++ 			struct sw_rx_data *bd,
++ 			struct eth_fast_path_rx_reg_cqe *cqe,
++ 			u16 *data_offset, u16 *len)
++ {
++ 	struct xdp_buff xdp;
++ 	enum xdp_action act;
++ 
++ 	xdp.data_hard_start = page_address(bd->data);
++ 	xdp.data = xdp.data_hard_start + *data_offset;
++ 	xdp_set_data_meta_invalid(&xdp);
++ 	xdp.data_end = xdp.data + *len;
++ 
++ 	/* Queues always have a full reset currently, so for the time
++ 	 * being until there's atomic program replace just mark read
++ 	 * side for map helpers.
++ 	 */
++ 	rcu_read_lock();
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	rcu_read_unlock();
++ 
++ 	/* Recalculate, as XDP might have changed the headers */
++ 	*data_offset = xdp.data - xdp.data_hard_start;
++ 	*len = xdp.data_end - xdp.data;
++ 
++ 	if (act == XDP_PASS)
++ 		return true;
++ 
++ 	/* Count number of packets not to be passed to stack */
++ 	rxq->xdp_no_pass++;
++ 
++ 	switch (act) {
++ 	case XDP_TX:
++ 		/* We need the replacement buffer before transmit. */
++ 		if (qede_alloc_rx_buffer(rxq, true)) {
++ 			qede_recycle_rx_bd_ring(rxq, 1);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 			return false;
++ 		}
++ 
++ 		/* Now if there's a transmission problem, we'd still have to
++ 		 * throw current buffer, as replacement was already allocated.
++ 		 */
++ 		if (qede_xdp_xmit(edev, fp, bd, *data_offset, *len)) {
++ 			dma_unmap_page(rxq->dev, bd->mapping,
++ 				       PAGE_SIZE, DMA_BIDIRECTIONAL);
++ 			__free_page(bd->data);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 		}
++ 
++ 		/* Regardless, we've consumed an Rx BD */
++ 		qede_rx_bd_ring_consume(rxq);
++ 		return false;
++ 
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(edev->ndev, prog, act);
++ 	case XDP_DROP:
++ 		qede_recycle_rx_bd_ring(rxq, cqe->bd_num);
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  static struct sk_buff *qede_rx_allocate_skb(struct qede_dev *edev,
+  					    struct qede_rx_queue *rxq,
+  					    struct sw_rx_data *bd, u16 len,
+diff --cc drivers/net/tun.c
+index 3c46a6b55234,a6e0bffe3d29..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -1260,10 -1395,143 +1260,146 @@@ static void tun_rx_batched(struct tun_s
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool tun_can_build_skb(struct tun_struct *tun, struct tun_file *tfile,
++ 			      int len, int noblock, bool zerocopy)
++ {
++ 	if ((tun->flags & TUN_TYPE_MASK) != IFF_TAP)
++ 		return false;
++ 
++ 	if (tfile->socket.sk->sk_sndbuf != INT_MAX)
++ 		return false;
++ 
++ 	if (!noblock)
++ 		return false;
++ 
++ 	if (zerocopy)
++ 		return false;
++ 
++ 	if (SKB_DATA_ALIGN(len + TUN_RX_PAD) +
++ 	    SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) > PAGE_SIZE)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static struct sk_buff *tun_build_skb(struct tun_struct *tun,
++ 				     struct tun_file *tfile,
++ 				     struct iov_iter *from,
++ 				     struct virtio_net_hdr *hdr,
++ 				     int len, int *skb_xdp)
++ {
++ 	struct page_frag *alloc_frag = &current->task_frag;
++ 	struct sk_buff *skb;
++ 	struct bpf_prog *xdp_prog;
++ 	int buflen = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 	unsigned int delta = 0;
++ 	char *buf;
++ 	size_t copied;
++ 	bool xdp_xmit = false;
++ 	int err, pad = TUN_RX_PAD;
++ 
++ 	rcu_read_lock();
++ 	xdp_prog = rcu_dereference(tun->xdp_prog);
++ 	if (xdp_prog)
++ 		pad += TUN_HEADROOM;
++ 	buflen += SKB_DATA_ALIGN(len + pad);
++ 	rcu_read_unlock();
++ 
++ 	if (unlikely(!skb_page_frag_refill(buflen, alloc_frag, GFP_KERNEL)))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	buf = (char *)page_address(alloc_frag->page) + alloc_frag->offset;
++ 	copied = copy_page_from_iter(alloc_frag->page,
++ 				     alloc_frag->offset + pad,
++ 				     len, from);
++ 	if (copied != len)
++ 		return ERR_PTR(-EFAULT);
++ 
++ 	/* There's a small window that XDP may be set after the check
++ 	 * of xdp_prog above, this should be rare and for simplicity
++ 	 * we do XDP on skb in case the headroom is not enough.
++ 	 */
++ 	if (hdr->gso_type || !xdp_prog)
++ 		*skb_xdp = 1;
++ 	else
++ 		*skb_xdp = 0;
++ 
++ 	rcu_read_lock();
++ 	xdp_prog = rcu_dereference(tun->xdp_prog);
++ 	if (xdp_prog && !*skb_xdp) {
++ 		struct xdp_buff xdp;
++ 		void *orig_data;
++ 		u32 act;
++ 
++ 		xdp.data_hard_start = buf;
++ 		xdp.data = buf + pad;
++ 		xdp_set_data_meta_invalid(&xdp);
++ 		xdp.data_end = xdp.data + len;
++ 		orig_data = xdp.data;
++ 		act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 		switch (act) {
++ 		case XDP_REDIRECT:
++ 			get_page(alloc_frag->page);
++ 			alloc_frag->offset += buflen;
++ 			err = xdp_do_redirect(tun->dev, &xdp, xdp_prog);
++ 			if (err)
++ 				goto err_redirect;
++ 			return NULL;
++ 		case XDP_TX:
++ 			xdp_xmit = true;
++ 			/* fall through */
++ 		case XDP_PASS:
++ 			delta = orig_data - xdp.data;
++ 			break;
++ 		default:
++ 			bpf_warn_invalid_xdp_action(act);
++ 			/* fall through */
++ 		case XDP_ABORTED:
++ 			trace_xdp_exception(tun->dev, xdp_prog, act);
++ 			/* fall through */
++ 		case XDP_DROP:
++ 			goto err_xdp;
++ 		}
++ 	}
++ 
++ 	skb = build_skb(buf, buflen);
++ 	if (!skb) {
++ 		rcu_read_unlock();
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	skb_reserve(skb, pad - delta);
++ 	skb_put(skb, len + delta);
++ 	get_page(alloc_frag->page);
++ 	alloc_frag->offset += buflen;
++ 
++ 	if (xdp_xmit) {
++ 		skb->dev = tun->dev;
++ 		generic_xdp_tx(skb, xdp_prog);
++ 		rcu_read_lock();
++ 		return NULL;
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	return skb;
++ 
++ err_redirect:
++ 	put_page(alloc_frag->page);
++ err_xdp:
++ 	rcu_read_unlock();
++ 	this_cpu_inc(tun->pcpu_stats->rx_dropped);
++ 	return NULL;
++ }
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  /* Get packet from user space buffer */
+  static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
+ -			    void *msg_control, struct iov_iter *from,
+ -			    int noblock, bool more)
+ +			    void *msg_control, const struct iovec *iv,
+ +			    size_t total_len, size_t count, int noblock, bool more)
+  {
+  	struct tun_pi pi = { 0, cpu_to_be16(ETH_P_IP) };
+  	struct sk_buff *skb;
+diff --cc drivers/net/virtio_net.c
+index 7b0841ddd139,fc059f193e7d..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -288,14 -373,241 +288,97 @@@ static struct sk_buff *page_to_skb(stru
+  	return skb;
+  }
+  
+ -static void virtnet_xdp_flush(struct net_device *dev)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	struct send_queue *sq;
+ -	unsigned int qp;
+ -
+ -	qp = vi->curr_queue_pairs - vi->xdp_queue_pairs + smp_processor_id();
+ -	sq = &vi->sq[qp];
+ -
+ -	virtqueue_kick(sq->vq);
+ -}
+ -
+ -static bool __virtnet_xdp_xmit(struct virtnet_info *vi,
+ -			       struct xdp_buff *xdp)
+ -{
+ -	struct virtio_net_hdr_mrg_rxbuf *hdr;
+ -	unsigned int len;
+ -	struct send_queue *sq;
+ -	unsigned int qp;
+ -	void *xdp_sent;
+ -	int err;
+ -
+ -	qp = vi->curr_queue_pairs - vi->xdp_queue_pairs + smp_processor_id();
+ -	sq = &vi->sq[qp];
+ -
+ -	/* Free up any pending old buffers before queueing new ones. */
+ -	while ((xdp_sent = virtqueue_get_buf(sq->vq, &len)) != NULL) {
+ -		struct page *sent_page = virt_to_head_page(xdp_sent);
+ -
+ -		put_page(sent_page);
+ -	}
+ -
+ -	xdp->data -= vi->hdr_len;
+ -	/* Zero header and leave csum up to XDP layers */
+ -	hdr = xdp->data;
+ -	memset(hdr, 0, vi->hdr_len);
+ -
+ -	sg_init_one(sq->sg, xdp->data, xdp->data_end - xdp->data);
+ -
+ -	err = virtqueue_add_outbuf(sq->vq, sq->sg, 1, xdp->data, GFP_ATOMIC);
+ -	if (unlikely(err)) {
+ -		struct page *page = virt_to_head_page(xdp->data);
+ -
+ -		put_page(page);
+ -		return false;
+ -	}
+ -
+ -	return true;
+ -}
+ -
+ -static int virtnet_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	bool sent = __virtnet_xdp_xmit(vi, xdp);
+ -
+ -	if (!sent)
+ -		return -ENOSPC;
+ -	return 0;
+ -}
+ -
+ -static unsigned int virtnet_get_headroom(struct virtnet_info *vi)
+ +static struct sk_buff *receive_small(struct virtnet_info *vi, void *buf, unsigned int len)
+  {
+ -	return vi->xdp_queue_pairs ? VIRTIO_XDP_HEADROOM : 0;
+ -}
+ -
+ -/* We copy the packet for XDP in the following cases:
+ - *
+ - * 1) Packet is scattered across multiple rx buffers.
+ - * 2) Headroom space is insufficient.
+ - *
+ - * This is inefficient but it's a temporary condition that
+ - * we hit right after XDP is enabled and until queue is refilled
+ - * with large buffers with sufficient headroom - so it should affect
+ - * at most queue size packets.
+ - * Afterwards, the conditions to enable
+ - * XDP should preclude the underlying device from sending packets
+ - * across multiple buffers (num_buf > 1), and we make sure buffers
+ - * have enough headroom.
+ - */
+ -static struct page *xdp_linearize_page(struct receive_queue *rq,
+ -				       u16 *num_buf,
+ -				       struct page *p,
+ -				       int offset,
+ -				       int page_off,
+ -				       unsigned int *len)
+ -{
+ -	struct page *page = alloc_page(GFP_ATOMIC);
+ -
+ -	if (!page)
+ -		return NULL;
+ -
+ -	memcpy(page_address(page) + page_off, page_address(p) + offset, *len);
+ -	page_off += *len;
+ -
+ -	while (--*num_buf) {
+ -		unsigned int buflen;
+ -		void *buf;
+ -		int off;
+ -
+ -		buf = virtqueue_get_buf(rq->vq, &buflen);
+ -		if (unlikely(!buf))
+ -			goto err_buf;
+ -
+ -		p = virt_to_head_page(buf);
+ -		off = buf - page_address(p);
+ -
+ -		/* guard against a misconfigured or uncooperative backend that
+ -		 * is sending packet larger than the MTU.
+ -		 */
+ -		if ((page_off + buflen) > PAGE_SIZE) {
+ -			put_page(p);
+ -			goto err_buf;
+ -		}
+ -
+ -		memcpy(page_address(page) + page_off,
+ -		       page_address(p) + off, buflen);
+ -		page_off += buflen;
+ -		put_page(p);
+ -	}
+ -
+ -	/* Headroom does not contribute to packet length */
+ -	*len = page_off - VIRTIO_XDP_HEADROOM;
+ -	return page;
+ -err_buf:
+ -	__free_pages(page, 0);
+ -	return NULL;
+ -}
+ +	struct sk_buff * skb = buf;
+  
+ -static struct sk_buff *receive_small(struct net_device *dev,
+ -				     struct virtnet_info *vi,
+ -				     struct receive_queue *rq,
+ -				     void *buf, void *ctx,
+ -				     unsigned int len,
+ -				     bool *xdp_xmit)
+ -{
+ -	struct sk_buff *skb;
+ -	struct bpf_prog *xdp_prog;
+ -	unsigned int xdp_headroom = (unsigned long)ctx;
+ -	unsigned int header_offset = VIRTNET_RX_PAD + xdp_headroom;
+ -	unsigned int headroom = vi->hdr_len + header_offset;
+ -	unsigned int buflen = SKB_DATA_ALIGN(GOOD_PACKET_LEN + headroom) +
+ -			      SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ -	struct page *page = virt_to_head_page(buf);
+ -	unsigned int delta = 0, err;
+ -	struct page *xdp_page;
+  	len -= vi->hdr_len;
+ +	skb_trim(skb, len);
+  
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_lock();
++ 	xdp_prog = rcu_dereference(rq->xdp_prog);
++ 	if (xdp_prog) {
++ 		struct virtio_net_hdr_mrg_rxbuf *hdr = buf + header_offset;
++ 		struct xdp_buff xdp;
++ 		void *orig_data;
++ 		u32 act;
++ 
++ 		if (unlikely(hdr->hdr.gso_type || hdr->hdr.flags))
++ 			goto err_xdp;
++ 
++ 		if (unlikely(xdp_headroom < virtnet_get_headroom(vi))) {
++ 			int offset = buf - page_address(page) + header_offset;
++ 			unsigned int tlen = len + vi->hdr_len;
++ 			u16 num_buf = 1;
++ 
++ 			xdp_headroom = virtnet_get_headroom(vi);
++ 			header_offset = VIRTNET_RX_PAD + xdp_headroom;
++ 			headroom = vi->hdr_len + header_offset;
++ 			buflen = SKB_DATA_ALIGN(GOOD_PACKET_LEN + headroom) +
++ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 			xdp_page = xdp_linearize_page(rq, &num_buf, page,
++ 						      offset, header_offset,
++ 						      &tlen);
++ 			if (!xdp_page)
++ 				goto err_xdp;
++ 
++ 			buf = page_address(xdp_page);
++ 			put_page(page);
++ 			page = xdp_page;
++ 		}
++ 
++ 		xdp.data_hard_start = buf + VIRTNET_RX_PAD + vi->hdr_len;
++ 		xdp.data = xdp.data_hard_start + xdp_headroom;
++ 		xdp_set_data_meta_invalid(&xdp);
++ 		xdp.data_end = xdp.data + len;
++ 		orig_data = xdp.data;
++ 		act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 		switch (act) {
++ 		case XDP_PASS:
++ 			/* Recalculate length in case bpf program changed it */
++ 			delta = orig_data - xdp.data;
++ 			break;
++ 		case XDP_TX:
++ 			if (unlikely(!__virtnet_xdp_xmit(vi, &xdp)))
++ 				trace_xdp_exception(vi->dev, xdp_prog, act);
++ 			else
++ 				*xdp_xmit = true;
++ 			rcu_read_unlock();
++ 			goto xdp_xmit;
++ 		case XDP_REDIRECT:
++ 			err = xdp_do_redirect(dev, &xdp, xdp_prog);
++ 			if (!err)
++ 				*xdp_xmit = true;
++ 			rcu_read_unlock();
++ 			goto xdp_xmit;
++ 		default:
++ 			bpf_warn_invalid_xdp_action(act);
++ 		case XDP_ABORTED:
++ 			trace_xdp_exception(vi->dev, xdp_prog, act);
++ 		case XDP_DROP:
++ 			goto err_xdp;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	skb = build_skb(buf, buflen);
++ 	if (!skb) {
++ 		put_page(page);
++ 		goto err;
++ 	}
++ 	skb_reserve(skb, headroom - delta);
++ 	skb_put(skb, len + delta);
++ 	if (!delta) {
++ 		buf += header_offset;
++ 		memcpy(skb_vnet_hdr(skb), buf, vi->hdr_len);
++ 	} /* keep zeroed vnet hdr since packet was changed by bpf */
++ 
++ err:
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  	return skb;
+ -
+ -err_xdp:
+ -	rcu_read_unlock();
+ -	dev->stats.rx_dropped++;
+ -	put_page(page);
+ -xdp_xmit:
+ -	return NULL;
+  }
+  
+  static struct sk_buff *receive_big(struct net_device *dev,
+@@@ -321,31 -634,133 +404,130 @@@ static struct sk_buff *receive_mergeabl
+  					 struct virtnet_info *vi,
+  					 struct receive_queue *rq,
+  					 void *buf,
+ -					 void *ctx,
+ -					 unsigned int len,
+ -					 bool *xdp_xmit)
+ +					 unsigned int len)
+  {
+ -	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
+ -	u16 num_buf = virtio16_to_cpu(vi->vdev, hdr->num_buffers);
+ -	struct page *page = virt_to_head_page(buf);
+ -	int offset = buf - page_address(page);
+ -	struct sk_buff *head_skb, *curr_skb;
+ -	struct bpf_prog *xdp_prog;
+ -	unsigned int truesize;
+ -	unsigned int headroom = mergeable_ctx_to_headroom(ctx);
+ -	int err;
+ +	struct virtio_net_hdr_mrg_rxbuf *hdr = page_address(buf);
+ +	u16 num_buf = virtio16_to_cpu(rq->vq->vdev, hdr->num_buffers);
+ +	struct page *page = buf;
+ +	struct sk_buff *skb = page_to_skb(vi, rq, page, len);
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!skb))
+++=======
++ 	head_skb = NULL;
++ 
++ 	rcu_read_lock();
++ 	xdp_prog = rcu_dereference(rq->xdp_prog);
++ 	if (xdp_prog) {
++ 		struct page *xdp_page;
++ 		struct xdp_buff xdp;
++ 		void *data;
++ 		u32 act;
++ 
++ 		/* This happens when rx buffer size is underestimated */
++ 		if (unlikely(num_buf > 1 ||
++ 			     headroom < virtnet_get_headroom(vi))) {
++ 			/* linearize data for XDP */
++ 			xdp_page = xdp_linearize_page(rq, &num_buf,
++ 						      page, offset,
++ 						      VIRTIO_XDP_HEADROOM,
++ 						      &len);
++ 			if (!xdp_page)
++ 				goto err_xdp;
++ 			offset = VIRTIO_XDP_HEADROOM;
++ 		} else {
++ 			xdp_page = page;
++ 		}
++ 
++ 		/* Transient failure which in theory could occur if
++ 		 * in-flight packets from before XDP was enabled reach
++ 		 * the receive path after XDP is loaded. In practice I
++ 		 * was not able to create this condition.
++ 		 */
++ 		if (unlikely(hdr->hdr.gso_type))
++ 			goto err_xdp;
++ 
++ 		/* Allow consuming headroom but reserve enough space to push
++ 		 * the descriptor on if we get an XDP_TX return code.
++ 		 */
++ 		data = page_address(xdp_page) + offset;
++ 		xdp.data_hard_start = data - VIRTIO_XDP_HEADROOM + vi->hdr_len;
++ 		xdp.data = data + vi->hdr_len;
++ 		xdp_set_data_meta_invalid(&xdp);
++ 		xdp.data_end = xdp.data + (len - vi->hdr_len);
++ 		act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 		if (act != XDP_PASS)
++ 			ewma_pkt_len_add(&rq->mrg_avg_pkt_len, len);
++ 
++ 		switch (act) {
++ 		case XDP_PASS:
++ 			/* recalculate offset to account for any header
++ 			 * adjustments. Note other cases do not build an
++ 			 * skb and avoid using offset
++ 			 */
++ 			offset = xdp.data -
++ 					page_address(xdp_page) - vi->hdr_len;
++ 
++ 			/* We can only create skb based on xdp_page. */
++ 			if (unlikely(xdp_page != page)) {
++ 				rcu_read_unlock();
++ 				put_page(page);
++ 				head_skb = page_to_skb(vi, rq, xdp_page,
++ 						       offset, len, PAGE_SIZE);
++ 				return head_skb;
++ 			}
++ 			break;
++ 		case XDP_TX:
++ 			if (unlikely(!__virtnet_xdp_xmit(vi, &xdp)))
++ 				trace_xdp_exception(vi->dev, xdp_prog, act);
++ 			else
++ 				*xdp_xmit = true;
++ 			if (unlikely(xdp_page != page))
++ 				goto err_xdp;
++ 			rcu_read_unlock();
++ 			goto xdp_xmit;
++ 		case XDP_REDIRECT:
++ 			err = xdp_do_redirect(dev, &xdp, xdp_prog);
++ 			if (!err)
++ 				*xdp_xmit = true;
++ 			rcu_read_unlock();
++ 			goto xdp_xmit;
++ 		default:
++ 			bpf_warn_invalid_xdp_action(act);
++ 		case XDP_ABORTED:
++ 			trace_xdp_exception(vi->dev, xdp_prog, act);
++ 		case XDP_DROP:
++ 			if (unlikely(xdp_page != page))
++ 				__free_pages(xdp_page, 0);
++ 			goto err_xdp;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	truesize = mergeable_ctx_to_truesize(ctx);
++ 	if (unlikely(len > truesize)) {
++ 		pr_debug("%s: rx error: len %u exceeds truesize %lu\n",
++ 			 dev->name, len, (unsigned long)ctx);
++ 		dev->stats.rx_length_errors++;
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  		goto err_skb;
+ -	}
+ -
+ -	head_skb = page_to_skb(vi, rq, page, offset, len, truesize);
+ -	curr_skb = head_skb;
+  
+ -	if (unlikely(!curr_skb))
+ -		goto err_skb;
+  	while (--num_buf) {
+ -		int num_skb_frags;
+ -
+ -		buf = virtqueue_get_buf_ctx(rq->vq, &len, &ctx);
+ -		if (unlikely(!ctx)) {
+ -			pr_debug("%s: rx error: %d buffers out of %d missing\n",
+ -				 dev->name, num_buf,
+ -				 virtio16_to_cpu(vi->vdev,
+ -						 hdr->num_buffers));
+ +		i = skb_shinfo(skb)->nr_frags;
+ +		if (i >= MAX_SKB_FRAGS) {
+ +			pr_debug("%s: packet too long\n", skb->dev->name);
+ +			skb->dev->stats.rx_length_errors++;
+ +			return NULL;
+ +		}
+ +		page = virtqueue_get_buf(rq->vq, &len);
+ +		if (!page) {
+ +			pr_debug("%s: rx error: %d buffers %d missing\n",
+ +				 dev->name,
+ +				 virtio16_to_cpu(rq->vq->vdev,
+ +						 hdr->num_buffers),
+ +				 num_buf);
+  			dev->stats.rx_length_errors++;
+  			goto err_buf;
+  		}
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,2b672c50f160..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -84,8 -99,63 +84,59 @@@ struct bpf_map *bpf_map_get(struct fd f
+  struct bpf_func_proto {
+  	u64 (*func)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+  	bool gpl_only;
+ -	bool pkt_access;
+ -	enum bpf_return_type ret_type;
+ -	enum bpf_arg_type arg1_type;
+ -	enum bpf_arg_type arg2_type;
+ -	enum bpf_arg_type arg3_type;
+ -	enum bpf_arg_type arg4_type;
+ -	enum bpf_arg_type arg5_type;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* bpf_context is intentionally undefined structure. Pointer to bpf_context is
++  * the first argument to eBPF programs.
++  * For socket filters: 'struct bpf_context *' == 'struct sk_buff *'
++  */
++ struct bpf_context;
++ 
++ enum bpf_access_type {
++ 	BPF_READ = 1,
++ 	BPF_WRITE = 2
++ };
++ 
++ /* types of values stored in eBPF registers */
++ /* Pointer types represent:
++  * pointer
++  * pointer + imm
++  * pointer + (u16) var
++  * pointer + (u16) var + imm
++  * if (range > 0) then [ptr, ptr + range - off) is safe to access
++  * if (id > 0) means that some 'var' was added
++  * if (off > 0) means that 'imm' was added
++  */
++ enum bpf_reg_type {
++ 	NOT_INIT = 0,		 /* nothing was written into register */
++ 	SCALAR_VALUE,		 /* reg doesn't contain a valid pointer */
++ 	PTR_TO_CTX,		 /* reg points to bpf_context */
++ 	CONST_PTR_TO_MAP,	 /* reg points to struct bpf_map */
++ 	PTR_TO_MAP_VALUE,	 /* reg points to map element value */
++ 	PTR_TO_MAP_VALUE_OR_NULL,/* points to map elem value or NULL */
++ 	PTR_TO_STACK,		 /* reg == frame_pointer + offset */
++ 	PTR_TO_PACKET_META,	 /* skb->data - meta_len */
++ 	PTR_TO_PACKET,		 /* reg points to skb->data */
++ 	PTR_TO_PACKET_END,	 /* skb->data + headlen */
++ };
++ 
++ /* The information passed from prog-specific *_is_valid_access
++  * back to the verifier.
++  */
++ struct bpf_insn_access_aux {
++ 	enum bpf_reg_type reg_type;
++ 	int ctx_field_size;
++ };
++ 
++ static inline void
++ bpf_ctx_record_field_size(struct bpf_insn_access_aux *aux, u32 size)
++ {
++ 	aux->ctx_field_size = size;
++ }
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  struct bpf_verifier_ops {
+  	/* return eBPF function prototype for verification */
+  	const struct bpf_func_proto *(*get_func_proto)(enum bpf_func_id func_id);
+diff --cc include/linux/filter.h
+index d322ed880333,911d454af107..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -21,23 -441,54 +21,69 @@@ struct compat_sock_fprog 
+  };
+  #endif
+  
+ -struct sock_fprog_kern {
+ -	u16			len;
+ -	struct sock_filter	*filter;
+ +struct sk_buff;
+ +struct sock;
+ +struct bpf_prog_aux;
+ +
+ +struct bpf_prog
+ +{
+ +	struct bpf_prog_aux	*aux;	/* Auxiliary fields */
+  };
+  
+++<<<<<<< HEAD
+ +struct sk_filter
+ +{
+ +	atomic_t		refcnt;
+ +	unsigned int         	len;	/* Number of filter blocks */
+ +	unsigned int		(*bpf_func)(const struct sk_buff *skb,
+ +					    const struct sock_filter *filter);
+ +	struct rcu_head		rcu;
+ +	struct sock_filter     	insns[0];
+++=======
++ struct bpf_binary_header {
++ 	unsigned int pages;
++ 	u8 image[];
++ };
++ 
++ struct bpf_prog {
++ 	u16			pages;		/* Number of allocated pages */
++ 	kmemcheck_bitfield_begin(meta);
++ 	u16			jited:1,	/* Is our filter JIT'ed? */
++ 				locked:1,	/* Program image locked? */
++ 				gpl_compatible:1, /* Is filter GPL compatible? */
++ 				cb_access:1,	/* Is control block accessed? */
++ 				dst_needed:1;	/* Do we need dst entry? */
++ 	kmemcheck_bitfield_end(meta);
++ 	enum bpf_prog_type	type;		/* Type of BPF program */
++ 	u32			len;		/* Number of filter blocks */
++ 	u32			jited_len;	/* Size of jited insns in bytes */
++ 	u8			tag[BPF_TAG_SIZE];
++ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
++ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
++ 	unsigned int		(*bpf_func)(const void *ctx,
++ 					    const struct bpf_insn *insn);
++ 	/* Instructions for interpreter */
++ 	union {
++ 		struct sock_filter	insns[0];
++ 		struct bpf_insn		insnsi[0];
++ 	};
++ };
++ 
++ struct sk_filter {
++ 	refcount_t	refcnt;
++ 	struct rcu_head	rcu;
++ 	struct bpf_prog	*prog;
++ };
++ 
++ #define BPF_PROG_RUN(filter, ctx)  (*filter->bpf_func)(ctx, filter->insnsi)
++ 
++ #define BPF_SKB_CB_LEN QDISC_CB_PRIV_LEN
++ 
++ struct bpf_skb_data_end {
++ 	struct qdisc_skb_cb qdisc_cb;
++ 	void *data_meta;
++ 	void *data_end;
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  };
+  
+  struct xdp_buff {
+@@@ -46,17 -498,176 +93,25 @@@
+  	void *data_hard_start;
+  };
+  
+ -/* Compute the linear packet data range [data, data_end) which
+ - * will be accessed by various program types (cls_bpf, act_bpf,
+ - * lwt, ...). Subsystems allowing direct data access must (!)
+ - * ensure that cb[] area can be written to when BPF program is
+ - * invoked (otherwise cb[] save/restore is necessary).
+ +/* compute the linear packet data range [data, data_end) which
+ + * will be accessed by cls_bpf and act_bpf programs
+   */
+ -static inline void bpf_compute_data_pointers(struct sk_buff *skb)
+ +static inline unsigned int sk_filter_len(const struct sk_filter *fp)
+  {
+++<<<<<<< HEAD
+ +	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
+++=======
++ 	struct bpf_skb_data_end *cb = (struct bpf_skb_data_end *)skb->cb;
++ 
++ 	BUILD_BUG_ON(sizeof(*cb) > FIELD_SIZEOF(struct sk_buff, cb));
++ 	cb->data_meta = skb->data - skb_metadata_len(skb);
++ 	cb->data_end  = skb->data + skb_headlen(skb);
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  }
+  
+ -static inline u8 *bpf_skb_cb(struct sk_buff *skb)
+ -{
+ -	/* eBPF programs may read/write skb->cb[] area to transfer meta
+ -	 * data between tail calls. Since this also needs to work with
+ -	 * tc, that scratch memory is mapped to qdisc_skb_cb's data area.
+ -	 *
+ -	 * In some socket filter cases, the cb unfortunately needs to be
+ -	 * saved/restored so that protocol specific skb->cb[] data won't
+ -	 * be lost. In any case, due to unpriviledged eBPF programs
+ -	 * attached to sockets, we need to clear the bpf_skb_cb() area
+ -	 * to not leak previous contents to user space.
+ -	 */
+ -	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) != BPF_SKB_CB_LEN);
+ -	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) !=
+ -		     FIELD_SIZEOF(struct qdisc_skb_cb, data));
+ -
+ -	return qdisc_skb_cb(skb)->data;
+ -}
+ -
+ -static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
+ -				       struct sk_buff *skb)
+ -{
+ -	u8 *cb_data = bpf_skb_cb(skb);
+ -	u8 cb_saved[BPF_SKB_CB_LEN];
+ -	u32 res;
+ -
+ -	if (unlikely(prog->cb_access)) {
+ -		memcpy(cb_saved, cb_data, sizeof(cb_saved));
+ -		memset(cb_data, 0, sizeof(cb_saved));
+ -	}
+ -
+ -	res = BPF_PROG_RUN(prog, skb);
+ -
+ -	if (unlikely(prog->cb_access))
+ -		memcpy(cb_data, cb_saved, sizeof(cb_saved));
+ -
+ -	return res;
+ -}
+ -
+ -static inline u32 bpf_prog_run_clear_cb(const struct bpf_prog *prog,
+ -					struct sk_buff *skb)
+ -{
+ -	u8 *cb_data = bpf_skb_cb(skb);
+ -
+ -	if (unlikely(prog->cb_access))
+ -		memset(cb_data, 0, BPF_SKB_CB_LEN);
+ -
+ -	return BPF_PROG_RUN(prog, skb);
+ -}
+ -
+ -static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+ -					    struct xdp_buff *xdp)
+ -{
+ -	/* Caller needs to hold rcu_read_lock() (!), otherwise program
+ -	 * can be released while still running, or map elements could be
+ -	 * freed early while still having concurrent users. XDP fastpath
+ -	 * already takes rcu_read_lock() when fetching the program, so
+ -	 * it's not necessary here anymore.
+ -	 */
+ -	return BPF_PROG_RUN(prog, xdp);
+ -}
+ -
+ -static inline u32 bpf_prog_insn_size(const struct bpf_prog *prog)
+ -{
+ -	return prog->len * sizeof(struct bpf_insn);
+ -}
+ -
+ -static inline u32 bpf_prog_tag_scratch_size(const struct bpf_prog *prog)
+ -{
+ -	return round_up(bpf_prog_insn_size(prog) +
+ -			sizeof(__be64) + 1, SHA_MESSAGE_BYTES);
+ -}
+ -
+ -static inline unsigned int bpf_prog_size(unsigned int proglen)
+ -{
+ -	return max(sizeof(struct bpf_prog),
+ -		   offsetof(struct bpf_prog, insns[proglen]));
+ -}
+ -
+ -static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
+ -{
+ -	/* When classic BPF programs have been loaded and the arch
+ -	 * does not have a classic BPF JIT (anymore), they have been
+ -	 * converted via bpf_migrate_filter() to eBPF and thus always
+ -	 * have an unspec program type.
+ -	 */
+ -	return prog->type == BPF_PROG_TYPE_UNSPEC;
+ -}
+ -
+ -static inline bool
+ -bpf_ctx_narrow_access_ok(u32 off, u32 size, const u32 size_default)
+ -{
+ -	bool off_ok;
+ -#ifdef __LITTLE_ENDIAN
+ -	off_ok = (off & (size_default - 1)) == 0;
+ -#else
+ -	off_ok = (off & (size_default - 1)) + size == size_default;
+ -#endif
+ -	return off_ok && size <= size_default && (size & (size - 1)) == 0;
+ -}
+ -
+ -#define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
+ -
+ -#ifdef CONFIG_ARCH_HAS_SET_MEMORY
+ -static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+ -{
+ -	fp->locked = 1;
+ -	WARN_ON_ONCE(set_memory_ro((unsigned long)fp, fp->pages));
+ -}
+ -
+ -static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+ -{
+ -	if (fp->locked) {
+ -		WARN_ON_ONCE(set_memory_rw((unsigned long)fp, fp->pages));
+ -		/* In case set_memory_rw() fails, we want to be the first
+ -		 * to crash here instead of some random place later on.
+ -		 */
+ -		fp->locked = 0;
+ -	}
+ -}
+ -
+ -static inline void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
+ -{
+ -	WARN_ON_ONCE(set_memory_ro((unsigned long)hdr, hdr->pages));
+ -}
+ -
+ -static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
+ -{
+ -	WARN_ON_ONCE(set_memory_rw((unsigned long)hdr, hdr->pages));
+ -}
+ -#else
+ -static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+ -{
+ -}
+ -
+ -static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+ -{
+ -}
+ -
+ -static inline void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
+ +static inline void bpf_compute_data_end(struct sk_buff *skb)
+  {
+ -}
+ -
+ -static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
+ -{
+ -}
+ -#endif /* CONFIG_ARCH_HAS_SET_MEMORY */
+ -
+ -static inline struct bpf_binary_header *
+ -bpf_jit_binary_hdr(const struct bpf_prog *fp)
+ -{
+ -	unsigned long real_start = (unsigned long)fp->bpf_func;
+ -	unsigned long addr = real_start & PAGE_MASK;
+ -
+ -	return (void *)addr;
+ +	return;
+  }
+  
+  int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
+@@@ -65,35 -676,97 +120,97 @@@ static inline int sk_filter(struct soc
+  	return sk_filter_trim_cap(sk, skb, 1);
+  }
+  
+ -struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err);
+ -void bpf_prog_free(struct bpf_prog *fp);
+ -
+ -struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
+ -struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
+ -				  gfp_t gfp_extra_flags);
+ -void __bpf_prog_free(struct bpf_prog *fp);
+ +extern unsigned int sk_run_filter(const struct sk_buff *skb,
+ +				  const struct sock_filter *filter);
+ +extern int sk_unattached_filter_create(struct sk_filter **pfp,
+ +				       struct sock_fprog *fprog);
+ +extern void sk_unattached_filter_destroy(struct sk_filter *fp);
+ +extern int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ +extern int sk_detach_filter(struct sock *sk);
+ +extern int sk_chk_filter(struct sock_filter *filter, unsigned int flen);
+ +extern int sk_get_filter(struct sock *sk, struct sock_filter __user *filter, unsigned len);
+ +extern void sk_decode_filter(struct sock_filter *filt, struct sock_filter *to);
+  
+ -static inline void bpf_prog_unlock_free(struct bpf_prog *fp)
+ +static inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+ +				   struct xdp_buff *xdp)
+  {
+ -	bpf_prog_unlock_ro(fp);
+ -	__bpf_prog_free(fp);
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void bpf_warn_invalid_xdp_action(u32 act)
+ +{
+ +	return;
+ +}
+++=======
++ typedef int (*bpf_aux_classic_check_t)(struct sock_filter *filter,
++ 				       unsigned int flen);
++ 
++ int bpf_prog_create(struct bpf_prog **pfp, struct sock_fprog_kern *fprog);
++ int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
++ 			      bpf_aux_classic_check_t trans, bool save_orig);
++ void bpf_prog_destroy(struct bpf_prog *fp);
++ 
++ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
++ int sk_attach_bpf(u32 ufd, struct sock *sk);
++ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);
++ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk);
++ int sk_detach_filter(struct sock *sk);
++ int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
++ 		  unsigned int len);
++ 
++ bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
++ void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
++ 
++ u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ 
++ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog);
++ void bpf_jit_compile(struct bpf_prog *prog);
++ bool bpf_helper_changes_pkt_data(void *func);
++ 
++ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
++ 				       const struct bpf_insn *patch, u32 len);
++ 
++ /* The pair of xdp_do_redirect and xdp_do_flush_map MUST be called in the
++  * same cpu context. Further for best results no more than a single map
++  * for the do_redirect/do_flush pair should be used. This limitation is
++  * because we only track one map and force a flush when the map changes.
++  * This does not appear to be a real limitation for existing software.
++  */
++ int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
++ 			    struct bpf_prog *prog);
++ int xdp_do_redirect(struct net_device *dev,
++ 		    struct xdp_buff *xdp,
++ 		    struct bpf_prog *prog);
++ void xdp_do_flush_map(void);
++ 
++ /* Drivers not supporting XDP metadata can use this helper, which
++  * rejects any room expansion for metadata as a result.
++  */
++ static __always_inline void
++ xdp_set_data_meta_invalid(struct xdp_buff *xdp)
++ {
++ 	xdp->data_meta = xdp->data + 1;
++ }
++ 
++ static __always_inline bool
++ xdp_data_meta_unsupported(const struct xdp_buff *xdp)
++ {
++ 	return unlikely(xdp->data_meta > xdp->data);
++ }
++ 
++ void bpf_warn_invalid_xdp_action(u32 act);
++ 
++ struct sock *do_sk_redirect_map(void);
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  
+  #ifdef CONFIG_BPF_JIT
+ -extern int bpf_jit_enable;
+ -extern int bpf_jit_harden;
+ -extern int bpf_jit_kallsyms;
+ -
+ -typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+ -
+ -struct bpf_binary_header *
+ -bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
+ -		     unsigned int alignment,
+ -		     bpf_jit_fill_hole_t bpf_fill_ill_insns);
+ -void bpf_jit_binary_free(struct bpf_binary_header *hdr);
+ -
+ -void bpf_jit_free(struct bpf_prog *fp);
+ +#include <stdarg.h>
+ +#include <linux/linkage.h>
+ +#include <linux/printk.h>
+  
+ -struct bpf_prog *bpf_jit_blind_constants(struct bpf_prog *fp);
+ -void bpf_jit_prog_release_other(struct bpf_prog *fp, struct bpf_prog *fp_other);
+ +extern void bpf_jit_compile(struct sk_filter *fp);
+ +extern void bpf_jit_free(struct sk_filter *fp);
+  
+  static inline void bpf_jit_dump(unsigned int flen, unsigned int proglen,
+  				u32 pass, void *image)
+diff --cc include/linux/skbuff.h
+index 6ad965e15f51,19e64bfb1a66..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -447,7 -489,9 +447,13 @@@ struct ubuf_info 
+   * the end of the header data, ie. at skb->end.
+   */
+  struct skb_shared_info {
+++<<<<<<< HEAD
+ +	unsigned char	nr_frags;
+++=======
++ 	__u8		__unused;
++ 	__u8		meta_len;
++ 	__u8		nr_frags;
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  	__u8		tx_flags;
+  	unsigned short	gso_size;
+  	/* Warning: this field is not always filled in (UFO)! */
+@@@ -3278,13 -3398,74 +3284,76 @@@ static inline ktime_t net_timedelta(kti
+  
+  static inline ktime_t net_invalid_timestamp(void)
+  {
+ -	return 0;
+ +	return ktime_set(0, 0);
+  }
+  
++ static inline u8 skb_metadata_len(const struct sk_buff *skb)
++ {
++ 	return skb_shinfo(skb)->meta_len;
++ }
++ 
++ static inline void *skb_metadata_end(const struct sk_buff *skb)
++ {
++ 	return skb_mac_header(skb);
++ }
++ 
++ static inline bool __skb_metadata_differs(const struct sk_buff *skb_a,
++ 					  const struct sk_buff *skb_b,
++ 					  u8 meta_len)
++ {
++ 	const void *a = skb_metadata_end(skb_a);
++ 	const void *b = skb_metadata_end(skb_b);
++ 	/* Using more efficient varaiant than plain call to memcmp(). */
++ #if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && BITS_PER_LONG == 64
++ 	u64 diffs = 0;
++ 
++ 	switch (meta_len) {
++ #define __it(x, op) (x -= sizeof(u##op))
++ #define __it_diff(a, b, op) (*(u##op *)__it(a, op)) ^ (*(u##op *)__it(b, op))
++ 	case 32: diffs |= __it_diff(a, b, 64);
++ 	case 24: diffs |= __it_diff(a, b, 64);
++ 	case 16: diffs |= __it_diff(a, b, 64);
++ 	case  8: diffs |= __it_diff(a, b, 64);
++ 		break;
++ 	case 28: diffs |= __it_diff(a, b, 64);
++ 	case 20: diffs |= __it_diff(a, b, 64);
++ 	case 12: diffs |= __it_diff(a, b, 64);
++ 	case  4: diffs |= __it_diff(a, b, 32);
++ 		break;
++ 	}
++ 	return diffs;
++ #else
++ 	return memcmp(a - meta_len, b - meta_len, meta_len);
++ #endif
++ }
++ 
++ static inline bool skb_metadata_differs(const struct sk_buff *skb_a,
++ 					const struct sk_buff *skb_b)
++ {
++ 	u8 len_a = skb_metadata_len(skb_a);
++ 	u8 len_b = skb_metadata_len(skb_b);
++ 
++ 	if (!(len_a | len_b))
++ 		return false;
++ 
++ 	return len_a != len_b ?
++ 	       true : __skb_metadata_differs(skb_a, skb_b, len_a);
++ }
++ 
++ static inline void skb_metadata_set(struct sk_buff *skb, u8 meta_len)
++ {
++ 	skb_shinfo(skb)->meta_len = meta_len;
++ }
++ 
++ static inline void skb_metadata_clear(struct sk_buff *skb)
++ {
++ 	skb_metadata_set(skb, 0);
++ }
++ 
+  struct sk_buff *skb_clone_sk(struct sk_buff *skb);
+  
+ +void skb_timestamping_init(void);
+ +
+  #ifdef CONFIG_NETWORK_PHY_TIMESTAMPING
+  
+  void skb_clone_tx_timestamp(struct sk_buff *skb);
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,e43491ac4823..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -132,13 -197,587 +132,539 @@@ union bpf_attr 
+  			__aligned_u64 value;
+  			__aligned_u64 next_key;
+  		};
+ -		__u64		flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_LOAD command */
+ -		__u32		prog_type;	/* one of enum bpf_prog_type */
+ -		__u32		insn_cnt;
+ -		__aligned_u64	insns;
+ -		__aligned_u64	license;
+ -		__u32		log_level;	/* verbosity level of verifier */
+ -		__u32		log_size;	/* size of user buffer */
+ -		__aligned_u64	log_buf;	/* user supplied buffer */
+ -		__u32		kern_version;	/* checked when prog_type=kprobe */
+ -		__u32		prog_flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_OBJ_* commands */
+ -		__aligned_u64	pathname;
+ -		__u32		bpf_fd;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_ATTACH/DETACH commands */
+ -		__u32		target_fd;	/* container object to attach to */
+ -		__u32		attach_bpf_fd;	/* eBPF program to attach */
+ -		__u32		attach_type;
+ -		__u32		attach_flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_TEST_RUN command */
+ -		__u32		prog_fd;
+ -		__u32		retval;
+ -		__u32		data_size_in;
+ -		__u32		data_size_out;
+ -		__aligned_u64	data_in;
+ -		__aligned_u64	data_out;
+ -		__u32		repeat;
+ -		__u32		duration;
+ -	} test;
+ -
+ -	struct { /* anonymous struct used by BPF_*_GET_*_ID */
+ -		union {
+ -			__u32		start_id;
+ -			__u32		prog_id;
+ -			__u32		map_id;
+ -		};
+ -		__u32		next_id;
+  	};
+ -
+ -	struct { /* anonymous struct used by BPF_OBJ_GET_INFO_BY_FD */
+ -		__u32		bpf_fd;
+ -		__u32		info_len;
+ -		__aligned_u64	info;
+ -	} info;
+  } __attribute__((aligned(8)));
+  
+++<<<<<<< HEAD
+++=======
++ /* BPF helper function descriptions:
++  *
++  * void *bpf_map_lookup_elem(&map, &key)
++  *     Return: Map value or NULL
++  *
++  * int bpf_map_update_elem(&map, &key, &value, flags)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_map_delete_elem(&map, &key)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_probe_read(void *dst, int size, void *src)
++  *     Return: 0 on success or negative error
++  *
++  * u64 bpf_ktime_get_ns(void)
++  *     Return: current ktime
++  *
++  * int bpf_trace_printk(const char *fmt, int fmt_size, ...)
++  *     Return: length of buffer written or negative error
++  *
++  * u32 bpf_prandom_u32(void)
++  *     Return: random value
++  *
++  * u32 bpf_raw_smp_processor_id(void)
++  *     Return: SMP processor ID
++  *
++  * int bpf_skb_store_bytes(skb, offset, from, len, flags)
++  *     store bytes into packet
++  *     @skb: pointer to skb
++  *     @offset: offset within packet from skb->mac_header
++  *     @from: pointer where to copy bytes from
++  *     @len: number of bytes to store into packet
++  *     @flags: bit 0 - if true, recompute skb->csum
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_l3_csum_replace(skb, offset, from, to, flags)
++  *     recompute IP checksum
++  *     @skb: pointer to skb
++  *     @offset: offset within packet where IP checksum is located
++  *     @from: old value of header field
++  *     @to: new value of header field
++  *     @flags: bits 0-3 - size of header field
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_l4_csum_replace(skb, offset, from, to, flags)
++  *     recompute TCP/UDP checksum
++  *     @skb: pointer to skb
++  *     @offset: offset within packet where TCP/UDP checksum is located
++  *     @from: old value of header field
++  *     @to: new value of header field
++  *     @flags: bits 0-3 - size of header field
++  *             bit 4 - is pseudo header
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_tail_call(ctx, prog_array_map, index)
++  *     jump into another BPF program
++  *     @ctx: context pointer passed to next program
++  *     @prog_array_map: pointer to map which type is BPF_MAP_TYPE_PROG_ARRAY
++  *     @index: index inside array that selects specific program to run
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_clone_redirect(skb, ifindex, flags)
++  *     redirect to another netdev
++  *     @skb: pointer to skb
++  *     @ifindex: ifindex of the net device
++  *     @flags: bit 0 - if set, redirect to ingress instead of egress
++  *             other bits - reserved
++  *     Return: 0 on success or negative error
++  *
++  * u64 bpf_get_current_pid_tgid(void)
++  *     Return: current->tgid << 32 | current->pid
++  *
++  * u64 bpf_get_current_uid_gid(void)
++  *     Return: current_gid << 32 | current_uid
++  *
++  * int bpf_get_current_comm(char *buf, int size_of_buf)
++  *     stores current->comm into buf
++  *     Return: 0 on success or negative error
++  *
++  * u32 bpf_get_cgroup_classid(skb)
++  *     retrieve a proc's classid
++  *     @skb: pointer to skb
++  *     Return: classid if != 0
++  *
++  * int bpf_skb_vlan_push(skb, vlan_proto, vlan_tci)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_vlan_pop(skb)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_get_tunnel_key(skb, key, size, flags)
++  * int bpf_skb_set_tunnel_key(skb, key, size, flags)
++  *     retrieve or populate tunnel metadata
++  *     @skb: pointer to skb
++  *     @key: pointer to 'struct bpf_tunnel_key'
++  *     @size: size of 'struct bpf_tunnel_key'
++  *     @flags: room for future extensions
++  *     Return: 0 on success or negative error
++  *
++  * u64 bpf_perf_event_read(map, flags)
++  *     read perf event counter value
++  *     @map: pointer to perf_event_array map
++  *     @flags: index of event in the map or bitmask flags
++  *     Return: value of perf event counter read or error code
++  *
++  * int bpf_redirect(ifindex, flags)
++  *     redirect to another netdev
++  *     @ifindex: ifindex of the net device
++  *     @flags:
++  *	  cls_bpf:
++  *          bit 0 - if set, redirect to ingress instead of egress
++  *          other bits - reserved
++  *	  xdp_bpf:
++  *	    all bits - reserved
++  *     Return: cls_bpf: TC_ACT_REDIRECT on success or TC_ACT_SHOT on error
++  *	       xdp_bfp: XDP_REDIRECT on success or XDP_ABORT on error
++  * int bpf_redirect_map(map, key, flags)
++  *     redirect to endpoint in map
++  *     @map: pointer to dev map
++  *     @key: index in map to lookup
++  *     @flags: --
++  *     Return: XDP_REDIRECT on success or XDP_ABORT on error
++  *
++  * u32 bpf_get_route_realm(skb)
++  *     retrieve a dst's tclassid
++  *     @skb: pointer to skb
++  *     Return: realm if != 0
++  *
++  * int bpf_perf_event_output(ctx, map, flags, data, size)
++  *     output perf raw sample
++  *     @ctx: struct pt_regs*
++  *     @map: pointer to perf_event_array map
++  *     @flags: index of event in the map or bitmask flags
++  *     @data: data on stack to be output as raw data
++  *     @size: size of data
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_get_stackid(ctx, map, flags)
++  *     walk user or kernel stack and return id
++  *     @ctx: struct pt_regs*
++  *     @map: pointer to stack_trace map
++  *     @flags: bits 0-7 - numer of stack frames to skip
++  *             bit 8 - collect user stack instead of kernel
++  *             bit 9 - compare stacks by hash only
++  *             bit 10 - if two different stacks hash into the same stackid
++  *                      discard old
++  *             other bits - reserved
++  *     Return: >= 0 stackid on success or negative error
++  *
++  * s64 bpf_csum_diff(from, from_size, to, to_size, seed)
++  *     calculate csum diff
++  *     @from: raw from buffer
++  *     @from_size: length of from buffer
++  *     @to: raw to buffer
++  *     @to_size: length of to buffer
++  *     @seed: optional seed
++  *     Return: csum result or negative error code
++  *
++  * int bpf_skb_get_tunnel_opt(skb, opt, size)
++  *     retrieve tunnel options metadata
++  *     @skb: pointer to skb
++  *     @opt: pointer to raw tunnel option data
++  *     @size: size of @opt
++  *     Return: option size
++  *
++  * int bpf_skb_set_tunnel_opt(skb, opt, size)
++  *     populate tunnel options metadata
++  *     @skb: pointer to skb
++  *     @opt: pointer to raw tunnel option data
++  *     @size: size of @opt
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_change_proto(skb, proto, flags)
++  *     Change protocol of the skb. Currently supported is v4 -> v6,
++  *     v6 -> v4 transitions. The helper will also resize the skb. eBPF
++  *     program is expected to fill the new headers via skb_store_bytes
++  *     and lX_csum_replace.
++  *     @skb: pointer to skb
++  *     @proto: new skb->protocol type
++  *     @flags: reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_change_type(skb, type)
++  *     Change packet type of skb.
++  *     @skb: pointer to skb
++  *     @type: new skb->pkt_type type
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_under_cgroup(skb, map, index)
++  *     Check cgroup2 membership of skb
++  *     @skb: pointer to skb
++  *     @map: pointer to bpf_map in BPF_MAP_TYPE_CGROUP_ARRAY type
++  *     @index: index of the cgroup in the bpf_map
++  *     Return:
++  *       == 0 skb failed the cgroup2 descendant test
++  *       == 1 skb succeeded the cgroup2 descendant test
++  *        < 0 error
++  *
++  * u32 bpf_get_hash_recalc(skb)
++  *     Retrieve and possibly recalculate skb->hash.
++  *     @skb: pointer to skb
++  *     Return: hash
++  *
++  * u64 bpf_get_current_task(void)
++  *     Returns current task_struct
++  *     Return: current
++  *
++  * int bpf_probe_write_user(void *dst, void *src, int len)
++  *     safely attempt to write to a location
++  *     @dst: destination address in userspace
++  *     @src: source address on stack
++  *     @len: number of bytes to copy
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_current_task_under_cgroup(map, index)
++  *     Check cgroup2 membership of current task
++  *     @map: pointer to bpf_map in BPF_MAP_TYPE_CGROUP_ARRAY type
++  *     @index: index of the cgroup in the bpf_map
++  *     Return:
++  *       == 0 current failed the cgroup2 descendant test
++  *       == 1 current succeeded the cgroup2 descendant test
++  *        < 0 error
++  *
++  * int bpf_skb_change_tail(skb, len, flags)
++  *     The helper will resize the skb to the given new size, to be used f.e.
++  *     with control messages.
++  *     @skb: pointer to skb
++  *     @len: new skb length
++  *     @flags: reserved
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_skb_pull_data(skb, len)
++  *     The helper will pull in non-linear data in case the skb is non-linear
++  *     and not all of len are part of the linear section. Only needed for
++  *     read/write with direct packet access.
++  *     @skb: pointer to skb
++  *     @len: len to make read/writeable
++  *     Return: 0 on success or negative error
++  *
++  * s64 bpf_csum_update(skb, csum)
++  *     Adds csum into skb->csum in case of CHECKSUM_COMPLETE.
++  *     @skb: pointer to skb
++  *     @csum: csum to add
++  *     Return: csum on success or negative error
++  *
++  * void bpf_set_hash_invalid(skb)
++  *     Invalidate current skb->hash.
++  *     @skb: pointer to skb
++  *
++  * int bpf_get_numa_node_id()
++  *     Return: Id of current NUMA node.
++  *
++  * int bpf_skb_change_head()
++  *     Grows headroom of skb and adjusts MAC header offset accordingly.
++  *     Will extends/reallocae as required automatically.
++  *     May change skb data pointer and will thus invalidate any check
++  *     performed for direct packet access.
++  *     @skb: pointer to skb
++  *     @len: length of header to be pushed in front
++  *     @flags: Flags (unused for now)
++  *     Return: 0 on success or negative error
++  *
++  * int bpf_xdp_adjust_head(xdp_md, delta)
++  *     Adjust the xdp_md.data by delta
++  *     @xdp_md: pointer to xdp_md
++  *     @delta: An positive/negative integer to be added to xdp_md.data
++  *     Return: 0 on success or negative on error
++  *
++  * int bpf_probe_read_str(void *dst, int size, const void *unsafe_ptr)
++  *     Copy a NUL terminated string from unsafe address. In case the string
++  *     length is smaller than size, the target is not padded with further NUL
++  *     bytes. In case the string length is larger than size, just count-1
++  *     bytes are copied and the last byte is set to NUL.
++  *     @dst: destination address
++  *     @size: maximum number of bytes to copy, including the trailing NUL
++  *     @unsafe_ptr: unsafe address
++  *     Return:
++  *       > 0 length of the string including the trailing NUL on success
++  *       < 0 error
++  *
++  * u64 bpf_get_socket_cookie(skb)
++  *     Get the cookie for the socket stored inside sk_buff.
++  *     @skb: pointer to skb
++  *     Return: 8 Bytes non-decreasing number on success or 0 if the socket
++  *     field is missing inside sk_buff
++  *
++  * u32 bpf_get_socket_uid(skb)
++  *     Get the owner uid of the socket stored inside sk_buff.
++  *     @skb: pointer to skb
++  *     Return: uid of the socket owner on success or overflowuid if failed.
++  *
++  * u32 bpf_set_hash(skb, hash)
++  *     Set full skb->hash.
++  *     @skb: pointer to skb
++  *     @hash: hash to set
++  *
++  * int bpf_setsockopt(bpf_socket, level, optname, optval, optlen)
++  *     Calls setsockopt. Not all opts are available, only those with
++  *     integer optvals plus TCP_CONGESTION.
++  *     Supported levels: SOL_SOCKET and IPROTO_TCP
++  *     @bpf_socket: pointer to bpf_socket
++  *     @level: SOL_SOCKET or IPROTO_TCP
++  *     @optname: option name
++  *     @optval: pointer to option value
++  *     @optlen: length of optval in byes
++  *     Return: 0 or negative error
++  *
++  * int bpf_skb_adjust_room(skb, len_diff, mode, flags)
++  *     Grow or shrink room in sk_buff.
++  *     @skb: pointer to skb
++  *     @len_diff: (signed) amount of room to grow/shrink
++  *     @mode: operation mode (enum bpf_adj_room_mode)
++  *     @flags: reserved for future use
++  *     Return: 0 on success or negative error code
++  *
++  * int bpf_sk_redirect_map(map, key, flags)
++  *     Redirect skb to a sock in map using key as a lookup key for the
++  *     sock in map.
++  *     @map: pointer to sockmap
++  *     @key: key to lookup sock in map
++  *     @flags: reserved for future use
++  *     Return: SK_REDIRECT
++  *
++  * int bpf_sock_map_update(skops, map, key, flags)
++  *	@skops: pointer to bpf_sock_ops
++  *	@map: pointer to sockmap to update
++  *	@key: key to insert/update sock in map
++  *	@flags: same flags as map update elem
++  *
++  * int bpf_xdp_adjust_meta(xdp_md, delta)
++  *     Adjust the xdp_md.data_meta by delta
++  *     @xdp_md: pointer to xdp_md
++  *     @delta: An positive/negative integer to be added to xdp_md.data_meta
++  *     Return: 0 on success or negative on error
++  */
++ #define __BPF_FUNC_MAPPER(FN)		\
++ 	FN(unspec),			\
++ 	FN(map_lookup_elem),		\
++ 	FN(map_update_elem),		\
++ 	FN(map_delete_elem),		\
++ 	FN(probe_read),			\
++ 	FN(ktime_get_ns),		\
++ 	FN(trace_printk),		\
++ 	FN(get_prandom_u32),		\
++ 	FN(get_smp_processor_id),	\
++ 	FN(skb_store_bytes),		\
++ 	FN(l3_csum_replace),		\
++ 	FN(l4_csum_replace),		\
++ 	FN(tail_call),			\
++ 	FN(clone_redirect),		\
++ 	FN(get_current_pid_tgid),	\
++ 	FN(get_current_uid_gid),	\
++ 	FN(get_current_comm),		\
++ 	FN(get_cgroup_classid),		\
++ 	FN(skb_vlan_push),		\
++ 	FN(skb_vlan_pop),		\
++ 	FN(skb_get_tunnel_key),		\
++ 	FN(skb_set_tunnel_key),		\
++ 	FN(perf_event_read),		\
++ 	FN(redirect),			\
++ 	FN(get_route_realm),		\
++ 	FN(perf_event_output),		\
++ 	FN(skb_load_bytes),		\
++ 	FN(get_stackid),		\
++ 	FN(csum_diff),			\
++ 	FN(skb_get_tunnel_opt),		\
++ 	FN(skb_set_tunnel_opt),		\
++ 	FN(skb_change_proto),		\
++ 	FN(skb_change_type),		\
++ 	FN(skb_under_cgroup),		\
++ 	FN(get_hash_recalc),		\
++ 	FN(get_current_task),		\
++ 	FN(probe_write_user),		\
++ 	FN(current_task_under_cgroup),	\
++ 	FN(skb_change_tail),		\
++ 	FN(skb_pull_data),		\
++ 	FN(csum_update),		\
++ 	FN(set_hash_invalid),		\
++ 	FN(get_numa_node_id),		\
++ 	FN(skb_change_head),		\
++ 	FN(xdp_adjust_head),		\
++ 	FN(probe_read_str),		\
++ 	FN(get_socket_cookie),		\
++ 	FN(get_socket_uid),		\
++ 	FN(set_hash),			\
++ 	FN(setsockopt),			\
++ 	FN(skb_adjust_room),		\
++ 	FN(redirect_map),		\
++ 	FN(sk_redirect_map),		\
++ 	FN(sock_map_update),		\
++ 	FN(xdp_adjust_meta),
++ 
++ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
++  * function eBPF program intends to call
++  */
++ #define __BPF_ENUM_FN(x) BPF_FUNC_ ## x
++ enum bpf_func_id {
++ 	__BPF_FUNC_MAPPER(__BPF_ENUM_FN)
++ 	__BPF_FUNC_MAX_ID,
++ };
++ #undef __BPF_ENUM_FN
++ 
++ /* All flags used by eBPF helper functions, placed here. */
++ 
++ /* BPF_FUNC_skb_store_bytes flags. */
++ #define BPF_F_RECOMPUTE_CSUM		(1ULL << 0)
++ #define BPF_F_INVALIDATE_HASH		(1ULL << 1)
++ 
++ /* BPF_FUNC_l3_csum_replace and BPF_FUNC_l4_csum_replace flags.
++  * First 4 bits are for passing the header field size.
++  */
++ #define BPF_F_HDR_FIELD_MASK		0xfULL
++ 
++ /* BPF_FUNC_l4_csum_replace flags. */
++ #define BPF_F_PSEUDO_HDR		(1ULL << 4)
++ #define BPF_F_MARK_MANGLED_0		(1ULL << 5)
++ #define BPF_F_MARK_ENFORCE		(1ULL << 6)
++ 
++ /* BPF_FUNC_clone_redirect and BPF_FUNC_redirect flags. */
++ #define BPF_F_INGRESS			(1ULL << 0)
++ 
++ /* BPF_FUNC_skb_set_tunnel_key and BPF_FUNC_skb_get_tunnel_key flags. */
++ #define BPF_F_TUNINFO_IPV6		(1ULL << 0)
++ 
++ /* BPF_FUNC_get_stackid flags. */
++ #define BPF_F_SKIP_FIELD_MASK		0xffULL
++ #define BPF_F_USER_STACK		(1ULL << 8)
++ #define BPF_F_FAST_STACK_CMP		(1ULL << 9)
++ #define BPF_F_REUSE_STACKID		(1ULL << 10)
++ 
++ /* BPF_FUNC_skb_set_tunnel_key flags. */
++ #define BPF_F_ZERO_CSUM_TX		(1ULL << 1)
++ #define BPF_F_DONT_FRAGMENT		(1ULL << 2)
++ 
++ /* BPF_FUNC_perf_event_output and BPF_FUNC_perf_event_read flags. */
++ #define BPF_F_INDEX_MASK		0xffffffffULL
++ #define BPF_F_CURRENT_CPU		BPF_F_INDEX_MASK
++ /* BPF_FUNC_perf_event_output for sk_buff input context. */
++ #define BPF_F_CTXLEN_MASK		(0xfffffULL << 32)
++ 
++ /* Mode for BPF_FUNC_skb_adjust_room helper. */
++ enum bpf_adj_room_mode {
++ 	BPF_ADJ_ROOM_NET,
++ };
++ 
++ /* user accessible mirror of in-kernel sk_buff.
++  * new fields can only be added to the end of this structure
++  */
++ struct __sk_buff {
++ 	__u32 len;
++ 	__u32 pkt_type;
++ 	__u32 mark;
++ 	__u32 queue_mapping;
++ 	__u32 protocol;
++ 	__u32 vlan_present;
++ 	__u32 vlan_tci;
++ 	__u32 vlan_proto;
++ 	__u32 priority;
++ 	__u32 ingress_ifindex;
++ 	__u32 ifindex;
++ 	__u32 tc_index;
++ 	__u32 cb[5];
++ 	__u32 hash;
++ 	__u32 tc_classid;
++ 	__u32 data;
++ 	__u32 data_end;
++ 	__u32 napi_id;
++ 
++ 	/* Accessed by BPF_PROG_TYPE_sk_skb types from here to ... */
++ 	__u32 family;
++ 	__u32 remote_ip4;	/* Stored in network byte order */
++ 	__u32 local_ip4;	/* Stored in network byte order */
++ 	__u32 remote_ip6[4];	/* Stored in network byte order */
++ 	__u32 local_ip6[4];	/* Stored in network byte order */
++ 	__u32 remote_port;	/* Stored in network byte order */
++ 	__u32 local_port;	/* stored in host byte order */
++ 	/* ... here. */
++ 
++ 	__u32 data_meta;
++ };
++ 
++ struct bpf_tunnel_key {
++ 	__u32 tunnel_id;
++ 	union {
++ 		__u32 remote_ipv4;
++ 		__u32 remote_ipv6[4];
++ 	};
++ 	__u8 tunnel_tos;
++ 	__u8 tunnel_ttl;
++ 	__u16 tunnel_ext;
++ 	__u32 tunnel_label;
++ };
++ 
++ /* Generic BPF return codes which all BPF program types may support.
++  * The values are binary compatible with their TC_ACT_* counter-part to
++  * provide backwards compatibility with existing SCHED_CLS and SCHED_ACT
++  * programs.
++  *
++  * XDP is handled seprately, see XDP_*.
++  */
++ enum bpf_ret_code {
++ 	BPF_OK = 0,
++ 	/* 1 reserved */
++ 	BPF_DROP = 2,
++ 	/* 3-6 reserved */
++ 	BPF_REDIRECT = 7,
++ 	/* >127 are reserved for prog type specific return codes */
++ };
++ 
++ struct bpf_sock {
++ 	__u32 bound_dev_if;
++ 	__u32 family;
++ 	__u32 type;
++ 	__u32 protocol;
++ 	__u32 mark;
++ 	__u32 priority;
++ };
++ 
++ #define XDP_PACKET_HEADROOM 256
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  /* User return codes for XDP prog type.
+   * A valid XDP program must return one of these defined values. All other
+ - * return codes are reserved for future use. Unknown return codes will
+ - * result in packet drops and a warning via bpf_warn_invalid_xdp_action().
+ + * return codes are reserved for future use. Unknown return codes will result
+ + * in packet drop.
+   */
+  enum xdp_action {
+  	XDP_ABORTED = 0,
+@@@ -153,16 -793,86 +679,17 @@@
+  struct xdp_md {
+  	__u32 data;
+  	__u32 data_end;
++ 	__u32 data_meta;
+  };
+  
+ -enum sk_action {
+ -	SK_ABORTED = 0,
+ -	SK_DROP,
+ -	SK_REDIRECT,
+ -};
+ -
+ -#define BPF_TAG_SIZE	8
+ -
+ -struct bpf_prog_info {
+ -	__u32 type;
+ -	__u32 id;
+ -	__u8  tag[BPF_TAG_SIZE];
+ -	__u32 jited_prog_len;
+ -	__u32 xlated_prog_len;
+ -	__aligned_u64 jited_prog_insns;
+ -	__aligned_u64 xlated_prog_insns;
+ -} __attribute__((aligned(8)));
+ -
+ -struct bpf_map_info {
+ -	__u32 type;
+ -	__u32 id;
+ -	__u32 key_size;
+ -	__u32 value_size;
+ -	__u32 max_entries;
+ -	__u32 map_flags;
+ -} __attribute__((aligned(8)));
+ -
+ -/* User bpf_sock_ops struct to access socket values and specify request ops
+ - * and their replies.
+ - * Some of this fields are in network (bigendian) byte order and may need
+ - * to be converted before use (bpf_ntohl() defined in samples/bpf/bpf_endian.h).
+ - * New fields can only be added at the end of this structure
+ - */
+ -struct bpf_sock_ops {
+ -	__u32 op;
+ -	union {
+ -		__u32 reply;
+ -		__u32 replylong[4];
+ -	};
+ -	__u32 family;
+ -	__u32 remote_ip4;	/* Stored in network byte order */
+ -	__u32 local_ip4;	/* Stored in network byte order */
+ -	__u32 remote_ip6[4];	/* Stored in network byte order */
+ -	__u32 local_ip6[4];	/* Stored in network byte order */
+ -	__u32 remote_port;	/* Stored in network byte order */
+ -	__u32 local_port;	/* stored in host byte order */
+ -};
+ +#define XDP_PACKET_HEADROOM 256
+  
+ -/* List of known BPF sock_ops operators.
+ - * New entries can only be added at the end
+ +/* integer value in 'imm' field of BPF_CALL instruction selects which helper
+ + * function eBPF program intends to call
+   */
+ -enum {
+ -	BPF_SOCK_OPS_VOID,
+ -	BPF_SOCK_OPS_TIMEOUT_INIT,	/* Should return SYN-RTO value to use or
+ -					 * -1 if default value should be used
+ -					 */
+ -	BPF_SOCK_OPS_RWND_INIT,		/* Should return initial advertized
+ -					 * window (in packets) or -1 if default
+ -					 * value should be used
+ -					 */
+ -	BPF_SOCK_OPS_TCP_CONNECT_CB,	/* Calls BPF program right before an
+ -					 * active connection is initialized
+ -					 */
+ -	BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB,	/* Calls BPF program when an
+ -						 * active connection is
+ -						 * established
+ -						 */
+ -	BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB,	/* Calls BPF program when a
+ -						 * passive connection is
+ -						 * established
+ -						 */
+ -	BPF_SOCK_OPS_NEEDS_ECN,		/* If connection's congestion control
+ -					 * needs ECN
+ -					 */
+ +enum bpf_func_id {
+ +	BPF_FUNC_unspec,
+ +	__BPF_FUNC_MAX_ID,
+  };
+  
+ -#define TCP_BPF_IW		1001	/* Set TCP initial congestion window */
+ -#define TCP_BPF_SNDCWND_CLAMP	1002	/* Set sndcwnd_clamp */
+ -
+  #endif /* _UAPI__LINUX_BPF_H__ */
+diff --cc net/core/dev.c
+index 057b965c99c7,e350c768d4b5..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3816,6 -3861,142 +3816,145 @@@ drop
+  	return NET_RX_DROP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
++ 				     struct bpf_prog *xdp_prog)
++ {
++ 	u32 metalen, act = XDP_DROP;
++ 	struct xdp_buff xdp;
++ 	void *orig_data;
++ 	int hlen, off;
++ 	u32 mac_len;
++ 
++ 	/* Reinjected packets coming from act_mirred or similar should
++ 	 * not get XDP generic processing.
++ 	 */
++ 	if (skb_cloned(skb))
++ 		return XDP_PASS;
++ 
++ 	/* XDP packets must be linear and must have sufficient headroom
++ 	 * of XDP_PACKET_HEADROOM bytes. This is the guarantee that also
++ 	 * native XDP provides, thus we need to do it here as well.
++ 	 */
++ 	if (skb_is_nonlinear(skb) ||
++ 	    skb_headroom(skb) < XDP_PACKET_HEADROOM) {
++ 		int hroom = XDP_PACKET_HEADROOM - skb_headroom(skb);
++ 		int troom = skb->tail + skb->data_len - skb->end;
++ 
++ 		/* In case we have to go down the path and also linearize,
++ 		 * then lets do the pskb_expand_head() work just once here.
++ 		 */
++ 		if (pskb_expand_head(skb,
++ 				     hroom > 0 ? ALIGN(hroom, NET_SKB_PAD) : 0,
++ 				     troom > 0 ? troom + 128 : 0, GFP_ATOMIC))
++ 			goto do_drop;
++ 		if (troom > 0 && __skb_linearize(skb))
++ 			goto do_drop;
++ 	}
++ 
++ 	/* The XDP program wants to see the packet starting at the MAC
++ 	 * header.
++ 	 */
++ 	mac_len = skb->data - skb_mac_header(skb);
++ 	hlen = skb_headlen(skb) + mac_len;
++ 	xdp.data = skb->data - mac_len;
++ 	xdp.data_meta = xdp.data;
++ 	xdp.data_end = xdp.data + hlen;
++ 	xdp.data_hard_start = skb->data - skb_headroom(skb);
++ 	orig_data = xdp.data;
++ 
++ 	act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 	off = xdp.data - orig_data;
++ 	if (off > 0)
++ 		__skb_pull(skb, off);
++ 	else if (off < 0)
++ 		__skb_push(skb, -off);
++ 	skb->mac_header += off;
++ 
++ 	switch (act) {
++ 	case XDP_REDIRECT:
++ 	case XDP_TX:
++ 		__skb_push(skb, mac_len);
++ 		break;
++ 	case XDP_PASS:
++ 		metalen = xdp.data - xdp.data_meta;
++ 		if (metalen)
++ 			skb_metadata_set(skb, metalen);
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		/* fall through */
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(skb->dev, xdp_prog, act);
++ 		/* fall through */
++ 	case XDP_DROP:
++ 	do_drop:
++ 		kfree_skb(skb);
++ 		break;
++ 	}
++ 
++ 	return act;
++ }
++ 
++ /* When doing generic XDP we have to bypass the qdisc layer and the
++  * network taps in order to match in-driver-XDP behavior.
++  */
++ void generic_xdp_tx(struct sk_buff *skb, struct bpf_prog *xdp_prog)
++ {
++ 	struct net_device *dev = skb->dev;
++ 	struct netdev_queue *txq;
++ 	bool free_skb = true;
++ 	int cpu, rc;
++ 
++ 	txq = netdev_pick_tx(dev, skb, NULL);
++ 	cpu = smp_processor_id();
++ 	HARD_TX_LOCK(dev, txq, cpu);
++ 	if (!netif_xmit_stopped(txq)) {
++ 		rc = netdev_start_xmit(skb, dev, txq, 0);
++ 		if (dev_xmit_complete(rc))
++ 			free_skb = false;
++ 	}
++ 	HARD_TX_UNLOCK(dev, txq);
++ 	if (free_skb) {
++ 		trace_xdp_exception(dev, xdp_prog, XDP_TX);
++ 		kfree_skb(skb);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(generic_xdp_tx);
++ 
++ static struct static_key generic_xdp_needed __read_mostly;
++ 
++ int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb)
++ {
++ 	if (xdp_prog) {
++ 		u32 act = netif_receive_generic_xdp(skb, xdp_prog);
++ 		int err;
++ 
++ 		if (act != XDP_PASS) {
++ 			switch (act) {
++ 			case XDP_REDIRECT:
++ 				err = xdp_do_generic_redirect(skb->dev, skb,
++ 							      xdp_prog);
++ 				if (err)
++ 					goto out_redir;
++ 			/* fallthru to submit skb */
++ 			case XDP_TX:
++ 				generic_xdp_tx(skb, xdp_prog);
++ 				break;
++ 			}
++ 			return XDP_DROP;
++ 		}
++ 	}
++ 	return XDP_PASS;
++ out_redir:
++ 	kfree_skb(skb);
++ 	return XDP_DROP;
++ }
++ EXPORT_SYMBOL_GPL(do_xdp_generic);
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  static int netif_rx_internal(struct sk_buff *skb)
+  {
+  	int ret;
+diff --cc net/core/filter.c
+index 060ed5f86613,9b6e7e84aafd..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -763,6 -1323,3052 +763,3055 @@@ int sk_attach_filter(struct sock_fprog 
+  }
+  EXPORT_SYMBOL_GPL(sk_attach_filter);
+  
+++<<<<<<< HEAD
+++=======
++ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk)
++ {
++ 	struct bpf_prog *prog = __get_filter(fprog, sk);
++ 	int err;
++ 
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	err = __reuseport_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		__bpf_prog_release(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct bpf_prog *__get_bpf(u32 ufd, struct sock *sk)
++ {
++ 	if (sock_flag(sk, SOCK_FILTER_LOCKED))
++ 		return ERR_PTR(-EPERM);
++ 
++ 	return bpf_prog_get_type(ufd, BPF_PROG_TYPE_SOCKET_FILTER);
++ }
++ 
++ int sk_attach_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog = __get_bpf(ufd, sk);
++ 	int err;
++ 
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	err = __sk_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		bpf_prog_put(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog = __get_bpf(ufd, sk);
++ 	int err;
++ 
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	err = __reuseport_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		bpf_prog_put(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ struct bpf_scratchpad {
++ 	union {
++ 		__be32 diff[MAX_BPF_STACK / sizeof(__be32)];
++ 		u8     buff[MAX_BPF_STACK];
++ 	};
++ };
++ 
++ static DEFINE_PER_CPU(struct bpf_scratchpad, bpf_sp);
++ 
++ static inline int __bpf_try_make_writable(struct sk_buff *skb,
++ 					  unsigned int write_len)
++ {
++ 	return skb_ensure_writable(skb, write_len);
++ }
++ 
++ static inline int bpf_try_make_writable(struct sk_buff *skb,
++ 					unsigned int write_len)
++ {
++ 	int err = __bpf_try_make_writable(skb, write_len);
++ 
++ 	bpf_compute_data_pointers(skb);
++ 	return err;
++ }
++ 
++ static int bpf_try_make_head_writable(struct sk_buff *skb)
++ {
++ 	return bpf_try_make_writable(skb, skb_headlen(skb));
++ }
++ 
++ static inline void bpf_push_mac_rcsum(struct sk_buff *skb)
++ {
++ 	if (skb_at_tc_ingress(skb))
++ 		skb_postpush_rcsum(skb, skb_mac_header(skb), skb->mac_len);
++ }
++ 
++ static inline void bpf_pull_mac_rcsum(struct sk_buff *skb)
++ {
++ 	if (skb_at_tc_ingress(skb))
++ 		skb_postpull_rcsum(skb, skb_mac_header(skb), skb->mac_len);
++ }
++ 
++ BPF_CALL_5(bpf_skb_store_bytes, struct sk_buff *, skb, u32, offset,
++ 	   const void *, from, u32, len, u64, flags)
++ {
++ 	void *ptr;
++ 
++ 	if (unlikely(flags & ~(BPF_F_RECOMPUTE_CSUM | BPF_F_INVALIDATE_HASH)))
++ 		return -EINVAL;
++ 	if (unlikely(offset > 0xffff))
++ 		return -EFAULT;
++ 	if (unlikely(bpf_try_make_writable(skb, offset + len)))
++ 		return -EFAULT;
++ 
++ 	ptr = skb->data + offset;
++ 	if (flags & BPF_F_RECOMPUTE_CSUM)
++ 		__skb_postpull_rcsum(skb, ptr, len, offset);
++ 
++ 	memcpy(ptr, from, len);
++ 
++ 	if (flags & BPF_F_RECOMPUTE_CSUM)
++ 		__skb_postpush_rcsum(skb, ptr, len, offset);
++ 	if (flags & BPF_F_INVALIDATE_HASH)
++ 		skb_clear_hash(skb);
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_store_bytes_proto = {
++ 	.func		= bpf_skb_store_bytes,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_PTR_TO_MEM,
++ 	.arg4_type	= ARG_CONST_SIZE,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_4(bpf_skb_load_bytes, const struct sk_buff *, skb, u32, offset,
++ 	   void *, to, u32, len)
++ {
++ 	void *ptr;
++ 
++ 	if (unlikely(offset > 0xffff))
++ 		goto err_clear;
++ 
++ 	ptr = skb_header_pointer(skb, offset, len, to);
++ 	if (unlikely(!ptr))
++ 		goto err_clear;
++ 	if (ptr != to)
++ 		memcpy(to, ptr, len);
++ 
++ 	return 0;
++ err_clear:
++ 	memset(to, 0, len);
++ 	return -EFAULT;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_load_bytes_proto = {
++ 	.func		= bpf_skb_load_bytes,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg4_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_2(bpf_skb_pull_data, struct sk_buff *, skb, u32, len)
++ {
++ 	/* Idea is the following: should the needed direct read/write
++ 	 * test fail during runtime, we can pull in more data and redo
++ 	 * again, since implicitly, we invalidate previous checks here.
++ 	 *
++ 	 * Or, since we know how much we need to make read/writeable,
++ 	 * this can be done once at the program beginning for direct
++ 	 * access case. By this we overcome limitations of only current
++ 	 * headroom being accessible.
++ 	 */
++ 	return bpf_try_make_writable(skb, len ? : skb_headlen(skb));
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_pull_data_proto = {
++ 	.func		= bpf_skb_pull_data,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_5(bpf_l3_csum_replace, struct sk_buff *, skb, u32, offset,
++ 	   u64, from, u64, to, u64, flags)
++ {
++ 	__sum16 *ptr;
++ 
++ 	if (unlikely(flags & ~(BPF_F_HDR_FIELD_MASK)))
++ 		return -EINVAL;
++ 	if (unlikely(offset > 0xffff || offset & 1))
++ 		return -EFAULT;
++ 	if (unlikely(bpf_try_make_writable(skb, offset + sizeof(*ptr))))
++ 		return -EFAULT;
++ 
++ 	ptr = (__sum16 *)(skb->data + offset);
++ 	switch (flags & BPF_F_HDR_FIELD_MASK) {
++ 	case 0:
++ 		if (unlikely(from != 0))
++ 			return -EINVAL;
++ 
++ 		csum_replace_by_diff(ptr, to);
++ 		break;
++ 	case 2:
++ 		csum_replace2(ptr, from, to);
++ 		break;
++ 	case 4:
++ 		csum_replace4(ptr, from, to);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_l3_csum_replace_proto = {
++ 	.func		= bpf_l3_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_5(bpf_l4_csum_replace, struct sk_buff *, skb, u32, offset,
++ 	   u64, from, u64, to, u64, flags)
++ {
++ 	bool is_pseudo = flags & BPF_F_PSEUDO_HDR;
++ 	bool is_mmzero = flags & BPF_F_MARK_MANGLED_0;
++ 	bool do_mforce = flags & BPF_F_MARK_ENFORCE;
++ 	__sum16 *ptr;
++ 
++ 	if (unlikely(flags & ~(BPF_F_MARK_MANGLED_0 | BPF_F_MARK_ENFORCE |
++ 			       BPF_F_PSEUDO_HDR | BPF_F_HDR_FIELD_MASK)))
++ 		return -EINVAL;
++ 	if (unlikely(offset > 0xffff || offset & 1))
++ 		return -EFAULT;
++ 	if (unlikely(bpf_try_make_writable(skb, offset + sizeof(*ptr))))
++ 		return -EFAULT;
++ 
++ 	ptr = (__sum16 *)(skb->data + offset);
++ 	if (is_mmzero && !do_mforce && !*ptr)
++ 		return 0;
++ 
++ 	switch (flags & BPF_F_HDR_FIELD_MASK) {
++ 	case 0:
++ 		if (unlikely(from != 0))
++ 			return -EINVAL;
++ 
++ 		inet_proto_csum_replace_by_diff(ptr, skb, to, is_pseudo);
++ 		break;
++ 	case 2:
++ 		inet_proto_csum_replace2(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	case 4:
++ 		inet_proto_csum_replace4(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (is_mmzero && !*ptr)
++ 		*ptr = CSUM_MANGLED_0;
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_l4_csum_replace_proto = {
++ 	.func		= bpf_l4_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_5(bpf_csum_diff, __be32 *, from, u32, from_size,
++ 	   __be32 *, to, u32, to_size, __wsum, seed)
++ {
++ 	struct bpf_scratchpad *sp = this_cpu_ptr(&bpf_sp);
++ 	u32 diff_size = from_size + to_size;
++ 	int i, j = 0;
++ 
++ 	/* This is quite flexible, some examples:
++ 	 *
++ 	 * from_size == 0, to_size > 0,  seed := csum --> pushing data
++ 	 * from_size > 0,  to_size == 0, seed := csum --> pulling data
++ 	 * from_size > 0,  to_size > 0,  seed := 0    --> diffing data
++ 	 *
++ 	 * Even for diffing, from_size and to_size don't need to be equal.
++ 	 */
++ 	if (unlikely(((from_size | to_size) & (sizeof(__be32) - 1)) ||
++ 		     diff_size > sizeof(sp->diff)))
++ 		return -EINVAL;
++ 
++ 	for (i = 0; i < from_size / sizeof(__be32); i++, j++)
++ 		sp->diff[j] = ~from[i];
++ 	for (i = 0; i <   to_size / sizeof(__be32); i++, j++)
++ 		sp->diff[j] = to[i];
++ 
++ 	return csum_partial(sp->diff, diff_size, seed);
++ }
++ 
++ static const struct bpf_func_proto bpf_csum_diff_proto = {
++ 	.func		= bpf_csum_diff,
++ 	.gpl_only	= false,
++ 	.pkt_access	= true,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_MEM,
++ 	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
++ 	.arg3_type	= ARG_PTR_TO_MEM,
++ 	.arg4_type	= ARG_CONST_SIZE_OR_ZERO,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_2(bpf_csum_update, struct sk_buff *, skb, __wsum, csum)
++ {
++ 	/* The interface is to be used in combination with bpf_csum_diff()
++ 	 * for direct packet writes. csum rotation for alignment as well
++ 	 * as emulating csum_sub() can be done from the eBPF program.
++ 	 */
++ 	if (skb->ip_summed == CHECKSUM_COMPLETE)
++ 		return (skb->csum = csum_add(skb->csum, csum));
++ 
++ 	return -ENOTSUPP;
++ }
++ 
++ static const struct bpf_func_proto bpf_csum_update_proto = {
++ 	.func		= bpf_csum_update,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
++ static inline int __bpf_rx_skb(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	return dev_forward_skb(dev, skb);
++ }
++ 
++ static inline int __bpf_rx_skb_no_mac(struct net_device *dev,
++ 				      struct sk_buff *skb)
++ {
++ 	int ret = ____dev_forward_skb(dev, skb);
++ 
++ 	if (likely(!ret)) {
++ 		skb->dev = dev;
++ 		ret = netif_rx(skb);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static inline int __bpf_tx_skb(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	int ret;
++ 
++ 	if (unlikely(__this_cpu_read(xmit_recursion) > XMIT_RECURSION_LIMIT)) {
++ 		net_crit_ratelimited("bpf: recursion limit reached on datapath, buggy bpf program?\n");
++ 		kfree_skb(skb);
++ 		return -ENETDOWN;
++ 	}
++ 
++ 	skb->dev = dev;
++ 
++ 	__this_cpu_inc(xmit_recursion);
++ 	ret = dev_queue_xmit(skb);
++ 	__this_cpu_dec(xmit_recursion);
++ 
++ 	return ret;
++ }
++ 
++ static int __bpf_redirect_no_mac(struct sk_buff *skb, struct net_device *dev,
++ 				 u32 flags)
++ {
++ 	/* skb->mac_len is not set on normal egress */
++ 	unsigned int mlen = skb->network_header - skb->mac_header;
++ 
++ 	__skb_pull(skb, mlen);
++ 
++ 	/* At ingress, the mac header has already been pulled once.
++ 	 * At egress, skb_pospull_rcsum has to be done in case that
++ 	 * the skb is originated from ingress (i.e. a forwarded skb)
++ 	 * to ensure that rcsum starts at net header.
++ 	 */
++ 	if (!skb_at_tc_ingress(skb))
++ 		skb_postpull_rcsum(skb, skb_mac_header(skb), mlen);
++ 	skb_pop_mac_header(skb);
++ 	skb_reset_mac_len(skb);
++ 	return flags & BPF_F_INGRESS ?
++ 	       __bpf_rx_skb_no_mac(dev, skb) : __bpf_tx_skb(dev, skb);
++ }
++ 
++ static int __bpf_redirect_common(struct sk_buff *skb, struct net_device *dev,
++ 				 u32 flags)
++ {
++ 	/* Verify that a link layer header is carried */
++ 	if (unlikely(skb->mac_header >= skb->network_header)) {
++ 		kfree_skb(skb);
++ 		return -ERANGE;
++ 	}
++ 
++ 	bpf_push_mac_rcsum(skb);
++ 	return flags & BPF_F_INGRESS ?
++ 	       __bpf_rx_skb(dev, skb) : __bpf_tx_skb(dev, skb);
++ }
++ 
++ static int __bpf_redirect(struct sk_buff *skb, struct net_device *dev,
++ 			  u32 flags)
++ {
++ 	if (dev_is_mac_header_xmit(dev))
++ 		return __bpf_redirect_common(skb, dev, flags);
++ 	else
++ 		return __bpf_redirect_no_mac(skb, dev, flags);
++ }
++ 
++ BPF_CALL_3(bpf_clone_redirect, struct sk_buff *, skb, u32, ifindex, u64, flags)
++ {
++ 	struct net_device *dev;
++ 	struct sk_buff *clone;
++ 	int ret;
++ 
++ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
++ 		return -EINVAL;
++ 
++ 	dev = dev_get_by_index_rcu(dev_net(skb->dev), ifindex);
++ 	if (unlikely(!dev))
++ 		return -EINVAL;
++ 
++ 	clone = skb_clone(skb, GFP_ATOMIC);
++ 	if (unlikely(!clone))
++ 		return -ENOMEM;
++ 
++ 	/* For direct write, we need to keep the invariant that the skbs
++ 	 * we're dealing with need to be uncloned. Should uncloning fail
++ 	 * here, we need to free the just generated clone to unclone once
++ 	 * again.
++ 	 */
++ 	ret = bpf_try_make_head_writable(skb);
++ 	if (unlikely(ret)) {
++ 		kfree_skb(clone);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	return __bpf_redirect(clone, dev, flags);
++ }
++ 
++ static const struct bpf_func_proto bpf_clone_redirect_proto = {
++ 	.func           = bpf_clone_redirect,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ 
++ struct redirect_info {
++ 	u32 ifindex;
++ 	u32 flags;
++ 	struct bpf_map *map;
++ 	struct bpf_map *map_to_flush;
++ 	unsigned long   map_owner;
++ };
++ 
++ static DEFINE_PER_CPU(struct redirect_info, redirect_info);
++ 
++ BPF_CALL_2(bpf_redirect, u32, ifindex, u64, flags)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 
++ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
++ 		return TC_ACT_SHOT;
++ 
++ 	ri->ifindex = ifindex;
++ 	ri->flags = flags;
++ 
++ 	return TC_ACT_REDIRECT;
++ }
++ 
++ int skb_do_redirect(struct sk_buff *skb)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	struct net_device *dev;
++ 
++ 	dev = dev_get_by_index_rcu(dev_net(skb->dev), ri->ifindex);
++ 	ri->ifindex = 0;
++ 	if (unlikely(!dev)) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return __bpf_redirect(skb, dev, ri->flags);
++ }
++ 
++ static const struct bpf_func_proto bpf_redirect_proto = {
++ 	.func           = bpf_redirect,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_ANYTHING,
++ 	.arg2_type      = ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_3(bpf_sk_redirect_map, struct bpf_map *, map, u32, key, u64, flags)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 
++ 	if (unlikely(flags))
++ 		return SK_ABORTED;
++ 
++ 	ri->ifindex = key;
++ 	ri->flags = flags;
++ 	ri->map = map;
++ 
++ 	return SK_REDIRECT;
++ }
++ 
++ struct sock *do_sk_redirect_map(void)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	struct sock *sk = NULL;
++ 
++ 	if (ri->map) {
++ 		sk = __sock_map_lookup_elem(ri->map, ri->ifindex);
++ 
++ 		ri->ifindex = 0;
++ 		ri->map = NULL;
++ 		/* we do not clear flags for future lookup */
++ 	}
++ 
++ 	return sk;
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_redirect_map_proto = {
++ 	.func           = bpf_sk_redirect_map,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_CONST_MAP_PTR,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_1(bpf_get_cgroup_classid, const struct sk_buff *, skb)
++ {
++ 	return task_get_classid(skb);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_cgroup_classid_proto = {
++ 	.func           = bpf_get_cgroup_classid,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ BPF_CALL_1(bpf_get_route_realm, const struct sk_buff *, skb)
++ {
++ 	return dst_tclassid(skb);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_route_realm_proto = {
++ 	.func           = bpf_get_route_realm,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ BPF_CALL_1(bpf_get_hash_recalc, struct sk_buff *, skb)
++ {
++ 	/* If skb_clear_hash() was called due to mangling, we can
++ 	 * trigger SW recalculation here. Later access to hash
++ 	 * can then use the inline skb->hash via context directly
++ 	 * instead of calling this helper again.
++ 	 */
++ 	return skb_get_hash(skb);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_hash_recalc_proto = {
++ 	.func		= bpf_get_hash_recalc,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ };
++ 
++ BPF_CALL_1(bpf_set_hash_invalid, struct sk_buff *, skb)
++ {
++ 	/* After all direct packet write, this can be used once for
++ 	 * triggering a lazy recalc on next skb_get_hash() invocation.
++ 	 */
++ 	skb_clear_hash(skb);
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_set_hash_invalid_proto = {
++ 	.func		= bpf_set_hash_invalid,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ };
++ 
++ BPF_CALL_2(bpf_set_hash, struct sk_buff *, skb, u32, hash)
++ {
++ 	/* Set user specified hash as L4(+), so that it gets returned
++ 	 * on skb_get_hash() call unless BPF prog later on triggers a
++ 	 * skb_clear_hash().
++ 	 */
++ 	__skb_set_sw_hash(skb, hash, true);
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_set_hash_proto = {
++ 	.func		= bpf_set_hash,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_3(bpf_skb_vlan_push, struct sk_buff *, skb, __be16, vlan_proto,
++ 	   u16, vlan_tci)
++ {
++ 	int ret;
++ 
++ 	if (unlikely(vlan_proto != htons(ETH_P_8021Q) &&
++ 		     vlan_proto != htons(ETH_P_8021AD)))
++ 		vlan_proto = htons(ETH_P_8021Q);
++ 
++ 	bpf_push_mac_rcsum(skb);
++ 	ret = skb_vlan_push(skb, vlan_proto, vlan_tci);
++ 	bpf_pull_mac_rcsum(skb);
++ 
++ 	bpf_compute_data_pointers(skb);
++ 	return ret;
++ }
++ 
++ const struct bpf_func_proto bpf_skb_vlan_push_proto = {
++ 	.func           = bpf_skb_vlan_push,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ EXPORT_SYMBOL_GPL(bpf_skb_vlan_push_proto);
++ 
++ BPF_CALL_1(bpf_skb_vlan_pop, struct sk_buff *, skb)
++ {
++ 	int ret;
++ 
++ 	bpf_push_mac_rcsum(skb);
++ 	ret = skb_vlan_pop(skb);
++ 	bpf_pull_mac_rcsum(skb);
++ 
++ 	bpf_compute_data_pointers(skb);
++ 	return ret;
++ }
++ 
++ const struct bpf_func_proto bpf_skb_vlan_pop_proto = {
++ 	.func           = bpf_skb_vlan_pop,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ EXPORT_SYMBOL_GPL(bpf_skb_vlan_pop_proto);
++ 
++ static int bpf_skb_generic_push(struct sk_buff *skb, u32 off, u32 len)
++ {
++ 	/* Caller already did skb_cow() with len as headroom,
++ 	 * so no need to do it here.
++ 	 */
++ 	skb_push(skb, len);
++ 	memmove(skb->data, skb->data + len, off);
++ 	memset(skb->data + off, 0, len);
++ 
++ 	/* No skb_postpush_rcsum(skb, skb->data + off, len)
++ 	 * needed here as it does not change the skb->csum
++ 	 * result for checksum complete when summing over
++ 	 * zeroed blocks.
++ 	 */
++ 	return 0;
++ }
++ 
++ static int bpf_skb_generic_pop(struct sk_buff *skb, u32 off, u32 len)
++ {
++ 	/* skb_ensure_writable() is not needed here, as we're
++ 	 * already working on an uncloned skb.
++ 	 */
++ 	if (unlikely(!pskb_may_pull(skb, off + len)))
++ 		return -ENOMEM;
++ 
++ 	skb_postpull_rcsum(skb, skb->data + off, len);
++ 	memmove(skb->data + len, skb->data, off);
++ 	__skb_pull(skb, len);
++ 
++ 	return 0;
++ }
++ 
++ static int bpf_skb_net_hdr_push(struct sk_buff *skb, u32 off, u32 len)
++ {
++ 	bool trans_same = skb->transport_header == skb->network_header;
++ 	int ret;
++ 
++ 	/* There's no need for __skb_push()/__skb_pull() pair to
++ 	 * get to the start of the mac header as we're guaranteed
++ 	 * to always start from here under eBPF.
++ 	 */
++ 	ret = bpf_skb_generic_push(skb, off, len);
++ 	if (likely(!ret)) {
++ 		skb->mac_header -= len;
++ 		skb->network_header -= len;
++ 		if (trans_same)
++ 			skb->transport_header = skb->network_header;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int bpf_skb_net_hdr_pop(struct sk_buff *skb, u32 off, u32 len)
++ {
++ 	bool trans_same = skb->transport_header == skb->network_header;
++ 	int ret;
++ 
++ 	/* Same here, __skb_push()/__skb_pull() pair not needed. */
++ 	ret = bpf_skb_generic_pop(skb, off, len);
++ 	if (likely(!ret)) {
++ 		skb->mac_header += len;
++ 		skb->network_header += len;
++ 		if (trans_same)
++ 			skb->transport_header = skb->network_header;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int bpf_skb_proto_4_to_6(struct sk_buff *skb)
++ {
++ 	const u32 len_diff = sizeof(struct ipv6hdr) - sizeof(struct iphdr);
++ 	u32 off = skb_mac_header_len(skb);
++ 	int ret;
++ 
++ 	ret = skb_cow(skb, len_diff);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	ret = bpf_skb_net_hdr_push(skb, off, len_diff);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	if (skb_is_gso(skb)) {
++ 		/* SKB_GSO_TCPV4 needs to be changed into
++ 		 * SKB_GSO_TCPV6.
++ 		 */
++ 		if (skb_shinfo(skb)->gso_type & SKB_GSO_TCPV4) {
++ 			skb_shinfo(skb)->gso_type &= ~SKB_GSO_TCPV4;
++ 			skb_shinfo(skb)->gso_type |=  SKB_GSO_TCPV6;
++ 		}
++ 
++ 		/* Due to IPv6 header, MSS needs to be downgraded. */
++ 		skb_shinfo(skb)->gso_size -= len_diff;
++ 		/* Header must be checked, and gso_segs recomputed. */
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
++ 		skb_shinfo(skb)->gso_segs = 0;
++ 	}
++ 
++ 	skb->protocol = htons(ETH_P_IPV6);
++ 	skb_clear_hash(skb);
++ 
++ 	return 0;
++ }
++ 
++ static int bpf_skb_proto_6_to_4(struct sk_buff *skb)
++ {
++ 	const u32 len_diff = sizeof(struct ipv6hdr) - sizeof(struct iphdr);
++ 	u32 off = skb_mac_header_len(skb);
++ 	int ret;
++ 
++ 	ret = skb_unclone(skb, GFP_ATOMIC);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	ret = bpf_skb_net_hdr_pop(skb, off, len_diff);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	if (skb_is_gso(skb)) {
++ 		/* SKB_GSO_TCPV6 needs to be changed into
++ 		 * SKB_GSO_TCPV4.
++ 		 */
++ 		if (skb_shinfo(skb)->gso_type & SKB_GSO_TCPV6) {
++ 			skb_shinfo(skb)->gso_type &= ~SKB_GSO_TCPV6;
++ 			skb_shinfo(skb)->gso_type |=  SKB_GSO_TCPV4;
++ 		}
++ 
++ 		/* Due to IPv4 header, MSS can be upgraded. */
++ 		skb_shinfo(skb)->gso_size += len_diff;
++ 		/* Header must be checked, and gso_segs recomputed. */
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
++ 		skb_shinfo(skb)->gso_segs = 0;
++ 	}
++ 
++ 	skb->protocol = htons(ETH_P_IP);
++ 	skb_clear_hash(skb);
++ 
++ 	return 0;
++ }
++ 
++ static int bpf_skb_proto_xlat(struct sk_buff *skb, __be16 to_proto)
++ {
++ 	__be16 from_proto = skb->protocol;
++ 
++ 	if (from_proto == htons(ETH_P_IP) &&
++ 	      to_proto == htons(ETH_P_IPV6))
++ 		return bpf_skb_proto_4_to_6(skb);
++ 
++ 	if (from_proto == htons(ETH_P_IPV6) &&
++ 	      to_proto == htons(ETH_P_IP))
++ 		return bpf_skb_proto_6_to_4(skb);
++ 
++ 	return -ENOTSUPP;
++ }
++ 
++ BPF_CALL_3(bpf_skb_change_proto, struct sk_buff *, skb, __be16, proto,
++ 	   u64, flags)
++ {
++ 	int ret;
++ 
++ 	if (unlikely(flags))
++ 		return -EINVAL;
++ 
++ 	/* General idea is that this helper does the basic groundwork
++ 	 * needed for changing the protocol, and eBPF program fills the
++ 	 * rest through bpf_skb_store_bytes(), bpf_lX_csum_replace()
++ 	 * and other helpers, rather than passing a raw buffer here.
++ 	 *
++ 	 * The rationale is to keep this minimal and without a need to
++ 	 * deal with raw packet data. F.e. even if we would pass buffers
++ 	 * here, the program still needs to call the bpf_lX_csum_replace()
++ 	 * helpers anyway. Plus, this way we keep also separation of
++ 	 * concerns, since f.e. bpf_skb_store_bytes() should only take
++ 	 * care of stores.
++ 	 *
++ 	 * Currently, additional options and extension header space are
++ 	 * not supported, but flags register is reserved so we can adapt
++ 	 * that. For offloads, we mark packet as dodgy, so that headers
++ 	 * need to be verified first.
++ 	 */
++ 	ret = bpf_skb_proto_xlat(skb, proto);
++ 	bpf_compute_data_pointers(skb);
++ 	return ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_change_proto_proto = {
++ 	.func		= bpf_skb_change_proto,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_2(bpf_skb_change_type, struct sk_buff *, skb, u32, pkt_type)
++ {
++ 	/* We only allow a restricted subset to be changed for now. */
++ 	if (unlikely(!skb_pkt_type_ok(skb->pkt_type) ||
++ 		     !skb_pkt_type_ok(pkt_type)))
++ 		return -EINVAL;
++ 
++ 	skb->pkt_type = pkt_type;
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_change_type_proto = {
++ 	.func		= bpf_skb_change_type,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
++ static u32 bpf_skb_net_base_len(const struct sk_buff *skb)
++ {
++ 	switch (skb->protocol) {
++ 	case htons(ETH_P_IP):
++ 		return sizeof(struct iphdr);
++ 	case htons(ETH_P_IPV6):
++ 		return sizeof(struct ipv6hdr);
++ 	default:
++ 		return ~0U;
++ 	}
++ }
++ 
++ static int bpf_skb_net_grow(struct sk_buff *skb, u32 len_diff)
++ {
++ 	u32 off = skb_mac_header_len(skb) + bpf_skb_net_base_len(skb);
++ 	int ret;
++ 
++ 	ret = skb_cow(skb, len_diff);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	ret = bpf_skb_net_hdr_push(skb, off, len_diff);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	if (skb_is_gso(skb)) {
++ 		/* Due to header grow, MSS needs to be downgraded. */
++ 		skb_shinfo(skb)->gso_size -= len_diff;
++ 		/* Header must be checked, and gso_segs recomputed. */
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
++ 		skb_shinfo(skb)->gso_segs = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int bpf_skb_net_shrink(struct sk_buff *skb, u32 len_diff)
++ {
++ 	u32 off = skb_mac_header_len(skb) + bpf_skb_net_base_len(skb);
++ 	int ret;
++ 
++ 	ret = skb_unclone(skb, GFP_ATOMIC);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	ret = bpf_skb_net_hdr_pop(skb, off, len_diff);
++ 	if (unlikely(ret < 0))
++ 		return ret;
++ 
++ 	if (skb_is_gso(skb)) {
++ 		/* Due to header shrink, MSS can be upgraded. */
++ 		skb_shinfo(skb)->gso_size += len_diff;
++ 		/* Header must be checked, and gso_segs recomputed. */
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
++ 		skb_shinfo(skb)->gso_segs = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static u32 __bpf_skb_max_len(const struct sk_buff *skb)
++ {
++ 	return skb->dev->mtu + skb->dev->hard_header_len;
++ }
++ 
++ static int bpf_skb_adjust_net(struct sk_buff *skb, s32 len_diff)
++ {
++ 	bool trans_same = skb->transport_header == skb->network_header;
++ 	u32 len_cur, len_diff_abs = abs(len_diff);
++ 	u32 len_min = bpf_skb_net_base_len(skb);
++ 	u32 len_max = __bpf_skb_max_len(skb);
++ 	__be16 proto = skb->protocol;
++ 	bool shrink = len_diff < 0;
++ 	int ret;
++ 
++ 	if (unlikely(len_diff_abs > 0xfffU))
++ 		return -EFAULT;
++ 	if (unlikely(proto != htons(ETH_P_IP) &&
++ 		     proto != htons(ETH_P_IPV6)))
++ 		return -ENOTSUPP;
++ 
++ 	len_cur = skb->len - skb_network_offset(skb);
++ 	if (skb_transport_header_was_set(skb) && !trans_same)
++ 		len_cur = skb_network_header_len(skb);
++ 	if ((shrink && (len_diff_abs >= len_cur ||
++ 			len_cur - len_diff_abs < len_min)) ||
++ 	    (!shrink && (skb->len + len_diff_abs > len_max &&
++ 			 !skb_is_gso(skb))))
++ 		return -ENOTSUPP;
++ 
++ 	ret = shrink ? bpf_skb_net_shrink(skb, len_diff_abs) :
++ 		       bpf_skb_net_grow(skb, len_diff_abs);
++ 
++ 	bpf_compute_data_pointers(skb);
++ 	return ret;
++ }
++ 
++ BPF_CALL_4(bpf_skb_adjust_room, struct sk_buff *, skb, s32, len_diff,
++ 	   u32, mode, u64, flags)
++ {
++ 	if (unlikely(flags))
++ 		return -EINVAL;
++ 	if (likely(mode == BPF_ADJ_ROOM_NET))
++ 		return bpf_skb_adjust_net(skb, len_diff);
++ 
++ 	return -ENOTSUPP;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_adjust_room_proto = {
++ 	.func		= bpf_skb_adjust_room,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static u32 __bpf_skb_min_len(const struct sk_buff *skb)
++ {
++ 	u32 min_len = skb_network_offset(skb);
++ 
++ 	if (skb_transport_header_was_set(skb))
++ 		min_len = skb_transport_offset(skb);
++ 	if (skb->ip_summed == CHECKSUM_PARTIAL)
++ 		min_len = skb_checksum_start_offset(skb) +
++ 			  skb->csum_offset + sizeof(__sum16);
++ 	return min_len;
++ }
++ 
++ static int bpf_skb_grow_rcsum(struct sk_buff *skb, unsigned int new_len)
++ {
++ 	unsigned int old_len = skb->len;
++ 	int ret;
++ 
++ 	ret = __skb_grow_rcsum(skb, new_len);
++ 	if (!ret)
++ 		memset(skb->data + old_len, 0, new_len - old_len);
++ 	return ret;
++ }
++ 
++ static int bpf_skb_trim_rcsum(struct sk_buff *skb, unsigned int new_len)
++ {
++ 	return __skb_trim_rcsum(skb, new_len);
++ }
++ 
++ BPF_CALL_3(bpf_skb_change_tail, struct sk_buff *, skb, u32, new_len,
++ 	   u64, flags)
++ {
++ 	u32 max_len = __bpf_skb_max_len(skb);
++ 	u32 min_len = __bpf_skb_min_len(skb);
++ 	int ret;
++ 
++ 	if (unlikely(flags || new_len > max_len || new_len < min_len))
++ 		return -EINVAL;
++ 	if (skb->encapsulation)
++ 		return -ENOTSUPP;
++ 
++ 	/* The basic idea of this helper is that it's performing the
++ 	 * needed work to either grow or trim an skb, and eBPF program
++ 	 * rewrites the rest via helpers like bpf_skb_store_bytes(),
++ 	 * bpf_lX_csum_replace() and others rather than passing a raw
++ 	 * buffer here. This one is a slow path helper and intended
++ 	 * for replies with control messages.
++ 	 *
++ 	 * Like in bpf_skb_change_proto(), we want to keep this rather
++ 	 * minimal and without protocol specifics so that we are able
++ 	 * to separate concerns as in bpf_skb_store_bytes() should only
++ 	 * be the one responsible for writing buffers.
++ 	 *
++ 	 * It's really expected to be a slow path operation here for
++ 	 * control message replies, so we're implicitly linearizing,
++ 	 * uncloning and drop offloads from the skb by this.
++ 	 */
++ 	ret = __bpf_try_make_writable(skb, skb->len);
++ 	if (!ret) {
++ 		if (new_len > skb->len)
++ 			ret = bpf_skb_grow_rcsum(skb, new_len);
++ 		else if (new_len < skb->len)
++ 			ret = bpf_skb_trim_rcsum(skb, new_len);
++ 		if (!ret && skb_is_gso(skb))
++ 			skb_gso_reset(skb);
++ 	}
++ 
++ 	bpf_compute_data_pointers(skb);
++ 	return ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_change_tail_proto = {
++ 	.func		= bpf_skb_change_tail,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_3(bpf_skb_change_head, struct sk_buff *, skb, u32, head_room,
++ 	   u64, flags)
++ {
++ 	u32 max_len = __bpf_skb_max_len(skb);
++ 	u32 new_len = skb->len + head_room;
++ 	int ret;
++ 
++ 	if (unlikely(flags || (!skb_is_gso(skb) && new_len > max_len) ||
++ 		     new_len < skb->len))
++ 		return -EINVAL;
++ 
++ 	ret = skb_cow(skb, head_room);
++ 	if (likely(!ret)) {
++ 		/* Idea for this helper is that we currently only
++ 		 * allow to expand on mac header. This means that
++ 		 * skb->protocol network header, etc, stay as is.
++ 		 * Compared to bpf_skb_change_tail(), we're more
++ 		 * flexible due to not needing to linearize or
++ 		 * reset GSO. Intention for this helper is to be
++ 		 * used by an L3 skb that needs to push mac header
++ 		 * for redirection into L2 device.
++ 		 */
++ 		__skb_push(skb, head_room);
++ 		memset(skb->data, 0, head_room);
++ 		skb_reset_mac_header(skb);
++ 	}
++ 
++ 	bpf_compute_data_pointers(skb);
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_change_head_proto = {
++ 	.func		= bpf_skb_change_head,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ };
++ 
++ static unsigned long xdp_get_metalen(const struct xdp_buff *xdp)
++ {
++ 	return xdp_data_meta_unsupported(xdp) ? 0 :
++ 	       xdp->data - xdp->data_meta;
++ }
++ 
++ BPF_CALL_2(bpf_xdp_adjust_head, struct xdp_buff *, xdp, int, offset)
++ {
++ 	unsigned long metalen = xdp_get_metalen(xdp);
++ 	void *data_start = xdp->data_hard_start + metalen;
++ 	void *data = xdp->data + offset;
++ 
++ 	if (unlikely(data < data_start ||
++ 		     data > xdp->data_end - ETH_HLEN))
++ 		return -EINVAL;
++ 
++ 	if (metalen)
++ 		memmove(xdp->data_meta + offset,
++ 			xdp->data_meta, metalen);
++ 	xdp->data_meta += offset;
++ 	xdp->data = data;
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_xdp_adjust_head_proto = {
++ 	.func		= bpf_xdp_adjust_head,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_2(bpf_xdp_adjust_meta, struct xdp_buff *, xdp, int, offset)
++ {
++ 	void *meta = xdp->data_meta + offset;
++ 	unsigned long metalen = xdp->data - meta;
++ 
++ 	if (xdp_data_meta_unsupported(xdp))
++ 		return -ENOTSUPP;
++ 	if (unlikely(meta < xdp->data_hard_start ||
++ 		     meta > xdp->data))
++ 		return -EINVAL;
++ 	if (unlikely((metalen & (sizeof(__u32) - 1)) ||
++ 		     (metalen > 32)))
++ 		return -EACCES;
++ 
++ 	xdp->data_meta = meta;
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_xdp_adjust_meta_proto = {
++ 	.func		= bpf_xdp_adjust_meta,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
++ static int __bpf_tx_xdp(struct net_device *dev,
++ 			struct bpf_map *map,
++ 			struct xdp_buff *xdp,
++ 			u32 index)
++ {
++ 	int err;
++ 
++ 	if (!dev->netdev_ops->ndo_xdp_xmit) {
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	err = dev->netdev_ops->ndo_xdp_xmit(dev, xdp);
++ 	if (err)
++ 		return err;
++ 	if (map)
++ 		__dev_map_insert_ctx(map, index);
++ 	else
++ 		dev->netdev_ops->ndo_xdp_flush(dev);
++ 	return 0;
++ }
++ 
++ void xdp_do_flush_map(void)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	struct bpf_map *map = ri->map_to_flush;
++ 
++ 	ri->map_to_flush = NULL;
++ 	if (map)
++ 		__dev_map_flush(map);
++ }
++ EXPORT_SYMBOL_GPL(xdp_do_flush_map);
++ 
++ static inline bool xdp_map_invalid(const struct bpf_prog *xdp_prog,
++ 				   unsigned long aux)
++ {
++ 	return (unsigned long)xdp_prog->aux != aux;
++ }
++ 
++ static int xdp_do_redirect_map(struct net_device *dev, struct xdp_buff *xdp,
++ 			       struct bpf_prog *xdp_prog)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	unsigned long map_owner = ri->map_owner;
++ 	struct bpf_map *map = ri->map;
++ 	struct net_device *fwd = NULL;
++ 	u32 index = ri->ifindex;
++ 	int err;
++ 
++ 	ri->ifindex = 0;
++ 	ri->map = NULL;
++ 	ri->map_owner = 0;
++ 
++ 	if (unlikely(xdp_map_invalid(xdp_prog, map_owner))) {
++ 		err = -EFAULT;
++ 		map = NULL;
++ 		goto err;
++ 	}
++ 
++ 	fwd = __dev_map_lookup_elem(map, index);
++ 	if (!fwd) {
++ 		err = -EINVAL;
++ 		goto err;
++ 	}
++ 	if (ri->map_to_flush && ri->map_to_flush != map)
++ 		xdp_do_flush_map();
++ 
++ 	err = __bpf_tx_xdp(fwd, map, xdp, index);
++ 	if (unlikely(err))
++ 		goto err;
++ 
++ 	ri->map_to_flush = map;
++ 	_trace_xdp_redirect_map(dev, xdp_prog, fwd, map, index);
++ 	return 0;
++ err:
++ 	_trace_xdp_redirect_map_err(dev, xdp_prog, fwd, map, index, err);
++ 	return err;
++ }
++ 
++ int xdp_do_redirect(struct net_device *dev, struct xdp_buff *xdp,
++ 		    struct bpf_prog *xdp_prog)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	struct net_device *fwd;
++ 	u32 index = ri->ifindex;
++ 	int err;
++ 
++ 	if (ri->map)
++ 		return xdp_do_redirect_map(dev, xdp, xdp_prog);
++ 
++ 	fwd = dev_get_by_index_rcu(dev_net(dev), index);
++ 	ri->ifindex = 0;
++ 	if (unlikely(!fwd)) {
++ 		err = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	err = __bpf_tx_xdp(fwd, NULL, xdp, 0);
++ 	if (unlikely(err))
++ 		goto err;
++ 
++ 	_trace_xdp_redirect(dev, xdp_prog, index);
++ 	return 0;
++ err:
++ 	_trace_xdp_redirect_err(dev, xdp_prog, index, err);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(xdp_do_redirect);
++ 
++ int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
++ 			    struct bpf_prog *xdp_prog)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 	unsigned long map_owner = ri->map_owner;
++ 	struct bpf_map *map = ri->map;
++ 	struct net_device *fwd = NULL;
++ 	u32 index = ri->ifindex;
++ 	unsigned int len;
++ 	int err = 0;
++ 
++ 	ri->ifindex = 0;
++ 	ri->map = NULL;
++ 	ri->map_owner = 0;
++ 
++ 	if (map) {
++ 		if (unlikely(xdp_map_invalid(xdp_prog, map_owner))) {
++ 			err = -EFAULT;
++ 			map = NULL;
++ 			goto err;
++ 		}
++ 		fwd = __dev_map_lookup_elem(map, index);
++ 	} else {
++ 		fwd = dev_get_by_index_rcu(dev_net(dev), index);
++ 	}
++ 	if (unlikely(!fwd)) {
++ 		err = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	if (unlikely(!(fwd->flags & IFF_UP))) {
++ 		err = -ENETDOWN;
++ 		goto err;
++ 	}
++ 
++ 	len = fwd->mtu + fwd->hard_header_len + VLAN_HLEN;
++ 	if (skb->len > len) {
++ 		err = -EMSGSIZE;
++ 		goto err;
++ 	}
++ 
++ 	skb->dev = fwd;
++ 	map ? _trace_xdp_redirect_map(dev, xdp_prog, fwd, map, index)
++ 		: _trace_xdp_redirect(dev, xdp_prog, index);
++ 	return 0;
++ err:
++ 	map ? _trace_xdp_redirect_map_err(dev, xdp_prog, fwd, map, index, err)
++ 		: _trace_xdp_redirect_err(dev, xdp_prog, index, err);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(xdp_do_generic_redirect);
++ 
++ BPF_CALL_2(bpf_xdp_redirect, u32, ifindex, u64, flags)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 
++ 	if (unlikely(flags))
++ 		return XDP_ABORTED;
++ 
++ 	ri->ifindex = ifindex;
++ 	ri->flags = flags;
++ 	ri->map = NULL;
++ 	ri->map_owner = 0;
++ 
++ 	return XDP_REDIRECT;
++ }
++ 
++ static const struct bpf_func_proto bpf_xdp_redirect_proto = {
++ 	.func           = bpf_xdp_redirect,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_ANYTHING,
++ 	.arg2_type      = ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_4(bpf_xdp_redirect_map, struct bpf_map *, map, u32, ifindex, u64, flags,
++ 	   unsigned long, map_owner)
++ {
++ 	struct redirect_info *ri = this_cpu_ptr(&redirect_info);
++ 
++ 	if (unlikely(flags))
++ 		return XDP_ABORTED;
++ 
++ 	ri->ifindex = ifindex;
++ 	ri->flags = flags;
++ 	ri->map = map;
++ 	ri->map_owner = map_owner;
++ 
++ 	return XDP_REDIRECT;
++ }
++ 
++ /* Note, arg4 is hidden from users and populated by the verifier
++  * with the right pointer.
++  */
++ static const struct bpf_func_proto bpf_xdp_redirect_map_proto = {
++ 	.func           = bpf_xdp_redirect_map,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_CONST_MAP_PTR,
++ 	.arg2_type      = ARG_ANYTHING,
++ 	.arg3_type      = ARG_ANYTHING,
++ };
++ 
++ bool bpf_helper_changes_pkt_data(void *func)
++ {
++ 	if (func == bpf_skb_vlan_push ||
++ 	    func == bpf_skb_vlan_pop ||
++ 	    func == bpf_skb_store_bytes ||
++ 	    func == bpf_skb_change_proto ||
++ 	    func == bpf_skb_change_head ||
++ 	    func == bpf_skb_change_tail ||
++ 	    func == bpf_skb_adjust_room ||
++ 	    func == bpf_skb_pull_data ||
++ 	    func == bpf_clone_redirect ||
++ 	    func == bpf_l3_csum_replace ||
++ 	    func == bpf_l4_csum_replace ||
++ 	    func == bpf_xdp_adjust_head ||
++ 	    func == bpf_xdp_adjust_meta)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static unsigned long bpf_skb_copy(void *dst_buff, const void *skb,
++ 				  unsigned long off, unsigned long len)
++ {
++ 	void *ptr = skb_header_pointer(skb, off, len, dst_buff);
++ 
++ 	if (unlikely(!ptr))
++ 		return len;
++ 	if (ptr != dst_buff)
++ 		memcpy(dst_buff, ptr, len);
++ 
++ 	return 0;
++ }
++ 
++ BPF_CALL_5(bpf_skb_event_output, struct sk_buff *, skb, struct bpf_map *, map,
++ 	   u64, flags, void *, meta, u64, meta_size)
++ {
++ 	u64 skb_size = (flags & BPF_F_CTXLEN_MASK) >> 32;
++ 
++ 	if (unlikely(flags & ~(BPF_F_CTXLEN_MASK | BPF_F_INDEX_MASK)))
++ 		return -EINVAL;
++ 	if (unlikely(skb_size > skb->len))
++ 		return -EFAULT;
++ 
++ 	return bpf_event_output(map, flags, meta, meta_size, skb, skb_size,
++ 				bpf_skb_copy);
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_event_output_proto = {
++ 	.func		= bpf_skb_event_output,
++ 	.gpl_only	= true,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_CONST_MAP_PTR,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_PTR_TO_MEM,
++ 	.arg5_type	= ARG_CONST_SIZE,
++ };
++ 
++ static unsigned short bpf_tunnel_key_af(u64 flags)
++ {
++ 	return flags & BPF_F_TUNINFO_IPV6 ? AF_INET6 : AF_INET;
++ }
++ 
++ BPF_CALL_4(bpf_skb_get_tunnel_key, struct sk_buff *, skb, struct bpf_tunnel_key *, to,
++ 	   u32, size, u64, flags)
++ {
++ 	const struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	u8 compat[sizeof(struct bpf_tunnel_key)];
++ 	void *to_orig = to;
++ 	int err;
++ 
++ 	if (unlikely(!info || (flags & ~(BPF_F_TUNINFO_IPV6)))) {
++ 		err = -EINVAL;
++ 		goto err_clear;
++ 	}
++ 	if (ip_tunnel_info_af(info) != bpf_tunnel_key_af(flags)) {
++ 		err = -EPROTO;
++ 		goto err_clear;
++ 	}
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key))) {
++ 		err = -EINVAL;
++ 		switch (size) {
++ 		case offsetof(struct bpf_tunnel_key, tunnel_label):
++ 		case offsetof(struct bpf_tunnel_key, tunnel_ext):
++ 			goto set_compat;
++ 		case offsetof(struct bpf_tunnel_key, remote_ipv6[1]):
++ 			/* Fixup deprecated structure layouts here, so we have
++ 			 * a common path later on.
++ 			 */
++ 			if (ip_tunnel_info_af(info) != AF_INET)
++ 				goto err_clear;
++ set_compat:
++ 			to = (struct bpf_tunnel_key *)compat;
++ 			break;
++ 		default:
++ 			goto err_clear;
++ 		}
++ 	}
++ 
++ 	to->tunnel_id = be64_to_cpu(info->key.tun_id);
++ 	to->tunnel_tos = info->key.tos;
++ 	to->tunnel_ttl = info->key.ttl;
++ 
++ 	if (flags & BPF_F_TUNINFO_IPV6) {
++ 		memcpy(to->remote_ipv6, &info->key.u.ipv6.src,
++ 		       sizeof(to->remote_ipv6));
++ 		to->tunnel_label = be32_to_cpu(info->key.label);
++ 	} else {
++ 		to->remote_ipv4 = be32_to_cpu(info->key.u.ipv4.src);
++ 	}
++ 
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key)))
++ 		memcpy(to_orig, to, size);
++ 
++ 	return 0;
++ err_clear:
++ 	memset(to_orig, 0, size);
++ 	return err;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_get_tunnel_key_proto = {
++ 	.func		= bpf_skb_get_tunnel_key,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_3(bpf_skb_get_tunnel_opt, struct sk_buff *, skb, u8 *, to, u32, size)
++ {
++ 	const struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	int err;
++ 
++ 	if (unlikely(!info ||
++ 		     !(info->key.tun_flags & TUNNEL_OPTIONS_PRESENT))) {
++ 		err = -ENOENT;
++ 		goto err_clear;
++ 	}
++ 	if (unlikely(size < info->options_len)) {
++ 		err = -ENOMEM;
++ 		goto err_clear;
++ 	}
++ 
++ 	ip_tunnel_info_opts_get(to, info);
++ 	if (size > info->options_len)
++ 		memset(to + info->options_len, 0, size - info->options_len);
++ 
++ 	return info->options_len;
++ err_clear:
++ 	memset(to, 0, size);
++ 	return err;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_get_tunnel_opt_proto = {
++ 	.func		= bpf_skb_get_tunnel_opt,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ static struct metadata_dst __percpu *md_dst;
++ 
++ BPF_CALL_4(bpf_skb_set_tunnel_key, struct sk_buff *, skb,
++ 	   const struct bpf_tunnel_key *, from, u32, size, u64, flags)
++ {
++ 	struct metadata_dst *md = this_cpu_ptr(md_dst);
++ 	u8 compat[sizeof(struct bpf_tunnel_key)];
++ 	struct ip_tunnel_info *info;
++ 
++ 	if (unlikely(flags & ~(BPF_F_TUNINFO_IPV6 | BPF_F_ZERO_CSUM_TX |
++ 			       BPF_F_DONT_FRAGMENT)))
++ 		return -EINVAL;
++ 	if (unlikely(size != sizeof(struct bpf_tunnel_key))) {
++ 		switch (size) {
++ 		case offsetof(struct bpf_tunnel_key, tunnel_label):
++ 		case offsetof(struct bpf_tunnel_key, tunnel_ext):
++ 		case offsetof(struct bpf_tunnel_key, remote_ipv6[1]):
++ 			/* Fixup deprecated structure layouts here, so we have
++ 			 * a common path later on.
++ 			 */
++ 			memcpy(compat, from, size);
++ 			memset(compat + size, 0, sizeof(compat) - size);
++ 			from = (const struct bpf_tunnel_key *) compat;
++ 			break;
++ 		default:
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	if (unlikely((!(flags & BPF_F_TUNINFO_IPV6) && from->tunnel_label) ||
++ 		     from->tunnel_ext))
++ 		return -EINVAL;
++ 
++ 	skb_dst_drop(skb);
++ 	dst_hold((struct dst_entry *) md);
++ 	skb_dst_set(skb, (struct dst_entry *) md);
++ 
++ 	info = &md->u.tun_info;
++ 	info->mode = IP_TUNNEL_INFO_TX;
++ 
++ 	info->key.tun_flags = TUNNEL_KEY | TUNNEL_CSUM | TUNNEL_NOCACHE;
++ 	if (flags & BPF_F_DONT_FRAGMENT)
++ 		info->key.tun_flags |= TUNNEL_DONT_FRAGMENT;
++ 
++ 	info->key.tun_id = cpu_to_be64(from->tunnel_id);
++ 	info->key.tos = from->tunnel_tos;
++ 	info->key.ttl = from->tunnel_ttl;
++ 
++ 	if (flags & BPF_F_TUNINFO_IPV6) {
++ 		info->mode |= IP_TUNNEL_INFO_IPV6;
++ 		memcpy(&info->key.u.ipv6.dst, from->remote_ipv6,
++ 		       sizeof(from->remote_ipv6));
++ 		info->key.label = cpu_to_be32(from->tunnel_label) &
++ 				  IPV6_FLOWLABEL_MASK;
++ 	} else {
++ 		info->key.u.ipv4.dst = cpu_to_be32(from->remote_ipv4);
++ 		if (flags & BPF_F_ZERO_CSUM_TX)
++ 			info->key.tun_flags &= ~TUNNEL_CSUM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_set_tunnel_key_proto = {
++ 	.func		= bpf_skb_set_tunnel_key,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_3(bpf_skb_set_tunnel_opt, struct sk_buff *, skb,
++ 	   const u8 *, from, u32, size)
++ {
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	const struct metadata_dst *md = this_cpu_ptr(md_dst);
++ 
++ 	if (unlikely(info != &md->u.tun_info || (size & (sizeof(u32) - 1))))
++ 		return -EINVAL;
++ 	if (unlikely(size > IP_TUNNEL_OPTS_MAX))
++ 		return -ENOMEM;
++ 
++ 	ip_tunnel_info_opts_set(info, from, size);
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_set_tunnel_opt_proto = {
++ 	.func		= bpf_skb_set_tunnel_opt,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ static const struct bpf_func_proto *
++ bpf_get_skb_set_tunnel_proto(enum bpf_func_id which)
++ {
++ 	if (!md_dst) {
++ 		/* Race is not possible, since it's called from verifier
++ 		 * that is holding verifier mutex.
++ 		 */
++ 		md_dst = metadata_dst_alloc_percpu(IP_TUNNEL_OPTS_MAX,
++ 						   METADATA_IP_TUNNEL,
++ 						   GFP_KERNEL);
++ 		if (!md_dst)
++ 			return NULL;
++ 	}
++ 
++ 	switch (which) {
++ 	case BPF_FUNC_skb_set_tunnel_key:
++ 		return &bpf_skb_set_tunnel_key_proto;
++ 	case BPF_FUNC_skb_set_tunnel_opt:
++ 		return &bpf_skb_set_tunnel_opt_proto;
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ BPF_CALL_3(bpf_skb_under_cgroup, struct sk_buff *, skb, struct bpf_map *, map,
++ 	   u32, idx)
++ {
++ 	struct bpf_array *array = container_of(map, struct bpf_array, map);
++ 	struct cgroup *cgrp;
++ 	struct sock *sk;
++ 
++ 	sk = skb_to_full_sk(skb);
++ 	if (!sk || !sk_fullsock(sk))
++ 		return -ENOENT;
++ 	if (unlikely(idx >= array->map.max_entries))
++ 		return -E2BIG;
++ 
++ 	cgrp = READ_ONCE(array->ptrs[idx]);
++ 	if (unlikely(!cgrp))
++ 		return -EAGAIN;
++ 
++ 	return sk_under_cgroup_hierarchy(sk, cgrp);
++ }
++ 
++ static const struct bpf_func_proto bpf_skb_under_cgroup_proto = {
++ 	.func		= bpf_skb_under_cgroup,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_CONST_MAP_PTR,
++ 	.arg3_type	= ARG_ANYTHING,
++ };
++ 
++ static unsigned long bpf_xdp_copy(void *dst_buff, const void *src_buff,
++ 				  unsigned long off, unsigned long len)
++ {
++ 	memcpy(dst_buff, src_buff + off, len);
++ 	return 0;
++ }
++ 
++ BPF_CALL_5(bpf_xdp_event_output, struct xdp_buff *, xdp, struct bpf_map *, map,
++ 	   u64, flags, void *, meta, u64, meta_size)
++ {
++ 	u64 xdp_size = (flags & BPF_F_CTXLEN_MASK) >> 32;
++ 
++ 	if (unlikely(flags & ~(BPF_F_CTXLEN_MASK | BPF_F_INDEX_MASK)))
++ 		return -EINVAL;
++ 	if (unlikely(xdp_size > (unsigned long)(xdp->data_end - xdp->data)))
++ 		return -EFAULT;
++ 
++ 	return bpf_event_output(map, flags, meta, meta_size, xdp->data,
++ 				xdp_size, bpf_xdp_copy);
++ }
++ 
++ static const struct bpf_func_proto bpf_xdp_event_output_proto = {
++ 	.func		= bpf_xdp_event_output,
++ 	.gpl_only	= true,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_CONST_MAP_PTR,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_PTR_TO_MEM,
++ 	.arg5_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_1(bpf_get_socket_cookie, struct sk_buff *, skb)
++ {
++ 	return skb->sk ? sock_gen_cookie(skb->sk) : 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_get_socket_cookie_proto = {
++ 	.func           = bpf_get_socket_cookie,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ BPF_CALL_1(bpf_get_socket_uid, struct sk_buff *, skb)
++ {
++ 	struct sock *sk = sk_to_full_sk(skb->sk);
++ 	kuid_t kuid;
++ 
++ 	if (!sk || !sk_fullsock(sk))
++ 		return overflowuid;
++ 	kuid = sock_net_uid(sock_net(sk), sk);
++ 	return from_kuid_munged(sock_net(sk)->user_ns, kuid);
++ }
++ 
++ static const struct bpf_func_proto bpf_get_socket_uid_proto = {
++ 	.func           = bpf_get_socket_uid,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ };
++ 
++ BPF_CALL_5(bpf_setsockopt, struct bpf_sock_ops_kern *, bpf_sock,
++ 	   int, level, int, optname, char *, optval, int, optlen)
++ {
++ 	struct sock *sk = bpf_sock->sk;
++ 	int ret = 0;
++ 	int val;
++ 
++ 	if (!sk_fullsock(sk))
++ 		return -EINVAL;
++ 
++ 	if (level == SOL_SOCKET) {
++ 		if (optlen != sizeof(int))
++ 			return -EINVAL;
++ 		val = *((int *)optval);
++ 
++ 		/* Only some socketops are supported */
++ 		switch (optname) {
++ 		case SO_RCVBUF:
++ 			sk->sk_userlocks |= SOCK_RCVBUF_LOCK;
++ 			sk->sk_rcvbuf = max_t(int, val * 2, SOCK_MIN_RCVBUF);
++ 			break;
++ 		case SO_SNDBUF:
++ 			sk->sk_userlocks |= SOCK_SNDBUF_LOCK;
++ 			sk->sk_sndbuf = max_t(int, val * 2, SOCK_MIN_SNDBUF);
++ 			break;
++ 		case SO_MAX_PACING_RATE:
++ 			sk->sk_max_pacing_rate = val;
++ 			sk->sk_pacing_rate = min(sk->sk_pacing_rate,
++ 						 sk->sk_max_pacing_rate);
++ 			break;
++ 		case SO_PRIORITY:
++ 			sk->sk_priority = val;
++ 			break;
++ 		case SO_RCVLOWAT:
++ 			if (val < 0)
++ 				val = INT_MAX;
++ 			sk->sk_rcvlowat = val ? : 1;
++ 			break;
++ 		case SO_MARK:
++ 			sk->sk_mark = val;
++ 			break;
++ 		default:
++ 			ret = -EINVAL;
++ 		}
++ #ifdef CONFIG_INET
++ 	} else if (level == SOL_TCP &&
++ 		   sk->sk_prot->setsockopt == tcp_setsockopt) {
++ 		if (optname == TCP_CONGESTION) {
++ 			char name[TCP_CA_NAME_MAX];
++ 			bool reinit = bpf_sock->op > BPF_SOCK_OPS_NEEDS_ECN;
++ 
++ 			strncpy(name, optval, min_t(long, optlen,
++ 						    TCP_CA_NAME_MAX-1));
++ 			name[TCP_CA_NAME_MAX-1] = 0;
++ 			ret = tcp_set_congestion_control(sk, name, false, reinit);
++ 		} else {
++ 			struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 			if (optlen != sizeof(int))
++ 				return -EINVAL;
++ 
++ 			val = *((int *)optval);
++ 			/* Only some options are supported */
++ 			switch (optname) {
++ 			case TCP_BPF_IW:
++ 				if (val <= 0 || tp->data_segs_out > 0)
++ 					ret = -EINVAL;
++ 				else
++ 					tp->snd_cwnd = val;
++ 				break;
++ 			case TCP_BPF_SNDCWND_CLAMP:
++ 				if (val <= 0) {
++ 					ret = -EINVAL;
++ 				} else {
++ 					tp->snd_cwnd_clamp = val;
++ 					tp->snd_ssthresh = val;
++ 				}
++ 				break;
++ 			default:
++ 				ret = -EINVAL;
++ 			}
++ 		}
++ #endif
++ 	} else {
++ 		ret = -EINVAL;
++ 	}
++ 	return ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_setsockopt_proto = {
++ 	.func		= bpf_setsockopt,
++ 	.gpl_only	= true,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_PTR_TO_MEM,
++ 	.arg5_type	= ARG_CONST_SIZE,
++ };
++ 
++ static const struct bpf_func_proto *
++ bpf_base_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_map_lookup_elem:
++ 		return &bpf_map_lookup_elem_proto;
++ 	case BPF_FUNC_map_update_elem:
++ 		return &bpf_map_update_elem_proto;
++ 	case BPF_FUNC_map_delete_elem:
++ 		return &bpf_map_delete_elem_proto;
++ 	case BPF_FUNC_get_prandom_u32:
++ 		return &bpf_get_prandom_u32_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_raw_smp_processor_id_proto;
++ 	case BPF_FUNC_get_numa_node_id:
++ 		return &bpf_get_numa_node_id_proto;
++ 	case BPF_FUNC_tail_call:
++ 		return &bpf_tail_call_proto;
++ 	case BPF_FUNC_ktime_get_ns:
++ 		return &bpf_ktime_get_ns_proto;
++ 	case BPF_FUNC_trace_printk:
++ 		if (capable(CAP_SYS_ADMIN))
++ 			return bpf_get_trace_printk_proto();
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ sock_filter_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	/* inet and inet6 sockets are created in a process
++ 	 * context so there is always a valid uid/gid
++ 	 */
++ 	case BPF_FUNC_get_current_uid_gid:
++ 		return &bpf_get_current_uid_gid_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ sk_filter_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_load_bytes:
++ 		return &bpf_skb_load_bytes_proto;
++ 	case BPF_FUNC_get_socket_cookie:
++ 		return &bpf_get_socket_cookie_proto;
++ 	case BPF_FUNC_get_socket_uid:
++ 		return &bpf_get_socket_uid_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ tc_cls_act_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_store_bytes:
++ 		return &bpf_skb_store_bytes_proto;
++ 	case BPF_FUNC_skb_load_bytes:
++ 		return &bpf_skb_load_bytes_proto;
++ 	case BPF_FUNC_skb_pull_data:
++ 		return &bpf_skb_pull_data_proto;
++ 	case BPF_FUNC_csum_diff:
++ 		return &bpf_csum_diff_proto;
++ 	case BPF_FUNC_csum_update:
++ 		return &bpf_csum_update_proto;
++ 	case BPF_FUNC_l3_csum_replace:
++ 		return &bpf_l3_csum_replace_proto;
++ 	case BPF_FUNC_l4_csum_replace:
++ 		return &bpf_l4_csum_replace_proto;
++ 	case BPF_FUNC_clone_redirect:
++ 		return &bpf_clone_redirect_proto;
++ 	case BPF_FUNC_get_cgroup_classid:
++ 		return &bpf_get_cgroup_classid_proto;
++ 	case BPF_FUNC_skb_vlan_push:
++ 		return &bpf_skb_vlan_push_proto;
++ 	case BPF_FUNC_skb_vlan_pop:
++ 		return &bpf_skb_vlan_pop_proto;
++ 	case BPF_FUNC_skb_change_proto:
++ 		return &bpf_skb_change_proto_proto;
++ 	case BPF_FUNC_skb_change_type:
++ 		return &bpf_skb_change_type_proto;
++ 	case BPF_FUNC_skb_adjust_room:
++ 		return &bpf_skb_adjust_room_proto;
++ 	case BPF_FUNC_skb_change_tail:
++ 		return &bpf_skb_change_tail_proto;
++ 	case BPF_FUNC_skb_get_tunnel_key:
++ 		return &bpf_skb_get_tunnel_key_proto;
++ 	case BPF_FUNC_skb_set_tunnel_key:
++ 		return bpf_get_skb_set_tunnel_proto(func_id);
++ 	case BPF_FUNC_skb_get_tunnel_opt:
++ 		return &bpf_skb_get_tunnel_opt_proto;
++ 	case BPF_FUNC_skb_set_tunnel_opt:
++ 		return bpf_get_skb_set_tunnel_proto(func_id);
++ 	case BPF_FUNC_redirect:
++ 		return &bpf_redirect_proto;
++ 	case BPF_FUNC_get_route_realm:
++ 		return &bpf_get_route_realm_proto;
++ 	case BPF_FUNC_get_hash_recalc:
++ 		return &bpf_get_hash_recalc_proto;
++ 	case BPF_FUNC_set_hash_invalid:
++ 		return &bpf_set_hash_invalid_proto;
++ 	case BPF_FUNC_set_hash:
++ 		return &bpf_set_hash_proto;
++ 	case BPF_FUNC_perf_event_output:
++ 		return &bpf_skb_event_output_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_smp_processor_id_proto;
++ 	case BPF_FUNC_skb_under_cgroup:
++ 		return &bpf_skb_under_cgroup_proto;
++ 	case BPF_FUNC_get_socket_cookie:
++ 		return &bpf_get_socket_cookie_proto;
++ 	case BPF_FUNC_get_socket_uid:
++ 		return &bpf_get_socket_uid_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ xdp_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_perf_event_output:
++ 		return &bpf_xdp_event_output_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_smp_processor_id_proto;
++ 	case BPF_FUNC_xdp_adjust_head:
++ 		return &bpf_xdp_adjust_head_proto;
++ 	case BPF_FUNC_xdp_adjust_meta:
++ 		return &bpf_xdp_adjust_meta_proto;
++ 	case BPF_FUNC_redirect:
++ 		return &bpf_xdp_redirect_proto;
++ 	case BPF_FUNC_redirect_map:
++ 		return &bpf_xdp_redirect_map_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ lwt_inout_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_load_bytes:
++ 		return &bpf_skb_load_bytes_proto;
++ 	case BPF_FUNC_skb_pull_data:
++ 		return &bpf_skb_pull_data_proto;
++ 	case BPF_FUNC_csum_diff:
++ 		return &bpf_csum_diff_proto;
++ 	case BPF_FUNC_get_cgroup_classid:
++ 		return &bpf_get_cgroup_classid_proto;
++ 	case BPF_FUNC_get_route_realm:
++ 		return &bpf_get_route_realm_proto;
++ 	case BPF_FUNC_get_hash_recalc:
++ 		return &bpf_get_hash_recalc_proto;
++ 	case BPF_FUNC_perf_event_output:
++ 		return &bpf_skb_event_output_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_smp_processor_id_proto;
++ 	case BPF_FUNC_skb_under_cgroup:
++ 		return &bpf_skb_under_cgroup_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ 	sock_ops_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_setsockopt:
++ 		return &bpf_setsockopt_proto;
++ 	case BPF_FUNC_sock_map_update:
++ 		return &bpf_sock_map_update_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *sk_skb_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_store_bytes:
++ 		return &bpf_skb_store_bytes_proto;
++ 	case BPF_FUNC_skb_load_bytes:
++ 		return &bpf_skb_load_bytes_proto;
++ 	case BPF_FUNC_skb_pull_data:
++ 		return &bpf_skb_pull_data_proto;
++ 	case BPF_FUNC_skb_change_tail:
++ 		return &bpf_skb_change_tail_proto;
++ 	case BPF_FUNC_skb_change_head:
++ 		return &bpf_skb_change_head_proto;
++ 	case BPF_FUNC_get_socket_cookie:
++ 		return &bpf_get_socket_cookie_proto;
++ 	case BPF_FUNC_get_socket_uid:
++ 		return &bpf_get_socket_uid_proto;
++ 	case BPF_FUNC_sk_redirect_map:
++ 		return &bpf_sk_redirect_map_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ lwt_xmit_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_get_tunnel_key:
++ 		return &bpf_skb_get_tunnel_key_proto;
++ 	case BPF_FUNC_skb_set_tunnel_key:
++ 		return bpf_get_skb_set_tunnel_proto(func_id);
++ 	case BPF_FUNC_skb_get_tunnel_opt:
++ 		return &bpf_skb_get_tunnel_opt_proto;
++ 	case BPF_FUNC_skb_set_tunnel_opt:
++ 		return bpf_get_skb_set_tunnel_proto(func_id);
++ 	case BPF_FUNC_redirect:
++ 		return &bpf_redirect_proto;
++ 	case BPF_FUNC_clone_redirect:
++ 		return &bpf_clone_redirect_proto;
++ 	case BPF_FUNC_skb_change_tail:
++ 		return &bpf_skb_change_tail_proto;
++ 	case BPF_FUNC_skb_change_head:
++ 		return &bpf_skb_change_head_proto;
++ 	case BPF_FUNC_skb_store_bytes:
++ 		return &bpf_skb_store_bytes_proto;
++ 	case BPF_FUNC_csum_update:
++ 		return &bpf_csum_update_proto;
++ 	case BPF_FUNC_l3_csum_replace:
++ 		return &bpf_l3_csum_replace_proto;
++ 	case BPF_FUNC_l4_csum_replace:
++ 		return &bpf_l4_csum_replace_proto;
++ 	case BPF_FUNC_set_hash_invalid:
++ 		return &bpf_set_hash_invalid_proto;
++ 	default:
++ 		return lwt_inout_func_proto(func_id);
++ 	}
++ }
++ 
++ static bool bpf_skb_is_valid_access(int off, int size, enum bpf_access_type type,
++ 				    struct bpf_insn_access_aux *info)
++ {
++ 	const int size_default = sizeof(__u32);
++ 
++ 	if (off < 0 || off >= sizeof(struct __sk_buff))
++ 		return false;
++ 
++ 	/* The verifier guarantees that size > 0. */
++ 	if (off % size != 0)
++ 		return false;
++ 
++ 	switch (off) {
++ 	case bpf_ctx_range_till(struct __sk_buff, cb[0], cb[4]):
++ 		if (off + size > offsetofend(struct __sk_buff, cb[4]))
++ 			return false;
++ 		break;
++ 	case bpf_ctx_range_till(struct __sk_buff, remote_ip6[0], remote_ip6[3]):
++ 	case bpf_ctx_range_till(struct __sk_buff, local_ip6[0], local_ip6[3]):
++ 	case bpf_ctx_range_till(struct __sk_buff, remote_ip4, remote_ip4):
++ 	case bpf_ctx_range_till(struct __sk_buff, local_ip4, local_ip4):
++ 	case bpf_ctx_range(struct __sk_buff, data):
++ 	case bpf_ctx_range(struct __sk_buff, data_meta):
++ 	case bpf_ctx_range(struct __sk_buff, data_end):
++ 		if (size != size_default)
++ 			return false;
++ 		break;
++ 	default:
++ 		/* Only narrow read access allowed for now. */
++ 		if (type == BPF_WRITE) {
++ 			if (size != size_default)
++ 				return false;
++ 		} else {
++ 			bpf_ctx_record_field_size(info, size_default);
++ 			if (!bpf_ctx_narrow_access_ok(off, size, size_default))
++ 				return false;
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static bool sk_filter_is_valid_access(int off, int size,
++ 				      enum bpf_access_type type,
++ 				      struct bpf_insn_access_aux *info)
++ {
++ 	switch (off) {
++ 	case bpf_ctx_range(struct __sk_buff, tc_classid):
++ 	case bpf_ctx_range(struct __sk_buff, data):
++ 	case bpf_ctx_range(struct __sk_buff, data_meta):
++ 	case bpf_ctx_range(struct __sk_buff, data_end):
++ 	case bpf_ctx_range_till(struct __sk_buff, family, local_port):
++ 		return false;
++ 	}
++ 
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case bpf_ctx_range_till(struct __sk_buff, cb[0], cb[4]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return bpf_skb_is_valid_access(off, size, type, info);
++ }
++ 
++ static bool lwt_is_valid_access(int off, int size,
++ 				enum bpf_access_type type,
++ 				struct bpf_insn_access_aux *info)
++ {
++ 	switch (off) {
++ 	case bpf_ctx_range(struct __sk_buff, tc_classid):
++ 	case bpf_ctx_range_till(struct __sk_buff, family, local_port):
++ 	case bpf_ctx_range(struct __sk_buff, data_meta):
++ 		return false;
++ 	}
++ 
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case bpf_ctx_range(struct __sk_buff, mark):
++ 		case bpf_ctx_range(struct __sk_buff, priority):
++ 		case bpf_ctx_range_till(struct __sk_buff, cb[0], cb[4]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	switch (off) {
++ 	case bpf_ctx_range(struct __sk_buff, data):
++ 		info->reg_type = PTR_TO_PACKET;
++ 		break;
++ 	case bpf_ctx_range(struct __sk_buff, data_end):
++ 		info->reg_type = PTR_TO_PACKET_END;
++ 		break;
++ 	}
++ 
++ 	return bpf_skb_is_valid_access(off, size, type, info);
++ }
++ 
++ static bool sock_filter_is_valid_access(int off, int size,
++ 					enum bpf_access_type type,
++ 					struct bpf_insn_access_aux *info)
++ {
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct bpf_sock, bound_dev_if):
++ 		case offsetof(struct bpf_sock, mark):
++ 		case offsetof(struct bpf_sock, priority):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	if (off < 0 || off + size > sizeof(struct bpf_sock))
++ 		return false;
++ 	/* The verifier guarantees that size > 0. */
++ 	if (off % size != 0)
++ 		return false;
++ 	if (size != sizeof(__u32))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static int bpf_unclone_prologue(struct bpf_insn *insn_buf, bool direct_write,
++ 				const struct bpf_prog *prog, int drop_verdict)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	if (!direct_write)
++ 		return 0;
++ 
++ 	/* if (!skb->cloned)
++ 	 *       goto start;
++ 	 *
++ 	 * (Fast-path, otherwise approximation that we might be
++ 	 *  a clone, do the rest in helper.)
++ 	 */
++ 	*insn++ = BPF_LDX_MEM(BPF_B, BPF_REG_6, BPF_REG_1, CLONED_OFFSET());
++ 	*insn++ = BPF_ALU32_IMM(BPF_AND, BPF_REG_6, CLONED_MASK);
++ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, BPF_REG_6, 0, 7);
++ 
++ 	/* ret = bpf_skb_pull_data(skb, 0); */
++ 	*insn++ = BPF_MOV64_REG(BPF_REG_6, BPF_REG_1);
++ 	*insn++ = BPF_ALU64_REG(BPF_XOR, BPF_REG_2, BPF_REG_2);
++ 	*insn++ = BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
++ 			       BPF_FUNC_skb_pull_data);
++ 	/* if (!ret)
++ 	 *      goto restore;
++ 	 * return TC_ACT_SHOT;
++ 	 */
++ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 2);
++ 	*insn++ = BPF_ALU32_IMM(BPF_MOV, BPF_REG_0, drop_verdict);
++ 	*insn++ = BPF_EXIT_INSN();
++ 
++ 	/* restore: */
++ 	*insn++ = BPF_MOV64_REG(BPF_REG_1, BPF_REG_6);
++ 	/* start: */
++ 	*insn++ = prog->insnsi[0];
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static int tc_cls_act_prologue(struct bpf_insn *insn_buf, bool direct_write,
++ 			       const struct bpf_prog *prog)
++ {
++ 	return bpf_unclone_prologue(insn_buf, direct_write, prog, TC_ACT_SHOT);
++ }
++ 
++ static bool tc_cls_act_is_valid_access(int off, int size,
++ 				       enum bpf_access_type type,
++ 				       struct bpf_insn_access_aux *info)
++ {
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case bpf_ctx_range(struct __sk_buff, mark):
++ 		case bpf_ctx_range(struct __sk_buff, tc_index):
++ 		case bpf_ctx_range(struct __sk_buff, priority):
++ 		case bpf_ctx_range(struct __sk_buff, tc_classid):
++ 		case bpf_ctx_range_till(struct __sk_buff, cb[0], cb[4]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	switch (off) {
++ 	case bpf_ctx_range(struct __sk_buff, data):
++ 		info->reg_type = PTR_TO_PACKET;
++ 		break;
++ 	case bpf_ctx_range(struct __sk_buff, data_meta):
++ 		info->reg_type = PTR_TO_PACKET_META;
++ 		break;
++ 	case bpf_ctx_range(struct __sk_buff, data_end):
++ 		info->reg_type = PTR_TO_PACKET_END;
++ 		break;
++ 	case bpf_ctx_range_till(struct __sk_buff, family, local_port):
++ 		return false;
++ 	}
++ 
++ 	return bpf_skb_is_valid_access(off, size, type, info);
++ }
++ 
++ static bool __is_valid_xdp_access(int off, int size)
++ {
++ 	if (off < 0 || off >= sizeof(struct xdp_md))
++ 		return false;
++ 	if (off % size != 0)
++ 		return false;
++ 	if (size != sizeof(__u32))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool xdp_is_valid_access(int off, int size,
++ 				enum bpf_access_type type,
++ 				struct bpf_insn_access_aux *info)
++ {
++ 	if (type == BPF_WRITE)
++ 		return false;
++ 
++ 	switch (off) {
++ 	case offsetof(struct xdp_md, data):
++ 		info->reg_type = PTR_TO_PACKET;
++ 		break;
++ 	case offsetof(struct xdp_md, data_meta):
++ 		info->reg_type = PTR_TO_PACKET_META;
++ 		break;
++ 	case offsetof(struct xdp_md, data_end):
++ 		info->reg_type = PTR_TO_PACKET_END;
++ 		break;
++ 	}
++ 
++ 	return __is_valid_xdp_access(off, size);
++ }
++ 
++ void bpf_warn_invalid_xdp_action(u32 act)
++ {
++ 	const u32 act_max = XDP_REDIRECT;
++ 
++ 	WARN_ONCE(1, "%s XDP return value %u, expect packet loss!\n",
++ 		  act > act_max ? "Illegal" : "Driver unsupported",
++ 		  act);
++ }
++ EXPORT_SYMBOL_GPL(bpf_warn_invalid_xdp_action);
++ 
++ static bool __is_valid_sock_ops_access(int off, int size)
++ {
++ 	if (off < 0 || off >= sizeof(struct bpf_sock_ops))
++ 		return false;
++ 	/* The verifier guarantees that size > 0. */
++ 	if (off % size != 0)
++ 		return false;
++ 	if (size != sizeof(__u32))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool sock_ops_is_valid_access(int off, int size,
++ 				     enum bpf_access_type type,
++ 				     struct bpf_insn_access_aux *info)
++ {
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct bpf_sock_ops, op) ...
++ 		     offsetof(struct bpf_sock_ops, replylong[3]):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return __is_valid_sock_ops_access(off, size);
++ }
++ 
++ static int sk_skb_prologue(struct bpf_insn *insn_buf, bool direct_write,
++ 			   const struct bpf_prog *prog)
++ {
++ 	return bpf_unclone_prologue(insn_buf, direct_write, prog, SK_DROP);
++ }
++ 
++ static bool sk_skb_is_valid_access(int off, int size,
++ 				   enum bpf_access_type type,
++ 				   struct bpf_insn_access_aux *info)
++ {
++ 	switch (off) {
++ 	case bpf_ctx_range(struct __sk_buff, tc_classid):
++ 	case bpf_ctx_range(struct __sk_buff, data_meta):
++ 		return false;
++ 	}
++ 
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case bpf_ctx_range(struct __sk_buff, mark):
++ 		case bpf_ctx_range(struct __sk_buff, tc_index):
++ 		case bpf_ctx_range(struct __sk_buff, priority):
++ 			break;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	switch (off) {
++ 	case bpf_ctx_range(struct __sk_buff, data):
++ 		info->reg_type = PTR_TO_PACKET;
++ 		break;
++ 	case bpf_ctx_range(struct __sk_buff, data_end):
++ 		info->reg_type = PTR_TO_PACKET_END;
++ 		break;
++ 	}
++ 
++ 	return bpf_skb_is_valid_access(off, size, type, info);
++ }
++ 
++ static u32 bpf_convert_ctx_access(enum bpf_access_type type,
++ 				  const struct bpf_insn *si,
++ 				  struct bpf_insn *insn_buf,
++ 				  struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 	int off;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct __sk_buff, len):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, len, 4,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, protocol):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, protocol, 2,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, vlan_proto):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, vlan_proto, 2,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, priority):
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					      bpf_target_off(struct sk_buff, priority, 4,
++ 							     target_size));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					      bpf_target_off(struct sk_buff, priority, 4,
++ 							     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, ingress_ifindex):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, skb_iif, 4,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, ifindex):
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, dev),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, dev));
++ 		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct net_device, ifindex, 4,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, hash):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, hash, 4,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, mark):
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					      bpf_target_off(struct sk_buff, mark, 4,
++ 							     target_size));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					      bpf_target_off(struct sk_buff, mark, 4,
++ 							     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, pkt_type):
++ 		*target_size = 1;
++ 		*insn++ = BPF_LDX_MEM(BPF_B, si->dst_reg, si->src_reg,
++ 				      PKT_TYPE_OFFSET());
++ 		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, PKT_TYPE_MAX);
++ #ifdef __BIG_ENDIAN_BITFIELD
++ 		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, 5);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, queue_mapping):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, queue_mapping, 2,
++ 						     target_size));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, vlan_present):
++ 	case offsetof(struct __sk_buff, vlan_tci):
++ 		BUILD_BUG_ON(VLAN_TAG_PRESENT != 0x1000);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, vlan_tci, 2,
++ 						     target_size));
++ 		if (si->off == offsetof(struct __sk_buff, vlan_tci)) {
++ 			*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg,
++ 						~VLAN_TAG_PRESENT);
++ 		} else {
++ 			*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, 12);
++ 			*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, 1);
++ 		}
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, cb[0]) ...
++ 	     offsetofend(struct __sk_buff, cb[4]) - 1:
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct qdisc_skb_cb, data) < 20);
++ 		BUILD_BUG_ON((offsetof(struct sk_buff, cb) +
++ 			      offsetof(struct qdisc_skb_cb, data)) %
++ 			     sizeof(__u64));
++ 
++ 		prog->cb_access = 1;
++ 		off  = si->off;
++ 		off -= offsetof(struct __sk_buff, cb[0]);
++ 		off += offsetof(struct sk_buff, cb);
++ 		off += offsetof(struct qdisc_skb_cb, data);
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_SIZE(si->code), si->dst_reg,
++ 					      si->src_reg, off);
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_SIZE(si->code), si->dst_reg,
++ 					      si->src_reg, off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, tc_classid):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct qdisc_skb_cb, tc_classid) != 2);
++ 
++ 		off  = si->off;
++ 		off -= offsetof(struct __sk_buff, tc_classid);
++ 		off += offsetof(struct sk_buff, cb);
++ 		off += offsetof(struct qdisc_skb_cb, tc_classid);
++ 		*target_size = 2;
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_H, si->dst_reg,
++ 					      si->src_reg, off);
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg,
++ 					      si->src_reg, off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, data):
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, data),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, data));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, data_meta):
++ 		off  = si->off;
++ 		off -= offsetof(struct __sk_buff, data_meta);
++ 		off += offsetof(struct sk_buff, cb);
++ 		off += offsetof(struct bpf_skb_data_end, data_meta);
++ 		*insn++ = BPF_LDX_MEM(BPF_SIZEOF(void *), si->dst_reg,
++ 				      si->src_reg, off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, data_end):
++ 		off  = si->off;
++ 		off -= offsetof(struct __sk_buff, data_end);
++ 		off += offsetof(struct sk_buff, cb);
++ 		off += offsetof(struct bpf_skb_data_end, data_end);
++ 		*insn++ = BPF_LDX_MEM(BPF_SIZEOF(void *), si->dst_reg,
++ 				      si->src_reg, off);
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, tc_index):
++ #ifdef CONFIG_NET_SCHED
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 					      bpf_target_off(struct sk_buff, tc_index, 2,
++ 							     target_size));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 					      bpf_target_off(struct sk_buff, tc_index, 2,
++ 							     target_size));
++ #else
++ 		*target_size = 2;
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_MOV64_REG(si->dst_reg, si->dst_reg);
++ 		else
++ 			*insn++ = BPF_MOV64_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, napi_id):
++ #if defined(CONFIG_NET_RX_BUSY_POLL)
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct sk_buff, napi_id, 4,
++ 						     target_size));
++ 		*insn++ = BPF_JMP_IMM(BPF_JGE, si->dst_reg, MIN_NAPI_ID, 1);
++ 		*insn++ = BPF_MOV64_IMM(si->dst_reg, 0);
++ #else
++ 		*target_size = 4;
++ 		*insn++ = BPF_MOV64_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 	case offsetof(struct __sk_buff, family):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_family) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct sock_common,
++ 						     skc_family,
++ 						     2, target_size));
++ 		break;
++ 	case offsetof(struct __sk_buff, remote_ip4):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_daddr) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct sock_common,
++ 						     skc_daddr,
++ 						     4, target_size));
++ 		break;
++ 	case offsetof(struct __sk_buff, local_ip4):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common,
++ 					  skc_rcv_saddr) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct sock_common,
++ 						     skc_rcv_saddr,
++ 						     4, target_size));
++ 		break;
++ 	case offsetof(struct __sk_buff, remote_ip6[0]) ...
++ 	     offsetof(struct __sk_buff, remote_ip6[3]):
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common,
++ 					  skc_v6_daddr.s6_addr32[0]) != 4);
++ 
++ 		off = si->off;
++ 		off -= offsetof(struct __sk_buff, remote_ip6[0]);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common,
++ 					       skc_v6_daddr.s6_addr32[0]) +
++ 				      off);
++ #else
++ 		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 	case offsetof(struct __sk_buff, local_ip6[0]) ...
++ 	     offsetof(struct __sk_buff, local_ip6[3]):
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common,
++ 					  skc_v6_rcv_saddr.s6_addr32[0]) != 4);
++ 
++ 		off = si->off;
++ 		off -= offsetof(struct __sk_buff, local_ip6[0]);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common,
++ 					       skc_v6_rcv_saddr.s6_addr32[0]) +
++ 				      off);
++ #else
++ 		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, remote_port):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_dport) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct sock_common,
++ 						     skc_dport,
++ 						     2, target_size));
++ #ifndef __BIG_ENDIAN_BITFIELD
++ 		*insn++ = BPF_ALU32_IMM(BPF_LSH, si->dst_reg, 16);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, local_port):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_num) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct sock_common,
++ 						     skc_num, 2, target_size));
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static u32 sock_filter_convert_ctx_access(enum bpf_access_type type,
++ 					  const struct bpf_insn *si,
++ 					  struct bpf_insn *insn_buf,
++ 					  struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sock, bound_dev_if):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock, sk_bound_dev_if) != 4);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					offsetof(struct sock, sk_bound_dev_if));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      offsetof(struct sock, sk_bound_dev_if));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock, mark):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock, sk_mark) != 4);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					offsetof(struct sock, sk_mark));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      offsetof(struct sock, sk_mark));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock, priority):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock, sk_priority) != 4);
++ 
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					offsetof(struct sock, sk_priority));
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      offsetof(struct sock, sk_priority));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock, family):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock, sk_family) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      offsetof(struct sock, sk_family));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock, type):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      offsetof(struct sock, __sk_flags_offset));
++ 		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, SK_FL_TYPE_MASK);
++ 		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, SK_FL_TYPE_SHIFT);
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock, protocol):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      offsetof(struct sock, __sk_flags_offset));
++ 		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, SK_FL_PROTO_MASK);
++ 		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, SK_FL_PROTO_SHIFT);
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static u32 tc_cls_act_convert_ctx_access(enum bpf_access_type type,
++ 					 const struct bpf_insn *si,
++ 					 struct bpf_insn *insn_buf,
++ 					 struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct __sk_buff, ifindex):
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, dev),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct sk_buff, dev));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      bpf_target_off(struct net_device, ifindex, 4,
++ 						     target_size));
++ 		break;
++ 	default:
++ 		return bpf_convert_ctx_access(type, si, insn_buf, prog,
++ 					      target_size);
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static u32 xdp_convert_ctx_access(enum bpf_access_type type,
++ 				  const struct bpf_insn *si,
++ 				  struct bpf_insn *insn_buf,
++ 				  struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct xdp_md, data):
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct xdp_buff, data));
++ 		break;
++ 	case offsetof(struct xdp_md, data_meta):
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data_meta),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct xdp_buff, data_meta));
++ 		break;
++ 	case offsetof(struct xdp_md, data_end):
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data_end),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct xdp_buff, data_end));
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static u32 sock_ops_convert_ctx_access(enum bpf_access_type type,
++ 				       const struct bpf_insn *si,
++ 				       struct bpf_insn *insn_buf,
++ 				       struct bpf_prog *prog,
++ 				       u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 	int off;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sock_ops, op) ...
++ 	     offsetof(struct bpf_sock_ops, replylong[3]):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct bpf_sock_ops, op) !=
++ 			     FIELD_SIZEOF(struct bpf_sock_ops_kern, op));
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct bpf_sock_ops, reply) !=
++ 			     FIELD_SIZEOF(struct bpf_sock_ops_kern, reply));
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct bpf_sock_ops, replylong) !=
++ 			     FIELD_SIZEOF(struct bpf_sock_ops_kern, replylong));
++ 		off = si->off;
++ 		off -= offsetof(struct bpf_sock_ops, op);
++ 		off += offsetof(struct bpf_sock_ops_kern, op);
++ 		if (type == BPF_WRITE)
++ 			*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					      off);
++ 		else
++ 			*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 					      off);
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, family):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_family) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 					      struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common, skc_family));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, remote_ip4):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_daddr) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 						struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common, skc_daddr));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, local_ip4):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_rcv_saddr) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 					      struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common,
++ 					       skc_rcv_saddr));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, remote_ip6[0]) ...
++ 	     offsetof(struct bpf_sock_ops, remote_ip6[3]):
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common,
++ 					  skc_v6_daddr.s6_addr32[0]) != 4);
++ 
++ 		off = si->off;
++ 		off -= offsetof(struct bpf_sock_ops, remote_ip6[0]);
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 						struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common,
++ 					       skc_v6_daddr.s6_addr32[0]) +
++ 				      off);
++ #else
++ 		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, local_ip6[0]) ...
++ 	     offsetof(struct bpf_sock_ops, local_ip6[3]):
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common,
++ 					  skc_v6_rcv_saddr.s6_addr32[0]) != 4);
++ 
++ 		off = si->off;
++ 		off -= offsetof(struct bpf_sock_ops, local_ip6[0]);
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 						struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common,
++ 					       skc_v6_rcv_saddr.s6_addr32[0]) +
++ 				      off);
++ #else
++ 		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, remote_port):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_dport) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 						struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common, skc_dport));
++ #ifndef __BIG_ENDIAN_BITFIELD
++ 		*insn++ = BPF_ALU32_IMM(BPF_LSH, si->dst_reg, 16);
++ #endif
++ 		break;
++ 
++ 	case offsetof(struct bpf_sock_ops, local_port):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sock_common, skc_num) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(
++ 						struct bpf_sock_ops_kern, sk),
++ 				      si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sock_ops_kern, sk));
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->dst_reg,
++ 				      offsetof(struct sock_common, skc_num));
++ 		break;
++ 	}
++ 	return insn - insn_buf;
++ }
++ 
++ const struct bpf_verifier_ops sk_filter_prog_ops = {
++ 	.get_func_proto		= sk_filter_func_proto,
++ 	.is_valid_access	= sk_filter_is_valid_access,
++ 	.convert_ctx_access	= bpf_convert_ctx_access,
++ };
++ 
++ const struct bpf_verifier_ops tc_cls_act_prog_ops = {
++ 	.get_func_proto		= tc_cls_act_func_proto,
++ 	.is_valid_access	= tc_cls_act_is_valid_access,
++ 	.convert_ctx_access	= tc_cls_act_convert_ctx_access,
++ 	.gen_prologue		= tc_cls_act_prologue,
++ 	.test_run		= bpf_prog_test_run_skb,
++ };
++ 
++ const struct bpf_verifier_ops xdp_prog_ops = {
++ 	.get_func_proto		= xdp_func_proto,
++ 	.is_valid_access	= xdp_is_valid_access,
++ 	.convert_ctx_access	= xdp_convert_ctx_access,
++ 	.test_run		= bpf_prog_test_run_xdp,
++ };
++ 
++ const struct bpf_verifier_ops cg_skb_prog_ops = {
++ 	.get_func_proto		= sk_filter_func_proto,
++ 	.is_valid_access	= sk_filter_is_valid_access,
++ 	.convert_ctx_access	= bpf_convert_ctx_access,
++ 	.test_run		= bpf_prog_test_run_skb,
++ };
++ 
++ const struct bpf_verifier_ops lwt_inout_prog_ops = {
++ 	.get_func_proto		= lwt_inout_func_proto,
++ 	.is_valid_access	= lwt_is_valid_access,
++ 	.convert_ctx_access	= bpf_convert_ctx_access,
++ 	.test_run		= bpf_prog_test_run_skb,
++ };
++ 
++ const struct bpf_verifier_ops lwt_xmit_prog_ops = {
++ 	.get_func_proto		= lwt_xmit_func_proto,
++ 	.is_valid_access	= lwt_is_valid_access,
++ 	.convert_ctx_access	= bpf_convert_ctx_access,
++ 	.gen_prologue		= tc_cls_act_prologue,
++ 	.test_run		= bpf_prog_test_run_skb,
++ };
++ 
++ const struct bpf_verifier_ops cg_sock_prog_ops = {
++ 	.get_func_proto		= sock_filter_func_proto,
++ 	.is_valid_access	= sock_filter_is_valid_access,
++ 	.convert_ctx_access	= sock_filter_convert_ctx_access,
++ };
++ 
++ const struct bpf_verifier_ops sock_ops_prog_ops = {
++ 	.get_func_proto		= sock_ops_func_proto,
++ 	.is_valid_access	= sock_ops_is_valid_access,
++ 	.convert_ctx_access	= sock_ops_convert_ctx_access,
++ };
++ 
++ const struct bpf_verifier_ops sk_skb_prog_ops = {
++ 	.get_func_proto		= sk_skb_func_proto,
++ 	.is_valid_access	= sk_skb_is_valid_access,
++ 	.convert_ctx_access	= bpf_convert_ctx_access,
++ 	.gen_prologue		= sk_skb_prologue,
++ };
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  int sk_detach_filter(struct sock *sk)
+  {
+  	int ret = -ENOENT;
+diff --cc net/core/skbuff.c
+index 9488c5317ec3,d98c2e3ce2bf..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -1311,6 -1508,16 +1311,19 @@@ int pskb_expand_head(struct sk_buff *sk
+  	skb->hdr_len  = 0;
+  	skb->nohdr    = 0;
+  	atomic_set(&skb_shinfo(skb)->dataref, 1);
+++<<<<<<< HEAD
+++=======
++ 
++ 	skb_metadata_clear(skb);
++ 
++ 	/* It is not generally safe to change skb->truesize.
++ 	 * For the moment, we really care of rx path, or
++ 	 * when skb is orphaned (not attached to a socket).
++ 	 */
++ 	if (!skb->sk || skb->destructor == sock_edemux)
++ 		skb->truesize += size - osize;
++ 
+++>>>>>>> de8f3a83b0a0 (bpf: add meta pointer for direct access)
+  	return 0;
+  
+  nofrags:
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_main.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path net/bpf/test_run.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 7dcf0666233f..fdda2d77853c 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -94,6 +94,7 @@ bool bnxt_rx_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr, u16 cons,
+ 
+ 	xdp.data_hard_start = *data_ptr - offset;
+ 	xdp.data = *data_ptr;
++	xdp_set_data_meta_invalid(&xdp);
+ 	xdp.data_end = *data_ptr + *len;
+ 	xdp.rxq = &rxr->xdp_rxq;
+ 	orig_data = xdp.data;
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 85c724545e26..328caa08126f 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -1614,6 +1614,7 @@ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, void *hard_start,
+ 
+ 	xdp.data_hard_start = hard_start;
+ 	xdp.data = data + *off;
++	xdp_set_data_meta_invalid(&xdp);
+ 	xdp.data_end = data + *off + *len;
+ 
+ 	orig_data = xdp.data;
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_fp.c
+* Unmerged path drivers/net/tun.c
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/filter.h
+* Unmerged path include/linux/skbuff.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path net/bpf/test_run.c
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/filter.c
+* Unmerged path net/core/skbuff.c
