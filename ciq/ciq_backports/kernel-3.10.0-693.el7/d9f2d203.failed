@@ -1,0 +1,225 @@
+HID: wacom: Properly free inputs if 'wacom_allocate_inputs' fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: Properly free inputs if wacom_allocate_inputs fails (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 94.31%
+commit-author Jason Gerecke <killertofu@gmail.com>
+commit d9f2d203ab42f099b32ec4580e43eb08b3e4c412
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d9f2d203.failed
+
+The 'wacom_allocate_inputs' function tries to allocate three input devices: one
+each for the pen, touch, and pad. The pointers that are returned by the
+'wacom_allocate_input' calls are temporarily stored to local variables where
+they are checked to ensure they're non-null before storing them in the
+'wacom_wac' structure. If an allocation fails,  the 'wacom_free_inputs'
+function is called to reclaim the memory. Unfortunately, 'wacom_free_inputs' is
+called prior to the pointers being copied, so it is not actually able to free
+anything.
+
+This patch has the calls to 'wacom_allocate_input' store the pointer directly
+in the 'wacom_wac' structure where they can be freed. Also, it replaces the
+call to 'wacom_free_inputs' with the (more general) 'wacom_clean_inputs' and
+removes the no-longer-used function.
+
+[jkosina@suse.com: modify to resolve conflict with 67e123f ("Delete
+ unnecessary checks")]
+
+	Signed-off-by: Jason Gerecke <jason.gerecke@wacom.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.com>
+(cherry picked from commit d9f2d203ab42f099b32ec4580e43eb08b3e4c412)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,3512d833cc24..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -1127,35 -1088,162 +1127,137 @@@ static void wacom_destroy_battery(struc
+  	}
+  }
+  
+ -static ssize_t wacom_show_speed(struct device *dev,
+ -				struct device_attribute
+ -				*attr, char *buf)
+ -{
+ -	struct hid_device *hdev = container_of(dev, struct hid_device, dev);
+ -	struct wacom *wacom = hid_get_drvdata(hdev);
+ -
+ -	return snprintf(buf, PAGE_SIZE, "%i\n", wacom->wacom_wac.bt_high_speed);
+ -}
+ -
+ -static ssize_t wacom_store_speed(struct device *dev,
+ -				struct device_attribute *attr,
+ -				const char *buf, size_t count)
+ -{
+ -	struct hid_device *hdev = container_of(dev, struct hid_device, dev);
+ -	struct wacom *wacom = hid_get_drvdata(hdev);
+ -	u8 new_speed;
+ -
+ -	if (kstrtou8(buf, 0, &new_speed))
+ -		return -EINVAL;
+ -
+ -	if (new_speed != 0 && new_speed != 1)
+ -		return -EINVAL;
+ -
+ -	wacom_bt_query_tablet_data(hdev, new_speed, &wacom->wacom_wac.features);
+ -
+ -	return count;
+ -}
+ -
+ -static DEVICE_ATTR(speed, DEV_ATTR_RW_PERM,
+ -		wacom_show_speed, wacom_store_speed);
+ -
+ -static struct input_dev *wacom_allocate_input(struct wacom *wacom)
+ +static int wacom_register_input(struct wacom *wacom)
+  {
+  	struct input_dev *input_dev;
+ -	struct hid_device *hdev = wacom->hdev;
+ +	struct usb_interface *intf = wacom->intf;
+ +	struct usb_device *dev = interface_to_usbdev(intf);
+  	struct wacom_wac *wacom_wac = &(wacom->wacom_wac);
+ +	int error;
+  
+  	input_dev = input_allocate_device();
+ -	if (!input_dev)
+ -		return NULL;
+ +	if (!input_dev) {
+ +		error = -ENOMEM;
+ +		goto fail1;
+ +	}
+  
+ -	input_dev->name = wacom_wac->pen_name;
+ -	input_dev->phys = hdev->phys;
+ -	input_dev->dev.parent = &hdev->dev;
+ +	input_dev->name = wacom_wac->name;
+ +	input_dev->dev.parent = &intf->dev;
+  	input_dev->open = wacom_open;
+  	input_dev->close = wacom_close;
+ -	input_dev->uniq = hdev->uniq;
+ -	input_dev->id.bustype = hdev->bus;
+ -	input_dev->id.vendor  = hdev->vendor;
+ -	input_dev->id.product = wacom_wac->pid ? wacom_wac->pid : hdev->product;
+ -	input_dev->id.version = hdev->version;
+ +	usb_to_input_id(dev, &input_dev->id);
+  	input_set_drvdata(input_dev, wacom);
+  
+ -	return input_dev;
+ -}
+ +	wacom_wac->input = input_dev;
+ +	error = wacom_setup_input_capabilities(input_dev, wacom_wac);
+ +	if (error)
+ +		goto fail1;
+  
+++<<<<<<< HEAD
+ +	error = input_register_device(input_dev);
+ +	if (error)
+ +		goto fail2;
+++=======
++ static void wacom_clean_inputs(struct wacom *wacom)
++ {
++ 	if (wacom->wacom_wac.pen_input) {
++ 		if (wacom->wacom_wac.pen_registered)
++ 			input_unregister_device(wacom->wacom_wac.pen_input);
++ 		else
++ 			input_free_device(wacom->wacom_wac.pen_input);
++ 	}
++ 	if (wacom->wacom_wac.touch_input) {
++ 		if (wacom->wacom_wac.touch_registered)
++ 			input_unregister_device(wacom->wacom_wac.touch_input);
++ 		else
++ 			input_free_device(wacom->wacom_wac.touch_input);
++ 	}
++ 	if (wacom->wacom_wac.pad_input) {
++ 		if (wacom->wacom_wac.pad_registered)
++ 			input_unregister_device(wacom->wacom_wac.pad_input);
++ 		else
++ 			input_free_device(wacom->wacom_wac.pad_input);
++ 	}
++ 	wacom->wacom_wac.pen_input = NULL;
++ 	wacom->wacom_wac.touch_input = NULL;
++ 	wacom->wacom_wac.pad_input = NULL;
++ 	wacom_destroy_leds(wacom);
++ }
++ 
++ static int wacom_allocate_inputs(struct wacom *wacom)
++ {
++ 	struct wacom_wac *wacom_wac = &(wacom->wacom_wac);
++ 
++ 	wacom_wac->pen_input = wacom_allocate_input(wacom);
++ 	wacom_wac->touch_input = wacom_allocate_input(wacom);
++ 	wacom_wac->pad_input = wacom_allocate_input(wacom);
++ 	if (!wacom_wac->pen_input || !wacom_wac->touch_input || !wacom_wac->pad_input) {
++ 		wacom_clean_inputs(wacom);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	wacom_wac->touch_input->name = wacom_wac->touch_name;
++ 	wacom_wac->pad_input->name = wacom_wac->pad_name;
++ 
++ 	return 0;
++ }
++ 
++ static int wacom_register_inputs(struct wacom *wacom)
++ {
++ 	struct input_dev *pen_input_dev, *touch_input_dev, *pad_input_dev;
++ 	struct wacom_wac *wacom_wac = &(wacom->wacom_wac);
++ 	int error = 0;
++ 
++ 	pen_input_dev = wacom_wac->pen_input;
++ 	touch_input_dev = wacom_wac->touch_input;
++ 	pad_input_dev = wacom_wac->pad_input;
++ 
++ 	if (!pen_input_dev || !touch_input_dev || !pad_input_dev)
++ 		return -EINVAL;
++ 
++ 	error = wacom_setup_pen_input_capabilities(pen_input_dev, wacom_wac);
++ 	if (error) {
++ 		/* no pen in use on this interface */
++ 		input_free_device(pen_input_dev);
++ 		wacom_wac->pen_input = NULL;
++ 		pen_input_dev = NULL;
++ 	} else {
++ 		error = input_register_device(pen_input_dev);
++ 		if (error)
++ 			goto fail_register_pen_input;
++ 		wacom_wac->pen_registered = true;
++ 	}
++ 
++ 	error = wacom_setup_touch_input_capabilities(touch_input_dev, wacom_wac);
++ 	if (error) {
++ 		/* no touch in use on this interface */
++ 		input_free_device(touch_input_dev);
++ 		wacom_wac->touch_input = NULL;
++ 		touch_input_dev = NULL;
++ 	} else {
++ 		error = input_register_device(touch_input_dev);
++ 		if (error)
++ 			goto fail_register_touch_input;
++ 		wacom_wac->touch_registered = true;
++ 	}
++ 
++ 	error = wacom_setup_pad_input_capabilities(pad_input_dev, wacom_wac);
++ 	if (error) {
++ 		/* no pad in use on this interface */
++ 		input_free_device(pad_input_dev);
++ 		wacom_wac->pad_input = NULL;
++ 		pad_input_dev = NULL;
++ 	} else {
++ 		error = input_register_device(pad_input_dev);
++ 		if (error)
++ 			goto fail_register_pad_input;
++ 		wacom_wac->pad_registered = true;
++ 
++ 		error = wacom_initialize_leds(wacom);
++ 		if (error)
++ 			goto fail_leds;
++ 	}
+++>>>>>>> d9f2d203ab42 (HID: wacom: Properly free inputs if 'wacom_allocate_inputs' fails)
+  
+  	return 0;
+  
+* Unmerged path drivers/hid/wacom_sys.c
