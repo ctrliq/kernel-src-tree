@@ -1,0 +1,134 @@
+IB/{rxe,core,rdmavt}: Fix kernel crash for reg MR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [rdma] ib/{rxe, core, rdmavt}: Fix kernel crash for reg MR (Don Dutile) [1385848 1384574 1417285]
+Rebuild_FUZZ: 98.00%
+commit-author Parav Pandit <pandit.parav@gmail.com>
+commit d9703650f4aba7555fde92636d8d9a689029e8f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d9703650.failed
+
+This patch fixes below kernel crash on memory registration for rxe
+and other transport drivers which has dma_ops extension.
+
+IB/core invokes ib_map_sg_attrs() in generic manner with dma attributes
+which is used by mlx5 and mthca adapters.  However in doing so it
+ignored honoring dma_ops extension of software based transports for
+sg map/unmap operation.  This results in calling dma_map_sg_attrs of
+hardware virtual device resulting in crash for null reference.
+
+We extend the core to support sg_map/unmap_attrs and transport drivers
+to implement those dma_ops callback functions.
+
+Verified usign perftest applications.
+
+BUG: unable to handle kernel NULL pointer dereference at           (null)
+IP: [<ffffffff81032a75>] check_addr+0x35/0x60
+...
+Call Trace:
+ [<ffffffff81032b39>] ? nommu_map_sg+0x99/0xd0
+ [<ffffffffa02b31c6>] ib_umem_get+0x3d6/0x470 [ib_core]
+ [<ffffffffa01cc329>] rxe_mem_init_user+0x49/0x270 [rdma_rxe]
+ [<ffffffffa01c793a>] ? rxe_add_index+0xca/0x100 [rdma_rxe]
+ [<ffffffffa01c995f>] rxe_reg_user_mr+0x9f/0x130 [rdma_rxe]
+ [<ffffffffa00419fe>] ib_uverbs_reg_mr+0x14e/0x2c0 [ib_uverbs]
+ [<ffffffffa003d3ab>] ib_uverbs_write+0x15b/0x3b0 [ib_uverbs]
+ [<ffffffff811e92a6>] ? mem_cgroup_commit_charge+0x76/0xe0
+ [<ffffffff811af0a9>] ? page_add_new_anon_rmap+0x89/0xc0
+ [<ffffffff8117e6c9>] ? lru_cache_add_active_or_unevictable+0x39/0xc0
+ [<ffffffff811f0da8>] __vfs_write+0x28/0x120
+ [<ffffffff811f1239>] ? rw_verify_area+0x49/0xb0
+ [<ffffffff811f1492>] vfs_write+0xb2/0x1b0
+ [<ffffffff811f27d6>] SyS_write+0x46/0xa0
+ [<ffffffff814f7d32>] entry_SYSCALL_64_fastpath+0x1a/0xa4
+
+	Signed-off-by: Parav Pandit <pandit.parav@gmail.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d9703650f4aba7555fde92636d8d9a689029e8f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_dma.c
+#	include/rdma/ib_verbs.h
+diff --cc include/rdma/ib_verbs.h
+index 78cb6674d269,9e935655fccb..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2934,17 -3006,27 +2942,35 @@@ static inline void ib_dma_unmap_sg(stru
+  static inline int ib_dma_map_sg_attrs(struct ib_device *dev,
+  				      struct scatterlist *sg, int nents,
+  				      enum dma_data_direction direction,
+ -				      unsigned long dma_attrs)
+ +				      struct dma_attrs *attrs)
+  {
+++<<<<<<< HEAD
+ +	return dma_map_sg_attrs(dev->dma_device, sg, nents, direction, attrs);
+++=======
++ 	if (dev->dma_ops)
++ 		return dev->dma_ops->map_sg_attrs(dev, sg, nents, direction,
++ 						  dma_attrs);
++ 	else
++ 		return dma_map_sg_attrs(dev->dma_device, sg, nents, direction,
++ 					dma_attrs);
+++>>>>>>> d9703650f4ab (IB/{rxe,core,rdmavt}: Fix kernel crash for reg MR)
+  }
+  
+  static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
+  					 struct scatterlist *sg, int nents,
+  					 enum dma_data_direction direction,
+ -					 unsigned long dma_attrs)
+ +					 struct dma_attrs *attrs)
+  {
+++<<<<<<< HEAD
+ +	dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction, attrs);
+++=======
++ 	if (dev->dma_ops)
++ 		return dev->dma_ops->unmap_sg_attrs(dev, sg, nents, direction,
++ 						  dma_attrs);
++ 	else
++ 		dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction,
++ 				   dma_attrs);
+++>>>>>>> d9703650f4ab (IB/{rxe,core,rdmavt}: Fix kernel crash for reg MR)
+  }
+  /**
+   * ib_sg_dma_address - Return the DMA address from a scatter/gather entry
+* Unmerged path drivers/infiniband/sw/rxe/rxe_dma.c
+diff --git a/drivers/infiniband/sw/rdmavt/dma.c b/drivers/infiniband/sw/rdmavt/dma.c
+index 33076a5eee2f..01f71caa3ac4 100644
+--- a/drivers/infiniband/sw/rdmavt/dma.c
++++ b/drivers/infiniband/sw/rdmavt/dma.c
+@@ -138,6 +138,21 @@ static void rvt_unmap_sg(struct ib_device *dev,
+ 	/* This is a stub, nothing to be done here */
+ }
+ 
++static int rvt_map_sg_attrs(struct ib_device *dev, struct scatterlist *sgl,
++			    int nents, enum dma_data_direction direction,
++			    unsigned long attrs)
++{
++	return rvt_map_sg(dev, sgl, nents, direction);
++}
++
++static void rvt_unmap_sg_attrs(struct ib_device *dev,
++			       struct scatterlist *sg, int nents,
++			       enum dma_data_direction direction,
++			       unsigned long attrs)
++{
++	return rvt_unmap_sg(dev, sg, nents, direction);
++}
++
+ static void rvt_sync_single_for_cpu(struct ib_device *dev, u64 addr,
+ 				    size_t size, enum dma_data_direction dir)
+ {
+@@ -177,6 +192,8 @@ struct ib_dma_mapping_ops rvt_default_dma_mapping_ops = {
+ 	.unmap_page = rvt_dma_unmap_page,
+ 	.map_sg = rvt_map_sg,
+ 	.unmap_sg = rvt_unmap_sg,
++	.map_sg_attrs = rvt_map_sg_attrs,
++	.unmap_sg_attrs = rvt_unmap_sg_attrs,
+ 	.sync_single_for_cpu = rvt_sync_single_for_cpu,
+ 	.sync_single_for_device = rvt_sync_single_for_device,
+ 	.alloc_coherent = rvt_dma_alloc_coherent,
+* Unmerged path drivers/infiniband/sw/rxe/rxe_dma.c
+* Unmerged path include/rdma/ib_verbs.h
