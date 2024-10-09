@@ -1,0 +1,215 @@
+x86/ldt: Fix small LDT allocation for Xen
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] ldt: Fix small LDT allocation for Xen (Gopal Tiwari) [1456572]
+Rebuild_FUZZ: 94.87%
+commit-author Jan Beulich <JBeulich@suse.com>
+commit f454b478861325f067fd58ba7ee9f1b5c4a9d6a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f454b478.failed
+
+While the following commit:
+
+  37868fe113 ("x86/ldt: Make modify_ldt synchronous")
+
+added a nice comment explaining that Xen needs page-aligned
+whole page chunks for guest descriptor tables, it then
+nevertheless used kzalloc() on the small size path.
+
+As I'm unaware of guarantees for kmalloc(PAGE_SIZE, ) to return
+page-aligned memory blocks, I believe this needs to be switched
+back to __get_free_page() (or better get_zeroed_page()).
+
+	Signed-off-by: Jan Beulich <jbeulich@suse.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: David Vrabel <david.vrabel@citrix.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/55E735D6020000780009F1E6@prv-mh.provo.novell.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f454b478861325f067fd58ba7ee9f1b5c4a9d6a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/ldt.c
+diff --cc arch/x86/kernel/ldt.c
+index 6b6d22561e6f,6acc9dd91f36..000000000000
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@@ -21,97 -21,82 +21,119 @@@
+  #include <asm/mmu_context.h>
+  #include <asm/syscalls.h>
+  
+ -/* context.lock is held for us, so we don't need any locking. */
+ +#ifdef CONFIG_SMP
+  static void flush_ldt(void *current_mm)
+  {
+ -	mm_context_t *pc;
+ -
+ -	if (current->active_mm != current_mm)
+ -		return;
+ +	if (current->active_mm == current_mm)
+ +		load_LDT(&current->active_mm->context);
+ +}
+ +#endif
+  
+ -	pc = &current->active_mm->context;
+ -	set_ldt(pc->ldt->entries, pc->ldt->size);
+ +static void free_ldt(void *ldt, int size)
+ +{
+ +	if (size * LDT_ENTRY_SIZE > PAGE_SIZE)
+ +		vfree(ldt);
+ +	else
+ +		put_page(virt_to_page(ldt));
+  }
+  
+ -/* The caller must call finalize_ldt_struct on the result. LDT starts zeroed. */
+ -static struct ldt_struct *alloc_ldt_struct(int size)
+ +static int alloc_ldt(mm_context_t *pc, int mincount, int reload)
+  {
+ -	struct ldt_struct *new_ldt;
+ -	int alloc_size;
+ -
+ -	if (size > LDT_ENTRIES)
+ -		return NULL;
+ -
+ -	new_ldt = kmalloc(sizeof(struct ldt_struct), GFP_KERNEL);
+ -	if (!new_ldt)
+ -		return NULL;
+ -
+ -	BUILD_BUG_ON(LDT_ENTRY_SIZE != sizeof(struct desc_struct));
+ -	alloc_size = size * LDT_ENTRY_SIZE;
+ -
+ -	/*
+ -	 * Xen is very picky: it requires a page-aligned LDT that has no
+ -	 * trailing nonzero bytes in any page that contains LDT descriptors.
+ -	 * Keep it simple: zero the whole allocation and never allocate less
+ -	 * than PAGE_SIZE.
+ -	 */
+ -	if (alloc_size > PAGE_SIZE)
+ -		new_ldt->entries = vzalloc(alloc_size);
+ +	void *oldldt, *newldt;
+ +	int oldsize;
+ +	int ret;
+ +
+ +	if (mincount <= pc->size)
+ +		return 0;
+ +	oldsize = pc->size;
+ +	mincount = (mincount + (PAGE_SIZE / LDT_ENTRY_SIZE - 1)) &
+ +			(~(PAGE_SIZE / LDT_ENTRY_SIZE - 1));
+ +	if (mincount * LDT_ENTRY_SIZE > PAGE_SIZE)
+ +		newldt = vmalloc(mincount * LDT_ENTRY_SIZE);
+  	else
+++<<<<<<< HEAD
+ +		newldt = (void *)__get_free_page(GFP_KERNEL);
+++=======
++ 		new_ldt->entries = (void *)get_zeroed_page(GFP_KERNEL);
+ -
+ -	if (!new_ldt->entries) {
+ -		kfree(new_ldt);
+ -		return NULL;
+++>>>>>>> f454b4788613 (x86/ldt: Fix small LDT allocation for Xen)
+ +
+ +	if (!newldt)
+ +		return -ENOMEM;
+ +	ret = kaiser_add_mapping((unsigned long)newldt,
+ +				 mincount * LDT_ENTRY_SIZE,
+ +				 __PAGE_KERNEL | _PAGE_GLOBAL);
+ +	if (ret) {
+ +		free_ldt(newldt, mincount);
+ +		return -ENOMEM;
+  	}
+  
+ -	new_ldt->size = size;
+ -	return new_ldt;
+ -}
+ +	if (oldsize)
+ +		memcpy(newldt, pc->ldt, oldsize * LDT_ENTRY_SIZE);
+ +	oldldt = pc->ldt;
+ +	memset(newldt + oldsize * LDT_ENTRY_SIZE, 0,
+ +	       (mincount - oldsize) * LDT_ENTRY_SIZE);
+  
+ -/* After calling this, the LDT is immutable. */
+ -static void finalize_ldt_struct(struct ldt_struct *ldt)
+ -{
+ -	paravirt_alloc_ldt(ldt->entries, ldt->size);
+ +	paravirt_alloc_ldt(newldt, mincount);
+ +
+ +#ifdef CONFIG_X86_64
+ +	/* CHECKME: Do we really need this ? */
+ +	wmb();
+ +#endif
+ +	pc->ldt = newldt;
+ +	wmb();
+ +	pc->size = mincount;
+ +	wmb();
+ +
+ +	if (reload) {
+ +#ifdef CONFIG_SMP
+ +		preempt_disable();
+ +		load_LDT(pc);
+ +		if (!cpumask_equal(mm_cpumask(current->mm),
+ +				   cpumask_of(smp_processor_id())))
+ +			smp_call_function(flush_ldt, current->mm, 1);
+ +		preempt_enable();
+ +#else
+ +		load_LDT(pc);
+ +#endif
+ +	}
+ +	if (oldsize) {
+ +		kaiser_remove_mapping((unsigned long)oldldt,
+ +				      oldsize * LDT_ENTRY_SIZE);
+ +		paravirt_free_ldt(oldldt, oldsize);
+ +		free_ldt(oldldt, oldsize);
+ +	}
+ +	return 0;
+  }
+  
+ -/* context.lock is held */
+ -static void install_ldt(struct mm_struct *current_mm,
+ -			struct ldt_struct *ldt)
+ +static inline int copy_ldt(mm_context_t *new, mm_context_t *old)
+  {
+ -	/* Synchronizes with lockless_dereference in load_mm_ldt. */
+ -	smp_store_release(&current_mm->context.ldt, ldt);
+ +	int err = alloc_ldt(new, old->size, 0);
+ +	int i;
+ +
+ +	if (err < 0)
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < old->size; i++)
+ +		write_ldt_entry(new->ldt, i, old->ldt + i * LDT_ENTRY_SIZE);
+ +	return 0;
+++=======
++ 	/* Activate the LDT for all CPUs using current_mm. */
++ 	on_each_cpu_mask(mm_cpumask(current_mm), flush_ldt, current_mm, true);
++ }
++ 
++ static void free_ldt_struct(struct ldt_struct *ldt)
++ {
++ 	if (likely(!ldt))
++ 		return;
++ 
++ 	paravirt_free_ldt(ldt->entries, ldt->size);
++ 	if (ldt->size * LDT_ENTRY_SIZE > PAGE_SIZE)
++ 		vfree(ldt->entries);
++ 	else
++ 		free_page((unsigned long)ldt->entries);
++ 	kfree(ldt);
+++>>>>>>> f454b4788613 (x86/ldt: Fix small LDT allocation for Xen)
+  }
+  
+  /*
+* Unmerged path arch/x86/kernel/ldt.c
