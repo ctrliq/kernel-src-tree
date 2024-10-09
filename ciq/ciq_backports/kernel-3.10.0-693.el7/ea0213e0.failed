@@ -1,0 +1,198 @@
+md: superblock changes for PPL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] superblock changes for PPL (Nigel Croxon) [1434872]
+Rebuild_FUZZ: 92.86%
+commit-author Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+commit ea0213e0c7cc1c1b52badf27bd7db4f50a67baaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ea0213e0.failed
+
+Include information about PPL location and size into mdp_superblock_1
+and copy it to/from rdev. Because PPL is mutually exclusive with bitmap,
+put it in place of 'bitmap_offset'. Add a new flag MD_FEATURE_PPL for
+'feature_map', analogically to MD_FEATURE_BITMAP_OFFSET. Add MD_HAS_PPL
+to mddev->flags to indicate that PPL is enabled on an array.
+
+	Signed-off-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit ea0213e0c7cc1c1b52badf27bd7db4f50a67baaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.h
+#	drivers/md/raid0.c
+#	drivers/md/raid1.c
+diff --cc drivers/md/md.h
+index 07747899ac17,a7b2f16452c4..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -182,6 -217,31 +189,34 @@@ extern int rdev_set_badblocks(struct md
+  			      int is_new);
+  extern int rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
+  				int is_new);
+++<<<<<<< HEAD
+++=======
++ struct md_cluster_info;
++ 
++ /* change UNSUPPORTED_MDDEV_FLAGS for each array type if new flag is added */
++ enum mddev_flags {
++ 	MD_ARRAY_FIRST_USE,	/* First use of array, needs initialization */
++ 	MD_CLOSING,		/* If set, we are closing the array, do not open
++ 				 * it then */
++ 	MD_JOURNAL_CLEAN,	/* A raid with journal is already clean */
++ 	MD_HAS_JOURNAL,		/* The raid array has journal feature set */
++ 	MD_CLUSTER_RESYNC_LOCKED, /* cluster raid only, which means node
++ 				   * already took resync lock, need to
++ 				   * release the lock */
++ 	MD_FAILFAST_SUPPORTED,	/* Using MD_FAILFAST on metadata writes is
++ 				 * supported as calls to md_error() will
++ 				 * never cause the array to become failed.
++ 				 */
++ 	MD_HAS_PPL,		/* The raid array has PPL feature set */
++ };
++ 
++ enum mddev_sb_flags {
++ 	MD_SB_CHANGE_DEVS,		/* Some device status has changed */
++ 	MD_SB_CHANGE_CLEAN,	/* transition to or from 'clean' */
++ 	MD_SB_CHANGE_PENDING,	/* switch from 'clean' to 'active' in progress */
++ 	MD_SB_NEED_REWRITE,	/* metadata write needs to be repeated */
++ };
+++>>>>>>> ea0213e0c7cc (md: superblock changes for PPL)
+  
+  struct mddev {
+  	void				*private;
+diff --cc drivers/md/raid0.c
+index f8c0a3b476b3,56f70c3ad37c..000000000000
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@@ -25,10 -26,11 +25,18 @@@
+  #include "raid0.h"
+  #include "raid5.h"
+  
+++<<<<<<< HEAD
+ +static bool devices_discard_performance = false;
+ +module_param(devices_discard_performance, bool, 0644);
+ +MODULE_PARM_DESC(devices_discard_performance,
+ +		 "Set to Y if all devices in each array handles discard requests at proper speed");
+++=======
++ #define UNSUPPORTED_MDDEV_FLAGS		\
++ 	((1L << MD_HAS_JOURNAL) |	\
++ 	 (1L << MD_JOURNAL_CLEAN) |	\
++ 	 (1L << MD_FAILFAST_SUPPORTED) |\
++ 	 (1L << MD_HAS_PPL))
+++>>>>>>> ea0213e0c7cc (md: superblock changes for PPL)
+  
+  static int raid0_congested(struct mddev *mddev, int bits)
+  {
+diff --cc drivers/md/raid1.c
+index e588c32492da,730e57259af9..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -41,6 -45,11 +41,14 @@@
+  #include "raid1.h"
+  #include "bitmap.h"
+  
+++<<<<<<< HEAD
+++=======
++ #define UNSUPPORTED_MDDEV_FLAGS		\
++ 	((1L << MD_HAS_JOURNAL) |	\
++ 	 (1L << MD_JOURNAL_CLEAN) |	\
++ 	 (1L << MD_HAS_PPL))
++ 
+++>>>>>>> ea0213e0c7cc (md: superblock changes for PPL)
+  /*
+   * Number of guaranteed r1bios in case of extreme VM load:
+   */
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index efc1b3243366..1a6260339253 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -1500,6 +1500,12 @@ static int super_1_load(struct md_rdev *rdev, struct md_rdev *refdev, int minor_
+ 	} else if (sb->bblog_offset != 0)
+ 		rdev->badblocks.shift = 0;
+ 
++	if (le32_to_cpu(sb->feature_map) & MD_FEATURE_PPL) {
++		rdev->ppl.offset = (__s16)le16_to_cpu(sb->ppl.offset);
++		rdev->ppl.size = le16_to_cpu(sb->ppl.size);
++		rdev->ppl.sector = rdev->sb_start + rdev->ppl.offset;
++	}
++
+ 	if (!refdev) {
+ 		ret = 1;
+ 	} else {
+@@ -1613,6 +1619,13 @@ static int super_1_validate(struct mddev *mddev, struct md_rdev *rdev)
+ 
+ 		if (le32_to_cpu(sb->feature_map) & MD_FEATURE_JOURNAL)
+ 			set_bit(MD_HAS_JOURNAL, &mddev->flags);
++
++		if (le32_to_cpu(sb->feature_map) & MD_FEATURE_PPL) {
++			if (le32_to_cpu(sb->feature_map) &
++			    (MD_FEATURE_BITMAP_OFFSET | MD_FEATURE_JOURNAL))
++				return -EINVAL;
++			set_bit(MD_HAS_PPL, &mddev->flags);
++		}
+ 	} else if (mddev->pers == NULL) {
+ 		/* Insist of good event counter while assembling, except for
+ 		 * spares (which don't need an event count) */
+@@ -1818,6 +1831,12 @@ retry:
+ 	if (test_bit(MD_HAS_JOURNAL, &mddev->flags))
+ 		sb->feature_map |= cpu_to_le32(MD_FEATURE_JOURNAL);
+ 
++	if (test_bit(MD_HAS_PPL, &mddev->flags)) {
++		sb->feature_map |= cpu_to_le32(MD_FEATURE_PPL);
++		sb->ppl.offset = cpu_to_le16(rdev->ppl.offset);
++		sb->ppl.size = cpu_to_le16(rdev->ppl.size);
++	}
++
+ 	rdev_for_each(rdev2, mddev) {
+ 		i = rdev2->desc_nr;
+ 		if (test_bit(Faulty, &rdev2->flags))
+* Unmerged path drivers/md/md.h
+* Unmerged path drivers/md/raid0.c
+* Unmerged path drivers/md/raid1.c
+diff --git a/include/uapi/linux/raid/md_p.h b/include/uapi/linux/raid/md_p.h
+index 8f0b1c61eefb..b2669973d8a6 100644
+--- a/include/uapi/linux/raid/md_p.h
++++ b/include/uapi/linux/raid/md_p.h
+@@ -230,10 +230,18 @@ struct mdp_superblock_1 {
+ 
+ 	__le32	chunksize;	/* in 512byte sectors */
+ 	__le32	raid_disks;
+-	__le32	bitmap_offset;	/* sectors after start of superblock that bitmap starts
+-				 * NOTE: signed, so bitmap can be before superblock
+-				 * only meaningful of feature_map[0] is set.
+-				 */
++	union {
++		__le32	bitmap_offset;	/* sectors after start of superblock that bitmap starts
++					 * NOTE: signed, so bitmap can be before superblock
++					 * only meaningful of feature_map[0] is set.
++					 */
++
++		/* only meaningful when feature_map[MD_FEATURE_PPL] is set */
++		struct {
++			__le16 offset; /* sectors from start of superblock that ppl starts (signed) */
++			__le16 size; /* ppl size in sectors */
++		} ppl;
++	};
+ 
+ 	/* These are only valid with feature bit '4' */
+ 	__le32	new_level;	/* new level we are reshaping to		*/
+@@ -304,6 +312,7 @@ struct mdp_superblock_1 {
+ 					     * is guided by bitmap.
+ 					     */
+ #define	MD_FEATURE_JOURNAL		512 /* support write cache */
++#define	MD_FEATURE_PPL			1024 /* support PPL */
+ #define	MD_FEATURE_ALL			(MD_FEATURE_BITMAP_OFFSET	\
+ 					|MD_FEATURE_RECOVERY_OFFSET	\
+ 					|MD_FEATURE_RESHAPE_ACTIVE	\
+@@ -313,6 +322,7 @@ struct mdp_superblock_1 {
+ 					|MD_FEATURE_NEW_OFFSET		\
+ 					|MD_FEATURE_RECOVERY_BITMAP	\
+ 					|MD_FEATURE_JOURNAL		\
++					|MD_FEATURE_PPL			\
+ 					)
+ 
+ struct r5l_payload_header {
