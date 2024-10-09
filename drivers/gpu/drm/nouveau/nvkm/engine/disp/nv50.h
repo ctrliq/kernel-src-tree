@@ -17,7 +17,7 @@ struct nv50_disp {
 	struct {
 		unsigned long mask;
 		int nr;
-	} head;
+	} head, dac;
 
 	struct {
 		u32 lvdsconf;
@@ -52,12 +52,7 @@ struct nv50_disp_func {
 	struct {
 		int (*cnt)(struct nvkm_disp *, unsigned long *mask);
 		int (*new)(struct nvkm_disp *, int id);
-	} head;
-
-	struct {
-		int nr;
-		int (*new)(struct nvkm_disp *, int id);
-	} dac;
+	} head, dac;
 
 	struct {
 		int nr;
