@@ -1,0 +1,195 @@
+IB/mlx5: Introduce DEVX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit a8b92ca1b0e5ce620e425e9d2f89ce44f1a82a82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a8b92ca1.failed
+
+Introduce DEVX to enable direct device commands in downstream patches
+from this series.
+
+In that mode of work the firmware manages the isolation between
+processes' resources and as such a DEVX user id is created and assigned
+to the given user context upon allocation request.
+
+A capability check is done to make sure that this feature is really
+supported by the firmware prior to creating the DEVX user id.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a8b92ca1b0e5ce620e425e9d2f89ce44f1a82a82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 7653bfad9f25,1c857dd3c77f..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -131,6 -142,8 +131,11 @@@ struct mlx5_ib_ucontext 
+  	struct mutex		vma_private_list_mutex;
+  
+  	u64			lib_caps;
+++<<<<<<< HEAD
+++=======
++ 	DECLARE_BITMAP(dm_pages, MLX5_MAX_MEMIC_PAGES);
++ 	u16			devx_uid;
+++>>>>>>> a8b92ca1b0e5 (IB/mlx5: Introduce DEVX)
+  };
+  
+  static inline struct mlx5_ib_ucontext *to_mucontext(struct ib_ucontext *ibucontext)
+diff --git a/drivers/infiniband/hw/mlx5/Makefile b/drivers/infiniband/hw/mlx5/Makefile
+index d42b922bede8..577e4c418bae 100644
+--- a/drivers/infiniband/hw/mlx5/Makefile
++++ b/drivers/infiniband/hw/mlx5/Makefile
+@@ -3,3 +3,4 @@ obj-$(CONFIG_MLX5_INFINIBAND)	+= mlx5_ib.o
+ mlx5_ib-y :=	main.o cq.o doorbell.o qp.o mem.o srq.o mr.o ah.o mad.o gsi.o ib_virt.o cmd.o cong.o
+ mlx5_ib-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += odp.o
+ mlx5_ib-$(CONFIG_MLX5_ESWITCH) += ib_rep.o
++mlx5_ib-$(CONFIG_INFINIBAND_USER_ACCESS) += devx.o
+diff --git a/drivers/infiniband/hw/mlx5/devx.c b/drivers/infiniband/hw/mlx5/devx.c
+new file mode 100644
+index 000000000000..775448910ad1
+--- /dev/null
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/*
++ * Copyright (c) 2018, Mellanox Technologies inc.  All rights reserved.
++ */
++
++#include <rdma/ib_user_verbs.h>
++#include <rdma/ib_verbs.h>
++#include <rdma/uverbs_types.h>
++#include <rdma/uverbs_ioctl.h>
++#include <rdma/mlx5_user_ioctl_cmds.h>
++#include <rdma/ib_umem.h>
++#include <linux/mlx5/driver.h>
++#include <linux/mlx5/fs.h>
++#include "mlx5_ib.h"
++
++int mlx5_ib_devx_create(struct mlx5_ib_dev *dev, struct mlx5_ib_ucontext *context)
++{
++	u32 in[MLX5_ST_SZ_DW(create_uctx_in)] = {0};
++	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)] = {0};
++	u64 general_obj_types;
++	void *uctx;
++	void *hdr;
++	int err;
++
++	uctx = MLX5_ADDR_OF(create_uctx_in, in, uctx);
++	hdr = MLX5_ADDR_OF(create_uctx_in, in, hdr);
++
++	general_obj_types = MLX5_CAP_GEN_64(dev->mdev, general_obj_types);
++	if (!(general_obj_types & MLX5_GENERAL_OBJ_TYPES_CAP_UCTX) ||
++	    !(general_obj_types & MLX5_GENERAL_OBJ_TYPES_CAP_UMEM))
++		return -EINVAL;
++
++	if (!capable(CAP_NET_RAW))
++		return -EPERM;
++
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, opcode, MLX5_CMD_OP_CREATE_GENERAL_OBJECT);
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, obj_type, MLX5_OBJ_TYPE_UCTX);
++
++	err = mlx5_cmd_exec(dev->mdev, in, sizeof(in), out, sizeof(out));
++	if (err)
++		return err;
++
++	context->devx_uid = MLX5_GET(general_obj_out_cmd_hdr, out, obj_id);
++	return 0;
++}
++
++void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev,
++			  struct mlx5_ib_ucontext *context)
++{
++	u32 in[MLX5_ST_SZ_DW(general_obj_in_cmd_hdr)] = {0};
++	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)] = {0};
++
++	MLX5_SET(general_obj_in_cmd_hdr, in, opcode, MLX5_CMD_OP_DESTROY_GENERAL_OBJECT);
++	MLX5_SET(general_obj_in_cmd_hdr, in, obj_type, MLX5_OBJ_TYPE_UCTX);
++	MLX5_SET(general_obj_in_cmd_hdr, in, obj_id, context->devx_uid);
++
++	mlx5_cmd_exec(dev->mdev, in, sizeof(in), out, sizeof(out));
++}
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 1726b9447b75..9d10493f319c 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1666,8 +1666,8 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 	if (err)
+ 		return ERR_PTR(err);
+ 
+-	if (req.flags)
+-		return ERR_PTR(-EINVAL);
++	if (req.flags & ~MLX5_IB_ALLOC_UCTX_DEVX)
++		return ERR_PTR(-EOPNOTSUPP);
+ 
+ 	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2)
+ 		return ERR_PTR(-EOPNOTSUPP);
+@@ -1751,6 +1751,18 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 			goto out_uars;
+ 	}
+ 
++	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX) {
++		/* Block DEVX on Infiniband as of SELinux */
++		if (mlx5_ib_port_link_layer(ibdev, 1) != IB_LINK_LAYER_ETHERNET) {
++			err = -EPERM;
++			goto out_td;
++		}
++
++		err = mlx5_ib_devx_create(dev, context);
++		if (err)
++			goto out_td;
++	}
++
+ 	INIT_LIST_HEAD(&context->vma_private_list);
+ 	mutex_init(&context->vma_private_list_mutex);
+ 	INIT_LIST_HEAD(&context->db_page_list);
+@@ -1811,7 +1823,7 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 
+ 	err = ib_copy_to_udata(udata, &resp, resp.response_length);
+ 	if (err)
+-		goto out_td;
++		goto out_mdev;
+ 
+ 	bfregi->ver = ver;
+ 	bfregi->num_low_latency_bfregs = req.num_low_latency_bfregs;
+@@ -1821,6 +1833,9 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 
+ 	return &context->ibucontext;
+ 
++out_mdev:
++	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX)
++		mlx5_ib_devx_destroy(dev, context);
+ out_td:
+ 	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
+ 		mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+@@ -1846,6 +1861,9 @@ static int mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
+ 	struct mlx5_ib_dev *dev = to_mdev(ibcontext->device);
+ 	struct mlx5_bfreg_info *bfregi;
+ 
++	if (context->devx_uid)
++		mlx5_ib_devx_destroy(dev, context);
++
+ 	bfregi = &context->bfregi;
+ 	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
+ 		mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/include/uapi/rdma/mlx5-abi.h b/include/uapi/rdma/mlx5-abi.h
+index 9c99cfe01569..c744d409c568 100644
+--- a/include/uapi/rdma/mlx5-abi.h
++++ b/include/uapi/rdma/mlx5-abi.h
+@@ -74,6 +74,9 @@ enum mlx5_lib_caps {
+ 	MLX5_LIB_CAP_4K_UAR	= (__u64)1 << 0,
+ };
+ 
++enum mlx5_ib_alloc_uctx_v2_flags {
++	MLX5_IB_ALLOC_UCTX_DEVX	= 1 << 0,
++};
+ struct mlx5_ib_alloc_ucontext_req_v2 {
+ 	__u32	total_num_bfregs;
+ 	__u32	num_low_latency_bfregs;
