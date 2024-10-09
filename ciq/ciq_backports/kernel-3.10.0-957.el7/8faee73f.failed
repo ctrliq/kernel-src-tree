@@ -1,0 +1,845 @@
+hwmon: (core) Add fan attribute support to new API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [hwmon] (core) Add fan attribute support to new API (David Arcari) [1593277]
+Rebuild_FUZZ: 92.47%
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit 8faee73f92cd4dd4928e6860001315a0cc834c99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8faee73f.failed
+
+	Acked-by: Punit Agrawal <punit.agrawal@arm.com>
+	Reviewed-by: Jonathan Cameron <jic23@kernel.org>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+(cherry picked from commit 8faee73f92cd4dd4928e6860001315a0cc834c99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hwmon/hwmon.c
+#	include/linux/hwmon.h
+diff --cc drivers/hwmon/hwmon.c
+index a26c385a435b,4729d4742ab7..000000000000
+--- a/drivers/hwmon/hwmon.c
++++ b/drivers/hwmon/hwmon.c
+@@@ -80,6 -106,483 +80,486 @@@ static struct class hwmon_class = 
+  
+  static DEFINE_IDA(hwmon_ida);
+  
+++<<<<<<< HEAD
+++=======
++ /* Thermal zone handling */
++ 
++ #if IS_REACHABLE(CONFIG_THERMAL) && defined(CONFIG_THERMAL_OF)
++ static int hwmon_thermal_get_temp(void *data, int *temp)
++ {
++ 	struct hwmon_thermal_data *tdata = data;
++ 	struct hwmon_device *hwdev = tdata->hwdev;
++ 	int ret;
++ 	long t;
++ 
++ 	ret = hwdev->chip->ops->read(&hwdev->dev, hwmon_temp, hwmon_temp_input,
++ 				     tdata->index, &t);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	*temp = t;
++ 
++ 	return 0;
++ }
++ 
++ static struct thermal_zone_of_device_ops hwmon_thermal_ops = {
++ 	.get_temp = hwmon_thermal_get_temp,
++ };
++ 
++ static int hwmon_thermal_add_sensor(struct device *dev,
++ 				    struct hwmon_device *hwdev, int index)
++ {
++ 	struct hwmon_thermal_data *tdata;
++ 
++ 	tdata = devm_kzalloc(dev, sizeof(*tdata), GFP_KERNEL);
++ 	if (!tdata)
++ 		return -ENOMEM;
++ 
++ 	tdata->hwdev = hwdev;
++ 	tdata->index = index;
++ 
++ 	devm_thermal_zone_of_sensor_register(&hwdev->dev, index, tdata,
++ 					     &hwmon_thermal_ops);
++ 
++ 	return 0;
++ }
++ #else
++ static int hwmon_thermal_add_sensor(struct device *dev,
++ 				    struct hwmon_device *hwdev, int index)
++ {
++ 	return 0;
++ }
++ #endif /* IS_REACHABLE(CONFIG_THERMAL) && defined(CONFIG_THERMAL_OF) */
++ 
++ /* sysfs attribute management */
++ 
++ static ssize_t hwmon_attr_show(struct device *dev,
++ 			       struct device_attribute *devattr, char *buf)
++ {
++ 	struct hwmon_device_attribute *hattr = to_hwmon_attr(devattr);
++ 	long val;
++ 	int ret;
++ 
++ 	ret = hattr->ops->read(dev, hattr->type, hattr->attr, hattr->index,
++ 			       &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return sprintf(buf, "%ld\n", val);
++ }
++ 
++ static ssize_t hwmon_attr_store(struct device *dev,
++ 				struct device_attribute *devattr,
++ 				const char *buf, size_t count)
++ {
++ 	struct hwmon_device_attribute *hattr = to_hwmon_attr(devattr);
++ 	long val;
++ 	int ret;
++ 
++ 	ret = kstrtol(buf, 10, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	ret = hattr->ops->write(dev, hattr->type, hattr->attr, hattr->index,
++ 				val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return count;
++ }
++ 
++ static int hwmon_attr_base(enum hwmon_sensor_types type)
++ {
++ 	if (type == hwmon_in)
++ 		return 0;
++ 	return 1;
++ }
++ 
++ static struct attribute *hwmon_genattr(struct device *dev,
++ 				       const void *drvdata,
++ 				       enum hwmon_sensor_types type,
++ 				       u32 attr,
++ 				       int index,
++ 				       const char *template,
++ 				       const struct hwmon_ops *ops)
++ {
++ 	struct hwmon_device_attribute *hattr;
++ 	struct device_attribute *dattr;
++ 	struct attribute *a;
++ 	umode_t mode;
++ 	char *name;
++ 
++ 	/* The attribute is invisible if there is no template string */
++ 	if (!template)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	mode = ops->is_visible(drvdata, type, attr, index);
++ 	if (!mode)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	if ((mode & S_IRUGO) && !ops->read)
++ 		return ERR_PTR(-EINVAL);
++ 	if ((mode & S_IWUGO) && !ops->write)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (type == hwmon_chip) {
++ 		name = (char *)template;
++ 	} else {
++ 		name = devm_kzalloc(dev, strlen(template) + 16, GFP_KERNEL);
++ 		if (!name)
++ 			return ERR_PTR(-ENOMEM);
++ 		scnprintf(name, strlen(template) + 16, template,
++ 			  index + hwmon_attr_base(type));
++ 	}
++ 
++ 	hattr = devm_kzalloc(dev, sizeof(*hattr), GFP_KERNEL);
++ 	if (!hattr)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	hattr->type = type;
++ 	hattr->attr = attr;
++ 	hattr->index = index;
++ 	hattr->ops = ops;
++ 
++ 	dattr = &hattr->dev_attr;
++ 	dattr->show = hwmon_attr_show;
++ 	dattr->store = hwmon_attr_store;
++ 
++ 	a = &dattr->attr;
++ 	sysfs_attr_init(a);
++ 	a->name = name;
++ 	a->mode = mode;
++ 
++ 	return a;
++ }
++ 
++ static const char * const hwmon_chip_attr_templates[] = {
++ 	[hwmon_chip_temp_reset_history] = "temp_reset_history",
++ 	[hwmon_chip_in_reset_history] = "in_reset_history",
++ 	[hwmon_chip_curr_reset_history] = "curr_reset_history",
++ 	[hwmon_chip_power_reset_history] = "power_reset_history",
++ 	[hwmon_chip_update_interval] = "update_interval",
++ 	[hwmon_chip_alarms] = "alarms",
++ };
++ 
++ static const char * const hwmon_temp_attr_templates[] = {
++ 	[hwmon_temp_input] = "temp%d_input",
++ 	[hwmon_temp_type] = "temp%d_type",
++ 	[hwmon_temp_lcrit] = "temp%d_lcrit",
++ 	[hwmon_temp_lcrit_hyst] = "temp%d_lcrit_hyst",
++ 	[hwmon_temp_min] = "temp%d_min",
++ 	[hwmon_temp_min_hyst] = "temp%d_min_hyst",
++ 	[hwmon_temp_max] = "temp%d_max",
++ 	[hwmon_temp_max_hyst] = "temp%d_max_hyst",
++ 	[hwmon_temp_crit] = "temp%d_crit",
++ 	[hwmon_temp_crit_hyst] = "temp%d_crit_hyst",
++ 	[hwmon_temp_emergency] = "temp%d_emergency",
++ 	[hwmon_temp_emergency_hyst] = "temp%d_emergency_hyst",
++ 	[hwmon_temp_alarm] = "temp%d_alarm",
++ 	[hwmon_temp_lcrit_alarm] = "temp%d_lcrit_alarm",
++ 	[hwmon_temp_min_alarm] = "temp%d_min_alarm",
++ 	[hwmon_temp_max_alarm] = "temp%d_max_alarm",
++ 	[hwmon_temp_crit_alarm] = "temp%d_crit_alarm",
++ 	[hwmon_temp_emergency_alarm] = "temp%d_emergency_alarm",
++ 	[hwmon_temp_fault] = "temp%d_fault",
++ 	[hwmon_temp_offset] = "temp%d_offset",
++ 	[hwmon_temp_label] = "temp%d_label",
++ 	[hwmon_temp_lowest] = "temp%d_lowest",
++ 	[hwmon_temp_highest] = "temp%d_highest",
++ 	[hwmon_temp_reset_history] = "temp%d_reset_history",
++ };
++ 
++ static const char * const hwmon_in_attr_templates[] = {
++ 	[hwmon_in_input] = "in%d_input",
++ 	[hwmon_in_min] = "in%d_min",
++ 	[hwmon_in_max] = "in%d_max",
++ 	[hwmon_in_lcrit] = "in%d_lcrit",
++ 	[hwmon_in_crit] = "in%d_crit",
++ 	[hwmon_in_average] = "in%d_average",
++ 	[hwmon_in_lowest] = "in%d_lowest",
++ 	[hwmon_in_highest] = "in%d_highest",
++ 	[hwmon_in_reset_history] = "in%d_reset_history",
++ 	[hwmon_in_label] = "in%d_label",
++ 	[hwmon_in_alarm] = "in%d_alarm",
++ 	[hwmon_in_min_alarm] = "in%d_min_alarm",
++ 	[hwmon_in_max_alarm] = "in%d_max_alarm",
++ 	[hwmon_in_lcrit_alarm] = "in%d_lcrit_alarm",
++ 	[hwmon_in_crit_alarm] = "in%d_crit_alarm",
++ };
++ 
++ static const char * const hwmon_curr_attr_templates[] = {
++ 	[hwmon_curr_input] = "curr%d_input",
++ 	[hwmon_curr_min] = "curr%d_min",
++ 	[hwmon_curr_max] = "curr%d_max",
++ 	[hwmon_curr_lcrit] = "curr%d_lcrit",
++ 	[hwmon_curr_crit] = "curr%d_crit",
++ 	[hwmon_curr_average] = "curr%d_average",
++ 	[hwmon_curr_lowest] = "curr%d_lowest",
++ 	[hwmon_curr_highest] = "curr%d_highest",
++ 	[hwmon_curr_reset_history] = "curr%d_reset_history",
++ 	[hwmon_curr_label] = "curr%d_label",
++ 	[hwmon_curr_alarm] = "curr%d_alarm",
++ 	[hwmon_curr_min_alarm] = "curr%d_min_alarm",
++ 	[hwmon_curr_max_alarm] = "curr%d_max_alarm",
++ 	[hwmon_curr_lcrit_alarm] = "curr%d_lcrit_alarm",
++ 	[hwmon_curr_crit_alarm] = "curr%d_crit_alarm",
++ };
++ 
++ static const char * const hwmon_power_attr_templates[] = {
++ 	[hwmon_power_average] = "power%d_average",
++ 	[hwmon_power_average_interval] = "power%d_average_interval",
++ 	[hwmon_power_average_interval_max] = "power%d_interval_max",
++ 	[hwmon_power_average_interval_min] = "power%d_interval_min",
++ 	[hwmon_power_average_highest] = "power%d_average_highest",
++ 	[hwmon_power_average_lowest] = "power%d_average_lowest",
++ 	[hwmon_power_average_max] = "power%d_average_max",
++ 	[hwmon_power_average_min] = "power%d_average_min",
++ 	[hwmon_power_input] = "power%d_input",
++ 	[hwmon_power_input_highest] = "power%d_input_highest",
++ 	[hwmon_power_input_lowest] = "power%d_input_lowest",
++ 	[hwmon_power_reset_history] = "power%d_reset_history",
++ 	[hwmon_power_accuracy] = "power%d_accuracy",
++ 	[hwmon_power_cap] = "power%d_cap",
++ 	[hwmon_power_cap_hyst] = "power%d_cap_hyst",
++ 	[hwmon_power_cap_max] = "power%d_cap_max",
++ 	[hwmon_power_cap_min] = "power%d_cap_min",
++ 	[hwmon_power_max] = "power%d_max",
++ 	[hwmon_power_crit] = "power%d_crit",
++ 	[hwmon_power_label] = "power%d_label",
++ 	[hwmon_power_alarm] = "power%d_alarm",
++ 	[hwmon_power_cap_alarm] = "power%d_cap_alarm",
++ 	[hwmon_power_max_alarm] = "power%d_max_alarm",
++ 	[hwmon_power_crit_alarm] = "power%d_crit_alarm",
++ };
++ 
++ static const char * const hwmon_energy_attr_templates[] = {
++ 	[hwmon_energy_input] = "energy%d_input",
++ 	[hwmon_energy_label] = "energy%d_label",
++ };
++ 
++ static const char * const hwmon_humidity_attr_templates[] = {
++ 	[hwmon_humidity_input] = "humidity%d_input",
++ 	[hwmon_humidity_label] = "humidity%d_label",
++ 	[hwmon_humidity_min] = "humidity%d_min",
++ 	[hwmon_humidity_min_hyst] = "humidity%d_min_hyst",
++ 	[hwmon_humidity_max] = "humidity%d_max",
++ 	[hwmon_humidity_max_hyst] = "humidity%d_max_hyst",
++ 	[hwmon_humidity_alarm] = "humidity%d_alarm",
++ 	[hwmon_humidity_fault] = "humidity%d_fault",
++ };
++ 
++ static const char * const hwmon_fan_attr_templates[] = {
++ 	[hwmon_fan_input] = "fan%d_input",
++ 	[hwmon_fan_label] = "fan%d_label",
++ 	[hwmon_fan_min] = "fan%d_min",
++ 	[hwmon_fan_max] = "fan%d_max",
++ 	[hwmon_fan_div] = "fan%d_div",
++ 	[hwmon_fan_pulses] = "fan%d_pulses",
++ 	[hwmon_fan_target] = "fan%d_target",
++ 	[hwmon_fan_alarm] = "fan%d_alarm",
++ 	[hwmon_fan_min_alarm] = "fan%d_min_alarm",
++ 	[hwmon_fan_max_alarm] = "fan%d_max_alarm",
++ 	[hwmon_fan_fault] = "fan%d_fault",
++ };
++ 
++ static const char * const *__templates[] = {
++ 	[hwmon_chip] = hwmon_chip_attr_templates,
++ 	[hwmon_temp] = hwmon_temp_attr_templates,
++ 	[hwmon_in] = hwmon_in_attr_templates,
++ 	[hwmon_curr] = hwmon_curr_attr_templates,
++ 	[hwmon_power] = hwmon_power_attr_templates,
++ 	[hwmon_energy] = hwmon_energy_attr_templates,
++ 	[hwmon_humidity] = hwmon_humidity_attr_templates,
++ 	[hwmon_fan] = hwmon_fan_attr_templates,
++ };
++ 
++ static const int __templates_size[] = {
++ 	[hwmon_chip] = ARRAY_SIZE(hwmon_chip_attr_templates),
++ 	[hwmon_temp] = ARRAY_SIZE(hwmon_temp_attr_templates),
++ 	[hwmon_in] = ARRAY_SIZE(hwmon_in_attr_templates),
++ 	[hwmon_curr] = ARRAY_SIZE(hwmon_curr_attr_templates),
++ 	[hwmon_power] = ARRAY_SIZE(hwmon_power_attr_templates),
++ 	[hwmon_energy] = ARRAY_SIZE(hwmon_energy_attr_templates),
++ 	[hwmon_humidity] = ARRAY_SIZE(hwmon_humidity_attr_templates),
++ 	[hwmon_fan] = ARRAY_SIZE(hwmon_fan_attr_templates),
++ };
++ 
++ static int hwmon_num_channel_attrs(const struct hwmon_channel_info *info)
++ {
++ 	int i, n;
++ 
++ 	for (i = n = 0; info->config[i]; i++)
++ 		n += hweight32(info->config[i]);
++ 
++ 	return n;
++ }
++ 
++ static int hwmon_genattrs(struct device *dev,
++ 			  const void *drvdata,
++ 			  struct attribute **attrs,
++ 			  const struct hwmon_ops *ops,
++ 			  const struct hwmon_channel_info *info)
++ {
++ 	const char * const *templates;
++ 	int template_size;
++ 	int i, aindex = 0;
++ 
++ 	if (info->type >= ARRAY_SIZE(__templates))
++ 		return -EINVAL;
++ 
++ 	templates = __templates[info->type];
++ 	template_size = __templates_size[info->type];
++ 
++ 	for (i = 0; info->config[i]; i++) {
++ 		u32 attr_mask = info->config[i];
++ 		u32 attr;
++ 
++ 		while (attr_mask) {
++ 			struct attribute *a;
++ 
++ 			attr = __ffs(attr_mask);
++ 			attr_mask &= ~BIT(attr);
++ 			if (attr >= template_size)
++ 				return -EINVAL;
++ 			a = hwmon_genattr(dev, drvdata, info->type, attr, i,
++ 					  templates[attr], ops);
++ 			if (IS_ERR(a)) {
++ 				if (PTR_ERR(a) != -ENOENT)
++ 					return PTR_ERR(a);
++ 				continue;
++ 			}
++ 			attrs[aindex++] = a;
++ 		}
++ 	}
++ 	return aindex;
++ }
++ 
++ static struct attribute **
++ __hwmon_create_attrs(struct device *dev, const void *drvdata,
++ 		     const struct hwmon_chip_info *chip)
++ {
++ 	int ret, i, aindex = 0, nattrs = 0;
++ 	struct attribute **attrs;
++ 
++ 	for (i = 0; chip->info[i]; i++)
++ 		nattrs += hwmon_num_channel_attrs(chip->info[i]);
++ 
++ 	if (nattrs == 0)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	attrs = devm_kcalloc(dev, nattrs + 1, sizeof(*attrs), GFP_KERNEL);
++ 	if (!attrs)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	for (i = 0; chip->info[i]; i++) {
++ 		ret = hwmon_genattrs(dev, drvdata, &attrs[aindex], chip->ops,
++ 				     chip->info[i]);
++ 		if (ret < 0)
++ 			return ERR_PTR(ret);
++ 		aindex += ret;
++ 	}
++ 
++ 	return attrs;
++ }
++ 
++ static struct device *
++ __hwmon_device_register(struct device *dev, const char *name, void *drvdata,
++ 			const struct hwmon_chip_info *chip,
++ 			const struct attribute_group **groups)
++ {
++ 	struct hwmon_device *hwdev;
++ 	struct device *hdev;
++ 	int i, j, err, id;
++ 
++ 	/* Do not accept invalid characters in hwmon name attribute */
++ 	if (name && (!strlen(name) || strpbrk(name, "-* \t\n")))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	id = ida_simple_get(&hwmon_ida, 0, 0, GFP_KERNEL);
++ 	if (id < 0)
++ 		return ERR_PTR(id);
++ 
++ 	hwdev = kzalloc(sizeof(*hwdev), GFP_KERNEL);
++ 	if (hwdev == NULL) {
++ 		err = -ENOMEM;
++ 		goto ida_remove;
++ 	}
++ 
++ 	hdev = &hwdev->dev;
++ 
++ 	if (chip && chip->ops->is_visible) {
++ 		struct attribute **attrs;
++ 		int ngroups = 2;
++ 
++ 		if (groups)
++ 			for (i = 0; groups[i]; i++)
++ 				ngroups++;
++ 
++ 		hwdev->groups = devm_kcalloc(dev, ngroups, sizeof(*groups),
++ 					     GFP_KERNEL);
++ 		if (!hwdev->groups)
++ 			return ERR_PTR(-ENOMEM);
++ 
++ 		attrs = __hwmon_create_attrs(dev, drvdata, chip);
++ 		if (IS_ERR(attrs)) {
++ 			err = PTR_ERR(attrs);
++ 			goto free_hwmon;
++ 		}
++ 
++ 		hwdev->group.attrs = attrs;
++ 		ngroups = 0;
++ 		hwdev->groups[ngroups++] = &hwdev->group;
++ 
++ 		if (groups) {
++ 			for (i = 0; groups[i]; i++)
++ 				hwdev->groups[ngroups++] = groups[i];
++ 		}
++ 
++ 		hdev->groups = hwdev->groups;
++ 	} else {
++ 		hdev->groups = groups;
++ 	}
++ 
++ 	hwdev->name = name;
++ 	hdev->class = &hwmon_class;
++ 	hdev->parent = dev;
++ 	hdev->of_node = dev ? dev->of_node : NULL;
++ 	hwdev->chip = chip;
++ 	dev_set_drvdata(hdev, drvdata);
++ 	dev_set_name(hdev, HWMON_ID_FORMAT, id);
++ 	err = device_register(hdev);
++ 	if (err)
++ 		goto free_hwmon;
++ 
++ 	if (chip && chip->ops->is_visible && chip->ops->read &&
++ 	    chip->info[0]->type == hwmon_chip &&
++ 	    (chip->info[0]->config[0] & HWMON_C_REGISTER_TZ)) {
++ 		const struct hwmon_channel_info **info = chip->info;
++ 
++ 		for (i = 1; info[i]; i++) {
++ 			if (info[i]->type != hwmon_temp)
++ 				continue;
++ 
++ 			for (j = 0; info[i]->config[j]; j++) {
++ 				if (!chip->ops->is_visible(drvdata, hwmon_temp,
++ 							   hwmon_temp_input, j))
++ 					continue;
++ 				if (info[i]->config[j] & HWMON_T_INPUT)
++ 					hwmon_thermal_add_sensor(dev, hwdev, j);
++ 			}
++ 		}
++ 	}
++ 
++ 	return hdev;
++ 
++ free_hwmon:
++ 	kfree(hwdev);
++ ida_remove:
++ 	ida_simple_remove(&hwmon_ida, id);
++ 	return ERR_PTR(err);
++ }
++ 
+++>>>>>>> 8faee73f92cd (hwmon: (core) Add fan attribute support to new API)
+  /**
+   * hwmon_device_register_with_groups - register w/ hwmon
+   * @dev: the parent device
+diff --cc include/linux/hwmon.h
+index 09354f6c1d63,74e89d45ff67..000000000000
+--- a/include/linux/hwmon.h
++++ b/include/linux/hwmon.h
+@@@ -17,6 -17,325 +17,326 @@@
+  struct device;
+  struct attribute_group;
+  
+++<<<<<<< HEAD
+++=======
++ enum hwmon_sensor_types {
++ 	hwmon_chip,
++ 	hwmon_temp,
++ 	hwmon_in,
++ 	hwmon_curr,
++ 	hwmon_power,
++ 	hwmon_energy,
++ 	hwmon_humidity,
++ 	hwmon_fan,
++ };
++ 
++ enum hwmon_chip_attributes {
++ 	hwmon_chip_temp_reset_history,
++ 	hwmon_chip_in_reset_history,
++ 	hwmon_chip_curr_reset_history,
++ 	hwmon_chip_power_reset_history,
++ 	hwmon_chip_register_tz,
++ 	hwmon_chip_update_interval,
++ 	hwmon_chip_alarms,
++ };
++ 
++ #define HWMON_C_TEMP_RESET_HISTORY	BIT(hwmon_chip_temp_reset_history)
++ #define HWMON_C_IN_RESET_HISTORY	BIT(hwmon_chip_in_reset_history)
++ #define HWMON_C_CURR_RESET_HISTORY	BIT(hwmon_chip_curr_reset_history)
++ #define HWMON_C_POWER_RESET_HISTORY	BIT(hwmon_chip_power_reset_history)
++ #define HWMON_C_REGISTER_TZ		BIT(hwmon_chip_register_tz)
++ #define HWMON_C_UPDATE_INTERVAL		BIT(hwmon_chip_update_interval)
++ #define HWMON_C_ALARMS			BIT(hwmon_chip_alarms)
++ 
++ enum hwmon_temp_attributes {
++ 	hwmon_temp_input = 0,
++ 	hwmon_temp_type,
++ 	hwmon_temp_lcrit,
++ 	hwmon_temp_lcrit_hyst,
++ 	hwmon_temp_min,
++ 	hwmon_temp_min_hyst,
++ 	hwmon_temp_max,
++ 	hwmon_temp_max_hyst,
++ 	hwmon_temp_crit,
++ 	hwmon_temp_crit_hyst,
++ 	hwmon_temp_emergency,
++ 	hwmon_temp_emergency_hyst,
++ 	hwmon_temp_alarm,
++ 	hwmon_temp_lcrit_alarm,
++ 	hwmon_temp_min_alarm,
++ 	hwmon_temp_max_alarm,
++ 	hwmon_temp_crit_alarm,
++ 	hwmon_temp_emergency_alarm,
++ 	hwmon_temp_fault,
++ 	hwmon_temp_offset,
++ 	hwmon_temp_label,
++ 	hwmon_temp_lowest,
++ 	hwmon_temp_highest,
++ 	hwmon_temp_reset_history,
++ };
++ 
++ #define HWMON_T_INPUT		BIT(hwmon_temp_input)
++ #define HWMON_T_TYPE		BIT(hwmon_temp_type)
++ #define HWMON_T_LCRIT		BIT(hwmon_temp_lcrit)
++ #define HWMON_T_LCRIT_HYST	BIT(hwmon_temp_lcrit_hyst)
++ #define HWMON_T_MIN		BIT(hwmon_temp_min)
++ #define HWMON_T_MIN_HYST	BIT(hwmon_temp_min_hyst)
++ #define HWMON_T_MAX		BIT(hwmon_temp_max)
++ #define HWMON_T_MAX_HYST	BIT(hwmon_temp_max_hyst)
++ #define HWMON_T_CRIT		BIT(hwmon_temp_crit)
++ #define HWMON_T_CRIT_HYST	BIT(hwmon_temp_crit_hyst)
++ #define HWMON_T_EMERGENCY	BIT(hwmon_temp_emergency)
++ #define HWMON_T_EMERGENCY_HYST	BIT(hwmon_temp_emergency_hyst)
++ #define HWMON_T_MIN_ALARM	BIT(hwmon_temp_min_alarm)
++ #define HWMON_T_MAX_ALARM	BIT(hwmon_temp_max_alarm)
++ #define HWMON_T_CRIT_ALARM	BIT(hwmon_temp_crit_alarm)
++ #define HWMON_T_EMERGENCY_ALARM	BIT(hwmon_temp_emergency_alarm)
++ #define HWMON_T_FAULT		BIT(hwmon_temp_fault)
++ #define HWMON_T_OFFSET		BIT(hwmon_temp_offset)
++ #define HWMON_T_LABEL		BIT(hwmon_temp_label)
++ #define HWMON_T_LOWEST		BIT(hwmon_temp_lowest)
++ #define HWMON_T_HIGHEST		BIT(hwmon_temp_highest)
++ #define HWMON_T_RESET_HISTORY	BIT(hwmon_temp_reset_history)
++ 
++ enum hwmon_in_attributes {
++ 	hwmon_in_input,
++ 	hwmon_in_min,
++ 	hwmon_in_max,
++ 	hwmon_in_lcrit,
++ 	hwmon_in_crit,
++ 	hwmon_in_average,
++ 	hwmon_in_lowest,
++ 	hwmon_in_highest,
++ 	hwmon_in_reset_history,
++ 	hwmon_in_label,
++ 	hwmon_in_alarm,
++ 	hwmon_in_min_alarm,
++ 	hwmon_in_max_alarm,
++ 	hwmon_in_lcrit_alarm,
++ 	hwmon_in_crit_alarm,
++ };
++ 
++ #define HWMON_I_INPUT		BIT(hwmon_in_input)
++ #define HWMON_I_MIN		BIT(hwmon_in_min)
++ #define HWMON_I_MAX		BIT(hwmon_in_max)
++ #define HWMON_I_LCRIT		BIT(hwmon_in_lcrit)
++ #define HWMON_I_CRIT		BIT(hwmon_in_crit)
++ #define HWMON_I_AVERAGE		BIT(hwmon_in_average)
++ #define HWMON_I_LOWEST		BIT(hwmon_in_lowest)
++ #define HWMON_I_HIGHEST		BIT(hwmon_in_highest)
++ #define HWMON_I_RESET_HISTORY	BIT(hwmon_in_reset_history)
++ #define HWMON_I_LABEL		BIT(hwmon_in_label)
++ #define HWMON_I_ALARM		BIT(hwmon_in_alarm)
++ #define HWMON_I_MIN_ALARM	BIT(hwmon_in_min_alarm)
++ #define HWMON_I_MAX_ALARM	BIT(hwmon_in_max_alarm)
++ #define HWMON_I_LCRIT_ALARM	BIT(hwmon_in_lcrit_alarm)
++ #define HWMON_I_CRIT_ALARM	BIT(hwmon_in_crit_alarm)
++ 
++ enum hwmon_curr_attributes {
++ 	hwmon_curr_input,
++ 	hwmon_curr_min,
++ 	hwmon_curr_max,
++ 	hwmon_curr_lcrit,
++ 	hwmon_curr_crit,
++ 	hwmon_curr_average,
++ 	hwmon_curr_lowest,
++ 	hwmon_curr_highest,
++ 	hwmon_curr_reset_history,
++ 	hwmon_curr_label,
++ 	hwmon_curr_alarm,
++ 	hwmon_curr_min_alarm,
++ 	hwmon_curr_max_alarm,
++ 	hwmon_curr_lcrit_alarm,
++ 	hwmon_curr_crit_alarm,
++ };
++ 
++ #define HWMON_C_INPUT		BIT(hwmon_curr_input)
++ #define HWMON_C_MIN		BIT(hwmon_curr_min)
++ #define HWMON_C_MAX		BIT(hwmon_curr_max)
++ #define HWMON_C_LCRIT		BIT(hwmon_curr_lcrit)
++ #define HWMON_C_CRIT		BIT(hwmon_curr_crit)
++ #define HWMON_C_AVERAGE		BIT(hwmon_curr_average)
++ #define HWMON_C_LOWEST		BIT(hwmon_curr_lowest)
++ #define HWMON_C_HIGHEST		BIT(hwmon_curr_highest)
++ #define HWMON_C_RESET_HISTORY	BIT(hwmon_curr_reset_history)
++ #define HWMON_C_LABEL		BIT(hwmon_curr_label)
++ #define HWMON_C_ALARM		BIT(hwmon_curr_alarm)
++ #define HWMON_C_MIN_ALARM	BIT(hwmon_curr_min_alarm)
++ #define HWMON_C_MAX_ALARM	BIT(hwmon_curr_max_alarm)
++ #define HWMON_C_LCRIT_ALARM	BIT(hwmon_curr_lcrit_alarm)
++ #define HWMON_C_CRIT_ALARM	BIT(hwmon_curr_crit_alarm)
++ 
++ enum hwmon_power_attributes {
++ 	hwmon_power_average,
++ 	hwmon_power_average_interval,
++ 	hwmon_power_average_interval_max,
++ 	hwmon_power_average_interval_min,
++ 	hwmon_power_average_highest,
++ 	hwmon_power_average_lowest,
++ 	hwmon_power_average_max,
++ 	hwmon_power_average_min,
++ 	hwmon_power_input,
++ 	hwmon_power_input_highest,
++ 	hwmon_power_input_lowest,
++ 	hwmon_power_reset_history,
++ 	hwmon_power_accuracy,
++ 	hwmon_power_cap,
++ 	hwmon_power_cap_hyst,
++ 	hwmon_power_cap_max,
++ 	hwmon_power_cap_min,
++ 	hwmon_power_max,
++ 	hwmon_power_crit,
++ 	hwmon_power_label,
++ 	hwmon_power_alarm,
++ 	hwmon_power_cap_alarm,
++ 	hwmon_power_max_alarm,
++ 	hwmon_power_crit_alarm,
++ };
++ 
++ #define HWMON_P_AVERAGE			BIT(hwmon_power_average)
++ #define HWMON_P_AVERAGE_INTERVAL	BIT(hwmon_power_average_interval)
++ #define HWMON_P_AVERAGE_INTERVAL_MAX	BIT(hwmon_power_average_interval_max)
++ #define HWMON_P_AVERAGE_INTERVAL_MIN	BIT(hwmon_power_average_interval_min)
++ #define HWMON_P_AVERAGE_HIGHEST		BIT(hwmon_power_average_highest)
++ #define HWMON_P_AVERAGE_LOWEST		BIT(hwmon_power_average_lowest)
++ #define HWMON_P_AVERAGE_MAX		BIT(hwmon_power_average_max)
++ #define HWMON_P_AVERAGE_MIN		BIT(hwmon_power_average_min)
++ #define HWMON_P_INPUT			BIT(hwmon_power_input)
++ #define HWMON_P_INPUT_HIGHEST		BIT(hwmon_power_input_highest)
++ #define HWMON_P_INPUT_LOWEST		BIT(hwmon_power_input_lowest)
++ #define HWMON_P_RESET_HISTORY		BIT(hwmon_power_reset_history)
++ #define HWMON_P_ACCURACY		BIT(hwmon_power_accuracy)
++ #define HWMON_P_CAP			BIT(hwmon_power_cap)
++ #define HWMON_P_CAP_HYST		BIT(hwmon_power_cap_hyst)
++ #define HWMON_P_CAP_MAX			BIT(hwmon_power_cap_max)
++ #define HWMON_P_CAP_MIN			BIT(hwmon_power_cap_min)
++ #define HWMON_P_MAX			BIT(hwmon_power_max)
++ #define HWMON_P_CRIT			BIT(hwmon_power_crit)
++ #define HWMON_P_LABEL			BIT(hwmon_power_label)
++ #define HWMON_P_ALARM			BIT(hwmon_power_alarm)
++ #define HWMON_P_CAP_ALARM		BIT(hwmon_power_cap_alarm)
++ #define HWMON_P_MAX_ALARM		BIT(hwmon_power_max_alarm)
++ #define HWMON_P_CRIT_ALARM		BIT(hwmon_power_crit_alarm)
++ 
++ enum hwmon_energy_attributes {
++ 	hwmon_energy_input,
++ 	hwmon_energy_label,
++ };
++ 
++ #define HWMON_E_INPUT			BIT(hwmon_energy_input)
++ #define HWMON_E_LABEL			BIT(hwmon_energy_label)
++ 
++ enum hwmon_humidity_attributes {
++ 	hwmon_humidity_input,
++ 	hwmon_humidity_label,
++ 	hwmon_humidity_min,
++ 	hwmon_humidity_min_hyst,
++ 	hwmon_humidity_max,
++ 	hwmon_humidity_max_hyst,
++ 	hwmon_humidity_alarm,
++ 	hwmon_humidity_fault,
++ };
++ 
++ #define HWMON_H_INPUT			BIT(hwmon_humidity_input)
++ #define HWMON_H_LABEL			BIT(hwmon_humidity_label)
++ #define HWMON_H_MIN			BIT(hwmon_humidity_min)
++ #define HWMON_H_MIN_HYST		BIT(hwmon_humidity_min_hyst)
++ #define HWMON_H_MAX			BIT(hwmon_humidity_max)
++ #define HWMON_H_MAX_HYST		BIT(hwmon_humidity_max_hyst)
++ #define HWMON_H_ALARM			BIT(hwmon_humidity_alarm)
++ #define HWMON_H_FAULT			BIT(hwmon_humidity_fault)
++ 
++ enum hwmon_fan_attributes {
++ 	hwmon_fan_input,
++ 	hwmon_fan_label,
++ 	hwmon_fan_min,
++ 	hwmon_fan_max,
++ 	hwmon_fan_div,
++ 	hwmon_fan_pulses,
++ 	hwmon_fan_target,
++ 	hwmon_fan_alarm,
++ 	hwmon_fan_min_alarm,
++ 	hwmon_fan_max_alarm,
++ 	hwmon_fan_fault,
++ };
++ 
++ #define HWMON_F_INPUT			BIT(hwmon_fan_input)
++ #define HWMON_F_LABEL			BIT(hwmon_fan_label)
++ #define HWMON_F_MIN			BIT(hwmon_fan_min)
++ #define HWMON_F_MAX			BIT(hwmon_fan_max)
++ #define HWMON_F_DIV			BIT(hwmon_fan_div)
++ #define HWMON_F_PULSES			BIT(hwmon_fan_pulses)
++ #define HWMON_F_TARGET			BIT(hwmon_fan_target)
++ #define HWMON_F_ALARM			BIT(hwmon_fan_alarm)
++ #define HWMON_F_MIN_ALARM		BIT(hwmon_fan_min_alarm)
++ #define HWMON_F_MAX_ALARM		BIT(hwmon_fan_max_alarm)
++ #define HWMON_F_FAULT			BIT(hwmon_fan_fault)
++ 
++ /**
++  * struct hwmon_ops - hwmon device operations
++  * @is_visible: Callback to return attribute visibility. Mandatory.
++  *		Parameters are:
++  *		@const void *drvdata:
++  *			Pointer to driver-private data structure passed
++  *			as argument to hwmon_device_register_with_info().
++  *		@type:	Sensor type
++  *		@attr:	Sensor attribute
++  *		@channel:
++  *			Channel number
++  *		The function returns the file permissions.
++  *		If the return value is 0, no attribute will be created.
++  * @read:       Read callback. Optional. If not provided, attributes
++  *		will not be readable.
++  *		Parameters are:
++  *		@dev:	Pointer to hardware monitoring device
++  *		@type:	Sensor type
++  *		@attr:	Sensor attribute
++  *		@channel:
++  *			Channel number
++  *		@val:	Pointer to returned value
++  *		The function returns 0 on success or a negative error number.
++  * @write:	Write callback. Optional. If not provided, attributes
++  *		will not be writable.
++  *		Parameters are:
++  *		@dev:	Pointer to hardware monitoring device
++  *		@type:	Sensor type
++  *		@attr:	Sensor attribute
++  *		@channel:
++  *			Channel number
++  *		@val:	Value to write
++  *		The function returns 0 on success or a negative error number.
++  */
++ struct hwmon_ops {
++ 	umode_t (*is_visible)(const void *drvdata, enum hwmon_sensor_types type,
++ 			      u32 attr, int channel);
++ 	int (*read)(struct device *dev, enum hwmon_sensor_types type,
++ 		    u32 attr, int channel, long *val);
++ 	int (*write)(struct device *dev, enum hwmon_sensor_types type,
++ 		     u32 attr, int channel, long val);
++ };
++ 
++ /**
++  * Channel information
++  * @type:	Channel type.
++  * @config:	Pointer to NULL-terminated list of channel parameters.
++  *		Use for per-channel attributes.
++  */
++ struct hwmon_channel_info {
++ 	enum hwmon_sensor_types type;
++ 	const u32 *config;
++ };
++ 
++ /**
++  * Chip configuration
++  * @ops:	Pointer to hwmon operations.
++  * @info:	Null-terminated list of channel information.
++  */
++ struct hwmon_chip_info {
++ 	const struct hwmon_ops *ops;
++ 	const struct hwmon_channel_info **info;
++ };
++ 
+++>>>>>>> 8faee73f92cd (hwmon: (core) Add fan attribute support to new API)
+  struct device *hwmon_device_register(struct device *dev);
+  struct device *
+  hwmon_device_register_with_groups(struct device *dev, const char *name,
+* Unmerged path drivers/hwmon/hwmon.c
+* Unmerged path include/linux/hwmon.h
