@@ -1,0 +1,213 @@
+SUNRPC: Allow changing of the TCP timeout parameters on the fly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.66.1.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 7196dbb02ea05835b9ee56910ee82cb55422c7f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.66.1.el7/7196dbb0.failed
+
+When the NFSv4 server tells us the lease period, we usually want
+to adjust down the timeout parameters on the TCP connection to
+ensure that we don't miss lease renewals due to a faulty connection.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 7196dbb02ea05835b9ee56910ee82cb55422c7f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtsock.c
+diff --cc net/sunrpc/xprtsock.c
+index 511d26eb9236,810e9b59be16..000000000000
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@@ -2257,6 -2240,66 +2262,69 @@@ static void xs_tcp_shutdown(struct rpc_
+  		xs_reset_transport(transport);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void xs_tcp_set_socket_timeouts(struct rpc_xprt *xprt,
++ 		struct socket *sock)
++ {
++ 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
++ 	unsigned int keepidle;
++ 	unsigned int keepcnt;
++ 	unsigned int opt_on = 1;
++ 	unsigned int timeo;
++ 
++ 	spin_lock_bh(&xprt->transport_lock);
++ 	keepidle = DIV_ROUND_UP(xprt->timeout->to_initval, HZ);
++ 	keepcnt = xprt->timeout->to_retries + 1;
++ 	timeo = jiffies_to_msecs(xprt->timeout->to_initval) *
++ 		(xprt->timeout->to_retries + 1);
++ 	clear_bit(XPRT_SOCK_UPD_TIMEOUT, &transport->sock_state);
++ 	spin_unlock_bh(&xprt->transport_lock);
++ 
++ 	/* TCP Keepalive options */
++ 	kernel_setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
++ 			(char *)&opt_on, sizeof(opt_on));
++ 	kernel_setsockopt(sock, SOL_TCP, TCP_KEEPIDLE,
++ 			(char *)&keepidle, sizeof(keepidle));
++ 	kernel_setsockopt(sock, SOL_TCP, TCP_KEEPINTVL,
++ 			(char *)&keepidle, sizeof(keepidle));
++ 	kernel_setsockopt(sock, SOL_TCP, TCP_KEEPCNT,
++ 			(char *)&keepcnt, sizeof(keepcnt));
++ 
++ 	/* TCP user timeout (see RFC5482) */
++ 	kernel_setsockopt(sock, SOL_TCP, TCP_USER_TIMEOUT,
++ 			(char *)&timeo, sizeof(timeo));
++ }
++ 
++ static void xs_tcp_set_connect_timeout(struct rpc_xprt *xprt,
++ 		unsigned long connect_timeout,
++ 		unsigned long reconnect_timeout)
++ {
++ 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
++ 	struct rpc_timeout to;
++ 	unsigned long initval;
++ 
++ 	spin_lock_bh(&xprt->transport_lock);
++ 	if (reconnect_timeout < xprt->max_reconnect_timeout)
++ 		xprt->max_reconnect_timeout = reconnect_timeout;
++ 	if (connect_timeout < xprt->connect_timeout) {
++ 		memcpy(&to, xprt->timeout, sizeof(to));
++ 		initval = DIV_ROUND_UP(connect_timeout, to.to_retries + 1);
++ 		/* Arbitrary lower limit */
++ 		if (initval <  XS_TCP_INIT_REEST_TO << 1)
++ 			initval = XS_TCP_INIT_REEST_TO << 1;
++ 		to.to_initval = initval;
++ 		to.to_maxval = initval;
++ 		memcpy(&transport->tcp_timeout, &to,
++ 				sizeof(transport->tcp_timeout));
++ 		xprt->timeout = &transport->tcp_timeout;
++ 		xprt->connect_timeout = connect_timeout;
++ 	}
++ 	set_bit(XPRT_SOCK_UPD_TIMEOUT, &transport->sock_state);
++ 	spin_unlock_bh(&xprt->transport_lock);
++ }
++ 
+++>>>>>>> 7196dbb02ea0 (SUNRPC: Allow changing of the TCP timeout parameters on the fly)
+  static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
+  {
+  	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index 674fe42af7c0..7eee0008c989 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -138,6 +138,9 @@ struct rpc_xprt_ops {
+ 	void		(*release_request)(struct rpc_task *task);
+ 	void		(*close)(struct rpc_xprt *xprt);
+ 	void		(*destroy)(struct rpc_xprt *xprt);
++	void		(*set_connect_timeout)(struct rpc_xprt *xprt,
++					unsigned long connect_timeout,
++					unsigned long reconnect_timeout);
+ 	void		(*print_stats)(struct rpc_xprt *xprt, struct seq_file *seq);
+ 	int		(*enable_swap)(struct rpc_xprt *xprt);
+ 	void		(*disable_swap)(struct rpc_xprt *xprt);
+@@ -222,6 +225,7 @@ struct rpc_xprt {
+ 	struct timer_list	timer;
+ 	unsigned long		last_used,
+ 				idle_timeout,
++				connect_timeout,
+ 				max_reconnect_timeout;
+ 
+ 	/*
+diff --git a/include/linux/sunrpc/xprtsock.h b/include/linux/sunrpc/xprtsock.h
+index facbda48af62..11d0a9ab4f24 100644
+--- a/include/linux/sunrpc/xprtsock.h
++++ b/include/linux/sunrpc/xprtsock.h
+@@ -55,6 +55,8 @@ struct sock_xprt {
+ 	size_t			rcvsize,
+ 				sndsize;
+ 
++	struct rpc_timeout	tcp_timeout;
++
+ 	/*
+ 	 * Saved socket callback addresses
+ 	 */
+@@ -81,6 +83,7 @@ struct sock_xprt {
+ 
+ #define XPRT_SOCK_CONNECTING	1U
+ #define XPRT_SOCK_DATA_READY	(2)
++#define XPRT_SOCK_UPD_TIMEOUT	(3)
+ 
+ #endif /* __KERNEL__ */
+ 
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index 20e87f97d6bb..8a3e22bd2bf8 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -2697,6 +2697,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ {
+ 	struct rpc_xprt_switch *xps;
+ 	struct rpc_xprt *xprt;
++	unsigned long connect_timeout;
+ 	unsigned long reconnect_timeout;
+ 	unsigned char resvport;
+ 	int ret = 0;
+@@ -2709,6 +2710,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ 		return -EAGAIN;
+ 	}
+ 	resvport = xprt->resvport;
++	connect_timeout = xprt->connect_timeout;
+ 	reconnect_timeout = xprt->max_reconnect_timeout;
+ 	rcu_read_unlock();
+ 
+@@ -2718,7 +2720,10 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ 		goto out_put_switch;
+ 	}
+ 	xprt->resvport = resvport;
+-	xprt->max_reconnect_timeout = reconnect_timeout;
++	if (xprt->ops->set_connect_timeout != NULL)
++		xprt->ops->set_connect_timeout(xprt,
++				connect_timeout,
++				reconnect_timeout);
+ 
+ 	rpc_xprt_switch_set_roundrobin(xps);
+ 	if (setup) {
+@@ -2735,24 +2740,35 @@ out_put_switch:
+ }
+ EXPORT_SYMBOL_GPL(rpc_clnt_add_xprt);
+ 
++struct connect_timeout_data {
++	unsigned long connect_timeout;
++	unsigned long reconnect_timeout;
++};
++
+ static int
+-rpc_xprt_cap_max_reconnect_timeout(struct rpc_clnt *clnt,
++rpc_xprt_set_connect_timeout(struct rpc_clnt *clnt,
+ 		struct rpc_xprt *xprt,
+ 		void *data)
+ {
+-	unsigned long timeout = *((unsigned long *)data);
++	struct connect_timeout_data *timeo = data;
+ 
+-	if (timeout < xprt->max_reconnect_timeout)
+-		xprt->max_reconnect_timeout = timeout;
++	if (xprt->ops->set_connect_timeout)
++		xprt->ops->set_connect_timeout(xprt,
++				timeo->connect_timeout,
++				timeo->reconnect_timeout);
+ 	return 0;
+ }
+ 
+ void
+ rpc_cap_max_reconnect_timeout(struct rpc_clnt *clnt, unsigned long timeo)
+ {
++	struct connect_timeout_data timeout = {
++		.connect_timeout = timeo,
++		.reconnect_timeout = timeo,
++	};
+ 	rpc_clnt_iterate_for_each_xprt(clnt,
+-			rpc_xprt_cap_max_reconnect_timeout,
+-			&timeo);
++			rpc_xprt_set_connect_timeout,
++			&timeout);
+ }
+ EXPORT_SYMBOL_GPL(rpc_cap_max_reconnect_timeout);
+ 
+* Unmerged path net/sunrpc/xprtsock.c
