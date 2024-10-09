@@ -1084,9 +1084,6 @@ static const char nes_ethtool_stringset[][ETH_GSTRING_LEN] = {
 	"Free 4Kpbls",
 	"Free 256pbls",
 	"Timer Inits",
-	"LRO aggregated",
-	"LRO flushed",
-	"LRO no_desc",
 	"PAU CreateQPs",
 	"PAU DestroyQPs",
 };
@@ -1301,9 +1298,6 @@ static void nes_netdev_get_ethtool_stats(struct net_device *netdev,
 	target_stat_values[++index] = nesadapter->free_4kpbl;
 	target_stat_values[++index] = nesadapter->free_256pbl;
 	target_stat_values[++index] = int_mod_timer_init;
-	target_stat_values[++index] = nesvnic->lro_mgr.stats.aggregated;
-	target_stat_values[++index] = nesvnic->lro_mgr.stats.flushed;
-	target_stat_values[++index] = nesvnic->lro_mgr.stats.no_desc;
 	target_stat_values[++index] = atomic_read(&pau_qps_created);
 	target_stat_values[++index] = atomic_read(&pau_qps_destroyed);
 }
@@ -1708,7 +1702,6 @@ struct net_device *nes_netdev_init(struct nes_device *nesdev,
 		netdev->hw_features |= NETIF_F_TSO;
 
 	netdev->features = netdev->hw_features | NETIF_F_HIGHDMA | NETIF_F_HW_VLAN_CTAG_TX;
-	netdev->hw_features |= NETIF_F_LRO;
 
 	nes_debug(NES_DBG_INIT, "nesvnic = %p, reported features = 0x%lX, QPid = %d,"
 			" nic_index = %d, logical_port = %d, mac_index = %d.\n",
