@@ -1,0 +1,266 @@
+scsi: cxlflash: Cancel scheduled workers before stopping AFU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Cancel scheduled workers before stopping AFU (Gustavo Duarte) [1427396]
+Rebuild_FUZZ: 94.74%
+commit-author Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+commit 0df5bef739601f18bffc0d256ae451f239a826bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0df5bef7.failed
+
+When processing an AFU asynchronous interrupt, if the action results in an
+operation that requires off level processing (a link reset for example),
+the worker thread is scheduled. In the meantime a reset event (i.e.: EEH)
+could unmap the AFU to recover. This results in an Oops when the worker
+thread tries to access the AFU mapping.
+
+[c000000f17e03b90] d000000007cd5978 cxlflash_worker_thread+0x268/0x550
+[c000000f17e03c40] c00000000011883c process_one_work+0x1dc/0x680
+[c000000f17e03ce0] c000000000118e80 worker_thread+0x1a0/0x520
+[c000000f17e03d80] c000000000126174 kthread+0xf4/0x100
+[c000000f17e03e30] c00000000000a47c ret_from_kernel_thread+0x5c/0xe0
+
+In an effort to avoid this, a mapcount was introduced in
+commit b45cdbaf9f7f ("cxlflash: Resolve oops in wait_port_offline")
+but due to the race condition described above, this solution is incomplete.
+
+In order to fully resolve this problem and to simplify things, this commit
+removes the mapcount solution. Instead, the scheduled worker thread is
+cancelled after interrupts have been disabled and prior to the mapping
+being freed.
+
+Fixes: b45cdbaf9f7f ("cxlflash: Resolve oops in wait_port_offline")
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 0df5bef739601f18bffc0d256ae451f239a826bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index 4196b728e581,7069639e92bc..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -467,20 -439,19 +457,19 @@@ static const char *cxlflash_driver_info
+   */
+  static int cxlflash_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scp)
+  {
+ -	struct cxlflash_cfg *cfg = shost_priv(host);
+ +	struct cxlflash_cfg *cfg = (struct cxlflash_cfg *)host->hostdata;
+  	struct afu *afu = cfg->afu;
+  	struct device *dev = &cfg->dev->dev;
+ -	struct afu_cmd *cmd = sc_to_afucz(scp);
+ -	struct scatterlist *sg = scsi_sglist(scp);
+ +	struct afu_cmd *cmd;
+  	u32 port_sel = scp->device->channel + 1;
+ -	u16 req_flags = SISL_REQ_FLAGS_SUP_UNDERRUN;
+ +	int nseg, i, ncount;
+ +	struct scatterlist *sg;
+  	ulong lock_flags;
+ -	int nseg = 0;
+ +	short lflag = 0;
+  	int rc = 0;
+- 	int kref_got = 0;
+  
+ -	dev_dbg_ratelimited(dev, "%s: (scp=%p) %d/%d/%d/%llu "
+ -			    "cdb=(%08x-%08x-%08x-%08x)\n",
+ +	dev_dbg_ratelimited(dev, "%s: (scp=%p) %d/%d/%d/%d "
+ +			    "cdb=(%08X-%08X-%08X-%08X)\n",
+  			    __func__, scp, host->host_no, scp->device->channel,
+  			    scp->device->id, scp->device->lun,
+  			    get_unaligned_be32(&((u32 *)scp->cmnd)[0]),
+@@@ -515,59 -486,36 +504,79 @@@
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	cmd = cmd_checkout(afu);
+ +	if (unlikely(!cmd)) {
+ +		dev_err(dev, "%s: could not get a free command\n", __func__);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+ +	}
+ +
+ +	kref_get(&cfg->afu->mapcount);
+ +	kref_got = 1;
+++=======
++ 	if (likely(sg)) {
++ 		nseg = scsi_dma_map(scp);
++ 		if (unlikely(nseg < 0)) {
++ 			dev_err(dev, "%s: Fail DMA map\n", __func__);
++ 			rc = SCSI_MLQUEUE_HOST_BUSY;
++ 			goto out;
++ 		}
++ 
++ 		cmd->rcb.data_len = sg_dma_len(sg);
++ 		cmd->rcb.data_ea = sg_dma_address(sg);
++ 	}
++ 
++ 	cmd->scp = scp;
++ 	cmd->parent = afu;
+++>>>>>>> 0df5bef73960 (scsi: cxlflash: Cancel scheduled workers before stopping AFU)
+  
+  	cmd->rcb.ctx_id = afu->ctx_hndl;
+ -	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
+  	cmd->rcb.port_sel = port_sel;
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+  
+  	if (scp->sc_data_direction == DMA_TO_DEVICE)
+ -		req_flags |= SISL_REQ_FLAGS_HOST_WRITE;
+ +		lflag = SISL_REQ_FLAGS_HOST_WRITE;
+ +	else
+ +		lflag = SISL_REQ_FLAGS_HOST_READ;
+ +
+ +	cmd->rcb.req_flags = (SISL_REQ_FLAGS_PORT_LUN_ID |
+ +			      SISL_REQ_FLAGS_SUP_UNDERRUN | lflag);
+ +
+ +	/* Stash the scp in the reserved field, for reuse during interrupt */
+ +	cmd->rcb.scp = scp;
+  
+ -	cmd->rcb.req_flags = req_flags;
+ +	nseg = scsi_dma_map(scp);
+ +	if (unlikely(nseg < 0)) {
+ +		dev_err(dev, "%s: Fail DMA map! nseg=%d\n",
+ +			__func__, nseg);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+ +	}
+ +
+ +	ncount = scsi_sg_count(scp);
+ +	scsi_for_each_sg(scp, sg, ncount, i) {
+ +		cmd->rcb.data_len = sg_dma_len(sg);
+ +		cmd->rcb.data_ea = sg_dma_address(sg);
+ +	}
+ +
+ +	/* Copy the CDB from the scsi_cmnd passed in */
+  	memcpy(cmd->rcb.cdb, scp->cmnd, sizeof(cmd->rcb.cdb));
+  
+ -	rc = afu->send_cmd(afu, cmd);
+ -	if (unlikely(rc))
+ +	/* Send the command */
+ +	rc = send_cmd(afu, cmd);
+ +	if (unlikely(rc)) {
+ +		cmd_checkin(cmd);
+  		scsi_dma_unmap(scp);
+ +	}
+ +
+  out:
+++<<<<<<< HEAD
+ +	if (kref_got)
+ +		kref_put(&afu->mapcount, afu_unmap);
+ +	pr_devel("%s: returning rc=%d\n", __func__, rc);
+++=======
+++>>>>>>> 0df5bef73960 (scsi: cxlflash: Cancel scheduled workers before stopping AFU)
+  	return rc;
+  }
+  
+@@@ -613,30 -553,18 +622,37 @@@ static void free_mem(struct cxlflash_cf
+   *
+   * Safe to call with AFU in a partially allocated/initialized state.
+   *
+++<<<<<<< HEAD
+ + * Cleans up all state associated with the command queue, and unmaps
+ + * the MMIO space.
+ + *
+ + *  - complete() will take care of commands we initiated (they'll be checked
+ + *  in as part of the cleanup that occurs after the completion)
+ + *
+ + *  - cmd_checkin() will take care of entries that we did not initiate and that
+ + *  have not (and will not) complete because they are sitting on a [now stale]
+ + *  hardware queue
+++=======
++  * Cancels scheduled worker threads, waits for any active internal AFU
++  * commands to timeout and then unmaps the MMIO space.
+++>>>>>>> 0df5bef73960 (scsi: cxlflash: Cancel scheduled workers before stopping AFU)
+   */
+  static void stop_afu(struct cxlflash_cfg *cfg)
+  {
+ +	int i;
+  	struct afu *afu = cfg->afu;
+ +	struct afu_cmd *cmd;
+  
++ 	cancel_work_sync(&cfg->work_q);
++ 
+  	if (likely(afu)) {
+ -		while (atomic_read(&afu->cmds_active))
+ -			ssleep(1);
+ +		for (i = 0; i < CXLFLASH_NUM_CMDS; i++) {
+ +			cmd = &afu->cmd[i];
+ +			complete(&cmd->cevent);
+ +			if (!atomic_read(&cmd->free))
+ +				cmd_checkin(cmd);
+ +		}
+ +
+  		if (likely(afu->afu_map)) {
+  			cxl_psa_unmap((void __iomem *)afu->afu_map);
+  			afu->afu_map = NULL;
+@@@ -1807,21 -1693,28 +1818,26 @@@ static int init_afu(struct cxlflash_cf
+  	afu->interface_version =
+  	    readq_be(&afu->afu_map->global.regs.interface_version);
+  	if ((afu->interface_version + 1) == 0) {
+ -		dev_err(dev, "Back level AFU, please upgrade. AFU version %s "
+ -			"interface version %016llx\n", afu->version,
+ +		pr_err("Back level AFU, please upgrade. AFU version %s "
+ +		       "interface version 0x%llx\n", afu->version,
+  		       afu->interface_version);
+  		rc = -EINVAL;
+- 		goto err2;
++ 		goto err1;
+  	}
+  
+ -	if (afu_is_sq_cmd_mode(afu)) {
+ -		afu->send_cmd = send_cmd_sq;
+ -		afu->context_reset = context_reset_sq;
+ -	} else {
+ -		afu->send_cmd = send_cmd_ioarrin;
+ -		afu->context_reset = context_reset_ioarrin;
+ -	}
+ -
+ -	dev_dbg(dev, "%s: afu_ver=%s interface_ver=%016llx\n", __func__,
+ -		afu->version, afu->interface_version);
+ +	pr_debug("%s: afu version %s, interface version 0x%llX\n", __func__,
+ +		 afu->version, afu->interface_version);
+  
+  	rc = start_afu(cfg);
+  	if (rc) {
+++<<<<<<< HEAD
+ +		dev_err(dev, "%s: call to start_afu failed, rc=%d!\n",
+ +			__func__, rc);
+ +		goto err2;
+++=======
++ 		dev_err(dev, "%s: start_afu failed, rc=%d\n", __func__, rc);
++ 		goto err1;
+++>>>>>>> 0df5bef73960 (scsi: cxlflash: Cancel scheduled workers before stopping AFU)
+  	}
+  
+  	afu_err_intr_init(cfg->afu);
+@@@ -1831,11 -1724,9 +1847,9 @@@
+  	/* Restore the LUN mappings */
+  	cxlflash_restore_luntable(cfg);
+  out:
+ -	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  
+- err2:
+- 	kref_put(&afu->mapcount, afu_unmap);
+  err1:
+  	term_intr(cfg, UNMAP_THREE);
+  	term_mc(cfg);
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index ef2943d0f75c..d78b1bff068a 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -166,8 +166,6 @@ struct afu {
+ 	struct sisl_host_map __iomem *host_map;		/* MC host map */
+ 	struct sisl_ctrl_map __iomem *ctrl_map;		/* MC control map */
+ 
+-	struct kref mapcount;
+-
+ 	ctx_hndl_t ctx_hndl;	/* master's context handle */
+ 	u64 *hrrq_start;
+ 	u64 *hrrq_end;
+* Unmerged path drivers/scsi/cxlflash/main.c
