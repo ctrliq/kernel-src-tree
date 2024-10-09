@@ -1,0 +1,380 @@
+x86/speculation: Enable cross-hyperthread spectre v2 STIBP mitigation
+
+jira LE-1907
+cve CVE-2019-11091
+cve CVE-2018-12130
+cve CVE-2018-12127
+cve CVE-2018-12126
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] speculation: Enable cross-hyperthread spectre v2 STIBP mitigation (Waiman Long) [1709296 1690358 1690348 1690335] {CVE-2018-12126 CVE-2018-12127 CVE-2018-12130 CVE-2019-11091}
+Rebuild_FUZZ: 97.01%
+commit-author Jiri Kosina <jkosina@suse.cz>
+commit 53c613fe6349994f023245519265999eed75957f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/53c613fe.failed
+
+STIBP is a feature provided by certain Intel ucodes / CPUs. This feature
+(once enabled) prevents cross-hyperthread control of decisions made by
+indirect branch predictors.
+
+Enable this feature if
+
+- the CPU is vulnerable to spectre v2
+- the CPU supports SMT and has SMT siblings online
+- spectre_v2 mitigation autoselection is enabled (default)
+
+After some previous discussion, this leaves STIBP on all the time, as wrmsr
+on crossing kernel boundary is a no-no. This could perhaps later be a bit
+more optimized (like disabling it in NOHZ, experiment with disabling it in
+idle, etc) if needed.
+
+Note that the synchronization of the mask manipulation via newly added
+spec_ctrl_mutex is currently not strictly needed, as the only updater is
+already being serialized by cpu_add_remove_lock, but let's make this a
+little bit more future-proof.
+
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc:  "WoodhouseDavid" <dwmw@amazon.co.uk>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc:  "SchauflerCasey" <casey.schaufler@intel.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/nycvar.YFH.7.76.1809251438240.15880@cbobk.fhfr.pm
+
+(cherry picked from commit 53c613fe6349994f023245519265999eed75957f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 12a489be7869,53eb14a65610..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -22,15 -26,32 +22,36 @@@
+  #include <asm/paravirt.h>
+  #include <asm/alternative.h>
+  #include <asm/pgtable.h>
+ -#include <asm/set_memory.h>
+ -#include <asm/intel-family.h>
+ -#include <asm/e820/api.h>
+ -#include <asm/hypervisor.h>
+ +#include <asm/cacheflush.h>
+ +#include <asm/spec_ctrl.h>
+ +#include <linux/prctl.h>
+  
+  static void __init spectre_v2_select_mitigation(void);
+ -static void __init ssb_select_mitigation(void);
+ +static void __init ssb_parse_cmdline(void);
+ +void ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+++<<<<<<< HEAD
+ +extern void spec_ctrl_save_msr(void);
+++=======
++ 
++ /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
++ u64 x86_spec_ctrl_base;
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
++ static DEFINE_MUTEX(spec_ctrl_mutex);
++ 
++ /*
++  * The vendor and possibly platform specific bits which can be modified in
++  * x86_spec_ctrl_base.
++  */
++ static u64 __ro_after_init x86_spec_ctrl_mask = SPEC_CTRL_IBRS;
++ 
++ /*
++  * AMD specific MSR info for Speculative Store Bypass control.
++  * x86_amd_ls_cfg_ssbd_mask is initialized in identify_boot_cpu().
++  */
++ u64 __ro_after_init x86_amd_ls_cfg_base;
++ u64 __ro_after_init x86_amd_ls_cfg_ssbd_mask;
+++>>>>>>> 53c613fe6349 (x86/speculation: Enable cross-hyperthread spectre v2 STIBP mitigation)
+  
+  void __init check_bugs(void)
+  {
+@@@ -173,16 -301,72 +194,60 @@@ static enum spectre_v2_mitigation_cmd s
+  		}
+  	}
+  
+ -	if ((cmd == SPECTRE_V2_CMD_RETPOLINE ||
+ -	     cmd == SPECTRE_V2_CMD_RETPOLINE_AMD ||
+ -	     cmd == SPECTRE_V2_CMD_RETPOLINE_GENERIC) &&
+ -	    !IS_ENABLED(CONFIG_RETPOLINE)) {
+ -		pr_err("%s selected but not compiled in. Switching to AUTO select\n", mitigation_options[i].option);
+ +	if (!cmdline_find_option_bool(boot_command_line, "nospectre_v2"))
+  		return SPECTRE_V2_CMD_AUTO;
+ -	}
+ -
+ -	if (cmd == SPECTRE_V2_CMD_RETPOLINE_AMD &&
+ -	    boot_cpu_data.x86_vendor != X86_VENDOR_AMD) {
+ -		pr_err("retpoline,amd selected but CPU is not AMD. Switching to AUTO select\n");
+ -		return SPECTRE_V2_CMD_AUTO;
+ -	}
+ -
+ -	if (mitigation_options[i].secure)
+ -		spec2_print_if_secure(mitigation_options[i].option);
+ -	else
+ -		spec2_print_if_insecure(mitigation_options[i].option);
+ -
+ -	return cmd;
+ +disable:
+ +	return SPECTRE_V2_CMD_NONE;
+  }
+  
+++<<<<<<< HEAD
+ +void __spectre_v2_select_mitigation(void)
+++=======
++ static bool stibp_needed(void)
++ {
++ 	if (spectre_v2_enabled == SPECTRE_V2_NONE)
++ 		return false;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_STIBP))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void update_stibp_msr(void *info)
++ {
++ 	wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++ }
++ 
++ void arch_smt_update(void)
++ {
++ 	u64 mask;
++ 
++ 	if (!stibp_needed())
++ 		return;
++ 
++ 	mutex_lock(&spec_ctrl_mutex);
++ 	mask = x86_spec_ctrl_base;
++ 	if (cpu_smt_control == CPU_SMT_ENABLED)
++ 		mask |= SPEC_CTRL_STIBP;
++ 	else
++ 		mask &= ~SPEC_CTRL_STIBP;
++ 
++ 	if (mask != x86_spec_ctrl_base) {
++ 		pr_info("Spectre v2 cross-process SMT mitigation: %s STIBP\n",
++ 				cpu_smt_control == CPU_SMT_ENABLED ?
++ 				"Enabling" : "Disabling");
++ 		x86_spec_ctrl_base = mask;
++ 		on_each_cpu(update_stibp_msr, NULL, 1);
++ 	}
++ 	mutex_unlock(&spec_ctrl_mutex);
++ }
++ 
++ static void __init spectre_v2_select_mitigation(void)
+++>>>>>>> 53c613fe6349 (x86/speculation: Enable cross-hyperthread spectre v2 STIBP mitigation)
+  {
+ -	enum spectre_v2_mitigation_cmd cmd = spectre_v2_parse_cmdline();
+ -	enum spectre_v2_mitigation mode = SPECTRE_V2_NONE;
+ +	const bool full_retpoline = IS_ENABLED(CONFIG_RETPOLINE) && retp_compiler();
+ +	enum spectre_v2_mitigation_cmd cmd = spectre_v2_cmd;
+  
+  	/*
+  	 * If the CPU is not affected and the command line mode is NONE or AUTO
+@@@ -199,52 -383,88 +264,73 @@@
+  	case SPECTRE_V2_CMD_FORCE:
+  	case SPECTRE_V2_CMD_AUTO:
+  		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+ -			mode = SPECTRE_V2_IBRS_ENHANCED;
+ -			/* Force it so VMEXIT will restore correctly */
+ -			x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
+ -			wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ -			goto specv2_set_mode;
+ +			spec_ctrl_enable_ibrs_enhanced();
+ +			return;
+  		}
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+  		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_AMD:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_amd;
+ +
+ +	case SPECTRE_V2_CMD_RETPOLINE:
+ +		spec_ctrl_enable_retpoline();
+ +		return;
+ +
+ +	case SPECTRE_V2_CMD_IBRS:
+ +		if (spec_ctrl_force_enable_ibrs())
+ +			return;
+  		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_generic;
+ +
+ +	case SPECTRE_V2_CMD_IBRS_ALWAYS:
+ +		if (spec_ctrl_enable_ibrs_always() ||
+ +		    spec_ctrl_force_enable_ibp_disabled())
+ +			return;
+  		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+ +
+ +	case SPECTRE_V2_CMD_RETPOLINE_IBRS_USER:
+ +		if (spec_ctrl_enable_retpoline_ibrs_user())
+ +			return;
+  		break;
+  	}
+ -	pr_err("Spectre mitigation: kernel not compiled with retpoline; no mitigation available!");
+ -	return;
+  
+ -retpoline_auto:
+ -	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+ -	retpoline_amd:
+ -		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
+ -			pr_err("Spectre mitigation: LFENCE not serializing, switching to generic retpoline\n");
+ -			goto retpoline_generic;
+ -		}
+ -		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_AMD :
+ -					 SPECTRE_V2_RETPOLINE_MINIMAL_AMD;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	} else {
+ -	retpoline_generic:
+ -		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_GENERIC :
+ -					 SPECTRE_V2_RETPOLINE_MINIMAL;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	}
+ +	if (spec_ctrl_cond_enable_ibrs(full_retpoline))
+ +		return;
+  
+ -specv2_set_mode:
+ -	spectre_v2_enabled = mode;
+ -	pr_info("%s\n", spectre_v2_strings[mode]);
+ +	if (spec_ctrl_cond_enable_ibp_disabled())
+ +		return;
+  
+ -	/*
+ -	 * If spectre v2 protection has been enabled, unconditionally fill
+ -	 * RSB during a context switch; this protects against two independent
+ -	 * issues:
+ -	 *
+ -	 *	- RSB underflow (and switch to BTB) on Skylake+
+ -	 *	- SpectreRSB variant of spectre v2 on X86_BUG_SPECTRE_V2 CPUs
+ -	 */
+ -	setup_force_cpu_cap(X86_FEATURE_RSB_CTXSW);
+ -	pr_info("Spectre v2 / SpectreRSB mitigation: Filling RSB on context switch\n");
+ +	spec_ctrl_enable_retpoline();
+ +}
+  
+ -	/* Initialize Indirect Branch Prediction Barrier if supported */
+ -	if (boot_cpu_has(X86_FEATURE_IBPB)) {
+ -		setup_force_cpu_cap(X86_FEATURE_USE_IBPB);
+ -		pr_info("Spectre v2 mitigation: Enabling Indirect Branch Prediction Barrier\n");
+ -	}
+ +void spectre_v2_print_mitigation(void)
+ +{
+  
+++<<<<<<< HEAD
+ +	pr_info("%s\n", spectre_v2_strings[spec_ctrl_get_mitigation()]);
+ +}
+ +
+ +static void __init spectre_v2_select_mitigation(void)
+ +{
+ +	spectre_v2_cmd = spectre_v2_parse_cmdline();
+ +	__spectre_v2_select_mitigation();
+ +	spectre_v2_print_mitigation();
+++=======
++ 	/*
++ 	 * Retpoline means the kernel is safe because it has no indirect
++ 	 * branches. Enhanced IBRS protects firmware too, so, enable restricted
++ 	 * speculation around firmware calls only when Enhanced IBRS isn't
++ 	 * supported.
++ 	 *
++ 	 * Use "mode" to check Enhanced IBRS instead of boot_cpu_has(), because
++ 	 * the user might select retpoline on the kernel command line and if
++ 	 * the CPU supports Enhanced IBRS, kernel might un-intentionally not
++ 	 * enable IBRS around firmware calls.
++ 	 */
++ 	if (boot_cpu_has(X86_FEATURE_IBRS) && mode != SPECTRE_V2_IBRS_ENHANCED) {
++ 		setup_force_cpu_cap(X86_FEATURE_USE_IBRS_FW);
++ 		pr_info("Enabling Restricted Speculation for firmware calls\n");
++ 	}
++ 
++ 	/* Enable STIBP if appropriate */
++ 	arch_smt_update();
+++>>>>>>> 53c613fe6349 (x86/speculation: Enable cross-hyperthread spectre v2 STIBP mitigation)
+  }
+  
+  #undef pr_fmt
+@@@ -605,8 -853,10 +691,10 @@@ static ssize_t l1tf_show_state(char *bu
+  #endif
+  
+  static ssize_t cpu_show_common(struct device *dev, struct device_attribute *attr,
+ -			       char *buf, unsigned int bug)
+ +			char *buf, unsigned int bug)
+  {
++ 	int ret;
++ 
+  	if (!boot_cpu_has_bug(bug))
+  		return sprintf(buf, "Not affected\n");
+  
+@@@ -618,11 -868,18 +706,20 @@@
+  		break;
+  
+  	case X86_BUG_SPECTRE_V1:
+ -		return sprintf(buf, "Mitigation: __user pointer sanitization\n");
+ +		return sprintf(buf, "Mitigation: Load fences, __user pointer sanitization\n");
+  
+  	case X86_BUG_SPECTRE_V2:
+++<<<<<<< HEAD
+ +		return sprintf(buf, "%s\n",
+ +			       spectre_v2_strings[spec_ctrl_get_mitigation()]);
+++=======
++ 		ret = sprintf(buf, "%s%s%s%s%s\n", spectre_v2_strings[spectre_v2_enabled],
++ 			       boot_cpu_has(X86_FEATURE_USE_IBPB) ? ", IBPB" : "",
++ 			       boot_cpu_has(X86_FEATURE_USE_IBRS_FW) ? ", IBRS_FW" : "",
++ 			       (x86_spec_ctrl_base & SPEC_CTRL_STIBP) ? ", STIBP" : "",
++ 			       spectre_v2_module_string());
++ 		return ret;
+++>>>>>>> 53c613fe6349 (x86/speculation: Enable cross-hyperthread spectre v2 STIBP mitigation)
+  
+  	case X86_BUG_SPEC_STORE_BYPASS:
+  		return sprintf(buf, "%s\n", ssb_strings[ssb_mode]);
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 364a4aba2443..63309dd52765 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -801,6 +801,12 @@ static void cpuhp_online_cpu_device(unsigned int cpu)
+ 	kobject_uevent(&dev->kobj, KOBJ_ONLINE);
+ }
+ 
++/*
++ * Architectures that need SMT-specific errata handling during SMT hotplug
++ * should override this.
++ */
++void __weak arch_smt_update(void) { };
++
+ static int cpuhp_smt_disable(enum cpuhp_smt_control ctrlval)
+ {
+ 	int cpu, ret = 0;
+@@ -827,8 +833,10 @@ static int cpuhp_smt_disable(enum cpuhp_smt_control ctrlval)
+ 		 */
+ 		cpuhp_offline_cpu_device(cpu);
+ 	}
+-	if (!ret)
++	if (!ret) {
+ 		cpu_smt_control = ctrlval;
++		arch_smt_update();
++	}
+ 	cpu_maps_update_done();
+ 	return ret;
+ }
+@@ -839,6 +847,7 @@ static int cpuhp_smt_enable(void)
+ 
+ 	cpu_maps_update_begin();
+ 	cpu_smt_control = CPU_SMT_ENABLED;
++	arch_smt_update();
+ 	for_each_present_cpu(cpu) {
+ 		/* Skip online CPUs and CPUs on offline nodes */
+ 		if (cpu_online(cpu) || !node_online(cpu_to_node(cpu)))
