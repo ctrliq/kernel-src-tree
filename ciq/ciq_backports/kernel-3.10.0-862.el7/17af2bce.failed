@@ -1,0 +1,140 @@
+macvtap: add namespace support to the sysfs device class
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Marc Angel <marc@arista.com>
+commit 17af2bce88d31e65ed73d638bb752d2e13c66ced
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/17af2bce.failed
+
+When creating macvtaps that are expected to have the same ifindex
+in different network namespaces, only the first one will succeed.
+The others will fail with a sysfs_warn_dup warning due to them trying
+to create the following sysfs link (with 'NN' the ifindex of macvtapX):
+
+/sys/class/macvtap/tapNN -> /sys/devices/virtual/net/macvtapX/tapNN
+
+This is reproducible by running the following commands:
+
+ip netns add ns1
+ip netns add ns2
+ip link add veth0 type veth peer name veth1
+ip link set veth0 netns ns1
+ip link set veth1 netns ns2
+ip netns exec ns1 ip l add link veth0 macvtap0 type macvtap
+ip netns exec ns2 ip l add link veth1 macvtap1 type macvtap
+
+The last command will fail with "RTNETLINK answers: File exists" (along
+with the kernel warning) but retrying it will work because the ifindex
+was incremented.
+
+The 'net' device class is isolated between network namespaces so each
+one has its own hierarchy of net devices.
+This isn't the case for the 'macvtap' device class.
+The problem occurs half-way through the netdev registration, when
+`macvtap_device_event` is called-back to create the 'tapNN' macvtap
+class device under the 'macvtapX' net class device.
+
+This patch adds namespace support to the 'macvtap' device class so
+that /sys/class/macvtap is no longer shared between net namespaces.
+
+However, making the macvtap sysfs class namespace-aware has the side
+effect of changing /sys/devices/virtual/net/macvtapX/tapNN  into
+/sys/devices/virtual/net/macvtapX/macvtap/tapNN.
+
+This is due to Commit 24b1442 ("Driver-core: Always create class
+directories for classses that support namespaces") and the fact that
+class devices supporting namespaces are really not supposed to be placed
+directly under other class devices.
+
+To avoid breaking userland, a tapNN symlink pointing to macvtap/tapNN is
+created inside the macvtapX directory.
+
+	Signed-off-by: Marc Angel <marc@arista.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 17af2bce88d31e65ed73d638bb752d2e13c66ced)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvtap.c
+diff --cc drivers/net/macvtap.c
+index e3f80eeb0a6d,22b85b097cbc..000000000000
+--- a/drivers/net/macvtap.c
++++ b/drivers/net/macvtap.c
+@@@ -1439,16 -1314,20 +1452,27 @@@ static int macvtap_device_event(struct 
+  			macvtap_free_minor(vlan);
+  			return notifier_from_errno(PTR_ERR(classdev));
+  		}
++ 		err = sysfs_create_link(&dev->dev.kobj, &classdev->kobj,
++ 					tap_name);
++ 		if (err)
++ 			return notifier_from_errno(err);
+  		break;
+  	case NETDEV_UNREGISTER:
+++<<<<<<< HEAD
+++=======
++ 		/* vlan->minor == 0 if NETDEV_REGISTER above failed */
++ 		if (vlan->minor == 0)
++ 			break;
++ 		sysfs_remove_link(&dev->dev.kobj, tap_name);
+++>>>>>>> 17af2bce88d3 (macvtap: add namespace support to the sysfs device class)
+  		devt = MKDEV(MAJOR(macvtap_major), vlan->minor);
+- 		device_destroy(macvtap_class, devt);
++ 		device_destroy(&macvtap_class, devt);
+  		macvtap_free_minor(vlan);
+  		break;
+ +	case NETDEV_CHANGE_TX_QUEUE_LEN:
+ +		if (macvtap_queue_resize(vlan))
+ +			return NOTIFY_BAD;
+ +		break;
+  	}
+  
+  	return NOTIFY_DONE;
+@@@ -1472,13 -1351,11 +1496,11 @@@ static int macvtap_init(void
+  	if (err)
+  		goto out2;
+  
+- 	macvtap_class = class_create(THIS_MODULE, "macvtap");
+- 	if (IS_ERR(macvtap_class)) {
+- 		err = PTR_ERR(macvtap_class);
++ 	err = class_register(&macvtap_class);
++ 	if (err)
+  		goto out3;
+- 	}
+  
+ -	err = register_netdevice_notifier(&macvtap_notifier_block);
+ +	err = register_netdevice_notifier_rh(&macvtap_notifier_block);
+  	if (err)
+  		goto out4;
+  
+@@@ -1489,9 -1366,9 +1511,9 @@@
+  	return 0;
+  
+  out5:
+ -	unregister_netdevice_notifier(&macvtap_notifier_block);
+ +	unregister_netdevice_notifier_rh(&macvtap_notifier_block);
+  out4:
+- 	class_unregister(macvtap_class);
++ 	class_unregister(&macvtap_class);
+  out3:
+  	cdev_del(&macvtap_cdev);
+  out2:
+@@@ -1504,10 -1381,11 +1526,15 @@@ module_init(macvtap_init)
+  static void macvtap_exit(void)
+  {
+  	rtnl_link_unregister(&macvtap_link_ops);
+++<<<<<<< HEAD
+ +	unregister_netdevice_notifier_rh(&macvtap_notifier_block);
+ +	class_unregister(macvtap_class);
+++=======
++ 	unregister_netdevice_notifier(&macvtap_notifier_block);
++ 	class_unregister(&macvtap_class);
+++>>>>>>> 17af2bce88d3 (macvtap: add namespace support to the sysfs device class)
+  	cdev_del(&macvtap_cdev);
+  	unregister_chrdev_region(macvtap_major, MACVTAP_NUM_DEVS);
+ -	idr_destroy(&minor_idr);
+  }
+  module_exit(macvtap_exit);
+  
+* Unmerged path drivers/net/macvtap.c
