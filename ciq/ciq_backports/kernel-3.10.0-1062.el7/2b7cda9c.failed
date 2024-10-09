@@ -1,0 +1,87 @@
+tcp: fix tcp_mtu_probe() vs highest_sack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 2b7cda9c35d3b940eb9ce74b30bbd5eb30db493d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2b7cda9c.failed
+
+Based on SNMP values provided by Roman, Yuchung made the observation
+that some crashes in tcp_sacktag_walk() might be caused by MTU probing.
+
+Looking at tcp_mtu_probe(), I found that when a new skb was placed
+in front of the write queue, we were not updating tcp highest sack.
+
+If one skb is freed because all its content was copied to the new skb
+(for MTU probing), then tp->highest_sack could point to a now freed skb.
+
+Bad things would then happen, including infinite loops.
+
+This patch renames tcp_highest_sack_combine() and uses it
+from tcp_mtu_probe() to fix the bug.
+
+Note that I also removed one test against tp->sacked_out,
+since we want to replace tp->highest_sack regardless of whatever
+condition, since keeping a stale pointer to freed skb is a recipe
+for disaster.
+
+Fixes: a47e5a988a57 ("[TCP]: Convert highest_sack to sk_buff to allow direct access")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Alexei Starovoitov <alexei.starovoitov@gmail.com>
+	Reported-by: Roman Gushchin <guro@fb.com>
+	Reported-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Acked-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2b7cda9c35d3b940eb9ce74b30bbd5eb30db493d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_output.c
+diff --cc net/ipv4/tcp_output.c
+index 3cda143c781c,823003eef3a2..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -2389,7 -2659,14 +2390,18 @@@ static void tcp_collapse_retrans(struc
+  
+  	BUG_ON(tcp_skb_pcount(skb) != 1 || tcp_skb_pcount(next_skb) != 1);
+  
+++<<<<<<< HEAD
+ +	tcp_highest_sack_combine(sk, next_skb, skb);
+++=======
++ 	if (next_skb_size) {
++ 		if (next_skb_size <= skb_availroom(skb))
++ 			skb_copy_bits(next_skb, 0, skb_put(skb, next_skb_size),
++ 				      next_skb_size);
++ 		else if (!skb_shift(skb, next_skb, next_skb_size))
++ 			return false;
++ 	}
++ 	tcp_highest_sack_replace(sk, next_skb, skb);
+++>>>>>>> 2b7cda9c35d3 (tcp: fix tcp_mtu_probe() vs highest_sack)
+  
+  	tcp_unlink_write_queue(next_skb, sk);
+  
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index a8a2278295ca..b5650742c36a 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1543,12 +1543,12 @@ static inline void tcp_highest_sack_reset(struct sock *sk)
+ 	tcp_sk(sk)->highest_sack = tcp_write_queue_head(sk);
+ }
+ 
+-/* Called when old skb is about to be deleted (to be combined with new skb) */
+-static inline void tcp_highest_sack_combine(struct sock *sk,
++/* Called when old skb is about to be deleted and replaced by new skb */
++static inline void tcp_highest_sack_replace(struct sock *sk,
+ 					    struct sk_buff *old,
+ 					    struct sk_buff *new)
+ {
+-	if (tcp_sk(sk)->sacked_out && (old == tcp_sk(sk)->highest_sack))
++	if (old == tcp_highest_sack(sk))
+ 		tcp_sk(sk)->highest_sack = new;
+ }
+ 
+* Unmerged path net/ipv4/tcp_output.c
