@@ -1,0 +1,111 @@
+KVM: MMU: clear write-flooding on the fast path of tracked page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xiao Guangrong <guangrong.xiao@linux.intel.com>
+commit e5691a81e830c12d396b3f219ab999be87a1208f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e5691a81.failed
+
+If the page fault is caused by write access on write tracked page, the
+real shadow page walking is skipped, we lost the chance to clear write
+flooding for the page structure current vcpu is using
+
+Fix it by locklessly waking shadow page table to clear write flooding
+on the shadow page structure out of mmu-lock. So that we change the
+count to atomic_t
+
+	Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e5691a81e830c12d396b3f219ab999be87a1208f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/paging_tmpl.h
+diff --cc arch/x86/kvm/mmu.c
+index d38cbe631292,58c067da6efc..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3486,6 -3386,43 +3486,46 @@@ int handle_mmio_page_fault(struct kvm_v
+  }
+  EXPORT_SYMBOL_GPL(handle_mmio_page_fault);
+  
+++<<<<<<< HEAD
+++=======
++ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
++ 					 u32 error_code, gfn_t gfn)
++ {
++ 	if (unlikely(error_code & PFERR_RSVD_MASK))
++ 		return false;
++ 
++ 	if (!(error_code & PFERR_PRESENT_MASK) ||
++ 	      !(error_code & PFERR_WRITE_MASK))
++ 		return false;
++ 
++ 	/*
++ 	 * guest is writing the page which is write tracked which can
++ 	 * not be fixed by page fault handler.
++ 	 */
++ 	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_WRITE))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static void shadow_page_table_clear_flood(struct kvm_vcpu *vcpu, gva_t addr)
++ {
++ 	struct kvm_shadow_walk_iterator iterator;
++ 	u64 spte;
++ 
++ 	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
++ 		return;
++ 
++ 	walk_shadow_page_lockless_begin(vcpu);
++ 	for_each_shadow_entry_lockless(vcpu, addr, iterator, spte) {
++ 		clear_sp_write_flooding_count(iterator.sptep);
++ 		if (!is_shadow_present_pte(spte))
++ 			break;
++ 	}
++ 	walk_shadow_page_lockless_end(vcpu);
++ }
++ 
+++>>>>>>> e5691a81e830 (KVM: MMU: clear write-flooding on the fast path of tracked page)
+  static int nonpaging_page_fault(struct kvm_vcpu *vcpu, gva_t gva,
+  				u32 error_code, bool prefault)
+  {
+diff --cc arch/x86/kvm/paging_tmpl.h
+index 1852b22c2515,4174cf290fa3..000000000000
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@@ -733,6 -728,11 +733,14 @@@ static int FNAME(page_fault)(struct kvm
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (page_fault_handle_page_track(vcpu, error_code, walker.gfn)) {
++ 		shadow_page_table_clear_flood(vcpu, addr);
++ 		return 1;
++ 	}
++ 
+++>>>>>>> e5691a81e830 (KVM: MMU: clear write-flooding on the fast path of tracked page)
+  	vcpu->arch.write_fault_to_shadow_pgtable = false;
+  
+  	is_self_change_mapping = FNAME(is_self_change_mapping)(vcpu,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c4a4bfc6a009..a9f632b5deab 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -247,7 +247,7 @@ struct kvm_mmu_page {
+ #endif
+ 
+ 	/* Number of writes since the last time traversal visited this page.  */
+-	int write_flooding_count;
++	atomic_t write_flooding_count;
+ };
+ 
+ struct kvm_pio_request {
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/paging_tmpl.h
