@@ -1,0 +1,123 @@
+mm, thp: really limit transparent hugepage allocation to local node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] thp: really limit transparent hugepage allocation to local node (Aaron Tomlin) [1425895]
+Rebuild_FUZZ: 96.92%
+commit-author David Rientjes <rientjes@google.com>
+commit 5265047ac30191ea24b16503165000c225f54feb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5265047a.failed
+
+Commit 077fcf116c8c ("mm/thp: allocate transparent hugepages on local
+node") restructured alloc_hugepage_vma() with the intent of only
+allocating transparent hugepages locally when there was not an effective
+interleave mempolicy.
+
+alloc_pages_exact_node() does not limit the allocation to the single node,
+however, but rather prefers it.  This is because __GFP_THISNODE is not set
+which would cause the node-local nodemask to be passed.  Without it, only
+a nodemask that prefers the local node is passed.
+
+Fix this by passing __GFP_THISNODE and falling back to small pages when
+the allocation fails.
+
+Commit 9f1b868a13ac ("mm: thp: khugepaged: add policy for finding target
+node") suffers from a similar problem for khugepaged, which is also fixed.
+
+Fixes: 077fcf116c8c ("mm/thp: allocate transparent hugepages on local node")
+Fixes: 9f1b868a13ac ("mm: thp: khugepaged: add policy for finding target node")
+	Signed-off-by: David Rientjes <rientjes@google.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Pravin Shelar <pshelar@nicira.com>
+	Cc: Jarno Rajahalme <jrajahalme@nicira.com>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Greg Thelen <gthelen@google.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5265047ac30191ea24b16503165000c225f54feb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mempolicy.c
+diff --cc mm/mempolicy.c
+index b7e8a843647a,ede26291d4aa..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -2053,12 -1965,34 +2053,36 @@@ alloc_pages_vma(gfp_t gfp, int order, s
+  	struct mempolicy *pol;
+  	struct page *page;
+  	unsigned int cpuset_mems_cookie;
+ -	struct zonelist *zl;
+ -	nodemask_t *nmask;
+  
+  retry_cpuset:
+ -	pol = get_vma_policy(vma, addr);
+ +	pol = get_vma_policy(current, vma, addr);
+  	cpuset_mems_cookie = read_mems_allowed_begin();
+  
+++<<<<<<< HEAD
+ +	if (unlikely(pol->mode == MPOL_INTERLEAVE)) {
+++=======
++ 	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage &&
++ 					pol->mode != MPOL_INTERLEAVE)) {
++ 		/*
++ 		 * For hugepage allocation and non-interleave policy which
++ 		 * allows the current node, we only try to allocate from the
++ 		 * current node and don't fall back to other nodes, as the
++ 		 * cost of remote accesses would likely offset THP benefits.
++ 		 *
++ 		 * If the policy is interleave, or does not allow the current
++ 		 * node in its nodemask, we allocate the standard way.
++ 		 */
++ 		nmask = policy_nodemask(gfp, pol);
++ 		if (!nmask || node_isset(node, *nmask)) {
++ 			mpol_cond_put(pol);
++ 			page = alloc_pages_exact_node(node,
++ 						gfp | __GFP_THISNODE, order);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	if (pol->mode == MPOL_INTERLEAVE) {
+++>>>>>>> 5265047ac301 (mm, thp: really limit transparent hugepage allocation to local node)
+  		unsigned nid;
+  
+  		nid = interleave_nid(pol, vma, addr, PAGE_SHIFT + order);
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 70b20a937e19..7bef0ea658bc 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2407,8 +2407,14 @@ static struct page
+ 		       struct vm_area_struct *vma, unsigned long address,
+ 		       int node)
+ {
++	gfp_t flags;
++
+ 	VM_BUG_ON_PAGE(*hpage, *hpage);
+ 
++	/* Only allocate from the target node */
++	flags = alloc_hugepage_gfpmask(khugepaged_defrag(), __GFP_OTHER_NODE) |
++	        __GFP_THISNODE;
++
+ 	/*
+ 	 * Before allocating the hugepage, release the mmap_sem read lock.
+ 	 * The allocation can take potentially a long time if it involves
+@@ -2417,8 +2423,7 @@ static struct page
+ 	 */
+ 	up_read(&mm->mmap_sem);
+ 
+-	*hpage = alloc_pages_exact_node(node, alloc_hugepage_gfpmask(
+-		khugepaged_defrag(), __GFP_OTHER_NODE), HPAGE_PMD_ORDER);
++	*hpage = alloc_pages_exact_node(node, flags, HPAGE_PMD_ORDER);
+ 	if (unlikely(!*hpage)) {
+ 		count_vm_event(THP_COLLAPSE_ALLOC_FAILED);
+ 		*hpage = ERR_PTR(-ENOMEM);
+* Unmerged path mm/mempolicy.c
