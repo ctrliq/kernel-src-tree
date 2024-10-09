@@ -1,0 +1,145 @@
+net sched actions: do not overwrite status of action creation.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: actions: do not overwrite status of action creation (Ivan Vecera) [1447674]
+Rebuild_FUZZ: 95.00%
+commit-author Roman Mashak <mrv@mojatatu.com>
+commit 37f1c63e3e29181ad412485eec2200cffc1dc70f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/37f1c63e.failed
+
+nla_memdup_cookie was overwriting err value, declared at function
+scope and earlier initialized with result of ->init(). At success
+nla_memdup_cookie() returns 0, and thus module refcnt decremented,
+although the action was installed.
+
+$ sudo tc actions add action pass index 1 cookie 1234
+$ sudo tc actions ls action gact
+
+        action order 0: gact action pass
+         random type none pass val 0
+         index 1 ref 1 bind 0
+$
+$ lsmod
+Module                  Size  Used by
+act_gact               16384  0
+...
+$
+$ sudo rmmod act_gact
+[   52.310283] ------------[ cut here ]------------
+[   52.312551] WARNING: CPU: 1 PID: 455 at kernel/module.c:1113
+module_put+0x99/0xa0
+[   52.316278] Modules linked in: act_gact(-) crct10dif_pclmul crc32_pclmul
+ghash_clmulni_intel psmouse pcbc evbug aesni_intel aes_x86_64 crypto_simd
+serio_raw glue_helper pcspkr cryptd
+[   52.322285] CPU: 1 PID: 455 Comm: rmmod Not tainted 4.10.0+ #11
+[   52.324261] Call Trace:
+[   52.325132]  dump_stack+0x63/0x87
+[   52.326236]  __warn+0xd1/0xf0
+[   52.326260]  warn_slowpath_null+0x1d/0x20
+[   52.326260]  module_put+0x99/0xa0
+[   52.326260]  tcf_hashinfo_destroy+0x7f/0x90
+[   52.326260]  gact_exit_net+0x27/0x40 [act_gact]
+[   52.326260]  ops_exit_list.isra.6+0x38/0x60
+[   52.326260]  unregister_pernet_operations+0x90/0xe0
+[   52.326260]  unregister_pernet_subsys+0x21/0x30
+[   52.326260]  tcf_unregister_action+0x68/0xa0
+[   52.326260]  gact_cleanup_module+0x17/0xa0f [act_gact]
+[   52.326260]  SyS_delete_module+0x1ba/0x220
+[   52.326260]  entry_SYSCALL_64_fastpath+0x1e/0xad
+[   52.326260] RIP: 0033:0x7f527ffae367
+[   52.326260] RSP: 002b:00007ffeb402a598 EFLAGS: 00000202 ORIG_RAX:
+00000000000000b0
+[   52.326260] RAX: ffffffffffffffda RBX: 0000559b069912a0 RCX: 00007f527ffae367
+[   52.326260] RDX: 000000000000000a RSI: 0000000000000800 RDI: 0000559b06991308
+[   52.326260] RBP: 0000000000000003 R08: 00007f5280264420 R09: 00007ffeb4029511
+[   52.326260] R10: 000000000000087b R11: 0000000000000202 R12: 00007ffeb4029580
+[   52.326260] R13: 0000000000000000 R14: 0000000000000000 R15: 0000559b069912a0
+[   52.354856] ---[ end trace 90d89401542b0db6 ]---
+$
+
+With the fix:
+
+$ sudo modprobe act_gact
+$ lsmod
+Module                  Size  Used by
+act_gact               16384  0
+...
+$ sudo tc actions add action pass index 1 cookie 1234
+$ sudo tc actions ls action gact
+
+        action order 0: gact action pass
+         random type none pass val 0
+         index 1 ref 1 bind 0
+$
+$ lsmod
+Module                  Size  Used by
+act_gact               16384  1
+...
+$ sudo rmmod act_gact
+rmmod: ERROR: Module act_gact is in use
+$
+$ sudo /home/mrv/bin/tc actions del action gact index 1
+$ sudo rmmod act_gact
+$ lsmod
+Module                  Size  Used by
+$
+
+Fixes: 1045ba77a ("net sched actions: Add support for user cookies")
+	Signed-off-by: Roman Mashak <mrv@mojatatu.com>
+	Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 37f1c63e3e29181ad412485eec2200cffc1dc70f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index 45d305cc522a,b70aa57319ea..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -493,19 -596,29 +493,37 @@@ struct tc_action *tcf_action_init_1(str
+  		goto err_out;
+  	}
+  
+ +	err = -ENOMEM;
+ +	a = kzalloc(sizeof(*a), GFP_KERNEL);
+ +	if (a == NULL)
+ +		goto err_mod;
+ +
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&a->list);
+  	/* backward compatibility for policer */
+  	if (name == NULL)
+ -		err = a_o->init(net, tb[TCA_ACT_OPTIONS], est, &a, ovr, bind);
+ +		err = a_o->init(net, tb[TCA_ACT_OPTIONS], est, a, ovr, bind);
+  	else
+ -		err = a_o->init(net, nla, est, &a, ovr, bind);
+ +		err = a_o->init(net, nla, est, a, ovr, bind);
+  	if (err < 0)
+ -		goto err_mod;
+ -
+ +		goto err_free;
+++=======
++ 	if (tb[TCA_ACT_COOKIE]) {
++ 		int cklen = nla_len(tb[TCA_ACT_COOKIE]);
++ 
++ 		if (cklen > TC_COOKIE_MAX_SIZE) {
++ 			err = -EINVAL;
++ 			tcf_hash_release(a, bind);
++ 			goto err_mod;
++ 		}
++ 
++ 		if (nla_memdup_cookie(a, tb) < 0) {
++ 			err = -ENOMEM;
++ 			tcf_hash_release(a, bind);
++ 			goto err_mod;
++ 		}
++ 	}
+++>>>>>>> 37f1c63e3e29 (net sched actions: do not overwrite status of action creation.)
+  
+  	/* module count goes up only when brand new policy is created
+  	 * if it exists and is only bound to in a_o->init() then
+* Unmerged path net/sched/act_api.c
