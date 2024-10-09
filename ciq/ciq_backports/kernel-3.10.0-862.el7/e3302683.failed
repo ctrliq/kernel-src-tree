@@ -1,0 +1,232 @@
+x86/intel_rdt/mbm: Handle counter overflow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mbm: Handle counter overflow (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 95.00%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit e33026831bdb5f051499fec6a606f79fe1f94cc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e3302683.failed
+
+Set up a delayed work queue for each domain that will read all
+the MBM counters of active RMIDs once per second to make sure
+that they don't wrap around between reads from users.
+
+[Tony: Added the initializations for the work structure and completed
+the patch]
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+	Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-29-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit e33026831bdb5f051499fec6a606f79fe1f94cc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt_monitor.c
+#	arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,de26aa7971d4..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -232,19 -335,26 +232,39 @@@ void rdt_cbm_update(void *arg
+  	list_for_each_entry(d, &r->domains, list) {
+  		/* Find the domain that contains this CPU */
+  		if (cpumask_test_cpu(cpu, &d->cpu_mask))
+ -			return d;
+ +			goto found;
+  	}
+++<<<<<<< HEAD
+ +	pr_info_once("cpu %d not found in any domain for resource %s\n",
+++=======
++ 
++ 	return NULL;
++ }
++ 
++ void rdt_ctrl_update(void *arg)
++ {
++ 	struct msr_param *m = arg;
++ 	struct rdt_resource *r = m->res;
++ 	int cpu = smp_processor_id();
++ 	struct rdt_domain *d;
++ 
++ 	d = get_domain_from_cpu(cpu, r);
++ 	if (d) {
++ 		r->msr_update(d, m, r);
++ 		return;
++ 	}
++ 	pr_warn_once("cpu %d not found in any domain for resource %s\n",
+++>>>>>>> e33026831bdb (x86/intel_rdt/mbm: Handle counter overflow)
+  		     cpu, r->name);
+ +
+ +	return;
+ +
+ +found:
+ +	for (i = m->low; i < m->high; i++) {
+ +		int idx = cbm_idx(r, i);
+ +
+ +		wrmsrl(r->msr_base + idx, d->cbm[i]);
+ +	}
+  }
+  
+  /*
+@@@ -280,6 -390,69 +300,72 @@@ static struct rdt_domain *rdt_find_doma
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	struct msr_param m;
++ 	u32 *dc;
++ 	int i;
++ 
++ 	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
++ 	if (!dc)
++ 		return -ENOMEM;
++ 
++ 	d->ctrl_val = dc;
++ 
++ 	/*
++ 	 * Initialize the Control MSRs to having no control.
++ 	 * For Cache Allocation: Set all bits in cbm
++ 	 * For Memory Allocation: Set b/w requested to 100
++ 	 */
++ 	for (i = 0; i < r->num_closid; i++, dc++)
++ 		*dc = r->default_ctrl;
++ 
++ 	m.low = 0;
++ 	m.high = r->num_closid;
++ 	r->msr_update(d, &m, r);
++ 	return 0;
++ }
++ 
++ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	size_t tsize;
++ 
++ 	if (is_llc_occupancy_enabled()) {
++ 		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
++ 					   sizeof(unsigned long),
++ 					   GFP_KERNEL);
++ 		if (!d->rmid_busy_llc)
++ 			return -ENOMEM;
++ 	}
++ 	if (is_mbm_total_enabled()) {
++ 		tsize = sizeof(*d->mbm_total);
++ 		d->mbm_total = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_total) {
++ 			kfree(d->rmid_busy_llc);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 	if (is_mbm_local_enabled()) {
++ 		tsize = sizeof(*d->mbm_local);
++ 		d->mbm_local = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_local) {
++ 			kfree(d->rmid_busy_llc);
++ 			kfree(d->mbm_total);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	if (is_mbm_enabled()) {
++ 		INIT_DELAYED_WORK(&d->mbm_over, mbm_handle_overflow);
++ 		mbm_setup_overflow_handler(d);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e33026831bdb (x86/intel_rdt/mbm: Handle counter overflow)
+  /*
+   * domain_add_cpu - Add a cpu to a resource's domain list.
+   *
+@@@ -347,9 -523,24 +433,15 @@@ static void domain_remove_cpu(int cpu, 
+  
+  	cpumask_clear_cpu(cpu, &d->cpu_mask);
+  	if (cpumask_empty(&d->cpu_mask)) {
+ -		/*
+ -		 * If resctrl is mounted, remove all the
+ -		 * per domain monitor data directories.
+ -		 */
+ -		if (static_branch_unlikely(&rdt_mon_enable_key))
+ -			rmdir_mondata_subdir_allrdtgrp(r, d->id);
+ -		kfree(d->ctrl_val);
+ -		kfree(d->rmid_busy_llc);
+ -		kfree(d->mbm_total);
+ -		kfree(d->mbm_local);
+ +		kfree(d->cbm);
+  		list_del(&d->list);
++ 		if (is_mbm_enabled())
++ 			cancel_delayed_work(&d->mbm_over);
+  		kfree(d);
++ 	} else if (r == &rdt_resources_all[RDT_RESOURCE_L3] &&
++ 		   cpu == d->mbm_work_cpu && is_mbm_enabled()) {
++ 		cancel_delayed_work(&d->mbm_over);
++ 		mbm_setup_overflow_handler(d);
+  	}
+  }
+  
+diff --cc arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+index 1c3603d97e9d,c24dd067b9c5..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
++++ b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+@@@ -787,12 -1091,51 +789,29 @@@ static struct dentry *rdt_mount(struct 
+  	dentry = kernfs_mount(fs_type, flags, rdt_root,
+  			      RDTGROUP_SUPER_MAGIC, NULL);
+  	if (IS_ERR(dentry))
+ -		goto out_mondata;
+ +		goto out_destroy;
+  
+++<<<<<<< HEAD
+ +	static_key_slow_inc(&rdt_enable_key);
+++=======
++ 	if (rdt_alloc_capable)
++ 		static_branch_enable(&rdt_alloc_enable_key);
++ 	if (rdt_mon_capable)
++ 		static_branch_enable(&rdt_mon_enable_key);
++ 
++ 	if (rdt_alloc_capable || rdt_mon_capable)
++ 		static_branch_enable(&rdt_enable_key);
++ 
++ 	if (is_mbm_enabled()) {
++ 		r = &rdt_resources_all[RDT_RESOURCE_L3];
++ 		list_for_each_entry(dom, &r->domains, list)
++ 			mbm_setup_overflow_handler(dom);
++ 	}
++ 
+++>>>>>>> e33026831bdb (x86/intel_rdt/mbm: Handle counter overflow)
+  	goto out;
+  
+ -out_mondata:
+ -	if (rdt_mon_capable)
+ -		kernfs_remove(kn_mondata);
+ -out_mongrp:
+ -	if (rdt_mon_capable)
+ -		kernfs_remove(kn_mongrp);
+ -out_info:
+ +out_destroy:
+  	kernfs_remove(kn_info);
+  out_cdp:
+  	cdp_disable();
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
