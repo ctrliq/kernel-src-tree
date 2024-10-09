@@ -46,7 +46,7 @@ int copyfile_mode(const char *from, const char *to, mode_t mode);
 int copyfile_offset(int fromfd, loff_t from_ofs, int tofd, loff_t to_ofs, u64 size);
 
 ssize_t readn(int fd, void *buf, size_t n);
-ssize_t writen(int fd, void *buf, size_t n);
+ssize_t writen(int fd, const void *buf, size_t n);
 
 size_t hex_width(u64 v);
 int hex2u64(const char *ptr, u64 *val);
