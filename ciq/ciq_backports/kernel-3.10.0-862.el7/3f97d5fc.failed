@@ -1,0 +1,284 @@
+gpio: handle also nested irqchips in the chained handler set-up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [gpio] handle also nested irqchips in the chained handler set-up (David Arcari) [1467490]
+Rebuild_FUZZ: 95.00%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 3f97d5fcf99cb87f590ffe1d9422b2a26a8ef3ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3f97d5fc.failed
+
+To unify how we connect cascaded IRQ chips to parent IRQs, if
+NULL us passed as handler to the gpiochip_set_chained_irqchip()
+function, assume the chips is nested rather than chained, and
+we still get the parent set up correctly by way of this function
+call.
+
+Alter the drivers for tc3589x and stmpe to use this to set up
+their chained handlers as a demonstration of the usage.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 3f97d5fcf99cb87f590ffe1d9422b2a26a8ef3ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/gpio/driver.txt
+#	drivers/gpio/gpio-stmpe.c
+diff --cc Documentation/gpio/driver.txt
+index 9da0bfa74781,31e0b5db55d8..000000000000
+--- a/Documentation/gpio/driver.txt
++++ b/Documentation/gpio/driver.txt
+@@@ -62,6 -62,97 +62,100 @@@ Any debugfs dump method should normall
+  requested as GPIOs. They can use gpiochip_is_requested(), which returns either
+  NULL or the label associated with that GPIO when it was requested.
+  
+++<<<<<<< HEAD
+++=======
++ 
++ GPIO drivers providing IRQs
++ ---------------------------
++ It is custom that GPIO drivers (GPIO chips) are also providing interrupts,
++ most often cascaded off a parent interrupt controller, and in some special
++ cases the GPIO logic is melded with a SoC's primary interrupt controller.
++ 
++ The IRQ portions of the GPIO block are implemented using an irqchip, using
++ the header <linux/irq.h>. So basically such a driver is utilizing two sub-
++ systems simultaneously: gpio and irq.
++ 
++ GPIO irqchips usually fall in one of two categories:
++ 
++ * CHAINED GPIO irqchips: these are usually the type that is embedded on
++   an SoC. This means that there is a fast IRQ handler for the GPIOs that
++   gets called in a chain from the parent IRQ handler, most typically the
++   system interrupt controller. This means the GPIO irqchip is registered
++   using irq_set_chained_handler() or the corresponding
++   gpiochip_set_chained_irqchip() helper function, and the GPIO irqchip
++   handler will be called immediately from the parent irqchip, while
++   holding the IRQs disabled. The GPIO irqchip will then end up calling
++   something like this sequence in its interrupt handler:
++ 
++   static irqreturn_t tc3589x_gpio_irq(int irq, void *data)
++       chained_irq_enter(...);
++       generic_handle_irq(...);
++       chained_irq_exit(...);
++ 
++   Chained GPIO irqchips typically can NOT set the .can_sleep flag on
++   struct gpio_chip, as everything happens directly in the callbacks.
++ 
++ * NESTED THREADED GPIO irqchips: these are off-chip GPIO expanders and any
++   other GPIO irqchip residing on the other side of a sleeping bus. Of course
++   such drivers that need slow bus traffic to read out IRQ status and similar,
++   traffic which may in turn incur other IRQs to happen, cannot be handled
++   in a quick IRQ handler with IRQs disabled. Instead they need to spawn a
++   thread and then mask the parent IRQ line until the interrupt is handled
++   by the driver. The hallmark of this driver is to call something like
++   this in its interrupt handler:
++ 
++   static irqreturn_t tc3589x_gpio_irq(int irq, void *data)
++       ...
++       handle_nested_irq(irq);
++ 
++   The hallmark of threaded GPIO irqchips is that they set the .can_sleep
++   flag on struct gpio_chip to true, indicating that this chip may sleep
++   when accessing the GPIOs.
++ 
++ To help out in handling the set-up and management of GPIO irqchips and the
++ associated irqdomain and resource allocation callbacks, the gpiolib has
++ some helpers that can be enabled by selecting the GPIOLIB_IRQCHIP Kconfig
++ symbol:
++ 
++ * gpiochip_irqchip_add(): adds an irqchip to a gpiochip. It will pass
++   the struct gpio_chip* for the chip to all IRQ callbacks, so the callbacks
++   need to embed the gpio_chip in its state container and obtain a pointer
++   to the container using container_of().
++   (See Documentation/driver-model/design-patterns.txt)
++ 
++ * gpiochip_set_chained_irqchip(): sets up a chained irq handler for a
++   gpio_chip from a parent IRQ and passes the struct gpio_chip* as handler
++   data. (Notice handler data, since the irqchip data is likely used by the
++   parent irqchip!) This is for the chained type of chip. This is also used
++   to set up a nested irqchip if NULL is passed as handler.
++ 
++ To use the helpers please keep the following in mind:
++ 
++ - Make sure to assign all relevant members of the struct gpio_chip so that
++   the irqchip can initialize. E.g. .dev and .can_sleep shall be set up
++   properly.
++ 
++ It is legal for any IRQ consumer to request an IRQ from any irqchip no matter
++ if that is a combined GPIO+IRQ driver. The basic premise is that gpio_chip and
++ irq_chip are orthogonal, and offering their services independent of each
++ other.
++ 
++ gpiod_to_irq() is just a convenience function to figure out the IRQ for a
++ certain GPIO line and should not be relied upon to have been called before
++ the IRQ is used.
++ 
++ So always prepare the hardware and make it ready for action in respective
++ callbacks from the GPIO and irqchip APIs. Do not rely on gpiod_to_irq() having
++ been called first.
++ 
++ This orthogonality leads to ambiguities that we need to solve: if there is
++ competition inside the subsystem which side is using the resource (a certain
++ GPIO line and register for example) it needs to deny certain operations and
++ keep track of usage inside of the gpiolib subsystem. This is why the API
++ below exists.
++ 
++ 
+++>>>>>>> 3f97d5fcf99c (gpio: handle also nested irqchips in the chained handler set-up)
+  Locking IRQ usage
+  -----------------
+  Input GPIOs can be used as IRQ signals. When this happens, a driver is requested
+diff --cc drivers/gpio/gpio-stmpe.c
+index 3ce5bc38ac31,b0b342787c37..000000000000
+--- a/drivers/gpio/gpio-stmpe.c
++++ b/drivers/gpio/gpio-stmpe.c
+@@@ -372,23 -308,35 +372,54 @@@ static int stmpe_gpio_probe(struct plat
+  	if (ret)
+  		goto out_free;
+  
+++<<<<<<< HEAD
+ +	if (irq >= 0) {
+ +		ret = stmpe_gpio_irq_init(stmpe_gpio, np);
+ +		if (ret)
+ +			goto out_disable;
+ +
+ +		ret = request_threaded_irq(irq, NULL, stmpe_gpio_irq,
+ +				IRQF_ONESHOT, "stmpe-gpio", stmpe_gpio);
+++=======
++ 	ret = gpiochip_add(&stmpe_gpio->chip);
++ 	if (ret) {
++ 		dev_err(&pdev->dev, "unable to add gpiochip: %d\n", ret);
++ 		goto out_disable;
++ 	}
++ 
++ 	if (irq > 0) {
++ 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
++ 				stmpe_gpio_irq, IRQF_ONESHOT,
++ 				"stmpe-gpio", stmpe_gpio);
+++>>>>>>> 3f97d5fcf99c (gpio: handle also nested irqchips in the chained handler set-up)
+  		if (ret) {
+  			dev_err(&pdev->dev, "unable to get irq: %d\n", ret);
+  			goto out_disable;
+  		}
+++<<<<<<< HEAD
+ +	}
+ +
+ +	ret = gpiochip_add(&stmpe_gpio->chip);
+ +	if (ret) {
+ +		dev_err(&pdev->dev, "unable to add gpiochip: %d\n", ret);
+ +		goto out_freeirq;
+++=======
++ 		ret =  gpiochip_irqchip_add(&stmpe_gpio->chip,
++ 					    &stmpe_gpio_irq_chip,
++ 					    0,
++ 					    handle_simple_irq,
++ 					    IRQ_TYPE_NONE);
++ 		if (ret) {
++ 			dev_err(&pdev->dev,
++ 				"could not connect irqchip to gpiochip\n");
++ 			goto out_disable;
++ 		}
++ 
++ 		gpiochip_set_chained_irqchip(&stmpe_gpio->chip,
++ 					     &stmpe_gpio_irq_chip,
++ 					     irq,
++ 					     NULL);
+++>>>>>>> 3f97d5fcf99c (gpio: handle also nested irqchips in the chained handler set-up)
+  	}
+  
+  	if (pdata && pdata->setup)
+@@@ -398,11 -346,9 +429,12 @@@
+  
+  	return 0;
+  
+ +out_freeirq:
+ +	if (irq >= 0)
+ +		free_irq(irq, stmpe_gpio);
+  out_disable:
+  	stmpe_disable(stmpe, STMPE_BLOCK_GPIO);
++ 	gpiochip_remove(&stmpe_gpio->chip);
+  out_free:
+  	kfree(stmpe_gpio);
+  	return ret;
+* Unmerged path Documentation/gpio/driver.txt
+* Unmerged path drivers/gpio/gpio-stmpe.c
+diff --git a/drivers/gpio/gpio-tc3589x.c b/drivers/gpio/gpio-tc3589x.c
+index d34d80dfb083..085864d1835b 100644
+--- a/drivers/gpio/gpio-tc3589x.c
++++ b/drivers/gpio/gpio-tc3589x.c
+@@ -373,6 +373,11 @@ static int tc3589x_gpio_probe(struct platform_device *pdev)
+ 		goto out_freeirq;
+ 	}
+ 
++	gpiochip_set_chained_irqchip(&tc3589x_gpio->chip,
++				     &tc3589x_gpio_irq_chip,
++				     irq,
++				     NULL);
++
+ 	if (pdata && pdata->setup)
+ 		pdata->setup(tc3589x, tc3589x_gpio->chip.base);
+ 
+diff --git a/drivers/gpio/gpiolib.c b/drivers/gpio/gpiolib.c
+index 927a1d077837..c905987fa65e 100644
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -1471,13 +1471,14 @@ static struct gpio_chip *find_chip_by_name(const char *name)
+  */
+ 
+ /**
+- * gpiochip_add_chained_irqchip() - adds a chained irqchip to a gpiochip
+- * @gpiochip: the gpiochip to add the irqchip to
+- * @irqchip: the irqchip to add to the gpiochip
++ * gpiochip_set_chained_irqchip() - sets a chained irqchip to a gpiochip
++ * @gpiochip: the gpiochip to set the irqchip chain to
++ * @irqchip: the irqchip to chain to the gpiochip
+  * @parent_irq: the irq number corresponding to the parent IRQ for this
+  * chained irqchip
+  * @parent_handler: the parent interrupt handler for the accumulated IRQ
+- * coming out of the gpiochip
++ * coming out of the gpiochip. If the interrupt is nested rather than
++ * cascaded, pass NULL in this handler argument
+  */
+ void gpiochip_set_chained_irqchip(struct gpio_chip *gpiochip,
+ 				  struct irq_chip *irqchip,
+@@ -1486,23 +1487,26 @@ void gpiochip_set_chained_irqchip(struct gpio_chip *gpiochip,
+ {
+ 	unsigned int offset;
+ 
+-	if (gpiochip->can_sleep) {
+-		chip_err(gpiochip, "you cannot have chained interrupts on a chip that may sleep\n");
+-		return;
+-	}
+ 	if (!gpiochip->irqdomain) {
+ 		chip_err(gpiochip, "called %s before setting up irqchip\n",
+ 			 __func__);
+ 		return;
+ 	}
+ 
+-	irq_set_chained_handler(parent_irq, parent_handler);
+-
+-	/*
+-	 * The parent irqchip is already using the chip_data for this
+-	 * irqchip, so our callbacks simply use the handler_data.
+-	 */
+-	irq_set_handler_data(parent_irq, gpiochip);
++	if (parent_handler) {
++		if (gpiochip->can_sleep) {
++			chip_err(gpiochip,
++				 "you cannot have chained interrupts on a "
++				 "chip that may sleep\n");
++			return;
++		}
++		irq_set_chained_handler(parent_irq, parent_handler);
++		/*
++		 * The parent irqchip is already using the chip_data for this
++		 * irqchip, so our callbacks simply use the handler_data.
++		 */
++		irq_set_handler_data(parent_irq, gpiochip);
++	}
+ 
+ 	/* Set the parent IRQ for all affected IRQs */
+ 	for (offset = 0; offset < gpiochip->ngpio; offset++)
