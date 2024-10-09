@@ -1,0 +1,121 @@
+net/mlx5e: Do not reduce LRO WQE size when not using build_skb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Do not reduce LRO WQE size when not using build_skb (Jonathan Toppins) [1448565]
+Rebuild_FUZZ: 96.67%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 4078e637c12f1e0a74293f1ec9563f42bff14a03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4078e637.failed
+
+When rq_type is Striding RQ, no room of SKB_RESERVE is needed
+as SKB allocation is not done via build_skb.
+
+Fixes: e4b85508072b ("net/mlx5e: Slightly reduce hardware LRO size")
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4078e637c12f1e0a74293f1ec9563f42bff14a03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index ae009c7fda21,0d58729b42ae..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -71,6 -72,58 +71,61 @@@ struct mlx5e_channel_param 
+  	struct mlx5e_cq_param      icosq_cq;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
++ {
++ 	return MLX5_CAP_GEN(mdev, striding_rq) &&
++ 		MLX5_CAP_GEN(mdev, umr_ptr_rlky) &&
++ 		MLX5_CAP_ETH(mdev, reg_umr_sq);
++ }
++ 
++ static void mlx5e_set_rq_type_params(struct mlx5e_priv *priv, u8 rq_type)
++ {
++ 	priv->params.rq_wq_type = rq_type;
++ 	priv->params.lro_wqe_sz = MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ;
++ 	switch (priv->params.rq_wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		priv->params.log_rq_size = is_kdump_kernel() ?
++ 			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW :
++ 			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE_MPW;
++ 		priv->params.mpwqe_log_stride_sz =
++ 			MLX5E_GET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS) ?
++ 			MLX5_MPWRQ_CQE_CMPRS_LOG_STRIDE_SZ(priv->mdev) :
++ 			MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(priv->mdev);
++ 		priv->params.mpwqe_log_num_strides = MLX5_MPWRQ_LOG_WQE_SZ -
++ 			priv->params.mpwqe_log_stride_sz;
++ 		break;
++ 	default: /* MLX5_WQ_TYPE_LINKED_LIST */
++ 		priv->params.log_rq_size = is_kdump_kernel() ?
++ 			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE :
++ 			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
++ 
++ 		/* Extra room needed for build_skb */
++ 		priv->params.lro_wqe_sz -= MLX5_RX_HEADROOM +
++ 			SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 	}
++ 	priv->params.min_rx_wqes = mlx5_min_rx_wqes(priv->params.rq_wq_type,
++ 					       BIT(priv->params.log_rq_size));
++ 
++ 	mlx5_core_info(priv->mdev,
++ 		       "MLX5E: StrdRq(%d) RqSz(%ld) StrdSz(%ld) RxCqeCmprss(%d)\n",
++ 		       priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ,
++ 		       BIT(priv->params.log_rq_size),
++ 		       BIT(priv->params.mpwqe_log_stride_sz),
++ 		       MLX5E_GET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS));
++ }
++ 
++ static void mlx5e_set_rq_priv_params(struct mlx5e_priv *priv)
++ {
++ 	u8 rq_type = mlx5e_check_fragmented_striding_rq_cap(priv->mdev) &&
++ 		    !priv->xdp_prog ?
++ 		    MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ :
++ 		    MLX5_WQ_TYPE_LINKED_LIST;
++ 	mlx5e_set_rq_type_params(priv, rq_type);
++ }
++ 
+++>>>>>>> 4078e637c12f (net/mlx5e: Do not reduce LRO WQE size when not using build_skb)
+  static void mlx5e_update_carrier(struct mlx5e_priv *priv)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+@@@ -2827,25 -3550,12 +2882,19 @@@ static void mlx5e_build_netdev_priv(str
+  			    sizeof(priv->params.toeplitz_hash_key));
+  
+  	mlx5e_build_default_indir_rqt(mdev, priv->params.indirection_rqt,
+ -				      MLX5E_INDIR_RQT_SIZE, profile->max_nch(mdev));
+ +				      MLX5E_INDIR_RQT_SIZE, num_channels);
+  
+- 	priv->params.lro_wqe_sz =
+- 		MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ -
+- 		/* Extra room needed for build_skb */
+- 		MLX5_RX_HEADROOM -
+- 		SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+- 
+  	/* Initialize pflags */
+ -	MLX5E_SET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_BASED_MODER,
+ -			priv->params.rx_cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE);
+ -	MLX5E_SET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS, priv->params.rx_cqe_compress_def);
+ +	MLX5E_SET_PRIV_FLAG(priv, MLX5E_PFLAG_RX_CQE_BASED_MODER,
+ +			    priv->params.rx_cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE);
+ +
+ +	priv->mdev                         = mdev;
+ +	priv->netdev                       = netdev;
+ +	priv->params.num_channels          = num_channels;
+ +
+ +#ifdef CONFIG_MLX5_CORE_EN_DCB
+ +	mlx5e_ets_init(priv);
+ +#endif
+  
+  	mutex_init(&priv->state_lock);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
