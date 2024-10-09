@@ -1,0 +1,124 @@
+perf symbols: Fix slowness due to -ffunction-section
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Eric Saint-Etienne <eric.saint.etienne@oracle.com>
+commit 1e6285699b3034e6f4d1f091edd46d717580bf7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1e628569.failed
+
+Perf can take minutes to parse an image when -ffunction-section is used.
+This is especially true with the kernel image when it is compiled this
+way, which is the arm64 default since the patcheset "Enable deadcode
+elimination at link time".
+
+Perf organize maps using a rbtree. Whenever perf finds a new symbols, it
+first searches this rbtree for the map it belongs to, by strcmp()'aring
+section names.  When it finds the map with the right name, it uses it to
+add the symbol. With a usual image there aren't so many maps but when
+using -ffunction-section there's basically one map per function.  With
+the kernel image that's north of 40,000 maps. For most symbols perf has
+to parses the entire rbtree to eventually create a new map and add it.
+Consequently perf spends most of the time browsing a rbtree that keeps
+getting larger.
+
+This performance fix introduces a secondary rbtree that indexes maps
+based on the section name.
+
+	Signed-off-by: Eric Saint-Etienne <eric.saint.etienne@oracle.com>
+	Reviewed-by: Dave Kleikamp <dave.kleikamp@oracle.com>
+	Reviewed-by: David Aldridge <david.aldridge@oracle.com>
+	Reviewed-by: Rob Gardner <rob.gardner@oracle.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1542822679-25591-1-git-send-email-eric.saint.etienne@oracle.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 1e6285699b3034e6f4d1f091edd46d717580bf7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/map.c
+diff --cc tools/perf/util/map.c
+index fc6113541daa,781eed8e3265..000000000000
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@@ -19,12 -20,9 +19,13 @@@
+  #include "unwind.h"
+  
+  static void __maps__insert(struct maps *maps, struct map *map);
++ static void __maps__insert_name(struct maps *maps, struct map *map);
+  
+ +const char *map_type__name[MAP__NR_TYPES] = {
+ +	[MAP__FUNCTION] = "Functions",
+ +	[MAP__VARIABLE] = "Variables",
+ +};
+ +
+  static inline int is_anon_memory(const char *filename, u32 flags)
+  {
+  	return flags & MAP_HUGETLB ||
+@@@ -693,7 -665,8 +695,12 @@@ size_t map_groups__fprintf(struct map_g
+  
+  static void __map_groups__insert(struct map_groups *mg, struct map *map)
+  {
+++<<<<<<< HEAD
+ +	__maps__insert(&mg->maps[map->type], map);
+++=======
++ 	__maps__insert(&mg->maps, map);
++ 	__maps__insert_name(&mg->maps, map);
+++>>>>>>> 1e6285699b30 (perf symbols: Fix slowness due to -ffunction-section)
+  	map->groups = mg;
+  }
+  
+* Unmerged path tools/perf/util/map.c
+diff --git a/tools/perf/util/map.h b/tools/perf/util/map.h
+index ecaf2f62fa7a..ddbbae0e6803 100644
+--- a/tools/perf/util/map.h
++++ b/tools/perf/util/map.h
+@@ -33,6 +33,7 @@ struct map {
+ 		struct rb_node	rb_node;
+ 		struct list_head node;
+ 	};
++	struct rb_node          rb_node_name;
+ 	u64			start;
+ 	u64			end;
+ 	u8 /* enum map_type */	type;
+@@ -66,6 +67,7 @@ struct kmap {
+ 
+ struct maps {
+ 	struct rb_root	 entries;
++	struct rb_root	 names;
+ 	struct rw_semaphore lock;
+ };
+ 
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 6eafab72ae58..55a634920546 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -1652,11 +1652,22 @@ struct map *__map_groups__find_by_name(struct map_groups *mg, enum map_type type
+ {
+ 	struct maps *maps = &mg->maps[type];
+ 	struct map *map;
++	struct rb_node *node;
+ 
+ 	down_read(&maps->lock);
+ 
+-	for (map = maps__first(maps); map; map = map__next(map)) {
+-		if (map->dso && strcmp(map->dso->short_name, name) == 0)
++	for (node = maps->names.rb_node; node; ) {
++		int rc;
++
++		map = rb_entry(node, struct map, rb_node_name);
++
++		rc = strcmp(map->dso->short_name, name);
++		if (rc < 0)
++			node = node->rb_left;
++		else if (rc > 0)
++			node = node->rb_right;
++		else
++
+ 			goto out_unlock;
+ 	}
+ 
