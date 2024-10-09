@@ -1,0 +1,173 @@
+s390/qeth: conclude all event processing before offlining a card
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] qeth: conclude all event processing before offlining a card (Hendrik Brueckner) [1686039]
+Rebuild_FUZZ: 95.93%
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit c0a2e4d10d9366ada133a8ae4ff2f32397f8b15b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c0a2e4d1.failed
+
+Work for Bridgeport events is currently placed on a driver-wide
+workqueue. If the card is removed and freed while any such work is still
+active, this causes a use-after-free.
+So put the events on a per-card queue, where we can control their
+lifetime. As we also don't want stale events to last beyond an
+offline & online cycle, flush this queue when setting the card offline.
+
+Fixes: b4d72c08b358 ("qeth: bridgeport support - basic control")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c0a2e4d10d9366ada133a8ae4ff2f32397f8b15b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 88e60ed5028a,89f912213e62..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -70,9 -74,15 +70,8 @@@ static void qeth_notify_skbs(struct qet
+  static void qeth_release_skbs(struct qeth_qdio_out_buffer *buf);
+  static int qeth_init_qdio_out_buf(struct qeth_qdio_out_q *, int);
+  
+- struct workqueue_struct *qeth_wq;
+- EXPORT_SYMBOL_GPL(qeth_wq);
++ static struct workqueue_struct *qeth_wq;
+  
+ -int qeth_card_hw_is_reachable(struct qeth_card *card)
+ -{
+ -	return (card->state == CARD_STATE_SOFTSETUP) ||
+ -		(card->state == CARD_STATE_UP);
+ -}
+ -EXPORT_SYMBOL_GPL(qeth_card_hw_is_reachable);
+ -
+  static void qeth_close_dev_handler(struct work_struct *work)
+  {
+  	struct qeth_card *card;
+@@@ -1511,16 -1462,22 +1510,30 @@@ static struct qeth_card *qeth_alloc_car
+  	if (!card)
+  		goto out;
+  	QETH_DBF_HEX(SETUP, 2, &card, sizeof(void *));
+++<<<<<<< HEAD
+ +	card->ip_tbd_list = kzalloc(sizeof(struct list_head), GFP_KERNEL);
+ +	if (!card->ip_tbd_list) {
+ +		QETH_DBF_TEXT(SETUP, 0, "iptbdnom");
+ +		goto out_card;
+ +	}
+ +	if (qeth_setup_channel(&card->read))
+++=======
++ 
++ 	card->gdev = gdev;
++ 	dev_set_drvdata(&gdev->dev, card);
++ 	CARD_RDEV(card) = gdev->cdev[0];
++ 	CARD_WDEV(card) = gdev->cdev[1];
++ 	CARD_DDEV(card) = gdev->cdev[2];
++ 
++ 	card->event_wq = alloc_ordered_workqueue("%s", 0, dev_name(&gdev->dev));
++ 	if (!card->event_wq)
++ 		goto out_wq;
++ 	if (qeth_setup_channel(&card->read, true))
+++>>>>>>> c0a2e4d10d93 (s390/qeth: conclude all event processing before offlining a card)
+  		goto out_ip;
+ -	if (qeth_setup_channel(&card->write, true))
+ +	if (qeth_setup_channel(&card->write))
+  		goto out_channel;
+ -	if (qeth_setup_channel(&card->data, false))
+ -		goto out_data;
+ +	card->options.layer2 = -1;
+  	card->qeth_service_level.seq_print = qeth_core_sl_print;
+  	register_service_level(&card->qeth_service_level);
+  	return card;
+@@@ -1528,8 -1485,11 +1541,14 @@@
+  out_channel:
+  	qeth_clean_channel(&card->read);
+  out_ip:
+++<<<<<<< HEAD
+ +	kfree(card->ip_tbd_list);
+ +out_card:
+++=======
++ 	destroy_workqueue(card->event_wq);
++ out_wq:
++ 	dev_set_drvdata(&gdev->dev, NULL);
+++>>>>>>> c0a2e4d10d93 (s390/qeth: conclude all event processing before offlining a card)
+  	kfree(card);
+  out:
+  	return NULL;
+@@@ -4972,9 -5035,11 +4991,14 @@@ static void qeth_core_free_card(struct 
+  	QETH_DBF_HEX(SETUP, 2, &card, sizeof(void *));
+  	qeth_clean_channel(&card->read);
+  	qeth_clean_channel(&card->write);
+++<<<<<<< HEAD
+ +	kfree(card->ip_tbd_list);
+++=======
++ 	qeth_clean_channel(&card->data);
++ 	destroy_workqueue(card->event_wq);
+++>>>>>>> c0a2e4d10d93 (s390/qeth: conclude all event processing before offlining a card)
+  	qeth_free_qdio_buffers(card);
+  	unregister_service_level(&card->qeth_service_level);
+ -	dev_set_drvdata(&card->gdev->dev, NULL);
+  	kfree(card);
+  }
+  
+diff --cc drivers/s390/net/qeth_l2_main.c
+index b9852de25f9b,a43de2f9bcac..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -457,7 -369,8 +457,12 @@@ static int qeth_l2_stop_card(struct qet
+  		qeth_clear_cmd_buffers(&card->read);
+  		qeth_clear_cmd_buffers(&card->write);
+  	}
+++<<<<<<< HEAD
+ +	return rc;
+++=======
++ 
++ 	flush_workqueue(card->event_wq);
+++>>>>>>> c0a2e4d10d93 (s390/qeth: conclude all event processing before offlining a card)
+  }
+  
+  static int qeth_l2_process_inbound_buffer(struct qeth_card *card,
+diff --cc drivers/s390/net/qeth_l3_main.c
+index faa467771068,df34bff4ac31..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -2075,7 -1433,8 +2075,12 @@@ static int qeth_l3_stop_card(struct qet
+  		qeth_clear_cmd_buffers(&card->read);
+  		qeth_clear_cmd_buffers(&card->write);
+  	}
+++<<<<<<< HEAD
+ +	return rc;
+++=======
++ 
++ 	flush_workqueue(card->event_wq);
+++>>>>>>> c0a2e4d10d93 (s390/qeth: conclude all event processing before offlining a card)
+  }
+  
+  /*
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index d4437aa7c289..2bec73c13198 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -799,6 +799,7 @@ struct qeth_card {
+ 	struct qeth_seqno seqno;
+ 	struct qeth_card_options options;
+ 
++	struct workqueue_struct *event_wq;
+ 	wait_queue_head_t wait_q;
+ 	spinlock_t vlanlock;
+ 	spinlock_t mclock;
+@@ -909,7 +910,6 @@ extern const struct attribute_group *qeth_osn_attr_groups[];
+ extern const struct attribute_group qeth_device_attr_group;
+ extern const struct attribute_group qeth_device_blkt_group;
+ extern const struct device_type qeth_generic_devtype;
+-extern struct workqueue_struct *qeth_wq;
+ 
+ const char *qeth_get_cardname_short(struct qeth_card *);
+ int qeth_realloc_buffer_pool(struct qeth_card *, int);
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
