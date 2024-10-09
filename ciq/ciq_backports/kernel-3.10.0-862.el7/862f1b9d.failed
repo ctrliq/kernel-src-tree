@@ -1,0 +1,160 @@
+xfs: use struct iomap based DAX PMD fault path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 862f1b9d67187cf441e713cc77efae682d8ebc45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/862f1b9d.failed
+
+Switch xfs_filemap_pmd_fault() from using dax_pmd_fault() to the new and
+improved dax_iomap_pmd_fault().  Also, now that it has no more users,
+remove xfs_get_blocks_dax_fault().
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 862f1b9d67187cf441e713cc77efae682d8ebc45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_aops.h
+diff --cc fs/xfs/xfs_aops.c
+index e68aed48cb56,561cf1456c6c..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1371,9 -1419,8 +1370,14 @@@ __xfs_get_blocks
+  		if (ISUNWRITTEN(&imap))
+  			set_buffer_unwritten(bh_result);
+  		/* direct IO needs special help */
+++<<<<<<< HEAD
+ +		if (create && direct)
+ +			xfs_map_direct(inode, bh_result, &imap, offset,
+ +				       dax_fault);
+++=======
++ 		if (create)
++ 			xfs_map_direct(inode, bh_result, &imap, offset, is_cow);
+++>>>>>>> 862f1b9d6718 (xfs: use struct iomap based DAX PMD fault path)
+  	}
+  
+  	/*
+@@@ -1429,52 -1470,42 +1433,42 @@@ xfs_get_blocks_direct
+  	struct buffer_head	*bh_result,
+  	int			create)
+  {
+- 	return __xfs_get_blocks(inode, iblock, bh_result, create, true, false);
+- }
+- 
+- int
+- xfs_get_blocks_dax_fault(
+- 	struct inode		*inode,
+- 	sector_t		iblock,
+- 	struct buffer_head	*bh_result,
+- 	int			create)
+- {
+- 	return __xfs_get_blocks(inode, iblock, bh_result, create, true, true);
++ 	return __xfs_get_blocks(inode, iblock, bh_result, create, true);
+  }
+  
+ -/*
+ - * Complete a direct I/O write request.
+ - *
+ - * xfs_map_direct passes us some flags in the private data to tell us what to
+ - * do.  If no flags are set, then the write IO is an overwrite wholly within
+ - * the existing allocated file size and so there is nothing for us to do.
+ - *
+ - * Note that in this case the completion can be called in interrupt context,
+ - * whereas if we have flags set we will always be called in task context
+ - * (i.e. from a workqueue).
+ - */
+ -int
+ -xfs_end_io_direct_write(
+ -	struct kiocb		*iocb,
+ +static void
+ +__xfs_end_io_direct_write(
+ +	struct inode		*inode,
+ +	struct xfs_ioend	*ioend,
+  	loff_t			offset,
+ -	ssize_t			size,
+ -	void			*private)
+ +	ssize_t			size)
+  {
+ -	struct inode		*inode = file_inode(iocb->ki_filp);
+ -	struct xfs_inode	*ip = XFS_I(inode);
+ -	uintptr_t		flags = (uintptr_t)private;
+ -	int			error = 0;
+ +	struct xfs_mount	*mp = XFS_I(inode)->i_mount;
+ +	unsigned long		flags;
+  
+ -	trace_xfs_end_io_direct_write(ip, offset, size);
+ +	if (XFS_FORCED_SHUTDOWN(mp) || ioend->io_error)
+ +		goto out_end_io;
+  
+ -	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+ -		return -EIO;
+ +	/*
+ +	 * dio completion end_io functions are only called on writes if more
+ +	 * than 0 bytes was written.
+ +	 */
+ +	ASSERT(size > 0);
+  
+ -	if (size <= 0)
+ -		return size;
+ +	/*
+ +	 * The ioend only maps whole blocks, while the IO may be sector aligned.
+ +	 * Hence the ioend offset/size may not match the IO offset/size exactly.
+ +	 * Because we don't map overwrites within EOF into the ioend, the offset
+ +	 * may not match, but only if the endio spans EOF.  Either way, write
+ +	 * the IO sizes into the ioend so that completion processing does the
+ +	 * right thing.
+ +	 */
+ +	ASSERT(offset + size <= ioend->io_offset + ioend->io_size);
+ +	ioend->io_size = size;
+ +	ioend->io_offset = offset;
+  
+  	/*
+ -	 * The flags tell us whether we are doing unwritten extent conversions
+ +	 * The ioend tells us whether we are doing unwritten extent conversion
+  	 * or an append transaction that updates the on-disk file size. These
+  	 * cases are the only cases where we should *potentially* be needing
+  	 * to update the VFS inode size.
+diff --cc fs/xfs/xfs_aops.h
+index c70a99747be1,34dc00dfb91d..000000000000
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@@ -58,11 -59,9 +58,17 @@@ int	xfs_get_blocks(struct inode *inode
+  		       struct buffer_head *map_bh, int create);
+  int	xfs_get_blocks_direct(struct inode *inode, sector_t offset,
+  			      struct buffer_head *map_bh, int create);
+++<<<<<<< HEAD
+ +int	xfs_get_blocks_dax_fault(struct inode *inode, sector_t offset,
+ +			         struct buffer_head *map_bh, int create);
+ +
+ +void	xfs_end_io_direct_write(struct kiocb *iocb, loff_t offset,
+ +		ssize_t size, void *private, int ret, bool is_async);
+++=======
++ int	xfs_end_io_direct_write(struct kiocb *iocb, loff_t offset,
++ 		ssize_t size, void *private);
++ int	xfs_setfilesize(struct xfs_inode *ip, xfs_off_t offset, size_t size);
+++>>>>>>> 862f1b9d6718 (xfs: use struct iomap based DAX PMD fault path)
+  
+  extern void xfs_count_page_state(struct page *, int *, int *);
+  extern struct block_device *xfs_find_bdev_for_inode(struct inode *);
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_aops.h
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 4da908a64865..95af6d7c26d4 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1782,7 +1782,7 @@ xfs_filemap_pmd_fault(
+ 	}
+ 
+ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+-	ret = dax_pmd_fault(vma, addr, pmd, flags, xfs_get_blocks_dax_fault);
++	ret = dax_iomap_pmd_fault(vma, addr, pmd, flags, &xfs_iomap_ops);
+ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+ 
+ 	if (flags & FAULT_FLAG_WRITE)
