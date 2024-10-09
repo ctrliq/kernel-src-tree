@@ -1,0 +1,128 @@
+qla2xxx: Convert QLA_TGT_ABTS to TARGET_SCF_LOOKUP_LUN_FROM_TAG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit eb5ae2335a84cccf45ec01602bc300c3e70486d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/eb5ae233.failed
+
+Following Himanshu's earlier patch to drop the redundant tag
+lookup within __qlt_24xx_handle_abts(), go ahead and drop this
+now QLA_TGT_ABTS can use TARGET_SCF_LOOKUP_LUN_FROM_TAG and
+have target_submit_tmr() do this from common code.
+
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Acked-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Quinn Tran <quinn.tran@cavium.com>
+	Cc: Mike Christie <mchristi@redhat.com>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit eb5ae2335a84cccf45ec01602bc300c3e70486d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 2ec0b3b49350,401e245477d4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1921,39 -1847,13 +1921,46 @@@ static int __qlt_24xx_handle_abts(struc
+  	struct abts_recv_from_24xx *abts, struct fc_port *sess)
+  {
+  	struct qla_hw_data *ha = vha->hw;
+- 	struct se_session *se_sess = sess->se_sess;
+  	struct qla_tgt_mgmt_cmd *mcmd;
+++<<<<<<< HEAD
+ +	struct se_cmd *se_cmd;
+ +	u64 lun = 0;
+++=======
+++>>>>>>> eb5ae2335a84 (qla2xxx: Convert QLA_TGT_ABTS to TARGET_SCF_LOOKUP_LUN_FROM_TAG)
+  	int rc;
+- 	bool found_lun = false;
+- 	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+ +	list_for_each_entry(se_cmd, &se_sess->sess_cmd_list, se_cmd_list) {
+ +		struct qla_tgt_cmd *cmd =
+ +			container_of(se_cmd, struct qla_tgt_cmd, se_cmd);
+ +		if (se_cmd->tag == abts->exchange_addr_to_abort) {
+ +			lun = cmd->unpacked_lun;
+ +			found_lun = true;
+ +			break;
+ +		}
+ +	}
+ +	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ +
+ +	/* cmd not in LIO lists, look in qla list */
+ +	if (!found_lun) {
+ +		if (abort_cmd_for_tag(vha, abts->exchange_addr_to_abort)) {
+ +			/* send TASK_ABORT response immediately */
+ +			qlt_24xx_send_abts_resp(ha->base_qpair, abts,
+ +			    FCP_TMF_CMPL, false);
+ +			return 0;
+ +		} else {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf081,
+ +			    "unable to find cmd in driver or LIO for tag 0x%x\n",
+ +			    abts->exchange_addr_to_abort);
+ +			return -ENOENT;
+ +		}
+++=======
++ 	if (abort_cmd_for_tag(vha, abts->exchange_addr_to_abort)) {
++ 		/* send TASK_ABORT response immediately */
++ 		qlt_24xx_send_abts_resp(vha, abts, FCP_TMF_CMPL, false);
++ 		return 0;
+++>>>>>>> eb5ae2335a84 (qla2xxx: Convert QLA_TGT_ABTS to TARGET_SCF_LOOKUP_LUN_FROM_TAG)
+  	}
+  
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf00f,
+@@@ -1971,12 -1871,14 +1978,16 @@@
+  
+  	mcmd->sess = sess;
+  	memcpy(&mcmd->orig_iocb.abts, abts, sizeof(mcmd->orig_iocb.abts));
+ -	mcmd->reset_count = vha->hw->chip_reset;
+ +	mcmd->reset_count = ha->base_qpair->chip_reset;
+  	mcmd->tmr_func = QLA_TGT_ABTS;
+ +	mcmd->qpair = ha->base_qpair;
+ +	mcmd->vha = vha;
+  
+- 	rc = ha->tgt.tgt_ops->handle_tmr(mcmd, lun, mcmd->tmr_func,
++ 	/*
++ 	 * LUN is looked up by target-core internally based on the passed
++ 	 * abts->exchange_addr_to_abort tag.
++ 	 */
++ 	rc = ha->tgt.tgt_ops->handle_tmr(mcmd, 0, mcmd->tmr_func,
+  	    abts->exchange_addr_to_abort);
+  	if (rc != 0) {
+  		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf052,
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index a92e580047a9..21fe6cb52167 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -603,11 +603,13 @@ static int tcm_qla2xxx_handle_tmr(struct qla_tgt_mgmt_cmd *mcmd, u64 lun,
+ 	struct fc_port *sess = mcmd->sess;
+ 	struct se_cmd *se_cmd = &mcmd->se_cmd;
+ 	int transl_tmr_func = 0;
++	int flags = TARGET_SCF_ACK_KREF;
+ 
+ 	switch (tmr_func) {
+ 	case QLA_TGT_ABTS:
+ 		pr_debug("%ld: ABTS received\n", sess->vha->host_no);
+ 		transl_tmr_func = TMR_ABORT_TASK;
++		flags |= TARGET_SCF_LOOKUP_LUN_FROM_TAG;
+ 		break;
+ 	case QLA_TGT_2G_ABORT_TASK:
+ 		pr_debug("%ld: 2G Abort Task received\n", sess->vha->host_no);
+@@ -640,7 +642,7 @@ static int tcm_qla2xxx_handle_tmr(struct qla_tgt_mgmt_cmd *mcmd, u64 lun,
+ 	}
+ 
+ 	return target_submit_tmr(se_cmd, sess->se_sess, NULL, lun, mcmd,
+-	    transl_tmr_func, GFP_ATOMIC, tag, TARGET_SCF_ACK_KREF);
++	    transl_tmr_func, GFP_ATOMIC, tag, flags);
+ }
+ 
+ static int tcm_qla2xxx_queue_data_in(struct se_cmd *se_cmd)
