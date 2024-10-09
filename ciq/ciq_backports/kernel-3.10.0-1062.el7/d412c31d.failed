@@ -1,0 +1,82 @@
+net/mlx5: Fix command interface race in polling mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Fix command interface race in polling mode (Alaa Hleihel) [1669506 1642498]
+Rebuild_FUZZ: 96.00%
+commit-author Alex Vesker <valex@mellanox.com>
+commit d412c31dae053bf30a1bc15582a9990df297a660
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d412c31d.failed
+
+The command interface can work in two modes: Events and Polling.
+In the general case, each time we invoke a command, a work is
+queued to handle it.
+
+When working in events, the interrupt handler completes the
+command execution. On the other hand, when working in polling
+mode, the work itself completes it.
+
+Due to a bug in the work handler, a command could have been
+completed by the interrupt handler, while the work handler
+hasn't finished yet, causing the it to complete once again
+if the command interface mode was changed from Events to
+polling after the interrupt handler was called.
+
+mlx5_unload_one()
+        mlx5_stop_eqs()
+                // Destroy the EQ before cmd EQ
+                ...cmd_work_handler()
+                        write_doorbell()
+                        --> EVENT_TYPE_CMD
+                                mlx5_cmd_comp_handler() // First free
+                                        free_ent(cmd, ent->idx)
+                                        complete(&ent->done)
+
+        <-- mlx5_stop_eqs //cmd was complete
+                // move to polling before destroying the last cmd EQ
+                mlx5_cmd_use_polling()
+                        cmd->mode = POLL;
+
+                --> cmd_work_handler (continues)
+                        if (cmd->mode == POLL)
+                                mlx5_cmd_comp_handler() // Double free
+
+The solution is to store the cmd->mode before writing the doorbell.
+
+Fixes: e126ba97dba9 ("mlx5: Add driver for Mellanox Connect-IB adapters")
+	Signed-off-by: Alex Vesker <valex@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d412c31dae053bf30a1bc15582a9990df297a660)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+index cb32c3ccbcce,384c1fa49081..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+@@@ -806,7 -805,9 +806,8 @@@ static void cmd_work_handler(struct wor
+  	struct mlx5_cmd_layout *lay;
+  	struct semaphore *sem;
+  	unsigned long flags;
+ -	bool poll_cmd = ent->polling;
+  	int alloc_ret;
++ 	int cmd_mode;
+  
+  	sem = ent->page_queue ? &cmd->pages_sem : &cmd->sem;
+  	down(sem);
+@@@ -877,7 -879,7 +879,11 @@@
+  	iowrite32be(1 << ent->idx, &dev->iseg->cmd_dbell);
+  	mmiowb();
+  	/* if not in polling don't use ent after this point */
+++<<<<<<< HEAD
+ +	if (cmd->mode == CMD_MODE_POLLING) {
+++=======
++ 	if (cmd_mode == CMD_MODE_POLLING || poll_cmd) {
+++>>>>>>> d412c31dae05 (net/mlx5: Fix command interface race in polling mode)
+  		poll_timeout(ent);
+  		/* make sure we read the descriptor after ownership is SW */
+  		rmb();
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/cmd.c
