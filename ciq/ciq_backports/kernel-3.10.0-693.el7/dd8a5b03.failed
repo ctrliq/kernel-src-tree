@@ -1,0 +1,232 @@
+sysfs, kernfs: move sysfs_open_file to include/linux/kernfs.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit dd8a5b036b6e8d50854e130555f90f062c5eacec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dd8a5b03.failed
+
+sysfs_open_file will be used as the primary handle for kernfs methods.
+Move its definition from fs/sysfs/file.c to include/linux/kernfs.h and
+mark the public and private fields.
+
+This is pure relocation.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit dd8a5b036b6e8d50854e130555f90f062c5eacec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+#	include/linux/kernfs.h
+diff --cc fs/sysfs/file.c
+index 602f56db0442,acba5835577e..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -39,52 -44,61 +39,68 @@@ struct sysfs_open_dirent 
+  	atomic_t		refcnt;
+  	atomic_t		event;
+  	wait_queue_head_t	poll;
+ -	struct list_head	files; /* goes through sysfs_open_file.list */
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+ +};
+ +
+++<<<<<<< HEAD
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+ +	struct mutex		mutex;
+ +	int			needs_read_fill;
+ +	int			event;
+ +	struct list_head	list;
+  };
+  
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's 
+ + *	data. 
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+++=======
++ static bool sysfs_is_bin(struct sysfs_dirent *sd)
++ {
++ 	return sysfs_type(sd) == SYSFS_KOBJ_BIN_ATTR;
++ }
++ 
++ static struct sysfs_open_file *sysfs_of(struct file *file)
++ {
++ 	return ((struct seq_file *)file->private_data)->private;
++ }
++ 
++ /*
++  * Determine ktype->sysfs_ops for the given sysfs_dirent.  This function
++  * must be called while holding an active reference.
+++>>>>>>> dd8a5b036b6e (sysfs, kernfs: move sysfs_open_file to include/linux/kernfs.h)
+   */
+ -static const struct sysfs_ops *sysfs_file_ops(struct sysfs_dirent *sd)
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+  {
+ -	struct kobject *kobj = sd->s_parent->priv;
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+ +	ssize_t count;
+  
+ -	if (!sysfs_ignore_lockdep(sd))
+ -		lockdep_assert_held(sd);
+ -	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
+ -}
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+ -/*
+ - * Reads on sysfs are handled through seq_file, which takes care of hairy
+ - * details like buffering and seeking.  The following function pipes
+ - * sysfs_ops->show() result through seq_file.
+ - */
+ -static int sysfs_kf_seq_show(struct seq_file *sf, void *v)
+ -{
+ -	struct sysfs_open_file *of = sf->private;
+ -	struct kobject *kobj = of->sd->s_parent->priv;
+ -	const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+ -	ssize_t count;
+ -	char *buf;
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+  
+ -	/* acquire buffer and ensure that it's >= PAGE_SIZE */
+ -	count = seq_get_buf(sf, &buf);
+ -	if (count < PAGE_SIZE) {
+ -		seq_commit(sf, -1);
+ -		return 0;
+ -	}
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+  
+ -	/*
+ -	 * Invoke show().  Control may reach here via seq file lseek even
+ -	 * if @ops->show() isn't implemented.
+ -	 */
+ -	if (ops->show) {
+ -		count = ops->show(kobj, of->sd->priv, buf);
+ -		if (count < 0)
+ -			return count;
+ -	}
+ +	sysfs_put_active(attr_sd);
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+diff --cc include/linux/kernfs.h
+index 254b9e872b09,b923052c29d0..000000000000
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@@ -7,6 -7,89 +7,94 @@@
+  #ifndef __LINUX_KERNFS_H
+  #define __LINUX_KERNFS_H
+  
+++<<<<<<< HEAD
+ +struct sysfs_dirent;
+ +
+++=======
++ #include <linux/kernel.h>
++ #include <linux/err.h>
++ #include <linux/list.h>
++ #include <linux/mutex.h>
++ 
++ struct file;
++ struct iattr;
++ struct seq_file;
++ struct vm_area_struct;
++ 
++ struct sysfs_dirent;
++ 
++ struct sysfs_open_file {
++ 	/* published fields */
++ 	struct sysfs_dirent	*sd;
++ 	struct file		*file;
++ 
++ 	/* private fields, do not use outside kernfs proper */
++ 	struct mutex		mutex;
++ 	int			event;
++ 	struct list_head	list;
++ 
++ 	bool			mmapped;
++ 	const struct vm_operations_struct *vm_ops;
++ };
++ 
++ #ifdef CONFIG_SYSFS
++ 
++ struct sysfs_dirent *kernfs_create_dir_ns(struct sysfs_dirent *parent,
++ 					  const char *name, void *priv,
++ 					  const void *ns);
++ struct sysfs_dirent *kernfs_create_link(struct sysfs_dirent *parent,
++ 					const char *name,
++ 					struct sysfs_dirent *target);
++ void kernfs_remove(struct sysfs_dirent *sd);
++ int kernfs_remove_by_name_ns(struct sysfs_dirent *parent, const char *name,
++ 			     const void *ns);
++ int kernfs_rename_ns(struct sysfs_dirent *sd, struct sysfs_dirent *new_parent,
++ 		     const char *new_name, const void *new_ns);
++ void kernfs_enable_ns(struct sysfs_dirent *sd);
++ int kernfs_setattr(struct sysfs_dirent *sd, const struct iattr *iattr);
++ 
++ #else	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir_ns(struct sysfs_dirent *parent, const char *name, void *priv,
++ 		     const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_link(struct sysfs_dirent *parent, const char *name,
++ 		   struct sysfs_dirent *target)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_remove(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_remove_by_name_ns(struct sysfs_dirent *parent,
++ 					   const char *name, const void *ns)
++ { return -ENOSYS; }
++ 
++ static inline int kernfs_rename_ns(struct sysfs_dirent *sd,
++ 				   struct sysfs_dirent *new_parent,
++ 				   const char *new_name, const void *new_ns)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_enable_ns(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_setattr(struct sysfs_dirent *sd,
++ 				 const struct iattr *iattr)
++ { return -ENOSYS; }
++ 
++ #endif	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir(struct sysfs_dirent *parent, const char *name, void *priv)
++ {
++ 	return kernfs_create_dir_ns(parent, name, priv, NULL);
++ }
++ 
++ static inline int kernfs_remove_by_name(struct sysfs_dirent *parent,
++ 					const char *name)
++ {
++ 	return kernfs_remove_by_name_ns(parent, name, NULL);
++ }
++ 
+++>>>>>>> dd8a5b036b6e (sysfs, kernfs: move sysfs_open_file to include/linux/kernfs.h)
+  #endif	/* __LINUX_KERNFS_H */
+* Unmerged path fs/sysfs/file.c
+* Unmerged path include/linux/kernfs.h
