@@ -1,0 +1,1043 @@
+inode: rename i_wb_list to i_io_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit c7f5408493aeb01532927b2276316797a03ed6ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c7f54084.failed
+
+There's a small consistency problem between the inode and writeback
+naming. Writeback calls the "for IO" inode queues b_io and
+b_more_io, but the inode calls these the "writeback list" or
+i_wb_list. This makes it hard to an new "under writeback" list to
+the inode, or call it an "under IO" list on the bdi because either
+way we'll have writeback on IO and IO on writeback and it'll just be
+confusing. I'm getting confused just writing this!
+
+So, rename the inode "for IO" list variable to i_io_list so we can
+add a new "writeback list" in a subsequent patch.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit c7f5408493aeb01532927b2276316797a03ed6ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs-writeback.c
+#	fs/inode.c
+#	include/linux/fs.h
+#	mm/backing-dev.c
+diff --cc fs/fs-writeback.c
+index 204141e64775,63e00f11022e..000000000000
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@@ -81,34 -101,710 +81,711 @@@ static inline struct inode *wb_inode(st
+  
+  EXPORT_TRACEPOINT_SYMBOL_GPL(wbc_writepage);
+  
+ -static bool wb_io_lists_populated(struct bdi_writeback *wb)
+ +static void bdi_wakeup_thread(struct backing_dev_info *bdi)
+  {
+ -	if (wb_has_dirty_io(wb)) {
+ -		return false;
+ -	} else {
+ -		set_bit(WB_has_dirty_io, &wb->state);
+ -		WARN_ON_ONCE(!wb->avg_write_bandwidth);
+ -		atomic_long_add(wb->avg_write_bandwidth,
+ -				&wb->bdi->tot_write_bandwidth);
+ -		return true;
+ -	}
+ +	spin_lock_bh(&bdi->wb_lock);
+ +	if (test_bit(BDI_registered, &bdi->state))
+ +		mod_delayed_work(bdi_wq, &bdi->wb.dwork, 0);
+ +	spin_unlock_bh(&bdi->wb_lock);
+  }
+  
+ -static void wb_io_lists_depopulated(struct bdi_writeback *wb)
+ +static void bdi_queue_work(struct backing_dev_info *bdi,
+ +			   struct wb_writeback_work *work)
+  {
+ -	if (wb_has_dirty_io(wb) && list_empty(&wb->b_dirty) &&
+ -	    list_empty(&wb->b_io) && list_empty(&wb->b_more_io)) {
+ -		clear_bit(WB_has_dirty_io, &wb->state);
+ -		WARN_ON_ONCE(atomic_long_sub_return(wb->avg_write_bandwidth,
+ -					&wb->bdi->tot_write_bandwidth) < 0);
+ -	}
+ -}
+ +	trace_writeback_queue(bdi, work);
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&bdi->wb_lock);
+ +	if (!test_bit(BDI_registered, &bdi->state)) {
+ +		if (work->done)
+ +			complete(work->done);
+++=======
++ /**
++  * inode_io_list_move_locked - move an inode onto a bdi_writeback IO list
++  * @inode: inode to be moved
++  * @wb: target bdi_writeback
++  * @head: one of @wb->b_{dirty|io|more_io}
++  *
++  * Move @inode->i_io_list to @list of @wb and set %WB_has_dirty_io.
++  * Returns %true if @inode is the first occupant of the !dirty_time IO
++  * lists; otherwise, %false.
++  */
++ static bool inode_io_list_move_locked(struct inode *inode,
++ 				      struct bdi_writeback *wb,
++ 				      struct list_head *head)
++ {
++ 	assert_spin_locked(&wb->list_lock);
++ 
++ 	list_move(&inode->i_io_list, head);
++ 
++ 	/* dirty_time doesn't count as dirty_io until expiration */
++ 	if (head != &wb->b_dirty_time)
++ 		return wb_io_lists_populated(wb);
++ 
++ 	wb_io_lists_depopulated(wb);
++ 	return false;
++ }
++ 
++ /**
++  * inode_io_list_del_locked - remove an inode from its bdi_writeback IO list
++  * @inode: inode to be removed
++  * @wb: bdi_writeback @inode is being removed from
++  *
++  * Remove @inode which may be on one of @wb->b_{dirty|io|more_io} lists and
++  * clear %WB_has_dirty_io if all are empty afterwards.
++  */
++ static void inode_io_list_del_locked(struct inode *inode,
++ 				     struct bdi_writeback *wb)
++ {
++ 	assert_spin_locked(&wb->list_lock);
++ 
++ 	list_del_init(&inode->i_io_list);
++ 	wb_io_lists_depopulated(wb);
++ }
++ 
++ static void wb_wakeup(struct bdi_writeback *wb)
++ {
++ 	spin_lock_bh(&wb->work_lock);
++ 	if (test_bit(WB_registered, &wb->state))
++ 		mod_delayed_work(bdi_wq, &wb->dwork, 0);
++ 	spin_unlock_bh(&wb->work_lock);
++ }
++ 
++ static void wb_queue_work(struct bdi_writeback *wb,
++ 			  struct wb_writeback_work *work)
++ {
++ 	trace_writeback_queue(wb->bdi, work);
++ 
++ 	spin_lock_bh(&wb->work_lock);
++ 	if (!test_bit(WB_registered, &wb->state)) {
++ 		if (work->single_wait)
++ 			work->single_done = 1;
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  		goto out_unlock;
+  	}
+ -	if (work->done)
+ -		atomic_inc(&work->done->cnt);
+ -	list_add_tail(&work->list, &wb->work_list);
+ -	mod_delayed_work(bdi_wq, &wb->dwork, 0);
+ +	list_add_tail(&work->list, &bdi->work_list);
+ +	mod_delayed_work(bdi_wq, &bdi->wb.dwork, 0);
+  out_unlock:
+ -	spin_unlock_bh(&wb->work_lock);
+ +	spin_unlock_bh(&bdi->wb_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +__bdi_start_writeback(struct backing_dev_info *bdi, long nr_pages,
+ +		      bool range_cyclic, enum wb_reason reason)
+++=======
++ /**
++  * wb_wait_for_completion - wait for completion of bdi_writeback_works
++  * @bdi: bdi work items were issued to
++  * @done: target wb_completion
++  *
++  * Wait for one or more work items issued to @bdi with their ->done field
++  * set to @done, which should have been defined with
++  * DEFINE_WB_COMPLETION_ONSTACK().  This function returns after all such
++  * work items are completed.  Work items which are waited upon aren't freed
++  * automatically on completion.
++  */
++ static void wb_wait_for_completion(struct backing_dev_info *bdi,
++ 				   struct wb_completion *done)
++ {
++ 	atomic_dec(&done->cnt);		/* put down the initial count */
++ 	wait_event(bdi->wb_waitq, !atomic_read(&done->cnt));
++ }
++ 
++ #ifdef CONFIG_CGROUP_WRITEBACK
++ 
++ /* parameters for foreign inode detection, see wb_detach_inode() */
++ #define WB_FRN_TIME_SHIFT	13	/* 1s = 2^13, upto 8 secs w/ 16bit */
++ #define WB_FRN_TIME_AVG_SHIFT	3	/* avg = avg * 7/8 + new * 1/8 */
++ #define WB_FRN_TIME_CUT_DIV	2	/* ignore rounds < avg / 2 */
++ #define WB_FRN_TIME_PERIOD	(2 * (1 << WB_FRN_TIME_SHIFT))	/* 2s */
++ 
++ #define WB_FRN_HIST_SLOTS	16	/* inode->i_wb_frn_history is 16bit */
++ #define WB_FRN_HIST_UNIT	(WB_FRN_TIME_PERIOD / WB_FRN_HIST_SLOTS)
++ 					/* each slot's duration is 2s / 16 */
++ #define WB_FRN_HIST_THR_SLOTS	(WB_FRN_HIST_SLOTS / 2)
++ 					/* if foreign slots >= 8, switch */
++ #define WB_FRN_HIST_MAX_SLOTS	(WB_FRN_HIST_THR_SLOTS / 2 + 1)
++ 					/* one round can affect upto 5 slots */
++ 
++ void __inode_attach_wb(struct inode *inode, struct page *page)
++ {
++ 	struct backing_dev_info *bdi = inode_to_bdi(inode);
++ 	struct bdi_writeback *wb = NULL;
++ 
++ 	if (inode_cgwb_enabled(inode)) {
++ 		struct cgroup_subsys_state *memcg_css;
++ 
++ 		if (page) {
++ 			memcg_css = mem_cgroup_css_from_page(page);
++ 			wb = wb_get_create(bdi, memcg_css, GFP_ATOMIC);
++ 		} else {
++ 			/* must pin memcg_css, see wb_get_create() */
++ 			memcg_css = task_get_css(current, memory_cgrp_id);
++ 			wb = wb_get_create(bdi, memcg_css, GFP_ATOMIC);
++ 			css_put(memcg_css);
++ 		}
++ 	}
++ 
++ 	if (!wb)
++ 		wb = &bdi->wb;
++ 
++ 	/*
++ 	 * There may be multiple instances of this function racing to
++ 	 * update the same inode.  Use cmpxchg() to tell the winner.
++ 	 */
++ 	if (unlikely(cmpxchg(&inode->i_wb, NULL, wb)))
++ 		wb_put(wb);
++ }
++ 
++ /**
++  * locked_inode_to_wb_and_lock_list - determine a locked inode's wb and lock it
++  * @inode: inode of interest with i_lock held
++  *
++  * Returns @inode's wb with its list_lock held.  @inode->i_lock must be
++  * held on entry and is released on return.  The returned wb is guaranteed
++  * to stay @inode's associated wb until its list_lock is released.
++  */
++ static struct bdi_writeback *
++ locked_inode_to_wb_and_lock_list(struct inode *inode)
++ 	__releases(&inode->i_lock)
++ 	__acquires(&wb->list_lock)
++ {
++ 	while (true) {
++ 		struct bdi_writeback *wb = inode_to_wb(inode);
++ 
++ 		/*
++ 		 * inode_to_wb() association is protected by both
++ 		 * @inode->i_lock and @wb->list_lock but list_lock nests
++ 		 * outside i_lock.  Drop i_lock and verify that the
++ 		 * association hasn't changed after acquiring list_lock.
++ 		 */
++ 		wb_get(wb);
++ 		spin_unlock(&inode->i_lock);
++ 		spin_lock(&wb->list_lock);
++ 		wb_put(wb);		/* not gonna deref it anymore */
++ 
++ 		/* i_wb may have changed inbetween, can't use inode_to_wb() */
++ 		if (likely(wb == inode->i_wb))
++ 			return wb;	/* @inode already has ref */
++ 
++ 		spin_unlock(&wb->list_lock);
++ 		cpu_relax();
++ 		spin_lock(&inode->i_lock);
++ 	}
++ }
++ 
++ /**
++  * inode_to_wb_and_lock_list - determine an inode's wb and lock it
++  * @inode: inode of interest
++  *
++  * Same as locked_inode_to_wb_and_lock_list() but @inode->i_lock isn't held
++  * on entry.
++  */
++ static struct bdi_writeback *inode_to_wb_and_lock_list(struct inode *inode)
++ 	__acquires(&wb->list_lock)
++ {
++ 	spin_lock(&inode->i_lock);
++ 	return locked_inode_to_wb_and_lock_list(inode);
++ }
++ 
++ struct inode_switch_wbs_context {
++ 	struct inode		*inode;
++ 	struct bdi_writeback	*new_wb;
++ 
++ 	struct rcu_head		rcu_head;
++ 	struct work_struct	work;
++ };
++ 
++ static void inode_switch_wbs_work_fn(struct work_struct *work)
++ {
++ 	struct inode_switch_wbs_context *isw =
++ 		container_of(work, struct inode_switch_wbs_context, work);
++ 	struct inode *inode = isw->inode;
++ 	struct address_space *mapping = inode->i_mapping;
++ 	struct bdi_writeback *old_wb = inode->i_wb;
++ 	struct bdi_writeback *new_wb = isw->new_wb;
++ 	struct radix_tree_iter iter;
++ 	bool switched = false;
++ 	void **slot;
++ 
++ 	/*
++ 	 * By the time control reaches here, RCU grace period has passed
++ 	 * since I_WB_SWITCH assertion and all wb stat update transactions
++ 	 * between unlocked_inode_to_wb_begin/end() are guaranteed to be
++ 	 * synchronizing against mapping->tree_lock.
++ 	 *
++ 	 * Grabbing old_wb->list_lock, inode->i_lock and mapping->tree_lock
++ 	 * gives us exclusion against all wb related operations on @inode
++ 	 * including IO list manipulations and stat updates.
++ 	 */
++ 	if (old_wb < new_wb) {
++ 		spin_lock(&old_wb->list_lock);
++ 		spin_lock_nested(&new_wb->list_lock, SINGLE_DEPTH_NESTING);
++ 	} else {
++ 		spin_lock(&new_wb->list_lock);
++ 		spin_lock_nested(&old_wb->list_lock, SINGLE_DEPTH_NESTING);
++ 	}
++ 	spin_lock(&inode->i_lock);
++ 	spin_lock_irq(&mapping->tree_lock);
++ 
++ 	/*
++ 	 * Once I_FREEING is visible under i_lock, the eviction path owns
++ 	 * the inode and we shouldn't modify ->i_io_list.
++ 	 */
++ 	if (unlikely(inode->i_state & I_FREEING))
++ 		goto skip_switch;
++ 
++ 	/*
++ 	 * Count and transfer stats.  Note that PAGECACHE_TAG_DIRTY points
++ 	 * to possibly dirty pages while PAGECACHE_TAG_WRITEBACK points to
++ 	 * pages actually under underwriteback.
++ 	 */
++ 	radix_tree_for_each_tagged(slot, &mapping->page_tree, &iter, 0,
++ 				   PAGECACHE_TAG_DIRTY) {
++ 		struct page *page = radix_tree_deref_slot_protected(slot,
++ 							&mapping->tree_lock);
++ 		if (likely(page) && PageDirty(page)) {
++ 			__dec_wb_stat(old_wb, WB_RECLAIMABLE);
++ 			__inc_wb_stat(new_wb, WB_RECLAIMABLE);
++ 		}
++ 	}
++ 
++ 	radix_tree_for_each_tagged(slot, &mapping->page_tree, &iter, 0,
++ 				   PAGECACHE_TAG_WRITEBACK) {
++ 		struct page *page = radix_tree_deref_slot_protected(slot,
++ 							&mapping->tree_lock);
++ 		if (likely(page)) {
++ 			WARN_ON_ONCE(!PageWriteback(page));
++ 			__dec_wb_stat(old_wb, WB_WRITEBACK);
++ 			__inc_wb_stat(new_wb, WB_WRITEBACK);
++ 		}
++ 	}
++ 
++ 	wb_get(new_wb);
++ 
++ 	/*
++ 	 * Transfer to @new_wb's IO list if necessary.  The specific list
++ 	 * @inode was on is ignored and the inode is put on ->b_dirty which
++ 	 * is always correct including from ->b_dirty_time.  The transfer
++ 	 * preserves @inode->dirtied_when ordering.
++ 	 */
++ 	if (!list_empty(&inode->i_io_list)) {
++ 		struct inode *pos;
++ 
++ 		inode_io_list_del_locked(inode, old_wb);
++ 		inode->i_wb = new_wb;
++ 		list_for_each_entry(pos, &new_wb->b_dirty, i_io_list)
++ 			if (time_after_eq(inode->dirtied_when,
++ 					  pos->dirtied_when))
++ 				break;
++ 		inode_io_list_move_locked(inode, new_wb, pos->i_io_list.prev);
++ 	} else {
++ 		inode->i_wb = new_wb;
++ 	}
++ 
++ 	/* ->i_wb_frn updates may race wbc_detach_inode() but doesn't matter */
++ 	inode->i_wb_frn_winner = 0;
++ 	inode->i_wb_frn_avg_time = 0;
++ 	inode->i_wb_frn_history = 0;
++ 	switched = true;
++ skip_switch:
++ 	/*
++ 	 * Paired with load_acquire in unlocked_inode_to_wb_begin() and
++ 	 * ensures that the new wb is visible if they see !I_WB_SWITCH.
++ 	 */
++ 	smp_store_release(&inode->i_state, inode->i_state & ~I_WB_SWITCH);
++ 
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	spin_unlock(&inode->i_lock);
++ 	spin_unlock(&new_wb->list_lock);
++ 	spin_unlock(&old_wb->list_lock);
++ 
++ 	if (switched) {
++ 		wb_wakeup(new_wb);
++ 		wb_put(old_wb);
++ 	}
++ 	wb_put(new_wb);
++ 
++ 	iput(inode);
++ 	kfree(isw);
++ }
++ 
++ static void inode_switch_wbs_rcu_fn(struct rcu_head *rcu_head)
++ {
++ 	struct inode_switch_wbs_context *isw = container_of(rcu_head,
++ 				struct inode_switch_wbs_context, rcu_head);
++ 
++ 	/* needs to grab bh-unsafe locks, bounce to work item */
++ 	INIT_WORK(&isw->work, inode_switch_wbs_work_fn);
++ 	schedule_work(&isw->work);
++ }
++ 
++ /**
++  * inode_switch_wbs - change the wb association of an inode
++  * @inode: target inode
++  * @new_wb_id: ID of the new wb
++  *
++  * Switch @inode's wb association to the wb identified by @new_wb_id.  The
++  * switching is performed asynchronously and may fail silently.
++  */
++ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
++ {
++ 	struct backing_dev_info *bdi = inode_to_bdi(inode);
++ 	struct cgroup_subsys_state *memcg_css;
++ 	struct inode_switch_wbs_context *isw;
++ 
++ 	/* noop if seems to be already in progress */
++ 	if (inode->i_state & I_WB_SWITCH)
++ 		return;
++ 
++ 	isw = kzalloc(sizeof(*isw), GFP_ATOMIC);
++ 	if (!isw)
++ 		return;
++ 
++ 	/* find and pin the new wb */
++ 	rcu_read_lock();
++ 	memcg_css = css_from_id(new_wb_id, &memory_cgrp_subsys);
++ 	if (memcg_css)
++ 		isw->new_wb = wb_get_create(bdi, memcg_css, GFP_ATOMIC);
++ 	rcu_read_unlock();
++ 	if (!isw->new_wb)
++ 		goto out_free;
++ 
++ 	/* while holding I_WB_SWITCH, no one else can update the association */
++ 	spin_lock(&inode->i_lock);
++ 	if (inode->i_state & (I_WB_SWITCH | I_FREEING) ||
++ 	    inode_to_wb(inode) == isw->new_wb) {
++ 		spin_unlock(&inode->i_lock);
++ 		goto out_free;
++ 	}
++ 	inode->i_state |= I_WB_SWITCH;
++ 	spin_unlock(&inode->i_lock);
++ 
++ 	ihold(inode);
++ 	isw->inode = inode;
++ 
++ 	/*
++ 	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
++ 	 * the RCU protected stat update paths to grab the mapping's
++ 	 * tree_lock so that stat transfer can synchronize against them.
++ 	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
++ 	 */
++ 	call_rcu(&isw->rcu_head, inode_switch_wbs_rcu_fn);
++ 	return;
++ 
++ out_free:
++ 	if (isw->new_wb)
++ 		wb_put(isw->new_wb);
++ 	kfree(isw);
++ }
++ 
++ /**
++  * wbc_attach_and_unlock_inode - associate wbc with target inode and unlock it
++  * @wbc: writeback_control of interest
++  * @inode: target inode
++  *
++  * @inode is locked and about to be written back under the control of @wbc.
++  * Record @inode's writeback context into @wbc and unlock the i_lock.  On
++  * writeback completion, wbc_detach_inode() should be called.  This is used
++  * to track the cgroup writeback context.
++  */
++ void wbc_attach_and_unlock_inode(struct writeback_control *wbc,
++ 				 struct inode *inode)
++ {
++ 	if (!inode_cgwb_enabled(inode)) {
++ 		spin_unlock(&inode->i_lock);
++ 		return;
++ 	}
++ 
++ 	wbc->wb = inode_to_wb(inode);
++ 	wbc->inode = inode;
++ 
++ 	wbc->wb_id = wbc->wb->memcg_css->id;
++ 	wbc->wb_lcand_id = inode->i_wb_frn_winner;
++ 	wbc->wb_tcand_id = 0;
++ 	wbc->wb_bytes = 0;
++ 	wbc->wb_lcand_bytes = 0;
++ 	wbc->wb_tcand_bytes = 0;
++ 
++ 	wb_get(wbc->wb);
++ 	spin_unlock(&inode->i_lock);
++ 
++ 	/*
++ 	 * A dying wb indicates that the memcg-blkcg mapping has changed
++ 	 * and a new wb is already serving the memcg.  Switch immediately.
++ 	 */
++ 	if (unlikely(wb_dying(wbc->wb)))
++ 		inode_switch_wbs(inode, wbc->wb_id);
++ }
++ 
++ /**
++  * wbc_detach_inode - disassociate wbc from inode and perform foreign detection
++  * @wbc: writeback_control of the just finished writeback
++  *
++  * To be called after a writeback attempt of an inode finishes and undoes
++  * wbc_attach_and_unlock_inode().  Can be called under any context.
++  *
++  * As concurrent write sharing of an inode is expected to be very rare and
++  * memcg only tracks page ownership on first-use basis severely confining
++  * the usefulness of such sharing, cgroup writeback tracks ownership
++  * per-inode.  While the support for concurrent write sharing of an inode
++  * is deemed unnecessary, an inode being written to by different cgroups at
++  * different points in time is a lot more common, and, more importantly,
++  * charging only by first-use can too readily lead to grossly incorrect
++  * behaviors (single foreign page can lead to gigabytes of writeback to be
++  * incorrectly attributed).
++  *
++  * To resolve this issue, cgroup writeback detects the majority dirtier of
++  * an inode and transfers the ownership to it.  To avoid unnnecessary
++  * oscillation, the detection mechanism keeps track of history and gives
++  * out the switch verdict only if the foreign usage pattern is stable over
++  * a certain amount of time and/or writeback attempts.
++  *
++  * On each writeback attempt, @wbc tries to detect the majority writer
++  * using Boyer-Moore majority vote algorithm.  In addition to the byte
++  * count from the majority voting, it also counts the bytes written for the
++  * current wb and the last round's winner wb (max of last round's current
++  * wb, the winner from two rounds ago, and the last round's majority
++  * candidate).  Keeping track of the historical winner helps the algorithm
++  * to semi-reliably detect the most active writer even when it's not the
++  * absolute majority.
++  *
++  * Once the winner of the round is determined, whether the winner is
++  * foreign or not and how much IO time the round consumed is recorded in
++  * inode->i_wb_frn_history.  If the amount of recorded foreign IO time is
++  * over a certain threshold, the switch verdict is given.
++  */
++ void wbc_detach_inode(struct writeback_control *wbc)
++ {
++ 	struct bdi_writeback *wb = wbc->wb;
++ 	struct inode *inode = wbc->inode;
++ 	unsigned long avg_time, max_bytes, max_time;
++ 	u16 history;
++ 	int max_id;
++ 
++ 	if (!wb)
++ 		return;
++ 
++ 	history = inode->i_wb_frn_history;
++ 	avg_time = inode->i_wb_frn_avg_time;
++ 
++ 	/* pick the winner of this round */
++ 	if (wbc->wb_bytes >= wbc->wb_lcand_bytes &&
++ 	    wbc->wb_bytes >= wbc->wb_tcand_bytes) {
++ 		max_id = wbc->wb_id;
++ 		max_bytes = wbc->wb_bytes;
++ 	} else if (wbc->wb_lcand_bytes >= wbc->wb_tcand_bytes) {
++ 		max_id = wbc->wb_lcand_id;
++ 		max_bytes = wbc->wb_lcand_bytes;
++ 	} else {
++ 		max_id = wbc->wb_tcand_id;
++ 		max_bytes = wbc->wb_tcand_bytes;
++ 	}
++ 
++ 	/*
++ 	 * Calculate the amount of IO time the winner consumed and fold it
++ 	 * into the running average kept per inode.  If the consumed IO
++ 	 * time is lower than avag / WB_FRN_TIME_CUT_DIV, ignore it for
++ 	 * deciding whether to switch or not.  This is to prevent one-off
++ 	 * small dirtiers from skewing the verdict.
++ 	 */
++ 	max_time = DIV_ROUND_UP((max_bytes >> PAGE_SHIFT) << WB_FRN_TIME_SHIFT,
++ 				wb->avg_write_bandwidth);
++ 	if (avg_time)
++ 		avg_time += (max_time >> WB_FRN_TIME_AVG_SHIFT) -
++ 			    (avg_time >> WB_FRN_TIME_AVG_SHIFT);
++ 	else
++ 		avg_time = max_time;	/* immediate catch up on first run */
++ 
++ 	if (max_time >= avg_time / WB_FRN_TIME_CUT_DIV) {
++ 		int slots;
++ 
++ 		/*
++ 		 * The switch verdict is reached if foreign wb's consume
++ 		 * more than a certain proportion of IO time in a
++ 		 * WB_FRN_TIME_PERIOD.  This is loosely tracked by 16 slot
++ 		 * history mask where each bit represents one sixteenth of
++ 		 * the period.  Determine the number of slots to shift into
++ 		 * history from @max_time.
++ 		 */
++ 		slots = min(DIV_ROUND_UP(max_time, WB_FRN_HIST_UNIT),
++ 			    (unsigned long)WB_FRN_HIST_MAX_SLOTS);
++ 		history <<= slots;
++ 		if (wbc->wb_id != max_id)
++ 			history |= (1U << slots) - 1;
++ 
++ 		/*
++ 		 * Switch if the current wb isn't the consistent winner.
++ 		 * If there are multiple closely competing dirtiers, the
++ 		 * inode may switch across them repeatedly over time, which
++ 		 * is okay.  The main goal is avoiding keeping an inode on
++ 		 * the wrong wb for an extended period of time.
++ 		 */
++ 		if (hweight32(history) > WB_FRN_HIST_THR_SLOTS)
++ 			inode_switch_wbs(inode, max_id);
++ 	}
++ 
++ 	/*
++ 	 * Multiple instances of this function may race to update the
++ 	 * following fields but we don't mind occassional inaccuracies.
++ 	 */
++ 	inode->i_wb_frn_winner = max_id;
++ 	inode->i_wb_frn_avg_time = min(avg_time, (unsigned long)U16_MAX);
++ 	inode->i_wb_frn_history = history;
++ 
++ 	wb_put(wbc->wb);
++ 	wbc->wb = NULL;
++ }
++ 
++ /**
++  * wbc_account_io - account IO issued during writeback
++  * @wbc: writeback_control of the writeback in progress
++  * @page: page being written out
++  * @bytes: number of bytes being written out
++  *
++  * @bytes from @page are about to written out during the writeback
++  * controlled by @wbc.  Keep the book for foreign inode detection.  See
++  * wbc_detach_inode().
++  */
++ void wbc_account_io(struct writeback_control *wbc, struct page *page,
++ 		    size_t bytes)
++ {
++ 	int id;
++ 
++ 	/*
++ 	 * pageout() path doesn't attach @wbc to the inode being written
++ 	 * out.  This is intentional as we don't want the function to block
++ 	 * behind a slow cgroup.  Ultimately, we want pageout() to kick off
++ 	 * regular writeback instead of writing things out itself.
++ 	 */
++ 	if (!wbc->wb)
++ 		return;
++ 
++ 	rcu_read_lock();
++ 	id = mem_cgroup_css_from_page(page)->id;
++ 	rcu_read_unlock();
++ 
++ 	if (id == wbc->wb_id) {
++ 		wbc->wb_bytes += bytes;
++ 		return;
++ 	}
++ 
++ 	if (id == wbc->wb_lcand_id)
++ 		wbc->wb_lcand_bytes += bytes;
++ 
++ 	/* Boyer-Moore majority vote algorithm */
++ 	if (!wbc->wb_tcand_bytes)
++ 		wbc->wb_tcand_id = id;
++ 	if (id == wbc->wb_tcand_id)
++ 		wbc->wb_tcand_bytes += bytes;
++ 	else
++ 		wbc->wb_tcand_bytes -= min(bytes, wbc->wb_tcand_bytes);
++ }
++ EXPORT_SYMBOL_GPL(wbc_account_io);
++ 
++ /**
++  * inode_congested - test whether an inode is congested
++  * @inode: inode to test for congestion
++  * @cong_bits: mask of WB_[a]sync_congested bits to test
++  *
++  * Tests whether @inode is congested.  @cong_bits is the mask of congestion
++  * bits to test and the return value is the mask of set bits.
++  *
++  * If cgroup writeback is enabled for @inode, the congestion state is
++  * determined by whether the cgwb (cgroup bdi_writeback) for the blkcg
++  * associated with @inode is congested; otherwise, the root wb's congestion
++  * state is used.
++  */
++ int inode_congested(struct inode *inode, int cong_bits)
++ {
++ 	/*
++ 	 * Once set, ->i_wb never becomes NULL while the inode is alive.
++ 	 * Start transaction iff ->i_wb is visible.
++ 	 */
++ 	if (inode && inode_to_wb_is_valid(inode)) {
++ 		struct bdi_writeback *wb;
++ 		bool locked, congested;
++ 
++ 		wb = unlocked_inode_to_wb_begin(inode, &locked);
++ 		congested = wb_congested(wb, cong_bits);
++ 		unlocked_inode_to_wb_end(inode, locked);
++ 		return congested;
++ 	}
++ 
++ 	return wb_congested(&inode_to_bdi(inode)->wb, cong_bits);
++ }
++ EXPORT_SYMBOL_GPL(inode_congested);
++ 
++ /**
++  * wb_wait_for_single_work - wait for completion of a single bdi_writeback_work
++  * @bdi: bdi the work item was issued to
++  * @work: work item to wait for
++  *
++  * Wait for the completion of @work which was issued to one of @bdi's
++  * bdi_writeback's.  The caller must have set @work->single_wait before
++  * issuing it.  This wait operates independently fo
++  * wb_wait_for_completion() and also disables automatic freeing of @work.
++  */
++ static void wb_wait_for_single_work(struct backing_dev_info *bdi,
++ 				    struct wb_writeback_work *work)
++ {
++ 	if (WARN_ON_ONCE(!work->single_wait))
++ 		return;
++ 
++ 	wait_event(bdi->wb_waitq, work->single_done);
++ 
++ 	/*
++ 	 * Paired with smp_wmb() in wb_do_writeback() and ensures that all
++ 	 * modifications to @work prior to assertion of ->single_done is
++ 	 * visible to the caller once this function returns.
++ 	 */
++ 	smp_rmb();
++ }
++ 
++ /**
++  * wb_split_bdi_pages - split nr_pages to write according to bandwidth
++  * @wb: target bdi_writeback to split @nr_pages to
++  * @nr_pages: number of pages to write for the whole bdi
++  *
++  * Split @wb's portion of @nr_pages according to @wb's write bandwidth in
++  * relation to the total write bandwidth of all wb's w/ dirty inodes on
++  * @wb->bdi.
++  */
++ static long wb_split_bdi_pages(struct bdi_writeback *wb, long nr_pages)
++ {
++ 	unsigned long this_bw = wb->avg_write_bandwidth;
++ 	unsigned long tot_bw = atomic_long_read(&wb->bdi->tot_write_bandwidth);
++ 
++ 	if (nr_pages == LONG_MAX)
++ 		return LONG_MAX;
++ 
++ 	/*
++ 	 * This may be called on clean wb's and proportional distribution
++ 	 * may not make sense, just use the original @nr_pages in those
++ 	 * cases.  In general, we wanna err on the side of writing more.
++ 	 */
++ 	if (!tot_bw || this_bw >= tot_bw)
++ 		return nr_pages;
++ 	else
++ 		return DIV_ROUND_UP_ULL((u64)nr_pages * this_bw, tot_bw);
++ }
++ 
++ /**
++  * wb_clone_and_queue_work - clone a wb_writeback_work and issue it to a wb
++  * @wb: target bdi_writeback
++  * @base_work: source wb_writeback_work
++  *
++  * Try to make a clone of @base_work and issue it to @wb.  If cloning
++  * succeeds, %true is returned; otherwise, @base_work is issued directly
++  * and %false is returned.  In the latter case, the caller is required to
++  * wait for @base_work's completion using wb_wait_for_single_work().
++  *
++  * A clone is auto-freed on completion.  @base_work never is.
++  */
++ static bool wb_clone_and_queue_work(struct bdi_writeback *wb,
++ 				    struct wb_writeback_work *base_work)
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  {
+  	struct wb_writeback_work *work;
+  
+@@@ -172,13 -961,13 +849,19 @@@ void bdi_start_background_writeback(str
+  /*
+   * Remove the inode from the writeback list it is on.
+   */
+- void inode_wb_list_del(struct inode *inode)
++ void inode_io_list_del(struct inode *inode)
+  {
+ -	struct bdi_writeback *wb;
+ +	struct backing_dev_info *bdi = inode_to_bdi(inode);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&bdi->wb.list_lock);
+ +	list_del_init(&inode->i_wb_list);
+ +	spin_unlock(&bdi->wb.list_lock);
+++=======
++ 	wb = inode_to_wb_and_lock_list(inode);
++ 	inode_io_list_del_locked(inode, wb);
++ 	spin_unlock(&wb->list_lock);
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  }
+  
+  /*
+@@@ -200,7 -988,7 +883,11 @@@ static void redirty_tail(struct inode *
+  		if (time_before(inode->dirtied_when, tail->dirtied_when))
+  			inode->dirtied_when = jiffies;
+  	}
+++<<<<<<< HEAD
+ +	list_move(&inode->i_wb_list, &wb->b_dirty);
+++=======
++ 	inode_io_list_move_locked(inode, wb, &wb->b_dirty);
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  }
+  
+  /*
+@@@ -208,8 -996,7 +895,12 @@@
+   */
+  static void requeue_io(struct inode *inode, struct bdi_writeback *wb)
+  {
+++<<<<<<< HEAD
+ +	assert_spin_locked(&wb->list_lock);
+ +	list_move(&inode->i_wb_list, &wb->b_more_io);
+++=======
++ 	inode_io_list_move_locked(inode, wb, &wb->b_more_io);
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  }
+  
+  static void inode_sync_complete(struct inode *inode)
+@@@ -252,13 -1044,21 +943,13 @@@ static int move_expired_inodes(struct l
+  	int do_sb_sort = 0;
+  	int moved = 0;
+  
+ -	if ((flags & EXPIRE_DIRTY_ATIME) == 0)
+ -		older_than_this = work->older_than_this;
+ -	else if (!work->for_sync) {
+ -		expire_time = jiffies - (dirtytime_expire_interval * HZ);
+ -		older_than_this = &expire_time;
+ -	}
+  	while (!list_empty(delaying_queue)) {
+  		inode = wb_inode(delaying_queue->prev);
+ -		if (older_than_this &&
+ -		    inode_dirtied_after(inode, *older_than_this))
+ +		if (work->older_than_this &&
+ +		    inode_dirtied_after(inode, *work->older_than_this))
+  			break;
+- 		list_move(&inode->i_wb_list, &tmp);
++ 		list_move(&inode->i_io_list, &tmp);
+  		moved++;
+ -		if (flags & EXPIRE_DIRTY_ATIME)
+ -			set_bit(__I_DIRTY_TIME_EXPIRED, &inode->i_state);
+  		if (sb_is_blkdev_sb(inode->i_sb))
+  			continue;
+  		if (sb && sb != inode->i_sb)
+@@@ -425,9 -1230,12 +1116,18 @@@ static void requeue_inode(struct inode 
+  		 * updates after data IO completion.
+  		 */
+  		redirty_tail(inode, wb);
+++<<<<<<< HEAD
+ +	} else {
+ +		/* The inode is clean. Remove from writeback lists. */
+ +		list_del_init(&inode->i_wb_list);
+++=======
++ 	} else if (inode->i_state & I_DIRTY_TIME) {
++ 		inode->dirtied_when = jiffies;
++ 		inode_io_list_move_locked(inode, wb, &wb->b_dirty_time);
++ 	} else {
++ 		/* The inode is clean. Remove from writeback lists. */
++ 		inode_io_list_del_locked(inode, wb);
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  	}
+  }
+  
+@@@ -539,8 -1377,8 +1239,13 @@@ writeback_single_inode(struct inode *in
+  	 * If inode is clean, remove it from writeback lists. Otherwise don't
+  	 * touch it. See comment above for explanation.
+  	 */
+++<<<<<<< HEAD
+ +	if (!(inode->i_state & I_DIRTY))
+ +		list_del_init(&inode->i_wb_list);
+++=======
++ 	if (!(inode->i_state & I_DIRTY_ALL))
++ 		inode_io_list_del_locked(inode, wb);
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  	spin_unlock(&wb->list_lock);
+  	inode_sync_complete(inode);
+  out:
+@@@ -1180,31 -2072,39 +1885,53 @@@ void __mark_inode_dirty(struct inode *i
+  		 * reposition it (that would break b_dirty time-ordering).
+  		 */
+  		if (!was_dirty) {
+ -			struct bdi_writeback *wb;
+ -			struct list_head *dirty_list;
+  			bool wakeup_bdi = false;
+ +			bdi = inode_to_bdi(inode);
+  
+ -			wb = locked_inode_to_wb_and_lock_list(inode);
+ +			spin_unlock(&inode->i_lock);
+ +			spin_lock(&bdi->wb.list_lock);
+ +			if (bdi_cap_writeback_dirty(bdi)) {
+ +				WARN(!test_bit(BDI_registered, &bdi->state),
+ +				     "bdi-%s not registered\n", bdi->name);
+  
+ -			WARN(bdi_cap_writeback_dirty(wb->bdi) &&
+ -			     !test_bit(WB_registered, &wb->state),
+ -			     "bdi-%s not registered\n", wb->bdi->name);
+ +				/*
+ +				 * If this is the first dirty inode for this
+ +				 * bdi, we have to wake-up the corresponding
+ +				 * bdi thread to make sure background
+ +				 * write-back happens later.
+ +				 */
+ +				if (!wb_has_dirty_io(&bdi->wb))
+ +					wakeup_bdi = true;
+ +			}
+  
+  			inode->dirtied_when = jiffies;
+ -			if (dirtytime)
+ -				inode->dirtied_time_when = jiffies;
+ +			list_move(&inode->i_wb_list, &bdi->wb.b_dirty);
+ +			spin_unlock(&bdi->wb.list_lock);
+  
+++<<<<<<< HEAD
+ +			if (wakeup_bdi)
+ +				bdi_wakeup_thread_delayed(bdi);
+++=======
++ 			if (inode->i_state & (I_DIRTY_INODE | I_DIRTY_PAGES))
++ 				dirty_list = &wb->b_dirty;
++ 			else
++ 				dirty_list = &wb->b_dirty_time;
++ 
++ 			wakeup_bdi = inode_io_list_move_locked(inode, wb,
++ 							       dirty_list);
++ 
++ 			spin_unlock(&wb->list_lock);
++ 			trace_writeback_dirty_inode_enqueue(inode);
++ 
++ 			/*
++ 			 * If this is the first dirty inode for this bdi,
++ 			 * we have to wake-up the corresponding bdi thread
++ 			 * to make sure background write-back happens
++ 			 * later.
++ 			 */
++ 			if (bdi_cap_writeback_dirty(wb->bdi) && wakeup_bdi)
++ 				wb_wakeup_delayed(wb);
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  			return;
+  		}
+  	}
+diff --cc fs/inode.c
+index aaf9ae90702b,f09148e07198..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -24,12 -26,12 +24,16 @@@
+   *
+   * inode->i_lock protects:
+   *   inode->i_state, inode->i_hash, __iget()
+ - * Inode LRU list locks protect:
+ + * inode->i_sb->s_inode_lru_lock protects:
+   *   inode->i_sb->s_inode_lru, inode->i_lru
+ - * inode->i_sb->s_inode_list_lock protects:
+ - *   inode->i_sb->s_inodes, inode->i_sb_list
+ + * inode_sb_list_lock protects:
+ + *   sb->s_inodes, inode->i_sb_list
+   * bdi->wb.list_lock protects:
+++<<<<<<< HEAD
+ + *   bdi->wb.b_{dirty,io,more_io}, inode->i_wb_list
+++=======
++  *   bdi->wb.b_{dirty,io,more_io,dirty_time}, inode->i_io_list
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+   * inode_hash_lock protects:
+   *   inode_hashtable, inode->i_hash
+   *
+diff --cc include/linux/fs.h
+index 4086333a0708,34cfa60db678..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -633,9 -633,18 +633,21 @@@ struct inode 
+  	struct mutex		i_mutex;
+  
+  	unsigned long		dirtied_when;	/* jiffies of first dirtying */
+ -	unsigned long		dirtied_time_when;
+  
+  	struct hlist_node	i_hash;
+++<<<<<<< HEAD
+ +	struct list_head	i_wb_list;	/* backing dev IO list */
+++=======
++ 	struct list_head	i_io_list;	/* backing dev IO list */
++ #ifdef CONFIG_CGROUP_WRITEBACK
++ 	struct bdi_writeback	*i_wb;		/* the associated cgroup wb */
++ 
++ 	/* foreign inode detection, see wbc_detach_inode() */
++ 	int			i_wb_frn_winner;
++ 	u16			i_wb_frn_avg_time;
++ 	u16			i_wb_frn_history;
++ #endif
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  	struct list_head	i_lru;		/* inode LRU list */
+  	struct list_head	i_sb_list;
+  	union {
+diff --cc mm/backing-dev.c
+index 349f44e2577e,ee8d7fd07be3..000000000000
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@@ -68,18 -49,21 +68,24 @@@ static int bdi_debug_stats_show(struct 
+  	struct bdi_writeback *wb = &bdi->wb;
+  	unsigned long background_thresh;
+  	unsigned long dirty_thresh;
+ -	unsigned long wb_thresh;
+ -	unsigned long nr_dirty, nr_io, nr_more_io, nr_dirty_time;
+ +	unsigned long bdi_thresh;
+ +	unsigned long nr_dirty, nr_io, nr_more_io;
+  	struct inode *inode;
+  
+ -	nr_dirty = nr_io = nr_more_io = nr_dirty_time = 0;
+ +	nr_dirty = nr_io = nr_more_io = 0;
+  	spin_lock(&wb->list_lock);
+- 	list_for_each_entry(inode, &wb->b_dirty, i_wb_list)
++ 	list_for_each_entry(inode, &wb->b_dirty, i_io_list)
+  		nr_dirty++;
+- 	list_for_each_entry(inode, &wb->b_io, i_wb_list)
++ 	list_for_each_entry(inode, &wb->b_io, i_io_list)
+  		nr_io++;
+- 	list_for_each_entry(inode, &wb->b_more_io, i_wb_list)
++ 	list_for_each_entry(inode, &wb->b_more_io, i_io_list)
+  		nr_more_io++;
+++<<<<<<< HEAD
+++=======
++ 	list_for_each_entry(inode, &wb->b_dirty_time, i_io_list)
++ 		if (inode->i_state & I_DIRTY_TIME)
++ 			nr_dirty_time++;
+++>>>>>>> c7f5408493ae (inode: rename i_wb_list to i_io_list)
+  	spin_unlock(&wb->list_lock);
+  
+  	global_dirty_limits(&background_thresh, &dirty_thresh);
+* Unmerged path fs/fs-writeback.c
+* Unmerged path fs/inode.c
+diff --git a/fs/internal.h b/fs/internal.h
+index c58979ac0a78..6edf0f75a60f 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -129,7 +129,7 @@ extern bool atime_needs_update_rcu(const struct path *, struct inode *);
+ /*
+  * fs-writeback.c
+  */
+-extern void inode_wb_list_del(struct inode *inode);
++extern void inode_io_list_del(struct inode *inode);
+ 
+ extern int get_nr_dirty_inodes(void);
+ extern void evict_inodes(struct super_block *);
+* Unmerged path include/linux/fs.h
+* Unmerged path mm/backing-dev.c
