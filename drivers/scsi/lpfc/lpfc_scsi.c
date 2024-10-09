@@ -4856,7 +4856,7 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 	struct lpfc_scsi_buf *lpfc_cmd;
 	IOCB_t *cmd, *icmd;
 	int ret = SUCCESS, status = 0;
-	struct lpfc_sli_ring *pring_s4;
+	struct lpfc_sli_ring *pring_s4 = NULL;
 	int ret_val;
 	unsigned long flags;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(waitq);
@@ -4886,8 +4886,25 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 	}
 
 	iocb = &lpfc_cmd->cur_iocbq;
+	if (phba->sli_rev == LPFC_SLI_REV4) {
+		if (!(phba->cfg_fof) ||
+		    (!(iocb->iocb_flag & LPFC_IO_FOF))) {
+			pring_s4 =
+				phba->sli4_hba.fcp_wq[iocb->hba_wqidx]->pring;
+		} else {
+			iocb->hba_wqidx = 0;
+			pring_s4 = phba->sli4_hba.oas_wq->pring;
+		}
+		if (!pring_s4) {
+			ret = FAILED;
+			goto out_unlock;
+		}
+		spin_lock(&pring_s4->ring_lock);
+	}
 	/* the command is in process of being cancelled */
 	if (!(iocb->iocb_flag & LPFC_IO_ON_TXCMPLQ)) {
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			spin_unlock(&pring_s4->ring_lock);
 		spin_unlock_irqrestore(&phba->hbalock, flags);
 		lpfc_printf_vlog(vport, KERN_WARNING, LOG_FCP,
 			"3169 SCSI Layer abort requested I/O has been "
@@ -4901,6 +4918,8 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 	 * see the completion before the eh fired. Just return SUCCESS.
 	 */
 	if (lpfc_cmd->pCmd != cmnd) {
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			spin_unlock(&pring_s4->ring_lock);
 		lpfc_printf_vlog(vport, KERN_WARNING, LOG_FCP,
 			"3170 SCSI Layer abort requested I/O has been "
 			"completed by LLD.\n");
@@ -4913,6 +4932,8 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 	if (iocb->iocb_flag & LPFC_DRIVER_ABORTED) {
 		lpfc_printf_vlog(vport, KERN_WARNING, LOG_FCP,
 			 "3389 SCSI Layer I/O Abort Request is pending\n");
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			spin_unlock(&pring_s4->ring_lock);
 		spin_unlock_irqrestore(&phba->hbalock, flags);
 		goto wait_for_cmpl;
 	}
@@ -4920,6 +4941,8 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 	abtsiocb = __lpfc_sli_get_iocbq(phba);
 	if (abtsiocb == NULL) {
 		ret = FAILED;
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			spin_unlock(&pring_s4->ring_lock);
 		goto out_unlock;
 	}
 
@@ -4957,14 +4980,9 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 
 	abtsiocb->iocb_cmpl = lpfc_sli_abort_fcp_cmpl;
 	abtsiocb->vport = vport;
+	lpfc_cmd->waitq = &waitq;
 	if (phba->sli_rev == LPFC_SLI_REV4) {
-		pring_s4 = lpfc_sli4_calc_ring(phba, abtsiocb);
-		if (pring_s4 == NULL) {
-			ret = FAILED;
-			goto out_unlock;
-		}
 		/* Note: both hbalock and ring_lock must be set here */
-		spin_lock(&pring_s4->ring_lock);
 		ret_val = __lpfc_sli_issue_iocb(phba, pring_s4->ringno,
 						abtsiocb, 0);
 		spin_unlock(&pring_s4->ring_lock);
@@ -4977,6 +4995,17 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 
 
 	if (ret_val == IOCB_ERROR) {
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			spin_lock_irqsave(&pring_s4->ring_lock, flags);
+		else
+			spin_lock_irqsave(&phba->hbalock, flags);
+		/* Indicate the IO is not being aborted by the driver. */
+		iocb->iocb_flag &= ~LPFC_DRIVER_ABORTED;
+		lpfc_cmd->waitq = NULL;
+		if (phba->sli_rev == LPFC_SLI_REV4)
+			spin_unlock_irqrestore(&pring_s4->ring_lock, flags);
+		else
+			spin_unlock_irqrestore(&phba->hbalock, flags);
 		lpfc_sli_release_iocbq(phba, abtsiocb);
 		ret = FAILED;
 		goto out;
@@ -4987,7 +5016,6 @@ lpfc_abort_handler(struct scsi_cmnd *cmnd)
 			&phba->sli.sli3_ring[LPFC_FCP_RING], HA_R0RE_REQ);
 
 wait_for_cmpl:
-	lpfc_cmd->waitq = &waitq;
 	/* Wait for abort to complete */
 	wait_event_timeout(waitq,
 			  (lpfc_cmd->pCmd != cmnd),
