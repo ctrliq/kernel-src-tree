@@ -1,0 +1,85 @@
+dm rq: do not update rq partially in each ending bio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit dc6364b5170dc446fca076d6523aaebc339d6511
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dc6364b5.failed
+
+We don't need to update the original dm request partially when ending
+each cloned bio: just update original dm request once when the whole
+cloned request is finished.  This still allows full support for partial
+completion because a new 'completed' counter accounts for incremental
+progress as the clone bios complete.
+
+Partial request update can be a bit expensive, so we should try to avoid
+it, especially because it is run in softirq context.
+
+Avoiding all the partial request updates fixes both hard lockup and
+soft lockups that were easily reproduced while running Laurence's
+test[1] on IB/SRP.
+
+BTW, after d4acf3650c7c ("block: Make blk_mq_delay_kick_requeue_list()
+rerun the queue at a quiet time"), we need to make the test more
+aggressive for reproducing the lockup:
+
+	1) run hammer_write.sh 32 or 64 concurrently.
+	2) write 8M each time
+
+[1] https://marc.info/?l=linux-block&m=150220185510245&w=2
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit dc6364b5170dc446fca076d6523aaebc339d6511)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-rq.c
+diff --cc drivers/md/dm-rq.c
+index 1f764a7f4e36,eadfcfd106ff..000000000000
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@@ -139,8 -117,9 +139,14 @@@ static void end_clone_bio(struct bio *c
+  	struct dm_rq_clone_bio_info *info =
+  		container_of(clone, struct dm_rq_clone_bio_info, clone);
+  	struct dm_rq_target_io *tio = info->tio;
+++<<<<<<< HEAD
+ +	struct bio *bio = info->orig;
+ +	unsigned int nr_bytes = info->orig->bi_size;
+++=======
++ 	unsigned int nr_bytes = info->orig->bi_iter.bi_size;
++ 	blk_status_t error = clone->bi_status;
++ 	bool is_last = !clone->bi_next;
+++>>>>>>> dc6364b5170d (dm rq: do not update rq partially in each ending bio)
+  
+  	bio_put(clone);
+  
+@@@ -179,7 -151,9 +178,13 @@@
+  	 * Do not use blk_end_request() here, because it may complete
+  	 * the original request before the clone, and break the ordering.
+  	 */
+++<<<<<<< HEAD
+ +	blk_update_request(tio->orig, 0, nr_bytes);
+++=======
++ 	if (is_last)
++  exit:
++ 		blk_update_request(tio->orig, BLK_STS_OK, tio->completed);
+++>>>>>>> dc6364b5170d (dm rq: do not update rq partially in each ending bio)
+  }
+  
+  static struct dm_rq_target_io *tio_from_request(struct request *rq)
+* Unmerged path drivers/md/dm-rq.c
+diff --git a/drivers/md/dm-rq.h b/drivers/md/dm-rq.h
+index 4da06cae7bad..671e6b0e110e 100644
+--- a/drivers/md/dm-rq.h
++++ b/drivers/md/dm-rq.h
+@@ -29,6 +29,7 @@ struct dm_rq_target_io {
+ 	struct dm_stats_aux stats_aux;
+ 	unsigned long duration_jiffies;
+ 	unsigned n_sectors;
++	unsigned completed;
+ };
+ 
+ /*
