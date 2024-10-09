@@ -1,0 +1,155 @@
+fs: Avoid invalidation in interrupt context in dio_complete()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] Avoid invalidation in interrupt context in dio_complete() (Lukas Czerner) [1457517]
+Rebuild_FUZZ: 96.61%
+commit-author Lukas Czerner <lczerner@redhat.com>
+commit ffe51f0142a291a957eebb9687cafb15f2b3fc14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ffe51f01.failed
+
+Currently we try to defer completion of async DIO to the process context
+in case there are any mapped pages associated with the inode so that we
+can invalidate the pages when the IO completes. However the check is racy
+and the pages can be mapped afterwards. If this happens we might end up
+calling invalidate_inode_pages2_range() in dio_complete() in interrupt
+context which could sleep. This can be reproduced by generic/451.
+
+Fix this by passing the information whether we can or can't invalidate
+to the dio_complete(). Thanks Eryu Guan for reporting this and Jan Kara
+for suggesting a fix.
+
+Fixes: 332391a9935d ("fs: Fix page cache inconsistency when mixing buffered and AIO DIO")
+	Reported-by: Eryu Guan <eguan@redhat.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Tested-by: Eryu Guan <eguan@redhat.com>
+	Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ffe51f0142a291a957eebb9687cafb15f2b3fc14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/direct-io.c
+diff --cc fs/direct-io.c
+index 5682ec0743e0,8106a8dddfab..000000000000
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@@ -271,10 -231,11 +277,14 @@@ static void dio_iodone2_helper(struct d
+   * filesystems can use it to hold additional state between get_block calls and
+   * dio_complete.
+   */
+++<<<<<<< HEAD
+ +static ssize_t dio_complete(struct dio *dio, loff_t offset, ssize_t ret,
+ +		bool is_async)
+++=======
++ static ssize_t dio_complete(struct dio *dio, ssize_t ret, unsigned int flags)
+++>>>>>>> ffe51f0142a2 (fs: Avoid invalidation in interrupt context in dio_complete())
+  {
+ -	loff_t offset = dio->iocb->ki_pos;
+  	ssize_t transferred = 0;
+ -	int err;
+  
+  	/*
+  	 * AIO submission can race with bio completion to get here while
+@@@ -301,18 -266,44 +311,53 @@@
+  		ret = transferred;
+  
+  	/*
+ -	 * Try again to invalidate clean pages which might have been cached by
+ -	 * non-direct readahead, or faulted in by get_user_pages() if the source
+ -	 * of the write was an mmap'ed region of the file we're writing.  Either
+ -	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
+ -	 * this invalidation fails, tough, the write still worked...
+ +	 * Red Hat only: we have to support two calling conventions for
+ +	 * dio_iodone_t functions:
+ +	 * 1) the original, where the routine will call aio_complete and
+ +	 * 2) the new calling convention, where that is done in the
+ +	 *    generic code.
+ +	 * Differentiate between the two cases using an inode flag that
+ +	 * gets populated for all in-tree file systems.
+  	 */
+++<<<<<<< HEAD
+ +	if (dio->inode->i_sb->s_type->fs_flags & FS_HAS_DIO_IODONE2)
+ +		dio_iodone2_helper(dio, offset, transferred, ret, is_async);
+ +	else
+ +		dio_iodone_helper(dio, offset, transferred, ret, is_async);
+++=======
++ 	if (flags & DIO_COMPLETE_INVALIDATE &&
++ 	    ret > 0 && dio->op == REQ_OP_WRITE &&
++ 	    dio->inode->i_mapping->nrpages) {
++ 		err = invalidate_inode_pages2_range(dio->inode->i_mapping,
++ 					offset >> PAGE_SHIFT,
++ 					(offset + ret - 1) >> PAGE_SHIFT);
++ 		WARN_ON_ONCE(err);
++ 	}
++ 
++ 	if (dio->end_io) {
++ 
++ 		// XXX: ki_pos??
++ 		err = dio->end_io(dio->iocb, offset, ret, dio->private);
++ 		if (err)
++ 			ret = err;
++ 	}
++ 
++ 	if (!(dio->flags & DIO_SKIP_DIO_COUNT))
++ 		inode_dio_end(dio->inode);
++ 
++ 	if (flags & DIO_COMPLETE_ASYNC) {
++ 		/*
++ 		 * generic_write_sync expects ki_pos to have been updated
++ 		 * already, but the submission path only does this for
++ 		 * synchronous I/O.
++ 		 */
++ 		dio->iocb->ki_pos += transferred;
++ 
++ 		if (dio->op == REQ_OP_WRITE)
++ 			ret = generic_write_sync(dio->iocb,  transferred);
++ 		dio->iocb->ki_complete(dio->iocb, ret, 0);
++ 	}
+++>>>>>>> ffe51f0142a2 (fs: Avoid invalidation in interrupt context in dio_complete())
+  
+  	kmem_cache_free(dio_cache, dio);
+  	return ret;
+@@@ -322,10 -313,10 +367,14 @@@ static void dio_aio_complete_work(struc
+  {
+  	struct dio *dio = container_of(work, struct dio, complete_work);
+  
+++<<<<<<< HEAD
+ +	dio_complete(dio, dio->iocb->ki_pos, 0, true);
+++=======
++ 	dio_complete(dio, 0, DIO_COMPLETE_ASYNC | DIO_COMPLETE_INVALIDATE);
+++>>>>>>> ffe51f0142a2 (fs: Avoid invalidation in interrupt context in dio_complete())
+  }
+  
+ -static blk_status_t dio_bio_complete(struct dio *dio, struct bio *bio);
+ +static int dio_bio_complete(struct dio *dio, struct bio *bio);
+  
+  /*
+   * Asynchronous IO callback. 
+@@@ -351,7 -355,7 +400,11 @@@ static void dio_bio_end_aio(struct bio 
+  			queue_work(dio->inode->i_sb->s_dio_done_wq,
+  				   &dio->complete_work);
+  		} else {
+++<<<<<<< HEAD
+ +			dio_complete(dio, dio->iocb->ki_pos, 0, true);
+++=======
++ 			dio_complete(dio, 0, DIO_COMPLETE_ASYNC);
+++>>>>>>> ffe51f0142a2 (fs: Avoid invalidation in interrupt context in dio_complete())
+  		}
+  	}
+  }
+@@@ -1406,7 -1366,7 +1459,11 @@@ do_blockdev_direct_IO(int rw, struct ki
+  		dio_await_completion(dio);
+  
+  	if (drop_refcount(dio) == 0) {
+++<<<<<<< HEAD
+ +		retval = dio_complete(dio, offset, retval, false);
+++=======
++ 		retval = dio_complete(dio, retval, DIO_COMPLETE_INVALIDATE);
+++>>>>>>> ffe51f0142a2 (fs: Avoid invalidation in interrupt context in dio_complete())
+  	} else
+  		BUG_ON(retval != -EIOCBQUEUED);
+  
+* Unmerged path fs/direct-io.c
