@@ -1,0 +1,114 @@
+gfs2: Glock dump performance regression fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 7ac07fdaf840f9b141c6d5c286805107227c0e68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7ac07fda.failed
+
+Restore an optimization removed in commit 7f19449553 "Fix debugfs glocks
+dump": keep the glock hash table iterator active while the glock dump
+file is held open.  This avoids having to rescan the hash table from the
+start for each read, with quadratically rising runtime.
+
+In addition, use rhastable_walk_peek for resuming a glock dump at the
+current position: when a glock doesn't fit in the provided buffer
+anymore, the next read must revisit the same glock.
+
+Finally, also restart the dump from the first entry when we notice that
+the hash table has been resized in gfs2_glock_seq_start.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 7ac07fdaf840f9b141c6d5c286805107227c0e68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 9164fefd0b3c,82fb5583445c..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -1811,35 -1921,54 +1811,72 @@@ void gfs2_glock_exit(void
+  	destroy_workqueue(gfs2_delete_workqueue);
+  }
+  
+- static void gfs2_glock_iter_next(struct gfs2_glock_iter *gi)
++ static void gfs2_glock_iter_next(struct gfs2_glock_iter *gi, loff_t n)
+  {
+++<<<<<<< HEAD
+ +	do {
+ +		gi->gl = rhashtable_walk_next(&gi->hti);
+ +		if (IS_ERR(gi->gl)) {
+ +			if (PTR_ERR(gi->gl) == -EAGAIN)
+ +				continue;
+ +			gi->gl = NULL;
+ +		}
+ +	/* Skip entries for other sb and dead entries */
+ +	} while ((gi->gl) && ((gi->sdp != gi->gl->gl_name.ln_sbd) ||
+ +			      __lockref_is_dead(&gi->gl->gl_lockref)));
+++=======
++ 	if (n == 0)
++ 		gi->gl = rhashtable_walk_peek(&gi->hti);
++ 	else {
++ 		gi->gl = rhashtable_walk_next(&gi->hti);
++ 		n--;
++ 	}
++ 	for (;;) {
++ 		if (IS_ERR_OR_NULL(gi->gl)) {
++ 			if (!gi->gl)
++ 				return;
++ 			if (PTR_ERR(gi->gl) != -EAGAIN) {
++ 				gi->gl = NULL;
++ 				return;
++ 			}
++ 			n = 0;
++ 		} else if (gi->sdp == gi->gl->gl_name.ln_sbd &&
++ 			   !__lockref_is_dead(&gi->gl->gl_lockref)) {
++ 			if (!n--)
++ 				break;
++ 		}
++ 		gi->gl = rhashtable_walk_next(&gi->hti);
++ 	}
+++>>>>>>> 7ac07fdaf840 (gfs2: Glock dump performance regression fix)
+  }
+  
+  static void *gfs2_glock_seq_start(struct seq_file *seq, loff_t *pos)
+ -	__acquires(RCU)
+  {
+  	struct gfs2_glock_iter *gi = seq->private;
+- 	loff_t n = *pos;
++ 	loff_t n;
+  
+++<<<<<<< HEAD
+ +	rhashtable_walk_enter(&gl_hash_table, &gi->hti);
+ +	if (rhashtable_walk_start(&gi->hti) != 0)
+ +		return NULL;
+++=======
++ 	/*
++ 	 * We can either stay where we are, skip to the next hash table
++ 	 * entry, or start from the beginning.
++ 	 */
++ 	if (*pos < gi->last_pos) {
++ 		rhashtable_walk_exit(&gi->hti);
++ 		rhashtable_walk_enter(&gl_hash_table, &gi->hti);
++ 		n = *pos + 1;
++ 	} else {
++ 		n = *pos - gi->last_pos;
++ 	}
+++>>>>>>> 7ac07fdaf840 (gfs2: Glock dump performance regression fix)
+  
+- 	do {
+- 		gfs2_glock_iter_next(gi);
+- 	} while (gi->gl && n--);
++ 	rhashtable_walk_start(&gi->hti);
+  
++ 	gfs2_glock_iter_next(gi, n);
+  	gi->last_pos = *pos;
+- 
+  	return gi->gl;
+  }
+  
+* Unmerged path fs/gfs2/glock.c
