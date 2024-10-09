@@ -1,0 +1,287 @@
+net: sched: convert qdisc linked list to hashtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: convert qdisc linked list to hashtable (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 94.74%
+commit-author Jiri Kosina <jkosina@suse.cz>
+commit 59cc1f61f09c26ce82c308e24b76141e1efe99f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/59cc1f61.failed
+
+Convert the per-device linked list into a hashtable. The primary
+motivation for this change is that currently, we're not tracking all the
+qdiscs in hierarchy (e.g. excluding default qdiscs), as the lookup
+performed over the linked list by qdisc_match_from_root() is rather
+expensive.
+
+The ultimate goal is to get rid of hidden qdiscs completely, which will
+bring much more determinism in user experience.
+
+	Reviewed-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 59cc1f61f09c26ce82c308e24b76141e1efe99f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index f2e995a93118,96e0b6cd964e..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -53,9 -52,8 +53,10 @@@
+  #include <uapi/linux/netdevice.h>
+  #include <uapi/linux/if_bonding.h>
+  #include <uapi/linux/pkt_cls.h>
++ #include <linux/hashtable.h>
+  
+ +#include <linux/rh_kabi.h>
+ +
+  struct netpoll_info;
+  struct device;
+  struct phy_device;
+@@@ -1721,18 -1798,15 +1722,25 @@@ struct net_device 
+   * Cache lines mostly used on transmit path
+   */
+  	struct netdev_queue	*_tx ____cacheline_aligned_in_smp;
+ +
+ +	/* Number of TX queues allocated at alloc_netdev_mq() time  */
+  	unsigned int		num_tx_queues;
+ +
+ +	/* Number of TX queues currently active in device  */
+  	unsigned int		real_num_tx_queues;
+ +
+ +	/* root qdisc from userspace point of view */
+  	struct Qdisc		*qdisc;
+++<<<<<<< HEAD
+ +
+ +	unsigned long		tx_queue_len;	/* Max frames per queue allowed */
+++=======
++ #ifdef CONFIG_NET_SCHED
++ 	DECLARE_HASHTABLE	(qdisc_hash, 4);
++ #endif
++ 	unsigned long		tx_queue_len;
+++>>>>>>> 59cc1f61f09c (net: sched: convert qdisc linked list to hashtable)
+  	spinlock_t		tx_global_lock;
+ -	int			watchdog_timeo;
+  
+  #ifdef CONFIG_XPS
+  	struct xps_dev_maps __rcu *xps_maps;
+diff --cc net/core/dev.c
+index 75255cb2d9d9,936ea0054f57..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -7728,8 -7625,13 +7728,18 @@@ struct net_device *alloc_netdev_mqs(in
+  	INIT_LIST_HEAD(&dev->link_watch_list);
+  	INIT_LIST_HEAD(&dev->adj_list.upper);
+  	INIT_LIST_HEAD(&dev->adj_list.lower);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&dev->upper_dev_list);
+ +	INIT_LIST_HEAD(&dev->lower_dev_list);
+++=======
++ 	INIT_LIST_HEAD(&dev->all_adj_list.upper);
++ 	INIT_LIST_HEAD(&dev->all_adj_list.lower);
++ 	INIT_LIST_HEAD(&dev->ptype_all);
++ 	INIT_LIST_HEAD(&dev->ptype_specific);
++ #ifdef CONFIG_NET_SCHED
++ 	hash_init(dev->qdisc_hash);
++ #endif
+++>>>>>>> 59cc1f61f09c (net: sched: convert qdisc linked list to hashtable)
+  	dev->priv_flags = IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM;
+  	setup(dev);
+  
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/net/pkt_sched.h b/include/net/pkt_sched.h
+index 7caa99b482c6..cd334c9584e9 100644
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -90,8 +90,8 @@ int unregister_qdisc(struct Qdisc_ops *qops);
+ void qdisc_get_default(char *id, size_t len);
+ int qdisc_set_default(const char *id);
+ 
+-void qdisc_list_add(struct Qdisc *q);
+-void qdisc_list_del(struct Qdisc *q);
++void qdisc_hash_add(struct Qdisc *q);
++void qdisc_hash_del(struct Qdisc *q);
+ struct Qdisc *qdisc_lookup(struct net_device *dev, u32 handle);
+ struct Qdisc *qdisc_lookup_class(struct net_device *dev, u32 handle);
+ struct qdisc_rate_table *qdisc_get_rtab(struct tc_ratespec *r,
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 71548842d47c..446f6dab8603 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -66,7 +66,7 @@ struct Qdisc {
+ 	u32			limit;
+ 	const struct Qdisc_ops	*ops;
+ 	struct qdisc_size_table	__rcu *stab;
+-	struct list_head	list;
++	struct hlist_node       hash;
+ 	u32			handle;
+ 	u32			parent;
+ 	void			*u32_node;
+* Unmerged path net/core/dev.c
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index ccf895cad848..adfe68e5d588 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -29,6 +29,7 @@
+ #include <linux/hrtimer.h>
+ #include <linux/lockdep.h>
+ #include <linux/slab.h>
++#include <linux/hashtable.h>
+ 
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+@@ -265,33 +266,33 @@ static struct Qdisc *qdisc_match_from_root(struct Qdisc *root, u32 handle)
+ 	    root->handle == handle)
+ 		return root;
+ 
+-	list_for_each_entry_rcu(q, &root->list, list) {
++	hash_for_each_possible_rcu(qdisc_dev(root)->qdisc_hash, q, hash, handle) {
+ 		if (q->handle == handle)
+ 			return q;
+ 	}
+ 	return NULL;
+ }
+ 
+-void qdisc_list_add(struct Qdisc *q)
++void qdisc_hash_add(struct Qdisc *q)
+ {
+ 	if ((q->parent != TC_H_ROOT) && !(q->flags & TCQ_F_INGRESS)) {
+ 		struct Qdisc *root = qdisc_dev(q)->qdisc;
+ 
+ 		WARN_ON_ONCE(root == &noop_qdisc);
+ 		ASSERT_RTNL();
+-		list_add_tail_rcu(&q->list, &root->list);
++		hash_add_rcu(qdisc_dev(q)->qdisc_hash, &q->hash, q->handle);
+ 	}
+ }
+-EXPORT_SYMBOL(qdisc_list_add);
++EXPORT_SYMBOL(qdisc_hash_add);
+ 
+-void qdisc_list_del(struct Qdisc *q)
++void qdisc_hash_del(struct Qdisc *q)
+ {
+ 	if ((q->parent != TC_H_ROOT) && !(q->flags & TCQ_F_INGRESS)) {
+ 		ASSERT_RTNL();
+-		list_del_rcu(&q->list);
++		hash_del_rcu(&q->hash);
+ 	}
+ }
+-EXPORT_SYMBOL(qdisc_list_del);
++EXPORT_SYMBOL(qdisc_hash_del);
+ 
+ struct Qdisc *qdisc_lookup(struct net_device *dev, u32 handle)
+ {
+@@ -1002,7 +1003,7 @@ static struct Qdisc *qdisc_create(struct net_device *dev,
+ 				goto err_out4;
+ 		}
+ 
+-		qdisc_list_add(sch);
++		qdisc_hash_add(sch);
+ 
+ 		return sch;
+ 	}
+@@ -1439,6 +1440,7 @@ static int tc_dump_qdisc_root(struct Qdisc *root, struct sk_buff *skb,
+ {
+ 	int ret = 0, q_idx = *q_idx_p;
+ 	struct Qdisc *q;
++	int b;
+ 
+ 	if (!root)
+ 		return 0;
+@@ -1454,7 +1456,7 @@ static int tc_dump_qdisc_root(struct Qdisc *root, struct sk_buff *skb,
+ 			goto done;
+ 		q_idx++;
+ 	}
+-	list_for_each_entry(q, &root->list, list) {
++	hash_for_each(qdisc_dev(root)->qdisc_hash, b, q, hash) {
+ 		if (q_idx < s_q_idx) {
+ 			q_idx++;
+ 			continue;
+@@ -1773,6 +1775,7 @@ static int tc_dump_tclass_root(struct Qdisc *root, struct sk_buff *skb,
+ 			       int *t_p, int s_t)
+ {
+ 	struct Qdisc *q;
++	int b;
+ 
+ 	if (!root)
+ 		return 0;
+@@ -1780,7 +1783,7 @@ static int tc_dump_tclass_root(struct Qdisc *root, struct sk_buff *skb,
+ 	if (tc_dump_tclass_qdisc(root, skb, tcm, cb, t_p, s_t) < 0)
+ 		return -1;
+ 
+-	list_for_each_entry(q, &root->list, list) {
++	hash_for_each(qdisc_dev(root)->qdisc_hash, b, q, hash) {
+ 		if (tc_dump_tclass_qdisc(q, skb, tcm, cb, t_p, s_t) < 0)
+ 			return -1;
+ 	}
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index e276704c5e88..9a9f3cb90b0a 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -412,7 +412,6 @@ struct Qdisc noop_qdisc = {
+ 	.dequeue	=	noop_dequeue,
+ 	.flags		=	TCQ_F_BUILTIN,
+ 	.ops		=	&noop_qdisc_ops,
+-	.list		=	LIST_HEAD_INIT(noop_qdisc.list),
+ 	.q.lock		=	__SPIN_LOCK_UNLOCKED(noop_qdisc.q.lock),
+ 	.dev_queue	=	&noop_netdev_queue,
+ 	.busylock	=	__SPIN_LOCK_UNLOCKED(noop_qdisc.busylock),
+@@ -599,7 +598,6 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 		sch = (struct Qdisc *) QDISC_ALIGN((unsigned long) p);
+ 		sch->padded = (char *) sch - (char *) p;
+ 	}
+-	INIT_LIST_HEAD(&sch->list);
+ 	skb_queue_head_init(&sch->q);
+ 
+ 	spin_lock_init(&sch->busylock);
+@@ -679,7 +677,7 @@ void qdisc_destroy(struct Qdisc *qdisc)
+ 		return;
+ 
+ #ifdef CONFIG_NET_SCHED
+-	qdisc_list_del(qdisc);
++	qdisc_hash_del(qdisc);
+ 
+ 	qdisc_put_stab(rtnl_dereference(qdisc->stab));
+ #endif
+@@ -766,6 +764,10 @@ static void attach_default_qdiscs(struct net_device *dev)
+ 			qdisc->ops->attach(qdisc);
+ 		}
+ 	}
++#ifdef CONFIG_NET_SCHED
++	if (dev->qdisc)
++		qdisc_hash_add(dev->qdisc);
++#endif
+ }
+ 
+ static void transition_one_qdisc(struct net_device *dev,
+diff --git a/net/sched/sch_mq.c b/net/sched/sch_mq.c
+index b9439827c172..2bc8d7f8df16 100644
+--- a/net/sched/sch_mq.c
++++ b/net/sched/sch_mq.c
+@@ -88,7 +88,7 @@ static void mq_attach(struct Qdisc *sch)
+ 			qdisc_destroy(old);
+ #ifdef CONFIG_NET_SCHED
+ 		if (ntx < dev->real_num_tx_queues)
+-			qdisc_list_add(qdisc);
++			qdisc_hash_add(qdisc);
+ #endif
+ 
+ 	}
+diff --git a/net/sched/sch_mqprio.c b/net/sched/sch_mqprio.c
+index cce082c55f3b..8ff6721b8731 100644
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -191,7 +191,7 @@ static void mqprio_attach(struct Qdisc *sch)
+ 		if (old)
+ 			qdisc_destroy(old);
+ 		if (ntx < dev->real_num_tx_queues)
+-			qdisc_list_add(qdisc);
++			qdisc_hash_add(qdisc);
+ 	}
+ 	kfree(priv->qdiscs);
+ 	priv->qdiscs = NULL;
