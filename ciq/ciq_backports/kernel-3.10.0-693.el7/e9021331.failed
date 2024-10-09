@@ -1,0 +1,379 @@
+ntb: stop tasklet from spinning forever during shutdown.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] stop tasklet from spinning forever during shutdown (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 94.34%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit e902133162afd6437e372d74f2d305b0b4cc16d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e9021331.failed
+
+We can leave tasklet spinning forever if we disable the tasklet during
+qp shutdown and the tasklets are still being kicked off. This hopefully
+should avoid that race condition.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Reported-by: Alex Depoutovitch <alex@pernixdata.com>
+	Tested-by: Alex Depoutovitch <alex@pernixdata.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit e902133162afd6437e372d74f2d305b0b4cc16d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index cc39efa77597,4321488d2179..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -94,14 -116,18 +94,20 @@@ struct ntb_rx_info 
+  };
+  
+  struct ntb_transport_qp {
+ -	struct ntb_transport_ctx *transport;
+ -	struct ntb_dev *ndev;
+ +	struct ntb_transport *transport;
+ +	struct ntb_device *ndev;
+  	void *cb_data;
+ -	struct dma_chan *tx_dma_chan;
+ -	struct dma_chan *rx_dma_chan;
+ +	struct dma_chan *dma_chan;
+  
+  	bool client_ready;
+++<<<<<<< HEAD
+ +	bool qp_link;
+++=======
++ 	bool link_is_up;
++ 	bool active;
++ 
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  	u8 qp_num;	/* Only 64 QP's are allowed.  0-63 */
+ -	u64 qp_bit;
+  
+  	struct ntb_rx_info __iomem *rx_info;
+  	struct ntb_rx_info *remote_rx_info;
+@@@ -599,21 -717,43 +605,49 @@@ static int ntb_set_mw(struct ntb_transp
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ntb_qp_link_down_reset(struct ntb_transport_qp *qp)
++ {
++ 	qp->link_is_up = false;
++ 	qp->active = false;
++ 
++ 	qp->tx_index = 0;
++ 	qp->rx_index = 0;
++ 	qp->rx_bytes = 0;
++ 	qp->rx_pkts = 0;
++ 	qp->rx_ring_empty = 0;
++ 	qp->rx_err_no_buf = 0;
++ 	qp->rx_err_oflow = 0;
++ 	qp->rx_err_ver = 0;
++ 	qp->rx_memcpy = 0;
++ 	qp->rx_async = 0;
++ 	qp->tx_bytes = 0;
++ 	qp->tx_pkts = 0;
++ 	qp->tx_ring_full = 0;
++ 	qp->tx_err_no_buf = 0;
++ 	qp->tx_memcpy = 0;
++ 	qp->tx_async = 0;
++ 	qp->dma_tx_prep_err = 0;
++ 	qp->dma_rx_prep_err = 0;
++ }
++ 
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  static void ntb_qp_link_cleanup(struct ntb_transport_qp *qp)
+  {
+ -	struct ntb_transport_ctx *nt = qp->transport;
+ -	struct pci_dev *pdev = nt->ndev->pdev;
+ +	struct ntb_transport *nt = qp->transport;
+ +	struct pci_dev *pdev = ntb_query_pdev(nt->ndev);
+  
+ -	dev_info(&pdev->dev, "qp %d: Link Cleanup\n", qp->qp_num);
+ -
+ -	cancel_delayed_work_sync(&qp->link_work);
+ -	ntb_qp_link_down_reset(qp);
+ +	if (qp->qp_link == NTB_LINK_DOWN) {
+ +		cancel_delayed_work_sync(&qp->link_work);
+ +		return;
+ +	}
+  
+  	if (qp->event_handler)
+ -		qp->event_handler(qp->cb_data, qp->link_is_up);
+ +		qp->event_handler(qp->cb_data, NTB_LINK_DOWN);
+ +
+ +	dev_info(&pdev->dev, "qp %d: Link Down\n", qp->qp_num);
+ +	qp->qp_link = NTB_LINK_DOWN;
+  }
+  
+  static void ntb_qp_link_cleanup_work(struct work_struct *work)
+@@@ -818,38 -910,32 +852,50 @@@ static void ntb_qp_link_work(struct wor
+  	struct ntb_transport_qp *qp = container_of(work,
+  						   struct ntb_transport_qp,
+  						   link_work.work);
+ -	struct pci_dev *pdev = qp->ndev->pdev;
+ -	struct ntb_transport_ctx *nt = qp->transport;
+ -	int val;
+ +	struct pci_dev *pdev = ntb_query_pdev(qp->ndev);
+ +	struct ntb_transport *nt = qp->transport;
+ +	int rc, val;
+  
+ -	WARN_ON(!nt->link_is_up);
+ +	WARN_ON(nt->transport_link != NTB_LINK_UP);
+  
+ -	val = ntb_spad_read(nt->ndev, QP_LINKS);
+ +	rc = ntb_read_local_spad(nt->ndev, QP_LINKS, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading spad %d\n", QP_LINKS);
+ +		return;
+ +	}
+  
+ -	ntb_peer_spad_write(nt->ndev, QP_LINKS, val | BIT(qp->qp_num));
+ +	rc = ntb_write_remote_spad(nt->ndev, QP_LINKS, val | 1 << qp->qp_num);
+ +	if (rc)
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			val | 1 << qp->qp_num, QP_LINKS);
+  
+  	/* query remote spad for qp ready bits */
+ -	ntb_peer_spad_read(nt->ndev, QP_LINKS);
+ -	dev_dbg_ratelimited(&pdev->dev, "Remote QP link status = %x\n", val);
+ +	rc = ntb_read_remote_spad(nt->ndev, QP_LINKS, &val);
+ +	if (rc)
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", QP_LINKS);
+ +
+ +	dev_dbg(&pdev->dev, "Remote QP link status = %x\n", val);
+  
+  	/* See if the remote side is up */
+ -	if (val & BIT(qp->qp_num)) {
+ +	if (1 << qp->qp_num & val) {
+ +		qp->qp_link = NTB_LINK_UP;
+ +
+  		dev_info(&pdev->dev, "qp %d: Link Up\n", qp->qp_num);
+++<<<<<<< HEAD
+ +		if (qp->event_handler)
+ +			qp->event_handler(qp->cb_data, NTB_LINK_UP);
+ +	} else if (nt->transport_link == NTB_LINK_UP)
+++=======
++ 		qp->link_is_up = true;
++ 		qp->active = true;
++ 
++ 		if (qp->event_handler)
++ 			qp->event_handler(qp->cb_data, qp->link_is_up);
++ 
++ 		if (qp->active)
++ 			tasklet_schedule(&qp->rxc_db_work);
++ 	} else if (nt->link_is_up)
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  		schedule_delayed_work(&qp->link_work,
+  				      msecs_to_jiffies(NTB_LINK_DOWN_TIMEOUT));
+  }
+@@@ -1238,10 -1410,26 +1284,30 @@@ static int ntb_transport_rxc_db(void *d
+  			break;
+  	}
+  
+ -	if (i && qp->rx_dma_chan)
+ -		dma_async_issue_pending(qp->rx_dma_chan);
+ +	if (qp->dma_chan)
+ +		dma_async_issue_pending(qp->dma_chan);
+  
+++<<<<<<< HEAD
+ +	return i;
+++=======
++ 	if (i == qp->rx_max_entry) {
++ 		/* there is more work to do */
++ 		if (qp->active)
++ 			tasklet_schedule(&qp->rxc_db_work);
++ 	} else if (ntb_db_read(qp->ndev) & BIT_ULL(qp->qp_num)) {
++ 		/* the doorbell bit is set: clear it */
++ 		ntb_db_clear(qp->ndev, BIT_ULL(qp->qp_num));
++ 		/* ntb_db_read ensures ntb_db_clear write is committed */
++ 		ntb_db_read(qp->ndev);
++ 
++ 		/* an interrupt may have arrived between finishing
++ 		 * ntb_process_rxc and clearing the doorbell bit:
++ 		 * there might be some more work to do.
++ 		 */
++ 		if (qp->active)
++ 			tasklet_schedule(&qp->rxc_db_work);
++ 	}
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  }
+  
+  static void ntb_tx_copy_callback(void *data)
+@@@ -1527,10 -1764,12 +1593,17 @@@ void ntb_transport_free_queue(struct nt
+  	if (!qp)
+  		return;
+  
+ -	pdev = qp->ndev->pdev;
+ +	pdev = ntb_query_pdev(qp->ndev);
+  
+++<<<<<<< HEAD
+ +	if (qp->dma_chan) {
+ +		struct dma_chan *chan = qp->dma_chan;
+++=======
++ 	qp->active = false;
++ 
++ 	if (qp->tx_dma_chan) {
++ 		struct dma_chan *chan = qp->tx_dma_chan;
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  		/* Putting the dma_chan to NULL will force any new traffic to be
+  		 * processed by the CPU instead of the DAM engine
+  		 */
+@@@ -1541,10 -1780,28 +1614,32 @@@
+  		 */
+  		dma_sync_wait(chan, qp->last_cookie);
+  		dmaengine_terminate_all(chan);
+ -		dma_release_channel(chan);
+ +		dmaengine_put();
+  	}
+  
+++<<<<<<< HEAD
+ +	ntb_unregister_db_callback(qp->ndev, qp->qp_num);
+++=======
++ 	if (qp->rx_dma_chan) {
++ 		struct dma_chan *chan = qp->rx_dma_chan;
++ 		/* Putting the dma_chan to NULL will force any new traffic to be
++ 		 * processed by the CPU instead of the DAM engine
++ 		 */
++ 		qp->rx_dma_chan = NULL;
++ 
++ 		/* Try to be nice and wait for any queued DMA engine
++ 		 * transactions to process before smashing it with a rock
++ 		 */
++ 		dma_sync_wait(chan, qp->last_cookie);
++ 		dmaengine_terminate_all(chan);
++ 		dma_release_channel(chan);
++ 	}
++ 
++ 	qp_bit = BIT_ULL(qp->qp_num);
++ 
++ 	ntb_db_set_mask(qp->ndev, qp_bit);
++ 	tasklet_kill(&qp->rxc_db_work);
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  
+  	cancel_delayed_work_sync(&qp->link_work);
+  
+@@@ -1623,8 -1890,12 +1718,15 @@@ int ntb_transport_rx_enqueue(struct ntb
+  	entry->cb_data = cb;
+  	entry->buf = data;
+  	entry->len = len;
+ -	entry->flags = 0;
+  
+++<<<<<<< HEAD
+ +	ntb_list_add(&qp->ntb_rx_pend_q_lock, &entry->entry, &qp->rx_pend_q);
+++=======
++ 	ntb_list_add(&qp->ntb_rx_q_lock, &entry->entry, &qp->rx_pend_q);
++ 
++ 	if (qp->active)
++ 		tasklet_schedule(&qp->rxc_db_work);
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+  
+  	return 0;
+  }
+@@@ -1777,13 -2041,94 +1879,94 @@@ unsigned int ntb_transport_max_size(str
+  	if (!qp)
+  		return 0;
+  
+ -	rx_chan = qp->rx_dma_chan;
+ -	tx_chan = qp->tx_dma_chan;
+ -
+ -	copy_align = max(rx_chan ? rx_chan->device->copy_align : 0,
+ -			 tx_chan ? tx_chan->device->copy_align : 0);
+ +	if (!qp->dma_chan)
+ +		return qp->tx_max_frame - sizeof(struct ntb_payload_header);
+  
+  	/* If DMA engine usage is possible, try to find the max size for that */
+ -	max_size = qp->tx_max_frame - sizeof(struct ntb_payload_header);
+ -	max_size = round_down(max_size, 1 << copy_align);
+ +	max = qp->tx_max_frame - sizeof(struct ntb_payload_header);
+ +	max -= max % (1 << qp->dma_chan->device->copy_align);
+  
+ -	return max_size;
+ +	return max;
+  }
+  EXPORT_SYMBOL_GPL(ntb_transport_max_size);
+++<<<<<<< HEAD
+++=======
++ 
++ unsigned int ntb_transport_tx_free_entry(struct ntb_transport_qp *qp)
++ {
++ 	unsigned int head = qp->tx_index;
++ 	unsigned int tail = qp->remote_rx_info->entry;
++ 
++ 	return tail > head ? tail - head : qp->tx_max_entry + tail - head;
++ }
++ EXPORT_SYMBOL_GPL(ntb_transport_tx_free_entry);
++ 
++ static void ntb_transport_doorbell_callback(void *data, int vector)
++ {
++ 	struct ntb_transport_ctx *nt = data;
++ 	struct ntb_transport_qp *qp;
++ 	u64 db_bits;
++ 	unsigned int qp_num;
++ 
++ 	db_bits = (nt->qp_bitmap & ~nt->qp_bitmap_free &
++ 		   ntb_db_vector_mask(nt->ndev, vector));
++ 
++ 	while (db_bits) {
++ 		qp_num = __ffs(db_bits);
++ 		qp = &nt->qp_vec[qp_num];
++ 
++ 		if (qp->active)
++ 			tasklet_schedule(&qp->rxc_db_work);
++ 
++ 		db_bits &= ~BIT_ULL(qp_num);
++ 	}
++ }
++ 
++ static const struct ntb_ctx_ops ntb_transport_ops = {
++ 	.link_event = ntb_transport_event_callback,
++ 	.db_event = ntb_transport_doorbell_callback,
++ };
++ 
++ static struct ntb_client ntb_transport_client = {
++ 	.ops = {
++ 		.probe = ntb_transport_probe,
++ 		.remove = ntb_transport_free,
++ 	},
++ };
++ 
++ static int __init ntb_transport_init(void)
++ {
++ 	int rc;
++ 
++ 	pr_info("%s, version %s\n", NTB_TRANSPORT_DESC, NTB_TRANSPORT_VER);
++ 
++ 	if (debugfs_initialized())
++ 		nt_debugfs_dir = debugfs_create_dir(KBUILD_MODNAME, NULL);
++ 
++ 	rc = bus_register(&ntb_transport_bus);
++ 	if (rc)
++ 		goto err_bus;
++ 
++ 	rc = ntb_register_client(&ntb_transport_client);
++ 	if (rc)
++ 		goto err_client;
++ 
++ 	return 0;
++ 
++ err_client:
++ 	bus_unregister(&ntb_transport_bus);
++ err_bus:
++ 	debugfs_remove_recursive(nt_debugfs_dir);
++ 	return rc;
++ }
++ module_init(ntb_transport_init);
++ 
++ static void __exit ntb_transport_exit(void)
++ {
++ 	debugfs_remove_recursive(nt_debugfs_dir);
++ 
++ 	ntb_unregister_client(&ntb_transport_client);
++ 	bus_unregister(&ntb_transport_bus);
++ }
++ module_exit(ntb_transport_exit);
+++>>>>>>> e902133162af (ntb: stop tasklet from spinning forever during shutdown.)
+* Unmerged path drivers/ntb/ntb_transport.c
