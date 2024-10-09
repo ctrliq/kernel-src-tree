@@ -1,0 +1,439 @@
+amd-xgbe: Use page allocations for Rx buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 08dcc47c06c79de31b9b2c0b4637f6119e5701fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/08dcc47c.failed
+
+Use page allocations for Rx buffers instead of pre-allocating skbs
+of a set size.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 08dcc47c06c79de31b9b2c0b4637f6119e5701fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index a9ce56d5e988,99911f45f334..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -117,8 -117,7 +117,12 @@@
+  #include "xgbe.h"
+  #include "xgbe-common.h"
+  
+++<<<<<<< HEAD
+ +
+ +static void xgbe_unmap_skb(struct xgbe_prv_data *, struct xgbe_ring_data *);
+++=======
++ static void xgbe_unmap_rdata(struct xgbe_prv_data *, struct xgbe_ring_data *);
+++>>>>>>> 08dcc47c06c7 (amd-xgbe: Use page allocations for Rx buffers)
+  
+  static void xgbe_free_ring(struct xgbe_prv_data *pdata,
+  			   struct xgbe_ring *ring)
+@@@ -511,26 -587,10 +583,31 @@@ static void xgbe_realloc_rx_buffer(stru
+  		rdata = XGBE_GET_DESC_DATA(ring, ring->rx.realloc_index);
+  
+  		/* Reset rdata values */
+- 		xgbe_unmap_skb(pdata, rdata);
++ 		xgbe_unmap_rdata(pdata, rdata);
+  
+++<<<<<<< HEAD
+ +		/* Allocate skb & assign to each rdesc */
+ +		skb = dev_alloc_skb(pdata->rx_buf_size);
+ +		if (skb == NULL) {
+ +			netdev_alert(pdata->netdev,
+ +				     "failed to allocate skb\n");
+ +			break;
+ +		}
+ +		skb_dma = dma_map_single(pdata->dev, skb->data,
+ +					 pdata->rx_buf_size, DMA_FROM_DEVICE);
+ +		if (dma_mapping_error(pdata->dev, skb_dma)) {
+ +			netdev_alert(pdata->netdev,
+ +				     "failed to do the dma map\n");
+ +			dev_kfree_skb_any(skb);
+ +			break;
+ +		}
+ +		rdata->skb = skb;
+ +		rdata->skb_dma = skb_dma;
+ +		rdata->skb_dma_len = pdata->rx_buf_size;
+++=======
++ 		if (xgbe_map_rx_buffer(pdata, ring, rdata))
++ 			break;
+++>>>>>>> 08dcc47c06c7 (amd-xgbe: Use page allocations for Rx buffers)
+  
+  		hw_if->rx_desc_reset(rdata);
+  
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 6baf601c4282,d65f5aa8fdce..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -489,9 -593,117 +489,9 @@@ static void xgbe_free_rx_data(struct xg
+  		}
+  	}
+  
+- 	DBGPR("<--xgbe_free_rx_skbuff\n");
++ 	DBGPR("<--xgbe_free_rx_data\n");
+  }
+  
+ -static void xgbe_adjust_link(struct net_device *netdev)
+ -{
+ -	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ -	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ -	struct phy_device *phydev = pdata->phydev;
+ -	int new_state = 0;
+ -
+ -	if (phydev == NULL)
+ -		return;
+ -
+ -	if (phydev->link) {
+ -		/* Flow control support */
+ -		if (pdata->pause_autoneg) {
+ -			if (phydev->pause || phydev->asym_pause) {
+ -				pdata->tx_pause = 1;
+ -				pdata->rx_pause = 1;
+ -			} else {
+ -				pdata->tx_pause = 0;
+ -				pdata->rx_pause = 0;
+ -			}
+ -		}
+ -
+ -		if (pdata->tx_pause != pdata->phy_tx_pause) {
+ -			hw_if->config_tx_flow_control(pdata);
+ -			pdata->phy_tx_pause = pdata->tx_pause;
+ -		}
+ -
+ -		if (pdata->rx_pause != pdata->phy_rx_pause) {
+ -			hw_if->config_rx_flow_control(pdata);
+ -			pdata->phy_rx_pause = pdata->rx_pause;
+ -		}
+ -
+ -		/* Speed support */
+ -		if (phydev->speed != pdata->phy_speed) {
+ -			new_state = 1;
+ -
+ -			switch (phydev->speed) {
+ -			case SPEED_10000:
+ -				hw_if->set_xgmii_speed(pdata);
+ -				break;
+ -
+ -			case SPEED_2500:
+ -				hw_if->set_gmii_2500_speed(pdata);
+ -				break;
+ -
+ -			case SPEED_1000:
+ -				hw_if->set_gmii_speed(pdata);
+ -				break;
+ -			}
+ -			pdata->phy_speed = phydev->speed;
+ -		}
+ -
+ -		if (phydev->link != pdata->phy_link) {
+ -			new_state = 1;
+ -			pdata->phy_link = 1;
+ -		}
+ -	} else if (pdata->phy_link) {
+ -		new_state = 1;
+ -		pdata->phy_link = 0;
+ -		pdata->phy_speed = SPEED_UNKNOWN;
+ -	}
+ -
+ -	if (new_state)
+ -		phy_print_status(phydev);
+ -}
+ -
+ -static int xgbe_phy_init(struct xgbe_prv_data *pdata)
+ -{
+ -	struct net_device *netdev = pdata->netdev;
+ -	struct phy_device *phydev = pdata->phydev;
+ -	int ret;
+ -
+ -	pdata->phy_link = -1;
+ -	pdata->phy_speed = SPEED_UNKNOWN;
+ -	pdata->phy_tx_pause = pdata->tx_pause;
+ -	pdata->phy_rx_pause = pdata->rx_pause;
+ -
+ -	ret = phy_connect_direct(netdev, phydev, &xgbe_adjust_link,
+ -				 pdata->phy_mode);
+ -	if (ret) {
+ -		netdev_err(netdev, "phy_connect_direct failed\n");
+ -		return ret;
+ -	}
+ -
+ -	if (!phydev->drv || (phydev->drv->phy_id == 0)) {
+ -		netdev_err(netdev, "phy_id not valid\n");
+ -		ret = -ENODEV;
+ -		goto err_phy_connect;
+ -	}
+ -	DBGPR("  phy_connect_direct succeeded for PHY %s, link=%d\n",
+ -	      dev_name(&phydev->dev), phydev->link);
+ -
+ -	return 0;
+ -
+ -err_phy_connect:
+ -	phy_disconnect(phydev);
+ -
+ -	return ret;
+ -}
+ -
+ -static void xgbe_phy_exit(struct xgbe_prv_data *pdata)
+ -{
+ -	if (!pdata->phydev)
+ -		return;
+ -
+ -	phy_disconnect(pdata->phydev);
+ -}
+ -
+  int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
+  {
+  	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+@@@ -1209,33 -1779,36 +1240,54 @@@ read_again
+  			if (packet->errors)
+  				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+ -			goto next_packet;
+ +			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+ +					error = 1;
+ +					goto read_again;
+ +				}
+ +
+ +				dev_kfree_skb(skb);
+ +				continue;
+ +			}
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+++=======
++ 		if (!context) {
++ 			put_len = rdata->len - len;
++ 			len += put_len;
++ 
++ 			if (!skb) {
++ 				skb = xgbe_create_skb(pdata, rdata, put_len);
++ 				if (!skb) {
++ 					error = 1;
++ 					goto read_again;
++ 				}
++ 			} else {
++ 				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 						rdata->rx_pa.pages,
++ 						rdata->rx_pa.pages_offset,
++ 						put_len, rdata->rx_dma_len);
++ 			}
++ 
++ 			rdata->rx_pa.pages = NULL;
+++>>>>>>> 08dcc47c06c7 (amd-xgbe: Use page allocations for Rx buffers)
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+ -		if (incomplete || context_next)
+ +		if (incomplete)
+  			goto read_again;
+  
+ -		/* Stray Context Descriptor? */
+ -		if (!skb)
+ -			goto next_packet;
+ -
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 2da3691ffcd6..11445d6e90e0 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@ -752,13 +752,15 @@ static void xgbe_tx_desc_reset(struct xgbe_ring_data *rdata)
+ 	rdesc->desc1 = 0;
+ 	rdesc->desc2 = 0;
+ 	rdesc->desc3 = 0;
++
++	/* Make sure ownership is written to the descriptor */
++	wmb();
+ }
+ 
+ static void xgbe_tx_desc_init(struct xgbe_channel *channel)
+ {
+ 	struct xgbe_ring *ring = channel->tx_ring;
+ 	struct xgbe_ring_data *rdata;
+-	struct xgbe_ring_desc *rdesc;
+ 	int i;
+ 	int start_index = ring->cur;
+ 
+@@ -767,26 +769,11 @@ static void xgbe_tx_desc_init(struct xgbe_channel *channel)
+ 	/* Initialze all descriptors */
+ 	for (i = 0; i < ring->rdesc_count; i++) {
+ 		rdata = XGBE_GET_DESC_DATA(ring, i);
+-		rdesc = rdata->rdesc;
+ 
+-		/* Initialize Tx descriptor
+-		 *   Set buffer 1 (lo) address to zero
+-		 *   Set buffer 1 (hi) address to zero
+-		 *   Reset all other control bits (IC, TTSE, B2L & B1L)
+-		 *   Reset all other control bits (OWN, CTXT, FD, LD, CPC, CIC,
+-		 *     etc)
+-		 */
+-		rdesc->desc0 = 0;
+-		rdesc->desc1 = 0;
+-		rdesc->desc2 = 0;
+-		rdesc->desc3 = 0;
++		/* Initialize Tx descriptor */
++		xgbe_tx_desc_reset(rdata);
+ 	}
+ 
+-	/* Make sure everything is written to the descriptor(s) before
+-	 * telling the device about them
+-	 */
+-	wmb();
+-
+ 	/* Update the total number of Tx descriptors */
+ 	XGMAC_DMA_IOWRITE(channel, DMA_CH_TDRLR, ring->rdesc_count - 1);
+ 
+@@ -811,8 +798,8 @@ static void xgbe_rx_desc_reset(struct xgbe_ring_data *rdata)
+ 	 *   Set buffer 2 (hi) address to zero and set control bits
+ 	 *     OWN and INTE
+ 	 */
+-	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+-	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
++	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->rx_dma));
++	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->rx_dma));
+ 	rdesc->desc2 = 0;
+ 
+ 	rdesc->desc3 = 0;
+@@ -836,7 +823,6 @@ static void xgbe_rx_desc_init(struct xgbe_channel *channel)
+ 	struct xgbe_prv_data *pdata = channel->pdata;
+ 	struct xgbe_ring *ring = channel->rx_ring;
+ 	struct xgbe_ring_data *rdata;
+-	struct xgbe_ring_desc *rdesc;
+ 	unsigned int start_index = ring->cur;
+ 	unsigned int rx_coalesce, rx_frames;
+ 	unsigned int i;
+@@ -849,34 +835,16 @@ static void xgbe_rx_desc_init(struct xgbe_channel *channel)
+ 	/* Initialize all descriptors */
+ 	for (i = 0; i < ring->rdesc_count; i++) {
+ 		rdata = XGBE_GET_DESC_DATA(ring, i);
+-		rdesc = rdata->rdesc;
+ 
+-		/* Initialize Rx descriptor
+-		 *   Set buffer 1 (lo) address to dma address (lo)
+-		 *   Set buffer 1 (hi) address to dma address (hi)
+-		 *   Set buffer 2 (lo) address to zero
+-		 *   Set buffer 2 (hi) address to zero and set control
+-		 *     bits OWN and INTE appropriateley
+-		 */
+-		rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+-		rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
+-		rdesc->desc2 = 0;
+-		rdesc->desc3 = 0;
+-		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, OWN, 1);
+-		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, 1);
+-		rdata->interrupt = 1;
+-		if (rx_coalesce && (!rx_frames || ((i + 1) % rx_frames))) {
+-			/* Clear interrupt on completion bit */
+-			XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE,
+-					  0);
++		/* Set interrupt on completion bit as appropriate */
++		if (rx_coalesce && (!rx_frames || ((i + 1) % rx_frames)))
+ 			rdata->interrupt = 0;
+-		}
+-	}
++		else
++			rdata->interrupt = 1;
+ 
+-	/* Make sure everything is written to the descriptors before
+-	 * telling the device about them
+-	 */
+-	wmb();
++		/* Initialize Rx descriptor */
++		xgbe_rx_desc_reset(rdata);
++	}
+ 
+ 	/* Update the total number of Rx descriptors */
+ 	XGMAC_DMA_IOWRITE(channel, DMA_CH_RDRLR, ring->rdesc_count - 1);
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 30435fbd04b3..4d13a5a03702 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -137,6 +137,7 @@
+ 
+ #define XGBE_RX_MIN_BUF_SIZE	(ETH_FRAME_LEN + ETH_FCS_LEN + VLAN_HLEN)
+ #define XGBE_RX_BUF_ALIGN	64
++#define XGBE_SKB_ALLOC_SIZE	256
+ 
+ #define XGBE_MAX_DMA_CHANNELS	16
+ 
+@@ -221,6 +222,15 @@ struct xgbe_ring_desc {
+ 	u32 desc3;
+ };
+ 
++/* Page allocation related values */
++struct xgbe_page_alloc {
++	struct page *pages;
++	unsigned int pages_len;
++	unsigned int pages_offset;
++
++	dma_addr_t pages_dma;
++};
++
+ /* Structure used to hold information related to the descriptor
+  * and the packet associated with the descriptor (always use
+  * use the XGBE_GET_DESC_DATA macro to access this data from the ring)
+@@ -234,6 +244,12 @@ struct xgbe_ring_data {
+ 	unsigned int skb_dma_len;	/* Length of SKB DMA area */
+ 	unsigned int tso_header;        /* TSO header indicator */
+ 
++	struct xgbe_page_alloc rx_pa;	/* Rx buffer page allocation */
++	struct xgbe_page_alloc rx_unmap;
++
++	dma_addr_t rx_dma;		/* DMA address of Rx buffer */
++	unsigned int rx_dma_len;	/* Length of the Rx DMA buffer */
++
+ 	unsigned short len;		/* Length of received Rx packet */
+ 
+ 	unsigned int interrupt;		/* Interrupt indicator */
+@@ -258,6 +274,9 @@ struct xgbe_ring {
+ 	 */
+ 	struct xgbe_ring_data *rdata;
+ 
++	/* Page allocation for RX buffers */
++	struct xgbe_page_alloc rx_pa;
++
+ 	/* Ring index values
+ 	 *  cur   - Tx: index of descriptor to be used for current transfer
+ 	 *          Rx: index of descriptor to check for packet availability
+@@ -467,8 +486,8 @@ struct xgbe_desc_if {
+ 	int (*alloc_ring_resources)(struct xgbe_prv_data *);
+ 	void (*free_ring_resources)(struct xgbe_prv_data *);
+ 	int (*map_tx_skb)(struct xgbe_channel *, struct sk_buff *);
+-	void (*realloc_skb)(struct xgbe_channel *);
+-	void (*unmap_skb)(struct xgbe_prv_data *, struct xgbe_ring_data *);
++	void (*realloc_rx_buffer)(struct xgbe_channel *);
++	void (*unmap_rdata)(struct xgbe_prv_data *, struct xgbe_ring_data *);
+ 	void (*wrapper_tx_desc_init)(struct xgbe_prv_data *);
+ 	void (*wrapper_rx_desc_init)(struct xgbe_prv_data *);
+ };
+@@ -569,7 +588,7 @@ struct xgbe_prv_data {
+ 	unsigned int rx_riwt;
+ 	unsigned int rx_frames;
+ 
+-	/* Current MTU */
++	/* Current Rx buffer size */
+ 	unsigned int rx_buf_size;
+ 
+ 	/* Flow control settings */
