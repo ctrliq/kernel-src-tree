@@ -1,0 +1,241 @@
+seccomp: split filter prep from check and apply
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kees Cook <keescook@chromium.org>
+commit c8bee430dc52cfca6c1aab27752a89275d78d50f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c8bee430.failed
+
+In preparation for adding seccomp locking, move filter creation away
+from where it is checked and applied. This will allow for locking where
+no memory allocation is happening. The validation, filter attachment,
+and seccomp mode setting can all happen under the future locks.
+
+For extreme defensiveness, I've added a BUG_ON check for the calculated
+size of the buffer allocation in case BPF_MAXINSN ever changes, which
+shouldn't ever happen. The compiler should actually optimize out this
+check since the test above it makes it impossible.
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+(cherry picked from commit c8bee430dc52cfca6c1aab27752a89275d78d50f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/seccomp.c
+diff --cc kernel/seccomp.c
+index dab81904040f,58125160417c..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -18,6 -18,8 +18,11 @@@
+  #include <linux/compat.h>
+  #include <linux/sched.h>
+  #include <linux/seccomp.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/slab.h>
++ #include <linux/syscalls.h>
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  
+  /* #define SECCOMP_DEBUG 1 */
+  
+@@@ -237,70 -213,90 +241,100 @@@ static inline void seccomp_assign_mode(
+  
+  #ifdef CONFIG_SECCOMP_FILTER
+  /**
+-  * seccomp_attach_filter: Attaches a seccomp filter to current.
++  * seccomp_prepare_filter: Prepares a seccomp filter for use.
+   * @fprog: BPF program to install
+   *
+-  * Returns 0 on success or an errno on failure.
++  * Returns filter on success or an ERR_PTR on failure.
+   */
+- static long seccomp_attach_filter(struct sock_fprog *fprog)
++ static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
+  {
+  	struct seccomp_filter *filter;
+++<<<<<<< HEAD
+ +	unsigned long fp_size = fprog->len * sizeof(struct sock_filter);
+ +	unsigned long total_insns = fprog->len;
+ +	long ret;
+ +
+ +	if (fprog->len == 0 || fprog->len > BPF_MAXINSNS)
+ +		return -EINVAL;
+ +
+ +	for (filter = current->seccomp.filter; filter; filter = filter->prev)
+ +		total_insns += filter->len + 4;  /* include a 4 instr penalty */
+ +	if (total_insns > MAX_INSNS_PER_PATH)
+ +		return -ENOMEM;
+++=======
++ 	unsigned long fp_size;
++ 	struct sock_filter *fp;
++ 	int new_len;
++ 	long ret;
++ 
++ 	if (fprog->len == 0 || fprog->len > BPF_MAXINSNS)
++ 		return ERR_PTR(-EINVAL);
++ 	BUG_ON(INT_MAX / fprog->len < sizeof(struct sock_filter));
++ 	fp_size = fprog->len * sizeof(struct sock_filter);
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  
+  	/*
+ -	 * Installing a seccomp filter requires that the task has
+ +	 * Installing a seccomp filter requires that the task have
+  	 * CAP_SYS_ADMIN in its namespace or be running with no_new_privs.
+  	 * This avoids scenarios where unprivileged tasks can affect the
+  	 * behavior of privileged children.
+  	 */
+ -	if (!task_no_new_privs(current) &&
+ +	if (!current->no_new_privs &&
+  	    security_capable_noaudit(current_cred(), current_user_ns(),
+  				     CAP_SYS_ADMIN) != 0)
+- 		return -EACCES;
++ 		return ERR_PTR(-EACCES);
+  
+++<<<<<<< HEAD
+ +	/* Allocate a new seccomp_filter */
+ +	filter = kzalloc(sizeof(struct seccomp_filter) + fp_size,
+ +			 GFP_KERNEL|__GFP_NOWARN);
+ +	if (!filter)
+ +		return -ENOMEM;
+ +	atomic_set(&filter->usage, 1);
+ +	filter->len = fprog->len;
+++=======
++ 	fp = kzalloc(fp_size, GFP_KERNEL|__GFP_NOWARN);
++ 	if (!fp)
++ 		return ERR_PTR(-ENOMEM);
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  
+  	/* Copy the instructions from fprog. */
+  	ret = -EFAULT;
+ -	if (copy_from_user(fp, fprog->filter, fp_size))
+ -		goto free_prog;
+ +	if (copy_from_user(filter->insns, fprog->filter, fp_size))
+ +		goto fail;
+  
+  	/* Check and rewrite the fprog via the skb checker */
+ -	ret = sk_chk_filter(fp, fprog->len);
+ +	ret = sk_chk_filter(filter->insns, filter->len);
+  	if (ret)
+ -		goto free_prog;
+ +		goto fail;
+  
+  	/* Check and rewrite the fprog for seccomp use */
+ -	ret = seccomp_check_filter(fp, fprog->len);
+ -	if (ret)
+ -		goto free_prog;
+ -
+ -	/* Convert 'sock_filter' insns to 'sock_filter_int' insns */
+ -	ret = sk_convert_filter(fp, fprog->len, NULL, &new_len);
+ -	if (ret)
+ -		goto free_prog;
+ -
+ -	/* Allocate a new seccomp_filter */
+ -	ret = -ENOMEM;
+ -	filter = kzalloc(sizeof(struct seccomp_filter),
+ -			 GFP_KERNEL|__GFP_NOWARN);
+ -	if (!filter)
+ -		goto free_prog;
+ -
+ -	filter->prog = kzalloc(sk_filter_size(new_len),
+ -			       GFP_KERNEL|__GFP_NOWARN);
+ -	if (!filter->prog)
+ -		goto free_filter;
+ -
+ -	ret = sk_convert_filter(fp, fprog->len, filter->prog->insnsi, &new_len);
+ +	ret = seccomp_check_filter(filter->insns, filter->len);
+  	if (ret)
+ -		goto free_filter_prog;
+ -	kfree(fp);
+ -
+ -	atomic_set(&filter->usage, 1);
+ -	filter->prog->len = new_len;
+ -
+ -	sk_filter_select_runtime(filter->prog);
+ +		goto fail;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If there is an existing filter, make it the prev and don't drop its
+ +	 * task reference.
+ +	 */
+ +	filter->prev = current->seccomp.filter;
+ +	current->seccomp.filter = filter;
+ +	return 0;
+ +fail:
+ +	kfree(filter);
+ +	return ret;
+++=======
++ 	return filter;
++ 
++ free_filter_prog:
++ 	kfree(filter->prog);
++ free_filter:
++ 	kfree(filter);
++ free_prog:
++ 	kfree(fp);
++ 	return ERR_PTR(ret);
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  }
+  
+  /**
+@@@ -309,10 -305,11 +343,15 @@@
+   *
+   * Returns 0 on success and non-zero otherwise.
+   */
+++<<<<<<< HEAD
+ +long seccomp_attach_user_filter(char __user *user_filter)
+++=======
++ static struct seccomp_filter *
++ seccomp_prepare_user_filter(const char __user *user_filter)
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  {
+  	struct sock_fprog fprog;
+- 	long ret = -EFAULT;
++ 	struct seccomp_filter *filter = ERR_PTR(-EFAULT);
+  
+  #ifdef CONFIG_COMPAT
+  	if (is_compat_task()) {
+@@@ -348,7 -383,7 +425,11 @@@ void put_seccomp_filter(struct task_str
+  	while (orig && atomic_dec_and_test(&orig->usage)) {
+  		struct seccomp_filter *freeme = orig;
+  		orig = orig->prev;
+++<<<<<<< HEAD
+ +		kfree(freeme);
+++=======
++ 		seccomp_filter_free(freeme);
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  	}
+  }
+  
+@@@ -521,11 -557,22 +602,24 @@@ out
+   *
+   * Returns 0 on success or -EINVAL on failure.
+   */
+ -static long seccomp_set_mode_filter(unsigned int flags,
+ -				    const char __user *filter)
+ +static long seccomp_set_mode_filter(char __user *filter)
+  {
+  	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
++ 	struct seccomp_filter *prepared = NULL;
+  	long ret = -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Validate flags. */
++ 	if (flags != 0)
++ 		goto out;
++ 
++ 	/* Prepare the new filter before holding any locks. */
++ 	prepared = seccomp_prepare_user_filter(filter);
++ 	if (IS_ERR(prepared))
++ 		return PTR_ERR(prepared);
++ 
+++>>>>>>> c8bee430dc52 (seccomp: split filter prep from check and apply)
+  	if (!seccomp_may_assign_mode(seccomp_mode))
+  		goto out;
+  
+* Unmerged path kernel/seccomp.c
