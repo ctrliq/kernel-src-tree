@@ -1,0 +1,191 @@
+thp, dax: add thp_get_unmapped_area for pmd mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Toshi Kani <toshi.kani@hpe.com>
+commit 74d2fad1334d12bac8fe017aba598dd66c86628b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/74d2fad1.failed
+
+When CONFIG_FS_DAX_PMD is set, DAX supports mmap() using pmd page size.
+This feature relies on both mmap virtual address and FS block (i.e.
+physical address) to be aligned by the pmd page size.  Users can use
+mkfs options to specify FS to align block allocations.  However,
+aligning mmap address requires code changes to existing applications for
+providing a pmd-aligned address to mmap().
+
+For instance, fio with "ioengine=mmap" performs I/Os with mmap() [1].
+It calls mmap() with a NULL address, which needs to be changed to
+provide a pmd-aligned address for testing with DAX pmd mappings.
+Changing all applications that call mmap() with NULL is undesirable.
+
+Add thp_get_unmapped_area(), which can be called by filesystem's
+get_unmapped_area to align an mmap address by the pmd size for a DAX
+file.  It calls the default handler, mm->get_unmapped_area(), to find a
+range and then aligns it for a DAX file.
+
+The patch is based on Matthew Wilcox's change that allows adding support
+of the pud page size easily.
+
+[1]: https://github.com/axboe/fio/blob/master/engines/mmap.c
+Link: http://lkml.kernel.org/r/1472497881-9323-2-git-send-email-toshi.kani@hpe.com
+	Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Theodore Ts'o <tytso@mit.edu>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 74d2fad1334d12bac8fe017aba598dd66c86628b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/huge_mm.h
+#	mm/huge_memory.c
+diff --cc include/linux/huge_mm.h
+index 2f1205c8c5a1,4fca5263fd42..000000000000
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@@ -96,11 -86,15 +96,23 @@@ extern bool is_vma_temporary_stack(stru
+  #endif /* CONFIG_DEBUG_VM */
+  
+  extern unsigned long transparent_hugepage_flags;
+++<<<<<<< HEAD
+ +extern int copy_pte_range(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ +			  pmd_t *dst_pmd, pmd_t *src_pmd,
+ +			  struct vm_area_struct *vma,
+ +			  unsigned long addr, unsigned long end);
+ +extern int split_huge_page_to_list(struct page *page, struct list_head *list);
+++=======
++ 
++ extern unsigned long thp_get_unmapped_area(struct file *filp,
++ 		unsigned long addr, unsigned long len, unsigned long pgoff,
++ 		unsigned long flags);
++ 
++ extern void prep_transhuge_page(struct page *page);
++ extern void free_transhuge_page(struct page *page);
++ 
++ int split_huge_page_to_list(struct page *page, struct list_head *list);
+++>>>>>>> 74d2fad1334d (thp, dax: add thp_get_unmapped_area for pmd mappings)
+  static inline int split_huge_page(struct page *page)
+  {
+  	return split_huge_page_to_list(page, NULL);
+@@@ -243,7 -170,12 +255,10 @@@ struct page *get_huge_zero_page(void)
+  
+  #define transparent_hugepage_enabled(__vma) 0
+  
+ -static inline void prep_transhuge_page(struct page *page) {}
+ -
+  #define transparent_hugepage_flags 0UL
++ 
++ #define thp_get_unmapped_area	NULL
++ 
+  static inline int
+  split_huge_page_to_list(struct page *page, struct list_head *list)
+  {
+diff --cc mm/huge_memory.c
+index 329799c812d7,a0b0e562407d..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -683,23 -449,76 +683,83 @@@ pmd_t maybe_pmd_mkwrite(pmd_t pmd, stru
+  	return pmd;
+  }
+  
+ -static inline struct list_head *page_deferred_list(struct page *page)
+ +static inline pmd_t mk_huge_pmd(struct page *page, struct vm_area_struct *vma)
+  {
+ -	/*
+ -	 * ->lru in the tail pages is occupied by compound_head.
+ -	 * Let's use ->mapping + ->index in the second tail page as list_head.
+ -	 */
+ -	return (struct list_head *)&page[2].mapping;
+ +	pmd_t entry;
+ +	entry = mk_pmd(page, vma->vm_page_prot);
+ +	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ +	entry = pmd_mkhuge(entry);
+ +	return entry;
+  }
+  
+ -void prep_transhuge_page(struct page *page)
+ +static int __do_huge_pmd_anonymous_page(struct mm_struct *mm,
+ +					struct vm_area_struct *vma,
+ +					unsigned long address, pmd_t *pmd,
+ +					struct page *page, unsigned int flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * we use page->mapping and page->indexlru in second tail page
++ 	 * as list_head: assuming THP order >= 2
++ 	 */
++ 
++ 	INIT_LIST_HEAD(page_deferred_list(page));
++ 	set_compound_page_dtor(page, TRANSHUGE_PAGE_DTOR);
++ }
++ 
++ unsigned long __thp_get_unmapped_area(struct file *filp, unsigned long len,
++ 		loff_t off, unsigned long flags, unsigned long size)
++ {
++ 	unsigned long addr;
++ 	loff_t off_end = off + len;
++ 	loff_t off_align = round_up(off, size);
++ 	unsigned long len_pad;
++ 
++ 	if (off_end <= off_align || (off_end - off_align) < size)
++ 		return 0;
++ 
++ 	len_pad = len + size;
++ 	if (len_pad < len || (off + len_pad) < off)
++ 		return 0;
++ 
++ 	addr = current->mm->get_unmapped_area(filp, 0, len_pad,
++ 					      off >> PAGE_SHIFT, flags);
++ 	if (IS_ERR_VALUE(addr))
++ 		return 0;
++ 
++ 	addr += (off - addr) & (size - 1);
++ 	return addr;
++ }
++ 
++ unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
++ 		unsigned long len, unsigned long pgoff, unsigned long flags)
++ {
++ 	loff_t off = (loff_t)pgoff << PAGE_SHIFT;
++ 
++ 	if (addr)
++ 		goto out;
++ 	if (!IS_DAX(filp->f_mapping->host) || !IS_ENABLED(CONFIG_FS_DAX_PMD))
++ 		goto out;
++ 
++ 	addr = __thp_get_unmapped_area(filp, len, off, flags, PMD_SIZE);
++ 	if (addr)
++ 		return addr;
++ 
++  out:
++ 	return current->mm->get_unmapped_area(filp, addr, len, pgoff, flags);
++ }
++ EXPORT_SYMBOL_GPL(thp_get_unmapped_area);
++ 
++ static int __do_huge_pmd_anonymous_page(struct fault_env *fe, struct page *page,
++ 		gfp_t gfp)
++ {
++ 	struct vm_area_struct *vma = fe->vma;
++ 	struct mem_cgroup *memcg;
+++>>>>>>> 74d2fad1334d (thp, dax: add thp_get_unmapped_area for pmd mappings)
+  	pgtable_t pgtable;
+ -	unsigned long haddr = fe->address & HPAGE_PMD_MASK;
+ +	spinlock_t *ptl;
+ +	unsigned long haddr = address & HPAGE_PMD_MASK;
+  
+  	VM_BUG_ON_PAGE(!PageCompound(page), page);
+  
+* Unmerged path include/linux/huge_mm.h
+* Unmerged path mm/huge_memory.c
