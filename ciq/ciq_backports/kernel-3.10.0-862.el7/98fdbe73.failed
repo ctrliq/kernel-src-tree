@@ -1,0 +1,194 @@
+bnxt_en: Improve tx ring reservation logic.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Improve tx ring reservation logic (Jonathan Toppins) [1459659]
+Rebuild_FUZZ: 98.82%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 98fdbe73bfb809b1f8eec9f27a36e737caed3a44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/98fdbe73.failed
+
+When the number of TX rings is changed (e.g. ethtool -L, enabling XDP TX
+rings, etc), the current code tries to reserve the new number of TX rings
+before closing and re-opening the NIC.  If we are unable to reserve the
+new TX rings, we abort the operation and keep the current TX rings.
+
+The problem is that the firmware will disable the current TX rings even
+when it cannot reserve the new set of TX rings.  We fix it as follows:
+
+1. Instead of reserving the new set of TX rings, just ask the firmware
+to check if the new set of TX rings is available.  There is a flag in
+the firmware message to do that.  If not available, abort and the
+current TX rings will not be disabled.
+
+2. Do the actual TX ring reservation in the path that opens the NIC.
+We keep the number of TX rings currently successfully reserved.  If the
+number of TX rings is different than the reserved TX rings, we call
+firmware and reserve again.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 98fdbe73bfb809b1f8eec9f27a36e737caed3a44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 63d0059da7b3,4b0a80721c89..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -6674,6 -7030,31 +6707,34 @@@ static void bnxt_sp_task(struct work_st
+  	clear_bit(BNXT_STATE_IN_SP_TASK, &bp->state);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Under rtnl_lock */
++ int bnxt_check_rings(struct bnxt *bp, int tx, int rx, bool sh, int tcs,
++ 		     int tx_xdp)
++ {
++ 	int max_rx, max_tx, tx_sets = 1;
++ 	int tx_rings_needed;
++ 	int rc;
++ 
++ 	if (tcs)
++ 		tx_sets = tcs;
++ 
++ 	rc = bnxt_get_max_rings(bp, &max_rx, &max_tx, sh);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (max_rx < rx)
++ 		return -ENOMEM;
++ 
++ 	tx_rings_needed = tx * tx_sets + tx_xdp;
++ 	if (max_tx < tx_rings_needed)
++ 		return -ENOMEM;
++ 
++ 	return bnxt_hwrm_check_tx_rings(bp, tx_rings_needed);
++ }
++ 
+++>>>>>>> 98fdbe73bfb8 (bnxt_en: Improve tx ring reservation logic.)
+  static void bnxt_unmap_bars(struct bnxt *bp, struct pci_dev *pdev)
+  {
+  	if (bp->bar2) {
+@@@ -6862,19 -7241,10 +6923,26 @@@ int bnxt_setup_mq_tc(struct net_device 
+  	if (bp->flags & BNXT_FLAG_SHARED_RINGS)
+  		sh = true;
+  
+++<<<<<<< HEAD
+ +	if (tc) {
+ +		int max_rx_rings, max_tx_rings, req_tx_rings, rsv_tx_rings, rc;
+ +
+ +		req_tx_rings = bp->tx_nr_rings_per_tc * tc;
+ +		rc = bnxt_get_max_rings(bp, &max_rx_rings, &max_tx_rings, sh);
+ +		if (rc || req_tx_rings > max_tx_rings)
+ +			return -ENOMEM;
+ +
+ +		rsv_tx_rings = req_tx_rings;
+ +		if (bnxt_hwrm_reserve_tx_rings(bp, &rsv_tx_rings) ||
+ +		    rsv_tx_rings < req_tx_rings)
+ +			return -ENOMEM;
+ +	}
+++=======
++ 	rc = bnxt_check_rings(bp, bp->tx_nr_rings_per_tc, bp->rx_nr_rings,
++ 			      sh, tc, bp->tx_nr_rings_xdp);
++ 	if (rc)
++ 		return rc;
+++>>>>>>> 98fdbe73bfb8 (bnxt_en: Improve tx ring reservation logic.)
+  
+  	/* Needs to close the device and do hw resource re-allocations */
+  	if (netif_running(bp->dev))
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 93218af865c8,568516f9e36e..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1056,6 -1117,8 +1056,11 @@@ struct bnxt 
+  	int			tx_nr_pages;
+  	int			tx_nr_rings;
+  	int			tx_nr_rings_per_tc;
+++<<<<<<< HEAD
+++=======
++ 	int			tx_nr_rings_xdp;
++ 	int			tx_reserved_rings;
+++>>>>>>> 98fdbe73bfb8 (bnxt_en: Improve tx ring reservation logic.)
+  
+  	int			tx_wake_thresh;
+  	int			tx_push_thresh;
+@@@ -1238,7 -1344,11 +1243,12 @@@ int bnxt_hwrm_alloc_wol_fltr(struct bnx
+  int bnxt_hwrm_free_wol_fltr(struct bnxt *bp);
+  int bnxt_hwrm_fw_set_time(struct bnxt *);
+  int bnxt_open_nic(struct bnxt *, bool, bool);
+ -int bnxt_half_open_nic(struct bnxt *bp);
+ -void bnxt_half_close_nic(struct bnxt *bp);
+  int bnxt_close_nic(struct bnxt *, bool, bool);
+++<<<<<<< HEAD
+++=======
++ int bnxt_check_rings(struct bnxt *bp, int tx, int rx, bool sh, int tcs,
++ 		     int tx_xdp);
+++>>>>>>> 98fdbe73bfb8 (bnxt_en: Improve tx ring reservation logic.)
+  int bnxt_setup_mq_tc(struct net_device *dev, u8 tc);
+  int bnxt_get_max_rings(struct bnxt *, int *, int *, bool);
+  void bnxt_restore_pf_fw_resources(struct bnxt *bp);
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index fde893ebe8a5,8eff05a3e0e4..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@@ -413,32 -424,21 +413,47 @@@ static int bnxt_set_channels(struct net
+  	if (channel->combined_count)
+  		sh = true;
+  
+ +	bnxt_get_max_rings(bp, &max_rx_rings, &max_tx_rings, sh);
+ +
+  	tcs = netdev_get_num_tc(dev);
+ +	if (tcs > 1)
+ +		max_tx_rings /= tcs;
+ +
+ +	if (sh &&
+ +	    channel->combined_count > max_t(int, max_rx_rings, max_tx_rings))
+ +		return -ENOMEM;
+ +
+ +	if (!sh && (channel->rx_count > max_rx_rings ||
+ +		    channel->tx_count > max_tx_rings))
+ +		return -ENOMEM;
+  
+  	req_tx_rings = sh ? channel->combined_count : channel->tx_count;
+++<<<<<<< HEAD
+ +	req_tx_rings = min_t(int, req_tx_rings, max_tx_rings);
+ +	if (tcs > 1)
+ +		req_tx_rings *= tcs;
+ +
+ +	rsv_tx_rings = req_tx_rings;
+ +	if (bnxt_hwrm_reserve_tx_rings(bp, &rsv_tx_rings))
+ +		return -ENOMEM;
+ +
+ +	if (rsv_tx_rings < req_tx_rings) {
+ +		netdev_warn(dev, "Unable to allocate the requested tx rings\n");
+ +		return -ENOMEM;
+++=======
++ 	req_rx_rings = sh ? channel->combined_count : channel->rx_count;
++ 	if (bp->tx_nr_rings_xdp) {
++ 		if (!sh) {
++ 			netdev_err(dev, "Only combined mode supported when XDP is enabled.\n");
++ 			return -EINVAL;
++ 		}
++ 		tx_xdp = req_rx_rings;
++ 	}
++ 	rc = bnxt_check_rings(bp, req_tx_rings, req_rx_rings, sh, tcs, tx_xdp);
++ 	if (rc) {
++ 		netdev_warn(dev, "Unable to allocate the requested rings\n");
++ 		return rc;
+++>>>>>>> 98fdbe73bfb8 (bnxt_en: Improve tx ring reservation logic.)
+  	}
+  
+  	if (netif_running(dev)) {
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
