@@ -1,0 +1,453 @@
+s390/qeth: be drop monitor friendly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [s390] qeth: be drop monitor friendly (Philipp Rudo) [1731508]
+Rebuild_FUZZ: 92.31%
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 104b48592b5441c722dcd95c38ab9300f2d94856
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/104b4859.failed
+
+As part of the TX completion path, qeth_release_skbs() frees the completed
+skbs with __skb_queue_purge(). This ends in kfree_skb(), reporting every
+completed skb as dropped.
+On the other hand when dropping an skb in .ndo_start_xmit, we end up
+calling consume_skb()... where we should be using kfree_skb() so that
+drop monitors get notified.
+
+Switch the drop/consume logic around, and also don't accumulate dropped
+packets in the tx_errors statistics.
+
+Fixes: dc149e3764d8 ("s390/qeth: replace open-coded skb_queue_walk()")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 104b48592b5441c722dcd95c38ab9300f2d94856)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index b1a62a620d2b,44bd6f04c145..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -1204,29 -1151,15 +1204,40 @@@ out
+  static void qeth_release_skbs(struct qeth_qdio_out_buffer *buf)
+  {
+  	struct sk_buff *skb;
+++<<<<<<< HEAD
+ +	struct iucv_sock *iucv;
+ +	int notify_general_error = 0;
+ +
+ +	if (atomic_read(&buf->state) == QETH_QDIO_BUF_PENDING)
+ +		notify_general_error = 1;
+++=======
+++>>>>>>> 104b48592b54 (s390/qeth: be drop monitor friendly)
+  
+  	/* release may never happen from within CQ tasklet scope */
+  	WARN_ON_ONCE(atomic_read(&buf->state) == QETH_QDIO_BUF_IN_CQ);
+  
+++<<<<<<< HEAD
+ +	skb = skb_dequeue(&buf->skb_list);
+ +	while (skb) {
+ +		QETH_CARD_TEXT(buf->q->card, 5, "skbr");
+ +		QETH_CARD_TEXT_(buf->q->card, 5, "%lx", (long) skb);
+ +		if (notify_general_error && skb->protocol == ETH_P_AF_IUCV) {
+ +			if (skb->sk) {
+ +				iucv = iucv_sk(skb->sk);
+ +				iucv->sk_txnotify(skb, TX_NOTIFY_GENERALERROR);
+ +			}
+ +		}
+ +		atomic_dec(&skb->users);
+ +		dev_kfree_skb_any(skb);
+ +		skb = skb_dequeue(&buf->skb_list);
+ +	}
+++=======
++ 	if (atomic_read(&buf->state) == QETH_QDIO_BUF_PENDING)
++ 		qeth_notify_skbs(buf->q, buf, TX_NOTIFY_GENERALERROR);
++ 
++ 	while ((skb = __skb_dequeue(&buf->skb_list)) != NULL)
++ 		consume_skb(skb);
+++>>>>>>> 104b48592b54 (s390/qeth: be drop monitor friendly)
+  }
+  
+  static void qeth_clear_output_buffer(struct qeth_qdio_out_q *queue,
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 242de87a46a1,c3067fd3bd9e..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -824,176 -562,76 +824,181 @@@ static void qeth_l2_set_multicast_list(
+  		qeth_promisc_to_bridge(card);
+  }
+  
+ -static int qeth_l2_xmit_osn(struct qeth_card *card, struct sk_buff *skb,
+ -			    struct qeth_qdio_out_q *queue)
+ +static int qeth_l2_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+ -	struct qeth_hdr *hdr = (struct qeth_hdr *)skb->data;
+ -	addr_t end = (addr_t)(skb->data + sizeof(*hdr));
+ -	addr_t start = (addr_t)skb->data;
+ -	unsigned int elements = 0;
+ -	unsigned int hd_len = 0;
+  	int rc;
+ +	struct qeth_hdr *hdr = NULL;
+ +	int elements = 0;
+ +	struct qeth_card *card = dev->ml_priv;
+ +	struct sk_buff *new_skb = skb;
+ +	int cast_type = qeth_l2_get_cast_type(card, skb);
+ +	struct qeth_qdio_out_q *queue;
+ +	int tx_bytes = skb->len;
+ +	int data_offset = -1;
+ +	int elements_needed = 0;
+ +	int hd_len = 0;
+ +
+ +	if (card->qdio.do_prio_queueing || (cast_type &&
+ +					card->info.is_multicast_different))
+ +		queue = card->qdio.out_qs[qeth_get_priority_queue(card, skb,
+ +					qeth_get_ip_version(skb), cast_type)];
+ +	else
+ +		queue = card->qdio.out_qs[card->qdio.default_out_queue];
+ +
+ +	if ((card->state != CARD_STATE_UP) || !card->lan_online) {
+ +		card->stats.tx_carrier_errors++;
+ +		goto tx_drop;
+ +	}
+  
+ -	if (skb->protocol == htons(ETH_P_IPV6))
+ -		return -EPROTONOSUPPORT;
+ +	if ((card->info.type == QETH_CARD_TYPE_OSN) &&
+ +	    (skb->protocol == htons(ETH_P_IPV6)))
+ +		goto tx_drop;
+  
+ -	if (qeth_get_elements_for_range(start, end) > 1) {
+ -		/* Misaligned HW header, move it to its own buffer element. */
+ -		hdr = kmem_cache_alloc(qeth_core_header_cache, GFP_ATOMIC);
+ -		if (!hdr)
+ -			return -ENOMEM;
+ -		hd_len = sizeof(*hdr);
+ -		skb_copy_from_linear_data(skb, (char *)hdr, hd_len);
+ -		elements++;
+ +	if (card->options.performance_stats) {
+ +		card->perf_stats.outbound_cnt++;
+ +		card->perf_stats.outbound_start_time = qeth_get_micros();
+  	}
+ +	netif_stop_queue(dev);
+  
+ -	elements += qeth_count_elements(skb, hd_len);
+ -	if (elements > QETH_MAX_BUFFER_ELEMENTS(card)) {
+ -		rc = -E2BIG;
+ -		goto out;
+ +	if (card->info.type == QETH_CARD_TYPE_OSN)
+ +		hdr = (struct qeth_hdr *)skb->data;
+ +	else {
+ +		if (card->info.type == QETH_CARD_TYPE_IQD) {
+ +			new_skb = skb;
+ +			data_offset = ETH_HLEN;
+ +			hd_len = ETH_HLEN;
+ +			hdr = kmem_cache_alloc(qeth_core_header_cache,
+ +						GFP_ATOMIC);
+ +			if (!hdr)
+ +				goto tx_drop;
+ +			elements_needed++;
+ +			skb_reset_mac_header(new_skb);
+ +			qeth_l2_fill_header(card, hdr, new_skb, cast_type);
+ +			hdr->hdr.l2.pkt_length = new_skb->len;
+ +			memcpy(((char *)hdr) + sizeof(struct qeth_hdr),
+ +				skb_mac_header(new_skb), ETH_HLEN);
+ +		} else {
+ +			/* create a clone with writeable headroom */
+ +			new_skb = skb_realloc_headroom(skb,
+ +						sizeof(struct qeth_hdr));
+ +			if (!new_skb)
+ +				goto tx_drop;
+ +			hdr = (struct qeth_hdr *)skb_push(new_skb,
+ +						sizeof(struct qeth_hdr));
+ +			skb_set_mac_header(new_skb, sizeof(struct qeth_hdr));
+ +			qeth_l2_fill_header(card, hdr, new_skb, cast_type);
+ +			if (new_skb->ip_summed == CHECKSUM_PARTIAL)
+ +				qeth_l2_hdr_csum(card, hdr, new_skb);
+ +		}
+  	}
+  
+ -	rc = qeth_do_send_packet(card, queue, skb, hdr, hd_len, hd_len,
+ -				 elements);
+ -out:
+ -	if (rc && hd_len)
+ -		kmem_cache_free(qeth_core_header_cache, hdr);
+ +	elements = qeth_get_elements_no(card, new_skb, elements_needed,
+ +					(data_offset > 0) ? data_offset : 0);
+ +	if (!elements) {
+ +		if (data_offset >= 0)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +		goto tx_drop;
+ +	}
+ +
+ +	if (card->info.type != QETH_CARD_TYPE_IQD) {
+ +		if (qeth_hdr_chk_and_bounce(new_skb, &hdr,
+ +		    sizeof(struct qeth_hdr_layer2)))
+ +			goto tx_drop;
+ +		rc = qeth_do_send_packet(card, queue, new_skb, hdr,
+ +					 elements);
+ +	} else
+ +		rc = qeth_do_send_packet_fast(card, queue, new_skb, hdr,
+ +					elements, data_offset, hd_len);
+ +	if (!rc) {
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		if (new_skb != skb)
+ +			dev_kfree_skb_any(skb);
+ +		rc = NETDEV_TX_OK;
+ +	} else {
+ +		if (data_offset >= 0)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +
+++<<<<<<< HEAD
+ +		if (rc == -EBUSY) {
+ +			if (new_skb != skb)
+ +				dev_kfree_skb_any(new_skb);
+ +			return NETDEV_TX_BUSY;
+ +		} else
+ +			goto tx_drop;
+ +	}
+ +
+ +	netif_wake_queue(dev);
+ +	if (card->options.performance_stats)
+ +		card->perf_stats.outbound_time += qeth_get_micros() -
+ +			card->perf_stats.outbound_start_time;
+  	return rc;
+ +
+ +tx_drop:
+ +	card->stats.tx_dropped++;
+ +	card->stats.tx_errors++;
+ +	if ((new_skb != skb) && new_skb)
+ +		dev_kfree_skb_any(new_skb);
+ +	dev_kfree_skb_any(skb);
+++=======
+++	QETH_TXQ_STAT_INC(queue, tx_dropped);
+++	kfree_skb(skb);
+++>>>>>>> 104b48592b54 (s390/qeth: be drop monitor friendly)
+ +	netif_wake_queue(dev);
+ +	return NETDEV_TX_OK;
+  }
+  
+ -static netdev_tx_t qeth_l2_hard_start_xmit(struct sk_buff *skb,
+ -					   struct net_device *dev)
+ +static int __qeth_l2_open(struct net_device *dev)
+  {
+  	struct qeth_card *card = dev->ml_priv;
+ -	int cast_type = qeth_l2_get_cast_type(card, skb);
+ -	int ipv = qeth_get_ip_version(skb);
+ -	struct qeth_qdio_out_q *queue;
+ -	int tx_bytes = skb->len;
+ -	int rc;
+ +	int rc = 0;
+  
+ -	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	QETH_CARD_TEXT(card, 4, "qethopen");
+ +	if (card->state == CARD_STATE_UP)
+ +		return rc;
+ +	if (card->state != CARD_STATE_SOFTSETUP)
+ +		return -ENODEV;
+  
+ -	netif_stop_queue(dev);
+ +	if ((card->info.type != QETH_CARD_TYPE_OSN) &&
+ +	     (!(card->info.mac_bits & QETH_LAYER2_MAC_REGISTERED))) {
+ +		QETH_CARD_TEXT(card, 4, "nomacadr");
+ +		return -EPERM;
+ +	}
+ +	card->data.state = CH_STATE_UP;
+ +	card->state = CARD_STATE_UP;
+ +	netif_start_queue(dev);
+  
+ -	if (IS_OSN(card))
+ -		rc = qeth_l2_xmit_osn(card, skb, queue);
+ -	else
+ -		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+ -			       qeth_l2_fill_header);
+ +	if (qdio_stop_irq(card->data.ccwdev, 0) >= 0) {
+ +		napi_enable(&card->napi);
+ +		napi_schedule(&card->napi);
+ +	} else
+ +		rc = -EIO;
+ +	return rc;
+ +}
+  
+ -	if (!rc) {
+ -		QETH_TXQ_STAT_INC(queue, tx_packets);
+ -		QETH_TXQ_STAT_ADD(queue, tx_bytes, tx_bytes);
+ -		netif_wake_queue(dev);
+ -		return NETDEV_TX_OK;
+ -	} else if (rc == -EBUSY) {
+ -		return NETDEV_TX_BUSY;
+ -	} /* else fall through */
+ +static int qeth_l2_open(struct net_device *dev)
+ +{
+ +	struct qeth_card *card = dev->ml_priv;
+  
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ -	kfree_skb(skb);
+ -	netif_wake_queue(dev);
+ -	return NETDEV_TX_OK;
+ +	QETH_CARD_TEXT(card, 5, "qethope_");
+ +	if (qeth_wait_for_threads(card, QETH_RECOVER_THREAD)) {
+ +		QETH_CARD_TEXT(card, 3, "openREC");
+ +		return -ERESTARTSYS;
+ +	}
+ +	return __qeth_l2_open(dev);
+ +}
+ +
+ +static int qeth_l2_stop(struct net_device *dev)
+ +{
+ +	struct qeth_card *card = dev->ml_priv;
+ +
+ +	QETH_CARD_TEXT(card, 4, "qethstop");
+ +	netif_tx_disable(dev);
+ +	if (card->state == CARD_STATE_UP) {
+ +		card->state = CARD_STATE_SOFTSETUP;
+ +		napi_disable(&card->napi);
+ +	}
+ +	return 0;
+  }
+  
+  static const struct device_type qeth_l2_devtype = {
+diff --cc drivers/s390/net/qeth_l3_main.c
+index de299c58d695,53712cf26406..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -2857,113 -2079,24 +2857,118 @@@ static int qeth_l3_hard_start_xmit(stru
+  
+  	netif_stop_queue(dev);
+  
+ -	if (ipv == 4 || IS_IQD(card))
+ -		rc = qeth_l3_xmit(card, skb, queue, ipv, cast_type);
+ -	else
+ -		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+ -			       qeth_l3_fill_header);
+ +	/* fix hardware limitation: as long as we do not have sbal
+ +	 * chaining we can not send long frag lists
+ +	 */
+ +	if (large_send) {
+ +		if (qeth_l3_tso_elements(new_skb) + 1 > 16) {
+ +			if (skb_linearize(new_skb))
+ +				goto tx_drop;
+ +			if (card->options.performance_stats)
+ +				card->perf_stats.tx_lin++;
+ +		}
+ +	}
+ +
+ +	if (large_send && (cast_type == RTN_UNSPEC)) {
+ +		hdr = (struct qeth_hdr *)skb_push(new_skb,
+ +						sizeof(struct qeth_hdr_tso));
+ +		memset(hdr, 0, sizeof(struct qeth_hdr_tso));
+ +		qeth_l3_fill_header(card, hdr, new_skb, ipv, cast_type);
+ +		qeth_tso_fill_header(card, hdr, new_skb);
+ +		elements_needed++;
+ +	} else {
+ +		if (data_offset < 0) {
+ +			hdr = (struct qeth_hdr *)skb_push(new_skb,
+ +						sizeof(struct qeth_hdr));
+ +			qeth_l3_fill_header(card, hdr, new_skb, ipv,
+ +						cast_type);
+ +		} else {
+ +			if (new_skb->protocol == ETH_P_AF_IUCV)
+ +				qeth_l3_fill_af_iucv_hdr(card, hdr, new_skb);
+ +			else {
+ +				qeth_l3_fill_header(card, hdr, new_skb, ipv,
+ +							cast_type);
+ +				hdr->hdr.l3.length = new_skb->len - data_offset;
+ +			}
+ +		}
+ +
+ +		if (skb->ip_summed == CHECKSUM_PARTIAL)
+ +			qeth_l3_hdr_csum(card, hdr, new_skb);
+ +	}
+ +
+ +	elems = qeth_get_elements_no(card, new_skb, elements_needed,
+ +				     (data_offset > 0) ? data_offset : 0);
+ +	if (!elems) {
+ +		if (data_offset >= 0)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +		goto tx_drop;
+ +	}
+ +	elements_needed += elems;
+ +	nr_frags = skb_shinfo(new_skb)->nr_frags;
+ +
+ +	if (card->info.type != QETH_CARD_TYPE_IQD) {
+ +		int len;
+ +		if (large_send)
+ +			len = ((unsigned long)tcp_hdr(new_skb) +
+ +				tcp_hdr(new_skb)->doff * 4) -
+ +				(unsigned long)new_skb->data;
+ +		else
+ +			len = sizeof(struct qeth_hdr_layer3);
+ +
+ +		if (qeth_hdr_chk_and_bounce(new_skb, &hdr, len))
+ +			goto tx_drop;
+ +		rc = qeth_do_send_packet(card, queue, new_skb, hdr,
+ +					 elements_needed);
+ +	} else
+ +		rc = qeth_do_send_packet_fast(card, queue, new_skb, hdr,
+ +					elements_needed, data_offset, 0);
+  
+  	if (!rc) {
+ -		QETH_TXQ_STAT_INC(queue, tx_packets);
+ -		QETH_TXQ_STAT_ADD(queue, tx_bytes, tx_bytes);
+ -		netif_wake_queue(dev);
+ -		return NETDEV_TX_OK;
+ -	} else if (rc == -EBUSY) {
+ -		return NETDEV_TX_BUSY;
+ -	} /* else fall through */
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		if (new_skb != skb)
+ +			dev_kfree_skb_any(skb);
+ +		if (card->options.performance_stats) {
+ +			if (large_send) {
+ +				card->perf_stats.large_send_bytes += tx_bytes;
+ +				card->perf_stats.large_send_cnt++;
+ +			}
+ +			if (nr_frags) {
+ +				card->perf_stats.sg_skbs_sent++;
+ +				/* nr_frags + skb->data */
+ +				card->perf_stats.sg_frags_sent += nr_frags + 1;
+ +			}
+ +		}
+ +		rc = NETDEV_TX_OK;
+ +	} else {
+ +		if (data_offset >= 0)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +
+ +		if (rc == -EBUSY) {
+ +			if (new_skb != skb)
+ +				dev_kfree_skb_any(new_skb);
+ +			return NETDEV_TX_BUSY;
+ +		} else
+ +			goto tx_drop;
+ +	}
+ +
+ +	netif_wake_queue(dev);
+ +	if (card->options.performance_stats)
+ +		card->perf_stats.outbound_time += qeth_get_micros() -
+ +			card->perf_stats.outbound_start_time;
+ +	return rc;
+  
+  tx_drop:
+++<<<<<<< HEAD
+ +	card->stats.tx_dropped++;
+ +	card->stats.tx_errors++;
+ +	if ((new_skb != skb) && new_skb)
+ +		dev_kfree_skb_any(new_skb);
+ +	dev_kfree_skb_any(skb);
+++=======
++ 	QETH_TXQ_STAT_INC(queue, tx_dropped);
++ 	kfree_skb(skb);
+++>>>>>>> 104b48592b54 (s390/qeth: be drop monitor friendly)
+  	netif_wake_queue(dev);
+  	return NETDEV_TX_OK;
+  }
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
