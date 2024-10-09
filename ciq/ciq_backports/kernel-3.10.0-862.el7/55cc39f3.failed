@@ -1,0 +1,65 @@
+md: close a race with setting mddev->in_sync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] close a race with setting mddev->in_sync (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 95.24%
+commit-author NeilBrown <neilb@suse.com>
+commit 55cc39f345256af241deb6152ff5c06bedd10f11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/55cc39f3.failed
+
+If ->in_sync is being set just as md_write_start() is being called,
+it is possible that set_in_sync() won't see the elevated
+->writes_pending, and md_write_start() won't see the set ->in_sync.
+
+To close this race, re-test ->writes_pending after setting ->in_sync,
+and add memory barriers to ensure the increment of ->writes_pending
+will be seen by the time of this second test, or the new ->in_sync
+will be seen by md_write_start().
+
+Add a spinlock to array_state_show() to ensure this temporary
+instability is never visible from userspace.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 55cc39f345256af241deb6152ff5c06bedd10f11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 4c75b0e4a2a4,dee6bbfb29b8..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -2287,6 -2252,25 +2287,28 @@@ static void export_array(struct mddev *
+  	mddev->major_version = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool set_in_sync(struct mddev *mddev)
++ {
++ 	WARN_ON_ONCE(!spin_is_locked(&mddev->lock));
++ 	if (atomic_read(&mddev->writes_pending) == 0) {
++ 		if (mddev->in_sync == 0) {
++ 			mddev->in_sync = 1;
++ 			smp_mb();
++ 			if (atomic_read(&mddev->writes_pending))
++ 				/* lost a race with md_write_start() */
++ 				mddev->in_sync = 0;
++ 			set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
++ 			sysfs_notify_dirent_safe(mddev->sysfs_state);
++ 		}
++ 	}
++ 	if (mddev->safemode == 1)
++ 		mddev->safemode = 0;
++ 	return mddev->in_sync;
++ }
++ 
+++>>>>>>> 55cc39f34525 (md: close a race with setting mddev->in_sync)
+  static void sync_sbs(struct mddev *mddev, int nospares)
+  {
+  	/* Update each superblock (in-memory image), but
+* Unmerged path drivers/md/md.c
