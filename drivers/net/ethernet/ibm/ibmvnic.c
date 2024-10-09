@@ -2716,6 +2716,7 @@ static int handle_login_rsp(union ibmvnic_crq *login_rsp_crq,
 		ibmvnic_remove(adapter->vdev);
 		return -EIO;
 	}
+	release_login_buffer(adapter);
 	complete(&adapter->init_done);
 
 	memset(&crq, 0, sizeof(crq));
