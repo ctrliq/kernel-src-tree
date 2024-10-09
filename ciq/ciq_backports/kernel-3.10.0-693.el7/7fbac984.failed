@@ -1,0 +1,103 @@
+bridge: switchdev: Offload VLAN flags to hardware bridge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 7fbac984f33a374a06fa7b1fc41127bdaf7d6c07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7fbac984.failed
+
+When VLANs are created / destroyed on a VLAN filtering bridge (MASTER
+flag set), the configuration is passed down to the hardware. However,
+when only the flags (e.g. PVID) are toggled, the configuration is done
+in the software bridge alone.
+
+While it is possible to pass these flags to hardware when invoked with
+the SELF flag set, this creates inconsistency with regards to the way
+the VLANs are initially configured.
+
+Pass the flags down to the hardware even when the VLAN already exists
+and only the flags are toggled.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7fbac984f33a374a06fa7b1fc41127bdaf7d6c07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_vlan.c
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,9309bb4f2a5b..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -609,35 -955,39 +609,58 @@@ int br_vlan_init(struct net_bridge *br
+   */
+  int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags)
+  {
+++<<<<<<< HEAD
+ +	struct net_port_vlans *pv = NULL;
+ +	int err;
+ +
+ +	ASSERT_RTNL();
+ +
+ +	pv = rtnl_dereference(port->vlan_info);
+ +	if (pv)
+ +		return __vlan_add(pv, vid, flags);
+ +
+ +	/* Create port vlan infomration
+ +	 */
+ +	pv = kzalloc(sizeof(*pv), GFP_KERNEL);
+ +	if (!pv) {
+ +		err = -ENOMEM;
+ +		goto clean_up;
+++=======
++ 	struct switchdev_obj_port_vlan v = {
++ 		.obj.orig_dev = port->dev,
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 		.flags = flags,
++ 		.vid_begin = vid,
++ 		.vid_end = vid,
++ 	};
++ 	struct net_bridge_vlan *vlan;
++ 	int ret;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	vlan = br_vlan_find(nbp_vlan_group(port), vid);
++ 	if (vlan) {
++ 		/* Pass the flags to the hardware bridge */
++ 		ret = switchdev_port_obj_add(port->dev, &v.obj);
++ 		if (ret && ret != -EOPNOTSUPP)
++ 			return ret;
++ 		__vlan_add_flags(vlan, flags);
++ 		return 0;
+++>>>>>>> 7fbac984f33a (bridge: switchdev: Offload VLAN flags to hardware bridge)
+  	}
+  
+ -	vlan = kzalloc(sizeof(*vlan), GFP_KERNEL);
+ -	if (!vlan)
+ -		return -ENOMEM;
+ +	pv->port_idx = port->port_no;
+ +	pv->parent.port = port;
+ +	err = __vlan_add(pv, vid, flags);
+ +	if (err)
+ +		goto clean_up;
+  
+ -	vlan->vid = vid;
+ -	vlan->port = port;
+ -	ret = __vlan_add(vlan, flags);
+ -	if (ret)
+ -		kfree(vlan);
+ +	rcu_assign_pointer(port->vlan_info, pv);
+ +	return 0;
+  
+ -	return ret;
+ +clean_up:
+ +	kfree(pv);
+ +	return err;
+  }
+  
+  /* Must be protected by RTNL.
+* Unmerged path net/bridge/br_vlan.c
