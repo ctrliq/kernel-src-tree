@@ -1,0 +1,126 @@
+xfs: teach get_bmapx about shared extents and the CoW fork
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit f86f403794b1446b68afb3c233d4c0bc0e93b654
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f86f4037.failed
+
+Teach xfs_getbmapx how to report shared extents and CoW fork contents
+accurately in the bmap output by querying the refcount btree
+appropriately.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit f86f403794b1446b68afb3c233d4c0bc0e93b654)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/xfs_bmap_util.c
+index ad7a1ab465c3,f7b3f02ff650..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -41,6 -41,10 +41,13 @@@
+  #include "xfs_trace.h"
+  #include "xfs_icache.h"
+  #include "xfs_log.h"
+++<<<<<<< HEAD
+++=======
++ #include "xfs_rmap_btree.h"
++ #include "xfs_iomap.h"
++ #include "xfs_reflink.h"
++ #include "xfs_refcount.h"
+++>>>>>>> f86f403794b1 (xfs: teach get_bmapx about shared extents and the CoW fork)
+  
+  /* Kernel only BMAP related definitions and functions */
+  
+@@@ -408,10 -396,11 +416,16 @@@ xfs_getbmapx_fix_eof_hole
+  	struct getbmapx		*out,		/* output structure */
+  	int			prealloced,	/* this is a file with
+  						 * preallocated data space */
+++<<<<<<< HEAD
+ +	int64_t			end,		/* last block requested */
+ +	xfs_fsblock_t		startblock)
+++=======
++ 	__int64_t		end,		/* last block requested */
++ 	xfs_fsblock_t		startblock,
++ 	bool			moretocome)
+++>>>>>>> f86f403794b1 (xfs: teach get_bmapx about shared extents and the CoW fork)
+  {
+ -	__int64_t		fixlen;
+ +	int64_t			fixlen;
+  	xfs_mount_t		*mp;		/* file system mount point */
+  	xfs_ifork_t		*ifp;		/* inode fork pointer */
+  	xfs_extnum_t		lastx;		/* last extent pointer */
+@@@ -434,9 -423,10 +448,16 @@@
+  		else
+  			out->bmv_block = xfs_fsb_to_db(ip, startblock);
+  		fileblock = XFS_BB_TO_FSB(ip->i_mount, out->bmv_offset);
+++<<<<<<< HEAD
+ +		ifp = XFS_IFORK_PTR(ip, XFS_DATA_FORK);
+ +		if (xfs_iext_bno_to_ext(ifp, fileblock, &lastx) &&
+ +		   (lastx == xfs_iext_count(ifp) - 1))
+++=======
++ 		ifp = XFS_IFORK_PTR(ip, whichfork);
++ 		if (!moretocome &&
++ 		    xfs_iext_bno_to_ext(ifp, fileblock, &lastx) &&
++ 		   (lastx == (ifp->if_bytes / (uint)sizeof(xfs_bmbt_rec_t))-1))
+++>>>>>>> f86f403794b1 (xfs: teach get_bmapx about shared extents and the CoW fork)
+  			out->bmv_oflags |= BMV_OF_LAST;
+  	}
+  
+@@@ -496,14 -577,18 +608,26 @@@ xfs_getbmap
+  
+  		prealloced = 0;
+  		fixlen = 1LL << 32;
+++<<<<<<< HEAD
+ +	} else {
+ +		/* Local format data forks report no extents. */
+ +		if (ip->i_d.di_format == XFS_DINODE_FMT_LOCAL) {
+ +			bmv->bmv_entries = 0;
+ +			return 0;
+ +		}
+++=======
++ 		break;
++ 	case XFS_COW_FORK:
++ 		if (ip->i_cformat != XFS_DINODE_FMT_EXTENTS)
++ 			return -EINVAL;
++ 
++ 		prealloced = 0;
++ 		fixlen = XFS_ISIZE(ip);
++ 		break;
++ 	default:
+++>>>>>>> f86f403794b1 (xfs: teach get_bmapx about shared extents and the CoW fork)
+  		if (ip->i_d.di_format != XFS_DINODE_FMT_EXTENTS &&
+ -		    ip->i_d.di_format != XFS_DINODE_FMT_BTREE &&
+ -		    ip->i_d.di_format != XFS_DINODE_FMT_LOCAL)
+ +		    ip->i_d.di_format != XFS_DINODE_FMT_BTREE)
+  			return -EINVAL;
+  
+  		if (xfs_get_extsz_hint(ip) ||
+diff --git a/fs/xfs/libxfs/xfs_fs.h b/fs/xfs/libxfs/xfs_fs.h
+index e9ab20e375da..047e47c71e06 100644
+--- a/fs/xfs/libxfs/xfs_fs.h
++++ b/fs/xfs/libxfs/xfs_fs.h
+@@ -115,14 +115,16 @@ struct getbmapx {
+ #define BMV_IF_PREALLOC		0x4	/* rtn status BMV_OF_PREALLOC if req */
+ #define BMV_IF_DELALLOC		0x8	/* rtn status BMV_OF_DELALLOC if req */
+ #define BMV_IF_NO_HOLES		0x10	/* Do not return holes */
++#define BMV_IF_COWFORK		0x20	/* return CoW fork rather than data */
+ #define BMV_IF_VALID	\
+ 	(BMV_IF_ATTRFORK|BMV_IF_NO_DMAPI_READ|BMV_IF_PREALLOC|	\
+-	 BMV_IF_DELALLOC|BMV_IF_NO_HOLES)
++	 BMV_IF_DELALLOC|BMV_IF_NO_HOLES|BMV_IF_COWFORK)
+ 
+ /*	bmv_oflags values - returned for each non-header segment */
+ #define BMV_OF_PREALLOC		0x1	/* segment = unwritten pre-allocation */
+ #define BMV_OF_DELALLOC		0x2	/* segment = delayed allocation */
+ #define BMV_OF_LAST		0x4	/* segment is the last in the file */
++#define BMV_OF_SHARED		0x8	/* segment shared with another file */
+ 
+ /*
+  * Structure for XFS_IOC_FSSETDM.
+* Unmerged path fs/xfs/xfs_bmap_util.c
