@@ -1,0 +1,607 @@
+ntb: Adding split BAR support for Haswell platforms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] Adding split BAR support for Haswell platforms (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 94.85%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit ab760a0c5667519b375ea9c5ab3a23501c4817ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ab760a0c.failed
+
+On the Haswell platform, a split BAR option to allow creation of 2
+32bit BARs (4 and 5) from the 64bit BAR 4. Adding support for this
+new option.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit ab760a0c5667519b375ea9c5ab3a23501c4817ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_hw.c
+#	drivers/ntb/ntb_hw.h
+#	drivers/ntb/ntb_regs.h
+diff --cc drivers/ntb/ntb_hw.c
+index b250e730a323,cd29b1038c5e..000000000000
+--- a/drivers/ntb/ntb_hw.c
++++ b/drivers/ntb/ntb_hw.c
+@@@ -84,8 -82,10 +84,15 @@@ enum 
+  
+  static struct dentry *debugfs_dir;
+  
+++<<<<<<< HEAD
+ +/* Translate memory window 0,1 to BAR 2,4 */
+ +#define MW_TO_BAR(mw)	(mw * NTB_MAX_NUM_MW + 2)
+++=======
++ #define BWD_LINK_RECOVERY_TIME	500
++ 
++ /* Translate memory window 0,1,2 to BAR 2,4,5 */
++ #define MW_TO_BAR(mw)	(mw == 0 ? 2 : (mw == 1 ? 4 : 5))
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  
+  static const struct pci_device_id ntb_pci_tbl[] = {
+  	{PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_NTB_B2B_BWD)},
+@@@ -557,23 -728,236 +570,250 @@@ static void bwd_link_poll(struct work_s
+  
+  static int ntb_xeon_setup(struct ntb_device *ndev)
+  {
+ -	switch (ndev->conn_type) {
+ +	int rc;
+ +	u8 val;
+ +
+ +	ndev->hw_type = SNB_HW;
+ +
+ +	rc = pci_read_config_byte(ndev->pdev, NTB_PPD_OFFSET, &val);
+ +	if (rc)
+ +		return rc;
+ +
+ +	switch (val & SNB_PPD_CONN_TYPE) {
+  	case NTB_CONN_B2B:
+++<<<<<<< HEAD
+ +		ndev->conn_type = NTB_CONN_B2B;
+++=======
++ 		ndev->reg_ofs.ldb = ndev->reg_base + SNB_PDOORBELL_OFFSET;
++ 		ndev->reg_ofs.ldb_mask = ndev->reg_base + SNB_PDBMSK_OFFSET;
++ 		ndev->reg_ofs.spad_read = ndev->reg_base + SNB_SPAD_OFFSET;
++ 		ndev->reg_ofs.bar2_xlat = ndev->reg_base + SNB_SBAR2XLAT_OFFSET;
++ 		ndev->reg_ofs.bar4_xlat = ndev->reg_base + SNB_SBAR4XLAT_OFFSET;
++ 		if (ndev->split_bar)
++ 			ndev->reg_ofs.bar5_xlat =
++ 				ndev->reg_base + SNB_SBAR5XLAT_OFFSET;
++ 		ndev->limits.max_spads = SNB_MAX_B2B_SPADS;
++ 
++ 		/* There is a Xeon hardware errata related to writes to
++ 		 * SDOORBELL or B2BDOORBELL in conjunction with inbound access
++ 		 * to NTB MMIO Space, which may hang the system.  To workaround
++ 		 * this use the second memory window to access the interrupt and
++ 		 * scratch pad registers on the remote system.
++ 		 */
++ 		if (ndev->wa_flags & WA_SNB_ERR) {
++ 			if (!ndev->mw[ndev->limits.max_mw - 1].bar_sz)
++ 				return -EINVAL;
++ 
++ 			ndev->limits.max_db_bits = SNB_MAX_DB_BITS;
++ 			ndev->reg_ofs.spad_write =
++ 				ndev->mw[ndev->limits.max_mw - 1].vbase +
++ 				SNB_SPAD_OFFSET;
++ 			ndev->reg_ofs.rdb =
++ 				ndev->mw[ndev->limits.max_mw - 1].vbase +
++ 				SNB_PDOORBELL_OFFSET;
++ 
++ 			/* Set the Limit register to 4k, the minimum size, to
++ 			 * prevent an illegal access
++ 			 */
++ 			writeq(ndev->mw[1].bar_sz + 0x1000, ndev->reg_base +
++ 			       SNB_PBAR4LMT_OFFSET);
++ 			/* HW errata on the Limit registers.  They can only be
++ 			 * written when the base register is 4GB aligned and
++ 			 * < 32bit.  This should already be the case based on
++ 			 * the driver defaults, but write the Limit registers
++ 			 * first just in case.
++ 			 */
++ 
++ 			ndev->limits.max_mw = SNB_ERRATA_MAX_MW;
++ 		} else {
++ 			/* HW Errata on bit 14 of b2bdoorbell register.  Writes
++ 			 * will not be mirrored to the remote system.  Shrink
++ 			 * the number of bits by one, since bit 14 is the last
++ 			 * bit.
++ 			 */
++ 			ndev->limits.max_db_bits = SNB_MAX_DB_BITS - 1;
++ 			ndev->reg_ofs.spad_write = ndev->reg_base +
++ 						   SNB_B2B_SPAD_OFFSET;
++ 			ndev->reg_ofs.rdb = ndev->reg_base +
++ 					    SNB_B2B_DOORBELL_OFFSET;
++ 
++ 			/* Disable the Limit register, just incase it is set to
++ 			 * something silly. A 64bit write should handle it
++ 			 * regardless of whether it has a split BAR or not.
++ 			 */
++ 			writeq(0, ndev->reg_base + SNB_PBAR4LMT_OFFSET);
++ 			/* HW errata on the Limit registers.  They can only be
++ 			 * written when the base register is 4GB aligned and
++ 			 * < 32bit.  This should already be the case based on
++ 			 * the driver defaults, but write the Limit registers
++ 			 * first just in case.
++ 			 */
++ 			if (ndev->split_bar)
++ 				ndev->limits.max_mw = HSX_SPLITBAR_MAX_MW;
++ 			else
++ 				ndev->limits.max_mw = SNB_MAX_MW;
++ 		}
++ 
++ 		/* The Xeon errata workaround requires setting SBAR Base
++ 		 * addresses to known values, so that the PBAR XLAT can be
++ 		 * pointed at SBAR0 of the remote system.
++ 		 */
++ 		if (ndev->dev_type == NTB_DEV_USD) {
++ 			writeq(SNB_MBAR23_DSD_ADDR, ndev->reg_base +
++ 			       SNB_PBAR2XLAT_OFFSET);
++ 			if (ndev->wa_flags & WA_SNB_ERR)
++ 				writeq(SNB_MBAR01_DSD_ADDR, ndev->reg_base +
++ 				       SNB_PBAR4XLAT_OFFSET);
++ 			else {
++ 				if (ndev->split_bar) {
++ 					writel(SNB_MBAR4_DSD_ADDR,
++ 					       ndev->reg_base +
++ 					       SNB_PBAR4XLAT_OFFSET);
++ 					writel(SNB_MBAR5_DSD_ADDR,
++ 					       ndev->reg_base +
++ 					       SNB_PBAR5XLAT_OFFSET);
++ 				} else
++ 					writeq(SNB_MBAR4_DSD_ADDR,
++ 					       ndev->reg_base +
++ 					       SNB_PBAR4XLAT_OFFSET);
++ 
++ 				/* B2B_XLAT_OFFSET is a 64bit register, but can
++ 				 * only take 32bit writes
++ 				 */
++ 				writel(SNB_MBAR01_DSD_ADDR & 0xffffffff,
++ 				       ndev->reg_base + SNB_B2B_XLAT_OFFSETL);
++ 				writel(SNB_MBAR01_DSD_ADDR >> 32,
++ 				       ndev->reg_base + SNB_B2B_XLAT_OFFSETU);
++ 			}
++ 
++ 			writeq(SNB_MBAR01_USD_ADDR, ndev->reg_base +
++ 			       SNB_SBAR0BASE_OFFSET);
++ 			writeq(SNB_MBAR23_USD_ADDR, ndev->reg_base +
++ 			       SNB_SBAR2BASE_OFFSET);
++ 			if (ndev->split_bar) {
++ 				writel(SNB_MBAR4_USD_ADDR, ndev->reg_base +
++ 				       SNB_SBAR4BASE_OFFSET);
++ 				writel(SNB_MBAR5_USD_ADDR, ndev->reg_base +
++ 				       SNB_SBAR5BASE_OFFSET);
++ 			} else
++ 				writeq(SNB_MBAR4_USD_ADDR, ndev->reg_base +
++ 				       SNB_SBAR4BASE_OFFSET);
++ 		} else {
++ 			writeq(SNB_MBAR23_USD_ADDR, ndev->reg_base +
++ 			       SNB_PBAR2XLAT_OFFSET);
++ 			if (ndev->wa_flags & WA_SNB_ERR)
++ 				writeq(SNB_MBAR01_USD_ADDR, ndev->reg_base +
++ 				       SNB_PBAR4XLAT_OFFSET);
++ 			else {
++ 				if (ndev->split_bar) {
++ 					writel(SNB_MBAR4_USD_ADDR,
++ 					       ndev->reg_base +
++ 					       SNB_PBAR4XLAT_OFFSET);
++ 					writel(SNB_MBAR5_USD_ADDR,
++ 					       ndev->reg_base +
++ 					       SNB_PBAR5XLAT_OFFSET);
++ 				} else
++ 					writeq(SNB_MBAR4_USD_ADDR,
++ 					       ndev->reg_base +
++ 					       SNB_PBAR4XLAT_OFFSET);
++ 
++ 				/*
++ 				 * B2B_XLAT_OFFSET is a 64bit register, but can
++ 				 * only take 32bit writes
++ 				 */
++ 				writel(SNB_MBAR01_USD_ADDR & 0xffffffff,
++ 				       ndev->reg_base + SNB_B2B_XLAT_OFFSETL);
++ 				writel(SNB_MBAR01_USD_ADDR >> 32,
++ 				       ndev->reg_base + SNB_B2B_XLAT_OFFSETU);
++ 			}
++ 			writeq(SNB_MBAR01_DSD_ADDR, ndev->reg_base +
++ 			       SNB_SBAR0BASE_OFFSET);
++ 			writeq(SNB_MBAR23_DSD_ADDR, ndev->reg_base +
++ 			       SNB_SBAR2BASE_OFFSET);
++ 			if (ndev->split_bar) {
++ 				writel(SNB_MBAR4_DSD_ADDR, ndev->reg_base +
++ 				       SNB_SBAR4BASE_OFFSET);
++ 				writel(SNB_MBAR5_DSD_ADDR, ndev->reg_base +
++ 				       SNB_SBAR5BASE_OFFSET);
++ 			} else
++ 				writeq(SNB_MBAR4_DSD_ADDR, ndev->reg_base +
++ 				       SNB_SBAR4BASE_OFFSET);
++ 
++ 		}
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  		break;
+ +	case NTB_CONN_CLASSIC:
+  	case NTB_CONN_RP:
+++<<<<<<< HEAD
+++=======
++ 		if (ndev->wa_flags & WA_SNB_ERR) {
++ 			dev_err(&ndev->pdev->dev,
++ 				"NTB-RP disabled due to hardware errata.\n");
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* Scratch pads need to have exclusive access from the primary
++ 		 * or secondary side.  Halve the num spads so that each side can
++ 		 * have an equal amount.
++ 		 */
++ 		ndev->limits.max_spads = SNB_MAX_COMPAT_SPADS / 2;
++ 		ndev->limits.max_db_bits = SNB_MAX_DB_BITS;
++ 		/* Note: The SDOORBELL is the cause of the errata.  You REALLY
++ 		 * don't want to touch it.
++ 		 */
++ 		ndev->reg_ofs.rdb = ndev->reg_base + SNB_SDOORBELL_OFFSET;
++ 		ndev->reg_ofs.ldb = ndev->reg_base + SNB_PDOORBELL_OFFSET;
++ 		ndev->reg_ofs.ldb_mask = ndev->reg_base + SNB_PDBMSK_OFFSET;
++ 		/* Offset the start of the spads to correspond to whether it is
++ 		 * primary or secondary
++ 		 */
++ 		ndev->reg_ofs.spad_write = ndev->reg_base + SNB_SPAD_OFFSET +
++ 					   ndev->limits.max_spads * 4;
++ 		ndev->reg_ofs.spad_read = ndev->reg_base + SNB_SPAD_OFFSET;
++ 		ndev->reg_ofs.bar2_xlat = ndev->reg_base + SNB_SBAR2XLAT_OFFSET;
++ 		ndev->reg_ofs.bar4_xlat = ndev->reg_base + SNB_SBAR4XLAT_OFFSET;
++ 		if (ndev->split_bar) {
++ 			ndev->reg_ofs.bar5_xlat =
++ 				ndev->reg_base + SNB_SBAR5XLAT_OFFSET;
++ 			ndev->limits.max_mw = HSX_SPLITBAR_MAX_MW;
++ 		} else
++ 			ndev->limits.max_mw = SNB_MAX_MW;
++ 		break;
++ 	case NTB_CONN_TRANSPARENT:
++ 		if (ndev->wa_flags & WA_SNB_ERR) {
++ 			dev_err(&ndev->pdev->dev,
++ 				"NTB-TRANSPARENT disabled due to hardware errata.\n");
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* Scratch pads need to have exclusive access from the primary
++ 		 * or secondary side.  Halve the num spads so that each side can
++ 		 * have an equal amount.
++ 		 */
++ 		ndev->limits.max_spads = SNB_MAX_COMPAT_SPADS / 2;
++ 		ndev->limits.max_db_bits = SNB_MAX_DB_BITS;
++ 		ndev->reg_ofs.rdb = ndev->reg_base + SNB_PDOORBELL_OFFSET;
++ 		ndev->reg_ofs.ldb = ndev->reg_base + SNB_SDOORBELL_OFFSET;
++ 		ndev->reg_ofs.ldb_mask = ndev->reg_base + SNB_SDBMSK_OFFSET;
++ 		ndev->reg_ofs.spad_write = ndev->reg_base + SNB_SPAD_OFFSET;
++ 		/* Offset the start of the spads to correspond to whether it is
++ 		 * primary or secondary
++ 		 */
++ 		ndev->reg_ofs.spad_read = ndev->reg_base + SNB_SPAD_OFFSET +
++ 					  ndev->limits.max_spads * 4;
++ 		ndev->reg_ofs.bar2_xlat = ndev->reg_base + SNB_PBAR2XLAT_OFFSET;
++ 		ndev->reg_ofs.bar4_xlat = ndev->reg_base + SNB_PBAR4XLAT_OFFSET;
++ 
++ 		if (ndev->split_bar) {
++ 			ndev->reg_ofs.bar5_xlat =
++ 				ndev->reg_base + SNB_PBAR5XLAT_OFFSET;
++ 			ndev->limits.max_mw = HSX_SPLITBAR_MAX_MW;
++ 		} else
++ 			ndev->limits.max_mw = SNB_MAX_MW;
++ 		break;
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  	default:
+ -		/*
+ -		 * we should never hit this. the detect function should've
+ -		 * take cared of everything.
+ -		 */
+ +		dev_err(&ndev->pdev->dev, "Only B2B supported at this time\n");
+  		return -EINVAL;
+  	}
+  
+@@@ -1167,6 -1547,160 +1407,163 @@@ static void ntb_free_debugfs(struct ntb
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ntb_hw_link_up(struct ntb_device *ndev)
++ {
++ 	if (ndev->conn_type == NTB_CONN_TRANSPARENT)
++ 		ntb_link_event(ndev, NTB_LINK_UP);
++ 	else {
++ 		u32 ntb_cntl;
++ 
++ 		/* Let's bring the NTB link up */
++ 		ntb_cntl = readl(ndev->reg_ofs.lnk_cntl);
++ 		ntb_cntl &= ~(NTB_CNTL_LINK_DISABLE | NTB_CNTL_CFG_LOCK);
++ 		ntb_cntl |= NTB_CNTL_P2S_BAR23_SNOOP | NTB_CNTL_S2P_BAR23_SNOOP;
++ 		ntb_cntl |= NTB_CNTL_P2S_BAR4_SNOOP | NTB_CNTL_S2P_BAR4_SNOOP;
++ 		if (ndev->split_bar)
++ 			ntb_cntl |= NTB_CNTL_P2S_BAR5_SNOOP |
++ 				    NTB_CNTL_S2P_BAR5_SNOOP;
++ 
++ 		writel(ntb_cntl, ndev->reg_ofs.lnk_cntl);
++ 	}
++ }
++ 
++ static void ntb_hw_link_down(struct ntb_device *ndev)
++ {
++ 	u32 ntb_cntl;
++ 
++ 	if (ndev->conn_type == NTB_CONN_TRANSPARENT) {
++ 		ntb_link_event(ndev, NTB_LINK_DOWN);
++ 		return;
++ 	}
++ 
++ 	/* Bring NTB link down */
++ 	ntb_cntl = readl(ndev->reg_ofs.lnk_cntl);
++ 	ntb_cntl &= ~(NTB_CNTL_P2S_BAR23_SNOOP | NTB_CNTL_S2P_BAR23_SNOOP);
++ 	ntb_cntl &= ~(NTB_CNTL_P2S_BAR4_SNOOP | NTB_CNTL_S2P_BAR4_SNOOP);
++ 	if (ndev->split_bar)
++ 		ntb_cntl &= ~(NTB_CNTL_P2S_BAR5_SNOOP |
++ 			      NTB_CNTL_S2P_BAR5_SNOOP);
++ 	ntb_cntl |= NTB_CNTL_LINK_DISABLE | NTB_CNTL_CFG_LOCK;
++ 	writel(ntb_cntl, ndev->reg_ofs.lnk_cntl);
++ }
++ 
++ static void ntb_max_mw_detect(struct ntb_device *ndev)
++ {
++ 	if (ndev->split_bar)
++ 		ndev->limits.max_mw = HSX_SPLITBAR_MAX_MW;
++ 	else
++ 		ndev->limits.max_mw = SNB_MAX_MW;
++ }
++ 
++ static int ntb_xeon_detect(struct ntb_device *ndev)
++ {
++ 	int rc, bars_mask;
++ 	u32 bars;
++ 	u8 ppd;
++ 
++ 	ndev->hw_type = SNB_HW;
++ 
++ 	rc = pci_read_config_byte(ndev->pdev, NTB_PPD_OFFSET, &ppd);
++ 	if (rc)
++ 		return -EIO;
++ 
++ 	if (ppd & SNB_PPD_DEV_TYPE)
++ 		ndev->dev_type = NTB_DEV_USD;
++ 	else
++ 		ndev->dev_type = NTB_DEV_DSD;
++ 
++ 	ndev->split_bar = (ppd & SNB_PPD_SPLIT_BAR) ? 1 : 0;
++ 
++ 	switch (ppd & SNB_PPD_CONN_TYPE) {
++ 	case NTB_CONN_B2B:
++ 		dev_info(&ndev->pdev->dev, "Conn Type = B2B\n");
++ 		ndev->conn_type = NTB_CONN_B2B;
++ 		break;
++ 	case NTB_CONN_RP:
++ 		dev_info(&ndev->pdev->dev, "Conn Type = RP\n");
++ 		ndev->conn_type = NTB_CONN_RP;
++ 		break;
++ 	case NTB_CONN_TRANSPARENT:
++ 		dev_info(&ndev->pdev->dev, "Conn Type = TRANSPARENT\n");
++ 		ndev->conn_type = NTB_CONN_TRANSPARENT;
++ 		/*
++ 		 * This mode is default to USD/DSP. HW does not report
++ 		 * properly in transparent mode as it has no knowledge of
++ 		 * NTB. We will just force correct here.
++ 		 */
++ 		ndev->dev_type = NTB_DEV_USD;
++ 
++ 		/*
++ 		 * This is a way for transparent BAR to figure out if we
++ 		 * are doing split BAR or not. There is no way for the hw
++ 		 * on the transparent side to know and set the PPD.
++ 		 */
++ 		bars_mask = pci_select_bars(ndev->pdev, IORESOURCE_MEM);
++ 		bars = hweight32(bars_mask);
++ 		if (bars == (HSX_SPLITBAR_MAX_MW + 1))
++ 			ndev->split_bar = 1;
++ 
++ 		break;
++ 	default:
++ 		dev_err(&ndev->pdev->dev, "Unknown PPD %x\n", ppd);
++ 		return -ENODEV;
++ 	}
++ 
++ 	ntb_max_mw_detect(ndev);
++ 
++ 	return 0;
++ }
++ 
++ static int ntb_atom_detect(struct ntb_device *ndev)
++ {
++ 	int rc;
++ 	u32 ppd;
++ 
++ 	ndev->hw_type = BWD_HW;
++ 
++ 	rc = pci_read_config_dword(ndev->pdev, NTB_PPD_OFFSET, &ppd);
++ 	if (rc)
++ 		return rc;
++ 
++ 	switch ((ppd & BWD_PPD_CONN_TYPE) >> 8) {
++ 	case NTB_CONN_B2B:
++ 		dev_info(&ndev->pdev->dev, "Conn Type = B2B\n");
++ 		ndev->conn_type = NTB_CONN_B2B;
++ 		break;
++ 	case NTB_CONN_RP:
++ 	default:
++ 		dev_err(&ndev->pdev->dev, "Unsupported NTB configuration\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ppd & BWD_PPD_DEV_TYPE)
++ 		ndev->dev_type = NTB_DEV_DSD;
++ 	else
++ 		ndev->dev_type = NTB_DEV_USD;
++ 
++ 	return 0;
++ }
++ 
++ static int ntb_device_detect(struct ntb_device *ndev)
++ {
++ 	int rc;
++ 
++ 	if (is_ntb_xeon(ndev))
++ 		rc = ntb_xeon_detect(ndev);
++ 	else if (is_ntb_atom(ndev))
++ 		rc = ntb_atom_detect(ndev);
++ 	else
++ 		rc = -ENODEV;
++ 
++ 	dev_info(&ndev->pdev->dev, "Device Type = %s\n",
++ 		 ndev->dev_type == NTB_DEV_USD ? "USD/DSP" : "DSD/USP");
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  static int ntb_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	struct ntb_device *ndev;
+@@@ -1187,9 -1724,26 +1584,31 @@@
+  
+  	pci_set_master(ndev->pdev);
+  
+++<<<<<<< HEAD
+ +	rc = pci_request_selected_regions(pdev, NTB_BAR_MASK, KBUILD_MODNAME);
+ +	if (rc)
+++=======
++ 	rc = ntb_device_detect(ndev);
++ 	if (rc)
++ 		goto err;
++ 
++ 	ndev->mw = kcalloc(ndev->limits.max_mw, sizeof(struct ntb_mw),
++ 			   GFP_KERNEL);
++ 	if (!ndev->mw) {
++ 		rc = -ENOMEM;
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  		goto err1;
++ 	}
++ 
++ 	if (ndev->split_bar)
++ 		rc = pci_request_selected_regions(pdev, NTB_SPLITBAR_MASK,
++ 						  KBUILD_MODNAME);
++ 	else
++ 		rc = pci_request_selected_regions(pdev, NTB_BAR_MASK,
++ 						  KBUILD_MODNAME);
++ 
++ 	if (rc)
++ 		goto err2;
+  
+  	ndev->reg_base = pci_ioremap_bar(pdev, NTB_BAR_MMIO);
+  	if (!ndev->reg_base) {
+@@@ -1253,11 -1822,9 +1687,11 @@@
+  
+  	rc = ntb_transport_init(pdev);
+  	if (rc)
+- 		goto err6;
++ 		goto err7;
+  
+ -	ntb_hw_link_up(ndev);
+ +	/* Let's bring the NTB link up */
+ +	writel(NTB_CNTL_BAR23_SNOOP | NTB_CNTL_BAR45_SNOOP,
+ +	       ndev->reg_ofs.lnk_cntl);
+  
+  	return 0;
+  
+diff --cc drivers/ntb/ntb_hw.h
+index 32fde1724b87,96de5fc95f90..000000000000
+--- a/drivers/ntb/ntb_hw.h
++++ b/drivers/ntb/ntb_hw.h
+@@@ -137,7 -147,11 +140,12 @@@ struct ntb_device 
+  	unsigned char num_msix;
+  	unsigned char bits_per_vector;
+  	unsigned char max_cbs;
+ -	unsigned char link_width;
+ -	unsigned char link_speed;
+  	unsigned char link_status;
+++<<<<<<< HEAD
+++=======
++ 	unsigned char split_bar;
++ 
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  	struct delayed_work hb_timer;
+  	unsigned long last_ts;
+  
+diff --cc drivers/ntb/ntb_regs.h
+index 7d846ec07c2e,f028ff81fd77..000000000000
+--- a/drivers/ntb/ntb_regs.h
++++ b/drivers/ntb/ntb_regs.h
+@@@ -57,7 -55,9 +57,8 @@@
+  #define SNB_MAX_COMPAT_SPADS	16
+  /* Reserve the uppermost bit for link interrupt */
+  #define SNB_MAX_DB_BITS		15
+ -#define SNB_LINK_DB		15
+  #define SNB_DB_BITS_PER_VEC	5
++ #define HSX_SPLITBAR_MAX_MW	3
+  #define SNB_MAX_MW		2
+  #define SNB_ERRATA_MAX_MW	1
+  
+@@@ -69,18 -73,20 +70,23 @@@
+  
+  #define SNB_PBAR2LMT_OFFSET	0x0000
+  #define SNB_PBAR4LMT_OFFSET	0x0008
++ #define SNB_PBAR5LMT_OFFSET	0x000C
+  #define SNB_PBAR2XLAT_OFFSET	0x0010
+  #define SNB_PBAR4XLAT_OFFSET	0x0018
++ #define SNB_PBAR5XLAT_OFFSET	0x001C
+  #define SNB_SBAR2LMT_OFFSET	0x0020
+  #define SNB_SBAR4LMT_OFFSET	0x0028
++ #define SNB_SBAR5LMT_OFFSET	0x002C
+  #define SNB_SBAR2XLAT_OFFSET	0x0030
+  #define SNB_SBAR4XLAT_OFFSET	0x0038
++ #define SNB_SBAR5XLAT_OFFSET	0x003C
+  #define SNB_SBAR0BASE_OFFSET	0x0040
+ +#define SNB_SBAR0BASE_OFFSET	0x0040
+ +#define SNB_SBAR2BASE_OFFSET	0x0048
+ +#define SNB_SBAR4BASE_OFFSET	0x0050
+  #define SNB_SBAR2BASE_OFFSET	0x0048
+  #define SNB_SBAR4BASE_OFFSET	0x0050
++ #define SNB_SBAR5BASE_OFFSET	0x0054
+  #define SNB_NTBCNTL_OFFSET	0x0058
+  #define SNB_SBDF_OFFSET		0x005C
+  #define SNB_PDOORBELL_OFFSET	0x0060
+@@@ -131,9 -144,29 +143,35 @@@
+  #define BWD_B2B_SPADSEMA_OFFSET	0x80c0
+  #define BWD_B2B_STKYSPAD_OFFSET	0x80c4
+  
+++<<<<<<< HEAD
+ +#define NTB_CNTL_BAR23_SNOOP	(1 << 2)
+ +#define NTB_CNTL_BAR45_SNOOP	(1 << 6)
+ +#define BWD_CNTL_LINK_DOWN	(1 << 16)
+++=======
++ #define BWD_MODPHY_PCSREG4	0x1c004
++ #define BWD_MODPHY_PCSREG6	0x1c006
++ 
++ #define BWD_IP_BASE		0xC000
++ #define BWD_DESKEWSTS_OFFSET	(BWD_IP_BASE + 0x3024)
++ #define BWD_LTSSMERRSTS0_OFFSET (BWD_IP_BASE + 0x3180)
++ #define BWD_LTSSMSTATEJMP_OFFSET	(BWD_IP_BASE + 0x3040)
++ #define BWD_IBSTERRRCRVSTS0_OFFSET	(BWD_IP_BASE + 0x3324)
++ 
++ #define BWD_DESKEWSTS_DBERR	(1 << 15)
++ #define BWD_LTSSMERRSTS0_UNEXPECTEDEI	(1 << 20)
++ #define BWD_LTSSMSTATEJMP_FORCEDETECT	(1 << 2)
++ #define BWD_IBIST_ERR_OFLOW	0x7FFF7FFF
++ 
++ #define NTB_CNTL_CFG_LOCK		(1 << 0)
++ #define NTB_CNTL_LINK_DISABLE		(1 << 1)
++ #define NTB_CNTL_S2P_BAR23_SNOOP	(1 << 2)
++ #define NTB_CNTL_P2S_BAR23_SNOOP	(1 << 4)
++ #define NTB_CNTL_S2P_BAR4_SNOOP	(1 << 6)
++ #define NTB_CNTL_P2S_BAR4_SNOOP	(1 << 8)
++ #define NTB_CNTL_S2P_BAR5_SNOOP	(1 << 12)
++ #define NTB_CNTL_P2S_BAR5_SNOOP	(1 << 14)
++ #define BWD_CNTL_LINK_DOWN		(1 << 16)
+++>>>>>>> ab760a0c5667 (ntb: Adding split BAR support for Haswell platforms)
+  
+  #define NTB_PPD_OFFSET		0x00D4
+  #define SNB_PPD_CONN_TYPE	0x0003
+* Unmerged path drivers/ntb/ntb_hw.c
+* Unmerged path drivers/ntb/ntb_hw.h
+* Unmerged path drivers/ntb/ntb_regs.h
