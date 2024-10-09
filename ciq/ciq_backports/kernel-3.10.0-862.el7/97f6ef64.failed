@@ -1,0 +1,294 @@
+nvme-pci: remap BAR0 to cover admin CQ doorbell for large stride
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Xu Yu <yu.a.xu@intel.com>
+commit 97f6ef6464dbd235a4d9bdfc05d949aab24fc927
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/97f6ef64.failed
+
+The existing driver initially maps 8192 bytes of BAR0 which is
+intended to cover doorbells of admin SQ and CQ. However, if a
+large stride, e.g. 10, is used, the doorbell of admin CQ will
+be out of 8192 bytes. Consequently, a page fault will be raised
+when the admin CQ doorbell is accessed in nvme_configure_admin_queue().
+
+This patch fixes this issue by remapping BAR0 before accessing
+admin CQ doorbell if the initial mapping is not enough.
+
+	Signed-off-by: Xu Yu <yu.a.xu@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 97f6ef6464dbd235a4d9bdfc05d949aab24fc927)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index f136fc3284bb,5278ed9811a6..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -1304,9 -1554,160 +1335,166 @@@ static inline void nvme_release_cmb(str
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static size_t db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
+ +{
+ +	return 4096 + ((nr_io_queues + 1) * 8 * dev->db_stride);
+++=======
++ static int nvme_set_host_mem(struct nvme_dev *dev, u32 bits)
++ {
++ 	size_t len = dev->nr_host_mem_descs * sizeof(*dev->host_mem_descs);
++ 	struct nvme_command c;
++ 	u64 dma_addr;
++ 	int ret;
++ 
++ 	dma_addr = dma_map_single(dev->dev, dev->host_mem_descs, len,
++ 			DMA_TO_DEVICE);
++ 	if (dma_mapping_error(dev->dev, dma_addr))
++ 		return -ENOMEM;
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.features.opcode	= nvme_admin_set_features;
++ 	c.features.fid		= cpu_to_le32(NVME_FEAT_HOST_MEM_BUF);
++ 	c.features.dword11	= cpu_to_le32(bits);
++ 	c.features.dword12	= cpu_to_le32(dev->host_mem_size >>
++ 					      ilog2(dev->ctrl.page_size));
++ 	c.features.dword13	= cpu_to_le32(lower_32_bits(dma_addr));
++ 	c.features.dword14	= cpu_to_le32(upper_32_bits(dma_addr));
++ 	c.features.dword15	= cpu_to_le32(dev->nr_host_mem_descs);
++ 
++ 	ret = nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
++ 	if (ret) {
++ 		dev_warn(dev->ctrl.device,
++ 			 "failed to set host mem (err %d, flags %#x).\n",
++ 			 ret, bits);
++ 	}
++ 	dma_unmap_single(dev->dev, dma_addr, len, DMA_TO_DEVICE);
++ 	return ret;
++ }
++ 
++ static void nvme_free_host_mem(struct nvme_dev *dev)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < dev->nr_host_mem_descs; i++) {
++ 		struct nvme_host_mem_buf_desc *desc = &dev->host_mem_descs[i];
++ 		size_t size = le32_to_cpu(desc->size) * dev->ctrl.page_size;
++ 
++ 		dma_free_coherent(dev->dev, size, dev->host_mem_desc_bufs[i],
++ 				le64_to_cpu(desc->addr));
++ 	}
++ 
++ 	kfree(dev->host_mem_desc_bufs);
++ 	dev->host_mem_desc_bufs = NULL;
++ 	kfree(dev->host_mem_descs);
++ 	dev->host_mem_descs = NULL;
++ }
++ 
++ static int nvme_alloc_host_mem(struct nvme_dev *dev, u64 min, u64 preferred)
++ {
++ 	struct nvme_host_mem_buf_desc *descs;
++ 	u32 chunk_size, max_entries, i = 0;
++ 	void **bufs;
++ 	u64 size, tmp;
++ 
++ 	/* start big and work our way down */
++ 	chunk_size = min(preferred, (u64)PAGE_SIZE << MAX_ORDER);
++ retry:
++ 	tmp = (preferred + chunk_size - 1);
++ 	do_div(tmp, chunk_size);
++ 	max_entries = tmp;
++ 	descs = kcalloc(max_entries, sizeof(*descs), GFP_KERNEL);
++ 	if (!descs)
++ 		goto out;
++ 
++ 	bufs = kcalloc(max_entries, sizeof(*bufs), GFP_KERNEL);
++ 	if (!bufs)
++ 		goto out_free_descs;
++ 
++ 	for (size = 0; size < preferred; size += chunk_size) {
++ 		u32 len = min_t(u64, chunk_size, preferred - size);
++ 		dma_addr_t dma_addr;
++ 
++ 		bufs[i] = dma_alloc_attrs(dev->dev, len, &dma_addr, GFP_KERNEL,
++ 				DMA_ATTR_NO_KERNEL_MAPPING | DMA_ATTR_NO_WARN);
++ 		if (!bufs[i])
++ 			break;
++ 
++ 		descs[i].addr = cpu_to_le64(dma_addr);
++ 		descs[i].size = cpu_to_le32(len / dev->ctrl.page_size);
++ 		i++;
++ 	}
++ 
++ 	if (!size || (min && size < min)) {
++ 		dev_warn(dev->ctrl.device,
++ 			"failed to allocate host memory buffer.\n");
++ 		goto out_free_bufs;
++ 	}
++ 
++ 	dev_info(dev->ctrl.device,
++ 		"allocated %lld MiB host memory buffer.\n",
++ 		size >> ilog2(SZ_1M));
++ 	dev->nr_host_mem_descs = i;
++ 	dev->host_mem_size = size;
++ 	dev->host_mem_descs = descs;
++ 	dev->host_mem_desc_bufs = bufs;
++ 	return 0;
++ 
++ out_free_bufs:
++ 	while (--i >= 0) {
++ 		size_t size = le32_to_cpu(descs[i].size) * dev->ctrl.page_size;
++ 
++ 		dma_free_coherent(dev->dev, size, bufs[i],
++ 				le64_to_cpu(descs[i].addr));
++ 	}
++ 
++ 	kfree(bufs);
++ out_free_descs:
++ 	kfree(descs);
++ out:
++ 	/* try a smaller chunk size if we failed early */
++ 	if (chunk_size >= PAGE_SIZE * 2 && (i == 0 || size < min)) {
++ 		chunk_size /= 2;
++ 		goto retry;
++ 	}
++ 	dev->host_mem_descs = NULL;
++ 	return -ENOMEM;
++ }
++ 
++ static void nvme_setup_host_mem(struct nvme_dev *dev)
++ {
++ 	u64 max = (u64)max_host_mem_size_mb * SZ_1M;
++ 	u64 preferred = (u64)dev->ctrl.hmpre * 4096;
++ 	u64 min = (u64)dev->ctrl.hmmin * 4096;
++ 	u32 enable_bits = NVME_HOST_MEM_ENABLE;
++ 
++ 	preferred = min(preferred, max);
++ 	if (min > max) {
++ 		dev_warn(dev->ctrl.device,
++ 			"min host memory (%lld MiB) above limit (%d MiB).\n",
++ 			min >> ilog2(SZ_1M), max_host_mem_size_mb);
++ 		nvme_free_host_mem(dev);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * If we already have a buffer allocated check if we can reuse it.
++ 	 */
++ 	if (dev->host_mem_descs) {
++ 		if (dev->host_mem_size >= min)
++ 			enable_bits |= NVME_HOST_MEM_RETURN;
++ 		else
++ 			nvme_free_host_mem(dev);
++ 	}
++ 
++ 	if (!dev->host_mem_descs) {
++ 		if (nvme_alloc_host_mem(dev, min, preferred))
++ 			return;
++ 	}
++ 
++ 	if (nvme_set_host_mem(dev, enable_bits))
++ 		nvme_free_host_mem(dev);
+++>>>>>>> 97f6ef6464db (nvme-pci: remap BAR0 to cover admin CQ doorbell for large stride)
+  }
+  
+  static int nvme_setup_io_queues(struct nvme_dev *dev)
+@@@ -1332,23 -1734,18 +1521,18 @@@
+  			nvme_release_cmb(dev);
+  	}
+  
+- 	size = db_bar_size(dev, nr_io_queues);
+- 	if (size > 8192) {
+- 		iounmap(dev->bar);
+- 		do {
+- 			dev->bar = ioremap(pci_resource_start(pdev, 0), size);
+- 			if (dev->bar)
+- 				break;
+- 			if (!--nr_io_queues)
+- 				return -ENOMEM;
+- 			size = db_bar_size(dev, nr_io_queues);
+- 		} while (1);
+- 		dev->dbs = dev->bar + 4096;
+- 		adminq->q_db = dev->dbs;
+- 	}
++ 	do {
++ 		size = db_bar_size(dev, nr_io_queues);
++ 		result = nvme_remap_bar(dev, size);
++ 		if (!result)
++ 			break;
++ 		if (!--nr_io_queues)
++ 			return -ENOMEM;
++ 	} while (1);
++ 	adminq->q_db = dev->dbs;
+  
+  	/* Deregister the admin queue's interrupt */
+ -	pci_free_irq(pdev, 0, adminq);
+ +	free_irq(pci_irq_vector(pdev, 0), adminq);
+  
+  	/*
+  	 * If we enable msix early due to not intx, disable it again before
+@@@ -1814,23 -2257,38 +1998,22 @@@ static const struct nvme_ctrl_ops nvme_
+  
+  static int nvme_dev_map(struct nvme_dev *dev)
+  {
+ +	int bars;
+  	struct pci_dev *pdev = to_pci_dev(dev->dev);
+  
+ -	if (pci_request_mem_regions(pdev, "nvme"))
+ +	bars = pci_select_bars(pdev, IORESOURCE_MEM);
+ +	if (!bars)
+ +		return -ENODEV;
+ +	if (pci_request_selected_regions(pdev, bars, "nvme"))
+  		return -ENODEV;
+  
+- 	dev->bar = ioremap(pci_resource_start(pdev, 0), 8192);
+- 	if (!dev->bar)
++ 	if (nvme_remap_bar(dev, NVME_REG_DBS + 4096))
+  		goto release;
+  
+ -	return 0;
+ +       return 0;
+    release:
+ -	pci_release_mem_regions(pdev);
+ -	return -ENODEV;
+ -}
+ -
+ -static unsigned long check_dell_samsung_bug(struct pci_dev *pdev)
+ -{
+ -	if (pdev->vendor == 0x144d && pdev->device == 0xa802) {
+ -		/*
+ -		 * Several Samsung devices seem to drop off the PCIe bus
+ -		 * randomly when APST is on and uses the deepest sleep state.
+ -		 * This has been observed on a Samsung "SM951 NVMe SAMSUNG
+ -		 * 256GB", a "PM951 NVMe SAMSUNG 512GB", and a "Samsung SSD
+ -		 * 950 PRO 256GB", but it seems to be restricted to two Dell
+ -		 * laptops.
+ -		 */
+ -		if (dmi_match(DMI_SYS_VENDOR, "Dell Inc.") &&
+ -		    (dmi_match(DMI_PRODUCT_NAME, "XPS 15 9550") ||
+ -		     dmi_match(DMI_PRODUCT_NAME, "Precision 5510")))
+ -			return NVME_QUIRK_NO_DEEPEST_PS;
+ -	}
+ -
+ -	return 0;
+ +       pci_release_selected_regions(pdev, bars);
+ +       return -ENODEV;
+  }
+  
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+* Unmerged path drivers/nvme/host/pci.c
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index 1f20b70e79e3..80e1594768af 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -102,6 +102,7 @@ enum {
+ 	NVME_REG_ACQ	= 0x0030,	/* Admin CQ Base Address */
+ 	NVME_REG_CMBLOC = 0x0038,	/* Controller Memory Buffer Location */
+ 	NVME_REG_CMBSZ	= 0x003c,	/* Controller Memory Buffer Size */
++	NVME_REG_DBS	= 0x1000,	/* SQ 0 Tail Doorbell */
+ };
+ 
+ #define NVME_CAP_MQES(cap)	((cap) & 0xffff)
