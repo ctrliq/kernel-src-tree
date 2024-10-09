@@ -218,7 +218,7 @@ struct sdma_req_info {
 	 * in charge of managing its own ring.
 	 */
 	__u16 comp_idx;
-} __packed;
+} __attribute__((__packed__));
 
 /*
  * SW KDETH header.
@@ -229,7 +229,7 @@ struct hfi1_kdeth_header {
 	__le16 jkey;
 	__le16 hcrc;
 	__le32 swdata[7];
-} __packed;
+}  __attribute__((__packed__));
 
 /*
  * Structure describing the headers that User space uses. The
@@ -240,7 +240,7 @@ struct hfi1_pkt_header {
 	__be16 lrh[4];
 	__be32 bth[3];
 	struct hfi1_kdeth_header kdeth;
-} __packed;
+}  __attribute__((__packed__));
 
 
 /*
