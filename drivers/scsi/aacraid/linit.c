@@ -990,6 +990,13 @@ static ssize_t aac_show_bios_version(struct device *device,
 	return len;
 }
 
+static ssize_t aac_show_driver_version(struct device *device,
+					struct device_attribute *attr,
+					char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%s\n", aac_driver_version);
+}
+
 static ssize_t aac_show_serial_number(struct device *device,
 			       struct device_attribute *attr, char *buf)
 {
@@ -1094,6 +1101,13 @@ static struct device_attribute aac_bios_version = {
 	},
 	.show = aac_show_bios_version,
 };
+static struct device_attribute aac_lld_version = {
+	.attr = {
+		.name = "driver_version",
+		.mode = 0444,
+	},
+	.show = aac_show_driver_version,
+};
 static struct device_attribute aac_serial_number = {
 	.attr = {
 		.name = "serial_number",
@@ -1131,6 +1145,7 @@ static struct device_attribute *aac_attrs[] = {
 	&aac_kernel_version,
 	&aac_monitor_version,
 	&aac_bios_version,
+	&aac_lld_version,
 	&aac_serial_number,
 	&aac_max_channel,
 	&aac_max_id,
