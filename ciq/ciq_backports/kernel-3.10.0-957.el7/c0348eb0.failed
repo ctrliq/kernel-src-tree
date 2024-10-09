@@ -1,0 +1,157 @@
+IB: Let ib_core resolve destination mac address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit c0348eb069687a2f27c0cd23dafb35918edf9e75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c0348eb0.failed
+
+Since IB/core resolves the destination mac address for user and kernel
+consumers, avoid resolving in multiple provider drivers.
+
+Only ib_core resolves DMAC now, therefore resolve_eth_dmac is removed as
+exported symbol.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c0348eb069687a2f27c0cd23dafb35918edf9e75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hns/hns_roce_ah.c
+#	drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+index a866cd918aef,dec650930ca6..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+@@@ -201,21 -201,6 +201,24 @@@ struct ib_ah *ocrdma_create_ah(struct i
+  	/* Get network header type for this GID */
+  	ah->hdr_type = ib_gid_to_network_type(sgid_attr.gid_type, &sgid);
+  
+++<<<<<<< HEAD
+ +	if ((pd->uctx) &&
+ +	    (!rdma_is_multicast_addr((struct in6_addr *)grh->dgid.raw)) &&
+ +	    (!rdma_link_local_addr((struct in6_addr *)grh->dgid.raw))) {
+ +		status = rdma_addr_find_l2_eth_by_grh(&sgid, &grh->dgid,
+ +						      attr->roce.dmac,
+ +						      &vlan_tag,
+ +						      &sgid_attr.ndev->ifindex,
+ +						      NULL);
+ +		if (status) {
+ +			pr_err("%s(): Failed to resolve dmac from gid. status = %d\n",
+ +			       __func__, status);
+ +			goto av_conf_err;
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> c0348eb06968 (IB: Let ib_core resolve destination mac address)
+  	status = set_av_attr(dev, ah, attr, &sgid, pd->id, &isvlan, vlan_tag);
+  	if (status)
+  		goto av_conf_err;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_ah.c
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 614858bb8df6..65adbf19d737 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -53,6 +53,9 @@
+ 
+ #include "core_priv.h"
+ 
++static int ib_resolve_eth_dmac(struct ib_device *device,
++			       struct rdma_ah_attr *ah_attr);
++
+ static const char * const ib_events[] = {
+ 	[IB_EVENT_CQ_ERR]		= "CQ error",
+ 	[IB_EVENT_QP_FATAL]		= "QP fatal error",
+@@ -1258,8 +1261,8 @@ int ib_modify_qp_is_ok(enum ib_qp_state cur_state, enum ib_qp_state next_state,
+ }
+ EXPORT_SYMBOL(ib_modify_qp_is_ok);
+ 
+-int ib_resolve_eth_dmac(struct ib_device *device,
+-			struct rdma_ah_attr *ah_attr)
++static int ib_resolve_eth_dmac(struct ib_device *device,
++			       struct rdma_ah_attr *ah_attr)
+ {
+ 	int           ret = 0;
+ 	struct ib_global_route *grh;
+@@ -1318,7 +1321,6 @@ int ib_resolve_eth_dmac(struct ib_device *device,
+ out:
+ 	return ret;
+ }
+-EXPORT_SYMBOL(ib_resolve_eth_dmac);
+ 
+ /**
+  * ib_modify_qp_with_udata - Modifies the attributes for the specified QP.
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 02771e02e585..00126c1df599 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -740,14 +740,6 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
+ 			ah->qplib_ah.nw_type = CMDQ_CREATE_AH_TYPE_V1;
+ 			break;
+ 		}
+-		rc = rdma_addr_find_l2_eth_by_grh(&sgid, &grh->dgid,
+-						  ah_attr->roce.dmac, &vlan_tag,
+-						  &sgid_attr.ndev->ifindex,
+-						  NULL);
+-		if (rc) {
+-			dev_err(rdev_to_dev(rdev), "Failed to get dmac\n");
+-			goto fail;
+-		}
+ 	}
+ 
+ 	memcpy(ah->qplib_ah.dmac, ah_attr->roce.dmac, ETH_ALEN);
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_ah.c
+diff --git a/drivers/infiniband/hw/mlx4/ah.c b/drivers/infiniband/hw/mlx4/ah.c
+index 538c46a73248..6dee4fdc5d67 100644
+--- a/drivers/infiniband/hw/mlx4/ah.c
++++ b/drivers/infiniband/hw/mlx4/ah.c
+@@ -92,12 +92,10 @@ static struct ib_ah *create_iboe_ah(struct ib_pd *pd,
+ 	int ret;
+ 
+ 	memcpy(&in6, grh->dgid.raw, sizeof(in6));
+-	if (rdma_is_multicast_addr(&in6)) {
++	if (rdma_is_multicast_addr(&in6))
+ 		is_mcast = 1;
+-		rdma_get_mcast_mac(&in6, ah->av.eth.mac);
+-	} else {
+-		memcpy(ah->av.eth.mac, ah_attr->roce.dmac, ETH_ALEN);
+-	}
++
++	memcpy(ah->av.eth.mac, ah_attr->roce.dmac, ETH_ALEN);
+ 	ret = ib_get_cached_gid(pd->device, rdma_ah_get_port_num(ah_attr),
+ 				grh->sgid_index, &sgid, &gid_attr);
+ 	if (ret)
+diff --git a/drivers/infiniband/hw/mlx5/ah.c b/drivers/infiniband/hw/mlx5/ah.c
+index 3363e29157f6..fe269f680103 100644
+--- a/drivers/infiniband/hw/mlx5/ah.c
++++ b/drivers/infiniband/hw/mlx5/ah.c
+@@ -89,10 +89,6 @@ struct ib_ah *mlx5_ib_create_ah(struct ib_pd *pd, struct rdma_ah_attr *ah_attr,
+ 
+ 		resp.response_length = min_resp_len;
+ 
+-		err = ib_resolve_eth_dmac(pd->device, ah_attr);
+-		if (err)
+-			return ERR_PTR(err);
+-
+ 		memcpy(resp.dmac, ah_attr->roce.dmac, ETH_ALEN);
+ 		err = ib_copy_to_udata(udata, &resp, resp.response_length);
+ 		if (err)
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 9209093db1fc..661d0a4787ed 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -3690,8 +3690,6 @@ void ib_drain_rq(struct ib_qp *qp);
+ void ib_drain_sq(struct ib_qp *qp);
+ void ib_drain_qp(struct ib_qp *qp);
+ 
+-int ib_resolve_eth_dmac(struct ib_device *device,
+-			struct rdma_ah_attr *ah_attr);
+ int ib_get_eth_speed(struct ib_device *dev, u8 port_num, u8 *speed, u8 *width);
+ 
+ static inline u8 *rdma_ah_retrieve_dmac(struct rdma_ah_attr *attr)
