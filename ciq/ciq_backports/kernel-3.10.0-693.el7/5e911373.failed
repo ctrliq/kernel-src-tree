@@ -1,0 +1,320 @@
+mm/hugetlb: add cache of descriptors to resv_map for region_add
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hugetlb: add cache of descriptors to resv_map for region_add (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 97.56%
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 5e9113731a3ce616e8b5aa128ffc1aeaa4942571
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5e911373.failed
+
+hugetlbfs is used today by applications that want a high degree of
+control over huge page usage.  Often, large hugetlbfs files are used to
+map a large number huge pages into the application processes.  The
+applications know when page ranges within these large files will no
+longer be used, and ideally would like to release them back to the
+subpool or global pools for other uses.  The fallocate() system call
+provides an interface for preallocation and hole punching within files.
+This patch set adds fallocate functionality to hugetlbfs.
+
+fallocate hole punch will want to remove a specific range of pages.
+When pages are removed, their associated entries in the region/reserve
+map will also be removed.  This will break an assumption in the
+region_chg/region_add calling sequence.  If a new region descriptor must
+be allocated, it is done as part of the region_chg processing.  In this
+way, region_add can not fail because it does not need to attempt an
+allocation.
+
+To prepare for fallocate hole punch, create a "cache" of descriptors
+that can be used by region_add if necessary.  region_chg will ensure
+there are sufficient entries in the cache.  It will be necessary to
+track the number of in progress add operations to know a sufficient
+number of descriptors reside in the cache.  A new routine region_abort
+is added to adjust this in progress count when add operations are
+aborted.  vma_abort_reservation is also added for callers creating
+reservations with vma_needs_reservation/vma_commit_reservation.
+
+[akpm@linux-foundation.org: fix typo in comment, use more cols]
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5e9113731a3ce616e8b5aa128ffc1aeaa4942571)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 567cd0ffc031,4e5815ed7a8e..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -182,11 -240,17 +182,25 @@@ struct file_region 
+  
+  /*
+   * Add the huge page range represented by [f, t) to the reserve
+++<<<<<<< HEAD
+ + * map.  Existing regions will be expanded to accommodate the
+ + * specified range.  We know only existing regions need to be
+ + * expanded, because region_add is only called after region_chg
+ + * with the same range.  If a new file_region structure must
+ + * be allocated, it is done in region_chg.
+++=======
++  * map.  In the normal case, existing regions will be expanded
++  * to accommodate the specified range.  Sufficient regions should
++  * exist for expansion due to the previous call to region_chg
++  * with the same range.  However, it is possible that region_del
++  * could have been called after region_chg and modifed the map
++  * in such a way that no region exists to be expanded.  In this
++  * case, pull a region descriptor from the cache associated with
++  * the map and use that for the new range.
++  *
++  * Return the number of new huge pages added to the map.  This
++  * number is greater than or equal to zero.
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+   */
+  static long region_add(struct resv_map *resv, long f, long t)
+  {
+@@@ -221,10 -313,17 +257,16 @@@
+  			kfree(rg);
+  		}
+  	}
+ -
+ -	add += (nrg->from - f);		/* Added to beginning of region */
+  	nrg->from = f;
+ -	add += t - nrg->to;		/* Added to end of region */
+  	nrg->to = t;
+++<<<<<<< HEAD
+++=======
++ 
++ out_locked:
++ 	resv->adds_in_progress--;
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+  	spin_unlock(&resv->lock);
+ -	VM_BUG_ON(add < 0);
+ -	return add;
+ +	return 0;
+  }
+  
+  /*
+@@@ -1505,61 -1570,80 +1617,136 @@@ static void return_unused_surplus_pages
+  	}
+  }
+  
++ 
+  /*
+++<<<<<<< HEAD
+ + * Determine if the huge page at addr within the vma has an associated
+ + * reservation.  Where it does not we will need to logically increase
+ + * reservation and actually increase subpool usage before an allocation
+ + * can occur.  Where any new reservation would be required the
+ + * reservation change is prepared, but not committed.  Once the page
+ + * has been allocated from the subpool and instantiated the change should
+ + * be committed via vma_commit_reservation.  No action is required on
+ + * failure.
+ + */
+ +static long vma_needs_reservation(struct hstate *h,
+ +			struct vm_area_struct *vma, unsigned long addr)
+ +{
+ +	struct address_space *mapping = vma->vm_file->f_mapping;
+ +	struct inode *inode = mapping->host;
+++=======
++  * vma_needs_reservation, vma_commit_reservation and vma_abort_reservation
++  * are used by the huge page allocation routines to manage reservations.
++  *
++  * vma_needs_reservation is called to determine if the huge page at addr
++  * within the vma has an associated reservation.  If a reservation is
++  * needed, the value 1 is returned.  The caller is then responsible for
++  * managing the global reservation and subpool usage counts.  After
++  * the huge page has been allocated, vma_commit_reservation is called
++  * to add the page to the reservation map.  If the reservation must be
++  * aborted instead of committed, vma_abort_reservation is called.
++  *
++  * In the normal case, vma_commit_reservation returns the same value
++  * as the preceding vma_needs_reservation call.  The only time this
++  * is not the case is if a reserve map was changed between calls.  It
++  * is the responsibility of the caller to notice the difference and
++  * take appropriate action.
++  */
++ enum vma_resv_mode {
++ 	VMA_NEEDS_RESV,
++ 	VMA_COMMIT_RESV,
++ 	VMA_ABORT_RESV,
++ };
++ static long __vma_reservation_common(struct hstate *h,
++ 				struct vm_area_struct *vma, unsigned long addr,
++ 				enum vma_resv_mode mode)
++ {
++ 	struct resv_map *resv;
++ 	pgoff_t idx;
++ 	long ret;
++ 
++ 	resv = vma_resv_map(vma);
++ 	if (!resv)
++ 		return 1;
++ 
++ 	idx = vma_hugecache_offset(h, vma, addr);
++ 	switch (mode) {
++ 	case VMA_NEEDS_RESV:
++ 		ret = region_chg(resv, idx, idx + 1);
++ 		break;
++ 	case VMA_COMMIT_RESV:
++ 		ret = region_add(resv, idx, idx + 1);
++ 		break;
++ 	case VMA_ABORT_RESV:
++ 		region_abort(resv, idx, idx + 1);
++ 		ret = 0;
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	if (vma->vm_flags & VM_MAYSHARE)
++ 		return ret;
++ 	else
++ 		return ret < 0 ? ret : 0;
++ }
++ 
++ static long vma_needs_reservation(struct hstate *h,
++ 			struct vm_area_struct *vma, unsigned long addr)
++ {
++ 	return __vma_reservation_common(h, vma, addr, VMA_NEEDS_RESV);
++ }
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+ +
+ +	if (vma->vm_flags & VM_MAYSHARE) {
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *resv = inode->i_mapping->private_data;
+ +
+ +		return region_chg(resv, idx, idx + 1);
+ +
+ +	} else if (!is_vma_resv_set(vma, HPAGE_RESV_OWNER)) {
+ +		return 1;
+ +
+ +	} else  {
+ +		long err;
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *reservations = vma_resv_map(vma);
+  
+ -static long vma_commit_reservation(struct hstate *h,
+ +		err = region_chg(reservations, idx, idx + 1);
+ +		if (err < 0)
+ +			return err;
+ +		return 0;
+ +	}
+ +}
+ +static void vma_commit_reservation(struct hstate *h,
+  			struct vm_area_struct *vma, unsigned long addr)
+  {
+++<<<<<<< HEAD
+ +	struct address_space *mapping = vma->vm_file->f_mapping;
+ +	struct inode *inode = mapping->host;
+ +
+ +	if (vma->vm_flags & VM_MAYSHARE) {
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *resv = inode->i_mapping->private_data;
+ +
+ +		region_add(resv, idx, idx + 1);
+ +
+ +	} else if (is_vma_resv_set(vma, HPAGE_RESV_OWNER)) {
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *reservations = vma_resv_map(vma);
+ +
+ +		/* Mark this page used in the map. */
+ +		region_add(reservations, idx, idx + 1);
+ +	}
+++=======
++ 	return __vma_reservation_common(h, vma, addr, VMA_COMMIT_RESV);
++ }
++ 
++ static void vma_abort_reservation(struct hstate *h,
++ 			struct vm_area_struct *vma, unsigned long addr)
++ {
++ 	(void)__vma_reservation_common(h, vma, addr, VMA_ABORT_RESV);
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+  }
+  
+  static struct page *alloc_huge_page(struct vm_area_struct *vma,
+@@@ -1585,15 -1669,15 +1772,21 @@@
+  	if (chg < 0)
+  		return ERR_PTR(-ENOMEM);
+  	if (chg || avoid_reserve)
+++<<<<<<< HEAD
+ +		if (hugepage_subpool_get_pages(spool, 1))
+++=======
++ 		if (hugepage_subpool_get_pages(spool, 1) < 0) {
++ 			vma_abort_reservation(h, vma, addr);
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+  			return ERR_PTR(-ENOSPC);
++ 		}
+  
+  	ret = hugetlb_cgroup_charge_cgroup(idx, pages_per_huge_page(h), &h_cg);
+ -	if (ret)
+ -		goto out_subpool_put;
+ -
+ +	if (ret) {
+ +		if (chg || avoid_reserve)
+ +			hugepage_subpool_put_pages(spool, 1);
+ +		return ERR_PTR(-ENOSPC);
+ +	}
+  	spin_lock(&hugetlb_lock);
+  	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, chg);
+  	if (!page) {
+@@@ -1637,6 -1712,14 +1830,17 @@@
+  		hugetlb_acct_memory(h, -rsv_adjust);
+  	}
+  	return page;
+++<<<<<<< HEAD
+++=======
++ 
++ out_uncharge_cgroup:
++ 	hugetlb_cgroup_uncharge_cgroup(idx, pages_per_huge_page(h), h_cg);
++ out_subpool_put:
++ 	if (chg || avoid_reserve)
++ 		hugepage_subpool_put_pages(spool, 1);
++ 	vma_abort_reservation(h, vma, addr);
++ 	return ERR_PTR(-ENOSPC);
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+  }
+  
+  /*
+@@@ -3778,8 -3854,10 +3987,15 @@@ int hugetlb_reserve_pages(struct inode 
+  	}
+  	return 0;
+  out_err:
+++<<<<<<< HEAD
+ +	if (vma)
+ +		resv_map_put(vma);
+++=======
++ 	if (!vma || vma->vm_flags & VM_MAYSHARE)
++ 		region_abort(resv_map, from, to);
++ 	if (vma && is_vma_resv_set(vma, HPAGE_RESV_OWNER))
++ 		kref_put(&resv_map->refs, resv_map_release);
+++>>>>>>> 5e9113731a3c (mm/hugetlb: add cache of descriptors to resv_map for region_add)
+  	return ret;
+  }
+  
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index b9a4511c29ea..7170a209e45a 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -36,6 +36,9 @@ struct resv_map {
+ 	struct kref refs;
+ 	spinlock_t lock;
+ 	struct list_head regions;
++	long adds_in_progress;
++	struct list_head region_cache;
++	long region_cache_count;
+ };
+ extern struct resv_map *resv_map_alloc(void);
+ void resv_map_release(struct kref *ref);
+* Unmerged path mm/hugetlb.c
