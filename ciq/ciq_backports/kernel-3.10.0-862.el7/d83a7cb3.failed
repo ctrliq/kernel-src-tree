@@ -1,0 +1,1125 @@
+livepatch: change to a per-task consistency model
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit d83a7cb375eec21f04c83542395d08b2f6641da2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d83a7cb3.failed
+
+Change livepatch to use a basic per-task consistency model.  This is the
+foundation which will eventually enable us to patch those ~10% of
+security patches which change function or data semantics.  This is the
+biggest remaining piece needed to make livepatch more generally useful.
+
+This code stems from the design proposal made by Vojtech [1] in November
+2014.  It's a hybrid of kGraft and kpatch: it uses kGraft's per-task
+consistency and syscall barrier switching combined with kpatch's stack
+trace switching.  There are also a number of fallback options which make
+it quite flexible.
+
+Patches are applied on a per-task basis, when the task is deemed safe to
+switch over.  When a patch is enabled, livepatch enters into a
+transition state where tasks are converging to the patched state.
+Usually this transition state can complete in a few seconds.  The same
+sequence occurs when a patch is disabled, except the tasks converge from
+the patched state to the unpatched state.
+
+An interrupt handler inherits the patched state of the task it
+interrupts.  The same is true for forked tasks: the child inherits the
+patched state of the parent.
+
+Livepatch uses several complementary approaches to determine when it's
+safe to patch tasks:
+
+1. The first and most effective approach is stack checking of sleeping
+   tasks.  If no affected functions are on the stack of a given task,
+   the task is patched.  In most cases this will patch most or all of
+   the tasks on the first try.  Otherwise it'll keep trying
+   periodically.  This option is only available if the architecture has
+   reliable stacks (HAVE_RELIABLE_STACKTRACE).
+
+2. The second approach, if needed, is kernel exit switching.  A
+   task is switched when it returns to user space from a system call, a
+   user space IRQ, or a signal.  It's useful in the following cases:
+
+   a) Patching I/O-bound user tasks which are sleeping on an affected
+      function.  In this case you have to send SIGSTOP and SIGCONT to
+      force it to exit the kernel and be patched.
+   b) Patching CPU-bound user tasks.  If the task is highly CPU-bound
+      then it will get patched the next time it gets interrupted by an
+      IRQ.
+   c) In the future it could be useful for applying patches for
+      architectures which don't yet have HAVE_RELIABLE_STACKTRACE.  In
+      this case you would have to signal most of the tasks on the
+      system.  However this isn't supported yet because there's
+      currently no way to patch kthreads without
+      HAVE_RELIABLE_STACKTRACE.
+
+3. For idle "swapper" tasks, since they don't ever exit the kernel, they
+   instead have a klp_update_patch_state() call in the idle loop which
+   allows them to be patched before the CPU enters the idle state.
+
+   (Note there's not yet such an approach for kthreads.)
+
+All the above approaches may be skipped by setting the 'immediate' flag
+in the 'klp_patch' struct, which will disable per-task consistency and
+patch all tasks immediately.  This can be useful if the patch doesn't
+change any function or data semantics.  Note that, even with this flag
+set, it's possible that some tasks may still be running with an old
+version of the function, until that function returns.
+
+There's also an 'immediate' flag in the 'klp_func' struct which allows
+you to specify that certain functions in the patch can be applied
+without per-task consistency.  This might be useful if you want to patch
+a common function like schedule(), and the function change doesn't need
+consistency but the rest of the patch does.
+
+For architectures which don't have HAVE_RELIABLE_STACKTRACE, the user
+must set patch->immediate which causes all tasks to be patched
+immediately.  This option should be used with care, only when the patch
+doesn't change any function or data semantics.
+
+In the future, architectures which don't have HAVE_RELIABLE_STACKTRACE
+may be allowed to use per-task consistency if we can come up with
+another way to patch kthreads.
+
+The /sys/kernel/livepatch/<patch>/transition file shows whether a patch
+is in transition.  Only a single patch (the topmost patch on the stack)
+can be in transition at a given time.  A patch can remain in transition
+indefinitely, if any of the tasks are stuck in the initial patch state.
+
+A transition can be reversed and effectively canceled by writing the
+opposite value to the /sys/kernel/livepatch/<patch>/enabled file while
+the transition is in progress.  Then all the tasks will attempt to
+converge back to the original patch state.
+
+[1] https://lkml.kernel.org/r/20141107140458.GA21774@suse.cz
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Miroslav Benes <mbenes@suse.cz>
+	Acked-by: Ingo Molnar <mingo@kernel.org>        # for the scheduler changes
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit d83a7cb375eec21f04c83542395d08b2f6641da2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/ABI/testing/sysfs-kernel-livepatch
+#	Documentation/livepatch/livepatch.txt
+#	include/linux/init_task.h
+#	include/linux/livepatch.h
+#	include/linux/sched.h
+#	kernel/fork.c
+#	kernel/livepatch/Makefile
+#	kernel/livepatch/core.c
+#	kernel/livepatch/patch.c
+#	kernel/livepatch/patch.h
+#	kernel/sched/idle.c
+#	samples/livepatch/livepatch-sample.c
+diff --cc include/linux/init_task.h
+index a05294bda8c3,5a791055b176..000000000000
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@@ -12,8 -12,13 +12,15 @@@
+  #include <linux/securebits.h>
+  #include <linux/seqlock.h>
+  #include <linux/rbtree.h>
+ -#include <linux/sched/autogroup.h>
+  #include <net/net_namespace.h>
+  #include <linux/sched/rt.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/livepatch.h>
++ #include <linux/mm_types.h>
++ 
++ #include <asm/thread_info.h>
+++>>>>>>> d83a7cb375ee (livepatch: change to a per-task consistency model)
+  
+  #ifdef CONFIG_SMP
+  # define INIT_PUSHABLE_TASKS(tsk)					\
+@@@ -173,6 -187,37 +180,40 @@@ extern struct task_group root_task_grou
+  # define INIT_RT_MUTEXES(tsk)
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NUMA_BALANCING
++ # define INIT_NUMA_BALANCING(tsk)					\
++ 	.numa_preferred_nid = -1,					\
++ 	.numa_group = NULL,						\
++ 	.numa_faults = NULL,
++ #else
++ # define INIT_NUMA_BALANCING(tsk)
++ #endif
++ 
++ #ifdef CONFIG_KASAN
++ # define INIT_KASAN(tsk)						\
++ 	.kasan_depth = 1,
++ #else
++ # define INIT_KASAN(tsk)
++ #endif
++ 
++ #ifdef CONFIG_LIVEPATCH
++ # define INIT_LIVEPATCH(tsk)						\
++ 	.patch_state = KLP_UNDEFINED,
++ #else
++ # define INIT_LIVEPATCH(tsk)
++ #endif
++ 
++ #ifdef CONFIG_THREAD_INFO_IN_TASK
++ # define INIT_TASK_TI(tsk)			\
++ 	.thread_info = INIT_THREAD_INFO(tsk),	\
++ 	.stack_refcount = ATOMIC_INIT(1),
++ #else
++ # define INIT_TASK_TI(tsk)
++ #endif
++ 
+++>>>>>>> d83a7cb375ee (livepatch: change to a per-task consistency model)
+  /*
+   *  INIT_TASK is used to set up the first task table, touch at
+   * your own risk!. Base=0, limit=0x1fffff (=2MB)
+@@@ -240,10 -289,14 +281,16 @@@
+  	INIT_FTRACE_GRAPH						\
+  	INIT_TRACE_RECURSION						\
+  	INIT_TASK_RCU_PREEMPT(tsk)					\
+ -	INIT_TASK_RCU_TASKS(tsk)					\
+ -	INIT_CPUSET_SEQ(tsk)						\
+ -	INIT_RT_MUTEXES(tsk)						\
+ +	INIT_CPUSET_SEQ							\
+ +	INIT_RT_MUTEXES(tsk)					\
+  	INIT_PREV_CPUTIME(tsk)						\
+  	INIT_VTIME(tsk)							\
+++<<<<<<< HEAD
+++=======
++ 	INIT_NUMA_BALANCING(tsk)					\
++ 	INIT_KASAN(tsk)							\
++ 	INIT_LIVEPATCH(tsk)						\
+++>>>>>>> d83a7cb375ee (livepatch: change to a per-task consistency model)
+  }
+  
+  
+diff --cc include/linux/sched.h
+index 17d2f0bc1bf5,e11032010318..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1665,186 -917,141 +1665,208 @@@ struct task_struct 
+  
+  	/*
+  	 * numa_faults_locality tracks if faults recorded during the last
+ -	 * scan window were remote/local or failed to migrate. The task scan
+ -	 * period is adapted based on the locality of the faults with different
+ -	 * weights depending on whether they were shared or private faults
+ +	 * scan window were remote/local. The task scan period is adapted
+ +	 * based on the locality of the faults with different weights
+ +	 * depending on whether they were shared or private faults
+  	 */
+ -	unsigned long			numa_faults_locality[3];
+ +	unsigned long numa_faults_locality[2];
+  
+ -	unsigned long			numa_pages_migrated;
+ +	unsigned long numa_pages_migrated;
+  #endif /* CONFIG_NUMA_BALANCING */
+  
+ -	struct tlbflush_unmap_batch	tlb_ubc;
+ -
+ -	struct rcu_head			rcu;
+ +	struct rcu_head rcu;
+  
+ -	/* Cache last used pipe for splice(): */
+ -	struct pipe_inode_info		*splice_pipe;
+ +	/*
+ +	 * cache last used pipe for splice
+ +	 */
+ +	struct pipe_inode_info *splice_pipe;
+  
+ -	struct page_frag		task_frag;
+ +	struct page_frag task_frag;
+  
+ -#ifdef CONFIG_TASK_DELAY_ACCT
+ -	struct task_delay_info		*delays;
+ +#ifdef	CONFIG_TASK_DELAY_ACCT
+ +	struct task_delay_info *delays;
+  #endif
+ -
+  #ifdef CONFIG_FAULT_INJECTION
+ -	int				make_it_fail;
+ +	int make_it_fail;
+  #endif
+  	/*
+ -	 * When (nr_dirtied >= nr_dirtied_pause), it's time to call
+ -	 * balance_dirty_pages() for a dirty throttling pause:
+ +	 * when (nr_dirtied >= nr_dirtied_pause), it's time to call
+ +	 * balance_dirty_pages() for some dirty throttling pause
+  	 */
+ -	int				nr_dirtied;
+ -	int				nr_dirtied_pause;
+ -	/* Start of a write-and-pause period: */
+ -	unsigned long			dirty_paused_when;
+ +	int nr_dirtied;
+ +	int nr_dirtied_pause;
+ +	unsigned long dirty_paused_when; /* start of a write-and-pause period */
+  
+  #ifdef CONFIG_LATENCYTOP
+ -	int				latency_record_count;
+ -	struct latency_record		latency_record[LT_SAVECOUNT];
+ +	int latency_record_count;
+ +	struct latency_record latency_record[LT_SAVECOUNT];
+  #endif
+  	/*
+ -	 * Time slack values; these are used to round up poll() and
+ +	 * time slack values; these are used to round up poll() and
+  	 * select() etc timeout values. These are in nanoseconds.
+  	 */
+ -	u64				timer_slack_ns;
+ -	u64				default_timer_slack_ns;
+ -
+ -#ifdef CONFIG_KASAN
+ -	unsigned int			kasan_depth;
+ -#endif
+ -
+ -#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ -	/* Index of current stored address in ret_stack: */
+ -	int				curr_ret_stack;
+ -
+ -	/* Stack of return addresses for return function tracing: */
+ -	struct ftrace_ret_stack		*ret_stack;
+ -
+ -	/* Timestamp for last schedule: */
+ -	unsigned long long		ftrace_timestamp;
+ -
+ +	unsigned long timer_slack_ns;
+ +	unsigned long default_timer_slack_ns;
+ +
+ +#if defined(CONFIG_FUNCTION_GRAPH_TRACER) && !defined(CONFIG_S390)
+ +	/* Index of current stored address in ret_stack */
+ +	int curr_ret_stack;
+ +	/* Stack of return addresses for return function tracing */
+ +	struct ftrace_ret_stack	*ret_stack;
+ +	/* time stamp for last schedule */
+ +	unsigned long long ftrace_timestamp;
+  	/*
+  	 * Number of functions that haven't been traced
+ -	 * because of depth overrun:
+ +	 * because of depth overrun.
+  	 */
+ -	atomic_t			trace_overrun;
+ -
+ -	/* Pause tracing: */
+ -	atomic_t			tracing_graph_pause;
+ +	atomic_t trace_overrun;
+ +	/* Pause for the tracing */
+ +	atomic_t tracing_graph_pause;
+  #endif
+ -
+  #ifdef CONFIG_TRACING
+ -	/* State flags for use by tracers: */
+ -	unsigned long			trace;
+ -
+ -	/* Bitmask and counter of trace recursion: */
+ -	unsigned long			trace_recursion;
+ +	/* state flags for use by tracers */
+ +	unsigned long trace;
+ +	/* bitmask and counter of trace recursion */
+ +	unsigned long trace_recursion;
+  #endif /* CONFIG_TRACING */
+ -
+ -#ifdef CONFIG_KCOV
+ -	/* Coverage collection mode enabled for this task (0 if disabled): */
+ -	enum kcov_mode			kcov_mode;
+ -
+ -	/* Size of the kcov_area: */
+ -	unsigned int			kcov_size;
+ -
+ -	/* Buffer for coverage collection: */
+ -	void				*kcov_area;
+ -
+ -	/* KCOV descriptor wired with this task or NULL: */
+ -	struct kcov			*kcov;
+ +#ifdef CONFIG_MEMCG /* memcg uses this to do batch job */
+ +	struct memcg_batch_info {
+ +		int do_batch;	/* incremented when batch uncharge started */
+ +		struct mem_cgroup *memcg; /* target memcg of uncharge */
+ +		unsigned long nr_pages;	/* uncharged usage */
+ +		unsigned long memsw_nr_pages; /* uncharged mem+swap usage */
+ +	} memcg_batch;
+ +	unsigned int memcg_kmem_skip_account;
+  #endif
+ -
+ -#ifdef CONFIG_MEMCG
+ -	struct mem_cgroup		*memcg_in_oom;
+ -	gfp_t				memcg_oom_gfp_mask;
+ -	int				memcg_oom_order;
+ -
+ -	/* Number of pages to reclaim on returning to userland: */
+ -	unsigned int			memcg_nr_pages_over_high;
+ +#ifdef CONFIG_HAVE_HW_BREAKPOINT
+ +	atomic_t ptrace_bp_refcnt;
+  #endif
+ -
+ -#ifdef CONFIG_UPROBES
+ -	struct uprobe_task		*utask;
+ +#if !defined(CONFIG_S390) && defined(CONFIG_UPROBES)
+ +	struct uprobe_task *utask;
+  #endif
+  #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
+ -	unsigned int			sequential_io;
+ -	unsigned int			sequential_io_avg;
+ +	unsigned int	sequential_io;
+ +	unsigned int	sequential_io_avg;
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
++ 	unsigned long			task_state_change;
++ #endif
++ 	int				pagefault_disabled;
++ #ifdef CONFIG_MMU
++ 	struct task_struct		*oom_reaper_list;
++ #endif
++ #ifdef CONFIG_VMAP_STACK
++ 	struct vm_struct		*stack_vm_area;
++ #endif
++ #ifdef CONFIG_THREAD_INFO_IN_TASK
++ 	/* A live task holds one reference: */
++ 	atomic_t			stack_refcount;
++ #endif
++ #ifdef CONFIG_LIVEPATCH
++ 	int patch_state;
++ #endif
++ 	/* CPU-specific state of this task: */
++ 	struct thread_struct		thread;
+++>>>>>>> d83a7cb375ee (livepatch: change to a per-task consistency model)
+  
+ +	/* reserved for Red Hat */
+ +#ifdef CONFIG_DETECT_HUNG_TASK
+ +	RH_KABI_USE(1, unsigned long last_switch_count)
+ +#else
+ +	RH_KABI_RESERVE(1)
+ +#endif
+ +	RH_KABI_USE(2, unsigned long atomic_flags)
+ +#if defined(CONFIG_S390) && defined(CONFIG_UPROBES)
+ +	RH_KABI_USE(3, struct uprobe_task *utask)
+ +#else
+ +	RH_KABI_RESERVE(3)
+ +#endif
+ +	/* This would be in rss_stat[MM_SHMEMPAGES] if not for kABI */
+ +	RH_KABI_USE(4, int mm_shmempages)
+ +#ifdef CONFIG_INTEL_RDT_A
+ +	RH_KABI_USE(5, int closid)
+ +#else
+ +	RH_KABI_RESERVE(5)
+ +#endif
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+ +#ifndef __GENKSYMS__
+ +#ifdef CONFIG_MEMCG
+ +	struct memcg_oom_info {
+ +		struct mem_cgroup *memcg;
+ +		gfp_t gfp_mask;
+ +		int order;
+ +		unsigned int may_oom:1;
+ +	} memcg_oom;
+ +#endif
+ +#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+ +	struct tlbflush_unmap_batch tlb_ubc;
+ +#endif
+ +#if defined(CONFIG_FUNCTION_GRAPH_TRACER) && defined(CONFIG_S390)
+ +	/* Index of current stored address in ret_stack */
+ +	int curr_ret_stack;
+ +	/* Stack of return addresses for return function tracing */
+ +	struct ftrace_ret_stack	*ret_stack;
+ +	/* time stamp for last schedule */
+ +	unsigned long long ftrace_timestamp;
+  	/*
+ -	 * WARNING: on x86, 'thread_struct' contains a variable-sized
+ -	 * structure.  It *MUST* be at the end of 'task_struct'.
+ -	 *
+ -	 * Do not put anything below here!
+ +	 * Number of functions that haven't been traced
+ +	 * because of depth overrun.
+  	 */
+ +	atomic_t trace_overrun;
+ +	/* Pause for the tracing */
+ +	atomic_t tracing_graph_pause;
+ +#endif
+ +	struct sched_dl_entity dl;
+ +	#ifdef CONFIG_SMP
+ +		struct rb_node pushable_dl_tasks;
+ +	#endif
+ +	struct sched_statistics statistics;
+ +	struct wake_q_node wake_q;
+ +	struct prev_cputime prev_cputime;
+ +#endif /* __GENKSYMS__ */
+  };
+  
+ +/* Future-safe accessor for struct task_struct's cpus_allowed. */
+ +#define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+ +
+ +#define TNF_MIGRATED	0x01
+ +#define TNF_NO_GROUP	0x02
+ +#define TNF_SHARED	0x04
+ +#define TNF_FAULT_LOCAL	0x08
+ +
+ +#ifdef CONFIG_NUMA_BALANCING
+ +extern void task_numa_fault(int last_node, int node, int pages, int flags);
+ +extern pid_t task_numa_group_id(struct task_struct *p);
+ +extern void set_numabalancing_state(bool enabled);
+ +extern void task_numa_free(struct task_struct *p);
+ +extern bool should_numa_migrate_memory(struct task_struct *p, struct page *page,
+ +					int src_nid, int dst_cpu);
+ +#else
+ +static inline void task_numa_fault(int last_node, int node, int pages,
+ +				   int flags)
+ +{
+ +}
+ +static inline pid_t task_numa_group_id(struct task_struct *p)
+ +{
+ +	return 0;
+ +}
+ +static inline void set_numabalancing_state(bool enabled)
+ +{
+ +}
+ +static inline void task_numa_free(struct task_struct *p)
+ +{
+ +}
+ +static inline bool should_numa_migrate_memory(struct task_struct *p,
+ +				struct page *page, int src_nid, int dst_cpu)
+ +{
+ +	return true;
+ +}
+ +#endif
+ +
+  static inline struct pid *task_pid(struct task_struct *task)
+  {
+  	return task->pids[PIDTYPE_PID].pid;
+diff --cc kernel/fork.c
+index d1ed92efc038,942cbcd07c18..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -72,11 -84,10 +72,17 @@@
+  #include <linux/signalfd.h>
+  #include <linux/uprobes.h>
+  #include <linux/aio.h>
+ +#include <linux/hmm.h>
+  #include <linux/compiler.h>
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +#include <linux/user_namespace.h>
+ +#endif
+++=======
++ #include <linux/sysctl.h>
++ #include <linux/kcov.h>
++ #include <linux/livepatch.h>
+++>>>>>>> d83a7cb375ee (livepatch: change to a per-task consistency model)
+  
+  #include <asm/pgtable.h>
+  #include <asm/pgalloc.h>
+@@@ -1559,8 -1798,16 +1565,10 @@@ static struct task_struct *copy_process
+  		p->parent_exec_id = current->self_exec_id;
+  	}
+  
++ 	klp_copy_process(p);
++ 
+  	spin_lock(&current->sighand->siglock);
+  
+ -	/*
+ -	 * Copy seccomp details explicitly here, in case they were changed
+ -	 * before holding sighand lock.
+ -	 */
+ -	copy_seccomp(p);
+ -
+  	/*
+  	 * Process group and session signals need to be delivered to just the
+  	 * parent before the fork or both the parent and the child after the
+* Unmerged path Documentation/ABI/testing/sysfs-kernel-livepatch
+* Unmerged path Documentation/livepatch/livepatch.txt
+* Unmerged path include/linux/livepatch.h
+* Unmerged path kernel/livepatch/Makefile
+* Unmerged path kernel/livepatch/core.c
+* Unmerged path kernel/livepatch/patch.c
+* Unmerged path kernel/livepatch/patch.h
+* Unmerged path kernel/sched/idle.c
+* Unmerged path samples/livepatch/livepatch-sample.c
+* Unmerged path Documentation/ABI/testing/sysfs-kernel-livepatch
+* Unmerged path Documentation/livepatch/livepatch.txt
+* Unmerged path include/linux/init_task.h
+* Unmerged path include/linux/livepatch.h
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/livepatch/Makefile
+* Unmerged path kernel/livepatch/core.c
+* Unmerged path kernel/livepatch/patch.c
+* Unmerged path kernel/livepatch/patch.h
+diff --git a/kernel/livepatch/transition.c b/kernel/livepatch/transition.c
+new file mode 100644
+index 000000000000..428533ec51b5
+--- /dev/null
++++ b/kernel/livepatch/transition.c
+@@ -0,0 +1,543 @@
++/*
++ * transition.c - Kernel Live Patching transition functions
++ *
++ * Copyright (C) 2015-2016 Josh Poimboeuf <jpoimboe@redhat.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/cpu.h>
++#include <linux/stacktrace.h>
++#include "patch.h"
++#include "transition.h"
++#include "../sched/sched.h"
++
++#define MAX_STACK_ENTRIES  100
++#define STACK_ERR_BUF_SIZE 128
++
++extern struct mutex klp_mutex;
++
++struct klp_patch *klp_transition_patch;
++
++static int klp_target_state = KLP_UNDEFINED;
++
++/*
++ * This work can be performed periodically to finish patching or unpatching any
++ * "straggler" tasks which failed to transition in the first attempt.
++ */
++static void klp_transition_work_fn(struct work_struct *work)
++{
++	mutex_lock(&klp_mutex);
++
++	if (klp_transition_patch)
++		klp_try_complete_transition();
++
++	mutex_unlock(&klp_mutex);
++}
++static DECLARE_DELAYED_WORK(klp_transition_work, klp_transition_work_fn);
++
++/*
++ * The transition to the target patch state is complete.  Clean up the data
++ * structures.
++ */
++static void klp_complete_transition(void)
++{
++	struct klp_object *obj;
++	struct klp_func *func;
++	struct task_struct *g, *task;
++	unsigned int cpu;
++
++	if (klp_target_state == KLP_UNPATCHED) {
++		/*
++		 * All tasks have transitioned to KLP_UNPATCHED so we can now
++		 * remove the new functions from the func_stack.
++		 */
++		klp_unpatch_objects(klp_transition_patch);
++
++		/*
++		 * Make sure klp_ftrace_handler() can no longer see functions
++		 * from this patch on the ops->func_stack.  Otherwise, after
++		 * func->transition gets cleared, the handler may choose a
++		 * removed function.
++		 */
++		synchronize_rcu();
++	}
++
++	if (klp_transition_patch->immediate)
++		goto done;
++
++	klp_for_each_object(klp_transition_patch, obj)
++		klp_for_each_func(obj, func)
++			func->transition = false;
++
++	/* Prevent klp_ftrace_handler() from seeing KLP_UNDEFINED state */
++	if (klp_target_state == KLP_PATCHED)
++		synchronize_rcu();
++
++	read_lock(&tasklist_lock);
++	for_each_process_thread(g, task) {
++		WARN_ON_ONCE(test_tsk_thread_flag(task, TIF_PATCH_PENDING));
++		task->patch_state = KLP_UNDEFINED;
++	}
++	read_unlock(&tasklist_lock);
++
++	for_each_possible_cpu(cpu) {
++		task = idle_task(cpu);
++		WARN_ON_ONCE(test_tsk_thread_flag(task, TIF_PATCH_PENDING));
++		task->patch_state = KLP_UNDEFINED;
++	}
++
++done:
++	klp_target_state = KLP_UNDEFINED;
++	klp_transition_patch = NULL;
++}
++
++/*
++ * This is called in the error path, to cancel a transition before it has
++ * started, i.e. klp_init_transition() has been called but
++ * klp_start_transition() hasn't.  If the transition *has* been started,
++ * klp_reverse_transition() should be used instead.
++ */
++void klp_cancel_transition(void)
++{
++	klp_target_state = !klp_target_state;
++	klp_complete_transition();
++}
++
++/*
++ * Switch the patched state of the task to the set of functions in the target
++ * patch state.
++ *
++ * NOTE: If task is not 'current', the caller must ensure the task is inactive.
++ * Otherwise klp_ftrace_handler() might read the wrong 'patch_state' value.
++ */
++void klp_update_patch_state(struct task_struct *task)
++{
++	rcu_read_lock();
++
++	/*
++	 * This test_and_clear_tsk_thread_flag() call also serves as a read
++	 * barrier (smp_rmb) for two cases:
++	 *
++	 * 1) Enforce the order of the TIF_PATCH_PENDING read and the
++	 *    klp_target_state read.  The corresponding write barrier is in
++	 *    klp_init_transition().
++	 *
++	 * 2) Enforce the order of the TIF_PATCH_PENDING read and a future read
++	 *    of func->transition, if klp_ftrace_handler() is called later on
++	 *    the same CPU.  See __klp_disable_patch().
++	 */
++	if (test_and_clear_tsk_thread_flag(task, TIF_PATCH_PENDING))
++		task->patch_state = READ_ONCE(klp_target_state);
++
++	rcu_read_unlock();
++}
++
++/*
++ * Determine whether the given stack trace includes any references to a
++ * to-be-patched or to-be-unpatched function.
++ */
++static int klp_check_stack_func(struct klp_func *func,
++				struct stack_trace *trace)
++{
++	unsigned long func_addr, func_size, address;
++	struct klp_ops *ops;
++	int i;
++
++	if (func->immediate)
++		return 0;
++
++	for (i = 0; i < trace->nr_entries; i++) {
++		address = trace->entries[i];
++
++		if (klp_target_state == KLP_UNPATCHED) {
++			 /*
++			  * Check for the to-be-unpatched function
++			  * (the func itself).
++			  */
++			func_addr = (unsigned long)func->new_func;
++			func_size = func->new_size;
++		} else {
++			/*
++			 * Check for the to-be-patched function
++			 * (the previous func).
++			 */
++			ops = klp_find_ops(func->old_addr);
++
++			if (list_is_singular(&ops->func_stack)) {
++				/* original function */
++				func_addr = func->old_addr;
++				func_size = func->old_size;
++			} else {
++				/* previously patched function */
++				struct klp_func *prev;
++
++				prev = list_next_entry(func, stack_node);
++				func_addr = (unsigned long)prev->new_func;
++				func_size = prev->new_size;
++			}
++		}
++
++		if (address >= func_addr && address < func_addr + func_size)
++			return -EAGAIN;
++	}
++
++	return 0;
++}
++
++/*
++ * Determine whether it's safe to transition the task to the target patch state
++ * by looking for any to-be-patched or to-be-unpatched functions on its stack.
++ */
++static int klp_check_stack(struct task_struct *task, char *err_buf)
++{
++	static unsigned long entries[MAX_STACK_ENTRIES];
++	struct stack_trace trace;
++	struct klp_object *obj;
++	struct klp_func *func;
++	int ret;
++
++	trace.skip = 0;
++	trace.nr_entries = 0;
++	trace.max_entries = MAX_STACK_ENTRIES;
++	trace.entries = entries;
++	ret = save_stack_trace_tsk_reliable(task, &trace);
++	WARN_ON_ONCE(ret == -ENOSYS);
++	if (ret) {
++		snprintf(err_buf, STACK_ERR_BUF_SIZE,
++			 "%s: %s:%d has an unreliable stack\n",
++			 __func__, task->comm, task->pid);
++		return ret;
++	}
++
++	klp_for_each_object(klp_transition_patch, obj) {
++		if (!obj->patched)
++			continue;
++		klp_for_each_func(obj, func) {
++			ret = klp_check_stack_func(func, &trace);
++			if (ret) {
++				snprintf(err_buf, STACK_ERR_BUF_SIZE,
++					 "%s: %s:%d is sleeping on function %s\n",
++					 __func__, task->comm, task->pid,
++					 func->old_name);
++				return ret;
++			}
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Try to safely switch a task to the target patch state.  If it's currently
++ * running, or it's sleeping on a to-be-patched or to-be-unpatched function, or
++ * if the stack is unreliable, return false.
++ */
++static bool klp_try_switch_task(struct task_struct *task)
++{
++	struct rq *rq;
++	struct rq_flags flags;
++	int ret;
++	bool success = false;
++	char err_buf[STACK_ERR_BUF_SIZE];
++
++	err_buf[0] = '\0';
++
++	/* check if this task has already switched over */
++	if (task->patch_state == klp_target_state)
++		return true;
++
++	/*
++	 * For arches which don't have reliable stack traces, we have to rely
++	 * on other methods (e.g., switching tasks at kernel exit).
++	 */
++	if (!klp_have_reliable_stack())
++		return false;
++
++	/*
++	 * Now try to check the stack for any to-be-patched or to-be-unpatched
++	 * functions.  If all goes well, switch the task to the target patch
++	 * state.
++	 */
++	rq = task_rq_lock(task, &flags);
++
++	if (task_running(rq, task) && task != current) {
++		snprintf(err_buf, STACK_ERR_BUF_SIZE,
++			 "%s: %s:%d is running\n", __func__, task->comm,
++			 task->pid);
++		goto done;
++	}
++
++	ret = klp_check_stack(task, err_buf);
++	if (ret)
++		goto done;
++
++	success = true;
++
++	clear_tsk_thread_flag(task, TIF_PATCH_PENDING);
++	task->patch_state = klp_target_state;
++
++done:
++	task_rq_unlock(rq, task, &flags);
++
++	/*
++	 * Due to console deadlock issues, pr_debug() can't be used while
++	 * holding the task rq lock.  Instead we have to use a temporary buffer
++	 * and print the debug message after releasing the lock.
++	 */
++	if (err_buf[0] != '\0')
++		pr_debug("%s", err_buf);
++
++	return success;
++
++}
++
++/*
++ * Try to switch all remaining tasks to the target patch state by walking the
++ * stacks of sleeping tasks and looking for any to-be-patched or
++ * to-be-unpatched functions.  If such functions are found, the task can't be
++ * switched yet.
++ *
++ * If any tasks are still stuck in the initial patch state, schedule a retry.
++ */
++void klp_try_complete_transition(void)
++{
++	unsigned int cpu;
++	struct task_struct *g, *task;
++	bool complete = true;
++
++	WARN_ON_ONCE(klp_target_state == KLP_UNDEFINED);
++
++	/*
++	 * If the patch can be applied or reverted immediately, skip the
++	 * per-task transitions.
++	 */
++	if (klp_transition_patch->immediate)
++		goto success;
++
++	/*
++	 * Try to switch the tasks to the target patch state by walking their
++	 * stacks and looking for any to-be-patched or to-be-unpatched
++	 * functions.  If such functions are found on a stack, or if the stack
++	 * is deemed unreliable, the task can't be switched yet.
++	 *
++	 * Usually this will transition most (or all) of the tasks on a system
++	 * unless the patch includes changes to a very common function.
++	 */
++	read_lock(&tasklist_lock);
++	for_each_process_thread(g, task)
++		if (!klp_try_switch_task(task))
++			complete = false;
++	read_unlock(&tasklist_lock);
++
++	/*
++	 * Ditto for the idle "swapper" tasks.
++	 */
++	get_online_cpus();
++	for_each_possible_cpu(cpu) {
++		task = idle_task(cpu);
++		if (cpu_online(cpu)) {
++			if (!klp_try_switch_task(task))
++				complete = false;
++		} else if (task->patch_state != klp_target_state) {
++			/* offline idle tasks can be switched immediately */
++			clear_tsk_thread_flag(task, TIF_PATCH_PENDING);
++			task->patch_state = klp_target_state;
++		}
++	}
++	put_online_cpus();
++
++	if (!complete) {
++		/*
++		 * Some tasks weren't able to be switched over.  Try again
++		 * later and/or wait for other methods like kernel exit
++		 * switching.
++		 */
++		schedule_delayed_work(&klp_transition_work,
++				      round_jiffies_relative(HZ));
++		return;
++	}
++
++success:
++	pr_notice("'%s': %s complete\n", klp_transition_patch->mod->name,
++		  klp_target_state == KLP_PATCHED ? "patching" : "unpatching");
++
++	/* we're done, now cleanup the data structures */
++	klp_complete_transition();
++}
++
++/*
++ * Start the transition to the specified target patch state so tasks can begin
++ * switching to it.
++ */
++void klp_start_transition(void)
++{
++	struct task_struct *g, *task;
++	unsigned int cpu;
++
++	WARN_ON_ONCE(klp_target_state == KLP_UNDEFINED);
++
++	pr_notice("'%s': %s...\n", klp_transition_patch->mod->name,
++		  klp_target_state == KLP_PATCHED ? "patching" : "unpatching");
++
++	/*
++	 * If the patch can be applied or reverted immediately, skip the
++	 * per-task transitions.
++	 */
++	if (klp_transition_patch->immediate)
++		return;
++
++	/*
++	 * Mark all normal tasks as needing a patch state update.  They'll
++	 * switch either in klp_try_complete_transition() or as they exit the
++	 * kernel.
++	 */
++	read_lock(&tasklist_lock);
++	for_each_process_thread(g, task)
++		if (task->patch_state != klp_target_state)
++			set_tsk_thread_flag(task, TIF_PATCH_PENDING);
++	read_unlock(&tasklist_lock);
++
++	/*
++	 * Mark all idle tasks as needing a patch state update.  They'll switch
++	 * either in klp_try_complete_transition() or at the idle loop switch
++	 * point.
++	 */
++	for_each_possible_cpu(cpu) {
++		task = idle_task(cpu);
++		if (task->patch_state != klp_target_state)
++			set_tsk_thread_flag(task, TIF_PATCH_PENDING);
++	}
++}
++
++/*
++ * Initialize the global target patch state and all tasks to the initial patch
++ * state, and initialize all function transition states to true in preparation
++ * for patching or unpatching.
++ */
++void klp_init_transition(struct klp_patch *patch, int state)
++{
++	struct task_struct *g, *task;
++	unsigned int cpu;
++	struct klp_object *obj;
++	struct klp_func *func;
++	int initial_state = !state;
++
++	WARN_ON_ONCE(klp_target_state != KLP_UNDEFINED);
++
++	klp_transition_patch = patch;
++
++	/*
++	 * Set the global target patch state which tasks will switch to.  This
++	 * has no effect until the TIF_PATCH_PENDING flags get set later.
++	 */
++	klp_target_state = state;
++
++	/*
++	 * If the patch can be applied or reverted immediately, skip the
++	 * per-task transitions.
++	 */
++	if (patch->immediate)
++		return;
++
++	/*
++	 * Initialize all tasks to the initial patch state to prepare them for
++	 * switching to the target state.
++	 */
++	read_lock(&tasklist_lock);
++	for_each_process_thread(g, task) {
++		WARN_ON_ONCE(task->patch_state != KLP_UNDEFINED);
++		task->patch_state = initial_state;
++	}
++	read_unlock(&tasklist_lock);
++
++	/*
++	 * Ditto for the idle "swapper" tasks.
++	 */
++	for_each_possible_cpu(cpu) {
++		task = idle_task(cpu);
++		WARN_ON_ONCE(task->patch_state != KLP_UNDEFINED);
++		task->patch_state = initial_state;
++	}
++
++	/*
++	 * Enforce the order of the task->patch_state initializations and the
++	 * func->transition updates to ensure that klp_ftrace_handler() doesn't
++	 * see a func in transition with a task->patch_state of KLP_UNDEFINED.
++	 *
++	 * Also enforce the order of the klp_target_state write and future
++	 * TIF_PATCH_PENDING writes to ensure klp_update_patch_state() doesn't
++	 * set a task->patch_state to KLP_UNDEFINED.
++	 */
++	smp_wmb();
++
++	/*
++	 * Set the func transition states so klp_ftrace_handler() will know to
++	 * switch to the transition logic.
++	 *
++	 * When patching, the funcs aren't yet in the func_stack and will be
++	 * made visible to the ftrace handler shortly by the calls to
++	 * klp_patch_object().
++	 *
++	 * When unpatching, the funcs are already in the func_stack and so are
++	 * already visible to the ftrace handler.
++	 */
++	klp_for_each_object(patch, obj)
++		klp_for_each_func(obj, func)
++			func->transition = true;
++}
++
++/*
++ * This function can be called in the middle of an existing transition to
++ * reverse the direction of the target patch state.  This can be done to
++ * effectively cancel an existing enable or disable operation if there are any
++ * tasks which are stuck in the initial patch state.
++ */
++void klp_reverse_transition(void)
++{
++	unsigned int cpu;
++	struct task_struct *g, *task;
++
++	klp_transition_patch->enabled = !klp_transition_patch->enabled;
++
++	klp_target_state = !klp_target_state;
++
++	/*
++	 * Clear all TIF_PATCH_PENDING flags to prevent races caused by
++	 * klp_update_patch_state() running in parallel with
++	 * klp_start_transition().
++	 */
++	read_lock(&tasklist_lock);
++	for_each_process_thread(g, task)
++		clear_tsk_thread_flag(task, TIF_PATCH_PENDING);
++	read_unlock(&tasklist_lock);
++
++	for_each_possible_cpu(cpu)
++		clear_tsk_thread_flag(idle_task(cpu), TIF_PATCH_PENDING);
++
++	/* Let any remaining calls to klp_update_patch_state() complete */
++	synchronize_rcu();
++
++	klp_start_transition();
++}
++
++/* Called from copy_process() during fork */
++void klp_copy_process(struct task_struct *child)
++{
++	child->patch_state = current->patch_state;
++
++	/* TIF_PATCH_PENDING gets copied in setup_thread_stack() */
++}
+diff --git a/kernel/livepatch/transition.h b/kernel/livepatch/transition.h
+new file mode 100644
+index 000000000000..ce09b326546c
+--- /dev/null
++++ b/kernel/livepatch/transition.h
+@@ -0,0 +1,14 @@
++#ifndef _LIVEPATCH_TRANSITION_H
++#define _LIVEPATCH_TRANSITION_H
++
++#include <linux/livepatch.h>
++
++extern struct klp_patch *klp_transition_patch;
++
++void klp_init_transition(struct klp_patch *patch, int state);
++void klp_cancel_transition(void);
++void klp_start_transition(void);
++void klp_try_complete_transition(void);
++void klp_reverse_transition(void);
++
++#endif /* _LIVEPATCH_TRANSITION_H */
+* Unmerged path kernel/sched/idle.c
+* Unmerged path samples/livepatch/livepatch-sample.c
