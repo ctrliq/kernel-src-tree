@@ -103,6 +103,9 @@ static ssize_t show_##name##_list(struct device *dev,			\
 define_id_show_func(physical_package_id);
 define_one_ro(physical_package_id);
 
+define_id_show_func(die_id);
+static DEVICE_ATTR_RO(die_id);
+
 define_id_show_func(core_id);
 define_one_ro(core_id);
 
@@ -132,6 +135,7 @@ define_one_ro_named(drawer_siblings_list, show_drawer_cpumask_list);
 
 static struct attribute *default_attrs[] = {
 	&dev_attr_physical_package_id.attr,
+	&dev_attr_die_id.attr,
 	&dev_attr_core_id.attr,
 	&dev_attr_thread_siblings.attr,
 	&dev_attr_thread_siblings_list.attr,
