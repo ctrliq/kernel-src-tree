@@ -1,0 +1,126 @@
+RDMA/umem: Minor optimizations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Doug Ledford <dledford@redhat.com>
+commit 3312d1c6bdee6aa912c099c0ac0662d197c52842
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3312d1c6.failed
+
+Noticed while reviewing commit d4b4dd1b9706 ("RDMA/umem: Do not use
+current->tgid to track the mm_struct") patch.  Why would we take a lock,
+adjust a protected variable, drop the lock, and *then* check the input
+into our protected variable adjustment?  Then we have to take the lock
+again on our error unwind.  Let's just check the input early and skip
+taking the locks needlessly if the input isn't valid.
+
+It was also noticed that we set mm = current->mm, we then never modify
+mm, but we still go back and reference current->mm a number of times
+needlessly.  Be consistent in using the stored reference in mm.
+
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 3312d1c6bdee6aa912c099c0ac0662d197c52842)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem.c
+diff --cc drivers/infiniband/core/umem.c
+index 097e8522c0fc,1886d7709911..000000000000
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@@ -147,39 -152,43 +147,46 @@@ struct ib_umem *ib_umem_get(struct ib_u
+  		umem->hugetlb = 0;
+  
+  	npages = ib_umem_num_pages(umem);
++ 	if (npages == 0 || npages > UINT_MAX) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
+  
+ +	down_write(&current->mm->mmap_sem);
+ +
+ +	locked     = npages + current->mm->pinned_vm;
+  	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+  
+ -	down_write(&mm->mmap_sem);
+ -	mm->pinned_vm += npages;
+ -	if ((mm->pinned_vm > lock_limit) && !capable(CAP_IPC_LOCK)) {
+ -		up_write(&mm->mmap_sem);
+ +	if ((locked > lock_limit) && !capable(CAP_IPC_LOCK)) {
+  		ret = -ENOMEM;
+ -		goto vma;
+ +		goto out;
+  	}
+ -	up_write(&mm->mmap_sem);
+  
+  	cur_base = addr & PAGE_MASK;
+  
+++<<<<<<< HEAD
+ +	if (npages == 0 || npages > UINT_MAX) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +
+++=======
+++>>>>>>> 3312d1c6bdee (RDMA/umem: Minor optimizations)
+  	ret = sg_alloc_table(&umem->sg_head, npages, GFP_KERNEL);
+  	if (ret)
+ -		goto vma;
+ -
+ -	if (!umem->writable)
+ -		gup_flags |= FOLL_FORCE;
+ +		goto out;
+  
+ +	need_release = 1;
+  	sg_list_start = umem->sg_head.sgl;
+  
+ -	down_read(&mm->mmap_sem);
+  	while (npages) {
+  		ret = get_user_pages_longterm(cur_base,
+ -				     min_t(unsigned long, npages,
+ -					   PAGE_SIZE / sizeof (struct page *)),
+ -				     gup_flags, page_list, vma_list);
+ -		if (ret < 0) {
+ -			up_read(&mm->mmap_sem);
+ -			goto umem_release;
+ -		}
+ +				min_t(unsigned long, npages,
+ +				      PAGE_SIZE / sizeof (struct page *)),
+ +				1, !umem->writable, page_list, vma_list);
+ +
+ +		if (ret < 0)
+ +			goto out;
+  
+  		umem->npages += ret;
+  		cur_base += ret * PAGE_SIZE;
+@@@ -208,16 -218,15 +215,25 @@@
+  	}
+  
+  	ret = 0;
+ -	goto out;
+  
+++<<<<<<< HEAD
+++=======
++ umem_release:
++ 	__ib_umem_release(context->device, umem, 0);
++ vma:
++ 	down_write(&mm->mmap_sem);
++ 	mm->pinned_vm -= ib_umem_num_pages(umem);
++ 	up_write(&mm->mmap_sem);
+++>>>>>>> 3312d1c6bdee (RDMA/umem: Minor optimizations)
+  out:
+ +	if (ret < 0) {
+ +		if (need_release)
+ +			__ib_umem_release(context->device, umem, 0);
+ +		kfree(umem);
+ +	} else
+ +		current->mm->pinned_vm = locked;
+ +
+ +	up_write(&current->mm->mmap_sem);
+  	if (vma_list)
+  		free_page((unsigned long) vma_list);
+  	free_page((unsigned long) page_list);
+* Unmerged path drivers/infiniband/core/umem.c
