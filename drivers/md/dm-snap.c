@@ -2324,13 +2324,6 @@ static int origin_map(struct dm_target *ti, struct bio *bio)
 	return (bio_rw(bio) == WRITE) ? do_origin(o->dev, bio) : DM_MAPIO_REMAPPED;
 }
 
-static long origin_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
-		long nr_pages, void **kaddr, pfn_t *pfn)
-{
-	DMWARN("device does not support dax.");
-	return -EIO;
-}
-
 /*
  * Set the target "max_io_len" field to the minimum of all the snapshots'
  * chunk sizes.
@@ -2405,7 +2398,6 @@ static struct target_type origin_target = {
 	.status  = origin_status,
 	.merge	 = origin_merge,
 	.iterate_devices = origin_iterate_devices,
-	.direct_access = origin_dax_direct_access,
 };
 
 static struct target_type snapshot_target = {
