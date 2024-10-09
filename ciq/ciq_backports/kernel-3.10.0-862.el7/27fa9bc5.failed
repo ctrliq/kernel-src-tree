@@ -1,0 +1,394 @@
+nvme: split nvme status from block req->errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] split nvme status from block req->errors (David Milburn) [1454365 1456486 1457880]
+Rebuild_FUZZ: 93.02%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 27fa9bc54541dabc3fabe1c520d342f5add0379b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/27fa9bc5.failed
+
+We want our own clearly defined error field for NVMe passthrough commands,
+and the request errors field is going away in its current form.
+
+Just store the status and result field in the nvme_request field from
+hardirq completion context (using a new helper) and then generate a
+Linux errno for the block layer only when we actually need it.
+
+Because we can't overload the status value with a negative error code
+for cancelled command we now have a flags filed in struct nvme_request
+that contains a bit for this condition.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 27fa9bc54541dabc3fabe1c520d342f5add0379b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/fc.c
+#	drivers/nvme/host/lightnvm.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index bd223cb63595,c6f256d74b6b..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -61,6 -66,44 +61,47 @@@ static DEFINE_SPINLOCK(dev_list_lock)
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD
+++=======
++ int nvme_error_status(struct request *req)
++ {
++ 	switch (nvme_req(req)->status & 0x7ff) {
++ 	case NVME_SC_SUCCESS:
++ 		return 0;
++ 	case NVME_SC_CAP_EXCEEDED:
++ 		return -ENOSPC;
++ 	default:
++ 		return -EIO;
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(nvme_error_status);
++ 
++ static inline bool nvme_req_needs_retry(struct request *req)
++ {
++ 	if (blk_noretry_request(req))
++ 		return false;
++ 	if (nvme_req(req)->status & NVME_SC_DNR)
++ 		return false;
++ 	if (jiffies - req->start_time >= req->timeout)
++ 		return false;
++ 	if (nvme_req(req)->retries >= nvme_max_retries)
++ 		return false;
++ 	return true;
++ }
++ 
++ void nvme_complete_rq(struct request *req)
++ {
++ 	if (unlikely(nvme_req(req)->status && nvme_req_needs_retry(req))) {
++ 		nvme_req(req)->retries++;
++ 		blk_mq_requeue_request(req, !blk_mq_queue_stopped(req->q));
++ 		return;
++ 	}
++ 
++ 	blk_mq_end_request(req, nvme_error_status(req));
++ }
++ EXPORT_SYMBOL_GPL(nvme_complete_rq);
++ 
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  void nvme_cancel_request(struct request *req, void *data, bool reserved)
+  {
+  	int status;
+@@@ -311,17 -360,35 +354,29 @@@ int nvme_setup_cmd(struct nvme_ns *ns, 
+  {
+  	int ret = BLK_MQ_RQ_QUEUE_OK;
+  
+++<<<<<<< HEAD
+ +	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
+++=======
++ 	if (!(req->rq_flags & RQF_DONTPREP)) {
++ 		nvme_req(req)->retries = 0;
++ 		nvme_req(req)->flags = 0;
++ 		req->rq_flags |= RQF_DONTPREP;
++ 	}
++ 
++ 	switch (req_op(req)) {
++ 	case REQ_OP_DRV_IN:
++ 	case REQ_OP_DRV_OUT:
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  		memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
+ -		break;
+ -	case REQ_OP_FLUSH:
+ +	else if (req->cmd_flags & REQ_FLUSH)
+  		nvme_setup_flush(ns, cmd);
+ -		break;
+ -	case REQ_OP_WRITE_ZEROES:
+ -		/* currently only aliased to deallocate for a few ctrls: */
+ -	case REQ_OP_DISCARD:
+ +	else if (req->cmd_flags & REQ_DISCARD)
+  		ret = nvme_setup_discard(ns, req, cmd);
+ -		break;
+ -	case REQ_OP_READ:
+ -	case REQ_OP_WRITE:
+ +	else
+  		nvme_setup_rw(ns, req, cmd);
+ -		break;
+ -	default:
+ -		WARN_ON_ONCE(1);
+ -		return BLK_MQ_RQ_QUEUE_ERROR;
+ -	}
+  
+  	cmd->common.command_id = req->tag;
+ +
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+diff --cc drivers/nvme/host/fc.c
+index ab495bc8c3fb,450733c8cd24..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -1146,7 -1147,8 +1146,12 @@@ nvme_fc_fcpio_done(struct nvmefc_fcp_re
+  	struct nvme_fc_ctrl *ctrl = op->ctrl;
+  	struct nvme_fc_queue *queue = op->queue;
+  	struct nvme_completion *cqe = &op->rsp_iu.cqe;
+++<<<<<<< HEAD
+ +	u16 status;
+++=======
++ 	__le16 status = cpu_to_le16(NVME_SC_SUCCESS << 1);
++ 	union nvme_result result;
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  
+  	/*
+  	 * WARNING:
+@@@ -1211,10 -1213,10 +1216,10 @@@
+  		 */
+  		if (freq->transferred_length !=
+  			be32_to_cpu(op->cmd_iu.data_len)) {
+ -			status = cpu_to_le16(NVME_SC_FC_TRANSPORT_ERROR << 1);
+ +			status = -EIO;
+  			goto done;
+  		}
+- 		op->nreq.result.u64 = 0;
++ 		result.u64 = 0;
+  		break;
+  
+  	case sizeof(struct nvme_fc_ersp_iu):
+@@@ -1226,12 -1228,13 +1231,17 @@@
+  					(freq->rcv_rsplen / 4) ||
+  			     be32_to_cpu(op->rsp_iu.xfrd_len) !=
+  					freq->transferred_length ||
+ -			     op->rsp_iu.status_code ||
+  			     op->rqno != le16_to_cpu(cqe->command_id))) {
+ -			status = cpu_to_le16(NVME_SC_FC_TRANSPORT_ERROR << 1);
+ +			status = -EIO;
+  			goto done;
+  		}
+++<<<<<<< HEAD
+ +		op->nreq.result = cqe->result;
+ +		status = le16_to_cpu(cqe->status) >> 1;
+++=======
++ 		result = cqe->result;
++ 		status = cqe->status;
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  		break;
+  
+  	default:
+@@@ -1247,7 -1249,7 +1256,11 @@@ done
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	blk_mq_complete_request(rq, status);
+++=======
++ 	nvme_end_request(rq, status, result);
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  }
+  
+  static int
+diff --cc drivers/nvme/host/nvme.h
+index edb3488b21b7,d7330f75632d..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -18,18 -18,9 +18,8 @@@
+  #include <linux/pci.h>
+  #include <linux/kref.h>
+  #include <linux/blk-mq.h>
+ -#include <linux/lightnvm.h>
+ -#include <linux/sed-opal.h>
+ +#include <linux/idr.h>
+  
+- enum {
+- 	/*
+- 	 * Driver internal status code for commands that were cancelled due
+- 	 * to timeouts or controller shutdown.  The value is negative so
+- 	 * that it a) doesn't overlap with the unsigned hardware error codes,
+- 	 * and b) can easily be tested for.
+- 	 */
+- 	NVME_SC_CANCELLED		= -EINTR,
+- };
+- 
+  extern unsigned char nvme_io_timeout;
+  #define NVME_IO_TIMEOUT	(nvme_io_timeout * HZ)
+  
+@@@ -81,6 -80,13 +71,16 @@@ enum nvme_quirks 
+  struct nvme_request {
+  	struct nvme_command	*cmd;
+  	union nvme_result	result;
+++<<<<<<< HEAD
+++=======
++ 	u8			retries;
++ 	u8			flags;
++ 	u16			status;
++ };
++ 
++ enum {
++ 	NVME_REQ_CANCELLED		= (1 << 0),
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  };
+  
+  static inline struct nvme_request *nvme_req(struct request *req)
+@@@ -219,39 -236,26 +219,42 @@@ static inline u64 nvme_block_nr(struct 
+  	return (sector >> (ns->lba_shift - 9));
+  }
+  
+ +static inline unsigned nvme_map_len(struct request *rq)
+ +{
+ +	if (rq->cmd_flags & REQ_DISCARD)
+ +		return sizeof(struct nvme_dsm_range);
+ +	else
+ +		return blk_rq_bytes(rq);
+ +}
+ +
+  static inline void nvme_cleanup_cmd(struct request *req)
+  {
+ -	if (req->rq_flags & RQF_SPECIAL_PAYLOAD) {
+ -		kfree(page_address(req->special_vec.bv_page) +
+ -		      req->special_vec.bv_offset);
+ -	}
+ +	if (req->cmd_flags & REQ_DISCARD)
+ +		kfree(req->completion_data);
+  }
+  
+- static inline int nvme_error_status(u16 status)
++ static inline void nvme_end_request(struct request *req, __le16 status,
++ 		union nvme_result result)
+  {
+- 	switch (status & 0x7ff) {
+- 	case NVME_SC_SUCCESS:
+- 		return 0;
+- 	case NVME_SC_CAP_EXCEEDED:
+- 		return -ENOSPC;
+- 	default:
+- 		return -EIO;
+- 	}
++ 	struct nvme_request *rq = nvme_req(req);
++ 
++ 	rq->status = le16_to_cpu(status) >> 1;
++ 	rq->result = result;
++ 	blk_mq_complete_request(req, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool nvme_req_needs_retry(struct request *req, u16 status)
+ +{
+ +	return !(status & NVME_SC_DNR || blk_noretry_request(req)) &&
+ +		(jiffies - req->start_time) < req->timeout &&
+ +		req->retries < nvme_max_retries;
+ +}
+ +
+++=======
++ int nvme_error_status(struct request *req);
++ void nvme_complete_rq(struct request *req);
+++>>>>>>> 27fa9bc54541 (nvme: split nvme status from block req->errors)
+  void nvme_cancel_request(struct request *req, void *data, bool reserved);
+  bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
+  		enum nvme_ctrl_state new_state);
+* Unmerged path drivers/nvme/host/lightnvm.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/fc.c
+* Unmerged path drivers/nvme/host/lightnvm.c
+* Unmerged path drivers/nvme/host/nvme.h
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 20d5219150f0..9ef275533ad7 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -630,8 +630,7 @@ static int nvme_process_cq(struct nvme_queue *nvmeq)
+ 		}
+ 
+ 		req = blk_mq_tag_to_rq(*nvmeq->tags, cqe.command_id);
+-		nvme_req(req)->result = cqe.result;
+-		blk_mq_complete_request(req, le16_to_cpu(cqe.status) >> 1);
++		nvme_end_request(req, cqe.status, cqe.result);
+ 	}
+ 
+ 	if (head == nvmeq->cq_head && phase == nvmeq->cq_phase)
+@@ -748,9 +747,9 @@ static void abort_endio(struct request *req, int error)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct nvme_queue *nvmeq = iod->nvmeq;
+-	u16 status = req->errors;
+ 
+-	dev_warn(nvmeq->dev->ctrl.device, "Abort status: 0x%x", status);
++	dev_warn(nvmeq->dev->ctrl.device,
++		 "Abort status: 0x%x", nvme_req(req)->status);
+ 	atomic_inc(&nvmeq->dev->ctrl.abort_limit);
+ 	blk_mq_free_request(req);
+ }
+@@ -774,7 +773,7 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 			 "I/O %d QID %d timeout, disable controller\n",
+ 			 req->tag, nvmeq->qid);
+ 		nvme_dev_disable(dev, false);
+-		req->errors = NVME_SC_CANCELLED;
++		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+ 		return BLK_EH_HANDLED;
+ 	}
+ 
+@@ -794,7 +793,7 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 		 * Mark the request as handled, since the inline shutdown
+ 		 * forces all outstanding requests to complete.
+ 		 */
+-		req->errors = NVME_SC_CANCELLED;
++		nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+ 		return BLK_EH_HANDLED;
+ 	}
+ 
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 9eaa9a35b3d8..edcd74f6918a 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1181,8 +1181,7 @@ static int nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 	    wc->ex.invalidate_rkey == req->mr->rkey)
+ 		req->mr->need_inval = false;
+ 
+-	req->req.result = cqe->result;
+-	blk_mq_complete_request(rq, le16_to_cpu(cqe->status) >> 1);
++	nvme_end_request(rq, cqe->status, cqe->result);
+ 	return ret;
+ }
+ 
+@@ -1419,7 +1418,7 @@ nvme_rdma_timeout(struct request *rq, bool reserved)
+ 	nvme_rdma_error_recovery(req->queue->ctrl);
+ 
+ 	/* fail with DNR on cmd timeout */
+-	rq->errors = NVME_SC_ABORT_REQ | NVME_SC_DNR;
++	nvme_req(rq)->status = NVME_SC_ABORT_REQ | NVME_SC_DNR;
+ 
+ 	return BLK_EH_HANDLED;
+ }
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 7118fe2bf614..fc350df96971 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -140,7 +140,6 @@ static void nvme_loop_queue_response(struct nvmet_req *req)
+ 				&cqe->result);
+ 	} else {
+ 		struct request *rq;
+-		struct nvme_loop_iod *iod;
+ 
+ 		rq = blk_mq_tag_to_rq(nvme_loop_tagset(queue), cqe->command_id);
+ 		if (!rq) {
+@@ -150,9 +149,7 @@ static void nvme_loop_queue_response(struct nvmet_req *req)
+ 			return;
+ 		}
+ 
+-		iod = blk_mq_rq_to_pdu(rq);
+-		iod->nvme_req.result = cqe->result;
+-		blk_mq_complete_request(rq, le16_to_cpu(cqe->status) >> 1);
++		nvme_end_request(rq, cqe->status, cqe->result);
+ 	}
+ }
+ 
+@@ -173,7 +170,7 @@ nvme_loop_timeout(struct request *rq, bool reserved)
+ 	schedule_work(&iod->queue->ctrl->reset_work);
+ 
+ 	/* fail with DNR on admin cmd timeout */
+-	rq->errors = NVME_SC_ABORT_REQ | NVME_SC_DNR;
++	nvme_req(rq)->status = NVME_SC_ABORT_REQ | NVME_SC_DNR;
+ 
+ 	return BLK_EH_HANDLED;
+ }
