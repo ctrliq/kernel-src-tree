@@ -1296,6 +1296,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 			state = fa->fa_state;
 			new_fa->fa_state = state & ~FA_S_ACCESSED;
 			new_fa->fa_slen = fa->fa_slen;
+			new_fa->tb_id = tb->tb_id;
 
 			call_fib_entry_notifiers(net, FIB_EVENT_ENTRY_REPLACE,
 						 key, plen, fi,
