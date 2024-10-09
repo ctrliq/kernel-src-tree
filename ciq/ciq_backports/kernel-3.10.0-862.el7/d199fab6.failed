@@ -1,0 +1,134 @@
+packet: fix races in fanout_add()
+
+jira LE-1907
+cve CVE-2017-15649
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit d199fab63c11998a602205f7ee7ff7c05c97164b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d199fab6.failed
+
+Multiple threads can call fanout_add() at the same time.
+
+We need to grab fanout_mutex earlier to avoid races that could
+lead to one thread freeing po->rollover that was set by another thread.
+
+Do the same in fanout_release(), for peace of mind, and to help us
+finding lockdep issues earlier.
+
+Fixes: dc99f600698d ("packet: Add fanout support.")
+Fixes: 0648ab70afe6 ("packet: rollover prepare: per-socket state")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d199fab63c11998a602205f7ee7ff7c05c97164b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/packet/af_packet.c
+diff --cc net/packet/af_packet.c
+index 4908358f9312,0f03f6a53b4d..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -1379,13 -1642,28 +1380,32 @@@ static int fanout_add(struct sock *sk, 
+  		return -EINVAL;
+  	}
+  
++ 	mutex_lock(&fanout_mutex);
++ 
++ 	err = -EINVAL;
+  	if (!po->running)
+- 		return -EINVAL;
++ 		goto out;
+  
++ 	err = -EALREADY;
+  	if (po->fanout)
+- 		return -EALREADY;
++ 		goto out;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&fanout_mutex);
+++=======
++ 	if (type == PACKET_FANOUT_ROLLOVER ||
++ 	    (type_flags & PACKET_FANOUT_FLAG_ROLLOVER)) {
++ 		err = -ENOMEM;
++ 		rollover = kzalloc(sizeof(*rollover), GFP_KERNEL);
++ 		if (!rollover)
++ 			goto out;
++ 		atomic_long_set(&rollover->num, 0);
++ 		atomic_long_set(&rollover->num_huge, 0);
++ 		atomic_long_set(&rollover->num_failed, 0);
++ 		po->rollover = rollover;
++ 	}
++ 
+++>>>>>>> d199fab63c11 (packet: fix races in fanout_add())
+  	match = NULL;
+  	list_for_each_entry(f, &fanout_list, list) {
+  		if (f->id == id &&
+@@@ -1432,6 -1710,10 +1452,13 @@@
+  		}
+  	}
+  out:
+++<<<<<<< HEAD
+++=======
++ 	if (err && rollover) {
++ 		kfree(rollover);
++ 		po->rollover = NULL;
++ 	}
+++>>>>>>> d199fab63c11 (packet: fix races in fanout_add())
+  	mutex_unlock(&fanout_mutex);
+  	return err;
+  }
+@@@ -1441,19 -1723,36 +1468,45 @@@ static void fanout_release(struct sock 
+  	struct packet_sock *po = pkt_sk(sk);
+  	struct packet_fanout *f;
+  
+- 	f = po->fanout;
+- 	if (!f)
+- 		return;
+- 
+  	mutex_lock(&fanout_mutex);
+- 	po->fanout = NULL;
++ 	f = po->fanout;
++ 	if (f) {
++ 		po->fanout = NULL;
+  
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&f->sk_ref)) {
+ +		list_del(&f->list);
+ +		dev_remove_pack(&f->prot_hook);
+ +		kfree(f);
+ +	}
+ +	mutex_unlock(&fanout_mutex);
+++=======
++ 		if (atomic_dec_and_test(&f->sk_ref)) {
++ 			list_del(&f->list);
++ 			dev_remove_pack(&f->prot_hook);
++ 			fanout_release_data(f);
++ 			kfree(f);
++ 		}
++ 
++ 		if (po->rollover)
++ 			kfree_rcu(po->rollover, rcu);
++ 	}
++ 	mutex_unlock(&fanout_mutex);
++ }
++ 
++ static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
++ 					  struct sk_buff *skb)
++ {
++ 	/* Earlier code assumed this would be a VLAN pkt, double-check
++ 	 * this now that we have the actual packet in hand. We can only
++ 	 * do this check on Ethernet devices.
++ 	 */
++ 	if (unlikely(dev->type != ARPHRD_ETHER))
++ 		return false;
++ 
++ 	skb_reset_mac_header(skb);
++ 	return likely(eth_hdr(skb)->h_proto == htons(ETH_P_8021Q));
+++>>>>>>> d199fab63c11 (packet: fix races in fanout_add())
+  }
+  
+  static const struct proto_ops packet_ops;
+* Unmerged path net/packet/af_packet.c
