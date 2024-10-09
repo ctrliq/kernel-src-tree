@@ -1,0 +1,143 @@
+mmc: block: move multi-ioctl() to use block layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: move multi-ioctl() to use block layer (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.62%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 3ecd8cf23f88d5df1c545a5c04217987abb28575
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3ecd8cf2.failed
+
+This switches also the multiple-command ioctl() call to issue
+all ioctl()s through the block layer instead of going directly
+to the device.
+
+We extend the passed argument with an argument count and loop
+over all passed commands in the ioctl() issue function called
+from the block layer.
+
+By doing this we are again loosening the grip on the big host
+lock, since two calls to mmc_get_card()/mmc_put_card() are
+removed.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Avri Altman <Avri.Altman@sandisk.com>
+(cherry picked from commit 3ecd8cf23f88d5df1c545a5c04217987abb28575)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.h
+diff --cc drivers/mmc/core/block.c
+index 97e814713e97,e9737987956f..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -555,9 -563,12 +555,10 @@@ static int mmc_blk_ioctl_cmd(struct blo
+  			     struct mmc_ioc_cmd __user *ic_ptr)
+  {
+  	struct mmc_blk_ioc_data *idata;
++ 	struct mmc_blk_ioc_data *idatas[1];
+  	struct mmc_blk_data *md;
+ -	struct mmc_queue *mq;
+  	struct mmc_card *card;
+  	int err = 0, ioc_err = 0;
+ -	struct request *req;
+  
+  	/*
+  	 * The caller must have CAP_SYS_RAWIO, and must be calling this on the
+@@@ -583,17 -594,20 +584,32 @@@
+  		goto cmd_done;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmc_get_card(card);
+ +
+ +	ioc_err = __mmc_blk_ioctl_cmd(card, md, idata);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+ +
+++=======
++ 	/*
++ 	 * Dispatch the ioctl() into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	idatas[0] = idata;
++ 	req_to_mmc_queue_req(req)->idata = idatas;
++ 	req_to_mmc_queue_req(req)->ioc_count = 1;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->ioc_result;
+++>>>>>>> 3ecd8cf23f88 (mmc: block: move multi-ioctl() to use block layer)
+  	err = mmc_blk_ioctl_copy_to_user(ic_ptr, idata);
+ -	blk_put_request(req);
+  
+  cmd_done:
+  	mmc_blk_put(md);
+@@@ -603,6 -617,34 +619,37 @@@ cmd_err
+  	return ioc_err ? ioc_err : err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The ioctl commands come back from the block layer after it queued it and
++  * processed it with all other requests and then they get issued in this
++  * function.
++  */
++ static void mmc_blk_ioctl_cmd_issue(struct mmc_queue *mq, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	int ioc_err;
++ 	int i;
++ 
++ 	mq_rq = req_to_mmc_queue_req(req);
++ 	for (i = 0; i < mq_rq->ioc_count; i++) {
++ 		ioc_err = __mmc_blk_ioctl_cmd(card, md, mq_rq->idata[i]);
++ 		if (ioc_err)
++ 			break;
++ 	}
++ 	mq_rq->ioc_result = ioc_err;
++ 
++ 	/* Always switch back to main area after RPMB access */
++ 	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
++ 		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
++ 
++ 	blk_end_request_all(req, ioc_err);
++ }
++ 
+++>>>>>>> 3ecd8cf23f88 (mmc: block: move multi-ioctl() to use block layer)
+  static int mmc_blk_ioctl_multi_cmd(struct block_device *bdev,
+  				   struct mmc_ioc_multi_cmd __user *user)
+  {
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,8c76e7118c95..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -23,7 -40,10 +23,14 @@@ struct mmc_queue_req 
+  	char			*bounce_buf;
+  	struct scatterlist	*bounce_sg;
+  	unsigned int		bounce_sg_len;
+++<<<<<<< HEAD
+ +	struct mmc_async_req	mmc_active;
+++=======
++ 	struct mmc_async_req	areq;
++ 	int			ioc_result;
++ 	struct mmc_blk_ioc_data	**idata;
++ 	unsigned int		ioc_count;
+++>>>>>>> 3ecd8cf23f88 (mmc: block: move multi-ioctl() to use block layer)
+  };
+  
+  struct mmc_queue {
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.h
