@@ -1,0 +1,235 @@
+HID: hid-sensor-hub: Allow parallel synchronous reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [hid] hid-sensor-hub: Allow parallel synchronous reads (Tony Camuso) [1559170]
+Rebuild_FUZZ: 95.05%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit e651a1da442ae02a50081e38309dea5e89da2d41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e651a1da.failed
+
+Current implementation only allows one outstanding synchronous read.
+This is a performance hit when user mode is requesting raw reads
+of sensor attributes on multiple sensors together.
+This change changes the mutex lock to per hid sensor hub device instead
+of global lock. Although request to hid sensor hub is serialized, there
+can be multiple outstanding read requests pending for responses via
+hid reports.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Acked-by: Jonathan Cameron <jic23@kernel.org>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit e651a1da442ae02a50081e38309dea5e89da2d41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-sensor-hub.c
+#	include/linux/hid-sensor-hub.h
+diff --cc drivers/hid/hid-sensor-hub.c
+index 3e67ed86c707,62fadf8c86fc..000000000000
+--- a/drivers/hid/hid-sensor-hub.c
++++ b/drivers/hid/hid-sensor-hub.c
+@@@ -27,24 -26,8 +27,6 @@@
+  #include <linux/hid-sensor-hub.h>
+  #include "hid-ids.h"
+  
+- /**
+-  * struct sensor_hub_pending - Synchronous read pending information
+-  * @status:		Pending status true/false.
+-  * @ready:		Completion synchronization data.
+-  * @usage_id:		Usage id for physical device, E.g. Gyro usage id.
+-  * @attr_usage_id:	Usage Id of a field, E.g. X-AXIS for a gyro.
+-  * @raw_size:		Response size for a read request.
+-  * @raw_data:		Place holder for received response.
+-  */
+- struct sensor_hub_pending {
+- 	bool status;
+- 	struct completion ready;
+- 	u32 usage_id;
+- 	u32 attr_usage_id;
+- 	int raw_size;
+- 	u8  *raw_data;
+- };
+ -#define HID_SENSOR_HUB_ENUM_QUIRK	0x01
+--
+  /**
+   * struct sensor_hub_data - Hold a instance data for a HID hub device
+   * @hsdev:		Stored hid instance for current hub device.
+@@@ -55,12 -37,11 +36,11 @@@
+   * @dyn_callback_lock:	spin lock to protect callback list
+   * @hid_sensor_hub_client_devs:	Stores all MFD cells for a hub instance.
+   * @hid_sensor_client_cnt: Number of MFD cells, (no of sensors attached).
+ - * @ref_cnt:		Number of MFD clients have opened this device
+   */
+  struct sensor_hub_data {
+ +	struct hid_sensor_hub_device *hsdev;
+  	struct mutex mutex;
+  	spinlock_t lock;
+- 	struct sensor_hub_pending pending;
+  	struct list_head dyn_callback_list;
+  	spinlock_t dyn_callback_lock;
+  	struct mfd_cell *hid_sensor_hub_client_devs;
+@@@ -457,27 -435,32 +439,53 @@@ static int sensor_hub_raw_event(struct 
+  					report->field[i]->report_count)/8);
+  		sz = (report->field[i]->report_size *
+  					report->field[i]->report_count)/8;
+++<<<<<<< HEAD
+ +		if (pdata->pending.status && pdata->pending.attr_usage_id ==
+ +				report->field[i]->usage->hid) {
+ +			hid_dbg(hdev, "data was pending ...\n");
+ +			pdata->pending.raw_data = kmalloc(sz, GFP_ATOMIC);
+ +			if (pdata->pending.raw_data) {
+ +				memcpy(pdata->pending.raw_data, ptr, sz);
+ +				pdata->pending.raw_size  = sz;
+ +			} else
+ +				pdata->pending.raw_size = 0;
+ +			complete(&pdata->pending.ready);
+ +		}
+++=======
+++>>>>>>> e651a1da442a (HID: hid-sensor-hub: Allow parallel synchronous reads)
+  		collection = &hdev->collection[
+  				report->field[i]->usage->collection_index];
+  		hid_dbg(hdev, "collection->usage %x\n",
+  					collection->usage);
+++<<<<<<< HEAD
+ +		callback = sensor_hub_get_callback(pdata->hsdev->hdev,
+ +						report->field[i]->physical,
+ +							&priv);
+ +		if (callback && callback->capture_sample) {
+++=======
++ 
++ 		callback = sensor_hub_get_callback(hdev,
++ 				report->field[i]->physical,
++ 				report->field[i]->usage[0].collection_index,
++ 				&hsdev, &priv);
++ 		if (!callback) {
++ 			ptr += sz;
++ 			continue;
++ 		}
++ 		if (hsdev->pending.status && hsdev->pending.attr_usage_id ==
++ 				report->field[i]->usage->hid) {
++ 			hid_dbg(hdev, "data was pending ...\n");
++ 			hsdev->pending.raw_data = kmemdup(ptr, sz, GFP_ATOMIC);
++ 			if (hsdev->pending.raw_data)
++ 				hsdev->pending.raw_size = sz;
++ 			else
++ 				hsdev->pending.raw_size = 0;
++ 			complete(&hsdev->pending.ready);
++ 		}
++ 		if (callback->capture_sample) {
+++>>>>>>> e651a1da442a (HID: hid-sensor-hub: Allow parallel synchronous reads)
+  			if (report->field[i]->logical)
+ -				callback->capture_sample(hsdev,
+ +				callback->capture_sample(pdata->hsdev,
+  					report->field[i]->logical, sz, ptr,
+  					callback->pdev);
+  			else
+@@@ -587,20 -597,36 +595,49 @@@ static int sensor_hub_probe(struct hid_
+  			ret = -ENOMEM;
+  			goto err_stop_hw;
+  	}
+++<<<<<<< HEAD
+ +	list_for_each_entry(report, &report_enum->report_list, list) {
+ +		hid_dbg(hdev, "Report id:%x\n", report->id);
+ +		field = report->field[0];
+ +		if (report->maxfield && field &&
+ +					field->physical) {
+ +			name = kasprintf(GFP_KERNEL, "HID-SENSOR-%x",
+ +						field->physical);
+ +			if (name  == NULL) {
+++=======
++ 
++ 	for (i = 0; i < hdev->maxcollection; ++i) {
++ 		struct hid_collection *collection = &hdev->collection[i];
++ 
++ 		if (collection->type == HID_COLLECTION_PHYSICAL) {
++ 
++ 			hsdev = devm_kzalloc(&hdev->dev, sizeof(*hsdev),
++ 					     GFP_KERNEL);
++ 			if (!hsdev) {
++ 				hid_err(hdev, "cannot allocate hid_sensor_hub_device\n");
++ 				ret = -ENOMEM;
++ 				goto err_stop_hw;
++ 			}
++ 			hsdev->hdev = hdev;
++ 			hsdev->vendor_id = hdev->vendor;
++ 			hsdev->product_id = hdev->product;
++ 			hsdev->usage = collection->usage;
++ 			mutex_init(&hsdev->mutex);
++ 			hsdev->start_collection_index = i;
++ 			if (last_hsdev)
++ 				last_hsdev->end_collection_index = i;
++ 			last_hsdev = hsdev;
++ 			name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
++ 					      "HID-SENSOR-%x",
++ 					      collection->usage);
++ 			if (name == NULL) {
+++>>>>>>> e651a1da442a (HID: hid-sensor-hub: Allow parallel synchronous reads)
+  				hid_err(hdev, "Failed MFD device name\n");
+  					ret = -ENOMEM;
+ -					goto err_stop_hw;
+ +					goto err_free_names;
+  			}
+ +			sd->hid_sensor_hub_client_devs[
+ +				sd->hid_sensor_client_cnt].id = PLATFORM_DEVID_AUTO;
+  			sd->hid_sensor_hub_client_devs[
+  				sd->hid_sensor_client_cnt].name = name;
+  			sd->hid_sensor_hub_client_devs[
+@@@ -640,13 -667,14 +677,17 @@@ static void sensor_hub_remove(struct hi
+  	hid_hw_close(hdev);
+  	hid_hw_stop(hdev);
+  	spin_lock_irqsave(&data->lock, flags);
+- 	if (data->pending.status)
+- 		complete(&data->pending.ready);
++ 	for (i = 0; i < data->hid_sensor_client_cnt; ++i) {
++ 		struct hid_sensor_hub_device *hsdev =
++ 			data->hid_sensor_hub_client_devs[i].platform_data;
++ 		if (hsdev->pending.status)
++ 			complete(&hsdev->pending.ready);
++ 	}
+  	spin_unlock_irqrestore(&data->lock, flags);
+  	mfd_remove_devices(&hdev->dev);
+ +	for (i = 0; i < data->hid_sensor_client_cnt ; ++i)
+ +		kfree(data->hid_sensor_hub_client_devs[i].name);
+ +	kfree(data->hid_sensor_hub_client_devs);
+  	hid_set_drvdata(hdev, NULL);
+  	mutex_destroy(&data->mutex);
+  }
+diff --cc include/linux/hid-sensor-hub.h
+index 8fc2444454a4,60a34277ddf2..000000000000
+--- a/include/linux/hid-sensor-hub.h
++++ b/include/linux/hid-sensor-hub.h
+@@@ -53,13 -69,21 +71,29 @@@ struct sensor_hub_pending 
+   * @hdev:		Stores the hid instance.
+   * @vendor_id:		Vendor id of hub device.
+   * @product_id:		Product id of hub device.
+++<<<<<<< HEAD
+ + * @ref_cnt:		Number of MFD clients have opened this device
+++=======
++  * @usage:		Usage id for this hub device instance.
++  * @start_collection_index: Starting index for a phy type collection
++  * @end_collection_index: Last index for a phy type collection
++  * @mutex:		synchronizing mutex.
++  * @pending:		Holds information of pending sync read request.
+++>>>>>>> e651a1da442a (HID: hid-sensor-hub: Allow parallel synchronous reads)
+   */
+  struct hid_sensor_hub_device {
+  	struct hid_device *hdev;
+  	u32 vendor_id;
+  	u32 product_id;
+++<<<<<<< HEAD
+ +	int ref_cnt;
+++=======
++ 	u32 usage;
++ 	int start_collection_index;
++ 	int end_collection_index;
++ 	struct mutex mutex;
++ 	struct sensor_hub_pending pending;
+++>>>>>>> e651a1da442a (HID: hid-sensor-hub: Allow parallel synchronous reads)
+  };
+  
+  /**
+* Unmerged path drivers/hid/hid-sensor-hub.c
+* Unmerged path include/linux/hid-sensor-hub.h
