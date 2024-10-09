@@ -1,0 +1,261 @@
+x86, dax, pmem: remove indirection around memcpy_from_pmem()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 6abccd1bfee49e491095772fd5aa9e96d915ae52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6abccd1b.failed
+
+memcpy_from_pmem() maps directly to memcpy_mcsafe(). The wrapper
+serves no real benefit aside from affording a more generic function name
+than the x86-specific 'mcsafe'. However this would not be the first time
+that x86 terminology leaked into the global namespace. For lack of
+better name, just use memcpy_mcsafe() directly.
+
+This conversion also catches a place where we should have been using
+plain memcpy, acpi_nfit_blk_single_io().
+
+	Cc: <x86@kernel.org>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Acked-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 6abccd1bfee49e491095772fd5aa9e96d915ae52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pmem.h
+#	arch/x86/include/asm/string_64.h
+#	include/linux/pmem.h
+diff --cc arch/x86/include/asm/pmem.h
+index eda280cff1d3,d5a22bac9988..000000000000
+--- a/arch/x86/include/asm/pmem.h
++++ b/arch/x86/include/asm/pmem.h
+@@@ -44,21 -44,6 +44,24 @@@ static inline void arch_memcpy_to_pmem(
+  		BUG();
+  }
+  
+++<<<<<<< HEAD
+ +static inline int arch_memcpy_from_pmem(void *dst, const void *src,
+ +		size_t n)
+ +{
+ +	/*
+ +	 * KABI: until we can figure out how to shoe-horn mcsafe_memcpy
+ +	 * into RHEL, we always perform the fallback.
+ +	 */
+ +#if 0
+ +	if (static_cpu_has(X86_FEATURE_MCE_RECOVERY))
+ +		return memcpy_mcsafe(dst, (void __force *) src, n);
+ +#endif
+ +	memcpy(dst, (void __force *) src, n);
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 6abccd1bfee4 (x86, dax, pmem: remove indirection around memcpy_from_pmem())
+  /**
+   * arch_wb_cache_pmem - write back a cache range with CLWB
+   * @vaddr:	virtual start address
+diff --cc arch/x86/include/asm/string_64.h
+index 19e2c468fc2c,733bae07fb29..000000000000
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@@ -63,6 -66,49 +63,52 @@@ char *strcpy(char *dest, const char *sr
+  char *strcat(char *dest, const char *src);
+  int strcmp(const char *cs, const char *ct);
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_KASAN) && !defined(__SANITIZE_ADDRESS__)
++ 
++ /*
++  * For files that not instrumented (e.g. mm/slub.c) we
++  * should use not instrumented version of mem* functions.
++  */
++ 
++ #undef memcpy
++ #define memcpy(dst, src, len) __memcpy(dst, src, len)
++ #define memmove(dst, src, len) __memmove(dst, src, len)
++ #define memset(s, c, n) __memset(s, c, n)
++ #endif
++ 
++ #define __HAVE_ARCH_MEMCPY_MCSAFE 1
++ __must_check int memcpy_mcsafe_unrolled(void *dst, const void *src, size_t cnt);
++ DECLARE_STATIC_KEY_FALSE(mcsafe_key);
++ 
++ /**
++  * memcpy_mcsafe - copy memory with indication if a machine check happened
++  *
++  * @dst:	destination address
++  * @src:	source address
++  * @cnt:	number of bytes to copy
++  *
++  * Low level memory copy function that catches machine checks
++  * We only call into the "safe" function on systems that can
++  * actually do machine check recovery. Everyone else can just
++  * use memcpy().
++  *
++  * Return 0 for success, -EFAULT for fail
++  */
++ static __always_inline __must_check int
++ memcpy_mcsafe(void *dst, const void *src, size_t cnt)
++ {
++ #ifdef CONFIG_X86_MCE
++ 	if (static_branch_unlikely(&mcsafe_key))
++ 		return memcpy_mcsafe_unrolled(dst, src, cnt);
++ 	else
++ #endif
++ 		memcpy(dst, src, cnt);
++ 	return 0;
++ }
++ 
+++>>>>>>> 6abccd1bfee4 (x86, dax, pmem: remove indirection around memcpy_from_pmem())
+  #endif /* __KERNEL__ */
+  
+  #endif /* _ASM_X86_STRING_64_H */
+diff --cc include/linux/pmem.h
+index 0178133991d0,71ecf3d46aac..000000000000
+--- a/include/linux/pmem.h
++++ b/include/linux/pmem.h
+@@@ -32,11 -31,11 +32,19 @@@ static inline void arch_memcpy_to_pmem(
+  	BUG();
+  }
+  
+++<<<<<<< HEAD
+ +static inline int arch_memcpy_from_pmem(void *dst, const void *src,
+ +		size_t n)
+ +{
+ +	BUG();
+ +	return -EFAULT;
+++=======
++ static inline size_t arch_copy_from_iter_pmem(void *addr, size_t bytes,
++ 		struct iov_iter *i)
++ {
++ 	BUG();
++ 	return 0;
+++>>>>>>> 6abccd1bfee4 (x86, dax, pmem: remove indirection around memcpy_from_pmem())
+  }
+  
+  static inline void arch_clear_pmem(void *addr, size_t size)
+@@@ -55,45 -54,11 +63,51 @@@ static inline void arch_invalidate_pmem
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + * memcpy_from_pmem - read from persistent memory with error handling
+ + * @dst: destination buffer
+ + * @src: source buffer
+ + * @size: transfer length
+ + *
+ + * Returns 0 on success negative error code on failure.
+ + */
+ +static inline int memcpy_from_pmem(void *dst, void const *src, size_t size)
+ +{
+ +	return arch_memcpy_from_pmem(dst, src, size);
+ +}
+ +
+++=======
+++>>>>>>> 6abccd1bfee4 (x86, dax, pmem: remove indirection around memcpy_from_pmem())
+  static inline bool arch_has_pmem_api(void)
+  {
+  	return IS_ENABLED(CONFIG_ARCH_HAS_PMEM_API);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * These defaults seek to offer decent performance and minimize the
+ + * window between i/o completion and writes being durable on media.
+ + * However, it is undefined / architecture specific whether
+ + * ARCH_MEMREMAP_PMEM + default_memcpy_to_pmem is sufficient for
+ + * making data durable relative to i/o completion.
+ + */
+ +static inline void default_memcpy_to_pmem(void *dst, const void *src,
+ +		size_t size)
+ +{
+ +	memcpy((void __force *) dst, src, size);
+ +}
+ +
+ +static inline void default_clear_pmem(void *addr, size_t size)
+ +{
+ +	if (size == PAGE_SIZE && ((unsigned long)addr & ~PAGE_MASK) == 0)
+ +		clear_page((void __force *)addr);
+ +	else
+ +		memset((void __force *)addr, 0, size);
+ +}
+ +
+++=======
+++>>>>>>> 6abccd1bfee4 (x86, dax, pmem: remove indirection around memcpy_from_pmem())
+  /**
+   * memcpy_to_pmem - copy data to persistent memory
+   * @dst: destination buffer for the copy
+* Unmerged path arch/x86/include/asm/pmem.h
+* Unmerged path arch/x86/include/asm/string_64.h
+diff --git a/drivers/acpi/nfit/core.c b/drivers/acpi/nfit/core.c
+index 2b569941567e..bea2d1a5afdd 100644
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@ -1840,8 +1840,7 @@ static int acpi_nfit_blk_single_io(struct nfit_blk *nfit_blk,
+ 				mmio_flush_range((void __force *)
+ 					mmio->addr.aperture + offset, c);
+ 
+-			memcpy_from_pmem(iobuf + copied,
+-					mmio->addr.aperture + offset, c);
++			memcpy(iobuf + copied, mmio->addr.aperture + offset, c);
+ 		}
+ 
+ 		copied += c;
+diff --git a/drivers/nvdimm/claim.c b/drivers/nvdimm/claim.c
+index b3323c0697f6..61293504b52c 100644
+--- a/drivers/nvdimm/claim.c
++++ b/drivers/nvdimm/claim.c
+@@ -239,7 +239,7 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
+ 	if (rw == READ) {
+ 		if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align)))
+ 			return -EIO;
+-		return memcpy_from_pmem(buf, nsio->addr + offset, size);
++		return memcpy_mcsafe(buf, nsio->addr + offset, size);
+ 	}
+ 
+ 	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index a63d1c76771a..14cf7732452a 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -88,7 +88,7 @@ static int read_pmem(struct page *page, unsigned int off,
+ 	int rc;
+ 	void *mem = kmap_atomic(page);
+ 
+-	rc = memcpy_from_pmem(mem + off, pmem_addr, len);
++	rc = memcpy_mcsafe(mem + off, pmem_addr, len);
+ 	kunmap_atomic(mem);
+ 	if (rc)
+ 		return -EIO;
+* Unmerged path include/linux/pmem.h
+diff --git a/include/linux/string.h b/include/linux/string.h
+index d9d3ff2b1343..d14df1a1c0f3 100644
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -114,6 +114,14 @@ extern int memcmp(const void *,const void *,__kernel_size_t);
+ #ifndef __HAVE_ARCH_MEMCHR
+ extern void * memchr(const void *,int,__kernel_size_t);
+ #endif
++#ifndef __HAVE_ARCH_MEMCPY_MCSAFE
++static inline __must_check int memcpy_mcsafe(void *dst, const void *src,
++		size_t cnt)
++{
++	memcpy(dst, src, cnt);
++	return 0;
++}
++#endif
+ void *memchr_inv(const void *s, int c, size_t n);
+ 
+ extern void kfree_const(const void *x);
