@@ -1,0 +1,320 @@
+scsi: lpfc: Cleanup entry_repost settings on SLI4 queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Cleanup entry_repost settings on SLI4 queues (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 94.34%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 64eb4dcb140a7c5547f6e965fb471b1b75c01108
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/64eb4dcb.failed
+
+Too many work items being processed in IRQ context take a lot of CPU
+time and cause problems.
+
+With a recent change, we get out of the ISR after hitting entry_repost
+work items on a queue. However, the actual values for entry repost are
+still high. EQ is 128 and CQ is 128, this could translate into
+processing 128 * 128 (16384) work items under IRQ context.
+
+Set entry_repost in the actual queue creation routine now.  Limit EQ
+repost to 8 and CQ repost to 64 to further limit the amount of time
+spent in the IRQ.
+
+Fix fof IRQ routines as well.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 64eb4dcb140a7c5547f6e965fb471b1b75c01108)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_sli.c
+#	drivers/scsi/lpfc/lpfc_sli4.h
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index c54385fd9058,903c06ff828a..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -13318,8 -14229,10 +13312,15 @@@ lpfc_cq_create(struct lpfc_hba *phba, s
+  	switch (cq->entry_count) {
+  	default:
+  		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
+++<<<<<<< HEAD
+ +				"0361 Unsupported CQ count. (%d)\n",
+ +				cq->entry_count);
+++=======
++ 				"0361 Unsupported CQ count: "
++ 				"entry cnt %d sz %d pg cnt %d\n",
++ 				cq->entry_count, cq->entry_size,
++ 				cq->page_count);
+++>>>>>>> 64eb4dcb140a (scsi: lpfc: Cleanup entry_repost settings on SLI4 queues)
+  		if (cq->entry_count < 256) {
+  			status = -EINVAL;
+  			goto out;
+@@@ -13379,6 -14293,235 +13381,238 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_cq_create_set - Create a set of Completion Queues on the HBA for MRQ
++  * @phba: HBA structure that indicates port to create a queue on.
++  * @cqp: The queue structure array to use to create the completion queues.
++  * @eqp: The event queue array to bind these completion queues to.
++  *
++  * This function creates a set of  completion queue, s to support MRQ
++  * as detailed in @cqp, on a port,
++  * described by @phba by sending a CREATE_CQ_SET mailbox command to the HBA.
++  *
++  * The @phba struct is used to send mailbox command to HBA. The @cq struct
++  * is used to get the entry count and entry size that are necessary to
++  * determine the number of pages to allocate and use for this queue. The @eq
++  * is used to indicate which event queue to bind this completion queue to. This
++  * function will send the CREATE_CQ_SET mailbox command to the HBA to setup the
++  * completion queue. This function is asynchronous and will wait for the mailbox
++  * command to finish before continuing.
++  *
++  * On success this function will return a zero. If unable to allocate enough
++  * memory this function will return -ENOMEM. If the queue create mailbox command
++  * fails this function will return -ENXIO.
++  **/
++ int
++ lpfc_cq_create_set(struct lpfc_hba *phba, struct lpfc_queue **cqp,
++ 		   struct lpfc_queue **eqp, uint32_t type, uint32_t subtype)
++ {
++ 	struct lpfc_queue *cq;
++ 	struct lpfc_queue *eq;
++ 	struct lpfc_mbx_cq_create_set *cq_set;
++ 	struct lpfc_dmabuf *dmabuf;
++ 	LPFC_MBOXQ_t *mbox;
++ 	int rc, length, alloclen, status = 0;
++ 	int cnt, idx, numcq, page_idx = 0;
++ 	uint32_t shdr_status, shdr_add_status;
++ 	union lpfc_sli4_cfg_shdr *shdr;
++ 	uint32_t hw_page_size = phba->sli4_hba.pc_sli4_params.if_page_sz;
++ 
++ 	/* sanity check on queue memory */
++ 	numcq = phba->cfg_nvmet_mrq;
++ 	if (!cqp || !eqp || !numcq)
++ 		return -ENODEV;
++ 	if (!phba->sli4_hba.pc_sli4_params.supported)
++ 		hw_page_size = SLI4_PAGE_SIZE;
++ 
++ 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
++ 	if (!mbox)
++ 		return -ENOMEM;
++ 
++ 	length = sizeof(struct lpfc_mbx_cq_create_set);
++ 	length += ((numcq * cqp[0]->page_count) *
++ 		   sizeof(struct dma_address));
++ 	alloclen = lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_FCOE,
++ 			LPFC_MBOX_OPCODE_FCOE_CQ_CREATE_SET, length,
++ 			LPFC_SLI4_MBX_NEMBED);
++ 	if (alloclen < length) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 				"3098 Allocated DMA memory size (%d) is "
++ 				"less than the requested DMA memory size "
++ 				"(%d)\n", alloclen, length);
++ 		status = -ENOMEM;
++ 		goto out;
++ 	}
++ 	cq_set = mbox->sge_array->addr[0];
++ 	shdr = (union lpfc_sli4_cfg_shdr *)&cq_set->cfg_shdr;
++ 	bf_set(lpfc_mbox_hdr_version, &shdr->request, 0);
++ 
++ 	for (idx = 0; idx < numcq; idx++) {
++ 		cq = cqp[idx];
++ 		eq = eqp[idx];
++ 		if (!cq || !eq) {
++ 			status = -ENOMEM;
++ 			goto out;
++ 		}
++ 
++ 		switch (idx) {
++ 		case 0:
++ 			bf_set(lpfc_mbx_cq_create_set_page_size,
++ 			       &cq_set->u.request,
++ 			       (hw_page_size / SLI4_PAGE_SIZE));
++ 			bf_set(lpfc_mbx_cq_create_set_num_pages,
++ 			       &cq_set->u.request, cq->page_count);
++ 			bf_set(lpfc_mbx_cq_create_set_evt,
++ 			       &cq_set->u.request, 1);
++ 			bf_set(lpfc_mbx_cq_create_set_valid,
++ 			       &cq_set->u.request, 1);
++ 			bf_set(lpfc_mbx_cq_create_set_cqe_size,
++ 			       &cq_set->u.request, 0);
++ 			bf_set(lpfc_mbx_cq_create_set_num_cq,
++ 			       &cq_set->u.request, numcq);
++ 			switch (cq->entry_count) {
++ 			default:
++ 				lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 						"3118 Bad CQ count. (%d)\n",
++ 						cq->entry_count);
++ 				if (cq->entry_count < 256) {
++ 					status = -EINVAL;
++ 					goto out;
++ 				}
++ 				/* otherwise default to smallest (drop thru) */
++ 			case 256:
++ 				bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
++ 				       &cq_set->u.request, LPFC_CQ_CNT_256);
++ 				break;
++ 			case 512:
++ 				bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
++ 				       &cq_set->u.request, LPFC_CQ_CNT_512);
++ 				break;
++ 			case 1024:
++ 				bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
++ 				       &cq_set->u.request, LPFC_CQ_CNT_1024);
++ 				break;
++ 			}
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id0,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 1:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id1,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 2:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id2,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 3:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id3,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 4:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id4,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 5:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id5,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 6:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id6,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 7:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id7,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 8:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id8,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 9:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id9,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 10:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id10,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 11:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id11,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 12:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id12,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 13:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id13,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 14:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id14,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		case 15:
++ 			bf_set(lpfc_mbx_cq_create_set_eq_id15,
++ 			       &cq_set->u.request, eq->queue_id);
++ 			break;
++ 		}
++ 
++ 		/* link the cq onto the parent eq child list */
++ 		list_add_tail(&cq->list, &eq->child_list);
++ 		/* Set up completion queue's type and subtype */
++ 		cq->type = type;
++ 		cq->subtype = subtype;
++ 		cq->assoc_qid = eq->queue_id;
++ 		cq->host_index = 0;
++ 		cq->hba_index = 0;
++ 		cq->entry_repost = LPFC_CQ_REPOST;
++ 
++ 		rc = 0;
++ 		list_for_each_entry(dmabuf, &cq->page_list, list) {
++ 			memset(dmabuf->virt, 0, hw_page_size);
++ 			cnt = page_idx + dmabuf->buffer_tag;
++ 			cq_set->u.request.page[cnt].addr_lo =
++ 					putPaddrLow(dmabuf->phys);
++ 			cq_set->u.request.page[cnt].addr_hi =
++ 					putPaddrHigh(dmabuf->phys);
++ 			rc++;
++ 		}
++ 		page_idx += rc;
++ 	}
++ 
++ 	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_POLL);
++ 
++ 	/* The IOCTL status is embedded in the mailbox subheader. */
++ 	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
++ 	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
++ 	if (shdr_status || shdr_add_status || rc) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 				"3119 CQ_CREATE_SET mailbox failed with "
++ 				"status x%x add_status x%x, mbx status x%x\n",
++ 				shdr_status, shdr_add_status, rc);
++ 		status = -ENXIO;
++ 		goto out;
++ 	}
++ 	rc = bf_get(lpfc_mbx_cq_create_set_base_id, &cq_set->u.response);
++ 	if (rc == 0xFFFF) {
++ 		status = -ENXIO;
++ 		goto out;
++ 	}
++ 
++ 	for (idx = 0; idx < numcq; idx++) {
++ 		cq = cqp[idx];
++ 		cq->queue_id = rc + idx;
++ 	}
++ 
++ out:
++ 	lpfc_sli4_mbox_cmd_free(phba, mbox);
++ 	return status;
++ }
++ 
++ /**
+++>>>>>>> 64eb4dcb140a (scsi: lpfc: Cleanup entry_repost settings on SLI4 queues)
+   * lpfc_mq_create_fb_init - Send MCC_CREATE without async events registration
+   * @phba: HBA structure that indicates port to create a queue on.
+   * @mq: The queue structure to use to create the mailbox queue.
+diff --cc drivers/scsi/lpfc/lpfc_sli4.h
+index 10078254ebc7,cf863db27700..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@@ -134,10 -152,15 +133,18 @@@ struct lpfc_queue 
+  	uint32_t entry_count;	/* Number of entries to support on the queue */
+  	uint32_t entry_size;	/* Size of each queue entry. */
+  	uint32_t entry_repost;	/* Count of entries before doorbell is rung */
+++<<<<<<< HEAD
+ +#define LPFC_QUEUE_MIN_REPOST	8
+++=======
++ #define LPFC_EQ_REPOST		8
++ #define LPFC_MQ_REPOST		8
++ #define LPFC_CQ_REPOST		64
++ #define LPFC_RQ_REPOST		64
++ #define LPFC_RELEASE_NOTIFICATION_INTERVAL	32  /* For WQs */
+++>>>>>>> 64eb4dcb140a (scsi: lpfc: Cleanup entry_repost settings on SLI4 queues)
+  	uint32_t queue_id;	/* Queue ID assigned by the hardware */
+  	uint32_t assoc_qid;     /* Queue ID associated with, for CQ/WQ/MQ */
+ +	struct list_head page_list;
+  	uint32_t page_count;	/* Number of pages allocated for this queue */
+  	uint32_t host_index;	/* The host's index for putting or getting */
+  	uint32_t hba_index;	/* The last known hba index for get or put */
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli4.h
