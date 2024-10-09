@@ -1,0 +1,377 @@
+KVM: PPC: Book3S HV: Flush link stack on guest exit to host kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit af2e8c68b9c5403f77096969c516f742f5bb29e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/af2e8c68.failed
+
+On some systems that are vulnerable to Spectre v2, it is up to
+software to flush the link stack (return address stack), in order to
+protect against Spectre-RSB.
+
+When exiting from a guest we do some house keeping and then
+potentially exit to C code which is several stack frames deep in the
+host kernel. We will then execute a series of returns without
+preceeding calls, opening up the possiblity that the guest could have
+poisoned the link stack, and direct speculative execution of the host
+to a gadget of some sort.
+
+To prevent this we add a flush of the link stack on exit from a guest.
+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit af2e8c68b9c5403f77096969c516f742f5bb29e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+#	arch/powerpc/kernel/security.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/include/asm/asm-prototypes.h
+index 3ce3bff9caca,d84d1417ddb6..000000000000
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@@ -75,7 -152,32 +75,14 @@@ void __kprobes emulation_assist_interru
+  /* Patch sites */
+  extern s32 patch__call_flush_count_cache;
+  extern s32 patch__flush_count_cache_return;
+++<<<<<<< HEAD
+++=======
++ extern s32 patch__flush_link_stack_return;
++ extern s32 patch__call_kvm_flush_link_stack;
++ extern s32 patch__memset_nocache, patch__memcpy_nocache;
+++>>>>>>> af2e8c68b9c5 (KVM: PPC: Book3S HV: Flush link stack on guest exit to host kernel)
+  
+  extern long flush_count_cache;
++ extern long kvm_flush_link_stack;
+  
+ -#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ -void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
+ -void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
+ -#else
+ -static inline void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr,
+ -				     bool preserve_nv) { }
+ -static inline void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr,
+ -					bool preserve_nv) { }
+ -#endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+ -
+ -void kvmhv_save_host_pmu(void);
+ -void kvmhv_load_host_pmu(void);
+ -void kvmhv_save_guest_pmu(struct kvm_vcpu *vcpu, bool pmu_in_use);
+ -void kvmhv_load_guest_pmu(struct kvm_vcpu *vcpu);
+ -
+ -int __kvmhv_vcpu_entry_p9(struct kvm_vcpu *vcpu);
+ -
+ -long kvmppc_h_set_dabr(struct kvm_vcpu *vcpu, unsigned long dabr);
+ -long kvmppc_h_set_xdabr(struct kvm_vcpu *vcpu, unsigned long dabr,
+ -			unsigned long dabrx);
+ -
+  #endif /* _ASM_POWERPC_ASM_PROTOTYPES_H */
+diff --cc arch/powerpc/kernel/security.c
+index 37ad2a92bdf4,bd91dceb7010..000000000000
+--- a/arch/powerpc/kernel/security.c
++++ b/arch/powerpc/kernel/security.c
+@@@ -369,18 -386,49 +369,46 @@@ static __init int stf_barrier_debugfs_i
+  device_initcall(stf_barrier_debugfs_init);
+  #endif /* CONFIG_DEBUG_FS */
+  
+ -static void no_count_cache_flush(void)
+ -{
+ -	count_cache_flush_type = COUNT_CACHE_FLUSH_NONE;
+ -	pr_info("count-cache-flush: software flush disabled.\n");
+ -}
+ -
+  static void toggle_count_cache_flush(bool enable)
+  {
+ -	if (!security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE) &&
+ -	    !security_ftr_enabled(SEC_FTR_FLUSH_LINK_STACK))
+ -		enable = false;
+ -
+ -	if (!enable) {
+ +	if (!enable || !security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE)) {
+  		patch_instruction_site(&patch__call_flush_count_cache, PPC_INST_NOP);
+++<<<<<<< HEAD
+ +		count_cache_flush_type = COUNT_CACHE_FLUSH_NONE;
+ +		pr_info("count-cache-flush: software flush disabled.\n");
+++=======
++ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
++ 		patch_instruction_site(&patch__call_kvm_flush_link_stack, PPC_INST_NOP);
++ #endif
++ 		pr_info("link-stack-flush: software flush disabled.\n");
++ 		link_stack_flush_enabled = false;
++ 		no_count_cache_flush();
+++>>>>>>> af2e8c68b9c5 (KVM: PPC: Book3S HV: Flush link stack on guest exit to host kernel)
+  		return;
+  	}
+  
+  	patch_branch_site(&patch__call_flush_count_cache,
+  			  (u64)&flush_count_cache, BRANCH_SET_LINK);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
++ 	// This enables the branch from guest_exit_cont to kvm_flush_link_stack
++ 	patch_branch_site(&patch__call_kvm_flush_link_stack,
++ 			  (u64)&kvm_flush_link_stack, BRANCH_SET_LINK);
++ #endif
++ 
++ 	pr_info("link-stack-flush: software flush enabled.\n");
++ 	link_stack_flush_enabled = true;
++ 
++ 	// If we just need to flush the link stack, patch an early return
++ 	if (!security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE)) {
++ 		patch_instruction_site(&patch__flush_link_stack_return, PPC_INST_BLR);
++ 		no_count_cache_flush();
++ 		return;
++ 	}
++ 
+++>>>>>>> af2e8c68b9c5 (KVM: PPC: Book3S HV: Flush link stack on guest exit to host kernel)
+  	if (!security_ftr_enabled(SEC_FTR_BCCTR_FLUSH_ASSIST)) {
+  		count_cache_flush_type = COUNT_CACHE_FLUSH_SW;
+  		pr_info("count-cache-flush: full software flush sequence enabled.\n");
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 51727b3d009f,0496e66aaa56..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -1234,6 -1450,104 +1235,107 @@@ mc_cont
+  	mr	r4, r9
+  	bl	kvmhv_accumulate_time
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_XICS
++ 	/* We are exiting, pull the VP from the XIVE */
++ 	lbz	r0, VCPU_XIVE_PUSHED(r9)
++ 	cmpwi	cr0, r0, 0
++ 	beq	1f
++ 	li	r7, TM_SPC_PULL_OS_CTX
++ 	li	r6, TM_QW1_OS
++ 	mfmsr	r0
++ 	andi.	r0, r0, MSR_DR		/* in real mode? */
++ 	beq	2f
++ 	ld	r10, HSTATE_XIVE_TIMA_VIRT(r13)
++ 	cmpldi	cr0, r10, 0
++ 	beq	1f
++ 	/* First load to pull the context, we ignore the value */
++ 	eieio
++ 	lwzx	r11, r7, r10
++ 	/* Second load to recover the context state (Words 0 and 1) */
++ 	ldx	r11, r6, r10
++ 	b	3f
++ 2:	ld	r10, HSTATE_XIVE_TIMA_PHYS(r13)
++ 	cmpldi	cr0, r10, 0
++ 	beq	1f
++ 	/* First load to pull the context, we ignore the value */
++ 	eieio
++ 	lwzcix	r11, r7, r10
++ 	/* Second load to recover the context state (Words 0 and 1) */
++ 	ldcix	r11, r6, r10
++ 3:	std	r11, VCPU_XIVE_SAVED_STATE(r9)
++ 	/* Fixup some of the state for the next load */
++ 	li	r10, 0
++ 	li	r0, 0xff
++ 	stb	r10, VCPU_XIVE_PUSHED(r9)
++ 	stb	r10, (VCPU_XIVE_SAVED_STATE+3)(r9)
++ 	stb	r0, (VCPU_XIVE_SAVED_STATE+4)(r9)
++ 	eieio
++ 1:
++ #endif /* CONFIG_KVM_XICS */
++ 
++ 	/*
++ 	 * Possibly flush the link stack here, before we do a blr in
++ 	 * guest_exit_short_path.
++ 	 */
++ 1:	nop
++ 	patch_site 1b patch__call_kvm_flush_link_stack
++ 
++ 	/* If we came in through the P9 short path, go back out to C now */
++ 	lwz	r0, STACK_SLOT_SHORT_PATH(r1)
++ 	cmpwi	r0, 0
++ 	bne	guest_exit_short_path
++ 
++ 	/* For hash guest, read the guest SLB and save it away */
++ 	ld	r5, VCPU_KVM(r9)
++ 	lbz	r0, KVM_RADIX(r5)
++ 	li	r5, 0
++ 	cmpwi	r0, 0
++ 	bne	3f			/* for radix, save 0 entries */
++ 	lwz	r0,VCPU_SLB_NR(r9)	/* number of entries in SLB */
++ 	mtctr	r0
++ 	li	r6,0
++ 	addi	r7,r9,VCPU_SLB
++ 1:	slbmfee	r8,r6
++ 	andis.	r0,r8,SLB_ESID_V@h
++ 	beq	2f
++ 	add	r8,r8,r6		/* put index in */
++ 	slbmfev	r3,r6
++ 	std	r8,VCPU_SLB_E(r7)
++ 	std	r3,VCPU_SLB_V(r7)
++ 	addi	r7,r7,VCPU_SLB_SIZE
++ 	addi	r5,r5,1
++ 2:	addi	r6,r6,1
++ 	bdnz	1b
++ 	/* Finally clear out the SLB */
++ 	li	r0,0
++ 	slbmte	r0,r0
++ 	slbia
++ 	ptesync
++ 3:	stw	r5,VCPU_SLB_MAX(r9)
++ 
++ 	/* load host SLB entries */
++ BEGIN_MMU_FTR_SECTION
++ 	b	0f
++ END_MMU_FTR_SECTION_IFSET(MMU_FTR_TYPE_RADIX)
++ 	ld	r8,PACA_SLBSHADOWPTR(r13)
++ 
++ 	.rept	SLB_NUM_BOLTED
++ 	li	r3, SLBSHADOW_SAVEAREA
++ 	LDX_BE	r5, r8, r3
++ 	addi	r3, r3, 8
++ 	LDX_BE	r6, r8, r3
++ 	andis.	r7,r5,SLB_ESID_V@h
++ 	beq	1f
++ 	slbmte	r6,r5
++ 1:	addi	r8,r8,16
++ 	.endr
++ 0:
++ 
++ guest_bypass:
++ 	stw	r12, STACK_SLOT_TRAP(r1)
+++>>>>>>> af2e8c68b9c5 (KVM: PPC: Book3S HV: Flush link stack on guest exit to host kernel)
+  
+  	/* Save DEC */
+  	/* Do this before kvmhv_commence_exit so we know TB is guest TB */
+@@@ -1645,6 -1971,125 +1747,128 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S
+  	mtlr	r0
+  	blr
+  
+++<<<<<<< HEAD
+++=======
++ .balign 32
++ .global kvm_flush_link_stack
++ kvm_flush_link_stack:
++ 	/* Save LR into r0 */
++ 	mflr	r0
++ 
++ 	/* Flush the link stack. On Power8 it's up to 32 entries in size. */
++ 	.rept 32
++ 	bl	.+4
++ 	.endr
++ 
++ 	/* And on Power9 it's up to 64. */
++ BEGIN_FTR_SECTION
++ 	.rept 32
++ 	bl	.+4
++ 	.endr
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
++ 
++ 	/* Restore LR */
++ 	mtlr	r0
++ 	blr
++ 
++ kvmppc_guest_external:
++ 	/* External interrupt, first check for host_ipi. If this is
++ 	 * set, we know the host wants us out so let's do it now
++ 	 */
++ 	bl	kvmppc_read_intr
++ 
++ 	/*
++ 	 * Restore the active volatile registers after returning from
++ 	 * a C function.
++ 	 */
++ 	ld	r9, HSTATE_KVM_VCPU(r13)
++ 	li	r12, BOOK3S_INTERRUPT_EXTERNAL
++ 
++ 	/*
++ 	 * kvmppc_read_intr return codes:
++ 	 *
++ 	 * Exit to host (r3 > 0)
++ 	 *   1 An interrupt is pending that needs to be handled by the host
++ 	 *     Exit guest and return to host by branching to guest_exit_cont
++ 	 *
++ 	 *   2 Passthrough that needs completion in the host
++ 	 *     Exit guest and return to host by branching to guest_exit_cont
++ 	 *     However, we also set r12 to BOOK3S_INTERRUPT_HV_RM_HARD
++ 	 *     to indicate to the host to complete handling the interrupt
++ 	 *
++ 	 * Before returning to guest, we check if any CPU is heading out
++ 	 * to the host and if so, we head out also. If no CPUs are heading
++ 	 * check return values <= 0.
++ 	 *
++ 	 * Return to guest (r3 <= 0)
++ 	 *  0 No external interrupt is pending
++ 	 * -1 A guest wakeup IPI (which has now been cleared)
++ 	 *    In either case, we return to guest to deliver any pending
++ 	 *    guest interrupts.
++ 	 *
++ 	 * -2 A PCI passthrough external interrupt was handled
++ 	 *    (interrupt was delivered directly to guest)
++ 	 *    Return to guest to deliver any pending guest interrupts.
++ 	 */
++ 
++ 	cmpdi	r3, 1
++ 	ble	1f
++ 
++ 	/* Return code = 2 */
++ 	li	r12, BOOK3S_INTERRUPT_HV_RM_HARD
++ 	stw	r12, VCPU_TRAP(r9)
++ 	b	guest_exit_cont
++ 
++ 1:	/* Return code <= 1 */
++ 	cmpdi	r3, 0
++ 	bgt	guest_exit_cont
++ 
++ 	/* Return code <= 0 */
++ maybe_reenter_guest:
++ 	ld	r5, HSTATE_KVM_VCORE(r13)
++ 	lwz	r0, VCORE_ENTRY_EXIT(r5)
++ 	cmpwi	r0, 0x100
++ 	mr	r4, r9
++ 	blt	deliver_guest_interrupt
++ 	b	guest_exit_cont
++ 
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ /*
++  * Softpatch interrupt for transactional memory emulation cases
++  * on POWER9 DD2.2.  This is early in the guest exit path - we
++  * haven't saved registers or done a treclaim yet.
++  */
++ kvmppc_tm_emul:
++ 	/* Save instruction image in HEIR */
++ 	mfspr	r3, SPRN_HEIR
++ 	stw	r3, VCPU_HEIR(r9)
++ 
++ 	/*
++ 	 * The cases we want to handle here are those where the guest
++ 	 * is in real suspend mode and is trying to transition to
++ 	 * transactional mode.
++ 	 */
++ 	lbz	r0, HSTATE_FAKE_SUSPEND(r13)
++ 	cmpwi	r0, 0		/* keep exiting guest if in fake suspend */
++ 	bne	guest_exit_cont
++ 	rldicl	r3, r11, 64 - MSR_TS_S_LG, 62
++ 	cmpwi	r3, 1		/* or if not in suspend state */
++ 	bne	guest_exit_cont
++ 
++ 	/* Call C code to do the emulation */
++ 	mr	r3, r9
++ 	bl	kvmhv_p9_tm_emulation_early
++ 	nop
++ 	ld	r9, HSTATE_KVM_VCPU(r13)
++ 	li	r12, BOOK3S_INTERRUPT_HV_SOFTPATCH
++ 	cmpwi	r3, 0
++ 	beq	guest_exit_cont		/* continue exiting if not handled */
++ 	ld	r10, VCPU_PC(r9)
++ 	ld	r11, VCPU_MSR(r9)
++ 	b	fast_interrupt_c_return	/* go back to guest if handled */
++ #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
++ 
+++>>>>>>> af2e8c68b9c5 (KVM: PPC: Book3S HV: Flush link stack on guest exit to host kernel)
+  /*
+   * Check whether an HDSI is an HPTE not found fault or something else.
+   * If it is an HPTE not found fault that is due to the guest accessing
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+* Unmerged path arch/powerpc/kernel/security.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
