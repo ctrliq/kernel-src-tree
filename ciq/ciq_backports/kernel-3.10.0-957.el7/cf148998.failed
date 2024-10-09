@@ -1,0 +1,173 @@
+s390/alternative: use a copy of the facility bit mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] alternative: use a copy of the facility bit mask (Hendrik Brueckner) [1558325]
+Rebuild_FUZZ: 95.05%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit cf1489984641369611556bf00c48f945c77bcf02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cf148998.failed
+
+To be able to switch off specific CPU alternatives with kernel parameters
+make a copy of the facility bit mask provided by STFLE and use the copy
+for the decision to apply an alternative.
+
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit cf1489984641369611556bf00c48f945c77bcf02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/setup.c
+#	arch/s390/kernel/smp.c
+diff --cc arch/s390/kernel/setup.c
+index d6e8e87b465f,bcd2a4a3937e..000000000000
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@@ -324,39 -329,22 +324,47 @@@ static void __init setup_lowcore(void
+  	lc->kernel_stack = ((unsigned long) &init_thread_union)
+  		+ THREAD_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+  	lc->async_stack = (unsigned long)
+ -		memblock_virt_alloc(ASYNC_SIZE, ASYNC_SIZE)
+ +		__alloc_bootmem(ASYNC_SIZE, ASYNC_SIZE, 0)
+  		+ ASYNC_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+  	lc->panic_stack = (unsigned long)
+ -		memblock_virt_alloc(PAGE_SIZE, PAGE_SIZE)
+ +		__alloc_bootmem(PAGE_SIZE, PAGE_SIZE, 0)
+  		+ PAGE_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+ -	lc->current_task = (unsigned long)&init_task;
+ +	lc->current_task = (unsigned long) init_thread_union.thread_info.task;
+ +	lc->thread_info = (unsigned long) &init_thread_union;
+ +#ifdef CONFIG_64BIT
+  	lc->lpp = LPP_MAGIC;
+ +#endif
+  	lc->machine_flags = S390_lowcore.machine_flags;
+ -	lc->preempt_count = S390_lowcore.preempt_count;
+  	lc->stfl_fac_list = S390_lowcore.stfl_fac_list;
+  	memcpy(lc->stfle_fac_list, S390_lowcore.stfle_fac_list,
+++<<<<<<< HEAD
+ +	       MAX_FACILITY_BIT/8);
+ +#ifndef CONFIG_64BIT
+ +	if (MACHINE_HAS_IEEE) {
+ +		lc->extended_save_area_addr = (__u32)
+ +			__alloc_bootmem_low(PAGE_SIZE, PAGE_SIZE, 0);
+ +		/* enable extended save area */
+ +		__ctl_set_bit(14, 29);
+ +	}
+ +#else
+ +	if (MACHINE_HAS_VX || MACHINE_HAS_GS) {
+ +		unsigned long bits, size;
+ +
+ +		bits = MACHINE_HAS_GS ? 11 : 10;
+ +		size = 1UL << bits;
+ +		lc->mcesad = (__u64) __alloc_bootmem_low(size, size, 0);
+ +		if (MACHINE_HAS_GS)
+ +			lc->mcesad |= bits;
+ +	}
+ +	lc->vdso_per_cpu_data = (unsigned long) &lc->paste[0];
+ +#endif
+++=======
++ 	       sizeof(lc->stfle_fac_list));
++ 	memcpy(lc->alt_stfle_fac_list, S390_lowcore.alt_stfle_fac_list,
++ 	       sizeof(lc->alt_stfle_fac_list));
++ 	nmi_alloc_boot_cpu(lc);
++ 	vdso_alloc_boot_cpu(lc);
+++>>>>>>> cf1489984641 (s390/alternative: use a copy of the facility bit mask)
+  	lc->sync_enter_timer = S390_lowcore.sync_enter_timer;
+  	lc->async_enter_timer = S390_lowcore.async_enter_timer;
+  	lc->exit_timer = S390_lowcore.exit_timer;
+diff --cc arch/s390/kernel/smp.c
+index 8eca5b44a73a,fc28c9571647..000000000000
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@@ -297,7 -266,10 +297,14 @@@ static void pcpu_prepare_secondary(stru
+  	__ctl_store(lc->cregs_save_area, 0, 15);
+  	save_access_regs((unsigned int *) lc->access_regs_save_area);
+  	memcpy(lc->stfle_fac_list, S390_lowcore.stfle_fac_list,
+++<<<<<<< HEAD
+ +	       MAX_FACILITY_BIT/8);
+++=======
++ 	       sizeof(lc->stfle_fac_list));
++ 	memcpy(lc->alt_stfle_fac_list, S390_lowcore.alt_stfle_fac_list,
++ 	       sizeof(lc->alt_stfle_fac_list));
++ 	arch_spin_lock_setup(cpu);
+++>>>>>>> cf1489984641 (s390/alternative: use a copy of the facility bit mask)
+  }
+  
+  static void pcpu_attach_task(struct pcpu *pcpu, struct task_struct *tsk)
+diff --git a/arch/s390/include/asm/facility.h b/arch/s390/include/asm/facility.h
+index 0aa6a7ed95a3..155fcc7bcba6 100644
+--- a/arch/s390/include/asm/facility.h
++++ b/arch/s390/include/asm/facility.h
+@@ -13,6 +13,24 @@
+ 
+ #define MAX_FACILITY_BIT (256*8)	/* stfle_fac_list has 256 bytes */
+ 
++static inline void __set_facility(unsigned long nr, void *facilities)
++{
++	unsigned char *ptr = (unsigned char *) facilities;
++
++	if (nr >= MAX_FACILITY_BIT)
++		return;
++	ptr[nr >> 3] |= 0x80 >> (nr & 7);
++}
++
++static inline void __clear_facility(unsigned long nr, void *facilities)
++{
++	unsigned char *ptr = (unsigned char *) facilities;
++
++	if (nr >= MAX_FACILITY_BIT)
++		return;
++	ptr[nr >> 3] &= ~(0x80 >> (nr & 7));
++}
++
+ static inline int __test_facility(unsigned long nr, void *facilities)
+ {
+ 	unsigned char *ptr;
+diff --git a/arch/s390/include/asm/lowcore.h b/arch/s390/include/asm/lowcore.h
+index f7f58dd58e1e..218087be7083 100644
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -327,7 +327,8 @@ struct _lowcore {
+ 	__u8	pad_0x0e20[0x0f00-0x0e20];	/* 0x0e20 */
+ 
+ 	/* Extended facility list */
+-	__u64	stfle_fac_list[32];		/* 0x0f00 */
++	__u64	stfle_fac_list[16];		/* 0x0f00 */
++	__u64	alt_stfle_fac_list[16];		/* 0x0f80 */
+ 	__u8	pad_0x1000[0x11b0-0x1000];	/* 0x1000 */
+ 
+ 	/* Pointer to the machine check extended save area */
+diff --git a/arch/s390/kernel/alternative.c b/arch/s390/kernel/alternative.c
+index 934990fa1fd9..035e47fd4ad2 100644
+--- a/arch/s390/kernel/alternative.c
++++ b/arch/s390/kernel/alternative.c
+@@ -87,7 +87,8 @@ static void __init_or_module __apply_alternatives(struct alt_instr *start,
+ 		instr = (u8 *)&a->instr_offset + a->instr_offset;
+ 		replacement = (u8 *)&a->repl_offset + a->repl_offset;
+ 
+-		if (!test_facility(a->facility))
++		if (!__test_facility(a->facility,
++				     S390_lowcore.alt_stfle_fac_list))
+ 			continue;
+ 
+ 		if (unlikely(a->instrlen % 2 || a->replacementlen % 2)) {
+diff --git a/arch/s390/kernel/early.c b/arch/s390/kernel/early.c
+index 07df74a977d2..43148218ac33 100644
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -283,6 +283,9 @@ static noinline __init void setup_facility_list(void)
+ {
+ 	stfle(S390_lowcore.stfle_fac_list,
+ 	      ARRAY_SIZE(S390_lowcore.stfle_fac_list));
++	memcpy(S390_lowcore.alt_stfle_fac_list,
++	       S390_lowcore.stfle_fac_list,
++	       sizeof(S390_lowcore.alt_stfle_fac_list));
+ }
+ 
+ static __init void detect_mvpg(void)
+* Unmerged path arch/s390/kernel/setup.c
+* Unmerged path arch/s390/kernel/smp.c
