@@ -1,0 +1,290 @@
+cls_bpf: fix offload assumptions after callback conversion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 102740bd9436a3a6ba129af3a48271d794009fa5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/102740bd.failed
+
+cls_bpf used to take care of tracking what offload state a filter
+is in, i.e. it would track if offload request succeeded or not.
+This information would then be used to issue correct requests to
+the driver, e.g. requests for statistics only on offloaded filters,
+removing only filters which were offloaded, using add instead of
+replace if previous filter was not added etc.
+
+This tracking of offload state no longer functions with the new
+callback infrastructure.  There could be multiple entities trying
+to offload the same filter.
+
+Throw out all the tracking and corresponding commands and simply
+pass to the drivers both old and new bpf program.  Drivers will
+have to deal with offload state tracking by themselves.
+
+Fixes: 3f7889c4c79b ("net: sched: cls_bpf: call block callbacks for offload")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 102740bd9436a3a6ba129af3a48271d794009fa5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	include/net/pkt_cls.h
+#	net/sched/cls_bpf.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 4ca14182b178,a4cf62ba4604..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -111,7 -86,57 +111,61 @@@ static void nfp_bpf_vnic_free(struct nf
+  {
+  	if (nn->dp.bpf_offload_xdp)
+  		nfp_bpf_xdp_offload(app, nn, NULL);
+++<<<<<<< HEAD
+ +	kfree(nn->app_priv);
+++=======
++ }
++ 
++ static int nfp_bpf_setup_tc_block_cb(enum tc_setup_type type,
++ 				     void *type_data, void *cb_priv)
++ {
++ 	struct tc_cls_bpf_offload *cls_bpf = type_data;
++ 	struct nfp_net *nn = cb_priv;
++ 
++ 	if (type != TC_SETUP_CLSBPF ||
++ 	    !tc_can_offload(nn->dp.netdev) ||
++ 	    !nfp_net_ebpf_capable(nn) ||
++ 	    cls_bpf->common.protocol != htons(ETH_P_ALL) ||
++ 	    cls_bpf->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 	if (nn->dp.bpf_offload_xdp)
++ 		return -EBUSY;
++ 
++ 	/* Only support TC direct action */
++ 	if (!cls_bpf->exts_integrated ||
++ 	    tcf_exts_has_actions(cls_bpf->exts)) {
++ 		nn_err(nn, "only direct action with no legacy actions supported\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (cls_bpf->command != TC_CLSBPF_OFFLOAD)
++ 		return -EOPNOTSUPP;
++ 
++ 	return nfp_net_bpf_offload(nn, cls_bpf->prog, cls_bpf->oldprog);
++ }
++ 
++ static int nfp_bpf_setup_tc_block(struct net_device *netdev,
++ 				  struct tc_block_offload *f)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_bpf_setup_tc_block_cb,
++ 					     nn, nn);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_bpf_setup_tc_block_cb,
++ 					nn);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> 102740bd9436 (cls_bpf: fix offload assumptions after callback conversion)
+  }
+  
+  static int nfp_bpf_setup_tc(struct nfp_app *app, struct net_device *netdev,
+diff --cc include/net/pkt_cls.h
+index c1d9bcb11bff,8e08b6da72f3..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -577,6 -693,32 +577,35 @@@ struct tc_cls_matchall_offload 
+  	unsigned long cookie;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum tc_clsbpf_command {
++ 	TC_CLSBPF_OFFLOAD,
++ 	TC_CLSBPF_STATS,
++ };
++ 
++ struct tc_cls_bpf_offload {
++ 	struct tc_cls_common_offload common;
++ 	enum tc_clsbpf_command command;
++ 	struct tcf_exts *exts;
++ 	struct bpf_prog *prog;
++ 	struct bpf_prog *oldprog;
++ 	const char *name;
++ 	bool exts_integrated;
++ 	u32 gen_flags;
++ };
++ 
++ struct tc_mqprio_qopt_offload {
++ 	/* struct tc_mqprio_qopt must always be the first element */
++ 	struct tc_mqprio_qopt qopt;
++ 	u16 mode;
++ 	u16 shaper;
++ 	u32 flags;
++ 	u64 min_rate[TC_QOPT_MAX_QUEUE];
++ 	u64 max_rate[TC_QOPT_MAX_QUEUE];
++ };
++ 
+++>>>>>>> 102740bd9436 (cls_bpf: fix offload assumptions after callback conversion)
+  /* This structure holds cookie structure that is passed from user
+   * to the kernel for actions and classifiers
+   */
+diff --cc net/sched/cls_bpf.c
+index c7a7c00a2b7c,8d78e7f4ecc3..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -31,13 -38,16 +31,24 @@@ struct cls_bpf_head 
+  };
+  
+  struct cls_bpf_prog {
+++<<<<<<< HEAD
+ +	struct sk_filter *filter;
+++=======
++ 	struct bpf_prog *filter;
++ 	struct list_head link;
++ 	struct tcf_result res;
++ 	bool exts_integrated;
++ 	u32 gen_flags;
++ 	struct tcf_exts exts;
++ 	u32 handle;
++ 	u16 bpf_num_ops;
+++>>>>>>> 102740bd9436 (cls_bpf: fix offload assumptions after callback conversion)
+  	struct sock_filter *bpf_ops;
+ -	const char *bpf_name;
+ +	struct tcf_exts exts;
+ +	struct tcf_result res;
+ +	struct list_head link;
+ +	u32 handle;
+ +	u16 bpf_len;
+  	struct tcf_proto *tp;
+  	union {
+  		struct work_struct work;
+@@@ -73,23 -134,96 +84,114 @@@ static int cls_bpf_classify(struct sk_b
+  		if (ret < 0)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		return ret;
+ +	}
+ +
+ +	return -1;
+ +}
+ +
+ +
+ +static void cls_bpf_offload(struct tcf_proto *tp, struct cls_bpf_prog *prog,
+ +			    struct cls_bpf_prog *oldprog)
+ +{
+ +	return;
+++=======
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static bool cls_bpf_is_ebpf(const struct cls_bpf_prog *prog)
++ {
++ 	return !prog->bpf_ops;
++ }
++ 
++ static int cls_bpf_offload_cmd(struct tcf_proto *tp, struct cls_bpf_prog *prog,
++ 			       struct cls_bpf_prog *oldprog)
++ {
++ 	struct tcf_block *block = tp->chain->block;
++ 	struct tc_cls_bpf_offload cls_bpf = {};
++ 	struct cls_bpf_prog *obj;
++ 	bool skip_sw;
++ 	int err;
++ 
++ 	skip_sw = prog && tc_skip_sw(prog->gen_flags);
++ 	obj = prog ?: oldprog;
++ 
++ 	tc_cls_common_offload_init(&cls_bpf.common, tp);
++ 	cls_bpf.command = TC_CLSBPF_OFFLOAD;
++ 	cls_bpf.exts = &obj->exts;
++ 	cls_bpf.prog = prog ? prog->filter : NULL;
++ 	cls_bpf.oldprog = oldprog ? oldprog->filter : NULL;
++ 	cls_bpf.name = obj->bpf_name;
++ 	cls_bpf.exts_integrated = obj->exts_integrated;
++ 	cls_bpf.gen_flags = obj->gen_flags;
++ 
++ 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf, skip_sw);
++ 	if (prog) {
++ 		if (err < 0) {
++ 			cls_bpf_offload_cmd(tp, oldprog, prog);
++ 			return err;
++ 		} else if (err > 0) {
++ 			prog->gen_flags |= TCA_CLS_FLAGS_IN_HW;
++ 		}
++ 	}
++ 
++ 	if (prog && skip_sw && !(prog->gen_flags & TCA_CLS_FLAGS_IN_HW))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int cls_bpf_offload(struct tcf_proto *tp, struct cls_bpf_prog *prog,
++ 			   struct cls_bpf_prog *oldprog)
++ {
++ 	if (prog && oldprog && prog->gen_flags != oldprog->gen_flags)
++ 		return -EINVAL;
++ 
++ 	if (prog && tc_skip_hw(prog->gen_flags))
++ 		prog = NULL;
++ 	if (oldprog && tc_skip_hw(oldprog->gen_flags))
++ 		oldprog = NULL;
++ 	if (!prog && !oldprog)
++ 		return 0;
++ 
++ 	return cls_bpf_offload_cmd(tp, prog, oldprog);
+++>>>>>>> 102740bd9436 (cls_bpf: fix offload assumptions after callback conversion)
+  }
+  
+  static void cls_bpf_stop_offload(struct tcf_proto *tp,
+  				 struct cls_bpf_prog *prog)
+  {
+++<<<<<<< HEAD
+ +	return;
+++=======
++ 	int err;
++ 
++ 	err = cls_bpf_offload_cmd(tp, NULL, prog);
++ 	if (err)
++ 		pr_err("Stopping hardware offload failed: %d\n", err);
++ }
++ 
++ static void cls_bpf_offload_update_stats(struct tcf_proto *tp,
++ 					 struct cls_bpf_prog *prog)
++ {
++ 	struct tcf_block *block = tp->chain->block;
++ 	struct tc_cls_bpf_offload cls_bpf = {};
++ 
++ 	tc_cls_common_offload_init(&cls_bpf.common, tp);
++ 	cls_bpf.command = TC_CLSBPF_STATS;
++ 	cls_bpf.exts = &prog->exts;
++ 	cls_bpf.prog = prog->filter;
++ 	cls_bpf.name = prog->bpf_name;
++ 	cls_bpf.exts_integrated = prog->exts_integrated;
++ 	cls_bpf.gen_flags = prog->gen_flags;
++ 
++ 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf, false);
+++>>>>>>> 102740bd9436 (cls_bpf: fix offload assumptions after callback conversion)
+  }
+  
+  static int cls_bpf_init(struct tcf_proto *tp)
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path net/sched/cls_bpf.c
