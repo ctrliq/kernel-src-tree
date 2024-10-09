@@ -1,0 +1,169 @@
+PCI: hv: Allocate physically contiguous hypercall params buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [pci] hv: Allocate physically contiguous hypercall params buffer (Cathy Avery) [1364313]
+Rebuild_FUZZ: 95.87%
+commit-author Long Li <longli@microsoft.com>
+commit 0de8ce3ee8e38cc66683438f715c79a2cc69539e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0de8ce3e.failed
+
+hv_do_hypercall() assumes that we pass a segment from a physically
+contiguous buffer.  A buffer allocated on the stack may not work if
+CONFIG_VMAP_STACK=y is set.
+
+Use kmalloc() to allocate this buffer.
+
+	Reported-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: Long Li <longli@microsoft.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Acked-by: K. Y. Srinivasan <kys@microsoft.com>
+(cherry picked from commit 0de8ce3ee8e38cc66683438f715c79a2cc69539e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci-hyperv.c
+diff --cc drivers/pci/pci-hyperv.c
+index b80985e23a14,3efcc7bdc5fb..000000000000
+--- a/drivers/pci/pci-hyperv.c
++++ b/drivers/pci/pci-hyperv.c
+@@@ -371,7 -374,12 +371,16 @@@ struct hv_pcibus_device 
+  
+  	struct list_head children;
+  	struct list_head dr_list;
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	struct work_struct wrk;
+++=======
++ 
++ 	struct msi_domain_info msi_info;
++ 	struct msi_controller msi_chip;
++ 	struct irq_domain *irq_domain;
++ 	struct retarget_msi_interrupt retarget_msi_interrupt_params;
++ 	spinlock_t retarget_msi_interrupt_lock;
+++>>>>>>> 0de8ce3ee8e3 (PCI: hv: Allocate physically contiguous hypercall params buffer):drivers/pci/host/pci-hyperv.c
+  };
+  
+  /*
+@@@ -698,69 -752,66 +707,88 @@@ struct irq_cfg *irqd_cfg(struct irq_dat
+  static int hv_set_affinity(struct irq_data *data, const struct cpumask *dest,
+  			   bool force)
+  {
+ -	struct irq_data *parent = data->parent_data;
+ -
+ -	return parent->chip->irq_set_affinity(parent, dest, force);
+ -}
+ -
+ -static void hv_irq_mask(struct irq_data *data)
+ -{
+ -	pci_msi_mask_irq(data);
+ -}
+ -
+ -/**
+ - * hv_irq_unmask() - "Unmask" the IRQ by setting its current
+ - * affinity.
+ - * @data:	Describes the IRQ
+ - *
+ - * Build new a destination for the MSI and make a hypercall to
+ - * update the Interrupt Redirection Table. "Device Logical ID"
+ - * is built out of this PCI bus's instance GUID and the function
+ - * number of the device.
+ - */
+ -static void hv_irq_unmask(struct irq_data *data)
+ -{
+ -	struct msi_desc *msi_desc = irq_data_get_msi_desc(data);
+  	struct irq_cfg *cfg = irqd_cfg(data);
+- 	struct retarget_msi_interrupt params;
++ 	struct retarget_msi_interrupt *params;
+  	struct hv_pcibus_device *hbus;
+ -	struct cpumask *dest;
+  	struct pci_bus *pbus;
+  	struct pci_dev *pdev;
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	int cpu, ret;
+ +	unsigned int dest_id;
+++=======
++ 	int cpu;
++ 	unsigned long flags;
+++>>>>>>> 0de8ce3ee8e3 (PCI: hv: Allocate physically contiguous hypercall params buffer):drivers/pci/host/pci-hyperv.c
+  
+ -	dest = irq_data_get_affinity_mask(data);
+ -	pdev = msi_desc_to_pci_dev(msi_desc);
+ +	ret = __ioapic_set_affinity(data, dest, &dest_id);
+ +	if (ret)
+ +		return ret;
+ +
+ +	pdev = msi_desc_to_pci_dev(data->msi_desc);
+  	pbus = pdev->bus;
+  	hbus = container_of(pbus->sysdata, struct hv_pcibus_device, sysdata);
+  
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	memset(&params, 0, sizeof(params));
+ +	params.partition_id = HV_PARTITION_ID_SELF;
+ +	params.source = 1; /* MSI(-X) */
+ +	params.address = data->msi_desc->msg.address_lo;
+ +	params.data = data->msi_desc->msg.data;
+ +	params.device_id = (hbus->hdev->dev_instance.b[5] << 24) |
+++=======
++ 	spin_lock_irqsave(&hbus->retarget_msi_interrupt_lock, flags);
++ 
++ 	params = &hbus->retarget_msi_interrupt_params;
++ 	memset(params, 0, sizeof(*params));
++ 	params->partition_id = HV_PARTITION_ID_SELF;
++ 	params->source = 1; /* MSI(-X) */
++ 	params->address = msi_desc->msg.address_lo;
++ 	params->data = msi_desc->msg.data;
++ 	params->device_id = (hbus->hdev->dev_instance.b[5] << 24) |
+++>>>>>>> 0de8ce3ee8e3 (PCI: hv: Allocate physically contiguous hypercall params buffer):drivers/pci/host/pci-hyperv.c
+  			   (hbus->hdev->dev_instance.b[4] << 16) |
+  			   (hbus->hdev->dev_instance.b[7] << 8) |
+  			   (hbus->hdev->dev_instance.b[6] & 0xf8) |
+  			   PCI_FUNC(pdev->devfn);
+- 	params.vector = cfg->vector;
++ 	params->vector = cfg->vector;
+  
+  	for_each_cpu_and(cpu, dest, cpu_online_mask)
+- 		params.vp_mask |= (1ULL << vmbus_cpu_number_to_vp_number(cpu));
++ 		params->vp_mask |= (1ULL << vmbus_cpu_number_to_vp_number(cpu));
++ 
++ 	hv_do_hypercall(HVCALL_RETARGET_INTERRUPT, params, NULL);
+  
+- 	hv_do_hypercall(HVCALL_RETARGET_INTERRUPT, &params, NULL);
++ 	spin_unlock_irqrestore(&hbus->retarget_msi_interrupt_lock, flags);
+  
+ -	pci_msi_unmask_irq(data);
+ +	return 0;
+ +}
+ +
+ +int hv_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
+ +{
+ +	struct msi_desc *msidesc;
+ +	struct irq_chip *chip;
+ +	int ret;
+ +
+ +	/*
+ +	 * Call the base function which will do everything related to setting up
+ +	 * the tracking structures.
+ +	 */
+ +
+ +	ret = hv_msi.setup_msi_irqs(pdev, nvec, type);
+ +	if (ret)
+ +		return ret;
+ +
+ +	list_for_each_entry(msidesc, &pdev->msi_list, list) {
+ +		if (msidesc->irq) {
+ +			chip = irq_get_chip(msidesc->irq);
+ +			/*
+ +			 * Replace the affinity callback so that it doesn't
+ +			 * rearrage the message in the hardware.
+ +			 */
+ +			chip->irq_set_affinity = hv_set_affinity;
+ +		}
+ +	}
+ +
+ +	return 0;
+  }
+  
+  struct compose_comp_ctxt {
+* Unmerged path drivers/pci/pci-hyperv.c
