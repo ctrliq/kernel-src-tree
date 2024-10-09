@@ -1,0 +1,184 @@
+prctl: Add speculation control prctls
+
+jira LE-1907
+cve CVE-2018-3639
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit b617cfc858161140d69cc0b5cc211996b557a1c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b617cfc8.failed
+
+Add two new prctls to control aspects of speculation related vulnerabilites
+and their mitigations to provide finer grained control over performance
+impacting mitigations.
+
+PR_GET_SPECULATION_CTRL returns the state of the speculation misfeature
+which is selected with arg2 of prctl(2). The return value uses bit 0-2 with
+the following meaning:
+
+Bit  Define           Description
+0    PR_SPEC_PRCTL    Mitigation can be controlled per task by
+                      PR_SET_SPECULATION_CTRL
+1    PR_SPEC_ENABLE   The speculation feature is enabled, mitigation is
+                      disabled
+2    PR_SPEC_DISABLE  The speculation feature is disabled, mitigation is
+                      enabled
+
+If all bits are 0 the CPU is not affected by the speculation misfeature.
+
+If PR_SPEC_PRCTL is set, then the per task control of the mitigation is
+available. If not set, prctl(PR_SET_SPECULATION_CTRL) for the speculation
+misfeature will fail.
+
+PR_SET_SPECULATION_CTRL allows to control the speculation misfeature, which
+is selected by arg2 of prctl(2) per task. arg3 is used to hand in the
+control value, i.e. either PR_SPEC_ENABLE or PR_SPEC_DISABLE.
+
+The common return values are:
+
+EINVAL  prctl is not implemented by the architecture or the unused prctl()
+        arguments are not 0
+ENODEV  arg2 is selecting a not supported speculation misfeature
+
+PR_SET_SPECULATION_CTRL has these additional return values:
+
+ERANGE  arg3 is incorrect, i.e. it's not either PR_SPEC_ENABLE or PR_SPEC_DISABLE
+ENXIO   prctl control of the selected speculation misfeature is disabled
+
+The first supported controlable speculation misfeature is
+PR_SPEC_STORE_BYPASS. Add the define so this can be shared between
+architectures.
+
+Based on an initial patch from Tim Chen and mostly rewritten.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit b617cfc858161140d69cc0b5cc211996b557a1c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/prctl/spec_ctrl.rst
+#	Documentation/userspace-api/index.rst
+#	include/linux/nospec.h
+#	include/uapi/linux/prctl.h
+#	kernel/sys.c
+diff --cc include/uapi/linux/prctl.h
+index f818d081129b,ebf057ac1346..000000000000
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@@ -192,4 -198,24 +192,27 @@@ struct prctl_mm_map 
+  # define PR_CAP_AMBIENT_LOWER		3
+  # define PR_CAP_AMBIENT_CLEAR_ALL	4
+  
+++<<<<<<< HEAD
+++=======
++ /* arm64 Scalable Vector Extension controls */
++ /* Flag values must be kept in sync with ptrace NT_ARM_SVE interface */
++ #define PR_SVE_SET_VL			50	/* set task vector length */
++ # define PR_SVE_SET_VL_ONEXEC		(1 << 18) /* defer effect until exec */
++ #define PR_SVE_GET_VL			51	/* get task vector length */
++ /* Bits common to PR_SVE_SET_VL and PR_SVE_GET_VL */
++ # define PR_SVE_VL_LEN_MASK		0xffff
++ # define PR_SVE_VL_INHERIT		(1 << 17) /* inherit across exec */
++ 
++ /* Per task speculation control */
++ #define PR_GET_SPECULATION_CTRL		52
++ #define PR_SET_SPECULATION_CTRL		53
++ /* Speculation control variants */
++ # define PR_SPEC_STORE_BYPASS		0
++ /* Return and control values for PR_SET/GET_SPECULATION_CTRL */
++ # define PR_SPEC_NOT_AFFECTED		0
++ # define PR_SPEC_PRCTL			(1UL << 0)
++ # define PR_SPEC_ENABLE			(1UL << 1)
++ # define PR_SPEC_DISABLE		(1UL << 2)
++ 
+++>>>>>>> b617cfc85816 (prctl: Add speculation control prctls)
+  #endif /* _LINUX_PRCTL_H */
+diff --cc kernel/sys.c
+index 113961cf6711,b76dee23bdc9..000000000000
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@@ -2321,6 -2226,34 +2323,37 @@@ static int prctl_get_tid_address(struc
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static int propagate_has_child_subreaper(struct task_struct *p, void *data)
++ {
++ 	/*
++ 	 * If task has has_child_subreaper - all its decendants
++ 	 * already have these flag too and new decendants will
++ 	 * inherit it on fork, skip them.
++ 	 *
++ 	 * If we've found child_reaper - skip descendants in
++ 	 * it's subtree as they will never get out pidns.
++ 	 */
++ 	if (p->signal->has_child_subreaper ||
++ 	    is_child_reaper(task_pid(p)))
++ 		return 0;
++ 
++ 	p->signal->has_child_subreaper = 1;
++ 	return 1;
++ }
++ 
++ int __weak arch_prctl_spec_ctrl_get(unsigned long which)
++ {
++ 	return -EINVAL;
++ }
++ 
++ int __weak arch_prctl_spec_ctrl_set(unsigned long which, unsigned long ctrl)
++ {
++ 	return -EINVAL;
++ }
++ 
+++>>>>>>> b617cfc85816 (prctl: Add speculation control prctls)
+  SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+  		unsigned long, arg4, unsigned long, arg5)
+  {
+@@@ -2503,8 -2444,34 +2536,33 @@@
+  		error = MPX_ENABLE_MANAGEMENT();
+  		break;
+  	case PR_MPX_DISABLE_MANAGEMENT:
+ -		if (arg2 || arg3 || arg4 || arg5)
+ -			return -EINVAL;
+  		error = MPX_DISABLE_MANAGEMENT();
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case PR_SET_FP_MODE:
++ 		error = SET_FP_MODE(me, arg2);
++ 		break;
++ 	case PR_GET_FP_MODE:
++ 		error = GET_FP_MODE(me);
++ 		break;
++ 	case PR_SVE_SET_VL:
++ 		error = SVE_SET_VL(arg2);
++ 		break;
++ 	case PR_SVE_GET_VL:
++ 		error = SVE_GET_VL();
++ 		break;
++ 	case PR_GET_SPECULATION_CTRL:
++ 		if (arg3 || arg4 || arg5)
++ 			return -EINVAL;
++ 		error = arch_prctl_spec_ctrl_get(arg2);
++ 		break;
++ 	case PR_SET_SPECULATION_CTRL:
++ 		if (arg4 || arg5)
++ 			return -EINVAL;
++ 		error = arch_prctl_spec_ctrl_set(arg2, arg3);
++ 		break;
+++>>>>>>> b617cfc85816 (prctl: Add speculation control prctls)
+  	default:
+  		error = -EINVAL;
+  		break;
+* Unmerged path Documentation/prctl/spec_ctrl.rst
+* Unmerged path Documentation/userspace-api/index.rst
+* Unmerged path include/linux/nospec.h
+* Unmerged path Documentation/prctl/spec_ctrl.rst
+* Unmerged path Documentation/userspace-api/index.rst
+* Unmerged path include/linux/nospec.h
+* Unmerged path include/uapi/linux/prctl.h
+* Unmerged path kernel/sys.c
