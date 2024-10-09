@@ -1,0 +1,298 @@
+mlx4: add rx_alloc_pages counter in ethtool -S
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 7d7bfc6a3f69d2debe104656fadd8d568fda0e5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7d7bfc6a.failed
+
+This new counter tracks number of pages that we allocated for one port.
+
+lpaa24:~# ethtool -S eth0 | egrep 'rx_alloc_pages|rx_packets'
+     rx_packets: 306755183
+     rx_alloc_pages: 932897
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7d7bfc6a3f69d2debe104656fadd8d568fda0e5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_port.c
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_port.c
+index 49985ff6d757,e0eb695318e6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+@@@ -213,6 -213,10 +213,13 @@@ int mlx4_en_DUMP_ETH_STATS(struct mlx4_
+  	priv->port_stats.rx_chksum_good = 0;
+  	priv->port_stats.rx_chksum_none = 0;
+  	priv->port_stats.rx_chksum_complete = 0;
+++<<<<<<< HEAD
+++=======
++ 	priv->port_stats.rx_alloc_pages = 0;
++ 	priv->xdp_stats.rx_xdp_drop    = 0;
++ 	priv->xdp_stats.rx_xdp_tx      = 0;
++ 	priv->xdp_stats.rx_xdp_tx_full = 0;
+++>>>>>>> 7d7bfc6a3f69 (mlx4: add rx_alloc_pages counter in ethtool -S)
+  	for (i = 0; i < priv->rx_ring_num; i++) {
+  		const struct mlx4_en_rx_ring *ring = priv->rx_ring[i];
+  
+@@@ -220,6 -224,10 +227,13 @@@
+  		priv->port_stats.rx_chksum_good += READ_ONCE(ring->csum_ok);
+  		priv->port_stats.rx_chksum_none += READ_ONCE(ring->csum_none);
+  		priv->port_stats.rx_chksum_complete += READ_ONCE(ring->csum_complete);
+++<<<<<<< HEAD
+++=======
++ 		priv->port_stats.rx_alloc_pages += READ_ONCE(ring->rx_alloc_pages);
++ 		priv->xdp_stats.rx_xdp_drop	+= READ_ONCE(ring->xdp_drop);
++ 		priv->xdp_stats.rx_xdp_tx	+= READ_ONCE(ring->xdp_tx);
++ 		priv->xdp_stats.rx_xdp_tx_full	+= READ_ONCE(ring->xdp_tx_full);
+++>>>>>>> 7d7bfc6a3f69 (mlx4: add rx_alloc_pages counter in ethtool -S)
+  	}
+  	priv->port_stats.tx_chksum_offload = 0;
+  	priv->port_stats.queue_stopped = 0;
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 984f22166c89,d3a425fa46b3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -87,133 -72,40 +87,145 @@@ static int mlx4_alloc_pages(struct mlx4
+  }
+  
+  static int mlx4_en_alloc_frags(struct mlx4_en_priv *priv,
++ 			       struct mlx4_en_rx_ring *ring,
+  			       struct mlx4_en_rx_desc *rx_desc,
+  			       struct mlx4_en_rx_alloc *frags,
+ +			       struct mlx4_en_rx_alloc *ring_alloc,
+  			       gfp_t gfp)
+  {
+ +	struct mlx4_en_rx_alloc page_alloc[MLX4_EN_MAX_RX_FRAGS];
+ +	const struct mlx4_en_frag_info *frag_info;
+ +	struct page *page;
+ +	dma_addr_t dma;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < priv->num_frags; i++) {
+ +		frag_info = &priv->frag_info[i];
+ +		page_alloc[i] = ring_alloc[i];
+ +		page_alloc[i].page_offset += frag_info->frag_stride;
+ +
+ +		if (page_alloc[i].page_offset + frag_info->frag_stride <=
+ +		    ring_alloc[i].page_size)
+ +			continue;
+ +
+ +		if (unlikely(mlx4_alloc_pages(priv, &page_alloc[i],
+ +					      frag_info, gfp)))
+ +			goto out;
+ +	}
+ +
+ +	for (i = 0; i < priv->num_frags; i++) {
+ +		frags[i] = ring_alloc[i];
+ +		dma = ring_alloc[i].dma + ring_alloc[i].page_offset;
+ +		ring_alloc[i] = page_alloc[i];
+ +		rx_desc->data[i].addr = cpu_to_be64(dma);
+ +	}
+ +
+ +	return 0;
+ +
+ +out:
+ +	while (i--) {
+ +		if (page_alloc[i].page != ring_alloc[i].page) {
+ +			dma_unmap_page(priv->ddev, page_alloc[i].dma,
+ +				page_alloc[i].page_size,
+ +				priv->frag_info[i].dma_dir);
+ +			page = page_alloc[i].page;
+ +			/* Revert changes done by mlx4_alloc_pages */
+ +			page_ref_sub(page, page_alloc[i].page_size /
+ +					   priv->frag_info[i].frag_stride - 1);
+ +			put_page(page);
+ +		}
+ +	}
+ +	return -ENOMEM;
+ +}
+ +
+ +static void mlx4_en_free_frag(struct mlx4_en_priv *priv,
+ +			      struct mlx4_en_rx_alloc *frags,
+ +			      int i)
+ +{
+ +	const struct mlx4_en_frag_info *frag_info = &priv->frag_info[i];
+ +	u32 next_frag_end = frags[i].page_offset + 2 * frag_info->frag_stride;
+ +
+ +	if (next_frag_end > frags[i].page_size)
+ +		dma_unmap_page(priv->ddev, frags[i].dma, frags[i].page_size,
+ +			       frag_info->dma_dir);
+ +
+ +	if (frags[i].page)
+ +		put_page(frags[i].page);
+ +}
+ +
+ +static int mlx4_en_init_allocator(struct mlx4_en_priv *priv,
+ +				  struct mlx4_en_rx_ring *ring)
+ +{
+ +	int i;
+ +	struct mlx4_en_rx_alloc *page_alloc;
+ +
+ +	for (i = 0; i < priv->num_frags; i++) {
+ +		const struct mlx4_en_frag_info *frag_info = &priv->frag_info[i];
+ +
+ +		if (mlx4_alloc_pages(priv, &ring->page_alloc[i],
+ +				     frag_info, GFP_KERNEL | __GFP_COLD))
+ +			goto out;
+ +
+ +		en_dbg(DRV, priv, "  frag %d allocator: - size:%d frags:%d\n",
+ +		       i, ring->page_alloc[i].page_size,
+ +		       page_ref_count(ring->page_alloc[i].page));
+++=======
++ 	for (i = 0; i < priv->num_frags; i++, frags++) {
++ 		if (!frags->page) {
++ 			if (mlx4_alloc_page(priv, frags, gfp))
++ 				return -ENOMEM;
++ 			ring->rx_alloc_pages++;
++ 		}
++ 		rx_desc->data[i].addr = cpu_to_be64(frags->dma +
++ 						    frags->page_offset);
+++>>>>>>> 7d7bfc6a3f69 (mlx4: add rx_alloc_pages counter in ethtool -S)
+  	}
+  	return 0;
+ +
+ +out:
+ +	while (i--) {
+ +		struct page *page;
+ +
+ +		page_alloc = &ring->page_alloc[i];
+ +		dma_unmap_page(priv->ddev, page_alloc->dma,
+ +			       page_alloc->page_size,
+ +			       priv->frag_info[i].dma_dir);
+ +		page = page_alloc->page;
+ +		/* Revert changes done by mlx4_alloc_pages */
+ +		page_ref_sub(page, page_alloc->page_size /
+ +				   priv->frag_info[i].frag_stride - 1);
+ +		put_page(page);
+ +		page_alloc->page = NULL;
+ +	}
+ +	return -ENOMEM;
+  }
+  
+ -static void mlx4_en_free_frag(const struct mlx4_en_priv *priv,
+ -			      struct mlx4_en_rx_alloc *frag)
+ +static void mlx4_en_destroy_allocator(struct mlx4_en_priv *priv,
+ +				      struct mlx4_en_rx_ring *ring)
+  {
+ -	if (frag->page) {
+ -		dma_unmap_page(priv->ddev, frag->dma,
+ -			       PAGE_SIZE, priv->dma_dir);
+ -		__free_page(frag->page);
+ +	struct mlx4_en_rx_alloc *page_alloc;
+ +	int i;
+ +
+ +	for (i = 0; i < priv->num_frags; i++) {
+ +		const struct mlx4_en_frag_info *frag_info = &priv->frag_info[i];
+ +
+ +		page_alloc = &ring->page_alloc[i];
+ +		en_dbg(DRV, priv, "Freeing allocator:%d count:%d\n",
+ +		       i, page_count(page_alloc->page));
+ +
+ +		dma_unmap_page(priv->ddev, page_alloc->dma,
+ +				page_alloc->page_size, frag_info->dma_dir);
+ +		while (page_alloc->page_offset + frag_info->frag_stride <
+ +		       page_alloc->page_size) {
+ +			put_page(page_alloc->page);
+ +			page_alloc->page_offset += frag_info->frag_stride;
+ +		}
+ +		page_alloc->page = NULL;
+  	}
+ -	/* We need to clear all fields, otherwise a change of priv->log_rx_info
+ -	 * could lead to see garbage later in frag->page.
+ -	 */
+ -	memset(frag, 0, sizeof(*frag));
+  }
+  
+ -static void mlx4_en_init_rx_desc(const struct mlx4_en_priv *priv,
+ +static void mlx4_en_init_rx_desc(struct mlx4_en_priv *priv,
+  				 struct mlx4_en_rx_ring *ring, int index)
+  {
+  	struct mlx4_en_rx_desc *rx_desc = ring->buf + ring->stride * index;
+@@@ -245,17 -137,23 +257,20 @@@ static int mlx4_en_prepare_rx_desc(stru
+  	struct mlx4_en_rx_desc *rx_desc = ring->buf + (index * ring->stride);
+  	struct mlx4_en_rx_alloc *frags = ring->rx_info +
+  					(index << priv->log_rx_info);
+- 
+  	if (ring->page_cache.index > 0) {
+ -		/* XDP uses a single page per frame */
+ -		if (!frags->page) {
+ -			ring->page_cache.index--;
+ -			frags->page = ring->page_cache.buf[ring->page_cache.index].page;
+ -			frags->dma  = ring->page_cache.buf[ring->page_cache.index].dma;
+ -		}
+ -		frags->page_offset = XDP_PACKET_HEADROOM;
+ -		rx_desc->data[0].addr = cpu_to_be64(frags->dma +
+ -						    XDP_PACKET_HEADROOM);
+ +		frags[0] = ring->page_cache.buf[--ring->page_cache.index];
+ +		rx_desc->data[0].addr = cpu_to_be64(frags[0].dma);
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	return mlx4_en_alloc_frags(priv, rx_desc, frags, ring->page_alloc, gfp);
+++=======
++ 	return mlx4_en_alloc_frags(priv, ring, rx_desc, frags, gfp);
+++>>>>>>> 7d7bfc6a3f69 (mlx4: add rx_alloc_pages counter in ethtool -S)
+  }
+  
+ -static bool mlx4_en_is_ring_empty(const struct mlx4_en_rx_ring *ring)
+ +static inline bool mlx4_en_is_ring_empty(struct mlx4_en_rx_ring *ring)
+  {
+  	return ring->prod == ring->cons;
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index d8f46d99701e,39f401aa3047..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -355,6 -346,10 +355,13 @@@ struct mlx4_en_rx_ring 
+  	unsigned long csum_ok;
+  	unsigned long csum_none;
+  	unsigned long csum_complete;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long rx_alloc_pages;
++ 	unsigned long xdp_drop;
++ 	unsigned long xdp_tx;
++ 	unsigned long xdp_tx_full;
+++>>>>>>> 7d7bfc6a3f69 (mlx4: add rx_alloc_pages counter in ethtool -S)
+  	unsigned long dropped;
+  	int hwtstamp_rx_filter;
+  	cpumask_var_t affinity_mask;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index f561c634be3a..60bcf83096a8 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@ -117,7 +117,7 @@ static const char main_strings[][ETH_GSTRING_LEN] = {
+ 	/* port statistics */
+ 	"tso_packets",
+ 	"xmit_more",
+-	"queue_stopped", "wake_queue", "tx_timeout", "rx_alloc_failed",
++	"queue_stopped", "wake_queue", "tx_timeout", "rx_alloc_pages",
+ 	"rx_csum_good", "rx_csum_none", "rx_csum_complete", "tx_chksum_offload",
+ 
+ 	/* pf statistics */
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_port.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h
+index 7fd466c0b929..4b469b631557 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_stats.h
+@@ -37,7 +37,7 @@ struct mlx4_en_port_stats {
+ 	unsigned long queue_stopped;
+ 	unsigned long wake_queue;
+ 	unsigned long tx_timeout;
+-	unsigned long rx_alloc_failed;
++	unsigned long rx_alloc_pages;
+ 	unsigned long rx_chksum_good;
+ 	unsigned long rx_chksum_none;
+ 	unsigned long rx_chksum_complete;
