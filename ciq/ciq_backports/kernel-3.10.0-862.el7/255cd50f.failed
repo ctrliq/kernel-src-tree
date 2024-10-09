@@ -1,0 +1,110 @@
+net: sched: fix use-after-free in tcf_action_destroy and tcf_del_walker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: fix use-after-free in tcf_action_destroy and tcf_del_walker (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 96.35%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 255cd50f207ae8ec7b22663246c833407744e634
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/255cd50f.failed
+
+Recent commit d7fb60b9cafb ("net_sched: get rid of tcfa_rcu") removed
+freeing in call_rcu, which changed already existing hard-to-hit
+race condition into 100% hit:
+
+[  598.599825] BUG: unable to handle kernel NULL pointer dereference at 0000000000000030
+[  598.607782] IP: tcf_action_destroy+0xc0/0x140
+
+Or:
+
+[   40.858924] BUG: unable to handle kernel NULL pointer dereference at 0000000000000030
+[   40.862840] IP: tcf_generic_walker+0x534/0x820
+
+Fix this by storing the ops and use them directly for module_put call.
+
+Fixes: a85a970af265 ("net_sched: move tc_action into tcf_common")
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 255cd50f207ae8ec7b22663246c833407744e634)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index f6d266c05d33,da6fa82c98a8..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -133,31 -161,29 +133,42 @@@ nla_put_failure
+  	goto done;
+  }
+  
+ -static int tcf_del_walker(struct tcf_idrinfo *idrinfo, struct sk_buff *skb,
+ -			  const struct tc_action_ops *ops)
+ +static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a)
+  {
+ +	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+ +	struct hlist_head *head;
+ +	struct hlist_node *n;
+ +	struct tcf_common *p;
+  	struct nlattr *nest;
+ -	int n_i = 0;
+ +	int i = 0, n_i = 0;
+  	int ret = -EINVAL;
+ -	struct idr *idr = &idrinfo->action_idr;
+ -	struct tc_action *p;
+ -	unsigned long id = 1;
+  
+ -	nest = nla_nest_start(skb, 0);
+ +	nest = nla_nest_start(skb, a->order);
+  	if (nest == NULL)
+  		goto nla_put_failure;
+ -	if (nla_put_string(skb, TCA_KIND, ops->kind))
+ +	if (nla_put_string(skb, TCA_KIND, a->ops->kind))
+  		goto nla_put_failure;
+++<<<<<<< HEAD
+ +	for (i = 0; i < (hinfo->hmask + 1); i++) {
+ +		head = &hinfo->htab[tcf_hash(i, hinfo->hmask)];
+ +		hlist_for_each_entry_safe(p, n, head, tcfc_head) {
+ +			a->priv = p;
+ +			ret = __tcf_hash_release(a, false, true);
+ +			if (ret == ACT_P_DELETED) {
+ +				module_put(a->ops->owner);
+ +				n_i++;
+ +			} else if (ret < 0)
+ +				goto nla_put_failure;
+++=======
++ 
++ 	idr_for_each_entry_ext(idr, p, id) {
++ 		ret = __tcf_idr_release(p, false, true);
++ 		if (ret == ACT_P_DELETED) {
++ 			module_put(ops->owner);
++ 			n_i++;
++ 		} else if (ret < 0) {
++ 			goto nla_put_failure;
+++>>>>>>> 255cd50f207a (net: sched: fix use-after-free in tcf_action_destroy and tcf_del_walker)
+  		}
+  	}
+  	if (nla_put_u32(skb, TCA_FCNT, n_i))
+@@@ -466,13 -519,12 +478,18 @@@ int tcf_action_destroy(struct list_hea
+  	int ret = 0;
+  
+  	list_for_each_entry_safe(a, tmp, actions, list) {
+++<<<<<<< HEAD
+ +		ret = __tcf_hash_release(a, bind, true);
+++=======
++ 		ops = a->ops;
++ 		ret = __tcf_idr_release(a, bind, true);
+++>>>>>>> 255cd50f207a (net: sched: fix use-after-free in tcf_action_destroy and tcf_del_walker)
+  		if (ret == ACT_P_DELETED)
+- 			module_put(a->ops->owner);
++ 			module_put(ops->owner);
+  		else if (ret < 0)
+  			return ret;
+ +		list_del(&a->list);
+ +		kfree(a);
+  	}
+  	return ret;
+  }
+* Unmerged path net/sched/act_api.c
