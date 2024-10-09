@@ -1,0 +1,325 @@
+alx: prepare tx path for multi queue support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tobias Regnery <tobias.regnery@gmail.com>
+commit 2e06826bc659e0ff664b709719d746b7b088827b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2e06826b.failed
+
+This patch prepares the tx path to send data on multiple tx queues. It
+introduces per queue register adresses and uses them in the alx_tx_queue
+structs.
+
+There are new helper functions for the queue mapping in the tx path.
+
+Based on the downstream driver at github.com/qca/alx
+
+	Signed-off-by: Tobias Regnery <tobias.regnery@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2e06826bc659e0ff664b709719d746b7b088827b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/alx/main.c
+diff --cc drivers/net/ethernet/atheros/alx/main.c
+index b165b9e58ad3,0e773a2ca6a0..000000000000
+--- a/drivers/net/ethernet/atheros/alx/main.c
++++ b/drivers/net/ethernet/atheros/alx/main.c
+@@@ -160,24 -143,42 +160,55 @@@ static int alx_refill_rx_ring(struct al
+  	return count;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int alx_tpd_avail(struct alx_priv *alx)
+++=======
++ static struct alx_tx_queue *alx_tx_queue_mapping(struct alx_priv *alx,
++ 						 struct sk_buff *skb)
++ {
++ 	unsigned int r_idx = skb->queue_mapping;
++ 
++ 	if (r_idx >= alx->num_txq)
++ 		r_idx = r_idx % alx->num_txq;
++ 
++ 	return alx->qnapi[r_idx]->txq;
++ }
++ 
++ static struct netdev_queue *alx_get_tx_queue(const struct alx_tx_queue *txq)
++ {
++ 	return netdev_get_tx_queue(txq->netdev, txq->queue_idx);
++ }
++ 
++ static inline int alx_tpd_avail(struct alx_tx_queue *txq)
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  {
+ +	struct alx_tx_queue *txq = &alx->txq;
+ +
+  	if (txq->write_idx >= txq->read_idx)
+ -		return txq->count + txq->read_idx - txq->write_idx - 1;
+ +		return alx->tx_ringsz + txq->read_idx - txq->write_idx - 1;
+  	return txq->read_idx - txq->write_idx - 1;
+  }
+  
+ -static bool alx_clean_tx_irq(struct alx_tx_queue *txq)
+ +static bool alx_clean_tx_irq(struct alx_priv *alx)
+  {
+++<<<<<<< HEAD
+ +	struct alx_tx_queue *txq = &alx->txq;
+++=======
++ 	struct alx_priv *alx;
++ 	struct netdev_queue *tx_queue;
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  	u16 hw_read_idx, sw_read_idx;
+  	unsigned int total_bytes = 0, total_packets = 0;
+  	int budget = ALX_DEFAULT_TX_WORK;
+  
+++<<<<<<< HEAD
+++=======
++ 	alx = netdev_priv(txq->netdev);
++ 	tx_queue = alx_get_tx_queue(txq);
++ 
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  	sw_read_idx = txq->read_idx;
+- 	hw_read_idx = alx_read_mem16(&alx->hw, ALX_TPD_PRI0_CIDX);
++ 	hw_read_idx = alx_read_mem16(&alx->hw, txq->c_reg);
+  
+  	if (sw_read_idx != hw_read_idx) {
+  		while (sw_read_idx != hw_read_idx && budget > 0) {
+@@@ -197,12 -198,12 +228,21 @@@
+  		}
+  		txq->read_idx = sw_read_idx;
+  
+++<<<<<<< HEAD
+ +		netdev_completed_queue(alx->dev, total_packets, total_bytes);
+ +	}
+ +
+ +	if (netif_queue_stopped(alx->dev) && netif_carrier_ok(alx->dev) &&
+ +	    alx_tpd_avail(alx) > alx->tx_ringsz/4)
+ +		netif_wake_queue(alx->dev);
+++=======
++ 		netdev_tx_completed_queue(tx_queue, total_packets, total_bytes);
++ 	}
++ 
++ 	if (netif_tx_queue_stopped(tx_queue) && netif_carrier_ok(alx->dev) &&
++ 	    alx_tpd_avail(txq) > txq->count / 4)
++ 		netif_tx_wake_queue(tx_queue);
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  
+  	return sw_read_idx == hw_read_idx;
+  }
+@@@ -482,12 -505,11 +522,16 @@@ static void alx_free_txring_buf(struct 
+  	txq->write_idx = 0;
+  	txq->read_idx = 0;
+  
+++<<<<<<< HEAD
+ +	netdev_reset_queue(alx->dev);
+++=======
++ 	netdev_tx_reset_queue(alx_get_tx_queue(txq));
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  }
+  
+ -static void alx_free_rxring_buf(struct alx_rx_queue *rxq)
+ +static void alx_free_rxring_buf(struct alx_priv *alx)
+  {
+ +	struct alx_rx_queue *rxq = &alx->rxq;
+  	struct alx_buffer *cur_buf;
+  	u16 i;
+  
+@@@ -678,23 -696,121 +722,124 @@@ out_free
+  
+  static void alx_free_rings(struct alx_priv *alx)
+  {
+ -	int i;
+ -
+ +	netif_napi_del(&alx->napi);
+  	alx_free_buffers(alx);
+  
+ -	for (i = 0; i < alx->num_txq; i++)
+ -		if (alx->qnapi[i] && alx->qnapi[i]->txq)
+ -			kfree(alx->qnapi[i]->txq->bufs);
+ +	kfree(alx->txq.bufs);
+ +	kfree(alx->rxq.bufs);
+  
+++<<<<<<< HEAD
+ +	if (alx->rx_page) {
+ +		put_page(alx->rx_page);
+ +		alx->rx_page = NULL;
+ +	}
+ +
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+++=======
++ 	if (alx->qnapi[0] && alx->qnapi[0]->rxq)
++ 		kfree(alx->qnapi[0]->rxq->bufs);
++ 
++ 	if (!alx->descmem.virt)
++ 		dma_free_coherent(&alx->hw.pdev->dev,
++ 				  alx->descmem.size,
++ 				  alx->descmem.virt,
++ 				  alx->descmem.dma);
++ }
++ 
++ static void alx_free_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 	int i;
++ 
++ 	for (i = 0; i < alx->num_napi; i++) {
++ 		np = alx->qnapi[i];
++ 		if (!np)
++ 			continue;
++ 
++ 		netif_napi_del(&np->napi);
++ 		kfree(np->txq);
++ 		kfree(np->rxq);
++ 		kfree(np);
++ 		alx->qnapi[i] = NULL;
++ 	}
++ }
++ 
++ static const u16 tx_pidx_reg[] = {ALX_TPD_PRI0_PIDX, ALX_TPD_PRI1_PIDX,
++ 				  ALX_TPD_PRI2_PIDX, ALX_TPD_PRI3_PIDX};
++ static const u16 tx_cidx_reg[] = {ALX_TPD_PRI0_CIDX, ALX_TPD_PRI1_CIDX,
++ 				  ALX_TPD_PRI2_CIDX, ALX_TPD_PRI3_CIDX};
++ static const u32 tx_vect_mask[] = {ALX_ISR_TX_Q0, ALX_ISR_TX_Q1,
++ 				   ALX_ISR_TX_Q2, ALX_ISR_TX_Q3};
++ static const u32 rx_vect_mask[] = {ALX_ISR_RX_Q0, ALX_ISR_RX_Q1,
++ 				   ALX_ISR_RX_Q2, ALX_ISR_RX_Q3,
++ 				   ALX_ISR_RX_Q4, ALX_ISR_RX_Q5,
++ 				   ALX_ISR_RX_Q6, ALX_ISR_RX_Q7};
++ 
++ static int alx_alloc_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 	struct alx_rx_queue *rxq;
++ 	struct alx_tx_queue *txq;
++ 	int i;
++ 
++ 	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
++ 
++ 	/* allocate alx_napi structures */
++ 	for (i = 0; i < alx->num_napi; i++) {
++ 		np = kzalloc(sizeof(struct alx_napi), GFP_KERNEL);
++ 		if (!np)
++ 			goto err_out;
++ 
++ 		np->alx = alx;
++ 		netif_napi_add(alx->dev, &np->napi, alx_poll, 64);
++ 		alx->qnapi[i] = np;
++ 	}
++ 
++ 	/* allocate tx queues */
++ 	for (i = 0; i < alx->num_txq; i++) {
++ 		np = alx->qnapi[i];
++ 		txq = kzalloc(sizeof(*txq), GFP_KERNEL);
++ 		if (!txq)
++ 			goto err_out;
++ 
++ 		np->txq = txq;
++ 		txq->p_reg = tx_pidx_reg[i];
++ 		txq->c_reg = tx_cidx_reg[i];
++ 		txq->queue_idx = i;
++ 		txq->count = alx->tx_ringsz;
++ 		txq->netdev = alx->dev;
++ 		txq->dev = &alx->hw.pdev->dev;
++ 		np->vec_mask |= tx_vect_mask[i];
++ 		alx->int_mask |= tx_vect_mask[i];
++ 	}
++ 
++ 	/* allocate rx queues */
++ 	np = alx->qnapi[0];
++ 	rxq = kzalloc(sizeof(*rxq), GFP_KERNEL);
++ 	if (!rxq)
++ 		goto err_out;
++ 
++ 	np->rxq = rxq;
++ 	rxq->np = alx->qnapi[0];
++ 	rxq->queue_idx = 0;
++ 	rxq->count = alx->rx_ringsz;
++ 	rxq->netdev = alx->dev;
++ 	rxq->dev = &alx->hw.pdev->dev;
++ 	np->vec_mask |= rx_vect_mask[0];
++ 	alx->int_mask |= rx_vect_mask[0];
++ 
++ 	return 0;
++ 
++ err_out:
++ 	netdev_err(alx->dev, "error allocating internal structures\n");
++ 	alx_free_napis(alx);
++ 	return -ENOMEM;
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  }
+  
+ -static const int txq_vec_mapping_shift[] = {
+ -	0, ALX_MSI_MAP_TBL1_TXQ0_SHIFT,
+ -	0, ALX_MSI_MAP_TBL1_TXQ1_SHIFT,
+ -	1, ALX_MSI_MAP_TBL2_TXQ2_SHIFT,
+ -	1, ALX_MSI_MAP_TBL2_TXQ3_SHIFT,
+ -};
+ -
+  static void alx_config_vector_mapping(struct alx_priv *alx)
+  {
+  	struct alx_hw *hw = &alx->hw;
+@@@ -1357,16 -1525,17 +1502,27 @@@ err_dma
+  	return -ENOMEM;
+  }
+  
+- static netdev_tx_t alx_start_xmit(struct sk_buff *skb,
+- 				  struct net_device *netdev)
++ static netdev_tx_t alx_start_xmit_ring(struct sk_buff *skb,
++ 				       struct alx_tx_queue *txq)
+  {
+++<<<<<<< HEAD
+ +	struct alx_priv *alx = netdev_priv(netdev);
+ +	struct alx_tx_queue *txq = &alx->txq;
+ +	struct alx_txd *first;
+ +	int tso;
+ +
+ +	if (alx_tpd_avail(alx) < alx_tpd_req(skb)) {
+ +		netif_stop_queue(alx->dev);
+++=======
++ 	struct alx_priv *alx;
++ 	struct alx_txd *first;
++ 	int tso;
++ 
++ 	alx = netdev_priv(txq->netdev);
++ 
++ 	if (alx_tpd_avail(txq) < alx_tpd_req(skb)) {
++ 		netif_tx_stop_queue(alx_get_tx_queue(txq));
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  		goto drop;
+  	}
+  
+@@@ -1379,17 -1548,17 +1535,26 @@@
+  	else if (!tso && alx_tx_csum(skb, first))
+  		goto drop;
+  
+ -	if (alx_map_tx_skb(txq, skb) < 0)
+ +	if (alx_map_tx_skb(alx, skb) < 0)
+  		goto drop;
+  
+++<<<<<<< HEAD
+ +	netdev_sent_queue(alx->dev, skb->len);
+++=======
++ 	netdev_tx_sent_queue(alx_get_tx_queue(txq), skb->len);
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  
+  	/* flush updates before updating hardware */
+  	wmb();
+- 	alx_write_mem16(&alx->hw, ALX_TPD_PRI0_PIDX, txq->write_idx);
++ 	alx_write_mem16(&alx->hw, txq->p_reg, txq->write_idx);
+  
+++<<<<<<< HEAD
+ +	if (alx_tpd_avail(alx) < alx->tx_ringsz/8)
+ +		netif_stop_queue(alx->dev);
+++=======
++ 	if (alx_tpd_avail(txq) < txq->count / 8)
++ 		netif_tx_stop_queue(alx_get_tx_queue(txq));
+++>>>>>>> 2e06826bc659 (alx: prepare tx path for multi queue support)
+  
+  	return NETDEV_TX_OK;
+  
+* Unmerged path drivers/net/ethernet/atheros/alx/main.c
