@@ -1,0 +1,97 @@
+livepatch: Fix stacking of patches with respect to RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Petr Mladek <pmladek@suse.com>
+commit 842c08846420baa619fe3cb8c9af538efdb89428
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/842c0884.failed
+
+rcu_read_(un)lock(), list_*_rcu(), and synchronize_rcu() are used for a secure
+access and manipulation of the list of patches that modify the same function.
+In particular, it is the variable func_stack that is accessible from the ftrace
+handler via struct ftrace_ops and klp_ops.
+
+Of course, it synchronizes also some states of the patch on the top of the
+stack, e.g. func->transition in klp_ftrace_handler.
+
+At the same time, this mechanism guards also the manipulation of
+task->patch_state. It is modified according to the state of the transition and
+the state of the process.
+
+Now, all this works well as long as RCU works well. Sadly livepatching might
+get into some corner cases when this is not true. For example, RCU is not
+watching when rcu_read_lock() is taken in idle threads.  It is because they
+might sleep and prevent reaching the grace period for too long.
+
+There are ways how to make RCU watching even in idle threads, see
+rcu_irq_enter(). But there is a small location inside RCU infrastructure when
+even this does not work.
+
+This small problematic location can be detected either before calling
+rcu_irq_enter() by rcu_irq_enter_disabled() or later by rcu_is_watching().
+Sadly, there is no safe way how to handle it.  Once we detect that RCU was not
+watching, we might see inconsistent state of the function stack and the related
+variables in klp_ftrace_handler(). Then we could do a wrong decision, use an
+incompatible implementation of the function and break the consistency of the
+system. We could warn but we could not avoid the damage.
+
+Fortunately, ftrace has similar problems and they seem to be solved well there.
+It uses a heavy weight implementation of some RCU operations. In particular, it
+replaces:
+
+  + rcu_read_lock() with preempt_disable_notrace()
+  + rcu_read_unlock() with preempt_enable_notrace()
+  + synchronize_rcu() with schedule_on_each_cpu(sync_work)
+
+My understanding is that this is RCU implementation from a stone age. It meets
+the core RCU requirements but it is rather ineffective. Especially, it does not
+allow to batch or speed up the synchronize calls.
+
+On the other hand, it is very trivial. It allows to safely trace and/or
+livepatch even the RCU core infrastructure.  And the effectiveness is a not a
+big issue because using ftrace or livepatches on productive systems is a rare
+operation.  The safety is much more important than a negligible extra load.
+
+Note that the alternative implementation follows the RCU principles. Therefore,
+     we could and actually must use list_*_rcu() variants when manipulating the
+     func_stack.  These functions allow to access the pointers in the right
+     order and with the right barriers. But they do not use any other
+     information that would be set only by rcu_read_lock().
+
+Also note that there are actually two problems solved in ftrace:
+
+First, it cares about the consistency of RCU read sections.  It is being solved
+the way as described and used in this patch.
+
+Second, ftrace needs to make sure that nobody is inside the dynamic trampoline
+when it is being freed. For this, it also calls synchronize_rcu_tasks() in
+preemptive kernel in ftrace_shutdown().
+
+Livepatch has similar problem but it is solved by ftrace for free.
+klp_ftrace_handler() is a good guy and never sleeps. In addition, it is
+registered with FTRACE_OPS_FL_DYNAMIC. It causes that
+unregister_ftrace_function() calls:
+
+	* schedule_on_each_cpu(ftrace_sync) - always
+	* synchronize_rcu_tasks() - in preemptive kernel
+
+The effect is that nobody is neither inside the dynamic trampoline nor inside
+the ftrace handler after unregister_ftrace_function() returns.
+
+[jkosina@suse.cz: reformat changelog, fix comment]
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Miroslav Benes <mbenes@suse.cz>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 842c08846420baa619fe3cb8c9af538efdb89428)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/livepatch/patch.c
+#	kernel/livepatch/transition.c
+* Unmerged path kernel/livepatch/patch.c
+* Unmerged path kernel/livepatch/transition.c
+* Unmerged path kernel/livepatch/patch.c
+* Unmerged path kernel/livepatch/transition.c
