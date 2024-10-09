@@ -1668,7 +1668,7 @@ int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb, bool blocking)
 	if (rets < 0 && rets != -EINPROGRESS) {
 		pm_runtime_put_noidle(dev->dev);
 		cl_err(dev, cl, "rpm: get failed %d\n", rets);
-		return rets;
+		goto free;
 	}
 
 	cb->buf_idx = 0;
@@ -1747,6 +1747,8 @@ err:
 	cl_dbg(dev, cl, "rpm: autosuspend\n");
 	pm_runtime_mark_last_busy(dev->dev);
 	pm_runtime_put_autosuspend(dev->dev);
+free:
+	mei_io_cb_free(cb);
 
 	return rets;
 }
