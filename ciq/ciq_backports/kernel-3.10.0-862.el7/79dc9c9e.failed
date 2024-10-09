@@ -1,0 +1,219 @@
+target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 79dc9c9e865a7f8c14737453f112ced25deafdef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/79dc9c9e.failed
+
+This patch changes __core_scsi3_do_alloc_registration() code to
+drop pr_reg->pr_reg_tg_pt_lun pointer usage in favor of a new
+pr_reg RPTI + existing pr_reg->pr_aptpl_target_lun used by
+APTPL metadata logic.
+
+It also includes changes to REGISTER, REGISTER_AND_MOVE and APTPL
+feature bit codepaths to use rcu_dereference_check() with the
+expected non-zero se_dev_entry->pr_kref reference held.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 79dc9c9e865a7f8c14737453f112ced25deafdef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_pr.c
+diff --cc drivers/target/target_core_pr.c
+index a255afc452a9,48ed5d2bf5fe..000000000000
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@@ -679,8 -687,10 +682,10 @@@ static struct t10_pr_registration *__co
+  {
+  	struct se_dev_entry *deve_tmp;
+  	struct se_node_acl *nacl_tmp;
++ 	struct se_lun_acl *lacl_tmp;
++ 	struct se_lun *lun_tmp;
+  	struct se_port *port, *port_tmp;
+ -	const struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+ +	struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+  	struct t10_pr_registration *pr_reg, *pr_reg_atp, *pr_reg_tmp, *pr_reg_tmp_safe;
+  	int ret;
+  	/*
+@@@ -931,8 -946,7 +942,12 @@@ static int __core_scsi3_check_aptpl_reg
+  		     (pr_reg->pr_aptpl_target_lun == target_lun)) {
+  
+  			pr_reg->pr_reg_nacl = nacl;
+++<<<<<<< HEAD
+ +			pr_reg->pr_reg_deve = deve;
+ +			pr_reg->pr_reg_tg_pt_lun = lun;
+++=======
++ 			pr_reg->tg_pt_sep_rtpi = lun->lun_sep->sep_rtpi;
+++>>>>>>> 79dc9c9e865a (target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun)
+  
+  			list_del(&pr_reg->pr_reg_aptpl_list);
+  			spin_unlock(&pr_tmpl->aptpl_reg_lock);
+@@@ -1429,8 -1450,10 +1449,13 @@@ static void core_scsi3_lunacl_undepend_
+  	/*
+  	 * For nacl->dynamic_node_acl=1
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	lun_acl = rcu_dereference_check(se_deve->se_lun_acl,
++ 				atomic_read(&se_deve->pr_kref.refcount) != 0);
+++>>>>>>> 79dc9c9e865a (target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun)
+  	if (!lun_acl) {
+ -		kref_put(&se_deve->pr_kref, target_pr_kref_release);
+ +		atomic_dec_mb(&se_deve->pr_ref_count);
+  		return;
+  	}
+  	nacl = lun_acl->se_lun_nacl;
+@@@ -1456,7 -1477,7 +1481,11 @@@ core_scsi3_decode_spec_i_port
+  	struct se_portal_group *dest_tpg = NULL, *tmp_tpg;
+  	struct se_session *se_sess = cmd->se_sess;
+  	struct se_node_acl *dest_node_acl = NULL;
+++<<<<<<< HEAD
+ +	struct se_dev_entry *dest_se_deve = NULL, *local_se_deve;
+++=======
++ 	struct se_dev_entry *dest_se_deve = NULL;
+++>>>>>>> 79dc9c9e865a (target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun)
+  	struct t10_pr_registration *dest_pr_reg, *local_pr_reg, *pr_reg_e;
+  	struct t10_pr_registration *pr_reg_tmp, *pr_reg_tmp_safe;
+  	LIST_HEAD(tid_dest_list);
+@@@ -1467,15 -1487,12 +1496,13 @@@
+  	char *iport_ptr = NULL, i_buf[PR_REG_ISID_ID_LEN];
+  	sense_reason_t ret;
+  	u32 tpdl, tid_len = 0;
+- 	int dest_local_nexus;
+  	u32 dest_rtpi = 0;
+  
+ +	local_se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
+  	/*
+  	 * Allocate a struct pr_transport_id_holder and setup the
+- 	 * local_node_acl and local_se_deve pointers and add to
+- 	 * struct list_head tid_dest_list for add registration
+- 	 * processing in the loop of tid_dest_list below.
++ 	 * local_node_acl pointer and add to struct list_head tid_dest_list
++ 	 * for add registration processing in the loop of tid_dest_list below.
+  	 */
+  	tidh_new = kzalloc(sizeof(struct pr_transport_id_holder), GFP_KERNEL);
+  	if (!tidh_new) {
+@@@ -1485,10 -1502,10 +1512,11 @@@
+  	INIT_LIST_HEAD(&tidh_new->dest_list);
+  	tidh_new->dest_tpg = tpg;
+  	tidh_new->dest_node_acl = se_sess->se_node_acl;
+ +	tidh_new->dest_se_deve = local_se_deve;
+  
+  	local_pr_reg = __core_scsi3_alloc_registration(cmd->se_dev,
+- 				se_sess->se_node_acl, local_se_deve, l_isid,
++ 				se_sess->se_node_acl, cmd->se_lun,
++ 				NULL, cmd->orig_fe_lun, l_isid,
+  				sa_res_key, all_tg_pt, aptpl);
+  	if (!local_pr_reg) {
+  		kfree(tidh_new);
+@@@ -2030,7 -2043,6 +2061,10 @@@ core_scsi3_emulate_pro_register(struct 
+  		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+  	}
+  	se_tpg = se_sess->se_tpg;
+++<<<<<<< HEAD
+ +	se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
+++=======
+++>>>>>>> 79dc9c9e865a (target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun)
+  
+  	if (se_tpg->se_tpg_tfo->sess_get_initiator_sid) {
+  		memset(&isid_buf[0], 0, PR_REG_ISID_LEN);
+@@@ -2082,7 -2095,6 +2117,10 @@@
+  			if (ret != 0)
+  				return ret;
+  		}
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> 79dc9c9e865a (target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun)
+  		return core_scsi3_update_and_write_aptpl(dev, aptpl);
+  	}
+  
+@@@ -3437,10 -3442,13 +3475,20 @@@ after_iport_check
+  	dest_pr_reg = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
+  					iport_ptr);
+  	if (!dest_pr_reg) {
+++<<<<<<< HEAD
+ +		if (core_scsi3_alloc_registration(cmd->se_dev,
+ +				dest_node_acl, dest_se_deve, iport_ptr,
+ +				sa_res_key, 0, aptpl, 2, 1)) {
+ +			spin_unlock(&dev->dev_reservation_lock);
+++=======
++ 		struct se_lun *dest_lun = rcu_dereference_check(dest_se_deve->se_lun,
++ 				atomic_read(&dest_se_deve->pr_kref.refcount) != 0);
++ 
++ 		spin_unlock(&dev->dev_reservation_lock);
++ 		if (core_scsi3_alloc_registration(cmd->se_dev, dest_node_acl,
++ 					dest_lun, dest_se_deve, dest_se_deve->mapped_lun,
++ 					iport_ptr, sa_res_key, 0, aptpl, 2, 1)) {
+++>>>>>>> 79dc9c9e865a (target/pr: Change alloc_registration to avoid pr_reg_tg_pt_lun)
+  			ret = TCM_INVALID_PARAMETER_LIST;
+  			goto out;
+  		}
+diff --git a/drivers/target/target_core_configfs.c b/drivers/target/target_core_configfs.c
+index 5a4ad5ca14f6..d497b0b9f1d6 100644
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -942,7 +942,6 @@ static ssize_t target_core_dev_pr_show_attr_res_pr_holder_tg_port(
+ 		struct se_device *dev, char *page)
+ {
+ 	struct se_node_acl *se_nacl;
+-	struct se_lun *lun;
+ 	struct se_portal_group *se_tpg;
+ 	struct t10_pr_registration *pr_reg;
+ 	struct target_core_fabric_ops *tfo;
+@@ -957,7 +956,6 @@ static ssize_t target_core_dev_pr_show_attr_res_pr_holder_tg_port(
+ 
+ 	se_nacl = pr_reg->pr_reg_nacl;
+ 	se_tpg = se_nacl->se_tpg;
+-	lun = pr_reg->pr_reg_tg_pt_lun;
+ 	tfo = se_tpg->se_tpg_tfo;
+ 
+ 	len += sprintf(page+len, "SPC-3 Reservation: %s"
+@@ -965,9 +963,9 @@ static ssize_t target_core_dev_pr_show_attr_res_pr_holder_tg_port(
+ 		tfo->tpg_get_wwn(se_tpg));
+ 	len += sprintf(page+len, "SPC-3 Reservation: Relative Port"
+ 		" Identifier Tag: %hu %s Portal Group Tag: %hu"
+-		" %s Logical Unit: %u\n", lun->lun_sep->sep_rtpi,
++		" %s Logical Unit: %u\n", pr_reg->tg_pt_sep_rtpi,
+ 		tfo->get_fabric_name(), tfo->tpg_get_tag(se_tpg),
+-		tfo->get_fabric_name(), lun->unpacked_lun);
++		tfo->get_fabric_name(), pr_reg->pr_aptpl_target_lun);
+ 
+ out_unlock:
+ 	spin_unlock(&dev->dev_reservation_lock);
+* Unmerged path drivers/target/target_core_pr.c
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 7bcf92529421..7a2a60fa6c06 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -384,13 +384,14 @@ struct t10_pr_registration {
+ 	bool isid_present_at_reg;
+ 	u32 pr_res_mapped_lun;
+ 	u32 pr_aptpl_target_lun;
++	u16 tg_pt_sep_rtpi;
+ 	u32 pr_res_generation;
+ 	u64 pr_reg_bin_isid;
+ 	u64 pr_res_key;
+ 	atomic_t pr_res_holders;
+ 	struct se_node_acl *pr_reg_nacl;
++	/* Used by ALL_TG_PT=1 registration with deve->pr_ref taken */
+ 	struct se_dev_entry *pr_reg_deve;
+-	struct se_lun *pr_reg_tg_pt_lun;
+ 	struct list_head pr_reg_list;
+ 	struct list_head pr_reg_abort_list;
+ 	struct list_head pr_reg_aptpl_list;
+@@ -509,7 +510,6 @@ struct se_cmd {
+ 	struct list_head	se_delayed_node;
+ 	struct list_head	se_qf_node;
+ 	struct se_device      *se_dev;
+-	struct se_dev_entry   *se_deve;
+ 	struct se_lun		*se_lun;
+ 	/* Only used for internal passthrough and legacy TCM fabric modules */
+ 	struct se_session	*se_sess;
