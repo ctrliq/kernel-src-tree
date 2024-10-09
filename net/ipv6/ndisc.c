@@ -46,6 +46,7 @@
 #endif
 
 #include <linux/if_addr.h>
+#include <linux/if_ether.h>
 #include <linux/if_arp.h>
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
@@ -793,7 +794,7 @@ static void ndisc_recv_ns(struct sk_buff *skb)
 				 * who is doing DAD
 				 * so fail our DAD process
 				 */
-				addrconf_dad_failure(ifp);
+				addrconf_dad_failure(skb, ifp);
 				return;
 			} else {
 				/*
@@ -926,7 +927,7 @@ static void ndisc_recv_na(struct sk_buff *skb)
 	if (ifp) {
 		if (skb->pkt_type != PACKET_LOOPBACK
 		    && (ifp->flags & IFA_F_TENTATIVE)) {
-				addrconf_dad_failure(ifp);
+				addrconf_dad_failure(skb, ifp);
 				return;
 		}
 		/* What should we make now? The advertisement
@@ -940,8 +941,8 @@ static void ndisc_recv_na(struct sk_buff *skb)
 		 */
 		if (skb->pkt_type != PACKET_LOOPBACK)
 			ND_PRINTK(1, warn,
-				  "NA: someone advertises our address %pI6 on %s!\n",
-				  &ifp->addr, ifp->idev->dev->name);
+				  "NA: %pM advertised our address %pI6c on %s!\n",
+				  eth_hdr(skb)->h_source, &ifp->addr, ifp->idev->dev->name);
 		in6_ifa_put(ifp);
 		return;
 	}
