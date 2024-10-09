@@ -1,0 +1,209 @@
+netfilter: ipset: Out of bound access in hash:net* types fixed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit 6fe7ccfd77415a6ba250c10c580eb3f9acf79753
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6fe7ccfd.failed
+
+Dave Jones reported that KASan detected out of bounds access in hash:net*
+types:
+
+[   23.139532] ==================================================================
+[   23.146130] BUG: KASan: out of bounds access in hash_net4_add_cidr+0x1db/0x220 at addr ffff8800d4844b58
+[   23.152937] Write of size 4 by task ipset/457
+[   23.159742] =============================================================================
+[   23.166672] BUG kmalloc-512 (Not tainted): kasan: bad access detected
+[   23.173641] -----------------------------------------------------------------------------
+[   23.194668] INFO: Allocated in hash_net_create+0x16a/0x470 age=7 cpu=1 pid=456
+[   23.201836]  __slab_alloc.constprop.66+0x554/0x620
+[   23.208994]  __kmalloc+0x2f2/0x360
+[   23.216105]  hash_net_create+0x16a/0x470
+[   23.223238]  ip_set_create+0x3e6/0x740
+[   23.230343]  nfnetlink_rcv_msg+0x599/0x640
+[   23.237454]  netlink_rcv_skb+0x14f/0x190
+[   23.244533]  nfnetlink_rcv+0x3f6/0x790
+[   23.251579]  netlink_unicast+0x272/0x390
+[   23.258573]  netlink_sendmsg+0x5a1/0xa50
+[   23.265485]  SYSC_sendto+0x1da/0x2c0
+[   23.272364]  SyS_sendto+0xe/0x10
+[   23.279168]  entry_SYSCALL_64_fastpath+0x12/0x6f
+
+The bug is fixed in the patch and the testsuite is extended in ipset
+to check cidr handling more thoroughly.
+
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit 6fe7ccfd77415a6ba250c10c580eb3f9acf79753)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_hash_gen.h
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index 9ce28af662bf,691b54fcaf2a..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -113,61 -126,39 +113,72 @@@ htable_bits(u32 hashsize
+  	return bits;
+  }
+  
+ -#ifdef IP_SET_HASH_WITH_NETS
+ -#if IPSET_NET_COUNT > 1
+ -#define __CIDR(cidr, i)		(cidr[i])
+ -#else
+ -#define __CIDR(cidr, i)		(cidr)
+ -#endif
+ +/* Destroy the hashtable part of the set */
+ +static void
+ +ahash_destroy(struct htable *t)
+ +{
+ +	struct hbucket *n;
+ +	u32 i;
+  
+ -/* cidr + 1 is stored in net_prefixes to support /0 */
+ -#define NCIDR_PUT(cidr)		((cidr) + 1)
+ -#define NCIDR_GET(cidr)		((cidr) - 1)
+ +	for (i = 0; i < jhash_size(t->htable_bits); i++) {
+ +		n = hbucket(t, i);
+ +		if (n->size)
+ +			/* FIXME: use slab cache */
+ +			kfree(n->value);
+ +	}
+ +
+ +	ip_set_free(t);
+ +}
+ +
+ +static int
+ +hbucket_elem_add(struct hbucket *n, u8 ahash_max, size_t dsize)
+ +{
+ +	if (n->pos >= n->size) {
+ +		void *tmp;
+ +
+ +		if (n->size >= ahash_max)
+ +			/* Trigger rehashing */
+ +			return -EAGAIN;
+ +
+ +		tmp = kzalloc((n->size + AHASH_INIT_SIZE) * dsize,
+ +			      GFP_ATOMIC);
+ +		if (!tmp)
+ +			return -ENOMEM;
+ +		if (n->size) {
+ +			memcpy(tmp, n->value, n->size * dsize);
+ +			kfree(n->value);
+ +		}
+ +		n->value = tmp;
+ +		n->size += AHASH_INIT_SIZE;
+ +	}
+ +	return 0;
+ +}
+  
+ +#ifdef IP_SET_HASH_WITH_NETS
+  #ifdef IP_SET_HASH_WITH_NETS_PACKED
+ -/* When cidr is packed with nomatch, cidr - 1 is stored in the data entry */
+ -#define DCIDR_PUT(cidr)		((cidr) - 1)
+ -#define DCIDR_GET(cidr, i)	(__CIDR(cidr, i) + 1)
+ +/* When cidr is packed with nomatch, cidr - 1 is stored in the entry */
+ +#define CIDR(cidr)		(cidr + 1)
+  #else
+ -#define DCIDR_PUT(cidr)		(cidr)
+ -#define DCIDR_GET(cidr, i)	__CIDR(cidr, i)
+ +#define CIDR(cidr)		(cidr)
+  #endif
+  
+ -#define INIT_CIDR(cidr, host_mask)	\
+ -	DCIDR_PUT(((cidr) ? NCIDR_GET(cidr) : host_mask))
+ -
+  #define SET_HOST_MASK(family)	(family == AF_INET ? 32 : 128)
+  
+++<<<<<<< HEAD
+ +#ifdef IP_SET_HASH_WITH_MULTI
+ +#define NETS_LENGTH(family)	(SET_HOST_MASK(family) + 1)
+ +#else
+ +#define NETS_LENGTH(family)	SET_HOST_MASK(family)
+++=======
++ #ifdef IP_SET_HASH_WITH_NET0
++ /* cidr from 0 to SET_HOST_MASK() value and c = cidr + 1 */
++ #define NLEN(family)		(SET_HOST_MASK(family) + 1)
++ #define CIDR_POS(c)		((c) - 1)
++ #else
++ /* cidr from 1 to SET_HOST_MASK() value and c = cidr + 1 */
++ #define NLEN(family)		SET_HOST_MASK(family)
++ #define CIDR_POS(c)		((c) - 2)
+++>>>>>>> 6fe7ccfd7741 (netfilter: ipset: Out of bound access in hash:net* types fixed)
+  #endif
+  
+  #else
+@@@ -300,24 -303,22 +311,34 @@@ mtype_add_cidr(struct htype *h, u8 cidr
+  	int i, j;
+  
+  	/* Add in increasing prefix order, so larger cidr first */
+ -	for (i = 0, j = -1; i < nets_length && h->nets[i].cidr[n]; i++) {
+ -		if (j != -1) {
+ +	for (i = 0, j = -1; i < nets_length && h->nets[i].nets; i++) {
+ +		if (j != -1)
+  			continue;
+ -		} else if (h->nets[i].cidr[n] < cidr) {
+ +		else if (h->nets[i].cidr < cidr)
+  			j = i;
+++<<<<<<< HEAD
+ +		else if (h->nets[i].cidr == cidr) {
+ +			h->nets[i].nets++;
+++=======
++ 		} else if (h->nets[i].cidr[n] == cidr) {
++ 			h->nets[CIDR_POS(cidr)].nets[n]++;
+++>>>>>>> 6fe7ccfd7741 (netfilter: ipset: Out of bound access in hash:net* types fixed)
+  			return;
+  		}
+  	}
+  	if (j != -1) {
+ -		for (; i > j; i--)
+ -			h->nets[i].cidr[n] = h->nets[i - 1].cidr[n];
+ +		for (; i > j; i--) {
+ +			h->nets[i].cidr = h->nets[i - 1].cidr;
+ +			h->nets[i].nets = h->nets[i - 1].nets;
+ +		}
+  	}
+++<<<<<<< HEAD
+ +	h->nets[i].cidr = cidr;
+ +	h->nets[i].nets = 1;
+++=======
++ 	h->nets[i].cidr[n] = cidr;
++ 	h->nets[CIDR_POS(cidr)].nets[n] = 1;
+++>>>>>>> 6fe7ccfd7741 (netfilter: ipset: Out of bound access in hash:net* types fixed)
+  }
+  
+  static void
+@@@ -326,19 -327,15 +347,31 @@@ mtype_del_cidr(struct htype *h, u8 cidr
+  	u8 i, j, net_end = nets_length - 1;
+  
+  	for (i = 0; i < nets_length; i++) {
+++<<<<<<< HEAD
+ +	        if (h->nets[i].cidr != cidr)
+ +	                continue;
+ +                if (h->nets[i].nets > 1 || i == net_end ||
+ +                    h->nets[i + 1].nets == 0) {
+ +                        h->nets[i].nets--;
+ +                        return;
+ +                }
+ +                for (j = i; j < net_end && h->nets[j].nets; j++) {
+ +		        h->nets[j].cidr = h->nets[j + 1].cidr;
+ +		        h->nets[j].nets = h->nets[j + 1].nets;
+ +                }
+ +                h->nets[j].nets = 0;
+ +                return;
+++=======
++ 		if (h->nets[i].cidr[n] != cidr)
++ 			continue;
++ 		h->nets[CIDR_POS(cidr)].nets[n]--;
++ 		if (h->nets[CIDR_POS(cidr)].nets[n] > 0)
++ 			return;
++ 		for (j = i; j < net_end && h->nets[j].cidr[n]; j++)
++ 			h->nets[j].cidr[n] = h->nets[j + 1].cidr[n];
++ 		h->nets[j].cidr[n] = 0;
++ 		return;
+++>>>>>>> 6fe7ccfd7741 (netfilter: ipset: Out of bound access in hash:net* types fixed)
+  	}
+  }
+  #endif
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
