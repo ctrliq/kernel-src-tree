@@ -1,0 +1,147 @@
+mm/pkeys: Fix siginfo ABI breakage caused by new u64 field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 49cd53bf14aeb471c4a2682300dfc05ef2fd09f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/49cd53bf.failed
+
+Stephen Rothwell reported this linux-next build failure:
+
+	http://lkml.kernel.org/r/20160226164406.065a1ffc@canb.auug.org.au
+
+... caused by the Memory Protection Keys patches from the tip tree triggering
+a newly introduced build-time sanity check on an ARM build, because they changed
+the ABI of siginfo in an unexpected way.
+
+If u64 has a natural alignment of 8 bytes (which is the case on most mainstream
+platforms, with the notable exception of x86-32), then the leadup to the
+_sifields union matters:
+
+typedef struct siginfo {
+        int si_signo;
+        int si_errno;
+        int si_code;
+
+        union {
+	...
+        } _sifields;
+} __ARCH_SI_ATTRIBUTES siginfo_t;
+
+Note how the first 3 fields give us 12 bytes, so _sifields is not 8
+naturally bytes aligned.
+
+Before the _pkey field addition the largest element of _sifields (on
+32-bit platforms) was 32 bits. With the u64 added, the minimum alignment
+requirement increased to 8 bytes on those (rare) 32-bit platforms. Thus
+GCC padded the space after si_code with 4 extra bytes, and shifted all
+_sifields offsets by 4 bytes - breaking the ABI of all of those
+remaining fields.
+
+On 64-bit platforms this problem was hidden due to _sifields already
+having numerous fields with natural 8 bytes alignment (pointers).
+
+To fix this, we replace the u64 with an '__u32'.  The __u32 does not
+increase the minimum alignment requirement of the union, and it is
+also large enough to store the 16-bit pkey we have today on x86.
+
+	Reported-by: Stehen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Acked-by: Stehen Rothwell <sfr@canb.auug.org.au>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Helge Deller <deller@gmx.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: linux-next@vger.kernel.org
+Fixes: cd0ea35ff551 ("signals, pkeys: Notify userspace about protection key faults")
+Link: http://lkml.kernel.org/r/20160301125451.02C7426D@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 49cd53bf14aeb471c4a2682300dfc05ef2fd09f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/ia64/include/uapi/asm/siginfo.h
+#	arch/mips/include/uapi/asm/siginfo.h
+#	include/uapi/asm-generic/siginfo.h
+diff --cc arch/ia64/include/uapi/asm/siginfo.h
+index 4ea6225196bb,f72bf0172bb2..000000000000
+--- a/arch/ia64/include/uapi/asm/siginfo.h
++++ b/arch/ia64/include/uapi/asm/siginfo.h
+@@@ -63,6 -63,15 +63,18 @@@ typedef struct siginfo 
+  			unsigned int _flags;	/* see below */
+  			unsigned long _isr;	/* isr */
+  			short _addr_lsb;	/* lsb of faulting address */
+++<<<<<<< HEAD
+++=======
++ 			union {
++ 				/* used when si_code=SEGV_BNDERR */
++ 				struct {
++ 					void __user *_lower;
++ 					void __user *_upper;
++ 				} _addr_bnd;
++ 				/* used when si_code=SEGV_PKUERR */
++ 				__u32 _pkey;
++ 			};
+++>>>>>>> 49cd53bf14ae (mm/pkeys: Fix siginfo ABI breakage caused by new u64 field)
+  		} _sigfault;
+  
+  		/* SIGPOLL */
+diff --cc arch/mips/include/uapi/asm/siginfo.h
+index 6a8714193fb9,cc49dc240d67..000000000000
+--- a/arch/mips/include/uapi/asm/siginfo.h
++++ b/arch/mips/include/uapi/asm/siginfo.h
+@@@ -89,6 -86,15 +89,18 @@@ typedef struct siginfo 
+  			int _trapno;	/* TRAP # which caused the signal */
+  #endif
+  			short _addr_lsb;
+++<<<<<<< HEAD
+++=======
++ 			union {
++ 				/* used when si_code=SEGV_BNDERR */
++ 				struct {
++ 					void __user *_lower;
++ 					void __user *_upper;
++ 				} _addr_bnd;
++ 				/* used when si_code=SEGV_PKUERR */
++ 				__u32 _pkey;
++ 			};
+++>>>>>>> 49cd53bf14ae (mm/pkeys: Fix siginfo ABI breakage caused by new u64 field)
+  		} _sigfault;
+  
+  		/* SIGPOLL, SIGXFSZ (To do ...)	 */
+diff --cc include/uapi/asm-generic/siginfo.h
+index 0d397d4e8bf8,1abaf62c86fc..000000000000
+--- a/include/uapi/asm-generic/siginfo.h
++++ b/include/uapi/asm-generic/siginfo.h
+@@@ -91,12 -91,15 +91,24 @@@ typedef struct siginfo 
+  			int _trapno;	/* TRAP # which caused the signal */
+  #endif
+  			short _addr_lsb; /* LSB of the reported address */
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +			struct {
+ +				void __user *_lower;
+ +				void __user *_upper;
+ +			} _addr_bnd;
+ +#endif
+++=======
++ 			union {
++ 				/* used when si_code=SEGV_BNDERR */
++ 				struct {
++ 					void __user *_lower;
++ 					void __user *_upper;
++ 				} _addr_bnd;
++ 				/* used when si_code=SEGV_PKUERR */
++ 				__u32 _pkey;
++ 			};
+++>>>>>>> 49cd53bf14ae (mm/pkeys: Fix siginfo ABI breakage caused by new u64 field)
+  		} _sigfault;
+  
+  		/* SIGPOLL */
+* Unmerged path arch/ia64/include/uapi/asm/siginfo.h
+* Unmerged path arch/mips/include/uapi/asm/siginfo.h
+* Unmerged path include/uapi/asm-generic/siginfo.h
