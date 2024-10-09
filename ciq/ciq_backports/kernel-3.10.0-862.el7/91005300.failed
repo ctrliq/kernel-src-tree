@@ -1,0 +1,134 @@
+KVM: lapic: fix access preemption timer stuff even if kernel_irqchip=off
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit 910053002ef1fdc1d42b7015d5b2400172f43e42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/91005300.failed
+
+BUG: unable to handle kernel NULL pointer dereference at 000000000000008c
+IP: [<ffffffffc04e0180>] kvm_lapic_hv_timer_in_use+0x10/0x20 [kvm]
+PGD 0
+Oops: 0000 [#1] SMP
+Call Trace:
+ kvm_arch_vcpu_load+0x86/0x260 [kvm]
+ vcpu_load+0x46/0x60 [kvm]
+ kvm_vcpu_ioctl+0x79/0x7c0 [kvm]
+ ? __lock_is_held+0x54/0x70
+ do_vfs_ioctl+0x96/0x6a0
+ ? __fget_light+0x2a/0x90
+ SyS_ioctl+0x79/0x90
+ do_syscall_64+0x7c/0x1e0
+ entry_SYSCALL64_slow_path+0x25/0x25
+RIP  [<ffffffffc04e0180>] kvm_lapic_hv_timer_in_use+0x10/0x20 [kvm]
+ RSP <ffff8800db1f3d70>
+CR2: 000000000000008c
+---[ end trace a55fb79d2b3b4ee8 ]---
+
+This can be reproduced steadily by kernel_irqchip=off.
+
+We should not access preemption timer stuff if lapic is emulated in userspace.
+This patch fix it by avoiding access preemption timer stuff when kernel_irqchip=off.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Yunhong Jiang <yunhong.jiang@intel.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 910053002ef1fdc1d42b7015d5b2400172f43e42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index e191bcf72fce,b62c85229711..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1373,6 -1347,81 +1373,84 @@@ static void start_sw_tscdeadline(struc
+  	local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu)
++ {
++ 	if (!lapic_in_kernel(vcpu))
++ 		return false;
++ 
++ 	return vcpu->arch.apic->lapic_timer.hv_timer_in_use;
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_hv_timer_in_use);
++ 
++ static void cancel_hv_tscdeadline(struct kvm_lapic *apic)
++ {
++ 	kvm_x86_ops->cancel_hv_timer(apic->vcpu);
++ 	apic->lapic_timer.hv_timer_in_use = false;
++ }
++ 
++ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	WARN_ON(!apic->lapic_timer.hv_timer_in_use);
++ 	WARN_ON(swait_active(&vcpu->wq));
++ 	cancel_hv_tscdeadline(apic);
++ 	apic_timer_expired(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_expired_hv_timer);
++ 
++ static bool start_hv_tscdeadline(struct kvm_lapic *apic)
++ {
++ 	u64 tscdeadline = apic->lapic_timer.tscdeadline;
++ 
++ 	if (atomic_read(&apic->lapic_timer.pending) ||
++ 		kvm_x86_ops->set_hv_timer(apic->vcpu, tscdeadline)) {
++ 		if (apic->lapic_timer.hv_timer_in_use)
++ 			cancel_hv_tscdeadline(apic);
++ 	} else {
++ 		apic->lapic_timer.hv_timer_in_use = true;
++ 		hrtimer_cancel(&apic->lapic_timer.timer);
++ 
++ 		/* In case the sw timer triggered in the window */
++ 		if (atomic_read(&apic->lapic_timer.pending))
++ 			cancel_hv_tscdeadline(apic);
++ 	}
++ 	trace_kvm_hv_timer_state(apic->vcpu->vcpu_id,
++ 			apic->lapic_timer.hv_timer_in_use);
++ 	return apic->lapic_timer.hv_timer_in_use;
++ }
++ 
++ void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	WARN_ON(apic->lapic_timer.hv_timer_in_use);
++ 
++ 	if (apic_lvtt_tscdeadline(apic))
++ 		start_hv_tscdeadline(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_hv_timer);
++ 
++ void kvm_lapic_switch_to_sw_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	/* Possibly the TSC deadline timer is not enabled yet */
++ 	if (!apic->lapic_timer.hv_timer_in_use)
++ 		return;
++ 
++ 	cancel_hv_tscdeadline(apic);
++ 
++ 	if (atomic_read(&apic->lapic_timer.pending))
++ 		return;
++ 
++ 	start_sw_tscdeadline(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_sw_timer);
++ 
+++>>>>>>> 910053002ef1 (KVM: lapic: fix access preemption timer stuff even if kernel_irqchip=off)
+  static void start_apic_timer(struct kvm_lapic *apic)
+  {
+  	ktime_t now;
+* Unmerged path arch/x86/kvm/lapic.c
