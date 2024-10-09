@@ -1,0 +1,437 @@
+qed: Assign a unique per-queue index to queue-cid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit bbe3f233ec5ea99049f33471c0c0d0d2a78e2116
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bbe3f233.failed
+
+When a queue-cid is allocated, assign an index inside that's
+CID's queue-zone.
+
+For PFs and VFS, this number is going to be unique and derive
+from a per-queue-zone bitmap, while for PF's VFs queues the
+number is currently going to constant; Later, we'd add the
+capability of a VF to communicate such an index to its PF.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bbe3f233ec5ea99049f33471c0c0d0d2a78e2116)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_l2.c
+#	drivers/net/ethernet/qlogic/qed/qed_l2.h
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.c
+index f852981b5922,0a8d3a82d248..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@@ -65,12 -65,148 +65,150 @@@
+  #define QED_MAX_SGES_NUM 16
+  #define CRC32_POLY 0x1edc6f41
+  
+++<<<<<<< HEAD
+++=======
++ struct qed_l2_info {
++ 	u32 queues;
++ 	unsigned long **pp_qid_usage;
++ 
++ 	/* The lock is meant to synchronize access to the qid usage */
++ 	struct mutex lock;
++ };
++ 
++ int qed_l2_alloc(struct qed_hwfn *p_hwfn)
++ {
++ 	struct qed_l2_info *p_l2_info;
++ 	unsigned long **pp_qids;
++ 	u32 i;
++ 
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return 0;
++ 
++ 	p_l2_info = kzalloc(sizeof(*p_l2_info), GFP_KERNEL);
++ 	if (!p_l2_info)
++ 		return -ENOMEM;
++ 	p_hwfn->p_l2_info = p_l2_info;
++ 
++ 	if (IS_PF(p_hwfn->cdev)) {
++ 		p_l2_info->queues = RESC_NUM(p_hwfn, QED_L2_QUEUE);
++ 	} else {
++ 		u8 rx = 0, tx = 0;
++ 
++ 		qed_vf_get_num_rxqs(p_hwfn, &rx);
++ 		qed_vf_get_num_txqs(p_hwfn, &tx);
++ 
++ 		p_l2_info->queues = max_t(u8, rx, tx);
++ 	}
++ 
++ 	pp_qids = kzalloc(sizeof(unsigned long *) * p_l2_info->queues,
++ 			  GFP_KERNEL);
++ 	if (!pp_qids)
++ 		return -ENOMEM;
++ 	p_l2_info->pp_qid_usage = pp_qids;
++ 
++ 	for (i = 0; i < p_l2_info->queues; i++) {
++ 		pp_qids[i] = kzalloc(MAX_QUEUES_PER_QZONE / 8, GFP_KERNEL);
++ 		if (!pp_qids[i])
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void qed_l2_setup(struct qed_hwfn *p_hwfn)
++ {
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return;
++ 
++ 	mutex_init(&p_hwfn->p_l2_info->lock);
++ }
++ 
++ void qed_l2_free(struct qed_hwfn *p_hwfn)
++ {
++ 	u32 i;
++ 
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return;
++ 
++ 	if (!p_hwfn->p_l2_info)
++ 		return;
++ 
++ 	if (!p_hwfn->p_l2_info->pp_qid_usage)
++ 		goto out_l2_info;
++ 
++ 	/* Free until hit first uninitialized entry */
++ 	for (i = 0; i < p_hwfn->p_l2_info->queues; i++) {
++ 		if (!p_hwfn->p_l2_info->pp_qid_usage[i])
++ 			break;
++ 		kfree(p_hwfn->p_l2_info->pp_qid_usage[i]);
++ 	}
++ 
++ 	kfree(p_hwfn->p_l2_info->pp_qid_usage);
++ 
++ out_l2_info:
++ 	kfree(p_hwfn->p_l2_info);
++ 	p_hwfn->p_l2_info = NULL;
++ }
++ 
++ static bool qed_eth_queue_qid_usage_add(struct qed_hwfn *p_hwfn,
++ 					struct qed_queue_cid *p_cid)
++ {
++ 	struct qed_l2_info *p_l2_info = p_hwfn->p_l2_info;
++ 	u16 queue_id = p_cid->rel.queue_id;
++ 	bool b_rc = true;
++ 	u8 first;
++ 
++ 	mutex_lock(&p_l2_info->lock);
++ 
++ 	if (queue_id > p_l2_info->queues) {
++ 		DP_NOTICE(p_hwfn,
++ 			  "Requested to increase usage for qzone %04x out of %08x\n",
++ 			  queue_id, p_l2_info->queues);
++ 		b_rc = false;
++ 		goto out;
++ 	}
++ 
++ 	first = (u8)find_first_zero_bit(p_l2_info->pp_qid_usage[queue_id],
++ 					MAX_QUEUES_PER_QZONE);
++ 	if (first >= MAX_QUEUES_PER_QZONE) {
++ 		b_rc = false;
++ 		goto out;
++ 	}
++ 
++ 	__set_bit(first, p_l2_info->pp_qid_usage[queue_id]);
++ 	p_cid->qid_usage_idx = first;
++ 
++ out:
++ 	mutex_unlock(&p_l2_info->lock);
++ 	return b_rc;
++ }
++ 
++ static void qed_eth_queue_qid_usage_del(struct qed_hwfn *p_hwfn,
++ 					struct qed_queue_cid *p_cid)
++ {
++ 	mutex_lock(&p_hwfn->p_l2_info->lock);
++ 
++ 	clear_bit(p_cid->qid_usage_idx,
++ 		  p_hwfn->p_l2_info->pp_qid_usage[p_cid->rel.queue_id]);
++ 
++ 	mutex_unlock(&p_hwfn->p_l2_info->lock);
++ }
++ 
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
+  			       struct qed_queue_cid *p_cid)
+  {
+  	/* VFs' CIDs are 0-based in PF-view, and uninitialized on VF */
+ -	if ((p_cid->vfid == QED_QUEUE_CID_SELF) &&
+ -	    IS_PF(p_hwfn->cdev))
+ +	if (!p_cid->is_vf && IS_PF(p_hwfn->cdev))
+  		qed_cxt_release_cid(p_hwfn, p_cid->cid);
++ 
++ 	/* For PF's VFs we maintain the index inside queue-zone in IOV */
++ 	if (p_cid->vfid == QED_QUEUE_CID_SELF)
++ 		qed_eth_queue_qid_usage_del(p_hwfn, p_cid);
++ 
+  	vfree(p_cid);
+  }
+  
+@@@ -129,27 -278,29 +267,38 @@@ _qed_eth_queue_to_cid(struct qed_hwfn *
+  		p_cid->abs.stats_id = p_cid->rel.stats_id;
+  	}
+  
+ +	/* SBs relevant information was already provided as absolute */
+ +	p_cid->abs.sb = p_cid->rel.sb;
+ +	p_cid->abs.sb_idx = p_cid->rel.sb_idx;
+ +
+ +	/* This is tricky - we're actually interested in whehter this is a PF
+ +	 * entry meant for the VF.
+ +	 */
+ +	if (!b_is_same)
+ +		p_cid->is_vf = true;
+  out:
++ 	/* VF-images have provided the qid_usage_idx on their own.
++ 	 * Otherwise, we need to allocate a unique one.
++ 	 */
++ 	if (!p_vf_params) {
++ 		if (!qed_eth_queue_qid_usage_add(p_hwfn, p_cid))
++ 			goto fail;
++ 	} else {
++ 		p_cid->qid_usage_idx = p_vf_params->qid_usage_idx;
++ 	}
++ 
+  	DP_VERBOSE(p_hwfn,
+  		   QED_MSG_SP,
+- 		   "opaque_fid: %04x CID %08x vport %02x [%02x] qzone %04x [%04x] stats %02x [%02x] SB %04x PI %02x\n",
++ 		   "opaque_fid: %04x CID %08x vport %02x [%02x] qzone %04x.%02x [%04x] stats %02x [%02x] SB %04x PI %02x\n",
+  		   p_cid->opaque_fid,
+  		   p_cid->cid,
+  		   p_cid->rel.vport_id,
+  		   p_cid->abs.vport_id,
+  		   p_cid->rel.queue_id,
++ 		   p_cid->qid_usage_idx,
+  		   p_cid->abs.queue_id,
+  		   p_cid->rel.stats_id,
+ -		   p_cid->abs.stats_id, p_cid->sb_igu_id, p_cid->sb_idx);
+ +		   p_cid->abs.stats_id, p_cid->abs.sb, p_cid->abs.sb_idx);
+  
+  	return p_cid;
+  
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.h
+index 93cb932ef663,59c2ba3eb6c1..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.h
+@@@ -268,14 -277,47 +268,49 @@@ void qed_get_vport_stats(struct qed_de
+  
+  void qed_reset_vport_stats(struct qed_dev *cdev);
+  
+++<<<<<<< HEAD
+++=======
++ #define MAX_QUEUES_PER_QZONE    (sizeof(unsigned long) * 8)
++ #define QED_QUEUE_CID_SELF	(0xff)
++ 
++ /* Almost identical to the qed_queue_start_common_params,
++  * but here we maintain the SB index in IGU CAM.
++  */
++ struct qed_queue_cid_params {
++ 	u8 vport_id;
++ 	u16 queue_id;
++ 	u8 stats_id;
++ };
++ 
++ /* Additional parameters required for initialization of the queue_cid
++  * and are relevant only for a PF initializing one for its VFs.
++  */
++ struct qed_queue_cid_vf_params {
++ 	/* Should match the VF's relative index */
++ 	u8 vfid;
++ 
++ 	/* 0-based queue index. Should reflect the relative qzone the
++ 	 * VF thinks is associated with it [in its range].
++ 	 */
++ 	u8 vf_qid;
++ 
++ 	/* Indicates a VF is legacy, making it differ in:
++ 	 *  - Producers would be placed in a different place.
++ 	 */
++ 	bool vf_legacy;
++ 
++ 	u8 qid_usage_idx;
++ };
++ 
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  struct qed_queue_cid {
+ -	/* For stats-id, the `rel' is actually absolute as well */
+ -	struct qed_queue_cid_params rel;
+ -	struct qed_queue_cid_params abs;
+ -
+ -	/* These have no 'relative' meaning */
+ -	u16 sb_igu_id;
+ -	u8 sb_idx;
+ -
+ +	/* 'Relative' is a relative term ;-). Usually the indices [not counting
+ +	 * SBs] would be PF-relative, but there are some cases where that isn't
+ +	 * the case - specifically for a PF configuring its VF indices it's
+ +	 * possible some fields [E.g., stats-id] in 'rel' would already be abs.
+ +	 */
+ +	struct qed_queue_start_common_params rel;
+ +	struct qed_queue_start_common_params abs;
+  	u32 cid;
+  	u16 opaque_fid;
+  
+@@@ -284,9 -326,15 +319,15 @@@
+  	 * Notice this is relevant on the *PF* queue-cid of its VF's queues,
+  	 * and not on the VF itself.
+  	 */
+ -	u8 vfid;
+ +	bool is_vf;
+  	u8 vf_qid;
+  
++ 	/* We need an additional index to differentiate between queues opened
++ 	 * for same queue-zone, as VFs would have to communicate the info
++ 	 * to the PF [otherwise PF has no way to differentiate].
++ 	 */
++ 	u8 qid_usage_idx;
++ 
+  	/* Legacy VFs might have Rx producer located elsewhere */
+  	bool b_legacy_vf;
+  
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.c
+index c231e788de76,c205e476d39e..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@@ -1987,7 -1961,9 +1996,8 @@@ static void qed_iov_vf_mbx_start_rxq(st
+  	u8 status = PFVF_STATUS_NO_RESOURCE;
+  	struct qed_vf_q_info *p_queue;
+  	struct vfpf_start_rxq_tlv *req;
+ -	struct qed_sb_info sb_dummy;
+  	bool b_legacy_vf = false;
++ 	u8 qid_usage_idx;
+  	int rc;
+  
+  	req = &mbx->req_virt->start_rxq;
+@@@ -1997,20 -1973,30 +2007,37 @@@
+  	    !qed_iov_validate_sb(p_hwfn, vf, req->hw_sb))
+  		goto out;
+  
+- 	/* Acquire a new queue-cid */
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, false);
+  	p_queue = &vf->vf_queues[req->rx_qid];
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vf->acquire.vfdev_info.eth_fp_hsi_minor ==
++ 	    ETH_HSI_VER_NO_PKT_LEN_TUNN)
++ 
++ 	/* Acquire a new queue-cid */
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  	memset(&params, 0, sizeof(params));
+  	params.queue_id = p_queue->fw_rx_qid;
+  	params.vport_id = vf->vport_id;
+  	params.stats_id = vf->abs_vf_id + 0x10;
+ -	/* Since IGU index is passed via sb_info, construct a dummy one */
+ -	memset(&sb_dummy, 0, sizeof(sb_dummy));
+ -	sb_dummy.igu_sb_id = req->hw_sb;
+ -	params.p_sb = &sb_dummy;
+ +	params.sb = req->hw_sb;
+  	params.sb_idx = req->sb_index;
+  
+++<<<<<<< HEAD
+ +	p_queue->p_rx_cid = _qed_eth_queue_to_cid(p_hwfn,
+ +						  vf->opaque_fid,
+ +						  p_queue->fw_cid,
+ +						  req->rx_qid, &params);
+++=======
++ 	memset(&vf_params, 0, sizeof(vf_params));
++ 	vf_params.vfid = vf->relative_vf_id;
++ 	vf_params.vf_qid = (u8)req->rx_qid;
++ 	vf_params.vf_legacy = b_legacy_vf;
++ 	vf_params.qid_usage_idx = qid_usage_idx;
++ 	p_queue->p_rx_cid = qed_eth_queue_to_cid(p_hwfn, vf->opaque_fid,
++ 						 &params, &vf_params);
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  	if (!p_queue->p_rx_cid)
+  		goto out;
+  
+@@@ -2095,6 -2291,9 +2122,12 @@@ static void qed_iov_vf_mbx_start_txq(st
+  	u8 status = PFVF_STATUS_NO_RESOURCE;
+  	struct vfpf_start_txq_tlv *req;
+  	struct qed_vf_q_info *p_queue;
+++<<<<<<< HEAD
+++=======
++ 	struct qed_sb_info sb_dummy;
++ 	bool b_vf_legacy = false;
++ 	u8 qid_usage_idx;
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  	int rc;
+  	u16 pq;
+  
+@@@ -2106,19 -2305,33 +2139,39 @@@
+  	    !qed_iov_validate_sb(p_hwfn, vf, req->hw_sb))
+  		goto out;
+  
+- 	/* Acquire a new queue-cid */
++ 	qid_usage_idx = qed_iov_vf_mbx_qid(p_hwfn, vf, true);
+  	p_queue = &vf->vf_queues[req->tx_qid];
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vf->acquire.vfdev_info.eth_fp_hsi_minor ==
++ 	    ETH_HSI_VER_NO_PKT_LEN_TUNN)
++ 		b_vf_legacy = true;
++ 
++ 	/* Acquire a new queue-cid */
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  	params.queue_id = p_queue->fw_tx_qid;
+  	params.vport_id = vf->vport_id;
+  	params.stats_id = vf->abs_vf_id + 0x10;
+ -
+ -	/* Since IGU index is passed via sb_info, construct a dummy one */
+ -	memset(&sb_dummy, 0, sizeof(sb_dummy));
+ -	sb_dummy.igu_sb_id = req->hw_sb;
+ -	params.p_sb = &sb_dummy;
+ +	params.sb = req->hw_sb;
+  	params.sb_idx = req->sb_index;
+  
+++<<<<<<< HEAD
+ +	p_queue->p_tx_cid = _qed_eth_queue_to_cid(p_hwfn,
+ +						  vf->opaque_fid,
+ +						  p_queue->fw_cid,
+ +						  req->tx_qid, &params);
+++=======
++ 	memset(&vf_params, 0, sizeof(vf_params));
++ 	vf_params.vfid = vf->relative_vf_id;
++ 	vf_params.vf_qid = (u8)req->tx_qid;
++ 	vf_params.vf_legacy = b_vf_legacy;
++ 	vf_params.qid_usage_idx = qid_usage_idx;
++ 
++ 	p_queue->p_tx_cid = qed_eth_queue_to_cid(p_hwfn,
++ 						 vf->opaque_fid,
++ 						 &params, &vf_params);
+++>>>>>>> bbe3f233ec5e (qed: Assign a unique per-queue index to queue-cid)
+  	if (!p_queue->p_tx_cid)
+  		goto out;
+  
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.h
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_sriov.h b/drivers/net/ethernet/qlogic/qed/qed_sriov.h
+index bcff13a4692b..6fbbfc62f368 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.h
+@@ -141,6 +141,9 @@ struct qed_iov_vf_mbx {
+ 	struct vfpf_first_tlv first_tlv;
+ };
+ 
++#define QED_IOV_LEGACY_QID_RX (0)
++#define QED_IOV_LEGACY_QID_TX (1)
++
+ struct qed_vf_q_info {
+ 	u16 fw_rx_qid;
+ 	struct qed_queue_cid *p_rx_cid;
