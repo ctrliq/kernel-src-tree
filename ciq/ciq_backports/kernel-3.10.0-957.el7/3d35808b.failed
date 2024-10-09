@@ -1,0 +1,243 @@
+NFS: Merge the remaining setup_sequence functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Anna Schumaker <Anna.Schumaker@Netapp.com>
+commit 3d35808b1de48e0c478668b3177fcd3360aae543
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3d35808b.failed
+
+This creates a single place for all the work to happen, using the
+presence of a session to determine if extra values need to be set.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3d35808b1de48e0c478668b3177fcd3360aae543)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 0a1efaa4e649,f6a362ffcbd4..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -619,48 -622,6 +619,51 @@@ static void nfs4_set_sequence_privilege
+  	args->sa_privileged = 1;
+  }
+  
+++<<<<<<< HEAD
+ +int nfs40_setup_sequence(struct nfs4_slot_table *tbl,
+ +			 struct nfs4_sequence_args *args,
+ +			 struct nfs4_sequence_res *res,
+ +			 struct rpc_task *task)
+ +{
+ +	struct nfs4_slot *slot;
+ +
+ +	/* slot already allocated? */
+ +	if (res->sr_slot != NULL)
+ +		goto out_start;
+ +
+ +	spin_lock(&tbl->slot_tbl_lock);
+ +	if (nfs4_slot_tbl_draining(tbl) && !args->sa_privileged)
+ +		goto out_sleep;
+ +
+ +	slot = nfs4_alloc_slot(tbl);
+ +	if (IS_ERR(slot)) {
+ +		if (slot == ERR_PTR(-ENOMEM))
+ +			task->tk_timeout = HZ >> 2;
+ +		goto out_sleep;
+ +	}
+ +	spin_unlock(&tbl->slot_tbl_lock);
+ +
+ +	slot->privileged = args->sa_privileged ? 1 : 0;
+ +	args->sa_slot = slot;
+ +	res->sr_slot = slot;
+ +
+ +out_start:
+ +	rpc_call_start(task);
+ +	return 0;
+ +
+ +out_sleep:
+ +	if (args->sa_privileged)
+ +		rpc_sleep_on_priority(&tbl->slot_tbl_waitq, task,
+ +				NULL, RPC_PRIORITY_PRIVILEGED);
+ +	else
+ +		rpc_sleep_on(&tbl->slot_tbl_waitq, task, NULL);
+ +	spin_unlock(&tbl->slot_tbl_lock);
+ +	return -EAGAIN;
+ +}
+ +EXPORT_SYMBOL_GPL(nfs40_setup_sequence);
+ +
+++=======
+++>>>>>>> 3d35808b1de4 (NFS: Merge the remaining setup_sequence functions)
+  static void nfs40_sequence_free_slot(struct nfs4_sequence_res *res)
+  {
+  	struct nfs4_slot *slot = res->sr_slot;
+@@@ -875,93 -840,6 +878,96 @@@ int nfs4_sequence_done(struct rpc_task 
+  }
+  EXPORT_SYMBOL_GPL(nfs4_sequence_done);
+  
+++<<<<<<< HEAD
+ +int nfs41_setup_sequence(struct nfs4_session *session,
+ +				struct nfs4_sequence_args *args,
+ +				struct nfs4_sequence_res *res,
+ +				struct rpc_task *task)
+ +{
+ +	struct nfs4_slot *slot;
+ +	struct nfs4_slot_table *tbl;
+ +
+ +	dprintk("--> %s\n", __func__);
+ +	/* slot already allocated? */
+ +	if (res->sr_slot != NULL)
+ +		goto out_success;
+ +
+ +	tbl = &session->fc_slot_table;
+ +
+ +	task->tk_timeout = 0;
+ +
+ +	spin_lock(&tbl->slot_tbl_lock);
+ +	if (test_bit(NFS4_SLOT_TBL_DRAINING, &tbl->slot_tbl_state) &&
+ +	    !args->sa_privileged) {
+ +		/* The state manager will wait until the slot table is empty */
+ +		dprintk("%s session is draining\n", __func__);
+ +		goto out_sleep;
+ +	}
+ +
+ +	slot = nfs4_alloc_slot(tbl);
+ +	if (IS_ERR(slot)) {
+ +		/* If out of memory, try again in 1/4 second */
+ +		if (slot == ERR_PTR(-ENOMEM))
+ +			task->tk_timeout = HZ >> 2;
+ +		dprintk("<-- %s: no free slots\n", __func__);
+ +		goto out_sleep;
+ +	}
+ +	spin_unlock(&tbl->slot_tbl_lock);
+ +
+ +	slot->privileged = args->sa_privileged ? 1 : 0;
+ +	args->sa_slot = slot;
+ +
+ +	dprintk("<-- %s slotid=%u seqid=%u\n", __func__,
+ +			slot->slot_nr, slot->seq_nr);
+ +
+ +	res->sr_slot = slot;
+ +	res->sr_timestamp = jiffies;
+ +	res->sr_status_flags = 0;
+ +	/*
+ +	 * sr_status is only set in decode_sequence, and so will remain
+ +	 * set to 1 if an rpc level failure occurs.
+ +	 */
+ +	res->sr_status = 1;
+ +	trace_nfs4_setup_sequence(session, args);
+ +out_success:
+ +	rpc_call_start(task);
+ +	return 0;
+ +out_sleep:
+ +	/* Privileged tasks are queued with top priority */
+ +	if (args->sa_privileged)
+ +		rpc_sleep_on_priority(&tbl->slot_tbl_waitq, task,
+ +				NULL, RPC_PRIORITY_PRIVILEGED);
+ +	else
+ +		rpc_sleep_on(&tbl->slot_tbl_waitq, task, NULL);
+ +	spin_unlock(&tbl->slot_tbl_lock);
+ +	return -EAGAIN;
+ +}
+ +EXPORT_SYMBOL_GPL(nfs41_setup_sequence);
+ +
+ +static int nfs4_setup_sequence(const struct nfs_server *server,
+ +			       struct nfs4_sequence_args *args,
+ +			       struct nfs4_sequence_res *res,
+ +			       struct rpc_task *task)
+ +{
+ +	struct nfs4_session *session = nfs4_get_session(server->nfs_client);
+ +	int ret = 0;
+ +
+ +	if (!session)
+ +		return nfs40_setup_sequence(server->nfs_client->cl_slot_tbl,
+ +					    args, res, task);
+ +
+ +	dprintk("--> %s clp %p session %p sr_slot %u\n",
+ +		__func__, session->clp, session, res->sr_slot ?
+ +			res->sr_slot->slot_nr : NFS4_NO_SLOT);
+ +
+ +	ret = nfs41_setup_sequence(session, args, res, task);
+ +
+ +	dprintk("<-- %s status=%d\n", __func__, ret);
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 3d35808b1de4 (NFS: Merge the remaining setup_sequence functions)
+  static void nfs41_call_sync_prepare(struct rpc_task *task, void *calldata)
+  {
+  	struct nfs4_call_sync_data *data = calldata;
+@@@ -1015,6 -884,66 +1021,69 @@@ EXPORT_SYMBOL_GPL(nfs4_sequence_done)
+  
+  #endif	/* !CONFIG_NFS_V4_1 */
+  
+++<<<<<<< HEAD
+++=======
++ int nfs4_setup_sequence(const struct nfs_client *client,
++ 			struct nfs4_sequence_args *args,
++ 			struct nfs4_sequence_res *res,
++ 			struct rpc_task *task)
++ {
++ 	struct nfs4_session *session = nfs4_get_session(client);
++ 	struct nfs4_slot_table *tbl  = client->cl_slot_tbl;
++ 	struct nfs4_slot *slot;
++ 
++ 	/* slot already allocated? */
++ 	if (res->sr_slot != NULL)
++ 		goto out_start;
++ 
++ 	if (session) {
++ 		tbl = &session->fc_slot_table;
++ 		task->tk_timeout = 0;
++ 	}
++ 
++ 	spin_lock(&tbl->slot_tbl_lock);
++ 	/* The state manager will wait until the slot table is empty */
++ 	if (nfs4_slot_tbl_draining(tbl) && !args->sa_privileged)
++ 		goto out_sleep;
++ 
++ 	slot = nfs4_alloc_slot(tbl);
++ 	if (IS_ERR(slot)) {
++ 		/* Try again in 1/4 second */
++ 		if (slot == ERR_PTR(-ENOMEM))
++ 			task->tk_timeout = HZ >> 2;
++ 		goto out_sleep;
++ 	}
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 
++ 	slot->privileged = args->sa_privileged ? 1 : 0;
++ 	args->sa_slot = slot;
++ 
++ 	res->sr_slot = slot;
++ 	if (session) {
++ 		res->sr_timestamp = jiffies;
++ 		res->sr_status_flags = 0;
++ 		res->sr_status = 1;
++ #ifdef CONFIG_NFS_V4_1
++ 		trace_nfs4_setup_sequence(session, args);
++ #endif /* CONFIG_NFS_V4_1 */
++ 	}
++ 
++ out_start:
++ 	rpc_call_start(task);
++ 	return 0;
++ 
++ out_sleep:
++ 	if (args->sa_privileged)
++ 		rpc_sleep_on_priority(&tbl->slot_tbl_waitq, task,
++ 				NULL, RPC_PRIORITY_PRIVILEGED);
++ 	else
++ 		rpc_sleep_on(&tbl->slot_tbl_waitq, task, NULL);
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 	return -EAGAIN;
++ }
++ EXPORT_SYMBOL_GPL(nfs4_setup_sequence);
++ 
+++>>>>>>> 3d35808b1de4 (NFS: Merge the remaining setup_sequence functions)
+  static void nfs40_call_sync_prepare(struct rpc_task *task, void *calldata)
+  {
+  	struct nfs4_call_sync_data *data = calldata;
+* Unmerged path fs/nfs/nfs4proc.c
