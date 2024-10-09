@@ -1,0 +1,167 @@
+genirq: Use affinity hint in irqdesc allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 45ddcecbfa947f1dd8e8019bad9e90d6c9f2665c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/45ddcecb.failed
+
+Use the affinity hint in the irqdesc allocator. The hint is used to determine
+the node for the allocation and to set the affinity of the interrupt.
+
+If multiple interrupts are allocated (multi-MSI) then the allocator iterates
+over the cpumask and for each set cpu it allocates on their node and sets the
+initial affinity to that cpu.
+
+If a single interrupt is allocated (MSI-X) then the allocator uses the first
+cpu in the mask to compute the allocation node and uses the mask for the
+initial affinity setting.
+
+Interrupts set up this way are marked with the AFFINITY_MANAGED flag to
+prevent userspace from messing with their affinity settings.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: linux-block@vger.kernel.org
+	Cc: linux-pci@vger.kernel.org
+	Cc: linux-nvme@lists.infradead.org
+	Cc: axboe@fb.com
+	Cc: agordeev@redhat.com
+Link: http://lkml.kernel.org/r/1467621574-8277-5-git-send-email-hch@lst.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 45ddcecbfa947f1dd8e8019bad9e90d6c9f2665c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/irq/irqdesc.c
+diff --cc kernel/irq/irqdesc.c
+index 0674e54847c2,a623b44f2d4b..000000000000
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@@ -71,10 -68,13 +71,18 @@@ static int alloc_masks(struct irq_desc 
+  	return 0;
+  }
+  
+- static void desc_smp_init(struct irq_desc *desc, int node)
++ static void desc_smp_init(struct irq_desc *desc, int node,
++ 			  const struct cpumask *affinity)
+  {
+++<<<<<<< HEAD
+ +	desc->irq_data.node = node;
+ +	cpumask_copy(desc->irq_data.affinity, irq_default_affinity);
+++=======
++ 	if (!affinity)
++ 		affinity = irq_default_affinity;
++ 	cpumask_copy(desc->irq_common_data.affinity, affinity);
++ 
+++>>>>>>> 45ddcecbfa94 (genirq: Use affinity hint in irqdesc allocation)
+  #ifdef CONFIG_GENERIC_PENDING_IRQ
+  	cpumask_clear(desc->pending_mask);
+  #endif
+@@@ -88,8 -86,8 +96,13 @@@ static inline int desc_node(struct irq_
+  #else
+  static inline int
+  alloc_masks(struct irq_desc *desc, gfp_t gfp, int node) { return 0; }
+++<<<<<<< HEAD
+ +static inline void desc_smp_init(struct irq_desc *desc, int node) { }
+ +static inline int desc_node(struct irq_desc *desc) { return 0; }
+++=======
++ static inline void
++ desc_smp_init(struct irq_desc *desc, int node, const struct cpumask *affinity) { }
+++>>>>>>> 45ddcecbfa94 (genirq: Use affinity hint in irqdesc allocation)
+  #endif
+  
+  static void desc_set_defaults(unsigned int irq, struct irq_desc *desc, int node,
+@@@ -153,7 -153,19 +166,23 @@@ static void free_masks(struct irq_desc 
+  static inline void free_masks(struct irq_desc *desc) { }
+  #endif
+  
+++<<<<<<< HEAD
+ +static struct irq_desc *alloc_desc(int irq, int node, struct module *owner)
+++=======
++ void irq_lock_sparse(void)
++ {
++ 	mutex_lock(&sparse_irq_lock);
++ }
++ 
++ void irq_unlock_sparse(void)
++ {
++ 	mutex_unlock(&sparse_irq_lock);
++ }
++ 
++ static struct irq_desc *alloc_desc(int irq, int node, unsigned int flags,
++ 				   const struct cpumask *affinity,
++ 				   struct module *owner)
+++>>>>>>> 45ddcecbfa94 (genirq: Use affinity hint in irqdesc allocation)
+  {
+  	struct irq_desc *desc;
+  	gfp_t gfp = GFP_KERNEL;
+@@@ -171,8 -183,10 +200,9 @@@
+  
+  	raw_spin_lock_init(&desc->lock);
+  	lockdep_set_class(&desc->lock, &irq_desc_lock_class);
+ -	init_rcu_head(&desc->rcu);
+  
+- 	desc_set_defaults(irq, desc, node, owner);
++ 	desc_set_defaults(irq, desc, node, affinity, owner);
++ 	irqd_set(&desc->irq_data, flags);
+  
+  	return desc;
+  
+@@@ -199,13 -231,32 +229,32 @@@ static void free_desc(unsigned int irq
+  }
+  
+  static int alloc_descs(unsigned int start, unsigned int cnt, int node,
+ -		       const struct cpumask *affinity, struct module *owner)
+ +		       struct module *owner)
+  {
++ 	const struct cpumask *mask = NULL;
+  	struct irq_desc *desc;
+- 	int i;
++ 	unsigned int flags;
++ 	int i, cpu = -1;
++ 
++ 	if (affinity && cpumask_empty(affinity))
++ 		return -EINVAL;
++ 
++ 	flags = affinity ? IRQD_AFFINITY_MANAGED : 0;
+  
+  	for (i = 0; i < cnt; i++) {
+- 		desc = alloc_desc(start + i, node, owner);
++ 		if (affinity) {
++ 			cpu = cpumask_next(cpu, affinity);
++ 			if (cpu >= nr_cpu_ids)
++ 				cpu = cpumask_first(affinity);
++ 			node = cpu_to_node(cpu);
++ 
++ 			/*
++ 			 * For single allocations we use the caller provided
++ 			 * mask otherwise we use the mask of the target cpu
++ 			 */
++ 			mask = cnt == 1 ? affinity : cpumask_of(cpu);
++ 		}
++ 		desc = alloc_desc(start + i, node, flags, mask, owner);
+  		if (!desc)
+  			goto err;
+  		mutex_lock(&sparse_irq_lock);
+@@@ -299,7 -350,13 +348,16 @@@ struct irq_desc *irq_to_desc(unsigned i
+  
+  static void free_desc(unsigned int irq)
+  {
+++<<<<<<< HEAD
+ +	dynamic_irq_cleanup(irq);
+++=======
++ 	struct irq_desc *desc = irq_to_desc(irq);
++ 	unsigned long flags;
++ 
++ 	raw_spin_lock_irqsave(&desc->lock, flags);
++ 	desc_set_defaults(irq, desc, irq_desc_get_node(desc), NULL, NULL);
++ 	raw_spin_unlock_irqrestore(&desc->lock, flags);
+++>>>>>>> 45ddcecbfa94 (genirq: Use affinity hint in irqdesc allocation)
+  }
+  
+  static inline int alloc_descs(unsigned int start, unsigned int cnt, int node,
+* Unmerged path kernel/irq/irqdesc.c
