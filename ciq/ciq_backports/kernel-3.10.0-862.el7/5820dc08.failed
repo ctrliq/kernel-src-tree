@@ -1,0 +1,270 @@
+ovl: fix missing unlock_rename() in ovl_do_copy_up()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 5820dc0888d302ac05f8b91ffdf7e4e53b4fbf53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5820dc08.failed
+
+Use the ovl_lock_rename_workdir() helper which requires
+unlock_rename() only on lock success.
+
+Fixes: ("fd210b7d67ee ovl: move copy up lock out")
+	Cc: <stable@vger.kernel.org> # v4.13
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 5820dc0888d302ac05f8b91ffdf7e4e53b4fbf53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/copy_up.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/util.c
+diff --cc fs/overlayfs/copy_up.c
+index 6e96b99a973d,c441f9387a1b..000000000000
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@@ -358,38 -522,97 +358,99 @@@ out_cleanup
+  /*
+   * Copy up a single dentry
+   *
+ - * All renames start with copy up of source if necessary.  The actual
+ - * rename will only proceed once the copy up was successful.  Copy up uses
+ - * upper parent i_mutex for exclusion.  Since rename can change d_parent it
+ - * is possible that the copy up will lock the old parent.  At that point
+ - * the file will have already been copied up anyway.
+ + * Directory renames only allowed on "pure upper" (already created on
+ + * upper filesystem, never copied up).  Directories which are on lower or
+ + * are merged may not be renamed.  For these -EXDEV is returned and
+ + * userspace has to deal with it.  This means, when copying up a
+ + * directory we can rely on it and ancestors being stable.
+ + *
+ + * Non-directory renames start with copy up of source if necessary.  The
+ + * actual rename will only proceed once the copy up was successful.  Copy
+ + * up uses upper parent i_mutex for exclusion.  Since rename can change
+ + * d_parent it is possible that the copy up will lock the old parent.  At
+ + * that point the file will have already been copied up anyway.
+   */
+++<<<<<<< HEAD
+++=======
++ static int ovl_do_copy_up(struct ovl_copy_up_ctx *c)
++ {
++ 	int err;
++ 	struct ovl_fs *ofs = c->dentry->d_sb->s_fs_info;
++ 	bool indexed = false;
++ 
++ 	if (ovl_indexdir(c->dentry->d_sb) && !S_ISDIR(c->stat.mode) &&
++ 	    c->stat.nlink > 1)
++ 		indexed = true;
++ 
++ 	if (S_ISDIR(c->stat.mode) || c->stat.nlink == 1 || indexed)
++ 		c->origin = true;
++ 
++ 	if (indexed) {
++ 		c->destdir = ovl_indexdir(c->dentry->d_sb);
++ 		err = ovl_get_index_name(c->lowerpath.dentry, &c->destname);
++ 		if (err)
++ 			return err;
++ 	} else {
++ 		/*
++ 		 * Mark parent "impure" because it may now contain non-pure
++ 		 * upper
++ 		 */
++ 		err = ovl_set_impure(c->parent, c->destdir);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	/* Should we copyup with O_TMPFILE or with workdir? */
++ 	if (S_ISREG(c->stat.mode) && ofs->tmpfile) {
++ 		c->tmpfile = true;
++ 		err = ovl_copy_up_locked(c);
++ 	} else {
++ 		err = ovl_lock_rename_workdir(c->workdir, c->destdir);
++ 		if (!err) {
++ 			err = ovl_copy_up_locked(c);
++ 			unlock_rename(c->workdir, c->destdir);
++ 		}
++ 	}
++ 
++ 	if (indexed) {
++ 		if (!err)
++ 			ovl_set_flag(OVL_INDEX, d_inode(c->dentry));
++ 		kfree(c->destname.name);
++ 	} else if (!err) {
++ 		struct inode *udir = d_inode(c->destdir);
++ 
++ 		/* Restore timestamps on parent (best effort) */
++ 		inode_lock(udir);
++ 		ovl_set_timestamps(c->destdir, &c->pstat);
++ 		inode_unlock(udir);
++ 
++ 		ovl_dentry_set_upper_alias(c->dentry);
++ 	}
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 5820dc0888d3 (ovl: fix missing unlock_rename() in ovl_do_copy_up())
+  static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
+ -			   int flags)
+ +			   struct path *lowerpath, struct kstat *stat)
+  {
+ +	struct dentry *workdir = ovl_workdir(dentry);
+  	int err;
+ -	DEFINE_DELAYED_CALL(done);
+ +	struct kstat pstat;
+  	struct path parentpath;
+ -	struct ovl_copy_up_ctx ctx = {
+ -		.parent = parent,
+ -		.dentry = dentry,
+ -		.workdir = ovl_workdir(dentry),
+ -	};
+ +	struct dentry *upperdir;
+ +	struct dentry *upperdentry;
+ +	char *link = NULL;
+  
+ -	if (WARN_ON(!ctx.workdir))
+ +	if (WARN_ON(!workdir))
+  		return -EROFS;
+  
+ -	ovl_path_lower(dentry, &ctx.lowerpath);
+ -	err = vfs_getattr(&ctx.lowerpath, &ctx.stat,
+ -			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
+ -	if (err)
+ -		return err;
+ +	ovl_do_check_copy_up(lowerpath->dentry);
+  
+  	ovl_path_upper(parent, &parentpath);
+ -	ctx.destdir = parentpath.dentry;
+ -	ctx.destname = dentry->d_name;
+ +	upperdir = parentpath.dentry;
+  
+ -	err = vfs_getattr(&parentpath, &ctx.pstat,
+ -			  STATX_ATIME | STATX_MTIME, AT_STATX_SYNC_AS_STAT);
+ +	err = vfs_getattr(&parentpath, &pstat);
+  	if (err)
+  		return err;
+  
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,c706a6f99928..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -151,27 -200,58 +151,74 @@@ int ovl_path_next(int idx, struct dentr
+  struct dentry *ovl_dentry_upper(struct dentry *dentry);
+  struct dentry *ovl_dentry_lower(struct dentry *dentry);
+  struct dentry *ovl_dentry_real(struct dentry *dentry);
+ -struct dentry *ovl_i_dentry_upper(struct inode *inode);
+ -struct inode *ovl_inode_upper(struct inode *inode);
+ -struct inode *ovl_inode_lower(struct inode *inode);
+ -struct inode *ovl_inode_real(struct inode *inode);
+ -struct ovl_dir_cache *ovl_dir_cache(struct inode *inode);
+ -void ovl_set_dir_cache(struct inode *inode, struct ovl_dir_cache *cache);
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper);
+ +struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+ +void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache);
+ +struct dentry *ovl_workdir(struct dentry *dentry);
+ +int ovl_want_write(struct dentry *dentry);
+ +void ovl_drop_write(struct dentry *dentry);
+  bool ovl_dentry_is_opaque(struct dentry *dentry);
+++<<<<<<< HEAD
+++=======
++ bool ovl_dentry_is_whiteout(struct dentry *dentry);
++ void ovl_dentry_set_opaque(struct dentry *dentry);
++ bool ovl_dentry_has_upper_alias(struct dentry *dentry);
++ void ovl_dentry_set_upper_alias(struct dentry *dentry);
++ bool ovl_redirect_dir(struct super_block *sb);
++ const char *ovl_dentry_get_redirect(struct dentry *dentry);
++ void ovl_dentry_set_redirect(struct dentry *dentry, const char *redirect);
++ void ovl_inode_init(struct inode *inode, struct dentry *upperdentry,
++ 		    struct dentry *lowerdentry);
++ void ovl_inode_update(struct inode *inode, struct dentry *upperdentry);
++ void ovl_dentry_version_inc(struct dentry *dentry, bool impurity);
++ u64 ovl_dentry_version_get(struct dentry *dentry);
++ bool ovl_is_whiteout(struct dentry *dentry);
++ struct file *ovl_path_open(struct path *path, int flags);
++ int ovl_copy_up_start(struct dentry *dentry);
++ void ovl_copy_up_end(struct dentry *dentry);
++ bool ovl_check_dir_xattr(struct dentry *dentry, const char *name);
++ int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
++ 		       const char *name, const void *value, size_t size,
++ 		       int xerr);
++ int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry);
++ void ovl_set_flag(unsigned long flag, struct inode *inode);
++ void ovl_clear_flag(unsigned long flag, struct inode *inode);
++ bool ovl_test_flag(unsigned long flag, struct inode *inode);
++ bool ovl_inuse_trylock(struct dentry *dentry);
++ void ovl_inuse_unlock(struct dentry *dentry);
++ int ovl_nlink_start(struct dentry *dentry, bool *locked);
++ void ovl_nlink_end(struct dentry *dentry, bool locked);
++ int ovl_lock_rename_workdir(struct dentry *workdir, struct dentry *upperdir);
++ 
++ static inline bool ovl_is_impuredir(struct dentry *dentry)
++ {
++ 	return ovl_check_dir_xattr(dentry, OVL_XATTR_IMPURE);
++ }
++ 
++ 
++ /* namei.c */
++ int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
++ 		      struct dentry *origin, bool is_upper, bool set);
++ int ovl_verify_index(struct dentry *index, struct path *lowerstack,
++ 		     unsigned int numlower);
++ int ovl_get_index_name(struct dentry *origin, struct qstr *name);
++ int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
++ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+++>>>>>>> 5820dc0888d3 (ovl: fix missing unlock_rename() in ovl_do_copy_up())
+  bool ovl_lower_positive(struct dentry *dentry);
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry);
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque);
+ +bool ovl_is_whiteout(struct dentry *dentry);
+ +const struct cred *ovl_override_creds(struct super_block *sb);
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode);
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ +			  unsigned int flags);
+ +struct file *ovl_path_open(struct path *path, int flags);
+ +
+ +struct dentry *ovl_upper_create(struct dentry *upperdir, struct dentry *dentry,
+ +				struct kstat *stat, const char *link);
+  
+  /* readdir.c */
+  extern const struct file_operations ovl_dir_operations;
+* Unmerged path fs/overlayfs/util.c
+* Unmerged path fs/overlayfs/copy_up.c
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index 709c8eb662f9..363308366255 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -205,26 +205,6 @@ out_unlock:
+ 	return err;
+ }
+ 
+-static int ovl_lock_rename_workdir(struct dentry *workdir,
+-				   struct dentry *upperdir)
+-{
+-	/* Workdir should not be the same as upperdir */
+-	if (workdir == upperdir)
+-		goto err;
+-
+-	/* Workdir should not be subdir of upperdir and vice versa */
+-	if (lock_rename(workdir, upperdir) != NULL)
+-		goto err_unlock;
+-
+-	return 0;
+-
+-err_unlock:
+-	unlock_rename(workdir, upperdir);
+-err:
+-	pr_err("overlayfs: failed to lock workdir+upperdir\n");
+-	return -EIO;
+-}
+-
+ static struct dentry *ovl_clear_empty(struct dentry *dentry,
+ 				      struct list_head *list)
+ {
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/util.c
