@@ -1,0 +1,164 @@
+nfp: split out the allocation part of open
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit ee26756d01cbff9e8b9ef9635f58b05b27492a49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ee26756d.failed
+
+Our open/close implementations have 3 stages:
+ - allocation/freeing of ring resources, irqs etc.,
+ - device config,
+ - device/stack enable (can't fail).
+
+Right now all of those stages are placed in separate functions,
+apart from allocation during open.  Fix that.  It will make it
+easier for us to allocate resources for netdev-less vNICs.
+Because we want to reuse allocation code in netdev-less vNICs
+leave the netif_set_real_num_[rt]x_queues() calls inside open.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee26756d01cbff9e8b9ef9635f58b05b27492a49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,bec51f4a9299..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -2020,30 -2364,10 +2020,35 @@@ static void nfp_net_open_stack(struct n
+  	nfp_net_read_link_status(nn);
+  }
+  
+- static int nfp_net_netdev_open(struct net_device *netdev)
++ static int nfp_net_open_alloc_all(struct nfp_net *nn)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_net *nn = netdev_priv(netdev);
+ +	struct nfp_net_ring_set rx = {
+ +		.n_rings = nn->num_rx_rings,
+ +		.mtu = nn->netdev->mtu,
+ +		.dcnt = nn->rxd_cnt,
+ +	};
+ +	struct nfp_net_ring_set tx = {
+ +		.n_rings = nn->num_tx_rings,
+ +		.dcnt = nn->txd_cnt,
+ +	};
+  	int err, r;
+  
+ +	if (nn->ctrl & NFP_NET_CFG_CTRL_ENABLE) {
+ +		nn_err(nn, "Dev is already enabled: 0x%08x\n", nn->ctrl);
+ +		return -EBUSY;
+ +	}
+ +
+ +	/* Step 1: Allocate resources for rings and the like
+ +	 * - Request interrupts
+ +	 * - Allocate RX and TX ring resources
+ +	 * - Setup initial RSS table
+ +	 */
+++=======
+++	int err, r;
+++
+++>>>>>>> ee26756d01cb (nfp: split out the allocation part of open)
+  	err = nfp_net_aux_irq_request(nn, NFP_NET_CFG_EXN, "%s-exn",
+  				      nn->exn_name, sizeof(nn->exn_name),
+  				      NFP_NET_IRQ_EXN_IDX, nn->exn_handler);
+@@@ -2062,28 -2386,53 +2067,61 @@@
+  			goto err_cleanup_vec_p;
+  	}
+  
+ -	err = nfp_net_rx_rings_prepare(nn, &nn->dp);
+ -	if (err)
+ +	nn->rx_rings = nfp_net_rx_ring_set_prepare(nn, &rx);
+ +	if (!nn->rx_rings) {
+ +		err = -ENOMEM;
+  		goto err_cleanup_vec;
+ +	}
+  
+ -	err = nfp_net_tx_rings_prepare(nn, &nn->dp);
+ -	if (err)
+ +	nn->tx_rings = nfp_net_tx_ring_set_prepare(nn, &tx);
+ +	if (!nn->tx_rings) {
+ +		err = -ENOMEM;
+  		goto err_free_rx_rings;
+ +	}
+  
+  	for (r = 0; r < nn->max_r_vecs; r++)
+ -		nfp_net_vector_assign_rings(&nn->dp, &nn->r_vecs[r], r);
+ +		nfp_net_vector_assign_rings(nn, &nn->r_vecs[r], r);
+  
+++<<<<<<< HEAD
+ +	err = netif_set_real_num_tx_queues(netdev, nn->num_tx_rings);
+++=======
++ 	return 0;
++ 
++ err_free_rx_rings:
++ 	nfp_net_rx_rings_free(&nn->dp);
++ err_cleanup_vec:
++ 	r = nn->dp.num_r_vecs;
++ err_cleanup_vec_p:
++ 	while (r--)
++ 		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
++ 	nfp_net_aux_irq_free(nn, NFP_NET_CFG_LSC, NFP_NET_IRQ_LSC_IDX);
++ err_free_exn:
++ 	nfp_net_aux_irq_free(nn, NFP_NET_CFG_EXN, NFP_NET_IRQ_EXN_IDX);
++ 	return err;
++ }
++ 
++ static int nfp_net_netdev_open(struct net_device *netdev)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	int err;
++ 
++ 	/* Step 1: Allocate resources for rings and the like
++ 	 * - Request interrupts
++ 	 * - Allocate RX and TX ring resources
++ 	 * - Setup initial RSS table
++ 	 */
++ 	err = nfp_net_open_alloc_all(nn);
++ 	if (err)
++ 		return err;
++ 
++ 	err = netif_set_real_num_tx_queues(netdev, nn->dp.num_stack_tx_rings);
+++>>>>>>> ee26756d01cb (nfp: split out the allocation part of open)
+  	if (err)
+- 		goto err_free_rings;
++ 		goto err_free_all;
+  
+ -	err = netif_set_real_num_rx_queues(netdev, nn->dp.num_rx_rings);
+ +	err = netif_set_real_num_rx_queues(netdev, nn->num_rx_rings);
+  	if (err)
+- 		goto err_free_rings;
++ 		goto err_free_all;
+  
+  	/* Step 2: Configure the NFP
+  	 * - Enable rings from 0 to tx_rings/rx_rings - 1.
+@@@ -2106,18 -2455,8 +2144,23 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +err_free_rings:
+ +	nfp_net_tx_ring_set_free(nn, &tx);
+ +err_free_rx_rings:
+ +	nfp_net_rx_ring_set_free(nn, &rx);
+ +err_cleanup_vec:
+ +	r = nn->num_r_vecs;
+ +err_cleanup_vec_p:
+ +	while (r--)
+ +		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
+ +	nfp_net_aux_irq_free(nn, NFP_NET_CFG_LSC, NFP_NET_IRQ_LSC_IDX);
+ +err_free_exn:
+ +	nfp_net_aux_irq_free(nn, NFP_NET_CFG_EXN, NFP_NET_IRQ_EXN_IDX);
+++=======
++ err_free_all:
++ 	nfp_net_close_free_all(nn);
+++>>>>>>> ee26756d01cb (nfp: split out the allocation part of open)
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
