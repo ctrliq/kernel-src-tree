@@ -1,0 +1,141 @@
+net/mlx4_en: Fix panic on xmit while port is down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Fix panic on xmit while port is down (Don Dutile) [1385329 1417284]
+Rebuild_FUZZ: 95.74%
+commit-author Moshe Shemesh <moshe@mellanox.com>
+commit 7a61fc86af4a0c957c5b8c5777ab21d5cc286748
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7a61fc86.failed
+
+When port is down, tx drop counter update is not needed.
+Updating the counter in this case can cause a kernel
+panic as when the port is down, ring can be NULL.
+
+Fixes: 63a664b7e92b ("net/mlx4_en: fix tx_dropped bug")
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7a61fc86af4a0c957c5b8c5777ab21d5cc286748)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index b3a7a69913f7,e2509bba3e7c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@@ -1051,4 -1078,107 +1053,110 @@@ tx_drop
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_alloc *frame,
++ 			       struct net_device *dev, unsigned int length,
++ 			       int tx_ind, int *doorbell_pending)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	union mlx4_wqe_qpn_vlan	qpn_vlan = {};
++ 	struct mlx4_en_tx_ring *ring;
++ 	struct mlx4_en_tx_desc *tx_desc;
++ 	struct mlx4_wqe_data_seg *data;
++ 	struct mlx4_en_tx_info *tx_info;
++ 	int index, bf_index;
++ 	bool send_doorbell;
++ 	int nr_txbb = 1;
++ 	bool stop_queue;
++ 	dma_addr_t dma;
++ 	int real_size;
++ 	__be32 op_own;
++ 	u32 ring_cons;
++ 	bool bf_ok;
++ 
++ 	BUILD_BUG_ON_MSG(ALIGN(CTRL_SIZE + DS_SIZE, TXBB_SIZE) != TXBB_SIZE,
++ 			 "mlx4_en_xmit_frame requires minimum size tx desc");
++ 
++ 	ring = priv->tx_ring[tx_ind];
++ 
++ 	if (!priv->port_up)
++ 		goto tx_drop;
++ 
++ 	if (mlx4_en_is_tx_ring_full(ring))
++ 		goto tx_drop_count;
++ 
++ 	/* fetch ring->cons far ahead before needing it to avoid stall */
++ 	ring_cons = READ_ONCE(ring->cons);
++ 
++ 	index = ring->prod & ring->size_mask;
++ 	tx_info = &ring->tx_info[index];
++ 
++ 	bf_ok = ring->bf_enabled;
++ 
++ 	/* Track current inflight packets for performance analysis */
++ 	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
++ 			 (u32)(ring->prod - ring_cons - 1));
++ 
++ 	bf_index = ring->prod;
++ 	tx_desc = ring->buf + index * TXBB_SIZE;
++ 	data = &tx_desc->data;
++ 
++ 	dma = frame->dma;
++ 
++ 	tx_info->page = frame->page;
++ 	frame->page = NULL;
++ 	tx_info->map0_dma = dma;
++ 	tx_info->map0_byte_count = length;
++ 	tx_info->nr_txbb = nr_txbb;
++ 	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
++ 	tx_info->data_offset = (void *)data - (void *)tx_desc;
++ 	tx_info->ts_requested = 0;
++ 	tx_info->nr_maps = 1;
++ 	tx_info->linear = 1;
++ 	tx_info->inl = 0;
++ 
++ 	dma_sync_single_for_device(priv->ddev, dma, length, PCI_DMA_TODEVICE);
++ 
++ 	data->addr = cpu_to_be64(dma);
++ 	data->lkey = ring->mr_key;
++ 	dma_wmb();
++ 	data->byte_count = cpu_to_be32(length);
++ 
++ 	/* tx completion can avoid cache line miss for common cases */
++ 	tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
++ 
++ 	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
++ 		((ring->prod & ring->size) ?
++ 		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
++ 
++ 	ring->packets++;
++ 	ring->bytes += tx_info->nr_bytes;
++ 	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
++ 
++ 	ring->prod += nr_txbb;
++ 
++ 	stop_queue = mlx4_en_is_tx_ring_full(ring);
++ 	send_doorbell = stop_queue ||
++ 				*doorbell_pending > MLX4_EN_DOORBELL_BUDGET;
++ 	bf_ok &= send_doorbell;
++ 
++ 	real_size = ((CTRL_SIZE + nr_txbb * DS_SIZE) / 16) & 0x3f;
++ 
++ 	if (bf_ok)
++ 		qpn_vlan.bf_qpn = ring->doorbell_qpn | cpu_to_be32(real_size);
++ 	else
++ 		qpn_vlan.fence_size = real_size;
++ 
++ 	mlx4_en_tx_write_desc(ring, tx_desc, qpn_vlan, TXBB_SIZE, bf_index,
++ 			      op_own, bf_ok, send_doorbell);
++ 	*doorbell_pending = send_doorbell ? 0 : *doorbell_pending + 1;
++ 
++ 	return NETDEV_TX_OK;
++ 
++ tx_drop_count:
++ 	ring->tx_dropped++;
++ tx_drop:
++ 	return NETDEV_TX_BUSY;
++ }
+++>>>>>>> 7a61fc86af4a (net/mlx4_en: Fix panic on xmit while port is down)
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_tx.c
