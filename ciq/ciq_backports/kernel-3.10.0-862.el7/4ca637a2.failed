@@ -1,0 +1,185 @@
+net/mlx5: Delay events till mlx5 interface's add complete for pci resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Delay events till mlx5 interface's add complete for pci resume (Kamal Heib) [1456694]
+Rebuild_FUZZ: 97.14%
+commit-author Huy Nguyen <huyn@mellanox.com>
+commit 4ca637a20a524cd8ddbca696f12bfa92111c96e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4ca637a2.failed
+
+mlx5_ib_add is called during mlx5_pci_resume after a pci error.
+Before mlx5_ib_add completes, there are multiple events which trigger
+function mlx5_ib_event. This cause kernel panic because mlx5_ib_event
+accesses unitialized resources.
+
+The fix is to extend Erez Shitrit's patch <97834eba7c19>
+("net/mlx5: Delay events till ib registration ends") to cover
+the pci resume code path.
+
+Trace:
+mlx5_core 0001:01:00.6: mlx5_pci_resume was called
+mlx5_core 0001:01:00.6: firmware version: 16.20.1011
+mlx5_core 0001:01:00.6: mlx5_attach_interface:164:(pid 779):
+mlx5_ib_event:2996:(pid 34777): warning: event on port 1
+mlx5_ib_event:2996:(pid 34782): warning: event on port 1
+Unable to handle kernel paging request for data at address 0x0001c104
+Faulting instruction address: 0xd000000008f411fc
+Oops: Kernel access of bad area, sig: 11 [#1]
+...
+...
+Call Trace:
+[c000000fff77bb70] [d000000008f4119c] mlx5_ib_event+0x64/0x470 [mlx5_ib] (unreliable)
+[c000000fff77bc60] [d000000008e67130] mlx5_core_event+0xb8/0x210 [mlx5_core]
+[c000000fff77bd10] [d000000008e4bd00] mlx5_eq_int+0x528/0x860[mlx5_core]
+
+Fixes: 97834eba7c19 ("net/mlx5: Delay events till ib registration ends")
+	Signed-off-by: Huy Nguyen <huyn@mellanox.com>
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 4ca637a20a524cd8ddbca696f12bfa92111c96e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/dev.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/dev.c
+index a9dbc28f6b97,fc281712869b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+@@@ -50,6 -57,64 +50,67 @@@ enum 
+  	MLX5_INTERFACE_ATTACHED,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void add_delayed_event(struct mlx5_priv *priv,
++ 			      struct mlx5_core_dev *dev,
++ 			      enum mlx5_dev_event event,
++ 			      unsigned long param)
++ {
++ 	struct mlx5_delayed_event *delayed_event;
++ 
++ 	delayed_event = kzalloc(sizeof(*delayed_event), GFP_ATOMIC);
++ 	if (!delayed_event) {
++ 		mlx5_core_err(dev, "event %d is missed\n", event);
++ 		return;
++ 	}
++ 
++ 	mlx5_core_dbg(dev, "Accumulating event %d\n", event);
++ 	delayed_event->dev = dev;
++ 	delayed_event->event = event;
++ 	delayed_event->param = param;
++ 	list_add_tail(&delayed_event->list, &priv->waiting_events_list);
++ }
++ 
++ static void delayed_event_release(struct mlx5_device_context *dev_ctx,
++ 				  struct mlx5_priv *priv)
++ {
++ 	struct mlx5_core_dev *dev = container_of(priv, struct mlx5_core_dev, priv);
++ 	struct mlx5_delayed_event *de;
++ 	struct mlx5_delayed_event *n;
++ 	struct list_head temp;
++ 
++ 	INIT_LIST_HEAD(&temp);
++ 
++ 	spin_lock_irq(&priv->ctx_lock);
++ 
++ 	priv->is_accum_events = false;
++ 	list_splice_init(&priv->waiting_events_list, &temp);
++ 	if (!dev_ctx->context)
++ 		goto out;
++ 	list_for_each_entry_safe(de, n, &priv->waiting_events_list, list)
++ 		dev_ctx->intf->event(dev, dev_ctx->context, de->event, de->param);
++ 
++ out:
++ 	spin_unlock_irq(&priv->ctx_lock);
++ 
++ 	list_for_each_entry_safe(de, n, &temp, list) {
++ 		list_del(&de->list);
++ 		kfree(de);
++ 	}
++ }
++ 
++ /* accumulating events that can come after mlx5_ib calls to
++  * ib_register_device, till adding that interface to the events list.
++  */
++ static void delayed_event_start(struct mlx5_priv *priv)
++ {
++ 	spin_lock_irq(&priv->ctx_lock);
++ 	priv->is_accum_events = true;
++ 	spin_unlock_irq(&priv->ctx_lock);
++ }
++ 
+++>>>>>>> 4ca637a20a52 (net/mlx5: Delay events till mlx5 interface's add complete for pci resume)
+  void mlx5_add_device(struct mlx5_interface *intf, struct mlx5_priv *priv)
+  {
+  	struct mlx5_device_context *dev_ctx;
+@@@ -63,6 -128,9 +124,12 @@@
+  		return;
+  
+  	dev_ctx->intf = intf;
+++<<<<<<< HEAD
+++=======
++ 
++ 	delayed_event_start(priv);
++ 
+++>>>>>>> 4ca637a20a52 (net/mlx5: Delay events till mlx5 interface's add complete for pci resume)
+  	dev_ctx->context = intf->add(dev);
+  	set_bit(MLX5_INTERFACE_ADDED, &dev_ctx->state);
+  	if (intf->attach)
+@@@ -71,10 -139,24 +138,30 @@@
+  	if (dev_ctx->context) {
+  		spin_lock_irq(&priv->ctx_lock);
+  		list_add_tail(&dev_ctx->list, &priv->ctx_list);
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&priv->ctx_lock);
+ +	} else {
+ +		kfree(dev_ctx);
+++=======
++ 
++ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++ 		if (dev_ctx->intf->pfault) {
++ 			if (priv->pfault) {
++ 				mlx5_core_err(dev, "multiple page fault handlers not supported");
++ 			} else {
++ 				priv->pfault_ctx = dev_ctx->context;
++ 				priv->pfault = dev_ctx->intf->pfault;
++ 			}
++ 		}
++ #endif
++ 		spin_unlock_irq(&priv->ctx_lock);
+++>>>>>>> 4ca637a20a52 (net/mlx5: Delay events till mlx5 interface's add complete for pci resume)
+  	}
++ 
++ 	delayed_event_release(dev_ctx, priv);
++ 
++ 	if (!dev_ctx->context)
++ 		kfree(dev_ctx);
+  }
+  
+  static struct mlx5_device_context *mlx5_get_device(struct mlx5_interface *intf,
+@@@ -322,8 -417,17 +413,20 @@@ void mlx5_core_event(struct mlx5_core_d
+  
+  	spin_lock_irqsave(&priv->ctx_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (priv->is_accum_events)
++ 		add_delayed_event(priv, dev, event, param);
++ 
++ 	/* After mlx5_detach_device, the dev_ctx->intf is still set and dev_ctx is
++ 	 * still in priv->ctx_list. In this case, only notify the dev_ctx if its
++ 	 * ADDED or ATTACHED bit are set.
++ 	 */
+++>>>>>>> 4ca637a20a52 (net/mlx5: Delay events till mlx5 interface's add complete for pci resume)
+  	list_for_each_entry(dev_ctx, &priv->ctx_list, list)
+- 		if (dev_ctx->intf->event)
++ 		if (dev_ctx->intf->event &&
++ 		    (test_bit(MLX5_INTERFACE_ADDED, &dev_ctx->state) ||
++ 		     test_bit(MLX5_INTERFACE_ATTACHED, &dev_ctx->state)))
+  			dev_ctx->intf->event(dev, dev_ctx->context, event, param);
+  
+  	spin_unlock_irqrestore(&priv->ctx_lock, flags);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/dev.c
