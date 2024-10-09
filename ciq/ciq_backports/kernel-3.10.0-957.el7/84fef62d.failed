@@ -1,0 +1,195 @@
+nvme: check admin passthru command effects
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] check admin passthru command effects (David Milburn) [1519689]
+Rebuild_FUZZ: 92.31%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 84fef62d135b6e47b52f4e9280b5dbc5bb0050ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/84fef62d.failed
+
+The NVMe standard provides a command effects log page so the host may
+be aware of special requirements it may need to do for a particular
+command. For example, the command may need to run with IO quiesced to
+prevent timeouts or undefined behavior, or it may change the logical block
+formats that determine how the host needs to construct future commands.
+
+This patch saves the nvme command effects log page if the controller
+supports it, and performs appropriate actions before and after an admin
+passthrough command is completed. If the controller does not support the
+command effects log page, the driver will define the effects for known
+opcodes. The nvme format and santize are the only commands in this patch
+with known effects.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 84fef62d135b6e47b52f4e9280b5dbc5bb0050ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 0864460d67b9,65fd2fc1ae3c..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -68,13 -64,17 +68,16 @@@ MODULE_PARM_DESC(force_apst, "allow APS
+  struct workqueue_struct *nvme_wq;
+  EXPORT_SYMBOL_GPL(nvme_wq);
+  
+ +static LIST_HEAD(nvme_ctrl_list);
+ +static DEFINE_SPINLOCK(dev_list_lock);
+ +
+  static DEFINE_IDA(nvme_instance_ida);
+ -static dev_t nvme_chr_devt;
+ +
+  static struct class *nvme_class;
+  
++ static void nvme_ns_remove(struct nvme_ns *ns);
++ static int nvme_revalidate_disk(struct gendisk *disk);
++ 
+  static __le32 nvme_get_log_dw10(u8 lid, size_t size)
+  {
+  	return cpu_to_le32((((size / 4) - 1) << 16) | lid);
+@@@ -935,9 -1101,13 +1013,17 @@@ static int nvme_user_cmd(struct nvme_ct
+  	if (cmd.timeout_ms)
+  		timeout = msecs_to_jiffies(cmd.timeout_ms);
+  
++ 	effects = nvme_passthru_start(ctrl, ns, cmd.opcode);
+  	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
+  			(void __user *)(uintptr_t)cmd.addr, cmd.data_len,
+++<<<<<<< HEAD
+ +			&cmd.result, timeout);
+++=======
++ 			(void __user *)(uintptr_t)cmd.metadata, cmd.metadata,
++ 			0, &cmd.result, timeout);
++ 	nvme_passthru_end(ctrl, effects);
++ 
+++>>>>>>> 84fef62d135b (nvme: check admin passthru command effects)
+  	if (status >= 0) {
+  		if (put_user(cmd.result, &ucmd->result))
+  			return -EFAULT;
+@@@ -1591,6 -1828,37 +1677,40 @@@ static void nvme_init_subnqn(struct nvm
+  	memset(ctrl->subnqn + off, 0, sizeof(ctrl->subnqn) - off);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nvme_get_log(struct nvme_ctrl *ctrl, u8 log_page, void *log,
++ 			size_t size)
++ {
++ 	struct nvme_command c = { };
++ 
++ 	c.common.opcode = nvme_admin_get_log_page;
++ 	c.common.nsid = cpu_to_le32(NVME_NSID_ALL);
++ 	c.common.cdw10[0] = nvme_get_log_dw10(log_page, size);
++ 
++ 	return nvme_submit_sync_cmd(ctrl->admin_q, &c, log, size);
++ }
++ 
++ static int nvme_get_effects_log(struct nvme_ctrl *ctrl)
++ {
++ 	int ret;
++ 
++ 	if (!ctrl->effects)
++ 		ctrl->effects = kzalloc(sizeof(*ctrl->effects), GFP_KERNEL);
++ 
++ 	if (!ctrl->effects)
++ 		return 0;
++ 
++ 	ret = nvme_get_log(ctrl, NVME_LOG_CMD_EFFECTS, ctrl->effects,
++ 					sizeof(*ctrl->effects));
++ 	if (ret) {
++ 		kfree(ctrl->effects);
++ 		ctrl->effects = NULL;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> 84fef62d135b (nvme: check admin passthru command effects)
+  /*
+   * Initialize the cached copies of the Identify data and various controller
+   * register in our nvme_ctrl structure.  This should be called as soon as
+@@@ -2521,13 -2812,14 +2647,14 @@@ void nvme_uninit_ctrl(struct nvme_ctrl 
+  }
+  EXPORT_SYMBOL_GPL(nvme_uninit_ctrl);
+  
+ -static void nvme_free_ctrl(struct device *dev)
+ +static void nvme_free_ctrl(struct kref *kref)
+  {
+ -	struct nvme_ctrl *ctrl =
+ -		container_of(dev, struct nvme_ctrl, ctrl_device);
+ +	struct nvme_ctrl *ctrl = container_of(kref, struct nvme_ctrl, kref);
+  
+ +	put_device(ctrl->device);
+  	ida_simple_remove(&nvme_instance_ida, ctrl->instance);
+  	ida_destroy(&ctrl->ns_ida);
++ 	kfree(ctrl->effects);
+  
+  	ctrl->ops->free_ctrl(ctrl);
+  }
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index df4c3bd4f65c..b4db0dfbc529 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -156,6 +156,7 @@ struct nvme_ctrl {
+ 	bool subsystem;
+ 	unsigned long quirks;
+ 	struct nvme_id_power_state psd[32];
++	struct nvme_effects_log *effects;
+ 	struct work_struct scan_work;
+ 	struct work_struct async_event_work;
+ 	struct delayed_work ka_work;
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index f45d62f2ecf8..af9bffbe32e9 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -261,6 +261,7 @@ enum {
+ 	NVME_CTRL_ONCS_DSM			= 1 << 2,
+ 	NVME_CTRL_VWC_PRESENT			= 1 << 0,
+ 	NVME_CTRL_OACS_DBBUF_SUPP		= 1 << 8,
++	NVME_CTRL_LPA_CMD_EFFECTS_LOG		= 1 << 1,
+ };
+ 
+ struct nvme_lbaf {
+@@ -376,6 +377,21 @@ struct nvme_fw_slot_info_log {
+ 	__u8			rsvd64[448];
+ };
+ 
++enum {
++	NVME_CMD_EFFECTS_CSUPP		= 1 << 0,
++	NVME_CMD_EFFECTS_LBCC		= 1 << 1,
++	NVME_CMD_EFFECTS_NCC		= 1 << 2,
++	NVME_CMD_EFFECTS_NIC		= 1 << 3,
++	NVME_CMD_EFFECTS_CCC		= 1 << 4,
++	NVME_CMD_EFFECTS_CSE_MASK	= 3 << 16,
++};
++
++struct nvme_effects_log {
++	__le32 acs[256];
++	__le32 iocs[256];
++	__u8   resv[2048];
++};
++
+ enum {
+ 	NVME_SMART_CRIT_SPARE		= 1 << 0,
+ 	NVME_SMART_CRIT_TEMPERATURE	= 1 << 1,
+@@ -640,6 +656,7 @@ enum nvme_admin_opcode {
+ 	nvme_admin_format_nvm		= 0x80,
+ 	nvme_admin_security_send	= 0x81,
+ 	nvme_admin_security_recv	= 0x82,
++	nvme_admin_sanitize_nvm		= 0x84,
+ };
+ 
+ enum {
+@@ -670,6 +687,7 @@ enum {
+ 	NVME_LOG_ERROR		= 0x01,
+ 	NVME_LOG_SMART		= 0x02,
+ 	NVME_LOG_FW_SLOT	= 0x03,
++	NVME_LOG_CMD_EFFECTS	= 0x05,
+ 	NVME_LOG_DISC		= 0x70,
+ 	NVME_LOG_RESERVATION	= 0x80,
+ 	NVME_FWACT_REPL		= (0 << 3),
