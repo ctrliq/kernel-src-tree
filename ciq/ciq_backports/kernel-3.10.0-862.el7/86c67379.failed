@@ -1,0 +1,1103 @@
+Update ABORT processing for NVMET.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Update ABORT processing for NVMET (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 90.41%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 86c6737963e1c6019168512743908c8ee4e80f06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/86c67379.failed
+
+The driver with nvme had this routine stubbed.
+
+Right now XRI_ABORTED_CQE is not handled and the FC NVMET
+Transport has a new API for the driver.
+
+Missing code path, new NVME abort API
+Update ABORT processing for NVMET
+
+There are 3 new FC NVMET Transport API/ template routines for NVMET:
+
+lpfc_nvmet_xmt_fcp_release
+This NVMET template callback routine called to release context
+associated with an IO This routine is ALWAYS called last, even
+if the IO was aborted or completed in error.
+
+lpfc_nvmet_xmt_fcp_abort
+This NVMET template callback routine called to abort an exchange that
+has an IO in progress
+
+nvmet_fc_rcv_fcp_req
+When the lpfc driver receives an ABTS, this NVME FC transport layer
+callback routine is called. For this case there are 2 paths thru the
+driver: the driver either has an outstanding exchange / context for the
+XRI to be aborted or not.  If not, a BA_RJT is issued otherwise a BA_ACC
+
+NVMET Driver abort paths:
+
+There are 2 paths for aborting an IO. The first one is we receive an IO and
+decide not to process it because of lack of resources. An unsolicated ABTS
+is immediately sent back to the initiator as a response.
+lpfc_nvmet_unsol_fcp_buffer
+            lpfc_nvmet_unsol_issue_abort  (XMIT_SEQUENCE_WQE)
+
+The second one is we sent the IO up to the NVMET transport layer to
+process, and for some reason the NVME Transport layer decided to abort the
+IO before it completes all its phases. For this case there are 2 paths
+thru the driver:
+the driver either has an outstanding TSEND/TRECEIVE/TRSP WQE or no
+outstanding WQEs are present for the exchange / context.
+lpfc_nvmet_xmt_fcp_abort
+    if (LPFC_NVMET_IO_INP)
+        lpfc_nvmet_sol_fcp_issue_abort  (ABORT_WQE)
+                lpfc_nvmet_sol_fcp_abort_cmp
+    else
+        lpfc_nvmet_unsol_fcp_issue_abort
+                lpfc_nvmet_unsol_issue_abort  (XMIT_SEQUENCE_WQE)
+                        lpfc_nvmet_unsol_fcp_abort_cmp
+
+Context flags:
+LPFC_NVMET_IOP - his flag signifies an IO is in progress on the exchange.
+LPFC_NVMET_XBUSY  - this flag indicates the IO completed but the firmware
+is still busy with the corresponding exchange. The exchange should not be
+reused until after a XRI_ABORTED_CQE is received for that exchange.
+LPFC_NVMET_ABORT_OP - this flag signifies an ABORT_WQE was issued on the
+exchange.
+LPFC_NVMET_CTX_RLS  - this flag signifies a context free was requested,
+but we are deferring it due to an XBUSY or ABORT in progress.
+
+A ctxlock is added to the context structure that is used whenever these
+flags are set/read  within the context of an IO.
+The LPFC_NVMET_CTX_RLS flag is only set in the defer_relase routine when
+the transport has resolved all IO associated with the buffer. The flag is
+cleared when the CTX is associated with a new IO.
+
+An exchange can has both an LPFC_NVMET_XBUSY and a LPFC_NVMET_ABORT_OP
+condition active simultaneously. Both conditions must complete before the
+exchange is freed.
+When the abort callback (lpfc_nvmet_xmt_fcp_abort) is envoked:
+If there is an outstanding IO, the driver will issue an ABORT_WQE. This
+should result in 3 completions for the exchange:
+1) IO cmpl with XB bit set
+2) Abort WQE cmpl
+3) XRI_ABORTED_CQE cmpl
+For this scenerio, after completion #1, the NVMET Transport IO rsp
+callback is called.  After completion #2, no action is taken with respect
+to the exchange / context.  After completion #3, the exchange context is
+free for re-use on another IO.
+
+If there is no outstanding activity on the exchange, the driver will send a
+ABTS to the Initiator. Upon completion of this WQE, the exchange / context
+is freed for re-use on another IO.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+(cherry picked from commit 86c6737963e1c6019168512743908c8ee4e80f06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_crtn.h
+#	drivers/scsi/lpfc/lpfc_debugfs.c
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_mbox.c
+#	drivers/scsi/lpfc/lpfc_nvme.c
+#	drivers/scsi/lpfc/lpfc_nvmet.c
+#	drivers/scsi/lpfc/lpfc_nvmet.h
+#	drivers/scsi/lpfc/lpfc_sli4.h
+diff --cc drivers/scsi/lpfc/lpfc_crtn.h
+index 5c660beb66e2,944b32ca4931..000000000000
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@@ -21,6 -23,8 +21,11 @@@
+  typedef int (*node_filter)(struct lpfc_nodelist *, void *);
+  
+  struct fc_rport;
+++<<<<<<< HEAD
+++=======
++ struct fc_frame_header;
++ struct lpfc_nvmet_rcv_ctx;
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  void lpfc_down_link(struct lpfc_hba *, LPFC_MBOXQ_t *);
+  void lpfc_sli_read_link_ste(struct lpfc_hba *);
+  void lpfc_dump_mem(struct lpfc_hba *, LPFC_MBOXQ_t *, uint16_t, uint16_t);
+@@@ -231,8 -244,19 +236,17 @@@ struct hbq_dmabuf *lpfc_els_hbq_alloc(s
+  void lpfc_els_hbq_free(struct lpfc_hba *, struct hbq_dmabuf *);
+  struct hbq_dmabuf *lpfc_sli4_rb_alloc(struct lpfc_hba *);
+  void lpfc_sli4_rb_free(struct lpfc_hba *, struct hbq_dmabuf *);
+++<<<<<<< HEAD
+++=======
++ struct rqb_dmabuf *lpfc_sli4_nvmet_alloc(struct lpfc_hba *phba);
++ void lpfc_sli4_nvmet_free(struct lpfc_hba *phba, struct rqb_dmabuf *dmab);
++ void lpfc_nvmet_rq_post(struct lpfc_hba *phba, struct lpfc_nvmet_rcv_ctx *ctxp,
++ 			struct lpfc_dmabuf *mp);
++ int lpfc_nvmet_rcv_unsol_abort(struct lpfc_vport *vport,
++ 			       struct fc_frame_header *fc_hdr);
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  void lpfc_sli4_build_dflt_fcf_record(struct lpfc_hba *, struct fcf_record *,
+  			uint16_t);
+ -int lpfc_sli4_rq_put(struct lpfc_queue *hq, struct lpfc_queue *dq,
+ -		     struct lpfc_rqe *hrqe, struct lpfc_rqe *drqe);
+ -int lpfc_post_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *hq,
+ -			struct lpfc_queue *dq, int count);
+ -int lpfc_free_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *hq);
+  void lpfc_unregister_fcf(struct lpfc_hba *);
+  void lpfc_unregister_fcf_rescan(struct lpfc_hba *);
+  void lpfc_unregister_unused_fcf(struct lpfc_hba *);
+diff --cc drivers/scsi/lpfc/lpfc_debugfs.c
+index e6cf568b0f02,fce549a91911..000000000000
+--- a/drivers/scsi/lpfc/lpfc_debugfs.c
++++ b/drivers/scsi/lpfc/lpfc_debugfs.c
+@@@ -611,8 -630,621 +611,530 @@@ lpfc_debugfs_nodelist_data(struct lpfc_
+  		len +=  snprintf(buf+len, size-len, "\n");
+  	}
+  	spin_unlock_irq(shost->host_lock);
+ -
+ -	if (phba->nvmet_support && phba->targetport && (vport == phba->pport)) {
+ -		tgtp = (struct lpfc_nvmet_tgtport *)phba->targetport->private;
+ -		len += snprintf(buf + len, size - len,
+ -				"\nNVME Targetport Entry ...\n");
+ -
+ -		/* Port state is only one of two values for now. */
+ -		if (phba->targetport->port_id)
+ -			statep = "REGISTERED";
+ -		else
+ -			statep = "INIT";
+ -		len += snprintf(buf + len, size - len,
+ -				"TGT WWNN x%llx WWPN x%llx State %s\n",
+ -				wwn_to_u64(vport->fc_nodename.u.wwn),
+ -				wwn_to_u64(vport->fc_portname.u.wwn),
+ -				statep);
+ -		len += snprintf(buf + len, size - len,
+ -				"    Targetport DID x%06x\n",
+ -				phba->targetport->port_id);
+ -		goto out_exit;
+ -	}
+ -
+ -	len += snprintf(buf + len, size - len,
+ -				"\nNVME Lport/Rport Entries ...\n");
+ -
+ -	localport = vport->localport;
+ -	if (!localport)
+ -		goto out_exit;
+ -
+ -	spin_lock_irq(shost->host_lock);
+ -	lport = (struct lpfc_nvme_lport *)localport->private;
+ -
+ -	/* Port state is only one of two values for now. */
+ -	if (localport->port_id)
+ -		statep = "ONLINE";
+ -	else
+ -		statep = "UNKNOWN ";
+ -
+ -	len += snprintf(buf + len, size - len,
+ -			"Lport DID x%06x PortState %s\n",
+ -			localport->port_id, statep);
+ -
+ -	len += snprintf(buf + len, size - len, "\tRport List:\n");
+ -	list_for_each_entry(rport, &lport->rport_list, list) {
+ -		/* local short-hand pointer. */
+ -		nrport = rport->remoteport;
+ -
+ -		/* Port state is only one of two values for now. */
+ -		switch (nrport->port_state) {
+ -		case FC_OBJSTATE_ONLINE:
+ -			statep = "ONLINE";
+ -			break;
+ -		case FC_OBJSTATE_UNKNOWN:
+ -			statep = "UNKNOWN ";
+ -			break;
+ -		default:
+ -			statep = "UNSUPPORTED";
+ -			break;
+ -		}
+ -
+ -		/* Tab in to show lport ownership. */
+ -		len += snprintf(buf + len, size - len,
+ -				"\t%s Port ID:x%06x ",
+ -				statep, nrport->port_id);
+ -		len += snprintf(buf + len, size - len, "WWPN x%llx ",
+ -				nrport->port_name);
+ -		len += snprintf(buf + len, size - len, "WWNN x%llx ",
+ -				nrport->node_name);
+ -		switch (nrport->port_role) {
+ -		case FC_PORT_ROLE_NVME_INITIATOR:
+ -			len +=  snprintf(buf + len, size - len,
+ -					 "NVME INITIATOR ");
+ -			break;
+ -		case FC_PORT_ROLE_NVME_TARGET:
+ -			len +=  snprintf(buf + len, size - len,
+ -					 "NVME TARGET ");
+ -			break;
+ -		case FC_PORT_ROLE_NVME_DISCOVERY:
+ -			len +=  snprintf(buf + len, size - len,
+ -					 "NVME DISCOVERY ");
+ -			break;
+ -		default:
+ -			len +=  snprintf(buf + len, size - len,
+ -					 "UNKNOWN ROLE x%x",
+ -					 nrport->port_role);
+ -			break;
+ -		}
+ -
+ -		/* Terminate the string. */
+ -		len +=  snprintf(buf + len, size - len, "\n");
+ -	}
+ -
+ -	spin_unlock_irq(shost->host_lock);
+ - out_exit:
+  	return len;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * lpfc_debugfs_nvmestat_data - Dump target node list to a buffer
++  * @vport: The vport to gather target node info from.
++  * @buf: The buffer to dump log into.
++  * @size: The maximum amount of data to process.
++  *
++  * Description:
++  * This routine dumps the NVME statistics associated with @vport
++  *
++  * Return Value:
++  * This routine returns the amount of bytes that were dumped into @buf and will
++  * not exceed @size.
++  **/
++ static int
++ lpfc_debugfs_nvmestat_data(struct lpfc_vport *vport, char *buf, int size)
++ {
++ 	struct lpfc_hba   *phba = vport->phba;
++ 	struct lpfc_nvmet_tgtport *tgtp;
++ 	struct lpfc_nvmet_rcv_ctx *ctxp, *next_ctxp;
++ 	int len = 0;
++ 	int cnt;
++ 
++ 	if (phba->nvmet_support) {
++ 		if (!phba->targetport)
++ 			return len;
++ 		tgtp = (struct lpfc_nvmet_tgtport *)phba->targetport->private;
++ 		len += snprintf(buf + len, size - len,
++ 				"\nNVME Targetport Statistics\n");
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"LS: Rcv %08x Drop %08x Abort %08x\n",
++ 				atomic_read(&tgtp->rcv_ls_req_in),
++ 				atomic_read(&tgtp->rcv_ls_req_drop),
++ 				atomic_read(&tgtp->xmt_ls_abort));
++ 		if (atomic_read(&tgtp->rcv_ls_req_in) !=
++ 		    atomic_read(&tgtp->rcv_ls_req_out)) {
++ 			len += snprintf(buf + len, size - len,
++ 					"Rcv LS: in %08x != out %08x\n",
++ 					atomic_read(&tgtp->rcv_ls_req_in),
++ 					atomic_read(&tgtp->rcv_ls_req_out));
++ 		}
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"LS: Xmt %08x Drop %08x Cmpl %08x Err %08x\n",
++ 				atomic_read(&tgtp->xmt_ls_rsp),
++ 				atomic_read(&tgtp->xmt_ls_drop),
++ 				atomic_read(&tgtp->xmt_ls_rsp_cmpl),
++ 				atomic_read(&tgtp->xmt_ls_rsp_error));
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"FCP: Rcv %08x Drop %08x\n",
++ 				atomic_read(&tgtp->rcv_fcp_cmd_in),
++ 				atomic_read(&tgtp->rcv_fcp_cmd_drop));
++ 
++ 		if (atomic_read(&tgtp->rcv_fcp_cmd_in) !=
++ 		    atomic_read(&tgtp->rcv_fcp_cmd_out)) {
++ 			len += snprintf(buf + len, size - len,
++ 					"Rcv FCP: in %08x != out %08x\n",
++ 					atomic_read(&tgtp->rcv_fcp_cmd_in),
++ 					atomic_read(&tgtp->rcv_fcp_cmd_out));
++ 		}
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"FCP Rsp: read %08x readrsp %08x "
++ 				"write %08x rsp %08x\n",
++ 				atomic_read(&tgtp->xmt_fcp_read),
++ 				atomic_read(&tgtp->xmt_fcp_read_rsp),
++ 				atomic_read(&tgtp->xmt_fcp_write),
++ 				atomic_read(&tgtp->xmt_fcp_rsp));
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"FCP Rsp: abort %08x drop %08x\n",
++ 				atomic_read(&tgtp->xmt_fcp_abort),
++ 				atomic_read(&tgtp->xmt_fcp_drop));
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"FCP Rsp Cmpl: %08x err %08x drop %08x\n",
++ 				atomic_read(&tgtp->xmt_fcp_rsp_cmpl),
++ 				atomic_read(&tgtp->xmt_fcp_rsp_error),
++ 				atomic_read(&tgtp->xmt_fcp_rsp_drop));
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"ABORT: Xmt %08x Err %08x Cmpl %08x",
++ 				atomic_read(&tgtp->xmt_abort_rsp),
++ 				atomic_read(&tgtp->xmt_abort_rsp_error),
++ 				atomic_read(&tgtp->xmt_abort_cmpl));
++ 
++ 		len +=  snprintf(buf + len, size - len, "\n");
++ 
++ 		cnt = 0;
++ 		spin_lock(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 		list_for_each_entry_safe(ctxp, next_ctxp,
++ 				&phba->sli4_hba.lpfc_abts_nvmet_ctx_list,
++ 				list) {
++ 			cnt++;
++ 		}
++ 		spin_unlock(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 		if (cnt) {
++ 			len += snprintf(buf + len, size - len,
++ 					"ABORT: %d ctx entries\n", cnt);
++ 			spin_lock(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 			list_for_each_entry_safe(ctxp, next_ctxp,
++ 				    &phba->sli4_hba.lpfc_abts_nvmet_ctx_list,
++ 				    list) {
++ 				if (len >= (size - LPFC_DEBUG_OUT_LINE_SZ))
++ 					break;
++ 				len += snprintf(buf + len, size - len,
++ 						"Entry: oxid %x state %x "
++ 						"flag %x\n",
++ 						ctxp->oxid, ctxp->state,
++ 						ctxp->flag);
++ 			}
++ 			spin_unlock(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 		}
++ 	} else {
++ 		if (!(phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME))
++ 			return len;
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"\nNVME Lport Statistics\n");
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"LS: Xmt %016llx Cmpl %016llx\n",
++ 				phba->fc4NvmeLsRequests,
++ 				phba->fc4NvmeLsCmpls);
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"FCP: Rd %016llx Wr %016llx IO %016llx\n",
++ 				phba->fc4NvmeInputRequests,
++ 				phba->fc4NvmeOutputRequests,
++ 				phba->fc4NvmeControlRequests);
++ 
++ 		len += snprintf(buf + len, size - len,
++ 				"    Cmpl %016llx\n", phba->fc4NvmeIoCmpls);
++ 	}
++ 
++ 	return len;
++ }
++ 
++ 
++ /**
++  * lpfc_debugfs_nvmektime_data - Dump target node list to a buffer
++  * @vport: The vport to gather target node info from.
++  * @buf: The buffer to dump log into.
++  * @size: The maximum amount of data to process.
++  *
++  * Description:
++  * This routine dumps the NVME statistics associated with @vport
++  *
++  * Return Value:
++  * This routine returns the amount of bytes that were dumped into @buf and will
++  * not exceed @size.
++  **/
++ static int
++ lpfc_debugfs_nvmektime_data(struct lpfc_vport *vport, char *buf, int size)
++ {
++ 	struct lpfc_hba   *phba = vport->phba;
++ 	int len = 0;
++ 
++ 	if (phba->nvmet_support == 0) {
++ 		/* NVME Initiator */
++ 		len += snprintf(buf + len, PAGE_SIZE - len,
++ 				"ktime %s: Total Samples: %lld\n",
++ 				(phba->ktime_on ?  "Enabled" : "Disabled"),
++ 				phba->ktime_data_samples);
++ 		if (phba->ktime_data_samples == 0)
++ 			return len;
++ 
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"Segment 1: Last NVME Cmd cmpl "
++ 			"done -to- Start of next NVME cnd (in driver)\n");
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg1_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg1_min,
++ 			phba->ktime_seg1_max);
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"Segment 2: Driver start of NVME cmd "
++ 			"-to- Firmware WQ doorbell\n");
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg2_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg2_min,
++ 			phba->ktime_seg2_max);
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"Segment 3: Firmware WQ doorbell -to- "
++ 			"MSI-X ISR cmpl\n");
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg3_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg3_min,
++ 			phba->ktime_seg3_max);
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"Segment 4: MSI-X ISR cmpl -to- "
++ 			"NVME cmpl done\n");
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg4_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg4_min,
++ 			phba->ktime_seg4_max);
++ 		len += snprintf(
++ 			buf + len, PAGE_SIZE - len,
++ 			"Total IO avg time: %08lld\n",
++ 			div_u64(phba->ktime_seg1_total +
++ 			phba->ktime_seg2_total  +
++ 			phba->ktime_seg3_total +
++ 			phba->ktime_seg4_total,
++ 			phba->ktime_data_samples));
++ 		return len;
++ 	}
++ 
++ 	/* NVME Target */
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"ktime %s: Total Samples: %lld %lld\n",
++ 			(phba->ktime_on ? "Enabled" : "Disabled"),
++ 			phba->ktime_data_samples,
++ 			phba->ktime_status_samples);
++ 	if (phba->ktime_data_samples == 0)
++ 		return len;
++ 
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 1: MSI-X ISR Rcv cmd -to- "
++ 			"cmd pass to NVME Layer\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg1_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg1_min,
++ 			phba->ktime_seg1_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 2: cmd pass to NVME Layer- "
++ 			"-to- Driver rcv cmd OP (action)\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg2_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg2_min,
++ 			phba->ktime_seg2_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 3: Driver rcv cmd OP -to- "
++ 			"Firmware WQ doorbell: cmd\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg3_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg3_min,
++ 			phba->ktime_seg3_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 4: Firmware WQ doorbell: cmd "
++ 			"-to- MSI-X ISR for cmd cmpl\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg4_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg4_min,
++ 			phba->ktime_seg4_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 5: MSI-X ISR for cmd cmpl "
++ 			"-to- NVME layer passed cmd done\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg5_total,
++ 				phba->ktime_data_samples),
++ 			phba->ktime_seg5_min,
++ 			phba->ktime_seg5_max);
++ 
++ 	if (phba->ktime_status_samples == 0) {
++ 		len += snprintf(buf + len, PAGE_SIZE-len,
++ 				"Total: cmd received by MSI-X ISR "
++ 				"-to- cmd completed on wire\n");
++ 		len += snprintf(buf + len, PAGE_SIZE-len,
++ 				"avg:%08lld min:%08lld "
++ 				"max %08lld\n",
++ 				div_u64(phba->ktime_seg10_total,
++ 					phba->ktime_data_samples),
++ 				phba->ktime_seg10_min,
++ 				phba->ktime_seg10_max);
++ 		return len;
++ 	}
++ 
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 6: NVME layer passed cmd done "
++ 			"-to- Driver rcv rsp status OP\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg6_total,
++ 				phba->ktime_status_samples),
++ 			phba->ktime_seg6_min,
++ 			phba->ktime_seg6_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 7: Driver rcv rsp status OP "
++ 			"-to- Firmware WQ doorbell: status\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg7_total,
++ 				phba->ktime_status_samples),
++ 			phba->ktime_seg7_min,
++ 			phba->ktime_seg7_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 8: Firmware WQ doorbell: status"
++ 			" -to- MSI-X ISR for status cmpl\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg8_total,
++ 				phba->ktime_status_samples),
++ 			phba->ktime_seg8_min,
++ 			phba->ktime_seg8_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Segment 9: MSI-X ISR for status cmpl  "
++ 			"-to- NVME layer passed status done\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg9_total,
++ 				phba->ktime_status_samples),
++ 			phba->ktime_seg9_min,
++ 			phba->ktime_seg9_max);
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"Total: cmd received by MSI-X ISR -to- "
++ 			"cmd completed on wire\n");
++ 	len += snprintf(buf + len, PAGE_SIZE-len,
++ 			"avg:%08lld min:%08lld max %08lld\n",
++ 			div_u64(phba->ktime_seg10_total,
++ 				phba->ktime_status_samples),
++ 			phba->ktime_seg10_min,
++ 			phba->ktime_seg10_max);
++ 	return len;
++ }
++ 
++ /**
++  * lpfc_debugfs_nvmeio_trc_data - Dump NVME IO trace list to a buffer
++  * @phba: The phba to gather target node info from.
++  * @buf: The buffer to dump log into.
++  * @size: The maximum amount of data to process.
++  *
++  * Description:
++  * This routine dumps the NVME IO trace associated with @phba
++  *
++  * Return Value:
++  * This routine returns the amount of bytes that were dumped into @buf and will
++  * not exceed @size.
++  **/
++ static int
++ lpfc_debugfs_nvmeio_trc_data(struct lpfc_hba *phba, char *buf, int size)
++ {
++ 	struct lpfc_debugfs_nvmeio_trc *dtp;
++ 	int i, state, index, skip;
++ 	int len = 0;
++ 
++ 	state = phba->nvmeio_trc_on;
++ 
++ 	index = (atomic_read(&phba->nvmeio_trc_cnt) + 1) &
++ 		(phba->nvmeio_trc_size - 1);
++ 	skip = phba->nvmeio_trc_output_idx;
++ 
++ 	len += snprintf(buf + len, size - len,
++ 			"%s IO Trace %s: next_idx %d skip %d size %d\n",
++ 			(phba->nvmet_support ? "NVME" : "NVMET"),
++ 			(state ? "Enabled" : "Disabled"),
++ 			index, skip, phba->nvmeio_trc_size);
++ 
++ 	if (!phba->nvmeio_trc || state)
++ 		return len;
++ 
++ 	/* trace MUST bhe off to continue */
++ 
++ 	for (i = index; i < phba->nvmeio_trc_size; i++) {
++ 		if (skip) {
++ 			skip--;
++ 			continue;
++ 		}
++ 		dtp = phba->nvmeio_trc + i;
++ 		phba->nvmeio_trc_output_idx++;
++ 
++ 		if (!dtp->fmt)
++ 			continue;
++ 
++ 		len +=  snprintf(buf + len, size - len, dtp->fmt,
++ 			dtp->data1, dtp->data2, dtp->data3);
++ 
++ 		if (phba->nvmeio_trc_output_idx >= phba->nvmeio_trc_size) {
++ 			phba->nvmeio_trc_output_idx = 0;
++ 			len += snprintf(buf + len, size - len,
++ 					"Trace Complete\n");
++ 			goto out;
++ 		}
++ 
++ 		if (len >= (size - LPFC_DEBUG_OUT_LINE_SZ)) {
++ 			len += snprintf(buf + len, size - len,
++ 					"Trace Continue (%d of %d)\n",
++ 					phba->nvmeio_trc_output_idx,
++ 					phba->nvmeio_trc_size);
++ 			goto out;
++ 		}
++ 	}
++ 	for (i = 0; i < index; i++) {
++ 		if (skip) {
++ 			skip--;
++ 			continue;
++ 		}
++ 		dtp = phba->nvmeio_trc + i;
++ 		phba->nvmeio_trc_output_idx++;
++ 
++ 		if (!dtp->fmt)
++ 			continue;
++ 
++ 		len +=  snprintf(buf + len, size - len, dtp->fmt,
++ 			dtp->data1, dtp->data2, dtp->data3);
++ 
++ 		if (phba->nvmeio_trc_output_idx >= phba->nvmeio_trc_size) {
++ 			phba->nvmeio_trc_output_idx = 0;
++ 			len += snprintf(buf + len, size - len,
++ 					"Trace Complete\n");
++ 			goto out;
++ 		}
++ 
++ 		if (len >= (size - LPFC_DEBUG_OUT_LINE_SZ)) {
++ 			len += snprintf(buf + len, size - len,
++ 					"Trace Continue (%d of %d)\n",
++ 					phba->nvmeio_trc_output_idx,
++ 					phba->nvmeio_trc_size);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	len += snprintf(buf + len, size - len,
++ 			"Trace Done\n");
++ out:
++ 	return len;
++ }
++ 
++ /**
++  * lpfc_debugfs_cpucheck_data - Dump target node list to a buffer
++  * @vport: The vport to gather target node info from.
++  * @buf: The buffer to dump log into.
++  * @size: The maximum amount of data to process.
++  *
++  * Description:
++  * This routine dumps the NVME statistics associated with @vport
++  *
++  * Return Value:
++  * This routine returns the amount of bytes that were dumped into @buf and will
++  * not exceed @size.
++  **/
++ static int
++ lpfc_debugfs_cpucheck_data(struct lpfc_vport *vport, char *buf, int size)
++ {
++ 	struct lpfc_hba   *phba = vport->phba;
++ 	int i;
++ 	int len = 0;
++ 	uint32_t tot_xmt = 0;
++ 	uint32_t tot_rcv = 0;
++ 	uint32_t tot_cmpl = 0;
++ 	uint32_t tot_ccmpl = 0;
++ 
++ 	if (phba->nvmet_support == 0) {
++ 		/* NVME Initiator */
++ 		len += snprintf(buf + len, PAGE_SIZE - len,
++ 				"CPUcheck %s\n",
++ 				(phba->cpucheck_on & LPFC_CHECK_NVME_IO ?
++ 					"Enabled" : "Disabled"));
++ 		for (i = 0; i < phba->sli4_hba.num_present_cpu; i++) {
++ 			if (i >= LPFC_CHECK_CPU_CNT)
++ 				break;
++ 			len += snprintf(buf + len, PAGE_SIZE - len,
++ 					"%02d: xmit x%08x cmpl x%08x\n",
++ 					i, phba->cpucheck_xmt_io[i],
++ 					phba->cpucheck_cmpl_io[i]);
++ 			tot_xmt += phba->cpucheck_xmt_io[i];
++ 			tot_cmpl += phba->cpucheck_cmpl_io[i];
++ 		}
++ 		len += snprintf(buf + len, PAGE_SIZE - len,
++ 				"tot:xmit x%08x cmpl x%08x\n",
++ 				tot_xmt, tot_cmpl);
++ 		return len;
++ 	}
++ 
++ 	/* NVME Target */
++ 	len += snprintf(buf + len, PAGE_SIZE - len,
++ 			"CPUcheck %s ",
++ 			(phba->cpucheck_on & LPFC_CHECK_NVMET_IO ?
++ 				"IO Enabled - " : "IO Disabled - "));
++ 	len += snprintf(buf + len, PAGE_SIZE - len,
++ 			"%s\n",
++ 			(phba->cpucheck_on & LPFC_CHECK_NVMET_RCV ?
++ 				"Rcv Enabled\n" : "Rcv Disabled\n"));
++ 	for (i = 0; i < phba->sli4_hba.num_present_cpu; i++) {
++ 		if (i >= LPFC_CHECK_CPU_CNT)
++ 			break;
++ 		len += snprintf(buf + len, PAGE_SIZE - len,
++ 				"%02d: xmit x%08x ccmpl x%08x "
++ 				"cmpl x%08x rcv x%08x\n",
++ 				i, phba->cpucheck_xmt_io[i],
++ 				phba->cpucheck_ccmpl_io[i],
++ 				phba->cpucheck_cmpl_io[i],
++ 				phba->cpucheck_rcv_io[i]);
++ 		tot_xmt += phba->cpucheck_xmt_io[i];
++ 		tot_rcv += phba->cpucheck_rcv_io[i];
++ 		tot_cmpl += phba->cpucheck_cmpl_io[i];
++ 		tot_ccmpl += phba->cpucheck_ccmpl_io[i];
++ 	}
++ 	len += snprintf(buf + len, PAGE_SIZE - len,
++ 			"tot:xmit x%08x ccmpl x%08x cmpl x%08x rcv x%08x\n",
++ 			tot_xmt, tot_ccmpl, tot_cmpl, tot_rcv);
++ 	return len;
++ }
++ 
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  #endif
+  
+  /**
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index 6b2100eb2346,74cec2232a86..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -46,8 -53,10 +50,13 @@@
+  #include "lpfc_sli4.h"
+  #include "lpfc_nl.h"
+  #include "lpfc_disc.h"
+ -#include "lpfc.h"
+  #include "lpfc_scsi.h"
+++<<<<<<< HEAD
+ +#include "lpfc.h"
+++=======
++ #include "lpfc_nvme.h"
++ #include "lpfc_nvmet.h"
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  #include "lpfc_logmsg.h"
+  #include "lpfc_crtn.h"
+  #include "lpfc_vport.h"
+@@@ -1007,15 -1027,16 +1016,21 @@@ static in
+  lpfc_hba_down_post_s4(struct lpfc_hba *phba)
+  {
+  	struct lpfc_scsi_buf *psb, *psb_next;
++ 	struct lpfc_nvmet_rcv_ctx *ctxp, *ctxp_next;
+  	LIST_HEAD(aborts);
+++<<<<<<< HEAD
+++=======
++ 	LIST_HEAD(nvme_aborts);
++ 	LIST_HEAD(nvmet_aborts);
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	unsigned long iflag = 0;
+  	struct lpfc_sglq *sglq_entry = NULL;
+ +	struct lpfc_sli *psli = &phba->sli;
+ +	struct lpfc_sli_ring *pring;
+  
+ -
+ -	lpfc_sli_hbqbuf_free_all(phba);
+ +	lpfc_hba_free_post_buf(phba);
+  	lpfc_hba_clean_txcmplq(phba);
+ +	pring = &psli->ring[LPFC_ELS_RING];
+  
+  	/* At this point in time the HBA is either reset or DOA. Either
+  	 * way, nothing should be on lpfc_abts_els_sgl_list, it needs to be
+@@@ -1033,18 -1054,30 +1048,44 @@@
+  		&phba->sli4_hba.lpfc_abts_els_sgl_list, list)
+  		sglq_entry->state = SGL_FREED;
+  
+ +	spin_lock(&pring->ring_lock);
+  	list_splice_init(&phba->sli4_hba.lpfc_abts_els_sgl_list,
+++<<<<<<< HEAD
+ +			&phba->sli4_hba.lpfc_sgl_list);
+ +	spin_unlock(&pring->ring_lock);
+ +	spin_unlock(&phba->sli4_hba.abts_sgl_list_lock);
+ +	/* abts_scsi_buf_list_lock required because worker thread uses this
+ +	 * list.
+ +	 */
+ +	spin_lock(&phba->sli4_hba.abts_scsi_buf_list_lock);
+ +	list_splice_init(&phba->sli4_hba.lpfc_abts_scsi_buf_list,
+ +			&aborts);
+ +	spin_unlock(&phba->sli4_hba.abts_scsi_buf_list_lock);
+++=======
++ 			&phba->sli4_hba.lpfc_els_sgl_list);
++ 
++ 
++ 	spin_unlock(&phba->sli4_hba.sgl_list_lock);
++ 	/* abts_scsi_buf_list_lock required because worker thread uses this
++ 	 * list.
++ 	 */
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP) {
++ 		spin_lock(&phba->sli4_hba.abts_scsi_buf_list_lock);
++ 		list_splice_init(&phba->sli4_hba.lpfc_abts_scsi_buf_list,
++ 				 &aborts);
++ 		spin_unlock(&phba->sli4_hba.abts_scsi_buf_list_lock);
++ 	}
++ 
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++ 		spin_lock(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 		list_splice_init(&phba->sli4_hba.lpfc_abts_nvme_buf_list,
++ 				 &nvme_aborts);
++ 		list_splice_init(&phba->sli4_hba.lpfc_abts_nvmet_ctx_list,
++ 				 &nvmet_aborts);
++ 		spin_unlock(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 	}
++ 
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	spin_unlock_irq(&phba->hbalock);
+  
+  	list_for_each_entry_safe(psb, psb_next, &aborts, list) {
+@@@ -1055,6 -1088,21 +1096,24 @@@
+  	list_splice(&aborts, &phba->lpfc_scsi_buf_list_put);
+  	spin_unlock_irqrestore(&phba->scsi_buf_list_put_lock, iflag);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++ 		list_for_each_entry_safe(psb, psb_next, &nvme_aborts, list) {
++ 			psb->pCmd = NULL;
++ 			psb->status = IOSTAT_SUCCESS;
++ 		}
++ 		spin_lock_irqsave(&phba->nvme_buf_list_put_lock, iflag);
++ 		list_splice(&nvme_aborts, &phba->lpfc_nvme_buf_list_put);
++ 		spin_unlock_irqrestore(&phba->nvme_buf_list_put_lock, iflag);
++ 
++ 		list_for_each_entry_safe(ctxp, ctxp_next, &nvmet_aborts, list) {
++ 			ctxp->flag &= ~(LPFC_NVMET_XBUSY | LPFC_NVMET_ABORT_OP);
++ 			lpfc_nvmet_rq_post(phba, ctxp, &ctxp->rqb_buffer->hbuf);
++ 		}
++ 	}
++ 
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	lpfc_sli4_free_sp_events(phba);
+  	return 0;
+  }
+@@@ -5433,11 -5812,24 +5492,29 @@@ lpfc_sli4_driver_resource_setup(struct 
+  	/*
+  	 * Initialize the SLI Layer to run with lpfc SLI4 HBAs.
+  	 */
+++<<<<<<< HEAD
+ +	/* Initialize the Abort scsi buffer list used by driver */
+ +	spin_lock_init(&phba->sli4_hba.abts_scsi_buf_list_lock);
+ +	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_abts_scsi_buf_list);
+++=======
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP) {
++ 		/* Initialize the Abort scsi buffer list used by driver */
++ 		spin_lock_init(&phba->sli4_hba.abts_scsi_buf_list_lock);
++ 		INIT_LIST_HEAD(&phba->sli4_hba.lpfc_abts_scsi_buf_list);
++ 	}
++ 
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++ 		/* Initialize the Abort nvme buffer list used by driver */
++ 		spin_lock_init(&phba->sli4_hba.abts_nvme_buf_list_lock);
++ 		INIT_LIST_HEAD(&phba->sli4_hba.lpfc_abts_nvme_buf_list);
++ 		INIT_LIST_HEAD(&phba->sli4_hba.lpfc_abts_nvmet_ctx_list);
++ 		/* Fast-path XRI aborted CQ Event work queue list */
++ 		INIT_LIST_HEAD(&phba->sli4_hba.sp_nvme_xri_aborted_work_queue);
++ 	}
++ 
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	/* This abort list used by worker thread */
+ -	spin_lock_init(&phba->sli4_hba.sgl_list_lock);
+ -	spin_lock_init(&phba->sli4_hba.nvmet_io_lock);
+ +	spin_lock_init(&phba->sli4_hba.abts_sgl_list_lock);
+  
+  	/*
+  	 * Initialize driver internal slow-path work queues
+@@@ -6053,8 -6447,10 +6130,13 @@@ static voi
+  lpfc_init_sgl_list(struct lpfc_hba *phba)
+  {
+  	/* Initialize and populate the sglq list per host/VF. */
+ -	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_els_sgl_list);
+ +	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_sgl_list);
+  	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_abts_els_sgl_list);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_nvmet_sgl_list);
++ 	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_abts_nvmet_ctx_list);
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  
+  	/* els xri-sgl book keeping */
+  	phba->sli4_hba.els_xri_cnt = 0;
+@@@ -9513,11 -9976,29 +9595,31 @@@ static voi
+  lpfc_sli4_xri_exchange_busy_wait(struct lpfc_hba *phba)
+  {
+  	int wait_time = 0;
+++<<<<<<< HEAD
+ +	int fcp_xri_cmpl = list_empty(&phba->sli4_hba.lpfc_abts_scsi_buf_list);
+ +	int els_xri_cmpl = list_empty(&phba->sli4_hba.lpfc_abts_els_sgl_list);
+ +
+ +	while (!fcp_xri_cmpl || !els_xri_cmpl) {
+++=======
++ 	int nvme_xri_cmpl = 1;
++ 	int nvmet_xri_cmpl = 1;
++ 	int fcp_xri_cmpl = 1;
++ 	int els_xri_cmpl = list_empty(&phba->sli4_hba.lpfc_abts_els_sgl_list);
++ 
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP)
++ 		fcp_xri_cmpl =
++ 			list_empty(&phba->sli4_hba.lpfc_abts_scsi_buf_list);
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++ 		nvme_xri_cmpl =
++ 			list_empty(&phba->sli4_hba.lpfc_abts_nvme_buf_list);
++ 		nvmet_xri_cmpl =
++ 			list_empty(&phba->sli4_hba.lpfc_abts_nvmet_ctx_list);
++ 	}
++ 
++ 	while (!fcp_xri_cmpl || !els_xri_cmpl || !nvme_xri_cmpl ||
++ 	       !nvmet_xri_cmpl) {
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  		if (wait_time > LPFC_XRI_EXCH_BUSY_WAIT_TMO) {
+ -			if (!nvme_xri_cmpl)
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -						"6100 NVME XRI exchange busy "
+ -						"wait time: %d seconds.\n",
+ -						wait_time/1000);
+  			if (!fcp_xri_cmpl)
+  				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+  						"2877 FCP XRI exchange busy "
+@@@ -9534,10 -10015,20 +9636,27 @@@
+  			msleep(LPFC_XRI_EXCH_BUSY_WAIT_T1);
+  			wait_time += LPFC_XRI_EXCH_BUSY_WAIT_T1;
+  		}
+++<<<<<<< HEAD
+ +		fcp_xri_cmpl =
+ +			list_empty(&phba->sli4_hba.lpfc_abts_scsi_buf_list);
+ +		els_xri_cmpl =
+ +			list_empty(&phba->sli4_hba.lpfc_abts_els_sgl_list);
+++=======
++ 		if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++ 			nvme_xri_cmpl = list_empty(
++ 				&phba->sli4_hba.lpfc_abts_nvme_buf_list);
++ 			nvmet_xri_cmpl = list_empty(
++ 				&phba->sli4_hba.lpfc_abts_nvmet_ctx_list);
++ 		}
++ 
++ 		if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP)
++ 			fcp_xri_cmpl = list_empty(
++ 				&phba->sli4_hba.lpfc_abts_scsi_buf_list);
++ 
++ 		els_xri_cmpl =
++ 			list_empty(&phba->sli4_hba.lpfc_abts_els_sgl_list);
++ 
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	}
+  }
+  
+diff --cc drivers/scsi/lpfc/lpfc_mbox.c
+index f0fb18d00e9f,ce25a18367b5..000000000000
+--- a/drivers/scsi/lpfc/lpfc_mbox.c
++++ b/drivers/scsi/lpfc/lpfc_mbox.c
+@@@ -2081,6 -2083,12 +2081,15 @@@ lpfc_request_features(struct lpfc_hba *
+  	if (phba->max_vpi && phba->cfg_enable_npiv)
+  		bf_set(lpfc_mbx_rq_ftr_rq_npiv, &mboxq->u.mqe.un.req_ftrs, 1);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (phba->nvmet_support) {
++ 		bf_set(lpfc_mbx_rq_ftr_rq_mrqp, &mboxq->u.mqe.un.req_ftrs, 1);
++ 		/* iaab/iaar NOT set for now */
++ 		 bf_set(lpfc_mbx_rq_ftr_rq_iaab, &mboxq->u.mqe.un.req_ftrs, 0);
++ 		 bf_set(lpfc_mbx_rq_ftr_rq_iaar, &mboxq->u.mqe.un.req_ftrs, 0);
++ 	}
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	return;
+  }
+  
+diff --cc drivers/scsi/lpfc/lpfc_sli4.h
+index 0b88b5703e0f,da46471337c8..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@@ -568,14 -609,20 +568,19 @@@ struct lpfc_sli4_hba 
+  	uint16_t rpi_hdrs_in_use; /* must post rpi hdrs if set. */
+  	uint16_t next_xri; /* last_xri - max_cfg_param.xri_base = used */
+  	uint16_t next_rpi;
+ -	uint16_t nvme_xri_max;
+ -	uint16_t nvme_xri_cnt;
+ -	uint16_t nvme_xri_start;
+  	uint16_t scsi_xri_max;
+  	uint16_t scsi_xri_cnt;
+ -	uint16_t scsi_xri_start;
+  	uint16_t els_xri_cnt;
+ -	uint16_t nvmet_xri_cnt;
+ -	struct list_head lpfc_els_sgl_list;
+ +	uint16_t scsi_xri_start;
+ +	struct list_head lpfc_free_sgl_list;
+ +	struct list_head lpfc_sgl_list;
+  	struct list_head lpfc_abts_els_sgl_list;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head lpfc_nvmet_sgl_list;
++ 	struct list_head lpfc_abts_nvmet_ctx_list;
+++>>>>>>> 86c6737963e1 (Update ABORT processing for NVMET.)
+  	struct list_head lpfc_abts_scsi_buf_list;
+ -	struct list_head lpfc_abts_nvme_buf_list;
+  	struct lpfc_sglq **lpfc_sglq_active_list;
+  	struct list_head lpfc_rpi_hdr_list;
+  	unsigned long *rpi_bmask;
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.h
+* Unmerged path drivers/scsi/lpfc/lpfc_crtn.h
+* Unmerged path drivers/scsi/lpfc/lpfc_debugfs.c
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 3567b6a0d2ee..c0a16d26d35d 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -2381,6 +2381,9 @@ struct lpfc_mbx_request_features {
+ #define lpfc_mbx_rq_ftr_rq_ifip_SHIFT		7
+ #define lpfc_mbx_rq_ftr_rq_ifip_MASK		0x00000001
+ #define lpfc_mbx_rq_ftr_rq_ifip_WORD		word2
++#define lpfc_mbx_rq_ftr_rq_iaar_SHIFT		9
++#define lpfc_mbx_rq_ftr_rq_iaar_MASK		0x00000001
++#define lpfc_mbx_rq_ftr_rq_iaar_WORD		word2
+ #define lpfc_mbx_rq_ftr_rq_perfh_SHIFT		11
+ #define lpfc_mbx_rq_ftr_rq_perfh_MASK		0x00000001
+ #define lpfc_mbx_rq_ftr_rq_perfh_WORD		word2
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+* Unmerged path drivers/scsi/lpfc/lpfc_mbox.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.h
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index a72e33b21d85..a6cfb15fee97 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -15269,7 +15269,7 @@ lpfc_sli4_xri_inrange(struct lpfc_hba *phba,
+  * This function sends a basic response to a previous unsol sequence abort
+  * event after aborting the sequence handling.
+  **/
+-static void
++void
+ lpfc_sli4_seq_abort_rsp(struct lpfc_vport *vport,
+ 			struct fc_frame_header *fc_hdr, bool aborted)
+ {
+@@ -15446,6 +15446,11 @@ lpfc_sli4_handle_unsol_abort(struct lpfc_vport *vport,
+ 	}
+ 	lpfc_in_buf_free(phba, &dmabuf->dbuf);
+ 
++	if (phba->nvmet_support) {
++		lpfc_nvmet_rcv_unsol_abort(vport, &fc_hdr);
++		return;
++	}
++
+ 	/* Respond with BA_ACC or BA_RJT accordingly */
+ 	lpfc_sli4_seq_abort_rsp(vport, &fc_hdr, aborted);
+ }
+* Unmerged path drivers/scsi/lpfc/lpfc_sli4.h
