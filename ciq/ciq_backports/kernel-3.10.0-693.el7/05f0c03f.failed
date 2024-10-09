@@ -1,0 +1,219 @@
+vfio-pci: Allow to mmap sub-page MMIO BARs if the mmio page is exclusive
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Yongji Xie <xyjxie@linux.vnet.ibm.com>
+commit 05f0c03fbac1819e86c9d5db4e208b68fc1b9b5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/05f0c03f.failed
+
+Current vfio-pci implementation disallows to mmap
+sub-page(size < PAGE_SIZE) MMIO BARs because these BARs' mmio
+page may be shared with other BARs. This will cause some
+performance issues when we passthrough a PCI device with
+this kind of BARs. Guest will be not able to handle the mmio
+accesses to the BARs which leads to mmio emulations in host.
+
+However, not all sub-page BARs will share page with other BARs.
+We should allow to mmap the sub-page MMIO BARs which we can
+make sure will not share page with other BARs.
+
+This patch adds support for this case. And we try to add a
+dummy resource to reserve the remainder of the page which
+hot-add device's BAR might be assigned into. But it's not
+necessary to handle the case when the BAR is not page aligned.
+Because we can't expect the BAR will be assigned into the same
+location in a page in guest when we passthrough the BAR. And
+it's hard to access this BAR in userspace because we have
+no way to get the BAR's location in a page.
+
+	Signed-off-by: Yongji Xie <xyjxie@linux.vnet.ibm.com>
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 05f0c03fbac1819e86c9d5db4e208b68fc1b9b5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci.c
+#	drivers/vfio/pci/vfio_pci_private.h
+diff --cc drivers/vfio/pci/vfio_pci.c
+index 2a0043c78806,d624a527777f..000000000000
+--- a/drivers/vfio/pci/vfio_pci.c
++++ b/drivers/vfio/pci/vfio_pci.c
+@@@ -105,7 -110,76 +105,75 @@@ static inline bool vfio_pci_is_vga(stru
+  	return (pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA;
+  }
+  
++ static void vfio_pci_probe_mmaps(struct vfio_pci_device *vdev)
++ {
++ 	struct resource *res;
++ 	int bar;
++ 	struct vfio_pci_dummy_resource *dummy_res;
++ 
++ 	INIT_LIST_HEAD(&vdev->dummy_resources_list);
++ 
++ 	for (bar = PCI_STD_RESOURCES; bar <= PCI_STD_RESOURCE_END; bar++) {
++ 		res = vdev->pdev->resource + bar;
++ 
++ 		if (!IS_ENABLED(CONFIG_VFIO_PCI_MMAP))
++ 			goto no_mmap;
++ 
++ 		if (!(res->flags & IORESOURCE_MEM))
++ 			goto no_mmap;
++ 
++ 		/*
++ 		 * The PCI core shouldn't set up a resource with a
++ 		 * type but zero size. But there may be bugs that
++ 		 * cause us to do that.
++ 		 */
++ 		if (!resource_size(res))
++ 			goto no_mmap;
++ 
++ 		if (resource_size(res) >= PAGE_SIZE) {
++ 			vdev->bar_mmap_supported[bar] = true;
++ 			continue;
++ 		}
++ 
++ 		if (!(res->start & ~PAGE_MASK)) {
++ 			/*
++ 			 * Add a dummy resource to reserve the remainder
++ 			 * of the exclusive page in case that hot-add
++ 			 * device's bar is assigned into it.
++ 			 */
++ 			dummy_res = kzalloc(sizeof(*dummy_res), GFP_KERNEL);
++ 			if (dummy_res == NULL)
++ 				goto no_mmap;
++ 
++ 			dummy_res->resource.name = "vfio sub-page reserved";
++ 			dummy_res->resource.start = res->end + 1;
++ 			dummy_res->resource.end = res->start + PAGE_SIZE - 1;
++ 			dummy_res->resource.flags = res->flags;
++ 			if (request_resource(res->parent,
++ 						&dummy_res->resource)) {
++ 				kfree(dummy_res);
++ 				goto no_mmap;
++ 			}
++ 			dummy_res->index = bar;
++ 			list_add(&dummy_res->res_next,
++ 					&vdev->dummy_resources_list);
++ 			vdev->bar_mmap_supported[bar] = true;
++ 			continue;
++ 		}
++ 		/*
++ 		 * Here we don't handle the case when the BAR is not page
++ 		 * aligned because we can't expect the BAR will be
++ 		 * assigned into the same location in a page in guest
++ 		 * when we passthrough the BAR. And it's hard to access
++ 		 * this BAR in userspace because we have no way to get
++ 		 * the BAR's location in a page.
++ 		 */
++ no_mmap:
++ 		vdev->bar_mmap_supported[bar] = false;
++ 	}
++ }
++ 
+  static void vfio_pci_try_bus_reset(struct vfio_pci_device *vdev);
+ -static void vfio_pci_disable(struct vfio_pci_device *vdev);
+  
+  /*
+   * INTx masking requires the ability to disable INTx signaling via PCI_COMMAND
+@@@ -197,13 -273,29 +265,36 @@@ static int vfio_pci_enable(struct vfio_
+  	if (!vfio_vga_disabled() && vfio_pci_is_vga(pdev))
+  		vdev->has_vga = true;
+  
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (vfio_pci_is_vga(pdev) &&
++ 	    pdev->vendor == PCI_VENDOR_ID_INTEL &&
++ 	    IS_ENABLED(CONFIG_VFIO_PCI_IGD)) {
++ 		ret = vfio_pci_igd_init(vdev);
++ 		if (ret) {
++ 			dev_warn(&vdev->pdev->dev,
++ 				 "Failed to setup Intel IGD regions\n");
++ 			vfio_pci_disable(vdev);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	vfio_pci_probe_mmaps(vdev);
++ 
+++>>>>>>> 05f0c03fbac1 (vfio-pci: Allow to mmap sub-page MMIO BARs if the mmio page is exclusive)
+  	return 0;
+  }
+  
+  static void vfio_pci_disable(struct vfio_pci_device *vdev)
+  {
+  	struct pci_dev *pdev = vdev->pdev;
+++<<<<<<< HEAD
+ +	int bar;
+++=======
++ 	struct vfio_pci_dummy_resource *dummy_res, *tmp;
++ 	int i, bar;
+++>>>>>>> 05f0c03fbac1 (vfio-pci: Allow to mmap sub-page MMIO BARs if the mmio page is exclusive)
+  
+  	/* Stop the device from further DMA */
+  	pci_clear_master(pdev);
+@@@ -503,10 -701,15 +601,14 @@@ static long vfio_pci_ioctl(void *device
+  
+  			info.flags = VFIO_REGION_INFO_FLAG_READ |
+  				     VFIO_REGION_INFO_FLAG_WRITE;
+++<<<<<<< HEAD
+ +			if (IS_ENABLED(CONFIG_VFIO_PCI_MMAP) &&
+ +			    pci_resource_flags(pdev, info.index) &
+ +			    IORESOURCE_MEM && info.size >= PAGE_SIZE)
+++=======
++ 			if (vdev->bar_mmap_supported[info.index]) {
+++>>>>>>> 05f0c03fbac1 (vfio-pci: Allow to mmap sub-page MMIO BARs if the mmio page is exclusive)
+  				info.flags |= VFIO_REGION_INFO_FLAG_MMAP;
+ -				if (info.index == vdev->msix_bar) {
+ -					ret = msix_sparse_mmap_cap(vdev, &caps);
+ -					if (ret)
+ -						return ret;
+ -				}
+ -			}
+ -
+  			break;
+  		case VFIO_PCI_ROM_REGION_INDEX:
+  		{
+diff --cc drivers/vfio/pci/vfio_pci_private.h
+index 250373da6ac2,2128de86c80d..000000000000
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@@ -37,6 -38,31 +37,34 @@@ struct vfio_pci_irq_ctx 
+  	struct irq_bypass_producer	producer;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_pci_device;
++ struct vfio_pci_region;
++ 
++ struct vfio_pci_regops {
++ 	size_t	(*rw)(struct vfio_pci_device *vdev, char __user *buf,
++ 		      size_t count, loff_t *ppos, bool iswrite);
++ 	void	(*release)(struct vfio_pci_device *vdev,
++ 			   struct vfio_pci_region *region);
++ };
++ 
++ struct vfio_pci_region {
++ 	u32				type;
++ 	u32				subtype;
++ 	const struct vfio_pci_regops	*ops;
++ 	void				*data;
++ 	size_t				size;
++ 	u32				flags;
++ };
++ 
++ struct vfio_pci_dummy_resource {
++ 	struct resource		resource;
++ 	int			index;
++ 	struct list_head	res_next;
++ };
++ 
+++>>>>>>> 05f0c03fbac1 (vfio-pci: Allow to mmap sub-page MMIO BARs if the mmio page is exclusive)
+  struct vfio_pci_device {
+  	struct pci_dev		*pdev;
+  	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
+* Unmerged path drivers/vfio/pci/vfio_pci.c
+* Unmerged path drivers/vfio/pci/vfio_pci_private.h
