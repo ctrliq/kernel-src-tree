@@ -1,0 +1,408 @@
+net/mlx5: Add SRIOV VF max rate configuration support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Add SRIOV VF max rate configuration support (Don Dutile) [1386713 1385330 1417286]
+Rebuild_FUZZ: 96.08%
+commit-author Mohamad Haj Yahia <mohamad@mellanox.com>
+commit bd77bf1cb595477528f06f5c52f913f70acd73bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bd77bf1c.failed
+
+Implement the vf set rate ndo by modifying the TSAR vport rate limit.
+
+	Signed-off-by: Mohamad Haj Yahia <mohamad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+(cherry picked from commit bd77bf1cb595477528f06f5c52f913f70acd73bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 98d2ea9b4528,7f763d2f63bb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2446,6 -2930,35 +2446,38 @@@ static int mlx5e_set_vf_vlan(struct net
+  					   vlan, qos);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5e_set_vf_spoofchk(struct net_device *dev, int vf, bool setting)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	return mlx5_eswitch_set_vport_spoofchk(mdev->priv.eswitch, vf + 1, setting);
++ }
++ 
++ static int mlx5e_set_vf_trust(struct net_device *dev, int vf, bool setting)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	return mlx5_eswitch_set_vport_trust(mdev->priv.eswitch, vf + 1, setting);
++ }
++ 
++ static int mlx5e_set_vf_rate(struct net_device *dev, int vf, int min_tx_rate,
++ 			     int max_tx_rate)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	if (min_tx_rate)
++ 		return -EOPNOTSUPP;
++ 
++ 	return mlx5_eswitch_set_vport_rate(mdev->priv.eswitch, vf + 1,
++ 					   max_tx_rate);
++ }
++ 
+++>>>>>>> bd77bf1cb595 (net/mlx5: Add SRIOV VF max rate configuration support)
+  static int mlx5_vport_link2ifla(u8 esw_link)
+  {
+  	switch (esw_link) {
+@@@ -2613,6 -3262,11 +2645,12 @@@ static const struct net_device_ops mlx5
+  #endif
+  	.ndo_set_vf_mac          = mlx5e_set_vf_mac,
+  	.ndo_set_vf_vlan         = mlx5e_set_vf_vlan,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_set_vf_spoofchk     = mlx5e_set_vf_spoofchk,
++ 	.ndo_set_vf_trust        = mlx5e_set_vf_trust,
++ 	.ndo_set_vf_rate         = mlx5e_set_vf_rate,
+++>>>>>>> bd77bf1cb595 (net/mlx5: Add SRIOV VF max rate configuration support)
+  	.ndo_get_vf_config       = mlx5e_get_vf_config,
+  	.ndo_set_vf_link_state   = mlx5e_set_vf_link_state,
+  	.ndo_get_vf_stats        = mlx5e_get_vf_stats,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 084178cfa483,9ef01d1bea06..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1168,6 -1351,183 +1168,186 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Vport QoS management */
++ static int esw_create_tsar(struct mlx5_eswitch *esw)
++ {
++ 	u32 tsar_ctx[MLX5_ST_SZ_DW(scheduling_context)] = {0};
++ 	struct mlx5_core_dev *dev = esw->dev;
++ 	int err;
++ 
++ 	if (!MLX5_CAP_GEN(dev, qos) || !MLX5_CAP_QOS(dev, esw_scheduling))
++ 		return 0;
++ 
++ 	if (esw->qos.enabled)
++ 		return -EEXIST;
++ 
++ 	err = mlx5_create_scheduling_element_cmd(dev,
++ 						 SCHEDULING_HIERARCHY_E_SWITCH,
++ 						 &tsar_ctx,
++ 						 &esw->qos.root_tsar_id);
++ 	if (err) {
++ 		esw_warn(esw->dev, "E-Switch create TSAR failed (%d)\n", err);
++ 		return err;
++ 	}
++ 
++ 	esw->qos.enabled = true;
++ 	return 0;
++ }
++ 
++ static void esw_destroy_tsar(struct mlx5_eswitch *esw)
++ {
++ 	int err;
++ 
++ 	if (!esw->qos.enabled)
++ 		return;
++ 
++ 	err = mlx5_destroy_scheduling_element_cmd(esw->dev,
++ 						  SCHEDULING_HIERARCHY_E_SWITCH,
++ 						  esw->qos.root_tsar_id);
++ 	if (err)
++ 		esw_warn(esw->dev, "E-Switch destroy TSAR failed (%d)\n", err);
++ 
++ 	esw->qos.enabled = false;
++ }
++ 
++ static int esw_vport_enable_qos(struct mlx5_eswitch *esw, int vport_num,
++ 				u32 initial_max_rate)
++ {
++ 	u32 sched_ctx[MLX5_ST_SZ_DW(scheduling_context)] = {0};
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	struct mlx5_core_dev *dev = esw->dev;
++ 	void *vport_elem;
++ 	int err = 0;
++ 
++ 	if (!esw->qos.enabled || !MLX5_CAP_GEN(dev, qos) ||
++ 	    !MLX5_CAP_QOS(dev, esw_scheduling))
++ 		return 0;
++ 
++ 	if (vport->qos.enabled)
++ 		return -EEXIST;
++ 
++ 	MLX5_SET(scheduling_context, &sched_ctx, element_type,
++ 		 SCHEDULING_CONTEXT_ELEMENT_TYPE_VPORT);
++ 	vport_elem = MLX5_ADDR_OF(scheduling_context, &sched_ctx,
++ 				  element_attributes);
++ 	MLX5_SET(vport_element, vport_elem, vport_number, vport_num);
++ 	MLX5_SET(scheduling_context, &sched_ctx, parent_element_id,
++ 		 esw->qos.root_tsar_id);
++ 	MLX5_SET(scheduling_context, &sched_ctx, max_average_bw,
++ 		 initial_max_rate);
++ 
++ 	err = mlx5_create_scheduling_element_cmd(dev,
++ 						 SCHEDULING_HIERARCHY_E_SWITCH,
++ 						 &sched_ctx,
++ 						 &vport->qos.esw_tsar_ix);
++ 	if (err) {
++ 		esw_warn(esw->dev, "E-Switch create TSAR vport element failed (vport=%d,err=%d)\n",
++ 			 vport_num, err);
++ 		return err;
++ 	}
++ 
++ 	vport->qos.enabled = true;
++ 	return 0;
++ }
++ 
++ static void esw_vport_disable_qos(struct mlx5_eswitch *esw, int vport_num)
++ {
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	int err = 0;
++ 
++ 	if (!vport->qos.enabled)
++ 		return;
++ 
++ 	err = mlx5_destroy_scheduling_element_cmd(esw->dev,
++ 						  SCHEDULING_HIERARCHY_E_SWITCH,
++ 						  vport->qos.esw_tsar_ix);
++ 	if (err)
++ 		esw_warn(esw->dev, "E-Switch destroy TSAR vport element failed (vport=%d,err=%d)\n",
++ 			 vport_num, err);
++ 
++ 	vport->qos.enabled = false;
++ }
++ 
++ static int esw_vport_qos_config(struct mlx5_eswitch *esw, int vport_num,
++ 				u32 max_rate)
++ {
++ 	u32 sched_ctx[MLX5_ST_SZ_DW(scheduling_context)] = {0};
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	struct mlx5_core_dev *dev = esw->dev;
++ 	void *vport_elem;
++ 	u32 bitmask = 0;
++ 	int err = 0;
++ 
++ 	if (!MLX5_CAP_GEN(dev, qos) || !MLX5_CAP_QOS(dev, esw_scheduling))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (!vport->qos.enabled)
++ 		return -EIO;
++ 
++ 	MLX5_SET(scheduling_context, &sched_ctx, element_type,
++ 		 SCHEDULING_CONTEXT_ELEMENT_TYPE_VPORT);
++ 	vport_elem = MLX5_ADDR_OF(scheduling_context, &sched_ctx,
++ 				  element_attributes);
++ 	MLX5_SET(vport_element, vport_elem, vport_number, vport_num);
++ 	MLX5_SET(scheduling_context, &sched_ctx, parent_element_id,
++ 		 esw->qos.root_tsar_id);
++ 	MLX5_SET(scheduling_context, &sched_ctx, max_average_bw,
++ 		 max_rate);
++ 	bitmask |= MODIFY_SCHEDULING_ELEMENT_IN_MODIFY_BITMASK_MAX_AVERAGE_BW;
++ 
++ 	err = mlx5_modify_scheduling_element_cmd(dev,
++ 						 SCHEDULING_HIERARCHY_E_SWITCH,
++ 						 &sched_ctx,
++ 						 vport->qos.esw_tsar_ix,
++ 						 bitmask);
++ 	if (err) {
++ 		esw_warn(esw->dev, "E-Switch modify TSAR vport element failed (vport=%d,err=%d)\n",
++ 			 vport_num, err);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void node_guid_gen_from_mac(u64 *node_guid, u8 mac[ETH_ALEN])
++ {
++ 	((u8 *)node_guid)[7] = mac[0];
++ 	((u8 *)node_guid)[6] = mac[1];
++ 	((u8 *)node_guid)[5] = mac[2];
++ 	((u8 *)node_guid)[4] = 0xff;
++ 	((u8 *)node_guid)[3] = 0xfe;
++ 	((u8 *)node_guid)[2] = mac[3];
++ 	((u8 *)node_guid)[1] = mac[4];
++ 	((u8 *)node_guid)[0] = mac[5];
++ }
++ 
++ static void esw_apply_vport_conf(struct mlx5_eswitch *esw,
++ 				 struct mlx5_vport *vport)
++ {
++ 	int vport_num = vport->vport;
++ 
++ 	if (!vport_num)
++ 		return;
++ 
++ 	mlx5_modify_vport_admin_state(esw->dev,
++ 				      MLX5_QUERY_VPORT_STATE_IN_OP_MOD_ESW_VPORT,
++ 				      vport_num,
++ 				      vport->info.link_state);
++ 	mlx5_modify_nic_vport_mac_address(esw->dev, vport_num, vport->info.mac);
++ 	mlx5_modify_nic_vport_node_guid(esw->dev, vport_num, vport->info.node_guid);
++ 	modify_esw_vport_cvlan(esw->dev, vport_num, vport->info.vlan, vport->info.qos,
++ 			       (vport->info.vlan || vport->info.qos));
++ 
++ 	/* Only legacy mode needs ACLs */
++ 	if (esw->mode == SRIOV_LEGACY) {
++ 		esw_vport_ingress_config(esw, vport);
++ 		esw_vport_egress_config(esw, vport);
++ 	}
++ }
++ 
+++>>>>>>> bd77bf1cb595 (net/mlx5: Add SRIOV VF max rate configuration support)
+  static void esw_enable_vport(struct mlx5_eswitch *esw, int vport_num,
+  			     int enable_events)
+  {
+@@@ -1498,14 -1920,17 +1678,26 @@@ int mlx5_eswitch_get_vport_config(struc
+  	memset(ivi, 0, sizeof(*ivi));
+  	ivi->vf = vport - 1;
+  
+++<<<<<<< HEAD
+ +	mlx5_query_nic_vport_mac_address(esw->dev, vport, ivi->mac);
+ +	ivi->linkstate = mlx5_query_vport_admin_state(esw->dev,
+ +						      MLX5_QUERY_VPORT_STATE_IN_OP_MOD_ESW_VPORT,
+ +						      vport);
+ +	query_esw_vport_cvlan(esw->dev, vport, &vlan, &qos);
+ +	ivi->vlan = vlan;
+ +	ivi->qos = qos;
+ +	ivi->spoofchk = 0;
+++=======
++ 	mutex_lock(&esw->state_lock);
++ 	ether_addr_copy(ivi->mac, evport->info.mac);
++ 	ivi->linkstate = evport->info.link_state;
++ 	ivi->vlan = evport->info.vlan;
++ 	ivi->qos = evport->info.qos;
++ 	ivi->spoofchk = evport->info.spoofchk;
++ 	ivi->trusted = evport->info.trusted;
++ 	ivi->max_tx_rate = evport->info.max_rate;
++ 	mutex_unlock(&esw->state_lock);
+++>>>>>>> bd77bf1cb595 (net/mlx5: Add SRIOV VF max rate configuration support)
+  
+  	return 0;
+  }
+@@@ -1546,6 -1967,83 +1738,86 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
++ 				int vport, u16 vlan, u8 qos)
++ {
++ 	u8 set_flags = 0;
++ 
++ 	if (vlan || qos)
++ 		set_flags = SET_VLAN_STRIP | SET_VLAN_INSERT;
++ 
++ 	return __mlx5_eswitch_set_vport_vlan(esw, vport, vlan, qos, set_flags);
++ }
++ 
++ int mlx5_eswitch_set_vport_spoofchk(struct mlx5_eswitch *esw,
++ 				    int vport, bool spoofchk)
++ {
++ 	struct mlx5_vport *evport;
++ 	bool pschk;
++ 	int err = 0;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	evport = &esw->vports[vport];
++ 	pschk = evport->info.spoofchk;
++ 	evport->info.spoofchk = spoofchk;
++ 	if (evport->enabled && esw->mode == SRIOV_LEGACY)
++ 		err = esw_vport_ingress_config(esw, evport);
++ 	if (err)
++ 		evport->info.spoofchk = pschk;
++ 	mutex_unlock(&esw->state_lock);
++ 
++ 	return err;
++ }
++ 
++ int mlx5_eswitch_set_vport_trust(struct mlx5_eswitch *esw,
++ 				 int vport, bool setting)
++ {
++ 	struct mlx5_vport *evport;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	evport = &esw->vports[vport];
++ 	evport->info.trusted = setting;
++ 	if (evport->enabled)
++ 		esw_vport_change_handle_locked(evport);
++ 	mutex_unlock(&esw->state_lock);
++ 
++ 	return 0;
++ }
++ 
++ int mlx5_eswitch_set_vport_rate(struct mlx5_eswitch *esw,
++ 				int vport, u32 max_rate)
++ {
++ 	struct mlx5_vport *evport;
++ 	int err = 0;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	evport = &esw->vports[vport];
++ 	err = esw_vport_qos_config(esw, vport, max_rate);
++ 	if (!err)
++ 		evport->info.max_rate = max_rate;
++ 
++ 	mutex_unlock(&esw->state_lock);
++ 	return err;
++ }
++ 
+++>>>>>>> bd77bf1cb595 (net/mlx5: Add SRIOV VF max rate configuration support)
+  int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+  				 int vport,
+  				 struct ifla_vf_stats *vf_stats)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 7b5e70f8cc22,ddae90c1f15b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -164,6 -242,12 +164,15 @@@ int mlx5_eswitch_set_vport_state(struc
+  				 int vport, int link_state);
+  int mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
+  				int vport, u16 vlan, u8 qos);
+++<<<<<<< HEAD
+++=======
++ int mlx5_eswitch_set_vport_spoofchk(struct mlx5_eswitch *esw,
++ 				    int vport, bool spoofchk);
++ int mlx5_eswitch_set_vport_trust(struct mlx5_eswitch *esw,
++ 				 int vport_num, bool setting);
++ int mlx5_eswitch_set_vport_rate(struct mlx5_eswitch *esw,
++ 				int vport, u32 max_rate);
+++>>>>>>> bd77bf1cb595 (net/mlx5: Add SRIOV VF max rate configuration support)
+  int mlx5_eswitch_get_vport_config(struct mlx5_eswitch *esw,
+  				  int vport, struct ifla_vf_info *ivi);
+  int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
