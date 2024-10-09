@@ -517,7 +517,8 @@ struct bnxt_sw_tx_bd {
 };
 
 struct bnxt_sw_rx_bd {
-	u8			*data;
+	void			*data;
+	u8			*data_ptr;
 	DEFINE_DMA_UNMAP_ADDR(mapping);
 };
 
@@ -577,7 +578,8 @@ struct bnxt_tx_ring_info {
 };
 
 struct bnxt_tpa_info {
-	u8			*data;
+	void			*data;
+	u8			*data_ptr;
 	dma_addr_t		mapping;
 	u16			len;
 	unsigned short		gso_type;
@@ -993,6 +995,11 @@ struct bnxt {
 
 	struct sk_buff *	(*gro_func)(struct bnxt_tpa_info *, int, int,
 					    struct sk_buff *);
+
+	struct sk_buff *	(*rx_skb_func)(struct bnxt *,
+					       struct bnxt_rx_ring_info *,
+					       u16, void *, u8 *, dma_addr_t,
+					       unsigned int);
 
 	u32			rx_buf_size;
 	u32			rx_buf_use_size;	/* useable size */
