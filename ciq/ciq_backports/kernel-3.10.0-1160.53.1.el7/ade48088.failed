@@ -1,0 +1,132 @@
+gfs2: Don't write log headers after file system withdraw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit ade48088937f53fe0467162177726176813b9564
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/ade48088.failed
+
+Before this patch, when a node withdrew a gfs2 file system, it
+wrote a (clean) unmount log header. That's wrong. You don't want
+to write anything to the journal once you're withdrawn because
+that's acknowledging that the transaction is complete and the
+journal is in good shape, neither of which may be a valid
+assumption when the file system is withdrawn. This is especially
+true if the withdraw was caused due to io errors writing to the
+journal in the first place. The best course of action is to leave
+the journal "as is" until it may be safely replayed during
+journal recovery, regardless of whether it's done by this node or
+another.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit ade48088937f53fe0467162177726176813b9564)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,eb3f2e7b8085..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -619,8 -675,94 +619,96 @@@ out_of_blocks
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * gfs2_write_log_header - Write a journal log header buffer at lblock
++  * @sdp: The GFS2 superblock
++  * @jd: journal descriptor of the journal to which we are writing
++  * @seq: sequence number
++  * @tail: tail of the log
++  * @lblock: value for lh_blkno (block number relative to start of journal)
++  * @flags: log header flags GFS2_LOG_HEAD_*
++  * @op_flags: flags to pass to the bio
++  *
++  * Returns: the initialized log buffer descriptor
++  */
++ 
++ void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
++ 			   u64 seq, u32 tail, u32 lblock, u32 flags,
++ 			   int op_flags)
++ {
++ 	struct gfs2_log_header *lh;
++ 	u32 hash, crc;
++ 	struct page *page;
++ 	struct gfs2_statfs_change_host *l_sc = &sdp->sd_statfs_local;
++ 	struct timespec64 tv;
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	u64 dblock;
++ 
++ 	if (gfs2_withdrawn(sdp))
++ 		goto out;
++ 
++ 	page = mempool_alloc(gfs2_page_pool, GFP_NOIO);
++ 	lh = page_address(page);
++ 	clear_page(lh);
++ 
++ 	lh->lh_header.mh_magic = cpu_to_be32(GFS2_MAGIC);
++ 	lh->lh_header.mh_type = cpu_to_be32(GFS2_METATYPE_LH);
++ 	lh->lh_header.__pad0 = cpu_to_be64(0);
++ 	lh->lh_header.mh_format = cpu_to_be32(GFS2_FORMAT_LH);
++ 	lh->lh_header.mh_jid = cpu_to_be32(sdp->sd_jdesc->jd_jid);
++ 	lh->lh_sequence = cpu_to_be64(seq);
++ 	lh->lh_flags = cpu_to_be32(flags);
++ 	lh->lh_tail = cpu_to_be32(tail);
++ 	lh->lh_blkno = cpu_to_be32(lblock);
++ 	hash = ~crc32(~0, lh, LH_V1_SIZE);
++ 	lh->lh_hash = cpu_to_be32(hash);
++ 
++ 	ktime_get_coarse_real_ts64(&tv);
++ 	lh->lh_nsec = cpu_to_be32(tv.tv_nsec);
++ 	lh->lh_sec = cpu_to_be64(tv.tv_sec);
++ 	if (!list_empty(&jd->extent_list))
++ 		dblock = gfs2_log_bmap(jd, lblock);
++ 	else {
++ 		int ret = gfs2_lblk_to_dblk(jd->jd_inode, lblock, &dblock);
++ 		if (gfs2_assert_withdraw(sdp, ret == 0))
++ 			return;
++ 	}
++ 	lh->lh_addr = cpu_to_be64(dblock);
++ 	lh->lh_jinode = cpu_to_be64(GFS2_I(jd->jd_inode)->i_no_addr);
++ 
++ 	/* We may only write local statfs, quota, etc., when writing to our
++ 	   own journal. The values are left 0 when recovering a journal
++ 	   different from our own. */
++ 	if (!(flags & GFS2_LOG_HEAD_RECOVERY)) {
++ 		lh->lh_statfs_addr =
++ 			cpu_to_be64(GFS2_I(sdp->sd_sc_inode)->i_no_addr);
++ 		lh->lh_quota_addr =
++ 			cpu_to_be64(GFS2_I(sdp->sd_qc_inode)->i_no_addr);
++ 
++ 		spin_lock(&sdp->sd_statfs_spin);
++ 		lh->lh_local_total = cpu_to_be64(l_sc->sc_total);
++ 		lh->lh_local_free = cpu_to_be64(l_sc->sc_free);
++ 		lh->lh_local_dinodes = cpu_to_be64(l_sc->sc_dinodes);
++ 		spin_unlock(&sdp->sd_statfs_spin);
++ 	}
++ 
++ 	BUILD_BUG_ON(offsetof(struct gfs2_log_header, lh_crc) != LH_V1_SIZE);
++ 
++ 	crc = crc32c(~0, (void *)lh + LH_V1_SIZE + 4,
++ 		     sb->s_blocksize - LH_V1_SIZE - 4);
++ 	lh->lh_crc = cpu_to_be32(crc);
++ 
++ 	gfs2_log_write(sdp, page, sb->s_blocksize, 0, dblock);
++ 	gfs2_log_submit_bio(&sdp->sd_log_bio, REQ_OP_WRITE | op_flags);
++ out:
++ 	log_flush_wait(sdp);
++ }
++ 
++ /**
+++>>>>>>> ade48088937f (gfs2: Don't write log headers after file system withdraw)
+   * log_write_header - Get and initialize a journal header buffer
+   * @sdp: The GFS2 superblock
+ - * @flags: The log header flags, including log header origin
+   *
+   * Returns: the initialized log buffer descriptor
+   */
+* Unmerged path fs/gfs2/log.c
