@@ -1,0 +1,131 @@
+nvme-pci: add module parameter for io queue depth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] pci: add module parameter for io queue depth (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 94.62%
+commit-author weiping zhang <zhangweiping@didichuxing.com>
+commit b27c1e683d2c8cd666a042b02096d18237911a37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b27c1e68.failed
+
+Adjust io queue depth more easily, and make sure io queue depth >= 2.
+
+	Signed-off-by: weiping zhang <zhangweiping@didichuxing.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit b27c1e683d2c8cd666a042b02096d18237911a37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index bdee6de6e811,48d3ed3d48d1..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -62,8 -51,21 +61,18 @@@ static bool use_cmb_sqes = true
+  module_param(use_cmb_sqes, bool, 0644);
+  MODULE_PARM_DESC(use_cmb_sqes, "use controller's memory buffer for I/O SQes");
+  
+ -static unsigned int max_host_mem_size_mb = 128;
+ -module_param(max_host_mem_size_mb, uint, 0444);
+ -MODULE_PARM_DESC(max_host_mem_size_mb,
+ -	"Maximum Host Memory Buffer (HMB) size per controller (in MiB)");
+ +static struct workqueue_struct *nvme_workq;
+  
++ static int io_queue_depth_set(const char *val, const struct kernel_param *kp);
++ static const struct kernel_param_ops io_queue_depth_ops = {
++ 	.set = io_queue_depth_set,
++ 	.get = param_get_int,
++ };
++ 
++ static int io_queue_depth = 1024;
++ module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0644);
++ MODULE_PARM_DESC(io_queue_depth, "set io queue depth, should >= 2");
++ 
+  struct nvme_dev;
+  struct nvme_queue;
+  
+@@@ -100,8 -99,41 +109,32 @@@ struct nvme_dev 
+  	u32 cmbloc;
+  	struct nvme_ctrl ctrl;
+  	struct completion ioq_wait;
+ -
+ -	/* shadow doorbell buffer support: */
+ -	u32 *dbbuf_dbs;
+ -	dma_addr_t dbbuf_dbs_dma_addr;
+ -	u32 *dbbuf_eis;
+ -	dma_addr_t dbbuf_eis_dma_addr;
+ -
+ -	/* host memory buffer support: */
+ -	u64 host_mem_size;
+ -	u32 nr_host_mem_descs;
+ -	struct nvme_host_mem_buf_desc *host_mem_descs;
+ -	void **host_mem_desc_bufs;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
++ {
++ 	int n = 0, ret;
++ 
++ 	ret = kstrtoint(val, 10, &n);
++ 	if (ret != 0 || n < 2)
++ 		return -EINVAL;
++ 
++ 	return param_set_int(val, kp);
++ }
++ 
++ static inline unsigned int sq_idx(unsigned int qid, u32 stride)
++ {
++ 	return qid * 2 * stride;
++ }
++ 
++ static inline unsigned int cq_idx(unsigned int qid, u32 stride)
++ {
++ 	return (qid * 2 + 1) * stride;
++ }
++ 
+++>>>>>>> b27c1e683d2c (nvme-pci: add module parameter for io queue depth)
+  static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
+  {
+  	return container_of(ctrl, struct nvme_dev, ctrl);
+@@@ -1515,11 -1910,30 +1548,17 @@@ static int nvme_pci_enable(struct nvme_
+  	if (result < 0)
+  		return result;
+  
+ -	dev->ctrl.cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
+ +	cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
+  
+++<<<<<<< HEAD
+ +	dev->q_depth = min_t(int, NVME_CAP_MQES(cap) + 1, NVME_Q_DEPTH);
+ +	dev->db_stride = 1 << NVME_CAP_STRIDE(cap);
+++=======
++ 	dev->q_depth = min_t(int, NVME_CAP_MQES(dev->ctrl.cap) + 1,
++ 				io_queue_depth);
++ 	dev->db_stride = 1 << NVME_CAP_STRIDE(dev->ctrl.cap);
+++>>>>>>> b27c1e683d2c (nvme-pci: add module parameter for io queue depth)
+  	dev->dbs = dev->bar + 4096;
+ -
+ -	/*
+ -	 * Temporary fix for the Apple controller found in the MacBook8,1 and
+ -	 * some MacBook7,1 to avoid controller resets and data loss.
+ -	 */
+ -	if (pdev->vendor == PCI_VENDOR_ID_APPLE && pdev->device == 0x2001) {
+ -		dev->q_depth = 2;
+ -		dev_warn(dev->ctrl.device, "detected Apple NVMe controller, "
+ -			"set queue depth=%u to work around controller resets\n",
+ -			dev->q_depth);
+ -	} else if (pdev->vendor == PCI_VENDOR_ID_SAMSUNG &&
+ -		   (pdev->device == 0xa821 || pdev->device == 0xa822) &&
+ -		   NVME_CAP_MQES(dev->ctrl.cap) == 0) {
+ -		dev->q_depth = 64;
+ -		dev_err(dev->ctrl.device, "detected PM1725 NVMe controller, "
+ -                        "set queue depth=%u\n", dev->q_depth);
+ -	}
+ -
+  	/*
+  	 * CMBs can currently only exist on >=1.2 PCIe devices. We only
+  	 * populate sysfs if a CMB is implemented. Note that we add the
+* Unmerged path drivers/nvme/host/pci.c
