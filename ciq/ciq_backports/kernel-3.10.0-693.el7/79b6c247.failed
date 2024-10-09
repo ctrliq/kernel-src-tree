@@ -1,0 +1,210 @@
+KVM: PPC: Book3S HV: Host-side RM data structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suresh Warrier <warrier@linux.vnet.ibm.com>
+commit 79b6c247e9afe35714c1f83cfcecf40a438ca4a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/79b6c247.failed
+
+This patch defines the data structures to support the setting up
+of host side operations while running in real mode in the guest,
+and also the functions to allocate and free it.
+
+The operations are for now limited to virtual XICS operations.
+Currently, we have only defined one operation in the data
+structure:
+         - Wake up a VCPU sleeping in the host when it
+           receives a virtual interrupt
+
+The operations are assigned at the core level because PowerKVM
+requires that the host run in SMT off mode. For each core,
+we will need to manage its state atomically - where the state
+is defined by:
+1. Is the core running in the host?
+2. Is there a Real Mode (RM) operation pending on the host?
+
+Currently, core state is only managed at the whole-core level
+even when the system is in split-core mode. This just limits
+the number of free or "available" cores in the host to perform
+any host-side operations.
+
+The kvmppc_host_rm_core.rm_data allows any data to be passed by
+KVM in real mode to the host core along with the operation to
+be performed.
+
+The kvmppc_host_rm_ops structure is allocated the very first time
+a guest VM is started. Initial core state is also set - all online
+cores are in the host. This structure is never deleted, not even
+when there are no active guests. However, it needs to be freed
+when the module is unloaded because the kvmppc_host_rm_ops_hv
+can contain function pointers to kvm-hv.ko functions for the
+different supported host operations.
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+(cherry picked from commit 79b6c247e9afe35714c1f83cfcecf40a438ca4a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_ppc.h
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index 19c0b19b88fc,ded8ddac7dcf..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -455,6 -479,44 +459,47 @@@ static inline int kvmppc_xics_hcall(str
+  	{ return 0; }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Host-side operations we want to set up while running in real
++  * mode in the guest operating on the xics.
++  * Currently only VCPU wakeup is supported.
++  */
++ 
++ union kvmppc_rm_state {
++ 	unsigned long raw;
++ 	struct {
++ 		u32 in_host;
++ 		u32 rm_action;
++ 	};
++ };
++ 
++ struct kvmppc_host_rm_core {
++ 	union kvmppc_rm_state rm_state;
++ 	void *rm_data;
++ 	char pad[112];
++ };
++ 
++ struct kvmppc_host_rm_ops {
++ 	struct kvmppc_host_rm_core	*rm_core;
++ 	void		(*vcpu_kick)(struct kvm_vcpu *vcpu);
++ };
++ 
++ extern struct kvmppc_host_rm_ops *kvmppc_host_rm_ops_hv;
++ 
++ static inline unsigned long kvmppc_get_epr(struct kvm_vcpu *vcpu)
++ {
++ #ifdef CONFIG_KVM_BOOKE_HV
++ 	return mfspr(SPRN_GEPR);
++ #elif defined(CONFIG_BOOKE)
++ 	return vcpu->arch.epr;
++ #else
++ 	return 0;
++ #endif
++ }
++ 
+++>>>>>>> 79b6c247e9af (KVM: PPC: Book3S HV: Host-side RM data structures)
+  static inline void kvmppc_set_epr(struct kvm_vcpu *vcpu, u32 epr)
+  {
+  #ifdef CONFIG_KVM_BOOKE_HV
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 9a307d3552bf..61936e4f8975 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2997,6 +2997,73 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+ 	goto out_srcu;
+ }
+ 
++#ifdef CONFIG_KVM_XICS
++/*
++ * Allocate a per-core structure for managing state about which cores are
++ * running in the host versus the guest and for exchanging data between
++ * real mode KVM and CPU running in the host.
++ * This is only done for the first VM.
++ * The allocated structure stays even if all VMs have stopped.
++ * It is only freed when the kvm-hv module is unloaded.
++ * It's OK for this routine to fail, we just don't support host
++ * core operations like redirecting H_IPI wakeups.
++ */
++void kvmppc_alloc_host_rm_ops(void)
++{
++	struct kvmppc_host_rm_ops *ops;
++	unsigned long l_ops;
++	int cpu, core;
++	int size;
++
++	/* Not the first time here ? */
++	if (kvmppc_host_rm_ops_hv != NULL)
++		return;
++
++	ops = kzalloc(sizeof(struct kvmppc_host_rm_ops), GFP_KERNEL);
++	if (!ops)
++		return;
++
++	size = cpu_nr_cores() * sizeof(struct kvmppc_host_rm_core);
++	ops->rm_core = kzalloc(size, GFP_KERNEL);
++
++	if (!ops->rm_core) {
++		kfree(ops);
++		return;
++	}
++
++	for (cpu = 0; cpu < nr_cpu_ids; cpu += threads_per_core) {
++		if (!cpu_online(cpu))
++			continue;
++
++		core = cpu >> threads_shift;
++		ops->rm_core[core].rm_state.in_host = 1;
++	}
++
++	/*
++	 * Make the contents of the kvmppc_host_rm_ops structure visible
++	 * to other CPUs before we assign it to the global variable.
++	 * Do an atomic assignment (no locks used here), but if someone
++	 * beats us to it, just free our copy and return.
++	 */
++	smp_wmb();
++	l_ops = (unsigned long) ops;
++
++	if (cmpxchg64((unsigned long *)&kvmppc_host_rm_ops_hv, 0, l_ops)) {
++		kfree(ops->rm_core);
++		kfree(ops);
++	}
++}
++
++void kvmppc_free_host_rm_ops(void)
++{
++	if (kvmppc_host_rm_ops_hv) {
++		kfree(kvmppc_host_rm_ops_hv->rm_core);
++		kfree(kvmppc_host_rm_ops_hv);
++		kvmppc_host_rm_ops_hv = NULL;
++	}
++}
++#endif
++
+ static int kvmppc_core_init_vm_hv(struct kvm *kvm)
+ {
+ 	unsigned long lpcr, lpid;
+@@ -3009,6 +3076,8 @@ static int kvmppc_core_init_vm_hv(struct kvm *kvm)
+ 		return -ENOMEM;
+ 	kvm->arch.lpid = lpid;
+ 
++	kvmppc_alloc_host_rm_ops();
++
+ 	/*
+ 	 * Since we don't flush the TLB when tearing down a VM,
+ 	 * and this lpid might have previously been used,
+@@ -3243,6 +3312,7 @@ static int kvmppc_book3s_init_hv(void)
+ 
+ static void kvmppc_book3s_exit_hv(void)
+ {
++	kvmppc_free_host_rm_ops();
+ 	kvmppc_hv_ops = NULL;
+ }
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv_builtin.c b/arch/powerpc/kvm/book3s_hv_builtin.c
+index 2b357edf45a7..4799d3bbaf1c 100644
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@ -265,3 +265,6 @@ void kvmhv_commence_exit(int trap)
+ 			kvmhv_interrupt_vcore(vc, ee);
+ 	}
+ }
++
++struct kvmppc_host_rm_ops *kvmppc_host_rm_ops_hv;
++EXPORT_SYMBOL_GPL(kvmppc_host_rm_ops_hv);
