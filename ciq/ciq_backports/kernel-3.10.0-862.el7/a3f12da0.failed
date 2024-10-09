@@ -1,0 +1,244 @@
+iw_cxgb4: allocate wait object for each memory object
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Steve Wise <swise@opengridcomputing.com>
+commit a3f12da0e99a8d17118ee9e18a1f760a0d427b26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a3f12da0.failed
+
+Remove the local stack allocated c4iw_wr_wait object in preparation for
+correctly handling timeouts.
+
+Also refactored some code to simplify it and make errpath unwinding
+more readable.
+
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit a3f12da0e99a8d17118ee9e18a1f760a0d427b26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/mem.c
+diff --cc drivers/infiniband/hw/cxgb4/mem.c
+index 39cac5db937e,b2523b213c86..000000000000
+--- a/drivers/infiniband/hw/cxgb4/mem.c
++++ b/drivers/infiniband/hw/cxgb4/mem.c
+@@@ -51,9 -51,17 +51,10 @@@ static int inline_threshold = C4IW_INLI
+  module_param(inline_threshold, int, 0644);
+  MODULE_PARM_DESC(inline_threshold, "inline vs dsgl threshold (default=128)");
+  
+ -static int mr_exceeds_hw_limits(struct c4iw_dev *dev, u64 length)
+ -{
+ -	return (is_t4(dev->rdev.lldi.adapter_type) ||
+ -		is_t5(dev->rdev.lldi.adapter_type)) &&
+ -		length >= 8*1024*1024*1024ULL;
+ -}
+ -
+  static int _c4iw_write_mem_dma_aligned(struct c4iw_rdev *rdev, u32 addr,
+  				       u32 len, dma_addr_t data,
+- 				       int wait, struct sk_buff *skb)
++ 				       struct sk_buff *skb,
++ 				       struct c4iw_wr_wait *wr_waitp)
+  {
+  	struct ulp_mem_io *req;
+  	struct ulptx_sgl *sgl;
+@@@ -74,12 -81,11 +74,12 @@@
+  	}
+  	set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
+  
+ -	req = __skb_put_zero(skb, wr_len);
+ +	req = (struct ulp_mem_io *)__skb_put(skb, wr_len);
+ +	memset(req, 0, wr_len);
+  	INIT_ULPTX_WR(req, wr_len, 0, 0);
+  	req->wr.wr_hi = cpu_to_be32(FW_WR_OP_V(FW_ULPTX_WR) |
+- 			(wait ? FW_WR_COMPL_F : 0));
+- 	req->wr.wr_lo = wait ? (__force __be64)(unsigned long) &wr_wait : 0L;
++ 			(wr_waitp ? FW_WR_COMPL_F : 0));
++ 	req->wr.wr_lo = wr_waitp ? (__force __be64)(unsigned long)wr_waitp : 0L;
+  	req->wr.wr_mid = cpu_to_be32(FW_WR_LEN16_V(DIV_ROUND_UP(wr_len, 16)));
+  	req->cmd = cpu_to_be32(ULPTX_CMD_V(ULP_TX_MEM_WRITE) |
+  			       T5_ULP_MEMIO_ORDER_V(1) |
+@@@ -118,9 -124,9 +118,9 @@@ static int _c4iw_write_mem_inline(struc
+  		cmd |= cpu_to_be32(T5_ULP_MEMIO_IMM_F);
+  
+  	addr &= 0x7FFFFFF;
+ -	pr_debug("addr 0x%x len %u\n", addr, len);
+ +	PDBG("%s addr 0x%x len %u\n", __func__, addr, len);
+  	num_wqe = DIV_ROUND_UP(len, C4IW_MAX_INLINE_SIZE);
+- 	c4iw_init_wr_wait(&wr_wait);
++ 	c4iw_init_wr_wait(wr_waitp);
+  	for (i = 0; i < num_wqe; i++) {
+  
+  		copy_len = len > C4IW_MAX_INLINE_SIZE ? C4IW_MAX_INLINE_SIZE :
+@@@ -222,25 -229,33 +224,53 @@@ out
+   * If data is NULL, clear len byte of memory to zero.
+   */
+  static int write_adapter_mem(struct c4iw_rdev *rdev, u32 addr, u32 len,
+- 			     void *data, struct sk_buff *skb)
++ 			     void *data, struct sk_buff *skb,
++ 			     struct c4iw_wr_wait *wr_waitp)
+  {
+++<<<<<<< HEAD
+ +	if (is_t5(rdev->lldi.adapter_type) && use_dsgl) {
+ +		if (len > inline_threshold) {
+ +			if (_c4iw_write_mem_dma(rdev, addr, len, data, skb)) {
+ +				printk_ratelimited(KERN_WARNING
+ +						   "%s: dma map"
+ +						   " failure (non fatal)\n",
+ +						   pci_name(rdev->lldi.pdev));
+ +				return _c4iw_write_mem_inline(rdev, addr, len,
+ +							      data, skb);
+ +			} else {
+ +				return 0;
+ +			}
+ +		} else
+ +			return _c4iw_write_mem_inline(rdev, addr,
+ +						      len, data, skb);
+ +	} else
+ +		return _c4iw_write_mem_inline(rdev, addr, len, data, skb);
+++=======
++ 	int ret;
++ 
++ 	if (!rdev->lldi.ulptx_memwrite_dsgl || !use_dsgl) {
++ 		ret = _c4iw_write_mem_inline(rdev, addr, len, data, skb,
++ 					      wr_waitp);
++ 		goto out;
++ 	}
++ 
++ 	if (len <= inline_threshold) {
++ 		ret = _c4iw_write_mem_inline(rdev, addr, len, data, skb,
++ 					      wr_waitp);
++ 		goto out;
++ 	}
++ 
++ 	ret = _c4iw_write_mem_dma(rdev, addr, len, data, skb, wr_waitp);
++ 	if (ret) {
++ 		pr_warn_ratelimited("%s: dma map failure (non fatal)\n",
++ 				    pci_name(rdev->lldi.pdev));
++ 		ret = _c4iw_write_mem_inline(rdev, addr, len, data, skb,
++ 					      wr_waitp);
++ 	}
++ out:
++ 	return ret;
++ 
+++>>>>>>> a3f12da0e99a (iw_cxgb4: allocate wait object for each memory object)
+  }
+  
+  /*
+@@@ -324,11 -339,12 +354,12 @@@ static int write_pbl(struct c4iw_rdev *
+  {
+  	int err;
+  
+ -	pr_debug("*pdb_addr 0x%x, pbl_base 0x%x, pbl_size %d\n",
+ -		 pbl_addr, rdev->lldi.vr->pbl.start,
+ -		 pbl_size);
+ +	PDBG("%s *pdb_addr 0x%x, pbl_base 0x%x, pbl_size %d\n",
+ +	     __func__, pbl_addr, rdev->lldi.vr->pbl.start,
+ +	     pbl_size);
+  
+- 	err = write_adapter_mem(rdev, pbl_addr >> 5, pbl_size << 3, pbl, NULL);
++ 	err = write_adapter_mem(rdev, pbl_addr >> 5, pbl_size << 3, pbl, NULL,
++ 				wr_waitp);
+  	return err;
+  }
+  
+@@@ -499,14 -533,10 +544,10 @@@ struct ib_mr *c4iw_reg_user_mr(struct i
+  	mhp->rhp = rhp;
+  
+  	mhp->umem = ib_umem_get(pd->uobject->context, start, length, acc, 0);
+- 	if (IS_ERR(mhp->umem)) {
+- 		err = PTR_ERR(mhp->umem);
+- 		kfree_skb(mhp->dereg_skb);
+- 		kfree(mhp);
+- 		return ERR_PTR(err);
+- 	}
++ 	if (IS_ERR(mhp->umem))
++ 		goto err_free_skb;
+  
+ -	shift = mhp->umem->page_shift;
+ +	shift = ffs(mhp->umem->page_size) - 1;
+  
+  	n = mhp->umem->nmap;
+  	err = alloc_pbl(mhp, n);
+@@@ -631,10 -675,12 +686,12 @@@ int c4iw_dealloc_mw(struct ib_mw *mw
+  	rhp = mhp->rhp;
+  	mmid = (mw->rkey) >> 8;
+  	remove_handle(rhp, &rhp->mmidr, mmid);
+- 	deallocate_window(&rhp->rdev, mhp->attr.stag, mhp->dereg_skb);
++ 	deallocate_window(&rhp->rdev, mhp->attr.stag, mhp->dereg_skb,
++ 			  mhp->wr_waitp);
+  	kfree_skb(mhp->dereg_skb);
++ 	kfree(mhp->wr_waitp);
+  	kfree(mhp);
+ -	pr_debug("ib_mw %p mmid 0x%x ptr %p\n", mw, mmid, mhp);
+ +	PDBG("%s ib_mw %p mmid 0x%x ptr %p\n", __func__, mw, mmid, mhp);
+  	return 0;
+  }
+  
+@@@ -689,21 -743,23 +754,23 @@@ struct ib_mr *c4iw_alloc_mr(struct ib_p
+  	mhp->ibmr.rkey = mhp->ibmr.lkey = stag;
+  	if (insert_handle(rhp, &rhp->mmidr, mhp, mmid)) {
+  		ret = -ENOMEM;
+- 		goto err3;
++ 		goto err_dereg;
+  	}
+  
+ -	pr_debug("mmid 0x%x mhp %p stag 0x%x\n", mmid, mhp, stag);
+ +	PDBG("%s mmid 0x%x mhp %p stag 0x%x\n", __func__, mmid, mhp, stag);
+  	return &(mhp->ibmr);
+- err3:
++ err_dereg:
+  	dereg_mem(&rhp->rdev, stag, mhp->attr.pbl_size,
+- 		  mhp->attr.pbl_addr, mhp->dereg_skb);
+- err2:
++ 		  mhp->attr.pbl_addr, mhp->dereg_skb, mhp->wr_waitp);
++ err_free_pbl:
+  	c4iw_pblpool_free(&mhp->rhp->rdev, mhp->attr.pbl_addr,
+  			      mhp->attr.pbl_size << 3);
+- err1:
++ err_free_dma:
+  	dma_free_coherent(&mhp->rhp->rdev.lldi.pdev->dev,
+  			  mhp->max_mpl_len, mhp->mpl, mhp->mpl_addr);
+- err_mpl:
++ err_free_wr_wait:
++ 	kfree(mhp->wr_waitp);
++ err_free_mhp:
+  	kfree(mhp);
+  err:
+  	return ERR_PTR(ret);
+@@@ -755,7 -811,8 +822,12 @@@ int c4iw_dereg_mr(struct ib_mr *ib_mr
+  		kfree((void *) (unsigned long) mhp->kva);
+  	if (mhp->umem)
+  		ib_umem_release(mhp->umem);
+++<<<<<<< HEAD
+ +	PDBG("%s mmid 0x%x ptr %p\n", __func__, mmid, mhp);
+++=======
++ 	pr_debug("mmid 0x%x ptr %p\n", mmid, mhp);
++ 	kfree(mhp->wr_waitp);
+++>>>>>>> a3f12da0e99a (iw_cxgb4: allocate wait object for each memory object)
+  	kfree(mhp);
+  	return 0;
+  }
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index eb7973e70423..2ae55fe1675f 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -395,6 +395,7 @@ struct c4iw_mr {
+ 	dma_addr_t mpl_addr;
+ 	u32 max_mpl_len;
+ 	u32 mpl_len;
++	struct c4iw_wr_wait *wr_waitp;
+ };
+ 
+ static inline struct c4iw_mr *to_c4iw_mr(struct ib_mr *ibmr)
+@@ -408,6 +409,7 @@ struct c4iw_mw {
+ 	struct sk_buff *dereg_skb;
+ 	u64 kva;
+ 	struct tpt_attributes attr;
++	struct c4iw_wr_wait *wr_waitp;
+ };
+ 
+ static inline struct c4iw_mw *to_c4iw_mw(struct ib_mw *ibmw)
+* Unmerged path drivers/infiniband/hw/cxgb4/mem.c
