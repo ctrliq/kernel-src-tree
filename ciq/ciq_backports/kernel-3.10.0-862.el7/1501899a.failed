@@ -1,0 +1,149 @@
+mm: fix device-dax pud write-faults triggered by get_user_pages()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [kernel] fix device-dax pud write-faults triggered by get_user_pages() (Larry Woodman) [1457572 1457561]
+Rebuild_FUZZ: 96.83%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 1501899a898dfb5477c55534bdfd734c046da06d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1501899a.failed
+
+Currently only get_user_pages_fast() can safely handle the writable gup
+case due to its use of pud_access_permitted() to check whether the pud
+entry is writable.  In the gup slow path pud_write() is used instead of
+pud_access_permitted() and to date it has been unimplemented, just calls
+BUG_ON().
+
+    kernel BUG at ./include/linux/hugetlb.h:244!
+    [..]
+    RIP: 0010:follow_devmap_pud+0x482/0x490
+    [..]
+    Call Trace:
+     follow_page_mask+0x28c/0x6e0
+     __get_user_pages+0xe4/0x6c0
+     get_user_pages_unlocked+0x130/0x1b0
+     get_user_pages_fast+0x89/0xb0
+     iov_iter_get_pages_alloc+0x114/0x4a0
+     nfs_direct_read_schedule_iovec+0xd2/0x350
+     ? nfs_start_io_direct+0x63/0x70
+     nfs_file_direct_read+0x1e0/0x250
+     nfs_file_read+0x90/0xc0
+
+For now this just implements a simple check for the _PAGE_RW bit similar
+to pmd_write.  However, this implies that the gup-slow-path check is
+missing the extra checks that the gup-fast-path performs with
+pud_access_permitted.  Later patches will align all checks to use the
+'access_permitted' helper if the architecture provides it.
+
+Note that the generic 'access_permitted' helper fallback is the simple
+_PAGE_RW check on architectures that do not define the
+'access_permitted' helper(s).
+
+[dan.j.williams@intel.com: fix powerpc compile error]
+  Link: http://lkml.kernel.org/r/151129126165.37405.16031785266675461397.stgit@dwillia2-desk3.amr.corp.intel.com
+Link: http://lkml.kernel.org/r/151043109938.2842.14834662818213616199.stgit@dwillia2-desk3.amr.corp.intel.com
+Fixes: a00cc7d9dd93 ("mm, x86: add support for PUD-sized transparent hugepages")
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reported-by: Stephen Rothwell <sfr@canb.auug.org.au>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>	[x86]
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1501899a898dfb5477c55534bdfd734c046da06d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/pgtable.h
+#	include/linux/hugetlb.h
+diff --cc include/asm-generic/pgtable.h
+index 987c42c28cfd,1ac457511f4e..000000000000
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@@ -575,6 -814,23 +575,26 @@@ static inline int pmd_write(pmd_t pmd
+  #endif /* __HAVE_ARCH_PMD_WRITE */
+  #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+  
+++<<<<<<< HEAD
+++=======
++ #ifndef pud_write
++ static inline int pud_write(pud_t pud)
++ {
++ 	BUG();
++ 	return 0;
++ }
++ #endif /* pud_write */
++ 
++ #if !defined(CONFIG_TRANSPARENT_HUGEPAGE) || \
++ 	(defined(CONFIG_TRANSPARENT_HUGEPAGE) && \
++ 	 !defined(CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD))
++ static inline int pud_trans_huge(pud_t pud)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> 1501899a898d (mm: fix device-dax pud write-faults triggered by get_user_pages())
+  #ifndef pmd_read_atomic
+  static inline pmd_t pmd_read_atomic(pmd_t *pmdp)
+  {
+diff --cc include/linux/hugetlb.h
+index 6d3004940dd0,82a25880714a..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -204,6 -220,24 +204,27 @@@ static inline void __unmap_hugepage_ran
+  }
+  
+  #endif /* !CONFIG_HUGETLB_PAGE */
+++<<<<<<< HEAD
+++=======
++ /*
++  * hugepages at page global directory. If arch support
++  * hugepages at pgd level, they need to define this.
++  */
++ #ifndef pgd_huge
++ #define pgd_huge(x)	0
++ #endif
++ #ifndef p4d_huge
++ #define p4d_huge(x)	0
++ #endif
++ 
++ #ifndef pgd_write
++ static inline int pgd_write(pgd_t pgd)
++ {
++ 	BUG();
++ 	return 0;
++ }
++ #endif
+++>>>>>>> 1501899a898d (mm: fix device-dax pud write-faults triggered by get_user_pages())
+  
+  #define HUGETLB_ANON_FILE "anon_hugepage"
+  
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 50bdb1a560e0..e604d770474a 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -887,6 +887,12 @@ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
+ 	pmd_update(mm, addr, pmdp);
+ }
+ 
++#define pud_write pud_write
++static inline int pud_write(pud_t pud)
++{
++	return pud_flags(pud) & _PAGE_RW;
++}
++
+ /*
+  * clone_pgd_range(pgd_t *dst, pgd_t *src, int count);
+  *
+* Unmerged path include/asm-generic/pgtable.h
+* Unmerged path include/linux/hugetlb.h
