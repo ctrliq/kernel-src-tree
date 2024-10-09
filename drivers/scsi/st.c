@@ -4268,6 +4268,7 @@ static int st_probe(struct device *dev)
 		return -ENODEV;
 	}
 
+	scsi_autopm_get_device(SDp);
 	i = queue_max_segments(SDp->request_queue);
 	if (st_max_sg_segs < i)
 		i = st_max_sg_segs;
@@ -4415,6 +4416,7 @@ out_put_disk:
 out_buffer_free:
 	kfree(buffer);
 out:
+	scsi_autopm_put_device(SDp);
 	return -ENODEV;
 };
 
