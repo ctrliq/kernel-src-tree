@@ -1,0 +1,1459 @@
+bpf: make jited programs visible in traces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 74451e66d516c55e309e8d89a4a1e7596e46aacd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/74451e66.failed
+
+Long standing issue with JITed programs is that stack traces from
+function tracing check whether a given address is kernel code
+through {__,}kernel_text_address(), which checks for code in core
+kernel, modules and dynamically allocated ftrace trampolines. But
+what is still missing is BPF JITed programs (interpreted programs
+are not an issue as __bpf_prog_run() will be attributed to them),
+thus when a stack trace is triggered, the code walking the stack
+won't see any of the JITed ones. The same for address correlation
+done from user space via reading /proc/kallsyms. This is read by
+tools like perf, but the latter is also useful for permanent live
+tracing with eBPF itself in combination with stack maps when other
+eBPF types are part of the callchain. See offwaketime example on
+dumping stack from a map.
+
+This work tries to tackle that issue by making the addresses and
+symbols known to the kernel. The lookup from *kernel_text_address()
+is implemented through a latched RB tree that can be read under
+RCU in fast-path that is also shared for symbol/size/offset lookup
+for a specific given address in kallsyms. The slow-path iteration
+through all symbols in the seq file done via RCU list, which holds
+a tiny fraction of all exported ksyms, usually below 0.1 percent.
+Function symbols are exported as bpf_prog_<tag>, in order to aide
+debugging and attribution. This facility is currently enabled for
+root-only when bpf_jit_kallsyms is set to 1, and disabled if hardening
+is active in any mode. The rationale behind this is that still a lot
+of systems ship with world read permissions on kallsyms thus addresses
+should not get suddenly exposed for them. If that situation gets
+much better in future, we always have the option to change the
+default on this. Likewise, unprivileged programs are not allowed
+to add entries there either, but that is less of a concern as most
+such programs types relevant in this context are for root-only anyway.
+If enabled, call graphs and stack traces will then show a correct
+attribution; one example is illustrated below, where the trace is
+now visible in tooling such as perf script --kallsyms=/proc/kallsyms
+and friends.
+
+Before:
+
+  7fff8166889d bpf_clone_redirect+0x80007f0020ed (/lib/modules/4.9.0-rc8+/build/vmlinux)
+         f5d80 __sendmsg_nocancel+0xffff006451f1a007 (/usr/lib64/libc-2.18.so)
+
+After:
+
+  7fff816688b7 bpf_clone_redirect+0x80007f002107 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fffa0575728 bpf_prog_33c45a467c9e061a+0x8000600020fb (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fffa07ef1fc cls_bpf_classify+0x8000600020dc (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff81678b68 tc_classify+0x80007f002078 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8164d40b __netif_receive_skb_core+0x80007f0025fb (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8164d718 __netif_receive_skb+0x80007f002018 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8164e565 process_backlog+0x80007f002095 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8164dc71 net_rx_action+0x80007f002231 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff81767461 __softirqentry_text_start+0x80007f0020d1 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff817658ac do_softirq_own_stack+0x80007f00201c (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff810a2c20 do_softirq+0x80007f002050 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff810a2cb5 __local_bh_enable_ip+0x80007f002085 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8168d452 ip_finish_output2+0x80007f002152 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8168ea3d ip_finish_output+0x80007f00217d (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff8168f2af ip_output+0x80007f00203f (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  [...]
+  7fff81005854 do_syscall_64+0x80007f002054 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+  7fff817649eb return_from_SYSCALL_64+0x80007f002000 (/lib/modules/4.9.0-rc8+/build/vmlinux)
+         f5d80 __sendmsg_nocancel+0xffff01c484812007 (/usr/lib64/libc-2.18.so)
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 74451e66d516c55e309e8d89a4a1e7596e46aacd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/net/bpf_jit_comp.c
+#	arch/powerpc/net/bpf_jit_comp64.c
+#	arch/s390/net/bpf_jit_comp.c
+#	arch/x86/net/bpf_jit_comp.c
+#	include/linux/bpf.h
+#	include/linux/filter.h
+#	kernel/bpf/core.c
+#	kernel/bpf/syscall.c
+#	kernel/extable.c
+diff --cc arch/s390/net/bpf_jit_comp.c
+index 15be4f92e665,f1d0e62ec1dd..000000000000
+--- a/arch/s390/net/bpf_jit_comp.c
++++ b/arch/s390/net/bpf_jit_comp.c
+@@@ -698,187 -1066,276 +698,190 @@@ call_fn:	/* lg %r1,<d(function)>(%r13) 
+  		/* j <exit> */
+  		EMIT4_PCREL(0xa7f40000, jit->exit_ip - jit->prg);
+  		break;
+ -	/*
+ -	 * Branch relative (number of skipped instructions) to offset on
+ -	 * condition.
+ -	 *
+ -	 * Condition code to mask mapping:
+ -	 *
+ -	 * CC | Description	   | Mask
+ -	 * ------------------------------
+ -	 * 0  | Operands equal	   |	8
+ -	 * 1  | First operand low  |	4
+ -	 * 2  | First operand high |	2
+ -	 * 3  | Unused		   |	1
+ -	 *
+ -	 * For s390x relative branches: ip = ip + off_bytes
+ -	 * For BPF relative branches:	insn = insn + off_insns + 1
+ -	 *
+ -	 * For example for s390x with offset 0 we jump to the branch
+ -	 * instruction itself (loop) and for BPF with offset 0 we
+ -	 * branch to the instruction behind the branch.
+ -	 */
+ -	case BPF_JMP | BPF_JA: /* if (true) */
+ -		mask = 0xf000; /* j */
+ -		goto branch_oc;
+ -	case BPF_JMP | BPF_JSGT | BPF_K: /* ((s64) dst > (s64) imm) */
+ -		mask = 0x2000; /* jh */
+ -		goto branch_ks;
+ -	case BPF_JMP | BPF_JSGE | BPF_K: /* ((s64) dst >= (s64) imm) */
+ -		mask = 0xa000; /* jhe */
+ -		goto branch_ks;
+ -	case BPF_JMP | BPF_JGT | BPF_K: /* (dst_reg > imm) */
+ -		mask = 0x2000; /* jh */
+ -		goto branch_ku;
+ -	case BPF_JMP | BPF_JGE | BPF_K: /* (dst_reg >= imm) */
+ -		mask = 0xa000; /* jhe */
+ -		goto branch_ku;
+ -	case BPF_JMP | BPF_JNE | BPF_K: /* (dst_reg != imm) */
+ -		mask = 0x7000; /* jne */
+ -		goto branch_ku;
+ -	case BPF_JMP | BPF_JEQ | BPF_K: /* (dst_reg == imm) */
+ -		mask = 0x8000; /* je */
+ -		goto branch_ku;
+ -	case BPF_JMP | BPF_JSET | BPF_K: /* (dst_reg & imm) */
+ -		mask = 0x7000; /* jnz */
+ -		/* lgfi %w1,imm (load sign extend imm) */
+ -		EMIT6_IMM(0xc0010000, REG_W1, imm);
+ -		/* ngr %w1,%dst */
+ -		EMIT4(0xb9800000, REG_W1, dst_reg);
+ -		goto branch_oc;
+ -
+ -	case BPF_JMP | BPF_JSGT | BPF_X: /* ((s64) dst > (s64) src) */
+ -		mask = 0x2000; /* jh */
+ -		goto branch_xs;
+ -	case BPF_JMP | BPF_JSGE | BPF_X: /* ((s64) dst >= (s64) src) */
+ -		mask = 0xa000; /* jhe */
+ -		goto branch_xs;
+ -	case BPF_JMP | BPF_JGT | BPF_X: /* (dst > src) */
+ -		mask = 0x2000; /* jh */
+ -		goto branch_xu;
+ -	case BPF_JMP | BPF_JGE | BPF_X: /* (dst >= src) */
+ -		mask = 0xa000; /* jhe */
+ -		goto branch_xu;
+ -	case BPF_JMP | BPF_JNE | BPF_X: /* (dst != src) */
+ -		mask = 0x7000; /* jne */
+ -		goto branch_xu;
+ -	case BPF_JMP | BPF_JEQ | BPF_X: /* (dst == src) */
+ -		mask = 0x8000; /* je */
+ -		goto branch_xu;
+ -	case BPF_JMP | BPF_JSET | BPF_X: /* (dst & src) */
+ -		mask = 0x7000; /* jnz */
+ -		/* ngrk %w1,%dst,%src */
+ -		EMIT4_RRF(0xb9e40000, REG_W1, dst_reg, src_reg);
+ -		goto branch_oc;
+ -branch_ks:
+ -		/* lgfi %w1,imm (load sign extend imm) */
+ -		EMIT6_IMM(0xc0010000, REG_W1, imm);
+ -		/* cgrj %dst,%w1,mask,off */
+ -		EMIT6_PCREL(0xec000000, 0x0064, dst_reg, REG_W1, i, off, mask);
+ -		break;
+ -branch_ku:
+ -		/* lgfi %w1,imm (load sign extend imm) */
+ -		EMIT6_IMM(0xc0010000, REG_W1, imm);
+ -		/* clgrj %dst,%w1,mask,off */
+ -		EMIT6_PCREL(0xec000000, 0x0065, dst_reg, REG_W1, i, off, mask);
+ -		break;
+ -branch_xs:
+ -		/* cgrj %dst,%src,mask,off */
+ -		EMIT6_PCREL(0xec000000, 0x0064, dst_reg, src_reg, i, off, mask);
+ -		break;
+ -branch_xu:
+ -		/* clgrj %dst,%src,mask,off */
+ -		EMIT6_PCREL(0xec000000, 0x0065, dst_reg, src_reg, i, off, mask);
+ +	case BPF_S_ST: /* mem[K] = A */
+ +		jit->seen |= SEEN_MEM;
+ +		/* st %r5,<K>(%r15) */
+ +		EMIT4_DISP(0x5050f000,
+ +			   (jit->seen & SEEN_DATAREF) ? 160 + K*4 : K*4);
+ +		break;
+ +	case BPF_S_STX: /* mem[K] = X : mov %ebx,off8(%rbp) */
+ +		jit->seen |= SEEN_XREG | SEEN_MEM;
+ +		/* st %r12,<K>(%r15) */
+ +		EMIT4_DISP(0x50c0f000,
+ +			   (jit->seen & SEEN_DATAREF) ? 160 + K*4 : K*4);
+ +		break;
+ +	case BPF_S_ANC_PROTOCOL: /* A = ntohs(skb->protocol); */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, protocol) != 2);
+ +		/* lhi %r5,0 */
+ +		EMIT4(0xa7580000);
+ +		/* icm	%r5,3,<d(protocol)>(%r2) */
+ +		EMIT4_DISP(0xbf532000, offsetof(struct sk_buff, protocol));
+ +		break;
+ +	case BPF_S_ANC_IFINDEX:	/* if (!skb->dev) return 0;
+ +				 * A = skb->dev->ifindex */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct net_device, ifindex) != 4);
+ +		jit->seen |= SEEN_RET0;
+ +		/* lg %r1,<d(dev)>(%r2) */
+ +		EMIT6_DISP(0xe3102000, 0x0004, offsetof(struct sk_buff, dev));
+ +		/* ltgr %r1,%r1 */
+ +		EMIT4(0xb9020011);
+ +		/* jz <ret0> */
+ +		EMIT4_PCREL(0xa7840000, jit->ret0_ip - jit->prg);
+ +		/* l %r5,<d(ifindex)>(%r1) */
+ +		EMIT4_DISP(0x58501000, offsetof(struct net_device, ifindex));
+ +		break;
+ +	case BPF_S_ANC_MARK: /* A = skb->mark */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, mark) != 4);
+ +		/* l %r5,<d(mark)>(%r2) */
+ +		EMIT4_DISP(0x58502000, offsetof(struct sk_buff, mark));
+ +		break;
+ +	case BPF_S_ANC_QUEUE: /* A = skb->queue_mapping */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, queue_mapping) != 2);
+ +		/* lhi %r5,0 */
+ +		EMIT4(0xa7580000);
+ +		/* icm	%r5,3,<d(queue_mapping)>(%r2) */
+ +		EMIT4_DISP(0xbf532000, offsetof(struct sk_buff, queue_mapping));
+ +		break;
+ +	case BPF_S_ANC_HATYPE:	/* if (!skb->dev) return 0;
+ +				 * A = skb->dev->type */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct net_device, type) != 2);
+ +		jit->seen |= SEEN_RET0;
+ +		/* lg %r1,<d(dev)>(%r2) */
+ +		EMIT6_DISP(0xe3102000, 0x0004, offsetof(struct sk_buff, dev));
+ +		/* ltgr %r1,%r1 */
+ +		EMIT4(0xb9020011);
+ +		/* jz <ret0> */
+ +		EMIT4_PCREL(0xa7840000, jit->ret0_ip - jit->prg);
+ +		/* lhi %r5,0 */
+ +		EMIT4(0xa7580000);
+ +		/* icm	%r5,3,<d(type)>(%r1) */
+ +		EMIT4_DISP(0xbf531000, offsetof(struct net_device, type));
+ +		break;
+ +	case BPF_S_ANC_RXHASH: /* A = skb->hash */
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, hash) != 4);
+ +		/* l %r5,<d(hash)>(%r2) */
+ +		EMIT4_DISP(0x58502000, offsetof(struct sk_buff, hash));
+ +		break;
+ +	case BPF_S_ANC_VLAN_TAG:
+ +	case BPF_S_ANC_VLAN_TAG_PRESENT:
+ +		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, vlan_tci) != 2);
+ +		BUILD_BUG_ON(VLAN_TAG_PRESENT != 0x1000);
+ +		/* lhi %r5,0 */
+ +		EMIT4(0xa7580000);
+ +		/* icm	%r5,3,<d(vlan_tci)>(%r2) */
+ +		EMIT4_DISP(0xbf532000, offsetof(struct sk_buff, vlan_tci));
+ +		if (filter->code == BPF_S_ANC_VLAN_TAG) {
+ +			/* nill %r5,0xefff */
+ +			EMIT4_IMM(0xa5570000, ~VLAN_TAG_PRESENT);
+ +		} else {
+ +			/* nill %r5,0x1000 */
+ +			EMIT4_IMM(0xa5570000, VLAN_TAG_PRESENT);
+ +			/* srl %r5,12 */
+ +			EMIT4_DISP(0x88500000, 12);
+ +		}
+  		break;
+ -branch_oc:
+ -		/* brc mask,jmp_off (branch instruction needs 4 bytes) */
+ -		jmp_off = addrs[i + off + 1] - (addrs[i + 1] - 4);
+ -		EMIT4_PCREL(0xa7040000 | mask << 8, jmp_off);
+ -		break;
+ -	/*
+ -	 * BPF_LD
+ -	 */
+ -	case BPF_LD | BPF_ABS | BPF_B: /* b0 = *(u8 *) (skb->data+imm) */
+ -	case BPF_LD | BPF_IND | BPF_B: /* b0 = *(u8 *) (skb->data+imm+src) */
+ -		if ((BPF_MODE(insn->code) == BPF_ABS) && (imm >= 0))
+ -			func_addr = __pa(sk_load_byte_pos);
+ -		else
+ -			func_addr = __pa(sk_load_byte);
+ -		goto call_fn;
+ -	case BPF_LD | BPF_ABS | BPF_H: /* b0 = *(u16 *) (skb->data+imm) */
+ -	case BPF_LD | BPF_IND | BPF_H: /* b0 = *(u16 *) (skb->data+imm+src) */
+ -		if ((BPF_MODE(insn->code) == BPF_ABS) && (imm >= 0))
+ -			func_addr = __pa(sk_load_half_pos);
+ -		else
+ -			func_addr = __pa(sk_load_half);
+ -		goto call_fn;
+ -	case BPF_LD | BPF_ABS | BPF_W: /* b0 = *(u32 *) (skb->data+imm) */
+ -	case BPF_LD | BPF_IND | BPF_W: /* b0 = *(u32 *) (skb->data+imm+src) */
+ -		if ((BPF_MODE(insn->code) == BPF_ABS) && (imm >= 0))
+ -			func_addr = __pa(sk_load_word_pos);
+ -		else
+ -			func_addr = __pa(sk_load_word);
+ -		goto call_fn;
+ -call_fn:
+ -		jit->seen |= SEEN_SKB | SEEN_RET0 | SEEN_FUNC;
+ -		REG_SET_SEEN(REG_14); /* Return address of possible func call */
+ -
+ -		/*
+ -		 * Implicit input:
+ -		 *  BPF_REG_6	 (R7) : skb pointer
+ -		 *  REG_SKB_DATA (R12): skb data pointer (if no BPF_REG_AX)
+ -		 *
+ -		 * Calculated input:
+ -		 *  BPF_REG_2	 (R3) : offset of byte(s) to fetch in skb
+ -		 *  BPF_REG_5	 (R6) : return address
+ -		 *
+ -		 * Output:
+ -		 *  BPF_REG_0	 (R14): data read from skb
+ -		 *
+ -		 * Scratch registers (BPF_REG_1-5)
+ -		 */
+ -
+ -		/* Call function: llilf %w1,func_addr  */
+ -		EMIT6_IMM(0xc00f0000, REG_W1, func_addr);
+ -
+ -		/* Offset: lgfi %b2,imm */
+ -		EMIT6_IMM(0xc0010000, BPF_REG_2, imm);
+ -		if (BPF_MODE(insn->code) == BPF_IND)
+ -			/* agfr %b2,%src (%src is s32 here) */
+ -			EMIT4(0xb9180000, BPF_REG_2, src_reg);
+ -
+ -		/* Reload REG_SKB_DATA if BPF_REG_AX is used */
+ -		if (jit->seen & SEEN_REG_AX)
+ -			/* lg %skb_data,data_off(%b6) */
+ -			EMIT6_DISP_LH(0xe3000000, 0x0004, REG_SKB_DATA, REG_0,
+ -				      BPF_REG_6, offsetof(struct sk_buff, data));
+ -		/* basr %b5,%w1 (%b5 is call saved) */
+ -		EMIT2(0x0d00, BPF_REG_5, REG_W1);
+ -
+ -		/*
+ -		 * Note: For fast access we jump directly after the
+ -		 * jnz instruction from bpf_jit.S
+ -		 */
+ -		/* jnz <ret0> */
+ -		EMIT4_PCREL(0xa7740000, jit->ret0_ip - jit->prg);
+ +	case BPF_S_ANC_CPU: /* A = smp_processor_id() */
+ +#ifdef CONFIG_SMP
+ +		/* l %r5,<d(cpu_nr)> */
+ +		EMIT4_DISP(0x58500000, offsetof(struct _lowcore, cpu_nr));
+ +#else
+ +		/* lhi %r5,0 */
+ +		EMIT4(0xa7580000);
+ +#endif
+  		break;
+  	default: /* too complex, give up */
+ -		pr_err("Unknown opcode %02x\n", insn->code);
+ -		return -1;
+ -	}
+ -	return insn_count;
+ -}
+ -
+ -/*
+ - * Compile eBPF program into s390x code
+ - */
+ -static int bpf_jit_prog(struct bpf_jit *jit, struct bpf_prog *fp)
+ -{
+ -	int i, insn_count;
+ -
+ -	jit->lit = jit->lit_start;
+ -	jit->prg = 0;
+ -
+ -	bpf_jit_prologue(jit);
+ -	for (i = 0; i < fp->len; i += insn_count) {
+ -		insn_count = bpf_jit_insn(jit, fp, i);
+ -		if (insn_count < 0)
+ -			return -1;
+ -		jit->addrs[i + 1] = jit->prg; /* Next instruction address */
+ +		goto out;
+  	}
+ -	bpf_jit_epilogue(jit);
+ -
+ -	jit->lit_start = jit->prg;
+ -	jit->size = jit->lit;
+ -	jit->size_prg = jit->prg;
+ +	addrs[i] = jit->prg - jit->start;
+  	return 0;
+ +out:
+ +	return -1;
+  }
+  
+ -/*
+ - * Compile eBPF program "fp"
+ - */
+ -struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
+ +void bpf_jit_compile(struct sk_filter *fp)
+  {
+ -	struct bpf_prog *tmp, *orig_fp = fp;
+ -	struct bpf_binary_header *header;
+ -	bool tmp_blinded = false;
+ -	struct bpf_jit jit;
+ -	int pass;
+ +	unsigned long size, prg_len, lit_len;
+ +	struct bpf_jit jit, cjit;
+ +	unsigned int *addrs;
+ +	int pass, i;
+  
+  	if (!bpf_jit_enable)
+ -		return orig_fp;
+ -
+ -	tmp = bpf_jit_blind_constants(fp);
+ -	/*
+ -	 * If blinding was requested and we failed during blinding,
+ -	 * we must fall back to the interpreter.
+ -	 */
+ -	if (IS_ERR(tmp))
+ -		return orig_fp;
+ -	if (tmp != fp) {
+ -		tmp_blinded = true;
+ -		fp = tmp;
+ -	}
+ -
+ -	memset(&jit, 0, sizeof(jit));
+ -	jit.addrs = kcalloc(fp->len + 1, sizeof(*jit.addrs), GFP_KERNEL);
+ -	if (jit.addrs == NULL) {
+ -		fp = orig_fp;
+ -		goto out;
+ -	}
+ -	/*
+ -	 * Three initial passes:
+ -	 *   - 1/2: Determine clobbered registers
+ -	 *   - 3:   Calculate program size and addrs arrray
+ -	 */
+ -	for (pass = 1; pass <= 3; pass++) {
+ -		if (bpf_jit_prog(&jit, fp)) {
+ -			fp = orig_fp;
+ -			goto free_addrs;
+ +		return;
+ +	addrs = kcalloc(fp->len, sizeof(*addrs), GFP_KERNEL);
+ +	if (addrs == NULL)
+ +		return;
+ +	memset(&jit, 0, sizeof(cjit));
+ +	memset(&cjit, 0, sizeof(cjit));
+ +
+ +	for (pass = 0; pass < 10; pass++) {
+ +		jit.prg = jit.start;
+ +		jit.lit = jit.mid;
+ +
+ +		bpf_jit_prologue(&jit);
+ +		bpf_jit_noleaks(&jit, fp->insns);
+ +		for (i = 0; i < fp->len; i++) {
+ +			if (bpf_jit_insn(&jit, fp->insns + i, addrs, i,
+ +					 i == fp->len - 1))
+ +				goto out;
+  		}
+ -	}
+ -	/*
+ -	 * Final pass: Allocate and generate program
+ -	 */
+ -	if (jit.size >= BPF_SIZE_MAX) {
+ -		fp = orig_fp;
+ -		goto free_addrs;
+ -	}
+ -	header = bpf_jit_binary_alloc(jit.size, &jit.prg_buf, 2, jit_fill_hole);
+ -	if (!header) {
+ -		fp = orig_fp;
+ -		goto free_addrs;
+ -	}
+ -	if (bpf_jit_prog(&jit, fp)) {
+ -		fp = orig_fp;
+ -		goto free_addrs;
+ +		bpf_jit_epilogue(&jit);
+ +		if (jit.start) {
+ +			WARN_ON(jit.prg > cjit.prg || jit.lit > cjit.lit);
+ +			if (memcmp(&jit, &cjit, sizeof(jit)) == 0)
+ +				break;
+ +		} else if (jit.prg == cjit.prg && jit.lit == cjit.lit) {
+ +			prg_len = jit.prg - jit.start;
+ +			lit_len = jit.lit - jit.mid;
+ +			size = max_t(unsigned long, prg_len + lit_len,
+ +				     sizeof(struct work_struct));
+ +			if (size >= BPF_SIZE_MAX)
+ +				goto out;
+ +			jit.start = module_alloc(size);
+ +			if (!jit.start)
+ +				goto out;
+ +			jit.prg = jit.mid = jit.start + prg_len;
+ +			jit.lit = jit.end = jit.start + prg_len + lit_len;
+ +			jit.base_ip += (unsigned long) jit.start;
+ +			jit.exit_ip += (unsigned long) jit.start;
+ +			jit.ret0_ip += (unsigned long) jit.start;
+ +		}
+ +		cjit = jit;
+  	}
+  	if (bpf_jit_enable > 1) {
+ -		bpf_jit_dump(fp->len, jit.size, pass, jit.prg_buf);
+ -		if (jit.prg_buf)
+ -			print_fn_code(jit.prg_buf, jit.size_prg);
+ -	}
+ -	if (jit.prg_buf) {
+ -		set_memory_ro((unsigned long)header, header->pages);
+ -		fp->bpf_func = (void *) jit.prg_buf;
+ -		fp->jited = 1;
+ +		pr_err("flen=%d proglen=%lu pass=%d image=%p\n",
+ +		       fp->len, jit.end - jit.start, pass, jit.start);
+ +		if (jit.start) {
+ +			printk(KERN_ERR "JIT code:\n");
+ +			print_fn_code(jit.start, jit.mid - jit.start);
+ +			print_hex_dump(KERN_ERR, "JIT literals:\n",
+ +				       DUMP_PREFIX_ADDRESS, 16, 1,
+ +				       jit.mid, jit.end - jit.mid, false);
+ +		}
+  	}
+ -free_addrs:
+ -	kfree(jit.addrs);
+ +	if (jit.start)
+ +		fp->bpf_func = (void *) jit.start;
+  out:
+ -	if (tmp_blinded)
+ -		bpf_jit_prog_release_other(fp, fp == orig_fp ?
+ -					   tmp : orig_fp);
+ -	return fp;
+ +	kfree(addrs);
+ +}
+++<<<<<<< HEAD
+ +
+ +static void jit_free_defer(struct work_struct *arg)
+ +{
+ +	module_free(NULL, arg);
+ +}
+ +
+ +/* run from softirq, we must use a work_struct to call
+ + * module_free() from process context
+ + */
+ +void bpf_jit_free(struct sk_filter *fp)
+ +{
+ +	struct work_struct *work;
+ +
+ +	if (fp->bpf_func == sk_run_filter)
+ +		return;
+ +	work = (struct work_struct *)fp->bpf_func;
+ +	INIT_WORK(work, jit_free_defer);
+ +	schedule_work(work);
+  }
+++=======
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+diff --cc arch/x86/net/bpf_jit_comp.c
+index 9f43ac6fc966,18a62e208826..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -737,31 -1161,22 +737,34 @@@ cond_branch:			f_offset = addrs[i + fil
+  	}
+  
+  	if (bpf_jit_enable > 1)
+ -		bpf_jit_dump(prog->len, proglen, pass + 1, image);
+ +		bpf_jit_dump(flen, proglen, pass, image);
+  
+  	if (image) {
+ -		bpf_flush_icache(header, image + proglen);
+ -		set_memory_ro((unsigned long)header, header->pages);
+ -		prog->bpf_func = (void *)image;
+ -		prog->jited = 1;
+ -	} else {
+ -		prog = orig_prog;
+ +		bpf_flush_icache(image, image + proglen);
+ +		fp->bpf_func = (void *)image;
+  	}
+ -
+ -out_addrs:
+ -	kfree(addrs);
+  out:
+ -	if (tmp_blinded)
+ -		bpf_jit_prog_release_other(prog, prog == orig_prog ?
+ -					   tmp : orig_prog);
+ -	return prog;
+ +	kfree(addrs);
+ +	return;
+ +}
+++<<<<<<< HEAD
+ +
+ +static void jit_free_defer(struct work_struct *arg)
+ +{
+ +	module_free(NULL, arg);
+ +}
+ +
+ +/* run from softirq, we must use a work_struct to call
+ + * module_free() from process context
+ + */
+ +void bpf_jit_free(struct sk_filter *fp)
+ +{
+ +	if (fp->bpf_func != sk_run_filter) {
+ +		struct work_struct *work = (struct work_struct *)fp->bpf_func;
+ +
+ +		INIT_WORK(work, jit_free_defer);
+ +		schedule_work(work);
+ +	}
+  }
+++=======
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+diff --cc include/linux/bpf.h
+index a13be0886557,909fc033173a..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -8,11 -8,12 +8,13 @@@
+  #define _LINUX_BPF_H 1
+  
+  #include <uapi/linux/bpf.h>
++ 
+  #include <linux/workqueue.h>
+  #include <linux/file.h>
+ +#include <linux/err.h>
+  #include <linux/percpu.h>
+  #include <linux/err.h>
++ #include <linux/rbtree_latch.h>
+  
+  struct perf_event;
+  struct bpf_map;
+@@@ -199,13 -178,10 +201,19 @@@ struct bpf_verifier_ops 
+  struct bpf_prog_aux {
+  	atomic_t refcnt;
+  	u32 used_map_cnt;
+ +	u32 id;
+ +	u32 func_cnt;
+ +	struct bpf_prog **func;
+ +	void *jit_data; /* JIT specific data. arch dependent */
+  	u32 max_ctx_offset;
+++<<<<<<< HEAD
+ +	u32 stack_depth;
+ +	const struct bpf_prog_ops *ops;
+++=======
++ 	struct latch_tree_node ksym_tnode;
++ 	struct list_head ksym_lnode;
++ 	const struct bpf_verifier_ops *ops;
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  	struct bpf_map **used_maps;
+  	struct bpf_prog *prog;
+  	struct user_struct *user;
+diff --cc include/linux/filter.h
+index e2bb1b37f012,0c1cc9143cb2..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -63,11 -54,11 +63,19 @@@ struct xdp_buff
+  #define BPF_REG_AX		MAX_BPF_REG
+  #define MAX_BPF_JIT_REG		(MAX_BPF_REG + 1)
+  
+++<<<<<<< HEAD
+ +/* unused opcode to mark special call to bpf_tail_call() helper */
+ +#define BPF_TAIL_CALL	0xf0
+ +
+ +/* unused opcode to mark call to interpreter with arguments */
+ +#define BPF_CALL_ARGS	0xe0
+++=======
++ /* As per nm, we expose JITed images as text (code) section for
++  * kallsyms. That way, tools like perf can find it to match
++  * addresses.
++  */
++ #define BPF_SYM_ELF_TYPE	't'
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  
+  /* BPF program can access up to 512 bytes of stack space. */
+  #define MAX_BPF_STACK	512
+@@@ -519,19 -574,19 +532,33 @@@ static inline void bpf_prog_lock_ro(str
+  static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+  {
+  }
++ 
++ static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
++ {
++ }
+  #endif /* CONFIG_DEBUG_SET_MODULE_RONX */
+  
+++<<<<<<< HEAD
+ +/* compute the linear packet data range [data, data_end) which
+ + * will be accessed by cls_bpf and act_bpf programs
+ + */
+ +static inline unsigned int sk_filter_len(const struct sk_filter *fp)
+ +{
+ +	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
+ +}
+ +
+ +static inline void bpf_compute_data_end(struct sk_buff *skb)
+ +{
+ +	return;
+++=======
++ static inline struct bpf_binary_header *
++ bpf_jit_binary_hdr(const struct bpf_prog *fp)
++ {
++ 	unsigned long real_start = (unsigned long)fp->bpf_func;
++ 	unsigned long addr = real_start & PAGE_MASK;
++ 
++ 	return (void *)addr;
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  }
+  
+  int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
+@@@ -599,6 -636,12 +626,15 @@@ static inline bool bpf_dump_raw_ok(void
+  
+  struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+  				       const struct bpf_insn *patch, u32 len);
+++<<<<<<< HEAD
+++=======
++ void bpf_warn_invalid_xdp_action(u32 act);
++ 
++ #ifdef CONFIG_BPF_JIT
++ extern int bpf_jit_enable;
++ extern int bpf_jit_harden;
++ extern int bpf_jit_kallsyms;
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  
+  typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+  
+@@@ -645,12 -676,12 +681,21 @@@ static inline bool bpf_jit_is_ebpf(void
+  # endif
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool ebpf_jit_enabled(void)
+ +{
+ +	return bpf_jit_enable && bpf_jit_is_ebpf();
+ +}
+ +
+ +static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog)
+++=======
++ static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
++ {
++ 	return fp->jited && bpf_jit_is_ebpf();
++ }
++ 
++ static inline bool bpf_jit_blinding_enabled(void)
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  {
+  	/* These are the prerequisites, should someone ever have the
+  	 * idea to call blinding outside of them, we make sure to
+@@@ -667,23 -698,150 +712,132 @@@
+  
+  	return true;
+  }
+++<<<<<<< HEAD
+ +#else
+ +static inline bool ebpf_jit_enabled(void)
+ +{
+ +	return false;
+++=======
++ 
++ static inline bool bpf_jit_kallsyms_enabled(void)
++ {
++ 	/* There are a couple of corner cases where kallsyms should
++ 	 * not be enabled f.e. on hardening.
++ 	 */
++ 	if (bpf_jit_harden)
++ 		return false;
++ 	if (!bpf_jit_kallsyms)
++ 		return false;
++ 	if (bpf_jit_kallsyms == 1)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ const char *__bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 				 unsigned long *off, char *sym);
++ bool is_bpf_text_address(unsigned long addr);
++ int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
++ 		    char *sym);
++ 
++ static inline const char *
++ bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 		   unsigned long *off, char **modname, char *sym)
++ {
++ 	const char *ret = __bpf_address_lookup(addr, size, off, sym);
++ 
++ 	if (ret && modname)
++ 		*modname = NULL;
++ 	return ret;
++ }
++ 
++ void bpf_prog_kallsyms_add(struct bpf_prog *fp);
++ void bpf_prog_kallsyms_del(struct bpf_prog *fp);
++ 
++ #else /* CONFIG_BPF_JIT */
++ 
++ static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
++ {
++ 	return false;
++ }
++ 
++ static inline void bpf_jit_free(struct bpf_prog *fp)
++ {
++ 	bpf_prog_unlock_free(fp);
++ }
++ 
++ static inline bool bpf_jit_kallsyms_enabled(void)
++ {
++ 	return false;
++ }
++ 
++ static inline const char *
++ __bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 		     unsigned long *off, char *sym)
++ {
++ 	return NULL;
++ }
++ 
++ static inline bool is_bpf_text_address(unsigned long addr)
++ {
++ 	return false;
++ }
++ 
++ static inline int bpf_get_kallsym(unsigned int symnum, unsigned long *value,
++ 				  char *type, char *sym)
++ {
++ 	return -ERANGE;
++ }
++ 
++ static inline const char *
++ bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 		   unsigned long *off, char **modname, char *sym)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void bpf_prog_kallsyms_add(struct bpf_prog *fp)
++ {
++ }
++ 
++ static inline void bpf_prog_kallsyms_del(struct bpf_prog *fp)
++ {
++ }
++ #endif /* CONFIG_BPF_JIT */
++ 
++ #define BPF_ANC		BIT(15)
++ 
++ static inline bool bpf_needs_clear_a(const struct sock_filter *first)
++ {
++ 	switch (first->code) {
++ 	case BPF_RET | BPF_K:
++ 	case BPF_LD | BPF_W | BPF_LEN:
++ 		return false;
++ 
++ 	case BPF_LD | BPF_W | BPF_ABS:
++ 	case BPF_LD | BPF_H | BPF_ABS:
++ 	case BPF_LD | BPF_B | BPF_ABS:
++ 		if (first->k == SKF_AD_OFF + SKF_AD_ALU_XOR_X)
++ 			return true;
++ 		return false;
++ 
++ 	default:
++ 		return true;
++ 	}
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  }
+  
+ -static inline u16 bpf_anc_helper(const struct sock_filter *ftest)
+ +static inline void bpf_jit_compile(struct sk_filter *fp)
+  {
+ -	BUG_ON(ftest->code & BPF_ANC);
+ -
+ -	switch (ftest->code) {
+ -	case BPF_LD | BPF_W | BPF_ABS:
+ -	case BPF_LD | BPF_H | BPF_ABS:
+ -	case BPF_LD | BPF_B | BPF_ABS:
+ -#define BPF_ANCILLARY(CODE)	case SKF_AD_OFF + SKF_AD_##CODE:	\
+ -				return BPF_ANC | SKF_AD_##CODE
+ -		switch (ftest->k) {
+ -		BPF_ANCILLARY(PROTOCOL);
+ -		BPF_ANCILLARY(PKTTYPE);
+ -		BPF_ANCILLARY(IFINDEX);
+ -		BPF_ANCILLARY(NLATTR);
+ -		BPF_ANCILLARY(NLATTR_NEST);
+ -		BPF_ANCILLARY(MARK);
+ -		BPF_ANCILLARY(QUEUE);
+ -		BPF_ANCILLARY(HATYPE);
+ -		BPF_ANCILLARY(RXHASH);
+ -		BPF_ANCILLARY(CPU);
+ -		BPF_ANCILLARY(ALU_XOR_X);
+ -		BPF_ANCILLARY(VLAN_TAG);
+ -		BPF_ANCILLARY(VLAN_TAG_PRESENT);
+ -		BPF_ANCILLARY(PAY_OFFSET);
+ -		BPF_ANCILLARY(RANDOM);
+ -		BPF_ANCILLARY(VLAN_TPID);
+ -		}
+ -		/* Fallthrough. */
+ -	default:
+ -		return ftest->code;
+ -	}
+  }
+ +static inline void bpf_jit_free(struct sk_filter *fp)
+ +{
+ +}
+ +#define SK_RUN_FILTER(FILTER, SKB) sk_run_filter(SKB, FILTER->insns)
+ +#endif
+  
+ -void *bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb,
+ -					   int k, unsigned int size);
+ +void *trace_bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb,
+ +						 int k, unsigned int size);
+  
+  static inline void *bpf_load_pointer(const struct sk_buff *skb, int k,
+  				     unsigned int size, void *buffer)
+diff --cc kernel/bpf/core.c
+index 49a705a7610f,f45827e205d3..000000000000
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@@ -94,8 -97,9 +97,10 @@@ struct bpf_prog *bpf_prog_alloc(unsigne
+  	fp->pages = size / PAGE_SIZE;
+  	fp->aux = aux;
+  	fp->aux->prog = fp;
+ +	fp->jit_requested = ebpf_jit_enabled();
+  
++ 	INIT_LIST_HEAD_RCU(&fp->aux->ksym_lnode);
++ 
+  	return fp;
+  }
+  EXPORT_SYMBOL_GPL(bpf_prog_alloc);
+@@@ -351,10 -295,205 +356,212 @@@ struct bpf_prog *bpf_patch_insn_single(
+  }
+  
+  #ifdef CONFIG_BPF_JIT
+++<<<<<<< HEAD
+ +/* All BPF JIT sysctl knobs here. */
+ +int bpf_jit_enable   __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON);
+ +/* RHEL-only: set it to 1 by default */
+ +int bpf_jit_harden __read_mostly = 1;
+++=======
++ static __always_inline void
++ bpf_get_prog_addr_region(const struct bpf_prog *prog,
++ 			 unsigned long *symbol_start,
++ 			 unsigned long *symbol_end)
++ {
++ 	const struct bpf_binary_header *hdr = bpf_jit_binary_hdr(prog);
++ 	unsigned long addr = (unsigned long)hdr;
++ 
++ 	WARN_ON_ONCE(!bpf_prog_ebpf_jited(prog));
++ 
++ 	*symbol_start = addr;
++ 	*symbol_end   = addr + hdr->pages * PAGE_SIZE;
++ }
++ 
++ static void bpf_get_prog_name(const struct bpf_prog *prog, char *sym)
++ {
++ 	BUILD_BUG_ON(sizeof("bpf_prog_") +
++ 		     sizeof(prog->tag) * 2 + 1 > KSYM_NAME_LEN);
++ 
++ 	sym += snprintf(sym, KSYM_NAME_LEN, "bpf_prog_");
++ 	sym  = bin2hex(sym, prog->tag, sizeof(prog->tag));
++ 	*sym = 0;
++ }
++ 
++ static __always_inline unsigned long
++ bpf_get_prog_addr_start(struct latch_tree_node *n)
++ {
++ 	unsigned long symbol_start, symbol_end;
++ 	const struct bpf_prog_aux *aux;
++ 
++ 	aux = container_of(n, struct bpf_prog_aux, ksym_tnode);
++ 	bpf_get_prog_addr_region(aux->prog, &symbol_start, &symbol_end);
++ 
++ 	return symbol_start;
++ }
++ 
++ static __always_inline bool bpf_tree_less(struct latch_tree_node *a,
++ 					  struct latch_tree_node *b)
++ {
++ 	return bpf_get_prog_addr_start(a) < bpf_get_prog_addr_start(b);
++ }
++ 
++ static __always_inline int bpf_tree_comp(void *key, struct latch_tree_node *n)
++ {
++ 	unsigned long val = (unsigned long)key;
++ 	unsigned long symbol_start, symbol_end;
++ 	const struct bpf_prog_aux *aux;
++ 
++ 	aux = container_of(n, struct bpf_prog_aux, ksym_tnode);
++ 	bpf_get_prog_addr_region(aux->prog, &symbol_start, &symbol_end);
++ 
++ 	if (val < symbol_start)
++ 		return -1;
++ 	if (val >= symbol_end)
++ 		return  1;
++ 
++ 	return 0;
++ }
++ 
++ static const struct latch_tree_ops bpf_tree_ops = {
++ 	.less	= bpf_tree_less,
++ 	.comp	= bpf_tree_comp,
++ };
++ 
++ static DEFINE_SPINLOCK(bpf_lock);
++ static LIST_HEAD(bpf_kallsyms);
++ static struct latch_tree_root bpf_tree __cacheline_aligned;
++ 
++ int bpf_jit_kallsyms __read_mostly;
++ 
++ static void bpf_prog_ksym_node_add(struct bpf_prog_aux *aux)
++ {
++ 	WARN_ON_ONCE(!list_empty(&aux->ksym_lnode));
++ 	list_add_tail_rcu(&aux->ksym_lnode, &bpf_kallsyms);
++ 	latch_tree_insert(&aux->ksym_tnode, &bpf_tree, &bpf_tree_ops);
++ }
++ 
++ static void bpf_prog_ksym_node_del(struct bpf_prog_aux *aux)
++ {
++ 	if (list_empty(&aux->ksym_lnode))
++ 		return;
++ 
++ 	latch_tree_erase(&aux->ksym_tnode, &bpf_tree, &bpf_tree_ops);
++ 	list_del_rcu(&aux->ksym_lnode);
++ }
++ 
++ static bool bpf_prog_kallsyms_candidate(const struct bpf_prog *fp)
++ {
++ 	return fp->jited && !bpf_prog_was_classic(fp);
++ }
++ 
++ static bool bpf_prog_kallsyms_verify_off(const struct bpf_prog *fp)
++ {
++ 	return list_empty(&fp->aux->ksym_lnode) ||
++ 	       fp->aux->ksym_lnode.prev == LIST_POISON2;
++ }
++ 
++ void bpf_prog_kallsyms_add(struct bpf_prog *fp)
++ {
++ 	unsigned long flags;
++ 
++ 	if (!bpf_prog_kallsyms_candidate(fp) ||
++ 	    !capable(CAP_SYS_ADMIN))
++ 		return;
++ 
++ 	spin_lock_irqsave(&bpf_lock, flags);
++ 	bpf_prog_ksym_node_add(fp->aux);
++ 	spin_unlock_irqrestore(&bpf_lock, flags);
++ }
++ 
++ void bpf_prog_kallsyms_del(struct bpf_prog *fp)
++ {
++ 	unsigned long flags;
++ 
++ 	if (!bpf_prog_kallsyms_candidate(fp))
++ 		return;
++ 
++ 	spin_lock_irqsave(&bpf_lock, flags);
++ 	bpf_prog_ksym_node_del(fp->aux);
++ 	spin_unlock_irqrestore(&bpf_lock, flags);
++ }
++ 
++ static struct bpf_prog *bpf_prog_kallsyms_find(unsigned long addr)
++ {
++ 	struct latch_tree_node *n;
++ 
++ 	if (!bpf_jit_kallsyms_enabled())
++ 		return NULL;
++ 
++ 	n = latch_tree_find((void *)addr, &bpf_tree, &bpf_tree_ops);
++ 	return n ?
++ 	       container_of(n, struct bpf_prog_aux, ksym_tnode)->prog :
++ 	       NULL;
++ }
++ 
++ const char *__bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 				 unsigned long *off, char *sym)
++ {
++ 	unsigned long symbol_start, symbol_end;
++ 	struct bpf_prog *prog;
++ 	char *ret = NULL;
++ 
++ 	rcu_read_lock();
++ 	prog = bpf_prog_kallsyms_find(addr);
++ 	if (prog) {
++ 		bpf_get_prog_addr_region(prog, &symbol_start, &symbol_end);
++ 		bpf_get_prog_name(prog, sym);
++ 
++ 		ret = sym;
++ 		if (size)
++ 			*size = symbol_end - symbol_start;
++ 		if (off)
++ 			*off  = addr - symbol_start;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ bool is_bpf_text_address(unsigned long addr)
++ {
++ 	bool ret;
++ 
++ 	rcu_read_lock();
++ 	ret = bpf_prog_kallsyms_find(addr) != NULL;
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
++ 		    char *sym)
++ {
++ 	unsigned long symbol_start, symbol_end;
++ 	struct bpf_prog_aux *aux;
++ 	unsigned int it = 0;
++ 	int ret = -ERANGE;
++ 
++ 	if (!bpf_jit_kallsyms_enabled())
++ 		return ret;
++ 
++ 	rcu_read_lock();
++ 	list_for_each_entry_rcu(aux, &bpf_kallsyms, ksym_lnode) {
++ 		if (it++ != symnum)
++ 			continue;
++ 
++ 		bpf_get_prog_addr_region(aux->prog, &symbol_start, &symbol_end);
++ 		bpf_get_prog_name(aux->prog, sym);
++ 
++ 		*value = symbol_start;
++ 		*type  = BPF_SYM_ELF_TYPE;
++ 
++ 		ret = 0;
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  
+  struct bpf_binary_header *
+  bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
+@@@ -389,9 -528,29 +596,32 @@@
+  
+  void bpf_jit_binary_free(struct bpf_binary_header *hdr)
+  {
+ -	module_memfree(hdr);
+ +	module_free(NULL, hdr);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This symbol is only overridden by archs that have different
++  * requirements than the usual eBPF JITs, f.e. when they only
++  * implement cBPF JIT, do not set images read-only, etc.
++  */
++ void __weak bpf_jit_free(struct bpf_prog *fp)
++ {
++ 	if (fp->jited) {
++ 		struct bpf_binary_header *hdr = bpf_jit_binary_hdr(fp);
++ 
++ 		bpf_jit_binary_unlock_ro(hdr);
++ 		bpf_jit_binary_free(hdr);
++ 
++ 		WARN_ON_ONCE(!bpf_prog_kallsyms_verify_off(fp));
++ 	}
++ 
++ 	bpf_prog_unlock_free(fp);
++ }
++ 
++ int bpf_jit_harden __read_mostly;
++ 
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  static int bpf_jit_blind_insn(const struct bpf_insn *from,
+  			      const struct bpf_insn *aux,
+  			      struct bpf_insn *to_buff)
+diff --cc kernel/bpf/syscall.c
+index 0f40f82e3a57,461eb1e66a0f..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -976,18 -703,13 +976,26 @@@ static void __bpf_prog_put_rcu(struct r
+  	bpf_prog_free(aux->prog);
+  }
+  
+ +static void __bpf_prog_put(struct bpf_prog *prog, bool do_idr_lock)
+ +{
+ +	if (atomic_dec_and_test(&prog->aux->refcnt)) {
+ +		/* bpf_prog_free_id() must be called first */
+ +		bpf_prog_free_id(prog, do_idr_lock);
+ +		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+ +	}
+ +}
+ +
+  void bpf_prog_put(struct bpf_prog *prog)
+  {
+++<<<<<<< HEAD
+ +	__bpf_prog_put(prog, true);
+++=======
++ 	if (atomic_dec_and_test(&prog->aux->refcnt)) {
++ 		trace_bpf_prog_put_rcu(prog);
++ 		bpf_prog_kallsyms_del(prog);
++ 		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
++ 	}
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  }
+  EXPORT_SYMBOL_GPL(bpf_prog_put);
+  
+@@@ -1253,22 -899,13 +1261,27 @@@ static int bpf_prog_load(union bpf_att
+  	if (err < 0)
+  		goto free_used_maps;
+  
+ -	err = bpf_prog_new_fd(prog);
+ -	if (err < 0)
+ -		/* failed to allocate fd */
+ +	err = bpf_prog_alloc_id(prog);
+ +	if (err)
+  		goto free_used_maps;
+  
+ +	err = bpf_prog_new_fd(prog);
+ +	if (err < 0) {
+ +		/* failed to allocate fd.
+ +		 * bpf_prog_put() is needed because the above
+ +		 * bpf_prog_alloc_id() has published the prog
+ +		 * to the userspace and the userspace may
+ +		 * have refcnt-ed it through BPF_PROG_GET_FD_BY_ID.
+ +		 */
+ +		bpf_prog_put(prog);
+ +		return err;
+ +	}
+ +
+++<<<<<<< HEAD
+++=======
++ 	bpf_prog_kallsyms_add(prog);
++ 	trace_bpf_prog_load(prog, err);
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  	return err;
+  
+  free_used_maps:
+diff --cc kernel/extable.c
+index 67460b93b1a1,bd82117ad424..000000000000
+--- a/kernel/extable.c
++++ b/kernel/extable.c
+@@@ -20,9 -20,10 +20,10 @@@
+  #include <linux/module.h>
+  #include <linux/mutex.h>
+  #include <linux/init.h>
++ #include <linux/filter.h>
+  
+  #include <asm/sections.h>
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  
+  /*
+   * mutex protecting text section modification (dynamic code patching).
+@@@ -102,6 -103,10 +103,13 @@@ int __kernel_text_address(unsigned lon
+  		return 1;
+  	if (is_module_text_address(addr))
+  		return 1;
+++<<<<<<< HEAD
+++=======
++ 	if (is_ftrace_trampoline(addr))
++ 		return 1;
++ 	if (is_bpf_text_address(addr))
++ 		return 1;
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  	/*
+  	 * There might be init symbols in saved stacktraces.
+  	 * Give those symbols a chance to be printed in
+@@@ -119,7 -124,13 +127,17 @@@ int kernel_text_address(unsigned long a
+  {
+  	if (core_kernel_text(addr))
+  		return 1;
+++<<<<<<< HEAD
+ +	return is_module_text_address(addr);
+++=======
++ 	if (is_module_text_address(addr))
++ 		return 1;
++ 	if (is_ftrace_trampoline(addr))
++ 		return 1;
++ 	if (is_bpf_text_address(addr))
++ 		return 1;
++ 	return 0;
+++>>>>>>> 74451e66d516 (bpf: make jited programs visible in traces)
+  }
+  
+  /*
+* Unmerged path arch/arm64/net/bpf_jit_comp.c
+* Unmerged path arch/powerpc/net/bpf_jit_comp64.c
+diff --git a/Documentation/sysctl/net.txt b/Documentation/sysctl/net.txt
+index a4de7f62cec4..fdb0b925de13 100644
+--- a/Documentation/sysctl/net.txt
++++ b/Documentation/sysctl/net.txt
+@@ -54,6 +54,18 @@ Values :
+ 	1 - enable JIT hardening for unprivileged users only
+ 	2 - enable JIT hardening for all users
+ 
++bpf_jit_kallsyms
++----------------
++
++When Berkeley Packet Filter Just in Time compiler is enabled, then compiled
++images are unknown addresses to the kernel, meaning they neither show up in
++traces nor in /proc/kallsyms. This enables export of these addresses, which
++can be used for debugging/tracing. If bpf_jit_harden is enabled, this feature
++is disabled.
++Values :
++	0 - disable JIT kallsyms export (default value)
++	1 - enable JIT kallsyms export for privileged users only
++
+ dev_weight
+ --------------
+ 
+* Unmerged path arch/arm64/net/bpf_jit_comp.c
+* Unmerged path arch/powerpc/net/bpf_jit_comp64.c
+* Unmerged path arch/s390/net/bpf_jit_comp.c
+* Unmerged path arch/x86/net/bpf_jit_comp.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/extable.c
+diff --git a/kernel/kallsyms.c b/kernel/kallsyms.c
+index ba8a7f076e67..619acd7bb570 100644
+--- a/kernel/kallsyms.c
++++ b/kernel/kallsyms.c
+@@ -23,6 +23,7 @@
+ #include <linux/mm.h>
+ #include <linux/ctype.h>
+ #include <linux/slab.h>
++#include <linux/filter.h>
+ #include <linux/compiler.h>
+ 
+ #include <asm/sections.h>
+@@ -276,10 +277,11 @@ int kallsyms_lookup_size_offset(unsigned long addr, unsigned long *symbolsize,
+ 				unsigned long *offset)
+ {
+ 	char namebuf[KSYM_NAME_LEN];
++
+ 	if (is_ksym_addr(addr))
+ 		return !!get_symbol_pos(addr, symbolsize, offset);
+-
+-	return !!module_address_lookup(addr, symbolsize, offset, NULL, namebuf);
++	return !!module_address_lookup(addr, symbolsize, offset, NULL, namebuf) ||
++	       !!__bpf_address_lookup(addr, symbolsize, offset, namebuf);
+ }
+ 
+ /*
+@@ -294,6 +296,8 @@ const char *kallsyms_lookup(unsigned long addr,
+ 			    unsigned long *offset,
+ 			    char **modname, char *namebuf)
+ {
++	const char *ret;
++
+ 	namebuf[KSYM_NAME_LEN - 1] = 0;
+ 	namebuf[0] = 0;
+ 
+@@ -309,9 +313,13 @@ const char *kallsyms_lookup(unsigned long addr,
+ 		return namebuf;
+ 	}
+ 
+-	/* See if it's in a module. */
+-	return module_address_lookup(addr, symbolsize, offset, modname,
+-				     namebuf);
++	/* See if it's in a module or a BPF JITed image. */
++	ret = module_address_lookup(addr, symbolsize, offset,
++				    modname, namebuf);
++	if (!ret)
++		ret = bpf_address_lookup(addr, symbolsize,
++					 offset, modname, namebuf);
++	return ret;
+ }
+ 
+ int lookup_symbol_name(unsigned long addr, char *symname)
+@@ -447,6 +455,7 @@ EXPORT_SYMBOL(__print_symbol);
+ /* To avoid using get_symbol_offset for every symbol, we carry prefix along. */
+ struct kallsym_iter {
+ 	loff_t pos;
++	loff_t pos_mod_end;
+ 	unsigned long value;
+ 	unsigned int nameoff; /* If iterating in core kernel symbols. */
+ 	char type;
+@@ -458,13 +467,27 @@ struct kallsym_iter {
+ 
+ static int get_ksymbol_mod(struct kallsym_iter *iter)
+ {
+-	if (module_get_kallsym(iter->pos - kallsyms_num_syms, &iter->value,
+-				&iter->type, iter->name, iter->module_name,
+-				&iter->exported) < 0)
++	int ret = module_get_kallsym(iter->pos - kallsyms_num_syms,
++				     &iter->value, &iter->type,
++				     iter->name, iter->module_name,
++				     &iter->exported);
++	if (ret < 0) {
++		iter->pos_mod_end = iter->pos;
+ 		return 0;
++	}
++
+ 	return 1;
+ }
+ 
++static int get_ksymbol_bpf(struct kallsym_iter *iter)
++{
++	iter->module_name[0] = '\0';
++	iter->exported = 0;
++	return bpf_get_kallsym(iter->pos - iter->pos_mod_end,
++			       &iter->value, &iter->type,
++			       iter->name) < 0 ? 0 : 1;
++}
++
+ /* Returns space to next name. */
+ static unsigned long get_ksymbol_core(struct kallsym_iter *iter)
+ {
+@@ -485,16 +508,30 @@ static void reset_iter(struct kallsym_iter *iter, loff_t new_pos)
+ 	iter->name[0] = '\0';
+ 	iter->nameoff = get_symbol_offset(new_pos);
+ 	iter->pos = new_pos;
++	if (new_pos == 0)
++		iter->pos_mod_end = 0;
++}
++
++static int update_iter_mod(struct kallsym_iter *iter, loff_t pos)
++{
++	iter->pos = pos;
++
++	if (iter->pos_mod_end > 0 &&
++	    iter->pos_mod_end < iter->pos)
++		return get_ksymbol_bpf(iter);
++
++	if (!get_ksymbol_mod(iter))
++		return get_ksymbol_bpf(iter);
++
++	return 1;
+ }
+ 
+ /* Returns false if pos at or past end of file. */
+ static int update_iter(struct kallsym_iter *iter, loff_t pos)
+ {
+ 	/* Module symbols can be accessed randomly. */
+-	if (pos >= kallsyms_num_syms) {
+-		iter->pos = pos;
+-		return get_ksymbol_mod(iter);
+-	}
++	if (pos >= kallsyms_num_syms)
++		return update_iter_mod(iter, pos);
+ 
+ 	/* If we're not on the desired position, reset to new position. */
+ 	if (pos != iter->pos)
+diff --git a/net/Kconfig b/net/Kconfig
+index 85160c977301..f5da4b9656da 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -275,7 +275,8 @@ config BPF_JIT
+ 
+ 	  Note, admin should enable this feature changing:
+ 	  /proc/sys/net/core/bpf_jit_enable
+-	  /proc/sys/net/core/bpf_jit_harden (optional)
++	  /proc/sys/net/core/bpf_jit_harden   (optional)
++	  /proc/sys/net/core/bpf_jit_kallsyms (optional)
+ 
+ menu "Network testing"
+ 
+diff --git a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+index 449e413a4093..0e68d5942cb7 100644
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -233,6 +233,13 @@ static struct ctl_table net_core_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &two,
+ 	},
++	{
++		.procname	= "bpf_jit_kallsyms",
++		.data		= &bpf_jit_kallsyms,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
+ # endif
+ #endif
+ 	{
