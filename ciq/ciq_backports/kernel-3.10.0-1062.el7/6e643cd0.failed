@@ -1,0 +1,126 @@
+xfs: hold xfs_buf locked between shortform->leaf conversion and the addition of an attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 6e643cd094de3bd0f97edcc1db0089afa24d909f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6e643cd0.failed
+
+The new attribute leaf buffer is not held locked across the transaction
+roll between the shortform->leaf modification and the addition of the
+new entry.  As a result, the attribute buffer modification being made is
+not atomic from an operational perspective.  Hence the AIL push can grab
+it in the transient state of "just created" after the initial
+transaction is rolled, because the buffer has been released.  This leads
+to xfs_attr3_leaf_verify() asserting that hdr.count is zero, treating
+this as in-memory corruption, and shutting down the filesystem.
+
+Darrick ported the original patch to 4.15 and reworked it use the
+xfs_defer_bjoin helper and hold/join the buffer correctly across the
+second transaction roll.
+
+	Signed-off-by: Alex Lyakas <alex@zadarastorage.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 6e643cd094de3bd0f97edcc1db0089afa24d909f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr.c
+diff --cc fs/xfs/libxfs/xfs_attr.c
+index 3e8597157ebe,a76914db72ef..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@@ -327,14 -328,20 +328,31 @@@ xfs_attr_set
+  		 * GROT: another possible req'mt for a double-split btree op.
+  		 */
+  		xfs_defer_init(args.dfops, args.firstblock);
+++<<<<<<< HEAD
+ +		error = xfs_attr_shortform_to_leaf(&args);
+ +		if (!error)
+ +			error = xfs_defer_finish(&args.trans, args.dfops, dp);
+ +		if (error) {
+ +			args.trans = NULL;
+ +			xfs_defer_cancel(&dfops);
+ +			goto out;
+ +		}
+++=======
++ 		error = xfs_attr_shortform_to_leaf(&args, &leaf_bp);
++ 		if (error)
++ 			goto out_defer_cancel;
++ 		/*
++ 		 * Prevent the leaf buffer from being unlocked so that a
++ 		 * concurrent AIL push cannot grab the half-baked leaf
++ 		 * buffer and run into problems with the write verifier.
++ 		 */
++ 		xfs_trans_bhold(args.trans, leaf_bp);
++ 		xfs_defer_bjoin(args.dfops, leaf_bp);
++ 		xfs_defer_ijoin(args.dfops, dp);
++ 		error = xfs_defer_finish(&args.trans, args.dfops);
++ 		if (error)
++ 			goto out_defer_cancel;
+++>>>>>>> 6e643cd094de (xfs: hold xfs_buf locked between shortform->leaf conversion and the addition of an attribute)
+  
+  		/*
+  		 * Commit the leaf transformation.  We'll need another (linked)
+@@@ -373,7 -381,11 +392,14 @@@
+  
+  	return error;
+  
+++<<<<<<< HEAD
+++=======
++ out_defer_cancel:
++ 	xfs_defer_cancel(&dfops);
+++>>>>>>> 6e643cd094de (xfs: hold xfs_buf locked between shortform->leaf conversion and the addition of an attribute)
+  out:
++ 	if (leaf_bp)
++ 		xfs_trans_brelse(args.trans, leaf_bp);
+  	if (args.trans)
+  		xfs_trans_cancel(args.trans);
+  	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+* Unmerged path fs/xfs/libxfs/xfs_attr.c
+diff --git a/fs/xfs/libxfs/xfs_attr_leaf.c b/fs/xfs/libxfs/xfs_attr_leaf.c
+index cc4c91fce0be..521209514b31 100644
+--- a/fs/xfs/libxfs/xfs_attr_leaf.c
++++ b/fs/xfs/libxfs/xfs_attr_leaf.c
+@@ -735,10 +735,13 @@ xfs_attr_shortform_getvalue(xfs_da_args_t *args)
+ }
+ 
+ /*
+- * Convert from using the shortform to the leaf.
++ * Convert from using the shortform to the leaf.  On success, return the
++ * buffer so that we can keep it locked until we're totally done with it.
+  */
+ int
+-xfs_attr_shortform_to_leaf(xfs_da_args_t *args)
++xfs_attr_shortform_to_leaf(
++	struct xfs_da_args	*args,
++	struct xfs_buf		**leaf_bp)
+ {
+ 	xfs_inode_t *dp;
+ 	xfs_attr_shortform_t *sf;
+@@ -817,7 +820,7 @@ xfs_attr_shortform_to_leaf(xfs_da_args_t *args)
+ 		sfe = XFS_ATTR_SF_NEXTENTRY(sfe);
+ 	}
+ 	error = 0;
+-
++	*leaf_bp = bp;
+ out:
+ 	kmem_free(tmpbuffer);
+ 	return error;
+diff --git a/fs/xfs/libxfs/xfs_attr_leaf.h b/fs/xfs/libxfs/xfs_attr_leaf.h
+index f7dda0c237b0..894124efb421 100644
+--- a/fs/xfs/libxfs/xfs_attr_leaf.h
++++ b/fs/xfs/libxfs/xfs_attr_leaf.h
+@@ -48,7 +48,8 @@ void	xfs_attr_shortform_create(struct xfs_da_args *args);
+ void	xfs_attr_shortform_add(struct xfs_da_args *args, int forkoff);
+ int	xfs_attr_shortform_lookup(struct xfs_da_args *args);
+ int	xfs_attr_shortform_getvalue(struct xfs_da_args *args);
+-int	xfs_attr_shortform_to_leaf(struct xfs_da_args *args);
++int	xfs_attr_shortform_to_leaf(struct xfs_da_args *args,
++			struct xfs_buf **leaf_bp);
+ int	xfs_attr_shortform_remove(struct xfs_da_args *args);
+ int	xfs_attr_shortform_allfit(struct xfs_buf *bp, struct xfs_inode *dp);
+ int	xfs_attr_shortform_bytesfit(struct xfs_inode *dp, int bytes);
