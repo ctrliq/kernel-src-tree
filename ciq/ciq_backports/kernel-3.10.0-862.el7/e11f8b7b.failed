@@ -1,0 +1,186 @@
+dax: fix radix tree insertion race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit e11f8b7b6c4ea13bf8af6b8f42b45e15b554a92b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e11f8b7b.failed
+
+While running generic/340 in my test setup I hit the following race.  It
+can happen with kernels that support FS DAX PMDs, so v4.10 thru
+v4.11-rc5.
+
+Thread 1				Thread 2
+--------				--------
+dax_iomap_pmd_fault()
+  grab_mapping_entry()
+    spin_lock_irq()
+    get_unlocked_mapping_entry()
+    'entry' is NULL, can't call lock_slot()
+    spin_unlock_irq()
+    radix_tree_preload()
+					dax_iomap_pmd_fault()
+					  grab_mapping_entry()
+					    spin_lock_irq()
+					    get_unlocked_mapping_entry()
+					    ...
+					    lock_slot()
+					    spin_unlock_irq()
+					  dax_pmd_insert_mapping()
+					    <inserts a PMD mapping>
+    spin_lock_irq()
+    __radix_tree_insert() fails with -EEXIST
+    <fall back to 4k fault, and die horribly
+     when inserting a 4k entry where a PMD exists>
+
+The issue is that we have to drop mapping->tree_lock while calling
+radix_tree_preload(), but since we didn't have a radix tree entry to
+lock (unlike in the pmd_downgrade case) we have no protection against
+Thread 2 coming along and inserting a PMD at the same index.  For 4k
+entries we handled this with a special-case response to -EEXIST coming
+from the __radix_tree_insert(), but this doesn't save us for PMDs
+because the -EEXIST case can also mean that we collided with a 4k entry
+in the radix tree at a different index, but one that is covered by our
+PMD range.
+
+So, correctly handle both the 4k and 2M collision cases by explicitly
+re-checking the radix tree for an entry at our index once we reacquire
+mapping->tree_lock.
+
+This patch has made it through a clean xfstests run with the current
+v4.11-rc5 based linux/master, and it also ran generic/340 500 times in a
+loop.  It used to fail within the first 10 iterations.
+
+Link: http://lkml.kernel.org/r/20170406212944.2866-1-ross.zwisler@linux.intel.com
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: <stable@vger.kernel.org>    [4.10+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e11f8b7b6c4ea13bf8af6b8f42b45e15b554a92b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 1dfecdfb6245,85abd741253d..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -444,25 -322,95 +444,67 @@@ static void *grab_mapping_entry(struct 
+  restart:
+  	spin_lock_irq(&mapping->tree_lock);
+  	entry = get_unlocked_mapping_entry(mapping, index, &slot);
+ -
+ -	if (entry) {
+ -		if (size_flag & RADIX_DAX_PMD) {
+ -			if (!radix_tree_exceptional_entry(entry) ||
+ -			    dax_is_pte_entry(entry)) {
+ -				put_unlocked_mapping_entry(mapping, index,
+ -						entry);
+ -				entry = ERR_PTR(-EEXIST);
+ -				goto out_unlock;
+ -			}
+ -		} else { /* trying to grab a PTE entry */
+ -			if (radix_tree_exceptional_entry(entry) &&
+ -			    dax_is_pmd_entry(entry) &&
+ -			    (dax_is_zero_entry(entry) ||
+ -			     dax_is_empty_entry(entry))) {
+ -				pmd_downgrade = true;
+ -			}
+ -		}
+ -	}
+ -
+  	/* No entry for given index? Make sure radix tree is big enough. */
+ -	if (!entry || pmd_downgrade) {
+ +	if (!entry) {
+  		int err;
+  
+ -		if (pmd_downgrade) {
+ -			/*
+ -			 * Make sure 'entry' remains valid while we drop
+ -			 * mapping->tree_lock.
+ -			 */
+ -			entry = lock_slot(mapping, slot);
+ -		}
+ -
+  		spin_unlock_irq(&mapping->tree_lock);
+ -		/*
+ -		 * Besides huge zero pages the only other thing that gets
+ -		 * downgraded are empty entries which don't need to be
+ -		 * unmapped.
+ -		 */
+ -		if (pmd_downgrade && dax_is_zero_entry(entry))
+ -			unmap_mapping_range(mapping,
+ -				(index << PAGE_SHIFT) & PMD_MASK, PMD_SIZE, 0);
+ -
+  		err = radix_tree_preload(
+  				mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
+ -		if (err) {
+ -			if (pmd_downgrade)
+ -				put_locked_mapping_entry(mapping, index, entry);
+ +		if (err)
+  			return ERR_PTR(err);
+ -		}
+ +		entry = (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY |
+ +			       RADIX_DAX_ENTRY_LOCK);
+  		spin_lock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+ +		err = radix_tree_insert(&mapping->page_tree, index, entry);
+ +		radix_tree_preload_end();
+ +		if (err) {
+ +			spin_unlock_irq(&mapping->tree_lock);
+ +			/* Someone already created the entry? */
+ +			if (err == -EEXIST)
+ +				goto restart;
+++=======
++ 
++ 		if (!entry) {
++ 			/*
++ 			 * We needed to drop the page_tree lock while calling
++ 			 * radix_tree_preload() and we didn't have an entry to
++ 			 * lock.  See if another thread inserted an entry at
++ 			 * our index during this time.
++ 			 */
++ 			entry = __radix_tree_lookup(&mapping->page_tree, index,
++ 					NULL, &slot);
++ 			if (entry) {
++ 				radix_tree_preload_end();
++ 				spin_unlock_irq(&mapping->tree_lock);
++ 				goto restart;
++ 			}
++ 		}
++ 
++ 		if (pmd_downgrade) {
++ 			radix_tree_delete(&mapping->page_tree, index);
++ 			mapping->nrexceptional--;
++ 			dax_wake_mapping_entry_waiter(mapping, index, entry,
++ 					true);
++ 		}
++ 
++ 		entry = dax_radix_locked_entry(0, size_flag | RADIX_DAX_EMPTY);
++ 
++ 		err = __radix_tree_insert(&mapping->page_tree, index,
++ 				dax_radix_order(entry), entry);
++ 		radix_tree_preload_end();
++ 		if (err) {
++ 			spin_unlock_irq(&mapping->tree_lock);
++ 			/*
++ 			 * Our insertion of a DAX entry failed, most likely
++ 			 * because we were inserting a PMD entry and it
++ 			 * collided with a PTE sized entry at a different
++ 			 * index in the PMD range.  We haven't inserted
++ 			 * anything into the radix tree and have no waiters to
++ 			 * wake.
++ 			 */
+++>>>>>>> e11f8b7b6c4e (dax: fix radix tree insertion race)
+  			return ERR_PTR(err);
+  		}
+  		/* Good, we have inserted empty locked entry into the tree. */
+* Unmerged path fs/dax.c
