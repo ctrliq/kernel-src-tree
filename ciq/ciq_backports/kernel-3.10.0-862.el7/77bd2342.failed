@@ -1,0 +1,128 @@
+x86/mm: Add support for changing the memory encryption attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm: Add support for changing the memory encryption attribute (Suravee Suthikulpanit) [1361287]
+Rebuild_FUZZ: 96.77%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 77bd2342d4304bda7896c953d424d15deb314ca3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/77bd2342.failed
+
+Add support for changing the memory encryption attribute for one or more
+memory pages. This will be useful when we have to change the AP trampoline
+area to not be encrypted. Or when we need to change the SWIOTLB area to
+not be encrypted in support of devices that can't support the encryption
+mask range.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/924ae0d1f6d4c90c5a0e366c291b90a2d86aa79e.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 77bd2342d4304bda7896c953d424d15deb314ca3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/set_memory.h
+* Unmerged path arch/x86/include/asm/set_memory.h
+* Unmerged path arch/x86/include/asm/set_memory.h
+diff --git a/arch/x86/mm/pageattr.c b/arch/x86/mm/pageattr.c
+index 3fe832369c84..925abb357964 100644
+--- a/arch/x86/mm/pageattr.c
++++ b/arch/x86/mm/pageattr.c
+@@ -1645,6 +1645,68 @@ int set_memory_4k(unsigned long addr, int numpages)
+ 					__pgprot(0), 1, 0, NULL);
+ }
+ 
++static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
++{
++	struct cpa_data cpa;
++	unsigned long start;
++	int ret;
++
++	/* Nothing to do if the SME is not active */
++	if (!sme_active())
++		return 0;
++
++	/* Should not be working on unaligned addresses */
++	if (WARN_ONCE(addr & ~PAGE_MASK, "misaligned address: %#lx\n", addr))
++		addr &= PAGE_MASK;
++
++	start = addr;
++
++	memset(&cpa, 0, sizeof(cpa));
++	cpa.vaddr = &addr;
++	cpa.numpages = numpages;
++	cpa.mask_set = enc ? __pgprot(_PAGE_ENC) : __pgprot(0);
++	cpa.mask_clr = enc ? __pgprot(0) : __pgprot(_PAGE_ENC);
++	cpa.pgd = init_mm.pgd;
++
++	/* Must avoid aliasing mappings in the highmem code */
++	kmap_flush_unused();
++	vm_unmap_aliases();
++
++	/*
++	 * Before changing the encryption attribute, we need to flush caches.
++	 */
++	if (static_cpu_has(X86_FEATURE_CLFLUSH))
++		cpa_flush_range(start, numpages, 1);
++	else
++		cpa_flush_all(1);
++
++	ret = __change_page_attr_set_clr(&cpa, 1);
++
++	/*
++	 * After changing the encryption attribute, we need to flush TLBs
++	 * again in case any speculative TLB caching occurred (but no need
++	 * to flush caches again).  We could just use cpa_flush_all(), but
++	 * in case TLB flushing gets optimized in the cpa_flush_range()
++	 * path use the same logic as above.
++	 */
++	if (static_cpu_has(X86_FEATURE_CLFLUSH))
++		cpa_flush_range(start, numpages, 0);
++	else
++		cpa_flush_all(0);
++
++	return ret;
++}
++
++int set_memory_encrypted(unsigned long addr, int numpages)
++{
++	return __set_memory_enc_dec(addr, numpages, true);
++}
++
++int set_memory_decrypted(unsigned long addr, int numpages)
++{
++	return __set_memory_enc_dec(addr, numpages, false);
++}
++
+ int set_pages_uc(struct page *page, int numpages)
+ {
+ 	unsigned long addr = (unsigned long)page_address(page);
