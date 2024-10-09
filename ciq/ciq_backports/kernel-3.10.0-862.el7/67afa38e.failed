@@ -1,0 +1,621 @@
+mm/swap: add cache for swap slots allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] swap: add cache for swap slots allocation (Jerome Marchand) [1400689]
+Rebuild_FUZZ: 96.47%
+commit-author Tim Chen <tim.c.chen@linux.intel.com>
+commit 67afa38e012e9581b9b42f2a41dfc56b1280794d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/67afa38e.failed
+
+We add per cpu caches for swap slots that can be allocated and freed
+quickly without the need to touch the swap info lock.
+
+Two separate caches are maintained for swap slots allocated and swap
+slots returned.  This is to allow the swap slots to be returned to the
+global pool in a batch so they will have a chance to be coaelesced with
+other slots in a cluster.  We do not reuse the slots that are returned
+right away, as it may increase fragmentation of the slots.
+
+The swap allocation cache is protected by a mutex as we may sleep when
+searching for empty slots in cache.  The swap free cache is protected by
+a spin lock as we cannot sleep in the free path.
+
+We refill the swap slots cache when we run out of slots, and we disable
+the swap slots cache and drain the slots if the global number of slots
+fall below a low watermark threshold.  We re-enable the cache agian when
+the slots available are above a high watermark.
+
+[ying.huang@intel.com: use raw_cpu_ptr over this_cpu_ptr for swap slots access]
+[tim.c.chen@linux.intel.com: add comments on locks in swap_slots.h]
+  Link: http://lkml.kernel.org/r/20170118180327.GA24225@linux.intel.com
+Link: http://lkml.kernel.org/r/35de301a4eaa8daa2977de6e987f2c154385eb66.1484082593.git.tim.c.chen@linux.intel.com
+	Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+	Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+	Reviewed-by: Michal Hocko <mhocko@suse.com>
+	Cc: Aaron Lu <aaron.lu@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Jonathan Corbet <corbet@lwn.net> escreveu:
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 67afa38e012e9581b9b42f2a41dfc56b1280794d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/Makefile
+#	mm/swap_state.c
+#	mm/swapfile.c
+diff --cc mm/Makefile
+index 9f7674fba242,433eaf9a876e..000000000000
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@@ -16,8 -35,9 +16,14 @@@ obj-y			:= filemap.o mempool.o oom_kill
+  			   readahead.o swap.o truncate.o vmscan.o shmem.o \
+  			   util.o mmzone.o vmstat.o backing-dev.o \
+  			   mm_init.o mmu_context.o percpu.o slab_common.o \
+++<<<<<<< HEAD
+ +			   compaction.o \
+ +			   interval_tree.o list_lru.o workingset.o $(mmu-y)
+++=======
++ 			   compaction.o vmacache.o swap_slots.o \
++ 			   interval_tree.o list_lru.o workingset.o \
++ 			   debug.o $(mmu-y)
+++>>>>>>> 67afa38e012e (mm/swap: add cache for swap slots allocation)
+  
+  obj-y += init-mm.o
+  
+diff --cc mm/swap_state.c
+index 8ead62769c81,e1f07cafecaa..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -17,7 -17,8 +17,12 @@@
+  #include <linux/blkdev.h>
+  #include <linux/pagevec.h>
+  #include <linux/migrate.h>
+++<<<<<<< HEAD
+ +#include <linux/page_cgroup.h>
+++=======
++ #include <linux/vmalloc.h>
++ #include <linux/swap_slots.h>
+++>>>>>>> 67afa38e012e (mm/swap: add cache for swap slots allocation)
+  
+  #include <asm/pgtable.h>
+  
+diff --cc mm/swapfile.c
+index 44c2eac6b890,30a90fd140b7..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -494,12 -848,14 +495,16 @@@ nextsi
+  
+  	spin_unlock(&swap_avail_lock);
+  
+ -check_out:
+ -	if (n_ret < n_goal)
+ -		atomic_long_add((long) (n_goal-n_ret), &nr_swap_pages);
+ +	atomic_long_inc(&nr_swap_pages);
+  noswap:
+ -	return n_ret;
+ +	return (swp_entry_t) {0};
+  }
+  
+++<<<<<<< HEAD
+ +/* The only caller of this function is now susupend routine */
+++=======
++ /* The only caller of this function is now suspend routine */
+++>>>>>>> 67afa38e012e (mm/swap: add cache for swap slots allocation)
+  swp_entry_t get_swap_page_of_type(int type)
+  {
+  	struct swap_info_struct *si;
+@@@ -631,28 -1042,47 +636,60 @@@ void swap_free(swp_entry_t entry
+  {
+  	struct swap_info_struct *p;
+  
+ -	p = _swap_info_get(entry);
+ +	p = swap_info_get(entry);
+  	if (p) {
+++<<<<<<< HEAD
+ +		swap_entry_free(p, entry, 1);
+ +		spin_unlock(&p->lock);
+++=======
++ 		if (!__swap_entry_free(p, entry, 1))
++ 			free_swap_slot(entry);
+++>>>>>>> 67afa38e012e (mm/swap: add cache for swap slots allocation)
+  	}
+  }
+  
+  /*
+   * Called after dropping swapcache to decrease refcnt to swap entries.
+   */
+ -void swapcache_free(swp_entry_t entry)
+ +void swapcache_free(swp_entry_t entry, struct page *page)
+  {
+  	struct swap_info_struct *p;
+ +	unsigned char count;
+  
+ -	p = _swap_info_get(entry);
+ +	p = swap_info_get(entry);
+  	if (p) {
+++<<<<<<< HEAD
+ +		count = swap_entry_free(p, entry, SWAP_HAS_CACHE);
+ +		if (page)
+ +			mem_cgroup_uncharge_swapcache(page, entry, count != 0);
+++=======
++ 		if (!__swap_entry_free(p, entry, SWAP_HAS_CACHE))
++ 			free_swap_slot(entry);
++ 	}
++ }
++ 
++ void swapcache_free_entries(swp_entry_t *entries, int n)
++ {
++ 	struct swap_info_struct *p, *prev;
++ 	int i;
++ 
++ 	if (n <= 0)
++ 		return;
++ 
++ 	prev = NULL;
++ 	p = NULL;
++ 	for (i = 0; i < n; ++i) {
++ 		p = swap_info_get_cont(entries[i], prev);
++ 		if (p)
++ 			swap_entry_free(p, entries[i]);
++ 		else
++ 			break;
++ 		prev = p;
++ 	}
++ 	if (p)
+++>>>>>>> 67afa38e012e (mm/swap: add cache for swap slots allocation)
+  		spin_unlock(&p->lock);
+ +	}
+  }
+  
+  /*
+@@@ -749,17 -1270,18 +786,22 @@@ int free_swap_and_cache(swp_entry_t ent
+  	if (non_swap_entry(entry))
+  		return 1;
+  
+ -	p = _swap_info_get(entry);
+ +	p = swap_info_get(entry);
+  	if (p) {
+ -		count = __swap_entry_free(p, entry, 1);
+ -		if (count == SWAP_HAS_CACHE) {
+ +		if (swap_entry_free(p, entry, 1) == SWAP_HAS_CACHE) {
+  			page = find_get_page(swap_address_space(entry),
+ -					     swp_offset(entry));
+ +						entry.val);
+  			if (page && !trylock_page(page)) {
+ -				put_page(page);
+ +				page_cache_release(page);
+  				page = NULL;
+  			}
+++<<<<<<< HEAD
+ +		}
+ +		spin_unlock(&p->lock);
+++=======
++ 		} else if (!count)
++ 			free_swap_slot(entry);
+++>>>>>>> 67afa38e012e (mm/swap: add cache for swap slots allocation)
+  	}
+  	if (page) {
+  		/*
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 61d41d507b58..c7bb540827ab 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -403,6 +403,7 @@ extern struct page *swapin_readahead(swp_entry_t, gfp_t,
+ /* linux/mm/swapfile.c */
+ extern atomic_long_t nr_swap_pages;
+ extern long total_swap_pages;
++extern bool has_usable_swap(void);
+ 
+ /* Swap 50% full? Release swapcache more aggressively.. */
+ static inline bool vm_swap_full(void)
+@@ -445,6 +446,9 @@ mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout)
+ }
+ #endif
+ 
++extern int get_swap_slots(int n, swp_entry_t *slots);
++extern void swapcache_free_batch(swp_entry_t *entries, int n);
++
+ #else /* CONFIG_SWAP */
+ 
+ #define get_nr_swap_pages()			0L
+diff --git a/include/linux/swap_slots.h b/include/linux/swap_slots.h
+new file mode 100644
+index 000000000000..ba5623b27c60
+--- /dev/null
++++ b/include/linux/swap_slots.h
+@@ -0,0 +1,28 @@
++#ifndef _LINUX_SWAP_SLOTS_H
++#define _LINUX_SWAP_SLOTS_H
++
++#include <linux/swap.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++
++#define SWAP_SLOTS_CACHE_SIZE			SWAP_BATCH
++#define THRESHOLD_ACTIVATE_SWAP_SLOTS_CACHE	(5*SWAP_SLOTS_CACHE_SIZE)
++#define THRESHOLD_DEACTIVATE_SWAP_SLOTS_CACHE	(2*SWAP_SLOTS_CACHE_SIZE)
++
++struct swap_slots_cache {
++	bool		lock_initialized;
++	struct mutex	alloc_lock; /* protects slots, nr, cur */
++	swp_entry_t	*slots;
++	int		nr;
++	int		cur;
++	spinlock_t	free_lock;  /* protects slots_ret, n_ret */
++	swp_entry_t	*slots_ret;
++	int		n_ret;
++};
++
++void disable_swap_slots_cache_lock(void);
++void reenable_swap_slots_cache_unlock(void);
++int enable_swap_slots_cache(void);
++int free_swap_slot(swp_entry_t entry);
++
++#endif /* _LINUX_SWAP_SLOTS_H */
+* Unmerged path mm/Makefile
+diff --git a/mm/swap_slots.c b/mm/swap_slots.c
+new file mode 100644
+index 000000000000..ebf4f1cbac04
+--- /dev/null
++++ b/mm/swap_slots.c
+@@ -0,0 +1,342 @@
++/*
++ * Manage cache of swap slots to be used for and returned from
++ * swap.
++ *
++ * Copyright(c) 2016 Intel Corporation.
++ *
++ * Author: Tim Chen <tim.c.chen@linux.intel.com>
++ *
++ * We allocate the swap slots from the global pool and put
++ * it into local per cpu caches.  This has the advantage
++ * of no needing to acquire the swap_info lock every time
++ * we need a new slot.
++ *
++ * There is also opportunity to simply return the slot
++ * to local caches without needing to acquire swap_info
++ * lock.  We do not reuse the returned slots directly but
++ * move them back to the global pool in a batch.  This
++ * allows the slots to coaellesce and reduce fragmentation.
++ *
++ * The swap entry allocated is marked with SWAP_HAS_CACHE
++ * flag in map_count that prevents it from being allocated
++ * again from the global pool.
++ *
++ * The swap slots cache is protected by a mutex instead of
++ * a spin lock as when we search for slots with scan_swap_map,
++ * we can possibly sleep.
++ */
++
++#include <linux/swap_slots.h>
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/vmalloc.h>
++#include <linux/mutex.h>
++
++#ifdef CONFIG_SWAP
++
++static DEFINE_PER_CPU(struct swap_slots_cache, swp_slots);
++static bool	swap_slot_cache_active;
++static bool	swap_slot_cache_enabled;
++static bool	swap_slot_cache_initialized;
++DEFINE_MUTEX(swap_slots_cache_mutex);
++/* Serialize swap slots cache enable/disable operations */
++DEFINE_MUTEX(swap_slots_cache_enable_mutex);
++
++static void __drain_swap_slots_cache(unsigned int type);
++static void deactivate_swap_slots_cache(void);
++static void reactivate_swap_slots_cache(void);
++
++#define use_swap_slot_cache (swap_slot_cache_active && \
++		swap_slot_cache_enabled && swap_slot_cache_initialized)
++#define SLOTS_CACHE 0x1
++#define SLOTS_CACHE_RET 0x2
++
++static void deactivate_swap_slots_cache(void)
++{
++	mutex_lock(&swap_slots_cache_mutex);
++	swap_slot_cache_active = false;
++	__drain_swap_slots_cache(SLOTS_CACHE|SLOTS_CACHE_RET);
++	mutex_unlock(&swap_slots_cache_mutex);
++}
++
++static void reactivate_swap_slots_cache(void)
++{
++	mutex_lock(&swap_slots_cache_mutex);
++	swap_slot_cache_active = true;
++	mutex_unlock(&swap_slots_cache_mutex);
++}
++
++/* Must not be called with cpu hot plug lock */
++void disable_swap_slots_cache_lock(void)
++{
++	mutex_lock(&swap_slots_cache_enable_mutex);
++	swap_slot_cache_enabled = false;
++	if (swap_slot_cache_initialized) {
++		/* serialize with cpu hotplug operations */
++		get_online_cpus();
++		__drain_swap_slots_cache(SLOTS_CACHE|SLOTS_CACHE_RET);
++		put_online_cpus();
++	}
++}
++
++static void __reenable_swap_slots_cache(void)
++{
++	swap_slot_cache_enabled = has_usable_swap();
++}
++
++void reenable_swap_slots_cache_unlock(void)
++{
++	__reenable_swap_slots_cache();
++	mutex_unlock(&swap_slots_cache_enable_mutex);
++}
++
++static bool check_cache_active(void)
++{
++	long pages;
++
++	if (!swap_slot_cache_enabled || !swap_slot_cache_initialized)
++		return false;
++
++	pages = get_nr_swap_pages();
++	if (!swap_slot_cache_active) {
++		if (pages > num_online_cpus() *
++		    THRESHOLD_ACTIVATE_SWAP_SLOTS_CACHE)
++			reactivate_swap_slots_cache();
++		goto out;
++	}
++
++	/* if global pool of slot caches too low, deactivate cache */
++	if (pages < num_online_cpus() * THRESHOLD_DEACTIVATE_SWAP_SLOTS_CACHE)
++		deactivate_swap_slots_cache();
++out:
++	return swap_slot_cache_active;
++}
++
++static int alloc_swap_slot_cache(unsigned int cpu)
++{
++	struct swap_slots_cache *cache;
++	swp_entry_t *slots, *slots_ret;
++
++	/*
++	 * Do allocation outside swap_slots_cache_mutex
++	 * as vzalloc could trigger reclaim and get_swap_page,
++	 * which can lock swap_slots_cache_mutex.
++	 */
++	slots = vzalloc(sizeof(swp_entry_t) * SWAP_SLOTS_CACHE_SIZE);
++	if (!slots)
++		return -ENOMEM;
++
++	slots_ret = vzalloc(sizeof(swp_entry_t) * SWAP_SLOTS_CACHE_SIZE);
++	if (!slots_ret) {
++		vfree(slots);
++		return -ENOMEM;
++	}
++
++	mutex_lock(&swap_slots_cache_mutex);
++	cache = &per_cpu(swp_slots, cpu);
++	if (cache->slots || cache->slots_ret)
++		/* cache already allocated */
++		goto out;
++	if (!cache->lock_initialized) {
++		mutex_init(&cache->alloc_lock);
++		spin_lock_init(&cache->free_lock);
++		cache->lock_initialized = true;
++	}
++	cache->nr = 0;
++	cache->cur = 0;
++	cache->n_ret = 0;
++	cache->slots = slots;
++	slots = NULL;
++	cache->slots_ret = slots_ret;
++	slots_ret = NULL;
++out:
++	mutex_unlock(&swap_slots_cache_mutex);
++	if (slots)
++		vfree(slots);
++	if (slots_ret)
++		vfree(slots_ret);
++	return 0;
++}
++
++static void drain_slots_cache_cpu(unsigned int cpu, unsigned int type,
++				  bool free_slots)
++{
++	struct swap_slots_cache *cache;
++	swp_entry_t *slots = NULL;
++
++	cache = &per_cpu(swp_slots, cpu);
++	if ((type & SLOTS_CACHE) && cache->slots) {
++		mutex_lock(&cache->alloc_lock);
++		swapcache_free_entries(cache->slots + cache->cur, cache->nr);
++		cache->cur = 0;
++		cache->nr = 0;
++		if (free_slots && cache->slots) {
++			vfree(cache->slots);
++			cache->slots = NULL;
++		}
++		mutex_unlock(&cache->alloc_lock);
++	}
++	if ((type & SLOTS_CACHE_RET) && cache->slots_ret) {
++		spin_lock_irq(&cache->free_lock);
++		swapcache_free_entries(cache->slots_ret, cache->n_ret);
++		cache->n_ret = 0;
++		if (free_slots && cache->slots_ret) {
++			slots = cache->slots_ret;
++			cache->slots_ret = NULL;
++		}
++		spin_unlock_irq(&cache->free_lock);
++		if (slots)
++			vfree(slots);
++	}
++}
++
++static void __drain_swap_slots_cache(unsigned int type)
++{
++	unsigned int cpu;
++
++	/*
++	 * This function is called during
++	 *	1) swapoff, when we have to make sure no
++	 *	   left over slots are in cache when we remove
++	 *	   a swap device;
++	 *      2) disabling of swap slot cache, when we run low
++	 *	   on swap slots when allocating memory and need
++	 *	   to return swap slots to global pool.
++	 *
++	 * We cannot acquire cpu hot plug lock here as
++	 * this function can be invoked in the cpu
++	 * hot plug path:
++	 * cpu_up -> lock cpu_hotplug -> cpu hotplug state callback
++	 *   -> memory allocation -> direct reclaim -> get_swap_page
++	 *   -> drain_swap_slots_cache
++	 *
++	 * Hence the loop over current online cpu below could miss cpu that
++	 * is being brought online but not yet marked as online.
++	 * That is okay as we do not schedule and run anything on a
++	 * cpu before it has been marked online. Hence, we will not
++	 * fill any swap slots in slots cache of such cpu.
++	 * There are no slots on such cpu that need to be drained.
++	 */
++	for_each_online_cpu(cpu)
++		drain_slots_cache_cpu(cpu, type, false);
++}
++
++static int free_slot_cache(unsigned int cpu)
++{
++	mutex_lock(&swap_slots_cache_mutex);
++	drain_slots_cache_cpu(cpu, SLOTS_CACHE | SLOTS_CACHE_RET, true);
++	mutex_unlock(&swap_slots_cache_mutex);
++	return 0;
++}
++
++int enable_swap_slots_cache(void)
++{
++	int ret = 0;
++
++	mutex_lock(&swap_slots_cache_enable_mutex);
++	if (swap_slot_cache_initialized) {
++		__reenable_swap_slots_cache();
++		goto out_unlock;
++	}
++
++	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "swap_slots_cache",
++				alloc_swap_slot_cache, free_slot_cache);
++	if (ret < 0)
++		goto out_unlock;
++	swap_slot_cache_initialized = true;
++	__reenable_swap_slots_cache();
++out_unlock:
++	mutex_unlock(&swap_slots_cache_enable_mutex);
++	return 0;
++}
++
++/* called with swap slot cache's alloc lock held */
++static int refill_swap_slots_cache(struct swap_slots_cache *cache)
++{
++	if (!use_swap_slot_cache || cache->nr)
++		return 0;
++
++	cache->cur = 0;
++	if (swap_slot_cache_active)
++		cache->nr = get_swap_pages(SWAP_SLOTS_CACHE_SIZE, cache->slots);
++
++	return cache->nr;
++}
++
++int free_swap_slot(swp_entry_t entry)
++{
++	struct swap_slots_cache *cache;
++
++	BUG_ON(!swap_slot_cache_initialized);
++
++	cache = &get_cpu_var(swp_slots);
++	if (use_swap_slot_cache && cache->slots_ret) {
++		spin_lock_irq(&cache->free_lock);
++		/* Swap slots cache may be deactivated before acquiring lock */
++		if (!use_swap_slot_cache) {
++			spin_unlock_irq(&cache->free_lock);
++			goto direct_free;
++		}
++		if (cache->n_ret >= SWAP_SLOTS_CACHE_SIZE) {
++			/*
++			 * Return slots to global pool.
++			 * The current swap_map value is SWAP_HAS_CACHE.
++			 * Set it to 0 to indicate it is available for
++			 * allocation in global pool
++			 */
++			swapcache_free_entries(cache->slots_ret, cache->n_ret);
++			cache->n_ret = 0;
++		}
++		cache->slots_ret[cache->n_ret++] = entry;
++		spin_unlock_irq(&cache->free_lock);
++	} else {
++direct_free:
++		swapcache_free_entries(&entry, 1);
++	}
++	put_cpu_var(swp_slots);
++
++	return 0;
++}
++
++swp_entry_t get_swap_page(void)
++{
++	swp_entry_t entry, *pentry;
++	struct swap_slots_cache *cache;
++
++	/*
++	 * Preemption is allowed here, because we may sleep
++	 * in refill_swap_slots_cache().  But it is safe, because
++	 * accesses to the per-CPU data structure are protected by the
++	 * mutex cache->alloc_lock.
++	 *
++	 * The alloc path here does not touch cache->slots_ret
++	 * so cache->free_lock is not taken.
++	 */
++	cache = raw_cpu_ptr(&swp_slots);
++
++	entry.val = 0;
++	if (check_cache_active()) {
++		mutex_lock(&cache->alloc_lock);
++		if (cache->slots) {
++repeat:
++			if (cache->nr) {
++				pentry = &cache->slots[cache->cur++];
++				entry = *pentry;
++				pentry->val = 0;
++				cache->nr--;
++			} else {
++				if (refill_swap_slots_cache(cache))
++					goto repeat;
++			}
++		}
++		mutex_unlock(&cache->alloc_lock);
++		if (entry.val)
++			return entry;
++	}
++
++	get_swap_pages(1, &entry);
++
++	return entry;
++}
++
++#endif /* CONFIG_SWAP */
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/swapfile.c
