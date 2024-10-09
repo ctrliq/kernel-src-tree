@@ -184,7 +184,7 @@ struct hid_sensor_common {
 	struct work_struct work;
 };
 
-/*Convert from hid unit expo to regular exponent*/
+/* Convert from hid unit expo to regular exponent */
 static inline int hid_sensor_convert_exponent(int unit_expo)
 {
 	if (unit_expo < 0x08)
