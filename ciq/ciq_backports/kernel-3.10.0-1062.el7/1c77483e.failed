@@ -1,0 +1,565 @@
+IB: Improve uverbs_cleanup_ucontext algorithm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 1c77483e4c50339b0306572167ccbff6b55d051b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1c77483e.failed
+
+Improve uverbs_cleanup_ucontext algorithm to work properly when the
+topology graph of the objects cannot be determined at compile time.  This
+is the case with objects created via the devx interface in mlx5.
+
+Typically uverbs objects must be created in a strict topologically sorted
+order, so that LIFO ordering will generally cause them to be freed
+properly. There are only a few cases (eg memory windows) where objects can
+point to things out of the strict LIFO order.
+
+Instead of using an explicit ordering scheme where the HW destroy is not
+allowed to fail, go over the list multiple times and allow the destroy
+function to fail. If progress halts then a final, desperate, cleanup is
+done before leaking the memory. This indicates a driver bug.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 1c77483e4c50339b0306572167ccbff6b55d051b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_std_types_counters.c
+#	drivers/infiniband/core/uverbs_std_types_dm.c
+#	drivers/infiniband/core/uverbs_std_types_flow_action.c
+#	drivers/infiniband/core/uverbs_std_types_mr.c
+#	drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_counters.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_dm.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_flow_action.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+diff --git a/drivers/infiniband/core/rdma_core.c b/drivers/infiniband/core/rdma_core.c
+index 1cd838e607bd..fb326995bbf5 100644
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -354,9 +354,10 @@ static int __must_check remove_commit_idr_uobject(struct ib_uobject *uobj,
+ 
+ 	/*
+ 	 * We can only fail gracefully if the user requested to destroy the
+-	 * object. In the rest of the cases, just remove whatever you can.
++	 * object or when a retry may be called upon an error.
++	 * In the rest of the cases, just remove whatever you can.
+ 	 */
+-	if (why == RDMA_REMOVE_DESTROY && ret)
++	if (ib_is_destroy_retryable(ret, why, uobj))
+ 		return ret;
+ 
+ 	uverbs_idr_remove_uobj(uobj);
+@@ -385,7 +386,7 @@ static int __must_check remove_commit_fd_uobject(struct ib_uobject *uobj,
+ 		container_of(uobj, struct ib_uobject_file, uobj);
+ 	int ret = fd_type->context_closed(uobj_file, why);
+ 
+-	if (why == RDMA_REMOVE_DESTROY && ret)
++	if (ib_is_destroy_retryable(ret, why, uobj))
+ 		return ret;
+ 
+ 	if (why == RDMA_REMOVE_DURING_CLEANUP) {
+@@ -414,7 +415,7 @@ static int __must_check _rdma_remove_commit_uobject(struct ib_uobject *uobj,
+ 	struct ib_ucontext *ucontext = uobj->context;
+ 
+ 	ret = uobj->type->type_class->remove_commit(uobj, why);
+-	if (ret && why == RDMA_REMOVE_DESTROY) {
++	if (ib_is_destroy_retryable(ret, why, uobj)) {
+ 		/* We couldn't remove the object, so just unlock the uobject */
+ 		atomic_set(&uobj->usecnt, 0);
+ 		uobj->type->type_class->lookup_put(uobj, true);
+@@ -634,61 +635,77 @@ void uverbs_close_fd(struct file *f)
+ 	kref_put(uverbs_file_ref, ib_uverbs_release_file);
+ }
+ 
+-void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed)
++static int __uverbs_cleanup_ucontext(struct ib_ucontext *ucontext,
++				    enum rdma_remove_reason reason)
+ {
+-	enum rdma_remove_reason reason = device_removed ?
+-		RDMA_REMOVE_DRIVER_REMOVE : RDMA_REMOVE_CLOSE;
+-	unsigned int cur_order = 0;
++	struct ib_uobject *obj, *next_obj;
++	int ret = -EINVAL;
++	int err = 0;
+ 
++	/*
++	 * This shouldn't run while executing other commands on this
++	 * context. Thus, the only thing we should take care of is
++	 * releasing a FD while traversing this list. The FD could be
++	 * closed and released from the _release fop of this FD.
++	 * In order to mitigate this, we add a lock.
++	 * We take and release the lock per traversal in order to let
++	 * other threads (which might still use the FDs) chance to run.
++	 */
++	mutex_lock(&ucontext->uobjects_lock);
+ 	ucontext->cleanup_reason = reason;
++	list_for_each_entry_safe(obj, next_obj, &ucontext->uobjects, list) {
++		/*
++		 * if we hit this WARN_ON, that means we are
++		 * racing with a lookup_get.
++		 */
++		WARN_ON(uverbs_try_lock_object(obj, true));
++		err = obj->type->type_class->remove_commit(obj, reason);
++
++		if (ib_is_destroy_retryable(err, reason, obj)) {
++			pr_debug("ib_uverbs: failed to remove uobject id %d err %d\n",
++				 obj->id, err);
++			atomic_set(&obj->usecnt, 0);
++			continue;
++		}
++
++		if (err)
++			pr_err("ib_uverbs: unable to remove uobject id %d err %d\n",
++				obj->id, err);
++
++		list_del(&obj->list);
++		/* put the ref we took when we created the object */
++		uverbs_uobject_put(obj);
++		ret = 0;
++	}
++	mutex_unlock(&ucontext->uobjects_lock);
++	return ret;
++}
++
++void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed)
++{
++	enum rdma_remove_reason reason = device_removed ?
++					RDMA_REMOVE_DRIVER_REMOVE :
++					RDMA_REMOVE_CLOSE;
+ 	/*
+ 	 * Waits for all remove_commit and alloc_commit to finish. Logically, We
+ 	 * want to hold this forever as the context is going to be destroyed,
+ 	 * but we'll release it since it causes a "held lock freed" BUG message.
+ 	 */
+ 	down_write(&ucontext->cleanup_rwsem);
++	ucontext->cleanup_retryable = true;
++	while (!list_empty(&ucontext->uobjects))
++		if (__uverbs_cleanup_ucontext(ucontext, reason)) {
++			/*
++			 * No entry was cleaned-up successfully during this
++			 * iteration
++			 */
++			break;
++		}
+ 
+-	while (!list_empty(&ucontext->uobjects)) {
+-		struct ib_uobject *obj, *next_obj;
+-		unsigned int next_order = UINT_MAX;
++	ucontext->cleanup_retryable = false;
++	if (!list_empty(&ucontext->uobjects))
++		__uverbs_cleanup_ucontext(ucontext, reason);
+ 
+-		/*
+-		 * This shouldn't run while executing other commands on this
+-		 * context. Thus, the only thing we should take care of is
+-		 * releasing a FD while traversing this list. The FD could be
+-		 * closed and released from the _release fop of this FD.
+-		 * In order to mitigate this, we add a lock.
+-		 * We take and release the lock per order traversal in order
+-		 * to let other threads (which might still use the FDs) chance
+-		 * to run.
+-		 */
+-		mutex_lock(&ucontext->uobjects_lock);
+-		list_for_each_entry_safe(obj, next_obj, &ucontext->uobjects,
+-					 list) {
+-			if (obj->type->destroy_order == cur_order) {
+-				int ret;
+-
+-				/*
+-				 * if we hit this WARN_ON, that means we are
+-				 * racing with a lookup_get.
+-				 */
+-				WARN_ON(uverbs_try_lock_object(obj, true));
+-				ret = obj->type->type_class->remove_commit(obj,
+-									   reason);
+-				list_del(&obj->list);
+-				if (ret)
+-					pr_warn("ib_uverbs: failed to remove uobject id %d order %u\n",
+-						obj->id, cur_order);
+-				/* put the ref we took when we created the object */
+-				uverbs_uobject_put(obj);
+-			} else {
+-				next_order = min(next_order,
+-						 obj->type->destroy_order);
+-			}
+-		}
+-		mutex_unlock(&ucontext->uobjects_lock);
+-		cur_order = next_order;
+-	}
+ 	up_write(&ucontext->cleanup_rwsem);
+ }
+ 
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index cbf36c75d546..bed47a1f5f76 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -230,7 +230,7 @@ void ib_uverbs_wq_event_handler(struct ib_event *event, void *context_ptr);
+ void ib_uverbs_srq_event_handler(struct ib_event *event, void *context_ptr);
+ void ib_uverbs_event_handler(struct ib_event_handler *handler,
+ 			     struct ib_event *event);
+-int ib_uverbs_dealloc_xrcd(struct ib_uverbs_device *dev, struct ib_xrcd *xrcd,
++int ib_uverbs_dealloc_xrcd(struct ib_uobject *uobject, struct ib_xrcd *xrcd,
+ 			   enum rdma_remove_reason why);
+ 
+ int uverbs_dealloc_mw(struct ib_mw *mw);
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 51a95652bedd..068eb95e0720 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -110,6 +110,7 @@ ssize_t ib_uverbs_get_context(struct ib_uverbs_file *file,
+ 	ucontext->tgid = get_task_pid(current->group_leader, PIDTYPE_PID);
+ 	rcu_read_unlock();
+ 	ucontext->closing = 0;
++	ucontext->cleanup_retryable = false;
+ 
+ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ 	ucontext->umem_tree = RB_ROOT;
+@@ -602,12 +603,13 @@ ssize_t ib_uverbs_close_xrcd(struct ib_uverbs_file *file,
+ 	return ret ?: in_len;
+ }
+ 
+-int ib_uverbs_dealloc_xrcd(struct ib_uverbs_device *dev,
++int ib_uverbs_dealloc_xrcd(struct ib_uobject *uobject,
+ 			   struct ib_xrcd *xrcd,
+ 			   enum rdma_remove_reason why)
+ {
+ 	struct inode *inode;
+ 	int ret;
++	struct ib_uverbs_device *dev = uobject->context->ufile->device;
+ 
+ 	inode = xrcd->inode;
+ 	if (inode && !atomic_dec_and_test(&xrcd->usecnt))
+@@ -615,9 +617,12 @@ int ib_uverbs_dealloc_xrcd(struct ib_uverbs_device *dev,
+ 
+ 	ret = ib_dealloc_xrcd(xrcd);
+ 
+-	if (why == RDMA_REMOVE_DESTROY && ret)
++	if (ib_is_destroy_retryable(ret, why, uobject)) {
+ 		atomic_inc(&xrcd->usecnt);
+-	else if (inode)
++		return ret;
++	}
++
++	if (inode)
+ 		xrcd_table_delete(dev, inode);
+ 
+ 	return ret;
+diff --git a/drivers/infiniband/core/uverbs_std_types.c b/drivers/infiniband/core/uverbs_std_types.c
+index f83837ce24d4..472a2de018bf 100644
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@ -77,6 +77,13 @@ static int uverbs_free_qp(struct ib_uobject *uobject,
+ 		container_of(uobject, struct ib_uqp_object, uevent.uobject);
+ 	int ret;
+ 
++	/*
++	 * If this is a user triggered destroy then do not allow destruction
++	 * until the user cleans up all the mcast bindings. Unlike in other
++	 * places we forcibly clean up the mcast attachments for !DESTROY
++	 * because the mcast attaches are not ubojects and will not be
++	 * destroyed by anything else during cleanup processing.
++	 */
+ 	if (why == RDMA_REMOVE_DESTROY) {
+ 		if (!list_empty(&uqp->mcast_list))
+ 			return -EBUSY;
+@@ -85,7 +92,7 @@ static int uverbs_free_qp(struct ib_uobject *uobject,
+ 	}
+ 
+ 	ret = ib_destroy_qp(qp);
+-	if (ret && why == RDMA_REMOVE_DESTROY)
++	if (ib_is_destroy_retryable(ret, why, uobject))
+ 		return ret;
+ 
+ 	if (uqp->uxrcd)
+@@ -103,8 +110,10 @@ static int uverbs_free_rwq_ind_tbl(struct ib_uobject *uobject,
+ 	int ret;
+ 
+ 	ret = ib_destroy_rwq_ind_table(rwq_ind_tbl);
+-	if (!ret || why != RDMA_REMOVE_DESTROY)
+-		kfree(ind_tbl);
++	if (ib_is_destroy_retryable(ret, why, uobject))
++		return ret;
++
++	kfree(ind_tbl);
+ 	return ret;
+ }
+ 
+@@ -117,8 +126,10 @@ static int uverbs_free_wq(struct ib_uobject *uobject,
+ 	int ret;
+ 
+ 	ret = ib_destroy_wq(wq);
+-	if (!ret || why != RDMA_REMOVE_DESTROY)
+-		ib_uverbs_release_uevent(uobject->context->ufile, &uwq->uevent);
++	if (ib_is_destroy_retryable(ret, why, uobject))
++		return ret;
++
++	ib_uverbs_release_uevent(uobject->context->ufile, &uwq->uevent);
+ 	return ret;
+ }
+ 
+@@ -132,8 +143,7 @@ static int uverbs_free_srq(struct ib_uobject *uobject,
+ 	int ret;
+ 
+ 	ret = ib_destroy_srq(srq);
+-
+-	if (ret && why == RDMA_REMOVE_DESTROY)
++	if (ib_is_destroy_retryable(ret, why, uobject))
+ 		return ret;
+ 
+ 	if (srq_type == IB_SRQT_XRC) {
+@@ -161,12 +171,12 @@ static int uverbs_free_xrcd(struct ib_uobject *uobject,
+ 		container_of(uobject, struct ib_uxrcd_object, uobject);
+ 	int ret;
+ 
++	ret = ib_destroy_usecnt(&uxrcd->refcnt, why, uobject);
++	if (ret)
++		return ret;
++
+ 	mutex_lock(&uobject->context->ufile->device->xrcd_tree_mutex);
+-	if (why == RDMA_REMOVE_DESTROY && atomic_read(&uxrcd->refcnt))
+-		ret = -EBUSY;
+-	else
+-		ret = ib_uverbs_dealloc_xrcd(uobject->context->ufile->device,
+-					     xrcd, why);
++	ret = ib_uverbs_dealloc_xrcd(uobject, xrcd, why);
+ 	mutex_unlock(&uobject->context->ufile->device->xrcd_tree_mutex);
+ 
+ 	return ret;
+@@ -176,9 +186,11 @@ static int uverbs_free_pd(struct ib_uobject *uobject,
+ 			  enum rdma_remove_reason why)
+ {
+ 	struct ib_pd *pd = uobject->object;
++	int ret;
+ 
+-	if (why == RDMA_REMOVE_DESTROY && atomic_read(&pd->usecnt))
+-		return -EBUSY;
++	ret = ib_destroy_usecnt(&pd->usecnt, why, uobject);
++	if (ret)
++		return ret;
+ 
+ 	ib_dealloc_pd((struct ib_pd *)uobject->object);
+ 	return 0;
+@@ -248,48 +260,46 @@ void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata)
+ }
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_COMP_CHANNEL,
+-			    &UVERBS_TYPE_ALLOC_FD(0,
+-						  sizeof(struct ib_uverbs_completion_event_file),
++			    &UVERBS_TYPE_ALLOC_FD(sizeof(struct ib_uverbs_completion_event_file),
+ 						  uverbs_hot_unplug_completion_event_file,
+ 						  &uverbs_event_fops,
+ 						  "[infinibandevent]", O_RDONLY));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_QP,
+-			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), 0,
++			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object),
+ 						      uverbs_free_qp));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MW,
+-			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_mw));
++			    &UVERBS_TYPE_ALLOC_IDR(uverbs_free_mw));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MR,
+ 			    /* 1 is used in order to free the MR after all the MWs */
+ 			    &UVERBS_TYPE_ALLOC_IDR(1, uverbs_free_mr));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_SRQ,
+-			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object), 0,
++			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object),
+ 						      uverbs_free_srq));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_AH,
+-			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_ah));
++			    &UVERBS_TYPE_ALLOC_IDR(uverbs_free_ah));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_FLOW,
+ 			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+-						      0, uverbs_free_flow));
++						      uverbs_free_flow));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_WQ,
+-			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), 0,
++			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object),
+ 						      uverbs_free_wq));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL,
+-			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_rwq_ind_tbl));
++			    &UVERBS_TYPE_ALLOC_IDR(uverbs_free_rwq_ind_tbl));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_XRCD,
+-			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object), 0,
++			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object),
+ 						      uverbs_free_xrcd));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_PD,
+-			    /* 2 is used in order to free the PD after MRs */
+-			    &UVERBS_TYPE_ALLOC_IDR(2, uverbs_free_pd));
++			    &UVERBS_TYPE_ALLOC_IDR(uverbs_free_pd));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_DEVICE, NULL);
+ 
+* Unmerged path drivers/infiniband/core/uverbs_std_types_counters.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index b0dbae9dd0d7..4b59e60bcf7e 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -44,12 +44,16 @@ static int uverbs_free_cq(struct ib_uobject *uobject,
+ 	int ret;
+ 
+ 	ret = ib_destroy_cq(cq);
+-	if (!ret || why != RDMA_REMOVE_DESTROY)
+-		ib_uverbs_release_ucq(uobject->context->ufile, ev_queue ?
+-				      container_of(ev_queue,
+-						   struct ib_uverbs_completion_event_file,
+-						   ev_queue) : NULL,
+-				      ucq);
++	if (ib_is_destroy_retryable(ret, why, uobject))
++		return ret;
++
++	ib_uverbs_release_ucq(
++		uobject->context->ufile,
++		ev_queue ? container_of(ev_queue,
++					struct ib_uverbs_completion_event_file,
++					ev_queue) :
++			   NULL,
++		ucq);
+ 	return ret;
+ }
+ 
+@@ -200,7 +204,7 @@ static DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_CQ_DESTROY,
+ 			     UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_CQ,
+-			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_ucq_object), 0,
++			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_ucq_object),
+ 						      uverbs_free_cq),
+ #if IS_ENABLED(CONFIG_INFINIBAND_EXP_LEGACY_VERBS_NEW_UAPI)
+ 			    &UVERBS_METHOD(UVERBS_METHOD_CQ_CREATE),
+* Unmerged path drivers/infiniband/core/uverbs_std_types_dm.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_flow_action.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types_mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index d90947756c9b..f813987494e9 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1443,7 +1443,10 @@ struct ib_fmr_attr {
+ struct ib_umem;
+ 
+ enum rdma_remove_reason {
+-	/* Userspace requested uobject deletion. Call could fail */
++	/*
++	 * Userspace requested uobject deletion or initial try
++	 * to remove uobject via cleanup. Call could fail
++	 */
+ 	RDMA_REMOVE_DESTROY,
+ 	/* Context deletion. This call should delete the actual object itself */
+ 	RDMA_REMOVE_CLOSE,
+@@ -1464,6 +1467,7 @@ struct ib_ucontext {
+ 	/* protects cleanup process from other actions */
+ 	struct rw_semaphore	cleanup_rwsem;
+ 	enum rdma_remove_reason cleanup_reason;
++	bool cleanup_retryable;
+ 
+ 	struct pid             *tgid;
+ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+@@ -2577,6 +2581,46 @@ static inline bool ib_is_udata_cleared(struct ib_udata *udata,
+ 	return ib_is_buffer_cleared(udata->inbuf + offset, len);
+ }
+ 
++/**
++ * ib_is_destroy_retryable - Check whether the uobject destruction
++ * is retryable.
++ * @ret: The initial destruction return code
++ * @why: remove reason
++ * @uobj: The uobject that is destroyed
++ *
++ * This function is a helper function that IB layer and low-level drivers
++ * can use to consider whether the destruction of the given uobject is
++ * retry-able.
++ * It checks the original return code, if it wasn't success the destruction
++ * is retryable according to the ucontext state (i.e. cleanup_retryable) and
++ * the remove reason. (i.e. why).
++ * Must be called with the object locked for destroy.
++ */
++static inline bool ib_is_destroy_retryable(int ret, enum rdma_remove_reason why,
++					   struct ib_uobject *uobj)
++{
++	return ret && (why == RDMA_REMOVE_DESTROY ||
++		       uobj->context->cleanup_retryable);
++}
++
++/**
++ * ib_destroy_usecnt - Called during destruction to check the usecnt
++ * @usecnt: The usecnt atomic
++ * @why: remove reason
++ * @uobj: The uobject that is destroyed
++ *
++ * Non-zero usecnts will block destruction unless destruction was triggered by
++ * a ucontext cleanup.
++ */
++static inline int ib_destroy_usecnt(atomic_t *usecnt,
++				    enum rdma_remove_reason why,
++				    struct ib_uobject *uobj)
++{
++	if (atomic_read(usecnt) && ib_is_destroy_retryable(-EBUSY, why, uobj))
++		return -EBUSY;
++	return 0;
++}
++
+ /**
+  * ib_modify_qp_is_ok - Check that the supplied attribute mask
+  * contains all required attributes and no attributes not allowed for
+diff --git a/include/rdma/uverbs_types.h b/include/rdma/uverbs_types.h
+index cc04ec65588d..175495d1b0b8 100644
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -93,7 +93,6 @@ struct uverbs_obj_type_class {
+ struct uverbs_obj_type {
+ 	const struct uverbs_obj_type_class * const type_class;
+ 	size_t	     obj_size;
+-	unsigned int destroy_order;
+ };
+ 
+ /*
+@@ -152,10 +151,9 @@ extern const struct uverbs_obj_type_class uverbs_fd_class;
+ 
+ #define UVERBS_BUILD_BUG_ON(cond) (sizeof(char[1 - 2 * !!(cond)]) -	\
+ 				   sizeof(char))
+-#define UVERBS_TYPE_ALLOC_FD(_order, _obj_size, _context_closed, _fops, _name, _flags)\
++#define UVERBS_TYPE_ALLOC_FD(_obj_size, _context_closed, _fops, _name, _flags)\
+ 	((&((const struct uverbs_obj_fd_type)				\
+ 	 {.type = {							\
+-		.destroy_order = _order,				\
+ 		.type_class = &uverbs_fd_class,				\
+ 		.obj_size = (_obj_size) +				\
+ 			UVERBS_BUILD_BUG_ON((_obj_size) < sizeof(struct ib_uobject_file)), \
+@@ -164,18 +162,17 @@ extern const struct uverbs_obj_type_class uverbs_fd_class;
+ 	 .fops = _fops,							\
+ 	 .name = _name,							\
+ 	 .flags = _flags}))->type)
+-#define UVERBS_TYPE_ALLOC_IDR_SZ(_size, _order, _destroy_object)	\
++#define UVERBS_TYPE_ALLOC_IDR_SZ(_size, _destroy_object)	\
+ 	((&((const struct uverbs_obj_idr_type)				\
+ 	 {.type = {							\
+-		.destroy_order = _order,				\
+ 		.type_class = &uverbs_idr_class,			\
+ 		.obj_size = (_size) +					\
+ 			UVERBS_BUILD_BUG_ON((_size) <			\
+ 					    sizeof(struct ib_uobject))	\
+ 	 },								\
+ 	 .destroy_object = _destroy_object,}))->type)
+-#define UVERBS_TYPE_ALLOC_IDR(_order, _destroy_object)			\
+-	 UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uobject), _order,	\
++#define UVERBS_TYPE_ALLOC_IDR(_destroy_object)			\
++	 UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uobject),	\
+ 				  _destroy_object)
+ 
+ #endif
