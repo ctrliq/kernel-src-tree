@@ -1,0 +1,87 @@
+block: fix warning when I/O elevator is changed as request_queue is being removed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] fix warning when I/O elevator is changed as request_queue is being removed (Ming Lei) [1492441]
+Rebuild_FUZZ: 95.48%
+commit-author David Jeffery <djeffery@redhat.com>
+commit e9a823fb34a8b0fcba6e112aa1003258a1a5af50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e9a823fb.failed
+
+There is a race between changing I/O elevator and request_queue removal
+which can trigger the warning in kobject_add_internal.  A program can
+use sysfs to request a change of elevator at the same time another task
+is unregistering the request_queue the elevator would be attached to.
+The elevator's kobject will then attempt to be connected to the
+request_queue in the object tree when the request_queue has just been
+removed from sysfs.  This triggers the warning in kobject_add_internal
+as the request_queue no longer has a sysfs directory:
+
+kobject_add_internal failed for iosched (error: -2 parent: queue)
+------------[ cut here ]------------
+WARNING: CPU: 3 PID: 14075 at lib/kobject.c:244 kobject_add_internal+0x103/0x2d0
+
+To fix this warning, we can check the QUEUE_FLAG_REGISTERED flag when
+changing the elevator and use the request_queue's sysfs_lock to
+serialize between clearing the flag and the elevator testing the flag.
+
+	Signed-off-by: David Jeffery <djeffery@redhat.com>
+	Tested-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e9a823fb34a8b0fcba6e112aa1003258a1a5af50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+#	block/elevator.c
+diff --cc block/blk-sysfs.c
+index 28651fcb101c,b8362c0df51d..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -642,6 -931,13 +642,16 @@@ void blk_unregister_queue(struct gendis
+  	if (WARN_ON(!q))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&q->sysfs_lock);
++ 	queue_flag_clear_unlocked(QUEUE_FLAG_REGISTERED, q);
++ 	mutex_unlock(&q->sysfs_lock);
++ 
++ 	wbt_exit(q);
++ 
++ 
+++>>>>>>> e9a823fb34a8 (block: fix warning when I/O elevator is changed as request_queue is being removed)
+  	if (q->mq_ops)
+  		blk_mq_unregister_dev(disk_to_dev(disk), q);
+  
+diff --cc block/elevator.c
+index c585bf41be5d,153926a90901..000000000000
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@@ -958,8 -1055,15 +958,20 @@@ static int __elevator_change(struct req
+  	char elevator_name[ELV_NAME_MAX];
+  	struct elevator_type *e;
+  
+++<<<<<<< HEAD
+ +	if (!q->elevator)
+ +		return -ENXIO;
+++=======
++ 	/* Make sure queue is not in the middle of being removed */
++ 	if (!test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags))
++ 		return -ENOENT;
++ 
++ 	/*
++ 	 * Special case for mq, turn off scheduling
++ 	 */
++ 	if (q->mq_ops && !strncmp(name, "none", 4))
++ 		return elevator_switch(q, NULL);
+++>>>>>>> e9a823fb34a8 (block: fix warning when I/O elevator is changed as request_queue is being removed)
+  
+  	strlcpy(elevator_name, name, sizeof(elevator_name));
+  	e = elevator_get(strstrip(elevator_name), true);
+* Unmerged path block/blk-sysfs.c
+* Unmerged path block/elevator.c
