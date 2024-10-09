@@ -1,0 +1,282 @@
+tty: Convert termios_mutex to termios_rwsem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [tty] Convert termios_mutex to termios_rwsem (Aristeu Rozanski) [1684982]
+Rebuild_FUZZ: 93.83%
+commit-author Peter Hurley <peter@hurleysoftware.com>
+commit 6a1c0680cf3ba94356ecd58833e1540c93472a57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6a1c0680.failed
+
+termios is commonly accessed unsafely (especially by N_TTY)
+because the existing mutex forces exclusive access.
+Convert existing usage.
+
+	Signed-off-by: Peter Hurley <peter@hurleysoftware.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 6a1c0680cf3ba94356ecd58833e1540c93472a57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/tty_ioctl.c
+diff --cc drivers/tty/tty_ioctl.c
+index 8d59c3740c84,9ce20df8a2c8..000000000000
+--- a/drivers/tty/tty_ioctl.c
++++ b/drivers/tty/tty_ioctl.c
+@@@ -151,8 -151,8 +151,13 @@@ int tty_throttle_safe(struct tty_struc
+  {
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&tty->termios_mutex);
+ +	if (!tty_throttled(tty)) {
+++=======
++ 	down_write(&tty->termios_rwsem);
++ 	if (!test_bit(TTY_THROTTLED, &tty->flags)) {
+++>>>>>>> 6a1c0680cf3b (tty: Convert termios_mutex to termios_rwsem)
+  		if (tty->flow_change != TTY_THROTTLE_SAFE)
+  			ret = 1;
+  		else {
+@@@ -182,8 -182,8 +187,13 @@@ int tty_unthrottle_safe(struct tty_stru
+  {
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&tty->termios_mutex);
+ +	if (tty_throttled(tty)) {
+++=======
++ 	down_write(&tty->termios_rwsem);
++ 	if (test_bit(TTY_THROTTLED, &tty->flags)) {
+++>>>>>>> 6a1c0680cf3b (tty: Convert termios_mutex to termios_rwsem)
+  		if (tty->flow_change != TTY_UNTHROTTLE_SAFE)
+  			ret = 1;
+  		else {
+diff --git a/drivers/net/irda/irtty-sir.c b/drivers/net/irda/irtty-sir.c
+index a41267197839..177441afeb96 100644
+--- a/drivers/net/irda/irtty-sir.c
++++ b/drivers/net/irda/irtty-sir.c
+@@ -123,14 +123,14 @@ static int irtty_change_speed(struct sir_dev *dev, unsigned speed)
+ 
+ 	tty = priv->tty;
+ 
+-	mutex_lock(&tty->termios_mutex);
++	down_write(&tty->termios_rwsem);
+ 	old_termios = tty->termios;
+ 	cflag = tty->termios.c_cflag;
+ 	tty_encode_baud_rate(tty, speed, speed);
+ 	if (tty->ops->set_termios)
+ 		tty->ops->set_termios(tty, &old_termios);
+ 	priv->io.speed = speed;
+-	mutex_unlock(&tty->termios_mutex);
++	up_write(&tty->termios_rwsem);
+ 
+ 	return 0;
+ }
+@@ -280,7 +280,7 @@ static inline void irtty_stop_receiver(struct tty_struct *tty, int stop)
+ 	struct ktermios old_termios;
+ 	int cflag;
+ 
+-	mutex_lock(&tty->termios_mutex);
++	down_write(&tty->termios_rwsem);
+ 	old_termios = tty->termios;
+ 	cflag = tty->termios.c_cflag;
+ 	
+@@ -292,7 +292,7 @@ static inline void irtty_stop_receiver(struct tty_struct *tty, int stop)
+ 	tty->termios.c_cflag = cflag;
+ 	if (tty->ops->set_termios)
+ 		tty->ops->set_termios(tty, &old_termios);
+-	mutex_unlock(&tty->termios_mutex);
++	up_write(&tty->termios_rwsem);
+ }
+ 
+ /*****************************************************************/
+diff --git a/drivers/tty/n_tty.c b/drivers/tty/n_tty.c
+index 4181bb27f72e..55a072cd718d 100644
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -1518,7 +1518,7 @@ int is_ignored(int sig)
+  *	guaranteed that this function will not be re-entered or in progress
+  *	when the ldisc is closed.
+  *
+- *	Locking: Caller holds tty->termios_mutex
++ *	Locking: Caller holds tty->termios_rwsem
+  */
+ 
+ static void n_tty_set_termios(struct tty_struct *tty, struct ktermios *old)
+diff --git a/drivers/tty/pty.c b/drivers/tty/pty.c
+index c1d589274723..c19228545792 100644
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@ -285,7 +285,7 @@ static int pty_resize(struct tty_struct *tty,  struct winsize *ws)
+ 	struct tty_struct *pty = tty->link;
+ 
+ 	/* For a PTY we need to lock the tty side */
+-	mutex_lock(&tty->termios_mutex);
++	down_write(&tty->termios_rwsem);
+ 	if (!memcmp(ws, &tty->winsize, sizeof(*ws)))
+ 		goto done;
+ 
+@@ -312,7 +312,7 @@ static int pty_resize(struct tty_struct *tty,  struct winsize *ws)
+ 	tty->winsize = *ws;
+ 	pty->winsize = *ws;	/* Never used so will go away soon */
+ done:
+-	mutex_unlock(&tty->termios_mutex);
++	up_write(&tty->termios_rwsem);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index 32e05fcb7109..6478a124f33e 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -660,7 +660,7 @@ static int tty_signal_session_leader(struct tty_struct *tty, int exit_session)
+  *		  redirect lock for undoing redirection
+  *		  file list lock for manipulating list of ttys
+  *		  tty_ldiscs_lock from called functions
+- *		  termios_mutex resetting termios data
++ *		  termios_rwsem resetting termios data
+  *		  tasklist_lock to walk task list for hangup event
+  *		    ->siglock to protect ->signal/->sighand
+  */
+@@ -2259,7 +2259,7 @@ static int tiocsti(struct tty_struct *tty, char __user *p)
+  *
+  *	Copies the kernel idea of the window size into the user buffer.
+  *
+- *	Locking: tty->termios_mutex is taken to ensure the winsize data
++ *	Locking: tty->termios_rwsem is taken to ensure the winsize data
+  *		is consistent.
+  */
+ 
+@@ -2267,9 +2267,9 @@ static int tiocgwinsz(struct tty_struct *tty, struct winsize __user *arg)
+ {
+ 	int err;
+ 
+-	mutex_lock(&tty->termios_mutex);
++	down_read(&tty->termios_rwsem);
+ 	err = copy_to_user(arg, &tty->winsize, sizeof(*arg));
+-	mutex_unlock(&tty->termios_mutex);
++	up_read(&tty->termios_rwsem);
+ 
+ 	return err ? -EFAULT: 0;
+ }
+@@ -2290,7 +2290,7 @@ int tty_do_resize(struct tty_struct *tty, struct winsize *ws)
+ 	unsigned long flags;
+ 
+ 	/* Lock the tty */
+-	mutex_lock(&tty->termios_mutex);
++	down_write(&tty->termios_rwsem);
+ 	if (!memcmp(ws, &tty->winsize, sizeof(*ws)))
+ 		goto done;
+ 	/* Get the PID values and reference them so we can
+@@ -2305,7 +2305,7 @@ int tty_do_resize(struct tty_struct *tty, struct winsize *ws)
+ 
+ 	tty->winsize = *ws;
+ done:
+-	mutex_unlock(&tty->termios_mutex);
++	up_write(&tty->termios_rwsem);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(tty_do_resize);
+@@ -3048,7 +3048,7 @@ struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
+ 	tty->session = NULL;
+ 	tty->pgrp = NULL;
+ 	mutex_init(&tty->legacy_mutex);
+-	mutex_init(&tty->termios_mutex);
++	init_rwsem(&tty->termios_rwsem);
+ 	init_ldsem(&tty->ldisc_sem);
+ 	init_waitqueue_head(&tty->write_wait);
+ 	init_waitqueue_head(&tty->read_wait);
+* Unmerged path drivers/tty/tty_ioctl.c
+diff --git a/drivers/tty/tty_ldisc.c b/drivers/tty/tty_ldisc.c
+index fc5f2871598e..216ddeef4cf0 100644
+--- a/drivers/tty/tty_ldisc.c
++++ b/drivers/tty/tty_ldisc.c
+@@ -423,14 +423,14 @@ EXPORT_SYMBOL_GPL(tty_ldisc_flush);
+  *	they are not on hot paths so a little discipline won't do
+  *	any harm.
+  *
+- *	Locking: takes termios_mutex
++ *	Locking: takes termios_rwsem
+  */
+ 
+ static void tty_set_termios_ldisc(struct tty_struct *tty, int num)
+ {
+-	mutex_lock(&tty->termios_mutex);
++	down_write(&tty->termios_rwsem);
+ 	tty->termios.c_line = num;
+-	mutex_unlock(&tty->termios_mutex);
++	up_write(&tty->termios_rwsem);
+ }
+ 
+ /**
+@@ -609,11 +609,11 @@ int tty_set_ldisc(struct tty_struct *tty, int ldisc)
+ 
+ static void tty_reset_termios(struct tty_struct *tty)
+ {
+-	mutex_lock(&tty->termios_mutex);
++	down_write(&tty->termios_rwsem);
+ 	tty->termios = tty->driver->init_termios;
+ 	tty->termios.c_ispeed = tty_termios_input_baud_rate(&tty->termios);
+ 	tty->termios.c_ospeed = tty_termios_baud_rate(&tty->termios);
+-	mutex_unlock(&tty->termios_mutex);
++	up_write(&tty->termios_rwsem);
+ }
+ 
+ 
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index b4a38fcce32f..81f4510ae1c0 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -840,7 +840,7 @@ static inline int resize_screen(struct vc_data *vc, int width, int height,
+  *	If the caller passes a tty structure then update the termios winsize
+  *	information and perform any necessary signal handling.
+  *
+- *	Caller must hold the console semaphore. Takes the termios mutex and
++ *	Caller must hold the console semaphore. Takes the termios rwsem and
+  *	ctrl_lock of the tty IFF a tty is passed.
+  */
+ 
+@@ -984,7 +984,7 @@ int vc_resize(struct vc_data *vc, unsigned int cols, unsigned int rows)
+  *	the actual work.
+  *
+  *	Takes the console sem and the called methods then take the tty
+- *	termios_mutex and the tty ctrl_lock in that order.
++ *	termios_rwsem and the tty ctrl_lock in that order.
+  */
+ static int vt_resize(struct tty_struct *tty, struct winsize *ws)
+ {
+diff --git a/include/linux/tty.h b/include/linux/tty.h
+index 6870cd277e73..6bf2dd13b7eb 100644
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -10,6 +10,7 @@
+ #include <linux/mutex.h>
+ #include <linux/tty_flags.h>
+ #include <uapi/linux/tty.h>
++#include <linux/rwsem.h>
+ 
+ 
+ 
+@@ -244,9 +245,9 @@ struct tty_struct {
+ 
+ 	struct mutex atomic_write_lock;
+ 	struct mutex legacy_mutex;
+-	struct mutex termios_mutex;
++	struct rw_semaphore termios_rwsem;
+ 	spinlock_t ctrl_lock;
+-	/* Termios values are protected by the termios mutex */
++	/* Termios values are protected by the termios rwsem */
+ 	struct ktermios termios, termios_locked;
+ 	struct termiox *termiox;	/* May be NULL for unsupported */
+ 	char name[64];
+@@ -254,7 +255,7 @@ struct tty_struct {
+ 	struct pid *session;
+ 	unsigned long flags;
+ 	int count;
+-	struct winsize winsize;		/* termios mutex */
++	struct winsize winsize;		/* termios rwsem */
+ 	unsigned char stopped:1, hw_stopped:1, flow_stopped:1, packet:1;
+ 	unsigned char ctrl_status;	/* ctrl_lock */
+ 	unsigned int receive_room;	/* Bytes free for queue */
