@@ -1,0 +1,117 @@
+KVM: hyperv: support HV_X64_MSR_TSC_FREQUENCY and HV_X64_MSR_APIC_FREQUENCY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ladi Prosek <lprosek@redhat.com>
+commit 72c139bacfa386145d7bbb68c47c8824716153b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/72c139ba.failed
+
+It has been experimentally confirmed that supporting these two MSRs is one
+of the necessary conditions for nested Hyper-V to use the TSC page. Modern
+Windows guests are noticeably slower when they fall back to reading
+timestamps from the HV_X64_MSR_TIME_REF_COUNT MSR instead of using the TSC
+page.
+
+The newly supported MSRs are advertised with the AccessFrequencyRegs
+partition privilege flag and CPUID.40000003H:EDX[8] "Support for
+determining timer frequencies is available" (both outside of the scope of
+this KVM patch).
+
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Ladi Prosek <lprosek@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 72c139bacfa386145d7bbb68c47c8824716153b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/hyperv.c
+diff --cc arch/x86/kvm/hyperv.c
+index 5041730c0dbf,bf9992300efa..000000000000
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@@ -287,6 -1132,40 +287,43 @@@ static int kvm_hv_get_msr(struct kvm_vc
+  	case HV_X64_MSR_APIC_ASSIST_PAGE:
+  		data = hv->hv_vapic;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case HV_X64_MSR_VP_RUNTIME:
++ 		data = current_task_runtime_100ns() + hv->runtime_offset;
++ 		break;
++ 	case HV_X64_MSR_SCONTROL:
++ 	case HV_X64_MSR_SVERSION:
++ 	case HV_X64_MSR_SIEFP:
++ 	case HV_X64_MSR_SIMP:
++ 	case HV_X64_MSR_EOM:
++ 	case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++ 		return synic_get_msr(vcpu_to_synic(vcpu), msr, pdata);
++ 	case HV_X64_MSR_STIMER0_CONFIG:
++ 	case HV_X64_MSR_STIMER1_CONFIG:
++ 	case HV_X64_MSR_STIMER2_CONFIG:
++ 	case HV_X64_MSR_STIMER3_CONFIG: {
++ 		int timer_index = (msr - HV_X64_MSR_STIMER0_CONFIG)/2;
++ 
++ 		return stimer_get_config(vcpu_to_stimer(vcpu, timer_index),
++ 					 pdata);
++ 	}
++ 	case HV_X64_MSR_STIMER0_COUNT:
++ 	case HV_X64_MSR_STIMER1_COUNT:
++ 	case HV_X64_MSR_STIMER2_COUNT:
++ 	case HV_X64_MSR_STIMER3_COUNT: {
++ 		int timer_index = (msr - HV_X64_MSR_STIMER0_COUNT)/2;
++ 
++ 		return stimer_get_count(vcpu_to_stimer(vcpu, timer_index),
++ 					pdata);
++ 	}
++ 	case HV_X64_MSR_TSC_FREQUENCY:
++ 		data = (u64)vcpu->arch.virtual_tsc_khz * 1000;
++ 		break;
++ 	case HV_X64_MSR_APIC_FREQUENCY:
++ 		data = APIC_BUS_FREQUENCY;
++ 		break;
+++>>>>>>> 72c139bacfa3 (KVM: hyperv: support HV_X64_MSR_TSC_FREQUENCY and HV_X64_MSR_APIC_FREQUENCY)
+  	default:
+  		vcpu_unimpl(vcpu, "Hyper-V unhandled rdmsr: 0x%x\n", msr);
+  		return 1;
+* Unmerged path arch/x86/kvm/hyperv.c
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1e74c743d62f..3ea4f0e08759 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -53,8 +53,6 @@
+ #define PRIu64 "u"
+ #define PRIo64 "o"
+ 
+-#define APIC_BUS_CYCLE_NS 1
+-
+ /* #define apic_debug(fmt,arg...) printk(KERN_WARNING fmt,##arg) */
+ #define apic_debug(fmt, arg...)
+ 
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index a08ef06557c6..8abd88e4d3be 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -12,6 +12,9 @@
+ #define KVM_APIC_SHORT_MASK	0xc0000
+ #define KVM_APIC_DEST_MASK	0x800
+ 
++#define APIC_BUS_CYCLE_NS       1
++#define APIC_BUS_FREQUENCY      (1000000000ULL / APIC_BUS_CYCLE_NS)
++
+ struct kvm_timer {
+ 	struct hrtimer timer;
+ 	s64 period; 				/* unit: ns */
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b7e57596f87c..1b74639af375 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -977,6 +977,7 @@ static u32 emulated_msrs[] = {
+ 	MSR_KVM_SYSTEM_TIME_NEW, MSR_KVM_WALL_CLOCK_NEW,
+ 	HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL,
+ 	HV_X64_MSR_TIME_REF_COUNT, HV_X64_MSR_REFERENCE_TSC,
++	HV_X64_MSR_TSC_FREQUENCY, HV_X64_MSR_APIC_FREQUENCY,
+ 	HV_X64_MSR_CRASH_P0, HV_X64_MSR_CRASH_P1, HV_X64_MSR_CRASH_P2,
+ 	HV_X64_MSR_CRASH_P3, HV_X64_MSR_CRASH_P4, HV_X64_MSR_CRASH_CTL,
+ 	HV_X64_MSR_RESET,
