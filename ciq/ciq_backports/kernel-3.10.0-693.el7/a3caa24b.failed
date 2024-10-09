@@ -1,0 +1,189 @@
+ext4: only set S_DAX if DAX is really supported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit a3caa24b703794507bf2e0a68bdc800b90f5e70b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a3caa24b.failed
+
+Currently we have S_DAX set inode->i_flags for a regular file whenever
+ext4 is mounted with dax mount option. However in some cases we cannot
+really do DAX - e.g. when inode is marked to use data journalling, when
+inode data is being encrypted, or when inode is stored inline. Make sure
+S_DAX flag is appropriately set/cleared in these cases.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit a3caa24b703794507bf2e0a68bdc800b90f5e70b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/super.c
+diff --cc fs/ext4/super.c
+index 8a6f058f1768,cbfaee175fa5..000000000000
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@@ -1050,9 -1093,99 +1050,102 @@@ static int bdev_try_to_free_page(struc
+  	return try_to_free_buffers(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_EXT4_FS_ENCRYPTION
++ static int ext4_get_context(struct inode *inode, void *ctx, size_t len)
++ {
++ 	return ext4_xattr_get(inode, EXT4_XATTR_INDEX_ENCRYPTION,
++ 				 EXT4_XATTR_NAME_ENCRYPTION_CONTEXT, ctx, len);
++ }
++ 
++ static int ext4_key_prefix(struct inode *inode, u8 **key)
++ {
++ 	*key = EXT4_SB(inode->i_sb)->key_prefix;
++ 	return EXT4_SB(inode->i_sb)->key_prefix_size;
++ }
++ 
++ static int ext4_prepare_context(struct inode *inode)
++ {
++ 	return ext4_convert_inline_data(inode);
++ }
++ 
++ static int ext4_set_context(struct inode *inode, const void *ctx, size_t len,
++ 							void *fs_data)
++ {
++ 	handle_t *handle;
++ 	int res, res2;
++ 
++ 	/* fs_data is null when internally used. */
++ 	if (fs_data) {
++ 		res  = ext4_xattr_set(inode, EXT4_XATTR_INDEX_ENCRYPTION,
++ 				EXT4_XATTR_NAME_ENCRYPTION_CONTEXT, ctx,
++ 				len, 0);
++ 		if (!res) {
++ 			ext4_set_inode_flag(inode, EXT4_INODE_ENCRYPT);
++ 			ext4_clear_inode_state(inode,
++ 					EXT4_STATE_MAY_INLINE_DATA);
++ 			/*
++ 			 * Update inode->i_flags - e.g. S_DAX may get disabled
++ 			 */
++ 			ext4_set_inode_flags(inode);
++ 		}
++ 		return res;
++ 	}
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_MISC,
++ 			ext4_jbd2_credits_xattr(inode));
++ 	if (IS_ERR(handle))
++ 		return PTR_ERR(handle);
++ 
++ 	res = ext4_xattr_set(inode, EXT4_XATTR_INDEX_ENCRYPTION,
++ 			EXT4_XATTR_NAME_ENCRYPTION_CONTEXT, ctx,
++ 			len, 0);
++ 	if (!res) {
++ 		ext4_set_inode_flag(inode, EXT4_INODE_ENCRYPT);
++ 		/* Update inode->i_flags - e.g. S_DAX may get disabled */
++ 		ext4_set_inode_flags(inode);
++ 		res = ext4_mark_inode_dirty(handle, inode);
++ 		if (res)
++ 			EXT4_ERROR_INODE(inode, "Failed to mark inode dirty");
++ 	}
++ 	res2 = ext4_journal_stop(handle);
++ 	if (!res)
++ 		res = res2;
++ 	return res;
++ }
++ 
++ static int ext4_dummy_context(struct inode *inode)
++ {
++ 	return DUMMY_ENCRYPTION_ENABLED(EXT4_SB(inode->i_sb));
++ }
++ 
++ static unsigned ext4_max_namelen(struct inode *inode)
++ {
++ 	return S_ISLNK(inode->i_mode) ? inode->i_sb->s_blocksize :
++ 		EXT4_NAME_LEN;
++ }
++ 
++ static struct fscrypt_operations ext4_cryptops = {
++ 	.get_context		= ext4_get_context,
++ 	.key_prefix		= ext4_key_prefix,
++ 	.prepare_context	= ext4_prepare_context,
++ 	.set_context		= ext4_set_context,
++ 	.dummy_context		= ext4_dummy_context,
++ 	.is_encrypted		= ext4_encrypted_inode,
++ 	.empty_dir		= ext4_empty_dir,
++ 	.max_namelen		= ext4_max_namelen,
++ };
++ #else
++ static struct fscrypt_operations ext4_cryptops = {
++ 	.is_encrypted		= ext4_encrypted_inode,
++ };
++ #endif
++ 
+++>>>>>>> a3caa24b7037 (ext4: only set S_DAX if DAX is really supported)
+  #ifdef CONFIG_QUOTA
+ -static char *quotatypes[] = INITQFNAMES;
+ -#define QTYPE2NAME(t) (quotatypes[t])
+ +#define QTYPE2NAME(t) ((t) == USRQUOTA ? "user" : "group")
+ +#define QTYPE2MOPT(on, t) ((t) == USRQUOTA?((on)##USRJQUOTA):((on)##GRPJQUOTA))
+  
+  static int ext4_write_dquot(struct dquot *dquot);
+  static int ext4_acquire_dquot(struct dquot *dquot);
+diff --git a/fs/ext4/inline.c b/fs/ext4/inline.c
+index 49abc3721ea1..5d3f12bf4647 100644
+--- a/fs/ext4/inline.c
++++ b/fs/ext4/inline.c
+@@ -297,6 +297,11 @@ static int ext4_create_inline_data(handle_t *handle,
+ 	EXT4_I(inode)->i_inline_size = len + EXT4_MIN_INLINE_DATA_SIZE;
+ 	ext4_clear_inode_flag(inode, EXT4_INODE_EXTENTS);
+ 	ext4_set_inode_flag(inode, EXT4_INODE_INLINE_DATA);
++	/*
++	 * Propagate changes to inode->i_flags as well - e.g. S_DAX may
++	 * get cleared
++	 */
++	ext4_set_inode_flags(inode);
+ 	get_bh(is.iloc.bh);
+ 	error = ext4_mark_iloc_dirty(handle, inode, &is.iloc);
+ 
+@@ -443,6 +448,11 @@ static int ext4_destroy_inline_data_nolock(handle_t *handle,
+ 		}
+ 	}
+ 	ext4_clear_inode_flag(inode, EXT4_INODE_INLINE_DATA);
++	/*
++	 * Propagate changes to inode->i_flags as well - e.g. S_DAX may
++	 * get set.
++	 */
++	ext4_set_inode_flags(inode);
+ 
+ 	get_bh(is.iloc.bh);
+ 	error = ext4_mark_iloc_dirty(handle, inode, &is.iloc);
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 00b16b2cf044..3fa1aeefd310 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4066,7 +4066,9 @@ void ext4_set_inode_flags(struct inode *inode)
+ 		new_fl |= S_NOATIME;
+ 	if (flags & EXT4_DIRSYNC_FL)
+ 		new_fl |= S_DIRSYNC;
+-	if (test_opt(inode->i_sb, DAX) && S_ISREG(inode->i_mode))
++	if (test_opt(inode->i_sb, DAX) && S_ISREG(inode->i_mode) &&
++	    !ext4_should_journal_data(inode) && !ext4_has_inline_data(inode) &&
++	    !ext4_encrypted_inode(inode))
+ 		new_fl |= S_DAX;
+ 	inode_set_flags(inode, new_fl,
+ 			S_SYNC|S_APPEND|S_IMMUTABLE|S_NOATIME|S_DIRSYNC|S_DAX);
+@@ -5225,6 +5227,11 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
+ 		ext4_clear_inode_flag(inode, EXT4_INODE_JOURNAL_DATA);
+ 	}
+ 	ext4_set_aops(inode);
++	/*
++	 * Update inode->i_flags after EXT4_INODE_JOURNAL_DATA was updated.
++	 * E.g. S_DAX may get cleared / set.
++	 */
++	ext4_set_inode_flags(inode);
+ 
+ 	jbd2_journal_unlock_updates(journal);
+ 	ext4_inode_resume_unlocked_dio(inode);
+* Unmerged path fs/ext4/super.c
