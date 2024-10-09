@@ -1,0 +1,88 @@
+target: fix SAM_STAT_BUSY/TASK_SET_FULL handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] fix SAM_STAT_BUSY/TASK_SET_FULL handling (Mike Christie) [1480052]
+Rebuild_FUZZ: 90.91%
+commit-author Mike Christie <mchristi@redhat.com>
+commit 402242c904432207515e3ccb4126ff0dcfba89ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/402242c9.failed
+
+If the scsi status was not SAM_STAT_GOOD or there was no transport
+sense, we would ignore the scsi status and do a generic not ready
+LUN communication failure check condition failure.
+
+The problem is that LUN COMM failure is treated as a hard error
+sometimes and will cause apps to get IO errors instead of the OS's SCSI
+layer retrying. For example, the tcmu daemon will return SAM_STAT_QUEUE_FULL
+when memory runs low and can still make progress but wants the initiator to
+reduce the work load. Windows will fail this error directly the app
+instead of retrying.
+
+This patch is based on Nick's "target/iblock: Use -EAGAIN/-ENOMEM to
+propigate SAM BUSY/TASK_SET_FULL" patch here:
+
+http://comments.gmane.org/gmane.linux.scsi.target.devel/11301
+
+but instead of only setting SAM_STAT_GOOD, SAM_STAT_TASK_SET_FULL
+and SAM_STAT_BUSY as success, it sets all non check condition status
+as success so they are passed back to the initiator, so passthrough
+type backends can return all SCSI status codes. Since only passthrough
+uses this, I was not sure if we wanted to add checks for non-passthrough
+and specific codes.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 402242c904432207515e3ccb4126ff0dcfba89ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_transport.c
+diff --cc drivers/target/target_core_transport.c
+index 78073636da73,8735243edf04..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -681,27 -730,19 +681,39 @@@ void target_complete_cmd(struct se_cmd 
+  
+  	cmd->scsi_status = scsi_status;
+  
+- 
+  	spin_lock_irqsave(&cmd->t_state_lock, flags);
+++<<<<<<< HEAD
+ +	cmd->transport_state &= ~CMD_T_BUSY;
+ +
+ +	if (dev && dev->transport->transport_complete) {
+ +		dev->transport->transport_complete(cmd,
+ +				cmd->t_data_sg,
+ +				transport_get_sense_buffer(cmd));
+ +	}
+ +	if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
+++=======
++ 	switch (cmd->scsi_status) {
++ 	case SAM_STAT_CHECK_CONDITION:
++ 		if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
++ 			success = 1;
++ 		else
++ 			success = 0;
++ 		break;
++ 	default:
+++>>>>>>> 402242c90443 (target: fix SAM_STAT_BUSY/TASK_SET_FULL handling)
+  		success = 1;
++ 		break;
++ 	}
+  
+ +	/*
+ +	 * See if we are waiting to complete for an exception condition.
+ +	 */
+ +	if (cmd->transport_state & CMD_T_REQUEST_STOP) {
+ +		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +		complete(&cmd->task_stop_comp);
+ +		return;
+ +	}
+ +
+  	/*
+  	 * Check for case where an explicit ABORT_TASK has been received
+  	 * and transport_wait_for_tasks() will be waiting for completion..
+* Unmerged path drivers/target/target_core_transport.c
