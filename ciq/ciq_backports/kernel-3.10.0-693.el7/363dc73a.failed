@@ -1,0 +1,157 @@
+udp: be less conservative with sock rmem accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 363dc73acacbbcdae98acf5612303e9770e04b1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/363dc73a.failed
+
+Before commit 850cbaddb52d ("udp: use it's own memory accounting
+schema"), the udp protocol allowed sk_rmem_alloc to grow beyond
+the rcvbuf by the whole current packet's truesize. After said commit
+we allow sk_rmem_alloc to exceed the rcvbuf only if the receive queue
+is empty. As reported by Jesper this cause a performance regression
+for some (small) values of rcvbuf.
+
+This commit is intended to fix the regression restoring the old
+handling of the rcvbuf limit.
+
+	Reported-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Fixes: 850cbaddb52d ("udp: use it's own memory accounting schema")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 363dc73acacbbcdae98acf5612303e9770e04b1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+diff --cc net/ipv4/udp.c
+index a02b20ab0f64,16d88ba9ff1c..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1153,6 -1174,119 +1153,122 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* fully reclaim rmem/fwd memory allocated for skb */
++ static void udp_rmem_release(struct sock *sk, int size, int partial)
++ {
++ 	int amt;
++ 
++ 	atomic_sub(size, &sk->sk_rmem_alloc);
++ 	sk->sk_forward_alloc += size;
++ 	amt = (sk->sk_forward_alloc - partial) & ~(SK_MEM_QUANTUM - 1);
++ 	sk->sk_forward_alloc -= amt;
++ 
++ 	if (amt)
++ 		__sk_mem_reduce_allocated(sk, amt >> SK_MEM_QUANTUM_SHIFT);
++ }
++ 
++ /* Note: called with sk_receive_queue.lock held */
++ void udp_skb_destructor(struct sock *sk, struct sk_buff *skb)
++ {
++ 	udp_rmem_release(sk, skb->truesize, 1);
++ }
++ EXPORT_SYMBOL(udp_skb_destructor);
++ 
++ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct sk_buff_head *list = &sk->sk_receive_queue;
++ 	int rmem, delta, amt, err = -ENOMEM;
++ 	int size = skb->truesize;
++ 
++ 	/* try to avoid the costly atomic add/sub pair when the receive
++ 	 * queue is full; always allow at least a packet
++ 	 */
++ 	rmem = atomic_read(&sk->sk_rmem_alloc);
++ 	if (rmem > sk->sk_rcvbuf)
++ 		goto drop;
++ 
++ 	/* we drop only if the receive buf is full and the receive
++ 	 * queue contains some other skb
++ 	 */
++ 	rmem = atomic_add_return(size, &sk->sk_rmem_alloc);
++ 	if (rmem > (size + sk->sk_rcvbuf))
++ 		goto uncharge_drop;
++ 
++ 	spin_lock(&list->lock);
++ 	if (size >= sk->sk_forward_alloc) {
++ 		amt = sk_mem_pages(size);
++ 		delta = amt << SK_MEM_QUANTUM_SHIFT;
++ 		if (!__sk_mem_raise_allocated(sk, delta, amt, SK_MEM_RECV)) {
++ 			err = -ENOBUFS;
++ 			spin_unlock(&list->lock);
++ 			goto uncharge_drop;
++ 		}
++ 
++ 		sk->sk_forward_alloc += delta;
++ 	}
++ 
++ 	sk->sk_forward_alloc -= size;
++ 
++ 	/* no need to setup a destructor, we will explicitly release the
++ 	 * forward allocated memory on dequeue
++ 	 */
++ 	skb->dev = NULL;
++ 	sock_skb_set_dropcount(sk, skb);
++ 
++ 	__skb_queue_tail(list, skb);
++ 	spin_unlock(&list->lock);
++ 
++ 	if (!sock_flag(sk, SOCK_DEAD))
++ 		sk->sk_data_ready(sk);
++ 
++ 	return 0;
++ 
++ uncharge_drop:
++ 	atomic_sub(skb->truesize, &sk->sk_rmem_alloc);
++ 
++ drop:
++ 	atomic_inc(&sk->sk_drops);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(__udp_enqueue_schedule_skb);
++ 
++ void udp_destruct_sock(struct sock *sk)
++ {
++ 	/* reclaim completely the forward allocated memory */
++ 	unsigned int total = 0;
++ 	struct sk_buff *skb;
++ 
++ 	while ((skb = __skb_dequeue(&sk->sk_receive_queue)) != NULL) {
++ 		total += skb->truesize;
++ 		kfree_skb(skb);
++ 	}
++ 	udp_rmem_release(sk, total, 0);
++ 
++ 	inet_sock_destruct(sk);
++ }
++ EXPORT_SYMBOL_GPL(udp_destruct_sock);
++ 
++ int udp_init_sock(struct sock *sk)
++ {
++ 	sk->sk_destruct = udp_destruct_sock;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(udp_init_sock);
++ 
++ void skb_consume_udp(struct sock *sk, struct sk_buff *skb, int len)
++ {
++ 	if (unlikely(READ_ONCE(sk->sk_peek_off) >= 0)) {
++ 		bool slow = lock_sock_fast(sk);
++ 
++ 		sk_peek_offset_bwd(sk, len);
++ 		unlock_sock_fast(sk, slow);
++ 	}
++ 	consume_skb(skb);
++ }
++ EXPORT_SYMBOL_GPL(skb_consume_udp);
+++>>>>>>> 363dc73acacb (udp: be less conservative with sock rmem accounting)
+  
+  /**
+   *	first_packet_length	- return length of first packet in receive queue
+* Unmerged path net/ipv4/udp.c
