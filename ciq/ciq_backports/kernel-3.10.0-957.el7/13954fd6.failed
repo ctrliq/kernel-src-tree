@@ -1,0 +1,134 @@
+s390/pci_dma: improve lazy flush for unmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] pci_dma: improve lazy flush for unmap (Hendrik Brueckner) [1539025]
+Rebuild_FUZZ: 93.67%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 13954fd6913acff8f8b8c21612074b57051ba457
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/13954fd6.failed
+
+Lazy unmap (defer tlb flush after unmap until dma address reuse) can
+greatly reduce the number of RPCIT instructions in the best case. In
+reality we are often far away from the best case scenario because our
+implementation suffers from the following problem:
+
+To create dma addresses we maintain an iommu bitmap and a pointer into
+that bitmap to mark the start of the next search. That pointer moves from
+the start to the end of that bitmap and we issue a global tlb flush
+once that pointer wraps around. To prevent address reuse before we issue
+the tlb flush we even have to move the next pointer during unmaps - when
+clearing a bit > next. This could lead to a situation where we only use
+the rear part of that bitmap and issue more tlb flushes than expected.
+
+To fix this we no longer clear bits during unmap but maintain a 2nd
+bitmap which we use to mark addresses that can't be reused until we issue
+the global tlb flush after wrap around.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 13954fd6913acff8f8b8c21612074b57051ba457)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_dma.c
+diff --cc arch/s390/pci/pci_dma.c
+index 0a25a0fb6217,7350c8bc13a2..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -241,25 -257,36 +241,48 @@@ static unsigned long dma_alloc_iommu(st
+  	spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
+  	offset = __dma_alloc_iommu(dev, zdev->next_bit, size);
+  	if (offset == -1) {
++ 		if (!zdev->tlb_refresh && !s390_iommu_strict) {
++ 			/* global flush before DMA addresses are reused */
++ 			if (zpci_refresh_global(zdev))
++ 				goto out_error;
++ 
++ 			bitmap_andnot(zdev->iommu_bitmap, zdev->iommu_bitmap,
++ 				      zdev->lazy_bitmap, zdev->iommu_pages);
++ 			bitmap_zero(zdev->lazy_bitmap, zdev->iommu_pages);
++ 		}
+  		/* wrap-around */
+  		offset = __dma_alloc_iommu(dev, 0, size);
+++<<<<<<< HEAD
+ +		wrap = 1;
+ +	}
+ +
+ +	if (offset != -1) {
+ +		zdev->next_bit = offset + size;
+ +		if (!zdev->tlb_refresh && !s390_iommu_strict && wrap)
+ +			/* global flush after wrap-around with lazy unmap */
+ +			zpci_refresh_global(zdev);
+++=======
++ 		if (offset == -1)
++ 			goto out_error;
+++>>>>>>> 13954fd6913a (s390/pci_dma: improve lazy flush for unmap)
+  	}
+ -	zdev->next_bit = offset + size;
+  	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
+++<<<<<<< HEAD
+ +	return offset;
+++=======
++ 
++ 	return zdev->start_dma + offset * PAGE_SIZE;
++ 
++ out_error:
++ 	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
++ 	return DMA_ERROR_CODE;
+++>>>>>>> 13954fd6913a (s390/pci_dma: improve lazy flush for unmap)
+  }
+  
+ -static void dma_free_address(struct device *dev, dma_addr_t dma_addr, int size)
+ +static void dma_free_iommu(struct device *dev, unsigned long offset, int size)
+  {
+ -	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
+ -	unsigned long flags, offset;
+ -
+ -	offset = (dma_addr - zdev->start_dma) >> PAGE_SHIFT;
+ +	struct zpci_dev *zdev = get_zdev(to_pci_dev(dev));
+ +	unsigned long flags;
+  
+  	spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
+  	if (!zdev->iommu_bitmap)
+@@@ -500,12 -592,21 +531,15 @@@ out
+  
+  void zpci_dma_exit_device(struct zpci_dev *zdev)
+  {
+ -	/*
+ -	 * At this point, if the device is part of an IOMMU domain, this would
+ -	 * be a strong hint towards a bug in the IOMMU API (common) code and/or
+ -	 * simultaneous access via IOMMU and DMA API. So let's issue a warning.
+ -	 */
+ -	WARN_ON(zdev->s390_domain);
+ +	if (zpci_unregister_ioat(zdev, 0))
+ +		return;
+  
+ -	zpci_unregister_ioat(zdev, 0);
+ -	dma_cleanup_tables(zdev->dma_table);
+ -	zdev->dma_table = NULL;
+ +	dma_cleanup_tables(zdev);
+  	vfree(zdev->iommu_bitmap);
+  	zdev->iommu_bitmap = NULL;
++ 	vfree(zdev->lazy_bitmap);
++ 	zdev->lazy_bitmap = NULL;
++ 
+  	zdev->next_bit = 0;
+  }
+  
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 4e773a5477eb..f5204c72e07a 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -123,6 +123,7 @@ struct zpci_dev {
+ 
+ 	spinlock_t	iommu_bitmap_lock;
+ 	unsigned long	*iommu_bitmap;
++	unsigned long	*lazy_bitmap;
+ 	unsigned long	iommu_size;
+ 	unsigned long	iommu_pages;
+ 	unsigned int	next_bit;
+* Unmerged path arch/s390/pci/pci_dma.c
