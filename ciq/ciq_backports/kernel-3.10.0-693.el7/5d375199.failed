@@ -1,0 +1,538 @@
+KVM: PPC: Book3S HV: Set server for passed-through interrupts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 5d375199ea963fa2a972eae9c7d83db36ed37082
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5d375199.failed
+
+When a guest has a PCI pass-through device with an interrupt, it
+will direct the interrupt to a particular guest VCPU.  In fact the
+physical interrupt might arrive on any CPU, and then get
+delivered to the target VCPU in the emulated XICS (guest interrupt
+controller), and eventually delivered to the target VCPU.
+
+Now that we have code to handle device interrupts in real mode
+without exiting to the host kernel, there is an advantage to having
+the device interrupt arrive on the same sub(core) as the target
+VCPU is running on.  In this situation, the interrupt can be
+delivered to the target VCPU without any exit to the host kernel
+(using a hypervisor doorbell interrupt between threads if
+necessary).
+
+This patch aims to get passed-through device interrupts arriving
+on the correct core by setting the interrupt server in the real
+hardware XICS for the interrupt to the first thread in the (sub)core
+where its target VCPU is running.  We do this in the real-mode H_EOI
+code because the H_EOI handler already needs to look at the
+emulated ICS state for the interrupt (whereas the H_XIRR handler
+doesn't), and we know we are running in the target VCPU context
+at that point.
+
+We set the server CPU in hardware using an OPAL call, regardless of
+what the IRQ affinity mask for the interrupt says, and without
+updating the affinity mask.  This amounts to saying that when an
+interrupt is passed through to a guest, as a matter of policy we
+allow the guest's affinity for the interrupt to override the host's.
+
+This is inspired by an earlier patch from Suresh Warrier, although
+none of this code came from that earlier patch.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 5d375199ea963fa2a972eae9c7d83db36ed37082)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_ppc.h
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index 4af3129ec8aa,f6e49640dbe1..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -445,7 -478,24 +445,19 @@@ extern u64 kvmppc_xics_get_icp(struct k
+  extern int kvmppc_xics_set_icp(struct kvm_vcpu *vcpu, u64 icpval);
+  extern int kvmppc_xics_connect_vcpu(struct kvm_device *dev,
+  			struct kvm_vcpu *vcpu, u32 cpu);
+++<<<<<<< HEAD
+++=======
++ extern void kvmppc_xics_ipi_action(void);
++ extern void kvmppc_xics_set_mapped(struct kvm *kvm, unsigned long guest_irq,
++ 				   unsigned long host_irq);
++ extern void kvmppc_xics_clr_mapped(struct kvm *kvm, unsigned long guest_irq,
++ 				   unsigned long host_irq);
++ extern long kvmppc_deliver_irq_passthru(struct kvm_vcpu *vcpu, u32 xirr,
++ 				 struct kvmppc_irq_map *irq_map,
++ 				 struct kvmppc_passthru_irqmap *pimap);
++ extern int h_ipi_redirect;
+++>>>>>>> 5d375199ea96 (KVM: PPC: Book3S HV: Set server for passed-through interrupts)
+  #else
+ -static inline struct kvmppc_passthru_irqmap *kvmppc_get_passthru_irqmap(
+ -				struct kvm *kvm)
+ -	{ return NULL; }
+ -static inline void kvmppc_alloc_host_rm_ops(void) {};
+ -static inline void kvmppc_free_host_rm_ops(void) {};
+ -static inline void kvmppc_free_pimap(struct kvm *kvm) {};
+ -static inline int kvmppc_xics_rm_complete(struct kvm_vcpu *vcpu, u32 hcall)
+ -	{ return 0; }
+  static inline int kvmppc_xics_enabled(struct kvm_vcpu *vcpu)
+  	{ return 0; }
+  static inline void kvmppc_xics_free_icp(struct kvm_vcpu *vcpu) { }
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 32dd0caea96b,9b3bba643b43..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -3144,6 -3421,190 +3144,187 @@@ static int kvmppc_core_check_processor_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_XICS
++ 
++ void kvmppc_free_pimap(struct kvm *kvm)
++ {
++ 	kfree(kvm->arch.pimap);
++ }
++ 
++ static struct kvmppc_passthru_irqmap *kvmppc_alloc_pimap(void)
++ {
++ 	return kzalloc(sizeof(struct kvmppc_passthru_irqmap), GFP_KERNEL);
++ }
++ 
++ static int kvmppc_set_passthru_irq(struct kvm *kvm, int host_irq, int guest_gsi)
++ {
++ 	struct irq_desc *desc;
++ 	struct kvmppc_irq_map *irq_map;
++ 	struct kvmppc_passthru_irqmap *pimap;
++ 	struct irq_chip *chip;
++ 	int i;
++ 
++ 	if (!kvm_irq_bypass)
++ 		return 1;
++ 
++ 	desc = irq_to_desc(host_irq);
++ 	if (!desc)
++ 		return -EIO;
++ 
++ 	mutex_lock(&kvm->lock);
++ 
++ 	pimap = kvm->arch.pimap;
++ 	if (pimap == NULL) {
++ 		/* First call, allocate structure to hold IRQ map */
++ 		pimap = kvmppc_alloc_pimap();
++ 		if (pimap == NULL) {
++ 			mutex_unlock(&kvm->lock);
++ 			return -ENOMEM;
++ 		}
++ 		kvm->arch.pimap = pimap;
++ 	}
++ 
++ 	/*
++ 	 * For now, we only support interrupts for which the EOI operation
++ 	 * is an OPAL call followed by a write to XIRR, since that's
++ 	 * what our real-mode EOI code does.
++ 	 */
++ 	chip = irq_data_get_irq_chip(&desc->irq_data);
++ 	if (!chip || !is_pnv_opal_msi(chip)) {
++ 		pr_warn("kvmppc_set_passthru_irq_hv: Could not assign IRQ map for (%d,%d)\n",
++ 			host_irq, guest_gsi);
++ 		mutex_unlock(&kvm->lock);
++ 		return -ENOENT;
++ 	}
++ 
++ 	/*
++ 	 * See if we already have an entry for this guest IRQ number.
++ 	 * If it's mapped to a hardware IRQ number, that's an error,
++ 	 * otherwise re-use this entry.
++ 	 */
++ 	for (i = 0; i < pimap->n_mapped; i++) {
++ 		if (guest_gsi == pimap->mapped[i].v_hwirq) {
++ 			if (pimap->mapped[i].r_hwirq) {
++ 				mutex_unlock(&kvm->lock);
++ 				return -EINVAL;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (i == KVMPPC_PIRQ_MAPPED) {
++ 		mutex_unlock(&kvm->lock);
++ 		return -EAGAIN;		/* table is full */
++ 	}
++ 
++ 	irq_map = &pimap->mapped[i];
++ 
++ 	irq_map->v_hwirq = guest_gsi;
++ 	irq_map->desc = desc;
++ 
++ 	/*
++ 	 * Order the above two stores before the next to serialize with
++ 	 * the KVM real mode handler.
++ 	 */
++ 	smp_wmb();
++ 	irq_map->r_hwirq = desc->irq_data.hwirq;
++ 
++ 	if (i == pimap->n_mapped)
++ 		pimap->n_mapped++;
++ 
++ 	kvmppc_xics_set_mapped(kvm, guest_gsi, desc->irq_data.hwirq);
++ 
++ 	mutex_unlock(&kvm->lock);
++ 
++ 	return 0;
++ }
++ 
++ static int kvmppc_clr_passthru_irq(struct kvm *kvm, int host_irq, int guest_gsi)
++ {
++ 	struct irq_desc *desc;
++ 	struct kvmppc_passthru_irqmap *pimap;
++ 	int i;
++ 
++ 	if (!kvm_irq_bypass)
++ 		return 0;
++ 
++ 	desc = irq_to_desc(host_irq);
++ 	if (!desc)
++ 		return -EIO;
++ 
++ 	mutex_lock(&kvm->lock);
++ 
++ 	if (kvm->arch.pimap == NULL) {
++ 		mutex_unlock(&kvm->lock);
++ 		return 0;
++ 	}
++ 	pimap = kvm->arch.pimap;
++ 
++ 	for (i = 0; i < pimap->n_mapped; i++) {
++ 		if (guest_gsi == pimap->mapped[i].v_hwirq)
++ 			break;
++ 	}
++ 
++ 	if (i == pimap->n_mapped) {
++ 		mutex_unlock(&kvm->lock);
++ 		return -ENODEV;
++ 	}
++ 
++ 	kvmppc_xics_clr_mapped(kvm, guest_gsi, pimap->mapped[i].r_hwirq);
++ 
++ 	/* invalidate the entry */
++ 	pimap->mapped[i].r_hwirq = 0;
++ 
++ 	/*
++ 	 * We don't free this structure even when the count goes to
++ 	 * zero. The structure is freed when we destroy the VM.
++ 	 */
++ 
++ 	mutex_unlock(&kvm->lock);
++ 	return 0;
++ }
++ 
++ static int kvmppc_irq_bypass_add_producer_hv(struct irq_bypass_consumer *cons,
++ 					     struct irq_bypass_producer *prod)
++ {
++ 	int ret = 0;
++ 	struct kvm_kernel_irqfd *irqfd =
++ 		container_of(cons, struct kvm_kernel_irqfd, consumer);
++ 
++ 	irqfd->producer = prod;
++ 
++ 	ret = kvmppc_set_passthru_irq(irqfd->kvm, prod->irq, irqfd->gsi);
++ 	if (ret)
++ 		pr_info("kvmppc_set_passthru_irq (irq %d, gsi %d) fails: %d\n",
++ 			prod->irq, irqfd->gsi, ret);
++ 
++ 	return ret;
++ }
++ 
++ static void kvmppc_irq_bypass_del_producer_hv(struct irq_bypass_consumer *cons,
++ 					      struct irq_bypass_producer *prod)
++ {
++ 	int ret;
++ 	struct kvm_kernel_irqfd *irqfd =
++ 		container_of(cons, struct kvm_kernel_irqfd, consumer);
++ 
++ 	irqfd->producer = NULL;
++ 
++ 	/*
++ 	 * When producer of consumer is unregistered, we change back to
++ 	 * default external interrupt handling mode - KVM real mode
++ 	 * will switch back to host.
++ 	 */
++ 	ret = kvmppc_clr_passthru_irq(irqfd->kvm, prod->irq, irqfd->gsi);
++ 	if (ret)
++ 		pr_warn("kvmppc_clr_passthru_irq (irq %d, gsi %d) fails: %d\n",
++ 			prod->irq, irqfd->gsi, ret);
++ }
++ #endif
++ 
+++>>>>>>> 5d375199ea96 (KVM: PPC: Book3S HV: Set server for passed-through interrupts)
+  static long kvm_arch_vm_ioctl_hv(struct file *filp,
+  				 unsigned int ioctl, unsigned long arg)
+  {
+diff --cc arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 37eb41dc50c9,5f7527ec4ad5..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@@ -17,14 -18,24 +17,20 @@@
+  #include <asm/xics.h>
+  #include <asm/debug.h>
+  #include <asm/synch.h>
+ -#include <asm/cputhreads.h>
+ -#include <asm/pgtable.h>
+  #include <asm/ppc-opcode.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/pnv-pci.h>
++ #include <asm/opal.h>
+++>>>>>>> 5d375199ea96 (KVM: PPC: Book3S HV: Set server for passed-through interrupts)
+  
+  #include "book3s_xics.h"
+  
+  #define DEBUG_PASSUP
+  
+ -int h_ipi_redirect = 1;
+ -EXPORT_SYMBOL(h_ipi_redirect);
+ -int kvm_irq_bypass = 1;
+ -EXPORT_SYMBOL(kvm_irq_bypass);
+ -
+  static void icp_rm_deliver_irq(struct kvmppc_xics *xics, struct kvmppc_icp *icp,
+  			    u32 new_irq);
++ static int xics_opal_rm_set_server(unsigned int hw_irq, int server_cpu);
+  
+  /* -- ICS routines -- */
+  static void ics_rm_check_resend(struct kvmppc_xics *xics,
+@@@ -625,3 -725,138 +638,141 @@@ int kvmppc_rm_h_eoi(struct kvm_vcpu *vc
+   bail:
+  	return check_too_hard(xics, icp);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ unsigned long eoi_rc;
++ 
++ static void icp_eoi(struct irq_chip *c, u32 hwirq, u32 xirr)
++ {
++ 	unsigned long xics_phys;
++ 	int64_t rc;
++ 
++ 	rc = pnv_opal_pci_msi_eoi(c, hwirq);
++ 
++ 	if (rc)
++ 		eoi_rc = rc;
++ 
++ 	iosync();
++ 
++ 	/* EOI it */
++ 	xics_phys = local_paca->kvm_hstate.xics_phys;
++ 	_stwcix(xics_phys + XICS_XIRR, xirr);
++ }
++ 
++ static int xics_opal_rm_set_server(unsigned int hw_irq, int server_cpu)
++ {
++ 	unsigned int mangle_cpu = get_hard_smp_processor_id(server_cpu) << 2;
++ 
++ 	return opal_rm_set_xive(hw_irq, mangle_cpu, DEFAULT_PRIORITY);
++ }
++ 
++ /*
++  * Increment a per-CPU 32-bit unsigned integer variable.
++  * Safe to call in real-mode. Handles vmalloc'ed addresses
++  *
++  * ToDo: Make this work for any integral type
++  */
++ 
++ static inline void this_cpu_inc_rm(unsigned int __percpu *addr)
++ {
++ 	unsigned long l;
++ 	unsigned int *raddr;
++ 	int cpu = smp_processor_id();
++ 
++ 	raddr = per_cpu_ptr(addr, cpu);
++ 	l = (unsigned long)raddr;
++ 
++ 	if (REGION_ID(l) == VMALLOC_REGION_ID) {
++ 		l = vmalloc_to_phys(raddr);
++ 		raddr = (unsigned int *)l;
++ 	}
++ 	++*raddr;
++ }
++ 
++ /*
++  * We don't try to update the flags in the irq_desc 'istate' field in
++  * here as would happen in the normal IRQ handling path for several reasons:
++  *  - state flags represent internal IRQ state and are not expected to be
++  *    updated outside the IRQ subsystem
++  *  - more importantly, these are useful for edge triggered interrupts,
++  *    IRQ probing, etc., but we are only handling MSI/MSIx interrupts here
++  *    and these states shouldn't apply to us.
++  *
++  * However, we do update irq_stats - we somewhat duplicate the code in
++  * kstat_incr_irqs_this_cpu() for this since this function is defined
++  * in irq/internal.h which we don't want to include here.
++  * The only difference is that desc->kstat_irqs is an allocated per CPU
++  * variable and could have been vmalloc'ed, so we can't directly
++  * call __this_cpu_inc() on it. The kstat structure is a static
++  * per CPU variable and it should be accessible by real-mode KVM.
++  *
++  */
++ static void kvmppc_rm_handle_irq_desc(struct irq_desc *desc)
++ {
++ 	this_cpu_inc_rm(desc->kstat_irqs);
++ 	__this_cpu_inc(kstat.irqs_sum);
++ }
++ 
++ long kvmppc_deliver_irq_passthru(struct kvm_vcpu *vcpu,
++ 				 u32 xirr,
++ 				 struct kvmppc_irq_map *irq_map,
++ 				 struct kvmppc_passthru_irqmap *pimap)
++ {
++ 	struct kvmppc_xics *xics;
++ 	struct kvmppc_icp *icp;
++ 	u32 irq;
++ 
++ 	irq = irq_map->v_hwirq;
++ 	xics = vcpu->kvm->arch.xics;
++ 	icp = vcpu->arch.icp;
++ 
++ 	kvmppc_rm_handle_irq_desc(irq_map->desc);
++ 	icp_rm_deliver_irq(xics, icp, irq);
++ 
++ 	/* EOI the interrupt */
++ 	icp_eoi(irq_desc_get_chip(irq_map->desc), irq_map->r_hwirq, xirr);
++ 
++ 	if (check_too_hard(xics, icp) == H_TOO_HARD)
++ 		return 2;
++ 	else
++ 		return -2;
++ }
++ 
++ /*  --- Non-real mode XICS-related built-in routines ---  */
++ 
++ /**
++  * Host Operations poked by RM KVM
++  */
++ static void rm_host_ipi_action(int action, void *data)
++ {
++ 	switch (action) {
++ 	case XICS_RM_KICK_VCPU:
++ 		kvmppc_host_rm_ops_hv->vcpu_kick(data);
++ 		break;
++ 	default:
++ 		WARN(1, "Unexpected rm_action=%d data=%p\n", action, data);
++ 		break;
++ 	}
++ 
++ }
++ 
++ void kvmppc_xics_ipi_action(void)
++ {
++ 	int core;
++ 	unsigned int cpu = smp_processor_id();
++ 	struct kvmppc_host_rm_core *rm_corep;
++ 
++ 	core = cpu >> threads_shift;
++ 	rm_corep = &kvmppc_host_rm_ops_hv->rm_core[core];
++ 
++ 	if (rm_corep->rm_data) {
++ 		rm_host_ipi_action(rm_corep->rm_state.rm_action,
++ 							rm_corep->rm_data);
++ 		/* Order these stores against the real mode KVM */
++ 		rm_corep->rm_data = NULL;
++ 		smp_wmb();
++ 		rm_corep->rm_state.rm_action = 0;
++ 	}
++ }
+++>>>>>>> 5d375199ea96 (KVM: PPC: Book3S HV: Set server for passed-through interrupts)
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 0665efd78184..bb65ee53e776 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -1056,6 +1056,7 @@ int64_t opal_pci_config_write_half_word(uint64_t phb_id, uint64_t bus_dev_func,
+ int64_t opal_pci_config_write_word(uint64_t phb_id, uint64_t bus_dev_func,
+ 				   uint64_t offset, uint32_t data);
+ int64_t opal_set_xive(uint32_t isn, uint16_t server, uint8_t priority);
++int64_t opal_rm_set_xive(uint32_t isn, uint16_t server, uint8_t priority);
+ int64_t opal_get_xive(uint32_t isn, __be16 *server, uint8_t *priority);
+ int64_t opal_register_exception_handler(uint64_t opal_exception,
+ 					uint64_t handler_address,
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index 5543482c55d7..e3317dfb6f4a 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -99,6 +99,10 @@ static int ics_deliver_irq(struct kvmppc_xics *xics, u32 irq, u32 level)
+ 		return 0;
+ 	}
+ 
++	/* Record which CPU this arrived on for passed-through interrupts */
++	if (state->host_irq)
++		state->intr_cpu = raw_smp_processor_id();
++
+ 	/* Attempt delivery */
+ 	icp_deliver_irq(xics, NULL, irq);
+ 
+@@ -1414,3 +1418,34 @@ int kvm_irq_map_chip_pin(struct kvm *kvm, unsigned irqchip, unsigned pin)
+ {
+ 	return pin;
+ }
++
++void kvmppc_xics_set_mapped(struct kvm *kvm, unsigned long irq,
++			    unsigned long host_irq)
++{
++	struct kvmppc_xics *xics = kvm->arch.xics;
++	struct kvmppc_ics *ics;
++	u16 idx;
++
++	ics = kvmppc_xics_find_ics(xics, irq, &idx);
++	if (!ics)
++		return;
++
++	ics->irq_state[idx].host_irq = host_irq;
++	ics->irq_state[idx].intr_cpu = -1;
++}
++EXPORT_SYMBOL_GPL(kvmppc_xics_set_mapped);
++
++void kvmppc_xics_clr_mapped(struct kvm *kvm, unsigned long irq,
++			    unsigned long host_irq)
++{
++	struct kvmppc_xics *xics = kvm->arch.xics;
++	struct kvmppc_ics *ics;
++	u16 idx;
++
++	ics = kvmppc_xics_find_ics(xics, irq, &idx);
++	if (!ics)
++		return;
++
++	ics->irq_state[idx].host_irq = 0;
++}
++EXPORT_SYMBOL_GPL(kvmppc_xics_clr_mapped);
+diff --git a/arch/powerpc/kvm/book3s_xics.h b/arch/powerpc/kvm/book3s_xics.h
+index 129f5b2691a5..1d5fac80b706 100644
+--- a/arch/powerpc/kvm/book3s_xics.h
++++ b/arch/powerpc/kvm/book3s_xics.h
+@@ -42,6 +42,8 @@ struct ics_irq_state {
+ 	u8  lsi;		/* level-sensitive interrupt */
+ 	u8  asserted; /* Only for LSI */
+ 	u8  exists;
++	int intr_cpu;
++	u32 host_irq;
+ };
+ 
+ /* Atomic ICP state, updated with a single compare & swap */
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index 390b25022409..25dad557794a 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -120,6 +120,7 @@ OPAL_CALL(opal_pci_config_write_byte,		OPAL_PCI_CONFIG_WRITE_BYTE);
+ OPAL_CALL(opal_pci_config_write_half_word,	OPAL_PCI_CONFIG_WRITE_HALF_WORD);
+ OPAL_CALL(opal_pci_config_write_word,		OPAL_PCI_CONFIG_WRITE_WORD);
+ OPAL_CALL(opal_set_xive,			OPAL_SET_XIVE);
++OPAL_CALL_REAL(opal_rm_set_xive,		OPAL_SET_XIVE);
+ OPAL_CALL(opal_get_xive,			OPAL_GET_XIVE);
+ OPAL_CALL(opal_register_exception_handler,	OPAL_REGISTER_OPAL_EXCEPTION_HANDLER);
+ OPAL_CALL(opal_pci_eeh_freeze_status,		OPAL_PCI_EEH_FREEZE_STATUS);
