@@ -1306,8 +1306,7 @@ void __init native_smp_prepare_cpus(unsigned int max_cpus)
 	print_cpu_info(&cpu_data(0));
 	x86_init.timers.setup_percpu_clockev();
 
-	if (is_uv_system())
-		uv_system_init();
+	uv_system_init();
 
 	set_mtrr_aps_delayed_init();
 out:
