@@ -1,0 +1,197 @@
+sfc: support second + quarter ns time format for receive datapath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit 1280c0f8aafc4c09c59c576c8d50f367070b2619
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1280c0f8.failed
+
+The time_format that we stash in the PTP data structure is never
+ referenced, so we can remove it.  Instead, store the information needed
+ to interpret sync event timestamps.
+Also rolls in a couple of other related minor PTP fixes.
+
+Based on patches by Bert Kenward <bkenward@solarflare.com> and Laurence
+ Evans <levans@solarflare.com>.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1280c0f8aafc4c09c59c576c8d50f367070b2619)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ptp.c
+diff --cc drivers/net/ethernet/sfc/ptp.c
+index e8d8b37cae8f,196b0768b2f2..000000000000
+--- a/drivers/net/ethernet/sfc/ptp.c
++++ b/drivers/net/ethernet/sfc/ptp.c
+@@@ -233,14 -233,29 +233,22 @@@ struct efx_ptp_timeset 
+   * @config: Current timestamp configuration
+   * @enabled: PTP operation enabled
+   * @mode: Mode in which PTP operating (PTP version)
+-  * @time_format: Time format supported by this NIC
+   * @ns_to_nic_time: Function to convert from scalar nanoseconds to NIC time
+   * @nic_to_kernel_time: Function to convert from NIC to kernel time
++  * @nic_time.minor_max: Wrap point for NIC minor times
++  * @nic_time.sync_event_diff_min: Minimum acceptable difference between time
++  * in packet prefix and last MCDI time sync event i.e. how much earlier than
++  * the last sync event time a packet timestamp can be.
++  * @nic_time.sync_event_diff_max: Maximum acceptable difference between time
++  * in packet prefix and last MCDI time sync event i.e. how much later than
++  * the last sync event time a packet timestamp can be.
++  * @nic_time.sync_event_minor_shift: Shift required to make minor time from
++  * field in MCDI time sync event.
+   * @min_synchronisation_ns: Minimum acceptable corrected sync window
+ - * @capabilities: Capabilities flags from the NIC
+ - * @ts_corrections.ptp_tx: Required driver correction of PTP packet transmit
+ - *                         timestamps
+ - * @ts_corrections.ptp_rx: Required driver correction of PTP packet receive
+ - *                         timestamps
+ + * @ts_corrections.tx: Required driver correction of transmit timestamps
+ + * @ts_corrections.rx: Required driver correction of receive timestamps
+   * @ts_corrections.pps_out: PPS output error (information only)
+   * @ts_corrections.pps_in: Required driver correction of PPS input timestamps
+ - * @ts_corrections.general_tx: Required driver correction of general packet
+ - *                             transmit timestamps
+ - * @ts_corrections.general_rx: Required driver correction of general packet
+ - *                             receive timestamps
+   * @evt_frags: Partly assembled PTP events
+   * @evt_frag_idx: Current fragment number
+   * @evt_code: Last event code
+@@@ -288,13 -303,20 +296,18 @@@ struct efx_ptp_data 
+  	void (*ns_to_nic_time)(s64 ns, u32 *nic_major, u32 *nic_minor);
+  	ktime_t (*nic_to_kernel_time)(u32 nic_major, u32 nic_minor,
+  				      s32 correction);
++ 	struct {
++ 		u32 minor_max;
++ 		u32 sync_event_diff_min;
++ 		u32 sync_event_diff_max;
++ 		unsigned int sync_event_minor_shift;
++ 	} nic_time;
+  	unsigned int min_synchronisation_ns;
+  	struct {
+ -		s32 ptp_tx;
+ -		s32 ptp_rx;
+ +		s32 tx;
+ +		s32 rx;
+  		s32 pps_out;
+  		s32 pps_in;
+ -		s32 general_tx;
+ -		s32 general_rx;
+  	} ts_corrections;
+  	efx_qword_t evt_frags[MAX_EVENT_FRAGS];
+  	int evt_frag_idx;
+@@@ -473,6 -513,89 +486,92 @@@ static ktime_t efx_ptp_s27_to_ktime_cor
+  	return efx_ptp_s27_to_ktime(nic_major, nic_minor);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* For Medford2 platforms the time is in seconds and quarter nanoseconds. */
++ static void efx_ptp_ns_to_s_qns(s64 ns, u32 *nic_major, u32 *nic_minor)
++ {
++ 	struct timespec64 ts = ns_to_timespec64(ns);
++ 
++ 	*nic_major = (u32)ts.tv_sec;
++ 	*nic_minor = ts.tv_nsec * 4;
++ }
++ 
++ static ktime_t efx_ptp_s_qns_to_ktime_correction(u32 nic_major, u32 nic_minor,
++ 						 s32 correction)
++ {
++ 	ktime_t kt;
++ 
++ 	nic_minor = DIV_ROUND_CLOSEST(nic_minor, 4);
++ 	correction = DIV_ROUND_CLOSEST(correction, 4);
++ 
++ 	kt = ktime_set(nic_major, nic_minor);
++ 
++ 	if (correction >= 0)
++ 		kt = ktime_add_ns(kt, (u64)correction);
++ 	else
++ 		kt = ktime_sub_ns(kt, (u64)-correction);
++ 	return kt;
++ }
++ 
++ struct efx_channel *efx_ptp_channel(struct efx_nic *efx)
++ {
++ 	return efx->ptp_data ? efx->ptp_data->channel : NULL;
++ }
++ 
++ static u32 last_sync_timestamp_major(struct efx_nic *efx)
++ {
++ 	struct efx_channel *channel = efx_ptp_channel(efx);
++ 	u32 major = 0;
++ 
++ 	if (channel)
++ 		major = channel->sync_timestamp_major;
++ 	return major;
++ }
++ 
++ /* The 8000 series and later can provide the time from the MAC, which is only
++  * 48 bits long and provides meta-information in the top 2 bits.
++  */
++ static ktime_t
++ efx_ptp_mac_nic_to_ktime_correction(struct efx_nic *efx,
++ 				    struct efx_ptp_data *ptp,
++ 				    u32 nic_major, u32 nic_minor,
++ 				    s32 correction)
++ {
++ 	ktime_t kt = { 0 };
++ 
++ 	if (!(nic_major & 0x80000000)) {
++ 		WARN_ON_ONCE(nic_major >> 16);
++ 		/* Use the top bits from the latest sync event. */
++ 		nic_major &= 0xffff;
++ 		nic_major |= (last_sync_timestamp_major(efx) & 0xffff0000);
++ 
++ 		kt = ptp->nic_to_kernel_time(nic_major, nic_minor,
++ 					     correction);
++ 	}
++ 	return kt;
++ }
++ 
++ ktime_t efx_ptp_nic_to_kernel_time(struct efx_tx_queue *tx_queue)
++ {
++ 	struct efx_nic *efx = tx_queue->efx;
++ 	struct efx_ptp_data *ptp = efx->ptp_data;
++ 	ktime_t kt;
++ 
++ 	if (efx_ptp_use_mac_tx_timestamps(efx))
++ 		kt = efx_ptp_mac_nic_to_ktime_correction(efx, ptp,
++ 				tx_queue->completed_timestamp_major,
++ 				tx_queue->completed_timestamp_minor,
++ 				ptp->ts_corrections.general_tx);
++ 	else
++ 		kt = ptp->nic_to_kernel_time(
++ 				tx_queue->completed_timestamp_major,
++ 				tx_queue->completed_timestamp_minor,
++ 				ptp->ts_corrections.general_tx);
++ 	return kt;
++ }
++ 
+++>>>>>>> 1280c0f8aafc (sfc: support second + quarter ns time format for receive datapath)
+  /* Get PTP attributes and set up time conversions */
+  static int efx_ptp_get_attributes(struct efx_nic *efx)
+  {
+@@@ -1829,10 -2006,10 +1961,17 @@@ void __efx_rx_skb_attach_timestamp(stru
+  
+  	/* attach the timestamps to the skb */
+  	timestamps = skb_hwtstamps(skb);
+++<<<<<<< HEAD
+ +	timestamps->hwtstamp = efx_ptp_s27_to_ktime_correction(
+ +				pkt_timestamp_major,
+ +				pkt_timestamp_minor,
+ +				efx->ptp_data->ts_corrections.rx);
+++=======
++ 	timestamps->hwtstamp =
++ 		ptp->nic_to_kernel_time(pkt_timestamp_major,
++ 					pkt_timestamp_minor,
++ 					ptp->ts_corrections.general_rx);
+++>>>>>>> 1280c0f8aafc (sfc: support second + quarter ns time format for receive datapath)
+  }
+  
+  static int efx_phc_adjfreq(struct ptp_clock_info *ptp, s32 delta)
+* Unmerged path drivers/net/ethernet/sfc/ptp.c
