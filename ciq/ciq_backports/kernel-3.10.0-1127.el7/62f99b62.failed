@@ -1,0 +1,191 @@
+nvme-rdma: use dynamic dma mapping per command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 62f99b62e5e3b88d23b6ced4380199e8386965af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/62f99b62.failed
+
+Commit 87fd125344d6 ("nvme-rdma: remove redundant reference between
+ib_device and tagset") caused a kernel panic when disconnecting from an
+inaccessible controller (disconnect during re-connection).
+
+--
+nvme nvme0: Removing ctrl: NQN "testnqn1"
+nvme_rdma: nvme_rdma_exit_request: hctx 0 queue_idx 1
+BUG: unable to handle kernel paging request at 0000000080000228
+PGD 0 P4D 0
+Oops: 0000 [#1] SMP PTI
+...
+Call Trace:
+ blk_mq_exit_hctx+0x5c/0xf0
+ blk_mq_exit_queue+0xd4/0x100
+ blk_cleanup_queue+0x9a/0xc0
+ nvme_rdma_destroy_io_queues+0x52/0x60 [nvme_rdma]
+ nvme_rdma_shutdown_ctrl+0x3e/0x80 [nvme_rdma]
+ nvme_do_delete_ctrl+0x53/0x80 [nvme_core]
+ nvme_sysfs_delete+0x45/0x60 [nvme_core]
+ kernfs_fop_write+0x105/0x180
+ vfs_write+0xad/0x1a0
+ ksys_write+0x5a/0xd0
+ do_syscall_64+0x55/0x110
+ entry_SYSCALL_64_after_hwframe+0x44/0xa9
+RIP: 0033:0x7fa215417154
+--
+
+The reason for this crash is accessing an already freed ib_device for
+performing dma_unmap during exit_request commands. The root cause for
+that is that during re-connection all the queues are destroyed and
+re-created (and the ib_device is reference counted by the queues and
+freed as well) but the tagset stays alive and all the DMA mappings (that
+we perform in init_request) kept in the request context. The original
+commit fixed a different bug that was introduced during bonding (aka nic
+teaming) tests that for some scenarios change the underlying ib_device
+and caused memory leakage and possible segmentation fault. This commit
+is a complementary commit that also changes the wrong DMA mappings that
+were saved in the request context and making the request sqe dma
+mappings dynamic with the command lifetime (i.e. mapped in .queue_rq and
+unmapped in .complete). It also fixes the above crash of accessing freed
+ib_device during destruction of the tagset.
+
+Fixes: 87fd125344d6 ("nvme-rdma: remove redundant reference between ib_device and tagset")
+	Reported-by: Jim Harris <james.r.harris@intel.com>
+	Suggested-by: Sagi Grimberg <sagi@grimberg.me>
+	Tested-by: Jim Harris <james.r.harris@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 62f99b62e5e3b88d23b6ced4380199e8386965af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index a2ff5b88b98b,97f668a39ae1..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -280,43 -276,27 +285,41 @@@ static int nvme_rdma_create_qp(struct n
+  	return ret;
+  }
+  
+ -static void nvme_rdma_exit_request(struct blk_mq_tag_set *set,
+ -		struct request *rq, unsigned int hctx_idx)
+ +static void __nvme_rdma_exit_request(struct nvme_rdma_ctrl *ctrl,
+ +		struct request *rq, unsigned int queue_idx)
+  {
+  	struct nvme_rdma_request *req = blk_mq_rq_to_pdu(rq);
+++<<<<<<< HEAD
+ +	struct nvme_rdma_queue *queue = &ctrl->queues[queue_idx];
+ +	struct nvme_rdma_device *dev = queue->device;
+++=======
+++>>>>>>> 62f99b62e5e3 (nvme-rdma: use dynamic dma mapping per command)
+  
+- 	nvme_rdma_free_qe(dev->dev, &req->sqe, sizeof(struct nvme_command),
+- 			DMA_TO_DEVICE);
++ 	kfree(req->sqe.data);
+  }
+  
+ -static int nvme_rdma_init_request(struct blk_mq_tag_set *set,
+ -		struct request *rq, unsigned int hctx_idx,
+ -		unsigned int numa_node)
+ +static void nvme_rdma_exit_request(struct blk_mq_tag_set *set,
+ +		struct request *rq, unsigned int hctx_idx)
+ +{
+ +	return __nvme_rdma_exit_request(set->driver_data, rq, hctx_idx + 1);
+ +}
+ +
+ +static void nvme_rdma_exit_admin_request(struct blk_mq_tag_set *set,
+ +		struct request *rq, unsigned int hctx_idx)
+ +{
+ +	return __nvme_rdma_exit_request(set->driver_data, rq, 0);
+ +}
+ +
+ +static int __nvme_rdma_init_request(struct nvme_rdma_ctrl *ctrl,
+ +		struct request *rq, unsigned int queue_idx)
+  {
+ -	struct nvme_rdma_ctrl *ctrl = set->driver_data;
+  	struct nvme_rdma_request *req = blk_mq_rq_to_pdu(rq);
+ -	int queue_idx = (set == &ctrl->tag_set) ? hctx_idx + 1 : 0;
+  	struct nvme_rdma_queue *queue = &ctrl->queues[queue_idx];
+- 	struct nvme_rdma_device *dev = queue->device;
+- 	struct ib_device *ibdev = dev->dev;
+- 	int ret;
+  
+  	nvme_req(rq)->ctrl = &ctrl->ctrl;
+- 	ret = nvme_rdma_alloc_qe(ibdev, &req->sqe, sizeof(struct nvme_command),
+- 			DMA_TO_DEVICE);
+- 	if (ret)
+- 		return ret;
++ 	req->sqe.data = kzalloc(sizeof(struct nvme_command), GFP_KERNEL);
++ 	if (!req->sqe.data)
++ 		return -ENOMEM;
+  
+  	req->queue = queue;
+  
+@@@ -762,10 -771,15 +765,15 @@@ static int nvme_rdma_configure_admin_qu
+  		return error;
+  
+  	ctrl->device = ctrl->queues[0].device;
+ -	ctrl->ctrl.numa_node = dev_to_node(ctrl->device->dev->dma_device);
+  
+ -	ctrl->max_fr_pages = nvme_rdma_get_max_fr_pages(ctrl->device->dev);
+ +	ctrl->max_fr_pages = min_t(u32, NVME_RDMA_MAX_SEGMENTS,
+ +		ctrl->device->dev->attrs.max_fast_reg_page_list_len);
+  
++ 	/*
++ 	 * Bind the async event SQE DMA mapping to the admin queue lifetime.
++ 	 * It's safe, since any chage in the underlying RDMA device will issue
++ 	 * error recovery and queue re-creation.
++ 	 */
+  	error = nvme_rdma_alloc_qe(ctrl->device->dev, &ctrl->async_event_sqe,
+  			sizeof(struct nvme_command), DMA_TO_DEVICE);
+  	if (error)
+@@@ -1731,8 -1732,8 +1747,13 @@@ static int nvme_rdma_queue_rq(struct bl
+  			sizeof(struct nvme_command), DMA_TO_DEVICE);
+  
+  	ret = nvme_setup_cmd(ns, rq, c);
+++<<<<<<< HEAD
+ +	if (ret != BLK_MQ_RQ_QUEUE_OK)
+ +		return ret;
+++=======
++ 	if (ret)
++ 		goto unmap_qe;
+++>>>>>>> 62f99b62e5e3 (nvme-rdma: use dynamic dma mapping per command)
+  
+  	blk_mq_start_request(rq);
+  
+@@@ -1757,10 -1757,24 +1778,31 @@@
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	return BLK_MQ_RQ_QUEUE_OK;
+ +err:
+ +	return (ret == -ENOMEM || ret == -EAGAIN) ?
+ +		BLK_MQ_RQ_QUEUE_BUSY : BLK_MQ_RQ_QUEUE_ERROR;
+++=======
++ 	return BLK_STS_OK;
++ 
++ err:
++ 	if (err == -ENOMEM || err == -EAGAIN)
++ 		ret = BLK_STS_RESOURCE;
++ 	else
++ 		ret = BLK_STS_IOERR;
++ unmap_qe:
++ 	ib_dma_unmap_single(dev, req->sqe.dma, sizeof(struct nvme_command),
++ 			    DMA_TO_DEVICE);
++ 	return ret;
++ }
++ 
++ static int nvme_rdma_poll(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct nvme_rdma_queue *queue = hctx->driver_data;
++ 
++ 	return ib_process_cq_direct(queue->ib_cq, -1);
+++>>>>>>> 62f99b62e5e3 (nvme-rdma: use dynamic dma mapping per command)
+  }
+  
+  static void nvme_rdma_complete_rq(struct request *rq)
+* Unmerged path drivers/nvme/host/rdma.c
