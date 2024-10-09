@@ -1828,6 +1828,14 @@ static int acpi_nfit_init_mapping(struct acpi_nfit_desc *acpi_desc,
 	return 0;
 }
 
+static bool nfit_spa_is_virtual(struct acpi_nfit_system_address *spa)
+{
+	return (nfit_spa_type(spa) == NFIT_SPA_VDISK ||
+		nfit_spa_type(spa) == NFIT_SPA_VCD   ||
+		nfit_spa_type(spa) == NFIT_SPA_PDISK ||
+		nfit_spa_type(spa) == NFIT_SPA_PCD);
+}
+
 static int acpi_nfit_register_region(struct acpi_nfit_desc *acpi_desc,
 		struct nfit_spa *nfit_spa)
 {
@@ -1843,7 +1851,7 @@ static int acpi_nfit_register_region(struct acpi_nfit_desc *acpi_desc,
 	if (nfit_spa->nd_region)
 		return 0;
 
-	if (spa->range_index == 0) {
+	if (spa->range_index == 0 && !nfit_spa_is_virtual(spa)) {
 		dev_dbg(acpi_desc->dev, "%s: detected invalid spa index\n",
 				__func__);
 		return 0;
@@ -1902,6 +1910,11 @@ static int acpi_nfit_register_region(struct acpi_nfit_desc *acpi_desc,
 			rc = -ENOMEM;
 	} else if (nfit_spa_type(spa) == NFIT_SPA_VOLATILE) {
 		nfit_spa->nd_region = nvdimm_volatile_region_create(nvdimm_bus,
+				ndr_desc);
+		if (!nfit_spa->nd_region)
+			rc = -ENOMEM;
+	} else if (nfit_spa_is_virtual(spa)) {
+		nfit_spa->nd_region = nvdimm_pmem_region_create(nvdimm_bus,
 				ndr_desc);
 		if (!nfit_spa->nd_region)
 			rc = -ENOMEM;
