@@ -99,6 +99,7 @@ enum nfp_nsp_cmd {
 	SPCODE_ETH_CONTROL	= 8, /* Update media config from buffer */
 	SPCODE_NSP_WRITE_FLASH	= 11, /* Load and flash image from buffer */
 	SPCODE_NSP_IDENTIFY	= 13, /* Read NSP version */
+	SPCODE_FW_STORED	= 16, /* If no FW loaded, load flash app FW */
 };
 
 static const struct {
@@ -542,4 +543,9 @@ int nfp_nsp_read_identify(struct nfp_nsp *state, void *buf, unsigned int size)
 {
 	return nfp_nsp_command_buf(state, SPCODE_NSP_IDENTIFY, size, NULL, 0,
 				   buf, size);
+}
+
+int nfp_nsp_load_stored_fw(struct nfp_nsp *state)
+{
+	return nfp_nsp_command(state, SPCODE_FW_STORED);
 }
