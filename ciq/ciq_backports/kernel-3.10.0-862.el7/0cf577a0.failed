@@ -1,0 +1,172 @@
+tpm: Fix handling of missing event log
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+commit 0cf577a03f21a988f6dbe8133d07410967b8489a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0cf577a0.failed
+
+The event log is an optional firmware feature, if the firmware
+does not support it then the securityfs files should not be created
+and no other notification given.
+
+- Uniformly return -ENODEV from the tpm_bios_log_setup cone if
+  no event log is detected.
+- Check in ACPI if this node was discovered via ACPI.
+- Improve the check in OF to make sure there is a parent and to
+  fail detection if the two log properties are not declared
+- Pass through all other error codes instead of filtering just some
+
+	Signed-off-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+	Reviewed-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+	Tested-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+	Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+(cherry picked from commit 0cf577a03f21a988f6dbe8133d07410967b8489a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/tpm/tpm_acpi.c
+#	drivers/char/tpm/tpm_of.c
+diff --cc drivers/char/tpm/tpm_acpi.c
+index 5c80b93e8393,b7718c95fd0b..000000000000
+--- a/drivers/char/tpm/tpm_acpi.c
++++ b/drivers/char/tpm/tpm_acpi.c
+@@@ -60,11 -66,8 +66,16 @@@ int tpm_read_log_acpi(struct tpm_chip *
+  	status = acpi_get_table(ACPI_SIG_TCPA, 1,
+  				(struct acpi_table_header **)&buff);
+  
+++<<<<<<< HEAD
+ +	if (ACPI_FAILURE(status)) {
+ +		printk(KERN_ERR "%s: ERROR - Could not get TCPA table\n",
+ +		       __func__);
+ +		return -EIO;
+ +	}
+++=======
++ 	if (ACPI_FAILURE(status))
++ 		return -ENODEV;
+++>>>>>>> 0cf577a03f21 (tpm: Fix handling of missing event log)
+  
+  	switch(buff->platform_class) {
+  	case BIOS_SERVER:
+diff --cc drivers/char/tpm/tpm_of.c
+index 12a86dda3b69,7dee42d7b5e0..000000000000
+--- a/drivers/char/tpm/tpm_of.c
++++ b/drivers/char/tpm/tpm_of.c
+@@@ -29,35 -29,26 +29,47 @@@ int tpm_read_log_of(struct tpm_chip *ch
+  	struct tpm_bios_log *log;
+  
+  	log = &chip->log;
+- 	if (chip->dev.parent->of_node)
++ 	if (chip->dev.parent && chip->dev.parent->of_node)
+  		np = chip->dev.parent->of_node;
+ -	else
+ +	if (!np) {
+ +		pr_err("%s: ERROR - IBMVTPM not supported\n", __func__);
+  		return -ENODEV;
+ +	}
+  
+  	sizep = of_get_property(np, "linux,sml-size", NULL);
+++<<<<<<< HEAD
+ +	if (sizep == NULL) {
+ +		pr_err("%s: ERROR - SML size not found\n", __func__);
+ +		goto cleanup_eio;
+ +	}
+++=======
++ 	basep = of_get_property(np, "linux,sml-base", NULL);
++ 	if (sizep == NULL && basep == NULL)
++ 		return -ENODEV;
++ 	if (sizep == NULL || basep == NULL)
++ 		return -EIO;
++ 
+++>>>>>>> 0cf577a03f21 (tpm: Fix handling of missing event log)
+  	if (*sizep == 0) {
+ -		dev_warn(&chip->dev, "%s: Event log area empty\n", __func__);
+ -		return -EIO;
+ +		pr_err("%s: ERROR - event log area empty\n", __func__);
+ +		goto cleanup_eio;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	basep = of_get_property(np, "linux,sml-base", NULL);
+ +	if (basep == NULL) {
+ +		pr_err("%s: ERROR - SML not found\n", __func__);
+ +		goto cleanup_eio;
+  	}
+  
+++=======
+++>>>>>>> 0cf577a03f21 (tpm: Fix handling of missing event log)
+  	log->bios_event_log = kmalloc(*sizep, GFP_KERNEL);
+ -	if (!log->bios_event_log)
+ +	if (!log->bios_event_log) {
+ +		pr_err("%s: ERROR - Not enough memory for BIOS measurements\n",
+ +		       __func__);
+  		return -ENOMEM;
+ +	}
+  
+  	log->bios_event_log_end = log->bios_event_log + *sizep;
+  
+diff --git a/drivers/char/tpm/tpm-chip.c b/drivers/char/tpm/tpm-chip.c
+index 58e6f0f6d030..19c9fc480583 100644
+--- a/drivers/char/tpm/tpm-chip.c
++++ b/drivers/char/tpm/tpm-chip.c
+@@ -347,7 +347,7 @@ int tpm_chip_register(struct tpm_chip *chip)
+ 	tpm_sysfs_add_device(chip);
+ 
+ 	rc = tpm_bios_log_setup(chip);
+-	if (rc == -ENODEV)
++	if (rc != 0 && rc != -ENODEV)
+ 		return rc;
+ 
+ 	tpm_add_ppi(chip);
+* Unmerged path drivers/char/tpm/tpm_acpi.c
+diff --git a/drivers/char/tpm/tpm_eventlog.c b/drivers/char/tpm/tpm_eventlog.c
+index 34f0921f0203..c73f88cdeadf 100644
+--- a/drivers/char/tpm/tpm_eventlog.c
++++ b/drivers/char/tpm/tpm_eventlog.c
+@@ -368,14 +368,21 @@ static int tpm_read_log(struct tpm_chip *chip)
+ 	}
+ 
+ 	rc = tpm_read_log_acpi(chip);
+-	if ((rc == 0) || (rc == -ENOMEM))
++	if (rc != -ENODEV)
+ 		return rc;
+ 
+-	rc = tpm_read_log_of(chip);
+-
+-	return rc;
++	return tpm_read_log_of(chip);
+ }
+ 
++/*
++ * tpm_bios_log_setup() - Read the event log from the firmware
++ * @chip: TPM chip to use.
++ *
++ * If an event log is found then the securityfs files are setup to
++ * export it to userspace, otherwise nothing is done.
++ *
++ * Returns -ENODEV if the firmware has no event log.
++ */
+ int tpm_bios_log_setup(struct tpm_chip *chip)
+ {
+ 	const char *name = dev_name(&chip->dev);
+@@ -386,15 +393,8 @@ int tpm_bios_log_setup(struct tpm_chip *chip)
+ 		return 0;
+ 
+ 	rc = tpm_read_log(chip);
+-	/*
+-	 * read_log failure means event log is not supported except for ENOMEM.
+-	 */
+-	if (rc < 0) {
+-		if (rc == -ENOMEM)
+-			return -ENODEV;
+-		else
+-			return rc;
+-	}
++	if (rc)
++		return rc;
+ 
+ 	cnt = 0;
+ 	chip->bios_dir[cnt] = securityfs_create_dir(name, NULL);
+* Unmerged path drivers/char/tpm/tpm_of.c
