@@ -1,0 +1,311 @@
+xfs: split direct I/O and DAX path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 16d4d43595b4780daac8fcea6d042689124cb094
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/16d4d435.failed
+
+So far the DAX code overloaded the direct I/O code path.  There is very little
+in common between the two, and untangling them allows to clean up both variants.
+
+As a side effect we also get separate trace points for both I/O types.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 16d4d43595b4780daac8fcea6d042689124cb094)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_trace.h
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,d97e8cb99a59..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -285,56 -282,36 +285,64 @@@ xfs_file_fsync
+  }
+  
+  STATIC ssize_t
+ -xfs_file_dio_aio_read(
+ +xfs_file_aio_read(
+  	struct kiocb		*iocb,
+ -	struct iov_iter		*to)
+ +	const struct iovec	*iovp,
+ +	unsigned long		nr_segs,
+ +	loff_t			pos)
+  {
+ -	struct address_space	*mapping = iocb->ki_filp->f_mapping;
+ -	struct inode		*inode = mapping->host;
+ +	struct file		*file = iocb->ki_filp;
+ +	struct inode		*inode = file->f_mapping->host;
+  	struct xfs_inode	*ip = XFS_I(inode);
+ -	loff_t			isize = i_size_read(inode);
+ -	size_t			count = iov_iter_count(to);
+ -	struct iov_iter		data;
+ -	struct xfs_buftarg	*target;
+ +	struct xfs_mount	*mp = ip->i_mount;
+ +	size_t			size = 0;
+  	ssize_t			ret = 0;
+ +	int			ioflags = 0;
+ +	xfs_fsize_t		n;
+  
+ -	trace_xfs_file_direct_read(ip, count, iocb->ki_pos);
+ -
+ -	if (!count)
+ -		return 0; /* skip atime */
+ -
+ -	if (XFS_IS_REALTIME_INODE(ip))
+ -		target = ip->i_mount->m_rtdev_targp;
+ -	else
+ -		target = ip->i_mount->m_ddev_targp;
+ +	XFS_STATS_INC(mp, xs_read_calls);
+  
+ +	BUG_ON(iocb->ki_pos != pos);
+ +
+ +	if (unlikely(file->f_flags & O_DIRECT))
+ +		ioflags |= XFS_IO_ISDIRECT;
+ +	if (file->f_mode & FMODE_NOCMTIME)
+ +		ioflags |= XFS_IO_INVIS;
+ +
+++<<<<<<< HEAD
+ +	ret = generic_segment_checks(iovp, &nr_segs, &size, VERIFY_WRITE);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	if ((ioflags & XFS_IO_ISDIRECT) && !IS_DAX(inode)) {
+ +		xfs_buftarg_t	*target =
+ +			XFS_IS_REALTIME_INODE(ip) ?
+ +				mp->m_rtdev_targp : mp->m_ddev_targp;
+ +		/* DIO must be aligned to device logical sector size */
+ +		if ((pos | size) & target->bt_logical_sectormask) {
+ +			if (pos == i_size_read(inode))
+ +				return 0;
+ +			return -EINVAL;
+ +		}
+++=======
++ 	/* DIO must be aligned to device logical sector size */
++ 	if ((iocb->ki_pos | count) & target->bt_logical_sectormask) {
++ 		if (iocb->ki_pos == isize)
++ 			return 0;
++ 		return -EINVAL;
+++>>>>>>> 16d4d43595b4 (xfs: split direct I/O and DAX path)
+  	}
+  
+ +	n = mp->m_super->s_maxbytes - pos;
+ +	if (n <= 0 || size == 0)
+ +		return 0;
+ +
+ +	if (n < size)
+ +		size = n;
+ +
+ +	if (XFS_FORCED_SHUTDOWN(mp))
+ +		return -EIO;
+ +
+  	/*
+  	 * Locking is a bit tricky here. If we take an exclusive lock for direct
+  	 * IO, we effectively serialise all new concurrent read IO to this file
+@@@ -380,13 -357,88 +388,95 @@@
+  		xfs_rw_ilock_demote(ip, XFS_IOLOCK_EXCL);
+  	}
+  
+++<<<<<<< HEAD
+ +	trace_xfs_file_read(ip, size, pos, ioflags);
+++=======
++ 	data = *to;
++ 	ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data,
++ 			xfs_get_blocks_direct, NULL, NULL, 0);
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(to, ret);
++ 	}
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	file_accessed(iocb->ki_filp);
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_dax_read(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct address_space	*mapping = iocb->ki_filp->f_mapping;
++ 	struct inode		*inode = mapping->host;
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct iov_iter		data = *to;
++ 	size_t			count = iov_iter_count(to);
++ 	ssize_t			ret = 0;
++ 
++ 	trace_xfs_file_dax_read(ip, count, iocb->ki_pos);
++ 
++ 	if (!count)
++ 		return 0; /* skip atime */
++ 
++ 	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
++ 	ret = dax_do_io(iocb, inode, &data, xfs_get_blocks_direct, NULL, 0);
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(to, ret);
++ 	}
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	file_accessed(iocb->ki_filp);
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_buffered_aio_read(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
++ 	ssize_t			ret;
++ 
++ 	trace_xfs_file_buffered_read(ip, iov_iter_count(to), iocb->ki_pos);
++ 
++ 	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
++ 	ret = generic_file_read_iter(iocb, to);
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_read_iter(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct inode		*inode = file_inode(iocb->ki_filp);
++ 	struct xfs_mount	*mp = XFS_I(inode)->i_mount;
++ 	ssize_t			ret = 0;
++ 
++ 	XFS_STATS_INC(mp, xs_read_calls);
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	if (IS_DAX(inode))
++ 		ret = xfs_file_dax_read(iocb, to);
++ 	else if (iocb->ki_flags & IOCB_DIRECT)
++ 		ret = xfs_file_dio_aio_read(iocb, to);
++ 	else
++ 		ret = xfs_file_buffered_aio_read(iocb, to);
+++>>>>>>> 16d4d43595b4 (xfs: split direct I/O and DAX path)
+  
+ +	ret = generic_file_aio_read(iocb, iovp, nr_segs, pos);
+  	if (ret > 0)
+  		XFS_STATS_ADD(mp, xs_read_bytes, ret);
+ +
+ +	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+  	return ret;
+  }
+  
+@@@ -798,7 -780,7 +888,11 @@@ xfs_file_dio_aio_write
+  					mp->m_rtdev_targp : mp->m_ddev_targp;
+  
+  	/* DIO must be aligned to device logical sector size */
+++<<<<<<< HEAD
+ +	if (!IS_DAX(inode) && ((pos | count) & target->bt_logical_sectormask))
+++=======
++ 	if ((iocb->ki_pos | count) & target->bt_logical_sectormask)
+++>>>>>>> 16d4d43595b4 (xfs: split direct I/O and DAX path)
+  		return -EINVAL;
+  
+  	/* "unaligned" here means not aligned to a filesystem block */
+@@@ -861,10 -846,24 +955,29 @@@
+  		iolock = XFS_IOLOCK_SHARED;
+  	}
+  
+ -	trace_xfs_file_direct_write(ip, count, iocb->ki_pos);
+ +	trace_xfs_file_direct_write(ip, count, iocb->ki_pos, 0);
+ +	ret = generic_file_direct_write(iocb, iovp,
+ +			&nr_segs, pos, &iocb->ki_pos, count, ocount);
+  
+++<<<<<<< HEAD
+++=======
++ 	data = *from;
++ 	ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data,
++ 			xfs_get_blocks_direct, xfs_end_io_direct_write,
++ 			NULL, DIO_ASYNC_EXTEND);
++ 
++ 	/* see generic_file_direct_write() for why this is necessary */
++ 	if (mapping->nrpages) {
++ 		invalidate_inode_pages2_range(mapping,
++ 					      iocb->ki_pos >> PAGE_SHIFT,
++ 					      end >> PAGE_SHIFT);
++ 	}
++ 
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(from, ret);
++ 	}
+++>>>>>>> 16d4d43595b4 (xfs: split direct I/O and DAX path)
+  out:
+  	xfs_rw_iunlock(ip, iolock);
+  
+@@@ -962,20 -1010,17 +1135,27 @@@ xfs_file_aio_write
+  	if (ocount == 0)
+  		return 0;
+  
+ -	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+ -		return -EIO;
+ +	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
+ +		ret = -EIO;
+ +		goto out;
+ +	}
+  
+++<<<<<<< HEAD
+ +	if ((file->f_flags & O_DIRECT) || IS_DAX(inode))
+ +		ret = xfs_file_dio_aio_write(iocb, iovp, nr_segs, pos, ocount);
+++=======
++ 	if (IS_DAX(inode))
++ 		ret = xfs_file_dax_write(iocb, from);
++ 	else if (iocb->ki_flags & IOCB_DIRECT)
++ 		ret = xfs_file_dio_aio_write(iocb, from);
+++>>>>>>> 16d4d43595b4 (xfs: split direct I/O and DAX path)
+  	else
+ -		ret = xfs_file_buffered_aio_write(iocb, from);
+ +		ret = xfs_file_buffered_aio_write(iocb, iovp, nr_segs, pos,
+ +						  ocount);
+  
+  	if (ret > 0) {
+ +		ssize_t err;
+ +
+  		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+  
+  		/* Handle various SYNC-type writes */
+diff --cc fs/xfs/xfs_trace.h
+index 96c4f1be0409,c2876917dd89..000000000000
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@@ -1166,13 -1160,15 +1166,22 @@@ DECLARE_EVENT_CLASS(xfs_file_class
+  
+  #define DEFINE_RW_EVENT(name)		\
+  DEFINE_EVENT(xfs_file_class, name,	\
+++<<<<<<< HEAD
+ +	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset, int flags),	\
+ +	TP_ARGS(ip, count, offset, flags))
+ +DEFINE_RW_EVENT(xfs_file_read);
+++=======
++ 	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset),	\
++ 	TP_ARGS(ip, count, offset))
++ DEFINE_RW_EVENT(xfs_file_buffered_read);
++ DEFINE_RW_EVENT(xfs_file_direct_read);
++ DEFINE_RW_EVENT(xfs_file_dax_read);
+++>>>>>>> 16d4d43595b4 (xfs: split direct I/O and DAX path)
+  DEFINE_RW_EVENT(xfs_file_buffered_write);
+  DEFINE_RW_EVENT(xfs_file_direct_write);
++ DEFINE_RW_EVENT(xfs_file_dax_write);
+  DEFINE_RW_EVENT(xfs_file_splice_read);
+ +DEFINE_RW_EVENT(xfs_file_splice_write);
+  
+  DECLARE_EVENT_CLASS(xfs_page_class,
+  	TP_PROTO(struct inode *inode, struct page *page, unsigned long off,
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_trace.h
