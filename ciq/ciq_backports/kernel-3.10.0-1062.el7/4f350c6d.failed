@@ -1,0 +1,162 @@
+kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jim Mattson <jmattson@google.com>
+commit 4f350c6dbcb9000e18907515ec8a7b205ac33c69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4f350c6d.failed
+
+When emulating a nested VM-entry from L1 to L2, several control field
+validation checks are deferred to the hardware. Should one of these
+validation checks fail, vcpu_vmx_run will set the vmx->fail flag. When
+this happens, the L2 guest state is not loaded (even in part), and
+execution should continue in L1 with the next instruction after the
+VMLAUNCH/VMRESUME.
+
+The VMCS12 is not modified (except for the VM-instruction error
+field), the VMCS12 MSR save/load lists are not processed, and the CPU
+state is not loaded from the VMCS12 host area. Moreover, the vmcs02
+exit reason is stale, so it should not be consulted for any reason.
+
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4f350c6dbcb9000e18907515ec8a7b205ac33c69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index c5d9f414275b,a406afbb6d21..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -8149,14 -8343,15 +8149,16 @@@ static bool nested_vmx_exit_handled(str
+  	u32 intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ +	u32 exit_reason = vmx->exit_reason;
+  
+- 	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason,
+- 				vmcs_readl(EXIT_QUALIFICATION),
+- 				vmx->idt_vectoring_info,
+- 				intr_info,
+- 				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
+- 				KVM_ISA_VMX);
++ 	if (vmx->nested.nested_run_pending)
++ 		return false;
++ 
++ 	if (unlikely(vmx->fail)) {
++ 		pr_info_ratelimited("%s failed vm entry %x\n", __func__,
++ 				    vmcs_read32(VM_INSTRUCTION_ERROR));
++ 		return true;
++ 	}
+  
+  	/*
+  	 * The host physical addresses of some pages of guest memory
+@@@ -11303,49 -11399,37 +11303,66 @@@ static void nested_vmx_vmexit(struct kv
+  	/* trying to cancel vmlaunch/vmresume is a bug */
+  	WARN_ON_ONCE(vmx->nested.nested_run_pending);
+  
+++<<<<<<< HEAD
+ +	leave_guest_mode(vcpu);
+ +	if (exit_reason == -1)
+ +		sync_vmcs12(vcpu, vmcs12);
+ +	else
+ +		prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
+ +			       exit_qualification);
+ +
+ +	if (nested_vmx_store_msr(vcpu, vmcs12->vm_exit_msr_store_addr,
+ +				 vmcs12->vm_exit_msr_store_count))
+ +		nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
+ +
+ +	vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+ +
+++=======
+++>>>>>>> 4f350c6dbcb9 (kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure properly)
+  	/*
+- 	 * TODO: SDM says that with acknowledge interrupt on exit, bit 31 of
+- 	 * the VM-exit interrupt information (valid interrupt) is always set to
+- 	 * 1 on EXIT_REASON_EXTERNAL_INTERRUPT, so we shouldn't need
+- 	 * kvm_cpu_has_interrupt().  See the commit message for details.
++ 	 * The only expected VM-instruction error is "VM entry with
++ 	 * invalid control field(s)." Anything else indicates a
++ 	 * problem with L0.
+  	 */
+- 	if (nested_exit_intr_ack_set(vcpu) &&
+- 	    exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
+- 	    kvm_cpu_has_interrupt(vcpu)) {
+- 		int irq = kvm_cpu_get_interrupt(vcpu);
+- 		WARN_ON(irq < 0);
+- 		vmcs12->vm_exit_intr_info = irq |
+- 			INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
++ 	WARN_ON_ONCE(vmx->fail && (vmcs_read32(VM_INSTRUCTION_ERROR) !=
++ 				   VMXERR_ENTRY_INVALID_CONTROL_FIELD));
++ 
++ 	leave_guest_mode(vcpu);
++ 
++ 	if (likely(!vmx->fail)) {
++ 		prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
++ 			       exit_qualification);
++ 
++ 		if (nested_vmx_store_msr(vcpu, vmcs12->vm_exit_msr_store_addr,
++ 					 vmcs12->vm_exit_msr_store_count))
++ 			nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (exit_reason != -1)
+ +		trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
+ +					       vmcs12->exit_qualification,
+ +					       vmcs12->idt_vectoring_info_field,
+ +					       vmcs12->vm_exit_intr_info,
+ +					       vmcs12->vm_exit_intr_error_code,
+ +					       KVM_ISA_VMX);
+ +
+++=======
++ 	vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+++>>>>>>> 4f350c6dbcb9 (kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure properly)
+  	vm_entry_controls_reset_shadow(vmx);
+  	vm_exit_controls_reset_shadow(vmx);
+  	vmx_segment_cache_clear(vmx);
+  
+++<<<<<<< HEAD
+ +	load_vmcs12_host_state(vcpu, vmcs12);
+++=======
++ 	/* if no vmcs02 cache requested, remove the one we used */
++ 	if (VMCS02_POOL_SIZE == 0)
++ 		nested_free_vmcs02(vmx, vmx->nested.current_vmptr);
+++>>>>>>> 4f350c6dbcb9 (kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure properly)
+  
+  	/* Update any VMCS fields that might have changed while L2 ran */
+ -	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, vmx->msr_autoload.nr);
+ -	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, vmx->msr_autoload.nr);
+  	vmcs_write64(TSC_OFFSET, vcpu->arch.tsc_offset);
+  	if (vmx->hv_deadline_tsc == -1)
+  		vmcs_clear_bits(PIN_BASED_VM_EXEC_CONTROL,
+@@@ -11386,19 -11473,9 +11403,23 @@@
+  	 * We are now running in L2, mmu_notifier will force to reload the
+  	 * page's hpa for L2 vmcs. Need to reload it for L1 before entering L1.
+  	 */
+ -	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
+ +	kvm_vcpu_reload_apic_access_page(vcpu);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Exiting from L2 to L1, we're now back to L1 which thinks it just
+ +	 * finished a VMLAUNCH or VMRESUME instruction, so we need to set the
+ +	 * success or failure flag accordingly.
+ +	 */
+ +	if (unlikely(vmx->fail)) {
+ +		vmx->fail = 0;
+ +		nested_vmx_failValid(vcpu, vmcs_read32(VM_INSTRUCTION_ERROR));
+ +	} else
+ +		nested_vmx_succeed(vcpu);
+ +	if (enable_shadow_vmcs && exit_reason != -1)
+++=======
++ 	if (enable_shadow_vmcs)
+++>>>>>>> 4f350c6dbcb9 (kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure properly)
+  		vmx->nested.sync_shadow_vmcs = true;
+  
+  	/* in case we halted in L2 */
+* Unmerged path arch/x86/kvm/vmx.c
