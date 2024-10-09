@@ -1,0 +1,178 @@
+amd-xgbe: Tx engine must not be active before stopping it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 16edd34e9ebb4c0b63c69ada3abe106a309cb431
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/16edd34e.failed
+
+If the Tx engine is told to stop while it is actively processing Tx
+descriptors it is possible that the Tx descriptor(s) will not be closed
+out properly. When the Tx engine is restarted this could result in the
+driver being stuck on the improperly closed descriptor.
+
+Update the driver to wait for the Tx engine to be in a stopped or
+suspended state before issuing the stop command.
+
+This has not been an issue to date, but it's a good safe-guard to have.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 16edd34e9ebb4c0b63c69ada3abe106a309cb431)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1d8899bca25d,46ce54459121..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -137,8 -142,12 +137,13 @@@
+  
+  #define XGBE_RX_MIN_BUF_SIZE	(ETH_FRAME_LEN + ETH_FCS_LEN + VLAN_HLEN)
+  #define XGBE_RX_BUF_ALIGN	64
+ -#define XGBE_SKB_ALLOC_SIZE	256
+ -#define XGBE_SPH_HDSMS_SIZE	2	/* Keep in sync with SKB_ALLOC_SIZE */
+  
+  #define XGBE_MAX_DMA_CHANNELS	16
+++<<<<<<< HEAD
+++=======
++ #define XGBE_MAX_QUEUES		16
++ #define XGBE_DMA_STOP_TIMEOUT	5
+++>>>>>>> 16edd34e9ebb (amd-xgbe: Tx engine must not be active before stopping it)
+  
+  /* DMA cache settings - Outer sharable, write-back, write-allocate */
+  #define XGBE_DMA_OS_AXDOMAIN	0x2
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-common.h b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index 3373e9ef2003..2bfc8638024e 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@ -125,9 +125,6 @@
+ #define DMA_AXIAWCR			0x3018
+ #define DMA_DSR0			0x3020
+ #define DMA_DSR1			0x3024
+-#define DMA_DSR2			0x3028
+-#define DMA_DSR3			0x302c
+-#define DMA_DSR4			0x3030
+ 
+ /* DMA register entry bit positions and sizes */
+ #define DMA_AXIARCR_DRC_INDEX		0
+@@ -158,10 +155,6 @@
+ #define DMA_AXIAWCR_TDC_WIDTH		4
+ #define DMA_AXIAWCR_TDD_INDEX		28
+ #define DMA_AXIAWCR_TDD_WIDTH		2
+-#define DMA_DSR0_RPS_INDEX		8
+-#define DMA_DSR0_RPS_WIDTH		4
+-#define DMA_DSR0_TPS_INDEX		12
+-#define DMA_DSR0_TPS_WIDTH		4
+ #define DMA_ISR_MACIS_INDEX		17
+ #define DMA_ISR_MACIS_WIDTH		1
+ #define DMA_ISR_MTLIS_INDEX		16
+@@ -175,6 +168,20 @@
+ #define DMA_SBMR_UNDEF_INDEX		0
+ #define DMA_SBMR_UNDEF_WIDTH		1
+ 
++/* DMA register values */
++#define DMA_DSR_RPS_WIDTH		4
++#define DMA_DSR_TPS_WIDTH		4
++#define DMA_DSR_Q_WIDTH			(DMA_DSR_RPS_WIDTH + DMA_DSR_TPS_WIDTH)
++#define DMA_DSR0_RPS_START		8
++#define DMA_DSR0_TPS_START		12
++#define DMA_DSRX_FIRST_QUEUE		3
++#define DMA_DSRX_INC			4
++#define DMA_DSRX_QPR			4
++#define DMA_DSRX_RPS_START		0
++#define DMA_DSRX_TPS_START		4
++#define DMA_TPS_STOPPED			0x00
++#define DMA_TPS_SUSPENDED		0x06
++
+ /* DMA channel register offsets
+  *   Multiple channels can be active.  The first channel has registers
+  *   that begin at 0x3100.  Each subsequent channel has registers that
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 07d289155ace..0f80906328f7 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@ -1900,6 +1900,47 @@ static void xgbe_config_mmc(struct xgbe_prv_data *pdata)
+ 	XGMAC_IOWRITE_BITS(pdata, MMC_CR, CR, 1);
+ }
+ 
++static void xgbe_prepare_tx_stop(struct xgbe_prv_data *pdata,
++				 struct xgbe_channel *channel)
++{
++	unsigned int tx_dsr, tx_pos, tx_qidx;
++	unsigned int tx_status;
++	unsigned long tx_timeout;
++
++	/* Calculate the status register to read and the position within */
++	if (channel->queue_index < DMA_DSRX_FIRST_QUEUE) {
++		tx_dsr = DMA_DSR0;
++		tx_pos = (channel->queue_index * DMA_DSR_Q_WIDTH) +
++			 DMA_DSR0_TPS_START;
++	} else {
++		tx_qidx = channel->queue_index - DMA_DSRX_FIRST_QUEUE;
++
++		tx_dsr = DMA_DSR1 + ((tx_qidx / DMA_DSRX_QPR) * DMA_DSRX_INC);
++		tx_pos = ((tx_qidx % DMA_DSRX_QPR) * DMA_DSR_Q_WIDTH) +
++			 DMA_DSRX_TPS_START;
++	}
++
++	/* The Tx engine cannot be stopped if it is actively processing
++	 * descriptors. Wait for the Tx engine to enter the stopped or
++	 * suspended state.  Don't wait forever though...
++	 */
++	tx_timeout = jiffies + (XGBE_DMA_STOP_TIMEOUT * HZ);
++	while (time_before(jiffies, tx_timeout)) {
++		tx_status = XGMAC_IOREAD(pdata, tx_dsr);
++		tx_status = GET_BITS(tx_status, tx_pos, DMA_DSR_TPS_WIDTH);
++		if ((tx_status == DMA_TPS_STOPPED) ||
++		    (tx_status == DMA_TPS_SUSPENDED))
++			break;
++
++		usleep_range(500, 1000);
++	}
++
++	if (!time_before(jiffies, tx_timeout))
++		netdev_info(pdata->netdev,
++			    "timed out waiting for Tx DMA channel %u to stop\n",
++			    channel->queue_index);
++}
++
+ static void xgbe_enable_tx(struct xgbe_prv_data *pdata)
+ {
+ 	struct xgbe_channel *channel;
+@@ -1928,6 +1969,15 @@ static void xgbe_disable_tx(struct xgbe_prv_data *pdata)
+ 	struct xgbe_channel *channel;
+ 	unsigned int i;
+ 
++	/* Prepare for Tx DMA channel stop */
++	channel = pdata->channel;
++	for (i = 0; i < pdata->channel_count; i++, channel++) {
++		if (!channel->tx_ring)
++			break;
++
++		xgbe_prepare_tx_stop(pdata, channel);
++	}
++
+ 	/* Disable MAC Tx */
+ 	XGMAC_IOWRITE_BITS(pdata, MAC_TCR, TE, 0);
+ 
+@@ -2019,6 +2069,15 @@ static void xgbe_powerdown_tx(struct xgbe_prv_data *pdata)
+ 	struct xgbe_channel *channel;
+ 	unsigned int i;
+ 
++	/* Prepare for Tx DMA channel stop */
++	channel = pdata->channel;
++	for (i = 0; i < pdata->channel_count; i++, channel++) {
++		if (!channel->tx_ring)
++			break;
++
++		xgbe_prepare_tx_stop(pdata, channel);
++	}
++
+ 	/* Disable MAC Tx */
+ 	XGMAC_IOWRITE_BITS(pdata, MAC_TCR, TE, 0);
+ 
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
