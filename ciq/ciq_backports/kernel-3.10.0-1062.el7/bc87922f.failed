@@ -1,0 +1,275 @@
+phy: Move PHY PM operations into phy_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andrew Lunn <andrew@lunn.ch>
+commit bc87922ff59d364a33e9bce0febdef21a7fbd2af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bc87922f.failed
+
+The MDIO PM operations are really PHY device PM operations. So move
+them into phy_device. This will be needed when we support devices on
+the mdio bus which are not PHYs.
+
+	Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bc87922ff59d364a33e9bce0febdef21a7fbd2af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/mdio_bus.c
+#	drivers/net/phy/phy_device.c
+#	include/linux/mdio.h
+diff --cc drivers/net/phy/mdio_bus.c
+index 1dbef80dbf2d,65ff8199bd09..000000000000
+--- a/drivers/net/phy/mdio_bus.c
++++ b/drivers/net/phy/mdio_bus.c
+@@@ -451,59 -561,14 +451,64 @@@ static int mdio_bus_match(struct devic
+  }
+  
+  #ifdef CONFIG_PM
+++<<<<<<< HEAD
+ +
+ +static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
+ +{
+ +	struct device_driver *drv = phydev->dev.driver;
+ +	struct phy_driver *phydrv = to_phy_driver(drv);
+ +	struct net_device *netdev = phydev->attached_dev;
+ +
+ +	if (!drv || !phydrv->suspend)
+ +		return false;
+ +
+ +	/* PHY not attached? May suspend if the PHY has not already been
+ +	 * suspended as part of a prior call to phy_disconnect() ->
+ +	 * phy_detach() -> phy_suspend() because the parent netdev might be the
+ +	 * MDIO bus driver and clock gated at this point.
+ +	 */
+ +	if (!netdev)
+ +		return !phydev->suspended;
+ +
+ +	/*
+ +	 * Don't suspend PHY if the attched netdev parent may wakeup.
+ +	 * The parent may point to a PCI device, as in tg3 driver.
+ +	 */
+ +	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
+ +		return false;
+ +
+ +	/*
+ +	 * Also don't suspend PHY if the netdev itself may wakeup. This
+ +	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
+ +	 * e.g. SoC devices.
+ +	 */
+ +	if (device_may_wakeup(&netdev->dev))
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+++=======
+++>>>>>>> bc87922ff59d (phy: Move PHY PM operations into phy_device)
+  static int mdio_bus_suspend(struct device *dev)
+  {
+- 	struct phy_device *phydev = to_phy_device(dev);
++ 	struct mdio_device *mdio = to_mdio_device(dev);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We must stop the state machine manually, otherwise it stops out of
+ +	 * control, possibly with the phydev->lock held. Upon resume, netdev
+ +	 * may call phy routines that try to grab the same lock, and that may
+ +	 * lead to a deadlock.
+ +	 */
+ +	if (phydev->attached_dev && phydev->adjust_link)
+ +		phy_stop_machine(phydev);
+++=======
++ 	if (mdio->pm_ops && mdio->pm_ops->suspend)
++ 		return mdio->pm_ops->suspend(dev);
+++>>>>>>> bc87922ff59d (phy: Move PHY PM operations into phy_device)
+  
+- 	if (!mdio_bus_phy_may_suspend(phydev))
+- 		return 0;
+- 
+- 	return phy_suspend(phydev);
++ 	return 0;
+  }
+  
+  static int mdio_bus_resume(struct device *dev)
+diff --cc drivers/net/phy/phy_device.c
+index 273a57729eef,eb0b0ed32662..000000000000
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@@ -62,9 -63,118 +62,118 @@@ static struct phy_driver genphy_driver[
+  static LIST_HEAD(phy_fixup_list);
+  static DEFINE_MUTEX(phy_fixup_lock);
+  
++ #ifdef CONFIG_PM
++ static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
++ {
++ 	struct device_driver *drv = phydev->mdio.dev.driver;
++ 	struct phy_driver *phydrv = to_phy_driver(drv);
++ 	struct net_device *netdev = phydev->attached_dev;
++ 
++ 	if (!drv || !phydrv->suspend)
++ 		return false;
++ 
++ 	/* PHY not attached? May suspend if the PHY has not already been
++ 	 * suspended as part of a prior call to phy_disconnect() ->
++ 	 * phy_detach() -> phy_suspend() because the parent netdev might be the
++ 	 * MDIO bus driver and clock gated at this point.
++ 	 */
++ 	if (!netdev)
++ 		return !phydev->suspended;
++ 
++ 	/* Don't suspend PHY if the attached netdev parent may wakeup.
++ 	 * The parent may point to a PCI device, as in tg3 driver.
++ 	 */
++ 	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
++ 		return false;
++ 
++ 	/* Also don't suspend PHY if the netdev itself may wakeup. This
++ 	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
++ 	 * e.g. SoC devices.
++ 	 */
++ 	if (device_may_wakeup(&netdev->dev))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static int mdio_bus_phy_suspend(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 
++ 	/* We must stop the state machine manually, otherwise it stops out of
++ 	 * control, possibly with the phydev->lock held. Upon resume, netdev
++ 	 * may call phy routines that try to grab the same lock, and that may
++ 	 * lead to a deadlock.
++ 	 */
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_stop_machine(phydev);
++ 
++ 	if (!mdio_bus_phy_may_suspend(phydev))
++ 		return 0;
++ 
++ 	return phy_suspend(phydev);
++ }
++ 
++ static int mdio_bus_phy_resume(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 	int ret;
++ 
++ 	if (!mdio_bus_phy_may_suspend(phydev))
++ 		goto no_resume;
++ 
++ 	ret = phy_resume(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ no_resume:
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_start_machine(phydev);
++ 
++ 	return 0;
++ }
++ 
++ static int mdio_bus_phy_restore(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 	struct net_device *netdev = phydev->attached_dev;
++ 	int ret;
++ 
++ 	if (!netdev)
++ 		return 0;
++ 
++ 	ret = phy_init_hw(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* The PHY needs to renegotiate. */
++ 	phydev->link = 0;
++ 	phydev->state = PHY_UP;
++ 
++ 	phy_start_machine(phydev);
++ 
++ 	return 0;
++ }
++ 
++ static const struct dev_pm_ops mdio_bus_phy_pm_ops = {
++ 	.suspend = mdio_bus_phy_suspend,
++ 	.resume = mdio_bus_phy_resume,
++ 	.freeze = mdio_bus_phy_suspend,
++ 	.thaw = mdio_bus_phy_resume,
++ 	.restore = mdio_bus_phy_restore,
++ };
++ 
++ #define MDIO_BUS_PHY_PM_OPS (&mdio_bus_phy_pm_ops)
++ 
++ #else
++ 
++ #define MDIO_BUS_PHY_PM_OPS NULL
++ 
++ #endif /* CONFIG_PM */
++ 
+  /**
+   * phy_register_fixup - creates a new phy_fixup and adds it to the list
+ - * @bus_id: A string which matches phydev->mdio.dev.bus_id (or PHY_ANY_ID)
+ + * @bus_id: A string which matches phydev->dev.bus_id (or PHY_ANY_ID)
+   * @phy_uid: Used to match against phydev->phy_id (the UID of the PHY)
+   *	It can also be PHY_ANY_UID
+   * @phy_uid_mask: Applied to phydev->phy_id and fixup->phy_uid before
+@@@ -154,10 -265,18 +263,21 @@@ struct phy_device *phy_device_create(st
+  
+  	/* We allocate the device, and initialize the default values */
+  	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ -	if (!dev)
+ -		return ERR_PTR(-ENOMEM);
+ +	if (NULL == dev)
+ +		return (struct phy_device *)PTR_ERR((void *)-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	dev->dev.release = phy_device_release;
+++=======
++ 	mdiodev = &dev->mdio;
++ 	mdiodev->dev.release = phy_device_release;
++ 	mdiodev->dev.parent = &bus->dev;
++ 	mdiodev->dev.bus = &mdio_bus_type;
++ 	mdiodev->bus = bus;
++ 	mdiodev->pm_ops = MDIO_BUS_PHY_PM_OPS;
++ 	mdiodev->addr = addr;
++ 	mdiodev->flags = MDIO_DEVICE_FLAG_PHY;
+++>>>>>>> bc87922ff59d (phy: Move PHY PM operations into phy_device)
+  
+  	dev->speed = 0;
+  	dev->duplex = -1;
+diff --cc include/linux/mdio.h
+index 07a206d16ffc,9f844d372ed5..000000000000
+--- a/include/linux/mdio.h
++++ b/include/linux/mdio.h
+@@@ -13,6 -13,18 +13,21 @@@
+  
+  struct mii_bus;
+  
+++<<<<<<< HEAD
+++=======
++ struct mdio_device {
++ 	struct device dev;
++ 	const struct dev_pm_ops *pm_ops;
++ 	struct mii_bus *bus;
++ 	/* Bus address of the MDIO device (0-31) */
++ 	int addr;
++ 	int flags;
++ };
++ #define to_mdio_device(d) container_of(d, struct mdio_device, dev)
++ 
++ #define MDIO_DEVICE_FLAG_PHY		1
++ 
+++>>>>>>> bc87922ff59d (phy: Move PHY PM operations into phy_device)
+  static inline bool mdio_phy_id_is_c45(int phy_id)
+  {
+  	return (phy_id & MDIO_PHY_ID_C45) && !(phy_id & ~MDIO_PHY_ID_C45_MASK);
+* Unmerged path drivers/net/phy/mdio_bus.c
+* Unmerged path drivers/net/phy/phy_device.c
+* Unmerged path include/linux/mdio.h
