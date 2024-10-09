@@ -1,0 +1,93 @@
+Btrfs: introduce ticketed enospc infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Josef Bacik <jbacik@fb.com>
+commit 957780eb2788d8c218d539e19a85653f51a96dc1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/957780eb.failed
+
+Our enospc flushing sucks.  It is born from a time where we were early
+enospc'ing constantly because multiple threads would race in for the same
+reservation and randomly starve other ones out.  So I came up with this solution
+to block any other reservations from happening while one guy tried to flush
+stuff to satisfy his reservation.  This gives us pretty good correctness, but
+completely crap latency.
+
+The solution I've come up with is ticketed reservations.  Basically we try to
+make our reservation, and if we can't we put a ticket on a list in order and
+kick off an async flusher thread.  This async flusher thread does the same old
+flushing we always did, just asynchronously.  As space is freed and added back
+to the space_info it checks and sees if we have any tickets that need
+satisfying, and adds space to the tickets and wakes up anything we've satisfied.
+
+Once the flusher thread stops making progress it wakes up all the current
+tickets and tells them to take a hike.
+
+There is a priority list for things that can't flush, since the async flusher
+could do anything we need to avoid deadlocks.  These guys get priority for
+having their reservation made, and will still do manual flushing themselves in
+case the async flusher isn't running.
+
+This patch gives us significantly better latencies.  Thanks,
+
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit 957780eb2788d8c218d539e19a85653f51a96dc1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/extent-tree.c
+index fdbe3dee4eb1,2c17b621a661..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -4801,18 -4908,22 +4834,28 @@@ static inline u6
+  btrfs_calc_reclaim_metadata_size(struct btrfs_root *root,
+  				 struct btrfs_space_info *space_info)
+  {
++ 	struct reserve_ticket *ticket;
+  	u64 used;
+  	u64 expected;
+- 	u64 to_reclaim;
++ 	u64 to_reclaim = 0;
+  
+++<<<<<<< HEAD
+ +	to_reclaim = min_t(u64, num_online_cpus() * 1024 * 1024,
+ +				16 * 1024 * 1024);
+ +	spin_lock(&space_info->lock);
+++=======
++ 	to_reclaim = min_t(u64, num_online_cpus() * SZ_1M, SZ_16M);
+++>>>>>>> 957780eb2788 (Btrfs: introduce ticketed enospc infrastructure)
+  	if (can_overcommit(root, space_info, to_reclaim,
+- 			   BTRFS_RESERVE_FLUSH_ALL)) {
+- 		to_reclaim = 0;
+- 		goto out;
+- 	}
++ 			   BTRFS_RESERVE_FLUSH_ALL))
++ 		return 0;
++ 
++ 	list_for_each_entry(ticket, &space_info->tickets, list)
++ 		to_reclaim += ticket->bytes;
++ 	list_for_each_entry(ticket, &space_info->priority_tickets, list)
++ 		to_reclaim += ticket->bytes;
++ 	if (to_reclaim)
++ 		return to_reclaim;
+  
+  	used = space_info->bytes_used + space_info->bytes_reserved +
+  	       space_info->bytes_pinned + space_info->bytes_readonly +
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index eaff9105e433..62e9eff8e2fb 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -434,6 +434,8 @@ struct btrfs_space_info {
+ 	struct list_head list;
+ 	/* Protected by the spinlock 'lock'. */
+ 	struct list_head ro_bgs;
++	struct list_head priority_tickets;
++	struct list_head tickets;
+ 
+ 	struct rw_semaphore groups_sem;
+ 	/* for block groups in our same type */
+* Unmerged path fs/btrfs/extent-tree.c
