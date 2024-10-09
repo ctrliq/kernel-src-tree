@@ -1089,6 +1089,9 @@ void pci_restore_state(struct pci_dev *dev)
 
 	pci_restore_pcix_state(dev);
 	pci_restore_msi_state(dev);
+
+	/* Restore ACS and IOV configuration state */
+	pci_enable_acs(dev);
 	pci_restore_iov_state(dev);
 
 	dev->state_saved = false;
