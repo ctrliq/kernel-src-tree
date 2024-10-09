@@ -1081,7 +1081,7 @@ static struct key_vector *fib_find_node(struct trie *t,
  * priority less than or equal to PRIO.
  */
 static struct fib_alias *fib_find_alias(struct hlist_head *fah, u8 slen,
-					u8 tos, u32 prio)
+					u8 tos, u32 prio, u32 tb_id)
 {
 	struct fib_alias *fa;
 
@@ -1092,6 +1092,10 @@ static struct fib_alias *fib_find_alias(struct hlist_head *fah, u8 slen,
 		if (fa->fa_slen < slen)
 			continue;
 		if (fa->fa_slen != slen)
+			break;
+		if (fa->tb_id > tb_id)
+			continue;
+		if (fa->tb_id != tb_id)
 			break;
 		if (fa->fa_tos > tos)
 			continue;
@@ -1172,6 +1176,9 @@ static int fib_insert_alias(struct trie *t, struct key_vector *tp,
 		hlist_for_each_entry(last, &l->leaf, fa_list) {
 			if (new->fa_slen < last->fa_slen)
 				break;
+			if ((new->fa_slen == last->fa_slen) &&
+			    (new->tb_id > last->tb_id))
+				break;
 			fa = last;
 		}
 
@@ -1223,7 +1230,8 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 	}
 
 	l = fib_find_node(t, &tp, key);
-	fa = l ? fib_find_alias(&l->leaf, slen, tos, fi->fib_priority) : NULL;
+	fa = l ? fib_find_alias(&l->leaf, slen, tos, fi->fib_priority,
+				tb->tb_id) : NULL;
 
 	/* Now fa, if non-NULL, points to the first fib alias
 	 * with the same keys [prefix,tos,priority], if such key already
@@ -1252,7 +1260,9 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 		fa_match = NULL;
 		fa_first = fa;
 		hlist_for_each_entry_from(fa, fa_list) {
-			if ((fa->fa_slen != slen) || (fa->fa_tos != tos))
+			if ((fa->fa_slen != slen) ||
+			    (fa->tb_id != tb->tb_id) ||
+			    (fa->fa_tos != tos))
 				break;
 			if (fa->fa_info->fib_priority != fi->fib_priority)
 				break;
@@ -1597,7 +1607,7 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
 	if (!l)
 		return -ESRCH;
 
-	fa = fib_find_alias(&l->leaf, slen, tos, 0);
+	fa = fib_find_alias(&l->leaf, slen, tos, 0, tb->tb_id);
 	if (!fa)
 		return -ESRCH;
 
@@ -1607,7 +1617,9 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
 	hlist_for_each_entry_from(fa, fa_list) {
 		struct fib_info *fi = fa->fa_info;
 
-		if ((fa->fa_slen != slen) || (fa->fa_tos != tos))
+		if ((fa->fa_slen != slen) ||
+		    (fa->tb_id != tb->tb_id) ||
+		    (fa->fa_tos != tos))
 			break;
 
 		if ((!cfg->fc_type || fa->fa_type == cfg->fc_type) &&
