@@ -660,6 +660,11 @@ static void nfs41_sequence_free_slot(struct nfs4_sequence_res *res)
 	tbl = slot->table;
 	session = tbl->session;
 
+	/* Bump the slot sequence number */
+	if (slot->seq_done)
+		slot->seq_nr++;
+	slot->seq_done = 0;
+
 	spin_lock(&tbl->slot_tbl_lock);
 	/* Be nice to the server: try to ensure that the last transmitted
 	 * value for highest_user_slotid <= target_highest_slotid
@@ -717,7 +722,7 @@ int nfs41_sequence_done(struct rpc_task *task, struct nfs4_sequence_res *res)
 			goto retry_nowait;
 		}
 		/* Update the slot's sequence and clientid lease timer */
-		++slot->seq_nr;
+		slot->seq_done = 1;
 		clp = session->clp;
 		do_renew_lease(clp, res->sr_timestamp);
 		/* Check sequence flags */
@@ -772,7 +777,7 @@ int nfs41_sequence_done(struct rpc_task *task, struct nfs4_sequence_res *res)
 		goto retry_nowait;
 	default:
 		/* Just update the slot sequence no. */
-		++slot->seq_nr;
+		slot->seq_done = 1;
 	}
 out:
 	/* The session may be reset by one of the error handlers. */
