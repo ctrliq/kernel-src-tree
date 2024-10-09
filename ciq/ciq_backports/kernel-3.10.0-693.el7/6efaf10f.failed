@@ -1,0 +1,120 @@
+IB/rdmavt: Avoid queuing work into a destroyed cq kthread worker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Petr Mladek <pmladek@suse.com>
+commit 6efaf10f163d9a60d1d4b2a049b194a53537ba1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6efaf10f.failed
+
+The memory barrier is not enough to protect queuing works into
+a destroyed cq kthread. Just imagine the following situation:
+
+CPU1				CPU2
+
+rvt_cq_enter()
+  worker =  cq->rdi->worker;
+
+				rvt_cq_exit()
+				  rdi->worker = NULL;
+				  smp_wmb();
+				  kthread_flush_worker(worker);
+				  kthread_stop(worker->task);
+				  kfree(worker);
+
+				  // nothing queued yet =>
+				  // nothing flushed and
+				  // happily stopped and freed
+
+  if (likely(worker)) {
+     // true => read before CPU2 acted
+     cq->notify = RVT_CQ_NONE;
+     cq->triggered++;
+     kthread_queue_work(worker, &cq->comptask);
+
+  BANG: worker has been flushed/stopped/freed in the meantime.
+
+This patch solves this by protecting the critical sections by
+rdi->n_cqs_lock. It seems that this lock is not much contended
+and looks reasonable for this purpose.
+
+One catch is that rvt_cq_enter() might be called from IRQ context.
+Therefore we must always take the lock with IRQs disabled to avoid
+a possible deadlock.
+
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 6efaf10f163d9a60d1d4b2a049b194a53537ba1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/cq.c
+diff --cc drivers/infiniband/sw/rdmavt/cq.c
+index 3bbc3f36d3d6,223ec4589fc7..000000000000
+--- a/drivers/infiniband/sw/rdmavt/cq.c
++++ b/drivers/infiniband/sw/rdmavt/cq.c
+@@@ -124,13 -123,13 +123,17 @@@ void rvt_cq_enter(struct rvt_cq *cq, st
+  		 * This will cause send_complete() to be called in
+  		 * another thread.
+  		 */
+- 		smp_read_barrier_depends(); /* see rvt_cq_exit */
+- 		worker = cq->rdi->worker;
+- 		if (likely(worker)) {
++ 		spin_lock(&cq->rdi->n_cqs_lock);
++ 		if (likely(cq->rdi->worker)) {
+  			cq->notify = RVT_CQ_NONE;
+  			cq->triggered++;
+++<<<<<<< HEAD
+ +			queue_kthread_work(worker, &cq->comptask);
+++=======
++ 			kthread_queue_work(cq->rdi->worker, &cq->comptask);
+++>>>>>>> 6efaf10f163d (IB/rdmavt: Avoid queuing work into a destroyed cq kthread worker)
+  		}
++ 		spin_unlock(&cq->rdi->n_cqs_lock);
+  	}
+  
+  	spin_unlock_irqrestore(&cq->lock, flags);
+@@@ -295,10 -294,10 +298,15 @@@ int rvt_destroy_cq(struct ib_cq *ibcq
+  	struct rvt_cq *cq = ibcq_to_rvtcq(ibcq);
+  	struct rvt_dev_info *rdi = cq->rdi;
+  
+++<<<<<<< HEAD
+ +	flush_kthread_work(&cq->comptask);
+ +	spin_lock(&rdi->n_cqs_lock);
+++=======
++ 	kthread_flush_work(&cq->comptask);
++ 	spin_lock_irq(&rdi->n_cqs_lock);
+++>>>>>>> 6efaf10f163d (IB/rdmavt: Avoid queuing work into a destroyed cq kthread worker)
+  	rdi->n_cqs_allocated--;
+- 	spin_unlock(&rdi->n_cqs_lock);
++ 	spin_unlock_irq(&rdi->n_cqs_lock);
+  	if (cq->ip)
+  		kref_put(&cq->ip->ref, rvt_release_mmap_info);
+  	else
+@@@ -541,13 -540,16 +549,21 @@@ void rvt_cq_exit(struct rvt_dev_info *r
+  {
+  	struct kthread_worker *worker;
+  
+- 	worker = rdi->worker;
+- 	if (!worker)
++ 	/* block future queuing from send_complete() */
++ 	spin_lock_irq(&rdi->n_cqs_lock);
++ 	if (!rdi->worker) {
++ 		spin_unlock_irq(&rdi->n_cqs_lock);
+  		return;
+- 	/* blocks future queuing from send_complete() */
++ 	}
+  	rdi->worker = NULL;
+++<<<<<<< HEAD
+ +	smp_wmb(); /* See rdi_cq_enter */
+ +	flush_kthread_worker(worker);
+++=======
++ 	spin_unlock_irq(&rdi->n_cqs_lock);
++ 
++ 	kthread_flush_worker(worker);
+++>>>>>>> 6efaf10f163d (IB/rdmavt: Avoid queuing work into a destroyed cq kthread worker)
+  	kthread_stop(worker->task);
+  	kfree(worker);
+  }
+* Unmerged path drivers/infiniband/sw/rdmavt/cq.c
