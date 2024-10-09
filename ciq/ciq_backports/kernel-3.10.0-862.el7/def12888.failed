@@ -1,0 +1,284 @@
+rtnl: Add support for netdev event to link messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vlad Yasevich <vyasevich@gmail.com>
+commit def12888c161e6fec0702e5ec9c3962846e3a21d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/def12888.failed
+
+When netdev events happen, a rtnetlink_event() handler will send
+messages for every event in it's white list.  These messages contain
+current information about a particular device, but they do not include
+the iformation about which event just happened.  The consumer of
+the message has to try to infer this information.  In some cases
+(ex: NETDEV_NOTIFY_PEERS), that is not possible.
+
+This patch adds a new extension to RTM_NEWLINK message called IFLA_EVENT
+that would have an encoding of the which event triggered this
+message.  This would allow the the message consumer to easily determine
+if it is interested in a particular event or not.
+
+	Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit def12888c161e6fec0702e5ec9c3962846e3a21d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_link.h
+#	net/core/rtnetlink.c
+diff --cc include/uapi/linux/if_link.h
+index 996998dd2fff,97f6d302f627..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -160,6 -156,8 +160,11 @@@ enum 
+  	IFLA_GSO_MAX_SEGS,
+  	IFLA_GSO_MAX_SIZE,
+  	IFLA_PAD,
+++<<<<<<< HEAD
+++=======
++ 	IFLA_XDP,
++ 	IFLA_EVENT,
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  	__IFLA_MAX
+  };
+  
+@@@ -801,4 -885,39 +806,42 @@@ enum 
+  };
+  #define IFLA_OFFLOAD_XSTATS_MAX (__IFLA_OFFLOAD_XSTATS_MAX - 1)
+  
+++<<<<<<< HEAD
+++=======
++ /* XDP section */
++ 
++ #define XDP_FLAGS_UPDATE_IF_NOEXIST	(1U << 0)
++ #define XDP_FLAGS_MASK			(XDP_FLAGS_UPDATE_IF_NOEXIST)
++ 
++ enum {
++ 	IFLA_XDP_UNSPEC,
++ 	IFLA_XDP_FD,
++ 	IFLA_XDP_ATTACHED,
++ 	IFLA_XDP_FLAGS,
++ 	__IFLA_XDP_MAX,
++ };
++ 
++ #define IFLA_XDP_MAX (__IFLA_XDP_MAX - 1)
++ 
++ enum {
++ 	IFLA_EVENT_UNSPEC,
++ 	IFLA_EVENT_REBOOT,
++ 	IFLA_EVENT_CHANGE_MTU,
++ 	IFLA_EVENT_CHANGE_ADDR,
++ 	IFLA_EVENT_CHANGE_NAME,
++ 	IFLA_EVENT_FEAT_CHANGE,
++ 	IFLA_EVENT_BONDING_FAILOVER,
++ 	IFLA_EVENT_POST_TYPE_CHANGE,
++ 	IFLA_EVENT_NOTIFY_PEERS,
++ 	IFLA_EVENT_CHANGE_UPPER,
++ 	IFLA_EVENT_RESEND_IGMP,
++ 	IFLA_EVENT_PRE_CHANGE_MTU,
++ 	IFLA_EVENT_CHANGE_INFO_DATA,
++ 	IFLA_EVENT_PRE_CHANGE_UPPER,
++ 	IFLA_EVENT_CHANGE_LOWER_STATE,
++ 	IFLA_EVENT_UDP_TUNNEL_PUSH_INFO,
++ 	IFLA_EVENT_CHANGE_TX_QUEUE_LEN,
++ };
++ 
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  #endif /* _UAPI_LINUX_IF_LINK_H */
+diff --cc net/core/rtnetlink.c
+index 2ed873570a8d,b2bd4c9ee860..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -916,6 -943,8 +916,11 @@@ static noinline size_t if_nlmsg_size(co
+  	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_PORT_ID */
+  	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_SWITCH_ID */
+  	       + nla_total_size(IFNAMSIZ) /* IFLA_PHYS_PORT_NAME */
+++<<<<<<< HEAD
+++=======
++ 	       + rtnl_xdp_size(dev) /* IFLA_XDP */
++ 	       + nla_total_size(4)  /* IFLA_EVENT */
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  	       + nla_total_size(1); /* IFLA_PROTO_DOWN */
+  
+  }
+@@@ -1219,9 -1250,97 +1224,100 @@@ static int rtnl_fill_link_ifmap(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct netdev_xdp xdp_op = {};
++ 	struct nlattr *xdp;
++ 	int err;
++ 
++ 	if (!dev->netdev_ops->ndo_xdp)
++ 		return 0;
++ 	xdp = nla_nest_start(skb, IFLA_XDP);
++ 	if (!xdp)
++ 		return -EMSGSIZE;
++ 	xdp_op.command = XDP_QUERY_PROG;
++ 	err = dev->netdev_ops->ndo_xdp(dev, &xdp_op);
++ 	if (err)
++ 		goto err_cancel;
++ 	err = nla_put_u8(skb, IFLA_XDP_ATTACHED, xdp_op.prog_attached);
++ 	if (err)
++ 		goto err_cancel;
++ 
++ 	nla_nest_end(skb, xdp);
++ 	return 0;
++ 
++ err_cancel:
++ 	nla_nest_cancel(skb, xdp);
++ 	return err;
++ }
++ 
++ static int rtnl_fill_link_event(struct sk_buff *skb, unsigned long event)
++ {
++ 	u32 rtnl_event;
++ 
++ 	switch (event) {
++ 	case NETDEV_REBOOT:
++ 		rtnl_event = IFLA_EVENT_REBOOT;
++ 		break;
++ 	case NETDEV_CHANGEMTU:
++ 		rtnl_event = IFLA_EVENT_CHANGE_MTU;
++ 		break;
++ 	case NETDEV_CHANGEADDR:
++ 		rtnl_event = IFLA_EVENT_CHANGE_ADDR;
++ 		break;
++ 	case NETDEV_CHANGENAME:
++ 		rtnl_event = IFLA_EVENT_CHANGE_NAME;
++ 		break;
++ 	case NETDEV_FEAT_CHANGE:
++ 		rtnl_event = IFLA_EVENT_FEAT_CHANGE;
++ 		break;
++ 	case NETDEV_BONDING_FAILOVER:
++ 		rtnl_event = IFLA_EVENT_BONDING_FAILOVER;
++ 		break;
++ 	case NETDEV_POST_TYPE_CHANGE:
++ 		rtnl_event = IFLA_EVENT_POST_TYPE_CHANGE;
++ 		break;
++ 	case NETDEV_NOTIFY_PEERS:
++ 		rtnl_event = IFLA_EVENT_NOTIFY_PEERS;
++ 		break;
++ 	case NETDEV_CHANGEUPPER:
++ 		rtnl_event = IFLA_EVENT_CHANGE_UPPER;
++ 		break;
++ 	case NETDEV_RESEND_IGMP:
++ 		rtnl_event = IFLA_EVENT_RESEND_IGMP;
++ 		break;
++ 	case NETDEV_PRECHANGEMTU:
++ 		rtnl_event = IFLA_EVENT_PRE_CHANGE_MTU;
++ 		break;
++ 	case NETDEV_CHANGEINFODATA:
++ 		rtnl_event = IFLA_EVENT_CHANGE_INFO_DATA;
++ 		break;
++ 	case NETDEV_PRECHANGEUPPER:
++ 		rtnl_event = IFLA_EVENT_PRE_CHANGE_UPPER;
++ 		break;
++ 	case NETDEV_CHANGELOWERSTATE:
++ 		rtnl_event = IFLA_EVENT_CHANGE_LOWER_STATE;
++ 		break;
++ 	case NETDEV_UDP_TUNNEL_PUSH_INFO:
++ 		rtnl_event = IFLA_EVENT_UDP_TUNNEL_PUSH_INFO;
++ 		break;
++ 	case NETDEV_CHANGE_TX_QUEUE_LEN:
++ 		rtnl_event = IFLA_EVENT_CHANGE_TX_QUEUE_LEN;
++ 		break;
++ 	default:
++ 		return 0;
++ 	}
++ 
++ 	return nla_put_u32(skb, IFLA_EVENT, rtnl_event);
++ }
++ 
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+  			    int type, u32 pid, u32 seq, u32 change,
+- 			    unsigned int flags, u32 ext_filter_mask)
++ 			    unsigned int flags, u32 ext_filter_mask,
++ 			    unsigned long event)
+  {
+  	struct ifinfomsg *ifm;
+  	struct nlmsghdr *nlh;
+@@@ -1400,6 -1525,8 +1499,11 @@@ static const struct nla_policy ifla_pol
+  	[IFLA_PHYS_SWITCH_ID]	= { .type = NLA_BINARY, .len = MAX_PHYS_ITEM_ID_LEN },
+  	[IFLA_LINK_NETNSID]	= { .type = NLA_S32 },
+  	[IFLA_PROTO_DOWN]	= { .type = NLA_U8 },
+++<<<<<<< HEAD
+++=======
++ 	[IFLA_XDP]		= { .type = NLA_NESTED },
++ 	[IFLA_EVENT]		= { .type = NLA_U32 },
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  };
+  
+  static const struct nla_policy ifla_info_policy[IFLA_INFO_MAX+1] = {
+@@@ -1489,8 -1684,8 +1593,13 @@@ static int rtnl_dump_ifinfo(struct sk_b
+  			err = rtnl_fill_ifinfo(skb, dev, RTM_NEWLINK,
+  					       NETLINK_CB(cb->skb).portid,
+  					       cb->nlh->nlmsg_seq, 0,
+++<<<<<<< HEAD
+ +					       NLM_F_MULTI,
+ +					       ext_filter_mask);
+++=======
++ 					       flags,
++ 					       ext_filter_mask, 0);
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  			/* If we ran out of room on the first message,
+  			 * we're in trouble
+  			 */
+@@@ -3921,10 -4194,19 +4038,18 @@@ static int rtnetlink_event(struct notif
+  	case NETDEV_CHANGENAME:
+  	case NETDEV_FEAT_CHANGE:
+  	case NETDEV_BONDING_FAILOVER:
+ -	case NETDEV_POST_TYPE_CHANGE:
+  	case NETDEV_NOTIFY_PEERS:
+ -	case NETDEV_CHANGEUPPER:
+  	case NETDEV_RESEND_IGMP:
+ -	case NETDEV_PRECHANGEMTU:
+  	case NETDEV_CHANGEINFODATA:
+++<<<<<<< HEAD
+ +		rtmsg_ifinfo(RTM_NEWLINK, dev, 0, GFP_KERNEL);
+++=======
++ 	case NETDEV_PRECHANGEUPPER:
++ 	case NETDEV_CHANGELOWERSTATE:
++ 	case NETDEV_UDP_TUNNEL_PUSH_INFO:
++ 	case NETDEV_CHANGE_TX_QUEUE_LEN:
++ 		rtmsg_ifinfo_event(RTM_NEWLINK, dev, 0, event, GFP_KERNEL);
+++>>>>>>> def12888c161 (rtnl: Add support for netdev event to link messages)
+  		break;
+  	default:
+  		break;
+diff --git a/include/linux/rtnetlink.h b/include/linux/rtnetlink.h
+index e5e3fc72eb1c..d6aa49d58340 100644
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@ -18,7 +18,8 @@ extern int rtnl_put_cacheinfo(struct sk_buff *skb, struct dst_entry *dst,
+ 
+ void rtmsg_ifinfo(int type, struct net_device *dev, unsigned change, gfp_t flags);
+ struct sk_buff *rtmsg_ifinfo_build_skb(int type, struct net_device *dev,
+-				       unsigned change, gfp_t flags);
++				       unsigned change, unsigned long event,
++				       gfp_t flags);
+ void rtmsg_ifinfo_send(struct sk_buff *skb, struct net_device *dev,
+ 		       gfp_t flags);
+ 
+* Unmerged path include/uapi/linux/if_link.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 54ad82302512..0dfdde258ef0 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6801,7 +6801,7 @@ static void rollback_registered_many(struct list_head *head)
+ 
+ 		if (!dev->rtnl_link_ops ||
+ 		    dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
+-			skb = rtmsg_ifinfo_build_skb(RTM_DELLINK, dev, ~0U,
++			skb = rtmsg_ifinfo_build_skb(RTM_DELLINK, dev, ~0U, 0,
+ 						     GFP_KERNEL);
+ 
+ 		/*
+* Unmerged path net/core/rtnetlink.c
