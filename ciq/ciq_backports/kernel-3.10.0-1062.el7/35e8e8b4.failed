@@ -1,0 +1,611 @@
+net: aquantia: synchronized flow control between mac/phy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] aquantia: synchronized flow control between mac/phy (Igor Russkikh) [1648333]
+Rebuild_FUZZ: 95.33%
+commit-author Igor Russkikh <Igor.Russkikh@aquantia.com>
+commit 35e8e8b45d31bec34379dd36e7b71448e003efb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/35e8e8b4.failed
+
+Flow control statuses were not synchronized between blocks,
+that caused packets/link drop on some corner cases, when
+MAC sent PFC although Phy was not expecting these to come.
+
+Driver should readout the negotiated FC from phy and
+configure RX block accordigly.
+
+This is done on each link change event with information from FW.
+
+Fixes: 288551de45aa ("net: aquantia: Implement rx/tx flow control ethtools callback")
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 35e8e8b45d31bec34379dd36e7b71448e003efb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+index f2d8063a2cef,99ef1daaa4d8..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+@@@ -284,6 -285,222 +284,225 @@@ static int aq_ethtool_set_coalesce(stru
+  	return aq_nic_update_interrupt_moderation_settings(aq_nic);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void aq_ethtool_get_wol(struct net_device *ndev,
++ 			       struct ethtool_wolinfo *wol)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(aq_nic);
++ 
++ 	wol->supported = WAKE_MAGIC;
++ 	wol->wolopts = 0;
++ 
++ 	if (cfg->wol)
++ 		wol->wolopts |= WAKE_MAGIC;
++ }
++ 
++ static int aq_ethtool_set_wol(struct net_device *ndev,
++ 			      struct ethtool_wolinfo *wol)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(ndev->dev.parent);
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(aq_nic);
++ 	int err = 0;
++ 
++ 	if (wol->wolopts & WAKE_MAGIC)
++ 		cfg->wol |= AQ_NIC_WOL_ENABLED;
++ 	else
++ 		cfg->wol &= ~AQ_NIC_WOL_ENABLED;
++ 	err = device_set_wakeup_enable(&pdev->dev, wol->wolopts);
++ 
++ 	return err;
++ }
++ 
++ static enum hw_atl_fw2x_rate eee_mask_to_ethtool_mask(u32 speed)
++ {
++ 	u32 rate = 0;
++ 
++ 	if (speed & AQ_NIC_RATE_EEE_10G)
++ 		rate |= SUPPORTED_10000baseT_Full;
++ 
++ 	if (speed & AQ_NIC_RATE_EEE_2GS)
++ 		rate |= SUPPORTED_2500baseX_Full;
++ 
++ 	if (speed & AQ_NIC_RATE_EEE_1G)
++ 		rate |= SUPPORTED_1000baseT_Full;
++ 
++ 	return rate;
++ }
++ 
++ static int aq_ethtool_get_eee(struct net_device *ndev, struct ethtool_eee *eee)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	u32 rate, supported_rates;
++ 	int err = 0;
++ 
++ 	if (!aq_nic->aq_fw_ops->get_eee_rate)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = aq_nic->aq_fw_ops->get_eee_rate(aq_nic->aq_hw, &rate,
++ 					      &supported_rates);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	eee->supported = eee_mask_to_ethtool_mask(supported_rates);
++ 
++ 	if (aq_nic->aq_nic_cfg.eee_speeds)
++ 		eee->advertised = eee->supported;
++ 
++ 	eee->lp_advertised = eee_mask_to_ethtool_mask(rate);
++ 
++ 	eee->eee_enabled = !!eee->advertised;
++ 
++ 	eee->tx_lpi_enabled = eee->eee_enabled;
++ 	if (eee->advertised & eee->lp_advertised)
++ 		eee->eee_active = true;
++ 
++ 	return 0;
++ }
++ 
++ static int aq_ethtool_set_eee(struct net_device *ndev, struct ethtool_eee *eee)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	u32 rate, supported_rates;
++ 	struct aq_nic_cfg_s *cfg;
++ 	int err = 0;
++ 
++ 	cfg = aq_nic_get_cfg(aq_nic);
++ 
++ 	if (unlikely(!aq_nic->aq_fw_ops->get_eee_rate ||
++ 		     !aq_nic->aq_fw_ops->set_eee_rate))
++ 		return -EOPNOTSUPP;
++ 
++ 	err = aq_nic->aq_fw_ops->get_eee_rate(aq_nic->aq_hw, &rate,
++ 					      &supported_rates);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (eee->eee_enabled) {
++ 		rate = supported_rates;
++ 		cfg->eee_speeds = rate;
++ 	} else {
++ 		rate = 0;
++ 		cfg->eee_speeds = 0;
++ 	}
++ 
++ 	return aq_nic->aq_fw_ops->set_eee_rate(aq_nic->aq_hw, rate);
++ }
++ 
++ static int aq_ethtool_nway_reset(struct net_device *ndev)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 
++ 	if (unlikely(!aq_nic->aq_fw_ops->renegotiate))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (netif_running(ndev))
++ 		return aq_nic->aq_fw_ops->renegotiate(aq_nic->aq_hw);
++ 
++ 	return 0;
++ }
++ 
++ static void aq_ethtool_get_pauseparam(struct net_device *ndev,
++ 				      struct ethtool_pauseparam *pause)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	u32 fc = aq_nic->aq_nic_cfg.flow_control;
++ 
++ 	pause->autoneg = 0;
++ 
++ 	pause->rx_pause = !!(fc & AQ_NIC_FC_RX);
++ 	pause->tx_pause = !!(fc & AQ_NIC_FC_TX);
++ 
++ }
++ 
++ static int aq_ethtool_set_pauseparam(struct net_device *ndev,
++ 				     struct ethtool_pauseparam *pause)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	int err = 0;
++ 
++ 	if (!aq_nic->aq_fw_ops->set_flow_control)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (pause->autoneg == AUTONEG_ENABLE)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (pause->rx_pause)
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control |= AQ_NIC_FC_RX;
++ 	else
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control &= ~AQ_NIC_FC_RX;
++ 
++ 	if (pause->tx_pause)
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control |= AQ_NIC_FC_TX;
++ 	else
++ 		aq_nic->aq_hw->aq_nic_cfg->flow_control &= ~AQ_NIC_FC_TX;
++ 
++ 	err = aq_nic->aq_fw_ops->set_flow_control(aq_nic->aq_hw);
++ 
++ 	return err;
++ }
++ 
++ static void aq_get_ringparam(struct net_device *ndev,
++ 			     struct ethtool_ringparam *ring)
++ {
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	struct aq_nic_cfg_s *aq_nic_cfg = aq_nic_get_cfg(aq_nic);
++ 
++ 	ring->rx_pending = aq_nic_cfg->rxds;
++ 	ring->tx_pending = aq_nic_cfg->txds;
++ 
++ 	ring->rx_max_pending = aq_nic_cfg->aq_hw_caps->rxds_max;
++ 	ring->tx_max_pending = aq_nic_cfg->aq_hw_caps->txds_max;
++ }
++ 
++ static int aq_set_ringparam(struct net_device *ndev,
++ 			    struct ethtool_ringparam *ring)
++ {
++ 	int err = 0;
++ 	bool ndev_running = false;
++ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
++ 	struct aq_nic_cfg_s *aq_nic_cfg = aq_nic_get_cfg(aq_nic);
++ 	const struct aq_hw_caps_s *hw_caps = aq_nic_cfg->aq_hw_caps;
++ 
++ 	if (ring->rx_mini_pending || ring->rx_jumbo_pending) {
++ 		err = -EOPNOTSUPP;
++ 		goto err_exit;
++ 	}
++ 
++ 	if (netif_running(ndev)) {
++ 		ndev_running = true;
++ 		dev_close(ndev);
++ 	}
++ 
++ 	aq_nic_free_vectors(aq_nic);
++ 
++ 	aq_nic_cfg->rxds = max(ring->rx_pending, hw_caps->rxds_min);
++ 	aq_nic_cfg->rxds = min(aq_nic_cfg->rxds, hw_caps->rxds_max);
++ 	aq_nic_cfg->rxds = ALIGN(aq_nic_cfg->rxds, AQ_HW_RXD_MULTIPLE);
++ 
++ 	aq_nic_cfg->txds = max(ring->tx_pending, hw_caps->txds_min);
++ 	aq_nic_cfg->txds = min(aq_nic_cfg->txds, hw_caps->txds_max);
++ 	aq_nic_cfg->txds = ALIGN(aq_nic_cfg->txds, AQ_HW_TXD_MULTIPLE);
++ 
++ 	for (aq_nic->aq_vecs = 0; aq_nic->aq_vecs < aq_nic_cfg->vecs;
++ 	     aq_nic->aq_vecs++) {
++ 		aq_nic->aq_vec[aq_nic->aq_vecs] =
++ 		    aq_vec_alloc(aq_nic, aq_nic->aq_vecs, aq_nic_cfg);
++ 		if (unlikely(!aq_nic->aq_vec[aq_nic->aq_vecs])) {
++ 			err = -ENOMEM;
++ 			goto err_exit;
++ 		}
++ 	}
++ 	if (ndev_running)
++ 		err = dev_open(ndev);
++ 
++ err_exit:
++ 	return err;
++ }
++ 
+++>>>>>>> 35e8e8b45d31 (net: aquantia: synchronized flow control between mac/phy)
+  const struct ethtool_ops aq_ethtool_ops = {
+  	.get_link            = aq_ethtool_get_link,
+  	.get_regs_len        = aq_ethtool_get_regs_len,
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+index 1cf486d813e0,7ec8d24b2b0b..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+@@@ -199,7 -204,7 +199,11 @@@ struct aq_hw_ops 
+  
+  	int (*hw_get_fw_version)(struct aq_hw_s *self, u32 *fw_version);
+  
+++<<<<<<< HEAD
+ +	int (*hw_set_power)(struct aq_hw_s *self, unsigned int power_state);
+++=======
++ 	int (*hw_set_fc)(struct aq_hw_s *self, u32 fc, u32 tc);
+++>>>>>>> 35e8e8b45d31 (net: aquantia: synchronized flow control between mac/phy)
+  };
+  
+  struct aq_fw_ops {
+@@@ -220,7 -227,17 +224,9 @@@
+  
+  	int (*update_stats)(struct aq_hw_s *self);
+  
++ 	u32 (*get_flow_control)(struct aq_hw_s *self, u32 *fcmode);
++ 
+  	int (*set_flow_control)(struct aq_hw_s *self);
+ -
+ -	int (*set_power)(struct aq_hw_s *self, unsigned int power_state,
+ -			 u8 *mac);
+ -
+ -	int (*set_eee_rate)(struct aq_hw_s *self, u32 speed);
+ -
+ -	int (*get_eee_rate)(struct aq_hw_s *self, u32 *rate,
+ -			    u32 *supported_rates);
+  };
+  
+  #endif /* AQ_HW_H */
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 9122cd3a98cf,0011a3f2f672..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -772,6 -782,12 +782,15 @@@ void aq_nic_get_link_ksettings(struct a
+  		ethtool_link_ksettings_add_link_mode(cmd, advertising,
+  						     Pause);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Asym is when either RX or TX, but not both */
++ 	if (!!(self->aq_nic_cfg.flow_control & AQ_NIC_FC_TX) ^
++ 	    !!(self->aq_nic_cfg.flow_control & AQ_NIC_FC_RX))
++ 		ethtool_link_ksettings_add_link_mode(cmd, advertising,
++ 						     Asym_Pause);
++ 
+++>>>>>>> 35e8e8b45d31 (net: aquantia: synchronized flow control between mac/phy)
+  	if (self->aq_nic_cfg.aq_hw_caps->media_type == AQ_HW_MEDIA_TYPE_FIBRE)
+  		ethtool_link_ksettings_add_link_mode(cmd, advertising, FIBRE);
+  	else
+diff --cc drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+index 9664ea926ad9,7de3220d9cab..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+@@@ -29,6 -30,44 +29,47 @@@
+  #define HW_ATL_FW2X_MPI_STATE_ADDR	0x370
+  #define HW_ATL_FW2X_MPI_STATE2_ADDR	0x374
+  
+++<<<<<<< HEAD
+++=======
++ #define HW_ATL_FW2X_CAP_PAUSE            BIT(CAPS_HI_PAUSE)
++ #define HW_ATL_FW2X_CAP_ASYM_PAUSE       BIT(CAPS_HI_ASYMMETRIC_PAUSE)
++ #define HW_ATL_FW2X_CAP_SLEEP_PROXY      BIT(CAPS_HI_SLEEP_PROXY)
++ #define HW_ATL_FW2X_CAP_WOL              BIT(CAPS_HI_WOL)
++ 
++ #define HW_ATL_FW2X_CTRL_SLEEP_PROXY      BIT(CTRL_SLEEP_PROXY)
++ #define HW_ATL_FW2X_CTRL_WOL              BIT(CTRL_WOL)
++ #define HW_ATL_FW2X_CTRL_LINK_DROP        BIT(CTRL_LINK_DROP)
++ #define HW_ATL_FW2X_CTRL_PAUSE            BIT(CTRL_PAUSE)
++ #define HW_ATL_FW2X_CTRL_ASYMMETRIC_PAUSE BIT(CTRL_ASYMMETRIC_PAUSE)
++ #define HW_ATL_FW2X_CTRL_FORCE_RECONNECT  BIT(CTRL_FORCE_RECONNECT)
++ 
++ #define HW_ATL_FW2X_CAP_EEE_1G_MASK      BIT(CAPS_HI_1000BASET_FD_EEE)
++ #define HW_ATL_FW2X_CAP_EEE_2G5_MASK     BIT(CAPS_HI_2P5GBASET_FD_EEE)
++ #define HW_ATL_FW2X_CAP_EEE_5G_MASK      BIT(CAPS_HI_5GBASET_FD_EEE)
++ #define HW_ATL_FW2X_CAP_EEE_10G_MASK     BIT(CAPS_HI_10GBASET_FD_EEE)
++ 
++ #define HAL_ATLANTIC_WOL_FILTERS_COUNT   8
++ #define HAL_ATLANTIC_UTILS_FW2X_MSG_WOL  0x0E
++ 
++ struct __packed fw2x_msg_wol_pattern {
++ 	u8 mask[16];
++ 	u32 crc;
++ };
++ 
++ struct __packed fw2x_msg_wol {
++ 	u32 msg_id;
++ 	u8 hw_addr[ETH_ALEN];
++ 	u8 magic_packet_enabled;
++ 	u8 filter_count;
++ 	struct fw2x_msg_wol_pattern filter[HAL_ATLANTIC_WOL_FILTERS_COUNT];
++ 	u8 link_up_enabled;
++ 	u8 link_down_enabled;
++ 	u16 reserved;
++ 	u32 link_up_timeout;
++ 	u32 link_down_timeout;
++ };
++ 
+++>>>>>>> 35e8e8b45d31 (net: aquantia: synchronized flow control between mac/phy)
+  static int aq_fw2x_set_link_speed(struct aq_hw_s *self, u32 speed);
+  static int aq_fw2x_set_state(struct aq_hw_s *self,
+  			     enum hal_atl_utils_fw_state_e state);
+@@@ -206,6 -302,175 +247,178 @@@ static int aq_fw2x_update_stats(struct 
+  	return hw_atl_utils_update_stats(self);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int aq_fw2x_set_sleep_proxy(struct aq_hw_s *self, u8 *mac)
++ {
++ 	struct hw_atl_utils_fw_rpc *rpc = NULL;
++ 	struct offload_info *cfg = NULL;
++ 	unsigned int rpc_size = 0U;
++ 	u32 mpi_opts;
++ 	int err = 0;
++ 
++ 	rpc_size = sizeof(rpc->msg_id) + sizeof(*cfg);
++ 
++ 	err = hw_atl_utils_fw_rpc_wait(self, &rpc);
++ 	if (err < 0)
++ 		goto err_exit;
++ 
++ 	memset(rpc, 0, rpc_size);
++ 	cfg = (struct offload_info *)(&rpc->msg_id + 1);
++ 
++ 	memcpy(cfg->mac_addr, mac, ETH_ALEN);
++ 	cfg->len = sizeof(*cfg);
++ 
++ 	/* Clear bit 0x36C.23 and 0x36C.22 */
++ 	mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 	mpi_opts &= ~HW_ATL_FW2X_CTRL_SLEEP_PROXY;
++ 	mpi_opts &= ~HW_ATL_FW2X_CTRL_LINK_DROP;
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	err = hw_atl_utils_fw_rpc_call(self, rpc_size);
++ 	if (err < 0)
++ 		goto err_exit;
++ 
++ 	/* Set bit 0x36C.23 */
++ 	mpi_opts |= HW_ATL_FW2X_CTRL_SLEEP_PROXY;
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	AQ_HW_WAIT_FOR((aq_hw_read_reg(self, HW_ATL_FW2X_MPI_STATE2_ADDR) &
++ 			HW_ATL_FW2X_CTRL_SLEEP_PROXY), 1U, 10000U);
++ 
++ err_exit:
++ 	return err;
++ }
++ 
++ static int aq_fw2x_set_wol_params(struct aq_hw_s *self, u8 *mac)
++ {
++ 	struct hw_atl_utils_fw_rpc *rpc = NULL;
++ 	struct fw2x_msg_wol *msg = NULL;
++ 	u32 mpi_opts;
++ 	int err = 0;
++ 
++ 	err = hw_atl_utils_fw_rpc_wait(self, &rpc);
++ 	if (err < 0)
++ 		goto err_exit;
++ 
++ 	msg = (struct fw2x_msg_wol *)rpc;
++ 
++ 	msg->msg_id = HAL_ATLANTIC_UTILS_FW2X_MSG_WOL;
++ 	msg->magic_packet_enabled = true;
++ 	memcpy(msg->hw_addr, mac, ETH_ALEN);
++ 
++ 	mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 	mpi_opts &= ~(HW_ATL_FW2X_CTRL_SLEEP_PROXY | HW_ATL_FW2X_CTRL_WOL);
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	err = hw_atl_utils_fw_rpc_call(self, sizeof(*msg));
++ 	if (err < 0)
++ 		goto err_exit;
++ 
++ 	/* Set bit 0x36C.24 */
++ 	mpi_opts |= HW_ATL_FW2X_CTRL_WOL;
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	AQ_HW_WAIT_FOR((aq_hw_read_reg(self, HW_ATL_FW2X_MPI_STATE2_ADDR) &
++ 			HW_ATL_FW2X_CTRL_WOL), 1U, 10000U);
++ 
++ err_exit:
++ 	return err;
++ }
++ 
++ static int aq_fw2x_set_power(struct aq_hw_s *self, unsigned int power_state,
++ 			     u8 *mac)
++ {
++ 	int err = 0;
++ 
++ 	if (self->aq_nic_cfg->wol & AQ_NIC_WOL_ENABLED) {
++ 		err = aq_fw2x_set_sleep_proxy(self, mac);
++ 		if (err < 0)
++ 			goto err_exit;
++ 		err = aq_fw2x_set_wol_params(self, mac);
++ 	}
++ 
++ err_exit:
++ 	return err;
++ }
++ 
++ static int aq_fw2x_set_eee_rate(struct aq_hw_s *self, u32 speed)
++ {
++ 	u32 mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 
++ 	aq_fw2x_upd_eee_rate_bits(self, &mpi_opts, speed);
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	return 0;
++ }
++ 
++ static int aq_fw2x_get_eee_rate(struct aq_hw_s *self, u32 *rate,
++ 				u32 *supported_rates)
++ {
++ 	u32 mpi_state;
++ 	u32 caps_hi;
++ 	int err = 0;
++ 	u32 addr = self->mbox_addr + offsetof(struct hw_atl_utils_mbox, info) +
++ 		   offsetof(struct hw_aq_info, caps_hi);
++ 
++ 	err = hw_atl_utils_fw_downld_dwords(self, addr, &caps_hi,
++ 					    sizeof(caps_hi) / sizeof(u32));
++ 
++ 	if (err)
++ 		return err;
++ 
++ 	*supported_rates = fw2x_to_eee_mask(caps_hi);
++ 
++ 	mpi_state = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_STATE2_ADDR);
++ 	*rate = fw2x_to_eee_mask(mpi_state);
++ 
++ 	return err;
++ }
++ 
++ static int aq_fw2x_renegotiate(struct aq_hw_s *self)
++ {
++ 	u32 mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 
++ 	mpi_opts |= BIT(CTRL_FORCE_RECONNECT);
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++ 
++ 	return 0;
++ }
++ 
++ static int aq_fw2x_set_flow_control(struct aq_hw_s *self)
++ {
++ 	u32 mpi_state = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
++ 
++ 	aq_fw2x_set_mpi_flow_control(self, &mpi_state);
++ 
++ 	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_state);
++ 
++ 	return 0;
++ }
++ 
++ static u32 aq_fw2x_get_flow_control(struct aq_hw_s *self, u32 *fcmode)
++ {
++ 	u32 mpi_state = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_STATE2_ADDR);
++ 
++ 	if (mpi_state & HW_ATL_FW2X_CAP_PAUSE)
++ 		if (mpi_state & HW_ATL_FW2X_CAP_ASYM_PAUSE)
++ 			*fcmode = AQ_NIC_FC_RX;
++ 		else
++ 			*fcmode = AQ_NIC_FC_RX | AQ_NIC_FC_TX;
++ 	else
++ 		if (mpi_state & HW_ATL_FW2X_CAP_ASYM_PAUSE)
++ 			*fcmode = AQ_NIC_FC_TX;
++ 		else
++ 			*fcmode = 0;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 35e8e8b45d31 (net: aquantia: synchronized flow control between mac/phy)
+  const struct aq_fw_ops aq_fw_2x_ops = {
+  	.init = aq_fw2x_init,
+  	.deinit = aq_fw2x_deinit,
+@@@ -215,4 -481,9 +428,12 @@@
+  	.set_state = aq_fw2x_set_state,
+  	.update_link_status = aq_fw2x_update_link_status,
+  	.update_stats = aq_fw2x_update_stats,
+++<<<<<<< HEAD
+++=======
++ 	.set_power = aq_fw2x_set_power,
++ 	.set_eee_rate = aq_fw2x_set_eee_rate,
++ 	.get_eee_rate = aq_fw2x_get_eee_rate,
++ 	.set_flow_control = aq_fw2x_set_flow_control,
++ 	.get_flow_control = aq_fw2x_get_flow_control
+++>>>>>>> 35e8e8b45d31 (net: aquantia: synchronized flow control between mac/phy)
+  };
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+index b245cd105cc1..138d8db05087 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+@@ -98,12 +98,17 @@ static int hw_atl_b0_hw_reset(struct aq_hw_s *self)
+ 	return err;
+ }
+ 
++static int hw_atl_b0_set_fc(struct aq_hw_s *self, u32 fc, u32 tc)
++{
++	hw_atl_rpb_rx_xoff_en_per_tc_set(self, !!(fc & AQ_NIC_FC_RX), tc);
++	return 0;
++}
++
+ static int hw_atl_b0_hw_qos_set(struct aq_hw_s *self)
+ {
+ 	u32 tc = 0U;
+ 	u32 buff_size = 0U;
+ 	unsigned int i_priority = 0U;
+-	bool is_rx_flow_control = false;
+ 
+ 	/* TPS Descriptor rate init */
+ 	hw_atl_tps_tx_pkt_shed_desc_rate_curr_time_res_set(self, 0x0U);
+@@ -136,7 +141,6 @@ static int hw_atl_b0_hw_qos_set(struct aq_hw_s *self)
+ 
+ 	/* QoS Rx buf size per TC */
+ 	tc = 0;
+-	is_rx_flow_control = (AQ_NIC_FC_RX & self->aq_nic_cfg->flow_control);
+ 	buff_size = HW_ATL_B0_RXBUF_MAX;
+ 
+ 	hw_atl_rpb_rx_pkt_buff_size_per_tc_set(self, buff_size, tc);
+@@ -148,7 +152,8 @@ static int hw_atl_b0_hw_qos_set(struct aq_hw_s *self)
+ 						   (buff_size *
+ 						   (1024U / 32U) * 50U) /
+ 						   100U, tc);
+-	hw_atl_rpb_rx_xoff_en_per_tc_set(self, is_rx_flow_control ? 1U : 0U, tc);
++
++	hw_atl_b0_set_fc(self, self->aq_nic_cfg->flow_control, tc);
+ 
+ 	/* QoS 802.1p priority -> TC mapping */
+ 	for (i_priority = 8U; i_priority--;)
+@@ -962,4 +967,5 @@ const struct aq_hw_ops hw_atl_ops_b0 = {
+ 	.hw_get_regs                 = hw_atl_utils_hw_get_regs,
+ 	.hw_get_hw_stats             = hw_atl_utils_get_hw_stats,
+ 	.hw_get_fw_version           = hw_atl_utils_get_fw_version,
++	.hw_set_fc                   = hw_atl_b0_set_fc,
+ };
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
