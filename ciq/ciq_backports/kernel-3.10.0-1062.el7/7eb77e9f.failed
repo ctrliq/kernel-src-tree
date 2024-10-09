@@ -1,0 +1,151 @@
+kvm: x86: Add a root_hpa parameter to kvm_mmu->invlpg()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit 7eb77e9f5fcf652a21b2d12bff1cd509b6b14f21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7eb77e9f.failed
+
+This allows invlpg() to be called using either the active root_hpa
+or the prev_root_hpa.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7eb77e9f5fcf652a21b2d12bff1cd509b6b14f21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index db86a346eaea,6eeca915511e..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -161,7 -178,24 +161,28 @@@ struct kvm_shadow_walk_iterator 
+  	unsigned index;
+  };
+  
+++<<<<<<< HEAD
+ +#define for_each_shadow_entry(_vcpu, _addr, _walker)    \
+++=======
++ static const union kvm_mmu_page_role mmu_base_role_mask = {
++ 	.cr0_wp = 1,
++ 	.cr4_pae = 1,
++ 	.nxe = 1,
++ 	.smep_andnot_wp = 1,
++ 	.smap_andnot_wp = 1,
++ 	.smm = 1,
++ 	.guest_mode = 1,
++ 	.ad_disabled = 1,
++ };
++ 
++ #define for_each_shadow_entry_using_root(_vcpu, _root, _addr, _walker)     \
++ 	for (shadow_walk_init_using_root(&(_walker), (_vcpu),              \
++ 					 (_root), (_addr));                \
++ 	     shadow_walk_okay(&(_walker));			           \
++ 	     shadow_walk_next(&(_walker)))
++ 
++ #define for_each_shadow_entry(_vcpu, _addr, _walker)            \
+++>>>>>>> 7eb77e9f5fcf (kvm: x86: Add a root_hpa parameter to kvm_mmu->invlpg())
+  	for (shadow_walk_init(&(_walker), _vcpu, _addr);	\
+  	     shadow_walk_okay(&(_walker));			\
+  	     shadow_walk_next(&(_walker)))
+@@@ -2365,15 -2408,19 +2386,16 @@@ static struct kvm_mmu_page *kvm_mmu_get
+  	return sp;
+  }
+  
+- static void shadow_walk_init(struct kvm_shadow_walk_iterator *iterator,
+- 			     struct kvm_vcpu *vcpu, u64 addr)
++ static void shadow_walk_init_using_root(struct kvm_shadow_walk_iterator *iterator,
++ 					struct kvm_vcpu *vcpu, hpa_t root,
++ 					u64 addr)
+  {
+  	iterator->addr = addr;
+- 	iterator->shadow_addr = vcpu->arch.mmu.root_hpa;
++ 	iterator->shadow_addr = root;
+  	iterator->level = vcpu->arch.mmu.shadow_root_level;
+  
+ -	if (iterator->level == PT64_ROOT_4LEVEL &&
+ -	    vcpu->arch.mmu.root_level < PT64_ROOT_4LEVEL &&
+ +	if (iterator->level == PT64_ROOT_LEVEL &&
+ +	    vcpu->arch.mmu.root_level < PT64_ROOT_LEVEL &&
+  	    !vcpu->arch.mmu.direct_map)
+  		--iterator->level;
+  
+@@@ -4936,6 -5214,29 +4973,32 @@@ void kvm_mmu_invlpg(struct kvm_vcpu *vc
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_invlpg);
+  
+++<<<<<<< HEAD
+++=======
++ void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid)
++ {
++ 	struct kvm_mmu *mmu = &vcpu->arch.mmu;
++ 
++ 	if (pcid == kvm_get_active_pcid(vcpu)) {
++ 		mmu->invlpg(vcpu, gva, mmu->root_hpa);
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++ 	}
++ 
++ 	if (VALID_PAGE(mmu->prev_root.hpa) &&
++ 	    pcid == kvm_get_pcid(vcpu, mmu->prev_root.cr3))
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++ 
++ 	++vcpu->stat.invlpg;
++ 
++ 	/*
++ 	 * Mappings not reachable via the current cr3 or the prev_root.cr3 will
++ 	 * be synced when switching to that cr3, so nothing needs to be done
++ 	 * here for them.
++ 	 */
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_invpcid_gva);
++ 
+++>>>>>>> 7eb77e9f5fcf (kvm: x86: Add a root_hpa parameter to kvm_mmu->invlpg())
+  void kvm_enable_tdp(void)
+  {
+  	tdp_enabled = true;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a..439424829386 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -317,7 +317,7 @@ struct kvm_mmu {
+ 			       struct x86_exception *exception);
+ 	int (*sync_page)(struct kvm_vcpu *vcpu,
+ 			 struct kvm_mmu_page *sp);
+-	void (*invlpg)(struct kvm_vcpu *vcpu, gva_t gva);
++	void (*invlpg)(struct kvm_vcpu *vcpu, gva_t gva, hpa_t root_hpa);
+ 	void (*update_pte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 			   u64 *spte, const void *pte);
+ 	hpa_t root_hpa;
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index b281446d6b8c..c839dc870176 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -857,7 +857,7 @@ static gpa_t FNAME(get_level1_sp_gpa)(struct kvm_mmu_page *sp)
+ 	return gfn_to_gpa(sp->gfn) + offset * sizeof(pt_element_t);
+ }
+ 
+-static void FNAME(invlpg)(struct kvm_vcpu *vcpu, gva_t gva)
++static void FNAME(invlpg)(struct kvm_vcpu *vcpu, gva_t gva, hpa_t root_hpa)
+ {
+ 	struct kvm_shadow_walk_iterator iterator;
+ 	struct kvm_mmu_page *sp;
+@@ -872,13 +872,13 @@ static void FNAME(invlpg)(struct kvm_vcpu *vcpu, gva_t gva)
+ 	 */
+ 	mmu_topup_memory_caches(vcpu);
+ 
+-	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa)) {
++	if (!VALID_PAGE(root_hpa)) {
+ 		WARN_ON(1);
+ 		return;
+ 	}
+ 
+ 	spin_lock(&vcpu->kvm->mmu_lock);
+-	for_each_shadow_entry(vcpu, gva, iterator) {
++	for_each_shadow_entry_using_root(vcpu, root_hpa, gva, iterator) {
+ 		level = iterator.level;
+ 		sptep = iterator.sptep;
+ 
