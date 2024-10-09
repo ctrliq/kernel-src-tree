@@ -1,0 +1,167 @@
+i40e/i40evf: don't trust VF to reset itself
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alan Brady <alan.brady@intel.com>
+commit 17a9422de78c3a59b490b400f555635c477f1476
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/17a9422d.failed
+
+When using 'ethtool -L' on a VF to change number of requested queues
+from PF, we shouldn't trust the VF to reset itself after making the
+request.  Doing it that way opens the door for a potentially malicious
+VF to do nasty things to the PF which should never be the case.
+
+This makes it such that after VF makes a successful request, PF will
+then reset the VF to institute required changes.  Only if the request
+fails will PF send a message back to VF letting it know the request was
+unsuccessful.
+
+Testing-hints:
+There should be no real functional changes.  This is simply hardening
+against a potentially malicious VF.
+
+	Signed-off-by: Alan Brady <alan.brady@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 17a9422de78c3a59b490b400f555635c477f1476)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+#	drivers/net/ethernet/intel/i40evf/i40evf_virtchnl.c
+#	include/linux/avf/virtchnl.h
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index f469a3d68beb,f8a794b72462..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@@ -1885,6 -2039,57 +1885,60 @@@ error_param
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * i40e_vc_request_queues_msg
++  * @vf: pointer to the VF info
++  * @msg: pointer to the msg buffer
++  * @msglen: msg length
++  *
++  * VFs get a default number of queues but can use this message to request a
++  * different number.  If the request is successful, PF will reset the VF and
++  * return 0.  If unsuccessful, PF will send message informing VF of number of
++  * available queues and return result of sending VF a message.
++  **/
++ static int i40e_vc_request_queues_msg(struct i40e_vf *vf, u8 *msg, int msglen)
++ {
++ 	struct virtchnl_vf_res_request *vfres =
++ 		(struct virtchnl_vf_res_request *)msg;
++ 	int req_pairs = vfres->num_queue_pairs;
++ 	int cur_pairs = vf->num_queue_pairs;
++ 	struct i40e_pf *pf = vf->pf;
++ 
++ 	if (!test_bit(I40E_VF_STATE_ACTIVE, &vf->vf_states))
++ 		return -EINVAL;
++ 
++ 	if (req_pairs <= 0) {
++ 		dev_err(&pf->pdev->dev,
++ 			"VF %d tried to request %d queues.  Ignoring.\n",
++ 			vf->vf_id, req_pairs);
++ 	} else if (req_pairs > I40E_MAX_VF_QUEUES) {
++ 		dev_err(&pf->pdev->dev,
++ 			"VF %d tried to request more than %d queues.\n",
++ 			vf->vf_id,
++ 			I40E_MAX_VF_QUEUES);
++ 		vfres->num_queue_pairs = I40E_MAX_VF_QUEUES;
++ 	} else if (req_pairs - cur_pairs > pf->queues_left) {
++ 		dev_warn(&pf->pdev->dev,
++ 			 "VF %d requested %d more queues, but only %d left.\n",
++ 			 vf->vf_id,
++ 			 req_pairs - cur_pairs,
++ 			 pf->queues_left);
++ 		vfres->num_queue_pairs = pf->queues_left + cur_pairs;
++ 	} else {
++ 		/* successful request */
++ 		vf->num_req_queues = req_pairs;
++ 		i40e_vc_notify_vf_reset(vf);
++ 		i40e_reset_vf(vf, false);
++ 		return 0;
++ 	}
++ 
++ 	return i40e_vc_send_msg_to_vf(vf, VIRTCHNL_OP_REQUEST_QUEUES, 0,
++ 				      (u8 *)vfres, sizeof(vfres));
++ }
++ 
++ /**
+++>>>>>>> 17a9422de78c (i40e/i40evf: don't trust VF to reset itself)
+   * i40e_vc_get_stats_msg
+   * @vf: pointer to the VF info
+   * @msg: pointer to the msg buffer
+diff --cc drivers/net/ethernet/intel/i40evf/i40evf_virtchnl.c
+index 478c3f9a718f,46c8b8a3907c..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40evf_virtchnl.c
++++ b/drivers/net/ethernet/intel/i40evf/i40evf_virtchnl.c
+@@@ -377,6 -386,33 +377,36 @@@ void i40evf_map_queues(struct i40evf_ad
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * i40evf_request_queues
++  * @adapter: adapter structure
++  * @num: number of requested queues
++  *
++  * We get a default number of queues from the PF.  This enables us to request a
++  * different number.  Returns 0 on success, negative on failure
++  **/
++ int i40evf_request_queues(struct i40evf_adapter *adapter, int num)
++ {
++ 	struct virtchnl_vf_res_request vfres;
++ 
++ 	if (adapter->current_op != VIRTCHNL_OP_UNKNOWN) {
++ 		/* bail because we already have a command pending */
++ 		dev_err(&adapter->pdev->dev, "Cannot request queues, command %d pending\n",
++ 			adapter->current_op);
++ 		return -EBUSY;
++ 	}
++ 
++ 	vfres.num_queue_pairs = num;
++ 
++ 	adapter->current_op = VIRTCHNL_OP_REQUEST_QUEUES;
++ 	adapter->flags |= I40EVF_FLAG_REINIT_ITR_NEEDED;
++ 	return i40evf_send_pf_msg(adapter, VIRTCHNL_OP_REQUEST_QUEUES,
++ 				  (u8 *)&vfres, sizeof(vfres));
++ }
++ 
++ /**
+++>>>>>>> 17a9422de78c (i40e/i40evf: don't trust VF to reset itself)
+   * i40evf_add_ether_addrs
+   * @adapter: adapter structure
+   * @addrs: the MAC address filters to add (contiguous)
+@@@ -1021,6 -1096,19 +1051,22 @@@ void i40evf_virtchnl_completion(struct 
+  				 "Invalid message %d from PF\n", v_opcode);
+  		}
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case VIRTCHNL_OP_REQUEST_QUEUES: {
++ 		struct virtchnl_vf_res_request *vfres =
++ 			(struct virtchnl_vf_res_request *)msg;
++ 		if (vfres->num_queue_pairs != adapter->num_req_queues) {
++ 			dev_info(&adapter->pdev->dev,
++ 				 "Requested %d queues, PF can support %d\n",
++ 				 adapter->num_req_queues,
++ 				 vfres->num_queue_pairs);
++ 			adapter->num_req_queues = 0;
++ 			adapter->flags &= ~I40EVF_FLAG_REINIT_ITR_NEEDED;
++ 		}
++ 		}
++ 		break;
+++>>>>>>> 17a9422de78c (i40e/i40evf: don't trust VF to reset itself)
+  	default:
+  		if (adapter->current_op && (v_opcode != adapter->current_op))
+  			dev_warn(&adapter->pdev->dev, "Expected response %d from PF, received %d\n",
+* Unmerged path include/linux/avf/virtchnl.h
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40evf_virtchnl.c
+* Unmerged path include/linux/avf/virtchnl.h
