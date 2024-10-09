@@ -82,6 +82,7 @@ struct hdac_device {
 	bool  link_power_control:1;
 
 	/* sysfs */
+	struct mutex widget_lock;
 	struct hdac_widget_tree *widgets;
 
 	/* regmap */
