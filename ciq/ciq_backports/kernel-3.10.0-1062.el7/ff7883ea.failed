@@ -1,0 +1,138 @@
+net: ipv6: Make inet6addr_validator a blocking notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] ipv6: Make inet6addr_validator a blocking notifier (Ivan Vecera) [1678649]
+Rebuild_FUZZ: 95.24%
+commit-author David Ahern <dsahern@gmail.com>
+commit ff7883ea60e7b021bcd6539b8211879554c8db9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ff7883ea.failed
+
+inet6addr_validator chain was added by commit 3ad7d2468f79f ("Ipvlan
+should return an error when an address is already in use") to allow
+address validation before changes are committed and to be able to
+fail the address change with an error back to the user. The address
+validation is not done for addresses received from router
+advertisements.
+
+Handling RAs in softirq context is the only reason for the notifier
+chain to be atomic versus blocking. Since the only current user, ipvlan,
+of the validator chain ignores softirq context, the notifier can be made
+blocking and simply not invoked for softirq path.
+
+The blocking option is needed by spectrum for example to validate
+resources for an adding an address to an interface.
+
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ff7883ea60e7b021bcd6539b8211879554c8db9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ipvlan/ipvlan_main.c
+#	net/ipv6/addrconf.c
+#	net/ipv6/addrconf_core.c
+diff --cc net/ipv6/addrconf.c
+index a8297bbf8643,dd9c0c435f71..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -808,11 -986,13 +808,15 @@@ static u32 inet6_addr_hash(const struc
+  static struct inet6_ifaddr *
+  ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+  	      const struct in6_addr *peer_addr, int pfxlen,
+ -	      int scope, u32 flags, u32 valid_lft, u32 prefered_lft,
+ -	      bool can_block)
+ +	      int scope, u32 flags, u32 valid_lft, u32 prefered_lft)
+  {
+ -	gfp_t gfp_flags = can_block ? GFP_KERNEL : GFP_ATOMIC;
+ -	struct net *net = dev_net(idev->dev);
+  	struct inet6_ifaddr *ifa = NULL;
+++<<<<<<< HEAD
+ +	struct rt6_info *rt;
+ +	unsigned int hash;
+++=======
++ 	struct rt6_info *rt = NULL;
+++>>>>>>> ff7883ea60e7 (net: ipv6: Make inet6addr_validator a blocking notifier)
+  	int err = 0;
+  	int addr_type = ipv6_addr_type(addr);
+  
+@@@ -842,9 -1012,23 +846,26 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	ifa = kzalloc(sizeof(struct inet6_ifaddr), GFP_ATOMIC);
+++=======
++ 	/* validator notifier needs to be blocking;
++ 	 * do not call in atomic context
++ 	 */
++ 	if (can_block) {
++ 		struct in6_validator_info i6vi = {
++ 			.i6vi_addr = *addr,
++ 			.i6vi_dev = idev,
++ 		};
++ 
++ 		err = inet6addr_validator_notifier_call_chain(NETDEV_UP, &i6vi);
++ 		err = notifier_to_errno(err);
++ 		if (err < 0)
++ 			goto out;
++ 	}
+++>>>>>>> ff7883ea60e7 (net: ipv6: Make inet6addr_validator a blocking notifier)
+  
+ -	ifa = kzalloc(sizeof(*ifa), gfp_flags);
+ -	if (!ifa) {
+ +	if (ifa == NULL) {
+  		ADBG("ipv6_add_addr: malloc failed\n");
+  		err = -ENOBUFS;
+  		goto out;
+diff --cc net/ipv6/addrconf_core.c
+index a0ed0d8c036c,32b564dfd02a..000000000000
+--- a/net/ipv6/addrconf_core.c
++++ b/net/ipv6/addrconf_core.c
+@@@ -88,6 -88,7 +88,10 @@@ int __ipv6_addr_type(const struct in6_a
+  EXPORT_SYMBOL(__ipv6_addr_type);
+  
+  static ATOMIC_NOTIFIER_HEAD(inet6addr_chain);
+++<<<<<<< HEAD
+++=======
++ static BLOCKING_NOTIFIER_HEAD(inet6addr_validator_chain);
+++>>>>>>> ff7883ea60e7 (net: ipv6: Make inet6addr_validator a blocking notifier)
+  
+  int register_inet6addr_notifier(struct notifier_block *nb)
+  {
+@@@ -107,6 -108,25 +111,28 @@@ int inet6addr_notifier_call_chain(unsig
+  }
+  EXPORT_SYMBOL(inet6addr_notifier_call_chain);
+  
+++<<<<<<< HEAD
+++=======
++ int register_inet6addr_validator_notifier(struct notifier_block *nb)
++ {
++ 	return blocking_notifier_chain_register(&inet6addr_validator_chain, nb);
++ }
++ EXPORT_SYMBOL(register_inet6addr_validator_notifier);
++ 
++ int unregister_inet6addr_validator_notifier(struct notifier_block *nb)
++ {
++ 	return blocking_notifier_chain_unregister(&inet6addr_validator_chain,
++ 						  nb);
++ }
++ EXPORT_SYMBOL(unregister_inet6addr_validator_notifier);
++ 
++ int inet6addr_validator_notifier_call_chain(unsigned long val, void *v)
++ {
++ 	return blocking_notifier_call_chain(&inet6addr_validator_chain, val, v);
++ }
++ EXPORT_SYMBOL(inet6addr_validator_notifier_call_chain);
++ 
+++>>>>>>> ff7883ea60e7 (net: ipv6: Make inet6addr_validator a blocking notifier)
+  static int eafnosupport_ipv6_dst_lookup(struct net *net, struct sock *u1,
+  					struct dst_entry **u2,
+  					struct flowi6 *u3)
+* Unmerged path drivers/net/ipvlan/ipvlan_main.c
+* Unmerged path drivers/net/ipvlan/ipvlan_main.c
+* Unmerged path net/ipv6/addrconf.c
+* Unmerged path net/ipv6/addrconf_core.c
