@@ -1,0 +1,258 @@
+qla2xxx: Add bsg interface to support D_Port Diagnostics.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add bsg interface to support D_Port Diagnostics (Chad Dupuis) [1384091]
+Rebuild_FUZZ: 99.12%
+commit-author Joe Carnuccio <joe.carnuccio@qlogic.com>
+commit ec89146215d124c429bff84b498dccdc4919ffa7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ec891462.failed
+
+	Signed-off-by: Joe Carnuccio <joe.carnuccio@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit ec89146215d124c429bff84b498dccdc4919ffa7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 2e18dc18ea3a,2a1eb027e162..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -12,15 -12,14 +12,23 @@@
+   * |             Level            |   Last Value Used  |     Holes	|
+   * ----------------------------------------------------------------------
+   * | Module Init and Probe        |       0x018f       | 0x0146         |
+++<<<<<<< HEAD
+ + * | Mailbox commands             |       0x1181       | 0x111a-0x111b  |
+ + * |                              |                    | 0x1155-0x1158  |
+ + * |                              |                    | 0x1018-0x1019  |
+ + * |                              |                    | 0x1115-0x1116  |
+ + * |                              |                    | 0x10ca         |
+ + * | Device Discovery             |       0x2095       | 0x2020-0x2022, |
+++=======
++  * |                              |                    | 0x015b-0x0160	|
++  * |                              |                    | 0x016e		|
++  * | Mailbox commands             |       0x1196       |		|
++  * |                              |                    |		|
++  * | Device Discovery             |       0x2003       | 0x2016		|
+++>>>>>>> ec89146215d1 (qla2xxx: Add bsg interface to support D_Port Diagnostics.)
+   * |                              |                    | 0x2011-0x2012, |
+   * |                              |                    | 0x2099-0x20a4  |
+ - * | Queue Command and IO tracing |       0x3074       | 0x300b         |
+ + * | Queue Command and IO tracing |       0x3075       | 0x300b         |
+   * |                              |                    | 0x3027-0x3028  |
+   * |                              |                    | 0x303d-0x3041  |
+   * |                              |                    | 0x302d,0x3033  |
+@@@ -40,8 -39,8 +48,7 @@@
+   * |                              |                    | 0x70a5-0x70a6  |
+   * |                              |                    | 0x70a8,0x70ab  |
+   * |                              |                    | 0x70ad-0x70ae  |
+ - * |                              |                    | 0x70d0-0x70d6	|
+   * |                              |                    | 0x70d7-0x70db  |
+-  * |                              |                    | 0x70db		|
+   * | Task Management              |       0x803d       | 0x8000,0x800b  |
+   * |                              |                    | 0x8019         |
+   * |                              |                    | 0x8025,0x8026  |
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.c b/drivers/scsi/qla2xxx/qla_bsg.c
+index 8cadc4da7d59..592e9249db02 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@ -2295,6 +2295,47 @@ done:
+ 	return rval;
+ }
+ 
++static int
++qla2x00_do_dport_diagnostics(struct fc_bsg_job *bsg_job)
++{
++	struct Scsi_Host *host = bsg_job->shost;
++	scsi_qla_host_t *vha = shost_priv(host);
++	int rval;
++	struct qla_dport_diag *dd;
++
++	if (!IS_QLA83XX(vha->hw) && !IS_QLA27XX(vha->hw))
++		return -EPERM;
++
++	dd = kmalloc(sizeof(*dd), GFP_KERNEL);
++	if (!dd) {
++		ql_log(ql_log_warn, vha, 0x70db,
++		    "Failed to allocate memory for dport.\n");
++		return -ENOMEM;
++	}
++
++	sg_copy_to_buffer(bsg_job->request_payload.sg_list,
++	    bsg_job->request_payload.sg_cnt, dd, sizeof(*dd));
++
++	rval = qla26xx_dport_diagnostics(
++	    vha, dd->buf, sizeof(dd->buf), dd->options);
++	if (rval == QLA_SUCCESS) {
++		sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
++		    bsg_job->reply_payload.sg_cnt, dd, sizeof(*dd));
++	}
++
++	bsg_job->reply->reply_payload_rcv_len = sizeof(*dd);
++	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
++	    rval ? EXT_STATUS_MAILBOX : EXT_STATUS_OK;
++
++	bsg_job->reply_len = sizeof(*bsg_job->reply);
++	bsg_job->reply->result = DID_OK << 16;
++	bsg_job->job_done(bsg_job);
++
++	kfree(dd);
++
++	return 0;
++}
++
+ static int
+ qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
+ {
+@@ -2362,6 +2403,9 @@ qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
+ 	case QL_VND_GET_PRIV_STATS:
+ 		return qla2x00_get_priv_stats(bsg_job);
+ 
++	case QL_VND_DPORT_DIAGNOSTICS:
++		return qla2x00_do_dport_diagnostics(bsg_job);
++
+ 	default:
+ 		return -ENOSYS;
+ 	}
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.h b/drivers/scsi/qla2xxx/qla_bsg.h
+index c80192d45536..3b1045f95d6f 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.h
++++ b/drivers/scsi/qla2xxx/qla_bsg.h
+@@ -29,6 +29,7 @@
+ #define QL_VND_SET_FLASH_UPDATE_CAPS    0x16
+ #define QL_VND_GET_BBCR_DATA    0x17
+ #define QL_VND_GET_PRIV_STATS	0x18
++#define QL_VND_DPORT_DIAGNOSTICS	0x19
+ 
+ /* BSG Vendor specific subcode returns */
+ #define EXT_STATUS_OK			0
+@@ -266,4 +267,15 @@ struct  qla_bbcr_data {
+ 	uint16_t  mbx1;			/* Port state */
+ 	uint8_t   reserved[9];
+ } __packed;
++
++struct qla_dport_diag {
++	uint16_t options;
++	uint32_t buf[16];
++	uint8_t  unused[62];
++} __packed;
++
++/* D_Port options */
++#define QLA_DPORT_RESULT	0x0
++#define QLA_DPORT_START		0x2
++
+ #endif
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 5390445f16ac..2b9a9f7979c6 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -430,6 +430,9 @@ qla2x00_port_logout(scsi_qla_host_t *, struct fc_port *);
+ extern int
+ qla2x00_dump_mctp_data(scsi_qla_host_t *, dma_addr_t, uint32_t, uint32_t);
+ 
++extern int
++qla26xx_dport_diagnostics(scsi_qla_host_t *, void *, uint, uint);
++
+ /*
+  * Global Function Prototypes in qla_isr.c source file.
+  */
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 4e09fbdc9d1c..bd81ee6791c2 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -1148,10 +1148,13 @@ global_port_update:
+ 
+ 	case MBA_DPORT_DIAGNOSTICS:
+ 		ql_dbg(ql_dbg_async, vha, 0x5052,
+-		    "D-Port Diagnostics: %04x %04x=%s\n", mb[0], mb[1],
++		    "D-Port Diagnostics: %04x result=%s index=%u size=%u\n",
++		    mb[0],
+ 		    mb[1] == 0 ? "start" :
+ 		    mb[1] == 1 ? "done (ok)" :
+-		    mb[1] == 2 ? "done (error)" : "other");
++		    mb[1] == 2 ? "done (error)" : "other",
++		    LSB(mb[2]),
++		    mb[3]);
+ 		break;
+ 
+ 	case MBA_TEMPERATURE_ALERT:
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index fbe27de90b21..a31b46dd80f0 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -1610,7 +1610,7 @@ qla2x00_get_firmware_state(scsi_qla_host_t *vha, uint16_t *states)
+ 	states[0] = mcp->mb[1];
+ 	if (IS_FWI2_CAPABLE(vha->hw)) {
+ 		states[1] = mcp->mb[2];
+-		states[2] = mcp->mb[3];
++		states[2] = mcp->mb[3];  /* SFP info */
+ 		states[3] = mcp->mb[4];
+ 		states[4] = mcp->mb[5];
+ 		states[5] = mcp->mb[6];  /* DPORT status */
+@@ -5489,3 +5489,59 @@ qla2x00_dump_mctp_data(scsi_qla_host_t *vha, dma_addr_t req_dma, uint32_t addr,
+ 
+ 	return rval;
+ }
++
++int
++qla26xx_dport_diagnostics(scsi_qla_host_t *vha,
++	void *dd_buf, uint size, uint options)
++{
++	int rval;
++	mbx_cmd_t mc;
++	mbx_cmd_t *mcp = &mc;
++	dma_addr_t dd_dma;
++
++	if (!IS_QLA83XX(vha->hw) && !IS_QLA27XX(vha->hw))
++		return QLA_FUNCTION_FAILED;
++
++	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1192,
++	    "Entered %s.\n", __func__);
++
++	if (size < 1024) {
++		ql_log(ql_log_warn, vha, 0x1193, "Failed insufficient size.\n");
++		return QLA_FUNCTION_PARAMETER_ERROR;
++	}
++
++	dd_dma = dma_map_single(&vha->hw->pdev->dev,
++	    dd_buf, size, DMA_FROM_DEVICE);
++	if (!dd_dma) {
++		ql_log(ql_log_warn, vha, 0x1194, "Failed to map dma buffer.\n");
++		return QLA_MEMORY_ALLOC_FAILED;
++	}
++
++	memset(dd_buf, 0, size);
++
++	mcp->mb[0] = MBC_DPORT_DIAGNOSTICS;
++	mcp->mb[1] = options;
++	mcp->mb[2] = MSW(LSD(dd_dma));
++	mcp->mb[3] = LSW(LSD(dd_dma));
++	mcp->mb[6] = MSW(MSD(dd_dma));
++	mcp->mb[7] = LSW(MSD(dd_dma));
++	mcp->mb[8] = size;
++	mcp->out_mb = MBX_8|MBX_7|MBX_6|MBX_3|MBX_2|MBX_1|MBX_0;
++	mcp->in_mb = MBX_3|MBX_2|MBX_1|MBX_0;
++	mcp->buf_size = size;
++	mcp->flags = MBX_DMA_IN;
++	mcp->tov = MBX_TOV_SECONDS * 4;
++	rval = qla2x00_mailbox_command(vha, mcp);
++
++	if (rval != QLA_SUCCESS) {
++		ql_dbg(ql_dbg_mbx, vha, 0x1195, "Failed=%x.\n", rval);
++	} else {
++		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1196,
++		    "Done %s.\n", __func__);
++	}
++
++	dma_unmap_single(&vha->hw->pdev->dev, dd_dma,
++	    size, DMA_FROM_DEVICE);
++
++	return rval;
++}
