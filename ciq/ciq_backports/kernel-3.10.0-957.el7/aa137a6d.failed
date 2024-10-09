@@ -1,0 +1,313 @@
+s390/livepatch: Implement reliable stack tracing for the consistency model
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] livepatch: Implement reliable stack tracing for the consistency model (Josh Poimboeuf) [1578960]
+Rebuild_FUZZ: 96.50%
+commit-author Miroslav Benes <mbenes@suse.cz>
+commit aa137a6d302b5989ed205b7dfb7fe40a8851babc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/aa137a6d.failed
+
+The livepatch consistency model requires reliable stack tracing
+architecture support in order to work properly. In order to achieve
+this, two main issues have to be solved. First, reliable and consistent
+call chain backtracing has to be ensured. Second, the unwinder needs to
+be able to detect stack corruptions and return errors.
+
+The "zSeries ELF Application Binary Interface Supplement" says:
+
+  "The stack pointer points to the first word of the lowest allocated
+  stack frame. If the "back chain" is implemented this word will point to
+  the previously allocated stack frame (towards higher addresses), except
+  for the first stack frame, which shall have a back chain of zero (NULL).
+  The stack shall grow downwards, in other words towards lower addresses."
+
+"back chain" is optional. GCC option -mbackchain enables it. Quoting
+Martin Schwidefsky [1]:
+
+  "The compiler is called with the -mbackchain option, all normal C
+  function will store the backchain in the function prologue. All
+  functions written in assembler code should do the same, if you find one
+  that does not we should fix that. The end result is that a task that
+  *voluntarily* called schedule() should have a proper backchain at all
+  times.
+
+  Dependent on the use case this may or may not be enough. Asynchronous
+  interrupts may stop the CPU at the beginning of a function, if kernel
+  preemption is enabled we can end up with a broken backchain.  The
+  production kernels for IBM Z are all compiled *without* kernel
+  preemption. So yes, we might get away without the objtool support.
+
+  On a side-note, we do have a line item to implement the ORC unwinder for
+  the kernel, that includes the objtool support. Once we have that we can
+  drop the -mbackchain option for the kernel build. That gives us a nice
+  little performance benefit. I hope that the change from backchain to the
+  ORC unwinder will not be too hard to implement in the livepatch tools."
+
+Since -mbackchain is enabled by default when the kernel is compiled, the
+call chain backtracing should be currently ensured and objtool should
+not be necessary for livepatch purposes.
+
+Regarding the second issue, stack corruptions and non-reliable states
+have to be recognized by the unwinder. Mainly it means to detect
+preemption or page faults, the end of the task stack must be reached,
+return addresses must be valid text addresses and hacks like function
+graph tracing and kretprobes must be properly detected.
+
+Unwinding a running task's stack is not a problem, because there is a
+livepatch requirement that every checked task is blocked, except for the
+current task. Due to that, the implementation can be much simpler
+compared to the existing non-reliable infrastructure. We can consider a
+task's kernel/thread stack only and skip the other stacks.
+
+[1] 20180912121106.31ffa97c@mschwideX1 [not archived on lore.kernel.org]
+
+Link: https://lkml.kernel.org/r/20191106095601.29986-5-mbenes@suse.cz
+	Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Tested-by: Miroslav Benes <mbenes@suse.cz>
+	Signed-off-by: Miroslav Benes <mbenes@suse.cz>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit aa137a6d302b5989ed205b7dfb7fe40a8851babc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/Kconfig
+#	arch/s390/kernel/stacktrace.c
+diff --cc arch/s390/Kconfig
+index 6d4676098bd9,367a87c5d7b8..000000000000
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@@ -130,25 -155,45 +130,30 @@@ config S39
+  	select HAVE_KERNEL_XZ
+  	select HAVE_KPROBES
+  	select HAVE_KRETPROBES
+ -	select HAVE_KVM
+ +	select HAVE_KVM if 64BIT
+  	select HAVE_LIVEPATCH
+ -	select HAVE_PERF_REGS
+ -	select HAVE_PERF_USER_STACK_DUMP
+ +	select HAVE_MEMBLOCK
+  	select HAVE_MEMBLOCK_NODE_MAP
+ -	select HAVE_MEMBLOCK_PHYS_MAP
+ -	select HAVE_MMU_GATHER_NO_GATHER
+  	select HAVE_MOD_ARCH_SPECIFIC
+ -	select HAVE_NOP_MCOUNT
+  	select HAVE_OPROFILE
+ -	select HAVE_PCI
+  	select HAVE_PERF_EVENTS
+ -	select HAVE_RCU_TABLE_FREE
+  	select HAVE_REGS_AND_STACK_ACCESS_API
+++<<<<<<< HEAD
+++=======
++ 	select HAVE_RELIABLE_STACKTRACE
++ 	select HAVE_RSEQ
+++>>>>>>> aa137a6d302b (s390/livepatch: Implement reliable stack tracing for the consistency model)
+  	select HAVE_SYSCALL_TRACEPOINTS
+ +	select HAVE_UID16 if 32BIT
+  	select HAVE_VIRT_CPU_ACCOUNTING
+ -	select IOMMU_HELPER		if PCI
+ -	select IOMMU_SUPPORT		if PCI
+ +	select VIRT_TO_BUS
+ +	select KTIME_SCALAR if 32BIT
+  	select MODULES_USE_ELF_RELA
+ -	select NEED_DMA_MAP_STATE	if PCI
+ -	select NEED_SG_DMA_LENGTH	if PCI
+ -	select OLD_SIGACTION
+  	select OLD_SIGSUSPEND3
+ -	select PCI_DOMAINS		if PCI
+ -	select PCI_MSI			if PCI
+ -	select SPARSE_IRQ
+ +	select OLD_SIGACTION
+  	select SYSCTL_EXCEPTION_TRACE
+ -	select THREAD_INFO_IN_TASK
+ -	select TTY
+ +	select USE_GENERIC_SMP_HELPERS if SMP
+  	select VIRT_CPU_ACCOUNTING
+ -	select ARCH_HAS_SCALED_CPUTIME
+ -	select HAVE_NMI
+ -	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
+ -	select SWIOTLB
+ -	select GENERIC_ALLOCATOR
+ -
+  
+  config SCHED_OMIT_FRAME_POINTER
+  	def_bool y
+diff --cc arch/s390/kernel/stacktrace.c
+index 91fab70267b8,fc5419ac64c8..000000000000
+--- a/arch/s390/kernel/stacktrace.c
++++ b/arch/s390/kernel/stacktrace.c
+@@@ -5,113 -6,62 +5,163 @@@
+   *  Author(s): Heiko Carstens <heiko.carstens@de.ibm.com>
+   */
+  
+ +#include <linux/sched.h>
+  #include <linux/stacktrace.h>
+++<<<<<<< HEAD
+ +#include <linux/kallsyms.h>
+ +#include <linux/module.h>
+++=======
++ #include <asm/stacktrace.h>
++ #include <asm/unwind.h>
++ #include <asm/kprobes.h>
+++>>>>>>> aa137a6d302b (s390/livepatch: Implement reliable stack tracing for the consistency model)
+  
+ -void arch_stack_walk(stack_trace_consume_fn consume_entry, void *cookie,
+ -		     struct task_struct *task, struct pt_regs *regs)
+ +static unsigned long save_context_stack(struct stack_trace *trace,
+ +					unsigned long sp,
+ +					unsigned long low,
+ +					unsigned long high,
+ +					int savesched)
+  {
+ -	struct unwind_state state;
+ +	struct stack_frame *sf;
+ +	struct pt_regs *regs;
+  	unsigned long addr;
+  
+ -	unwind_for_each_frame(&state, task, regs, 0) {
+ -		addr = unwind_get_return_address(&state);
+ -		if (!addr || !consume_entry(cookie, addr, false))
+ -			break;
+ +	while(1) {
+ +		sp &= PSW_ADDR_INSN;
+ +		if (sp < low || sp > high)
+ +			return sp;
+ +		sf = (struct stack_frame *)sp;
+ +		while(1) {
+ +			addr = sf->gprs[8] & PSW_ADDR_INSN;
+ +			if (!trace->skip)
+ +				trace->entries[trace->nr_entries++] = addr;
+ +			else
+ +				trace->skip--;
+ +			if (trace->nr_entries >= trace->max_entries)
+ +				return sp;
+ +			low = sp;
+ +			sp = sf->back_chain & PSW_ADDR_INSN;
+ +			if (!sp)
+ +				break;
+ +			if (sp <= low || sp > high - sizeof(*sf))
+ +				return sp;
+ +			sf = (struct stack_frame *)sp;
+ +		}
+ +		/* Zero backchain detected, check for interrupt frame. */
+ +		sp = (unsigned long)(sf + 1);
+ +		if (sp <= low || sp > high - sizeof(*regs))
+ +			return sp;
+ +		regs = (struct pt_regs *)sp;
+ +		addr = regs->psw.addr & PSW_ADDR_INSN;
+ +		if (savesched || !in_sched_functions(addr)) {
+ +			if (!trace->skip)
+ +				trace->entries[trace->nr_entries++] = addr;
+ +			else
+ +				trace->skip--;
+ +		}
+ +		if (trace->nr_entries >= trace->max_entries)
+ +			return sp;
+ +		low = sp;
+ +		sp = regs->gprs[15];
+ +	}
+ +}
+ +
+++<<<<<<< HEAD
+ +static void __save_stack_trace(struct stack_trace *trace, unsigned long sp)
+ +{
+ +	unsigned long new_sp, frame_size;
+ +
+ +	frame_size = STACK_FRAME_OVERHEAD + sizeof(struct pt_regs);
+ +	new_sp = save_context_stack(trace, sp,
+ +			S390_lowcore.panic_stack + frame_size - PAGE_SIZE,
+ +			S390_lowcore.panic_stack + frame_size, 1);
+ +	new_sp = save_context_stack(trace, new_sp,
+ +			S390_lowcore.async_stack + frame_size - ASYNC_SIZE,
+ +			S390_lowcore.async_stack + frame_size, 1);
+ +	save_context_stack(trace, new_sp,
+ +			   S390_lowcore.thread_info,
+ +			   S390_lowcore.thread_info + THREAD_SIZE, 1);
+ +}
+ +
+ +void save_stack_trace(struct stack_trace *trace)
+ +{
+ +	register unsigned long r15 asm ("15");
+ +	unsigned long sp;
+ +
+ +	sp = r15;
+ +	__save_stack_trace(trace, sp);
+ +	if (trace->nr_entries < trace->max_entries)
+ +		trace->entries[trace->nr_entries++] = ULONG_MAX;
+ +}
+ +EXPORT_SYMBOL_GPL(save_stack_trace);
+ +
+ +void save_stack_trace_tsk(struct task_struct *tsk, struct stack_trace *trace)
+ +{
+ +	unsigned long sp, low, high;
+ +
+ +	sp = tsk->thread.ksp & PSW_ADDR_INSN;
+ +	if (tsk == current) {
+ +		/* Get current stack pointer. */
+ +		asm volatile("la %0,0(15)" : "=a" (sp));
+  	}
+ +	low = (unsigned long) task_stack_page(tsk);
+ +	high = (unsigned long) task_pt_regs(tsk);
+ +	save_context_stack(trace, sp, low, high, 0);
+ +	if (trace->nr_entries < trace->max_entries)
+ +		trace->entries[trace->nr_entries++] = ULONG_MAX;
+  }
+ +EXPORT_SYMBOL_GPL(save_stack_trace_tsk);
+ +
+ +void save_stack_trace_regs(struct pt_regs *regs, struct stack_trace *trace)
+ +{
+ +	unsigned long sp;
+  
+ +	sp = kernel_stack_pointer(regs);
+ +	__save_stack_trace(trace, sp);
+ +	if (trace->nr_entries < trace->max_entries)
+ +		trace->entries[trace->nr_entries++] = ULONG_MAX;
+ +}
+ +EXPORT_SYMBOL_GPL(save_stack_trace_regs);
+++=======
++ /*
++  * This function returns an error if it detects any unreliable features of the
++  * stack.  Otherwise it guarantees that the stack trace is reliable.
++  *
++  * If the task is not 'current', the caller *must* ensure the task is inactive.
++  */
++ int arch_stack_walk_reliable(stack_trace_consume_fn consume_entry,
++ 			     void *cookie, struct task_struct *task)
++ {
++ 	struct unwind_state state;
++ 	unsigned long addr;
++ 
++ 	unwind_for_each_frame(&state, task, NULL, 0) {
++ 		if (state.stack_info.type != STACK_TYPE_TASK)
++ 			return -EINVAL;
++ 
++ 		if (state.regs)
++ 			return -EINVAL;
++ 
++ 		addr = unwind_get_return_address(&state);
++ 		if (!addr)
++ 			return -EINVAL;
++ 
++ #ifdef CONFIG_KPROBES
++ 		/*
++ 		 * Mark stacktraces with kretprobed functions on them
++ 		 * as unreliable.
++ 		 */
++ 		if (state.ip == (unsigned long)kretprobe_trampoline)
++ 			return -EINVAL;
++ #endif
++ 
++ 		if (!consume_entry(cookie, addr, false))
++ 			return -EINVAL;
++ 	}
++ 
++ 	/* Check for stack corruption */
++ 	if (unwind_error(&state))
++ 		return -EINVAL;
++ 	return 0;
++ }
+++>>>>>>> aa137a6d302b (s390/livepatch: Implement reliable stack tracing for the consistency model)
+* Unmerged path arch/s390/Kconfig
+* Unmerged path arch/s390/kernel/stacktrace.c
