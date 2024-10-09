@@ -1,0 +1,152 @@
+bpf, cls: consolidate prog deletion path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 8d829bdb97dc3a0c9c8090b9b168ca46ea99c8d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8d829bdb.failed
+
+Commit 18cdb37ebf4c ("net: sched: do not use tcf_proto 'tp' argument from
+call_rcu") removed the last usage of tp from cls_bpf_delete_prog(), so also
+remove it from the function as argument to not give a wrong impression. tp
+is illegal to access from this callback, since it could already have been
+freed.
+
+Refactor the deletion code a bit, so that cls_bpf_destroy() can call into
+the same code for prog deletion as cls_bpf_delete() op, instead of having
+it unnecessarily duplicated.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d829bdb97dc3a0c9c8090b9b168ca46ea99c8d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_bpf.c
+diff --cc net/sched/cls_bpf.c
+index c7a7c00a2b7c,f70e03d2d2c8..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -106,47 -241,36 +106,65 @@@ static int cls_bpf_init(struct tcf_prot
+  	return 0;
+  }
+  
+- static void cls_bpf_delete_prog(struct tcf_proto *tp, struct cls_bpf_prog *prog)
++ static void __cls_bpf_delete_prog(struct cls_bpf_prog *prog)
+  {
+  	tcf_exts_destroy(&prog->exts);
+ +	tcf_exts_put_net(&prog->exts);
+  
+ -	if (cls_bpf_is_ebpf(prog))
+ -		bpf_prog_put(prog->filter);
+ -	else
+ -		bpf_prog_destroy(prog->filter);
+ +	sk_unattached_filter_destroy(prog->filter);
+  
+ -	kfree(prog->bpf_name);
+  	kfree(prog->bpf_ops);
+  	kfree(prog);
+  }
+  
+++<<<<<<< HEAD
+ +static void cls_bpf_delete_prog_work(struct work_struct *work)
+ +{
+ +	struct cls_bpf_prog *prog = container_of(work, struct cls_bpf_prog, work);
+ +
+ +	rtnl_lock();
+ +	cls_bpf_delete_prog(prog->tp, prog);
+ +	rtnl_unlock();
+ +}
+ +
+ +static void __cls_bpf_delete_prog(struct rcu_head *rcu)
+++=======
++ static void cls_bpf_delete_prog_rcu(struct rcu_head *rcu)
+++>>>>>>> 8d829bdb97dc (bpf, cls: consolidate prog deletion path)
+  {
+- 	struct cls_bpf_prog *prog = container_of(rcu, struct cls_bpf_prog, rcu);
++ 	__cls_bpf_delete_prog(container_of(rcu, struct cls_bpf_prog, rcu));
++ }
+  
+++<<<<<<< HEAD
+ +	INIT_WORK(&prog->work, cls_bpf_delete_prog_work);
+ +	tcf_queue_work(&prog->work);
+++=======
++ static void __cls_bpf_delete(struct tcf_proto *tp, struct cls_bpf_prog *prog)
++ {
++ 	cls_bpf_stop_offload(tp, prog);
++ 	list_del_rcu(&prog->link);
++ 	tcf_unbind_filter(tp, &prog->res);
++ 	call_rcu(&prog->rcu, cls_bpf_delete_prog_rcu);
+++>>>>>>> 8d829bdb97dc (bpf, cls: consolidate prog deletion path)
+  }
+  
+ -static int cls_bpf_delete(struct tcf_proto *tp, unsigned long arg)
+ +static int cls_bpf_delete(struct tcf_proto *tp, void *arg, bool *last)
+  {
+++<<<<<<< HEAD
+ +	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+ +	struct cls_bpf_prog *prog = (struct cls_bpf_prog *) arg;
+ +
+ +	cls_bpf_stop_offload(tp, prog);
+ +	list_del_rcu(&prog->link);
+ +	tcf_unbind_filter(tp, &prog->res);
+ +	if (tcf_exts_get_net(&prog->exts))
+ +		call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+ +	else
+ +		cls_bpf_delete_prog(prog->tp, prog);
+ +	*last = list_empty(&head->plist);
+++=======
++ 	__cls_bpf_delete(tp, (struct cls_bpf_prog *) arg);
+++>>>>>>> 8d829bdb97dc (bpf, cls: consolidate prog deletion path)
+  	return 0;
+  }
+  
+@@@ -155,18 -279,17 +173,26 @@@ static void cls_bpf_destroy(struct tcf_
+  	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+  	struct cls_bpf_prog *prog, *tmp;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(prog, tmp, &head->plist, link) {
+ +		cls_bpf_stop_offload(tp, prog);
+ +		list_del_rcu(&prog->link);
+ +		tcf_unbind_filter(tp, &prog->res);
+ +		tcf_exts_get_net(&prog->exts);
+ +		call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+ +	}
+++=======
++ 	if (!force && !list_empty(&head->plist))
++ 		return false;
++ 
++ 	list_for_each_entry_safe(prog, tmp, &head->plist, link)
++ 		__cls_bpf_delete(tp, prog);
+++>>>>>>> 8d829bdb97dc (bpf, cls: consolidate prog deletion path)
+  
+  	kfree_rcu(head, rcu);
+ -	return true;
+  }
+  
+ -static unsigned long cls_bpf_get(struct tcf_proto *tp, u32 handle)
+ +static void *cls_bpf_get(struct tcf_proto *tp, u32 handle)
+  {
+  	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+  	struct cls_bpf_prog *prog;
+@@@ -299,7 -505,11 +325,15 @@@ static int cls_bpf_change(struct net *n
+  	if (ret < 0)
+  		goto errout;
+  
+++<<<<<<< HEAD
+ +	cls_bpf_offload(tp, prog, oldprog);
+++=======
++ 	ret = cls_bpf_offload(tp, prog, oldprog);
++ 	if (ret) {
++ 		__cls_bpf_delete_prog(prog);
++ 		return ret;
++ 	}
+++>>>>>>> 8d829bdb97dc (bpf, cls: consolidate prog deletion path)
+  
+  	if (oldprog) {
+  		list_replace_rcu(&oldprog->link, &prog->link);
+* Unmerged path net/sched/cls_bpf.c
