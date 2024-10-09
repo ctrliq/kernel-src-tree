@@ -1,0 +1,222 @@
+IB/SA: Add support to query opa classport info.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] ib/sa: Add support to query opa classport info (Don Dutile) [1499362]
+Rebuild_FUZZ: 98.92%
+commit-author Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+commit 2196f2716292c39b35c86f5238ed16a8978f9ad4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2196f271.failed
+
+For OPA devices, SA will query the OPA classport info
+instead of the IB defined classport info.
+opa classport info exposes additional information and
+capabilities that are specific to OPA devices.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Don Hiatt <don.hiatt@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 2196f2716292c39b35c86f5238ed16a8978f9ad4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sa_query.c
+diff --cc drivers/infiniband/core/sa_query.c
+index 17b24d8a34e1,b57bdc257fcf..000000000000
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@@ -65,9 -67,23 +65,27 @@@ struct ib_sa_sm_ah 
+  	u8		     src_path_mask;
+  };
+  
++ enum rdma_class_port_info_type {
++ 	RDMA_CLASS_PORT_INFO_IB,
++ 	RDMA_CLASS_PORT_INFO_OPA
++ };
++ 
++ struct rdma_class_port_info {
++ 	enum rdma_class_port_info_type type;
++ 	union {
++ 		struct ib_class_port_info ib;
++ 		struct opa_class_port_info opa;
++ 	};
++ };
++ 
+  struct ib_sa_classport_cache {
+  	bool valid;
+++<<<<<<< HEAD
+ +	struct ib_class_port_info data;
+++=======
++ 	int retry_cnt;
++ 	struct rdma_class_port_info data;
+++>>>>>>> 2196f2716292 (IB/SA: Add support to query opa classport info.)
+  };
+  
+  struct ib_sa_port {
+@@@ -1642,7 -1749,42 +1750,46 @@@ err1
+  }
+  EXPORT_SYMBOL(ib_sa_guid_info_rec_query);
+  
+++<<<<<<< HEAD
+ +/* Support get SA ClassPortInfo */
+++=======
++ bool ib_sa_sendonly_fullmem_support(struct ib_sa_client *client,
++ 				    struct ib_device *device,
++ 				    u8 port_num)
++ {
++ 	struct ib_sa_device *sa_dev = ib_get_client_data(device, &sa_client);
++ 	struct ib_sa_port *port;
++ 	bool ret = false;
++ 	unsigned long flags;
++ 
++ 	if (!sa_dev)
++ 		return ret;
++ 
++ 	port  = &sa_dev->port[port_num - sa_dev->start_port];
++ 
++ 	spin_lock_irqsave(&port->classport_lock, flags);
++ 	if ((port->classport_info.valid) &&
++ 	    (port->classport_info.data.type == RDMA_CLASS_PORT_INFO_IB))
++ 		ret = ib_get_cpi_capmask2(&port->classport_info.data.ib)
++ 			& IB_SA_CAP_MASK2_SENDONLY_FULL_MEM_SUPPORT;
++ 	spin_unlock_irqrestore(&port->classport_lock, flags);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(ib_sa_sendonly_fullmem_support);
++ 
++ struct ib_classport_info_context {
++ 	struct completion	done;
++ 	struct ib_sa_query	*sa_query;
++ };
++ 
++ static void ib_classportinfo_cb(void *context)
++ {
++ 	struct ib_classport_info_context *cb_ctx = context;
++ 
++ 	complete(&cb_ctx->done);
++ }
++ 
+++>>>>>>> 2196f2716292 (IB/SA: Add support to query opa classport info.)
+  static void ib_sa_classport_info_rec_callback(struct ib_sa_query *sa_query,
+  					      int status,
+  					      struct ib_sa_mad *mad)
+@@@ -1650,30 -1792,52 +1797,59 @@@
+  	unsigned long flags;
+  	struct ib_sa_classport_info_query *query =
+  		container_of(sa_query, struct ib_sa_classport_info_query, sa_query);
++ 	struct ib_sa_classport_cache *info = &sa_query->port->classport_info;
+  
+  	if (mad) {
+- 		struct ib_class_port_info rec;
++ 		if (sa_query->flags & IB_SA_QUERY_OPA) {
++ 			struct opa_class_port_info rec;
+  
+- 		ib_unpack(classport_info_rec_table,
+- 			  ARRAY_SIZE(classport_info_rec_table),
+- 			  mad->data, &rec);
++ 			ib_unpack(opa_classport_info_rec_table,
++ 				  ARRAY_SIZE(opa_classport_info_rec_table),
++ 				  mad->data, &rec);
+  
+- 		spin_lock_irqsave(&sa_query->port->classport_lock, flags);
+- 		if (!status && !sa_query->port->classport_info.valid) {
+- 			memcpy(&sa_query->port->classport_info.data, &rec,
+- 			       sizeof(sa_query->port->classport_info.data));
++ 			spin_lock_irqsave(&sa_query->port->classport_lock,
++ 					  flags);
++ 			if (!status && !info->valid) {
++ 				memcpy(&info->data.opa, &rec,
++ 				       sizeof(info->data.opa));
+  
+- 			sa_query->port->classport_info.valid = true;
++ 				info->valid = true;
++ 				info->data.type = RDMA_CLASS_PORT_INFO_OPA;
++ 			}
++ 			spin_unlock_irqrestore(&sa_query->port->classport_lock,
++ 					       flags);
++ 
++ 		} else {
++ 			struct ib_class_port_info rec;
++ 
++ 			ib_unpack(ib_classport_info_rec_table,
++ 				  ARRAY_SIZE(ib_classport_info_rec_table),
++ 				  mad->data, &rec);
++ 
++ 			spin_lock_irqsave(&sa_query->port->classport_lock,
++ 					  flags);
++ 			if (!status && !info->valid) {
++ 				memcpy(&info->data.ib, &rec,
++ 				       sizeof(info->data.ib));
++ 
++ 				info->valid = true;
++ 				info->data.type = RDMA_CLASS_PORT_INFO_IB;
++ 			}
++ 			spin_unlock_irqrestore(&sa_query->port->classport_lock,
++ 					       flags);
+  		}
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(&sa_query->port->classport_lock, flags);
+ +
+ +		query->callback(status, &rec, query->context);
+ +	} else {
+ +		query->callback(status, NULL, query->context);
+++=======
+++>>>>>>> 2196f2716292 (IB/SA: Add support to query opa classport info.)
+  	}
+ -	query->callback(query->context);
+  }
+  
+ -static void ib_sa_classport_info_rec_release(struct ib_sa_query *sa_query)
+ +static void ib_sa_portclass_info_rec_release(struct ib_sa_query *sa_query)
+  {
+  	kfree(container_of(sa_query, struct ib_sa_classport_info_query,
+  			   sa_query));
+@@@ -1719,22 -1862,21 +1895,25 @@@ int ib_sa_classport_info_rec_query(stru
+  		return -ENOMEM;
+  
+  	query->sa_query.port = port;
++ 	query->sa_query.flags |= rdma_cap_opa_ah(port->agent->device,
++ 						 port->port_num) ?
++ 				 IB_SA_QUERY_OPA : 0;
+  	ret = alloc_mad(&query->sa_query, gfp_mask);
+  	if (ret)
+ -		goto err_free;
+ +		goto err1;
+  
+ -	query->callback = callback;
+ -	query->context = context;
+ +	ib_sa_client_get(client);
+ +	query->sa_query.client = client;
+ +	query->callback        = callback;
+ +	query->context         = context;
+  
+  	mad = query->sa_query.mad_buf->mad;
+- 	init_mad(mad, agent);
++ 	init_mad(&query->sa_query, agent);
+  
+ -	query->sa_query.callback = ib_sa_classport_info_rec_callback;
+ -	query->sa_query.release  = ib_sa_classport_info_rec_release;
+ +	query->sa_query.callback = callback ? ib_sa_classport_info_rec_callback : NULL;
+ +
+ +	query->sa_query.release  = ib_sa_portclass_info_rec_release;
+ +	/* support GET only */
+  	mad->mad_hdr.method	 = IB_MGMT_METHOD_GET;
+  	mad->mad_hdr.attr_id	 = cpu_to_be16(IB_SA_ATTR_CLASS_PORTINFO);
+  	mad->sa_hdr.comp_mask	 = 0;
+* Unmerged path drivers/infiniband/core/sa_query.c
+diff --git a/include/rdma/ib_sa.h b/include/rdma/ib_sa.h
+index fd0e53219f93..b12a57a35588 100644
+--- a/include/rdma/ib_sa.h
++++ b/include/rdma/ib_sa.h
+@@ -56,6 +56,7 @@ enum {
+ 	IB_SA_METHOD_GET_TRACE_TBL	= 0x13
+ };
+ 
++#define OPA_SA_CLASS_VERSION	0x80
+ enum {
+ 	IB_SA_ATTR_CLASS_PORTINFO    = 0x01,
+ 	IB_SA_ATTR_NOTICE	     = 0x02,
