@@ -563,6 +563,7 @@ isert_init_conn(struct isert_conn *isert_conn)
 	INIT_LIST_HEAD(&isert_conn->node);
 	init_completion(&isert_conn->login_comp);
 	init_completion(&isert_conn->login_req_comp);
+	init_waitqueue_head(&isert_conn->rem_wait);
 	kref_init(&isert_conn->kref);
 	mutex_init(&isert_conn->mutex);
 	spin_lock_init(&isert_conn->pool_lock);
@@ -743,7 +744,8 @@ isert_connect_release(struct isert_conn *isert_conn)
 		isert_conn_free_fastreg_pool(isert_conn);
 
 	isert_free_rx_descriptors(isert_conn);
-	if (isert_conn->cm_id)
+	if (isert_conn->cm_id &&
+	    !isert_conn->dev_removed)
 		rdma_destroy_id(isert_conn->cm_id);
 
 	if (isert_conn->qp) {
@@ -758,7 +760,10 @@ isert_connect_release(struct isert_conn *isert_conn)
 
 	isert_device_put(device);
 
-	kfree(isert_conn);
+	if (isert_conn->dev_removed)
+		wake_up_interruptible(&isert_conn->rem_wait);
+	else
+		kfree(isert_conn);
 }
 
 static void
@@ -918,6 +923,7 @@ static int
 isert_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 {
 	struct isert_np *isert_np = cma_id->context;
+	struct isert_conn *isert_conn;
 	int ret = 0;
 
 	isert_info("%s (%d): status %d id %p np %p\n",
@@ -938,10 +944,21 @@ isert_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 		break;
 	case RDMA_CM_EVENT_ADDR_CHANGE:    /* FALLTHRU */
 	case RDMA_CM_EVENT_DISCONNECTED:   /* FALLTHRU */
-	case RDMA_CM_EVENT_DEVICE_REMOVAL: /* FALLTHRU */
 	case RDMA_CM_EVENT_TIMEWAIT_EXIT:  /* FALLTHRU */
 		ret = isert_disconnected_handler(cma_id, event->event);
 		break;
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+		isert_conn = cma_id->qp->qp_context;
+		isert_conn->dev_removed = true;
+		isert_disconnected_handler(cma_id, event->event);
+		wait_event_interruptible(isert_conn->rem_wait,
+					 isert_conn->state == ISER_CONN_DOWN);
+		kfree(isert_conn);
+		/*
+		 * return non-zero from the callback to destroy
+		 * the rdma cm id
+		 */
+		return 1;
 	case RDMA_CM_EVENT_REJECTED:       /* FALLTHRU */
 	case RDMA_CM_EVENT_UNREACHABLE:    /* FALLTHRU */
 	case RDMA_CM_EVENT_CONNECT_ERROR:
