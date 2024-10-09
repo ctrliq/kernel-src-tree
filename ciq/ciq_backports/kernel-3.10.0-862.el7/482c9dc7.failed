@@ -1,0 +1,506 @@
+qla2xxx: Change scsi host lookup method.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Change scsi host lookup method (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 98.73%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 482c9dc79204bb83c3433a59680c787a0b98c000
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/482c9dc7.failed
+
+For target mode, when new scsi command arrive, driver first performs
+a look up of the SCSI Host. The current look up method is based on
+the ALPA portion of the NPort ID. For Cisco switch, the ALPA can
+not be used as the index. Instead, the new search method is based
+on the full value of the Nport_ID via btree lib.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 482c9dc79204bb83c3433a59680c787a0b98c000)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_gbl.h
+#	drivers/scsi/qla2xxx/qla_mbx.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 3f28536dc812,9251918773b1..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -2969,9 -3299,29 +2970,14 @@@ struct qlt_hw_data 
+  	uint8_t saved_add_firmware_options[2];
+  
+  	uint8_t tgt_node_name[WWN_SIZE];
+ -
+ -	struct dentry *dfs_tgt_sess;
+ -	struct dentry *dfs_tgt_port_database;
+ -
+ -	struct list_head q_full_list;
+ -	uint32_t num_pend_cmds;
+ -	uint32_t num_qfull_cmds_alloc;
+ -	uint32_t num_qfull_cmds_dropped;
+ -	spinlock_t q_full_lock;
+ -	uint32_t leak_exchg_thresh_hold;
+ -	spinlock_t sess_lock;
+  	int rspq_vector_cpuid;
+++<<<<<<< HEAD
+++=======
++ 	spinlock_t atio_lock ____cacheline_aligned;
++ 	struct btree_head32 host_map;
+++>>>>>>> 482c9dc79204 (qla2xxx: Change scsi host lookup method.)
+  };
+  
+ -#define MAX_QFULL_CMDS_ALLOC	8192
+ -#define Q_FULL_THRESH_HOLD_PERCENT 90
+ -#define Q_FULL_THRESH_HOLD(ha) \
+ -	((ha->cur_fw_xcb_count/100) * Q_FULL_THRESH_HOLD_PERCENT)
+ -
+ -#define LEAK_EXCHG_THRESH_HOLD_PERCENT 75	/* 75 percent */
+ -
+  /*
+   * Qlogic host adapter specific data structure.
+  */
+diff --cc drivers/scsi/qla2xxx/qla_gbl.h
+index c4f068539cd6,5b2451745e9f..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@@ -782,4 -834,27 +782,30 @@@ extern void qla82xx_mbx_completion(scsi
+  extern int qla8044_abort_isp(scsi_qla_host_t *);
+  extern int qla8044_check_fw_alive(struct scsi_qla_host *);
+  
+++<<<<<<< HEAD
+++=======
++ extern void qlt_host_reset_handler(struct qla_hw_data *ha);
++ extern int qla_get_exlogin_status(scsi_qla_host_t *, uint16_t *,
++ 	uint16_t *);
++ extern int qla_set_exlogin_mem_cfg(scsi_qla_host_t *vha, dma_addr_t phys_addr);
++ extern int qla_get_exchoffld_status(scsi_qla_host_t *, uint16_t *, uint16_t *);
++ extern int qla_set_exchoffld_mem_cfg(scsi_qla_host_t *, dma_addr_t);
++ extern void qlt_handle_abts_recv(struct scsi_qla_host *, response_t *);
++ 
++ int qla24xx_async_notify_ack(scsi_qla_host_t *, fc_port_t *,
++ 	struct imm_ntfy_from_isp *, int);
++ void qla24xx_do_nack_work(struct scsi_qla_host *, struct qla_work_evt *);
++ void qlt_plogi_ack_link(struct scsi_qla_host *, struct qlt_plogi_ack_t *,
++ 	struct fc_port *, enum qlt_plogi_link_t);
++ void qlt_plogi_ack_unref(struct scsi_qla_host *, struct qlt_plogi_ack_t *);
++ extern void qlt_schedule_sess_for_deletion(struct fc_port *, bool);
++ extern void qlt_schedule_sess_for_deletion_lock(struct fc_port *);
++ extern struct fc_port *qlt_find_sess_invalidate_other(scsi_qla_host_t *,
++ 	uint64_t wwn, port_id_t port_id, uint16_t loop_id, struct fc_port **);
++ void qla24xx_delete_sess_fn(struct work_struct *);
++ void qlt_unknown_atio_work_fn(struct work_struct *);
++ void qlt_update_host_map(struct scsi_qla_host *, port_id_t);
++ void qlt_remove_target_resources(struct qla_hw_data *);
++ 
+++>>>>>>> 482c9dc79204 (qla2xxx: Change scsi host lookup method.)
+  #endif /* _QLA_GBL_H */
+diff --cc drivers/scsi/qla2xxx/qla_mbx.c
+index 21eee93873e8,53d9579acc74..000000000000
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@@ -3467,12 -3619,11 +3467,13 @@@ voi
+  qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+  	struct vp_rpt_id_entry_24xx *rptid_entry)
+  {
+ +	uint8_t vp_idx;
+ +	uint16_t stat = le16_to_cpu(rptid_entry->vp_idx);
+  	struct qla_hw_data *ha = vha->hw;
+ -	scsi_qla_host_t *vp = NULL;
+ +	scsi_qla_host_t *vp;
+  	unsigned long   flags;
+  	int found;
++ 	port_id_t id;
+  
+  	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10b6,
+  	    "Entered %s.\n", __func__);
+@@@ -3480,81 -3631,114 +3481,139 @@@
+  	if (rptid_entry->entry_status != 0)
+  		return;
+  
++ 	id.b.domain = rptid_entry->port_id[2];
++ 	id.b.area   = rptid_entry->port_id[1];
++ 	id.b.al_pa  = rptid_entry->port_id[0];
++ 	id.b.rsvd_1 = 0;
++ 
+  	if (rptid_entry->format == 0) {
+ -		/* loop */
+  		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10b7,
+  		    "Format 0 : Number of VPs setup %d, number of "
+ -		    "VPs acquired %d.\n", rptid_entry->vp_setup,
+ -		    rptid_entry->vp_acquired);
+ +		    "VPs acquired %d.\n",
+ +		    MSB(le16_to_cpu(rptid_entry->vp_count)),
+ +		    LSB(le16_to_cpu(rptid_entry->vp_count)));
+  		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10b8,
+  		    "Primary port id %02x%02x%02x.\n",
+  		    rptid_entry->port_id[2], rptid_entry->port_id[1],
+  		    rptid_entry->port_id[0]);
+++<<<<<<< HEAD
+++=======
++ 
++ 		qlt_update_host_map(vha, id);
++ 
+++>>>>>>> 482c9dc79204 (qla2xxx: Change scsi host lookup method.)
+  	} else if (rptid_entry->format == 1) {
+ -		/* fabric */
+ +		vp_idx = LSB(stat);
+  		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10b9,
+  		    "Format 1: VP[%d] enabled - status %d - with "
+ -		    "port id %02x%02x%02x.\n", rptid_entry->vp_idx,
+ -			rptid_entry->vp_status,
+ +		    "port id %02x%02x%02x.\n", vp_idx, MSB(stat),
+  		    rptid_entry->port_id[2], rptid_entry->port_id[1],
+  		    rptid_entry->port_id[0]);
+  
+  		/* buffer to buffer credit flag */
+ -		vha->flags.bbcr_enable = (rptid_entry->u.f1.bbcr & 0xf) != 0;
+ -
+ -		if (rptid_entry->vp_idx == 0) {
+ -			if (rptid_entry->vp_status == VP_STAT_COMPL) {
+ -				/* FA-WWN is only for physical port */
+ -				if (qla_ini_mode_enabled(vha) &&
+ -				    ha->flags.fawwpn_enabled &&
+ -				    (rptid_entry->u.f1.flags &
+ -				     VP_FLAGS_NAME_VALID)) {
+ -					memcpy(vha->port_name,
+ -					    rptid_entry->u.f1.port_name,
+ -					    WWN_SIZE);
+ -				}
+ +		vha->flags.bbcr_enable = (rptid_entry->bbcr & 0xf) != 0;
+  
+ +		/* FA-WWN is only for physical port */
+ +		if (!vp_idx) {
+ +			void *wwpn = ha->init_cb->port_name;
+ +
+++<<<<<<< HEAD
+ +			if (!MSB(stat)) {
+ +				if (rptid_entry->vp_idx_map[1] & BIT_6)
+ +					wwpn = rptid_entry->reserved_4 + 8;
+++=======
++ 				qlt_update_host_map(vha, id);
+++>>>>>>> 482c9dc79204 (qla2xxx: Change scsi host lookup method.)
+  			}
+ -
+ +			memcpy(vha->port_name, wwpn, WWN_SIZE);
+  			fc_host_port_name(vha->host) =
+  			    wwn_to_u64(vha->port_name);
+++<<<<<<< HEAD
+ +			ql_dbg(ql_dbg_mbx, vha, 0x1018,
+ +			    "FA-WWN portname %016llx (%x)\n",
+ +			    fc_host_port_name(vha->host), MSB(stat));
+++=======
++ 
++ 			if (qla_ini_mode_enabled(vha))
++ 				ql_dbg(ql_dbg_mbx, vha, 0x1018,
++ 				    "FA-WWN portname %016llx (%x)\n",
++ 				    fc_host_port_name(vha->host),
++ 				    rptid_entry->vp_status);
++ 
++ 			set_bit(REGISTER_FC4_NEEDED, &vha->dpc_flags);
++ 			set_bit(REGISTER_FDMI_NEEDED, &vha->dpc_flags);
++ 		} else {
++ 			if (rptid_entry->vp_status != VP_STAT_COMPL &&
++ 				rptid_entry->vp_status != VP_STAT_ID_CHG) {
++ 				ql_dbg(ql_dbg_mbx, vha, 0x10ba,
++ 				    "Could not acquire ID for VP[%d].\n",
++ 				    rptid_entry->vp_idx);
++ 				return;
++ 			}
++ 
++ 			found = 0;
++ 			spin_lock_irqsave(&ha->vport_slock, flags);
++ 			list_for_each_entry(vp, &ha->vp_list, list) {
++ 				if (rptid_entry->vp_idx == vp->vp_idx) {
++ 					found = 1;
++ 					break;
++ 				}
++ 			}
++ 			spin_unlock_irqrestore(&ha->vport_slock, flags);
++ 
++ 			if (!found)
++ 				return;
++ 
++ 			qlt_update_host_map(vp, id);
++ 
++ 			/*
++ 			 * Cannot configure here as we are still sitting on the
++ 			 * response queue. Handle it in dpc context.
++ 			 */
++ 			set_bit(VP_IDX_ACQUIRED, &vp->vp_flags);
++ 			set_bit(REGISTER_FC4_NEEDED, &vp->dpc_flags);
++ 			set_bit(REGISTER_FDMI_NEEDED, &vp->dpc_flags);
+++>>>>>>> 482c9dc79204 (qla2xxx: Change scsi host lookup method.)
+  		}
+ -		set_bit(VP_DPC_NEEDED, &vha->dpc_flags);
+ -		qla2xxx_wake_dpc(vha);
+ -	} else if (rptid_entry->format == 2) {
+ -		ql_dbg(ql_dbg_async, vha, 0xffff,
+ -		    "RIDA: format 2/N2N Primary port id %02x%02x%02x.\n",
+ -		    rptid_entry->port_id[2], rptid_entry->port_id[1],
+ -		    rptid_entry->port_id[0]);
+  
+ -		ql_dbg(ql_dbg_async, vha, 0xffff,
+ -		    "N2N: Remote WWPN %8phC.\n",
+ -		    rptid_entry->u.f2.port_name);
+ +		vp = vha;
+ +		if (vp_idx == 0)
+ +			goto reg_needed;
+  
+ -		/* N2N.  direct connect */
+ -		vha->d_id.b.domain = rptid_entry->port_id[2];
+ -		vha->d_id.b.area = rptid_entry->port_id[1];
+ -		vha->d_id.b.al_pa = rptid_entry->port_id[0];
+ +		if (MSB(stat) != 0 && MSB(stat) != 2) {
+ +			ql_dbg(ql_dbg_mbx, vha, 0x10ba,
+ +			    "Could not acquire ID for VP[%d].\n", vp_idx);
+ +			return;
+ +		}
+  
+ +		found = 0;
+  		spin_lock_irqsave(&ha->vport_slock, flags);
+ -		qlt_update_vp_map(vha, SET_AL_PA);
+ +		list_for_each_entry(vp, &ha->vp_list, list) {
+ +			if (vp_idx == vp->vp_idx) {
+ +				found = 1;
+ +				break;
+ +			}
+ +		}
+  		spin_unlock_irqrestore(&ha->vport_slock, flags);
+ +
+ +		if (!found)
+ +			return;
+ +
+ +		vp->d_id.b.domain = rptid_entry->port_id[2];
+ +		vp->d_id.b.area =  rptid_entry->port_id[1];
+ +		vp->d_id.b.al_pa = rptid_entry->port_id[0];
+ +
+ +		/*
+ +		 * Cannot configure here as we are still sitting on the
+ +		 * response queue. Handle it in dpc context.
+ +		 */
+ +		set_bit(VP_IDX_ACQUIRED, &vp->vp_flags);
+ +
+ +reg_needed:
+ +		set_bit(REGISTER_FC4_NEEDED, &vp->dpc_flags);
+ +		set_bit(REGISTER_FDMI_NEEDED, &vp->dpc_flags);
+ +		set_bit(VP_DPC_NEEDED, &vha->dpc_flags);
+ +		qla2xxx_wake_dpc(vha);
+  	}
+  }
+  
+diff --git a/drivers/scsi/qla2xxx/Kconfig b/drivers/scsi/qla2xxx/Kconfig
+index 0cb90d65b74b..a1e886f755e8 100644
+--- a/drivers/scsi/qla2xxx/Kconfig
++++ b/drivers/scsi/qla2xxx/Kconfig
+@@ -3,6 +3,7 @@ config SCSI_QLA_FC
+ 	depends on PCI && SCSI
+ 	select SCSI_FC_ATTRS
+ 	select FW_LOADER
++	select BTREE
+ 	---help---
+ 	This qla2xxx driver supports all QLogic Fibre Channel
+ 	PCI and PCIe host adapters.
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_gbl.h
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index b9189cae77e5..993ef604369d 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -2464,8 +2464,8 @@ qla2x00_configure_hba(scsi_qla_host_t *vha)
+ 	uint8_t       domain;
+ 	char		connect_type[22];
+ 	struct qla_hw_data *ha = vha->hw;
+-	unsigned long flags;
+ 	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
++	port_id_t id;
+ 
+ 	/* Get host addresses. */
+ 	rval = qla2x00_get_adapter_id(vha,
+@@ -2543,13 +2543,11 @@ qla2x00_configure_hba(scsi_qla_host_t *vha)
+ 
+ 	/* Save Host port and loop ID. */
+ 	/* byte order - Big Endian */
+-	vha->d_id.b.domain = domain;
+-	vha->d_id.b.area = area;
+-	vha->d_id.b.al_pa = al_pa;
+-
+-	spin_lock_irqsave(&ha->vport_slock, flags);
+-	qlt_update_vp_map(vha, SET_AL_PA);
+-	spin_unlock_irqrestore(&ha->vport_slock, flags);
++	id.b.domain = domain;
++	id.b.area = area;
++	id.b.al_pa = al_pa;
++	id.b.rsvd_1 = 0;
++	qlt_update_host_map(vha, id);
+ 
+ 	if (!vha->flags.init_done)
+ 		ql_log(ql_log_info, vha, 0x2010,
+* Unmerged path drivers/scsi/qla2xxx/qla_mbx.c
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 4e0d0a2f9461..692b47b27baa 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -3483,6 +3483,7 @@ qla2x00_remove_one(struct pci_dev *pdev)
+ 	qla2x00_free_sysfs_attr(base_vha, true);
+ 
+ 	fc_remove_host(base_vha->host);
++	qlt_remove_target_resources(ha);
+ 
+ 	scsi_remove_host(base_vha->host);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index f10c075d97ef..e8d123ee63fc 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -146,21 +146,23 @@ static inline
+ struct scsi_qla_host *qlt_find_host_by_d_id(struct scsi_qla_host *vha,
+ 	uint8_t *d_id)
+ {
+-	struct qla_hw_data *ha = vha->hw;
+-	uint8_t vp_idx;
+-
+-	if ((vha->d_id.b.area != d_id[1]) || (vha->d_id.b.domain != d_id[0]))
+-		return NULL;
++	struct scsi_qla_host *host;
++	uint32_t key = 0;
+ 
+-	if (vha->d_id.b.al_pa == d_id[2])
++	if ((vha->d_id.b.area == d_id[1]) && (vha->d_id.b.domain == d_id[0]) &&
++	    (vha->d_id.b.al_pa == d_id[2]))
+ 		return vha;
+ 
+-	BUG_ON(ha->tgt.tgt_vp_map == NULL);
+-	vp_idx = ha->tgt.tgt_vp_map[d_id[2]].idx;
+-	if (likely(test_bit(vp_idx, ha->vp_idx_map)))
+-		return ha->tgt.tgt_vp_map[vp_idx].vha;
++	key  = (uint32_t)d_id[0] << 16;
++	key |= (uint32_t)d_id[1] <<  8;
++	key |= (uint32_t)d_id[2];
+ 
+-	return NULL;
++	host = btree_lookup32(&vha->hw->tgt.host_map, key);
++	if (!host)
++		ql_dbg(ql_dbg_tgt_mgt, vha, 0xffff,
++			   "Unable to find host %06x\n", key);
++
++	return host;
+ }
+ 
+ static inline
+@@ -4359,6 +4361,17 @@ int qlt_remove_target(struct qla_hw_data *ha, struct scsi_qla_host *vha)
+ 	return 0;
+ }
+ 
++void qlt_remove_target_resources(struct qla_hw_data *ha)
++{
++	struct scsi_qla_host *node;
++	u32 key = 0;
++
++	btree_for_each_safe32(&ha->tgt.host_map, key, node)
++		btree_remove32(&ha->tgt.host_map, key);
++
++	btree_destroy32(&ha->tgt.host_map);
++}
++
+ static void qlt_lport_dump(struct scsi_qla_host *vha, u64 wwpn,
+ 	unsigned char *b)
+ {
+@@ -4925,6 +4938,8 @@ qlt_modify_vp_config(struct scsi_qla_host *vha,
+ void
+ qlt_probe_one_stage1(struct scsi_qla_host *base_vha, struct qla_hw_data *ha)
+ {
++	int rc;
++
+ 	if (!QLA_TGT_MODE_ENABLED())
+ 		return;
+ 
+@@ -4939,6 +4954,13 @@ qlt_probe_one_stage1(struct scsi_qla_host *base_vha, struct qla_hw_data *ha)
+ 	mutex_init(&ha->tgt.tgt_mutex);
+ 	mutex_init(&ha->tgt.tgt_host_action_mutex);
+ 	qlt_clear_mode(base_vha);
++
++	rc = btree_init32(&ha->tgt.host_map);
++	if (rc)
++		ql_log(ql_log_info, base_vha, 0xffff,
++		    "Unable to initialize ha->host_map btree\n");
++
++	qlt_update_vp_map(base_vha, SET_VP_IDX);
+ }
+ 
+ irqreturn_t
+@@ -5002,25 +5024,69 @@ qlt_mem_free(struct qla_hw_data *ha)
+ void
+ qlt_update_vp_map(struct scsi_qla_host *vha, int cmd)
+ {
++	void *slot;
++	u32 key;
++	int rc;
++
+ 	if (!QLA_TGT_MODE_ENABLED())
+ 		return;
+ 
++	key = vha->d_id.b24;
++
+ 	switch (cmd) {
+ 	case SET_VP_IDX:
+ 		vha->hw->tgt.tgt_vp_map[vha->vp_idx].vha = vha;
+ 		break;
+ 	case SET_AL_PA:
+-		vha->hw->tgt.tgt_vp_map[vha->d_id.b.al_pa].idx = vha->vp_idx;
++		slot = btree_lookup32(&vha->hw->tgt.host_map, key);
++		if (!slot) {
++			ql_dbg(ql_dbg_tgt_mgt, vha, 0xffff,
++			    "Save vha in host_map %p %06x\n", vha, key);
++			rc = btree_insert32(&vha->hw->tgt.host_map,
++				key, vha, GFP_ATOMIC);
++			if (rc)
++				ql_log(ql_log_info, vha, 0xffff,
++				    "Unable to insert s_id into host_map: %06x\n",
++				    key);
++			return;
++		}
++		ql_dbg(ql_dbg_tgt_mgt, vha, 0xffff,
++			"replace existing vha in host_map %p %06x\n", vha, key);
++		btree_update32(&vha->hw->tgt.host_map, key, vha);
+ 		break;
+ 	case RESET_VP_IDX:
+ 		vha->hw->tgt.tgt_vp_map[vha->vp_idx].vha = NULL;
+ 		break;
+ 	case RESET_AL_PA:
+-		vha->hw->tgt.tgt_vp_map[vha->d_id.b.al_pa].idx = 0;
++		ql_dbg(ql_dbg_tgt_mgt, vha, 0xffff,
++		   "clear vha in host_map %p %06x\n", vha, key);
++		slot = btree_lookup32(&vha->hw->tgt.host_map, key);
++		if (slot)
++			btree_remove32(&vha->hw->tgt.host_map, key);
++		vha->d_id.b24 = 0;
+ 		break;
+ 	}
+ }
+ 
++void qlt_update_host_map(struct scsi_qla_host *vha, port_id_t id)
++{
++	unsigned long flags;
++	struct qla_hw_data *ha = vha->hw;
++
++	if (!vha->d_id.b24) {
++		spin_lock_irqsave(&ha->vport_slock, flags);
++		vha->d_id = id;
++		qlt_update_vp_map(vha, SET_AL_PA);
++		spin_unlock_irqrestore(&ha->vport_slock, flags);
++	} else if (vha->d_id.b24 != id.b24) {
++		spin_lock_irqsave(&ha->vport_slock, flags);
++		qlt_update_vp_map(vha, RESET_AL_PA);
++		vha->d_id = id;
++		qlt_update_vp_map(vha, SET_AL_PA);
++		spin_unlock_irqrestore(&ha->vport_slock, flags);
++	}
++}
++
+ static int __init qlt_parse_ini_mode(void)
+ {
+ 	if (strcasecmp(qlini_mode, QLA2XXX_INI_MODE_STR_EXCLUSIVE) == 0)
