@@ -1,0 +1,554 @@
+IB/hfi1: Resolve kernel panics by reference counting receive contexts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit f683c80ca68e087b55c6f9ab6ca6beb88ebc6d69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f683c80c.failed
+
+Base receive contexts can be used by sub contexts.  Because of this,
+resources for the context cannot be completely freed until all sub
+contexts are done using the base context.
+
+Introduce a reference count so that the base receive context can be
+freed only when all sub contexts are done with it.
+
+Use the provided function call for setting default send context
+integrity rather than the manual method.
+
+The cleanup path does not set all variables back to NULL after freeing
+resources.  Since the clean up code can get called more than once,
+(e.g. during context close and on the error path), it is necessary to
+make sure that all the variables are NULLed.
+
+Possible crash are:
+
+BUG: unable to handle kernel paging request at 0000000001908900
+IP: read_csr+0x24/0x30 [hfi1]
+RIP: 0010:read_csr+0x24/0x30 [hfi1]
+Call Trace:
+ sc_disable+0x40/0x110 [hfi1]
+ hfi1_file_close+0x16f/0x360 [hfi1]
+ __fput+0xe7/0x210
+ ____fput+0xe/0x10
+
+or
+
+kernel BUG at mm/slub.c:3877!
+RIP: 0010:kfree+0x14f/0x170
+Call Trace:
+ hfi1_free_ctxtdata+0x19a/0x2b0 [hfi1]
+ ? hfi1_user_exp_rcv_grp_free+0x73/0x80 [hfi1]
+ hfi1_file_close+0x20f/0x360 [hfi1]
+ __fput+0xe7/0x210
+ ____fput+0xe/0x10
+
+Fixes: Commit 62239fc6e554 ("IB/hfi1: Clean up on context initialization failure")
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f683c80ca68e087b55c6f9ab6ca6beb88ebc6d69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+#	drivers/infiniband/hw/hfi1/hfi.h
+#	drivers/infiniband/hw/hfi1/init.c
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 32dd4a920494,bbf80b1dd9d9..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -768,8 -773,10 +768,15 @@@ static int hfi1_file_close(struct inod
+  			   HFI1_MAX_SHARED_CTXTS) + fdata->subctxt;
+  	*ev = 0;
+  
+++<<<<<<< HEAD
+ +	if (--uctxt->cnt) {
+ +		uctxt->active_slaves &= ~(1 << fdata->subctxt);
+++=======
++ 	__clear_bit(fdata->subctxt, uctxt->in_use_ctxts);
++ 	fdata->uctxt = NULL;
++ 	hfi1_rcd_put(uctxt); /* fdata reference */
++ 	if (!bitmap_empty(uctxt->in_use_ctxts, HFI1_MAX_SHARED_CTXTS)) {
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  		mutex_unlock(&hfi1_mutex);
+  		goto done;
+  	}
+@@@ -789,17 -796,16 +796,22 @@@
+  	/* Clear the context's J_KEY */
+  	hfi1_clear_ctxt_jkey(dd, uctxt->ctxt);
+  	/*
+- 	 * Reset context integrity checks to default.
+- 	 * (writes to CSRs probably belong in chip.c)
++ 	 * If a send context is allocated, reset context integrity
++ 	 * checks to default and disable the send context.
+  	 */
+- 	write_kctxt_csr(dd, uctxt->sc->hw_context, SEND_CTXT_CHECK_ENABLE,
+- 			hfi1_pkt_default_send_ctxt_mask(dd, uctxt->sc->type));
+- 	sc_disable(uctxt->sc);
++ 	if (uctxt->sc) {
++ 		set_pio_integrity(uctxt->sc);
++ 		sc_disable(uctxt->sc);
++ 	}
+  	spin_unlock_irqrestore(&dd->uctxt_lock, flags);
+  
+++<<<<<<< HEAD
+ +	dd->rcd[uctxt->ctxt] = NULL;
+ +
+ +	hfi1_user_exp_rcv_grp_free(uctxt);
+++=======
++ 	hfi1_free_ctxt_rcv_groups(uctxt);
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  	hfi1_clear_ctxt_pkey(dd, uctxt);
+  
+  	uctxt->rcvwait_to = 0;
+@@@ -868,99 -874,113 +883,173 @@@ static int assign_ctxt(struct file *fp
+  	}
+  
+  	/*
+ -	 * Allocate a base context if context sharing is not required or we
+ -	 * couldn't find a sub context.
+ +	 * We execute the following block if we couldn't find a
+ +	 * shared context or if context sharing is not required.
+  	 */
+++<<<<<<< HEAD
+ +	if (!ret) {
+ +		i_minor = iminor(file_inode(fp)) - HFI1_USER_MINOR_BASE;
+ +		ret = get_user_context(fp, uinfo, i_minor);
+++=======
++ 	if (!ret)
++ 		ret = allocate_ctxt(fd, fd->dd, uinfo);
++ 
++ 	mutex_unlock(&hfi1_mutex);
++ 
++ 	/* Depending on the context type, do the appropriate init */
++ 	if (ret > 0) {
++ 		/*
++ 		 * sub-context info can only be set up after the base
++ 		 * context has been completed.
++ 		 */
++ 		ret = wait_event_interruptible(fd->uctxt->wait, !test_bit(
++ 					       HFI1_CTXT_BASE_UNINIT,
++ 					       &fd->uctxt->event_flags));
++ 		if (test_bit(HFI1_CTXT_BASE_FAILED, &fd->uctxt->event_flags))
++ 			ret = -ENOMEM;
++ 
++ 		/* The only thing a sub context needs is the user_xxx stuff */
++ 		if (!ret)
++ 			ret = init_user_ctxt(fd);
++ 
++ 		if (ret) {
++ 			clear_bit(fd->subctxt, fd->uctxt->in_use_ctxts);
++ 			hfi1_rcd_put(fd->uctxt);
++ 		}
++ 	} else if (!ret) {
++ 		ret = setup_base_ctxt(fd);
++ 		if (fd->uctxt->subctxt_cnt) {
++ 			/* If there is an error, set the failed bit. */
++ 			if (ret)
++ 				set_bit(HFI1_CTXT_BASE_FAILED,
++ 					&fd->uctxt->event_flags);
++ 			/*
++ 			 * Base context is done, notify anybody using a
++ 			 * sub-context that is waiting for this completion
++ 			 */
++ 			clear_bit(HFI1_CTXT_BASE_UNINIT,
++ 				  &fd->uctxt->event_flags);
++ 			wake_up(&fd->uctxt->wait);
++ 		}
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  	}
+ -
+ +done_unlock:
+ +	mutex_unlock(&hfi1_mutex);
+ +done:
+  	return ret;
+  }
+  
+ -/*
+ - * The hfi1_mutex must be held when this function is called.  It is
+ - * necessary to ensure serialized access to the bitmask in_use_ctxts.
+ - */
+ -static int find_sub_ctxt(struct hfi1_filedata *fd,
+ -			 const struct hfi1_user_info *uinfo)
+ +static int get_user_context(struct file *fp, struct hfi1_user_info *uinfo,
+ +			    int devno)
+  {
+ -	int i;
+ -	struct hfi1_devdata *dd = fd->dd;
+ -	u16 subctxt;
+ +	struct hfi1_devdata *dd = NULL;
+ +	int devmax, npresent, nup;
+  
+ -	for (i = dd->first_dyn_alloc_ctxt; i < dd->num_rcv_contexts; i++) {
+ -		struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ +	devmax = hfi1_count_units(&npresent, &nup);
+ +	if (!npresent)
+ +		return -ENXIO;
+  
+ -		/* Skip ctxts which are not yet open */
+ -		if (!uctxt ||
+ -		    bitmap_empty(uctxt->in_use_ctxts,
+ -				 HFI1_MAX_SHARED_CTXTS))
+ -			continue;
+ +	if (!nup)
+ +		return -ENETDOWN;
+  
+ -		/* Skip dynamically allocted kernel contexts */
+ -		if (uctxt->sc && (uctxt->sc->type == SC_KERNEL))
+ -			continue;
+ +	dd = hfi1_lookup(devno);
+ +	if (!dd)
+ +		return -ENODEV;
+ +	else if (!dd->freectxts)
+ +		return -EBUSY;
+  
+++<<<<<<< HEAD
+ +	return allocate_ctxt(fp, dd, uinfo);
+++=======
++ 		/* Skip ctxt if it doesn't match the requested one */
++ 		if (memcmp(uctxt->uuid, uinfo->uuid,
++ 			   sizeof(uctxt->uuid)) ||
++ 		    uctxt->jkey != generate_jkey(current_uid()) ||
++ 		    uctxt->subctxt_id != uinfo->subctxt_id ||
++ 		    uctxt->subctxt_cnt != uinfo->subctxt_cnt)
++ 			continue;
++ 
++ 		/* Verify the sharing process matches the master */
++ 		if (uctxt->userversion != uinfo->userversion)
++ 			return -EINVAL;
++ 
++ 		/* Find an unused context */
++ 		subctxt = find_first_zero_bit(uctxt->in_use_ctxts,
++ 					      HFI1_MAX_SHARED_CTXTS);
++ 		if (subctxt >= uctxt->subctxt_cnt)
++ 			return -EBUSY;
++ 
++ 		fd->uctxt = uctxt;
++ 		fd->subctxt = subctxt;
++ 
++ 		hfi1_rcd_get(uctxt);
++ 		__set_bit(fd->subctxt, uctxt->in_use_ctxts);
++ 
++ 		return 1;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  }
+  
+ -static int allocate_ctxt(struct hfi1_filedata *fd, struct hfi1_devdata *dd,
+ +static int find_shared_ctxt(struct file *fp,
+ +			    const struct hfi1_user_info *uinfo)
+ +{
+ +	int devmax, ndev, i;
+ +	int ret = 0;
+ +	struct hfi1_filedata *fd = fp->private_data;
+ +
+ +	devmax = hfi1_count_units(NULL, NULL);
+ +
+ +	for (ndev = 0; ndev < devmax; ndev++) {
+ +		struct hfi1_devdata *dd = hfi1_lookup(ndev);
+ +
+ +		if (!(dd && (dd->flags & HFI1_PRESENT) && dd->kregbase))
+ +			continue;
+ +		for (i = dd->first_dyn_alloc_ctxt;
+ +		     i < dd->num_rcv_contexts; i++) {
+ +			struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ +
+ +			/* Skip ctxts which are not yet open */
+ +			if (!uctxt || !uctxt->cnt)
+ +				continue;
+ +
+ +			/* Skip dynamically allocted kernel contexts */
+ +			if (uctxt->sc && (uctxt->sc->type == SC_KERNEL))
+ +				continue;
+ +
+ +			/* Skip ctxt if it doesn't match the requested one */
+ +			if (memcmp(uctxt->uuid, uinfo->uuid,
+ +				   sizeof(uctxt->uuid)) ||
+ +			    uctxt->jkey != generate_jkey(current_uid()) ||
+ +			    uctxt->subctxt_id != uinfo->subctxt_id ||
+ +			    uctxt->subctxt_cnt != uinfo->subctxt_cnt)
+ +				continue;
+ +
+ +			/* Verify the sharing process matches the master */
+ +			if (uctxt->userversion != uinfo->userversion ||
+ +			    uctxt->cnt >= uctxt->subctxt_cnt) {
+ +				ret = -EINVAL;
+ +				goto done;
+ +			}
+ +			fd->uctxt = uctxt;
+ +			fd->subctxt  = uctxt->cnt++;
+ +			uctxt->active_slaves |= 1 << fd->subctxt;
+ +			ret = 1;
+ +			goto done;
+ +		}
+ +	}
+ +
+ +done:
+ +	return ret;
+ +}
+ +
+ +static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+  			 struct hfi1_user_info *uinfo)
+  {
+ +	struct hfi1_filedata *fd = fp->private_data;
+  	struct hfi1_ctxtdata *uctxt;
+ -	unsigned int ctxt;
+ +	unsigned ctxt;
+  	int ret, numa;
+  
+  	if (dd->flags & HFI1_FROZEN) {
+@@@ -1222,54 -1253,38 +1314,78 @@@ static int setup_ctxt(struct file *fp
+  	struct hfi1_devdata *dd = uctxt->dd;
+  	int ret = 0;
+  
+ -	hfi1_init_ctxt(uctxt->sc);
+ +	/*
+ +	 * Context should be set up only once, including allocation and
+ +	 * programming of eager buffers. This is done if context sharing
+ +	 * is not requested or by the master process.
+ +	 */
+ +	if (!uctxt->subctxt_cnt || !fd->subctxt) {
+ +		ret = hfi1_init_ctxt(uctxt->sc);
+ +		if (ret)
+ +			goto done;
+  
+ -	/* Now allocate the RcvHdr queue and eager buffers. */
+ -	ret = hfi1_create_rcvhdrq(dd, uctxt);
+ -	if (ret)
+ -		return ret;
+ +		/* Now allocate the RcvHdr queue and eager buffers. */
+ +		ret = hfi1_create_rcvhdrq(dd, uctxt);
+ +		if (ret)
+ +			goto done;
+ +		ret = hfi1_setup_eagerbufs(uctxt);
+ +		if (ret)
+ +			goto done;
+ +		if (uctxt->subctxt_cnt && !fd->subctxt) {
+ +			ret = setup_subctxt(uctxt);
+ +			if (ret)
+ +				goto done;
+ +		}
+ +	} else {
+ +		ret = wait_event_interruptible(uctxt->wait, !test_bit(
+ +					       HFI1_CTXT_MASTER_UNINIT,
+ +					       &uctxt->event_flags));
+ +		if (ret)
+ +			goto done;
+ +	}
+  
+ -	ret = hfi1_setup_eagerbufs(uctxt);
+ +	ret = hfi1_user_sdma_alloc_queues(uctxt, fp);
+  	if (ret)
+ -		goto setup_failed;
+ +		goto done;
+ +	/*
+ +	 * Expected receive has to be setup for all processes (including
+ +	 * shared contexts). However, it has to be done after the master
+ +	 * context has been fully configured as it depends on the
+ +	 * eager/expected split of the RcvArray entries.
+ +	 * Setting it up here ensures that the subcontexts will be waiting
+ +	 * (due to the above wait_event_interruptible() until the master
+ +	 * is setup.
+ +	 */
+ +	ret = hfi1_user_exp_rcv_init(fp);
+ +	if (ret)
+ +		goto done;
+  
+++<<<<<<< HEAD
+ +	set_bit(HFI1_CTXT_SETUP_DONE, &uctxt->event_flags);
+ +done:
+++=======
++ 	/* If sub-contexts are enabled, do the appropriate setup */
++ 	if (uctxt->subctxt_cnt)
++ 		ret = setup_subctxt(uctxt);
++ 	if (ret)
++ 		goto setup_failed;
++ 
++ 	ret = hfi1_alloc_ctxt_rcv_groups(uctxt);
++ 	if (ret)
++ 		goto setup_failed;
++ 
++ 	ret = init_user_ctxt(fd);
++ 	if (ret)
++ 		goto setup_failed;
++ 
++ 	user_init(uctxt);
++ 
++ 	return 0;
++ 
++ setup_failed:
++ 	/* Call _free_ctxtdata, not _rcd_put().  We still need the context. */
++ 	hfi1_free_ctxtdata(dd, uctxt);
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/hfi1/hfi.h
+index 9e4a63b05006,1a33a5087734..000000000000
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@@ -219,18 -213,15 +219,26 @@@ struct hfi1_ctxtdata 
+  
+  	/* dynamic receive available interrupt timeout */
+  	u32 rcvavail_timeout;
+++<<<<<<< HEAD
+ +	/*
+ +	 * number of opens (including slave sub-contexts) on this instance
+ +	 * (ignoring forks, dup, etc. for now)
+ +	 */
+ +	int cnt;
+++=======
++ 	/* Reference count the base context usage */
++ 	struct kref kref;
++ 
++ 	/* Device context index */
++ 	unsigned ctxt;
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  	/*
+ -	 * non-zero if ctxt can be shared, and defines the maximum number of
+ -	 * sub-contexts for this device context.
+ +	 * how much space to leave at start of eager TID entries for
+ +	 * protocol use, on each TID
+  	 */
+ +	/* instead of calculating it */
+ +	unsigned ctxt;
+ +	/* non-zero if ctxt is being shared. */
+  	u16 subctxt_cnt;
+  	/* non-zero if ctxt is being shared. */
+  	u16 subctxt_id;
+@@@ -1281,17 -1281,19 +1289,30 @@@ void handle_linkup_change(struct hfi1_d
+  
+  void handle_user_interrupt(struct hfi1_ctxtdata *rcd);
+  
+ -int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
+ -int hfi1_setup_eagerbufs(struct hfi1_ctxtdata *rcd);
+ +int hfi1_create_rcvhdrq(struct hfi1_devdata *, struct hfi1_ctxtdata *);
+ +int hfi1_setup_eagerbufs(struct hfi1_ctxtdata *);
+  int hfi1_create_ctxts(struct hfi1_devdata *dd);
+++<<<<<<< HEAD
+ +struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *, u32, int);
+ +void hfi1_init_pportdata(struct pci_dev *, struct hfi1_pportdata *,
+ +			 struct hfi1_devdata *, u8, u8);
+ +void hfi1_free_ctxtdata(struct hfi1_devdata *, struct hfi1_ctxtdata *);
+ +
+ +int handle_receive_interrupt(struct hfi1_ctxtdata *, int);
+ +int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *, int);
+ +int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *, int);
+++=======
++ struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u32 ctxt,
++ 					   int numa);
++ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
++ 			 struct hfi1_devdata *dd, u8 hw_pidx, u8 port);
++ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
++ int hfi1_rcd_put(struct hfi1_ctxtdata *rcd);
++ void hfi1_rcd_get(struct hfi1_ctxtdata *rcd);
++ int handle_receive_interrupt(struct hfi1_ctxtdata *rcd, int thread);
++ int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *rcd, int thread);
++ int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *rcd, int thread);
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  void set_all_slowpath(struct hfi1_devdata *dd);
+  void hfi1_vnic_synchronize_irq(struct hfi1_devdata *dd);
+  void hfi1_set_vnic_msix_info(struct hfi1_ctxtdata *rcd);
+diff --cc drivers/infiniband/hw/hfi1/init.c
+index d1e1227c533d,dfdb4126ca05..000000000000
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@@ -194,11 -190,11 +194,19 @@@ int hfi1_create_ctxts(struct hfi1_devda
+  	return 0;
+  nomem:
+  	ret = -ENOMEM;
+++<<<<<<< HEAD
+ +bail:
+ +	if (dd->rcd) {
+ +		for (i = 0; i < dd->num_rcv_contexts; ++i)
+ +			hfi1_free_ctxtdata(dd, dd->rcd[i]);
+ +	}
+++=======
++ 
++ 	for (i = 0; dd->rcd && i < dd->first_dyn_alloc_ctxt; ++i)
++ 		hfi1_rcd_put(dd->rcd[i]);
++ 
++ 	/* All the contexts should be freed, free the array */
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  	kfree(dd->rcd);
+  	dd->rcd = NULL;
+  	return ret;
+@@@ -967,9 -996,12 +1005,16 @@@ void hfi1_free_ctxtdata(struct hfi1_dev
+  					  rcd->egrbufs.buffers[e].dma);
+  	}
+  	kfree(rcd->egrbufs.buffers);
++ 	rcd->egrbufs.alloced = 0;
++ 	rcd->egrbufs.buffers = NULL;
+  
+  	sc_free(rcd->sc);
+++<<<<<<< HEAD
+ +	vfree(rcd->user_event_mask);
+++=======
++ 	rcd->sc = NULL;
++ 
+++>>>>>>> f683c80ca68e (IB/hfi1: Resolve kernel panics by reference counting receive contexts)
+  	vfree(rcd->subctxt_uregbase);
+  	vfree(rcd->subctxt_rcvegrbuf);
+  	vfree(rcd->subctxt_rcvhdr_base);
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
+* Unmerged path drivers/infiniband/hw/hfi1/hfi.h
+* Unmerged path drivers/infiniband/hw/hfi1/init.c
+diff --git a/drivers/infiniband/hw/hfi1/vnic_main.c b/drivers/infiniband/hw/hfi1/vnic_main.c
+index b1572c795c35..6b7d33bc702e 100644
+--- a/drivers/infiniband/hw/hfi1/vnic_main.c
++++ b/drivers/infiniband/hw/hfi1/vnic_main.c
+@@ -160,11 +160,11 @@ static int allocate_vnic_ctxt(struct hfi1_devdata *dd,
+ 	return ret;
+ bail:
+ 	/*
+-	 * hfi1_free_ctxtdata() also releases send_context
+-	 * structure if uctxt->sc is not null
++	 * hfi1_rcd_put() will call hfi1_free_ctxtdata(), which will
++	 * release send_context structure if uctxt->sc is not null
+ 	 */
+ 	dd->rcd[uctxt->ctxt] = NULL;
+-	hfi1_free_ctxtdata(dd, uctxt);
++	hfi1_rcd_put(uctxt);
+ 	dd_dev_dbg(dd, "vnic allocation failed. rc %d\n", ret);
+ 	return ret;
+ }
+@@ -212,7 +212,7 @@ static void deallocate_vnic_ctxt(struct hfi1_devdata *dd,
+ 	hfi1_clear_ctxt_pkey(dd, uctxt);
+ 
+ 	hfi1_stats.sps_ctxts--;
+-	hfi1_free_ctxtdata(dd, uctxt);
++	hfi1_rcd_put(uctxt);
+ }
+ 
+ void hfi1_vnic_setup(struct hfi1_devdata *dd)
+@@ -755,6 +755,7 @@ static int hfi1_vnic_init(struct hfi1_vnic_vport_info *vinfo)
+ 		rc = hfi1_vnic_allot_ctxt(dd, &dd->vnic.ctxt[i]);
+ 		if (rc)
+ 			break;
++		hfi1_rcd_get(dd->vnic.ctxt[i]);
+ 		dd->vnic.ctxt[i]->vnic_q_idx = i;
+ 	}
+ 
+@@ -766,6 +767,7 @@ static int hfi1_vnic_init(struct hfi1_vnic_vport_info *vinfo)
+ 		 */
+ 		while (i-- > dd->vnic.num_ctxt) {
+ 			deallocate_vnic_ctxt(dd, dd->vnic.ctxt[i]);
++			hfi1_rcd_put(dd->vnic.ctxt[i]);
+ 			dd->vnic.ctxt[i] = NULL;
+ 		}
+ 		goto alloc_fail;
+@@ -795,6 +797,7 @@ static void hfi1_vnic_deinit(struct hfi1_vnic_vport_info *vinfo)
+ 	if (--dd->vnic.num_vports == 0) {
+ 		for (i = 0; i < dd->vnic.num_ctxt; i++) {
+ 			deallocate_vnic_ctxt(dd, dd->vnic.ctxt[i]);
++			hfi1_rcd_put(dd->vnic.ctxt[i]);
+ 			dd->vnic.ctxt[i] = NULL;
+ 		}
+ 		hfi1_deinit_vnic_rsm(dd);
