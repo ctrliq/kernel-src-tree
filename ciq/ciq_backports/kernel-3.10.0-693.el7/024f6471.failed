@@ -1,0 +1,305 @@
+sysfs, kernfs: introduce kernfs_notify()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 024f647117d697165aaadf3f1af1343b7000149a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/024f6471.failed
+
+Introduce kernfs interface to wake up poll(2) which takes and returns
+sysfs_dirents.
+
+sysfs_notify_dirent() is renamed to kernfs_notify() and sysfs_notify()
+is updated so that it doesn't directly grab sysfs_mutex but acquires
+the target sysfs_dirents using sysfs_get_dirent().
+sysfs_notify_dirent() is reimplemented as a dumb inline wrapper around
+kernfs_notify().
+
+This patch doesn't introduce any behavior changes.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 024f647117d697165aaadf3f1af1343b7000149a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+#	include/linux/kernfs.h
+#	include/linux/sysfs.h
+diff --cc fs/sysfs/file.c
+index 602f56db0442,a68cbef3a674..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -461,18 -878,23 +467,31 @@@ EXPORT_SYMBOL_GPL(kernfs_notify)
+  
+  void sysfs_notify(struct kobject *k, const char *dir, const char *attr)
+  {
+- 	struct sysfs_dirent *sd = k->sd;
+- 
+- 	mutex_lock(&sysfs_mutex);
++ 	struct sysfs_dirent *sd = k->sd, *tmp;
+  
+  	if (sd && dir)
+++<<<<<<< HEAD
+ +		sd = sysfs_find_dirent(sd, NULL, dir);
+ +	if (sd && attr)
+ +		sd = sysfs_find_dirent(sd, NULL, attr);
+ +	if (sd)
+ +		sysfs_notify_dirent(sd);
+++=======
++ 		sd = sysfs_get_dirent(sd, dir);
++ 	else
++ 		sysfs_get(sd);
+++>>>>>>> 024f647117d6 (sysfs, kernfs: introduce kernfs_notify())
++ 
++ 	if (sd && attr) {
++ 		tmp = sysfs_get_dirent(sd, attr);
++ 		sysfs_put(sd);
++ 		sd = tmp;
++ 	}
+  
+- 	mutex_unlock(&sysfs_mutex);
++ 	if (sd) {
++ 		kernfs_notify(sd);
++ 		sysfs_put(sd);
++ 	}
+  }
+  EXPORT_SYMBOL_GPL(sysfs_notify);
+  
+diff --cc include/linux/kernfs.h
+index 254b9e872b09,f20796ecc76e..000000000000
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@@ -7,6 -7,141 +7,134 @@@
+  #ifndef __LINUX_KERNFS_H
+  #define __LINUX_KERNFS_H
+  
+ -#include <linux/kernel.h>
+ -#include <linux/err.h>
+ -#include <linux/list.h>
+ -#include <linux/mutex.h>
+ -
+ -struct file;
+ -struct iattr;
+ -struct seq_file;
+ -struct vm_area_struct;
+ -
+  struct sysfs_dirent;
+  
+++<<<<<<< HEAD
+++=======
++ struct sysfs_open_file {
++ 	/* published fields */
++ 	struct sysfs_dirent	*sd;
++ 	struct file		*file;
++ 
++ 	/* private fields, do not use outside kernfs proper */
++ 	struct mutex		mutex;
++ 	int			event;
++ 	struct list_head	list;
++ 
++ 	bool			mmapped;
++ 	const struct vm_operations_struct *vm_ops;
++ };
++ 
++ struct kernfs_ops {
++ 	/*
++ 	 * Read is handled by either seq_file or raw_read().
++ 	 *
++ 	 * If seq_show() is present, seq_file path is active.  Other seq
++ 	 * operations are optional and if not implemented, the behavior is
++ 	 * equivalent to single_open().  @sf->private points to the
++ 	 * associated sysfs_open_file.
++ 	 *
++ 	 * read() is bounced through kernel buffer and a read larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	int (*seq_show)(struct seq_file *sf, void *v);
++ 
++ 	void *(*seq_start)(struct seq_file *sf, loff_t *ppos);
++ 	void *(*seq_next)(struct seq_file *sf, void *v, loff_t *ppos);
++ 	void (*seq_stop)(struct seq_file *sf, void *v);
++ 
++ 	ssize_t (*read)(struct sysfs_open_file *of, char *buf, size_t bytes,
++ 			loff_t off);
++ 
++ 	/*
++ 	 * write() is bounced through kernel buffer and a write larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	ssize_t (*write)(struct sysfs_open_file *of, char *buf, size_t bytes,
++ 			 loff_t off);
++ 
++ 	int (*mmap)(struct sysfs_open_file *of, struct vm_area_struct *vma);
++ };
++ 
++ #ifdef CONFIG_SYSFS
++ 
++ struct sysfs_dirent *kernfs_create_dir_ns(struct sysfs_dirent *parent,
++ 					  const char *name, void *priv,
++ 					  const void *ns);
++ struct sysfs_dirent *kernfs_create_file_ns(struct sysfs_dirent *parent,
++ 					   const char *name,
++ 					   umode_t mode, loff_t size,
++ 					   const struct kernfs_ops *ops,
++ 					   void *priv, const void *ns);
++ struct sysfs_dirent *kernfs_create_link(struct sysfs_dirent *parent,
++ 					const char *name,
++ 					struct sysfs_dirent *target);
++ void kernfs_remove(struct sysfs_dirent *sd);
++ int kernfs_remove_by_name_ns(struct sysfs_dirent *parent, const char *name,
++ 			     const void *ns);
++ int kernfs_rename_ns(struct sysfs_dirent *sd, struct sysfs_dirent *new_parent,
++ 		     const char *new_name, const void *new_ns);
++ void kernfs_enable_ns(struct sysfs_dirent *sd);
++ int kernfs_setattr(struct sysfs_dirent *sd, const struct iattr *iattr);
++ void kernfs_notify(struct sysfs_dirent *sd);
++ 
++ #else	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir_ns(struct sysfs_dirent *parent, const char *name, void *priv,
++ 		     const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file_ns(struct sysfs_dirent *parent, const char *name,
++ 		      umode_t mode, loff_t size, const struct kernfs_ops *ops,
++ 		      void *priv, const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_link(struct sysfs_dirent *parent, const char *name,
++ 		   struct sysfs_dirent *target)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_remove(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_remove_by_name_ns(struct sysfs_dirent *parent,
++ 					   const char *name, const void *ns)
++ { return -ENOSYS; }
++ 
++ static inline int kernfs_rename_ns(struct sysfs_dirent *sd,
++ 				   struct sysfs_dirent *new_parent,
++ 				   const char *new_name, const void *new_ns)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_enable_ns(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_setattr(struct sysfs_dirent *sd,
++ 				 const struct iattr *iattr)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_notify(struct sysfs_dirent *sd) { }
++ 
++ #endif	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir(struct sysfs_dirent *parent, const char *name, void *priv)
++ {
++ 	return kernfs_create_dir_ns(parent, name, priv, NULL);
++ }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file(struct sysfs_dirent *parent, const char *name, umode_t mode,
++ 		   loff_t size, const struct kernfs_ops *ops, void *priv)
++ {
++ 	return kernfs_create_file_ns(parent, name, mode, size, ops, priv, NULL);
++ }
++ 
++ static inline int kernfs_remove_by_name(struct sysfs_dirent *parent,
++ 					const char *name)
++ {
++ 	return kernfs_remove_by_name_ns(parent, name, NULL);
++ }
++ 
+++>>>>>>> 024f647117d6 (sysfs, kernfs: introduce kernfs_notify())
+  #endif	/* __LINUX_KERNFS_H */
+diff --cc include/linux/sysfs.h
+index a0524344cf5a,0ab2b023b613..000000000000
+--- a/include/linux/sysfs.h
++++ b/include/linux/sysfs.h
+@@@ -239,15 -241,11 +239,21 @@@ int sysfs_add_link_to_group(struct kobj
+  			    struct kobject *target, const char *link_name);
+  void sysfs_remove_link_from_group(struct kobject *kobj, const char *group_name,
+  				  const char *link_name);
+ +int __compat_only_sysfs_link_entry_to_kobj(struct kobject *kobj,
+ +				      struct kobject *target_kobj,
+ +				      const char *target_name);
+  
+  void sysfs_notify(struct kobject *kobj, const char *dir, const char *attr);
+++<<<<<<< HEAD
+ +void sysfs_notify_dirent(struct sysfs_dirent *sd);
+ +struct sysfs_dirent *sysfs_get_dirent(struct sysfs_dirent *parent_sd,
+ +				      const void *ns,
+ +				      const unsigned char *name);
+++=======
++ struct sysfs_dirent *sysfs_get_dirent_ns(struct sysfs_dirent *parent_sd,
++ 					 const unsigned char *name,
++ 					 const void *ns);
+++>>>>>>> 024f647117d6 (sysfs, kernfs: introduce kernfs_notify())
+  struct sysfs_dirent *sysfs_get(struct sysfs_dirent *sd);
+  void sysfs_put(struct sysfs_dirent *sd);
+  
+@@@ -422,13 -417,9 +428,19 @@@ static inline void sysfs_notify(struct 
+  				const char *attr)
+  {
+  }
+++<<<<<<< HEAD
+ +static inline void sysfs_notify_dirent(struct sysfs_dirent *sd)
+ +{
+ +}
+ +static inline
+ +struct sysfs_dirent *sysfs_get_dirent(struct sysfs_dirent *parent_sd,
+ +				      const void *ns,
+ +				      const unsigned char *name)
+++=======
++ static inline struct sysfs_dirent *
++ sysfs_get_dirent_ns(struct sysfs_dirent *parent_sd, const unsigned char *name,
++ 		    const void *ns)
+++>>>>>>> 024f647117d6 (sysfs, kernfs: introduce kernfs_notify())
+  {
+  	return NULL;
+  }
+@@@ -447,4 -438,33 +459,36 @@@ static inline int __must_check sysfs_in
+  
+  #endif /* CONFIG_SYSFS */
+  
+++<<<<<<< HEAD
+++=======
++ static inline int __must_check sysfs_create_file(struct kobject *kobj,
++ 						 const struct attribute *attr)
++ {
++ 	return sysfs_create_file_ns(kobj, attr, NULL);
++ }
++ 
++ static inline void sysfs_remove_file(struct kobject *kobj,
++ 				     const struct attribute *attr)
++ {
++ 	return sysfs_remove_file_ns(kobj, attr, NULL);
++ }
++ 
++ static inline int sysfs_rename_link(struct kobject *kobj, struct kobject *target,
++ 				    const char *old_name, const char *new_name)
++ {
++ 	return sysfs_rename_link_ns(kobj, target, old_name, new_name, NULL);
++ }
++ 
++ static inline struct sysfs_dirent *
++ sysfs_get_dirent(struct sysfs_dirent *parent_sd, const unsigned char *name)
++ {
++ 	return sysfs_get_dirent_ns(parent_sd, name, NULL);
++ }
++ 
++ static inline void sysfs_notify_dirent(struct sysfs_dirent *sd)
++ {
++ 	kernfs_notify(sd);
++ }
++ 
+++>>>>>>> 024f647117d6 (sysfs, kernfs: introduce kernfs_notify())
+  #endif /* _SYSFS_H_ */
+* Unmerged path fs/sysfs/file.c
+* Unmerged path include/linux/kernfs.h
+* Unmerged path include/linux/sysfs.h
