@@ -1,0 +1,145 @@
+mm: fix mprotect() behaviour on VM_LOCKED VMAs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] fix mprotect() behaviour on VM_LOCKED VMAs (Aaron Tomlin) [1677343]
+Rebuild_FUZZ: 95.45%
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 36f881883c57941bb32d25cea6524f9612ab5a2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/36f88188.failed
+
+On mlock(2) we trigger COW on private writable VMA to avoid faults in
+future.
+
+mm/gup.c:
+ 840 long populate_vma_page_range(struct vm_area_struct *vma,
+ 841                 unsigned long start, unsigned long end, int *nonblocking)
+ 842 {
+ ...
+ 855          * We want to touch writable mappings with a write fault in order
+ 856          * to break COW, except for shared mappings because these don't COW
+ 857          * and we would not want to dirty them for nothing.
+ 858          */
+ 859         if ((vma->vm_flags & (VM_WRITE | VM_SHARED)) == VM_WRITE)
+ 860                 gup_flags |= FOLL_WRITE;
+
+But we miss this case when we make VM_LOCKED VMA writeable via
+mprotect(2). The test case:
+
+	#define _GNU_SOURCE
+	#include <fcntl.h>
+	#include <stdio.h>
+	#include <stdlib.h>
+	#include <unistd.h>
+	#include <sys/mman.h>
+	#include <sys/resource.h>
+	#include <sys/stat.h>
+	#include <sys/time.h>
+	#include <sys/types.h>
+
+	#define PAGE_SIZE 4096
+
+	int main(int argc, char **argv)
+	{
+		struct rusage usage;
+		long before;
+		char *p;
+		int fd;
+
+		/* Create a file and populate first page of page cache */
+		fd = open("/tmp", O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR);
+		write(fd, "1", 1);
+
+		/* Create a *read-only* *private* mapping of the file */
+		p = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_PRIVATE, fd, 0);
+
+		/*
+		 * Since the mapping is read-only, mlock() will populate the mapping
+		 * with PTEs pointing to page cache without triggering COW.
+		 */
+		mlock(p, PAGE_SIZE);
+
+		/*
+		 * Mapping became read-write, but it's still populated with PTEs
+		 * pointing to page cache.
+		 */
+		mprotect(p, PAGE_SIZE, PROT_READ | PROT_WRITE);
+
+		getrusage(RUSAGE_SELF, &usage);
+		before = usage.ru_minflt;
+
+		/* Trigger COW: fault in mlock()ed VMA. */
+		*p = 1;
+
+		getrusage(RUSAGE_SELF, &usage);
+		printf("faults: %ld\n", usage.ru_minflt - before);
+
+		return 0;
+	}
+
+	$ ./test
+	faults: 1
+
+Let's fix it by triggering populating of VMA in mprotect_fixup() on this
+condition. We don't care about population error as we don't in other
+similar cases i.e. mremap.
+
+[akpm@linux-foundation.org: tweak comment text]
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 36f881883c57941bb32d25cea6524f9612ab5a2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mprotect.c
+diff --cc mm/mprotect.c
+index 720a5b1b2c5b,e7d6f1171ecb..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -29,9 -27,38 +29,42 @@@
+  #include <asm/uaccess.h>
+  #include <asm/pgtable.h>
+  #include <asm/cacheflush.h>
+ +#include <asm/mmu_context.h>
+  #include <asm/tlbflush.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include "internal.h"
++ 
++ /*
++  * For a prot_numa update we only hold mmap_sem for read so there is a
++  * potential race with faulting where a pmd was temporarily none. This
++  * function checks for a transhuge pmd under the appropriate lock. It
++  * returns a pte if it was successfully locked or NULL if it raced with
++  * a transhuge insertion.
++  */
++ static pte_t *lock_pte_protection(struct vm_area_struct *vma, pmd_t *pmd,
++ 			unsigned long addr, int prot_numa, spinlock_t **ptl)
++ {
++ 	pte_t *pte;
++ 	spinlock_t *pmdl;
++ 
++ 	/* !prot_numa is protected by mmap_sem held for write */
++ 	if (!prot_numa)
++ 		return pte_offset_map_lock(vma->vm_mm, pmd, addr, ptl);
++ 
++ 	pmdl = pmd_lock(vma->vm_mm, pmd);
++ 	if (unlikely(pmd_trans_huge(*pmd) || pmd_none(*pmd))) {
++ 		spin_unlock(pmdl);
++ 		return NULL;
++ 	}
++ 
++ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, ptl);
++ 	spin_unlock(pmdl);
++ 	return pte;
++ }
++ 
+++>>>>>>> 36f881883c57 (mm: fix mprotect() behaviour on VM_LOCKED VMAs)
+  static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+  		unsigned long addr, unsigned long end, pgprot_t newprot,
+  		int dirty_accountable, int prot_numa)
+* Unmerged path mm/mprotect.c
