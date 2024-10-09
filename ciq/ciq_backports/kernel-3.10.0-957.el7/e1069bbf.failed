@@ -1,0 +1,102 @@
+net: cdc_ncm: Reduce memory use when kernel memory low
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [usb] cdc_ncm: Reduce memory use when kernel memory low (Torez Smith) [1540721]
+Rebuild_FUZZ: 95.15%
+commit-author Jim Baxter <jim_baxter@mentor.com>
+commit e1069bbfcf3bcf4feb264397f3451184fd66b907
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e1069bbf.failed
+
+The CDC-NCM driver can require large amounts of memory to create
+skb's and this can be a problem when the memory becomes fragmented.
+
+This especially affects embedded systems that have constrained
+resources but wish to maximise the throughput of CDC-NCM with 16KiB
+NTB's.
+
+The issue is after running for a while the kernel memory can become
+fragmented and it needs compacting.
+If the NTB allocation is needed before the memory has been compacted
+the atomic allocation can fail which can cause increased latency,
+large re-transmissions or disconnections depending upon the data
+being transmitted at the time.
+This situation occurs for less than a second until the kernel has
+compacted the memory but the failed devices can take a lot longer to
+recover from the failed TX packets.
+
+To ease this temporary situation I modified the CDC-NCM TX path to
+temporarily switch into a reduced memory mode which allocates an NTB
+that will fit into a USB_CDC_NCM_NTB_MIN_OUT_SIZE (default 2048 Bytes)
+sized memory block and only transmit NTB's with a single network frame
+until the memory situation is resolved.
+Each time this issue occurs we wait for an increasing number of
+reduced size allocations before requesting a full size one to not
+put additional pressure on a low memory system.
+
+Once the memory is compacted the CDC-NCM data can resume transmitting
+at the normal tx_max rate once again.
+
+	Signed-off-by: Jim Baxter <jim_baxter@mentor.com>
+	Reviewed-by: Bjørn Mork <bjorn@mork.no>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e1069bbfcf3bcf4feb264397f3451184fd66b907)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/cdc_ncm.c
+diff --cc drivers/net/usb/cdc_ncm.c
+index d7c1b7ca7176,d103a1d4fb36..000000000000
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@@ -1228,9 -1257,9 +1258,9 @@@ cdc_ncm_fill_tx_frame(struct usbnet *de
+  	/* If requested, put NDP at end of frame. */
+  	if (ctx->drvflags & CDC_NCM_FLAG_NDP_TO_END) {
+  		nth16 = (struct usb_cdc_ncm_nth16 *)skb_out->data;
+- 		cdc_ncm_align_tail(skb_out, ctx->tx_ndp_modulus, 0, ctx->tx_max);
++ 		cdc_ncm_align_tail(skb_out, ctx->tx_ndp_modulus, 0, ctx->tx_curr_size);
+  		nth16->wNdpIndex = cpu_to_le16(skb_out->len);
+ -		skb_put_data(skb_out, ctx->delayed_ndp16, ctx->max_ndp_size);
+ +		memcpy(skb_put(skb_out, ctx->max_ndp_size), ctx->delayed_ndp16, ctx->max_ndp_size);
+  
+  		/* Zero out delayed NDP - signature checking will naturally fail. */
+  		ndp16 = memset(ctx->delayed_ndp16, 0, ctx->max_ndp_size);
+@@@ -1246,11 -1275,13 +1276,21 @@@
+  	 * a ZLP after full sized NTBs.
+  	 */
+  	if (!(dev->driver_info->flags & FLAG_SEND_ZLP) &&
+++<<<<<<< HEAD
+ +	    skb_out->len > ctx->min_tx_pkt)
+ +		memset(skb_put(skb_out, ctx->tx_max - skb_out->len), 0,
+ +		       ctx->tx_max - skb_out->len);
+ +	else if (skb_out->len < ctx->tx_max && (skb_out->len % dev->maxpacket) == 0)
+ +		*(u8 *)skb_put(skb_out, 1) = 0;	/* force short packet */
+++=======
++ 	    skb_out->len > ctx->min_tx_pkt) {
++ 		padding_count = ctx->tx_curr_size - skb_out->len;
++ 		skb_put_zero(skb_out, padding_count);
++ 	} else if (skb_out->len < ctx->tx_curr_size &&
++ 		   (skb_out->len % dev->maxpacket) == 0) {
++ 		skb_put_u8(skb_out, 0);	/* force short packet */
++ 	}
+++>>>>>>> e1069bbfcf3b (net: cdc_ncm: Reduce memory use when kernel memory low)
+  
+  	/* set final frame length */
+  	nth16 = (struct usb_cdc_ncm_nth16 *)skb_out->data;
+* Unmerged path drivers/net/usb/cdc_ncm.c
+diff --git a/include/linux/usb/cdc_ncm.h b/include/linux/usb/cdc_ncm.h
+index 00d232406f18..021f7a88f52c 100644
+--- a/include/linux/usb/cdc_ncm.h
++++ b/include/linux/usb/cdc_ncm.h
+@@ -117,6 +117,9 @@ struct cdc_ncm_ctx {
+ 	u32 tx_curr_frame_num;
+ 	u32 rx_max;
+ 	u32 tx_max;
++	u32 tx_curr_size;
++	u32 tx_low_mem_max_cnt;
++	u32 tx_low_mem_val;
+ 	u32 max_datagram_size;
+ 	u16 tx_max_datagrams;
+ 	u16 tx_remainder;
