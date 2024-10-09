@@ -1,0 +1,257 @@
+KVM: hyperv: fix locking of struct kvm_hv fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 3f5ad8be3713572f3946b69eb376206153d0ea2d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3f5ad8be.failed
+
+Introduce a new mutex to avoid an AB-BA deadlock between kvm->lock and
+vcpu->mutex.  Protect accesses in kvm_hv_setup_tsc_page too, as suggested
+by Roman.
+
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Reviewed-by: Roman Kagan <rkagan@virtuozzo.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3f5ad8be3713572f3946b69eb376206153d0ea2d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/hyperv.c
+diff --cc arch/x86/kvm/hyperv.c
+index 61529ab2e8e3,1572c35b4f1a..000000000000
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@@ -104,6 -770,135 +104,138 @@@ static int kvm_hv_msr_set_crash_data(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The kvmclock and Hyper-V TSC page use similar formulas, and converting
++  * between them is possible:
++  *
++  * kvmclock formula:
++  *    nsec = (ticks - tsc_timestamp) * tsc_to_system_mul * 2^(tsc_shift-32)
++  *           + system_time
++  *
++  * Hyper-V formula:
++  *    nsec/100 = ticks * scale / 2^64 + offset
++  *
++  * When tsc_timestamp = system_time = 0, offset is zero in the Hyper-V formula.
++  * By dividing the kvmclock formula by 100 and equating what's left we get:
++  *    ticks * scale / 2^64 = ticks * tsc_to_system_mul * 2^(tsc_shift-32) / 100
++  *            scale / 2^64 =         tsc_to_system_mul * 2^(tsc_shift-32) / 100
++  *            scale        =         tsc_to_system_mul * 2^(32+tsc_shift) / 100
++  *
++  * Now expand the kvmclock formula and divide by 100:
++  *    nsec = ticks * tsc_to_system_mul * 2^(tsc_shift-32)
++  *           - tsc_timestamp * tsc_to_system_mul * 2^(tsc_shift-32)
++  *           + system_time
++  *    nsec/100 = ticks * tsc_to_system_mul * 2^(tsc_shift-32) / 100
++  *               - tsc_timestamp * tsc_to_system_mul * 2^(tsc_shift-32) / 100
++  *               + system_time / 100
++  *
++  * Replace tsc_to_system_mul * 2^(tsc_shift-32) / 100 by scale / 2^64:
++  *    nsec/100 = ticks * scale / 2^64
++  *               - tsc_timestamp * scale / 2^64
++  *               + system_time / 100
++  *
++  * Equate with the Hyper-V formula so that ticks * scale / 2^64 cancels out:
++  *    offset = system_time / 100 - tsc_timestamp * scale / 2^64
++  *
++  * These two equivalencies are implemented in this function.
++  */
++ static bool compute_tsc_page_parameters(struct pvclock_vcpu_time_info *hv_clock,
++ 					HV_REFERENCE_TSC_PAGE *tsc_ref)
++ {
++ 	u64 max_mul;
++ 
++ 	if (!(hv_clock->flags & PVCLOCK_TSC_STABLE_BIT))
++ 		return false;
++ 
++ 	/*
++ 	 * check if scale would overflow, if so we use the time ref counter
++ 	 *    tsc_to_system_mul * 2^(tsc_shift+32) / 100 >= 2^64
++ 	 *    tsc_to_system_mul / 100 >= 2^(32-tsc_shift)
++ 	 *    tsc_to_system_mul >= 100 * 2^(32-tsc_shift)
++ 	 */
++ 	max_mul = 100ull << (32 - hv_clock->tsc_shift);
++ 	if (hv_clock->tsc_to_system_mul >= max_mul)
++ 		return false;
++ 
++ 	/*
++ 	 * Otherwise compute the scale and offset according to the formulas
++ 	 * derived above.
++ 	 */
++ 	tsc_ref->tsc_scale =
++ 		mul_u64_u32_div(1ULL << (32 + hv_clock->tsc_shift),
++ 				hv_clock->tsc_to_system_mul,
++ 				100);
++ 
++ 	tsc_ref->tsc_offset = hv_clock->system_time;
++ 	do_div(tsc_ref->tsc_offset, 100);
++ 	tsc_ref->tsc_offset -=
++ 		mul_u64_u64_shr(hv_clock->tsc_timestamp, tsc_ref->tsc_scale, 64);
++ 	return true;
++ }
++ 
++ void kvm_hv_setup_tsc_page(struct kvm *kvm,
++ 			   struct pvclock_vcpu_time_info *hv_clock)
++ {
++ 	struct kvm_hv *hv = &kvm->arch.hyperv;
++ 	u32 tsc_seq;
++ 	u64 gfn;
++ 
++ 	BUILD_BUG_ON(sizeof(tsc_seq) != sizeof(hv->tsc_ref.tsc_sequence));
++ 	BUILD_BUG_ON(offsetof(HV_REFERENCE_TSC_PAGE, tsc_sequence) != 0);
++ 
++ 	if (!(hv->hv_tsc_page & HV_X64_MSR_TSC_REFERENCE_ENABLE))
++ 		return;
++ 
++ 	mutex_lock(&kvm->arch.hyperv.hv_lock);
++ 	if (!(hv->hv_tsc_page & HV_X64_MSR_TSC_REFERENCE_ENABLE))
++ 		goto out_unlock;
++ 
++ 	gfn = hv->hv_tsc_page >> HV_X64_MSR_TSC_REFERENCE_ADDRESS_SHIFT;
++ 	/*
++ 	 * Because the TSC parameters only vary when there is a
++ 	 * change in the master clock, do not bother with caching.
++ 	 */
++ 	if (unlikely(kvm_read_guest(kvm, gfn_to_gpa(gfn),
++ 				    &tsc_seq, sizeof(tsc_seq))))
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * While we're computing and writing the parameters, force the
++ 	 * guest to use the time reference count MSR.
++ 	 */
++ 	hv->tsc_ref.tsc_sequence = 0;
++ 	if (kvm_write_guest(kvm, gfn_to_gpa(gfn),
++ 			    &hv->tsc_ref, sizeof(hv->tsc_ref.tsc_sequence)))
++ 		goto out_unlock;
++ 
++ 	if (!compute_tsc_page_parameters(hv_clock, &hv->tsc_ref))
++ 		goto out_unlock;
++ 
++ 	/* Ensure sequence is zero before writing the rest of the struct.  */
++ 	smp_wmb();
++ 	if (kvm_write_guest(kvm, gfn_to_gpa(gfn), &hv->tsc_ref, sizeof(hv->tsc_ref)))
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * Now switch to the TSC page mechanism by writing the sequence.
++ 	 */
++ 	tsc_seq++;
++ 	if (tsc_seq == 0xFFFFFFFF || tsc_seq == 0)
++ 		tsc_seq = 1;
++ 
++ 	/* Write the struct entirely before the non-zero sequence.  */
++ 	smp_wmb();
++ 
++ 	hv->tsc_ref.tsc_sequence = tsc_seq;
++ 	kvm_write_guest(kvm, gfn_to_gpa(gfn),
++ 			&hv->tsc_ref, sizeof(hv->tsc_ref.tsc_sequence));
++ out_unlock:
++ 	mutex_unlock(&kvm->arch.hyperv.hv_lock);
++ }
++ 
+++>>>>>>> 3f5ad8be3713 (KVM: hyperv: fix locking of struct kvm_hv fields)
+  static int kvm_hv_set_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 data,
+  			     bool host)
+  {
+@@@ -300,12 -1148,12 +432,12 @@@ int kvm_hv_set_msr_common(struct kvm_vc
+  	if (kvm_hv_msr_partition_wide(msr)) {
+  		int r;
+  
+- 		mutex_lock(&vcpu->kvm->lock);
++ 		mutex_lock(&vcpu->kvm->arch.hyperv.hv_lock);
+  		r = kvm_hv_set_msr_pw(vcpu, msr, data, host);
+- 		mutex_unlock(&vcpu->kvm->lock);
++ 		mutex_unlock(&vcpu->kvm->arch.hyperv.hv_lock);
+  		return r;
+  	} else
+ -		return kvm_hv_set_msr(vcpu, msr, data, host);
+ +		return kvm_hv_set_msr(vcpu, msr, data);
+  }
+  
+  int kvm_hv_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
+@@@ -323,9 -1171,30 +455,9 @@@
+  
+  bool kvm_hv_hypercall_enabled(struct kvm *kvm)
+  {
+- 	return kvm->arch.hyperv.hv_hypercall & HV_X64_MSR_HYPERCALL_ENABLE;
++ 	return READ_ONCE(kvm->arch.hyperv.hv_hypercall) & HV_X64_MSR_HYPERCALL_ENABLE;
+  }
+  
+ -static void kvm_hv_hypercall_set_result(struct kvm_vcpu *vcpu, u64 result)
+ -{
+ -	bool longmode;
+ -
+ -	longmode = is_64_bit_mode(vcpu);
+ -	if (longmode)
+ -		kvm_register_write(vcpu, VCPU_REGS_RAX, result);
+ -	else {
+ -		kvm_register_write(vcpu, VCPU_REGS_RDX, result >> 32);
+ -		kvm_register_write(vcpu, VCPU_REGS_RAX, result & 0xffffffff);
+ -	}
+ -}
+ -
+ -static int kvm_hv_hypercall_complete_userspace(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_run *run = vcpu->run;
+ -
+ -	kvm_hv_hypercall_set_result(vcpu, run->hyperv.u.hcall.result);
+ -	return 1;
+ -}
+ -
+  int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+  {
+  	u64 param, ingpa, outgpa, ret;
+diff --git a/Documentation/virtual/kvm/locking.txt b/Documentation/virtual/kvm/locking.txt
+index e5dd9f4d6100..fd013bf4115b 100644
+--- a/Documentation/virtual/kvm/locking.txt
++++ b/Documentation/virtual/kvm/locking.txt
+@@ -13,8 +13,12 @@ The acquisition orders for mutexes are as follows:
+ - kvm->slots_lock is taken outside kvm->irq_lock, though acquiring
+   them together is quite rare.
+ 
+-For spinlocks, kvm_lock is taken outside kvm->mmu_lock.  Everything
+-else is a leaf: no other lock is taken inside the critical sections.
++On x86, vcpu->mutex is taken outside kvm->arch.hyperv.hv_lock.
++
++For spinlocks, kvm_lock is taken outside kvm->mmu_lock.
++
++Everything else is a leaf: no other lock is taken inside the critical
++sections.
+ 
+ 2: Exception
+ ------------
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index ab2d8132f390..c5a03fe9975b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -646,6 +646,7 @@ struct kvm_apic_map {
+ 
+ /* Hyper-V emulation context */
+ struct kvm_hv {
++	struct mutex hv_lock;
+ 	u64 hv_guest_os_id;
+ 	u64 hv_hypercall;
+ 	u64 hv_tsc_page;
+* Unmerged path arch/x86/kvm/hyperv.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 99e230533b87..ad97fa416df5 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7855,6 +7855,7 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 
+ 	raw_spin_lock_init(&kvm->arch.tsc_write_lock);
+ 	mutex_init(&kvm->arch.apic_map_lock);
++	mutex_init(&kvm->arch.hyperv.hv_lock);
+ 	spin_lock_init(&kvm->arch.pvclock_gtod_sync_lock);
+ 
+ 	kvm->arch.kvmclock_offset = -ktime_get_boot_ns();
