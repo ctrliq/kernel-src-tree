@@ -1,0 +1,144 @@
+kvm: x86: move MSR_IA32_TSC handling to x86.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit dd259935e4eec844dc3e5b8a7cd951cd658b4fb6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dd259935.failed
+
+This is not specific to Intel/AMD anymore.  The TSC offset is available
+in vcpu->arch.tsc_offset.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit dd259935e4eec844dc3e5b8a7cd951cd658b4fb6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/svm.c
+index 2abd6b8af3db,80ea26274a54..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -3839,8 -4202,32 +3833,37 @@@ static int svm_set_msr(struct kvm_vcpu 
+  		svm->vmcb->save.g_pat = data;
+  		mark_dirty(svm->vmcb, VMCB_NPT);
+  		break;
+++<<<<<<< HEAD
+ +	case MSR_IA32_TSC:
+ +		kvm_write_tsc(vcpu, msr);
+++=======
++ 	case MSR_IA32_SPEC_CTRL:
++ 		if (!msr->host_initiated &&
++ 		    !guest_cpuid_has(vcpu, X86_FEATURE_IBRS))
++ 			return 1;
++ 
++ 		/* The STIBP bit doesn't fault even if it's not advertised */
++ 		if (data & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP))
++ 			return 1;
++ 
++ 		svm->spec_ctrl = data;
++ 
++ 		if (!data)
++ 			break;
++ 
++ 		/*
++ 		 * For non-nested:
++ 		 * When it's written (to non-zero) for the first time, pass
++ 		 * it through.
++ 		 *
++ 		 * For nested:
++ 		 * The handling of the MSR bitmap for L2 guests is done in
++ 		 * nested_svm_vmrun_msrpm.
++ 		 * We update the L1 MSR bit as well since it will end up
++ 		 * touching the MSR anyway now.
++ 		 */
++ 		set_msr_interception(svm->msrpm, MSR_IA32_SPEC_CTRL, 1, 1);
+++>>>>>>> dd259935e4ee (kvm: x86: move MSR_IA32_TSC handling to x86.c)
+  		break;
+  	case MSR_IA32_PRED_CMD:
+  		if (!msr->host_initiated &&
+diff --cc arch/x86/kvm/x86.c
+index f751a44d4548,51ecd381793b..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2166,6 -2364,14 +2166,17 @@@ int kvm_set_msr_common(struct kvm_vcpu 
+  			return 1;
+  		vcpu->arch.smbase = data;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case MSR_IA32_TSC:
++ 		kvm_write_tsc(vcpu, msr_info);
++ 		break;
++ 	case MSR_SMI_COUNT:
++ 		if (!msr_info->host_initiated)
++ 			return 1;
++ 		vcpu->arch.smi_count = data;
++ 		break;
+++>>>>>>> dd259935e4ee (kvm: x86: move MSR_IA32_TSC handling to x86.c)
+  	case MSR_KVM_WALL_CLOCK_NEW:
+  	case MSR_KVM_WALL_CLOCK:
+  		vcpu->kvm->arch.wall_clock = data;
+@@@ -2382,8 -2608,11 +2393,11 @@@ int kvm_get_msr_common(struct kvm_vcpu 
+  		msr_info->data = 0;
+  		break;
+  	case MSR_IA32_UCODE_REV:
+ -		msr_info->data = vcpu->arch.microcode_version;
+ +		msr_info->data = 0x100000000ULL;
+  		break;
++ 	case MSR_IA32_TSC:
++ 		msr_info->data = kvm_scale_tsc(vcpu, rdtsc()) + vcpu->arch.tsc_offset;
++ 		break;
+  	case MSR_MTRRcap:
+  	case 0x200 ... 0x2ff:
+  		return kvm_mtrr_get_msr(vcpu, msr_info->index, &msr_info->data);
+* Unmerged path arch/x86/kvm/svm.c
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 5501a1957de2..a3f9cdff0e9c 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2756,20 +2756,6 @@ static void setup_msrs(struct vcpu_vmx *vmx)
+ 		vmx_update_msr_bitmap(&vmx->vcpu);
+ }
+ 
+-/*
+- * reads and returns guest's timestamp counter "register"
+- * guest_tsc = (host_tsc * tsc multiplier) >> 48 + tsc_offset
+- * -- Intel TSC Scaling for Virtualization White Paper, sec 1.3
+- */
+-static u64 guest_read_tsc(struct kvm_vcpu *vcpu)
+-{
+-	u64 host_tsc, tsc_offset;
+-
+-	host_tsc = rdtsc();
+-	tsc_offset = vmcs_read64(TSC_OFFSET);
+-	return kvm_scale_tsc(vcpu, host_tsc) + tsc_offset;
+-}
+-
+ /*
+  * writes 'offset' into guest's timestamp counter offset register
+  */
+@@ -3139,9 +3125,6 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ #endif
+ 	case MSR_EFER:
+ 		return kvm_get_msr_common(vcpu, msr_info);
+-	case MSR_IA32_TSC:
+-		msr_info->data = guest_read_tsc(vcpu);
+-		break;
+ 	case MSR_IA32_SPEC_CTRL:
+ 		if (!msr_info->host_initiated &&
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL))
+@@ -3255,9 +3238,6 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 			return 1;
+ 		vmcs_write64(GUEST_BNDCFGS, data);
+ 		break;
+-	case MSR_IA32_TSC:
+-		kvm_write_tsc(vcpu, msr_info);
+-		break;
+ 	case MSR_IA32_SPEC_CTRL:
+ 		if (!msr_info->host_initiated &&
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL))
+* Unmerged path arch/x86/kvm/x86.c
