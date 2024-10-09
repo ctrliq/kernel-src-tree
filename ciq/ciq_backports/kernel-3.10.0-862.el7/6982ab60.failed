@@ -1,0 +1,363 @@
+net/mlx5e: Xmit, no write combining
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Xmit, no write combining (Don Dutile) [1456694 1499362]
+Rebuild_FUZZ: 93.94%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 6982ab609768f4e7c84eab053314effa0bc500fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6982ab60.failed
+
+mlx5e netdev Blue Flame (write combining) support demands a lot of
+overhead for a little latency gain for some special cases, this overhead
+is hurting the common case.
+
+Here we remove xmit Blue Flame support by creating all bfregs with no
+write combining for all SQs, and we remove a lot of BF logic and
+conditions from xmit data path.
+
+Simplify mlx5e_tx_notify_hw (doorbell function) by removing BF related
+code and by removing one memory barrier needed for WC mapped SQ doorbell
+buffers, which no longer exist.
+
+Performance improvement:
+System: Intel(R) Xeon(R) CPU E5-2620 v3 @ 2.40GHz
+
+Test case                   Before      Now      improvement
+---------------------------------------------------------------
+TX packets (24 threads)     50Mpps      54Mpps    8%
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6982ab609768f4e7c84eab053314effa0bc500fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 16c2c2d53ebb,85261e9ccf4a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -411,10 -425,9 +410,9 @@@ struct mlx5e_sq_dma 
+  
+  enum {
+  	MLX5E_SQ_STATE_ENABLED,
+- 	MLX5E_SQ_STATE_BF_ENABLE,
+  };
+  
+ -struct mlx5e_sq_wqe_info {
+ +struct mlx5e_ico_wqe_info {
+  	u8  opcode;
+  	u8  num_wqebbs;
+  };
+@@@ -794,11 -812,9 +788,14 @@@ void mlx5e_set_rx_cq_mode_params(struc
+  				 u8 cq_period_mode);
+  void mlx5e_set_rq_type_params(struct mlx5e_priv *priv, u8 rq_type);
+  
+- static inline void mlx5e_tx_notify_hw(struct mlx5e_sq *sq,
+- 				      struct mlx5_wqe_ctrl_seg *ctrl, int bf_sz)
++ static inline void
++ mlx5e_tx_notify_hw(struct mlx5e_sq *sq, struct mlx5_wqe_ctrl_seg *ctrl)
+  {
+++<<<<<<< HEAD
+ +	u16 ofst = MLX5_BF_OFFSET + sq->bf_offset;
+ +
+++=======
+++>>>>>>> 6982ab609768 (net/mlx5e: Xmit, no write combining)
+  	/* ensure wqe is visible to device before updating doorbell record */
+  	dma_wmb();
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index edb21d8194bc,f9bcbd277adb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -952,7 -1017,7 +952,11 @@@ static int mlx5e_create_sq(struct mlx5e
+  	sq->channel   = c;
+  	sq->tc        = tc;
+  
+++<<<<<<< HEAD
+ +	err = mlx5_alloc_map_uar(mdev, &sq->uar, !!MLX5_CAP_GEN(mdev, bf));
+++=======
++ 	err = mlx5_alloc_bfreg(mdev, &sq->bfreg, false, false);
+++>>>>>>> 6982ab609768 (net/mlx5e: Xmit, no write combining)
+  	if (err)
+  		return err;
+  
+@@@ -965,17 -1030,9 +969,21 @@@
+  		goto err_unmap_free_uar;
+  
+  	sq->wq.db       = &sq->wq.db[MLX5_SND_DBR];
+++<<<<<<< HEAD
+ +	if (sq->uar.bf_map) {
+ +		set_bit(MLX5E_SQ_STATE_BF_ENABLE, &sq->state);
+ +		sq->uar_map = sq->uar.bf_map;
+ +	} else {
+ +		sq->uar_map = sq->uar.map;
+ +	}
+ +	sq->bf_buf_size = (1 << MLX5_CAP_GEN(mdev, log_bf_reg_size)) / 2;
+++=======
++ 
+++>>>>>>> 6982ab609768 (net/mlx5e: Xmit, no write combining)
+  	sq->max_inline  = param->max_inline;
+ -	sq->min_inline_mode = param->min_inline_mode;
+ +	sq->min_inline_mode =
+ +		MLX5_CAP_ETH(mdev, wqe_inline_mode) == MLX5_CAP_INLINE_MODE_VPORT_CONTEXT ?
+ +		param->min_inline_mode : 0;
+  
+  	err = mlx5e_alloc_sq_db(sq, cpu_to_node(c->cpu));
+  	if (err)
+@@@ -990,11 -1046,7 +998,15 @@@
+  		priv->txq_to_sq_map[txq_ix] = sq;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (sq->type == MLX5E_SQ_ICO)
+ +		sq_max_wqebbs = MLX5E_ICOSQ_MAX_WQEBBS;
+ +
+ +	sq->edge      = (sq->wq.sz_m1 + 1) - sq_max_wqebbs;
+ +	sq->bf_budget = MLX5E_SQ_BF_BUDGET;
+++=======
++ 	sq->edge = (sq->wq.sz_m1 + 1) - mlx5e_sq_get_max_wqebbs(sq->type);
+++>>>>>>> 6982ab609768 (net/mlx5e: Xmit, no write combining)
+  
+  	return 0;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index e8c9b2d23033,873b3085756c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -636,6 -637,127 +636,130 @@@ static inline void mlx5e_complete_rx_cq
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_sq *sq)
++ {
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_tx_wqe *wqe;
++ 	u16 pi = (sq->pc - MLX5E_XDP_TX_WQEBBS) & wq->sz_m1; /* last pi */
++ 
++ 	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
++ 	mlx5e_tx_notify_hw(sq, &wqe->ctrl);
++ }
++ 
++ static inline bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
++ 					struct mlx5e_dma_info *di,
++ 					const struct xdp_buff *xdp)
++ {
++ 	struct mlx5e_sq          *sq   = &rq->channel->xdp_sq;
++ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
++ 	u16                      pi    = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 	struct mlx5e_sq_wqe_info *wi   = &sq->db.xdp.wqe_info[pi];
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 	struct mlx5_wqe_data_seg *dseg;
++ 	u8 ds_cnt = MLX5E_XDP_TX_DS_COUNT;
++ 
++ 	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
++ 	dma_addr_t dma_addr  = di->addr + data_offset;
++ 	unsigned int dma_len = xdp->data_end - xdp->data;
++ 
++ 	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE ||
++ 		     MLX5E_SW2HW_MTU(rq->netdev->mtu) < dma_len)) {
++ 		rq->stats.xdp_drop++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return false;
++ 	}
++ 
++ 	if (unlikely(!mlx5e_sq_has_room_for(sq, MLX5E_XDP_TX_WQEBBS))) {
++ 		if (sq->db.xdp.doorbell) {
++ 			/* SQ is full, ring doorbell */
++ 			mlx5e_xmit_xdp_doorbell(sq);
++ 			sq->db.xdp.doorbell = false;
++ 		}
++ 		rq->stats.xdp_tx_full++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return false;
++ 	}
++ 
++ 	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len,
++ 				   PCI_DMA_TODEVICE);
++ 
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
++ 	/* copy the inline part if required */
++ 	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
++ 		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
++ 		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++ 		dma_len  -= MLX5E_XDP_MIN_INLINE;
++ 		dma_addr += MLX5E_XDP_MIN_INLINE;
++ 
++ 		ds_cnt   += MLX5E_XDP_IHS_DS_COUNT;
++ 		dseg++;
++ 	}
++ 
++ 	/* write the dma part */
++ 	dseg->addr       = cpu_to_be64(dma_addr);
++ 	dseg->byte_count = cpu_to_be32(dma_len);
++ 	dseg->lkey       = sq->mkey_be;
++ 
++ 	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++ 	cseg->qpn_ds = cpu_to_be32((sq->sqn << 8) | ds_cnt);
++ 
++ 	sq->db.xdp.di[pi] = *di;
++ 	wi->opcode     = MLX5_OPCODE_SEND;
++ 	wi->num_wqebbs = MLX5E_XDP_TX_WQEBBS;
++ 	sq->pc += MLX5E_XDP_TX_WQEBBS;
++ 
++ 	sq->db.xdp.doorbell = true;
++ 	rq->stats.xdp_tx++;
++ 	return true;
++ }
++ 
++ /* returns true if packet was consumed by xdp */
++ static inline int mlx5e_xdp_handle(struct mlx5e_rq *rq,
++ 				   struct mlx5e_dma_info *di,
++ 				   void *va, u16 *rx_headroom, u32 *len)
++ {
++ 	const struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 
++ 	if (!prog)
++ 		return false;
++ 
++ 	xdp.data = va + *rx_headroom;
++ 	xdp.data_end = xdp.data + *len;
++ 	xdp.data_hard_start = va;
++ 
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		*rx_headroom = xdp.data - xdp.data_hard_start;
++ 		*len = xdp.data_end - xdp.data;
++ 		return false;
++ 	case XDP_TX:
++ 		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
++ 			trace_xdp_exception(rq->netdev, prog, act);
++ 		return true;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(rq->netdev, prog, act);
++ 	case XDP_DROP:
++ 		rq->stats.xdp_drop++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return true;
++ 	}
++ }
++ 
+++>>>>>>> 6982ab609768 (net/mlx5e: Xmit, no write combining)
+  static inline
+  struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+  			     u16 wqe_counter, u32 cqe_bcnt)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 2a270903b57d..be47c9c179e4 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -57,7 +57,7 @@ void mlx5e_send_nop(struct mlx5e_sq *sq, bool notify_hw)
+ 
+ 	if (notify_hw) {
+ 		cseg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+-		mlx5e_tx_notify_hw(sq, &wqe->ctrl, 0);
++		mlx5e_tx_notify_hw(sq, &wqe->ctrl);
+ 	}
+ }
+ 
+@@ -173,25 +173,6 @@ static inline unsigned int mlx5e_calc_min_inline(enum mlx5_inline_modes mode,
+ 	}
+ }
+ 
+-static inline u16 mlx5e_get_inline_hdr_size(struct mlx5e_sq *sq,
+-					    struct sk_buff *skb, bool bf)
+-{
+-	/* Some NIC TX decisions, e.g loopback, are based on the packet
+-	 * headers and occur before the data gather.
+-	 * Therefore these headers must be copied into the WQE
+-	 */
+-	if (bf) {
+-		u16 ihs = skb_headlen(skb);
+-
+-		if (skb_vlan_tag_present(skb))
+-			ihs += VLAN_HLEN;
+-
+-		if (ihs <= sq->max_inline)
+-			return skb_headlen(skb);
+-	}
+-	return mlx5e_calc_min_inline(sq->min_inline_mode, skb);
+-}
+-
+ static inline void mlx5e_tx_skb_pull_inline(unsigned char **skb_data,
+ 					    unsigned int *skb_len,
+ 					    unsigned int len)
+@@ -233,7 +214,6 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
+ 	u8  opcode = MLX5_OPCODE_SEND;
+ 	dma_addr_t dma_addr = 0;
+ 	unsigned int num_bytes;
+-	bool bf = false;
+ 	u16 headlen;
+ 	u16 ds_cnt;
+ 	u16 ihs;
+@@ -253,11 +233,6 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
+ 	} else
+ 		sq->stats.csum_none++;
+ 
+-	if (sq->cc != sq->prev_cc) {
+-		sq->prev_cc = sq->cc;
+-		sq->bf_budget = (sq->cc == sq->pc) ? MLX5E_SQ_BF_BUDGET : 0;
+-	}
+-
+ 	if (skb_is_gso(skb)) {
+ 		eseg->mss    = cpu_to_be16(skb_shinfo(skb)->gso_size);
+ 		opcode       = MLX5_OPCODE_LSO;
+@@ -275,10 +250,7 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
+ 		sq->stats.packets += skb_shinfo(skb)->gso_segs;
+ 		num_bytes = skb->len + (skb_shinfo(skb)->gso_segs - 1) * ihs;
+ 	} else {
+-		bf = sq->bf_budget &&
+-		     !skb->xmit_more &&
+-		     !skb_shinfo(skb)->nr_frags;
+-		ihs = mlx5e_get_inline_hdr_size(sq, skb, bf);
++		ihs = mlx5e_calc_min_inline(sq->min_inline_mode, skb);
+ 		sq->stats.packets++;
+ 		num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
+ 	}
+@@ -362,13 +334,8 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
+ 
+ 	sq->stats.xmit_more += skb->xmit_more;
+ 	if (!skb->xmit_more || netif_xmit_stopped(sq->txq)) {
+-		int bf_sz = 0;
+-
+-		if (bf && test_bit(MLX5E_SQ_STATE_BF_ENABLE, &sq->state))
+-			bf_sz = wi->num_wqebbs << 3;
+-
+ 		cseg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+-		mlx5e_tx_notify_hw(sq, &wqe->ctrl, bf_sz);
++		mlx5e_tx_notify_hw(sq, &wqe->ctrl);
+ 	}
+ 
+ 	/* fill sq edge with nops to avoid wqe wrap around */
+@@ -377,9 +344,6 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
+ 		mlx5e_send_nop(sq, false);
+ 	}
+ 
+-	if (bf)
+-		sq->bf_budget--;
+-
+ 	return NETDEV_TX_OK;
+ 
+ dma_unmap_wqe_err:
