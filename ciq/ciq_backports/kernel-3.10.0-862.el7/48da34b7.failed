@@ -1,0 +1,283 @@
+sched: add and use qdisc_skb_head helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 48da34b7a74201f15315cb1fc40bb9a7bd2b4940
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/48da34b7.failed
+
+This change replaces sk_buff_head struct in Qdiscs with new qdisc_skb_head.
+
+Its similar to the skb_buff_head api, but does not use skb->prev pointers.
+
+Qdiscs will commonly enqueue at the tail of a list and dequeue at head.
+While skb_buff_head works fine for this, enqueue/dequeue needs to also
+adjust the prev pointer of next element.
+
+The ->prev pointer is not required for qdiscs so we can just leave
+it undefined and avoid one cacheline write access for en/dequeue.
+
+	Suggested-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 48da34b7a74201f15315cb1fc40bb9a7bd2b4940)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/sch_generic.c
+#	net/sched/sch_htb.c
+#	net/sched/sch_netem.c
+diff --cc include/net/sch_generic.h
+index e957def28d63,e6aa0a249672..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -43,9 -36,19 +43,17 @@@ struct qdisc_size_table 
+  	u16			data[];
+  };
+  
++ /* similar to sk_buff_head, but skb->prev pointer is undefined. */
++ struct qdisc_skb_head {
++ 	struct sk_buff	*head;
++ 	struct sk_buff	*tail;
++ 	__u32		qlen;
++ 	spinlock_t	lock;
++ };
++ 
+  struct Qdisc {
+ -	int 			(*enqueue)(struct sk_buff *skb,
+ -					   struct Qdisc *sch,
+ -					   struct sk_buff **to_free);
+ -	struct sk_buff *	(*dequeue)(struct Qdisc *sch);
+ +	int 			(*enqueue)(struct sk_buff *skb, struct Qdisc *dev);
+ +	struct sk_buff *	(*dequeue)(struct Qdisc *dev);
+  	unsigned int		flags;
+  #define TCQ_F_BUILTIN		1
+  #define TCQ_F_INGRESS		2
+@@@ -79,11 -83,14 +87,16 @@@
+  	/*
+  	 * For performance sake on SMP, we put highly modified fields at the end
+  	 */
+++<<<<<<< HEAD
+ +	unsigned long		state;
+ +	struct sk_buff_head	q;
+++=======
++ 	struct sk_buff		*gso_skb ____cacheline_aligned_in_smp;
++ 	struct qdisc_skb_head	q;
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  	struct gnet_stats_basic_packed bstats;
+ -	seqcount_t		running;
+ +	unsigned int		__state;
+  	struct gnet_stats_queue	qstats;
+ -	unsigned long		state;
+ -	struct Qdisc            *next_sched;
+ -	struct sk_buff		*skb_bad_txq;
+  	struct rcu_head		rcu_head;
+  	int			padded;
+  	atomic_t		refcnt;
+@@@ -614,11 -639,25 +644,23 @@@ static inline int qdisc_enqueue_tail(st
+  	return __qdisc_enqueue_tail(skb, sch, &sch->q);
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct sk_buff *__qdisc_dequeue_head(struct Qdisc *sch,
+ +						   struct sk_buff_head *list)
+++=======
++ static inline struct sk_buff *__qdisc_dequeue_head(struct qdisc_skb_head *qh)
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  {
+- 	struct sk_buff *skb = __skb_dequeue(list);
++ 	struct sk_buff *skb = qh->head;
++ 
++ 	if (likely(skb != NULL)) {
++ 		qh->head = skb->next;
++ 		qh->qlen--;
++ 		if (qh->head == NULL)
++ 			qh->tail = NULL;
++ 		skb->next = NULL;
++ 	}
+  
+ -	return skb;
+ -}
+ -
+ -static inline struct sk_buff *qdisc_dequeue_head(struct Qdisc *sch)
+ -{
+ -	struct sk_buff *skb = __qdisc_dequeue_head(&sch->q);
+ -
+  	if (likely(skb != NULL)) {
+  		qdisc_qstats_backlog_dec(sch, skb);
+  		qdisc_bstats_update(sch, skb);
+@@@ -633,9 -676,10 +675,14 @@@ static inline struct sk_buff *qdisc_deq
+  }
+  
+  static inline unsigned int __qdisc_queue_drop_head(struct Qdisc *sch,
+++<<<<<<< HEAD
+ +					      struct sk_buff_head *list)
+++=======
++ 						   struct qdisc_skb_head *qh,
++ 						   struct sk_buff **to_free)
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  {
+- 	struct sk_buff *skb = __skb_dequeue(list);
++ 	struct sk_buff *skb = __qdisc_dequeue_head(qh);
+  
+  	if (likely(skb != NULL)) {
+  		unsigned int len = qdisc_pkt_len(skb);
+@@@ -705,14 -737,20 +754,29 @@@ static inline struct sk_buff *qdisc_deq
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void __qdisc_reset_queue(struct Qdisc *sch,
+ +				       struct sk_buff_head *list)
+++=======
++ static inline void __qdisc_reset_queue(struct qdisc_skb_head *qh)
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  {
+  	/*
+  	 * We do not know the backlog in bytes of this list, it
+  	 * is up to the caller to correct it
+  	 */
+++<<<<<<< HEAD
+ +	__skb_queue_purge(list);
+++=======
++ 	ASSERT_RTNL();
++ 	if (qh->qlen) {
++ 		rtnl_kfree_skbs(qh->head, qh->tail);
++ 
++ 		qh->head = NULL;
++ 		qh->tail = NULL;
++ 		qh->qlen = 0;
++ 	}
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  }
+  
+  static inline void qdisc_reset_queue(struct Qdisc *sch)
+diff --cc net/sched/sch_generic.c
+index 57cbfa322683,6cfb6e9038c2..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -472,12 -483,13 +472,12 @@@ static inline struct qdisc_skb_head *ba
+  	return priv->q + band;
+  }
+  
+ -static int pfifo_fast_enqueue(struct sk_buff *skb, struct Qdisc *qdisc,
+ -			      struct sk_buff **to_free)
+ +static int pfifo_fast_enqueue(struct sk_buff *skb, struct Qdisc *qdisc)
+  {
+ -	if (qdisc->q.qlen < qdisc_dev(qdisc)->tx_queue_len) {
+ +	if (skb_queue_len(&qdisc->q) < qdisc_dev(qdisc)->tx_queue_len) {
+  		int band = prio2band[skb->priority & TC_PRIO_MAX];
+  		struct pfifo_fast_priv *priv = qdisc_priv(qdisc);
+- 		struct sk_buff_head *list = band2list(priv, band);
++ 		struct qdisc_skb_head *list = band2list(priv, band);
+  
+  		priv->bitmap |= (1 << band);
+  		qdisc->q.qlen++;
+@@@ -493,11 -505,16 +493,21 @@@ static struct sk_buff *pfifo_fast_deque
+  	int band = bitmap2band[priv->bitmap];
+  
+  	if (likely(band >= 0)) {
+++<<<<<<< HEAD
+ +		struct sk_buff_head *list = band2list(priv, band);
+ +		struct sk_buff *skb = __qdisc_dequeue_head(qdisc, list);
+++=======
++ 		struct qdisc_skb_head *qh = band2list(priv, band);
++ 		struct sk_buff *skb = __qdisc_dequeue_head(qh);
++ 
++ 		if (likely(skb != NULL)) {
++ 			qdisc_qstats_backlog_dec(qdisc, skb);
++ 			qdisc_bstats_update(qdisc, skb);
++ 		}
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  
+  		qdisc->q.qlen--;
+- 		if (skb_queue_empty(list))
++ 		if (qh->qlen == 0)
+  			priv->bitmap &= ~(1 << band);
+  
+  		return skb;
+@@@ -599,8 -617,8 +609,13 @@@ struct Qdisc *qdisc_alloc(struct netdev
+  		sch = (struct Qdisc *) QDISC_ALIGN((unsigned long) p);
+  		sch->padded = (char *) sch - (char *) p;
+  	}
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&sch->list);
+ +	skb_queue_head_init(&sch->q);
+++=======
++ 	qdisc_skb_head_init(&sch->q);
++ 	spin_lock_init(&sch->q.lock);
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  
+  	spin_lock_init(&sch->busylock);
+  	lockdep_set_class(&sch->busylock,
+diff --cc net/sched/sch_htb.c
+index 1e10f13f8290,c798d0de8a9d..000000000000
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@@ -570,7 -570,24 +570,28 @@@ static inline void htb_deactivate(struc
+  	list_del_init(&cl->un.leaf.drop_list);
+  }
+  
+++<<<<<<< HEAD
+ +static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+++=======
++ static void htb_enqueue_tail(struct sk_buff *skb, struct Qdisc *sch,
++ 			     struct qdisc_skb_head *qh)
++ {
++ 	struct sk_buff *last = qh->tail;
++ 
++ 	if (last) {
++ 		skb->next = NULL;
++ 		last->next = skb;
++ 		qh->tail = skb;
++ 	} else {
++ 		qh->tail = skb;
++ 		qh->head = skb;
++ 	}
++ 	qh->qlen++;
++ }
++ 
++ static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch,
++ 		       struct sk_buff **to_free)
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  {
+  	int uninitialized_var(ret);
+  	struct htb_sched *q = qdisc_priv(sch);
+@@@ -579,10 -596,10 +600,10 @@@
+  	if (cl == HTB_DIRECT) {
+  		/* enqueue to helper queue */
+  		if (q->direct_queue.qlen < q->direct_qlen) {
+- 			__skb_queue_tail(&q->direct_queue, skb);
++ 			htb_enqueue_tail(skb, sch, &q->direct_queue);
+  			q->direct_pkts++;
+  		} else {
+ -			return qdisc_drop(skb, sch, to_free);
+ +			return qdisc_drop(skb, sch);
+  		}
+  #ifdef CONFIG_NET_CLS_ACT
+  	} else if (!cl) {
+diff --cc net/sched/sch_netem.c
+index e8a216075f50,9f7b380cf0a3..000000000000
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@@ -529,8 -532,8 +539,13 @@@ static int netem_enqueue(struct sk_buf
+  		if (q->rate) {
+  			struct sk_buff *last;
+  
+++<<<<<<< HEAD
+ +			if (!skb_queue_empty(&sch->q))
+ +				last = skb_peek_tail(&sch->q);
+++=======
++ 			if (sch->q.qlen)
++ 				last = sch->q.tail;
+++>>>>>>> 48da34b7a742 (sched: add and use qdisc_skb_head helpers)
+  			else
+  				last = netem_rb_to_skb(rb_last(&q->t_root));
+  			if (last) {
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/sch_generic.c
+* Unmerged path net/sched/sch_htb.c
+* Unmerged path net/sched/sch_netem.c
