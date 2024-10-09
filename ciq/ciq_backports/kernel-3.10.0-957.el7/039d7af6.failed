@@ -1,0 +1,189 @@
+EDAC, sb_edac: Classify memory mirroring modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [edac] sb_edac: Classify memory mirroring modes (Aristeu Rozanski) [1483004 1483026]
+Rebuild_FUZZ: 93.02%
+commit-author Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+commit 039d7af651ba414b468bbb22d5d1a76169f81c0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/039d7af6.failed
+
+Basically, there are full memory mirroring and address range partial
+memory mirroring (supported by Haswell EX and Broadwell EX) modes.
+
+a) In full memory mirroring, the memory behind each memory controller
+   is mirrored, i.e. the memory is split into two identical mirrors
+   (primary and secondary), half of the memory is reserved for redundancy.
+
+b) In address range partial memory mirroring, the memory size (range)
+   of primary and secondary behind each memory controller can be user
+   defined by the TAD0 register. The rest of memory ranges defined by
+   TAD1/TAD2/... in that memory controller are non-mirrored.
+
+For more detail on memory mirroring, see the following link written by Tony Luck:
+
+  https://01.org/lkp/blogs/tonyluck/2016/address-range-partial-memory-mirroring-linux
+
+Currently the sb_edac driver only supports address decoding in full
+memory mirroring and non-mirroring modes. In address range partial
+memory mirroring mode, it may fail to decode an address that falls in a
+non-mirroring area (the following was one of this kind of failed logs).
+
+  mce: Uncorrected hardware memory error in user-access at 566d53a400
+  Memory failure: 0x566d53a: Killing einj_mem_uc:4647 due to hardware memory corruption
+  Memory failure: 0x566d53a: recovery action for dirty LRU page: Recovered
+  mce: [Hardware Error]: Machine check events logged
+  EDAC sbridge MC1: HANDLING MCE MEMORY ERROR
+  EDAC sbridge MC1: CPU 48: Machine Check Event: 0 Bank 7: ec00000000010090
+  EDAC sbridge MC1: TSC 4b914aa5a99dab
+  EDAC sbridge MC1: ADDR 566d53a400
+  EDAC sbridge MC1: MISC 1443a0c86
+  EDAC sbridge MC1: PROCESSOR 0:406f1 TIME 1499712764 SOCKET 2 APIC 80
+  EDAC MC1: 0 UE Can't discover the memory rank for ch addr 0x7fb54e900 on any memory ( page:0x0 offset:0x0 grain:32)
+  mce: [Hardware Error]: Machine check events logged
+
+Therefore, classify memory mirroring modes and make the address decoding
+in address range partial memory mode correct.
+
+	Signed-off-by: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/20170730180651.30060-1-qiuxu.zhuo@intel.com
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 039d7af651ba414b468bbb22d5d1a76169f81c0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/edac/sb_edac.c
+diff --cc drivers/edac/sb_edac.c
+index 46d184adba24,dc0591654011..000000000000
+--- a/drivers/edac/sb_edac.c
++++ b/drivers/edac/sb_edac.c
+@@@ -375,19 -383,10 +381,20 @@@ struct sbridge_pvt 
+  	struct sbridge_channel	channel[NUM_CHANNELS];
+  
+  	/* Memory type detection */
+- 	bool			is_mirrored, is_lockstep, is_close_pg;
++ 	bool			is_cur_addr_mirrored, is_lockstep, is_close_pg;
+  	bool			is_chan_hash;
++ 	enum mirroring_mode	mirror_mode;
+  
+ +	/* Fifo double buffers */
+ +	struct mce		mce_entry[MCE_LOG_LEN];
+ +	struct mce		mce_outentry[MCE_LOG_LEN];
+ +
+ +	/* Fifo in/out counters */
+ +	unsigned		mce_in, mce_out;
+ +
+ +	/* Count indicator to show errors not got */
+ +	unsigned		mce_overrun;
+ +
+  	/* Memory description */
+  	u64			tolm, tohm;
+  	struct knl_pvt knl;
+@@@ -1746,6 -1648,84 +1753,87 @@@ static int get_dimm_config(struct mem_c
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int get_dimm_config(struct mem_ctl_info *mci)
++ {
++ 	struct sbridge_pvt *pvt = mci->pvt_info;
++ 	u64 knl_mc_sizes[KNL_MAX_CHANNELS];
++ 	enum edac_type mode;
++ 	u32 reg;
++ 
++ 	pvt->sbridge_dev->node_id = pvt->info.get_node_id(pvt);
++ 	edac_dbg(0, "mc#%d: Node ID: %d, source ID: %d\n",
++ 		 pvt->sbridge_dev->mc,
++ 		 pvt->sbridge_dev->node_id,
++ 		 pvt->sbridge_dev->source_id);
++ 
++ 	/* KNL doesn't support mirroring or lockstep,
++ 	 * and is always closed page
++ 	 */
++ 	if (pvt->info.type == KNIGHTS_LANDING) {
++ 		mode = EDAC_S4ECD4ED;
++ 		pvt->mirror_mode = NON_MIRRORING;
++ 		pvt->is_cur_addr_mirrored = false;
++ 
++ 		if (knl_get_dimm_capacity(pvt, knl_mc_sizes) != 0)
++ 			return -1;
++ 		if (pci_read_config_dword(pvt->pci_ta, KNL_MCMTR, &pvt->info.mcmtr)) {
++ 			edac_dbg(0, "Failed to read KNL_MCMTR register\n");
++ 			return -ENODEV;
++ 		}
++ 	} else {
++ 		if (pvt->info.type == HASWELL || pvt->info.type == BROADWELL) {
++ 			if (pci_read_config_dword(pvt->pci_ha, HASWELL_HASYSDEFEATURE2, &reg)) {
++ 				edac_dbg(0, "Failed to read HASWELL_HASYSDEFEATURE2 register\n");
++ 				return -ENODEV;
++ 			}
++ 			pvt->is_chan_hash = GET_BITFIELD(reg, 21, 21);
++ 			if (GET_BITFIELD(reg, 28, 28)) {
++ 				pvt->mirror_mode = ADDR_RANGE_MIRRORING;
++ 				edac_dbg(0, "Address range partial memory mirroring is enabled\n");
++ 				goto next;
++ 			}
++ 		}
++ 		if (pci_read_config_dword(pvt->pci_ras, RASENABLES, &reg)) {
++ 			edac_dbg(0, "Failed to read RASENABLES register\n");
++ 			return -ENODEV;
++ 		}
++ 		if (IS_MIRROR_ENABLED(reg)) {
++ 			pvt->mirror_mode = FULL_MIRRORING;
++ 			edac_dbg(0, "Full memory mirroring is enabled\n");
++ 		} else {
++ 			pvt->mirror_mode = NON_MIRRORING;
++ 			edac_dbg(0, "Memory mirroring is disabled\n");
++ 		}
++ 
++ next:
++ 		if (pci_read_config_dword(pvt->pci_ta, MCMTR, &pvt->info.mcmtr)) {
++ 			edac_dbg(0, "Failed to read MCMTR register\n");
++ 			return -ENODEV;
++ 		}
++ 		if (IS_LOCKSTEP_ENABLED(pvt->info.mcmtr)) {
++ 			edac_dbg(0, "Lockstep is enabled\n");
++ 			mode = EDAC_S8ECD8ED;
++ 			pvt->is_lockstep = true;
++ 		} else {
++ 			edac_dbg(0, "Lockstep is disabled\n");
++ 			mode = EDAC_S4ECD4ED;
++ 			pvt->is_lockstep = false;
++ 		}
++ 		if (IS_CLOSE_PG(pvt->info.mcmtr)) {
++ 			edac_dbg(0, "address map is on closed page mode\n");
++ 			pvt->is_close_pg = true;
++ 		} else {
++ 			edac_dbg(0, "address map is on open page mode\n");
++ 			pvt->is_close_pg = false;
++ 		}
++ 	}
++ 
++ 	return __populate_dimms(mci, knl_mc_sizes, mode);
++ }
++ 
+++>>>>>>> 039d7af651ba (EDAC, sb_edac: Classify memory mirroring modes)
+  static void get_memory_layout(const struct mem_ctl_info *mci)
+  {
+  	struct sbridge_pvt *pvt = mci->pvt_info;
+@@@ -2149,11 -2116,10 +2237,12 @@@ static int get_memory_error_data(struc
+  	}
+  	*channel_mask = 1 << base_ch;
+  
+ -	pci_read_config_dword(pvt->pci_tad[base_ch], tad_ch_nilv_offset[n_tads], &tad_offset);
+ +	pci_read_config_dword(pvt->pci_tad[ch_add + base_ch],
+ +				tad_ch_nilv_offset[n_tads],
+ +				&tad_offset);
+  
+- 	if (pvt->is_mirrored) {
++ 	if (pvt->mirror_mode == FULL_MIRRORING ||
++ 	    (pvt->mirror_mode == ADDR_RANGE_MIRRORING && n_tads == 0)) {
+  		*channel_mask |= 1 << ((base_ch + 2) % 4);
+  		switch(ch_way) {
+  		case 2:
+* Unmerged path drivers/edac/sb_edac.c
