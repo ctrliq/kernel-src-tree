@@ -1,0 +1,274 @@
+vmbus: add direct isr callback mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit b71e328297a3a578c482fb4814e737a0ec185839
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b71e3282.failed
+
+Change the simple boolean batched_reading into a tri-value.
+For future NAPI support in netvsc driver, the callback needs to
+occur directly in interrupt handler.
+
+Batched mode is also changed to disable host interrupts immediately
+in interrupt routine (to avoid unnecessary host signals), and the
+tasklet is rescheduled if more data is detected.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit b71e328297a3a578c482fb4814e737a0ec185839)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/connection.c
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/connection.c
+index 9b72ebcd37bc,a8366fec1458..000000000000
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@@ -323,23 -295,12 +323,28 @@@ struct vmbus_channel *relid2channel(u3
+  }
+  
+  /*
+ - * vmbus_on_event - Process a channel event notification
+ + * process_chn_event - Process a channel event notification
+   */
+ -void vmbus_on_event(unsigned long data)
+ +static void process_chn_event(u32 relid)
+  {
+++<<<<<<< HEAD
+ +	struct vmbus_channel *channel;
+ +	void *arg;
+ +	bool read_state;
+ +	u32 bytes_to_read;
+++=======
++ 	struct vmbus_channel *channel = (void *) data;
++ 	void (*callback_fn)(void *);
+++>>>>>>> b71e328297a3 (vmbus: add direct isr callback mode)
+ +
+ +	/*
+ +	 * Find the channel based on this relid and invokes the
+ +	 * channel callback to process the event
+ +	 */
+ +	channel = pcpu_relid2channel(relid);
+ +
+ +	if (!channel)
+ +		return;
+  
+  	/*
+  	 * A channel once created is persistent even when there
+@@@ -349,10 -310,13 +354,20 @@@
+  	 * Thus, checking and invoking the driver specific callback takes
+  	 * care of orderly unloading of the driver.
+  	 */
+++<<<<<<< HEAD
+ +
+ +	if (channel->onchannel_callback != NULL) {
+ +		arg = channel->channel_callback_context;
+ +		read_state = channel->batched_reading;
+++=======
++ 	callback_fn = READ_ONCE(channel->onchannel_callback);
++ 	if (unlikely(callback_fn == NULL))
++ 		return;
++ 
++ 	(*callback_fn)(channel->channel_callback_context);
++ 
++ 	if (channel->callback_mode == HV_CALL_BATCHED) {
+++>>>>>>> b71e328297a3 (vmbus: add direct isr callback mode)
+  		/*
+  		 * This callback reads the messages sent by the host.
+  		 * We can optimize host to guest signaling by ensuring:
+diff --cc drivers/hv/vmbus_drv.c
+index 4aa498db4703,f7f6b9144b07..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -915,10 -885,83 +915,85 @@@ msg_handled
+  	vmbus_signal_eom(msg, message_type);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Direct callback for channels using other deferred processing
++  */
++ static void vmbus_channel_isr(struct vmbus_channel *channel)
++ {
++ 	void (*callback_fn)(void *);
++ 
++ 	callback_fn = READ_ONCE(channel->onchannel_callback);
++ 	if (likely(callback_fn != NULL))
++ 		(*callback_fn)(channel->channel_callback_context);
++ }
++ 
++ /*
++  * Schedule all channels with events pending
++  */
++ static void vmbus_chan_sched(struct hv_per_cpu_context *hv_cpu)
++ {
++ 	unsigned long *recv_int_page;
++ 	u32 maxbits, relid;
++ 
++ 	if (vmbus_proto_version < VERSION_WIN8) {
++ 		maxbits = MAX_NUM_CHANNELS_SUPPORTED;
++ 		recv_int_page = vmbus_connection.recv_int_page;
++ 	} else {
++ 		/*
++ 		 * When the host is win8 and beyond, the event page
++ 		 * can be directly checked to get the id of the channel
++ 		 * that has the interrupt pending.
++ 		 */
++ 		void *page_addr = hv_cpu->synic_event_page;
++ 		union hv_synic_event_flags *event
++ 			= (union hv_synic_event_flags *)page_addr +
++ 						 VMBUS_MESSAGE_SINT;
++ 
++ 		maxbits = HV_EVENT_FLAGS_COUNT;
++ 		recv_int_page = event->flags;
++ 	}
++ 
++ 	if (unlikely(!recv_int_page))
++ 		return;
++ 
++ 	for_each_set_bit(relid, recv_int_page, maxbits) {
++ 		struct vmbus_channel *channel;
++ 
++ 		if (!sync_test_and_clear_bit(relid, recv_int_page))
++ 			continue;
++ 
++ 		/* Special case - vmbus channel protocol msg */
++ 		if (relid == 0)
++ 			continue;
++ 
++ 		/* Find channel based on relid */
++ 		list_for_each_entry(channel, &hv_cpu->chan_list, percpu_list) {
++ 			if (channel->offermsg.child_relid != relid)
++ 				continue;
++ 
++ 			switch (channel->callback_mode) {
++ 			case HV_CALL_ISR:
++ 				vmbus_channel_isr(channel);
++ 				break;
++ 
++ 			case HV_CALL_BATCHED:
++ 				hv_begin_read(&channel->inbound);
++ 				/* fallthrough */
++ 			case HV_CALL_DIRECT:
++ 				tasklet_schedule(&channel->callback_event);
++ 			}
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> b71e328297a3 (vmbus: add direct isr callback mode)
+  static void vmbus_isr(void)
+  {
+ -	struct hv_per_cpu_context *hv_cpu
+ -		= this_cpu_ptr(hv_context.cpu_context);
+ -	void *page_addr = hv_cpu->synic_event_page;
+ +	int cpu = smp_processor_id();
+ +	void *page_addr;
+  	struct hv_message *msg;
+  	union hv_synic_event_flags *event;
+  	bool handled = false;
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 8a209b718a7d..f343b90a2838 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -788,13 +788,6 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
+ 		return;
+ 	}
+ 
+-	/*
+-	 * By default we setup state to enable batched
+-	 * reading. A specific service can choose to
+-	 * disable this prior to opening the channel.
+-	 */
+-	newchannel->batched_reading = true;
+-
+ 	/*
+ 	 * Setup state for signalling the host.
+ 	 */
+* Unmerged path drivers/hv/connection.c
+diff --git a/drivers/hv/hv_util.c b/drivers/hv/hv_util.c
+index c07ee1d8a581..77b5f8fc7584 100644
+--- a/drivers/hv/hv_util.c
++++ b/drivers/hv/hv_util.c
+@@ -420,8 +420,7 @@ static int util_probe(struct hv_device *dev,
+ 	 * Turn off batched reading for all util drivers before we open the
+ 	 * channel.
+ 	 */
+-
+-	set_channel_read_state(dev->channel, false);
++	set_channel_read_mode(dev->channel, HV_CALL_DIRECT);
+ 
+ 	hv_set_drvdata(dev, srv);
+ 
+* Unmerged path drivers/hv/vmbus_drv.c
+diff --git a/drivers/uio/uio_hv_generic.c b/drivers/uio/uio_hv_generic.c
+index 3f0640ce6a98..c623aa71322b 100644
+--- a/drivers/uio/uio_hv_generic.c
++++ b/drivers/uio/uio_hv_generic.c
+@@ -125,7 +125,7 @@ hv_uio_probe(struct hv_device *dev,
+ 		goto fail;
+ 
+ 	dev->channel->inbound.ring_buffer->interrupt_mask = 1;
+-	dev->channel->batched_reading = false;
++	set_channel_read_mode(dev->channel, HV_CALL_DIRECT);
+ 
+ 	/* Fill general uio info */
+ 	pdata->info.name = "uio_hv_generic";
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 2d127a5ad611..4d11b47a1f01 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -751,19 +751,21 @@ struct vmbus_channel {
+ 	void *channel_callback_context;
+ 
+ 	/*
+-	 * A channel can be marked for efficient (batched)
+-	 * reading:
+-	 * If batched_reading is set to "true", we read until the
+-	 * channel is empty and hold off interrupts from the host
+-	 * during the entire read process.
+-	 * If batched_reading is set to "false", the client is not
+-	 * going to perform batched reading.
+-	 *
+-	 * By default we will enable batched reading; specific
+-	 * drivers that don't want this behavior can turn it off.
++	 * A channel can be marked for one of three modes of reading:
++	 *   BATCHED - callback called from taslket and should read
++	 *            channel until empty. Interrupts from the host
++	 *            are masked while read is in process (default).
++	 *   DIRECT - callback called from tasklet (softirq).
++	 *   ISR - callback called in interrupt context and must
++	 *         invoke its own deferred processing.
++	 *         Host interrupts are disabled and must be re-enabled
++	 *         when ring is empty.
+ 	 */
+-
+-	bool batched_reading;
++	enum hv_callback_mode {
++		HV_CALL_BATCHED,
++		HV_CALL_DIRECT,
++		HV_CALL_ISR
++	} callback_mode;
+ 
+ 	bool is_dedicated_interrupt;
+ 	struct hv_input_signal_event_buffer sig_buf;
+@@ -926,9 +928,10 @@ static inline void set_channel_affinity_state(struct vmbus_channel *c,
+ 	c->affinity_policy = policy;
+ }
+ 
+-static inline void set_channel_read_state(struct vmbus_channel *c, bool state)
++static inline void set_channel_read_mode(struct vmbus_channel *c,
++					enum hv_callback_mode mode)
+ {
+-	c->batched_reading = state;
++	c->callback_mode = mode;
+ }
+ 
+ static inline void set_per_channel_state(struct vmbus_channel *c, void *s)
