@@ -1,0 +1,183 @@
+random: Add callback API for random pool readiness
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit 205a525c334295e3cd4cc7755fd2c0398e3a787f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/205a525c.failed
+
+The get_blocking_random_bytes API is broken because the wait can
+be arbitrarily long (potentially forever) so there is no safe way
+of calling it from within the kernel.
+
+This patch replaces it with a callback API instead.  The callback
+is invoked potentially from interrupt context so the user needs
+to schedule their own work thread if necessary.
+
+In addition to adding callbacks, they can also be removed as
+otherwise this opens up a way for user-space to allocate kernel
+memory with no bound (by opening algif_rng descriptors and then
+closing them).
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 205a525c334295e3cd4cc7755fd2c0398e3a787f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/random.c
+#	include/linux/random.h
+diff --cc drivers/char/random.c
+index 8703daefb37b,a1576ed1d88e..000000000000
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@@ -406,18 -406,11 +406,23 @@@ static struct poolinfo 
+   */
+  static DECLARE_WAIT_QUEUE_HEAD(random_read_wait);
+  static DECLARE_WAIT_QUEUE_HEAD(random_write_wait);
+ -static DECLARE_WAIT_QUEUE_HEAD(urandom_init_wait);
+  static struct fasync_struct *fasync;
+  
+++<<<<<<< HEAD
+ +static bool debug;
+ +module_param(debug, bool, 0644);
+ +#define DEBUG_ENT(fmt, arg...) do { \
+ +	if (debug) \
+ +		printk(KERN_DEBUG "random %04d %04d %04d: " \
+ +		fmt,\
+ +		input_pool.entropy_count,\
+ +		blocking_pool.entropy_count,\
+ +		nonblocking_pool.entropy_count,\
+ +		## arg); } while (0)
+++=======
++ static DEFINE_SPINLOCK(random_ready_list_lock);
++ static LIST_HEAD(random_ready_list);
+++>>>>>>> 205a525c3342 (random: Add callback API for random pool readiness)
+  
+  /**********************************************************************
+   *
+@@@ -661,12 -673,15 +682,24 @@@ retry
+  	if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
+  		goto retry;
+  
+++<<<<<<< HEAD
+ +	if (!r->initialized && nbits > 0) {
+ +		r->entropy_total += nbits;
+ +		if (r->entropy_total > 128) {
+ +			r->initialized = 1;
+ +			if (r == &nonblocking_pool)
+ +				prandom_reseed_late();
+++=======
++ 	r->entropy_total += nbits;
++ 	if (!r->initialized && r->entropy_total > 128) {
++ 		r->initialized = 1;
++ 		r->entropy_total = 0;
++ 		if (r == &nonblocking_pool) {
++ 			prandom_reseed_late();
++ 			process_random_ready_list();
++ 			wake_up_all(&urandom_init_wait);
++ 			pr_notice("random: %s pool is initialized\n", r->name);
+++>>>>>>> 205a525c3342 (random: Add callback API for random pool readiness)
+  		}
+  	}
+  
+@@@ -1214,6 -1265,76 +1247,79 @@@ void get_random_bytes(void *buf, int nb
+  EXPORT_SYMBOL(get_random_bytes);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Equivalent function to get_random_bytes with the difference that this
++  * function blocks the request until the nonblocking_pool is initialized.
++  */
++ void get_blocking_random_bytes(void *buf, int nbytes)
++ {
++ 	if (unlikely(nonblocking_pool.initialized == 0))
++ 		wait_event(urandom_init_wait, nonblocking_pool.initialized);
++ 	extract_entropy(&nonblocking_pool, buf, nbytes, 0, 0);
++ }
++ EXPORT_SYMBOL(get_blocking_random_bytes);
++ 
++ /*
++  * Add a callback function that will be invoked when the nonblocking
++  * pool is initialised.
++  *
++  * returns: 0 if callback is successfully added
++  *	    -EALREADY if pool is already initialised (callback not called)
++  *	    -ENOENT if module for callback is not alive
++  */
++ int add_random_ready_callback(struct random_ready_callback *rdy)
++ {
++ 	struct module *owner;
++ 	unsigned long flags;
++ 	int err = -EALREADY;
++ 
++ 	if (likely(nonblocking_pool.initialized))
++ 		return err;
++ 
++ 	owner = rdy->owner;
++ 	if (!try_module_get(owner))
++ 		return -ENOENT;
++ 
++ 	spin_lock_irqsave(&random_ready_list_lock, flags);
++ 	if (nonblocking_pool.initialized)
++ 		goto out;
++ 
++ 	owner = NULL;
++ 
++ 	list_add(&rdy->list, &random_ready_list);
++ 	err = 0;
++ 
++ out:
++ 	spin_unlock_irqrestore(&random_ready_list_lock, flags);
++ 
++ 	module_put(owner);
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL(add_random_ready_callback);
++ 
++ /*
++  * Delete a previously registered readiness callback function.
++  */
++ void del_random_ready_callback(struct random_ready_callback *rdy)
++ {
++ 	unsigned long flags;
++ 	struct module *owner = NULL;
++ 
++ 	spin_lock_irqsave(&random_ready_list_lock, flags);
++ 	if (!list_empty(&rdy->list)) {
++ 		list_del_init(&rdy->list);
++ 		owner = rdy->owner;
++ 	}
++ 	spin_unlock_irqrestore(&random_ready_list_lock, flags);
++ 
++ 	module_put(owner);
++ }
++ EXPORT_SYMBOL(del_random_ready_callback);
++ 
++ /*
+++>>>>>>> 205a525c3342 (random: Add callback API for random pool readiness)
+   * This function will use the architecture-specific hardware random
+   * number generator if it is available.  The arch-specific hw RNG will
+   * almost certainly be faster than what we can do in software, but it
+diff --cc include/linux/random.h
+index 2214c3046110,30e2aca0b16a..000000000000
+--- a/include/linux/random.h
++++ b/include/linux/random.h
+@@@ -14,6 -21,9 +21,12 @@@ extern void add_input_randomness(unsign
+  extern void add_interrupt_randomness(int irq, int irq_flags);
+  
+  extern void get_random_bytes(void *buf, int nbytes);
+++<<<<<<< HEAD
+++=======
++ extern void get_blocking_random_bytes(void *buf, int nbytes);
++ extern int add_random_ready_callback(struct random_ready_callback *rdy);
++ extern void del_random_ready_callback(struct random_ready_callback *rdy);
+++>>>>>>> 205a525c3342 (random: Add callback API for random pool readiness)
+  extern void get_random_bytes_arch(void *buf, int nbytes);
+  void generate_random_uuid(unsigned char uuid_out[16]);
+  extern int random_int_secret_init(void);
+* Unmerged path drivers/char/random.c
+* Unmerged path include/linux/random.h
