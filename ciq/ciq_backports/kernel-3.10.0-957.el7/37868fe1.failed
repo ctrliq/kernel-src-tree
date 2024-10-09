@@ -1,0 +1,603 @@
+x86/ldt: Make modify_ldt synchronous
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] ldt: Make modify_ldt synchronous (Gopal Tiwari) [1456572]
+Rebuild_FUZZ: 94.12%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 37868fe113ff2ba814b3b4eb12df214df555f8dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/37868fe1.failed
+
+modify_ldt() has questionable locking and does not synchronize
+threads.  Improve it: redesign the locking and synchronize all
+threads' LDTs using an IPI on all modifications.
+
+This will dramatically slow down modify_ldt in multithreaded
+programs, but there shouldn't be any multithreaded programs that
+care about modify_ldt's performance in the first place.
+
+This fixes some fallout from the CVE-2015-5157 fixes.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jan Beulich <jbeulich@suse.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: security@kernel.org <security@kernel.org>
+	Cc: <stable@vger.kernel.org>
+	Cc: xen-devel <xen-devel@lists.xen.org>
+Link: http://lkml.kernel.org/r/4c6978476782160600471bd865b318db34c7b628.1438291540.git.luto@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 37868fe113ff2ba814b3b4eb12df214df555f8dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/core.c
+#	arch/x86/include/asm/mmu_context.h
+#	arch/x86/kernel/ldt.c
+#	arch/x86/power/cpu.c
+diff --cc arch/x86/events/core.c
+index 39b79315d993,9469dfa55607..000000000000
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@@ -2233,10 -2194,10 +2237,14 @@@ static unsigned long get_segment_base(u
+  		if (idx > GDT_ENTRIES)
+  			return 0;
+  
+++<<<<<<< HEAD:arch/x86/events/core.c
+ +		desc = __this_cpu_ptr(&gdt_page.gdt[0]);
+++=======
++ 		desc = raw_cpu_ptr(gdt_page.gdt) + idx;
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous):arch/x86/kernel/cpu/perf_event.c
+  	}
+  
+- 	return get_desc_base(desc + idx);
++ 	return get_desc_base(desc);
+  }
+  
+  #ifdef CONFIG_COMPAT
+diff --cc arch/x86/include/asm/mmu_context.h
+index b2b6416ef3c2,984abfe47edc..000000000000
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@@ -18,6 -18,65 +18,50 @@@ static inline void paravirt_activate_mm
+  }
+  #endif	/* !CONFIG_PARAVIRT */
+  
+ -#ifdef CONFIG_PERF_EVENTS
+ -extern struct static_key rdpmc_always_available;
+ -
+ -static inline void load_mm_cr4(struct mm_struct *mm)
+ -{
+ -	if (static_key_false(&rdpmc_always_available) ||
+ -	    atomic_read(&mm->context.perf_rdpmc_allowed))
+ -		cr4_set_bits(X86_CR4_PCE);
+ -	else
+ -		cr4_clear_bits(X86_CR4_PCE);
+ -}
+ -#else
+ -static inline void load_mm_cr4(struct mm_struct *mm) {}
+ -#endif
+ -
++ /*
++  * ldt_structs can be allocated, used, and freed, but they are never
++  * modified while live.
++  */
++ struct ldt_struct {
++ 	/*
++ 	 * Xen requires page-aligned LDTs with special permissions.  This is
++ 	 * needed to prevent us from installing evil descriptors such as
++ 	 * call gates.  On native, we could merge the ldt_struct and LDT
++ 	 * allocations, but it's not worth trying to optimize.
++ 	 */
++ 	struct desc_struct *entries;
++ 	int size;
++ };
++ 
++ static inline void load_mm_ldt(struct mm_struct *mm)
++ {
++ 	struct ldt_struct *ldt;
++ 
++ 	/* lockless_dereference synchronizes with smp_store_release */
++ 	ldt = lockless_dereference(mm->context.ldt);
++ 
++ 	/*
++ 	 * Any change to mm->context.ldt is followed by an IPI to all
++ 	 * CPUs with the mm active.  The LDT will not be freed until
++ 	 * after the IPI is handled by all such CPUs.  This means that,
++ 	 * if the ldt_struct changes before we return, the values we see
++ 	 * will be safe, and the new values will be loaded before we run
++ 	 * any user code.
++ 	 *
++ 	 * NB: don't try to convert this to use RCU without extreme care.
++ 	 * We would still need IRQs off, because we don't want to change
++ 	 * the local LDT after an IPI loaded a newer value than the one
++ 	 * that we can see.
++ 	 */
++ 
++ 	if (unlikely(ldt))
++ 		set_ldt(ldt->entries, ldt->size);
++ 	else
++ 		clear_LDT();
++ 
++ 	DEBUG_LOCKS_WARN_ON(preemptible());
++ }
++ 
+  /*
+   * Used for LDT copy/destruction.
+   */
+@@@ -107,9 -111,23 +151,27 @@@ static inline void switch_mm(struct mm_
+  		/* Stop flush ipis for the previous mm */
+  		cpumask_clear_cpu(cpu, mm_cpumask(prev));
+  
+++<<<<<<< HEAD
+ +		/* Load the LDT, if the LDT is different: */
+++=======
++ 		/* Load per-mm CR4 state */
++ 		load_mm_cr4(next);
++ 
++ 		/*
++ 		 * Load the LDT, if the LDT is different.
++ 		 *
++ 		 * It's possible that prev->context.ldt doesn't match
++ 		 * the LDT register.  This can happen if leave_mm(prev)
++ 		 * was called and then modify_ldt changed
++ 		 * prev->context.ldt but suppressed an IPI to this CPU.
++ 		 * In this case, prev->context.ldt != NULL, because we
++ 		 * never set context.ldt to NULL while the mm still
++ 		 * exists.  That means that next->context.ldt !=
++ 		 * prev->context.ldt, because mms never share an LDT.
++ 		 */
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
+  		if (unlikely(prev->context.ldt != next->context.ldt))
+- 			load_LDT_nolock(&next->context);
++ 			load_mm_ldt(next);
+  	}
+  #ifdef CONFIG_SMP
+  	  else {
+@@@ -129,12 -146,11 +191,18 @@@
+  			 * We were in lazy tlb mode and leave_mm disabled
+  			 * tlb flush IPI delivery. We must reload CR3
+  			 * to make sure to use no freed page tables.
+ +			 *
+ +			 * As above, load_cr3() is serializing and orders TLB
+ +			 * fills with respect to the mm_cpumask write.
+  			 */
+  			load_cr3(next->pgd);
+++<<<<<<< HEAD
+ +			load_LDT_nolock(&next->context);
+++=======
++ 			trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
++ 			load_mm_cr4(next);
++ 			load_mm_ldt(next);
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
+  		}
+  	}
+  #endif
+diff --cc arch/x86/kernel/ldt.c
+index 6b6d22561e6f,2bcc0525f1c1..000000000000
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@@ -10,9 -10,9 +10,10 @@@
+  #include <linux/gfp.h>
+  #include <linux/sched.h>
+  #include <linux/string.h>
+ +#include <linux/kaiser.h>
+  #include <linux/mm.h>
+  #include <linux/smp.h>
++ #include <linux/slab.h>
+  #include <linux/vmalloc.h>
+  #include <linux/uaccess.h>
+  
+@@@ -21,105 -21,91 +22,156 @@@
+  #include <asm/mmu_context.h>
+  #include <asm/syscalls.h>
+  
+- #ifdef CONFIG_SMP
++ /* context.lock is held for us, so we don't need any locking. */
+  static void flush_ldt(void *current_mm)
+  {
+- 	if (current->active_mm == current_mm)
+- 		load_LDT(&current->active_mm->context);
++ 	mm_context_t *pc;
++ 
++ 	if (current->active_mm != current_mm)
++ 		return;
++ 
++ 	pc = &current->active_mm->context;
++ 	set_ldt(pc->ldt->entries, pc->ldt->size);
+  }
+- #endif
+  
+++<<<<<<< HEAD
+ +static void free_ldt(void *ldt, int size)
+ +{
+ +	if (size * LDT_ENTRY_SIZE > PAGE_SIZE)
+ +		vfree(ldt);
+ +	else
+ +		put_page(virt_to_page(ldt));
+ +}
+ +
+ +static int alloc_ldt(mm_context_t *pc, int mincount, int reload)
+ +{
+ +	void *oldldt, *newldt;
+ +	int oldsize;
+ +	int ret;
+- 
+- 	if (mincount <= pc->size)
+- 		return 0;
+- 	oldsize = pc->size;
+- 	mincount = (mincount + (PAGE_SIZE / LDT_ENTRY_SIZE - 1)) &
+- 			(~(PAGE_SIZE / LDT_ENTRY_SIZE - 1));
+- 	if (mincount * LDT_ENTRY_SIZE > PAGE_SIZE)
+- 		newldt = vmalloc(mincount * LDT_ENTRY_SIZE);
+++=======
++ /* The caller must call finalize_ldt_struct on the result. LDT starts zeroed. */
++ static struct ldt_struct *alloc_ldt_struct(int size)
++ {
++ 	struct ldt_struct *new_ldt;
++ 	int alloc_size;
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
++ 
++ 	if (size > LDT_ENTRIES)
++ 		return NULL;
++ 
++ 	new_ldt = kmalloc(sizeof(struct ldt_struct), GFP_KERNEL);
++ 	if (!new_ldt)
++ 		return NULL;
++ 
++ 	BUILD_BUG_ON(LDT_ENTRY_SIZE != sizeof(struct desc_struct));
++ 	alloc_size = size * LDT_ENTRY_SIZE;
++ 
++ 	/*
++ 	 * Xen is very picky: it requires a page-aligned LDT that has no
++ 	 * trailing nonzero bytes in any page that contains LDT descriptors.
++ 	 * Keep it simple: zero the whole allocation and never allocate less
++ 	 * than PAGE_SIZE.
++ 	 */
++ 	if (alloc_size > PAGE_SIZE)
++ 		new_ldt->entries = vzalloc(alloc_size);
+  	else
+- 		newldt = (void *)__get_free_page(GFP_KERNEL);
++ 		new_ldt->entries = kzalloc(PAGE_SIZE, GFP_KERNEL);
+  
+++<<<<<<< HEAD
+ +	if (!newldt)
+ +		return -ENOMEM;
+ +	ret = kaiser_add_mapping((unsigned long)newldt,
+ +				 mincount * LDT_ENTRY_SIZE,
+ +				 __PAGE_KERNEL | _PAGE_GLOBAL);
+ +	if (ret) {
+ +		free_ldt(newldt, mincount);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	if (oldsize)
+ +		memcpy(newldt, pc->ldt, oldsize * LDT_ENTRY_SIZE);
+ +	oldldt = pc->ldt;
+ +	memset(newldt + oldsize * LDT_ENTRY_SIZE, 0,
+ +	       (mincount - oldsize) * LDT_ENTRY_SIZE);
+ +
+ +	paravirt_alloc_ldt(newldt, mincount);
+ +
+ +#ifdef CONFIG_X86_64
+ +	/* CHECKME: Do we really need this ? */
+ +	wmb();
+ +#endif
+ +	pc->ldt = newldt;
+ +	wmb();
+ +	pc->size = mincount;
+ +	wmb();
+ +
+ +	if (reload) {
+ +#ifdef CONFIG_SMP
+ +		preempt_disable();
+ +		load_LDT(pc);
+ +		if (!cpumask_equal(mm_cpumask(current->mm),
+ +				   cpumask_of(smp_processor_id())))
+ +			smp_call_function(flush_ldt, current->mm, 1);
+ +		preempt_enable();
+ +#else
+ +		load_LDT(pc);
+ +#endif
+ +	}
+ +	if (oldsize) {
+ +		kaiser_remove_mapping((unsigned long)oldldt,
+ +				      oldsize * LDT_ENTRY_SIZE);
+ +		paravirt_free_ldt(oldldt, oldsize);
+ +		free_ldt(oldldt, oldsize);
+ +	}
+ +	return 0;
+++=======
++ 	if (!new_ldt->entries) {
++ 		kfree(new_ldt);
++ 		return NULL;
++ 	}
++ 
++ 	new_ldt->size = size;
++ 	return new_ldt;
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
+  }
+  
+- static inline int copy_ldt(mm_context_t *new, mm_context_t *old)
++ /* After calling this, the LDT is immutable. */
++ static void finalize_ldt_struct(struct ldt_struct *ldt)
+  {
+- 	int err = alloc_ldt(new, old->size, 0);
+- 	int i;
++ 	paravirt_alloc_ldt(ldt->entries, ldt->size);
++ }
+  
+- 	if (err < 0)
+- 		return err;
++ /* context.lock is held */
++ static void install_ldt(struct mm_struct *current_mm,
++ 			struct ldt_struct *ldt)
++ {
++ 	/* Synchronizes with lockless_dereference in load_mm_ldt. */
++ 	smp_store_release(&current_mm->context.ldt, ldt);
+  
+- 	for (i = 0; i < old->size; i++)
+- 		write_ldt_entry(new->ldt, i, old->ldt + i * LDT_ENTRY_SIZE);
+- 	return 0;
++ 	/* Activate the LDT for all CPUs using current_mm. */
++ 	on_each_cpu_mask(mm_cpumask(current_mm), flush_ldt, current_mm, true);
++ }
++ 
++ static void free_ldt_struct(struct ldt_struct *ldt)
++ {
++ 	if (likely(!ldt))
++ 		return;
++ 
++ 	paravirt_free_ldt(ldt->entries, ldt->size);
++ 	if (ldt->size * LDT_ENTRY_SIZE > PAGE_SIZE)
++ 		vfree(ldt->entries);
++ 	else
++ 		kfree(ldt->entries);
++ 	kfree(ldt);
+  }
+  
+  /*
+   * we do not have to muck with descriptors here, that is
+   * done in switch_mm() as needed.
+   */
+ -int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ +int init_new_context_ldt(struct task_struct *tsk, struct mm_struct *mm)
+  {
++ 	struct ldt_struct *new_ldt;
+  	struct mm_struct *old_mm;
+  	int retval = 0;
+  
+@@@ -139,23 -144,10 +210,28 @@@ out_unlock
+   *
+   * 64bit: Don't touch the LDT register - we're already in the next thread.
+   */
+ -void destroy_context(struct mm_struct *mm)
+ +void destroy_context_ldt(struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	if (mm->context.size) {
+ +#ifdef CONFIG_X86_32
+ +		/* CHECKME: Can this ever happen ? */
+ +		if (mm == current->active_mm)
+ +			clear_LDT();
+ +#endif
+ +		kaiser_remove_mapping((unsigned long)mm->context.ldt,
+ +				      mm->context.size * LDT_ENTRY_SIZE);
+ +		paravirt_free_ldt(mm->context.ldt, mm->context.size);
+ +		if (mm->context.size * LDT_ENTRY_SIZE > PAGE_SIZE)
+ +			vfree(mm->context.ldt);
+ +		else
+ +			put_page(virt_to_page(mm->context.ldt));
+ +		mm->context.size = 0;
+ +	}
+++=======
++ 	free_ldt_struct(mm->context.ldt);
++ 	mm->context.ldt = NULL;
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
+  }
+  
+  static int read_ldt(void __user *ptr, unsigned long bytecount)
+@@@ -231,29 -230,39 +314,45 @@@ static int write_ldt(void __user *ptr, 
+  			goto out;
+  	}
+  
+- 	mutex_lock(&mm->context.lock);
+- 	if (ldt_info.entry_number >= mm->context.size) {
+- 		error = alloc_ldt(&current->mm->context,
+- 				  ldt_info.entry_number + 1, 1);
+- 		if (error < 0)
+- 			goto out_unlock;
+- 	}
+- 
+- 	/* Allow LDTs to be cleared by the user. */
+- 	if (ldt_info.base_addr == 0 && ldt_info.limit == 0) {
+- 		if (oldmode || LDT_empty(&ldt_info)) {
+- 			memset(&ldt, 0, sizeof(ldt));
+- 			goto install;
++ 	if ((oldmode && !ldt_info.base_addr && !ldt_info.limit) ||
++ 	    LDT_empty(&ldt_info)) {
++ 		/* The user wants to clear the entry. */
++ 		memset(&ldt, 0, sizeof(ldt));
++ 	} else {
++ 		if (!IS_ENABLED(CONFIG_X86_16BIT) && !ldt_info.seg_32bit) {
++ 			error = -EINVAL;
++ 			goto out;
+  		}
++ 
++ 		fill_ldt(&ldt, &ldt_info);
++ 		if (oldmode)
++ 			ldt.avl = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	fill_ldt(&ldt, &ldt_info);
+ +	if (oldmode)
+ +		ldt.avl = 0;
+++=======
++ 	mutex_lock(&mm->context.lock);
++ 
++ 	old_ldt = mm->context.ldt;
++ 	oldsize = old_ldt ? old_ldt->size : 0;
++ 	newsize = max((int)(ldt_info.entry_number + 1), oldsize);
++ 
++ 	error = -ENOMEM;
++ 	new_ldt = alloc_ldt_struct(newsize);
++ 	if (!new_ldt)
++ 		goto out_unlock;
++ 
++ 	if (old_ldt)
++ 		memcpy(new_ldt->entries, old_ldt->entries, oldsize * LDT_ENTRY_SIZE);
++ 	new_ldt->entries[ldt_info.entry_number] = ldt;
++ 	finalize_ldt_struct(new_ldt);
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
+  
+- 	/* Install the new entry ...  */
+- install:
+- 	write_ldt_entry(mm->context.ldt, ldt_info.entry_number, &ldt);
++ 	install_ldt(mm, new_ldt);
++ 	free_ldt_struct(old_ldt);
+  	error = 0;
+  
+  out_unlock:
+diff --cc arch/x86/power/cpu.c
+index f25c4588fcc4,9ab52791fed5..000000000000
+--- a/arch/x86/power/cpu.c
++++ b/arch/x86/power/cpu.c
+@@@ -159,7 -154,9 +159,13 @@@ static void fix_processor_context(void
+  	syscall_init();				/* This sets MSR_*STAR and related */
+  #endif
+  	load_TR_desc();				/* This does ltr */
+++<<<<<<< HEAD
+ +	load_LDT(&current->active_mm->context);	/* This does lldt */
+++=======
++ 	load_mm_ldt(current->active_mm);	/* This does lldt */
++ 
++ 	fpu__resume_cpu();
+++>>>>>>> 37868fe113ff (x86/ldt: Make modify_ldt synchronous)
+  }
+  
+  /**
+* Unmerged path arch/x86/events/core.c
+diff --git a/arch/x86/include/asm/desc.h b/arch/x86/include/asm/desc.h
+index e77662b1a286..f80192a5fe2e 100644
+--- a/arch/x86/include/asm/desc.h
++++ b/arch/x86/include/asm/desc.h
+@@ -272,21 +272,6 @@ static inline void clear_LDT(void)
+ 	set_ldt(NULL, 0);
+ }
+ 
+-/*
+- * load one particular LDT into the current CPU
+- */
+-static inline void load_LDT_nolock(mm_context_t *pc)
+-{
+-	set_ldt(pc->ldt, pc->size);
+-}
+-
+-static inline void load_LDT(mm_context_t *pc)
+-{
+-	preempt_disable();
+-	load_LDT_nolock(pc);
+-	preempt_enable();
+-}
+-
+ static inline unsigned long get_desc_base(const struct desc_struct *desc)
+ {
+ 	return (unsigned)(desc->base0 | ((desc->base1) << 16) | ((desc->base2) << 24));
+diff --git a/arch/x86/include/asm/mmu.h b/arch/x86/include/asm/mmu.h
+index 5f55e6962769..926f67263287 100644
+--- a/arch/x86/include/asm/mmu.h
++++ b/arch/x86/include/asm/mmu.h
+@@ -9,8 +9,7 @@
+  * we put the segment information here.
+  */
+ typedef struct {
+-	void *ldt;
+-	int size;
++	struct ldt_struct *ldt;
+ 
+ #ifdef CONFIG_X86_64
+ 	/* True if mm supports a task running in 32 bit compatibility mode. */
+* Unmerged path arch/x86/include/asm/mmu_context.h
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 49cb90f121df..5f927570ac3a 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1545,7 +1545,7 @@ void cpu_init(void)
+ 	current->thread.sp0 = v;	/* Restore original value */
+ 	set_tss_desc(cpu, t);
+ 	load_TR_desc();
+-	load_LDT(&init_mm.context);
++	load_mm_ldt(&init_mm);
+ 
+ 	clear_all_debug_regs();
+ 	dbg_restore_debug_regs();
+@@ -1590,7 +1590,7 @@ void cpu_init(void)
+ 	load_sp0(t, thread);
+ 	set_tss_desc(cpu, t);
+ 	load_TR_desc();
+-	load_LDT(&init_mm.context);
++	load_mm_ldt(&init_mm);
+ 
+ 	t->x86_tss.io_bitmap_base = offsetof(struct tss_struct, io_bitmap);
+ 
+* Unmerged path arch/x86/kernel/ldt.c
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index fb066fe1e019..a2cbef633e3d 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -126,11 +126,11 @@ void __show_regs(struct pt_regs *regs, int all)
+ void release_thread(struct task_struct *dead_task)
+ {
+ 	if (dead_task->mm) {
+-		if (dead_task->mm->context.size) {
++		if (dead_task->mm->context.ldt) {
+ 			pr_warn("WARNING: dead process %s still has LDT? <%p/%d>\n",
+ 				dead_task->comm,
+ 				dead_task->mm->context.ldt,
+-				dead_task->mm->context.size);
++				dead_task->mm->context.ldt->size);
+ 			BUG();
+ 		}
+ 	}
+diff --git a/arch/x86/kernel/step.c b/arch/x86/kernel/step.c
+index 9b4d51d0c0d0..6273324186ac 100644
+--- a/arch/x86/kernel/step.c
++++ b/arch/x86/kernel/step.c
+@@ -5,6 +5,7 @@
+ #include <linux/mm.h>
+ #include <linux/ptrace.h>
+ #include <asm/desc.h>
++#include <asm/mmu_context.h>
+ 
+ unsigned long convert_ip_to_linear(struct task_struct *child, struct pt_regs *regs)
+ {
+@@ -30,10 +31,11 @@ unsigned long convert_ip_to_linear(struct task_struct *child, struct pt_regs *re
+ 		seg &= ~7UL;
+ 
+ 		mutex_lock(&child->mm->context.lock);
+-		if (unlikely((seg >> 3) >= child->mm->context.size))
++		if (unlikely(!child->mm->context.ldt ||
++			     (seg >> 3) >= child->mm->context.ldt->size))
+ 			addr = -1L; /* bogus selector, access would fault */
+ 		else {
+-			desc = child->mm->context.ldt + seg;
++			desc = &child->mm->context.ldt->entries[seg];
+ 			base = get_desc_base(desc);
+ 
+ 			/* 16-bit code segment? */
+* Unmerged path arch/x86/power/cpu.c
