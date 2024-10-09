@@ -1,0 +1,223 @@
+vhost: convert pre sorted vhost memory array to interval tree
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [vhost] convert pre sorted vhost memory array to interval tree (Wei Xu) [1425127 1283257]
+Rebuild_FUZZ: 93.91%
+commit-author Jason Wang <jasowang@redhat.com>
+commit a9709d6874d55130663567577a9b05c35138cc6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a9709d68.failed
+
+Current pre-sorted memory region array has some limitations for future
+device IOTLB conversion:
+
+1) need extra work for adding and removing a single region, and it's
+   expected to be slow because of sorting or memory re-allocation.
+2) need extra work of removing a large range which may intersect
+   several regions with different size.
+3) need trick for a replacement policy like LRU
+
+To overcome the above shortcomings, this patch convert it to interval
+tree which can easily address the above issue with almost no extra
+work.
+
+The patch could be used for:
+
+- Extend the current API and only let the userspace to send diffs of
+  memory table.
+- Simplify Device IOTLB implementation.
+
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit a9709d6874d55130663567577a9b05c35138cc6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vhost.c
+diff --cc drivers/vhost/vhost.c
+index f65052baafd1,8071f3638db9..000000000000
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@@ -42,8 -43,12 +43,12 @@@ enum 
+  #define vhost_used_event(vq) ((__virtio16 __user *)&vq->avail->ring[vq->num])
+  #define vhost_avail_event(vq) ((__virtio16 __user *)&vq->used->ring[vq->num])
+  
++ INTERVAL_TREE_DEFINE(struct vhost_umem_node,
++ 		     rb, __u64, __subtree_last,
++ 		     START, LAST, , vhost_umem_interval_tree);
++ 
+  #ifdef CONFIG_VHOST_CROSS_ENDIAN_LEGACY
+ -static void vhost_disable_cross_endian(struct vhost_virtqueue *vq)
+ +static void vhost_vq_reset_user_be(struct vhost_virtqueue *vq)
+  {
+  	vq->user_be = !virtio_legacy_is_little_endian();
+  }
+@@@ -280,10 -302,10 +285,16 @@@ static void vhost_vq_reset(struct vhost
+  	vq->call_ctx = NULL;
+  	vq->call = NULL;
+  	vq->log_ctx = NULL;
+++<<<<<<< HEAD
+ +	vq->memory = NULL;
+ +	vq->is_le = virtio_legacy_is_little_endian();
+ +	vhost_vq_reset_user_be(vq);
+++=======
++ 	vhost_reset_is_le(vq);
++ 	vhost_disable_cross_endian(vq);
+++>>>>>>> a9709d6874d5 (vhost: convert pre sorted vhost memory array to interval tree)
+  	vq->busyloop_timeout = 0;
++ 	vq->umem = NULL;
+  }
+  
+  static int vhost_worker(void *data)
+@@@ -387,25 -399,24 +398,25 @@@ long vhost_dev_init(struct vhost_dev *d
+  	mutex_init(&dev->mutex);
+  	dev->log_ctx = NULL;
+  	dev->log_file = NULL;
+- 	dev->memory = NULL;
++ 	dev->umem = NULL;
+  	dev->mm = NULL;
+ +	spin_lock_init(&dev->work_lock);
+ +	INIT_LIST_HEAD(&dev->work_list);
+  	dev->worker = NULL;
+ -	init_llist_head(&dev->work_list);
+ -
+  
+  	for (i = 0; i < dev->nvqs; ++i) {
+ -		vq = dev->vqs[i];
+ -		vq->log = NULL;
+ -		vq->indirect = NULL;
+ -		vq->heads = NULL;
+ -		vq->dev = dev;
+ -		mutex_init(&vq->mutex);
+ -		vhost_vq_reset(dev, vq);
+ -		if (vq->handle_kick)
+ -			vhost_poll_init(&vq->poll, vq->handle_kick,
+ -					POLLIN, dev);
+ +		dev->vqs[i]->log = NULL;
+ +		dev->vqs[i]->indirect = NULL;
+ +		dev->vqs[i]->heads = NULL;
+ +		dev->vqs[i]->dev = dev;
+ +		mutex_init(&dev->vqs[i]->mutex);
+ +		vhost_vq_reset(dev, dev->vqs[i]);
+ +		if (dev->vqs[i]->handle_kick)
+ +			vhost_poll_init(&dev->vqs[i]->poll,
+ +					dev->vqs[i]->handle_kick, POLLIN, dev);
+  	}
+ +
+ +	return 0;
+  }
+  EXPORT_SYMBOL_GPL(vhost_dev_init);
+  
+@@@ -556,9 -591,9 +591,15 @@@ void vhost_dev_cleanup(struct vhost_de
+  		fput(dev->log_file);
+  	dev->log_file = NULL;
+  	/* No one will access memory at this point */
+++<<<<<<< HEAD
+ +	kvfree(dev->memory);
+ +	dev->memory = NULL;
+ +	WARN_ON(!list_empty(&dev->work_list));
+++=======
++ 	vhost_umem_clean(dev->umem);
++ 	dev->umem = NULL;
++ 	WARN_ON(!llist_empty(&dev->work_list));
+++>>>>>>> a9709d6874d5 (vhost: convert pre sorted vhost memory array to interval tree)
+  	if (dev->worker) {
+  		kthread_stop(dev->worker);
+  		dev->worker = NULL;
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index 13cfb2d2863d..6981cd100c13 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -1090,20 +1090,20 @@ static long vhost_net_reset_owner(struct vhost_net *n)
+ 	struct socket *tx_sock = NULL;
+ 	struct socket *rx_sock = NULL;
+ 	long err;
+-	struct vhost_memory *memory;
++	struct vhost_umem *umem;
+ 
+ 	mutex_lock(&n->dev.mutex);
+ 	err = vhost_dev_check_owner(&n->dev);
+ 	if (err)
+ 		goto done;
+-	memory = vhost_dev_reset_owner_prepare();
+-	if (!memory) {
++	umem = vhost_dev_reset_owner_prepare();
++	if (!umem) {
+ 		err = -ENOMEM;
+ 		goto done;
+ 	}
+ 	vhost_net_stop(n, &tx_sock, &rx_sock);
+ 	vhost_net_flush(n);
+-	vhost_dev_reset_owner(&n->dev, memory);
++	vhost_dev_reset_owner(&n->dev, umem);
+ 	vhost_net_vq_reset(n);
+ done:
+ 	mutex_unlock(&n->dev.mutex);
+* Unmerged path drivers/vhost/vhost.c
+diff --git a/drivers/vhost/vhost.h b/drivers/vhost/vhost.h
+index 5fd914ff48dd..e8ae24711573 100644
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -53,6 +53,25 @@ struct vhost_log {
+ 	u64 len;
+ };
+ 
++#define START(node) ((node)->start)
++#define LAST(node) ((node)->last)
++
++struct vhost_umem_node {
++	struct rb_node rb;
++	struct list_head link;
++	__u64 start;
++	__u64 last;
++	__u64 size;
++	__u64 userspace_addr;
++	__u64 flags_padding;
++	__u64 __subtree_last;
++};
++
++struct vhost_umem {
++	struct rb_root umem_tree;
++	struct list_head umem_list;
++};
++
+ /* The virtqueue structure describes a queue attached to a device. */
+ struct vhost_virtqueue {
+ 	struct vhost_dev *dev;
+@@ -101,7 +120,7 @@ struct vhost_virtqueue {
+ 	struct iovec *indirect;
+ 	struct vring_used_elem *heads;
+ 	/* Protected by virtqueue mutex. */
+-	struct vhost_memory *memory;
++	struct vhost_umem *umem;
+ 	void *private_data;
+ 	u64 acked_features;
+ 	/* Log write descriptors */
+@@ -119,7 +138,6 @@ struct vhost_virtqueue {
+ };
+ 
+ struct vhost_dev {
+-	struct vhost_memory *memory;
+ 	struct mm_struct *mm;
+ 	struct mutex mutex;
+ 	struct vhost_virtqueue **vqs;
+@@ -129,14 +147,15 @@ struct vhost_dev {
+ 	spinlock_t work_lock;
+ 	struct list_head work_list;
+ 	struct task_struct *worker;
++	struct vhost_umem *umem;
+ };
+ 
+ long vhost_dev_init(struct vhost_dev *, struct vhost_virtqueue **vqs, int nvqs);
+ long vhost_dev_set_owner(struct vhost_dev *dev);
+ bool vhost_dev_has_owner(struct vhost_dev *dev);
+ long vhost_dev_check_owner(struct vhost_dev *);
+-struct vhost_memory *vhost_dev_reset_owner_prepare(void);
+-void vhost_dev_reset_owner(struct vhost_dev *, struct vhost_memory *);
++struct vhost_umem *vhost_dev_reset_owner_prepare(void);
++void vhost_dev_reset_owner(struct vhost_dev *, struct vhost_umem *);
+ void vhost_dev_cleanup(struct vhost_dev *, bool locked);
+ void vhost_dev_stop(struct vhost_dev *);
+ long vhost_dev_ioctl(struct vhost_dev *, unsigned int ioctl, void __user *argp);
