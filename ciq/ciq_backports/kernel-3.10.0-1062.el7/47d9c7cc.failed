@@ -1,0 +1,231 @@
+fsnotify: generalize iteration of marks by object type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 47d9c7cc457adc5d6d8ca966482a51459f81e852
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/47d9c7cc.failed
+
+Make some code that handles marks of object types inode and vfsmount
+generic, so it can handle other object types.
+
+Introduce fsnotify_foreach_obj_type macro to iterate marks by object type
+and fsnotify_iter_{should|set}_report_type macros to set/test report_mask.
+
+This is going to be used for adding mark of another object type
+(super block mark).
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 47d9c7cc457adc5d6d8ca966482a51459f81e852)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.c
+#	fs/notify/inotify/inotify_user.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/notify/fsnotify.c
+index 0a2346cb87c4,bc9a51480156..000000000000
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@@ -264,6 -261,57 +264,60 @@@ static struct fsnotify_mark *fsnotify_n
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * iter_info is a multi head priority queue of marks.
++  * Pick a subset of marks from queue heads, all with the
++  * same group and set the report_mask for selected subset.
++  * Returns the report_mask of the selected subset.
++  */
++ static unsigned int fsnotify_iter_select_report_types(
++ 		struct fsnotify_iter_info *iter_info)
++ {
++ 	struct fsnotify_group *max_prio_group = NULL;
++ 	struct fsnotify_mark *mark;
++ 	int type;
++ 
++ 	/* Choose max prio group among groups of all queue heads */
++ 	fsnotify_foreach_obj_type(type) {
++ 		mark = iter_info->marks[type];
++ 		if (mark &&
++ 		    fsnotify_compare_groups(max_prio_group, mark->group) > 0)
++ 			max_prio_group = mark->group;
++ 	}
++ 
++ 	if (!max_prio_group)
++ 		return 0;
++ 
++ 	/* Set the report mask for marks from same group as max prio group */
++ 	iter_info->report_mask = 0;
++ 	fsnotify_foreach_obj_type(type) {
++ 		mark = iter_info->marks[type];
++ 		if (mark &&
++ 		    fsnotify_compare_groups(max_prio_group, mark->group) == 0)
++ 			fsnotify_iter_set_report_type(iter_info, type);
++ 	}
++ 
++ 	return iter_info->report_mask;
++ }
++ 
++ /*
++  * Pop from iter_info multi head queue, the marks that were iterated in the
++  * current iteration step.
++  */
++ static void fsnotify_iter_next(struct fsnotify_iter_info *iter_info)
++ {
++ 	int type;
++ 
++ 	fsnotify_foreach_obj_type(type) {
++ 		if (fsnotify_iter_should_report_type(iter_info, type))
++ 			iter_info->marks[type] =
++ 				fsnotify_next_mark(iter_info->marks[type]);
++ 	}
++ }
++ 
++ /*
+++>>>>>>> 47d9c7cc457a (fsnotify: generalize iteration of marks by object type)
+   * This is the main call to fsnotify.  The VFS calls into hook specific functions
+   * in linux/fsnotify.h.  Those functions then in turn call here.  Here will call
+   * out to all of the registered fsnotify_group.  Those groups can then use the
+diff --cc fs/notify/inotify/inotify_user.c
+index 9b45f7086122,6a408ab3169d..000000000000
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@@ -473,10 -485,14 +473,17 @@@ void inotify_ignored_and_remove_idr(str
+  				    struct fsnotify_group *group)
+  {
+  	struct inotify_inode_mark *i_mark;
+++<<<<<<< HEAD
+++=======
++ 	struct fsnotify_iter_info iter_info = { };
++ 
++ 	fsnotify_iter_set_report_type_mark(&iter_info, FSNOTIFY_OBJ_TYPE_INODE,
++ 					   fsn_mark);
+++>>>>>>> 47d9c7cc457a (fsnotify: generalize iteration of marks by object type)
+  
+  	/* Queue ignore event for the watch */
+ -	inotify_handle_event(group, NULL, FS_IN_IGNORED, NULL,
+ -			     FSNOTIFY_EVENT_NONE, NULL, 0, &iter_info);
+ +	inotify_handle_event(group, NULL, fsn_mark, NULL, FS_IN_IGNORED,
+ +			     NULL, FSNOTIFY_EVENT_NONE, NULL, 0, NULL);
+  
+  	i_mark = container_of(fsn_mark, struct inotify_inode_mark, fsn_mark);
+  	/* remove this mark from the idr */
+diff --cc include/linux/fsnotify_backend.h
+index 68286d820069,763423bfa3d6..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -200,6 -199,57 +200,60 @@@ struct fsnotify_group 
+  #define FSNOTIFY_EVENT_PATH	1
+  #define FSNOTIFY_EVENT_INODE	2
+  
+++<<<<<<< HEAD
+++=======
++ enum fsnotify_obj_type {
++ 	FSNOTIFY_OBJ_TYPE_INODE,
++ 	FSNOTIFY_OBJ_TYPE_VFSMOUNT,
++ 	FSNOTIFY_OBJ_TYPE_COUNT,
++ 	FSNOTIFY_OBJ_TYPE_DETACHED = FSNOTIFY_OBJ_TYPE_COUNT
++ };
++ 
++ #define FSNOTIFY_OBJ_TYPE_INODE_FL	(1U << FSNOTIFY_OBJ_TYPE_INODE)
++ #define FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL	(1U << FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++ #define FSNOTIFY_OBJ_ALL_TYPES_MASK	((1U << FSNOTIFY_OBJ_TYPE_COUNT) - 1)
++ 
++ struct fsnotify_iter_info {
++ 	struct fsnotify_mark *marks[FSNOTIFY_OBJ_TYPE_COUNT];
++ 	unsigned int report_mask;
++ 	int srcu_idx;
++ };
++ 
++ static inline bool fsnotify_iter_should_report_type(
++ 		struct fsnotify_iter_info *iter_info, int type)
++ {
++ 	return (iter_info->report_mask & (1U << type));
++ }
++ 
++ static inline void fsnotify_iter_set_report_type(
++ 		struct fsnotify_iter_info *iter_info, int type)
++ {
++ 	iter_info->report_mask |= (1U << type);
++ }
++ 
++ static inline void fsnotify_iter_set_report_type_mark(
++ 		struct fsnotify_iter_info *iter_info, int type,
++ 		struct fsnotify_mark *mark)
++ {
++ 	iter_info->marks[type] = mark;
++ 	iter_info->report_mask |= (1U << type);
++ }
++ 
++ #define FSNOTIFY_ITER_FUNCS(name, NAME) \
++ static inline struct fsnotify_mark *fsnotify_iter_##name##_mark( \
++ 		struct fsnotify_iter_info *iter_info) \
++ { \
++ 	return (iter_info->report_mask & FSNOTIFY_OBJ_TYPE_##NAME##_FL) ? \
++ 		iter_info->marks[FSNOTIFY_OBJ_TYPE_##NAME] : NULL; \
++ }
++ 
++ FSNOTIFY_ITER_FUNCS(inode, INODE)
++ FSNOTIFY_ITER_FUNCS(vfsmount, VFSMOUNT)
++ 
++ #define fsnotify_foreach_obj_type(type) \
++ 	for (type = 0; type < FSNOTIFY_OBJ_TYPE_COUNT; type++)
++ 
+++>>>>>>> 47d9c7cc457a (fsnotify: generalize iteration of marks by object type)
+  /*
+   * Inode / vfsmount point to this structure which tracks all marks attached to
+   * the inode / vfsmount. The reference to inode / vfsmount is held by this
+* Unmerged path fs/notify/fsnotify.c
+* Unmerged path fs/notify/inotify/inotify_user.c
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index 258d99087183..aa415d4cb12a 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -294,12 +294,12 @@ static void fsnotify_put_mark_wake(struct fsnotify_mark *mark)
+ 
+ bool fsnotify_prepare_user_wait(struct fsnotify_iter_info *iter_info)
+ {
+-	/* This can fail if mark is being removed */
+-	if (!fsnotify_get_mark_safe(iter_info->inode_mark))
+-		return false;
+-	if (!fsnotify_get_mark_safe(iter_info->vfsmount_mark)) {
+-		fsnotify_put_mark_wake(iter_info->inode_mark);
+-		return false;
++	int type;
++
++	fsnotify_foreach_obj_type(type) {
++		/* This can fail if mark is being removed */
++		if (!fsnotify_get_mark_safe(iter_info->marks[type]))
++			goto fail;
+ 	}
+ 
+ 	/*
+@@ -310,13 +310,20 @@ bool fsnotify_prepare_user_wait(struct fsnotify_iter_info *iter_info)
+ 	srcu_read_unlock(&fsnotify_mark_srcu, iter_info->srcu_idx);
+ 
+ 	return true;
++
++fail:
++	for (type--; type >= 0; type--)
++		fsnotify_put_mark_wake(iter_info->marks[type]);
++	return false;
+ }
+ 
+ void fsnotify_finish_user_wait(struct fsnotify_iter_info *iter_info)
+ {
++	int type;
++
+ 	iter_info->srcu_idx = srcu_read_lock(&fsnotify_mark_srcu);
+-	fsnotify_put_mark_wake(iter_info->inode_mark);
+-	fsnotify_put_mark_wake(iter_info->vfsmount_mark);
++	fsnotify_foreach_obj_type(type)
++		fsnotify_put_mark_wake(iter_info->marks[type]);
+ }
+ 
+ /*
+* Unmerged path include/linux/fsnotify_backend.h
