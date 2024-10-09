@@ -1,0 +1,352 @@
+nfp: bpf: record jump destination to simplify jump fixup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jiong Wang <jiong.wang@netronome.com>
+commit 5b674140addc3c863efa227946ad7328f016a7a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5b674140.failed
+
+eBPF insns are internally organized as dual-list inside NFP offload JIT.
+Random access to an insn needs to be done by either forward or backward
+traversal along the list.
+
+One place we need to do such traversal is at nfp_fixup_branches where one
+traversal is needed for each jump insn to find the destination. Such
+traversals could be avoided if jump destinations are collected through a
+single travesal in a pre-scan pass, and such information could also be
+useful in other places where jump destination info are needed.
+
+This patch adds such jump destination collection in nfp_prog_prepare.
+
+	Suggested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 5b674140addc3c863efa227946ad7328f016a7a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+#	drivers/net/ethernet/netronome/nfp/bpf/offload.c
+#	drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7,e488656f406c..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -100,6 -93,8 +100,11 @@@ typedef int (*instr_cb_t)(struct nfp_pr
+   * struct nfp_insn_meta - BPF instruction wrapper
+   * @insn: BPF instruction
+   * @ptr: pointer type for memory operations
+++<<<<<<< HEAD
+++=======
++  * @ptr_not_const: pointer is not always constant
++  * @jmp_dst: destination info for jump instructions
+++>>>>>>> 5b674140addc (nfp: bpf: record jump destination to simplify jump fixup)
+   * @off: index of first generated machine instruction (in nfp_prog.prog)
+   * @n: eBPF instruction number
+   * @skip: skip this instruction (optimized out)
+@@@ -108,7 -103,13 +113,17 @@@
+   */
+  struct nfp_insn_meta {
+  	struct bpf_insn insn;
+++<<<<<<< HEAD
+ +	struct bpf_reg_state ptr;
+++=======
++ 	union {
++ 		struct {
++ 			struct bpf_reg_state ptr;
++ 			bool ptr_not_const;
++ 		};
++ 		struct nfp_insn_meta *jmp_dst;
++ 	};
+++>>>>>>> 5b674140addc (nfp: bpf: record jump destination to simplify jump fixup)
+  	unsigned int off;
+  	unsigned short n;
+  	bool skip;
+@@@ -183,37 -180,24 +198,49 @@@ struct nfp_prog 
+  	struct list_head insns;
+  };
+  
+ -int nfp_bpf_jit(struct nfp_prog *prog);
+ +struct nfp_bpf_result {
+ +	unsigned int n_instr;
+ +	bool dense_mode;
+ +};
+ +
+ +int
+ +nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
+ +	    unsigned int prog_start, unsigned int prog_done,
+ +	    unsigned int prog_sz, struct nfp_bpf_result *res);
+  
+ -extern const struct bpf_ext_analyzer_ops nfp_bpf_analyzer_ops;
+ +int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+  
+ -struct netdev_bpf;
+ -struct nfp_app;
+  struct nfp_net;
+ +struct tc_cls_bpf_offload;
+ +
+ +/**
+ + * struct nfp_net_bpf_priv - per-vNIC BPF private data
+ + * @rx_filter:		Filter offload statistics - dropped packets/bytes
+ + * @rx_filter_prev:	Filter offload statistics - values from previous update
+ + * @rx_filter_change:	Jiffies when statistics last changed
+ + * @rx_filter_stats_timer:  Timer for polling filter offload statistics
+ + * @rx_filter_lock:	Lock protecting timer state changes (teardown)
+ + */
+ +struct nfp_net_bpf_priv {
+ +	struct nfp_stat_pair rx_filter, rx_filter_prev;
+ +	unsigned long rx_filter_change;
+ +	struct timer_list rx_filter_stats_timer;
+ +	spinlock_t rx_filter_lock;
+ +};
+  
+ -int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+ -			bool old_prog);
+ +int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
+ +void nfp_net_filter_stats_timer(unsigned long data);
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
++ 			  struct netdev_bpf *bpf);
++ int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
++ 		      struct bpf_prog *prog);
++ int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
++ 		    struct bpf_prog *prog);
++ struct nfp_insn_meta *
++ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
++ 		  unsigned int insn_idx, unsigned int n_insns);
+++>>>>>>> 5b674140addc (nfp: bpf: record jump destination to simplify jump fixup)
+  #endif
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index de79faf0874b,240db663d83f..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@@ -51,64 -51,41 +51,91 @@@
+  #include "../nfp_net_ctrl.h"
+  #include "../nfp_net.h"
+  
+ +void nfp_net_filter_stats_timer(unsigned long data)
+ +{
+ +	struct nfp_net *nn = (void *)data;
+ +	struct nfp_net_bpf_priv *priv;
+ +	struct nfp_stat_pair latest;
+ +
+ +	priv = nn->app_priv;
+ +
+ +	spin_lock_bh(&priv->rx_filter_lock);
+ +
+ +	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ +		mod_timer(&priv->rx_filter_stats_timer,
+ +			  jiffies + NFP_NET_STAT_POLL_IVL);
+ +
+ +	spin_unlock_bh(&priv->rx_filter_lock);
+ +
+ +	latest.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	latest.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +
+ +	if (latest.pkts != priv->rx_filter.pkts)
+ +		priv->rx_filter_change = jiffies;
+ +
+ +	priv->rx_filter = latest;
+ +}
+ +
+ +#if 0 /* Not in RHEL7 */
+ +static void nfp_net_bpf_stats_reset(struct nfp_net *nn)
+ +{
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +
+ +	priv->rx_filter.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	priv->rx_filter.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +	priv->rx_filter_prev = priv->rx_filter;
+ +	priv->rx_filter_change = jiffies;
+ +}
+ +
+  static int
+ -nfp_prog_prepare(struct nfp_prog *nfp_prog, const struct bpf_insn *prog,
+ -		 unsigned int cnt)
+ +nfp_net_bpf_stats_update(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+++<<<<<<< HEAD
+ +	struct tc_action *a;
+ +	LIST_HEAD(actions);
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +	u64 bytes, pkts;
+ +
+ +	pkts = priv->rx_filter.pkts - priv->rx_filter_prev.pkts;
+ +	bytes = priv->rx_filter.bytes - priv->rx_filter_prev.bytes;
+ +	bytes -= pkts * ETH_HLEN;
+ +
+ +	priv->rx_filter_prev = priv->rx_filter;
+++=======
++ 	struct nfp_insn_meta *meta;
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < cnt; i++) {
++ 		meta = kzalloc(sizeof(*meta), GFP_KERNEL);
++ 		if (!meta)
++ 			return -ENOMEM;
+++>>>>>>> 5b674140addc (nfp: bpf: record jump destination to simplify jump fixup)
+  
+ -		meta->insn = prog[i];
+ -		meta->n = i;
+ +	preempt_disable();
+  
+ -		list_add_tail(&meta->l, &nfp_prog->insns);
+ -	}
+ +	tcf_exts_to_list(cls_bpf->exts, &actions);
+ +	list_for_each_entry(a, &actions, list)
+ +		tcf_action_stats_update(a, bytes, pkts, nn->rx_filter_change);
+ +
+ +	preempt_enable();
+  
++ 	/* Another pass to record jump information. */
++ 	list_for_each_entry(meta, &nfp_prog->insns, l) {
++ 		u64 code = meta->insn.code;
++ 
++ 		if (BPF_CLASS(code) == BPF_JMP && BPF_OP(code) != BPF_EXIT &&
++ 		    BPF_OP(code) != BPF_CALL) {
++ 			struct nfp_insn_meta *dst_meta;
++ 			unsigned short dst_indx;
++ 
++ 			dst_indx = meta->n + 1 + meta->insn.off;
++ 			dst_meta = nfp_bpf_goto_meta(nfp_prog, meta, dst_indx,
++ 						     cnt);
++ 
++ 			meta->jmp_dst = dst_meta;
++ 		}
++ 	}
++ 
+  	return 0;
+  }
+  
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+index 8b981cfbeb65,cca67730b91f..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@@ -40,13 -40,7 +40,17 @@@
+  
+  #include "main.h"
+  
+++<<<<<<< HEAD
+ +/* Analyzer/verifier definitions */
+ +struct nfp_bpf_analyzer_priv {
+ +	struct nfp_prog *prog;
+ +	struct nfp_insn_meta *meta;
+ +};
+ +
+ +static struct nfp_insn_meta *
+++=======
++ struct nfp_insn_meta *
+++>>>>>>> 5b674140addc (nfp: bpf: record jump destination to simplify jump fixup)
+  nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+  		  unsigned int insn_idx, unsigned int n_insns)
+  {
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/jit.c b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+index 5b0338790b43..cf0ffeab9e54 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -65,12 +65,6 @@
+ 	     next = nfp_meta_next(pos),				\
+ 	     next2 = nfp_meta_next(next))
+ 
+-static bool
+-nfp_meta_has_next(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+-{
+-	return meta->l.next != &nfp_prog->insns;
+-}
+-
+ static bool
+ nfp_meta_has_prev(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+@@ -1769,9 +1763,8 @@ static void br_set_offset(u64 *instr, u16 offset)
+ /* --- Assembler logic --- */
+ static int nfp_fixup_branches(struct nfp_prog *nfp_prog)
+ {
+-	struct nfp_insn_meta *meta, *next;
++	struct nfp_insn_meta *meta, *jmp_dst;
+ 	u32 idx, br_idx;
+-	int off;
+ 
+ 	list_for_each_entry(meta, &nfp_prog->insns, l) {
+ 		if (meta->skip)
+@@ -1779,13 +1772,10 @@ static int nfp_fixup_branches(struct nfp_prog *nfp_prog)
+ 		if (BPF_CLASS(meta->insn.code) != BPF_JMP)
+ 			continue;
+ 
+-		if (list_is_last(&meta->l, &nfp_prog->insns)) {
+-			next = NULL;
++		if (list_is_last(&meta->l, &nfp_prog->insns))
+ 			idx = nfp_prog->last_bpf_off;
+-		} else {
+-			next = list_next_entry(meta, l);
+-			idx = next->off - 1;
+-		}
++		else
++			idx = list_next_entry(meta, l)->off - 1;
+ 
+ 		br_idx = nfp_prog_offset_to_index(nfp_prog, idx);
+ 
+@@ -1798,43 +1788,14 @@ static int nfp_fixup_branches(struct nfp_prog *nfp_prog)
+ 		if (FIELD_GET(OP_BR_SPECIAL, nfp_prog->prog[br_idx]))
+ 			continue;
+ 
+-		/* Find the target offset in assembler realm */
+-		off = meta->insn.off;
+-		if (!off) {
+-			pr_err("Fixup found zero offset!!\n");
++		if (!meta->jmp_dst) {
++			pr_err("Non-exit jump doesn't have destination info recorded!!\n");
+ 			return -ELOOP;
+ 		}
+ 
+-		if (!next) {
+-			/* When "next" is NULL, "meta" is the last node in the
+-			 * list. Given it is an JMP, it then must be a backward
+-			 * jump.
+-			 *
+-			 * For eBPF, the jump offset is against pc + 1, so we
+-			 * need to compensate the offset by 1 as we are pointing
+-			 * "next" to the current node "meta".
+-			 */
+-			if (WARN_ON_ONCE(off > -2))
+-				return -ELOOP;
+-
+-			next = meta;
+-			off += 1;
+-		}
+-
+-		while (off > 0 && nfp_meta_has_next(nfp_prog, next)) {
+-			next = nfp_meta_next(next);
+-			off--;
+-		}
+-		while (off < 0 && nfp_meta_has_prev(nfp_prog, next)) {
+-			next = nfp_meta_prev(next);
+-			off++;
+-		}
+-		if (off) {
+-			pr_err("Fixup found too large jump!! %d\n", off);
+-			return -ELOOP;
+-		}
++		jmp_dst = meta->jmp_dst;
+ 
+-		if (next->skip) {
++		if (jmp_dst->skip) {
+ 			pr_err("Branch landing on removed instruction!!\n");
+ 			return -ELOOP;
+ 		}
+@@ -1843,7 +1804,7 @@ static int nfp_fixup_branches(struct nfp_prog *nfp_prog)
+ 		     idx <= br_idx; idx++) {
+ 			if (!nfp_is_br(nfp_prog->prog[idx]))
+ 				continue;
+-			br_set_offset(&nfp_prog->prog[idx], next->off);
++			br_set_offset(&nfp_prog->prog[idx], jmp_dst->off);
+ 		}
+ 	}
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/offload.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/verifier.c
