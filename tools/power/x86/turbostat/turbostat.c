@@ -2448,6 +2448,7 @@ int probe_nhm_msrs(unsigned int family, unsigned int model)
 		pkg_cstate_limits = phi_pkg_cstate_limits;
 		break;
 	case INTEL_FAM6_ATOM_GOLDMONT:	/* BXT */
+	case INTEL_FAM6_ATOM_GEMINI_LAKE:
 	case INTEL_FAM6_ATOM_DENVERTON:	/* DNV */
 		pkg_cstate_limits = bxt_pkg_cstate_limits;
 		break;
@@ -2909,6 +2910,7 @@ void rapl_probe(unsigned int family, unsigned int model)
 		}
 		break;
 	case INTEL_FAM6_ATOM_GOLDMONT:	/* BXT */
+	case INTEL_FAM6_ATOM_GEMINI_LAKE:
 		do_rapl = RAPL_PKG | RAPL_PKG_POWER_INFO;
 		if (rapl_joules)
 			BIC_PRESENT(BIC_Pkg_J);
@@ -3260,6 +3262,7 @@ int has_snb_msrs(unsigned int family, unsigned int model)
 	case INTEL_FAM6_KABYLAKE_DESKTOP:	/* KBL */
 	case INTEL_FAM6_SKYLAKE_X:	/* SKX */
 	case INTEL_FAM6_ATOM_GOLDMONT:	/* BXT */
+	case INTEL_FAM6_ATOM_GEMINI_LAKE:
 	case INTEL_FAM6_ATOM_DENVERTON:	/* DNV */
 		return 1;
 	}
@@ -3291,6 +3294,7 @@ int has_hsw_msrs(unsigned int family, unsigned int model)
 	case INTEL_FAM6_KABYLAKE_MOBILE:	/* KBL */
 	case INTEL_FAM6_KABYLAKE_DESKTOP:	/* KBL */
 	case INTEL_FAM6_ATOM_GOLDMONT:	/* BXT */
+	case INTEL_FAM6_ATOM_GEMINI_LAKE:
 		return 1;
 	}
 	return 0;
@@ -3639,6 +3643,7 @@ void process_cpuid()
 					crystal_hz = 25000000;	/* 25.0 MHz */
 					break;
 				case INTEL_FAM6_ATOM_GOLDMONT:	/* BXT */
+				case INTEL_FAM6_ATOM_GEMINI_LAKE:
 					crystal_hz = 19200000;	/* 19.2 MHz */
 					break;
 				default:
