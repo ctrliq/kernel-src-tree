@@ -1,0 +1,184 @@
+x86/smpboot: Fix __max_logical_packages estimate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Prarit Bhargava <prarit@redhat.com>
+commit b4c0a7326f5dc0ef7a64128b0ae7d081f4b2cbd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b4c0a732.failed
+
+A system booted with a small number of cores enabled per package
+panics because the estimate of __max_logical_packages is too low.
+
+This occurs when the total number of active cores across all packages is
+less than the maximum core count for a single package. e.g.:
+
+  On a 4 package system with 20 cores/package where only 4 cores are
+  enabled on each package, the value of __max_logical_packages is
+  calculated as DIV_ROUND_UP(16 / 20) = 1 and not 4.
+
+Calculate __max_logical_packages after the cpu enumeration has completed.
+Use the boot cpu's data to extrapolate the number of packages.
+
+	Signed-off-by: Prarit Bhargava <prarit@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: He Chen <he.chen@linux.intel.com>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Piotr Luc <piotr.luc@intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arvind Yadav <arvind.yadav.cs@gmail.com>
+	Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Mathias Krause <minipli@googlemail.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Link: https://lkml.kernel.org/r/20171114124257.22013-4-prarit@redhat.com
+
+(cherry picked from commit b4c0a7326f5dc0ef7a64128b0ae7d081f4b2cbd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/smpboot.c
+index 92e0aea4e8c8,3d01df7d7cf6..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -252,25 -303,13 +252,19 @@@ static void notrace start_secondary(voi
+   */
+  int topology_update_package_map(unsigned int pkg, unsigned int cpu)
+  {
+ -	int new;
+ +	unsigned int new;
+ +
+ +	/* Called from early boot ? */
+ +	if (!physical_package_map)
+ +		return 0;
+  
+ -	/* Already available somewhere? */
+ -	new = topology_phys_to_logical_pkg(pkg);
+ -	if (new >= 0)
+ +	if (pkg >= max_physical_pkg_id)
+ +		return -EINVAL;
+ +
+ +	/* Set the logical package id */
+ +	if (test_and_set_bit(pkg, physical_package_map))
+  		goto found;
+  
+- 	if (logical_packages >= __max_logical_packages) {
+- 		pr_warn("Package %u of CPU %u exceeds BIOS package data %u.\n",
+- 			logical_packages, cpu, __max_logical_packages);
+- 		return -ENOSPC;
+- 	}
+- 
+  	new = logical_packages++;
+  	if (new != pkg) {
+  		pr_info("CPU %u Converting physical %u to logical package %u\n",
+@@@ -283,83 -320,6 +277,86 @@@ found
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * topology_phys_to_logical_pkg - Map a physical package id to a logical
+ + *
+ + * Returns logical package id or -1 if not found
+ + */
+ +int topology_phys_to_logical_pkg(unsigned int phys_pkg)
+ +{
+ +	if (phys_pkg >= max_physical_pkg_id)
+ +		return -1;
+ +	return physical_to_logical_pkg[phys_pkg];
+ +}
+ +EXPORT_SYMBOL(topology_phys_to_logical_pkg);
+ +
+ +static void __init smp_init_package_map(struct cpuinfo_x86 *c, unsigned int cpu)
+ +{
+ +	unsigned int ncpus;
+ +	size_t size;
+ +
+ +	/*
+ +	 * Today neither Intel nor AMD support heterogenous systems. That
+ +	 * might change in the future....
+ +	 *
+ +	 * While ideally we'd want '* smp_num_siblings' in the below @ncpus
+ +	 * computation, this won't actually work since some Intel BIOSes
+ +	 * report inconsistent HT data when they disable HT.
+ +	 *
+ +	 * In particular, they reduce the APIC-IDs to only include the cores,
+ +	 * but leave the CPUID topology to say there are (2) siblings.
+ +	 * This means we don't know how many threads there will be until
+ +	 * after the APIC enumeration.
+ +	 *
+ +	 * By not including this we'll sometimes over-estimate the number of
+ +	 * logical packages by the amount of !present siblings, but this is
+ +	 * still better than MAX_LOCAL_APIC.
+ +	 *
+ +	 * We use total_cpus not nr_cpu_ids because nr_cpu_ids can be limited
+ +	 * on the command line leading to a similar issue as the HT disable
+ +	 * problem because the hyperthreads are usually enumerated after the
+ +	 * primary cores.
+ +	 */
+ +	ncpus = boot_cpu_data.x86_max_cores;
+ +	if (!ncpus) {
+ +		pr_warn("x86_max_cores == zero !?!?");
+ +		ncpus = 1;
+ +	}
+ +
+ +	__max_logical_packages = DIV_ROUND_UP(total_cpus, ncpus);
+ +	logical_packages = 0;
+ +
+ +	/*
+ +	 * Possibly larger than what we need as the number of apic ids per
+ +	 * package can be smaller than the actual used apic ids.
+ +	 */
+ +	max_physical_pkg_id = DIV_ROUND_UP(MAX_LOCAL_APIC, ncpus);
+ +
+ +	if (x86_hyper == &x86_hyper_xen_hvm) {
+ +		/*
+ +		 * RHEL-only. Each logical package has not more than
+ +		 * x86_max_cores CPUs but it can happen that it has less, e.g.
+ +		 * we may have 1 CPU per logical package regardless of what's
+ +		 * in x86_max_cores. This is seen on some Xen setups with AMD
+ +		 * processors.
+ +		 */
+ +		__max_logical_packages = min(max_physical_pkg_id, total_cpus);
+ +	}
+ +
+ +	size = max_physical_pkg_id * sizeof(unsigned int);
+ +	physical_to_logical_pkg = kmalloc(size, GFP_KERNEL);
+ +	memset(physical_to_logical_pkg, 0xff, size);
+ +	size = BITS_TO_LONGS(max_physical_pkg_id) * sizeof(unsigned long);
+ +	physical_package_map = kzalloc(size, GFP_KERNEL);
+ +
+ +	pr_info("Max logical packages: %u\n", __max_logical_packages);
+ +
+ +	topology_update_package_map(c->phys_proc_id, cpu);
+ +}
+ +
+++=======
+++>>>>>>> b4c0a7326f5d (x86/smpboot: Fix __max_logical_packages estimate)
+  void __init smp_store_boot_cpu_info(void)
+  {
+  	int id = 0; /* CPU 0 */
+@@@ -368,8 -327,8 +365,13 @@@
+  
+  	*c = boot_cpu_data;
+  	c->cpu_index = id;
+++<<<<<<< HEAD
+ +	*rh_c = rh_boot_cpu_data;
+ +	smp_init_package_map(c, id);
+++=======
++ 	topology_update_package_map(c->phys_proc_id, id);
++ 	c->initialized = true;
+++>>>>>>> b4c0a7326f5d (x86/smpboot: Fix __max_logical_packages estimate)
+  }
+  
+  /*
+* Unmerged path arch/x86/kernel/smpboot.c
