@@ -1,0 +1,297 @@
+mremap: properly flush TLB before releasing the page
+
+jira LE-1907
+cve CVE-2018-18281
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit eb66ae030829605d61fbef1909ce310e29f78821
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/eb66ae03.failed
+
+Jann Horn points out that our TLB flushing was subtly wrong for the
+mremap() case.  What makes mremap() special is that we don't follow the
+usual "add page to list of pages to be freed, then flush tlb, and then
+free pages".  No, mremap() obviously just _moves_ the page from one page
+table location to another.
+
+That matters, because mremap() thus doesn't directly control the
+lifetime of the moved page with a freelist: instead, the lifetime of the
+page is controlled by the page table locking, that serializes access to
+the entry.
+
+As a result, we need to flush the TLB not just before releasing the lock
+for the source location (to avoid any concurrent accesses to the entry),
+but also before we release the destination page table lock (to avoid the
+TLB being flushed after somebody else has already done something to that
+page).
+
+This also makes the whole "need_flush" logic unnecessary, since we now
+always end up flushing the TLB for every valid entry.
+
+Reported-and-tested-by: Jann Horn <jannh@google.com>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Tested-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit eb66ae030829605d61fbef1909ce310e29f78821)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+#	mm/mremap.c
+diff --cc mm/huge_memory.c
+index 5f95a9b1998d,deed97fba979..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1873,43 -1752,45 +1873,43 @@@ int zap_huge_pmd(struct mmu_gather *tlb
+  	return 1;
+  }
+  
+ -#ifndef pmd_move_must_withdraw
+ -static inline int pmd_move_must_withdraw(spinlock_t *new_pmd_ptl,
+ -					 spinlock_t *old_pmd_ptl,
+ -					 struct vm_area_struct *vma)
+ +int mincore_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ +		unsigned long addr, unsigned long end,
+ +		unsigned char *vec)
+  {
+ -	/*
+ -	 * With split pmd lock we also need to move preallocated
+ -	 * PTE page table if new_pmd is on different PMD page table.
+ -	 *
+ -	 * We also don't deposit and withdraw tables for file pages.
+ -	 */
+ -	return (new_pmd_ptl != old_pmd_ptl) && vma_is_anonymous(vma);
+ -}
+ -#endif
+ +	spinlock_t *ptl;
+ +	int ret = 0;
+  
+ -static pmd_t move_soft_dirty_pmd(pmd_t pmd)
+ -{
+ -#ifdef CONFIG_MEM_SOFT_DIRTY
+ -	if (unlikely(is_pmd_migration_entry(pmd)))
+ -		pmd = pmd_swp_mksoft_dirty(pmd);
+ -	else if (pmd_present(pmd))
+ -		pmd = pmd_mksoft_dirty(pmd);
+ -#endif
+ -	return pmd;
+ +	if (__pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+ +		/*
+ +		 * All logical pages in the range are present
+ +		 * if backed by a huge page.
+ +		 */
+ +		spin_unlock(ptl);
+ +		memset(vec, 1, (end - addr) >> PAGE_SHIFT);
+ +		ret = 1;
+ +	}
+ +
+ +	return ret;
+  }
+  
+ -bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
+ +int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
+ +		  unsigned long old_addr,
+  		  unsigned long new_addr, unsigned long old_end,
+- 		  pmd_t *old_pmd, pmd_t *new_pmd, bool *need_flush)
++ 		  pmd_t *old_pmd, pmd_t *new_pmd)
+  {
+  	spinlock_t *old_ptl, *new_ptl;
+ +	int ret = 0;
+  	pmd_t pmd;
+ -	struct mm_struct *mm = vma->vm_mm;
+  	bool force_flush = false;
+  
+ +	struct mm_struct *mm = vma->vm_mm;
+ +
+  	if ((old_addr & ~HPAGE_PMD_MASK) ||
+  	    (new_addr & ~HPAGE_PMD_MASK) ||
+ -	    old_end - old_addr < HPAGE_PMD_SIZE)
+ -		return false;
+ +	    old_end - old_addr < HPAGE_PMD_SIZE ||
+ +	    (new_vma->vm_flags & VM_NOHUGEPAGE))
+ +		goto out;
+  
+  	/*
+  	 * The destination pmd shouldn't be established, free_pgtables()
+@@@ -1929,26 -1810,26 +1929,36 @@@
+  		new_ptl = pmd_lockptr(mm, new_pmd);
+  		if (new_ptl != old_ptl)
+  			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
+++<<<<<<< HEAD
+ +		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+ +		if (pmd_present(pmd) && pmd_dirty(pmd))
+++=======
++ 		pmd = pmdp_huge_get_and_clear(mm, old_addr, old_pmd);
++ 		if (pmd_present(pmd))
+++>>>>>>> eb66ae030829 (mremap: properly flush TLB before releasing the page)
+  			force_flush = true;
+  		VM_BUG_ON(!pmd_none(*new_pmd));
+ -
+ -		if (pmd_move_must_withdraw(new_ptl, old_ptl, vma)) {
+ +		if (pmd_move_must_withdraw(new_ptl, old_ptl)) {
+  			pgtable_t pgtable;
+  			pgtable = pgtable_trans_huge_withdraw(mm, old_pmd);
+  			pgtable_trans_huge_deposit(mm, new_pmd, pgtable);
+  		}
+++<<<<<<< HEAD
+ +		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
+ +		if (new_ptl != old_ptl)
+ +			spin_unlock(new_ptl);
+++=======
++ 		pmd = move_soft_dirty_pmd(pmd);
++ 		set_pmd_at(mm, new_addr, new_pmd, pmd);
+++>>>>>>> eb66ae030829 (mremap: properly flush TLB before releasing the page)
+  		if (force_flush)
+  			flush_tlb_range(vma, old_addr, old_addr + PMD_SIZE);
+- 		else
+- 			*need_flush = true;
++ 		if (new_ptl != old_ptl)
++ 			spin_unlock(new_ptl);
+  		spin_unlock(old_ptl);
+ -		return true;
+  	}
+ -	return false;
+ +out:
+ +	return ret;
+  }
+  
+  /*
+diff --cc mm/mremap.c
+index 9b572652d9e7,a9617e72e6b7..000000000000
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@@ -92,10 -115,8 +92,10 @@@ static pte_t move_soft_dirty_pte(pte_t 
+  static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
+  		unsigned long old_addr, unsigned long old_end,
+  		struct vm_area_struct *new_vma, pmd_t *new_pmd,
+- 		unsigned long new_addr, bool need_rmap_locks, bool *need_flush)
++ 		unsigned long new_addr, bool need_rmap_locks)
+  {
+ +	struct address_space *mapping = NULL;
+ +	struct anon_vma *anon_vma = NULL;
+  	struct mm_struct *mm = vma->vm_mm;
+  	pte_t *old_pte, *new_pte, pte;
+  	spinlock_t *old_ptl, *new_ptl;
+@@@ -146,17 -160,20 +146,19 @@@
+  				   new_pte++, new_addr += PAGE_SIZE) {
+  		if (pte_none(*old_pte))
+  			continue;
+ -
+  		pte = ptep_get_and_clear(mm, old_addr, old_pte);
+  		/*
+- 		 * If we are remapping a dirty PTE, make sure
++ 		 * If we are remapping a valid PTE, make sure
+  		 * to flush TLB before we drop the PTL for the
+- 		 * old PTE or we may race with page_mkclean().
++ 		 * PTE.
+  		 *
+- 		 * This check has to be done after we removed the
+- 		 * old PTE from page tables or another thread may
+- 		 * dirty it after the check and before the removal.
++ 		 * NOTE! Both old and new PTL matter: the old one
++ 		 * for racing with page_mkclean(), the new one to
++ 		 * make sure the physical page stays valid until
++ 		 * the TLB entry for the old mapping has been
++ 		 * flushed.
+  		 */
+- 		if (pte_present(pte) && pte_dirty(pte))
++ 		if (pte_present(pte))
+  			force_flush = true;
+  		pte = move_pte(pte, new_vma->vm_page_prot, old_addr, new_addr);
+  		pte = move_soft_dirty_pte(pte);
+@@@ -167,19 -186,11 +171,15 @@@
+  	if (new_ptl != old_ptl)
+  		spin_unlock(new_ptl);
+  	pte_unmap(new_pte - 1);
+- 	if (force_flush)
+- 		flush_tlb_range(vma, old_end - len, old_end);
+- 	else
+- 		*need_flush = true;
+  	pte_unmap_unlock(old_pte - 1, old_ptl);
+ -	if (need_rmap_locks)
+ -		drop_rmap_locks(vma);
+ +	if (anon_vma)
+ +		anon_vma_unlock_write(anon_vma);
+ +	if (mapping)
+ +		mutex_unlock(&mapping->i_mmap_mutex);
+  }
+  
+ +#define LATENCY_LIMIT	(64 * PAGE_SIZE)
+ +
+  unsigned long move_page_tables(struct vm_area_struct *vma,
+  		unsigned long old_addr, struct vm_area_struct *new_vma,
+  		unsigned long new_addr, unsigned long len,
+@@@ -211,40 -221,31 +210,44 @@@
+  		new_pmd = alloc_new_pmd(vma->vm_mm, vma, new_addr);
+  		if (!new_pmd)
+  			break;
+ -		if (is_swap_pmd(*old_pmd) || pmd_trans_huge(*old_pmd)) {
+ +		if (pmd_trans_huge(*old_pmd)) {
+ +			int err = 0;
+  			if (extent == HPAGE_PMD_SIZE) {
+ -				bool moved;
+ +				VM_BUG_ON(vma->vm_file || !vma->anon_vma);
+  				/* See comment in move_ptes() */
+  				if (need_rmap_locks)
+++<<<<<<< HEAD
+ +					anon_vma_lock_write(vma->anon_vma);
+ +				err = move_huge_pmd(vma, new_vma, old_addr,
+ +						    new_addr, old_end,
+ +						    old_pmd, new_pmd,
+ +						    &need_flush);
+++=======
++ 					take_rmap_locks(vma);
++ 				moved = move_huge_pmd(vma, old_addr, new_addr,
++ 						    old_end, old_pmd, new_pmd);
+++>>>>>>> eb66ae030829 (mremap: properly flush TLB before releasing the page)
+  				if (need_rmap_locks)
+ -					drop_rmap_locks(vma);
+ -				if (moved)
+ -					continue;
+ +					anon_vma_unlock_write(vma->anon_vma);
+  			}
+ -			split_huge_pmd(vma, old_pmd, old_addr);
+ -			if (pmd_trans_unstable(old_pmd))
+ +			if (err > 0)
+  				continue;
+ +			else if (!err) {
+ +				split_huge_page_pmd(vma, old_addr, old_pmd);
+ +			}
+ +			VM_BUG_ON(pmd_trans_huge(*old_pmd));
+  		}
+ -		if (pte_alloc(new_vma->vm_mm, new_pmd, new_addr))
+ +		if (pmd_none(*new_pmd) && __pte_alloc(new_vma->vm_mm, new_vma,
+ +						      new_pmd, new_addr))
+  			break;
+  		next = (new_addr + PMD_SIZE) & PMD_MASK;
+  		if (extent > next - new_addr)
+  			extent = next - new_addr;
+ +		if (extent > LATENCY_LIMIT)
+ +			extent = LATENCY_LIMIT;
+  		move_ptes(vma, old_pmd, old_addr, old_addr + extent, new_vma,
+- 			  new_pmd, new_addr, need_rmap_locks, &need_flush);
++ 			  new_pmd, new_addr, need_rmap_locks);
+  	}
+- 	if (need_flush)
+- 		flush_tlb_range(vma, old_end-len, old_addr);
+  
+  	mmu_notifier_invalidate_range_end(vma->vm_mm, mmun_start, mmun_end);
+  
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index f63e6ad63202..537dff98725d 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -42,7 +42,7 @@ extern int move_huge_pmd(struct vm_area_struct *vma,
+ 			 struct vm_area_struct *new_vma,
+ 			 unsigned long old_addr,
+ 			 unsigned long new_addr, unsigned long old_end,
+-			 pmd_t *old_pmd, pmd_t *new_pmd, bool *need_flush);
++			 pmd_t *old_pmd, pmd_t *new_pmd);
+ extern int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 			unsigned long addr, pgprot_t newprot,
+ 			int prot_numa);
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/mremap.c
