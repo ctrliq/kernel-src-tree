@@ -275,7 +275,7 @@ bitmap_port_create(struct net *net, struct ip_set *set, struct nlattr *tb[],
 		return -ENOMEM;
 
 	map->elements = last_port - first_port + 1;
-	map->memsize = map->elements * sizeof(unsigned long);
+	map->memsize = bitmap_bytes(0, map->elements);
 	set->variant = &bitmap_port;
 	if (tb[IPSET_ATTR_CADT_FLAGS])
 		cadt_flags = ip_set_get_h32(tb[IPSET_ATTR_CADT_FLAGS]);
