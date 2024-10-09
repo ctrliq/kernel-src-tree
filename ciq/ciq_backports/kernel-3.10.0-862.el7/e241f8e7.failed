@@ -1,0 +1,190 @@
+iommu/amd: Add locking to per-domain flush-queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Add locking to per-domain flush-queue (Suravee Suthikulpanit) [1508644]
+Rebuild_FUZZ: 93.33%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit e241f8e76c152e000d481fc8334d41d22c013fe8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e241f8e7.failed
+
+With locking we can safely access the flush-queues of other
+cpus.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit e241f8e76c152e000d481fc8334d41d22c013fe8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index e80343c1de99,9a06acc8cc9d..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -117,26 -136,17 +117,33 @@@ static void update_domain(struct protec
+  static int protection_domain_init(struct protection_domain *domain);
+  static void detach_device(struct device *dev);
+  
+ -#define FLUSH_QUEUE_SIZE 256
+ +/*
+ + * For dynamic growth the aperture size is split into ranges of 128MB of
+ + * DMA address space each. This struct represents one such range.
+ + */
+ +struct aperture_range {
+  
+ -struct flush_queue_entry {
+ -	unsigned long iova_pfn;
+ -	unsigned long pages;
+ -};
+ +	spinlock_t bitmap_lock;
+ +
+++<<<<<<< HEAD
+ +	/* address allocation bitmap */
+ +	unsigned long *bitmap;
+ +	unsigned long offset;
+ +	unsigned long next_bit;
+  
+ +	/*
+ +	 * Array of PTE pages for the aperture. In this array we save all the
+ +	 * leaf pages of the domain page table used for the aperture. This way
+ +	 * we don't need to walk the page table to find a specific PTE. We can
+ +	 * just calculate its address in constant time.
+ +	 */
+ +	u64 *pte_pages[64];
+++=======
++ struct flush_queue {
++ 	struct flush_queue_entry *entries;
++ 	unsigned head, tail;
++ 	spinlock_t lock;
+++>>>>>>> e241f8e76c15 (iommu/amd: Add locking to per-domain flush-queue)
+  };
+  
+  /*
+@@@ -1972,6 -1757,121 +1979,124 @@@ static void free_gcr3_table(struct prot
+  	free_page((unsigned long)domain->gcr3_tbl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dma_ops_domain_free_flush_queue(struct dma_ops_domain *dom)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 
++ 		queue = per_cpu_ptr(dom->flush_queue, cpu);
++ 		kfree(queue->entries);
++ 	}
++ 
++ 	free_percpu(dom->flush_queue);
++ 
++ 	dom->flush_queue = NULL;
++ }
++ 
++ static int dma_ops_domain_alloc_flush_queue(struct dma_ops_domain *dom)
++ {
++ 	int cpu;
++ 
++ 	dom->flush_queue = alloc_percpu(struct flush_queue);
++ 	if (!dom->flush_queue)
++ 		return -ENOMEM;
++ 
++ 	/* First make sure everything is cleared */
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 
++ 		queue = per_cpu_ptr(dom->flush_queue, cpu);
++ 		queue->head    = 0;
++ 		queue->tail    = 0;
++ 		queue->entries = NULL;
++ 	}
++ 
++ 	/* Now start doing the allocation */
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 
++ 		queue = per_cpu_ptr(dom->flush_queue, cpu);
++ 		queue->entries = kzalloc(FLUSH_QUEUE_SIZE * sizeof(*queue->entries),
++ 					 GFP_KERNEL);
++ 		if (!queue->entries) {
++ 			dma_ops_domain_free_flush_queue(dom);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		spin_lock_init(&queue->lock);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline bool queue_ring_full(struct flush_queue *queue)
++ {
++ 	assert_spin_locked(&queue->lock);
++ 
++ 	return (((queue->tail + 1) % FLUSH_QUEUE_SIZE) == queue->head);
++ }
++ 
++ #define queue_ring_for_each(i, q) \
++ 	for (i = (q)->head; i != (q)->tail; i = (i + 1) % FLUSH_QUEUE_SIZE)
++ 
++ static void queue_release(struct dma_ops_domain *dom,
++ 			  struct flush_queue *queue)
++ {
++ 	unsigned i;
++ 
++ 	assert_spin_locked(&queue->lock);
++ 
++ 	queue_ring_for_each(i, queue)
++ 		free_iova_fast(&dom->iovad,
++ 			       queue->entries[i].iova_pfn,
++ 			       queue->entries[i].pages);
++ 
++ 	queue->head = queue->tail = 0;
++ }
++ 
++ static inline unsigned queue_ring_add(struct flush_queue *queue)
++ {
++ 	unsigned idx = queue->tail;
++ 
++ 	assert_spin_locked(&queue->lock);
++ 	queue->tail = (idx + 1) % FLUSH_QUEUE_SIZE;
++ 
++ 	return idx;
++ }
++ 
++ static void queue_add(struct dma_ops_domain *dom,
++ 		      unsigned long address, unsigned long pages)
++ {
++ 	struct flush_queue *queue;
++ 	unsigned long flags;
++ 	int idx;
++ 
++ 	pages     = __roundup_pow_of_two(pages);
++ 	address >>= PAGE_SHIFT;
++ 
++ 	queue = get_cpu_ptr(dom->flush_queue);
++ 	spin_lock_irqsave(&queue->lock, flags);
++ 
++ 	if (queue_ring_full(queue)) {
++ 		domain_flush_tlb(&dom->domain);
++ 		domain_flush_complete(&dom->domain);
++ 		queue_release(dom, queue);
++ 	}
++ 
++ 	idx = queue_ring_add(queue);
++ 
++ 	queue->entries[idx].iova_pfn = address;
++ 	queue->entries[idx].pages    = pages;
++ 
++ 	spin_unlock_irqrestore(&queue->lock, flags);
++ 	put_cpu_ptr(dom->flush_queue);
++ }
++ 
+++>>>>>>> e241f8e76c15 (iommu/amd: Add locking to per-domain flush-queue)
+  /*
+   * Free a domain, only used if something went wrong in the
+   * allocation path and we need to free an already allocated page table
+* Unmerged path drivers/iommu/amd_iommu.c
