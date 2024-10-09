@@ -1,0 +1,100 @@
+blk-mq: fix performance regression with shared tags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 8e8320c9315c47a6a090188720ccff32a6a6ba18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8e8320c9.failed
+
+If we have shared tags enabled, then every IO completion will trigger
+a full loop of every queue belonging to a tag set, and every hardware
+queue for each of those queues, even if nothing needs to be done.
+This causes a massive performance regression if you have a lot of
+shared devices.
+
+Instead of doing this huge full scan on every IO, add an atomic
+counter to the main queue that tracks how many hardware queues have
+been marked as needing a restart. With that, we can avoid looking for
+restartable queues, if we don't have to.
+
+Max reports that this restores performance. Before this patch, 4K
+IOPS was limited to 22-23K IOPS. With the patch, we are running at
+950-970K IOPS.
+
+Fixes: 6d8c6c0f97ad ("blk-mq: Restart a single queue if tag sets are shared")
+	Reported-by: Max Gurtovoy <maxg@mellanox.com>
+	Tested-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Tested-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8e8320c9315c47a6a090188720ccff32a6a6ba18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq-sched.h
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index ba3405333171,1ddd36bd2173..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -359,6 -391,11 +359,14 @@@ struct request_queue 
+  	int			nr_rqs[2];	/* # allocated [a]sync rqs */
+  	int			nr_rqs_elvpriv;	/* # allocated rqs w/ elvpriv */
+  
+++<<<<<<< HEAD
+++=======
++ 	atomic_t		shared_hctx_restart;
++ 
++ 	struct blk_queue_stats	*stats;
++ 	struct rq_wb		*rq_wb;
++ 
+++>>>>>>> 8e8320c9315c (blk-mq: fix performance regression with shared tags)
+  	/*
+  	 * If blkcg is not used, @q->root_rl serves all requests.  If blkcg
+  	 * is used, root blkg allocates from @q->root_rl and all other
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index d9bfe0c6bc0e..217cbfff843b 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2010,20 +2010,30 @@ static void blk_mq_map_swqueue(struct request_queue *q,
+ 	}
+ }
+ 
++/*
++ * Caller needs to ensure that we're either frozen/quiesced, or that
++ * the queue isn't live yet.
++ */
+ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+ {
+ 	struct blk_mq_hw_ctx *hctx;
+ 	int i;
+ 
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+-		if (shared)
++		if (shared) {
++			if (test_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state))
++				atomic_inc(&q->shared_hctx_restart);
+ 			hctx->flags |= BLK_MQ_F_TAG_SHARED;
+-		else
++		} else {
++			if (test_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state))
++				atomic_dec(&q->shared_hctx_restart);
+ 			hctx->flags &= ~BLK_MQ_F_TAG_SHARED;
++		}
+ 	}
+ }
+ 
+-static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set, bool shared)
++static void blk_mq_update_tag_set_depth(struct blk_mq_tag_set *set,
++					bool shared)
+ {
+ 	struct request_queue *q;
+ 
+* Unmerged path include/linux/blkdev.h
