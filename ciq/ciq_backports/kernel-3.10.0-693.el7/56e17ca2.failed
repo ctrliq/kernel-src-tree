@@ -1,0 +1,393 @@
+x86/platform/UV: Initialize PCH GPP_D_0 NMI Pin to be NMI source
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] platform/uv: Initialize PCH GPP_D_0 NMI Pin to be NMI source (Frank Ramsay) [1416460]
+Rebuild_FUZZ: 96.77%
+commit-author travis@sgi.com <travis@sgi.com>
+commit 56e17ca2c5ed31f5812ed8e0694e7ef880068cfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/56e17ca2.failed
+
+The initialize PCH NMI I/O function is separate and may be moved to BIOS
+for security reasons.  This function detects whether the PCH NMI config
+has already been done and if not, it will then initialize the PCH here.
+
+	Signed-off-by: Mike Travis <travis@sgi.com>
+	Reviewed-by: Russ Anderson <rja@hpe.com>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Dimitri Sivanich <sivanich@hpe.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20170125163518.089387859@asylum.americas.sgi.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 56e17ca2c5ed31f5812ed8e0694e7ef880068cfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/uv/uv_nmi.c
+diff --cc arch/x86/platform/uv/uv_nmi.c
+index c6fd36338c09,6a71b087da98..000000000000
+--- a/arch/x86/platform/uv/uv_nmi.c
++++ b/arch/x86/platform/uv/uv_nmi.c
+@@@ -63,9 -64,22 +63,25 @@@
+  
+  static struct uv_hub_nmi_s **uv_hub_nmi_list;
+  
+ -DEFINE_PER_CPU(struct uv_cpu_nmi_s, uv_cpu_nmi);
+ -EXPORT_PER_CPU_SYMBOL_GPL(uv_cpu_nmi);
+ +DEFINE_PER_CPU(struct uv_cpu_nmi_s, __uv_cpu_nmi);
+ +EXPORT_PER_CPU_SYMBOL_GPL(__uv_cpu_nmi);
+  
+++<<<<<<< HEAD
+++=======
++ /* UV hubless values */
++ #define NMI_CONTROL_PORT	0x70
++ #define NMI_DUMMY_PORT		0x71
++ #define PAD_OWN_GPP_D_0		0x2c
++ #define GPI_NMI_STS_GPP_D_0	0x164
++ #define GPI_NMI_ENA_GPP_D_0	0x174
++ #define STS_GPP_D_0_MASK	0x1
++ #define PAD_CFG_DW0_GPP_D_0	0x4c0
++ #define GPIROUTNMI		(1ul << 17)
++ #define PCH_PCR_GPIO_1_BASE	0xfdae0000ul
++ #define PCH_PCR_GPIO_ADDRESS(offset) (int *)((u64)(pch_base) | (u64)(offset))
++ 
++ static u64 *pch_base;
+++>>>>>>> 56e17ca2c5ed (x86/platform/UV: Initialize PCH GPP_D_0 NMI Pin to be NMI source)
+  static unsigned long nmi_mmr;
+  static unsigned long nmi_mmr_clear;
+  static unsigned long nmi_mmr_pending;
+@@@ -143,16 -157,80 +159,93 @@@ module_param_named(wait_count, uv_nmi_w
+  static int uv_nmi_retry_count = 500;
+  module_param_named(retry_count, uv_nmi_retry_count, int, 0644);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Valid NMI Actions:
+ + *  "dump"	- dump process stack for each cpu
+ + *  "ips"	- dump IP info for each cpu
+ + *  "kdump"	- do crash dump
+ + *  "kdb"	- enter KDB (default)
+ + *  "kgdb"	- enter KGDB
+ + */
+ +static char uv_nmi_action[8] = "kdump";
+ +module_param_string(action, uv_nmi_action, sizeof(uv_nmi_action), 0644);
+++=======
++ static bool uv_pch_intr_enable = true;
++ static bool uv_pch_intr_now_enabled;
++ module_param_named(pch_intr_enable, uv_pch_intr_enable, bool, 0644);
++ 
++ static bool uv_pch_init_enable = true;
++ module_param_named(pch_init_enable, uv_pch_init_enable, bool, 0644);
++ 
++ static int uv_nmi_debug;
++ module_param_named(debug, uv_nmi_debug, int, 0644);
++ 
++ #define nmi_debug(fmt, ...)				\
++ 	do {						\
++ 		if (uv_nmi_debug)			\
++ 			pr_info(fmt, ##__VA_ARGS__);	\
++ 	} while (0)
++ 
++ /* Valid NMI Actions */
++ #define	ACTION_LEN	16
++ static struct nmi_action {
++ 	char	*action;
++ 	char	*desc;
++ } valid_acts[] = {
++ 	{	"kdump",	"do kernel crash dump"			},
++ 	{	"dump",		"dump process stack for each cpu"	},
++ 	{	"ips",		"dump Inst Ptr info for each cpu"	},
++ 	{	"kdb",		"enter KDB (needs kgdboc= assignment)"	},
++ 	{	"kgdb",		"enter KGDB (needs gdb target remote)"	},
++ 	{	"health",	"check if CPUs respond to NMI"		},
++ };
++ typedef char action_t[ACTION_LEN];
++ static action_t uv_nmi_action = { "dump" };
++ 
++ static int param_get_action(char *buffer, const struct kernel_param *kp)
++ {
++ 	return sprintf(buffer, "%s\n", uv_nmi_action);
++ }
++ 
++ static int param_set_action(const char *val, const struct kernel_param *kp)
++ {
++ 	int i;
++ 	int n = ARRAY_SIZE(valid_acts);
++ 	char arg[ACTION_LEN], *p;
++ 
++ 	/* (remove possible '\n') */
++ 	strncpy(arg, val, ACTION_LEN - 1);
++ 	arg[ACTION_LEN - 1] = '\0';
++ 	p = strchr(arg, '\n');
++ 	if (p)
++ 		*p = '\0';
++ 
++ 	for (i = 0; i < n; i++)
++ 		if (!strcmp(arg, valid_acts[i].action))
++ 			break;
++ 
++ 	if (i < n) {
++ 		strcpy(uv_nmi_action, arg);
++ 		pr_info("UV: New NMI action:%s\n", uv_nmi_action);
++ 		return 0;
++ 	}
++ 
++ 	pr_err("UV: Invalid NMI action:%s, valid actions are:\n", arg);
++ 	for (i = 0; i < n; i++)
++ 		pr_err("UV: %-8s - %s\n",
++ 			valid_acts[i].action, valid_acts[i].desc);
++ 	return -EINVAL;
++ }
++ 
++ static const struct kernel_param_ops param_ops_action = {
++ 	.get = param_get_action,
++ 	.set = param_set_action,
++ };
++ #define param_check_action(name, p) __param_check(name, p, action_t)
++ 
++ module_param_named(action, uv_nmi_action, action, 0644);
+++>>>>>>> 56e17ca2c5ed (x86/platform/UV: Initialize PCH GPP_D_0 NMI Pin to be NMI source)
+  
+  static inline bool uv_nmi_action_is(const char *action)
+  {
+@@@ -191,6 -269,198 +284,201 @@@ static inline void uv_local_mmr_clear_n
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * UV hubless NMI handler functions
++  */
++ static inline void uv_reassert_nmi(void)
++ {
++ 	/* (from arch/x86/include/asm/mach_traps.h) */
++ 	outb(0x8f, NMI_CONTROL_PORT);
++ 	inb(NMI_DUMMY_PORT);		/* dummy read */
++ 	outb(0x0f, NMI_CONTROL_PORT);
++ 	inb(NMI_DUMMY_PORT);		/* dummy read */
++ }
++ 
++ static void uv_init_hubless_pch_io(int offset, int mask, int data)
++ {
++ 	int *addr = PCH_PCR_GPIO_ADDRESS(offset);
++ 	int readd = readl(addr);
++ 
++ 	if (mask) {			/* OR in new data */
++ 		int writed = (readd & ~mask) | data;
++ 
++ 		nmi_debug("UV:PCH: %p = %x & %x | %x (%x)\n",
++ 			addr, readd, ~mask, data, writed);
++ 		writel(writed, addr);
++ 	} else if (readd & data) {	/* clear status bit */
++ 		nmi_debug("UV:PCH: %p = %x\n", addr, data);
++ 		writel(data, addr);
++ 	}
++ 
++ 	(void)readl(addr);		/* flush write data */
++ }
++ 
++ static void uv_nmi_setup_hubless_intr(void)
++ {
++ 	uv_pch_intr_now_enabled = uv_pch_intr_enable;
++ 
++ 	uv_init_hubless_pch_io(
++ 		PAD_CFG_DW0_GPP_D_0, GPIROUTNMI,
++ 		uv_pch_intr_now_enabled ? GPIROUTNMI : 0);
++ 
++ 	nmi_debug("UV:NMI: GPP_D_0 interrupt %s\n",
++ 		uv_pch_intr_now_enabled ? "enabled" : "disabled");
++ }
++ 
++ static struct init_nmi {
++ 	unsigned int	offset;
++ 	unsigned int	mask;
++ 	unsigned int	data;
++ } init_nmi[] = {
++ 	{	/* HOSTSW_OWN_GPP_D_0 */
++ 	.offset = 0x84,
++ 	.mask = 0x1,
++ 	.data = 0x0,	/* ACPI Mode */
++ 	},
++ 
++ /* clear status */
++ 	{	/* GPI_INT_STS_GPP_D_0 */
++ 	.offset = 0x104,
++ 	.mask = 0x0,
++ 	.data = 0x1,	/* Clear Status */
++ 	},
++ 	{	/* GPI_GPE_STS_GPP_D_0 */
++ 	.offset = 0x124,
++ 	.mask = 0x0,
++ 	.data = 0x1,	/* Clear Status */
++ 	},
++ 	{	/* GPI_SMI_STS_GPP_D_0 */
++ 	.offset = 0x144,
++ 	.mask = 0x0,
++ 	.data = 0x1,	/* Clear Status */
++ 	},
++ 	{	/* GPI_NMI_STS_GPP_D_0 */
++ 	.offset = 0x164,
++ 	.mask = 0x0,
++ 	.data = 0x1,	/* Clear Status */
++ 	},
++ 
++ /* disable interrupts */
++ 	{	/* GPI_INT_EN_GPP_D_0 */
++ 	.offset = 0x114,
++ 	.mask = 0x1,
++ 	.data = 0x0,	/* disable interrupt generation */
++ 	},
++ 	{	/* GPI_GPE_EN_GPP_D_0 */
++ 	.offset = 0x134,
++ 	.mask = 0x1,
++ 	.data = 0x0,	/* disable interrupt generation */
++ 	},
++ 	{	/* GPI_SMI_EN_GPP_D_0 */
++ 	.offset = 0x154,
++ 	.mask = 0x1,
++ 	.data = 0x0,	/* disable interrupt generation */
++ 	},
++ 	{	/* GPI_NMI_EN_GPP_D_0 */
++ 	.offset = 0x174,
++ 	.mask = 0x1,
++ 	.data = 0x0,	/* disable interrupt generation */
++ 	},
++ 
++ /* setup GPP_D_0 Pad Config */
++ 	{	/* PAD_CFG_DW0_GPP_D_0 */
++ 	.offset = 0x4c0,
++ 	.mask = 0xffffffff,
++ 	.data = 0x82020100,
++ /*
++  *  31:30 Pad Reset Config (PADRSTCFG): = 2h  # PLTRST# (default)
++  *
++  *  29    RX Pad State Select (RXPADSTSEL): = 0 # Raw RX pad state directly
++  *                                                from RX buffer (default)
++  *
++  *  28    RX Raw Override to '1' (RXRAW1): = 0 # No Override
++  *
++  *  26:25 RX Level/Edge Configuration (RXEVCFG):
++  *      = 0h # Level
++  *      = 1h # Edge
++  *
++  *  23    RX Invert (RXINV): = 0 # No Inversion (signal active high)
++  *
++  *  20    GPIO Input Route IOxAPIC (GPIROUTIOXAPIC):
++  * = 0 # Routing does not cause peripheral IRQ...
++  *     # (we want an NMI not an IRQ)
++  *
++  *  19    GPIO Input Route SCI (GPIROUTSCI): = 0 # Routing does not cause SCI.
++  *  18    GPIO Input Route SMI (GPIROUTSMI): = 0 # Routing does not cause SMI.
++  *  17    GPIO Input Route NMI (GPIROUTNMI): = 1 # Routing can cause NMI.
++  *
++  *  11:10 Pad Mode (PMODE1/0): = 0h = GPIO control the Pad.
++  *   9    GPIO RX Disable (GPIORXDIS):
++  * = 0 # Enable the input buffer (active low enable)
++  *
++  *   8    GPIO TX Disable (GPIOTXDIS):
++  * = 1 # Disable the output buffer; i.e. Hi-Z
++  *
++  *   1 GPIO RX State (GPIORXSTATE): This is the current internal RX pad state..
++  *   0 GPIO TX State (GPIOTXSTATE):
++  * = 0 # (Leave at default)
++  */
++ 	},
++ 
++ /* Pad Config DW1 */
++ 	{	/* PAD_CFG_DW1_GPP_D_0 */
++ 	.offset = 0x4c4,
++ 	.mask = 0x3c00,
++ 	.data = 0,	/* Termination = none (default) */
++ 	},
++ };
++ 
++ static void uv_init_hubless_pch_d0(void)
++ {
++ 	int i, read;
++ 
++ 	read = *PCH_PCR_GPIO_ADDRESS(PAD_OWN_GPP_D_0);
++ 	if (read != 0) {
++ 		pr_info("UV: Hubless NMI already configured\n");
++ 		return;
++ 	}
++ 
++ 	nmi_debug("UV: Initializing UV Hubless NMI on PCH\n");
++ 	for (i = 0; i < ARRAY_SIZE(init_nmi); i++) {
++ 		uv_init_hubless_pch_io(init_nmi[i].offset,
++ 					init_nmi[i].mask,
++ 					init_nmi[i].data);
++ 	}
++ }
++ 
++ static int uv_nmi_test_hubless(struct uv_hub_nmi_s *hub_nmi)
++ {
++ 	int *pstat = PCH_PCR_GPIO_ADDRESS(GPI_NMI_STS_GPP_D_0);
++ 	int status = *pstat;
++ 
++ 	hub_nmi->nmi_value = status;
++ 	atomic_inc(&hub_nmi->read_mmr_count);
++ 
++ 	if (!(status & STS_GPP_D_0_MASK))	/* Not a UV external NMI */
++ 		return 0;
++ 
++ 	*pstat = STS_GPP_D_0_MASK;	/* Is a UV NMI: clear GPP_D_0 status */
++ 	(void)*pstat;			/* flush write */
++ 
++ 	return 1;
++ }
++ 
++ static int uv_test_nmi(struct uv_hub_nmi_s *hub_nmi)
++ {
++ 	if (hub_nmi->hub_present)
++ 		return uv_nmi_test_mmr(hub_nmi);
++ 
++ 	if (hub_nmi->pch_owner)		/* Only PCH owner can check status */
++ 		return uv_nmi_test_hubless(hub_nmi);
++ 
++ 	return -1;
++ }
++ 
++ /*
+++>>>>>>> 56e17ca2c5ed (x86/platform/UV: Initialize PCH GPP_D_0 NMI Pin to be NMI source)
+   * If first cpu in on this hub, set hub_nmi "in_nmi" and "owner" values and
+   * return true.  If first cpu in on the system, set global "in_nmi" flag.
+   */
+@@@ -723,5 -1036,31 +1011,27 @@@ void uv_nmi_setup(void
+  		uv_hub_nmi_per(cpu) = uv_hub_nmi_list[nid];
+  	}
+  	BUG_ON(!alloc_cpumask_var(&uv_nmi_cpu_mask, GFP_KERNEL));
+ -}
+ -
+ -/* Setup for UV Hub systems */
+ -void __init uv_nmi_setup(void)
+ -{
+ -	uv_nmi_setup_mmrs();
+ -	uv_nmi_setup_common(true);
+  	uv_register_nmi_notifier();
+++<<<<<<< HEAD
+++=======
++ 	pr_info("UV: Hub NMI enabled\n");
++ }
++ 
++ /* Setup for UV Hubless systems */
++ void __init uv_nmi_setup_hubless(void)
++ {
++ 	uv_nmi_setup_common(false);
++ 	pch_base = xlate_dev_mem_ptr(PCH_PCR_GPIO_1_BASE);
++ 	nmi_debug("UV: PCH base:%p from 0x%lx, GPP_D_0\n",
++ 		pch_base, PCH_PCR_GPIO_1_BASE);
++ 	if (uv_pch_init_enable)
++ 		uv_init_hubless_pch_d0();
++ 	uv_init_hubless_pch_io(GPI_NMI_ENA_GPP_D_0,
++ 				STS_GPP_D_0_MASK, STS_GPP_D_0_MASK);
++ 	uv_nmi_setup_hubless_intr();
++ 	/* Ensure NMI enabled in Processor Interface Reg: */
++ 	uv_reassert_nmi();
++ 	uv_register_nmi_notifier();
++ 	pr_info("UV: Hubless NMI enabled\n");
+++>>>>>>> 56e17ca2c5ed (x86/platform/UV: Initialize PCH GPP_D_0 NMI Pin to be NMI source)
+  }
+* Unmerged path arch/x86/platform/uv/uv_nmi.c
