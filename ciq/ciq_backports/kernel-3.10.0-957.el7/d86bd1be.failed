@@ -1,0 +1,194 @@
+mm/slub: support left redzone
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] slub: support left redzone (Christoph von Recklinghausen) [1562140]
+Rebuild_FUZZ: 94.55%
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit d86bd1bece6fc41d59253002db5441fe960a37f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d86bd1be.failed
+
+SLUB already has a redzone debugging feature.  But it is only positioned
+at the end of object (aka right redzone) so it cannot catch left oob.
+Although current object's right redzone acts as left redzone of next
+object, first object in a slab cannot take advantage of this effect.
+This patch explicitly adds a left red zone to each object to detect left
+oob more precisely.
+
+Background:
+
+Someone complained to me that left OOB doesn't catch even if KASAN is
+enabled which does page allocation debugging.  That page is out of our
+control so it would be allocated when left OOB happens and, in this
+case, we can't find OOB.  Moreover, SLUB debugging feature can be
+enabled without page allocator debugging and, in this case, we will miss
+that OOB.
+
+Before trying to implement, I expected that changes would be too
+complex, but, it doesn't look that complex to me now.  Almost changes
+are applied to debug specific functions so I feel okay.
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d86bd1bece6fc41d59253002db5441fe960a37f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 20b1a0c59b8d,2d4d817f3d7a..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -123,6 -124,23 +123,26 @@@ static inline int kmem_cache_debug(stru
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void *fixup_red_left(struct kmem_cache *s, void *p)
++ {
++ 	if (kmem_cache_debug(s) && s->flags & SLAB_RED_ZONE)
++ 		p += s->red_left_pad;
++ 
++ 	return p;
++ }
++ 
++ static inline bool kmem_cache_has_cpu_partial(struct kmem_cache *s)
++ {
++ #ifdef CONFIG_SLUB_CPU_PARTIAL
++ 	return !kmem_cache_debug(s);
++ #else
++ 	return false;
++ #endif
++ }
++ 
+++>>>>>>> d86bd1bece6f (mm/slub: support left redzone)
+  /*
+   * Issues still to be resolved:
+   *
+@@@ -223,29 -240,6 +243,32 @@@ static inline void stat(const struct km
+   * 			Core slab cache functions
+   *******************************************************************/
+  
+++<<<<<<< HEAD
+ +static inline struct kmem_cache_node *get_node(struct kmem_cache *s, int node)
+ +{
+ +	return s->node[node];
+ +}
+ +
+ +/* Verify that a pointer has an address that is valid within a slab page */
+ +static inline int check_valid_pointer(struct kmem_cache *s,
+ +				struct page *page, const void *object)
+ +{
+ +	void *base;
+ +
+ +	if (!object)
+ +		return 1;
+ +
+ +	base = page_address(page);
+ +	if (object < base || object >= base + page->objects * s->size ||
+ +		(object - base) % s->size) {
+ +		return 0;
+ +	}
+ +
+ +	return 1;
+ +}
+ +
+++=======
+++>>>>>>> d86bd1bece6f (mm/slub: support left redzone)
+  static inline void *get_freepointer(struct kmem_cache *s, void *object)
+  {
+  	return *(void **)(object + s->offset);
+@@@ -472,10 -467,48 +513,30 @@@ static int disable_higher_order_debug
+  /*
+   * Object debugging
+   */
++ 
++ /* Verify that a pointer has an address that is valid within a slab page */
++ static inline int check_valid_pointer(struct kmem_cache *s,
++ 				struct page *page, void *object)
++ {
++ 	void *base;
++ 
++ 	if (!object)
++ 		return 1;
++ 
++ 	base = page_address(page);
++ 	object = restore_red_left(s, object);
++ 	if (object < base || object >= base + page->objects * s->size ||
++ 		(object - base) % s->size) {
++ 		return 0;
++ 	}
++ 
++ 	return 1;
++ }
++ 
+  static void print_section(char *text, u8 *addr, unsigned int length)
+  {
+ -	metadata_access_enable();
+  	print_hex_dump(KERN_ERR, text, DUMP_PREFIX_ADDRESS, 16, 1, addr,
+  			length, 1);
+ -	metadata_access_disable();
+  }
+  
+  static struct track *get_track(struct kmem_cache *s, void *object,
+@@@ -604,10 -639,12 +665,12 @@@ static void print_trailer(struct kmem_c
+  
+  	print_page_info(page);
+  
+ -	pr_err("INFO: Object 0x%p @offset=%tu fp=0x%p\n\n",
+ -	       p, p - addr, get_freepointer(s, p));
+ +	printk(KERN_ERR "INFO: Object 0x%p @offset=%tu fp=0x%p\n\n",
+ +			p, p - addr, get_freepointer(s, p));
+  
+- 	if (p > addr + 16)
++ 	if (s->flags & SLAB_RED_ZONE)
++ 		print_section("Redzone ", p - s->red_left_pad, s->red_left_pad);
++ 	else if (p > addr + 16)
+  		print_section("Bytes b4 ", p - 16, 16);
+  
+  	print_section("Object ", p, min_t(unsigned long, s->object_size,
+@@@ -1444,10 -1482,23 +1514,10 @@@ static struct page *new_slab(struct kme
+  			set_freepointer(s, p, NULL);
+  	}
+  
+- 	page->freelist = start;
++ 	page->freelist = fixup_red_left(s, start);
+  	page->inuse = page->objects;
+  	page->frozen = 1;
+ -
+  out:
+ -	if (gfpflags_allow_blocking(flags))
+ -		local_irq_disable();
+ -	if (!page)
+ -		return NULL;
+ -
+ -	mod_zone_page_state(page_zone(page),
+ -		(s->flags & SLAB_RECLAIM_ACCOUNT) ?
+ -		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
+ -		1 << oo_order(oo));
+ -
+ -	inc_slabs_node(s, page_to_nid(page), page->objects);
+ -
+  	return page;
+  }
+  
+diff --git a/include/linux/slub_def.h b/include/linux/slub_def.h
+index 027276fa8713..b3604ee3846f 100644
+--- a/include/linux/slub_def.h
++++ b/include/linux/slub_def.h
+@@ -87,6 +87,7 @@ struct kmem_cache {
+ 	int reserved;		/* Reserved bytes at the end of slabs */
+ 	const char *name;	/* Name (only for display!) */
+ 	struct list_head list;	/* List of slab caches */
++	int red_left_pad;	/* Left redzone padding size */
+ #ifdef CONFIG_SYSFS
+ 	struct kobject kobj;	/* For sysfs */
+ #endif
+* Unmerged path mm/slub.c
