@@ -1,0 +1,518 @@
+mmc: Delete bounce buffer handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] Delete bounce buffer handling (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 92.06%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit de3ee99b097dd51938276e3af388cd4ad0f2750a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/de3ee99b.failed
+
+In may, Steven sent a patch deleting the bounce buffer handling
+and the CONFIG_MMC_BLOCK_BOUNCE option.
+
+I chose the less invasive path of making it a runtime config
+option, and we merged that successfully for kernel v4.12.
+
+The code is however just standing in the way and taking up
+space for seemingly no gain on any systems in wide use today.
+
+Pierre says the code was there to improve speed on TI SDHCI
+controllers on certain HP laptops and possibly some Ricoh
+controllers as well. Early SDHCI controllers lacked the
+scatter-gather feature, which made software bounce buffers
+a significant speed boost.
+
+We are clearly talking about the list of SDHCI PCI-based
+MMC/SD card readers found in the pci_ids[] list in
+drivers/mmc/host/sdhci-pci-core.c.
+
+The TI SDHCI derivative is not supported by the upstream
+kernel. This leaves the Ricoh.
+
+What we can however notice is that the x86 defconfigs in the
+kernel did not enable CONFIG_MMC_BLOCK_BOUNCE option, which
+means that any such laptop would have to have a custom
+configured kernel to actually take advantage of this
+bounce buffer speed-up. It simply seems like there was
+a speed optimization for the Ricoh controllers that noone
+was using. (I have not checked the distro defconfigs but
+I am pretty sure the situation is the same there.)
+
+Bounce buffers increased performance on the OMAP HSMMC
+at one point, and was part of the original submission in
+commit a45c6cb81647 ("[ARM] 5369/1: omap mmc: Add new
+   omap hsmmc controller for 2430 and 34xx, v3")
+
+This optimization was removed in
+commit 0ccd76d4c236 ("omap_hsmmc: Implement scatter-gather
+   emulation")
+which found that scatter-gather emulation provided even
+better performance.
+
+The same was introduced for SDHCI in
+commit 2134a922c6e7 ("sdhci: scatter-gather (ADMA) support")
+
+I am pretty positively convinced that software
+scatter-gather emulation will do for any host controller what
+the bounce buffers were doing. Essentially, the bounce buffer
+was a reimplementation of software scatter-gather-emulation in
+the MMC subsystem, and it should be done away with.
+
+	Cc: Pierre Ossman <pierre@ossman.eu>
+	Cc: Juha Yrjola <juha.yrjola@solidboot.com>
+	Cc: Steven J. Hill <Steven.Hill@cavium.com>
+	Cc: Shawn Lin <shawn.lin@rock-chips.com>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Suggested-by: Steven J. Hill <Steven.Hill@cavium.com>
+	Suggested-by: Shawn Lin <shawn.lin@rock-chips.com>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit de3ee99b097dd51938276e3af388cd4ad0f2750a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.c
+#	drivers/mmc/core/queue.h
+#	drivers/mmc/host/cavium.c
+#	include/linux/mmc/host.h
+diff --cc drivers/mmc/core/block.c
+index bf17147e2808,2ad7b5c69156..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1522,6 -1596,66 +1522,69 @@@ static void mmc_blk_rw_rq_prep(struct m
+  						brq->data.blocks);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (*do_rel_wr)
++ 		mmc_apply_rel_rw(brq, card, req);
++ 
++ 	/*
++ 	 * Data tag is used only during writing meta data to speed
++ 	 * up write and any subsequent read of this meta data
++ 	 */
++ 	*do_data_tag = card->ext_csd.data_tag_unit_size &&
++ 		       (req->cmd_flags & REQ_META) &&
++ 		       (rq_data_dir(req) == WRITE) &&
++ 		       ((brq->data.blocks * brq->data.blksz) >=
++ 			card->ext_csd.data_tag_unit_size);
++ 
++ 	mmc_set_data_timeout(&brq->data, card);
++ 
++ 	brq->data.sg = mqrq->sg;
++ 	brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
++ 
++ 	/*
++ 	 * Adjust the sg list so it is the same size as the
++ 	 * request.
++ 	 */
++ 	if (brq->data.blocks != blk_rq_sectors(req)) {
++ 		int i, data_size = brq->data.blocks << 9;
++ 		struct scatterlist *sg;
++ 
++ 		for_each_sg(brq->data.sg, sg, brq->data.sg_len, i) {
++ 			data_size -= sg->length;
++ 			if (data_size <= 0) {
++ 				sg->length += data_size;
++ 				i++;
++ 				break;
++ 			}
++ 		}
++ 		brq->data.sg_len = i;
++ 	}
++ 
++ 	mqrq->areq.mrq = &brq->mrq;
++ }
++ 
++ static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
++ 			       struct mmc_card *card,
++ 			       int disable_multi,
++ 			       struct mmc_queue *mq)
++ {
++ 	u32 readcmd, writecmd;
++ 	struct mmc_blk_request *brq = &mqrq->brq;
++ 	struct request *req = mmc_queue_req_to_req(mqrq);
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	bool do_rel_wr, do_data_tag;
++ 
++ 	mmc_blk_data_prep(mq, mqrq, disable_multi, &do_rel_wr, &do_data_tag);
++ 
++ 	brq->mrq.cmd = &brq->cmd;
++ 
++ 	brq->cmd.arg = blk_rq_pos(req);
++ 	if (!mmc_card_blockaddr(card))
++ 		brq->cmd.arg <<= 9;
++ 	brq->cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_ADTC;
++ 
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  	if (brq->data.blocks > 1 || do_rel_wr) {
+  		/* SPI multiblock writes terminate using a special
+  		 * token, not a STOP_TRANSMISSION request.
+@@@ -1701,11 -1823,10 +1764,16 @@@ static int mmc_blk_issue_rw_rq(struct m
+  		 * An asynchronous request has been completed and we proceed
+  		 * to handle the result of it.
+  		 */
+ -		mq_rq =	container_of(old_areq, struct mmc_queue_req, areq);
+ +		mq_rq =	container_of(old_areq, struct mmc_queue_req, mmc_active);
+  		brq = &mq_rq->brq;
+++<<<<<<< HEAD
+ +		req = mq_rq->req;
+ +		type = rq_data_dir(req) == READ ? MMC_BLK_READ : MMC_BLK_WRITE;
+ +		mmc_queue_bounce_post(mq_rq);
+++=======
++ 		old_req = mmc_queue_req_to_req(mq_rq);
++ 		type = rq_data_dir(old_req) == READ ? MMC_BLK_READ : MMC_BLK_WRITE;
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  
+  		switch (status) {
+  		case MMC_BLK_SUCCESS:
+diff --cc drivers/mmc/core/queue.c
+index b0ae9d688e28,0a4e77a5ba33..000000000000
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@@ -21,9 -20,9 +21,7 @@@
+  
+  #include "queue.h"
+  #include "block.h"
+ -#include "core.h"
+ -#include "card.h"
+  
+- #define MMC_QUEUE_BOUNCESZ	65536
+- 
+  /*
+   * Prepare a MMC request. This just filters out odd stuff.
+   */
+@@@ -179,83 -145,36 +177,105 @@@ static void mmc_queue_setup_discard(str
+  	if (card->pref_erase > max_discard)
+  		q->limits.discard_granularity = 0;
+  	if (mmc_can_secure_erase_trim(card))
+ -		queue_flag_set_unlocked(QUEUE_FLAG_SECERASE, q);
+ +		queue_flag_set_unlocked(QUEUE_FLAG_SECDISCARD, q);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MMC_BLOCK_BOUNCE
+ +static bool mmc_queue_alloc_bounce_bufs(struct mmc_queue *mq,
+ +					unsigned int bouncesz)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].bounce_buf = kmalloc(bouncesz, GFP_KERNEL);
+ +		if (!mq->mqrq[i].bounce_buf)
+ +			goto out_err;
+ +	}
+ +
+ +	return true;
+ +
+ +out_err:
+ +	while (--i >= 0) {
+ +		kfree(mq->mqrq[i].bounce_buf);
+ +		mq->mqrq[i].bounce_buf = NULL;
+ +	}
+ +	pr_warn("%s: unable to allocate bounce buffers\n",
+ +		mmc_card_name(mq->card));
+ +	return false;
+ +}
+ +
+ +static int mmc_queue_alloc_bounce_sgs(struct mmc_queue *mq,
+ +				      unsigned int bouncesz)
+++=======
++ /**
++  * mmc_init_request() - initialize the MMC-specific per-request data
++  * @q: the request queue
++  * @req: the request
++  * @gfp: memory allocation policy
++  */
++ static int mmc_init_request(struct request_queue *q, struct request *req,
++ 			    gfp_t gfp)
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  {
+ -	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
+ -	struct mmc_queue *mq = q->queuedata;
+ -	struct mmc_card *card = mq->card;
+ -	struct mmc_host *host = card->host;
+ +	int i, ret;
+ +
+++<<<<<<< HEAD
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].sg = mmc_alloc_sg(1, &ret);
+ +		if (ret)
+ +			return ret;
+ +
+ +		mq->mqrq[i].bounce_sg = mmc_alloc_sg(bouncesz / 512, &ret);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	return 0;
+ +}
+ +#endif
+ +
+ +static int mmc_queue_alloc_sgs(struct mmc_queue *mq, int max_segs)
+ +{
+ +	int i, ret;
+  
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].sg = mmc_alloc_sg(max_segs, &ret);
+ +		if (ret)
+ +			return ret;
+ +	}
+++=======
++ 	mq_rq->sg = mmc_alloc_sg(host->max_segs, gfp);
++ 	if (!mq_rq->sg)
++ 		return -ENOMEM;
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  
+  	return 0;
+  }
+  
+ -static void mmc_exit_request(struct request_queue *q, struct request *req)
+ +static void mmc_queue_req_free_bufs(struct mmc_queue_req *mqrq)
+  {
+ -	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
+ +	kfree(mqrq->bounce_sg);
+ +	mqrq->bounce_sg = NULL;
+  
+++<<<<<<< HEAD
+ +	kfree(mqrq->sg);
+ +	mqrq->sg = NULL;
+ +
+ +	kfree(mqrq->bounce_buf);
+ +	mqrq->bounce_buf = NULL;
+ +}
+ +
+ +static void mmc_queue_reqs_free_bufs(struct mmc_queue *mq)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < mq->qdepth; i++)
+ +		mmc_queue_req_free_bufs(&mq->mqrq[i]);
+++=======
++ 	kfree(mq_rq->sg);
++ 	mq_rq->sg = NULL;
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  }
+  
+  /**
+@@@ -276,21 -194,24 +296,25 @@@ int mmc_init_queue(struct mmc_queue *mq
+  	int ret = -ENOMEM;
+  
+  	if (mmc_dev(host)->dma_mask && *mmc_dev(host)->dma_mask)
+++<<<<<<< HEAD
+ +		limit = *mmc_dev(host)->dma_mask;
+++=======
++ 		limit = (u64)dma_max_pfn(mmc_dev(host)) << PAGE_SHIFT;
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  
+  	mq->card = card;
+ -	mq->queue = blk_alloc_queue(GFP_KERNEL);
+ +	mq->queue = blk_init_queue(mmc_request_fn, lock);
+  	if (!mq->queue)
+  		return -ENOMEM;
+ -	mq->queue->queue_lock = lock;
+ -	mq->queue->request_fn = mmc_request_fn;
+ -	mq->queue->init_rq_fn = mmc_init_request;
+ -	mq->queue->exit_rq_fn = mmc_exit_request;
+ -	mq->queue->cmd_size = sizeof(struct mmc_queue_req);
+ +
+ +	mq->qdepth = 2;
+ +	mq->mqrq = kcalloc(mq->qdepth, sizeof(struct mmc_queue_req),
+ +			   GFP_KERNEL);
+ +	if (!mq->mqrq)
+ +		goto blk_cleanup;
+ +	mq->mqrq_cur = &mq->mqrq[0];
+ +	mq->mqrq_prev = &mq->mqrq[1];
+  	mq->queue->queuedata = mq;
+ -	mq->qcnt = 0;
+ -	ret = blk_init_allocated_queue(mq->queue);
+ -	if (ret) {
+ -		blk_cleanup_queue(mq->queue);
+ -		return ret;
+ -	}
+  
+  	blk_queue_prep_rq(mq->queue, mmc_prep_request);
+  	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, mq->queue);
+@@@ -298,45 -219,11 +322,53 @@@
+  	if (mmc_can_erase(card))
+  		mmc_queue_setup_discard(mq->queue, card);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MMC_BLOCK_BOUNCE
+ +	if (host->max_segs == 1) {
+ +		unsigned int bouncesz;
+ +
+ +		bouncesz = MMC_QUEUE_BOUNCESZ;
+ +
+ +		if (bouncesz > host->max_req_size)
+ +			bouncesz = host->max_req_size;
+ +		if (bouncesz > host->max_seg_size)
+ +			bouncesz = host->max_seg_size;
+ +		if (bouncesz > (host->max_blk_count * 512))
+ +			bouncesz = host->max_blk_count * 512;
+ +
+ +		if (bouncesz > 512 &&
+ +		    mmc_queue_alloc_bounce_bufs(mq, bouncesz)) {
+ +			blk_queue_bounce_limit(mq->queue, BLK_BOUNCE_ANY);
+ +			blk_queue_max_hw_sectors(mq->queue, bouncesz / 512);
+ +			blk_queue_max_segments(mq->queue, bouncesz / 512);
+ +			blk_queue_max_segment_size(mq->queue, bouncesz);
+ +
+ +			ret = mmc_queue_alloc_bounce_sgs(mq, bouncesz);
+ +			if (ret)
+ +				goto cleanup_queue;
+ +			bounce = true;
+ +		}
+ +	}
+ +#endif
+ +
+ +	if (!bounce) {
+ +		blk_queue_bounce_limit(mq->queue, limit);
+ +		blk_queue_max_hw_sectors(mq->queue,
+ +			min(host->max_blk_count, host->max_req_size / 512));
+ +		blk_queue_max_segments(mq->queue, host->max_segs);
+ +		blk_queue_max_segment_size(mq->queue, host->max_seg_size);
+ +
+ +		ret = mmc_queue_alloc_sgs(mq, host->max_segs);
+ +		if (ret)
+ +			goto cleanup_queue;
+ +	}
+++=======
++ 	blk_queue_bounce_limit(mq->queue, limit);
++ 	blk_queue_max_hw_sectors(mq->queue,
++ 		min(host->max_blk_count, host->max_req_size / 512));
++ 	blk_queue_max_segments(mq->queue, host->max_segs);
++ 	blk_queue_max_segment_size(mq->queue, host->max_seg_size);
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  
+  	sema_init(&mq->thread_sem, 1);
+  
+@@@ -433,55 -312,7 +465,61 @@@ void mmc_queue_resume(struct mmc_queue 
+   */
+  unsigned int mmc_queue_map_sg(struct mmc_queue *mq, struct mmc_queue_req *mqrq)
+  {
+++<<<<<<< HEAD
+ +	unsigned int sg_len;
+ +	size_t buflen;
+ +	struct scatterlist *sg;
+ +	int i;
+ +
+ +	if (!mqrq->bounce_buf)
+ +		return blk_rq_map_sg(mq->queue, mqrq->req, mqrq->sg);
+ +
+ +	sg_len = blk_rq_map_sg(mq->queue, mqrq->req, mqrq->bounce_sg);
+ +
+ +	mqrq->bounce_sg_len = sg_len;
+ +
+ +	buflen = 0;
+ +	for_each_sg(mqrq->bounce_sg, sg, sg_len, i)
+ +		buflen += sg->length;
+ +
+ +	sg_init_one(mqrq->sg, mqrq->bounce_buf, buflen);
+ +
+ +	return 1;
+ +}
+ +
+ +/*
+ + * If writing, bounce the data to the buffer before the request
+ + * is sent to the host driver
+ + */
+ +void mmc_queue_bounce_pre(struct mmc_queue_req *mqrq)
+ +{
+ +	if (!mqrq->bounce_buf)
+ +		return;
+ +
+ +	if (rq_data_dir(mqrq->req) != WRITE)
+ +		return;
+ +
+ +	sg_copy_to_buffer(mqrq->bounce_sg, mqrq->bounce_sg_len,
+ +		mqrq->bounce_buf, mqrq->sg[0].length);
+ +}
+ +
+ +/*
+ + * If reading, bounce the data from the buffer after the request
+ + * has been handled by the host driver
+ + */
+ +void mmc_queue_bounce_post(struct mmc_queue_req *mqrq)
+ +{
+ +	if (!mqrq->bounce_buf)
+ +		return;
+ +
+ +	if (rq_data_dir(mqrq->req) != READ)
+ +		return;
+ +
+ +	sg_copy_from_buffer(mqrq->bounce_sg, mqrq->bounce_sg_len,
+ +		mqrq->bounce_buf, mqrq->sg[0].length);
+++=======
++ 	struct request *req = mmc_queue_req_to_req(mqrq);
++ 
++ 	return blk_rq_map_sg(mq->queue, req, mqrq->sg);
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  }
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,f18d3f656baa..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -16,14 -32,28 +16,22 @@@ struct mmc_blk_request 
+  	int			retune_retry_done;
+  };
+  
+ -/**
+ - * enum mmc_drv_op - enumerates the operations in the mmc_queue_req
+ - * @MMC_DRV_OP_IOCTL: ioctl operation
+ - * @MMC_DRV_OP_BOOT_WP: write protect boot partitions
+ - * @MMC_DRV_OP_GET_CARD_STATUS: get card status
+ - * @MMC_DRV_OP_GET_EXT_CSD: get the EXT CSD from an eMMC card
+ - */
+ -enum mmc_drv_op {
+ -	MMC_DRV_OP_IOCTL,
+ -	MMC_DRV_OP_BOOT_WP,
+ -	MMC_DRV_OP_GET_CARD_STATUS,
+ -	MMC_DRV_OP_GET_EXT_CSD,
+ -};
+ -
+  struct mmc_queue_req {
+ +	struct request		*req;
+  	struct mmc_blk_request	brq;
+  	struct scatterlist	*sg;
+++<<<<<<< HEAD
+ +	char			*bounce_buf;
+ +	struct scatterlist	*bounce_sg;
+ +	unsigned int		bounce_sg_len;
+ +	struct mmc_async_req	mmc_active;
+++=======
++ 	struct mmc_async_req	areq;
++ 	enum mmc_drv_op		drv_op;
++ 	int			drv_op_result;
++ 	void			*drv_op_data;
++ 	unsigned int		ioc_count;
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  };
+  
+  struct mmc_queue {
+diff --cc include/linux/mmc/host.h
+index 3d6f7a820ea1,9a43763a68ad..000000000000
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@@ -273,6 -316,7 +273,10 @@@ struct mmc_host 
+  #define MMC_CAP_UHS_SDR50	(1 << 18)	/* Host supports UHS SDR50 mode */
+  #define MMC_CAP_UHS_SDR104	(1 << 19)	/* Host supports UHS SDR104 mode */
+  #define MMC_CAP_UHS_DDR50	(1 << 20)	/* Host supports UHS DDR50 mode */
+++<<<<<<< HEAD
+++=======
++ /* (1 << 21) is free for reuse */
+++>>>>>>> de3ee99b097d (mmc: Delete bounce buffer handling)
+  #define MMC_CAP_DRIVER_TYPE_A	(1 << 23)	/* Host supports Driver Type A */
+  #define MMC_CAP_DRIVER_TYPE_C	(1 << 24)	/* Host supports Driver Type C */
+  #define MMC_CAP_DRIVER_TYPE_D	(1 << 25)	/* Host supports Driver Type D */
+* Unmerged path drivers/mmc/host/cavium.c
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.c
+* Unmerged path drivers/mmc/core/queue.h
+* Unmerged path drivers/mmc/host/cavium.c
+* Unmerged path include/linux/mmc/host.h
