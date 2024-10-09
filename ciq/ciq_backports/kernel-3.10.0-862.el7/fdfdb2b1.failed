@@ -1,0 +1,225 @@
+intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit fdfdb2b1301670a69195ba1e5666df4a7f02eb46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fdfdb2b1.failed
+
+After commit a4675fbc4a7a (cpufreq: intel_pstate: Replace timers with
+utilization update callbacks) wrmsrl_on_cpu() cannot be called in the
+intel_pstate_adjust_busy_pstate() path as that is executed with
+disabled interrupts.  However, atom_set_pstate() called from there
+via intel_pstate_set_pstate() uses wrmsrl_on_cpu() to update the
+IA32_PERF_CTL MSR which triggers the WARN_ON_ONCE() in
+smp_call_function_single().
+
+The reason why wrmsrl_on_cpu() is used by atom_set_pstate() is
+because intel_pstate_set_pstate() calling it is also invoked during
+the initialization and cleanup of the driver and in those cases it is
+not guaranteed to be run on the CPU that is being updated.  However,
+in the case when intel_pstate_set_pstate() is called by
+intel_pstate_adjust_busy_pstate(), wrmsrl() can be used to update
+the register safely.  Moreover, intel_pstate_set_pstate() already
+contains code that only is executed if the function is called by
+intel_pstate_adjust_busy_pstate() and there is a special argument
+passed to it because of that.
+
+To fix the problem at hand, rearrange the code taking the above
+observations into account.
+
+First, replace the ->set() callback in struct pstate_funcs with a
+->get_val() one that will return the value to be written to the
+IA32_PERF_CTL MSR without updating the register.
+
+Second, split intel_pstate_set_pstate() into two functions,
+intel_pstate_update_pstate() to be called by
+intel_pstate_adjust_busy_pstate() that will contain all of the
+intel_pstate_set_pstate() code which only needs to be executed in
+that case and will use wrmsrl() to update the MSR (after obtaining
+the value to write to it from the ->get_val() callback), and
+intel_pstate_set_min_pstate() to be invoked during the
+initialization and cleanup that will set the P-state to the
+minimum one and will update the MSR using wrmsrl_on_cpu().
+
+Finally, move the code shared between intel_pstate_update_pstate()
+and intel_pstate_set_min_pstate() to a new static inline function
+intel_pstate_record_pstate() and make them both call it.
+
+Of course, that unifies the handling of the IA32_PERF_CTL MSR writes
+between Atom and Core.
+
+Fixes: a4675fbc4a7a (cpufreq: intel_pstate: Replace timers with utilization update callbacks)
+Reported-and-tested-by: Josh Boyer <jwboyer@fedoraproject.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit fdfdb2b1301670a69195ba1e5666df4a7f02eb46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 5e3c944b968b,4b644526fd59..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -602,15 -585,25 +602,13 @@@ static u64 atom_get_val(struct cpudata 
+  	if (pstate > cpudata->pstate.max_pstate)
+  		vid = cpudata->vid.turbo;
+  
+- 	val |= vid;
+- 
+- 	wrmsrl_on_cpu(cpudata->cpu, MSR_IA32_PERF_CTL, val);
++ 	return val | vid;
+  }
+  
+ -static int silvermont_get_scaling(void)
+ -{
+ -	u64 value;
+ -	int i;
+ -	/* Defined in Table 35-6 from SDM (Sept 2015) */
+ -	static int silvermont_freq_table[] = {
+ -		83300, 100000, 133300, 116700, 80000};
+ -
+ -	rdmsrl(MSR_FSB_FREQ, value);
+ -	i = value & 0x7;
+ -	WARN_ON(i > 4);
+ -
+ -	return silvermont_freq_table[i];
+ -}
+ +#define ATOM_BCLK_FREQS 5
+ +static int atom_freq_table[ATOM_BCLK_FREQS] = { 833, 1000, 1333, 1167, 800};
+  
+ -static int airmont_get_scaling(void)
+ +static int atom_get_scaling(void)
+  {
+  	u64 value;
+  	int i;
+@@@ -721,7 -717,7 +719,11 @@@ static u64 core_get_val(struct cpudata 
+  	if (limits->no_turbo && !limits->turbo_disabled)
+  		val |= (u64)1 << 32;
+  
+++<<<<<<< HEAD
+ +	wrmsrl_on_cpu(cpudata->cpu, MSR_IA32_PERF_CTL, val);
+++=======
++ 	return val;
+++>>>>>>> fdfdb2b13016 (intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts)
+  }
+  
+  static int knl_get_turbo_pstate(void)
+@@@ -771,8 -767,29 +773,34 @@@ static struct cpu_defaults atom_params 
+  		.get_max_physical = atom_get_max_pstate,
+  		.get_min = atom_get_min_pstate,
+  		.get_turbo = atom_get_turbo_pstate,
+++<<<<<<< HEAD
+ +		.set = atom_set_pstate,
+ +		.get_scaling = atom_get_scaling,
+++=======
++ 		.get_val = atom_get_val,
++ 		.get_scaling = silvermont_get_scaling,
++ 		.get_vid = atom_get_vid,
++ 		.get_target_pstate = get_target_pstate_use_cpu_load,
++ 	},
++ };
++ 
++ static struct cpu_defaults airmont_params = {
++ 	.pid_policy = {
++ 		.sample_rate_ms = 10,
++ 		.deadband = 0,
++ 		.setpoint = 60,
++ 		.p_gain_pct = 14,
++ 		.d_gain_pct = 0,
++ 		.i_gain_pct = 4,
++ 	},
++ 	.funcs = {
++ 		.get_max = atom_get_max_pstate,
++ 		.get_max_physical = atom_get_max_pstate,
++ 		.get_min = atom_get_min_pstate,
++ 		.get_turbo = atom_get_turbo_pstate,
++ 		.get_val = atom_get_val,
++ 		.get_scaling = airmont_get_scaling,
+++>>>>>>> fdfdb2b13016 (intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts)
+  		.get_vid = atom_get_vid,
+  		.get_target_pstate = get_target_pstate_use_cpu_load,
+  	},
+@@@ -820,24 -837,24 +848,40 @@@ static void intel_pstate_get_min_max(st
+  	*min = clamp_t(int, min_perf, cpu->pstate.min_pstate, max_perf);
+  }
+  
+++<<<<<<< HEAD
+ +static void intel_pstate_set_pstate(struct cpudata *cpu, int pstate)
+ +{
+ +	int max_perf, min_perf;
+ +
+ +	update_turbo_state();
+ +
+ +	intel_pstate_get_min_max(cpu, &min_perf, &max_perf);
+ +
+ +	pstate = clamp_t(int, pstate, min_perf, max_perf);
+ +
+ +	if (pstate == cpu->pstate.current_pstate)
+ +		return;
+ +
+++=======
++ static inline void intel_pstate_record_pstate(struct cpudata *cpu, int pstate)
++ {
+++>>>>>>> fdfdb2b13016 (intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts)
+  	trace_cpu_frequency(pstate * cpu->pstate.scaling, cpu->cpu);
+- 
+  	cpu->pstate.current_pstate = pstate;
++ }
++ 
++ static void intel_pstate_set_min_pstate(struct cpudata *cpu)
++ {
++ 	int pstate = cpu->pstate.min_pstate;
+  
+- 	pstate_funcs.set(cpu, pstate);
++ 	intel_pstate_record_pstate(cpu, pstate);
++ 	/*
++ 	 * Generally, there is no guarantee that this code will always run on
++ 	 * the CPU being updated, so force the register update to run on the
++ 	 * right CPU.
++ 	 */
++ 	wrmsrl_on_cpu(cpu->cpu, MSR_IA32_PERF_CTL,
++ 		      pstate_funcs.get_val(cpu, pstate));
+  }
+  
+  static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
+@@@ -850,7 -867,8 +894,12 @@@
+  
+  	if (pstate_funcs.get_vid)
+  		pstate_funcs.get_vid(cpu);
+++<<<<<<< HEAD
+ +	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+++=======
++ 
++ 	intel_pstate_set_min_pstate(cpu);
+++>>>>>>> fdfdb2b13016 (intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts)
+  }
+  
+  static inline void intel_pstate_calc_busy(struct cpudata *cpu)
+@@@ -1005,7 -1019,7 +1069,11 @@@ static inline void intel_pstate_adjust_
+  
+  	target_pstate = pstate_funcs.get_target_pstate(cpu);
+  
+++<<<<<<< HEAD
+ +	intel_pstate_set_pstate(cpu, target_pstate);
+++=======
++ 	intel_pstate_update_pstate(cpu, target_pstate);
+++>>>>>>> fdfdb2b13016 (intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts)
+  
+  	sample = &cpu->sample;
+  	trace_pstate_sample(fp_toint(sample->core_pct_busy),
+@@@ -1202,7 -1193,7 +1270,11 @@@ static void intel_pstate_stop_cpu(struc
+  	if (hwp_active)
+  		return;
+  
+++<<<<<<< HEAD
+ +	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+++=======
++ 	intel_pstate_set_min_pstate(cpu);
+++>>>>>>> fdfdb2b13016 (intel_pstate: Do not call wrmsrl_on_cpu() with disabled interrupts)
+  }
+  
+  static int intel_pstate_cpu_init(struct cpufreq_policy *policy)
+* Unmerged path drivers/cpufreq/intel_pstate.c
