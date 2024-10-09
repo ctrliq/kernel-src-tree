@@ -1,0 +1,162 @@
+net/mlx4_en: Replace TXBB_SIZE multiplications with shift operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Replace TXBB_SIZE multiplications with shift operations (Don Dutile) [1499363 1456692]
+Rebuild_FUZZ: 96.97%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 9573e0d39ff8d7d1e0bcc10e23d18b9cbc4ca14e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9573e0d3.failed
+
+Define LOG_TXBB_SIZE, log of TXBB_SIZE, and use it with a shift
+operation instead of a multiplication with TXBB_SIZE.
+Operations are equivalent as TXBB_SIZE is a power of two.
+
+Performance tests:
+Tested on ConnectX3Pro, Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+
+Gain is too small to be measurable, no degradation sensed.
+Results are similar for IPv4 and IPv6.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Cc: kernel-team@fb.com
+	Cc: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9573e0d39ff8d7d1e0bcc10e23d18b9cbc4ca14e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 8c25cc789ee8,efc4411b1e44..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@@ -265,13 -264,13 +266,13 @@@ static void mlx4_en_stamp_wqe(struct ml
+  }
+  
+  
+ -u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
+ -			 struct mlx4_en_tx_ring *ring,
+ -			 int index, u64 timestamp,
+ -			 int napi_mode)
+ +static u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
+ +				struct mlx4_en_tx_ring *ring,
+ +				int index, u8 owner, u64 timestamp,
+ +				int napi_mode)
+  {
+  	struct mlx4_en_tx_info *tx_info = &ring->tx_info[index];
+- 	struct mlx4_en_tx_desc *tx_desc = ring->buf + index * TXBB_SIZE;
++ 	struct mlx4_en_tx_desc *tx_desc = ring->buf + (index << LOG_TXBB_SIZE);
+  	struct mlx4_wqe_data_seg *data = (void *) tx_desc + tx_info->data_offset;
+  	void *end = ring->buf + ring->buf_size;
+  	struct sk_buff *skb = tx_info->skb;
+@@@ -1076,3 -1097,88 +1078,91 @@@ tx_drop
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX4_EN_XDP_TX_NRTXBB  1
++ #define MLX4_EN_XDP_TX_REAL_SZ (((CTRL_SIZE + MLX4_EN_XDP_TX_NRTXBB * DS_SIZE) \
++ 				 / 16) & 0x3f)
++ 
++ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_ring *rx_ring,
++ 			       struct mlx4_en_rx_alloc *frame,
++ 			       struct net_device *dev, unsigned int length,
++ 			       int tx_ind, bool *doorbell_pending)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	union mlx4_wqe_qpn_vlan	qpn_vlan = {};
++ 	struct mlx4_en_tx_desc *tx_desc;
++ 	struct mlx4_en_tx_info *tx_info;
++ 	struct mlx4_wqe_data_seg *data;
++ 	struct mlx4_en_tx_ring *ring;
++ 	dma_addr_t dma;
++ 	__be32 op_own;
++ 	int index;
++ 
++ 	if (unlikely(!priv->port_up))
++ 		goto tx_drop;
++ 
++ 	ring = priv->tx_ring[TX_XDP][tx_ind];
++ 
++ 	if (unlikely(mlx4_en_is_tx_ring_full(ring)))
++ 		goto tx_drop_count;
++ 
++ 	index = ring->prod & ring->size_mask;
++ 	tx_info = &ring->tx_info[index];
++ 
++ 	/* Track current inflight packets for performance analysis */
++ 	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
++ 			 (u32)(ring->prod - READ_ONCE(ring->cons) - 1));
++ 
++ 	tx_desc = ring->buf + (index << LOG_TXBB_SIZE);
++ 	data = &tx_desc->data;
++ 
++ 	dma = frame->dma;
++ 
++ 	tx_info->page = frame->page;
++ 	frame->page = NULL;
++ 	tx_info->map0_dma = dma;
++ 	tx_info->map0_byte_count = PAGE_SIZE;
++ 	tx_info->nr_txbb = MLX4_EN_XDP_TX_NRTXBB;
++ 	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
++ 	tx_info->data_offset = offsetof(struct mlx4_en_tx_desc, data);
++ 	tx_info->ts_requested = 0;
++ 	tx_info->nr_maps = 1;
++ 	tx_info->linear = 1;
++ 	tx_info->inl = 0;
++ 
++ 	dma_sync_single_range_for_device(priv->ddev, dma, frame->page_offset,
++ 					 length, PCI_DMA_TODEVICE);
++ 
++ 	data->addr = cpu_to_be64(dma + frame->page_offset);
++ 	data->lkey = ring->mr_key;
++ 	dma_wmb();
++ 	data->byte_count = cpu_to_be32(length);
++ 
++ 	/* tx completion can avoid cache line miss for common cases */
++ 	tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
++ 
++ 	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
++ 		((ring->prod & ring->size) ?
++ 		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
++ 
++ 	rx_ring->xdp_tx++;
++ 	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
++ 
++ 	ring->prod += MLX4_EN_XDP_TX_NRTXBB;
++ 
++ 	qpn_vlan.fence_size = MLX4_EN_XDP_TX_REAL_SZ;
++ 
++ 	mlx4_en_tx_write_desc(ring, tx_desc, qpn_vlan, TXBB_SIZE, 0,
++ 			      op_own, false, false);
++ 	*doorbell_pending = true;
++ 
++ 	return NETDEV_TX_OK;
++ 
++ tx_drop_count:
++ 	rx_ring->xdp_tx_full++;
++ 	*doorbell_pending = true;
++ tx_drop:
++ 	return NETDEV_TX_BUSY;
++ }
+++>>>>>>> 9573e0d39ff8 (net/mlx4_en: Replace TXBB_SIZE multiplications with shift operations)
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index c8bcd3a38f69..32547479483d 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -72,7 +72,8 @@
+ #define DEF_RX_RINGS		16
+ #define MAX_RX_RINGS		128
+ #define MIN_RX_RINGS		4
+-#define TXBB_SIZE		64
++#define LOG_TXBB_SIZE		6
++#define TXBB_SIZE		BIT(LOG_TXBB_SIZE)
+ #define HEADROOM		(2048 / TXBB_SIZE + 1)
+ #define STAMP_STRIDE		64
+ #define STAMP_DWORDS		(STAMP_STRIDE / 4)
