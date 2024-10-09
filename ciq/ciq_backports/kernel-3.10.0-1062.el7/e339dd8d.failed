@@ -1,0 +1,90 @@
+xfs: use sync buffer I/O for sync delwri queue submission
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit e339dd8d8b045399e918c6737b2cc435b21a451e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e339dd8d.failed
+
+If a delwri queue occurs of a buffer that sits on a delwri queue
+wait list, the queue sets _XBF_DELWRI_Q without changing the state
+of ->b_list. This occurs, for example, if another thread beats the
+current delwri waiter thread to the buffer lock after I/O
+completion. Once the waiter acquires the lock, it removes the buffer
+from the wait list and leaves a buffer with _XBF_DELWRI_Q set but
+not populated on a list. This results in a lost buffer submission
+and in turn can result in assert failures due to _XBF_DELWRI_Q being
+set on buffer reclaim or filesystem lockups if the buffer happens to
+cover an item in the AIL.
+
+This problem has been reproduced by repeated iterations of xfs/305
+on high CPU count (28xcpu) systems with limited memory (~1GB). Dirty
+dquot reclaim races with an xfsaild push of a separate dquot backed
+by the same buffer such that the buffer sits on the reclaim wait
+list at the time xfsaild attempts to queue it. Since the latter
+dquot has been flush locked but the underlying buffer not submitted
+for I/O, the dquot pins the AIL and causes the filesystem to
+livelock.
+
+This race is essentially made possible by the buffer lock cycle
+involved with waiting on a synchronous delwri queue submission.
+Close the race by using synchronous buffer I/O for respective delwri
+queue submission. This means the buffer remains locked across the
+I/O and so is inaccessible from other contexts while in the
+intermediate wait list state. The sync buffer I/O wait mechanism is
+factored into a helper such that sync delwri buffer submission and
+serialization are batched operations.
+
+Designed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit e339dd8d8b045399e918c6737b2cc435b21a451e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index e9479a72798b,ef234847b4e6..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -2003,21 -2016,22 +2007,27 @@@ xfs_buf_delwri_submit_buffers
+  		trace_xfs_buf_delwri_split(bp, _RET_IP_);
+  
+  		/*
+- 		 * We do all IO submission async. This means if we need
+- 		 * to wait for IO completion we need to take an extra
+- 		 * reference so the buffer is still valid on the other
+- 		 * side. We need to move the buffer onto the io_list
+- 		 * at this point so the caller can still access it.
++ 		 * If we have a wait list, each buffer (and associated delwri
++ 		 * queue reference) transfers to it and is submitted
++ 		 * synchronously. Otherwise, drop the buffer from the delwri
++ 		 * queue and submit async.
+  		 */
+++<<<<<<< HEAD
+ +		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_ASYNC | XBF_WRITE_FAIL);
+ +		bp->b_flags |= XBF_WRITE | XBF_ASYNC;
+++=======
++ 		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_WRITE_FAIL);
++ 		bp->b_flags |= XBF_WRITE;
+++>>>>>>> e339dd8d8b04 (xfs: use sync buffer I/O for sync delwri queue submission)
+  		if (wait_list) {
+- 			xfs_buf_hold(bp);
++ 			bp->b_flags &= ~XBF_ASYNC;
+  			list_move_tail(&bp->b_list, wait_list);
+- 		} else
++ 			__xfs_buf_submit(bp);
++ 		} else {
++ 			bp->b_flags |= XBF_ASYNC;
+  			list_del_init(&bp->b_list);
+- 
+- 		xfs_buf_submit(bp);
++ 			xfs_buf_submit(bp);
++ 		}
+  	}
+  	blk_finish_plug(&plug);
+  
+* Unmerged path fs/xfs/xfs_buf.c
