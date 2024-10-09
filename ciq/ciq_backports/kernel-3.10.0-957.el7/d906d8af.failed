@@ -1,0 +1,124 @@
+tcmu: fix module removal due to stuck thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit d906d8af28e524bfa62c49cb2315f6ccdb910938
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d906d8af.failed
+
+We need to do a kthread_should_stop to check when kthread_stop has been
+called.
+
+This was a regression added in
+
+b6df4b79a5514a9c6c53533436704129ef45bf76
+tcmu: Add global data block pool support
+
+so not sure if you wanted to merge it in with that patch or what.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit d906d8af28e524bfa62c49cb2315f6ccdb910938)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,9045837f748b..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1650,9 -1545,87 +1650,90 @@@ static struct target_backend_ops tcmu_o
+  	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int unmap_thread_fn(void *data)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	uint32_t start, end, block;
++ 	struct page *page;
++ 	int i;
++ 
++ 	while (1) {
++ 		DEFINE_WAIT(__wait);
++ 
++ 		prepare_to_wait(&unmap_wait, &__wait, TASK_INTERRUPTIBLE);
++ 		schedule();
++ 		finish_wait(&unmap_wait, &__wait);
++ 
++ 		if (kthread_should_stop())
++ 			break;
++ 
++ 		mutex_lock(&root_udev_mutex);
++ 		list_for_each_entry(udev, &root_udev, node) {
++ 			mutex_lock(&udev->cmdr_lock);
++ 
++ 			/* Try to complete the finished commands first */
++ 			tcmu_handle_completions(udev);
++ 
++ 			/* Skip the udevs waiting the global pool or in idle */
++ 			if (udev->waiting_global || !udev->dbi_thresh) {
++ 				mutex_unlock(&udev->cmdr_lock);
++ 				continue;
++ 			}
++ 
++ 			end = udev->dbi_max + 1;
++ 			block = find_last_bit(udev->data_bitmap, end);
++ 			if (block == udev->dbi_max) {
++ 				/*
++ 				 * The last bit is dbi_max, so there is
++ 				 * no need to shrink any blocks.
++ 				 */
++ 				mutex_unlock(&udev->cmdr_lock);
++ 				continue;
++ 			} else if (block == end) {
++ 				/* The current udev will goto idle state */
++ 				udev->dbi_thresh = start = 0;
++ 				udev->dbi_max = 0;
++ 			} else {
++ 				udev->dbi_thresh = start = block + 1;
++ 				udev->dbi_max = block;
++ 			}
++ 
++ 			/* Here will truncate the data area from off */
++ 			off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 			unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 			/* Release the block pages */
++ 			for (i = start; i < end; i++) {
++ 				page = radix_tree_delete(&udev->data_blocks, i);
++ 				if (page) {
++ 					__free_page(page);
++ 					atomic_dec(&global_db_count);
++ 				}
++ 			}
++ 			mutex_unlock(&udev->cmdr_lock);
++ 		}
++ 
++ 		/*
++ 		 * Try to wake up the udevs who are waiting
++ 		 * for the global data pool.
++ 		 */
++ 		list_for_each_entry(udev, &root_udev, node) {
++ 			if (udev->waiting_global)
++ 				wake_up(&udev->wait_cmdr);
++ 		}
++ 		mutex_unlock(&root_udev_mutex);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> d906d8af28e5 (tcmu: fix module removal due to stuck thread)
+  static int __init tcmu_module_init(void)
+  {
+ -	int ret, i, len = 0;
+ +	int ret, i, k, len = 0;
+  
+  	BUILD_BUG_ON((sizeof(struct tcmu_cmd_entry) % TCMU_OP_ALIGN_SIZE) != 0);
+  
+* Unmerged path drivers/target/target_core_user.c
