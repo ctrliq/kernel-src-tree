@@ -1,0 +1,176 @@
+tcmu: merge common block release code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit bf99ec13327bb5b0f6475aea8735c0ca34cc2a26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bf99ec13.failed
+
+Have unmap_thread_fn use tcmu_blocks_release.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit bf99ec13327bb5b0f6475aea8735c0ca34cc2a26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,d9fd91ee8282..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1058,6 -1283,68 +1058,71 @@@ static int tcmu_open(struct uio_info *i
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcmu_dev_call_rcu(struct rcu_head *p)
++ {
++ 	struct se_device *dev = container_of(p, struct se_device, rcu_head);
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 
++ 	kfree(udev->uio_info.name);
++ 	kfree(udev->name);
++ 	kfree(udev);
++ }
++ 
++ static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
++ {
++ 	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
++ 		kmem_cache_free(tcmu_cmd_cache, cmd);
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static void tcmu_blocks_release(struct radix_tree_root *blocks,
++ 				int start, int end)
++ {
++ 	int i;
++ 	struct page *page;
++ 
++ 	for (i = start; i < end; i++) {
++ 		page = radix_tree_delete(blocks, i);
++ 		if (page) {
++ 			__free_page(page);
++ 			atomic_dec(&global_db_count);
++ 		}
++ 	}
++ }
++ 
++ static void tcmu_dev_kref_release(struct kref *kref)
++ {
++ 	struct tcmu_dev *udev = container_of(kref, struct tcmu_dev, kref);
++ 	struct se_device *dev = &udev->se_dev;
++ 	struct tcmu_cmd *cmd;
++ 	bool all_expired = true;
++ 	int i;
++ 
++ 	vfree(udev->mb_addr);
++ 	udev->mb_addr = NULL;
++ 
++ 	/* Upper layer should drain all requests before calling this */
++ 	spin_lock_irq(&udev->commands_lock);
++ 	idr_for_each_entry(&udev->commands, cmd, i) {
++ 		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
++ 			all_expired = false;
++ 	}
++ 	idr_destroy(&udev->commands);
++ 	spin_unlock_irq(&udev->commands_lock);
++ 	WARN_ON(!all_expired);
++ 
++ 	mutex_lock(&udev->cmdr_lock);
++ 	tcmu_blocks_release(&udev->data_blocks, 0, udev->dbi_max + 1);
++ 	mutex_unlock(&udev->cmdr_lock);
++ 
++ 	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
++ }
++ 
+++>>>>>>> bf99ec13327b (tcmu: merge common block release code)
+  static int tcmu_release(struct uio_info *info, struct inode *inode)
+  {
+  	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+@@@ -1650,6 -1973,76 +1715,79 @@@ static struct target_backend_ops tcmu_o
+  	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int unmap_thread_fn(void *data)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	uint32_t start, end, block;
++ 
++ 	while (!kthread_should_stop()) {
++ 		DEFINE_WAIT(__wait);
++ 
++ 		prepare_to_wait(&unmap_wait, &__wait, TASK_INTERRUPTIBLE);
++ 		schedule();
++ 		finish_wait(&unmap_wait, &__wait);
++ 
++ 		if (kthread_should_stop())
++ 			break;
++ 
++ 		mutex_lock(&root_udev_mutex);
++ 		list_for_each_entry(udev, &root_udev, node) {
++ 			mutex_lock(&udev->cmdr_lock);
++ 
++ 			/* Try to complete the finished commands first */
++ 			tcmu_handle_completions(udev);
++ 
++ 			/* Skip the udevs waiting the global pool or in idle */
++ 			if (udev->waiting_global || !udev->dbi_thresh) {
++ 				mutex_unlock(&udev->cmdr_lock);
++ 				continue;
++ 			}
++ 
++ 			end = udev->dbi_max + 1;
++ 			block = find_last_bit(udev->data_bitmap, end);
++ 			if (block == udev->dbi_max) {
++ 				/*
++ 				 * The last bit is dbi_max, so there is
++ 				 * no need to shrink any blocks.
++ 				 */
++ 				mutex_unlock(&udev->cmdr_lock);
++ 				continue;
++ 			} else if (block == end) {
++ 				/* The current udev will goto idle state */
++ 				udev->dbi_thresh = start = 0;
++ 				udev->dbi_max = 0;
++ 			} else {
++ 				udev->dbi_thresh = start = block + 1;
++ 				udev->dbi_max = block;
++ 			}
++ 
++ 			/* Here will truncate the data area from off */
++ 			off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 			unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 			/* Release the block pages */
++ 			tcmu_blocks_release(&udev->data_blocks, start, end);
++ 			mutex_unlock(&udev->cmdr_lock);
++ 		}
++ 
++ 		/*
++ 		 * Try to wake up the udevs who are waiting
++ 		 * for the global data pool.
++ 		 */
++ 		list_for_each_entry(udev, &root_udev, node) {
++ 			if (udev->waiting_global)
++ 				wake_up(&udev->wait_cmdr);
++ 		}
++ 		mutex_unlock(&root_udev_mutex);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> bf99ec13327b (tcmu: merge common block release code)
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+* Unmerged path drivers/target/target_core_user.c
