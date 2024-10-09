@@ -37,7 +37,7 @@
 #define IBMVNIC_RX_WEIGHT		16
 /* when changing this, update IBMVNIC_IO_ENTITLEMENT_DEFAULT */
 #define IBMVNIC_BUFFS_PER_POOL	100
-#define IBMVNIC_MAX_TX_QUEUES	5
+#define IBMVNIC_MAX_QUEUES	5
 
 struct ibmvnic_login_buffer {
 	__be32 len;
