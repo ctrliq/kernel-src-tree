@@ -1,0 +1,149 @@
+mm: fix locking order in mm_take_all_locks()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] fix locking order in mm_take_all_locks() (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 95.24%
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 88f306b68cbb36e500da4b9601b2e3d13dd683c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/88f306b6.failed
+
+Dmitry Vyukov has reported[1] possible deadlock (triggered by his
+syzkaller fuzzer):
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&hugetlbfs_i_mmap_rwsem_key);
+                               lock(&mapping->i_mmap_rwsem);
+                               lock(&hugetlbfs_i_mmap_rwsem_key);
+  lock(&mapping->i_mmap_rwsem);
+
+Both traces points to mm_take_all_locks() as a source of the problem.
+It doesn't take care about ordering or hugetlbfs_i_mmap_rwsem_key (aka
+mapping->i_mmap_rwsem for hugetlb mapping) vs.  i_mmap_rwsem.
+
+huge_pmd_share() does memory allocation under hugetlbfs_i_mmap_rwsem_key
+and allocator can take i_mmap_rwsem if it hit reclaim.  So we need to
+take i_mmap_rwsem from all hugetlb VMAs before taking i_mmap_rwsem from
+rest of VMAs.
+
+The patch also documents locking order for hugetlbfs_i_mmap_rwsem_key.
+
+[1] http://lkml.kernel.org/r/CACT4Y+Zu95tBs-0EvdiAKzUOsb4tczRRfCRTpLr4bg_OP9HuVg@mail.gmail.com
+
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Reviewed-by: Michal Hocko <mhocko@suse.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 88f306b68cbb36e500da4b9601b2e3d13dd683c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/hugetlbfs/inode.c
+#	mm/mmap.c
+#	mm/rmap.c
+diff --cc fs/hugetlbfs/inode.c
+index bf25a49de3ab,bbc333b01ca3..000000000000
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@@ -648,12 -706,12 +648,17 @@@ static struct inode *hugetlbfs_get_root
+  }
+  
+  /*
+ - * Hugetlbfs is not reclaimable; therefore its i_mmap_rwsem will never
+ + * Hugetlbfs is not reclaimable; therefore its i_mmap_mutex will never
+   * be taken from reclaim -- unlike regular filesystems. This needs an
+++<<<<<<< HEAD
+ + * annotation because huge_pmd_share() does an allocation under
+ + * i_mmap_mutex.
+++=======
++  * annotation because huge_pmd_share() does an allocation under hugetlb's
++  * i_mmap_rwsem.
+++>>>>>>> 88f306b68cbb (mm: fix locking order in mm_take_all_locks())
+   */
+ -static struct lock_class_key hugetlbfs_i_mmap_rwsem_key;
+ +struct lock_class_key hugetlbfs_i_mmap_mutex_key;
+  
+  static struct inode *hugetlbfs_get_inode(struct super_block *sb,
+  					struct inode *dir,
+diff --cc mm/mmap.c
+index 2cc2556c0b9f,84b12624ceb0..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -3105,10 -3184,16 +3105,23 @@@ static void vm_lock_mapping(struct mm_s
+   * mapping->flags avoid to take the same lock twice, if more than one
+   * vma in this mm is backed by the same anon_vma or address_space.
+   *
+++<<<<<<< HEAD
+ + * We can take all the locks in random order because the VM code
+ + * taking i_mmap_mutex or anon_vma->rwsem outside the mmap_sem never
+ + * takes more than one of them in a row. Secondly we're protected
+ + * against a concurrent mm_take_all_locks() by the mm_all_locks_mutex.
+++=======
++  * We take locks in following order, accordingly to comment at beginning
++  * of mm/rmap.c:
++  *   - all hugetlbfs_i_mmap_rwsem_key locks (aka mapping->i_mmap_rwsem for
++  *     hugetlb mapping);
++  *   - all i_mmap_rwsem locks;
++  *   - all anon_vma->rwseml
++  *
++  * We can take all locks within these types randomly because the VM code
++  * doesn't nest them and we protected from parallel mm_take_all_locks() by
++  * mm_all_locks_mutex.
+++>>>>>>> 88f306b68cbb (mm: fix locking order in mm_take_all_locks())
+   *
+   * mm_take_all_locks() and mm_drop_all_locks are expensive operations
+   * that may have to take thousand of locks.
+diff --cc mm/rmap.c
+index 651b49d02afd,79f3bf047f38..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -23,19 -23,22 +23,38 @@@
+   * inode->i_mutex	(while writing or truncating, not reading or faulting)
+   *   mm->mmap_sem
+   *     page->flags PG_locked (lock_page)
+++<<<<<<< HEAD
+ + *       mapping->i_mmap_mutex
+ + *         anon_vma->rwsem
+ + *           mm->page_table_lock or pte_lock
+ + *             zone->lru_lock (in mark_page_accessed, isolate_lru_page)
+ + *             swap_lock (in swap_duplicate, swap_info_get)
+ + *               mmlist_lock (in mmput, drain_mmlist and others)
+ + *               mapping->private_lock (in __set_page_dirty_buffers)
+ + *               inode->i_lock (in set_page_dirty's __mark_inode_dirty)
+ + *               bdi.wb->list_lock (in set_page_dirty's __mark_inode_dirty)
+ + *                 sb_lock (within inode_lock in fs/fs-writeback.c)
+ + *                 mapping->tree_lock (widely used, in set_page_dirty,
+ + *                           in arch-dependent flush_dcache_mmap_lock,
+ + *                           within bdi.wb->list_lock in __sync_single_inode)
+++=======
++  *       hugetlbfs_i_mmap_rwsem_key (in huge_pmd_share)
++  *         mapping->i_mmap_rwsem
++  *           anon_vma->rwsem
++  *             mm->page_table_lock or pte_lock
++  *               zone->lru_lock (in mark_page_accessed, isolate_lru_page)
++  *               swap_lock (in swap_duplicate, swap_info_get)
++  *                 mmlist_lock (in mmput, drain_mmlist and others)
++  *                 mapping->private_lock (in __set_page_dirty_buffers)
++  *                   mem_cgroup_{begin,end}_page_stat (memcg->move_lock)
++  *                     mapping->tree_lock (widely used)
++  *                 inode->i_lock (in set_page_dirty's __mark_inode_dirty)
++  *                 bdi.wb->list_lock (in set_page_dirty's __mark_inode_dirty)
++  *                   sb_lock (within inode_lock in fs/fs-writeback.c)
++  *                   mapping->tree_lock (widely used, in set_page_dirty,
++  *                             in arch-dependent flush_dcache_mmap_lock,
++  *                             within bdi.wb->list_lock in __sync_single_inode)
+++>>>>>>> 88f306b68cbb (mm: fix locking order in mm_take_all_locks())
+   *
+   * anon_vma->rwsem,mapping->i_mutex      (memory_failure, collect_procs_anon)
+   *   ->tasklist_lock
+* Unmerged path fs/hugetlbfs/inode.c
+* Unmerged path mm/mmap.c
+* Unmerged path mm/rmap.c
