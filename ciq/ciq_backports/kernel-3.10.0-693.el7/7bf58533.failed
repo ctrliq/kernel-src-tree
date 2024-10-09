@@ -1,0 +1,159 @@
+nvme: don't pass the full CQE to nvme_complete_async_event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] don't pass the full CQE to nvme_complete_async_event (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 94.55%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7bf58533a0bc257edff883619befe7e5a1e8caca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7bf58533.failed
+
+We only need the status and result fields, and passing them explicitly
+makes life a lot easier for the Fibre Channel transport which doesn't
+have a full CQE for the fast path case.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 7bf58533a0bc257edff883619befe7e5a1e8caca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+#	drivers/nvme/host/pci.c
+#	drivers/nvme/host/rdma.c
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/host/core.c
+index 0588703d149f,53584d21c805..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1393,11 -1865,74 +1393,70 @@@ void nvme_remove_namespaces(struct nvme
+  {
+  	struct nvme_ns *ns, *next;
+  
+ -	/*
+ -	 * The dead states indicates the controller was not gracefully
+ -	 * disconnected. In that case, we won't be able to flush any data while
+ -	 * removing the namespaces' disks; fail all the queues now to avoid
+ -	 * potentially having to clean up the failed sync later.
+ -	 */
+ -	if (ctrl->state == NVME_CTRL_DEAD)
+ -		nvme_kill_queues(ctrl);
+ -
+ +	mutex_lock(&ctrl->namespaces_mutex);
+  	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list)
+  		nvme_ns_remove(ns);
+ +	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(nvme_remove_namespaces);
++ 
++ static void nvme_async_event_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl =
++ 		container_of(work, struct nvme_ctrl, async_event_work);
++ 
++ 	spin_lock_irq(&ctrl->lock);
++ 	while (ctrl->event_limit > 0) {
++ 		int aer_idx = --ctrl->event_limit;
++ 
++ 		spin_unlock_irq(&ctrl->lock);
++ 		ctrl->ops->submit_async_event(ctrl, aer_idx);
++ 		spin_lock_irq(&ctrl->lock);
++ 	}
++ 	spin_unlock_irq(&ctrl->lock);
++ }
++ 
++ void nvme_complete_async_event(struct nvme_ctrl *ctrl, __le16 status,
++ 		union nvme_result *res)
++ {
++ 	u32 result = le32_to_cpu(res->u32);
++ 	bool done = true;
++ 
++ 	switch (le16_to_cpu(status) >> 1) {
++ 	case NVME_SC_SUCCESS:
++ 		done = false;
++ 		/*FALLTHRU*/
++ 	case NVME_SC_ABORT_REQ:
++ 		++ctrl->event_limit;
++ 		schedule_work(&ctrl->async_event_work);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	if (done)
++ 		return;
++ 
++ 	switch (result & 0xff07) {
++ 	case NVME_AER_NOTICE_NS_CHANGED:
++ 		dev_info(ctrl->device, "rescanning\n");
++ 		nvme_queue_scan(ctrl);
++ 		break;
++ 	default:
++ 		dev_warn(ctrl->device, "async event result %08x\n", result);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(nvme_complete_async_event);
++ 
++ void nvme_queue_async_events(struct nvme_ctrl *ctrl)
++ {
++ 	ctrl->event_limit = NVME_NR_AERS;
++ 	schedule_work(&ctrl->async_event_work);
++ }
++ EXPORT_SYMBOL_GPL(nvme_queue_async_events);
+++>>>>>>> 7bf58533a0bc (nvme: don't pass the full CQE to nvme_complete_async_event)
+  
+  static DEFINE_IDA(nvme_instance_ida);
+  
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,468fc445bf35..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -238,9 -271,14 +238,17 @@@ void nvme_uninit_ctrl(struct nvme_ctrl 
+  void nvme_put_ctrl(struct nvme_ctrl *ctrl);
+  int nvme_init_identify(struct nvme_ctrl *ctrl);
+  
+ -void nvme_queue_scan(struct nvme_ctrl *ctrl);
+ +void nvme_scan_namespaces(struct nvme_ctrl *ctrl);
+  void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
+  
+++<<<<<<< HEAD
+++=======
++ #define NVME_NR_AERS	1
++ void nvme_complete_async_event(struct nvme_ctrl *ctrl, __le16 status,
++ 		union nvme_result *res);
++ void nvme_queue_async_events(struct nvme_ctrl *ctrl);
++ 
+++>>>>>>> 7bf58533a0bc (nvme: don't pass the full CQE to nvme_complete_async_event)
+  void nvme_stop_queues(struct nvme_ctrl *ctrl);
+  void nvme_start_queues(struct nvme_ctrl *ctrl);
+  void nvme_kill_queues(struct nvme_ctrl *ctrl);
+diff --cc drivers/nvme/host/pci.c
+index 82e66e32363e,51d13d5ec7a8..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -694,7 -703,8 +694,12 @@@ static int nvme_process_cq(struct nvme_
+  		 */
+  		if (unlikely(nvmeq->qid == 0 &&
+  				cqe.command_id >= NVME_AQ_BLKMQ_DEPTH)) {
+++<<<<<<< HEAD
+ +			nvme_complete_async_event(nvmeq->dev, &cqe);
+++=======
++ 			nvme_complete_async_event(&nvmeq->dev->ctrl,
++ 					cqe.status, &cqe.result);
+++>>>>>>> 7bf58533a0bc (nvme: don't pass the full CQE to nvme_complete_async_event)
+  			continue;
+  		}
+  
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/nvme/host/pci.c
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
