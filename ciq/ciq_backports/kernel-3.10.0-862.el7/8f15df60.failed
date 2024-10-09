@@ -1,0 +1,152 @@
+nfp: add phys_switch_id support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Simon Horman <simon.horman@netronome.com>
+commit 8f15df600dff00c8f28c8588bdd4dca55dff690b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8f15df60.failed
+
+Add phys_switch_id support by allowing lookup of
+SWITCHDEV_ATTR_ID_PORT_PARENT_ID via the nfp_repr_port_attr_get
+switchdev operation.
+
+This is visible to user-space in the phys_switch_id attribute
+of a netdev.
+
+e.g.
+
+cd /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0
+find . -name phys_switch_id | xargs grep .
+./net/eth3/phys_switch_id:00154d1300bd
+./net/eth4/phys_switch_id:00154d1300bd
+./net/eth2/phys_switch_id:00154d1300bd
+grep: ./net/eth5/phys_switch_id: Operation not supported
+
+In the above eth2 and eth3 and representor netdevs for the first and second
+physical port. eth4 is the representor for the PF. And eth5 is the PF netdev.
+
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8f15df600dff00c8f28c8588bdd4dca55dff690b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,b5834525c5f0..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -58,13 -61,17 +58,14 @@@
+  #include <linux/log2.h>
+  #include <linux/if_vlan.h>
+  #include <linux/random.h>
+ -#include <linux/vmalloc.h>
+ +
+  #include <linux/ktime.h>
+  
++ #include <net/switchdev.h>
+  #include <net/vxlan.h>
+  
+ -#include "nfpcore/nfp_nsp.h"
+ -#include "nfp_app.h"
+  #include "nfp_net_ctrl.h"
+  #include "nfp_net.h"
+ -#include "nfp_port.h"
+  
+  /**
+   * nfp_net_get_fw_version() - Read and parse the FW version
+@@@ -2820,9 -3693,77 +2821,78 @@@ int nfp_net_netdev_init(struct net_devi
+  
+  	netdev->features = netdev->hw_features;
+  
+ -	if (nfp_app_has_tc(nn->app))
+ -		netdev->hw_features |= NETIF_F_HW_TC;
+ -
+  	/* Advertise but disable TSO by default. */
+  	netdev->features &= ~(NETIF_F_TSO | NETIF_F_TSO6);
+++<<<<<<< HEAD
+ +	nn->dp.ctrl &= ~NFP_NET_CFG_CTRL_LSO;
+++=======
++ 	nn->dp.ctrl &= ~NFP_NET_CFG_CTRL_LSO_ANY;
++ 
++ 	/* Finalise the netdev setup */
++ 	netdev->netdev_ops = &nfp_net_netdev_ops;
++ 	netdev->watchdog_timeo = msecs_to_jiffies(5 * 1000);
++ 
++ 	SWITCHDEV_SET_OPS(netdev, &nfp_port_switchdev_ops);
++ 
++ 	/* MTU range: 68 - hw-specific max */
++ 	netdev->min_mtu = ETH_MIN_MTU;
++ 	netdev->max_mtu = nn->max_mtu;
++ 
++ 	netif_carrier_off(netdev);
++ 
++ 	nfp_net_set_ethtool_ops(netdev);
++ }
++ 
++ /**
++  * nfp_net_init() - Initialise/finalise the nfp_net structure
++  * @nn:		NFP Net device structure
++  *
++  * Return: 0 on success or negative errno on error.
++  */
++ int nfp_net_init(struct nfp_net *nn)
++ {
++ 	int err;
++ 
++ 	nn->dp.rx_dma_dir = DMA_FROM_DEVICE;
++ 
++ 	/* Get some of the read-only fields from the BAR */
++ 	nn->cap = nn_readl(nn, NFP_NET_CFG_CAP);
++ 	nn->max_mtu = nn_readl(nn, NFP_NET_CFG_MAX_MTU);
++ 
++ 	/* Chained metadata is signalled by capabilities except in version 4 */
++ 	nn->dp.chained_metadata_format = nn->fw_ver.major == 4 ||
++ 					 !nn->dp.netdev ||
++ 					 nn->cap & NFP_NET_CFG_CTRL_CHAIN_META;
++ 	if (nn->dp.chained_metadata_format && nn->fw_ver.major != 4)
++ 		nn->cap &= ~NFP_NET_CFG_CTRL_RSS;
++ 
++ 	/* Determine RX packet/metadata boundary offset */
++ 	if (nn->fw_ver.major >= 2) {
++ 		u32 reg;
++ 
++ 		reg = nn_readl(nn, NFP_NET_CFG_RX_OFFSET);
++ 		if (reg > NFP_NET_MAX_PREPEND) {
++ 			nn_err(nn, "Invalid rx offset: %d\n", reg);
++ 			return -EINVAL;
++ 		}
++ 		nn->dp.rx_offset = reg;
++ 	} else {
++ 		nn->dp.rx_offset = NFP_NET_RX_OFFSET;
++ 	}
++ 
++ 	/* Set default MTU and Freelist buffer size */
++ 	if (nn->max_mtu < NFP_NET_DEFAULT_MTU)
++ 		nn->dp.mtu = nn->max_mtu;
++ 	else
++ 		nn->dp.mtu = NFP_NET_DEFAULT_MTU;
++ 	nn->dp.fl_bufsz = nfp_net_calc_fl_bufsz(&nn->dp);
++ 
++ 	if (nn->cap & NFP_NET_CFG_CTRL_RSS_ANY) {
++ 		nfp_net_rss_init(nn);
++ 		nn->dp.ctrl |= nn->cap & NFP_NET_CFG_CTRL_RSS2 ?:
++ 					 NFP_NET_CFG_CTRL_RSS;
++ 	}
+++>>>>>>> 8f15df600dff (nfp: add phys_switch_id support)
+  
+  	/* Allow L2 Broadcast and Multicast through by default, if supported */
+  	if (nn->cap & NFP_NET_CFG_CTRL_L2BC)
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
