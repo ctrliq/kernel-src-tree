@@ -952,6 +952,7 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
 				       truncate_size, truncate_seq);
 	}
 
+	req->r_abort_on_full = true;
 	req->r_flags = flags;
 	req->r_base_oloc.pool = ceph_file_layout_pg_pool(*layout);
 	ceph_oid_printf(&req->r_base_oid, "%llx.%08llx", vino.ino, objnum);
@@ -1613,6 +1614,7 @@ static void maybe_request_map(struct ceph_osd_client *osdc)
 		ceph_monc_renew_subs(&osdc->client->monc);
 }
 
+static void complete_request(struct ceph_osd_request *req, int err);
 static void send_map_check(struct ceph_osd_request *req);
 
 static void __submit_request(struct ceph_osd_request *req, bool wrlocked)
@@ -1622,6 +1624,7 @@ static void __submit_request(struct ceph_osd_request *req, bool wrlocked)
 	enum calc_target_result ct_res;
 	bool need_send = false;
 	bool promoted = false;
+	bool need_abort = false;
 
 	WARN_ON(req->r_tid);
 	dout("%s req %p wrlocked %d\n", __func__, req, wrlocked);
@@ -1656,6 +1659,8 @@ again:
 		pr_warn_ratelimited("FULL or reached pool quota\n");
 		req->r_t.paused = true;
 		maybe_request_map(osdc);
+		if (req->r_abort_on_full)
+			need_abort = true;
 	} else if (!osd_homeless(osd)) {
 		need_send = true;
 	} else {
@@ -1672,6 +1677,8 @@ again:
 	link_request(osd, req);
 	if (need_send)
 		send_request(req);
+	else if (need_abort)
+		complete_request(req, -ENOSPC);
 	mutex_unlock(&osd->lock);
 
 	if (ct_res == CALC_TARGET_POOL_DNE)
