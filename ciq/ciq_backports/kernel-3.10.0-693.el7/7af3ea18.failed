@@ -1,0 +1,225 @@
+libceph: stop allocating a new cipher on every crypto request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 7af3ea189a9a13f090de51c97f676215dabc1205
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7af3ea18.failed
+
+This is useless and more importantly not allowed on the writeback path,
+because crypto_alloc_skcipher() allocates memory with GFP_KERNEL, which
+can recurse back into the filesystem:
+
+    kworker/9:3     D ffff92303f318180     0 20732      2 0x00000080
+    Workqueue: ceph-msgr ceph_con_workfn [libceph]
+     ffff923035dd4480 ffff923038f8a0c0 0000000000000001 000000009eb27318
+     ffff92269eb28000 ffff92269eb27338 ffff923036b145ac ffff923035dd4480
+     00000000ffffffff ffff923036b145b0 ffffffff951eb4e1 ffff923036b145a8
+    Call Trace:
+     [<ffffffff951eb4e1>] ? schedule+0x31/0x80
+     [<ffffffff951eb77a>] ? schedule_preempt_disabled+0xa/0x10
+     [<ffffffff951ed1f4>] ? __mutex_lock_slowpath+0xb4/0x130
+     [<ffffffff951ed28b>] ? mutex_lock+0x1b/0x30
+     [<ffffffffc0a974b3>] ? xfs_reclaim_inodes_ag+0x233/0x2d0 [xfs]
+     [<ffffffff94d92ba5>] ? move_active_pages_to_lru+0x125/0x270
+     [<ffffffff94f2b985>] ? radix_tree_gang_lookup_tag+0xc5/0x1c0
+     [<ffffffff94dad0f3>] ? __list_lru_walk_one.isra.3+0x33/0x120
+     [<ffffffffc0a98331>] ? xfs_reclaim_inodes_nr+0x31/0x40 [xfs]
+     [<ffffffff94e05bfe>] ? super_cache_scan+0x17e/0x190
+     [<ffffffff94d919f3>] ? shrink_slab.part.38+0x1e3/0x3d0
+     [<ffffffff94d9616a>] ? shrink_node+0x10a/0x320
+     [<ffffffff94d96474>] ? do_try_to_free_pages+0xf4/0x350
+     [<ffffffff94d967ba>] ? try_to_free_pages+0xea/0x1b0
+     [<ffffffff94d863bd>] ? __alloc_pages_nodemask+0x61d/0xe60
+     [<ffffffff94ddf42d>] ? cache_grow_begin+0x9d/0x560
+     [<ffffffff94ddfb88>] ? fallback_alloc+0x148/0x1c0
+     [<ffffffff94ed84e7>] ? __crypto_alloc_tfm+0x37/0x130
+     [<ffffffff94de09db>] ? __kmalloc+0x1eb/0x580
+     [<ffffffffc09fe2db>] ? crush_choose_firstn+0x3eb/0x470 [libceph]
+     [<ffffffff94ed84e7>] ? __crypto_alloc_tfm+0x37/0x130
+     [<ffffffff94ed9c19>] ? crypto_spawn_tfm+0x39/0x60
+     [<ffffffffc08b30a3>] ? crypto_cbc_init_tfm+0x23/0x40 [cbc]
+     [<ffffffff94ed857c>] ? __crypto_alloc_tfm+0xcc/0x130
+     [<ffffffff94edcc23>] ? crypto_skcipher_init_tfm+0x113/0x180
+     [<ffffffff94ed7cc3>] ? crypto_create_tfm+0x43/0xb0
+     [<ffffffff94ed83b0>] ? crypto_larval_lookup+0x150/0x150
+     [<ffffffff94ed7da2>] ? crypto_alloc_tfm+0x72/0x120
+     [<ffffffffc0a01dd7>] ? ceph_aes_encrypt2+0x67/0x400 [libceph]
+     [<ffffffffc09fd264>] ? ceph_pg_to_up_acting_osds+0x84/0x5b0 [libceph]
+     [<ffffffff950d40a0>] ? release_sock+0x40/0x90
+     [<ffffffff95139f94>] ? tcp_recvmsg+0x4b4/0xae0
+     [<ffffffffc0a02714>] ? ceph_encrypt2+0x54/0xc0 [libceph]
+     [<ffffffffc0a02b4d>] ? ceph_x_encrypt+0x5d/0x90 [libceph]
+     [<ffffffffc0a02bdf>] ? calcu_signature+0x5f/0x90 [libceph]
+     [<ffffffffc0a02ef5>] ? ceph_x_sign_message+0x35/0x50 [libceph]
+     [<ffffffffc09e948c>] ? prepare_write_message_footer+0x5c/0xa0 [libceph]
+     [<ffffffffc09ecd18>] ? ceph_con_workfn+0x2258/0x2dd0 [libceph]
+     [<ffffffffc09e9903>] ? queue_con_delay+0x33/0xd0 [libceph]
+     [<ffffffffc09f68ed>] ? __submit_request+0x20d/0x2f0 [libceph]
+     [<ffffffffc09f6ef8>] ? ceph_osdc_start_request+0x28/0x30 [libceph]
+     [<ffffffffc0b52603>] ? rbd_queue_workfn+0x2f3/0x350 [rbd]
+     [<ffffffff94c94ec0>] ? process_one_work+0x160/0x410
+     [<ffffffff94c951bd>] ? worker_thread+0x4d/0x480
+     [<ffffffff94c95170>] ? process_one_work+0x410/0x410
+     [<ffffffff94c9af8d>] ? kthread+0xcd/0xf0
+     [<ffffffff951efb2f>] ? ret_from_fork+0x1f/0x40
+     [<ffffffff94c9aec0>] ? kthread_create_on_node+0x190/0x190
+
+Allocating the cipher along with the key fixes the issue - as long the
+key doesn't change, a single cipher context can be used concurrently in
+multiple requests.
+
+We still can't take that GFP_KERNEL allocation though.  Both
+ceph_crypto_key_clone() and ceph_crypto_key_decode() are called from
+GFP_NOFS context, so resort to memalloc_noio_{save,restore}() here.
+
+	Reported-by: Lucas Stach <l.stach@pengutronix.de>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: Sage Weil <sage@redhat.com>
+(cherry picked from commit 7af3ea189a9a13f090de51c97f676215dabc1205)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/crypto.c
+diff --cc net/ceph/crypto.c
+index 627deded6778,3949ce70be07..000000000000
+--- a/net/ceph/crypto.c
++++ b/net/ceph/crypto.c
+@@@ -164,64 -208,67 +207,102 @@@ static void teardown_sgtable(struct sg_
+  		sg_free_table(sgt);
+  }
+  
+ -static int ceph_aes_crypt(const struct ceph_crypto_key *key, bool encrypt,
+ -			  void *buf, int buf_len, int in_len, int *pout_len)
+ +static int ceph_aes_encrypt(const void *key, int key_len,
+ +			    void *dst, size_t *dst_len,
+ +			    const void *src, size_t src_len)
+  {
+++<<<<<<< HEAD
+ +	struct scatterlist sg_in[2], prealloc_sg;
+ +	struct sg_table sg_out;
+ +	struct crypto_skcipher *tfm = ceph_crypto_alloc_cipher();
+ +	SKCIPHER_REQUEST_ON_STACK(req, tfm);
+++=======
++ 	SKCIPHER_REQUEST_ON_STACK(req, key->tfm);
++ 	struct sg_table sgt;
++ 	struct scatterlist prealloc_sg;
++ 	char iv[AES_BLOCK_SIZE];
++ 	int pad_byte = AES_BLOCK_SIZE - (in_len & (AES_BLOCK_SIZE - 1));
++ 	int crypt_len = encrypt ? in_len + pad_byte : in_len;
+++>>>>>>> 7af3ea189a9a (libceph: stop allocating a new cipher on every crypto request)
+  	int ret;
+ +	char iv[AES_BLOCK_SIZE];
+ +	size_t zero_padding = (0x10 - (src_len & 0x0f));
+ +	char pad[16];
+ +
+++<<<<<<< HEAD
+ +	if (IS_ERR(tfm))
+ +		return PTR_ERR(tfm);
+ +
+ +	memset(pad, zero_padding, zero_padding);
+  
+ +	*dst_len = src_len + zero_padding;
+ +
+ +	sg_init_table(sg_in, 2);
+ +	sg_set_buf(&sg_in[0], src, src_len);
+ +	sg_set_buf(&sg_in[1], pad, zero_padding);
+ +	ret = setup_sgtable(&sg_out, &prealloc_sg, dst, *dst_len);
+++=======
++ 	WARN_ON(crypt_len > buf_len);
++ 	if (encrypt)
++ 		memset(buf + in_len, pad_byte, pad_byte);
++ 	ret = setup_sgtable(&sgt, &prealloc_sg, buf, crypt_len);
+++>>>>>>> 7af3ea189a9a (libceph: stop allocating a new cipher on every crypto request)
+  	if (ret)
+- 		goto out_tfm;
++ 		return ret;
+  
+++<<<<<<< HEAD
+ +	crypto_skcipher_setkey((void *)tfm, key, key_len);
+++=======
+++>>>>>>> 7af3ea189a9a (libceph: stop allocating a new cipher on every crypto request)
+  	memcpy(iv, aes_iv, AES_BLOCK_SIZE);
+- 
+- 	skcipher_request_set_tfm(req, tfm);
++ 	skcipher_request_set_tfm(req, key->tfm);
+  	skcipher_request_set_callback(req, 0, NULL, NULL);
+ -	skcipher_request_set_crypt(req, sgt.sgl, sgt.sgl, crypt_len, iv);
+ +	skcipher_request_set_crypt(req, sg_in, sg_out.sgl,
+ +				   src_len + zero_padding, iv);
+  
+  	/*
+ -	print_hex_dump(KERN_ERR, "key: ", DUMP_PREFIX_NONE, 16, 1,
+ -		       key->key, key->len, 1);
+ -	print_hex_dump(KERN_ERR, " in: ", DUMP_PREFIX_NONE, 16, 1,
+ -		       buf, crypt_len, 1);
+ +	print_hex_dump(KERN_ERR, "enc key: ", DUMP_PREFIX_NONE, 16, 1,
+ +		       key, key_len, 1);
+ +	print_hex_dump(KERN_ERR, "enc src: ", DUMP_PREFIX_NONE, 16, 1,
+ +			src, src_len, 1);
+ +	print_hex_dump(KERN_ERR, "enc pad: ", DUMP_PREFIX_NONE, 16, 1,
+ +			pad, zero_padding, 1);
+  	*/
+ -	if (encrypt)
+ -		ret = crypto_skcipher_encrypt(req);
+ -	else
+ -		ret = crypto_skcipher_decrypt(req);
+ +	ret = crypto_skcipher_encrypt(req);
+  	skcipher_request_zero(req);
+ -	if (ret) {
+ -		pr_err("%s %scrypt failed: %d\n", __func__,
+ -		       encrypt ? "en" : "de", ret);
+ -		goto out_sgt;
+ +	if (ret < 0) {
+ +		pr_err("ceph_aes_crypt failed %d\n", ret);
+ +		goto out_sg;
+  	}
+  	/*
+ -	print_hex_dump(KERN_ERR, "out: ", DUMP_PREFIX_NONE, 16, 1,
+ -		       buf, crypt_len, 1);
+ +	print_hex_dump(KERN_ERR, "enc out: ", DUMP_PREFIX_NONE, 16, 1,
+ +		       dst, *dst_len, 1);
+  	*/
+  
+++<<<<<<< HEAD
+ +out_sg:
+ +	teardown_sgtable(&sg_out);
+ +out_tfm:
+ +	crypto_free_skcipher(tfm);
+++=======
++ 	if (encrypt) {
++ 		*pout_len = crypt_len;
++ 	} else {
++ 		pad_byte = *(char *)(buf + in_len - 1);
++ 		if (pad_byte > 0 && pad_byte <= AES_BLOCK_SIZE &&
++ 		    in_len >= pad_byte) {
++ 			*pout_len = in_len - pad_byte;
++ 		} else {
++ 			pr_err("%s got bad padding %d on in_len %d\n",
++ 			       __func__, pad_byte, in_len);
++ 			ret = -EPERM;
++ 			goto out_sgt;
++ 		}
++ 	}
++ 
++ out_sgt:
++ 	teardown_sgtable(&sgt);
+++>>>>>>> 7af3ea189a9a (libceph: stop allocating a new cipher on every crypto request)
+  	return ret;
+  }
+  
+* Unmerged path net/ceph/crypto.c
+diff --git a/net/ceph/crypto.h b/net/ceph/crypto.h
+index 02b569479ffe..0924e5e6981f 100644
+--- a/net/ceph/crypto.h
++++ b/net/ceph/crypto.h
+@@ -12,6 +12,7 @@ struct ceph_crypto_key {
+ 	struct ceph_timespec created;
+ 	int len;
+ 	void *key;
++	struct crypto_skcipher *tfm;
+ };
+ 
+ int ceph_crypto_key_clone(struct ceph_crypto_key *dst,
