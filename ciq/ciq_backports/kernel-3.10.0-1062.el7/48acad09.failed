@@ -1,0 +1,264 @@
+scsi: qla2xxx: Fix N2N link re-connect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Fix N2N link re-connect (Himanshu Madhani) [1628301]
+Rebuild_FUZZ: 91.43%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 48acad099074984f6b0b6e4da011856ba25d12ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/48acad09.failed
+
+In case of N2N connect, sg_reset for bus/device/host was causing driver and
+firmware state to go out of sync.  This patch fixes this link instablity
+when reconnect is attempted after link flap.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 48acad099074984f6b0b6e4da011856ba25d12ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index d7dabcc58986,52e163553e90..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -578,34 -645,49 +645,64 @@@ static void qla24xx_handle_gnl_done_eve
+  	}
+  
+  	if (!found) {
+- 		/* fw has no record of this port */
+- 		for (i = 0; i < n; i++) {
+- 			e = &vha->gnl.l[i];
+- 			id.b.domain = e->port_id[0];
+- 			id.b.area = e->port_id[1];
+- 			id.b.al_pa = e->port_id[2];
+- 			id.b.rsvd_1 = 0;
+- 			loop_id = le16_to_cpu(e->nport_handle);
+- 
++ 		switch (vha->hw->current_topology) {
++ 		case ISP_CFG_F:
++ 		case ISP_CFG_FL:
++ 			for (i = 0; i < n; i++) {
++ 				e = &vha->gnl.l[i];
++ 				id.b.domain = e->port_id[0];
++ 				id.b.area = e->port_id[1];
++ 				id.b.al_pa = e->port_id[2];
++ 				id.b.rsvd_1 = 0;
++ 				loop_id = le16_to_cpu(e->nport_handle);
++ 
+++<<<<<<< HEAD
+ +			if (fcport->d_id.b24 == id.b24) {
+ +				conflict_fcport =
+ +					qla2x00_find_fcport_by_wwpn(vha,
+ +					    e->port_name, 0);
+ +				if (conflict_fcport) {
+ +					qlt_schedule_sess_for_deletion
+ +						(conflict_fcport);
+ +					ql_dbg(ql_dbg_disc, vha, 0x20e6,
+ +					    "%s %d %8phC post del sess\n",
+ +					    __func__, __LINE__,
+ +					    conflict_fcport->port_name);
+ +				}
+++=======
++ 				if (fcport->d_id.b24 == id.b24) {
++ 					conflict_fcport =
++ 					    qla2x00_find_fcport_by_wwpn(vha,
++ 						e->port_name, 0);
++ 					ql_dbg(ql_dbg_disc + ql_dbg_verbose,
++ 					    vha, 0x20e5,
++ 					    "%s %d %8phC post del sess\n",
++ 					    __func__, __LINE__,
++ 					    conflict_fcport->port_name);
++ 					qlt_schedule_sess_for_deletion
++ 						(conflict_fcport);
++ 				}
++ 				/*
++ 				 * FW already picked this loop id for
++ 				 * another fcport
++ 				 */
++ 				if (fcport->loop_id == loop_id)
++ 					fcport->loop_id = FC_NO_LOOP_ID;
+++>>>>>>> 48acad099074 (scsi: qla2xxx: Fix N2N link re-connect)
+  			}
+- 
+- 			/* FW already picked this loop id for another fcport */
+- 			if (fcport->loop_id == loop_id)
+- 				fcport->loop_id = FC_NO_LOOP_ID;
++ 			qla24xx_fcport_handle_login(vha, fcport);
++ 			break;
++ 		case ISP_CFG_N:
++ 			/*
++ 			 * FW handles the initial login for n2n.
++ 			 * Do link reinit to trigger this auto login.
++ 			 */
++ 			set_bit(N2N_LINK_RESET, &vha->dpc_flags);
++ 			qla2xxx_wake_dpc(vha);
++ 			break;
++ 		default:
++ 			break;
+  		}
+- 		qla24xx_fcport_handle_login(vha, fcport);
+  	}
+  } /* gnl_event */
+  
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index bbacfc0690d0..3419cc6cb5bb 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -389,6 +389,7 @@ struct srb_iocb {
+ #define SRB_LOGIN_COND_PLOGI	BIT_1
+ #define SRB_LOGIN_SKIP_PRLI	BIT_2
+ #define SRB_LOGIN_NVME_PRLI	BIT_3
++#define SRB_LOGIN_PRLI_ONLY	BIT_4
+ 			uint16_t data[2];
+ 			u32 iop[2];
+ 		} logio;
+@@ -4245,7 +4246,7 @@ typedef struct scsi_qla_host {
+ #define FCOE_CTX_RESET_NEEDED	18	/* Initiate FCoE context reset */
+ #define MPI_RESET_NEEDED	19	/* Initiate MPI FW reset */
+ #define ISP_QUIESCE_NEEDED	20	/* Driver need some quiescence */
+-#define FREE_BIT 21
++#define N2N_LINK_RESET		21
+ #define PORT_UPDATE_NEEDED	22
+ #define FX00_RESET_RECOVERY	23
+ #define FX00_TARGET_SCAN	24
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_iocb.c b/drivers/scsi/qla2xxx/qla_iocb.c
+index a1336ee52148..811d7412e5ab 100644
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@ -2283,12 +2283,15 @@ qla24xx_login_iocb(srb_t *sp, struct logio_entry_24xx *logio)
+ 	struct srb_iocb *lio = &sp->u.iocb_cmd;
+ 
+ 	logio->entry_type = LOGINOUT_PORT_IOCB_TYPE;
+-	logio->control_flags = cpu_to_le16(LCF_COMMAND_PLOGI);
+-
+-	if (lio->u.logio.flags & SRB_LOGIN_COND_PLOGI)
+-		logio->control_flags |= cpu_to_le16(LCF_COND_PLOGI);
+-	if (lio->u.logio.flags & SRB_LOGIN_SKIP_PRLI)
+-		logio->control_flags |= cpu_to_le16(LCF_SKIP_PRLI);
++	if (lio->u.logio.flags & SRB_LOGIN_PRLI_ONLY) {
++		logio->control_flags = cpu_to_le16(LCF_COMMAND_PRLI);
++	} else {
++		logio->control_flags = cpu_to_le16(LCF_COMMAND_PLOGI);
++		if (lio->u.logio.flags & SRB_LOGIN_COND_PLOGI)
++			logio->control_flags |= cpu_to_le16(LCF_COND_PLOGI);
++		if (lio->u.logio.flags & SRB_LOGIN_SKIP_PRLI)
++			logio->control_flags |= cpu_to_le16(LCF_SKIP_PRLI);
++	}
+ 	logio->nport_handle = cpu_to_le16(sp->fcport->loop_id);
+ 	logio->port_id[0] = sp->fcport->d_id.b.al_pa;
+ 	logio->port_id[1] = sp->fcport->d_id.b.area;
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 82d7173c899f..f1909f509114 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -910,7 +910,8 @@ skip_rio:
+ 			if (!atomic_read(&vha->loop_down_timer))
+ 				atomic_set(&vha->loop_down_timer,
+ 				    LOOP_DOWN_TIME);
+-			qla2x00_mark_all_devices_lost(vha, 1);
++			if (!N2N_TOPO(ha))
++				qla2x00_mark_all_devices_lost(vha, 1);
+ 		}
+ 
+ 		if (vha->vp_idx) {
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 41722e0d4725..ba566052f954 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -2179,7 +2179,10 @@ qla2x00_lip_reset(scsi_qla_host_t *vha)
+ 		mcp->out_mb = MBX_2|MBX_1|MBX_0;
+ 	} else if (IS_FWI2_CAPABLE(vha->hw)) {
+ 		mcp->mb[0] = MBC_LIP_FULL_LOGIN;
+-		mcp->mb[1] = BIT_6;
++		if (N2N_TOPO(vha->hw))
++			mcp->mb[1] = BIT_4; /* re-init */
++		else
++			mcp->mb[1] = BIT_6; /* LIP */
+ 		mcp->mb[2] = 0;
+ 		mcp->mb[3] = vha->hw->loop_reset_delay;
+ 		mcp->out_mb = MBX_3|MBX_2|MBX_1|MBX_0;
+@@ -3913,28 +3916,6 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 		if (fcport) {
+ 			fcport->plogi_nack_done_deadline = jiffies + HZ;
+ 			fcport->scan_state = QLA_FCPORT_FOUND;
+-			switch (fcport->disc_state) {
+-			case DSC_DELETED:
+-				ql_dbg(ql_dbg_disc, vha, 0x210d,
+-				    "%s %d %8phC login\n",
+-				    __func__, __LINE__, fcport->port_name);
+-				qla24xx_fcport_handle_login(vha, fcport);
+-				break;
+-			case DSC_DELETE_PEND:
+-				break;
+-			default:
+-				qlt_schedule_sess_for_deletion(fcport);
+-				break;
+-			}
+-		} else {
+-			id.b.al_pa  = rptid_entry->u.f2.remote_nport_id[0];
+-			id.b.area   = rptid_entry->u.f2.remote_nport_id[1];
+-			id.b.domain = rptid_entry->u.f2.remote_nport_id[2];
+-			qla24xx_post_newsess_work(vha, &id,
+-			    rptid_entry->u.f2.port_name,
+-			    rptid_entry->u.f2.node_name,
+-			    NULL,
+-			    FC4_TYPE_UNKNOWN);
+ 		}
+ 	}
+ }
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 71331284f418..fe0eeaa18ca9 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -6254,6 +6254,11 @@ intr_on_check:
+ 		if (!IS_QLAFX00(ha))
+ 			qla2x00_do_dpc_all_vps(base_vha);
+ 
++		if (test_and_clear_bit(N2N_LINK_RESET,
++			&base_vha->dpc_flags)) {
++			qla2x00_lip_reset(base_vha);
++		}
++
+ 		ha->dpc_active = 0;
+ end_loop:
+ 		set_current_state(TASK_INTERRUPTIBLE);
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 2ec0b3b49350..75cc4feb99d2 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -798,6 +798,10 @@ qlt_plogi_ack_find_add(struct scsi_qla_host *vha, port_id_t *id,
+ 
+ 	list_for_each_entry(pla, &vha->plogi_ack_list, list) {
+ 		if (pla->id.b24 == id->b24) {
++			ql_dbg(ql_dbg_disc + ql_dbg_verbose, vha, 0x210d,
++			    "%s %d %8phC Term INOT due to new INOT",
++			    __func__, __LINE__,
++			    pla->iocb.u.isp24.port_name);
+ 			qlt_send_term_imm_notif(vha, &pla->iocb, 1);
+ 			memcpy(&pla->iocb, iocb, sizeof(pla->iocb));
+ 			return pla;
+@@ -1066,6 +1070,7 @@ void qlt_free_session_done(struct work_struct *work)
+ 		struct qlt_plogi_ack_t *con =
+ 		    sess->plogi_link[QLT_PLOGI_LINK_CONFLICT];
+ 		struct imm_ntfy_from_isp *iocb;
++		own = sess->plogi_link[QLT_PLOGI_LINK_SAME_WWN];
+ 
+ 		if (con) {
+ 			iocb = &con->iocb;
+@@ -4623,6 +4628,10 @@ static int qlt_handle_login(struct scsi_qla_host *vha,
+ 
+ 	pla = qlt_plogi_ack_find_add(vha, &port_id, iocb);
+ 	if (!pla) {
++		ql_dbg(ql_dbg_disc + ql_dbg_verbose, vha, 0xffff,
++		    "%s %d %8phC Term INOT due to mem alloc fail",
++		    __func__, __LINE__,
++		    iocb->u.isp24.port_name);
+ 		qlt_send_term_imm_notif(vha, iocb, 1);
+ 		goto out;
+ 	}
