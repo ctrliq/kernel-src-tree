@@ -195,7 +195,7 @@ static const struct {
 	{ NULL, NULL },
 };
 
-bool is_supported_compression(const char *ext)
+static bool is_supported_compression(const char *ext)
 {
 	unsigned i;
 
