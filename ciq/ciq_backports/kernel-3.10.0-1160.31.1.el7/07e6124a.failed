@@ -1,0 +1,189 @@
+vt: selection, close sel_buffer race
+
+jira LE-1907
+cve CVE-2020-8648
+Rebuild_History Non-Buildable kernel-3.10.0-1160.31.1.el7
+commit-author Jiri Slaby <jslaby@suse.cz>
+commit 07e6124a1a46b4b5a9b3cacc0c306b50da87abf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.31.1.el7/07e6124a.failed
+
+syzkaller reported this UAF:
+BUG: KASAN: use-after-free in n_tty_receive_buf_common+0x2481/0x2940 drivers/tty/n_tty.c:1741
+Read of size 1 at addr ffff8880089e40e9 by task syz-executor.1/13184
+
+CPU: 0 PID: 13184 Comm: syz-executor.1 Not tainted 5.4.7 #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.12.0-1 04/01/2014
+Call Trace:
+...
+ kasan_report+0xe/0x20 mm/kasan/common.c:634
+ n_tty_receive_buf_common+0x2481/0x2940 drivers/tty/n_tty.c:1741
+ tty_ldisc_receive_buf+0xac/0x190 drivers/tty/tty_buffer.c:461
+ paste_selection+0x297/0x400 drivers/tty/vt/selection.c:372
+ tioclinux+0x20d/0x4e0 drivers/tty/vt/vt.c:3044
+ vt_ioctl+0x1bcf/0x28d0 drivers/tty/vt/vt_ioctl.c:364
+ tty_ioctl+0x525/0x15a0 drivers/tty/tty_io.c:2657
+ vfs_ioctl fs/ioctl.c:47 [inline]
+
+It is due to a race between parallel paste_selection (TIOCL_PASTESEL)
+and set_selection_user (TIOCL_SETSEL) invocations. One uses sel_buffer,
+while the other frees it and reallocates a new one for another
+selection. Add a mutex to close this race.
+
+The mutex takes care properly of sel_buffer and sel_buffer_lth only. The
+other selection global variables (like sel_start, sel_end, and sel_cons)
+are protected only in set_selection_user. The other functions need quite
+some more work to close the races of the variables there. This is going
+to happen later.
+
+This likely fixes (I am unsure as there is no reproducer provided) bug
+206361 too. It was marked as CVE-2020-8648.
+
+	Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+	Reported-by: syzbot+59997e8d5cbdc486e6f6@syzkaller.appspotmail.com
+References: https://bugzilla.kernel.org/show_bug.cgi?id=206361
+	Cc: stable <stable@vger.kernel.org>
+Link: https://lore.kernel.org/r/20200210081131.23572-2-jslaby@suse.cz
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 07e6124a1a46b4b5a9b3cacc0c306b50da87abf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/selection.c
+diff --cc drivers/tty/vt/selection.c
+index 3bfbca6cb277,0c50d7410b31..000000000000
+--- a/drivers/tty/vt/selection.c
++++ b/drivers/tty/vt/selection.c
+@@@ -155,53 -170,51 +157,59 @@@ static int store_utf8(u16 c, char *p
+   *	The entire selection process is managed under the console_lock. It's
+   *	 a lot under the lock but its hardly a performance path
+   */
+ -int set_selection_user(const struct tiocl_selection __user *sel,
+ -		       struct tty_struct *tty)
+ -{
+ -	struct tiocl_selection v;
+ -
+ -	if (copy_from_user(&v, sel, sizeof(*sel)))
+ -		return -EFAULT;
+ -
+ -	return set_selection_kernel(&v, tty);
+ -}
+ -
+ -int set_selection_kernel(struct tiocl_selection *v, struct tty_struct *tty)
+ +int set_selection(const struct tiocl_selection __user *sel, struct tty_struct *tty)
+  {
+  	struct vc_data *vc = vc_cons[fg_console].d;
+ -	int new_sel_start, new_sel_end, spc;
+ +	int sel_mode, new_sel_start, new_sel_end, spc;
+  	char *bp, *obp;
+  	int i, ps, pe, multiplier;
+++<<<<<<< HEAD
+ +	u16 c;
+ +	int mode;
+++=======
++ 	u32 c;
++ 	int mode, ret = 0;
+++>>>>>>> 07e6124a1a46 (vt: selection, close sel_buffer race)
+  
+  	poke_blanked_console();
+  
+ -	v->xs = min_t(u16, v->xs - 1, vc->vc_cols - 1);
+ -	v->ys = min_t(u16, v->ys - 1, vc->vc_rows - 1);
+ -	v->xe = min_t(u16, v->xe - 1, vc->vc_cols - 1);
+ -	v->ye = min_t(u16, v->ye - 1, vc->vc_rows - 1);
+ -	ps = v->ys * vc->vc_size_row + (v->xs << 1);
+ -	pe = v->ye * vc->vc_size_row + (v->xe << 1);
+ -
+ -	if (v->sel_mode == TIOCL_SELCLEAR) {
+ -		/* useful for screendump without selection highlights */
+ -		clear_selection();
+ -		return 0;
+ -	}
+ +	{ unsigned short xs, ys, xe, ye;
+  
+ -	if (mouse_reporting() && (v->sel_mode & TIOCL_SELMOUSEREPORT)) {
+ -		mouse_report(tty, v->sel_mode & TIOCL_SELBUTTONMASK, v->xs,
+ -			     v->ys);
+ -		return 0;
+ -	}
+ +	  if (!access_ok(VERIFY_READ, sel, sizeof(*sel)))
+ +		return -EFAULT;
+ +	  __get_user(xs, &sel->xs);
+ +	  __get_user(ys, &sel->ys);
+ +	  __get_user(xe, &sel->xe);
+ +	  __get_user(ye, &sel->ye);
+ +	  __get_user(sel_mode, &sel->sel_mode);
+ +	  xs--; ys--; xe--; ye--;
+ +	  xs = limit(xs, vc->vc_cols - 1);
+ +	  ys = limit(ys, vc->vc_rows - 1);
+ +	  xe = limit(xe, vc->vc_cols - 1);
+ +	  ye = limit(ye, vc->vc_rows - 1);
+ +	  ps = ys * vc->vc_size_row + (xs << 1);
+ +	  pe = ye * vc->vc_size_row + (xe << 1);
+ +
+ +	  if (sel_mode == TIOCL_SELCLEAR) {
+ +	      /* useful for screendump without selection highlights */
+ +	      clear_selection();
+ +	      return 0;
+ +	  }
+ +
+ +	  if (mouse_reporting() && (sel_mode & TIOCL_SELMOUSEREPORT)) {
+ +	      mouse_report(tty, sel_mode & TIOCL_SELBUTTONMASK, xs, ys);
+ +	      return 0;
+ +	  }
+ +        }
+  
+  	if (ps > pe)	/* make sel_start <= sel_end */
+ -		swap(ps, pe);
+ +	{
+ +		int tmp = ps;
+ +		ps = pe;
+ +		pe = tmp;
+ +	}
+  
++ 	mutex_lock(&sel_lock);
+  	if (sel_cons != vc_cons[fg_console].d) {
+  		clear_selection();
+  		sel_cons = vc_cons[fg_console].d;
+@@@ -323,8 -339,11 +333,10 @@@
+  		}
+  	}
+  	sel_buffer_lth = bp - sel_buffer;
+- 	return 0;
++ unlock:
++ 	mutex_unlock(&sel_lock);
++ 	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(set_selection_kernel);
+  
+  /* Insert the contents of the selection buffer into the
+   * queue of the tty associated with the current console.
+@@@ -346,15 -366,25 +358,18 @@@ int paste_selection(struct tty_struct *
+  	console_unlock();
+  
+  	ld = tty_ldisc_ref_wait(tty);
+ -	if (!ld)
+ -		return -EIO;	/* ldisc was hung up */
+ -	tty_buffer_lock_exclusive(&vc->port);
+  
+ +	/* FIXME: this is completely unsafe */
+  	add_wait_queue(&vc->paste_wait, &wait);
++ 	mutex_lock(&sel_lock);
+  	while (sel_buffer && sel_buffer_lth > pasted) {
+  		set_current_state(TASK_INTERRUPTIBLE);
+ -		if (signal_pending(current)) {
+ -			ret = -EINTR;
+ -			break;
+ -		}
+  		if (tty_throttled(tty)) {
++ 			mutex_unlock(&sel_lock);
+  			schedule();
++ 			mutex_lock(&sel_lock);
+  			continue;
+  		}
+ -		__set_current_state(TASK_RUNNING);
+  		count = sel_buffer_lth - pasted;
+  		count = tty_ldisc_receive_buf(ld, sel_buffer + pasted, NULL,
+  					      count);
+* Unmerged path drivers/tty/vt/selection.c
