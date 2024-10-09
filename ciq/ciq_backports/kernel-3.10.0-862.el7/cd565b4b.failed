@@ -1,0 +1,465 @@
+IB/IPoIB: Support acceleration options callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Erez Shitrit <erezsh@mellanox.com>
+commit cd565b4b51e5fe258d6ce9ddc167ee51f3044ba5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cd565b4b.failed
+
+IPoIB driver now uses the new set of callback functions.
+
+If the hardware provider supports the new ipoib_options implementation,
+the driver uses the callbacks in its data path flows, otherwise it uses the
+driver default implementation for all data flows in its code.
+
+The default implementation wasn't change and it is exactly as it was before
+introduction of acceleration support.
+
+	Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+	Reviewed-by: Alex Vesker <valex@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit cd565b4b51e5fe258d6ce9ddc167ee51f3044ba5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 91ce500f1b9b,2a489f174c51..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1927,12 -1928,25 +1929,30 @@@ static void ipoib_build_priv(struct net
+  	INIT_DELAYED_WORK(&priv->neigh_reap_task, ipoib_reap_neigh);
+  }
+  
+- struct ipoib_dev_priv *ipoib_intf_alloc(const char *name)
++ static const struct net_device_ops ipoib_netdev_default_pf = {
++ 	.ndo_init		 = ipoib_dev_init_default,
++ 	.ndo_uninit		 = ipoib_dev_uninit_default,
++ 	.ndo_open		 = ipoib_ib_dev_open_default,
++ 	.ndo_stop		 = ipoib_ib_dev_stop_default,
++ };
++ 
++ static struct net_device
++ *ipoib_create_netdev_default(struct ib_device *hca,
++ 			     const char *name,
++ 			     unsigned char name_assign_type,
++ 			     void (*setup)(struct net_device *))
+  {
+  	struct net_device *dev;
++ 	struct rdma_netdev *rn;
+  
+++<<<<<<< HEAD
+ +	dev = alloc_netdev((int) sizeof (struct ipoib_dev_priv), name,
+ +			   ipoib_setup);
+++=======
++ 	dev = alloc_netdev((int)sizeof(struct rdma_netdev),
++ 			   name,
++ 			   name_assign_type, setup);
+++>>>>>>> cd565b4b51e5 (IB/IPoIB: Support acceleration options callbacks)
+  	if (!dev)
+  		return NULL;
+  
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 9a912830c8e0..2ae1f0883c9b 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -52,7 +52,6 @@
+ #include <rdma/ib_pack.h>
+ #include <rdma/ib_sa.h>
+ #include <linux/sched.h>
+-
+ /* constants */
+ 
+ enum ipoib_flush_level {
+@@ -153,8 +152,12 @@ static inline void skb_add_pseudo_hdr(struct sk_buff *skb)
+ 	skb_pull(skb, IPOIB_HARD_LEN);
+ }
+ 
+-/* Keep the refactoring compile able */
+-#define ipoib_priv netdev_priv
++static inline struct ipoib_dev_priv *ipoib_priv(const struct net_device *dev)
++{
++	struct rdma_netdev *rn = netdev_priv(dev);
++
++	return rn->clnt_priv;
++}
+ 
+ /* Used for all multicast joins (broadcast, IPv4 mcast and IPv6 mcast) */
+ struct ipoib_mcast {
+@@ -407,6 +410,7 @@ struct ipoib_dev_priv {
+ 	struct timer_list poll_timer;
+ 	unsigned max_send_sge;
+ 	bool sm_fullmember_sendonly_support;
++	const struct net_device_ops	*rn_ops;
+ };
+ 
+ struct ipoib_ah {
+@@ -485,16 +489,16 @@ int ipoib_open(struct net_device *dev);
+ int ipoib_add_pkey_attr(struct net_device *dev);
+ int ipoib_add_umcast_attr(struct net_device *dev);
+ 
+-void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+-		struct ipoib_ah *address, u32 dqpn);
++int ipoib_send(struct net_device *dev, struct sk_buff *skb,
++	       struct ib_ah *address, u32 dqpn);
+ void ipoib_reap_ah(struct work_struct *work);
+ 
+ struct ipoib_path *__path_find(struct net_device *dev, void *gid);
+ void ipoib_mark_paths_invalid(struct net_device *dev);
+ void ipoib_flush_paths(struct net_device *dev);
+ int ipoib_check_sm_sendonly_fullmember_support(struct ipoib_dev_priv *priv);
+-struct ipoib_dev_priv *ipoib_intf_alloc(const char *format);
+-
++struct ipoib_dev_priv *ipoib_intf_alloc(struct ib_device *hca, u8 port,
++					const char *format);
+ void ipoib_ib_tx_timer_func(unsigned long ctx);
+ void ipoib_ib_dev_flush_light(struct work_struct *work);
+ void ipoib_ib_dev_flush_normal(struct work_struct *work);
+@@ -502,8 +506,9 @@ void ipoib_ib_dev_flush_heavy(struct work_struct *work);
+ void ipoib_pkey_event(struct work_struct *work);
+ void ipoib_ib_dev_cleanup(struct net_device *dev);
+ 
+-void ipoib_dev_uninit_default(struct net_device *dev);
++int ipoib_ib_dev_open_default(struct net_device *dev);
+ int ipoib_ib_dev_open(struct net_device *dev);
++int ipoib_ib_dev_stop(struct net_device *dev);
+ void ipoib_ib_dev_up(struct net_device *dev);
+ void ipoib_ib_dev_down(struct net_device *dev);
+ int ipoib_ib_dev_stop_default(struct net_device *dev);
+@@ -566,8 +571,10 @@ void ipoib_path_iter_read(struct ipoib_path_iter *iter,
+ 			  struct ipoib_path *path);
+ #endif
+ 
+-int ipoib_mcast_attach(struct net_device *dev, u16 mlid,
+-		       union ib_gid *mgid, int set_qkey);
++int ipoib_mcast_attach(struct net_device *dev, struct ib_device *hca,
++		       union ib_gid *mgid, u16 mlid, int set_qkey, u32 qkey);
++int ipoib_mcast_detach(struct net_device *dev, struct ib_device *hca,
++		       union ib_gid *mgid, u16 mlid);
+ void ipoib_mcast_remove_list(struct list_head *remove_list);
+ void ipoib_check_and_add_mcast_sendonly(struct ipoib_dev_priv *priv, u8 *mgid,
+ 				struct list_head *remove_list);
+@@ -591,7 +598,7 @@ void __exit ipoib_netlink_fini(void);
+ void ipoib_set_umcast(struct net_device *ndev, int umcast_val);
+ int  ipoib_set_mode(struct net_device *dev, const char *buf);
+ 
+-void ipoib_setup(struct net_device *dev);
++void ipoib_setup_common(struct net_device *dev);
+ 
+ void ipoib_pkey_open(struct ipoib_dev_priv *priv);
+ void ipoib_drain_cq(struct net_device *dev);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index 7c8f63d68cb5..886f790d54f9 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -537,8 +537,8 @@ static inline int post_send(struct ipoib_dev_priv *priv,
+ 	return ib_post_send(priv->qp, &priv->tx_wr.wr, &bad_wr);
+ }
+ 
+-void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+-		struct ipoib_ah *address, u32 dqpn)
++int ipoib_send(struct net_device *dev, struct sk_buff *skb,
++	       struct ib_ah *address, u32 dqpn)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+ 	struct ipoib_tx_buf *tx_req;
+@@ -554,7 +554,7 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 			++dev->stats.tx_dropped;
+ 			++dev->stats.tx_errors;
+ 			dev_kfree_skb_any(skb);
+-			return;
++			return -1;
+ 		}
+ 	} else {
+ 		if (unlikely(skb->len > priv->mcast_mtu + IPOIB_ENCAP_LEN)) {
+@@ -563,7 +563,7 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 			++dev->stats.tx_dropped;
+ 			++dev->stats.tx_errors;
+ 			ipoib_cm_skb_too_long(dev, skb, priv->mcast_mtu);
+-			return;
++			return -1;
+ 		}
+ 		phead = NULL;
+ 		hlen  = 0;
+@@ -574,7 +574,7 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 			++dev->stats.tx_dropped;
+ 			++dev->stats.tx_errors;
+ 			dev_kfree_skb_any(skb);
+-			return;
++			return -1;
+ 		}
+ 		/* Does skb_linearize return ok without reducing nr_frags? */
+ 		if (skb_shinfo(skb)->nr_frags > usable_sge) {
+@@ -582,7 +582,7 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 			++dev->stats.tx_dropped;
+ 			++dev->stats.tx_errors;
+ 			dev_kfree_skb_any(skb);
+-			return;
++			return -1;
+ 		}
+ 	}
+ 
+@@ -602,7 +602,7 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 	if (unlikely(ipoib_dma_map_tx(priv->ca, tx_req))) {
+ 		++dev->stats.tx_errors;
+ 		dev_kfree_skb_any(skb);
+-		return;
++		return -1;
+ 	}
+ 
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL)
+@@ -621,7 +621,7 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 	skb_dst_drop(skb);
+ 
+ 	rc = post_send(priv, priv->tx_head & (ipoib_sendq_size - 1),
+-		       address->ah, dqpn, tx_req, phead, hlen);
++		       address, dqpn, tx_req, phead, hlen);
+ 	if (unlikely(rc)) {
+ 		ipoib_warn(priv, "post_send failed, error %d\n", rc);
+ 		++dev->stats.tx_errors;
+@@ -630,16 +630,19 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
+ 		dev_kfree_skb_any(skb);
+ 		if (netif_queue_stopped(dev))
+ 			netif_wake_queue(dev);
++		rc = 0;
+ 	} else {
+ 		netif_trans_update(dev);
+ 
+-		address->last_send = priv->tx_head;
++		rc = priv->tx_head;
+ 		++priv->tx_head;
+ 	}
+ 
+ 	if (unlikely(priv->tx_outstanding > MAX_SEND_CQE))
+ 		while (poll_tx(priv))
+ 			; /* nothing */
++
++	return rc;
+ }
+ 
+ static void __ipoib_reap_ah(struct net_device *dev)
+@@ -714,7 +717,7 @@ int ipoib_ib_dev_stop_default(struct net_device *dev)
+ 	struct ipoib_tx_buf *tx_req;
+ 	int i;
+ 
+-	if (test_and_clear_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
++	if (test_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
+ 		napi_disable(&priv->napi);
+ 
+ 	ipoib_cm_dev_stop(dev);
+@@ -785,8 +788,11 @@ timeout:
+ 
+ int ipoib_ib_dev_stop(struct net_device *dev)
+ {
+-	ipoib_ib_dev_stop_default(dev);
++	struct ipoib_dev_priv *priv = ipoib_priv(dev);
++
++	priv->rn_ops->ndo_stop(dev);
+ 
++	clear_bit(IPOIB_FLAG_INITIALIZED, &priv->flags);
+ 	ipoib_flush_ah(dev);
+ 
+ 	return 0;
+@@ -811,23 +817,20 @@ int ipoib_ib_dev_open_default(struct net_device *dev)
+ 	ret = ipoib_ib_post_receives(dev);
+ 	if (ret) {
+ 		ipoib_warn(priv, "ipoib_ib_post_receives returned %d\n", ret);
+-		goto dev_stop;
++		goto out;
+ 	}
+ 
+ 	ret = ipoib_cm_dev_open(dev);
+ 	if (ret) {
+ 		ipoib_warn(priv, "ipoib_cm_dev_open returned %d\n", ret);
+-		goto dev_stop;
++		goto out;
+ 	}
+ 
+-	if (!test_and_set_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
++	if (!test_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
+ 		napi_enable(&priv->napi);
+ 
+ 	return 0;
+-dev_stop:
+-	if (!test_and_set_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
+-		napi_enable(&priv->napi);
+-	ipoib_ib_dev_stop(dev);
++out:
+ 	return -1;
+ }
+ 
+@@ -847,16 +850,21 @@ int ipoib_ib_dev_open(struct net_device *dev)
+ 	queue_delayed_work(priv->wq, &priv->ah_reap_task,
+ 			   round_jiffies_relative(HZ));
+ 
+-	if (ipoib_ib_dev_open_default(dev)) {
++	if (priv->rn_ops->ndo_open(dev)) {
+ 		pr_warn("%s: Failed to open dev\n", dev->name);
+-		goto stop_ah_reap;
++		goto dev_stop;
+ 	}
+ 
++	set_bit(IPOIB_FLAG_INITIALIZED, &priv->flags);
++
+ 	return 0;
+ 
+-stop_ah_reap:
++dev_stop:
+ 	set_bit(IPOIB_STOP_REAPER, &priv->flags);
+ 	cancel_delayed_work(&priv->ah_reap_task);
++	set_bit(IPOIB_FLAG_INITIALIZED, &priv->flags);
++	napi_enable(&priv->napi);
++	ipoib_ib_dev_stop(dev);
+ 	return -1;
+ }
+ 
+@@ -1241,7 +1249,7 @@ void ipoib_ib_dev_cleanup(struct net_device *dev)
+ 
+ 	clear_bit(IPOIB_PKEY_ASSIGNED, &priv->flags);
+ 
+-	ipoib_dev_uninit_default(dev);
++	priv->rn_ops->ndo_uninit(dev);
+ 
+ 	if (priv->pd) {
+ 		ib_dealloc_pd(priv->pd);
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index df35a85f7a40..aec4008ca326 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -210,6 +210,7 @@ static int ipoib_mcast_join_finish(struct ipoib_mcast *mcast,
+ {
+ 	struct net_device *dev = mcast->dev;
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
++	struct rdma_netdev *rn = netdev_priv(dev);
+ 	struct ipoib_ah *ah;
+ 	int ret;
+ 	int set_qkey = 0;
+@@ -257,8 +258,9 @@ static int ipoib_mcast_join_finish(struct ipoib_mcast *mcast,
+ 			return 0;
+ 		}
+ 
+-		ret = ipoib_mcast_attach(dev, be16_to_cpu(mcast->mcmember.mlid),
+-					 &mcast->mcmember.mgid, set_qkey);
++		ret = rn->attach_mcast(dev, priv->ca, &mcast->mcmember.mgid,
++				       be16_to_cpu(mcast->mcmember.mlid),
++				       set_qkey, priv->qkey);
+ 		if (ret < 0) {
+ 			ipoib_warn(priv, "couldn't attach QP to multicast group %pI6\n",
+ 				   mcast->mcmember.mgid.raw);
+@@ -704,6 +706,7 @@ int ipoib_mcast_stop_thread(struct net_device *dev)
+ static int ipoib_mcast_leave(struct net_device *dev, struct ipoib_mcast *mcast)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
++	struct rdma_netdev *rn = netdev_priv(dev);
+ 	int ret = 0;
+ 
+ 	if (test_and_clear_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags))
+@@ -717,8 +720,8 @@ static int ipoib_mcast_leave(struct net_device *dev, struct ipoib_mcast *mcast)
+ 				mcast->mcmember.mgid.raw);
+ 
+ 		/* Remove ourselves from the multicast group */
+-		ret = ib_detach_mcast(priv->qp, &mcast->mcmember.mgid,
+-				      be16_to_cpu(mcast->mcmember.mlid));
++		ret = rn->detach_mcast(dev, priv->ca, &mcast->mcmember.mgid,
++				       be16_to_cpu(mcast->mcmember.mlid));
+ 		if (ret)
+ 			ipoib_warn(priv, "ib_detach_mcast failed (result = %d)\n", ret);
+ 	} else if (!test_bit(IPOIB_MCAST_FLAG_SENDONLY, &mcast->flags))
+@@ -760,6 +763,7 @@ void ipoib_mcast_remove_list(struct list_head *remove_list)
+ void ipoib_mcast_send(struct net_device *dev, u8 *daddr, struct sk_buff *skb)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
++	struct rdma_netdev *rn = netdev_priv(dev);
+ 	struct ipoib_mcast *mcast;
+ 	unsigned long flags;
+ 	void *mgid = daddr + 4;
+@@ -822,7 +826,8 @@ void ipoib_mcast_send(struct net_device *dev, u8 *daddr, struct sk_buff *skb)
+ 			}
+ 		}
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+-		ipoib_send(dev, skb, mcast->ah, IB_MULTICAST_QPN);
++		mcast->ah->last_send = rn->send(dev, skb, mcast->ah->ah,
++						IB_MULTICAST_QPN);
+ 		if (neigh)
+ 			ipoib_neigh_put(neigh);
+ 		return;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_netlink.c b/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+index f734b608e6ed..28884781311b 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+@@ -162,7 +162,7 @@ static struct rtnl_link_ops ipoib_link_ops __read_mostly = {
+ 	.maxtype	= IFLA_IPOIB_MAX,
+ 	.policy		= ipoib_policy,
+ 	.priv_size	= sizeof(struct ipoib_dev_priv),
+-	.setup		= ipoib_setup,
++	.setup		= ipoib_setup_common,
+ 	.newlink	= ipoib_new_child_link,
+ 	.changelink	= ipoib_changelink,
+ 	.dellink	= ipoib_unregister_child_dev,
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+index 87b6f205d1fc..bb64baf25309 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+@@ -35,7 +35,8 @@
+ 
+ #include "ipoib.h"
+ 
+-int ipoib_mcast_attach(struct net_device *dev, u16 mlid, union ib_gid *mgid, int set_qkey)
++int ipoib_mcast_attach(struct net_device *dev, struct ib_device *hca,
++		       union ib_gid *mgid, u16 mlid, int set_qkey, u32 qkey)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+ 	struct ib_qp_attr *qp_attr = NULL;
+@@ -56,7 +57,7 @@ int ipoib_mcast_attach(struct net_device *dev, u16 mlid, union ib_gid *mgid, int
+ 			goto out;
+ 
+ 		/* set correct QKey for QP */
+-		qp_attr->qkey = priv->qkey;
++		qp_attr->qkey = qkey;
+ 		ret = ib_modify_qp(priv->qp, qp_attr, IB_QP_QKEY);
+ 		if (ret) {
+ 			ipoib_warn(priv, "failed to modify QP, ret = %d\n", ret);
+@@ -74,6 +75,17 @@ out:
+ 	return ret;
+ }
+ 
++int ipoib_mcast_detach(struct net_device *dev, struct ib_device *hca,
++		       union ib_gid *mgid, u16 mlid)
++{
++	struct ipoib_dev_priv *priv = ipoib_priv(dev);
++	int ret;
++
++	ret = ib_detach_mcast(priv->qp, mgid, mlid);
++
++	return ret;
++}
++
+ int ipoib_init_qp(struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index a69df126283b..b53e3f15421a 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@ -124,14 +124,15 @@ int ipoib_vlan_add(struct net_device *pdev, unsigned short pkey)
+ 	if (!capable(CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	ppriv = netdev_priv(pdev);
++	ppriv = ipoib_priv(pdev);
+ 
+ 	if (test_bit(IPOIB_FLAG_GOING_DOWN, &ppriv->flags))
+ 		return -EPERM;
+ 
+ 	snprintf(intf_name, sizeof intf_name, "%s.%04x",
+ 		 ppriv->dev->name, pkey);
+-	priv = ipoib_intf_alloc(intf_name);
++
++	priv = ipoib_intf_alloc(ppriv->ca, ppriv->port, intf_name);
+ 	if (!priv)
+ 		return -ENOMEM;
+ 
