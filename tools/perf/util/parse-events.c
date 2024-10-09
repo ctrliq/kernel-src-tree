@@ -431,7 +431,7 @@ int parse_events_add_cache(struct list_head *list, int *idx,
 }
 
 static void tracepoint_error(struct parse_events_error *e, int err,
-			     char *sys, char *name)
+			     const char *sys, const char *name)
 {
 	char help[BUFSIZ];
 
@@ -461,7 +461,7 @@ static void tracepoint_error(struct parse_events_error *e, int err,
 }
 
 static int add_tracepoint(struct list_head *list, int *idx,
-			  char *sys_name, char *evt_name,
+			  const char *sys_name, const char *evt_name,
 			  struct parse_events_error *err,
 			  struct list_head *head_config)
 {
@@ -486,7 +486,7 @@ static int add_tracepoint(struct list_head *list, int *idx,
 }
 
 static int add_tracepoint_multi_event(struct list_head *list, int *idx,
-				      char *sys_name, char *evt_name,
+				      const char *sys_name, const char *evt_name,
 				      struct parse_events_error *err,
 				      struct list_head *head_config)
 {
@@ -528,7 +528,7 @@ static int add_tracepoint_multi_event(struct list_head *list, int *idx,
 }
 
 static int add_tracepoint_event(struct list_head *list, int *idx,
-				char *sys_name, char *evt_name,
+				const char *sys_name, const char *evt_name,
 				struct parse_events_error *err,
 				struct list_head *head_config)
 {
@@ -540,7 +540,7 @@ static int add_tracepoint_event(struct list_head *list, int *idx,
 }
 
 static int add_tracepoint_multi_sys(struct list_head *list, int *idx,
-				    char *sys_name, char *evt_name,
+				    const char *sys_name, const char *evt_name,
 				    struct parse_events_error *err,
 				    struct list_head *head_config)
 {
@@ -892,7 +892,7 @@ do {								\
 }
 
 int parse_events_add_tracepoint(struct list_head *list, int *idx,
-				char *sys, char *event,
+				const char *sys, const char *event,
 				struct parse_events_error *err,
 				struct list_head *head_config)
 {
