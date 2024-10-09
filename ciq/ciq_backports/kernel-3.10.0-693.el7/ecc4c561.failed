@@ -1,0 +1,397 @@
+perf tools: Propagate perf_config() errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit ecc4c5614b24ee8ebaa35b834b5768dc9302ee3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ecc4c561.failed
+
+Previously these were being ignored, sometimes silently.
+
+Stop doing that, emitting debug messages and handling the errors.
+
+Testing it:
+
+  $ cat ~/.perfconfig
+  cat: /home/acme/.perfconfig: No such file or directory
+  $ perf stat -e cycles usleep 1
+
+   Performance counter stats for 'usleep 1':
+
+           938,996      cycles:u
+
+       0.003813731 seconds time elapsed
+
+  $ perf top --stdio
+  Error:
+  You may not have permission to collect system-wide stats.
+
+  Consider tweaking /proc/sys/kernel/perf_event_paranoid,
+  <SNIP>
+  [ perf record: Captured and wrote 0.019 MB perf.data (7 samples) ]
+  [acme@jouet linux]$ perf report --stdio
+  # To display the perf.data header info, please use --header/--header-only options.
+  # Overhead  Command  Shared Object      Symbol
+  # ........  .......  .................  .........................
+    71.77%  usleep   libc-2.24.so       [.] _dl_addr
+    27.07%  usleep   ld-2.24.so         [.] _dl_next_ld_env_entry
+     1.13%  usleep   [kernel.kallsyms]  [k] page_fault
+  $
+  $ touch ~/.perfconfig
+  $ ls -la ~/.perfconfig
+  -rw-rw-r--. 1 acme acme 0 Jan 27 12:14 /home/acme/.perfconfig
+  $
+  $ perf stat -e instructions usleep 1
+
+   Performance counter stats for 'usleep 1':
+
+           244,610      instructions:u
+
+       0.000805383 seconds time elapsed
+
+  $
+  [root@jouet ~]# chown acme.acme ~/.perfconfig
+  [root@jouet ~]# perf stat -e cycles usleep 1
+    Warning: File /root/.perfconfig not owned by current user or root, ignoring it.
+
+   Performance counter stats for 'usleep 1':
+
+           937,615      cycles
+
+       0.000836931 seconds time elapsed
+  #
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/n/tip-j2rq96so6xdqlr8p8rd6a3jx@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit ecc4c5614b24ee8ebaa35b834b5768dc9302ee3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/llvm-utils.c
+diff --cc tools/perf/util/llvm-utils.c
+index 5887bb8c1243,824356488ce6..000000000000
+--- a/tools/perf/util/llvm-utils.c
++++ b/tools/perf/util/llvm-utils.c
+@@@ -40,8 -46,13 +40,18 @@@ int perf_llvm_config(const char *var, c
+  		llvm_param.kbuild_dir = strdup(value);
+  	else if (!strcmp(var, "kbuild-opts"))
+  		llvm_param.kbuild_opts = strdup(value);
+++<<<<<<< HEAD
+ +	else
+ +		return -1;
+++=======
++ 	else if (!strcmp(var, "dump-obj"))
++ 		llvm_param.dump_obj = !!perf_config_bool(var, value);
++ 	else {
++ 		pr_debug("Invalid LLVM config option: %s\n", value);
++ 		return -1;
++ 	}
++ 	llvm_param.user_set_param = true;
+++>>>>>>> ecc4c5614b24 (perf tools: Propagate perf_config() errors)
+  	return 0;
+  }
+  
+diff --git a/tools/perf/builtin-help.c b/tools/perf/builtin-help.c
+index 7d45c42bdd25..51681447b083 100644
+--- a/tools/perf/builtin-help.c
++++ b/tools/perf/builtin-help.c
+@@ -447,11 +447,13 @@ int cmd_help(int argc, const char **argv, const char *prefix __maybe_unused)
+ 		NULL
+ 	};
+ 	const char *alias;
+-	int rc = 0;
++	int rc;
+ 
+ 	load_command_list("perf-", &main_cmds, &other_cmds);
+ 
+-	perf_config(perf_help_config, &help_format);
++	rc = perf_config(perf_help_config, &help_format);
++	if (rc)
++		return rc;
+ 
+ 	argc = parse_options_subcommand(argc, argv, builtin_help_options,
+ 			builtin_help_subcommands, builtin_help_usage, 0);
+diff --git a/tools/perf/builtin-kmem.c b/tools/perf/builtin-kmem.c
+index 9c22903425f9..ec582bd63f1c 100644
+--- a/tools/perf/builtin-kmem.c
++++ b/tools/perf/builtin-kmem.c
+@@ -1922,10 +1922,12 @@ int cmd_kmem(int argc, const char **argv, const char *prefix __maybe_unused)
+ 		NULL
+ 	};
+ 	struct perf_session *session;
+-	int ret = -1;
+ 	const char errmsg[] = "No %s allocation events found.  Have you run 'perf kmem record --%s'?\n";
++	int ret = perf_config(kmem_config, NULL);
++
++	if (ret)
++		return ret;
+ 
+-	perf_config(kmem_config, NULL);
+ 	argc = parse_options_subcommand(argc, argv, kmem_options,
+ 					kmem_subcommands, kmem_usage, 0);
+ 
+@@ -1950,6 +1952,8 @@ int cmd_kmem(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	if (session == NULL)
+ 		return -1;
+ 
++	ret = -1;
++
+ 	if (kmem_slab) {
+ 		if (!perf_evlist__find_tracepoint_by_name(session->evlist,
+ 							  "kmem:kmalloc")) {
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 6cb1cbb83a86..0312350643c8 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -1341,7 +1341,9 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	if (rec->evlist == NULL)
+ 		return -ENOMEM;
+ 
+-	perf_config(perf_record_config, rec);
++	err = perf_config(perf_record_config, rec);
++	if (err)
++		return err;
+ 
+ 	argc = parse_options(argc, argv, record_options, record_usage,
+ 			    PARSE_OPT_STOP_AT_NON_OPTION);
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index cd7a79b84fd3..60bfe3dba3c1 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -847,7 +847,9 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	perf_config(report__config, &report);
++	ret = perf_config(report__config, &report);
++	if (ret)
++		return ret;
+ 
+ 	argc = parse_options(argc, argv, options, report_usage, 0);
+ 	if (argc) {
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index cb7f9fb43c83..ab4c8f450c25 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -1247,7 +1247,9 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	if (top.evlist == NULL)
+ 		return -ENOMEM;
+ 
+-	perf_config(perf_top_config, &top);
++	status = perf_config(perf_top_config, &top);
++	if (status)
++		return status;
+ 
+ 	argc = parse_options(argc, argv, options, top_usage, 0);
+ 	if (argc)
+diff --git a/tools/perf/perf.c b/tools/perf/perf.c
+index 285387b0f485..3d1205f5bde0 100644
+--- a/tools/perf/perf.c
++++ b/tools/perf/perf.c
+@@ -88,11 +88,12 @@ static int pager_command_config(const char *var, const char *value, void *data)
+ /* returns 0 for "no pager", 1 for "use pager", and -1 for "not specified" */
+ int check_pager_config(const char *cmd)
+ {
++	int err;
+ 	struct pager_config c;
+ 	c.cmd = cmd;
+ 	c.val = -1;
+-	perf_config(pager_command_config, &c);
+-	return c.val;
++	err = perf_config(pager_command_config, &c);
++	return err ?: c.val;
+ }
+ 
+ static int browser_command_config(const char *var, const char *value, void *data)
+@@ -111,11 +112,12 @@ static int browser_command_config(const char *var, const char *value, void *data
+  */
+ static int check_browser_config(const char *cmd)
+ {
++	int err;
+ 	struct pager_config c;
+ 	c.cmd = cmd;
+ 	c.val = -1;
+-	perf_config(browser_command_config, &c);
+-	return c.val;
++	err = perf_config(browser_command_config, &c);
++	return err ?: c.val;
+ }
+ 
+ static void commit_pager_choice(void)
+@@ -506,6 +508,7 @@ static void cache_line_size(int *cacheline_sizep)
+ 
+ int main(int argc, const char **argv)
+ {
++	int err;
+ 	const char *cmd;
+ 	char sbuf[STRERR_BUFSIZE];
+ 
+@@ -524,7 +527,9 @@ int main(int argc, const char **argv)
+ 	srandom(time(NULL));
+ 
+ 	perf_config__init();
+-	perf_config(perf_default_config, NULL);
++	err = perf_config(perf_default_config, NULL);
++	if (err)
++		return err;
+ 	set_buildid_dir(NULL);
+ 
+ 	/* get debugfs/tracefs mount point from /proc/mounts */
+diff --git a/tools/perf/util/callchain.c b/tools/perf/util/callchain.c
+index d51d10cab3e9..18e11b4d1857 100644
+--- a/tools/perf/util/callchain.c
++++ b/tools/perf/util/callchain.c
+@@ -48,6 +48,8 @@ static int parse_callchain_mode(const char *value)
+ 		callchain_param.mode = CHAIN_FOLDED;
+ 		return 0;
+ 	}
++
++	pr_err("Invalid callchain mode: %s\n", value);
+ 	return -1;
+ }
+ 
+@@ -63,6 +65,8 @@ static int parse_callchain_order(const char *value)
+ 		callchain_param.order_set = true;
+ 		return 0;
+ 	}
++
++	pr_err("Invalid callchain order: %s\n", value);
+ 	return -1;
+ }
+ 
+@@ -80,6 +84,8 @@ static int parse_callchain_sort_key(const char *value)
+ 		callchain_param.branch_callstack = 1;
+ 		return 0;
+ 	}
++
++	pr_err("Invalid callchain sort key: %s\n", value);
+ 	return -1;
+ }
+ 
+@@ -97,6 +103,8 @@ static int parse_callchain_value(const char *value)
+ 		callchain_param.value = CCVAL_COUNT;
+ 		return 0;
+ 	}
++
++	pr_err("Invalid callchain config key: %s\n", value);
+ 	return -1;
+ }
+ 
+@@ -210,13 +218,17 @@ int perf_callchain_config(const char *var, const char *value)
+ 		return parse_callchain_sort_key(value);
+ 	if (!strcmp(var, "threshold")) {
+ 		callchain_param.min_percent = strtod(value, &endptr);
+-		if (value == endptr)
++		if (value == endptr) {
++			pr_err("Invalid callchain threshold: %s\n", value);
+ 			return -1;
++		}
+ 	}
+ 	if (!strcmp(var, "print-limit")) {
+ 		callchain_param.print_limit = strtod(value, &endptr);
+-		if (value == endptr)
++		if (value == endptr) {
++			pr_err("Invalid callchain print limit: %s\n", value);
+ 			return -1;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/tools/perf/util/config.c b/tools/perf/util/config.c
+index 5316da777e0d..8c72c693eb3d 100644
+--- a/tools/perf/util/config.c
++++ b/tools/perf/util/config.c
+@@ -386,8 +386,10 @@ static int perf_buildid_config(const char *var, const char *value)
+ 	if (!strcmp(var, "buildid.dir")) {
+ 		const char *dir = perf_config_dirname(var, value);
+ 
+-		if (!dir)
++		if (!dir) {
++			pr_err("Invalid buildid directory!\n");
+ 			return -1;
++		}
+ 		strncpy(buildid_dir, dir, MAXPATHLEN-1);
+ 		buildid_dir[MAXPATHLEN-1] = '\0';
+ 	}
+@@ -405,10 +407,9 @@ static int perf_default_core_config(const char *var __maybe_unused,
+ static int perf_ui_config(const char *var, const char *value)
+ {
+ 	/* Add other config variables here. */
+-	if (!strcmp(var, "ui.show-headers")) {
++	if (!strcmp(var, "ui.show-headers"))
+ 		symbol_conf.show_hist_headers = perf_config_bool(var, value);
+-		return 0;
+-	}
++
+ 	return 0;
+ }
+ 
+diff --git a/tools/perf/util/data-convert-bt.c b/tools/perf/util/data-convert-bt.c
+index 1f5e9fe4a7b0..cea0c2ef1e8b 100644
+--- a/tools/perf/util/data-convert-bt.c
++++ b/tools/perf/util/data-convert-bt.c
+@@ -1473,7 +1473,7 @@ int bt_convert__perf2ctf(const char *input, const char *path,
+ 		},
+ 	};
+ 	struct ctf_writer *cw = &c.writer;
+-	int err = -1;
++	int err;
+ 
+ 	if (opts->all) {
+ 		c.tool.comm = process_comm_event;
+@@ -1481,12 +1481,15 @@ int bt_convert__perf2ctf(const char *input, const char *path,
+ 		c.tool.fork = process_fork_event;
+ 	}
+ 
+-	perf_config(convert__config, &c);
++	err = perf_config(convert__config, &c);
++	if (err)
++		return err;
+ 
+ 	/* CTF writer */
+ 	if (ctf_writer__init(cw, path))
+ 		return -1;
+ 
++	err = -1;
+ 	/* perf.data session */
+ 	session = perf_session__new(&file, 0, &c.tool);
+ 	if (!session)
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 1ba3964ccb65..eda361e13d34 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -2439,8 +2439,10 @@ int parse_filter_percentage(const struct option *opt __maybe_unused,
+ 		symbol_conf.filter_relative = true;
+ 	else if (!strcmp(arg, "absolute"))
+ 		symbol_conf.filter_relative = false;
+-	else
++	else {
++		pr_debug("Invalud percentage: %s\n", arg);
+ 		return -1;
++	}
+ 
+ 	return 0;
+ }
+diff --git a/tools/perf/util/intel-pt.c b/tools/perf/util/intel-pt.c
+index ca333c8a86a0..fbccb2c927d5 100644
+--- a/tools/perf/util/intel-pt.c
++++ b/tools/perf/util/intel-pt.c
+@@ -2158,7 +2158,9 @@ int intel_pt_process_auxtrace_info(union perf_event *event,
+ 
+ 	addr_filters__init(&pt->filts);
+ 
+-	perf_config(intel_pt_perf_config, pt);
++	err = perf_config(intel_pt_perf_config, pt);
++	if (err)
++		goto err_free;
+ 
+ 	err = auxtrace_queues__init(&pt->queues);
+ 	if (err)
+* Unmerged path tools/perf/util/llvm-utils.c
