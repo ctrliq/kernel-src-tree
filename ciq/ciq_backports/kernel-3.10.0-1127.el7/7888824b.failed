@@ -1,0 +1,162 @@
+udf: Use correct partition reference number for metadata
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Alden Tondettar <alden.tondettar@gmail.com>
+commit 7888824b0b1c9c3753d2aedf1d00e7a1c20c18af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/7888824b.failed
+
+UDF/OSTA terminology is confusing. Partition Numbers (PNs) are arbitrary
+16-bit values, one for each physical partition in the volume.  Partition
+Reference Numbers (PRNs) are indices into the the Partition Map Table
+and do not necessarily equal the PN of the mapped partition.
+
+The current metadata code mistakenly uses the PN instead of the PRN when
+mapping metadata blocks to physical/sparable blocks.  Windows-created
+UDF 2.5 discs for some reason use large, arbitrary PNs, resulting in
+mount failure and KASAN read warnings in udf_read_inode().
+
+For example, a NetBSD UDF 2.5 partition might look like this:
+
+PRN PN Type
+--- -- ----
+  0  0 Sparable
+  1  0 Metadata
+
+Since PRN == PN, we are fine.
+
+But Windows could gives us:
+
+PRN PN   Type
+--- ---- ----
+  0 8192 Sparable
+  1 8192 Metadata
+
+So udf_read_inode() will start out by checking the partition length in
+sbi->s_partmaps[8192], which is obviously out of bounds.
+
+Fix this by creating a new field (s_phys_partition_ref) in struct
+udf_meta_data, referencing whatever physical or sparable map has the
+same partition number as the metadata partition.
+
+[JK: Add comment about s_phys_partition_ref, change its name]
+
+	Signed-off-by: Alden Tondettar <alden.tondettar@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 7888824b0b1c9c3753d2aedf1d00e7a1c20c18af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/udf/partition.c
+#	fs/udf/super.c
+diff --cc fs/udf/partition.c
+index d6caf01a2097,888c364b2fe9..000000000000
+--- a/fs/udf/partition.c
++++ b/fs/udf/partition.c
+@@@ -325,7 -326,10 +326,14 @@@ uint32_t udf_get_pblock_meta25(struct s
+  		udf_warn(sb, "error reading from METADATA, trying to read from MIRROR\n");
+  		if (!(mdata->s_flags & MF_MIRROR_FE_LOADED)) {
+  			mdata->s_mirror_fe = udf_find_metadata_inode_efe(sb,
+++<<<<<<< HEAD
+ +				mdata->s_mirror_file_loc, map->s_partition_num);
+++=======
++ 				mdata->s_mirror_file_loc,
++ 				mdata->s_phys_partition_ref);
++ 			if (IS_ERR(mdata->s_mirror_fe))
++ 				mdata->s_mirror_fe = NULL;
+++>>>>>>> 7888824b0b1c (udf: Use correct partition reference number for metadata)
+  			mdata->s_flags |= MF_MIRROR_FE_LOADED;
+  		}
+  
+diff --cc fs/udf/super.c
+index 9a45395df54b,4942549e7dc8..000000000000
+--- a/fs/udf/super.c
++++ b/fs/udf/super.c
+@@@ -917,16 -957,18 +917,16 @@@ struct inode *udf_find_metadata_inode_e
+  	struct inode *metadata_fe;
+  
+  	addr.logicalBlockNum = meta_file_loc;
+- 	addr.partitionReferenceNum = partition_num;
++ 	addr.partitionReferenceNum = partition_ref;
+  
+ -	metadata_fe = udf_iget_special(sb, &addr);
+ +	metadata_fe = udf_iget(sb, &addr);
+  
+ -	if (IS_ERR(metadata_fe)) {
+ +	if (metadata_fe == NULL)
+  		udf_warn(sb, "metadata inode efe not found\n");
+ -		return metadata_fe;
+ -	}
+ -	if (UDF_I(metadata_fe)->i_alloc_type != ICBTAG_FLAG_AD_SHORT) {
+ +	else if (UDF_I(metadata_fe)->i_alloc_type != ICBTAG_FLAG_AD_SHORT) {
+  		udf_warn(sb, "metadata inode efe does not have short allocation descriptors!\n");
+  		iput(metadata_fe);
+ -		return ERR_PTR(-EIO);
+ +		metadata_fe = NULL;
+  	}
+  
+  	return metadata_fe;
+@@@ -944,24 -989,26 +946,35 @@@ static int udf_load_metadata_files(stru
+  
+  	/* metadata address */
+  	udf_debug("Metadata file location: block = %d part = %d\n",
+- 		  mdata->s_meta_file_loc, map->s_partition_num);
++ 		  mdata->s_meta_file_loc, mdata->s_phys_partition_ref);
+  
+++<<<<<<< HEAD
+ +	mdata->s_metadata_fe = udf_find_metadata_inode_efe(sb,
+ +		mdata->s_meta_file_loc, map->s_partition_num);
+ +
+ +	if (mdata->s_metadata_fe == NULL) {
+++=======
++ 	fe = udf_find_metadata_inode_efe(sb, mdata->s_meta_file_loc,
++ 					 mdata->s_phys_partition_ref);
++ 	if (IS_ERR(fe)) {
+++>>>>>>> 7888824b0b1c (udf: Use correct partition reference number for metadata)
+  		/* mirror file entry */
+  		udf_debug("Mirror metadata file location: block = %d part = %d\n",
+- 			  mdata->s_mirror_file_loc, map->s_partition_num);
++ 			  mdata->s_mirror_file_loc, mdata->s_phys_partition_ref);
+  
+++<<<<<<< HEAD
+ +		mdata->s_mirror_fe = udf_find_metadata_inode_efe(sb,
+ +			mdata->s_mirror_file_loc, map->s_partition_num);
+++=======
++ 		fe = udf_find_metadata_inode_efe(sb, mdata->s_mirror_file_loc,
++ 						 mdata->s_phys_partition_ref);
+++>>>>>>> 7888824b0b1c (udf: Use correct partition reference number for metadata)
+  
+ -		if (IS_ERR(fe)) {
+ +		if (mdata->s_mirror_fe == NULL) {
+  			udf_err(sb, "Both metadata and mirror metadata inode efe can not found\n");
+ -			return PTR_ERR(fe);
+ +			return -EIO;
+  		}
+ -		mdata->s_mirror_fe = fe;
+ -	} else
+ -		mdata->s_metadata_fe = fe;
+ -
+ +	}
+  
+  	/*
+  	 * bitmap file entry
+* Unmerged path fs/udf/partition.c
+* Unmerged path fs/udf/super.c
+diff --git a/fs/udf/udf_sb.h b/fs/udf/udf_sb.h
+index ed401e94aa8c..3f1de4926448 100644
+--- a/fs/udf/udf_sb.h
++++ b/fs/udf/udf_sb.h
+@@ -63,6 +63,11 @@ struct udf_meta_data {
+ 	__u32	s_bitmap_file_loc;
+ 	__u32	s_alloc_unit_size;
+ 	__u16	s_align_unit_size;
++	/*
++	 * Partition Reference Number of the associated physical / sparable
++	 * partition
++	 */
++	__u16   s_phys_partition_ref;
+ 	int	s_flags;
+ 	struct inode *s_metadata_fe;
+ 	struct inode *s_mirror_fe;
