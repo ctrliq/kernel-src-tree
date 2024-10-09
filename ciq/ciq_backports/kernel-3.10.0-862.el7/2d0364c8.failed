@@ -1,0 +1,158 @@
+blk-mq: Register <dev>/queue/mq after having registered <dev>/queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 2d0364c8c1a97a1d44760895a982221c06af0f35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2d0364c8.failed
+
+A later patch in this series will modify blk_mq_debugfs_register()
+such that it uses q->kobj.parent to determine the name of a
+request queue. Hence make sure that that pointer is initialized
+before blk_mq_debugfs_register() is called. To avoid lock inversion,
+protect sysfs / debugfs registration with the queue sysfs_lock
+instead of the global mutex all_q_mutex.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 2d0364c8c1a97a1d44760895a982221c06af0f35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sysfs.c
+#	block/blk-mq.h
+#	block/blk-sysfs.c
+diff --cc block/blk-mq-sysfs.c
+index 44799e473f05,a2dbb1a48e72..000000000000
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@@ -375,17 -251,14 +375,23 @@@ static int blk_mq_register_hctx(struct 
+  static void __blk_mq_unregister_dev(struct device *dev, struct request_queue *q)
+  {
+  	struct blk_mq_hw_ctx *hctx;
+ -	int i;
+ +	struct blk_mq_ctx *ctx;
+ +	int i, j;
+  
+++<<<<<<< HEAD
+ +	queue_for_each_hw_ctx(q, hctx, i) {
+++=======
++ 	lockdep_assert_held(&q->sysfs_lock);
++ 
++ 	queue_for_each_hw_ctx(q, hctx, i)
+++>>>>>>> 2d0364c8c1a9 (blk-mq: Register <dev>/queue/mq after having registered <dev>/queue)
+  		blk_mq_unregister_hctx(hctx);
+  
+ -	blk_mq_debugfs_unregister_hctxs(q);
+ +		hctx_for_each_ctx(hctx, ctx, j)
+ +			kobject_put(&ctx->kobj);
+ +
+ +		kobject_put(&hctx->kobj);
+ +	}
+  
+  	kobject_uevent(&q->mq_kobj, KOBJ_REMOVE);
+  	kobject_del(&q->mq_kobj);
+@@@ -426,10 -309,9 +432,11 @@@ int __blk_mq_register_dev(struct devic
+  	struct blk_mq_hw_ctx *hctx;
+  	int ret, i;
+  
+- 	blk_mq_disable_hotplug();
++ 	WARN_ON_ONCE(!q->kobj.parent);
++ 	lockdep_assert_held(&q->sysfs_lock);
+  
+ +	blk_mq_sysfs_init(q);
+ +
+  	ret = kobject_add(&q->mq_kobj, kobject_get(&dev->kobj), "%s", "mq");
+  	if (ret < 0)
+  		goto out;
+@@@ -458,11 -352,17 +475,15 @@@ void blk_mq_sysfs_unregister(struct req
+  	struct blk_mq_hw_ctx *hctx;
+  	int i;
+  
++ 	mutex_lock(&q->sysfs_lock);
+  	if (!q->mq_sysfs_init_done)
+- 		return;
++ 		goto unlock;
+  
+ -	blk_mq_debugfs_unregister_hctxs(q);
+ -
+  	queue_for_each_hw_ctx(q, hctx, i)
+  		blk_mq_unregister_hctx(hctx);
++ 
++ unlock:
++ 	mutex_unlock(&q->sysfs_lock);
+  }
+  
+  int blk_mq_sysfs_register(struct request_queue *q)
+@@@ -470,9 -370,12 +491,10 @@@
+  	struct blk_mq_hw_ctx *hctx;
+  	int i, ret = 0;
+  
++ 	mutex_lock(&q->sysfs_lock);
+  	if (!q->mq_sysfs_init_done)
+- 		return ret;
++ 		goto unlock;
+  
+ -	blk_mq_debugfs_register_hctxs(q);
+ -
+  	queue_for_each_hw_ctx(q, hctx, i) {
+  		ret = blk_mq_register_hctx(hctx);
+  		if (ret)
+diff --cc block/blk-mq.h
+index 2d50f02667c4,7d955c756810..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -57,6 -70,15 +57,12 @@@ extern int blk_mq_hw_queue_to_node(unsi
+  /*
+   * sysfs helpers
+   */
+++<<<<<<< HEAD
+++=======
++ extern void blk_mq_sysfs_init(struct request_queue *q);
++ extern void blk_mq_sysfs_deinit(struct request_queue *q);
++ extern int __blk_mq_register_dev(struct device *dev, struct request_queue *q);
+++>>>>>>> 2d0364c8c1a9 (blk-mq: Register <dev>/queue/mq after having registered <dev>/queue)
+  extern int blk_mq_sysfs_register(struct request_queue *q);
+  extern void blk_mq_sysfs_unregister(struct request_queue *q);
+  extern void blk_mq_hctx_kobj_init(struct blk_mq_hw_ctx *hctx);
+diff --cc block/blk-sysfs.c
+index 28651fcb101c,3f37813ccbaf..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -610,16 -877,23 +610,25 @@@ int blk_register_queue(struct gendisk *
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Prevent changes through sysfs until registration is completed. */
++ 	mutex_lock(&q->sysfs_lock);
++ 
+++>>>>>>> 2d0364c8c1a9 (blk-mq: Register <dev>/queue/mq after having registered <dev>/queue)
+  	ret = kobject_add(&q->kobj, kobject_get(&dev->kobj), "%s", "queue");
+  	if (ret < 0) {
+  		blk_trace_remove_sysfs(dev);
+ -		goto unlock;
+ +		return ret;
+  	}
+  
++ 	if (q->mq_ops)
++ 		__blk_mq_register_dev(dev, q);
++ 
+  	kobject_uevent(&q->kobj, KOBJ_ADD);
+  
+ -	wbt_enable_default(q);
+ -
+ -	blk_throtl_register_queue(q);
+ +	if (q->mq_ops)
+ +		blk_mq_register_dev(dev, q);
+  
+  	if (q->request_fn || (q->mq_ops && q->elevator)) {
+  		ret = elv_register_queue(q);
+* Unmerged path block/blk-mq-sysfs.c
+* Unmerged path block/blk-mq.h
+* Unmerged path block/blk-sysfs.c
