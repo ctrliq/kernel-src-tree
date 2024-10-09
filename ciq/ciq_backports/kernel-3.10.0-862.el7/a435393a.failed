@@ -1,0 +1,600 @@
+mlx5: move affinity hints assignments to generic code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit a435393acafbf0ecff4deb3e3cb554b34f0d0664
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a435393a.failed
+
+generic api takes care of spreading affinity similar to
+what mlx5 open coded (and even handles better asymmetric
+configurations). Ask the generic API to spread affinity
+for us, and feed him pre_vectors that do not participate
+in affinity settings (which is an improvement to what we
+had before).
+
+The affinity assignments should match what mlx5 tried to
+do earlier but now we do not set affinity to async, cmd
+and pages dedicated vectors.
+
+Also, remove mlx5e_get_cpu and introduce mlx5e_get_node
+(used for allocation purposes) and mlx5_get_vector_affinity
+(for indirection table construction) as they provide the needed
+information. Luckily, we have generic helpers to get cpumask
+and node given a irq vector. mlx5_get_vector_affinity will
+be used by mlx5_ib in a subsequent patch.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit a435393acafbf0ecff4deb3e3cb554b34f0d0664)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 950c1d21ad52,fb647561c592..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -546,9 -567,9 +552,13 @@@ static int mlx5e_create_rq(struct mlx5e
+  	int err;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	param->wq.db_numa_node = cpu_to_node(c->cpu);
+++=======
++ 	rqp->wq.db_numa_node = mlx5e_get_node(c->priv, c->ix);
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  
+ -	err = mlx5_wq_ll_create(mdev, &rqp->wq, rqc_wq, &rq->wq,
+ +	err = mlx5_wq_ll_create(mdev, &param->wq, rqc_wq, &rq->wq,
+  				&rq->wq_ctrl);
+  	if (err)
+  		return err;
+@@@ -592,9 -632,11 +602,17 @@@
+  			goto err_destroy_umr_mkey;
+  		break;
+  	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+++<<<<<<< HEAD
+ +		rq->dma_info = kzalloc_node(wq_sz * sizeof(*rq->dma_info),
+ +					    GFP_KERNEL, cpu_to_node(c->cpu));
+ +		if (!rq->dma_info) {
+++=======
++ 		rq->wqe.frag_info =
++ 			kzalloc_node(wq_sz * sizeof(*rq->wqe.frag_info),
++ 				     GFP_KERNEL,
++ 				     mlx5e_get_node(c->priv, c->ix));
++ 		if (!rq->wqe.frag_info) {
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  			err = -ENOMEM;
+  			goto err_rq_wq_destroy;
+  		}
+@@@ -856,14 -956,75 +874,76 @@@ static void mlx5e_close_rq(struct mlx5e
+  {
+  	clear_bit(MLX5E_RQ_STATE_ENABLED, &rq->state);
+  	napi_synchronize(&rq->channel->napi); /* prevent mlx5e_post_rx_wqes */
+ -}
+ -
+ -static void mlx5e_close_rq(struct mlx5e_rq *rq)
+ -{
+  	cancel_work_sync(&rq->am.work);
+ -	mlx5e_destroy_rq(rq);
+ +
+ +	mlx5e_disable_rq(rq);
+  	mlx5e_free_rx_descs(rq);
+ -	mlx5e_free_rq(rq);
+ +	mlx5e_destroy_rq(rq);
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5e_free_sq_ico_db(struct mlx5e_sq *sq)
+++=======
++ static void mlx5e_free_xdpsq_db(struct mlx5e_xdpsq *sq)
++ {
++ 	kfree(sq->db.di);
++ }
++ 
++ static int mlx5e_alloc_xdpsq_db(struct mlx5e_xdpsq *sq, int numa)
++ {
++ 	int wq_sz = mlx5_wq_cyc_get_size(&sq->wq);
++ 
++ 	sq->db.di = kzalloc_node(sizeof(*sq->db.di) * wq_sz,
++ 				     GFP_KERNEL, numa);
++ 	if (!sq->db.di) {
++ 		mlx5e_free_xdpsq_db(sq);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
++ 			     struct mlx5e_params *params,
++ 			     struct mlx5e_sq_param *param,
++ 			     struct mlx5e_xdpsq *sq)
++ {
++ 	void *sqc_wq               = MLX5_ADDR_OF(sqc, param->sqc, wq);
++ 	struct mlx5_core_dev *mdev = c->mdev;
++ 	int err;
++ 
++ 	sq->pdev      = c->pdev;
++ 	sq->mkey_be   = c->mkey_be;
++ 	sq->channel   = c;
++ 	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
++ 	sq->min_inline_mode = params->tx_min_inline_mode;
++ 
++ 	param->wq.db_numa_node = mlx5e_get_node(c->priv, c->ix);
++ 	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, &sq->wq, &sq->wq_ctrl);
++ 	if (err)
++ 		return err;
++ 	sq->wq.db = &sq->wq.db[MLX5_SND_DBR];
++ 
++ 	err = mlx5e_alloc_xdpsq_db(sq, mlx5e_get_node(c->priv, c->ix));
++ 	if (err)
++ 		goto err_sq_wq_destroy;
++ 
++ 	return 0;
++ 
++ err_sq_wq_destroy:
++ 	mlx5_wq_destroy(&sq->wq_ctrl);
++ 
++ 	return err;
++ }
++ 
++ static void mlx5e_free_xdpsq(struct mlx5e_xdpsq *sq)
++ {
++ 	mlx5e_free_xdpsq_db(sq);
++ 	mlx5_wq_destroy(&sq->wq_ctrl);
++ }
++ 
++ static void mlx5e_free_icosq_db(struct mlx5e_icosq *sq)
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  {
+  	kfree(sq->db.ico_wqe);
+  }
+@@@ -880,14 -1041,52 +960,44 @@@ static int mlx5e_alloc_sq_ico_db(struc
+  	return 0;
+  }
+  
+ -static int mlx5e_alloc_icosq(struct mlx5e_channel *c,
+ -			     struct mlx5e_sq_param *param,
+ -			     struct mlx5e_icosq *sq)
+ +static void mlx5e_free_sq_txq_db(struct mlx5e_sq *sq)
+  {
+++<<<<<<< HEAD
+ +	kfree(sq->db.txq.wqe_info);
+ +	kfree(sq->db.txq.dma_fifo);
+ +	kfree(sq->db.txq.skb);
+++=======
++ 	void *sqc_wq               = MLX5_ADDR_OF(sqc, param->sqc, wq);
++ 	struct mlx5_core_dev *mdev = c->mdev;
++ 	int err;
++ 
++ 	sq->pdev      = c->pdev;
++ 	sq->mkey_be   = c->mkey_be;
++ 	sq->channel   = c;
++ 	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
++ 
++ 	param->wq.db_numa_node = mlx5e_get_node(c->priv, c->ix);
++ 	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, &sq->wq, &sq->wq_ctrl);
++ 	if (err)
++ 		return err;
++ 	sq->wq.db = &sq->wq.db[MLX5_SND_DBR];
++ 
++ 	err = mlx5e_alloc_icosq_db(sq, mlx5e_get_node(c->priv, c->ix));
++ 	if (err)
++ 		goto err_sq_wq_destroy;
++ 
++ 	sq->edge = (sq->wq.sz_m1 + 1) - MLX5E_ICOSQ_MAX_WQEBBS;
++ 
++ 	return 0;
++ 
++ err_sq_wq_destroy:
++ 	mlx5_wq_destroy(&sq->wq_ctrl);
++ 
++ 	return err;
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  }
+  
+ -static void mlx5e_free_icosq(struct mlx5e_icosq *sq)
+ -{
+ -	mlx5e_free_icosq_db(sq);
+ -	mlx5_wq_destroy(&sq->wq_ctrl);
+ -}
+ -
+ -static void mlx5e_free_txqsq_db(struct mlx5e_txqsq *sq)
+ -{
+ -	kfree(sq->db.wqe_info);
+ -	kfree(sq->db.dma_fifo);
+ -}
+ -
+ -static int mlx5e_alloc_txqsq_db(struct mlx5e_txqsq *sq, int numa)
+ +static int mlx5e_alloc_sq_txq_db(struct mlx5e_sq *sq, int numa)
+  {
+  	int wq_sz = mlx5_wq_cyc_get_size(&sq->wq);
+  	int df_sz = wq_sz * MLX5_SEND_WQEBB_NUM_DS;
+@@@ -908,76 -1105,34 +1018,85 @@@
+  	return 0;
+  }
+  
+ -static int mlx5e_alloc_txqsq(struct mlx5e_channel *c,
+ -			     int txq_ix,
+ -			     struct mlx5e_params *params,
+ -			     struct mlx5e_sq_param *param,
+ -			     struct mlx5e_txqsq *sq)
+ +static void mlx5e_free_sq_db(struct mlx5e_sq *sq)
+  {
+ -	void *sqc_wq               = MLX5_ADDR_OF(sqc, param->sqc, wq);
+ -	struct mlx5_core_dev *mdev = c->mdev;
+ +	switch (sq->type) {
+ +	case MLX5E_SQ_TXQ:
+ +		mlx5e_free_sq_txq_db(sq);
+ +		break;
+ +	case MLX5E_SQ_ICO:
+ +		mlx5e_free_sq_ico_db(sq);
+ +		break;
+ +	}
+ +}
+ +
+ +static int mlx5e_alloc_sq_db(struct mlx5e_sq *sq, int numa)
+ +{
+ +	switch (sq->type) {
+ +	case MLX5E_SQ_TXQ:
+ +		return mlx5e_alloc_sq_txq_db(sq, numa);
+ +	case MLX5E_SQ_ICO:
+ +		return mlx5e_alloc_sq_ico_db(sq, numa);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int mlx5e_create_sq(struct mlx5e_channel *c,
+ +			   int tc,
+ +			   struct mlx5e_sq_param *param,
+ +			   struct mlx5e_sq *sq)
+ +{
+ +	struct mlx5e_priv *priv = c->priv;
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+ +
+ +	void *sqc = param->sqc;
+ +	void *sqc_wq = MLX5_ADDR_OF(sqc, sqc, wq);
+ +	u16 sq_max_wqebbs;
+  	int err;
+  
+ +	sq->type      = param->type;
+  	sq->pdev      = c->pdev;
+ -	sq->tstamp    = c->tstamp;
+ +	sq->tstamp    = &priv->tstamp;
+  	sq->mkey_be   = c->mkey_be;
+  	sq->channel   = c;
+ -	sq->txq_ix    = txq_ix;
+ -	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
+ -	sq->max_inline      = params->tx_max_inline;
+ -	sq->min_inline_mode = params->tx_min_inline_mode;
+ -	if (MLX5_IPSEC_DEV(c->priv->mdev))
+ -		set_bit(MLX5E_SQ_STATE_IPSEC, &sq->state);
+ +	sq->tc        = tc;
+  
+++<<<<<<< HEAD
+ +	err = mlx5_alloc_map_uar(mdev, &sq->uar, !!MLX5_CAP_GEN(mdev, bf));
+++=======
++ 	param->wq.db_numa_node = mlx5e_get_node(c->priv, c->ix);
++ 	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, &sq->wq, &sq->wq_ctrl);
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  	if (err)
+  		return err;
+ -	sq->wq.db    = &sq->wq.db[MLX5_SND_DBR];
+  
+++<<<<<<< HEAD
+ +	sq->uar_map = sq->bfreg.map;
+ +	param->wq.db_numa_node = cpu_to_node(c->cpu);
+ +
+ +	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, &sq->wq,
+ +				 &sq->wq_ctrl);
+ +	if (err)
+ +		goto err_unmap_free_uar;
+ +
+ +	sq->wq.db       = &sq->wq.db[MLX5_SND_DBR];
+ +	if (sq->uar.bf_map) {
+ +		set_bit(MLX5E_SQ_STATE_BF_ENABLE, &sq->state);
+ +		sq->uar_map = sq->uar.bf_map;
+ +	} else {
+ +		sq->uar_map = sq->uar.map;
+ +	}
+ +	sq->bf_buf_size = (1 << MLX5_CAP_GEN(mdev, log_bf_reg_size)) / 2;
+ +	sq->max_inline  = param->max_inline;
+ +	sq->min_inline_mode =
+ +		MLX5_CAP_ETH(mdev, wqe_inline_mode) == MLX5_CAP_INLINE_MODE_VPORT_CONTEXT ?
+ +		param->min_inline_mode : 0;
+ +
+ +	err = mlx5e_alloc_sq_db(sq, cpu_to_node(c->cpu));
+++=======
++ 	err = mlx5e_alloc_txqsq_db(sq, mlx5e_get_node(c->priv, c->ix));
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  	if (err)
+  		goto err_sq_wq_destroy;
+  
+@@@ -1220,7 -1497,26 +1339,30 @@@ static int mlx5e_create_cq(struct mlx5e
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5e_destroy_cq(struct mlx5e_cq *cq)
+++=======
++ static int mlx5e_alloc_cq(struct mlx5e_channel *c,
++ 			  struct mlx5e_cq_param *param,
++ 			  struct mlx5e_cq *cq)
++ {
++ 	struct mlx5_core_dev *mdev = c->priv->mdev;
++ 	int err;
++ 
++ 	param->wq.buf_numa_node = mlx5e_get_node(c->priv, c->ix);
++ 	param->wq.db_numa_node  = mlx5e_get_node(c->priv, c->ix);
++ 	param->eq_ix   = c->ix;
++ 
++ 	err = mlx5e_alloc_cq_common(mdev, param, cq);
++ 
++ 	cq->napi    = &c->napi;
++ 	cq->channel = c;
++ 
++ 	return err;
++ }
++ 
++ static void mlx5e_free_cq(struct mlx5e_cq *cq)
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  {
+  	mlx5_cqwq_destroy(&cq->wq_ctrl);
+  }
+@@@ -1311,19 -1600,14 +1453,14 @@@ err_destroy_cq
+  
+  static void mlx5e_close_cq(struct mlx5e_cq *cq)
+  {
+ +	mlx5e_disable_cq(cq);
+  	mlx5e_destroy_cq(cq);
+ -	mlx5e_free_cq(cq);
+  }
+  
+- static int mlx5e_get_cpu(struct mlx5e_priv *priv, int ix)
+- {
+- 	return cpumask_first(priv->mdev->priv.irq_info[ix].mask);
+- }
+- 
+  static int mlx5e_open_tx_cqs(struct mlx5e_channel *c,
+ -			     struct mlx5e_params *params,
+  			     struct mlx5e_channel_param *cparam)
+  {
+ +	struct mlx5e_priv *priv = c->priv;
+  	int err;
+  	int tc;
+  
+@@@ -1466,22 -1749,20 +1603,24 @@@ static int mlx5e_open_channel(struct ml
+  			      struct mlx5e_channel_param *cparam,
+  			      struct mlx5e_channel **cp)
+  {
+ -	struct mlx5e_cq_moder icocq_moder = {0, 0};
+ +	struct mlx5e_cq_moder icosq_cq_moder = {0, 0};
+  	struct net_device *netdev = priv->netdev;
+++<<<<<<< HEAD
+ +	struct mlx5e_cq_moder rx_cq_profile;
+ +	int cpu = mlx5e_get_cpu(priv, ix);
+++=======
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  	struct mlx5e_channel *c;
+ +	struct mlx5e_sq *sq;
+  	int err;
+ +	int i;
+  
+- 	c = kzalloc_node(sizeof(*c), GFP_KERNEL, cpu_to_node(cpu));
++ 	c = kzalloc_node(sizeof(*c), GFP_KERNEL, mlx5e_get_node(priv, ix));
+  	if (!c)
+  		return -ENOMEM;
+  
+  	c->priv     = priv;
+ -	c->mdev     = priv->mdev;
+ -	c->tstamp   = &priv->tstamp;
+  	c->ix       = ix;
+- 	c->cpu      = cpu;
+  	c->pdev     = &priv->mdev->pdev->dev;
+  	c->netdev   = priv->netdev;
+  	c->mkey_be  = cpu_to_be32(priv->mdev->mlx5e_res.mkey.key);
+@@@ -1561,6 -1841,26 +1700,29 @@@ err_napi_del
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_activate_channel(struct mlx5e_channel *c)
++ {
++ 	int tc;
++ 
++ 	for (tc = 0; tc < c->num_tc; tc++)
++ 		mlx5e_activate_txqsq(&c->sq[tc]);
++ 	mlx5e_activate_rq(&c->rq);
++ 	netif_set_xps_queue(c->netdev,
++ 		mlx5_get_vector_affinity(c->priv->mdev, c->ix), c->ix);
++ }
++ 
++ static void mlx5e_deactivate_channel(struct mlx5e_channel *c)
++ {
++ 	int tc;
++ 
++ 	mlx5e_deactivate_rq(&c->rq);
++ 	for (tc = 0; tc < c->num_tc; tc++)
++ 		mlx5e_deactivate_txqsq(&c->sq[tc]);
++ }
++ 
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  static void mlx5e_close_channel(struct mlx5e_channel *c)
+  {
+  	mlx5e_close_rq(&c->rq);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 593e3ff970b9,e464e8179655..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -293,9 -316,11 +293,12 @@@ static int mlx5_enable_msix(struct mlx5
+  {
+  	struct mlx5_priv *priv = &dev->priv;
+  	struct mlx5_eq_table *table = &priv->eq_table;
++ 	struct irq_affinity irqdesc = {
++ 		.pre_vectors = MLX5_EQ_VEC_COMP_BASE,
++ 	};
+  	int num_eqs = 1 << MLX5_CAP_GEN(dev, log_max_eq);
+  	int nvec;
+ +	int i;
+  
+  	nvec = MLX5_CAP_GEN(dev, num_ports) * num_online_cpus() +
+  	       MLX5_EQ_VEC_COMP_BASE;
+@@@ -303,17 -328,14 +306,24 @@@
+  	if (nvec <= MLX5_EQ_VEC_COMP_BASE)
+  		return -ENOMEM;
+  
+ +	priv->msix_arr = kcalloc(nvec, sizeof(*priv->msix_arr), GFP_KERNEL);
+ +
+  	priv->irq_info = kcalloc(nvec, sizeof(*priv->irq_info), GFP_KERNEL);
+ -	if (!priv->irq_info)
+ +	if (!priv->msix_arr || !priv->irq_info)
+  		goto err_free_msix;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < nvec; i++)
+ +		priv->msix_arr[i].entry = i;
+ +
+ +	nvec = pci_enable_msix_range(dev->pdev, priv->msix_arr,
+ +				     MLX5_EQ_VEC_COMP_BASE + 1, nvec);
+++=======
++ 	nvec = pci_alloc_irq_vectors_affinity(dev->pdev,
++ 			MLX5_EQ_VEC_COMP_BASE + 1, nvec,
++ 			PCI_IRQ_MSIX | PCI_IRQ_AFFINITY,
++ 			&irqdesc);
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  	if (nvec < 0)
+  		return nvec;
+  
+@@@ -587,68 -606,9 +597,71 @@@ cycle_t mlx5_read_internal_timer(struc
+  	if (timer_h != timer_h1) /* wrap around */
+  		timer_l = ioread32be(&dev->iseg->internal_timer_l);
+  
+ -	return (u64)timer_l | (u64)timer_h1 << 32;
+ +	return (cycle_t)timer_l | (cycle_t)timer_h1 << 32;
+ +}
+ +
+++<<<<<<< HEAD
+ +static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
+ +{
+ +	struct mlx5_priv *priv  = &mdev->priv;
+ +	struct msix_entry *msix = priv->msix_arr;
+ +	int irq                 = msix[i + MLX5_EQ_VEC_COMP_BASE].vector;
+ +
+ +	if (!zalloc_cpumask_var(&priv->irq_info[i].mask, GFP_KERNEL)) {
+ +		mlx5_core_warn(mdev, "zalloc_cpumask_var failed");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	cpumask_set_cpu(cpumask_local_spread(i, priv->numa_node),
+ +			priv->irq_info[i].mask);
+ +
+ +	if (IS_ENABLED(CONFIG_SMP) &&
+ +	    irq_set_affinity_hint(irq, priv->irq_info[i].mask))
+ +		mlx5_core_warn(mdev, "irq_set_affinity_hint failed, irq 0x%.4x", irq);
+ +
+ +	return 0;
+ +}
+ +
+ +static void mlx5_irq_clear_affinity_hint(struct mlx5_core_dev *mdev, int i)
+ +{
+ +	struct mlx5_priv *priv  = &mdev->priv;
+ +	struct msix_entry *msix = priv->msix_arr;
+ +	int irq                 = msix[i + MLX5_EQ_VEC_COMP_BASE].vector;
+ +
+ +	irq_set_affinity_hint(irq, NULL);
+ +	free_cpumask_var(priv->irq_info[i].mask);
+ +}
+ +
+ +static int mlx5_irq_set_affinity_hints(struct mlx5_core_dev *mdev)
+ +{
+ +	int err;
+ +	int i;
+ +
+ +	for (i = 0; i < mdev->priv.eq_table.num_comp_vectors; i++) {
+ +		err = mlx5_irq_set_affinity_hint(mdev, i);
+ +		if (err)
+ +			goto err_out;
+ +	}
+ +
+ +	return 0;
+ +
+ +err_out:
+ +	for (i--; i >= 0; i--)
+ +		mlx5_irq_clear_affinity_hint(mdev, i);
+ +
+ +	return err;
+  }
+  
+ +static void mlx5_irq_clear_affinity_hints(struct mlx5_core_dev *mdev)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < mdev->priv.eq_table.num_comp_vectors; i++)
+ +		mlx5_irq_clear_affinity_hint(mdev, i);
+ +}
+ +
+++=======
+++>>>>>>> a435393acafb (mlx5: move affinity hints assignments to generic code)
+  int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn,
+  		    unsigned int *irqn)
+  {
+@@@ -1229,11 -1212,10 +1233,10 @@@ static int mlx5_unload_one(struct mlx5_
+  	mlx5_eswitch_detach(dev->priv.eswitch);
+  #endif
+  	mlx5_cleanup_fs(dev);
+- 	mlx5_irq_clear_affinity_hints(dev);
+  	free_comp_eqs(dev);
+  	mlx5_stop_eqs(dev);
+ -	mlx5_put_uars_page(dev, priv->uar);
+ -	mlx5_free_irq_vectors(dev);
+ +	mlx5_free_uuars(dev, &priv->uuari);
+ +	mlx5_disable_msix(dev);
+  	if (cleanup)
+  		mlx5_cleanup_once(dev);
+  	mlx5_stop_health_poll(dev);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index efce1dc691aa..ba25a2bd4bce 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -511,7 +511,6 @@ struct mlx5e_channel {
+ 	/* control */
+ 	struct mlx5e_priv         *priv;
+ 	int                        ix;
+-	int                        cpu;
+ };
+ 
+ enum mlx5e_traffic_types {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 522c3e2f587a..17ba1892c4dd 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -502,7 +502,6 @@ struct mlx5_core_sriov {
+ };
+ 
+ struct mlx5_irq_info {
+-	cpumask_var_t mask;
+ 	char name[MLX5_MAX_IRQ_NAME];
+ };
+ 
+@@ -1051,4 +1050,10 @@ enum {
+ 	MLX5_TRIGGERED_CMD_COMP = (u64)1 << 32,
+ };
+ 
++static inline const struct cpumask *
++mlx5_get_vector_affinity(struct mlx5_core_dev *dev, int vector)
++{
++	return pci_irq_get_affinity(dev->pdev, MLX5_EQ_VEC_COMP_BASE + vector);
++}
++
+ #endif /* MLX5_DRIVER_H */
