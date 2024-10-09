@@ -1,0 +1,272 @@
+gfs2: gfs2_glock_get: Wait on freeing glocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 0515480ad424f2d6853ffe448f444ba3c756c057
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0515480a.failed
+
+Keep glocks in their hash table until they are freed instead of removing
+them when their last reference is dropped.  This allows to wait for any
+previous instances of a glock to go away in gfs2_glock_get before
+creating a new glocks.
+
+Special thanks to Andy Price for finding and fixing a problem which also
+required us to delete the rcu_read_unlock from the error case in function
+gfs2_glock_get.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 0515480ad424f2d6853ffe448f444ba3c756c057)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 11b05fe84e1a,11d48b964047..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -78,9 -81,69 +79,73 @@@ static struct rhashtable_params ht_parm
+  
+  static struct rhashtable gl_hash_table;
+  
+++<<<<<<< HEAD
+ +void gfs2_glock_free(struct gfs2_glock *gl)
+++=======
++ #define GLOCK_WAIT_TABLE_BITS 12
++ #define GLOCK_WAIT_TABLE_SIZE (1 << GLOCK_WAIT_TABLE_BITS)
++ static wait_queue_head_t glock_wait_table[GLOCK_WAIT_TABLE_SIZE] __cacheline_aligned;
++ 
++ struct wait_glock_queue {
++ 	struct lm_lockname *name;
++ 	wait_queue_entry_t wait;
++ };
++ 
++ static int glock_wake_function(wait_queue_entry_t *wait, unsigned int mode,
++ 			       int sync, void *key)
++ {
++ 	struct wait_glock_queue *wait_glock =
++ 		container_of(wait, struct wait_glock_queue, wait);
++ 	struct lm_lockname *wait_name = wait_glock->name;
++ 	struct lm_lockname *wake_name = key;
++ 
++ 	if (wake_name->ln_sbd != wait_name->ln_sbd ||
++ 	    wake_name->ln_number != wait_name->ln_number ||
++ 	    wake_name->ln_type != wait_name->ln_type)
++ 		return 0;
++ 	return autoremove_wake_function(wait, mode, sync, key);
++ }
++ 
++ static wait_queue_head_t *glock_waitqueue(struct lm_lockname *name)
++ {
++ 	u32 hash = jhash2((u32 *)name, sizeof(*name) / 4, 0);
++ 
++ 	return glock_wait_table + hash_32(hash, GLOCK_WAIT_TABLE_BITS);
++ }
++ 
++ static void prepare_to_wait_on_glock(wait_queue_head_t **wq,
++ 				     struct wait_glock_queue *wait,
++ 				     struct lm_lockname *name)
++ {
++ 	wait->name = name;
++ 	init_wait(&wait->wait);
++ 	wait->wait.func = glock_wake_function;
++ 	*wq = glock_waitqueue(name);
++ 	prepare_to_wait(*wq, &wait->wait, TASK_UNINTERRUPTIBLE);
++ }
++ 
++ static void finish_wait_on_glock(wait_queue_head_t *wq,
++ 				 struct wait_glock_queue *wait)
++ {
++ 	finish_wait(wq, &wait->wait);
++ }
++ 
++ /**
++  * wake_up_glock  -  Wake up waiters on a glock
++  * @gl: the glock
++  */
++ static void wake_up_glock(struct gfs2_glock *gl)
++ {
++ 	wait_queue_head_t *wq = glock_waitqueue(&gl->gl_name);
++ 
++ 	if (waitqueue_active(wq))
++ 		__wake_up(wq, TASK_NORMAL, 1, &gl->gl_name);
++ }
++ 
++ static void gfs2_glock_dealloc(struct rcu_head *rcu)
+++>>>>>>> 0515480ad424 (gfs2: gfs2_glock_get: Wait on freeing glocks)
+  {
+ -	struct gfs2_glock *gl = container_of(rcu, struct gfs2_glock, gl_rcu);
+ +	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  
+  	if (gl->gl_ops->go_flags & GLOF_ASPACE) {
+  		kmem_cache_free(gfs2_glock_aspace_cachep, gl);
+@@@ -88,6 -151,16 +153,19 @@@
+  		kfree(gl->gl_lksb.sb_lvbptr);
+  		kmem_cache_free(gfs2_glock_cachep, gl);
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ void gfs2_glock_free(struct gfs2_glock *gl)
++ {
++ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++ 
++ 	rhashtable_remove_fast(&gl_hash_table, &gl->gl_node, ht_parms);
++ 	smp_mb();
++ 	wake_up_glock(gl);
++ 	call_rcu(&gl->gl_rcu, gfs2_glock_dealloc);
+++>>>>>>> 0515480ad424 (gfs2: gfs2_glock_get: Wait on freeing glocks)
+  	if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+  		wake_up(&sdp->sd_glock_wait);
+  }
+@@@ -146,13 -223,45 +224,27 @@@ static void __gfs2_glock_remove_from_lr
+  		atomic_dec(&lru_count);
+  		clear_bit(GLF_LRU, &gl->gl_flags);
+  	}
+ -	spin_unlock(&lru_lock);
+ -}
+ -
+ -/*
+ - * Enqueue the glock on the work queue.  Passes one glock reference on to the
+ - * work queue.
+ - */
+ -static void __gfs2_glock_queue_work(struct gfs2_glock *gl, unsigned long delay) {
+ -	if (!queue_delayed_work(glock_workqueue, &gl->gl_work, delay)) {
+ -		/*
+ -		 * We are holding the lockref spinlock, and the work was still
+ -		 * queued above.  The queued work (glock_work_func) takes that
+ -		 * spinlock before dropping its glock reference(s), so it
+ -		 * cannot have dropped them in the meantime.
+ -		 */
+ -		GLOCK_BUG_ON(gl, gl->gl_lockref.count < 2);
+ -		gl->gl_lockref.count--;
+ -	}
+ -}
+ -
+ -static void gfs2_glock_queue_work(struct gfs2_glock *gl, unsigned long delay) {
+ -	spin_lock(&gl->gl_lockref.lock);
+ -	__gfs2_glock_queue_work(gl, delay);
+ -	spin_unlock(&gl->gl_lockref.lock);
+  }
+  
+ -static void __gfs2_glock_put(struct gfs2_glock *gl)
+ +static void gfs2_glock_remove_from_lru(struct gfs2_glock *gl)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&lru_lock);
+ +	__gfs2_glock_remove_from_lru(gl);
+ +	spin_unlock(&lru_lock);
+++=======
++ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++ 	struct address_space *mapping = gfs2_glock2aspace(gl);
++ 
++ 	lockref_mark_dead(&gl->gl_lockref);
++ 
++ 	gfs2_glock_remove_from_lru(gl);
++ 	spin_unlock(&gl->gl_lockref.lock);
++ 	GLOCK_BUG_ON(gl, !list_empty(&gl->gl_holders));
++ 	GLOCK_BUG_ON(gl, mapping && mapping->nrpages);
++ 	trace_gfs2_glock_put(gl);
++ 	sdp->sd_lockstruct.ls_ops->lm_put_lock(gl);
+++>>>>>>> 0515480ad424 (gfs2: gfs2_glock_get: Wait on freeing glocks)
+  }
+  
+  /**
+@@@ -628,19 -721,57 +720,49 @@@ static void glock_work_func(struct work
+  		}
+  	}
+  	run_queue(gl, 0);
+ -	if (delay) {
+ -		/* Keep one glock reference for the work we requeue. */
+ -		drop_refs--;
+ +	spin_unlock(&gl->gl_spin);
+ +	if (!delay)
+ +		gfs2_glock_put(gl);
+ +	else {
+  		if (gl->gl_name.ln_type != LM_TYPE_INODE)
+  			delay = 0;
+ -		__gfs2_glock_queue_work(gl, delay);
+ +		if (queue_delayed_work(glock_workqueue, &gl->gl_work, delay) == 0)
+ +			gfs2_glock_put(gl);
+  	}
+ -
+ -	/*
+ -	 * Drop the remaining glock references manually here. (Mind that
+ -	 * __gfs2_glock_queue_work depends on the lockref spinlock begin held
+ -	 * here as well.)
+ -	 */
+ -	gl->gl_lockref.count -= drop_refs;
+ -	if (!gl->gl_lockref.count) {
+ -		__gfs2_glock_put(gl);
+ -		return;
+ -	}
+ -	spin_unlock(&gl->gl_lockref.lock);
+ +	if (drop_ref)
+ +		gfs2_glock_put(gl);
+  }
+  
++ static struct gfs2_glock *find_insert_glock(struct lm_lockname *name,
++ 					    struct gfs2_glock *new)
++ {
++ 	struct wait_glock_queue wait;
++ 	wait_queue_head_t *wq;
++ 	struct gfs2_glock *gl;
++ 
++ again:
++ 	prepare_to_wait_on_glock(&wq, &wait, name);
++ 	rcu_read_lock();
++ 	if (new) {
++ 		gl = rhashtable_lookup_get_insert_fast(&gl_hash_table,
++ 			&new->gl_node, ht_parms);
++ 		if (IS_ERR(gl))
++ 			goto out;
++ 	} else {
++ 		gl = rhashtable_lookup_fast(&gl_hash_table,
++ 			name, ht_parms);
++ 	}
++ 	if (gl && !lockref_get_not_dead(&gl->gl_lockref)) {
++ 		rcu_read_unlock();
++ 		schedule();
++ 		goto again;
++ 	}
++ out:
++ 	rcu_read_unlock();
++ 	finish_wait_on_glock(wq, &wait);
++ 	return gl;
++ }
++ 
+  /**
+   * gfs2_glock_get() - Get a glock, or create one if one doesn't exist
+   * @sdp: The GFS2 superblock
+@@@ -1792,14 -1900,23 +1900,17 @@@ int __init gfs2_glock_init(void
+  	gfs2_delete_workqueue = alloc_workqueue("delete_workqueue",
+  						WQ_MEM_RECLAIM | WQ_FREEZABLE,
+  						0);
+ -	if (!gfs2_delete_workqueue) {
+ +	if (IS_ERR(gfs2_delete_workqueue)) {
+  		destroy_workqueue(glock_workqueue);
+  		rhashtable_destroy(&gl_hash_table);
+ -		return -ENOMEM;
+ +		return PTR_ERR(gfs2_delete_workqueue);
+  	}
+  
+ -	ret = register_shrinker(&glock_shrinker);
+ -	if (ret) {
+ -		destroy_workqueue(gfs2_delete_workqueue);
+ -		destroy_workqueue(glock_workqueue);
+ -		rhashtable_destroy(&gl_hash_table);
+ -		return ret;
+ -	}
+ +	register_shrinker(&glock_shrinker);
+  
++ 	for (i = 0; i < GLOCK_WAIT_TABLE_SIZE; i++)
++ 		init_waitqueue_head(glock_wait_table + i);
++ 
+  	return 0;
+  }
+  
+* Unmerged path fs/gfs2/glock.c
