@@ -1,0 +1,578 @@
+scsi: be2iscsi: Fix closing of connection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Fix closing of connection (Maurizio Lombardi) [1394016]
+Rebuild_FUZZ: 92.11%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 49fc5152f5904aeab75aaef631ea61dff7ee76d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/49fc5152.failed
+
+CID needs to be freed even when invalidate or upload connection fails.
+Attempt to close connection 3 times before freeing CID.
+
+Set cleanup_type to INVALIDATE instead of force TCP_RST.  This
+unnecessarily is terminating connection with reset instead of gracefully
+closing it.
+
+Set save_cfg to 0 - session not to be saved on flash.
+
+Add delay and process CQ before uploading connection.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Reviewed-by: Chris Leech <cleech@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 49fc5152f5904aeab75aaef631ea61dff7ee76d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_iscsi.c
+#	drivers/scsi/be2iscsi/be_mgmt.c
+#	drivers/scsi/be2iscsi/be_mgmt.h
+diff --cc drivers/scsi/be2iscsi/be_iscsi.c
+index b7de816ed52e,bad6b5eee37e..000000000000
+--- a/drivers/scsi/be2iscsi/be_iscsi.c
++++ b/drivers/scsi/be2iscsi/be_iscsi.c
+@@@ -1329,33 -1348,22 +1353,29 @@@ void beiscsi_ep_disconnect(struct iscsi
+  	if (beiscsi_ep->conn) {
+  		beiscsi_conn = beiscsi_ep->conn;
+  		iscsi_suspend_queue(beiscsi_conn->conn);
+- 		mgmt_invalidate_flag = ~BEISCSI_NO_RST_ISSUE;
+- 		tcp_upload_flag = CONNECTION_UPLOAD_GRACEFUL;
+- 	} else {
+- 		mgmt_invalidate_flag = BEISCSI_NO_RST_ISSUE;
+- 		tcp_upload_flag = CONNECTION_UPLOAD_ABORT;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (phba->state & BE_ADAPTER_PCI_ERR) {
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+ +			    "BS_%d : PCI_ERROR Recovery\n");
+ +		goto free_ep;
+++=======
++ 	if (!beiscsi_hba_is_online(phba)) {
++ 		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++ 			    "BS_%d : HBA in error 0x%lx\n", phba->state);
++ 	} else {
++ 		/**
++ 		 * Make CID available even if close fails.
++ 		 * If not freed, FW might fail open using the CID.
++ 		 */
++ 		if (beiscsi_conn_close(beiscsi_ep) < 0)
++ 			__beiscsi_log(phba, KERN_ERR,
++ 				      "BS_%d : close conn failed cid %d\n",
++ 				      beiscsi_ep->ep_cid);
+++>>>>>>> 49fc5152f590 (scsi: be2iscsi: Fix closing of connection)
+  	}
+  
+- 	tag = mgmt_invalidate_connection(phba, beiscsi_ep,
+- 					  beiscsi_ep->ep_cid,
+- 					  mgmt_invalidate_flag,
+- 					  savecfg_flag);
+- 	if (!tag) {
+- 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+- 			    "BS_%d : mgmt_invalidate_connection Failed for cid=%d\n",
+- 			    beiscsi_ep->ep_cid);
+- 	}
+- 
+- 	beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
+- 	beiscsi_close_conn(beiscsi_ep, tcp_upload_flag);
+- free_ep:
+- 	msleep(BEISCSI_LOGOUT_SYNC_DELAY);
+  	beiscsi_free_ep(beiscsi_ep);
+  	if (!phba->conn_table[cri_index])
+  		__beiscsi_log(phba, KERN_ERR,
+diff --cc drivers/scsi/be2iscsi/be_mgmt.c
+index 794ed5647611,3198c8441284..000000000000
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@@ -618,166 -113,19 +618,169 @@@ unsigned int mgmt_vendor_specific_fw_cm
+  		return 0;
+  	}
+  
+ -	mcc_sge = nonembedded_sgl(wrb);
+ -	be_wrb_hdr_prepare(wrb, nonemb_cmd->size, false,
+ -			   job->request_payload.sg_cnt);
+ -	mcc_sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+ -	mcc_sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
+ -	mcc_sge->len = cpu_to_le32(nonemb_cmd->size);
+ -
+ +	mcc_sge = nonembedded_sgl(wrb);
+ +	be_wrb_hdr_prepare(wrb, nonemb_cmd->size, false,
+ +			   job->request_payload.sg_cnt);
+ +	mcc_sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+ +	mcc_sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
+ +	mcc_sge->len = cpu_to_le32(nonemb_cmd->size);
+ +
+ +	be_mcc_notify(phba, tag);
+ +
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +	return tag;
+ +}
+ +
+++<<<<<<< HEAD
+ +/**
+ + * mgmt_epfw_cleanup()- Inform FW to cleanup data structures.
+ + * @phba: pointer to dev priv structure
+ + * @ulp_num: ULP number.
+ + *
+ + * return
+ + *	Success: 0
+ + *	Failure: Non-Zero Value
+ + **/
+ +int mgmt_epfw_cleanup(struct beiscsi_hba *phba, unsigned short ulp_num)
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct iscsi_cleanup_req *req;
+ +	unsigned int tag;
+ +	int status;
+ +
+ +	mutex_lock(&ctrl->mbox_lock);
+ +	wrb = alloc_mcc_wrb(phba, &tag);
+ +	if (!wrb) {
+ +		mutex_unlock(&ctrl->mbox_lock);
+ +		return -EBUSY;
+ +	}
+ +
+ +	req = embedded_payload(wrb);
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
+ +			   OPCODE_COMMON_ISCSI_CLEANUP, sizeof(*req));
+ +
+ +	req->chute = (1 << ulp_num);
+ +	req->hdr_ring_id = cpu_to_le16(HWI_GET_DEF_HDRQ_ID(phba, ulp_num));
+ +	req->data_ring_id = cpu_to_le16(HWI_GET_DEF_BUFQ_ID(phba, ulp_num));
+ +
+ +	be_mcc_notify(phba, tag);
+ +	status = be_mcc_compl_poll(phba, tag);
+ +	if (status)
+ +		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_INIT,
+ +			    "BG_%d : mgmt_epfw_cleanup , FAILED\n");
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +	return status;
+ +}
+ +
+ +unsigned int  mgmt_invalidate_icds(struct beiscsi_hba *phba,
+ +				struct invalidate_command_table *inv_tbl,
+ +				unsigned int num_invalidate, unsigned int cid,
+ +				struct be_dma_mem *nonemb_cmd)
+ +
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct be_sge *sge;
+ +	struct invalidate_commands_params_in *req;
+ +	unsigned int i, tag;
+ +
+ +	mutex_lock(&ctrl->mbox_lock);
+ +	wrb = alloc_mcc_wrb(phba, &tag);
+ +	if (!wrb) {
+ +		mutex_unlock(&ctrl->mbox_lock);
+ +		return 0;
+ +	}
+ +
+ +	req = nonemb_cmd->va;
+ +	memset(req, 0, sizeof(*req));
+ +	sge = nonembedded_sgl(wrb);
+ +
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), false, 1);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
+ +			OPCODE_COMMON_ISCSI_ERROR_RECOVERY_INVALIDATE_COMMANDS,
+ +			sizeof(*req));
+ +	req->ref_handle = 0;
+ +	req->cleanup_type = CMD_ISCSI_COMMAND_INVALIDATE;
+ +	for (i = 0; i < num_invalidate; i++) {
+ +		req->table[i].icd = inv_tbl->icd;
+ +		req->table[i].cid = inv_tbl->cid;
+ +		req->icd_count++;
+ +		inv_tbl++;
+ +	}
+ +	sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+ +	sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
+ +	sge->len = cpu_to_le32(nonemb_cmd->size);
+ +
+ +	be_mcc_notify(phba, tag);
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +	return tag;
+ +}
+ +
+ +unsigned int mgmt_invalidate_connection(struct beiscsi_hba *phba,
+ +					 struct beiscsi_endpoint *beiscsi_ep,
+ +					 unsigned short cid,
+ +					 unsigned short issue_reset,
+ +					 unsigned short savecfg_flag)
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct iscsi_invalidate_connection_params_in *req;
+ +	unsigned int tag = 0;
+ +
+ +	mutex_lock(&ctrl->mbox_lock);
+ +	wrb = alloc_mcc_wrb(phba, &tag);
+ +	if (!wrb) {
+ +		mutex_unlock(&ctrl->mbox_lock);
+ +		return 0;
+ +	}
+ +
+ +	req = embedded_payload(wrb);
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
+ +			   OPCODE_ISCSI_INI_DRIVER_INVALIDATE_CONNECTION,
+ +			   sizeof(*req));
+ +	req->session_handle = beiscsi_ep->fw_handle;
+ +	req->cid = cid;
+ +	if (issue_reset)
+ +		req->cleanup_type = CMD_ISCSI_CONNECTION_ISSUE_TCP_RST;
+ +	else
+ +		req->cleanup_type = CMD_ISCSI_CONNECTION_INVALIDATE;
+ +	req->save_cfg = savecfg_flag;
+ +	be_mcc_notify(phba, tag);
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +	return tag;
+ +}
+ +
+ +unsigned int mgmt_upload_connection(struct beiscsi_hba *phba,
+ +				unsigned short cid, unsigned int upload_flag)
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct tcp_upload_params_in *req;
+ +	unsigned int tag;
+ +
+ +	mutex_lock(&ctrl->mbox_lock);
+ +	wrb = alloc_mcc_wrb(phba, &tag);
+ +	if (!wrb) {
+ +		mutex_unlock(&ctrl->mbox_lock);
+ +		return 0;
+ +	}
+ +
+ +	req = embedded_payload(wrb);
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_COMMON_TCP_UPLOAD,
+ +			   OPCODE_COMMON_TCP_UPLOAD, sizeof(*req));
+ +	req->id = (unsigned short)cid;
+ +	req->upload_type = (unsigned char)upload_flag;
+  	be_mcc_notify(phba, tag);
+ -
+  	mutex_unlock(&ctrl->mbox_lock);
+  	return tag;
+  }
+  
+++=======
+++>>>>>>> 49fc5152f590 (scsi: be2iscsi: Fix closing of connection)
+  /**
+   * mgmt_open_connection()- Establish a TCP CXN
+   * @dst_addr: Destination Address
+@@@ -1814,30 -1388,96 +1817,102 @@@ void beiscsi_offload_cxn_v2(struct beis
+  		      exp_statsn) / 32] + 1));
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * beiscsi_logout_fw_sess()- Firmware Session Logout
+ + * @phba: Device priv structure instance
+ + * @fw_sess_handle: FW session handle
+ + *
+ + * Logout from the FW established sessions.
+ + * returns
+ + *  Success: 0
+ + *  Failure: Non-Zero Value
+ + *
+ + */
+ +int beiscsi_logout_fw_sess(struct beiscsi_hba *phba,
+ +		uint32_t fw_sess_handle)
+++=======
++ unsigned int beiscsi_invalidate_cxn(struct beiscsi_hba *phba,
++ 				    struct beiscsi_endpoint *beiscsi_ep)
++ {
++ 	struct be_invalidate_connection_params_in *req;
++ 	struct be_ctrl_info *ctrl = &phba->ctrl;
++ 	struct be_mcc_wrb *wrb;
++ 	unsigned int tag = 0;
++ 
++ 	mutex_lock(&ctrl->mbox_lock);
++ 	wrb = alloc_mcc_wrb(phba, &tag);
++ 	if (!wrb) {
++ 		mutex_unlock(&ctrl->mbox_lock);
++ 		return 0;
++ 	}
++ 
++ 	req = embedded_payload(wrb);
++ 	be_wrb_hdr_prepare(wrb, sizeof(union be_invalidate_connection_params),
++ 			   true, 0);
++ 	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
++ 			   OPCODE_ISCSI_INI_DRIVER_INVALIDATE_CONNECTION,
++ 			   sizeof(*req));
++ 	req->session_handle = beiscsi_ep->fw_handle;
++ 	req->cid = beiscsi_ep->ep_cid;
++ 	if (beiscsi_ep->conn)
++ 		req->cleanup_type = BE_CLEANUP_TYPE_INVALIDATE;
++ 	else
++ 		req->cleanup_type = BE_CLEANUP_TYPE_ISSUE_TCP_RST;
++ 	/**
++ 	 * 0 - non-persistent targets
++ 	 * 1 - save session info on flash
++ 	 */
++ 	req->save_cfg = 0;
++ 	be_mcc_notify(phba, tag);
++ 	mutex_unlock(&ctrl->mbox_lock);
++ 	return tag;
++ }
++ 
++ unsigned int beiscsi_upload_cxn(struct beiscsi_hba *phba,
++ 				struct beiscsi_endpoint *beiscsi_ep)
++ {
++ 	struct be_ctrl_info *ctrl = &phba->ctrl;
++ 	struct be_mcc_wrb *wrb;
++ 	struct be_tcp_upload_params_in *req;
++ 	unsigned int tag;
++ 
++ 	mutex_lock(&ctrl->mbox_lock);
++ 	wrb = alloc_mcc_wrb(phba, &tag);
++ 	if (!wrb) {
++ 		mutex_unlock(&ctrl->mbox_lock);
++ 		return 0;
++ 	}
++ 
++ 	req = embedded_payload(wrb);
++ 	be_wrb_hdr_prepare(wrb, sizeof(union be_tcp_upload_params), true, 0);
++ 	be_cmd_hdr_prepare(&req->hdr, CMD_COMMON_TCP_UPLOAD,
++ 			   OPCODE_COMMON_TCP_UPLOAD, sizeof(*req));
++ 	req->id = beiscsi_ep->ep_cid;
++ 	if (beiscsi_ep->conn)
++ 		req->upload_type = BE_UPLOAD_TYPE_GRACEFUL;
++ 	else
++ 		req->upload_type = BE_UPLOAD_TYPE_ABORT;
++ 	be_mcc_notify(phba, tag);
++ 	mutex_unlock(&ctrl->mbox_lock);
++ 	return tag;
++ }
++ 
++ int beiscsi_mgmt_invalidate_icds(struct beiscsi_hba *phba,
++ 				 struct invldt_cmd_tbl *inv_tbl,
++ 				 unsigned int nents)
+++>>>>>>> 49fc5152f590 (scsi: be2iscsi: Fix closing of connection)
+  {
+  	struct be_ctrl_info *ctrl = &phba->ctrl;
+ -	struct invldt_cmds_params_in *req;
+ -	struct be_dma_mem nonemb_cmd;
+  	struct be_mcc_wrb *wrb;
+ -	unsigned int i, tag;
+ -	struct be_sge *sge;
+ +	struct be_cmd_req_logout_fw_sess *req;
+ +	struct be_cmd_resp_logout_fw_sess *resp;
+ +	unsigned int tag;
+  	int rc;
+  
+ -	if (!nents || nents > BE_INVLDT_CMD_TBL_SZ)
+ -		return -EINVAL;
+ -
+ -	nonemb_cmd.size = sizeof(union be_invldt_cmds_params);
+ -	nonemb_cmd.va = pci_zalloc_consistent(phba->ctrl.pdev,
+ -					      nonemb_cmd.size,
+ -					      &nonemb_cmd.dma);
+ -	if (!nonemb_cmd.va) {
+ -		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ -			    "BM_%d : invldt_cmds_params alloc failed\n");
+ -		return -ENOMEM;
+ -	}
+ +	beiscsi_log(phba, KERN_INFO,
+ +		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ +		    "BG_%d : In bescsi_logout_fwboot_sess\n");
+  
+  	mutex_lock(&ctrl->mbox_lock);
+  	wrb = alloc_mcc_wrb(phba, &tag);
+diff --cc drivers/scsi/be2iscsi/be_mgmt.h
+index 3ae2c46961a3,1ad6c401a5f6..000000000000
+--- a/drivers/scsi/be2iscsi/be_mgmt.h
++++ b/drivers/scsi/be2iscsi/be_mgmt.h
+@@@ -102,40 -41,18 +102,53 @@@ int mgmt_open_connection(struct beiscsi
+  			 struct beiscsi_endpoint *beiscsi_ep,
+  			 struct be_dma_mem *nonemb_cmd);
+  
+++<<<<<<< HEAD
+ +unsigned int mgmt_upload_connection(struct beiscsi_hba *phba,
+ +				     unsigned short cid,
+ +				     unsigned int upload_flag);
+ +unsigned int mgmt_invalidate_icds(struct beiscsi_hba *phba,
+ +				struct invalidate_command_table *inv_tbl,
+ +				unsigned int num_invalidate, unsigned int cid,
+ +				struct be_dma_mem *nonemb_cmd);
+++=======
+++>>>>>>> 49fc5152f590 (scsi: be2iscsi: Fix closing of connection)
+  unsigned int mgmt_vendor_specific_fw_cmd(struct be_ctrl_info *ctrl,
+  					 struct beiscsi_hba *phba,
+  					 struct bsg_job *job,
+  					 struct be_dma_mem *nonemb_cmd);
+  
+++<<<<<<< HEAD
+ +#define BEISCSI_NO_RST_ISSUE	0
+ +struct iscsi_invalidate_connection_params_in {
+ +	struct be_cmd_req_hdr hdr;
+ +	unsigned int session_handle;
+ +	unsigned short cid;
+ +	unsigned short unused;
+ +	unsigned short cleanup_type;
+ +	unsigned short save_cfg;
+ +} __packed;
+ +
+ +struct iscsi_invalidate_connection_params_out {
+ +	unsigned int session_handle;
+ +	unsigned short cid;
+ +	unsigned short unused;
+ +} __packed;
+ +
+ +union iscsi_invalidate_connection_params {
+ +	struct iscsi_invalidate_connection_params_in request;
+ +	struct iscsi_invalidate_connection_params_out response;
+ +} __packed;
+ +
+ +struct invalidate_commands_params_in {
+++=======
++ #define BE_INVLDT_CMD_TBL_SZ	128
++ struct invldt_cmd_tbl {
++ 	unsigned short icd;
++ 	unsigned short cid;
++ } __packed;
++ 
++ struct invldt_cmds_params_in {
+++>>>>>>> 49fc5152f590 (scsi: be2iscsi: Fix closing of connection)
+  	struct be_cmd_req_hdr hdr;
+  	unsigned int ref_handle;
+  	unsigned int icd_count;
+@@@ -338,7 -241,12 +351,16 @@@ void beiscsi_offload_cxn_v2(struct beis
+  			     struct wrb_handle *pwrb_handle,
+  			     struct hwi_wrb_context *pwrb_context);
+  
+++<<<<<<< HEAD
+ +void beiscsi_ue_detect(struct beiscsi_hba *phba);
+++=======
++ unsigned int beiscsi_invalidate_cxn(struct beiscsi_hba *phba,
++ 				    struct beiscsi_endpoint *beiscsi_ep);
++ 
++ unsigned int beiscsi_upload_cxn(struct beiscsi_hba *phba,
++ 				struct beiscsi_endpoint *beiscsi_ep);
++ 
+++>>>>>>> 49fc5152f590 (scsi: be2iscsi: Fix closing of connection)
+  int be_cmd_modify_eq_delay(struct beiscsi_hba *phba,
+  			 struct be_set_eqd *, int num);
+  
+diff --git a/drivers/scsi/be2iscsi/be.h b/drivers/scsi/be2iscsi/be.h
+index b862bc2bb57c..752a0a5f3738 100644
+--- a/drivers/scsi/be2iscsi/be.h
++++ b/drivers/scsi/be2iscsi/be.h
+@@ -154,7 +154,6 @@ struct be_ctrl_info {
+ #define PAGE_SHIFT_4K 12
+ #define PAGE_SIZE_4K (1 << PAGE_SHIFT_4K)
+ #define mcc_timeout		120000 /* 12s timeout */
+-#define BEISCSI_LOGOUT_SYNC_DELAY	250
+ 
+ /* Returns number of pages spanned by the data starting at the given addr */
+ #define PAGES_4K_SPANNED(_address, size)				\
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index 913b37a8858b..62a1f6b82843 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -1075,24 +1075,49 @@ struct be_mcc_wrb_context {
+ #define DB_DEF_PDU_EVENT_SHIFT		15
+ #define DB_DEF_PDU_CQPROC_SHIFT		16
+ 
+-struct dmsg_cqe {
+-	u32 dw[4];
++struct be_invalidate_connection_params_in {
++	struct be_cmd_req_hdr hdr;
++	u32 session_handle;
++	u16 cid;
++	u16 unused;
++#define BE_CLEANUP_TYPE_INVALIDATE	0x8001
++#define BE_CLEANUP_TYPE_ISSUE_TCP_RST	0x8002
++	u16 cleanup_type;
++	u16 save_cfg;
++} __packed;
++
++struct be_invalidate_connection_params_out {
++	u32 session_handle;
++	u16 cid;
++	u16 unused;
+ } __packed;
+ 
+-struct tcp_upload_params_in {
++union be_invalidate_connection_params {
++	struct be_invalidate_connection_params_in req;
++	struct be_invalidate_connection_params_out resp;
++} __packed;
++
++struct be_tcp_upload_params_in {
+ 	struct be_cmd_req_hdr hdr;
+ 	u16 id;
++#define BE_UPLOAD_TYPE_GRACEFUL		1
++/* abortive upload with reset */
++#define BE_UPLOAD_TYPE_ABORT_RESET	2
++/* abortive upload without reset */
++#define BE_UPLOAD_TYPE_ABORT		3
++/* abortive upload with reset, sequence number by driver */
++#define BE_UPLOAD_TYPE_ABORT_WITH_SEQ	4
+ 	u16 upload_type;
+ 	u32 reset_seq;
+ } __packed;
+ 
+-struct tcp_upload_params_out {
++struct be_tcp_upload_params_out {
+ 	u32 dw[32];
+ } __packed;
+ 
+-union tcp_upload_params {
+-	struct tcp_upload_params_in request;
+-	struct tcp_upload_params_out response;
++union be_tcp_upload_params {
++	struct be_tcp_upload_params_in request;
++	struct be_tcp_upload_params_out response;
+ } __packed;
+ 
+ struct be_ulp_fw_cfg {
+@@ -1173,10 +1198,7 @@ struct be_cmd_get_port_name {
+ #define OPCODE_COMMON_WRITE_FLASH		96
+ #define OPCODE_COMMON_READ_FLASH		97
+ 
+-/* --- CMD_ISCSI_INVALIDATE_CONNECTION_TYPE --- */
+ #define CMD_ISCSI_COMMAND_INVALIDATE		1
+-#define CMD_ISCSI_CONNECTION_INVALIDATE		0x8001
+-#define CMD_ISCSI_CONNECTION_ISSUE_TCP_RST	0x8002
+ 
+ #define INI_WR_CMD			1	/* Initiator write command */
+ #define INI_TMF_CMD			2	/* Initiator TMF command */
+@@ -1199,27 +1221,6 @@ struct be_cmd_get_port_name {
+ 						 *  preparedby
+ 						 * driver should not be touched
+ 						 */
+-/* --- CMD_CHUTE_TYPE --- */
+-#define CMD_CONNECTION_CHUTE_0		1
+-#define CMD_CONNECTION_CHUTE_1		2
+-#define CMD_CONNECTION_CHUTE_2		3
+-
+-#define EQ_MAJOR_CODE_COMPLETION	0
+-
+-#define CMD_ISCSI_SESSION_DEL_CFG_FROM_FLASH 0
+-#define CMD_ISCSI_SESSION_SAVE_CFG_ON_FLASH 1
+-
+-/* --- CONNECTION_UPLOAD_PARAMS --- */
+-/* These parameters are used to define the type of upload desired.  */
+-#define CONNECTION_UPLOAD_GRACEFUL      1	/* Graceful upload  */
+-#define CONNECTION_UPLOAD_ABORT_RESET   2	/* Abortive upload with
+-						 * reset
+-						 */
+-#define CONNECTION_UPLOAD_ABORT		3	/* Abortive upload without
+-						 * reset
+-						 */
+-#define CONNECTION_UPLOAD_ABORT_WITH_SEQ 4	/* Abortive upload with reset,
+-						 * sequence number by driver  */
+ 
+ /* Returns the number of items in the field array. */
+ #define BE_NUMBER_OF_FIELD(_type_, _field_)	\
+* Unmerged path drivers/scsi/be2iscsi/be_iscsi.c
+* Unmerged path drivers/scsi/be2iscsi/be_mgmt.c
+* Unmerged path drivers/scsi/be2iscsi/be_mgmt.h
