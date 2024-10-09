@@ -1,0 +1,205 @@
+usb: core: safely deal with the dynamic quirk lists
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [usb] core: safely deal with the dynamic quirk lists (Torez Smith) [1657401]
+Rebuild_FUZZ: 94.85%
+commit-author Harry Pan <harry.pan@intel.com>
+commit 16c4cb19fa85c648a803752eb63cac0ef69231c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/16c4cb19.failed
+
+Applying dynamic usbcore quirks in early booting when the slab is
+not yet ready would cause kernel panic of null pointer dereference
+because the quirk_count has been counted as 1 while the quirk_list
+was failed to allocate.
+
+i.e.,
+[    1.044970] BUG: unable to handle kernel NULL pointer dereference at           (null)
+[    1.044995] IP: [<ffffffffb0953ec7>] usb_detect_quirks+0x88/0xd1
+[    1.045016] PGD 0
+[    1.045026] Oops: 0000 [#1] PREEMPT SMP
+[    1.046986] gsmi: Log Shutdown Reason 0x03
+[    1.046995] Modules linked in:
+[    1.047008] CPU: 0 PID: 81 Comm: kworker/0:3 Not tainted 4.4.154 #28
+[    1.047016] Hardware name: Google Coral/Coral, BIOS Google_Coral.10068.27.0 12/04/2017
+[    1.047028] Workqueue: usb_hub_wq hub_event
+[    1.047037] task: ffff88017a321c80 task.stack: ffff88017a384000
+[    1.047044] RIP: 0010:[<ffffffffb0953ec7>]  [<ffffffffb0953ec7>] usb_detect_quirks+0x88/0xd1
+
+To tackle this odd, let's balance the quirk_count to 0 when the kcalloc
+call fails, and defer the quirk setting into a lower level callback
+which ensures that the kernel memory management has been initialized.
+
+Fixes: 027bd6cafd9a ("usb: core: Add "quirks" parameter for usbcore")
+	Signed-off-by: Harry Pan <harry.pan@intel.com>
+	Acked-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Cc: stable <stable@vger.kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 16c4cb19fa85c648a803752eb63cac0ef69231c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/quirks.c
+diff --cc drivers/usb/core/quirks.c
+index 705cc0fee08d,178d6c6063c0..000000000000
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@@ -11,6 -12,152 +11,155 @@@
+  #include <linux/usb/hcd.h>
+  #include "usb.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct quirk_entry {
++ 	u16 vid;
++ 	u16 pid;
++ 	u32 flags;
++ };
++ 
++ static DEFINE_MUTEX(quirk_mutex);
++ 
++ static struct quirk_entry *quirk_list;
++ static unsigned int quirk_count;
++ 
++ static char quirks_param[128];
++ 
++ static int quirks_param_set(const char *val, const struct kernel_param *kp)
++ {
++ 	char *p, *field;
++ 	u16 vid, pid;
++ 	u32 flags;
++ 	size_t i;
++ 	int err;
++ 
++ 	err = param_set_copystring(val, kp);
++ 	if (err)
++ 		return err;
++ 
++ 	mutex_lock(&quirk_mutex);
++ 
++ 	if (!*val) {
++ 		quirk_count = 0;
++ 		kfree(quirk_list);
++ 		quirk_list = NULL;
++ 		goto unlock;
++ 	}
++ 
++ 	for (quirk_count = 1, i = 0; val[i]; i++)
++ 		if (val[i] == ',')
++ 			quirk_count++;
++ 
++ 	if (quirk_list) {
++ 		kfree(quirk_list);
++ 		quirk_list = NULL;
++ 	}
++ 
++ 	quirk_list = kcalloc(quirk_count, sizeof(struct quirk_entry),
++ 			     GFP_KERNEL);
++ 	if (!quirk_list) {
++ 		quirk_count = 0;
++ 		mutex_unlock(&quirk_mutex);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0, p = (char *)val; p && *p;) {
++ 		/* Each entry consists of VID:PID:flags */
++ 		field = strsep(&p, ":");
++ 		if (!field)
++ 			break;
++ 
++ 		if (kstrtou16(field, 16, &vid))
++ 			break;
++ 
++ 		field = strsep(&p, ":");
++ 		if (!field)
++ 			break;
++ 
++ 		if (kstrtou16(field, 16, &pid))
++ 			break;
++ 
++ 		field = strsep(&p, ",");
++ 		if (!field || !*field)
++ 			break;
++ 
++ 		/* Collect the flags */
++ 		for (flags = 0; *field; field++) {
++ 			switch (*field) {
++ 			case 'a':
++ 				flags |= USB_QUIRK_STRING_FETCH_255;
++ 				break;
++ 			case 'b':
++ 				flags |= USB_QUIRK_RESET_RESUME;
++ 				break;
++ 			case 'c':
++ 				flags |= USB_QUIRK_NO_SET_INTF;
++ 				break;
++ 			case 'd':
++ 				flags |= USB_QUIRK_CONFIG_INTF_STRINGS;
++ 				break;
++ 			case 'e':
++ 				flags |= USB_QUIRK_RESET;
++ 				break;
++ 			case 'f':
++ 				flags |= USB_QUIRK_HONOR_BNUMINTERFACES;
++ 				break;
++ 			case 'g':
++ 				flags |= USB_QUIRK_DELAY_INIT;
++ 				break;
++ 			case 'h':
++ 				flags |= USB_QUIRK_LINEAR_UFRAME_INTR_BINTERVAL;
++ 				break;
++ 			case 'i':
++ 				flags |= USB_QUIRK_DEVICE_QUALIFIER;
++ 				break;
++ 			case 'j':
++ 				flags |= USB_QUIRK_IGNORE_REMOTE_WAKEUP;
++ 				break;
++ 			case 'k':
++ 				flags |= USB_QUIRK_NO_LPM;
++ 				break;
++ 			case 'l':
++ 				flags |= USB_QUIRK_LINEAR_FRAME_INTR_BINTERVAL;
++ 				break;
++ 			case 'm':
++ 				flags |= USB_QUIRK_DISCONNECT_SUSPEND;
++ 				break;
++ 			case 'n':
++ 				flags |= USB_QUIRK_DELAY_CTRL_MSG;
++ 				break;
++ 			/* Ignore unrecognized flag characters */
++ 			}
++ 		}
++ 
++ 		quirk_list[i++] = (struct quirk_entry)
++ 			{ .vid = vid, .pid = pid, .flags = flags };
++ 	}
++ 
++ 	if (i < quirk_count)
++ 		quirk_count = i;
++ 
++ unlock:
++ 	mutex_unlock(&quirk_mutex);
++ 
++ 	return 0;
++ }
++ 
++ static const struct kernel_param_ops quirks_param_ops = {
++ 	.set = quirks_param_set,
++ 	.get = param_get_string,
++ };
++ 
++ static struct kparam_string quirks_param_string = {
++ 	.maxlen = sizeof(quirks_param),
++ 	.string = quirks_param,
++ };
++ 
++ device_param_cb(quirks, &quirks_param_ops, &quirks_param_string, 0644);
++ MODULE_PARM_DESC(quirks, "Add/modify USB quirks by specifying quirks=vendorID:productID:quirks");
++ 
+++>>>>>>> 16c4cb19fa85 (usb: core: safely deal with the dynamic quirk lists)
+  /* Lists of quirky USB devices, split in device quirks and interface quirks.
+   * Device quirks are applied at the very beginning of the enumeration process,
+   * right after reading the device descriptor. They can thus only match on device
+* Unmerged path drivers/usb/core/quirks.c
