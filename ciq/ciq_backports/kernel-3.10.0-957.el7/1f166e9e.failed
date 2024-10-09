@@ -1,0 +1,209 @@
+s390/pci_dma: split dma_update_trans
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] pci_dma: split dma_update_trans (Hendrik Brueckner) [1539025]
+Rebuild_FUZZ: 92.54%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 1f166e9e5c7cd5d1fe2a5da7c97c1688d4c93fbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1f166e9e.failed
+
+Split dma_update_trans into __dma_update_trans which handles updating
+the dma translation tables and __dma_purge_tlb which takes care of
+purging associated entries in the dma translation lookaside buffer.
+
+The map_sg API makes use of this split approach by calling
+__dma_update_trans once per physically contiguous address range but
+__dma_purge_tlb only once per dma contiguous address range.
+
+This results in less invocations of the expensive RPCIT instruction
+when using map_sg.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 1f166e9e5c7cd5d1fe2a5da7c97c1688d4c93fbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_dma.c
+diff --cc arch/s390/pci/pci_dma.c
+index 0a25a0fb6217,9e5f2ecf7f25..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -191,7 -175,42 +175,46 @@@ out_unlock
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static void dma_free_seg_table(unsigned long entry)
+++=======
++ static int __dma_purge_tlb(struct zpci_dev *zdev, dma_addr_t dma_addr,
++ 			   size_t size, int flags)
++ {
++ 	/*
++ 	 * With zdev->tlb_refresh == 0, rpcit is not required to establish new
++ 	 * translations when previously invalid translation-table entries are
++ 	 * validated. With lazy unmap, it also is skipped for previously valid
++ 	 * entries, but a global rpcit is then required before any address can
++ 	 * be re-used, i.e. after each iommu bitmap wrap-around.
++ 	 */
++ 	if (!zdev->tlb_refresh &&
++ 			(!s390_iommu_strict ||
++ 			((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID)))
++ 		return 0;
++ 
++ 	return zpci_refresh_trans((u64) zdev->fh << 32, dma_addr,
++ 				  PAGE_ALIGN(size));
++ }
++ 
++ static int dma_update_trans(struct zpci_dev *zdev, unsigned long pa,
++ 			    dma_addr_t dma_addr, size_t size, int flags)
++ {
++ 	int rc;
++ 
++ 	rc = __dma_update_trans(zdev, pa, dma_addr, size, flags);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = __dma_purge_tlb(zdev, dma_addr, size, flags);
++ 	if (rc && ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID))
++ 		__dma_update_trans(zdev, pa, dma_addr, size, ZPCI_PTE_INVALID);
++ 
++ 	return rc;
++ }
++ 
++ void dma_free_seg_table(unsigned long entry)
+++>>>>>>> 1f166e9e5c7c (s390/pci_dma: split dma_update_trans)
+  {
+  	unsigned long *sto = get_rt_sto(entry);
+  	int sx;
+@@@ -402,37 -407,98 +425,87 @@@ static void s390_dma_free(struct devic
+  	free_pages((unsigned long) pa, get_order(size));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Map a segment into a contiguous dma address area */
++ static int __s390_dma_map_sg(struct device *dev, struct scatterlist *sg,
++ 			     size_t size, dma_addr_t *handle,
++ 			     enum dma_data_direction dir)
++ {
++ 	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
++ 	dma_addr_t dma_addr_base, dma_addr;
++ 	int flags = ZPCI_PTE_VALID;
++ 	struct scatterlist *s;
++ 	unsigned long pa;
++ 	int ret;
++ 
++ 	size = PAGE_ALIGN(size);
++ 	dma_addr_base = dma_alloc_address(dev, size >> PAGE_SHIFT);
++ 	if (dma_addr_base == DMA_ERROR_CODE)
++ 		return -ENOMEM;
++ 
++ 	dma_addr = dma_addr_base;
++ 	if (dir == DMA_NONE || dir == DMA_TO_DEVICE)
++ 		flags |= ZPCI_TABLE_PROTECTED;
++ 
++ 	for (s = sg; dma_addr < dma_addr_base + size; s = sg_next(s)) {
++ 		pa = page_to_phys(sg_page(s)) + s->offset;
++ 		ret = __dma_update_trans(zdev, pa, dma_addr, s->length, flags);
++ 		if (ret)
++ 			goto unmap;
++ 
++ 		dma_addr += s->length;
++ 	}
++ 	ret = __dma_purge_tlb(zdev, dma_addr_base, size, flags);
++ 	if (ret)
++ 		goto unmap;
++ 
++ 	*handle = dma_addr_base;
++ 	atomic64_add(size >> PAGE_SHIFT, &zdev->mapped_pages);
++ 
++ 	return ret;
++ 
++ unmap:
++ 	dma_update_trans(zdev, 0, dma_addr_base, dma_addr - dma_addr_base,
++ 			 ZPCI_PTE_INVALID);
++ 	dma_free_address(dev, dma_addr_base, size >> PAGE_SHIFT);
++ 	zpci_err("map error:\n");
++ 	zpci_err_dma(ret, pa);
++ 	return ret;
++ }
++ 
+++>>>>>>> 1f166e9e5c7c (s390/pci_dma: split dma_update_trans)
+  static int s390_dma_map_sg(struct device *dev, struct scatterlist *sg,
+  			   int nr_elements, enum dma_data_direction dir,
+ -			   unsigned long attrs)
+ +			   struct dma_attrs *attrs)
+  {
+ -	struct scatterlist *s = sg, *start = sg, *dma = sg;
+ -	unsigned int max = dma_get_max_seg_size(dev);
+ -	unsigned int size = s->offset + s->length;
+ -	unsigned int offset = s->offset;
+ -	int count = 0, i;
+ -
+ -	for (i = 1; i < nr_elements; i++) {
+ -		s = sg_next(s);
+ -
+ -		s->dma_address = DMA_ERROR_CODE;
+ -		s->dma_length = 0;
+ -
+ -		if (s->offset || (size & ~PAGE_MASK) ||
+ -		    size + s->length > max) {
+ -			if (__s390_dma_map_sg(dev, start, size,
+ -					      &dma->dma_address, dir))
+ -				goto unmap;
+ -
+ -			dma->dma_address += offset;
+ -			dma->dma_length = size - offset;
+ +	int mapped_elements = 0;
+ +	struct scatterlist *s;
+ +	int i;
+  
+ -			size = offset = s->offset;
+ -			start = s;
+ -			dma = sg_next(dma);
+ -			count++;
+ -		}
+ -		size += s->length;
+ +	for_each_sg(sg, s, nr_elements, i) {
+ +		struct page *page = sg_page(s);
+ +		s->dma_address = s390_dma_map_pages(dev, page, s->offset,
+ +						    s->length, dir, NULL);
+ +		if (!dma_mapping_error(dev, s->dma_address)) {
+ +			s->dma_length = s->length;
+ +			mapped_elements++;
+ +		} else
+ +			goto unmap;
+  	}
+ -	if (__s390_dma_map_sg(dev, start, size, &dma->dma_address, dir))
+ -		goto unmap;
+ -
+ -	dma->dma_address += offset;
+ -	dma->dma_length = size - offset;
+ +out:
+ +	return mapped_elements;
+  
+ -	return count + 1;
+  unmap:
+ -	for_each_sg(sg, s, count, i)
+ -		s390_dma_unmap_pages(dev, sg_dma_address(s), sg_dma_len(s),
+ -				     dir, attrs);
+ -
+ -	return 0;
+ +	for_each_sg(sg, s, mapped_elements, i) {
+ +		if (s->dma_address)
+ +			s390_dma_unmap_pages(dev, s->dma_address, s->dma_length,
+ +					     dir, NULL);
+ +		s->dma_address = 0;
+ +		s->dma_length = 0;
+ +	}
+ +	mapped_elements = 0;
+ +	goto out;
+  }
+  
+  static void s390_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
+* Unmerged path arch/s390/pci/pci_dma.c
