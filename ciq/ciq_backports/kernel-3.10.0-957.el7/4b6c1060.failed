@@ -1,0 +1,117 @@
+md: fix md_write_start() deadlock w/o metadata devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] fix md_write_start() deadlock w/o metadata devices (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 96.15%
+commit-author Heinz Mauelshagen <heinzm@redhat.com>
+commit 4b6c1060eaa6495aa5b0032e8f2d51dd936b1257
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4b6c1060.failed
+
+If no metadata devices are configured on raid1/4/5/6/10
+(e.g. via dm-raid), md_write_start() unconditionally waits
+for superblocks to be written thus deadlocking.
+
+Fix introduces mddev->has_superblocks bool, defines it in md_run()
+and checks for it in md_write_start() to conditionally avoid waiting.
+
+Once on it, check for non-existing superblocks in md_super_write().
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=198647
+Fixes: cc27b0c78c796 ("md: fix deadlock between mddev_suspend() and md_write_start()")
+
+	Signed-off-by: Heinz Mauelshagen <heinzm@redhat.com>
+	Signed-off-by: Shaohua Li <sh.li@alibaba-inc.com>
+(cherry picked from commit 4b6c1060eaa6495aa5b0032e8f2d51dd936b1257)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.h
+diff --cc drivers/md/md.h
+index 1fc509a98656,fbc925cce810..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -486,6 -466,28 +486,31 @@@ struct mddev 
+  	struct work_struct flush_work;
+  	struct work_struct event_work;	/* used by dm to report failure event */
+  	void (*sync_super)(struct mddev *mddev, struct md_rdev *rdev);
+++<<<<<<< HEAD
+++=======
++ 	struct md_cluster_info		*cluster_info;
++ 	unsigned int			good_device_nr;	/* good device num within cluster raid */
++ 
++ 	bool	has_superblocks:1;
++ };
++ 
++ enum recovery_flags {
++ 	/*
++ 	 * If neither SYNC or RESHAPE are set, then it is a recovery.
++ 	 */
++ 	MD_RECOVERY_RUNNING,	/* a thread is running, or about to be started */
++ 	MD_RECOVERY_SYNC,	/* actually doing a resync, not a recovery */
++ 	MD_RECOVERY_RECOVER,	/* doing recovery, or need to try it. */
++ 	MD_RECOVERY_INTR,	/* resync needs to be aborted for some reason */
++ 	MD_RECOVERY_DONE,	/* thread is done and is waiting to be reaped */
++ 	MD_RECOVERY_NEEDED,	/* we might need to start a resync/recover */
++ 	MD_RECOVERY_REQUESTED,	/* user-space has requested a sync (used with SYNC) */
++ 	MD_RECOVERY_CHECK,	/* user-space request for check-only, no repair */
++ 	MD_RECOVERY_RESHAPE,	/* A reshape is happening */
++ 	MD_RECOVERY_FROZEN,	/* User request to abort, and not restart, any action */
++ 	MD_RECOVERY_ERROR,	/* sync-action interrupted because io-error */
++ 	MD_RECOVERY_WAIT,	/* waiting for pers->start() to finish */
+++>>>>>>> 4b6c1060eaa6 (md: fix md_write_start() deadlock w/o metadata devices)
+  };
+  
+  static inline int __must_check mddev_lock(struct mddev *mddev)
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 23c14e0358c0..d507cab7c5b7 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -815,6 +815,9 @@ void md_super_write(struct mddev *mddev, struct md_rdev *rdev,
+ 	struct bio *bio;
+ 	int ff = WRITE_FLUSH_FUA;
+ 
++	if (!page)
++		return;
++
+ 	if (test_bit(Faulty, &rdev->flags))
+ 		return;
+ 
+@@ -5380,6 +5383,7 @@ int md_run(struct mddev *mddev)
+ 	 * the only valid external interface is through the md
+ 	 * device.
+ 	 */
++	mddev->has_superblocks = false;
+ 	rdev_for_each(rdev, mddev) {
+ 		if (test_bit(Faulty, &rdev->flags))
+ 			continue;
+@@ -5393,6 +5397,9 @@ int md_run(struct mddev *mddev)
+ 				set_disk_ro(mddev->gendisk, 1);
+ 		}
+ 
++		if (rdev->sb_page)
++			mddev->has_superblocks = true;
++
+ 		/* perform some consistency tests on the device.
+ 		 * We don't want the data to overlap the metadata,
+ 		 * Internal Bitmap issues have been handled elsewhere.
+@@ -7812,6 +7819,7 @@ EXPORT_SYMBOL(md_done_sync);
+ bool md_write_start(struct mddev *mddev, struct bio *bi)
+ {
+ 	int did_change = 0;
++
+ 	if (bio_data_dir(bi) != WRITE)
+ 		return true;
+ 
+@@ -7844,6 +7852,8 @@ bool md_write_start(struct mddev *mddev, struct bio *bi)
+ 	rcu_read_unlock();
+ 	if (did_change)
+ 		sysfs_notify_dirent_safe(mddev->sysfs_state);
++	if (!mddev->has_superblocks)
++		return true;
+ 	wait_event(mddev->sb_wait,
+ 		   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags) ||
+ 		   mddev->suspended);
+* Unmerged path drivers/md/md.h
