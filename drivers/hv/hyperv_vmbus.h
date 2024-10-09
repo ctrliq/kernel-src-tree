@@ -574,7 +574,7 @@ struct vmbus_channel_message_table_entry {
 	void (*message_handler)(struct vmbus_channel_message_header *msg);
 };
 
-extern struct vmbus_channel_message_table_entry
+extern const struct vmbus_channel_message_table_entry
 	channel_message_table[CHANNELMSG_COUNT];
 
 /* Free the message slot and signal end-of-message if required */
