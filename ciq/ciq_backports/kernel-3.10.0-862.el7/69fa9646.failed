@@ -1,0 +1,88 @@
+nvme_fc: fix error recovery on link down.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] fc: fix error recovery on link down (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 92.11%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 69fa964632fe18a11a80ead0d09ef3399b08144a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/69fa9646.failed
+
+Currently, the fc transport invokes nvme_fc_error_recovery() on every
+io in which the transport detects an error.  Which means:
+a) it's really noisy on large io loads that all get hit by a link down.
+b) we repeatively call nvme_stop_queues() even though queues are
+ stopped upon the first error or as first steps of reset_work.
+
+Correct by:
+Errors are only meaningful if the controller is in the LIVE state.
+Thus, enact the reset_work only if LIVE. If called repeatively, state
+will have already transitioned.
+There's no need to stop the queues here. Let the first steps of
+reset_work do the queue stopping.
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 69fa964632fe18a11a80ead0d09ef3399b08144a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index bff7f964238e,ed87214fdc0e..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -1604,27 -1746,30 +1604,45 @@@ nvme_fc_free_nvme_ctrl(struct nvme_ctr
+  	nvme_fc_ctrl_put(ctrl);
+  }
+  
+ -static void
+ -nvme_fc_error_recovery(struct nvme_fc_ctrl *ctrl, char *errmsg)
+ +
+ +static int
+ +__nvme_fc_abort_op(struct nvme_fc_ctrl *ctrl, struct nvme_fc_fcp_op *op)
+  {
+++<<<<<<< HEAD
+ +	int state;
+ +
+ +	state = atomic_xchg(&op->state, FCPOP_STATE_ABORTED);
+ +	if (state != FCPOP_STATE_ACTIVE) {
+ +		atomic_set(&op->state, state);
+ +		return -ECANCELED; /* fail */
+++=======
++ 	/* only proceed if in LIVE state - e.g. on first error */
++ 	if (ctrl->ctrl.state != NVME_CTRL_LIVE)
++ 		return;
++ 
++ 	dev_warn(ctrl->ctrl.device,
++ 		"NVME-FC{%d}: transport association error detected: %s\n",
++ 		ctrl->cnum, errmsg);
++ 	dev_warn(ctrl->ctrl.device,
++ 		"NVME-FC{%d}: resetting controller\n", ctrl->cnum);
++ 
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
++ 		dev_err(ctrl->ctrl.device,
++ 			"NVME-FC{%d}: error_recovery: Couldn't change state "
++ 			"to RECONNECTING\n", ctrl->cnum);
++ 		return;
+++>>>>>>> 69fa964632fe (nvme_fc: fix error recovery on link down.)
+  	}
+  
+ -	nvme_reset_ctrl(&ctrl->ctrl);
+ +	ctrl->lport->ops->fcp_abort(&ctrl->lport->localport,
+ +					&ctrl->rport->remoteport,
+ +					op->queue->lldd_handle,
+ +					&op->fcp_req);
+ +
+ +	return 0;
+  }
+  
+ -static enum blk_eh_timer_return
+ +enum blk_eh_timer_return
+  nvme_fc_timeout(struct request *rq, bool reserved)
+  {
+  	struct nvme_fc_fcp_op *op = blk_mq_rq_to_pdu(rq);
+* Unmerged path drivers/nvme/host/fc.c
