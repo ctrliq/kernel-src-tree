@@ -1,0 +1,254 @@
+dmaengine: dw: move clock operations to platform.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [sound] alsa: dmaengine: dw: move clock operations to platform.c (Jaroslav Kysela) [1463624]
+Rebuild_FUZZ: 94.34%
+commit-author Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+commit a15636e83eb0dedefcb1221be729023e4c281748
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a15636e8.failed
+
+On BayTrail platform DMA is not functional in the PCI mode, whereby it always
+failed and exit at the point when it tries to get a clock. It causes the PCI
+mode probe to exit with the error message:
+	dw_dmac_pci: probe of 0000:00:1e.0 failed with error -2
+
+This patch moves clock operations to where it belongs to. Thus, the clock is
+provided only in ACPI / non-PCI cases.
+
+	Reported-by: Chew, Chiau Ee <chiau.ee.chew@intel.com>
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+(cherry picked from commit a15636e83eb0dedefcb1221be729023e4c281748)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/dw/internal.h
+#	drivers/dma/dw/platform.c
+#	drivers/dma/dw_dmac.c
+diff --cc drivers/dma/dw_dmac.c
+index e4409f73fad7,9546b1f599f0..000000000000
+--- a/drivers/dma/dw_dmac.c
++++ b/drivers/dma/dw_dmac.c
+@@@ -1668,37 -1480,24 +1667,41 @@@ static int dw_probe(struct platform_dev
+  	int			err;
+  	int			i;
+  
+ -	dw = devm_kzalloc(chip->dev, sizeof(*dw), GFP_KERNEL);
+ -	if (!dw)
+ -		return -ENOMEM;
+ +	io = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ +	if (!io)
+ +		return -EINVAL;
+  
+ -	dw->regs = chip->regs;
+ -	chip->dw = dw;
+ +	irq = platform_get_irq(pdev, 0);
+ +	if (irq < 0)
+ +		return irq;
+  
+++<<<<<<< HEAD:drivers/dma/dw_dmac.c
+ +	regs = devm_ioremap_resource(&pdev->dev, io);
+ +	if (IS_ERR(regs))
+ +		return PTR_ERR(regs);
+ +
+ +	/* Apply default dma_mask if needed */
+ +	if (!pdev->dev.dma_mask) {
+ +		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+ +		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
+ +	}
+ +
+ +	dw_params = dma_read_byaddr(regs, DW_PARAMS);
+++=======
++ 	dw_params = dma_read_byaddr(chip->regs, DW_PARAMS);
+++>>>>>>> a15636e83eb0 (dmaengine: dw: move clock operations to platform.c):drivers/dma/dw/core.c
+  	autocfg = dw_params >> DW_PARAMS_EN & 0x1;
+  
+ -	dev_dbg(chip->dev, "DW_PARAMS: 0x%08x\n", dw_params);
+ +	dev_dbg(&pdev->dev, "DW_PARAMS: 0x%08x\n", dw_params);
+ +
+ +	pdata = dev_get_platdata(&pdev->dev);
+ +	if (!pdata)
+ +		pdata = dw_dma_parse_dt(pdev);
+  
+  	if (!pdata && autocfg) {
+ -		pdata = devm_kzalloc(chip->dev, sizeof(*pdata), GFP_KERNEL);
+ -		if (!pdata) {
+ -			err = -ENOMEM;
+ -			goto err_pdata;
+ -		}
+ +		pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+ +		if (!pdata)
+ +			return -ENOMEM;
+  
+  		/* Fill platform data with the default values */
+  		pdata->is_private = true;
+@@@ -1851,32 -1645,27 +1854,40 @@@
+  
+  	dma_writel(dw, CFG, DW_CFG_DMA_EN);
+  
+ -	err = dma_async_device_register(&dw->dma);
+ -	if (err)
+ -		goto err_dma_register;
+ -
+ -	dev_info(chip->dev, "DesignWare DMA Controller, %d channels\n",
+ +	dev_info(&pdev->dev, "DesignWare DMA Controller, %d channels\n",
+  		 nr_channels);
+  
+ +	dma_async_device_register(&dw->dma);
+ +
+ +	if (pdev->dev.of_node) {
+ +		err = of_dma_controller_register(pdev->dev.of_node,
+ +						 dw_dma_of_xlate, dw);
+ +		if (err)
+ +			dev_err(&pdev->dev,
+ +				"could not register of_dma_controller\n");
+ +	}
+ +
+ +	if (ACPI_HANDLE(&pdev->dev))
+ +		dw_dma_acpi_controller_register(dw);
+ +
+  	return 0;
+++<<<<<<< HEAD:drivers/dma/dw_dmac.c
+++=======
++ 
++ err_dma_register:
++ 	free_irq(chip->irq, dw);
++ err_pdata:
++ 	return err;
+++>>>>>>> a15636e83eb0 (dmaengine: dw: move clock operations to platform.c):drivers/dma/dw/core.c
+  }
+ -EXPORT_SYMBOL_GPL(dw_dma_probe);
+  
+ -int dw_dma_remove(struct dw_dma_chip *chip)
+ +static int dw_remove(struct platform_device *pdev)
+  {
+ -	struct dw_dma		*dw = chip->dw;
+ +	struct dw_dma		*dw = platform_get_drvdata(pdev);
+  	struct dw_dma_chan	*dwc, *_dwc;
+  
+ +	if (pdev->dev.of_node)
+ +		of_dma_controller_free(pdev->dev.of_node);
+  	dw_dma_off(dw);
+  	dma_async_device_unregister(&dw->dma);
+  
+@@@ -1890,86 -1680,39 +1901,81 @@@
+  
+  	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(dw_dma_remove);
+  
+ -void dw_dma_shutdown(struct dw_dma_chip *chip)
+ +static void dw_shutdown(struct platform_device *pdev)
+  {
+ -	struct dw_dma *dw = chip->dw;
+ +	struct dw_dma	*dw = platform_get_drvdata(pdev);
+  
+  	dw_dma_off(dw);
+- 	clk_disable_unprepare(dw->clk);
+  }
+ -EXPORT_SYMBOL_GPL(dw_dma_shutdown);
+ -
+ -#ifdef CONFIG_PM_SLEEP
+  
+ -int dw_dma_suspend(struct dw_dma_chip *chip)
+ +static int dw_suspend_noirq(struct device *dev)
+  {
+ -	struct dw_dma *dw = chip->dw;
+ +	struct platform_device *pdev = to_platform_device(dev);
+ +	struct dw_dma	*dw = platform_get_drvdata(pdev);
+  
+  	dw_dma_off(dw);
+- 	clk_disable_unprepare(dw->clk);
+- 
+  	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(dw_dma_suspend);
+  
+ -int dw_dma_resume(struct dw_dma_chip *chip)
+ +static int dw_resume_noirq(struct device *dev)
+  {
+ -	struct dw_dma *dw = chip->dw;
+ +	struct platform_device *pdev = to_platform_device(dev);
+ +	struct dw_dma	*dw = platform_get_drvdata(pdev);
+  
+- 	clk_prepare_enable(dw->clk);
+  	dma_writel(dw, CFG, DW_CFG_DMA_EN);
+- 
+  	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(dw_dma_resume);
+  
+ -#endif /* CONFIG_PM_SLEEP */
+ +static const struct dev_pm_ops dw_dev_pm_ops = {
+ +	.suspend_noirq = dw_suspend_noirq,
+ +	.resume_noirq = dw_resume_noirq,
+ +	.freeze_noirq = dw_suspend_noirq,
+ +	.thaw_noirq = dw_resume_noirq,
+ +	.restore_noirq = dw_resume_noirq,
+ +	.poweroff_noirq = dw_suspend_noirq,
+ +};
+ +
+ +#ifdef CONFIG_OF
+ +static const struct of_device_id dw_dma_of_id_table[] = {
+ +	{ .compatible = "snps,dma-spear1340" },
+ +	{}
+ +};
+ +MODULE_DEVICE_TABLE(of, dw_dma_of_id_table);
+ +#endif
+ +
+ +#ifdef CONFIG_ACPI
+ +static const struct acpi_device_id dw_dma_acpi_id_table[] = {
+ +	{ "INTL9C60", 0 },
+ +	{ }
+ +};
+ +#endif
+ +
+ +static struct platform_driver dw_driver = {
+ +	.probe		= dw_probe,
+ +	.remove		= dw_remove,
+ +	.shutdown	= dw_shutdown,
+ +	.driver = {
+ +		.name	= "dw_dmac",
+ +		.pm	= &dw_dev_pm_ops,
+ +		.of_match_table = of_match_ptr(dw_dma_of_id_table),
+ +		.acpi_match_table = ACPI_PTR(dw_dma_acpi_id_table),
+ +	},
+ +};
+ +
+ +static int __init dw_init(void)
+ +{
+ +	return platform_driver_register(&dw_driver);
+ +}
+ +subsys_initcall(dw_init);
+ +
+ +static void __exit dw_exit(void)
+ +{
+ +	platform_driver_unregister(&dw_driver);
+ +}
+ +module_exit(dw_exit);
+  
+  MODULE_LICENSE("GPL v2");
+ -MODULE_DESCRIPTION("Synopsys DesignWare DMA Controller core driver");
+ +MODULE_DESCRIPTION("Synopsys DesignWare DMA Controller driver");
+  MODULE_AUTHOR("Haavard Skinnemoen (Atmel)");
+  MODULE_AUTHOR("Viresh Kumar <viresh.linux@gmail.com>");
+* Unmerged path drivers/dma/dw/internal.h
+* Unmerged path drivers/dma/dw/platform.c
+* Unmerged path drivers/dma/dw/internal.h
+* Unmerged path drivers/dma/dw/platform.c
+* Unmerged path drivers/dma/dw_dmac.c
+diff --git a/drivers/dma/dw_dmac_regs.h b/drivers/dma/dw_dmac_regs.h
+index 9d417200bd57..57558e2dce56 100644
+--- a/drivers/dma/dw_dmac_regs.h
++++ b/drivers/dma/dw_dmac_regs.h
+@@ -243,7 +243,6 @@ struct dw_dma {
+ 	void __iomem		*regs;
+ 	struct dma_pool		*desc_pool;
+ 	struct tasklet_struct	tasklet;
+-	struct clk		*clk;
+ 
+ 	u8			all_chan_mask;
+ 
