@@ -1,0 +1,320 @@
+x86, kaslr: Return location from decompress_kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] kaslr: Return location from decompress_kernel (Baoquan He) [1290840]
+Rebuild_FUZZ: 94.74%
+commit-author Kees Cook <keescook@chromium.org>
+commit 8ab3820fd5b2896d66da7bb2a906bc382e63e7bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8ab3820f.failed
+
+This allows decompress_kernel to return a new location for the kernel to
+be relocated to. Additionally, enforces CONFIG_PHYSICAL_START as the
+minimum relocation position when building with CONFIG_RELOCATABLE.
+
+With CONFIG_RANDOMIZE_BASE set, the choose_kernel_location routine
+will select a new location to decompress the kernel, though here it is
+presently a no-op. The kernel command line option "nokaslr" is introduced
+to bypass these routines.
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+Link: http://lkml.kernel.org/r/1381450698-28710-3-git-send-email-keescook@chromium.org
+	Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+(cherry picked from commit 8ab3820fd5b2896d66da7bb2a906bc382e63e7bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/Makefile
+diff --cc arch/x86/boot/compressed/Makefile
+index 1dc427850e11,ae8b5dbbd8c5..000000000000
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@@ -28,7 -27,7 +28,11 @@@ HOST_EXTRACFLAGS += -I$(srctree)/tools/
+  
+  VMLINUX_OBJS = $(obj)/vmlinux.lds $(obj)/head_$(BITS).o $(obj)/misc.o \
+  	$(obj)/string.o $(obj)/cmdline.o $(obj)/early_serial_console.o \
+++<<<<<<< HEAD
+ +	$(obj)/piggy.o
+++=======
++ 	$(obj)/piggy.o $(obj)/cpuflags.o $(obj)/aslr.o
+++>>>>>>> 8ab3820fd5b2 (x86, kaslr: Return location from decompress_kernel)
+  
+  $(obj)/eboot.o: KBUILD_CFLAGS += -fshort-wchar -mno-red-zone
+  
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index ef522ccf479f..d4033330f4d9 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2057,6 +2057,10 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 	noapic		[SMP,APIC] Tells the kernel to not make use of any
+ 			IOAPICs that may be present in the system.
+ 
++	nokaslr		[X86]
++			Disable kernel base offset ASLR (Address Space
++			Layout Randomization) if built into the kernel.
++
+ 	noautogroup	Disable scheduler automatic task group creation.
+ 
+ 	nobats		[PPC] Do not use BATs for mapping kernel lowmem
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 5162fc083bed..5486a475dc2f 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1789,16 +1789,46 @@ config RELOCATABLE
+ 
+ 	  Note: If CONFIG_RELOCATABLE=y, then the kernel runs from the address
+ 	  it has been loaded at and the compile time physical address
+-	  (CONFIG_PHYSICAL_START) is ignored.
++	  (CONFIG_PHYSICAL_START) is used as the minimum location.
+ 
+-# Relocation on x86-32 needs some additional build support
++config RANDOMIZE_BASE
++	bool "Randomize the address of the kernel image"
++	depends on RELOCATABLE
++	depends on !HIBERNATION
++	default n
++	---help---
++	   Randomizes the physical and virtual address at which the
++	   kernel image is decompressed, as a security feature that
++	   deters exploit attempts relying on knowledge of the location
++	   of kernel internals.
++
++	   Entropy is generated using the RDRAND instruction if it
++	   is supported.  If not, then RDTSC is used, if supported. If
++	   neither RDRAND nor RDTSC are supported, then no randomness
++	   is introduced.
++
++	   The kernel will be offset by up to RANDOMIZE_BASE_MAX_OFFSET,
++	   and aligned according to PHYSICAL_ALIGN.
++
++config RANDOMIZE_BASE_MAX_OFFSET
++	hex "Maximum ASLR offset allowed"
++	depends on RANDOMIZE_BASE
++	default "0x10000000"
++	range 0x0 0x10000000
++	---help---
++	 Determines the maximal offset in bytes that will be applied to the
++	 kernel when Address Space Layout Randomization (ASLR) is active.
++	 Must be less than or equal to the actual physical memory on the
++	 system. This must be a power of two.
++
++# Relocation on x86 needs some additional build support
+ config X86_NEED_RELOCS
+ 	def_bool y
+-	depends on X86_32 && RELOCATABLE
++	depends on RANDOMIZE_BASE || (X86_32 && RELOCATABLE)
+ 
+ config PHYSICAL_ALIGN
+ 	hex "Alignment value to which kernel should be aligned"
+-	default "0x1000000"
++	default "0x200000"
+ 	range 0x2000 0x1000000 if X86_32
+ 	range 0x200000 0x1000000 if X86_64
+ 	---help---
+* Unmerged path arch/x86/boot/compressed/Makefile
+diff --git a/arch/x86/boot/compressed/aslr.c b/arch/x86/boot/compressed/aslr.c
+new file mode 100644
+index 000000000000..b73cc66d201e
+--- /dev/null
++++ b/arch/x86/boot/compressed/aslr.c
+@@ -0,0 +1,23 @@
++#include "misc.h"
++
++#ifdef CONFIG_RANDOMIZE_BASE
++
++unsigned char *choose_kernel_location(unsigned char *input,
++				      unsigned long input_size,
++				      unsigned char *output,
++				      unsigned long output_size)
++{
++	unsigned long choice = (unsigned long)output;
++
++	if (cmdline_find_option_bool("nokaslr")) {
++		debug_putstr("KASLR disabled...\n");
++		goto out;
++	}
++
++	/* XXX: choose random location. */
++
++out:
++	return (unsigned char *)choice;
++}
++
++#endif /* CONFIG_RANDOMIZE_BASE */
+diff --git a/arch/x86/boot/compressed/cmdline.c b/arch/x86/boot/compressed/cmdline.c
+index bffd73b45b1f..b68e3033e6b9 100644
+--- a/arch/x86/boot/compressed/cmdline.c
++++ b/arch/x86/boot/compressed/cmdline.c
+@@ -1,6 +1,6 @@
+ #include "misc.h"
+ 
+-#ifdef CONFIG_EARLY_PRINTK
++#if CONFIG_EARLY_PRINTK || CONFIG_RANDOMIZE_BASE
+ 
+ static unsigned long fs;
+ static inline void set_fs(unsigned long seg)
+diff --git a/arch/x86/boot/compressed/head_32.S b/arch/x86/boot/compressed/head_32.S
+index cd551a21ccd3..ead48bab1a39 100644
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@ -140,9 +140,11 @@ preferred_addr:
+ 	addl    %eax, %ebx
+ 	notl	%eax
+ 	andl    %eax, %ebx
+-#else
+-	movl	$LOAD_PHYSICAL_ADDR, %ebx
++	cmpl	$LOAD_PHYSICAL_ADDR, %ebx
++	jge	1f
+ #endif
++	movl	$LOAD_PHYSICAL_ADDR, %ebx
++1:
+ 
+ 	/* Target address to relocate to for decompression */
+ 	addl	$z_extract_offset, %ebx
+@@ -214,14 +216,14 @@ relocated:
+ 	leal	boot_heap(%ebx), %eax
+ 	pushl	%eax		/* heap area */
+ 	pushl	%esi		/* real mode pointer */
+-	call	decompress_kernel
++	call	decompress_kernel /* returns kernel location in %eax */
+ 	addl	$24, %esp
+ 
+ /*
+  * Jump to the decompressed kernel.
+  */
+ 	xorl	%ebx, %ebx
+-	jmp	*%ebp
++	jmp	*%eax
+ 
+ #ifdef CONFIG_EFI_STUB
+ 	.data
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+index 30884024f487..2bb93ac17e3a 100644
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -96,9 +96,11 @@ ENTRY(startup_32)
+ 	addl	%eax, %ebx
+ 	notl	%eax
+ 	andl	%eax, %ebx
+-#else
+-	movl	$LOAD_PHYSICAL_ADDR, %ebx
++	cmpl	$LOAD_PHYSICAL_ADDR, %ebx
++	jge	1f
+ #endif
++	movl	$LOAD_PHYSICAL_ADDR, %ebx
++1:
+ 
+ 	/* Target address to relocate to for decompression */
+ 	addl	$z_extract_offset, %ebx
+@@ -322,9 +324,11 @@ preferred_addr:
+ 	addq	%rax, %rbp
+ 	notq	%rax
+ 	andq	%rax, %rbp
+-#else
+-	movq	$LOAD_PHYSICAL_ADDR, %rbp
++	cmpq	$LOAD_PHYSICAL_ADDR, %rbp
++	jge	1f
+ #endif
++	movq	$LOAD_PHYSICAL_ADDR, %rbp
++1:
+ 
+ 	/* Target address to relocate to for decompression */
+ 	leaq	z_extract_offset(%rbp), %rbx
+@@ -406,13 +410,13 @@ relocated:
+ 	movl	$z_input_len, %ecx	/* input_len */
+ 	movq	%rbp, %r8		/* output target address */
+ 	movq	$z_output_len, %r9	/* decompressed length */
+-	call	decompress_kernel
++	call	decompress_kernel	/* returns kernel location in %rax */
+ 	popq	%rsi
+ 
+ /*
+  * Jump to the decompressed kernel.
+  */
+-	jmp	*%rbp
++	jmp	*%rax
+ 
+ 	.code32
+ no_longmode:
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index f432a23615b1..0983f692c63c 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -356,7 +356,7 @@ static void parse_elf(void *output)
+ 	free(phdrs);
+ }
+ 
+-asmlinkage void decompress_kernel(void *rmode, memptr heap,
++asmlinkage void *decompress_kernel(void *rmode, memptr heap,
+ 				  unsigned char *input_data,
+ 				  unsigned long input_len,
+ 				  unsigned char *output,
+@@ -383,6 +383,10 @@ asmlinkage void decompress_kernel(void *rmode, memptr heap,
+ 	free_mem_ptr     = heap;	/* Heap */
+ 	free_mem_end_ptr = heap + BOOT_HEAP_SIZE;
+ 
++	output = choose_kernel_location(input_data, input_len,
++					output, output_len);
++
++	/* Validate memory location choices. */
+ 	if ((unsigned long)output & (MIN_KERNEL_ALIGN - 1))
+ 		error("Destination address inappropriately aligned");
+ #ifdef CONFIG_X86_64
+@@ -402,5 +406,5 @@ asmlinkage void decompress_kernel(void *rmode, memptr heap,
+ 	parse_elf(output);
+ 	handle_relocations(output, output_len);
+ 	debug_putstr("done.\nBooting the kernel.\n");
+-	return;
++	return output;
+ }
+diff --git a/arch/x86/boot/compressed/misc.h b/arch/x86/boot/compressed/misc.h
+index 674019d8e235..9077af7fd0b8 100644
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -39,23 +39,38 @@ static inline void debug_putstr(const char *s)
+ 
+ #endif
+ 
+-#ifdef CONFIG_EARLY_PRINTK
+-
++#if CONFIG_EARLY_PRINTK || CONFIG_RANDOMIZE_BASE
+ /* cmdline.c */
+ int cmdline_find_option(const char *option, char *buffer, int bufsize);
+ int cmdline_find_option_bool(const char *option);
++#endif
+ 
+-/* early_serial_console.c */
+-extern int early_serial_base;
+-void console_init(void);
+ 
++#if CONFIG_RANDOMIZE_BASE
++/* aslr.c */
++unsigned char *choose_kernel_location(unsigned char *input,
++				      unsigned long input_size,
++				      unsigned char *output,
++				      unsigned long output_size);
+ #else
++static inline
++unsigned char *choose_kernel_location(unsigned char *input,
++				      unsigned long input_size,
++				      unsigned char *output,
++				      unsigned long output_size)
++{
++	return output;
++}
++#endif
+ 
++#ifdef CONFIG_EARLY_PRINTK
+ /* early_serial_console.c */
++extern int early_serial_base;
++void console_init(void);
++#else
+ static const int early_serial_base;
+ static inline void console_init(void)
+ { }
+-
+ #endif
+ 
+ #endif
