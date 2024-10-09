@@ -1,0 +1,136 @@
+vfio: New external user group/file match
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 5d6dee80a1e94cc284d03e06d930e60e8d3ecf7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5d6dee80.failed
+
+At the point where the kvm-vfio pseudo device wants to release its
+vfio group reference, we can't always acquire a new reference to make
+that happen.  The group can be in a state where we wouldn't allow a
+new reference to be added.  This new helper function allows a caller
+to match a file to a group to facilitate this.  Given a file and
+group, report if they match.  Thus the caller needs to already have a
+group reference to match to the file.  This allows the deletion of a
+group without acquiring a new reference.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Reviewed-by: Eric Auger <eric.auger@redhat.com>
+	Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+	Tested-by: Eric Auger <eric.auger@redhat.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 5d6dee80a1e94cc284d03e06d930e60e8d3ecf7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/vfio.c
+diff --cc virt/kvm/vfio.c
+index d32f239eb471,d99850c462a1..000000000000
+--- a/virt/kvm/vfio.c
++++ b/virt/kvm/vfio.c
+@@@ -207,15 -269,60 +218,19 @@@ static int kvm_vfio_set_group(struct kv
+  			break;
+  		}
+  
+ -		mutex_unlock(&kv->lock);
+ -
+ -		fdput(f);
+ -
+ -		kvm_vfio_update_coherency(dev);
+ -
+ -		return ret;
+ +		kvm_arch_end_assignment(dev->kvm);
+  
+ -#ifdef CONFIG_SPAPR_TCE_IOMMU
+ -	case KVM_DEV_VFIO_GROUP_SET_SPAPR_TCE: {
+ -		struct kvm_vfio_spapr_tce param;
+ -		struct kvm_vfio *kv = dev->private;
+ -		struct vfio_group *vfio_group;
+ -		struct kvm_vfio_group *kvg;
+ -		struct fd f;
+ -		struct iommu_group *grp;
+ -
+ -		if (copy_from_user(&param, (void __user *)arg,
+ -				sizeof(struct kvm_vfio_spapr_tce)))
+ -			return -EFAULT;
+ +		mutex_unlock(&kv->lock);
+  
+ -		f = fdget(param.groupfd);
+ -		if (!f.file)
+ -			return -EBADF;
+++<<<<<<< HEAD
+ +		kvm_vfio_group_set_kvm(vfio_group, NULL);
+  
+ -		vfio_group = kvm_vfio_group_get_external_user(f.file);
+ +		kvm_vfio_group_put_external_user(vfio_group);
+++=======
++ 		fdput(f);
+++>>>>>>> 5d6dee80a1e9 (vfio: New external user group/file match)
+  
+ -		if (IS_ERR(vfio_group))
+ -			return PTR_ERR(vfio_group);
+ -
+ -		grp = kvm_vfio_group_get_iommu_group(vfio_group);
+ -		if (WARN_ON_ONCE(!grp)) {
+ -			kvm_vfio_group_put_external_user(vfio_group);
+ -			return -EIO;
+ -		}
+ -
+ -		ret = -ENOENT;
+ -
+ -		mutex_lock(&kv->lock);
+ -
+ -		list_for_each_entry(kvg, &kv->group_list, node) {
+ -			if (kvg->vfio_group != vfio_group)
+ -				continue;
+ -
+ -			ret = kvm_spapr_tce_attach_iommu_group(dev->kvm,
+ -					param.tablefd, grp);
+ -			break;
+ -		}
+ -
+ -		mutex_unlock(&kv->lock);
+ -
+ -		iommu_group_put(grp);
+ -		kvm_vfio_group_put_external_user(vfio_group);
+ +		kvm_vfio_update_coherency(dev);
+  
+  		return ret;
+  	}
+diff --git a/drivers/vfio/vfio.c b/drivers/vfio/vfio.c
+index cd75f91ebfc6..64e28fd0a47f 100644
+--- a/drivers/vfio/vfio.c
++++ b/drivers/vfio/vfio.c
+@@ -1783,6 +1783,15 @@ void vfio_group_put_external_user(struct vfio_group *group)
+ }
+ EXPORT_SYMBOL_GPL(vfio_group_put_external_user);
+ 
++bool vfio_external_group_match_file(struct vfio_group *test_group,
++				    struct file *filep)
++{
++	struct vfio_group *group = filep->private_data;
++
++	return (filep->f_op == &vfio_group_fops) && (group == test_group);
++}
++EXPORT_SYMBOL_GPL(vfio_external_group_match_file);
++
+ int vfio_external_user_iommu_id(struct vfio_group *group)
+ {
+ 	return iommu_group_id(group->iommu_group);
+diff --git a/include/linux/vfio.h b/include/linux/vfio.h
+index 409ae1dacaef..91d6c1940a5c 100644
+--- a/include/linux/vfio.h
++++ b/include/linux/vfio.h
+@@ -95,6 +95,8 @@ extern void vfio_unregister_iommu_driver(
+  */
+ extern struct vfio_group *vfio_group_get_external_user(struct file *filep);
+ extern void vfio_group_put_external_user(struct vfio_group *group);
++extern bool vfio_external_group_match_file(struct vfio_group *group,
++					   struct file *filep);
+ extern int vfio_external_user_iommu_id(struct vfio_group *group);
+ extern long vfio_external_check_extension(struct vfio_group *group,
+ 					  unsigned long arg);
+* Unmerged path virt/kvm/vfio.c
