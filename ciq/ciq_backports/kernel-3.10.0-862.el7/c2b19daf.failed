@@ -1,0 +1,608 @@
+sysfs, kernfs: prepare read path for kernfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit c2b19daf6760fae9d5db9e9d1683644728888293
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c2b19daf.failed
+
+We're in the process of separating out core sysfs functionality into
+kernfs which will deal with sysfs_dirents directly.  This patch
+rearranges read path so that the kernfs and sysfs parts are separate.
+
+* Regular file read path is refactored such that
+  kernfs_seq_start/next/stop/show() handle all the boilerplate work
+  including locking and updating event count for poll, while
+  sysfs_kf_seq_show() deals with interaction with kobj show method.
+
+* Bin file read path is refactored such that kernfs_file_direct_read()
+  handles all the boilerplate work including buffer management and
+  locking, while sysfs_kf_bin_read() deals with interaction with
+  bin_attribute read method.
+
+kernfs_file_read() is added.  It invokes either the seq_file or direct
+read path depending on the file type.  This will eventually allow
+using the same file_operations for both file types, which is necessary
+to separate out kernfs.
+
+While this patch changes the order of some operations, it shouldn't
+change any visible behavior.
+
+v2: Dropped unnecessary zeroing of @count from sysfs_kf_seq_show().
+    Add comments explaining single_open() behavior.  Both suggested by
+    Pavel.
+
+v3: seq_stop() is called even after seq_start() failed.
+    kernfs_seq_start() updated so that it doesn't unlock
+    sysfs_open_file->mutex on failure so that kernfs_seq_stop()
+    doesn't try to unlock an already unlocked mutex.  Reported by
+    Fengguang.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: Pavel Machek <pavel@ucw.cz>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit c2b19daf6760fae9d5db9e9d1683644728888293)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,b695b8b229fc..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -41,52 -44,72 +41,85 @@@ struct sysfs_open_dirent 
+  	atomic_t		refcnt;
+  	atomic_t		event;
+  	wait_queue_head_t	poll;
+ -	struct list_head	files; /* goes through sysfs_open_file.list */
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+  };
+  
+ -struct sysfs_open_file {
+ -	struct sysfs_dirent	*sd;
+ -	struct file		*file;
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+  	struct mutex		mutex;
+ +	int			needs_read_fill;
+  	int			event;
+  	struct list_head	list;
+ -
+ -	bool			mmapped;
+ -	const struct vm_operations_struct *vm_ops;
+  };
+  
+ -static bool sysfs_is_bin(struct sysfs_dirent *sd)
+ -{
+ -	return sysfs_type(sd) == SYSFS_KOBJ_BIN_ATTR;
+ -}
+ -
+ -static struct sysfs_open_file *sysfs_of(struct file *file)
+ -{
+ -	return ((struct seq_file *)file->private_data)->private;
+ -}
+ -
+ -/*
+ - * Determine ktype->sysfs_ops for the given sysfs_dirent.  This function
+ - * must be called while holding an active reference.
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's
+ + *	data.
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+   */
+ -static const struct sysfs_ops *sysfs_file_ops(struct sysfs_dirent *sd)
+ -{
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+ +{
+++<<<<<<< HEAD
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+++=======
++ 	struct kobject *kobj = sd->s_parent->priv;
++ 
++ 	if (!sysfs_ignore_lockdep(sd))
++ 		lockdep_assert_held(sd);
++ 	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
++ }
++ 
++ /*
++  * Reads on sysfs are handled through seq_file, which takes care of hairy
++  * details like buffering and seeking.  The following function pipes
++  * sysfs_ops->show() result through seq_file.
++  */
++ static int sysfs_kf_seq_show(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 	struct kobject *kobj = of->sd->s_parent->priv;
++ 	const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  	ssize_t count;
++ 	char *buf;
+  
+ -	/* acquire buffer and ensure that it's >= PAGE_SIZE */
+ -	count = seq_get_buf(sf, &buf);
+ -	if (count < PAGE_SIZE) {
+ -		seq_commit(sf, -1);
+ -		return 0;
+ -	}
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+ +
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+ +
+ +	sysfs_put_active(attr_sd);
+++=======
++ 	/*
++ 	 * Invoke show().  Control may reach here via seq file lseek even
++ 	 * if @ops->show() isn't implemented.
++ 	 */
++ 	if (ops->show) {
++ 		count = ops->show(kobj, of->sd->priv, buf);
++ 		if (count < 0)
++ 			return count;
++ 	}
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+@@@ -98,13 -121,196 +131,196 @@@
+  		/* Try to struggle along */
+  		count = PAGE_SIZE - 1;
+  	}
+++<<<<<<< HEAD
+ +	if (count >= 0) {
+ +		buffer->needs_read_fill = 0;
+ +		buffer->count = count;
+++=======
++ 	seq_commit(sf, count);
++ 	return 0;
++ }
++ 
++ static ssize_t sysfs_kf_bin_read(struct sysfs_open_file *of, char *buf,
++ 				 size_t count, loff_t pos)
++ {
++ 	struct bin_attribute *battr = of->sd->priv;
++ 	struct kobject *kobj = of->sd->s_parent->priv;
++ 	loff_t size = file_inode(of->file)->i_size;
++ 
++ 	if (!count)
++ 		return 0;
++ 
++ 	if (size) {
++ 		if (pos > size)
++ 			return 0;
++ 		if (pos + count > size)
++ 			count = size - pos;
++ 	}
++ 
++ 	if (!battr->read)
++ 		return -EIO;
++ 
++ 	return battr->read(of->file, kobj, battr, buf, pos, count);
++ }
++ 
++ static void *kernfs_seq_start(struct seq_file *sf, loff_t *ppos)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	/*
++ 	 * The same behavior and code as single_open().  Returns !NULL if
++ 	 * pos is at the beginning; otherwise, NULL.
++ 	 */
++ 	return NULL + !*ppos;
++ }
++ 
++ static void *kernfs_seq_next(struct seq_file *sf, void *v, loff_t *ppos)
++ {
++ 	/*
++ 	 * The same behavior and code as single_open(), always terminate
++ 	 * after the initial read.
++ 	 */
++ 	++*ppos;
++ 	return NULL;
++ }
++ 
++ static void kernfs_seq_stop(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 
++ 	sysfs_put_active(of->sd);
++ 	mutex_unlock(&of->mutex);
++ }
++ 
++ static int kernfs_seq_show(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 
++ 	of->event = atomic_read(&of->sd->s_attr.open->event);
++ 
++ 	return sysfs_kf_seq_show(sf, v);
++ }
++ 
++ static const struct seq_operations kernfs_seq_ops = {
++ 	.start = kernfs_seq_start,
++ 	.next = kernfs_seq_next,
++ 	.stop = kernfs_seq_stop,
++ 	.show = kernfs_seq_show,
++ };
++ 
++ /*
++  * As reading a bin file can have side-effects, the exact offset and bytes
++  * specified in read(2) call should be passed to the read callback making
++  * it difficult to use seq_file.  Implement simplistic custom buffering for
++  * bin files.
++  */
++ static ssize_t kernfs_file_direct_read(struct sysfs_open_file *of,
++ 				       char __user *user_buf, size_t count,
++ 				       loff_t *ppos)
++ {
++ 	ssize_t len = min_t(size_t, count, PAGE_SIZE);
++ 	char *buf;
++ 
++ 	buf = kmalloc(len, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd)) {
++ 		len = -ENODEV;
++ 		mutex_unlock(&of->mutex);
++ 		goto out_free;
++ 	}
++ 
++ 	len = sysfs_kf_bin_read(of, buf, len, *ppos);
++ 
++ 	sysfs_put_active(of->sd);
++ 	mutex_unlock(&of->mutex);
++ 
++ 	if (len < 0)
++ 		goto out_free;
++ 
++ 	if (copy_to_user(user_buf, buf, len)) {
++ 		len = -EFAULT;
++ 		goto out_free;
++ 	}
++ 
++ 	*ppos += len;
++ 
++  out_free:
++ 	kfree(buf);
++ 	return len;
++ }
++ 
++ /**
++  * kernfs_file_read - kernfs vfs read callback
++  * @file: file pointer
++  * @user_buf: data to write
++  * @count: number of bytes
++  * @ppos: starting offset
++  */
++ static ssize_t kernfs_file_read(struct file *file, char __user *user_buf,
++ 				size_t count, loff_t *ppos)
++ {
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 
++ 	if (sysfs_is_bin(of->sd))
++ 		return kernfs_file_direct_read(of, user_buf, count, ppos);
++ 	else
++ 		return seq_read(file, user_buf, count, ppos);
++ }
++ 
++ /**
++  * flush_write_buffer - push buffer to kobject
++  * @of: open file
++  * @buf: data buffer for file
++  * @off: file offset to write to
++  * @count: number of bytes
++  *
++  * Get the correct pointers for the kobject and the attribute we're dealing
++  * with, then call the store() method for it with @buf.
++  */
++ static int flush_write_buffer(struct sysfs_open_file *of, char *buf, loff_t off,
++ 			      size_t count)
++ {
++ 	struct kobject *kobj = of->sd->s_parent->priv;
++ 	int rc = 0;
++ 
++ 	/*
++ 	 * Need @of->sd for attr and ops, its parent for kobj.  @of->mutex
++ 	 * nests outside active ref and is just to ensure that the ops
++ 	 * aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd)) {
++ 		mutex_unlock(&of->mutex);
++ 		return -ENODEV;
++ 	}
++ 
++ 	if (sysfs_is_bin(of->sd)) {
++ 		struct bin_attribute *battr = of->sd->priv;
++ 
++ 		rc = -EIO;
++ 		if (battr->write)
++ 			rc = battr->write(of->file, kobj, battr, buf, off,
++ 					  count);
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  	} else {
+ -		const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+ -
+ -		rc = ops->store(kobj, of->sd->priv, buf, count);
+ +		ret = count;
+  	}
+ -
+ -	sysfs_put_active(of->sd);
+ -	mutex_unlock(&of->mutex);
+ -
+ -	return rc;
+ +	return ret;
+  }
+  
+  /**
+@@@ -339,59 -675,93 +555,107 @@@ static int sysfs_open_file(struct inod
+  	if (!sysfs_get_active(attr_sd))
+  		return -ENODEV;
+  
+ -	if (sysfs_is_bin(attr_sd)) {
+ -		struct bin_attribute *battr = attr_sd->priv;
+ -
+ -		has_read = battr->read || battr->mmap;
+ -		has_write = battr->write || battr->mmap;
+ -		has_mmap = battr->mmap;
+ -	} else {
+ -		const struct sysfs_ops *ops = sysfs_file_ops(attr_sd);
+ +	/* every kobject with an attribute needs a ktype assigned */
+ +	if (kobj->ktype && kobj->ktype->sysfs_ops)
+ +		ops = kobj->ktype->sysfs_ops;
+ +	else {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs attribute operations for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +		goto err_out;
+ +	}
+  
+ -		/* every kobject with an attribute needs a ktype assigned */
+ -		if (WARN(!ops, KERN_ERR
+ -			 "missing sysfs attribute operations for kobject: %s\n",
+ -			 kobject_name(kobj)))
+ +	/* File needs write support.
+ +	 * The inode's perms must say it's ok,
+ +	 * and we must have a store method.
+ +	 */
+ +	if (file->f_mode & FMODE_WRITE) {
+ +		if (!(inode->i_mode & S_IWUGO) || !ops->store)
+  			goto err_out;
+ -
+ -		has_read = ops->show;
+ -		has_write = ops->store;
+ -		has_mmap = false;
+  	}
+  
+ -	/* check perms and supported operations */
+ -	if ((file->f_mode & FMODE_WRITE) &&
+ -	    (!(inode->i_mode & S_IWUGO) || !has_write))
+ -		goto err_out;
+ -
+ -	if ((file->f_mode & FMODE_READ) &&
+ -	    (!(inode->i_mode & S_IRUGO) || !has_read))
+ -		goto err_out;
+ +	/* File needs read support.
+ +	 * The inode's perms must say it's ok, and we there
+ +	 * must be a show method for it.
+ +	 */
+ +	if (file->f_mode & FMODE_READ) {
+ +		if (!(inode->i_mode & S_IRUGO) || !ops->show)
+ +			goto err_out;
+ +	}
+  
+ -	/* allocate a sysfs_open_file for the file */
+ +	/* No error? Great, allocate a buffer for the file, and store it
+ +	 * it in file->private_data for easy access.
+ +	 */
+  	error = -ENOMEM;
+ -	of = kzalloc(sizeof(struct sysfs_open_file), GFP_KERNEL);
+ -	if (!of)
+ +	buffer = kzalloc(sizeof(struct sysfs_buffer), GFP_KERNEL);
+ +	if (!buffer)
+  		goto err_out;
+  
+++<<<<<<< HEAD
+ +	mutex_init(&buffer->mutex);
+ +	buffer->needs_read_fill = 1;
+ +	buffer->ops = ops;
+ +	file->private_data = buffer;
+++=======
++ 	/*
++ 	 * The following is done to give a different lockdep key to
++ 	 * @of->mutex for files which implement mmap.  This is a rather
++ 	 * crude way to avoid false positive lockdep warning around
++ 	 * mm->mmap_sem - mmap nests @of->mutex under mm->mmap_sem and
++ 	 * reading /sys/block/sda/trace/act_mask grabs sr_mutex, under
++ 	 * which mm->mmap_sem nests, while holding @of->mutex.  As each
++ 	 * open file has a separate mutex, it's okay as long as those don't
++ 	 * happen on the same file.  At this point, we can't easily give
++ 	 * each file a separate locking class.  Let's differentiate on
++ 	 * whether the file has mmap or not for now.
++ 	 */
++ 	if (has_mmap)
++ 		mutex_init(&of->mutex);
++ 	else
++ 		mutex_init(&of->mutex);
++ 
++ 	of->sd = attr_sd;
++ 	of->file = file;
++ 
++ 	/*
++ 	 * Always instantiate seq_file even if read access doesn't use
++ 	 * seq_file or is not requested.  This unifies private data access
++ 	 * and readable regular files are the vast majority anyway.
++ 	 */
++ 	if (sysfs_is_bin(attr_sd))
++ 		error = seq_open(file, NULL);
++ 	else
++ 		error = seq_open(file, &kernfs_seq_ops);
++ 	if (error)
++ 		goto err_free;
++ 
++ 	((struct seq_file *)file->private_data)->private = of;
++ 
++ 	/* seq_file clears PWRITE unconditionally, restore it if WRITE */
++ 	if (file->f_mode & FMODE_WRITE)
++ 		file->f_mode |= FMODE_PWRITE;
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  
+  	/* make sure we have open dirent struct */
+ -	error = sysfs_get_open_dirent(attr_sd, of);
+ +	error = sysfs_get_open_dirent(attr_sd, buffer);
+  	if (error)
+ -		goto err_close;
+ +		goto err_free;
+  
+  	/* open succeeded, put active references */
+  	sysfs_put_active(attr_sd);
+  	return 0;
+  
+++<<<<<<< HEAD
+ + err_free:
+ +	kfree(buffer);
+ + err_out:
+++=======
++ err_close:
++ 	seq_release(inode, file);
++ err_free:
++ 	kfree(of);
++ err_out:
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  	sysfs_put_active(attr_sd);
+  	return error;
+  }
+@@@ -399,13 -769,11 +663,19 @@@
+  static int sysfs_release(struct inode *inode, struct file *filp)
+  {
+  	struct sysfs_dirent *sd = filp->f_path.dentry->d_fsdata;
+ -	struct sysfs_open_file *of = sysfs_of(filp);
+ +	struct sysfs_buffer *buffer = filp->private_data;
+  
+++<<<<<<< HEAD
+ +	sysfs_put_open_dirent(sd, buffer);
+ +
+ +	if (buffer->page)
+ +		free_page((unsigned long)buffer->page);
+ +	kfree(buffer);
+++=======
++ 	sysfs_put_open_dirent(sd, of);
++ 	seq_release(inode, filp);
++ 	kfree(of);
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  
+  	return 0;
+  }
+@@@ -484,7 -877,7 +754,11 @@@ void sysfs_notify(struct kobject *k, co
+  EXPORT_SYMBOL_GPL(sysfs_notify);
+  
+  const struct file_operations sysfs_file_operations = {
+++<<<<<<< HEAD
+ +	.read		= sysfs_read_file,
+++=======
++ 	.read		= kernfs_file_read,
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+  	.write		= sysfs_write_file,
+  	.llseek		= generic_file_llseek,
+  	.open		= sysfs_open_file,
+@@@ -492,47 -885,19 +766,59 @@@
+  	.poll		= sysfs_poll,
+  };
+  
+++<<<<<<< HEAD
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+ +{
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+++=======
++ const struct file_operations sysfs_bin_operations = {
++ 	.read		= kernfs_file_read,
++ 	.write		= sysfs_write_file,
++ 	.llseek		= generic_file_llseek,
++ 	.mmap		= sysfs_bin_mmap,
++ 	.open		= sysfs_open_file,
++ 	.release	= sysfs_release,
++ 	.poll		= sysfs_poll,
++ };
+++>>>>>>> c2b19daf6760 (sysfs, kernfs: prepare read path for kernfs)
+ +
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+ +	}
+ +
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+ +
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs namespace attribute operation for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +	}
+ +	*pns = ns;
+ +	return err;
+ +}
+  
+ -int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
+ -			   const struct attribute *attr, int type,
+ -			   umode_t amode, const void *ns)
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+  {
+  	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+  	struct sysfs_addrm_cxt acxt;
+* Unmerged path fs/sysfs/file.c
