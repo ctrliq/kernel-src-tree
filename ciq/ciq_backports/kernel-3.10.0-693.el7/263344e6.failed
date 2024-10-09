@@ -1,0 +1,121 @@
+bridge: vlan: fix possible null ptr derefs on port init and deinit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 263344e64c0a2ac0e409a1a3f27effb6d57b853e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/263344e6.failed
+
+When a new port is being added we need to make vlgrp available after
+rhashtable has been initialized and when removing a port we need to
+flush the vlans and free the resources after we're sure noone can use
+the port, i.e. after it's removed from the port list and synchronize_rcu
+is executed.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 263344e64c0a2ac0e409a1a3f27effb6d57b853e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_vlan.c
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,7e9d60a402e2..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -598,10 -824,66 +598,62 @@@ unlock
+  
+  int br_vlan_init(struct net_bridge *br)
+  {
+ -	int ret = -ENOMEM;
+ -
+ -	br->vlgrp = kzalloc(sizeof(struct net_bridge_vlan_group), GFP_KERNEL);
+ -	if (!br->vlgrp)
+ -		goto out;
+ -	ret = rhashtable_init(&br->vlgrp->vlan_hash, &br_vlan_rht_params);
+ -	if (ret)
+ -		goto err_rhtbl;
+ -	INIT_LIST_HEAD(&br->vlgrp->vlan_list);
+  	br->vlan_proto = htons(ETH_P_8021Q);
+  	br->default_pvid = 1;
+++<<<<<<< HEAD
+ +	return br_vlan_add(br, 1,
+ +			   BRIDGE_VLAN_INFO_PVID | BRIDGE_VLAN_INFO_UNTAGGED);
+++=======
++ 	ret = br_vlan_add(br, 1,
++ 			  BRIDGE_VLAN_INFO_PVID | BRIDGE_VLAN_INFO_UNTAGGED |
++ 			  BRIDGE_VLAN_INFO_BRENTRY);
++ 	if (ret)
++ 		goto err_vlan_add;
++ 
++ out:
++ 	return ret;
++ 
++ err_vlan_add:
++ 	rhashtable_destroy(&br->vlgrp->vlan_hash);
++ err_rhtbl:
++ 	kfree(br->vlgrp);
++ 
++ 	goto out;
++ }
++ 
++ int nbp_vlan_init(struct net_bridge_port *p)
++ {
++ 	struct net_bridge_vlan_group *vg;
++ 	int ret = -ENOMEM;
++ 
++ 	vg = kzalloc(sizeof(struct net_bridge_vlan_group), GFP_KERNEL);
++ 	if (!vg)
++ 		goto out;
++ 
++ 	ret = rhashtable_init(&vg->vlan_hash, &br_vlan_rht_params);
++ 	if (ret)
++ 		goto err_rhtbl;
++ 	INIT_LIST_HEAD(&vg->vlan_list);
++ 	/* Make sure everything's committed before publishing vg */
++ 	smp_wmb();
++ 	p->vlgrp = vg;
++ 	if (p->br->default_pvid) {
++ 		ret = nbp_vlan_add(p, p->br->default_pvid,
++ 				   BRIDGE_VLAN_INFO_PVID |
++ 				   BRIDGE_VLAN_INFO_UNTAGGED);
++ 		if (ret)
++ 			goto err_vlan_add;
++ 	}
++ out:
++ 	return ret;
++ 
++ err_vlan_add:
++ 	rhashtable_destroy(&vg->vlan_hash);
++ err_rhtbl:
++ 	kfree(vg);
++ 
++ 	goto out;
+++>>>>>>> 263344e64c0a (bridge: vlan: fix possible null ptr derefs on port init and deinit)
+  }
+  
+  /* Must be protected by RTNL.
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index c4107a488d8b..e9e38e85355c 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -276,7 +276,6 @@ static void del_nbp(struct net_bridge_port *p)
+ 		update_headroom(br, get_max_headroom(br));
+ 	netdev_reset_rx_headroom(dev);
+ 
+-	nbp_vlan_flush(p);
+ 	br_fdb_delete_by_port(br, p, 0, 1);
+ 	nbp_update_port_count(br);
+ 
+@@ -285,6 +284,8 @@ static void del_nbp(struct net_bridge_port *p)
+ 	dev->priv_flags &= ~IFF_BRIDGE_PORT;
+ 
+ 	netdev_rx_handler_unregister(dev);
++	/* use the synchronize_rcu done by netdev_rx_handler_unregister */
++	nbp_vlan_flush(p);
+ 
+ 	br_multicast_del_port(p);
+ 
+* Unmerged path net/bridge/br_vlan.c
