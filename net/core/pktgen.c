@@ -2515,8 +2515,6 @@ static int pktgen_output_ipsec(struct sk_buff *skb, struct pktgen_dev *pkt_dev)
 	if (x->props.mode != XFRM_MODE_TRANSPORT)
 		return 0;
 
-	spin_lock(&x->lock);
-
 	err = x->outer_mode->output(x, skb);
 	if (err)
 		goto error;
@@ -2524,10 +2522,11 @@ static int pktgen_output_ipsec(struct sk_buff *skb, struct pktgen_dev *pkt_dev)
 	if (err)
 		goto error;
 
+	spin_lock_bh(&x->lock);
 	x->curlft.bytes += skb->len;
 	x->curlft.packets++;
+	spin_unlock_bh(&x->lock);
 error:
-	spin_unlock(&x->lock);
 	return err;
 }
 
