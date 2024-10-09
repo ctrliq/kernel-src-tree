@@ -394,11 +394,12 @@ xfs_iomap_prealloc_size(
 	struct xfs_inode	*ip,
 	loff_t			offset,
 	loff_t			count,
-	xfs_extnum_t		idx,
-	struct xfs_bmbt_irec	*prev)
+	xfs_extnum_t		idx)
 {
 	struct xfs_mount	*mp = ip->i_mount;
+	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, XFS_DATA_FORK);
 	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
+	struct xfs_bmbt_irec	prev;
 	int			shift = 0;
 	int64_t			freesp;
 	xfs_fsblock_t		qblocks;
@@ -418,8 +419,8 @@ xfs_iomap_prealloc_size(
 	 */
 	if ((mp->m_flags & XFS_MOUNT_DFLT_IOSIZE) ||
 	    XFS_ISIZE(ip) < XFS_FSB_TO_B(mp, mp->m_dalign) ||
-	    idx == 0 ||
-	    prev->br_startoff + prev->br_blockcount < offset_fsb)
+	    !xfs_iext_get_extent(ifp, idx - 1, &prev) ||
+	    prev.br_startoff + prev.br_blockcount < offset_fsb)
 		return mp->m_writeio_blocks;
 
 	/*
@@ -438,8 +439,8 @@ xfs_iomap_prealloc_size(
 	 * always extends to MAXEXTLEN rather than falling short due to things
 	 * like stripe unit/width alignment of real extents.
 	 */
-	if (prev->br_blockcount <= (MAXEXTLEN >> 1))
-		alloc_blocks = prev->br_blockcount << 1;
+	if (prev.br_blockcount <= (MAXEXTLEN >> 1))
+		alloc_blocks = prev.br_blockcount << 1;
 	else
 		alloc_blocks = XFS_B_TO_FSB(mp, offset);
 	if (!alloc_blocks)
@@ -536,7 +537,6 @@ xfs_iomap_write_delay(
 	xfs_fileoff_t		end_fsb, orig_end_fsb;
 	int			error = 0, eof = 0;
 	struct xfs_bmbt_irec	got;
-	struct xfs_bmbt_irec	prev;
 	xfs_extnum_t		idx;
 
 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
@@ -559,8 +559,7 @@ xfs_iomap_write_delay(
 			return error;
 	}
 
-	xfs_bmap_search_extents(ip, offset_fsb, XFS_DATA_FORK, &eof, &idx,
-			&got, &prev);
+	eof = !xfs_iext_lookup_extent(ip, ifp, offset_fsb, &idx, &got);
 	if (!eof && got.br_startoff <= offset_fsb) {
 		trace_xfs_iomap_found(ip, offset, count, 0, &got);
 		goto done;
@@ -586,8 +585,7 @@ xfs_iomap_write_delay(
 	if (eof) {
 		xfs_fsblock_t	prealloc_blocks;
 
-		prealloc_blocks =
-			xfs_iomap_prealloc_size(ip, offset, count, idx, &prev);
+		prealloc_blocks = xfs_iomap_prealloc_size(ip, offset, count, idx);
 		if (prealloc_blocks) {
 			xfs_extlen_t	align;
 			xfs_off_t	end_offset;
