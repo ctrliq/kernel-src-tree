@@ -1,0 +1,191 @@
+KVM: page track: add the framework of guest page tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xiao Guangrong <guangrong.xiao@linux.intel.com>
+commit 21ebbedaddf25a35a70fedc001ba7e5f5b9129bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/21ebbeda.failed
+
+The array, gfn_track[mode][gfn], is introduced in memory slot for every
+guest page, this is the tracking count for the gust page on different
+modes. If the page is tracked then the count is increased, the page is
+not tracked after the count reaches zero
+
+We use 'unsigned short' as the tracking count which should be enough as
+shadow page table only can use 2^14 (2^3 for level, 2^1 for cr4_pae, 2^2
+for quadrant, 2^3 for access, 2^1 for nxe, 2^1 for cr0_wp, 2^1 for
+smep_andnot_wp, 2^1 for smap_andnot_wp, and 2^1 for smm) at most, there
+is enough room for other trackers
+
+Two callbacks, kvm_page_track_create_memslot() and
+kvm_page_track_free_memslot() are implemented in this patch, they are
+internally used to initialize and reclaim the memory of the array
+
+Currently, only write track mode is supported
+
+	Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 21ebbedaddf25a35a70fedc001ba7e5f5b9129bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/Makefile
+diff --cc arch/x86/kvm/Makefile
+index 167ae65a0c98,464fa477afbf..000000000000
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@@ -12,10 -12,11 +12,16 @@@ kvm-y			+= $(KVM)/kvm_main.o $(KVM)/coa
+  kvm-$(CONFIG_KVM_ASYNC_PF)	+= $(KVM)/async_pf.o
+  
+  kvm-y			+= x86.o mmu.o emulate.o i8259.o irq.o lapic.o \
+++<<<<<<< HEAD
+ +			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o \
+ +			   hyperv.o
+++=======
++ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
++ 			   hyperv.o page_track.o
+++>>>>>>> 21ebbedaddf2 (KVM: page track: add the framework of guest page tracking)
+  
+  kvm-$(CONFIG_KVM_DEVICE_ASSIGNMENT)	+= assigned-dev.o iommu.o
++ 
+  kvm-intel-y		+= vmx.o pmu_intel.o
+  kvm-amd-y		+= svm.o pmu_amd.o
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c4a4bfc6a009..8f0c71460167 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -31,6 +31,7 @@
+ #include <asm/mtrr.h>
+ #include <asm/msr-index.h>
+ #include <asm/asm.h>
++#include <asm/kvm_page_track.h>
+ 
+ #define KVM_MAX_VCPUS 288
+ #define KVM_SOFT_MAX_VCPUS 240
+@@ -189,6 +190,14 @@ struct kvm_mmu_memory_cache {
+ 	void *objects[KVM_NR_MEM_OBJS];
+ };
+ 
++/*
++ * the pages used as guest page table on soft mmu are tracked by
++ * kvm_memory_slot.arch.gfn_track which is 16 bits, so the role bits used
++ * by indirect shadow page can not be more than 15 bits.
++ *
++ * Currently, we used 14 bits that are @level, @cr4_pae, @quadrant, @access,
++ * @nxe, @cr0_wp, @smep_andnot_wp and @smap_andnot_wp.
++ */
+ union kvm_mmu_page_role {
+ 	unsigned word;
+ 	struct {
+@@ -571,6 +580,7 @@ struct kvm_lpage_info {
+ struct kvm_arch_memory_slot {
+ 	unsigned long *rmap[KVM_NR_PAGE_SIZES];
+ 	struct kvm_lpage_info *lpage_info[KVM_NR_PAGE_SIZES - 1];
++	unsigned short *gfn_track[KVM_PAGE_TRACK_MAX];
+ };
+ 
+ /*
+diff --git a/arch/x86/include/asm/kvm_page_track.h b/arch/x86/include/asm/kvm_page_track.h
+new file mode 100644
+index 000000000000..5520040682d1
+--- /dev/null
++++ b/arch/x86/include/asm/kvm_page_track.h
+@@ -0,0 +1,13 @@
++#ifndef _ASM_X86_KVM_PAGE_TRACK_H
++#define _ASM_X86_KVM_PAGE_TRACK_H
++
++enum kvm_page_track_mode {
++	KVM_PAGE_TRACK_WRITE,
++	KVM_PAGE_TRACK_MAX,
++};
++
++void kvm_page_track_free_memslot(struct kvm_memory_slot *free,
++				 struct kvm_memory_slot *dont);
++int kvm_page_track_create_memslot(struct kvm_memory_slot *slot,
++				  unsigned long npages);
++#endif
+* Unmerged path arch/x86/kvm/Makefile
+diff --git a/arch/x86/kvm/page_track.c b/arch/x86/kvm/page_track.c
+new file mode 100644
+index 000000000000..8c396d08c0a4
+--- /dev/null
++++ b/arch/x86/kvm/page_track.c
+@@ -0,0 +1,52 @@
++/*
++ * Support KVM gust page tracking
++ *
++ * This feature allows us to track page access in guest. Currently, only
++ * write access is tracked.
++ *
++ * Copyright(C) 2015 Intel Corporation.
++ *
++ * Author:
++ *   Xiao Guangrong <guangrong.xiao@linux.intel.com>
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2.  See
++ * the COPYING file in the top-level directory.
++ */
++
++#include <linux/kvm_host.h>
++#include <asm/kvm_host.h>
++#include <asm/kvm_page_track.h>
++
++#include "mmu.h"
++
++void kvm_page_track_free_memslot(struct kvm_memory_slot *free,
++				 struct kvm_memory_slot *dont)
++{
++	int i;
++
++	for (i = 0; i < KVM_PAGE_TRACK_MAX; i++)
++		if (!dont || free->arch.gfn_track[i] !=
++		      dont->arch.gfn_track[i]) {
++			kvfree(free->arch.gfn_track[i]);
++			free->arch.gfn_track[i] = NULL;
++		}
++}
++
++int kvm_page_track_create_memslot(struct kvm_memory_slot *slot,
++				  unsigned long npages)
++{
++	int  i;
++
++	for (i = 0; i < KVM_PAGE_TRACK_MAX; i++) {
++		slot->arch.gfn_track[i] = kvm_kvzalloc(npages *
++					    sizeof(*slot->arch.gfn_track[i]));
++		if (!slot->arch.gfn_track[i])
++			goto track_free;
++	}
++
++	return 0;
++
++track_free:
++	kvm_page_track_free_memslot(slot, NULL);
++	return -ENOMEM;
++}
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9677babcc502..a704c1731def 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8068,6 +8068,8 @@ void kvm_arch_free_memslot(struct kvm *kvm, struct kvm_memory_slot *free,
+ 			free->arch.lpage_info[i - 1] = NULL;
+ 		}
+ 	}
++
++	kvm_page_track_free_memslot(free, dont);
+ }
+ 
+ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
+@@ -8116,6 +8118,9 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 		}
+ 	}
+ 
++	if (kvm_page_track_create_memslot(slot, npages))
++		goto out_free;
++
+ 	return 0;
+ 
+ out_free:
