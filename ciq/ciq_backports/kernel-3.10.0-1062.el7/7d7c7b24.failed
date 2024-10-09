@@ -1,0 +1,432 @@
+s390/bitops: rename find_first_bit_left() to find_first_bit_inv()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] bitops: rename find_first_bit_left() to find_first_bit_inv() (Yauheni Kaliuta) [1691710]
+Rebuild_FUZZ: 96.00%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 7d7c7b24e416afb2637be8447e03ca4457c100fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7d7c7b24.failed
+
+find_first_bit_left() and friends have nothing to do with the normal
+LSB0 bit numbering for big endian machines used in Linux (least
+significant bit has bit number 0).
+Instead they use MSB0 bit numbering, where the most signficant bit has
+bit number 0. So rename find_first_bit_left() and friends to
+find_first_bit_inv(), to avoid any confusion.
+Also provide inv versions of set_bit, clear_bit and test_bit.
+
+This also removes the confusing use of e.g. set_bit() in airq.c which
+uses a "be_to_le" bit number conversion, which could imply that instead
+set_bit_le() could be used. But that is entirely wrong since the _le
+bitops variant uses yet another bit numbering scheme.
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 7d7c7b24e416afb2637be8447e03ca4457c100fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/bitops.h
+#	arch/s390/lib/find.c
+#	drivers/s390/cio/airq.c
+diff --cc arch/s390/include/asm/bitops.h
+index 6038349c8410,6e6ad0680829..000000000000
+--- a/arch/s390/include/asm/bitops.h
++++ b/arch/s390/include/asm/bitops.h
+@@@ -274,183 -300,93 +274,223 @@@ static inline int test_bit(unsigned lon
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Optimized find bit helper functions.
+ + */
+++=======
++  * Functions which use MSB0 bit numbering.
++  * On an s390x system the bits are numbered:
++  *   |0..............63|64............127|128...........191|192...........255|
++  * and on s390:
++  *   |0.....31|31....63|64....95|96...127|128..159|160..191|192..223|224..255|
++  */
++ unsigned long find_first_bit_inv(const unsigned long *addr, unsigned long size);
++ unsigned long find_next_bit_inv(const unsigned long *addr, unsigned long size,
++ 				unsigned long offset);
++ 
++ static inline void set_bit_inv(unsigned long nr, volatile unsigned long *ptr)
++ {
++ 	return set_bit(nr ^ (BITS_PER_LONG - 1), ptr);
++ }
++ 
++ static inline void clear_bit_inv(unsigned long nr, volatile unsigned long *ptr)
++ {
++ 	return clear_bit(nr ^ (BITS_PER_LONG - 1), ptr);
++ }
++ 
++ static inline void __set_bit_inv(unsigned long nr, volatile unsigned long *ptr)
++ {
++ 	return __set_bit(nr ^ (BITS_PER_LONG - 1), ptr);
++ }
++ 
++ static inline void __clear_bit_inv(unsigned long nr, volatile unsigned long *ptr)
++ {
++ 	return __clear_bit(nr ^ (BITS_PER_LONG - 1), ptr);
++ }
++ 
++ static inline int test_bit_inv(unsigned long nr,
++ 			       const volatile unsigned long *ptr)
++ {
++ 	return test_bit(nr ^ (BITS_PER_LONG - 1), ptr);
++ }
++ 
++ #ifdef CONFIG_HAVE_MARCH_Z9_109_FEATURES
+++>>>>>>> 7d7c7b24e416 (s390/bitops: rename find_first_bit_left() to find_first_bit_inv())
+  
+  /**
+ - * __flogr - find leftmost one
+ - * @word - The word to search
+ - *
+ - * Returns the bit number of the most significant bit set,
+ - * where the most significant bit has bit number 0.
+ - * If no bit is set this function returns 64.
+ + * __ffz_word_loop - find byte offset of first long != -1UL
+ + * @addr: pointer to array of unsigned long
+ + * @size: size of the array in bits
+ + */
+ +static inline unsigned long __ffz_word_loop(const unsigned long *addr,
+ +					    unsigned long size)
+ +{
+ +	typedef struct { long _[__BITOPS_WORDS(size)]; } addrtype;
+ +	unsigned long bytes = 0;
+ +
+ +	asm volatile(
+ +#ifndef CONFIG_64BIT
+ +		"	ahi	%1,-1\n"
+ +		"	sra	%1,5\n"
+ +		"	jz	1f\n"
+ +		"0:	c	%2,0(%0,%3)\n"
+ +		"	jne	1f\n"
+ +		"	la	%0,4(%0)\n"
+ +		"	brct	%1,0b\n"
+ +		"1:\n"
+ +#else
+ +		"	aghi	%1,-1\n"
+ +		"	srag	%1,%1,6\n"
+ +		"	jz	1f\n"
+ +		"0:	cg	%2,0(%0,%3)\n"
+ +		"	jne	1f\n"
+ +		"	la	%0,8(%0)\n"
+ +		"	brct	%1,0b\n"
+ +		"1:\n"
+ +#endif
+ +		: "+&a" (bytes), "+&d" (size)
+ +		: "d" (-1UL), "a" (addr), "m" (*(addrtype *) addr)
+ +		: "cc" );
+ +	return bytes;
+ +}
+ +
+ +/**
+ + * __ffs_word_loop - find byte offset of first long != 0UL
+ + * @addr: pointer to array of unsigned long
+ + * @size: size of the array in bits
+   */
+ -static inline unsigned char __flogr(unsigned long word)
+ -{
+ -	if (__builtin_constant_p(word)) {
+ -		unsigned long bit = 0;
+ -
+ -		if (!word)
+ -			return 64;
+ -		if (!(word & 0xffffffff00000000UL)) {
+ -			word <<= 32;
+ -			bit += 32;
+ -		}
+ -		if (!(word & 0xffff000000000000UL)) {
+ -			word <<= 16;
+ -			bit += 16;
+ -		}
+ -		if (!(word & 0xff00000000000000UL)) {
+ -			word <<= 8;
+ -			bit += 8;
+ -		}
+ -		if (!(word & 0xf000000000000000UL)) {
+ -			word <<= 4;
+ -			bit += 4;
+ -		}
+ -		if (!(word & 0xc000000000000000UL)) {
+ -			word <<= 2;
+ -			bit += 2;
+ -		}
+ -		if (!(word & 0x8000000000000000UL)) {
+ -			word <<= 1;
+ -			bit += 1;
+ -		}
+ -		return bit;
+ -	} else {
+ -		register unsigned long bit asm("4") = word;
+ -		register unsigned long out asm("5");
+ -
+ -		asm volatile(
+ -			"       flogr   %[bit],%[bit]\n"
+ -			: [bit] "+d" (bit), [out] "=d" (out) : : "cc");
+ -		return bit;
+ +static inline unsigned long __ffs_word_loop(const unsigned long *addr,
+ +					    unsigned long size)
+ +{
+ +	typedef struct { long _[__BITOPS_WORDS(size)]; } addrtype;
+ +	unsigned long bytes = 0;
+ +
+ +	asm volatile(
+ +#ifndef CONFIG_64BIT
+ +		"	ahi	%1,-1\n"
+ +		"	sra	%1,5\n"
+ +		"	jz	1f\n"
+ +		"0:	c	%2,0(%0,%3)\n"
+ +		"	jne	1f\n"
+ +		"	la	%0,4(%0)\n"
+ +		"	brct	%1,0b\n"
+ +		"1:\n"
+ +#else
+ +		"	aghi	%1,-1\n"
+ +		"	srag	%1,%1,6\n"
+ +		"	jz	1f\n"
+ +		"0:	cg	%2,0(%0,%3)\n"
+ +		"	jne	1f\n"
+ +		"	la	%0,8(%0)\n"
+ +		"	brct	%1,0b\n"
+ +		"1:\n"
+ +#endif
+ +		: "+&a" (bytes), "+&a" (size)
+ +		: "d" (0UL), "a" (addr), "m" (*(addrtype *) addr)
+ +		: "cc" );
+ +	return bytes;
+ +}
+ +
+ +/**
+ + * __ffz_word - add number of the first unset bit
+ + * @nr: base value the bit number is added to
+ + * @word: the word that is searched for unset bits
+ + */
+ +static inline unsigned long __ffz_word(unsigned long nr, unsigned long word)
+ +{
+ +#ifdef CONFIG_64BIT
+ +	if ((word & 0xffffffff) == 0xffffffff) {
+ +		word >>= 32;
+ +		nr += 32;
+ +	}
+ +#endif
+ +	if ((word & 0xffff) == 0xffff) {
+ +		word >>= 16;
+ +		nr += 16;
+ +	}
+ +	if ((word & 0xff) == 0xff) {
+ +		word >>= 8;
+ +		nr += 8;
+ +	}
+ +	return nr + _zb_findmap[(unsigned char) word];
+ +}
+ +
+ +/**
+ + * __ffs_word - add number of the first set bit
+ + * @nr: base value the bit number is added to
+ + * @word: the word that is searched for set bits
+ + */
+ +static inline unsigned long __ffs_word(unsigned long nr, unsigned long word)
+ +{
+ +#ifdef CONFIG_64BIT
+ +	if ((word & 0xffffffff) == 0) {
+ +		word >>= 32;
+ +		nr += 32;
+ +	}
+ +#endif
+ +	if ((word & 0xffff) == 0) {
+ +		word >>= 16;
+ +		nr += 16;
+  	}
+ +	if ((word & 0xff) == 0) {
+ +		word >>= 8;
+ +		nr += 8;
+ +	}
+ +	return nr + _sb_findmap[(unsigned char) word];
+ +}
+ +
+ +
+ +/**
+ + * __load_ulong_be - load big endian unsigned long
+ + * @p: pointer to array of unsigned long
+ + * @offset: byte offset of source value in the array
+ + */
+ +static inline unsigned long __load_ulong_be(const unsigned long *p,
+ +					    unsigned long offset)
+ +{
+ +	p = (unsigned long *)((unsigned long) p + offset);
+ +	return *p;
+ +}
+ +
+ +/**
+ + * __load_ulong_le - load little endian unsigned long
+ + * @p: pointer to array of unsigned long
+ + * @offset: byte offset of source value in the array
+ + */
+ +static inline unsigned long __load_ulong_le(const unsigned long *p,
+ +					    unsigned long offset)
+ +{
+ +	unsigned long word;
+ +
+ +	p = (unsigned long *)((unsigned long) p + offset);
+ +#ifndef CONFIG_64BIT
+ +	asm volatile(
+ +		"	ic	%0,%O1(%R1)\n"
+ +		"	icm	%0,2,%O1+1(%R1)\n"
+ +		"	icm	%0,4,%O1+2(%R1)\n"
+ +		"	icm	%0,8,%O1+3(%R1)"
+ +		: "=&d" (word) : "Q" (*p) : "cc");
+ +#else
+ +	asm volatile(
+ +		"	lrvg	%0,%1"
+ +		: "=d" (word) : "m" (*p) );
+ +#endif
+ +	return word;
+ +}
+ +
+ +/*
+ + * The various find bit functions.
+ + */
+ +
+ +/*
+ + * ffz - find first zero in word.
+ + * @word: The word to search
+ + *
+ + * Undefined if no zero exists, so code should check against ~0UL first.
+ + */
+ +static inline unsigned long ffz(unsigned long word)
+ +{
+ +	return __ffz_word(0, word);
+  }
+  
+  /**
+diff --cc drivers/s390/cio/airq.c
+index d3f446ebb35a,f055df0b167f..000000000000
+--- a/drivers/s390/cio/airq.c
++++ b/drivers/s390/cio/airq.c
+@@@ -169,73 -186,55 +169,102 @@@ void airq_iv_release(struct airq_iv *iv
+  EXPORT_SYMBOL(airq_iv_release);
+  
+  /**
+ - * airq_iv_alloc_bit - allocate an irq bit from an interrupt vector
+ + * airq_iv_alloc - allocate irq bits from an interrupt vector
+   * @iv: pointer to an interrupt vector structure
+ + * @num: number of consecutive irq bits to allocate
+   *
+ - * Returns the bit number of the allocated irq, or -1UL if no bit
+ - * is available or the AIRQ_IV_ALLOC flag has not been specified
+ + * Returns the bit number of the first irq in the allocated block of irqs,
+ + * or -1UL if no bit is available or the AIRQ_IV_ALLOC flag has not been
+ + * specified
+   */
+ -unsigned long airq_iv_alloc_bit(struct airq_iv *iv)
+ +unsigned long airq_iv_alloc(struct airq_iv *iv, unsigned long num)
+  {
+++<<<<<<< HEAD
+ +	const unsigned long be_to_le = BITS_PER_LONG - 1;
+ +	unsigned long bit, i, flags;
+++=======
++ 	unsigned long bit;
+++>>>>>>> 7d7c7b24e416 (s390/bitops: rename find_first_bit_left() to find_first_bit_inv())
+  
+ -	if (!iv->avail)
+ +	if (!iv->avail || num == 0)
+  		return -1UL;
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&iv->lock, flags);
+ +	bit = find_first_bit_left(iv->avail, iv->bits);
+ +	while (bit + num <= iv->bits) {
+ +		for (i = 1; i < num; i++)
+ +			if (!test_bit((bit + i) ^ be_to_le, iv->avail))
+ +				break;
+ +		if (i >= num) {
+ +			/* Found a suitable block of irqs */
+ +			for (i = 0; i < num; i++)
+ +				clear_bit((bit + i) ^ be_to_le, iv->avail);
+ +			if (bit + num >= iv->end)
+ +				iv->end = bit + num + 1;
+ +			break;
+ +		}
+ +		bit = find_next_bit_left(iv->avail, iv->bits, bit + i + 1);
+ +	}
+ +	if (bit + num > iv->bits)
+++=======
++ 	spin_lock(&iv->lock);
++ 	bit = find_first_bit_inv(iv->avail, iv->bits);
++ 	if (bit < iv->bits) {
++ 		clear_bit_inv(bit, iv->avail);
++ 		if (bit >= iv->end)
++ 			iv->end = bit + 1;
++ 	} else
+++>>>>>>> 7d7c7b24e416 (s390/bitops: rename find_first_bit_left() to find_first_bit_inv())
+  		bit = -1UL;
+ -	spin_unlock(&iv->lock);
+ +	spin_unlock_irqrestore(&iv->lock, flags);
+  	return bit;
+ -
+  }
+ -EXPORT_SYMBOL(airq_iv_alloc_bit);
+ +EXPORT_SYMBOL(airq_iv_alloc);
+  
+  /**
+ - * airq_iv_free_bit - free an irq bit of an interrupt vector
+ + * airq_iv_free - free irq bits of an interrupt vector
+   * @iv: pointer to interrupt vector structure
+ - * @bit: number of the irq bit to free
+ + * @bit: number of the first irq bit to free
+ + * @num: number of consecutive irq bits to free
+   */
+ -void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit)
+ +void airq_iv_free(struct airq_iv *iv, unsigned long bit, unsigned long num)
+  {
+++<<<<<<< HEAD
+ +	const unsigned long be_to_le = BITS_PER_LONG - 1;
+ +
+ +	unsigned long i, flags;
+ +
+ +	if (!iv->avail || num == 0)
+ +		return;
+ +	spin_lock_irqsave(&iv->lock, flags);
+ +	for (i = 0; i < num; i++) {
+ +		/* Clear (possibly left over) interrupt bit */
+ +		clear_bit((bit + i) ^ be_to_le, iv->vector);
+ +		/* Make the bit positions available again */
+ +		set_bit((bit + i) ^ be_to_le, iv->avail);
+++=======
++ 	if (!iv->avail)
++ 		return;
++ 	spin_lock(&iv->lock);
++ 	/* Clear (possibly left over) interrupt bit */
++ 	clear_bit_inv(bit, iv->vector);
++ 	/* Make the bit position available again */
++ 	set_bit_inv(bit, iv->avail);
++ 	if (bit == iv->end - 1) {
++ 		/* Find new end of bit-field */
++ 		while (--iv->end > 0)
++ 			if (!test_bit_inv(iv->end - 1, iv->avail))
++ 				break;
+++>>>>>>> 7d7c7b24e416 (s390/bitops: rename find_first_bit_left() to find_first_bit_inv())
+ +	}
+ +	if (bit + num >= iv->end) {
+ +		/* Find new end of bit-field */
+ +		while (iv->end > 0 && !test_bit((iv->end - 1) ^ be_to_le, iv->avail))
+ +			iv->end--;
+  	}
+ -	spin_unlock(&iv->lock);
+ +	spin_unlock_irqrestore(&iv->lock, flags);
+  }
+ -EXPORT_SYMBOL(airq_iv_free_bit);
+ +EXPORT_SYMBOL(airq_iv_free);
+  
+  /**
+   * airq_iv_scan - scan interrupt vector for non-zero bits
+* Unmerged path arch/s390/lib/find.c
+* Unmerged path arch/s390/include/asm/bitops.h
+* Unmerged path arch/s390/lib/find.c
+* Unmerged path drivers/s390/cio/airq.c
