@@ -1,0 +1,347 @@
+btrfs: update btrfs_space_info's bytes_may_use timely
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Xiaoguang <wangxg.fnst@cn.fujitsu.com>
+commit 18513091af9483ba84328d42092bd4d42a3c958f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/18513091.failed
+
+This patch can fix some false ENOSPC errors, below test script can
+reproduce one false ENOSPC error:
+	#!/bin/bash
+	dd if=/dev/zero of=fs.img bs=$((1024*1024)) count=128
+	dev=$(losetup --show -f fs.img)
+	mkfs.btrfs -f -M $dev
+	mkdir /tmp/mntpoint
+	mount $dev /tmp/mntpoint
+	cd /tmp/mntpoint
+	xfs_io -f -c "falloc 0 $((64*1024*1024))" testfile
+
+Above script will fail for ENOSPC reason, but indeed fs still has free
+space to satisfy this request. Please see call graph:
+btrfs_fallocate()
+|-> btrfs_alloc_data_chunk_ondemand()
+|   bytes_may_use += 64M
+|-> btrfs_prealloc_file_range()
+    |-> btrfs_reserve_extent()
+        |-> btrfs_add_reserved_bytes()
+        |   alloc_type is RESERVE_ALLOC_NO_ACCOUNT, so it does not
+        |   change bytes_may_use, and bytes_reserved += 64M. Now
+        |   bytes_may_use + bytes_reserved == 128M, which is greater
+        |   than btrfs_space_info's total_bytes, false enospc occurs.
+        |   Note, the bytes_may_use decrease operation will be done in
+        |   end of btrfs_fallocate(), which is too late.
+
+Here is another simple case for buffered write:
+                    CPU 1              |              CPU 2
+                                       |
+|-> cow_file_range()                   |-> __btrfs_buffered_write()
+    |-> btrfs_reserve_extent()         |   |
+    |                                  |   |
+    |                                  |   |
+    |    .....                         |   |-> btrfs_check_data_free_space()
+    |                                  |
+    |                                  |
+    |-> extent_clear_unlock_delalloc() |
+
+In CPU 1, btrfs_reserve_extent()->find_free_extent()->
+btrfs_add_reserved_bytes() do not decrease bytes_may_use, the decrease
+operation will be delayed to be done in extent_clear_unlock_delalloc().
+Assume in this case, btrfs_reserve_extent() reserved 128MB data, CPU2's
+btrfs_check_data_free_space() tries to reserve 100MB data space.
+If
+	100MB > data_sinfo->total_bytes - data_sinfo->bytes_used -
+		data_sinfo->bytes_reserved - data_sinfo->bytes_pinned -
+		data_sinfo->bytes_readonly - data_sinfo->bytes_may_use
+btrfs_check_data_free_space() will try to allcate new data chunk or call
+btrfs_start_delalloc_roots(), or commit current transaction in order to
+reserve some free space, obviously a lot of work. But indeed it's not
+necessary as long as decreasing bytes_may_use timely, we still have
+free space, decreasing 128M from bytes_may_use.
+
+To fix this issue, this patch chooses to update bytes_may_use for both
+data and metadata in btrfs_add_reserved_bytes(). For compress path, real
+extent length may not be equal to file content length, so introduce a
+ram_bytes argument for btrfs_reserve_extent(), find_free_extent() and
+btrfs_add_reserved_bytes(), it's becasue bytes_may_use is increased by
+file content length. Then compress path can update bytes_may_use
+correctly. Also now we can discard RESERVE_ALLOC_NO_ACCOUNT, RESERVE_ALLOC
+and RESERVE_FREE.
+
+As we know, usually EXTENT_DO_ACCOUNTING is used for error path. In
+run_delalloc_nocow(), for inode marked as NODATACOW or extent marked as
+PREALLOC, we also need to update bytes_may_use, but can not pass
+EXTENT_DO_ACCOUNTING, because it also clears metadata reservation, so
+here we introduce EXTENT_CLEAR_DATA_RESV flag to indicate btrfs_clear_bit_hook()
+to update btrfs_space_info's bytes_may_use.
+
+Meanwhile __btrfs_prealloc_file_range() will call
+btrfs_free_reserved_data_space() internally for both sucessful and failed
+path, btrfs_prealloc_file_range()'s callers does not need to call
+btrfs_free_reserved_data_space() any more.
+
+	Signed-off-by: Wang Xiaoguang <wangxg.fnst@cn.fujitsu.com>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 18513091af9483ba84328d42092bd4d42a3c958f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+#	fs/btrfs/file.c
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/extent-tree.c
+index 937794635502,133c93b0a0f1..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -7602,10 -7946,12 +7583,19 @@@ int btrfs_reserve_extent(struct btrfs_r
+  	flags = btrfs_get_alloc_profile(root, is_data);
+  again:
+  	WARN_ON(num_bytes < root->sectorsize);
+++<<<<<<< HEAD
+ +	ret = find_free_extent(root, num_bytes, empty_size, hint_byte, ins,
+ +			       flags, delalloc);
+ +
+ +	if (ret == -ENOSPC) {
+++=======
++ 	ret = find_free_extent(root, ram_bytes, num_bytes, empty_size,
++ 			       hint_byte, ins, flags, delalloc);
++ 	if (!ret && !is_data) {
++ 		btrfs_dec_block_group_reservations(root->fs_info,
++ 						   ins->objectid);
++ 	} else if (ret == -ENOSPC) {
+++>>>>>>> 18513091af94 (btrfs: update btrfs_space_info's bytes_may_use timely)
+  		if (!final_tried && ins->offset) {
+  			num_bytes = min(num_bytes >> 1, ins->offset);
+  			num_bytes = round_down(num_bytes, root->sectorsize);
+diff --cc fs/btrfs/file.c
+index e43faf9abaf6,3391f2adf0c8..000000000000
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@@ -2860,18 -2856,11 +2871,23 @@@ out_unlock
+  	unlock_extent_cached(&BTRFS_I(inode)->io_tree, alloc_start, locked_end,
+  			     &cached_state, GFP_KERNEL);
+  out:
+++<<<<<<< HEAD
+ +	/*
+ +	 * As we waited the extent range, the data_rsv_map must be empty
+ +	 * in the range, as written data range will be released from it.
+ +	 * And for prealloacted extent, it will also be released when
+ +	 * its metadata is written.
+ +	 * So this is completely used as cleanup.
+ +	 */
+ +	btrfs_qgroup_free_data(inode, alloc_start, alloc_end - alloc_start);
+ +	mutex_unlock(&inode->i_mutex);
+++=======
++ 	inode_unlock(inode);
+++>>>>>>> 18513091af94 (btrfs: update btrfs_space_info's bytes_may_use timely)
+  	/* Let go of our reservation. */
+- 	btrfs_free_reserved_data_space(inode, alloc_start,
+- 				       alloc_end - alloc_start);
++ 	if (ret != 0)
++ 		btrfs_free_reserved_data_space(inode, alloc_start,
++ 				       alloc_end - cur_offset);
+  	return ret;
+  }
+  
+diff --cc fs/btrfs/inode.c
+index 3fafb48a6ff7,bcea20015d9a..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -961,9 -971,10 +963,10 @@@ static noinline int cow_file_range(stru
+  				     EXTENT_DEFRAG, PAGE_UNLOCK |
+  				     PAGE_CLEAR_DIRTY | PAGE_SET_WRITEBACK |
+  				     PAGE_END_WRITEBACK);
+- 
++ 			btrfs_free_reserved_data_space_noquota(inode, start,
++ 						end - start + 1);
+  			*nr_written = *nr_written +
+ -			     (end - start + PAGE_SIZE) / PAGE_SIZE;
+ +			     (end - start + PAGE_CACHE_SIZE) / PAGE_CACHE_SIZE;
+  			*page_started = 1;
+  			goto out;
+  		} else if (ret < 0) {
+@@@ -7698,57 -7742,30 +7705,67 @@@ static int btrfs_get_blocks_direct(stru
+  		block_start = em->block_start + (start - em->start);
+  
+  		if (can_nocow_extent(inode, start, &len, &orig_start,
+ -				     &orig_block_len, &ram_bytes) == 1 &&
+ -		    btrfs_inc_nocow_writers(root->fs_info, block_start)) {
+ -			struct extent_map *em2;
+ -
+ -			em2 = btrfs_create_dio_extent(inode, start, len,
+ -						      orig_start, block_start,
+ -						      len, orig_block_len,
+ -						      ram_bytes, type);
+ -			btrfs_dec_nocow_writers(root->fs_info, block_start);
+ -			if (type == BTRFS_ORDERED_PREALLOC) {
+ +				     &orig_block_len, &ram_bytes) == 1) {
+ +
+ +			/*
+ +			 * Create the ordered extent before the extent map. This
+ +			 * is to avoid races with the fast fsync path because it
+ +			 * collects ordered extents into a local list and then
+ +			 * collects all the new extent maps, so we must create
+ +			 * the ordered extent first and make sure the fast fsync
+ +			 * path collects any new ordered extents after
+ +			 * collecting new extent maps as well. The fsync path
+ +			 * simply can not rely on inode_dio_wait() because it
+ +			 * causes deadlock with AIO.
+ +			 */
+ +			ret = btrfs_add_ordered_extent_dio(inode, start,
+ +					   block_start, len, len, type);
+ +			if (ret) {
+  				free_extent_map(em);
+ -				em = em2;
+ -			}
+ -			if (em2 && IS_ERR(em2)) {
+ -				ret = PTR_ERR(em2);
+  				goto unlock_err;
+  			}
+++<<<<<<< HEAD
+ +
+ +			if (type == BTRFS_ORDERED_PREALLOC) {
+ +				free_extent_map(em);
+ +				em = create_pinned_em(inode, start, len,
+ +						       orig_start,
+ +						       block_start, len,
+ +						       orig_block_len,
+ +						       ram_bytes, type);
+ +				if (IS_ERR(em)) {
+ +					struct btrfs_ordered_extent *oe;
+ +
+ +					ret = PTR_ERR(em);
+ +					oe = btrfs_lookup_ordered_extent(inode,
+ +									 start);
+ +					ASSERT(oe);
+ +					if (WARN_ON(!oe))
+ +						goto unlock_err;
+ +					set_bit(BTRFS_ORDERED_IOERR,
+ +						&oe->flags);
+ +					set_bit(BTRFS_ORDERED_IO_DONE,
+ +						&oe->flags);
+ +					btrfs_remove_ordered_extent(inode, oe);
+ +					/*
+ +					 * Once for our lookup and once for the
+ +					 * ordered extents tree.
+ +					 */
+ +					btrfs_put_ordered_extent(oe);
+ +					btrfs_put_ordered_extent(oe);
+ +					goto unlock_err;
+ +				}
+ +			}
+ +
+++=======
++ 			/*
++ 			 * For inode marked NODATACOW or extent marked PREALLOC,
++ 			 * use the existing or preallocated extent, so does not
++ 			 * need to adjust btrfs_space_info's bytes_may_use.
++ 			 */
++ 			btrfs_free_reserved_data_space_noquota(inode,
++ 					start, len);
+++>>>>>>> 18513091af94 (btrfs: update btrfs_space_info's bytes_may_use timely)
+  			goto unlock;
+  		}
+  	}
+@@@ -7783,9 -7800,9 +7800,8 @@@ unlock
+  			i_size_write(inode, start + len);
+  
+  		adjust_dio_outstanding_extents(inode, dio_data, len);
+- 		btrfs_free_reserved_data_space(inode, start, len);
+  		WARN_ON(dio_data->reserve < len);
+  		dio_data->reserve -= len;
+ -		dio_data->unsubmitted_oe_range_end = start + len;
+  		current->journal_info = dio_data;
+  	}
+  
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 48f38b765f55..37ec9f9acd23 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2535,7 +2535,7 @@ int btrfs_alloc_logged_file_extent(struct btrfs_trans_handle *trans,
+ 				   struct btrfs_root *root,
+ 				   u64 root_objectid, u64 owner, u64 offset,
+ 				   struct btrfs_key *ins);
+-int btrfs_reserve_extent(struct btrfs_root *root, u64 num_bytes,
++int btrfs_reserve_extent(struct btrfs_root *root, u64 ram_bytes, u64 num_bytes,
+ 			 u64 min_alloc_size, u64 empty_size, u64 hint_byte,
+ 			 struct btrfs_key *ins, int is_data, int delalloc);
+ int btrfs_inc_ref(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+* Unmerged path fs/btrfs/extent-tree.c
+diff --git a/fs/btrfs/extent_io.h b/fs/btrfs/extent_io.h
+index c7b1fc085048..115bd6e53455 100644
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@ -20,6 +20,7 @@
+ #define EXTENT_DAMAGED		(1U << 14)
+ #define EXTENT_NORESERVE	(1U << 15)
+ #define EXTENT_QGROUP_RESERVED	(1U << 16)
++#define EXTENT_CLEAR_DATA_RESV	(1U << 17)
+ #define EXTENT_IOBITS		(EXTENT_LOCKED | EXTENT_WRITEBACK)
+ #define EXTENT_CTLBITS		(EXTENT_DO_ACCOUNTING | EXTENT_FIRST_DELALLOC)
+ 
+* Unmerged path fs/btrfs/file.c
+diff --git a/fs/btrfs/inode-map.c b/fs/btrfs/inode-map.c
+index 8d4cffdaf181..99534e95035f 100644
+--- a/fs/btrfs/inode-map.c
++++ b/fs/btrfs/inode-map.c
+@@ -495,10 +495,9 @@ again:
+ 	ret = btrfs_prealloc_file_range_trans(inode, trans, 0, 0, prealloc,
+ 					      prealloc, prealloc, &alloc_hint);
+ 	if (ret) {
+-		btrfs_delalloc_release_space(inode, 0, prealloc);
++		btrfs_delalloc_release_metadata(inode, prealloc);
+ 		goto out_put;
+ 	}
+-	btrfs_free_reserved_data_space(inode, 0, prealloc);
+ 
+ 	ret = btrfs_write_out_ino_cache(root, trans, path, inode);
+ out_put:
+* Unmerged path fs/btrfs/inode.c
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index 23e79910d40f..e750fb4fa698 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -3037,6 +3037,7 @@ int prealloc_file_extent_cluster(struct inode *inode,
+ 	int ret = 0;
+ 	u64 prealloc_start = cluster->start - offset;
+ 	u64 prealloc_end = cluster->end - offset;
++	u64 cur_offset;
+ 
+ 	BUG_ON(cluster->start != cluster->boundary[0]);
+ 	mutex_lock(&inode->i_mutex);
+@@ -3046,6 +3047,7 @@ int prealloc_file_extent_cluster(struct inode *inode,
+ 	if (ret)
+ 		goto out;
+ 
++	cur_offset = prealloc_start;
+ 	while (nr < cluster->nr) {
+ 		start = cluster->boundary[nr] - offset;
+ 		if (nr + 1 < cluster->nr)
+@@ -3055,16 +3057,21 @@ int prealloc_file_extent_cluster(struct inode *inode,
+ 
+ 		lock_extent(&BTRFS_I(inode)->io_tree, start, end);
+ 		num_bytes = end + 1 - start;
++		if (cur_offset < start)
++			btrfs_free_reserved_data_space(inode, cur_offset,
++					start - cur_offset);
+ 		ret = btrfs_prealloc_file_range(inode, 0, start,
+ 						num_bytes, num_bytes,
+ 						end + 1, &alloc_hint);
++		cur_offset = end + 1;
+ 		unlock_extent(&BTRFS_I(inode)->io_tree, start, end);
+ 		if (ret)
+ 			break;
+ 		nr++;
+ 	}
+-	btrfs_free_reserved_data_space(inode, prealloc_start,
+-				       prealloc_end + 1 - prealloc_start);
++	if (cur_offset < prealloc_end)
++		btrfs_free_reserved_data_space(inode, cur_offset,
++				       prealloc_end + 1 - cur_offset);
+ out:
+ 	mutex_unlock(&inode->i_mutex);
+ 	return ret;
