@@ -1,0 +1,146 @@
+nfp: bpf: allocate vNIC priv for keeping track of the offloaded program
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 4f83435ad777358d9cdc138868feebbe2a23f577
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4f83435a.failed
+
+After TC offloads were converted to callbacks we have no choice
+but keep track of the offloaded filter in the driver.
+
+Since this change came a little late in the release cycle
+there were a number of conflicts and allocation of vNIC priv
+structure seems to have slipped away in linux-next.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f83435ad777358d9cdc138868feebbe2a23f577)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 4ca14182b178,4b63167906ca..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -87,31 -86,96 +87,61 @@@ static const char *nfp_bpf_extra_cap(st
+  
+  static int
+  nfp_bpf_vnic_alloc(struct nfp_app *app, struct nfp_net *nn, unsigned int id)
+++<<<<<<< HEAD
+++=======
++ {
++ 	int err;
++ 
++ 	nn->app_priv = kzalloc(sizeof(struct nfp_bpf_vnic), GFP_KERNEL);
++ 	if (!nn->app_priv)
++ 		return -ENOMEM;
++ 
++ 	err = nfp_app_nic_vnic_alloc(app, nn, id);
++ 	if (err)
++ 		goto err_free_priv;
++ 
++ 	return 0;
++ err_free_priv:
++ 	kfree(nn->app_priv);
++ 	return err;
++ }
++ 
++ static void nfp_bpf_vnic_free(struct nfp_app *app, struct nfp_net *nn)
++ {
++ 	struct nfp_bpf_vnic *bv = nn->app_priv;
++ 
++ 	WARN_ON(bv->tc_prog);
++ 	kfree(bv);
++ }
++ 
++ static int nfp_bpf_setup_tc_block_cb(enum tc_setup_type type,
++ 				     void *type_data, void *cb_priv)
+++>>>>>>> 4f83435ad777 (nfp: bpf: allocate vNIC priv for keeping track of the offloaded program)
+  {
+ -	struct tc_cls_bpf_offload *cls_bpf = type_data;
+ -	struct nfp_net *nn = cb_priv;
+ -	struct bpf_prog *oldprog;
+ -	struct nfp_bpf_vnic *bv;
+ -	int err;
+ -
+ -	if (type != TC_SETUP_CLSBPF ||
+ -	    !tc_can_offload(nn->dp.netdev) ||
+ -	    !nfp_net_ebpf_capable(nn) ||
+ -	    cls_bpf->common.protocol != htons(ETH_P_ALL) ||
+ -	    cls_bpf->common.chain_index)
+ -		return -EOPNOTSUPP;
+ -
+ -	/* Only support TC direct action */
+ -	if (!cls_bpf->exts_integrated ||
+ -	    tcf_exts_has_actions(cls_bpf->exts)) {
+ -		nn_err(nn, "only direct action with no legacy actions supported\n");
+ -		return -EOPNOTSUPP;
+ -	}
+ -
+ -	if (cls_bpf->command != TC_CLSBPF_OFFLOAD)
+ -		return -EOPNOTSUPP;
+ +	struct nfp_net_bpf_priv *priv;
+ +	int ret;
+  
+ -	bv = nn->app_priv;
+ -	oldprog = cls_bpf->oldprog;
+ +	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+ +	if (!priv)
+ +		return -ENOMEM;
+  
+ -	/* Don't remove if oldprog doesn't match driver's state */
+ -	if (bv->tc_prog != oldprog) {
+ -		oldprog = NULL;
+ -		if (!cls_bpf->prog)
+ -			return 0;
+ -	}
+ +	nn->app_priv = priv;
+ +	spin_lock_init(&priv->rx_filter_lock);
+ +	setup_timer(&priv->rx_filter_stats_timer,
+ +		    nfp_net_filter_stats_timer, (unsigned long)nn);
+  
+ -	err = nfp_net_bpf_offload(nn, cls_bpf->prog, oldprog);
+ -	if (err)
+ -		return err;
+ +	ret = nfp_app_nic_vnic_alloc(app, nn, id);
+ +	if (ret)
+ +		kfree(priv);
+  
+ -	bv->tc_prog = cls_bpf->prog;
+ -	return 0;
+ +	return ret;
+  }
+  
+ -static int nfp_bpf_setup_tc_block(struct net_device *netdev,
+ -				  struct tc_block_offload *f)
+ +static void nfp_bpf_vnic_free(struct nfp_app *app, struct nfp_net *nn)
+  {
+ -	struct nfp_net *nn = netdev_priv(netdev);
+ -
+ -	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+ -		return -EOPNOTSUPP;
+ -
+ -	switch (f->command) {
+ -	case TC_BLOCK_BIND:
+ -		return tcf_block_cb_register(f->block,
+ -					     nfp_bpf_setup_tc_block_cb,
+ -					     nn, nn);
+ -	case TC_BLOCK_UNBIND:
+ -		tcf_block_cb_unregister(f->block,
+ -					nfp_bpf_setup_tc_block_cb,
+ -					nn);
+ -		return 0;
+ -	default:
+ -		return -EOPNOTSUPP;
+ -	}
+ +	if (nn->dp.bpf_offload_xdp)
+ +		nfp_bpf_xdp_offload(app, nn, NULL);
+ +	kfree(nn->app_priv);
+  }
+  
+  static int nfp_bpf_setup_tc(struct nfp_app *app, struct net_device *netdev,
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
