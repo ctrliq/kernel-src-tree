@@ -1,0 +1,267 @@
+xprtrdma: Refactor FRMR invalidation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit a100fda1a2e1fa6c52373b9c7985a0bd3459bf4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a100fda1.failed
+
+Clean up: After some recent updates, clarifications can be made to
+the FRMR invalidation logic.
+
+- Both the remote and local invalidation case mark the frmr INVALID,
+  so make that a common path.
+
+- Manage the WR list more "tastefully" by replacing the conditional
+  that discriminates between the list head and ->next pointers.
+
+- Use mw->mw_handle in all cases, since that has the same value as
+  f->fr_mr->rkey, and is already in cache.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit a100fda1a2e1fa6c52373b9c7985a0bd3459bf4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index cba1269d30ef,900dc4024d2c..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -454,59 -432,31 +454,62 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  	if (rc)
+  		goto out_senderr;
+  
+ -	mw->mw_handle = mr->rkey;
+ -	mw->mw_length = mr->length;
+ -	mw->mw_offset = mr->iova;
+ +	seg1->mr_dir = direction;
+ +	seg1->rl_mw = mw;
+ +	seg1->mr_rkey = mr->rkey;
+ +	seg1->mr_base = mr->iova;
+ +	seg1->mr_nsegs = frmr->sg_nents;
+ +	seg1->mr_len = mr->length;
+  
+ -	*out = mw;
+ -	return mw->mw_nents;
+ +	return frmr->sg_nents;
+  
+ -out_dmamap_err:
+ -	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
+ -	       mw->mw_sg, mw->mw_nents);
+ -	rpcrdma_defer_mr_recovery(mw);
+ -	return -EIO;
+ +out_senderr:
+ +	dprintk("RPC:       %s: ib_post_send status %i\n", __func__, rc);
+ +	ib_dma_unmap_sg(device, frmr->sg, dma_nents, direction);
+ +	__frwr_queue_recovery(mw);
+ +	return rc;
+ +}
+ +
+++<<<<<<< HEAD
+ +static struct ib_send_wr *
+ +__frwr_prepare_linv_wr(struct rpcrdma_mr_seg *seg)
+ +{
+ +	struct rpcrdma_mw *mw = seg->rl_mw;
+ +	struct rpcrdma_frmr *f = &mw->frmr;
+ +	struct ib_send_wr *invalidate_wr;
+ +
+ +	f->fr_state = FRMR_IS_INVALID;
+ +	invalidate_wr = &f->fr_invwr;
+  
+ -out_mapmr_err:
+ -	pr_err("rpcrdma: failed to map mr %p (%u/%u)\n",
+ -	       frmr->fr_mr, n, mw->mw_nents);
+ -	rpcrdma_defer_mr_recovery(mw);
+ -	return -EIO;
+ +	memset(invalidate_wr, 0, sizeof(*invalidate_wr));
+ +	f->fr_cqe.done = frwr_wc_localinv;
+ +	invalidate_wr->wr_cqe = &f->fr_cqe;
+ +	invalidate_wr->opcode = IB_WR_LOCAL_INV;
+ +	invalidate_wr->ex.invalidate_rkey = f->fr_mr->rkey;
+  
+ -out_senderr:
+ -	pr_err("rpcrdma: FRMR registration ib_post_send returned %i\n", rc);
+ -	rpcrdma_defer_mr_recovery(mw);
+ -	return -ENOTCONN;
+ +	return invalidate_wr;
+ +}
+ +
+ +static void
+ +__frwr_dma_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg,
+ +		 int rc)
+ +{
+ +	struct ib_device *device = r_xprt->rx_ia.ri_device;
+ +	struct rpcrdma_mw *mw = seg->rl_mw;
+ +	struct rpcrdma_frmr *f = &mw->frmr;
+ +
+ +	seg->rl_mw = NULL;
+ +
+ +	ib_dma_unmap_sg(device, f->sg, f->sg_nents, seg->mr_dir);
+ +
+ +	if (!rc)
+ +		rpcrdma_put_mw(r_xprt, mw);
+ +	else
+ +		__frwr_queue_recovery(mw);
+  }
+  
+++=======
+++>>>>>>> a100fda1a2e1 (xprtrdma: Refactor FRMR invalidation)
+  /* Invalidate all memory regions that were registered for "req".
+   *
+   * Sleeps until it is safe for the host CPU to access the
+@@@ -515,12 -467,12 +518,17 @@@
+  static void
+  frwr_op_unmap_sync(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
+  {
+++<<<<<<< HEAD
+ +	struct ib_send_wr *invalidate_wrs, *pos, *prev, *bad_wr;
+++=======
++ 	struct ib_send_wr *first, **prev, *last, *bad_wr;
++ 	struct rpcrdma_rep *rep = req->rl_reply;
+++>>>>>>> a100fda1a2e1 (xprtrdma: Refactor FRMR invalidation)
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ -	struct rpcrdma_mw *mw, *tmp;
+ +	struct rpcrdma_mr_seg *seg;
+ +	unsigned int i, nchunks;
+  	struct rpcrdma_frmr *f;
+ -	int count, rc;
+ +	int rc;
+  
+  	dprintk("RPC:       %s: req %p\n", __func__, req);
+  
+@@@ -529,42 -481,56 +537,76 @@@
+  	 * Chain the LOCAL_INV Work Requests and post them with
+  	 * a single ib_post_send() call.
+  	 */
+++<<<<<<< HEAD
+ +	invalidate_wrs = pos = prev = NULL;
+ +	seg = NULL;
+ +	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
+ +		seg = &req->rl_segments[i];
+ +
+ +		pos = __frwr_prepare_linv_wr(seg);
+ +
+ +		if (!invalidate_wrs)
+ +			invalidate_wrs = pos;
+ +		else
+ +			prev->next = pos;
+ +		prev = pos;
+ +
+ +		i += seg->mr_nsegs;
+++=======
++ 	f = NULL;
++ 	count = 0;
++ 	prev = &first;
++ 	list_for_each_entry(mw, &req->rl_registered, mw_list) {
++ 		mw->frmr.fr_state = FRMR_IS_INVALID;
++ 
++ 		if ((rep->rr_wc_flags & IB_WC_WITH_INVALIDATE) &&
++ 		    (mw->mw_handle == rep->rr_inv_rkey))
++ 			continue;
++ 
++ 		f = &mw->frmr;
++ 		dprintk("RPC:       %s: invalidating frmr %p\n",
++ 			__func__, f);
++ 
++ 		f->fr_cqe.done = frwr_wc_localinv;
++ 		last = &f->fr_invwr;
++ 		memset(last, 0, sizeof(*last));
++ 		last->wr_cqe = &f->fr_cqe;
++ 		last->opcode = IB_WR_LOCAL_INV;
++ 		last->ex.invalidate_rkey = mw->mw_handle;
++ 		count++;
++ 
++ 		*prev = last;
++ 		prev = &last->next;
+++>>>>>>> a100fda1a2e1 (xprtrdma: Refactor FRMR invalidation)
+  	}
+ -	if (!f)
+ -		goto unmap;
+ +	f = &seg->rl_mw->frmr;
+  
+  	/* Strong send queue ordering guarantees that when the
+  	 * last WR in the chain completes, all WRs in the chain
+  	 * are complete.
+  	 */
+- 	f->fr_invwr.send_flags = IB_SEND_SIGNALED;
++ 	last->send_flags = IB_SEND_SIGNALED;
+  	f->fr_cqe.done = frwr_wc_localinv_wake;
+  	reinit_completion(&f->fr_linv_done);
+ -
+ -	/* Initialize CQ count, since there is always a signaled
+ -	 * WR being posted here.  The new cqcount depends on how
+ -	 * many SQEs are about to be consumed.
+ -	 */
+ -	rpcrdma_init_cqcount(&r_xprt->rx_ep, count);
+ +	INIT_CQCOUNT(&r_xprt->rx_ep);
+  
+  	/* Transport disconnect drains the receive CQ before it
+  	 * replaces the QP. The RPC reply handler won't call us
+  	 * unless ri_id->qp is a valid pointer.
+  	 */
+++<<<<<<< HEAD
+ +	rc = ib_post_send(ia->ri_id->qp, invalidate_wrs, &bad_wr);
+ +	if (rc) {
+ +		pr_warn("%s: ib_post_send failed %i\n", __func__, rc);
+ +		rdma_disconnect(ia->ri_id);
+ +		goto unmap;
+ +	}
+++=======
++ 	r_xprt->rx_stats.local_inv_needed++;
++ 	rc = ib_post_send(ia->ri_id->qp, first, &bad_wr);
++ 	if (rc)
++ 		goto reset_mrs;
+++>>>>>>> a100fda1a2e1 (xprtrdma: Refactor FRMR invalidation)
+  
+  	wait_for_completion(&f->fr_linv_done);
+  
+@@@ -572,16 -538,31 +614,40 @@@
+  	 * them to the free MW list.
+  	 */
+  unmap:
+++<<<<<<< HEAD
+ +	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
+ +		seg = &req->rl_segments[i];
+++=======
++ 	list_for_each_entry_safe(mw, tmp, &req->rl_registered, mw_list) {
++ 		dprintk("RPC:       %s: DMA unmapping frmr %p\n",
++ 			__func__, &mw->frmr);
++ 		list_del_init(&mw->mw_list);
++ 		ib_dma_unmap_sg(ia->ri_device,
++ 				mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 		rpcrdma_put_mw(r_xprt, mw);
++ 	}
++ 	return;
+++>>>>>>> a100fda1a2e1 (xprtrdma: Refactor FRMR invalidation)
+  
+ -reset_mrs:
+ -	pr_err("rpcrdma: FRMR invalidate ib_post_send returned %i\n", rc);
+ -	rdma_disconnect(ia->ri_id);
+ +		__frwr_dma_unmap(r_xprt, seg, rc);
+  
+++<<<<<<< HEAD
+ +		i += seg->mr_nsegs;
+ +		seg->mr_nsegs = 0;
+++=======
++ 	/* Find and reset the MRs in the LOCAL_INV WRs that did not
++ 	 * get posted. This is synchronous, and slow.
++ 	 */
++ 	list_for_each_entry(mw, &req->rl_registered, mw_list) {
++ 		f = &mw->frmr;
++ 		if (mw->mw_handle == bad_wr->ex.invalidate_rkey) {
++ 			__frwr_reset_mr(ia, mw);
++ 			bad_wr = bad_wr->next;
++ 		}
+++>>>>>>> a100fda1a2e1 (xprtrdma: Refactor FRMR invalidation)
+  	}
+ -	goto unmap;
+ +
+ +	req->rl_nchunks = 0;
+  }
+  
+  /* Use a slow, safe mechanism to invalidate all memory regions
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
