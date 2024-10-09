@@ -1,0 +1,272 @@
+target/user: PGR Support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+commit 4ec5bf0ea83930b96addf6b78225bf0355459d7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4ec5bf0e.failed
+
+This adds initial PGR support for just TCMU, since tcmu doesn't
+have the necessary IT_NEXUS info to process PGR in userspace,
+so have those commands be processed in kernel.
+
+HA support is not available yet, we will work on it if this patch
+is acceptable.
+
+	Signed-off-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 4ec5bf0ea83930b96addf6b78225bf0355459d7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_configfs.c
+#	drivers/target/target_core_device.c
+diff --cc drivers/target/target_core_configfs.c
+index c42c1c913011,e7b62bc239a7..000000000000
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@@ -886,12 -1395,12 +886,12 @@@ static ssize_t target_core_dev_pr_show_
+  	return len;
+  }
+  
+ -static ssize_t target_pr_res_holder_show(struct config_item *item, char *page)
+ +static ssize_t target_core_dev_pr_show_attr_res_holder(struct se_device *dev,
+ +		char *page)
+  {
+ -	struct se_device *dev = pr_to_dev(item);
+  	int ret;
+  
+- 	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH)
++ 	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH_PGR)
+  		return sprintf(page, "Passthrough\n");
+  
+  	spin_lock(&dev->dev_reservation_lock);
+@@@ -1037,12 -1536,11 +1037,16 @@@ static ssize_t target_core_dev_pr_show_
+  	return len;
+  }
+  
+ -static ssize_t target_pr_res_type_show(struct config_item *item, char *page)
+ -{
+ -	struct se_device *dev = pr_to_dev(item);
+ +SE_DEV_PR_ATTR_RO(res_pr_type);
+  
+++<<<<<<< HEAD
+ +static ssize_t target_core_dev_pr_show_attr_res_type(
+ +		struct se_device *dev, char *page)
+ +{
+ +	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH)
+++=======
++ 	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH_PGR)
+++>>>>>>> 4ec5bf0ea839 (target/user: PGR Support)
+  		return sprintf(page, "SPC_PASSTHROUGH\n");
+  	else if (dev->dev_reservation_flags & DRF_SPC2_RESERVATIONS)
+  		return sprintf(page, "SPC2_RESERVATIONS\n");
+@@@ -1050,27 -1548,24 +1054,35 @@@
+  		return sprintf(page, "SPC3_PERSISTENT_RESERVATIONS\n");
+  }
+  
+ -static ssize_t target_pr_res_aptpl_active_show(struct config_item *item,
+ -		char *page)
+ -{
+ -	struct se_device *dev = pr_to_dev(item);
+ +SE_DEV_PR_ATTR_RO(res_type);
+  
+++<<<<<<< HEAD
+ +static ssize_t target_core_dev_pr_show_attr_res_aptpl_active(
+ +		struct se_device *dev, char *page)
+ +{
+ +	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH)
+++=======
++ 	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH_PGR)
+++>>>>>>> 4ec5bf0ea839 (target/user: PGR Support)
+  		return 0;
+  
+  	return sprintf(page, "APTPL Bit Status: %s\n",
+  		(dev->t10_pr.pr_aptpl_active) ? "Activated" : "Disabled");
+  }
+  
+ -static ssize_t target_pr_res_aptpl_metadata_show(struct config_item *item,
+ -		char *page)
+ -{
+ -	struct se_device *dev = pr_to_dev(item);
+ +SE_DEV_PR_ATTR_RO(res_aptpl_active);
+  
+++<<<<<<< HEAD
+ +/*
+ + * res_aptpl_metadata
+ + */
+ +static ssize_t target_core_dev_pr_show_attr_res_aptpl_metadata(
+ +		struct se_device *dev, char *page)
+ +{
+ +	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH)
+++=======
++ 	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH_PGR)
+++>>>>>>> 4ec5bf0ea839 (target/user: PGR Support)
+  		return 0;
+  
+  	return sprintf(page, "Ready to process PR APTPL metadata..\n");
+diff --cc drivers/target/target_core_device.c
+index 1e65ea95d7f2,c4845678eb91..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -1710,3 -1036,114 +1710,117 @@@ void core_dev_release_virtual_lun0(void
+  		target_free_device(g_lun0_dev);
+  	core_delete_hba(hba);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Common CDB parsing for kernel and user passthrough.
++  */
++ sense_reason_t
++ passthrough_parse_cdb(struct se_cmd *cmd,
++ 	sense_reason_t (*exec_cmd)(struct se_cmd *cmd))
++ {
++ 	unsigned char *cdb = cmd->t_task_cdb;
++ 	struct se_device *dev = cmd->se_dev;
++ 	unsigned int size;
++ 
++ 	/*
++ 	 * Clear a lun set in the cdb if the initiator talking to use spoke
++ 	 * and old standards version, as we can't assume the underlying device
++ 	 * won't choke up on it.
++ 	 */
++ 	switch (cdb[0]) {
++ 	case READ_10: /* SBC - RDProtect */
++ 	case READ_12: /* SBC - RDProtect */
++ 	case READ_16: /* SBC - RDProtect */
++ 	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
++ 	case VERIFY: /* SBC - VRProtect */
++ 	case VERIFY_16: /* SBC - VRProtect */
++ 	case WRITE_VERIFY: /* SBC - VRProtect */
++ 	case WRITE_VERIFY_12: /* SBC - VRProtect */
++ 	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
++ 		break;
++ 	default:
++ 		cdb[1] &= 0x1f; /* clear logical unit number */
++ 		break;
++ 	}
++ 
++ 	/*
++ 	 * For REPORT LUNS we always need to emulate the response, for everything
++ 	 * else, pass it up.
++ 	 */
++ 	if (cdb[0] == REPORT_LUNS) {
++ 		cmd->execute_cmd = spc_emulate_report_luns;
++ 		return TCM_NO_SENSE;
++ 	}
++ 
++ 	/*
++ 	 * For PERSISTENT RESERVE IN/OUT, RELEASE, and RESERVE we need to
++ 	 * emulate the response, since tcmu does not have the information
++ 	 * required to process these commands.
++ 	 */
++ 	if (!(dev->transport->transport_flags &
++ 	      TRANSPORT_FLAG_PASSTHROUGH_PGR)) {
++ 		if (cdb[0] == PERSISTENT_RESERVE_IN) {
++ 			cmd->execute_cmd = target_scsi3_emulate_pr_in;
++ 			size = (cdb[7] << 8) + cdb[8];
++ 			return target_cmd_size_check(cmd, size);
++ 		}
++ 		if (cdb[0] == PERSISTENT_RESERVE_OUT) {
++ 			cmd->execute_cmd = target_scsi3_emulate_pr_out;
++ 			size = (cdb[7] << 8) + cdb[8];
++ 			return target_cmd_size_check(cmd, size);
++ 		}
++ 
++ 		if (cdb[0] == RELEASE || cdb[0] == RELEASE_10) {
++ 			cmd->execute_cmd = target_scsi2_reservation_release;
++ 			if (cdb[0] == RELEASE_10)
++ 				size = (cdb[7] << 8) | cdb[8];
++ 			else
++ 				size = cmd->data_length;
++ 			return target_cmd_size_check(cmd, size);
++ 		}
++ 		if (cdb[0] == RESERVE || cdb[0] == RESERVE_10) {
++ 			cmd->execute_cmd = target_scsi2_reservation_reserve;
++ 			if (cdb[0] == RESERVE_10)
++ 				size = (cdb[7] << 8) | cdb[8];
++ 			else
++ 				size = cmd->data_length;
++ 			return target_cmd_size_check(cmd, size);
++ 		}
++ 	}
++ 
++ 	/* Set DATA_CDB flag for ops that should have it */
++ 	switch (cdb[0]) {
++ 	case READ_6:
++ 	case READ_10:
++ 	case READ_12:
++ 	case READ_16:
++ 	case WRITE_6:
++ 	case WRITE_10:
++ 	case WRITE_12:
++ 	case WRITE_16:
++ 	case WRITE_VERIFY:
++ 	case WRITE_VERIFY_12:
++ 	case 0x8e: /* WRITE_VERIFY_16 */
++ 	case COMPARE_AND_WRITE:
++ 	case XDWRITEREAD_10:
++ 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
++ 		break;
++ 	case VARIABLE_LENGTH_CMD:
++ 		switch (get_unaligned_be16(&cdb[8])) {
++ 		case READ_32:
++ 		case WRITE_32:
++ 		case 0x0c: /* WRITE_VERIFY_32 */
++ 		case XDWRITEREAD_32:
++ 			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
++ 			break;
++ 		}
++ 	}
++ 
++ 	cmd->execute_cmd = exec_cmd;
++ 
++ 	return TCM_NO_SENSE;
++ }
++ EXPORT_SYMBOL(passthrough_parse_cdb);
+++>>>>>>> 4ec5bf0ea839 (target/user: PGR Support)
+* Unmerged path drivers/target/target_core_configfs.c
+* Unmerged path drivers/target/target_core_device.c
+diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
+index a255afc452a9..d55f305e1da8 100644
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@ -4109,7 +4109,7 @@ target_check_reservation(struct se_cmd *cmd)
+ 		return 0;
+ 	if (dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE)
+ 		return 0;
+-	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH)
++	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH_PGR)
+ 		return 0;
+ 
+ 	spin_lock(&dev->dev_reservation_lock);
+diff --git a/drivers/target/target_core_pscsi.c b/drivers/target/target_core_pscsi.c
+index 59a8a2963c0e..ba998e4940e0 100644
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@ -1193,7 +1193,8 @@ static struct se_subsystem_api pscsi_template = {
+ 	.name			= "pscsi",
+ 	.owner			= THIS_MODULE,
+ 	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH |
+-				  TRANSPORT_FLAG_PASSTHROUGH_ALUA,
++				  TRANSPORT_FLAG_PASSTHROUGH_ALUA |
++				  TRANSPORT_FLAG_PASSTHROUGH_PGR,
+ 	.attach_hba		= pscsi_attach_hba,
+ 	.detach_hba		= pscsi_detach_hba,
+ 	.pmode_enable_hba	= pscsi_pmode_enable_hba,
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index b898a92cae3d..eac889fffe00 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -7,6 +7,7 @@
+  * backend module.
+  */
+ #define TRANSPORT_FLAG_PASSTHROUGH_ALUA		0x2
++#define TRANSPORT_FLAG_PASSTHROUGH_PGR          0x4
+ 
+ struct target_backend_cits {
+ 	struct config_item_type tb_dev_cit;
