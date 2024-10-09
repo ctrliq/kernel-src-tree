@@ -238,6 +238,7 @@ enum mlx5_flow_match_level {
 struct mlx5_esw_flow_attr {
 	struct mlx5_eswitch_rep *in_rep;
 	struct mlx5_eswitch_rep *out_rep;
+	struct mlx5_core_dev	*out_mdev;
 
 	int	action;
 	__be16	vlan_proto;
