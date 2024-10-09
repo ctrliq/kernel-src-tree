@@ -1,0 +1,190 @@
+tcmu: Support emulate_write_cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [target] Support emulate_write_cache (Xiubo Li) [1559232]
+Rebuild_FUZZ: 90.00%
+commit-author Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+commit 9a8bb60650b3d6994bd19a3200941f029c95a7a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9a8bb606.failed
+
+This will enable the toggling of write_cache in tcmu through targetcli-fb
+
+	Signed-off-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+Reviewed-By: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9a8bb60650b3d6994bd19a3200941f029c95a7a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 955a6ec44625,0c797cc69d9e..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1262,9 -1290,18 +1262,11 @@@ static int tcmu_configure_device(struc
+  	/* Other attributes can be configured in userspace */
+  	if (!dev->dev_attrib.hw_max_sectors)
+  		dev->dev_attrib.hw_max_sectors = 128;
++ 	if (!dev->dev_attrib.emulate_write_cache)
++ 		dev->dev_attrib.emulate_write_cache = 0;
+  	dev->dev_attrib.hw_queue_depth = 128;
+  
+ -	/*
+ -	 * Get a ref incase userspace does a close on the uio device before
+ -	 * LIO has initiated tcmu_free_device.
+ -	 */
+ -	kref_get(&udev->kref);
+ -
+ -	ret = tcmu_netlink_event(TCMU_CMD_ADDED_DEVICE, udev->uio_info.name,
+ -				 udev->uio_info.uio_dev->minor);
+ +	ret = tcmu_netlink_event(udev, TCMU_CMD_ADDED_DEVICE, 0, NULL);
+  	if (ret)
+  		goto err_netlink;
+  
+@@@ -1540,97 -1548,31 +1542,125 @@@ static ssize_t tcmu_cmd_time_out_store(
+  }
+  CONFIGFS_ATTR(tcmu_, cmd_time_out);
+  
+++<<<<<<< HEAD
+ +static ssize_t tcmu_qfull_time_out_show(struct config_item *item, char *page)
+ +{
+ +	struct se_dev_attrib *da = container_of(to_config_group(item),
+ +						struct se_dev_attrib, da_group);
+ +	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ +
+ +	return snprintf(page, PAGE_SIZE, "%ld\n", udev->qfull_time_out <= 0 ?
+ +			udev->qfull_time_out :
+ +			udev->qfull_time_out / MSEC_PER_SEC);
+ +}
+ +
+ +static ssize_t tcmu_qfull_time_out_store(struct config_item *item,
+ +					 const char *page, size_t count)
+ +{
+ +	struct se_dev_attrib *da = container_of(to_config_group(item),
+ +						struct se_dev_attrib, da_group);
+ +	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ +	s32 val;
+ +	int ret;
+ +
+ +	ret = kstrtos32(page, 0, &val);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	if (val >= 0) {
+ +		udev->qfull_time_out = val * MSEC_PER_SEC;
+ +	} else if (val == -1) {
+ +		udev->qfull_time_out = val;
+ +	} else {
+ +		printk(KERN_ERR "Invalid qfull timeout value %d\n", val);
+ +		return -EINVAL;
+ +	}
+ +	return count;
+ +}
+ +CONFIGFS_ATTR(tcmu_, qfull_time_out);
+ +
+ +static ssize_t tcmu_dev_size_show(struct config_item *item, char *page)
+ +{
+ +	struct se_dev_attrib *da = container_of(to_config_group(item),
+ +						struct se_dev_attrib, da_group);
+ +	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ +
+ +	return snprintf(page, PAGE_SIZE, "%zu\n", udev->dev_size);
+ +}
+ +
+ +static ssize_t tcmu_dev_size_store(struct config_item *item, const char *page,
+ +				   size_t count)
+ +{
+ +	struct se_dev_attrib *da = container_of(to_config_group(item),
+ +						struct se_dev_attrib, da_group);
+ +	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ +	u64 val;
+ +	int ret;
+ +
+ +	ret = kstrtou64(page, 0, &val);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	/* Check if device has been configured before */
+ +	if (tcmu_dev_configured(udev)) {
+ +		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
+ +					 TCMU_ATTR_DEV_SIZE, &val);
+ +		if (ret) {
+ +			pr_err("Unable to reconfigure device\n");
+ +			return ret;
+ +		}
+ +	}
+ +
+ +	udev->dev_size = val;
+ +	return count;
+ +}
+ +CONFIGFS_ATTR(tcmu_, dev_size);
+ +
+ +static ssize_t tcmu_max_data_area_mb_show(struct config_item *item, char *page)
+ +{
+ +	struct se_dev_attrib *da = container_of(to_config_group(item),
+ +						struct se_dev_attrib, da_group);
+ +	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ +
+ +	return snprintf(page, PAGE_SIZE, "%u\n",
+ +			TCMU_BLOCKS_TO_MBS(udev->max_blocks));
+ +}
+ +CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
+ +
+ +struct configfs_attribute *tcmu_attrib_attrs[] = {
+ +	&tcmu_attr_cmd_time_out,
+ +	&tcmu_attr_qfull_time_out,
+ +	&tcmu_attr_max_data_area_mb,
+ +	&tcmu_attr_dev_size,
+ +	NULL,
+ +};
+++=======
++ static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
++ }
++ 
++ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
++ 					      const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	int val;
++ 	int ret;
++ 
++ 	ret = kstrtouint(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	da->emulate_write_cache = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, emulate_write_cache);
+++>>>>>>> 9a8bb60650b3 (tcmu: Support emulate_write_cache)
+  
+  static struct configfs_attribute **tcmu_attrs;
+  
+@@@ -1693,10 -1709,9 +1723,16 @@@ static int __init tcmu_module_init(void
+  	for (i = 0; passthrough_attrib_attrs[i] != NULL; i++) {
+  		tcmu_attrs[i] = passthrough_attrib_attrs[i];
+  	}
+++<<<<<<< HEAD
+ +	for (k = 0; tcmu_attrib_attrs[k] != NULL; k++) {
+ +		tcmu_attrs[i] = tcmu_attrib_attrs[k];
+ +		i++;
+ +	}
+++=======
++ 	tcmu_attrs[i] = &tcmu_attr_cmd_time_out;
++ 	i++;
++ 	tcmu_attrs[i] = &tcmu_attr_emulate_write_cache;
+++>>>>>>> 9a8bb60650b3 (tcmu: Support emulate_write_cache)
+  	tcmu_ops.tb_dev_attrib_attrs = tcmu_attrs;
+  
+  	ret = transport_backend_register(&tcmu_ops);
+* Unmerged path drivers/target/target_core_user.c
