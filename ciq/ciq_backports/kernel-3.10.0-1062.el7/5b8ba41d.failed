@@ -1,0 +1,171 @@
+KVM: nVMX: move vmcs12 EPTP consistency check to check_vmentry_prereqs()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 5b8ba41dafd789a64cdfb2b5ab6b0eb71f821cfc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5b8ba41d.failed
+
+An invalid EPTP causes a VMFail(VMXERR_ENTRY_INVALID_CONTROL_FIELD),
+not a VMExit.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Reviewed-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5b8ba41dafd789a64cdfb2b5ab6b0eb71f821cfc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,3831e0968d6a..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9704,17 -11327,15 +9704,15 @@@ static unsigned long nested_ept_get_cr3
+  	return get_vmcs12(vcpu)->ept_pointer;
+  }
+  
+- static int nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
++ static void nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
+  {
+  	WARN_ON(mmu_is_nested(vcpu));
+- 	if (!valid_ept_address(vcpu, nested_ept_get_cr3(vcpu)))
+- 		return 1;
+  
+ +	kvm_mmu_unload(vcpu);
+  	kvm_init_shadow_ept_mmu(vcpu,
+ -			to_vmx(vcpu)->nested.msrs.ept_caps &
+ +			to_vmx(vcpu)->nested.nested_vmx_ept_caps &
+  			VMX_EPT_EXECUTE_ONLY_BIT,
+ -			nested_ept_ad_enabled(vcpu),
+ -			nested_ept_get_cr3(vcpu));
+ +			nested_ept_ad_enabled(vcpu));
+  	vcpu->arch.mmu.set_cr3           = vmx_set_cr3;
+  	vcpu->arch.mmu.get_cr3           = nested_ept_get_cr3;
+  	vcpu->arch.mmu.inject_page_fault = nested_ept_inject_page_fault;
+@@@ -10560,14 -12324,27 +10557,22 @@@ static int prepare_vmcs02(struct kvm_vc
+  		vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (nested_cpu_has_ept(vmcs12)) {
+ +		if (nested_ept_init_mmu_context(vcpu)) {
+ +			*entry_failure_code = ENTRY_FAIL_DEFAULT;
+ +			return 1;
+ +		}
+ +	}
+++=======
++ 	if (nested_cpu_has_ept(vmcs12))
++ 		nested_ept_init_mmu_context(vcpu);
++ 	else if (nested_cpu_has2(vmcs12,
++ 				 SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES))
++ 		vmx_flush_tlb(vcpu, true);
+++>>>>>>> 5b8ba41dafd7 (KVM: nVMX: move vmcs12 EPTP consistency check to check_vmentry_prereqs())
+  
+ -	/*
+ -	 * This sets GUEST_CR0 to vmcs12->guest_cr0, possibly modifying those
+ -	 * bits which we consider mandatory enabled.
+ -	 * The CR0_READ_SHADOW is what L2 should have expected to read given
+ -	 * the specifications by L1; It's not enough to take
+ -	 * vmcs12->cr0_read_shadow because on our cr0_guest_host_mask we we
+ -	 * have more bits than L1 expected.
+ -	 */
+ -	vmx_set_cr0(vcpu, vmcs12->guest_cr0);
+ -	vmcs_writel(CR0_READ_SHADOW, nested_read_cr0(vmcs12));
+ -
+ -	vmx_set_cr4(vcpu, vmcs12->guest_cr4);
+ -	vmcs_writel(CR4_READ_SHADOW, nested_read_cr4(vmcs12));
+ -
+ -	if (vmx->nested.nested_run_pending &&
+ +	if (from_vmentry &&
+  	    (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER))
+  		vcpu->arch.efer = vmcs12->guest_ia32_efer;
+  	else if (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE)
+@@@ -10670,6 -12467,81 +10675,84 @@@ static int check_vmentry_prereqs(struc
+  	    !nested_cr3_valid(vcpu, vmcs12->host_cr3))
+  		return VMXERR_ENTRY_INVALID_HOST_STATE_FIELD;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * If the load IA32_EFER VM-exit control is 1, bits reserved in the
++ 	 * IA32_EFER MSR must be 0 in the field for that register. In addition,
++ 	 * the values of the LMA and LME bits in the field must each be that of
++ 	 * the host address-space size VM-exit control.
++ 	 */
++ 	if (vmcs12->vm_exit_controls & VM_EXIT_LOAD_IA32_EFER) {
++ 		ia32e = (vmcs12->vm_exit_controls &
++ 			 VM_EXIT_HOST_ADDR_SPACE_SIZE) != 0;
++ 		if (!kvm_valid_efer(vcpu, vmcs12->host_ia32_efer) ||
++ 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LMA) ||
++ 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LME))
++ 			return VMXERR_ENTRY_INVALID_HOST_STATE_FIELD;
++ 	}
++ 
++ 	/*
++ 	 * From the Intel SDM, volume 3:
++ 	 * Fields relevant to VM-entry event injection must be set properly.
++ 	 * These fields are the VM-entry interruption-information field, the
++ 	 * VM-entry exception error code, and the VM-entry instruction length.
++ 	 */
++ 	if (vmcs12->vm_entry_intr_info_field & INTR_INFO_VALID_MASK) {
++ 		u32 intr_info = vmcs12->vm_entry_intr_info_field;
++ 		u8 vector = intr_info & INTR_INFO_VECTOR_MASK;
++ 		u32 intr_type = intr_info & INTR_INFO_INTR_TYPE_MASK;
++ 		bool has_error_code = intr_info & INTR_INFO_DELIVER_CODE_MASK;
++ 		bool should_have_error_code;
++ 		bool urg = nested_cpu_has2(vmcs12,
++ 					   SECONDARY_EXEC_UNRESTRICTED_GUEST);
++ 		bool prot_mode = !urg || vmcs12->guest_cr0 & X86_CR0_PE;
++ 
++ 		/* VM-entry interruption-info field: interruption type */
++ 		if (intr_type == INTR_TYPE_RESERVED ||
++ 		    (intr_type == INTR_TYPE_OTHER_EVENT &&
++ 		     !nested_cpu_supports_monitor_trap_flag(vcpu)))
++ 			return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 		/* VM-entry interruption-info field: vector */
++ 		if ((intr_type == INTR_TYPE_NMI_INTR && vector != NMI_VECTOR) ||
++ 		    (intr_type == INTR_TYPE_HARD_EXCEPTION && vector > 31) ||
++ 		    (intr_type == INTR_TYPE_OTHER_EVENT && vector != 0))
++ 			return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 		/* VM-entry interruption-info field: deliver error code */
++ 		should_have_error_code =
++ 			intr_type == INTR_TYPE_HARD_EXCEPTION && prot_mode &&
++ 			x86_exception_has_error_code(vector);
++ 		if (has_error_code != should_have_error_code)
++ 			return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 		/* VM-entry exception error code */
++ 		if (has_error_code &&
++ 		    vmcs12->vm_entry_exception_error_code & GENMASK(31, 15))
++ 			return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 		/* VM-entry interruption-info field: reserved bits */
++ 		if (intr_info & INTR_INFO_RESVD_BITS_MASK)
++ 			return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 		/* VM-entry instruction length */
++ 		switch (intr_type) {
++ 		case INTR_TYPE_SOFT_EXCEPTION:
++ 		case INTR_TYPE_SOFT_INTR:
++ 		case INTR_TYPE_PRIV_SW_EXCEPTION:
++ 			if ((vmcs12->vm_entry_instruction_len > 15) ||
++ 			    (vmcs12->vm_entry_instruction_len == 0 &&
++ 			     !nested_cpu_has_zero_length_injection(vcpu)))
++ 				return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 		}
++ 	}
++ 
++ 	if (nested_cpu_has_ept(vmcs12) &&
++ 	    !valid_ept_address(vcpu, vmcs12->ept_pointer))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
+++>>>>>>> 5b8ba41dafd7 (KVM: nVMX: move vmcs12 EPTP consistency check to check_vmentry_prereqs())
+  	return 0;
+  }
+  
+* Unmerged path arch/x86/kvm/vmx.c
