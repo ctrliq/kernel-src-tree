@@ -65,6 +65,7 @@ struct sym_hist_entry {
 
 struct annotation_data {
 	double			 percent;
+	double			 percent_sum;
 	struct sym_hist_entry	 he;
 };
 
@@ -77,6 +78,7 @@ struct annotation_line {
 	float			 ipc;
 	u64			 cycles;
 	size_t			 privsize;
+	char			*path;
 	int			 samples_nr;
 	struct annotation_data	 samples[0];
 };
