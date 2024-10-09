@@ -1,0 +1,124 @@
+gfs2: Do log_flush in gfs2_ail_empty_gl even if ail list is empty
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 9ff78289356af640941bbb0dd3f46af2063f0046
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/9ff78289.failed
+
+Before this patch, if gfs2_ail_empty_gl saw there was nothing on
+the ail list, it would return and not flush the log. The problem
+is that there could still be a revoke for the rgrp sitting on the
+sd_log_le_revoke list that's been recently taken off the ail list.
+But that revoke still needs to be written, and the rgrp_go_inval
+still needs to call log_flush_wait to ensure the revokes are all
+properly written to the journal before we relinquish control of
+the glock to another node. If we give the glock to another node
+before we have this knowledge, the node might crash and its journal
+replayed, in which case the missing revoke would allow the journal
+replay to replay the rgrp over top of the rgrp we already gave to
+another node, thus overwriting its changes and corrupting the
+file system.
+
+This patch makes gfs2_ail_empty_gl still call gfs2_log_flush rather
+than returning.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 9ff78289356af640941bbb0dd3f46af2063f0046)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+diff --cc fs/gfs2/glops.c
+index 90b93ba7dd9f,bbbcae8d853c..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -90,21 -92,49 +90,51 @@@ static void gfs2_ail_empty_gl(struct gf
+  	INIT_LIST_HEAD(&tr.tr_databuf);
+  	tr.tr_revokes = atomic_read(&gl->gl_ail_count);
+  
+- 	if (!tr.tr_revokes)
++ 	if (!tr.tr_revokes) {
++ 		bool have_revokes;
++ 		bool log_in_flight;
++ 
++ 		/*
++ 		 * We have nothing on the ail, but there could be revokes on
++ 		 * the sdp revoke queue, in which case, we still want to flush
++ 		 * the log and wait for it to finish.
++ 		 *
++ 		 * If the sdp revoke list is empty too, we might still have an
++ 		 * io outstanding for writing revokes, so we should wait for
++ 		 * it before returning.
++ 		 *
++ 		 * If none of these conditions are true, our revokes are all
++ 		 * flushed and we can return.
++ 		 */
++ 		gfs2_log_lock(sdp);
++ 		have_revokes = !list_empty(&sdp->sd_log_revokes);
++ 		log_in_flight = atomic_read(&sdp->sd_log_in_flight);
++ 		gfs2_log_unlock(sdp);
++ 		if (have_revokes)
++ 			goto flush;
++ 		if (log_in_flight)
++ 			log_flush_wait(sdp);
+  		return;
++ 	}
+  
+ -	/* A shortened, inline version of gfs2_trans_begin()
+ -         * tr->alloced is not set since the transaction structure is
+ -         * on the stack */
+ -	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes);
+ -	tr.tr_ip = _RET_IP_;
+ -	if (gfs2_log_reserve(sdp, tr.tr_reserved) < 0)
+ -		return;
+ +	/* A shortened, inline version of gfs2_trans_begin() */
+ +	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes, sizeof(u64));
+ +	tr.tr_ip = (unsigned long)__builtin_return_address(0);
+ +	sb_start_intwrite(sdp->sd_vfs);
+ +	gfs2_log_reserve(sdp, tr.tr_reserved);
+  	WARN_ON_ONCE(current->journal_info);
+  	current->journal_info = &tr;
+  
+  	__gfs2_ail_flush(gl, 0, tr.tr_revokes);
+  
+  	gfs2_trans_end(sdp);
+++<<<<<<< HEAD
+ +	gfs2_log_flush(sdp, NULL);
+++=======
++ flush:
++ 	gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 		       GFS2_LFC_AIL_EMPTY_GL);
+++>>>>>>> 9ff78289356a (gfs2: Do log_flush in gfs2_ail_empty_gl even if ail list is empty)
+  }
+  
+  void gfs2_ail_flush(struct gfs2_glock *gl, bool fsync)
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index 78f81ccc8357..4eb23916fdd4 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -469,7 +469,7 @@ static void log_pull_tail(struct gfs2_sbd *sdp, unsigned int new_tail)
+ }
+ 
+ 
+-static void log_flush_wait(struct gfs2_sbd *sdp)
++void log_flush_wait(struct gfs2_sbd *sdp)
+ {
+ 	DEFINE_WAIT(wait);
+ 
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 0f14bc655cc6..d4a04414610f 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -73,6 +73,7 @@ extern void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl);
+ extern void gfs2_log_commit(struct gfs2_sbd *sdp, struct gfs2_trans *trans);
+ extern void gfs2_remove_from_ail(struct gfs2_bufdata *bd);
+ extern void gfs2_ail1_flush(struct gfs2_sbd *sdp, struct writeback_control *wbc);
++extern void log_flush_wait(struct gfs2_sbd *sdp);
+ 
+ extern void gfs2_log_shutdown(struct gfs2_sbd *sdp, int ro);
+ extern void gfs2_meta_syncfs(struct gfs2_sbd *sdp);
