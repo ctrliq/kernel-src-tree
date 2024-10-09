@@ -1,0 +1,212 @@
+md/raid1: handle flush request correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid1: handle flush request correctly (Xiao Ni) [1379764]
+Rebuild_FUZZ: 96.10%
+commit-author Shaohua Li <shli@fb.com>
+commit aff8da09f2381f0869faaf6637b0d892a3ee99ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aff8da09.failed
+
+I got a warning triggered in align_to_barrier_unit_end. It's a flush
+request so sectors == 0. The flush request happens to work well without
+the new barrier patch, but we'd better handle it explictly.
+
+	Cc: NeilBrown <neilb@suse.com>
+	Acked-by: Coly Li <colyli@suse.de>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit aff8da09f2381f0869faaf6637b0d892a3ee99ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+diff --cc drivers/md/raid1.c
+index e588c32492da,8901f0c8c775..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1069,15 -1172,117 +1069,21 @@@ static void raid1_make_request(struct m
+  	struct raid1_info *mirror;
+  	struct r1bio *r1_bio;
+  	struct bio *read_bio;
+ -	struct bitmap *bitmap = mddev->bitmap;
+ -	const int op = bio_op(bio);
+ -	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
+ -	int sectors_handled;
+ -	int max_sectors;
+ -	int rdisk;
+ -
+ -	/*
+ -	 * Still need barrier for READ in case that whole
+ -	 * array is frozen.
+ -	 */
+ -	wait_read_barrier(conf, bio->bi_iter.bi_sector);
+ -
+ -	r1_bio = alloc_r1bio(mddev, bio, 0);
+ -
+ -	/*
+ -	 * We might need to issue multiple reads to different
+ -	 * devices if there are bad blocks around, so we keep
+ -	 * track of the number of reads in bio->bi_phys_segments.
+ -	 * If this is 0, there is only one r1_bio and no locking
+ -	 * will be needed when requests complete.  If it is
+ -	 * non-zero, then it is the number of not-completed requests.
+ -	 */
+ -	bio->bi_phys_segments = 0;
+ -	bio_clear_flag(bio, BIO_SEG_VALID);
+ -
+ -	/*
+ -	 * make_request() can abort the operation when read-ahead is being
+ -	 * used and no empty request is available.
+ -	 */
+ -read_again:
+ -	rdisk = read_balance(conf, r1_bio, &max_sectors);
+ -
+ -	if (rdisk < 0) {
+ -		/* couldn't find anywhere to read from */
+ -		raid_end_bio_io(r1_bio);
+ -		return;
+ -	}
+ -	mirror = conf->mirrors + rdisk;
+ -
+ -	if (test_bit(WriteMostly, &mirror->rdev->flags) &&
+ -	    bitmap) {
+ -		/*
+ -		 * Reading from a write-mostly device must take care not to
+ -		 * over-take any writes that are 'behind'
+ -		 */
+ -		raid1_log(mddev, "wait behind writes");
+ -		wait_event(bitmap->behind_wait,
+ -			   atomic_read(&bitmap->behind_writes) == 0);
+ -	}
+ -	r1_bio->read_disk = rdisk;
+ -
+ -	read_bio = bio_clone_fast(bio, GFP_NOIO, mddev->bio_set);
+ -	bio_trim(read_bio, r1_bio->sector - bio->bi_iter.bi_sector,
+ -		 max_sectors);
+ -
+ -	r1_bio->bios[rdisk] = read_bio;
+ -
+ -	read_bio->bi_iter.bi_sector = r1_bio->sector +
+ -		mirror->rdev->data_offset;
+ -	read_bio->bi_bdev = mirror->rdev->bdev;
+ -	read_bio->bi_end_io = raid1_end_read_request;
+ -	bio_set_op_attrs(read_bio, op, do_sync);
+ -	if (test_bit(FailFast, &mirror->rdev->flags) &&
+ -	    test_bit(R1BIO_FailFast, &r1_bio->state))
+ -	        read_bio->bi_opf |= MD_FAILFAST;
+ -	read_bio->bi_private = r1_bio;
+ -
+ -	if (mddev->gendisk)
+ -	        trace_block_bio_remap(bdev_get_queue(read_bio->bi_bdev),
+ -	                              read_bio, disk_devt(mddev->gendisk),
+ -	                              r1_bio->sector);
+ -
+ -	if (max_sectors < r1_bio->sectors) {
+ -		/*
+ -		 * could not read all from this device, so we will need another
+ -		 * r1_bio.
+ -		 */
+ -		sectors_handled = (r1_bio->sector + max_sectors
+ -				   - bio->bi_iter.bi_sector);
+ -		r1_bio->sectors = max_sectors;
+ -		spin_lock_irq(&conf->device_lock);
+ -		if (bio->bi_phys_segments == 0)
+ -			bio->bi_phys_segments = 2;
+ -		else
+ -			bio->bi_phys_segments++;
+ -		spin_unlock_irq(&conf->device_lock);
+ -
+ -		/*
+ -		 * Cannot call generic_make_request directly as that will be
+ -		 * queued in __make_request and subsequent mempool_alloc might
+ -		 * block waiting for it.  So hand bio over to raid1d.
+ -		 */
+ -		reschedule_retry(r1_bio);
+ -
+ -		r1_bio = alloc_r1bio(mddev, bio, sectors_handled);
+ -		goto read_again;
+ -	} else
+ -		generic_make_request(read_bio);
+ -}
+ -
+ -static void raid1_write_request(struct mddev *mddev, struct bio *bio)
+ -{
+ -	struct r1conf *conf = mddev->private;
+ -	struct r1bio *r1_bio;
+  	int i, disks;
+ -	struct bitmap *bitmap = mddev->bitmap;
+ +	struct bitmap *bitmap;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	const int rw = bio_data_dir(bio);
+ +	const unsigned long do_sync = (bio->bi_rw & REQ_SYNC);
+ +	const unsigned long do_flush_fua = (bio->bi_rw & (REQ_FLUSH | REQ_FUA));
+ +	const unsigned long do_discard = (bio->bi_rw
+ +					  & (REQ_DISCARD | REQ_SECURE));
+ +	const unsigned long do_same = (bio->bi_rw & REQ_WRITE_SAME);
+++=======
++ 	const int op = bio_op(bio);
++ 	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
++ 	const unsigned long do_fua = (bio->bi_opf & REQ_FUA);
+++>>>>>>> aff8da09f238 (md/raid1: handle flush request correctly)
+  	struct md_rdev *blocked_rdev;
+  	struct blk_plug_cb *cb;
+  	struct raid1_plug_cb *plug = NULL;
+@@@ -1388,8 -1508,11 +1394,16 @@@ read_again
+  				   conf->mirrors[i].rdev->data_offset);
+  		mbio->bi_bdev = conf->mirrors[i].rdev->bdev;
+  		mbio->bi_end_io	= raid1_end_write_request;
+++<<<<<<< HEAD
+ +		mbio->bi_rw =
+ +			WRITE | do_flush_fua | do_sync | do_discard | do_same;
+++=======
++ 		bio_set_op_attrs(mbio, op, do_fua | do_sync);
++ 		if (test_bit(FailFast, &conf->mirrors[i].rdev->flags) &&
++ 		    !test_bit(WriteMostly, &conf->mirrors[i].rdev->flags) &&
++ 		    conf->raid_disks - mddev->degraded > 1)
++ 			mbio->bi_opf |= MD_FAILFAST;
+++>>>>>>> aff8da09f238 (md/raid1: handle flush request correctly)
+  		mbio->bi_private = r1_bio;
+  
+  		atomic_inc(&r1_bio->remaining);
+@@@ -1434,6 -1559,34 +1448,37 @@@
+  	wake_up(&conf->wait_barrier);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void raid1_make_request(struct mddev *mddev, struct bio *bio)
++ {
++ 	struct bio *split;
++ 	sector_t sectors;
++ 
++ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
++ 		md_flush_request(mddev, bio);
++ 		return;
++ 	}
++ 
++ 	/* if bio exceeds barrier unit boundary, split it */
++ 	do {
++ 		sectors = align_to_barrier_unit_end(
++ 				bio->bi_iter.bi_sector, bio_sectors(bio));
++ 		if (sectors < bio_sectors(bio)) {
++ 			split = bio_split(bio, sectors, GFP_NOIO, fs_bio_set);
++ 			bio_chain(split, bio);
++ 		} else {
++ 			split = bio;
++ 		}
++ 
++ 		if (bio_data_dir(split) == READ)
++ 			raid1_read_request(mddev, split);
++ 		else
++ 			raid1_write_request(mddev, split);
++ 	} while (split != bio);
++ }
++ 
+++>>>>>>> aff8da09f238 (md/raid1: handle flush request correctly)
+  static void raid1_status(struct seq_file *seq, struct mddev *mddev)
+  {
+  	struct r1conf *conf = mddev->private;
+* Unmerged path drivers/md/raid1.c
