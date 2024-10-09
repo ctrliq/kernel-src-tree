@@ -1,0 +1,234 @@
+KVM: x86: switch KVMCLOCK base to monotonic raw clock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Marcelo Tosatti <mtosatti@redhat.com>
+commit 53fafdbb8b21fa99dfd8376ca056bffde8cafc11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/53fafdbb.failed
+
+Commit 0bc48bea36d1 ("KVM: x86: update master clock before computing
+kvmclock_offset")
+switches the order of operations to avoid the conversion
+
+TSC (without frequency correction) ->
+system_timestamp (with frequency correction),
+
+which might cause a time jump.
+
+However, it leaves any other masterclock update unsafe, which includes,
+at the moment:
+
+        * HV_X64_MSR_REFERENCE_TSC MSR write.
+        * TSC writes.
+        * Host suspend/resume.
+
+Avoid the time jump issue by using frequency uncorrected
+CLOCK_MONOTONIC_RAW clock.
+
+Its the guests time keeping software responsability
+to track and correct a reference clock such as UTC.
+
+This fixes forward time jump (which can result in
+failure to bring up a vCPU) during vCPU hotplug:
+
+Oct 11 14:48:33 storage kernel: CPU2 has been hot-added
+Oct 11 14:48:34 storage kernel: CPU3 has been hot-added
+Oct 11 14:49:22 storage kernel: smpboot: Booting Node 0 Processor 2 APIC 0x2          <-- time jump of almost 1 minute
+Oct 11 14:49:22 storage kernel: smpboot: do_boot_cpu failed(-1) to wakeup CPU#2
+Oct 11 14:49:23 storage kernel: smpboot: Booting Node 0 Processor 3 APIC 0x3
+Oct 11 14:49:23 storage kernel: kvm-clock: cpu 3, msr 0:7ff640c1, secondary cpu clock
+
+Which happens because:
+
+                /*
+                 * Wait 10s total for a response from AP
+                 */
+                boot_error = -1;
+                timeout = jiffies + 10*HZ;
+                while (time_before(jiffies, timeout)) {
+                         ...
+                }
+
+Analyzed-by: Igor Mammedov <imammedo@redhat.com>
+	Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 53fafdbb8b21fa99dfd8376ca056bffde8cafc11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 69feb8491cac,89621025577a..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1157,12 -1552,10 +1162,17 @@@ static struct pvclock_gtod_data pvclock
+  static void update_pvclock_gtod(struct timekeeper *tk)
+  {
+  	struct pvclock_gtod_data *vdata = &pvclock_gtod_data;
+- 	u64 boot_ns;
++ 	u64 boot_ns, boot_ns_raw;
+  
+++<<<<<<< HEAD
+ +	boot_ns = timespec_to_ns(&tk->total_sleep_time)
+ +		+ tk->wall_to_monotonic.tv_sec * (u64)NSEC_PER_SEC
+ +		+ tk->wall_to_monotonic.tv_nsec
+ +		+ tk->xtime_sec * (u64)NSEC_PER_SEC;
+++=======
++ 	boot_ns = ktime_to_ns(ktime_add(tk->tkr_mono.base, tk->offs_boot));
++ 	boot_ns_raw = ktime_to_ns(ktime_add(tk->tkr_raw.base, tk->offs_boot));
+++>>>>>>> 53fafdbb8b21 (KVM: x86: switch KVMCLOCK base to monotonic raw clock)
+  
+  	write_seqcount_begin(&vdata->seq);
+  
+@@@ -1173,7 -1566,13 +1183,17 @@@
+  	vdata->clock.mult		= tk->tkr_mono.mult;
+  	vdata->clock.shift		= tk->tkr_mono.shift;
+  
+++<<<<<<< HEAD
+ +	vdata->boot_ns                  = boot_ns;
+++=======
++ 	vdata->raw_clock.vclock_mode	= tk->tkr_raw.clock->archdata.vclock_mode;
++ 	vdata->raw_clock.cycle_last	= tk->tkr_raw.cycle_last;
++ 	vdata->raw_clock.mask		= tk->tkr_raw.mask;
++ 	vdata->raw_clock.mult		= tk->tkr_raw.mult;
++ 	vdata->raw_clock.shift		= tk->tkr_raw.shift;
++ 
++ 	vdata->boot_ns			= boot_ns;
+++>>>>>>> 53fafdbb8b21 (KVM: x86: switch KVMCLOCK base to monotonic raw clock)
+  	vdata->nsec_base		= tk->tkr_mono.xtime_nsec;
+  
+  	vdata->wall_time_sec            = tk->xtime_sec;
+@@@ -1590,18 -2003,43 +1613,58 @@@ static u64 read_tsc(void
+  	return last;
+  }
+  
+++<<<<<<< HEAD
+ +static inline u64 vgettsc(u64 *cycle_now)
+ +{
+ +	long v;
+ +	struct pvclock_gtod_data *gtod = &pvclock_gtod_data;
+ +
+ +	*cycle_now = read_tsc();
+ +
+ +	v = (*cycle_now - gtod->clock.cycle_last) & gtod->clock.mask;
+ +	return v * gtod->clock.mult;
+ +}
+ +
+ +static int do_monotonic_boot(s64 *t, u64 *cycle_now)
+++=======
++ static inline u64 vgettsc(struct pvclock_clock *clock, u64 *tsc_timestamp,
++ 			  int *mode)
++ {
++ 	long v;
++ 	u64 tsc_pg_val;
++ 
++ 	switch (clock->vclock_mode) {
++ 	case VCLOCK_HVCLOCK:
++ 		tsc_pg_val = hv_read_tsc_page_tsc(hv_get_tsc_page(),
++ 						  tsc_timestamp);
++ 		if (tsc_pg_val != U64_MAX) {
++ 			/* TSC page valid */
++ 			*mode = VCLOCK_HVCLOCK;
++ 			v = (tsc_pg_val - clock->cycle_last) &
++ 				clock->mask;
++ 		} else {
++ 			/* TSC page invalid */
++ 			*mode = VCLOCK_NONE;
++ 		}
++ 		break;
++ 	case VCLOCK_TSC:
++ 		*mode = VCLOCK_TSC;
++ 		*tsc_timestamp = read_tsc();
++ 		v = (*tsc_timestamp - clock->cycle_last) &
++ 			clock->mask;
++ 		break;
++ 	default:
++ 		*mode = VCLOCK_NONE;
++ 	}
++ 
++ 	if (*mode == VCLOCK_NONE)
++ 		*tsc_timestamp = v = 0;
++ 
++ 	return v * clock->mult;
++ }
++ 
++ static int do_monotonic_raw(s64 *t, u64 *tsc_timestamp)
+++>>>>>>> 53fafdbb8b21 (KVM: x86: switch KVMCLOCK base to monotonic raw clock)
+  {
+  	struct pvclock_gtod_data *gtod = &pvclock_gtod_data;
+  	unsigned long seq;
+@@@ -1610,11 -2048,10 +1673,16 @@@
+  
+  	do {
+  		seq = read_seqcount_begin(&gtod->seq);
+++<<<<<<< HEAD
+ +		mode = gtod->clock.vclock_mode;
+ +		ns = gtod->nsec_base;
+ +		ns += vgettsc(cycle_now);
+++=======
++ 		ns = gtod->monotonic_raw_nsec;
++ 		ns += vgettsc(&gtod->raw_clock, tsc_timestamp, &mode);
+++>>>>>>> 53fafdbb8b21 (KVM: x86: switch KVMCLOCK base to monotonic raw clock)
+  		ns >>= gtod->clock.shift;
+- 		ns += gtod->boot_ns;
++ 		ns += gtod->boot_ns_raw;
+  	} while (unlikely(read_seqcount_retry(&gtod->seq, seq)));
+  	*t = ns;
+  
+@@@ -1630,10 -2067,9 +1698,14 @@@ static int do_realtime(struct timespec 
+  
+  	do {
+  		seq = read_seqcount_begin(&gtod->seq);
+ +		mode = gtod->clock.vclock_mode;
+  		ts->tv_sec = gtod->wall_time_sec;
+  		ns = gtod->nsec_base;
+++<<<<<<< HEAD
+ +		ns += vgettsc(cycle_now);
+++=======
++ 		ns += vgettsc(&gtod->clock, tsc_timestamp, &mode);
+++>>>>>>> 53fafdbb8b21 (KVM: x86: switch KVMCLOCK base to monotonic raw clock)
+  		ns >>= gtod->clock.shift;
+  	} while (unlikely(read_seqcount_retry(&gtod->seq, seq)));
+  
+@@@ -1643,25 -2079,26 +1715,30 @@@
+  	return mode;
+  }
+  
+ -/* returns true if host is using TSC based clocksource */
+ -static bool kvm_get_time_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp)
+ +/* returns true if host is using tsc clocksource */
+ +static bool kvm_get_time_and_clockread(s64 *kernel_ns, u64 *cycle_now)
+  {
+  	/* checked again under seqlock below */
+ -	if (!gtod_is_based_on_tsc(pvclock_gtod_data.clock.vclock_mode))
+ +	if (pvclock_gtod_data.clock.vclock_mode != VCLOCK_TSC)
+  		return false;
+  
+++<<<<<<< HEAD
+ +	return do_monotonic_boot(kernel_ns, cycle_now) == VCLOCK_TSC;
+++=======
++ 	return gtod_is_based_on_tsc(do_monotonic_raw(kernel_ns,
++ 						      tsc_timestamp));
+++>>>>>>> 53fafdbb8b21 (KVM: x86: switch KVMCLOCK base to monotonic raw clock)
+  }
+  
+ -/* returns true if host is using TSC based clocksource */
+ -static bool kvm_get_walltime_and_clockread(struct timespec64 *ts,
+ -					   u64 *tsc_timestamp)
+ +/* returns true if host is using tsc clocksource */
+ +static bool kvm_get_walltime_and_clockread(struct timespec *ts,
+ +					   u64 *cycle_now)
+  {
+  	/* checked again under seqlock below */
+ -	if (!gtod_is_based_on_tsc(pvclock_gtod_data.clock.vclock_mode))
+ +	if (pvclock_gtod_data.clock.vclock_mode != VCLOCK_TSC)
+  		return false;
+  
+ -	return gtod_is_based_on_tsc(do_realtime(ts, tsc_timestamp));
+ +	return do_realtime(ts, cycle_now) == VCLOCK_TSC;
+  }
+  #endif
+  
+* Unmerged path arch/x86/kvm/x86.c
