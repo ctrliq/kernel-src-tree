@@ -2413,8 +2413,7 @@ size_t perf_event__sample_event_size(const struct perf_sample *sample, u64 type,
 
 int perf_event__synthesize_sample(union perf_event *event, u64 type,
 				  u64 read_format,
-				  const struct perf_sample *sample,
-				  bool swapped)
+				  const struct perf_sample *sample)
 {
 	u64 *array;
 	size_t sz;
@@ -2439,15 +2438,6 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type,
 	if (type & PERF_SAMPLE_TID) {
 		u.val32[0] = sample->pid;
 		u.val32[1] = sample->tid;
-		if (swapped) {
-			/*
-			 * Inverse of what is done in perf_evsel__parse_sample
-			 */
-			u.val32[0] = bswap_32(u.val32[0]);
-			u.val32[1] = bswap_32(u.val32[1]);
-			u.val64 = bswap_64(u.val64);
-		}
-
 		*array = u.val64;
 		array++;
 	}
@@ -2475,13 +2465,6 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type,
 	if (type & PERF_SAMPLE_CPU) {
 		u.val32[0] = sample->cpu;
 		u.val32[1] = 0;
-		if (swapped) {
-			/*
-			 * Inverse of what is done in perf_evsel__parse_sample
-			 */
-			u.val32[0] = bswap_32(u.val32[0]);
-			u.val64 = bswap_64(u.val64);
-		}
 		*array = u.val64;
 		array++;
 	}
@@ -2528,15 +2511,6 @@ int perf_event__synthesize_sample(union perf_event *event, u64 type,
 
 	if (type & PERF_SAMPLE_RAW) {
 		u.val32[0] = sample->raw_size;
-		if (WARN_ONCE(swapped,
-			      "Endianness of raw data not corrected!\n")) {
-			/*
-			 * Inverse of what is done in perf_evsel__parse_sample
-			 */
-			u.val32[0] = bswap_32(u.val32[0]);
-			u.val32[1] = bswap_32(u.val32[1]);
-			u.val64 = bswap_64(u.val64);
-		}
 		*array = u.val64;
 		array = (void *)array + sizeof(u32);
 
