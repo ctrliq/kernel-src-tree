@@ -56,6 +56,7 @@ static const char *perf_event__names[] = {
 	[PERF_RECORD_STAT_ROUND]		= "STAT_ROUND",
 	[PERF_RECORD_EVENT_UPDATE]		= "EVENT_UPDATE",
 	[PERF_RECORD_TIME_CONV]			= "TIME_CONV",
+	[PERF_RECORD_HEADER_FEATURE]		= "FEATURE",
 };
 
 const char *perf_event__name(unsigned int id)
