@@ -1,0 +1,350 @@
+net/mlx5: Add Fast teardown support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Feras Daoud <ferasda@mellanox.com>
+commit fcd29ad17c6ff885dfae58f557e9323941e63ba2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/fcd29ad1.failed
+
+Today mlx5 devices support two teardown modes:
+1- Regular teardown
+2- Force teardown
+
+This change introduces the enhanced version of the "Force teardown" that
+allows SW to perform teardown in a faster way without the need to reclaim
+all the pages.
+
+Fast teardown provides the following advantages:
+1- Fix a FW race condition that could cause command timeout
+2- Avoid moving to polling mode
+3- Close the vport to prevent PCI ACK to be sent without been scatter
+to memory
+
+	Signed-off-by: Feras Daoud <ferasda@mellanox.com>
+	Reviewed-by: Majd Dibbiny <majd@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit fcd29ad17c6ff885dfae58f557e9323941e63ba2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fw.c
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+#	include/linux/mlx5/mlx5_ifc.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fw.c
+index d537e62e868a,1ab6f7e3bec6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fw.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fw.c
+@@@ -231,6 -231,82 +231,85 @@@ int mlx5_cmd_teardown_hca(struct mlx5_c
+  	return mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_cmd_force_teardown_hca(struct mlx5_core_dev *dev)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(teardown_hca_out)] = {0};
++ 	u32 in[MLX5_ST_SZ_DW(teardown_hca_in)] = {0};
++ 	int force_state;
++ 	int ret;
++ 
++ 	if (!MLX5_CAP_GEN(dev, force_teardown)) {
++ 		mlx5_core_dbg(dev, "force teardown is not supported in the firmware\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	MLX5_SET(teardown_hca_in, in, opcode, MLX5_CMD_OP_TEARDOWN_HCA);
++ 	MLX5_SET(teardown_hca_in, in, profile, MLX5_TEARDOWN_HCA_IN_PROFILE_FORCE_CLOSE);
++ 
++ 	ret = mlx5_cmd_exec_polling(dev, in, sizeof(in), out, sizeof(out));
++ 	if (ret)
++ 		return ret;
++ 
++ 	force_state = MLX5_GET(teardown_hca_out, out, state);
++ 	if (force_state == MLX5_TEARDOWN_HCA_OUT_FORCE_STATE_FAIL) {
++ 		mlx5_core_warn(dev, "teardown with force mode failed, doing normal teardown\n");
++ 		return -EIO;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ #define MLX5_FAST_TEARDOWN_WAIT_MS   3000
++ int mlx5_cmd_fast_teardown_hca(struct mlx5_core_dev *dev)
++ {
++ 	unsigned long end, delay_ms = MLX5_FAST_TEARDOWN_WAIT_MS;
++ 	u32 out[MLX5_ST_SZ_DW(teardown_hca_out)] = {0};
++ 	u32 in[MLX5_ST_SZ_DW(teardown_hca_in)] = {0};
++ 	int state;
++ 	int ret;
++ 
++ 	if (!MLX5_CAP_GEN(dev, fast_teardown)) {
++ 		mlx5_core_dbg(dev, "fast teardown is not supported in the firmware\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	MLX5_SET(teardown_hca_in, in, opcode, MLX5_CMD_OP_TEARDOWN_HCA);
++ 	MLX5_SET(teardown_hca_in, in, profile,
++ 		 MLX5_TEARDOWN_HCA_IN_PROFILE_PREPARE_FAST_TEARDOWN);
++ 
++ 	ret = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 	if (ret)
++ 		return ret;
++ 
++ 	state = MLX5_GET(teardown_hca_out, out, state);
++ 	if (state == MLX5_TEARDOWN_HCA_OUT_FORCE_STATE_FAIL) {
++ 		mlx5_core_warn(dev, "teardown with fast mode failed\n");
++ 		return -EIO;
++ 	}
++ 
++ 	mlx5_set_nic_state(dev, MLX5_NIC_IFC_DISABLED);
++ 
++ 	/* Loop until device state turns to disable */
++ 	end = jiffies + msecs_to_jiffies(delay_ms);
++ 	do {
++ 		if (mlx5_get_nic_state(dev) == MLX5_NIC_IFC_DISABLED)
++ 			break;
++ 
++ 		cond_resched();
++ 	} while (!time_after(jiffies, end));
++ 
++ 	if (mlx5_get_nic_state(dev) != MLX5_NIC_IFC_DISABLED) {
++ 		dev_err(&dev->pdev->dev, "NIC IFC still %d after %lums.\n",
++ 			mlx5_get_nic_state(dev), delay_ms);
++ 		return -EIO;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> fcd29ad17c6f (net/mlx5: Add Fast teardown support)
+  enum mlxsw_reg_mcc_instruction {
+  	MLX5_REG_MCC_INSTRUCTION_LOCK_UPDATE_HANDLE = 0x01,
+  	MLX5_REG_MCC_INSTRUCTION_RELEASE_UPDATE_HANDLE = 0x02,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index b83bea6e48e5,28132c7dc05f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1325,6 -1592,57 +1325,60 @@@ static const struct pci_error_handlers 
+  	.resume		= mlx5_pci_resume
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5_try_fast_unload(struct mlx5_core_dev *dev)
++ {
++ 	bool fast_teardown = false, force_teardown = false;
++ 	int ret = 1;
++ 
++ 	fast_teardown = MLX5_CAP_GEN(dev, fast_teardown);
++ 	force_teardown = MLX5_CAP_GEN(dev, force_teardown);
++ 
++ 	mlx5_core_dbg(dev, "force teardown firmware support=%d\n", force_teardown);
++ 	mlx5_core_dbg(dev, "fast teardown firmware support=%d\n", fast_teardown);
++ 
++ 	if (!fast_teardown && !force_teardown)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
++ 		mlx5_core_dbg(dev, "Device in internal error state, giving up\n");
++ 		return -EAGAIN;
++ 	}
++ 
++ 	/* Panic tear down fw command will stop the PCI bus communication
++ 	 * with the HCA, so the health polll is no longer needed.
++ 	 */
++ 	mlx5_drain_health_wq(dev);
++ 	mlx5_stop_health_poll(dev, false);
++ 
++ 	ret = mlx5_cmd_fast_teardown_hca(dev);
++ 	if (!ret)
++ 		goto succeed;
++ 
++ 	ret = mlx5_cmd_force_teardown_hca(dev);
++ 	if (!ret)
++ 		goto succeed;
++ 
++ 	mlx5_core_dbg(dev, "Firmware couldn't do fast unload error: %d\n", ret);
++ 	mlx5_start_health_poll(dev);
++ 	return ret;
++ 
++ succeed:
++ 	mlx5_enter_error_state(dev, true);
++ 
++ 	/* Some platforms requiring freeing the IRQ's in the shutdown
++ 	 * flow. If they aren't freed they can't be allocated after
++ 	 * kexec. There is no need to cleanup the mlx5_core software
++ 	 * contexts.
++ 	 */
++ 	mlx5_irq_clear_affinity_hints(dev);
++ 	mlx5_core_eq_free_irqs(dev);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> fcd29ad17c6f (net/mlx5: Add Fast teardown support)
+  static void shutdown(struct pci_dev *pdev)
+  {
+  	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 72c4903ec42b,cc298527baf1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -99,10 -94,15 +99,16 @@@ int mlx5_query_hca_caps(struct mlx5_cor
+  int mlx5_query_board_id(struct mlx5_core_dev *dev);
+  int mlx5_cmd_init_hca(struct mlx5_core_dev *dev, uint32_t *sw_owner_id);
+  int mlx5_cmd_teardown_hca(struct mlx5_core_dev *dev);
+++<<<<<<< HEAD
+++=======
++ int mlx5_cmd_force_teardown_hca(struct mlx5_core_dev *dev);
++ int mlx5_cmd_fast_teardown_hca(struct mlx5_core_dev *dev);
++ 
+++>>>>>>> fcd29ad17c6f (net/mlx5: Add Fast teardown support)
+  void mlx5_core_event(struct mlx5_core_dev *dev, enum mlx5_dev_event event,
+  		     unsigned long param);
+ -void mlx5_core_page_fault(struct mlx5_core_dev *dev,
+ -			  struct mlx5_pagefault *pfault);
+  void mlx5_port_module_event(struct mlx5_core_dev *dev, struct mlx5_eqe *eqe);
+ -void mlx5_enter_error_state(struct mlx5_core_dev *dev, bool force);
+ +void mlx5_enter_error_state(struct mlx5_core_dev *dev);
+  void mlx5_disable_device(struct mlx5_core_dev *dev);
+  void mlx5_recover_device(struct mlx5_core_dev *dev);
+  int mlx5_sriov_init(struct mlx5_core_dev *dev);
+@@@ -181,6 -212,18 +187,19 @@@ static inline int mlx5_lag_is_lacp_owne
+  		    MLX5_CAP_GEN(dev, lag_master);
+  }
+  
+ -int mlx5_lag_allow(struct mlx5_core_dev *dev);
+ -int mlx5_lag_forbid(struct mlx5_core_dev *dev);
+ -
+  void mlx5_reload_interface(struct mlx5_core_dev *mdev, int protocol);
+++<<<<<<< HEAD
+ +void mlx5_lag_update(struct mlx5_core_dev *dev);
+++=======
++ 
++ enum {
++ 	MLX5_NIC_IFC_FULL		= 0,
++ 	MLX5_NIC_IFC_DISABLED		= 1,
++ 	MLX5_NIC_IFC_NO_DRAM_NIC	= 2,
++ 	MLX5_NIC_IFC_INVALID		= 3
++ };
++ 
++ u8 mlx5_get_nic_state(struct mlx5_core_dev *dev);
++ void mlx5_set_nic_state(struct mlx5_core_dev *dev, u8 state);
+++>>>>>>> fcd29ad17c6f (net/mlx5: Add Fast teardown support)
+  #endif /* __MLX5_CORE_H__ */
+diff --cc include/linux/mlx5/mlx5_ifc.h
+index de50303c6d57,6e8a882052b1..000000000000
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@@ -3446,12 -3351,15 +3447,23 @@@ struct mlx5_ifc_teardown_hca_out_bits 
+  
+  	u8         syndrome[0x20];
+  
+++<<<<<<< HEAD
+ +	u8         reserved_at_40[0x40];
+++=======
++ 	u8         reserved_at_40[0x3f];
++ 
++ 	u8         state[0x1];
+++>>>>>>> fcd29ad17c6f (net/mlx5: Add Fast teardown support)
+  };
+  
+  enum {
+  	MLX5_TEARDOWN_HCA_IN_PROFILE_GRACEFUL_CLOSE  = 0x0,
+++<<<<<<< HEAD
+ +	MLX5_TEARDOWN_HCA_IN_PROFILE_PANIC_CLOSE     = 0x1,
+++=======
++ 	MLX5_TEARDOWN_HCA_IN_PROFILE_FORCE_CLOSE     = 0x1,
++ 	MLX5_TEARDOWN_HCA_IN_PROFILE_PREPARE_FAST_TEARDOWN = 0x2,
+++>>>>>>> fcd29ad17c6f (net/mlx5: Add Fast teardown support)
+  };
+  
+  struct mlx5_ifc_teardown_hca_in_bits {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fw.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/health.c b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+index 7004ce46f354..726db80ef9ad 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@ -59,23 +59,26 @@ enum {
+ 	MLX5_HEALTH_SYNDR_HIGH_TEMP		= 0x10
+ };
+ 
+-enum {
+-	MLX5_NIC_IFC_FULL		= 0,
+-	MLX5_NIC_IFC_DISABLED		= 1,
+-	MLX5_NIC_IFC_NO_DRAM_NIC	= 2,
+-	MLX5_NIC_IFC_INVALID		= 3
+-};
+-
+ enum {
+ 	MLX5_DROP_NEW_HEALTH_WORK,
+ 	MLX5_DROP_NEW_RECOVERY_WORK,
+ };
+ 
+-static u8 get_nic_state(struct mlx5_core_dev *dev)
++u8 mlx5_get_nic_state(struct mlx5_core_dev *dev)
+ {
+ 	return (ioread32be(&dev->iseg->cmdq_addr_l_sz) >> 8) & 3;
+ }
+ 
++void mlx5_set_nic_state(struct mlx5_core_dev *dev, u8 state)
++{
++	u32 cur_cmdq_addr_l_sz;
++
++	cur_cmdq_addr_l_sz = ioread32be(&dev->iseg->cmdq_addr_l_sz);
++	iowrite32be((cur_cmdq_addr_l_sz & 0xFFFFF000) |
++		    state << MLX5_NIC_IFC_OFFSET,
++		    &dev->iseg->cmdq_addr_l_sz);
++}
++
+ static void trigger_cmd_completions(struct mlx5_core_dev *dev)
+ {
+ 	unsigned long flags;
+@@ -104,7 +107,7 @@ static int in_fatal(struct mlx5_core_dev *dev)
+ 	struct mlx5_core_health *health = &dev->priv.health;
+ 	struct health_buffer __iomem *h = health->health;
+ 
+-	if (get_nic_state(dev) == MLX5_NIC_IFC_DISABLED)
++	if (mlx5_get_nic_state(dev) == MLX5_NIC_IFC_DISABLED)
+ 		return 1;
+ 
+ 	if (ioread32be(&h->fw_ver) == 0xffffffff)
+@@ -134,7 +137,7 @@ unlock:
+ 
+ static void mlx5_handle_bad_state(struct mlx5_core_dev *dev)
+ {
+-	u8 nic_interface = get_nic_state(dev);
++	u8 nic_interface = mlx5_get_nic_state(dev);
+ 
+ 	switch (nic_interface) {
+ 	case MLX5_NIC_IFC_FULL:
+@@ -169,7 +172,7 @@ static void health_recover(struct work_struct *work)
+ 	priv = container_of(health, struct mlx5_priv, health);
+ 	dev = container_of(priv, struct mlx5_core_dev, priv);
+ 
+-	nic_state = get_nic_state(dev);
++	nic_state = mlx5_get_nic_state(dev);
+ 	if (nic_state == MLX5_NIC_IFC_INVALID) {
+ 		dev_err(&dev->pdev->dev, "health recovery flow aborted since the nic state is invalid\n");
+ 		return;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --git a/include/linux/mlx5/device.h b/include/linux/mlx5/device.h
+index bf2b19fddd3b..e326524bafcc 100644
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -511,6 +511,10 @@ struct health_buffer {
+ 	__be16		ext_synd;
+ };
+ 
++enum mlx5_cmd_addr_l_sz_offset {
++	MLX5_NIC_IFC_OFFSET = 8,
++};
++
+ struct mlx5_init_seg {
+ 	__be32			fw_rev;
+ 	__be32			cmdif_rev_fw_sub;
+* Unmerged path include/linux/mlx5/mlx5_ifc.h
