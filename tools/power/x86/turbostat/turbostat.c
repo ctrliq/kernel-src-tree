@@ -3655,6 +3655,9 @@ void decode_misc_enable_msr(void)
 {
 	unsigned long long msr;
 
+	if (!genuine_intel)
+		return;
+
 	if (!get_msr(base_cpu, MSR_IA32_MISC_ENABLE, &msr))
 		fprintf(outf, "cpu%d: MSR_IA32_MISC_ENABLE: 0x%08llx (%s %s %s)\n",
 			base_cpu, msr,
