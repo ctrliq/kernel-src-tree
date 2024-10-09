@@ -1,0 +1,202 @@
+ACPI: APEI: call into AER handling regardless of severity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Tyler Baicar <tbaicar@codeaurora.org>
+commit 9852ce9ae213d39a98f161db84b90b047fbdc436
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/9852ce9a.failed
+
+Currently the GHES code only calls into the AER driver for
+recoverable type errors. This is incorrect because errors of
+other severities do not get logged by the AER driver and do not
+get exposed to user space via the AER trace event. So, call
+into the AER driver for PCIe errors regardless of the severity
+
+	Signed-off-by: Tyler Baicar <tbaicar@codeaurora.org>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 9852ce9ae213d39a98f161db84b90b047fbdc436)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/apei/ghes.c
+diff --cc drivers/acpi/apei/ghes.c
+index 7f3555a98b9d,cc65d1992635..000000000000
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@@ -412,26 -387,74 +412,80 @@@ static void ghes_handle_memory_failure(
+  {
+  #ifdef CONFIG_ACPI_APEI_MEMORY_FAILURE
+  	unsigned long pfn;
+ -	int flags = -1;
+  	int sec_sev = ghes_severity(gdata->error_severity);
+ -	struct cper_sec_mem_err *mem_err = acpi_hest_get_payload(gdata);
+ -
+ -	if (!(mem_err->validation_bits & CPER_MEM_VALID_PA))
+ -		return;
+ -
+ -	pfn = mem_err->physical_addr >> PAGE_SHIFT;
+ -	if (!pfn_valid(pfn)) {
+ -		pr_warn_ratelimited(FW_WARN GHES_PFX
+ -		"Invalid address in generic error data: %#llx\n",
+ -		mem_err->physical_addr);
+ -		return;
+ -	}
+ +	struct cper_sec_mem_err *mem_err;
+ +	mem_err = (struct cper_sec_mem_err *)(gdata + 1);
+  
+ -	/* iff following two events can be handled properly by now */
+  	if (sec_sev == GHES_SEV_CORRECTED &&
+++<<<<<<< HEAD
+ +	    (gdata->flags & CPER_SEC_ERROR_THRESHOLD_EXCEEDED) &&
+ +	    (mem_err->validation_bits & CPER_MEM_VALID_PA)) {
+ +		pfn = mem_err->physical_addr >> PAGE_SHIFT;
+ +		if (pfn_valid(pfn))
+ +			memory_failure_queue(pfn, 0, MF_SOFT_OFFLINE);
+ +		else if (printk_ratelimit())
+ +			pr_warn(FW_WARN GHES_PFX
+ +			"Invalid address in generic error data: %#llx\n",
+ +			mem_err->physical_addr);
+ +	}
+ +	if (sev == GHES_SEV_RECOVERABLE &&
+ +	    sec_sev == GHES_SEV_RECOVERABLE &&
+ +	    mem_err->validation_bits & CPER_MEM_VALID_PA) {
+ +		pfn = mem_err->physical_addr >> PAGE_SHIFT;
+ +		memory_failure_queue(pfn, 0, 0);
+++=======
++ 	    (gdata->flags & CPER_SEC_ERROR_THRESHOLD_EXCEEDED))
++ 		flags = MF_SOFT_OFFLINE;
++ 	if (sev == GHES_SEV_RECOVERABLE && sec_sev == GHES_SEV_RECOVERABLE)
++ 		flags = 0;
++ 
++ 	if (flags != -1)
++ 		memory_failure_queue(pfn, 0, flags);
++ #endif
++ }
++ 
++ /*
++  * PCIe AER errors need to be sent to the AER driver for reporting and
++  * recovery. The GHES severities map to the following AER severities and
++  * require the following handling:
++  *
++  * GHES_SEV_CORRECTABLE -> AER_CORRECTABLE
++  *     These need to be reported by the AER driver but no recovery is
++  *     necessary.
++  * GHES_SEV_RECOVERABLE -> AER_NONFATAL
++  * GHES_SEV_RECOVERABLE && CPER_SEC_RESET -> AER_FATAL
++  *     These both need to be reported and recovered from by the AER driver.
++  * GHES_SEV_PANIC does not make it to this handling since the kernel must
++  *     panic.
++  */
++ static void ghes_handle_aer(struct acpi_hest_generic_data *gdata)
++ {
++ #ifdef CONFIG_ACPI_APEI_PCIEAER
++ 	struct cper_sec_pcie *pcie_err = acpi_hest_get_payload(gdata);
++ 
++ 	if (pcie_err->validation_bits & CPER_PCIE_VALID_DEVICE_ID &&
++ 	    pcie_err->validation_bits & CPER_PCIE_VALID_AER_INFO) {
++ 		unsigned int devfn;
++ 		int aer_severity;
++ 
++ 		devfn = PCI_DEVFN(pcie_err->device_id.device,
++ 				  pcie_err->device_id.function);
++ 		aer_severity = cper_severity_to_aer(gdata->error_severity);
++ 
++ 		/*
++ 		 * If firmware reset the component to contain
++ 		 * the error, we must reinitialize it before
++ 		 * use, so treat it as a fatal AER error.
++ 		 */
++ 		if (gdata->flags & CPER_SEC_RESET)
++ 			aer_severity = AER_FATAL;
++ 
++ 		aer_recover_queue(pcie_err->device_id.segment,
++ 				  pcie_err->device_id.bus,
++ 				  devfn, aer_severity,
++ 				  (struct aer_capability_regs *)
++ 				  pcie_err->aer_info);
+++>>>>>>> 9852ce9ae213 (ACPI: APEI: call into AER handling regardless of severity)
+  	}
+  #endif
+  }
+@@@ -444,51 -470,36 +498,59 @@@ static void ghes_do_proc(struct ghes *g
+  
+  	sev = ghes_severity(estatus->error_severity);
+  	apei_estatus_for_each_section(estatus, gdata) {
+ -		sec_type = (guid_t *)gdata->section_type;
+  		sec_sev = ghes_severity(gdata->error_severity);
+ -		if (gdata->validation_bits & CPER_SEC_VALID_FRU_ID)
+ -			fru_id = (guid_t *)gdata->fru_id;
+ -
+ -		if (gdata->validation_bits & CPER_SEC_VALID_FRU_TEXT)
+ -			fru_text = gdata->fru_text;
+ -
+ -		if (guid_equal(sec_type, &CPER_SEC_PLATFORM_MEM)) {
+ -			struct cper_sec_mem_err *mem_err = acpi_hest_get_payload(gdata);
+ -
+ +		if (!uuid_le_cmp(*(uuid_le *)gdata->section_type,
+ +				 CPER_SEC_PLATFORM_MEM)) {
+ +			struct cper_sec_mem_err *mem_err;
+ +			mem_err = (struct cper_sec_mem_err *)(gdata+1);
+  			ghes_edac_report_mem_error(ghes, sev, mem_err);
+  
+ -			arch_apei_report_mem_error(sev, mem_err);
+ +#ifdef CONFIG_X86_MCE
+ +			apei_mce_report_mem_error(sev, mem_err);
+ +#endif
+  			ghes_handle_memory_failure(gdata, sev);
+  		}
+++<<<<<<< HEAD
+ +#ifdef CONFIG_ACPI_APEI_PCIEAER
+ +		else if (!uuid_le_cmp(*(uuid_le *)gdata->section_type,
+ +				      CPER_SEC_PCIE)) {
+ +			struct cper_sec_pcie *pcie_err;
+ +			pcie_err = (struct cper_sec_pcie *)(gdata+1);
+ +			if (sev == GHES_SEV_RECOVERABLE &&
+ +			    sec_sev == GHES_SEV_RECOVERABLE &&
+ +			    pcie_err->validation_bits & CPER_PCIE_VALID_DEVICE_ID &&
+ +			    pcie_err->validation_bits & CPER_PCIE_VALID_AER_INFO) {
+ +				unsigned int devfn;
+ +				int aer_severity;
+++=======
++ 		else if (guid_equal(sec_type, &CPER_SEC_PCIE)) {
++ 			ghes_handle_aer(gdata);
++ 		}
++ 		else if (guid_equal(sec_type, &CPER_SEC_PROC_ARM)) {
++ 			struct cper_sec_proc_arm *err = acpi_hest_get_payload(gdata);
+++>>>>>>> 9852ce9ae213 (ACPI: APEI: call into AER handling regardless of severity)
+ +
+ +				devfn = PCI_DEVFN(pcie_err->device_id.device,
+ +						  pcie_err->device_id.function);
+ +				aer_severity = cper_severity_to_aer(sev);
+ +
+ +				/*
+ +				 * If firmware reset the component to contain
+ +				 * the error, we must reinitialize it before
+ +				 * use, so treat it as a fatal AER error.
+ +				 */
+ +				if (gdata->flags & CPER_SEC_RESET)
+ +					aer_severity = AER_FATAL;
+ +
+ +				aer_recover_queue(pcie_err->device_id.segment,
+ +						  pcie_err->device_id.bus,
+ +						  devfn, aer_severity,
+ +						  (struct aer_capability_regs *)
+ +						  pcie_err->aer_info);
+ +			}
+  
+ -			log_arm_hw_error(err);
+ -		} else {
+ -			void *err = acpi_hest_get_payload(gdata);
+ -
+ -			log_non_standard_event(sec_type, fru_id, fru_text,
+ -					       sec_sev, err,
+ -					       gdata->error_data_length);
+  		}
+ +#endif
+  	}
+  }
+  
+* Unmerged path drivers/acpi/apei/ghes.c
