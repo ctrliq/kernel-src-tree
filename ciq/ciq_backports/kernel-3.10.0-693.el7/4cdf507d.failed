@@ -1,0 +1,236 @@
+icmp: add a global rate limitation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 4cdf507d54525842dfd9f6313fdafba039084046
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4cdf507d.failed
+
+Current ICMP rate limiting uses inetpeer cache, which is an RBL tree
+protected by a lock, meaning that hosts can be stuck hard if all cpus
+want to check ICMP limits.
+
+When say a DNS or NTP server process is restarted, inetpeer tree grows
+quick and machine comes to its knees.
+
+iptables can not help because the bottleneck happens before ICMP
+messages are even cooked and sent.
+
+This patch adds a new global limitation, using a token bucket filter,
+controlled by two new sysctl :
+
+icmp_msgs_per_sec - INTEGER
+    Limit maximal number of ICMP packets sent per second from this host.
+    Only messages whose type matches icmp_ratemask are
+    controlled by this limit.
+    Default: 1000
+
+icmp_msgs_burst - INTEGER
+    icmp_msgs_per_sec controls number of ICMP packets sent per second,
+    while icmp_msgs_burst controls the burst size of these packets.
+    Default: 50
+
+Note that if we really want to send millions of ICMP messages per
+second, we might extend idea and infra added in commit 04ca6973f7c1a
+("ip: make IP identifiers less predictable") :
+add a token bucket in the ip_idents hash and no longer rely on inetpeer.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4cdf507d54525842dfd9f6313fdafba039084046)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/sysctl_net_ipv4.c
+#	net/ipv6/icmp.c
+diff --cc net/ipv4/sysctl_net_ipv4.c
+index 5529c590cd07,8a25509c35b3..000000000000
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@@ -780,11 -731,20 +780,28 @@@ static struct ctl_table ipv4_table[] = 
+  		.extra2		= &one,
+  	},
+  	{
+++<<<<<<< HEAD
+ +		.procname	= "tcp_invalid_ratelimit",
+ +		.data		= &sysctl_tcp_invalid_ratelimit,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec_ms_jiffies,
+++=======
++ 		.procname	= "icmp_msgs_per_sec",
++ 		.data		= &sysctl_icmp_msgs_per_sec,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 	},
++ 	{
++ 		.procname	= "icmp_msgs_burst",
++ 		.data		= &sysctl_icmp_msgs_burst,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
+++>>>>>>> 4cdf507d5452 (icmp: add a global rate limitation)
+  	},
+  	{
+  		.procname	= "udp_mem",
+diff --cc net/ipv6/icmp.c
+index 6afaf8b3b1a1,141e1f3ab74e..000000000000
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@@ -197,10 -204,15 +196,22 @@@ static bool icmpv6_xrlim_allow(struct s
+  		if (rt->rt6i_dst.plen < 128)
+  			tmo >>= ((128 - rt->rt6i_dst.plen)>>5);
+  
+++<<<<<<< HEAD
+ +		peer = inet_getpeer_v6(net->ipv6.peers, &fl6->daddr, 1);
+ +		res = inet_peer_xrlim_allow(peer, tmo);
+ +		if (peer)
+ +			inet_putpeer(peer);
+++=======
++ 		if (icmp_global_allow()) {
++ 			struct inet_peer *peer;
++ 
++ 			peer = inet_getpeer_v6(net->ipv6.peers,
++ 					       &rt->rt6i_dst.addr, 1);
++ 			res = inet_peer_xrlim_allow(peer, tmo);
++ 			if (peer)
++ 				inet_putpeer(peer);
++ 		}
+++>>>>>>> 4cdf507d5452 (icmp: add a global rate limitation)
+  	}
+  	dst_release(dst);
+  	return res;
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index d275d07a0efb..5af1f49d3a63 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -763,8 +763,21 @@ icmp_ratelimit - INTEGER
+ 	icmp_ratemask (see below) to specific targets.
+ 	0 to disable any limiting,
+ 	otherwise the minimal space between responses in milliseconds.
++	Note that another sysctl, icmp_msgs_per_sec limits the number
++	of ICMP packets	sent on all targets.
+ 	Default: 1000
+ 
++icmp_msgs_per_sec - INTEGER
++	Limit maximal number of ICMP packets sent per second from this host.
++	Only messages whose type matches icmp_ratemask (see below) are
++	controlled by this limit.
++	Default: 1000
++
++icmp_msgs_burst - INTEGER
++	icmp_msgs_per_sec controls number of ICMP packets sent per second,
++	while icmp_msgs_burst controls the burst size of these packets.
++	Default: 50
++
+ icmp_ratemask - INTEGER
+ 	Mask made of ICMP types for which rates are being limited.
+ 	Significant bits: IHGFEDCBA9876543210
+diff --git a/include/net/ip.h b/include/net/ip.h
+index 5506ed81f7f4..f7531b844a3d 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -547,6 +547,10 @@ void ip_icmp_error(struct sock *sk, struct sk_buff *skb, int err, __be16 port,
+ void ip_local_error(struct sock *sk, int err, __be32 daddr, __be16 dport,
+ 		    u32 info);
+ 
++bool icmp_global_allow(void);
++extern int sysctl_icmp_msgs_per_sec;
++extern int sysctl_icmp_msgs_burst;
++
+ #ifdef CONFIG_PROC_FS
+ int ip_misc_proc_init(void);
+ #endif
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index 6988f500f6f0..e6846645fbc3 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -231,12 +231,62 @@ static inline void icmp_xmit_unlock(struct sock *sk)
+ 	spin_unlock_bh(&sk->sk_lock.slock);
+ }
+ 
++int sysctl_icmp_msgs_per_sec __read_mostly = 1000;
++int sysctl_icmp_msgs_burst __read_mostly = 50;
++
++static struct {
++	spinlock_t	lock;
++	u32		credit;
++	u32		stamp;
++} icmp_global = {
++	.lock		= __SPIN_LOCK_UNLOCKED(icmp_global.lock),
++};
++
++/**
++ * icmp_global_allow - Are we allowed to send one more ICMP message ?
++ *
++ * Uses a token bucket to limit our ICMP messages to sysctl_icmp_msgs_per_sec.
++ * Returns false if we reached the limit and can not send another packet.
++ * Note: called with BH disabled
++ */
++bool icmp_global_allow(void)
++{
++	u32 credit, delta, incr = 0, now = (u32)jiffies;
++	bool rc = false;
++
++	/* Check if token bucket is empty and cannot be refilled
++	 * without taking the spinlock.
++	 */
++	if (!icmp_global.credit) {
++		delta = min_t(u32, now - icmp_global.stamp, HZ);
++		if (delta < HZ / 50)
++			return false;
++	}
++
++	spin_lock(&icmp_global.lock);
++	delta = min_t(u32, now - icmp_global.stamp, HZ);
++	if (delta >= HZ / 50) {
++		incr = sysctl_icmp_msgs_per_sec * delta / HZ ;
++		if (incr)
++			icmp_global.stamp = now;
++	}
++	credit = min_t(u32, icmp_global.credit + incr, sysctl_icmp_msgs_burst);
++	if (credit) {
++		credit--;
++		rc = true;
++	}
++	icmp_global.credit = credit;
++	spin_unlock(&icmp_global.lock);
++	return rc;
++}
++EXPORT_SYMBOL(icmp_global_allow);
++
+ /*
+  *	Send an ICMP frame.
+  */
+ 
+-static inline bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+-				      struct flowi4 *fl4, int type, int code)
++static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
++			       struct flowi4 *fl4, int type, int code)
+ {
+ 	struct dst_entry *dst = &rt->dst;
+ 	bool rc = true;
+@@ -253,8 +303,14 @@ static inline bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ 		goto out;
+ 
+ 	/* Limit if icmp type is enabled in ratemask. */
+-	if ((1 << type) & net->ipv4.sysctl_icmp_ratemask) {
+-		struct inet_peer *peer = inet_getpeer_v4(net->ipv4.peers, fl4->daddr, 1);
++	if (!((1 << type) & net->ipv4.sysctl_icmp_ratemask))
++		goto out;
++
++	rc = false;
++	if (icmp_global_allow()) {
++		struct inet_peer *peer;
++
++		peer = inet_getpeer_v4(net->ipv4.peers, fl4->daddr, 1);
+ 		rc = inet_peer_xrlim_allow(peer,
+ 					   net->ipv4.sysctl_icmp_ratelimit);
+ 		if (peer)
+* Unmerged path net/ipv4/sysctl_net_ipv4.c
+* Unmerged path net/ipv6/icmp.c
