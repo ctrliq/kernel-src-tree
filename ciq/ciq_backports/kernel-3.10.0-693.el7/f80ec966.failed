@@ -1,0 +1,112 @@
+nvme: Limit command retries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] Limit command retries (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 87.50%
+commit-author Keith Busch <keith.busch@intel.com>
+commit f80ec966c19b78af4360e26e32e1ab775253105f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f80ec966.failed
+
+Many controller implementations will return errors to commands that will
+not succeed, but without the DNR bit set. The driver previously retried
+these commands an unlimited number of times until the command timeout
+has exceeded, which takes an unnecessarilly long period of time.
+
+This patch limits the number of retries a command can have, defaulting
+to 5, but is user tunable at load or runtime.
+
+The struct request's 'retries' field is used to track the number of
+retries attempted. This is in contrast with scsi's use of this field,
+which indicates how many retries are allowed.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f80ec966c19b78af4360e26e32e1ab775253105f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,ab18b78102bf..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -38,6 -38,16 +38,19 @@@ extern unsigned char admin_timeout
+  extern unsigned char shutdown_timeout;
+  #define SHUTDOWN_TIMEOUT	(shutdown_timeout * HZ)
+  
+++<<<<<<< HEAD
+++=======
++ #define NVME_DEFAULT_KATO	5
++ #define NVME_KATO_GRACE		10
++ 
++ extern unsigned int nvme_max_retries;
++ 
++ enum {
++ 	NVME_NS_LBA		= 0,
++ 	NVME_NS_LIGHTNVM	= 1,
++ };
++ 
+++>>>>>>> f80ec966c19b (nvme: Limit command retries)
+  /*
+   * List of workarounds for devices that required behavior not specified in
+   * the standard.
+@@@ -226,9 -241,13 +239,10 @@@ static inline int nvme_error_status(u1
+  static inline bool nvme_req_needs_retry(struct request *req, u16 status)
+  {
+  	return !(status & NVME_SC_DNR || blk_noretry_request(req)) &&
+- 		(jiffies - req->start_time) < req->timeout;
++ 		(jiffies - req->start_time) < req->timeout &&
++ 		req->retries < nvme_max_retries;
+  }
+  
+ -void nvme_cancel_request(struct request *req, void *data, bool reserved);
+ -bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
+ -		enum nvme_ctrl_state new_state);
+  int nvme_disable_ctrl(struct nvme_ctrl *ctrl, u64 cap);
+  int nvme_enable_ctrl(struct nvme_ctrl *ctrl, u64 cap);
+  int nvme_shutdown_ctrl(struct nvme_ctrl *ctrl);
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 63f6b5f40b5c..c8b1ec82e1a5 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -45,6 +45,11 @@ unsigned char shutdown_timeout = 5;
+ module_param(shutdown_timeout, byte, 0644);
+ MODULE_PARM_DESC(shutdown_timeout, "timeout in seconds for controller shutdown");
+ 
++unsigned int nvme_max_retries = 5;
++module_param_named(max_retries, nvme_max_retries, uint, 0644);
++MODULE_PARM_DESC(max_retries, "max number of retries a command may have");
++EXPORT_SYMBOL_GPL(nvme_max_retries);
++
+ static int nvme_major;
+ module_param(nvme_major, int, 0);
+ 
+* Unmerged path drivers/nvme/host/nvme.h
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 6cf19a97b3a4..91209b0f66c3 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -356,6 +356,11 @@ static int nvme_init_iod(struct request *rq, struct nvme_dev *dev)
+ 	iod->npages = -1;
+ 	iod->nents = 0;
+ 	iod->length = size;
++
++	if (!(rq->cmd_flags & REQ_DONTPREP)) {
++		rq->retries = 0;
++		rq->cmd_flags |= REQ_DONTPREP;
++	}
+ 	return 0;
+ }
+ 
+@@ -640,6 +645,7 @@ static void nvme_complete_rq(struct request *req)
+ 
+ 	if (unlikely(req->errors)) {
+ 		if (nvme_req_needs_retry(req, req->errors)) {
++			req->retries++;
+ 			nvme_requeue_req(req);
+ 			return;
+ 		}
