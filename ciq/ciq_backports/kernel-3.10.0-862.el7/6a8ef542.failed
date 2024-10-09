@@ -1,0 +1,241 @@
+nfp: bpf: release the reference on offloaded programs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 6a8ef5428c9fb5b589c2c912889d157abb50dd61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6a8ef542.failed
+
+The xdp_prog member of the adapter's data path structure is used
+for XDP in driver mode.  In case a XDP program is loaded with in
+HW-only mode, we need to store it somewhere else.  Add a new XDP
+prog pointer in the main structure and use that when we need to
+know whether any XDP program is loaded, not only a driver mode
+one.  Only release our reference on adapter free instead of
+immediately after netdev unregister to allow offload to be disabled
+first.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6a8ef5428c9fb5b589c2c912889d157abb50dd61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,b7446793106d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -432,16 -540,12 +432,22 @@@ static inline bool nfp_net_fw_ver_eq(st
+   * @rss_cfg:            RSS configuration
+   * @rss_key:            RSS secret key
+   * @rss_itbl:           RSS indirection table
+++<<<<<<< HEAD
+++=======
++  * @xdp_flags:		Flags with which XDP prog was loaded
++  * @xdp_prog:		XDP prog (for ctrl path, both DRV and HW modes)
++  * @max_r_vecs:		Number of allocated interrupt vectors for RX/TX
+++>>>>>>> 6a8ef5428c9f (nfp: bpf: release the reference on offloaded programs)
+   * @max_tx_rings:       Maximum number of TX rings supported by the Firmware
+   * @max_rx_rings:       Maximum number of RX rings supported by the Firmware
+ + * @num_tx_rings:       Currently configured number of TX rings
+ + * @num_rx_rings:       Currently configured number of RX rings
+ + * @txd_cnt:            Size of the TX ring in number of descriptors
+ + * @rxd_cnt:            Size of the RX ring in number of descriptors
+ + * @tx_rings:           Array of pre-allocated TX ring structures
+ + * @rx_rings:           Array of pre-allocated RX ring structures
+ + * @max_r_vecs:	        Number of allocated interrupt vectors for RX/TX
+ + * @num_r_vecs:         Number of used ring vectors
+   * @r_vecs:             Pre-allocated array of ring vectors
+   * @irq_entries:        Pre-allocated array of MSI-X entries
+   * @lsc_handler:        Handler for Link State Change interrupt
+@@@ -497,6 -592,9 +503,12 @@@ struct nfp_net 
+  	u8 rss_key[NFP_NET_CFG_RSS_KEY_SZ];
+  	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
+  
+++<<<<<<< HEAD
+++=======
++ 	u32 xdp_flags;
++ 	struct bpf_prog *xdp_prog;
++ 
+++>>>>>>> 6a8ef5428c9f (nfp: bpf: release the reference on offloaded programs)
+  	unsigned int max_tx_rings;
+  	unsigned int max_rx_rings;
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,35b4530a7e02..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -2600,8 -3274,95 +2600,100 @@@ static void nfp_net_del_vxlan_port(stru
+  		nfp_net_set_vxlan_port(nn, idx, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct net_device_ops nfp_net_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+++=======
++ static int
++ nfp_net_xdp_setup_drv(struct nfp_net *nn, struct bpf_prog *prog,
++ 		      struct netlink_ext_ack *extack)
++ {
++ 	struct nfp_net_dp *dp;
++ 
++ 	if (!prog == !nn->dp.xdp_prog) {
++ 		WRITE_ONCE(nn->dp.xdp_prog, prog);
++ 		return 0;
++ 	}
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->xdp_prog = prog;
++ 	dp->num_tx_rings += prog ? nn->dp.num_rx_rings : -nn->dp.num_rx_rings;
++ 	dp->rx_dma_dir = prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
++ 	dp->rx_dma_off = prog ? XDP_PACKET_HEADROOM - nn->dp.rx_offset : 0;
++ 
++ 	/* We need RX reconfig to remap the buffers (BIDIR vs FROM_DEV) */
++ 	return nfp_net_ring_reconfig(nn, dp, extack);
++ }
++ 
++ static int
++ nfp_net_xdp_setup(struct nfp_net *nn, struct bpf_prog *prog, u32 flags,
++ 		  struct netlink_ext_ack *extack)
++ {
++ 	struct bpf_prog *offload_prog;
++ 	int err;
++ 
++ 	if (nn->xdp_prog && (flags ^ nn->xdp_flags) & XDP_FLAGS_MODES)
++ 		return -EBUSY;
++ 
++ 	offload_prog = flags & XDP_FLAGS_DRV_MODE ? NULL : prog;
++ 
++ 	err = nfp_net_xdp_setup_drv(nn, prog, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	nfp_app_xdp_offload(nn->app, nn, offload_prog);
++ 
++ 	if (nn->xdp_prog)
++ 		bpf_prog_put(nn->xdp_prog);
++ 	nn->xdp_prog = prog;
++ 	nn->xdp_flags = flags;
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
++ 					 xdp->extack);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!nn->xdp_prog;
++ 		xdp->prog_id = nn->xdp_prog ? nn->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int nfp_net_set_mac_address(struct net_device *netdev, void *addr)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	struct sockaddr *saddr = addr;
++ 	int err;
++ 
++ 	err = eth_prepare_mac_addr_change(netdev, addr);
++ 	if (err)
++ 		return err;
++ 
++ 	nfp_net_write_mac_addr(nn, saddr->sa_data);
++ 
++ 	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_MACADDR);
++ 	if (err)
++ 		return err;
++ 
++ 	eth_commit_mac_addr_change(netdev, addr);
++ 
++ 	return 0;
++ }
++ 
++ const struct net_device_ops nfp_net_netdev_ops = {
+++>>>>>>> 6a8ef5428c9f (nfp: bpf: release the reference on offloaded programs)
+  	.ndo_open		= nfp_net_netdev_open,
+  	.ndo_stop		= nfp_net_netdev_close,
+  	.ndo_start_xmit		= nfp_net_tx,
+@@@ -2702,12 -3487,39 +2794,43 @@@ struct nfp_net *nfp_net_netdev_alloc(st
+  }
+  
+  /**
+ - * nfp_net_free() - Undo what @nfp_net_alloc() did
+ + * nfp_net_netdev_free() - Undo what @nfp_net_netdev_alloc() did
+   * @nn:      NFP Net device to reconfigure
+   */
+ -void nfp_net_free(struct nfp_net *nn)
+ +void nfp_net_netdev_free(struct nfp_net *nn)
+  {
+++<<<<<<< HEAD
+ +	free_netdev(nn->netdev);
+++=======
++ 	if (nn->xdp_prog)
++ 		bpf_prog_put(nn->xdp_prog);
++ 
++ 	if (nn->dp.netdev)
++ 		free_netdev(nn->dp.netdev);
++ 	else
++ 		vfree(nn);
++ }
++ 
++ /**
++  * nfp_net_rss_key_sz() - Get current size of the RSS key
++  * @nn:		NFP Net device instance
++  *
++  * Return: size of the RSS key for currently selected hash function.
++  */
++ unsigned int nfp_net_rss_key_sz(struct nfp_net *nn)
++ {
++ 	switch (nn->rss_hfunc) {
++ 	case ETH_RSS_HASH_TOP:
++ 		return NFP_NET_CFG_RSS_KEY_SZ;
++ 	case ETH_RSS_HASH_XOR:
++ 		return 0;
++ 	case ETH_RSS_HASH_CRC32:
++ 		return 4;
++ 	}
++ 
++ 	nn_warn(nn, "Unknown hash function: %u\n", nn->rss_hfunc);
++ 	return 0;
+++>>>>>>> 6a8ef5428c9f (nfp: bpf: release the reference on offloaded programs)
+  }
+  
+  /**
+@@@ -2860,10 -3743,13 +2983,17 @@@ int nfp_net_netdev_init(struct net_devi
+  }
+  
+  /**
+ - * nfp_net_clean() - Undo what nfp_net_init() did.
+ - * @nn:		NFP Net device structure
+ + * nfp_net_netdev_clean() - Undo what nfp_net_netdev_init() did.
+ + * @netdev:      netdev structure
+   */
+ -void nfp_net_clean(struct nfp_net *nn)
+ +void nfp_net_netdev_clean(struct net_device *netdev)
+  {
+++<<<<<<< HEAD
+ +	unregister_netdev(netdev);
+++=======
++ 	if (!nn->dp.netdev)
++ 		return;
++ 
++ 	unregister_netdev(nn->dp.netdev);
+++>>>>>>> 6a8ef5428c9f (nfp: bpf: release the reference on offloaded programs)
+  }
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
