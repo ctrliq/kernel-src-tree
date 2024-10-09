@@ -1,0 +1,354 @@
+ibmvnic: Client-initiated failover
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+commit 40c9db8ad8b4b7f87e2f4a5e80cf1732f2825e6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/40c9db8a.failed
+
+The IBM vNIC protocol provides support for the user to initiate
+a failover from the client LPAR in case the current backing infrastructure
+is deemed inadequate or in an error state.
+
+Support for two H_VIOCTL sub-commands for vNIC devices are required
+to implement this function. These commands are H_GET_SESSION_TOKEN
+and H_SESSION_ERR_DETECTED.
+
+"[H_GET_SESSION_TOKEN] is used to obtain a session token from a VNIC client
+adapter.  This token is opaque to the caller and is intended to be used in
+tandem with the SESSION_ERROR_DETECTED vioctl subfunction."
+
+"[H_SESSION_ERR_DETECTED] is used to report that the currently active
+backing device for a VNIC client adapter is behaving poorly, and that
+the hypervisor should attempt to fail over to a different backing device,
+if one is available."
+
+To provide tools access to this functionality the vNIC driver creates a
+sysfs file that, when written to, will send a request to pHyp to failover
+to a different backing device.
+
+	Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+	Reviewed-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 40c9db8ad8b4b7f87e2f4a5e80cf1732f2825e6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index e51abefcc89d,fd3ef3005fb0..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -3719,126 -3609,57 +3719,128 @@@ map_failed
+  	return retrc;
+  }
+  
+ -static int ibmvnic_init(struct ibmvnic_adapter *adapter)
+ +/* debugfs for dump */
+ +static int ibmvnic_dump_show(struct seq_file *seq, void *v)
+ +{
+ +	struct net_device *netdev = seq->private;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ +	struct device *dev = &adapter->vdev->dev;
+ +	union ibmvnic_crq crq;
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.request_dump_size.first = IBMVNIC_CRQ_CMD;
+ +	crq.request_dump_size.cmd = REQUEST_DUMP_SIZE;
+ +
+ +	init_completion(&adapter->fw_done);
+ +	ibmvnic_send_crq(adapter, &crq);
+ +	wait_for_completion(&adapter->fw_done);
+ +
+ +	seq_write(seq, adapter->dump_data, adapter->dump_data_size);
+ +
+ +	dma_unmap_single(dev, adapter->dump_data_token, adapter->dump_data_size,
+ +			 DMA_BIDIRECTIONAL);
+ +
+ +	kfree(adapter->dump_data);
+ +
+ +	return 0;
+ +}
+ +
+ +static int ibmvnic_dump_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, ibmvnic_dump_show, inode->i_private);
+ +}
+ +
+ +static const struct file_operations ibmvnic_dump_ops = {
+ +	.owner          = THIS_MODULE,
+ +	.open           = ibmvnic_dump_open,
+ +	.read           = seq_read,
+ +	.llseek         = seq_lseek,
+ +	.release        = single_release,
+ +};
+ +
+ +static void handle_crq_init_rsp(struct work_struct *work)
+  {
+ +	struct ibmvnic_adapter *adapter = container_of(work,
+ +						       struct ibmvnic_adapter,
+ +						       vnic_crq_init);
+  	struct device *dev = &adapter->vdev->dev;
+ +	struct net_device *netdev = adapter->netdev;
+  	unsigned long timeout = msecs_to_jiffies(30000);
+ +	bool restart = false;
+  	int rc;
+  
+ -	if (adapter->resetting) {
+ -		rc = ibmvnic_reset_crq(adapter);
+ -		if (!rc)
+ -			rc = vio_enable_interrupts(adapter->vdev);
+ -	} else {
+ -		rc = init_crq_queue(adapter);
+ +	if (adapter->failover) {
+ +		release_sub_crqs(adapter);
+ +		if (netif_running(netdev)) {
+ +			netif_tx_disable(netdev);
+ +			ibmvnic_close(netdev);
+ +			restart = true;
+ +		}
+  	}
+  
+ -	if (rc) {
+ -		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
+ -		return rc;
+ +	reinit_completion(&adapter->init_done);
+ +	send_version_xchg(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ +		dev_err(dev, "Passive init timeout\n");
+ +		goto task_failed;
+  	}
+  
+ -	adapter->from_passive_init = false;
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+  
+ -	init_completion(&adapter->init_done);
+ -	ibmvnic_send_crq_init(adapter);
+ -	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ -		dev_err(dev, "Initialization sequence timed out\n");
+ -		return -1;
+ -	}
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout)) {
+ +				dev_err(dev, "Passive init timeout\n");
+ +				goto task_failed;
+ +			}
+ +		}
+ +	} while (adapter->renegotiate);
+ +	rc = init_sub_crq_irqs(adapter);
+ +
+ +	if (rc)
+ +		goto task_failed;
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+  
+ -	if (adapter->from_passive_init) {
+ -		adapter->state = VNIC_OPEN;
+ -		adapter->from_passive_init = false;
+ -		return -1;
+ +	if (adapter->failover) {
+ +		adapter->failover = false;
+ +		if (restart) {
+ +			rc = ibmvnic_open(netdev);
+ +			if (rc)
+ +				goto restart_failed;
+ +		}
+ +		netif_carrier_on(netdev);
+ +		return;
+  	}
+  
+ -	if (adapter->resetting)
+ -		rc = reset_sub_crq_queues(adapter);
+ -	else
+ -		rc = init_sub_crqs(adapter);
+ +	rc = register_netdev(netdev);
+  	if (rc) {
+ -		dev_err(dev, "Initialization of sub crqs failed\n");
+ -		release_crq_queue(adapter);
+ +		dev_err(dev,
+ +			"failed to register netdev rc=%d\n", rc);
+ +		goto register_failed;
+  	}
+ +	dev_info(dev, "ibmvnic registered\n");
+  
+ -	return rc;
+ +	return;
+ +
+ +restart_failed:
+ +	dev_err(dev, "Failed to restart ibmvnic, rc=%d\n", rc);
+ +register_failed:
+ +	release_sub_crqs(adapter);
+ +task_failed:
+ +	dev_err(dev, "Passive initialization was not successful\n");
+  }
+  
++ static struct device_attribute dev_attr_failover;
++ 
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+  {
+ +	unsigned long timeout = msecs_to_jiffies(30000);
+  	struct ibmvnic_adapter *adapter;
+  	struct net_device *netdev;
+  	unsigned char *mac_addr_p;
+@@@ -3876,81 -3695,37 +3878,93 @@@
+  	netdev->ethtool_ops = &ibmvnic_ethtool_ops;
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	INIT_WORK(&adapter->vnic_crq_init, handle_crq_init_rsp);
+ +	INIT_WORK(&adapter->ibmvnic_xport, ibmvnic_xport_event);
+ +
+  	spin_lock_init(&adapter->stats_lock);
+  
+ +	rc = ibmvnic_init_crq_queue(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "Couldn't initialize crq. rc=%d\n", rc);
+ +		goto free_netdev;
+ +	}
+ +
+  	INIT_LIST_HEAD(&adapter->errors);
+ +	INIT_LIST_HEAD(&adapter->inflight);
+  	spin_lock_init(&adapter->error_list_lock);
+ +	spin_lock_init(&adapter->inflight_lock);
+ +
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+ +
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+ +
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+ +
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+  
+ -	INIT_WORK(&adapter->ibmvnic_reset, __ibmvnic_reset);
+ -	INIT_LIST_HEAD(&adapter->rwi_list);
+ -	mutex_init(&adapter->reset_lock);
+ -	mutex_init(&adapter->rwi_lock);
+ -	adapter->resetting = false;
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+ +		}
+ +	} while (adapter->renegotiate);
+  
+ -	rc = ibmvnic_init(adapter);
+ +	rc = init_sub_crq_irqs(adapter);
+  	if (rc) {
+ -		free_netdev(netdev);
+ -		return rc;
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+  	}
+  
+ -	netdev->mtu = adapter->req_mtu - ETH_HLEN;
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+  
++ 	rc = device_create_file(&dev->dev, &dev_attr_failover);
++ 	if (rc) {
++ 		free_netdev(netdev);
++ 		return rc;
++ 	}
++ 
+  	rc = register_netdev(netdev);
+  	if (rc) {
+  		dev_err(&dev->dev, "failed to register netdev rc=%d\n", rc);
+++<<<<<<< HEAD
+ +		goto free_sub_crqs;
+++=======
++ 		device_remove_file(&dev->dev, &dev_attr_failover);
++ 		free_netdev(netdev);
++ 		return rc;
+++>>>>>>> 40c9db8ad8b4 (ibmvnic: Client-initiated failover)
+  	}
+  	dev_info(&dev->dev, "ibmvnic registered\n");
+  
+@@@ -3973,26 -3738,18 +3987,31 @@@ static int ibmvnic_remove(struct vio_de
+  	struct net_device *netdev = dev_get_drvdata(&dev->dev);
+  	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  
+ -	adapter->state = VNIC_REMOVING;
+  	unregister_netdev(netdev);
+ -	mutex_lock(&adapter->reset_lock);
+  
+ -	release_resources(adapter);
+  	release_sub_crqs(adapter);
+ -	release_crq_queue(adapter);
+  
+ -	adapter->state = VNIC_REMOVED;
+ +	ibmvnic_release_crq_queue(adapter);
+ +
+ +	if (adapter->debugfs_dir && !IS_ERR(adapter->debugfs_dir))
+ +		debugfs_remove_recursive(adapter->debugfs_dir);
+ +
+ +	dma_unmap_single(&dev->dev, adapter->stats_token,
+ +			 sizeof(struct ibmvnic_statistics), DMA_FROM_DEVICE);
+ +
+ +	if (adapter->ras_comps)
+ +		dma_free_coherent(&dev->dev,
+ +				  adapter->ras_comp_num *
+ +				  sizeof(struct ibmvnic_fw_component),
+ +				  adapter->ras_comps, adapter->ras_comps_tok);
+ +
+ +	kfree(adapter->ras_comp_int);
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_unlock(&adapter->reset_lock);
++ 	device_remove_file(&dev->dev, &dev_attr_failover);
+++>>>>>>> 40c9db8ad8b4 (ibmvnic: Client-initiated failover)
+  	free_netdev(netdev);
+  	dev_set_drvdata(&dev->dev, NULL);
+  
+diff --git a/arch/powerpc/include/asm/hvcall.h b/arch/powerpc/include/asm/hvcall.h
+index 67b92316ea8e..24a26d563aca 100644
+--- a/arch/powerpc/include/asm/hvcall.h
++++ b/arch/powerpc/include/asm/hvcall.h
+@@ -293,6 +293,8 @@
+ #define H_DISABLE_ALL_VIO_INTS	0x0A
+ #define H_DISABLE_VIO_INTERRUPT	0x0B
+ #define H_ENABLE_VIO_INTERRUPT	0x0C
++#define H_GET_SESSION_TOKEN	0x19
++#define H_SESSION_ERR_DETECTED	0x1A
+ 
+ 
+ /* Platform specific hcalls, used by KVM */
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
