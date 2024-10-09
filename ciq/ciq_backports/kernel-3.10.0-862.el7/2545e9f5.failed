@@ -1,0 +1,382 @@
+x86/intel_rdt: Cleanup namespace to support multiple resource types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt: Cleanup namespace to support multiple resource types (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 96.92%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit 2545e9f51ea860736c4dc1e90a44ed75e9c91e3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2545e9f5.failed
+
+Lot of data structures and functions are named after cache specific
+resources(named after cbm, cache etc). In many cases other non cache
+resources may need to share the same data structures/functions.
+
+Generalize such naming to prepare to add more resources like memory
+bandwidth.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1491611637-20417-3-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 2545e9f51ea860736c4dc1e90a44ed75e9c91e3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,92d8431fdc38..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -168,61 -168,20 +168,61 @@@ static void rdt_get_cdp_l3_config(int t
+  	r->enabled = false;
+  }
+  
+ -static int get_cache_id(int cpu, int level)
+ +/**
+ + * Choose a width for the resource name
+ + * and resource data based on the resource that has
+ + * widest name and cbm.
+ + */
+ +static void rdt_init_padding(void)
+  {
+ -	struct cpu_cacheinfo *ci = get_cpu_cacheinfo(cpu);
+ -	int i;
+ +	struct rdt_resource *r;
+ +	int cl;
+ +
+ +	for_each_enabled_rdt_resource(r) {
+ +		cl = strlen(r->name);
+ +		if (cl > max_name_width)
+ +			max_name_width = cl;
+  
+ -	for (i = 0; i < ci->num_leaves; i++) {
+ -		if (ci->info_list[i].level == level)
+ -			return ci->info_list[i].id;
+ +		if (r->data_width > max_data_width)
+ +			max_data_width = r->data_width;
+  	}
+ +}
+  
+ -	return -1;
+ +static inline bool get_rdt_resources(void)
+ +{
+ +	bool ret = false;
+ +
+ +	if (cache_alloc_hsw_probe())
+ +		return true;
+ +
+ +	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ +		return false;
+ +
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ +		rdt_get_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ +		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +		}
+ +		ret = true;
+ +	}
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
+ +		/* CPUID 0x10.2 fields are same format at 0x10.1 */
+ +		rdt_get_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
+ +		ret = true;
+ +	}
+ +
+ +	rdt_init_padding();
+ +
+ +	return ret;
+ +}
+ +
+ +static int get_cache_id(int cpu, int level)
+ +{
+ +	return get_cpu_cache_id(cpu, level);
+  }
+  
+- void rdt_cbm_update(void *arg)
++ void rdt_ctrl_update(void *arg)
+  {
+  	struct msr_param *m = (struct msr_param *)arg;
+  	struct rdt_resource *r = m->res;
+@@@ -325,9 -284,8 +325,14 @@@ static void domain_add_cpu(int cpu, str
+  	for (i = 0; i < r->num_closid; i++) {
+  		int idx = cbm_idx(r, i);
+  
+++<<<<<<< HEAD
+ +		d->cbm[i] = r->max_cbm;
+ +		if (notifier)
+ +			wrmsrl(r->msr_base + idx, d->cbm[i]);
+++=======
++ 		d->ctrl_val[i] = r->default_ctrl;
++ 		wrmsrl(r->msr_base + idx, d->ctrl_val[i]);
+++>>>>>>> 2545e9f51ea8 (x86/intel_rdt: Cleanup namespace to support multiple resource types)
+  	}
+  
+  	cpumask_set_cpu(cpu, &d->cpu_mask);
+@@@ -437,29 -372,30 +442,52 @@@ static void __init rdt_cpu_setup(void *
+  	}
+  }
+  
+ -static __init bool get_rdt_resources(void)
+ +static struct notifier_block rdt_cpu_nb = {
+ +	.notifier_call  = rdt_cpu_notify,
+ +	.priority	= -INT_MAX,
+ +};
+ +
+ +static int __init rdt_notifier_init(void)
+  {
+ -	bool ret = false;
+ +	unsigned int cpu;
+ +
+++<<<<<<< HEAD
+ +	for_each_online_cpu(cpu) {
+ +		intel_rdt_online_cpu(cpu, false);
+ +		/*
+ +		 * RHEL7 - The upstream hotplug notification invokes the
+ +		 *         callbacks on related cpus, but that's not the
+ +		 *         case of the RHEL7 notification support.
+ +		 *         Following call ensures we run all the msr
+ +		 *         initialization setup on related cpus.
+ +		 */
+ +		smp_call_function_single(cpu, rdt_cpu_setup, NULL, 1);
+ +	}
+  
+ +	__register_cpu_notifier(&rdt_cpu_nb);
+ +	return 0;
+++=======
++ 	if (cache_alloc_hsw_probe())
++ 		return true;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_RDT_A))
++ 		return false;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
++ 		rdt_get_cache_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
++ 		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
++ 			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
++ 			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
++ 		}
++ 		ret = true;
++ 	}
++ 	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
++ 		/* CPUID 0x10.2 fields are same format at 0x10.1 */
++ 		rdt_get_cache_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
++ 		ret = true;
++ 	}
++ 	return ret;
+++>>>>>>> 2545e9f51ea8 (x86/intel_rdt: Cleanup namespace to support multiple resource types)
+  }
+  
+  static int __init intel_rdt_late_init(void)
+diff --git a/arch/x86/include/asm/intel_rdt.h b/arch/x86/include/asm/intel_rdt.h
+index 06f50d0ed14f..a49fd4239237 100644
+--- a/arch/x86/include/asm/intel_rdt.h
++++ b/arch/x86/include/asm/intel_rdt.h
+@@ -79,7 +79,7 @@ struct rftype {
+  * @capable:			Is this feature available on this machine
+  * @name:			Name to use in "schemata" file
+  * @num_closid:			Number of CLOSIDs available
+- * @max_cbm:			Largest Cache Bit Mask allowed
++ * @default_ctrl:		Specifies default cache cbm or mem b/w percent.
+  * @data_width:			Character width of data when displaying
+  * @min_cbm_bits:		Minimum number of consecutive bits to be set
+  *				in a cache bit mask
+@@ -97,7 +97,7 @@ struct rdt_resource {
+ 	int			num_closid;
+ 	int			cbm_len;
+ 	int			min_cbm_bits;
+-	u32			max_cbm;
++	u32			default_ctrl;
+ 	int			data_width;
+ 	struct list_head	domains;
+ 	int			msr_base;
+@@ -111,17 +111,17 @@ struct rdt_resource {
+  * @list:	all instances of this resource
+  * @id:		unique id for this instance
+  * @cpu_mask:	which cpus share this resource
+- * @cbm:	array of cache bit masks (indexed by CLOSID)
+- * @new_cbm:	new cbm value to be loaded
+- * @have_new_cbm: did user provide new_cbm for this domain
++ * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
++ * @new_ctrl:	new ctrl value to be loaded
++ * @have_new_ctrl: did user provide new_ctrl for this domain
+  */
+ struct rdt_domain {
+ 	struct list_head	list;
+ 	int			id;
+ 	struct cpumask		cpu_mask;
+-	u32			*cbm;
+-	u32			new_cbm;
+-	bool			have_new_cbm;
++	u32			*ctrl_val;
++	u32			new_ctrl;
++	bool			have_new_ctrl;
+ };
+ 
+ /**
+@@ -172,8 +172,8 @@ union cpuid_0x10_1_eax {
+ 	unsigned int full;
+ };
+ 
+-/* CPUID.(EAX=10H, ECX=ResID=1).EDX */
+-union cpuid_0x10_1_edx {
++/* CPUID.(EAX=10H, ECX=ResID).EDX */
++union cpuid_0x10_x_edx {
+ 	struct {
+ 		unsigned int cos_max:16;
+ 	} split;
+@@ -182,7 +182,7 @@ union cpuid_0x10_1_edx {
+ 
+ DECLARE_PER_CPU_READ_MOSTLY(int, cpu_closid);
+ 
+-void rdt_cbm_update(void *arg);
++void rdt_ctrl_update(void *arg);
+ struct rdtgroup *rdtgroup_kn_lock_live(struct kernfs_node *kn);
+ void rdtgroup_kn_unlock(struct kernfs_node *kn);
+ ssize_t rdtgroup_schemata_write(struct kernfs_open_file *of,
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+diff --git a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+index 13bdbbd81667..736ea79a6514 100644
+--- a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
++++ b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+@@ -518,12 +518,12 @@ static int rdt_num_closids_show(struct kernfs_open_file *of,
+ 	return 0;
+ }
+ 
+-static int rdt_cbm_mask_show(struct kernfs_open_file *of,
++static int rdt_default_ctrl_show(struct kernfs_open_file *of,
+ 			     struct seq_file *seq, void *v)
+ {
+ 	struct rdt_resource *r = of->kn->parent->priv;
+ 
+-	seq_printf(seq, "%x\n", r->max_cbm);
++	seq_printf(seq, "%x\n", r->default_ctrl);
+ 
+ 	return 0;
+ }
+@@ -550,7 +550,7 @@ static struct rftype res_info_files[] = {
+ 		.name		= "cbm_mask",
+ 		.mode		= 0444,
+ 		.kf_ops		= &rdtgroup_kf_single_ops,
+-		.seq_show	= rdt_cbm_mask_show,
++		.seq_show	= rdt_default_ctrl_show,
+ 	},
+ 	{
+ 		.name		= "min_cbm_bits",
+@@ -800,7 +800,7 @@ out:
+ 	return dentry;
+ }
+ 
+-static int reset_all_cbms(struct rdt_resource *r)
++static int reset_all_ctrls(struct rdt_resource *r)
+ {
+ 	struct msr_param msr_param;
+ 	cpumask_var_t cpu_mask;
+@@ -823,14 +823,14 @@ static int reset_all_cbms(struct rdt_resource *r)
+ 		cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
+ 
+ 		for (i = 0; i < r->num_closid; i++)
+-			d->cbm[i] = r->max_cbm;
++			d->ctrl_val[i] = r->default_ctrl;
+ 	}
+ 	cpu = get_cpu();
+ 	/* Update CBM on this cpu if it's in cpu_mask. */
+ 	if (cpumask_test_cpu(cpu, cpu_mask))
+-		rdt_cbm_update(&msr_param);
++		rdt_ctrl_update(&msr_param);
+ 	/* Update CBM on all other cpus in cpu_mask. */
+-	smp_call_function_many(cpu_mask, rdt_cbm_update, &msr_param, 1);
++	smp_call_function_many(cpu_mask, rdt_ctrl_update, &msr_param, 1);
+ 	put_cpu();
+ 
+ 	free_cpumask_var(cpu_mask);
+@@ -916,7 +916,7 @@ static void rdt_kill_sb(struct super_block *sb)
+ 
+ 	/*Put everything back to default values. */
+ 	for_each_enabled_rdt_resource(r)
+-		reset_all_cbms(r);
++		reset_all_ctrls(r);
+ 	cdp_disable();
+ 	rmdir_all_sub();
+ 	static_key_slow_dec(&rdt_enable_key);
+diff --git a/arch/x86/kernel/cpu/intel_rdt_schemata.c b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+index 8594db455aa1..7695179776ba 100644
+--- a/arch/x86/kernel/cpu/intel_rdt_schemata.c
++++ b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+@@ -38,7 +38,7 @@ static bool cbm_validate(unsigned long var, struct rdt_resource *r)
+ {
+ 	unsigned long first_bit, zero_bit;
+ 
+-	if (var == 0 || var > r->max_cbm)
++	if (var == 0 || var > r->default_ctrl)
+ 		return false;
+ 
+ 	first_bit = find_first_bit(&var, r->cbm_len);
+@@ -61,7 +61,7 @@ static int parse_cbm(char *buf, struct rdt_resource *r, struct rdt_domain *d)
+ 	unsigned long data;
+ 	int ret;
+ 
+-	if (d->have_new_cbm)
++	if (d->have_new_ctrl)
+ 		return -EINVAL;
+ 
+ 	ret = kstrtoul(buf, 16, &data);
+@@ -69,8 +69,8 @@ static int parse_cbm(char *buf, struct rdt_resource *r, struct rdt_domain *d)
+ 		return ret;
+ 	if (!cbm_validate(data, r))
+ 		return -EINVAL;
+-	d->new_cbm = data;
+-	d->have_new_cbm = true;
++	d->new_ctrl = data;
++	d->have_new_ctrl = true;
+ 
+ 	return 0;
+ }
+@@ -119,9 +119,9 @@ static int update_domains(struct rdt_resource *r, int closid)
+ 	msr_param.res = r;
+ 
+ 	list_for_each_entry(d, &r->domains, list) {
+-		if (d->have_new_cbm && d->new_cbm != d->cbm[closid]) {
++		if (d->have_new_ctrl && d->new_ctrl != d->ctrl_val[closid]) {
+ 			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
+-			d->cbm[closid] = d->new_cbm;
++			d->ctrl_val[closid] = d->new_ctrl;
+ 		}
+ 	}
+ 	if (cpumask_empty(cpu_mask))
+@@ -129,9 +129,9 @@ static int update_domains(struct rdt_resource *r, int closid)
+ 	cpu = get_cpu();
+ 	/* Update CBM on this cpu if it's in cpu_mask. */
+ 	if (cpumask_test_cpu(cpu, cpu_mask))
+-		rdt_cbm_update(&msr_param);
++		rdt_ctrl_update(&msr_param);
+ 	/* Update CBM on other cpus. */
+-	smp_call_function_many(cpu_mask, rdt_cbm_update, &msr_param, 1);
++	smp_call_function_many(cpu_mask, rdt_ctrl_update, &msr_param, 1);
+ 	put_cpu();
+ 
+ done:
+@@ -164,7 +164,7 @@ ssize_t rdtgroup_schemata_write(struct kernfs_open_file *of,
+ 
+ 	for_each_enabled_rdt_resource(r)
+ 		list_for_each_entry(dom, &r->domains, list)
+-			dom->have_new_cbm = false;
++			dom->have_new_ctrl = false;
+ 
+ 	while ((tok = strsep(&buf, "\n")) != NULL) {
+ 		resname = strsep(&tok, ":");
+@@ -208,7 +208,7 @@ static void show_doms(struct seq_file *s, struct rdt_resource *r, int closid)
+ 		if (sep)
+ 			seq_puts(s, ";");
+ 		seq_printf(s, "%d=%0*x", dom->id, max_data_width,
+-			   dom->cbm[closid]);
++			   dom->ctrl_val[closid]);
+ 		sep = true;
+ 	}
+ 	seq_puts(s, "\n");
