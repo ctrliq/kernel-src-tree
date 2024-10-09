@@ -1233,7 +1233,7 @@ int rxe_register_device(struct rxe_dev *rxe)
 	dev->owner = THIS_MODULE;
 	dev->node_type = RDMA_NODE_IB_CA;
 	dev->phys_port_cnt = 1;
-	dev->num_comp_vectors = RXE_NUM_COMP_VECTORS;
+	dev->num_comp_vectors = num_possible_cpus();
 	dev->dev.parent = rxe_dma_device(rxe);
 	dev->local_dma_lkey = 0;
 	dev->node_guid = rxe_node_guid(rxe);
