@@ -1,0 +1,357 @@
+amd-xgbe: Add support for VLAN filtering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 801c62d945c6121c0262924732e430f0553bfb37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/801c62d9.failed
+
+This patch adds support for (imperfect) filtering of
+VLAN tag ids using a 16-bit filter hash table.  When
+VLANs are added, a 4-bit hash is calculated with the
+result indicating the bit in the hash table to set.
+This table is used by the hardware to drop packets with
+a VLAN id that does not hash to a set bit in the table.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 801c62d945c6121c0262924732e430f0553bfb37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/Kconfig
+diff --cc drivers/net/ethernet/amd/Kconfig
+index 13d74aa4033d,8e83e4c8fff0..000000000000
+--- a/drivers/net/ethernet/amd/Kconfig
++++ b/drivers/net/ethernet/amd/Kconfig
+@@@ -179,4 -177,17 +179,20 @@@ config SUNLANC
+  	  To compile this driver as a module, choose M here: the module
+  	  will be called sunlance.
+  
+++<<<<<<< HEAD
+++=======
++ config AMD_XGBE
++ 	tristate "AMD 10GbE Ethernet driver"
++ 	depends on OF_NET
++ 	select PHYLIB
++ 	select AMD_XGBE_PHY
++ 	select BITREVERSE
++ 	---help---
++ 	  This driver supports the AMD 10GbE Ethernet device found on an
++ 	  AMD SoC.
++ 
++ 	  To compile this driver as a module, choose M here: the module
++ 	  will be called amd-xgbe.
++ 
+++>>>>>>> 801c62d945c6 (amd-xgbe: Add support for VLAN filtering)
+  endif # NET_VENDOR_AMD
+* Unmerged path drivers/net/ethernet/amd/Kconfig
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-common.h b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index 129d322977f1..1de9d0fc594a 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@ -393,6 +393,8 @@
+ #define MAC_PFR_PM_WIDTH		1
+ #define MAC_PFR_PR_INDEX		0
+ #define MAC_PFR_PR_WIDTH		1
++#define MAC_PFR_VTFE_INDEX		16
++#define MAC_PFR_VTFE_WIDTH		1
+ #define MAC_PMTCSR_MGKPKTEN_INDEX	1
+ #define MAC_PMTCSR_MGKPKTEN_WIDTH	1
+ #define MAC_PMTCSR_PWRDWN_INDEX		0
+@@ -427,6 +429,8 @@
+ #define MAC_TCR_SS_WIDTH		2
+ #define MAC_TCR_TE_INDEX		0
+ #define MAC_TCR_TE_WIDTH		1
++#define MAC_VLANHTR_VLHT_INDEX		0
++#define MAC_VLANHTR_VLHT_WIDTH		16
+ #define MAC_VLANIR_VLTI_INDEX		20
+ #define MAC_VLANIR_VLTI_WIDTH		1
+ #define MAC_VLANIR_CSVL_INDEX		19
+@@ -437,10 +441,18 @@
+ #define MAC_VLANTR_ERSVLM_WIDTH		1
+ #define MAC_VLANTR_ESVL_INDEX		18
+ #define MAC_VLANTR_ESVL_WIDTH		1
++#define MAC_VLANTR_ETV_INDEX		16
++#define MAC_VLANTR_ETV_WIDTH		1
+ #define MAC_VLANTR_EVLS_INDEX		21
+ #define MAC_VLANTR_EVLS_WIDTH		2
+ #define MAC_VLANTR_EVLRXS_INDEX		24
+ #define MAC_VLANTR_EVLRXS_WIDTH		1
++#define MAC_VLANTR_VL_INDEX		0
++#define MAC_VLANTR_VL_WIDTH		16
++#define MAC_VLANTR_VTHM_INDEX		25
++#define MAC_VLANTR_VTHM_WIDTH		1
++#define MAC_VLANTR_VTIM_INDEX		17
++#define MAC_VLANTR_VTIM_WIDTH		1
+ #define MAC_VR_DEVID_INDEX		8
+ #define MAC_VR_DEVID_WIDTH		8
+ #define MAC_VR_SNPSVER_INDEX		0
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index d0f437945dd4..2c7d582e0859 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@ -116,6 +116,7 @@
+ 
+ #include <linux/phy.h>
+ #include <linux/clk.h>
++#include <linux/bitrev.h>
+ 
+ #include "xgbe.h"
+ #include "xgbe-common.h"
+@@ -738,6 +739,89 @@ static int xgbe_disable_rx_vlan_stripping(struct xgbe_prv_data *pdata)
+ 	return 0;
+ }
+ 
++static int xgbe_enable_rx_vlan_filtering(struct xgbe_prv_data *pdata)
++{
++	/* Enable VLAN filtering */
++	XGMAC_IOWRITE_BITS(pdata, MAC_PFR, VTFE, 1);
++
++	/* Enable VLAN Hash Table filtering */
++	XGMAC_IOWRITE_BITS(pdata, MAC_VLANTR, VTHM, 1);
++
++	/* Disable VLAN tag inverse matching */
++	XGMAC_IOWRITE_BITS(pdata, MAC_VLANTR, VTIM, 0);
++
++	/* Only filter on the lower 12-bits of the VLAN tag */
++	XGMAC_IOWRITE_BITS(pdata, MAC_VLANTR, ETV, 1);
++
++	/* In order for the VLAN Hash Table filtering to be effective,
++	 * the VLAN tag identifier in the VLAN Tag Register must not
++	 * be zero.  Set the VLAN tag identifier to "1" to enable the
++	 * VLAN Hash Table filtering.  This implies that a VLAN tag of
++	 * 1 will always pass filtering.
++	 */
++	XGMAC_IOWRITE_BITS(pdata, MAC_VLANTR, VL, 1);
++
++	return 0;
++}
++
++static int xgbe_disable_rx_vlan_filtering(struct xgbe_prv_data *pdata)
++{
++	/* Disable VLAN filtering */
++	XGMAC_IOWRITE_BITS(pdata, MAC_PFR, VTFE, 0);
++
++	return 0;
++}
++
++#ifndef CRCPOLY_LE
++#define CRCPOLY_LE 0xedb88320
++#endif
++static u32 xgbe_vid_crc32_le(__le16 vid_le)
++{
++	u32 poly = CRCPOLY_LE;
++	u32 crc = ~0;
++	u32 temp = 0;
++	unsigned char *data = (unsigned char *)&vid_le;
++	unsigned char data_byte = 0;
++	int i, bits;
++
++	bits = get_bitmask_order(VLAN_VID_MASK);
++	for (i = 0; i < bits; i++) {
++		if ((i % 8) == 0)
++			data_byte = data[i / 8];
++
++		temp = ((crc & 1) ^ data_byte) & 1;
++		crc >>= 1;
++		data_byte >>= 1;
++
++		if (temp)
++			crc ^= poly;
++	}
++
++	return crc;
++}
++
++static int xgbe_update_vlan_hash_table(struct xgbe_prv_data *pdata)
++{
++	u32 crc;
++	u16 vid;
++	__le16 vid_le;
++	u16 vlan_hash_table = 0;
++
++	/* Generate the VLAN Hash Table value */
++	for_each_set_bit(vid, pdata->active_vlans, VLAN_N_VID) {
++		/* Get the CRC32 value of the VLAN ID */
++		vid_le = cpu_to_le16(vid);
++		crc = bitrev32(~xgbe_vid_crc32_le(vid_le)) >> 28;
++
++		vlan_hash_table |= (1 << crc);
++	}
++
++	/* Set the VLAN Hash Table filtering register */
++	XGMAC_IOWRITE_BITS(pdata, MAC_VLANHTR, VLHT, vlan_hash_table);
++
++	return 0;
++}
++
+ static void xgbe_tx_desc_reset(struct xgbe_ring_data *rdata)
+ {
+ 	struct xgbe_ring_desc *rdesc = rdata->rdesc;
+@@ -1547,6 +1631,14 @@ static void xgbe_config_vlan_support(struct xgbe_prv_data *pdata)
+ 	XGMAC_IOWRITE_BITS(pdata, MAC_VLANIR, CSVL, 0);
+ 	XGMAC_IOWRITE_BITS(pdata, MAC_VLANIR, VLTI, 1);
+ 
++	/* Set the current VLAN Hash Table register value */
++	xgbe_update_vlan_hash_table(pdata);
++
++	if (pdata->netdev->features & NETIF_F_HW_VLAN_CTAG_FILTER)
++		xgbe_enable_rx_vlan_filtering(pdata);
++	else
++		xgbe_disable_rx_vlan_filtering(pdata);
++
+ 	if (pdata->netdev->features & NETIF_F_HW_VLAN_CTAG_RX)
+ 		xgbe_enable_rx_vlan_stripping(pdata);
+ 	else
+@@ -2118,6 +2210,9 @@ void xgbe_init_function_ptrs_dev(struct xgbe_hw_if *hw_if)
+ 
+ 	hw_if->enable_rx_vlan_stripping = xgbe_enable_rx_vlan_stripping;
+ 	hw_if->disable_rx_vlan_stripping = xgbe_disable_rx_vlan_stripping;
++	hw_if->enable_rx_vlan_filtering = xgbe_enable_rx_vlan_filtering;
++	hw_if->disable_rx_vlan_filtering = xgbe_disable_rx_vlan_filtering;
++	hw_if->update_vlan_hash_table = xgbe_update_vlan_hash_table;
+ 
+ 	hw_if->read_mmd_regs = xgbe_read_mmd_regs;
+ 	hw_if->write_mmd_regs = xgbe_write_mmd_regs;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 0efb5062e271..2acc37c07d9b 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -1000,6 +1000,38 @@ static struct rtnl_link_stats64 *xgbe_get_stats64(struct net_device *netdev,
+ 	return s;
+ }
+ 
++static int xgbe_vlan_rx_add_vid(struct net_device *netdev, __be16 proto,
++				u16 vid)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct xgbe_hw_if *hw_if = &pdata->hw_if;
++
++	DBGPR("-->%s\n", __func__);
++
++	set_bit(vid, pdata->active_vlans);
++	hw_if->update_vlan_hash_table(pdata);
++
++	DBGPR("<--%s\n", __func__);
++
++	return 0;
++}
++
++static int xgbe_vlan_rx_kill_vid(struct net_device *netdev, __be16 proto,
++				 u16 vid)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct xgbe_hw_if *hw_if = &pdata->hw_if;
++
++	DBGPR("-->%s\n", __func__);
++
++	clear_bit(vid, pdata->active_vlans);
++	hw_if->update_vlan_hash_table(pdata);
++
++	DBGPR("<--%s\n", __func__);
++
++	return 0;
++}
++
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ static void xgbe_poll_controller(struct net_device *netdev)
+ {
+@@ -1022,26 +1054,26 @@ static int xgbe_set_features(struct net_device *netdev,
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+-	unsigned int rxcsum_enabled, rxvlan_enabled;
++	unsigned int rxcsum, rxvlan, rxvlan_filter;
+ 
+-	rxcsum_enabled = !!(pdata->netdev_features & NETIF_F_RXCSUM);
+-	rxvlan_enabled = !!(pdata->netdev_features & NETIF_F_HW_VLAN_CTAG_RX);
++	rxcsum = pdata->netdev_features & NETIF_F_RXCSUM;
++	rxvlan = pdata->netdev_features & NETIF_F_HW_VLAN_CTAG_RX;
++	rxvlan_filter = pdata->netdev_features & NETIF_F_HW_VLAN_CTAG_FILTER;
+ 
+-	if ((features & NETIF_F_RXCSUM) && !rxcsum_enabled) {
++	if ((features & NETIF_F_RXCSUM) && !rxcsum)
+ 		hw_if->enable_rx_csum(pdata);
+-		netdev_alert(netdev, "state change - rxcsum enabled\n");
+-	} else if (!(features & NETIF_F_RXCSUM) && rxcsum_enabled) {
++	else if (!(features & NETIF_F_RXCSUM) && rxcsum)
+ 		hw_if->disable_rx_csum(pdata);
+-		netdev_alert(netdev, "state change - rxcsum disabled\n");
+-	}
+ 
+-	if ((features & NETIF_F_HW_VLAN_CTAG_RX) && !rxvlan_enabled) {
++	if ((features & NETIF_F_HW_VLAN_CTAG_RX) && !rxvlan)
+ 		hw_if->enable_rx_vlan_stripping(pdata);
+-		netdev_alert(netdev, "state change - rxvlan enabled\n");
+-	} else if (!(features & NETIF_F_HW_VLAN_CTAG_RX) && rxvlan_enabled) {
++	else if (!(features & NETIF_F_HW_VLAN_CTAG_RX) && rxvlan)
+ 		hw_if->disable_rx_vlan_stripping(pdata);
+-		netdev_alert(netdev, "state change - rxvlan disabled\n");
+-	}
++
++	if ((features & NETIF_F_HW_VLAN_CTAG_FILTER) && !rxvlan_filter)
++		hw_if->enable_rx_vlan_filtering(pdata);
++	else if (!(features & NETIF_F_HW_VLAN_CTAG_FILTER) && rxvlan_filter)
++		hw_if->disable_rx_vlan_filtering(pdata);
+ 
+ 	pdata->netdev_features = features;
+ 
+@@ -1059,6 +1091,8 @@ static const struct net_device_ops xgbe_netdev_ops = {
+ 	.ndo_validate_addr	= eth_validate_addr,
+ 	.ndo_change_mtu		= xgbe_change_mtu,
+ 	.ndo_get_stats64	= xgbe_get_stats64,
++	.ndo_vlan_rx_add_vid	= xgbe_vlan_rx_add_vid,
++	.ndo_vlan_rx_kill_vid	= xgbe_vlan_rx_kill_vid,
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	.ndo_poll_controller	= xgbe_poll_controller,
+ #endif
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-main.c b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+index fefcbb6c69a8..c3a48b7c2aed 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-main.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+@@ -385,7 +385,8 @@ static int xgbe_probe(struct platform_device *pdev)
+ 			      NETIF_F_TSO6 |
+ 			      NETIF_F_GRO |
+ 			      NETIF_F_HW_VLAN_CTAG_RX |
+-			      NETIF_F_HW_VLAN_CTAG_TX;
++			      NETIF_F_HW_VLAN_CTAG_TX |
++			      NETIF_F_HW_VLAN_CTAG_FILTER;
+ 
+ 	netdev->vlan_features |= NETIF_F_SG |
+ 				 NETIF_F_IP_CSUM |
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index f5da54cddd8d..3cb911f39b60 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -121,6 +121,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/workqueue.h>
+ #include <linux/phy.h>
++#include <linux/if_vlan.h>
++#include <linux/bitops.h>
+ 
+ 
+ #define XGBE_DRV_NAME		"amd-xgbe"
+@@ -393,6 +395,9 @@ struct xgbe_hw_if {
+ 
+ 	int (*enable_rx_vlan_stripping)(struct xgbe_prv_data *);
+ 	int (*disable_rx_vlan_stripping)(struct xgbe_prv_data *);
++	int (*enable_rx_vlan_filtering)(struct xgbe_prv_data *);
++	int (*disable_rx_vlan_filtering)(struct xgbe_prv_data *);
++	int (*update_vlan_hash_table)(struct xgbe_prv_data *);
+ 
+ 	int (*read_mmd_regs)(struct xgbe_prv_data *, int, int);
+ 	void (*write_mmd_regs)(struct xgbe_prv_data *, int, int, int);
+@@ -588,6 +593,9 @@ struct xgbe_prv_data {
+ 	struct napi_struct napi;
+ 	struct xgbe_mmc_stats mmc_stats;
+ 
++	/* Filtering support */
++	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
++
+ 	/* System clock value used for Rx watchdog */
+ 	struct clk *sysclock;
+ 
