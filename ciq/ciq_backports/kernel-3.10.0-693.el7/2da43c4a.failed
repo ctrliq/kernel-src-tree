@@ -1,0 +1,204 @@
+RDS: TCP: make receive path use the rds_conn_path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit 2da43c4a1b517d02e71d9611a2242273e7d399ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2da43c4a.failed
+
+The ->sk_user_data contains a pointer to the rds_conn_path
+for the socket. Use this consistently in the rds_tcp_data_ready
+callbacks to get the rds_conn_path for rds_recv_incoming.
+
+	Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2da43c4a1b517d02e71d9611a2242273e7d399ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/rds.h
+#	net/rds/tcp.h
+#	net/rds/tcp_recv.c
+#	net/rds/threads.c
+diff --cc net/rds/rds.h
+index 8889455d9d7c,0faca3011370..000000000000
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@@ -448,9 -462,8 +448,14 @@@ struct rds_transport 
+  		    unsigned int hdr_off, unsigned int sg, unsigned int off);
+  	int (*xmit_rdma)(struct rds_connection *conn, struct rm_rdma_op *op);
+  	int (*xmit_atomic)(struct rds_connection *conn, struct rm_atomic_op *op);
+++<<<<<<< HEAD
+ +	int (*recv)(struct rds_connection *conn);
+ +	int (*inc_copy_to_user)(struct rds_incoming *inc, struct iovec *iov,
+ +				size_t size);
+++=======
++ 	int (*recv_path)(struct rds_conn_path *cp);
++ 	int (*inc_copy_to_user)(struct rds_incoming *inc, struct iov_iter *to);
+++>>>>>>> 2da43c4a1b51 (RDS: TCP: make receive path use the rds_conn_path)
+  	void (*inc_free)(struct rds_incoming *inc);
+  
+  	int (*cm_handle_connect)(struct rdma_cm_id *cm_id,
+diff --cc net/rds/tcp.h
+index 3949f2d1c41c,5a5f91abe1de..000000000000
+--- a/net/rds/tcp.h
++++ b/net/rds/tcp.h
+@@@ -74,17 -74,16 +74,22 @@@ int rds_tcp_keepalive(struct socket *so
+  /* tcp_recv.c */
+  int rds_tcp_recv_init(void);
+  void rds_tcp_recv_exit(void);
+++<<<<<<< HEAD
+ +void rds_tcp_data_ready(struct sock *sk, int bytes);
+ +int rds_tcp_recv(struct rds_connection *conn);
+++=======
++ void rds_tcp_data_ready(struct sock *sk);
++ int rds_tcp_recv_path(struct rds_conn_path *cp);
+++>>>>>>> 2da43c4a1b51 (RDS: TCP: make receive path use the rds_conn_path)
+  void rds_tcp_inc_free(struct rds_incoming *inc);
+ -int rds_tcp_inc_copy_to_user(struct rds_incoming *inc, struct iov_iter *to);
+ +int rds_tcp_inc_copy_to_user(struct rds_incoming *inc, struct iovec *iov,
+ +			     size_t size);
+  
+  /* tcp_send.c */
+ -void rds_tcp_xmit_path_prepare(struct rds_conn_path *cp);
+ -void rds_tcp_xmit_path_complete(struct rds_conn_path *cp);
+ +void rds_tcp_xmit_prepare(struct rds_connection *conn);
+ +void rds_tcp_xmit_complete(struct rds_connection *conn);
+  int rds_tcp_xmit(struct rds_connection *conn, struct rds_message *rm,
+ -		 unsigned int hdr_off, unsigned int sg, unsigned int off);
+ +	         unsigned int hdr_off, unsigned int sg, unsigned int off);
+  void rds_tcp_write_space(struct sock *sk);
+  
+  /* tcp_stats.c */
+diff --cc net/rds/tcp_recv.c
+index 288a3c443bdf,ad4892e97f91..000000000000
+--- a/net/rds/tcp_recv.c
++++ b/net/rds/tcp_recv.c
+@@@ -332,11 -316,11 +336,16 @@@ void rds_tcp_data_ready(struct sock *sk
+  	ready = tc->t_orig_data_ready;
+  	rds_tcp_stats_inc(s_tcp_data_ready_calls);
+  
+++<<<<<<< HEAD
+ +	if (rds_tcp_read_sock(conn, GFP_ATOMIC) == -ENOMEM)
+ +		queue_delayed_work(rds_wq, &conn->c_recv_w, 0);
+++=======
++ 	if (rds_tcp_read_sock(cp, GFP_ATOMIC) == -ENOMEM)
++ 		queue_delayed_work(rds_wq, &cp->cp_recv_w, 0);
+++>>>>>>> 2da43c4a1b51 (RDS: TCP: make receive path use the rds_conn_path)
+  out:
+ -	read_unlock_bh(&sk->sk_callback_lock);
+ -	ready(sk);
+ +	read_unlock(&sk->sk_callback_lock);
+ +	ready(sk, bytes);
+  }
+  
+  int rds_tcp_recv_init(void)
+diff --cc net/rds/threads.c
+index 55bb19ff40f2,f717b69e03f9..000000000000
+--- a/net/rds/threads.c
++++ b/net/rds/threads.c
+@@@ -189,12 -197,14 +189,18 @@@ void rds_send_worker(struct work_struc
+  
+  void rds_recv_worker(struct work_struct *work)
+  {
+ -	struct rds_conn_path *cp = container_of(work,
+ -						struct rds_conn_path,
+ -						cp_recv_w.work);
+ +	struct rds_connection *conn = container_of(work, struct rds_connection, c_recv_w.work);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (rds_conn_state(conn) == RDS_CONN_UP) {
+ +		ret = conn->c_trans->recv(conn);
+ +		rdsdebug("conn %p ret %d\n", conn, ret);
+++=======
++ 	if (rds_conn_path_state(cp) == RDS_CONN_UP) {
++ 		ret = cp->cp_conn->c_trans->recv_path(cp);
++ 		rdsdebug("conn %p ret %d\n", cp->cp_conn, ret);
+++>>>>>>> 2da43c4a1b51 (RDS: TCP: make receive path use the rds_conn_path)
+  		switch (ret) {
+  		case -EAGAIN:
+  			rds_stats_inc(s_recv_immediate_retry);
+diff --git a/net/rds/ib.c b/net/rds/ib.c
+index 6c6dd30d927b..09010eb538f8 100644
+--- a/net/rds/ib.c
++++ b/net/rds/ib.c
+@@ -383,7 +383,7 @@ struct rds_transport rds_ib_transport = {
+ 	.xmit			= rds_ib_xmit,
+ 	.xmit_rdma		= rds_ib_xmit_rdma,
+ 	.xmit_atomic		= rds_ib_xmit_atomic,
+-	.recv			= rds_ib_recv,
++	.recv_path		= rds_ib_recv_path,
+ 	.conn_alloc		= rds_ib_conn_alloc,
+ 	.conn_free		= rds_ib_conn_free,
+ 	.conn_connect		= rds_ib_conn_connect,
+diff --git a/net/rds/ib.h b/net/rds/ib.h
+index 33ec6a6553e1..07e2063922d8 100644
+--- a/net/rds/ib.h
++++ b/net/rds/ib.h
+@@ -354,7 +354,7 @@ void rds_ib_mr_cqe_handler(struct rds_ib_connection *ic, struct ib_wc *wc);
+ /* ib_recv.c */
+ int rds_ib_recv_init(void);
+ void rds_ib_recv_exit(void);
+-int rds_ib_recv(struct rds_connection *conn);
++int rds_ib_recv_path(struct rds_conn_path *conn);
+ int rds_ib_recv_alloc_caches(struct rds_ib_connection *ic);
+ void rds_ib_recv_free_caches(struct rds_ib_connection *ic);
+ void rds_ib_recv_refill(struct rds_connection *conn, int prefill, gfp_t gfp);
+diff --git a/net/rds/ib_recv.c b/net/rds/ib_recv.c
+index 40cf255a3bdb..f30a3516d04f 100644
+--- a/net/rds/ib_recv.c
++++ b/net/rds/ib_recv.c
+@@ -1024,8 +1024,9 @@ void rds_ib_recv_cqe_handler(struct rds_ib_connection *ic,
+ 		rds_ib_recv_refill(conn, 0, GFP_NOWAIT);
+ }
+ 
+-int rds_ib_recv(struct rds_connection *conn)
++int rds_ib_recv_path(struct rds_conn_path *cp)
+ {
++	struct rds_connection *conn = cp->cp_conn;
+ 	struct rds_ib_connection *ic = conn->c_transport_data;
+ 	int ret = 0;
+ 
+diff --git a/net/rds/loop.c b/net/rds/loop.c
+index 6b12b68541ae..99c80e7dad84 100644
+--- a/net/rds/loop.c
++++ b/net/rds/loop.c
+@@ -100,7 +100,7 @@ static void rds_loop_inc_free(struct rds_incoming *inc)
+ }
+ 
+ /* we need to at least give the thread something to succeed */
+-static int rds_loop_recv(struct rds_connection *conn)
++static int rds_loop_recv_path(struct rds_conn_path *cp)
+ {
+ 	return 0;
+ }
+@@ -183,7 +183,7 @@ void rds_loop_exit(void)
+  */
+ struct rds_transport rds_loop_transport = {
+ 	.xmit			= rds_loop_xmit,
+-	.recv			= rds_loop_recv,
++	.recv_path		= rds_loop_recv_path,
+ 	.conn_alloc		= rds_loop_conn_alloc,
+ 	.conn_free		= rds_loop_conn_free,
+ 	.conn_connect		= rds_loop_conn_connect,
+* Unmerged path net/rds/rds.h
+diff --git a/net/rds/tcp.c b/net/rds/tcp.c
+index 5ea4c0469433..7edd6eb196f8 100644
+--- a/net/rds/tcp.c
++++ b/net/rds/tcp.c
+@@ -339,7 +339,7 @@ struct rds_transport rds_tcp_transport = {
+ 	.xmit_prepare		= rds_tcp_xmit_prepare,
+ 	.xmit_complete		= rds_tcp_xmit_complete,
+ 	.xmit			= rds_tcp_xmit,
+-	.recv			= rds_tcp_recv,
++	.recv_path		= rds_tcp_recv_path,
+ 	.conn_alloc		= rds_tcp_conn_alloc,
+ 	.conn_free		= rds_tcp_conn_free,
+ 	.conn_connect		= rds_tcp_conn_connect,
+* Unmerged path net/rds/tcp.h
+* Unmerged path net/rds/tcp_recv.c
+* Unmerged path net/rds/threads.c
