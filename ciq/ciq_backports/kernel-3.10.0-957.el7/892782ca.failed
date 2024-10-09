@@ -1,0 +1,492 @@
+tcmu: allow userspace to reset ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 892782caf19a97ccc95df51b3bb659ecacff986a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/892782ca.failed
+
+This patch adds 2 tcmu attrs to block/unblock a device and
+reset the ring buffer. They are used when the userspace
+daemon has crashed or forced to shutdown while IO is executing.
+On restart, the daemon can block the device so new IO is not
+sent to userspace while it puts the ring in a clean state.
+
+Notes: The reset ring opreation is specific to tcmu, but the
+block one could be generic. I kept it tcmu specific, because
+it requires some extra locking/state checks in the main IO
+path and since other backend modules did not need this
+functionality I thought only tcmu should take the perf hit.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 892782caf19a97ccc95df51b3bb659ecacff986a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 07b665cb5768,511168bec159..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -601,10 -872,19 +602,24 @@@ tcmu_queue_cmd_ring(struct tcmu_cmd *tc
+  	uint32_t cmd_head;
+  	uint64_t cdb_off;
+  	bool copy_to_data_area;
+ -	size_t data_length = tcmu_cmd_get_data_length(tcmu_cmd);
+ +	size_t data_length;
+  
+++<<<<<<< HEAD
+ +	if (test_bit(TCMU_DEV_BIT_BROKEN, &udev->flags))
+ +		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+++=======
++ 	*scsi_err = TCM_NO_SENSE;
++ 
++ 	if (test_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags)) {
++ 		*scsi_err = TCM_LUN_BUSY;
++ 		return -1;
++ 	}
++ 
++ 	if (test_bit(TCMU_DEV_BIT_BROKEN, &udev->flags)) {
++ 		*scsi_err = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 		return -1;
++ 	}
+++>>>>>>> 892782caf19a (tcmu: allow userspace to reset ring)
+  
+  	/*
+  	 * Must be a certain minimum size for response sense info, but
+@@@ -973,11 -1264,81 +988,86 @@@ static struct se_device *tcmu_alloc_dev
+  	return &udev->se_dev;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool run_cmdr_queue(struct tcmu_dev *udev, bool fail)
++ {
++ 	struct tcmu_cmd *tcmu_cmd, *tmp_cmd;
++ 	LIST_HEAD(cmds);
++ 	bool drained = true;
++ 	sense_reason_t scsi_ret;
++ 	int ret;
++ 
++ 	if (list_empty(&udev->cmdr_queue))
++ 		return true;
++ 
++ 	pr_debug("running %s's cmdr queue forcefail %d\n", udev->name, fail);
++ 
++ 	list_splice_init(&udev->cmdr_queue, &cmds);
++ 
++ 	list_for_each_entry_safe(tcmu_cmd, tmp_cmd, &cmds, cmdr_queue_entry) {
++ 		list_del_init(&tcmu_cmd->cmdr_queue_entry);
++ 
++ 	        pr_debug("removing cmd %u on dev %s from queue\n",
++ 		         tcmu_cmd->cmd_id, udev->name);
++ 
++ 		if (fail) {
++ 			idr_remove(&udev->commands, tcmu_cmd->cmd_id);
++ 			/*
++ 			 * We were not able to even start the command, so
++ 			 * fail with busy to allow a retry in case runner
++ 			 * was only temporarily down. If the device is being
++ 			 * removed then LIO core will do the right thing and
++ 			 * fail the retry.
++ 			 */
++ 			target_complete_cmd(tcmu_cmd->se_cmd, SAM_STAT_BUSY);
++ 			tcmu_free_cmd(tcmu_cmd);
++ 			continue;
++ 		}
++ 
++ 		ret = queue_cmd_ring(tcmu_cmd, &scsi_ret);
++ 		if (ret < 0) {
++ 		        pr_debug("cmd %u on dev %s failed with %u\n",
++ 			         tcmu_cmd->cmd_id, udev->name, scsi_ret);
++ 
++ 			idr_remove(&udev->commands, tcmu_cmd->cmd_id);
++ 			/*
++ 			 * Ignore scsi_ret for now. target_complete_cmd
++ 			 * drops it.
++ 			 */
++ 			target_complete_cmd(tcmu_cmd->se_cmd,
++ 					    SAM_STAT_CHECK_CONDITION);
++ 			tcmu_free_cmd(tcmu_cmd);
++ 		} else if (ret > 0) {
++ 			pr_debug("ran out of space during cmdr queue run\n");
++ 			/*
++ 			 * cmd was requeued, so just put all cmds back in
++ 			 * the queue
++ 			 */
++ 			list_splice_tail(&cmds, &udev->cmdr_queue);
++ 			drained = false;
++ 			goto done;
++ 		}
++ 	}
++ 	if (list_empty(&udev->cmdr_queue))
++ 		del_timer(&udev->qfull_timer);
++ done:
++ 	return drained;
++ }
++ 
+++>>>>>>> 892782caf19a (tcmu: allow userspace to reset ring)
+  static int tcmu_irqcontrol(struct uio_info *info, s32 irq_on)
+  {
+ -	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+ +	struct tcmu_dev *tcmu_dev = container_of(info, struct tcmu_dev, uio_info);
+  
+++<<<<<<< HEAD
+ +	tcmu_handle_completions(tcmu_dev);
+++=======
++ 	mutex_lock(&udev->cmdr_lock);
++ 	tcmu_handle_completions(udev);
++ 	run_cmdr_queue(udev, false);
++ 	mutex_unlock(&udev->cmdr_lock);
+++>>>>>>> 892782caf19a (tcmu: allow userspace to reset ring)
+  
+  	return 0;
+  }
+@@@ -1322,41 -1805,97 +1412,113 @@@ static bool tcmu_dev_configured(struct 
+  static void tcmu_destroy_device(struct se_device *dev)
+  {
+  	struct tcmu_dev *udev = TCMU_DEV(dev);
+ +	struct tcmu_cmd *cmd;
+ +	bool all_expired = true;
+ +	int i;
+ +
+ +	del_timer_sync(&udev->timeout);
+  
+ -	del_timer_sync(&udev->cmd_timer);
+ -	del_timer_sync(&udev->qfull_timer);
+ +	if (tcmu_dev_configured(udev)) {
+ +		tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE, 0, NULL);
+  
+ -	mutex_lock(&root_udev_mutex);
+ -	list_del(&udev->node);
+ -	mutex_unlock(&root_udev_mutex);
+ +		uio_unregister_device(&udev->uio_info);
+ +		kfree(udev->uio_info.name);
+ +		kfree(udev->name);
+  
+ -	tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE, 0, NULL);
+ +		mutex_lock(&device_mutex);
+ +		idr_remove(&devices_idr, udev->dev_index);
+ +		mutex_unlock(&device_mutex);
+ +	}
+  
+ -	uio_unregister_device(&udev->uio_info);
+ +	vfree(udev->mb_addr);
+  
+ -	/* release ref from configure */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ +	/* Upper layer should drain all requests before calling this */
+ +	spin_lock_irq(&udev->commands_lock);
+ +	idr_for_each_entry(&udev->commands, cmd, i) {
+ +		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
+ +			all_expired = false;
+ +	}
+ +	idr_destroy(&udev->commands);
+ +	spin_unlock_irq(&udev->commands_lock);
+ +	WARN_ON(!all_expired);
+ +	kfree(udev->data_bitmap);
+  }
+  
++ static void tcmu_unblock_dev(struct tcmu_dev *udev)
++ {
++ 	mutex_lock(&udev->cmdr_lock);
++ 	clear_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags);
++ 	mutex_unlock(&udev->cmdr_lock);
++ }
++ 
++ static void tcmu_block_dev(struct tcmu_dev *udev)
++ {
++ 	mutex_lock(&udev->cmdr_lock);
++ 
++ 	if (test_and_set_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags))
++ 		goto unlock;
++ 
++ 	/* complete IO that has executed successfully */
++ 	tcmu_handle_completions(udev);
++ 	/* fail IO waiting to be queued */
++ 	run_cmdr_queue(udev, true);
++ 
++ unlock:
++ 	mutex_unlock(&udev->cmdr_lock);
++ }
++ 
++ static void tcmu_reset_ring(struct tcmu_dev *udev, u8 err_level)
++ {
++ 	struct tcmu_mailbox *mb;
++ 	struct tcmu_cmd *cmd;
++ 	int i;
++ 
++ 	mutex_lock(&udev->cmdr_lock);
++ 
++ 	idr_for_each_entry(&udev->commands, cmd, i) {
++ 		if (!list_empty(&cmd->cmdr_queue_entry))
++ 			continue;
++ 
++ 		pr_debug("removing cmd %u on dev %s from ring (is expired %d)\n",
++ 			  cmd->cmd_id, udev->name,
++ 			  test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags));
++ 
++ 		idr_remove(&udev->commands, i);
++ 		if (!test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
++ 			if (err_level == 1) {
++ 				/*
++ 				 * Userspace was not able to start the
++ 				 * command or it is retryable.
++ 				 */
++ 				target_complete_cmd(cmd->se_cmd, SAM_STAT_BUSY);
++ 			} else {
++ 				/* hard failure */
++ 				target_complete_cmd(cmd->se_cmd,
++ 						    SAM_STAT_CHECK_CONDITION);
++ 			}
++ 		}
++ 		tcmu_cmd_free_data(cmd, cmd->dbi_cnt);
++ 		tcmu_free_cmd(cmd);
++ 	}
++ 
++ 	mb = udev->mb_addr;
++ 	tcmu_flush_dcache_range(mb, sizeof(*mb));
++ 	pr_debug("mb last %u head %u tail %u\n", udev->cmdr_last_cleaned,
++ 		 mb->cmd_tail, mb->cmd_head);
++ 
++ 	udev->cmdr_last_cleaned = 0;
++ 	mb->cmd_tail = 0;
++ 	mb->cmd_head = 0;
++ 	tcmu_flush_dcache_range(mb, sizeof(*mb));
++ 
++ 	del_timer(&udev->cmd_timer);
++ 
++ 	mutex_unlock(&udev->cmdr_lock);
++ }
++ 
+  enum {
+  	Opt_dev_config, Opt_dev_size, Opt_hw_block_size, Opt_hw_max_sectors,
+ -	Opt_nl_reply_supported, Opt_max_data_area_mb, Opt_err,
+ +	Opt_max_data_area_mb, Opt_err,
+  };
+  
+  static match_table_t tokens = {
+@@@ -1623,12 -2235,119 +1785,76 @@@ static ssize_t tcmu_max_data_area_mb_sh
+  	struct se_dev_attrib *da = container_of(to_config_group(item),
+  						struct se_dev_attrib, da_group);
+  	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ -	s8 val;
+ -	int ret;
+ -
+ -	ret = kstrtos8(page, 0, &val);
+ -	if (ret < 0)
+ -		return ret;
+ -
+ -	udev->nl_reply_supported = val;
+ -	return count;
+ -}
+ -CONFIGFS_ATTR(tcmu_, nl_reply_supported);
+ -
+ -static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
+ -					     char *page)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -					struct se_dev_attrib, da_group);
+ -
+ -	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
+ -}
+ -
+ -static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
+ -					      const char *page, size_t count)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -					struct se_dev_attrib, da_group);
+ -	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ -	u8 val;
+ -	int ret;
+ -
+ -	ret = kstrtou8(page, 0, &val);
+ -	if (ret < 0)
+ -		return ret;
+  
+ -	/* Check if device has been configured before */
+ -	if (tcmu_dev_configured(udev)) {
+ -		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
+ -					 TCMU_ATTR_WRITECACHE, &val);
+ -		if (ret) {
+ -			pr_err("Unable to reconfigure device\n");
+ -			return ret;
+ -		}
+ -	}
+ -
+ -	da->emulate_write_cache = val;
+ -	return count;
+ +	return snprintf(page, PAGE_SIZE, "%u\n",
+ +			TCMU_BLOCKS_TO_MBS(udev->max_blocks));
+  }
+ -CONFIGFS_ATTR(tcmu_, emulate_write_cache);
+ +CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
+  
++ static ssize_t tcmu_block_dev_show(struct config_item *item, char *page)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 
++ 	if (test_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags))
++ 		return snprintf(page, PAGE_SIZE, "%s\n", "blocked");
++ 	else
++ 		return snprintf(page, PAGE_SIZE, "%s\n", "unblocked");
++ }
++ 
++ static ssize_t tcmu_block_dev_store(struct config_item *item, const char *page,
++ 				    size_t count)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val > 1) {
++ 		pr_err("Invalid block value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!val)
++ 		tcmu_unblock_dev(udev);
++ 	else
++ 		tcmu_block_dev(udev);
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, block_dev);
++ 
++ static ssize_t tcmu_reset_ring_store(struct config_item *item, const char *page,
++ 				     size_t count)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val != 1 && val != 2) {
++ 		pr_err("Invalid reset ring value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	tcmu_reset_ring(udev, val);
++ 	return count;
++ }
++ CONFIGFS_ATTR_WO(tcmu_, reset_ring);
++ 
+  static struct configfs_attribute *tcmu_attrib_attrs[] = {
+  	&tcmu_attr_cmd_time_out,
+  	&tcmu_attr_qfull_time_out,
+@@@ -1654,9 -2382,95 +1886,9 @@@ static struct target_backend_ops tcmu_o
+  	.show_configfs_dev_params = tcmu_show_configfs_dev_params,
+  	.get_device_type	= sbc_get_device_type,
+  	.get_blocks		= tcmu_get_blocks,
+- 	.tb_dev_attrib_attrs	= NULL,
++ 	.tb_dev_action_attrs	= tcmu_action_attrs,
+  };
+  
+ -static void find_free_blocks(void)
+ -{
+ -	struct tcmu_dev *udev;
+ -	loff_t off;
+ -	u32 start, end, block, total_freed = 0;
+ -
+ -	if (atomic_read(&global_db_count) <= tcmu_global_max_blocks)
+ -		return;
+ -
+ -	mutex_lock(&root_udev_mutex);
+ -	list_for_each_entry(udev, &root_udev, node) {
+ -		mutex_lock(&udev->cmdr_lock);
+ -
+ -		/* Try to complete the finished commands first */
+ -		tcmu_handle_completions(udev);
+ -
+ -		/* Skip the udevs in idle */
+ -		if (!udev->dbi_thresh) {
+ -			mutex_unlock(&udev->cmdr_lock);
+ -			continue;
+ -		}
+ -
+ -		end = udev->dbi_max + 1;
+ -		block = find_last_bit(udev->data_bitmap, end);
+ -		if (block == udev->dbi_max) {
+ -			/*
+ -			 * The last bit is dbi_max, so it is not possible
+ -			 * reclaim any blocks.
+ -			 */
+ -			mutex_unlock(&udev->cmdr_lock);
+ -			continue;
+ -		} else if (block == end) {
+ -			/* The current udev will goto idle state */
+ -			udev->dbi_thresh = start = 0;
+ -			udev->dbi_max = 0;
+ -		} else {
+ -			udev->dbi_thresh = start = block + 1;
+ -			udev->dbi_max = block;
+ -		}
+ -
+ -		/* Here will truncate the data area from off */
+ -		off = udev->data_off + start * DATA_BLOCK_SIZE;
+ -		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
+ -
+ -		/* Release the block pages */
+ -		tcmu_blocks_release(&udev->data_blocks, start, end);
+ -		mutex_unlock(&udev->cmdr_lock);
+ -
+ -		total_freed += end - start;
+ -		pr_debug("Freed %u blocks (total %u) from %s.\n", end - start,
+ -			 total_freed, udev->name);
+ -	}
+ -	mutex_unlock(&root_udev_mutex);
+ -
+ -	if (atomic_read(&global_db_count) > tcmu_global_max_blocks)
+ -		schedule_delayed_work(&tcmu_unmap_work, msecs_to_jiffies(5000));
+ -}
+ -
+ -static void check_timedout_devices(void)
+ -{
+ -	struct tcmu_dev *udev, *tmp_dev;
+ -	LIST_HEAD(devs);
+ -
+ -	spin_lock_bh(&timed_out_udevs_lock);
+ -	list_splice_init(&timed_out_udevs, &devs);
+ -
+ -	list_for_each_entry_safe(udev, tmp_dev, &devs, timedout_entry) {
+ -		list_del_init(&udev->timedout_entry);
+ -		spin_unlock_bh(&timed_out_udevs_lock);
+ -
+ -		mutex_lock(&udev->cmdr_lock);
+ -		idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
+ -		mutex_unlock(&udev->cmdr_lock);
+ -
+ -		spin_lock_bh(&timed_out_udevs_lock);
+ -	}
+ -
+ -	spin_unlock_bh(&timed_out_udevs_lock);
+ -}
+ -
+ -static void tcmu_unmap_work_fn(struct work_struct *work)
+ -{
+ -	check_timedout_devices();
+ -	find_free_blocks();
+ -}
+ -
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+* Unmerged path drivers/target/target_core_user.c
