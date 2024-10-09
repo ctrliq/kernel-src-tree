@@ -1,0 +1,360 @@
+net/mlx5e: Use linear SKB in Striding RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Use linear SKB in Striding RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 94.74%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 619a8f2a42f1031cdbd74435b6a9191eb4913139
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/619a8f2a.failed
+
+Current Striding RQ HW feature utilizes the RX buffers so that
+there is no wasted room between the strides. This maximises
+the memory utilization.
+This prevents the use of build_skb() (which requires headroom
+and tailroom), and demands to memcpy the packets headers into
+the skb linear part.
+
+In this patch, whenever a set of conditions holds, we apply
+an RQ configuration that allows combining the use of linear SKB
+on top of a Striding RQ.
+
+To use build_skb() with Striding RQ, the following must hold:
+1. packet does not cross a page boundary.
+2. there is enough headroom and tailroom surrounding the packet.
+
+We can satisfy 1 and 2 by configuring:
+	stride size = MTU + headroom + tailoom.
+
+This is possible only when:
+a. (MTU - headroom - tailoom) does not exceed PAGE_SIZE.
+b. HW LRO is turned off.
+
+Using linear SKB has many advantages:
+- Saves a memcpy of the headers.
+- No page-boundary checks in datapath.
+- No filler CQEs.
+- Significantly smaller CQ.
+- SKB data continuously resides in linear part, and not split to
+  small amount (linear part) and large amount (fragment).
+  This saves datapath cycles in driver and improves utilization
+  of SKB fragments in GRO.
+- The fragments of a resulting GRO SKB follow the IP forwarding
+  assumption of equal-size fragments.
+
+Some implementation details:
+HW writes the packets to the beginning of a stride,
+i.e. does not keep headroom. To overcome this we make sure we can
+extend backwards and use the last bytes of stride i-1.
+Extra care is needed for stride 0 as it has no preceding stride.
+We make sure headroom bytes are available by shifting the buffer
+pointer passed to HW by headroom bytes.
+
+This configuration now becomes default, whenever capable.
+Of course, this implies turning LRO off.
+
+Performance testing:
+ConnectX-5, single core, single RX ring, default MTU.
+
+UDP packet rate, early drop in TC layer:
+
+--------------------------------------------
+| pkt size | before    | after     | ratio |
+--------------------------------------------
+| 1500byte | 4.65 Mpps | 5.96 Mpps | 1.28x |
+|  500byte | 5.23 Mpps | 5.97 Mpps | 1.14x |
+|   64byte | 5.94 Mpps | 5.96 Mpps | 1.00x |
+--------------------------------------------
+
+TCP streams: ~20% gain
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 619a8f2a42f1031cdbd74435b6a9191eb4913139)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 62b38cfe3313,d26dd4bc89f4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -498,7 -494,7 +501,11 @@@ struct mlx5e_rq 
+  		} wqe;
+  		struct {
+  			struct mlx5e_mpw_info *info;
+++<<<<<<< HEAD
+ +			void                  *mtt_no_align;
+++=======
++ 			mlx5e_fp_skb_from_cqe_mpwrq skb_from_cqe_mpwrq;
+++>>>>>>> 619a8f2a42f1 (net/mlx5e: Use linear SKB in Striding RQ)
+  			u16                    num_strides;
+  			u8                     log_stride_sz;
+  			bool                   umr_in_progress;
+@@@ -846,12 -838,13 +853,18 @@@ bool mlx5e_post_rx_mpwqes(struct mlx5e_
+  void mlx5e_dealloc_rx_wqe(struct mlx5e_rq *rq, u16 ix);
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix);
+  void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi);
++ struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				u16 cqe_bcnt, u32 head_offset, u32 page_idx);
++ struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				   u16 cqe_bcnt, u32 head_offset, u32 page_idx);
+  
+ +u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
+ +				   struct mlx5e_params *params);
+ +u8 mlx5e_mpwqe_get_log_num_strides(struct mlx5_core_dev *mdev,
+ +				   struct mlx5e_params *params);
+ +
+  void mlx5e_update_stats(struct mlx5e_priv *priv);
+  
+  int mlx5e_create_flow_steering(struct mlx5e_priv *priv);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 40f65e70ce7f,bba2fa0aa15f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -80,14 -73,76 +80,70 @@@ struct mlx5e_channel_param 
+  
+  bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
+  {
+ -	bool striding_rq_umr = MLX5_CAP_GEN(mdev, striding_rq) &&
+ +	return MLX5_CAP_GEN(mdev, striding_rq) &&
+  		MLX5_CAP_GEN(mdev, umr_ptr_rlky) &&
+  		MLX5_CAP_ETH(mdev, reg_umr_sq);
+ -	u16 max_wqe_sz_cap = MLX5_CAP_GEN(mdev, max_wqe_sz_sq);
+ -	bool inline_umr = MLX5E_UMR_WQE_INLINE_SZ <= max_wqe_sz_cap;
+ -
+ -	if (!striding_rq_umr)
+ -		return false;
+ -	if (!inline_umr) {
+ -		mlx5_core_warn(mdev, "Cannot support Striding RQ: UMR WQE size (%d) exceeds maximum supported (%d).\n",
+ -			       (int)MLX5E_UMR_WQE_INLINE_SZ, max_wqe_sz_cap);
+ -		return false;
+ -	}
+ -	return true;
+  }
+  
+++<<<<<<< HEAD
+ +u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
+ +				   struct mlx5e_params *params)
+++=======
++ static u32 mlx5e_mpwqe_get_linear_frag_sz(struct mlx5e_params *params)
+  {
++ 	if (!params->xdp_prog) {
++ 		u16 hw_mtu = MLX5E_SW2HW_MTU(params, params->sw_mtu);
++ 		u16 rq_headroom = MLX5_RX_HEADROOM + NET_IP_ALIGN;
++ 
++ 		return MLX5_SKB_FRAG_SZ(rq_headroom + hw_mtu);
++ 	}
++ 
++ 	return PAGE_SIZE;
++ }
++ 
++ static u8 mlx5e_mpwqe_log_pkts_per_wqe(struct mlx5e_params *params)
++ {
++ 	u32 linear_frag_sz = mlx5e_mpwqe_get_linear_frag_sz(params);
++ 
++ 	return MLX5_MPWRQ_LOG_WQE_SZ - order_base_2(linear_frag_sz);
++ }
++ 
++ static bool mlx5e_rx_mpwqe_is_linear_skb(struct mlx5_core_dev *mdev,
++ 					 struct mlx5e_params *params)
++ {
++ 	u32 frag_sz = mlx5e_mpwqe_get_linear_frag_sz(params);
++ 	s8 signed_log_num_strides_param;
++ 	u8 log_num_strides;
++ 
++ 	if (params->lro_en || frag_sz > PAGE_SIZE)
++ 		return false;
++ 
++ 	if (MLX5_CAP_GEN(mdev, ext_stride_num_range))
++ 		return true;
++ 
++ 	log_num_strides = MLX5_MPWRQ_LOG_WQE_SZ - order_base_2(frag_sz);
++ 	signed_log_num_strides_param =
++ 		(s8)log_num_strides - MLX5_MPWQE_LOG_NUM_STRIDES_BASE;
++ 
++ 	return signed_log_num_strides_param >= 0;
++ }
++ 
++ static u8 mlx5e_mpwqe_get_log_rq_size(struct mlx5e_params *params)
++ {
++ 	if (params->log_rq_mtu_frames <
++ 	    mlx5e_mpwqe_log_pkts_per_wqe(params) + MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW)
++ 		return MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW;
++ 
++ 	return params->log_rq_mtu_frames - mlx5e_mpwqe_log_pkts_per_wqe(params);
++ }
++ 
++ static u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
++ 					  struct mlx5e_params *params)
+++>>>>>>> 619a8f2a42f1 (net/mlx5e: Use linear SKB in Striding RQ)
++ {
++ 	if (mlx5e_rx_mpwqe_is_linear_skb(mdev, params))
++ 		return order_base_2(mlx5e_mpwqe_get_linear_frag_sz(params));
++ 
+  	return MLX5E_MPWQE_STRIDE_SZ(mdev,
+  		MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS));
+  }
+@@@ -116,25 -175,23 +176,31 @@@ void mlx5e_init_rq_type_params(struct m
+  			       struct mlx5e_params *params)
+  {
+  	params->lro_wqe_sz = MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ;
+ -	params->log_rq_mtu_frames = is_kdump_kernel() ?
+ -		MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE :
+ -		MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
+  	switch (params->rq_wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ +		params->log_rq_size = is_kdump_kernel() ?
+ +			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW :
+ +			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE_MPW;
+  		break;
+  	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+ +		params->log_rq_size = is_kdump_kernel() ?
+ +			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE :
+ +			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
+ +
+  		/* Extra room needed for build_skb */
+- 		params->lro_wqe_sz -= mlx5e_get_rq_headroom(params) +
++ 		params->lro_wqe_sz -= mlx5e_get_rq_headroom(mdev, params) +
+  			SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+  	}
+  
+  	mlx5_core_info(mdev, "MLX5E: StrdRq(%d) RqSz(%ld) StrdSz(%ld) RxCqeCmprss(%d)\n",
+  		       params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ,
+++<<<<<<< HEAD
+ +		       BIT(params->log_rq_size),
+++=======
++ 		       params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ ?
++ 		       BIT(mlx5e_mpwqe_get_log_rq_size(params)) :
++ 		       BIT(params->log_rq_mtu_frames),
+++>>>>>>> 619a8f2a42f1 (net/mlx5e: Use linear SKB in Striding RQ)
+  		       BIT(mlx5e_mpwqe_get_log_stride_size(mdev, params)),
+  		       MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS));
+  }
+@@@ -436,8 -429,12 +502,8 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  		goto err_rq_wq_destroy;
+  	}
+  
+ -	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq->ix);
+ -	if (err < 0)
+ -		goto err_rq_wq_destroy;
+ -
+  	rq->buff.map_dir = rq->xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+- 	rq->buff.headroom = mlx5e_get_rq_headroom(params);
++ 	rq->buff.headroom = mlx5e_get_rq_headroom(mdev, params);
+  
+  	switch (rq->wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+@@@ -1767,10 -1871,13 +1836,12 @@@ static void mlx5e_build_rq_param(struc
+  	switch (params->rq_wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+  		MLX5_SET(wq, wq, log_wqe_num_of_strides,
+- 			 mlx5e_mpwqe_get_log_num_strides(mdev, params) - 9);
++ 			 mlx5e_mpwqe_get_log_num_strides(mdev, params) -
++ 			 MLX5_MPWQE_LOG_NUM_STRIDES_BASE);
+  		MLX5_SET(wq, wq, log_wqe_stride_size,
+- 			 mlx5e_mpwqe_get_log_stride_size(mdev, params) - 6);
++ 			 mlx5e_mpwqe_get_log_stride_size(mdev, params) -
++ 			 MLX5_MPWQE_LOG_STRIDE_SZ_BASE);
+  		MLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ);
+ -		MLX5_SET(wq, wq, log_wq_sz, mlx5e_mpwqe_get_log_rq_size(params));
+  		break;
+  	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+  		MLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_LINKED_LIST);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index c00c27e0cf7c,07db8a58d0a2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -893,11 -885,9 +911,15 @@@ struct sk_buff *skb_from_cqe(struct mlx
+  	if (consumed)
+  		return NULL; /* page/packet was consumed by XDP */
+  
+++<<<<<<< HEAD
+ +	skb = build_skb(va, frag_size);
+ +	if (unlikely(!skb)) {
+ +		rq->stats->buff_alloc_err++;
+++=======
++ 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt);
++ 	if (unlikely(!skb))
+++>>>>>>> 619a8f2a42f1 (net/mlx5e: Use linear SKB in Striding RQ)
+  		return NULL;
+- 	}
+  
+  	/* queue up for recycling/reuse */
+  	page_ref_inc(di->page);
+@@@ -1052,18 -1076,13 +1108,25 @@@ void mlx5e_handle_rx_cqe_mpwrq(struct m
+  		goto mpwrq_cqe_out;
+  	}
+  
+++<<<<<<< HEAD
+ +	skb = napi_alloc_skb(rq->cq.napi,
+ +			     ALIGN(MLX5_MPWRQ_SMALL_PACKET_THRESHOLD,
+ +				   sizeof(long)));
+ +	if (unlikely(!skb)) {
+ +		rq->stats->buff_alloc_err++;
+ +		goto mpwrq_cqe_out;
+ +	}
+ +
+ +	prefetchw(skb->data);
+++=======
+++>>>>>>> 619a8f2a42f1 (net/mlx5e: Use linear SKB in Striding RQ)
+  	cqe_bcnt = mpwrq_get_cqe_byte_cnt(cqe);
+  
+- 	mlx5e_mpwqe_fill_rx_skb(rq, cqe, wi, cqe_bcnt, skb);
++ 	skb = rq->mpwqe.skb_from_cqe_mpwrq(rq, wi, cqe_bcnt, head_offset,
++ 					   page_idx);
++ 	if (unlikely(!skb))
++ 		goto mpwrq_cqe_out;
++ 
+  	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
+  	napi_gro_receive(rq->cq.napi, skb);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/include/linux/mlx5/device.h b/include/linux/mlx5/device.h
+index 38ace22b52ae..454c9cd38110 100644
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -782,6 +782,9 @@ static inline u64 get_cqe_ts(struct mlx5_cqe64 *cqe)
+ 	return (u64)lo | ((u64)hi << 32);
+ }
+ 
++#define MLX5_MPWQE_LOG_NUM_STRIDES_BASE	(9)
++#define MLX5_MPWQE_LOG_STRIDE_SZ_BASE	(6)
++
+ struct mpwrq_cqe_bc {
+ 	__be16	filler_consumed_strides;
+ 	__be16	byte_cnt;
+diff --git a/include/linux/mlx5/mlx5_ifc.h b/include/linux/mlx5/mlx5_ifc.h
+index 4a01909336e7..b814c8995501 100644
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -1044,7 +1044,8 @@ struct mlx5_ifc_cmd_hca_cap_bits {
+ 	u8         reserved_at_398[0x3];
+ 	u8         log_max_tis_per_sq[0x5];
+ 
+-	u8         reserved_at_3a0[0x3];
++	u8         ext_stride_num_range[0x1];
++	u8         reserved_at_3a1[0x2];
+ 	u8         log_max_stride_sz_rq[0x5];
+ 	u8         reserved_at_3a8[0x3];
+ 	u8         log_min_stride_sz_rq[0x5];
+@@ -1211,9 +1212,9 @@ struct mlx5_ifc_wq_bits {
+ 	u8         log_hairpin_num_packets[0x5];
+ 	u8         reserved_at_128[0x3];
+ 	u8         log_hairpin_data_sz[0x5];
+-	u8         reserved_at_130[0x5];
+ 
+-	u8         log_wqe_num_of_strides[0x3];
++	u8         reserved_at_130[0x4];
++	u8         log_wqe_num_of_strides[0x4];
+ 	u8         two_byte_shift_en[0x1];
+ 	u8         reserved_at_139[0x4];
+ 	u8         log_wqe_stride_size[0x3];
