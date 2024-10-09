@@ -1,0 +1,469 @@
+s390/qeth: fix potential deadlock on workqueue flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit c8183f5489020afc08dd9d88c3e4ee0e3c820733
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/c8183f54.failed
+
+The L2 bridgeport code uses the coarse 'conf_mutex' for guarding access
+to its configuration state.
+This can result in a deadlock when qeth_l2_stop_card() - called under the
+conf_mutex - blocks on flush_workqueue() to wait for the completion of
+pending bridgeport workers. Such workers would also need to aquire
+the conf_mutex, stalling indefinitely.
+
+Introduce a lock that specifically guards the bridgeport configuration,
+so that the workers no longer need the conf_mutex.
+Wrapping qeth_l2_promisc_to_bridge() in this fine-grained lock then also
+fixes a theoretical race against a concurrent qeth_bridge_port_role_store()
+operation.
+
+Fixes: c0a2e4d10d93 ("s390/qeth: conclude all event processing before offlining a card")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Alexandra Winter <wintera@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c8183f5489020afc08dd9d88c3e4ee0e3c820733)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_l2_main.c
+index b03799ca48d0,4bccdce19b5a..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -797,148 -460,155 +797,277 @@@ static void qeth_promisc_to_bridge(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void qeth_l2_set_multicast_list(struct net_device *dev)
+++=======
++ static void qeth_l2_set_promisc_mode(struct qeth_card *card)
++ {
++ 	bool enable = card->dev->flags & IFF_PROMISC;
++ 
++ 	if (card->info.promisc_mode == enable)
++ 		return;
++ 
++ 	if (qeth_adp_supported(card, IPA_SETADP_SET_PROMISC_MODE)) {
++ 		qeth_setadp_promisc_mode(card, enable);
++ 	} else {
++ 		mutex_lock(&card->sbp_lock);
++ 		if (card->options.sbp.reflect_promisc)
++ 			qeth_l2_promisc_to_bridge(card, enable);
++ 		mutex_unlock(&card->sbp_lock);
++ 	}
++ }
++ 
++ /* New MAC address is added to the hash table and marked to be written on card
++  * only if there is not in the hash table storage already
++  *
++ */
++ static void qeth_l2_add_mac(struct qeth_card *card, struct netdev_hw_addr *ha)
++ {
++ 	u32 mac_hash = get_unaligned((u32 *)(&ha->addr[2]));
++ 	struct qeth_mac *mac;
++ 
++ 	hash_for_each_possible(card->mac_htable, mac, hnode, mac_hash) {
++ 		if (ether_addr_equal_64bits(ha->addr, mac->mac_addr)) {
++ 			mac->disp_flag = QETH_DISP_ADDR_DO_NOTHING;
++ 			return;
++ 		}
++ 	}
++ 
++ 	mac = kzalloc(sizeof(struct qeth_mac), GFP_ATOMIC);
++ 	if (!mac)
++ 		return;
++ 
++ 	ether_addr_copy(mac->mac_addr, ha->addr);
++ 	mac->disp_flag = QETH_DISP_ADDR_ADD;
++ 
++ 	hash_add(card->mac_htable, &mac->hnode, mac_hash);
++ }
++ 
++ static void qeth_l2_rx_mode_work(struct work_struct *work)
++ {
++ 	struct qeth_card *card = container_of(work, struct qeth_card,
++ 					      rx_mode_work);
++ 	struct net_device *dev = card->dev;
++ 	struct netdev_hw_addr *ha;
++ 	struct qeth_mac *mac;
++ 	struct hlist_node *tmp;
++ 	int i;
++ 	int rc;
++ 
++ 	QETH_CARD_TEXT(card, 3, "setmulti");
++ 
++ 	netif_addr_lock_bh(dev);
++ 	netdev_for_each_mc_addr(ha, dev)
++ 		qeth_l2_add_mac(card, ha);
++ 	netdev_for_each_uc_addr(ha, dev)
++ 		qeth_l2_add_mac(card, ha);
++ 	netif_addr_unlock_bh(dev);
++ 
++ 	hash_for_each_safe(card->mac_htable, i, tmp, mac, hnode) {
++ 		switch (mac->disp_flag) {
++ 		case QETH_DISP_ADDR_DELETE:
++ 			qeth_l2_remove_mac(card, mac->mac_addr);
++ 			hash_del(&mac->hnode);
++ 			kfree(mac);
++ 			break;
++ 		case QETH_DISP_ADDR_ADD:
++ 			rc = qeth_l2_write_mac(card, mac->mac_addr);
++ 			if (rc) {
++ 				hash_del(&mac->hnode);
++ 				kfree(mac);
++ 				break;
++ 			}
++ 			/* fall through */
++ 		default:
++ 			/* for next call to set_rx_mode(): */
++ 			mac->disp_flag = QETH_DISP_ADDR_DELETE;
++ 		}
++ 	}
++ 
++ 	qeth_l2_set_promisc_mode(card);
++ }
++ 
++ static int qeth_l2_xmit_osn(struct qeth_card *card, struct sk_buff *skb,
++ 			    struct qeth_qdio_out_q *queue)
++ {
++ 	struct qeth_hdr *hdr = (struct qeth_hdr *)skb->data;
++ 	addr_t end = (addr_t)(skb->data + sizeof(*hdr));
++ 	addr_t start = (addr_t)skb->data;
++ 	unsigned int elements = 0;
++ 	unsigned int hd_len = 0;
++ 	int rc;
++ 
++ 	if (skb->protocol == htons(ETH_P_IPV6))
++ 		return -EPROTONOSUPPORT;
++ 
++ 	if (qeth_get_elements_for_range(start, end) > 1) {
++ 		/* Misaligned HW header, move it to its own buffer element. */
++ 		hdr = kmem_cache_alloc(qeth_core_header_cache, GFP_ATOMIC);
++ 		if (!hdr)
++ 			return -ENOMEM;
++ 		hd_len = sizeof(*hdr);
++ 		skb_copy_from_linear_data(skb, (char *)hdr, hd_len);
++ 		elements++;
++ 	}
++ 
++ 	elements += qeth_count_elements(skb, hd_len);
++ 	if (elements > queue->max_elements) {
++ 		rc = -E2BIG;
++ 		goto out;
++ 	}
++ 
++ 	rc = qeth_do_send_packet(card, queue, skb, hdr, hd_len, hd_len,
++ 				 elements);
++ out:
++ 	if (rc && hd_len)
++ 		kmem_cache_free(qeth_core_header_cache, hdr);
++ 	return rc;
++ }
++ 
++ static netdev_tx_t qeth_l2_hard_start_xmit(struct sk_buff *skb,
++ 					   struct net_device *dev)
+++>>>>>>> c8183f548902 (s390/qeth: fix potential deadlock on workqueue flush)
+  {
+  	struct qeth_card *card = dev->ml_priv;
+ -	u16 txq = skb_get_queue_mapping(skb);
+ -	struct qeth_qdio_out_q *queue;
+ -	int rc;
+ +	struct netdev_hw_addr *ha;
+ +
+ +	if (card->info.type == QETH_CARD_TYPE_OSN)
+ +		return ;
+ +
+ +	QETH_CARD_TEXT(card, 3, "setmulti");
+ +	if (qeth_threads_running(card, QETH_RECOVER_THREAD) &&
+ +	    (card->state != CARD_STATE_UP))
+ +		return;
+ +	qeth_l2_del_all_mc(card, 1);
+ +	spin_lock_bh(&card->mclock);
+ +	netdev_for_each_mc_addr(ha, dev)
+ +		qeth_l2_add_mc(card, ha->addr, 0);
+  
+ -	if (!skb_is_gso(skb))
+ -		qdisc_skb_cb(skb)->pkt_len = skb->len;
+ -	if (IS_IQD(card))
+ -		txq = qeth_iqd_translate_txq(dev, txq);
+ -	queue = card->qdio.out_qs[txq];
+ +	netdev_for_each_uc_addr(ha, dev)
+ +		qeth_l2_add_mc(card, ha->addr, 1);
+  
+ -	if (IS_OSN(card))
+ -		rc = qeth_l2_xmit_osn(card, skb, queue);
+ +	spin_unlock_bh(&card->mclock);
+ +	if (qeth_adp_supported(card, IPA_SETADP_SET_PROMISC_MODE))
+ +		qeth_setadp_promisc_mode(card);
+  	else
+ -		rc = qeth_xmit(card, skb, queue, qeth_get_ip_version(skb),
+ -			       qeth_l2_fill_header);
+ +		qeth_promisc_to_bridge(card);
+ +}
+  
+ -	if (!rc)
+ -		return NETDEV_TX_OK;
+ +static int qeth_l2_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ +{
+ +	int rc;
+ +	struct qeth_hdr *hdr = NULL;
+ +	int elements = 0;
+ +	struct qeth_card *card = dev->ml_priv;
+ +	struct sk_buff *new_skb = skb;
+ +	int cast_type = qeth_l2_get_cast_type(card, skb);
+ +	struct qeth_qdio_out_q *queue;
+ +	int tx_bytes = skb->len;
+ +	int data_offset = -1;
+ +	int elements_needed = 0;
+ +	int hd_len = 0;
+ +
+ +	if (card->qdio.do_prio_queueing || (cast_type &&
+ +					card->info.is_multicast_different))
+ +		queue = card->qdio.out_qs[qeth_get_priority_queue(card, skb,
+ +					qeth_get_ip_version(skb), cast_type)];
+ +	else
+ +		queue = card->qdio.out_qs[card->qdio.default_out_queue];
+ +
+ +	if ((card->state != CARD_STATE_UP) || !card->lan_online) {
+ +		card->stats.tx_carrier_errors++;
+ +		goto tx_drop;
+ +	}
+ +
+ +	if ((card->info.type == QETH_CARD_TYPE_OSN) &&
+ +	    (skb->protocol == htons(ETH_P_IPV6)))
+ +		goto tx_drop;
+ +
+ +	if (card->options.performance_stats) {
+ +		card->perf_stats.outbound_cnt++;
+ +		card->perf_stats.outbound_start_time = qeth_get_micros();
+ +	}
+ +	netif_stop_queue(dev);
+ +
+ +	if (card->info.type == QETH_CARD_TYPE_OSN)
+ +		hdr = (struct qeth_hdr *)skb->data;
+ +	else {
+ +		if (card->info.type == QETH_CARD_TYPE_IQD) {
+ +			new_skb = skb;
+ +			data_offset = ETH_HLEN;
+ +			hd_len = ETH_HLEN;
+ +			hdr = kmem_cache_alloc(qeth_core_header_cache,
+ +						GFP_ATOMIC);
+ +			if (!hdr)
+ +				goto tx_drop;
+ +			elements_needed++;
+ +			skb_reset_mac_header(new_skb);
+ +			qeth_l2_fill_header(card, hdr, new_skb, cast_type);
+ +			hdr->hdr.l2.pkt_length = new_skb->len;
+ +			memcpy(((char *)hdr) + sizeof(struct qeth_hdr),
+ +				skb_mac_header(new_skb), ETH_HLEN);
+ +		} else {
+ +			/* create a clone with writeable headroom */
+ +			new_skb = skb_realloc_headroom(skb,
+ +						sizeof(struct qeth_hdr));
+ +			if (!new_skb)
+ +				goto tx_drop;
+ +			hdr = (struct qeth_hdr *)skb_push(new_skb,
+ +						sizeof(struct qeth_hdr));
+ +			skb_set_mac_header(new_skb, sizeof(struct qeth_hdr));
+ +			qeth_l2_fill_header(card, hdr, new_skb, cast_type);
+ +			if (new_skb->ip_summed == CHECKSUM_PARTIAL)
+ +				qeth_l2_hdr_csum(card, hdr, new_skb);
+ +		}
+ +	}
+ +
+ +	elements = qeth_get_elements_no(card, new_skb, elements_needed,
+ +					(data_offset > 0) ? data_offset : 0);
+ +	if (!elements) {
+ +		if (data_offset >= 0)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +		goto tx_drop;
+ +	}
+ +
+ +	if (card->info.type != QETH_CARD_TYPE_IQD) {
+ +		if (qeth_hdr_chk_and_bounce(new_skb, &hdr,
+ +		    sizeof(struct qeth_hdr_layer2)))
+ +			goto tx_drop;
+ +		rc = qeth_do_send_packet(card, queue, new_skb, hdr,
+ +					 elements);
+ +	} else
+ +		rc = qeth_do_send_packet_fast(card, queue, new_skb, hdr,
+ +					elements, data_offset, hd_len);
+ +	if (!rc) {
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		if (new_skb != skb)
+ +			dev_kfree_skb_any(skb);
+ +		rc = NETDEV_TX_OK;
+ +	} else {
+ +		if (data_offset >= 0)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +
+ +		if (rc == -EBUSY) {
+ +			if (new_skb != skb)
+ +				dev_kfree_skb_any(new_skb);
+ +			return NETDEV_TX_BUSY;
+ +		} else
+ +			goto tx_drop;
+ +	}
+ +
+ +	netif_wake_queue(dev);
+ +	if (card->options.performance_stats)
+ +		card->perf_stats.outbound_time += qeth_get_micros() -
+ +			card->perf_stats.outbound_start_time;
+ +	return rc;
+  
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +tx_drop:
+ +	card->stats.tx_dropped++;
+ +	if ((new_skb != skb) && new_skb)
+ +		dev_kfree_skb_any(new_skb);
+  	kfree_skb(skb);
+ +	netif_wake_queue(dev);
+  	return NETDEV_TX_OK;
+  }
+  
+@@@ -1005,6 -634,9 +1134,12 @@@ static int qeth_l2_probe_device(struct 
+  	struct qeth_card *card = dev_get_drvdata(&gdev->dev);
+  	int rc;
+  
+++<<<<<<< HEAD
+++=======
++ 	qeth_l2_vnicc_set_defaults(card);
++ 	mutex_init(&card->sbp_lock);
++ 
+++>>>>>>> c8183f548902 (s390/qeth: fix potential deadlock on workqueue flush)
+  	if (gdev->dev.type == &qeth_generic_devtype) {
+  		rc = qeth_l2_create_device_attributes(&gdev->dev);
+  		if (rc)
+@@@ -1165,6 -809,21 +1300,24 @@@ static int __qeth_l2_set_online(struct 
+  	} else
+  		card->info.hwtrap = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&card->sbp_lock);
++ 	qeth_bridgeport_query_support(card);
++ 	if (card->options.sbp.supported_funcs)
++ 		dev_info(&card->gdev->dev,
++ 		"The device represents a Bridge Capable Port\n");
++ 	mutex_unlock(&card->sbp_lock);
++ 
++ 	qeth_l2_register_dev_addr(card);
++ 
++ 	/* for the rx_bcast characteristic, init VNICC after setmac */
++ 	qeth_l2_vnicc_init(card);
++ 
++ 	qeth_trace_features(card);
++ 	qeth_l2_trace_features(card);
++ 
+++>>>>>>> c8183f548902 (s390/qeth: fix potential deadlock on workqueue flush)
+  	qeth_l2_setup_bridgeport_attrs(card);
+  
+  	card->state = CARD_STATE_HARDSETUP;
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index c7cb26604798..5c9316d7aa64 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -843,6 +843,7 @@ struct qeth_card {
+ 	struct service_level qeth_service_level;
+ 	struct qdio_ssqd_desc ssqd;
+ 	debug_info_t *debug;
++	struct mutex sbp_lock;
+ 	struct mutex conf_mutex;
+ 	struct mutex discipline_mutex;
+ 	struct napi_struct napi;
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+diff --git a/drivers/s390/net/qeth_l2_sys.c b/drivers/s390/net/qeth_l2_sys.c
+index be7992cec14c..b72c2101ae1d 100644
+--- a/drivers/s390/net/qeth_l2_sys.c
++++ b/drivers/s390/net/qeth_l2_sys.c
+@@ -30,6 +30,7 @@ static ssize_t qeth_bridge_port_role_state_show(struct device *dev,
+ 
+ 	mutex_lock(&card->conf_mutex);
+ 
++	mutex_lock(&card->sbp_lock);
+ 	if (qeth_card_hw_is_reachable(card) &&
+ 					card->options.sbp.supported_funcs)
+ 		rc = qeth_bridgeport_query_ports(card,
+@@ -63,6 +64,7 @@ static ssize_t qeth_bridge_port_role_state_show(struct device *dev,
+ 		else
+ 			rc = sprintf(buf, "%s\n", word);
+ 	}
++	mutex_unlock(&card->sbp_lock);
+ 
+ 	mutex_unlock(&card->conf_mutex);
+ 
+@@ -94,6 +96,7 @@ static ssize_t qeth_bridge_port_role_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&card->conf_mutex);
++	mutex_lock(&card->sbp_lock);
+ 
+ 	if (card->options.sbp.reflect_promisc) /* Forbid direct manipulation */
+ 		rc = -EPERM;
+@@ -104,6 +107,7 @@ static ssize_t qeth_bridge_port_role_store(struct device *dev,
+ 	} else
+ 		card->options.sbp.role = role;
+ 
++	mutex_unlock(&card->sbp_lock);
+ 	mutex_unlock(&card->conf_mutex);
+ 
+ 	return rc ? rc : count;
+@@ -157,6 +161,7 @@ static ssize_t qeth_bridgeport_hostnotification_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&card->conf_mutex);
++	mutex_lock(&card->sbp_lock);
+ 
+ 	if (qeth_card_hw_is_reachable(card)) {
+ 		rc = qeth_bridgeport_an_set(card, enable);
+@@ -165,6 +170,7 @@ static ssize_t qeth_bridgeport_hostnotification_store(struct device *dev,
+ 	} else
+ 		card->options.sbp.hostnotification = enable;
+ 
++	mutex_unlock(&card->sbp_lock);
+ 	mutex_unlock(&card->conf_mutex);
+ 
+ 	return rc ? rc : count;
+@@ -217,6 +223,7 @@ static ssize_t qeth_bridgeport_reflect_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&card->conf_mutex);
++	mutex_lock(&card->sbp_lock);
+ 
+ 	if (card->options.sbp.role != QETH_SBP_ROLE_NONE)
+ 		rc = -EPERM;
+@@ -226,6 +233,7 @@ static ssize_t qeth_bridgeport_reflect_store(struct device *dev,
+ 		rc = 0;
+ 	}
+ 
++	mutex_unlock(&card->sbp_lock);
+ 	mutex_unlock(&card->conf_mutex);
+ 
+ 	return rc ? rc : count;
+@@ -271,6 +279,8 @@ void qeth_l2_setup_bridgeport_attrs(struct qeth_card *card)
+ 		return;
+ 	if (!card->options.sbp.supported_funcs)
+ 		return;
++
++	mutex_lock(&card->sbp_lock);
+ 	if (card->options.sbp.role != QETH_SBP_ROLE_NONE) {
+ 		/* Conditional to avoid spurious error messages */
+ 		qeth_bridgeport_setrole(card, card->options.sbp.role);
+@@ -282,8 +292,10 @@ void qeth_l2_setup_bridgeport_attrs(struct qeth_card *card)
+ 		rc = qeth_bridgeport_an_set(card, 1);
+ 		if (rc)
+ 			card->options.sbp.hostnotification = 0;
+-	} else
++	} else {
+ 		qeth_bridgeport_an_set(card, 0);
++	}
++	mutex_unlock(&card->sbp_lock);
+ }
+ 
+ const struct attribute_group *qeth_l2_attr_groups[] = {
