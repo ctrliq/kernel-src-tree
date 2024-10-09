@@ -1,0 +1,296 @@
+perf trace: Beautify statx syscall 'flag' and 'mask' arguments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit fd5cead23f54697310bd565aa2a23ae5128080a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fd5cead2.failed
+
+To test it, build samples/statx/test_statx, which I did as:
+
+  $ make headers_install
+  $ cc -I ~/git/linux/usr/include samples/statx/test-statx.c -o /tmp/statx
+
+And then use perf trace on it:
+
+  # perf trace -e statx /tmp/statx /etc/passwd
+  statx(/etc/passwd) = 0
+  results=7ff
+    Size: 3496            Blocks: 8          IO Block: 4096    regular file
+  Device: fd:00           Inode: 280156      Links: 1
+  Access: (0644/-rw-r--r--)  Uid:     0   Gid:     0
+  Access: 2017-03-29 16:01:01.650073438-0300
+  Modify: 2017-03-10 16:25:14.156479354-0300
+  Change: 2017-03-10 16:25:14.171479328-0300
+     0.000 ( 0.007 ms): statx/30648 statx(dfd: CWD, filename: 0x7ef503f4, flags: SYMLINK_NOFOLLOW, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7fff7ef4eb10) = 0
+  #
+
+Using the test-stat.c options to change the mask:
+
+  # perf trace -e statx /tmp/statx -O /etc/passwd > /dev/null
+     0.000 ( 0.008 ms): statx/30745 statx(dfd: CWD, filename: 0x3a0753f4, flags: SYMLINK_NOFOLLOW, mask: BTIME, buffer: 0x7ffd3a0735c0) = 0
+  #
+  # perf trace -e statx /tmp/statx -A /etc/passwd > /dev/null
+     0.000 ( 0.010 ms): statx/30757 statx(dfd: CWD, filename: 0xa94e63f4, flags: SYMLINK_NOFOLLOW|NO_AUTOMOUNT, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7ffea94e49d0) = 0
+  #
+  # trace --no-inherit -e statx /tmp/statx -F /etc/passwd > /dev/null
+     0.000 ( 0.011 ms): statx(dfd: CWD, filename: 0x3b02d3f3, flags: SYMLINK_NOFOLLOW|STATX_FORCE_SYNC, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7ffd3b02c850) = 0
+  #
+  # trace --no-inherit -e statx /tmp/statx -F -L /etc/passwd > /dev/null
+     0.000 ( 0.008 ms): statx(dfd: CWD, filename: 0x15cff3f3, flags: STATX_FORCE_SYNC, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7fff15cfdda0) = 0
+  #
+  # trace --no-inherit -e statx /tmp/statx -D -O /etc/passwd > /dev/null
+     0.000 ( 0.009 ms): statx(dfd: CWD, filename: 0xfa37f3f3, flags: SYMLINK_NOFOLLOW|STATX_DONT_SYNC, mask: BTIME, buffer: 0x7ffffa37da20) = 0
+  #
+
+Adding a probe to get the filename collected as well:
+
+  # perf probe 'vfs_getname=getname_flags:72 pathname=result->name:string'
+  Added new event:
+    probe:vfs_getname    (on getname_flags:72 with pathname=result->name:string)
+
+  You can now use it in all perf tools, such as:
+
+	  perf record -e probe:vfs_getname -aR sleep 1
+
+  # trace --no-inherit -e statx /tmp/statx -D -O /etc/passwd > /dev/null
+     0.169 ( 0.007 ms): statx(dfd: CWD, filename: /etc/passwd, flags: SYMLINK_NOFOLLOW|STATX_DONT_SYNC, mask: BTIME, buffer: 0x7ffda9bf50f0) = 0
+  #
+
+Same technique could be used to collect and beautify the result put in
+the 'buffer' argument.
+
+Finally do a system wide 'perf trace' session looking for any use of statx,
+then run the test proggie with various flags:
+
+  # trace -e statx
+   16612.967 ( 0.028 ms): statx/4562 statx(dfd: CWD, filename: /tmp/statx, flags: SYMLINK_NOFOLLOW, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7ffef195d660) = 0
+   33064.447 ( 0.011 ms): statx/4569 statx(dfd: CWD, filename: /tmp/statx, flags: SYMLINK_NOFOLLOW|STATX_FORCE_SYNC, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7ffc5484c790) = 0
+   36050.891 ( 0.023 ms): statx/4576 statx(dfd: CWD, filename: /tmp/statx, flags: SYMLINK_NOFOLLOW, mask: BTIME, buffer: 0x7ffeb18b66e0) = 0
+   38039.889 ( 0.023 ms): statx/4584 statx(dfd: CWD, filename: /tmp/statx, flags: SYMLINK_NOFOLLOW, mask: TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS|BTIME, buffer: 0x7fff1db0ea90) = 0
+  ^C#
+
+This one also starts moving the beautifiers from files directly included
+in builtin-trace.c to separate objects + a beauty.h header with
+prototypes, so that we can add test cases in tools/perf/tests/ to fire
+syscalls with various arguments and then get them intercepted as
+syscalls:sys_enter_foo or raw_syscalls:sys_enter + sys_exit to then
+format and check that the formatted output is the one we expect.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/n/tip-xvzw8eynffvez5czyzidhrno@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit fd5cead23f54697310bd565aa2a23ae5128080a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/arch/x86/entry/syscalls/syscall_64.tbl
+diff --cc tools/perf/arch/x86/entry/syscalls/syscall_64.tbl
+index 4c704c0b050f,5aef183e2f85..000000000000
+--- a/tools/perf/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/tools/perf/arch/x86/entry/syscalls/syscall_64.tbl
+@@@ -320,12 -320,25 +320,24 @@@
+  311	64	process_vm_writev	sys_process_vm_writev
+  312	common	kcmp			sys_kcmp
+  313	common	finit_module		sys_finit_module
+ -314	common	sched_setattr		sys_sched_setattr
+ -315	common	sched_getattr		sys_sched_getattr
+ +314	common  sched_setattr		sys_sched_setattr
+ +315	common  sched_getattr		sys_sched_getattr
+  316	common	renameat2		sys_renameat2
+ -317	common	seccomp			sys_seccomp
+ -318	common	getrandom		sys_getrandom
+  319	common	memfd_create		sys_memfd_create
+  320	common	kexec_file_load		sys_kexec_file_load
+ -321	common	bpf			sys_bpf
+ -322	64	execveat		sys_execveat/ptregs
+  323	common	userfaultfd		sys_userfaultfd
+++<<<<<<< HEAD
+++=======
++ 324	common	membarrier		sys_membarrier
++ 325	common	mlock2			sys_mlock2
++ 326	common	copy_file_range		sys_copy_file_range
++ 327	64	preadv2			sys_preadv2
++ 328	64	pwritev2		sys_pwritev2
++ 329	common	pkey_mprotect		sys_pkey_mprotect
++ 330	common	pkey_alloc		sys_pkey_alloc
++ 331	common	pkey_free		sys_pkey_free
++ 332	common	statx			sys_statx
+++>>>>>>> fd5cead23f54 (perf trace: Beautify statx syscall 'flag' and 'mask' arguments)
+  
+  #
+  # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/tools/perf/Build b/tools/perf/Build
+index 9b79f8d7db50..bd8eeb60533c 100644
+--- a/tools/perf/Build
++++ b/tools/perf/Build
+@@ -50,5 +50,6 @@ libperf-y += util/
+ libperf-y += arch/
+ libperf-y += ui/
+ libperf-y += scripts/
++libperf-y += trace/beauty/
+ 
+ gtk-y += ui/gtk/
+* Unmerged path tools/perf/arch/x86/entry/syscalls/syscall_64.tbl
+diff --git a/tools/perf/builtin-trace.c b/tools/perf/builtin-trace.c
+index 45ebc2da0ef4..35f98732e877 100644
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@ -31,6 +31,7 @@
+ #include "util/intlist.h"
+ #include "util/thread_map.h"
+ #include "util/stat.h"
++#include "trace/beauty/beauty.h"
+ #include "trace-event.h"
+ #include "util/parse-events.h"
+ #include "callchain.h"
+@@ -265,15 +266,6 @@ out_delete:
+ 	({ struct syscall_tp *fields = evsel->priv; \
+ 	   fields->name.pointer(&fields->name, sample); })
+ 
+-struct syscall_arg {
+-	unsigned long val;
+-	struct thread *thread;
+-	struct trace  *trace;
+-	void	      *parm;
+-	u8	      idx;
+-	u8	      mask;
+-};
+-
+ struct strarray {
+ 	int	    offset;
+ 	int	    nr_entries;
+@@ -766,6 +758,10 @@ static struct syscall_fmt {
+ 	  .arg_parm	 = { [0] = &strarray__socket_families, /* family */ }, },
+ 	{ .name	    = "stat",	    .errmsg = true, .alias = "newstat", },
+ 	{ .name	    = "statfs",	    .errmsg = true, },
++	{ .name	    = "statx",	    .errmsg = true,
++	  .arg_scnprintf = { [0] = SCA_FDAT, /* flags */
++			     [2] = SCA_STATX_FLAGS, /* flags */
++			     [3] = SCA_STATX_MASK, /* mask */ }, },
+ 	{ .name	    = "swapoff",    .errmsg = true,
+ 	  .arg_scnprintf = { [0] = SCA_FILENAME, /* specialfile */ }, },
+ 	{ .name	    = "swapon",	    .errmsg = true,
+diff --git a/tools/perf/trace/beauty/Build b/tools/perf/trace/beauty/Build
+new file mode 100644
+index 000000000000..be95ac6ce845
+--- /dev/null
++++ b/tools/perf/trace/beauty/Build
+@@ -0,0 +1 @@
++libperf-y += statx.o
+diff --git a/tools/perf/trace/beauty/beauty.h b/tools/perf/trace/beauty/beauty.h
+new file mode 100644
+index 000000000000..cf50be3f17a4
+--- /dev/null
++++ b/tools/perf/trace/beauty/beauty.h
+@@ -0,0 +1,24 @@
++#ifndef _PERF_TRACE_BEAUTY_H
++#define _PERF_TRACE_BEAUTY_H
++
++#include <linux/types.h>
++
++struct trace;
++struct thread;
++
++struct syscall_arg {
++	unsigned long val;
++	struct thread *thread;
++	struct trace  *trace;
++	void	      *parm;
++	u8	      idx;
++	u8	      mask;
++};
++
++size_t syscall_arg__scnprintf_statx_flags(char *bf, size_t size, struct syscall_arg *arg);
++#define SCA_STATX_FLAGS syscall_arg__scnprintf_statx_flags
++
++size_t syscall_arg__scnprintf_statx_mask(char *bf, size_t size, struct syscall_arg *arg);
++#define SCA_STATX_MASK syscall_arg__scnprintf_statx_mask
++
++#endif /* _PERF_TRACE_BEAUTY_H */
+diff --git a/tools/perf/trace/beauty/statx.c b/tools/perf/trace/beauty/statx.c
+new file mode 100644
+index 000000000000..5643b692af4c
+--- /dev/null
++++ b/tools/perf/trace/beauty/statx.c
+@@ -0,0 +1,72 @@
++/*
++ * trace/beauty/statx.c
++ *
++ *  Copyright (C) 2017, Red Hat Inc, Arnaldo Carvalho de Melo <acme@redhat.com>
++ *
++ * Released under the GPL v2. (and only v2, not any later version)
++ */
++
++#include "trace/beauty/beauty.h"
++#include <linux/kernel.h>
++#include <sys/types.h>
++#include <uapi/linux/fcntl.h>
++#include <uapi/linux/stat.h>
++
++size_t syscall_arg__scnprintf_statx_flags(char *bf, size_t size, struct syscall_arg *arg)
++{
++	int printed = 0, flags = arg->val;
++
++	if (flags == 0)
++		return scnprintf(bf, size, "SYNC_AS_STAT");
++#define	P_FLAG(n) \
++	if (flags & AT_##n) { \
++		printed += scnprintf(bf + printed, size - printed, "%s%s", printed ? "|" : "", #n); \
++		flags &= ~AT_##n; \
++	}
++
++	P_FLAG(SYMLINK_NOFOLLOW);
++	P_FLAG(REMOVEDIR);
++	P_FLAG(SYMLINK_FOLLOW);
++	P_FLAG(NO_AUTOMOUNT);
++	P_FLAG(EMPTY_PATH);
++	P_FLAG(STATX_FORCE_SYNC);
++	P_FLAG(STATX_DONT_SYNC);
++
++#undef P_FLAG
++
++	if (flags)
++		printed += scnprintf(bf + printed, size - printed, "%s%#x", printed ? "|" : "", flags);
++
++	return printed;
++}
++
++size_t syscall_arg__scnprintf_statx_mask(char *bf, size_t size, struct syscall_arg *arg)
++{
++	int printed = 0, flags = arg->val;
++
++#define	P_FLAG(n) \
++	if (flags & STATX_##n) { \
++		printed += scnprintf(bf + printed, size - printed, "%s%s", printed ? "|" : "", #n); \
++		flags &= ~STATX_##n; \
++	}
++
++	P_FLAG(TYPE);
++	P_FLAG(MODE);
++	P_FLAG(NLINK);
++	P_FLAG(UID);
++	P_FLAG(GID);
++	P_FLAG(ATIME);
++	P_FLAG(MTIME);
++	P_FLAG(CTIME);
++	P_FLAG(INO);
++	P_FLAG(SIZE);
++	P_FLAG(BLOCKS);
++	P_FLAG(BTIME);
++
++#undef P_FLAG
++
++	if (flags)
++		printed += scnprintf(bf + printed, size - printed, "%s%#x", printed ? "|" : "", flags);
++
++	return printed;
++}
