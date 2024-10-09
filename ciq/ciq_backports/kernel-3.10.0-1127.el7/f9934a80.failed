@@ -1,0 +1,135 @@
+blk-mq: introduce blk_mq_tagset_wait_completed_request()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit f9934a80f91dba8c7029ba7601459e41ea7770aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/f9934a80.failed
+
+blk-mq may schedule to call queue's complete function on remote CPU via
+IPI, but doesn't provide any way to synchronize the request's complete
+fn. The current queue freeze interface can't provide the synchonization
+because aborted requests stay at blk-mq queues during EH.
+
+In some driver's EH(such as NVMe), hardware queue's resource may be freed &
+re-allocated. If the completed request's complete fn is run finally after the
+hardware queue's resource is released, kernel crash will be triggered.
+
+Prepare for fixing this kind of issue by introducing
+blk_mq_tagset_wait_completed_request().
+
+	Cc: Max Gurtovoy <maxg@mellanox.com>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Keith Busch <keith.busch@intel.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f9934a80f91dba8c7029ba7601459e41ea7770aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+diff --cc block/blk-mq-tag.c
+index 077457fdfef0,008388e82b5c..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -310,35 -355,51 +311,83 @@@ void blk_mq_tagset_busy_iter(struct blk
+  }
+  EXPORT_SYMBOL(blk_mq_tagset_busy_iter);
+  
+++<<<<<<< HEAD
+ +int blk_mq_reinit_tagset(struct blk_mq_tag_set *set)
+ +{
+ +	int i, j, ret = 0;
+ +
+ +	if (!set->ops->aux_ops || !set->ops->aux_ops->reinit_request)
+ +		goto out;
+ +
+ +	for (i = 0; i < set->nr_hw_queues; i++) {
+ +		struct blk_mq_tags *tags = set->tags[i];
+ +
+ +		if (!tags)
+ +			continue;
+ +
+ +		for (j = 0; j < tags->nr_tags; j++) {
+ +			if (!tags->static_rqs[j])
+ +				continue;
+ +
+ +			ret = set->ops->aux_ops->reinit_request(set->driver_data,
+ +						tags->static_rqs[j]);
+ +			if (ret)
+ +				goto out;
+ +		}
+ +	}
+ +
+ +out:
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(blk_mq_reinit_tagset);
+ +
+++=======
++ static bool blk_mq_tagset_count_completed_rqs(struct request *rq,
++ 		void *data, bool reserved)
++ {
++ 	unsigned *count = data;
++ 
++ 	if (blk_mq_request_completed(rq))
++ 		(*count)++;
++ 	return true;
++ }
++ 
++ /**
++  * blk_mq_tagset_wait_completed_request - wait until all completed req's
++  * complete funtion is run
++  * @tagset:	Tag set to drain completed request
++  *
++  * Note: This function has to be run after all IO queues are shutdown
++  */
++ void blk_mq_tagset_wait_completed_request(struct blk_mq_tag_set *tagset)
++ {
++ 	while (true) {
++ 		unsigned count = 0;
++ 
++ 		blk_mq_tagset_busy_iter(tagset,
++ 				blk_mq_tagset_count_completed_rqs, &count);
++ 		if (!count)
++ 			break;
++ 		msleep(5);
++ 	}
++ }
++ EXPORT_SYMBOL(blk_mq_tagset_wait_completed_request);
++ 
++ /**
++  * blk_mq_queue_tag_busy_iter - iterate over all requests with a driver tag
++  * @q:		Request queue to examine.
++  * @fn:		Pointer to the function that will be called for each request
++  *		on @q. @fn will be called as follows: @fn(hctx, rq, @priv,
++  *		reserved) where rq is a pointer to a request and hctx points
++  *		to the hardware queue associated with the request. 'reserved'
++  *		indicates whether or not @rq is a reserved request.
++  * @priv:	Will be passed as third argument to @fn.
++  *
++  * Note: if @q->tag_set is shared with other request queues then @fn will be
++  * called for all requests on all queues that share that tag set and not only
++  * for requests associated with @q.
++  */
+++>>>>>>> f9934a80f91d (blk-mq: introduce blk_mq_tagset_wait_completed_request())
+  void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
+  		void *priv)
+  {
+* Unmerged path block/blk-mq-tag.c
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index a446b71af41d..eefbd26bf860 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -352,6 +352,7 @@ bool blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+ void blk_mq_run_hw_queues(struct request_queue *q, bool async);
+ void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
+ 		busy_tag_iter_fn *fn, void *priv);
++void blk_mq_tagset_wait_completed_request(struct blk_mq_tag_set *tagset);
+ void blk_mq_freeze_queue(struct request_queue *q);
+ void blk_mq_unfreeze_queue(struct request_queue *q);
+ void blk_freeze_queue_start(struct request_queue *q);
