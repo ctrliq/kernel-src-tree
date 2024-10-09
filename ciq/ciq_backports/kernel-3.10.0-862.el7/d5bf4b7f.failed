@@ -1,0 +1,123 @@
+nvme-rdma: fix concurrent reset and reconnect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] rdma: fix concurrent reset and reconnect (David Milburn) [1517602]
+Rebuild_FUZZ: 94.12%
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit d5bf4b7f437c250821d40c3e32158729e6b484ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d5bf4b7f.failed
+
+Now ctrl state machine allows to transition from RESETTING to
+RECONNECTING.  In nvme-rdma when we receive a rdma cm DISONNECTED event,
+we trigger nvme_rdma_error_recovery. This happens also when we execute a
+controller reset, issue a cm diconnect request and receive a cm
+disconnect reply, as a result, the reset work and the error recovery work
+can run concurrently.
+
+Until now the state machine prevented from the error recovery work from
+running as a result of a controller reset (RESETTING -> RECONNECTING was
+not allowed).
+
+To fix this, we adopt the FC state machine approach, we always transition
+from LIVE to RESETTING and only then to RECONNECTING.  We do this both
+for the error recovery work and the controller reset work:
+
+ 1. transition to RESETTING
+ 2. teardown the controller association
+ 3. transition to RECONNECTING
+
+This will restore the protection against reset work and error recovery work
+from concurrently running together.
+
+Fixes: 3cec7f9de448 ("nvme: allow controller RESETTING to RECONNECTING transition")
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit d5bf4b7f437c250821d40c3e32158729e6b484ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index d32f781f91a5,2a0bba7f50cf..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -814,18 -971,24 +814,24 @@@ static void nvme_rdma_error_recovery_wo
+  	 * queues are not a live anymore, so restart the queues to fail fast
+  	 * new IO
+  	 */
+ -	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+ +	blk_mq_start_stopped_hw_queues(ctrl->ctrl.admin_q, true);
+  	nvme_start_queues(&ctrl->ctrl);
+  
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
++ 		/* state change failure should never happen */
++ 		WARN_ON_ONCE(1);
++ 		return;
++ 	}
++ 
+  	nvme_rdma_reconnect_or_remove(ctrl);
+  }
+  
+  static void nvme_rdma_error_recovery(struct nvme_rdma_ctrl *ctrl)
+  {
+- 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING))
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RESETTING))
+  		return;
+  
+ -	queue_work(nvme_wq, &ctrl->err_work);
+ +	queue_work(nvme_rdma_wq, &ctrl->err_work);
+  }
+  
+  static void nvme_rdma_wr_error(struct ib_cq *cq, struct ib_wc *wc,
+@@@ -1736,30 -1756,23 +1742,42 @@@ static void nvme_rdma_reset_ctrl_work(s
+  	int ret;
+  	bool changed;
+  
+ -	nvme_stop_ctrl(&ctrl->ctrl);
+ -	nvme_rdma_shutdown_ctrl(ctrl, false);
+ +	nvme_rdma_shutdown_ctrl(ctrl);
+  
+++<<<<<<< HEAD
+ +	ret = nvme_rdma_configure_admin_queue(ctrl);
+ +	if (ret) {
+ +		/* ctrl is already shutdown, just remove the ctrl */
+ +		INIT_WORK(&ctrl->delete_work, nvme_rdma_remove_ctrl_work);
+ +		goto del_dead_ctrl;
+ +	}
+++=======
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
++ 		/* state change failure should never happen */
++ 		WARN_ON_ONCE(1);
++ 		return;
++ 	}
++ 
++ 	ret = nvme_rdma_configure_admin_queue(ctrl, false);
++ 	if (ret)
++ 		goto out_fail;
+++>>>>>>> d5bf4b7f437c (nvme-rdma: fix concurrent reset and reconnect)
+  
+ -	if (ctrl->ctrl.queue_count > 1) {
+ -		ret = nvme_rdma_configure_io_queues(ctrl, false);
+ +	if (ctrl->queue_count > 1) {
+ +		ret = blk_mq_reinit_tagset(&ctrl->tag_set);
+  		if (ret)
+ -			goto out_fail;
+ +			goto del_dead_ctrl;
+ +
+ +		ret = nvme_rdma_init_io_queues(ctrl);
+ +		if (ret)
+ +			goto del_dead_ctrl;
+ +
+ +		ret = nvme_rdma_connect_io_queues(ctrl);
+ +		if (ret)
+ +			goto del_dead_ctrl;
+ +
+ +		blk_mq_update_nr_hw_queues(&ctrl->tag_set,
+ +				ctrl->ctrl.queue_count - 1);
+  	}
+  
+  	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
+* Unmerged path drivers/nvme/host/rdma.c
