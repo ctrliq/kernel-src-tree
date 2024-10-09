@@ -592,6 +592,7 @@ struct lpfc_sli4_hba {
 	uint32_t ue_to_sr;
 	uint32_t ue_to_rp;
 	struct lpfc_register sli_intf;
+	struct lpfc_register sli_asic_ver;
 	struct lpfc_pc_sli4_params pc_sli4_params;
 	struct msix_entry *msix_entries;
 	struct lpfc_bbscn_params bbscn_params;
