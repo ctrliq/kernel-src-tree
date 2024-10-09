@@ -1,0 +1,328 @@
+qla2xxx: Convert to percpu_ida session tag pre-allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 51a07f84649d2be206c4c2ad9a612956db0c2f8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/51a07f84.failed
+
+This patch converts qla2xxx target code to use generic percpu_ida
+tag allocation provided by target-core, thus removing the original
+kmem_cache_zalloc() for each struct qla_tgt_cmd descriptor in the
+incoming ATIO packet fast-path.
+
+This includes the conversion of qlt_handle_cmd_for_atio() to perform
+qla_tgt_sess lookup before dispatching a command descriptor into
+qla_tgt_wq process context, along with handling the case where no
+active session exists, and subsequently kicking off a seperate
+process context for qlt_create_sess_from_atio() to create a new one.
+
+It also includes moving tag allocation into generic code within
+qlt_get_tag(), so that the same logic can be shared between
+qlt_handle_cmd_for_atio() + qlt_create_sess_from_atio() contexts.
+Also, __qlt_do_work() has been made generic between both normal
+process context in qlt_do_work() + qlt_create_sess_from_atio().
+
+Next, update qlt_free_cmd() to release the percpu-ida tags, and
+drop the now-unused global qla_tgt_cmd_cachep.
+
+Finally in tcm_qla2xxx code, tcm_qla2xxx_check_initiator_node_acl()
+has been updated to use transport_init_session_tags() along with a
+hardcoded TCM_QLA2XXX_DEFAULT_TAGS=2088 as the number of qla_tgt_cmd
+descriptors to pre-allocate per qla_tgt_sess instance.
+
+(Use ha->fw_xcb_count if available to calculate num_tags, and
+ also factor in extra pad tags - Quinn)
+
+	Cc: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Cc: Quinn Tran <quinn.tran@qlogic.com>
+	Cc: Giridhar Malavali <giridhar.malavali@qlogic.com>
+	Cc: Chad Dupuis <chad.dupuis@qlogic.com>
+	Cc: Roland Dreier <roland@kernel.org>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 51a07f84649d2be206c4c2ad9a612956db0c2f8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 456cb0f88a7e,bd9c725c08e1..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2586,13 -2495,12 +2592,17 @@@ static struct qla_tgt_sess *qlt_make_lo
+  /*
+   * Process context for I/O path into tcm_qla2xxx code
+   */
+- static void qlt_do_work(struct work_struct *work)
++ static void __qlt_do_work(struct qla_tgt_cmd *cmd)
+  {
+- 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
+  	scsi_qla_host_t *vha = cmd->vha;
+  	struct qla_hw_data *ha = vha->hw;
+++<<<<<<< HEAD
+ +	struct qla_tgt *tgt = ha->tgt.qla_tgt;
+ +	struct qla_tgt_sess *sess = NULL;
+++=======
++ 	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
++ 	struct qla_tgt_sess *sess = cmd->sess;
+++>>>>>>> 51a07f84649d (qla2xxx: Convert to percpu_ida session tag pre-allocation)
+  	struct atio_from_isp *atio = &cmd->atio;
+  	unsigned char *cdb;
+  	unsigned long flags;
+@@@ -2602,41 -2510,6 +2612,44 @@@
+  	if (tgt->tgt_stop)
+  		goto out_term;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha,
+ +	    atio->u.isp24.fcp_hdr.s_id);
+ +	/* Do kref_get() before dropping qla_hw_data->hardware_lock. */
+ +	if (sess)
+ +		kref_get(&sess->se_sess->sess_kref);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +
+ +	if (unlikely(!sess)) {
+ +		uint8_t *s_id =	atio->u.isp24.fcp_hdr.s_id;
+ +
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
+ +			"qla_target(%d): Unable to find wwn login"
+ +			" (s_id %x:%x:%x), trying to create it manually\n",
+ +			vha->vp_idx, s_id[0], s_id[1], s_id[2]);
+ +
+ +		if (atio->u.raw.entry_count > 1) {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
+ +				"Dropping multy entry cmd %p\n", cmd);
+ +			goto out_term;
+ +		}
+ +
+ +		mutex_lock(&ha->tgt.tgt_mutex);
+ +		sess = qlt_make_local_sess(vha, s_id);
+ +		/* sess has an extra creation ref. */
+ +		mutex_unlock(&ha->tgt.tgt_mutex);
+ +
+ +		if (!sess)
+ +			goto out_term;
+ +	}
+ +
+ +	cmd->sess = sess;
+ +	cmd->loop_id = sess->loop_id;
+ +	cmd->conf_compl_supported = sess->conf_compl_supported;
+ +
+++=======
+++>>>>>>> 51a07f84649d (qla2xxx: Convert to percpu_ida session tag pre-allocation)
+  	cdb = &atio->u.isp24.fcp_cmnd.cdb[0];
+  	cmd->tag = atio->u.isp24.exchange_addr;
+  	cmd->unpacked_lun = scsilun_to_int(
+@@@ -2681,10 -2556,105 +2694,112 @@@ out_term
+  	 */
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1);
+++<<<<<<< HEAD
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +	if (sess)
+ +		ha->tgt.tgt_ops->put_sess(sess);
+++=======
++ 	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
++ 	ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++>>>>>>> 51a07f84649d (qla2xxx: Convert to percpu_ida session tag pre-allocation)
++ }
++ 
++ static void qlt_do_work(struct work_struct *work)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
++ 
++ 	__qlt_do_work(cmd);
++ }
++ 
++ static struct qla_tgt_cmd *qlt_get_tag(scsi_qla_host_t *vha,
++ 				       struct qla_tgt_sess *sess,
++ 				       struct atio_from_isp *atio)
++ {
++ 	struct se_session *se_sess = sess->se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 	cmd->state = QLA_TGT_STATE_NEW;
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	cmd->vha = vha;
++ 	cmd->se_cmd.map_tag = tag;
++ 	cmd->sess = sess;
++ 	cmd->loop_id = sess->loop_id;
++ 	cmd->conf_compl_supported = sess->conf_compl_supported;
++ 
++ 	return cmd;
++ }
++ 
++ static void qlt_send_busy(struct scsi_qla_host *, struct atio_from_isp *,
++ 			  uint16_t);
++ 
++ static void qlt_create_sess_from_atio(struct work_struct *work)
++ {
++ 	struct qla_tgt_sess_op *op = container_of(work,
++ 					struct qla_tgt_sess_op, work);
++ 	scsi_qla_host_t *vha = op->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	uint8_t *s_id = op->atio.u.isp24.fcp_hdr.s_id;
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
++ 		"qla_target(%d): Unable to find wwn login"
++ 		" (s_id %x:%x:%x), trying to create it manually\n",
++ 		vha->vp_idx, s_id[0], s_id[1], s_id[2]);
++ 
++ 	if (op->atio.u.raw.entry_count > 1) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
++ 		        "Dropping multy entry atio %p\n", &op->atio);
++ 		goto out_term;
++ 	}
++ 
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 	sess = qlt_make_local_sess(vha, s_id);
++ 	/* sess has an extra creation ref. */
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	if (!sess)
++ 		goto out_term;
++ 	/*
++ 	 * Now obtain a pre-allocated session tag using the original op->atio
++ 	 * packet header, and dispatch into __qlt_do_work() using the existing
++ 	 * process context.
++ 	 */
++ 	cmd = qlt_get_tag(vha, sess, &op->atio);
++ 	if (!cmd) {
++ 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
++ 		ha->tgt.tgt_ops->put_sess(sess);
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		kfree(op);
++ 		return;
++ 	}
++ 	/*
++ 	 * __qlt_do_work() will call ha->tgt.tgt_ops->put_sess() to release
++ 	 * the extra reference taken above by qlt_make_local_sess()
++ 	 */
++ 	__qlt_do_work(cmd);
++ 	kfree(op);
++ 	return;
++ 
++ out_term:
++ 	spin_lock_irqsave(&ha->hardware_lock, flags);
++ 	qlt_send_term_exchange(vha, NULL, &op->atio, 1);
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 	kfree(op);
++ 
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -2692,7 -2662,8 +2807,12 @@@ static int qlt_handle_cmd_for_atio(stru
+  	struct atio_from_isp *atio)
+  {
+  	struct qla_hw_data *ha = vha->hw;
+++<<<<<<< HEAD
+ +	struct qla_tgt *tgt = ha->tgt.qla_tgt;
+++=======
++ 	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
++ 	struct qla_tgt_sess *sess;
+++>>>>>>> 51a07f84649d (qla2xxx: Convert to percpu_ida session tag pre-allocation)
+  	struct qla_tgt_cmd *cmd;
+  
+  	if (unlikely(tgt->tgt_stop)) {
+@@@ -2708,13 -2697,6 +2846,16 @@@
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&cmd->cmd_list);
+ +
+ +	memcpy(&cmd->atio, atio, sizeof(*atio));
+ +	cmd->state = QLA_TGT_STATE_NEW;
+ +	cmd->tgt = ha->tgt.qla_tgt;
+ +	cmd->vha = vha;
+ +
+++=======
+++>>>>>>> 51a07f84649d (qla2xxx: Convert to percpu_ida session tag pre-allocation)
+  	INIT_WORK(&cmd->work, qlt_do_work);
+  	queue_work(qla_tgt_wq, &cmd->work);
+  	return 0;
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 6af0f98e9585,7b3a97026934..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -1401,8 -1465,10 +1401,10 @@@ static int tcm_qla2xxx_check_initiator_
+  	struct qla_tgt_sess *sess = qla_tgt_sess;
+  	unsigned char port_name[36];
+  	unsigned long flags;
++ 	int num_tags = (ha->fw_xcb_count) ? ha->fw_xcb_count :
++ 		       TCM_QLA2XXX_DEFAULT_TAGS;
+  
+ -	lport = vha->vha_tgt.target_lport_ptr;
+ +	lport = ha->tgt.target_lport_ptr;
+  	if (!lport) {
+  		pr_err("Unable to locate struct tcm_qla2xxx_lport\n");
+  		dump_stack();
+@@@ -1418,7 -1484,9 +1420,13 @@@
+  	}
+  	se_tpg = &tpg->se_tpg;
+  
+++<<<<<<< HEAD
+ +	se_sess = transport_init_session();
+++=======
++ 	se_sess = transport_init_session_tags(num_tags,
++ 					      sizeof(struct qla_tgt_cmd),
++ 					      TARGET_PROT_NORMAL);
+++>>>>>>> 51a07f84649d (qla2xxx: Convert to percpu_ida session tag pre-allocation)
+  	if (IS_ERR(se_sess)) {
+  		pr_err("Unable to initialize struct se_session\n");
+  		return PTR_ERR(se_sess);
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0..d1baa7c7c0e7 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -805,6 +805,12 @@ struct qla_tgt {
+ 	struct list_head tgt_list_entry;
+ };
+ 
++struct qla_tgt_sess_op {
++	struct scsi_qla_host *vha;
++	struct atio_from_isp atio;
++	struct work_struct work;
++};
++
+ /*
+  * Equivilant to IT Nexus (Initiator-Target)
+  */
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.h b/drivers/scsi/qla2xxx/tcm_qla2xxx.h
+index cd2453b8f3ee..650b9433a7d6 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.h
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.h
+@@ -4,6 +4,11 @@
+ #define TCM_QLA2XXX_VERSION	"v0.1"
+ /* length of ASCII WWPNs including pad */
+ #define TCM_QLA2XXX_NAMELEN	32
++/*
++ * Number of pre-allocated per-session tags, based upon the worst-case
++ * per port number of iocbs
++ */
++#define TCM_QLA2XXX_DEFAULT_TAGS 2088
+ 
+ #include "qla_target.h"
+ 
