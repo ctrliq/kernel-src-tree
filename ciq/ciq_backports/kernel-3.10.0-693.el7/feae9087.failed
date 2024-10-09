@@ -1,0 +1,158 @@
+net/mlx5: Add devlink interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Add devlink interface (Don Dutile) [1383792 1417284]
+Rebuild_FUZZ: 93.10%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit feae908744d7f78b9dd06afda9de47f997f2d81a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/feae9087.failed
+
+The devlink interface is initially used to set/get the mode of the SRIOV e-switch.
+
+Currently, these are only stubs for get/set, down-stream patch will actually
+fill them out.
+
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit feae908744d7f78b9dd06afda9de47f997f2d81a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 7b5e70f8cc22,7843f981509d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -169,5 -200,23 +170,24 @@@ int mlx5_eswitch_get_vport_config(struc
+  int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+  				 int vport,
+  				 struct ifla_vf_stats *vf_stats);
+ -struct mlx5_flow_rule *
+ -mlx5_eswitch_add_send_to_vport_rule(struct mlx5_eswitch *esw, int vport, u32 sqn);
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_flow_rule *
++ mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, int vport, u32 tirn);
++ 
++ int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode);
++ int mlx5_devlink_eswitch_mode_get(struct devlink *devlink, u16 *mode);
++ 
++ #define MLX5_DEBUG_ESWITCH_MASK BIT(3)
++ 
++ #define esw_info(dev, format, ...)				\
++ 	pr_info("(%s): E-Switch: " format, (dev)->priv.name, ##__VA_ARGS__)
++ 
++ #define esw_warn(dev, format, ...)				\
++ 	pr_warn("(%s): E-Switch: " format, (dev)->priv.name, ##__VA_ARGS__)
++ 
++ #define esw_debug(dev, format, ...)				\
++ 	mlx5_core_dbg_mask(dev, MLX5_DEBUG_ESWITCH_MASK, format, ##__VA_ARGS__)
+++>>>>>>> feae908744d7 (net/mlx5: Add devlink interface)
+  #endif /* __MLX5_ESWITCH_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/Kconfig b/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+index 37150247c353..19b2ded01004 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+@@ -4,6 +4,7 @@
+ 
+ config MLX5_CORE
+ 	tristate "Mellanox Technologies ConnectX-4 and Connect-IB core driver"
++	depends on MAY_USE_DEVLINK
+ 	depends on PCI
+ 	default n
+ 	---help---
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 016601cbba64..ca102f666000 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -50,6 +50,7 @@
+ #ifdef CONFIG_RFS_ACCEL
+ #include <linux/cpu_rmap.h>
+ #endif
++#include <net/devlink.h>
+ #include "mlx5_core.h"
+ #include "fs_core.h"
+ #ifdef CONFIG_MLX5_CORE_EN
+@@ -1347,19 +1348,28 @@ struct mlx5_core_event_handler {
+ 		      void *data);
+ };
+ 
++static const struct devlink_ops mlx5_devlink_ops = {
++#ifdef CONFIG_MLX5_CORE_EN
++	.eswitch_mode_set = mlx5_devlink_eswitch_mode_set,
++	.eswitch_mode_get = mlx5_devlink_eswitch_mode_get,
++#endif
++};
+ 
+ static int init_one(struct pci_dev *pdev,
+ 		    const struct pci_device_id *id)
+ {
+ 	struct mlx5_core_dev *dev;
++	struct devlink *devlink;
+ 	struct mlx5_priv *priv;
+ 	int err;
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+-	if (!dev) {
++	devlink = devlink_alloc(&mlx5_devlink_ops, sizeof(*dev));
++	if (!devlink) {
+ 		dev_err(&pdev->dev, "kzalloc failed\n");
+ 		return -ENOMEM;
+ 	}
++
++	dev = devlink_priv(devlink);
+ 	priv = &dev->priv;
+ 	priv->pci_dev_data = id->driver_data;
+ 
+@@ -1397,15 +1407,21 @@ static int init_one(struct pci_dev *pdev,
+ 		goto clean_health;
+ 	}
+ 
++	err = devlink_register(devlink, &pdev->dev);
++	if (err)
++		goto clean_load;
++
+ 	return 0;
+ 
++clean_load:
++	mlx5_unload_one(dev, priv);
+ clean_health:
+ 	mlx5_health_cleanup(dev);
+ close_pci:
+ 	mlx5_pci_close(dev, priv);
+ clean_dev:
+ 	pci_set_drvdata(pdev, NULL);
+-	kfree(dev);
++	devlink_free(devlink);
+ 
+ 	return err;
+ }
+@@ -1413,8 +1429,10 @@ clean_dev:
+ static void remove_one(struct pci_dev *pdev)
+ {
+ 	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
++	struct devlink *devlink = priv_to_devlink(dev);
+ 	struct mlx5_priv *priv = &dev->priv;
+ 
++	devlink_unregister(devlink);
+ 	if (mlx5_unload_one(dev, priv)) {
+ 		dev_err(&dev->pdev->dev, "mlx5_unload_one failed\n");
+ 		mlx5_health_cleanup(dev);
+@@ -1423,7 +1441,7 @@ static void remove_one(struct pci_dev *pdev)
+ 	mlx5_health_cleanup(dev);
+ 	mlx5_pci_close(dev, priv);
+ 	pci_set_drvdata(pdev, NULL);
+-	kfree(dev);
++	devlink_free(devlink);
+ }
+ 
+ static pci_ers_result_t mlx5_pci_err_detected(struct pci_dev *pdev,
