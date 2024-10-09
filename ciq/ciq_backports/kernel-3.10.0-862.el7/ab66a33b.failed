@@ -1,0 +1,218 @@
+x86/intel_rdt/mba: Memory bandwith allocation feature detect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mba: Memory bandwith allocation feature detect (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 96.55%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit ab66a33b032eb5b8186aeaf648127bce829c9efd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ab66a33b.failed
+
+Detect MBA feature if CPUID.(EAX=10H, ECX=0):EBX.L2[bit 3] = 1.
+Add supporting data structures to detect feature details which is done
+in later patch using CPUID with EAX=10H, ECX= 3.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1491611637-20417-4-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit ab66a33b032eb5b8186aeaf648127bce829c9efd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/include/asm/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/scattered.c
+diff --cc arch/x86/include/asm/intel_rdt.h
+index 06f50d0ed14f,6295594bd673..000000000000
+--- a/arch/x86/include/asm/intel_rdt.h
++++ b/arch/x86/include/asm/intel_rdt.h
+@@@ -172,8 -184,16 +172,21 @@@ union cpuid_0x10_1_eax 
+  	unsigned int full;
+  };
+  
+++<<<<<<< HEAD
+ +/* CPUID.(EAX=10H, ECX=ResID=1).EDX */
+ +union cpuid_0x10_1_edx {
+++=======
++ /* CPUID.(EAX=10H, ECX=ResID=3).EAX */
++ union cpuid_0x10_3_eax {
++ 	struct {
++ 		unsigned int max_delay:12;
++ 	} split;
++ 	unsigned int full;
++ };
++ 
++ /* CPUID.(EAX=10H, ECX=ResID).EDX */
++ union cpuid_0x10_x_edx {
+++>>>>>>> ab66a33b032e (x86/intel_rdt/mba: Memory bandwith allocation feature detect)
+  	struct {
+  		unsigned int cos_max:16;
+  	} split;
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,82eafd643632..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -398,68 -388,53 +398,81 @@@ static int intel_rdt_offline_cpu(unsign
+  	return 0;
+  }
+  
+ -/*
+ - * Choose a width for the resource name and resource data based on the
+ - * resource that has widest name and cbm.
+ - */
+ -static __init void rdt_init_padding(void)
+ +static int
+ +rdt_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
+  {
+ -	struct rdt_resource *r;
+ -	int cl;
+ +       unsigned int cpu = (long)hcpu;
+  
+ -	for_each_enabled_rdt_resource(r) {
+ -		cl = strlen(r->name);
+ -		if (cl > max_name_width)
+ -			max_name_width = cl;
+ +       switch (action & ~CPU_TASKS_FROZEN) {
+  
+ -		if (r->data_width > max_data_width)
+ -			max_data_width = r->data_width;
+ -	}
+ +       case CPU_ONLINE:
+ +       case CPU_DOWN_FAILED:
+ +               intel_rdt_online_cpu(cpu, true);
+ +               break;
+ +
+ +       case CPU_UP_CANCELED:
+ +       case CPU_DOWN_PREPARE:
+ +               intel_rdt_offline_cpu(cpu);
+ +               break;
+ +       default:
+ +               break;
+ +       }
+ +
+ +       return NOTIFY_OK;
+  }
+  
+ -static __init bool get_rdt_resources(void)
+ +static void __init rdt_cpu_setup(void *dummy)
+  {
+ -	bool ret = false;
+ +	struct rdt_resource *r;
+ +	int i;
+  
+ -	if (cache_alloc_hsw_probe())
+ -		return true;
+ +	clear_closid(smp_processor_id());
+  
+ -	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ -		return false;
+ +	for_each_capable_rdt_resource(r) {
+ +		for (i = 0; i < r->num_closid; i++) {
+ +			int idx = cbm_idx(r, i);
+  
+ -	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ -		rdt_get_cache_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ -		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ -			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ -			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +			wrmsrl(r->msr_base + idx, r->max_cbm);
+  		}
+ -		ret = true;
+  	}
+ +}
+ +
+ +static struct notifier_block rdt_cpu_nb = {
+ +	.notifier_call  = rdt_cpu_notify,
+ +	.priority	= -INT_MAX,
+ +};
+ +
+ +static int __init rdt_notifier_init(void)
+ +{
+ +	unsigned int cpu;
+ +
+ +	for_each_online_cpu(cpu) {
+ +		intel_rdt_online_cpu(cpu, false);
+ +		/*
+ +		 * RHEL7 - The upstream hotplug notification invokes the
+ +		 *         callbacks on related cpus, but that's not the
+ +		 *         case of the RHEL7 notification support.
+ +		 *         Following call ensures we run all the msr
+ +		 *         initialization setup on related cpus.
+ +		 */
+ +		smp_call_function_single(cpu, rdt_cpu_setup, NULL, 1);
+ +	}
+++<<<<<<< HEAD
+ +
+ +	__register_cpu_notifier(&rdt_cpu_nb);
+ +	return 0;
+++=======
++ 	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
++ 		/* CPUID 0x10.2 fields are same format at 0x10.1 */
++ 		rdt_get_cache_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
++ 		ret = true;
++ 	}
++ 
++ 	if (boot_cpu_has(X86_FEATURE_MBA))
++ 		ret = true;
++ 
++ 	return ret;
+++>>>>>>> ab66a33b032e (x86/intel_rdt/mba: Memory bandwith allocation feature detect)
+  }
+  
+  static int __init intel_rdt_late_init(void)
+diff --cc arch/x86/kernel/cpu/scattered.c
+index 1f6b3fec429c,23c23508c012..000000000000
+--- a/arch/x86/kernel/cpu/scattered.c
++++ b/arch/x86/kernel/cpu/scattered.c
+@@@ -19,22 -19,21 +19,38 @@@ struct cpuid_bit 
+  
+  /* Please keep the leaf sorted by cpuid_bit.level for faster search. */
+  static const struct cpuid_bit cpuid_bits[] = {
+++<<<<<<< HEAD
+ +	{ X86_FEATURE_INTEL_PT,		CPUID_EBX,25, 0x00000007, 0 },
+ +	{ X86_FEATURE_AVX512_4VNNIW,	CPUID_EDX, 2, 0x00000007, 0 },
+ +	{ X86_FEATURE_AVX512_4FMAPS,	CPUID_EDX, 3, 0x00000007, 0 },
+ +	{ X86_FEATURE_APERFMPERF,	CPUID_ECX, 0, 0x00000006, 0 },
+ +	{ X86_FEATURE_EPB,		CPUID_ECX, 3, 0x00000006, 0 },
+ +	{ X86_FEATURE_CAT_L3,		CPUID_EBX, 1, 0x00000010, 0 },
+ +	{ X86_FEATURE_CAT_L2,		CPUID_EBX, 2, 0x00000010, 0 },
+ +	{ X86_FEATURE_CDP_L3,		CPUID_ECX, 2, 0x00000010, 1 },
+ +	{ X86_FEATURE_HW_PSTATE,	CPUID_EDX, 7, 0x80000007, 0 },
+ +	{ X86_FEATURE_CPB,		CPUID_EDX, 9, 0x80000007, 0 },
+ +	{ X86_FEATURE_PROC_FEEDBACK,	CPUID_EDX,11, 0x80000007, 0 },
+ +	{ X86_FEATURE_AVIC,       	CPUID_EDX,13, 0x8000000a, 0 },
+ +	{ 0, 0, 0, 0 }
+++=======
++ 	{ X86_FEATURE_APERFMPERF,       CPUID_ECX,  0, 0x00000006, 0 },
++ 	{ X86_FEATURE_EPB,		CPUID_ECX,  3, 0x00000006, 0 },
++ 	{ X86_FEATURE_INTEL_PT,		CPUID_EBX, 25, 0x00000007, 0 },
++ 	{ X86_FEATURE_AVX512_4VNNIW,    CPUID_EDX,  2, 0x00000007, 0 },
++ 	{ X86_FEATURE_AVX512_4FMAPS,    CPUID_EDX,  3, 0x00000007, 0 },
++ 	{ X86_FEATURE_CAT_L3,		CPUID_EBX,  1, 0x00000010, 0 },
++ 	{ X86_FEATURE_CAT_L2,		CPUID_EBX,  2, 0x00000010, 0 },
++ 	{ X86_FEATURE_CDP_L3,		CPUID_ECX,  2, 0x00000010, 1 },
++ 	{ X86_FEATURE_MBA,		CPUID_EBX,  3, 0x00000010, 0 },
++ 	{ X86_FEATURE_HW_PSTATE,	CPUID_EDX,  7, 0x80000007, 0 },
++ 	{ X86_FEATURE_CPB,		CPUID_EDX,  9, 0x80000007, 0 },
++ 	{ X86_FEATURE_PROC_FEEDBACK,    CPUID_EDX, 11, 0x80000007, 0 },
++ 	{ 0, 0, 0, 0, 0 }
+++>>>>>>> ab66a33b032e (x86/intel_rdt/mba: Memory bandwith allocation feature detect)
+  };
+  
+ +
+  void init_scattered_cpuid_features(struct cpuinfo_x86 *c)
+  {
+  	u32 max_level;
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/include/asm/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/scattered.c
