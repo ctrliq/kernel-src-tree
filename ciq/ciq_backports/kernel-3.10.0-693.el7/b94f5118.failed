@@ -1,0 +1,115 @@
+kernel/watchdog: prevent false hardlockup on overloaded system
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [kernel] watchdog: prevent false hardlockup on overloaded system (Don Zickus) [1399881]
+Rebuild_FUZZ: 94.02%
+commit-author Don Zickus <dzickus@redhat.com>
+commit b94f51183b0617e7b9b4fb4137d4cf1cab7547c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b94f5118.failed
+
+On an overloaded system, it is possible that a change in the watchdog
+threshold can be delayed long enough to trigger a false positive.
+
+This can easily be achieved by having a cpu spinning indefinitely on a
+task, while another cpu updates watchdog threshold.
+
+What happens is while trying to park the watchdog threads, the hrtimers
+on the other cpus trigger and reprogram themselves with the new slower
+watchdog threshold.  Meanwhile, the nmi watchdog is still programmed
+with the old faster threshold.
+
+Because the one cpu is blocked, it prevents the thread parking on the
+other cpus from completing, which is needed to shutdown the nmi watchdog
+and reprogram it correctly.  As a result, a false positive from the nmi
+watchdog is reported.
+
+Fix this by setting a park_in_progress flag to block all lockups until
+the parking is complete.
+
+Fix provided by Ulrich Obergfell.
+
+[akpm@linux-foundation.org: s/park_in_progress/watchdog_park_in_progress/]
+Link: http://lkml.kernel.org/r/1481041033-192236-1-git-send-email-dzickus@redhat.com
+	Signed-off-by: Don Zickus <dzickus@redhat.com>
+	Reviewed-by: Aaron Tomlin <atomlin@redhat.com>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b94f51183b0617e7b9b4fb4137d4cf1cab7547c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nmi.h
+#	kernel/watchdog_hld.c
+diff --cc include/linux/nmi.h
+index 6fee1cdf0225,0a3fadc32693..000000000000
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@@ -65,9 -108,17 +65,16 @@@ extern int nmi_watchdog_enabled
+  extern int soft_watchdog_enabled;
+  extern int watchdog_user_enabled;
+  extern int watchdog_thresh;
+++<<<<<<< HEAD
+ +extern struct cpumask watchdog_cpumask;
+++=======
++ extern unsigned long watchdog_enabled;
++ extern unsigned long *watchdog_cpumask_bits;
++ extern atomic_t watchdog_park_in_progress;
++ #ifdef CONFIG_SMP
+++>>>>>>> b94f51183b06 (kernel/watchdog: prevent false hardlockup on overloaded system)
+  extern int sysctl_softlockup_all_cpu_backtrace;
+  extern int sysctl_hardlockup_all_cpu_backtrace;
+ -#else
+ -#define sysctl_softlockup_all_cpu_backtrace 0
+ -#define sysctl_hardlockup_all_cpu_backtrace 0
+ -#endif
+ -extern bool is_hardlockup(void);
+  struct ctl_table;
+  extern int proc_watchdog(struct ctl_table *, int ,
+  			 void __user *, size_t *, loff_t *);
+* Unmerged path kernel/watchdog_hld.c
+* Unmerged path include/linux/nmi.h
+diff --git a/kernel/watchdog.c b/kernel/watchdog.c
+index a642e6e9a095..6ad7ad7412fd 100644
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -69,6 +69,8 @@ struct cpumask watchdog_cpumask __read_mostly;
+ #define for_each_watchdog_cpu(cpu) \
+ 	for_each_cpu_and((cpu), cpu_online_mask, &watchdog_cpumask)
+ 
++atomic_t watchdog_park_in_progress = ATOMIC_INIT(0);
++
+ /*
+  * The 'watchdog_running' variable is set to 1 when the watchdog threads
+  * are registered/started and is set to 0 when the watchdog threads are
+@@ -392,6 +394,9 @@ static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
+ 	int duration;
+ 	int softlockup_all_cpu_backtrace = sysctl_softlockup_all_cpu_backtrace;
+ 
++	if (atomic_read(&watchdog_park_in_progress) != 0)
++		return HRTIMER_NORESTART;
++
+ 	/* kick the hardlockup detector */
+ 	watchdog_interrupt_count();
+ 
+@@ -702,12 +707,16 @@ static int watchdog_park_threads(void)
+ {
+ 	int cpu, ret = 0;
+ 
++	atomic_set(&watchdog_park_in_progress, 1);
++
+ 	for_each_watchdog_cpu(cpu) {
+ 		ret = kthread_park(per_cpu(softlockup_watchdog, cpu));
+ 		if (ret)
+ 			break;
+ 	}
+ 
++	atomic_set(&watchdog_park_in_progress, 0);
++
+ 	return ret;
+ }
+ 
+* Unmerged path kernel/watchdog_hld.c
