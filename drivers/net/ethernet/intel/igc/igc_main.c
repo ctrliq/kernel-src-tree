@@ -4228,6 +4228,7 @@ static int igc_probe(struct pci_dev *pdev,
 
 	/* Add supported features to the features list*/
 	netdev->features |= NETIF_F_HW_CSUM;
+	netdev->features |= NETIF_F_SCTP_CRC;
 
 	/* setup the private structure */
 	err = igc_sw_init(adapter);
