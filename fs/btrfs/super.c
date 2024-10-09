@@ -2230,7 +2230,7 @@ static void btrfs_interface_exit(void)
 		printk(KERN_INFO "BTRFS: misc_deregister failed for control device\n");
 }
 
-static void btrfs_print_info(void)
+static void btrfs_print_mod_info(void)
 {
 	printk(KERN_INFO "Btrfs loaded"
 #ifdef CONFIG_BTRFS_DEBUG
@@ -2329,7 +2329,7 @@ static int __init init_btrfs_fs(void)
 
 	btrfs_init_lockdep();
 
-	btrfs_print_info();
+	btrfs_print_mod_info();
 
 	err = btrfs_run_sanity_tests();
 	if (err)
