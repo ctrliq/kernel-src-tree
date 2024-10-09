@@ -1,0 +1,142 @@
+mlxsw: spectrum_router: Add helpers for neighbor access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Arkadi Sharshevsky <arkadis@mellanox.com>
+commit f17cc84d1c2f661cb29cb7efc58f9d654ef3c643
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f17cc84d.failed
+
+This is done as a preparation before introducing the ability to dump the
+host table via dpipe, and to count the table size. The mlxsw's neighbor
+representative struct stays private to the router module.
+
+	Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f17cc84d1c2f661cb29cb7efc58f9d654ef3c643)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/node_subscr.h
+diff --cc net/tipc/node_subscr.h
+index c95d20727ded,80ac032d64a2..000000000000
+--- a/net/tipc/node_subscr.h
++++ b/net/tipc/node_subscr.h
+@@@ -34,30 -32,42 +34,60 @@@
+   * POSSIBILITY OF SUCH DAMAGE.
+   */
+  
+ -#ifndef _MLXSW_ROUTER_H_
+ -#define _MLXSW_ROUTER_H_
+ +#ifndef _TIPC_NODE_SUBSCR_H
+ +#define _TIPC_NODE_SUBSCR_H
+ +
+ +#include "addr.h"
+  
+ -#include "spectrum.h"
+ +typedef void (*net_ev_handler) (void *usr_handle);
+  
+ -enum mlxsw_sp_rif_counter_dir {
+ -	MLXSW_SP_RIF_COUNTER_INGRESS,
+ -	MLXSW_SP_RIF_COUNTER_EGRESS,
+ +/**
+ + * struct tipc_node_subscr - "node down" subscription entry
+ + * @node: ptr to node structure of interest (or NULL, if none)
+ + * @handle_node_down: routine to invoke when node fails
+ + * @usr_handle: argument to pass to routine when node fails
+ + * @nodesub_list: adjacent entries in list of subscriptions for the node
+ + */
+ +struct tipc_node_subscr {
+ +	struct tipc_node *node;
+ +	net_ev_handler handle_node_down;
+ +	void *usr_handle;
+ +	struct list_head nodesub_list;
+  };
+  
+++<<<<<<< HEAD:net/tipc/node_subscr.h
+ +void tipc_nodesub_subscribe(struct tipc_node_subscr *node_sub, u32 addr,
+ +			    void *usr_handle, net_ev_handler handle_down);
+ +void tipc_nodesub_unsubscribe(struct tipc_node_subscr *node_sub);
+ +void tipc_nodesub_notify(struct tipc_node *node);
+++=======
++ struct mlxsw_sp_neigh_entry;
++ 
++ struct mlxsw_sp_rif *mlxsw_sp_rif_by_index(const struct mlxsw_sp *mlxsw_sp,
++ 					   u16 rif_index);
++ u16 mlxsw_sp_rif_index(const struct mlxsw_sp_rif *rif);
++ int mlxsw_sp_rif_dev_ifindex(const struct mlxsw_sp_rif *rif);
++ int mlxsw_sp_rif_counter_value_get(struct mlxsw_sp *mlxsw_sp,
++ 				   struct mlxsw_sp_rif *rif,
++ 				   enum mlxsw_sp_rif_counter_dir dir,
++ 				   u64 *cnt);
++ void mlxsw_sp_rif_counter_free(struct mlxsw_sp *mlxsw_sp,
++ 			       struct mlxsw_sp_rif *rif,
++ 			       enum mlxsw_sp_rif_counter_dir dir);
++ int mlxsw_sp_rif_counter_alloc(struct mlxsw_sp *mlxsw_sp,
++ 			       struct mlxsw_sp_rif *rif,
++ 			       enum mlxsw_sp_rif_counter_dir dir);
++ struct mlxsw_sp_neigh_entry *
++ mlxsw_sp_rif_neigh_next(struct mlxsw_sp_rif *rif,
++ 			struct mlxsw_sp_neigh_entry *neigh_entry);
++ int mlxsw_sp_neigh_entry_type(struct mlxsw_sp_neigh_entry *neigh_entry);
++ unsigned char *
++ mlxsw_sp_neigh_entry_ha(struct mlxsw_sp_neigh_entry *neigh_entry);
++ u32 mlxsw_sp_neigh4_entry_dip(struct mlxsw_sp_neigh_entry *neigh_entry);
++ 
++ #define mlxsw_sp_rif_neigh_for_each(neigh_entry, rif)				\
++ 	for (neigh_entry = mlxsw_sp_rif_neigh_next(rif, NULL); neigh_entry;	\
++ 	     neigh_entry = mlxsw_sp_rif_neigh_next(rif, neigh_entry))
+++>>>>>>> f17cc84d1c2f (mlxsw: spectrum_router: Add helpers for neighbor access):drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+  
+ -#endif /* _MLXSW_ROUTER_H_*/
+ +#endif
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 6908726c154c..07dda3c9303f 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@ -613,6 +613,42 @@ static const struct rhashtable_params mlxsw_sp_neigh_ht_params = {
+ 	.key_len = sizeof(struct mlxsw_sp_neigh_key),
+ };
+ 
++struct mlxsw_sp_neigh_entry *
++mlxsw_sp_rif_neigh_next(struct mlxsw_sp_rif *rif,
++			struct mlxsw_sp_neigh_entry *neigh_entry)
++{
++	if (!neigh_entry) {
++		if (list_empty(&rif->neigh_list))
++			return NULL;
++		else
++			return list_first_entry(&rif->neigh_list,
++						typeof(*neigh_entry),
++						rif_list_node);
++	}
++	if (neigh_entry->rif_list_node.next == &rif->neigh_list)
++		return NULL;
++	return list_next_entry(neigh_entry, rif_list_node);
++}
++
++int mlxsw_sp_neigh_entry_type(struct mlxsw_sp_neigh_entry *neigh_entry)
++{
++	return neigh_entry->key.n->tbl->family;
++}
++
++unsigned char *
++mlxsw_sp_neigh_entry_ha(struct mlxsw_sp_neigh_entry *neigh_entry)
++{
++	return neigh_entry->ha;
++}
++
++u32 mlxsw_sp_neigh4_entry_dip(struct mlxsw_sp_neigh_entry *neigh_entry)
++{
++	struct neighbour *n;
++
++	n = neigh_entry->key.n;
++	return ntohl(*((__be32 *) n->primary_key));
++}
++
+ static struct mlxsw_sp_neigh_entry *
+ mlxsw_sp_neigh_entry_alloc(struct mlxsw_sp *mlxsw_sp, struct neighbour *n,
+ 			   u16 rif)
+* Unmerged path net/tipc/node_subscr.h
