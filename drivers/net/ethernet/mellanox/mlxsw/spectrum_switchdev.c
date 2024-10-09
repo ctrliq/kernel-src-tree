@@ -118,6 +118,9 @@ static int mlxsw_sp_port_attr_get(struct net_device *dev,
 			(mlxsw_sp_port->learning_sync ? BR_LEARNING_SYNC : 0) |
 			(mlxsw_sp_port->uc_flood ? BR_FLOOD : 0);
 		break;
+	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS_SUPPORT:
+		attr->u.brport_flags_support = BR_LEARNING | BR_FLOOD;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
