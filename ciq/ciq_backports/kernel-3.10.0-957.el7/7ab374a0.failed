@@ -1,0 +1,399 @@
+iio: kfifo: Remove unused argument in iio_kfifo_allocate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] kfifo: Remove unused argument in iio_kfifo_allocate (Tony Camuso) [1559170]
+Rebuild_FUZZ: 95.33%
+commit-author Karol Wrona <k.wrona@samsung.com>
+commit 7ab374a053a43050117eb452306b6cd9dcb58cfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7ab374a0.failed
+
+indio_dev was unused in function body plus some small style fix - add new
+lines after "if(sth) return sth" and before the last return statement.
+
+The argument was removed also in its client.
+
+	Signed-off-by: Karol Wrona <k.wrona@samsung.com>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 7ab374a053a43050117eb452306b6cd9dcb58cfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/adc/ti_am335x_adc.c
+#	drivers/iio/industrialio-triggered-buffer.c
+#	drivers/iio/kfifo_buf.c
+#	drivers/staging/iio/impedance-analyzer/ad5933.c
+#	drivers/staging/iio/meter/ade7758_ring.c
+diff --cc drivers/iio/adc/ti_am335x_adc.c
+index 5f9a7e7d3135,5eea299518a3..000000000000
+--- a/drivers/iio/adc/ti_am335x_adc.c
++++ b/drivers/iio/adc/ti_am335x_adc.c
+@@@ -58,23 -99,203 +58,199 @@@ static void tiadc_step_config(struct ti
+  	 */
+  
+  	steps = TOTAL_STEPS - adc_dev->channels;
+ -	if (iio_buffer_enabled(indio_dev))
+ -		stepconfig = STEPCONFIG_AVG_16 | STEPCONFIG_FIFO1
+ -					| STEPCONFIG_MODE_SWCNT;
+ -	else
+ -		stepconfig = STEPCONFIG_AVG_16 | STEPCONFIG_FIFO1;
+ -
+ -	for (i = 0; i < adc_dev->channels; i++) {
+ -		int chan;
+ -
+ -		chan = adc_dev->channel_line[i];
+ -		tiadc_writel(adc_dev, REG_STEPCONFIG(steps),
+ -				stepconfig | STEPCONFIG_INP(chan));
+ -		tiadc_writel(adc_dev, REG_STEPDELAY(steps),
+ +	channels = TOTAL_CHANNELS - adc_dev->channels;
+ +
+ +	stepconfig = STEPCONFIG_AVG_16 | STEPCONFIG_FIFO1;
+ +
+ +	for (i = (steps + 1); i <= TOTAL_STEPS; i++) {
+ +		tiadc_writel(adc_dev, REG_STEPCONFIG(i),
+ +				stepconfig | STEPCONFIG_INP(channels));
+ +		tiadc_writel(adc_dev, REG_STEPDELAY(i),
+  				STEPCONFIG_OPENDLY);
+ -		adc_dev->channel_step[i] = steps;
+ -		steps++;
+ +		channels++;
+  	}
+ +	tiadc_writel(adc_dev, REG_SE, STPENB_STEPENB);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static irqreturn_t tiadc_irq_h(int irq, void *private)
++ {
++ 	struct iio_dev *indio_dev = private;
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	unsigned int status, config;
++ 	status = tiadc_readl(adc_dev, REG_IRQSTATUS);
++ 
++ 	/*
++ 	 * ADC and touchscreen share the IRQ line.
++ 	 * FIFO0 interrupts are used by TSC. Handle FIFO1 IRQs here only
++ 	 */
++ 	if (status & IRQENB_FIFO1OVRRUN) {
++ 		/* FIFO Overrun. Clear flag. Disable/Enable ADC to recover */
++ 		config = tiadc_readl(adc_dev, REG_CTRL);
++ 		config &= ~(CNTRLREG_TSCSSENB);
++ 		tiadc_writel(adc_dev, REG_CTRL, config);
++ 		tiadc_writel(adc_dev, REG_IRQSTATUS, IRQENB_FIFO1OVRRUN
++ 				| IRQENB_FIFO1UNDRFLW | IRQENB_FIFO1THRES);
++ 		tiadc_writel(adc_dev, REG_CTRL, (config | CNTRLREG_TSCSSENB));
++ 		return IRQ_HANDLED;
++ 	} else if (status & IRQENB_FIFO1THRES) {
++ 		/* Disable irq and wake worker thread */
++ 		tiadc_writel(adc_dev, REG_IRQCLR, IRQENB_FIFO1THRES);
++ 		return IRQ_WAKE_THREAD;
++ 	}
++ 
++ 	return IRQ_NONE;
++ }
++ 
++ static irqreturn_t tiadc_worker_h(int irq, void *private)
++ {
++ 	struct iio_dev *indio_dev = private;
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	int i, k, fifo1count, read;
++ 	u16 *data = adc_dev->data;
++ 
++ 	fifo1count = tiadc_readl(adc_dev, REG_FIFO1CNT);
++ 	for (k = 0; k < fifo1count; k = k + i) {
++ 		for (i = 0; i < (indio_dev->scan_bytes)/2; i++) {
++ 			read = tiadc_readl(adc_dev, REG_FIFO1);
++ 			data[i] = read & FIFOREAD_DATA_MASK;
++ 		}
++ 		iio_push_to_buffers(indio_dev, (u8 *) data);
++ 	}
++ 
++ 	tiadc_writel(adc_dev, REG_IRQSTATUS, IRQENB_FIFO1THRES);
++ 	tiadc_writel(adc_dev, REG_IRQENABLE, IRQENB_FIFO1THRES);
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static int tiadc_buffer_preenable(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	int i, fifo1count, read;
++ 
++ 	tiadc_writel(adc_dev, REG_IRQCLR, (IRQENB_FIFO1THRES |
++ 				IRQENB_FIFO1OVRRUN |
++ 				IRQENB_FIFO1UNDRFLW));
++ 
++ 	/* Flush FIFO. Needed in corner cases in simultaneous tsc/adc use */
++ 	fifo1count = tiadc_readl(adc_dev, REG_FIFO1CNT);
++ 	for (i = 0; i < fifo1count; i++)
++ 		read = tiadc_readl(adc_dev, REG_FIFO1);
++ 
++ 	return 0;
++ }
++ 
++ static int tiadc_buffer_postenable(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	struct iio_buffer *buffer = indio_dev->buffer;
++ 	unsigned int enb = 0;
++ 	u8 bit;
++ 
++ 	tiadc_step_config(indio_dev);
++ 	for_each_set_bit(bit, buffer->scan_mask, adc_dev->channels)
++ 		enb |= (get_adc_step_bit(adc_dev, bit) << 1);
++ 	adc_dev->buffer_en_ch_steps = enb;
++ 
++ 	am335x_tsc_se_set_cache(adc_dev->mfd_tscadc, enb);
++ 
++ 	tiadc_writel(adc_dev,  REG_IRQSTATUS, IRQENB_FIFO1THRES
++ 				| IRQENB_FIFO1OVRRUN | IRQENB_FIFO1UNDRFLW);
++ 	tiadc_writel(adc_dev,  REG_IRQENABLE, IRQENB_FIFO1THRES
++ 				| IRQENB_FIFO1OVRRUN);
++ 
++ 	return 0;
++ }
++ 
++ static int tiadc_buffer_predisable(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	int fifo1count, i, read;
++ 
++ 	tiadc_writel(adc_dev, REG_IRQCLR, (IRQENB_FIFO1THRES |
++ 				IRQENB_FIFO1OVRRUN | IRQENB_FIFO1UNDRFLW));
++ 	am335x_tsc_se_clr(adc_dev->mfd_tscadc, adc_dev->buffer_en_ch_steps);
++ 	adc_dev->buffer_en_ch_steps = 0;
++ 
++ 	/* Flush FIFO of leftover data in the time it takes to disable adc */
++ 	fifo1count = tiadc_readl(adc_dev, REG_FIFO1CNT);
++ 	for (i = 0; i < fifo1count; i++)
++ 		read = tiadc_readl(adc_dev, REG_FIFO1);
++ 
++ 	return 0;
++ }
++ 
++ static int tiadc_buffer_postdisable(struct iio_dev *indio_dev)
++ {
++ 	tiadc_step_config(indio_dev);
++ 
++ 	return 0;
++ }
++ 
++ static const struct iio_buffer_setup_ops tiadc_buffer_setup_ops = {
++ 	.preenable = &tiadc_buffer_preenable,
++ 	.postenable = &tiadc_buffer_postenable,
++ 	.predisable = &tiadc_buffer_predisable,
++ 	.postdisable = &tiadc_buffer_postdisable,
++ };
++ 
++ static int tiadc_iio_buffered_hardware_setup(struct iio_dev *indio_dev,
++ 	irqreturn_t (*pollfunc_bh)(int irq, void *p),
++ 	irqreturn_t (*pollfunc_th)(int irq, void *p),
++ 	int irq,
++ 	unsigned long flags,
++ 	const struct iio_buffer_setup_ops *setup_ops)
++ {
++ 	struct iio_buffer *buffer;
++ 	int ret;
++ 
++ 	buffer = iio_kfifo_allocate();
++ 	if (!buffer)
++ 		return -ENOMEM;
++ 
++ 	iio_device_attach_buffer(indio_dev, buffer);
++ 
++ 	ret = request_threaded_irq(irq,	pollfunc_th, pollfunc_bh,
++ 				flags, indio_dev->name, indio_dev);
++ 	if (ret)
++ 		goto error_kfifo_free;
++ 
++ 	indio_dev->setup_ops = setup_ops;
++ 	indio_dev->modes |= INDIO_BUFFER_HARDWARE;
++ 
++ 	return 0;
++ 
++ error_kfifo_free:
++ 	iio_kfifo_free(indio_dev->buffer);
++ 	return ret;
++ }
++ 
++ static void tiadc_iio_buffered_hardware_remove(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 
++ 	free_irq(adc_dev->mfd_tscadc->irq, indio_dev);
++ 	iio_kfifo_free(indio_dev->buffer);
++ }
++ 
++ 
++ static const char * const chan_name_ain[] = {
++ 	"AIN0",
++ 	"AIN1",
++ 	"AIN2",
++ 	"AIN3",
++ 	"AIN4",
++ 	"AIN5",
++ 	"AIN6",
++ 	"AIN7",
++ };
++ 
+++>>>>>>> 7ab374a053a4 (iio: kfifo: Remove unused argument in iio_kfifo_allocate)
+  static int tiadc_channel_init(struct iio_dev *indio_dev, int channels)
+  {
+ -	struct tiadc_device *adc_dev = iio_priv(indio_dev);
+  	struct iio_chan_spec *chan_array;
+ -	struct iio_chan_spec *chan;
+  	int i;
+  
+  	indio_dev->num_channels = channels;
+diff --cc drivers/iio/industrialio-triggered-buffer.c
+index 19eaf7c3b7c0,15a5341b5e7b..000000000000
+--- a/drivers/iio/industrialio-triggered-buffer.c
++++ b/drivers/iio/industrialio-triggered-buffer.c
+@@@ -46,10 -46,11 +46,15 @@@ int iio_triggered_buffer_setup(struct i
+  	irqreturn_t (*pollfunc_th)(int irq, void *p),
+  	const struct iio_buffer_setup_ops *setup_ops)
+  {
+ -	struct iio_buffer *buffer;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	indio_dev->buffer = iio_kfifo_allocate(indio_dev);
+ +	if (!indio_dev->buffer) {
+++=======
++ 	buffer = iio_kfifo_allocate();
++ 	if (!buffer) {
+++>>>>>>> 7ab374a053a4 (iio: kfifo: Remove unused argument in iio_kfifo_allocate)
+  		ret = -ENOMEM;
+  		goto error_ret;
+  	}
+diff --cc drivers/iio/kfifo_buf.c
+index 1bea41bcbdc6,7f6fad658e83..000000000000
+--- a/drivers/iio/kfifo_buf.c
++++ b/drivers/iio/kfifo_buf.c
+@@@ -133,25 -133,27 +133,31 @@@ static int iio_read_first_n_kfifo(struc
+  static const struct iio_buffer_access_funcs kfifo_access_funcs = {
+  	.store_to = &iio_store_to_kfifo,
+  	.read_first_n = &iio_read_first_n_kfifo,
+ -	.data_available = iio_kfifo_buf_data_available,
+  	.request_update = &iio_request_update_kfifo,
+ +	.get_bytes_per_datum = &iio_get_bytes_per_datum_kfifo,
+  	.set_bytes_per_datum = &iio_set_bytes_per_datum_kfifo,
+ +	.get_length = &iio_get_length_kfifo,
+  	.set_length = &iio_set_length_kfifo,
+ -	.release = &iio_kfifo_buffer_release,
+  };
+  
+- struct iio_buffer *iio_kfifo_allocate(struct iio_dev *indio_dev)
++ struct iio_buffer *iio_kfifo_allocate(void)
+  {
+  	struct iio_kfifo *kf;
+  
+- 	kf = kzalloc(sizeof *kf, GFP_KERNEL);
++ 	kf = kzalloc(sizeof(*kf), GFP_KERNEL);
+  	if (!kf)
+  		return NULL;
++ 
+  	kf->update_needed = true;
+  	iio_buffer_init(&kf->buffer);
+ +	kf->buffer.attrs = &iio_kfifo_attribute_group;
+  	kf->buffer.access = &kfifo_access_funcs;
+  	kf->buffer.length = 2;
+++<<<<<<< HEAD
+++=======
++ 	mutex_init(&kf->user_lock);
++ 
+++>>>>>>> 7ab374a053a4 (iio: kfifo: Remove unused argument in iio_kfifo_allocate)
+  	return &kf->buffer;
+  }
+  EXPORT_SYMBOL(iio_kfifo_allocate);
+diff --cc drivers/staging/iio/impedance-analyzer/ad5933.c
+index 6330af656a0f,39f60aca0838..000000000000
+--- a/drivers/staging/iio/impedance-analyzer/ad5933.c
++++ b/drivers/staging/iio/impedance-analyzer/ad5933.c
+@@@ -630,10 -624,14 +630,17 @@@ static const struct iio_buffer_setup_op
+  
+  static int ad5933_register_ring_funcs_and_init(struct iio_dev *indio_dev)
+  {
+++<<<<<<< HEAD
+ +	indio_dev->buffer = iio_kfifo_allocate(indio_dev);
+ +	if (!indio_dev->buffer)
+++=======
++ 	struct iio_buffer *buffer;
++ 
++ 	buffer = iio_kfifo_allocate();
++ 	if (!buffer)
+++>>>>>>> 7ab374a053a4 (iio: kfifo: Remove unused argument in iio_kfifo_allocate)
+  		return -ENOMEM;
+  
+ -	iio_device_attach_buffer(indio_dev, buffer);
+ -
+  	/* Ring buffer functions - here trigger setup related */
+  	indio_dev->setup_ops = &ad5933_ring_setup_ops;
+  
+diff --cc drivers/staging/iio/meter/ade7758_ring.c
+index b29e2d5d9937,782fd9a3bc0d..000000000000
+--- a/drivers/staging/iio/meter/ade7758_ring.c
++++ b/drivers/staging/iio/meter/ade7758_ring.c
+@@@ -125,10 -116,11 +125,15 @@@ void ade7758_unconfigure_ring(struct ii
+  int ade7758_configure_ring(struct iio_dev *indio_dev)
+  {
+  	struct ade7758_state *st = iio_priv(indio_dev);
+ -	struct iio_buffer *buffer;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	indio_dev->buffer = iio_kfifo_allocate(indio_dev);
+ +	if (!indio_dev->buffer) {
+++=======
++ 	buffer = iio_kfifo_allocate();
++ 	if (!buffer) {
+++>>>>>>> 7ab374a053a4 (iio: kfifo: Remove unused argument in iio_kfifo_allocate)
+  		ret = -ENOMEM;
+  		return ret;
+  	}
+* Unmerged path drivers/iio/adc/ti_am335x_adc.c
+* Unmerged path drivers/iio/industrialio-triggered-buffer.c
+* Unmerged path drivers/iio/kfifo_buf.c
+diff --git a/drivers/staging/iio/accel/lis3l02dq_ring.c b/drivers/staging/iio/accel/lis3l02dq_ring.c
+index 5b8f0f6c9938..b4dc515de952 100644
+--- a/drivers/staging/iio/accel/lis3l02dq_ring.c
++++ b/drivers/staging/iio/accel/lis3l02dq_ring.c
+@@ -397,7 +397,7 @@ int lis3l02dq_configure_buffer(struct iio_dev *indio_dev)
+ 	int ret;
+ 	struct iio_buffer *buffer;
+ 
+-	buffer = iio_kfifo_allocate(indio_dev);
++	buffer = iio_kfifo_allocate();
+ 	if (!buffer)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/staging/iio/iio_simple_dummy_buffer.c b/drivers/staging/iio/iio_simple_dummy_buffer.c
+index 72f400c3cbcb..676b10d0aaa6 100644
+--- a/drivers/staging/iio/iio_simple_dummy_buffer.c
++++ b/drivers/staging/iio/iio_simple_dummy_buffer.c
+@@ -132,7 +132,7 @@ int iio_simple_dummy_configure_buffer(struct iio_dev *indio_dev,
+ 	struct iio_buffer *buffer;
+ 
+ 	/* Allocate a buffer to use - here a kfifo */
+-	buffer = iio_kfifo_allocate(indio_dev);
++	buffer = iio_kfifo_allocate();
+ 	if (buffer == NULL) {
+ 		ret = -ENOMEM;
+ 		goto error_ret;
+* Unmerged path drivers/staging/iio/impedance-analyzer/ad5933.c
+* Unmerged path drivers/staging/iio/meter/ade7758_ring.c
+diff --git a/include/linux/iio/kfifo_buf.h b/include/linux/iio/kfifo_buf.h
+index 25eeac762e84..1a8d57a41738 100644
+--- a/include/linux/iio/kfifo_buf.h
++++ b/include/linux/iio/kfifo_buf.h
+@@ -5,7 +5,7 @@
+ #include <linux/iio/iio.h>
+ #include <linux/iio/buffer.h>
+ 
+-struct iio_buffer *iio_kfifo_allocate(struct iio_dev *indio_dev);
++struct iio_buffer *iio_kfifo_allocate(void);
+ void iio_kfifo_free(struct iio_buffer *r);
+ 
+ #endif
