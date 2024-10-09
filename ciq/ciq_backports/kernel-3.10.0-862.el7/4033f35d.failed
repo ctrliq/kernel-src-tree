@@ -1,0 +1,253 @@
+nvme-pci: use dma memory for the host memory buffer descriptors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] pci: use dma memory for the host memory buffer descriptors (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 95.87%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4033f35d174af4804a79fd5731d9e6be976f9f28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4033f35d.failed
+
+The NVMe 1.3 specification says in section 5.21.1.13:
+
+"After a successful completion of a Set Features enabling the host memory
+ buffer, the host shall not write to the associated host memory region,
+ buffer size, or descriptor list until the host memory buffer has been
+ disabled."
+
+While this doesn't state that the descriptor list must remain accessible
+to the device it certainly implies it must remaing readable by the device.
+
+So switch to a dma coherent allocation for the descriptor list just to be
+safe - it's not like the cost for it matters compared to the actual
+memory buffers.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Fixes: 87ad72a59a38 ("nvme-pci: implement host memory buffer support")
+(cherry picked from commit 4033f35d174af4804a79fd5731d9e6be976f9f28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 74de1d1461c5,ea892e732268..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -100,8 -99,42 +100,24 @@@ struct nvme_dev 
+  	u32 cmbloc;
+  	struct nvme_ctrl ctrl;
+  	struct completion ioq_wait;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* shadow doorbell buffer support: */
++ 	u32 *dbbuf_dbs;
++ 	dma_addr_t dbbuf_dbs_dma_addr;
++ 	u32 *dbbuf_eis;
++ 	dma_addr_t dbbuf_eis_dma_addr;
++ 
++ 	/* host memory buffer support: */
++ 	u64 host_mem_size;
++ 	u32 nr_host_mem_descs;
++ 	dma_addr_t host_mem_descs_dma;
++ 	struct nvme_host_mem_buf_desc *host_mem_descs;
++ 	void **host_mem_desc_bufs;
+++>>>>>>> 4033f35d174a (nvme-pci: use dma memory for the host memory buffer descriptors)
+  };
+  
+ -static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
+ -{
+ -	int n = 0, ret;
+ -
+ -	ret = kstrtoint(val, 10, &n);
+ -	if (ret != 0 || n < 2)
+ -		return -EINVAL;
+ -
+ -	return param_set_int(val, kp);
+ -}
+ -
+ -static inline unsigned int sq_idx(unsigned int qid, u32 stride)
+ -{
+ -	return qid * 2 * stride;
+ -}
+ -
+ -static inline unsigned int cq_idx(unsigned int qid, u32 stride)
+ -{
+ -	return (qid * 2 + 1) * stride;
+ -}
+ -
+  static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
+  {
+  	return container_of(ctrl, struct nvme_dev, ctrl);
+@@@ -1301,9 -1564,160 +1317,164 @@@ static inline void nvme_release_cmb(str
+  	}
+  }
+  
+ -static int nvme_set_host_mem(struct nvme_dev *dev, u32 bits)
+ +static size_t db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
+  {
+++<<<<<<< HEAD
+ +	return 4096 + ((nr_io_queues + 1) * 8 * dev->db_stride);
+++=======
++ 	u64 dma_addr = dev->host_mem_descs_dma;
++ 	struct nvme_command c;
++ 	int ret;
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.features.opcode	= nvme_admin_set_features;
++ 	c.features.fid		= cpu_to_le32(NVME_FEAT_HOST_MEM_BUF);
++ 	c.features.dword11	= cpu_to_le32(bits);
++ 	c.features.dword12	= cpu_to_le32(dev->host_mem_size >>
++ 					      ilog2(dev->ctrl.page_size));
++ 	c.features.dword13	= cpu_to_le32(lower_32_bits(dma_addr));
++ 	c.features.dword14	= cpu_to_le32(upper_32_bits(dma_addr));
++ 	c.features.dword15	= cpu_to_le32(dev->nr_host_mem_descs);
++ 
++ 	ret = nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
++ 	if (ret) {
++ 		dev_warn(dev->ctrl.device,
++ 			 "failed to set host mem (err %d, flags %#x).\n",
++ 			 ret, bits);
++ 	}
++ 	return ret;
++ }
++ 
++ static void nvme_free_host_mem(struct nvme_dev *dev)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < dev->nr_host_mem_descs; i++) {
++ 		struct nvme_host_mem_buf_desc *desc = &dev->host_mem_descs[i];
++ 		size_t size = le32_to_cpu(desc->size) * dev->ctrl.page_size;
++ 
++ 		dma_free_coherent(dev->dev, size, dev->host_mem_desc_bufs[i],
++ 				le64_to_cpu(desc->addr));
++ 	}
++ 
++ 	kfree(dev->host_mem_desc_bufs);
++ 	dev->host_mem_desc_bufs = NULL;
++ 	dma_free_coherent(dev->dev,
++ 			dev->nr_host_mem_descs * sizeof(*dev->host_mem_descs),
++ 			dev->host_mem_descs, dev->host_mem_descs_dma);
++ 	dev->host_mem_descs = NULL;
++ }
++ 
++ static int nvme_alloc_host_mem(struct nvme_dev *dev, u64 min, u64 preferred)
++ {
++ 	struct nvme_host_mem_buf_desc *descs;
++ 	u32 chunk_size, max_entries, len;
++ 	dma_addr_t descs_dma;
++ 	int i = 0;
++ 	void **bufs;
++ 	u64 size = 0, tmp;
++ 
++ 	/* start big and work our way down */
++ 	chunk_size = min(preferred, (u64)PAGE_SIZE << MAX_ORDER);
++ retry:
++ 	tmp = (preferred + chunk_size - 1);
++ 	do_div(tmp, chunk_size);
++ 	max_entries = tmp;
++ 	descs = dma_zalloc_coherent(dev->dev, max_entries * sizeof(*descs),
++ 			&descs_dma, GFP_KERNEL);
++ 	if (!descs)
++ 		goto out;
++ 
++ 	bufs = kcalloc(max_entries, sizeof(*bufs), GFP_KERNEL);
++ 	if (!bufs)
++ 		goto out_free_descs;
++ 
++ 	for (size = 0; size < preferred; size += len) {
++ 		dma_addr_t dma_addr;
++ 
++ 		len = min_t(u64, chunk_size, preferred - size);
++ 		bufs[i] = dma_alloc_attrs(dev->dev, len, &dma_addr, GFP_KERNEL,
++ 				DMA_ATTR_NO_KERNEL_MAPPING | DMA_ATTR_NO_WARN);
++ 		if (!bufs[i])
++ 			break;
++ 
++ 		descs[i].addr = cpu_to_le64(dma_addr);
++ 		descs[i].size = cpu_to_le32(len / dev->ctrl.page_size);
++ 		i++;
++ 	}
++ 
++ 	if (!size || (min && size < min)) {
++ 		dev_warn(dev->ctrl.device,
++ 			"failed to allocate host memory buffer.\n");
++ 		goto out_free_bufs;
++ 	}
++ 
++ 	dev_info(dev->ctrl.device,
++ 		"allocated %lld MiB host memory buffer.\n",
++ 		size >> ilog2(SZ_1M));
++ 	dev->nr_host_mem_descs = i;
++ 	dev->host_mem_size = size;
++ 	dev->host_mem_descs = descs;
++ 	dev->host_mem_descs_dma = descs_dma;
++ 	dev->host_mem_desc_bufs = bufs;
++ 	return 0;
++ 
++ out_free_bufs:
++ 	while (--i >= 0) {
++ 		size_t size = le32_to_cpu(descs[i].size) * dev->ctrl.page_size;
++ 
++ 		dma_free_coherent(dev->dev, size, bufs[i],
++ 				le64_to_cpu(descs[i].addr));
++ 	}
++ 
++ 	kfree(bufs);
++ out_free_descs:
++ 	dma_free_coherent(dev->dev, max_entries * sizeof(*descs), descs,
++ 			descs_dma);
++ out:
++ 	/* try a smaller chunk size if we failed early */
++ 	if (chunk_size >= PAGE_SIZE * 2 && (i == 0 || size < min)) {
++ 		chunk_size /= 2;
++ 		goto retry;
++ 	}
++ 	dev->host_mem_descs = NULL;
++ 	return -ENOMEM;
++ }
++ 
++ static void nvme_setup_host_mem(struct nvme_dev *dev)
++ {
++ 	u64 max = (u64)max_host_mem_size_mb * SZ_1M;
++ 	u64 preferred = (u64)dev->ctrl.hmpre * 4096;
++ 	u64 min = (u64)dev->ctrl.hmmin * 4096;
++ 	u32 enable_bits = NVME_HOST_MEM_ENABLE;
++ 
++ 	preferred = min(preferred, max);
++ 	if (min > max) {
++ 		dev_warn(dev->ctrl.device,
++ 			"min host memory (%lld MiB) above limit (%d MiB).\n",
++ 			min >> ilog2(SZ_1M), max_host_mem_size_mb);
++ 		nvme_free_host_mem(dev);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * If we already have a buffer allocated check if we can reuse it.
++ 	 */
++ 	if (dev->host_mem_descs) {
++ 		if (dev->host_mem_size >= min)
++ 			enable_bits |= NVME_HOST_MEM_RETURN;
++ 		else
++ 			nvme_free_host_mem(dev);
++ 	}
++ 
++ 	if (!dev->host_mem_descs) {
++ 		if (nvme_alloc_host_mem(dev, min, preferred))
++ 			return;
++ 	}
++ 
++ 	if (nvme_set_host_mem(dev, enable_bits))
++ 		nvme_free_host_mem(dev);
+++>>>>>>> 4033f35d174a (nvme-pci: use dma memory for the host memory buffer descriptors)
+  }
+  
+  static int nvme_setup_io_queues(struct nvme_dev *dev)
+* Unmerged path drivers/nvme/host/pci.c
