@@ -1,0 +1,184 @@
+scsi: scsi_dh_alua: Fix a reference counting bug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] scsi_dh_alua: Fix a reference counting bug (Mike Snitzer) [1499107]
+Rebuild_FUZZ: 93.33%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit df3d422cbac685da882e4c239dfda07de33d431b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/df3d422c.failed
+
+The code at the end of alua_rtpg_work() is as follows:
+
+	scsi_device_put(sdev);
+	kref_put(&pg->kref, release_port_group);
+
+In other words, alua_rtpg_queue() must hold an sdev reference and a pg
+reference before queueing rtpg work. If no rtpg work is queued no
+additional references should be held when alua_rtpg_queue() returns. If
+no rtpg work is queued, ensure that alua_rtpg_queue() only gives up the
+sdev reference if that reference was obtained by the same
+alua_rtpg_queue() call.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reported-by: Tang Junhui <tang.junhui@zte.com.cn>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Tang Junhui <tang.junhui@zte.com.cn>
+	Cc: <stable@vger.kernel.org>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit df3d422cbac685da882e4c239dfda07de33d431b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/device_handler/scsi_dh_alua.c
+diff --cc drivers/scsi/device_handler/scsi_dh_alua.c
+index 2f054f24112a,7bb20684e9fa..000000000000
+--- a/drivers/scsi/device_handler/scsi_dh_alua.c
++++ b/drivers/scsi/device_handler/scsi_dh_alua.c
+@@@ -541,6 -776,139 +541,142 @@@ static unsigned alua_stpg(struct scsi_d
+  	return SCSI_DH_RETRY;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void alua_rtpg_work(struct work_struct *work)
++ {
++ 	struct alua_port_group *pg =
++ 		container_of(work, struct alua_port_group, rtpg_work.work);
++ 	struct scsi_device *sdev;
++ 	LIST_HEAD(qdata_list);
++ 	int err = SCSI_DH_OK;
++ 	struct alua_queue_data *qdata, *tmp;
++ 	unsigned long flags;
++ 	struct workqueue_struct *alua_wq = kaluad_wq;
++ 
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	sdev = pg->rtpg_sdev;
++ 	if (!sdev) {
++ 		WARN_ON(pg->flags & ALUA_PG_RUN_RTPG);
++ 		WARN_ON(pg->flags & ALUA_PG_RUN_STPG);
++ 		spin_unlock_irqrestore(&pg->lock, flags);
++ 		kref_put(&pg->kref, release_port_group);
++ 		return;
++ 	}
++ 	if (pg->flags & ALUA_SYNC_STPG)
++ 		alua_wq = kaluad_sync_wq;
++ 	pg->flags |= ALUA_PG_RUNNING;
++ 	if (pg->flags & ALUA_PG_RUN_RTPG) {
++ 		int state = pg->state;
++ 
++ 		pg->flags &= ~ALUA_PG_RUN_RTPG;
++ 		spin_unlock_irqrestore(&pg->lock, flags);
++ 		if (state == SCSI_ACCESS_STATE_TRANSITIONING) {
++ 			if (alua_tur(sdev) == SCSI_DH_RETRY) {
++ 				spin_lock_irqsave(&pg->lock, flags);
++ 				pg->flags &= ~ALUA_PG_RUNNING;
++ 				pg->flags |= ALUA_PG_RUN_RTPG;
++ 				spin_unlock_irqrestore(&pg->lock, flags);
++ 				queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 						   pg->interval * HZ);
++ 				return;
++ 			}
++ 			/* Send RTPG on failure or if TUR indicates SUCCESS */
++ 		}
++ 		err = alua_rtpg(sdev, pg);
++ 		spin_lock_irqsave(&pg->lock, flags);
++ 		if (err == SCSI_DH_RETRY || pg->flags & ALUA_PG_RUN_RTPG) {
++ 			pg->flags &= ~ALUA_PG_RUNNING;
++ 			pg->flags |= ALUA_PG_RUN_RTPG;
++ 			spin_unlock_irqrestore(&pg->lock, flags);
++ 			queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 					   pg->interval * HZ);
++ 			return;
++ 		}
++ 		if (err != SCSI_DH_OK)
++ 			pg->flags &= ~ALUA_PG_RUN_STPG;
++ 	}
++ 	if (pg->flags & ALUA_PG_RUN_STPG) {
++ 		pg->flags &= ~ALUA_PG_RUN_STPG;
++ 		spin_unlock_irqrestore(&pg->lock, flags);
++ 		err = alua_stpg(sdev, pg);
++ 		spin_lock_irqsave(&pg->lock, flags);
++ 		if (err == SCSI_DH_RETRY || pg->flags & ALUA_PG_RUN_RTPG) {
++ 			pg->flags |= ALUA_PG_RUN_RTPG;
++ 			pg->interval = 0;
++ 			pg->flags &= ~ALUA_PG_RUNNING;
++ 			spin_unlock_irqrestore(&pg->lock, flags);
++ 			queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 					   pg->interval * HZ);
++ 			return;
++ 		}
++ 	}
++ 
++ 	list_splice_init(&pg->rtpg_list, &qdata_list);
++ 	pg->rtpg_sdev = NULL;
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 
++ 	list_for_each_entry_safe(qdata, tmp, &qdata_list, entry) {
++ 		list_del(&qdata->entry);
++ 		if (qdata->callback_fn)
++ 			qdata->callback_fn(qdata->callback_data, err);
++ 		kfree(qdata);
++ 	}
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	pg->flags &= ~ALUA_PG_RUNNING;
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 	scsi_device_put(sdev);
++ 	kref_put(&pg->kref, release_port_group);
++ }
++ 
++ static void alua_rtpg_queue(struct alua_port_group *pg,
++ 			    struct scsi_device *sdev,
++ 			    struct alua_queue_data *qdata, bool force)
++ {
++ 	int start_queue = 0;
++ 	unsigned long flags;
++ 	struct workqueue_struct *alua_wq = kaluad_wq;
++ 
++ 	if (!pg)
++ 		return;
++ 
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	if (qdata) {
++ 		list_add_tail(&qdata->entry, &pg->rtpg_list);
++ 		pg->flags |= ALUA_PG_RUN_STPG;
++ 		force = true;
++ 	}
++ 	if (pg->rtpg_sdev == NULL) {
++ 		pg->interval = 0;
++ 		pg->flags |= ALUA_PG_RUN_RTPG;
++ 		kref_get(&pg->kref);
++ 		pg->rtpg_sdev = sdev;
++ 		scsi_device_get(sdev);
++ 		start_queue = 1;
++ 	} else if (!(pg->flags & ALUA_PG_RUN_RTPG) && force) {
++ 		pg->flags |= ALUA_PG_RUN_RTPG;
++ 		/* Do not queue if the worker is already running */
++ 		if (!(pg->flags & ALUA_PG_RUNNING)) {
++ 			kref_get(&pg->kref);
++ 			sdev = NULL;
++ 			start_queue = 1;
++ 		}
++ 	}
++ 
++ 	if (pg->flags & ALUA_SYNC_STPG)
++ 		alua_wq = kaluad_sync_wq;
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 
++ 	if (start_queue &&
++ 	    !queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 				msecs_to_jiffies(ALUA_RTPG_DELAY_MSECS))) {
++ 		if (sdev)
++ 			scsi_device_put(sdev);
++ 		kref_put(&pg->kref, release_port_group);
++ 	}
++ }
++ 
+++>>>>>>> df3d422cbac6 (scsi: scsi_dh_alua: Fix a reference counting bug)
+  /*
+   * alua_initialize - Initialize ALUA state
+   * @sdev: the device to be initialized
+* Unmerged path drivers/scsi/device_handler/scsi_dh_alua.c
