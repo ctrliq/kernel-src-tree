@@ -1,0 +1,76 @@
+ext4: bugfix for mmaped pages in mpage_release_unused_pages()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author wangguang <wang.guang55@zte.com.cn>
+commit 4e800c0359d9a53e6bf0ab216954971b2515247f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4e800c03.failed
+
+Pages clear buffers after ext4 delayed block allocation failed,
+However, it does not clean its pte_dirty flag.
+if the pages unmap ,in cording to the pte_dirty ,
+unmap_page_range may try to call __set_page_dirty,
+
+which may lead to the bugon at 
+mpage_prepare_extent_to_map:head = page_buffers(page);.
+
+This patch just call clear_page_dirty_for_io to clean pte_dirty 
+at mpage_release_unused_pages for pages mmaped. 
+
+Steps to reproduce the bug:
+
+（1） mmap a file in ext4
+	addr = (char *)mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED,
+	       	            fd, 0);
+	memset(addr, 'i', 4096);
+
+（2） return EIO at 
+
+	ext4_writepages->mpage_map_and_submit_extent->mpage_map_one_extent 
+
+which causes this log message to be print:
+
+                ext4_msg(sb, KERN_CRIT,
+                        "Delayed block allocation failed for "
+                        "inode %lu at logical offset %llu with"
+                        " max blocks %u with error %d",
+                        inode->i_ino,
+                        (unsigned long long)map->m_lblk,
+                        (unsigned)map->m_len, -err);
+
+(3）Unmap the addr cause warning at
+
+	__set_page_dirty:WARN_ON_ONCE(warn && !PageUptodate(page));
+
+(4) wait for a minute,then bugon happen.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: wangguang <wangguang03@zte.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 4e800c0359d9a53e6bf0ab216954971b2515247f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index 3c0d8d1f2f8a,9b464e5272bb..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -1374,8 -1649,9 +1374,14 @@@ static void mpage_release_unused_pages(
+  			BUG_ON(!PageLocked(page));
+  			BUG_ON(PageWriteback(page));
+  			if (invalidate) {
+++<<<<<<< HEAD
+ +				block_invalidatepage_range(page, 0,
+ +							   PAGE_CACHE_SIZE);
+++=======
++ 				if (page_mapped(page))
++ 					clear_page_dirty_for_io(page);
++ 				block_invalidatepage(page, 0, PAGE_SIZE);
+++>>>>>>> 4e800c0359d9 (ext4: bugfix for mmaped pages in mpage_release_unused_pages())
+  				ClearPageUptodate(page);
+  			}
+  			unlock_page(page);
+* Unmerged path fs/ext4/inode.c
