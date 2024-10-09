@@ -1,0 +1,308 @@
+lib/decompressors: use real out buf size for gunzip with kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [lib] decompressors: use real out buf size for gunzip with kernel (Baoquan He) [1290840]
+Rebuild_FUZZ: 96.72%
+commit-author Yinghai Lu <yinghai@kernel.org>
+commit 2d3862d26e67a59340ba1cf1748196c76c5787de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2d3862d2.failed
+
+When loading x86 64bit kernel above 4GiB with patched grub2, got kernel
+gunzip error.
+
+| early console in decompress_kernel
+| decompress_kernel:
+|       input: [0x807f2143b4-0x807ff61aee]
+|      output: [0x807cc00000-0x807f3ea29b] 0x027ea29c: output_len
+| boot via startup_64
+| KASLR using RDTSC...
+|  new output: [0x46fe000000-0x470138cfff] 0x0338d000: output_run_size
+|  decompress: [0x46fe000000-0x47007ea29b] <=== [0x807f2143b4-0x807ff61aee]
+|
+| Decompressing Linux... gz...
+|
+| uncompression error
+|
+| -- System halted
+
+the new buffer is at 0x46fe000000ULL, decompressor_gzip is using
+0xffffffb901ffffff as out_len.  gunzip in lib/zlib_inflate/inflate.c cap
+that len to 0x01ffffff and decompress fails later.
+
+We could hit this problem with crashkernel booting that uses kexec loading
+kernel above 4GiB.
+
+We have decompress_* support:
+    1. inbuf[]/outbuf[] for kernel preboot.
+    2. inbuf[]/flush() for initramfs
+    3. fill()/flush() for initrd.
+This bug only affect kernel preboot path that use outbuf[].
+
+Add __decompress and take real out_buf_len for gunzip instead of guessing
+wrong buf size.
+
+Fixes: 1431574a1c4 (lib/decompressors: fix "no limit" output buffer length)
+	Signed-off-by: Yinghai Lu <yinghai@kernel.org>
+	Cc: Alexandre Courbot <acourbot@nvidia.com>
+	Cc: Jon Medhurst <tixy@linaro.org>
+	Cc: Stephen Warren <swarren@wwwdotorg.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2d3862d26e67a59340ba1cf1748196c76c5787de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/h8300/boot/compressed/misc.c
+#	lib/decompress_bunzip2.c
+#	lib/decompress_inflate.c
+#	lib/decompress_unlz4.c
+#	lib/decompress_unlzma.c
+diff --cc arch/h8300/boot/compressed/misc.c
+index 51ab6cbd030f,c4f2cfcb117b..000000000000
+--- a/arch/h8300/boot/compressed/misc.c
++++ b/arch/h8300/boot/compressed/misc.c
+@@@ -174,8 -70,5 +174,12 @@@ void decompress_kernel(void
+  	free_mem_ptr = (unsigned long)&_end;
+  	free_mem_end_ptr = free_mem_ptr + HEAP_SIZE;
+  
+++<<<<<<< HEAD
+ +	makecrc();
+ +	puts("Uncompressing Linux... ");
+ +	gunzip();
+ +	puts("Ok, booting the kernel.\n");
+++=======
++ 	__decompress(input_data, input_len, NULL, NULL, output, 0, NULL, error);
+++>>>>>>> 2d3862d26e67 (lib/decompressors: use real out buf size for gunzip with kernel)
+  }
+diff --cc lib/decompress_bunzip2.c
+index 31c5f7675fbf,0234361b24b8..000000000000
+--- a/lib/decompress_bunzip2.c
++++ b/lib/decompress_bunzip2.c
+@@@ -743,12 -743,12 +743,21 @@@ exit_0
+  }
+  
+  #ifdef PREBOOT
+++<<<<<<< HEAD
+ +STATIC int INIT decompress(unsigned char *buf, int len,
+ +			int(*fill)(void*, unsigned int),
+ +			int(*flush)(void*, unsigned int),
+ +			unsigned char *outbuf,
+ +			int *pos,
+ +			void(*error)(char *x))
+++=======
++ STATIC int INIT __decompress(unsigned char *buf, long len,
++ 			long (*fill)(void*, unsigned long),
++ 			long (*flush)(void*, unsigned long),
++ 			unsigned char *outbuf, long olen,
++ 			long *pos,
++ 			void (*error)(char *x))
+++>>>>>>> 2d3862d26e67 (lib/decompressors: use real out buf size for gunzip with kernel)
+  {
+  	return bunzip2(buf, len - 4, fill, flush, outbuf, pos, error);
+  }
+diff --cc lib/decompress_inflate.c
+index 0edfd742a154,555c06bf20da..000000000000
+--- a/lib/decompress_inflate.c
++++ b/lib/decompress_inflate.c
+@@@ -33,11 -34,11 +34,19 @@@ static int INIT nofill(void *buffer, un
+  }
+  
+  /* Included from initramfs et al code */
+++<<<<<<< HEAD
+ +STATIC int INIT gunzip(unsigned char *buf, int len,
+ +		       int(*fill)(void*, unsigned int),
+ +		       int(*flush)(void*, unsigned int),
+ +		       unsigned char *out_buf,
+ +		       int *pos,
+++=======
++ STATIC int INIT __gunzip(unsigned char *buf, long len,
++ 		       long (*fill)(void*, unsigned long),
++ 		       long (*flush)(void*, unsigned long),
++ 		       unsigned char *out_buf, long out_len,
++ 		       long *pos,
+++>>>>>>> 2d3862d26e67 (lib/decompressors: use real out buf size for gunzip with kernel)
+  		       void(*error)(char *x)) {
+  	u8 *zbuf;
+  	struct z_stream_s *strm;
+diff --cc lib/decompress_unlzma.c
+index 32adb73a9038,decb64629c14..000000000000
+--- a/lib/decompress_unlzma.c
++++ b/lib/decompress_unlzma.c
+@@@ -667,13 -667,12 +667,22 @@@ exit_0
+  }
+  
+  #ifdef PREBOOT
+++<<<<<<< HEAD
+ +STATIC int INIT decompress(unsigned char *buf, int in_len,
+ +			      int(*fill)(void*, unsigned int),
+ +			      int(*flush)(void*, unsigned int),
+ +			      unsigned char *output,
+ +			      int *posp,
+ +			      void(*error)(char *x)
+ +	)
+++=======
++ STATIC int INIT __decompress(unsigned char *buf, long in_len,
++ 			      long (*fill)(void*, unsigned long),
++ 			      long (*flush)(void*, unsigned long),
++ 			      unsigned char *output, long out_len,
++ 			      long *posp,
++ 			      void (*error)(char *x))
+++>>>>>>> 2d3862d26e67 (lib/decompressors: use real out buf size for gunzip with kernel)
+  {
+  	return unlzma(buf, in_len - 4, fill, flush, output, posp, error);
+  }
+* Unmerged path lib/decompress_unlz4.c
+diff --git a/arch/arm/boot/compressed/decompress.c b/arch/arm/boot/compressed/decompress.c
+index 24b0475cb8bf..82382319fa06 100644
+--- a/arch/arm/boot/compressed/decompress.c
++++ b/arch/arm/boot/compressed/decompress.c
+@@ -53,5 +53,5 @@ extern char * strstr(const char * s1, const char *s2);
+ 
+ int do_decompress(u8 *input, int len, u8 *output, void (*error)(char *x))
+ {
+-	return decompress(input, len, NULL, NULL, output, NULL, error);
++	return __decompress(input, len, NULL, NULL, output, 0, NULL, error);
+ }
+* Unmerged path arch/h8300/boot/compressed/misc.c
+diff --git a/arch/m32r/boot/compressed/misc.c b/arch/m32r/boot/compressed/misc.c
+index 28a09529f206..3a7692745868 100644
+--- a/arch/m32r/boot/compressed/misc.c
++++ b/arch/m32r/boot/compressed/misc.c
+@@ -86,6 +86,7 @@ decompress_kernel(int mmu_on, unsigned char *zimage_data,
+ 	free_mem_end_ptr = free_mem_ptr + BOOT_HEAP_SIZE;
+ 
+ 	puts("\nDecompressing Linux... ");
+-	decompress(input_data, input_len, NULL, NULL, output_data, NULL, error);
++	__decompress(input_data, input_len, NULL, NULL, output_data, 0,
++			NULL, error);
+ 	puts("done.\nBooting the kernel.\n");
+ }
+diff --git a/arch/mips/boot/compressed/decompress.c b/arch/mips/boot/compressed/decompress.c
+index 2c9573098c0d..6bfd0beae6c5 100644
+--- a/arch/mips/boot/compressed/decompress.c
++++ b/arch/mips/boot/compressed/decompress.c
+@@ -102,8 +102,8 @@ void decompress_kernel(unsigned long boot_heap_start)
+ 	puts("\n");
+ 
+ 	/* Decompress the kernel with according algorithm */
+-	decompress((char *)zimage_start, zimage_size, 0, 0,
+-		   (void *)VMLINUX_LOAD_ADDRESS_ULL, 0, error);
++	__decompress((char *)zimage_start, zimage_size, 0, 0,
++		   (void *)VMLINUX_LOAD_ADDRESS_ULL, 0, 0, error);
+ 
+ 	/* FIXME: should we flush cache here? */
+ 	puts("Now, booting the kernel...\n");
+diff --git a/arch/s390/boot/compressed/misc.c b/arch/s390/boot/compressed/misc.c
+index c4c6a1cf221b..4318ad2f2f63 100644
+--- a/arch/s390/boot/compressed/misc.c
++++ b/arch/s390/boot/compressed/misc.c
+@@ -164,7 +164,7 @@ unsigned long decompress_kernel(void)
+ #endif
+ 
+ 	puts("Uncompressing Linux... ");
+-	decompress(input_data, input_len, NULL, NULL, output, NULL, error);
++	__decompress(input_data, input_len, NULL, NULL, output, 0, NULL, error);
+ 	puts("Ok, booting the kernel.\n");
+ 	return (unsigned long) output;
+ }
+diff --git a/arch/sh/boot/compressed/misc.c b/arch/sh/boot/compressed/misc.c
+index 95470a472d2c..208a9753ab38 100644
+--- a/arch/sh/boot/compressed/misc.c
++++ b/arch/sh/boot/compressed/misc.c
+@@ -132,7 +132,7 @@ void decompress_kernel(void)
+ 
+ 	puts("Uncompressing Linux... ");
+ 	cache_control(CACHE_ENABLE);
+-	decompress(input_data, input_len, NULL, NULL, output, NULL, error);
++	__decompress(input_data, input_len, NULL, NULL, output, 0, NULL, error);
+ 	cache_control(CACHE_DISABLE);
+ 	puts("Ok, booting the kernel.\n");
+ }
+diff --git a/arch/unicore32/boot/compressed/misc.c b/arch/unicore32/boot/compressed/misc.c
+index 176d5bda3559..5c65dfee278c 100644
+--- a/arch/unicore32/boot/compressed/misc.c
++++ b/arch/unicore32/boot/compressed/misc.c
+@@ -119,8 +119,8 @@ unsigned long decompress_kernel(unsigned long output_start,
+ 	output_ptr = get_unaligned_le32(tmp);
+ 
+ 	arch_decomp_puts("Uncompressing Linux...");
+-	decompress(input_data, input_data_end - input_data, NULL, NULL,
+-			output_data, NULL, error);
++	__decompress(input_data, input_data_end - input_data, NULL, NULL,
++			output_data, 0, NULL, error);
+ 	arch_decomp_puts(" done, booting the kernel.\n");
+ 	return output_ptr;
+ }
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 136cb407d4ef..d9a58d61b6ec 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -412,7 +412,8 @@ asmlinkage void decompress_kernel(void *rmode, memptr heap,
+ #endif
+ 
+ 	debug_putstr("\nDecompressing Linux... ");
+-	decompress(input_data, input_len, NULL, NULL, output, NULL, error);
++	__decompress(input_data, input_len, NULL, NULL, output, output_len,
++			NULL, error);
+ 	parse_elf(output);
+ 	/*
+ 	 * 32-bit always performs relocations. 64-bit relocations are only
+* Unmerged path lib/decompress_bunzip2.c
+* Unmerged path lib/decompress_inflate.c
+* Unmerged path lib/decompress_unlz4.c
+* Unmerged path lib/decompress_unlzma.c
+diff --git a/lib/decompress_unlzo.c b/lib/decompress_unlzo.c
+index 960183d4258f..c1449084217f 100644
+--- a/lib/decompress_unlzo.c
++++ b/lib/decompress_unlzo.c
+@@ -31,6 +31,7 @@
+  */
+ 
+ #ifdef STATIC
++#define PREBOOT
+ #include "lzo/lzo1x_decompress_safe.c"
+ #else
+ #include <linux/decompress/unlzo.h>
+@@ -287,4 +288,14 @@ exit:
+ 	return ret;
+ }
+ 
+-#define decompress unlzo
++#ifdef PREBOOT
++STATIC int INIT __decompress(unsigned char *buf, long len,
++			   long (*fill)(void*, unsigned long),
++			   long (*flush)(void*, unsigned long),
++			   unsigned char *out_buf, long olen,
++			   long *pos,
++			   void (*error)(char *x))
++{
++	return unlzo(buf, len, fill, flush, out_buf, pos, error);
++}
++#endif
+diff --git a/lib/decompress_unxz.c b/lib/decompress_unxz.c
+index 9f34eb56854d..d5b3452c99fa 100644
+--- a/lib/decompress_unxz.c
++++ b/lib/decompress_unxz.c
+@@ -394,4 +394,14 @@ error_alloc_state:
+  * This macro is used by architecture-specific files to decompress
+  * the kernel image.
+  */
+-#define decompress unxz
++#ifdef XZ_PREBOOT
++STATIC int INIT __decompress(unsigned char *buf, long len,
++			   long (*fill)(void*, unsigned long),
++			   long (*flush)(void*, unsigned long),
++			   unsigned char *out_buf, long olen,
++			   long *pos,
++			   void (*error)(char *x))
++{
++	return unxz(buf, len, fill, flush, out_buf, pos, error);
++}
++#endif
