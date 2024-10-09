@@ -1,0 +1,573 @@
+switchdev: Pass original device to port netdev driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 6ff64f6f9242d7e50f3e99cb280f69d1927a5fa6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6ff64f6f.failed
+
+switchdev drivers need to know the netdev on which the switchdev op was
+invoked. For example, the STP state of a VLAN interface configured on top
+of a port can change while being member in a bridge. In this case, the
+underlying driver should only change the STP state of that particular
+VLAN and not of all the VLANs configured on the port.
+
+However, current switchdev infrastructure only passes the port netdev down
+to the driver. Solve that by passing the original device down to the
+driver as part of the required switchdev object / attribute.
+
+This doesn't entail any change in current switchdev drivers. It simply
+enables those supporting stacked devices to know the originating device
+and act accordingly.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6ff64f6f9242d7e50f3e99cb280f69d1927a5fa6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/switchdev.h
+#	net/bridge/br_fdb.c
+#	net/bridge/br_stp.c
+#	net/bridge/br_vlan.c
+#	net/core/net-sysfs.c
+#	net/core/rtnetlink.c
+#	net/switchdev/switchdev.c
+diff --cc net/bridge/br_fdb.c
+index 46b89ee4408e,82e3e9705017..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -130,6 -131,21 +130,24 @@@ static void fdb_del_hw_addr(struct net_
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fdb_del_external_learn(struct net_bridge_fdb_entry *f)
++ {
++ 	struct switchdev_obj_port_fdb fdb = {
++ 		.obj = {
++ 			.orig_dev = f->dst->dev,
++ 			.id = SWITCHDEV_OBJ_ID_PORT_FDB,
++ 			.flags = SWITCHDEV_F_DEFER,
++ 		},
++ 		.vid = f->vlan_id,
++ 	};
++ 
++ 	ether_addr_copy(fdb.addr, f->addr.addr);
++ 	switchdev_port_obj_del(f->dst->dev, &fdb.obj);
++ }
++ 
+++>>>>>>> 6ff64f6f9242 (switchdev: Pass original device to port netdev driver)
+  static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+  {
+  	if (f->is_static)
+diff --cc net/bridge/br_stp.c
+index 48a6519f8bc7,b3cca126b103..000000000000
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@@ -38,7 -39,19 +38,18 @@@ void br_log_state(const struct net_brid
+  
+  void br_set_state(struct net_bridge_port *p, unsigned int state)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct switchdev_attr attr = {
++ 		.orig_dev = p->dev,
++ 		.id = SWITCHDEV_ATTR_ID_PORT_STP_STATE,
++ 		.flags = SWITCHDEV_F_DEFER,
++ 		.u.stp_state = state,
++ 	};
++ 	int err;
++ 
+++>>>>>>> 6ff64f6f9242 (switchdev: Pass original device to port netdev driver)
+  	p->state = state;
+ -	err = switchdev_port_attr_set(p->dev, &attr);
+ -	if (err && err != -EOPNOTSUPP)
+ -		br_warn(p->br, "error setting offload STP state on port %u(%s)\n",
+ -				(unsigned int) p->port_no, p->dev->name);
+  }
+  
+  /* called under bridge lock */
+@@@ -550,6 -568,30 +561,33 @@@ int br_set_max_age(struct net_bridge *b
+  
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int br_set_ageing_time(struct net_bridge *br, u32 ageing_time)
++ {
++ 	struct switchdev_attr attr = {
++ 		.orig_dev = br->dev,
++ 		.id = SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME,
++ 		.flags = SWITCHDEV_F_SKIP_EOPNOTSUPP,
++ 		.u.ageing_time = ageing_time,
++ 	};
++ 	unsigned long t = clock_t_to_jiffies(ageing_time);
++ 	int err;
++ 
++ 	if (t < BR_MIN_AGEING_TIME || t > BR_MAX_AGEING_TIME)
++ 		return -ERANGE;
++ 
++ 	err = switchdev_port_attr_set(br->dev, &attr);
++ 	if (err)
++ 		return err;
++ 
++ 	br->ageing_time = t;
++ 	mod_timer(&br->gc_timer, jiffies);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6ff64f6f9242 (switchdev: Pass original device to port netdev driver)
+  void __br_set_forward_delay(struct net_bridge *br, unsigned long t)
+  {
+  	br->bridge_forward_delay = t;
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,66c4549efbbb..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -20,45 -46,170 +20,110 @@@ static void __vlan_delete_pvid(struct n
+  		return;
+  
+  	smp_wmb();
+ -	vg->pvid = 0;
+ +	v->pvid = 0;
+  }
+  
+ -static void __vlan_add_flags(struct net_bridge_vlan *v, u16 flags)
+ +static void __vlan_add_flags(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ -
+ -	if (br_vlan_is_master(v))
+ -		vg = br_vlan_group(v->br);
+ -	else
+ -		vg = nbp_vlan_group(v->port);
+ -
+  	if (flags & BRIDGE_VLAN_INFO_PVID)
+ -		__vlan_add_pvid(vg, v->vid);
+ +		__vlan_add_pvid(v, vid);
+  	else
+ -		__vlan_delete_pvid(vg, v->vid);
+ +		__vlan_delete_pvid(v, vid);
+  
+  	if (flags & BRIDGE_VLAN_INFO_UNTAGGED)
+ -		v->flags |= BRIDGE_VLAN_INFO_UNTAGGED;
+ +		set_bit(vid, v->untagged_bitmap);
+  	else
+ -		v->flags &= ~BRIDGE_VLAN_INFO_UNTAGGED;
+ +		clear_bit(vid, v->untagged_bitmap);
+  }
+  
+ -static int __vlan_vid_add(struct net_device *dev, struct net_bridge *br,
+ -			  u16 vid, u16 flags)
+ +static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+++<<<<<<< HEAD
+ +	struct net_bridge_port *p = NULL;
+ +	struct net_bridge *br;
+ +	struct net_device *dev;
+ +	int err;
+ +
+ +	if (test_bit(vid, v->vlan_bitmap)) {
+ +		__vlan_add_flags(v, vid, flags);
+++=======
++ 	struct switchdev_obj_port_vlan v = {
++ 		.obj.orig_dev = dev,
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 		.flags = flags,
++ 		.vid_begin = vid,
++ 		.vid_end = vid,
++ 	};
++ 	int err;
++ 
++ 	/* Try switchdev op first. In case it is not supported, fallback to
++ 	 * 8021q add.
++ 	 */
++ 	err = switchdev_port_obj_add(dev, &v.obj);
++ 	if (err == -EOPNOTSUPP)
++ 		return vlan_vid_add(dev, br->vlan_proto, vid);
++ 	return err;
++ }
++ 
++ static void __vlan_add_list(struct net_bridge_vlan *v)
++ {
++ 	struct net_bridge_vlan_group *vg;
++ 	struct list_head *headp, *hpos;
++ 	struct net_bridge_vlan *vent;
++ 
++ 	if (br_vlan_is_master(v))
++ 		vg = br_vlan_group(v->br);
++ 	else
++ 		vg = nbp_vlan_group(v->port);
++ 
++ 	headp = &vg->vlan_list;
++ 	list_for_each_prev(hpos, headp) {
++ 		vent = list_entry(hpos, struct net_bridge_vlan, vlist);
++ 		if (v->vid < vent->vid)
++ 			continue;
++ 		else
++ 			break;
++ 	}
++ 	list_add_rcu(&v->vlist, hpos);
++ }
++ 
++ static void __vlan_del_list(struct net_bridge_vlan *v)
++ {
++ 	list_del_rcu(&v->vlist);
++ }
++ 
++ static int __vlan_vid_del(struct net_device *dev, struct net_bridge *br,
++ 			  u16 vid)
++ {
++ 	struct switchdev_obj_port_vlan v = {
++ 		.obj.orig_dev = dev,
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 		.vid_begin = vid,
++ 		.vid_end = vid,
++ 	};
++ 	int err;
++ 
++ 	/* Try switchdev op first. In case it is not supported, fallback to
++ 	 * 8021q del.
++ 	 */
++ 	err = switchdev_port_obj_del(dev, &v.obj);
++ 	if (err == -EOPNOTSUPP) {
++ 		vlan_vid_del(dev, br->vlan_proto, vid);
+++>>>>>>> 6ff64f6f9242 (switchdev: Pass original device to port netdev driver)
+  		return 0;
+  	}
+ -	return err;
+ -}
+ -
+ -/* Returns a master vlan, if it didn't exist it gets created. In all cases a
+ - * a reference is taken to the master vlan before returning.
+ - */
+ -static struct net_bridge_vlan *br_vlan_get_master(struct net_bridge *br, u16 vid)
+ -{
+ -	struct net_bridge_vlan_group *vg;
+ -	struct net_bridge_vlan *masterv;
+ -
+ -	vg = br_vlan_group(br);
+ -	masterv = br_vlan_find(vg, vid);
+ -	if (!masterv) {
+ -		/* missing global ctx, create it now */
+ -		if (br_vlan_add(br, vid, 0))
+ -			return NULL;
+ -		masterv = br_vlan_find(vg, vid);
+ -		if (WARN_ON(!masterv))
+ -			return NULL;
+ -	}
+ -	atomic_inc(&masterv->refcnt);
+ -
+ -	return masterv;
+ -}
+ -
+ -static void br_vlan_put_master(struct net_bridge_vlan *masterv)
+ -{
+ -	struct net_bridge_vlan_group *vg;
+ -
+ -	if (!br_vlan_is_master(masterv))
+ -		return;
+ -
+ -	vg = br_vlan_group(masterv->br);
+ -	if (atomic_dec_and_test(&masterv->refcnt)) {
+ -		rhashtable_remove_fast(&vg->vlan_hash,
+ -				       &masterv->vnode, br_vlan_rht_params);
+ -		__vlan_del_list(masterv);
+ -		kfree_rcu(masterv, rcu);
+ -	}
+ -}
+ -
+ -/* This is the shared VLAN add function which works for both ports and bridge
+ - * devices. There are four possible calls to this function in terms of the
+ - * vlan entry type:
+ - * 1. vlan is being added on a port (no master flags, global entry exists)
+ - * 2. vlan is being added on a bridge (both master and brentry flags)
+ - * 3. vlan is being added on a port, but a global entry didn't exist which
+ - *    is being created right now (master flag set, brentry flag unset), the
+ - *    global entry is used for global per-vlan features, but not for filtering
+ - * 4. same as 3 but with both master and brentry flags set so the entry
+ - *    will be used for filtering in both the port and the bridge
+ - */
+ -static int __vlan_add(struct net_bridge_vlan *v, u16 flags)
+ -{
+ -	struct net_bridge_vlan *masterv = NULL;
+ -	struct net_bridge_port *p = NULL;
+ -	struct net_bridge_vlan_group *vg;
+ -	struct net_device *dev;
+ -	struct net_bridge *br;
+ -	int err;
+  
+ -	if (br_vlan_is_master(v)) {
+ -		br = v->br;
+ -		dev = br->dev;
+ -		vg = br_vlan_group(br);
+ -	} else {
+ -		p = v->port;
+ +	if (v->port_idx) {
+ +		p = v->parent.port;
+  		br = p->br;
+  		dev = p->dev;
+ -		vg = nbp_vlan_group(p);
+ +	} else {
+ +		br = v->parent.br;
+ +		dev = br->dev;
+  	}
+  
+ -	if (p) {
+ +	/* Toggle HW filters when filtering is enabled */
+ +	if (p && p->br->vlan_enabled) {
+  		/* Add VLAN to the device filter if it is supported.
+  		 * This ensures tagged traffic enters the bridge when
+  		 * promiscuous mode is disabled by br_manage_promisc().
+diff --cc net/core/net-sysfs.c
+index c7c996a3d5f5,bca8c350e7f3..000000000000
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@@ -416,11 -470,16 +416,19 @@@ static ssize_t phys_switch_id_show(stru
+  		return restart_syscall();
+  
+  	if (dev_isalive(netdev)) {
+++<<<<<<< HEAD
+ +		struct netdev_phys_item_id ppid;
+++=======
++ 		struct switchdev_attr attr = {
++ 			.orig_dev = netdev,
++ 			.id = SWITCHDEV_ATTR_ID_PORT_PARENT_ID,
++ 			.flags = SWITCHDEV_F_NO_RECURSE,
++ 		};
+++>>>>>>> 6ff64f6f9242 (switchdev: Pass original device to port netdev driver)
+  
+ -		ret = switchdev_port_attr_get(netdev, &attr);
+ +		ret = netdev_switch_parent_id_get(netdev, &ppid);
+  		if (!ret)
+ -			ret = sprintf(buf, "%*phN\n", attr.u.ppid.id_len,
+ -				      attr.u.ppid.id);
+ +			ret = sprintf(buf, "%*phN\n", ppid.id_len, ppid.id);
+  	}
+  	rtnl_unlock();
+  
+diff --cc net/core/rtnetlink.c
+index 38cedad711a1,d8b0113d3eec..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1022,6 -1005,190 +1022,193 @@@ static int rtnl_phys_port_id_fill(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtnl_phys_port_name_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	char name[IFNAMSIZ];
++ 	int err;
++ 
++ 	err = dev_get_phys_port_name(dev, name, sizeof(name));
++ 	if (err) {
++ 		if (err == -EOPNOTSUPP)
++ 			return 0;
++ 		return err;
++ 	}
++ 
++ 	if (nla_put(skb, IFLA_PHYS_PORT_NAME, strlen(name), name))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
++ static int rtnl_phys_switch_id_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	int err;
++ 	struct switchdev_attr attr = {
++ 		.orig_dev = dev,
++ 		.id = SWITCHDEV_ATTR_ID_PORT_PARENT_ID,
++ 		.flags = SWITCHDEV_F_NO_RECURSE,
++ 	};
++ 
++ 	err = switchdev_port_attr_get(dev, &attr);
++ 	if (err) {
++ 		if (err == -EOPNOTSUPP)
++ 			return 0;
++ 		return err;
++ 	}
++ 
++ 	if (nla_put(skb, IFLA_PHYS_SWITCH_ID, attr.u.ppid.id_len,
++ 		    attr.u.ppid.id))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
++ static noinline_for_stack int rtnl_fill_stats(struct sk_buff *skb,
++ 					      struct net_device *dev)
++ {
++ 	const struct rtnl_link_stats64 *stats;
++ 	struct rtnl_link_stats64 temp;
++ 	struct nlattr *attr;
++ 
++ 	stats = dev_get_stats(dev, &temp);
++ 
++ 	attr = nla_reserve(skb, IFLA_STATS,
++ 			   sizeof(struct rtnl_link_stats));
++ 	if (!attr)
++ 		return -EMSGSIZE;
++ 
++ 	copy_rtnl_link_stats(nla_data(attr), stats);
++ 
++ 	attr = nla_reserve(skb, IFLA_STATS64,
++ 			   sizeof(struct rtnl_link_stats64));
++ 	if (!attr)
++ 		return -EMSGSIZE;
++ 
++ 	copy_rtnl_link_stats64(nla_data(attr), stats);
++ 
++ 	return 0;
++ }
++ 
++ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
++ 					       struct net_device *dev,
++ 					       int vfs_num,
++ 					       struct nlattr *vfinfo)
++ {
++ 	struct ifla_vf_rss_query_en vf_rss_query_en;
++ 	struct ifla_vf_link_state vf_linkstate;
++ 	struct ifla_vf_spoofchk vf_spoofchk;
++ 	struct ifla_vf_tx_rate vf_tx_rate;
++ 	struct ifla_vf_stats vf_stats;
++ 	struct ifla_vf_trust vf_trust;
++ 	struct ifla_vf_vlan vf_vlan;
++ 	struct ifla_vf_rate vf_rate;
++ 	struct nlattr *vf, *vfstats;
++ 	struct ifla_vf_mac vf_mac;
++ 	struct ifla_vf_info ivi;
++ 
++ 	/* Not all SR-IOV capable drivers support the
++ 	 * spoofcheck and "RSS query enable" query.  Preset to
++ 	 * -1 so the user space tool can detect that the driver
++ 	 * didn't report anything.
++ 	 */
++ 	ivi.spoofchk = -1;
++ 	ivi.rss_query_en = -1;
++ 	ivi.trusted = -1;
++ 	memset(ivi.mac, 0, sizeof(ivi.mac));
++ 	/* The default value for VF link state is "auto"
++ 	 * IFLA_VF_LINK_STATE_AUTO which equals zero
++ 	 */
++ 	ivi.linkstate = 0;
++ 	if (dev->netdev_ops->ndo_get_vf_config(dev, vfs_num, &ivi))
++ 		return 0;
++ 
++ 	vf_mac.vf =
++ 		vf_vlan.vf =
++ 		vf_rate.vf =
++ 		vf_tx_rate.vf =
++ 		vf_spoofchk.vf =
++ 		vf_linkstate.vf =
++ 		vf_rss_query_en.vf =
++ 		vf_trust.vf = ivi.vf;
++ 
++ 	memcpy(vf_mac.mac, ivi.mac, sizeof(ivi.mac));
++ 	vf_vlan.vlan = ivi.vlan;
++ 	vf_vlan.qos = ivi.qos;
++ 	vf_tx_rate.rate = ivi.max_tx_rate;
++ 	vf_rate.min_tx_rate = ivi.min_tx_rate;
++ 	vf_rate.max_tx_rate = ivi.max_tx_rate;
++ 	vf_spoofchk.setting = ivi.spoofchk;
++ 	vf_linkstate.link_state = ivi.linkstate;
++ 	vf_rss_query_en.setting = ivi.rss_query_en;
++ 	vf_trust.setting = ivi.trusted;
++ 	vf = nla_nest_start(skb, IFLA_VF_INFO);
++ 	if (!vf) {
++ 		nla_nest_cancel(skb, vfinfo);
++ 		return -EMSGSIZE;
++ 	}
++ 	if (nla_put(skb, IFLA_VF_MAC, sizeof(vf_mac), &vf_mac) ||
++ 	    nla_put(skb, IFLA_VF_VLAN, sizeof(vf_vlan), &vf_vlan) ||
++ 	    nla_put(skb, IFLA_VF_RATE, sizeof(vf_rate),
++ 		    &vf_rate) ||
++ 	    nla_put(skb, IFLA_VF_TX_RATE, sizeof(vf_tx_rate),
++ 		    &vf_tx_rate) ||
++ 	    nla_put(skb, IFLA_VF_SPOOFCHK, sizeof(vf_spoofchk),
++ 		    &vf_spoofchk) ||
++ 	    nla_put(skb, IFLA_VF_LINK_STATE, sizeof(vf_linkstate),
++ 		    &vf_linkstate) ||
++ 	    nla_put(skb, IFLA_VF_RSS_QUERY_EN,
++ 		    sizeof(vf_rss_query_en),
++ 		    &vf_rss_query_en) ||
++ 	    nla_put(skb, IFLA_VF_TRUST,
++ 		    sizeof(vf_trust), &vf_trust))
++ 		return -EMSGSIZE;
++ 	memset(&vf_stats, 0, sizeof(vf_stats));
++ 	if (dev->netdev_ops->ndo_get_vf_stats)
++ 		dev->netdev_ops->ndo_get_vf_stats(dev, vfs_num,
++ 						&vf_stats);
++ 	vfstats = nla_nest_start(skb, IFLA_VF_STATS);
++ 	if (!vfstats) {
++ 		nla_nest_cancel(skb, vf);
++ 		nla_nest_cancel(skb, vfinfo);
++ 		return -EMSGSIZE;
++ 	}
++ 	if (nla_put_u64(skb, IFLA_VF_STATS_RX_PACKETS,
++ 			vf_stats.rx_packets) ||
++ 	    nla_put_u64(skb, IFLA_VF_STATS_TX_PACKETS,
++ 			vf_stats.tx_packets) ||
++ 	    nla_put_u64(skb, IFLA_VF_STATS_RX_BYTES,
++ 			vf_stats.rx_bytes) ||
++ 	    nla_put_u64(skb, IFLA_VF_STATS_TX_BYTES,
++ 			vf_stats.tx_bytes) ||
++ 	    nla_put_u64(skb, IFLA_VF_STATS_BROADCAST,
++ 			vf_stats.broadcast) ||
++ 	    nla_put_u64(skb, IFLA_VF_STATS_MULTICAST,
++ 			vf_stats.multicast))
++ 		return -EMSGSIZE;
++ 	nla_nest_end(skb, vfstats);
++ 	nla_nest_end(skb, vf);
++ 	return 0;
++ }
++ 
++ static int rtnl_fill_link_ifmap(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct rtnl_link_ifmap map = {
++ 		.mem_start   = dev->mem_start,
++ 		.mem_end     = dev->mem_end,
++ 		.base_addr   = dev->base_addr,
++ 		.irq         = dev->irq,
++ 		.dma         = dev->dma,
++ 		.port        = dev->if_port,
++ 	};
++ 	if (nla_put(skb, IFLA_MAP, sizeof(map), &map))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6ff64f6f9242 (switchdev: Pass original device to port netdev driver)
+  static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+  			    int type, u32 pid, u32 seq, u32 change,
+  			    unsigned int flags, u32 ext_filter_mask)
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/bridge/br_fdb.c
+* Unmerged path net/bridge/br_stp.c
+diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
+index 44b80532c4a0..a9432539b49e 100644
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -37,6 +37,7 @@ static inline port_id br_make_port_id(__u8 priority, __u16 port_no)
+ void br_init_port(struct net_bridge_port *p)
+ {
+ 	struct switchdev_attr attr = {
++		.orig_dev = p->dev,
+ 		.id = SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME,
+ 		.flags = SWITCHDEV_F_SKIP_EOPNOTSUPP | SWITCHDEV_F_DEFER,
+ 		.u.ageing_time = p->br->ageing_time,
+* Unmerged path net/bridge/br_vlan.c
+* Unmerged path net/core/net-sysfs.c
+* Unmerged path net/core/rtnetlink.c
+* Unmerged path net/switchdev/switchdev.c
