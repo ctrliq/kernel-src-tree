@@ -1389,7 +1389,7 @@ void thread__find_addr_map(struct thread *thread, u8 cpumode,
 		return;
 	}
 try_again:
-	al->map = map_groups__find(mg, type, al->addr);
+	al->map = __map_groups__find(mg, type, al->addr);
 	if (al->map == NULL) {
 		/*
 		 * If this is outside of all known maps, and is a negative
