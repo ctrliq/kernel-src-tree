@@ -809,12 +809,12 @@ static int hw_atl_b0_hw_interrupt_moderation_set(struct aq_hw_s *self,
 			PHAL_ATLANTIC_B0->itr_rx |= max_timer << 0x10U;
 		} else {
 			static unsigned int hw_atl_b0_timers_table_tx_[][2] = {
-				{0xffU, 0xffU}, /* 10Gbit */
-				{0xffU, 0x1ffU}, /* 5Gbit */
-				{0xffU, 0x1ffU}, /* 5Gbit 5GS */
-				{0xffU, 0x1ffU}, /* 2.5Gbit */
-				{0xffU, 0x1ffU}, /* 1Gbit */
-				{0xffU, 0x1ffU}, /* 100Mbit */
+				{0xfU, 0xffU}, /* 10Gbit */
+				{0xfU, 0x1ffU}, /* 5Gbit */
+				{0xfU, 0x1ffU}, /* 5Gbit 5GS */
+				{0xfU, 0x1ffU}, /* 2.5Gbit */
+				{0xfU, 0x1ffU}, /* 1Gbit */
+				{0xfU, 0x1ffU}, /* 100Mbit */
 			};
 
 			static unsigned int hw_atl_b0_timers_table_rx_[][2] = {
