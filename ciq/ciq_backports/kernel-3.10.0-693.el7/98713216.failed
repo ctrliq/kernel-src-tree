@@ -1,0 +1,680 @@
+scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Fix for crash in beiscsi_eh_device_reset (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 94.34%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 987132167f4bfb132cd56601f77d2bd5ba9cff4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/98713216.failed
+
+System crashes when sg_reset is executed in a loop.
+CPU: 13 PID: 7073 Comm: sg_reset Tainted: G            E   4.8.0-rc1+ #4
+RIP: 0010:[<ffffffffa0825370>]  [<ffffffffa0825370>]
+beiscsi_eh_device_reset+0x160/0x520 [be2iscsi]
+Call Trace:
+[<ffffffff814c7c77>] ? scsi_host_alloc_command+0x47/0xc0
+[<ffffffff814caafa>] scsi_try_bus_device_reset+0x2a/0x50
+[<ffffffff814cb46e>] scsi_ioctl_reset+0x13e/0x260
+[<ffffffff814ca477>] scsi_ioctl+0x137/0x3d0
+[<ffffffffa05e4ba2>] sg_ioctl+0x572/0xc20 [sg]
+[<ffffffff8123f627>] do_vfs_ioctl+0xa7/0x5d0
+
+The accesses to beiscsi_io_task is being protected in device reset handler
+with frwd_lock but the freeing of task can happen under back_lock.
+
+Hold the reference of iscsi_task till invalidation completes.
+This prevents use of ICD when invalidation of that ICD is being processed.
+Use frwd_lock for iscsi_tasks looping and back_lock to access
+beiscsi_io_task structures.
+
+Rewrite mgmt_invalidation_icds to handle allocation and freeing of IOCTL
+buffer in one place.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 987132167f4bfb132cd56601f77d2bd5ba9cff4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+#	drivers/scsi/be2iscsi/be_mgmt.c
+#	drivers/scsi/be2iscsi/be_mgmt.h
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index ff265d59e294,7feecc0b4903..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -226,9 -225,8 +226,14 @@@ static int beiscsi_eh_abort(struct scsi
+  	struct beiscsi_conn *beiscsi_conn;
+  	struct beiscsi_hba *phba;
+  	struct iscsi_session *session;
+++<<<<<<< HEAD
+ +	struct invalidate_command_table *inv_tbl;
+ +	struct be_dma_mem nonemb_cmd;
+ +	unsigned int cid, tag, num_invalidate;
+++=======
++ 	struct invldt_cmd_tbl inv_tbl;
++ 	unsigned int cid;
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  	int rc;
+  
+  	cls_session = starget_to_session(scsi_target(sc->device));
+@@@ -252,38 -254,15 +257,42 @@@
+  	AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
+  		      aborted_io_task->pwrb_handle->pwrb,
+  		      1);
+ +
+ +	conn = aborted_task->conn;
+ +	beiscsi_conn = conn->dd_data;
+ +	phba = beiscsi_conn->phba;
+ +
+  	/* invalidate iocb */
+  	cid = beiscsi_conn->beiscsi_conn_cid;
+++<<<<<<< HEAD
+ +	inv_tbl = phba->inv_tbl;
+ +	memset(inv_tbl, 0x0, sizeof(*inv_tbl));
+ +	inv_tbl->cid = cid;
+ +	inv_tbl->icd = aborted_io_task->psgl_handle->sgl_index;
+ +	num_invalidate = 1;
+ +	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+ +				sizeof(struct invalidate_commands_params_in),
+ +				&nonemb_cmd.dma);
+ +	if (nonemb_cmd.va == NULL) {
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ +			    "BM_%d : Failed to allocate memory for"
+ +			    "mgmt_invalidate_icds\n");
+ +		return FAILED;
+ +	}
+ +	nonemb_cmd.size = sizeof(struct invalidate_commands_params_in);
+ +
+ +	tag = mgmt_invalidate_icds(phba, inv_tbl, num_invalidate,
+ +				   cid, &nonemb_cmd);
+ +	if (!tag) {
+++=======
++ 	inv_tbl.cid = cid;
++ 	inv_tbl.icd = aborted_io_task->psgl_handle->sgl_index;
++ 	rc = beiscsi_mgmt_invalidate_icds(phba, &inv_tbl, 1);
++ 	if (rc) {
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_EH,
+- 			    "BM_%d : mgmt_invalidate_icds could not be"
+- 			    "submitted\n");
+- 		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+- 				    nonemb_cmd.va, nonemb_cmd.dma);
+- 
++ 			    "BM_%d : sc %p invalidation failed %d\n",
++ 			    sc, rc);
+  		return FAILED;
+  	}
+  
+@@@ -297,230 -271,103 +301,284 @@@
+  
+  static int beiscsi_eh_device_reset(struct scsi_cmnd *sc)
+  {
+- 	struct iscsi_task *abrt_task;
+- 	struct beiscsi_io_task *abrt_io_task;
+- 	struct iscsi_conn *conn;
+- 	struct beiscsi_conn *beiscsi_conn;
+- 	struct beiscsi_hba *phba;
+- 	struct iscsi_session *session;
++ 	struct beiscsi_invldt_cmd_tbl {
++ 		struct invldt_cmd_tbl tbl[BE_INVLDT_CMD_TBL_SZ];
++ 		struct iscsi_task *task[BE_INVLDT_CMD_TBL_SZ];
++ 	} *inv_tbl;
+  	struct iscsi_cls_session *cls_session;
+++<<<<<<< HEAD
+ +	struct invalidate_command_table *inv_tbl;
+ +	struct be_dma_mem nonemb_cmd;
+ +	unsigned int cid, tag, i, num_invalidate;
+ +	int rc;
+++=======
++ 	struct beiscsi_conn *beiscsi_conn;
++ 	struct beiscsi_io_task *io_task;
++ 	struct iscsi_session *session;
++ 	struct beiscsi_hba *phba;
++ 	struct iscsi_conn *conn;
++ 	struct iscsi_task *task;
++ 	unsigned int i, nents;
++ 	int rc, more = 0;
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  
+- 	/* invalidate iocbs */
+  	cls_session = starget_to_session(scsi_target(sc->device));
+  	session = cls_session->dd_data;
+++<<<<<<< HEAD
+ +	spin_lock_bh(&session->lock);
+++=======
++ 
++ 	spin_lock_bh(&session->frwd_lock);
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  	if (!session->leadconn || session->state != ISCSI_STATE_LOGGED_IN) {
+ -		spin_unlock_bh(&session->frwd_lock);
+ +		spin_unlock_bh(&session->lock);
+  		return FAILED;
+  	}
++ 
+  	conn = session->leadconn;
+  	beiscsi_conn = conn->dd_data;
+  	phba = beiscsi_conn->phba;
+++<<<<<<< HEAD
+ +	cid = beiscsi_conn->beiscsi_conn_cid;
+ +	inv_tbl = phba->inv_tbl;
+ +	memset(inv_tbl, 0x0, sizeof(*inv_tbl) * BE2_CMDS_PER_CXN);
+ +	num_invalidate = 0;
+++=======
++ 
++ 	inv_tbl = kzalloc(sizeof(*inv_tbl), GFP_KERNEL);
++ 	if (!inv_tbl) {
++ 		spin_unlock_bh(&session->frwd_lock);
++ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
++ 			    "BM_%d : invldt_cmd_tbl alloc failed\n");
++ 		return FAILED;
++ 	}
++ 	nents = 0;
++ 	/* take back_lock to prevent task from getting cleaned up under us */
++ 	spin_lock(&session->back_lock);
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  	for (i = 0; i < conn->session->cmds_max; i++) {
+- 		abrt_task = conn->session->cmds[i];
+- 		abrt_io_task = abrt_task->dd_data;
+- 		if (!abrt_task->sc || abrt_task->state == ISCSI_TASK_FREE)
++ 		task = conn->session->cmds[i];
++ 		if (!task->sc)
+  			continue;
+  
+- 		if (sc->device->lun != abrt_task->sc->device->lun)
++ 		if (sc->device->lun != task->sc->device->lun)
+  			continue;
+ -		/**
+ -		 * Can't fit in more cmds? Normally this won't happen b'coz
+ -		 * BEISCSI_CMD_PER_LUN is same as BE_INVLDT_CMD_TBL_SZ.
+ -		 */
+ -		if (nents == BE_INVLDT_CMD_TBL_SZ) {
+ -			more = 1;
+ -			break;
+ -		}
+  
+- 		/* Invalidate WRB Posted for this Task */
++ 		/* get a task ref till FW processes the req for the ICD used */
++ 		__iscsi_get_task(task);
++ 		io_task = task->dd_data;
++ 		/* mark WRB invalid which have been not processed by FW yet */
+  		AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
+- 			      abrt_io_task->pwrb_handle->pwrb,
++ 			      io_task->pwrb_handle->pwrb,
+  			      1);
+  
+++<<<<<<< HEAD
+ +		inv_tbl->cid = cid;
+ +		inv_tbl->icd = abrt_io_task->psgl_handle->sgl_index;
+ +		num_invalidate++;
+ +		inv_tbl++;
+ +	}
+ +	spin_unlock_bh(&session->lock);
+ +	inv_tbl = phba->inv_tbl;
+ +
+ +	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+ +				sizeof(struct invalidate_commands_params_in),
+ +				&nonemb_cmd.dma);
+ +	if (nonemb_cmd.va == NULL) {
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ +			    "BM_%d : Failed to allocate memory for"
+ +			    "mgmt_invalidate_icds\n");
+ +		return FAILED;
+ +	}
+ +	nonemb_cmd.size = sizeof(struct invalidate_commands_params_in);
+ +	memset(nonemb_cmd.va, 0, nonemb_cmd.size);
+ +	tag = mgmt_invalidate_icds(phba, inv_tbl, num_invalidate,
+ +				   cid, &nonemb_cmd);
+ +	if (!tag) {
+++=======
++ 		inv_tbl->tbl[nents].cid = beiscsi_conn->beiscsi_conn_cid;
++ 		inv_tbl->tbl[nents].icd = io_task->psgl_handle->sgl_index;
++ 		inv_tbl->task[nents] = task;
++ 		nents++;
++ 	}
++ 	spin_unlock_bh(&session->back_lock);
++ 	spin_unlock_bh(&session->frwd_lock);
++ 
++ 	rc = SUCCESS;
++ 	if (!nents)
++ 		goto end_reset;
++ 
++ 	if (more) {
++ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
++ 			    "BM_%d : number of cmds exceeds size of invalidation table\n");
++ 		rc = FAILED;
++ 		goto end_reset;
++ 	}
++ 
++ 	if (beiscsi_mgmt_invalidate_icds(phba, &inv_tbl->tbl[0], nents)) {
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_EH,
+- 			    "BM_%d : mgmt_invalidate_icds could not be"
+- 			    " submitted\n");
+- 		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+- 				    nonemb_cmd.va, nonemb_cmd.dma);
+- 		return FAILED;
++ 			    "BM_%d : cid %u scmds invalidation failed\n",
++ 			    beiscsi_conn->beiscsi_conn_cid);
++ 		rc = FAILED;
+  	}
+  
+- 	rc = beiscsi_mccq_compl_wait(phba, tag, NULL, &nonemb_cmd);
+- 	if (rc != -EBUSY)
+- 		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+- 				    nonemb_cmd.va, nonemb_cmd.dma);
+- 	return iscsi_eh_device_reset(sc);
++ end_reset:
++ 	for (i = 0; i < nents; i++)
++ 		iscsi_put_task(inv_tbl->task[i]);
++ 	kfree(inv_tbl);
++ 
++ 	if (rc == SUCCESS)
++ 		rc = iscsi_eh_device_reset(sc);
++ 	return rc;
+  }
+  
+ +static ssize_t beiscsi_show_boot_tgt_info(void *data, int type, char *buf)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +	struct mgmt_session_info *boot_sess = &phba->boot_sess;
+ +	struct mgmt_conn_info *boot_conn = &boot_sess->conn_list[0];
+ +	char *str = buf;
+ +	int rc = -EPERM;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_TGT_NAME:
+ +		rc = sprintf(buf, "%.*s\n",
+ +			    (int)strlen(boot_sess->target_name),
+ +			    (char *)&boot_sess->target_name);
+ +		break;
+ +	case ISCSI_BOOT_TGT_IP_ADDR:
+ +		if (boot_conn->dest_ipaddr.ip_type == BEISCSI_IP_TYPE_V4)
+ +			rc = sprintf(buf, "%pI4\n",
+ +				(char *)&boot_conn->dest_ipaddr.addr);
+ +		else
+ +			rc = sprintf(str, "%pI6\n",
+ +				(char *)&boot_conn->dest_ipaddr.addr);
+ +		break;
+ +	case ISCSI_BOOT_TGT_PORT:
+ +		rc = sprintf(str, "%d\n", boot_conn->dest_port);
+ +		break;
+ +
+ +	case ISCSI_BOOT_TGT_CHAP_NAME:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     target_chap_name_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.target_chap_name);
+ +		break;
+ +	case ISCSI_BOOT_TGT_CHAP_SECRET:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     target_secret_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.target_secret);
+ +		break;
+ +	case ISCSI_BOOT_TGT_REV_CHAP_NAME:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     intr_chap_name_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.intr_chap_name);
+ +		break;
+ +	case ISCSI_BOOT_TGT_REV_CHAP_SECRET:
+ +		rc = sprintf(str,  "%.*s\n",
+ +			     boot_conn->negotiated_login_options.auth_data.chap.
+ +			     intr_secret_length,
+ +			     (char *)&boot_conn->negotiated_login_options.
+ +			     auth_data.chap.intr_secret);
+ +		break;
+ +	case ISCSI_BOOT_TGT_FLAGS:
+ +		rc = sprintf(str, "2\n");
+ +		break;
+ +	case ISCSI_BOOT_TGT_NIC_ASSOC:
+ +		rc = sprintf(str, "0\n");
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +static ssize_t beiscsi_show_boot_ini_info(void *data, int type, char *buf)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +	char *str = buf;
+ +	int rc = -EPERM;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_INI_INITIATOR_NAME:
+ +		rc = sprintf(str, "%s\n", phba->boot_sess.initiator_iscsiname);
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +static ssize_t beiscsi_show_boot_eth_info(void *data, int type, char *buf)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +	char *str = buf;
+ +	int rc = -EPERM;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_ETH_FLAGS:
+ +		rc = sprintf(str, "2\n");
+ +		break;
+ +	case ISCSI_BOOT_ETH_INDEX:
+ +		rc = sprintf(str, "0\n");
+ +		break;
+ +	case ISCSI_BOOT_ETH_MAC:
+ +		rc  = beiscsi_get_macaddr(str, phba);
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +
+ +static umode_t beiscsi_tgt_get_attr_visibility(void *data, int type)
+ +{
+ +	umode_t rc = 0;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_TGT_NAME:
+ +	case ISCSI_BOOT_TGT_IP_ADDR:
+ +	case ISCSI_BOOT_TGT_PORT:
+ +	case ISCSI_BOOT_TGT_CHAP_NAME:
+ +	case ISCSI_BOOT_TGT_CHAP_SECRET:
+ +	case ISCSI_BOOT_TGT_REV_CHAP_NAME:
+ +	case ISCSI_BOOT_TGT_REV_CHAP_SECRET:
+ +	case ISCSI_BOOT_TGT_NIC_ASSOC:
+ +	case ISCSI_BOOT_TGT_FLAGS:
+ +		rc = S_IRUGO;
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +static umode_t beiscsi_ini_get_attr_visibility(void *data, int type)
+ +{
+ +	umode_t rc = 0;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_INI_INITIATOR_NAME:
+ +		rc = S_IRUGO;
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+ +
+ +static umode_t beiscsi_eth_get_attr_visibility(void *data, int type)
+ +{
+ +	umode_t rc = 0;
+ +
+ +	switch (type) {
+ +	case ISCSI_BOOT_ETH_FLAGS:
+ +	case ISCSI_BOOT_ETH_MAC:
+ +	case ISCSI_BOOT_ETH_INDEX:
+ +		rc = S_IRUGO;
+ +		break;
+ +	}
+ +	return rc;
+ +}
+ +
+  /*------------------- PCI Driver operations and data ----------------- */
+  static const struct pci_device_id beiscsi_pci_id_table[] = {
+  	{ PCI_DEVICE(BE_VENDOR_ID, BE_DEVICE_ID1) },
+diff --cc drivers/scsi/be2iscsi/be_mgmt.c
+index 794ed5647611,110c0d076d9a..000000000000
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@@ -631,92 -128,6 +631,95 @@@ unsigned int mgmt_vendor_specific_fw_cm
+  	return tag;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * mgmt_epfw_cleanup()- Inform FW to cleanup data structures.
+ + * @phba: pointer to dev priv structure
+ + * @ulp_num: ULP number.
+ + *
+ + * return
+ + *	Success: 0
+ + *	Failure: Non-Zero Value
+ + **/
+ +int mgmt_epfw_cleanup(struct beiscsi_hba *phba, unsigned short ulp_num)
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct iscsi_cleanup_req *req;
+ +	unsigned int tag;
+ +	int status;
+ +
+ +	mutex_lock(&ctrl->mbox_lock);
+ +	wrb = alloc_mcc_wrb(phba, &tag);
+ +	if (!wrb) {
+ +		mutex_unlock(&ctrl->mbox_lock);
+ +		return -EBUSY;
+ +	}
+ +
+ +	req = embedded_payload(wrb);
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
+ +			   OPCODE_COMMON_ISCSI_CLEANUP, sizeof(*req));
+ +
+ +	req->chute = (1 << ulp_num);
+ +	req->hdr_ring_id = cpu_to_le16(HWI_GET_DEF_HDRQ_ID(phba, ulp_num));
+ +	req->data_ring_id = cpu_to_le16(HWI_GET_DEF_BUFQ_ID(phba, ulp_num));
+ +
+ +	be_mcc_notify(phba, tag);
+ +	status = be_mcc_compl_poll(phba, tag);
+ +	if (status)
+ +		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_INIT,
+ +			    "BG_%d : mgmt_epfw_cleanup , FAILED\n");
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +	return status;
+ +}
+ +
+ +unsigned int  mgmt_invalidate_icds(struct beiscsi_hba *phba,
+ +				struct invalidate_command_table *inv_tbl,
+ +				unsigned int num_invalidate, unsigned int cid,
+ +				struct be_dma_mem *nonemb_cmd)
+ +
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct be_sge *sge;
+ +	struct invalidate_commands_params_in *req;
+ +	unsigned int i, tag;
+ +
+ +	mutex_lock(&ctrl->mbox_lock);
+ +	wrb = alloc_mcc_wrb(phba, &tag);
+ +	if (!wrb) {
+ +		mutex_unlock(&ctrl->mbox_lock);
+ +		return 0;
+ +	}
+ +
+ +	req = nonemb_cmd->va;
+ +	memset(req, 0, sizeof(*req));
+ +	sge = nonembedded_sgl(wrb);
+ +
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), false, 1);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
+ +			OPCODE_COMMON_ISCSI_ERROR_RECOVERY_INVALIDATE_COMMANDS,
+ +			sizeof(*req));
+ +	req->ref_handle = 0;
+ +	req->cleanup_type = CMD_ISCSI_COMMAND_INVALIDATE;
+ +	for (i = 0; i < num_invalidate; i++) {
+ +		req->table[i].icd = inv_tbl->icd;
+ +		req->table[i].cid = inv_tbl->cid;
+ +		req->icd_count++;
+ +		inv_tbl++;
+ +	}
+ +	sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+ +	sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
+ +	sge->len = cpu_to_le32(nonemb_cmd->size);
+ +
+ +	be_mcc_notify(phba, tag);
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +	return tag;
+ +}
+ +
+++=======
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  unsigned int mgmt_invalidate_connection(struct beiscsi_hba *phba,
+  					 struct beiscsi_endpoint *beiscsi_ep,
+  					 unsigned short cid,
+@@@ -1814,69 -1451,63 +1817,128 @@@ void beiscsi_offload_cxn_v2(struct beis
+  		      exp_statsn) / 32] + 1));
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * beiscsi_logout_fw_sess()- Firmware Session Logout
+ + * @phba: Device priv structure instance
+ + * @fw_sess_handle: FW session handle
+ + *
+ + * Logout from the FW established sessions.
+ + * returns
+ + *  Success: 0
+ + *  Failure: Non-Zero Value
+ + *
+ + */
+ +int beiscsi_logout_fw_sess(struct beiscsi_hba *phba,
+ +		uint32_t fw_sess_handle)
+ +{
+ +	struct be_ctrl_info *ctrl = &phba->ctrl;
+ +	struct be_mcc_wrb *wrb;
+ +	struct be_cmd_req_logout_fw_sess *req;
+ +	struct be_cmd_resp_logout_fw_sess *resp;
+ +	unsigned int tag;
+ +	int rc;
+ +
+ +	beiscsi_log(phba, KERN_INFO,
+ +		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ +		    "BG_%d : In bescsi_logout_fwboot_sess\n");
+++=======
++ int beiscsi_mgmt_invalidate_icds(struct beiscsi_hba *phba,
++ 				 struct invldt_cmd_tbl *inv_tbl,
++ 				 unsigned int nents)
++ {
++ 	struct be_ctrl_info *ctrl = &phba->ctrl;
++ 	struct invldt_cmds_params_in *req;
++ 	struct be_dma_mem nonemb_cmd;
++ 	struct be_mcc_wrb *wrb;
++ 	unsigned int i, tag;
++ 	struct be_sge *sge;
++ 	int rc;
++ 
++ 	if (!nents || nents > BE_INVLDT_CMD_TBL_SZ)
++ 		return -EINVAL;
++ 
++ 	nonemb_cmd.size = sizeof(union be_invldt_cmds_params);
++ 	nonemb_cmd.va = pci_zalloc_consistent(phba->ctrl.pdev,
++ 					      nonemb_cmd.size,
++ 					      &nonemb_cmd.dma);
++ 	if (!nonemb_cmd.va) {
++ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
++ 			    "BM_%d : invldt_cmds_params alloc failed\n");
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  
+  	mutex_lock(&ctrl->mbox_lock);
+  	wrb = alloc_mcc_wrb(phba, &tag);
+  	if (!wrb) {
+  		mutex_unlock(&ctrl->mbox_lock);
+++<<<<<<< HEAD
+ +		beiscsi_log(phba, KERN_INFO,
+ +			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ +			    "BG_%d : MBX Tag Failure\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	req = embedded_payload(wrb);
+ +	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+ +	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
+ +			   OPCODE_ISCSI_INI_SESSION_LOGOUT_TARGET,
+ +			   sizeof(struct be_cmd_req_logout_fw_sess));
+ +
+ +	/* Set the session handle */
+ +	req->session_handle = fw_sess_handle;
+ +	be_mcc_notify(phba, tag);
+ +	mutex_unlock(&ctrl->mbox_lock);
+ +
+ +	rc = beiscsi_mccq_compl_wait(phba, tag, &wrb, NULL);
+ +	if (rc) {
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+ +			    "BG_%d : MBX CMD FW_SESSION_LOGOUT_TARGET Failed\n");
+ +		return -EBUSY;
+ +	}
+ +
+ +	resp = embedded_payload(wrb);
+ +	if (resp->session_status !=
+ +		BEISCSI_MGMT_SESSION_CLOSE) {
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+ +			    "BG_%d : FW_SESSION_LOGOUT_TARGET resp : 0x%x\n",
+ +			    resp->session_status);
+ +		rc = -EINVAL;
+ +	}
+ +
+++=======
++ 		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
++ 				    nonemb_cmd.va, nonemb_cmd.dma);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	req = nonemb_cmd.va;
++ 	be_wrb_hdr_prepare(wrb, nonemb_cmd.size, false, 1);
++ 	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
++ 			OPCODE_COMMON_ISCSI_ERROR_RECOVERY_INVALIDATE_COMMANDS,
++ 			sizeof(*req));
++ 	req->ref_handle = 0;
++ 	req->cleanup_type = CMD_ISCSI_COMMAND_INVALIDATE;
++ 	for (i = 0; i < nents; i++) {
++ 		req->table[i].icd = inv_tbl[i].icd;
++ 		req->table[i].cid = inv_tbl[i].cid;
++ 		req->icd_count++;
++ 	}
++ 	sge = nonembedded_sgl(wrb);
++ 	sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd.dma));
++ 	sge->pa_lo = cpu_to_le32(lower_32_bits(nonemb_cmd.dma));
++ 	sge->len = cpu_to_le32(nonemb_cmd.size);
++ 
++ 	be_mcc_notify(phba, tag);
++ 	mutex_unlock(&ctrl->mbox_lock);
++ 
++ 	rc = beiscsi_mccq_compl_wait(phba, tag, NULL, &nonemb_cmd);
++ 	if (rc != -EBUSY)
++ 		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
++ 				    nonemb_cmd.va, nonemb_cmd.dma);
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  	return rc;
+  }
+diff --cc drivers/scsi/be2iscsi/be_mgmt.h
+index 3ae2c46961a3,f301d57320ec..000000000000
+--- a/drivers/scsi/be2iscsi/be_mgmt.h
++++ b/drivers/scsi/be2iscsi/be_mgmt.h
+@@@ -266,11 -258,6 +266,14 @@@ struct beiscsi_endpoint 
+  	u16 cid_vld;
+  };
+  
+++<<<<<<< HEAD
+ +int mgmt_get_fw_config(struct be_ctrl_info *ctrl,
+ +				 struct beiscsi_hba *phba);
+ +int mgmt_get_port_name(struct be_ctrl_info *ctrl,
+ +		       struct beiscsi_hba *phba);
+ +
+++=======
+++>>>>>>> 987132167f4b (scsi: be2iscsi: Fix for crash in beiscsi_eh_device_reset)
+  unsigned int mgmt_invalidate_connection(struct beiscsi_hba *phba,
+  					 struct beiscsi_endpoint *beiscsi_ep,
+  					 unsigned short cid,
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+* Unmerged path drivers/scsi/be2iscsi/be_mgmt.c
+* Unmerged path drivers/scsi/be2iscsi/be_mgmt.h
