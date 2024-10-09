@@ -1,0 +1,141 @@
+nfp: implement firmware flashing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+commit 7a7415659144a4636a2f04f432393fa36dcc1b80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7a741565.failed
+
+Firmware flashing takes around 60s (specified to not take more than
+70s). Prevent hogging the RTNL lock in this time and make use of the
+longer timeout for the NSP command. The timeout is set to 2.5 * 70
+seconds.
+
+We only allow flashing the firmware from reprs or PF netdevs. VFs do not
+have an app reference.
+
+	Signed-off-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7a7415659144a4636a2f04f432393fa36dcc1b80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+index 125a38097124,39abac678b71..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+@@@ -96,6 -96,8 +96,11 @@@ enum nfp_nsp_cmd 
+  	SPCODE_FW_LOAD		= 6, /* Load fw from buffer, len in option */
+  	SPCODE_ETH_RESCAN	= 7, /* Rescan ETHs, write ETH_TABLE to buf */
+  	SPCODE_ETH_CONTROL	= 8, /* Update media config from buffer */
+++<<<<<<< HEAD
+++=======
++ 	SPCODE_NSP_WRITE_FLASH	= 11, /* Load and flash image from buffer */
++ 	SPCODE_NSP_SENSORS	= 12, /* Read NSP sensor(s) */
+++>>>>>>> 7a7415659144 (nfp: implement firmware flashing)
+  	SPCODE_NSP_IDENTIFY	= 13, /* Read NSP version */
+  };
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 206ca17e5c92..557adf50ca91 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@ -47,6 +47,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/pci.h>
+ #include <linux/ethtool.h>
++#include <linux/firmware.h>
+ 
+ #include "nfpcore/nfp.h"
+ #include "nfpcore/nfp_nsp.h"
+@@ -1266,6 +1267,57 @@ static int nfp_net_set_channels(struct net_device *netdev,
+ 	return nfp_net_set_num_rings(nn, total_rx, total_tx);
+ }
+ 
++static int
++nfp_net_flash_device(struct net_device *netdev, struct ethtool_flash *flash)
++{
++	const struct firmware *fw;
++	struct nfp_app *app;
++	struct nfp_nsp *nsp;
++	struct device *dev;
++	int err;
++
++	if (flash->region != ETHTOOL_FLASH_ALL_REGIONS)
++		return -EOPNOTSUPP;
++
++	app = nfp_app_from_netdev(netdev);
++	if (!app)
++		return -EOPNOTSUPP;
++
++	dev = &app->pdev->dev;
++
++	nsp = nfp_nsp_open(app->cpp);
++	if (IS_ERR(nsp)) {
++		err = PTR_ERR(nsp);
++		dev_err(dev, "Failed to access the NSP: %d\n", err);
++		return err;
++	}
++
++	err = request_firmware_direct(&fw, flash->data, dev);
++	if (err)
++		goto exit_close_nsp;
++
++	dev_info(dev, "Please be patient while writing flash image: %s\n",
++		 flash->data);
++	dev_hold(netdev);
++	rtnl_unlock();
++
++	err = nfp_nsp_write_flash(nsp, fw);
++	if (err < 0) {
++		dev_err(dev, "Flash write failed: %d\n", err);
++		goto exit_rtnl_lock;
++	}
++	dev_info(dev, "Finished writing flash image\n");
++
++exit_rtnl_lock:
++	rtnl_lock();
++	dev_put(netdev);
++	release_firmware(fw);
++
++exit_close_nsp:
++	nfp_nsp_close(nsp);
++	return err;
++}
++
+ static const struct ethtool_ops nfp_net_ethtool_ops = {
+ 	.get_drvinfo		= nfp_net_get_drvinfo,
+ 	.get_link		= ethtool_op_get_link,
+@@ -1276,6 +1328,7 @@ static const struct ethtool_ops nfp_net_ethtool_ops = {
+ 	.get_sset_count		= nfp_net_get_sset_count,
+ 	.get_rxnfc		= nfp_net_get_rxnfc,
+ 	.set_rxnfc		= nfp_net_set_rxnfc,
++	.flash_device		= nfp_net_flash_device,
+ 	.get_rxfh_indir_size	= nfp_net_get_rxfh_indir_size,
+ 	.get_rxfh_key_size	= nfp_net_get_rxfh_key_size,
+ 	.get_rxfh		= nfp_net_get_rxfh,
+@@ -1301,6 +1354,7 @@ const struct ethtool_ops nfp_port_ethtool_ops = {
+ 	.get_strings		= nfp_port_get_strings,
+ 	.get_ethtool_stats	= nfp_port_get_stats,
+ 	.get_sset_count		= nfp_port_get_sset_count,
++	.flash_device		= nfp_net_flash_device,
+ 	.set_dump		= nfp_app_set_dump,
+ 	.get_dump_flag		= nfp_app_get_dump_flag,
+ 	.get_dump_data		= nfp_app_get_dump_data,
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h
+index 820dade03c9d..d9d89a61a0d6 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.h
+@@ -48,6 +48,7 @@ u16 nfp_nsp_get_abi_ver_minor(struct nfp_nsp *state);
+ int nfp_nsp_wait(struct nfp_nsp *state);
+ int nfp_nsp_device_soft_reset(struct nfp_nsp *state);
+ int nfp_nsp_load_fw(struct nfp_nsp *state, const struct firmware *fw);
++int nfp_nsp_write_flash(struct nfp_nsp *state, const struct firmware *fw);
+ int nfp_nsp_mac_reinit(struct nfp_nsp *state);
+ 
+ static inline bool nfp_nsp_has_mac_reinit(struct nfp_nsp *state)
