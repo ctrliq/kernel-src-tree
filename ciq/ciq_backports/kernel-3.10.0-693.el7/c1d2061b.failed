@@ -1,0 +1,122 @@
+drm/i915: Squelch any ktime/jiffie rounding errors for wait-ioctl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: Squelch any ktime/jiffie rounding errors for wait-ioctl (Rob Clark) [1422186]
+Rebuild_FUZZ: 96.83%
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit c1d2061b28c2aa25ec39b60d9c248e6beebd7315
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c1d2061b.failed
+
+We wait upon jiffies, but report the time elapsed using a
+high-resolution timer. This discrepancy can lead to us timing out the
+wait prior to us reporting the elapsed time as complete.
+
+This restores the squelching lost in commit e95433c73a11 ("drm/i915:
+Rearrange i915_wait_request() accounting with callers").
+
+Fixes: e95433c73a11 ("drm/i915: Rearrange i915_wait_request() accounting with callers")
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Matthew Auld <matthew.william.auld@gmail.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: <drm-intel-fixes@lists.freedesktop.org> # v4.10-rc1+
+	Cc: stable@vger.kernel.org
+Link: http://patchwork.freedesktop.org/patch/msgid/20170216125441.30923-1-chris@chris-wilson.co.uk
+	Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+(cherry picked from commit c1d2061b28c2aa25ec39b60d9c248e6beebd7315)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem.c
+diff --cc drivers/gpu/drm/i915/i915_gem.c
+index 6fdaedc1cdbc,e6b8a4f56bbe..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@@ -3105,56 -3057,34 +3105,81 @@@ i915_gem_wait_ioctl(struct drm_device *
+  	if (args->flags != 0)
+  		return -EINVAL;
+  
+ -	obj = i915_gem_object_lookup(file, args->bo_handle);
+ -	if (!obj)
+ +	ret = i915_mutex_lock_interruptible(dev);
+ +	if (ret)
+ +		return ret;
+ +
+ +	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->bo_handle));
+ +	if (&obj->base == NULL) {
+ +		mutex_unlock(&dev->struct_mutex);
+  		return -ENOENT;
+++<<<<<<< HEAD
+++=======
++ 
++ 	start = ktime_get();
++ 
++ 	ret = i915_gem_object_wait(obj,
++ 				   I915_WAIT_INTERRUPTIBLE | I915_WAIT_ALL,
++ 				   to_wait_timeout(args->timeout_ns),
++ 				   to_rps_client(file));
++ 
++ 	if (args->timeout_ns > 0) {
++ 		args->timeout_ns -= ktime_to_ns(ktime_sub(ktime_get(), start));
++ 		if (args->timeout_ns < 0)
++ 			args->timeout_ns = 0;
++ 
++ 		/*
++ 		 * Apparently ktime isn't accurate enough and occasionally has a
++ 		 * bit of mismatch in the jiffies<->nsecs<->ktime loop. So patch
++ 		 * things up to make the test happy. We allow up to 1 jiffy.
++ 		 *
++ 		 * This is a regression from the timespec->ktime conversion.
++ 		 */
++ 		if (ret == -ETIME && !nsecs_to_jiffies(args->timeout_ns))
++ 			args->timeout_ns = 0;
+++>>>>>>> c1d2061b28c2 (drm/i915: Squelch any ktime/jiffie rounding errors for wait-ioctl)
+ +	}
+ +
+ +	/* Need to make sure the object gets inactive eventually. */
+ +	ret = i915_gem_object_flush_active(obj);
+ +	if (ret)
+ +		goto out;
+ +
+ +	if (!obj->active)
+ +		goto out;
+ +
+ +	/* Do this after OLR check to make sure we make forward progress polling
+ +	 * on this IOCTL with a timeout == 0 (like busy ioctl)
+ +	 */
+ +	if (args->timeout_ns == 0) {
+ +		ret = -ETIME;
+ +		goto out;
+ +	}
+ +
+ +	drm_gem_object_unreference(&obj->base);
+ +	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
+ +
+ +	for (i = 0; i < I915_NUM_RINGS; i++) {
+ +		if (obj->last_read_req[i] == NULL)
+ +			continue;
+ +
+ +		req[n++] = i915_gem_request_reference(obj->last_read_req[i]);
+ +	}
+ +
+ +	mutex_unlock(&dev->struct_mutex);
+ +
+ +	for (i = 0; i < n; i++) {
+ +		if (ret == 0)
+ +			ret = __i915_wait_request(req[i], reset_counter, true,
+ +						  args->timeout_ns > 0 ? &args->timeout_ns : NULL,
+ +						  to_rps_client(file));
+ +		i915_gem_request_unreference__unlocked(req[i]);
+  	}
+ +	return ret;
+  
+ -	i915_gem_object_put(obj);
+ +out:
+ +	drm_gem_object_unreference(&obj->base);
+ +	mutex_unlock(&dev->struct_mutex);
+  	return ret;
+  }
+  
+* Unmerged path drivers/gpu/drm/i915/i915_gem.c
