@@ -1,0 +1,133 @@
+ceph: use atomic_t for ceph_inode_info::i_shared_gen
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 97aeb6bf988e0830fd80dca724fd89526b3f35e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/97aeb6bf.failed
+
+It allows accessing i_shared_gen without holding i_ceph_lock. It is
+preparation for later patch.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Acked-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 97aeb6bf988e0830fd80dca724fd89526b3f35e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+diff --cc fs/ceph/dir.c
+index 83040cdc8671,d671d5876828..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -191,23 -172,22 +191,32 @@@ __dcache_find_get_entry(struct dentry *
+   * defined IFF we hold CEPH_CAP_FILE_SHARED (which will be revoked by
+   * the MDS if/when the directory is modified).
+   */
+++<<<<<<< HEAD
+ +static int __dcache_readdir(struct file *filp,
+ +			    void *dirent, filldir_t filldir,
+ +			    u32 shared_gen)
+++=======
++ static int __dcache_readdir(struct file *file,  struct dir_context *ctx,
++ 			    int shared_gen)
+++>>>>>>> 97aeb6bf988e (ceph: use atomic_t for ceph_inode_info::i_shared_gen)
+  {
+ -	struct ceph_file_info *fi = file->private_data;
+ -	struct dentry *parent = file->f_path.dentry;
+ -	struct inode *dir = d_inode(parent);
+ +	struct ceph_file_info *fi = filp->private_data;
+ +	struct dentry *parent = filp->f_dentry;
+ +	struct inode *dir = parent->d_inode;
+  	struct dentry *dentry, *last = NULL;
+  	struct ceph_dentry_info *di;
+  	struct ceph_readdir_cache_control cache_ctl = {};
+  	u64 idx = 0;
+  	int err = 0;
+  
+++<<<<<<< HEAD
+ +	dout("__dcache_readdir %p v%u at %llx\n", dir, shared_gen, filp->f_pos);
+++=======
++ 	dout("__dcache_readdir %p v%u at %llx\n", dir, (unsigned)shared_gen, ctx->pos);
+++>>>>>>> 97aeb6bf988e (ceph: use atomic_t for ceph_inode_info::i_shared_gen)
+  
+  	/* search start position */
+ -	if (ctx->pos > 2) {
+ +	if (filp->f_pos > 2) {
+  		u64 count = div_u64(i_size_read(dir), sizeof(struct dentry *));
+  		while (count > 0) {
+  			u64 step = count >> 1;
+@@@ -354,9 -333,9 +363,9 @@@ static int ceph_readdir(struct file *fi
+  	    ceph_snap(inode) != CEPH_SNAPDIR &&
+  	    __ceph_dir_is_complete_ordered(ci) &&
+  	    __ceph_caps_issued_mask(ci, CEPH_CAP_FILE_SHARED, 1)) {
+- 		u32 shared_gen = ci->i_shared_gen;
++ 		int shared_gen = atomic_read(&ci->i_shared_gen);
+  		spin_unlock(&ci->i_ceph_lock);
+ -		err = __dcache_readdir(file, ctx, shared_gen);
+ +		err = __dcache_readdir(filp, dirent, filldir, shared_gen);
+  		if (err != -EAGAIN)
+  			return err;
+  	} else {
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index e44b0f60bff9..087d248176b0 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -495,7 +495,7 @@ static void __check_cap_issue(struct ceph_inode_info *ci, struct ceph_cap *cap,
+ 	 */
+ 	if ((issued & CEPH_CAP_FILE_SHARED) != (had & CEPH_CAP_FILE_SHARED)) {
+ 		if (issued & CEPH_CAP_FILE_SHARED)
+-			ci->i_shared_gen++;
++			atomic_inc(&ci->i_shared_gen);
+ 		if (S_ISDIR(ci->vfs_inode.i_mode)) {
+ 			dout(" marking %p NOT complete\n", &ci->vfs_inode);
+ 			__ceph_dir_clear_complete(ci);
+* Unmerged path fs/ceph/dir.c
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 89fde4d86e99..84276b468c2a 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -493,7 +493,7 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
+ 	ci->i_wrbuffer_ref = 0;
+ 	ci->i_wrbuffer_ref_head = 0;
+ 	atomic_set(&ci->i_filelock_ref, 0);
+-	ci->i_shared_gen = 0;
++	atomic_set(&ci->i_shared_gen, 0);
+ 	ci->i_rdcache_gen = 0;
+ 	ci->i_rdcache_revoking = 0;
+ 
+@@ -1017,7 +1017,7 @@ static void update_dentry_lease(struct dentry *dentry,
+ 	if (ceph_snap(dir) != CEPH_NOSNAP)
+ 		goto out_unlock;
+ 
+-	di->lease_shared_gen = ceph_inode(dir)->i_shared_gen;
++	di->lease_shared_gen = atomic_read(&ceph_inode(dir)->i_shared_gen);
+ 
+ 	if (duration == 0)
+ 		goto out_unlock;
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index b4cf3e6bac33..a39d5b84c52a 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -246,7 +246,8 @@ struct ceph_inode_xattr {
+  */
+ struct ceph_dentry_info {
+ 	struct ceph_mds_session *lease_session;
+-	u32 lease_gen, lease_shared_gen;
++	int lease_shared_gen;
++	u32 lease_gen;
+ 	u32 lease_seq;
+ 	unsigned long lease_renew_after, lease_renew_from;
+ 	struct list_head lru;
+@@ -344,7 +345,7 @@ struct ceph_inode_info {
+ 	int i_rd_ref, i_rdcache_ref, i_wr_ref, i_wb_ref;
+ 	int i_wrbuffer_ref, i_wrbuffer_ref_head;
+ 	atomic_t i_filelock_ref;
+-	u32 i_shared_gen;       /* increment each time we get FILE_SHARED */
++	atomic_t i_shared_gen;       /* increment each time we get FILE_SHARED */
+ 	u32 i_rdcache_gen;      /* incremented each time we get FILE_CACHE. */
+ 	u32 i_rdcache_revoking; /* RDCACHE gen to async invalidate, if any */
+ 
