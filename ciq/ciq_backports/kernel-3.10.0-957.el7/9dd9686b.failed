@@ -1,0 +1,263 @@
+scsi: qla2xxx: Add changes for devloss timeout in driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add changes for devloss timeout in driver (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.34%
+commit-author Darren Trapp <darren.trapp@cavium.com>
+commit 9dd9686b14199a1c3e668e1cca124cd1c74b77e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9dd9686b.failed
+
+Add support for error recovery within devloss timeout, now that
+FC-NVMe transport support devloss timeout.
+
+	Signed-off-by: Darren Trapp <darren.trapp@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9dd9686b14199a1c3e668e1cca124cd1c74b77e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_isr.c
+#	drivers/scsi/qla2xxx/qla_nvme.c
+#	drivers/scsi/qla2xxx/qla_nvme.h
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index d0397ca42fad,56f78dce4d3c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -2285,6 -2343,19 +2285,22 @@@ typedef struct fc_port 
+  	unsigned int send_els_logo:1;
+  	unsigned int login_pause:1;
+  	unsigned int login_succ:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int query:1;
++ 	unsigned int id_changed:1;
++ 
++ 	struct work_struct nvme_del_work;
++ 	struct completion nvme_del_done;
++ 	uint32_t nvme_prli_service_param;
++ #define NVME_PRLI_SP_CONF       BIT_7
++ #define NVME_PRLI_SP_INITIATOR  BIT_5
++ #define NVME_PRLI_SP_TARGET     BIT_4
++ #define NVME_PRLI_SP_DISCOVERY  BIT_3
++ 	uint8_t nvme_flag;
++ #define NVME_FLAG_REGISTERED 4
++ #define NVME_FLAG_DELETING 2
+++>>>>>>> 9dd9686b1419 (scsi: qla2xxx: Add changes for devloss timeout in driver)
+  
+  	struct fc_port *conflict;
+  	unsigned char logout_completed;
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index 55510f69f284,93f2f1df7168..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -1805,6 -1840,136 +1805,139 @@@ qla24xx_tm_iocb_entry(scsi_qla_host_t *
+  	sp->done(sp, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ qla24xx_nvme_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
++ {
++ 	const char func[] = "NVME-IOCB";
++ 	fc_port_t *fcport;
++ 	srb_t *sp;
++ 	struct srb_iocb *iocb;
++ 	struct sts_entry_24xx *sts = (struct sts_entry_24xx *)tsk;
++ 	uint16_t        state_flags;
++ 	struct nvmefc_fcp_req *fd;
++ 	uint16_t        ret = 0;
++ 	struct srb_iocb *nvme;
++ 
++ 	sp = qla2x00_get_sp_from_handle(vha, func, req, tsk);
++ 	if (!sp)
++ 		return;
++ 
++ 	iocb = &sp->u.iocb_cmd;
++ 	fcport = sp->fcport;
++ 	iocb->u.nvme.comp_status = le16_to_cpu(sts->comp_status);
++ 	state_flags  = le16_to_cpu(sts->state_flags);
++ 	fd = iocb->u.nvme.desc;
++ 	nvme = &sp->u.iocb_cmd;
++ 
++ 	if (unlikely(nvme->u.nvme.aen_op))
++ 		atomic_dec(&sp->vha->hw->nvme_active_aen_cnt);
++ 
++ 	/*
++ 	 * State flags: Bit 6 and 0.
++ 	 * If 0 is set, we don't care about 6.
++ 	 * both cases resp was dma'd to host buffer
++ 	 * if both are 0, that is good path case.
++ 	 * if six is set and 0 is clear, we need to
++ 	 * copy resp data from status iocb to resp buffer.
++ 	 */
++ 	if (!(state_flags & (SF_FCP_RSP_DMA | SF_NVME_ERSP))) {
++ 		iocb->u.nvme.rsp_pyld_len = 0;
++ 	} else if ((state_flags & SF_FCP_RSP_DMA)) {
++ 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
++ 	} else if (state_flags & SF_NVME_ERSP) {
++ 		uint32_t *inbuf, *outbuf;
++ 		uint16_t iter;
++ 
++ 		inbuf = (uint32_t *)&sts->nvme_ersp_data;
++ 		outbuf = (uint32_t *)fd->rspaddr;
++ 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
++ 		iter = iocb->u.nvme.rsp_pyld_len >> 2;
++ 		for (; iter; iter--)
++ 			*outbuf++ = swab32(*inbuf++);
++ 	} else { /* unhandled case */
++ 	    ql_log(ql_log_warn, fcport->vha, 0x503a,
++ 		"NVME-%s error. Unhandled state_flags of %x\n",
++ 		sp->name, state_flags);
++ 	}
++ 
++ 	fd->transferred_length = fd->payload_length -
++ 	    le32_to_cpu(sts->residual_len);
++ 
++ 	/*
++ 	 * If transport error then Failure (HBA rejects request)
++ 	 * otherwise transport will handle.
++ 	 */
++ 	if (sts->entry_status) {
++ 		ql_log(ql_log_warn, fcport->vha, 0x5038,
++ 		    "NVME-%s error - hdl=%x entry-status(%x).\n",
++ 		    sp->name, sp->handle, sts->entry_status);
++ 		ret = QLA_FUNCTION_FAILED;
++ 	} else  {
++ 		switch (le16_to_cpu(sts->comp_status)) {
++ 			case CS_COMPLETE:
++ 				ret = QLA_SUCCESS;
++ 			break;
++ 
++ 			case CS_ABORTED:
++ 			case CS_RESET:
++ 			case CS_PORT_UNAVAILABLE:
++ 			case CS_PORT_LOGGED_OUT:
++ 			case CS_PORT_BUSY:
++ 				ql_log(ql_log_warn, fcport->vha, 0x5060,
++ 				"NVME-%s ERR Handling - hdl=%x completion status(%x) resid=%x  ox_id=%x\n",
++ 				sp->name, sp->handle, sts->comp_status,
++ 				le32_to_cpu(sts->residual_len), sts->ox_id);
++ 				fd->transferred_length = 0;
++ 				iocb->u.nvme.rsp_pyld_len = 0;
++ 				ret = QLA_ABORTED;
++ 			break;
++ 
++ 			default:
++ 				ql_log(ql_log_warn, fcport->vha, 0x5060,
++ 				"NVME-%s error - hdl=%x completion status(%x) resid=%x  ox_id=%x\n",
++ 				sp->name, sp->handle, sts->comp_status,
++ 				le32_to_cpu(sts->residual_len), sts->ox_id);
++ 				ret = QLA_FUNCTION_FAILED;
++ 				break;
++ 		}
++ 	}
++ 	sp->done(sp, ret);
++ }
++ 
++ static void qla_ctrlvp_completed(scsi_qla_host_t *vha, struct req_que *req,
++     struct vp_ctrl_entry_24xx *vce)
++ {
++ 	const char func[] = "CTRLVP-IOCB";
++ 	srb_t *sp;
++ 	int rval = QLA_SUCCESS;
++ 
++ 	sp = qla2x00_get_sp_from_handle(vha, func, req, vce);
++ 	if (!sp)
++ 		return;
++ 
++ 	if (vce->entry_status != 0) {
++ 		ql_dbg(ql_dbg_vport, vha, 0x10c4,
++ 		    "%s: Failed to complete IOCB -- error status (%x)\n",
++ 		    sp->name, vce->entry_status);
++ 		rval = QLA_FUNCTION_FAILED;
++ 	} else if (vce->comp_status != cpu_to_le16(CS_COMPLETE)) {
++ 		ql_dbg(ql_dbg_vport, vha, 0x10c5,
++ 		    "%s: Failed to complete IOCB -- completion status (%x) vpidx %x\n",
++ 		    sp->name, le16_to_cpu(vce->comp_status),
++ 		    le16_to_cpu(vce->vp_idx_failed));
++ 		rval = QLA_FUNCTION_FAILED;
++ 	} else {
++ 		ql_dbg(ql_dbg_vport, vha, 0x10c6,
++ 		    "Done %s.\n", __func__);
++ 	}
++ 
++ 	sp->rc = rval;
++ 	sp->done(sp, rval);
++ }
++ 
+++>>>>>>> 9dd9686b1419 (scsi: qla2xxx: Add changes for devloss timeout in driver)
+  /**
+   * qla2x00_process_response_queue() - Process response queue entries.
+   * @rsp: response queue
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 753c5e0953f9,ead6813ea9b3..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1128,8 -1169,14 +1128,19 @@@ void qlt_unreg_sess(struct fc_port *ses
+  	sess->last_rscn_gen = sess->rscn_gen;
+  	sess->last_login_gen = sess->login_gen;
+  
+++<<<<<<< HEAD
+ +	INIT_WORK(&sess->free_work, qlt_free_session_done);
+ +	schedule_work(&sess->free_work);
+++=======
++ 	if (sess->nvme_flag & NVME_FLAG_REGISTERED &&
++ 	    !(sess->nvme_flag & NVME_FLAG_DELETING)) {
++ 		sess->nvme_flag |= NVME_FLAG_DELETING;
++ 		schedule_work(&sess->nvme_del_work);
++ 	} else {
++ 		INIT_WORK(&sess->free_work, qlt_free_session_done);
++ 		schedule_work(&sess->free_work);
++ 	}
+++>>>>>>> 9dd9686b1419 (scsi: qla2xxx: Add changes for devloss timeout in driver)
+  }
+  EXPORT_SYMBOL(qlt_unreg_sess);
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.c
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.h
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index f74932ce86ba..7a67b084b33e 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -4950,6 +4950,14 @@ qla2x00_find_all_fabric_devs(scsi_qla_host_t *vha)
+ 			break;
+ 		}
+ 
++		if (fcport->fc4f_nvme) {
++			if (fcport->disc_state == DSC_DELETE_PEND) {
++				fcport->disc_state = DSC_GNL;
++				vha->fcport_count--;
++				fcport->login_succ = 0;
++			}
++		}
++
+ 		if (found) {
+ 			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+ 			continue;
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.c
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.h
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index b93b39992329..e56239c4ce53 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -1017,7 +1017,7 @@ extern void qlt_fc_port_deleted(struct scsi_qla_host *, fc_port_t *, int);
+ extern int __init qlt_init(void);
+ extern void qlt_exit(void);
+ extern void qlt_update_vp_map(struct scsi_qla_host *, int);
+-
++extern void qlt_free_session_done(struct work_struct *);
+ /*
+  * This macro is used during early initializations when host->active_mode
+  * is not set. Right now, ha value is ignored.
