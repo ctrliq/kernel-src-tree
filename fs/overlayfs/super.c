@@ -1133,14 +1133,14 @@ static int ovl_own_xattr_get(struct dentry *dentry,
 			     const char *name, void *buffer, size_t size,
 			     int handler_flags)
 {
-	return -EPERM;
+	return -EOPNOTSUPP;
 }
 
 static int ovl_own_xattr_set(struct dentry *dentry,
 			     const char *name, const void *value,
 			     size_t size, int flags, int handler_flags)
 {
-	return -EPERM;
+	return -EOPNOTSUPP;
 }
 
 static int ovl_other_xattr_get(struct dentry *dentry,
