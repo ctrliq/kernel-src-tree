@@ -1,0 +1,334 @@
+selinux lsm IB/core: Implement LSM notification system
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Daniel Jurgens <danielj@mellanox.com>
+commit 8f408ab64be6319cb7736cbc6982838dcc362306
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8f408ab6.failed
+
+Add a generic notificaiton mechanism in the LSM. Interested consumers
+can register a callback with the LSM and security modules can produce
+events.
+
+Because access to Infiniband QPs are enforced in the setup phase of a
+connection security should be enforced again if the policy changes.
+Register infiniband devices for policy change notification and check all
+QPs on that device when the notification is received.
+
+Add a call to the notification mechanism from SELinux when the AVC
+cache changes or setenforce is cleared.
+
+	Signed-off-by: Daniel Jurgens <danielj@mellanox.com>
+	Acked-by: James Morris <james.l.morris@oracle.com>
+	Acked-by: Doug Ledford <dledford@redhat.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 8f408ab64be6319cb7736cbc6982838dcc362306)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	include/linux/security.h
+#	security/security.c
+diff --cc drivers/infiniband/core/device.c
+index 32656f7b9a64,631eaa9daf65..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -317,6 -335,64 +327,67 @@@ void ib_get_device_fw_str(struct ib_dev
+  }
+  EXPORT_SYMBOL(ib_get_device_fw_str);
+  
+++<<<<<<< HEAD
+++=======
++ static int setup_port_pkey_list(struct ib_device *device)
++ {
++ 	int i;
++ 
++ 	/**
++ 	 * device->port_pkey_list is indexed directly by the port number,
++ 	 * Therefore it is declared as a 1 based array with potential empty
++ 	 * slots at the beginning.
++ 	 */
++ 	device->port_pkey_list = kcalloc(rdma_end_port(device) + 1,
++ 					 sizeof(*device->port_pkey_list),
++ 					 GFP_KERNEL);
++ 
++ 	if (!device->port_pkey_list)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < (rdma_end_port(device) + 1); i++) {
++ 		spin_lock_init(&device->port_pkey_list[i].list_lock);
++ 		INIT_LIST_HEAD(&device->port_pkey_list[i].pkey_list);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void ib_policy_change_task(struct work_struct *work)
++ {
++ 	struct ib_device *dev;
++ 
++ 	down_read(&lists_rwsem);
++ 	list_for_each_entry(dev, &device_list, core_list) {
++ 		int i;
++ 
++ 		for (i = rdma_start_port(dev); i <= rdma_end_port(dev); i++) {
++ 			u64 sp;
++ 			int ret = ib_get_cached_subnet_prefix(dev,
++ 							      i,
++ 							      &sp);
++ 
++ 			WARN_ONCE(ret,
++ 				  "ib_get_cached_subnet_prefix err: %d, this should never happen here\n",
++ 				  ret);
++ 			ib_security_cache_change(dev, i, sp);
++ 		}
++ 	}
++ 	up_read(&lists_rwsem);
++ }
++ 
++ static int ib_security_change(struct notifier_block *nb, unsigned long event,
++ 			      void *lsm_data)
++ {
++ 	if (event != LSM_POLICY_CHANGE)
++ 		return NOTIFY_DONE;
++ 
++ 	schedule_work(&ib_policy_change_work);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
+++>>>>>>> 8f408ab64be6 (selinux lsm IB/core: Implement LSM notification system)
+  /**
+   * ib_register_device - Register an IB device with IB core
+   * @device:Device to register
+diff --cc include/linux/security.h
+index dfc8642094cf,f96e333f6042..000000000000
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@@ -70,13 -69,14 +70,21 @@@ struct audit_krule
+  struct user_namespace;
+  struct timezone;
+  
+++<<<<<<< HEAD
+ +/*
+ + * These functions are in security/capability.c and are used
+ + * as the default capabilities functions
+ + */
+++=======
++ enum lsm_event {
++ 	LSM_POLICY_CHANGE,
++ };
++ 
++ /* These functions are in security/commoncap.c */
+++>>>>>>> 8f408ab64be6 (selinux lsm IB/core: Implement LSM notification system)
+  extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
+  		       int cap, int audit);
+ -extern int cap_settime(const struct timespec64 *ts, const struct timezone *tz);
+ +extern int cap_settime(const struct timespec *ts, const struct timezone *tz);
+  extern int cap_ptrace_access_check(struct task_struct *child, unsigned int mode);
+  extern int cap_ptrace_traceme(struct task_struct *parent);
+  extern int cap_capget(struct task_struct *target, kernel_cap_t *effective, kernel_cap_t *inheritable, kernel_cap_t *permitted);
+diff --cc security/security.c
+index 576b8827705a,b59be0d6535f..000000000000
+--- a/security/security.c
++++ b/security/security.c
+@@@ -29,6 -31,13 +29,16 @@@
+  
+  #define MAX_LSM_EVM_XATTR	2
+  
+++<<<<<<< HEAD
+++=======
++ /* Maximum number of letters for an LSM name string */
++ #define SECURITY_NAME_MAX	10
++ 
++ struct security_hook_heads security_hook_heads __lsm_ro_after_init;
++ static ATOMIC_NOTIFIER_HEAD(lsm_notifier_chain);
++ 
++ char *lsm_names;
+++>>>>>>> 8f408ab64be6 (selinux lsm IB/core: Implement LSM notification system)
+  /* Boot-time LSM user choice */
+  static __initdata char chosen_lsm[SECURITY_NAME_MAX + 1] =
+  	CONFIG_DEFAULT_SECURITY;
+@@@ -106,44 -148,104 +116,97 @@@ int __init security_module_enable(struc
+  }
+  
+  /**
+ - * security_add_hooks - Add a modules hooks to the hook lists.
+ - * @hooks: the hooks to add
+ - * @count: the number of hooks to add
+ - * @lsm: the name of the security module
+ + * register_security - registers a security framework with the kernel
+ + * @ops: a pointer to the struct security_options that is to be registered
+ + *
+ + * This function allows a security module to register itself with the
+ + * kernel security subsystem.  Some rudimentary checking is done on the @ops
+ + * value passed to this function. You'll need to check first if your LSM
+ + * is allowed to register its @ops by calling security_module_enable(@ops).
+   *
+ - * Each LSM has to register its hooks with the infrastructure.
+ + * If there is already a security module registered with the kernel,
+ + * an error will be returned.  Otherwise %0 is returned on success.
+   */
+ -void __init security_add_hooks(struct security_hook_list *hooks, int count,
+ -				char *lsm)
+ +int __init register_security(struct security_operations *ops)
+  {
+ -	int i;
+ -
+ -	for (i = 0; i < count; i++) {
+ -		hooks[i].lsm = lsm;
+ -		list_add_tail_rcu(&hooks[i].list, hooks[i].head);
+ +	if (verify(ops)) {
+ +		printk(KERN_DEBUG "%s could not verify "
+ +		       "security_operations structure.\n", __func__);
+ +		return -EINVAL;
+  	}
+ -	if (lsm_append(lsm, &lsm_names) < 0)
+ -		panic("%s - Cannot get early memory.\n", __func__);
+ +
+ +	if (security_ops != &default_security_ops)
+ +		return -EAGAIN;
+ +
+ +	security_ops = ops;
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int call_lsm_notifier(enum lsm_event event, void *data)
++ {
++ 	return atomic_notifier_call_chain(&lsm_notifier_chain, event, data);
++ }
++ EXPORT_SYMBOL(call_lsm_notifier);
++ 
++ int register_lsm_notifier(struct notifier_block *nb)
++ {
++ 	return atomic_notifier_chain_register(&lsm_notifier_chain, nb);
++ }
++ EXPORT_SYMBOL(register_lsm_notifier);
++ 
++ int unregister_lsm_notifier(struct notifier_block *nb)
++ {
++ 	return atomic_notifier_chain_unregister(&lsm_notifier_chain, nb);
++ }
++ EXPORT_SYMBOL(unregister_lsm_notifier);
++ 
++ /*
++  * Hook list operation macros.
++  *
++  * call_void_hook:
++  *	This is a hook that does not return a value.
++  *
++  * call_int_hook:
++  *	This is a hook that returns a value.
++  */
++ 
++ #define call_void_hook(FUNC, ...)				\
++ 	do {							\
++ 		struct security_hook_list *P;			\
++ 								\
++ 		list_for_each_entry(P, &security_hook_heads.FUNC, list)	\
++ 			P->hook.FUNC(__VA_ARGS__);		\
++ 	} while (0)
++ 
++ #define call_int_hook(FUNC, IRC, ...) ({			\
++ 	int RC = IRC;						\
++ 	do {							\
++ 		struct security_hook_list *P;			\
++ 								\
++ 		list_for_each_entry(P, &security_hook_heads.FUNC, list) { \
++ 			RC = P->hook.FUNC(__VA_ARGS__);		\
++ 			if (RC != 0)				\
++ 				break;				\
++ 		}						\
++ 	} while (0);						\
++ 	RC;							\
++ })
++ 
+++>>>>>>> 8f408ab64be6 (selinux lsm IB/core: Implement LSM notification system)
+  /* Security operations */
+  
+ -int security_binder_set_context_mgr(struct task_struct *mgr)
+ -{
+ -	return call_int_hook(binder_set_context_mgr, 0, mgr);
+ -}
+ -
+ -int security_binder_transaction(struct task_struct *from,
+ -				struct task_struct *to)
+ -{
+ -	return call_int_hook(binder_transaction, 0, from, to);
+ -}
+ -
+ -int security_binder_transfer_binder(struct task_struct *from,
+ -				    struct task_struct *to)
+ -{
+ -	return call_int_hook(binder_transfer_binder, 0, from, to);
+ -}
+ -
+ -int security_binder_transfer_file(struct task_struct *from,
+ -				  struct task_struct *to, struct file *file)
+ -{
+ -	return call_int_hook(binder_transfer_file, 0, from, to, file);
+ -}
+ -
+  int security_ptrace_access_check(struct task_struct *child, unsigned int mode)
+  {
+ -	return call_int_hook(ptrace_access_check, 0, child, mode);
+ +#ifdef CONFIG_SECURITY_YAMA_STACKED
+ +	int rc;
+ +	rc = yama_ptrace_access_check(child, mode);
+ +	if (rc)
+ +		return rc;
+ +#endif
+ +	return security_ops->ptrace_access_check(child, mode);
+  }
+  
+  int security_ptrace_traceme(struct task_struct *parent)
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path include/linux/security.h
+* Unmerged path security/security.c
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 7c150cbbfbc6..f62e6ee8428b 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -159,6 +159,14 @@ static int selinux_netcache_avc_callback(u32 event)
+ 	return 0;
+ }
+ 
++static int selinux_lsm_notifier_avc_callback(u32 event)
++{
++	if (event == AVC_CALLBACK_RESET)
++		call_lsm_notifier(LSM_POLICY_CHANGE, NULL);
++
++	return 0;
++}
++
+ /*
+  * initialise the security for the init task
+  */
+@@ -6202,6 +6210,9 @@ static __init int selinux_init(void)
+ 	if (avc_add_callback(selinux_netcache_avc_callback, AVC_CALLBACK_RESET))
+ 		panic("SELinux: Unable to register AVC netcache callback\n");
+ 
++	if (avc_add_callback(selinux_lsm_notifier_avc_callback, AVC_CALLBACK_RESET))
++		panic("SELinux: Unable to register AVC LSM notifier callback\n");
++
+ 	if (selinux_enforcing)
+ 		printk(KERN_DEBUG "SELinux:  Starting in enforcing mode\n");
+ 	else
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index e89edc244e37..c4a21a8745eb 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -181,6 +181,8 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+ 			avc_ss_reset(0);
+ 		selnl_notify_setenforce(selinux_enforcing);
+ 		selinux_status_update_setenforce(selinux_enforcing);
++		if (!selinux_enforcing)
++			call_lsm_notifier(LSM_POLICY_CHANGE, NULL);
+ 	}
+ 	length = count;
+ out:
