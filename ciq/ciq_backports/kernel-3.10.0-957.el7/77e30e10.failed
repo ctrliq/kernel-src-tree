@@ -1,0 +1,212 @@
+iwlwifi: mvm: query regdb for wmm rule if needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Haim Dreyfuss <haim.dreyfuss@intel.com>
+commit 77e30e10ee28a53c8af95809866ee8493583e29a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/77e30e10.failed
+
+Since our device is regulatory self managed it maintains its regulatory
+rules by its own. However the wmm_rules values can't be set by the
+device itself but only the indication about the need to set it.
+In case the device set wmm indication, proactively query the regulatory
+data base to get these values
+
+	Signed-off-by: Haim Dreyfuss <haim.dreyfuss@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+(cherry picked from commit 77e30e10ee28a53c8af95809866ee8493583e29a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.c
+diff --cc drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.c
+index c3a5d8ccc95e,ca0174680af9..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.c
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.c
+@@@ -75,6 -75,8 +75,11 @@@
+  #include "iwl-prph.h"
+  #include "iwl-io.h"
+  #include "iwl-csr.h"
+++<<<<<<< HEAD
+++=======
++ #include "fw/acpi.h"
++ #include "fw/api/nvm-reg.h"
+++>>>>>>> 77e30e10ee28 (iwlwifi: mvm: query regdb for wmm rule if needed)
+  
+  /* NVM offsets (in words) definitions */
+  enum nvm_offsets {
+@@@ -929,99 -978,42 +981,130 @@@ iwl_parse_nvm_mcc_info(struct device *d
+  	}
+  
+  	regd->n_reg_rules = valid_rules;
++ 	regd->n_wmm_rules = n_wmms;
+  
+- 	/* set alpha2 from FW. */
+- 	regd->alpha2[0] = fw_mcc >> 8;
+- 	regd->alpha2[1] = fw_mcc & 0xff;
++ 	/*
++ 	 * Narrow down regdom for unused regulatory rules to prevent hole
++ 	 * between reg rules to wmm rules.
++ 	 */
++ 	regd_to_copy = sizeof(struct ieee80211_regdomain) +
++ 		valid_rules * sizeof(struct ieee80211_reg_rule);
++ 
++ 	wmms_to_copy = sizeof(struct ieee80211_wmm_rule) * n_wmms;
++ 
++ 	copy_rd = kzalloc(regd_to_copy + wmms_to_copy, GFP_KERNEL);
++ 	if (!copy_rd) {
++ 		copy_rd = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 
++ 	memcpy(copy_rd, regd, regd_to_copy);
++ 	memcpy((u8 *)copy_rd + regd_to_copy, (u8 *)regd + size_of_regd,
++ 	       wmms_to_copy);
++ 
++ 	d_wmm = (struct ieee80211_wmm_rule *)((u8 *)copy_rd + regd_to_copy);
++ 	s_wmm = (struct ieee80211_wmm_rule *)((u8 *)regd + size_of_regd);
++ 
++ 	for (i = 0; i < regd->n_reg_rules; i++) {
++ 		if (!regd->reg_rules[i].wmm_rule)
++ 			continue;
++ 
++ 		copy_rd->reg_rules[i].wmm_rule = d_wmm +
++ 			(regd->reg_rules[i].wmm_rule - s_wmm) /
++ 			sizeof(struct ieee80211_wmm_rule);
++ 	}
+  
+- 	return regd;
++ out:
++ 	kfree(regdb_ptrs);
++ 	kfree(regd);
++ 	return copy_rd;
+  }
+  IWL_EXPORT_SYMBOL(iwl_parse_nvm_mcc_info);
+ +
+ +#ifdef CONFIG_ACPI
+ +#define WRDD_METHOD		"WRDD"
+ +#define WRDD_WIFI		(0x07)
+ +#define WRDD_WIGIG		(0x10)
+ +
+ +static u32 iwl_wrdd_get_mcc(struct device *dev, union acpi_object *wrdd)
+ +{
+ +	union acpi_object *mcc_pkg, *domain_type, *mcc_value;
+ +	u32 i;
+ +
+ +	if (wrdd->type != ACPI_TYPE_PACKAGE ||
+ +	    wrdd->package.count < 2 ||
+ +	    wrdd->package.elements[0].type != ACPI_TYPE_INTEGER ||
+ +	    wrdd->package.elements[0].integer.value != 0) {
+ +		IWL_DEBUG_EEPROM(dev, "Unsupported wrdd structure\n");
+ +		return 0;
+ +	}
+ +
+ +	for (i = 1 ; i < wrdd->package.count ; ++i) {
+ +		mcc_pkg = &wrdd->package.elements[i];
+ +
+ +		if (mcc_pkg->type != ACPI_TYPE_PACKAGE ||
+ +		    mcc_pkg->package.count < 2 ||
+ +		    mcc_pkg->package.elements[0].type != ACPI_TYPE_INTEGER ||
+ +		    mcc_pkg->package.elements[1].type != ACPI_TYPE_INTEGER) {
+ +			mcc_pkg = NULL;
+ +			continue;
+ +		}
+ +
+ +		domain_type = &mcc_pkg->package.elements[0];
+ +		if (domain_type->integer.value == WRDD_WIFI)
+ +			break;
+ +
+ +		mcc_pkg = NULL;
+ +	}
+ +
+ +	if (mcc_pkg) {
+ +		mcc_value = &mcc_pkg->package.elements[1];
+ +		return mcc_value->integer.value;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +int iwl_get_bios_mcc(struct device *dev, char *mcc)
+ +{
+ +	acpi_handle root_handle;
+ +	acpi_handle handle;
+ +	struct acpi_buffer wrdd = {ACPI_ALLOCATE_BUFFER, NULL};
+ +	acpi_status status;
+ +	u32 mcc_val;
+ +
+ +	root_handle = ACPI_HANDLE(dev);
+ +	if (!root_handle) {
+ +		IWL_DEBUG_EEPROM(dev,
+ +				 "Could not retrieve root port ACPI handle\n");
+ +		return -ENOENT;
+ +	}
+ +
+ +	/* Get the method's handle */
+ +	status = acpi_get_handle(root_handle, (acpi_string)WRDD_METHOD,
+ +				 &handle);
+ +	if (ACPI_FAILURE(status)) {
+ +		IWL_DEBUG_EEPROM(dev, "WRD method not found\n");
+ +		return -ENOENT;
+ +	}
+ +
+ +	/* Call WRDD with no arguments */
+ +	status = acpi_evaluate_object(handle, NULL, NULL, &wrdd);
+ +	if (ACPI_FAILURE(status)) {
+ +		IWL_DEBUG_EEPROM(dev, "WRDC invocation failed (0x%x)\n",
+ +				 status);
+ +		return -ENOENT;
+ +	}
+ +
+ +	mcc_val = iwl_wrdd_get_mcc(dev, wrdd.pointer);
+ +	kfree(wrdd.pointer);
+ +	if (!mcc_val)
+ +		return -ENOENT;
+ +
+ +	mcc[0] = (mcc_val >> 8) & 0xff;
+ +	mcc[1] = mcc_val & 0xff;
+ +	mcc[2] = '\0';
+ +	return 0;
+ +}
+ +IWL_EXPORT_SYMBOL(iwl_get_bios_mcc);
+ +#endif
+* Unmerged path drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.h b/drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.h
+index 2d1a24dd8410..8ecc5a185936 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.h
+@@ -101,13 +101,15 @@ void iwl_init_sbands(struct device *dev, const struct iwl_cfg *cfg,
+  *
+  * This function parses the regulatory channel data received as a
+  * MCC_UPDATE_CMD command. It returns a newly allocation regulatory domain,
+- * to be fed into the regulatory core. An ERR_PTR is returned on error.
++ * to be fed into the regulatory core. In case the geo_info is set handle
++ * accordingly. An ERR_PTR is returned on error.
+  * If not given to the regulatory core, the user is responsible for freeing
+  * the regdomain returned here with kfree.
+  */
+ struct ieee80211_regdomain *
+ iwl_parse_nvm_mcc_info(struct device *dev, const struct iwl_cfg *cfg,
+-		       int num_of_ch, __le32 *channels, u16 fw_mcc);
++		       int num_of_ch, __le32 *channels, u16 fw_mcc,
++		       u16 geo_info);
+ 
+ #ifdef CONFIG_ACPI
+ /**
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index a9ac872226fd..15405f675b5c 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -333,7 +333,8 @@ struct ieee80211_regdomain *iwl_mvm_get_regdomain(struct wiphy *wiphy,
+ 	regd = iwl_parse_nvm_mcc_info(mvm->trans->dev, mvm->cfg,
+ 				      __le32_to_cpu(resp->n_channels),
+ 				      resp->channels,
+-				      __le16_to_cpu(resp->mcc));
++				      __le16_to_cpu(resp->mcc),
++				      __le16_to_cpu(resp->geo_info));
+ 	/* Store the return source id */
+ 	src_id = resp->source_id;
+ 	kfree(resp);
