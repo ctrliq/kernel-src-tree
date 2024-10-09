@@ -1,0 +1,145 @@
+mmc: block: Reparametrize mmc_blk_ioctl_[multi]_cmd()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Reparametrize mmc_blk_ioctl_(multi)_cmd() (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 91.09%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 2fe20baec46caeaf1076a7f3d7cfd3e75c40205c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2fe20bae.failed
+
+Instead of passing a block device to
+mmc_blk_ioctl[_multi]_cmd(), let's pass struct mmc_blk_data()
+so we operate ioctl()s on the MMC block device representation
+rather than the vanilla block device.
+
+This saves a little duplicated code and makes it possible to
+issue ioctl()s not targeted for a specific block device but
+rather for a specific partition/area.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 2fe20baec46caeaf1076a7f3d7cfd3e75c40205c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index 02e8b44f3a1d,0eebc2f726c3..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -554,9 -557,11 +554,14 @@@ static int mmc_blk_ioctl_cmd(struct mmc
+  			     struct mmc_ioc_cmd __user *ic_ptr)
+  {
+  	struct mmc_blk_ioc_data *idata;
+++<<<<<<< HEAD
+ +	struct mmc_blk_data *md;
+++=======
++ 	struct mmc_blk_ioc_data *idatas[1];
++ 	struct mmc_queue *mq;
+++>>>>>>> 2fe20baec46c (mmc: block: Reparametrize mmc_blk_ioctl_[multi]_cmd())
+  	struct mmc_card *card;
+  	int err = 0, ioc_err = 0;
+ -	struct request *req;
+  
+  	idata = mmc_blk_ioctl_copy_from_user(ic_ptr);
+  	if (IS_ERR(idata))
+@@@ -574,21 -573,23 +573,19 @@@
+  		goto cmd_done;
+  	}
+  
+ -	/*
+ -	 * Dispatch the ioctl() into the block request queue.
+ -	 */
+ -	mq = &md->queue;
+ -	req = blk_get_request(mq->queue,
+ -		idata->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
+ -		__GFP_RECLAIM);
+ -	idatas[0] = idata;
+ -	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_IOCTL;
+ -	req_to_mmc_queue_req(req)->drv_op_data = idatas;
+ -	req_to_mmc_queue_req(req)->ioc_count = 1;
+ -	blk_execute_rq(mq->queue, NULL, req, 0);
+ -	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+ +	mmc_get_card(card);
+ +
+ +	ioc_err = __mmc_blk_ioctl_cmd(card, md, idata);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+ +
+  	err = mmc_blk_ioctl_copy_to_user(ic_ptr, idata);
+ -	blk_put_request(req);
+  
+  cmd_done:
+- 	mmc_blk_put(md);
+- cmd_err:
+  	kfree(idata->buf);
+  	kfree(idata);
+  	return ioc_err ? ioc_err : err;
+@@@ -600,9 -601,10 +597,13 @@@ static int mmc_blk_ioctl_multi_cmd(stru
+  	struct mmc_blk_ioc_data **idata = NULL;
+  	struct mmc_ioc_cmd __user *cmds = user->cmds;
+  	struct mmc_card *card;
+++<<<<<<< HEAD
+ +	struct mmc_blk_data *md;
+++=======
++ 	struct mmc_queue *mq;
+++>>>>>>> 2fe20baec46c (mmc: block: Reparametrize mmc_blk_ioctl_[multi]_cmd())
+  	int i, err = 0, ioc_err = 0;
+  	__u64 num_of_cmds;
+ -	struct request *req;
+  
+  	if (copy_from_user(&num_of_cmds, &user->num_of_cmds,
+  			   sizeof(num_of_cmds)))
+@@@ -630,32 -632,29 +631,31 @@@
+  	card = md->queue.card;
+  	if (IS_ERR(card)) {
+  		err = PTR_ERR(card);
+- 		goto cmd_done;
++ 		goto cmd_err;
+  	}
+  
+ +	mmc_get_card(card);
+  
+ -	/*
+ -	 * Dispatch the ioctl()s into the block request queue.
+ -	 */
+ -	mq = &md->queue;
+ -	req = blk_get_request(mq->queue,
+ -		idata[0]->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
+ -		__GFP_RECLAIM);
+ -	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_IOCTL;
+ -	req_to_mmc_queue_req(req)->drv_op_data = idata;
+ -	req_to_mmc_queue_req(req)->ioc_count = num_of_cmds;
+ -	blk_execute_rq(mq->queue, NULL, req, 0);
+ -	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+ +	for (i = 0; i < num_of_cmds && !ioc_err; i++)
+ +		ioc_err = __mmc_blk_ioctl_cmd(card, md, idata[i]);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+  
+  	/* copy to user if data and response */
+  	for (i = 0; i < num_of_cmds && !err; i++)
+  		err = mmc_blk_ioctl_copy_to_user(&cmds[i], idata[i]);
+  
+++<<<<<<< HEAD
+ +cmd_done:
+ +	mmc_blk_put(md);
+++=======
++ 	blk_put_request(req);
++ 
+++>>>>>>> 2fe20baec46c (mmc: block: Reparametrize mmc_blk_ioctl_[multi]_cmd())
+  cmd_err:
+  	for (i = 0; i < num_of_cmds; i++) {
+  		kfree(idata[i]->buf);
+* Unmerged path drivers/mmc/core/block.c
