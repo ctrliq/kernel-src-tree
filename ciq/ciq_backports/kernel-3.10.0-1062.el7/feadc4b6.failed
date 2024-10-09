@@ -1,0 +1,172 @@
+rtnetlink: always put IFLA_LINK for links with a link-netnsid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit feadc4b6cf42a53a8a93c918a569a0b7e62bd350
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/feadc4b6.failed
+
+Currently, nla_put_iflink() doesn't put the IFLA_LINK attribute when
+iflink == ifindex.
+
+In some cases, a device can be created in a different netns with the
+same ifindex as its parent. That device will not dump its IFLA_LINK
+attribute, which can confuse some userspace software that expects it.
+For example, if the last ifindex created in init_net and foo are both
+8, these commands will trigger the issue:
+
+    ip link add parent type dummy                   # ifindex 9
+    ip link add link parent netns foo type macvlan  # ifindex 9 in ns foo
+
+So, in case a device puts the IFLA_LINK_NETNSID attribute in a dump,
+always put the IFLA_LINK attribute as well.
+
+Thanks to Dan Winship for analyzing the original OpenShift bug down to
+the missing netlink attribute.
+
+v2: change Fixes tag, it's been here forever, as Nicolas Dichtel said
+    add Nicolas' ack
+v3: change Fixes tag
+    fix subject typo, spotted by Edward Cree
+
+Analyzed-by: Dan Winship <danw@redhat.com>
+Fixes: d8a5ec672768 ("[NET]: netlink support for moving devices between network namespaces.")
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Acked-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit feadc4b6cf42a53a8a93c918a569a0b7e62bd350)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/rtnetlink.c
+diff --cc net/core/rtnetlink.c
+index c70e7cdc57f8,adcc045952c2..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1365,6 -1481,105 +1365,108 @@@ static u32 rtnl_get_event(unsigned lon
+  	return rtnl_event_type;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int put_master_ifindex(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	const struct net_device *upper_dev;
++ 	int ret = 0;
++ 
++ 	rcu_read_lock();
++ 
++ 	upper_dev = netdev_master_upper_dev_get_rcu(dev);
++ 	if (upper_dev)
++ 		ret = nla_put_u32(skb, IFLA_MASTER, upper_dev->ifindex);
++ 
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ 
++ static int nla_put_iflink(struct sk_buff *skb, const struct net_device *dev,
++ 			  bool force)
++ {
++ 	int ifindex = dev_get_iflink(dev);
++ 
++ 	if (force || dev->ifindex != ifindex)
++ 		return nla_put_u32(skb, IFLA_LINK, ifindex);
++ 
++ 	return 0;
++ }
++ 
++ static noinline_for_stack int nla_put_ifalias(struct sk_buff *skb,
++ 					      struct net_device *dev)
++ {
++ 	char buf[IFALIASZ];
++ 	int ret;
++ 
++ 	ret = dev_get_alias(dev, buf, sizeof(buf));
++ 	return ret > 0 ? nla_put_string(skb, IFLA_IFALIAS, buf) : 0;
++ }
++ 
++ static int rtnl_fill_link_netnsid(struct sk_buff *skb,
++ 				  const struct net_device *dev,
++ 				  struct net *src_net)
++ {
++ 	bool put_iflink = false;
++ 
++ 	if (dev->rtnl_link_ops && dev->rtnl_link_ops->get_link_net) {
++ 		struct net *link_net = dev->rtnl_link_ops->get_link_net(dev);
++ 
++ 		if (!net_eq(dev_net(dev), link_net)) {
++ 			int id = peernet2id_alloc(src_net, link_net);
++ 
++ 			if (nla_put_s32(skb, IFLA_LINK_NETNSID, id))
++ 				return -EMSGSIZE;
++ 
++ 			put_iflink = true;
++ 		}
++ 	}
++ 
++ 	return nla_put_iflink(skb, dev, put_iflink);
++ }
++ 
++ static int rtnl_fill_link_af(struct sk_buff *skb,
++ 			     const struct net_device *dev,
++ 			     u32 ext_filter_mask)
++ {
++ 	const struct rtnl_af_ops *af_ops;
++ 	struct nlattr *af_spec;
++ 
++ 	af_spec = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
++ 	if (!af_spec)
++ 		return -EMSGSIZE;
++ 
++ 	list_for_each_entry_rcu(af_ops, &rtnl_af_ops, list) {
++ 		struct nlattr *af;
++ 		int err;
++ 
++ 		if (!af_ops->fill_link_af)
++ 			continue;
++ 
++ 		af = nla_nest_start_noflag(skb, af_ops->family);
++ 		if (!af)
++ 			return -EMSGSIZE;
++ 
++ 		err = af_ops->fill_link_af(skb, dev, ext_filter_mask);
++ 		/*
++ 		 * Caller may return ENODATA to indicate that there
++ 		 * was no data to be dumped. This is not an error, it
++ 		 * means we should trim the attribute header and
++ 		 * continue.
++ 		 */
++ 		if (err == -ENODATA)
++ 			nla_nest_cancel(skb, af);
++ 		else if (err < 0)
++ 			return -EMSGSIZE;
++ 
++ 		nla_nest_end(skb, af);
++ 	}
++ 
++ 	nla_nest_end(skb, af_spec);
++ 	return 0;
++ }
++ 
+++>>>>>>> feadc4b6cf42 (rtnetlink: always put IFLA_LINK for links with a link-netnsid)
+  static int rtnl_fill_ifinfo(struct sk_buff *skb,
+  			    struct net_device *dev, struct net *src_net,
+  			    int type, u32 pid, u32 seq, u32 change,
+@@@ -1408,10 -1622,7 +1510,14 @@@
+  #ifdef CONFIG_RPS
+  	    nla_put_u32(skb, IFLA_NUM_RX_QUEUES, dev->num_rx_queues) ||
+  #endif
+++<<<<<<< HEAD
+ +	    (dev->ifindex != dev_get_iflink(dev) &&
+ +	     nla_put_u32(skb, IFLA_LINK, dev_get_iflink(dev))) ||
+ +	    (upper_dev &&
+ +	     nla_put_u32(skb, IFLA_MASTER, upper_dev->ifindex)) ||
+++=======
++ 	    put_master_ifindex(skb, dev) ||
+++>>>>>>> feadc4b6cf42 (rtnetlink: always put IFLA_LINK for links with a link-netnsid)
+  	    nla_put_u8(skb, IFLA_CARRIER, netif_carrier_ok(dev)) ||
+  	    (dev->qdisc &&
+  	     nla_put_string(skb, IFLA_QDISC, dev->qdisc->ops->id)) ||
+* Unmerged path net/core/rtnetlink.c
