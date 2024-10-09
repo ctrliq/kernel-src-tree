@@ -1,0 +1,174 @@
+dm snapshot: add optional discard support features
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 2e6023850e177dbaca21498ada04c5a5ac93f812
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/2e602385.failed
+
+discard_zeroes_cow - a discard issued to the snapshot device that maps
+to entire chunks to will zero the corresponding exception(s) in the
+snapshot's exception store.
+
+discard_passdown_origin - a discard to the snapshot device is passed down
+to the snapshot-origin's underlying device.  This doesn't cause copy-out
+to the snapshot exception store because the snapshot-origin target is
+bypassed.
+
+The discard_passdown_origin feature depends on the discard_zeroes_cow
+feature being enabled.
+
+When these 2 features are enabled they allow a temporarily read-only
+device that has completely exhausted its free space to recover space.
+To do so dm-snapshot provides temporary buffer to accommodate writes
+that the temporarily read-only device cannot handle yet.  Once the upper
+layer frees space (e.g. fstrim to XFS) the discards issued to the
+dm-snapshot target will be issued to underlying read-only device whose
+free space was exhausted.  In addition those discards will also cause
+zeroes to be written to the snapshot exception store if corresponding
+exceptions exist.  If the underlying origin device provides
+deduplication for zero blocks then if/when the snapshot is merged backed
+to the origin those blocks will become unused.  Once the origin has
+gained adequate space, merging the snapshot back to the thinly
+provisioned device will permit continued use of that device without the
+temporary space provided by the snapshot.
+
+Requested-by: John Dorminy <jdorminy@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 2e6023850e177dbaca21498ada04c5a5ac93f812)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/device-mapper/snapshot.txt
+#	drivers/md/dm-snap.c
+diff --cc Documentation/device-mapper/snapshot.txt
+index ad6949bff2e3,1810833f6dc6..000000000000
+--- a/Documentation/device-mapper/snapshot.txt
++++ b/Documentation/device-mapper/snapshot.txt
+@@@ -49,8 -50,27 +50,30 @@@ The difference between persistent and t
+  snapshots less metadata must be saved on disk - they can be kept in
+  memory by the kernel.
+  
+++<<<<<<< HEAD
+++=======
++ When loading or unloading the snapshot target, the corresponding
++ snapshot-origin or snapshot-merge target must be suspended. A failure to
++ suspend the origin target could result in data corruption.
++ 
++ Optional features:
++ 
++    discard_zeroes_cow - a discard issued to the snapshot device that
++    maps to entire chunks to will zero the corresponding exception(s) in
++    the snapshot's exception store.
++ 
++    discard_passdown_origin - a discard to the snapshot device is passed
++    down to the snapshot-origin's underlying device.  This doesn't cause
++    copy-out to the snapshot exception store because the snapshot-origin
++    target is bypassed.
++ 
++    The discard_passdown_origin feature depends on the discard_zeroes_cow
++    feature being enabled.
++ 
+++>>>>>>> 2e6023850e17 (dm snapshot: add optional discard support features)
+  
+  * snapshot-merge <origin> <COW device> <persistent> <chunksize>
++   [<# feature args> [<arg>]*]
+  
+  takes the same table arguments as the snapshot target except it only
+  works with persistent snapshots.  This target assumes the role of the
+diff --cc drivers/md/dm-snap.c
+index 4f3251269638,63916e1dc569..000000000000
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@@ -1275,13 -1398,10 +1337,15 @@@ static int snapshot_ctr(struct dm_targe
+  
+  bad_read_metadata:
+  	unregister_snapshot(s);
+- 
+  bad_load_and_register:
+++<<<<<<< HEAD
+ +	mempool_destroy(s->pending_pool);
+ +
+++=======
++ 	mempool_exit(&s->pending_pool);
+++>>>>>>> 2e6023850e17 (dm snapshot: add optional discard support features)
+  bad_pending_pool:
+  	dm_kcopyd_client_destroy(s->kcopyd_client);
+- 
+  bad_kcopyd:
+  	dm_exception_table_exit(&s->pending, pending_cache);
+  	dm_exception_table_exit(&s->complete, exception_cache);
+@@@ -1720,14 -1854,44 +1780,45 @@@ __find_pending_exception(struct dm_snap
+  static void remap_exception(struct dm_snapshot *s, struct dm_exception *e,
+  			    struct bio *bio, chunk_t chunk)
+  {
+ -	bio_set_dev(bio, s->cow->bdev);
+ -	bio->bi_iter.bi_sector =
+ -		chunk_to_sector(s->store, dm_chunk_number(e->new_chunk) +
+ -				(chunk - e->old_chunk)) +
+ -		(bio->bi_iter.bi_sector & s->store->chunk_mask);
+ +	bio->bi_bdev = s->cow->bdev;
+ +	bio->bi_sector = chunk_to_sector(s->store,
+ +					 dm_chunk_number(e->new_chunk) +
+ +					 (chunk - e->old_chunk)) +
+ +					 (bio->bi_sector &
+ +					  s->store->chunk_mask);
+  }
+  
++ static void zero_callback(int read_err, unsigned long write_err, void *context)
++ {
++ 	struct bio *bio = context;
++ 	struct dm_snapshot *s = bio->bi_private;
++ 
++ 	up(&s->cow_count);
++ 	bio->bi_status = write_err ? BLK_STS_IOERR : 0;
++ 	bio_endio(bio);
++ }
++ 
++ static void zero_exception(struct dm_snapshot *s, struct dm_exception *e,
++ 			   struct bio *bio, chunk_t chunk)
++ {
++ 	struct dm_io_region dest;
++ 
++ 	dest.bdev = s->cow->bdev;
++ 	dest.sector = bio->bi_iter.bi_sector;
++ 	dest.count = s->store->chunk_size;
++ 
++ 	down(&s->cow_count);
++ 	WARN_ON_ONCE(bio->bi_private);
++ 	bio->bi_private = s;
++ 	dm_kcopyd_zero(s->kcopyd_client, 1, &dest, 0, zero_callback, bio);
++ }
++ 
++ static bool io_overlaps_chunk(struct dm_snapshot *s, struct bio *bio)
++ {
++ 	return bio->bi_iter.bi_size ==
++ 		(s->store->chunk_size << SECTOR_SHIFT);
++ }
++ 
+  static int snapshot_map(struct dm_target *ti, struct bio *bio)
+  {
+  	struct dm_exception *e;
+@@@ -1805,10 -2009,12 +1929,14 @@@
+  
+  		r = DM_MAPIO_SUBMITTED;
+  
+++<<<<<<< HEAD
+ +		if (!pe->started &&
+ +		    bio->bi_size == (s->store->chunk_size << SECTOR_SHIFT)) {
+++=======
++ 		if (!pe->started && io_overlaps_chunk(s, bio)) {
+++>>>>>>> 2e6023850e17 (dm snapshot: add optional discard support features)
+  			pe->started = 1;
+ -
+ -			dm_exception_table_unlock(&lock);
+ -			up_read(&s->lock);
+ -
+ +			mutex_unlock(&s->lock);
+  			start_full_bio(pe, bio);
+  			goto out;
+  		}
+* Unmerged path Documentation/device-mapper/snapshot.txt
+* Unmerged path drivers/md/dm-snap.c
