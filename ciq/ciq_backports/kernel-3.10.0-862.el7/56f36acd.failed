@@ -1,0 +1,279 @@
+mqprio: Modify mqprio to pass user parameters via ndo_setup_tc.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] mqprio: Modify mqprio to pass user parameters via ndo_setup_tc (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 99.20%
+commit-author Amritha Nambiar <amritha.nambiar@intel.com>
+commit 56f36acd215cf7c28372b2fdb4f33f6900e97e05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/56f36acd.failed
+
+The configurable priority to traffic class mapping and the user specified
+queue ranges are used to configure the traffic class, overriding the
+hardware defaults when the 'hw' option is set to 0. However, when the 'hw'
+option is non-zero, the hardware QOS defaults are used.
+
+This patch makes it so that we can pass the data the user provided to
+ndo_setup_tc. This allows us to pull in the queue configuration if the
+user requested it as well as any additional hardware offload type
+requested by using a value other than 1 for the hw value.
+
+Finally it also provides a means for the device driver to return the level
+supported for the offload type via the qopt->hw value. Previously we were
+just always assuming the value to be 1, in the future values beyond just 1
+may be supported.
+
+	Signed-off-by: Amritha Nambiar <amritha.nambiar@intel.com>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56f36acd215cf7c28372b2fdb4f33f6900e97e05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+#	drivers/net/ethernet/ti/netcp_core.c
+#	include/linux/netdevice.h
+#	net/sched/sch_mqprio.c
+diff --cc include/linux/netdevice.h
+index f2e995a93118,b7365b587818..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -821,7 -789,8 +821,11 @@@ struct tc_to_netdev 
+  		struct tc_cls_u32_offload *cls_u32;
+  		struct tc_cls_flower_offload *cls_flower;
+  		struct tc_cls_matchall_offload *cls_mall;
+++<<<<<<< HEAD
+++=======
++ 		struct tc_cls_bpf_offload *cls_bpf;
++ 		struct tc_mqprio_qopt *mqprio;
+++>>>>>>> 56f36acd215c (mqprio: Modify mqprio to pass user parameters via ndo_setup_tc.)
+  	};
+  	bool egress_dev;
+  };
+diff --cc net/sched/sch_mqprio.c
+index 748ea1bbc507,0a4cf27ea54b..000000000000
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@@ -39,15 -38,15 +38,26 @@@ static void mqprio_destroy(struct Qdis
+  		kfree(priv->qdiscs);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (priv->hw_owned && (dev->netdev_ops->ndo_setup_tc ||
+ +			       dev->netdev_ops->ndo_setup_tc_rh72))
+ +		if (dev->netdev_ops->ndo_setup_tc) {
+ +			dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0, &tc);
+ +		} else {
+ +			dev->netdev_ops->ndo_setup_tc_rh72(dev, 0);
+ +		}
+ +	else
+++=======
++ 	if (priv->hw_offload && dev->netdev_ops->ndo_setup_tc) {
++ 		struct tc_mqprio_qopt offload = { 0 };
++ 		struct tc_to_netdev tc = { .type = TC_SETUP_MQPRIO,
++ 					   { .mqprio = &offload } };
++ 
++ 		dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0, &tc);
++ 	} else {
+++>>>>>>> 56f36acd215c (mqprio: Modify mqprio to pass user parameters via ndo_setup_tc.)
+  		netdev_set_num_tc(dev, 0);
++ 	}
+  }
+  
+  static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt)
+@@@ -145,16 -148,15 +155,22 @@@ static int mqprio_init(struct Qdisc *sc
+  	 * supplied and verified mapping
+  	 */
+  	if (qopt->hw) {
+- 		struct tc_to_netdev tc = {.type = TC_SETUP_MQPRIO,
+- 					  { .tc = qopt->num_tc }};
++ 		struct tc_mqprio_qopt offload = *qopt;
++ 		struct tc_to_netdev tc = { .type = TC_SETUP_MQPRIO,
++ 					   { .mqprio = &offload } };
+  
+ -		err = dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0, &tc);
+ +		priv->hw_owned = 1;
+ +		err = dev->netdev_ops->ndo_setup_tc ?
+ +			dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0,
+ +						      &tc) :
+ +			dev->netdev_ops->ndo_setup_tc_rh72(dev, qopt->num_tc);
+  		if (err)
+  			return err;
+++<<<<<<< HEAD
+++=======
++ 
++ 		priv->hw_offload = offload.hw;
+++>>>>>>> 56f36acd215c (mqprio: Modify mqprio to pass user parameters via ndo_setup_tc.)
+  	} else {
+  		netdev_set_num_tc(dev, qopt->num_tc);
+  		for (i = 0; i < qopt->num_tc; i++)
+* Unmerged path drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+* Unmerged path drivers/net/ethernet/ti/netcp_core.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index a01866542bfd..ec436b59f246 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -1861,7 +1861,8 @@ static int xgbe_setup_tc(struct net_device *netdev, u32 handle, __be16 proto,
+ 	if (tc_to_netdev->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	tc = tc_to_netdev->tc;
++	tc_to_netdev->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++	tc = tc_to_netdev->mqprio->num_tc;
+ 
+ 	if (tc > pdata->hw_feat.tc_cnt)
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index 4810103f310d..6ce480b88238 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -4288,7 +4288,10 @@ int __bnx2x_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+ {
+ 	if (tc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+-	return bnx2x_setup_tc(dev, tc->tc);
++
++	tc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return bnx2x_setup_tc(dev, tc->mqprio->num_tc);
+ }
+ 
+ /* called with rtnl_lock */
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index bdacd982a1af..b70c069b6f18 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -6721,7 +6721,9 @@ static int bnxt_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+ 	if (ntc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	return bnxt_setup_mq_tc(dev, ntc->tc);
++	ntc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return bnxt_setup_mq_tc(dev, ntc->mqprio->num_tc);
+ }
+ 
+ #ifdef CONFIG_RFS_ACCEL
+* Unmerged path drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+diff --git a/drivers/net/ethernet/intel/fm10k/fm10k_netdev.c b/drivers/net/ethernet/intel/fm10k/fm10k_netdev.c
+index 4afd8bd1bd47..07b4c46bf309 100644
+--- a/drivers/net/ethernet/intel/fm10k/fm10k_netdev.c
++++ b/drivers/net/ethernet/intel/fm10k/fm10k_netdev.c
+@@ -1242,7 +1242,9 @@ static int __fm10k_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+ 	if (tc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	return fm10k_setup_tc(dev, tc->tc);
++	tc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return fm10k_setup_tc(dev, tc->mqprio->num_tc);
+ }
+ 
+ #if 0
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
+index 807f35d0c136..b47974106d52 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -5618,9 +5618,12 @@ static int __i40e_setup_tc(struct net_device *netdev, u32 handle, __be16 proto,
+ 			   struct tc_to_netdev *tc)
+ #endif
+ {
+-	if (handle != TC_H_ROOT || tc->type != TC_SETUP_MQPRIO)
++	if (tc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+-	return i40e_setup_tc(netdev, tc->tc);
++
++	tc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return i40e_setup_tc(netdev, tc->mqprio->num_tc);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index c0b8df7cf72a..37059471b075 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -8571,7 +8571,9 @@ static int __ixgbe_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+ 	if (tc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	return ixgbe_setup_tc(dev, tc->tc);
++	tc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return ixgbe_setup_tc(dev, tc->mqprio->num_tc);
+ }
+ 
+ #ifdef CONFIG_PCI_IOV
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 76d984cbb6d9..6df66ac669cb 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -88,7 +88,9 @@ static int __mlx4_en_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+ 	if (tc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	return mlx4_en_setup_tc(dev, tc->tc);
++	tc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return mlx4_en_setup_tc(dev, tc->mqprio->num_tc);
+ }
+ 
+ #ifdef CONFIG_RFS_ACCEL
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index edb21d8194bc..438e1f58a67a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2635,7 +2635,9 @@ mqprio:
+ 	if (tc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	return mlx5e_setup_tc(dev, tc->tc);
++	tc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
++	return mlx5e_setup_tc(dev, tc->mqprio->num_tc);
+ }
+ 
+ static struct rtnl_link_stats64 *
+diff --git a/drivers/net/ethernet/sfc/falcon/tx.c b/drivers/net/ethernet/sfc/falcon/tx.c
+index 104fb15a73f2..f6daf09b8627 100644
+--- a/drivers/net/ethernet/sfc/falcon/tx.c
++++ b/drivers/net/ethernet/sfc/falcon/tx.c
+@@ -437,11 +437,13 @@ int ef4_setup_tc(struct net_device *net_dev, u32 handle, __be16 proto,
+ 	if (ntc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	num_tc = ntc->tc;
++	num_tc = ntc->mqprio->num_tc;
+ 
+ 	if (ef4_nic_rev(efx) < EF4_REV_FALCON_B0 || num_tc > EF4_MAX_TX_TC)
+ 		return -EINVAL;
+ 
++	ntc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
+ 	if (num_tc == net_dev->num_tc)
+ 		return 0;
+ 
+diff --git a/drivers/net/ethernet/sfc/tx.c b/drivers/net/ethernet/sfc/tx.c
+index ff88d60aa6d5..3bdf87f31087 100644
+--- a/drivers/net/ethernet/sfc/tx.c
++++ b/drivers/net/ethernet/sfc/tx.c
+@@ -665,11 +665,13 @@ int efx_setup_tc(struct net_device *net_dev, u32 handle, __be16 proto,
+ 	if (ntc->type != TC_SETUP_MQPRIO)
+ 		return -EINVAL;
+ 
+-	num_tc = ntc->tc;
++	num_tc = ntc->mqprio->num_tc;
+ 
+ 	if (num_tc > EFX_MAX_TX_TC)
+ 		return -EINVAL;
+ 
++	ntc->mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++
+ 	if (num_tc == net_dev->num_tc)
+ 		return 0;
+ 
+* Unmerged path drivers/net/ethernet/ti/netcp_core.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/sched/sch_mqprio.c
