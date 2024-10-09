@@ -1,0 +1,583 @@
+s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Correct function bits for CEX2x and CEX3x cards (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 94.83%
+commit-author Harald Freudenberger <freude@linux.vnet.ibm.com>
+commit 148784246ef2d85f000713cf56e1c90b405228e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/14878424.failed
+
+For the older CEX2x and CEX3x cards the function bits returned
+by TAPQ do not reflect the functions of the card. Instead the
+functionality is implicit by the type of the card. The reworked
+zcrypt requires to have the function bits set correct, so this
+patch fixes this. The queue selection is not only based on these
+function bits but also on function pointers set by the individual
+drivers.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.vnet.ibm.com>
+	Signed-off-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 148784246ef2d85f000713cf56e1c90b405228e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/zcrypt_api.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,b15013234c77..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -536,17 -251,45 +536,44 @@@ static inline void ap_schedule_poll_tim
+   * @qid: The AP queue number
+   * @queue_depth: Pointer to queue depth value
+   * @device_type: Pointer to device type value
+ - * @facilities: Pointer to facility indicator
+   */
+ -static int ap_query_queue(ap_qid_t qid, int *queue_depth, int *device_type,
+ -			  unsigned int *facilities)
+ +static int ap_query_queue(ap_qid_t qid, int *queue_depth, int *device_type)
+  {
+  	struct ap_queue_status status;
+ -	unsigned long info;
+ -	int nd;
+ -
+ -	if (!ap_test_config_card_id(AP_QID_CARD(qid)))
+ -		return -ENODEV;
+ +	int t_depth, t_device_type;
+  
+ -	status = ap_test_queue(qid, &info);
+ +	status = ap_test_queue(qid, &t_depth, &t_device_type);
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+++<<<<<<< HEAD
+ +		*queue_depth = t_depth + 1;
+ +		*device_type = t_device_type;
+++=======
++ 		*queue_depth = (int)(info & 0xff);
++ 		*device_type = (int)((info >> 24) & 0xff);
++ 		*facilities = (unsigned int)(info >> 32);
++ 		/* Update maximum domain id */
++ 		nd = (info >> 16) & 0xff;
++ 		if ((info & (1UL << 57)) && nd > 0)
++ 			ap_max_domain_id = nd;
++ 		switch (*device_type) {
++ 			/* For CEX2 and CEX3 the available functions
++ 			 * are not refrected by the facilities bits.
++ 			 * Instead it is coded into the type. So here
++ 			 * modify the function bits based on the type.
++ 			 */
++ 		case AP_DEVICE_TYPE_CEX2A:
++ 		case AP_DEVICE_TYPE_CEX3A:
++ 			*facilities |= 0x08000000;
++ 			break;
++ 		case AP_DEVICE_TYPE_CEX2C:
++ 		case AP_DEVICE_TYPE_CEX3C:
++ 			*facilities |= 0x10000000;
++ 			break;
++ 		default:
++ 			break;
++ 		}
+++>>>>>>> 148784246ef2 (s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.)
+  		return 0;
+  	case AP_RESPONSE_Q_NOT_AVAIL:
+  	case AP_RESPONSE_DECONFIGURED:
+diff --cc drivers/s390/crypto/zcrypt_api.c
+index 5282fcf3e2f5,71e298fe339f..000000000000
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@@ -432,34 -236,50 +432,55 @@@ static long zcrypt_rsa_modexpo(struct i
+  	 */
+  	mex->outputdatalength = mex->inputdatalength;
+  
+ -	rc = get_rsa_modex_fc(mex, &func_code);
+ -	if (rc)
+ -		return rc;
+ -
+ -	pref_zc = NULL;
+ -	pref_zq = NULL;
+ -	spin_lock(&zcrypt_list_lock);
+ -	for_each_zcrypt_card(zc) {
+ -		/* Check for online accelarator and CCA cards */
+ -		if (!zc->online || !(zc->card->functions & 0x18000000))
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online ||
+ +		    !zdev->ops->rsa_modexpo ||
+ +		    zdev->min_mod_size > mex->inputdatalength ||
+ +		    zdev->max_mod_size < mex->inputdatalength)
+  			continue;
+++<<<<<<< HEAD
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->rsa_modexpo(zdev, mex);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+++=======
++ 		/* Check for size limits */
++ 		if (zc->min_mod_size > mex->inputdatalength ||
++ 		    zc->max_mod_size < mex->inputdatalength)
++ 			continue;
++ 		/* get weight index of the card device	*/
++ 		weight = zc->speed_rating[func_code];
++ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
++ 			continue;
++ 		for_each_zcrypt_queue(zq, zc) {
++ 			/* check if device is online and eligible */
++ 			if (!zq->online || !zq->ops->rsa_modexpo)
++ 				continue;
++ 			if (zcrypt_queue_compare(zq, pref_zq,
++ 						 weight, pref_weight))
++ 				continue;
++ 			pref_zc = zc;
++ 			pref_zq = zq;
++ 			pref_weight = weight;
+++>>>>>>> 148784246ef2 (s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.)
+  		}
+ +		else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+ -	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	if (!pref_zq)
+ -		return -ENODEV;
+ -
+ -	rc = pref_zq->ops->rsa_modexpo(pref_zq, mex);
+ -
+ -	spin_lock(&zcrypt_list_lock);
+ -	zcrypt_drop_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	return rc;
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+  }
+  
+  static long zcrypt_rsa_crt(struct ica_rsa_modexpo_crt *crt)
+@@@ -477,125 -299,134 +498,163 @@@
+  	 */
+  	crt->outputdatalength = crt->inputdatalength;
+  
+ -	rc = get_rsa_crt_fc(crt, &func_code);
+ -	if (rc)
+ -		return rc;
+ -
+ -	pref_zc = NULL;
+ -	pref_zq = NULL;
+ -	spin_lock(&zcrypt_list_lock);
+ -	for_each_zcrypt_card(zc) {
+ -		/* Check for online accelarator and CCA cards */
+ -		if (!zc->online || !(zc->card->functions & 0x18000000))
+ +	copied = 0;
+ + restart:
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online ||
+ +		    !zdev->ops->rsa_modexpo_crt ||
+ +		    zdev->min_mod_size > crt->inputdatalength ||
+ +		    zdev->max_mod_size < crt->inputdatalength)
+  			continue;
+++<<<<<<< HEAD
+ +		if (zdev->short_crt && crt->inputdatalength > 240) {
+ +			/*
+ +			 * Check inputdata for leading zeros for cards
+ +			 * that can't handle np_prime, bp_key, or
+ +			 * u_mult_inv > 128 bytes.
+ +			 */
+ +			if (copied == 0) {
+ +				unsigned int len;
+ +				spin_unlock_bh(&zcrypt_device_lock);
+ +				/* len is max 256 / 2 - 120 = 8
+ +				 * For bigger device just assume len of leading
+ +				 * 0s is 8 as stated in the requirements for
+ +				 * ica_rsa_modexpo_crt struct in zcrypt.h.
+ +				 */
+ +				if (crt->inputdatalength <= 256)
+ +					len = crt->inputdatalength / 2 - 120;
+ +				else
+ +					len = 8;
+ +				if (len > sizeof(z1))
+ +					return -EFAULT;
+ +				z1 = z2 = z3 = 0;
+ +				if (copy_from_user(&z1, crt->np_prime, len) ||
+ +				    copy_from_user(&z2, crt->bp_key, len) ||
+ +				    copy_from_user(&z3, crt->u_mult_inv, len))
+ +					return -EFAULT;
+ +				z1 = z2 = z3 = 0;
+ +				copied = 1;
+ +				/*
+ +				 * We have to restart device lookup -
+ +				 * the device list may have changed by now.
+ +				 */
+ +				goto restart;
+ +			}
+ +			if (z1 != 0ULL || z2 != 0ULL || z3 != 0ULL)
+ +				/* The device can't handle this request. */
+++=======
++ 		/* Check for size limits */
++ 		if (zc->min_mod_size > crt->inputdatalength ||
++ 		    zc->max_mod_size < crt->inputdatalength)
++ 			continue;
++ 		/* get weight index of the card device	*/
++ 		weight = zc->speed_rating[func_code];
++ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
++ 			continue;
++ 		for_each_zcrypt_queue(zq, zc) {
++ 			/* check if device is online and eligible */
++ 			if (!zq->online || !zq->ops->rsa_modexpo_crt)
+++>>>>>>> 148784246ef2 (s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.)
+  				continue;
+ -			if (zcrypt_queue_compare(zq, pref_zq,
+ -						 weight, pref_weight))
+ -				continue;
+ -			pref_zc = zc;
+ -			pref_zq = zq;
+ -			pref_weight = weight;
+  		}
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->rsa_modexpo_crt(zdev, crt);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+ +		}
+ +		else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+ -	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	if (!pref_zq)
+ -		return -ENODEV;
+ -
+ -	rc = pref_zq->ops->rsa_modexpo_crt(pref_zq, crt);
+ -
+ -	spin_lock(&zcrypt_list_lock);
+ -	zcrypt_drop_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	return rc;
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+  }
+  
+  static long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+  {
+ -	struct zcrypt_card *zc, *pref_zc;
+ -	struct zcrypt_queue *zq, *pref_zq;
+ -	struct ap_message ap_msg;
+ -	unsigned int weight, pref_weight;
+ -	unsigned int func_code;
+ -	unsigned short *domain;
+ +	struct zcrypt_device *zdev;
+  	int rc;
+  
+ -	rc = get_cprb_fc(xcRB, &ap_msg, &func_code, &domain);
+ -	if (rc)
+ -		return rc;
+ -
+ -	pref_zc = NULL;
+ -	pref_zq = NULL;
+ -	spin_lock(&zcrypt_list_lock);
+ -	for_each_zcrypt_card(zc) {
+ -		/* Check for online CCA cards */
+ -		if (!zc->online || !(zc->card->functions & 0x10000000))
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online || !zdev->ops->send_cprb ||
+ +		   (zdev->ops->variant == MSGTYPE06_VARIANT_EP11) ||
+ +		   (xcRB->user_defined != AUTOSELECT &&
+ +		    AP_QID_DEVICE(zdev->ap_dev->qid) != xcRB->user_defined))
+  			continue;
+++<<<<<<< HEAD
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->send_cprb(zdev, xcRB);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+++=======
++ 		/* Check for user selected CCA card */
++ 		if (xcRB->user_defined != AUTOSELECT &&
++ 		    xcRB->user_defined != zc->card->id)
++ 			continue;
++ 		/* get weight index of the card device	*/
++ 		weight = speed_idx_cca(func_code) * zc->speed_rating[SECKEY];
++ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
++ 			continue;
++ 		for_each_zcrypt_queue(zq, zc) {
++ 			/* check if device is online and eligible */
++ 			if (!zq->online ||
++ 			    !zq->ops->send_cprb ||
++ 			    ((*domain != (unsigned short) AUTOSELECT) &&
++ 			     (*domain != AP_QID_QUEUE(zq->queue->qid))))
++ 				continue;
++ 			if (zcrypt_queue_compare(zq, pref_zq,
++ 						 weight, pref_weight))
++ 				continue;
++ 			pref_zc = zc;
++ 			pref_zq = zq;
++ 			pref_weight = weight;
+++>>>>>>> 148784246ef2 (s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.)
+  		}
+ +		else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+  	}
+ -	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	if (!pref_zq)
+ -		return -ENODEV;
+ -
+ -	/* in case of auto select, provide the correct domain */
+ -	if (*domain == (unsigned short) AUTOSELECT)
+ -		*domain = AP_QID_QUEUE(pref_zq->queue->qid);
+ -
+ -	rc = pref_zq->ops->send_cprb(pref_zq, xcRB, &ap_msg);
+ -
+ -	spin_lock(&zcrypt_list_lock);
+ -	zcrypt_drop_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -	return rc;
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+  }
+  
+ -static bool is_desired_ep11_card(unsigned int dev_id,
+ -				 unsigned short target_num,
+ -				 struct ep11_target_dev *targets)
+ -{
+ -	while (target_num-- > 0) {
+ -		if (dev_id == targets->ap_id)
+ -			return true;
+ -		targets++;
+ -	}
+ -	return false;
+ -}
+ +struct ep11_target_dev_list {
+ +	unsigned short		targets_num;
+ +	struct ep11_target_dev	*targets;
+ +};
+  
+ -static bool is_desired_ep11_queue(unsigned int dev_qid,
+ -				  unsigned short target_num,
+ -				  struct ep11_target_dev *targets)
+ +static bool is_desired_ep11dev(unsigned int dev_qid,
+ +			       struct ep11_target_dev_list dev_list)
+  {
+ -	while (target_num-- > 0) {
+ -		if (AP_MKQID(targets->ap_id, targets->dom_id) == dev_qid)
+ +	int n;
+ +
+ +	for (n = 0; n < dev_list.targets_num; n++, dev_list.targets++) {
+ +		if ((AP_QID_DEVICE(dev_qid) == dev_list.targets->ap_id) &&
+ +		    (AP_QID_QUEUE(dev_qid) == dev_list.targets->dom_id)) {
+  			return true;
+ -		targets++;
+ +		}
+  	}
+  	return false;
+  }
+@@@ -630,70 -459,109 +689,122 @@@ static long zcrypt_send_ep11_cprb(struc
+  			return -EFAULT;
+  	}
+  
+ -	rc = get_ep11cprb_fc(xcrb, &ap_msg, &func_code);
+ -	if (rc)
+ -		goto out_free;
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		/* check if device is eligible */
+ +		if (!zdev->online ||
+ +		    zdev->ops->variant != MSGTYPE06_VARIANT_EP11)
+ +			continue;
+  
+ -	pref_zc = NULL;
+ -	pref_zq = NULL;
+ -	spin_lock(&zcrypt_list_lock);
+ -	for_each_zcrypt_card(zc) {
+ -		/* Check for online EP11 cards */
+ -		if (!zc->online || !(zc->card->functions & 0x04000000))
+ +		/* check if device is selected as valid target */
+ +		if (!is_desired_ep11dev(zdev->ap_dev->qid, ep11_dev_list) &&
+ +		    !autoselect)
+  			continue;
+++<<<<<<< HEAD
+ +
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->send_ep11_cprb(zdev, xcrb);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+ +		} else {
+ +			rc = -EAGAIN;
+ +		  }
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+ +		return rc;
+++=======
++ 		/* Check for user selected EP11 card */
++ 		if (targets &&
++ 		    !is_desired_ep11_card(zc->card->id, target_num, targets))
++ 			continue;
++ 		/* get weight index of the card device	*/
++ 		weight = speed_idx_ep11(func_code) * zc->speed_rating[SECKEY];
++ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
++ 			continue;
++ 		for_each_zcrypt_queue(zq, zc) {
++ 			/* check if device is online and eligible */
++ 			if (!zq->online ||
++ 			    !zq->ops->send_ep11_cprb ||
++ 			    (targets &&
++ 			     !is_desired_ep11_queue(zq->queue->qid,
++ 						    target_num, targets)))
++ 				continue;
++ 			if (zcrypt_queue_compare(zq, pref_zq,
++ 						 weight, pref_weight))
++ 				continue;
++ 			pref_zc = zc;
++ 			pref_zq = zq;
++ 			pref_weight = weight;
++ 		}
+++>>>>>>> 148784246ef2 (s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.)
+  	}
+ -	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	if (!pref_zq) {
+ -		rc = -ENODEV;
+ -		goto out_free;
+ -	}
+ -
+ -	rc = pref_zq->ops->send_ep11_cprb(pref_zq, xcrb, &ap_msg);
+ -
+ -	spin_lock(&zcrypt_list_lock);
+ -	zcrypt_drop_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -out_free:
+ -	kfree(targets);
+ -	return rc;
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+  }
+  
+  static long zcrypt_rng(char *buffer)
+  {
+ -	struct zcrypt_card *zc, *pref_zc;
+ -	struct zcrypt_queue *zq, *pref_zq;
+ -	unsigned int weight, pref_weight;
+ -	unsigned int func_code;
+ -	struct ap_message ap_msg;
+ -	unsigned int domain;
+ +	struct zcrypt_device *zdev;
+  	int rc;
+  
+ -	rc = get_rng_fc(&ap_msg, &func_code, &domain);
+ -	if (rc)
+ +	spin_lock_bh(&zcrypt_device_lock);
+ +	list_for_each_entry(zdev, &zcrypt_device_list, list) {
+ +		if (!zdev->online || !zdev->ops->rng)
+ +			continue;
+ +		zcrypt_device_get(zdev);
+ +		get_device(&zdev->ap_dev->device);
+ +		zdev->request_count++;
+ +		__zcrypt_decrease_preference(zdev);
+ +		if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
+ +			spin_unlock_bh(&zcrypt_device_lock);
+ +			rc = zdev->ops->rng(zdev, buffer);
+ +			spin_lock_bh(&zcrypt_device_lock);
+ +			module_put(zdev->ap_dev->drv->driver.owner);
+ +		} else
+ +			rc = -EAGAIN;
+ +		zdev->request_count--;
+ +		__zcrypt_increase_preference(zdev);
+ +		put_device(&zdev->ap_dev->device);
+ +		zcrypt_device_put(zdev);
+ +		spin_unlock_bh(&zcrypt_device_lock);
+  		return rc;
+++<<<<<<< HEAD
+++=======
++ 
++ 	pref_zc = NULL;
++ 	pref_zq = NULL;
++ 	spin_lock(&zcrypt_list_lock);
++ 	for_each_zcrypt_card(zc) {
++ 		/* Check for online CCA cards */
++ 		if (!zc->online || !(zc->card->functions & 0x10000000))
++ 			continue;
++ 		/* get weight index of the card device	*/
++ 		weight = zc->speed_rating[func_code];
++ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
++ 			continue;
++ 		for_each_zcrypt_queue(zq, zc) {
++ 			/* check if device is online and eligible */
++ 			if (!zq->online || !zq->ops->rng)
++ 				continue;
++ 			if (zcrypt_queue_compare(zq, pref_zq,
++ 						 weight, pref_weight))
++ 				continue;
++ 			pref_zc = zc;
++ 			pref_zq = zq;
++ 			pref_weight = weight;
++ 		}
+++>>>>>>> 148784246ef2 (s390/zcrypt: Correct function bits for CEX2x and CEX3x cards.)
+  	}
+ -	pref_zq = zcrypt_pick_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -
+ -	if (!pref_zq)
+ -		return -ENODEV;
+ -
+ -	rc = pref_zq->ops->rng(pref_zq, buffer, &ap_msg);
+ -
+ -	spin_lock(&zcrypt_list_lock);
+ -	zcrypt_drop_queue(pref_zc, pref_zq, weight);
+ -	spin_unlock(&zcrypt_list_lock);
+ -	return rc;
+ +	spin_unlock_bh(&zcrypt_device_lock);
+ +	return -ENODEV;
+  }
+  
+  static void zcrypt_device_status_mask(struct zcrypt_device_matrix *matrix)
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/zcrypt_api.c
