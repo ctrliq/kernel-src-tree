@@ -1,0 +1,335 @@
+sysfs: return correct error code on unimplemented mmap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vladimir Zapolskiy <vladimir_zapolskiy@mentor.com>
+commit 1c1365e374bfadf908eae02cded7abb9e672c9d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1c1365e3.failed
+
+Both POSIX.1-2008 and Linux Programmer's Manual have a dedicated return
+error code for a case, when a file doesn't support mmap(), it's ENODEV.
+
+This change replaces overloaded EINVAL with ENODEV in a situation
+described above for sysfs binary files.
+
+	Signed-off-by: Vladimir Zapolskiy <vladimir_zapolskiy@mentor.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 1c1365e374bfadf908eae02cded7abb9e672c9d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,382db3c045f3..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -148,60 -255,263 +148,98 @@@ out
+  }
+  
+  /**
+ - * sysfs_write_file - write an attribute
+ - * @file: file pointer
+ - * @user_buf: data to write
+ - * @count: number of bytes
+ - * @ppos: starting offset
+ - *
+ - * Copy data in from userland and pass it to the matching
+ - * sysfs_ops->store() by invoking flush_write_buffer().
+ + *	fill_write_buffer - copy buffer from userspace.
+ + *	@buffer:	data buffer for file.
+ + *	@buf:		data from user.
+ + *	@count:		number of bytes in @userbuf.
+   *
+ - * There is no easy way for us to know if userspace is only doing a partial
+ - * write, so we don't support them. We expect the entire buffer to come on
+ - * the first write.  Hint: if you're writing a value, first read the file,
+ - * modify only the the value you're changing, then write entire buffer
+ - * back.
+ + *	Allocate @buffer->page if it hasn't been already, then
+ + *	copy the user-supplied buffer into it.
+   */
+ -static ssize_t sysfs_write_file(struct file *file, const char __user *user_buf,
+ -				size_t count, loff_t *ppos)
+ +static int fill_write_buffer(struct sysfs_buffer * buffer,
+ +			     const char __user * buf, size_t count)
+  {
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	ssize_t len = min_t(size_t, count, PAGE_SIZE);
+ -	loff_t size = file_inode(file)->i_size;
+ -	char *buf;
+ -
+ -	if (sysfs_is_bin(of->sd) && size) {
+ -		if (size <= *ppos)
+ -			return 0;
+ -		len = min_t(ssize_t, len, size - *ppos);
+ -	}
+ -
+ -	if (!len)
+ -		return 0;
+ +	int error;
+  
+ -	buf = kmalloc(len + 1, GFP_KERNEL);
+ -	if (!buf)
+ +	if (!buffer->page)
+ +		buffer->page = (char *)get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+  		return -ENOMEM;
+  
+ -	if (copy_from_user(buf, user_buf, len)) {
+ -		len = -EFAULT;
+ -		goto out_free;
+ -	}
+ -	buf[len] = '\0';	/* guarantee string termination */
+ -
+ -	len = flush_write_buffer(of, buf, *ppos, len);
+ -	if (len > 0)
+ -		*ppos += len;
+ -out_free:
+ -	kfree(buf);
+ -	return len;
+ -}
+ -
+ -static void sysfs_bin_vma_open(struct vm_area_struct *vma)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -
+ -	if (!of->vm_ops)
+ -		return;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return;
+ -
+ -	if (of->vm_ops->open)
+ -		of->vm_ops->open(vma);
+ -
+ -	sysfs_put_active(of->sd);
+ -}
+ -
+ -static int sysfs_bin_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	int ret;
+ -
+ -	if (!of->vm_ops)
+ -		return VM_FAULT_SIGBUS;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return VM_FAULT_SIGBUS;
+ -
+ -	ret = VM_FAULT_SIGBUS;
+ -	if (of->vm_ops->fault)
+ -		ret = of->vm_ops->fault(vma, vmf);
+ -
+ -	sysfs_put_active(of->sd);
+ -	return ret;
+ -}
+ -
+ -static int sysfs_bin_page_mkwrite(struct vm_area_struct *vma,
+ -				  struct vm_fault *vmf)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	int ret;
+ -
+ -	if (!of->vm_ops)
+ -		return VM_FAULT_SIGBUS;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return VM_FAULT_SIGBUS;
+ -
+ -	ret = 0;
+ -	if (of->vm_ops->page_mkwrite)
+ -		ret = of->vm_ops->page_mkwrite(vma, vmf);
+ -	else
+ -		file_update_time(file);
+ -
+ -	sysfs_put_active(of->sd);
+ -	return ret;
+ -}
+ -
+ -static int sysfs_bin_access(struct vm_area_struct *vma, unsigned long addr,
+ -			    void *buf, int len, int write)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	int ret;
+ -
+ -	if (!of->vm_ops)
+ -		return -EINVAL;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return -EINVAL;
+ -
+ -	ret = -EINVAL;
+ -	if (of->vm_ops->access)
+ -		ret = of->vm_ops->access(vma, addr, buf, len, write);
+ -
+ -	sysfs_put_active(of->sd);
+ -	return ret;
+ -}
+ -
+ -#ifdef CONFIG_NUMA
+ -static int sysfs_bin_set_policy(struct vm_area_struct *vma,
+ -				struct mempolicy *new)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	int ret;
+ -
+ -	if (!of->vm_ops)
+ -		return 0;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return -EINVAL;
+ -
+ -	ret = 0;
+ -	if (of->vm_ops->set_policy)
+ -		ret = of->vm_ops->set_policy(vma, new);
+ -
+ -	sysfs_put_active(of->sd);
+ -	return ret;
+ -}
+ -
+ -static struct mempolicy *sysfs_bin_get_policy(struct vm_area_struct *vma,
+ -					      unsigned long addr)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	struct mempolicy *pol;
+ -
+ -	if (!of->vm_ops)
+ -		return vma->vm_policy;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return vma->vm_policy;
+ -
+ -	pol = vma->vm_policy;
+ -	if (of->vm_ops->get_policy)
+ -		pol = of->vm_ops->get_policy(vma, addr);
+ -
+ -	sysfs_put_active(of->sd);
+ -	return pol;
+ +	if (count >= PAGE_SIZE)
+ +		count = PAGE_SIZE - 1;
+ +	error = copy_from_user(buffer->page,buf,count);
+ +	buffer->needs_read_fill = 1;
+ +	/* if buf is assumed to contain a string, terminate it by \0,
+ +	   so e.g. sscanf() can scan the string easily */
+ +	buffer->page[count] = 0;
+ +	return error ? -EFAULT : count;
+  }
+  
+ -static int sysfs_bin_migrate(struct vm_area_struct *vma, const nodemask_t *from,
+ -			     const nodemask_t *to, unsigned long flags)
+ -{
+ -	struct file *file = vma->vm_file;
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	int ret;
+ -
+ -	if (!of->vm_ops)
+ -		return 0;
+ -
+ -	if (!sysfs_get_active(of->sd))
+ -		return 0;
+ -
+ -	ret = 0;
+ -	if (of->vm_ops->migrate)
+ -		ret = of->vm_ops->migrate(vma, from, to, flags);
+  
+ -	sysfs_put_active(of->sd);
+ -	return ret;
+ -}
+ -#endif
+ -
+ -static const struct vm_operations_struct sysfs_bin_vm_ops = {
+ -	.open		= sysfs_bin_vma_open,
+ -	.fault		= sysfs_bin_fault,
+ -	.page_mkwrite	= sysfs_bin_page_mkwrite,
+ -	.access		= sysfs_bin_access,
+ -#ifdef CONFIG_NUMA
+ -	.set_policy	= sysfs_bin_set_policy,
+ -	.get_policy	= sysfs_bin_get_policy,
+ -	.migrate	= sysfs_bin_migrate,
+ -#endif
+ -};
+ -
+ -static int sysfs_bin_mmap(struct file *file, struct vm_area_struct *vma)
+ +/**
+ + *	flush_write_buffer - push buffer to kobject.
+ + *	@dentry:	dentry to the attribute
+ + *	@buffer:	data buffer for file.
+ + *	@count:		number of bytes
+ + *
+ + *	Get the correct pointers for the kobject and the attribute we're
+ + *	dealing with, then call the store() method for the attribute,
+ + *	passing the buffer that we acquired in fill_write_buffer().
+ + */
+ +static int
+ +flush_write_buffer(struct dentry * dentry, struct sysfs_buffer * buffer, size_t count)
+  {
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	struct bin_attribute *battr = of->sd->s_attr.bin_attr;
+ -	struct kobject *kobj = of->sd->s_parent->s_dir.kobj;
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+  	int rc;
+  
+ -	mutex_lock(&of->mutex);
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+  
+ -	/* need of->sd for battr, its parent for kobj */
+ -	rc = -ENODEV;
+ -	if (!sysfs_get_active(of->sd))
+ -		goto out_unlock;
+ +	rc = ops->store(kobj, attr_sd->s_attr.attr, buffer->page, count);
+  
+++<<<<<<< HEAD
+ +	sysfs_put_active(attr_sd);
+++=======
++ 	if (!battr->mmap)
++ 		goto out_put;
++ 
++ 	rc = battr->mmap(file, kobj, battr, vma);
++ 	if (rc)
++ 		goto out_put;
++ 
++ 	/*
++ 	 * PowerPC's pci_mmap of legacy_mem uses shmem_zero_setup()
++ 	 * to satisfy versions of X which crash if the mmap fails: that
++ 	 * substitutes a new vm_file, and we don't then want bin_vm_ops.
++ 	 */
++ 	if (vma->vm_file != file)
++ 		goto out_put;
++ 
++ 	rc = -EINVAL;
++ 	if (of->mmapped && of->vm_ops != vma->vm_ops)
++ 		goto out_put;
++ 
++ 	/*
++ 	 * It is not possible to successfully wrap close.
++ 	 * So error if someone is trying to use close.
++ 	 */
++ 	rc = -EINVAL;
++ 	if (vma->vm_ops && vma->vm_ops->close)
++ 		goto out_put;
++ 
++ 	rc = 0;
++ 	of->mmapped = 1;
++ 	of->vm_ops = vma->vm_ops;
++ 	vma->vm_ops = &sysfs_bin_vm_ops;
++ out_put:
++ 	sysfs_put_active(of->sd);
++ out_unlock:
++ 	mutex_unlock(&of->mutex);
+++>>>>>>> 1c1365e374bf (sysfs: return correct error code on unimplemented mmap())
+  
+  	return rc;
+  }
+* Unmerged path fs/sysfs/file.c
