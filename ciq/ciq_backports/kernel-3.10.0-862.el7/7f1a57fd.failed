@@ -1,0 +1,351 @@
+power_supply: Fix possible NULL pointer dereference on early uevent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Krzysztof Kozlowski <k.kozlowski@samsung.com>
+commit 7f1a57fdd6cb6e7be2ed31878a34655df38e1861
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7f1a57fd.failed
+
+Don't call the power_supply_changed() from power_supply_register() when
+parent is still probing because it may lead to accessing parent too
+early.
+
+In bq27x00_battery this caused NULL pointer exception because uevent of
+power_supply_changed called back the the get_property() method provided
+by the driver. The get_property() method accessed pointer which should
+be returned by power_supply_register().
+
+Starting from bq27x00_battery_probe():
+  di->bat = power_supply_register()
+    power_supply_changed()
+      kobject_uevent()
+        power_supply_uevent()
+          power_supply_show_property()
+            power_supply_get_property()
+              bq27x00_battery_get_property()
+                dereference of di->bat which is NULL here
+
+The dereference of di->bat (value returned by power_supply_register())
+is the currently visible problem. However calling back the methods
+provided by driver before ending the probe may lead to accessing other
+driver-related data which is not yet initialized.
+
+The call to power_supply_changed() is postponed till probing ends -
+mutex of parent device is released.
+
+	Reported-by: H. Nikolaus Schaller <hns@goldelico.com>
+	Signed-off-by: Krzysztof Kozlowski <k.kozlowski@samsung.com>
+Fixes: 297d716f6260 ("power_supply: Change ownership from driver to core")
+Tested-By: Dr. H. Nikolaus Schaller <hns@goldelico.com>
+	Signed-off-by: Sebastian Reichel <sre@kernel.org>
+(cherry picked from commit 7f1a57fdd6cb6e7be2ed31878a34655df38e1861)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/power/power_supply_core.c
+diff --cc drivers/power/power_supply_core.c
+index 0d8164e2f763,4bc0c7f459a5..000000000000
+--- a/drivers/power/power_supply_core.c
++++ b/drivers/power/power_supply_core.c
+@@@ -24,8 -25,13 +24,10 @@@
+  struct class *power_supply_class;
+  EXPORT_SYMBOL_GPL(power_supply_class);
+  
+ -ATOMIC_NOTIFIER_HEAD(power_supply_notifier);
+ -EXPORT_SYMBOL_GPL(power_supply_notifier);
+ -
+  static struct device_type power_supply_dev_type;
+  
++ #define POWER_SUPPLY_DEFERRED_REGISTER_TIME	msecs_to_jiffies(10)
++ 
+  static bool __power_supply_is_supplied_by(struct power_supply *supplier,
+  					 struct power_supply *supply)
+  {
+@@@ -489,14 -661,25 +515,26 @@@ static void psy_unregister_cooler(struc
+  }
+  #endif
+  
+ -static struct power_supply *__must_check
+ -__power_supply_register(struct device *parent,
+ -				   const struct power_supply_desc *desc,
+ -				   const struct power_supply_config *cfg,
+ -				   bool ws)
+ +int __power_supply_register(struct device *parent, struct power_supply *psy, bool ws)
+  {
+  	struct device *dev;
+ -	struct power_supply *psy;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ +	if (!dev)
+ +		return -ENOMEM;
+++=======
++ 	if (!parent)
++ 		pr_warn("%s: Expected proper parent device for '%s'\n",
++ 			__func__, desc->name);
++ 
++ 	psy = kzalloc(sizeof(*psy), GFP_KERNEL);
++ 	if (!psy)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	dev = &psy->dev;
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  
+  	device_initialize(dev);
+  
+@@@ -505,9 -688,21 +543,11 @@@
+  	dev->parent = parent;
+  	dev->release = power_supply_dev_release;
+  	dev_set_drvdata(dev, psy);
+ -	psy->desc = desc;
+ -	if (cfg) {
+ -		psy->drv_data = cfg->drv_data;
+ -		psy->of_node = cfg->of_node;
+ -		psy->supplied_to = cfg->supplied_to;
+ -		psy->num_supplicants = cfg->num_supplicants;
+ -	}
+ -
+ -	rc = dev_set_name(dev, "%s", desc->name);
+ -	if (rc)
+ -		goto dev_set_name_failed;
+ +	psy->dev = dev;
+  
+  	INIT_WORK(&psy->changed_work, power_supply_changed_work);
++ 	INIT_DELAYED_WORK(&psy->deferred_register_work,
++ 			  power_supply_deferred_register_work);
+  
+  	rc = power_supply_check_supplies(psy);
+  	if (rc) {
+@@@ -540,34 -731,79 +580,92 @@@
+  	if (rc)
+  		goto create_triggers_failed;
+  
+++<<<<<<< HEAD
+ +	power_supply_changed(psy);
+++=======
++ 	/*
++ 	 * Update use_cnt after any uevents (most notably from device_add()).
++ 	 * We are here still during driver's probe but
++ 	 * the power_supply_uevent() calls back driver's get_property
++ 	 * method so:
++ 	 * 1. Driver did not assigned the returned struct power_supply,
++ 	 * 2. Driver could not finish initialization (anything in its probe
++ 	 *    after calling power_supply_register()).
++ 	 */
++ 	atomic_inc(&psy->use_cnt);
++ 
++ 	queue_delayed_work(system_power_efficient_wq,
++ 			   &psy->deferred_register_work,
++ 			   POWER_SUPPLY_DEFERRED_REGISTER_TIME);
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  
+ -	return psy;
+ +	goto success;
+  
+  create_triggers_failed:
+  	psy_unregister_cooler(psy);
+  register_cooler_failed:
+  	psy_unregister_thermal(psy);
+  register_thermal_failed:
+ +wakeup_init_failed:
+  	device_del(dev);
+ +kobject_set_name_failed:
+  device_add_failed:
+ -wakeup_init_failed:
+  check_supplies_failed:
+ -dev_set_name_failed:
+  	put_device(dev);
+ -	return ERR_PTR(rc);
+ +success:
+ +	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +int power_supply_register(struct device *parent, struct power_supply *psy)
+++=======
++ /**
++  * power_supply_register() - Register new power supply
++  * @parent:	Device to be a parent of power supply's device, usually
++  *		the device which probe function calls this
++  * @desc:	Description of power supply, must be valid through whole
++  *		lifetime of this power supply
++  * @cfg:	Run-time specific configuration accessed during registering,
++  *		may be NULL
++  *
++  * Return: A pointer to newly allocated power_supply on success
++  * or ERR_PTR otherwise.
++  * Use power_supply_unregister() on returned power_supply pointer to release
++  * resources.
++  */
++ struct power_supply *__must_check power_supply_register(struct device *parent,
++ 		const struct power_supply_desc *desc,
++ 		const struct power_supply_config *cfg)
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  {
+ -	return __power_supply_register(parent, desc, cfg, true);
+ +	return __power_supply_register(parent, psy, true);
+  }
+  EXPORT_SYMBOL_GPL(power_supply_register);
+  
+++<<<<<<< HEAD
+ +int power_supply_register_no_ws(struct device *parent, struct power_supply *psy)
+++=======
++ /**
++  * power_supply_register() - Register new non-waking-source power supply
++  * @parent:	Device to be a parent of power supply's device, usually
++  *		the device which probe function calls this
++  * @desc:	Description of power supply, must be valid through whole
++  *		lifetime of this power supply
++  * @cfg:	Run-time specific configuration accessed during registering,
++  *		may be NULL
++  *
++  * Return: A pointer to newly allocated power_supply on success
++  * or ERR_PTR otherwise.
++  * Use power_supply_unregister() on returned power_supply pointer to release
++  * resources.
++  */
++ struct power_supply *__must_check
++ power_supply_register_no_ws(struct device *parent,
++ 		const struct power_supply_desc *desc,
++ 		const struct power_supply_config *cfg)
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  {
+ -	return __power_supply_register(parent, desc, cfg, false);
+ +	return __power_supply_register(parent, psy, false);
+  }
+  EXPORT_SYMBOL_GPL(power_supply_register_no_ws);
+  
+@@@ -578,18 -814,35 +676,39 @@@ static void devm_power_supply_release(s
+  	power_supply_unregister(*psy);
+  }
+  
+++<<<<<<< HEAD
+ +int devm_power_supply_register(struct device *parent, struct power_supply *psy)
+++=======
++ /**
++  * power_supply_register() - Register managed power supply
++  * @parent:	Device to be a parent of power supply's device, usually
++  *		the device which probe function calls this
++  * @desc:	Description of power supply, must be valid through whole
++  *		lifetime of this power supply
++  * @cfg:	Run-time specific configuration accessed during registering,
++  *		may be NULL
++  *
++  * Return: A pointer to newly allocated power_supply on success
++  * or ERR_PTR otherwise.
++  * The returned power_supply pointer will be automatically unregistered
++  * on driver detach.
++  */
++ struct power_supply *__must_check
++ devm_power_supply_register(struct device *parent,
++ 		const struct power_supply_desc *desc,
++ 		const struct power_supply_config *cfg)
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  {
+ -	struct power_supply **ptr, *psy;
+ -
+ -	ptr = devres_alloc(devm_power_supply_release, sizeof(*ptr), GFP_KERNEL);
+ +	struct power_supply **ptr = devres_alloc(devm_power_supply_release,
+ +						 sizeof(*ptr), GFP_KERNEL);
+ +	int ret;
+  
+  	if (!ptr)
+ -		return ERR_PTR(-ENOMEM);
+ -	psy = __power_supply_register(parent, desc, cfg, true);
+ -	if (IS_ERR(psy)) {
+ +		return -ENOMEM;
+ +	ret = __power_supply_register(parent, psy, true);
+ +	if (ret < 0)
+  		devres_free(ptr);
+ -	} else {
+ +	else {
+  		*ptr = psy;
+  		devres_add(parent, ptr);
+  	}
+@@@ -597,18 -850,35 +716,39 @@@
+  }
+  EXPORT_SYMBOL_GPL(devm_power_supply_register);
+  
+++<<<<<<< HEAD
+ +int devm_power_supply_register_no_ws(struct device *parent, struct power_supply *psy)
+++=======
++ /**
++  * power_supply_register() - Register managed non-waking-source power supply
++  * @parent:	Device to be a parent of power supply's device, usually
++  *		the device which probe function calls this
++  * @desc:	Description of power supply, must be valid through whole
++  *		lifetime of this power supply
++  * @cfg:	Run-time specific configuration accessed during registering,
++  *		may be NULL
++  *
++  * Return: A pointer to newly allocated power_supply on success
++  * or ERR_PTR otherwise.
++  * The returned power_supply pointer will be automatically unregistered
++  * on driver detach.
++  */
++ struct power_supply *__must_check
++ devm_power_supply_register_no_ws(struct device *parent,
++ 		const struct power_supply_desc *desc,
++ 		const struct power_supply_config *cfg)
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  {
+ -	struct power_supply **ptr, *psy;
+ -
+ -	ptr = devres_alloc(devm_power_supply_release, sizeof(*ptr), GFP_KERNEL);
+ +	struct power_supply **ptr = devres_alloc(devm_power_supply_release,
+ +						 sizeof(*ptr), GFP_KERNEL);
+ +	int ret;
+  
+  	if (!ptr)
+ -		return ERR_PTR(-ENOMEM);
+ -	psy = __power_supply_register(parent, desc, cfg, false);
+ -	if (IS_ERR(psy)) {
+ +		return -ENOMEM;
+ +	ret = __power_supply_register(parent, psy, false);
+ +	if (ret < 0)
+  		devres_free(ptr);
+ -	} else {
+ +	else {
+  		*ptr = psy;
+  		devres_add(parent, ptr);
+  	}
+@@@ -616,10 -886,19 +756,15 @@@
+  }
+  EXPORT_SYMBOL_GPL(devm_power_supply_register_no_ws);
+  
+ -/**
+ - * power_supply_unregister() - Remove this power supply from system
+ - * @psy:	Pointer to power supply to unregister
+ - *
+ - * Remove this power supply from the system. The resources of power supply
+ - * will be freed here or on last power_supply_put() call.
+ - */
+  void power_supply_unregister(struct power_supply *psy)
+  {
+ -	WARN_ON(atomic_dec_return(&psy->use_cnt));
+  	cancel_work_sync(&psy->changed_work);
+++<<<<<<< HEAD
+ +	sysfs_remove_link(&psy->dev->kobj, "powers");
+++=======
++ 	cancel_delayed_work_sync(&psy->deferred_register_work);
++ 	sysfs_remove_link(&psy->dev.kobj, "powers");
+++>>>>>>> 7f1a57fdd6cb (power_supply: Fix possible NULL pointer dereference on early uevent)
+  	power_supply_remove_triggers(psy);
+  	psy_unregister_cooler(psy);
+  	psy_unregister_thermal(psy);
+* Unmerged path drivers/power/power_supply_core.c
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index b5a0d5291835..c53aca1e7a5c 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -198,6 +198,7 @@ struct power_supply {
+ 	/* private */
+ 	struct device *dev;
+ 	struct work_struct changed_work;
++	struct delayed_work deferred_register_work;
+ 	spinlock_t changed_lock;
+ 	bool changed;
+ #ifdef CONFIG_THERMAL
