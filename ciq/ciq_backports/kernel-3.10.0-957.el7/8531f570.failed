@@ -1,0 +1,1102 @@
+drm/nouveau/disp/nv50-: merge handling of pio and dma channels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 8531f57027136fa63ddae91821ca89b32b571fe2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8531f570.failed
+
+Unnecessarily complicated, and a barrier to cleanly supporting Volta.
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 8531f57027136fa63ddae91821ca89b32b571fe2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.h
+* Unmerged path drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.h
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/baseg84.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/baseg84.c
+index 03ec508d19f0..01253f4a9946 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/baseg84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/baseg84.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ g84_disp_base_mthd_base = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegf119.c
+index 4c372dc6a128..389e19dfc514 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegf119.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ gf119_disp_base_mthd_base = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegp102.c
+index 3a25259de057..0cb23d673aa0 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/basegp102.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs <bskeggs@redhat.com>
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ int
+ gp102_disp_base_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/basenv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/basenv50.c
+index 11639e2a792f..19eb7dde01f2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/basenv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/basenv50.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ #include "head.h"
+ 
+ #include <core/client.h>
+@@ -30,7 +30,7 @@
+ #include <nvif/unpack.h>
+ 
+ int
+-nv50_disp_base_new_(const struct nv50_disp_dmac_func *func,
++nv50_disp_base_new_(const struct nv50_disp_chan_func *func,
+ 		    const struct nv50_disp_chan_mthd *mthd,
+ 		    struct nv50_disp *disp, int chid,
+ 		    const struct nvkm_oclass *oclass, void *argv, u32 argc,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c
+index badbd62b90c7..783c533ae170 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.c
+@@ -26,6 +26,7 @@
+ 
+ #include <core/client.h>
+ #include <core/notify.h>
++#include <core/oproxy.h>
+ #include <core/ramht.h>
+ #include <engine/dma.h>
+ 
+@@ -202,25 +203,76 @@ nv50_disp_chan_map(struct nvkm_object *object, u64 *addr, u32 *size)
+ 	return 0;
+ }
+ 
++struct nv50_disp_chan_object {
++	struct nvkm_oproxy oproxy;
++	struct nv50_disp *disp;
++	int hash;
++};
++
++static void
++nv50_disp_chan_child_del_(struct nvkm_oproxy *base)
++{
++	struct nv50_disp_chan_object *object =
++		container_of(base, typeof(*object), oproxy);
++	nvkm_ramht_remove(object->disp->ramht, object->hash);
++}
++
++static const struct nvkm_oproxy_func
++nv50_disp_chan_child_func_ = {
++	.dtor[0] = nv50_disp_chan_child_del_,
++};
++
+ static int
+ nv50_disp_chan_child_new(const struct nvkm_oclass *oclass,
+-			 void *data, u32 size, struct nvkm_object **pobject)
++			 void *argv, u32 argc, struct nvkm_object **pobject)
+ {
+ 	struct nv50_disp_chan *chan = nv50_disp_chan(oclass->parent);
+-	return chan->func->child_new(chan, oclass, data, size, pobject);
++	struct nv50_disp *disp = chan->disp;
++	struct nvkm_device *device = disp->base.engine.subdev.device;
++	const struct nvkm_device_oclass *sclass = oclass->priv;
++	struct nv50_disp_chan_object *object;
++	int ret;
++
++	if (!(object = kzalloc(sizeof(*object), GFP_KERNEL)))
++		return -ENOMEM;
++	nvkm_oproxy_ctor(&nv50_disp_chan_child_func_, oclass, &object->oproxy);
++	object->disp = disp;
++	*pobject = &object->oproxy.base;
++
++	ret = sclass->ctor(device, oclass, argv, argc, &object->oproxy.object);
++	if (ret)
++		return ret;
++
++	object->hash = chan->func->bind(chan, object->oproxy.object,
++					      oclass->handle);
++	if (object->hash < 0)
++		return object->hash;
++
++	return 0;
+ }
+ 
+ static int
+ nv50_disp_chan_child_get(struct nvkm_object *object, int index,
+-			 struct nvkm_oclass *oclass)
++			 struct nvkm_oclass *sclass)
+ {
+ 	struct nv50_disp_chan *chan = nv50_disp_chan(object);
+-	if (chan->func->child_get) {
+-		int ret = chan->func->child_get(chan, index, oclass);
+-		if (ret == 0)
+-			oclass->ctor = nv50_disp_chan_child_new;
+-		return ret;
++	struct nvkm_device *device = chan->disp->base.engine.subdev.device;
++	const struct nvkm_device_oclass *oclass = NULL;
++
++	if (chan->func->bind)
++		sclass->engine = nvkm_device_engine(device, NVKM_ENGINE_DMAOBJ);
++	else
++		sclass->engine = NULL;
++
++	if (sclass->engine && sclass->engine->func->base.sclass) {
++		sclass->engine->func->base.sclass(sclass, index, &oclass);
++		if (oclass) {
++			sclass->ctor = nv50_disp_chan_child_new,
++			sclass->priv = oclass;
++			return 0;
++		}
+ 	}
++
+ 	return -EINVAL;
+ }
+ 
+@@ -246,7 +298,7 @@ nv50_disp_chan_dtor(struct nvkm_object *object)
+ 	struct nv50_disp *disp = chan->disp;
+ 	if (chan->chid.user >= 0)
+ 		disp->chan[chan->chid.user] = NULL;
+-	return chan->func->dtor ? chan->func->dtor(chan) : chan;
++	return chan;
+ }
+ 
+ static const struct nvkm_object_func
+@@ -262,12 +314,18 @@ nv50_disp_chan = {
+ };
+ 
+ int
+-nv50_disp_chan_ctor(const struct nv50_disp_chan_func *func,
++nv50_disp_chan_new_(const struct nv50_disp_chan_func *func,
+ 		    const struct nv50_disp_chan_mthd *mthd,
+ 		    struct nv50_disp *disp, int ctrl, int user, int head,
+ 		    const struct nvkm_oclass *oclass,
+-		    struct nv50_disp_chan *chan)
++		    struct nvkm_object **pobject)
+ {
++	struct nv50_disp_chan *chan;
++
++	if (!(chan = kzalloc(sizeof(*chan), GFP_KERNEL)))
++		return -ENOMEM;
++	*pobject = &chan->object;
++
+ 	nvkm_object_ctor(&nv50_disp_chan, oclass, &chan->object);
+ 	chan->func = func;
+ 	chan->mthd = mthd;
+@@ -283,20 +341,3 @@ nv50_disp_chan_ctor(const struct nv50_disp_chan_func *func,
+ 	disp->chan[chan->chid.user] = chan;
+ 	return 0;
+ }
+-
+-int
+-nv50_disp_chan_new_(const struct nv50_disp_chan_func *func,
+-		    const struct nv50_disp_chan_mthd *mthd,
+-		    struct nv50_disp *disp, int ctrl, int user, int head,
+-		    const struct nvkm_oclass *oclass,
+-		    struct nvkm_object **pobject)
+-{
+-	struct nv50_disp_chan *chan;
+-
+-	if (!(chan = kzalloc(sizeof(*chan), GFP_KERNEL)))
+-		return -ENOMEM;
+-	*pobject = &chan->object;
+-
+-	return nv50_disp_chan_ctor(func, mthd, disp, ctrl, user,
+-				   head, oclass, chan);
+-}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.h
+index 57ef0de1c7e7..ccb966f12674 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/channv50.h
+@@ -3,7 +3,6 @@
+ #define nv50_disp_chan(p) container_of((p), struct nv50_disp_chan, object)
+ #include "nv50.h"
+ struct nv50_disp_root;
+-struct nv50_disp_dmac_func;
+ 
+ struct nv50_disp_chan {
+ 	const struct nv50_disp_chan_func *func;
+@@ -17,36 +16,38 @@ struct nv50_disp_chan {
+ 	int head;
+ 
+ 	struct nvkm_object object;
++
++	u64 push;
+ };
+ 
+ struct nv50_disp_chan_func {
+-	void *(*dtor)(struct nv50_disp_chan *);
+ 	int (*init)(struct nv50_disp_chan *);
+ 	void (*fini)(struct nv50_disp_chan *);
+-	int (*child_get)(struct nv50_disp_chan *, int index,
+-			 struct nvkm_oclass *);
+-	int (*child_new)(struct nv50_disp_chan *, const struct nvkm_oclass *,
+-			 void *data, u32 size, struct nvkm_object **);
++	int (*bind)(struct nv50_disp_chan *, struct nvkm_object *, u32 handle);
+ };
+ 
+-int nv50_disp_chan_ctor(const struct nv50_disp_chan_func *,
+-			const struct nv50_disp_chan_mthd *,
+-			struct nv50_disp *, int ctrl, int user, int head,
+-			const struct nvkm_oclass *, struct nv50_disp_chan *);
+ int nv50_disp_chan_new_(const struct nv50_disp_chan_func *,
+ 			const struct nv50_disp_chan_mthd *,
+ 			struct nv50_disp *, int ctrl, int user, int head,
+ 			const struct nvkm_oclass *, struct nvkm_object **);
++int nv50_disp_dmac_new_(const struct nv50_disp_chan_func *,
++			const struct nv50_disp_chan_mthd *,
++			struct nv50_disp *, int chid, int head, u64 push,
++			const struct nvkm_oclass *, struct nvkm_object **);
+ 
+ extern const struct nv50_disp_chan_func nv50_disp_pioc_func;
+-extern const struct nv50_disp_chan_func gf119_disp_pioc_func;
++extern const struct nv50_disp_chan_func nv50_disp_dmac_func;
++int nv50_disp_dmac_bind(struct nv50_disp_chan *, struct nvkm_object *, u32);
++extern const struct nv50_disp_chan_func nv50_disp_core_func;
+ 
+-extern const struct nvkm_event_func nv50_disp_chan_uevent;
+-int  nv50_disp_chan_uevent_ctor(struct nvkm_object *, void *, u32,
+-				struct nvkm_notify *);
+-void nv50_disp_chan_uevent_send(struct nv50_disp *, int);
++extern const struct nv50_disp_chan_func gf119_disp_pioc_func;
++extern const struct nv50_disp_chan_func gf119_disp_dmac_func;
++void gf119_disp_dmac_fini(struct nv50_disp_chan *);
++int gf119_disp_dmac_bind(struct nv50_disp_chan *, struct nvkm_object *, u32);
++extern const struct nv50_disp_chan_func gf119_disp_core_func;
++void gf119_disp_core_fini(struct nv50_disp_chan *);
+ 
+-extern const struct nvkm_event_func gf119_disp_chan_uevent;
++extern const struct nv50_disp_chan_func gp102_disp_dmac_func;
+ 
+ int nv50_disp_curs_new_(const struct nv50_disp_chan_func *,
+ 			struct nv50_disp *, int ctrl, int user,
+@@ -56,17 +57,17 @@ int nv50_disp_oimm_new_(const struct nv50_disp_chan_func *,
+ 			struct nv50_disp *, int ctrl, int user,
+ 			const struct nvkm_oclass *, void *argv, u32 argc,
+ 			struct nvkm_object **);
+-int nv50_disp_base_new_(const struct nv50_disp_dmac_func *,
++int nv50_disp_base_new_(const struct nv50_disp_chan_func *,
+ 			const struct nv50_disp_chan_mthd *,
+ 			struct nv50_disp *, int chid,
+ 			const struct nvkm_oclass *, void *argv, u32 argc,
+ 			struct nvkm_object **);
+-int nv50_disp_core_new_(const struct nv50_disp_dmac_func *,
++int nv50_disp_core_new_(const struct nv50_disp_chan_func *,
+ 			const struct nv50_disp_chan_mthd *,
+ 			struct nv50_disp *, int chid,
+ 			const struct nvkm_oclass *oclass, void *argv, u32 argc,
+ 			struct nvkm_object **);
+-int nv50_disp_ovly_new_(const struct nv50_disp_dmac_func *,
++int nv50_disp_ovly_new_(const struct nv50_disp_chan_func *,
+ 			const struct nv50_disp_chan_mthd *,
+ 			struct nv50_disp *, int chid,
+ 			const struct nvkm_oclass *, void *argv, u32 argc,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg84.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg84.c
+index b16857f468ee..cfc54aad3e7c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg84.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ const struct nv50_disp_mthd_list
+ g84_disp_core_mthd_dac = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg94.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg94.c
+index ea5f48912c77..e911925f1182 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg94.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coreg94.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ g94_disp_core_mthd_sor = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregf119.c
+index 9e48cc3625b5..17c66162417b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregf119.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <subdev/timer.h>
+ 
+@@ -167,10 +167,9 @@ gf119_disp_core_mthd = {
+ };
+ 
+ void
+-gf119_disp_core_fini(struct nv50_disp_dmac *chan)
++gf119_disp_core_fini(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 
+ 	/* deactivate channel */
+@@ -190,10 +189,9 @@ gf119_disp_core_fini(struct nv50_disp_dmac *chan)
+ }
+ 
+ static int
+-gf119_disp_core_init(struct nv50_disp_dmac *chan)
++gf119_disp_core_init(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 
+ 	/* enable error reporting */
+@@ -220,7 +218,7 @@ gf119_disp_core_init(struct nv50_disp_dmac *chan)
+ 	return 0;
+ }
+ 
+-const struct nv50_disp_dmac_func
++const struct nv50_disp_chan_func
+ gf119_disp_core_func = {
+ 	.init = gf119_disp_core_init,
+ 	.fini = gf119_disp_core_fini,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregk104.c
+index ca095958efdf..5c800174e079 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregk104.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ gk104_disp_core_mthd_head = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregp102.c
+index 3ec353e90b3e..57d26051bc95 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/coregp102.c
+@@ -21,15 +21,14 @@
+  *
+  * Authors: Ben Skeggs <bskeggs@redhat.com>
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <subdev/timer.h>
+ 
+ static int
+-gp102_disp_core_init(struct nv50_disp_dmac *chan)
++gp102_disp_core_init(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 
+ 	/* enable error reporting */
+@@ -56,7 +55,7 @@ gp102_disp_core_init(struct nv50_disp_dmac *chan)
+ 	return 0;
+ }
+ 
+-static const struct nv50_disp_dmac_func
++static const struct nv50_disp_chan_func
+ gp102_disp_core_func = {
+ 	.init = gp102_disp_core_init,
+ 	.fini = gf119_disp_core_fini,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/corenv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/corenv50.c
+index 8cdcf5b590e7..d648c4d7b55c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/corenv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/corenv50.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <core/client.h>
+ #include <subdev/timer.h>
+@@ -30,7 +30,7 @@
+ #include <nvif/unpack.h>
+ 
+ int
+-nv50_disp_core_new_(const struct nv50_disp_dmac_func *func,
++nv50_disp_core_new_(const struct nv50_disp_chan_func *func,
+ 		    const struct nv50_disp_chan_mthd *mthd,
+ 		    struct nv50_disp *disp, int chid,
+ 		    const struct nvkm_oclass *oclass, void *argv, u32 argc,
+@@ -164,10 +164,9 @@ nv50_disp_core_mthd = {
+ };
+ 
+ static void
+-nv50_disp_core_fini(struct nv50_disp_dmac *chan)
++nv50_disp_core_fini(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 
+ 	/* deactivate channel */
+@@ -186,10 +185,9 @@ nv50_disp_core_fini(struct nv50_disp_dmac *chan)
+ }
+ 
+ static int
+-nv50_disp_core_init(struct nv50_disp_dmac *chan)
++nv50_disp_core_init(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+ 
+ 	/* enable error reporting */
+@@ -222,7 +220,7 @@ nv50_disp_core_init(struct nv50_disp_dmac *chan)
+ 	return 0;
+ }
+ 
+-const struct nv50_disp_dmac_func
++const struct nv50_disp_chan_func
+ nv50_disp_core_func = {
+ 	.init = nv50_disp_core_init,
+ 	.fini = nv50_disp_core_fini,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgf119.c
+index b73bcc38a259..f69749a29df8 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgf119.c
+@@ -21,29 +21,27 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
+-#include "rootnv50.h"
++#include "channv50.h"
+ 
+ #include <core/ramht.h>
+ #include <subdev/timer.h>
+ 
+ int
+-gf119_disp_dmac_bind(struct nv50_disp_dmac *chan,
++gf119_disp_dmac_bind(struct nv50_disp_chan *chan,
+ 		     struct nvkm_object *object, u32 handle)
+ {
+-	return nvkm_ramht_insert(chan->base.disp->ramht, object,
+-				 chan->base.chid.user, -9, handle,
+-				 chan->base.chid.user << 27 | 0x00000001);
++	return nvkm_ramht_insert(chan->disp->ramht, object,
++				 chan->chid.user, -9, handle,
++				 chan->chid.user << 27 | 0x00000001);
+ }
+ 
+ void
+-gf119_disp_dmac_fini(struct nv50_disp_dmac *chan)
++gf119_disp_dmac_fini(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	int ctrl = chan->base.chid.ctrl;
+-	int user = chan->base.chid.user;
++	int ctrl = chan->chid.ctrl;
++	int user = chan->chid.user;
+ 
+ 	/* deactivate channel */
+ 	nvkm_mask(device, 0x610490 + (ctrl * 0x0010), 0x00001010, 0x00001000);
+@@ -62,13 +60,12 @@ gf119_disp_dmac_fini(struct nv50_disp_dmac *chan)
+ }
+ 
+ static int
+-gf119_disp_dmac_init(struct nv50_disp_dmac *chan)
++gf119_disp_dmac_init(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	int ctrl = chan->base.chid.ctrl;
+-	int user = chan->base.chid.user;
++	int ctrl = chan->chid.ctrl;
++	int user = chan->chid.user;
+ 
+ 	/* enable error reporting */
+ 	nvkm_mask(device, 0x6100a0, 0x00000001 << user, 0x00000001 << user);
+@@ -94,7 +91,7 @@ gf119_disp_dmac_init(struct nv50_disp_dmac *chan)
+ 	return 0;
+ }
+ 
+-const struct nv50_disp_dmac_func
++const struct nv50_disp_chan_func
+ gf119_disp_dmac_func = {
+ 	.init = gf119_disp_dmac_init,
+ 	.fini = gf119_disp_dmac_fini,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgp102.c
+index 62e9b8430791..22fa5925644a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacgp102.c
+@@ -21,19 +21,17 @@
+  *
+  * Authors: Ben Skeggs <bskeggs@redhat.com>
+  */
+-#include "dmacnv50.h"
+-#include "rootnv50.h"
++#include "channv50.h"
+ 
+ #include <subdev/timer.h>
+ 
+ static int
+-gp102_disp_dmac_init(struct nv50_disp_dmac *chan)
++gp102_disp_dmac_init(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	int ctrl = chan->base.chid.ctrl;
+-	int user = chan->base.chid.user;
++	int ctrl = chan->chid.ctrl;
++	int user = chan->chid.user;
+ 
+ 	/* enable error reporting */
+ 	nvkm_mask(device, 0x6100a0, 0x00000001 << user, 0x00000001 << user);
+@@ -59,7 +57,7 @@ gp102_disp_dmac_init(struct nv50_disp_dmac *chan)
+ 	return 0;
+ }
+ 
+-const struct nv50_disp_dmac_func
++const struct nv50_disp_chan_func
+ gp102_disp_dmac_func = {
+ 	.init = gp102_disp_dmac_init,
+ 	.fini = gf119_disp_dmac_fini,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.c
+index d081947d0689..5cd08cad2c26 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.c
+@@ -21,117 +21,16 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
+-#include "rootnv50.h"
++#include "channv50.h"
+ 
+ #include <core/client.h>
+-#include <core/oproxy.h>
+ #include <core/ramht.h>
+ #include <subdev/fb.h>
+ #include <subdev/timer.h>
+ #include <engine/dma.h>
+ 
+-struct nv50_disp_dmac_object {
+-	struct nvkm_oproxy oproxy;
+-	struct nv50_disp *disp;
+-	int hash;
+-};
+-
+-static void
+-nv50_disp_dmac_child_del_(struct nvkm_oproxy *base)
+-{
+-	struct nv50_disp_dmac_object *object =
+-		container_of(base, typeof(*object), oproxy);
+-	nvkm_ramht_remove(object->disp->ramht, object->hash);
+-}
+-
+-static const struct nvkm_oproxy_func
+-nv50_disp_dmac_child_func_ = {
+-	.dtor[0] = nv50_disp_dmac_child_del_,
+-};
+-
+-static int
+-nv50_disp_dmac_child_new_(struct nv50_disp_chan *base,
+-			  const struct nvkm_oclass *oclass,
+-			  void *data, u32 size, struct nvkm_object **pobject)
+-{
+-	struct nv50_disp_dmac *chan = nv50_disp_dmac(base);
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_device *device = disp->base.engine.subdev.device;
+-	const struct nvkm_device_oclass *sclass = oclass->priv;
+-	struct nv50_disp_dmac_object *object;
+-	int ret;
+-
+-	if (!(object = kzalloc(sizeof(*object), GFP_KERNEL)))
+-		return -ENOMEM;
+-	nvkm_oproxy_ctor(&nv50_disp_dmac_child_func_, oclass, &object->oproxy);
+-	object->disp = disp;
+-	*pobject = &object->oproxy.base;
+-
+-	ret = sclass->ctor(device, oclass, data, size, &object->oproxy.object);
+-	if (ret)
+-		return ret;
+-
+-	object->hash = chan->func->bind(chan, object->oproxy.object,
+-					      oclass->handle);
+-	if (object->hash < 0)
+-		return object->hash;
+-
+-	return 0;
+-}
+-
+-static int
+-nv50_disp_dmac_child_get_(struct nv50_disp_chan *base, int index,
+-			  struct nvkm_oclass *sclass)
+-{
+-	struct nv50_disp_dmac *chan = nv50_disp_dmac(base);
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_device *device = disp->base.engine.subdev.device;
+-	const struct nvkm_device_oclass *oclass = NULL;
+-
+-	sclass->engine = nvkm_device_engine(device, NVKM_ENGINE_DMAOBJ);
+-	if (sclass->engine && sclass->engine->func->base.sclass) {
+-		sclass->engine->func->base.sclass(sclass, index, &oclass);
+-		if (oclass) {
+-			sclass->priv = oclass;
+-			return 0;
+-		}
+-	}
+-
+-	return -EINVAL;
+-}
+-
+-static void
+-nv50_disp_dmac_fini_(struct nv50_disp_chan *base)
+-{
+-	struct nv50_disp_dmac *chan = nv50_disp_dmac(base);
+-	chan->func->fini(chan);
+-}
+-
+-static int
+-nv50_disp_dmac_init_(struct nv50_disp_chan *base)
+-{
+-	struct nv50_disp_dmac *chan = nv50_disp_dmac(base);
+-	return chan->func->init(chan);
+-}
+-
+-static void *
+-nv50_disp_dmac_dtor_(struct nv50_disp_chan *base)
+-{
+-	return nv50_disp_dmac(base);
+-}
+-
+-static const struct nv50_disp_chan_func
+-nv50_disp_dmac_func_ = {
+-	.dtor = nv50_disp_dmac_dtor_,
+-	.init = nv50_disp_dmac_init_,
+-	.fini = nv50_disp_dmac_fini_,
+-	.child_get = nv50_disp_dmac_child_get_,
+-	.child_new = nv50_disp_dmac_child_new_,
+-};
+-
+ int
+-nv50_disp_dmac_new_(const struct nv50_disp_dmac_func *func,
++nv50_disp_dmac_new_(const struct nv50_disp_chan_func *func,
+ 		    const struct nv50_disp_chan_mthd *mthd,
+ 		    struct nv50_disp *disp, int chid, int head, u64 push,
+ 		    const struct nvkm_oclass *oclass,
+@@ -139,16 +38,12 @@ nv50_disp_dmac_new_(const struct nv50_disp_dmac_func *func,
+ {
+ 	struct nvkm_client *client = oclass->client;
+ 	struct nvkm_dmaobj *dmaobj;
+-	struct nv50_disp_dmac *chan;
++	struct nv50_disp_chan *chan;
+ 	int ret;
+ 
+-	if (!(chan = kzalloc(sizeof(*chan), GFP_KERNEL)))
+-		return -ENOMEM;
+-	*pobject = &chan->base.object;
+-	chan->func = func;
+-
+-	ret = nv50_disp_chan_ctor(&nv50_disp_dmac_func_, mthd, disp,
+-				  chid, chid, head, oclass, &chan->base);
++	ret = nv50_disp_chan_new_(func, mthd, disp, chid, chid, head, oclass,
++				  pobject);
++	chan = nv50_disp_chan(*pobject);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -174,23 +69,22 @@ nv50_disp_dmac_new_(const struct nv50_disp_dmac_func *func,
+ }
+ 
+ int
+-nv50_disp_dmac_bind(struct nv50_disp_dmac *chan,
++nv50_disp_dmac_bind(struct nv50_disp_chan *chan,
+ 		    struct nvkm_object *object, u32 handle)
+ {
+-	return nvkm_ramht_insert(chan->base.disp->ramht, object,
+-				 chan->base.chid.user, -10, handle,
+-				 chan->base.chid.user << 28 |
+-				 chan->base.chid.user);
++	return nvkm_ramht_insert(chan->disp->ramht, object,
++				 chan->chid.user, -10, handle,
++				 chan->chid.user << 28 |
++				 chan->chid.user);
+ }
+ 
+ static void
+-nv50_disp_dmac_fini(struct nv50_disp_dmac *chan)
++nv50_disp_dmac_fini(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	int ctrl = chan->base.chid.ctrl;
+-	int user = chan->base.chid.user;
++	int ctrl = chan->chid.ctrl;
++	int user = chan->chid.user;
+ 
+ 	/* deactivate channel */
+ 	nvkm_mask(device, 0x610200 + (ctrl * 0x0010), 0x00001010, 0x00001000);
+@@ -208,13 +102,12 @@ nv50_disp_dmac_fini(struct nv50_disp_dmac *chan)
+ }
+ 
+ static int
+-nv50_disp_dmac_init(struct nv50_disp_dmac *chan)
++nv50_disp_dmac_init(struct nv50_disp_chan *chan)
+ {
+-	struct nv50_disp *disp = chan->base.disp;
+-	struct nvkm_subdev *subdev = &disp->base.engine.subdev;
++	struct nvkm_subdev *subdev = &chan->disp->base.engine.subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	int ctrl = chan->base.chid.ctrl;
+-	int user = chan->base.chid.user;
++	int ctrl = chan->chid.ctrl;
++	int user = chan->chid.user;
+ 
+ 	/* enable error reporting */
+ 	nvkm_mask(device, 0x610028, 0x00010000 << user, 0x00010000 << user);
+@@ -240,7 +133,7 @@ nv50_disp_dmac_init(struct nv50_disp_dmac *chan)
+ 	return 0;
+ }
+ 
+-const struct nv50_disp_dmac_func
++const struct nv50_disp_chan_func
+ nv50_disp_dmac_func = {
+ 	.init = nv50_disp_dmac_init,
+ 	.fini = nv50_disp_dmac_fini,
+* Unmerged path drivers/gpu/drm/nouveau/nvkm/engine/disp/dmacnv50.h
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c
+index 382e6a6a6ff2..794e90982641 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gf119.c
+@@ -24,6 +24,7 @@
+ #include "nv50.h"
+ #include "head.h"
+ #include "ior.h"
++#include "channv50.h"
+ #include "rootnv50.h"
+ 
+ #include <core/ramht.h>
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp102.c
+index 0a2c5b5f87eb..3468ddec1270 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/gp102.c
+@@ -24,6 +24,7 @@
+ #include "nv50.h"
+ #include "head.h"
+ #include "ior.h"
++#include "channv50.h"
+ #include "rootnv50.h"
+ 
+ static void
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h
+index 88789ca9ac43..59fbba6ec6ae 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.h
+@@ -78,4 +78,11 @@ void gf119_disp_intr_error(struct nv50_disp *, int);
+ void nv50_disp_dptmds_war_2(struct nv50_disp *, struct dcb_output *);
+ void nv50_disp_dptmds_war_3(struct nv50_disp *, struct dcb_output *);
+ void nv50_disp_update_sppll1(struct nv50_disp *);
++
++extern const struct nvkm_event_func nv50_disp_chan_uevent;
++int  nv50_disp_chan_uevent_ctor(struct nvkm_object *, void *, u32,
++				struct nvkm_notify *);
++void nv50_disp_chan_uevent_send(struct nv50_disp *, int);
++
++extern const struct nvkm_event_func gf119_disp_chan_uevent;
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlyg84.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlyg84.c
+index 6b55cf483fe2..31b915d48699 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlyg84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlyg84.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ g84_disp_ovly_mthd_base = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygf119.c
+index 30901caf75dc..83fd534c44da 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygf119.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ gf119_disp_ovly_mthd_base = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygk104.c
+index 682c146c39d4..a7acacbc92c1 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygk104.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ gk104_disp_ovly_mthd_base = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygp102.c
+index bcc5ac40f6f9..e0eca6ea914c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygp102.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ int
+ gp102_disp_ovly_new(const struct nvkm_oclass *oclass, void *argv, u32 argc,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygt200.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygt200.c
+index 655deb0d2fa0..dc60cd00dc16 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygt200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlygt200.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ static const struct nv50_disp_mthd_list
+ gt200_disp_ovly_mthd_base = {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlynv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlynv50.c
+index 46f5df0b3a1e..6974c12c4518 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlynv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/ovlynv50.c
+@@ -21,7 +21,7 @@
+  *
+  * Authors: Ben Skeggs
+  */
+-#include "dmacnv50.h"
++#include "channv50.h"
+ #include "head.h"
+ 
+ #include <core/client.h>
+@@ -30,7 +30,7 @@
+ #include <nvif/unpack.h>
+ 
+ int
+-nv50_disp_ovly_new_(const struct nv50_disp_dmac_func *func,
++nv50_disp_ovly_new_(const struct nv50_disp_chan_func *func,
+ 		    const struct nv50_disp_chan_mthd *mthd,
+ 		    struct nv50_disp *disp, int chid,
+ 		    const struct nvkm_oclass *oclass, void *argv, u32 argc,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg84.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg84.c
+index e51f89f32507..1ed371fd7ddf 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg84.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg84.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg94.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg94.c
+index ed7838eedb2c..ef579eb00238 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg94.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootg94.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgf119.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgf119.c
+index ac92e65131c9..fe011165dc02 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgf119.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgf119.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk104.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk104.c
+index 3bb6d601aed2..9e8ffd348b50 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk104.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk110.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk110.c
+index 336419815d98..dc85cc1c9490 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk110.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgk110.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm107.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm107.c
+index c53e71ee69e7..e0181ca08840 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm107.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm107.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm200.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm200.c
+index 85409d1bc7bc..e5e590e19f62 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgm200.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp100.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp100.c
+index ebfd245c573a..762a1a922e05 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp100.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs <bskeggs@redhat.com>
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp102.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp102.c
+index 54b5fda99208..c7f00946c9af 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgp102.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs <bskeggs@redhat.com>
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt200.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt200.c
+index 14ac83bf3693..a6963654087c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt200.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt200.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt215.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt215.c
+index cb1a208e68bd..4fe0a3ae8891 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt215.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootgt215.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ 
+ #include <nvif/class.h>
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+index 9d716ee7621e..3aa5a2879239 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.c
+@@ -22,7 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "rootnv50.h"
+-#include "dmacnv50.h"
++#include "channv50.h"
+ #include "dp.h"
+ #include "head.h"
+ #include "ior.h"
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h
+index 0464a0bbeb9e..8c90514b8a5c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/disp/rootnv50.h
+@@ -1,8 +1,8 @@
+ #ifndef __NV50_DISP_ROOT_H__
+ #define __NV50_DISP_ROOT_H__
+ #define nv50_disp_root(p) container_of((p), struct nv50_disp_root, object)
++#include <core/object.h>
+ #include "nv50.h"
+-#include "dmacnv50.h"
+ 
+ struct nv50_disp_root {
+ 	const struct nv50_disp_root_func *func;
