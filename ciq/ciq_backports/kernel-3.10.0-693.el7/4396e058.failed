@@ -1,0 +1,340 @@
+timekeeping: Provide fast and NMI safe access to CLOCK_MONOTONIC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 4396e058c52e167729729cf64ea3dfa229637086
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4396e058.failed
+
+Tracers want a correlated time between the kernel instrumentation and
+user space. We really do not want to export sched_clock() to user
+space, so we need to provide something sensible for this.
+
+Using separate data structures with an non blocking sequence count
+based update mechanism allows us to do that. The data structure
+required for the readout has a sequence counter and two copies of the
+timekeeping data.
+
+On the update side:
+
+  smp_wmb();
+  tkf->seq++;
+  smp_wmb();
+  update(tkf->base[0], tk);
+  smp_wmb();
+  tkf->seq++;
+  smp_wmb();
+  update(tkf->base[1], tk);
+
+On the reader side:
+
+  do {
+     seq = tkf->seq;
+     smp_rmb();
+     idx = seq & 0x01;
+     now = now(tkf->base[idx]);
+     smp_rmb();
+  } while (seq != tkf->seq)
+
+So if a NMI hits the update of base[0] it will use base[1] which is
+still consistent, but this timestamp is not guaranteed to be monotonic
+across an update.
+
+The timestamp is calculated by:
+
+	now = base_mono + clock_delta * slope
+
+So if the update lowers the slope, readers who are forced to the
+not yet updated second array are still using the old steeper slope.
+
+ tmono
+ ^
+ |    o  n
+ |   o n
+ |  u
+ | o
+ |o
+ |12345678---> reader order
+
+ o = old slope
+ u = update
+ n = new slope
+
+So reader 6 will observe time going backwards versus reader 5.
+
+While other CPUs are likely to be able observe that, the only way
+for a CPU local observation is when an NMI hits in the middle of
+the update. Timestamps taken from that NMI context might be ahead
+of the following timestamps. Callers need to be aware of that and
+deal with it.
+
+V2: Got rid of clock monotonic raw and reorganized the data
+    structures. Folded in the barrier fix from Mathieu.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Signed-off-by: John Stultz <john.stultz@linaro.org>
+(cherry picked from commit 4396e058c52e167729729cf64ea3dfa229637086)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/timekeeping.c
+diff --cc kernel/time/timekeeping.c
+index 1f122214a691,8980fb722fc5..000000000000
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@@ -31,11 -32,34 +31,27 @@@
+  #define TK_MIRROR		(1 << 1)
+  #define TK_CLOCK_WAS_SET	(1 << 2)
+  
+ -/*
+ - * The most important data for readout fits into a single 64 byte
+ - * cache line.
+ - */
+ -static struct {
+ -	seqcount_t		seq;
+ -	struct timekeeper	timekeeper;
+ -} tk_core ____cacheline_aligned;
+ -
+ +static struct timekeeper timekeeper;
+  static DEFINE_RAW_SPINLOCK(timekeeper_lock);
+ +static seqcount_t timekeeper_seq;
+  static struct timekeeper shadow_timekeeper;
+  
++ /**
++  * struct tk_fast - NMI safe timekeeper
++  * @seq:	Sequence counter for protecting updates. The lowest bit
++  *		is the index for the tk_read_base array
++  * @base:	tk_read_base array. Access is indexed by the lowest bit of
++  *		@seq.
++  *
++  * See @update_fast_timekeeper() below.
++  */
++ struct tk_fast {
++ 	seqcount_t		seq;
++ 	struct tk_read_base	base[2];
++ };
++ 
++ static struct tk_fast tk_fast_mono ____cacheline_aligned;
++ 
+  /* flag for if timekeeping is suspended */
+  int __read_mostly timekeeping_suspended;
+  
+@@@ -196,24 -207,165 +212,136 @@@ static inline s64 timekeeping_delta_to_
+  	return nsec + arch_gettimeoffset();
+  }
+  
+ -static inline s64 timekeeping_get_ns_raw(struct timekeeper *tk)
+ +static inline s64 timekeeping_get_ns(struct tk_read_base *tkr)
+  {
+ -	struct clocksource *clock = tk->tkr.clock;
+ -	cycle_t cycle_now, delta;
+ -	s64 nsec;
+ -
+ -	/* read clocksource: */
+ -	cycle_now = tk->tkr.read(clock);
+ +	cycle_t delta;
+  
+ -	/* calculate the delta since the last update_wall_time: */
+ -	delta = clocksource_delta(cycle_now, tk->tkr.cycle_last, tk->tkr.mask);
+ -
+ -	/* convert delta to nanoseconds. */
+ -	nsec = clocksource_cyc2ns(delta, clock->mult, clock->shift);
+ -
+ -	/* If arch requires, add in get_arch_timeoffset() */
+ -	return nsec + arch_gettimeoffset();
+ +	delta = timekeeping_get_delta(tkr);
+ +	return timekeeping_delta_to_ns(tkr, delta);
+  }
+  
+++<<<<<<< HEAD
+ +static inline s64 timekeeping_cycles_to_ns(struct tk_read_base *tkr,
+ +					    cycle_t cycles)
+++=======
++ /**
++  * update_fast_timekeeper - Update the fast and NMI safe monotonic timekeeper.
++  * @tk:		The timekeeper from which we take the update
++  * @tkf:	The fast timekeeper to update
++  * @tbase:	The time base for the fast timekeeper (mono/raw)
++  *
++  * We want to use this from any context including NMI and tracing /
++  * instrumenting the timekeeping code itself.
++  *
++  * So we handle this differently than the other timekeeping accessor
++  * functions which retry when the sequence count has changed. The
++  * update side does:
++  *
++  * smp_wmb();	<- Ensure that the last base[1] update is visible
++  * tkf->seq++;
++  * smp_wmb();	<- Ensure that the seqcount update is visible
++  * update(tkf->base[0], tk);
++  * smp_wmb();	<- Ensure that the base[0] update is visible
++  * tkf->seq++;
++  * smp_wmb();	<- Ensure that the seqcount update is visible
++  * update(tkf->base[1], tk);
++  *
++  * The reader side does:
++  *
++  * do {
++  *	seq = tkf->seq;
++  *	smp_rmb();
++  *	idx = seq & 0x01;
++  *	now = now(tkf->base[idx]);
++  *	smp_rmb();
++  * } while (seq != tkf->seq)
++  *
++  * As long as we update base[0] readers are forced off to
++  * base[1]. Once base[0] is updated readers are redirected to base[0]
++  * and the base[1] update takes place.
++  *
++  * So if a NMI hits the update of base[0] then it will use base[1]
++  * which is still consistent. In the worst case this can result is a
++  * slightly wrong timestamp (a few nanoseconds). See
++  * @ktime_get_mono_fast_ns.
++  */
++ static void update_fast_timekeeper(struct timekeeper *tk)
++ {
++ 	struct tk_read_base *base = tk_fast_mono.base;
++ 
++ 	/* Force readers off to base[1] */
++ 	raw_write_seqcount_latch(&tk_fast_mono.seq);
++ 
++ 	/* Update base[0] */
++ 	memcpy(base, &tk->tkr, sizeof(*base));
++ 
++ 	/* Force readers back to base[0] */
++ 	raw_write_seqcount_latch(&tk_fast_mono.seq);
++ 
++ 	/* Update base[1] */
++ 	memcpy(base + 1, base, sizeof(*base));
++ }
++ 
++ /**
++  * ktime_get_mono_fast_ns - Fast NMI safe access to clock monotonic
++  *
++  * This timestamp is not guaranteed to be monotonic across an update.
++  * The timestamp is calculated by:
++  *
++  *	now = base_mono + clock_delta * slope
++  *
++  * So if the update lowers the slope, readers who are forced to the
++  * not yet updated second array are still using the old steeper slope.
++  *
++  * tmono
++  * ^
++  * |    o  n
++  * |   o n
++  * |  u
++  * | o
++  * |o
++  * |12345678---> reader order
++  *
++  * o = old slope
++  * u = update
++  * n = new slope
++  *
++  * So reader 6 will observe time going backwards versus reader 5.
++  *
++  * While other CPUs are likely to be able observe that, the only way
++  * for a CPU local observation is when an NMI hits in the middle of
++  * the update. Timestamps taken from that NMI context might be ahead
++  * of the following timestamps. Callers need to be aware of that and
++  * deal with it.
++  */
++ u64 notrace ktime_get_mono_fast_ns(void)
++ {
++ 	struct tk_read_base *tkr;
++ 	unsigned int seq;
++ 	u64 now;
++ 
++ 	do {
++ 		seq = raw_read_seqcount(&tk_fast_mono.seq);
++ 		tkr = tk_fast_mono.base + (seq & 0x01);
++ 		now = ktime_to_ns(tkr->base_mono) + timekeeping_get_ns(tkr);
++ 
++ 	} while (read_seqcount_retry(&tk_fast_mono.seq, seq));
++ 	return now;
++ }
++ EXPORT_SYMBOL_GPL(ktime_get_mono_fast_ns);
++ 
++ #ifdef CONFIG_GENERIC_TIME_VSYSCALL_OLD
++ 
++ static inline void update_vsyscall(struct timekeeper *tk)
+++>>>>>>> 4396e058c52e (timekeeping: Provide fast and NMI safe access to CLOCK_MONOTONIC)
+  {
+ -	struct timespec xt;
+ +	cycle_t delta;
+  
+ -	xt = tk_xtime(tk);
+ -	update_vsyscall_old(&xt, &tk->wall_to_monotonic, tk->tkr.clock, tk->tkr.mult,
+ -			    tk->tkr.cycle_last);
+ -}
+ -
+ -static inline void old_vsyscall_fixup(struct timekeeper *tk)
+ -{
+ -	s64 remainder;
+ -
+ -	/*
+ -	* Store only full nanoseconds into xtime_nsec after rounding
+ -	* it up and add the remainder to the error difference.
+ -	* XXX - This is necessary to avoid small 1ns inconsistnecies caused
+ -	* by truncating the remainder in vsyscalls. However, it causes
+ -	* additional work to be done in timekeeping_adjust(). Once
+ -	* the vsyscall implementations are converted to use xtime_nsec
+ -	* (shifted nanoseconds), and CONFIG_GENERIC_TIME_VSYSCALL_OLD
+ -	* users are removed, this can be killed.
+ -	*/
+ -	remainder = tk->tkr.xtime_nsec & ((1ULL << tk->tkr.shift) - 1);
+ -	tk->tkr.xtime_nsec -= remainder;
+ -	tk->tkr.xtime_nsec += 1ULL << tk->tkr.shift;
+ -	tk->ntp_error += remainder << tk->ntp_error_shift;
+ -	tk->ntp_error -= (1ULL << tk->tkr.shift) << tk->ntp_error_shift;
+ +	/* calculate the delta since the last update_wall_time */
+ +	delta = clocksource_delta(cycles, tkr->clock->cycle_last,
+ +				  tkr->clock->mask);
+ +	return timekeeping_delta_to_ns(tkr, delta);
+  }
+ -#else
+ -#define old_vsyscall_fixup(tk)
+ -#endif
+  
+  static RAW_NOTIFIER_HEAD(pvclock_gtod_chain);
+  
+@@@ -305,11 -442,13 +433,18 @@@ static void timekeeping_update(struct t
+  	update_vsyscall(tk);
+  	update_pvclock_gtod(tk, action & TK_CLOCK_WAS_SET);
+  
+ -	tk_update_ktime_data(tk);
+ +	if (action & TK_CLOCK_WAS_SET)
+ +		tk->clock_was_set_seq++;
+  
+  	if (action & TK_MIRROR)
+++<<<<<<< HEAD
+ +		memcpy(&shadow_timekeeper, &timekeeper, sizeof(timekeeper));
+++=======
++ 		memcpy(&shadow_timekeeper, &tk_core.timekeeper,
++ 		       sizeof(tk_core.timekeeper));
++ 
++ 	update_fast_timekeeper(tk);
+++>>>>>>> 4396e058c52e (timekeeping: Provide fast and NMI safe access to CLOCK_MONOTONIC)
+  }
+  
+  /**
+diff --git a/include/linux/timekeeping.h b/include/linux/timekeeping.h
+index 7bc90f9753f2..61bcbab41e9c 100644
+--- a/include/linux/timekeeping.h
++++ b/include/linux/timekeeping.h
+@@ -193,6 +193,8 @@ extern int get_device_system_crosststamp(
+ 			struct system_time_snapshot *history,
+ 			struct system_device_crosststamp *xtstamp);
+ 
++extern u64 ktime_get_mono_fast_ns(void);
++
+ /*
+  * Simultaneously snapshot realtime and monotonic raw clocks
+  */
+* Unmerged path kernel/time/timekeeping.c
