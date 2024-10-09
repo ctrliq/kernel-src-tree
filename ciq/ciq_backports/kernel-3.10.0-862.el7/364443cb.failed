@@ -1,0 +1,208 @@
+ext4: convert DAX reads to iomap infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 364443cbcfe70f927b6a0dc0d410b4d4318bc1ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/364443cb.failed
+
+Implement basic iomap_begin function that handles reading and use it for
+DAX reads.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 364443cbcfe70f927b6a0dc0d410b4d4318bc1ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+#	fs/ext4/inode.c
+diff --cc fs/ext4/file.c
+index db1bf9992414,1f25c644cb12..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -663,10 -726,8 +699,15 @@@ loff_t ext4_llseek(struct file *file, l
+  
+  const struct file_operations ext4_file_operations = {
+  	.llseek		= ext4_llseek,
+++<<<<<<< HEAD
+ +	.read		= do_sync_read,
+ +	.write		= do_sync_write,
+ +	.aio_read	= generic_file_aio_read,
+ +	.aio_write	= ext4_file_write,
+++=======
++ 	.read_iter	= ext4_file_read_iter,
++ 	.write_iter	= ext4_file_write_iter,
+++>>>>>>> 364443cbcfe7 (ext4: convert DAX reads to iomap infrastructure)
+  	.unlocked_ioctl = ext4_ioctl,
+  #ifdef CONFIG_COMPAT
+  	.compat_ioctl	= ext4_compat_ioctl,
+diff --cc fs/ext4/inode.c
+index e633520ebfef,5e0526fed165..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -37,8 -36,8 +37,13 @@@
+  #include <linux/kernel.h>
+  #include <linux/printk.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+ +#include <linux/ratelimit.h>
+ +#include <linux/aio.h>
+++=======
++ #include <linux/bitops.h>
++ #include <linux/iomap.h>
+++>>>>>>> 364443cbcfe7 (ext4: convert DAX reads to iomap infrastructure)
+  
+  #include "ext4_jbd2.h"
+  #include "xattr.h"
+@@@ -3064,55 -3288,90 +3069,108 @@@ static int ext4_get_block_overwrite(str
+  int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+  		       struct buffer_head *bh_result, int create)
+  {
+ -	int ret;
+ +	int ret, err;
+ +	int credits;
+ +	struct ext4_map_blocks map;
+ +	handle_t *handle = NULL;
+ +	int retries = 0;
+ +	int flags = 0;
+  
+  	ext4_debug("inode %lu, create flag %d\n", inode->i_ino, create);
+ -	if (!create)
+ -		return _ext4_get_block(inode, iblock, bh_result, 0);
+ -
+ -	ret = ext4_get_block_trans(inode, iblock, bh_result,
+ -				   EXT4_GET_BLOCKS_PRE_IO |
+ -				   EXT4_GET_BLOCKS_CREATE_ZERO);
+ -	if (ret < 0)
+ -		return ret;
+ +	map.m_lblk = iblock;
+ +	map.m_len = bh_result->b_size >> inode->i_blkbits;
+ +	credits = ext4_chunk_trans_blocks(inode, map.m_len);
+ +retry:
+ +	if (create) {
+ +		flags |= EXT4_GET_BLOCKS_CREATE_ZERO;
+ +		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
+ +		if (IS_ERR(handle)) {
+ +			ret = PTR_ERR(handle);
+ +			return ret;
+ +		}
+ +	}
+  
+ -	if (buffer_unwritten(bh_result)) {
+ +	ret = ext4_map_blocks(handle, inode, &map, flags);
+ +	if (create) {
+ +		err = ext4_journal_stop(handle);
+ +		if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+ +			goto retry;
+ +		if (ret >= 0 && err < 0)
+ +			ret = err;
+ +	}
+ +	if (ret <= 0)
+ +		goto out;
+ +out:
+ +	WARN_ON_ONCE(ret == 0 && create);
+ +	if (ret > 0) {
+ +		map_bh(bh_result, inode->i_sb, map.m_pblk);
+  		/*
+ -		 * We are protected by i_mmap_sem or i_mutex so we know block
+ -		 * cannot go away from under us even though we dropped
+ -		 * i_data_sem. Convert extent to written and write zeros there.
+ +		 * At least for now we have to clear BH_New so that DAX code
+ +		 * doesn't attempt to zero blocks again in a racy way.
+  		 */
+ -		ret = ext4_get_block_trans(inode, iblock, bh_result,
+ -					   EXT4_GET_BLOCKS_CONVERT |
+ -					   EXT4_GET_BLOCKS_CREATE_ZERO);
+ -		if (ret < 0)
+ -			return ret;
+ +		map.m_flags &= ~EXT4_MAP_NEW;
+ +		ext4_update_bh_state(bh_result, map.m_flags);
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+ +		ret = 0;
+ +	} else if (ret == 0) {
+ +		/* hole case, need to fill in bh->b_size */
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+  	}
+ -	/*
+ -	 * At least for now we have to clear BH_New so that DAX code
+ -	 * doesn't attempt to zero blocks again in a racy way.
+ -	 */
+ -	clear_buffer_new(bh_result);
+ -	return 0;
+ +	return ret;
+  }
++ 
++ static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
++ 			    unsigned flags, struct iomap *iomap)
++ {
++ 	unsigned int blkbits = inode->i_blkbits;
++ 	unsigned long first_block = offset >> blkbits;
++ 	unsigned long last_block = (offset + length - 1) >> blkbits;
++ 	struct ext4_map_blocks map;
++ 	int ret;
++ 
++ 	if (flags & IOMAP_WRITE)
++ 		return -EIO;
++ 
++ 	if (WARN_ON_ONCE(ext4_has_inline_data(inode)))
++ 		return -ERANGE;
++ 
++ 	map.m_lblk = first_block;
++ 	map.m_len = last_block - first_block + 1;
++ 
++ 	ret = ext4_map_blocks(NULL, inode, &map, 0);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	iomap->flags = 0;
++ 	iomap->bdev = inode->i_sb->s_bdev;
++ 	iomap->offset = first_block << blkbits;
++ 
++ 	if (ret == 0) {
++ 		iomap->type = IOMAP_HOLE;
++ 		iomap->blkno = IOMAP_NULL_BLOCK;
++ 		iomap->length = (u64)map.m_len << blkbits;
++ 	} else {
++ 		if (map.m_flags & EXT4_MAP_MAPPED) {
++ 			iomap->type = IOMAP_MAPPED;
++ 		} else if (map.m_flags & EXT4_MAP_UNWRITTEN) {
++ 			iomap->type = IOMAP_UNWRITTEN;
++ 		} else {
++ 			WARN_ON_ONCE(1);
++ 			return -EIO;
++ 		}
++ 		iomap->blkno = (sector_t)map.m_pblk << (blkbits - 9);
++ 		iomap->length = (u64)map.m_len << blkbits;
++ 	}
++ 
++ 	if (map.m_flags & EXT4_MAP_NEW)
++ 		iomap->flags |= IOMAP_F_NEW;
++ 	return 0;
++ }
++ 
++ struct iomap_ops ext4_iomap_ops = {
++ 	.iomap_begin		= ext4_iomap_begin,
++ };
++ 
+  #else
+  /* Just define empty function, it will never get called. */
+  int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index beaca043ea50..afb40f114d35 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2918,6 +2918,8 @@ static inline bool ext4_aligned_io(struct inode *inode, loff_t off, loff_t len)
+ 	return IS_ALIGNED(off, blksize) && IS_ALIGNED(len, blksize);
+ }
+ 
++extern struct iomap_ops ext4_iomap_ops;
++
+ #endif	/* __KERNEL__ */
+ 
+ #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/inode.c
