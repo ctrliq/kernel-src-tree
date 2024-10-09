@@ -716,7 +716,7 @@ static void ceph_aio_complete_req(struct ceph_osd_request *req)
 		}
 	}
 
-	ceph_put_page_vector(osd_data->pages, num_pages, false);
+	ceph_put_page_vector(osd_data->pages, num_pages, !aio_req->write);
 	ceph_osdc_put_request(req);
 
 	if (rc < 0)
@@ -973,7 +973,7 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 				len = ret;
 		}
 
-		ceph_put_page_vector(pages, num_pages, false);
+		ceph_put_page_vector(pages, num_pages, !write);
 
 		ceph_osdc_put_request(req);
 		if (ret < 0)
