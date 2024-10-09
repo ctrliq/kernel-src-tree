@@ -1,0 +1,333 @@
+net/mlx5e: Add UDP GSO support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Add UDP GSO support (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 92.86%
+commit-author Boris Pismenny <borisp@mellanox.com>
+commit 689adf0d4892680f5998ea424e0ace560b492dc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/689adf0d.failed
+
+This patch enables UDP GSO support. We enable this by using two WQEs
+the first is a UDP LSO WQE for all segments with equal length, and the
+second is for the last segment in case it has different length.
+Due to HW limitation, before sending, we must adjust the packet length fields.
+
+We measure performance between two Intel(R) Xeon(R) CPU E5-2643 v2 @3.50GHz
+machines connected back-to-back with Connectx4-Lx (40Gbps) NICs.
+We compare single stream UDP, UDP GSO and UDP GSO with offload.
+Performance:
+		| MSS (bytes)	| Throughput (Gbps)	| CPU utilization (%)
+UDP GSO offload	| 1472		| 35.6			| 8%
+UDP GSO 	| 1472		| 25.5			| 17%
+UDP 		| 1472		| 10.2			| 17%
+UDP GSO offload	| 1024		| 35.6			| 8%
+UDP GSO		| 1024		| 19.2			| 17%
+UDP 		| 1024		| 5.7			| 17%
+UDP GSO offload	| 512		| 33.8			| 16%
+UDP GSO		| 512		| 10.4			| 17%
+UDP 		| 512		| 3.5			| 17%
+
+	Signed-off-by: Boris Pismenny <borisp@mellanox.com>
+	Signed-off-by: Yossi Kuperman <yossiku@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 689adf0d4892680f5998ea424e0ace560b492dc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+index 1d7bd82a1fb1,39a5d13ba459..000000000000
+--- a/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
++++ b/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+@@@ -28,35 -28,48 +28,77 @@@
+   * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+ - *
+   */
+  
+ -#ifndef __MLX5E_EN_ACCEL_H__
+ -#define __MLX5E_EN_ACCEL_H__
+ +/*
+ + * This file is conditionally built on PowerPC only.  Otherwise weak symbol
+ + * versions of the functions exported from here are used.
+ + */
+ +
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +#include "ipath_kernel.h"
+  
+ +/**
+ + * ipath_enable_wc - enable write combining for MMIO writes to the device
+ + * @dd: infinipath device
+ + *
+ + * Nothing to do on PowerPC, so just return without error.
+ + */
+ +int ipath_enable_wc(struct ipath_devdata *dd)
+ +{
+ +	return 0;
+ +}
+ +
+ +/**
+ + * ipath_unordered_wc - indicate whether write combining is unordered
+ + *
+ + * Because our performance depends on our ability to do write
+ + * combining mmio writes in the most efficient way, we need to
+ + * know if we are on a processor that may reorder stores when
+ + * write combining.
+ + */
+ +int ipath_unordered_wc(void)
+ +{
+ +	return 1;
+ +}
+++=======
++ #include <linux/skbuff.h>
++ #include <linux/netdevice.h>
++ #include "en_accel/ipsec_rxtx.h"
++ #include "en_accel/tls_rxtx.h"
++ #include "en_accel/rxtx.h"
++ #include "en.h"
++ 
++ static inline struct sk_buff *mlx5e_accel_handle_tx(struct sk_buff *skb,
++ 						    struct mlx5e_txqsq *sq,
++ 						    struct net_device *dev,
++ 						    struct mlx5e_tx_wqe **wqe,
++ 						    u16 *pi)
++ {
++ #ifdef CONFIG_MLX5_EN_TLS
++ 	if (test_bit(MLX5E_SQ_STATE_TLS, &sq->state)) {
++ 		skb = mlx5e_tls_handle_tx_skb(dev, sq, skb, wqe, pi);
++ 		if (unlikely(!skb))
++ 			return NULL;
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_MLX5_EN_IPSEC
++ 	if (test_bit(MLX5E_SQ_STATE_IPSEC, &sq->state)) {
++ 		skb = mlx5e_ipsec_handle_tx_skb(dev, *wqe, skb);
++ 		if (unlikely(!skb))
++ 			return NULL;
++ 	}
++ #endif
++ 
++ 	if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4) {
++ 		skb = mlx5e_udp_gso_handle_tx_skb(dev, sq, skb, wqe, pi);
++ 		if (unlikely(!skb))
++ 			return NULL;
++ 	}
++ 
++ 	return skb;
++ }
++ 
++ #endif /* __MLX5E_EN_ACCEL_H__ */
+++>>>>>>> 689adf0d4892 (net/mlx5e: Add UDP GSO support):drivers/net/ethernet/mellanox/mlx5/core/en_accel/en_accel.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 24a5d4209b80,d923f2f58608..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -13,8 -14,8 +13,13 @@@ mlx5_core-$(CONFIG_MLX5_FPGA) += fpga/c
+  		fpga/ipsec.o fpga/tls.o
+  
+  mlx5_core-$(CONFIG_MLX5_CORE_EN) += en_main.o en_common.o en_fs.o en_ethtool.o \
+++<<<<<<< HEAD
+ +		en_tx.o en_rx.o en_dim.o en_txrx.o en_stats.o vxlan.o \
+ +		en_arfs.o en_fs_ethtool.o en_selftest.o
+++=======
++ 		en_tx.o en_rx.o en_dim.o en_txrx.o en_accel/rxtx.o en_stats.o  \
++ 		vxlan.o en_arfs.o en_fs_ethtool.o en_selftest.o en/port.o
+++>>>>>>> 689adf0d4892 (net/mlx5e: Add UDP GSO support)
+  
+  mlx5_core-$(CONFIG_MLX5_MPFS) += lib/mpfs.o
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 31cc86df395a,f450d9ca31fb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -401,20 -439,17 +404,27 @@@ dma_unmap_wqe_err
+  netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(dev);
+ -	struct mlx5e_tx_wqe *wqe;
+ -	struct mlx5e_txqsq *sq;
+ -	u16 pi;
+ +	struct mlx5e_txqsq *sq = priv->txq2sq[skb_get_queue_mapping(skb)];
+ +	struct mlx5_wq_cyc *wq = &sq->wq;
+ +	u16 pi = sq->pc & wq->sz_m1;
+ +	struct mlx5e_tx_wqe *wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+  
+ -	sq = priv->txq2sq[skb_get_queue_mapping(skb)];
+ -	mlx5e_sq_fetch_wqe(sq, &wqe, &pi);
+ +	memset(wqe, 0, sizeof(*wqe));
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MLX5_EN_IPSEC
+ +	if (sq->state & BIT(MLX5E_SQ_STATE_IPSEC)) {
+ +		skb = mlx5e_ipsec_handle_tx_skb(dev, wqe, skb);
+ +		if (unlikely(!skb))
+ +			return NETDEV_TX_OK;
+ +	}
+ +#endif
+++=======
++ 	/* might send skbs and update wqe and pi */
++ 	skb = mlx5e_accel_handle_tx(skb, sq, dev, &wqe, &pi);
++ 	if (unlikely(!skb))
++ 		return NETDEV_TX_OK;
+++>>>>>>> 689adf0d4892 (net/mlx5e: Add UDP GSO support)
+  
+  	return mlx5e_sq_xmit(sq, skb, wqe, pi);
+  }
+* Unmerged path drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/rxtx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/rxtx.c
+new file mode 100644
+index 000000000000..4bb1f3b12b96
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/rxtx.c
+@@ -0,0 +1,108 @@
++#include "en_accel/rxtx.h"
++
++static void mlx5e_udp_gso_prepare_last_skb(struct sk_buff *skb,
++					   struct sk_buff *nskb,
++					   int remaining)
++{
++	int bytes_needed = remaining, remaining_headlen, remaining_page_offset;
++	int headlen = skb_transport_offset(skb) + sizeof(struct udphdr);
++	int payload_len = remaining + sizeof(struct udphdr);
++	int k = 0, i, j;
++
++	skb_copy_bits(skb, 0, nskb->data, headlen);
++	nskb->dev = skb->dev;
++	skb_reset_mac_header(nskb);
++	skb_set_network_header(nskb, skb_network_offset(skb));
++	skb_set_transport_header(nskb, skb_transport_offset(skb));
++	skb_set_tail_pointer(nskb, headlen);
++
++	/* How many frags do we need? */
++	for (i = skb_shinfo(skb)->nr_frags - 1; i >= 0; i--) {
++		bytes_needed -= skb_frag_size(&skb_shinfo(skb)->frags[i]);
++		k++;
++		if (bytes_needed <= 0)
++			break;
++	}
++
++	/* Fill the first frag and split it if necessary */
++	j = skb_shinfo(skb)->nr_frags - k;
++	remaining_page_offset = -bytes_needed;
++	skb_fill_page_desc(nskb, 0,
++			   skb_shinfo(skb)->frags[j].page.p,
++			   skb_shinfo(skb)->frags[j].page_offset + remaining_page_offset,
++			   skb_shinfo(skb)->frags[j].size - remaining_page_offset);
++
++	skb_frag_ref(skb, j);
++
++	/* Fill the rest of the frags */
++	for (i = 1; i < k; i++) {
++		j = skb_shinfo(skb)->nr_frags - k + i;
++
++		skb_fill_page_desc(nskb, i,
++				   skb_shinfo(skb)->frags[j].page.p,
++				   skb_shinfo(skb)->frags[j].page_offset,
++				   skb_shinfo(skb)->frags[j].size);
++		skb_frag_ref(skb, j);
++	}
++	skb_shinfo(nskb)->nr_frags = k;
++
++	remaining_headlen = remaining - skb->data_len;
++
++	/* headlen contains remaining data? */
++	if (remaining_headlen > 0)
++		skb_copy_bits(skb, skb->len - remaining, nskb->data + headlen,
++			      remaining_headlen);
++	nskb->len = remaining + headlen;
++	nskb->data_len =  payload_len - sizeof(struct udphdr) +
++		max_t(int, 0, remaining_headlen);
++	nskb->protocol = skb->protocol;
++	if (nskb->protocol == htons(ETH_P_IP)) {
++		ip_hdr(nskb)->id = htons(ntohs(ip_hdr(nskb)->id) +
++					 skb_shinfo(skb)->gso_segs);
++		ip_hdr(nskb)->tot_len =
++			htons(payload_len + sizeof(struct iphdr));
++	} else {
++		ipv6_hdr(nskb)->payload_len = htons(payload_len);
++	}
++	udp_hdr(nskb)->len = htons(payload_len);
++	skb_shinfo(nskb)->gso_size = 0;
++	nskb->ip_summed = skb->ip_summed;
++	nskb->csum_start = skb->csum_start;
++	nskb->csum_offset = skb->csum_offset;
++	nskb->queue_mapping = skb->queue_mapping;
++}
++
++/* might send skbs and update wqe and pi */
++struct sk_buff *mlx5e_udp_gso_handle_tx_skb(struct net_device *netdev,
++					    struct mlx5e_txqsq *sq,
++					    struct sk_buff *skb,
++					    struct mlx5e_tx_wqe **wqe,
++					    u16 *pi)
++{
++	int payload_len = skb_shinfo(skb)->gso_size + sizeof(struct udphdr);
++	int headlen = skb_transport_offset(skb) + sizeof(struct udphdr);
++	int remaining = (skb->len - headlen) % skb_shinfo(skb)->gso_size;
++	struct sk_buff *nskb;
++
++	if (skb->protocol == htons(ETH_P_IP))
++		ip_hdr(skb)->tot_len = htons(payload_len + sizeof(struct iphdr));
++	else
++		ipv6_hdr(skb)->payload_len = htons(payload_len);
++	udp_hdr(skb)->len = htons(payload_len);
++	if (!remaining)
++		return skb;
++
++	nskb = alloc_skb(max_t(int, headlen, headlen + remaining - skb->data_len), GFP_ATOMIC);
++	if (unlikely(!nskb)) {
++		sq->stats->dropped++;
++		return NULL;
++	}
++
++	mlx5e_udp_gso_prepare_last_skb(skb, nskb, remaining);
++
++	skb_shinfo(skb)->gso_segs--;
++	pskb_trim(skb, skb->len - remaining);
++	mlx5e_sq_xmit(sq, skb, *wqe, *pi);
++	mlx5e_sq_fetch_wqe(sq, wqe, pi);
++	return nskb;
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/rxtx.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/rxtx.h
+new file mode 100644
+index 000000000000..ed42699a78b3
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/rxtx.h
+@@ -0,0 +1,14 @@
++
++#ifndef __MLX5E_EN_ACCEL_RX_TX_H__
++#define __MLX5E_EN_ACCEL_RX_TX_H__
++
++#include <linux/skbuff.h>
++#include "en.h"
++
++struct sk_buff *mlx5e_udp_gso_handle_tx_skb(struct net_device *netdev,
++					    struct mlx5e_txqsq *sq,
++					    struct sk_buff *skb,
++					    struct mlx5e_tx_wqe **wqe,
++					    u16 *pi);
++
++#endif
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a0bfa9c3ce47..b59c90147533 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -4246,6 +4246,9 @@ static void mlx5e_build_nic_netdev(struct net_device *netdev)
+ 	netdev->features         |= NETIF_F_HIGHDMA;
+ 	netdev->features         |= NETIF_F_HW_VLAN_STAG_FILTER;
+ 
++	netdev->features         |= NETIF_F_GSO_UDP_L4;
++	netdev->hw_features      |= NETIF_F_GSO_UDP_L4;
++
+ 	netdev->priv_flags       |= IFF_UNICAST_FLT;
+ 
+ 	mlx5e_set_netdev_dev_addr(netdev);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
