@@ -1,0 +1,148 @@
+iommu/amd: Implement timeout to flush unmap queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Implement timeout to flush unmap queues (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 93.62%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit bb279475db4d0bb07e4dbc99e060362b9f3b5093
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bb279475.failed
+
+In case the queue doesn't fill up, we flush the TLB at least
+10ms after the unmap happened to make sure that the TLB is
+cleaned up.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit bb279475db4d0bb07e4dbc99e060362b9f3b5093)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 3c777dd3adaa,c0b2f4fc6bfc..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -72,6 -89,25 +72,28 @@@ LIST_HEAD(ioapic_map)
+  LIST_HEAD(hpet_map);
+  LIST_HEAD(acpihid_map);
+  
+++<<<<<<< HEAD
+++=======
++ #define FLUSH_QUEUE_SIZE 256
++ 
++ struct flush_queue_entry {
++ 	unsigned long iova_pfn;
++ 	unsigned long pages;
++ 	struct dma_ops_domain *dma_dom;
++ };
++ 
++ struct flush_queue {
++ 	spinlock_t lock;
++ 	unsigned next;
++ 	struct flush_queue_entry *entries;
++ };
++ 
++ DEFINE_PER_CPU(struct flush_queue, flush_queue);
++ 
++ static atomic_t queue_timer_on;
++ static struct timer_list queue_timer;
++ 
+++>>>>>>> bb279475db4d (iommu/amd: Implement timeout to flush unmap queues)
+  /*
+   * Domain for untranslated devices - only allocated
+   * if iommu=pt passed on kernel cmd line.
+@@@ -2408,6 -2123,88 +2430,91 @@@ static struct iommu_group *amd_iommu_de
+   *
+   *****************************************************************************/
+  
+++<<<<<<< HEAD
+++=======
++ static void __queue_flush(struct flush_queue *queue)
++ {
++ 	struct protection_domain *domain;
++ 	unsigned long flags;
++ 	int idx;
++ 
++ 	/* First flush TLB of all known domains */
++ 	spin_lock_irqsave(&amd_iommu_pd_lock, flags);
++ 	list_for_each_entry(domain, &amd_iommu_pd_list, list)
++ 		domain_flush_tlb(domain);
++ 	spin_unlock_irqrestore(&amd_iommu_pd_lock, flags);
++ 
++ 	/* Wait until flushes have completed */
++ 	domain_flush_complete(NULL);
++ 
++ 	for (idx = 0; idx < queue->next; ++idx) {
++ 		struct flush_queue_entry *entry;
++ 
++ 		entry = queue->entries + idx;
++ 
++ 		free_iova_fast(&entry->dma_dom->iovad,
++ 				entry->iova_pfn,
++ 				entry->pages);
++ 
++ 		/* Not really necessary, just to make sure we catch any bugs */
++ 		entry->dma_dom = NULL;
++ 	}
++ 
++ 	queue->next = 0;
++ }
++ 
++ void queue_flush_timeout(unsigned long unsused)
++ {
++ 	int cpu;
++ 
++ 	atomic_set(&queue_timer_on, 0);
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 		unsigned long flags;
++ 
++ 		queue = per_cpu_ptr(&flush_queue, cpu);
++ 		spin_lock_irqsave(&queue->lock, flags);
++ 		if (queue->next > 0)
++ 			__queue_flush(queue);
++ 		spin_unlock_irqrestore(&queue->lock, flags);
++ 	}
++ }
++ 
++ static void queue_add(struct dma_ops_domain *dma_dom,
++ 		      unsigned long address, unsigned long pages)
++ {
++ 	struct flush_queue_entry *entry;
++ 	struct flush_queue *queue;
++ 	unsigned long flags;
++ 	int idx;
++ 
++ 	pages     = __roundup_pow_of_two(pages);
++ 	address >>= PAGE_SHIFT;
++ 
++ 	queue = get_cpu_ptr(&flush_queue);
++ 	spin_lock_irqsave(&queue->lock, flags);
++ 
++ 	if (queue->next == FLUSH_QUEUE_SIZE)
++ 		__queue_flush(queue);
++ 
++ 	idx   = queue->next++;
++ 	entry = queue->entries + idx;
++ 
++ 	entry->iova_pfn = address;
++ 	entry->pages    = pages;
++ 	entry->dma_dom  = dma_dom;
++ 
++ 	spin_unlock_irqrestore(&queue->lock, flags);
++ 
++ 	if (atomic_cmpxchg(&queue_timer_on, 0, 1) == 0)
++ 		mod_timer(&queue_timer, jiffies + msecs_to_jiffies(10));
++ 
++ 	put_cpu_ptr(&flush_queue);
++ }
++ 
++ 
+++>>>>>>> bb279475db4d (iommu/amd: Implement timeout to flush unmap queues)
+  /*
+   * In the dma_ops path we only have the struct device. This function
+   * finds the corresponding IOMMU, the protection domain and the
+* Unmerged path drivers/iommu/amd_iommu.c
