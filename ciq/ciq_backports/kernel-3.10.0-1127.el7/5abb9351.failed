@@ -1,0 +1,354 @@
+s390/uv: introduce guest side ultravisor code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Vasily Gorbik <gor@linux.ibm.com>
+commit 5abb9351dfd937d43193f4d09af9c72bfe2c4180
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5abb9351.failed
+
+The Ultravisor Call Facility (stfle bit 158) defines an API to the
+Ultravisor (UV calls), a mini hypervisor located at machine
+level. With help of the Ultravisor, KVM will be able to run
+"protected" VMs, special VMs whose memory and management data are
+unavailable to KVM.
+
+The protected VMs can also request services from the Ultravisor.
+The guest api consists of UV calls to share and unshare memory with the
+kvm hypervisor.
+
+To enable this feature support PROTECTED_VIRTUALIZATION_GUEST kconfig
+option has been introduced.
+
+Co-developed-by: Janosch Frank <frankja@de.ibm.com>
+	Signed-off-by: Janosch Frank <frankja@de.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 5abb9351dfd937d43193f4d09af9c72bfe2c4180)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/boot/Makefile
+#	arch/s390/boot/startup.c
+#	arch/s390/kernel/setup.c
+diff --cc arch/s390/boot/Makefile
+index 9a42ecec5647,a5ae68b2aa84..000000000000
+--- a/arch/s390/boot/Makefile
++++ b/arch/s390/boot/Makefile
+@@@ -2,25 -3,64 +2,52 @@@
+  # Makefile for the linux s390-specific parts of the memory manager.
+  #
+  
+ -KCOV_INSTRUMENT := n
+ -GCOV_PROFILE := n
+ -UBSAN_SANITIZE := n
+ -KASAN_SANITIZE := n
+ +COMPILE_VERSION := __linux_compile_version_id__`hostname |  \
+ +			tr -c '[0-9A-Za-z]' '_'`__`date | \
+ +			tr -c '[0-9A-Za-z]' '_'`_t
+  
+ -KBUILD_AFLAGS := $(KBUILD_AFLAGS_DECOMPRESSOR)
+ -KBUILD_CFLAGS := $(KBUILD_CFLAGS_DECOMPRESSOR)
+ +ccflags-y  := -DCOMPILE_VERSION=$(COMPILE_VERSION) -gstabs -I.
+  
+ -#
+ -# Use -march=z900 for als.c to be able to print an error
+ -# message if the kernel is started on a machine which is too old
+ -#
+ -ifneq ($(CC_FLAGS_MARCH),-march=z900)
+ -AFLAGS_REMOVE_head.o		+= $(CC_FLAGS_MARCH)
+ -AFLAGS_head.o			+= -march=z900
+ -AFLAGS_REMOVE_mem.o		+= $(CC_FLAGS_MARCH)
+ -AFLAGS_mem.o			+= -march=z900
+ -CFLAGS_REMOVE_als.o		+= $(CC_FLAGS_MARCH)
+ -CFLAGS_als.o			+= -march=z900
+ -CFLAGS_REMOVE_sclp_early_core.o	+= $(CC_FLAGS_MARCH)
+ -CFLAGS_sclp_early_core.o	+= -march=z900
+ -endif
+ +targets := image
+ +targets += bzImage
+ +subdir- := compressed
+  
+++<<<<<<< HEAD
+ +$(obj)/image: vmlinux FORCE
+++=======
++ CFLAGS_sclp_early_core.o += -I$(srctree)/drivers/s390/char
++ 
++ obj-y	:= head.o als.o startup.o mem_detect.o ipl_parm.o string.o ebcdic.o
++ obj-y	+= sclp_early_core.o mem.o ipl_vmparm.o cmdline.o ctype.o
++ obj-$(CONFIG_PROTECTED_VIRTUALIZATION_GUEST)	+= uv.o
++ targets	:= bzImage startup.a section_cmp.boot.data section_cmp.boot.preserved.data $(obj-y)
++ subdir-	:= compressed
++ 
++ OBJECTS := $(addprefix $(obj)/,$(obj-y))
++ 
++ quiet_cmd_section_cmp = SECTCMP $*
++ define cmd_section_cmp
++ 	s1=`$(OBJDUMP) -t -j "$*" "$<" | sort | \
++ 		sed -n "/0000000000000000/! s/.*\s$*\s\+//p" | sha256sum`; \
++ 	s2=`$(OBJDUMP) -t -j "$*" "$(word 2,$^)" | sort | \
++ 		sed -n "/0000000000000000/! s/.*\s$*\s\+//p" | sha256sum`; \
++ 	if [ "$$s1" != "$$s2" ]; then \
++ 		echo "error: section $* differs between $< and $(word 2,$^)" >&2; \
++ 		exit 1; \
++ 	fi; \
++ 	touch $@
++ endef
++ 
++ $(obj)/bzImage: $(obj)/compressed/vmlinux $(obj)/section_cmp.boot.data $(obj)/section_cmp.boot.preserved.data FORCE
+++>>>>>>> 5abb9351dfd9 (s390/uv: introduce guest side ultravisor code)
+  	$(call if_changed,objcopy)
+  
+ -$(obj)/section_cmp%: vmlinux $(obj)/compressed/vmlinux FORCE
+ -	$(call if_changed,section_cmp)
+ +$(obj)/bzImage: $(obj)/compressed/vmlinux FORCE
+ +	$(call if_changed,objcopy)
+  
+ -$(obj)/compressed/vmlinux: $(obj)/startup.a FORCE
+ +$(obj)/compressed/vmlinux: FORCE
+  	$(Q)$(MAKE) $(build)=$(obj)/compressed $@
+  
+ -$(obj)/startup.a: $(OBJECTS) FORCE
+ -	$(call if_changed,ar)
+ -
+  install: $(CONFIGURE) $(obj)/bzImage
+  	sh -x  $(srctree)/$(obj)/install.sh $(KERNELRELEASE) $(obj)/bzImage \
+  	      System.map "$(INSTALL_PATH)"
+diff --cc arch/s390/kernel/setup.c
+index 4f2bc9c92d24,70197a68e6fa..000000000000
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@@ -61,8 -65,12 +61,13 @@@
+  #include <asm/diag.h>
+  #include <asm/os_info.h>
+  #include <asm/sclp.h>
+ -#include <asm/sysinfo.h>
+ -#include <asm/numa.h>
+  #include <asm/alternative.h>
+  #include <asm/nospec-branch.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/mem_detect.h>
++ #include <asm/uv.h>
+++>>>>>>> 5abb9351dfd9 (s390/uv: introduce guest side ultravisor code)
+  #include "entry.h"
+  
+  /*
+@@@ -81,10 -89,16 +86,22 @@@ unsigned long elf_hwcap = 0
+  char elf_platform[ELF_PLATFORM_SIZE];
+  
+  unsigned long int_hwcap = 0;
+ +struct mem_chunk __initdata memory_chunk[MEMORY_CHUNKS];
+  
+++<<<<<<< HEAD
+ +int __initdata memory_end_set;
+ +unsigned long __initdata memory_end;
+++=======
++ #ifdef CONFIG_PROTECTED_VIRTUALIZATION_GUEST
++ int __bootdata_preserved(prot_virt_guest);
++ #endif
++ 
++ int __bootdata(noexec_disabled);
++ int __bootdata(memory_end_set);
++ unsigned long __bootdata(memory_end);
++ unsigned long __bootdata(max_physmem_end);
++ struct mem_detect_info __bootdata(mem_detect);
+++>>>>>>> 5abb9351dfd9 (s390/uv: introduce guest side ultravisor code)
+  
+  unsigned long VMALLOC_START;
+  EXPORT_SYMBOL(VMALLOC_START);
+* Unmerged path arch/s390/boot/startup.c
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index ebaf45ac4e5d..62b275c5b2c6 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -757,6 +757,17 @@ source "lib/Kconfig"
+ 
+ menu "Virtualization"
+ 
++config PROTECTED_VIRTUALIZATION_GUEST
++	def_bool n
++	prompt "Protected virtualization guest support"
++	help
++	  Select this option, if you want to be able to run this
++	  kernel as a protected virtualization KVM guest.
++	  Protected virtualization capable machines have a mini hypervisor
++	  located at machine level (an ultravisor). With help of the
++	  Ultravisor, KVM will be able to run "protected" VMs, special
++	  VMs whose memory and management data are unavailable to KVM.
++
+ config PFAULT
+ 	def_bool y
+ 	prompt "Pseudo page fault support"
+* Unmerged path arch/s390/boot/Makefile
+* Unmerged path arch/s390/boot/startup.c
+diff --git a/arch/s390/boot/uv.c b/arch/s390/boot/uv.c
+new file mode 100644
+index 000000000000..ed007f4a6444
+--- /dev/null
++++ b/arch/s390/boot/uv.c
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <asm/uv.h>
++#include <asm/facility.h>
++#include <asm/sections.h>
++
++int __bootdata_preserved(prot_virt_guest);
++
++void uv_query_info(void)
++{
++	struct uv_cb_qui uvcb = {
++		.header.cmd = UVC_CMD_QUI,
++		.header.len = sizeof(uvcb)
++	};
++
++	if (!test_facility(158))
++		return;
++
++	if (uv_call(0, (uint64_t)&uvcb))
++		return;
++
++	if (test_bit_inv(BIT_UVC_CMD_SET_SHARED_ACCESS, (unsigned long *)uvcb.inst_calls_list) &&
++	    test_bit_inv(BIT_UVC_CMD_REMOVE_SHARED_ACCESS, (unsigned long *)uvcb.inst_calls_list))
++		prot_virt_guest = 1;
++}
+diff --git a/arch/s390/include/asm/uv.h b/arch/s390/include/asm/uv.h
+new file mode 100644
+index 000000000000..ef3c00b049ab
+--- /dev/null
++++ b/arch/s390/include/asm/uv.h
+@@ -0,0 +1,132 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Ultravisor Interfaces
++ *
++ * Copyright IBM Corp. 2019
++ *
++ * Author(s):
++ *	Vasily Gorbik <gor@linux.ibm.com>
++ *	Janosch Frank <frankja@linux.ibm.com>
++ */
++#ifndef _ASM_S390_UV_H
++#define _ASM_S390_UV_H
++
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/bug.h>
++#include <asm/page.h>
++
++#define UVC_RC_EXECUTED		0x0001
++#define UVC_RC_INV_CMD		0x0002
++#define UVC_RC_INV_STATE	0x0003
++#define UVC_RC_INV_LEN		0x0005
++#define UVC_RC_NO_RESUME	0x0007
++
++#define UVC_CMD_QUI			0x0001
++#define UVC_CMD_SET_SHARED_ACCESS	0x1000
++#define UVC_CMD_REMOVE_SHARED_ACCESS	0x1001
++
++/* Bits in installed uv calls */
++enum uv_cmds_inst {
++	BIT_UVC_CMD_QUI = 0,
++	BIT_UVC_CMD_SET_SHARED_ACCESS = 8,
++	BIT_UVC_CMD_REMOVE_SHARED_ACCESS = 9,
++};
++
++struct uv_cb_header {
++	u16 len;
++	u16 cmd;	/* Command Code */
++	u16 rc;		/* Response Code */
++	u16 rrc;	/* Return Reason Code */
++} __packed __aligned(8);
++
++struct uv_cb_qui {
++	struct uv_cb_header header;
++	u64 reserved08;
++	u64 inst_calls_list[4];
++	u64 reserved30[15];
++} __packed __aligned(8);
++
++struct uv_cb_share {
++	struct uv_cb_header header;
++	u64 reserved08[3];
++	u64 paddr;
++	u64 reserved28;
++} __packed __aligned(8);
++
++static inline int uv_call(unsigned long r1, unsigned long r2)
++{
++	int cc;
++
++	asm volatile(
++		"0:	.insn rrf,0xB9A40000,%[r1],%[r2],0,0\n"
++		"		brc	3,0b\n"
++		"		ipm	%[cc]\n"
++		"		srl	%[cc],28\n"
++		: [cc] "=d" (cc)
++		: [r1] "a" (r1), [r2] "a" (r2)
++		: "memory", "cc");
++	return cc;
++}
++
++#ifdef CONFIG_PROTECTED_VIRTUALIZATION_GUEST
++extern int prot_virt_guest;
++
++static inline int is_prot_virt_guest(void)
++{
++	return prot_virt_guest;
++}
++
++static inline int share(unsigned long addr, u16 cmd)
++{
++	struct uv_cb_share uvcb = {
++		.header.cmd = cmd,
++		.header.len = sizeof(uvcb),
++		.paddr = addr
++	};
++
++	if (!is_prot_virt_guest())
++		return -ENOTSUPP;
++	/*
++	 * Sharing is page wise, if we encounter addresses that are
++	 * not page aligned, we assume something went wrong. If
++	 * malloced structs are passed to this function, we could leak
++	 * data to the hypervisor.
++	 */
++	BUG_ON(addr & ~PAGE_MASK);
++
++	if (!uv_call(0, (u64)&uvcb))
++		return 0;
++	return -EINVAL;
++}
++
++/*
++ * Guest 2 request to the Ultravisor to make a page shared with the
++ * hypervisor for IO.
++ *
++ * @addr: Real or absolute address of the page to be shared
++ */
++static inline int uv_set_shared(unsigned long addr)
++{
++	return share(addr, UVC_CMD_SET_SHARED_ACCESS);
++}
++
++/*
++ * Guest 2 request to the Ultravisor to make a page unshared.
++ *
++ * @addr: Real or absolute address of the page to be unshared
++ */
++static inline int uv_remove_shared(unsigned long addr)
++{
++	return share(addr, UVC_CMD_REMOVE_SHARED_ACCESS);
++}
++
++void uv_query_info(void);
++#else
++#define is_prot_virt_guest() 0
++static inline int uv_set_shared(unsigned long addr) { return 0; }
++static inline int uv_remove_shared(unsigned long addr) { return 0; }
++static inline void uv_query_info(void) {}
++#endif
++
++#endif /* _ASM_S390_UV_H */
+* Unmerged path arch/s390/kernel/setup.c
