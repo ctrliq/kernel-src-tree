@@ -1,0 +1,273 @@
+RDS: TCP: Track peer's connection generation number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit 905dd4184e0732de41d6ee3c7b06e0cfdd9f0aad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/905dd418.failed
+
+The RDS transport has to be able to distinguish between
+two types of failure events:
+(a) when the transport fails (e.g., TCP connection reset)
+    but the RDS socket/connection layer on both sides stays
+    the same
+(b) when the peer's RDS layer itself resets (e.g., due to module
+    reload or machine reboot at the peer)
+In case (a) both sides must reconnect and continue the RDS messaging
+without any message loss or disruption to the message sequence numbers,
+and this is achieved by rds_send_path_reset().
+
+In case (b) we should reset all rds_connection state to the
+new incarnation of the peer. Examples of state that needs to
+be reset are next expected rx sequence number from, or messages to be
+retransmitted to, the new incarnation of the peer.
+
+To achieve this, the RDS handshake probe added as part of
+commit 5916e2c1554f ("RDS: TCP: Enable multipath RDS for TCP")
+is enhanced so that sender and receiver of the RDS ping-probe
+will add a generation number as part of the RDS_EXTHDR_GEN_NUM
+extension header. Each peer stores local and remote generation
+numbers as part of each rds_connection. Changes in generation
+number will be detected via incoming handshake probe ping
+request or response and will allow the receiver to reset rds_connection
+state.
+
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 905dd4184e0732de41d6ee3c7b06e0cfdd9f0aad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/message.c
+#	net/rds/rds.h
+#	net/rds/recv.c
+#	net/rds/send.c
+diff --cc net/rds/message.c
+index aba232f9f308,49bfb512d808..000000000000
+--- a/net/rds/message.c
++++ b/net/rds/message.c
+@@@ -41,6 -41,8 +41,11 @@@ static unsigned int	rds_exthdr_size[__R
+  [RDS_EXTHDR_VERSION]	= sizeof(struct rds_ext_header_version),
+  [RDS_EXTHDR_RDMA]	= sizeof(struct rds_ext_header_rdma),
+  [RDS_EXTHDR_RDMA_DEST]	= sizeof(struct rds_ext_header_rdma_dest),
+++<<<<<<< HEAD
+++=======
++ [RDS_EXTHDR_NPATHS]	= sizeof(u16),
++ [RDS_EXTHDR_GEN_NUM]	= sizeof(u32),
+++>>>>>>> 905dd4184e07 (RDS: TCP: Track peer's connection generation number)
+  };
+  
+  
+diff --cc net/rds/rds.h
+index b0f62d150ae6,ebbf909b87ec..000000000000
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@@ -128,12 -149,11 +128,20 @@@ struct rds_connection 
+  	struct list_head	c_map_item;
+  	unsigned long		c_map_queued;
+  
+++<<<<<<< HEAD
+ +	unsigned int		c_unacked_packets;
+ +	unsigned int		c_unacked_bytes;
+ +
+ +	/* Protocol version */
+ +	unsigned int		c_version;
+ +	possible_net_t		c_net;
+++=======
++ 	struct rds_conn_path	c_path[RDS_MPATH_WORKERS];
++ 	wait_queue_head_t	c_hs_waitq; /* handshake waitq */
++ 
++ 	u32			c_my_gen_num;
++ 	u32			c_peer_gen_num;
+++>>>>>>> 905dd4184e07 (RDS: TCP: Track peer's connection generation number)
+  };
+  
+  static inline
+@@@ -212,6 -243,12 +220,15 @@@ struct rds_ext_header_rdma_dest 
+  	__be32			h_rdma_offset;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Extension header announcing number of paths.
++  * Implicit length = 2 bytes.
++  */
++ #define RDS_EXTHDR_NPATHS	5
++ #define RDS_EXTHDR_GEN_NUM	6
++ 
+++>>>>>>> 905dd4184e07 (RDS: TCP: Track peer's connection generation number)
+  #define __RDS_EXTHDR_MAX	16 /* for now */
+  
+  struct rds_incoming {
+diff --cc net/rds/recv.c
+index aa7e3b20218b,9d0666e5fe35..000000000000
+--- a/net/rds/recv.c
++++ b/net/rds/recv.c
+@@@ -156,6 -186,73 +186,76 @@@ static void rds_recv_incoming_exthdrs(s
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void rds_recv_hs_exthdrs(struct rds_header *hdr,
++ 				struct rds_connection *conn)
++ {
++ 	unsigned int pos = 0, type, len;
++ 	union {
++ 		struct rds_ext_header_version version;
++ 		u16 rds_npaths;
++ 		u32 rds_gen_num;
++ 	} buffer;
++ 	u32 new_peer_gen_num = 0;
++ 
++ 	while (1) {
++ 		len = sizeof(buffer);
++ 		type = rds_message_next_extension(hdr, &pos, &buffer, &len);
++ 		if (type == RDS_EXTHDR_NONE)
++ 			break;
++ 		/* Process extension header here */
++ 		switch (type) {
++ 		case RDS_EXTHDR_NPATHS:
++ 			conn->c_npaths = min_t(int, RDS_MPATH_WORKERS,
++ 					       buffer.rds_npaths);
++ 			break;
++ 		case RDS_EXTHDR_GEN_NUM:
++ 			new_peer_gen_num = buffer.rds_gen_num;
++ 			break;
++ 		default:
++ 			pr_warn_ratelimited("ignoring unknown exthdr type "
++ 					     "0x%x\n", type);
++ 		}
++ 	}
++ 	/* if RDS_EXTHDR_NPATHS was not found, default to a single-path */
++ 	conn->c_npaths = max_t(int, conn->c_npaths, 1);
++ 	rds_conn_peer_gen_update(conn, new_peer_gen_num);
++ }
++ 
++ /* rds_start_mprds() will synchronously start multiple paths when appropriate.
++  * The scheme is based on the following rules:
++  *
++  * 1. rds_sendmsg on first connect attempt sends the probe ping, with the
++  *    sender's npaths (s_npaths)
++  * 2. rcvr of probe-ping knows the mprds_paths = min(s_npaths, r_npaths). It
++  *    sends back a probe-pong with r_npaths. After that, if rcvr is the
++  *    smaller ip addr, it starts rds_conn_path_connect_if_down on all
++  *    mprds_paths.
++  * 3. sender gets woken up, and can move to rds_conn_path_connect_if_down.
++  *    If it is the smaller ipaddr, rds_conn_path_connect_if_down can be
++  *    called after reception of the probe-pong on all mprds_paths.
++  *    Otherwise (sender of probe-ping is not the smaller ip addr): just call
++  *    rds_conn_path_connect_if_down on the hashed path. (see rule 4)
++  * 4. when cp_index > 0, rds_connect_worker must only trigger
++  *    a connection if laddr < faddr.
++  * 5. sender may end up queuing the packet on the cp. will get sent out later.
++  *    when connection is completed.
++  */
++ static void rds_start_mprds(struct rds_connection *conn)
++ {
++ 	int i;
++ 	struct rds_conn_path *cp;
++ 
++ 	if (conn->c_npaths > 1 && conn->c_laddr < conn->c_faddr) {
++ 		for (i = 1; i < conn->c_npaths; i++) {
++ 			cp = &conn->c_path[i];
++ 			rds_conn_path_connect_if_down(cp);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 905dd4184e07 (RDS: TCP: Track peer's connection generation number)
+  /*
+   * The transport must make sure that this is serialized against other
+   * rx and conn reset on this specific conn.
+diff --cc net/rds/send.c
+index 283757171fc5,77c8c6e613ad..000000000000
+--- a/net/rds/send.c
++++ b/net/rds/send.c
+@@@ -260,12 -259,13 +260,19 @@@ restart
+  			 * connection.
+  			 * Therefore, we never retransmit messages with RDMA ops.
+  			 */
+++<<<<<<< HEAD
+ +			if (rm->rdma.op_active &&
+ +			    test_bit(RDS_MSG_RETRANSMITTED, &rm->m_flags)) {
+ +				spin_lock_irqsave(&conn->c_lock, flags);
+++=======
++ 			if (test_bit(RDS_MSG_FLUSH, &rm->m_flags) ||
++ 			    (rm->rdma.op_active &&
++ 			    test_bit(RDS_MSG_RETRANSMITTED, &rm->m_flags))) {
++ 				spin_lock_irqsave(&cp->cp_lock, flags);
+++>>>>>>> 905dd4184e07 (RDS: TCP: Track peer's connection generation number)
+  				if (test_and_clear_bit(RDS_MSG_ON_CONN, &rm->m_flags))
+  					list_move(&rm->m_conn_item, &to_be_dropped);
+ -				spin_unlock_irqrestore(&cp->cp_lock, flags);
+ +				spin_unlock_irqrestore(&conn->c_lock, flags);
+  				continue;
+  			}
+  
+@@@ -1165,9 -1199,22 +1172,24 @@@ rds_send_pong(struct rds_conn_path *cp
+  	rm->m_inc.i_conn = cp->cp_conn;
+  	rm->m_inc.i_conn_path = cp;
+  
+ -	rds_message_populate_header(&rm->m_inc.i_hdr, sport, dport,
+ +	rds_message_populate_header(&rm->m_inc.i_hdr, 0, dport,
+  				    cp->cp_next_tx_seq);
+ -	rm->m_inc.i_hdr.h_flags |= h_flags;
+  	cp->cp_next_tx_seq++;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (RDS_HS_PROBE(sport, dport) && cp->cp_conn->c_trans->t_mp_capable) {
++ 		u16 npaths = RDS_MPATH_WORKERS;
++ 
++ 		rds_message_add_extension(&rm->m_inc.i_hdr,
++ 					  RDS_EXTHDR_NPATHS, &npaths,
++ 					  sizeof(npaths));
++ 		rds_message_add_extension(&rm->m_inc.i_hdr,
++ 					  RDS_EXTHDR_GEN_NUM,
++ 					  &cp->cp_conn->c_my_gen_num,
++ 					  sizeof(u32));
++ 	}
+++>>>>>>> 905dd4184e07 (RDS: TCP: Track peer's connection generation number)
+  	spin_unlock_irqrestore(&cp->cp_lock, flags);
+  
+  	rds_stats_inc(s_send_queued);
+diff --git a/net/rds/af_rds.c b/net/rds/af_rds.c
+index a38c9c82a48c..13ce9895f1e5 100644
+--- a/net/rds/af_rds.c
++++ b/net/rds/af_rds.c
+@@ -605,10 +605,14 @@ static void rds_exit(void)
+ }
+ module_exit(rds_exit);
+ 
++u32 rds_gen_num;
++
+ static int rds_init(void)
+ {
+ 	int ret;
+ 
++	net_get_random_once(&rds_gen_num, sizeof(rds_gen_num));
++
+ 	ret = rds_bind_lock_init();
+ 	if (ret)
+ 		goto out;
+diff --git a/net/rds/connection.c b/net/rds/connection.c
+index c790f83d093b..f21206c2edcc 100644
+--- a/net/rds/connection.c
++++ b/net/rds/connection.c
+@@ -244,6 +244,8 @@ new_conn:
+ 			kmem_cache_free(rds_conn_slab, conn);
+ 			conn = found;
+ 		} else {
++			conn->c_my_gen_num = rds_gen_num;
++			conn->c_peer_gen_num = 0;
+ 			hlist_add_head_rcu(&conn->c_hash_node, head);
+ 			rds_cong_add_conn(conn);
+ 			rds_conn_count++;
+* Unmerged path net/rds/message.c
+* Unmerged path net/rds/rds.h
+* Unmerged path net/rds/recv.c
+* Unmerged path net/rds/send.c
