@@ -1,0 +1,246 @@
+target: Convert demo-mode only drivers to target_alloc_session
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Convert demo-mode only drivers to target_alloc_session (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.10%
+commit-author Christoph Hellwig <hch@lst.de>
+commit fb444abe61f5a943a41870d71eab8c4402bd46ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fb444abe.failed
+
+This patch converts existing loopback, usb-gadget, and
+xen-scsiback demo-mode only fabric drivers to use the
+new target_alloc_session API caller.
+
+This includes adding a new alloc_session callback for
+fabric driver internal nexus pointer assignments.
+
+(Fixes for early for-next nexus breakage - Dan Carpenter)
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Acked-by: Juergen Gross <jgross@suse.com>
+	Tested-by: Andrzej Pietrasiewicz <andrzej.p@samsung.com>
+	Tested-by: Chris Boot <bootc@bootc.net>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit fb444abe61f5a943a41870d71eab8c4402bd46ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/gadget/tcm_usb_gadget.c
+#	drivers/xen/xen-scsiback.c
+diff --cc drivers/usb/gadget/tcm_usb_gadget.c
+index 7cacd6ae818e,e803724c7ee3..000000000000
+--- a/drivers/usb/gadget/tcm_usb_gadget.c
++++ b/drivers/usb/gadget/tcm_usb_gadget.c
+@@@ -1717,47 -1598,27 +1726,58 @@@ static int tcm_usbg_make_nexus(struct u
+  	if (tpg->tpg_nexus) {
+  		ret = -EEXIST;
+  		pr_debug("tpg->tpg_nexus already exists\n");
+- 		goto err_unlock;
++ 		goto out_unlock;
+  	}
+- 	se_tpg = &tpg->se_tpg;
+  
+- 	ret = -ENOMEM;
+  	tv_nexus = kzalloc(sizeof(*tv_nexus), GFP_KERNEL);
+  	if (!tv_nexus) {
+++<<<<<<< HEAD:drivers/usb/gadget/tcm_usb_gadget.c
+ +		pr_err("Unable to allocate struct tcm_vhost_nexus\n");
+ +		goto err_unlock;
+ +	}
+ +	tv_nexus->tvn_se_sess = transport_init_session();
+ +	if (IS_ERR(tv_nexus->tvn_se_sess))
+ +		goto err_free;
+ +
+ +	/*
+ +	 * Since we are running in 'demo mode' this call with generate a
+ +	 * struct se_node_acl for the tcm_vhost struct se_portal_group with
+ +	 * the SCSI Initiator port name of the passed configfs group 'name'.
+ +	 */
+ +	tv_nexus->tvn_se_sess->se_node_acl = core_tpg_check_initiator_node_acl(
+ +			se_tpg, name);
+ +	if (!tv_nexus->tvn_se_sess->se_node_acl) {
+ +		pr_debug("core_tpg_check_initiator_node_acl() failed"
+ +				" for %s\n", name);
+ +		goto err_session;
+ +	}
+ +	/*
+ +	 * Now register the TCM vHost virtual I_T Nexus as active with the
+ +	 * call to __transport_register_session()
+ +	 */
+ +	__transport_register_session(se_tpg, tv_nexus->tvn_se_sess->se_node_acl,
+ +			tv_nexus->tvn_se_sess, tv_nexus);
+ +	tpg->tpg_nexus = tv_nexus;
+ +	mutex_unlock(&tpg->tpg_mutex);
+ +	return 0;
+++=======
++ 		ret = -ENOMEM;
++ 		goto out_unlock;
++ 	}
+  
+- err_session:
+- 	transport_free_session(tv_nexus->tvn_se_sess);
+- err_free:
+- 	kfree(tv_nexus);
+- err_unlock:
++ 	tv_nexus->tvn_se_sess = target_alloc_session(&tpg->se_tpg, 0, 0,
++ 						     TARGET_PROT_NORMAL, name,
++ 						     tv_nexus, usbg_alloc_sess_cb);
++ 	if (IS_ERR(tv_nexus->tvn_se_sess)) {
++ #define MAKE_NEXUS_MSG "core_tpg_check_initiator_node_acl() failed for %s\n"
++ 		pr_debug(MAKE_NEXUS_MSG, name);
++ #undef MAKE_NEXUS_MSG
++ 		ret = PTR_ERR(tv_nexus->tvn_se_sess);
++ 		kfree(tv_nexus);
++ 	}
+++>>>>>>> fb444abe61f5 (target: Convert demo-mode only drivers to target_alloc_session):drivers/usb/gadget/function/f_tcm.c
++ 
++ out_unlock:
+  	mutex_unlock(&tpg->tpg_mutex);
+  	return ret;
+  }
+* Unmerged path drivers/xen/xen-scsiback.c
+diff --git a/drivers/target/loopback/tcm_loop.c b/drivers/target/loopback/tcm_loop.c
+index 9f83e2336f48..73885bacc455 100644
+--- a/drivers/target/loopback/tcm_loop.c
++++ b/drivers/target/loopback/tcm_loop.c
+@@ -988,58 +988,48 @@ static struct configfs_attribute *tcm_loop_tpg_attrib_attrs[] = {
+ 
+ /* Start items for tcm_loop_nexus_cit */
+ 
++static int tcm_loop_alloc_sess_cb(struct se_portal_group *se_tpg,
++				  struct se_session *se_sess, void *p)
++{
++	struct tcm_loop_tpg *tl_tpg = container_of(se_tpg,
++					struct tcm_loop_tpg, tl_se_tpg);
++
++	tl_tpg->tl_nexus = p;
++	return 0;
++}
++
+ static int tcm_loop_make_nexus(
+ 	struct tcm_loop_tpg *tl_tpg,
+ 	const char *name)
+ {
+-	struct se_portal_group *se_tpg;
+ 	struct tcm_loop_hba *tl_hba = tl_tpg->tl_hba;
+ 	struct tcm_loop_nexus *tl_nexus;
+-	int ret = -ENOMEM;
++	int ret;
+ 
+ 	if (tl_tpg->tl_nexus) {
+ 		pr_debug("tl_tpg->tl_nexus already exists\n");
+ 		return -EEXIST;
+ 	}
+-	se_tpg = &tl_tpg->tl_se_tpg;
+ 
+ 	tl_nexus = kzalloc(sizeof(struct tcm_loop_nexus), GFP_KERNEL);
+ 	if (!tl_nexus) {
+ 		pr_err("Unable to allocate struct tcm_loop_nexus\n");
+ 		return -ENOMEM;
+ 	}
+-	/*
+-	 * Initialize the struct se_session pointer
+-	 */
+-	tl_nexus->se_sess = transport_init_session(
+-				TARGET_PROT_DIN_PASS | TARGET_PROT_DOUT_PASS);
++
++	tl_nexus->se_sess = target_alloc_session(&tl_tpg->tl_se_tpg, 0, 0,
++					TARGET_PROT_DIN_PASS | TARGET_PROT_DOUT_PASS,
++					name, tl_nexus, tcm_loop_alloc_sess_cb);
+ 	if (IS_ERR(tl_nexus->se_sess)) {
+ 		ret = PTR_ERR(tl_nexus->se_sess);
+-		goto out;
+-	}
+-	/*
+-	 * Since we are running in 'demo mode' this call with generate a
+-	 * struct se_node_acl for the tcm_loop struct se_portal_group with the SCSI
+-	 * Initiator port name of the passed configfs group 'name'.
+-	 */
+-	tl_nexus->se_sess->se_node_acl = core_tpg_check_initiator_node_acl(
+-				se_tpg, (unsigned char *)name);
+-	if (!tl_nexus->se_sess->se_node_acl) {
+-		transport_free_session(tl_nexus->se_sess);
+-		goto out;
++		kfree(tl_nexus);
++		return ret;
+ 	}
+-	/* Now, register the I_T Nexus as active. */
+-	transport_register_session(se_tpg, tl_nexus->se_sess->se_node_acl,
+-			tl_nexus->se_sess, tl_nexus);
+-	tl_tpg->tl_nexus = tl_nexus;
++
+ 	pr_debug("TCM_Loop_ConfigFS: Established I_T Nexus to emulated"
+ 		" %s Initiator Port: %s\n", tcm_loop_dump_proto_id(tl_hba),
+ 		name);
+ 	return 0;
+-
+-out:
+-	kfree(tl_nexus);
+-	return ret;
+ }
+ 
+ static int tcm_loop_drop_nexus(
+diff --git a/drivers/target/sbp/sbp_target.c b/drivers/target/sbp/sbp_target.c
+index b33c121ab56c..96593d63cb97 100644
+--- a/drivers/target/sbp/sbp_target.c
++++ b/drivers/target/sbp/sbp_target.c
+@@ -202,45 +202,28 @@ static struct sbp_session *sbp_session_create(
+ 	struct sbp_session *sess;
+ 	int ret;
+ 	char guid_str[17];
+-	struct se_node_acl *se_nacl;
++
++	snprintf(guid_str, sizeof(guid_str), "%016llx", guid);
+ 
+ 	sess = kmalloc(sizeof(*sess), GFP_KERNEL);
+ 	if (!sess) {
+ 		pr_err("failed to allocate session descriptor\n");
+ 		return ERR_PTR(-ENOMEM);
+ 	}
++	spin_lock_init(&sess->lock);
++	INIT_LIST_HEAD(&sess->login_list);
++	INIT_DELAYED_WORK(&sess->maint_work, session_maintenance_work);
++	sess->guid = guid;
+ 
+-	sess->se_sess = transport_init_session(TARGET_PROT_NORMAL);
++	sess->se_sess = target_alloc_session(&tpg->se_tpg, 0, 0, TARGET_PROT_NORMAL,
++					     guid_str, sess, NULL);
+ 	if (IS_ERR(sess->se_sess)) {
+ 		pr_err("failed to init se_session\n");
+-
+ 		ret = PTR_ERR(sess->se_sess);
+ 		kfree(sess);
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	snprintf(guid_str, sizeof(guid_str), "%016llx", guid);
+-
+-	se_nacl = core_tpg_check_initiator_node_acl(&tpg->se_tpg, guid_str);
+-	if (!se_nacl) {
+-		pr_warn("Node ACL not found for %s\n", guid_str);
+-
+-		transport_free_session(sess->se_sess);
+-		kfree(sess);
+-
+-		return ERR_PTR(-EPERM);
+-	}
+-
+-	sess->se_sess->se_node_acl = se_nacl;
+-
+-	spin_lock_init(&sess->lock);
+-	INIT_LIST_HEAD(&sess->login_list);
+-	INIT_DELAYED_WORK(&sess->maint_work, session_maintenance_work);
+-
+-	sess->guid = guid;
+-
+-	transport_register_session(&tpg->se_tpg, se_nacl, sess->se_sess, sess);
+-
+ 	return sess;
+ }
+ 
+* Unmerged path drivers/usb/gadget/tcm_usb_gadget.c
+* Unmerged path drivers/xen/xen-scsiback.c
