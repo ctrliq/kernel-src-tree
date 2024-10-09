@@ -1,0 +1,133 @@
+ipvs: make drop_entry protection effective for SIP-pe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Marco Angaroni <marcoangaroni@gmail.com>
+commit 698e2a8dca98e4de32f3f630e6d9cd93753c52e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/698e2a8d.failed
+
+DoS protection policy that deletes connections to avoid out of memory is
+currently not effective for SIP-pe plus OPS-mode for two reasons:
+  1) connection templates (holding SIP call-id) are always skipped in
+     ip_vs_random_dropentry()
+  2) in_pkts counter (used by drop_entry algorithm) is not incremented
+     for connection templates
+
+This patch addresses such problems with the following changes:
+  a) connection templates associated (via their dest) to virtual-services
+     configured in OPS mode are included in ip_vs_random_dropentry()
+     monitoring. This applies to SIP-pe over UDP (which requires OPS mode),
+     but is more general principle: when OPS is controlled by templates
+     memory can be used only by templates themselves, since OPS conns are
+     deleted after packet is forwarded.
+  b) OPS connections, if controlled by a template, cause increment of
+     in_pkts counter of their template. This is already happening but only
+     in case director is in master-slave mode (see ip_vs_sync_conn()).
+
+	Signed-off-by: Marco Angaroni <marcoangaroni@gmail.com>
+	Acked-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit 698e2a8dca98e4de32f3f630e6d9cd93753c52e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_conn.c
+#	net/netfilter/ipvs/ip_vs_core.c
+diff --cc net/netfilter/ipvs/ip_vs_conn.c
+index 69b1996c49f4,2cb3c626cd43..000000000000
+--- a/net/netfilter/ipvs/ip_vs_conn.c
++++ b/net/netfilter/ipvs/ip_vs_conn.c
+@@@ -1220,8 -1261,18 +1220,18 @@@ static inline int todrop_entry(struct i
+  	return 1;
+  }
+  
++ static inline bool ip_vs_conn_ops_mode(struct ip_vs_conn *cp)
++ {
++ 	struct ip_vs_service *svc;
++ 
++ 	if (!cp->dest)
++ 		return false;
++ 	svc = rcu_dereference(cp->dest->svc);
++ 	return svc && (svc->flags & IP_VS_SVC_F_ONEPACKET);
++ }
++ 
+  /* Called from keventd and must protect itself from softirqs */
+ -void ip_vs_random_dropentry(struct netns_ipvs *ipvs)
+ +void ip_vs_random_dropentry(struct net *net)
+  {
+  	int idx;
+  	struct ip_vs_conn *cp, *cp_c;
+@@@ -1232,17 -1284,17 +1242,29 @@@
+  	for (idx = 0; idx < (ip_vs_conn_tab_size>>5); idx++) {
+  		unsigned int hash = prandom_u32() & ip_vs_conn_tab_mask;
+  
+ +		/*
+ +		 *  Lock is actually needed in this loop.
+ +		 */
+ +		rcu_read_lock();
+ +
+  		hlist_for_each_entry_rcu(cp, &ip_vs_conn_tab[hash], c_list) {
+++<<<<<<< HEAD
+ +			if (cp->flags & IP_VS_CONN_F_TEMPLATE)
+ +				/* connection template */
+ +				continue;
+ +			if (!ip_vs_conn_net_eq(cp, net))
+++=======
++ 			if (cp->ipvs != ipvs)
+++>>>>>>> 698e2a8dca98 (ipvs: make drop_entry protection effective for SIP-pe)
+  				continue;
++ 			if (cp->flags & IP_VS_CONN_F_TEMPLATE) {
++ 				if (atomic_read(&cp->n_control) ||
++ 				    !ip_vs_conn_ops_mode(cp))
++ 					continue;
++ 				else
++ 					/* connection template of OPS */
++ 					goto try_drop;
++ 			}
+  			if (cp->protocol == IPPROTO_TCP) {
+  				switch(cp->state) {
+  				case IP_VS_TCP_S_SYN_RECV:
+@@@ -1257,7 -1309,20 +1279,8 @@@
+  				default:
+  					continue;
+  				}
+ -			} else if (cp->protocol == IPPROTO_SCTP) {
+ -				switch (cp->state) {
+ -				case IP_VS_SCTP_S_INIT1:
+ -				case IP_VS_SCTP_S_INIT:
+ -					break;
+ -				case IP_VS_SCTP_S_ESTABLISHED:
+ -					if (todrop_entry(cp))
+ -						break;
+ -					continue;
+ -				default:
+ -					continue;
+ -				}
+  			} else {
++ try_drop:
+  				if (!todrop_entry(cp))
+  					continue;
+  			}
+diff --cc net/netfilter/ipvs/ip_vs_core.c
+index f1576576eb85,1207f20d24e4..000000000000
+--- a/net/netfilter/ipvs/ip_vs_core.c
++++ b/net/netfilter/ipvs/ip_vs_core.c
+@@@ -1740,7 -1993,10 +1743,14 @@@ ip_vs_in(unsigned int hooknum, struct s
+  		pkts = atomic_add_return(1, &cp->in_pkts);
+  
+  	if (ipvs->sync_state & IP_VS_STATE_MASTER)
+++<<<<<<< HEAD
+ +		ip_vs_sync_conn(net, cp, pkts);
+++=======
++ 		ip_vs_sync_conn(ipvs, cp, pkts);
++ 	else if ((cp->flags & IP_VS_CONN_F_ONE_PACKET) && cp->control)
++ 		/* increment is done inside ip_vs_sync_conn too */
++ 		atomic_inc(&cp->control->in_pkts);
+++>>>>>>> 698e2a8dca98 (ipvs: make drop_entry protection effective for SIP-pe)
+  
+  	ip_vs_conn_put(cp);
+  	return ret;
+* Unmerged path net/netfilter/ipvs/ip_vs_conn.c
+* Unmerged path net/netfilter/ipvs/ip_vs_core.c
