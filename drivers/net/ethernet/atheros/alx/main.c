@@ -642,6 +642,22 @@ static void alx_config_vector_mapping(struct alx_priv *alx)
 	alx_write_mem32(hw, ALX_MSI_ID_MAP, 0);
 }
 
+static void alx_init_intr(struct alx_priv *alx, bool msix)
+{
+	if (!(alx->flags & ALX_FLAG_USING_MSIX)) {
+		if (!pci_enable_msi(alx->hw.pdev))
+			alx->flags |= ALX_FLAG_USING_MSI;
+	}
+}
+
+static void alx_disable_advanced_intr(struct alx_priv *alx)
+{
+	if (alx->flags & ALX_FLAG_USING_MSI) {
+		pci_disable_msi(alx->hw.pdev);
+		alx->flags &= ~ALX_FLAG_USING_MSI;
+	}
+}
+
 static void alx_irq_enable(struct alx_priv *alx)
 {
 	struct alx_hw *hw = &alx->hw;
@@ -672,9 +688,7 @@ static int alx_request_irq(struct alx_priv *alx)
 
 	msi_ctrl = (hw->imt >> 1) << ALX_MSI_RETRANS_TM_SHIFT;
 
-	if (!pci_enable_msi(alx->hw.pdev)) {
-		alx->msi = true;
-
+	if (alx->flags & ALX_FLAG_USING_MSI) {
 		alx_write_mem32(hw, ALX_MSI_RETRANS_TIMER,
 				msi_ctrl | ALX_MSI_MASK_SEL_LINE);
 		err = request_irq(pdev->irq, alx_intr_msi, 0,
@@ -683,6 +697,7 @@ static int alx_request_irq(struct alx_priv *alx)
 			goto out;
 
 		/* fall back to legacy interrupt */
+		alx->flags &= ~ALX_FLAG_USING_MSI;
 		pci_disable_msi(alx->hw.pdev);
 	}
 
@@ -701,10 +716,7 @@ static void alx_free_irq(struct alx_priv *alx)
 
 	free_irq(pdev->irq, alx);
 
-	if (alx->msi) {
-		pci_disable_msi(alx->hw.pdev);
-		alx->msi = false;
-	}
+	alx_disable_advanced_intr(alx);
 }
 
 static int alx_identify_hw(struct alx_priv *alx)
@@ -879,6 +891,8 @@ static void alx_netif_start(struct alx_priv *alx)
 static int __alx_open(struct alx_priv *alx, bool resume)
 {
 	int err;
+
+	alx_init_intr(alx, false);
 
 	if (!resume)
 		netif_carrier_off(alx->dev);
@@ -1269,7 +1283,7 @@ static void alx_poll_controller(struct net_device *netdev)
 {
 	struct alx_priv *alx = netdev_priv(netdev);
 
-	if (alx->msi)
+	if (alx->flags & ALX_FLAG_USING_MSI)
 		alx_intr_msi(0, alx);
 	else
 		alx_intr_legacy(0, alx);
