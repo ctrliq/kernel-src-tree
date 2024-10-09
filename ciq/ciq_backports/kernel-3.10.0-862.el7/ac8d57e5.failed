@@ -1,0 +1,355 @@
+kvm: x86: mmu: allow A/D bits to be disabled in an mmu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Peter Feiner <pfeiner@google.com>
+commit ac8d57e5734389da18633d4e8cc030fe10843da7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ac8d57e5.failed
+
+Adds the plumbing to disable A/D bits in the MMU based on a new role
+bit, ad_disabled. When A/D is disabled, the MMU operates as though A/D
+aren't available (i.e., using access tracking faults instead).
+
+To avoid SP -> kvm_mmu_page.role.ad_disabled lookups all over the
+place, A/D disablement is now stored in the SPTE. This state is stored
+in the SPTE by tweaking the use of SPTE_SPECIAL_MASK for access
+tracking. Rather than just setting SPTE_SPECIAL_MASK when an
+access-tracking SPTE is non-present, we now always set
+SPTE_SPECIAL_MASK for access-tracking SPTEs.
+
+	Signed-off-by: Peter Feiner <pfeiner@google.com>
+[Use role.ad_disabled even for direct (non-shadow) EPT page tables.  Add
+ documentation and a few MMU_WARN_ONs. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ac8d57e5734389da18633d4e8cc030fe10843da7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 588adec09b8c,48d8e7e60163..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -175,8 -183,27 +175,29 @@@ static u64 __read_mostly shadow_user_ma
+  static u64 __read_mostly shadow_accessed_mask;
+  static u64 __read_mostly shadow_dirty_mask;
+  static u64 __read_mostly shadow_mmio_mask;
+ -static u64 __read_mostly shadow_mmio_value;
+  static u64 __read_mostly shadow_present_mask;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * SPTEs used by MMUs without A/D bits are marked with shadow_acc_track_value.
++  * Non-present SPTEs with shadow_acc_track_value set are in place for access
++  * tracking.
++  */
++ static u64 __read_mostly shadow_acc_track_mask;
++ static const u64 shadow_acc_track_value = SPTE_SPECIAL_MASK;
++ 
++ /*
++  * The mask/shift to use for saving the original R/X bits when marking the PTE
++  * as not-present for access tracking purposes. We do not save the W bit as the
++  * PTEs being access tracked also need to be dirty tracked, so the W bit will be
++  * restored only when a write is attempted to the page.
++  */
++ static const u64 shadow_acc_track_saved_bits_mask = PT64_EPT_READABLE_MASK |
++ 						    PT64_EPT_EXECUTABLE_MASK;
++ static const u64 shadow_acc_track_saved_bits_shift = PT64_SECOND_AVAIL_BITS_SHIFT;
++ 
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  static void mmu_spte_set(u64 *sptep, u64 spte);
+  static void mmu_free_roots(struct kvm_vcpu *vcpu);
+  
+@@@ -186,6 -215,34 +207,37 @@@ void kvm_mmu_set_mmio_spte_mask(u64 mmi
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_set_mmio_spte_mask);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool sp_ad_disabled(struct kvm_mmu_page *sp)
++ {
++ 	return sp->role.ad_disabled;
++ }
++ 
++ static inline bool spte_ad_enabled(u64 spte)
++ {
++ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
++ 	return !(spte & shadow_acc_track_value);
++ }
++ 
++ static inline u64 spte_shadow_accessed_mask(u64 spte)
++ {
++ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
++ 	return spte_ad_enabled(spte) ? shadow_accessed_mask : 0;
++ }
++ 
++ static inline u64 spte_shadow_dirty_mask(u64 spte)
++ {
++ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
++ 	return spte_ad_enabled(spte) ? shadow_dirty_mask : 0;
++ }
++ 
++ static inline bool is_access_track_spte(u64 spte)
++ {
++ 	return !spte_ad_enabled(spte) && (spte & shadow_acc_track_mask) == 0;
++ }
++ 
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  /*
+   * the low bit of the generation number is always presumed to be zero.
+   * This disables mmio caching during memslot updates.  The concept is
+@@@ -282,15 -339,28 +334,26 @@@ static bool check_mmio_spte(struct kvm_
+  	return likely(kvm_gen == spte_gen);
+  }
+  
+ -/*
+ - * Sets the shadow PTE masks used by the MMU.
+ - *
+ - * Assumptions:
+ - *  - Setting either @accessed_mask or @dirty_mask requires setting both
+ - *  - At least one of @accessed_mask or @acc_track_mask must be set
+ - */
+  void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+ -		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask,
+ -		u64 acc_track_mask)
+ +		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask)
+  {
+++<<<<<<< HEAD
+++=======
++ 	BUG_ON(!dirty_mask != !accessed_mask);
++ 	BUG_ON(!accessed_mask && !acc_track_mask);
++ 	BUG_ON(acc_track_mask & shadow_acc_track_value);
++ 
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  	shadow_user_mask = user_mask;
+  	shadow_accessed_mask = accessed_mask;
+  	shadow_dirty_mask = dirty_mask;
+  	shadow_nx_mask = nx_mask;
+  	shadow_x_mask = x_mask;
+  	shadow_present_mask = p_mask;
+++<<<<<<< HEAD
+++=======
++ 	shadow_acc_track_mask = acc_track_mask;
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_set_mask_ptes);
+  
+@@@ -486,26 -576,25 +549,41 @@@ static bool spte_has_volatile_bits(u64 
+  	 * also, it can help us to get a stable is_writable_pte()
+  	 * to ensure tlb flush is not missed.
+  	 */
+ -	if (spte_can_locklessly_be_made_writable(spte) ||
+ -	    is_access_track_spte(spte))
+ +	if (spte_can_locklessly_be_made_writable(spte))
+  		return true;
+  
+++<<<<<<< HEAD
+ +	if (!shadow_accessed_mask)
+ +		return false;
+++=======
++ 	if (spte_ad_enabled(spte)) {
++ 		if ((spte & shadow_accessed_mask) == 0 ||
++ 	    	    (is_writable_pte(spte) && (spte & shadow_dirty_mask) == 0))
++ 			return true;
++ 	}
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  
+ -	return false;
+ +	if (!is_shadow_present_pte(spte))
+ +		return false;
+ +
+ +	if ((spte & shadow_accessed_mask) &&
+ +	      (!is_writable_pte(spte) || (spte & shadow_dirty_mask)))
+ +		return false;
+ +
+ +	return true;
+  }
+  
+  static bool is_accessed_spte(u64 spte)
+  {
+++<<<<<<< HEAD
+ +	return shadow_accessed_mask ? spte & shadow_accessed_mask
+ +				    : true;
+++=======
++ 	u64 accessed_mask = spte_shadow_accessed_mask(spte);
++ 
++ 	return accessed_mask ? spte & accessed_mask
++ 			     : !is_access_track_spte(spte);
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  }
+  
+  static bool is_dirty_spte(u64 spte)
+@@@ -649,6 -739,78 +728,81 @@@ static u64 mmu_spte_get_lockless(u64 *s
+  	return __get_spte_lockless(sptep);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u64 mark_spte_for_access_track(u64 spte)
++ {
++ 	if (spte_ad_enabled(spte))
++ 		return spte & ~shadow_accessed_mask;
++ 
++ 	if (is_access_track_spte(spte))
++ 		return spte;
++ 
++ 	/*
++ 	 * Making an Access Tracking PTE will result in removal of write access
++ 	 * from the PTE. So, verify that we will be able to restore the write
++ 	 * access in the fast page fault path later on.
++ 	 */
++ 	WARN_ONCE((spte & PT_WRITABLE_MASK) &&
++ 		  !spte_can_locklessly_be_made_writable(spte),
++ 		  "kvm: Writable SPTE is not locklessly dirty-trackable\n");
++ 
++ 	WARN_ONCE(spte & (shadow_acc_track_saved_bits_mask <<
++ 			  shadow_acc_track_saved_bits_shift),
++ 		  "kvm: Access Tracking saved bit locations are not zero\n");
++ 
++ 	spte |= (spte & shadow_acc_track_saved_bits_mask) <<
++ 		shadow_acc_track_saved_bits_shift;
++ 	spte &= ~shadow_acc_track_mask;
++ 
++ 	return spte;
++ }
++ 
++ /* Restore an acc-track PTE back to a regular PTE */
++ static u64 restore_acc_track_spte(u64 spte)
++ {
++ 	u64 new_spte = spte;
++ 	u64 saved_bits = (spte >> shadow_acc_track_saved_bits_shift)
++ 			 & shadow_acc_track_saved_bits_mask;
++ 
++ 	WARN_ON_ONCE(spte_ad_enabled(spte));
++ 	WARN_ON_ONCE(!is_access_track_spte(spte));
++ 
++ 	new_spte &= ~shadow_acc_track_mask;
++ 	new_spte &= ~(shadow_acc_track_saved_bits_mask <<
++ 		      shadow_acc_track_saved_bits_shift);
++ 	new_spte |= saved_bits;
++ 
++ 	return new_spte;
++ }
++ 
++ /* Returns the Accessed status of the PTE and resets it at the same time. */
++ static bool mmu_spte_age(u64 *sptep)
++ {
++ 	u64 spte = mmu_spte_get_lockless(sptep);
++ 
++ 	if (!is_accessed_spte(spte))
++ 		return false;
++ 
++ 	if (spte_ad_enabled(spte)) {
++ 		clear_bit((ffs(shadow_accessed_mask) - 1),
++ 			  (unsigned long *)sptep);
++ 	} else {
++ 		/*
++ 		 * Capture the dirty status of the page, so that it doesn't get
++ 		 * lost when the SPTE is marked for access tracking.
++ 		 */
++ 		if (is_writable_pte(spte))
++ 			kvm_set_pfn_dirty(spte_to_pfn(spte));
++ 
++ 		spte = mark_spte_for_access_track(spte);
++ 		mmu_spte_update_no_track(sptep, spte);
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> ac8d57e57343 (kvm: x86: mmu: allow A/D bits to be disabled in an mmu)
+  static void walk_shadow_page_lockless_begin(struct kvm_vcpu *vcpu)
+  {
+  	/*
+@@@ -2265,9 -2432,19 +2440,14 @@@ static void link_shadow_page(u64 *sptep
+  	BUILD_BUG_ON(VMX_EPT_WRITABLE_MASK != PT_WRITABLE_MASK);
+  
+  	spte = __pa(sp->spt) | shadow_present_mask | PT_WRITABLE_MASK |
+- 	       shadow_user_mask | shadow_x_mask | shadow_accessed_mask;
++ 	       shadow_user_mask | shadow_x_mask;
++ 
++ 	if (sp_ad_disabled(sp))
++ 		spte |= shadow_acc_track_value;
++ 	else
++ 		spte |= shadow_accessed_mask;
+  
+  	mmu_spte_set(sptep, spte);
+ -
+ -	mmu_page_add_parent_pte(vcpu, sp, sptep);
+ -
+ -	if (sp->unsync_children || sp->unsync)
+ -		mark_unsync(sptep);
+  }
+  
+  static void validate_direct_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+@@@ -2603,9 -2779,12 +2788,9 @@@ static int set_spte(struct kvm_vcpu *vc
+  
+  	if (pte_access & ACC_WRITE_MASK) {
+  		kvm_vcpu_mark_page_dirty(vcpu, gfn);
+- 		spte |= shadow_dirty_mask;
++ 		spte |= spte_shadow_dirty_mask(spte);
+  	}
+  
+ -	if (speculative)
+ -		spte = mark_spte_for_access_track(spte);
+ -
+  set_pte:
+  	if (mmu_spte_update(sptep, spte))
+  		kvm_flush_remote_tlbs(vcpu->kvm);
+diff --git a/Documentation/virtual/kvm/mmu.txt b/Documentation/virtual/kvm/mmu.txt
+index 481b6a9c25d5..f50d45b1e967 100644
+--- a/Documentation/virtual/kvm/mmu.txt
++++ b/Documentation/virtual/kvm/mmu.txt
+@@ -179,6 +179,10 @@ Shadow pages contain the following information:
+     shadow page; it is also used to go back from a struct kvm_mmu_page
+     to a memslot, through the kvm_memslots_for_spte_role macro and
+     __gfn_to_memslot.
++  role.ad_disabled:
++    Is 1 if the MMU instance cannot use A/D bits.  EPT did not have A/D
++    bits before Haswell; shadow EPT page tables also cannot use A/D bits
++    if the L1 hypervisor does not enable them.
+   gfn:
+     Either the guest page table containing the translations shadowed by this
+     page, or the base page frame for linear translations.  See role.direct.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index ab2d8132f390..730ee0ec70e8 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -222,7 +222,8 @@ union kvm_mmu_page_role {
+ 		unsigned cr0_wp:1;
+ 		unsigned smep_andnot_wp:1;
+ 		unsigned smap_andnot_wp:1;
+-		unsigned :8;
++		unsigned ad_disabled:1;
++		unsigned :7;
+ 
+ 		/*
+ 		 * This is left at the top of the word so that
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmutrace.h b/arch/x86/kvm/mmutrace.h
+index ce463a9cc8fb..cfa5286730cc 100644
+--- a/arch/x86/kvm/mmutrace.h
++++ b/arch/x86/kvm/mmutrace.h
+@@ -30,8 +30,9 @@
+ 								        \
+ 	role.word = __entry->role;					\
+ 									\
+-	trace_seq_printf(p, "sp gen %lx gfn %llx %u%s q%u%s %s%s"	\
+-			 " %snxe root %u %s%c",	__entry->mmu_valid_gen,	\
++	trace_seq_printf(p, "sp gen %lx gfn %llx l%u%s q%u%s %s%s"	\
++			 " %snxe %sad root %u %s%c",			\
++			 __entry->mmu_valid_gen,			\
+ 			 __entry->gfn, role.level,			\
+ 			 role.cr4_pae ? " pae" : "",			\
+ 			 role.quadrant,					\
+@@ -39,6 +40,7 @@
+ 			 access_str[role.access],			\
+ 			 role.invalid ? " invalid" : "",		\
+ 			 role.nxe ? "" : "!",				\
++			 role.ad_disabled ? "!" : "",			\
+ 			 __entry->root_count,				\
+ 			 __entry->unsync ? "unsync" : "sync", 0);	\
+ 	saved_ptr;							\
