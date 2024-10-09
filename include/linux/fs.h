@@ -1735,6 +1735,10 @@ extern int vfs_whiteout(struct inode *, struct dentry *);
  */
 extern void dentry_unhash(struct dentry *dentry);
 
+int vfs_mkobj(struct dentry *, umode_t,
+		int (*f)(struct dentry *, umode_t, void *),
+		void *);
+
 /*
  * VFS file helper functions.
  */
