@@ -1,0 +1,307 @@
+mm/swap: free swap slots in batch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] swap: free swap slots in batch (Jerome Marchand) [1400689]
+Rebuild_FUZZ: 95.24%
+commit-author Tim Chen <tim.c.chen@linux.intel.com>
+commit 7c00bafee87c7bac7ed9eced7c161f8e5332cb4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c00bafe.failed
+
+Add new functions that free unused swap slots in batches without the
+need to reacquire swap info lock.  This improves scalability and reduce
+lock contention.
+
+Link: http://lkml.kernel.org/r/c25e0fcdfd237ec4ca7db91631d3b9f6ed23824e.1484082593.git.tim.c.chen@linux.intel.com
+	Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+	Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Aaron Lu <aaron.lu@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Jonathan Corbet <corbet@lwn.net> escreveu:
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7c00bafee87c7bac7ed9eced7c161f8e5332cb4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swap.h
+#	mm/swapfile.c
+diff --cc include/linux/swap.h
+index 61d41d507b58,bcc0b18f96d2..000000000000
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@@ -423,7 -393,8 +423,12 @@@ extern void swap_shmem_alloc(swp_entry_
+  extern int swap_duplicate(swp_entry_t);
+  extern int swapcache_prepare(swp_entry_t);
+  extern void swap_free(swp_entry_t);
+++<<<<<<< HEAD
+ +extern void swapcache_free(swp_entry_t, struct page *page);
+++=======
++ extern void swapcache_free(swp_entry_t);
++ extern void swapcache_free_entries(swp_entry_t *entries, int n);
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  extern int free_swap_and_cache(swp_entry_t);
+  extern int swap_type_of(dev_t, sector_t, struct block_device **);
+  extern unsigned int count_swap_pages(int, int);
+diff --cc mm/swapfile.c
+index 44c2eac6b890,8b5bd34b1a00..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -557,14 -932,44 +557,53 @@@ out
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned char swap_entry_free(struct swap_info_struct *p,
+ +				     swp_entry_t entry, unsigned char usage)
+++=======
++ static struct swap_info_struct *swap_info_get(swp_entry_t entry)
++ {
++ 	struct swap_info_struct *p;
++ 
++ 	p = _swap_info_get(entry);
++ 	if (p)
++ 		spin_lock(&p->lock);
++ 	return p;
++ }
++ 
++ static struct swap_info_struct *swap_info_get_cont(swp_entry_t entry,
++ 					struct swap_info_struct *q)
++ {
++ 	struct swap_info_struct *p;
++ 
++ 	p = _swap_info_get(entry);
++ 
++ 	if (p != q) {
++ 		if (q != NULL)
++ 			spin_unlock(&q->lock);
++ 		if (p != NULL)
++ 			spin_lock(&p->lock);
++ 	}
++ 	return p;
++ }
++ 
++ static unsigned char __swap_entry_free(struct swap_info_struct *p,
++ 				       swp_entry_t entry, unsigned char usage)
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  {
+ -	struct swap_cluster_info *ci;
+  	unsigned long offset = swp_offset(entry);
+  	unsigned char count;
+  	unsigned char has_cache;
+++<<<<<<< HEAD
+ +
+ +	count = p->swap_map[offset];
+++=======
++ 
++ 	ci = lock_cluster_or_swap_info(p, offset);
++ 
++ 	count = p->swap_map[offset];
++ 
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  	has_cache = count & SWAP_HAS_CACHE;
+  	count &= ~SWAP_HAS_CACHE;
+  
+@@@ -587,72 -992,104 +626,154 @@@
+  			count--;
+  	}
+  
+ +	if (!count)
+ +		mem_cgroup_uncharge_swap(entry);
+ +
+  	usage = count | has_cache;
+- 	p->swap_map[offset] = usage;
++ 	p->swap_map[offset] = usage ? : SWAP_HAS_CACHE;
+  
+++<<<<<<< HEAD
+ +	/* free if no reference */
+ +	if (!usage) {
+ +		if (offset < p->lowest_bit)
+ +			p->lowest_bit = offset;
+ +		if (offset > p->highest_bit) {
+ +			bool was_full = !p->highest_bit;
+ +			p->highest_bit = offset;
+ +			if (was_full && (p->flags & SWP_WRITEOK)) {
+ +				spin_lock(&swap_avail_lock);
+ +				WARN_ON(!plist_node_empty(&p->avail_list));
+ +				if (plist_node_empty(&p->avail_list))
+ +					plist_add(&p->avail_list,
+ +						  &swap_avail_head);
+ +				spin_unlock(&swap_avail_lock);
+ +			}
+ +		}
+ +		atomic_long_inc(&nr_swap_pages);
+ +		p->inuse_pages--;
+ +		frontswap_invalidate_page(p->type, offset);
+ +		if (p->flags & SWP_BLKDEV) {
+ +			struct gendisk *disk = p->bdev->bd_disk;
+ +			if (disk->fops->swap_slot_free_notify)
+ +				disk->fops->swap_slot_free_notify(p->bdev,
+ +								  offset);
+ +		}
+ +	}
+++=======
++ 	unlock_cluster_or_swap_info(p, ci);
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  
+  	return usage;
+  }
+  
++ static void swap_entry_free(struct swap_info_struct *p, swp_entry_t entry)
++ {
++ 	struct swap_cluster_info *ci;
++ 	unsigned long offset = swp_offset(entry);
++ 	unsigned char count;
++ 
++ 	ci = lock_cluster(p, offset);
++ 	count = p->swap_map[offset];
++ 	VM_BUG_ON(count != SWAP_HAS_CACHE);
++ 	p->swap_map[offset] = 0;
++ 	dec_cluster_info_page(p, p->cluster_info, offset);
++ 	unlock_cluster(ci);
++ 
++ 	mem_cgroup_uncharge_swap(entry);
++ 	if (offset < p->lowest_bit)
++ 		p->lowest_bit = offset;
++ 	if (offset > p->highest_bit) {
++ 		bool was_full = !p->highest_bit;
++ 
++ 		p->highest_bit = offset;
++ 		if (was_full && (p->flags & SWP_WRITEOK)) {
++ 			spin_lock(&swap_avail_lock);
++ 			WARN_ON(!plist_node_empty(&p->avail_list));
++ 			if (plist_node_empty(&p->avail_list))
++ 				plist_add(&p->avail_list,
++ 					  &swap_avail_head);
++ 			spin_unlock(&swap_avail_lock);
++ 		}
++ 	}
++ 	atomic_long_inc(&nr_swap_pages);
++ 	p->inuse_pages--;
++ 	frontswap_invalidate_page(p->type, offset);
++ 	if (p->flags & SWP_BLKDEV) {
++ 		struct gendisk *disk = p->bdev->bd_disk;
++ 
++ 		if (disk->fops->swap_slot_free_notify)
++ 			disk->fops->swap_slot_free_notify(p->bdev,
++ 							  offset);
++ 	}
++ }
++ 
+  /*
+ - * Caller has made sure that the swap device corresponding to entry
+ + * Caller has made sure that the swapdevice corresponding to entry
+   * is still around or has not been recycled.
+   */
+  void swap_free(swp_entry_t entry)
+  {
+  	struct swap_info_struct *p;
+  
+++<<<<<<< HEAD
+ +	p = swap_info_get(entry);
+ +	if (p) {
+ +		swap_entry_free(p, entry, 1);
+ +		spin_unlock(&p->lock);
+++=======
++ 	p = _swap_info_get(entry);
++ 	if (p) {
++ 		if (!__swap_entry_free(p, entry, 1))
++ 			swapcache_free_entries(&entry, 1);
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  	}
+  }
+  
+  /*
+   * Called after dropping swapcache to decrease refcnt to swap entries.
+   */
+ -void swapcache_free(swp_entry_t entry)
+ +void swapcache_free(swp_entry_t entry, struct page *page)
+  {
+  	struct swap_info_struct *p;
+ +	unsigned char count;
+  
+++<<<<<<< HEAD
+ +	p = swap_info_get(entry);
+ +	if (p) {
+ +		count = swap_entry_free(p, entry, SWAP_HAS_CACHE);
+ +		if (page)
+ +			mem_cgroup_uncharge_swapcache(page, entry, count != 0);
+ +		spin_unlock(&p->lock);
+ +	}
+++=======
++ 	p = _swap_info_get(entry);
++ 	if (p) {
++ 		if (!__swap_entry_free(p, entry, SWAP_HAS_CACHE))
++ 			swapcache_free_entries(&entry, 1);
++ 	}
++ }
++ 
++ void swapcache_free_entries(swp_entry_t *entries, int n)
++ {
++ 	struct swap_info_struct *p, *prev;
++ 	int i;
++ 
++ 	if (n <= 0)
++ 		return;
++ 
++ 	prev = NULL;
++ 	p = NULL;
++ 	for (i = 0; i < n; ++i) {
++ 		p = swap_info_get_cont(entries[i], prev);
++ 		if (p)
++ 			swap_entry_free(p, entries[i]);
++ 		else
++ 			break;
++ 		prev = p;
++ 	}
++ 	if (p)
++ 		spin_unlock(&p->lock);
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  }
+  
+  /*
+@@@ -749,17 -1277,18 +871,22 @@@ int free_swap_and_cache(swp_entry_t ent
+  	if (non_swap_entry(entry))
+  		return 1;
+  
+- 	p = swap_info_get(entry);
++ 	p = _swap_info_get(entry);
+  	if (p) {
+++<<<<<<< HEAD
+ +		if (swap_entry_free(p, entry, 1) == SWAP_HAS_CACHE) {
+++=======
++ 		count = __swap_entry_free(p, entry, 1);
++ 		if (count == SWAP_HAS_CACHE) {
+++>>>>>>> 7c00bafee87c (mm/swap: free swap slots in batch)
+  			page = find_get_page(swap_address_space(entry),
+ -					     swp_offset(entry));
+ +						entry.val);
+  			if (page && !trylock_page(page)) {
+ -				put_page(page);
+ +				page_cache_release(page);
+  				page = NULL;
+  			}
+- 		}
+- 		spin_unlock(&p->lock);
++ 		} else if (!count)
++ 			swapcache_free_entries(&entry, 1);
+  	}
+  	if (page) {
+  		/*
+* Unmerged path include/linux/swap.h
+* Unmerged path mm/swapfile.c
