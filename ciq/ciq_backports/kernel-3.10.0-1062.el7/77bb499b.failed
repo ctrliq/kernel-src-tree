@@ -1,0 +1,312 @@
+pagemap: add mmap-exclusive bit for marking pages mapped only here
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+commit 77bb499bb60f4b79cca7d139c8041662860fcf87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/77bb499b.failed
+
+This patch sets bit 56 in pagemap if this page is mapped only once.  It
+allows to detect exclusively used pages without exposing PFN:
+
+present file exclusive state
+0       0    0         non-present
+1       1    0         file page mapped somewhere else
+1       1    1         file page mapped only here
+1       0    0         anon non-CoWed page (shared with parent/child)
+1       0    1         anon CoWed page (or never forked)
+
+CoWed pages in (MAP_FILE | MAP_PRIVATE) areas are anon in this context.
+
+MMap-exclusive bit doesn't reflect potential page-sharing via swapcache:
+page could be mapped once but has several swap-ptes which point to it.
+Application could detect that by swap bit in pagemap entry and touch that
+pte via /proc/pid/mem to get real information.
+
+See http://lkml.kernel.org/r/CAEVpBa+_RyACkhODZrRvQLs80iy0sqpdrd0AaP_-tgnX3Y9yNQ@mail.gmail.com
+
+Requested by Mark Williamson.
+
+[akpm@linux-foundation.org: fix spello]
+	Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Reviewed-by: Mark Williamson <mwilliamson@undo-software.com>
+	Tested-by:  Mark Williamson <mwilliamson@undo-software.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 77bb499bb60f4b79cca7d139c8041662860fcf87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+#	tools/vm/page-types.c
+diff --cc fs/proc/task_mmu.c
+index bf81d9f4a02e,67c76468a7be..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -1005,30 -945,20 +1005,41 @@@ struct pagemapread 
+  #define PAGEMAP_WALK_SIZE	(PMD_SIZE)
+  #define PAGEMAP_WALK_MASK	(PMD_MASK)
+  
+++<<<<<<< HEAD
+ +#define PM_ENTRY_BYTES      sizeof(pagemap_entry_t)
+ +#define PM_STATUS_BITS      3
+ +#define PM_STATUS_OFFSET    (64 - PM_STATUS_BITS)
+ +#define PM_STATUS_MASK      (((1LL << PM_STATUS_BITS) - 1) << PM_STATUS_OFFSET)
+ +#define PM_STATUS(nr)       (((nr) << PM_STATUS_OFFSET) & PM_STATUS_MASK)
+ +#define PM_PSHIFT_BITS      6
+ +#define PM_PSHIFT_OFFSET    (PM_STATUS_OFFSET - PM_PSHIFT_BITS)
+ +#define PM_PSHIFT_MASK      (((1LL << PM_PSHIFT_BITS) - 1) << PM_PSHIFT_OFFSET)
+ +#define __PM_PSHIFT(x)      (((u64) (x) << PM_PSHIFT_OFFSET) & PM_PSHIFT_MASK)
+ +#define PM_PFRAME_MASK      ((1LL << PM_PSHIFT_OFFSET) - 1)
+ +#define PM_PFRAME(x)        ((x) & PM_PFRAME_MASK)
+ +/* in "new" pagemap pshift bits are occupied with more status bits */
+ +#define PM_STATUS2(v2, x)   (__PM_PSHIFT(v2 ? x : PAGE_SHIFT))
+++=======
++ #define PM_ENTRY_BYTES		sizeof(pagemap_entry_t)
++ #define PM_PFRAME_BITS		55
++ #define PM_PFRAME_MASK		GENMASK_ULL(PM_PFRAME_BITS - 1, 0)
++ #define PM_SOFT_DIRTY		BIT_ULL(55)
++ #define PM_MMAP_EXCLUSIVE	BIT_ULL(56)
++ #define PM_FILE			BIT_ULL(61)
++ #define PM_SWAP			BIT_ULL(62)
++ #define PM_PRESENT		BIT_ULL(63)
+++>>>>>>> 77bb499bb60f (pagemap: add mmap-exclusive bit for marking pages mapped only here)
+  
+ +#define __PM_SOFT_DIRTY      (1LL)
+ +#define PM_PRESENT          PM_STATUS(4LL)
+ +#define PM_SWAP             PM_STATUS(2LL)
+ +#define PM_FILE             PM_STATUS(1LL)
+ +#define PM_NOT_PRESENT(v2)  PM_STATUS2(v2, 0)
+  #define PM_END_OF_BUFFER    1
+  
+ -static inline pagemap_entry_t make_pme(u64 frame, u64 flags)
+ +static inline pagemap_entry_t make_pme(u64 val)
+  {
+ -	return (pagemap_entry_t) { .pme = (frame & PM_PFRAME_MASK) | flags };
+ +	return (pagemap_entry_t) { .pme = val };
+  }
+  
+  static int add_to_pagemap(unsigned long addr, pagemap_entry_t *pme,
+@@@ -1114,60 -1037,52 +1125,90 @@@ static void pte_to_pagemap_entry(pagema
+  
+  	if (page && !PageAnon(page))
+  		flags |= PM_FILE;
+++<<<<<<< HEAD
+ +	if ((vma->vm_flags & VM_SOFTDIRTY))
+ +		flags2 |= __PM_SOFT_DIRTY;
+++=======
++ 	if (page && page_mapcount(page) == 1)
++ 		flags |= PM_MMAP_EXCLUSIVE;
++ 	if (vma->vm_flags & VM_SOFTDIRTY)
++ 		flags |= PM_SOFT_DIRTY;
+++>>>>>>> 77bb499bb60f (pagemap: add mmap-exclusive bit for marking pages mapped only here)
+ +
+ +	*pme = make_pme(PM_PFRAME(frame) | PM_STATUS2(pm->v2, flags2) | flags);
+ +}
+  
+ -	return make_pme(frame, flags);
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +static void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
+ +		pmd_t pmd, int offset, int pmd_flags2)
+ +{
+ +	/*
+ +	 * Currently pmd for thp is always present because thp can not be
+ +	 * swapped-out, migrated, or HWPOISONed (split in such cases instead.)
+ +	 * This if-check is just to prepare for future implementation.
+ +	 */
+ +	if (pmd_present(pmd))
+ +		*pme = make_pme(PM_PFRAME(pmd_pfn(pmd) + offset)
+ +				| PM_STATUS2(pm->v2, pmd_flags2) | PM_PRESENT);
+ +	else
+ +		*pme = make_pme(PM_NOT_PRESENT(pm->v2) | PM_STATUS2(pm->v2, pmd_flags2));
+ +}
+ +#else
+ +static inline void thp_pmd_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
+ +		pmd_t pmd, int offset, int pmd_flags2)
+ +{
+  }
+ +#endif
+  
+ -static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
+ +static int pagemap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+  			     struct mm_walk *walk)
+  {
+ -	struct vm_area_struct *vma = walk->vma;
+ +	struct vm_area_struct *vma;
+  	struct pagemapread *pm = walk->private;
+  	spinlock_t *ptl;
+ -	pte_t *pte, *orig_pte;
+ +	pte_t *pte;
+  	int err = 0;
+  
+ -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ -	if (pmd_trans_huge_lock(pmdp, vma, &ptl) == 1) {
+ -		u64 flags = 0, frame = 0;
+ -		pmd_t pmd = *pmdp;
+ +	/* find the first VMA at or above 'addr' */
+ +	vma = find_vma(walk->mm, addr);
+ +	if (vma && pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+ +		int pmd_flags2;
+  
+++<<<<<<< HEAD
+ +		if ((vma->vm_flags & VM_SOFTDIRTY) || pmd_soft_dirty(*pmd))
+ +			pmd_flags2 = __PM_SOFT_DIRTY;
+ +		else
+ +			pmd_flags2 = 0;
+++=======
++ 		if ((vma->vm_flags & VM_SOFTDIRTY) || pmd_soft_dirty(pmd))
++ 			flags |= PM_SOFT_DIRTY;
++ 
++ 		/*
++ 		 * Currently pmd for thp is always present because thp
++ 		 * can not be swapped-out, migrated, or HWPOISONed
++ 		 * (split in such cases instead.)
++ 		 * This if-check is just to prepare for future implementation.
++ 		 */
++ 		if (pmd_present(pmd)) {
++ 			struct page *page = pmd_page(pmd);
++ 
++ 			if (page_mapcount(page) == 1)
++ 				flags |= PM_MMAP_EXCLUSIVE;
++ 
++ 			flags |= PM_PRESENT;
++ 			if (pm->show_pfn)
++ 				frame = pmd_pfn(pmd) +
++ 					((addr & ~PMD_MASK) >> PAGE_SHIFT);
++ 		}
+++>>>>>>> 77bb499bb60f (pagemap: add mmap-exclusive bit for marking pages mapped only here)
+  
+  		for (; addr != end; addr += PAGE_SIZE) {
+ -			pagemap_entry_t pme = make_pme(frame, flags);
+ +			unsigned long offset;
+ +			pagemap_entry_t pme;
+  
+ +			offset = (addr & ~PAGEMAP_WALK_MASK) >>
+ +					PAGE_SHIFT;
+ +			thp_pmd_to_pagemap_entry(&pme, pm, *pmd, offset, pmd_flags2);
+  			err = add_to_pagemap(addr, &pme, pm);
+  			if (err)
+  				break;
+@@@ -1249,22 -1124,33 +1290,40 @@@ static int pagemap_hugetlb_range(pte_t 
+  				 struct mm_walk *walk)
+  {
+  	struct pagemapread *pm = walk->private;
+ -	struct vm_area_struct *vma = walk->vma;
+ -	u64 flags = 0, frame = 0;
+ +	struct vm_area_struct *vma;
+  	int err = 0;
+ -	pte_t pte;
+ -
+ -	if (vma->vm_flags & VM_SOFTDIRTY)
+ -		flags |= PM_SOFT_DIRTY;
+ -
+ +	int flags2;
+ +	pagemap_entry_t pme;
+ +
+ +	vma = find_vma(walk->mm, addr);
+ +	WARN_ON_ONCE(!vma);
+ +
+++<<<<<<< HEAD
+ +	if (vma && (vma->vm_flags & VM_SOFTDIRTY))
+ +		flags2 = __PM_SOFT_DIRTY;
+ +	else
+ +		flags2 = 0;
+++=======
++ 	pte = huge_ptep_get(ptep);
++ 	if (pte_present(pte)) {
++ 		struct page *page = pte_page(pte);
++ 
++ 		if (!PageAnon(page))
++ 			flags |= PM_FILE;
++ 
++ 		if (page_mapcount(page) == 1)
++ 			flags |= PM_MMAP_EXCLUSIVE;
++ 
++ 		flags |= PM_PRESENT;
++ 		if (pm->show_pfn)
++ 			frame = pte_pfn(pte) +
++ 				((addr & ~hmask) >> PAGE_SHIFT);
++ 	}
+++>>>>>>> 77bb499bb60f (pagemap: add mmap-exclusive bit for marking pages mapped only here)
+  
+  	for (; addr != end; addr += PAGE_SIZE) {
+ -		pagemap_entry_t pme = make_pme(frame, flags);
+ -
+ +		int offset = (addr & ~hmask) >> PAGE_SHIFT;
+ +		huge_pte_to_pagemap_entry(&pme, pm, *pte, offset, flags2);
+  		err = add_to_pagemap(addr, &pme, pm);
+  		if (err)
+  			return err;
+@@@ -1285,7 -1173,9 +1344,13 @@@
+   * Bits 0-54  page frame number (PFN) if present
+   * Bits 0-4   swap type if swapped
+   * Bits 5-54  swap offset if swapped
+++<<<<<<< HEAD
+ + * Bits 55-60 page shift (page size = 1<<page shift)
+++=======
++  * Bit  55    pte is soft-dirty (see Documentation/vm/soft-dirty.txt)
++  * Bit  56    page exclusively mapped
++  * Bits 57-60 zero
+++>>>>>>> 77bb499bb60f (pagemap: add mmap-exclusive bit for marking pages mapped only here)
+   * Bit  61    page is file-page or shared-anon
+   * Bit  62    page swapped
+   * Bit  63    page present
+diff --cc tools/vm/page-types.c
+index cc32f303d504,7f73fa32a590..000000000000
+--- a/tools/vm/page-types.c
++++ b/tools/vm/page-types.c
+@@@ -51,23 -57,15 +51,35 @@@
+   * pagemap kernel ABI bits
+   */
+  
+++<<<<<<< HEAD
+ +#define PM_ENTRY_BYTES      sizeof(uint64_t)
+ +#define PM_STATUS_BITS      3
+ +#define PM_STATUS_OFFSET    (64 - PM_STATUS_BITS)
+ +#define PM_STATUS_MASK      (((1LL << PM_STATUS_BITS) - 1) << PM_STATUS_OFFSET)
+ +#define PM_STATUS(nr)       (((nr) << PM_STATUS_OFFSET) & PM_STATUS_MASK)
+ +#define PM_PSHIFT_BITS      6
+ +#define PM_PSHIFT_OFFSET    (PM_STATUS_OFFSET - PM_PSHIFT_BITS)
+ +#define PM_PSHIFT_MASK      (((1LL << PM_PSHIFT_BITS) - 1) << PM_PSHIFT_OFFSET)
+ +#define __PM_PSHIFT(x)      (((uint64_t) (x) << PM_PSHIFT_OFFSET) & PM_PSHIFT_MASK)
+ +#define PM_PFRAME_MASK      ((1LL << PM_PSHIFT_OFFSET) - 1)
+ +#define PM_PFRAME(x)        ((x) & PM_PFRAME_MASK)
+ +
+ +#define __PM_SOFT_DIRTY      (1LL)
+ +#define PM_PRESENT          PM_STATUS(4LL)
+ +#define PM_SWAP             PM_STATUS(2LL)
+ +#define PM_SOFT_DIRTY       __PM_PSHIFT(__PM_SOFT_DIRTY)
+ +
+++=======
++ #define PM_ENTRY_BYTES		8
++ #define PM_PFRAME_BITS		55
++ #define PM_PFRAME_MASK		((1LL << PM_PFRAME_BITS) - 1)
++ #define PM_PFRAME(x)		((x) & PM_PFRAME_MASK)
++ #define PM_SOFT_DIRTY		(1ULL << 55)
++ #define PM_MMAP_EXCLUSIVE	(1ULL << 56)
++ #define PM_FILE			(1ULL << 61)
++ #define PM_SWAP			(1ULL << 62)
++ #define PM_PRESENT		(1ULL << 63)
+++>>>>>>> 77bb499bb60f (pagemap: add mmap-exclusive bit for marking pages mapped only here)
+  
+  /*
+   * kernel page flags
+diff --git a/Documentation/vm/pagemap.txt b/Documentation/vm/pagemap.txt
+index fd7c3cfddd8e..5f54b2d2c892 100644
+--- a/Documentation/vm/pagemap.txt
++++ b/Documentation/vm/pagemap.txt
+@@ -16,7 +16,8 @@ There are three components to pagemap:
+     * Bits 0-4   swap type if swapped
+     * Bits 5-54  swap offset if swapped
+     * Bit  55    pte is soft-dirty (see Documentation/vm/soft-dirty.txt)
+-    * Bits 56-60 zero
++    * Bit  56    page exclusively mapped
++    * Bits 57-60 zero
+     * Bit  61    page is file-page or shared-anon
+     * Bit  62    page swapped
+     * Bit  63    page present
+* Unmerged path fs/proc/task_mmu.c
+* Unmerged path tools/vm/page-types.c
