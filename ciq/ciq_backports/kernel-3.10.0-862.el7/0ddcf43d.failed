@@ -1,0 +1,645 @@
+ipv4: FIB Local/MAIN table collapse
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexander Duyck <alexander.h.duyck@redhat.com>
+commit 0ddcf43d5d4a03ded1ee3f6b3b72a0cbed4e90b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0ddcf43d.failed
+
+This patch is meant to collapse local and main into one by converting
+tb_data from an array to a pointer.  Doing this allows us to point the
+local table into the main while maintaining the same variables in the
+table.
+
+As such the tb_data was converted from an array to a pointer, and a new
+array called data is added in order to still provide an object for tb_data
+to point to.
+
+In order to track the origin of the fib aliases a tb_id value was added in
+a hole that existed on 64b systems.  Using this we can also reverse the
+merge in the event that custom FIB rules are enabled.
+
+With this patch I am seeing an improvement of 20ns to 30ns for routing
+lookups as long as custom rules are not enabled, with custom rules enabled
+we fall back to split tables and the original behavior.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ddcf43d5d4a03ded1ee3f6b3b72a0cbed4e90b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_fib.h
+#	net/core/fib_rules.c
+#	net/ipv4/fib_rules.c
+#	net/ipv4/fib_trie.c
+diff --cc include/net/ip_fib.h
+index c451a6db3f60,54271ed0ed45..000000000000
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@@ -239,20 -185,22 +239,30 @@@ struct fib_table 
+  	u32			tb_id;
+  	int			tb_default;
+  	int			tb_num_default;
+++<<<<<<< HEAD
+ +	unsigned long		tb_data[0];
+++=======
++ 	struct rcu_head		rcu;
++ 	unsigned long 		*tb_data;
++ 	unsigned long		__data[0];
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  };
+  
+  int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
+  		     struct fib_result *res, int fib_flags);
+ -int fib_table_insert(struct fib_table *, struct fib_config *);
+ -int fib_table_delete(struct fib_table *, struct fib_config *);
+ +int fib_table_insert(struct net *, struct fib_table *, struct fib_config *);
+ +int fib_table_delete(struct net *, struct fib_table *, struct fib_config *);
+  int fib_table_dump(struct fib_table *table, struct sk_buff *skb,
+  		   struct netlink_callback *cb);
+++<<<<<<< HEAD
+ +int fib_table_flush(struct net *net, struct fib_table *table);
+++=======
++ int fib_table_flush(struct fib_table *table);
++ struct fib_table *fib_trie_unmerge(struct fib_table *main_tb);
++ void fib_table_flush_external(struct fib_table *table);
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  void fib_free_table(struct fib_table *tb);
+  
+- 
+- 
+  #ifndef CONFIG_IP_MULTIPLE_TABLES
+  
+  #define TABLE_LOCAL_INDEX	(RT_TABLE_LOCAL & (FIB_TABLE_HASHSZ - 1))
+@@@ -285,20 -233,9 +295,26 @@@ static inline int fib_lookup(struct ne
+  
+  	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	tb = fib_get_table(net, RT_TABLE_LOCAL);
+ +	if (tb)
+ +		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+ +
+ +	if (!err)
+ +		goto out;
+ +
+ +	tb = fib_get_table(net, RT_TABLE_MAIN);
+ +	if (tb)
+ +		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+ +
+ +out:
+ +	if (err == -EAGAIN)
+ +		err = -ENETUNREACH;
+++=======
++ 	tb = fib_get_table(net, RT_TABLE_MAIN);
++ 	if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++ 		err = 0;
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  
+  	rcu_read_unlock();
+  
+@@@ -327,27 -264,15 +343,34 @@@ static inline int fib_lookup(struct ne
+  
+  	res->tclassid = 0;
+  
+++<<<<<<< HEAD
+ +	tb = rcu_dereference_rtnl(net->ipv4.fib_local);
+ +	if (tb)
+ +		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+ +
+ +	if (!err)
+ +		goto out;
+++=======
++ 	for (err = 0; !err; err = -ENETUNREACH) {
++ 		tb = rcu_dereference_rtnl(net->ipv4.fib_main);
++ 		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
++ 			break;
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  
+ -		tb = rcu_dereference_rtnl(net->ipv4.fib_default);
+ -		if (tb && !fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF))
+ -			break;
+ -	}
+ +	tb = rcu_dereference_rtnl(net->ipv4.fib_main);
+ +	if (tb)
+ +		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+ +
+ +	if (!err)
+ +		goto out;
+ +
+ +	tb = rcu_dereference_rtnl(net->ipv4.fib_default);
+ +	if (tb)
+ +		err = fib_table_lookup(tb, flp, res, FIB_LOOKUP_NOREF);
+ +
+ +out:
+ +	if (err == -EAGAIN)
+ +		err = -ENETUNREACH;
+  
+  	rcu_read_unlock();
+  
+@@@ -375,6 -300,8 +398,11 @@@ static inline int fib_num_tclassid_user
+  	return 0;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ int fib_unmerge(struct net *net);
++ void fib_flush_external(struct net *net);
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  
+  /* Exported by fib_semantics.c */
+  int ip_fib_check_default(__be32 gw, struct net_device *dev);
+diff --cc net/core/fib_rules.c
+index ce8f348377af,b55677fed1c8..000000000000
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@@ -476,8 -492,11 +476,16 @@@ static int fib_nl_delrule(struct sk_buf
+  			goto errout;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (rule->tun_id)
+ +			ip_tunnel_unneed_metadata();
+++=======
++ 		if (ops->delete) {
++ 			err = ops->delete(rule);
++ 			if (err)
++ 				goto errout;
++ 		}
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  
+  		list_del_rcu(&rule->list);
+  
+diff --cc net/ipv4/fib_rules.c
+index 8225b78362db,e9bc5e42cf43..000000000000
+--- a/net/ipv4/fib_rules.c
++++ b/net/ipv4/fib_rules.c
+@@@ -207,7 -236,9 +217,13 @@@ static int fib4_rule_delete(struct fib_
+  		net->ipv4.fib_num_tclassid_users--;
+  #endif
+  	net->ipv4.fib_has_custom_rules = true;
+++<<<<<<< HEAD
+ +	call_fib_rule_notifiers(net, FIB_EVENT_RULE_DEL);
+++=======
++ 	fib_flush_external(rule->fr_net);
++ errout:
++ 	return err;
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  }
+  
+  static int fib4_rule_compare(struct fib_rule *rule, struct fib_rule_hdr *frh,
+diff --cc net/ipv4/fib_trie.c
+index c6fa84ea0802,7b2badd74ad8..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1333,7 -1200,18 +1336,8 @@@ int fib_table_insert(struct net *net, s
+  	new_fa->fa_type = cfg->fc_type;
+  	new_fa->fa_state = 0;
+  	new_fa->fa_slen = slen;
++ 	new_fa->tb_id = tb->tb_id;
+  
+ -	/* (Optionally) offload fib entry to switch hardware. */
+ -	err = netdev_switch_fib_ipv4_add(key, plen, fi, tos,
+ -					 cfg->fc_type,
+ -					 cfg->fc_nlflags,
+ -					 tb->tb_id);
+ -	if (err) {
+ -		netdev_switch_fib_ipv4_abort(fi);
+ -		goto out_free_new_fa;
+ -	}
+ -
+  	/* Insert new entry to the list. */
+  	err = fib_insert_alias(t, tp, l, new_fa, fa, key);
+  	if (err)
+@@@ -1343,10 -1221,8 +1347,15 @@@
+  		tb->tb_num_default++;
+  
+  	rt_cache_flush(cfg->fc_nlinfo.nl_net);
+++<<<<<<< HEAD
+ +	call_fib_entry_notifiers(net, event, key, plen, fi, tos, cfg->fc_type,
+ +				 tb->tb_id);
+ +	rtmsg_fib(RTM_NEWROUTE, htonl(key), new_fa, plen, tb->tb_id,
+ +		  &cfg->fc_nlinfo, nlflags);
+++=======
++ 	rtmsg_fib(RTM_NEWROUTE, htonl(key), new_fa, plen, new_fa->tb_id,
++ 		  &cfg->fc_nlinfo, 0);
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  succeeded:
+  	return 0;
+  
+@@@ -1703,8 -1583,199 +1715,202 @@@ found
+  	return n;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fib_trie_free(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order and free everything */
++ 	for (;;) {
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			n = pn;
++ 			pn = node_parent(pn);
++ 
++ 			/* drop emptied tnode */
++ 			put_child_root(pn, n->key, NULL);
++ 			node_free(n);
++ 
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			hlist_del_rcu(&fa->fa_list);
++ 			alias_free_mem_rcu(fa);
++ 		}
++ 
++ 		put_child_root(pn, n->key, NULL);
++ 		node_free(n);
++ 	}
++ 
++ #ifdef CONFIG_IP_FIB_TRIE_STATS
++ 	free_percpu(t->stats);
++ #endif
++ 	kfree(tb);
++ }
++ 
++ struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
++ {
++ 	struct trie *ot = (struct trie *)oldtb->tb_data;
++ 	struct key_vector *l, *tp = ot->kv;
++ 	struct fib_table *local_tb;
++ 	struct fib_alias *fa;
++ 	struct trie *lt;
++ 	t_key key = 0;
++ 
++ 	if (oldtb->tb_data == oldtb->__data)
++ 		return oldtb;
++ 
++ 	local_tb = fib_trie_table(RT_TABLE_LOCAL, NULL);
++ 	if (!local_tb)
++ 		return NULL;
++ 
++ 	lt = (struct trie *)local_tb->tb_data;
++ 
++ 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
++ 		struct key_vector *local_l = NULL, *local_tp;
++ 
++ 		hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
++ 			struct fib_alias *new_fa;
++ 
++ 			if (local_tb->tb_id != fa->tb_id)
++ 				continue;
++ 
++ 			/* clone fa for new local table */
++ 			new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);
++ 			if (!new_fa)
++ 				goto out;
++ 
++ 			memcpy(new_fa, fa, sizeof(*fa));
++ 
++ 			/* insert clone into table */
++ 			if (!local_l)
++ 				local_l = fib_find_node(lt, &local_tp, l->key);
++ 
++ 			if (fib_insert_alias(lt, local_tp, local_l, new_fa,
++ 					     NULL, l->key))
++ 				goto out;
++ 		}
++ 
++ 		/* stop loop if key wrapped back to 0 */
++ 		key = l->key + 1;
++ 		if (key < l->key)
++ 			break;
++ 	}
++ 
++ 	return local_tb;
++ out:
++ 	fib_trie_free(local_tb);
++ 
++ 	return NULL;
++ }
++ 
++ /* Caller must hold RTNL */
++ void fib_table_flush_external(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order */
++ 	for (;;) {
++ 		unsigned char slen = 0;
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			/* cannot resize the trie vector */
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			/* resize completed node */
++ 			pn = resize(t, pn);
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			struct fib_info *fi = fa->fa_info;
++ 
++ 			/* if alias was cloned to local then we just
++ 			 * need to remove the local copy from main
++ 			 */
++ 			if (tb->tb_id != fa->tb_id) {
++ 				hlist_del_rcu(&fa->fa_list);
++ 				alias_free_mem_rcu(fa);
++ 				continue;
++ 			}
++ 
++ 			/* record local slen */
++ 			slen = fa->fa_slen;
++ 
++ 			if (!fi || !(fi->fib_flags & RTNH_F_EXTERNAL))
++ 				continue;
++ 
++ 			netdev_switch_fib_ipv4_del(n->key,
++ 						   KEYLENGTH - fa->fa_slen,
++ 						   fi, fa->fa_tos,
++ 						   fa->fa_type, tb->tb_id);
++ 		}
++ 
++ 		/* update leaf slen */
++ 		n->slen = slen;
++ 
++ 		if (hlist_empty(&n->leaf)) {
++ 			put_child_root(pn, n->key, NULL);
++ 			node_free(n);
++ 		} else {
++ 			leaf_pull_suffix(pn, n);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  /* Caller must hold RTNL. */
+ -int fib_table_flush(struct fib_table *tb)
+ +int fib_table_flush(struct net *net, struct fib_table *tb)
+  {
+  	struct trie *t = (struct trie *)tb->tb_data;
+  	struct key_vector *pn = t->kv;
+@@@ -1777,77 -1849,14 +1983,84 @@@
+  	return found;
+  }
+  
+ +static void fib_leaf_notify(struct net *net, struct key_vector *l,
+ +			    struct fib_table *tb, struct notifier_block *nb,
+ +			    enum fib_event_type event_type)
+ +{
+ +	struct fib_alias *fa;
+ +
+ +	hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
+ +		struct fib_info *fi = fa->fa_info;
+ +
+ +		if (!fi)
+ +			continue;
+ +
+ +#if 0
+ +		/* local and main table can share the same trie,
+ +		 * so don't notify twice for the same entry.
+ +		 *
+ +		 * RHEL note: This cannot happen because there is not
+ +		 * backported 0ddcf43d5d4a ("ipv4: FIB Local/MAIN table
+ +		 * collapse") in RHEL. Local and main tables cannot share
+ +		 * a trie. Leaving the code and this note for future.
+ +		 */
+ +		if (tb->tb_id != fa->tb_id)
+ +			continue;
+ +#endif
+ +
+ +		call_fib_entry_notifier(nb, net, event_type, l->key,
+ +					KEYLENGTH - fa->fa_slen, fi, fa->fa_tos,
+ +					fa->fa_type, tb->tb_id);
+ +	}
+ +}
+ +
+ +static void fib_table_notify(struct net *net, struct fib_table *tb,
+ +			     struct notifier_block *nb,
+ +			     enum fib_event_type event_type)
+ +{
+ +	struct trie *t = (struct trie *)tb->tb_data;
+ +	struct key_vector *l, *tp = t->kv;
+ +	t_key key = 0;
+ +
+ +	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
+ +		fib_leaf_notify(net, l, tb, nb, event_type);
+ +
+ +		key = l->key + 1;
+ +		/* stop in case of wrap around */
+ +		if (key < l->key)
+ +			break;
+ +	}
+ +}
+ +
+ +static void fib_notify(struct net *net, struct notifier_block *nb,
+ +		       enum fib_event_type event_type)
+ +{
+ +	unsigned int h;
+ +
+ +	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
+ +		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
+ +		struct fib_table *tb;
+ +
+ +		hlist_for_each_entry_rcu(tb, head, tb_hlist)
+ +			fib_table_notify(net, tb, nb, event_type);
+ +	}
+ +}
+ +
+  static void __trie_free_rcu(struct rcu_head *head)
+  {
+ -	struct fib_table *tb = container_of(head, struct fib_table, rcu);
+ +	struct trie *t = container_of(head, struct trie, rcu);
+ +	unsigned long *tb_data = (unsigned long *)t;
+ +	struct fib_table *tb = container_of(tb_data, struct fib_table,
+ +					    tb_data[0]);
+  #ifdef CONFIG_IP_FIB_TRIE_STATS
+++<<<<<<< HEAD
+ +	free_percpu(t->stats);
+++=======
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 
++ 	if (tb->tb_data == tb->__data)
++ 		free_percpu(t->stats);
+++>>>>>>> 0ddcf43d5d4a (ipv4: FIB Local/MAIN table collapse)
+  #endif /* CONFIG_IP_FIB_TRIE_STATS */
+  	kfree(tb);
+  }
+diff --git a/include/net/fib_rules.h b/include/net/fib_rules.h
+index 951273722f8b..922eaa50ece9 100644
+--- a/include/net/fib_rules.h
++++ b/include/net/fib_rules.h
+@@ -57,7 +57,7 @@ struct fib_rules_ops {
+ 					     struct sk_buff *,
+ 					     struct fib_rule_hdr *,
+ 					     struct nlattr **);
+-	void			(*delete)(struct fib_rule *);
++	int			(*delete)(struct fib_rule *);
+ 	int			(*compare)(struct fib_rule *,
+ 					   struct fib_rule_hdr *,
+ 					   struct nlattr **);
+* Unmerged path include/net/ip_fib.h
+* Unmerged path net/core/fib_rules.c
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index a1edce8ca987..dc62ea7cc7a2 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -52,14 +52,14 @@ static int __net_init fib4_rules_init(struct net *net)
+ {
+ 	struct fib_table *local_table, *main_table;
+ 
+-	local_table = fib_trie_table(RT_TABLE_LOCAL);
+-	if (local_table == NULL)
+-		return -ENOMEM;
+-
+-	main_table  = fib_trie_table(RT_TABLE_MAIN);
++	main_table  = fib_trie_table(RT_TABLE_MAIN, NULL);
+ 	if (main_table == NULL)
+ 		goto fail;
+ 
++	local_table = fib_trie_table(RT_TABLE_LOCAL, main_table);
++	if (local_table == NULL)
++		return -ENOMEM;
++
+ 	hlist_add_head_rcu(&local_table->tb_hlist,
+ 				&net->ipv4.fib_table_hash[TABLE_LOCAL_INDEX]);
+ 	hlist_add_head_rcu(&main_table->tb_hlist,
+@@ -74,7 +74,7 @@ fail:
+ 
+ struct fib_table *fib_new_table(struct net *net, u32 id)
+ {
+-	struct fib_table *tb;
++	struct fib_table *tb, *alias = NULL;
+ 	unsigned int h;
+ 
+ 	if (id == 0)
+@@ -83,7 +83,10 @@ struct fib_table *fib_new_table(struct net *net, u32 id)
+ 	if (tb)
+ 		return tb;
+ 
+-	tb = fib_trie_table(id);
++	if (id == RT_TABLE_LOCAL)
++		alias = fib_new_table(net, RT_TABLE_MAIN);
++
++	tb = fib_trie_table(id, alias);
+ 	if (!tb)
+ 		return NULL;
+ 
+@@ -126,6 +129,48 @@ struct fib_table *fib_get_table(struct net *net, u32 id)
+ }
+ #endif /* CONFIG_IP_MULTIPLE_TABLES */
+ 
++static void fib_replace_table(struct net *net, struct fib_table *old,
++			      struct fib_table *new)
++{
++#ifdef CONFIG_IP_MULTIPLE_TABLES
++	switch (new->tb_id) {
++	case RT_TABLE_LOCAL:
++		rcu_assign_pointer(net->ipv4.fib_local, new);
++		break;
++	case RT_TABLE_MAIN:
++		rcu_assign_pointer(net->ipv4.fib_main, new);
++		break;
++	case RT_TABLE_DEFAULT:
++		rcu_assign_pointer(net->ipv4.fib_default, new);
++		break;
++	default:
++		break;
++	}
++
++#endif
++	/* replace the old table in the hlist */
++	hlist_replace_rcu(&old->tb_hlist, &new->tb_hlist);
++}
++
++int fib_unmerge(struct net *net)
++{
++	struct fib_table *old, *new;
++
++	old = fib_get_table(net, RT_TABLE_LOCAL);
++	new = fib_trie_unmerge(old);
++
++	if (!new)
++		return -ENOMEM;
++
++	/* replace merged table with clean table */
++	if (new != old) {
++		fib_replace_table(net, old, new);
++		fib_free_table(old);
++	}
++
++	return 0;
++}
++
+ static void fib_flush(struct net *net)
+ {
+ 	int flushed = 0;
+diff --git a/net/ipv4/fib_lookup.h b/net/ipv4/fib_lookup.h
+index c6118779d817..072fb917ee28 100644
+--- a/net/ipv4/fib_lookup.h
++++ b/net/ipv4/fib_lookup.h
+@@ -12,6 +12,7 @@ struct fib_alias {
+ 	u8			fa_type;
+ 	u8			fa_state;
+ 	u8			fa_slen;
++	u32			tb_id;
+ 	struct rcu_head		rcu;
+ };
+ 
+* Unmerged path net/ipv4/fib_rules.c
+* Unmerged path net/ipv4/fib_trie.c
