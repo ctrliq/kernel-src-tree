@@ -1,0 +1,184 @@
+nvme: move namespace scanning to core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] move namespace scanning to core (David Milburn) [1384066]
+Rebuild_FUZZ: 91.18%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5955be2144b3b56182e2175e7e3d2ddf27fb485d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5955be21.failed
+
+Move the scan work item and surrounding code to the common code.  For now
+we need a new finish_scan method to allow the PCI driver to set the
+irq affinity hints, but I have plans in the works to obsolete this as well.
+
+Note that this moves the namespace scanning from nvme_wq to the system
+workqueue, but as we don't rely on namespace scanning to finish from reset
+or I/O this should be fine.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by Jon Derrick: <jonathan.derrick@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 5955be2144b3b56182e2175e7e3d2ddf27fb485d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index b3ed604adce1,899bb4181495..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1362,7 -1559,21 +1367,24 @@@ static void nvme_scan_work(struct work_
+  	list_sort(NULL, &ctrl->namespaces, ns_cmp);
+  	mutex_unlock(&ctrl->namespaces_mutex);
+  	kfree(id);
++ 
++ 	if (ctrl->ops->post_scan)
++ 		ctrl->ops->post_scan(ctrl);
++ }
+++<<<<<<< HEAD
+++=======
++ 
++ void nvme_queue_scan(struct nvme_ctrl *ctrl)
++ {
++ 	/*
++ 	 * Do not queue new scan work when a controller is reset during
++ 	 * removal.
++ 	 */
++ 	if (ctrl->state == NVME_CTRL_LIVE)
++ 		schedule_work(&ctrl->scan_work);
+  }
++ EXPORT_SYMBOL_GPL(nvme_queue_scan);
+++>>>>>>> 5955be2144b3 (nvme: move namespace scanning to core)
+  
+  void nvme_remove_namespaces(struct nvme_ctrl *ctrl)
+  {
+@@@ -1402,7 -1614,10 +1424,14 @@@ static void nvme_release_instance(struc
+  }
+  
+  void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
+++<<<<<<< HEAD
+ + {
+++=======
++ {
++ 	flush_work(&ctrl->scan_work);
++ 	nvme_remove_namespaces(ctrl);
++ 
+++>>>>>>> 5955be2144b3 (nvme: move namespace scanning to core)
+  	device_destroy(nvme_class, MKDEV(nvme_char_major, ctrl->instance));
+  
+  	spin_lock(&dev_list_lock);
+diff --cc drivers/nvme/host/pci.c
+index b6cb5e36606f,15bc33755324..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -270,17 -265,6 +269,20 @@@ static int nvme_init_request(void *data
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void nvme_queue_scan(struct nvme_dev *dev)
+ +{
+ +	/*
+ +	 * Do not queue new scan work when a controller is reset during
+ +	 * removal.
+ +	 */
+ +	if (test_bit(NVME_CTRL_REMOVING, &dev->flags))
+ +		return;
+ +	queue_work(nvme_workq, &dev->scan_work);
+ +}
+ +
+++=======
+++>>>>>>> 5955be2144b3 (nvme: move namespace scanning to core)
+  static void nvme_complete_async_event(struct nvme_dev *dev,
+  		struct nvme_completion *cqe)
+  {
+@@@ -297,10 -281,10 +299,15 @@@
+  
+  	switch (result & 0xff07) {
+  	case NVME_AER_NOTICE_NS_CHANGED:
+++<<<<<<< HEAD
+ +		dev_info(dev->dev, "rescanning\n");
+ +		nvme_queue_scan(dev);
+++=======
++ 		dev_info(dev->ctrl.device, "rescanning\n");
++ 		nvme_queue_scan(&dev->ctrl);
+++>>>>>>> 5955be2144b3 (nvme: move namespace scanning to core)
+  	default:
+ -		dev_warn(dev->ctrl.device, "async event result %08x\n", result);
+ +		dev_warn(dev->dev, "async event result %08x\n", result);
+  	}
+  }
+  
+@@@ -1847,7 -1868,13 +1845,17 @@@ static void nvme_reset_work(struct work
+  		nvme_dev_add(dev);
+  	}
+  
+++<<<<<<< HEAD
+ +	clear_bit(NVME_CTRL_RESETTING, &dev->flags);
+++=======
++ 	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_LIVE)) {
++ 		dev_warn(dev->ctrl.device, "failed to mark controller live\n");
++ 		goto out;
++ 	}
++ 
++ 	if (dev->online_queues > 1)
++ 		nvme_queue_scan(&dev->ctrl);
+++>>>>>>> 5955be2144b3 (nvme: move namespace scanning to core)
+  	return;
+  
+   out:
+@@@ -2016,12 -2045,12 +2024,15 @@@ static void nvme_remove(struct pci_dev 
+  {
+  	struct nvme_dev *dev = pci_get_drvdata(pdev);
+  
+ -	del_timer_sync(&dev->watchdog_timer);
+ -
+ -	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
+ -
+ +	set_bit(NVME_CTRL_REMOVING, &dev->flags);
+  	pci_set_drvdata(pdev, NULL);
+  	flush_work(&dev->async_work);
+++<<<<<<< HEAD
+ +	flush_work(&dev->reset_work);
+ +	flush_work(&dev->scan_work);
+ +	nvme_remove_namespaces(&dev->ctrl);
+++=======
+++>>>>>>> 5955be2144b3 (nvme: move namespace scanning to core)
+  	nvme_uninit_ctrl(&dev->ctrl);
+  	nvme_dev_disable(dev, true);
+  	flush_work(&dev->reset_work);
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index b4cca1f4b0ba..29d54708cd7e 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -107,6 +107,7 @@ struct nvme_ctrl {
+ 	u32 vs;
+ 	bool subsystem;
+ 	unsigned long quirks;
++	struct work_struct scan_work;
+ };
+ 
+ /*
+@@ -145,6 +146,7 @@ struct nvme_ctrl_ops {
+ 	int (*reg_read64)(struct nvme_ctrl *ctrl, u32 off, u64 *val);
+ 	int (*reset_ctrl)(struct nvme_ctrl *ctrl);
+ 	void (*free_ctrl)(struct nvme_ctrl *ctrl);
++	void (*post_scan)(struct nvme_ctrl *ctrl);
+ };
+ 
+ static inline bool nvme_ctrl_ready(struct nvme_ctrl *ctrl)
+@@ -232,7 +234,7 @@ void nvme_uninit_ctrl(struct nvme_ctrl *ctrl);
+ void nvme_put_ctrl(struct nvme_ctrl *ctrl);
+ int nvme_init_identify(struct nvme_ctrl *ctrl);
+ 
+-void nvme_scan_namespaces(struct nvme_ctrl *ctrl);
++void nvme_queue_scan(struct nvme_ctrl *ctrl);
+ void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
+ 
+ void nvme_stop_queues(struct nvme_ctrl *ctrl);
+* Unmerged path drivers/nvme/host/pci.c
