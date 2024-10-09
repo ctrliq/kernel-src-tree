@@ -1,0 +1,727 @@
+HID: wacom: add full support of the Wacom Bamboo PAD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: add full support of the Wacom Bamboo PAD (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 94.95%
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit 8c97a765467c5d58682e85f103899ec2355fc393
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8c97a765.failed
+
+The stylus of this device works just fine out of the box.
+The touch is seen by default as a mouse with relative events and some
+gestures.
+The wireless and the wired version have slightly different firmwares, but
+the debug mode 2 on the feature 2 is common to the 2 devices. In this mode,
+all the reports are emitted through the debug interface (pen, raw touch
+and mouse emulation), so we have to re-route manually the events.
+
+We keep the Pen interface as a HID_GENERIC one because it works, and only
+parse the raw touches while discarding the mouse emulation & gestures.
+
+Switching the default in raw mode allows us to have a consistent user
+experience accross all the multitouch touchpads (and enable the touch part
+of the devices).
+
+Note that the buttons of this devices are reported through the touch
+interface. There is no 'Pad' interface. It seemed more natural to have
+the BTN_LEFT and BTN_RIGHT reported with the touch because they are
+placed under the touch interface and it looks like they belong to the
+touch part.
+
+	Tested-by: Josep Sanchez Ferreres <josep.sanchez.ferreres@est.fib.upc.edu>
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Acked-by: Ping Cheng <pingc@wacom.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 8c97a765467c5d58682e85f103899ec2355fc393)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+#	drivers/hid/wacom_wac.c
+#	drivers/hid/wacom_wac.h
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,957699fb70b5..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -568,17 -392,26 +568,20 @@@ static int wacom_query_tablet_data(stru
+  	if (features->device_type == BTN_TOOL_FINGER) {
+  		if (features->type > TABLETPC) {
+  			/* MT Tablet PC touch */
+ -			return wacom_set_device_mode(hdev, 3, 4, 4);
+ +			return wacom_set_device_mode(intf, 3, 4, 4);
+  		}
+ -		else if (features->type == WACOM_24HDT || features->type == CINTIQ_HYBRID) {
+ -			return wacom_set_device_mode(hdev, 18, 3, 2);
+ +		else if (features->type == WACOM_24HDT) {
+ +			return wacom_set_device_mode(intf, 18, 3, 2);
+  		}
+  		else if (features->type == WACOM_27QHDT) {
+ -			return wacom_set_device_mode(hdev, 131, 3, 2);
+ +			return wacom_set_device_mode(intf, 131, 3, 2);
+  		}
++ 		else if (features->type == BAMBOO_PAD) {
++ 			return wacom_set_device_mode(hdev, 2, 2, 2);
++ 		}
+  	} else if (features->device_type == BTN_TOOL_PEN) {
+  		if (features->type <= BAMBOO_PT && features->type != WIRELESS) {
+ -			return wacom_set_device_mode(hdev, 2, 2, 2);
+ +			return wacom_set_device_mode(intf, 2, 2, 2);
+  		}
+  	}
+  
+@@@ -1334,11 -1421,28 +1337,26 @@@ static int wacom_probe(struct usb_inter
+  	wacom->intf = intf;
+  	mutex_init(&wacom->lock);
+  	INIT_WORK(&wacom->work, wacom_wireless_work);
+ +	usb_make_path(dev, wacom->phys, sizeof(wacom->phys));
+ +	strlcat(wacom->phys, "/input0", sizeof(wacom->phys));
+  
+ -	if (!(features->quirks & WACOM_QUIRK_NO_INPUT)) {
+ -		error = wacom_allocate_inputs(wacom);
+ -		if (error)
+ -			goto fail_allocate_inputs;
+ -	}
+ +	endpoint = &intf->cur_altsetting->endpoint[0].desc;
+  
++ 	/*
++ 	 * Bamboo Pad has a generic hid handling for the Pen, and we switch it
++ 	 * into debug mode for the touch part.
++ 	 * We ignore the other interfaces.
++ 	 */
++ 	if (features->type == BAMBOO_PAD) {
++ 		if (features->pktlen == WACOM_PKGLEN_PENABLED) {
++ 			features->type = HID_GENERIC;
++ 		} else if ((features->pktlen != WACOM_PKGLEN_BPAD_TOUCH) &&
++ 			   (features->pktlen != WACOM_PKGLEN_BPAD_TOUCH_USB)) {
++ 			error = -ENODEV;
++ 			goto fail_shared_data;
++ 		}
++ 	}
++ 
+  	/* set the default size in case we do not get them from hid */
+  	wacom_set_default_phy(features);
+  
+@@@ -1364,6 -1465,27 +1382,30 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Same thing for Bamboo 3rd gen.
++ 	 */
++ 	if ((features->type == BAMBOO_PT) &&
++ 	    (features->pktlen == WACOM_PKGLEN_BBTOUCH3) &&
++ 	    (features->device_type == BTN_TOOL_PEN)) {
++ 		features->device_type = BTN_TOOL_FINGER;
++ 
++ 		features->x_max = 4096;
++ 		features->y_max = 4096;
++ 	}
++ 
++ 	/*
++ 	 * Same thing for Bamboo PAD
++ 	 */
++ 	if (features->type == BAMBOO_PAD)
++ 		features->device_type = BTN_TOOL_FINGER;
++ 
++ 	if (hdev->bus == BUS_BLUETOOTH)
++ 		features->quirks |= WACOM_QUIRK_BATTERY;
++ 
+++>>>>>>> 8c97a765467c (HID: wacom: add full support of the Wacom Bamboo PAD)
+  	wacom_setup_device_quirks(features);
+  
+  	/* set unit to "100th of a mm" for devices not reported by HID */
+diff --cc drivers/hid/wacom_wac.c
+index d83376be6444,bbf72f94c91d..000000000000
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@@ -1589,6 -2233,211 +1678,214 @@@ int wacom_setup_input_capabilities(stru
+  		__set_bit(INPUT_PROP_POINTER, input_dev->propbit);
+  		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case WACOM_27QHD:
++ 	case WACOM_24HD:
++ 	case DTK:
++ 	case WACOM_22HD:
++ 	case WACOM_21UX2:
++ 	case WACOM_BEE:
++ 	case CINTIQ:
++ 	case WACOM_13HD:
++ 	case CINTIQ_HYBRID:
++ 		input_set_abs_params(input_dev, ABS_Z, -900, 899, 0, 0);
++ 		input_abs_set_res(input_dev, ABS_Z, 287);
++ 		__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
++ 		wacom_setup_cintiq(wacom_wac);
++ 		break;
++ 
++ 	case INTUOS3:
++ 	case INTUOS3L:
++ 	case INTUOS3S:
++ 	case INTUOS4:
++ 	case INTUOS4WL:
++ 	case INTUOS4L:
++ 	case INTUOS4S:
++ 		input_set_abs_params(input_dev, ABS_Z, -900, 899, 0, 0);
++ 		input_abs_set_res(input_dev, ABS_Z, 287);
++ 		/* fall through */
++ 
++ 	case INTUOS:
++ 		__set_bit(INPUT_PROP_POINTER, input_dev->propbit);
++ 
++ 		wacom_setup_intuos(wacom_wac);
++ 		break;
++ 
++ 	case INTUOS5:
++ 	case INTUOS5L:
++ 	case INTUOSPM:
++ 	case INTUOSPL:
++ 	case INTUOS5S:
++ 	case INTUOSPS:
++ 		__set_bit(INPUT_PROP_POINTER, input_dev->propbit);
++ 
++ 		if (features->device_type == BTN_TOOL_PEN) {
++ 			input_set_abs_params(input_dev, ABS_DISTANCE, 0,
++ 					      features->distance_max,
++ 					      0, 0);
++ 
++ 			input_set_abs_params(input_dev, ABS_Z, -900, 899, 0, 0);
++ 			input_abs_set_res(input_dev, ABS_Z, 287);
++ 
++ 			wacom_setup_intuos(wacom_wac);
++ 		} else if (features->device_type == BTN_TOOL_FINGER) {
++ 			__clear_bit(ABS_MISC, input_dev->absbit);
++ 
++ 			input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR,
++ 			                     0, features->x_max, 0, 0);
++ 			input_set_abs_params(input_dev, ABS_MT_TOUCH_MINOR,
++ 			                     0, features->y_max, 0, 0);
++ 			input_mt_init_slots(input_dev, features->touch_max, INPUT_MT_POINTER);
++ 		}
++ 		break;
++ 
++ 	case WACOM_24HDT:
++ 		if (features->device_type == BTN_TOOL_FINGER) {
++ 			input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR, 0, features->x_max, 0, 0);
++ 			input_set_abs_params(input_dev, ABS_MT_WIDTH_MAJOR, 0, features->x_max, 0, 0);
++ 			input_set_abs_params(input_dev, ABS_MT_WIDTH_MINOR, 0, features->y_max, 0, 0);
++ 			input_set_abs_params(input_dev, ABS_MT_ORIENTATION, 0, 1, 0, 0);
++ 		}
++ 		/* fall through */
++ 
++ 	case WACOM_27QHDT:
++ 	case MTSCREEN:
++ 	case MTTPC:
++ 	case MTTPC_B:
++ 	case TABLETPC2FG:
++ 		if (features->device_type == BTN_TOOL_FINGER && features->touch_max > 1)
++ 			input_mt_init_slots(input_dev, features->touch_max, INPUT_MT_DIRECT);
++ 		/* fall through */
++ 
++ 	case TABLETPC:
++ 	case TABLETPCE:
++ 		__clear_bit(ABS_MISC, input_dev->absbit);
++ 
++ 		__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
++ 
++ 		if (features->device_type != BTN_TOOL_PEN)
++ 			break;  /* no need to process stylus stuff */
++ 
++ 		/* fall through */
++ 
++ 	case DTUS:
++ 	case DTUSX:
++ 	case PL:
++ 	case DTU:
++ 		__set_bit(BTN_TOOL_PEN, input_dev->keybit);
++ 		__set_bit(BTN_TOOL_RUBBER, input_dev->keybit);
++ 		__set_bit(BTN_STYLUS, input_dev->keybit);
++ 		__set_bit(BTN_STYLUS2, input_dev->keybit);
++ 
++ 		__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
++ 		break;
++ 
++ 	case PTU:
++ 		__set_bit(BTN_STYLUS2, input_dev->keybit);
++ 		/* fall through */
++ 
++ 	case PENPARTNER:
++ 		__set_bit(BTN_TOOL_PEN, input_dev->keybit);
++ 		__set_bit(BTN_TOOL_RUBBER, input_dev->keybit);
++ 		__set_bit(BTN_STYLUS, input_dev->keybit);
++ 
++ 		__set_bit(INPUT_PROP_POINTER, input_dev->propbit);
++ 		break;
++ 
++ 	case INTUOSHT:
++ 		if (features->touch_max &&
++ 		    features->device_type == BTN_TOOL_FINGER) {
++ 			input_dev->evbit[0] |= BIT_MASK(EV_SW);
++ 			__set_bit(SW_MUTE_DEVICE, input_dev->swbit);
++ 		}
++ 		/* fall through */
++ 
++ 	case BAMBOO_PT:
++ 		__clear_bit(ABS_MISC, input_dev->absbit);
++ 
++ 		if (features->device_type == BTN_TOOL_FINGER) {
++ 
++ 			if (features->touch_max) {
++ 				if (features->pktlen == WACOM_PKGLEN_BBTOUCH3) {
++ 					input_set_abs_params(input_dev,
++ 						     ABS_MT_TOUCH_MAJOR,
++ 						     0, features->x_max, 0, 0);
++ 					input_set_abs_params(input_dev,
++ 						     ABS_MT_TOUCH_MINOR,
++ 						     0, features->y_max, 0, 0);
++ 				}
++ 				input_mt_init_slots(input_dev, features->touch_max, INPUT_MT_POINTER);
++ 			} else {
++ 				/* buttons/keys only interface */
++ 				__clear_bit(ABS_X, input_dev->absbit);
++ 				__clear_bit(ABS_Y, input_dev->absbit);
++ 				__clear_bit(BTN_TOUCH, input_dev->keybit);
++ 
++ 				/* PAD is setup by wacom_setup_pad_input_capabilities later */
++ 				return 1;
++ 			}
++ 		} else if (features->device_type == BTN_TOOL_PEN) {
++ 			__set_bit(INPUT_PROP_POINTER, input_dev->propbit);
++ 			__set_bit(BTN_TOOL_RUBBER, input_dev->keybit);
++ 			__set_bit(BTN_TOOL_PEN, input_dev->keybit);
++ 			__set_bit(BTN_STYLUS, input_dev->keybit);
++ 			__set_bit(BTN_STYLUS2, input_dev->keybit);
++ 			input_set_abs_params(input_dev, ABS_DISTANCE, 0,
++ 					      features->distance_max,
++ 					      0, 0);
++ 		}
++ 		break;
++ 	case BAMBOO_PAD:
++ 		__clear_bit(ABS_MISC, input_dev->absbit);
++ 		input_mt_init_slots(input_dev, features->touch_max,
++ 				    INPUT_MT_POINTER);
++ 		__set_bit(BTN_LEFT, input_dev->keybit);
++ 		__set_bit(BTN_RIGHT, input_dev->keybit);
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ int wacom_setup_pad_input_capabilities(struct input_dev *input_dev,
++ 				   struct wacom_wac *wacom_wac)
++ {
++ 	struct wacom_features *features = &wacom_wac->features;
++ 	int i;
++ 
++ 	input_dev->evbit[0] |= BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
++ 
++ 	/* kept for making legacy xf86-input-wacom working with the wheels */
++ 	__set_bit(ABS_MISC, input_dev->absbit);
++ 
++ 	/* kept for making legacy xf86-input-wacom accepting the pad */
++ 	input_set_abs_params(input_dev, ABS_X, 0, 1, 0, 0);
++ 	input_set_abs_params(input_dev, ABS_Y, 0, 1, 0, 0);
++ 
++ 	/* kept for making udev and libwacom accepting the pad */
++ 	__set_bit(BTN_STYLUS, input_dev->keybit);
++ 
++ 	switch (features->type) {
++ 	case GRAPHIRE_BT:
++ 		__set_bit(BTN_0, input_dev->keybit);
++ 		__set_bit(BTN_1, input_dev->keybit);
++ 		break;
++ 
++ 	case WACOM_MO:
++ 		__set_bit(BTN_BACK, input_dev->keybit);
++ 		__set_bit(BTN_LEFT, input_dev->keybit);
++ 		__set_bit(BTN_FORWARD, input_dev->keybit);
++ 		__set_bit(BTN_RIGHT, input_dev->keybit);
++ 		input_set_abs_params(input_dev, ABS_WHEEL, 0, 71, 0, 0);
++ 		break;
++ 
++ 	case WACOM_G4:
++ 		__set_bit(BTN_BACK, input_dev->keybit);
++ 		__set_bit(BTN_FORWARD, input_dev->keybit);
++ 		input_set_capability(input_dev, EV_REL, REL_WHEEL);
++ 		break;
++ 
+++>>>>>>> 8c97a765467c (HID: wacom: add full support of the Wacom Bamboo PAD)
+  	case WACOM_24HD:
+  		__set_bit(BTN_A, input_dev->keybit);
+  		__set_bit(BTN_B, input_dev->keybit);
+@@@ -2114,136 -2891,197 +2411,169 @@@ static const struct wacom_features waco
+  	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x5e };
+  static const struct wacom_features wacom_features_0x5E =
+  	{ "Wacom Cintiq 22HDT", .type = WACOM_24HDT,
+ -	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x5b, .touch_max = 10,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ +	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x5b, .touch_max = 10 };
+  static const struct wacom_features wacom_features_0x90 =
+ -	{ "Wacom ISDv4 90", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 90",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x93 =
+ -	{ "Wacom ISDv4 93", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 93",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x97 =
+ -	{ "Wacom ISDv4 97", 26202, 16325, 511, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 97",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  511,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x9A =
+ -	{ "Wacom ISDv4 9A", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 9A",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x9F =
+ -	{ "Wacom ISDv4 9F", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 9F",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xE2 =
+ -	{ "Wacom ISDv4 E2", 26202, 16325, 255, 0,
+ -	  TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom ISDv4 E2",       WACOM_PKGLEN_TPC2FG,    26202, 16325,  255,
+ +	  0, TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xE3 =
+ -	{ "Wacom ISDv4 E3", 26202, 16325, 255, 0,
+ -	  TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom ISDv4 E3",       WACOM_PKGLEN_TPC2FG,    26202, 16325,  255,
+ +	  0, TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xE5 =
+ -	{ "Wacom ISDv4 E5", 26202, 16325, 255, 0,
+ -	  MTSCREEN, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 E5",       WACOM_PKGLEN_MTOUCH,    26202, 16325,  255,
+ +	  0, MTSCREEN, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xE6 =
+ -	{ "Wacom ISDv4 E6", 27760, 15694, 255, 0,
+ -	  TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom ISDv4 E6",       WACOM_PKGLEN_TPC2FG,    27760, 15694,  255,
+ +	  0, TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xEC =
+ -	{ "Wacom ISDv4 EC", 25710, 14500, 255, 0,
+ -	  TABLETPC,    WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 EC",       WACOM_PKGLEN_GRAPHIRE,  25710, 14500,  255,
+ +	  0, TABLETPC,    WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xED =
+ -	{ "Wacom ISDv4 ED", 26202, 16325, 255, 0,
+ -	  TABLETPCE, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 ED",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPCE, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xEF =
+ -	{ "Wacom ISDv4 EF", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 EF",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x100 =
+ -	{ "Wacom ISDv4 100", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 100",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x101 =
+ -	{ "Wacom ISDv4 101", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 101",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x10D =
+ -	{ "Wacom ISDv4 10D", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x10E =
+ -	{ "Wacom ISDv4 10E", 27760, 15694, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x10F =
+ -	{ "Wacom ISDv4 10F", 27760, 15694, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x116 =
+ -	{ "Wacom ISDv4 116", 26202, 16325, 255, 0,
+ -	  TABLETPCE, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x12C =
+ -	{ "Wacom ISDv4 12C", 27848, 15752, 2047, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 10D",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x4001 =
+ -	{ "Wacom ISDv4 4001", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x4004 =
+ -	{ "Wacom ISDv4 4004", 11060, 6220, 255, 0,
+ -	  MTTPC_B, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x5000 =
+ -	{ "Wacom ISDv4 5000", 27848, 15752, 1023, 0,
+ -	  MTTPC_B, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x5002 =
+ -	{ "Wacom ISDv4 5002", 29576, 16724, 1023, 0,
+ -	  MTTPC_B, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 4001",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x47 =
+ -	{ "Wacom Intuos2 6x8", 20320, 16240, 1023, 31,
+ -	  INTUOS, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom Intuos2 6x8",    WACOM_PKGLEN_INTUOS,    20320, 16240, 1023,
+ +	  31, INTUOS, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x84 =
+ -	{ "Wacom Wireless Receiver", 0, 0, 0, 0,
+ -	  WIRELESS, 0, 0, .touch_max = 16 };
+ +	{ "Wacom Wireless Receiver", WACOM_PKGLEN_WIRELESS, 0, 0, 0,
+ +	  0, WIRELESS, 0, 0, .touch_max = 16 };
+  static const struct wacom_features wacom_features_0xD0 =
+ -	{ "Wacom Bamboo 2FG", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG",     WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD1 =
+ -	{ "Wacom Bamboo 2FG 4x5", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG 4x5", WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD2 =
+ -	{ "Wacom Bamboo Craft", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo Craft",   WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD3 =
+ -	{ "Wacom Bamboo 2FG 6x8", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG 6x8", WACOM_PKGLEN_BBFUN,     21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD4 =
+ -	{ "Wacom Bamboo Pen", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom Bamboo Pen",     WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xD5 =
+ -	{ "Wacom Bamboo Pen 6x8", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom Bamboo Pen 6x8",     WACOM_PKGLEN_BBFUN, 21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xD6 =
+ -	{ "Wacom BambooPT 2FG 4x5", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom BambooPT 2FG 4x5", WACOM_PKGLEN_BBFUN,   14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD7 =
+ -	{ "Wacom BambooPT 2FG Small", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom BambooPT 2FG Small", WACOM_PKGLEN_BBFUN, 14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD8 =
+ -	{ "Wacom Bamboo Comic 2FG", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo Comic 2FG", WACOM_PKGLEN_BBFUN,   21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xDA =
+ -	{ "Wacom Bamboo 2FG 4x5 SE", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ -static const struct wacom_features wacom_features_0xDB =
+ -	{ "Wacom Bamboo 2FG 6x8 SE", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG 4x5 SE", WACOM_PKGLEN_BBFUN,  14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+ +static struct wacom_features wacom_features_0xDB =
+ +	{ "Wacom Bamboo 2FG 6x8 SE", WACOM_PKGLEN_BBFUN,  21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xDD =
+ -        { "Wacom Bamboo Connect", 14720, 9200, 1023, 31,
+ -          BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +        { "Wacom Bamboo Connect", WACOM_PKGLEN_BBPEN,     14720,  9200, 1023,
+ +          31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xDE =
+ -        { "Wacom Bamboo 16FG 4x5", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16 };
+ +        { "Wacom Bamboo 16FG 4x5", WACOM_PKGLEN_BBPEN,    14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 16 };
+  static const struct wacom_features wacom_features_0xDF =
+ -        { "Wacom Bamboo 16FG 6x8", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16 };
+ -static const struct wacom_features wacom_features_0x300 =
+ -	{ "Wacom Bamboo One S", 14720, 9225, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x301 =
+ -	{ "Wacom Bamboo One M", 21648, 13530, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x302 =
+ -	{ "Wacom Intuos PT S", 15200, 9500, 1023, 31,
+ -	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ -static const struct wacom_features wacom_features_0x303 =
+ -	{ "Wacom Intuos PT M", 21600, 13500, 1023, 31,
+ -	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ -static const struct wacom_features wacom_features_0x30E =
+ -	{ "Wacom Intuos S", 15200, 9500, 1023, 31,
+ -	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ +        { "Wacom Bamboo 16FG 6x8", WACOM_PKGLEN_BBPEN,    21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 16 };
+  static const struct wacom_features wacom_features_0x6004 =
+++<<<<<<< HEAD
+ +	{ "ISD-V4",               WACOM_PKGLEN_GRAPHIRE,  12800,  8000,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+++=======
++ 	{ "ISD-V4", 12800, 8000, 255, 0,
++ 	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
++ static const struct wacom_features wacom_features_0x307 =
++ 	{ "Wacom ISDv5 307", 59152, 33448, 2047, 63,
++ 	  CINTIQ_HYBRID, WACOM_INTUOS3_RES, WACOM_INTUOS3_RES,
++ 	  WACOM_CINTIQ_OFFSET, WACOM_CINTIQ_OFFSET,
++ 	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x309 };
++ static const struct wacom_features wacom_features_0x309 =
++ 	{ "Wacom ISDv5 309", .type = WACOM_24HDT, /* Touch */
++ 	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x0307, .touch_max = 10,
++ 	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
++ static const struct wacom_features wacom_features_0x30A =
++ 	{ "Wacom ISDv5 30A", 59152, 33448, 2047, 63,
++ 	  CINTIQ_HYBRID, WACOM_INTUOS3_RES, WACOM_INTUOS3_RES,
++ 	  WACOM_CINTIQ_OFFSET, WACOM_CINTIQ_OFFSET,
++ 	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x30C };
++ static const struct wacom_features wacom_features_0x30C =
++ 	{ "Wacom ISDv5 30C", .type = WACOM_24HDT, /* Touch */
++ 	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x30A, .touch_max = 10,
++ 	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
++ static const struct wacom_features wacom_features_0x318 =
++ 	{ "Wacom USB Bamboo PAD", 4095, 4095, /* Touch */
++ 	  .type = BAMBOO_PAD, 35, 48, .touch_max = 4 };
++ static const struct wacom_features wacom_features_0x319 =
++ 	{ "Wacom Wireless Bamboo PAD", 4095, 4095, /* Touch */
++ 	  .type = BAMBOO_PAD, 35, 48, .touch_max = 4 };
++ static const struct wacom_features wacom_features_0x323 =
++ 	{ "Wacom Intuos P M", 21600, 13500, 1023, 31,
++ 	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
++ 	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+++>>>>>>> 8c97a765467c (HID: wacom: add full support of the Wacom Bamboo PAD)
+  
+ -static const struct wacom_features wacom_features_HID_ANY_ID =
+ -	{ "Wacom HID", .type = HID_GENERIC };
+ +#define USB_DEVICE_WACOM(prod)					\
+ +	USB_DEVICE(USB_VENDOR_ID_WACOM, prod),			\
+ +	.driver_info = (kernel_ulong_t)&wacom_features_##prod
+  
+ -#define USB_DEVICE_WACOM(prod)						\
+ -	HID_DEVICE(BUS_USB, HID_GROUP_WACOM, USB_VENDOR_ID_WACOM, prod),\
+ -	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+ -
+ -#define BT_DEVICE_WACOM(prod)						\
+ -	HID_DEVICE(BUS_BLUETOOTH, HID_GROUP_WACOM, USB_VENDOR_ID_WACOM, prod),\
+ -	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+ -
+ -#define I2C_DEVICE_WACOM(prod)						\
+ -	HID_DEVICE(BUS_I2C, HID_GROUP_WACOM, USB_VENDOR_ID_WACOM, prod),\
+ -	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+ +#define USB_DEVICE_DETAILED(prod, class, sub, proto)			\
+ +	USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_WACOM, prod, class,	\
+ +				      sub, proto),			\
+ +	.driver_info = (kernel_ulong_t)&wacom_features_##prod
+  
+  #define USB_DEVICE_LENOVO(prod)					\
+ -	HID_USB_DEVICE(USB_VENDOR_ID_LENOVO, prod),			\
+ -	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+ +	USB_DEVICE(USB_VENDOR_ID_LENOVO, prod),			\
+ +	.driver_info = (kernel_ulong_t)&wacom_features_##prod
+  
+ -const struct hid_device_id wacom_ids[] = {
+ +const struct usb_device_id wacom_ids[] = {
+  	{ USB_DEVICE_WACOM(0x00) },
+ -	{ USB_DEVICE_WACOM(0x03) },
+  	{ USB_DEVICE_WACOM(0x10) },
+  	{ USB_DEVICE_WACOM(0x11) },
+  	{ USB_DEVICE_WACOM(0x12) },
+@@@ -2351,10 -3184,32 +2681,24 @@@
+  	{ USB_DEVICE_WACOM(0x100) },
+  	{ USB_DEVICE_WACOM(0x101) },
+  	{ USB_DEVICE_WACOM(0x10D) },
+ -	{ USB_DEVICE_WACOM(0x10E) },
+ -	{ USB_DEVICE_WACOM(0x10F) },
+ -	{ USB_DEVICE_WACOM(0x116) },
+ -	{ USB_DEVICE_WACOM(0x12C) },
+ -	{ USB_DEVICE_WACOM(0x300) },
+ -	{ USB_DEVICE_WACOM(0x301) },
+ -	{ USB_DEVICE_WACOM(0x302) },
+ -	{ USB_DEVICE_WACOM(0x303) },
+  	{ USB_DEVICE_WACOM(0x304) },
+++<<<<<<< HEAD
+ +	{ USB_DEVICE_DETAILED(0x314, USB_CLASS_HID, 0, 0) },
+ +	{ USB_DEVICE_DETAILED(0x315, USB_CLASS_HID, 0, 0) },
+ +	{ USB_DEVICE_DETAILED(0x317, USB_CLASS_HID, 0, 0) },
+++=======
++ 	{ USB_DEVICE_WACOM(0x307) },
++ 	{ USB_DEVICE_WACOM(0x309) },
++ 	{ USB_DEVICE_WACOM(0x30A) },
++ 	{ USB_DEVICE_WACOM(0x30C) },
++ 	{ USB_DEVICE_WACOM(0x30E) },
++ 	{ USB_DEVICE_WACOM(0x314) },
++ 	{ USB_DEVICE_WACOM(0x315) },
++ 	{ USB_DEVICE_WACOM(0x317) },
++ 	{ USB_DEVICE_WACOM(0x318) },
++ 	{ USB_DEVICE_WACOM(0x319) },
++ 	{ USB_DEVICE_WACOM(0x323) },
+++>>>>>>> 8c97a765467c (HID: wacom: add full support of the Wacom Bamboo PAD)
+  	{ USB_DEVICE_WACOM(0x32A) },
+  	{ USB_DEVICE_WACOM(0x32B) },
+  	{ USB_DEVICE_WACOM(0x32C) },
+diff --cc drivers/hid/wacom_wac.h
+index d220d069f329,a3d0828ff8b1..000000000000
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@@ -29,8 -31,10 +29,15 @@@
+  #define WACOM_PKGLEN_WIRELESS	32
+  #define WACOM_PKGLEN_MTOUCH	62
+  #define WACOM_PKGLEN_MTTPC	40
+++<<<<<<< HEAD
+ +#define WACOM_REPORT_CINTIQ	16
+ +#define WACOM_REPORT_CINTIQPAD	17
+++=======
++ #define WACOM_PKGLEN_DTUS	68
++ #define WACOM_PKGLEN_PENABLED	 8
++ #define WACOM_PKGLEN_BPAD_TOUCH	32
++ #define WACOM_PKGLEN_BPAD_TOUCH_USB	64
+++>>>>>>> 8c97a765467c (HID: wacom: add full support of the Wacom Bamboo PAD)
+  
+  /* wacom data size per MT contact */
+  #define WACOM_BYTES_PER_MT_PACKET	11
+@@@ -53,10 -58,19 +60,17 @@@
+  #define WACOM_REPORT_TPC1FG		6
+  #define WACOM_REPORT_TPC2FG		13
+  #define WACOM_REPORT_TPCMT		13
+ -#define WACOM_REPORT_TPCMT2		3
+  #define WACOM_REPORT_TPCHID		15
+ -#define WACOM_REPORT_CINTIQ		16
+ -#define WACOM_REPORT_CINTIQPAD		17
+  #define WACOM_REPORT_TPCST		16
+ -#define WACOM_REPORT_DTUS		17
+  #define WACOM_REPORT_TPC1FGE		18
+  #define WACOM_REPORT_24HDT		1
+++<<<<<<< HEAD
+++=======
++ #define WACOM_REPORT_WL			128
++ #define WACOM_REPORT_USB		192
++ #define WACOM_REPORT_BPAD_PEN		3
++ #define WACOM_REPORT_BPAD_TOUCH		16
+++>>>>>>> 8c97a765467c (HID: wacom: add full support of the Wacom Bamboo PAD)
+  
+  /* device quirks */
+  #define WACOM_QUIRK_MULTI_INPUT		0x0001
+* Unmerged path drivers/hid/wacom_sys.c
+* Unmerged path drivers/hid/wacom_wac.c
+* Unmerged path drivers/hid/wacom_wac.h
