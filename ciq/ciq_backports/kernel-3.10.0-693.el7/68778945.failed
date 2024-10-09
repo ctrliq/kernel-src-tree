@@ -1,0 +1,114 @@
+SUNRPC: Separate buffer pointers for RPC Call and Reply messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 68778945e46f143ed7974b427a8065f69a4ce944
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/68778945.failed
+
+For xprtrdma, the RPC Call and Reply buffers are involved in real
+I/O operations.
+
+To start with, the DMA direction of the I/O for a Call is opposite
+that of a Reply.
+
+In the current arrangement, the Reply buffer address is on a
+four-byte alignment just past the call buffer. Would be friendlier
+on some platforms if that was at a DMA cache alignment instead.
+
+Because the current arrangement allocates a single memory region
+which contains both buffers, the RPC Reply buffer often contains a
+page boundary in it when the Call buffer is large enough (which is
+frequent).
+
+It would be a little nicer for setting up DMA operations (and
+possible registration of the Reply buffer) if the two buffers were
+separated, well-aligned, and contained as few page boundaries as
+possible.
+
+Now, I could just pad out the single memory region used for the pair
+of buffers. But frequently that would mean a lot of unused space to
+ensure the Reply buffer did not have a page boundary.
+
+Add a separate pointer to rpc_rqst that points right to the RPC
+Reply buffer. This makes no difference to xprtsock, but it will help
+xprtrdma in subsequent patches.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 68778945e46f143ed7974b427a8065f69a4ce944)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/sched.c
+#	net/sunrpc/xprtrdma/transport.c
+diff --cc net/sunrpc/sched.c
+index fcfd48d263f6,5db68b371db2..000000000000
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@@ -861,7 -890,9 +861,13 @@@ void *rpc_malloc(struct rpc_task *task
+  	buf->len = size;
+  	dprintk("RPC: %5u allocated buffer of size %zu at %p\n",
+  			task->tk_pid, size, buf);
+++<<<<<<< HEAD
+ +	return &buf->data;
+++=======
++ 	rqst->rq_buffer = buf->data;
++ 	rqst->rq_rbuffer = (char *)rqst->rq_buffer + rqst->rq_callsize;
++ 	return 0;
+++>>>>>>> 68778945e46f (SUNRPC: Separate buffer pointers for RPC Call and Reply messages)
+  }
+  EXPORT_SYMBOL_GPL(rpc_malloc);
+  
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,136caf3dd299..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -514,8 -523,9 +514,14 @@@ xprt_rdma_allocate(struct rpc_task *tas
+  out:
+  	dprintk("RPC:       %s: size %zd, request 0x%p\n", __func__, size, req);
+  	req->rl_connect_cookie = 0;	/* our reserved value */
+++<<<<<<< HEAD
+ +	req->rl_task = task;
+ +	return req->rl_sendbuf->rg_base;
+++=======
++ 	rqst->rq_buffer = req->rl_sendbuf->rg_base;
++ 	rqst->rq_rbuffer = (char *)rqst->rq_buffer + rqst->rq_rcvsize;
++ 	return 0;
+++>>>>>>> 68778945e46f (SUNRPC: Separate buffer pointers for RPC Call and Reply messages)
+  
+  out_rdmabuf:
+  	min_size = r_xprt->rx_data.inline_wsize;
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index a5425a2a0462..d464368cc530 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -84,8 +84,9 @@ struct rpc_rqst {
+ 	struct list_head	rq_list;
+ 
+ 	void			*rq_buffer;	/* Call XDR encode buffer */
+-	size_t			rq_callsize,
+-				rq_rcvsize;
++	size_t			rq_callsize;
++	void			*rq_rbuffer;	/* Reply XDR decode buffer */
++	size_t			rq_rcvsize;
+ 	size_t			rq_xmit_bytes_sent;	/* total bytes sent */
+ 	size_t			rq_reply_bytes_recvd;	/* total reply bytes */
+ 							/* received */
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index c64bdf532ed4..f3a024d48853 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -1762,7 +1762,7 @@ rpc_xdr_encode(struct rpc_task *task)
+ 		     req->rq_buffer,
+ 		     req->rq_callsize);
+ 	xdr_buf_init(&req->rq_rcv_buf,
+-		     (char *)req->rq_buffer + req->rq_callsize,
++		     req->rq_rbuffer,
+ 		     req->rq_rcvsize);
+ 
+ 	p = rpc_encode_header(task);
+* Unmerged path net/sunrpc/sched.c
+* Unmerged path net/sunrpc/xprtrdma/transport.c
