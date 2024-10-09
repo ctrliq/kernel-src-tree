@@ -1,0 +1,192 @@
+mm: mempolicy: turn vma_set_policy() into vma_dup_policy()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit ef0855d334e1e4af7c3e0c42146a8479ea14a5ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ef0855d3.failed
+
+Simple cleanup.  Every user of vma_set_policy() does the same work, this
+looks a bit annoying imho.  And the new trivial helper which does
+mpol_dup() + vma_set_policy() to simplify the callers.
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ef0855d334e1e4af7c3e0c42146a8479ea14a5ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+diff --cc kernel/fork.c
+index 350a3225b39e,81ccb4f010c2..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -403,8 -351,6 +403,11 @@@ static int dup_mmap(struct mm_struct *m
+  	struct rb_node **rb_link, *rb_parent;
+  	int retval;
+  	unsigned long charge;
+++<<<<<<< HEAD
+ +	struct mempolicy *pol;
+ +	LIST_HEAD(uf);
+++=======
+++>>>>>>> ef0855d334e1 (mm: mempolicy: turn vma_set_policy() into vma_dup_policy())
+  
+  	uprobe_start_dup_mmap();
+  	down_write(&oldmm->mmap_sem);
+@@@ -458,23 -399,13 +461,21 @@@
+  			goto fail_nomem;
+  		*tmp = *mpnt;
+  		INIT_LIST_HEAD(&tmp->anon_vma_chain);
+- 		pol = mpol_dup(vma_policy(mpnt));
+- 		retval = PTR_ERR(pol);
+- 		if (IS_ERR(pol))
++ 		retval = vma_dup_policy(mpnt, tmp);
++ 		if (retval)
+  			goto fail_nomem_policy;
+- 		vma_set_policy(tmp, pol);
+  		tmp->vm_mm = mm;
+ -		if (anon_vma_fork(tmp, mpnt))
+ +		retval = dup_userfaultfd(tmp, &uf);
+ +		if (retval)
+ +			goto fail_nomem_anon_vma_fork;
+ +		if (tmp->vm_flags & VM_WIPEONFORK) {
+ +			/* VM_WIPEONFORK gets a clean slate in the child. */
+ +			tmp->anon_vma = NULL;
+ +			if (anon_vma_prepare(tmp))
+ +				goto fail_nomem_anon_vma_fork;
+ +		} else if (anon_vma_fork(tmp, mpnt))
+  			goto fail_nomem_anon_vma_fork;
+ -		tmp->vm_flags &= ~VM_LOCKED;
+ +		tmp->vm_flags &= ~(VM_LOCKED|VM_LOCKONFAULT);
+  		tmp->vm_next = tmp->vm_prev = NULL;
+  		file = tmp->vm_file;
+  		if (file) {
+diff --git a/include/linux/mempolicy.h b/include/linux/mempolicy.h
+index 69b9a2b8f968..0d4e7bb2588d 100644
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@ -92,7 +92,6 @@ static inline struct mempolicy *mpol_dup(struct mempolicy *pol)
+ }
+ 
+ #define vma_policy(vma) ((vma)->vm_policy)
+-#define vma_set_policy(vma, pol) ((vma)->vm_policy = (pol))
+ 
+ static inline void mpol_get(struct mempolicy *pol)
+ {
+@@ -127,6 +126,7 @@ struct shared_policy {
+ 	rwlock_t lock;
+ };
+ 
++int vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst);
+ void mpol_shared_policy_init(struct shared_policy *sp, struct mempolicy *mpol);
+ int mpol_set_shared_policy(struct shared_policy *info,
+ 				struct vm_area_struct *vma,
+@@ -256,7 +256,12 @@ mpol_shared_policy_lookup(struct shared_policy *sp, unsigned long idx)
+ }
+ 
+ #define vma_policy(vma) NULL
+-#define vma_set_policy(vma, pol) do {} while(0)
++
++static inline int
++vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst)
++{
++	return 0;
++}
+ 
+ static inline void numa_policy_init(void)
+ {
+* Unmerged path kernel/fork.c
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index f339cd117114..26cfc00b24da 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2156,6 +2156,16 @@ retry_cpuset:
+ }
+ EXPORT_SYMBOL(alloc_pages_current);
+ 
++int vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst)
++{
++	struct mempolicy *pol = mpol_dup(vma_policy(src));
++
++	if (IS_ERR(pol))
++		return PTR_ERR(pol);
++	dst->vm_policy = pol;
++	return 0;
++}
++
+ /*
+  * If mpol_dup() sees current->cpuset == cpuset_being_rebound, then it
+  * rebinds the mempolicy its copying by calling mpol_rebind_policy()
+diff --git a/mm/mmap.c b/mm/mmap.c
+index d07a55987643..cb68990be4cd 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2687,7 +2687,6 @@ detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
+ int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long addr, int new_below)
+ {
+-	struct mempolicy *pol;
+ 	struct vm_area_struct *new;
+ 	int err = -ENOMEM;
+ 
+@@ -2713,12 +2712,9 @@ int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		new->vm_pgoff += ((addr - vma->vm_start) >> PAGE_SHIFT);
+ 	}
+ 
+-	pol = mpol_dup(vma_policy(vma));
+-	if (IS_ERR(pol)) {
+-		err = PTR_ERR(pol);
++	err = vma_dup_policy(vma, new);
++	if (err)
+ 		goto out_free_vma;
+-	}
+-	vma_set_policy(new, pol);
+ 
+ 	if (anon_vma_clone(new, vma))
+ 		goto out_free_mpol;
+@@ -2746,7 +2742,7 @@ int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		fput(new->vm_file);
+ 	unlink_anon_vmas(new);
+  out_free_mpol:
+-	mpol_put(pol);
++	mpol_put(vma_policy(new));
+  out_free_vma:
+ 	kmem_cache_free(vm_area_cachep, new);
+  out_err:
+@@ -3118,7 +3114,6 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	struct vm_area_struct *new_vma, *prev;
+ 	struct rb_node **rb_link, *rb_parent;
+-	struct mempolicy *pol;
+ 	bool faulted_in_anon_vma = true;
+ 
+ 	/*
+@@ -3164,10 +3159,8 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 			new_vma->vm_start = addr;
+ 			new_vma->vm_end = addr + len;
+ 			new_vma->vm_pgoff = pgoff;
+-			pol = mpol_dup(vma_policy(vma));
+-			if (IS_ERR(pol))
++			if (vma_dup_policy(vma, new_vma))
+ 				goto out_free_vma;
+-			vma_set_policy(new_vma, pol);
+ 			INIT_LIST_HEAD(&new_vma->anon_vma_chain);
+ 			if (anon_vma_clone(new_vma, vma))
+ 				goto out_free_mempol;
+@@ -3182,7 +3175,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 	return new_vma;
+ 
+  out_free_mempol:
+-	mpol_put(pol);
++	mpol_put(vma_policy(new_vma));
+  out_free_vma:
+ 	kmem_cache_free(vm_area_cachep, new_vma);
+ 	return NULL;
