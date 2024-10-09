@@ -1,0 +1,450 @@
+sched: Replace post_schedule with a balance callback list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit e3fca9e7cbfb72694a21c886fcdf9f059cfded9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/e3fca9e7.failed
+
+Generalize the post_schedule() stuff into a balance callback list.
+This allows us to more easily use it outside of schedule() and cross
+sched_class.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: ktkhai@parallels.com
+	Cc: rostedt@goodmis.org
+	Cc: juri.lelli@gmail.com
+	Cc: pang.xunlei@linaro.org
+	Cc: oleg@redhat.com
+	Cc: wanpeng.li@linux.intel.com
+	Cc: umgwanakikbuti@gmail.com
+Link: http://lkml.kernel.org/r/20150611124742.424032725@infradead.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit e3fca9e7cbfb72694a21c886fcdf9f059cfded9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+#	kernel/sched/rt.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/core.c
+index 9474c46ea21e,fa32bc09dadf..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -2473,35 -2276,36 +2473,51 @@@ static void finish_task_switch(struct r
+  
+  #ifdef CONFIG_SMP
+  
+ +/* assumes rq->lock is held */
+ +static inline void pre_schedule(struct rq *rq, struct task_struct *prev)
+ +{
+ +	if (prev->sched_class->pre_schedule)
+ +		prev->sched_class->pre_schedule(rq, prev);
+ +}
+ +
+  /* rq->lock is NOT held, but preemption is disabled */
+- static inline void post_schedule(struct rq *rq)
++ static void __balance_callback(struct rq *rq)
+  {
+- 	if (rq->post_schedule) {
+- 		unsigned long flags;
++ 	struct callback_head *head, *next;
++ 	void (*func)(struct rq *rq);
++ 	unsigned long flags;
+  
+- 		raw_spin_lock_irqsave(&rq->lock, flags);
+- 		if (rq->curr->sched_class->post_schedule)
+- 			rq->curr->sched_class->post_schedule(rq);
+- 		raw_spin_unlock_irqrestore(&rq->lock, flags);
++ 	raw_spin_lock_irqsave(&rq->lock, flags);
++ 	head = rq->balance_callback;
++ 	rq->balance_callback = NULL;
++ 	while (head) {
++ 		func = (void (*)(struct rq *))head->func;
++ 		next = head->next;
++ 		head->next = NULL;
++ 		head = next;
+  
+- 		rq->post_schedule = 0;
++ 		func(rq);
+  	}
++ 	raw_spin_unlock_irqrestore(&rq->lock, flags);
++ }
++ 
++ static inline void balance_callback(struct rq *rq)
++ {
++ 	if (unlikely(rq->balance_callback))
++ 		__balance_callback(rq);
+  }
+  
+  #else
+  
+++<<<<<<< HEAD
+ +static inline void pre_schedule(struct rq *rq, struct task_struct *p)
+ +{
+ +}
+ +
+ +static inline void post_schedule(struct rq *rq)
+++=======
++ static inline void balance_callback(struct rq *rq)
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  {
+  }
+  
+@@@ -2511,23 -2315,17 +2527,31 @@@
+   * schedule_tail - first thing a freshly forked thread must call.
+   * @prev: the thread we just switched away from.
+   */
+ -asmlinkage __visible void schedule_tail(struct task_struct *prev)
+ +asmlinkage void schedule_tail(struct task_struct *prev)
+  	__releases(rq->lock)
+  {
+ -	struct rq *rq;
+ +	struct rq *rq = this_rq();
+  
+++<<<<<<< HEAD
+ +	finish_task_switch(rq, prev);
+ +
+ +	/*
+ +	 * FIXME: do we need to worry about rq being invalidated by the
+ +	 * task_switch?
+ +	 */
+ +	post_schedule(rq);
+++=======
++ 	/* finish_task_switch() drops rq->lock and enables preemtion */
++ 	preempt_disable();
++ 	rq = finish_task_switch(prev);
++ 	balance_callback(rq);
++ 	preempt_enable();
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  
+ +#ifdef __ARCH_WANT_UNLOCKED_CTXSW
+ +	/* In this case, finish_task_switch does not reenable preemption */
+ +	preempt_enable();
+ +#endif
+  	if (current->set_child_tid)
+  		put_user(task_pid_vnr(current), current->set_child_tid);
+  }
+@@@ -3625,13 -2835,8 +3649,17 @@@ need_resched
+  	} else
+  		raw_spin_unlock_irq(&rq->lock);
+  
+++<<<<<<< HEAD
+ +	post_schedule(rq);
+ +
+ +	sched_preempt_enable_no_resched();
+ +	if (need_resched())
+ +		goto need_resched;
+++=======
++ 	balance_callback(rq);
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  }
+ +STACK_FRAME_NON_STANDARD(__schedule); /* switch_to() */
+  
+  static inline void sched_submit_work(struct task_struct *tsk)
+  {
+@@@ -8640,8 -7230,8 +8668,13 @@@ void __init sched_init(void
+  #ifdef CONFIG_SMP
+  		rq->sd = NULL;
+  		rq->rd = NULL;
+++<<<<<<< HEAD
+ +		rq->cpu_power = rq->cpu_capacity_orig = SCHED_POWER_SCALE;
+ +		rq->post_schedule = 0;
+++=======
++ 		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
++ 		rq->balance_callback = NULL;
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  		rq->active_balance = 0;
+  		rq->next_balance = jiffies;
+  		rq->push_cpu = 0;
+diff --cc kernel/sched/deadline.c
+index 75f9634980d1,d80523fb1de5..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -434,9 -208,26 +434,29 @@@ static inline int has_pushable_dl_tasks
+  
+  static int push_dl_task(struct rq *rq);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool need_pull_dl_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	return dl_task(prev);
++ }
++ 
++ static DEFINE_PER_CPU(struct callback_head, dl_balance_head);
++ 
++ static void push_dl_tasks(struct rq *);
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ 	if (!has_pushable_dl_tasks(rq))
++ 		return;
++ 
++ 	queue_balance_callback(rq, &per_cpu(dl_balance_head, rq->cpu), push_dl_tasks);
++ }
++ 
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq);
+  
+ -static void dl_task_offline_migration(struct rq *rq, struct task_struct *p)
+ +static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p)
+  {
+  	struct rq *later_rq = NULL;
+  	bool fallback = false;
+@@@ -507,6 -293,19 +527,22 @@@ void dec_dl_migration(struct sched_dl_e
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool need_pull_dl_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	return false;
++ }
++ 
++ static inline int pull_dl_task(struct rq *rq)
++ {
++ 	return 0;
++ }
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ }
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  #endif /* CONFIG_SMP */
+  
+  static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags);
+@@@ -1604,9 -1133,7 +1640,13 @@@ struct task_struct *pick_next_task_dl(s
+  	if (hrtick_enabled(rq))
+  		start_hrtick_dl(rq, p);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+ +	rq->post_schedule = has_pushable_dl_tasks(rq);
+ +#endif /* CONFIG_SMP */
+++=======
++ 	queue_push_tasks(rq);
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  
+  	return p;
+  }
+@@@ -2032,18 -1551,6 +2072,21 @@@ skip
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void pre_schedule_dl(struct rq *rq, struct task_struct *prev)
+ +{
+ +	/* Try to pull other tasks here */
+ +	if (dl_task(prev))
+ +		pull_dl_task(rq);
+ +}
+ +
+ +static void post_schedule_dl(struct rq *rq)
+ +{
+ +	push_dl_tasks(rq);
+ +}
+ +
+++=======
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  /*
+   * Since the task is not running and a reschedule is not going to happen
+   * anytime soon on its runqueue, we try pushing it away now.
+@@@ -2287,8 -1786,6 +2330,11 @@@ const struct sched_class dl_sched_clas
+  	.set_cpus_allowed       = set_cpus_allowed_dl,
+  	.rq_online              = rq_online_dl,
+  	.rq_offline             = rq_offline_dl,
+++<<<<<<< HEAD
+ +	.pre_schedule		= pre_schedule_dl,
+ +	.post_schedule		= post_schedule_dl,
+++=======
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  	.task_woken		= task_woken_dl,
+  #endif
+  
+diff --cc kernel/sched/rt.c
+index 6b68ceb9a68d,4f3726fe1246..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -313,6 -354,18 +313,21 @@@ static inline int has_pushable_tasks(st
+  	return !plist_head_empty(&rq->rt.pushable_tasks);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static DEFINE_PER_CPU(struct callback_head, rt_balance_head);
++ 
++ static void push_rt_tasks(struct rq *);
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ 	if (!has_pushable_tasks(rq))
++ 		return;
++ 
++ 	queue_balance_callback(rq, &per_cpu(rt_balance_head, rq->cpu), push_rt_tasks);
++ }
++ 
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
+  {
+  	plist_del(&p->pushable_tasks, &rq->rt.pushable_tasks);
+@@@ -357,8 -410,24 +372,24 @@@ void dec_rt_migration(struct sched_rt_e
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	return false;
++ }
++ 
++ static inline int pull_rt_task(struct rq *this_rq)
++ {
++ 	return 0;
++ }
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ }
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  #endif /* CONFIG_SMP */
+  
+ -static void enqueue_top_rt_rq(struct rt_rq *rt_rq);
+ -static void dequeue_top_rt_rq(struct rt_rq *rt_rq);
+ -
+  static inline int on_rt_rq(struct sched_rt_entity *rt_se)
+  {
+  	return !list_empty(&rt_se->run_list);
+@@@ -1370,21 -1465,42 +1401,25 @@@ static struct task_struct *_pick_next_t
+  	return p;
+  }
+  
+ -static struct task_struct *
+ -pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ +static struct task_struct *pick_next_task_rt(struct rq *rq)
+  {
+ -	struct task_struct *p;
+ -	struct rt_rq *rt_rq = &rq->rt;
+ +	struct task_struct *p = _pick_next_task_rt(rq);
+  
+ -	if (need_pull_rt_task(rq, prev)) {
+ -		pull_rt_task(rq);
+ -		/*
+ -		 * pull_rt_task() can drop (and re-acquire) rq->lock; this
+ -		 * means a dl or stop task can slip in, in which case we need
+ -		 * to re-start task selection.
+ -		 */
+ -		if (unlikely((rq->stop && task_on_rq_queued(rq->stop)) ||
+ -			     rq->dl.dl_nr_running))
+ -			return RETRY_TASK;
+ -	}
+ +	/* The running task is never eligible for pushing */
+ +	if (p)
+ +		dequeue_pushable_task(rq, p);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+  	/*
+ -	 * We may dequeue prev's rt_rq in put_prev_task().
+ -	 * So, we update time before rt_nr_running check.
+ +	 * We detect this state here so that we can avoid taking the RQ
+ +	 * lock again later if there is no need to push
+  	 */
+ -	if (prev->sched_class == &rt_sched_class)
+ -		update_curr_rt(rq);
+ -
+ -	if (!rt_rq->rt_queued)
+ -		return NULL;
+ -
+ -	put_prev_task(rq, prev);
+ -
+ -	p = _pick_next_task_rt(rq);
+ -
+ -	/* The running task is never eligible for pushing */
+ -	dequeue_pushable_task(rq, p);
+ -
+ +	rq->post_schedule = has_pushable_tasks(rq);
+ +#endif
+++=======
++ 	queue_push_tasks(rq);
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  
+  	return p;
+  }
+@@@ -1778,18 -2045,6 +1813,21 @@@ skip
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void pre_schedule_rt(struct rq *rq, struct task_struct *prev)
+ +{
+ +	/* Try to pull RT tasks here if we lower this rq's prio */
+ +	if (rq->rt.highest_prio.curr > prev->prio)
+ +		pull_rt_task(rq);
+ +}
+ +
+ +static void post_schedule_rt(struct rq *rq)
+ +{
+ +	push_rt_tasks(rq);
+ +}
+ +
+++=======
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  /*
+   * If we are not running and we are not going to reschedule soon, we should
+   * try to push tasks away now
+@@@ -2061,8 -2316,6 +2099,11 @@@ const struct sched_class rt_sched_clas
+  	.set_cpus_allowed       = set_cpus_allowed_rt,
+  	.rq_online              = rq_online_rt,
+  	.rq_offline             = rq_offline_rt,
+++<<<<<<< HEAD
+ +	.pre_schedule		= pre_schedule_rt,
+ +	.post_schedule		= post_schedule_rt,
+++=======
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  	.task_woken		= task_woken_rt,
+  	.switched_from		= switched_from_rt,
+  #endif
+diff --cc kernel/sched/sched.h
+index 38c9ae998b34,62949ab06bc2..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -673,11 -621,13 +673,12 @@@ struct rq 
+  	struct root_domain *rd;
+  	struct sched_domain *sd;
+  
+ -	unsigned long cpu_capacity;
+ -	unsigned long cpu_capacity_orig;
+ +	unsigned long cpu_power;
+  
++ 	struct callback_head *balance_callback;
++ 
+  	unsigned char idle_balance;
+  	/* For active balancing */
+- 	int post_schedule;
+  	int active_balance;
+  	int push_cpu;
+  	struct cpu_stop_work active_balance_work;
+@@@ -1262,9 -1208,7 +1278,13 @@@ struct sched_class 
+  	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+  	void (*migrate_task_rq)(struct task_struct *p, int next_cpu);
+  
+++<<<<<<< HEAD
+ +	void (*pre_schedule) (struct rq *this_rq, struct task_struct *task);
+ +	void (*post_schedule) (struct rq *this_rq);
+ +	RH_KABI_DEPRECATE_FN(void, task_waking, struct task_struct *task)
+++=======
++ 	void (*task_waking) (struct task_struct *task);
+++>>>>>>> e3fca9e7cbfb (sched: Replace post_schedule with a balance callback list)
+  	void (*task_woken) (struct rq *this_rq, struct task_struct *task);
+  
+  	void (*set_cpus_allowed)(struct task_struct *p,
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/rt.c
+* Unmerged path kernel/sched/sched.h
