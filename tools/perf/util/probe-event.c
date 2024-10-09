@@ -2373,7 +2373,7 @@ kprobe_blacklist__find_by_address(struct list_head *blacklist,
 	struct kprobe_blacklist_node *node;
 
 	list_for_each_entry(node, blacklist, list) {
-		if (node->start <= address && address <= node->end)
+		if (node->start <= address && address < node->end)
 			return node;
 	}
 
