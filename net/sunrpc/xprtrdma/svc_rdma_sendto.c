@@ -314,7 +314,6 @@ static int send_write(struct svcxprt_rdma *xprt, struct svc_rqst *rqstp,
  err:
 	svc_rdma_unmap_dma(ctxt);
 	svc_rdma_put_context(ctxt, 0);
-	/* Fatal error, close transport */
 	return -EIO;
 }
 
@@ -566,6 +565,7 @@ static int send_reply(struct svcxprt_rdma *rdma,
  err:
 	svc_rdma_unmap_dma(ctxt);
 	svc_rdma_put_context(ctxt, 1);
+	pr_err("svcrdma: failed to send reply, rc=%d\n", ret);
 	return -EIO;
 }
 
@@ -637,6 +637,9 @@ int svc_rdma_sendto(struct svc_rqst *rqstp)
 
 	ret = send_reply(rdma, rqstp, res_page, rdma_resp, ctxt, vec,
 			 inline_bytes);
+	if (ret < 0)
+		goto err1;
+
 	svc_rdma_put_req_map(rdma, vec);
 	dprintk("svcrdma: send_reply returns %d\n", ret);
 	return ret;
@@ -646,7 +649,8 @@ int svc_rdma_sendto(struct svc_rqst *rqstp)
  err0:
 	svc_rdma_put_req_map(rdma, vec);
 	svc_rdma_put_context(ctxt, 0);
-	return ret;
+	set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
+	return -ENOTCONN;
 }
 
 void svc_rdma_send_error(struct svcxprt_rdma *xprt, struct rpcrdma_msg *rmsgp,
