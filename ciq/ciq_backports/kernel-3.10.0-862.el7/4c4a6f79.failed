@@ -1,0 +1,184 @@
+KVM: nVMX: track NMI blocking state separately for each VMCS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 4c4a6f790ee862ee9f0dc8b35c71f55bcf792b71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4c4a6f79.failed
+
+vmx_recover_nmi_blocking is using a cached value of the guest
+interruptibility info, which is stored in vmx->nmi_known_unmasked.
+vmx_recover_nmi_blocking is run for both normal and nested guests,
+so the cached value must be per-VMCS.
+
+This fixes eventinj.flat in a nested non-EPT environment.  With EPT it
+works, because the EPT violation handler doesn't have the
+vmx->nmi_known_unmasked optimization (it is unnecessary because, unlike
+vmx_recover_nmi_blocking, it can just look at the exit qualification).
+
+Thanks to Wanpeng Li for debugging the testcase and providing an initial
+patch.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 4c4a6f790ee862ee9f0dc8b35c71f55bcf792b71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 2e8522c4beef,a0c472bcb2a2..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -5078,23 -5511,8 +5079,28 @@@ static void vmx_inject_nmi(struct kvm_v
+  {
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  
+++<<<<<<< HEAD
+ +	if (!is_guest_mode(vcpu)) {
+ +		if (!cpu_has_virtual_nmis()) {
+ +			/*
+ +			 * Tracking the NMI-blocked state in software is built upon
+ +			 * finding the next open IRQ window. This, in turn, depends on
+ +			 * well-behaving guests: They have to keep IRQs disabled at
+ +			 * least as long as the NMI handler runs. Otherwise we may
+ +			 * cause NMI nesting, maybe breaking the guest. But as this is
+ +			 * highly unlikely, we can live with the residual risk.
+ +			 */
+ +			vmx->soft_vnmi_blocked = 1;
+ +			vmx->vnmi_blocked_time = 0;
+ +		}
+ +
+ +		++vcpu->stat.nmi_injections;
+ +		vmx->nmi_known_unmasked = false;
+ +	}
+++=======
++ 	++vcpu->stat.nmi_injections;
++ 	vmx->loaded_vmcs->nmi_known_unmasked = false;
+++>>>>>>> 4c4a6f790ee8 (KVM: nVMX: track NMI blocking state separately for each VMCS)
+  
+  	if (vmx->rmode.vm86_active) {
+  		if (kvm_inject_realmode_interrupt(vcpu, NMI_VECTOR, 0) != EMULATE_DONE)
+@@@ -5108,31 -5526,27 +5114,50 @@@
+  
+  static bool vmx_get_nmi_mask(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	if (!cpu_has_virtual_nmis())
+ +		return to_vmx(vcpu)->soft_vnmi_blocked;
+ +	if (to_vmx(vcpu)->nmi_known_unmasked)
+++=======
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	bool masked;
++ 
++ 	if (vmx->loaded_vmcs->nmi_known_unmasked)
+++>>>>>>> 4c4a6f790ee8 (KVM: nVMX: track NMI blocking state separately for each VMCS)
+  		return false;
+- 	return vmcs_read32(GUEST_INTERRUPTIBILITY_INFO)	& GUEST_INTR_STATE_NMI;
++ 	masked = vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) & GUEST_INTR_STATE_NMI;
++ 	vmx->loaded_vmcs->nmi_known_unmasked = !masked;
++ 	return masked;
+  }
+  
+  static void vmx_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked)
+  {
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  
+++<<<<<<< HEAD
+ +	if (!cpu_has_virtual_nmis()) {
+ +		if (vmx->soft_vnmi_blocked != masked) {
+ +			vmx->soft_vnmi_blocked = masked;
+ +			vmx->vnmi_blocked_time = 0;
+ +		}
+ +	} else {
+ +		vmx->nmi_known_unmasked = !masked;
+ +		if (masked)
+ +			vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO,
+ +				      GUEST_INTR_STATE_NMI);
+ +		else
+ +			vmcs_clear_bits(GUEST_INTERRUPTIBILITY_INFO,
+ +					GUEST_INTR_STATE_NMI);
+ +	}
+++=======
++ 	vmx->loaded_vmcs->nmi_known_unmasked = !masked;
++ 	if (masked)
++ 		vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO,
++ 			      GUEST_INTR_STATE_NMI);
++ 	else
++ 		vmcs_clear_bits(GUEST_INTERRUPTIBILITY_INFO,
++ 				GUEST_INTR_STATE_NMI);
+++>>>>>>> 4c4a6f790ee8 (KVM: nVMX: track NMI blocking state separately for each VMCS)
+  }
+  
+  static int vmx_nmi_allowed(struct kvm_vcpu *vcpu)
+@@@ -8441,37 -8740,33 +8466,67 @@@ static void vmx_recover_nmi_blocking(st
+  
+  	idtv_info_valid = vmx->idt_vectoring_info & VECTORING_INFO_VALID_MASK;
+  
+++<<<<<<< HEAD
+ +	if (cpu_has_virtual_nmis()) {
+ +		if (vmx->nmi_known_unmasked)
+ +			return;
+ +		/*
+ +		 * Can't use vmx->exit_intr_info since we're not sure what
+ +		 * the exit reason is.
+ +		 */
+ +		exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+ +		unblock_nmi = (exit_intr_info & INTR_INFO_UNBLOCK_NMI) != 0;
+ +		vector = exit_intr_info & INTR_INFO_VECTOR_MASK;
+ +		/*
+ +		 * SDM 3: 27.7.1.2 (September 2008)
+ +		 * Re-set bit "block by NMI" before VM entry if vmexit caused by
+ +		 * a guest IRET fault.
+ +		 * SDM 3: 23.2.2 (September 2008)
+ +		 * Bit 12 is undefined in any of the following cases:
+ +		 *  If the VM exit sets the valid bit in the IDT-vectoring
+ +		 *   information field.
+ +		 *  If the VM exit is due to a double fault.
+ +		 */
+ +		if ((exit_intr_info & INTR_INFO_VALID_MASK) && unblock_nmi &&
+ +		    vector != DF_VECTOR && !idtv_info_valid)
+ +			vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO,
+ +				      GUEST_INTR_STATE_NMI);
+ +		else
+ +			vmx->nmi_known_unmasked =
+ +				!(vmcs_read32(GUEST_INTERRUPTIBILITY_INFO)
+ +				  & GUEST_INTR_STATE_NMI);
+ +	} else if (unlikely(vmx->soft_vnmi_blocked))
+ +		vmx->vnmi_blocked_time +=
+ +			ktime_to_ns(ktime_sub(ktime_get(), vmx->entry_time));
+++=======
++ 	if (vmx->loaded_vmcs->nmi_known_unmasked)
++ 		return;
++ 	/*
++ 	 * Can't use vmx->exit_intr_info since we're not sure what
++ 	 * the exit reason is.
++ 	 */
++ 	exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
++ 	unblock_nmi = (exit_intr_info & INTR_INFO_UNBLOCK_NMI) != 0;
++ 	vector = exit_intr_info & INTR_INFO_VECTOR_MASK;
++ 	/*
++ 	 * SDM 3: 27.7.1.2 (September 2008)
++ 	 * Re-set bit "block by NMI" before VM entry if vmexit caused by
++ 	 * a guest IRET fault.
++ 	 * SDM 3: 23.2.2 (September 2008)
++ 	 * Bit 12 is undefined in any of the following cases:
++ 	 *  If the VM exit sets the valid bit in the IDT-vectoring
++ 	 *   information field.
++ 	 *  If the VM exit is due to a double fault.
++ 	 */
++ 	if ((exit_intr_info & INTR_INFO_VALID_MASK) && unblock_nmi &&
++ 	    vector != DF_VECTOR && !idtv_info_valid)
++ 		vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO,
++ 			      GUEST_INTR_STATE_NMI);
++ 	else
++ 		vmx->loaded_vmcs->nmi_known_unmasked =
++ 			!(vmcs_read32(GUEST_INTERRUPTIBILITY_INFO)
++ 			  & GUEST_INTR_STATE_NMI);
+++>>>>>>> 4c4a6f790ee8 (KVM: nVMX: track NMI blocking state separately for each VMCS)
+  }
+  
+  static void __vmx_complete_interrupts(struct kvm_vcpu *vcpu,
+* Unmerged path arch/x86/kvm/vmx.c
