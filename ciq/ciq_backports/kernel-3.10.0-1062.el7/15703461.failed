@@ -1,0 +1,1171 @@
+IB/{hfi1, qib, rdmavt}: Move ruc_loopback to rdmavt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Venkata Sandeep Dhanalakota <venkata.s.dhanalakota@intel.com>
+commit 15703461533a5ffd775722390431625daaae7618
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/15703461.failed
+
+This patch moves ruc_loopback() from hfi1 into rdmavt for code sharing
+with the qib driver.
+
+	Reviewed-by: Brian Welty <brian.welty@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Venkata Sandeep Dhanalakota <venkata.s.dhanalakota@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 15703461533a5ffd775722390431625daaae7618)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/ruc.c
+#	drivers/infiniband/hw/qib/qib_ruc.c
+#	drivers/infiniband/sw/rdmavt/qp.c
+#	include/rdma/rdmavt_qp.h
+diff --cc drivers/infiniband/hw/hfi1/ruc.c
+index cdb8c22819f8,7fb317c711df..000000000000
+--- a/drivers/infiniband/hw/hfi1/ruc.c
++++ b/drivers/infiniband/hw/hfi1/ruc.c
+@@@ -156,333 -156,6 +156,336 @@@ int hfi1_ruc_check_hdr(struct hfi1_ibpo
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ruc_loopback - handle UC and RC loopback requests
+ + * @sqp: the sending QP
+ + *
+ + * This is called from hfi1_do_send() to
+ + * forward a WQE addressed to the same HFI.
+ + * Note that although we are single threaded due to the send engine, we still
+ + * have to protect against post_send().  We don't have to worry about
+ + * receive interrupts since this is a connected protocol and all packets
+ + * will pass through here.
+ + */
+ +static void ruc_loopback(struct rvt_qp *sqp)
+ +{
+ +	struct hfi1_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+ +	struct rvt_qp *qp;
+ +	struct rvt_swqe *wqe;
+ +	struct rvt_sge *sge;
+ +	unsigned long flags;
+ +	struct ib_wc wc;
+ +	u64 sdata;
+ +	atomic64_t *maddr;
+ +	enum ib_wc_status send_status;
+ +	bool release;
+ +	int ret;
+ +	bool copy_last = false;
+ +	int local_ops = 0;
+ +
+ +	rcu_read_lock();
+ +
+ +	/*
+ +	 * Note that we check the responder QP state after
+ +	 * checking the requester's state.
+ +	 */
+ +	qp = rvt_lookup_qpn(ib_to_rvt(sqp->ibqp.device), &ibp->rvp,
+ +			    sqp->remote_qpn);
+ +
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +
+ +	/* Return if we are already busy processing a work request. */
+ +	if ((sqp->s_flags & (RVT_S_BUSY | HFI1_S_ANY_WAIT)) ||
+ +	    !(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_OR_FLUSH_SEND))
+ +		goto unlock;
+ +
+ +	sqp->s_flags |= RVT_S_BUSY;
+ +
+ +again:
+ +	if (sqp->s_last == ACCESS_ONCE(sqp->s_head))
+ +		goto clr_busy;
+ +	wqe = rvt_get_swqe_ptr(sqp, sqp->s_last);
+ +
+ +	/* Return if it is not OK to start a new work request. */
+ +	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_NEXT_SEND_OK)) {
+ +		if (!(ib_rvt_state_ops[sqp->state] & RVT_FLUSH_SEND))
+ +			goto clr_busy;
+ +		/* We are in the error state, flush the work request. */
+ +		send_status = IB_WC_WR_FLUSH_ERR;
+ +		goto flush_send;
+ +	}
+ +
+ +	/*
+ +	 * We can rely on the entry not changing without the s_lock
+ +	 * being held until we update s_last.
+ +	 * We increment s_cur to indicate s_last is in progress.
+ +	 */
+ +	if (sqp->s_last == sqp->s_cur) {
+ +		if (++sqp->s_cur >= sqp->s_size)
+ +			sqp->s_cur = 0;
+ +	}
+ +	spin_unlock_irqrestore(&sqp->s_lock, flags);
+ +
+ +	if (!qp || !(ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) ||
+ +	    qp->ibqp.qp_type != sqp->ibqp.qp_type) {
+ +		ibp->rvp.n_pkt_drops++;
+ +		/*
+ +		 * For RC, the requester would timeout and retry so
+ +		 * shortcut the timeouts and just signal too many retries.
+ +		 */
+ +		if (sqp->ibqp.qp_type == IB_QPT_RC)
+ +			send_status = IB_WC_RETRY_EXC_ERR;
+ +		else
+ +			send_status = IB_WC_SUCCESS;
+ +		goto serr;
+ +	}
+ +
+ +	memset(&wc, 0, sizeof(wc));
+ +	send_status = IB_WC_SUCCESS;
+ +
+ +	release = true;
+ +	sqp->s_sge.sge = wqe->sg_list[0];
+ +	sqp->s_sge.sg_list = wqe->sg_list + 1;
+ +	sqp->s_sge.num_sge = wqe->wr.num_sge;
+ +	sqp->s_len = wqe->length;
+ +	switch (wqe->wr.opcode) {
+ +	case IB_WR_REG_MR:
+ +		goto send_comp;
+ +
+ +	case IB_WR_LOCAL_INV:
+ +		if (!(wqe->wr.send_flags & RVT_SEND_COMPLETION_ONLY)) {
+ +			if (rvt_invalidate_rkey(sqp,
+ +						wqe->wr.ex.invalidate_rkey))
+ +				send_status = IB_WC_LOC_PROT_ERR;
+ +			local_ops = 1;
+ +		}
+ +		goto send_comp;
+ +
+ +	case IB_WR_SEND_WITH_INV:
+ +		if (!rvt_invalidate_rkey(qp, wqe->wr.ex.invalidate_rkey)) {
+ +			wc.wc_flags = IB_WC_WITH_INVALIDATE;
+ +			wc.ex.invalidate_rkey = wqe->wr.ex.invalidate_rkey;
+ +		}
+ +		goto send;
+ +
+ +	case IB_WR_SEND_WITH_IMM:
+ +		wc.wc_flags = IB_WC_WITH_IMM;
+ +		wc.ex.imm_data = wqe->wr.ex.imm_data;
+ +		/* FALLTHROUGH */
+ +	case IB_WR_SEND:
+ +send:
+ +		ret = rvt_get_rwqe(qp, false);
+ +		if (ret < 0)
+ +			goto op_err;
+ +		if (!ret)
+ +			goto rnr_nak;
+ +		break;
+ +
+ +	case IB_WR_RDMA_WRITE_WITH_IMM:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
+ +			goto inv_err;
+ +		wc.wc_flags = IB_WC_WITH_IMM;
+ +		wc.ex.imm_data = wqe->wr.ex.imm_data;
+ +		ret = rvt_get_rwqe(qp, true);
+ +		if (ret < 0)
+ +			goto op_err;
+ +		if (!ret)
+ +			goto rnr_nak;
+ +		/* skip copy_last set and qp_access_flags recheck */
+ +		goto do_write;
+ +	case IB_WR_RDMA_WRITE:
+ +		copy_last = rvt_is_user_qp(qp);
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
+ +			goto inv_err;
+ +do_write:
+ +		if (wqe->length == 0)
+ +			break;
+ +		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
+ +					  wqe->rdma_wr.remote_addr,
+ +					  wqe->rdma_wr.rkey,
+ +					  IB_ACCESS_REMOTE_WRITE)))
+ +			goto acc_err;
+ +		qp->r_sge.sg_list = NULL;
+ +		qp->r_sge.num_sge = 1;
+ +		qp->r_sge.total_len = wqe->length;
+ +		break;
+ +
+ +	case IB_WR_RDMA_READ:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+ +			goto inv_err;
+ +		if (unlikely(!rvt_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
+ +					  wqe->rdma_wr.remote_addr,
+ +					  wqe->rdma_wr.rkey,
+ +					  IB_ACCESS_REMOTE_READ)))
+ +			goto acc_err;
+ +		release = false;
+ +		sqp->s_sge.sg_list = NULL;
+ +		sqp->s_sge.num_sge = 1;
+ +		qp->r_sge.sge = wqe->sg_list[0];
+ +		qp->r_sge.sg_list = wqe->sg_list + 1;
+ +		qp->r_sge.num_sge = wqe->wr.num_sge;
+ +		qp->r_sge.total_len = wqe->length;
+ +		break;
+ +
+ +	case IB_WR_ATOMIC_CMP_AND_SWP:
+ +	case IB_WR_ATOMIC_FETCH_AND_ADD:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+ +			goto inv_err;
+ +		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+ +					  wqe->atomic_wr.remote_addr,
+ +					  wqe->atomic_wr.rkey,
+ +					  IB_ACCESS_REMOTE_ATOMIC)))
+ +			goto acc_err;
+ +		/* Perform atomic OP and save result. */
+ +		maddr = (atomic64_t *)qp->r_sge.sge.vaddr;
+ +		sdata = wqe->atomic_wr.compare_add;
+ +		*(u64 *)sqp->s_sge.sge.vaddr =
+ +			(wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+ +			(u64)atomic64_add_return(sdata, maddr) - sdata :
+ +			(u64)cmpxchg((u64 *)qp->r_sge.sge.vaddr,
+ +				      sdata, wqe->atomic_wr.swap);
+ +		rvt_put_mr(qp->r_sge.sge.mr);
+ +		qp->r_sge.num_sge = 0;
+ +		goto send_comp;
+ +
+ +	default:
+ +		send_status = IB_WC_LOC_QP_OP_ERR;
+ +		goto serr;
+ +	}
+ +
+ +	sge = &sqp->s_sge.sge;
+ +	while (sqp->s_len) {
+ +		u32 len = sqp->s_len;
+ +
+ +		if (len > sge->length)
+ +			len = sge->length;
+ +		if (len > sge->sge_length)
+ +			len = sge->sge_length;
+ +		WARN_ON_ONCE(len == 0);
+ +		hfi1_copy_sge(&qp->r_sge, sge->vaddr, len, release, copy_last);
+ +		sge->vaddr += len;
+ +		sge->length -= len;
+ +		sge->sge_length -= len;
+ +		if (sge->sge_length == 0) {
+ +			if (!release)
+ +				rvt_put_mr(sge->mr);
+ +			if (--sqp->s_sge.num_sge)
+ +				*sge = *sqp->s_sge.sg_list++;
+ +		} else if (sge->length == 0 && sge->mr->lkey) {
+ +			if (++sge->n >= RVT_SEGSZ) {
+ +				if (++sge->m >= sge->mr->mapsz)
+ +					break;
+ +				sge->n = 0;
+ +			}
+ +			sge->vaddr =
+ +				sge->mr->map[sge->m]->segs[sge->n].vaddr;
+ +			sge->length =
+ +				sge->mr->map[sge->m]->segs[sge->n].length;
+ +		}
+ +		sqp->s_len -= len;
+ +	}
+ +	if (release)
+ +		rvt_put_ss(&qp->r_sge);
+ +
+ +	if (!test_and_clear_bit(RVT_R_WRID_VALID, &qp->r_aflags))
+ +		goto send_comp;
+ +
+ +	if (wqe->wr.opcode == IB_WR_RDMA_WRITE_WITH_IMM)
+ +		wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
+ +	else
+ +		wc.opcode = IB_WC_RECV;
+ +	wc.wr_id = qp->r_wr_id;
+ +	wc.status = IB_WC_SUCCESS;
+ +	wc.byte_len = wqe->length;
+ +	wc.qp = &qp->ibqp;
+ +	wc.src_qp = qp->remote_qpn;
+ +	wc.slid = rdma_ah_get_dlid(&qp->remote_ah_attr) & U16_MAX;
+ +	wc.sl = rdma_ah_get_sl(&qp->remote_ah_attr);
+ +	wc.port_num = 1;
+ +	/* Signal completion event if the solicited bit is set. */
+ +	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+ +		     wqe->wr.send_flags & IB_SEND_SOLICITED);
+ +
+ +send_comp:
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +	ibp->rvp.n_loop_pkts++;
+ +flush_send:
+ +	sqp->s_rnr_retry = sqp->s_rnr_retry_cnt;
+ +	hfi1_send_complete(sqp, wqe, send_status);
+ +	if (local_ops) {
+ +		atomic_dec(&sqp->local_ops_pending);
+ +		local_ops = 0;
+ +	}
+ +	goto again;
+ +
+ +rnr_nak:
+ +	/* Handle RNR NAK */
+ +	if (qp->ibqp.qp_type == IB_QPT_UC)
+ +		goto send_comp;
+ +	ibp->rvp.n_rnr_naks++;
+ +	/*
+ +	 * Note: we don't need the s_lock held since the BUSY flag
+ +	 * makes this single threaded.
+ +	 */
+ +	if (sqp->s_rnr_retry == 0) {
+ +		send_status = IB_WC_RNR_RETRY_EXC_ERR;
+ +		goto serr;
+ +	}
+ +	if (sqp->s_rnr_retry_cnt < 7)
+ +		sqp->s_rnr_retry--;
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_RECV_OK))
+ +		goto clr_busy;
+ +	rvt_add_rnr_timer(sqp, qp->r_min_rnr_timer <<
+ +				IB_AETH_CREDIT_SHIFT);
+ +	goto clr_busy;
+ +
+ +op_err:
+ +	send_status = IB_WC_REM_OP_ERR;
+ +	wc.status = IB_WC_LOC_QP_OP_ERR;
+ +	goto err;
+ +
+ +inv_err:
+ +	send_status = IB_WC_REM_INV_REQ_ERR;
+ +	wc.status = IB_WC_LOC_QP_OP_ERR;
+ +	goto err;
+ +
+ +acc_err:
+ +	send_status = IB_WC_REM_ACCESS_ERR;
+ +	wc.status = IB_WC_LOC_PROT_ERR;
+ +err:
+ +	/* responder goes to error state */
+ +	rvt_rc_error(qp, wc.status);
+ +
+ +serr:
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +	hfi1_send_complete(sqp, wqe, send_status);
+ +	if (sqp->ibqp.qp_type == IB_QPT_RC) {
+ +		int lastwqe = rvt_error_qp(sqp, IB_WC_WR_FLUSH_ERR);
+ +
+ +		sqp->s_flags &= ~RVT_S_BUSY;
+ +		spin_unlock_irqrestore(&sqp->s_lock, flags);
+ +		if (lastwqe) {
+ +			struct ib_event ev;
+ +
+ +			ev.device = sqp->ibqp.device;
+ +			ev.element.qp = &sqp->ibqp;
+ +			ev.event = IB_EVENT_QP_LAST_WQE_REACHED;
+ +			sqp->ibqp.event_handler(&ev, sqp->ibqp.qp_context);
+ +		}
+ +		goto done;
+ +	}
+ +clr_busy:
+ +	sqp->s_flags &= ~RVT_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&sqp->s_lock, flags);
+ +done:
+ +	rcu_read_unlock();
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 15703461533a (IB/{hfi1, qib, rdmavt}: Move ruc_loopback to rdmavt)
+   * hfi1_make_grh - construct a GRH header
+   * @ibp: a pointer to the IB port
+   * @hdr: a pointer to the GRH header being constructed
+diff --cc drivers/infiniband/hw/qib/qib_ruc.c
+index d6231e874b82,1fa21938f310..000000000000
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@@ -171,307 -171,6 +171,310 @@@ err
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * qib_ruc_loopback - handle UC and RC lookback requests
+ + * @sqp: the sending QP
+ + *
+ + * This is called from qib_do_send() to
+ + * forward a WQE addressed to the same HCA.
+ + * Note that although we are single threaded due to the tasklet, we still
+ + * have to protect against post_send().  We don't have to worry about
+ + * receive interrupts since this is a connected protocol and all packets
+ + * will pass through here.
+ + */
+ +static void qib_ruc_loopback(struct rvt_qp *sqp)
+ +{
+ +	struct qib_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+ +	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+ +	struct qib_devdata *dd = ppd->dd;
+ +	struct rvt_dev_info *rdi = &dd->verbs_dev.rdi;
+ +	struct rvt_qp *qp;
+ +	struct rvt_swqe *wqe;
+ +	struct rvt_sge *sge;
+ +	unsigned long flags;
+ +	struct ib_wc wc;
+ +	u64 sdata;
+ +	atomic64_t *maddr;
+ +	enum ib_wc_status send_status;
+ +	int release;
+ +	int ret;
+ +
+ +	rcu_read_lock();
+ +	/*
+ +	 * Note that we check the responder QP state after
+ +	 * checking the requester's state.
+ +	 */
+ +	qp = rvt_lookup_qpn(rdi, &ibp->rvp, sqp->remote_qpn);
+ +	if (!qp)
+ +		goto done;
+ +
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +
+ +	/* Return if we are already busy processing a work request. */
+ +	if ((sqp->s_flags & (RVT_S_BUSY | RVT_S_ANY_WAIT)) ||
+ +	    !(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_OR_FLUSH_SEND))
+ +		goto unlock;
+ +
+ +	sqp->s_flags |= RVT_S_BUSY;
+ +
+ +again:
+ +	if (sqp->s_last == ACCESS_ONCE(sqp->s_head))
+ +		goto clr_busy;
+ +	wqe = rvt_get_swqe_ptr(sqp, sqp->s_last);
+ +
+ +	/* Return if it is not OK to start a new work reqeust. */
+ +	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_NEXT_SEND_OK)) {
+ +		if (!(ib_rvt_state_ops[sqp->state] & RVT_FLUSH_SEND))
+ +			goto clr_busy;
+ +		/* We are in the error state, flush the work request. */
+ +		send_status = IB_WC_WR_FLUSH_ERR;
+ +		goto flush_send;
+ +	}
+ +
+ +	/*
+ +	 * We can rely on the entry not changing without the s_lock
+ +	 * being held until we update s_last.
+ +	 * We increment s_cur to indicate s_last is in progress.
+ +	 */
+ +	if (sqp->s_last == sqp->s_cur) {
+ +		if (++sqp->s_cur >= sqp->s_size)
+ +			sqp->s_cur = 0;
+ +	}
+ +	spin_unlock_irqrestore(&sqp->s_lock, flags);
+ +
+ +	if (!qp || !(ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) ||
+ +	    qp->ibqp.qp_type != sqp->ibqp.qp_type) {
+ +		ibp->rvp.n_pkt_drops++;
+ +		/*
+ +		 * For RC, the requester would timeout and retry so
+ +		 * shortcut the timeouts and just signal too many retries.
+ +		 */
+ +		if (sqp->ibqp.qp_type == IB_QPT_RC)
+ +			send_status = IB_WC_RETRY_EXC_ERR;
+ +		else
+ +			send_status = IB_WC_SUCCESS;
+ +		goto serr;
+ +	}
+ +
+ +	memset(&wc, 0, sizeof(wc));
+ +	send_status = IB_WC_SUCCESS;
+ +
+ +	release = 1;
+ +	sqp->s_sge.sge = wqe->sg_list[0];
+ +	sqp->s_sge.sg_list = wqe->sg_list + 1;
+ +	sqp->s_sge.num_sge = wqe->wr.num_sge;
+ +	sqp->s_len = wqe->length;
+ +	switch (wqe->wr.opcode) {
+ +	case IB_WR_SEND_WITH_IMM:
+ +		wc.wc_flags = IB_WC_WITH_IMM;
+ +		wc.ex.imm_data = wqe->wr.ex.imm_data;
+ +		/* FALLTHROUGH */
+ +	case IB_WR_SEND:
+ +		ret = rvt_get_rwqe(qp, false);
+ +		if (ret < 0)
+ +			goto op_err;
+ +		if (!ret)
+ +			goto rnr_nak;
+ +		break;
+ +
+ +	case IB_WR_RDMA_WRITE_WITH_IMM:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
+ +			goto inv_err;
+ +		wc.wc_flags = IB_WC_WITH_IMM;
+ +		wc.ex.imm_data = wqe->wr.ex.imm_data;
+ +		ret = rvt_get_rwqe(qp, true);
+ +		if (ret < 0)
+ +			goto op_err;
+ +		if (!ret)
+ +			goto rnr_nak;
+ +		/* FALLTHROUGH */
+ +	case IB_WR_RDMA_WRITE:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
+ +			goto inv_err;
+ +		if (wqe->length == 0)
+ +			break;
+ +		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
+ +					  wqe->rdma_wr.remote_addr,
+ +					  wqe->rdma_wr.rkey,
+ +					  IB_ACCESS_REMOTE_WRITE)))
+ +			goto acc_err;
+ +		qp->r_sge.sg_list = NULL;
+ +		qp->r_sge.num_sge = 1;
+ +		qp->r_sge.total_len = wqe->length;
+ +		break;
+ +
+ +	case IB_WR_RDMA_READ:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+ +			goto inv_err;
+ +		if (unlikely(!rvt_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
+ +					  wqe->rdma_wr.remote_addr,
+ +					  wqe->rdma_wr.rkey,
+ +					  IB_ACCESS_REMOTE_READ)))
+ +			goto acc_err;
+ +		release = 0;
+ +		sqp->s_sge.sg_list = NULL;
+ +		sqp->s_sge.num_sge = 1;
+ +		qp->r_sge.sge = wqe->sg_list[0];
+ +		qp->r_sge.sg_list = wqe->sg_list + 1;
+ +		qp->r_sge.num_sge = wqe->wr.num_sge;
+ +		qp->r_sge.total_len = wqe->length;
+ +		break;
+ +
+ +	case IB_WR_ATOMIC_CMP_AND_SWP:
+ +	case IB_WR_ATOMIC_FETCH_AND_ADD:
+ +		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+ +			goto inv_err;
+ +		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+ +					  wqe->atomic_wr.remote_addr,
+ +					  wqe->atomic_wr.rkey,
+ +					  IB_ACCESS_REMOTE_ATOMIC)))
+ +			goto acc_err;
+ +		/* Perform atomic OP and save result. */
+ +		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+ +		sdata = wqe->atomic_wr.compare_add;
+ +		*(u64 *) sqp->s_sge.sge.vaddr =
+ +			(wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+ +			(u64) atomic64_add_return(sdata, maddr) - sdata :
+ +			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+ +				      sdata, wqe->atomic_wr.swap);
+ +		rvt_put_mr(qp->r_sge.sge.mr);
+ +		qp->r_sge.num_sge = 0;
+ +		goto send_comp;
+ +
+ +	default:
+ +		send_status = IB_WC_LOC_QP_OP_ERR;
+ +		goto serr;
+ +	}
+ +
+ +	sge = &sqp->s_sge.sge;
+ +	while (sqp->s_len) {
+ +		u32 len = sqp->s_len;
+ +
+ +		if (len > sge->length)
+ +			len = sge->length;
+ +		if (len > sge->sge_length)
+ +			len = sge->sge_length;
+ +		BUG_ON(len == 0);
+ +		qib_copy_sge(&qp->r_sge, sge->vaddr, len, release);
+ +		sge->vaddr += len;
+ +		sge->length -= len;
+ +		sge->sge_length -= len;
+ +		if (sge->sge_length == 0) {
+ +			if (!release)
+ +				rvt_put_mr(sge->mr);
+ +			if (--sqp->s_sge.num_sge)
+ +				*sge = *sqp->s_sge.sg_list++;
+ +		} else if (sge->length == 0 && sge->mr->lkey) {
+ +			if (++sge->n >= RVT_SEGSZ) {
+ +				if (++sge->m >= sge->mr->mapsz)
+ +					break;
+ +				sge->n = 0;
+ +			}
+ +			sge->vaddr =
+ +				sge->mr->map[sge->m]->segs[sge->n].vaddr;
+ +			sge->length =
+ +				sge->mr->map[sge->m]->segs[sge->n].length;
+ +		}
+ +		sqp->s_len -= len;
+ +	}
+ +	if (release)
+ +		rvt_put_ss(&qp->r_sge);
+ +
+ +	if (!test_and_clear_bit(RVT_R_WRID_VALID, &qp->r_aflags))
+ +		goto send_comp;
+ +
+ +	if (wqe->wr.opcode == IB_WR_RDMA_WRITE_WITH_IMM)
+ +		wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
+ +	else
+ +		wc.opcode = IB_WC_RECV;
+ +	wc.wr_id = qp->r_wr_id;
+ +	wc.status = IB_WC_SUCCESS;
+ +	wc.byte_len = wqe->length;
+ +	wc.qp = &qp->ibqp;
+ +	wc.src_qp = qp->remote_qpn;
+ +	wc.slid = rdma_ah_get_dlid(&qp->remote_ah_attr);
+ +	wc.sl = rdma_ah_get_sl(&qp->remote_ah_attr);
+ +	wc.port_num = 1;
+ +	/* Signal completion event if the solicited bit is set. */
+ +	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+ +		     wqe->wr.send_flags & IB_SEND_SOLICITED);
+ +
+ +send_comp:
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +	ibp->rvp.n_loop_pkts++;
+ +flush_send:
+ +	sqp->s_rnr_retry = sqp->s_rnr_retry_cnt;
+ +	qib_send_complete(sqp, wqe, send_status);
+ +	goto again;
+ +
+ +rnr_nak:
+ +	/* Handle RNR NAK */
+ +	if (qp->ibqp.qp_type == IB_QPT_UC)
+ +		goto send_comp;
+ +	ibp->rvp.n_rnr_naks++;
+ +	/*
+ +	 * Note: we don't need the s_lock held since the BUSY flag
+ +	 * makes this single threaded.
+ +	 */
+ +	if (sqp->s_rnr_retry == 0) {
+ +		send_status = IB_WC_RNR_RETRY_EXC_ERR;
+ +		goto serr;
+ +	}
+ +	if (sqp->s_rnr_retry_cnt < 7)
+ +		sqp->s_rnr_retry--;
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_RECV_OK))
+ +		goto clr_busy;
+ +	rvt_add_rnr_timer(sqp, qp->r_min_rnr_timer <<
+ +				IB_AETH_CREDIT_SHIFT);
+ +	goto clr_busy;
+ +
+ +op_err:
+ +	send_status = IB_WC_REM_OP_ERR;
+ +	wc.status = IB_WC_LOC_QP_OP_ERR;
+ +	goto err;
+ +
+ +inv_err:
+ +	send_status = IB_WC_REM_INV_REQ_ERR;
+ +	wc.status = IB_WC_LOC_QP_OP_ERR;
+ +	goto err;
+ +
+ +acc_err:
+ +	send_status = IB_WC_REM_ACCESS_ERR;
+ +	wc.status = IB_WC_LOC_PROT_ERR;
+ +err:
+ +	/* responder goes to error state */
+ +	rvt_rc_error(qp, wc.status);
+ +
+ +serr:
+ +	spin_lock_irqsave(&sqp->s_lock, flags);
+ +	qib_send_complete(sqp, wqe, send_status);
+ +	if (sqp->ibqp.qp_type == IB_QPT_RC) {
+ +		int lastwqe = rvt_error_qp(sqp, IB_WC_WR_FLUSH_ERR);
+ +
+ +		sqp->s_flags &= ~RVT_S_BUSY;
+ +		spin_unlock_irqrestore(&sqp->s_lock, flags);
+ +		if (lastwqe) {
+ +			struct ib_event ev;
+ +
+ +			ev.device = sqp->ibqp.device;
+ +			ev.element.qp = &sqp->ibqp;
+ +			ev.event = IB_EVENT_QP_LAST_WQE_REACHED;
+ +			sqp->ibqp.event_handler(&ev, sqp->ibqp.qp_context);
+ +		}
+ +		goto done;
+ +	}
+ +clr_busy:
+ +	sqp->s_flags &= ~RVT_S_BUSY;
+ +unlock:
+ +	spin_unlock_irqrestore(&sqp->s_lock, flags);
+ +done:
+ +	rcu_read_unlock();
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 15703461533a (IB/{hfi1, qib, rdmavt}: Move ruc_loopback to rdmavt)
+   * qib_make_grh - construct a GRH header
+   * @ibp: a pointer to the IB port
+   * @hdr: a pointer to the GRH header being constructed
+diff --cc drivers/infiniband/sw/rdmavt/qp.c
+index bc0e332ee6a2,1735deb1a9d4..000000000000
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@@ -2465,3 -2657,454 +2465,457 @@@ void rvt_qp_iter(struct rvt_dev_info *r
+  	rcu_read_unlock();
+  }
+  EXPORT_SYMBOL(rvt_qp_iter);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * This should be called with s_lock held.
++  */
++ void rvt_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
++ 		       enum ib_wc_status status)
++ {
++ 	u32 old_last, last;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(qp->ibqp.device);
++ 
++ 	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_OR_FLUSH_SEND))
++ 		return;
++ 
++ 	last = qp->s_last;
++ 	old_last = last;
++ 	trace_rvt_qp_send_completion(qp, wqe, last);
++ 	if (++last >= qp->s_size)
++ 		last = 0;
++ 	trace_rvt_qp_send_completion(qp, wqe, last);
++ 	qp->s_last = last;
++ 	/* See post_send() */
++ 	barrier();
++ 	rvt_put_swqe(wqe);
++ 	if (qp->ibqp.qp_type == IB_QPT_UD ||
++ 	    qp->ibqp.qp_type == IB_QPT_SMI ||
++ 	    qp->ibqp.qp_type == IB_QPT_GSI)
++ 		atomic_dec(&ibah_to_rvtah(wqe->ud_wr.ah)->refcount);
++ 
++ 	rvt_qp_swqe_complete(qp,
++ 			     wqe,
++ 			     rdi->wc_opcode[wqe->wr.opcode],
++ 			     status);
++ 
++ 	if (qp->s_acked == old_last)
++ 		qp->s_acked = last;
++ 	if (qp->s_cur == old_last)
++ 		qp->s_cur = last;
++ 	if (qp->s_tail == old_last)
++ 		qp->s_tail = last;
++ 	if (qp->state == IB_QPS_SQD && last == qp->s_cur)
++ 		qp->s_draining = 0;
++ }
++ EXPORT_SYMBOL(rvt_send_complete);
++ 
++ /**
++  * rvt_copy_sge - copy data to SGE memory
++  * @qp: associated QP
++  * @ss: the SGE state
++  * @data: the data to copy
++  * @length: the length of the data
++  * @release: boolean to release MR
++  * @copy_last: do a separate copy of the last 8 bytes
++  */
++ void rvt_copy_sge(struct rvt_qp *qp, struct rvt_sge_state *ss,
++ 		  void *data, u32 length,
++ 		  bool release, bool copy_last)
++ {
++ 	struct rvt_sge *sge = &ss->sge;
++ 	int i;
++ 	bool in_last = false;
++ 	bool cacheless_copy = false;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(qp->ibqp.device);
++ 	struct rvt_wss *wss = rdi->wss;
++ 	unsigned int sge_copy_mode = rdi->dparms.sge_copy_mode;
++ 
++ 	if (sge_copy_mode == RVT_SGE_COPY_CACHELESS) {
++ 		cacheless_copy = length >= PAGE_SIZE;
++ 	} else if (sge_copy_mode == RVT_SGE_COPY_ADAPTIVE) {
++ 		if (length >= PAGE_SIZE) {
++ 			/*
++ 			 * NOTE: this *assumes*:
++ 			 * o The first vaddr is the dest.
++ 			 * o If multiple pages, then vaddr is sequential.
++ 			 */
++ 			wss_insert(wss, sge->vaddr);
++ 			if (length >= (2 * PAGE_SIZE))
++ 				wss_insert(wss, (sge->vaddr + PAGE_SIZE));
++ 
++ 			cacheless_copy = wss_exceeds_threshold(wss);
++ 		} else {
++ 			wss_advance_clean_counter(wss);
++ 		}
++ 	}
++ 
++ 	if (copy_last) {
++ 		if (length > 8) {
++ 			length -= 8;
++ 		} else {
++ 			copy_last = false;
++ 			in_last = true;
++ 		}
++ 	}
++ 
++ again:
++ 	while (length) {
++ 		u32 len = rvt_get_sge_length(sge, length);
++ 
++ 		WARN_ON_ONCE(len == 0);
++ 		if (unlikely(in_last)) {
++ 			/* enforce byte transfer ordering */
++ 			for (i = 0; i < len; i++)
++ 				((u8 *)sge->vaddr)[i] = ((u8 *)data)[i];
++ 		} else if (cacheless_copy) {
++ 			cacheless_memcpy(sge->vaddr, data, len);
++ 		} else {
++ 			memcpy(sge->vaddr, data, len);
++ 		}
++ 		rvt_update_sge(ss, len, release);
++ 		data += len;
++ 		length -= len;
++ 	}
++ 
++ 	if (copy_last) {
++ 		copy_last = false;
++ 		in_last = true;
++ 		length = 8;
++ 		goto again;
++ 	}
++ }
++ EXPORT_SYMBOL(rvt_copy_sge);
++ 
++ /**
++  * ruc_loopback - handle UC and RC loopback requests
++  * @sqp: the sending QP
++  *
++  * This is called from rvt_do_send() to forward a WQE addressed to the same HFI
++  * Note that although we are single threaded due to the send engine, we still
++  * have to protect against post_send().  We don't have to worry about
++  * receive interrupts since this is a connected protocol and all packets
++  * will pass through here.
++  */
++ void rvt_ruc_loopback(struct rvt_qp *sqp)
++ {
++ 	struct rvt_ibport *rvp =  NULL;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(sqp->ibqp.device);
++ 	struct rvt_qp *qp;
++ 	struct rvt_swqe *wqe;
++ 	struct rvt_sge *sge;
++ 	unsigned long flags;
++ 	struct ib_wc wc;
++ 	u64 sdata;
++ 	atomic64_t *maddr;
++ 	enum ib_wc_status send_status;
++ 	bool release;
++ 	int ret;
++ 	bool copy_last = false;
++ 	int local_ops = 0;
++ 
++ 	rcu_read_lock();
++ 	rvp = rdi->ports[sqp->port_num - 1];
++ 
++ 	/*
++ 	 * Note that we check the responder QP state after
++ 	 * checking the requester's state.
++ 	 */
++ 
++ 	qp = rvt_lookup_qpn(ib_to_rvt(sqp->ibqp.device), rvp,
++ 			    sqp->remote_qpn);
++ 
++ 	spin_lock_irqsave(&sqp->s_lock, flags);
++ 
++ 	/* Return if we are already busy processing a work request. */
++ 	if ((sqp->s_flags & (RVT_S_BUSY | RVT_S_ANY_WAIT)) ||
++ 	    !(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_OR_FLUSH_SEND))
++ 		goto unlock;
++ 
++ 	sqp->s_flags |= RVT_S_BUSY;
++ 
++ again:
++ 	if (sqp->s_last == READ_ONCE(sqp->s_head))
++ 		goto clr_busy;
++ 	wqe = rvt_get_swqe_ptr(sqp, sqp->s_last);
++ 
++ 	/* Return if it is not OK to start a new work request. */
++ 	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_NEXT_SEND_OK)) {
++ 		if (!(ib_rvt_state_ops[sqp->state] & RVT_FLUSH_SEND))
++ 			goto clr_busy;
++ 		/* We are in the error state, flush the work request. */
++ 		send_status = IB_WC_WR_FLUSH_ERR;
++ 		goto flush_send;
++ 	}
++ 
++ 	/*
++ 	 * We can rely on the entry not changing without the s_lock
++ 	 * being held until we update s_last.
++ 	 * We increment s_cur to indicate s_last is in progress.
++ 	 */
++ 	if (sqp->s_last == sqp->s_cur) {
++ 		if (++sqp->s_cur >= sqp->s_size)
++ 			sqp->s_cur = 0;
++ 	}
++ 	spin_unlock_irqrestore(&sqp->s_lock, flags);
++ 
++ 	if (!qp || !(ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) ||
++ 	    qp->ibqp.qp_type != sqp->ibqp.qp_type) {
++ 		rvp->n_pkt_drops++;
++ 		/*
++ 		 * For RC, the requester would timeout and retry so
++ 		 * shortcut the timeouts and just signal too many retries.
++ 		 */
++ 		if (sqp->ibqp.qp_type == IB_QPT_RC)
++ 			send_status = IB_WC_RETRY_EXC_ERR;
++ 		else
++ 			send_status = IB_WC_SUCCESS;
++ 		goto serr;
++ 	}
++ 
++ 	memset(&wc, 0, sizeof(wc));
++ 	send_status = IB_WC_SUCCESS;
++ 
++ 	release = true;
++ 	sqp->s_sge.sge = wqe->sg_list[0];
++ 	sqp->s_sge.sg_list = wqe->sg_list + 1;
++ 	sqp->s_sge.num_sge = wqe->wr.num_sge;
++ 	sqp->s_len = wqe->length;
++ 	switch (wqe->wr.opcode) {
++ 	case IB_WR_REG_MR:
++ 		goto send_comp;
++ 
++ 	case IB_WR_LOCAL_INV:
++ 		if (!(wqe->wr.send_flags & RVT_SEND_COMPLETION_ONLY)) {
++ 			if (rvt_invalidate_rkey(sqp,
++ 						wqe->wr.ex.invalidate_rkey))
++ 				send_status = IB_WC_LOC_PROT_ERR;
++ 			local_ops = 1;
++ 		}
++ 		goto send_comp;
++ 
++ 	case IB_WR_SEND_WITH_INV:
++ 		if (!rvt_invalidate_rkey(qp, wqe->wr.ex.invalidate_rkey)) {
++ 			wc.wc_flags = IB_WC_WITH_INVALIDATE;
++ 			wc.ex.invalidate_rkey = wqe->wr.ex.invalidate_rkey;
++ 		}
++ 		goto send;
++ 
++ 	case IB_WR_SEND_WITH_IMM:
++ 		wc.wc_flags = IB_WC_WITH_IMM;
++ 		wc.ex.imm_data = wqe->wr.ex.imm_data;
++ 		/* FALLTHROUGH */
++ 	case IB_WR_SEND:
++ send:
++ 		ret = rvt_get_rwqe(qp, false);
++ 		if (ret < 0)
++ 			goto op_err;
++ 		if (!ret)
++ 			goto rnr_nak;
++ 		break;
++ 
++ 	case IB_WR_RDMA_WRITE_WITH_IMM:
++ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
++ 			goto inv_err;
++ 		wc.wc_flags = IB_WC_WITH_IMM;
++ 		wc.ex.imm_data = wqe->wr.ex.imm_data;
++ 		ret = rvt_get_rwqe(qp, true);
++ 		if (ret < 0)
++ 			goto op_err;
++ 		if (!ret)
++ 			goto rnr_nak;
++ 		/* skip copy_last set and qp_access_flags recheck */
++ 		goto do_write;
++ 	case IB_WR_RDMA_WRITE:
++ 		copy_last = rvt_is_user_qp(qp);
++ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
++ 			goto inv_err;
++ do_write:
++ 		if (wqe->length == 0)
++ 			break;
++ 		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, wqe->length,
++ 					  wqe->rdma_wr.remote_addr,
++ 					  wqe->rdma_wr.rkey,
++ 					  IB_ACCESS_REMOTE_WRITE)))
++ 			goto acc_err;
++ 		qp->r_sge.sg_list = NULL;
++ 		qp->r_sge.num_sge = 1;
++ 		qp->r_sge.total_len = wqe->length;
++ 		break;
++ 
++ 	case IB_WR_RDMA_READ:
++ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
++ 			goto inv_err;
++ 		if (unlikely(!rvt_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
++ 					  wqe->rdma_wr.remote_addr,
++ 					  wqe->rdma_wr.rkey,
++ 					  IB_ACCESS_REMOTE_READ)))
++ 			goto acc_err;
++ 		release = false;
++ 		sqp->s_sge.sg_list = NULL;
++ 		sqp->s_sge.num_sge = 1;
++ 		qp->r_sge.sge = wqe->sg_list[0];
++ 		qp->r_sge.sg_list = wqe->sg_list + 1;
++ 		qp->r_sge.num_sge = wqe->wr.num_sge;
++ 		qp->r_sge.total_len = wqe->length;
++ 		break;
++ 
++ 	case IB_WR_ATOMIC_CMP_AND_SWP:
++ 	case IB_WR_ATOMIC_FETCH_AND_ADD:
++ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
++ 			goto inv_err;
++ 		if (unlikely(!rvt_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
++ 					  wqe->atomic_wr.remote_addr,
++ 					  wqe->atomic_wr.rkey,
++ 					  IB_ACCESS_REMOTE_ATOMIC)))
++ 			goto acc_err;
++ 		/* Perform atomic OP and save result. */
++ 		maddr = (atomic64_t *)qp->r_sge.sge.vaddr;
++ 		sdata = wqe->atomic_wr.compare_add;
++ 		*(u64 *)sqp->s_sge.sge.vaddr =
++ 			(wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
++ 			(u64)atomic64_add_return(sdata, maddr) - sdata :
++ 			(u64)cmpxchg((u64 *)qp->r_sge.sge.vaddr,
++ 				      sdata, wqe->atomic_wr.swap);
++ 		rvt_put_mr(qp->r_sge.sge.mr);
++ 		qp->r_sge.num_sge = 0;
++ 		goto send_comp;
++ 
++ 	default:
++ 		send_status = IB_WC_LOC_QP_OP_ERR;
++ 		goto serr;
++ 	}
++ 
++ 	sge = &sqp->s_sge.sge;
++ 	while (sqp->s_len) {
++ 		u32 len = sqp->s_len;
++ 
++ 		if (len > sge->length)
++ 			len = sge->length;
++ 		if (len > sge->sge_length)
++ 			len = sge->sge_length;
++ 		WARN_ON_ONCE(len == 0);
++ 		rvt_copy_sge(qp, &qp->r_sge, sge->vaddr,
++ 			     len, release, copy_last);
++ 		sge->vaddr += len;
++ 		sge->length -= len;
++ 		sge->sge_length -= len;
++ 		if (sge->sge_length == 0) {
++ 			if (!release)
++ 				rvt_put_mr(sge->mr);
++ 			if (--sqp->s_sge.num_sge)
++ 				*sge = *sqp->s_sge.sg_list++;
++ 		} else if (sge->length == 0 && sge->mr->lkey) {
++ 			if (++sge->n >= RVT_SEGSZ) {
++ 				if (++sge->m >= sge->mr->mapsz)
++ 					break;
++ 				sge->n = 0;
++ 			}
++ 			sge->vaddr =
++ 				sge->mr->map[sge->m]->segs[sge->n].vaddr;
++ 			sge->length =
++ 				sge->mr->map[sge->m]->segs[sge->n].length;
++ 		}
++ 		sqp->s_len -= len;
++ 	}
++ 	if (release)
++ 		rvt_put_ss(&qp->r_sge);
++ 
++ 	if (!test_and_clear_bit(RVT_R_WRID_VALID, &qp->r_aflags))
++ 		goto send_comp;
++ 
++ 	if (wqe->wr.opcode == IB_WR_RDMA_WRITE_WITH_IMM)
++ 		wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
++ 	else
++ 		wc.opcode = IB_WC_RECV;
++ 	wc.wr_id = qp->r_wr_id;
++ 	wc.status = IB_WC_SUCCESS;
++ 	wc.byte_len = wqe->length;
++ 	wc.qp = &qp->ibqp;
++ 	wc.src_qp = qp->remote_qpn;
++ 	wc.slid = rdma_ah_get_dlid(&qp->remote_ah_attr) & U16_MAX;
++ 	wc.sl = rdma_ah_get_sl(&qp->remote_ah_attr);
++ 	wc.port_num = 1;
++ 	/* Signal completion event if the solicited bit is set. */
++ 	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
++ 		     wqe->wr.send_flags & IB_SEND_SOLICITED);
++ 
++ send_comp:
++ 	spin_lock_irqsave(&sqp->s_lock, flags);
++ 	rvp->n_loop_pkts++;
++ flush_send:
++ 	sqp->s_rnr_retry = sqp->s_rnr_retry_cnt;
++ 	rvt_send_complete(sqp, wqe, send_status);
++ 	if (local_ops) {
++ 		atomic_dec(&sqp->local_ops_pending);
++ 		local_ops = 0;
++ 	}
++ 	goto again;
++ 
++ rnr_nak:
++ 	/* Handle RNR NAK */
++ 	if (qp->ibqp.qp_type == IB_QPT_UC)
++ 		goto send_comp;
++ 	rvp->n_rnr_naks++;
++ 	/*
++ 	 * Note: we don't need the s_lock held since the BUSY flag
++ 	 * makes this single threaded.
++ 	 */
++ 	if (sqp->s_rnr_retry == 0) {
++ 		send_status = IB_WC_RNR_RETRY_EXC_ERR;
++ 		goto serr;
++ 	}
++ 	if (sqp->s_rnr_retry_cnt < 7)
++ 		sqp->s_rnr_retry--;
++ 	spin_lock_irqsave(&sqp->s_lock, flags);
++ 	if (!(ib_rvt_state_ops[sqp->state] & RVT_PROCESS_RECV_OK))
++ 		goto clr_busy;
++ 	rvt_add_rnr_timer(sqp, qp->r_min_rnr_timer <<
++ 				IB_AETH_CREDIT_SHIFT);
++ 	goto clr_busy;
++ 
++ op_err:
++ 	send_status = IB_WC_REM_OP_ERR;
++ 	wc.status = IB_WC_LOC_QP_OP_ERR;
++ 	goto err;
++ 
++ inv_err:
++ 	send_status = IB_WC_REM_INV_REQ_ERR;
++ 	wc.status = IB_WC_LOC_QP_OP_ERR;
++ 	goto err;
++ 
++ acc_err:
++ 	send_status = IB_WC_REM_ACCESS_ERR;
++ 	wc.status = IB_WC_LOC_PROT_ERR;
++ err:
++ 	/* responder goes to error state */
++ 	rvt_rc_error(qp, wc.status);
++ 
++ serr:
++ 	spin_lock_irqsave(&sqp->s_lock, flags);
++ 	rvt_send_complete(sqp, wqe, send_status);
++ 	if (sqp->ibqp.qp_type == IB_QPT_RC) {
++ 		int lastwqe = rvt_error_qp(sqp, IB_WC_WR_FLUSH_ERR);
++ 
++ 		sqp->s_flags &= ~RVT_S_BUSY;
++ 		spin_unlock_irqrestore(&sqp->s_lock, flags);
++ 		if (lastwqe) {
++ 			struct ib_event ev;
++ 
++ 			ev.device = sqp->ibqp.device;
++ 			ev.element.qp = &sqp->ibqp;
++ 			ev.event = IB_EVENT_QP_LAST_WQE_REACHED;
++ 			sqp->ibqp.event_handler(&ev, sqp->ibqp.qp_context);
++ 		}
++ 		goto done;
++ 	}
++ clr_busy:
++ 	sqp->s_flags &= ~RVT_S_BUSY;
++ unlock:
++ 	spin_unlock_irqrestore(&sqp->s_lock, flags);
++ done:
++ 	rcu_read_unlock();
++ }
++ EXPORT_SYMBOL(rvt_ruc_loopback);
+++>>>>>>> 15703461533a (IB/{hfi1, qib, rdmavt}: Move ruc_loopback to rdmavt)
+diff --cc include/rdma/rdmavt_qp.h
+index 927f6d5b6d0f,cbafb1878669..000000000000
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@@ -678,6 -678,13 +678,16 @@@ void rvt_del_timers_sync(struct rvt_qp 
+  void rvt_stop_rc_timers(struct rvt_qp *qp);
+  void rvt_add_retry_timer(struct rvt_qp *qp);
+  
+++<<<<<<< HEAD
+++=======
++ void rvt_copy_sge(struct rvt_qp *qp, struct rvt_sge_state *ss,
++ 		  void *data, u32 length,
++ 		  bool release, bool copy_last);
++ void rvt_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
++ 		       enum ib_wc_status status);
++ void rvt_ruc_loopback(struct rvt_qp *qp);
++ 
+++>>>>>>> 15703461533a (IB/{hfi1, qib, rdmavt}: Move ruc_loopback to rdmavt)
+  /**
+   * struct rvt_qp_iter - the iterator for QPs
+   * @qp - the current QP
+* Unmerged path drivers/infiniband/hw/hfi1/ruc.c
+* Unmerged path drivers/infiniband/hw/qib/qib_ruc.c
+* Unmerged path drivers/infiniband/sw/rdmavt/qp.c
+* Unmerged path include/rdma/rdmavt_qp.h
