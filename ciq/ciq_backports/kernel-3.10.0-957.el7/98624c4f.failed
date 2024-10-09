@@ -1,0 +1,158 @@
+scsi: qla2xxx: remove irq_affinity_notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: remove irq_affinity_notifier (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 92.50%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 98624c4fed0abd848b291fbd3da18c2251b79429
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/98624c4f.failed
+
+Now that qla2xxx uses the IRQ layer affinity assignment, affinity won't
+change over the life time of a device and the notifiers are useless.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 98624c4fed0abd848b291fbd3da18c2251b79429)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_isr.c
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index 5b62f352b08f,5815403d1d65..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -17,12 -16,8 +17,8 @@@
+  static void qla2x00_mbx_completion(scsi_qla_host_t *, uint16_t);
+  static void qla2x00_status_entry(scsi_qla_host_t *, struct rsp_que *, void *);
+  static void qla2x00_status_cont_entry(struct rsp_que *, sts_cont_entry_t *);
+ -static void qla2x00_error_entry(scsi_qla_host_t *, struct rsp_que *,
+ +static int qla2x00_error_entry(scsi_qla_host_t *, struct rsp_que *,
+  	sts_entry_t *);
+- static void qla_irq_affinity_notify(struct irq_affinity_notify *,
+-     const cpumask_t *);
+- static void qla_irq_affinity_release(struct kref *);
+- 
+  
+  /**
+   * qla2100_intr_handler() - Process interrupts for the ISP2100 and ISP2200.
+@@@ -2759,12 -2564,9 +2755,15 @@@ void qla24xx_process_response_queue(str
+  	struct sts_entry_24xx *pkt;
+  	struct qla_hw_data *ha = vha->hw;
+  
+ -	if (!vha->flags.online)
+ +	if (!ha->flags.fw_started)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (rsp->qpair->cpuid != smp_processor_id())
+ +		qla_cpu_update(rsp->qpair, smp_processor_id());
+ +
+++=======
+++>>>>>>> 98624c4fed0a (scsi: qla2xxx: remove irq_affinity_notifier)
+  	while (rsp->ring_ptr->signature != RESPONSE_PROCESSED) {
+  		pkt = (struct sts_entry_24xx *)rsp->ring_ptr;
+  
+@@@ -3316,6 -3084,6 +3312,7 @@@ qla24xx_enable_msix(struct qla_hw_data 
+  			goto msix_register_fail;
+  		qentry->have_irq = 1;
+  		qentry->in_use = 1;
+++<<<<<<< HEAD
+  	}
+  
+  	/*
+@@@ -3332,20 -3099,8 +3329,22 @@@
+  		qentry->in_use = 1;
+  		ret = request_irq(qentry->vector,
+  			msix_entries[QLA_ATIO_VECTOR].handler,
+ -			0, msix_entries[QLA_ATIO_VECTOR].name, rsp);
+ +			0, qentry->name, rsp);
+  		qentry->have_irq = 1;
+ +
+ +		/* Register for CPU affinity notification. */
+ +		irq_set_affinity_notifier(qentry->vector, &qentry->irq_notify);
+ +
+ +		/* Schedule work (ie. trigger a notification) to read cpu
+ +		 * mask for this specific irq.
+ +		 * kref_get is required because
+ +		* irq_affinity_notify() will do
+ +		* kref_put().
+ +		*/
+ +		kref_get(&qentry->irq_notify.kref);
+ +		schedule_work(&qentry->irq_notify.work);
+++=======
+++>>>>>>> 98624c4fed0a (scsi: qla2xxx: remove irq_affinity_notifier)
+  	}
+  
+  msix_register_fail:
+@@@ -3513,51 -3280,3 +3512,54 @@@ int qla25xx_request_irq(struct qla_hw_d
+  	msix->handle = qpair;
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +
+ +
+ +/* irq_set_affinity/irqbalance will trigger notification of cpu mask update */
+ +static void qla_irq_affinity_notify(struct irq_affinity_notify *notify,
+ +	const cpumask_t *mask)
+ +{
+ +	struct qla_msix_entry *e =
+ +		container_of(notify, struct qla_msix_entry, irq_notify);
+ +	struct qla_hw_data *ha;
+ +	struct scsi_qla_host *base_vha;
+ +	struct rsp_que *rsp;
+ +
+ +	/* user is recommended to set mask to just 1 cpu */
+ +	e->cpuid = cpumask_first(mask);
+ +
+ +	rsp = (struct rsp_que *)e->handle;
+ +	ha = rsp->hw;
+ +
+ +	base_vha = pci_get_drvdata(ha->pdev);
+ +
+ +	ql_dbg(ql_dbg_init, base_vha, 0xffff,
+ +	    "%s: host %ld : vector %d cpu %d\n", __func__,
+ +	    base_vha->host_no, e->vector, e->cpuid);
+ +
+ +	if (e->have_irq) {
+ +		if ((IS_QLA83XX(ha) || IS_QLA27XX(ha)) &&
+ +		    (e->entry == QLA83XX_RSPQ_MSIX_ENTRY_NUMBER)) {
+ +			ha->tgt.rspq_vector_cpuid = e->cpuid;
+ +			ql_dbg(ql_dbg_init, base_vha, 0xffff,
+ +			    "%s: host%ld: rspq vector %d cpu %d  runtime change\n",
+ +			    __func__, base_vha->host_no, e->vector, e->cpuid);
+ +		}
+ +	}
+ +}
+ +
+ +static void qla_irq_affinity_release(struct kref *ref)
+ +{
+ +	struct irq_affinity_notify *notify =
+ +		container_of(ref, struct irq_affinity_notify, kref);
+ +	struct qla_msix_entry *e =
+ +		container_of(notify, struct qla_msix_entry, irq_notify);
+ +	struct rsp_que *rsp = (struct rsp_que *)e->handle;
+ +	struct scsi_qla_host *base_vha = pci_get_drvdata(rsp->hw->pdev);
+ +
+ +	ql_dbg(ql_dbg_init, base_vha, 0xffff,
+ +	    "%s: host%ld: vector %d cpu %d\n", __func__,
+ +	    base_vha->host_no, e->vector, e->cpuid);
+ +}
+++=======
+++>>>>>>> 98624c4fed0a (scsi: qla2xxx: remove irq_affinity_notifier)
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 70dffc916a3d..70d7879fe218 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3040,7 +3040,6 @@ struct qla_msix_entry {
+ 	uint16_t entry;
+ 	char name[30];
+ 	void *handle;
+-	struct irq_affinity_notify irq_notify;
+ 	int cpuid;
+ };
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
