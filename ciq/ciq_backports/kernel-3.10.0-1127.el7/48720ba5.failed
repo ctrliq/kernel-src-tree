@@ -1,0 +1,213 @@
+virtio/s390: use DMA memory for ccw I/O and classic notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Halil Pasic <pasic@linux.ibm.com>
+commit 48720ba56891570e3b750b271d80efb631478630
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/48720ba5.failed
+
+Before virtio-ccw could get away with not using DMA API for the pieces of
+memory it does ccw I/O with. With protected virtualization this has to
+change, since the hypervisor needs to read and sometimes also write these
+pieces of memory.
+
+The hypervisor is supposed to poke the classic notifiers, if these are
+used, out of band with regards to ccw I/O. So these need to be allocated
+as DMA memory (which is shared memory for protected virtualization
+guests).
+
+Let us factor out everything from struct virtio_ccw_device that needs to
+be DMA memory in a satellite that is allocated as such.
+
+Note: The control blocks of I/O instructions do not need to be shared.
+These are marshalled by the ultravisor.
+
+	Signed-off-by: Halil Pasic <pasic@linux.ibm.com>
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Reviewed-by: Michael Mueller <mimu@linux.ibm.com>
+	Tested-by: Michael Mueller <mimu@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+(cherry picked from commit 48720ba56891570e3b750b271d80efb631478630)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/virtio/virtio_ccw.c
+diff --cc drivers/s390/virtio/virtio_ccw.c
+index fc0ddb3a7109,800252955a2f..000000000000
+--- a/drivers/s390/virtio/virtio_ccw.c
++++ b/drivers/s390/virtio/virtio_ccw.c
+@@@ -58,10 -62,8 +64,7 @@@ struct virtio_ccw_device 
+  	unsigned int revision; /* Transport revision */
+  	wait_queue_head_t wait_q;
+  	spinlock_t lock;
+ -	struct mutex io_lock; /* Serializes I/O requests */
+  	struct list_head virtqueues;
+- 	unsigned long indicators;
+- 	unsigned long indicators2;
+- 	struct vq_config_block *config_block;
+  	bool is_thinint;
+  	bool going_away;
+  	bool device_lost;
+@@@ -367,13 -373,13 +371,13 @@@ static void virtio_ccw_drop_indicator(s
+  			 "Failed to deregister indicators (%d)\n", ret);
+  	else if (vcdev->is_thinint)
+  		virtio_ccw_drop_indicators(vcdev);
+- 	kfree(indicatorp);
+- 	kfree(thinint_area);
++ 	ccw_device_dma_free(vcdev->cdev, indicatorp, sizeof(indicators(vcdev)));
++ 	ccw_device_dma_free(vcdev->cdev, thinint_area, sizeof(*thinint_area));
+  }
+  
+ -static inline long __do_kvm_notify(struct subchannel_id schid,
+ -				   unsigned long queue_index,
+ -				   long cookie)
+ +static inline long do_kvm_notify(struct subchannel_id schid,
+ +				 unsigned long queue_index,
+ +				 long cookie)
+  {
+  	register unsigned long __nr asm("1") = KVM_S390_VIRTIO_CCW_NOTIFY;
+  	register struct subchannel_id __schid asm("2") = schid;
+@@@ -461,9 -474,8 +465,14 @@@ static void virtio_ccw_del_vq(struct vi
+  			 ret, index);
+  
+  	vring_del_virtqueue(vq);
+++<<<<<<< HEAD
+ +	size = PAGE_ALIGN(vring_size(info->num, KVM_VIRTIO_CCW_RING_ALIGN));
+ +	free_pages_exact(info->queue, size);
+ +	kfree(info->info_block);
+++=======
++ 	ccw_device_dma_free(vcdev->cdev, info->info_block,
++ 			    sizeof(*info->info_block));
+++>>>>>>> 48720ba56891 (virtio/s390: use DMA memory for ccw I/O and classic notifiers)
+  	kfree(info);
+  }
+  
+@@@ -572,9 -582,8 +581,14 @@@ out_err
+  	if (vq)
+  		vring_del_virtqueue(vq);
+  	if (info) {
+++<<<<<<< HEAD
+ +		if (info->queue)
+ +			free_pages_exact(info->queue, size);
+ +		kfree(info->info_block);
+++=======
++ 		ccw_device_dma_free(vcdev->cdev, info->info_block,
++ 				    sizeof(*info->info_block));
+++>>>>>>> 48720ba56891 (virtio/s390: use DMA memory for ccw I/O and classic notifiers)
+  	}
+  	kfree(info);
+  	return ERR_PTR(err);
+@@@ -635,10 -647,10 +650,10 @@@ static int virtio_ccw_find_vqs(struct v
+  {
+  	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
+  	unsigned long *indicatorp = NULL;
+ -	int ret, i, queue_idx = 0;
+ +	int ret, i;
+  	struct ccw1 *ccw;
+  
+- 	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
++ 	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
+  	if (!ccw)
+  		return -ENOMEM;
+  
+@@@ -832,8 -865,9 +852,8 @@@ static void virtio_ccw_get_config(struc
+  	int ret;
+  	struct ccw1 *ccw;
+  	void *config_area;
+ -	unsigned long flags;
+  
+- 	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
++ 	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
+  	if (!ccw)
+  		return;
+  
+@@@ -850,15 -885,17 +871,15 @@@
+  	if (ret)
+  		goto out_free;
+  
+ -	spin_lock_irqsave(&vcdev->lock, flags);
+  	memcpy(vcdev->config, config_area, offset + len);
+ +	if (buf)
+ +		memcpy(buf, &vcdev->config[offset], len);
+  	if (vcdev->config_ready < offset + len)
+  		vcdev->config_ready = offset + len;
+ -	spin_unlock_irqrestore(&vcdev->lock, flags);
+ -	if (buf)
+ -		memcpy(buf, config_area + offset, len);
+  
+  out_free:
+- 	kfree(config_area);
+- 	kfree(ccw);
++ 	ccw_device_dma_free(vcdev->cdev, config_area, VIRTIO_CCW_CONFIG_SIZE);
++ 	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
+  }
+  
+  static void virtio_ccw_set_config(struct virtio_device *vdev,
+@@@ -868,8 -905,9 +889,8 @@@
+  	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
+  	struct ccw1 *ccw;
+  	void *config_area;
+ -	unsigned long flags;
+  
+- 	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
++ 	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
+  	if (!ccw)
+  		return;
+  
+@@@ -943,10 -984,17 +965,10 @@@ static void virtio_ccw_set_status(struc
+  	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_STATUS);
+  	/* Write failed? We assume status is unchanged. */
+  	if (ret)
+- 		*vcdev->status = old_status;
+- 	kfree(ccw);
++ 		vcdev->dma_area->status = old_status;
++ 	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
+  }
+  
+ -static const char *virtio_ccw_bus_name(struct virtio_device *vdev)
+ -{
+ -	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
+ -
+ -	return dev_name(&vcdev->cdev->dev);
+ -}
+ -
+  static const struct virtio_config_ops virtio_ccw_config_ops = {
+  	.get_features = virtio_ccw_get_features,
+  	.finalize_features = virtio_ccw_finalize_features,
+@@@ -1230,24 -1279,19 +1252,31 @@@ static int virtio_ccw_online(struct ccw
+  		ret = -ENOMEM;
+  		goto out_free;
+  	}
+++<<<<<<< HEAD
+ +	vcdev->config_block = kzalloc(sizeof(*vcdev->config_block),
+ +				   GFP_DMA | GFP_KERNEL);
+ +	if (!vcdev->config_block) {
+ +		ret = -ENOMEM;
+ +		goto out_free;
+ +	}
+ +	vcdev->status = kzalloc(sizeof(*vcdev->status), GFP_DMA | GFP_KERNEL);
+ +	if (!vcdev->status) {
+++=======
++ 	vcdev->vdev.dev.parent = &cdev->dev;
++ 	vcdev->cdev = cdev;
++ 	vcdev->dma_area = ccw_device_dma_zalloc(vcdev->cdev,
++ 						sizeof(*vcdev->dma_area));
++ 	if (!vcdev->dma_area) {
+++>>>>>>> 48720ba56891 (virtio/s390: use DMA memory for ccw I/O and classic notifiers)
+  		ret = -ENOMEM;
+  		goto out_free;
+  	}
+  
+  	vcdev->is_thinint = virtio_ccw_use_airq; /* at least try */
+  
+ +	vcdev->vdev.dev.parent = &cdev->dev;
+  	vcdev->vdev.dev.release = virtio_ccw_release_dev;
+  	vcdev->vdev.config = &virtio_ccw_config_ops;
+- 	vcdev->cdev = cdev;
+  	init_waitqueue_head(&vcdev->wait_q);
+  	INIT_LIST_HEAD(&vcdev->virtqueues);
+  	spin_lock_init(&vcdev->lock);
+* Unmerged path drivers/s390/virtio/virtio_ccw.c
