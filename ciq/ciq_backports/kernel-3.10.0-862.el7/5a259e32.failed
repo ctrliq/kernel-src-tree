@@ -1,0 +1,216 @@
+scsi: smartpqi: add module parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] smartpqi: add module parameters (Don Brace) [1457414]
+Rebuild_FUZZ: 91.18%
+commit-author Kevin Barnett <kevin.barnett@microsemi.com>
+commit 5a259e32ba32c380537f3d186a311e528b9f9c94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5a259e32.failed
+
+Add module parameters to disable heartbeat support and to disable
+shutting down the controller when a controller is taken offline.
+
+	Reviewed-by: Scott Benesh <scott.benesh@microsemi.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microsemi.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5a259e32ba32c380537f3d186a311e528b9f9c94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index 13a5a9aaadf9,7bf6222c19a7..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -93,6 -122,25 +93,28 @@@ module_param_named(disable_device_id_wi
+  MODULE_PARM_DESC(disable_device_id_wildcards,
+  	"Disable device ID wildcards.");
+  
+++<<<<<<< HEAD
+++=======
++ static int pqi_disable_heartbeat;
++ module_param_named(disable_heartbeat,
++ 	pqi_disable_heartbeat, int, 0644);
++ MODULE_PARM_DESC(disable_heartbeat,
++ 	"Disable heartbeat.");
++ 
++ static int pqi_disable_ctrl_shutdown;
++ module_param_named(disable_ctrl_shutdown,
++ 	pqi_disable_ctrl_shutdown, int, 0644);
++ MODULE_PARM_DESC(disable_ctrl_shutdown,
++ 	"Disable controller shutdown when controller locked up.");
++ 
++ static char *pqi_lockup_action_param;
++ module_param_named(lockup_action,
++ 	pqi_lockup_action_param, charp, 0644);
++ MODULE_PARM_DESC(lockup_action, "Action to take when controller locked up.\n"
++ 	"\t\tSupported: none, reboot, panic\n"
++ 	"\t\tDefault: none");
++ 
+++>>>>>>> 5a259e32ba32 (scsi: smartpqi: add module parameters)
+  static char *raid_levels[] = {
+  	"RAID-0",
+  	"RAID-4",
+@@@ -5633,6 -5941,61 +5655,64 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int pqi_process_config_table(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	u32 table_length;
++ 	u32 section_offset;
++ 	void __iomem *table_iomem_addr;
++ 	struct pqi_config_table *config_table;
++ 	struct pqi_config_table_section_header *section;
++ 
++ 	table_length = ctrl_info->config_table_length;
++ 
++ 	config_table = kmalloc(table_length, GFP_KERNEL);
++ 	if (!config_table) {
++ 		dev_err(&ctrl_info->pci_dev->dev,
++ 			"failed to allocate memory for PQI configuration table\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/*
++ 	 * Copy the config table contents from I/O memory space into the
++ 	 * temporary buffer.
++ 	 */
++ 	table_iomem_addr = ctrl_info->iomem_base +
++ 		ctrl_info->config_table_offset;
++ 	memcpy_fromio(config_table, table_iomem_addr, table_length);
++ 
++ 	section_offset =
++ 		get_unaligned_le32(&config_table->first_section_offset);
++ 
++ 	while (section_offset) {
++ 		section = (void *)config_table + section_offset;
++ 
++ 		switch (get_unaligned_le16(&section->section_id)) {
++ 		case PQI_CONFIG_TABLE_SECTION_HEARTBEAT:
++ 			if (pqi_disable_heartbeat)
++ 				dev_warn(&ctrl_info->pci_dev->dev,
++ 				"heartbeat disabled by module parameter\n");
++ 			else
++ 				ctrl_info->heartbeat_counter =
++ 					table_iomem_addr +
++ 					section_offset +
++ 					offsetof(
++ 					struct pqi_config_table_heartbeat,
++ 						heartbeat_counter);
++ 			break;
++ 		}
++ 
++ 		section_offset =
++ 			get_unaligned_le16(&section->next_section_offset);
++ 	}
++ 
++ 	kfree(config_table);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 5a259e32ba32 (scsi: smartpqi: add module parameters)
+  /* Switches the controller from PQI mode back into SIS mode. */
+  
+  static int pqi_revert_to_sis_mode(struct pqi_ctrl_info *ctrl_info)
+@@@ -6010,7 -6494,88 +6090,92 @@@ static void pqi_remove_ctrl(struct pqi_
+  	pqi_free_ctrl_resources(ctrl_info);
+  }
+  
+++<<<<<<< HEAD
+ +static void pqi_print_ctrl_info(struct pci_dev *pdev,
+++=======
++ static void pqi_perform_lockup_action(void)
++ {
++ 	switch (pqi_lockup_action) {
++ 	case PANIC:
++ 		panic("FATAL: Smart Family Controller lockup detected");
++ 		break;
++ 	case REBOOT:
++ 		emergency_restart();
++ 		break;
++ 	case NONE:
++ 	default:
++ 		break;
++ 	}
++ }
++ 
++ static struct pqi_raid_error_info pqi_ctrl_offline_raid_error_info = {
++ 	.data_out_result = PQI_DATA_IN_OUT_HARDWARE_ERROR,
++ 	.status = SAM_STAT_CHECK_CONDITION,
++ };
++ 
++ static void pqi_fail_all_outstanding_requests(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	unsigned int i;
++ 	struct pqi_io_request *io_request;
++ 	struct scsi_cmnd *scmd;
++ 
++ 	for (i = 0; i < ctrl_info->max_io_slots; i++) {
++ 		io_request = &ctrl_info->io_request_pool[i];
++ 		if (atomic_read(&io_request->refcount) == 0)
++ 			continue;
++ 
++ 		scmd = io_request->scmd;
++ 		if (scmd) {
++ 			set_host_byte(scmd, DID_NO_CONNECT);
++ 		} else {
++ 			io_request->status = -ENXIO;
++ 			io_request->error_info =
++ 				&pqi_ctrl_offline_raid_error_info;
++ 		}
++ 
++ 		io_request->io_complete_callback(io_request,
++ 			io_request->context);
++ 	}
++ }
++ 
++ static void pqi_take_ctrl_offline_deferred(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	pqi_perform_lockup_action();
++ 	pqi_stop_heartbeat_timer(ctrl_info);
++ 	pqi_free_interrupts(ctrl_info);
++ 	pqi_cancel_rescan_worker(ctrl_info);
++ 	pqi_cancel_update_time_worker(ctrl_info);
++ 	pqi_ctrl_wait_until_quiesced(ctrl_info);
++ 	pqi_fail_all_outstanding_requests(ctrl_info);
++ 	pqi_clear_all_queued_raid_bypass_retries(ctrl_info);
++ 	pqi_ctrl_unblock_requests(ctrl_info);
++ }
++ 
++ static void pqi_ctrl_offline_worker(struct work_struct *work)
++ {
++ 	struct pqi_ctrl_info *ctrl_info;
++ 
++ 	ctrl_info = container_of(work, struct pqi_ctrl_info, ctrl_offline_work);
++ 	pqi_take_ctrl_offline_deferred(ctrl_info);
++ }
++ 
++ static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	if (!ctrl_info->controller_online)
++ 		return;
++ 
++ 	ctrl_info->controller_online = false;
++ 	ctrl_info->pqi_mode_enabled = false;
++ 	pqi_ctrl_block_requests(ctrl_info);
++ 	if (!pqi_disable_ctrl_shutdown)
++ 		sis_shutdown_ctrl(ctrl_info);
++ 	pci_disable_device(ctrl_info->pci_dev);
++ 	dev_err(&ctrl_info->pci_dev->dev, "controller offline\n");
++ 	schedule_work(&ctrl_info->ctrl_offline_work);
++ }
++ 
++ static void pqi_print_ctrl_info(struct pci_dev *pci_dev,
+++>>>>>>> 5a259e32ba32 (scsi: smartpqi: add module parameters)
+  	const struct pci_device_id *id)
+  {
+  	char *ctrl_description;
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
