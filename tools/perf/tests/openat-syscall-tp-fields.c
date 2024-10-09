@@ -82,8 +82,14 @@ int test__syscall_openat_tp_fields(int subtest __maybe_unused)
 
 		for (i = 0; i < evlist->nr_mmaps; i++) {
 			union perf_event *event;
+			struct perf_mmap *md;
+			u64 end, start;
 
-			while ((event = perf_evlist__mmap_read(evlist, i)) != NULL) {
+			md = &evlist->mmap[i];
+			if (perf_mmap__read_init(md, false, &start, &end) < 0)
+				continue;
+
+			while ((event = perf_mmap__read_event(md, false, &start, end)) != NULL) {
 				const u32 type = event->header.type;
 				int tp_flags;
 				struct perf_sample sample;
@@ -91,7 +97,7 @@ int test__syscall_openat_tp_fields(int subtest __maybe_unused)
 				++nr_events;
 
 				if (type != PERF_RECORD_SAMPLE) {
-					perf_evlist__mmap_consume(evlist, i);
+					perf_mmap__consume(md, false);
 					continue;
 				}
 
@@ -111,6 +117,7 @@ int test__syscall_openat_tp_fields(int subtest __maybe_unused)
 
 				goto out_ok;
 			}
+			perf_mmap__read_done(md);
 		}
 
 		if (nr_events == before)
