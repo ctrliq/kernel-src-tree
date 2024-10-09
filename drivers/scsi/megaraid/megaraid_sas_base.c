@@ -6621,6 +6621,7 @@ megasas_resume(struct pci_dev *pdev)
 	 */
 
 	atomic_set(&instance->fw_outstanding, 0);
+	atomic_set(&instance->ldio_outstanding, 0);
 
 	/*
 	 * We expect the FW state to be READY
