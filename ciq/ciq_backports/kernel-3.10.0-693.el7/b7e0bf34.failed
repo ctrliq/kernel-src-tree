@@ -1,0 +1,150 @@
+tracing/uprobes: Add @+file_offset fetch method
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Namhyung Kim <namhyung.kim@lge.com>
+commit b7e0bf341f6cfa92ae0a0e3d0c3496729595e1e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b7e0bf34.failed
+
+Enable to fetch data from a file offset.  Currently it only supports
+fetching from same binary uprobe set.  It'll translate the file offset
+to a proper virtual address in the process.
+
+The syntax is "@+OFFSET" as it does similar to normal memory fetching
+(@ADDR) which does no address translation.
+
+	Suggested-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Acked-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: zhangwei(Jovi) <jovi.zhangwei@huawei.com>
+	Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+(cherry picked from commit b7e0bf341f6cfa92ae0a0e3d0c3496729595e1e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/trace/trace_uprobe.c
+index 8abef9c8c004,1fdea6d3f851..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -1048,7 -1140,12 +1077,16 @@@ static int uprobe_dispatcher(struct upr
+  	tu = container_of(con, struct trace_uprobe, consumer);
+  	tu->nhit++;
+  
+++<<<<<<< HEAD
+ +	if (tu->flags & TP_FLAG_TRACE)
+++=======
++ 	udd.tu = tu;
++ 	udd.bp_addr = instruction_pointer(regs);
++ 
++ 	current->utask->vaddr = (unsigned long) &udd;
++ 
++ 	if (tu->tp.flags & TP_FLAG_TRACE)
+++>>>>>>> b7e0bf341f6c (tracing/uprobes: Add @+file_offset fetch method)
+  		ret |= uprobe_trace_func(tu, regs);
+  
+  #ifdef CONFIG_PERF_EVENTS
+@@@ -1065,7 -1163,12 +1104,16 @@@ static int uretprobe_dispatcher(struct 
+  
+  	tu = container_of(con, struct trace_uprobe, consumer);
+  
+++<<<<<<< HEAD
+ +	if (tu->flags & TP_FLAG_TRACE)
+++=======
++ 	udd.tu = tu;
++ 	udd.bp_addr = func;
++ 
++ 	current->utask->vaddr = (unsigned long) &udd;
++ 
++ 	if (tu->tp.flags & TP_FLAG_TRACE)
+++>>>>>>> b7e0bf341f6c (tracing/uprobes: Add @+file_offset fetch method)
+  		uretprobe_trace_func(tu, func, regs);
+  
+  #ifdef CONFIG_PERF_EVENTS
+diff --git a/Documentation/trace/uprobetracer.txt b/Documentation/trace/uprobetracer.txt
+index 87841843f78a..89b282e77046 100644
+--- a/Documentation/trace/uprobetracer.txt
++++ b/Documentation/trace/uprobetracer.txt
+@@ -32,6 +32,7 @@ Synopsis of uprobe_tracer
+   FETCHARGS     : Arguments. Each probe can have up to 128 args.
+    %REG         : Fetch register REG
+    @ADDR	: Fetch memory at ADDR (ADDR should be in userspace)
++   @+OFFSET	: Fetch memory at OFFSET (OFFSET from same file as PATH)
+    $stackN	: Fetch Nth entry of stack (N >= 0)
+    $stack	: Fetch stack address.
+    $retval	: Fetch return value.(*)
+diff --git a/kernel/trace/trace_kprobe.c b/kernel/trace/trace_kprobe.c
+index 893acbc1e48e..50356290f72e 100644
+--- a/kernel/trace/trace_kprobe.c
++++ b/kernel/trace/trace_kprobe.c
+@@ -250,6 +250,14 @@ DEFINE_BASIC_FETCH_FUNCS(symbol)
+ DEFINE_FETCH_symbol(string)
+ DEFINE_FETCH_symbol(string_size)
+ 
++/* kprobes don't support file_offset fetch methods */
++#define fetch_file_offset_u8		NULL
++#define fetch_file_offset_u16		NULL
++#define fetch_file_offset_u32		NULL
++#define fetch_file_offset_u64		NULL
++#define fetch_file_offset_string	NULL
++#define fetch_file_offset_string_size	NULL
++
+ /* Fetch type information table */
+ const struct fetch_type kprobes_fetch_type_table[] = {
+ 	/* Special types */
+diff --git a/kernel/trace/trace_probe.c b/kernel/trace/trace_probe.c
+index 00c5841de03f..e5a5e595e69e 100644
+--- a/kernel/trace/trace_probe.c
++++ b/kernel/trace/trace_probe.c
+@@ -374,7 +374,7 @@ static int parse_probe_arg(char *arg, const struct fetch_type *t,
+ 		}
+ 		break;
+ 
+-	case '@':	/* memory or symbol */
++	case '@':	/* memory, file-offset or symbol */
+ 		if (isdigit(arg[1])) {
+ 			ret = kstrtoul(arg + 1, 0, &param);
+ 			if (ret)
+@@ -382,6 +382,17 @@ static int parse_probe_arg(char *arg, const struct fetch_type *t,
+ 
+ 			f->fn = t->fetch[FETCH_MTD_memory];
+ 			f->data = (void *)param;
++		} else if (arg[1] == '+') {
++			/* kprobes don't support file offsets */
++			if (is_kprobe)
++				return -EINVAL;
++
++			ret = kstrtol(arg + 2, 0, &offset);
++			if (ret)
++				break;
++
++			f->fn = t->fetch[FETCH_MTD_file_offset];
++			f->data = (void *)offset;
+ 		} else {
+ 			/* uprobes don't support symbols */
+ 			if (!is_kprobe)
+diff --git a/kernel/trace/trace_probe.h b/kernel/trace/trace_probe.h
+index 4c2b914a4465..163c98b94238 100644
+--- a/kernel/trace/trace_probe.h
++++ b/kernel/trace/trace_probe.h
+@@ -106,6 +106,7 @@ enum {
+ 	FETCH_MTD_symbol,
+ 	FETCH_MTD_deref,
+ 	FETCH_MTD_bitfield,
++	FETCH_MTD_file_offset,
+ 	FETCH_MTD_END,
+ };
+ 
+@@ -217,6 +218,7 @@ ASSIGN_FETCH_FUNC(memory, ftype),			\
+ ASSIGN_FETCH_FUNC(symbol, ftype),			\
+ ASSIGN_FETCH_FUNC(deref, ftype),			\
+ ASSIGN_FETCH_FUNC(bitfield, ftype),			\
++ASSIGN_FETCH_FUNC(file_offset, ftype),			\
+ 	  }						\
+ 	}
+ 
+* Unmerged path kernel/trace/trace_uprobe.c
