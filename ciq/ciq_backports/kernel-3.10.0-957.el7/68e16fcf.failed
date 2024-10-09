@@ -1,0 +1,237 @@
+nvme-rdma: introduce nvme_rdma_start_queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 68e16fcfaf9bbde573e89f783cf1ca60acb49cf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/68e16fcf.failed
+
+This should pair with nvme_rdma_stop_queue.  While this is not a complete
+inverse, it still pairs up pretty well because in fabrics we don't have a
+disconnect capsule (yet) but we simply teardown the transport association.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 68e16fcfaf9bbde573e89f783cf1ca60acb49cf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index 6d8e34242c5f,09c4ea8332d7..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -614,27 -591,41 +614,56 @@@ static void nvme_rdma_free_io_queues(st
+  	int i;
+  
+  	for (i = 1; i < ctrl->ctrl.queue_count; i++)
+ -		nvme_rdma_stop_queue(&ctrl->queues[i]);
+ +		nvme_rdma_stop_and_free_queue(&ctrl->queues[i]);
+  }
+  
+- static int nvme_rdma_connect_io_queues(struct nvme_rdma_ctrl *ctrl)
++ static int nvme_rdma_start_queue(struct nvme_rdma_ctrl *ctrl, int idx)
++ {
++ 	int ret;
++ 
++ 	if (idx)
++ 		ret = nvmf_connect_io_queue(&ctrl->ctrl, idx);
++ 	else
++ 		ret = nvmf_connect_admin_queue(&ctrl->ctrl);
++ 
++ 	if (!ret)
++ 		set_bit(NVME_RDMA_Q_LIVE, &ctrl->queues[idx].flags);
++ 	else
++ 		dev_info(ctrl->ctrl.device,
++ 			"failed to connect queue: %d ret=%d\n", idx, ret);
++ 	return ret;
++ }
++ 
++ static int nvme_rdma_start_io_queues(struct nvme_rdma_ctrl *ctrl)
+  {
+  	int i, ret = 0;
+  
+  	for (i = 1; i < ctrl->ctrl.queue_count; i++) {
+++<<<<<<< HEAD
+ +		ret = nvmf_connect_io_queue(&ctrl->ctrl, i);
+ +		if (ret) {
+ +			dev_info(ctrl->ctrl.device,
+ +				"failed to connect i/o queue: %d\n", ret);
+ +			goto out_free_queues;
+ +		}
+ +		set_bit(NVME_RDMA_Q_LIVE, &ctrl->queues[i].flags);
+++=======
++ 		ret = nvme_rdma_start_queue(ctrl, i);
++ 		if (ret)
++ 			goto out_stop_queues;
+++>>>>>>> 68e16fcfaf9b (nvme-rdma: introduce nvme_rdma_start_queue)
+  	}
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +out_free_queues:
+ +	nvme_rdma_free_io_queues(ctrl);
+++=======
++ out_stop_queues:
++ 	for (i--; i >= 1; i--)
++ 		nvme_rdma_stop_queue(&ctrl->queues[i]);
+++>>>>>>> 68e16fcfaf9b (nvme-rdma: introduce nvme_rdma_start_queue)
+  	return ret;
+  }
+  
+@@@ -679,10 -734,144 +708,151 @@@ static void nvme_rdma_destroy_admin_que
+  {
+  	nvme_rdma_free_qe(ctrl->queues[0].device->dev, &ctrl->async_event_sqe,
+  			sizeof(struct nvme_command), DMA_TO_DEVICE);
+++<<<<<<< HEAD
+ +	nvme_rdma_stop_and_free_queue(&ctrl->queues[0]);
+ +	blk_cleanup_queue(ctrl->ctrl.admin_q);
+ +	blk_mq_free_tag_set(&ctrl->admin_tag_set);
+ +	nvme_rdma_dev_put(ctrl->device);
+++=======
++ 	nvme_rdma_stop_queue(&ctrl->queues[0]);
++ 	if (remove) {
++ 		blk_cleanup_queue(ctrl->ctrl.admin_q);
++ 		nvme_rdma_free_tagset(&ctrl->ctrl, true);
++ 	}
++ 	nvme_rdma_free_queue(&ctrl->queues[0]);
++ }
++ 
++ static int nvme_rdma_configure_admin_queue(struct nvme_rdma_ctrl *ctrl,
++ 		bool new)
++ {
++ 	int error;
++ 
++ 	error = nvme_rdma_alloc_queue(ctrl, 0, NVME_AQ_DEPTH);
++ 	if (error)
++ 		return error;
++ 
++ 	ctrl->device = ctrl->queues[0].device;
++ 
++ 	ctrl->max_fr_pages = min_t(u32, NVME_RDMA_MAX_SEGMENTS,
++ 		ctrl->device->dev->attrs.max_fast_reg_page_list_len);
++ 
++ 	if (new) {
++ 		ctrl->ctrl.admin_tagset = nvme_rdma_alloc_tagset(&ctrl->ctrl, true);
++ 		if (IS_ERR(ctrl->ctrl.admin_tagset))
++ 			goto out_free_queue;
++ 
++ 		ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
++ 		if (IS_ERR(ctrl->ctrl.admin_q)) {
++ 			error = PTR_ERR(ctrl->ctrl.admin_q);
++ 			goto out_free_tagset;
++ 		}
++ 	} else {
++ 		error = blk_mq_reinit_tagset(&ctrl->admin_tag_set,
++ 					     nvme_rdma_reinit_request);
++ 		if (error)
++ 			goto out_free_queue;
++ 	}
++ 
++ 	error = nvme_rdma_start_queue(ctrl, 0);
++ 	if (error)
++ 		goto out_cleanup_queue;
++ 
++ 	error = nvmf_reg_read64(&ctrl->ctrl, NVME_REG_CAP,
++ 			&ctrl->ctrl.cap);
++ 	if (error) {
++ 		dev_err(ctrl->ctrl.device,
++ 			"prop_get NVME_REG_CAP failed\n");
++ 		goto out_cleanup_queue;
++ 	}
++ 
++ 	ctrl->ctrl.sqsize =
++ 		min_t(int, NVME_CAP_MQES(ctrl->ctrl.cap), ctrl->ctrl.sqsize);
++ 
++ 	error = nvme_enable_ctrl(&ctrl->ctrl, ctrl->ctrl.cap);
++ 	if (error)
++ 		goto out_cleanup_queue;
++ 
++ 	ctrl->ctrl.max_hw_sectors =
++ 		(ctrl->max_fr_pages - 1) << (PAGE_SHIFT - 9);
++ 
++ 	error = nvme_init_identify(&ctrl->ctrl);
++ 	if (error)
++ 		goto out_cleanup_queue;
++ 
++ 	error = nvme_rdma_alloc_qe(ctrl->queues[0].device->dev,
++ 			&ctrl->async_event_sqe, sizeof(struct nvme_command),
++ 			DMA_TO_DEVICE);
++ 	if (error)
++ 		goto out_cleanup_queue;
++ 
++ 	return 0;
++ 
++ out_cleanup_queue:
++ 	if (new)
++ 		blk_cleanup_queue(ctrl->ctrl.admin_q);
++ out_free_tagset:
++ 	if (new)
++ 		nvme_rdma_free_tagset(&ctrl->ctrl, true);
++ out_free_queue:
++ 	nvme_rdma_free_queue(&ctrl->queues[0]);
++ 	return error;
++ }
++ 
++ static void nvme_rdma_destroy_io_queues(struct nvme_rdma_ctrl *ctrl,
++ 		bool remove)
++ {
++ 	nvme_rdma_stop_io_queues(ctrl);
++ 	if (remove) {
++ 		blk_cleanup_queue(ctrl->ctrl.connect_q);
++ 		nvme_rdma_free_tagset(&ctrl->ctrl, false);
++ 	}
++ 	nvme_rdma_free_io_queues(ctrl);
++ }
++ 
++ static int nvme_rdma_configure_io_queues(struct nvme_rdma_ctrl *ctrl, bool new)
++ {
++ 	int ret;
++ 
++ 	ret = nvme_rdma_alloc_io_queues(ctrl);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (new) {
++ 		ctrl->ctrl.tagset = nvme_rdma_alloc_tagset(&ctrl->ctrl, false);
++ 		if (IS_ERR(ctrl->ctrl.tagset))
++ 			goto out_free_io_queues;
++ 
++ 		ctrl->ctrl.connect_q = blk_mq_init_queue(&ctrl->tag_set);
++ 		if (IS_ERR(ctrl->ctrl.connect_q)) {
++ 			ret = PTR_ERR(ctrl->ctrl.connect_q);
++ 			goto out_free_tag_set;
++ 		}
++ 	} else {
++ 		ret = blk_mq_reinit_tagset(&ctrl->tag_set,
++ 					   nvme_rdma_reinit_request);
++ 		if (ret)
++ 			goto out_free_io_queues;
++ 
++ 		blk_mq_update_nr_hw_queues(&ctrl->tag_set,
++ 			ctrl->ctrl.queue_count - 1);
++ 	}
++ 
++ 	ret = nvme_rdma_start_io_queues(ctrl);
++ 	if (ret)
++ 		goto out_cleanup_connect_q;
++ 
++ 	return 0;
++ 
++ out_cleanup_connect_q:
++ 	if (new)
++ 		blk_cleanup_queue(ctrl->ctrl.connect_q);
++ out_free_tag_set:
++ 	if (new)
++ 		nvme_rdma_free_tagset(&ctrl->ctrl, false);
++ out_free_io_queues:
++ 	nvme_rdma_free_io_queues(ctrl);
++ 	return ret;
+++>>>>>>> 68e16fcfaf9b (nvme-rdma: introduce nvme_rdma_start_queue)
+  }
+  
+  static void nvme_rdma_free_ctrl(struct nvme_ctrl *nctrl)
+* Unmerged path drivers/nvme/host/rdma.c
