@@ -1,0 +1,124 @@
+iommu/amd: Reduce delay waiting for command buffer space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Reduce delay waiting for command buffer space (Suravee Suthikulpanit) [1508644]
+Rebuild_FUZZ: 94.34%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 23e967e17c58779b38f69f8d41d727f59440d36a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/23e967e1.failed
+
+Currently if there is no room to add a command to the command buffer, the
+driver performs a "completion wait" which only returns when all commands
+on the queue have been processed. There is no need to wait for the entire
+command queue to be executed before adding the next command.
+
+Update the driver to perform the same udelay() loop that the "completion
+wait" performs, but instead re-read the head pointer to determine if
+sufficient space is available.  The very first time it is found that there
+is no space available, the udelay() will be skipped to immediately perform
+the opportunistic read of the head pointer. If it is still found that
+there is not sufficient space, then the udelay() will be performed.
+
+	Signed-off-by: Leo Duran <leo.duran@amd.com>
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 23e967e17c58779b38f69f8d41d727f59440d36a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index e80343c1de99,1efbef7f3b61..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -1013,45 -1041,55 +1013,66 @@@ static void build_inv_irt(struct iommu_
+   * Writes the command to the IOMMUs command buffer and informs the
+   * hardware about the new command.
+   */
+ -static int __iommu_queue_command_sync(struct amd_iommu *iommu,
+ -				      struct iommu_cmd *cmd,
+ -				      bool sync)
+ +static int iommu_queue_command_sync(struct amd_iommu *iommu,
+ +				    struct iommu_cmd *cmd,
+ +				    bool sync)
+  {
+++<<<<<<< HEAD
+ +	u32 left, tail, head, next_tail;
+ +	unsigned long flags;
+++=======
++ 	unsigned int count = 0;
++ 	u32 left, next_tail;
+++>>>>>>> 23e967e17c58 (iommu/amd: Reduce delay waiting for command buffer space)
+  
+ -	next_tail = (iommu->cmd_buf_tail + sizeof(*cmd)) % CMD_BUFFER_SIZE;
+  again:
+ -	left      = (iommu->cmd_buf_head - next_tail) % CMD_BUFFER_SIZE;
+ +	spin_lock_irqsave(&iommu->lock, flags);
+ +
+ +	head      = readl(iommu->mmio_base + MMIO_CMD_HEAD_OFFSET);
+ +	tail      = readl(iommu->mmio_base + MMIO_CMD_TAIL_OFFSET);
+ +	next_tail = (tail + sizeof(*cmd)) % CMD_BUFFER_SIZE;
+ +	left      = (head - next_tail) % CMD_BUFFER_SIZE;
+  
+  	if (left <= 0x20) {
+++<<<<<<< HEAD
+ +		struct iommu_cmd sync_cmd;
+ +		volatile u64 sem = 0;
+ +		int ret;
+ +
+ +		build_completion_wait(&sync_cmd, (u64)&sem);
+ +		copy_cmd_to_buffer(iommu, &sync_cmd, tail);
+ +
+ +		spin_unlock_irqrestore(&iommu->lock, flags);
+ +
+ +		if ((ret = wait_on_sem(&sem)) != 0)
+ +			return ret;
+++=======
++ 		/* Skip udelay() the first time around */
++ 		if (count++) {
++ 			if (count == LOOP_TIMEOUT) {
++ 				pr_err("AMD-Vi: Command buffer timeout\n");
++ 				return -EIO;
++ 			}
++ 
++ 			udelay(1);
++ 		}
++ 
++ 		/* Update head and recheck remaining space */
++ 		iommu->cmd_buf_head = readl(iommu->mmio_base +
++ 					    MMIO_CMD_HEAD_OFFSET);
+++>>>>>>> 23e967e17c58 (iommu/amd: Reduce delay waiting for command buffer space)
+  
+  		goto again;
+  	}
+  
+ -	copy_cmd_to_buffer(iommu, cmd);
+ +	copy_cmd_to_buffer(iommu, cmd, tail);
+  
+- 	/* We need to sync now to make sure all commands are processed */
++ 	/* Do we need to make sure all commands are processed? */
+  	iommu->need_sync = sync;
+  
+ -	return 0;
+ -}
+ -
+ -static int iommu_queue_command_sync(struct amd_iommu *iommu,
+ -				    struct iommu_cmd *cmd,
+ -				    bool sync)
+ -{
+ -	unsigned long flags;
+ -	int ret;
+ -
+ -	spin_lock_irqsave(&iommu->lock, flags);
+ -	ret = __iommu_queue_command_sync(iommu, cmd, sync);
+  	spin_unlock_irqrestore(&iommu->lock, flags);
+  
+ -	return ret;
+ +	return 0;
+  }
+  
+  static int iommu_queue_command(struct amd_iommu *iommu, struct iommu_cmd *cmd)
+* Unmerged path drivers/iommu/amd_iommu.c
