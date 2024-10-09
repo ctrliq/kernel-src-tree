@@ -1,0 +1,1359 @@
+netfilter: ipset: Introduce RCU locking in hash:* types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit 18f84d41d34fa35d0d64bbaea01fe664553ecc06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/18f84d41.failed
+
+Three types of data need to be protected in the case of the hash types:
+
+a. The hash buckets: standard rcu pointer operations are used.
+b. The element blobs in the hash buckets are stored in an array and
+   a bitmap is used for book-keeping to tell which elements in the array
+   are used or free.
+c. Networks per cidr values and the cidr values themselves are stored
+   in fix sized arrays and need no protection. The values are modified
+   in such an order that in the worst case an element testing is repeated
+   once with the same cidr value.
+
+The ipset hash approach uses arrays instead of lists and therefore is
+incompatible with rhashtable.
+
+Performance is tested by Jesper Dangaard Brouer:
+
+Simple drop in FORWARD
+~~~~~~~~~~~~~~~~~~~~~~
+
+Dropping via simple iptables net-mask match::
+
+ iptables -t raw -N simple || iptables -t raw -F simple
+ iptables -t raw -I simple  -s 198.18.0.0/15 -j DROP
+ iptables -t raw -D PREROUTING -j simple
+ iptables -t raw -I PREROUTING -j simple
+
+Drop performance in "raw": 11.3Mpps
+
+Generator: sending 12.2Mpps (tx:12264083 pps)
+
+Drop via original ipset in RAW table
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Create a set with lots of elements::
+
+ sudo ./ipset destroy test
+ echo "create test hash:ip hashsize 65536" > test.set
+ for x in `seq 0 255`; do
+    for y in `seq 0 255`; do
+        echo "add test 198.18.$x.$y" >> test.set
+    done
+ done
+ sudo ./ipset restore < test.set
+
+Dropping via ipset::
+
+ iptables -t raw -F
+ iptables -t raw -N net198 || iptables -t raw -F net198
+ iptables -t raw -I net198 -m set --match-set test src -j DROP
+ iptables -t raw -I PREROUTING -j net198
+
+Drop performance in "raw" with ipset: 8Mpps
+
+Perf report numbers ipset drop in "raw"::
+
+ +   24.65%  ksoftirqd/1  [ip_set]           [k] ip_set_test
+ -   21.42%  ksoftirqd/1  [kernel.kallsyms]  [k] _raw_read_lock_bh
+    - _raw_read_lock_bh
+       + 99.88% ip_set_test
+ -   19.42%  ksoftirqd/1  [kernel.kallsyms]  [k] _raw_read_unlock_bh
+    - _raw_read_unlock_bh
+       + 99.72% ip_set_test
+ +    4.31%  ksoftirqd/1  [ip_set_hash_ip]   [k] hash_ip4_kadt
+ +    2.27%  ksoftirqd/1  [ixgbe]            [k] ixgbe_fetch_rx_buffer
+ +    2.18%  ksoftirqd/1  [ip_tables]        [k] ipt_do_table
+ +    1.81%  ksoftirqd/1  [ip_set_hash_ip]   [k] hash_ip4_test
+ +    1.61%  ksoftirqd/1  [kernel.kallsyms]  [k] __netif_receive_skb_core
+ +    1.44%  ksoftirqd/1  [kernel.kallsyms]  [k] build_skb
+ +    1.42%  ksoftirqd/1  [kernel.kallsyms]  [k] ip_rcv
+ +    1.36%  ksoftirqd/1  [kernel.kallsyms]  [k] __local_bh_enable_ip
+ +    1.16%  ksoftirqd/1  [kernel.kallsyms]  [k] dev_gro_receive
+ +    1.09%  ksoftirqd/1  [kernel.kallsyms]  [k] __rcu_read_unlock
+ +    0.96%  ksoftirqd/1  [ixgbe]            [k] ixgbe_clean_rx_irq
+ +    0.95%  ksoftirqd/1  [kernel.kallsyms]  [k] __netdev_alloc_frag
+ +    0.88%  ksoftirqd/1  [kernel.kallsyms]  [k] kmem_cache_alloc
+ +    0.87%  ksoftirqd/1  [xt_set]           [k] set_match_v3
+ +    0.85%  ksoftirqd/1  [kernel.kallsyms]  [k] inet_gro_receive
+ +    0.83%  ksoftirqd/1  [kernel.kallsyms]  [k] nf_iterate
+ +    0.76%  ksoftirqd/1  [kernel.kallsyms]  [k] put_compound_page
+ +    0.75%  ksoftirqd/1  [kernel.kallsyms]  [k] __rcu_read_lock
+
+Drop via ipset in RAW table with RCU-locking
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With RCU locking, the RW-lock is gone.
+
+Drop performance in "raw" with ipset with RCU-locking: 11.3Mpps
+
+Performance-tested-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit 18f84d41d34fa35d0d64bbaea01fe664553ecc06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_hash_gen.h
+#	net/netfilter/ipset/ip_set_hash_mac.c
+#	net/netfilter/ipset/ip_set_hash_netnet.c
+#	net/netfilter/ipset/ip_set_hash_netportnet.c
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index 9ce28af662bf,f352cc022010..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -71,16 -76,22 +76,21 @@@ struct hbucket 
+  
+  /* The hash table: the table size stored here in order to make resizing easy */
+  struct htable {
+ -	atomic_t ref;		/* References for resizing */
+ -	atomic_t uref;		/* References for dumping */
+  	u8 htable_bits;		/* size of hash table == 2^htable_bits */
+- 	struct hbucket bucket[0]; /* hashtable buckets */
++ 	struct hbucket __rcu *bucket[0]; /* hashtable buckets */
+  };
+  
+- #define hbucket(h, i)		(&((h)->bucket[i]))
++ #define hbucket(h, i)		((h)->bucket[i])
+  
+ -#ifndef IPSET_NET_COUNT
+ -#define IPSET_NET_COUNT		1
+ -#endif
+ -
+  /* Book-keeping of the prefixes added to the set */
+  struct net_prefixes {
+++<<<<<<< HEAD
+ +	u8 cidr;		/* the different cidr values in the set */
+ +	u32 nets;		/* number of elements per cidr */
+++=======
++ 	u32 nets[IPSET_NET_COUNT]; /* number of elements for this cidr */
++ 	u8 cidr[IPSET_NET_COUNT];  /* the cidr value */
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  };
+  
+  /* Compute the hash table size */
+@@@ -113,61 -125,35 +124,64 @@@ htable_bits(u32 hashsize
+  	return bits;
+  }
+  
+ -#ifdef IP_SET_HASH_WITH_NETS
+ -#if IPSET_NET_COUNT > 1
+ -#define __CIDR(cidr, i)		(cidr[i])
+ -#else
+ -#define __CIDR(cidr, i)		(cidr)
+ -#endif
+++<<<<<<< HEAD
+ +/* Destroy the hashtable part of the set */
+ +static void
+ +ahash_destroy(struct htable *t)
+ +{
+ +	struct hbucket *n;
+ +	u32 i;
+  
+ -/* cidr + 1 is stored in net_prefixes to support /0 */
+ -#define NCIDR_PUT(cidr)		((cidr) + 1)
+ -#define NCIDR_GET(cidr)		((cidr) - 1)
+ +	for (i = 0; i < jhash_size(t->htable_bits); i++) {
+ +		n = hbucket(t, i);
+ +		if (n->size)
+ +			/* FIXME: use slab cache */
+ +			kfree(n->value);
+ +	}
+ +
+ +	ip_set_free(t);
+ +}
+ +
+ +static int
+ +hbucket_elem_add(struct hbucket *n, u8 ahash_max, size_t dsize)
+ +{
+ +	if (n->pos >= n->size) {
+ +		void *tmp;
+  
+ +		if (n->size >= ahash_max)
+ +			/* Trigger rehashing */
+ +			return -EAGAIN;
+ +
+ +		tmp = kzalloc((n->size + AHASH_INIT_SIZE) * dsize,
+ +			      GFP_ATOMIC);
+ +		if (!tmp)
+ +			return -ENOMEM;
+ +		if (n->size) {
+ +			memcpy(tmp, n->value, n->size * dsize);
+ +			kfree(n->value);
+ +		}
+ +		n->value = tmp;
+ +		n->size += AHASH_INIT_SIZE;
+ +	}
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+ +#ifdef IP_SET_HASH_WITH_NETS
+  #ifdef IP_SET_HASH_WITH_NETS_PACKED
+ -/* When cidr is packed with nomatch, cidr - 1 is stored in the data entry */
+ -#define DCIDR_PUT(cidr)		((cidr) - 1)
+ -#define DCIDR_GET(cidr, i)	(__CIDR(cidr, i) + 1)
+ +/* When cidr is packed with nomatch, cidr - 1 is stored in the entry */
+ +#define CIDR(cidr)		(cidr + 1)
+  #else
+ -#define DCIDR_PUT(cidr)		(cidr)
+ -#define DCIDR_GET(cidr, i)	__CIDR(cidr, i)
+ +#define CIDR(cidr)		(cidr)
+  #endif
+  
+ -#define INIT_CIDR(cidr, host_mask)	\
+ -	DCIDR_PUT(((cidr) ? NCIDR_GET(cidr) : host_mask))
+ -
+  #define SET_HOST_MASK(family)	(family == AF_INET ? 32 : 128)
+  
+ -#ifdef IP_SET_HASH_WITH_NET0
+ -#define NLEN(family)		(SET_HOST_MASK(family) + 1)
+ +#ifdef IP_SET_HASH_WITH_MULTI
+ +#define NETS_LENGTH(family)	(SET_HOST_MASK(family) + 1)
+  #else
+ -#define NLEN(family)		SET_HOST_MASK(family)
+ +#define NETS_LENGTH(family)	SET_HOST_MASK(family)
+  #endif
+  
+  #else
+@@@ -326,18 -322,14 +337,23 @@@ mtype_del_cidr(struct htype *h, u8 cidr
+  	u8 i, j, net_end = nets_length - 1;
+  
+  	for (i = 0; i < nets_length; i++) {
+ -	        if (h->nets[i].cidr[n] != cidr)
+ +	        if (h->nets[i].cidr != cidr)
+  	                continue;
+++<<<<<<< HEAD
+ +                if (h->nets[i].nets > 1 || i == net_end ||
+ +                    h->nets[i + 1].nets == 0) {
+ +                        h->nets[i].nets--;
+++=======
++ 		h->nets[cidr - 1].nets[n]--;
++ 		if (h->nets[cidr - 1].nets[n] > 0)
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+                          return;
+ -		for (j = i; j < net_end && h->nets[j].cidr[n]; j++)
+ -		        h->nets[j].cidr[n] = h->nets[j + 1].cidr[n];
+ -		h->nets[j].cidr[n] = 0;
+ +                }
+ +                for (j = i; j < net_end && h->nets[j].nets; j++) {
+ +		        h->nets[j].cidr = h->nets[j + 1].cidr;
+ +		        h->nets[j].nets = h->nets[j + 1].nets;
+ +                }
+ +                h->nets[j].nets = 0;
+                  return;
+  	}
+  }
+@@@ -345,23 -337,40 +361,55 @@@
+  
+  /* Calculate the actual memory size of the set data */
+  static size_t
+ -mtype_ahash_memsize(const struct htype *h, const struct htable *t,
+ -		    u8 nets_length, size_t dsize)
+ +mtype_ahash_memsize(const struct htype *h, u8 nets_length)
+  {
+  	u32 i;
+++<<<<<<< HEAD
+ +	struct htable *t = h->table;
+ +	size_t memsize = sizeof(*h)
+ +			 + sizeof(*t)
+ +#ifdef IP_SET_HASH_WITH_NETS
+ +			 + sizeof(struct net_prefixes) * nets_length
+ +#endif
+ +			 + jhash_size(t->htable_bits) * sizeof(struct hbucket);
+ +
+ +	for (i = 0; i < jhash_size(t->htable_bits); i++)
+ +		memsize += t->bucket[i].size * h->dsize;
+++=======
++ 	struct hbucket *n;
++ 	size_t memsize = sizeof(*h) + sizeof(*t);
++ 
++ #ifdef IP_SET_HASH_WITH_NETS
++ 	memsize += sizeof(struct net_prefixes) * nets_length;
++ #endif
++ 	for (i = 0; i < jhash_size(t->htable_bits); i++) {
++ 		n = rcu_dereference_bh(hbucket(t, i));
++ 		if (!n)
++ 			continue;
++ 		memsize += sizeof(struct hbucket) + n->size * dsize;
++ 	}
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+  	return memsize;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Get the ith element from the array block n */
++ #define ahash_data(n, i, dsize)	\
++ 	((struct mtype_elem *)((n)->value + ((i) * (dsize))))
++ 
++ static void
++ mtype_ext_cleanup(struct ip_set *set, struct hbucket *n)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < n->pos; i++)
++ 		if (test_bit(i, n->used))
++ 			ip_set_ext_destroy(set, ahash_data(n, i, set->dsize));
++ }
++ 
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  /* Flush a hash type of set: destroy all elements */
+  static void
+  mtype_flush(struct ip_set *set)
+@@@ -371,34 -380,54 +419,75 @@@
+  	struct hbucket *n;
+  	u32 i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < jhash_size(t->htable_bits); i++) {
+ +		n = hbucket(t, i);
+ +		if (n->size) {
+ +			n->size = n->pos = 0;
+ +			/* FIXME: use slab cache */
+ +			kfree(n->value);
+ +		}
+++=======
++ 	t = ipset_dereference_protected(h->table, set);
++ 	for (i = 0; i < jhash_size(t->htable_bits); i++) {
++ 		n = __ipset_dereference_protected(hbucket(t, i), 1);
++ 		if (!n)
++ 			continue;
++ 		if (set->extensions & IPSET_EXT_DESTROY)
++ 			mtype_ext_cleanup(set, n);
++ 		/* FIXME: use slab cache */
++ 		rcu_assign_pointer(hbucket(t, i), NULL);
++ 		kfree_rcu(n, rcu);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	}
+  #ifdef IP_SET_HASH_WITH_NETS
+ -	memset(h->nets, 0, sizeof(struct net_prefixes) * NLEN(set->family));
+ +	memset(h->nets, 0, sizeof(struct net_prefixes)
+ +			   * NETS_LENGTH(set->family));
+  #endif
+  	h->elements = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Destroy the hashtable part of the set */
++ static void
++ mtype_ahash_destroy(struct ip_set *set, struct htable *t, bool ext_destroy)
++ {
++ 	struct hbucket *n;
++ 	u32 i;
++ 
++ 	for (i = 0; i < jhash_size(t->htable_bits); i++) {
++ 		n = __ipset_dereference_protected(hbucket(t, i), 1);
++ 		if (!n)
++ 			continue;
++ 		if (set->extensions & IPSET_EXT_DESTROY && ext_destroy)
++ 			mtype_ext_cleanup(set, n);
++ 		/* FIXME: use slab cache */
++ 		kfree(n);
++ 	}
++ 
++ 	ip_set_free(t);
++ }
++ 
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  /* Destroy a hash type of set */
+  static void
+  mtype_destroy(struct ip_set *set)
+  {
+  	struct htype *h = set->data;
+  
+ -	if (SET_WITH_TIMEOUT(set))
+ +	if (set->extensions & IPSET_EXT_TIMEOUT)
+  		del_timer_sync(&h->gc);
+  
+++<<<<<<< HEAD
+ +	ahash_destroy(h->table);
+ +#ifdef IP_SET_HASH_WITH_RBTREE
+ +	rbtree_destroy(&h->rbtree);
+ +#endif
+++=======
++ 	mtype_ahash_destroy(set, __ipset_dereference_protected(h->table, 1),
++ 			    true);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	kfree(h);
+  
+  	set->data = NULL;
+@@@ -433,43 -465,49 +522,65 @@@ mtype_same_set(const struct ip_set *a, 
+  	       a->extensions == b->extensions;
+  }
+  
+ +/* Get the ith element from the array block n */
+ +#define ahash_data(n, i, dsize)	\
+ +	((struct mtype_elem *)((n)->value + ((i) * (dsize))))
+ +
+  /* Delete expired elements from the hashtable */
+  static void
+ -mtype_expire(struct ip_set *set, struct htype *h, u8 nets_length, size_t dsize)
+ +mtype_expire(struct htype *h, u8 nets_length, size_t dsize)
+  {
+ -	struct htable *t;
+ +	struct htable *t = h->table;
+  	struct hbucket *n;
+  	struct mtype_elem *data;
+++<<<<<<< HEAD
+ +	u32 i;
+ +	int j;
+ +
+++=======
++ 	u32 i, j, d;
++ #ifdef IP_SET_HASH_WITH_NETS
++ 	u8 k;
++ #endif
++ 
++ 	t = ipset_dereference_protected(h->table, set);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	for (i = 0; i < jhash_size(t->htable_bits); i++) {
+- 		n = hbucket(t, i);
+- 		for (j = 0; j < n->pos; j++) {
++ 		n = __ipset_dereference_protected(hbucket(t, i), 1);
++ 		if (!n)
++ 			continue;
++ 		for (j = 0, d = 0; j < n->pos; j++) {
++ 			if (!test_bit(j, n->used)) {
++ 				d++;
++ 				continue;
++ 			}
+  			data = ahash_data(n, j, dsize);
+ -			if (ip_set_timeout_expired(ext_timeout(data, set))) {
+ +			if (ip_set_timeout_expired(ext_timeout(data, h))) {
+  				pr_debug("expired %u/%u\n", i, j);
++ 				clear_bit(j, n->used);
++ 				smp_mb__after_atomic();
+  #ifdef IP_SET_HASH_WITH_NETS
+ -				for (k = 0; k < IPSET_NET_COUNT; k++)
+ -					mtype_del_cidr(h,
+ -						NCIDR_PUT(DCIDR_GET(data->cidr,
+ -								    k)),
+ -						nets_length, k);
+ +				mtype_del_cidr(h, CIDR(data->cidr),
+ +					       nets_length);
+  #endif
+++<<<<<<< HEAD
+ +				if (j != n->pos - 1)
+ +					/* Not last one */
+ +					memcpy(data,
+ +					       ahash_data(n, n->pos - 1, dsize),
+ +					       dsize);
+ +				n->pos--;
+++=======
++ 				ip_set_ext_destroy(set, data);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  				h->elements--;
++ 				d++;
+  			}
+  		}
+- 		if (n->pos + AHASH_INIT_SIZE < n->size) {
+- 			void *tmp = kzalloc((n->size - AHASH_INIT_SIZE)
+- 					    * dsize,
+- 					    GFP_ATOMIC);
++ 		if (d >= AHASH_INIT_SIZE) {
++ 			struct hbucket *tmp = kzalloc(sizeof(*tmp) +
++ 					(n->size - AHASH_INIT_SIZE) * dsize,
++ 					GFP_ATOMIC);
+  			if (!tmp)
+  				/* Still try to delete expired elements */
+  				continue;
+@@@ -488,11 -534,11 +607,17 @@@ mtype_gc(unsigned long ul_set
+  	struct htype *h = set->data;
+  
+  	pr_debug("called\n");
+++<<<<<<< HEAD
+ +	write_lock_bh(&set->lock);
+ +	mtype_expire(h, NETS_LENGTH(set->family), h->dsize);
+ +	write_unlock_bh(&set->lock);
+++=======
++ 	spin_lock_bh(&set->lock);
++ 	mtype_expire(set, h, NLEN(set->family), set->dsize);
++ 	spin_unlock_bh(&set->lock);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+ -	h->gc.expires = jiffies + IPSET_GC_PERIOD(set->timeout) * HZ;
+ +	h->gc.expires = jiffies + IPSET_GC_PERIOD(h->timeout) * HZ;
+  	add_timer(&h->gc);
+  }
+  
+@@@ -503,68 -549,107 +628,156 @@@ static in
+  mtype_resize(struct ip_set *set, bool retried)
+  {
+  	struct htype *h = set->data;
+++<<<<<<< HEAD
+ +	struct htable *t, *orig = h->table;
+ +	u8 htable_bits = orig->htable_bits;
+++=======
++ 	struct htable *t, *orig;
++ 	u8 htable_bits;
++ 	size_t dsize = set->dsize;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  #ifdef IP_SET_HASH_WITH_NETS
+  	u8 flags;
++ 	struct mtype_elem *tmp;
+  #endif
+  	struct mtype_elem *data;
+  	struct mtype_elem *d;
+  	struct hbucket *n, *m;
+- 	u32 i, j;
++ 	u32 i, j, key;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	/* Try to cleanup once */
+ +	if (SET_WITH_TIMEOUT(set) && !retried) {
+ +		i = h->elements;
+ +		write_lock_bh(&set->lock);
+ +		mtype_expire(set->data, NETS_LENGTH(set->family),
+ +			     h->dsize);
+ +		write_unlock_bh(&set->lock);
+ +		if (h->elements < i)
+ +			return 0;
+ +	}
+++=======
++ #ifdef IP_SET_HASH_WITH_NETS
++ 	tmp = kmalloc(dsize, GFP_KERNEL);
++ 	if (!tmp)
++ 		return -ENOMEM;
++ #endif
++ 	rcu_read_lock_bh();
++ 	orig = rcu_dereference_bh_nfnl(h->table);
++ 	htable_bits = orig->htable_bits;
++ 	rcu_read_unlock_bh();
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+  retry:
+  	ret = 0;
+  	htable_bits++;
+- 	pr_debug("attempt to resize set %s from %u to %u, t %p\n",
+- 		 set->name, orig->htable_bits, htable_bits, orig);
+  	if (!htable_bits) {
+  		/* In case we have plenty of memory :-) */
+++<<<<<<< HEAD
+ +		pr_warning("Cannot increase the hashsize of set %s further\n",
+ +			   set->name);
+ +		return -IPSET_ERR_HASH_FULL;
+++=======
++ 		pr_warn("Cannot increase the hashsize of set %s further\n",
++ 			set->name);
++ 		ret = -IPSET_ERR_HASH_FULL;
++ 		goto out;
++ 	}
++ 	t = ip_set_alloc(htable_size(htable_bits));
++ 	if (!t) {
++ 		ret = -ENOMEM;
++ 		goto out;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	}
+- 	t = ip_set_alloc(sizeof(*t)
+- 			 + jhash_size(htable_bits) * sizeof(struct hbucket));
+- 	if (!t)
+- 		return -ENOMEM;
+  	t->htable_bits = htable_bits;
+  
+++<<<<<<< HEAD
+ +	read_lock_bh(&set->lock);
+++=======
++ 	spin_lock_bh(&set->lock);
++ 	orig = __ipset_dereference_protected(h->table, 1);
++ 	/* There can't be another parallel resizing, but dumping is possible */
++ 	atomic_set(&orig->ref, 1);
++ 	atomic_inc(&orig->uref);
++ 	pr_debug("attempt to resize set %s from %u to %u, t %p\n",
++ 		 set->name, orig->htable_bits, htable_bits, orig);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	for (i = 0; i < jhash_size(orig->htable_bits); i++) {
+- 		n = hbucket(orig, i);
++ 		n = __ipset_dereference_protected(hbucket(orig, i), 1);
++ 		if (!n)
++ 			continue;
+  		for (j = 0; j < n->pos; j++) {
+++<<<<<<< HEAD
+ +			data = ahash_data(n, j, h->dsize);
+++=======
++ 			if (!test_bit(j, n->used))
++ 				continue;
++ 			data = ahash_data(n, j, dsize);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  #ifdef IP_SET_HASH_WITH_NETS
++ 			/* We have readers running parallel with us,
++ 			 * so the live data cannot be modified.
++ 			 */
+  			flags = 0;
++ 			memcpy(tmp, data, dsize);
++ 			data = tmp;
+  			mtype_data_reset_flags(data, &flags);
+  #endif
+++<<<<<<< HEAD
+ +			m = hbucket(t, HKEY(data, h->initval, htable_bits));
+ +			ret = hbucket_elem_add(m, AHASH_MAX(h), h->dsize);
+ +			if (ret < 0) {
+ +#ifdef IP_SET_HASH_WITH_NETS
+ +				mtype_data_reset_flags(data, &flags);
+ +#endif
+ +				read_unlock_bh(&set->lock);
+ +				ahash_destroy(t);
+ +				if (ret == -EAGAIN)
+ +					goto retry;
+ +				return ret;
+ +			}
+ +			d = ahash_data(m, m->pos++, h->dsize);
+ +			memcpy(d, data, h->dsize);
+++=======
++ 			key = HKEY(data, h->initval, htable_bits);
++ 			m = __ipset_dereference_protected(hbucket(t, key), 1);
++ 			if (!m) {
++ 				m = kzalloc(sizeof(*m) +
++ 					    AHASH_INIT_SIZE * dsize,
++ 					    GFP_ATOMIC);
++ 				if (!m) {
++ 					ret = -ENOMEM;
++ 					goto cleanup;
++ 				}
++ 				m->size = AHASH_INIT_SIZE;
++ 				RCU_INIT_POINTER(hbucket(t, key), m);
++ 			} else if (m->pos >= m->size) {
++ 				struct hbucket *ht;
++ 
++ 				if (m->size >= AHASH_MAX(h)) {
++ 					ret = -EAGAIN;
++ 				} else {
++ 					ht = kzalloc(sizeof(*ht) +
++ 						(m->size + AHASH_INIT_SIZE)
++ 						* dsize,
++ 						GFP_ATOMIC);
++ 					if (!ht)
++ 						ret = -ENOMEM;
++ 				}
++ 				if (ret < 0)
++ 					goto cleanup;
++ 				memcpy(ht, m, sizeof(struct hbucket) +
++ 					      m->size * dsize);
++ 				ht->size = m->size + AHASH_INIT_SIZE;
++ 				kfree(m);
++ 				m = ht;
++ 				RCU_INIT_POINTER(hbucket(t, key), ht);
++ 			}
++ 			d = ahash_data(m, m->pos, dsize);
++ 			memcpy(d, data, dsize);
++ 			set_bit(m->pos++, m->used);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  #ifdef IP_SET_HASH_WITH_NETS
+  			mtype_data_reset_flags(d, &flags);
+  #endif
+@@@ -579,9 -664,26 +792,22 @@@
+  
+  	pr_debug("set %s resized from %u (%p) to %u (%p)\n", set->name,
+  		 orig->htable_bits, orig, t->htable_bits, t);
+ -	/* If there's nobody else dumping the table, destroy it */
+ -	if (atomic_dec_and_test(&orig->uref)) {
+ -		pr_debug("Table destroy by resize %p\n", orig);
+ -		mtype_ahash_destroy(set, orig, false);
+ -	}
+ +	ahash_destroy(orig);
+  
+- 	return 0;
++ out:
++ #ifdef IP_SET_HASH_WITH_NETS
++ 	kfree(tmp);
++ #endif
++ 	return ret;
++ 
++ cleanup:
++ 	atomic_set(&orig->ref, 0);
++ 	atomic_dec(&orig->uref);
++ 	spin_unlock_bh(&set->lock);
++ 	mtype_ahash_destroy(set, t, false);
++ 	if (ret == -EAGAIN)
++ 		goto retry;
++ 	goto out;
+  }
+  
+  /* Add an element to a hash and update the internal counters when succeeded,
+@@@ -594,86 -696,144 +820,201 @@@ mtype_add(struct ip_set *set, void *val
+  	struct htable *t;
+  	const struct mtype_elem *d = value;
+  	struct mtype_elem *data;
+- 	struct hbucket *n;
+- 	int i, ret = 0;
+- 	int j = AHASH_MAX(h) + 1;
++ 	struct hbucket *n, *old = ERR_PTR(-ENOENT);
++ 	int i, j = -1;
+  	bool flag_exist = flags & IPSET_FLAG_EXIST;
++ 	bool deleted = false, forceadd = false, reuse = false;
+  	u32 key, multi = 0;
+  
+++<<<<<<< HEAD
+ +	if (SET_WITH_TIMEOUT(set) && h->elements >= h->maxelem)
+ +		/* FIXME: when set is full, we slow down here */
+ +		mtype_expire(h, NETS_LENGTH(set->family), h->dsize);
+ +
+ +	if (h->elements >= h->maxelem) {
+ +		if (net_ratelimit())
+ +			pr_warning("Set %s is full, maxelem %u reached\n",
+ +				   set->name, h->maxelem);
+ +		return -IPSET_ERR_HASH_FULL;
+ +	}
+ +
+ +	rcu_read_lock_bh();
+ +	t = rcu_dereference_bh(h->table);
+++=======
++ 	if (h->elements >= h->maxelem) {
++ 		if (SET_WITH_TIMEOUT(set))
++ 			/* FIXME: when set is full, we slow down here */
++ 			mtype_expire(set, h, NLEN(set->family), set->dsize);
++ 		if (h->elements >= h->maxelem && SET_WITH_FORCEADD(set))
++ 			forceadd = true;
++ 	}
++ 
++ 	t = ipset_dereference_protected(h->table, set);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	key = HKEY(value, h->initval, t->htable_bits);
+- 	n = hbucket(t, key);
++ 	n = __ipset_dereference_protected(hbucket(t, key), 1);
++ 	if (!n) {
++ 		if (forceadd) {
++ 			if (net_ratelimit())
++ 				pr_warn("Set %s is full, maxelem %u reached\n",
++ 					set->name, h->maxelem);
++ 			return -IPSET_ERR_HASH_FULL;
++ 		} else if (h->elements >= h->maxelem) {
++ 			goto set_full;
++ 		}
++ 		old = NULL;
++ 		n = kzalloc(sizeof(*n) + AHASH_INIT_SIZE * set->dsize,
++ 			    GFP_ATOMIC);
++ 		if (!n)
++ 			return -ENOMEM;
++ 		n->size = AHASH_INIT_SIZE;
++ 		goto copy_elem;
++ 	}
+  	for (i = 0; i < n->pos; i++) {
+++<<<<<<< HEAD
+ +		data = ahash_data(n, i, h->dsize);
+++=======
++ 		if (!test_bit(i, n->used)) {
++ 			/* Reuse first deleted entry */
++ 			if (j == -1) {
++ 				deleted = reuse = true;
++ 				j = i;
++ 			}
++ 			continue;
++ 		}
++ 		data = ahash_data(n, i, set->dsize);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  		if (mtype_data_equal(data, d, &multi)) {
+  			if (flag_exist ||
+  			    (SET_WITH_TIMEOUT(set) &&
+ -			     ip_set_timeout_expired(ext_timeout(data, set)))) {
+ +			     ip_set_timeout_expired(ext_timeout(data, h)))) {
+  				/* Just the extensions could be overwritten */
+  				j = i;
+- 				goto reuse_slot;
+- 			} else {
+- 				ret = -IPSET_ERR_EXIST;
+- 				goto out;
++ 				goto overwrite_extensions;
+  			}
++ 			return -IPSET_ERR_EXIST;
+  		}
+  		/* Reuse first timed out entry */
+  		if (SET_WITH_TIMEOUT(set) &&
+++<<<<<<< HEAD
+ +		    ip_set_timeout_expired(ext_timeout(data, h)) &&
+ +		    j != AHASH_MAX(h) + 1)
+++=======
++ 		    ip_set_timeout_expired(ext_timeout(data, set)) &&
++ 		    j == -1) {
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  			j = i;
++ 			reuse = true;
++ 		}
+  	}
+++<<<<<<< HEAD
+ +reuse_slot:
+ +	if (j != AHASH_MAX(h) + 1) {
+ +		/* Fill out reused slot */
+ +		data = ahash_data(n, j, h->dsize);
+ +#ifdef IP_SET_HASH_WITH_NETS
+ +		mtype_del_cidr(h, CIDR(data->cidr), NETS_LENGTH(set->family));
+ +		mtype_add_cidr(h, CIDR(d->cidr), NETS_LENGTH(set->family));
+ +#endif
+ +	} else {
+ +		/* Use/create a new slot */
+ +		TUNE_AHASH_MAX(h, multi);
+ +		ret = hbucket_elem_add(n, AHASH_MAX(h), h->dsize);
+ +		if (ret != 0) {
+ +			if (ret == -EAGAIN)
+ +				mtype_data_next(&h->next, d);
+ +			goto out;
+ +		}
+ +		data = ahash_data(n, n->pos++, h->dsize);
+ +#ifdef IP_SET_HASH_WITH_NETS
+ +		mtype_add_cidr(h, CIDR(d->cidr), NETS_LENGTH(set->family));
+ +#endif
+ +		h->elements++;
+++=======
++ 	if (reuse || forceadd) {
++ 		data = ahash_data(n, j, set->dsize);
++ 		if (!deleted) {
++ #ifdef IP_SET_HASH_WITH_NETS
++ 			for (i = 0; i < IPSET_NET_COUNT; i++)
++ 				mtype_del_cidr(h,
++ 					NCIDR_PUT(DCIDR_GET(data->cidr, i)),
++ 					NLEN(set->family), i);
++ #endif
++ 			ip_set_ext_destroy(set, data);
++ 			h->elements--;
++ 		}
++ 		goto copy_data;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	}
++ 	if (h->elements >= h->maxelem)
++ 		goto set_full;
++ 	/* Create a new slot */
++ 	if (n->pos >= n->size) {
++ 		TUNE_AHASH_MAX(h, multi);
++ 		if (n->size >= AHASH_MAX(h)) {
++ 			/* Trigger rehashing */
++ 			mtype_data_next(&h->next, d);
++ 			return -EAGAIN;
++ 		}
++ 		old = n;
++ 		n = kzalloc(sizeof(*n) +
++ 			    (old->size + AHASH_INIT_SIZE) * set->dsize,
++ 			    GFP_ATOMIC);
++ 		if (!n)
++ 			return -ENOMEM;
++ 		memcpy(n, old, sizeof(struct hbucket) +
++ 		       old->size * set->dsize);
++ 		n->size = old->size + AHASH_INIT_SIZE;
++ 	}
++ 
++ copy_elem:
++ 	j = n->pos++;
++ 	data = ahash_data(n, j, set->dsize);
++ copy_data:
++ 	h->elements++;
++ #ifdef IP_SET_HASH_WITH_NETS
++ 	for (i = 0; i < IPSET_NET_COUNT; i++)
++ 		mtype_add_cidr(h, NCIDR_PUT(DCIDR_GET(d->cidr, i)),
++ 			       NLEN(set->family), i);
++ #endif
+  	memcpy(data, d, sizeof(struct mtype_elem));
++ overwrite_extensions:
+  #ifdef IP_SET_HASH_WITH_NETS
+  	mtype_data_set_flags(data, flags);
+  #endif
+++<<<<<<< HEAD
+ +	if (SET_WITH_TIMEOUT(set))
+ +		ip_set_timeout_set(ext_timeout(data, h), ext->timeout);
+ +	if (SET_WITH_COUNTER(set))
+ +		ip_set_init_counter(ext_counter(data, h), ext);
+++=======
++ 	if (SET_WITH_COUNTER(set))
++ 		ip_set_init_counter(ext_counter(data, set), ext);
++ 	if (SET_WITH_COMMENT(set))
++ 		ip_set_init_comment(ext_comment(data, set), ext);
++ 	if (SET_WITH_SKBINFO(set))
++ 		ip_set_init_skbinfo(ext_skbinfo(data, set), ext);
++ 	/* Must come last for the case when timed out entry is reused */
++ 	if (SET_WITH_TIMEOUT(set))
++ 		ip_set_timeout_set(ext_timeout(data, set), ext->timeout);
++ 	smp_mb__before_atomic();
++ 	set_bit(j, n->used);
++ 	if (old != ERR_PTR(-ENOENT)) {
++ 		rcu_assign_pointer(hbucket(t, key), n);
++ 		if (old)
++ 			kfree_rcu(old, rcu);
++ 	}
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+- out:
+- 	rcu_read_unlock_bh();
+- 	return ret;
++ 	return 0;
++ set_full:
++ 	if (net_ratelimit())
++ 		pr_warn("Set %s is full, maxelem %u reached\n",
++ 			set->name, h->maxelem);
++ 	return -IPSET_ERR_HASH_FULL;
+  }
+  
+- /* Delete an element from the hash: swap it with the last element
+-  * and free up space if possible.
++ /* Delete an element from the hash and free up space if possible.
+   */
+  static int
+  mtype_del(struct ip_set *set, void *value, const struct ip_set_ext *ext,
+@@@ -684,43 -844,71 +1025,107 @@@
+  	const struct mtype_elem *d = value;
+  	struct mtype_elem *data;
+  	struct hbucket *n;
+++<<<<<<< HEAD
+ +	int i;
+++=======
++ 	int i, j, k, ret = -IPSET_ERR_EXIST;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	u32 key, multi = 0;
++ 	size_t dsize = set->dsize;
+  
+++<<<<<<< HEAD
+ +	key = HKEY(value, h->initval, t->htable_bits);
+ +	n = hbucket(t, key);
+ +	for (i = 0; i < n->pos; i++) {
+ +		data = ahash_data(n, i, h->dsize);
+ +		if (!mtype_data_equal(data, d, &multi))
+ +			continue;
+ +		if (SET_WITH_TIMEOUT(set) &&
+ +		    ip_set_timeout_expired(ext_timeout(data, h)))
+ +			return -IPSET_ERR_EXIST;
+ +		if (i != n->pos - 1)
+ +			/* Not last one */
+ +			memcpy(data, ahash_data(n, n->pos - 1, h->dsize),
+ +			       h->dsize);
+++=======
++ 	t = ipset_dereference_protected(h->table, set);
++ 	key = HKEY(value, h->initval, t->htable_bits);
++ 	n = __ipset_dereference_protected(hbucket(t, key), 1);
++ 	if (!n)
++ 		goto out;
++ 	for (i = 0, k = 0; i < n->pos; i++) {
++ 		if (!test_bit(i, n->used)) {
++ 			k++;
++ 			continue;
++ 		}
++ 		data = ahash_data(n, i, dsize);
++ 		if (!mtype_data_equal(data, d, &multi))
++ 			continue;
++ 		if (SET_WITH_TIMEOUT(set) &&
++ 		    ip_set_timeout_expired(ext_timeout(data, set)))
++ 			goto out;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+- 		n->pos--;
++ 		ret = 0;
++ 		clear_bit(i, n->used);
++ 		smp_mb__after_atomic();
++ 		if (i + 1 == n->pos)
++ 			n->pos--;
+  		h->elements--;
+  #ifdef IP_SET_HASH_WITH_NETS
+ -		for (j = 0; j < IPSET_NET_COUNT; j++)
+ -			mtype_del_cidr(h, NCIDR_PUT(DCIDR_GET(d->cidr, j)),
+ -				       NLEN(set->family), j);
+ +		mtype_del_cidr(h, CIDR(d->cidr), NETS_LENGTH(set->family));
+  #endif
+++<<<<<<< HEAD
+ +		if (n->pos + AHASH_INIT_SIZE < n->size) {
+ +			void *tmp = kzalloc((n->size - AHASH_INIT_SIZE)
+ +					    * h->dsize,
+ +					    GFP_ATOMIC);
+ +			if (!tmp)
+ +				return 0;
+ +			n->size -= AHASH_INIT_SIZE;
+ +			memcpy(tmp, n->value, n->size * h->dsize);
+ +			kfree(n->value);
+ +			n->value = tmp;
+ +		}
+ +		return 0;
+ +	}
+ +
+ +	return -IPSET_ERR_EXIST;
+++=======
++ 		ip_set_ext_destroy(set, data);
++ 
++ 		for (; i < n->pos; i++) {
++ 			if (!test_bit(i, n->used))
++ 				k++;
++ 		}
++ 		if (n->pos == 0 && k == 0) {
++ 			rcu_assign_pointer(hbucket(t, key), NULL);
++ 			kfree_rcu(n, rcu);
++ 		} else if (k >= AHASH_INIT_SIZE) {
++ 			struct hbucket *tmp = kzalloc(sizeof(*tmp) +
++ 					(n->size - AHASH_INIT_SIZE) * dsize,
++ 					GFP_ATOMIC);
++ 			if (!tmp)
++ 				goto out;
++ 			tmp->size = n->size - AHASH_INIT_SIZE;
++ 			for (j = 0, k = 0; j < n->pos; j++) {
++ 				if (!test_bit(j, n->used))
++ 					continue;
++ 				data = ahash_data(n, j, dsize);
++ 				memcpy(tmp->value + k * dsize, data, dsize);
++ 				set_bit(j, tmp->used);
++ 				k++;
++ 			}
++ 			tmp->pos = k;
++ 			rcu_assign_pointer(hbucket(t, key), tmp);
++ 			kfree_rcu(n, rcu);
++ 		}
++ 		goto out;
++ 	}
++ 
++ out:
++ 	return ret;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  }
+  
+  static inline int
+@@@ -743,20 -933,38 +1148,28 @@@ mtype_test_cidrs(struct ip_set *set, st
+  		 struct ip_set_ext *mext, u32 flags)
+  {
+  	struct htype *h = set->data;
+ -	struct htable *t = rcu_dereference_bh(h->table);
+ +	struct htable *t = h->table;
+  	struct hbucket *n;
+  	struct mtype_elem *data;
+ -#if IPSET_NET_COUNT == 2
+ -	struct mtype_elem orig = *d;
+ -	int i, j = 0, k;
+ -#else
+  	int i, j = 0;
+ -#endif
+  	u32 key, multi = 0;
+ -	u8 nets_length = NLEN(set->family);
+ +	u8 nets_length = NETS_LENGTH(set->family);
+  
+  	pr_debug("test by nets\n");
+ -	for (; j < nets_length && h->nets[j].cidr[0] && !multi; j++) {
+ -#if IPSET_NET_COUNT == 2
+ -		mtype_data_reset_elem(d, &orig);
+ -		mtype_data_netmask(d, NCIDR_GET(h->nets[j].cidr[0]), false);
+ -		for (k = 0; k < nets_length && h->nets[k].cidr[1] && !multi;
+ -		     k++) {
+ -			mtype_data_netmask(d, NCIDR_GET(h->nets[k].cidr[1]),
+ -					   true);
+ -#else
+ -		mtype_data_netmask(d, NCIDR_GET(h->nets[j].cidr[0]));
+ -#endif
+ +	for (; j < nets_length && h->nets[j].nets && !multi; j++) {
+ +		mtype_data_netmask(d, h->nets[j].cidr);
+  		key = HKEY(d, h->initval, t->htable_bits);
+- 		n = hbucket(t, key);
++ 		n =  rcu_dereference_bh(hbucket(t, key));
++ 		if (!n)
++ 			continue;
+  		for (i = 0; i < n->pos; i++) {
+++<<<<<<< HEAD
+ +			data = ahash_data(n, i, h->dsize);
+++=======
++ 			if (!test_bit(i, n->used))
++ 				continue;
++ 			data = ahash_data(n, i, set->dsize);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  			if (!mtype_data_equal(data, d, &multi))
+  				continue;
+  			if (SET_WITH_TIMEOUT(set)) {
+@@@ -787,9 -998,10 +1200,13 @@@ mtype_test(struct ip_set *set, void *va
+  	struct mtype_elem *d = value;
+  	struct hbucket *n;
+  	struct mtype_elem *data;
+ -	int i, ret = 0;
+ +	int i;
+  	u32 key, multi = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	t = rcu_dereference_bh(h->table);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  #ifdef IP_SET_HASH_WITH_NETS
+  	/* If we test an IP address and not a network address,
+  	 * try all possible network sizes */
+@@@ -798,15 -1015,24 +1215,30 @@@
+  #endif
+  
+  	key = HKEY(d, h->initval, t->htable_bits);
+- 	n = hbucket(t, key);
++ 	n = rcu_dereference_bh(hbucket(t, key));
++ 	if (!n) {
++ 		ret = 0;
++ 		goto out;
++ 	}
+  	for (i = 0; i < n->pos; i++) {
+++<<<<<<< HEAD
+ +		data = ahash_data(n, i, h->dsize);
+++=======
++ 		if (!test_bit(i, n->used))
++ 			continue;
++ 		data = ahash_data(n, i, set->dsize);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  		if (mtype_data_equal(data, d, &multi) &&
+  		    !(SET_WITH_TIMEOUT(set) &&
+ -		      ip_set_timeout_expired(ext_timeout(data, set)))) {
+ -			ret = mtype_data_match(data, ext, mext, set, flags);
+ -			goto out;
+ -		}
+ +		      ip_set_timeout_expired(ext_timeout(data, h))))
+ +			return mtype_data_match(data, ext, mext, set, flags);
+  	}
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ out:
++ 	return ret;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  }
+  
+  /* Reply a HEADER request: fill out the header part of the set */
+@@@ -814,18 -1040,22 +1246,31 @@@ static in
+  mtype_head(struct ip_set *set, struct sk_buff *skb)
+  {
+  	const struct htype *h = set->data;
+ -	const struct htable *t;
+  	struct nlattr *nested;
+  	size_t memsize;
++ 	u8 htable_bits;
+  
+++<<<<<<< HEAD
+ +	read_lock_bh(&set->lock);
+ +	memsize = mtype_ahash_memsize(h, NETS_LENGTH(set->family));
+ +	read_unlock_bh(&set->lock);
+++=======
++ 	rcu_read_lock_bh();
++ 	t = rcu_dereference_bh_nfnl(h->table);
++ 	memsize = mtype_ahash_memsize(h, t, NLEN(set->family), set->dsize);
++ 	htable_bits = t->htable_bits;
++ 	rcu_read_unlock_bh();
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+  	nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
+  	if (!nested)
+  		goto nla_put_failure;
+  	if (nla_put_net32(skb, IPSET_ATTR_HASHSIZE,
+++<<<<<<< HEAD
+ +			  htonl(jhash_size(h->table->htable_bits))) ||
+++=======
++ 			  htonl(jhash_size(htable_bits))) ||
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  	    nla_put_net32(skb, IPSET_ATTR_MAXELEM, htonl(h->maxelem)))
+  		goto nla_put_failure;
+  #ifdef IP_SET_HASH_WITH_NETMASK
+@@@ -858,31 -1112,42 +1303,51 @@@ mtype_list(const struct ip_set *set
+  	struct nlattr *atd, *nested;
+  	const struct hbucket *n;
+  	const struct mtype_elem *e;
+ -	u32 first = cb->args[IPSET_CB_ARG0];
+ +	u32 first = cb->args[2];
+  	/* We assume that one hash bucket fills into one page */
+  	void *incomplete;
+- 	int i;
++ 	int i, ret = 0;
+  
+  	atd = ipset_nest_start(skb, IPSET_ATTR_ADT);
+  	if (!atd)
+  		return -EMSGSIZE;
++ 
+  	pr_debug("list hash set %s\n", set->name);
+++<<<<<<< HEAD
+ +	for (; cb->args[2] < jhash_size(t->htable_bits); cb->args[2]++) {
+ +		incomplete = skb_tail_pointer(skb);
+ +		n = hbucket(t, cb->args[2]);
+ +		pr_debug("cb->args[2]: %lu, t %p n %p\n", cb->args[2], t, n);
+ +		for (i = 0; i < n->pos; i++) {
+ +			e = ahash_data(n, i, h->dsize);
+++=======
++ 	t = (const struct htable *)cb->args[IPSET_CB_PRIVATE];
++ 	/* Expire may replace a hbucket with another one */
++ 	rcu_read_lock();
++ 	for (; cb->args[IPSET_CB_ARG0] < jhash_size(t->htable_bits);
++ 	     cb->args[IPSET_CB_ARG0]++) {
++ 		incomplete = skb_tail_pointer(skb);
++ 		n = rcu_dereference(hbucket(t, cb->args[IPSET_CB_ARG0]));
++ 		pr_debug("cb->arg bucket: %lu, t %p n %p\n",
++ 			 cb->args[IPSET_CB_ARG0], t, n);
++ 		if (!n)
++ 			continue;
++ 		for (i = 0; i < n->pos; i++) {
++ 			if (!test_bit(i, n->used))
++ 				continue;
++ 			e = ahash_data(n, i, set->dsize);
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  			if (SET_WITH_TIMEOUT(set) &&
+ -			    ip_set_timeout_expired(ext_timeout(e, set)))
+ +			    ip_set_timeout_expired(ext_timeout(e, h)))
+  				continue;
+  			pr_debug("list hash %lu hbucket %p i %u, data %p\n",
+ -				 cb->args[IPSET_CB_ARG0], n, i, e);
+ +				 cb->args[2], n, i, e);
+  			nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
+  			if (!nested) {
+ -				if (cb->args[IPSET_CB_ARG0] == first) {
+ +				if (cb->args[2] == first) {
+  					nla_nest_cancel(skb, atd);
+- 					return -EMSGSIZE;
++ 					ret = -EMSGSIZE;
++ 					goto out;
+  				} else
+  					goto nla_put_failure;
+  			}
+@@@ -901,20 -1160,22 +1366,33 @@@
+  	}
+  	ipset_nest_end(skb, atd);
+  	/* Set listing finished */
+ -	cb->args[IPSET_CB_ARG0] = 0;
+ +	cb->args[2] = 0;
+  
+- 	return 0;
++ 	goto out;
+  
+  nla_put_failure:
+  	nlmsg_trim(skb, incomplete);
+++<<<<<<< HEAD
+ +	if (unlikely(first == cb->args[2])) {
+ +		pr_warning("Can't list set %s: one bucket does not fit into "
+ +			   "a message. Please report it!\n", set->name);
+ +		cb->args[2] = 0;
+ +		return -EMSGSIZE;
+ +	}
+ +	ipset_nest_end(skb, atd);
+ +	return 0;
+++=======
++ 	if (unlikely(first == cb->args[IPSET_CB_ARG0])) {
++ 		pr_warn("Can't list set %s: one bucket does not fit into a message. Please report it!\n",
++ 			set->name);
++ 		cb->args[IPSET_CB_ARG0] = 0;
++ 		ret = -EMSGSIZE;
++ 	} else
++ 		ipset_nest_end(skb, atd);
++ out:
++ 	rcu_read_unlock();
++ 	return ret;
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  }
+  
+  static int
+@@@ -989,6 -1265,14 +1472,17 @@@ IPSET_TOKEN(HTYPE, _create)(struct net 
+  			return -IPSET_ERR_INVALID_NETMASK;
+  	}
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef IP_SET_HASH_WITH_MARKMASK
++ 	if (tb[IPSET_ATTR_MARKMASK]) {
++ 		markmask = ntohl(nla_get_be32(tb[IPSET_ATTR_MARKMASK]));
++ 
++ 		if (markmask == 0)
++ 			return -IPSET_ERR_INVALID_MARKMASK;
++ 	}
++ #endif
+++>>>>>>> 18f84d41d34f (netfilter: ipset: Introduce RCU locking in hash:* types)
+  
+  	hsize = sizeof(*h);
+  #ifdef IP_SET_HASH_WITH_NETS
+* Unmerged path net/netfilter/ipset/ip_set_hash_mac.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_netnet.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_netportnet.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
+diff --git a/net/netfilter/ipset/ip_set_hash_ip.c b/net/netfilter/ipset/ip_set_hash_ip.c
+index 6e3d06eb397b..e8732879519d 100644
+--- a/net/netfilter/ipset/ip_set_hash_ip.c
++++ b/net/netfilter/ipset/ip_set_hash_ip.c
+@@ -336,6 +336,7 @@ hash_ip_init(void)
+ static void __exit
+ hash_ip_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_ip_type);
+ }
+ 
+diff --git a/net/netfilter/ipset/ip_set_hash_ipmark.c b/net/netfilter/ipset/ip_set_hash_ipmark.c
+index 50389697a53a..bee4ff05e3f2 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipmark.c
++++ b/net/netfilter/ipset/ip_set_hash_ipmark.c
+@@ -302,6 +302,7 @@ hash_ipmark_init(void)
+ static void __exit
+ hash_ipmark_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_ipmark_type);
+ }
+ 
+diff --git a/net/netfilter/ipset/ip_set_hash_ipport.c b/net/netfilter/ipset/ip_set_hash_ipport.c
+index 5e57c86de14d..d71007cb4bd6 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipport.c
++++ b/net/netfilter/ipset/ip_set_hash_ipport.c
+@@ -429,6 +429,7 @@ hash_ipport_init(void)
+ static void __exit
+ hash_ipport_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_ipport_type);
+ }
+ 
+diff --git a/net/netfilter/ipset/ip_set_hash_ipportip.c b/net/netfilter/ipset/ip_set_hash_ipportip.c
+index 24b9417eb2c5..6a8fa3ec7658 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipportip.c
++++ b/net/netfilter/ipset/ip_set_hash_ipportip.c
+@@ -450,6 +450,7 @@ hash_ipportip_init(void)
+ static void __exit
+ hash_ipportip_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_ipportip_type);
+ }
+ 
+diff --git a/net/netfilter/ipset/ip_set_hash_ipportnet.c b/net/netfilter/ipset/ip_set_hash_ipportnet.c
+index bb1a8e8f02c9..12d5b07b6912 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipportnet.c
++++ b/net/netfilter/ipset/ip_set_hash_ipportnet.c
+@@ -613,6 +613,7 @@ hash_ipportnet_init(void)
+ static void __exit
+ hash_ipportnet_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_ipportnet_type);
+ }
+ 
+* Unmerged path net/netfilter/ipset/ip_set_hash_mac.c
+diff --git a/net/netfilter/ipset/ip_set_hash_net.c b/net/netfilter/ipset/ip_set_hash_net.c
+index 0a64dad156d9..6c17b1433de3 100644
+--- a/net/netfilter/ipset/ip_set_hash_net.c
++++ b/net/netfilter/ipset/ip_set_hash_net.c
+@@ -438,6 +438,7 @@ hash_net_init(void)
+ static void __exit
+ hash_net_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_net_type);
+ }
+ 
+diff --git a/net/netfilter/ipset/ip_set_hash_netiface.c b/net/netfilter/ipset/ip_set_hash_netiface.c
+index aa4929b15a09..2412a9bf8991 100644
+--- a/net/netfilter/ipset/ip_set_hash_netiface.c
++++ b/net/netfilter/ipset/ip_set_hash_netiface.c
+@@ -696,6 +696,7 @@ hash_netiface_init(void)
+ static void __exit
+ hash_netiface_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_netiface_type);
+ }
+ 
+* Unmerged path net/netfilter/ipset/ip_set_hash_netnet.c
+diff --git a/net/netfilter/ipset/ip_set_hash_netport.c b/net/netfilter/ipset/ip_set_hash_netport.c
+index d98a685cd916..6b31d87b006b 100644
+--- a/net/netfilter/ipset/ip_set_hash_netport.c
++++ b/net/netfilter/ipset/ip_set_hash_netport.c
+@@ -555,6 +555,7 @@ hash_netport_init(void)
+ static void __exit
+ hash_netport_fini(void)
+ {
++	rcu_barrier();
+ 	ip_set_type_unregister(&hash_netport_type);
+ }
+ 
+* Unmerged path net/netfilter/ipset/ip_set_hash_netportnet.c
