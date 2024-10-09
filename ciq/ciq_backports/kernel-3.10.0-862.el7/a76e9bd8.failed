@@ -1,0 +1,175 @@
+i2c: attach/detach I2C client device to the ACPI power domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [i2c] attach/detach I2C client device to the ACPI power domain (Gopal Tiwari) [1456705]
+Rebuild_FUZZ: 95.73%
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit a76e9bd89ae70fdfff5fd1ca47756a35d10c5f3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a76e9bd8.failed
+
+If the I2C client device is enumerated from ACPI namespace it might have
+ACPI methods that needs to be called in order to transition the device to
+different power states (such as _PSx).
+
+Implement this for I2C client devices by checking if the device has an ACPI
+handle and if that's the case, attach it to the ACPI power domain. In
+addition we make sure that the device is fully powered when its ->probe()
+function gets called.
+
+For non-ACPI devices this patch is a no-op.
+
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Wolfram Sang <wsa@the-dreams.de>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit a76e9bd89ae70fdfff5fd1ca47756a35d10c5f3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/i2c-core.c
+diff --cc drivers/i2c/i2c-core.c
+index 8661cdd81e17,03a8ae64d762..000000000000
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@@ -263,10 -254,13 +263,16 @@@ static int i2c_device_probe(struct devi
+  					client->flags & I2C_CLIENT_WAKE);
+  	dev_dbg(dev, "probe\n");
+  
++ 	acpi_dev_pm_attach(&client->dev, true);
+  	status = driver->probe(client, i2c_match_id(driver->id_table, client));
+ -	if (status) {
+ -		client->driver = NULL;
+ +	if (status)
+  		i2c_set_clientdata(client, NULL);
+++<<<<<<< HEAD
+ +
+++=======
++ 		acpi_dev_pm_detach(&client->dev, true);
++ 	}
+++>>>>>>> a76e9bd89ae7 (i2c: attach/detach I2C client device to the ACPI power domain)
+  	return status;
+  }
+  
+@@@ -287,9 -281,11 +293,14 @@@ static int i2c_device_remove(struct dev
+  		dev->driver = NULL;
+  		status = 0;
+  	}
+ -	if (status == 0) {
+ -		client->driver = NULL;
+ +	if (status == 0)
+  		i2c_set_clientdata(client, NULL);
+++<<<<<<< HEAD
+ +
+++=======
++ 	}
++ 	acpi_dev_pm_detach(&client->dev, true);
+++>>>>>>> a76e9bd89ae7 (i2c: attach/detach I2C client device to the ACPI power domain)
+  	return status;
+  }
+  
+@@@ -1157,6 -1061,98 +1168,101 @@@ EXPORT_SYMBOL(of_find_i2c_adapter_by_no
+  static void of_i2c_register_devices(struct i2c_adapter *adap) { }
+  #endif /* CONFIG_OF */
+  
+++<<<<<<< HEAD
+++=======
++ /* ACPI support code */
++ 
++ #if IS_ENABLED(CONFIG_ACPI)
++ static int acpi_i2c_add_resource(struct acpi_resource *ares, void *data)
++ {
++ 	struct i2c_board_info *info = data;
++ 
++ 	if (ares->type == ACPI_RESOURCE_TYPE_SERIAL_BUS) {
++ 		struct acpi_resource_i2c_serialbus *sb;
++ 
++ 		sb = &ares->data.i2c_serial_bus;
++ 		if (sb->type == ACPI_RESOURCE_SERIAL_TYPE_I2C) {
++ 			info->addr = sb->slave_address;
++ 			if (sb->access_mode == ACPI_I2C_10BIT_MODE)
++ 				info->flags |= I2C_CLIENT_TEN;
++ 		}
++ 	} else if (info->irq < 0) {
++ 		struct resource r;
++ 
++ 		if (acpi_dev_resource_interrupt(ares, 0, &r))
++ 			info->irq = r.start;
++ 	}
++ 
++ 	/* Tell the ACPI core to skip this resource */
++ 	return 1;
++ }
++ 
++ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
++ 				       void *data, void **return_value)
++ {
++ 	struct i2c_adapter *adapter = data;
++ 	struct list_head resource_list;
++ 	struct i2c_board_info info;
++ 	struct acpi_device *adev;
++ 	int ret;
++ 
++ 	if (acpi_bus_get_device(handle, &adev))
++ 		return AE_OK;
++ 	if (acpi_bus_get_status(adev) || !adev->status.present)
++ 		return AE_OK;
++ 
++ 	memset(&info, 0, sizeof(info));
++ 	info.acpi_node.handle = handle;
++ 	info.irq = -1;
++ 
++ 	INIT_LIST_HEAD(&resource_list);
++ 	ret = acpi_dev_get_resources(adev, &resource_list,
++ 				     acpi_i2c_add_resource, &info);
++ 	acpi_dev_free_resource_list(&resource_list);
++ 
++ 	if (ret < 0 || !info.addr)
++ 		return AE_OK;
++ 
++ 	adev->power.flags.ignore_parent = true;
++ 	strlcpy(info.type, dev_name(&adev->dev), sizeof(info.type));
++ 	if (!i2c_new_device(adapter, &info)) {
++ 		adev->power.flags.ignore_parent = false;
++ 		dev_err(&adapter->dev,
++ 			"failed to add I2C device %s from ACPI\n",
++ 			dev_name(&adev->dev));
++ 	}
++ 
++ 	return AE_OK;
++ }
++ 
++ /**
++  * acpi_i2c_register_devices - enumerate I2C slave devices behind adapter
++  * @adap: pointer to adapter
++  *
++  * Enumerate all I2C slave devices behind this adapter by walking the ACPI
++  * namespace. When a device is found it will be added to the Linux device
++  * model and bound to the corresponding ACPI handle.
++  */
++ static void acpi_i2c_register_devices(struct i2c_adapter *adap)
++ {
++ 	acpi_handle handle;
++ 	acpi_status status;
++ 
++ 	handle = ACPI_HANDLE(adap->dev.parent);
++ 	if (!handle)
++ 		return;
++ 
++ 	status = acpi_walk_namespace(ACPI_TYPE_DEVICE, handle, 1,
++ 				     acpi_i2c_add_device, NULL,
++ 				     adap, NULL);
++ 	if (ACPI_FAILURE(status))
++ 		dev_warn(&adap->dev, "failed to enumerate I2C slaves\n");
++ }
++ #else
++ static inline void acpi_i2c_register_devices(struct i2c_adapter *adap) {}
++ #endif /* CONFIG_ACPI */
++ 
+++>>>>>>> a76e9bd89ae7 (i2c: attach/detach I2C client device to the ACPI power domain)
+  static int i2c_do_add_adapter(struct i2c_driver *driver,
+  			      struct i2c_adapter *adap)
+  {
+* Unmerged path drivers/i2c/i2c-core.c
