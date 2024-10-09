@@ -1,0 +1,236 @@
+net: bridge: drop skb2/skb0 variables and use a local_rcv boolean
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] bridge: drop skb2/skb0 variables and use a local_rcv boolean (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 96.00%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit b35c5f632b630183396a2ea2e2247ff8bbf2c94f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b35c5f63.failed
+
+Currently if the packet is going to be received locally we set skb0 or
+sometimes called skb2 variables to the original skb. This can get
+confusing and also we can avoid one conditional on the fast path by
+simply using a boolean and passing it around. Thanks to Roopa for the
+name suggestion.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b35c5f632b630183396a2ea2e2247ff8bbf2c94f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_forward.c
+#	net/bridge/br_input.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_forward.c
+index 20c11b41fe6a,204f99304a8a..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -136,10 -138,11 +136,16 @@@ void br_deliver(const struct net_bridge
+  EXPORT_SYMBOL_GPL(br_deliver);
+  
+  /* called with rcu_read_lock */
+- void br_forward(const struct net_bridge_port *to, struct sk_buff *skb, struct sk_buff *skb0)
++ void br_forward(const struct net_bridge_port *to, struct sk_buff *skb,
++ 		bool local_rcv)
+  {
+++<<<<<<< HEAD
+ +	if (should_deliver(to, skb)) {
+ +		if (skb0)
+++=======
++ 	if (to && should_deliver(to, skb)) {
++ 		if (local_rcv)
+++>>>>>>> b35c5f632b63 (net: bridge: drop skb2/skb0 variables and use a local_rcv boolean)
+  			deliver_clone(to, skb, __br_forward);
+  		else
+  			__br_forward(to, skb);
+@@@ -191,13 -194,13 +197,12 @@@ out
+  
+  /* called under bridge lock */
+  static void br_flood(struct net_bridge *br, struct sk_buff *skb,
+- 		     struct sk_buff *skb0,
+  		     void (*__packet_hook)(const struct net_bridge_port *p,
+  					   struct sk_buff *skb),
+- 		     bool unicast)
++ 		     bool local_rcv, bool unicast)
+  {
+ -	u8 igmp_type = br_multicast_igmp_type(skb);
+ -	struct net_bridge_port *prev;
+  	struct net_bridge_port *p;
+ +	struct net_bridge_port *prev;
+  
+  	prev = NULL;
+  
+@@@ -241,12 -255,14 +246,13 @@@ void br_flood_forward(struct net_bridg
+  #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+  /* called with rcu_read_lock */
+  static void br_multicast_flood(struct net_bridge_mdb_entry *mdst,
+- 			       struct sk_buff *skb, struct sk_buff *skb0,
++ 			       struct sk_buff *skb,
+  			       void (*__packet_hook)(
+  					const struct net_bridge_port *p,
+- 					struct sk_buff *skb))
++ 					struct sk_buff *skb),
++ 			       bool local_rcv)
+  {
+  	struct net_device *dev = BR_INPUT_SKB_CB(skb)->brdev;
+ -	u8 igmp_type = br_multicast_igmp_type(skb);
+  	struct net_bridge *br = netdev_priv(dev);
+  	struct net_bridge_port *prev = NULL;
+  	struct net_bridge_port_group *p;
+diff --cc net/bridge/br_input.c
+index ddc6cbe6269c,dd8885def11b..000000000000
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@@ -59,15 -129,14 +59,24 @@@ static int br_pass_frame_up(struct sk_b
+  }
+  
+  /* note: already called with rcu_read_lock */
+ -int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ +int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	const unsigned char *dest = eth_hdr(skb)->h_dest;
+ +	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
+ +	struct net_bridge *br;
+ +	struct net_bridge_fdb_entry *dst;
+ +	struct net_bridge_mdb_entry *mdst;
+ +	struct sk_buff *skb2;
+ +	bool unicast = true;
+++=======
++ 	bool local_rcv = false, mcast_hit = false, unicast = true;
++ 	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
++ 	const unsigned char *dest = eth_hdr(skb)->h_dest;
++ 	struct net_bridge_fdb_entry *dst = NULL;
++ 	struct net_bridge_mdb_entry *mdst;
++ 	struct net_bridge *br;
+++>>>>>>> b35c5f632b63 (net: bridge: drop skb2/skb0 variables and use a local_rcv boolean)
+  	u16 vid = 0;
+  
+  	if (!p || p->state == BR_STATE_DISABLED)
+@@@ -90,50 -159,46 +99,69 @@@
+  
+  	BR_INPUT_SKB_CB(skb)->brdev = br->dev;
+  
+- 	/* The packet skb2 goes to the local host (NULL to skip). */
+- 	skb2 = NULL;
+- 
+- 	if (br->dev->flags & IFF_PROMISC)
+- 		skb2 = skb;
++ 	local_rcv = !!(br->dev->flags & IFF_PROMISC);
+  
+ -	if (IS_ENABLED(CONFIG_INET) && skb->protocol == htons(ETH_P_ARP))
+ -		br_do_proxy_arp(skb, br, vid, p);
+ +	dst = NULL;
+  
+  	if (is_broadcast_ether_addr(dest)) {
+- 		skb2 = skb;
++ 		local_rcv = true;
+  		unicast = false;
+  	} else if (is_multicast_ether_addr(dest)) {
+  		mdst = br_mdb_get(br, skb, vid);
+  		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+  		    br_multicast_querier_exists(br, eth_hdr(skb))) {
+  			if ((mdst && mdst->mglist) ||
+++<<<<<<< HEAD
+ +			    br_multicast_is_router(br))
+ +				skb2 = skb;
+ +			br_multicast_forward(mdst, skb, skb2);
+ +			skb = NULL;
+ +			if (!skb2)
+ +				goto out;
+ +		} else
+ +			skb2 = skb;
+ +
+++=======
++ 			    br_multicast_is_router(br)) {
++ 				local_rcv = true;
++ 				br->dev->stats.multicast++;
++ 			}
++ 			mcast_hit = true;
++ 		} else {
++ 			local_rcv = true;
++ 			br->dev->stats.multicast++;
++ 		}
+++>>>>>>> b35c5f632b63 (net: bridge: drop skb2/skb0 variables and use a local_rcv boolean)
+  		unicast = false;
+ -	} else if ((dst = __br_fdb_get(br, dest, vid)) && dst->is_local) {
+ +		br->dev->stats.multicast++;
+ +	} else if ((dst = __br_fdb_get(br, dest, vid)) &&
+ +			dst->is_local) {
+ +		skb2 = skb;
+  		/* Do not forward the packet since it's local. */
+ -		return br_pass_frame_up(skb);
+ +		skb = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (skb) {
+ +		if (dst) {
+ +			dst->used = jiffies;
+ +			br_forward(dst->dst, skb, skb2);
+ +		} else
+ +			br_flood_forward(br, skb, skb2, unicast);
+++=======
++ 	if (dst) {
++ 		dst->used = jiffies;
++ 		br_forward(dst->dst, skb, local_rcv);
++ 	} else {
++ 		if (!mcast_hit)
++ 			br_flood_forward(br, skb, local_rcv, unicast);
++ 		else
++ 			br_multicast_forward(mdst, skb, local_rcv);
+++>>>>>>> b35c5f632b63 (net: bridge: drop skb2/skb0 variables and use a local_rcv boolean)
+  	}
+  
+- 	if (skb2)
+- 		return br_pass_frame_up(skb2);
++ 	if (local_rcv)
++ 		return br_pass_frame_up(skb);
+  
+  out:
+  	return 0;
+diff --cc net/bridge/br_private.h
+index 1e1daa30e106,4d6cdf459e57..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -398,13 -502,17 +398,20 @@@ void br_fdb_unsync_static(struct net_br
+  
+  /* br_forward.c */
+  void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb);
+++<<<<<<< HEAD
+ +int br_dev_queue_push_xmit(struct sock *sk, struct sk_buff *skb);
+ +void br_forward(const struct net_bridge_port *to,
+ +		struct sk_buff *skb, struct sk_buff *skb0);
+ +int br_forward_finish(struct sock *sk, struct sk_buff *skb);
+++=======
++ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb);
++ void br_forward(const struct net_bridge_port *to, struct sk_buff *skb,
++ 		bool local_rcv);
++ int br_forward_finish(struct net *net, struct sock *sk, struct sk_buff *skb);
+++>>>>>>> b35c5f632b63 (net: bridge: drop skb2/skb0 variables and use a local_rcv boolean)
+  void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast);
+  void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+- 		      struct sk_buff *skb2, bool unicast);
++ 		      bool local_rcv, bool unicast);
+  
+  /* br_if.c */
+  void br_port_carrier_check(struct net_bridge_port *p);
+@@@ -456,7 -563,7 +463,11 @@@ void br_multicast_dev_del(struct net_br
+  void br_multicast_deliver(struct net_bridge_mdb_entry *mdst,
+  			  struct sk_buff *skb);
+  void br_multicast_forward(struct net_bridge_mdb_entry *mdst,
+++<<<<<<< HEAD
+ +			 struct sk_buff *skb, struct sk_buff *skb2);
+++=======
++ 			  struct sk_buff *skb, bool local_rcv);
+++>>>>>>> b35c5f632b63 (net: bridge: drop skb2/skb0 variables and use a local_rcv boolean)
+  int br_multicast_set_router(struct net_bridge *br, unsigned long val);
+  int br_multicast_set_port_router(struct net_bridge_port *p, unsigned long val);
+  int br_multicast_toggle(struct net_bridge *br, unsigned long val);
+* Unmerged path net/bridge/br_forward.c
+* Unmerged path net/bridge/br_input.c
+* Unmerged path net/bridge/br_private.h
