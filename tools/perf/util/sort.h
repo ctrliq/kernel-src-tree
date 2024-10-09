@@ -123,7 +123,6 @@ struct hist_entry {
 	};
 	char			*srcline;
 	char			*srcfile;
-	struct inline_node	*inline_node;
 	struct symbol		*parent;
 	struct branch_info	*branch_info;
 	struct hists		*hists;
