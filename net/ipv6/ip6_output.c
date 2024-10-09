@@ -1292,7 +1292,7 @@ emsgsize:
 	 */
 
 	cork->length += length;
-	if ((((length + fragheaderlen) > mtu) ||
+	if ((((length + (skb ? skb->len : headersize)) > mtu) ||
 	     (skb && skb_is_gso(skb))) &&
 	    (sk->sk_protocol == IPPROTO_UDP) &&
 	    (rt->dst.dev->features & NETIF_F_UFO) && !dst_xfrm(&rt->dst) &&
