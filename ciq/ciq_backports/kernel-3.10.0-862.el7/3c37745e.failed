@@ -1,0 +1,264 @@
+net/mlx5e: Properly deal with encap flows add/del under neigh update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Properly deal with encap flows add/del under neigh update (Kamal Heib) [1456694]
+Rebuild_FUZZ: 96.97%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit 3c37745ec614ff048d5dce38f976804b05d307ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3c37745e.failed
+
+Currently, the encap action offload is handled in the actions parse
+function and not in mlx5e_tc_add_fdb_flow() where we deal with all
+the other aspects of offloading actions (vlan, modify header) and
+the rule itself.
+
+When the neigh update code (mlx5e_tc_encap_flows_add()) recreates the
+encap entry and offloads the related flows, we wrongly call again into
+mlx5e_tc_add_fdb_flow(), this for itself would cause us to handle
+again the offloading of vlans and header re-write which puts things
+in non consistent state and step on freed memory (e.g the modify
+header parse buffer which is already freed).
+
+Since on error, mlx5e_tc_add_fdb_flow() detaches and may release the
+encap entry, it causes a corruption at the neigh update code which goes
+over the list of flows associated with this encap entry, or double free
+when the tc flow is later deleted by user-space.
+
+When neigh update (mlx5e_tc_encap_flows_del()) unoffloads the flows related
+to an encap entry which is now invalid, we do a partial repeat of the eswitch
+flow removal code which is wrong too.
+
+To fix things up we do the following:
+
+(1) handle the encap action offload in the eswitch flow add function
+    mlx5e_tc_add_fdb_flow() as done for the other actions and the rule itself.
+
+(2) modify the neigh update code (mlx5e_tc_encap_flows_add/del) to only
+    deal with the encap entry and rules delete/add and not with any of
+    the other offloaded actions.
+
+Fixes: 232c001398ae ('net/mlx5e: Add support to neighbour update flow')
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reviewed-by: Paul Blakey <paulb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 3c37745ec614ff048d5dce38f976804b05d307ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 2a258dca3413,9ba1f72060aa..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -316,10 -364,23 +342,30 @@@ mlx5e_tc_add_fdb_flow(struct mlx5e_pri
+  		goto err_add_vlan;
+  	}
+  
+++<<<<<<< HEAD
+ +	rule = mlx5_eswitch_add_offloaded_rule(esw, &parse_attr->spec, attr);
+ +	if (IS_ERR(rule))
+ +		goto err_add_rule;
+ +
+++=======
++ 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
++ 		err = mlx5e_attach_mod_hdr(priv, flow, parse_attr);
++ 		kfree(parse_attr->mod_hdr_actions);
++ 		if (err) {
++ 			rule = ERR_PTR(err);
++ 			goto err_mod_hdr;
++ 		}
++ 	}
++ 
++ 	/* we get here if (1) there's no error (rule being null) or when
++ 	 * (2) there's an encap action and we're on -EAGAIN (no valid neigh)
++ 	 */
++ 	if (rule != ERR_PTR(-EAGAIN)) {
++ 		rule = mlx5_eswitch_add_offloaded_rule(esw, &parse_attr->spec, attr);
++ 		if (IS_ERR(rule))
++ 			goto err_add_rule;
++ 	}
+++>>>>>>> 3c37745ec614 (net/mlx5e: Properly deal with encap flows add/del under neigh update)
+  	return rule;
+  
+  err_add_rule:
+@@@ -327,7 -391,7 +373,11 @@@
+  err_add_vlan:
+  	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_ENCAP)
+  		mlx5e_detach_encap(priv, flow);
+++<<<<<<< HEAD
+ +
+++=======
++ err_attach_encap:
+++>>>>>>> 3c37745ec614 (net/mlx5e: Properly deal with encap flows add/del under neigh update)
+  	return rule;
+  }
+  
+@@@ -335,14 -399,126 +385,126 @@@ static void mlx5e_tc_del_fdb_flow(struc
+  				  struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+  
+ -	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+ -		flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+ -		mlx5_eswitch_del_offloaded_rule(esw, flow->rule, attr);
+ -	}
+ +	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED)
+ +		mlx5_eswitch_del_offloaded_rule(esw, flow->rule, flow->esw_attr);
+  
+ -	mlx5_eswitch_del_vlan_action(esw, attr);
+ +	mlx5_eswitch_del_vlan_action(esw, flow->esw_attr);
+  
+ -	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_ENCAP) {
+ +	if (flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_ENCAP)
+  		mlx5e_detach_encap(priv, flow);
+++<<<<<<< HEAD
+++=======
++ 		kvfree(attr->parse_attr);
++ 	}
++ 
++ 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
++ 		mlx5e_detach_mod_hdr(priv, flow);
++ }
++ 
++ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
++ 			      struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	struct mlx5_esw_flow_attr *esw_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int err;
++ 
++ 	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
++ 			       e->encap_size, e->encap_header,
++ 			       &e->encap_id);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "Failed to offload cached encapsulation header, %d\n",
++ 			       err);
++ 		return;
++ 	}
++ 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
++ 	mlx5e_rep_queue_neigh_stats_work(priv);
++ 
++ 	list_for_each_entry(flow, &e->flows, encap) {
++ 		esw_attr = flow->esw_attr;
++ 		esw_attr->encap_id = e->encap_id;
++ 		flow->rule = mlx5_eswitch_add_offloaded_rule(esw, &esw_attr->parse_attr->spec, esw_attr);
++ 		if (IS_ERR(flow->rule)) {
++ 			err = PTR_ERR(flow->rule);
++ 			mlx5_core_warn(priv->mdev, "Failed to update cached encapsulation flow, %d\n",
++ 				       err);
++ 			continue;
++ 		}
++ 		flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	}
++ }
++ 
++ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
++ 			      struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	struct mlx5e_tc_flow *flow;
++ 
++ 	list_for_each_entry(flow, &e->flows, encap) {
++ 		if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
++ 			flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
++ 			mlx5_eswitch_del_offloaded_rule(esw, flow->rule, flow->esw_attr);
++ 		}
++ 	}
++ 
++ 	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
++ 		e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
++ 		mlx5_encap_dealloc(priv->mdev, e->encap_id);
++ 	}
++ }
++ 
++ void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
++ {
++ 	struct mlx5e_neigh *m_neigh = &nhe->m_neigh;
++ 	u64 bytes, packets, lastuse = 0;
++ 	struct mlx5e_tc_flow *flow;
++ 	struct mlx5e_encap_entry *e;
++ 	struct mlx5_fc *counter;
++ 	struct neigh_table *tbl;
++ 	bool neigh_used = false;
++ 	struct neighbour *n;
++ 
++ 	if (m_neigh->family == AF_INET)
++ 		tbl = &arp_tbl;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else if (m_neigh->family == AF_INET6)
++ 		tbl = ipv6_stub->nd_tbl;
++ #endif
++ 	else
++ 		return;
++ 
++ 	list_for_each_entry(e, &nhe->encap_list, encap_list) {
++ 		if (!(e->flags & MLX5_ENCAP_ENTRY_VALID))
++ 			continue;
++ 		list_for_each_entry(flow, &e->flows, encap) {
++ 			if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
++ 				counter = mlx5_flow_rule_counter(flow->rule);
++ 				mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
++ 				if (time_after((unsigned long)lastuse, nhe->reported_lastuse)) {
++ 					neigh_used = true;
++ 					break;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	if (neigh_used) {
++ 		nhe->reported_lastuse = jiffies;
++ 
++ 		/* find the relevant neigh according to the cached device and
++ 		 * dst ip pair
++ 		 */
++ 		n = neigh_lookup(tbl, &m_neigh->dst_ip, m_neigh->dev);
++ 		if (!n) {
++ 			WARN(1, "The neighbour already freed\n");
++ 			return;
++ 		}
++ 
++ 		neigh_event_send(n, NULL);
++ 		neigh_release(n);
++ 	}
+++>>>>>>> 3c37745ec614 (net/mlx5e: Properly deal with encap flows add/del under neigh update)
+  }
+  
+  static void mlx5e_detach_encap(struct mlx5e_priv *priv,
+@@@ -1602,18 -1982,16 +1764,28 @@@ static int parse_tc_fdb_actions(struct 
+  				attr->action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+  					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  				out_priv = netdev_priv(out_dev);
+ -				rpriv = out_priv->ppriv;
+ -				attr->out_rep = rpriv->rep;
+ +				attr->out_rep = out_priv->ppriv;
+  			} else if (encap) {
+++<<<<<<< HEAD
+ +				err = mlx5e_attach_encap(priv, info,
+ +							 out_dev, attr);
+ +				if (err)
+ +					return err;
+ +				list_add(&flow->encap, &attr->encap->flows);
+ +				attr->action |= MLX5_FLOW_CONTEXT_ACTION_ENCAP |
+ +					MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ +				out_priv = netdev_priv(attr->encap->out_dev);
+ +				attr->out_rep = out_priv->ppriv;
+++=======
++ 				parse_attr->mirred_ifindex = ifindex;
++ 				parse_attr->tun_info = *info;
++ 				attr->parse_attr = parse_attr;
++ 				attr->action |= MLX5_FLOW_CONTEXT_ACTION_ENCAP |
++ 					MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
++ 					MLX5_FLOW_CONTEXT_ACTION_COUNT;
++ 				/* attr->out_rep is resolved when we handle encap */
+++>>>>>>> 3c37745ec614 (net/mlx5e: Properly deal with encap flows add/del under neigh update)
+  			} else {
+  				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+  				       priv->netdev->name, out_dev->name);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
