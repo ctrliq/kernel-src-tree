@@ -1,0 +1,129 @@
+iommu/amd: Reduce amount of MMIO when submitting commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Reduce amount of MMIO when submitting commands (Suravee Suthikulpanit) [1508644]
+Rebuild_FUZZ: 94.44%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit d334a5637dfb53f7d07017afc1e491903b482ef8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d334a563.failed
+
+As newer, higher speed devices are developed, perf data shows that the
+amount of MMIO that is performed when submitting commands to the IOMMU
+causes performance issues. Currently, the command submission path reads
+the command buffer head and tail pointers and then writes the tail
+pointer once the command is ready.
+
+The tail pointer is only ever updated by the driver so it can be tracked
+by the driver without having to read it from the hardware.
+
+The head pointer is updated by the hardware, but can be read
+opportunistically. Reading the head pointer only when it appears that
+there might not be room in the command buffer and then re-checking the
+available space reduces the number of times the head pointer has to be
+read.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d334a5637dfb53f7d07017afc1e491903b482ef8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index e80343c1de99,d81c895ff4f4..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -1013,32 -1041,37 +1014,59 @@@ static void build_inv_irt(struct iommu_
+   * Writes the command to the IOMMUs command buffer and informs the
+   * hardware about the new command.
+   */
+ -static int __iommu_queue_command_sync(struct amd_iommu *iommu,
+ -				      struct iommu_cmd *cmd,
+ -				      bool sync)
+ +static int iommu_queue_command_sync(struct amd_iommu *iommu,
+ +				    struct iommu_cmd *cmd,
+ +				    bool sync)
+  {
+++<<<<<<< HEAD
+ +	u32 left, tail, head, next_tail;
+ +	unsigned long flags;
+++=======
++ 	bool read_head = true;
++ 	u32 left, next_tail;
+++>>>>>>> d334a5637dfb (iommu/amd: Reduce amount of MMIO when submitting commands)
+  
++ 	next_tail = (iommu->cmd_buf_tail + sizeof(*cmd)) % CMD_BUFFER_SIZE;
+  again:
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&iommu->lock, flags);
+ +
+ +	head      = readl(iommu->mmio_base + MMIO_CMD_HEAD_OFFSET);
+ +	tail      = readl(iommu->mmio_base + MMIO_CMD_TAIL_OFFSET);
+ +	next_tail = (tail + sizeof(*cmd)) % CMD_BUFFER_SIZE;
+ +	left      = (head - next_tail) % CMD_BUFFER_SIZE;
+++=======
++ 	left      = (iommu->cmd_buf_head - next_tail) % CMD_BUFFER_SIZE;
+++>>>>>>> d334a5637dfb (iommu/amd: Reduce amount of MMIO when submitting commands)
+  
+  	if (left <= 0x20) {
+  		struct iommu_cmd sync_cmd;
+ +		volatile u64 sem = 0;
+  		int ret;
+  
+++<<<<<<< HEAD
+ +		build_completion_wait(&sync_cmd, (u64)&sem);
+ +		copy_cmd_to_buffer(iommu, &sync_cmd, tail);
+++=======
++ 		if (read_head) {
++ 			/* Update head and recheck remaining space */
++ 			iommu->cmd_buf_head = readl(iommu->mmio_base +
++ 						    MMIO_CMD_HEAD_OFFSET);
++ 			read_head = false;
++ 			goto again;
++ 		}
++ 
++ 		read_head = true;
++ 
++ 		iommu->cmd_sem = 0;
++ 
++ 		build_completion_wait(&sync_cmd, (u64)&iommu->cmd_sem);
++ 		copy_cmd_to_buffer(iommu, &sync_cmd);
+++>>>>>>> d334a5637dfb (iommu/amd: Reduce amount of MMIO when submitting commands)
+ +
+ +		spin_unlock_irqrestore(&iommu->lock, flags);
+  
+ -		if ((ret = wait_on_sem(&iommu->cmd_sem)) != 0)
+ +		if ((ret = wait_on_sem(&sem)) != 0)
+  			return ret;
+  
+  		goto again;
+* Unmerged path drivers/iommu/amd_iommu.c
+diff --git a/drivers/iommu/amd_iommu_init.c b/drivers/iommu/amd_iommu_init.c
+index 9cab1b2422c6..49dca7edff7d 100644
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@ -572,6 +572,8 @@ void amd_iommu_reset_cmd_buffer(struct amd_iommu *iommu)
+ 
+ 	writel(0x00, iommu->mmio_base + MMIO_CMD_HEAD_OFFSET);
+ 	writel(0x00, iommu->mmio_base + MMIO_CMD_TAIL_OFFSET);
++	iommu->cmd_buf_head = 0;
++	iommu->cmd_buf_tail = 0;
+ 
+ 	iommu_feature_enable(iommu, CONTROL_CMDBUF_EN);
+ }
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index e448daa671af..3a06b338790d 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -479,6 +479,8 @@ struct amd_iommu {
+ 
+ 	/* command buffer virtual address */
+ 	u8 *cmd_buf;
++	u32 cmd_buf_head;
++	u32 cmd_buf_tail;
+ 
+ 	/* event buffer virtual address */
+ 	u8 *evt_buf;
