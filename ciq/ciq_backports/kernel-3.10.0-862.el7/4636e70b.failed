@@ -1,0 +1,274 @@
+dax: prevent invalidation of mapped DAX entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 4636e70bb0a8b871998b6841a2e4b205cf2bc863
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4636e70b.failed
+
+Patch series "mm,dax: Fix data corruption due to mmap inconsistency",
+v4.
+
+This series fixes data corruption that can happen for DAX mounts when
+page faults race with write(2) and as a result page tables get out of
+sync with block mappings in the filesystem and thus data seen through
+mmap is different from data seen through read(2).
+
+The series passes testing with t_mmap_stale test program from Ross and
+also other mmap related tests on DAX filesystem.
+
+This patch (of 4):
+
+dax_invalidate_mapping_entry() currently removes DAX exceptional entries
+only if they are clean and unlocked.  This is done via:
+
+  invalidate_mapping_pages()
+    invalidate_exceptional_entry()
+      dax_invalidate_mapping_entry()
+
+However, for page cache pages removed in invalidate_mapping_pages()
+there is an additional criteria which is that the page must not be
+mapped.  This is noted in the comments above invalidate_mapping_pages()
+and is checked in invalidate_inode_page().
+
+For DAX entries this means that we can can end up in a situation where a
+DAX exceptional entry, either a huge zero page or a regular DAX entry,
+could end up mapped but without an associated radix tree entry.  This is
+inconsistent with the rest of the DAX code and with what happens in the
+page cache case.
+
+We aren't able to unmap the DAX exceptional entry because according to
+its comments invalidate_mapping_pages() isn't allowed to block, and
+unmap_mapping_range() takes a write lock on the mapping->i_mmap_rwsem.
+
+Since we essentially never have unmapped DAX entries to evict from the
+radix tree, just remove dax_invalidate_mapping_entry().
+
+Fixes: c6dcf52c23d2 ("mm: Invalidate DAX radix tree entries only if appropriate")
+Link: http://lkml.kernel.org/r/20170510085419.27601-2-jack@suse.cz
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reported-by: Jan Kara <jack@suse.cz>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: <stable@vger.kernel.org>    [4.10+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4636e70bb0a8b871998b6841a2e4b205cf2bc863)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/dax.h
+#	mm/truncate.c
+diff --cc fs/dax.c
+index 1dfecdfb6245,38deebb8c86e..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -548,16 -456,17 +548,30 @@@ int dax_delete_mapping_entry(struct add
+  	 * caller has seen exceptional entry for this index, we better find it
+  	 * at that index as well...
+  	 */
+++<<<<<<< HEAD
+ +	if (WARN_ON_ONCE(!entry || !radix_tree_exceptional_entry(entry))) {
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		return 0;
+ +	}
+ +	radix_tree_delete(&mapping->page_tree, index);
+ +	mapping->nrexceptional--;
+ +	spin_unlock_irq(&mapping->tree_lock);
+ +	dax_wake_mapping_entry_waiter(mapping, index, entry, true);
+ +
+ +	return 1;
+++=======
++ 	WARN_ON_ONCE(!ret);
++ 	return ret;
++ }
++ 
++ /*
++  * Invalidate exceptional DAX entry if it is clean.
++  */
++ int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
++ 				      pgoff_t index)
++ {
++ 	return __dax_invalidate_mapping_entry(mapping, index, false);
+++>>>>>>> 4636e70bb0a8 (dax: prevent invalidation of mapped DAX entries)
+  }
+  
+  /*
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,d1236d16ef00..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,65 +6,34 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+ -struct iomap_ops;
+ -struct dax_device;
+ -struct dax_operations {
+ -	/*
+ -	 * direct_access: translate a device-relative
+ -	 * logical-page-offset into an absolute physical pfn. Return the
+ -	 * number of pages available for DAX at that pfn.
+ -	 */
+ -	long (*direct_access)(struct dax_device *, pgoff_t, long,
+ -			void **, pfn_t *);
+ -};
+ -
+ -int dax_read_lock(void);
+ -void dax_read_unlock(int id);
+ -struct dax_device *dax_get_by_host(const char *host);
+ -struct dax_device *alloc_dax(void *private, const char *host,
+ -		const struct dax_operations *ops);
+ -void put_dax(struct dax_device *dax_dev);
+ -bool dax_alive(struct dax_device *dax_dev);
+ -void kill_dax(struct dax_device *dax_dev);
+ -void *dax_get_private(struct dax_device *dax_dev);
+ -long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+ -		void **kaddr, pfn_t *pfn);
+ -
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ -
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+  
+ -static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ -{
+ -	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ -			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ -			RADIX_DAX_ENTRY_LOCK);
+ -}
+  
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ -int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+++<<<<<<< HEAD
+++=======
++ int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
++ 				      pgoff_t index);
+++>>>>>>> 4636e70bb0a8 (dax: prevent invalidation of mapped DAX entries)
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+diff --cc mm/truncate.c
+index 4112e2136c0a,706cff171a15..000000000000
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@@ -49,25 -41,58 +49,56 @@@ static void clear_exceptional_entry(str
+  		goto unlock;
+  	if (*slot != entry)
+  		goto unlock;
+ -	__radix_tree_replace(&mapping->page_tree, node, slot, NULL,
+ -			     workingset_update_node, mapping);
+ +	radix_tree_replace_slot(slot, NULL);
+  	mapping->nrexceptional--;
+ +	if (!node)
+ +		goto unlock;
+ +	workingset_node_shadows_dec(node);
+ +	/*
+ +	 * Don't track node without shadow entries.
+ +	 *
+ +	 * Avoid acquiring the list_lru lock if already untracked.
+ +	 * The list_empty() test is safe as node->private_list is
+ +	 * protected by mapping->tree_lock.
+ +	 */
+ +	if (!workingset_node_shadows(node) &&
+ +	    !list_empty(&node->private_list))
+ +		workingset_forget_node(node);
+ +	__radix_tree_delete_node(&mapping->page_tree, node);
+ +
+++<<<<<<< HEAD
+  unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+ -}
+ -
+ -/*
+ - * Unconditionally remove exceptional entry. Usually called from truncate path.
+ - */
+ -static void truncate_exceptional_entry(struct address_space *mapping,
+ -				       pgoff_t index, void *entry)
+ -{
+ -	/* Handled by shmem itself */
+ -	if (shmem_mapping(mapping))
+ -		return;
+ -
+ -	if (dax_mapping(mapping)) {
+ -		dax_delete_mapping_entry(mapping, index);
+ -		return;
+ -	}
+ -	clear_shadow_entry(mapping, index, entry);
+ -}
+ -
+++=======
++ /*
++  * Invalidate exceptional entry if easily possible. This handles exceptional
++  * entries for invalidate_inode_pages().
++  */
++ static int invalidate_exceptional_entry(struct address_space *mapping,
++ 					pgoff_t index, void *entry)
++ {
++ 	/* Handled by shmem itself, or for DAX we do nothing. */
++ 	if (shmem_mapping(mapping) || dax_mapping(mapping))
++ 		return 1;
++ 	clear_shadow_entry(mapping, index, entry);
++ 	return 1;
++ }
++ 
++ /*
++  * Invalidate exceptional entry if clean. This handles exceptional entries for
++  * invalidate_inode_pages2() so for DAX it evicts only clean entries.
++  */
++ static int invalidate_exceptional_entry2(struct address_space *mapping,
++ 					 pgoff_t index, void *entry)
++ {
++ 	/* Handled by shmem itself */
++ 	if (shmem_mapping(mapping))
++ 		return 1;
++ 	if (dax_mapping(mapping))
++ 		return dax_invalidate_mapping_entry_sync(mapping, index);
++ 	clear_shadow_entry(mapping, index, entry);
++ 	return 1;
+++>>>>>>> 4636e70bb0a8 (dax: prevent invalidation of mapped DAX entries)
+  }
+  
+  /**
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
+* Unmerged path mm/truncate.c
