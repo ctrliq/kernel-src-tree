@@ -1,0 +1,243 @@
+mm,fork: introduce MADV_WIPEONFORK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] fork: introduce MADV_WIPEONFORK (Rafael Aquini) [1476297]
+Rebuild_FUZZ: 95.38%
+commit-author Rik van Riel <riel@redhat.com>
+commit d2cd9ede6e193dd7d88b6d27399e96229a551b19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d2cd9ede.failed
+
+Introduce MADV_WIPEONFORK semantics, which result in a VMA being empty
+in the child process after fork.  This differs from MADV_DONTFORK in one
+important way.
+
+If a child process accesses memory that was MADV_WIPEONFORK, it will get
+zeroes.  The address ranges are still valid, they are just empty.
+
+If a child process accesses memory that was MADV_DONTFORK, it will get a
+segmentation fault, since those address ranges are no longer valid in
+the child after fork.
+
+Since MADV_DONTFORK also seems to be used to allow very large programs
+to fork in systems with strict memory overcommit restrictions, changing
+the semantics of MADV_DONTFORK might break existing programs.
+
+MADV_WIPEONFORK only works on private, anonymous VMAs.
+
+The use case is libraries that store or cache information, and want to
+know that they need to regenerate it in the child process after fork.
+
+Examples of this would be:
+ - systemd/pulseaudio API checks (fail after fork) (replacing a getpid
+   check, which is too slow without a PID cache)
+ - PKCS#11 API reinitialization check (mandated by specification)
+ - glibc's upcoming PRNG (reseed after fork)
+ - OpenSSL PRNG (reseed after fork)
+
+The security benefits of a forking server having a re-inialized PRNG in
+every child process are pretty obvious.  However, due to libraries
+having all kinds of internal state, and programs getting compiled with
+many different versions of each library, it is unreasonable to expect
+calling programs to re-initialize everything manually after fork.
+
+A further complication is the proliferation of clone flags, programs
+bypassing glibc's functions to call clone directly, and programs calling
+unshare, causing the glibc pthread_atfork hook to not get called.
+
+It would be better to have the kernel take care of this automatically.
+
+The patch also adds MADV_KEEPONFORK, to undo the effects of a prior
+MADV_WIPEONFORK.
+
+This is similar to the OpenBSD minherit syscall with MAP_INHERIT_ZERO:
+
+    https://man.openbsd.org/minherit.2
+
+[akpm@linux-foundation.org: numerically order arch/parisc/include/uapi/asm/mman.h #defines]
+Link: http://lkml.kernel.org/r/20170811212829.29186-3-riel@redhat.com
+	Signed-off-by: Rik van Riel <riel@redhat.com>
+	Reported-by: Florian Weimer <fweimer@redhat.com>
+	Reported-by: Colm MacCártaigh <colm@allcosts.net>
+	Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Helge Deller <deller@gmx.de>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Will Drewry <wad@chromium.org>
+	Cc: <linux-api@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d2cd9ede6e193dd7d88b6d27399e96229a551b19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/parisc/include/uapi/asm/mman.h
+#	include/trace/events/mmflags.h
+#	mm/madvise.c
+diff --cc arch/parisc/include/uapi/asm/mman.h
+index 294d251ca7b2,775b5d5e41a1..000000000000
+--- a/arch/parisc/include/uapi/asm/mman.h
++++ b/arch/parisc/include/uapi/asm/mman.h
+@@@ -66,6 -57,12 +66,15 @@@
+  					   overrides the coredump filter bits */
+  #define MADV_DODUMP	70		/* Clear the MADV_NODUMP flag */
+  
+++<<<<<<< HEAD
+++=======
++ #define MADV_WIPEONFORK 71		/* Zero memory on fork, child only */
++ #define MADV_KEEPONFORK 72		/* Undo MADV_WIPEONFORK */
++ 
++ #define MADV_HWPOISON     100		/* poison a page for testing */
++ #define MADV_SOFT_OFFLINE 101		/* soft offline page for testing */
++ 
+++>>>>>>> d2cd9ede6e19 (mm,fork: introduce MADV_WIPEONFORK)
+  /* compatibility flags */
+  #define MAP_FILE	0
+  #define MAP_VARIABLE	0
+diff --cc mm/madvise.c
+index b0f5c3aa9c31,eea1c733286f..000000000000
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@@ -449,10 -707,16 +460,20 @@@ madvise_behavior_valid(int behavior
+  #endif
+  	case MADV_DONTDUMP:
+  	case MADV_DODUMP:
+++<<<<<<< HEAD
+ +		return 1;
+++=======
++ 	case MADV_WIPEONFORK:
++ 	case MADV_KEEPONFORK:
++ #ifdef CONFIG_MEMORY_FAILURE
++ 	case MADV_SOFT_OFFLINE:
++ 	case MADV_HWPOISON:
++ #endif
++ 		return true;
+++>>>>>>> d2cd9ede6e19 (mm,fork: introduce MADV_WIPEONFORK)
+  
+  	default:
+ -		return false;
+ +		return 0;
+  	}
+  }
+  
+* Unmerged path include/trace/events/mmflags.h
+diff --git a/arch/alpha/include/uapi/asm/mman.h b/arch/alpha/include/uapi/asm/mman.h
+index 0086b472bc2b..be53f590d8ac 100644
+--- a/arch/alpha/include/uapi/asm/mman.h
++++ b/arch/alpha/include/uapi/asm/mman.h
+@@ -60,6 +60,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git a/arch/mips/include/uapi/asm/mman.h b/arch/mips/include/uapi/asm/mman.h
+index cfcb876cae6b..2104eaa70b43 100644
+--- a/arch/mips/include/uapi/asm/mman.h
++++ b/arch/mips/include/uapi/asm/mman.h
+@@ -84,6 +84,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+* Unmerged path arch/parisc/include/uapi/asm/mman.h
+diff --git a/arch/xtensa/include/uapi/asm/mman.h b/arch/xtensa/include/uapi/asm/mman.h
+index 00eed6786d7e..94bbcced336e 100644
+--- a/arch/xtensa/include/uapi/asm/mman.h
++++ b/arch/xtensa/include/uapi/asm/mman.h
+@@ -90,6 +90,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 2a2e2958ee0d..5d4c2f932520 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -627,6 +627,7 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
+ 		[ilog2(VM_HUGETLB)]	= "ht",
+ 		[ilog2(VM_NONLINEAR)]	= "nl",
+ 		[ilog2(VM_ARCH_1)]	= "ar",
++		[ilog2(VM_WIPEONFORK)]	= "wf",
+ 		[ilog2(VM_DONTDUMP)]	= "dd",
+ #ifdef CONFIG_MEM_SOFT_DIRTY
+ 		[ilog2(VM_SOFTDIRTY)]	= "sd",
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 329d8a2b3e80..f2144f5d680e 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -142,7 +142,7 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
+ #define VM_NONLINEAR	0x00800000	/* Is non-linear (remap_file_pages) */
+ #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
+-#define VM_ARCH_2	0x02000000
++#define VM_WIPEONFORK	0x02000000	/* Wipe VMA contents in child. */
+ #define VM_DONTDUMP	0x04000000	/* Do not include in the core dump */
+ 
+ #ifdef CONFIG_MEM_SOFT_DIRTY
+* Unmerged path include/trace/events/mmflags.h
+diff --git a/include/uapi/asm-generic/mman-common.h b/include/uapi/asm-generic/mman-common.h
+index 2c8ab0e60aae..4fb517a1b2a0 100644
+--- a/include/uapi/asm-generic/mman-common.h
++++ b/include/uapi/asm-generic/mman-common.h
+@@ -52,6 +52,9 @@
+ 					   overrides the coredump filter bits */
+ #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
+ 
++#define MADV_WIPEONFORK 18		/* Zero memory on fork, child only */
++#define MADV_KEEPONFORK 19		/* Undo MADV_WIPEONFORK */
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 55e4ca475546..a1b15e131acf 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -467,7 +467,12 @@ static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
+ 		retval = dup_userfaultfd(tmp, &uf);
+ 		if (retval)
+ 			goto fail_nomem_anon_vma_fork;
+-		if (anon_vma_fork(tmp, mpnt))
++		if (tmp->vm_flags & VM_WIPEONFORK) {
++			/* VM_WIPEONFORK gets a clean slate in the child. */
++			tmp->anon_vma = NULL;
++			if (anon_vma_prepare(tmp))
++				goto fail_nomem_anon_vma_fork;
++		} else if (anon_vma_fork(tmp, mpnt))
+ 			goto fail_nomem_anon_vma_fork;
+ 		tmp->vm_flags &= ~(VM_LOCKED);
+ 		tmp->vm_next = tmp->vm_prev = NULL;
+@@ -515,7 +520,8 @@ static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
+ 		rb_parent = &tmp->vm_rb;
+ 
+ 		mm->map_count++;
+-		retval = copy_page_range(mm, oldmm, mpnt);
++		if (!(tmp->vm_flags & VM_WIPEONFORK))
++			retval = copy_page_range(mm, oldmm, mpnt);
+ 
+ 		if (tmp->vm_ops && tmp->vm_ops->open)
+ 			tmp->vm_ops->open(tmp);
+* Unmerged path mm/madvise.c
