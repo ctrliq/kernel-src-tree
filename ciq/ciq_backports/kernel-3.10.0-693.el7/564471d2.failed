@@ -1,0 +1,297 @@
+xprtrdma: Create common scatterlist fields in rpcrdma_mw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 564471d2f2f1ddaf02119b8759813666db93abba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/564471d2.failed
+
+Clean up: FMR is about to replace the rpcrdma_map_one code with
+scatterlists. Move the scatterlist fields out of the FRWR-specific
+union and into the generic part of rpcrdma_mw.
+
+One minor change: -EIO is now returned if FRWR registration fails.
+The RPC is terminated immediately, since the problem is likely due
+to a software bug, thus retrying likely won't help.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 564471d2f2f1ddaf02119b8759813666db93abba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 144dce124c80,f02ab80aa6ee..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -98,6 -98,46 +98,49 @@@ frwr_destroy_recovery_wq(void
+  	destroy_workqueue(wq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ __frwr_reset_mr(struct rpcrdma_ia *ia, struct rpcrdma_mw *r)
++ {
++ 	struct rpcrdma_frmr *f = &r->frmr;
++ 	int rc;
++ 
++ 	rc = ib_dereg_mr(f->fr_mr);
++ 	if (rc) {
++ 		pr_warn("rpcrdma: ib_dereg_mr status %d, frwr %p orphaned\n",
++ 			rc, r);
++ 		return rc;
++ 	}
++ 
++ 	f->fr_mr = ib_alloc_mr(ia->ri_pd, IB_MR_TYPE_MEM_REG,
++ 			       ia->ri_max_frmr_depth);
++ 	if (IS_ERR(f->fr_mr)) {
++ 		pr_warn("rpcrdma: ib_alloc_mr status %ld, frwr %p orphaned\n",
++ 			PTR_ERR(f->fr_mr), r);
++ 		return PTR_ERR(f->fr_mr);
++ 	}
++ 
++ 	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, r);
++ 	f->fr_state = FRMR_IS_INVALID;
++ 	return 0;
++ }
++ 
++ static void
++ __frwr_reset_and_unmap(struct rpcrdma_mw *mw)
++ {
++ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
++ 	int rc;
++ 
++ 	rc = __frwr_reset_mr(ia, mw);
++ 	ib_dma_unmap_sg(ia->ri_device, mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (rc)
++ 		return;
++ 	rpcrdma_put_mw(r_xprt, mw);
++ }
++ 
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  /* Deferred reset of a single FRMR. Generate a fresh rkey by
+   * replacing the MR.
+   *
+@@@ -109,26 -149,9 +152,30 @@@ static voi
+  __frwr_recovery_worker(struct work_struct *work)
+  {
+  	struct rpcrdma_mw *r = container_of(work, struct rpcrdma_mw,
+ -					    mw_work);
+ +					    frmr.fr_work);
+ +	struct rpcrdma_xprt *r_xprt = r->frmr.fr_xprt;
+ +	unsigned int depth = r_xprt->rx_ia.ri_max_frmr_depth;
+ +	struct ib_pd *pd = r_xprt->rx_ia.ri_pd;
+ +
+++<<<<<<< HEAD
+ +	if (ib_dereg_mr(r->frmr.fr_mr))
+ +		goto out_fail;
+  
+ +	r->frmr.fr_mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG, depth);
+ +	if (IS_ERR(r->frmr.fr_mr))
+ +		goto out_fail;
+ +
+ +	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, r);
+ +	r->frmr.fr_state = FRMR_IS_INVALID;
+ +	rpcrdma_put_mw(r_xprt, r);
+ +	return;
+ +
+ +out_fail:
+ +	pr_warn("RPC:       %s: FRMR %p unrecovered\n",
+ +		__func__, r);
+++=======
++ 	__frwr_reset_and_unmap(r);
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  }
+  
+  /* A broken MR was discovered in a context that can't sleep.
+@@@ -152,11 -174,11 +198,19 @@@ __frwr_init(struct rpcrdma_mw *r, struc
+  	if (IS_ERR(f->fr_mr))
+  		goto out_mr_err;
+  
+++<<<<<<< HEAD
+ +	f->sg = kcalloc(depth, sizeof(*f->sg), GFP_KERNEL);
+ +	if (!f->sg)
+ +		goto out_list_err;
+ +
+ +	sg_init_table(f->sg, depth);
+++=======
++ 	r->mw_sg = kcalloc(depth, sizeof(*r->mw_sg), GFP_KERNEL);
++ 	if (!r->mw_sg)
++ 		goto out_list_err;
++ 
++ 	sg_init_table(r->mw_sg, depth);
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  
+  	init_completion(&f->fr_linv_done);
+  
+@@@ -185,7 -207,7 +239,11 @@@ __frwr_release(struct rpcrdma_mw *r
+  	if (rc)
+  		dprintk("RPC:       %s: ib_dereg_mr status %i\n",
+  			__func__, rc);
+++<<<<<<< HEAD
+ +	kfree(r->frmr.sg);
+++=======
++ 	kfree(r->mw_sg);
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  }
+  
+  static int
+@@@ -396,15 -415,14 +451,22 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  
+  	if (nsegs > ia->ri_max_frmr_depth)
+  		nsegs = ia->ri_max_frmr_depth;
+- 
+  	for (i = 0; i < nsegs;) {
+  		if (seg->mr_page)
+++<<<<<<< HEAD
+ +			sg_set_page(&frmr->sg[i],
+++=======
++ 			sg_set_page(&mw->mw_sg[i],
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  				    seg->mr_page,
+  				    seg->mr_len,
+  				    offset_in_page(seg->mr_offset));
+  		else
+++<<<<<<< HEAD
+ +			sg_set_buf(&frmr->sg[i], seg->mr_offset,
+++=======
++ 			sg_set_buf(&mw->mw_sg[i], seg->mr_offset,
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  				   seg->mr_len);
+  
+  		++seg;
+@@@ -415,25 -433,20 +477,42 @@@
+  		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+  			break;
+  	}
+++<<<<<<< HEAD
+ +	frmr->sg_nents = i;
+ +
+ +	dma_nents = ib_dma_map_sg(device, frmr->sg, frmr->sg_nents, direction);
+ +	if (!dma_nents) {
+ +		pr_err("RPC:       %s: failed to dma map sg %p sg_nents %u\n",
+ +		       __func__, frmr->sg, frmr->sg_nents);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	n = ib_map_mr_sg(mr, frmr->sg, frmr->sg_nents, NULL, PAGE_SIZE);
+ +	if (unlikely(n != frmr->sg_nents)) {
+ +		pr_err("RPC:       %s: failed to map mr %p (%u/%u)\n",
+ +		       __func__, frmr->fr_mr, n, frmr->sg_nents);
+ +		rc = n < 0 ? n : -EINVAL;
+ +		goto out_senderr;
+ +	}
+ +
+ +	dprintk("RPC:       %s: Using frmr %p to map %u segments (%u bytes)\n",
+ +		__func__, mw, frmr->sg_nents, mr->length);
+++=======
++ 	mw->mw_nents = i;
++ 	mw->mw_dir = rpcrdma_data_dir(writing);
++ 
++ 	dma_nents = ib_dma_map_sg(ia->ri_device,
++ 				  mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (!dma_nents)
++ 		goto out_dmamap_err;
++ 
++ 	n = ib_map_mr_sg(mr, mw->mw_sg, mw->mw_nents, NULL, PAGE_SIZE);
++ 	if (unlikely(n != mw->mw_nents))
++ 		goto out_mapmr_err;
++ 
++ 	dprintk("RPC:       %s: Using frmr %p to map %u segments (%u bytes)\n",
++ 		__func__, mw, mw->mw_nents, mr->length);
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  
+  	key = (u8)(mr->rkey & 0x000000FF);
+  	ib_update_fast_reg_key(mr, ++key);
+@@@ -459,14 -471,25 +538,36 @@@
+  	seg1->rl_mw = mw;
+  	seg1->mr_rkey = mr->rkey;
+  	seg1->mr_base = mr->iova;
+++<<<<<<< HEAD
+ +	seg1->mr_nsegs = frmr->sg_nents;
+ +	seg1->mr_len = mr->length;
+ +
+ +	return frmr->sg_nents;
+ +
+ +out_senderr:
+ +	dprintk("RPC:       %s: ib_post_send status %i\n", __func__, rc);
+ +	ib_dma_unmap_sg(device, frmr->sg, dma_nents, direction);
+++=======
++ 	seg1->mr_nsegs = mw->mw_nents;
++ 	seg1->mr_len = mr->length;
++ 
++ 	return mw->mw_nents;
++ 
++ out_dmamap_err:
++ 	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
++ 	       mw->mw_sg, mw->mw_nents);
++ 	return -ENOMEM;
++ 
++ out_mapmr_err:
++ 	pr_err("rpcrdma: failed to map mr %p (%u/%u)\n",
++ 	       frmr->fr_mr, n, mw->mw_nents);
++ 	rc = n < 0 ? n : -EIO;
++ 	__frwr_queue_recovery(mw);
++ 	return rc;
++ 
++ out_senderr:
++ 	pr_err("rpcrdma: ib_post_send status %i\n", rc);
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  	__frwr_queue_recovery(mw);
+  	return rc;
+  }
+@@@ -575,8 -578,12 +676,14 @@@ frwr_op_unmap_sync(struct rpcrdma_xprt 
+  unmap:
+  	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
+  		seg = &req->rl_segments[i];
+ -		mw = seg->rl_mw;
+ -		seg->rl_mw = NULL;
+  
+++<<<<<<< HEAD
+ +		__frwr_dma_unmap(r_xprt, seg, rc);
+++=======
++ 		ib_dma_unmap_sg(ia->ri_device,
++ 				mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 		rpcrdma_put_mw(r_xprt, mw);
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  
+  		i += seg->mr_nsegs;
+  		seg->mr_nsegs = 0;
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index 616f26ccd604,c53abd1281b3..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -221,8 -221,6 +221,11 @@@ enum rpcrdma_frmr_state 
+  };
+  
+  struct rpcrdma_frmr {
+++<<<<<<< HEAD
+ +	struct scatterlist		*sg;
+ +	int				sg_nents;
+++=======
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  	struct ib_mr			*fr_mr;
+  	struct ib_cqe			fr_cqe;
+  	enum rpcrdma_frmr_state		fr_state;
+@@@ -245,7 -245,8 +252,12 @@@ struct rpcrdma_mw 
+  		struct rpcrdma_fmr	fmr;
+  		struct rpcrdma_frmr	frmr;
+  	};
+++<<<<<<< HEAD
+ +	struct list_head	mw_list;
+++=======
++ 	struct work_struct	mw_work;
++ 	struct rpcrdma_xprt	*mw_xprt;
+++>>>>>>> 564471d2f2f1 (xprtrdma: Create common scatterlist fields in rpcrdma_mw)
+  	struct list_head	mw_all;
+  };
+  
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
