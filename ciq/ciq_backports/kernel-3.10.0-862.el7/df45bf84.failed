@@ -1,0 +1,646 @@
+net: sched: fix use-after-free in tcf_block_put_ext
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: fix use-after-free in tcf_block_put_ext (Ivan Vecera) [1533034]
+Rebuild_FUZZ: 94.85%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit df45bf84e4f5a48f23d4b1a07d21d566e8b587b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/df45bf84.failed
+
+Since the block is freed with last chain being put, once we reach the
+end of iteration of list_for_each_entry_safe, the block may be
+already freed. I'm hitting this only by creating and deleting clsact:
+
+[  202.171952] ==================================================================
+[  202.180182] BUG: KASAN: use-after-free in tcf_block_put_ext+0x240/0x390
+[  202.187590] Read of size 8 at addr ffff880225539a80 by task tc/796
+[  202.194508]
+[  202.196185] CPU: 0 PID: 796 Comm: tc Not tainted 4.15.0-rc2jiri+ #5
+[  202.203200] Hardware name: Mellanox Technologies Ltd. "MSN2100-CB2F"/"SA001017", BIOS 5.6.5 06/07/2016
+[  202.213613] Call Trace:
+[  202.216369]  dump_stack+0xda/0x169
+[  202.220192]  ? dma_virt_map_sg+0x147/0x147
+[  202.224790]  ? show_regs_print_info+0x54/0x54
+[  202.229691]  ? tcf_chain_destroy+0x1dc/0x250
+[  202.234494]  print_address_description+0x83/0x3d0
+[  202.239781]  ? tcf_block_put_ext+0x240/0x390
+[  202.244575]  kasan_report+0x1ba/0x460
+[  202.248707]  ? tcf_block_put_ext+0x240/0x390
+[  202.253518]  tcf_block_put_ext+0x240/0x390
+[  202.258117]  ? tcf_chain_flush+0x290/0x290
+[  202.262708]  ? qdisc_hash_del+0x82/0x1a0
+[  202.267111]  ? qdisc_hash_add+0x50/0x50
+[  202.271411]  ? __lock_is_held+0x5f/0x1a0
+[  202.275843]  clsact_destroy+0x3d/0x80 [sch_ingress]
+[  202.281323]  qdisc_destroy+0xcb/0x240
+[  202.285445]  qdisc_graft+0x216/0x7b0
+[  202.289497]  tc_get_qdisc+0x260/0x560
+
+Fix this by holding the block also by chain 0 and put chain 0
+explicitly, out of the list_for_each_entry_safe loop at the very
+end of tcf_block_put_ext.
+
+Fixes: efbf78973978 ("net_sched: get rid of rcu_barrier() in tcf_block_put_ext()")
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df45bf84e4f5a48f23d4b1a07d21d566e8b587b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,5b9b8a61e8c4..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -124,7 -118,583 +124,587 @@@ static inline u32 tcf_auto_prio(struct 
+  	if (tp)
+  		first = tp->prio - 1;
+  
+++<<<<<<< HEAD
+ +	return first;
+++=======
++ 	return TC_H_MAJ(first);
++ }
++ 
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q,
++ 					  struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 	tp->chain = chain;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
++ 					  u32 chain_index)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
++ 	if (!chain)
++ 		return NULL;
++ 	list_add_tail(&chain->list, &block->chain_list);
++ 	chain->block = block;
++ 	chain->index = chain_index;
++ 	chain->refcnt = 1;
++ 	return chain;
++ }
++ 
++ static void tcf_chain_head_change(struct tcf_chain *chain,
++ 				  struct tcf_proto *tp_head)
++ {
++ 	if (chain->chain_head_change)
++ 		chain->chain_head_change(tp_head,
++ 					 chain->chain_head_change_priv);
++ }
++ 
++ static void tcf_chain_flush(struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp = rtnl_dereference(chain->filter_chain);
++ 
++ 	tcf_chain_head_change(chain, NULL);
++ 	while (tp) {
++ 		RCU_INIT_POINTER(chain->filter_chain, tp->next);
++ 		tcf_proto_destroy(tp);
++ 		tp = rtnl_dereference(chain->filter_chain);
++ 		tcf_chain_put(chain);
++ 	}
++ }
++ 
++ static void tcf_chain_destroy(struct tcf_chain *chain)
++ {
++ 	struct tcf_block *block = chain->block;
++ 
++ 	list_del(&chain->list);
++ 	kfree(chain);
++ 	if (list_empty(&block->chain_list))
++ 		kfree(block);
++ }
++ 
++ static void tcf_chain_hold(struct tcf_chain *chain)
++ {
++ 	++chain->refcnt;
++ }
++ 
++ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
++ 				bool create)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	list_for_each_entry(chain, &block->chain_list, list) {
++ 		if (chain->index == chain_index) {
++ 			tcf_chain_hold(chain);
++ 			return chain;
++ 		}
++ 	}
++ 
++ 	return create ? tcf_chain_create(block, chain_index) : NULL;
++ }
++ EXPORT_SYMBOL(tcf_chain_get);
++ 
++ void tcf_chain_put(struct tcf_chain *chain)
++ {
++ 	if (--chain->refcnt == 0)
++ 		tcf_chain_destroy(chain);
++ }
++ EXPORT_SYMBOL(tcf_chain_put);
++ 
++ static void tcf_block_offload_cmd(struct tcf_block *block, struct Qdisc *q,
++ 				  struct tcf_block_ext_info *ei,
++ 				  enum tc_block_command command)
++ {
++ 	struct net_device *dev = q->dev_queue->dev;
++ 	struct tc_block_offload bo = {};
++ 
++ 	if (!dev->netdev_ops->ndo_setup_tc)
++ 		return;
++ 	bo.command = command;
++ 	bo.binder_type = ei->binder_type;
++ 	bo.block = block;
++ 	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_BLOCK, &bo);
++ }
++ 
++ static void tcf_block_offload_bind(struct tcf_block *block, struct Qdisc *q,
++ 				   struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_BIND);
++ }
++ 
++ static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
++ 				     struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_UNBIND);
++ }
++ 
++ int tcf_block_get_ext(struct tcf_block **p_block, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei)
++ {
++ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	struct tcf_chain *chain;
++ 	int err;
++ 
++ 	if (!block)
++ 		return -ENOMEM;
++ 	INIT_LIST_HEAD(&block->chain_list);
++ 	INIT_LIST_HEAD(&block->cb_list);
++ 
++ 	/* Create chain 0 by default, it has to be always present. */
++ 	chain = tcf_chain_create(block, 0);
++ 	if (!chain) {
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	WARN_ON(!ei->chain_head_change);
++ 	chain->chain_head_change = ei->chain_head_change;
++ 	chain->chain_head_change_priv = ei->chain_head_change_priv;
++ 	block->net = qdisc_net(q);
++ 	block->q = q;
++ 	tcf_block_offload_bind(block, q, ei);
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get_ext);
++ 
++ static void tcf_chain_head_change_dflt(struct tcf_proto *tp_head, void *priv)
++ {
++ 	struct tcf_proto __rcu **p_filter_chain = priv;
++ 
++ 	rcu_assign_pointer(*p_filter_chain, tp_head);
++ }
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q)
++ {
++ 	struct tcf_block_ext_info ei = {
++ 		.chain_head_change = tcf_chain_head_change_dflt,
++ 		.chain_head_change_priv = p_filter_chain,
++ 	};
++ 
++ 	WARN_ON(!p_filter_chain);
++ 	return tcf_block_get_ext(p_block, q, &ei);
++ }
++ EXPORT_SYMBOL(tcf_block_get);
++ 
++ /* XXX: Standalone actions are not allowed to jump to any chain, and bound
++  * actions should be all removed after flushing.
++  */
++ void tcf_block_put_ext(struct tcf_block *block, struct Qdisc *q,
++ 		       struct tcf_block_ext_info *ei)
++ {
++ 	struct tcf_chain *chain, *tmp;
++ 
++ 	/* Hold a refcnt for all chains, so that they don't disappear
++ 	 * while we are iterating.
++ 	 */
++ 	list_for_each_entry(chain, &block->chain_list, list)
++ 		tcf_chain_hold(chain);
++ 
++ 	list_for_each_entry(chain, &block->chain_list, list)
++ 		tcf_chain_flush(chain);
++ 
++ 	tcf_block_offload_unbind(block, q, ei);
++ 
++ 	/* At this point, all the chains should have refcnt >= 1. */
++ 	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
++ 		tcf_chain_put(chain);
++ 
++ 	/* Finally, put chain 0 and allow block to be freed. */
++ 	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
++ 	tcf_chain_put(chain);
++ }
++ EXPORT_SYMBOL(tcf_block_put_ext);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	struct tcf_block_ext_info ei = {0, };
++ 
++ 	if (!block)
++ 		return;
++ 	tcf_block_put_ext(block, block->q, &ei);
++ }
++ 
++ EXPORT_SYMBOL(tcf_block_put);
++ 
++ struct tcf_block_cb {
++ 	struct list_head list;
++ 	tc_setup_cb_t *cb;
++ 	void *cb_ident;
++ 	void *cb_priv;
++ 	unsigned int refcnt;
++ };
++ 
++ void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
++ {
++ 	return block_cb->cb_priv;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_priv);
++ 
++ struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
++ 					 tc_setup_cb_t *cb, void *cb_ident)
++ {	struct tcf_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list)
++ 		if (block_cb->cb == cb && block_cb->cb_ident == cb_ident)
++ 			return block_cb;
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_lookup);
++ 
++ void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
++ {
++ 	block_cb->refcnt++;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_incref);
++ 
++ unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
++ {
++ 	return --block_cb->refcnt;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_decref);
++ 
++ struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
++ 					     tc_setup_cb_t *cb, void *cb_ident,
++ 					     void *cb_priv)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 
++ 	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
++ 	if (!block_cb)
++ 		return NULL;
++ 	block_cb->cb = cb;
++ 	block_cb->cb_ident = cb_ident;
++ 	block_cb->cb_priv = cb_priv;
++ 	list_add(&block_cb->list, &block->cb_list);
++ 	return block_cb;
++ }
++ EXPORT_SYMBOL(__tcf_block_cb_register);
++ 
++ int tcf_block_cb_register(struct tcf_block *block,
++ 			  tc_setup_cb_t *cb, void *cb_ident,
++ 			  void *cb_priv)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 
++ 	block_cb = __tcf_block_cb_register(block, cb, cb_ident, cb_priv);
++ 	return block_cb ? 0 : -ENOMEM;
++ }
++ EXPORT_SYMBOL(tcf_block_cb_register);
++ 
++ void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
++ {
++ 	list_del(&block_cb->list);
++ 	kfree(block_cb);
++ }
++ EXPORT_SYMBOL(__tcf_block_cb_unregister);
++ 
++ void tcf_block_cb_unregister(struct tcf_block *block,
++ 			     tc_setup_cb_t *cb, void *cb_ident)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 
++ 	block_cb = tcf_block_cb_lookup(block, cb, cb_ident);
++ 	if (!block_cb)
++ 		return;
++ 	__tcf_block_cb_unregister(block_cb);
++ }
++ EXPORT_SYMBOL(tcf_block_cb_unregister);
++ 
++ static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
++ 			     void *type_data, bool err_stop)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 	int ok_count = 0;
++ 	int err;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list) {
++ 		err = block_cb->cb(type, type_data, block_cb->cb_priv);
++ 		if (err) {
++ 			if (err_stop)
++ 				return err;
++ 		} else {
++ 			ok_count++;
++ 		}
++ 	}
++ 	return ok_count;
++ }
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *orig_tp = tp;
++ 	const struct tcf_proto *first_tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode)) {
++ 			first_tp = orig_tp;
++ 			goto reset;
++ 		} else if (unlikely(TC_ACT_EXT_CMP(err, TC_ACT_GOTO_CHAIN))) {
++ 			first_tp = res->goto_tp;
++ 			goto reset;
++ 		}
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = first_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
++ struct tcf_chain_info {
++ 	struct tcf_proto __rcu **pprev;
++ 	struct tcf_proto __rcu *next;
++ };
++ 
++ static struct tcf_proto *tcf_chain_tp_prev(struct tcf_chain_info *chain_info)
++ {
++ 	return rtnl_dereference(*chain_info->pprev);
++ }
++ 
++ static void tcf_chain_tp_insert(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	if (*chain_info->pprev == chain->filter_chain)
++ 		tcf_chain_head_change(chain, tp);
++ 	RCU_INIT_POINTER(tp->next, tcf_chain_tp_prev(chain_info));
++ 	rcu_assign_pointer(*chain_info->pprev, tp);
++ 	tcf_chain_hold(chain);
++ }
++ 
++ static void tcf_chain_tp_remove(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	struct tcf_proto *next = rtnl_dereference(chain_info->next);
++ 
++ 	if (tp == chain->filter_chain)
++ 		tcf_chain_head_change(chain, next);
++ 	RCU_INIT_POINTER(*chain_info->pprev, next);
++ 	tcf_chain_put(chain);
++ }
++ 
++ static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
++ 					   struct tcf_chain_info *chain_info,
++ 					   u32 protocol, u32 prio,
++ 					   bool prio_allocate)
++ {
++ 	struct tcf_proto **pprev;
++ 	struct tcf_proto *tp;
++ 
++ 	/* Check the chain for existence of proto-tcf with this priority */
++ 	for (pprev = &chain->filter_chain;
++ 	     (tp = rtnl_dereference(*pprev)); pprev = &tp->next) {
++ 		if (tp->prio >= prio) {
++ 			if (tp->prio == prio) {
++ 				if (prio_allocate ||
++ 				    (tp->protocol != protocol && protocol))
++ 					return ERR_PTR(-EINVAL);
++ 			} else {
++ 				tp = NULL;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	chain_info->pprev = pprev;
++ 	chain_info->next = tp ? tp->next : NULL;
++ 	return tp;
++ }
++ 
++ static int tcf_fill_node(struct net *net, struct sk_buff *skb,
++ 			 struct tcf_proto *tp, struct Qdisc *q, u32 parent,
++ 			 void *fh, u32 portid, u32 seq, u16 flags, int event)
++ {
++ 	struct tcmsg *tcm;
++ 	struct nlmsghdr  *nlh;
++ 	unsigned char *b = skb_tail_pointer(skb);
++ 
++ 	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*tcm), flags);
++ 	if (!nlh)
++ 		goto out_nlmsg_trim;
++ 	tcm = nlmsg_data(nlh);
++ 	tcm->tcm_family = AF_UNSPEC;
++ 	tcm->tcm__pad1 = 0;
++ 	tcm->tcm__pad2 = 0;
++ 	tcm->tcm_ifindex = qdisc_dev(q)->ifindex;
++ 	tcm->tcm_parent = parent;
++ 	tcm->tcm_info = TC_H_MAKE(tp->prio, tp->protocol);
++ 	if (nla_put_string(skb, TCA_KIND, tp->ops->kind))
++ 		goto nla_put_failure;
++ 	if (nla_put_u32(skb, TCA_CHAIN, tp->chain->index))
++ 		goto nla_put_failure;
++ 	if (!fh) {
++ 		tcm->tcm_handle = 0;
++ 	} else {
++ 		if (tp->ops->dump && tp->ops->dump(net, tp, fh, skb, tcm) < 0)
++ 			goto nla_put_failure;
++ 	}
++ 	nlh->nlmsg_len = skb_tail_pointer(skb) - b;
++ 	return skb->len;
++ 
++ out_nlmsg_trim:
++ nla_put_failure:
++ 	nlmsg_trim(skb, b);
++ 	return -1;
++ }
++ 
++ static int tfilter_notify(struct net *net, struct sk_buff *oskb,
++ 			  struct nlmsghdr *n, struct tcf_proto *tp,
++ 			  struct Qdisc *q, u32 parent,
++ 			  void *fh, int event, bool unicast)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tcf_fill_node(net, skb, tp, q, parent, fh, portid, n->nlmsg_seq,
++ 			  n->nlmsg_flags, event) <= 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (unicast)
++ 		return netlink_unicast(net->rtnl, skb, portid, MSG_DONTWAIT);
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static int tfilter_del_notify(struct net *net, struct sk_buff *oskb,
++ 			      struct nlmsghdr *n, struct tcf_proto *tp,
++ 			      struct Qdisc *q, u32 parent,
++ 			      void *fh, bool unicast, bool *last)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 	int err;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tcf_fill_node(net, skb, tp, q, parent, fh, portid, n->nlmsg_seq,
++ 			  n->nlmsg_flags, RTM_DELTFILTER) <= 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = tp->ops->delete(tp, fh, last);
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return err;
++ 	}
++ 
++ 	if (unicast)
++ 		return netlink_unicast(net->rtnl, skb, portid, MSG_DONTWAIT);
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static void tfilter_notify_chain(struct net *net, struct sk_buff *oskb,
++ 				 struct Qdisc *q, u32 parent,
++ 				 struct nlmsghdr *n,
++ 				 struct tcf_chain *chain, int event)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	for (tp = rtnl_dereference(chain->filter_chain);
++ 	     tp; tp = rtnl_dereference(tp->next))
++ 		tfilter_notify(net, oskb, n, tp, q, parent, 0, event, false);
+++>>>>>>> df45bf84e4f5 (net: sched: fix use-after-free in tcf_block_put_ext)
+  }
+  
+  /* Add/change/delete/get a filter node */
+* Unmerged path net/sched/cls_api.c
