@@ -1,0 +1,168 @@
+IB/mlx5: Reduce the use of num_port capability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Jurgens <danielj@mellanox.com>
+commit 508562d6f708888b10127c2892513f76ea8b22ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/508562d6.failed
+
+Remove use of the num_ports general capability throughout. The number of
+ports will be variable in the future, and reported in a different way.
+
+	Signed-off-by: Daniel Jurgens <danielj@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 508562d6f708888b10127c2892513f76ea8b22ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 0f4f1df8ee11,0c24cd42b411..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -4052,30 -4047,24 +4052,30 @@@ mlx5_ib_get_vector_affinity(struct ib_d
+  	return mlx5_get_vector_affinity(dev->mdev, comp_vector);
+  }
+  
+ -static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ -	cleanup_srcu_struct(&dev->mr_srcu);
+ -#endif
+ -	kfree(dev->port);
+ -}
+ -
+ -static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ +static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+  {
+ -	struct mlx5_core_dev *mdev = dev->mdev;
+ +	struct mlx5_ib_dev *dev;
+ +	enum rdma_link_layer ll;
+ +	int port_type_cap;
+  	const char *name;
+  	int err;
+ +	int i;
+ +
+ +	port_type_cap = MLX5_CAP_GEN(mdev, port_type);
+ +	ll = mlx5_port_type_cap_to_rdma_ll(port_type_cap);
+ +
+ +	printk_once(KERN_INFO "%s", mlx5_version);
+ +
+ +	dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
+ +	if (!dev)
+ +		return NULL;
+ +
+ +	dev->mdev = mdev;
+  
+- 	dev->port = kcalloc(MLX5_CAP_GEN(mdev, num_ports), sizeof(*dev->port),
++ 	dev->port = kcalloc(dev->num_ports, sizeof(*dev->port),
+  			    GFP_KERNEL);
+  	if (!dev->port)
+ -		return -ENOMEM;
+ +		goto err_dealloc;
+  
+  	rwlock_init(&dev->roce.netdev_lock);
+  	err = get_port_caps(dev);
+@@@ -4301,14 -4408,51 +4300,56 @@@
+  		err = device_create_file(&dev->ib_dev.dev,
+  					 mlx5_class_attributes[i]);
+  		if (err)
+ -			return err;
+ +			goto err_delay_drop;
+  	}
+  
+ -	return 0;
+ -}
+ +	if ((MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&
+ +	    (MLX5_CAP_GEN(mdev, disable_local_lb_uc) ||
+ +	     MLX5_CAP_GEN(mdev, disable_local_lb_mc)))
+ +		mutex_init(&dev->lb_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ static void __mlx5_ib_remove(struct mlx5_ib_dev *dev,
++ 			     const struct mlx5_ib_profile *profile,
++ 			     int stage)
++ {
++ 	/* Number of stages to cleanup */
++ 	while (stage) {
++ 		stage--;
++ 		if (profile->stage[stage].cleanup)
++ 			profile->stage[stage].cleanup(dev);
++ 	}
++ 
++ 	ib_dealloc_device((struct ib_device *)dev);
++ }
++ 
++ static void *__mlx5_ib_add(struct mlx5_core_dev *mdev,
++ 			   const struct mlx5_ib_profile *profile)
++ {
++ 	struct mlx5_ib_dev *dev;
++ 	int err;
++ 	int i;
++ 
++ 	printk_once(KERN_INFO "%s", mlx5_version);
++ 
++ 	dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
++ 	if (!dev)
++ 		return NULL;
++ 
++ 	dev->mdev = mdev;
++ 	dev->num_ports = MLX5_CAP_GEN(mdev, num_ports);
++ 
++ 	for (i = 0; i < MLX5_IB_STAGE_MAX; i++) {
++ 		if (profile->stage[i].init) {
++ 			err = profile->stage[i].init(dev);
++ 			if (err)
++ 				goto err_out;
++ 		}
++ 	}
++ 
++ 	dev->profile = profile;
+++>>>>>>> 508562d6f708 (IB/mlx5: Reduce the use of num_port capability)
+  	dev->ib_active = true;
+  
+  	return dev;
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 8dd30da62791,4b08472cf0ba..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -4673,12 -4673,12 +4673,18 @@@ static void to_rdma_ah_attr(struct mlx5
+  
+  	memset(ah_attr, 0, sizeof(*ah_attr));
+  
+++<<<<<<< HEAD
+ +	if (!path->port || path->port > MLX5_CAP_GEN(dev, num_ports))
+++=======
++ 	ah_attr->type = rdma_ah_find_type(&ibdev->ib_dev, path->port);
++ 	rdma_ah_set_port_num(ah_attr, path->port);
++ 	if (rdma_ah_get_port_num(ah_attr) == 0 ||
++ 	    rdma_ah_get_port_num(ah_attr) > ibdev->num_ports)
+++>>>>>>> 508562d6f708 (IB/mlx5: Reduce the use of num_port capability)
+  		return;
+  
+ +	ah_attr->type = rdma_ah_find_type(&ibdev->ib_dev, path->port);
+ +
+  	rdma_ah_set_port_num(ah_attr, path->port);
+  	rdma_ah_set_sl(ah_attr, path->dci_cfi_prio_sl & 0xf);
+  
+diff --git a/drivers/infiniband/hw/mlx5/mad.c b/drivers/infiniband/hw/mlx5/mad.c
+index 1003b0133a49..0559e0a9e398 100644
+--- a/drivers/infiniband/hw/mlx5/mad.c
++++ b/drivers/infiniband/hw/mlx5/mad.c
+@@ -519,7 +519,7 @@ int mlx5_query_mad_ifc_port(struct ib_device *ibdev, u8 port,
+ 	int ext_active_speed;
+ 	int err = -ENOMEM;
+ 
+-	if (port < 1 || port > MLX5_CAP_GEN(mdev, num_ports)) {
++	if (port < 1 || port > dev->num_ports) {
+ 		mlx5_ib_warn(dev, "invalid port number %d\n", port);
+ 		return -EINVAL;
+ 	}
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
