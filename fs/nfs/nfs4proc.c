@@ -8270,7 +8270,7 @@ static void nfs4_layoutreturn_release(void *calldata)
 	spin_lock(&lo->plh_inode->i_lock);
 	pnfs_mark_matching_lsegs_invalid(lo, &freeme, &lrp->args.range);
 	pnfs_mark_layout_returned_if_empty(lo);
-	if (lrp->res.lrs_present)
+	if (lrp->res.lrs_present && pnfs_layout_is_valid(lo))
 		pnfs_set_layout_stateid(lo, &lrp->res.stateid, true);
 	pnfs_clear_layoutreturn_waitbit(lo);
 	spin_unlock(&lo->plh_inode->i_lock);
