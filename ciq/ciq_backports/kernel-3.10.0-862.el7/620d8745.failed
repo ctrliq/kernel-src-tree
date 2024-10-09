@@ -1,0 +1,455 @@
+Introduce cifs_copy_file_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] cifs: introduce cifs_copy_file_range() (Sachin Prabhu) [1416385]
+Rebuild_FUZZ: 91.43%
+commit-author Sachin Prabhu <sprabhu@redhat.com>
+commit 620d8745b35daaf507186c26b40c7ea02aed131e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/620d8745.failed
+
+The earlier changes to copy range for cifs unintentionally disabled the more
+common form of server side copy.
+
+The patch introduces the file_operations helper cifs_copy_file_range()
+which is used by the syscall copy_file_range. The new file operations
+helper allows us to perform server side copies for SMB2.0 and 2.1
+servers as well as SMB 3.0+ servers which do not support the ioctl
+FSCTL_DUPLICATE_EXTENTS_TO_FILE.
+
+The new helper uses the ioctl FSCTL_SRV_COPYCHUNK_WRITE to perform
+server side copies. The helper is called by vfs_copy_file_range() only
+once an attempt to clone the file using the ioctl
+FSCTL_DUPLICATE_EXTENTS_TO_FILE has failed.
+
+	Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+	Reviewed-by: Pavel Shilovsky <pshilov@microsoft.com>
+CC: Stable  <stable@vger.kernel.org>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 620d8745b35daaf507186c26b40c7ea02aed131e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsfs.c
+#	fs/cifs/cifsfs.h
+#	fs/cifs/cifsglob.h
+#	fs/cifs/ioctl.c
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/cifsfs.c
+index 5b65d4fc9e5d,dd3f5fabfdf6..000000000000
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@@ -932,23 -914,147 +932,159 @@@ const struct inode_operations cifs_file
+  };
+  
+  const struct inode_operations cifs_symlink_inode_ops = {
+ -	.get_link = cifs_get_link,
+ +	.readlink = generic_readlink,
+ +	.follow_link = cifs_follow_link,
+ +	.put_link = kfree_put_link,
+  	.permission = cifs_permission,
+ +#ifdef CONFIG_CIFS_XATTR
+ +	.setxattr = cifs_setxattr,
+ +	.getxattr = cifs_getxattr,
+  	.listxattr = cifs_listxattr,
+ +	.removexattr = cifs_removexattr,
+ +#endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int cifs_clone_file_range(struct file *src_file, loff_t off,
++ 		struct file *dst_file, loff_t destoff, u64 len)
++ {
++ 	struct inode *src_inode = file_inode(src_file);
++ 	struct inode *target_inode = file_inode(dst_file);
++ 	struct cifsFileInfo *smb_file_src = src_file->private_data;
++ 	struct cifsFileInfo *smb_file_target = dst_file->private_data;
++ 	struct cifs_tcon *target_tcon = tlink_tcon(smb_file_target->tlink);
++ 	unsigned int xid;
++ 	int rc;
++ 
++ 	cifs_dbg(FYI, "clone range\n");
++ 
++ 	xid = get_xid();
++ 
++ 	if (!src_file->private_data || !dst_file->private_data) {
++ 		rc = -EBADF;
++ 		cifs_dbg(VFS, "missing cifsFileInfo on copy range src file\n");
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Note: cifs case is easier than btrfs since server responsible for
++ 	 * checks for proper open modes and file type and if it wants
++ 	 * server could even support copy of range where source = target
++ 	 */
++ 	lock_two_nondirectories(target_inode, src_inode);
++ 
++ 	if (len == 0)
++ 		len = src_inode->i_size - off;
++ 
++ 	cifs_dbg(FYI, "about to flush pages\n");
++ 	/* should we flush first and last page first */
++ 	truncate_inode_pages_range(&target_inode->i_data, destoff,
++ 				   PAGE_ALIGN(destoff + len)-1);
++ 
++ 	if (target_tcon->ses->server->ops->duplicate_extents)
++ 		rc = target_tcon->ses->server->ops->duplicate_extents(xid,
++ 			smb_file_src, smb_file_target, off, len, destoff);
++ 	else
++ 		rc = -EOPNOTSUPP;
++ 
++ 	/* force revalidate of size and timestamps of target file now
++ 	   that target is updated on the server */
++ 	CIFS_I(target_inode)->time = 0;
++ 	/* although unlocking in the reverse order from locking is not
++ 	   strictly necessary here it is a little cleaner to be consistent */
++ 	unlock_two_nondirectories(src_inode, target_inode);
++ out:
++ 	free_xid(xid);
++ 	return rc;
++ }
++ 
++ ssize_t cifs_file_copychunk_range(unsigned int xid,
++ 				struct file *src_file, loff_t off,
++ 				struct file *dst_file, loff_t destoff,
++ 				size_t len, unsigned int flags)
++ {
++ 	struct inode *src_inode = file_inode(src_file);
++ 	struct inode *target_inode = file_inode(dst_file);
++ 	struct cifsFileInfo *smb_file_src;
++ 	struct cifsFileInfo *smb_file_target;
++ 	struct cifs_tcon *src_tcon;
++ 	struct cifs_tcon *target_tcon;
++ 	ssize_t rc;
++ 
++ 	cifs_dbg(FYI, "copychunk range\n");
++ 
++ 	if (src_inode == target_inode) {
++ 		rc = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (!src_file->private_data || !dst_file->private_data) {
++ 		rc = -EBADF;
++ 		cifs_dbg(VFS, "missing cifsFileInfo on copy range src file\n");
++ 		goto out;
++ 	}
++ 
++ 	rc = -EXDEV;
++ 	smb_file_target = dst_file->private_data;
++ 	smb_file_src = src_file->private_data;
++ 	src_tcon = tlink_tcon(smb_file_src->tlink);
++ 	target_tcon = tlink_tcon(smb_file_target->tlink);
++ 
++ 	if (src_tcon->ses != target_tcon->ses) {
++ 		cifs_dbg(VFS, "source and target of copy not on same server\n");
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Note: cifs case is easier than btrfs since server responsible for
++ 	 * checks for proper open modes and file type and if it wants
++ 	 * server could even support copy of range where source = target
++ 	 */
++ 	lock_two_nondirectories(target_inode, src_inode);
++ 
++ 	cifs_dbg(FYI, "about to flush pages\n");
++ 	/* should we flush first and last page first */
++ 	truncate_inode_pages(&target_inode->i_data, 0);
++ 
++ 	if (target_tcon->ses->server->ops->copychunk_range)
++ 		rc = target_tcon->ses->server->ops->copychunk_range(xid,
++ 			smb_file_src, smb_file_target, off, len, destoff);
++ 	else
++ 		rc = -EOPNOTSUPP;
++ 
++ 	/* force revalidate of size and timestamps of target file now
++ 	 * that target is updated on the server
++ 	 */
++ 	CIFS_I(target_inode)->time = 0;
++ 	/* although unlocking in the reverse order from locking is not
++ 	 * strictly necessary here it is a little cleaner to be consistent
++ 	 */
++ 	unlock_two_nondirectories(src_inode, target_inode);
++ 
++ out:
++ 	return rc;
++ }
++ 
++ static ssize_t cifs_copy_file_range(struct file *src_file, loff_t off,
++ 				struct file *dst_file, loff_t destoff,
++ 				size_t len, unsigned int flags)
++ {
++ 	unsigned int xid = get_xid();
++ 	ssize_t rc;
++ 
++ 	rc = cifs_file_copychunk_range(xid, src_file, off, dst_file, destoff,
++ 					len, flags);
++ 	free_xid(xid);
++ 	return rc;
++ }
++ 
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  const struct file_operations cifs_file_ops = {
+ -	.read_iter = cifs_loose_read_iter,
+ -	.write_iter = cifs_file_write_iter,
+ +	.read = do_sync_read,
+ +	.write = do_sync_write,
+ +	.aio_read = cifs_loose_read,
+ +	.aio_write = cifs_file_aio_write,
+  	.open = cifs_open,
+  	.release = cifs_close,
+  	.lock = cifs_lock,
+@@@ -958,6 -1064,8 +1094,11 @@@
+  	.splice_read = generic_file_splice_read,
+  	.llseek = cifs_llseek,
+  	.unlocked_ioctl	= cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.setlease = cifs_setlease,
+  	.fallocate = cifs_fallocate,
+  };
+@@@ -976,6 -1082,8 +1117,11 @@@ const struct file_operations cifs_file_
+  	.splice_read = generic_file_splice_read,
+  	.llseek = cifs_llseek,
+  	.unlocked_ioctl	= cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.setlease = cifs_setlease,
+  	.fallocate = cifs_fallocate,
+  };
+@@@ -994,6 -1100,8 +1140,11 @@@ const struct file_operations cifs_file_
+  	.mmap = cifs_file_mmap,
+  	.splice_read = generic_file_splice_read,
+  	.unlocked_ioctl  = cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.llseek = cifs_llseek,
+  	.setlease = cifs_setlease,
+  	.fallocate = cifs_fallocate,
+@@@ -1012,6 -1118,8 +1163,11 @@@ const struct file_operations cifs_file_
+  	.splice_read = generic_file_splice_read,
+  	.llseek = cifs_llseek,
+  	.unlocked_ioctl	= cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.setlease = cifs_setlease,
+  	.fallocate = cifs_fallocate,
+  };
+@@@ -1029,6 -1135,8 +1185,11 @@@ const struct file_operations cifs_file_
+  	.splice_read = generic_file_splice_read,
+  	.llseek = cifs_llseek,
+  	.unlocked_ioctl	= cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.setlease = cifs_setlease,
+  	.fallocate = cifs_fallocate,
+  };
+@@@ -1046,6 -1152,8 +1207,11 @@@ const struct file_operations cifs_file_
+  	.mmap = cifs_file_mmap,
+  	.splice_read = generic_file_splice_read,
+  	.unlocked_ioctl  = cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.llseek = cifs_llseek,
+  	.setlease = cifs_setlease,
+  	.fallocate = cifs_fallocate,
+@@@ -1056,6 -1164,8 +1222,11 @@@ const struct file_operations cifs_dir_o
+  	.release = cifs_closedir,
+  	.read    = generic_read_dir,
+  	.unlocked_ioctl  = cifs_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.copy_file_range = cifs_copy_file_range,
++ 	.clone_file_range = cifs_clone_file_range,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	.llseek = generic_file_llseek,
+  };
+  
+diff --cc fs/cifs/cifsfs.h
+index 5dca01306e75,30bf89b1fd9a..000000000000
+--- a/fs/cifs/cifsfs.h
++++ b/fs/cifs/cifsfs.h
+@@@ -132,18 -126,25 +132,31 @@@ extern struct vfsmount *cifs_dfs_d_auto
+  #endif
+  
+  /* Functions related to symlinks */
+ -extern const char *cifs_get_link(struct dentry *, struct inode *,
+ -			struct delayed_call *);
+ +extern void *cifs_follow_link(struct dentry *direntry, struct nameidata *nd);
+ +extern int cifs_readlink(struct dentry *direntry, char __user *buffer,
+ +			 int buflen);
+  extern int cifs_symlink(struct inode *inode, struct dentry *direntry,
+  			const char *symname);
+ -
+ -#ifdef CONFIG_CIFS_XATTR
+ -extern const struct xattr_handler *cifs_xattr_handlers[];
+ +extern int	cifs_removexattr(struct dentry *, const char *);
+ +extern int	cifs_setxattr(struct dentry *, const char *, const void *,
+ +			size_t, int);
+ +extern ssize_t	cifs_getxattr(struct dentry *, const char *, void *, size_t);
+  extern ssize_t	cifs_listxattr(struct dentry *, char *, size_t);
+++<<<<<<< HEAD
+++=======
++ #else
++ # define cifs_xattr_handlers NULL
++ # define cifs_listxattr NULL
++ #endif
++ 
++ extern ssize_t cifs_file_copychunk_range(unsigned int xid,
++ 					struct file *src_file, loff_t off,
++ 					struct file *dst_file, loff_t destoff,
++ 					size_t len, unsigned int flags);
++ 
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  extern long cifs_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
+ +
+  #ifdef CONFIG_CIFS_NFSD_EXPORT
+  extern const struct export_operations cifs_export_ops;
+  #endif /* CONFIG_CIFS_NFSD_EXPORT */
+diff --cc fs/cifs/cifsglob.h
+index 2d53c6a224e6,d07f13a63369..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -406,9 -408,10 +406,16 @@@ struct smb_version_operations 
+  	char * (*create_lease_buf)(u8 *, u8);
+  	/* parse lease context buffer and return oplock/epoch info */
+  	__u8 (*parse_lease_buf)(void *, unsigned int *);
+++<<<<<<< HEAD
+ +	int (*clone_range)(const unsigned int, struct cifsFileInfo *src_file,
+ +			struct cifsFileInfo *target_file, u64 src_off, u64 len,
+ +			u64 dest_off);
+++=======
++ 	ssize_t (*copychunk_range)(const unsigned int,
++ 			struct cifsFileInfo *src_file,
++ 			struct cifsFileInfo *target_file,
++ 			u64 src_off, u64 len, u64 dest_off);
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	int (*duplicate_extents)(const unsigned int, struct cifsFileInfo *src,
+  			struct cifsFileInfo *target_file, u64 src_off, u64 len,
+  			u64 dest_off);
+diff --cc fs/cifs/ioctl.c
+index 22af9a25cf09,265c45fe4ea5..000000000000
+--- a/fs/cifs/ioctl.c
++++ b/fs/cifs/ioctl.c
+@@@ -34,20 -34,14 +34,27 @@@
+  #include "cifs_ioctl.h"
+  #include <linux/btrfs.h>
+  
+++<<<<<<< HEAD
+ +static long cifs_ioctl_clone(unsigned int xid, struct file *dst_file,
+ +			unsigned long srcfd, u64 off, u64 len, u64 destoff,
+ +			bool dup_extents)
+ +{
+ +	int rc;
+ +	struct cifsFileInfo *smb_file_target = dst_file->private_data;
+ +	struct inode *target_inode = file_inode(dst_file);
+ +	struct cifs_tcon *target_tcon;
+++=======
++ static long cifs_ioctl_copychunk(unsigned int xid, struct file *dst_file,
++ 			unsigned long srcfd)
++ {
++ 	int rc;
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  	struct fd src_file;
+ +	struct cifsFileInfo *smb_file_src;
+  	struct inode *src_inode;
+ +	struct cifs_tcon *src_tcon;
+  
+ -	cifs_dbg(FYI, "ioctl copychunk range\n");
+ +	cifs_dbg(FYI, "ioctl clone range\n");
+  	/* the destination must be opened for writing */
+  	if (!(dst_file->f_mode & FMODE_WRITE)) {
+  		cifs_dbg(FYI, "file target not open for write\n");
+@@@ -101,41 -72,9 +108,46 @@@
+  	if (S_ISDIR(src_inode->i_mode))
+  		goto out_fput;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Note: cifs case is easier than btrfs since server responsible for
+ +	 * checks for proper open modes and file type and if it wants
+ +	 * server could even support copy of range where source = target
+ +	 */
+ +	lock_two_nondirectories(target_inode, src_inode);
+++=======
++ 	rc = cifs_file_copychunk_range(xid, src_file.file, 0, dst_file, 0,
++ 					src_inode->i_size, 0);
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  
+ +	/* determine range to clone */
+ +	rc = -EINVAL;
+ +	if (off + len > src_inode->i_size || off + len < off)
+ +		goto out_unlock;
+ +	if (len == 0)
+ +		len = src_inode->i_size - off;
+ +
+ +	cifs_dbg(FYI, "about to flush pages\n");
+ +	/* should we flush first and last page first */
+ +	truncate_inode_pages_range(&target_inode->i_data, destoff,
+ +				   PAGE_CACHE_ALIGN(destoff + len)-1);
+ +
+ +	if (dup_extents && target_tcon->ses->server->ops->duplicate_extents)
+ +		rc = target_tcon->ses->server->ops->duplicate_extents(xid,
+ +			smb_file_src, smb_file_target, off, len, destoff);
+ +	else if (!dup_extents && target_tcon->ses->server->ops->clone_range)
+ +		rc = target_tcon->ses->server->ops->clone_range(xid,
+ +			smb_file_src, smb_file_target, off, len, destoff);
+ +	else
+ +		rc = -EOPNOTSUPP;
+ +
+ +	/* force revalidate of size and timestamps of target file now
+ +	   that target is updated on the server */
+ +	CIFS_I(target_inode)->time = 0;
+ +out_unlock:
+ +	/* although unlocking in the reverse order from locking is not
+ +	   strictly necessary here it is a little cleaner to be consistent */
+ +	unlock_two_nondirectories(src_inode, target_inode);
+  out_fput:
+  	fdput(src_file);
+  out_drop_write:
+diff --cc fs/cifs/smb2ops.c
+index 5d456ebb3813,063e59d543f9..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -586,8 -592,8 +586,13 @@@ req_res_key_exit
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +smb2_clone_range(const unsigned int xid,
+++=======
++ static ssize_t
++ smb2_copychunk_range(const unsigned int xid,
+++>>>>>>> 620d8745b35d (Introduce cifs_copy_file_range())
+  			struct cifsFileInfo *srcfile,
+  			struct cifsFileInfo *trgtfile, u64 src_off,
+  			u64 len, u64 dest_off)
+* Unmerged path fs/cifs/cifsfs.c
+* Unmerged path fs/cifs/cifsfs.h
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/ioctl.c
+* Unmerged path fs/cifs/smb2ops.c
