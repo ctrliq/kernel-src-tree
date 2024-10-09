@@ -1,0 +1,499 @@
+mlxsw: spectrum_router: Support IPv4 underlay decap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit 4607f6d26950ffb3c4c8e5b2db42f364f19dd26c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4607f6d2.failed
+
+Unlike encapsulation, which is represented by a next hop forwarding to
+an IPIP tunnel, decapsulation is a type of local route. It is created
+for local routes whose prefix corresponds to the local address of one of
+offloaded IPIP tunnels. When the tunnel is removed (i.e. all the encap
+next hops are removed), the decap offload is migrated back to a trap for
+resolution in slow path.
+
+This patch assumes that decap route is already present when encap route
+is added. A follow-up patch will fix this issue.
+
+Note that this patch only supports IPv4 underlay. Support for IPv6
+underlay will be subject to follow-up work apart from this patchset.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4607f6d26950ffb3c4c8e5b2db42f364f19dd26c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+#	net/tipc/node_subscr.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 2055c8543e7b,0d09f81ff686..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -126,7 -402,22 +134,26 @@@ struct mlxsw_sp_fib_node 
+  	struct mlxsw_sp_fib_key key;
+  };
+  
+++<<<<<<< HEAD
+ +struct mlxsw_sp_fib_entry_params {
+++=======
++ struct mlxsw_sp_fib_entry_decap {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 	u32 tunnel_index;
++ };
++ 
++ struct mlxsw_sp_fib_entry {
++ 	struct list_head list;
++ 	struct mlxsw_sp_fib_node *fib_node;
++ 	enum mlxsw_sp_fib_entry_type type;
++ 	struct list_head nexthop_group_node;
++ 	struct mlxsw_sp_nexthop_group *nh_group;
++ 	struct mlxsw_sp_fib_entry_decap decap; /* Valid for decap entries. */
++ };
++ 
++ struct mlxsw_sp_fib4_entry {
++ 	struct mlxsw_sp_fib_entry common;
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap)
+  	u32 tb_id;
+  	u32 prio;
+  	u8 tos;
+@@@ -587,7 -908,273 +614,277 @@@ static void mlxsw_sp_vrs_fini(struct ml
+  	 */
+  	mlxsw_core_flush_owq();
+  	mlxsw_sp_router_fib_flush(mlxsw_sp);
+++<<<<<<< HEAD
+ +	kfree(mlxsw_sp->router.vrs);
+++=======
++ 	kfree(mlxsw_sp->router->vrs);
++ }
++ 
++ static struct net_device *
++ __mlxsw_sp_ipip_netdev_ul_dev_get(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 	struct net *net = dev_net(ol_dev);
++ 
++ 	return __dev_get_by_index(net, tun->parms.link);
++ }
++ 
++ static u32 mlxsw_sp_ipip_dev_ul_tb_id(const struct net_device *ol_dev)
++ {
++ 	struct net_device *d = __mlxsw_sp_ipip_netdev_ul_dev_get(ol_dev);
++ 
++ 	if (d)
++ 		return l3mdev_fib_table(d) ? : RT_TABLE_MAIN;
++ 	else
++ 		return l3mdev_fib_table(ol_dev) ? : RT_TABLE_MAIN;
++ }
++ 
++ static struct mlxsw_sp_rif *
++ mlxsw_sp_rif_create(struct mlxsw_sp *mlxsw_sp,
++ 		    const struct mlxsw_sp_rif_params *params);
++ 
++ static struct mlxsw_sp_rif_ipip_lb *
++ mlxsw_sp_ipip_ol_ipip_lb_create(struct mlxsw_sp *mlxsw_sp,
++ 				enum mlxsw_sp_ipip_type ipipt,
++ 				struct net_device *ol_dev)
++ {
++ 	struct mlxsw_sp_rif_params_ipip_lb lb_params;
++ 	const struct mlxsw_sp_ipip_ops *ipip_ops;
++ 	struct mlxsw_sp_rif *rif;
++ 
++ 	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipipt];
++ 	lb_params = (struct mlxsw_sp_rif_params_ipip_lb) {
++ 		.common.dev = ol_dev,
++ 		.common.lag = false,
++ 		.lb_config = ipip_ops->ol_loopback_config(mlxsw_sp, ol_dev),
++ 	};
++ 
++ 	rif = mlxsw_sp_rif_create(mlxsw_sp, &lb_params.common);
++ 	if (IS_ERR(rif))
++ 		return ERR_CAST(rif);
++ 	return container_of(rif, struct mlxsw_sp_rif_ipip_lb, common);
++ }
++ 
++ static struct mlxsw_sp_ipip_entry *
++ mlxsw_sp_ipip_entry_alloc(struct mlxsw_sp *mlxsw_sp,
++ 			  enum mlxsw_sp_ipip_type ipipt,
++ 			  struct net_device *ol_dev)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 	struct mlxsw_sp_ipip_entry *ret = NULL;
++ 
++ 	ipip_entry = kzalloc(sizeof(*ipip_entry), GFP_KERNEL);
++ 	if (!ipip_entry)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	ipip_entry->ol_lb = mlxsw_sp_ipip_ol_ipip_lb_create(mlxsw_sp, ipipt,
++ 							    ol_dev);
++ 	if (IS_ERR(ipip_entry->ol_lb)) {
++ 		ret = ERR_CAST(ipip_entry->ol_lb);
++ 		goto err_ol_ipip_lb_create;
++ 	}
++ 
++ 	ipip_entry->ipipt = ipipt;
++ 	ipip_entry->ol_dev = ol_dev;
++ 
++ 	return ipip_entry;
++ 
++ err_ol_ipip_lb_create:
++ 	kfree(ipip_entry);
++ 	return ret;
++ }
++ 
++ static void
++ mlxsw_sp_ipip_entry_destroy(struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	WARN_ON(ipip_entry->ref_count > 0);
++ 	mlxsw_sp_rif_destroy(&ipip_entry->ol_lb->common);
++ 	kfree(ipip_entry);
++ }
++ 
++ static __be32
++ mlxsw_sp_ipip_netdev_saddr4(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return tun->parms.iph.saddr;
++ }
++ 
++ union mlxsw_sp_l3addr
++ mlxsw_sp_ipip_netdev_saddr(enum mlxsw_sp_l3proto proto,
++ 			   const struct net_device *ol_dev)
++ {
++ 	switch (proto) {
++ 	case MLXSW_SP_L3_PROTO_IPV4:
++ 		return (union mlxsw_sp_l3addr) {
++ 			.addr4 = mlxsw_sp_ipip_netdev_saddr4(ol_dev),
++ 		};
++ 	case MLXSW_SP_L3_PROTO_IPV6:
++ 		break;
++ 	};
++ 
++ 	WARN_ON(1);
++ 	return (union mlxsw_sp_l3addr) {
++ 		.addr4 = 0,
++ 	};
++ }
++ 
++ static bool mlxsw_sp_l3addr_eq(const union mlxsw_sp_l3addr *addr1,
++ 			       const union mlxsw_sp_l3addr *addr2)
++ {
++ 	return !memcmp(addr1, addr2, sizeof(*addr1));
++ }
++ 
++ static bool
++ mlxsw_sp_ipip_entry_saddr_matches(struct mlxsw_sp *mlxsw_sp,
++ 				  const enum mlxsw_sp_l3proto ul_proto,
++ 				  union mlxsw_sp_l3addr saddr,
++ 				  u32 ul_tb_id,
++ 				  struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u32 tun_ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ipip_entry->ol_dev);
++ 	enum mlxsw_sp_ipip_type ipipt = ipip_entry->ipipt;
++ 	union mlxsw_sp_l3addr tun_saddr;
++ 
++ 	if (mlxsw_sp->router->ipip_ops_arr[ipipt]->ul_proto != ul_proto)
++ 		return false;
++ 
++ 	tun_saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ipip_entry->ol_dev);
++ 	return tun_ul_tb_id == ul_tb_id &&
++ 	       mlxsw_sp_l3addr_eq(&tun_saddr, &saddr);
++ }
++ 
++ static int
++ mlxsw_sp_fib_entry_decap_init(struct mlxsw_sp *mlxsw_sp,
++ 			      struct mlxsw_sp_fib_entry *fib_entry,
++ 			      struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u32 tunnel_index;
++ 	int err;
++ 
++ 	err = mlxsw_sp_kvdl_alloc(mlxsw_sp, 1, &tunnel_index);
++ 	if (err)
++ 		return err;
++ 
++ 	ipip_entry->decap_fib_entry = fib_entry;
++ 	fib_entry->decap.ipip_entry = ipip_entry;
++ 	fib_entry->decap.tunnel_index = tunnel_index;
++ 	return 0;
++ }
++ 
++ static void mlxsw_sp_fib_entry_decap_fini(struct mlxsw_sp *mlxsw_sp,
++ 					  struct mlxsw_sp_fib_entry *fib_entry)
++ {
++ 	/* Unlink this node from the IPIP entry that it's the decap entry of. */
++ 	fib_entry->decap.ipip_entry->decap_fib_entry = NULL;
++ 	fib_entry->decap.ipip_entry = NULL;
++ 	mlxsw_sp_kvdl_free(mlxsw_sp, fib_entry->decap.tunnel_index);
++ }
++ 
++ static int mlxsw_sp_fib_entry_update(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_fib_entry *fib_entry);
++ 
++ static void
++ mlxsw_sp_ipip_entry_demote_decap(struct mlxsw_sp *mlxsw_sp,
++ 				 struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	struct mlxsw_sp_fib_entry *fib_entry = ipip_entry->decap_fib_entry;
++ 
++ 	mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, fib_entry);
++ 	fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_TRAP;
++ 
++ 	mlxsw_sp_fib_entry_update(mlxsw_sp, fib_entry);
++ }
++ 
++ static struct mlxsw_sp_ipip_entry *
++ mlxsw_sp_ipip_entry_get(struct mlxsw_sp *mlxsw_sp,
++ 			enum mlxsw_sp_ipip_type ipipt,
++ 			struct net_device *ol_dev)
++ {
++ 	u32 ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ol_dev);
++ 	struct mlxsw_sp_router *router = mlxsw_sp->router;
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 	enum mlxsw_sp_l3proto ul_proto;
++ 	union mlxsw_sp_l3addr saddr;
++ 
++ 	list_for_each_entry(ipip_entry, &mlxsw_sp->router->ipip_list,
++ 			    ipip_list_node) {
++ 		if (ipip_entry->ol_dev == ol_dev)
++ 			goto inc_ref_count;
++ 
++ 		/* The configuration where several tunnels have the same local
++ 		 * address in the same underlay table needs special treatment in
++ 		 * the HW. That is currently not implemented in the driver.
++ 		 */
++ 		ul_proto = router->ipip_ops_arr[ipip_entry->ipipt]->ul_proto;
++ 		saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ol_dev);
++ 		if (mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, saddr,
++ 						      ul_tb_id, ipip_entry))
++ 			return ERR_PTR(-EEXIST);
++ 	}
++ 
++ 	ipip_entry = mlxsw_sp_ipip_entry_alloc(mlxsw_sp, ipipt, ol_dev);
++ 	if (IS_ERR(ipip_entry))
++ 		return ipip_entry;
++ 
++ 	list_add_tail(&ipip_entry->ipip_list_node,
++ 		      &mlxsw_sp->router->ipip_list);
++ 
++ inc_ref_count:
++ 	++ipip_entry->ref_count;
++ 	return ipip_entry;
++ }
++ 
++ static void
++ mlxsw_sp_ipip_entry_put(struct mlxsw_sp *mlxsw_sp,
++ 			struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	if (--ipip_entry->ref_count == 0) {
++ 		list_del(&ipip_entry->ipip_list_node);
++ 		if (ipip_entry->decap_fib_entry)
++ 			mlxsw_sp_ipip_entry_demote_decap(mlxsw_sp, ipip_entry);
++ 		mlxsw_sp_ipip_entry_destroy(ipip_entry);
++ 	}
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap)
++ }
++ 
++ static bool
++ mlxsw_sp_ipip_entry_matches_decap(struct mlxsw_sp *mlxsw_sp,
++ 				  const struct net_device *ul_dev,
++ 				  enum mlxsw_sp_l3proto ul_proto,
++ 				  union mlxsw_sp_l3addr ul_dip,
++ 				  struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u32 ul_tb_id = l3mdev_fib_table(ul_dev) ? : RT_TABLE_MAIN;
++ 	enum mlxsw_sp_ipip_type ipipt = ipip_entry->ipipt;
++ 	struct net_device *ipip_ul_dev;
++ 
++ 	if (mlxsw_sp->router->ipip_ops_arr[ipipt]->ul_proto != ul_proto)
++ 		return false;
++ 
++ 	ipip_ul_dev = __mlxsw_sp_ipip_netdev_ul_dev_get(ipip_entry->ol_dev);
++ 	return mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, ul_dip,
++ 						 ul_tb_id, ipip_entry) &&
++ 	       (!ipip_ul_dev || ipip_ul_dev == ul_dev);
++ }
++ 
++ /* Given decap parameters, find the corresponding IPIP entry. */
++ static struct mlxsw_sp_ipip_entry *
++ mlxsw_sp_ipip_entry_find_by_decap(struct mlxsw_sp *mlxsw_sp,
++ 				  const struct net_device *ul_dev,
++ 				  enum mlxsw_sp_l3proto ul_proto,
++ 				  union mlxsw_sp_l3addr ul_dip)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 
++ 	list_for_each_entry(ipip_entry, &mlxsw_sp->router->ipip_list,
++ 			    ipip_list_node)
++ 		if (mlxsw_sp_ipip_entry_matches_decap(mlxsw_sp, ul_dev,
++ 						      ul_proto, ul_dip,
++ 						      ipip_entry))
++ 			return ipip_entry;
++ 
++ 	return NULL;
+  }
+  
+  struct mlxsw_sp_neigh_key {
+@@@ -1984,17 -3112,36 +2281,46 @@@ static int mlxsw_sp_fib_entry_op4_trap(
+  	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ralue), ralue_pl);
+  }
+  
+++<<<<<<< HEAD
+ +static int mlxsw_sp_fib_entry_op4(struct mlxsw_sp *mlxsw_sp,
+ +				  struct mlxsw_sp_fib_entry *fib_entry,
+ +				  enum mlxsw_reg_ralue_op op)
+++=======
++ static int
++ mlxsw_sp_fib_entry_op_ipip_decap(struct mlxsw_sp *mlxsw_sp,
++ 				 struct mlxsw_sp_fib_entry *fib_entry,
++ 				 enum mlxsw_reg_ralue_op op)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry = fib_entry->decap.ipip_entry;
++ 	const struct mlxsw_sp_ipip_ops *ipip_ops;
++ 
++ 	if (WARN_ON(!ipip_entry))
++ 		return -EINVAL;
++ 
++ 	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
++ 	return ipip_ops->fib_entry_op(mlxsw_sp, ipip_entry, op,
++ 				      fib_entry->decap.tunnel_index);
++ }
++ 
++ static int __mlxsw_sp_fib_entry_op(struct mlxsw_sp *mlxsw_sp,
++ 				   struct mlxsw_sp_fib_entry *fib_entry,
++ 				   enum mlxsw_reg_ralue_op op)
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap)
+  {
+  	switch (fib_entry->type) {
+  	case MLXSW_SP_FIB_ENTRY_TYPE_REMOTE:
+ -		return mlxsw_sp_fib_entry_op_remote(mlxsw_sp, fib_entry, op);
+ +		return mlxsw_sp_fib_entry_op4_remote(mlxsw_sp, fib_entry, op);
+  	case MLXSW_SP_FIB_ENTRY_TYPE_LOCAL:
+ -		return mlxsw_sp_fib_entry_op_local(mlxsw_sp, fib_entry, op);
+ +		return mlxsw_sp_fib_entry_op4_local(mlxsw_sp, fib_entry, op);
+  	case MLXSW_SP_FIB_ENTRY_TYPE_TRAP:
+++<<<<<<< HEAD
+ +		return mlxsw_sp_fib_entry_op4_trap(mlxsw_sp, fib_entry, op);
+++=======
++ 		return mlxsw_sp_fib_entry_op_trap(mlxsw_sp, fib_entry, op);
++ 	case MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP:
++ 		return mlxsw_sp_fib_entry_op_ipip_decap(mlxsw_sp,
++ 							fib_entry, op);
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap)
+  	}
+  	return -EINVAL;
+  }
+@@@ -2525,12 -3681,13 +2863,20 @@@ err_fib4_node_entry_add
+  
+  static void
+  mlxsw_sp_fib4_node_entry_unlink(struct mlxsw_sp *mlxsw_sp,
+ -				struct mlxsw_sp_fib4_entry *fib4_entry)
+ +				struct mlxsw_sp_fib_entry *fib_entry)
+  {
+++<<<<<<< HEAD
+ +	struct mlxsw_sp_fib_node *fib_node = fib_entry->fib_node;
+ +
+ +	mlxsw_sp_fib4_node_entry_del(mlxsw_sp, fib_node, fib_entry);
+ +	mlxsw_sp_fib4_node_list_remove(fib_entry);
+++=======
++ 	mlxsw_sp_fib_node_entry_del(mlxsw_sp, &fib4_entry->common);
++ 	mlxsw_sp_fib4_node_list_remove(fib4_entry);
++ 
++ 	if (fib4_entry->common.type == MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP)
++ 		mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, &fib4_entry->common);
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap)
+  }
+  
+  static void mlxsw_sp_fib4_entry_replace(struct mlxsw_sp *mlxsw_sp,
+diff --cc net/tipc/node_subscr.h
+index c95d20727ded,cd986bde856a..000000000000
+--- a/net/tipc/node_subscr.h
++++ b/net/tipc/node_subscr.h
+@@@ -34,30 -32,47 +34,72 @@@
+   * POSSIBILITY OF SUCH DAMAGE.
+   */
+  
+ -#ifndef _MLXSW_IPIP_H_
+ -#define _MLXSW_IPIP_H_
+ +#ifndef _TIPC_NODE_SUBSCR_H
+ +#define _TIPC_NODE_SUBSCR_H
+  
+++<<<<<<< HEAD:net/tipc/node_subscr.h
+ +#include "addr.h"
+++=======
++ #include "spectrum_router.h"
++ #include <net/ip_fib.h>
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap):drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
+ +
+ +typedef void (*net_ev_handler) (void *usr_handle);
+  
+ -enum mlxsw_sp_ipip_type {
+ -	MLXSW_SP_IPIP_TYPE_MAX,
+ +/**
+ + * struct tipc_node_subscr - "node down" subscription entry
+ + * @node: ptr to node structure of interest (or NULL, if none)
+ + * @handle_node_down: routine to invoke when node fails
+ + * @usr_handle: argument to pass to routine when node fails
+ + * @nodesub_list: adjacent entries in list of subscriptions for the node
+ + */
+ +struct tipc_node_subscr {
+ +	struct tipc_node *node;
+ +	net_ev_handler handle_node_down;
+ +	void *usr_handle;
+ +	struct list_head nodesub_list;
+  };
+  
+++<<<<<<< HEAD:net/tipc/node_subscr.h
+ +void tipc_nodesub_subscribe(struct tipc_node_subscr *node_sub, u32 addr,
+ +			    void *usr_handle, net_ev_handler handle_down);
+ +void tipc_nodesub_unsubscribe(struct tipc_node_subscr *node_sub);
+ +void tipc_nodesub_notify(struct tipc_node *node);
+ +
+ +#endif
+++=======
++ struct mlxsw_sp_ipip_entry {
++ 	enum mlxsw_sp_ipip_type ipipt;
++ 	struct net_device *ol_dev; /* Overlay. */
++ 	struct mlxsw_sp_rif_ipip_lb *ol_lb;
++ 	unsigned int ref_count; /* Number of next hops using the tunnel. */
++ 	struct mlxsw_sp_fib_entry *decap_fib_entry;
++ 	struct list_head ipip_list_node;
++ };
++ 
++ struct mlxsw_sp_ipip_ops {
++ 	int dev_type;
++ 	enum mlxsw_sp_l3proto ul_proto; /* Underlay. */
++ 
++ 	int (*nexthop_update)(struct mlxsw_sp *mlxsw_sp, u32 adj_index,
++ 			      struct mlxsw_sp_ipip_entry *ipip_entry);
++ 
++ 	bool (*can_offload)(const struct mlxsw_sp *mlxsw_sp,
++ 			    const struct net_device *ol_dev,
++ 			    enum mlxsw_sp_l3proto ol_proto);
++ 
++ 	/* Return a configuration for creating an overlay loopback RIF. */
++ 	struct mlxsw_sp_rif_ipip_lb_config
++ 	(*ol_loopback_config)(struct mlxsw_sp *mlxsw_sp,
++ 			      const struct net_device *ol_dev);
++ 
++ 	int (*fib_entry_op)(struct mlxsw_sp *mlxsw_sp,
++ 			    struct mlxsw_sp_ipip_entry *ipip_entry,
++ 			    enum mlxsw_reg_ralue_op op,
++ 			    u32 tunnel_index);
++ };
++ 
++ extern const struct mlxsw_sp_ipip_ops *mlxsw_sp_ipip_ops_arr[];
++ 
++ #endif /* _MLXSW_IPIP_H_*/
+++>>>>>>> 4607f6d26950 (mlxsw: spectrum_router: Support IPv4 underlay decap):drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+* Unmerged path net/tipc/node_subscr.h
