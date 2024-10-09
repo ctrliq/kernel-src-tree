@@ -1,0 +1,136 @@
+ACPI / PM: Always enable wakeup GPEs when enabling device wakeup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit f35cec255557d1037ff0d772edfd6e7b1e92cdc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f35cec25.failed
+
+Wakeup GPEs are currently only enabled when setting up devices for
+remote wakeup at run time.  During system-wide transitions they are
+enabled by ACPICA at the very last stage of suspend (before asking
+the BIOS to take over).  Of course, that only works for system
+sleep states supported by ACPI, so in particular it doesn't work
+for the "freeze" sleep state.
+
+For this reason, modify the ACPI core device PM code to enable wakeup
+GPEs for devices when setting them up for wakeup regardless of whether
+that is remote wakeup at runtime or system wakeup.  That allows the
+same device wakeup setup routine to be used for both runtime PM and
+system-wide PM and makes it possible to reduce code size quite a bit.
+
+This make ACPI-based PCI Wake-on-LAN work with the "freeze" sleep
+state on my venerable Toshiba Portege R500 and should help other
+systems too.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit f35cec255557d1037ff0d772edfd6e7b1e92cdc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/device_pm.c
+diff --cc drivers/acpi/device_pm.c
+index f3563166ead6,ad2810900799..000000000000
+--- a/drivers/acpi/device_pm.c
++++ b/drivers/acpi/device_pm.c
+@@@ -608,18 -638,16 +608,17 @@@ int acpi_pm_device_sleep_state(struct d
+  }
+  EXPORT_SYMBOL(acpi_pm_device_sleep_state);
+  
+- #ifdef CONFIG_PM_RUNTIME
+  /**
+ - * acpi_pm_notify_work_func - ACPI devices wakeup notification work function.
+ - * @work: Work item to handle.
+ + * acpi_wakeup_device - Wakeup notification handler for ACPI devices.
+ + * @handle: ACPI handle of the device the notification is for.
+ + * @event: Type of the signaled event.
+ + * @context: Device corresponding to @handle.
+   */
+ -static void acpi_pm_notify_work_func(struct work_struct *work)
+ +static void acpi_wakeup_device(acpi_handle handle, u32 event, void *context)
+  {
+ -	struct device *dev;
+ +	struct device *dev = context;
+  
+ -	dev = container_of(work, struct acpi_device_wakeup_context, work)->dev;
+ -	if (dev) {
+ +	if (event == ACPI_NOTIFY_DEVICE_WAKE && dev) {
+  		pm_wakeup_event(dev, 0);
+  		pm_runtime_resume(dev);
+  	}
+@@@ -681,12 -712,9 +683,15 @@@ int acpi_pm_device_run_wake(struct devi
+  		return -ENODEV;
+  	}
+  
+- 	return __acpi_device_run_wake(adev, enable);
++ 	return acpi_device_wakeup(adev, enable, ACPI_STATE_S0);
+  }
+  EXPORT_SYMBOL(acpi_pm_device_run_wake);
+++<<<<<<< HEAD
+ +#else
+ +static inline void acpi_wakeup_device(acpi_handle handle, u32 event,
+ +				      void *context) {}
+++=======
+++>>>>>>> f35cec255557 (ACPI / PM: Always enable wakeup GPEs when enabling device wakeup)
+  #endif /* CONFIG_PM_RUNTIME */
+  
+  #ifdef CONFIG_PM_SLEEP
+@@@ -1001,19 -1069,11 +991,19 @@@ int acpi_dev_pm_attach(struct device *d
+  	if (dev->pm_domain)
+  		return -EEXIST;
+  
+ -	acpi_add_pm_notifier(adev, dev, acpi_pm_notify_work_func);
+ -	dev->pm_domain = &acpi_general_pm_domain;
+ +	/*
+ +	 * Only attach the power domain to the first device if the
+ +	 * companion is shared by multiple. This is to prevent doing power
+ +	 * management twice.
+ +	 */
+ +	if (!acpi_device_is_first_physical_node(adev, dev))
+ +		return -EBUSY;
+ +
+ +	acpi_add_pm_notifier(adev, acpi_wakeup_device, dev);
+ +	dev_pm_domain_set(dev, &acpi_general_pm_domain);
+  	if (power_on) {
+  		acpi_dev_pm_full_power(adev);
+- 		__acpi_device_run_wake(adev, false);
++ 		acpi_device_wakeup(adev, ACPI_STATE_S0, false);
+  	}
+  	return 0;
+  }
+* Unmerged path drivers/acpi/device_pm.c
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index ac2849840375..a0f94f01330c 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -596,13 +596,8 @@ static inline int acpi_pm_device_sleep_state(struct device *d, int *p, int m)
+ #endif
+ 
+ #ifdef CONFIG_PM_RUNTIME
+-int __acpi_device_run_wake(struct acpi_device *, bool);
+ int acpi_pm_device_run_wake(struct device *, bool);
+ #else
+-static inline int __acpi_device_run_wake(struct acpi_device *adev, bool en)
+-{
+-	return -ENODEV;
+-}
+ static inline int acpi_pm_device_run_wake(struct device *dev, bool enable)
+ {
+ 	return -ENODEV;
+@@ -610,14 +605,8 @@ static inline int acpi_pm_device_run_wake(struct device *dev, bool enable)
+ #endif
+ 
+ #ifdef CONFIG_PM_SLEEP
+-int __acpi_device_sleep_wake(struct acpi_device *, u32, bool);
+ int acpi_pm_device_sleep_wake(struct device *, bool);
+ #else
+-static inline int __acpi_device_sleep_wake(struct acpi_device *adev,
+-					   u32 target_state, bool enable)
+-{
+-	return -ENODEV;
+-}
+ static inline int acpi_pm_device_sleep_wake(struct device *dev, bool enable)
+ {
+ 	return -ENODEV;
