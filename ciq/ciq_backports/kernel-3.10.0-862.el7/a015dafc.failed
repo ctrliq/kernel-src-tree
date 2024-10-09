@@ -1,0 +1,359 @@
+ovl: use ovl_inode mutex to synchronize concurrent copy up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit a015dafcaf5b0316654a39bc598a76804595af90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a015dafc.failed
+
+Use the new ovl_inode mutex to synchonize concurrent copy up
+instead of the super block copy up workqueue.
+
+Moving the synchronization object from the overlay dentry to
+the overlay inode is needed for synchonizing concurrent copy up
+of lower hardlinks to the same upper inode.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit a015dafcaf5b0316654a39bc598a76804595af90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/ovl_entry.h
+#	fs/overlayfs/super.c
+#	fs/overlayfs/util.c
+diff --cc fs/overlayfs/super.c
+index aaf06952d88f,b0d539af1fad..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -415,282 -156,44 +415,296 @@@ static const struct dentry_operations_w
+  	.d_real = ovl_d_real,
+  };
+  
+ -static const struct dentry_operations ovl_reval_dentry_operations = {
+ -	.d_release = ovl_dentry_release,
+ +static const struct dentry_operations_wrapper ovl_reval_dentry_operations = {
+ +	.ops = {
+ +		.d_release = ovl_dentry_release,
+ +		.d_revalidate = ovl_dentry_revalidate,
+ +		.d_weak_revalidate = ovl_dentry_weak_revalidate,
+ +	},
+ +	.size = sizeof(struct dentry_operations_wrapper),
+  	.d_real = ovl_d_real,
+ -	.d_revalidate = ovl_dentry_revalidate,
+ -	.d_weak_revalidate = ovl_dentry_weak_revalidate,
+  };
+  
+ -static struct kmem_cache *ovl_inode_cachep;
+ -
+ -static struct inode *ovl_alloc_inode(struct super_block *sb)
+ +static struct ovl_entry *ovl_alloc_entry(unsigned int numlower)
+  {
+ -	struct ovl_inode *oi = kmem_cache_alloc(ovl_inode_cachep, GFP_KERNEL);
+ +	size_t size = offsetof(struct ovl_entry, lowerstack[numlower]);
+ +	struct ovl_entry *oe = kzalloc(size, GFP_KERNEL);
+  
+++<<<<<<< HEAD
+ +	if (oe)
+ +		oe->numlower = numlower;
+++=======
++ 	oi->redirect = NULL;
++ 	oi->flags = 0;
++ 	oi->__upperdentry = NULL;
++ 	oi->lower = NULL;
++ 	mutex_init(&oi->lock);
+++>>>>>>> a015dafcaf5b (ovl: use ovl_inode mutex to synchronize concurrent copy up)
+  
+ -	return &oi->vfs_inode;
+ +	return oe;
+  }
+  
+ -static void ovl_i_callback(struct rcu_head *head)
+ +static bool ovl_dentry_remote(struct dentry *dentry)
+  {
+ -	struct inode *inode = container_of(head, struct inode, i_rcu);
+ -
+ -	kmem_cache_free(ovl_inode_cachep, OVL_I(inode));
+ +	return dentry->d_flags &
+ +		(DCACHE_OP_REVALIDATE | DCACHE_OP_WEAK_REVALIDATE |
+ +		 DCACHE_OP_REAL);
+  }
+  
+ -static void ovl_destroy_inode(struct inode *inode)
+ +static bool ovl_dentry_weird(struct dentry *dentry)
+  {
+ -	struct ovl_inode *oi = OVL_I(inode);
+ +	return dentry->d_flags & (DCACHE_NEED_AUTOMOUNT |
+ +				  DCACHE_MANAGE_TRANSIT |
+ +				  DCACHE_OP_HASH |
+ +				  DCACHE_OP_COMPARE);
+ +}
+  
+++<<<<<<< HEAD
+ +static inline struct dentry *ovl_lookup_real(struct dentry *dir,
+ +					     const struct qstr *name)
+ +{
+ +	struct dentry *dentry;
+++=======
++ 	dput(oi->__upperdentry);
++ 	kfree(oi->redirect);
++ 	mutex_destroy(&oi->lock);
+++>>>>>>> a015dafcaf5b (ovl: use ovl_inode mutex to synchronize concurrent copy up)
+ +
+ +	dentry = lookup_one_len_unlocked(name->name, dir, name->len);
+ +	if (IS_ERR(dentry)) {
+ +		if (PTR_ERR(dentry) == -ENOENT)
+ +			dentry = NULL;
+ +	} else if (!dentry->d_inode) {
+ +		dput(dentry);
+ +		dentry = NULL;
+ +	} else if (ovl_dentry_weird(dentry)) {
+ +		dput(dentry);
+ +		/* Don't support traversing automounts and other weirdness */
+ +		dentry = ERR_PTR(-EREMOTE);
+ +	}
+ +	return dentry;
+ +}
+  
+ -	call_rcu(&inode->i_rcu, ovl_i_callback);
+ +/*
+ + * Returns next layer in stack starting from top.
+ + * Returns -1 if this is the last layer.
+ + */
+ +int ovl_path_next(int idx, struct dentry *dentry, struct path *path)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	BUG_ON(idx < 0);
+ +	if (idx == 0) {
+ +		ovl_path_upper(dentry, path);
+ +		if (path->dentry)
+ +			return oe->numlower ? 1 : -1;
+ +		idx++;
+ +	}
+ +	BUG_ON(idx > oe->numlower);
+ +	*path = oe->lowerstack[idx - 1];
+ +
+ +	return (idx < oe->numlower) ? idx + 1 : -1;
+ +}
+ +
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ +			  unsigned int flags)
+ +{
+ +	struct ovl_entry *oe;
+ +	const struct cred *old_cred;
+ +	struct ovl_entry *poe = dentry->d_parent->d_fsdata;
+ +	struct path *stack = NULL;
+ +	struct dentry *upperdir, *upperdentry = NULL;
+ +	unsigned int ctr = 0;
+ +	struct inode *inode = NULL;
+ +	bool upperopaque = false;
+ +	bool stop = false;
+ +	bool isdir = false;
+ +	struct dentry *this;
+ +	unsigned int i;
+ +	int err;
+ +
+ +	old_cred = ovl_override_creds(dentry->d_sb);
+ +	upperdir = ovl_upperdentry_dereference(poe);
+ +	if (upperdir) {
+ +		this = ovl_lookup_real(upperdir, &dentry->d_name);
+ +		err = PTR_ERR(this);
+ +		if (IS_ERR(this))
+ +			goto out;
+ +
+ +		if (this) {
+ +			if (unlikely(ovl_dentry_remote(this))) {
+ +				dput(this);
+ +				err = -EREMOTE;
+ +				goto out;
+ +			}
+ +			if (ovl_is_whiteout(this)) {
+ +				dput(this);
+ +				this = NULL;
+ +				stop = upperopaque = true;
+ +			} else if (!d_is_dir(this)) {
+ +				stop = true;
+ +			} else {
+ +				isdir = true;
+ +				if (poe->numlower && ovl_is_opaquedir(this))
+ +					stop = upperopaque = true;
+ +			}
+ +		}
+ +		upperdentry = this;
+ +	}
+ +
+ +	if (!stop && poe->numlower) {
+ +		err = -ENOMEM;
+ +		stack = kcalloc(poe->numlower, sizeof(struct path), GFP_KERNEL);
+ +		if (!stack)
+ +			goto out_put_upper;
+ +	}
+ +
+ +	for (i = 0; !stop && i < poe->numlower; i++) {
+ +		struct path lowerpath = poe->lowerstack[i];
+ +
+ +		this = ovl_lookup_real(lowerpath.dentry, &dentry->d_name);
+ +		err = PTR_ERR(this);
+ +		if (IS_ERR(this)) {
+ +			/*
+ +			 * If it's positive, then treat ENAMETOOLONG as ENOENT.
+ +			 */
+ +			if (err == -ENAMETOOLONG && (upperdentry || ctr))
+ +				continue;
+ +			goto out_put;
+ +		}
+ +		if (!this)
+ +			continue;
+ +		if (ovl_is_whiteout(this)) {
+ +			dput(this);
+ +			break;
+ +		}
+ +		/*
+ +		 * If this is a non-directory then stop here.
+ +		 */
+ +		if (!d_is_dir(this)) {
+ +			if (isdir) {
+ +				dput(this);
+ +				break;
+ +			}
+ +			stop = true;
+ +		} else {
+ +			/*
+ +			 * Only makes sense to check opaque dir if this is not
+ +			 * the lowermost layer.
+ +			 */
+ +			if (i < poe->numlower - 1 && ovl_is_opaquedir(this))
+ +				stop = true;
+ +		}
+ +
+ +		stack[ctr].dentry = this;
+ +		stack[ctr].mnt = lowerpath.mnt;
+ +		ctr++;
+ +	}
+ +
+ +	oe = ovl_alloc_entry(ctr);
+ +	err = -ENOMEM;
+ +	if (!oe)
+ +		goto out_put;
+ +
+ +	if (upperdentry || ctr) {
+ +		struct dentry *realdentry;
+ +		struct inode *realinode;
+ +
+ +		realdentry = upperdentry ? upperdentry : stack[0].dentry;
+ +		realinode = d_inode(realdentry);
+ +
+ +		err = -ENOMEM;
+ +		if (upperdentry && !d_is_dir(upperdentry)) {
+ +			inode = ovl_get_inode(dentry->d_sb, realinode);
+ +		} else {
+ +			inode = ovl_new_inode(dentry->d_sb, realinode->i_mode);
+ +			if (inode)
+ +				ovl_inode_init(inode, realinode, !!upperdentry);
+ +		}
+ +		if (!inode)
+ +			goto out_free_oe;
+ +		ovl_copyattr(realdentry->d_inode, inode);
+ +	}
+ +
+ +	revert_creds(old_cred);
+ +	oe->opaque = upperopaque;
+ +	oe->__upperdentry = upperdentry;
+ +	memcpy(oe->lowerstack, stack, sizeof(struct path) * ctr);
+ +	kfree(stack);
+ +	dentry->d_fsdata = oe;
+ +	d_add(dentry, inode);
+ +
+ +	return NULL;
+ +
+ +out_free_oe:
+ +	kfree(oe);
+ +out_put:
+ +	for (i = 0; i < ctr; i++)
+ +		dput(stack[i].dentry);
+ +	kfree(stack);
+ +out_put_upper:
+ +	dput(upperdentry);
+ +out:
+ +	revert_creds(old_cred);
+ +	return ERR_PTR(err);
+ +}
+ +
+ +bool ovl_lower_positive(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	struct ovl_entry *poe = dentry->d_parent->d_fsdata;
+ +	const struct qstr *name = &dentry->d_name;
+ +	unsigned int i;
+ +	bool positive = false;
+ +	bool done = false;
+ +
+ +	/*
+ +	 * If dentry is negative, then lower is positive iff this is a
+ +	 * whiteout.
+ +	 */
+ +	if (!dentry->d_inode)
+ +		return oe->opaque;
+ +
+ +	/* Negative upper -> positive lower */
+ +	if (!oe->__upperdentry)
+ +		return true;
+ +
+ +	/* Positive upper -> have to look up lower to see whether it exists */
+ +	for (i = 0; !done && !positive && i < poe->numlower; i++) {
+ +		struct dentry *this;
+ +		struct dentry *lowerdir = poe->lowerstack[i].dentry;
+ +
+ +		this = lookup_one_len_unlocked(name->name, lowerdir,
+ +					       name->len);
+ +		if (IS_ERR(this)) {
+ +			switch (PTR_ERR(this)) {
+ +			case -ENOENT:
+ +			case -ENAMETOOLONG:
+ +				break;
+ +
+ +			default:
+ +				/*
+ +				 * Assume something is there, we just couldn't
+ +				 * access it.
+ +				 */
+ +				positive = true;
+ +				break;
+ +			}
+ +		} else {
+ +			if (this->d_inode) {
+ +				positive = !ovl_is_whiteout(this);
+ +				done = true;
+ +			}
+ +			dput(this);
+ +		}
+ +	}
+ +
+ +	return positive;
+ +}
+ +
+ +struct file *ovl_path_open(struct path *path, int flags)
+ +{
+ +	return dentry_open(path, flags | O_NOATIME, current_cred());
+  }
+  
+  static void ovl_put_super(struct super_block *sb)
+@@@ -1265,6 -784,7 +1279,10 @@@ static int ovl_fill_super(struct super_
+  	if (!ufs)
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	ufs->config.redirect_dir = ovl_redirect_dir_def;
+++>>>>>>> a015dafcaf5b (ovl: use ovl_inode mutex to synchronize concurrent copy up)
+  	err = ovl_parse_opt((char *) data, &ufs->config);
+  	if (err)
+  		goto out_free_config;
+* Unmerged path fs/overlayfs/ovl_entry.h
+* Unmerged path fs/overlayfs/util.c
+* Unmerged path fs/overlayfs/ovl_entry.h
+* Unmerged path fs/overlayfs/super.c
+* Unmerged path fs/overlayfs/util.c
