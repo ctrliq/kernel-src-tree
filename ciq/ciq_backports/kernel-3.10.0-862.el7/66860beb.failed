@@ -1,0 +1,113 @@
+nfp: bpf: allow offloaded filters to update stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 66860beb7ed5df11433528cb535d5e9f7dad2302
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/66860beb.failed
+
+Periodically poll stats and call into offloaded actions
+to update them.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 66860beb7ed5df11433528cb535d5e9f7dad2302)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da,13c6a9001b4d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -496,11 -517,16 +509,21 @@@ struct nfp_net 
+  	u8 rss_key[NFP_NET_CFG_RSS_KEY_SZ];
+  	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
+  
+++<<<<<<< HEAD
+ +	unsigned int max_tx_rings;
+ +	unsigned int max_rx_rings;
+++=======
++ 	struct nfp_stat_pair rx_filter, rx_filter_prev;
++ 	unsigned long rx_filter_change;
++ 	struct timer_list rx_filter_stats_timer;
++ 	spinlock_t rx_filter_lock;
++ 
++ 	int max_tx_rings;
++ 	int max_rx_rings;
+++>>>>>>> 66860beb7ed5 (nfp: bpf: allow offloaded filters to update stats)
+  
+ -	int num_tx_rings;
+ -	int num_rx_rings;
+ +	unsigned int num_tx_rings;
+ +	unsigned int num_rx_rings;
+  
+  	int stride_tx;
+  	int stride_rx;
+@@@ -784,9 -788,14 +807,18 @@@ nfp_net_debugfs_port_add(struct nfp_ne
+  {
+  }
+  
+ -static inline void nfp_net_debugfs_adapter_del(struct nfp_net *nn)
+ +static inline void nfp_net_debugfs_dir_clean(struct dentry **dir)
+  {
+  }
+++<<<<<<< HEAD
+ +#endif /* CONFIG_NFP_DEBUG */
+++=======
++ #endif /* CONFIG_NFP_NET_DEBUG */
++ 
++ void nfp_net_filter_stats_timer(unsigned long data);
++ int
++ nfp_net_bpf_offload(struct nfp_net *nn, u32 handle, __be16 proto,
++ 		    struct tc_cls_bpf_offload *cls_bpf);
+++>>>>>>> 66860beb7ed5 (nfp: bpf: allow offloaded filters to update stats)
+  
+  #endif /* _NFP_NET_H_ */
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_offload.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index de17d3265a77..8f4c7b39b1d1 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -2689,10 +2689,13 @@ struct nfp_net *nfp_net_netdev_alloc(struct pci_dev *pdev,
+ 	nn->rxd_cnt = NFP_NET_RX_DESCS_DEFAULT;
+ 
+ 	spin_lock_init(&nn->reconfig_lock);
++	spin_lock_init(&nn->rx_filter_lock);
+ 	spin_lock_init(&nn->link_status_lock);
+ 
+ 	setup_timer(&nn->reconfig_timer,
+ 		    nfp_net_reconfig_timer, (unsigned long)nn);
++	setup_timer(&nn->rx_filter_stats_timer,
++		    nfp_net_filter_stats_timer, (unsigned long)nn);
+ 
+ 	return nn;
+ }
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index dfbf6b94ff5b..c240d5ebc35d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@ -111,6 +111,18 @@ static const struct _nfp_net_et_stats nfp_net_et_stats[] = {
+ 	{"dev_tx_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_TX_FRAMES)},
+ 	{"dev_tx_mc_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_TX_MC_FRAMES)},
+ 	{"dev_tx_bc_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_TX_BC_FRAMES)},
++
++	{"bpf_pass_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP0_FRAMES)},
++	{"bpf_pass_bytes", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP0_BYTES)},
++	/* see comments in outro functions in nfp_bpf_jit.c to find out
++	 * how different BPF modes use app-specific counters
++	 */
++	{"bpf_app1_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP1_FRAMES)},
++	{"bpf_app1_bytes", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP1_BYTES)},
++	{"bpf_app2_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP2_FRAMES)},
++	{"bpf_app2_bytes", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP2_BYTES)},
++	{"bpf_app3_pkts", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP3_FRAMES)},
++	{"bpf_app3_bytes", NN_ET_DEV_STAT(NFP_NET_CFG_STATS_APP3_BYTES)},
+ };
+ 
+ #define NN_ET_GLOBAL_STATS_LEN ARRAY_SIZE(nfp_net_et_stats)
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_offload.c
