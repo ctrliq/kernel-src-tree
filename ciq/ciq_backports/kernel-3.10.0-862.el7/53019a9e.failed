@@ -1,0 +1,124 @@
+iommu/amd: Do sanity check for address translation and irq remap of old dev table entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Do sanity check for address translation and irq remap of old dev table entry (Jerry Snitselaar) [1062729]
+Rebuild_FUZZ: 96.43%
+commit-author Baoquan He <bhe@redhat.com>
+commit 53019a9e88cc14bae2780ba807faba87a5829891
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/53019a9e.failed
+
+Firstly split the dev table entry copy into address translation part
+and irq remapping part. Because these two parts could be enabled
+independently.
+
+Secondly do sanity check for address translation and irq remap of old
+dev table entry separately.
+
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 53019a9e88cc14bae2780ba807faba87a5829891)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu_types.h
+diff --cc drivers/iommu/amd_iommu_types.h
+index e448daa671af,f0979183ec9b..000000000000
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@@ -223,6 -237,27 +223,30 @@@
+  
+  #define PPR_REQ_FAULT		0x01
+  
+++<<<<<<< HEAD
+++=======
++ /* Constants for GA Log handling */
++ #define GA_LOG_ENTRIES		512
++ #define GA_LOG_SIZE_SHIFT	56
++ #define GA_LOG_SIZE_512		(0x8ULL << GA_LOG_SIZE_SHIFT)
++ #define GA_ENTRY_SIZE		8
++ #define GA_LOG_SIZE		(GA_ENTRY_SIZE * GA_LOG_ENTRIES)
++ 
++ #define GA_TAG(x)		(u32)(x & 0xffffffffULL)
++ #define GA_DEVID(x)		(u16)(((x) >> 32) & 0xffffULL)
++ #define GA_REQ_TYPE(x)		(((x) >> 60) & 0xfULL)
++ 
++ #define GA_GUEST_NR		0x1
++ 
++ /* Bit value definition for dte irq remapping fields*/
++ #define DTE_IRQ_PHYS_ADDR_MASK	(((1ULL << 45)-1) << 6)
++ #define DTE_IRQ_REMAP_INTCTL_MASK	(0x3ULL << 60)
++ #define DTE_IRQ_TABLE_LEN_MASK	(0xfULL << 1)
++ #define DTE_IRQ_REMAP_INTCTL    (2ULL << 60)
++ #define DTE_IRQ_TABLE_LEN       (8ULL << 1)
++ #define DTE_IRQ_REMAP_ENABLE    1ULL
++ 
+++>>>>>>> 53019a9e88cc (iommu/amd: Do sanity check for address translation and irq remap of old dev table entry)
+  #define PAGE_MODE_NONE    0x00
+  #define PAGE_MODE_1_LEVEL 0x01
+  #define PAGE_MODE_2_LEVEL 0x02
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index e80343c1de99..174a4e1a4f56 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -3622,11 +3622,6 @@ union irte {
+ 	} fields;
+ };
+ 
+-#define DTE_IRQ_PHYS_ADDR_MASK	(((1ULL << 45)-1) << 6)
+-#define DTE_IRQ_REMAP_INTCTL    (2ULL << 60)
+-#define DTE_IRQ_TABLE_LEN       (8ULL << 1)
+-#define DTE_IRQ_REMAP_ENABLE    1ULL
+-
+ static void set_dte_irq_entry(u16 devid, struct irq_remap_table *table)
+ {
+ 	u64 dte;
+diff --git a/drivers/iommu/amd_iommu_init.c b/drivers/iommu/amd_iommu_init.c
+index 7961fd9385cc..1ba19a1cb00d 100644
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@ -697,12 +697,12 @@ static int get_dev_entry_bit(u16 devid, u8 bit)
+ 
+ static bool copy_device_table(void)
+ {
++	u64 int_ctl, int_tab_len, entry, last_entry = 0;
+ 	struct dev_table_entry *old_devtb = NULL;
+ 	u32 lo, hi, devid, old_devtb_size;
+ 	phys_addr_t old_devtb_phys;
+-	u64 entry, last_entry = 0;
+ 	struct amd_iommu *iommu;
+-	u16 dom_id, dte_v;
++	u16 dom_id, dte_v, irq_v;
+ 	gfp_t gfp_flag;
+ 
+ 
+@@ -744,8 +744,25 @@ static bool copy_device_table(void)
+ 		old_dev_tbl_cpy[devid] = old_devtb[devid];
+ 		dom_id = old_devtb[devid].data[1] & DEV_DOMID_MASK;
+ 		dte_v = old_devtb[devid].data[0] & DTE_FLAG_V;
+-		if (dte_v && dom_id)
++
++		if (dte_v && dom_id) {
++			old_dev_tbl_cpy[devid].data[0] = old_devtb[devid].data[0];
++			old_dev_tbl_cpy[devid].data[1] = old_devtb[devid].data[1];
+ 			__set_bit(dom_id, amd_iommu_pd_alloc_bitmap);
++		}
++
++		irq_v = old_devtb[devid].data[2] & DTE_IRQ_REMAP_ENABLE;
++		int_ctl = old_devtb[devid].data[2] & DTE_IRQ_REMAP_INTCTL_MASK;
++		int_tab_len = old_devtb[devid].data[2] & DTE_IRQ_TABLE_LEN_MASK;
++		if (irq_v && (int_ctl || int_tab_len)) {
++			if ((int_ctl != DTE_IRQ_REMAP_INTCTL) ||
++			    (int_tab_len != DTE_IRQ_TABLE_LEN)) {
++				pr_err("Wrong old irq remapping flag: %#x\n", devid);
++				return false;
++			}
++
++		        old_dev_tbl_cpy[devid].data[2] = old_devtb[devid].data[2];
++		}
+ 	}
+ 	memunmap(old_devtb);
+ 
+* Unmerged path drivers/iommu/amd_iommu_types.h
