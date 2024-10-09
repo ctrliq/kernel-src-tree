@@ -87,6 +87,11 @@ static DEFINE_SPINLOCK(free_entries_lock);
 /* Global disable flag - will be set in case of an error */
 static u32 global_disable __read_mostly;
 
+static inline bool dma_debug_disabled(void)
+{
+	return global_disable;
+}
+
 /* Global error count */
 static u32 error_count;
 
@@ -742,7 +747,7 @@ static int dma_debug_device_change(struct notifier_block *nb, unsigned long acti
 	struct dma_debug_entry *uninitialized_var(entry);
 	int count;
 
-	if (global_disable)
+	if (dma_debug_disabled())
 		return 0;
 
 	switch (action) {
@@ -770,7 +775,7 @@ void dma_debug_add_bus(struct bus_type *bus)
 {
 	struct notifier_block *nb;
 
-	if (global_disable)
+	if (dma_debug_disabled())
 		return;
 
 	nb = kzalloc(sizeof(struct notifier_block), GFP_KERNEL);
@@ -791,7 +796,7 @@ void dma_debug_init(u32 num_entries)
 {
 	int i;
 
-	if (global_disable)
+	if (dma_debug_disabled())
 		return;
 
 	for (i = 0; i < HASH_SIZE; ++i) {
@@ -1040,7 +1045,7 @@ void debug_dma_map_page(struct device *dev, struct page *page, size_t offset,
 {
 	struct dma_debug_entry *entry;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	if (dma_mapping_error(dev, dma_addr))
@@ -1079,7 +1084,7 @@ void debug_dma_mapping_error(struct device *dev, dma_addr_t dma_addr)
 	struct hash_bucket *bucket;
 	unsigned long flags;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	ref.dev = dev;
@@ -1121,7 +1126,7 @@ void debug_dma_unmap_page(struct device *dev, dma_addr_t addr,
 		.direction      = direction,
 	};
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	if (map_single)
@@ -1138,7 +1143,7 @@ void debug_dma_map_sg(struct device *dev, struct scatterlist *sg,
 	struct scatterlist *s;
 	int i;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	for_each_sg(sg, s, mapped_ents, i) {
@@ -1190,7 +1195,7 @@ void debug_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
 	struct scatterlist *s;
 	int mapped_ents = 0, i;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	for_each_sg(sglist, s, nelems, i) {
@@ -1221,7 +1226,7 @@ void debug_dma_alloc_coherent(struct device *dev, size_t size,
 {
 	struct dma_debug_entry *entry;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	if (unlikely(virt == NULL))
@@ -1254,7 +1259,7 @@ void debug_dma_free_coherent(struct device *dev, size_t size,
 		.direction      = DMA_BIDIRECTIONAL,
 	};
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	check_unmap(&ref);
@@ -1266,7 +1271,7 @@ void debug_dma_sync_single_for_cpu(struct device *dev, dma_addr_t dma_handle,
 {
 	struct dma_debug_entry ref;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	ref.type         = dma_debug_single;
@@ -1286,7 +1291,7 @@ void debug_dma_sync_single_for_device(struct device *dev,
 {
 	struct dma_debug_entry ref;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	ref.type         = dma_debug_single;
@@ -1307,7 +1312,7 @@ void debug_dma_sync_single_range_for_cpu(struct device *dev,
 {
 	struct dma_debug_entry ref;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	ref.type         = dma_debug_single;
@@ -1328,7 +1333,7 @@ void debug_dma_sync_single_range_for_device(struct device *dev,
 {
 	struct dma_debug_entry ref;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	ref.type         = dma_debug_single;
@@ -1348,7 +1353,7 @@ void debug_dma_sync_sg_for_cpu(struct device *dev, struct scatterlist *sg,
 	struct scatterlist *s;
 	int mapped_ents = 0, i;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	for_each_sg(sg, s, nelems, i) {
@@ -1380,7 +1385,7 @@ void debug_dma_sync_sg_for_device(struct device *dev, struct scatterlist *sg,
 	struct scatterlist *s;
 	int mapped_ents = 0, i;
 
-	if (unlikely(global_disable))
+	if (unlikely(dma_debug_disabled()))
 		return;
 
 	for_each_sg(sg, s, nelems, i) {
