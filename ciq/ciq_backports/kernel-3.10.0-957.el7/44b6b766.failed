@@ -1,0 +1,512 @@
+platform/x86: wmi: create userspace interface for drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [platform] x86: wmi: create userspace interface for drivers (Jarod Wilson) [1562200]
+Rebuild_FUZZ: 91.43%
+commit-author Mario Limonciello <mario.limonciello@dell.com>
+commit 44b6b7661132b1b0e5fd3147ded66f1e4a817ca9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/44b6b766.failed
+
+For WMI operations that are only Set or Query readable and writable sysfs
+attributes created by WMI vendor drivers or the bus driver makes sense.
+
+For other WMI operations that are run on Method, there needs to be a
+way to guarantee to userspace that the results from the method call
+belong to the data request to the method call.  Sysfs attributes don't
+work well in this scenario because two userspace processes may be
+competing at reading/writing an attribute and step on each other's
+data.
+
+When a WMI vendor driver declares a callback method in the wmi_driver
+the WMI bus driver will create a character device that maps to that
+function.  This callback method will be responsible for filtering
+invalid requests and performing the actual call.
+
+That character device will correspond to this path:
+/dev/wmi/$driver
+
+Performing read() on this character device will provide the size
+of the buffer that the character device needs to perform calls.
+This buffer size can be set by vendor drivers through a new symbol
+or when MOF parsing is available by the MOF.
+
+Performing ioctl() on this character device will be interpretd
+by the WMI bus driver. It will perform sanity tests for size of
+data, test them for a valid instance, copy the data from userspace
+and pass iton to the vendor driver to further process and run.
+
+This creates an implicit policy that each driver will only be allowed
+a single character device.  If a module matches multiple GUID's,
+the wmi_devices will need to be all handled by the same wmi_driver.
+
+The WMI vendor drivers will be responsible for managing inappropriate
+access to this character device and proper locking on data used by
+it.
+
+When a WMI vendor driver is unloaded the WMI bus driver will clean
+up the character device and any memory allocated for the call.
+
+	Signed-off-by: Mario Limonciello <mario.limonciello@dell.com>
+	Reviewed-by: Edward O'Callaghan <quasisec@google.com>
+	Signed-off-by: Darren Hart (VMware) <dvhart@infradead.org>
+(cherry picked from commit 44b6b7661132b1b0e5fd3147ded66f1e4a817ca9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/wmi.c
+#	include/linux/wmi.h
+diff --cc drivers/platform/x86/wmi.c
+index ce57af6635c6,8c31ed4f0e1b..000000000000
+--- a/drivers/platform/x86/wmi.c
++++ b/drivers/platform/x86/wmi.c
+@@@ -29,16 -33,20 +29,29 @@@
+  
+  #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+  
+ -#include <linux/acpi.h>
+ -#include <linux/device.h>
+ -#include <linux/init.h>
+  #include <linux/kernel.h>
+++<<<<<<< HEAD
+ +#include <linux/init.h>
+ +#include <linux/types.h>
+ +#include <linux/device.h>
+ +#include <linux/list.h>
+ +#include <linux/acpi.h>
+ +#include <linux/slab.h>
+ +#include <linux/module.h>
+ +#include <acpi/acpi_bus.h>
+ +#include <acpi/acpi_drivers.h>
+++=======
++ #include <linux/list.h>
++ #include <linux/miscdevice.h>
++ #include <linux/module.h>
++ #include <linux/platform_device.h>
++ #include <linux/slab.h>
++ #include <linux/types.h>
++ #include <linux/uaccess.h>
++ #include <linux/uuid.h>
++ #include <linux/wmi.h>
++ #include <uapi/linux/wmi.h>
+++>>>>>>> 44b6b7661132 (platform/x86: wmi: create userspace interface for drivers)
+  
+  ACPI_MODULE_NAME("wmi");
+  MODULE_AUTHOR("Carlos Corbacho");
+@@@ -63,12 -69,17 +76,20 @@@ struct guid_block 
+  };
+  
+  struct wmi_block {
+ -	struct wmi_device dev;
+  	struct list_head list;
+  	struct guid_block gblock;
++ 	struct miscdevice char_dev;
++ 	struct mutex char_mutex;
+  	struct acpi_device *acpi_device;
+  	wmi_notify_handler handler;
+  	void *handler_data;
+++<<<<<<< HEAD
+ +	struct device dev;
+++=======
++ 	u64 req_buf_size;
++ 
++ 	bool read_takes_no_args;
+++>>>>>>> 44b6b7661132 (platform/x86: wmi: create userspace interface for drivers)
+  };
+  
+  
+@@@ -672,31 -762,328 +712,262 @@@ static int wmi_dev_uevent(struct devic
+  	return 0;
+  }
+  
+ -static void wmi_dev_release(struct device *dev)
+ +static void wmi_dev_free(struct device *dev)
+  {
+ -	struct wmi_block *wblock = dev_to_wblock(dev);
+ +	struct wmi_block *wmi_block = container_of(dev, struct wmi_block, dev);
+  
+ -	kfree(wblock);
+ +	kfree(wmi_block);
+  }
+  
+++<<<<<<< HEAD
+ +static struct class wmi_class = {
+++=======
++ static int wmi_dev_match(struct device *dev, struct device_driver *driver)
++ {
++ 	struct wmi_driver *wmi_driver =
++ 		container_of(driver, struct wmi_driver, driver);
++ 	struct wmi_block *wblock = dev_to_wblock(dev);
++ 	const struct wmi_device_id *id = wmi_driver->id_table;
++ 
++ 	while (id->guid_string) {
++ 		uuid_le driver_guid;
++ 
++ 		if (WARN_ON(uuid_le_to_bin(id->guid_string, &driver_guid)))
++ 			continue;
++ 		if (!memcmp(&driver_guid, wblock->gblock.guid, 16))
++ 			return 1;
++ 
++ 		id++;
++ 	}
++ 
++ 	return 0;
++ }
++ static int wmi_char_open(struct inode *inode, struct file *filp)
++ {
++ 	const char *driver_name = filp->f_path.dentry->d_iname;
++ 	struct wmi_block *wblock = NULL;
++ 	struct wmi_block *next = NULL;
++ 
++ 	list_for_each_entry_safe(wblock, next, &wmi_block_list, list) {
++ 		if (!wblock->dev.dev.driver)
++ 			continue;
++ 		if (strcmp(driver_name, wblock->dev.dev.driver->name) == 0) {
++ 			filp->private_data = wblock;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!filp->private_data)
++ 		return -ENODEV;
++ 
++ 	return nonseekable_open(inode, filp);
++ }
++ 
++ static ssize_t wmi_char_read(struct file *filp, char __user *buffer,
++ 	size_t length, loff_t *offset)
++ {
++ 	struct wmi_block *wblock = filp->private_data;
++ 
++ 	return simple_read_from_buffer(buffer, length, offset,
++ 				       &wblock->req_buf_size,
++ 				       sizeof(wblock->req_buf_size));
++ }
++ 
++ static long wmi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++ {
++ 	struct wmi_ioctl_buffer __user *input =
++ 		(struct wmi_ioctl_buffer __user *) arg;
++ 	struct wmi_block *wblock = filp->private_data;
++ 	struct wmi_ioctl_buffer *buf = NULL;
++ 	struct wmi_driver *wdriver = NULL;
++ 	int ret;
++ 
++ 	if (_IOC_TYPE(cmd) != WMI_IOC)
++ 		return -ENOTTY;
++ 
++ 	/* make sure we're not calling a higher instance than exists*/
++ 	if (_IOC_NR(cmd) >= wblock->gblock.instance_count)
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&wblock->char_mutex);
++ 	buf = wblock->handler_data;
++ 	if (get_user(buf->length, &input->length)) {
++ 		dev_dbg(&wblock->dev.dev, "Read length from user failed\n");
++ 		ret = -EFAULT;
++ 		goto out_ioctl;
++ 	}
++ 	/* if it's too small, abort */
++ 	if (buf->length < wblock->req_buf_size) {
++ 		dev_err(&wblock->dev.dev,
++ 			"Buffer %lld too small, need at least %lld\n",
++ 			buf->length, wblock->req_buf_size);
++ 		ret = -EINVAL;
++ 		goto out_ioctl;
++ 	}
++ 	/* if it's too big, warn, driver will only use what is needed */
++ 	if (buf->length > wblock->req_buf_size)
++ 		dev_warn(&wblock->dev.dev,
++ 			"Buffer %lld is bigger than required %lld\n",
++ 			buf->length, wblock->req_buf_size);
++ 
++ 	/* copy the structure from userspace */
++ 	if (copy_from_user(buf, input, wblock->req_buf_size)) {
++ 		dev_dbg(&wblock->dev.dev, "Copy %llu from user failed\n",
++ 			wblock->req_buf_size);
++ 		ret = -EFAULT;
++ 		goto out_ioctl;
++ 	}
++ 
++ 	/* let the driver do any filtering and do the call */
++ 	wdriver = container_of(wblock->dev.dev.driver,
++ 			       struct wmi_driver, driver);
++ 	if (!try_module_get(wdriver->driver.owner))
++ 		return -EBUSY;
++ 	ret = wdriver->filter_callback(&wblock->dev, cmd, buf);
++ 	module_put(wdriver->driver.owner);
++ 	if (ret)
++ 		goto out_ioctl;
++ 
++ 	/* return the result (only up to our internal buffer size) */
++ 	if (copy_to_user(input, buf, wblock->req_buf_size)) {
++ 		dev_dbg(&wblock->dev.dev, "Copy %llu to user failed\n",
++ 			wblock->req_buf_size);
++ 		ret = -EFAULT;
++ 	}
++ 
++ out_ioctl:
++ 	mutex_unlock(&wblock->char_mutex);
++ 	return ret;
++ }
++ 
++ static const struct file_operations wmi_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.read		= wmi_char_read,
++ 	.open		= wmi_char_open,
++ 	.unlocked_ioctl	= wmi_ioctl,
++ 	.compat_ioctl	= wmi_ioctl,
++ };
++ 
++ static int wmi_dev_probe(struct device *dev)
++ {
++ 	struct wmi_block *wblock = dev_to_wblock(dev);
++ 	struct wmi_driver *wdriver =
++ 		container_of(dev->driver, struct wmi_driver, driver);
++ 	int ret = 0;
++ 	int count;
++ 	char *buf;
++ 
++ 	if (ACPI_FAILURE(wmi_method_enable(wblock, 1)))
++ 		dev_warn(dev, "failed to enable device -- probing anyway\n");
++ 
++ 	if (wdriver->probe) {
++ 		ret = wdriver->probe(dev_to_wdev(dev));
++ 		if (ret != 0)
++ 			goto probe_failure;
++ 	}
++ 
++ 	/* driver wants a character device made */
++ 	if (wdriver->filter_callback) {
++ 		/* check that required buffer size declared by driver or MOF */
++ 		if (!wblock->req_buf_size) {
++ 			dev_err(&wblock->dev.dev,
++ 				"Required buffer size not set\n");
++ 			ret = -EINVAL;
++ 			goto probe_failure;
++ 		}
++ 
++ 		count = get_order(wblock->req_buf_size);
++ 		wblock->handler_data = (void *)__get_free_pages(GFP_KERNEL,
++ 								count);
++ 		if (!wblock->handler_data) {
++ 			ret = -ENOMEM;
++ 			goto probe_failure;
++ 		}
++ 
++ 		buf = kmalloc(strlen(wdriver->driver.name) + 4, GFP_KERNEL);
++ 		if (!buf) {
++ 			ret = -ENOMEM;
++ 			goto probe_string_failure;
++ 		}
++ 		sprintf(buf, "wmi/%s", wdriver->driver.name);
++ 		wblock->char_dev.minor = MISC_DYNAMIC_MINOR;
++ 		wblock->char_dev.name = buf;
++ 		wblock->char_dev.fops = &wmi_fops;
++ 		wblock->char_dev.mode = 0444;
++ 		ret = misc_register(&wblock->char_dev);
++ 		if (ret) {
++ 			dev_warn(dev, "failed to register char dev: %d", ret);
++ 			ret = -ENOMEM;
++ 			goto probe_misc_failure;
++ 		}
++ 	}
++ 
++ 	return 0;
++ 
++ probe_misc_failure:
++ 	kfree(buf);
++ probe_string_failure:
++ 	kfree(wblock->handler_data);
++ probe_failure:
++ 	if (ACPI_FAILURE(wmi_method_enable(wblock, 0)))
++ 		dev_warn(dev, "failed to disable device\n");
++ 	return ret;
++ }
++ 
++ static int wmi_dev_remove(struct device *dev)
++ {
++ 	struct wmi_block *wblock = dev_to_wblock(dev);
++ 	struct wmi_driver *wdriver =
++ 		container_of(dev->driver, struct wmi_driver, driver);
++ 	int ret = 0;
++ 
++ 	if (wdriver->filter_callback) {
++ 		misc_deregister(&wblock->char_dev);
++ 		kfree(wblock->char_dev.name);
++ 		free_pages((unsigned long)wblock->handler_data,
++ 			   get_order(wblock->req_buf_size));
++ 	}
++ 
++ 	if (wdriver->remove)
++ 		ret = wdriver->remove(dev_to_wdev(dev));
++ 
++ 	if (ACPI_FAILURE(wmi_method_enable(wblock, 0)))
++ 		dev_warn(dev, "failed to disable device\n");
++ 
++ 	return ret;
++ }
++ 
++ static struct class wmi_bus_class = {
++ 	.name = "wmi_bus",
++ };
++ 
++ static struct bus_type wmi_bus_type = {
+++>>>>>>> 44b6b7661132 (platform/x86: wmi: create userspace interface for drivers)
+  	.name = "wmi",
+ +	.dev_release = wmi_dev_free,
+ +	.dev_uevent = wmi_dev_uevent,
+  	.dev_groups = wmi_groups,
+ -	.match = wmi_dev_match,
+ -	.uevent = wmi_dev_uevent,
+ -	.probe = wmi_dev_probe,
+ -	.remove = wmi_dev_remove,
+ -};
+ -
+ -static struct device_type wmi_type_event = {
+ -	.name = "event",
+ -	.groups = wmi_event_groups,
+ -	.release = wmi_dev_release,
+ -};
+ -
+ -static struct device_type wmi_type_method = {
+ -	.name = "method",
+ -	.groups = wmi_method_groups,
+ -	.release = wmi_dev_release,
+ -};
+ -
+ -static struct device_type wmi_type_data = {
+ -	.name = "data",
+ -	.groups = wmi_data_groups,
+ -	.release = wmi_dev_release,
+  };
+  
+ -static int wmi_create_device(struct device *wmi_bus_dev,
+ -			     const struct guid_block *gblock,
+ +static int wmi_create_device(const struct guid_block *gblock,
+  			     struct wmi_block *wblock,
+  			     struct acpi_device *device)
+  {
+ -	struct acpi_device_info *info;
+ -	char method[5];
+ -	int result;
+ +	wblock->dev.class = &wmi_class;
+  
+ -	if (gblock->flags & ACPI_WMI_EVENT) {
+ -		wblock->dev.dev.type = &wmi_type_event;
+ -		goto out_init;
+ -	}
+ +	dev_set_name(&wblock->dev, "%pUL", gblock->guid);
+  
+++<<<<<<< HEAD
+ +	dev_set_drvdata(&wblock->dev, wblock);
+++=======
++ 	if (gblock->flags & ACPI_WMI_METHOD) {
++ 		wblock->dev.dev.type = &wmi_type_method;
++ 		mutex_init(&wblock->char_mutex);
++ 		goto out_init;
++ 	}
+++>>>>>>> 44b6b7661132 (platform/x86: wmi: create userspace interface for drivers)
+  
+ -	/*
+ -	 * Data Block Query Control Method (WQxx by convention) is
+ -	 * required per the WMI documentation. If it is not present,
+ -	 * we ignore this data block.
+ -	 */
+ -	strcpy(method, "WQ");
+ -	strncat(method, wblock->gblock.object_id, 2);
+ -	result = get_subobj_info(device->handle, method, &info);
+ -
+ -	if (result) {
+ -		dev_warn(wmi_bus_dev,
+ -			 "%s data block query control method not found",
+ -			 method);
+ -		return result;
+ -	}
+ -
+ -	wblock->dev.dev.type = &wmi_type_data;
+ -
+ -	/*
+ -	 * The Microsoft documentation specifically states:
+ -	 *
+ -	 *   Data blocks registered with only a single instance
+ -	 *   can ignore the parameter.
+ -	 *
+ -	 * ACPICA will get mad at us if we call the method with the wrong number
+ -	 * of arguments, so check what our method expects.  (On some Dell
+ -	 * laptops, WQxx may not be a method at all.)
+ -	 */
+ -	if (info->type != ACPI_TYPE_METHOD || info->param_count == 0)
+ -		wblock->read_takes_no_args = true;
+ -
+ -	kfree(info);
+ -
+ -	strcpy(method, "WS");
+ -	strncat(method, wblock->gblock.object_id, 2);
+ -	result = get_subobj_info(device->handle, method, NULL);
+ -
+ -	if (result == 0)
+ -		wblock->dev.setable = true;
+ -
+ - out_init:
+ -	wblock->dev.dev.bus = &wmi_bus_type;
+ -	wblock->dev.dev.parent = wmi_bus_dev;
+ -
+ -	dev_set_name(&wblock->dev.dev, "%pUL", gblock->guid);
+ -
+ -	device_initialize(&wblock->dev.dev);
+ -
+ -	return 0;
+ +	return device_register(&wblock->dev);
+  }
+  
+  static void wmi_free_devices(struct acpi_device *device)
+* Unmerged path include/linux/wmi.h
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 28d01d76d545..e9627012fd0a 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -273,6 +273,7 @@ ACPI WMI DRIVER
+ L:	platform-driver-x86@vger.kernel.org
+ S:	Orphan
+ F:	drivers/platform/x86/wmi.c
++F:	include/uapi/linux/wmi.h
+ 
+ AD1889 ALSA SOUND DRIVER
+ M:	Thibaut Varene <T-Bone@parisc-linux.org>
+* Unmerged path drivers/platform/x86/wmi.c
+* Unmerged path include/linux/wmi.h
+diff --git a/include/uapi/linux/wmi.h b/include/uapi/linux/wmi.h
+new file mode 100644
+index 000000000000..7e52350ac9b3
+--- /dev/null
++++ b/include/uapi/linux/wmi.h
+@@ -0,0 +1,26 @@
++/*
++ *  User API methods for ACPI-WMI mapping driver
++ *
++ *  Copyright (C) 2017 Dell, Inc.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2 as
++ *  published by the Free Software Foundation.
++ */
++#ifndef _UAPI_LINUX_WMI_H
++#define _UAPI_LINUX_WMI_H
++
++#include <linux/types.h>
++
++/* WMI bus will filter all WMI vendor driver requests through this IOC */
++#define WMI_IOC 'W'
++
++/* All ioctl requests through WMI should declare their size followed by
++ * relevant data objects
++ */
++struct wmi_ioctl_buffer {
++	__u64	length;
++	__u8	data[];
++};
++
++#endif
