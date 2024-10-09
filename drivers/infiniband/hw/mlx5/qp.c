@@ -1440,6 +1440,7 @@ create_tir:
 	kvfree(in);
 	/* qpn is reserved for that QP */
 	qp->trans_qp.base.mqp.qpn = 0;
+	qp->flags |= MLX5_IB_QP_RSS;
 	return 0;
 
 err:
