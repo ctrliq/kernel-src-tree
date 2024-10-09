@@ -1,0 +1,163 @@
+dax: use sb_issue_zerout instead of calling dax_clear_sectors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Matthew Wilcox <matthew.r.wilcox@intel.com>
+commit 3dc29161070ab14d065554c0ad58988ab77a7bfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3dc29161.failed
+
+dax_clear_sectors() cannot handle poisoned blocks.  These must be
+zeroed using the BIO interface instead.  Convert ext2 and XFS to use
+only sb_issue_zerout().
+
+	Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+[vishal: Also remove the dax_clear_sectors function entirely]
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+(cherry picked from commit 3dc29161070ab14d065554c0ad58988ab77a7bfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/ext2/inode.c
+#	include/linux/dax.h
+diff --cc fs/dax.c
+index 2dc57eba7712,0abbbb62981e..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -79,49 -87,6 +79,52 @@@ struct page *read_dax_sector(struct blo
+  	return page;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * dax_clear_sectors() is called from within transaction context from XFS,
+ + * and hence this means the stack from this point must follow GFP_NOFS
+ + * semantics for all operations.
+ + */
+ +int dax_clear_sectors(struct block_device *bdev, sector_t _sector, long _size)
+ +{
+ +	struct blk_dax_ctl dax = {
+ +		.sector = _sector,
+ +		.size = _size,
+ +	};
+ +
+ +	might_sleep();
+ +	do {
+ +		long count, sz;
+ +
+ +		count = dax_map_atomic(bdev, &dax);
+ +		if (count < 0)
+ +			return count;
+ +		sz = min_t(long, count, SZ_128K);
+ +		clear_pmem(dax.addr, sz);
+ +		dax.size -= sz;
+ +		dax.sector += sz / 512;
+ +		dax_unmap_atomic(bdev, &dax);
+ +		cond_resched();
+ +	} while (dax.size);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(dax_clear_sectors);
+ +
+ +/* the clear_pmem() calls are ordered by a wmb_pmem() in the caller */
+ +static void dax_new_buf(void *addr, unsigned size, unsigned first,
+ +		loff_t pos, loff_t end)
+ +{
+ +	loff_t final = end - pos + first; /* The final byte of the buffer */
+ +
+ +	if (first > 0)
+ +		clear_pmem(addr, first);
+ +	if (final < size)
+ +		clear_pmem(addr + final, size - final);
+ +}
+ +
+++=======
+++>>>>>>> 3dc29161070a (dax: use sb_issue_zerout instead of calling dax_clear_sectors)
+  static bool buffer_written(struct buffer_head *bh)
+  {
+  	return buffer_mapped(bh) && !buffer_unwritten(bh);
+diff --cc fs/ext2/inode.c
+index 35e32b3fcad6,17cbd6b696f2..000000000000
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@@ -735,10 -738,9 +736,16 @@@ static int ext2_get_blocks(struct inod
+  		 * so that it's not found by another thread before it's
+  		 * initialised
+  		 */
+++<<<<<<< HEAD
+ +		err = dax_clear_sectors(inode->i_sb->s_bdev,
+ +				le32_to_cpu(chain[depth-1].key) <<
+ +				(inode->i_blkbits - 9),
+ +				1 << inode->i_blkbits);
+++=======
++ 		err = sb_issue_zeroout(inode->i_sb,
++ 				le32_to_cpu(chain[depth-1].key), count,
++ 				GFP_NOFS);
+++>>>>>>> 3dc29161070a (dax: use sb_issue_zerout instead of calling dax_clear_sectors)
+  		if (err) {
+  			mutex_unlock(&ei->truncate_mutex);
+  			goto cleanup;
+diff --cc include/linux/dax.h
+index bbe07d8b9dee,7f853ffaa987..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -5,16 -5,12 +5,21 @@@
+  #include <linux/mm.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_clear_sectors(struct block_device *bdev, sector_t _sector, long _size);
+++=======
++ ssize_t dax_do_io(struct kiocb *, struct inode *, struct iov_iter *, loff_t,
++ 		  get_block_t, dio_iodone_t, int flags);
+++>>>>>>> 3dc29161070a (dax: use sb_issue_zerout instead of calling dax_clear_sectors)
+  int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+  int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ -int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+ -int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+ +int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+  
+  #ifdef CONFIG_FS_DAX
+  struct page *read_dax_sector(struct block_device *bdev, sector_t n);
+* Unmerged path fs/dax.c
+* Unmerged path fs/ext2/inode.c
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 935fc7ad67c0..d12b33b07f99 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -72,18 +72,11 @@ xfs_zero_extent(
+ 	struct xfs_mount *mp = ip->i_mount;
+ 	xfs_daddr_t	sector = xfs_fsb_to_db(ip, start_fsb);
+ 	sector_t	block = XFS_BB_TO_FSBT(mp, sector);
+-	ssize_t		size = XFS_FSB_TO_B(mp, count_fsb);
+-
+-	if (IS_DAX(VFS_I(ip)))
+-		return dax_clear_sectors(xfs_find_bdev_for_inode(VFS_I(ip)),
+-				sector, size);
+-
+-	/*
+-	 * let the block layer decide on the fastest method of
+-	 * implementing the zeroing.
+-	 */
+-	return sb_issue_zeroout(mp->m_super, block, count_fsb, GFP_NOFS);
+ 
++	return blkdev_issue_zeroout(xfs_find_bdev_for_inode(VFS_I(ip)),
++		block << (mp->m_super->s_blocksize_bits - 9),
++		count_fsb << (mp->m_super->s_blocksize_bits - 9),
++		GFP_NOFS, true);
+ }
+ 
+ /*
+* Unmerged path include/linux/dax.h
