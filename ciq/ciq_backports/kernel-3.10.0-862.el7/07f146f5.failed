@@ -1,0 +1,119 @@
+x86/mm/pkeys: Optimize fault handling in access_error()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm/pkeys: Optimize fault handling in access_error() (Rui Wang) [1272615]
+Rebuild_FUZZ: 96.23%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 07f146f53e8de826e4afa3a88ea65bdb13c24959
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/07f146f5.failed
+
+We might not strictly have to make modifictions to
+access_error() to check the VMA here.
+
+If we do not, we will do this:
+
+ 1. app sets VMA pkey to K
+ 2. app touches a !present page
+ 3. do_page_fault(), allocates and maps page, sets pte.pkey=K
+ 4. return to userspace
+ 5. touch instruction reexecutes, but triggers PF_PK
+ 6. do PKEY signal
+
+What happens with this patch applied:
+
+ 1. app sets VMA pkey to K
+ 2. app touches a !present page
+ 3. do_page_fault() notices that K is inaccessible
+ 4. do PKEY signal
+
+We basically skip the fault that does an allocation.
+
+So what this lets us do is protect areas from even being
+*populated* unless it is accessible according to protection
+keys.  That seems handy to me and makes protection keys work
+more like an mprotect()'d mapping.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/20160212210222.EBB63D8C@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 07f146f53e8de826e4afa3a88ea65bdb13c24959)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/fault.c
+diff --cc arch/x86/mm/fault.c
+index 1977abf5754c,68ecdffe284e..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -809,7 -894,23 +809,27 @@@ __bad_area(struct pt_regs *regs, unsign
+  static noinline void
+  bad_area(struct pt_regs *regs, unsigned long error_code, unsigned long address)
+  {
+++<<<<<<< HEAD
+ +	__bad_area(regs, error_code, address, SEGV_MAPERR);
+++=======
++ 	__bad_area(regs, error_code, address, NULL, SEGV_MAPERR);
++ }
++ 
++ static inline bool bad_area_access_from_pkeys(unsigned long error_code,
++ 		struct vm_area_struct *vma)
++ {
++ 	/* This code is always called on the current mm */
++ 	bool foreign = false;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++ 		return false;
++ 	if (error_code & PF_PK)
++ 		return true;
++ 	/* this checks permission keys on the VMA: */
++ 	if (!arch_vma_access_permitted(vma, (error_code & PF_WRITE), foreign))
++ 		return true;
++ 	return false;
+++>>>>>>> 07f146f53e8d (x86/mm/pkeys: Optimize fault handling in access_error())
+  }
+  
+  static noinline void
+@@@ -966,6 -1097,24 +986,27 @@@ int show_unhandled_signals = 1
+  static inline int
+  access_error(unsigned long error_code, struct vm_area_struct *vma)
+  {
+++<<<<<<< HEAD
+++=======
++ 	/* This is only called for the current mm, so: */
++ 	bool foreign = false;
++ 	/*
++ 	 * Access or read was blocked by protection keys. We do
++ 	 * this check before any others because we do not want
++ 	 * to, for instance, confuse a protection-key-denied
++ 	 * write with one for which we should do a COW.
++ 	 */
++ 	if (error_code & PF_PK)
++ 		return 1;
++ 	/*
++ 	 * Make sure to check the VMA so that we do not perform
++ 	 * faults just to hit a PF_PK as soon as we fill in a
++ 	 * page.
++ 	 */
++ 	if (!arch_vma_access_permitted(vma, (error_code & PF_WRITE), foreign))
++ 		return 1;
++ 
+++>>>>>>> 07f146f53e8d (x86/mm/pkeys: Optimize fault handling in access_error())
+  	if (error_code & PF_WRITE) {
+  		/* write, present and write, not present: */
+  		if (unlikely(!(vma->vm_flags & VM_WRITE)))
+* Unmerged path arch/x86/mm/fault.c
