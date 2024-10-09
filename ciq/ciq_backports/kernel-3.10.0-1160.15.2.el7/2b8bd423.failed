@@ -1,0 +1,947 @@
+block/diskstats: more accurate approximation of io_ticks for slow disks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.15.2.el7
+commit-author Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+commit 2b8bd423614c595540eaadcfbc702afe8e155e50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.15.2.el7/2b8bd423.failed
+
+Currently io_ticks is approximated by adding one at each start and end of
+requests if jiffies counter has changed. This works perfectly for requests
+shorter than a jiffy or if one of requests starts/ends at each jiffy.
+
+If disk executes just one request at a time and they are longer than two
+jiffies then only first and last jiffies will be accounted.
+
+Fix is simple: at the end of request add up into io_ticks jiffies passed
+since last update rather than just one jiffy.
+
+Example: common HDD executes random read 4k requests around 12ms.
+
+fio --name=test --filename=/dev/sdb --rw=randread --direct=1 --runtime=30 &
+iostat -x 10 sdb
+
+Note changes of iostat's "%util" 8,43% -> 99,99% before/after patch:
+
+Before:
+
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sdb               0,00     0,00   82,60    0,00   330,40     0,00     8,00     0,96   12,09   12,09    0,00   1,02   8,43
+
+After:
+
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sdb               0,00     0,00   82,50    0,00   330,00     0,00     8,00     1,00   12,10   12,10    0,00  12,12  99,99
+
+Now io_ticks does not loose time between start and end of requests, but
+for queue-depth > 1 some I/O time between adjacent starts might be lost.
+
+For load estimation "%util" is not as useful as average queue length,
+but it clearly shows how often disk queue is completely empty.
+
+Fixes: 5b18b5a73760 ("block: delete part_round_stats and switch to less precise counting")
+	Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2b8bd423614c595540eaadcfbc702afe8e155e50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/iostats.txt
+#	block/bio.c
+#	block/blk-core.c
+#	include/linux/genhd.h
+diff --cc Documentation/iostats.txt
+index 65f694f2d1c9,9b14b0c2c9c4..000000000000
+--- a/Documentation/iostats.txt
++++ b/Documentation/iostats.txt
+@@@ -64,26 -70,39 +64,35 @@@ Field  2 -- # of reads merged, field 6 
+      efficiency.  Thus two 4K reads may become one 8K read before it is
+      ultimately handed to the disk, and so it will be counted (and queued)
+      as only one I/O.  This field lets you know how often this was done.
+ -
+ -Field  3 -- # of sectors read (unsigned long)
+ +Field  3 -- # of sectors read
+      This is the total number of sectors read successfully.
+ -
+ -Field  4 -- # of milliseconds spent reading (unsigned int)
+ +Field  4 -- # of milliseconds spent reading
+      This is the total number of milliseconds spent by all reads (as
+      measured from __make_request() to end_that_request_last()).
+ -
+ -Field  5 -- # of writes completed (unsigned long)
+ +Field  5 -- # of writes completed
+      This is the total number of writes completed successfully.
+ -
+ -Field  6 -- # of writes merged  (unsigned long)
+ +Field  6 -- # of writes merged
+      See the description of field 2.
+ -
+ -Field  7 -- # of sectors written (unsigned long)
+ +Field  7 -- # of sectors written
+      This is the total number of sectors written successfully.
+ -
+ -Field  8 -- # of milliseconds spent writing (unsigned int)
+ +Field  8 -- # of milliseconds spent writing
+      This is the total number of milliseconds spent by all writes (as
+      measured from __make_request() to end_that_request_last()).
+ -
+ -Field  9 -- # of I/Os currently in progress (unsigned int)
+ +Field  9 -- # of I/Os currently in progress
+      The only field that should go to zero. Incremented as requests are
+      given to appropriate struct request_queue and decremented as they finish.
+ -
+ -Field 10 -- # of milliseconds spent doing I/Os (unsigned int)
+ +Field 10 -- # of milliseconds spent doing I/Os
+      This field increases so long as field 9 is nonzero.
+++<<<<<<< HEAD:Documentation/iostats.txt
+ +Field 11 -- weighted # of milliseconds spent doing I/Os
+++=======
++ 
++     Since 5.0 this field counts jiffies when at least one request was
++     started or completed. If request runs more than 2 jiffies then some
++     I/O time might be not accounted in case of concurrent requests.
++ 
++ Field 11 -- weighted # of milliseconds spent doing I/Os (unsigned int)
+++>>>>>>> 2b8bd423614c (block/diskstats: more accurate approximation of io_ticks for slow disks):Documentation/admin-guide/iostats.rst
+      This field is incremented at each I/O start, I/O completion, I/O
+      merge, or read of these stats by the number of I/Os in progress
+      (field 9) times the number of milliseconds spent doing I/O since the
+diff --cc block/blk-core.c
+index 036f097abd39,4401b30a1751..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2531,19 -1329,19 +2531,27 @@@ void blk_account_io_done(struct reques
+  	 * normal IO on queueing nor completion.  Accounting the
+  	 * containing request is enough.
+  	 */
+ -	if (req->part && blk_do_io_stat(req) &&
+ -	    !(req->rq_flags & RQF_FLUSH_SEQ)) {
+ -		const int sgrp = op_stat_group(req_op(req));
+ +	if (blk_do_io_stat(req) && !(req->cmd_flags & REQ_FLUSH_SEQ)) {
+ +		unsigned long duration = jiffies - req->start_time;
+ +		const int rw = rq_data_dir(req);
+  		struct hd_struct *part;
+ +		int cpu;
+  
+ -		part_stat_lock();
+ +		cpu = part_stat_lock();
+  		part = req->part;
+  
+++<<<<<<< HEAD
+ +		part_stat_inc(cpu, part, ios[rw]);
+ +		part_stat_add(cpu, part, ticks[rw], duration);
+ +		part_round_stats(req->q, cpu, part);
+ +		part_dec_in_flight(req->q, part, rw);
+++=======
++ 		update_io_ticks(part, jiffies, true);
++ 		part_stat_inc(part, ios[sgrp]);
++ 		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
++ 		part_stat_add(part, time_in_queue, nsecs_to_jiffies64(now - req->start_time_ns));
++ 		part_dec_in_flight(req->q, part, rq_data_dir(req));
+++>>>>>>> 2b8bd423614c (block/diskstats: more accurate approximation of io_ticks for slow disks)
+  
+  		hd_struct_put(part);
+  		part_stat_unlock();
+@@@ -2605,642 -1379,141 +2613,647 @@@ void blk_account_io_start(struct reques
+  		rq->part = part;
+  	}
+  
+ -	update_io_ticks(part, jiffies, false);
+++<<<<<<< HEAD
+++=======
+++	update_io_ticks(part, jiffies, false);
+++
+++>>>>>>> 2b8bd423614c (block/diskstats: more accurate approximation of io_ticks for slow disks)
+ +	part_stat_unlock();
+ +}
+ +
+ +/**
+ + * blk_peek_request - peek at the top of a request queue
+ + * @q: request queue to peek at
+ + *
+ + * Description:
+ + *     Return the request at the top of @q.  The returned request
+ + *     should be started using blk_start_request() before LLD starts
+ + *     processing it.
+ + *
+ + * Return:
+ + *     Pointer to the request at the top of @q if available.  Null
+ + *     otherwise.
+ + *
+ + * Context:
+ + *     queue_lock must be held.
+ + */
+ +struct request *blk_peek_request(struct request_queue *q)
+ +{
+ +	struct request *rq;
+ +	int ret;
+ +
+ +	while ((rq = __elv_next_request(q)) != NULL) {
+ +
+ +		rq = blk_pm_peek_request(q, rq);
+ +		if (!rq)
+ +			break;
+ +
+ +		if (!(rq->cmd_flags & REQ_STARTED)) {
+ +			/*
+ +			 * This is the first time the device driver
+ +			 * sees this request (possibly after
+ +			 * requeueing).  Notify IO scheduler.
+ +			 */
+ +			if (rq->cmd_flags & REQ_SORTED)
+ +				elv_activate_rq(q, rq);
+ +
+ +			/*
+ +			 * just mark as started even if we don't start
+ +			 * it, a request that has been delayed should
+ +			 * not be passed by new incoming requests
+ +			 */
+ +			rq->cmd_flags |= REQ_STARTED;
+ +			trace_block_rq_issue(q, rq);
+ +		}
+ +
+ +		if (!q->boundary_rq || q->boundary_rq == rq) {
+ +			q->end_sector = rq_end_sector(rq);
+ +			q->boundary_rq = NULL;
+ +		}
+ +
+ +		if (rq->cmd_flags & REQ_DONTPREP)
+ +			break;
+ +
+ +		if (q->dma_drain_size && blk_rq_bytes(rq)) {
+ +			/*
+ +			 * make sure space for the drain appears we
+ +			 * know we can do this because max_hw_segments
+ +			 * has been adjusted to be one fewer than the
+ +			 * device can handle
+ +			 */
+ +			rq->nr_phys_segments++;
+ +		}
+ +
+ +		if (!q->prep_rq_fn)
+ +			break;
+ +
+ +		ret = q->prep_rq_fn(q, rq);
+ +		if (ret == BLKPREP_OK) {
+ +			break;
+ +		} else if (ret == BLKPREP_DEFER) {
+ +			/*
+ +			 * the request may have been (partially) prepped.
+ +			 * we need to keep this request in the front to
+ +			 * avoid resource deadlock.  REQ_STARTED will
+ +			 * prevent other fs requests from passing this one.
+ +			 */
+ +			if (q->dma_drain_size && blk_rq_bytes(rq) &&
+ +			    !(rq->cmd_flags & REQ_DONTPREP)) {
+ +				/*
+ +				 * remove the space for the drain we added
+ +				 * so that we don't add it again
+ +				 */
+ +				--rq->nr_phys_segments;
+ +			}
+ +
+ +			rq = NULL;
+ +			break;
+ +		} else if (ret == BLKPREP_KILL) {
+ +			rq->cmd_flags |= REQ_QUIET;
+ +			/*
+ +			 * Mark this request as started so we don't trigger
+ +			 * any debug logic in the end I/O path.
+ +			 */
+ +			blk_start_request(rq);
+ +			__blk_end_request_all(rq, -EIO);
+ +		} else {
+ +			printk(KERN_ERR "%s: bad return=%d\n", __func__, ret);
+ +			break;
+ +		}
+ +	}
+ +
+ +	return rq;
+ +}
+ +EXPORT_SYMBOL(blk_peek_request);
+ +
+ +void blk_dequeue_request(struct request *rq)
+ +{
+ +	struct request_queue *q = rq->q;
+ +
+ +	BUG_ON(list_empty(&rq->queuelist));
+ +	BUG_ON(ELV_ON_HASH(rq));
+ +
+ +	list_del_init(&rq->queuelist);
+ +
+ +	/*
+ +	 * the time frame between a request being removed from the lists
+ +	 * and to it is freed is accounted as io that is in progress at
+ +	 * the driver side.
+ +	 */
+ +	if (blk_account_rq(rq)) {
+ +		q->in_flight[rq_is_sync(rq)]++;
+ +		set_io_start_time_ns(rq);
+ +	}
+ +}
+ +
+ +/**
+ + * blk_start_request - start request processing on the driver
+ + * @req: request to dequeue
+ + *
+ + * Description:
+ + *     Dequeue @req and start timeout timer on it.  This hands off the
+ + *     request to the driver.
+ + *
+ + *     Block internal functions which don't want to start timer should
+ + *     call blk_dequeue_request().
+ + *
+ + * Context:
+ + *     queue_lock must be held.
+ + */
+ +void blk_start_request(struct request *req)
+ +{
+ +	blk_dequeue_request(req);
+ +
+ +	/* blk-stat isn't used on non-mq now, so disable it until it is needed */
+ +#if 0
+ +	if (test_bit(QUEUE_FLAG_STATS, &req->q->queue_flags)) {
+ +		blk_stat_set_issue_time(&req->issue_stat);
+ +		req->cmd_flags |= REQ_STATS;
+ +	}
+ +#endif
+ +
+ +	/*
+ +	 * We are now handing the request to the hardware, initialize
+ +	 * resid_len to full count and add the timeout handler.
+ +	 */
+ +	req->resid_len = blk_rq_bytes(req);
+ +	if (unlikely(blk_bidi_rq(req)))
+ +		req->next_rq->resid_len = blk_rq_bytes(req->next_rq);
+ +
+ +	BUG_ON(test_bit(REQ_ATOM_COMPLETE, &req->atomic_flags));
+ +	blk_add_timer(req);
+ +}
+ +EXPORT_SYMBOL(blk_start_request);
+ +
+ +/**
+ + * blk_fetch_request - fetch a request from a request queue
+ + * @q: request queue to fetch a request from
+ + *
+ + * Description:
+ + *     Return the request at the top of @q.  The request is started on
+ + *     return and LLD can start processing it immediately.
+ + *
+ + * Return:
+ + *     Pointer to the request at the top of @q if available.  Null
+ + *     otherwise.
+ + *
+ + * Context:
+ + *     queue_lock must be held.
+ + */
+ +struct request *blk_fetch_request(struct request_queue *q)
+ +{
+ +	struct request *rq;
+ +
+ +	rq = blk_peek_request(q);
+ +	if (rq)
+ +		blk_start_request(rq);
+ +	return rq;
+ +}
+ +EXPORT_SYMBOL(blk_fetch_request);
+ +
+ +/**
+ + * blk_update_request - Special helper function for request stacking drivers
+ + * @req:      the request being processed
+ + * @error:    %0 for success, < %0 for error
+ + * @nr_bytes: number of bytes to complete @req
+ + *
+ + * Description:
+ + *     Ends I/O on a number of bytes attached to @req, but doesn't complete
+ + *     the request structure even if @req doesn't have leftover.
+ + *     If @req has leftover, sets it up for the next range of segments.
+ + *
+ + *     This special helper function is only for request stacking drivers
+ + *     (e.g. request-based dm) so that they can handle partial completion.
+ + *     Actual device drivers should use blk_end_request instead.
+ + *
+ + *     Passing the result of blk_rq_bytes() as @nr_bytes guarantees
+ + *     %false return from this function.
+ + *
+ + * Return:
+ + *     %false - this request doesn't have any more data
+ + *     %true  - this request has more data
+ + **/
+ +bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
+ +{
+ +	int total_bytes;
+ +
+ +	trace_block_rq_complete(req->q, req, nr_bytes);
+ +
+ +	if (!req->bio)
+ +		return false;
+ +
+ +	/*
+ +	 * For fs requests, rq is just carrier of independent bio's
+ +	 * and each partial completion should be handled separately.
+ +	 * Reset per-request error on each partial completion.
+ +	 *
+ +	 * TODO: tj: This is too subtle.  It would be better to let
+ +	 * low level drivers do what they see fit.
+ +	 */
+ +	if (req->cmd_type == REQ_TYPE_FS)
+ +		req->errors = 0;
+ +
+ +	if (error && req->cmd_type == REQ_TYPE_FS &&
+ +	    !(req->cmd_flags & REQ_QUIET)) {
+ +		char *error_type;
+ +
+ +		switch (error) {
+ +		case -ENOLINK:
+ +			error_type = "recoverable transport";
+ +			break;
+ +		case -EREMOTEIO:
+ +			error_type = "critical target";
+ +			break;
+ +		case -EBADE:
+ +			error_type = "critical nexus";
+ +			break;
+ +		case -ENOSPC:
+ +			error_type = "critical space allocation";
+ +			break;
+ +		case -ENODATA:
+ +			error_type = "critical medium";
+ +			break;
+ +		case -EIO:
+ +		default:
+ +			error_type = "I/O";
+ +			break;
+ +		}
+ +		printk_ratelimited(KERN_ERR "%s: %s error, dev %s, sector %llu\n",
+ +				   __func__, error_type, req->rq_disk ?
+ +				   req->rq_disk->disk_name : "?",
+ +				   (unsigned long long)blk_rq_pos(req));
+ +
+ +	}
+ +
+ +	blk_account_io_completion(req, nr_bytes);
+ +
+ +	total_bytes = 0;
+ +	while (req->bio) {
+ +		struct bio *bio = req->bio;
+ +		unsigned bio_bytes = min(bio->bi_size, nr_bytes);
+ +
+ +		if (bio_bytes == bio->bi_size)
+ +			req->bio = bio->bi_next;
+ +
+ +		/* Completion has already been traced */
+ +		clear_bit(BIO_TRACE_COMPLETION, &bio->bi_flags);
+ +		req_bio_endio(req, bio, bio_bytes, error);
+ +
+ +		total_bytes += bio_bytes;
+ +		nr_bytes -= bio_bytes;
+ +
+ +		if (!nr_bytes)
+ +			break;
+ +	}
+ +
+ +	/*
+ +	 * completely done
+ +	 */
+ +	if (!req->bio) {
+ +		/*
+ +		 * Reset counters so that the request stacking driver
+ +		 * can find how many bytes remain in the request
+ +		 * later.
+ +		 */
+ +		req->__data_len = 0;
+ +		return false;
+ +	}
+ +
+ +	req->__data_len -= total_bytes;
+ +	req->buffer = bio_data(req->bio);
+ +
+ +	/* update sector only for requests with clear definition of sector */
+ +	if (req->cmd_type == REQ_TYPE_FS)
+ +		req->__sector += total_bytes >> 9;
+ +
+ +	/* mixed attributes always follow the first bio */
+ +	if (req->cmd_flags & REQ_MIXED_MERGE) {
+ +		req->cmd_flags &= ~REQ_FAILFAST_MASK;
+ +		req->cmd_flags |= req->bio->bi_rw & REQ_FAILFAST_MASK;
+ +	}
+ +
+ +	/*
+ +	 * If total number of sectors is less than the first segment
+ +	 * size, something has gone terribly wrong.
+ +	 */
+ +	if (blk_rq_bytes(req) < blk_rq_cur_bytes(req)) {
+ +		blk_dump_rq_flags(req, "request botched");
+ +		req->__data_len = blk_rq_cur_bytes(req);
+ +	}
+ +
+ +	/* recalculate the number of segments */
+ +	blk_recalc_rq_segments(req);
+ +
+ +	return true;
+ +}
+ +EXPORT_SYMBOL_GPL(blk_update_request);
+ +
+ +static bool blk_update_bidi_request(struct request *rq, int error,
+ +				    unsigned int nr_bytes,
+ +				    unsigned int bidi_bytes)
+ +{
+ +	if (blk_update_request(rq, error, nr_bytes))
+ +		return true;
+ +
+ +	/* Bidi request must be completed as a whole */
+ +	if (unlikely(blk_bidi_rq(rq)) &&
+ +	    blk_update_request(rq->next_rq, error, bidi_bytes))
+ +		return true;
+ +
+ +	if (blk_queue_add_random(rq->q))
+ +		add_disk_randomness(rq->rq_disk);
+ +
+ +	return false;
+ +}
+ +
+ +/**
+ + * blk_unprep_request - unprepare a request
+ + * @req:	the request
+ + *
+ + * This function makes a request ready for complete resubmission (or
+ + * completion).  It happens only after all error handling is complete,
+ + * so represents the appropriate moment to deallocate any resources
+ + * that were allocated to the request in the prep_rq_fn.  The queue
+ + * lock is held when calling this.
+ + */
+ +void blk_unprep_request(struct request *req)
+ +{
+ +	struct request_queue *q = req->q;
+ +
+ +	req->cmd_flags &= ~REQ_DONTPREP;
+ +	if (q->unprep_rq_fn)
+ +		q->unprep_rq_fn(q, req);
+ +}
+ +EXPORT_SYMBOL_GPL(blk_unprep_request);
+ +
+ +/*
+ + * queue lock must be held
+ + */
+ +void blk_finish_request(struct request *req, int error)
+ +{
+ +	struct request_queue *q = req->q;
+ +
+ +	if (req->cmd_flags & REQ_STATS)
+ +		blk_stat_add(req);
+ +
+ +	if (req->cmd_flags & REQ_QUEUED)
+ +		blk_queue_end_tag(q, req);
+ +
+ +	BUG_ON(blk_queued_rq(req));
+ +
+ +	if (unlikely(laptop_mode) && req->cmd_type == REQ_TYPE_FS)
+ +		laptop_io_completion(&req->q->backing_dev_info);
+ +
+ +	blk_delete_timer(req);
+ +
+ +	if (req->cmd_flags & REQ_DONTPREP)
+ +		blk_unprep_request(req);
+ +
+ +	blk_account_io_done(req);
+ +
+ +	if (req->end_io)
+ +		req->end_io(req, error);
+ +	else {
+ +		if (blk_bidi_rq(req))
+ +			__blk_put_request(req->next_rq->q, req->next_rq);
+  
+ -	part_stat_unlock();
+ +		__blk_put_request(q, req);
+ +	}
+  }
+ +EXPORT_SYMBOL(blk_finish_request);
+  
+ -/*
+ - * Steal bios from a request and add them to a bio list.
+ - * The request must not have been partially completed before.
+ - */
+ -void blk_steal_bios(struct bio_list *list, struct request *rq)
+ +/**
+ + * blk_end_bidi_request - Complete a bidi request
+ + * @rq:         the request to complete
+ + * @error:      %0 for success, < %0 for error
+ + * @nr_bytes:   number of bytes to complete @rq
+ + * @bidi_bytes: number of bytes to complete @rq->next_rq
+ + *
+ + * Description:
+ + *     Ends I/O on a number of bytes attached to @rq and @rq->next_rq.
+ + *     Drivers that supports bidi can safely call this member for any
+ + *     type of request, bidi or uni.  In the later case @bidi_bytes is
+ + *     just ignored.
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + **/
+ +static bool blk_end_bidi_request(struct request *rq, int error,
+ +				 unsigned int nr_bytes, unsigned int bidi_bytes)
+  {
+ -	if (rq->bio) {
+ -		if (list->tail)
+ -			list->tail->bi_next = rq->bio;
+ -		else
+ -			list->head = rq->bio;
+ -		list->tail = rq->biotail;
+ +	struct request_queue *q = rq->q;
+ +	unsigned long flags;
+  
+ -		rq->bio = NULL;
+ -		rq->biotail = NULL;
+ -	}
+ +	if (blk_update_bidi_request(rq, error, nr_bytes, bidi_bytes))
+ +		return true;
+  
+ -	rq->__data_len = 0;
+ +	spin_lock_irqsave(q->queue_lock, flags);
+ +	blk_finish_request(rq, error);
+ +	spin_unlock_irqrestore(q->queue_lock, flags);
+ +
+ +	return false;
+  }
+ -EXPORT_SYMBOL_GPL(blk_steal_bios);
+  
+  /**
+ - * blk_update_request - Special helper function for request stacking drivers
+ - * @req:      the request being processed
+ - * @error:    block status code
+ - * @nr_bytes: number of bytes to complete @req
+ + * __blk_end_bidi_request - Complete a bidi request with queue lock held
+ + * @rq:         the request to complete
+ + * @error:      %0 for success, < %0 for error
+ + * @nr_bytes:   number of bytes to complete @rq
+ + * @bidi_bytes: number of bytes to complete @rq->next_rq
+   *
+   * Description:
+ - *     Ends I/O on a number of bytes attached to @req, but doesn't complete
+ - *     the request structure even if @req doesn't have leftover.
+ - *     If @req has leftover, sets it up for the next range of segments.
+ - *
+ - *     This special helper function is only for request stacking drivers
+ - *     (e.g. request-based dm) so that they can handle partial completion.
+ - *     Actual device drivers should use blk_mq_end_request instead.
+ - *
+ - *     Passing the result of blk_rq_bytes() as @nr_bytes guarantees
+ - *     %false return from this function.
+ - *
+ - * Note:
+ - *	The RQF_SPECIAL_PAYLOAD flag is ignored on purpose in both
+ - *	blk_rq_bytes() and in blk_update_request().
+ + *     Identical to blk_end_bidi_request() except that queue lock is
+ + *     assumed to be locked on entry and remains so on return.
+   *
+   * Return:
+ - *     %false - this request doesn't have any more data
+ - *     %true  - this request has more data
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+   **/
+ -bool blk_update_request(struct request *req, blk_status_t error,
+ -		unsigned int nr_bytes)
+ +bool __blk_end_bidi_request(struct request *rq, int error,
+ +				   unsigned int nr_bytes, unsigned int bidi_bytes)
+  {
+ -	int total_bytes;
+ +	if (blk_update_bidi_request(rq, error, nr_bytes, bidi_bytes))
+ +		return true;
+  
+ -	trace_block_rq_complete(req, blk_status_to_errno(error), nr_bytes);
+ +	blk_finish_request(rq, error);
+  
+ -	if (!req->bio)
+ -		return false;
+ +	return false;
+ +}
+  
+ -#ifdef CONFIG_BLK_DEV_INTEGRITY
+ -	if (blk_integrity_rq(req) && req_op(req) == REQ_OP_READ &&
+ -	    error == BLK_STS_OK)
+ -		req->q->integrity.profile->complete_fn(req, nr_bytes);
+ -#endif
+ +/**
+ + * blk_end_request - Helper function for drivers to complete the request.
+ + * @rq:       the request being processed
+ + * @error:    %0 for success, < %0 for error
+ + * @nr_bytes: number of bytes to complete
+ + *
+ + * Description:
+ + *     Ends I/O on a number of bytes attached to @rq.
+ + *     If @rq has leftover, sets it up for the next range of segments.
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + **/
+ +bool blk_end_request(struct request *rq, int error, unsigned int nr_bytes)
+ +{
+ +	return blk_end_bidi_request(rq, error, nr_bytes, 0);
+ +}
+ +EXPORT_SYMBOL(blk_end_request);
+  
+ -	if (unlikely(error && !blk_rq_is_passthrough(req) &&
+ -		     !(req->rq_flags & RQF_QUIET)))
+ -		print_req_error(req, error, __func__);
+ +/**
+ + * blk_end_request_all - Helper function for drives to finish the request.
+ + * @rq: the request to finish
+ + * @error: %0 for success, < %0 for error
+ + *
+ + * Description:
+ + *     Completely finish @rq.
+ + */
+ +void blk_end_request_all(struct request *rq, int error)
+ +{
+ +	bool pending;
+ +	unsigned int bidi_bytes = 0;
+  
+ -	blk_account_io_completion(req, nr_bytes);
+ +	if (unlikely(blk_bidi_rq(rq)))
+ +		bidi_bytes = blk_rq_bytes(rq->next_rq);
+  
+ -	total_bytes = 0;
+ -	while (req->bio) {
+ -		struct bio *bio = req->bio;
+ -		unsigned bio_bytes = min(bio->bi_iter.bi_size, nr_bytes);
+ +	pending = blk_end_bidi_request(rq, error, blk_rq_bytes(rq), bidi_bytes);
+ +	BUG_ON(pending);
+ +}
+ +EXPORT_SYMBOL(blk_end_request_all);
+  
+ -		if (bio_bytes == bio->bi_iter.bi_size)
+ -			req->bio = bio->bi_next;
+ +/**
+ + * blk_end_request_cur - Helper function to finish the current request chunk.
+ + * @rq: the request to finish the current chunk for
+ + * @error: %0 for success, < %0 for error
+ + *
+ + * Description:
+ + *     Complete the current consecutively mapped chunk from @rq.
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + */
+ +bool blk_end_request_cur(struct request *rq, int error)
+ +{
+ +	return blk_end_request(rq, error, blk_rq_cur_bytes(rq));
+ +}
+ +EXPORT_SYMBOL(blk_end_request_cur);
+  
+ -		/* Completion has already been traced */
+ -		bio_clear_flag(bio, BIO_TRACE_COMPLETION);
+ -		req_bio_endio(req, bio, bio_bytes, error);
+ +/**
+ + * blk_end_request_err - Finish a request till the next failure boundary.
+ + * @rq: the request to finish till the next failure boundary for
+ + * @error: must be negative errno
+ + *
+ + * Description:
+ + *     Complete @rq till the next failure boundary.
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + */
+ +bool blk_end_request_err(struct request *rq, int error)
+ +{
+ +	WARN_ON(error >= 0);
+ +	return blk_end_request(rq, error, blk_rq_err_bytes(rq));
+ +}
+ +EXPORT_SYMBOL_GPL(blk_end_request_err);
+  
+ -		total_bytes += bio_bytes;
+ -		nr_bytes -= bio_bytes;
+ +/**
+ + * __blk_end_request - Helper function for drivers to complete the request.
+ + * @rq:       the request being processed
+ + * @error:    %0 for success, < %0 for error
+ + * @nr_bytes: number of bytes to complete
+ + *
+ + * Description:
+ + *     Must be called with queue lock held unlike blk_end_request().
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + **/
+ +bool __blk_end_request(struct request *rq, int error, unsigned int nr_bytes)
+ +{
+ +	return __blk_end_bidi_request(rq, error, nr_bytes, 0);
+ +}
+ +EXPORT_SYMBOL(__blk_end_request);
+  
+ -		if (!nr_bytes)
+ -			break;
+ -	}
+ +/**
+ + * __blk_end_request_all - Helper function for drives to finish the request.
+ + * @rq: the request to finish
+ + * @error: %0 for success, < %0 for error
+ + *
+ + * Description:
+ + *     Completely finish @rq.  Must be called with queue lock held.
+ + */
+ +void __blk_end_request_all(struct request *rq, int error)
+ +{
+ +	bool pending;
+ +	unsigned int bidi_bytes = 0;
+  
+ -	/*
+ -	 * completely done
+ -	 */
+ -	if (!req->bio) {
+ -		/*
+ -		 * Reset counters so that the request stacking driver
+ -		 * can find how many bytes remain in the request
+ -		 * later.
+ -		 */
+ -		req->__data_len = 0;
+ -		return false;
+ -	}
+ +	if (unlikely(blk_bidi_rq(rq)))
+ +		bidi_bytes = blk_rq_bytes(rq->next_rq);
+  
+ -	req->__data_len -= total_bytes;
+ +	pending = __blk_end_bidi_request(rq, error, blk_rq_bytes(rq), bidi_bytes);
+ +	BUG_ON(pending);
+ +}
+ +EXPORT_SYMBOL(__blk_end_request_all);
+  
+ -	/* update sector only for requests with clear definition of sector */
+ -	if (!blk_rq_is_passthrough(req))
+ -		req->__sector += total_bytes >> 9;
+ +/**
+ + * __blk_end_request_cur - Helper function to finish the current request chunk.
+ + * @rq: the request to finish the current chunk for
+ + * @error: %0 for success, < %0 for error
+ + *
+ + * Description:
+ + *     Complete the current consecutively mapped chunk from @rq.  Must
+ + *     be called with queue lock held.
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + */
+ +bool __blk_end_request_cur(struct request *rq, int error)
+ +{
+ +	return __blk_end_request(rq, error, blk_rq_cur_bytes(rq));
+ +}
+ +EXPORT_SYMBOL(__blk_end_request_cur);
+  
+ -	/* mixed attributes always follow the first bio */
+ -	if (req->rq_flags & RQF_MIXED_MERGE) {
+ -		req->cmd_flags &= ~REQ_FAILFAST_MASK;
+ -		req->cmd_flags |= req->bio->bi_opf & REQ_FAILFAST_MASK;
+ -	}
+ +/**
+ + * __blk_end_request_err - Finish a request till the next failure boundary.
+ + * @rq: the request to finish till the next failure boundary for
+ + * @error: must be negative errno
+ + *
+ + * Description:
+ + *     Complete @rq till the next failure boundary.  Must be called
+ + *     with queue lock held.
+ + *
+ + * Return:
+ + *     %false - we are done with this request
+ + *     %true  - still buffers pending for this request
+ + */
+ +bool __blk_end_request_err(struct request *rq, int error)
+ +{
+ +	WARN_ON(error >= 0);
+ +	return __blk_end_request(rq, error, blk_rq_err_bytes(rq));
+ +}
+ +EXPORT_SYMBOL_GPL(__blk_end_request_err);
+  
+ -	if (!(req->rq_flags & RQF_SPECIAL_PAYLOAD)) {
+ -		/*
+ -		 * If total number of sectors is less than the first segment
+ -		 * size, something has gone terribly wrong.
+ -		 */
+ -		if (blk_rq_bytes(req) < blk_rq_cur_bytes(req)) {
+ -			blk_dump_rq_flags(req, "request botched");
+ -			req->__data_len = blk_rq_cur_bytes(req);
+ -		}
+ +void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
+ +		     struct bio *bio)
+ +{
+ +	/* Bit 0 (R/W) is identical in rq->cmd_flags and bio->bi_rw */
+ +	rq->cmd_flags |= bio->bi_rw & REQ_WRITE;
+  
+ -		/* recalculate the number of segments */
+ -		req->nr_phys_segments = blk_recalc_rq_segments(req);
+ +	if (bio_has_data(bio)) {
+ +		rq->nr_phys_segments = bio_phys_segments(q, bio);
+ +		rq->buffer = bio_data(bio);
+  	}
+ +	rq->__data_len = bio->bi_size;
+ +	rq->bio = rq->biotail = bio;
+  
+ -	return true;
+ +	if (bio->bi_bdev)
+ +		rq->rq_disk = bio->bi_bdev->bd_disk;
+  }
+ -EXPORT_SYMBOL_GPL(blk_update_request);
+  
+  #if ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE
+  /**
+diff --cc include/linux/genhd.h
+index 8c45e6e1f01f,13bb51f37b3f..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -391,27 -422,21 +391,31 @@@ void part_dec_in_flight(struct request_
+  void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
+  			int rw);
+  
+ -void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
+ -
+ -/* block/genhd.c */
+ -extern void device_add_disk(struct device *parent, struct gendisk *disk,
+ -			    const struct attribute_group **groups);
+ -static inline void add_disk(struct gendisk *disk)
+++<<<<<<< HEAD
+ +static inline struct partition_meta_info *alloc_part_info(struct gendisk *disk)
+  {
+ -	device_add_disk(NULL, disk, NULL);
+ +	if (disk)
+ +		return kzalloc_node(sizeof(struct partition_meta_info),
+ +				    GFP_KERNEL, disk->node_id);
+ +	return kzalloc(sizeof(struct partition_meta_info), GFP_KERNEL);
+  }
+ -extern void device_add_disk_no_queue_reg(struct device *parent, struct gendisk *disk);
+ -static inline void add_disk_no_queue_reg(struct gendisk *disk)
+ +
+ +static inline void free_part_info(struct hd_struct *part)
+  {
+ -	device_add_disk_no_queue_reg(NULL, disk);
+ +	kfree(part->info);
+  }
+  
+ +/* block/blk-core.c */
+ +extern void part_round_stats(struct request_queue *q, int cpu, struct hd_struct *part);
+++=======
+++void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
+++>>>>>>> 2b8bd423614c (block/diskstats: more accurate approximation of io_ticks for slow disks)
+ +
+ +/* block/genhd.c */
+ +extern void add_disk(struct gendisk *disk);
+ +extern void add_disk_no_queue_reg(struct gendisk *disk);
+ +extern void add_disk_with_attributes(struct gendisk *disk,
+ +                const struct attribute_group **groups);
+  extern void del_gendisk(struct gendisk *gp);
+  extern struct gendisk *get_gendisk(dev_t dev, int *partno);
+  extern struct block_device *bdget_disk(struct gendisk *disk, int partno);
+* Unmerged path block/bio.c
+* Unmerged path Documentation/iostats.txt
+* Unmerged path block/bio.c
+* Unmerged path block/blk-core.c
+* Unmerged path include/linux/genhd.h
