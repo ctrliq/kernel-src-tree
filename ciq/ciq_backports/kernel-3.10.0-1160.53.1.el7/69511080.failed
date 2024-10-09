@@ -1,0 +1,229 @@
+gfs2: Introduce concept of a pending withdraw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 69511080bd6efd34f4e020fcde6cf73bb4a61af6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/69511080.failed
+
+File system withdraws can be delayed when inconsistencies are
+discovered when we cannot withdraw immediately, for example, when
+critical spin_locks are held. But delaying the withdraw can cause
+gfs2 to ignore the error and keep running for a short period of time.
+For example, an rgrp glock may be dequeued and demoted while there
+are still buffers that haven't been properly revoked, due to io
+errors writing to the journal.
+
+This patch introduces a new concept of a pending withdraw, which
+means an inconsistency has been discovered and we need to withdraw
+at the earliest possible opportunity. In these cases, we aren't
+quite withdrawn yet, but we still need to not dequeue glocks and
+other critical things. If we dequeue the glocks and the withdraw
+results in our journal being replayed, the replay could overwrite
+data that's been modified by a different node that acquired the
+glock in the meantime.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 69511080bd6efd34f4e020fcde6cf73bb4a61af6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/log.c
+#	fs/gfs2/util.c
+#	fs/gfs2/util.h
+diff --cc fs/gfs2/incore.h
+index 1f6f222b6802,3cd2de3db40a..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -588,6 -616,15 +588,18 @@@ enum 
+  	SDF_RORECOVERY		= 7, /* read only recovery */
+  	SDF_SKIP_DLM_UNLOCK	= 8,
+  	SDF_FORCE_AIL_FLUSH     = 9,
+++<<<<<<< HEAD
+++=======
++ 	SDF_AIL1_IO_ERROR	= 10,
++ 	SDF_FS_FROZEN           = 11,
++ 	SDF_WITHDRAWING		= 12, /* Will withdraw eventually */
++ };
++ 
++ enum gfs2_freeze_state {
++ 	SFS_UNFROZEN		= 0,
++ 	SFS_STARTING_FREEZE	= 1,
++ 	SFS_FROZEN		= 2,
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  };
+  
+  #define GFS2_FSNAME_LEN		256
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,d1ab04135b2f..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -105,8 -103,12 +105,13 @@@ __acquires(&sdp->sd_ail_lock
+  		gfs2_assert(sdp, bd->bd_tr == tr);
+  
+  		if (!buffer_busy(bh)) {
+ -			if (!buffer_uptodate(bh) &&
+ -			    !test_and_set_bit(SDF_AIL1_IO_ERROR,
+ -					      &sdp->sd_flags)) {
+ +			if (!buffer_uptodate(bh))
+  				gfs2_io_error_bh(sdp, bh);
+++<<<<<<< HEAD
+++=======
++ 				gfs2_withdraw_delayed(sdp);
++ 			}
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  			list_move(&bd->bd_ail_st_list, &tr->tr_ail2_list);
+  			continue;
+  		}
+@@@ -145,17 -147,22 +150,31 @@@ void gfs2_ail1_flush(struct gfs2_sbd *s
+  {
+  	struct list_head *head = &sdp->sd_ail1_list;
+  	struct gfs2_trans *tr;
+++<<<<<<< HEAD
+++=======
++ 	struct blk_plug plug;
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  
+  	trace_gfs2_ail_flush(sdp, wbc, 1);
+ -	blk_start_plug(&plug);
+  	spin_lock(&sdp->sd_ail_lock);
+  restart:
+  	list_for_each_entry_reverse(tr, head, tr_list) {
+  		if (wbc->nr_to_write <= 0)
+  			break;
+++<<<<<<< HEAD
+ +		if (gfs2_ail1_start_one(sdp, wbc, tr))
+ +			goto restart;
+ +	}
+ +	spin_unlock(&sdp->sd_ail_lock);
+++=======
++ 		if (gfs2_ail1_start_one(sdp, wbc, tr) && !gfs2_withdrawn(sdp))
++ 			goto restart;
++ 	}
++ 	spin_unlock(&sdp->sd_ail_lock);
++ 	blk_finish_plug(&plug);
++ 	if (test_bit(SDF_WITHDRAWING, &sdp->sd_flags))
++ 		gfs2_withdraw(sdp);
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  	trace_gfs2_ail_flush(sdp, wbc, 0);
+  }
+  
+@@@ -194,11 -201,13 +213,16 @@@ static void gfs2_ail1_empty_one(struct 
+  		gfs2_assert(sdp, bd->bd_tr == tr);
+  		if (buffer_busy(bh))
+  			continue;
+ -		if (!buffer_uptodate(bh) &&
+ -		    !test_and_set_bit(SDF_AIL1_IO_ERROR, &sdp->sd_flags)) {
+ +		if (!buffer_uptodate(bh))
+  			gfs2_io_error_bh(sdp, bh);
+++<<<<<<< HEAD
+++=======
++ 			gfs2_withdraw_delayed(sdp);
++ 		}
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  		list_move(&bd->bd_ail_st_list, &tr->tr_ail2_list);
+  	}
+ +
+  }
+  
+  /**
+@@@ -225,6 -234,11 +249,14 @@@ static int gfs2_ail1_empty(struct gfs2_
+  	ret = list_empty(&sdp->sd_ail1_list);
+  	spin_unlock(&sdp->sd_ail_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (test_bit(SDF_WITHDRAWING, &sdp->sd_flags)) {
++ 		gfs2_lm(sdp, "fatal: I/O error(s)\n");
++ 		gfs2_withdraw(sdp);
++ 	}
++ 
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  	return ret;
+  }
+  
+diff --cc fs/gfs2/util.c
+index 33a5f6d866e6,47cd40de08b1..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -253,21 -241,22 +253,33 @@@ int gfs2_io_error_i(struct gfs2_sbd *sd
+  }
+  
+  /**
+ - * gfs2_io_error_bh_i - Flag a buffer I/O error
+ - * @withdraw: withdraw the filesystem
+ + * gfs2_io_error_bh_i - Flag a buffer I/O error and withdraw
+ + * Returns: -1 if this call withdrew the machine,
+ + *          0 if it was already withdrawn
+   */
+  
+ -void gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
+ -			const char *function, char *file, unsigned int line,
+ -			bool withdraw)
+ +int gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
+ +		       const char *function, char *file, unsigned int line)
+  {
+++<<<<<<< HEAD
+ +	int rv;
+ +	rv = gfs2_lm_withdraw(sdp,
+ +		"GFS2: fsid=%s: fatal: I/O error\n"
+ +		"GFS2: fsid=%s:   block = %llu\n"
+ +		"GFS2: fsid=%s:   function = %s, file = %s, line = %u\n",
+ +		sdp->sd_fsname,
+ +		sdp->sd_fsname, (unsigned long long)bh->b_blocknr,
+ +		sdp->sd_fsname, function, file, line);
+ +	return rv;
+++=======
++ 	if (gfs2_withdrawn(sdp))
++ 		return;
++ 
++ 	fs_err(sdp, "fatal: I/O error\n"
++ 	       "  block = %llu\n"
++ 	       "  function = %s, file = %s, line = %u\n",
++ 	       (unsigned long long)bh->b_blocknr, function, file, line);
++ 	if (withdraw)
++ 		gfs2_withdraw(sdp);
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  }
+ -
+diff --cc fs/gfs2/util.h
+index 44242f56811a,16b2cc6c4560..000000000000
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@@ -161,6 -172,25 +161,28 @@@ static inline unsigned int gfs2_tune_ge
+  	return x;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * gfs2_withdraw_delayed - withdraw as soon as possible without deadlocks
++  * @sdp: the superblock
++  */
++ static inline void gfs2_withdraw_delayed(struct gfs2_sbd *sdp)
++ {
++ 	set_bit(SDF_WITHDRAWING, &sdp->sd_flags);
++ }
++ 
++ /**
++  * gfs2_withdrawn - test whether the file system is withdrawing or withdrawn
++  * @sdp: the superblock
++  */
++ static inline bool gfs2_withdrawn(struct gfs2_sbd *sdp)
++ {
++ 	return test_bit(SDF_WITHDRAWN, &sdp->sd_flags) ||
++ 		test_bit(SDF_WITHDRAWING, &sdp->sd_flags);
++ }
++ 
+++>>>>>>> 69511080bd6e (gfs2: Introduce concept of a pending withdraw)
+  #define gfs2_tune_get(sdp, field) \
+  gfs2_tune_get_i(&(sdp)->sd_tune, &(sdp)->sd_tune.field)
+  
+* Unmerged path fs/gfs2/incore.h
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/util.c
+* Unmerged path fs/gfs2/util.h
