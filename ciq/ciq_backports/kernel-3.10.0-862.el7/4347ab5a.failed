@@ -1,0 +1,113 @@
+target: Avoid DataIN transfers for non-GOOD SAM status
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Avoid DataIN transfers for non-GOOD SAM status (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.00%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 4347ab5a086efcba449e7a6f0a14d1474060006b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4347ab5a.failed
+
+This patch modifies existing transport_complete_*() code
+to avoid invoking target_core_fabric_ops->queue_data_in()
+driver callbacks for I/O READs with non-GOOD SAM status.
+
+Some initiators expect GOOD status when a DATA-IN payload
+transfer is involved, so to be safe go ahead and always
+invoke target_core_fabric_ops->queue_status() to generate
+fabric responses instead.
+
+Note this is a prerequisite for IBLOCK supporting retriable
+status, so SAM_STAT_BUSY + SAM_STAT_TASK_SET_FULL always
+generates fabric driver responses instead of initiating
+DataIN payload transfer when non-GOOD status is present
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Andy Grover <agrover@redhat.com>
+	Cc: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 4347ab5a086efcba449e7a6f0a14d1474060006b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_transport.c
+diff --cc drivers/target/target_core_transport.c
+index 68bc47c2e404,784dd22d33a3..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -1943,30 -1988,18 +1943,33 @@@ static void transport_complete_qf(struc
+  	int ret = 0;
+  
+  	transport_complete_task_attr(cmd);
+ +	/*
+ +	 * If a fabric driver ->write_pending() or ->queue_data_in() callback
+ +	 * has returned neither -ENOMEM or -EAGAIN, assume it's fatal and
+ +	 * the same callbacks should not be retried.  Return CHECK_CONDITION
+ +	 * if a scsi_status is not already set.
+ +	 *
+ +	 * If a fabric driver ->queue_status() has returned non zero, always
+ +	 * keep retrying no matter what..
+ +	 */
+ +	if (cmd->t_state == TRANSPORT_COMPLETE_QF_ERR) {
+ +		if (cmd->scsi_status)
+ +			goto queue_status;
+  
+ -	if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE) {
+ -		trace_target_cmd_complete(cmd);
+ -		ret = cmd->se_tfo->queue_status(cmd);
+ -		goto out;
+ +		cmd->se_cmd_flags |= SCF_EMULATED_TASK_SENSE;
+ +		cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
+ +		cmd->scsi_sense_length  = TRANSPORT_SENSE_BUFFER;
+ +		goto queue_status;
+  	}
+  
+ +	if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
+ +		goto queue_status;
+ +
+  	switch (cmd->data_direction) {
+  	case DMA_FROM_DEVICE:
++ 		if (cmd->scsi_status)
++ 			goto queue_status;
++ 
+  		trace_target_cmd_complete(cmd);
+  		ret = cmd->se_tfo->queue_data_in(cmd);
+  		break;
+@@@ -2114,12 -2132,11 +2117,20 @@@ static void target_complete_ok_work(str
+  queue_rsp:
+  	switch (cmd->data_direction) {
+  	case DMA_FROM_DEVICE:
+++<<<<<<< HEAD
+ +		spin_lock(&cmd->se_lun->lun_sep_lock);
+ +		if (cmd->se_lun->lun_sep) {
+ +			cmd->se_lun->lun_sep->sep_stats.tx_data_octets +=
+ +					cmd->data_length;
+ +		}
+ +		spin_unlock(&cmd->se_lun->lun_sep_lock);
+++=======
++ 		if (cmd->scsi_status)
++ 			goto queue_status;
++ 
++ 		atomic_long_add(cmd->data_length,
++ 				&cmd->se_lun->lun_stats.tx_data_octets);
+++>>>>>>> 4347ab5a086e (target: Avoid DataIN transfers for non-GOOD SAM status)
+  		/*
+  		 * Perform READ_STRIP of PI using software emulation when
+  		 * backend had PI enabled, if the transport will not be
+@@@ -2165,9 -2174,10 +2176,10 @@@
+  		}
+  		/* Fall through for DMA_TO_DEVICE */
+  	case DMA_NONE:
++ queue_status:
+  		trace_target_cmd_complete(cmd);
+  		ret = cmd->se_tfo->queue_status(cmd);
+ -		if (ret == -EAGAIN || ret == -ENOMEM)
+ +		if (ret)
+  			goto queue_full;
+  		break;
+  	default:
+* Unmerged path drivers/target/target_core_transport.c
