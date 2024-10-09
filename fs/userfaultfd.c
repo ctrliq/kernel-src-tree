@@ -468,8 +468,13 @@ static int __maybe_unused userfaultfd_event_wait_completion(
 		struct userfaultfd_ctx *ctx,
 		struct userfaultfd_wait_queue *ewq)
 {
-	int ret = 0;
+	int ret;
 
+	ret = -1;
+	if (WARN_ON_ONCE(current->flags & PF_EXITING))
+		goto out;
+
+	ret = 0;
 	ewq->ctx = ctx;
 	init_waitqueue_entry(&ewq->wq, current);
 
@@ -504,7 +509,7 @@ static int __maybe_unused userfaultfd_event_wait_completion(
 	 * ctx may go away after this if the userfault pseudo fd is
 	 * already released.
 	 */
-
+out:
 	userfaultfd_ctx_put(ctx);
 	return ret;
 }
