@@ -1,0 +1,140 @@
+kvm: x86: do not use KVM_REQ_EVENT for APICv interrupt injection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit b95234c840045b7c72380fd14c59416af28fcb02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b95234c8.failed
+
+Since bf9f6ac8d749 ("KVM: Update Posted-Interrupts Descriptor when vCPU
+is blocked", 2015-09-18) the posted interrupt descriptor is checked
+unconditionally for PIR.ON.  Therefore we don't need KVM_REQ_EVENT to
+trigger the scan and, if NMIs or SMIs are not involved, we can avoid
+the complicated event injection path.
+
+Calling kvm_vcpu_kick if PIR.ON=1 is also useless, though it has been
+there since APICv was introduced.
+
+However, without the KVM_REQ_EVENT safety net KVM needs to be much
+more careful about races between vmx_deliver_posted_interrupt and
+vcpu_enter_guest.  First, the IPI for posted interrupts may be issued
+between setting vcpu->mode = IN_GUEST_MODE and disabling interrupts.
+If that happens, kvm_trigger_posted_interrupt returns true, but
+smp_kvm_posted_intr_ipi doesn't do anything about it.  The guest is
+entered with PIR.ON, but the posted interrupt IPI has not been sent
+and the interrupt is only delivered to the guest on the next vmentry
+(if any).  To fix this, disable interrupts before setting vcpu->mode.
+This ensures that the IPI is delayed until the guest enters non-root mode;
+it is then trapped by the processor causing the interrupt to be injected.
+
+Second, the IPI may be issued between kvm_x86_ops->sync_pir_to_irr(vcpu)
+and vcpu->mode = IN_GUEST_MODE.  In this case, kvm_vcpu_kick is called
+but it (correctly) doesn't do anything because it sees vcpu->mode ==
+OUTSIDE_GUEST_MODE.  Again, the guest is entered with PIR.ON but no
+posted interrupt IPI is pending; this time, the fix for this is to move
+the RVI update after IN_GUEST_MODE.
+
+Both issues were mostly masked by the liberal usage of KVM_REQ_EVENT,
+though the second could actually happen with VT-d posted interrupts.
+In both race scenarios KVM_REQ_EVENT would cancel guest entry, resulting
+in another vmentry which would inject the interrupt.
+
+This saves about 300 cycles on the self_ipi_* tests of vmexit.flat.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b95234c840045b7c72380fd14c59416af28fcb02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/lapic.c
+index 1e74c743d62f,9fa5b8164961..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -378,9 -386,7 +378,13 @@@ void kvm_apic_update_irr(struct kvm_vcp
+  {
+  	struct kvm_lapic *apic = vcpu->arch.apic;
+  
+++<<<<<<< HEAD
+ +	__kvm_apic_update_irr(pir, apic->regs);
+ +
+ +	kvm_make_request(KVM_REQ_EVENT, vcpu);
+++=======
++ 	return __kvm_apic_update_irr(pir, apic->regs);
+++>>>>>>> b95234c84004 (kvm: x86: do not use KVM_REQ_EVENT for APICv interrupt injection)
+  }
+  EXPORT_SYMBOL_GPL(kvm_apic_update_irr);
+  
+diff --cc arch/x86/kvm/x86.c
+index 525d581e7a09,63a89a51dcc9..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -6601,24 -6791,28 +6601,27 @@@ static int vcpu_enter_guest(struct kvm_
+  			r = 0;
+  			goto out;
+  		}
+ -		if (kvm_check_request(KVM_REQ_HV_RESET, vcpu)) {
+ -			vcpu->run->exit_reason = KVM_EXIT_SYSTEM_EVENT;
+ -			vcpu->run->system_event.type = KVM_SYSTEM_EVENT_RESET;
+ -			r = 0;
+ -			goto out;
+ -		}
+ -		if (kvm_check_request(KVM_REQ_HV_EXIT, vcpu)) {
+ -			vcpu->run->exit_reason = KVM_EXIT_HYPERV;
+ -			vcpu->run->hyperv = vcpu->arch.hyperv.exit;
+ -			r = 0;
+ -			goto out;
+ -		}
+ +	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * KVM_REQ_EVENT is not set when posted interrupts are set by
+ +	 * VT-d hardware, so we have to update RVI unconditionally.
+ +	 */
+ +	if (kvm_lapic_enabled(vcpu)) {
+  		/*
+ -		 * KVM_REQ_HV_STIMER has to be processed after
+ -		 * KVM_REQ_CLOCK_UPDATE, because Hyper-V SynIC timers
+ -		 * depend on the guest clock being up-to-date
+ +		 * Update architecture specific hints for APIC
+ +		 * virtual interrupt delivery.
+  		 */
+ -		if (kvm_check_request(KVM_REQ_HV_STIMER, vcpu))
+ -			kvm_hv_process_stimers(vcpu);
+ +		if (vcpu->arch.apicv_active) {
+ +			kvm_x86_ops->sync_pir_to_irr(vcpu);
+ +			kvm_x86_ops->hwapic_irr_update(vcpu,
+ +				kvm_lapic_find_highest_irr(vcpu));
+ +		}
+  	}
+  
+++=======
+++>>>>>>> b95234c84004 (kvm: x86: do not use KVM_REQ_EVENT for APICv interrupt injection)
+  	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
+  		++vcpu->stat.req_event;
+  		kvm_apic_accept_events(vcpu);
+* Unmerged path arch/x86/kvm/lapic.c
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 4de6d6513aff..dd06abe40e2b 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -4600,9 +4600,11 @@ static void vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
+ 	if (pi_test_and_set_pir(vector, &vmx->pi_desc))
+ 		return;
+ 
+-	r = pi_test_and_set_on(&vmx->pi_desc);
+-	kvm_make_request(KVM_REQ_EVENT, vcpu);
+-	if (r || !kvm_vcpu_trigger_posted_interrupt(vcpu))
++	/* If a previous notification has sent the IPI, nothing to do.  */
++	if (pi_test_and_set_on(&vmx->pi_desc))
++		return;
++
++	if (!kvm_vcpu_trigger_posted_interrupt(vcpu))
+ 		kvm_vcpu_kick(vcpu);
+ }
+ 
+* Unmerged path arch/x86/kvm/x86.c
