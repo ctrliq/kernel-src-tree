@@ -1,0 +1,281 @@
+tun: implement carrier change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 26d31925cd5ea4b5b168ed538b0326d63ccbb384
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/26d31925.failed
+
+The userspace may need to control the carrier state.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: Didier Pallard <didier.pallard@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 26d31925cd5ea4b5b168ed538b0326d63ccbb384)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+#	include/uapi/linux/if_tun.h
+diff --cc drivers/net/tun.c
+index 35cc09f13a24,835c73f42ae7..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -955,50 -1199,153 +955,66 @@@ tun_net_get_stats64(struct net_device *
+  	stats->tx_dropped = tx_dropped;
+  }
+  
+ -static int tun_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+ -		       struct netlink_ext_ack *extack)
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +static void tun_poll_controller(struct net_device *dev)
+  {
+ -	struct tun_struct *tun = netdev_priv(dev);
+ -	struct tun_file *tfile;
+ -	struct bpf_prog *old_prog;
+ -	int i;
+ -
+ -	old_prog = rtnl_dereference(tun->xdp_prog);
+ -	rcu_assign_pointer(tun->xdp_prog, prog);
+ -	if (old_prog)
+ -		bpf_prog_put(old_prog);
+ -
+ -	for (i = 0; i < tun->numqueues; i++) {
+ -		tfile = rtnl_dereference(tun->tfiles[i]);
+ -		if (prog)
+ -			sock_set_flag(&tfile->sk, SOCK_XDP);
+ -		else
+ -			sock_reset_flag(&tfile->sk, SOCK_XDP);
+ -	}
+ -	list_for_each_entry(tfile, &tun->disabled, next) {
+ -		if (prog)
+ -			sock_set_flag(&tfile->sk, SOCK_XDP);
+ -		else
+ -			sock_reset_flag(&tfile->sk, SOCK_XDP);
+ -	}
+ -
+ -	return 0;
+ +	/*
+ +	 * Tun only receives frames when:
+ +	 * 1) the char device endpoint gets data from user space
+ +	 * 2) the tun socket gets a sendmsg call from user space
+ +	 * Since both of those are syncronous operations, we are guaranteed
+ +	 * never to have pending data when we poll for it
+ +	 * so theres nothing to do here but return.
+ +	 * We need this though so netpoll recognizes us as an interface that
+ +	 * supports polling, which enables bridge devices in virt setups to
+ +	 * still use netconsole
+ +	 */
+ +	return;
+  }
+ +#endif
+  
+ -static u32 tun_xdp_query(struct net_device *dev)
+ +static void tun_set_headroom(struct net_device *dev, int new_hr)
+  {
+  	struct tun_struct *tun = netdev_priv(dev);
+ -	const struct bpf_prog *xdp_prog;
+ -
+ -	xdp_prog = rtnl_dereference(tun->xdp_prog);
+ -	if (xdp_prog)
+ -		return xdp_prog->aux->id;
+  
+ -	return 0;
+ -}
+ +	if (new_hr < NET_SKB_PAD)
+ +		new_hr = NET_SKB_PAD;
+  
+ -static int tun_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+ -{
+ -	switch (xdp->command) {
+ -	case XDP_SETUP_PROG:
+ -		return tun_xdp_set(dev, xdp->prog, xdp->extack);
+ -	case XDP_QUERY_PROG:
+ -		xdp->prog_id = tun_xdp_query(dev);
+ -		return 0;
+ -	default:
+ -		return -EINVAL;
+ -	}
+ +	tun->align = new_hr;
+  }
+  
++ static int tun_net_change_carrier(struct net_device *dev, bool new_carrier)
++ {
++ 	if (new_carrier) {
++ 		struct tun_struct *tun = netdev_priv(dev);
++ 
++ 		if (!tun->numqueues)
++ 			return -EPERM;
++ 
++ 		netif_carrier_on(dev);
++ 	} else {
++ 		netif_carrier_off(dev);
++ 	}
++ 	return 0;
++ }
++ 
+  static const struct net_device_ops tun_netdev_ops = {
+  	.ndo_uninit		= tun_net_uninit,
+  	.ndo_open		= tun_net_open,
+  	.ndo_stop		= tun_net_close,
+  	.ndo_start_xmit		= tun_net_xmit,
+ +	.ndo_change_mtu_rh74	= tun_net_change_mtu,
+  	.ndo_fix_features	= tun_net_fix_features,
+  	.ndo_select_queue	= tun_select_queue,
+ -	.ndo_set_rx_headroom	= tun_set_headroom,
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +	.ndo_poll_controller	= tun_poll_controller,
+ +#endif
+ +	.ndo_size		= sizeof(struct net_device_ops),
+ +	.extended.ndo_set_rx_headroom	= tun_set_headroom,
+  	.ndo_get_stats64	= tun_net_get_stats64,
++ 	.ndo_change_carrier	= tun_net_change_carrier,
+  };
+  
+ -static void __tun_xdp_flush_tfile(struct tun_file *tfile)
+ -{
+ -	/* Notify and wake up reader process */
+ -	if (tfile->flags & TUN_FASYNC)
+ -		kill_fasync(&tfile->fasync, SIGIO, POLL_IN);
+ -	tfile->socket.sk->sk_data_ready(tfile->socket.sk);
+ -}
+ -
+ -static int tun_xdp_xmit(struct net_device *dev, int n,
+ -			struct xdp_frame **frames, u32 flags)
+ -{
+ -	struct tun_struct *tun = netdev_priv(dev);
+ -	struct tun_file *tfile;
+ -	u32 numqueues;
+ -	int drops = 0;
+ -	int cnt = n;
+ -	int i;
+ -
+ -	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+ -		return -EINVAL;
+ -
+ -	rcu_read_lock();
+ -
+ -	numqueues = READ_ONCE(tun->numqueues);
+ -	if (!numqueues) {
+ -		rcu_read_unlock();
+ -		return -ENXIO; /* Caller will free/return all frames */
+ -	}
+ -
+ -	tfile = rcu_dereference(tun->tfiles[smp_processor_id() %
+ -					    numqueues]);
+ -
+ -	spin_lock(&tfile->tx_ring.producer_lock);
+ -	for (i = 0; i < n; i++) {
+ -		struct xdp_frame *xdp = frames[i];
+ -		/* Encode the XDP flag into lowest bit for consumer to differ
+ -		 * XDP buffer from sk_buff.
+ -		 */
+ -		void *frame = tun_xdp_to_ptr(xdp);
+ -
+ -		if (__ptr_ring_produce(&tfile->tx_ring, frame)) {
+ -			this_cpu_inc(tun->pcpu_stats->tx_dropped);
+ -			xdp_return_frame_rx_napi(xdp);
+ -			drops++;
+ -		}
+ -	}
+ -	spin_unlock(&tfile->tx_ring.producer_lock);
+ -
+ -	if (flags & XDP_XMIT_FLUSH)
+ -		__tun_xdp_flush_tfile(tfile);
+ -
+ -	rcu_read_unlock();
+ -	return cnt - drops;
+ -}
+ -
+ -static int tun_xdp_tx(struct net_device *dev, struct xdp_buff *xdp)
+ -{
+ -	struct xdp_frame *frame = convert_to_xdp_frame(xdp);
+ -
+ -	if (unlikely(!frame))
+ -		return -EOVERFLOW;
+ -
+ -	return tun_xdp_xmit(dev, 1, &frame, XDP_XMIT_FLUSH);
+ -}
+ -
+  static const struct net_device_ops tap_netdev_ops = {
+  	.ndo_uninit		= tun_net_uninit,
+  	.ndo_open		= tun_net_open,
+@@@ -1010,12 -1356,12 +1026,18 @@@
+  	.ndo_set_mac_address	= eth_mac_addr,
+  	.ndo_validate_addr	= eth_validate_addr,
+  	.ndo_select_queue	= tun_select_queue,
+ -	.ndo_features_check	= passthru_features_check,
+ -	.ndo_set_rx_headroom	= tun_set_headroom,
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +	.ndo_poll_controller	= tun_poll_controller,
+ +#endif
+ +	.ndo_size		= sizeof(struct net_device_ops),
+ +	.extended.ndo_set_rx_headroom	= tun_set_headroom,
+  	.ndo_get_stats64	= tun_net_get_stats64,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_bpf		= tun_xdp,
++ 	.ndo_xdp_xmit		= tun_xdp_xmit,
++ 	.ndo_change_carrier	= tun_net_change_carrier,
+++>>>>>>> 26d31925cd5e (tun: implement carrier change)
+  };
+  
+  static void tun_flow_init(struct tun_struct *tun)
+@@@ -2227,8 -3016,10 +2249,9 @@@ static long __tun_chr_ioctl(struct fil
+  			    unsigned long arg, int ifreq_len)
+  {
+  	struct tun_file *tfile = file->private_data;
+ -	struct net *net = sock_net(&tfile->sk);
+  	struct tun_struct *tun;
+  	void __user* argp = (void __user*)arg;
++ 	unsigned int ifindex, carrier;
+  	struct ifreq ifr;
+  	kuid_t owner;
+  	kgid_t group;
+@@@ -2496,6 -3300,22 +2518,25 @@@
+  		ret = 0;
+  		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case TUNSETSTEERINGEBPF:
++ 		ret = tun_set_ebpf(tun, &tun->steering_prog, argp);
++ 		break;
++ 
++ 	case TUNSETFILTEREBPF:
++ 		ret = tun_set_ebpf(tun, &tun->filter_prog, argp);
++ 		break;
++ 
++ 	case TUNSETCARRIER:
++ 		ret = -EFAULT;
++ 		if (copy_from_user(&carrier, argp, sizeof(carrier)))
++ 			goto unlock;
++ 
++ 		ret = tun_net_change_carrier(tun->dev, (bool)carrier);
++ 		break;
++ 
+++>>>>>>> 26d31925cd5e (tun: implement carrier change)
+  	default:
+  		ret = -EINVAL;
+  		break;
+diff --cc include/uapi/linux/if_tun.h
+index 08a62b13d75c,23a6753b37df..000000000000
+--- a/include/uapi/linux/if_tun.h
++++ b/include/uapi/linux/if_tun.h
+@@@ -56,6 -57,9 +56,12 @@@
+   */
+  #define TUNSETVNETBE _IOW('T', 222, int)
+  #define TUNGETVNETBE _IOR('T', 223, int)
+++<<<<<<< HEAD
+++=======
++ #define TUNSETSTEERINGEBPF _IOR('T', 224, int)
++ #define TUNSETFILTEREBPF _IOR('T', 225, int)
++ #define TUNSETCARRIER _IOW('T', 226, int)
+++>>>>>>> 26d31925cd5e (tun: implement carrier change)
+  
+  /* TUNSETIFF ifr flags */
+  #define IFF_TUN		0x0001
+* Unmerged path drivers/net/tun.c
+* Unmerged path include/uapi/linux/if_tun.h
