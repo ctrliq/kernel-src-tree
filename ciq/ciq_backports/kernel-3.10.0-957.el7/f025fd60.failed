@@ -1,0 +1,191 @@
+net/mlx4_en: XDP_TX, assign constant values of TX descs on ring creaion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: XDP_TX, assign constant values of TX descs on ring creaion (Erez Alfasi) [1520295]
+Rebuild_FUZZ: 97.10%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit f025fd6061e120713d6c11c92983804c6805d6cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f025fd60.failed
+
+In XDP_TX, some fields in tx_info and tx_desc are constants across
+all entries of the different XDP_TX rings.
+Assign values to these fields on ring creation time, rather than in
+data-path.
+
+Patchset performance tests:
+Tested on ConnectX3Pro, Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+Single queue no-RSS optimization ON.
+
+XDP_TX packet rate:
+------------------------------
+Before    | After     | Gain |
+13.7 Mpps | 14.0 Mpps | %2.2 |
+------------------------------
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f025fd6061e120713d6c11c92983804c6805d6cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index b471f82c74fc,d611df2f274d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -1731,14 -1747,16 +1731,20 @@@ int mlx4_en_start_port(struct net_devic
+  			if (t != TX_XDP) {
+  				tx_ring->tx_queue = netdev_get_tx_queue(dev, i);
+  				tx_ring->recycle_ring = NULL;
+ -
+ -				/* Arm CQ for TX completions */
+ -				mlx4_en_arm_cq(priv, cq);
+ -
+  			} else {
+++<<<<<<< HEAD
+ +				/* mlx4_en_init_recycle_ring(priv, i); */
+ +				tx_ring->recycle_ring = NULL; /* not in rhel7 */
+++=======
++ 				mlx4_en_init_tx_xdp_ring_descs(priv, tx_ring);
++ 				mlx4_en_init_recycle_ring(priv, i);
++ 				/* XDP TX CQ should never be armed */
+++>>>>>>> f025fd6061e1 (net/mlx4_en: XDP_TX, assign constant values of TX descs on ring creaion)
+  			}
+  
+ +			/* Arm CQ for TX completions */
+ +			mlx4_en_arm_cq(priv, cq);
+ +
+  			/* Set initial ownership of all Tx TXBBs to SW (1) */
+  			for (j = 0; j < tx_ring->buf_size; j += STAMP_STRIDE)
+  				*((u32 *)(tx_ring->buf + j)) = 0xffffffff;
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 0949c7934152,596445a4a241..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@@ -1058,3 -1081,104 +1058,107 @@@ tx_drop
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX4_EN_XDP_TX_NRTXBB  1
++ #define MLX4_EN_XDP_TX_REAL_SZ (((CTRL_SIZE + MLX4_EN_XDP_TX_NRTXBB * DS_SIZE) \
++ 				 / 16) & 0x3f)
++ 
++ void mlx4_en_init_tx_xdp_ring_descs(struct mlx4_en_priv *priv,
++ 				    struct mlx4_en_tx_ring *ring)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ring->size; i++) {
++ 		struct mlx4_en_tx_info *tx_info = &ring->tx_info[i];
++ 		struct mlx4_en_tx_desc *tx_desc = ring->buf +
++ 			(i << LOG_TXBB_SIZE);
++ 
++ 		tx_info->map0_byte_count = PAGE_SIZE;
++ 		tx_info->nr_txbb = MLX4_EN_XDP_TX_NRTXBB;
++ 		tx_info->data_offset = offsetof(struct mlx4_en_tx_desc, data);
++ 		tx_info->ts_requested = 0;
++ 		tx_info->nr_maps = 1;
++ 		tx_info->linear = 1;
++ 		tx_info->inl = 0;
++ 
++ 		tx_desc->data.lkey = ring->mr_key;
++ 		tx_desc->ctrl.qpn_vlan.fence_size = MLX4_EN_XDP_TX_REAL_SZ;
++ 		tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
++ 	}
++ }
++ 
++ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_ring *rx_ring,
++ 			       struct mlx4_en_rx_alloc *frame,
++ 			       struct mlx4_en_priv *priv, unsigned int length,
++ 			       int tx_ind, bool *doorbell_pending)
++ {
++ 	struct mlx4_en_tx_desc *tx_desc;
++ 	struct mlx4_en_tx_info *tx_info;
++ 	struct mlx4_wqe_data_seg *data;
++ 	struct mlx4_en_tx_ring *ring;
++ 	dma_addr_t dma;
++ 	__be32 op_own;
++ 	int index;
++ 
++ 	if (unlikely(!priv->port_up))
++ 		goto tx_drop;
++ 
++ 	ring = priv->tx_ring[TX_XDP][tx_ind];
++ 
++ 	if (unlikely(mlx4_en_is_tx_ring_full(ring)))
++ 		goto tx_drop_count;
++ 
++ 	index = ring->prod & ring->size_mask;
++ 	tx_info = &ring->tx_info[index];
++ 
++ 	/* Track current inflight packets for performance analysis */
++ 	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
++ 			 (u32)(ring->prod - READ_ONCE(ring->cons) - 1));
++ 
++ 	tx_desc = ring->buf + (index << LOG_TXBB_SIZE);
++ 	data = &tx_desc->data;
++ 
++ 	dma = frame->dma;
++ 
++ 	tx_info->page = frame->page;
++ 	frame->page = NULL;
++ 	tx_info->map0_dma = dma;
++ 	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
++ 
++ 	dma_sync_single_range_for_device(priv->ddev, dma, frame->page_offset,
++ 					 length, PCI_DMA_TODEVICE);
++ 
++ 	data->addr = cpu_to_be64(dma + frame->page_offset);
++ 	dma_wmb();
++ 	data->byte_count = cpu_to_be32(length);
++ 
++ 	/* tx completion can avoid cache line miss for common cases */
++ 
++ 	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
++ 		((ring->prod & ring->size) ?
++ 		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
++ 
++ 	rx_ring->xdp_tx++;
++ 	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
++ 
++ 	ring->prod += MLX4_EN_XDP_TX_NRTXBB;
++ 
++ 	/* Ensure new descriptor hits memory
++ 	 * before setting ownership of this descriptor to HW
++ 	 */
++ 	dma_wmb();
++ 	tx_desc->ctrl.owner_opcode = op_own;
++ 	ring->xmit_more++;
++ 
++ 	*doorbell_pending = true;
++ 
++ 	return NETDEV_TX_OK;
++ 
++ tx_drop_count:
++ 	rx_ring->xdp_tx_full++;
++ 	*doorbell_pending = true;
++ tx_drop:
++ 	return NETDEV_TX_BUSY;
++ }
+++>>>>>>> f025fd6061e1 (net/mlx4_en: XDP_TX, assign constant values of TX descs on ring creaion)
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 3d28addafaf4..97940d42716a 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -697,6 +697,8 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+ 			   int node, int queue_index);
+ void mlx4_en_destroy_tx_ring(struct mlx4_en_priv *priv,
+ 			     struct mlx4_en_tx_ring **pring);
++void mlx4_en_init_tx_xdp_ring_descs(struct mlx4_en_priv *priv,
++				    struct mlx4_en_tx_ring *ring);
+ int mlx4_en_activate_tx_ring(struct mlx4_en_priv *priv,
+ 			     struct mlx4_en_tx_ring *ring,
+ 			     int cq, int user_prio);
