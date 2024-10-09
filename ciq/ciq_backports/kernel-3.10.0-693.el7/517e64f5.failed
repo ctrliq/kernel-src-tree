@@ -1,0 +1,685 @@
+sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 517e64f57883bd63c5a4ab8b3d0d3ed68c55d0cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/517e64f5.failed
+
+Currently, sysfs_dirent active_ref lockdep annotation uses
+attribute->[s]key as the lockdep key, which forces
+kernfs_create_file_ns() to assume that sysfs_dirent->priv is pointing
+to a struct attribute which may not be true for non-sysfs users.  This
+patch restructures the lockdep annotation such that
+
+* kernfs_ops contains lockdep_key which is used by default for files
+  created kernfs_create_file_ns().
+
+* kernfs_create_file_ns_key() is introduced which takes an extra @key
+  argument.  The created file will use the specified key for
+  active_ref lockdep annotation.  If NULL is specified, lockdep for
+  the file is disabled.
+
+* sysfs_add_file_mode_ns() is updated to use
+  kernfs_create_file_ns_key() with the appropriate key from the
+  attribute or NULL if ignore_lockdep is set.
+
+This makes the lockdep annotation properly contained in kernfs while
+allowing sysfs to cleanly keep its current behavior.  This patch
+doesn't introduce any behavior differences.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 517e64f57883bd63c5a4ab8b3d0d3ed68c55d0cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/dir.c
+#	fs/sysfs/file.c
+#	fs/sysfs/sysfs.h
+#	include/linux/kernfs.h
+diff --cc fs/sysfs/dir.c
+index 3f68344137e5,8f2d577b5f64..000000000000
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@@ -168,7 -150,7 +168,11 @@@ struct sysfs_dirent *sysfs_get_active(s
+  	if (!atomic_inc_unless_negative(&sd->s_active))
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	if (likely(!ignore_lockdep(sd)))
+++=======
++ 	if (sd->s_flags & SYSFS_FLAG_LOCKDEP)
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  		rwsem_acquire_read(&sd->dep_map, 0, 1, _RET_IP_);
+  	return sd;
+  }
+@@@ -187,7 -169,7 +191,11 @@@ void sysfs_put_active(struct sysfs_dire
+  	if (unlikely(!sd))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (likely(!ignore_lockdep(sd)))
+++=======
++ 	if (sd->s_flags & SYSFS_FLAG_LOCKDEP)
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  		rwsem_release(&sd->dep_map, 1, _RET_IP_);
+  	v = atomic_dec_return(&sd->s_active);
+  	if (likely(v != SD_DEACTIVATED_BIAS))
+diff --cc fs/sysfs/file.c
+index 602f56db0442,e4eca285b390..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -39,52 -44,67 +39,83 @@@ struct sysfs_open_dirent 
+  	atomic_t		refcnt;
+  	atomic_t		event;
+  	wait_queue_head_t	poll;
+ -	struct list_head	files; /* goes through sysfs_open_file.list */
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+  };
+  
+ -static struct sysfs_open_file *sysfs_of(struct file *file)
+ -{
+ -	return ((struct seq_file *)file->private_data)->private;
+ -}
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+ +	struct mutex		mutex;
+ +	int			needs_read_fill;
+ +	int			event;
+ +	struct list_head	list;
+ +};
+  
+ -/*
+ - * Determine the kernfs_ops for the given sysfs_dirent.  This function must
+ - * be called while holding an active reference.
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's 
+ + *	data. 
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+   */
+ -static const struct kernfs_ops *kernfs_ops(struct sysfs_dirent *sd)
+ -{
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+ +{
+++<<<<<<< HEAD
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+++=======
++ 	if (sd->s_flags & SYSFS_FLAG_LOCKDEP)
++ 		lockdep_assert_held(sd);
++ 	return sd->s_attr.ops;
++ }
++ 
++ /*
++  * Determine ktype->sysfs_ops for the given sysfs_dirent.  This function
++  * must be called while holding an active reference.
++  */
++ static const struct sysfs_ops *sysfs_file_ops(struct sysfs_dirent *sd)
++ {
++ 	struct kobject *kobj = sd->s_parent->priv;
++ 
++ 	if (sd->s_flags & SYSFS_FLAG_LOCKDEP)
++ 		lockdep_assert_held(sd);
++ 	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
++ }
++ 
++ /*
++  * Reads on sysfs are handled through seq_file, which takes care of hairy
++  * details like buffering and seeking.  The following function pipes
++  * sysfs_ops->show() result through seq_file.
++  */
++ static int sysfs_kf_seq_show(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 	struct kobject *kobj = of->sd->s_parent->priv;
++ 	const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  	ssize_t count;
+ -	char *buf;
+  
+ -	/* acquire buffer and ensure that it's >= PAGE_SIZE */
+ -	count = seq_get_buf(sf, &buf);
+ -	if (count < PAGE_SIZE) {
+ -		seq_commit(sf, -1);
+ -		return 0;
+ -	}
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+ -	/*
+ -	 * Invoke show().  Control may reach here via seq file lseek even
+ -	 * if @ops->show() isn't implemented.
+ -	 */
+ -	if (ops->show) {
+ -		count = ops->show(kobj, of->sd->priv, buf);
+ -		if (count < 0)
+ -			return count;
+ -	}
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+ +
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+ +
+ +	sysfs_put_active(attr_sd);
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+@@@ -476,99 -898,180 +507,152 @@@ void sysfs_notify(struct kobject *k, co
+  }
+  EXPORT_SYMBOL_GPL(sysfs_notify);
+  
+ -const struct file_operations kernfs_file_operations = {
+ -	.read		= kernfs_file_read,
+ -	.write		= kernfs_file_write,
+ +const struct file_operations sysfs_file_operations = {
+ +	.read		= sysfs_read_file,
+ +	.write		= sysfs_write_file,
+  	.llseek		= generic_file_llseek,
+ -	.mmap		= kernfs_file_mmap,
+ -	.open		= kernfs_file_open,
+ -	.release	= kernfs_file_release,
+ -	.poll		= kernfs_file_poll,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_empty = {
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_ro = {
+ -	.seq_show	= sysfs_kf_seq_show,
+ +	.open		= sysfs_open_file,
+ +	.release	= sysfs_release,
+ +	.poll		= sysfs_poll,
+  };
+  
+ -static const struct kernfs_ops sysfs_file_kfops_wo = {
+ -	.write		= sysfs_kf_write,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_rw = {
+ -	.seq_show	= sysfs_kf_seq_show,
+ -	.write		= sysfs_kf_write,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_bin_kfops_ro = {
+ -	.read		= sysfs_kf_bin_read,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_bin_kfops_wo = {
+ -	.write		= sysfs_kf_bin_write,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_bin_kfops_rw = {
+ -	.read		= sysfs_kf_bin_read,
+ -	.write		= sysfs_kf_bin_write,
+ -	.mmap		= sysfs_kf_bin_mmap,
+ -};
+ -
+ -int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
+ -			   const struct attribute *attr, bool is_bin,
+ -			   umode_t mode, const void *ns)
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+  {
+++<<<<<<< HEAD
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+++=======
++ 	struct lock_class_key *key = NULL;
++ 	const struct kernfs_ops *ops;
++ 	struct sysfs_dirent *sd;
++ 	loff_t size;
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  
+ -	if (!is_bin) {
+ -		struct kobject *kobj = dir_sd->priv;
+ -		const struct sysfs_ops *sysfs_ops = kobj->ktype->sysfs_ops;
+ -
+ -		/* every kobject with an attribute needs a ktype assigned */
+ -		if (WARN(!sysfs_ops, KERN_ERR
+ -			 "missing sysfs attribute operations for kobject: %s\n",
+ -			 kobject_name(kobj)))
+ -			return -EINVAL;
+ -
+ -		if (sysfs_ops->show && sysfs_ops->store)
+ -			ops = &sysfs_file_kfops_rw;
+ -		else if (sysfs_ops->show)
+ -			ops = &sysfs_file_kfops_ro;
+ -		else if (sysfs_ops->store)
+ -			ops = &sysfs_file_kfops_wo;
+ -		else
+ -			ops = &sysfs_file_kfops_empty;
+ -
+ -		size = PAGE_SIZE;
+ -	} else {
+ -		struct bin_attribute *battr = (void *)attr;
+ -
+ -		if ((battr->read && battr->write) || battr->mmap)
+ -			ops = &sysfs_bin_kfops_rw;
+ -		else if (battr->read)
+ -			ops = &sysfs_bin_kfops_ro;
+ -		else if (battr->write)
+ -			ops = &sysfs_bin_kfops_wo;
+ -		else
+ -			ops = &sysfs_file_kfops_empty;
+ -
+ -		size = battr->size;
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+ +
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR "missing sysfs namespace attribute operation for "
+ +		     "kobject: %s\n", kobject_name(kobj));
+++=======
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	if (!attr->ignore_lockdep)
++ 		key = attr->key ?: (struct lock_class_key *)&attr->skey;
++ #endif
++ 	sd = kernfs_create_file_ns_key(dir_sd, attr->name, mode, size,
++ 				       ops, (void *)attr, ns, key);
++ 	if (IS_ERR(sd)) {
++ 		if (PTR_ERR(sd) == -EEXIST)
++ 			sysfs_warn_dup(dir_sd, attr->name);
++ 		return PTR_ERR(sd);
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  	}
+ -	return 0;
+ +	*pns = ns;
+ +	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+++=======
++ /**
++  * kernfs_create_file_ns_key - create a file
++  * @parent: directory to create the file in
++  * @name: name of the file
++  * @mode: mode of the file
++  * @size: size of the file
++  * @ops: kernfs operations for the file
++  * @priv: private data for the file
++  * @ns: optional namespace tag of the file
++  * @key: lockdep key for the file's active_ref, %NULL to disable lockdep
++  *
++  * Returns the created node on success, ERR_PTR() value on error.
++  */
++ struct sysfs_dirent *kernfs_create_file_ns_key(struct sysfs_dirent *parent,
++ 					       const char *name,
++ 					       umode_t mode, loff_t size,
++ 					       const struct kernfs_ops *ops,
++ 					       void *priv, const void *ns,
++ 					       struct lock_class_key *key)
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  {
+ +	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+  	struct sysfs_addrm_cxt acxt;
+  	struct sysfs_dirent *sd;
+ +	const void *ns;
+  	int rc;
+  
+ -	sd = sysfs_new_dirent(name, (mode & S_IALLUGO) | S_IFREG,
+ -			      SYSFS_KOBJ_ATTR);
+ +	rc = sysfs_attr_ns(dir_sd->s_dir.kobj, attr, &ns);
+ +	if (rc)
+ +		return rc;
+ +
+ +	sd = sysfs_new_dirent(attr->name, mode, type);
+  	if (!sd)
+ -		return ERR_PTR(-ENOMEM);
+ +		return -ENOMEM;
+  
+ -	sd->s_attr.ops = ops;
+ -	sd->s_attr.size = size;
+  	sd->s_ns = ns;
+++<<<<<<< HEAD
+ +	sd->s_attr.attr = (void *)attr;
+ +	sysfs_dirent_init_lockdep(sd);
+++=======
++ 	sd->priv = priv;
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	if (key) {
++ 		lockdep_init_map(&sd->dep_map, "s_active", key, 0);
++ 		sd->s_flags |= SYSFS_FLAG_LOCKDEP;
++ 	}
++ #endif
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  
+ -	/*
+ -	 * sd->s_attr.ops is accesible only while holding active ref.  We
+ -	 * need to know whether some ops are implemented outside active
+ -	 * ref.  Cache their existence in flags.
+ -	 */
+ -	if (ops->seq_show)
+ -		sd->s_flags |= SYSFS_FLAG_HAS_SEQ_SHOW;
+ -	if (ops->mmap)
+ -		sd->s_flags |= SYSFS_FLAG_HAS_MMAP;
+ -
+ -	sysfs_addrm_start(&acxt);
+ -	rc = sysfs_add_one(&acxt, sd, parent);
+ +	sysfs_addrm_start(&acxt, dir_sd);
+ +	rc = sysfs_add_one(&acxt, sd);
+  	sysfs_addrm_finish(&acxt);
+  
+ -	if (rc) {
+ +	if (rc)
+  		sysfs_put(sd);
+ -		return ERR_PTR(rc);
+ -	}
+ -	return sd;
+ +
+ +	return rc;
+  }
+  
+ +
+  int sysfs_add_file(struct sysfs_dirent *dir_sd, const struct attribute *attr,
+ -		   bool is_bin)
+ +		   int type)
+  {
+ -	return sysfs_add_file_mode_ns(dir_sd, attr, is_bin, attr->mode, NULL);
+ +	return sysfs_add_file_mode(dir_sd, attr, type, attr->mode);
+  }
+  
+ +
+  /**
+ - * sysfs_create_file_ns - create an attribute file for an object with custom ns
+ - * @kobj: object we're creating for
+ - * @attr: attribute descriptor
+ - * @ns: namespace the new file should belong to
+ + *	sysfs_create_file - create an attribute file for an object.
+ + *	@kobj:	object we're creating for. 
+ + *	@attr:	attribute descriptor.
+   */
+ -int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
+ -			 const void *ns)
+ +
+ +int sysfs_create_file(struct kobject * kobj, const struct attribute * attr)
+  {
+  	BUG_ON(!kobj || !kobj->sd || !attr);
+  
+diff --cc fs/sysfs/sysfs.h
+index d1e4043eb0c3,e93f8b845611..000000000000
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@@ -85,49 -80,25 +85,61 @@@ struct sysfs_dirent 
+  
+  #define SD_DEACTIVATED_BIAS		INT_MIN
+  
+ -#define SYSFS_TYPE_MASK			0x000f
+ +#define SYSFS_TYPE_MASK			0x00ff
+  #define SYSFS_DIR			0x0001
+  #define SYSFS_KOBJ_ATTR			0x0002
+ -#define SYSFS_KOBJ_LINK			0x0004
+ +#define SYSFS_KOBJ_BIN_ATTR		0x0004
+ +#define SYSFS_KOBJ_LINK			0x0008
+  #define SYSFS_COPY_NAME			(SYSFS_DIR | SYSFS_KOBJ_LINK)
+ -#define SYSFS_ACTIVE_REF		SYSFS_KOBJ_ATTR
+ +#define SYSFS_ACTIVE_REF		(SYSFS_KOBJ_ATTR | SYSFS_KOBJ_BIN_ATTR)
+ +
+++<<<<<<< HEAD
+ +/* identify any namespace tag on sysfs_dirents */
+ +#define SYSFS_NS_TYPE_MASK		0xf00
+ +#define SYSFS_NS_TYPE_SHIFT		8
+  
+ +#define SYSFS_FLAG_MASK			~(SYSFS_NS_TYPE_MASK|SYSFS_TYPE_MASK)
+ +#define SYSFS_FLAG_REMOVED		0x02000
+++=======
++ #define SYSFS_FLAG_MASK			~SYSFS_TYPE_MASK
++ #define SYSFS_FLAG_REMOVED		0x0010
++ #define SYSFS_FLAG_NS			0x0020
++ #define SYSFS_FLAG_HAS_SEQ_SHOW		0x0040
++ #define SYSFS_FLAG_HAS_MMAP		0x0080
++ #define SYSFS_FLAG_LOCKDEP		0x0100
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  
+  static inline unsigned int sysfs_type(struct sysfs_dirent *sd)
+  {
+  	return sd->s_flags & SYSFS_TYPE_MASK;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Return any namespace tags on this dirent.
+ + * enum kobj_ns_type is defined in linux/kobject.h
+ + */
+ +static inline enum kobj_ns_type sysfs_ns_type(struct sysfs_dirent *sd)
+ +{
+ +	return (sd->s_flags & SYSFS_NS_TYPE_MASK) >> SYSFS_NS_TYPE_SHIFT;
+ +}
+ +
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +#define sysfs_dirent_init_lockdep(sd)				\
+ +do {								\
+ +	struct attribute *attr = sd->s_attr.attr;		\
+ +	struct lock_class_key *key = attr->key;			\
+ +	if (!key)						\
+ +		key = &attr->skey;				\
+ +								\
+ +	lockdep_init_map(&sd->dep_map, "s_active", key, 0);	\
+ +} while(0)
+ +#else
+ +#define sysfs_dirent_init_lockdep(sd) do {} while(0)
+ +#endif
+ +
+++=======
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  /*
+   * Context structure to be used while adding/removing nodes.
+   */
+diff --cc include/linux/kernfs.h
+index 254b9e872b09,105d09dcb064..000000000000
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@@ -7,6 -7,162 +7,167 @@@
+  #ifndef __LINUX_KERNFS_H
+  #define __LINUX_KERNFS_H
+  
+++<<<<<<< HEAD
+ +struct sysfs_dirent;
+ +
+++=======
++ #include <linux/kernel.h>
++ #include <linux/err.h>
++ #include <linux/list.h>
++ #include <linux/mutex.h>
++ #include <linux/lockdep.h>
++ 
++ struct file;
++ struct iattr;
++ struct seq_file;
++ struct vm_area_struct;
++ 
++ struct sysfs_dirent;
++ 
++ struct sysfs_open_file {
++ 	/* published fields */
++ 	struct sysfs_dirent	*sd;
++ 	struct file		*file;
++ 
++ 	/* private fields, do not use outside kernfs proper */
++ 	struct mutex		mutex;
++ 	int			event;
++ 	struct list_head	list;
++ 
++ 	bool			mmapped;
++ 	const struct vm_operations_struct *vm_ops;
++ };
++ 
++ struct kernfs_ops {
++ 	/*
++ 	 * Read is handled by either seq_file or raw_read().
++ 	 *
++ 	 * If seq_show() is present, seq_file path is active.  Other seq
++ 	 * operations are optional and if not implemented, the behavior is
++ 	 * equivalent to single_open().  @sf->private points to the
++ 	 * associated sysfs_open_file.
++ 	 *
++ 	 * read() is bounced through kernel buffer and a read larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	int (*seq_show)(struct seq_file *sf, void *v);
++ 
++ 	void *(*seq_start)(struct seq_file *sf, loff_t *ppos);
++ 	void *(*seq_next)(struct seq_file *sf, void *v, loff_t *ppos);
++ 	void (*seq_stop)(struct seq_file *sf, void *v);
++ 
++ 	ssize_t (*read)(struct sysfs_open_file *of, char *buf, size_t bytes,
++ 			loff_t off);
++ 
++ 	/*
++ 	 * write() is bounced through kernel buffer and a write larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	ssize_t (*write)(struct sysfs_open_file *of, char *buf, size_t bytes,
++ 			 loff_t off);
++ 
++ 	int (*mmap)(struct sysfs_open_file *of, struct vm_area_struct *vma);
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	struct lock_class_key	lockdep_key;
++ #endif
++ };
++ 
++ #ifdef CONFIG_SYSFS
++ 
++ struct sysfs_dirent *kernfs_create_dir_ns(struct sysfs_dirent *parent,
++ 					  const char *name, void *priv,
++ 					  const void *ns);
++ struct sysfs_dirent *kernfs_create_file_ns_key(struct sysfs_dirent *parent,
++ 					       const char *name,
++ 					       umode_t mode, loff_t size,
++ 					       const struct kernfs_ops *ops,
++ 					       void *priv, const void *ns,
++ 					       struct lock_class_key *key);
++ struct sysfs_dirent *kernfs_create_link(struct sysfs_dirent *parent,
++ 					const char *name,
++ 					struct sysfs_dirent *target);
++ void kernfs_remove(struct sysfs_dirent *sd);
++ int kernfs_remove_by_name_ns(struct sysfs_dirent *parent, const char *name,
++ 			     const void *ns);
++ int kernfs_rename_ns(struct sysfs_dirent *sd, struct sysfs_dirent *new_parent,
++ 		     const char *new_name, const void *new_ns);
++ void kernfs_enable_ns(struct sysfs_dirent *sd);
++ int kernfs_setattr(struct sysfs_dirent *sd, const struct iattr *iattr);
++ void kernfs_notify(struct sysfs_dirent *sd);
++ 
++ #else	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir_ns(struct sysfs_dirent *parent, const char *name, void *priv,
++ 		     const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file_ns_key(struct sysfs_dirent *parent, const char *name,
++ 			  umode_t mode, loff_t size,
++ 			  const struct kernfs_ops *ops, void *priv,
++ 			  const void *ns, struct lock_class_key *key)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_link(struct sysfs_dirent *parent, const char *name,
++ 		   struct sysfs_dirent *target)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_remove(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_remove_by_name_ns(struct sysfs_dirent *parent,
++ 					   const char *name, const void *ns)
++ { return -ENOSYS; }
++ 
++ static inline int kernfs_rename_ns(struct sysfs_dirent *sd,
++ 				   struct sysfs_dirent *new_parent,
++ 				   const char *new_name, const void *new_ns)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_enable_ns(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_setattr(struct sysfs_dirent *sd,
++ 				 const struct iattr *iattr)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_notify(struct sysfs_dirent *sd) { }
++ 
++ #endif	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir(struct sysfs_dirent *parent, const char *name, void *priv)
++ {
++ 	return kernfs_create_dir_ns(parent, name, priv, NULL);
++ }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file_ns(struct sysfs_dirent *parent, const char *name,
++ 		      umode_t mode, loff_t size, const struct kernfs_ops *ops,
++ 		      void *priv, const void *ns)
++ {
++ 	struct lock_class_key *key = NULL;
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	key = (struct lock_class_key *)&ops->lockdep_key;
++ #endif
++ 	return kernfs_create_file_ns_key(parent, name, mode, size, ops, priv,
++ 					 ns, key);
++ }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file(struct sysfs_dirent *parent, const char *name, umode_t mode,
++ 		   loff_t size, const struct kernfs_ops *ops, void *priv)
++ {
++ 	return kernfs_create_file_ns(parent, name, mode, size, ops, priv, NULL);
++ }
++ 
++ static inline int kernfs_remove_by_name(struct sysfs_dirent *parent,
++ 					const char *name)
++ {
++ 	return kernfs_remove_by_name_ns(parent, name, NULL);
++ }
++ 
+++>>>>>>> 517e64f57883 (sysfs, kernfs: revamp sysfs_dirent active_ref lockdep annotation)
+  #endif	/* __LINUX_KERNFS_H */
+* Unmerged path fs/sysfs/dir.c
+* Unmerged path fs/sysfs/file.c
+* Unmerged path fs/sysfs/sysfs.h
+* Unmerged path include/linux/kernfs.h
