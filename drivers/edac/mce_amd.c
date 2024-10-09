@@ -1064,6 +1064,7 @@ EXPORT_SYMBOL_GPL(amd_decode_mce);
 
 static struct notifier_block amd_mce_dec_nb = {
 	.notifier_call	= amd_decode_mce,
+	.priority	= MCE_PRIO_EDAC,
 };
 
 static int __init mce_amd_init(void)
