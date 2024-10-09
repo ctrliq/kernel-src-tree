@@ -1,0 +1,343 @@
+sysfs, kernfs: add kernfs_ops->seq_{start|next|stop}()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit d19b9846df64d8845be682b6318bd1aee246cf60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d19b9846.failed
+
+kernfs_ops currently only supports single_open() behavior which is
+pretty restrictive.  Add optional callbacks ->seq_{start|next|stop}()
+which, when implemented, are invoked for seq_file traversal.  This
+allows full seq_file functionality for kernfs users.  This currently
+doesn't have any user and doesn't change any behavior.
+
+v2: Refreshed on top of the updated "sysfs, kernfs: prepare read path
+    for kernfs".
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d19b9846df64d8845be682b6318bd1aee246cf60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+#	include/linux/kernfs.h
+diff --cc fs/sysfs/file.c
+index 602f56db0442,74e3478d9cb4..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -96,13 -116,154 +96,144 @@@ static int fill_read_buffer(struct dent
+  		/* Try to struggle along */
+  		count = PAGE_SIZE - 1;
+  	}
+ -	seq_commit(sf, count);
+ -	return 0;
+ -}
+ -
+ -static ssize_t sysfs_kf_bin_read(struct sysfs_open_file *of, char *buf,
+ -				 size_t count, loff_t pos)
+ -{
+ -	struct bin_attribute *battr = of->sd->priv;
+ -	struct kobject *kobj = of->sd->s_parent->priv;
+ -	loff_t size = file_inode(of->file)->i_size;
+ -
+ -	if (!count)
+ -		return 0;
+ -
+ -	if (size) {
+ -		if (pos > size)
+ -			return 0;
+ -		if (pos + count > size)
+ -			count = size - pos;
+ +	if (count >= 0) {
+ +		buffer->needs_read_fill = 0;
+ +		buffer->count = count;
+ +	} else {
+ +		ret = count;
+  	}
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 
++ 	if (!battr->read)
++ 		return -EIO;
++ 
++ 	return battr->read(of->file, kobj, battr, buf, pos, count);
++ }
++ 
++ static void *kernfs_seq_start(struct seq_file *sf, loff_t *ppos)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 	const struct kernfs_ops *ops;
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	ops = kernfs_ops(of->sd);
++ 	if (ops->seq_start) {
++ 		return ops->seq_start(sf, ppos);
++ 	} else {
++ 		/*
++ 		 * The same behavior and code as single_open().  Returns
++ 		 * !NULL if pos is at the beginning; otherwise, NULL.
++ 		 */
++ 		return NULL + !*ppos;
++ 	}
++ }
++ 
++ static void *kernfs_seq_next(struct seq_file *sf, void *v, loff_t *ppos)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 	const struct kernfs_ops *ops = kernfs_ops(of->sd);
++ 
++ 	if (ops->seq_next) {
++ 		return ops->seq_next(sf, v, ppos);
++ 	} else {
++ 		/*
++ 		 * The same behavior and code as single_open(), always
++ 		 * terminate after the initial read.
++ 		 */
++ 		++*ppos;
++ 		return NULL;
++ 	}
++ }
++ 
++ static void kernfs_seq_stop(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 	const struct kernfs_ops *ops = kernfs_ops(of->sd);
++ 
++ 	if (ops->seq_stop)
++ 		ops->seq_stop(sf, v);
++ 
++ 	sysfs_put_active(of->sd);
++ 	mutex_unlock(&of->mutex);
++ }
++ 
++ static int kernfs_seq_show(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 
++ 	of->event = atomic_read(&of->sd->s_attr.open->event);
++ 
++ 	return of->sd->s_attr.ops->seq_show(sf, v);
++ }
++ 
++ static const struct seq_operations kernfs_seq_ops = {
++ 	.start = kernfs_seq_start,
++ 	.next = kernfs_seq_next,
++ 	.stop = kernfs_seq_stop,
++ 	.show = kernfs_seq_show,
++ };
++ 
++ /*
++  * As reading a bin file can have side-effects, the exact offset and bytes
++  * specified in read(2) call should be passed to the read callback making
++  * it difficult to use seq_file.  Implement simplistic custom buffering for
++  * bin files.
++  */
++ static ssize_t kernfs_file_direct_read(struct sysfs_open_file *of,
++ 				       char __user *user_buf, size_t count,
++ 				       loff_t *ppos)
++ {
++ 	ssize_t len = min_t(size_t, count, PAGE_SIZE);
++ 	const struct kernfs_ops *ops;
++ 	char *buf;
++ 
++ 	buf = kmalloc(len, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * @of->mutex nests outside active ref and is just to ensure that
++ 	 * the ops aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd)) {
++ 		len = -ENODEV;
++ 		mutex_unlock(&of->mutex);
++ 		goto out_free;
++ 	}
++ 
++ 	ops = kernfs_ops(of->sd);
++ 	if (ops->read)
++ 		len = ops->read(of, buf, len, *ppos);
++ 	else
++ 		len = -EINVAL;
++ 
++ 	sysfs_put_active(of->sd);
++ 	mutex_unlock(&of->mutex);
++ 
++ 	if (len < 0)
++ 		goto out_free;
++ 
++ 	if (copy_to_user(user_buf, buf, len)) {
++ 		len = -EFAULT;
++ 		goto out_free;
++ 	}
++ 
++ 	*ppos += len;
++ 
++  out_free:
++ 	kfree(buf);
++ 	return len;
+++>>>>>>> d19b9846df64 (sysfs, kernfs: add kernfs_ops->seq_{start|next|stop}())
+  }
+  
+  /**
+diff --cc include/linux/kernfs.h
+index 254b9e872b09,ba993ebcd81e..000000000000
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@@ -7,6 -7,138 +7,131 @@@
+  #ifndef __LINUX_KERNFS_H
+  #define __LINUX_KERNFS_H
+  
+ -#include <linux/kernel.h>
+ -#include <linux/err.h>
+ -#include <linux/list.h>
+ -#include <linux/mutex.h>
+ -
+ -struct file;
+ -struct iattr;
+ -struct seq_file;
+ -struct vm_area_struct;
+ -
+  struct sysfs_dirent;
+  
+++<<<<<<< HEAD
+++=======
++ struct sysfs_open_file {
++ 	/* published fields */
++ 	struct sysfs_dirent	*sd;
++ 	struct file		*file;
++ 
++ 	/* private fields, do not use outside kernfs proper */
++ 	struct mutex		mutex;
++ 	int			event;
++ 	struct list_head	list;
++ 
++ 	bool			mmapped;
++ 	const struct vm_operations_struct *vm_ops;
++ };
++ 
++ struct kernfs_ops {
++ 	/*
++ 	 * Read is handled by either seq_file or raw_read().
++ 	 *
++ 	 * If seq_show() is present, seq_file path is active.  Other seq
++ 	 * operations are optional and if not implemented, the behavior is
++ 	 * equivalent to single_open().  @sf->private points to the
++ 	 * associated sysfs_open_file.
++ 	 *
++ 	 * read() is bounced through kernel buffer and a read larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	int (*seq_show)(struct seq_file *sf, void *v);
++ 
++ 	void *(*seq_start)(struct seq_file *sf, loff_t *ppos);
++ 	void *(*seq_next)(struct seq_file *sf, void *v, loff_t *ppos);
++ 	void (*seq_stop)(struct seq_file *sf, void *v);
++ 
++ 	ssize_t (*read)(struct sysfs_open_file *of, char *buf, size_t bytes,
++ 			loff_t off);
++ 
++ 	/*
++ 	 * write() is bounced through kernel buffer and a write larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	ssize_t (*write)(struct sysfs_open_file *of, char *buf, size_t bytes,
++ 			 loff_t off);
++ 
++ 	int (*mmap)(struct sysfs_open_file *of, struct vm_area_struct *vma);
++ };
++ 
++ #ifdef CONFIG_SYSFS
++ 
++ struct sysfs_dirent *kernfs_create_dir_ns(struct sysfs_dirent *parent,
++ 					  const char *name, void *priv,
++ 					  const void *ns);
++ struct sysfs_dirent *kernfs_create_file_ns(struct sysfs_dirent *parent,
++ 					   const char *name,
++ 					   umode_t mode, loff_t size,
++ 					   const struct kernfs_ops *ops,
++ 					   void *priv, const void *ns);
++ struct sysfs_dirent *kernfs_create_link(struct sysfs_dirent *parent,
++ 					const char *name,
++ 					struct sysfs_dirent *target);
++ void kernfs_remove(struct sysfs_dirent *sd);
++ int kernfs_remove_by_name_ns(struct sysfs_dirent *parent, const char *name,
++ 			     const void *ns);
++ int kernfs_rename_ns(struct sysfs_dirent *sd, struct sysfs_dirent *new_parent,
++ 		     const char *new_name, const void *new_ns);
++ void kernfs_enable_ns(struct sysfs_dirent *sd);
++ int kernfs_setattr(struct sysfs_dirent *sd, const struct iattr *iattr);
++ 
++ #else	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir_ns(struct sysfs_dirent *parent, const char *name, void *priv,
++ 		     const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file_ns(struct sysfs_dirent *parent, const char *name,
++ 		      umode_t mode, loff_t size, const struct kernfs_ops *ops,
++ 		      void *priv, const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_link(struct sysfs_dirent *parent, const char *name,
++ 		   struct sysfs_dirent *target)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_remove(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_remove_by_name_ns(struct sysfs_dirent *parent,
++ 					   const char *name, const void *ns)
++ { return -ENOSYS; }
++ 
++ static inline int kernfs_rename_ns(struct sysfs_dirent *sd,
++ 				   struct sysfs_dirent *new_parent,
++ 				   const char *new_name, const void *new_ns)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_enable_ns(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_setattr(struct sysfs_dirent *sd,
++ 				 const struct iattr *iattr)
++ { return -ENOSYS; }
++ 
++ #endif	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_dir(struct sysfs_dirent *parent, const char *name, void *priv)
++ {
++ 	return kernfs_create_dir_ns(parent, name, priv, NULL);
++ }
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_file(struct sysfs_dirent *parent, const char *name, umode_t mode,
++ 		   loff_t size, const struct kernfs_ops *ops, void *priv)
++ {
++ 	return kernfs_create_file_ns(parent, name, mode, size, ops, priv, NULL);
++ }
++ 
++ static inline int kernfs_remove_by_name(struct sysfs_dirent *parent,
++ 					const char *name)
++ {
++ 	return kernfs_remove_by_name_ns(parent, name, NULL);
++ }
++ 
+++>>>>>>> d19b9846df64 (sysfs, kernfs: add kernfs_ops->seq_{start|next|stop}())
+  #endif	/* __LINUX_KERNFS_H */
+* Unmerged path fs/sysfs/file.c
+* Unmerged path include/linux/kernfs.h
