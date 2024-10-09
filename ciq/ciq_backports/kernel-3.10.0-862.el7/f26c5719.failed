@@ -1,0 +1,225 @@
+dm: add dax_device and dax_operations support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit f26c5719b2d7b00de69eb83eb1c1c831759fdc9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f26c5719.failed
+
+Allocate a dax_device to represent the capacity of a device-mapper
+instance. Provide a ->direct_access() method via the new dax_operations
+indirection that mirrors the functionality of the current direct_access
+support via block_device_operations.  Once fs/dax.c has been converted
+to use dax_operations the old dm_blk_direct_access() will be removed.
+
+A new helper dm_dax_get_live_target() is introduced to separate some of
+the dm-specifics from the direct_access implementation.
+
+This enabling is only for the top-level dm representation to upper
+layers. Converting target direct_access implementations is deferred to a
+separate patch.
+
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit f26c5719b2d7b00de69eb83eb1c1c831759fdc9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 3a3e56a9c437,bd56dfe43a99..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -916,18 -921,98 +914,58 @@@ static struct dm_target *dm_dax_get_liv
+  
+  	ti = dm_table_find_target(map, sector);
+  	if (!dm_target_is_valid(ti))
+- 		goto out;
++ 		return NULL;
+  
+- 	len = max_io_len(sector, ti) << SECTOR_SHIFT;
+- 	size = min(len, size);
++ 	return ti;
++ }
+  
+- 	if (ti->type->direct_access)
+- 		ret = ti->type->direct_access(ti, sector, kaddr, pfn, size);
+- out:
++ static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	struct mapped_device *md = dax_get_private(dax_dev);
++ 	sector_t sector = pgoff * PAGE_SECTORS;
++ 	struct dm_target *ti;
++ 	long len, ret = -EIO;
++ 	int srcu_idx;
++ 
++ 	ti = dm_dax_get_live_target(md, sector, &srcu_idx);
++ 
++ 	if (!ti)
++ 		goto out;
++ 	if (!ti->type->direct_access)
++ 		goto out;
++ 	len = max_io_len(sector, ti) / PAGE_SECTORS;
++ 	if (len < 1)
++ 		goto out;
++ 	nr_pages = min(len, nr_pages);
++ 	if (ti->type->direct_access) {
++ 		ret = ti->type->direct_access(ti, sector, kaddr, pfn,
++ 				nr_pages * PAGE_SIZE);
++ 		/*
++ 		 * FIXME: convert ti->type->direct_access to return
++ 		 * nr_pages directly.
++ 		 */
++ 		if (ret >= 0)
++ 			ret /= PAGE_SIZE;
++ 	}
++  out:
+  	dm_put_live_table(md, srcu_idx);
+- 	return min(ret, size);
++ 
++ 	return ret;
++ }
++ 
++ static long dm_blk_direct_access(struct block_device *bdev, sector_t sector,
++ 		void **kaddr, pfn_t *pfn, long size)
++ {
++ 	struct mapped_device *md = bdev->bd_disk->private_data;
++ 	struct dax_device *dax_dev = md->dax_dev;
++ 	long nr_pages = size / PAGE_SIZE;
++ 
++ 	nr_pages = dm_dax_direct_access(dax_dev, sector / PAGE_SECTORS,
++ 			nr_pages, kaddr, pfn);
++ 	return nr_pages < 0 ? nr_pages : nr_pages * PAGE_SIZE;
+  }
+  
+ -/*
+ - * A target may call dm_accept_partial_bio only from the map routine.  It is
+ - * allowed for all bio types except REQ_PREFLUSH.
+ - *
+ - * dm_accept_partial_bio informs the dm that the target only wants to process
+ - * additional n_sectors sectors of the bio and the rest of the data should be
+ - * sent in a next bio.
+ - *
+ - * A diagram that explains the arithmetics:
+ - * +--------------------+---------------+-------+
+ - * |         1          |       2       |   3   |
+ - * +--------------------+---------------+-------+
+ - *
+ - * <-------------- *tio->len_ptr --------------->
+ - *                      <------- bi_size ------->
+ - *                      <-- n_sectors -->
+ - *
+ - * Region 1 was already iterated over with bio_advance or similar function.
+ - *	(it may be empty if the target doesn't use bio_advance)
+ - * Region 2 is the remaining bio size that the target wants to process.
+ - *	(it may be empty if region 1 is non-empty, although there is no reason
+ - *	 to make it empty)
+ - * The target requires that region 3 is to be sent in the next bio.
+ - *
+ - * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
+ - * the partially processed part (the sum of regions 1+2) must be the same for all
+ - * copies of the bio.
+ - */
+ -void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+ -{
+ -	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ -	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+ -	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
+ -	BUG_ON(bi_size > *tio->len_ptr);
+ -	BUG_ON(n_sectors > bi_size);
+ -	*tio->len_ptr -= bi_size - n_sectors;
+ -	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
+ -}
+ -EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+ -
+  /*
+   * Flush current->bio_list when the target map method blocks.
+   * This fixes deadlocks in snapshot and possibly in other targets.
+@@@ -1637,6 -1512,43 +1676,46 @@@ void dm_init_normal_md_queue(struct map
+  	blk_queue_bounce_limit(md->queue, BLK_BOUNCE_ANY);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void cleanup_mapped_device(struct mapped_device *md)
++ {
++ 	if (md->wq)
++ 		destroy_workqueue(md->wq);
++ 	if (md->kworker_task)
++ 		kthread_stop(md->kworker_task);
++ 	mempool_destroy(md->io_pool);
++ 	if (md->bs)
++ 		bioset_free(md->bs);
++ 
++ 	if (md->dax_dev) {
++ 		kill_dax(md->dax_dev);
++ 		put_dax(md->dax_dev);
++ 		md->dax_dev = NULL;
++ 	}
++ 
++ 	if (md->disk) {
++ 		spin_lock(&_minor_lock);
++ 		md->disk->private_data = NULL;
++ 		spin_unlock(&_minor_lock);
++ 		del_gendisk(md->disk);
++ 		put_disk(md->disk);
++ 	}
++ 
++ 	if (md->queue)
++ 		blk_cleanup_queue(md->queue);
++ 
++ 	cleanup_srcu_struct(&md->io_barrier);
++ 
++ 	if (md->bdev) {
++ 		bdput(md->bdev);
++ 		md->bdev = NULL;
++ 	}
++ 
++ 	dm_mq_cleanup_mapped_device(md);
++ }
++ 
+++>>>>>>> f26c5719b2d7 (dm: add dax_device and dax_operations support)
+  /*
+   * Allocate and initialise a blank device with a given minor.
+   */
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index 78f132f95307..ae1b8c2ebd47 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -182,6 +182,7 @@ config BLK_DEV_DM_BUILTIN
+ config BLK_DEV_DM
+ 	tristate "Device mapper support"
+ 	select BLK_DEV_DM_BUILTIN
++	select DAX
+ 	---help---
+ 	  Device-mapper is a low level volume manager.  It works by allowing
+ 	  people to specify mappings for ranges of logical sectors.  Various
+diff --git a/drivers/md/dm-core.h b/drivers/md/dm-core.h
+index 307834df211a..ccd7a1a46137 100644
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -57,6 +57,7 @@ struct mapped_device {
+ 	struct target_type *immutable_target_type;
+ 
+ 	struct gendisk *disk;
++	struct dax_device *dax_dev;
+ 	char name[16];
+ 
+ 	void *interface_ptr;
+* Unmerged path drivers/md/dm.c
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index d1f62607e00c..735fe4bd4925 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -137,6 +137,7 @@ typedef int (*dm_busy_fn) (struct dm_target *ti);
+  */
+ typedef long (*dm_direct_access_fn) (struct dm_target *ti, sector_t sector,
+ 				     void **kaddr, pfn_t *pfn, long size);
++#define PAGE_SECTORS (PAGE_SIZE / 512)
+ 
+ void dm_error(const char *message);
+ 
