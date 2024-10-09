@@ -1,0 +1,150 @@
+ovl: fix relatime for directories
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit cd91304e7190b4c4802f8e413ab2214b233e0260
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cd91304e.failed
+
+Need to treat non-regular overlayfs files the same as regular files when
+checking for an atime update.
+
+Add a d_real() flag to make it return the upper dentry for all file types.
+
+	Reported-by: "zhangyi (F)" <yi.zhang@huawei.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit cd91304e7190b4c4802f8e413ab2214b233e0260)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+#	fs/overlayfs/super.c
+#	include/linux/dcache.h
+diff --cc fs/inode.c
+index 17ad412108c8,eed15033e36b..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -1536,15 -1566,31 +1536,40 @@@ EXPORT_SYMBOL(bmap)
+  /*
+   * Update times in overlayed inode from underlying real inode
+   */
+ -static void update_ovl_inode_times(struct dentry *dentry, struct inode *inode,
+ -			       bool rcu)
+ +static void update_ovl_inode_times(struct dentry *dentry, struct inode *inode)
+  {
+++<<<<<<< HEAD
+ +	struct inode *realinode = d_real_inode(dentry);
+ +
+ +	if (unlikely(inode != realinode) &&
+ +	    (!timespec_equal(&inode->i_mtime, &realinode->i_mtime) ||
+ +	     !timespec_equal(&inode->i_ctime, &realinode->i_ctime))) {
+ +		inode->i_mtime = realinode->i_mtime;
+ +		inode->i_ctime = realinode->i_ctime;
+++=======
++ 	struct dentry *upperdentry;
++ 
++ 	/*
++ 	 * Nothing to do if in rcu or if non-overlayfs
++ 	 */
++ 	if (rcu || likely(!(dentry->d_flags & DCACHE_OP_REAL)))
++ 		return;
++ 
++ 	upperdentry = d_real(dentry, NULL, 0, D_REAL_UPPER);
++ 
++ 	/*
++ 	 * If file is on lower then we can't update atime, so no worries about
++ 	 * stale mtime/ctime.
++ 	 */
++ 	if (upperdentry) {
++ 		struct inode *realinode = d_inode(upperdentry);
++ 
++ 		if ((!timespec_equal(&inode->i_mtime, &realinode->i_mtime) ||
++ 		     !timespec_equal(&inode->i_ctime, &realinode->i_ctime))) {
++ 			inode->i_mtime = realinode->i_mtime;
++ 			inode->i_ctime = realinode->i_ctime;
++ 		}
+++>>>>>>> cd91304e7190 (ovl: fix relatime for directories)
+  	}
+  }
+  
+diff --cc fs/overlayfs/super.c
+index 1736d21e7c3f,cd49c0298ddf..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -83,7 -75,10 +83,14 @@@ static struct dentry *ovl_d_real(struc
+  	struct dentry *real;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (!dentry->d_inode || !S_ISREG(dentry->d_inode->i_mode)) {
+++=======
++ 	if (flags & D_REAL_UPPER)
++ 		return ovl_dentry_upper(dentry);
++ 
++ 	if (!d_is_reg(dentry)) {
+++>>>>>>> cd91304e7190 (ovl: fix relatime for directories)
+  		if (!inode || inode == d_inode(dentry))
+  			return dentry;
+  		goto bug;
+diff --cc include/linux/dcache.h
+index d021d2f76e5c,ed1a7cf6923a..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -570,9 -562,47 +570,50 @@@ static inline struct dentry *d_backing_
+  	return upper;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* d_real() flags */
++ #define D_REAL_UPPER	0x2	/* return upper dentry or NULL if non-upper */
++ 
++ /**
++  * d_real - Return the real dentry
++  * @dentry: the dentry to query
++  * @inode: inode to select the dentry from multiple layers (can be NULL)
++  * @open_flags: open flags to control copy-up behavior
++  * @flags: flags to control what is returned by this function
++  *
++  * If dentry is on a union/overlay, then return the underlying, real dentry.
++  * Otherwise return the dentry itself.
++  *
++  * See also: Documentation/filesystems/vfs.txt
++  */
++ static inline struct dentry *d_real(struct dentry *dentry,
++ 				    const struct inode *inode,
++ 				    unsigned int open_flags, unsigned int flags)
++ {
++ 	if (unlikely(dentry->d_flags & DCACHE_OP_REAL))
++ 		return dentry->d_op->d_real(dentry, inode, open_flags, flags);
++ 	else
++ 		return dentry;
++ }
++ 
++ /**
++  * d_real_inode - Return the real inode
++  * @dentry: The dentry to query
++  *
++  * If dentry is on a union/overlay, then return the underlying, real inode.
++  * Otherwise return d_inode().
++  */
++ static inline struct inode *d_real_inode(const struct dentry *dentry)
++ {
++ 	/* This usage of d_real() results in const dentry */
++ 	return d_backing_inode(d_real((struct dentry *) dentry, NULL, 0, 0));
++ }
++ 
+++>>>>>>> cd91304e7190 (ovl: fix relatime for directories)
+  struct name_snapshot {
+ -	const unsigned char *name;
+ -	unsigned char inline_name[DNAME_INLINE_LEN];
+ +	const char *name;
+ +	char inline_name[DNAME_INLINE_LEN];
+  };
+  void take_dentry_name_snapshot(struct name_snapshot *, struct dentry *);
+  void release_dentry_name_snapshot(struct name_snapshot *);
+* Unmerged path fs/inode.c
+* Unmerged path fs/overlayfs/super.c
+* Unmerged path include/linux/dcache.h
