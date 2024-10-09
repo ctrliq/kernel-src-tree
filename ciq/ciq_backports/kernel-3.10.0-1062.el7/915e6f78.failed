@@ -1,0 +1,444 @@
+x86/kvm/hyper-v: inject #GP only when invalid SINTx vector is unmasked
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] kvm/hyper-v: inject #GP only when invalid SINTx vector is unmasked (Vitaly Kuznetsov) [1631439]
+Rebuild_FUZZ: 97.06%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 915e6f78bd0641da692ffa7e0b766e633e12e628
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/915e6f78.failed
+
+Hyper-V 2016 on KVM with SynIC enabled doesn't boot with the following
+trace:
+
+    kvm_entry:            vcpu 0
+    kvm_exit:             reason MSR_WRITE rip 0xfffff8000131c1e5 info 0 0
+    kvm_hv_synic_set_msr: vcpu_id 0 msr 0x40000090 data 0x10000 host 0
+    kvm_msr:              msr_write 40000090 = 0x10000 (#GP)
+    kvm_inj_exception:    #GP (0x0)
+
+KVM acts according to the following statement from TLFS:
+
+"
+11.8.4 SINTx Registers
+...
+Valid values for vector are 16-255 inclusive. Specifying an invalid
+vector number results in #GP.
+"
+
+However, I checked and genuine Hyper-V doesn't #GP when we write 0x10000
+to SINTx. I checked with Microsoft and they confirmed that if either the
+Masked bit (bit 16) or the Polling bit (bit 18) is set to 1, then they
+ignore the value of Vector. Make KVM act accordingly.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Roman Kagan <rkagan@virtuozzo.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 915e6f78bd0641da692ffa7e0b766e633e12e628)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/hyperv.c
+diff --cc arch/x86/kvm/hyperv.c
+index a44fd11c98a7,9225b3a64579..000000000000
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@@ -30,6 -36,392 +30,395 @@@
+  
+  #include "trace.h"
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 synic_read_sint(struct kvm_vcpu_hv_synic *synic, int sint)
++ {
++ 	return atomic64_read(&synic->sint[sint]);
++ }
++ 
++ static inline int synic_get_sint_vector(u64 sint_value)
++ {
++ 	if (sint_value & HV_SYNIC_SINT_MASKED)
++ 		return -1;
++ 	return sint_value & HV_SYNIC_SINT_VECTOR_MASK;
++ }
++ 
++ static bool synic_has_vector_connected(struct kvm_vcpu_hv_synic *synic,
++ 				      int vector)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++) {
++ 		if (synic_get_sint_vector(synic_read_sint(synic, i)) == vector)
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static bool synic_has_vector_auto_eoi(struct kvm_vcpu_hv_synic *synic,
++ 				     int vector)
++ {
++ 	int i;
++ 	u64 sint_value;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++) {
++ 		sint_value = synic_read_sint(synic, i);
++ 		if (synic_get_sint_vector(sint_value) == vector &&
++ 		    sint_value & HV_SYNIC_SINT_AUTO_EOI)
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static void synic_update_vector(struct kvm_vcpu_hv_synic *synic,
++ 				int vector)
++ {
++ 	if (vector < HV_SYNIC_FIRST_VALID_VECTOR)
++ 		return;
++ 
++ 	if (synic_has_vector_connected(synic, vector))
++ 		__set_bit(vector, synic->vec_bitmap);
++ 	else
++ 		__clear_bit(vector, synic->vec_bitmap);
++ 
++ 	if (synic_has_vector_auto_eoi(synic, vector))
++ 		__set_bit(vector, synic->auto_eoi_bitmap);
++ 	else
++ 		__clear_bit(vector, synic->auto_eoi_bitmap);
++ }
++ 
++ static int synic_set_sint(struct kvm_vcpu_hv_synic *synic, int sint,
++ 			  u64 data, bool host)
++ {
++ 	int vector, old_vector;
++ 	bool masked;
++ 
++ 	vector = data & HV_SYNIC_SINT_VECTOR_MASK;
++ 	masked = data & HV_SYNIC_SINT_MASKED;
++ 
++ 	/*
++ 	 * Valid vectors are 16-255, however, nested Hyper-V attempts to write
++ 	 * default '0x10000' value on boot and this should not #GP. We need to
++ 	 * allow zero-initing the register from host as well.
++ 	 */
++ 	if (vector < HV_SYNIC_FIRST_VALID_VECTOR && !host && !masked)
++ 		return 1;
++ 	/*
++ 	 * Guest may configure multiple SINTs to use the same vector, so
++ 	 * we maintain a bitmap of vectors handled by synic, and a
++ 	 * bitmap of vectors with auto-eoi behavior.  The bitmaps are
++ 	 * updated here, and atomically queried on fast paths.
++ 	 */
++ 	old_vector = synic_read_sint(synic, sint) & HV_SYNIC_SINT_VECTOR_MASK;
++ 
++ 	atomic64_set(&synic->sint[sint], data);
++ 
++ 	synic_update_vector(synic, old_vector);
++ 
++ 	synic_update_vector(synic, vector);
++ 
++ 	/* Load SynIC vectors into EOI exit bitmap */
++ 	kvm_make_request(KVM_REQ_SCAN_IOAPIC, synic_to_vcpu(synic));
++ 	return 0;
++ }
++ 
++ static struct kvm_vcpu *get_vcpu_by_vpidx(struct kvm *kvm, u32 vpidx)
++ {
++ 	struct kvm_vcpu *vcpu = NULL;
++ 	int i;
++ 
++ 	if (vpidx < KVM_MAX_VCPUS)
++ 		vcpu = kvm_get_vcpu(kvm, vpidx);
++ 	if (vcpu && vcpu_to_hv_vcpu(vcpu)->vp_index == vpidx)
++ 		return vcpu;
++ 	kvm_for_each_vcpu(i, vcpu, kvm)
++ 		if (vcpu_to_hv_vcpu(vcpu)->vp_index == vpidx)
++ 			return vcpu;
++ 	return NULL;
++ }
++ 
++ static struct kvm_vcpu_hv_synic *synic_get(struct kvm *kvm, u32 vpidx)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	struct kvm_vcpu_hv_synic *synic;
++ 
++ 	vcpu = get_vcpu_by_vpidx(kvm, vpidx);
++ 	if (!vcpu)
++ 		return NULL;
++ 	synic = vcpu_to_synic(vcpu);
++ 	return (synic->active) ? synic : NULL;
++ }
++ 
++ static void synic_clear_sint_msg_pending(struct kvm_vcpu_hv_synic *synic,
++ 					u32 sint)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	struct page *page;
++ 	gpa_t gpa;
++ 	struct hv_message *msg;
++ 	struct hv_message_page *msg_page;
++ 
++ 	gpa = synic->msg_page & PAGE_MASK;
++ 	page = kvm_vcpu_gfn_to_page(vcpu, gpa >> PAGE_SHIFT);
++ 	if (is_error_page(page)) {
++ 		vcpu_err(vcpu, "Hyper-V SynIC can't get msg page, gpa 0x%llx\n",
++ 			 gpa);
++ 		return;
++ 	}
++ 	msg_page = kmap_atomic(page);
++ 
++ 	msg = &msg_page->sint_message[sint];
++ 	msg->header.message_flags.msg_pending = 0;
++ 
++ 	kunmap_atomic(msg_page);
++ 	kvm_release_page_dirty(page);
++ 	kvm_vcpu_mark_page_dirty(vcpu, gpa >> PAGE_SHIFT);
++ }
++ 
++ static void kvm_hv_notify_acked_sint(struct kvm_vcpu *vcpu, u32 sint)
++ {
++ 	struct kvm *kvm = vcpu->kvm;
++ 	struct kvm_vcpu_hv_synic *synic = vcpu_to_synic(vcpu);
++ 	struct kvm_vcpu_hv *hv_vcpu = vcpu_to_hv_vcpu(vcpu);
++ 	struct kvm_vcpu_hv_stimer *stimer;
++ 	int gsi, idx, stimers_pending;
++ 
++ 	trace_kvm_hv_notify_acked_sint(vcpu->vcpu_id, sint);
++ 
++ 	if (synic->msg_page & HV_SYNIC_SIMP_ENABLE)
++ 		synic_clear_sint_msg_pending(synic, sint);
++ 
++ 	/* Try to deliver pending Hyper-V SynIC timers messages */
++ 	stimers_pending = 0;
++ 	for (idx = 0; idx < ARRAY_SIZE(hv_vcpu->stimer); idx++) {
++ 		stimer = &hv_vcpu->stimer[idx];
++ 		if (stimer->msg_pending &&
++ 		    (stimer->config & HV_STIMER_ENABLE) &&
++ 		    HV_STIMER_SINT(stimer->config) == sint) {
++ 			set_bit(stimer->index,
++ 				hv_vcpu->stimer_pending_bitmap);
++ 			stimers_pending++;
++ 		}
++ 	}
++ 	if (stimers_pending)
++ 		kvm_make_request(KVM_REQ_HV_STIMER, vcpu);
++ 
++ 	idx = srcu_read_lock(&kvm->irq_srcu);
++ 	gsi = atomic_read(&synic->sint_to_gsi[sint]);
++ 	if (gsi != -1)
++ 		kvm_notify_acked_gsi(kvm, gsi);
++ 	srcu_read_unlock(&kvm->irq_srcu, idx);
++ }
++ 
++ static void synic_exit(struct kvm_vcpu_hv_synic *synic, u32 msr)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	struct kvm_vcpu_hv *hv_vcpu = &vcpu->arch.hyperv;
++ 
++ 	hv_vcpu->exit.type = KVM_EXIT_HYPERV_SYNIC;
++ 	hv_vcpu->exit.u.synic.msr = msr;
++ 	hv_vcpu->exit.u.synic.control = synic->control;
++ 	hv_vcpu->exit.u.synic.evt_page = synic->evt_page;
++ 	hv_vcpu->exit.u.synic.msg_page = synic->msg_page;
++ 
++ 	kvm_make_request(KVM_REQ_HV_EXIT, vcpu);
++ }
++ 
++ static int synic_set_msr(struct kvm_vcpu_hv_synic *synic,
++ 			 u32 msr, u64 data, bool host)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	int ret;
++ 
++ 	if (!synic->active)
++ 		return 1;
++ 
++ 	trace_kvm_hv_synic_set_msr(vcpu->vcpu_id, msr, data, host);
++ 
++ 	ret = 0;
++ 	switch (msr) {
++ 	case HV_X64_MSR_SCONTROL:
++ 		synic->control = data;
++ 		if (!host)
++ 			synic_exit(synic, msr);
++ 		break;
++ 	case HV_X64_MSR_SVERSION:
++ 		if (!host) {
++ 			ret = 1;
++ 			break;
++ 		}
++ 		synic->version = data;
++ 		break;
++ 	case HV_X64_MSR_SIEFP:
++ 		if ((data & HV_SYNIC_SIEFP_ENABLE) && !host &&
++ 		    !synic->dont_zero_synic_pages)
++ 			if (kvm_clear_guest(vcpu->kvm,
++ 					    data & PAGE_MASK, PAGE_SIZE)) {
++ 				ret = 1;
++ 				break;
++ 			}
++ 		synic->evt_page = data;
++ 		if (!host)
++ 			synic_exit(synic, msr);
++ 		break;
++ 	case HV_X64_MSR_SIMP:
++ 		if ((data & HV_SYNIC_SIMP_ENABLE) && !host &&
++ 		    !synic->dont_zero_synic_pages)
++ 			if (kvm_clear_guest(vcpu->kvm,
++ 					    data & PAGE_MASK, PAGE_SIZE)) {
++ 				ret = 1;
++ 				break;
++ 			}
++ 		synic->msg_page = data;
++ 		if (!host)
++ 			synic_exit(synic, msr);
++ 		break;
++ 	case HV_X64_MSR_EOM: {
++ 		int i;
++ 
++ 		for (i = 0; i < ARRAY_SIZE(synic->sint); i++)
++ 			kvm_hv_notify_acked_sint(vcpu, i);
++ 		break;
++ 	}
++ 	case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++ 		ret = synic_set_sint(synic, msr - HV_X64_MSR_SINT0, data, host);
++ 		break;
++ 	default:
++ 		ret = 1;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int synic_get_msr(struct kvm_vcpu_hv_synic *synic, u32 msr, u64 *pdata)
++ {
++ 	int ret;
++ 
++ 	if (!synic->active)
++ 		return 1;
++ 
++ 	ret = 0;
++ 	switch (msr) {
++ 	case HV_X64_MSR_SCONTROL:
++ 		*pdata = synic->control;
++ 		break;
++ 	case HV_X64_MSR_SVERSION:
++ 		*pdata = synic->version;
++ 		break;
++ 	case HV_X64_MSR_SIEFP:
++ 		*pdata = synic->evt_page;
++ 		break;
++ 	case HV_X64_MSR_SIMP:
++ 		*pdata = synic->msg_page;
++ 		break;
++ 	case HV_X64_MSR_EOM:
++ 		*pdata = 0;
++ 		break;
++ 	case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++ 		*pdata = atomic64_read(&synic->sint[msr - HV_X64_MSR_SINT0]);
++ 		break;
++ 	default:
++ 		ret = 1;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int synic_set_irq(struct kvm_vcpu_hv_synic *synic, u32 sint)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	struct kvm_lapic_irq irq;
++ 	int ret, vector;
++ 
++ 	if (sint >= ARRAY_SIZE(synic->sint))
++ 		return -EINVAL;
++ 
++ 	vector = synic_get_sint_vector(synic_read_sint(synic, sint));
++ 	if (vector < 0)
++ 		return -ENOENT;
++ 
++ 	memset(&irq, 0, sizeof(irq));
++ 	irq.shorthand = APIC_DEST_SELF;
++ 	irq.dest_mode = APIC_DEST_PHYSICAL;
++ 	irq.delivery_mode = APIC_DM_FIXED;
++ 	irq.vector = vector;
++ 	irq.level = 1;
++ 
++ 	ret = kvm_irq_delivery_to_apic(vcpu->kvm, vcpu->arch.apic, &irq, NULL);
++ 	trace_kvm_hv_synic_set_irq(vcpu->vcpu_id, sint, irq.vector, ret);
++ 	return ret;
++ }
++ 
++ int kvm_hv_synic_set_irq(struct kvm *kvm, u32 vpidx, u32 sint)
++ {
++ 	struct kvm_vcpu_hv_synic *synic;
++ 
++ 	synic = synic_get(kvm, vpidx);
++ 	if (!synic)
++ 		return -EINVAL;
++ 
++ 	return synic_set_irq(synic, sint);
++ }
++ 
++ void kvm_hv_synic_send_eoi(struct kvm_vcpu *vcpu, int vector)
++ {
++ 	struct kvm_vcpu_hv_synic *synic = vcpu_to_synic(vcpu);
++ 	int i;
++ 
++ 	trace_kvm_hv_synic_send_eoi(vcpu->vcpu_id, vector);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++)
++ 		if (synic_get_sint_vector(synic_read_sint(synic, i)) == vector)
++ 			kvm_hv_notify_acked_sint(vcpu, i);
++ }
++ 
++ static int kvm_hv_set_sint_gsi(struct kvm *kvm, u32 vpidx, u32 sint, int gsi)
++ {
++ 	struct kvm_vcpu_hv_synic *synic;
++ 
++ 	synic = synic_get(kvm, vpidx);
++ 	if (!synic)
++ 		return -EINVAL;
++ 
++ 	if (sint >= ARRAY_SIZE(synic->sint_to_gsi))
++ 		return -EINVAL;
++ 
++ 	atomic_set(&synic->sint_to_gsi[sint], gsi);
++ 	return 0;
++ }
++ 
++ void kvm_hv_irq_routing_update(struct kvm *kvm)
++ {
++ 	struct kvm_irq_routing_table *irq_rt;
++ 	struct kvm_kernel_irq_routing_entry *e;
++ 	u32 gsi;
++ 
++ 	irq_rt = srcu_dereference_check(kvm->irq_routing, &kvm->irq_srcu,
++ 					lockdep_is_held(&kvm->irq_lock));
++ 
++ 	for (gsi = 0; gsi < irq_rt->nr_rt_entries; gsi++) {
++ 		hlist_for_each_entry(e, &irq_rt->map[gsi], link) {
++ 			if (e->type == KVM_IRQ_ROUTING_HV_SINT)
++ 				kvm_hv_set_sint_gsi(kvm, e->hv_sint.vcpu,
++ 						    e->hv_sint.sint, gsi);
++ 		}
++ 	}
++ }
++ 
++ static void synic_init(struct kvm_vcpu_hv_synic *synic)
++ {
++ 	int i;
++ 
++ 	memset(synic, 0, sizeof(*synic));
++ 	synic->version = HV_SYNIC_VERSION_1;
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++) {
++ 		atomic64_set(&synic->sint[i], HV_SYNIC_SINT_MASKED);
++ 		atomic_set(&synic->sint_to_gsi[i], -1);
++ 	}
++ }
++ 
+++>>>>>>> 915e6f78bd06 (x86/kvm/hyper-v: inject #GP only when invalid SINTx vector is unmasked)
+  static u64 get_time_ref_counter(struct kvm *kvm)
+  {
+  	struct kvm_hv *hv = &kvm->arch.hyperv;
+* Unmerged path arch/x86/kvm/hyperv.c
