@@ -1,0 +1,617 @@
+x86: Prepare inline-asm for straight-line-speculation
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b17c2baa305cccbd16bafa289fd743cc2db77966
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/b17c2baa.failed
+
+Replace all ret/retq instructions with ASM_RET in preparation of
+making it more than a single instruction.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211204134907.964635458@infradead.org
+(cherry picked from commit b17c2baa305cccbd16bafa289fd743cc2db77966)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/paravirt.h
+#	arch/x86/kernel/alternative.c
+#	arch/x86/kernel/kprobes/core.c
+#	arch/x86/kernel/paravirt.c
+#	arch/x86/kvm/emulate.c
+#	arch/x86/lib/error-inject.c
+#	samples/ftrace/ftrace-direct-modify.c
+#	samples/ftrace/ftrace-direct-too.c
+#	samples/ftrace/ftrace-direct.c
+diff --cc arch/x86/include/asm/paravirt.h
+index b62cb9297173,ce1148c5620b..000000000000
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@@ -769,9 -671,13 +769,14 @@@ static __always_inline void __ticket_un
+  	    "call " #func ";"						\
+  	    PV_RESTORE_ALL_CALLER_REGS					\
+  	    FRAME_END							\
+++<<<<<<< HEAD
+ +	    "ret;"							\
+++=======
++ 	    ASM_RET							\
++ 	    ".size " PV_THUNK_NAME(func) ", .-" PV_THUNK_NAME(func) ";"	\
+++>>>>>>> b17c2baa305c (x86: Prepare inline-asm for straight-line-speculation)
+  	    ".popsection")
+  
+ -#define PV_CALLEE_SAVE_REGS_THUNK(func)			\
+ -	__PV_CALLEE_SAVE_REGS_THUNK(func, ".text")
+ -
+  /* Get a reference to a callee-save function */
+  #define PV_CALLEE_SAVE(func)						\
+  	((struct paravirt_callee_save) { __raw_callee_save_##func })
+diff --cc arch/x86/kernel/alternative.c
+index 137dcbca27ba,175cde66a1ae..000000000000
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@@ -470,11 -691,98 +470,97 @@@ extern struct paravirt_patch_site __sta
+  	__stop_parainstructions[];
+  #endif	/* CONFIG_PARAVIRT */
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Self-test for the INT3 based CALL emulation code.
++  *
++  * This exercises int3_emulate_call() to make sure INT3 pt_regs are set up
++  * properly and that there is a stack gap between the INT3 frame and the
++  * previous context. Without this gap doing a virtual PUSH on the interrupted
++  * stack would corrupt the INT3 IRET frame.
++  *
++  * See entry_{32,64}.S for more details.
++  */
++ 
++ /*
++  * We define the int3_magic() function in assembly to control the calling
++  * convention such that we can 'call' it from assembly.
++  */
++ 
++ extern void int3_magic(unsigned int *ptr); /* defined in asm */
++ 
++ asm (
++ "	.pushsection	.init.text, \"ax\", @progbits\n"
++ "	.type		int3_magic, @function\n"
++ "int3_magic:\n"
++ "	movl	$1, (%" _ASM_ARG1 ")\n"
++ 	ASM_RET
++ "	.size		int3_magic, .-int3_magic\n"
++ "	.popsection\n"
++ );
++ 
++ extern __initdata unsigned long int3_selftest_ip; /* defined in asm below */
++ 
++ static int __init
++ int3_exception_notify(struct notifier_block *self, unsigned long val, void *data)
++ {
++ 	struct die_args *args = data;
++ 	struct pt_regs *regs = args->regs;
++ 
++ 	if (!regs || user_mode(regs))
++ 		return NOTIFY_DONE;
++ 
++ 	if (val != DIE_INT3)
++ 		return NOTIFY_DONE;
++ 
++ 	if (regs->ip - INT3_INSN_SIZE != int3_selftest_ip)
++ 		return NOTIFY_DONE;
++ 
++ 	int3_emulate_call(regs, (unsigned long)&int3_magic);
++ 	return NOTIFY_STOP;
++ }
++ 
++ static void __init int3_selftest(void)
++ {
++ 	static __initdata struct notifier_block int3_exception_nb = {
++ 		.notifier_call	= int3_exception_notify,
++ 		.priority	= INT_MAX-1, /* last */
++ 	};
++ 	unsigned int val = 0;
++ 
++ 	BUG_ON(register_die_notifier(&int3_exception_nb));
++ 
++ 	/*
++ 	 * Basically: int3_magic(&val); but really complicated :-)
++ 	 *
++ 	 * Stick the address of the INT3 instruction into int3_selftest_ip,
++ 	 * then trigger the INT3, padded with NOPs to match a CALL instruction
++ 	 * length.
++ 	 */
++ 	asm volatile ("1: int3; nop; nop; nop; nop\n\t"
++ 		      ".pushsection .init.data,\"aw\"\n\t"
++ 		      ".align " __ASM_SEL(4, 8) "\n\t"
++ 		      ".type int3_selftest_ip, @object\n\t"
++ 		      ".size int3_selftest_ip, " __ASM_SEL(4, 8) "\n\t"
++ 		      "int3_selftest_ip:\n\t"
++ 		      __ASM_SEL(.long, .quad) " 1b\n\t"
++ 		      ".popsection\n\t"
++ 		      : ASM_CALL_CONSTRAINT
++ 		      : __ASM_SEL_RAW(a, D) (&val)
++ 		      : "memory");
++ 
++ 	BUG_ON(val != 1);
++ 
++ 	unregister_die_notifier(&int3_exception_nb);
++ }
++ 
+++>>>>>>> b17c2baa305c (x86: Prepare inline-asm for straight-line-speculation)
+  void __init alternative_instructions(void)
+  {
+ -	int3_selftest();
+ -
+ -	/*
+ -	 * The patching is not fully atomic, so try to avoid local
+ -	 * interruptions that might execute the to be patched code.
+ -	 * Other CPUs are not running.
+ -	 */
+ +	/* The patching is not fully atomic, so try to avoid local interruptions
+ +	   that might execute the to be patched code.
+ +	   Other CPUs are not running. */
+  	stop_nmi();
+  
+  	/*
+diff --cc arch/x86/kernel/kprobes/core.c
+index c81494082474,6290712cb36d..000000000000
+--- a/arch/x86/kernel/kprobes/core.c
++++ b/arch/x86/kernel/kprobes/core.c
+@@@ -643,275 -1017,97 +643,300 @@@ static int __kprobes kprobe_handler(str
+   * When a retprobed function returns, this code saves registers and
+   * calls trampoline_handler() runs, which calls the kretprobe's handler.
+   */
+ -asm(
+ -	".text\n"
+ -	".global __kretprobe_trampoline\n"
+ -	".type __kretprobe_trampoline, @function\n"
+ -	"__kretprobe_trampoline:\n"
+ +static void __used __kprobes kretprobe_trampoline_holder(void)
+ +{
+ +	asm volatile (
+ +			".global kretprobe_trampoline\n"
+ +			"kretprobe_trampoline: \n"
+  #ifdef CONFIG_X86_64
+ -	/* Push a fake return address to tell the unwinder it's a kretprobe. */
+ -	"	pushq $__kretprobe_trampoline\n"
+ -	UNWIND_HINT_FUNC
+ -	/* Save the 'sp - 8', this will be fixed later. */
+ -	"	pushq %rsp\n"
+ -	"	pushfq\n"
+ -	SAVE_REGS_STRING
+ -	"	movq %rsp, %rdi\n"
+ -	"	call trampoline_handler\n"
+ -	RESTORE_REGS_STRING
+ -	/* In trampoline_handler(), 'regs->flags' is copied to 'regs->sp'. */
+ -	"	addq $8, %rsp\n"
+ -	"	popfq\n"
+ +			/* We don't bother saving the ss register */
+ +			"	pushq %rsp\n"
+ +			"	pushfq\n"
+ +			SAVE_REGS_STRING
+ +			"	movq %rsp, %rdi\n"
+ +			"	call trampoline_handler\n"
+ +			/* Replace saved sp with true return address. */
+ +			"	movq %rax, 152(%rsp)\n"
+ +			RESTORE_REGS_STRING
+ +			"	popfq\n"
+  #else
+ -	/* Push a fake return address to tell the unwinder it's a kretprobe. */
+ -	"	pushl $__kretprobe_trampoline\n"
+ -	UNWIND_HINT_FUNC
+ -	/* Save the 'sp - 4', this will be fixed later. */
+ -	"	pushl %esp\n"
+ -	"	pushfl\n"
+ -	SAVE_REGS_STRING
+ -	"	movl %esp, %eax\n"
+ -	"	call trampoline_handler\n"
+ -	RESTORE_REGS_STRING
+ -	/* In trampoline_handler(), 'regs->flags' is copied to 'regs->sp'. */
+ -	"	addl $4, %esp\n"
+ -	"	popfl\n"
+ +			"	pushf\n"
+ +			SAVE_REGS_STRING
+ +			"	movl %esp, %eax\n"
+ +			"	call trampoline_handler\n"
+ +			/* Move flags to cs */
+ +			"	movl 56(%esp), %edx\n"
+ +			"	movl %edx, 52(%esp)\n"
+ +			/* Replace saved flags with true return address. */
+ +			"	movl %eax, 56(%esp)\n"
+ +			RESTORE_REGS_STRING
+ +			"	popf\n"
+  #endif
+++<<<<<<< HEAD
+ +			"	ret\n");
+++=======
++ 	ASM_RET
++ 	".size __kretprobe_trampoline, .-__kretprobe_trampoline\n"
++ );
++ NOKPROBE_SYMBOL(__kretprobe_trampoline);
++ /*
++  * __kretprobe_trampoline() skips updating frame pointer. The frame pointer
++  * saved in trampoline_handler() points to the real caller function's
++  * frame pointer. Thus the __kretprobe_trampoline() doesn't have a
++  * standard stack frame with CONFIG_FRAME_POINTER=y.
++  * Let's mark it non-standard function. Anyway, FP unwinder can correctly
++  * unwind without the hint.
++  */
++ STACK_FRAME_NON_STANDARD_FP(__kretprobe_trampoline);
++ 
++ /* This is called from kretprobe_trampoline_handler(). */
++ void arch_kretprobe_fixup_return(struct pt_regs *regs,
++ 				 kprobe_opcode_t *correct_ret_addr)
++ {
++ 	unsigned long *frame_pointer = &regs->sp + 1;
++ 
++ 	/* Replace fake return address with real one. */
++ 	*frame_pointer = (unsigned long)correct_ret_addr;
+++>>>>>>> b17c2baa305c (x86: Prepare inline-asm for straight-line-speculation)
+  }
+ +STACK_FRAME_NON_STANDARD(kretprobe_trampoline_holder);
+ +STACK_FRAME_NON_STANDARD(kretprobe_trampoline);
+  
+  /*
+ - * Called from __kretprobe_trampoline
+ + * Called from kretprobe_trampoline
+   */
+ -__used __visible void trampoline_handler(struct pt_regs *regs)
+ +__visible __used __kprobes void *trampoline_handler(struct pt_regs *regs)
+  {
+ -	unsigned long *frame_pointer;
+ -
+ +	struct kretprobe_instance *ri = NULL;
+ +	struct hlist_head *head, empty_rp;
+ +	struct hlist_node *tmp;
+ +	unsigned long flags, orig_ret_address = 0;
+ +	unsigned long trampoline_address = (unsigned long)&kretprobe_trampoline;
+ +	kprobe_opcode_t *correct_ret_addr = NULL;
+ +
+ +	INIT_HLIST_HEAD(&empty_rp);
+ +	kretprobe_hash_lock(current, &head, &flags);
+  	/* fixup registers */
+ +#ifdef CONFIG_X86_64
+  	regs->cs = __KERNEL_CS;
+ -#ifdef CONFIG_X86_32
+ +#else
+ +	regs->cs = __KERNEL_CS | get_kernel_rpl();
+  	regs->gs = 0;
+  #endif
+ -	regs->ip = (unsigned long)&__kretprobe_trampoline;
+ +	regs->ip = trampoline_address;
+  	regs->orig_ax = ~0UL;
+ -	regs->sp += sizeof(long);
+ -	frame_pointer = &regs->sp + 1;
+  
+  	/*
+ -	 * The return address at 'frame_pointer' is recovered by the
+ -	 * arch_kretprobe_fixup_return() which called from the
+ -	 * kretprobe_trampoline_handler().
+ +	 * It is possible to have multiple instances associated with a given
+ +	 * task either because multiple functions in the call path have
+ +	 * return probes installed on them, and/or more than one
+ +	 * return probe was registered for a target function.
+ +	 *
+ +	 * We can handle this because:
+ +	 *     - instances are always pushed into the head of the list
+ +	 *     - when multiple return probes are registered for the same
+ +	 *	 function, the (chronologically) first instance's ret_addr
+ +	 *	 will be the real return address, and all the rest will
+ +	 *	 point to kretprobe_trampoline.
+  	 */
+ -	kretprobe_trampoline_handler(regs, frame_pointer);
+ +	hlist_for_each_entry_safe(ri, tmp, head, hlist) {
+ +		if (ri->task != current)
+ +			/* another task is sharing our hash bucket */
+ +			continue;
+ +
+ +		orig_ret_address = (unsigned long)ri->ret_addr;
+ +
+ +		if (orig_ret_address != trampoline_address)
+ +			/*
+ +			 * This is the real return address. Any other
+ +			 * instances associated with this task are for
+ +			 * other calls deeper on the call stack
+ +			 */
+ +			break;
+ +	}
+ +
+ +	kretprobe_assert(ri, orig_ret_address, trampoline_address);
+ +
+ +	correct_ret_addr = ri->ret_addr;
+ +	hlist_for_each_entry_safe(ri, tmp, head, hlist) {
+ +		if (ri->task != current)
+ +			/* another task is sharing our hash bucket */
+ +			continue;
+ +
+ +		orig_ret_address = (unsigned long)ri->ret_addr;
+ +		if (ri->rp && ri->rp->handler) {
+ +			__this_cpu_write(current_kprobe, &ri->rp->kp);
+ +			get_kprobe_ctlblk()->kprobe_status = KPROBE_HIT_ACTIVE;
+ +			ri->ret_addr = correct_ret_addr;
+ +			ri->rp->handler(ri, regs);
+ +			__this_cpu_write(current_kprobe, NULL);
+ +		}
+ +
+ +		recycle_rp_inst(ri, &empty_rp);
+ +
+ +		if (orig_ret_address != trampoline_address)
+ +			/*
+ +			 * This is the real return address. Any other
+ +			 * instances associated with this task are for
+ +			 * other calls deeper on the call stack
+ +			 */
+ +			break;
+ +	}
+ +
+ +	kretprobe_hash_unlock(current, &flags);
+ +
+ +	hlist_for_each_entry_safe(ri, tmp, &empty_rp, hlist) {
+ +		hlist_del(&ri->hlist);
+ +		kfree(ri);
+ +	}
+ +	return (void *)orig_ret_address;
+ +}
+ +
+ +/*
+ + * Called after single-stepping.  p->addr is the address of the
+ + * instruction whose first byte has been replaced by the "int 3"
+ + * instruction.  To avoid the SMP problems that can occur when we
+ + * temporarily put back the original opcode to single-step, we
+ + * single-stepped a copy of the instruction.  The address of this
+ + * copy is p->ainsn.insn.
+ + *
+ + * This function prepares to return from the post-single-step
+ + * interrupt.  We have to fix up the stack as follows:
+ + *
+ + * 0) Except in the case of absolute or indirect jump or call instructions,
+ + * the new ip is relative to the copied instruction.  We need to make
+ + * it relative to the original instruction.
+ + *
+ + * 1) If the single-stepped instruction was pushfl, then the TF and IF
+ + * flags are set in the just-pushed flags, and may need to be cleared.
+ + *
+ + * 2) If the single-stepped instruction was a call, the return address
+ + * that is atop the stack is the address following the copied instruction.
+ + * We need to make it the address following the original instruction.
+ + *
+ + * If this is the first time we've single-stepped the instruction at
+ + * this probepoint, and the instruction is boostable, boost it: add a
+ + * jump instruction after the copied instruction, that jumps to the next
+ + * instruction after the probepoint.
+ + */
+ +static void __kprobes
+ +resume_execution(struct kprobe *p, struct pt_regs *regs, struct kprobe_ctlblk *kcb)
+ +{
+ +	unsigned long *tos = stack_addr(regs);
+ +	unsigned long copy_ip = (unsigned long)p->ainsn.insn;
+ +	unsigned long orig_ip = (unsigned long)p->addr;
+ +	kprobe_opcode_t *insn = p->ainsn.insn;
+ +
+ +	/* Skip prefixes */
+ +	insn = skip_prefixes(insn);
+ +
+ +	regs->flags &= ~X86_EFLAGS_TF;
+ +	switch (*insn) {
+ +	case 0x9c:	/* pushfl */
+ +		*tos &= ~(X86_EFLAGS_TF | X86_EFLAGS_IF);
+ +		*tos |= kcb->kprobe_old_flags;
+ +		break;
+ +	case 0xc2:	/* iret/ret/lret */
+ +	case 0xc3:
+ +	case 0xca:
+ +	case 0xcb:
+ +	case 0xcf:
+ +	case 0xea:	/* jmp absolute -- ip is correct */
+ +		/* ip is already adjusted, no more changes required */
+ +		p->ainsn.boostable = 1;
+ +		goto no_change;
+ +	case 0xe8:	/* call relative - Fix return addr */
+ +		*tos = orig_ip + (*tos - copy_ip);
+ +		break;
+ +#ifdef CONFIG_X86_32
+ +	case 0x9a:	/* call absolute -- same as call absolute, indirect */
+ +		*tos = orig_ip + (*tos - copy_ip);
+ +		goto no_change;
+ +#endif
+ +	case 0xff:
+ +		if ((insn[1] & 0x30) == 0x10) {
+ +			/*
+ +			 * call absolute, indirect
+ +			 * Fix return addr; ip is correct.
+ +			 * But this is not boostable
+ +			 */
+ +			*tos = orig_ip + (*tos - copy_ip);
+ +			goto no_change;
+ +		} else if (((insn[1] & 0x31) == 0x20) ||
+ +			   ((insn[1] & 0x31) == 0x21)) {
+ +			/*
+ +			 * jmp near and far, absolute indirect
+ +			 * ip is correct. And this is boostable
+ +			 */
+ +			p->ainsn.boostable = 1;
+ +			goto no_change;
+ +		}
+ +	default:
+ +		break;
+ +	}
+ +
+ +	if (p->ainsn.boostable == 0) {
+ +		if ((regs->ip > copy_ip) &&
+ +		    (regs->ip - copy_ip) + 5 < MAX_INSN_SIZE) {
+ +			/*
+ +			 * These instructions can be executed directly if it
+ +			 * jumps back to correct address.
+ +			 */
+ +			synthesize_reljump((void *)regs->ip,
+ +				(void *)orig_ip + (regs->ip - copy_ip));
+ +			p->ainsn.boostable = 1;
+ +		} else {
+ +			p->ainsn.boostable = -1;
+ +		}
+ +	}
+ +
+ +	regs->ip += orig_ip - copy_ip;
+ +
+ +no_change:
+ +	restore_btf();
+ +}
+ +
+ +/*
+ + * Interrupts are disabled on entry as trap1 is an interrupt gate and they
+ + * remain disabled throughout this function.
+ + */
+ +static int __kprobes post_kprobe_handler(struct pt_regs *regs)
+ +{
+ +	struct kprobe *cur = kprobe_running();
+ +	struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
+ +
+ +	if (!cur)
+ +		return 0;
+ +
+ +	resume_execution(cur, regs, kcb);
+ +	regs->flags |= kcb->kprobe_saved_flags;
+ +
+ +	if ((kcb->kprobe_status != KPROBE_REENTER) && cur->post_handler) {
+ +		kcb->kprobe_status = KPROBE_HIT_SSDONE;
+ +		cur->post_handler(cur, regs, 0);
+ +	}
+ +
+ +	/* Restore back the original saved kprobes variables and continue. */
+ +	if (kcb->kprobe_status == KPROBE_REENTER) {
+ +		restore_previous_kprobe(kcb);
+ +		goto out;
+ +	}
+ +	reset_current_kprobe();
+ +out:
+ +	preempt_enable_no_resched();
+  
+  	/*
+ -	 * Copy FLAGS to 'pt_regs::sp' so that __kretprobe_trapmoline()
+ -	 * can do RET right after POPF.
+ +	 * if somebody else is singlestepping across a probe point, flags
+ +	 * will have TF set, in which case, continue the remaining processing
+ +	 * of do_debug, as if this is not a probe hit.
+  	 */
+ -	regs->sp = regs->flags;
+ +	if (regs->flags & X86_EFLAGS_TF)
+ +		return 0;
+ +
+ +	return 1;
+  }
+ -NOKPROBE_SYMBOL(trampoline_handler);
+  
+ -int kprobe_fault_handler(struct pt_regs *regs, int trapnr)
+ +int __kprobes kprobe_fault_handler(struct pt_regs *regs, int trapnr)
+  {
+  	struct kprobe *cur = kprobe_running();
+  	struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
+diff --cc arch/x86/kernel/paravirt.c
+index da6c7e5ee57d,4420499f7bb4..000000000000
+--- a/arch/x86/kernel/paravirt.c
++++ b/arch/x86/kernel/paravirt.c
+@@@ -53,16 -46,16 +53,28 @@@ asm (".pushsection .entry.text, \"ax\"\
+       ".type _paravirt_nop, @function\n\t"
+       ".popsection");
+  
+++<<<<<<< HEAD
+ +/* identity function, which can be inlined */
+ +u32 notrace _paravirt_ident_32(u32 x)
+ +{
+ +	return x;
+ +}
+++=======
++ /* stub always returning 0. */
++ asm (".pushsection .entry.text, \"ax\"\n"
++      ".global paravirt_ret0\n"
++      "paravirt_ret0:\n\t"
++      "xor %" _ASM_AX ", %" _ASM_AX ";\n\t"
++      ASM_RET
++      ".size paravirt_ret0, . - paravirt_ret0\n\t"
++      ".type paravirt_ret0, @function\n\t"
++      ".popsection");
+++>>>>>>> b17c2baa305c (x86: Prepare inline-asm for straight-line-speculation)
+  
+ +u64 notrace _paravirt_ident_64(u64 x)
+ +{
+ +	return x;
+ +}
+  
+  void __init default_banner(void)
+  {
+diff --cc arch/x86/kvm/emulate.c
+index 1574e4d3dcf1,b026350c04c7..000000000000
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@@ -461,8 -435,7 +461,12 @@@ static int fastop(struct x86_emulate_ct
+  	__FOP_RET(#op)
+  
+  asm(".pushsection .fixup, \"ax\"\n"
+++<<<<<<< HEAD
+ +    ".global kvm_fastop_exception \n"
+ +    "kvm_fastop_exception: xor %esi, %esi; ret\n"
+++=======
++     "kvm_fastop_exception: xor %esi, %esi; " ASM_RET
+++>>>>>>> b17c2baa305c (x86: Prepare inline-asm for straight-line-speculation)
+      ".popsection");
+  
+  FOP_START(setcc)
+* Unmerged path arch/x86/lib/error-inject.c
+* Unmerged path samples/ftrace/ftrace-direct-modify.c
+* Unmerged path samples/ftrace/ftrace-direct-too.c
+* Unmerged path samples/ftrace/ftrace-direct.c
+diff --git a/arch/x86/include/asm/linkage.h b/arch/x86/include/asm/linkage.h
+index 79327e9483a3..8af5470cb28d 100644
+--- a/arch/x86/include/asm/linkage.h
++++ b/arch/x86/include/asm/linkage.h
+@@ -55,6 +55,10 @@
+ #define __ALIGN_STR	__stringify(__ALIGN)
+ #endif
+ 
++#else /* __ASSEMBLY__ */
++
++#define ASM_RET	"ret\n\t"
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _ASM_X86_LINKAGE_H */
+* Unmerged path arch/x86/include/asm/paravirt.h
+diff --git a/arch/x86/include/asm/qspinlock_paravirt.h b/arch/x86/include/asm/qspinlock_paravirt.h
+index 9d55f9b6e167..149ff1e5888a 100644
+--- a/arch/x86/include/asm/qspinlock_paravirt.h
++++ b/arch/x86/include/asm/qspinlock_paravirt.h
+@@ -48,7 +48,7 @@ asm    (".pushsection .text;"
+ 	"jne   .slowpath;"
+ 	"pop   %rdx;"
+ 	FRAME_END
+-	"ret;"
++	ASM_RET
+ 	".slowpath: "
+ 	"push   %rsi;"
+ 	"movzbl %al,%esi;"
+@@ -56,7 +56,7 @@ asm    (".pushsection .text;"
+ 	"pop    %rsi;"
+ 	"pop    %rdx;"
+ 	FRAME_END
+-	"ret;"
++	ASM_RET
+ 	".size " PV_UNLOCK ", .-" PV_UNLOCK ";"
+ 	".popsection");
+ 
+* Unmerged path arch/x86/kernel/alternative.c
+* Unmerged path arch/x86/kernel/kprobes/core.c
+* Unmerged path arch/x86/kernel/paravirt.c
+* Unmerged path arch/x86/kvm/emulate.c
+* Unmerged path arch/x86/lib/error-inject.c
+* Unmerged path samples/ftrace/ftrace-direct-modify.c
+* Unmerged path samples/ftrace/ftrace-direct-too.c
+* Unmerged path samples/ftrace/ftrace-direct.c
