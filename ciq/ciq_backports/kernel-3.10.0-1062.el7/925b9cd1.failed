@@ -1,0 +1,328 @@
+locking/rwsem: Make owner store task pointer of last owning reader
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Waiman Long <longman@redhat.com>
+commit 925b9cd1b89a94b7124d128c80dfc48f78a63098
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/925b9cd1.failed
+
+Currently, when a reader acquires a lock, it only sets the
+RWSEM_READER_OWNED bit in the owner field. The other bits are simply
+not used. When debugging hanging cases involving rwsems and readers,
+the owner value does not provide much useful information at all.
+
+This patch modifies the current behavior to always store the task_struct
+pointer of the last rwsem-acquiring reader in a reader-owned rwsem. This
+may be useful in debugging rwsem hanging cases especially if only one
+reader is involved. However, the task in the owner field may not the
+real owner or one of the real owners at all when the owner value is
+examined, for example, in a crash dump. So it is just an additional
+hint about the past history.
+
+If CONFIG_DEBUG_RWSEMS=y is enabled, the owner field will be checked at
+unlock time too to make sure the task pointer value is valid. That does
+have a slight performance cost and so is only enabled as part of that
+debug option.
+
+From the performance point of view, it is expected that the changes
+shouldn't have any noticeable performance impact. A rwsem microbenchmark
+(with 48 worker threads and 1:1 reader/writer ratio) was ran on a
+2-socket 24-core 48-thread Haswell system.  The locking rates on a
+4.19-rc1 based kernel were as follows:
+
+  1) Unpatched kernel:				543.3 kops/s
+  2) Patched kernel:				549.2 kops/s
+  3) Patched kernel (CONFIG_DEBUG_RWSEMS on):	546.6 kops/s
+
+There was actually a slight increase in performance (1.1%) in this
+particular case. Maybe it was caused by the elimination of a branch or
+just a testing noise. Turning on the CONFIG_DEBUG_RWSEMS option also
+had less than the expected impact on performance.
+
+The least significant 2 bits of the owner value are now used to designate
+the rwsem is readers owned and the owners are anonymous.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Will Deacon <will.deacon@arm.com>
+Link: http://lkml.kernel.org/r/1536265114-10842-1-git-send-email-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 925b9cd1b89a94b7124d128c80dfc48f78a63098)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rwsem.h
+#	kernel/rwsem.c
+#	kernel/rwsem.h
+diff --cc include/linux/rwsem.h
+index 56c930b825c7,67dbb57508b1..000000000000
+--- a/include/linux/rwsem.h
++++ b/include/linux/rwsem.h
+@@@ -66,8 -44,16 +66,17 @@@ struct rw_semaphore 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Setting bit 1 of the owner field but not bit 0 will indicate
++  * that the rwsem is writer-owned with an unknown owner.
++  */
++ #define RWSEM_OWNER_UNKNOWN	((struct task_struct *)-2L)
++ 
+++>>>>>>> 925b9cd1b89a (locking/rwsem: Make owner store task pointer of last owning reader)
+  extern struct rw_semaphore *rwsem_down_read_failed(struct rw_semaphore *sem);
+ -extern struct rw_semaphore *rwsem_down_read_failed_killable(struct rw_semaphore *sem);
+  extern struct rw_semaphore *rwsem_down_write_failed(struct rw_semaphore *sem);
+ -extern struct rw_semaphore *rwsem_down_write_failed_killable(struct rw_semaphore *sem);
+  extern struct rw_semaphore *rwsem_wake(struct rw_semaphore *);
+  extern struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem);
+  
+diff --cc kernel/rwsem.c
+index 00aea37d4649,e586f0d03ad3..000000000000
+--- a/kernel/rwsem.c
++++ b/kernel/rwsem.c
+@@@ -80,7 -117,9 +80,12 @@@ EXPORT_SYMBOL(down_write_trylock)
+  void up_read(struct rw_semaphore *sem)
+  {
+  	rwsem_release(&sem->dep_map, 1, _RET_IP_);
+++<<<<<<< HEAD:kernel/rwsem.c
+++=======
++ 	DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner & RWSEM_READER_OWNED));
+++>>>>>>> 925b9cd1b89a (locking/rwsem: Make owner store task pointer of last owning reader):kernel/locking/rwsem.c
+  
++ 	rwsem_clear_reader_owned(sem);
+  	__up_read(sem);
+  }
+  
+@@@ -159,8 -198,25 +164,12 @@@ void down_write_nested(struct rw_semaph
+  
+  EXPORT_SYMBOL(down_write_nested);
+  
+ -int __sched down_write_killable_nested(struct rw_semaphore *sem, int subclass)
+ -{
+ -	might_sleep();
+ -	rwsem_acquire(&sem->dep_map, subclass, 0, _RET_IP_);
+ -
+ -	if (LOCK_CONTENDED_RETURN(sem, __down_write_trylock, __down_write_killable)) {
+ -		rwsem_release(&sem->dep_map, 1, _RET_IP_);
+ -		return -EINTR;
+ -	}
+ -
+ -	rwsem_set_owner(sem);
+ -	return 0;
+ -}
+ -
+ -EXPORT_SYMBOL(down_write_killable_nested);
+ -
+  void up_read_non_owner(struct rw_semaphore *sem)
+  {
+++<<<<<<< HEAD:kernel/rwsem.c
+++=======
++ 	DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner & RWSEM_READER_OWNED));
+++>>>>>>> 925b9cd1b89a (locking/rwsem: Make owner store task pointer of last owning reader):kernel/locking/rwsem.c
+  	__up_read(sem);
+  }
+  
+diff --cc kernel/rwsem.h
+index a5a68562640f,bad2bca0268b..000000000000
+--- a/kernel/rwsem.h
++++ b/kernel/rwsem.h
+@@@ -1,24 -1,37 +1,30 @@@
+ -/* SPDX-License-Identifier: GPL-2.0 */
+  /*
+-  * The owner field of the rw_semaphore structure will be set to
+-  * RWSEM_READER_OWNED when a reader grabs the lock. A writer will clear
+-  * the owner field when it unlocks. A reader, on the other hand, will
+-  * not touch the owner field when it unlocks.
++  * The least significant 2 bits of the owner value has the following
++  * meanings when set.
++  *  - RWSEM_READER_OWNED (bit 0): The rwsem is owned by readers
++  *  - RWSEM_ANONYMOUSLY_OWNED (bit 1): The rwsem is anonymously owned,
++  *    i.e. the owner(s) cannot be readily determined. It can be reader
++  *    owned or the owning writer is indeterminate.
+   *
+-  * In essence, the owner field now has the following 4 states:
+-  *  1) 0
+-  *     - lock is free or the owner hasn't set the field yet
+-  *  2) RWSEM_READER_OWNED
+-  *     - lock is currently or previously owned by readers (lock is free
+-  *       or not set by owner yet)
+-  *  3) RWSEM_ANONYMOUSLY_OWNED bit set with some other bits set as well
+-  *     - lock is owned by an anonymous writer, so spinning on the lock
+-  *       owner should be disabled.
+-  *  4) Other non-zero value
+-  *     - a writer owns the lock and other writers can spin on the lock owner.
++  * When a writer acquires a rwsem, it puts its task_struct pointer
++  * into the owner field. It is cleared after an unlock.
++  *
++  * When a reader acquires a rwsem, it will also puts its task_struct
++  * pointer into the owner field with both the RWSEM_READER_OWNED and
++  * RWSEM_ANONYMOUSLY_OWNED bits set. On unlock, the owner field will
++  * largely be left untouched. So for a free or reader-owned rwsem,
++  * the owner value may contain information about the last reader that
++  * acquires the rwsem. The anonymous bit is set because that particular
++  * reader may or may not still own the lock.
++  *
++  * That information may be helpful in debugging cases where the system
++  * seems to hang on a reader owned rwsem especially if only one reader
++  * is involved. Ideally we would like to track all the readers that own
++  * a rwsem, but the overhead is simply too big.
+   */
+- #define RWSEM_ANONYMOUSLY_OWNED	(1UL << 0)
+- #define RWSEM_READER_OWNED	((struct task_struct *)RWSEM_ANONYMOUSLY_OWNED)
++ #define RWSEM_READER_OWNED	(1UL << 0)
++ #define RWSEM_ANONYMOUSLY_OWNED	(1UL << 1)
+  
+ -#ifdef CONFIG_DEBUG_RWSEMS
+ -# define DEBUG_RWSEMS_WARN_ON(c)	DEBUG_LOCKS_WARN_ON(c)
+ -#else
+ -# define DEBUG_RWSEMS_WARN_ON(c)
+ -#endif
+ -
+  #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+  /*
+   * All writes to owner are protected by WRITE_ONCE() to make sure that
+@@@ -37,15 -50,26 +43,36 @@@ static inline void rwsem_clear_owner(st
+  	WRITE_ONCE(sem->owner, NULL);
+  }
+  
++ /*
++  * The task_struct pointer of the last owning reader will be left in
++  * the owner field.
++  *
++  * Note that the owner value just indicates the task has owned the rwsem
++  * previously, it may not be the real owner or one of the real owners
++  * anymore when that field is examined, so take it with a grain of salt.
++  */
++ static inline void __rwsem_set_reader_owned(struct rw_semaphore *sem,
++ 					    struct task_struct *owner)
++ {
++ 	unsigned long val = (unsigned long)owner | RWSEM_READER_OWNED
++ 						 | RWSEM_ANONYMOUSLY_OWNED;
++ 
++ 	WRITE_ONCE(sem->owner, (struct task_struct *)val);
++ }
++ 
+  static inline void rwsem_set_reader_owned(struct rw_semaphore *sem)
+  {
+++<<<<<<< HEAD:kernel/rwsem.h
+ +	/*
+ +	 * We check the owner value first to make sure that we will only
+ +	 * do a write to the rwsem cacheline when it is really necessary
+ +	 * to minimize cacheline contention.
+ +	 */
+ +	if (sem->owner != RWSEM_READER_OWNED)
+ +		WRITE_ONCE(sem->owner, RWSEM_READER_OWNED);
+++=======
++ 	__rwsem_set_reader_owned(sem, current);
+++>>>>>>> 925b9cd1b89a (locking/rwsem: Make owner store task pointer of last owning reader):kernel/locking/rwsem.h
+  }
+  
+  /*
+@@@ -66,46 -90,23 +93,66 @@@ static inline bool rwsem_has_anonymous_
+  	return (unsigned long)owner & RWSEM_ANONYMOUSLY_OWNED;
+  }
+  
+++<<<<<<< HEAD:kernel/rwsem.h
+ +/*
+ + * struct slist contains a pointer to a struct list circular list.
+ + * The head of the slist is the entry pointed to by the slist. The tail
+ + * is the one pointed to by the "prev" member of the head.
+ + */
+ +static inline void INIT_SLIST_HEAD(struct slist_head *head)
+ +{
+ +	WRITE_ONCE(head->next, (void *)head);
+ +}
+ +
+ +static inline bool slist_is_singular(struct slist_head *head)
+ +{
+ +	return !slist_empty(head) && list_empty(head->next);
+ +}
+ +
+ +static inline void slist_add_tail(struct list_head  *new,
+ +				  struct slist_head *head)
+ +{
+ +	if (slist_empty(head)) {
+ +		INIT_LIST_HEAD(new);
+ +		head->next = new;
+ +	} else {
+ +		list_add_tail(new, head->next);
+ +	}
+ +}
+ +
+ +static inline void slist_del(struct list_head  *node,
+ +			     struct slist_head *head)
+ +{
+ +	if (head->next == node) {
+ +		if (list_empty(node)) {
+ +			INIT_SLIST_HEAD(head);
+ +			node->next = LIST_POISON1;
+ +			node->prev = LIST_POISON2;
+ +			return;
+ +		}
+ +		head->next = node->next;
+ +	}
+ +	list_del(node);
+ +}
+++=======
++ #ifdef CONFIG_DEBUG_RWSEMS
++ /*
++  * With CONFIG_DEBUG_RWSEMS configured, it will make sure that if there
++  * is a task pointer in owner of a reader-owned rwsem, it will be the
++  * real owner or one of the real owners. The only exception is when the
++  * unlock is done by up_read_non_owner().
++  */
++ #define rwsem_clear_reader_owned rwsem_clear_reader_owned
++ static inline void rwsem_clear_reader_owned(struct rw_semaphore *sem)
++ {
++ 	unsigned long val = (unsigned long)current | RWSEM_READER_OWNED
++ 						   | RWSEM_ANONYMOUSLY_OWNED;
++ 	if (READ_ONCE(sem->owner) == (struct task_struct *)val)
++ 		cmpxchg_relaxed((unsigned long *)&sem->owner, val,
++ 				RWSEM_READER_OWNED | RWSEM_ANONYMOUSLY_OWNED);
++ }
++ #endif
+++>>>>>>> 925b9cd1b89a (locking/rwsem: Make owner store task pointer of last owning reader):kernel/locking/rwsem.h
+  
+  #else
+  static inline void rwsem_set_owner(struct rw_semaphore *sem)
+@@@ -119,10 -125,10 +171,16 @@@ static inline void __rwsem_set_reader_o
+  static inline void rwsem_set_reader_owned(struct rw_semaphore *sem)
+  {
+  }
+ +
+ +#define slist_head			list_head
+ +#define INIT_SLIST_HEAD(head)		INIT_LIST_HEAD(head)
+ +#define slist_is_singular(head)		list_is_singular(head)
+ +#define slist_add_tail(new, head)	list_add_tail(new, head)
+ +#define slist_del(node, head)		list_del(node)
+  #endif
++ 
++ #ifndef rwsem_clear_reader_owned
++ static inline void rwsem_clear_reader_owned(struct rw_semaphore *sem)
++ {
++ }
++ #endif
+* Unmerged path include/linux/rwsem.h
+* Unmerged path kernel/rwsem.c
+* Unmerged path kernel/rwsem.h
+diff --git a/lib/rwsem.c b/lib/rwsem.c
+index dcbfa1eac830..abe46c20e1b5 100644
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@ -176,7 +176,7 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
+ 		 * but it gives the spinners an early indication that the
+ 		 * readers now have the lock.
+ 		 */
+-		rwsem_set_reader_owned(sem);
++		__rwsem_set_reader_owned(sem, waiter->task);
+ 	}
+ 
+ 	/*
