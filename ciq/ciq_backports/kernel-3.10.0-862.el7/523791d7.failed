@@ -1,0 +1,388 @@
+IB/mlx5: Fix implicit MR GC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Artemy Kovalyov <artemyko@mellanox.com>
+commit 523791d7c5eb4533ded3ba3de3517431243c0de5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/523791d7.failed
+
+When implicit MR's leaf MKey becomes unused, i.e. when it's
+last page being released my MMU invalidation it is marked as "dying"
+and scheduled for release by garbage collector.
+Currentle consequent page fault may remove "dying" flag.
+Treat leaf MKey as non-existent once it was scheduled to removal
+by GC.
+
+Fixes: 81713d3788d2 ('IB/mlx5: Add implicit MR support')
+	Signed-off-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 523791d7c5eb4533ded3ba3de3517431243c0de5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 25e3fb5efdf9,b506321f5cb7..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -41,7 -42,132 +41,136 @@@
+   * a pagefault. */
+  #define MMU_NOTIFIER_TIMEOUT 1000
+  
+++<<<<<<< HEAD
+ +struct workqueue_struct *mlx5_ib_page_fault_wq;
+++=======
++ #define MLX5_IMR_MTT_BITS (30 - PAGE_SHIFT)
++ #define MLX5_IMR_MTT_SHIFT (MLX5_IMR_MTT_BITS + PAGE_SHIFT)
++ #define MLX5_IMR_MTT_ENTRIES BIT_ULL(MLX5_IMR_MTT_BITS)
++ #define MLX5_IMR_MTT_SIZE BIT_ULL(MLX5_IMR_MTT_SHIFT)
++ #define MLX5_IMR_MTT_MASK (~(MLX5_IMR_MTT_SIZE - 1))
++ 
++ #define MLX5_KSM_PAGE_SHIFT MLX5_IMR_MTT_SHIFT
++ 
++ static u64 mlx5_imr_ksm_entries;
++ 
++ static int check_parent(struct ib_umem_odp *odp,
++ 			       struct mlx5_ib_mr *parent)
++ {
++ 	struct mlx5_ib_mr *mr = odp->private;
++ 
++ 	return mr && mr->parent == parent && !odp->dying;
++ }
++ 
++ static struct ib_umem_odp *odp_next(struct ib_umem_odp *odp)
++ {
++ 	struct mlx5_ib_mr *mr = odp->private, *parent = mr->parent;
++ 	struct ib_ucontext *ctx = odp->umem->context;
++ 	struct rb_node *rb;
++ 
++ 	down_read(&ctx->umem_rwsem);
++ 	while (1) {
++ 		rb = rb_next(&odp->interval_tree.rb);
++ 		if (!rb)
++ 			goto not_found;
++ 		odp = rb_entry(rb, struct ib_umem_odp, interval_tree.rb);
++ 		if (check_parent(odp, parent))
++ 			goto end;
++ 	}
++ not_found:
++ 	odp = NULL;
++ end:
++ 	up_read(&ctx->umem_rwsem);
++ 	return odp;
++ }
++ 
++ static struct ib_umem_odp *odp_lookup(struct ib_ucontext *ctx,
++ 				      u64 start, u64 length,
++ 				      struct mlx5_ib_mr *parent)
++ {
++ 	struct ib_umem_odp *odp;
++ 	struct rb_node *rb;
++ 
++ 	down_read(&ctx->umem_rwsem);
++ 	odp = rbt_ib_umem_lookup(&ctx->umem_tree, start, length);
++ 	if (!odp)
++ 		goto end;
++ 
++ 	while (1) {
++ 		if (check_parent(odp, parent))
++ 			goto end;
++ 		rb = rb_next(&odp->interval_tree.rb);
++ 		if (!rb)
++ 			goto not_found;
++ 		odp = rb_entry(rb, struct ib_umem_odp, interval_tree.rb);
++ 		if (ib_umem_start(odp->umem) > start + length)
++ 			goto not_found;
++ 	}
++ not_found:
++ 	odp = NULL;
++ end:
++ 	up_read(&ctx->umem_rwsem);
++ 	return odp;
++ }
++ 
++ void mlx5_odp_populate_klm(struct mlx5_klm *pklm, size_t offset,
++ 			   size_t nentries, struct mlx5_ib_mr *mr, int flags)
++ {
++ 	struct ib_pd *pd = mr->ibmr.pd;
++ 	struct ib_ucontext *ctx = pd->uobject->context;
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	struct ib_umem_odp *odp;
++ 	unsigned long va;
++ 	int i;
++ 
++ 	if (flags & MLX5_IB_UPD_XLT_ZAP) {
++ 		for (i = 0; i < nentries; i++, pklm++) {
++ 			pklm->bcount = cpu_to_be32(MLX5_IMR_MTT_SIZE);
++ 			pklm->key = cpu_to_be32(dev->null_mkey);
++ 			pklm->va = 0;
++ 		}
++ 		return;
++ 	}
++ 
++ 	odp = odp_lookup(ctx, offset * MLX5_IMR_MTT_SIZE,
++ 			     nentries * MLX5_IMR_MTT_SIZE, mr);
++ 
++ 	for (i = 0; i < nentries; i++, pklm++) {
++ 		pklm->bcount = cpu_to_be32(MLX5_IMR_MTT_SIZE);
++ 		va = (offset + i) * MLX5_IMR_MTT_SIZE;
++ 		if (odp && odp->umem->address == va) {
++ 			struct mlx5_ib_mr *mtt = odp->private;
++ 
++ 			pklm->key = cpu_to_be32(mtt->ibmr.lkey);
++ 			odp = odp_next(odp);
++ 		} else {
++ 			pklm->key = cpu_to_be32(dev->null_mkey);
++ 		}
++ 		mlx5_ib_dbg(dev, "[%d] va %lx key %x\n",
++ 			    i, va, be32_to_cpu(pklm->key));
++ 	}
++ }
++ 
++ static void mr_leaf_free_action(struct work_struct *work)
++ {
++ 	struct ib_umem_odp *odp = container_of(work, struct ib_umem_odp, work);
++ 	int idx = ib_umem_start(odp->umem) >> MLX5_IMR_MTT_SHIFT;
++ 	struct mlx5_ib_mr *mr = odp->private, *imr = mr->parent;
++ 
++ 	mr->parent = NULL;
++ 	synchronize_srcu(&mr->dev->mr_srcu);
++ 
++ 	ib_umem_release(odp->umem);
++ 	if (imr->live)
++ 		mlx5_ib_update_xlt(imr, idx, 1, 0,
++ 				   MLX5_IB_UPD_XLT_INDIRECT |
++ 				   MLX5_IB_UPD_XLT_ATOMIC);
++ 	mlx5_mr_cache_free(mr->dev, mr);
++ 
++ 	if (atomic_dec_and_test(&imr->num_leaf_free))
++ 		wake_up(&imr->q_leaf_free);
++ }
+++>>>>>>> 523791d7c5eb (IB/mlx5: Fix implicit MR GC)
+  
+  void mlx5_ib_invalidate_range(struct ib_umem *umem, unsigned long start,
+  			      unsigned long end)
+@@@ -162,18 -308,209 +291,212 @@@ static struct mlx5_ib_mr *mlx5_ib_odp_f
+  	return container_of(mmkey, struct mlx5_ib_mr, mmkey);
+  }
+  
+ -static void mlx5_ib_page_fault_resume(struct mlx5_ib_dev *dev,
+ -				      struct mlx5_pagefault *pfault,
+ +static void mlx5_ib_page_fault_resume(struct mlx5_ib_qp *qp,
+ +				      struct mlx5_ib_pfault *pfault,
+  				      int error)
+  {
+ -	int wq_num = pfault->event_subtype == MLX5_PFAULT_SUBTYPE_WQE ?
+ -		     pfault->wqe.wq_num : pfault->token;
+ +	struct mlx5_ib_dev *dev = to_mdev(qp->ibqp.pd->device);
+ +	u32 qpn = qp->trans_qp.base.mqp.qpn;
+  	int ret = mlx5_core_page_fault_resume(dev->mdev,
+ -					      pfault->token,
+ -					      wq_num,
+ -					      pfault->type,
+ +					      qpn,
+ +					      pfault->mpfault.flags,
+  					      error);
+  	if (ret)
+++<<<<<<< HEAD
+ +		pr_err("Failed to resolve the page fault on QP 0x%x\n", qpn);
+++=======
++ 		mlx5_ib_err(dev, "Failed to resolve the page fault on WQ 0x%x\n",
++ 			    wq_num);
++ }
++ 
++ static struct mlx5_ib_mr *implicit_mr_alloc(struct ib_pd *pd,
++ 					    struct ib_umem *umem,
++ 					    bool ksm, int access_flags)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	struct mlx5_ib_mr *mr;
++ 	int err;
++ 
++ 	mr = mlx5_mr_cache_alloc(dev, ksm ? MLX5_IMR_KSM_CACHE_ENTRY :
++ 					    MLX5_IMR_MTT_CACHE_ENTRY);
++ 
++ 	if (IS_ERR(mr))
++ 		return mr;
++ 
++ 	mr->ibmr.pd = pd;
++ 
++ 	mr->dev = dev;
++ 	mr->access_flags = access_flags;
++ 	mr->mmkey.iova = 0;
++ 	mr->umem = umem;
++ 
++ 	if (ksm) {
++ 		err = mlx5_ib_update_xlt(mr, 0,
++ 					 mlx5_imr_ksm_entries,
++ 					 MLX5_KSM_PAGE_SHIFT,
++ 					 MLX5_IB_UPD_XLT_INDIRECT |
++ 					 MLX5_IB_UPD_XLT_ZAP |
++ 					 MLX5_IB_UPD_XLT_ENABLE);
++ 
++ 	} else {
++ 		err = mlx5_ib_update_xlt(mr, 0,
++ 					 MLX5_IMR_MTT_ENTRIES,
++ 					 PAGE_SHIFT,
++ 					 MLX5_IB_UPD_XLT_ZAP |
++ 					 MLX5_IB_UPD_XLT_ENABLE |
++ 					 MLX5_IB_UPD_XLT_ATOMIC);
++ 	}
++ 
++ 	if (err)
++ 		goto fail;
++ 
++ 	mr->ibmr.lkey = mr->mmkey.key;
++ 	mr->ibmr.rkey = mr->mmkey.key;
++ 
++ 	mr->live = 1;
++ 
++ 	mlx5_ib_dbg(dev, "key %x dev %p mr %p\n",
++ 		    mr->mmkey.key, dev->mdev, mr);
++ 
++ 	return mr;
++ 
++ fail:
++ 	mlx5_ib_err(dev, "Failed to register MKEY %d\n", err);
++ 	mlx5_mr_cache_free(dev, mr);
++ 
++ 	return ERR_PTR(err);
++ }
++ 
++ static struct ib_umem_odp *implicit_mr_get_data(struct mlx5_ib_mr *mr,
++ 						u64 io_virt, size_t bcnt)
++ {
++ 	struct ib_ucontext *ctx = mr->ibmr.pd->uobject->context;
++ 	struct mlx5_ib_dev *dev = to_mdev(mr->ibmr.pd->device);
++ 	struct ib_umem_odp *odp, *result = NULL;
++ 	u64 addr = io_virt & MLX5_IMR_MTT_MASK;
++ 	int nentries = 0, start_idx = 0, ret;
++ 	struct mlx5_ib_mr *mtt;
++ 	struct ib_umem *umem;
++ 
++ 	mutex_lock(&mr->umem->odp_data->umem_mutex);
++ 	odp = odp_lookup(ctx, addr, 1, mr);
++ 
++ 	mlx5_ib_dbg(dev, "io_virt:%llx bcnt:%zx addr:%llx odp:%p\n",
++ 		    io_virt, bcnt, addr, odp);
++ 
++ next_mr:
++ 	if (likely(odp)) {
++ 		if (nentries)
++ 			nentries++;
++ 	} else {
++ 		umem = ib_alloc_odp_umem(ctx, addr, MLX5_IMR_MTT_SIZE);
++ 		if (IS_ERR(umem)) {
++ 			mutex_unlock(&mr->umem->odp_data->umem_mutex);
++ 			return ERR_CAST(umem);
++ 		}
++ 
++ 		mtt = implicit_mr_alloc(mr->ibmr.pd, umem, 0, mr->access_flags);
++ 		if (IS_ERR(mtt)) {
++ 			mutex_unlock(&mr->umem->odp_data->umem_mutex);
++ 			ib_umem_release(umem);
++ 			return ERR_CAST(mtt);
++ 		}
++ 
++ 		odp = umem->odp_data;
++ 		odp->private = mtt;
++ 		mtt->umem = umem;
++ 		mtt->mmkey.iova = addr;
++ 		mtt->parent = mr;
++ 		INIT_WORK(&odp->work, mr_leaf_free_action);
++ 
++ 		if (!nentries)
++ 			start_idx = addr >> MLX5_IMR_MTT_SHIFT;
++ 		nentries++;
++ 	}
++ 
++ 	/* Return first odp if region not covered by single one */
++ 	if (likely(!result))
++ 		result = odp;
++ 
++ 	addr += MLX5_IMR_MTT_SIZE;
++ 	if (unlikely(addr < io_virt + bcnt)) {
++ 		odp = odp_next(odp);
++ 		if (odp && odp->umem->address != addr)
++ 			odp = NULL;
++ 		goto next_mr;
++ 	}
++ 
++ 	if (unlikely(nentries)) {
++ 		ret = mlx5_ib_update_xlt(mr, start_idx, nentries, 0,
++ 					 MLX5_IB_UPD_XLT_INDIRECT |
++ 					 MLX5_IB_UPD_XLT_ATOMIC);
++ 		if (ret) {
++ 			mlx5_ib_err(dev, "Failed to update PAS\n");
++ 			result = ERR_PTR(ret);
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&mr->umem->odp_data->umem_mutex);
++ 	return result;
++ }
++ 
++ struct mlx5_ib_mr *mlx5_ib_alloc_implicit_mr(struct mlx5_ib_pd *pd,
++ 					     int access_flags)
++ {
++ 	struct ib_ucontext *ctx = pd->ibpd.uobject->context;
++ 	struct mlx5_ib_mr *imr;
++ 	struct ib_umem *umem;
++ 
++ 	umem = ib_umem_get(ctx, 0, 0, IB_ACCESS_ON_DEMAND, 0);
++ 	if (IS_ERR(umem))
++ 		return ERR_CAST(umem);
++ 
++ 	imr = implicit_mr_alloc(&pd->ibpd, umem, 1, access_flags);
++ 	if (IS_ERR(imr)) {
++ 		ib_umem_release(umem);
++ 		return ERR_CAST(imr);
++ 	}
++ 
++ 	imr->umem = umem;
++ 	init_waitqueue_head(&imr->q_leaf_free);
++ 	atomic_set(&imr->num_leaf_free, 0);
++ 
++ 	return imr;
++ }
++ 
++ static int mr_leaf_free(struct ib_umem *umem, u64 start,
++ 			u64 end, void *cookie)
++ {
++ 	struct mlx5_ib_mr *mr = umem->odp_data->private, *imr = cookie;
++ 
++ 	if (mr->parent != imr)
++ 		return 0;
++ 
++ 	ib_umem_odp_unmap_dma_pages(umem,
++ 				    ib_umem_start(umem),
++ 				    ib_umem_end(umem));
++ 
++ 	if (umem->odp_data->dying)
++ 		return 0;
++ 
++ 	WRITE_ONCE(umem->odp_data->dying, 1);
++ 	atomic_inc(&imr->num_leaf_free);
++ 	schedule_work(&umem->odp_data->work);
++ 
++ 	return 0;
++ }
++ 
++ void mlx5_ib_free_implicit_mr(struct mlx5_ib_mr *imr)
++ {
++ 	struct ib_ucontext *ctx = imr->ibmr.pd->uobject->context;
++ 
++ 	down_read(&ctx->umem_rwsem);
++ 	rbt_ib_umem_for_each_in_range(&ctx->umem_tree, 0, ULLONG_MAX,
++ 				      mr_leaf_free, imr);
++ 	up_read(&ctx->umem_rwsem);
++ 
++ 	wait_event(imr->q_leaf_free, !atomic_read(&imr->num_leaf_free));
+++>>>>>>> 523791d7c5eb (IB/mlx5: Fix implicit MR GC)
+  }
+  
+  /*
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
