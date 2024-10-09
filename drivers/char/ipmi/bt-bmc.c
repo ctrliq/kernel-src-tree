@@ -185,9 +185,6 @@ static ssize_t bt_bmc_read(struct file *file, char __user *buf,
 	ssize_t ret = 0;
 	ssize_t nread;
 
-	if (!access_ok(VERIFY_WRITE, buf, count))
-		return -EFAULT;
-
 	WARN_ON(*ppos);
 
 	if (wait_event_interruptible(bt_bmc->queue,
@@ -257,9 +254,6 @@ static ssize_t bt_bmc_write(struct file *file, const char __user *buf,
 	 */
 	if (count < 5)
 		return -EINVAL;
-
-	if (!access_ok(VERIFY_READ, buf, count))
-		return -EFAULT;
 
 	WARN_ON(*ppos);
 
