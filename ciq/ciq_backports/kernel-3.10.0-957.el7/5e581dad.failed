@@ -1,0 +1,183 @@
+bpf: make unknown opcode handling more robust
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 5e581dad4fec0e6d062740dc35b8dc248b39d224
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5e581dad.failed
+
+Recent findings by syzcaller fixed in 7891a87efc71 ("bpf: arsh is
+not supported in 32 bit alu thus reject it") triggered a warning
+in the interpreter due to unknown opcode not being rejected by
+the verifier. The 'return 0' for an unknown opcode is really not
+optimal, since with BPF to BPF calls, this would go untracked by
+the verifier.
+
+Do two things here to improve the situation: i) perform basic insn
+sanity check early on in the verification phase and reject every
+non-uapi insn right there. The bpf_opcode_in_insntable() table
+reuses the same mapping as the jumptable in ___bpf_prog_run() sans
+the non-public mappings. And ii) in ___bpf_prog_run() we do need
+to BUG in the case where the verifier would ever create an unknown
+opcode due to some rewrites.
+
+Note that JITs do not have such issues since they would punt to
+interpreter in these situations. Moreover, the BPF_JIT_ALWAYS_ON
+would also help to avoid such unknown opcodes in the first place.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 5e581dad4fec0e6d062740dc35b8dc248b39d224)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	kernel/bpf/core.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/filter.h
+index d322ed880333,276932d75975..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -65,35 -685,110 +65,46 @@@ static inline int sk_filter(struct soc
+  	return sk_filter_trim_cap(sk, skb, 1);
+  }
+  
+ -struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err);
+ -void bpf_prog_free(struct bpf_prog *fp);
+ -
+ +extern unsigned int sk_run_filter(const struct sk_buff *skb,
+ +				  const struct sock_filter *filter);
+ +extern int sk_unattached_filter_create(struct sk_filter **pfp,
+ +				       struct sock_fprog *fprog);
+ +extern void sk_unattached_filter_destroy(struct sk_filter *fp);
+ +extern int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ +extern int sk_detach_filter(struct sock *sk);
+ +extern int sk_chk_filter(struct sock_filter *filter, unsigned int flen);
+ +extern int sk_get_filter(struct sock *sk, struct sock_filter __user *filter, unsigned len);
+ +extern void sk_decode_filter(struct sock_filter *filt, struct sock_filter *to);
+ +
+++<<<<<<< HEAD
+ +static inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+ +				   struct xdp_buff *xdp)
+++=======
++ bool bpf_opcode_in_insntable(u8 code);
++ 
++ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
++ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
++ 				  gfp_t gfp_extra_flags);
++ void __bpf_prog_free(struct bpf_prog *fp);
++ 
++ static inline void bpf_prog_unlock_free(struct bpf_prog *fp)
+++>>>>>>> 5e581dad4fec (bpf: make unknown opcode handling more robust)
+  {
+ -	bpf_prog_unlock_ro(fp);
+ -	__bpf_prog_free(fp);
+ -}
+ -
+ -typedef int (*bpf_aux_classic_check_t)(struct sock_filter *filter,
+ -				       unsigned int flen);
+ -
+ -int bpf_prog_create(struct bpf_prog **pfp, struct sock_fprog_kern *fprog);
+ -int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
+ -			      bpf_aux_classic_check_t trans, bool save_orig);
+ -void bpf_prog_destroy(struct bpf_prog *fp);
+ -
+ -int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ -int sk_attach_bpf(u32 ufd, struct sock *sk);
+ -int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ -int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk);
+ -int sk_detach_filter(struct sock *sk);
+ -int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
+ -		  unsigned int len);
+ -
+ -bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
+ -void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
+ -
+ -u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+ -#define __bpf_call_base_args \
+ -	((u64 (*)(u64, u64, u64, u64, u64, const struct bpf_insn *)) \
+ -	 __bpf_call_base)
+ -
+ -struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog);
+ -void bpf_jit_compile(struct bpf_prog *prog);
+ -bool bpf_helper_changes_pkt_data(void *func);
+ -
+ -static inline bool bpf_dump_raw_ok(void)
+ -{
+ -	/* Reconstruction of call-sites is dependent on kallsyms,
+ -	 * thus make dump the same restriction.
+ -	 */
+ -	return kallsyms_show_value() == 1;
+ -}
+ -
+ -struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+ -				       const struct bpf_insn *patch, u32 len);
+ -
+ -/* The pair of xdp_do_redirect and xdp_do_flush_map MUST be called in the
+ - * same cpu context. Further for best results no more than a single map
+ - * for the do_redirect/do_flush pair should be used. This limitation is
+ - * because we only track one map and force a flush when the map changes.
+ - * This does not appear to be a real limitation for existing software.
+ - */
+ -int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
+ -			    struct bpf_prog *prog);
+ -int xdp_do_redirect(struct net_device *dev,
+ -		    struct xdp_buff *xdp,
+ -		    struct bpf_prog *prog);
+ -void xdp_do_flush_map(void);
+ -
+ -/* Drivers not supporting XDP metadata can use this helper, which
+ - * rejects any room expansion for metadata as a result.
+ - */
+ -static __always_inline void
+ -xdp_set_data_meta_invalid(struct xdp_buff *xdp)
+ -{
+ -	xdp->data_meta = xdp->data + 1;
+ +	return 0;
+  }
+  
+ -static __always_inline bool
+ -xdp_data_meta_unsupported(const struct xdp_buff *xdp)
+ +static inline void bpf_warn_invalid_xdp_action(u32 act)
+  {
+ -	return unlikely(xdp->data_meta > xdp->data);
+ +	return;
+  }
+  
+ -void bpf_warn_invalid_xdp_action(u32 act);
+ -
+ -struct sock *do_sk_redirect_map(struct sk_buff *skb);
+ -
+  #ifdef CONFIG_BPF_JIT
+ -extern int bpf_jit_enable;
+ -extern int bpf_jit_harden;
+ -extern int bpf_jit_kallsyms;
+ -
+ -typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+ -
+ -struct bpf_binary_header *
+ -bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
+ -		     unsigned int alignment,
+ -		     bpf_jit_fill_hole_t bpf_fill_ill_insns);
+ -void bpf_jit_binary_free(struct bpf_binary_header *hdr);
+ -
+ -void bpf_jit_free(struct bpf_prog *fp);
+ +#include <stdarg.h>
+ +#include <linux/linkage.h>
+ +#include <linux/printk.h>
+  
+ -struct bpf_prog *bpf_jit_blind_constants(struct bpf_prog *fp);
+ -void bpf_jit_prog_release_other(struct bpf_prog *fp, struct bpf_prog *fp_other);
+ +extern void bpf_jit_compile(struct sk_filter *fp);
+ +extern void bpf_jit_free(struct sk_filter *fp);
+  
+  static inline void bpf_jit_dump(unsigned int flen, unsigned int proglen,
+  				u32 pass, void *image)
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/verifier.c
