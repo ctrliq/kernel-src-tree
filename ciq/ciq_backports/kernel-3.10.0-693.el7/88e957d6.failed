@@ -1,0 +1,162 @@
+xen: introduce xen_vcpu_id mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [xen] introduce xen_vcpu_id mapping (Vitaly Kuznetsov) [1396554]
+Rebuild_FUZZ: 92.06%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 88e957d6e47f1232ad15b21e54a44f1147ea8c1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/88e957d6.failed
+
+It may happen that Xen's and Linux's ideas of vCPU id diverge. In
+particular, when we crash on a secondary vCPU we may want to do kdump
+and unlike plain kexec where we do migrate_to_reboot_cpu() we try
+booting on the vCPU which crashed. This doesn't work very well for
+PVHVM guests as we have a number of hypercalls where we pass vCPU id
+as a parameter. These hypercalls either fail or do something
+unexpected.
+
+To solve the issue introduce percpu xen_vcpu_id mapping. ARM and PV
+guests get direct mapping for now. Boot CPU for PVHVM guest gets its
+id from CPUID. With secondary CPUs it is a bit more
+trickier. Currently, we initialize IPI vectors before these CPUs boot
+so we can't use CPUID. Use ACPI ids from MADT instead.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+(cherry picked from commit 88e957d6e47f1232ad15b21e54a44f1147ea8c1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/xen/enlighten.c
+diff --cc arch/arm/xen/enlighten.c
+index 81edd31bb4ac,72cf06bf43f2..000000000000
+--- a/arch/arm/xen/enlighten.c
++++ b/arch/arm/xen/enlighten.c
+@@@ -162,8 -163,19 +166,16 @@@ static void __init xen_percpu_init(voi
+  	pr_info("Xen: initializing cpu%d\n", cpu);
+  	vcpup = per_cpu_ptr(xen_vcpu_info, cpu);
+  
+++<<<<<<< HEAD
+ +	info.mfn = __pa(vcpup) >> PAGE_SHIFT;
+ +	info.offset = offset_in_page(vcpup);
+++=======
++ 	/* Direct vCPU id mapping for ARM guests. */
++ 	per_cpu(xen_vcpu_id, cpu) = cpu;
++ 
++ 	info.mfn = virt_to_gfn(vcpup);
++ 	info.offset = xen_offset_in_page(vcpup);
+++>>>>>>> 88e957d6e47f (xen: introduce xen_vcpu_id mapping)
+  
+  	err = HYPERVISOR_vcpu_op(VCPUOP_register_vcpu_info, cpu, &info);
+  	BUG_ON(err);
+@@@ -263,6 -395,16 +275,19 @@@ static int __init xen_guest_init(void
+  	if (xen_vcpu_info == NULL)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Direct vCPU id mapping for ARM guests. */
++ 	per_cpu(xen_vcpu_id, 0) = 0;
++ 
++ 	xen_auto_xlat_grant_frames.count = gnttab_max_grant_frames();
++ 	if (xen_xlate_map_ballooned_pages(&xen_auto_xlat_grant_frames.pfn,
++ 					  &xen_auto_xlat_grant_frames.vaddr,
++ 					  xen_auto_xlat_grant_frames.count)) {
++ 		free_percpu(xen_vcpu_info);
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> 88e957d6e47f (xen: introduce xen_vcpu_id mapping)
+  	gnttab_init();
+  	if (!xen_initial_domain())
+  		xenbus_probe(NULL);
+* Unmerged path arch/arm/xen/enlighten.c
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index e845b370d8e6..e9a7c15da15c 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -59,6 +59,7 @@
+ #include <asm/xen/pci.h>
+ #include <asm/xen/hypercall.h>
+ #include <asm/xen/hypervisor.h>
++#include <asm/xen/cpuid.h>
+ #include <asm/fixmap.h>
+ #include <asm/processor.h>
+ #include <asm/proto.h>
+@@ -116,6 +117,10 @@ DEFINE_PER_CPU(struct vcpu_info *, xen_vcpu);
+  */
+ DEFINE_PER_CPU(struct vcpu_info, xen_vcpu_info);
+ 
++/* Linux <-> Xen vCPU id mapping */
++DEFINE_PER_CPU(int, xen_vcpu_id) = -1;
++EXPORT_PER_CPU_SYMBOL(xen_vcpu_id);
++
+ enum xen_domain_type xen_domain_type = XEN_NATIVE;
+ EXPORT_SYMBOL_GPL(xen_domain_type);
+ 
+@@ -1141,8 +1146,11 @@ void xen_setup_vcpu_info_placement(void)
+ {
+ 	int cpu;
+ 
+-	for_each_possible_cpu(cpu)
++	for_each_possible_cpu(cpu) {
++		/* Set up direct vCPU id mapping for PV guests. */
++		per_cpu(xen_vcpu_id, cpu) = cpu;
+ 		xen_vcpu_setup(cpu);
++	}
+ 
+ 	/* xen_vcpu_setup managed to place the vcpu_info within the
+ 	   percpu area for all cpus, so make use of it */
+@@ -1614,6 +1622,9 @@ asmlinkage void __init xen_start_kernel(void)
+ #endif
+ 	xen_raw_console_write("about to get started...\n");
+ 
++	/* Let's presume PV guests always boot on vCPU with id 0. */
++	per_cpu(xen_vcpu_id, 0) = 0;
++
+ 	xen_setup_runstate_info(0);
+ 
+ 	/* Start the world */
+@@ -1679,6 +1690,12 @@ static void __init init_hvm_pv_info(void)
+ 
+ 	xen_setup_features();
+ 
++	cpuid(base + 4, &eax, &ebx, &ecx, &edx);
++	if (eax & XEN_HVM_CPUID_VCPU_ID_PRESENT)
++		this_cpu_write(xen_vcpu_id, ebx);
++	else
++		this_cpu_write(xen_vcpu_id, smp_processor_id());
++
+ 	pv_info.name = "Xen HVM";
+ 
+ 	xen_domain_type = XEN_HVM_DOMAIN;
+@@ -1690,6 +1707,10 @@ static int xen_hvm_cpu_notify(struct notifier_block *self, unsigned long action,
+ 	int cpu = (long)hcpu;
+ 	switch (action) {
+ 	case CPU_UP_PREPARE:
++		if (cpu_acpi_id(cpu) != U32_MAX)
++			per_cpu(xen_vcpu_id, cpu) = cpu_acpi_id(cpu);
++		else
++			per_cpu(xen_vcpu_id, cpu) = cpu;
+ 		xen_vcpu_setup(cpu);
+ 		if (xen_have_vector_callback) {
+ 			if (xen_feature(XENFEAT_hvm_safe_pvclock))
+diff --git a/include/xen/xen-ops.h b/include/xen/xen-ops.h
+index d6fe062cad6b..fde17554231a 100644
+--- a/include/xen/xen-ops.h
++++ b/include/xen/xen-ops.h
+@@ -6,6 +6,12 @@
+ 
+ DECLARE_PER_CPU(struct vcpu_info *, xen_vcpu);
+ 
++DECLARE_PER_CPU(int, xen_vcpu_id);
++static inline int xen_vcpu_nr(int cpu)
++{
++	return per_cpu(xen_vcpu_id, cpu);
++}
++
+ void xen_arch_pre_suspend(void);
+ void xen_arch_post_suspend(int suspend_cancelled);
+ void xen_arch_hvm_post_suspend(int suspend_cancelled);
