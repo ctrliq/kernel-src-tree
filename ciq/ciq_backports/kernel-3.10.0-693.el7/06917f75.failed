@@ -1,0 +1,137 @@
+NTB: Improve performance with write combining
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] Improve performance with write combining (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 94.12%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 06917f753547e6bba8a5d17f79971d1c071a70dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/06917f75.failed
+
+Changing the memory window BAR mappings to write combining significantly
+boosts the performance.  We will also use memcpy that uses non-temporal
+store, which showed performance improvement when doing non-cached
+memcpys.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit 06917f753547e6bba8a5d17f79971d1c071a70dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index bf77f3a0b404,7a765d3230d8..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -56,9 -58,23 +56,15 @@@
+  #include <linux/pci.h>
+  #include <linux/slab.h>
+  #include <linux/types.h>
+++<<<<<<< HEAD
+ +#include "ntb_hw.h"
+++=======
++ #include <linux/uaccess.h>
++ #include "linux/ntb.h"
++ #include "linux/ntb_transport.h"
+++>>>>>>> 06917f753547 (NTB: Improve performance with write combining)
+  
+ -#define NTB_TRANSPORT_VERSION	4
+ -#define NTB_TRANSPORT_VER	"4"
+ -#define NTB_TRANSPORT_NAME	"ntb_transport"
+ -#define NTB_TRANSPORT_DESC	"Software Queue-Pair Transport over NTB"
+ -
+ -MODULE_DESCRIPTION(NTB_TRANSPORT_DESC);
+ -MODULE_VERSION(NTB_TRANSPORT_VER);
+ -MODULE_LICENSE("Dual BSD/GPL");
+ -MODULE_AUTHOR("Intel Corporation");
+ -
+ -static unsigned long max_mw_size;
+ -module_param(max_mw_size, ulong, 0644);
+ -MODULE_PARM_DESC(max_mw_size, "Limit size of large memory windows");
+ +#define NTB_TRANSPORT_VERSION	3
+  
+  static unsigned int transport_mtu = 0x401E;
+  module_param(transport_mtu, uint, 0644);
+@@@ -932,21 -986,43 +938,42 @@@ int ntb_transport_init(struct pci_dev *
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	nt->mw = kcalloc(ntb_max_mw(nt->ndev), sizeof(struct ntb_transport_mw),
+ +			 GFP_KERNEL);
+ +	if (!nt->mw) {
+ +		rc = -ENOMEM;
+ +		goto err1;
+++=======
++ 	for (i = 0; i < mw_count; i++) {
++ 		mw = &nt->mw_vec[i];
++ 
++ 		rc = ntb_mw_get_range(ndev, i, &mw->phys_addr, &mw->phys_size,
++ 				      &mw->xlat_align, &mw->xlat_align_size);
++ 		if (rc)
++ 			goto err1;
++ 
++ 		mw->vbase = ioremap_wc(mw->phys_addr, mw->phys_size);
++ 		if (!mw->vbase) {
++ 			rc = -ENOMEM;
++ 			goto err1;
++ 		}
++ 
++ 		mw->buff_size = 0;
++ 		mw->xlat_size = 0;
++ 		mw->virt_addr = NULL;
++ 		mw->dma_addr = 0;
+++>>>>>>> 06917f753547 (NTB: Improve performance with write combining)
+  	}
+  
+ -	qp_bitmap = ntb_db_valid_mask(ndev);
+ -
+ -	qp_count = ilog2(qp_bitmap);
+ -	if (max_num_clients && max_num_clients < qp_count)
+ -		qp_count = max_num_clients;
+ -	else if (mw_count < qp_count)
+ -		qp_count = mw_count;
+ -
+ -	qp_bitmap &= BIT_ULL(qp_count) - 1;
+ -
+ -	nt->qp_count = qp_count;
+ -	nt->qp_bitmap = qp_bitmap;
+ -	nt->qp_bitmap_free = qp_bitmap;
+ +	if (max_num_clients)
+ +		nt->max_qps = min(ntb_max_cbs(nt->ndev), max_num_clients);
+ +	else
+ +		nt->max_qps = min(ntb_max_cbs(nt->ndev), ntb_max_mw(nt->ndev));
+  
+ -	nt->qp_vec = kzalloc_node(qp_count * sizeof(*nt->qp_vec),
+ -				  GFP_KERNEL, node);
+ -	if (!nt->qp_vec) {
+ +	nt->qps = kcalloc(nt->max_qps, sizeof(struct ntb_transport_qp),
+ +			  GFP_KERNEL);
+ +	if (!nt->qps) {
+  		rc = -ENOMEM;
+  		goto err2;
+  	}
+@@@ -1269,8 -1376,19 +1296,16 @@@ static void ntb_tx_copy_callback(void *
+  
+  static void ntb_memcpy_tx(struct ntb_queue_entry *entry, void __iomem *offset)
+  {
++ #ifdef ARCH_HAS_NOCACHE_UACCESS
++ 	/*
++ 	 * Using non-temporal mov to improve performance on non-cached
++ 	 * writes, even though we aren't actually copying from user space.
++ 	 */
++ 	__copy_from_user_inatomic_nocache(offset, entry->buf, entry->len);
++ #else
+  	memcpy_toio(offset, entry->buf, entry->len);
++ #endif
+  
+ -	/* Ensure that the data is fully copied out before setting the flags */
+ -	wmb();
+ -
+  	ntb_tx_copy_callback(entry);
+  }
+  
+* Unmerged path drivers/ntb/ntb_transport.c
