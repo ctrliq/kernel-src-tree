@@ -1,0 +1,239 @@
+md/r5cache: fix io_unit handling in r5l_log_endio()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] r5cache: fix io_unit handling in r5l_log_endio() (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 96.97%
+commit-author Song Liu <songliubraving@fb.com>
+commit a9501d742127e613d744e29814e9532bacb147e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a9501d74.failed
+
+In r5l_log_endio(), once log->io_list_lock is released, the io unit
+may be accessed (or even freed) by other threads. Current code
+doesn't handle the io_unit properly, which leads to potential race
+conditions.
+
+This patch solves this race condition by:
+
+1. Add a pending_stripe count flush_payload. Multiple flush_payloads
+   are counted as only one pending_stripe. Flag has_flush_payload is
+   added to show whether the io unit has flush_payload;
+2. In r5l_log_endio(), check flags has_null_flush and
+   has_flush_payload with log->io_list_lock held. After the lock
+   is released, this IO unit is only accessed when we know the
+   pending_stripe counter cannot be zeroed by other threads.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit a9501d742127e613d744e29814e9532bacb147e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index 898694d710dc,2dcbafa8e66c..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -179,6 -233,20 +179,23 @@@ struct r5l_io_unit 
+  	struct list_head stripe_list; /* stripes added to the io_unit */
+  
+  	int state;
+++<<<<<<< HEAD
+++=======
++ 	bool need_split_bio;
++ 	struct bio *split_bio;
++ 
++ 	unsigned int has_flush:1;		/* include flush request */
++ 	unsigned int has_fua:1;			/* include fua request */
++ 	unsigned int has_null_flush:1;		/* include null flush request */
++ 	unsigned int has_flush_payload:1;	/* include flush payload  */
++ 	/*
++ 	 * io isn't sent yet, flush/fua request can only be submitted till it's
++ 	 * the first IO in running_ios list
++ 	 */
++ 	unsigned int io_deferred:1;
++ 
++ 	struct bio_list flush_barriers;   /* size == 0 flush bios */
+++>>>>>>> a9501d742127 (md/r5cache: fix io_unit handling in r5l_log_endio())
+  };
+  
+  /* r5l_io_unit state */
+@@@ -515,13 -565,17 +532,15 @@@ static void r5l_move_to_end_ios(struct 
+  	}
+  }
+  
+ -static void __r5l_stripe_write_finished(struct r5l_io_unit *io);
+ -static void r5l_log_endio(struct bio *bio)
+ +static void r5l_log_endio(struct bio *bio, int error)
+  {
+  	struct r5l_io_unit *io = bio->bi_private;
+ -	struct r5l_io_unit *io_deferred;
+  	struct r5l_log *log = io->log;
+  	unsigned long flags;
++ 	bool has_null_flush;
++ 	bool has_flush_payload;
+  
+ -	if (bio->bi_status)
+ +	if (error)
+  		md_error(log->rdev->mddev, log->rdev);
+  
+  	bio_put(bio);
+@@@ -531,7 -583,17 +550,21 @@@
+  
+  	spin_lock_irqsave(&log->io_list_lock, flags);
+  	__r5l_set_io_unit_state(io, IO_UNIT_IO_END);
+++<<<<<<< HEAD
+ +	if (log->need_cache_flush)
+++=======
++ 
++ 	/*
++ 	 * if the io doesn't not have null_flush or flush payload,
++ 	 * it is not safe to access it after releasing io_list_lock.
++ 	 * Therefore, it is necessary to check the condition with
++ 	 * the lock held.
++ 	 */
++ 	has_null_flush = io->has_null_flush;
++ 	has_flush_payload = io->has_flush_payload;
++ 
++ 	if (log->need_cache_flush && !list_empty(&io->stripe_list))
+++>>>>>>> a9501d742127 (md/r5cache: fix io_unit handling in r5l_log_endio())
+  		r5l_move_to_end_ios(log);
+  	else
+  		r5l_log_run_stripes(log);
+@@@ -539,6 -612,80 +572,83 @@@
+  
+  	if (log->need_cache_flush)
+  		md_wakeup_thread(log->rdev->mddev->thread);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* finish flush only io_unit and PAYLOAD_FLUSH only io_unit */
++ 	if (has_null_flush) {
++ 		struct bio *bi;
++ 
++ 		WARN_ON(bio_list_empty(&io->flush_barriers));
++ 		while ((bi = bio_list_pop(&io->flush_barriers)) != NULL) {
++ 			bio_endio(bi);
++ 			if (atomic_dec_and_test(&io->pending_stripe)) {
++ 				__r5l_stripe_write_finished(io);
++ 				return;
++ 			}
++ 		}
++ 	}
++ 	/* decrease pending_stripe for flush payload */
++ 	if (has_flush_payload)
++ 		if (atomic_dec_and_test(&io->pending_stripe))
++ 			__r5l_stripe_write_finished(io);
++ }
++ 
++ static void r5l_do_submit_io(struct r5l_log *log, struct r5l_io_unit *io)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&log->io_list_lock, flags);
++ 	__r5l_set_io_unit_state(io, IO_UNIT_IO_START);
++ 	spin_unlock_irqrestore(&log->io_list_lock, flags);
++ 
++ 	/*
++ 	 * In case of journal device failures, submit_bio will get error
++ 	 * and calls endio, then active stripes will continue write
++ 	 * process. Therefore, it is not necessary to check Faulty bit
++ 	 * of journal device here.
++ 	 *
++ 	 * We can't check split_bio after current_bio is submitted. If
++ 	 * io->split_bio is null, after current_bio is submitted, current_bio
++ 	 * might already be completed and the io_unit is freed. We submit
++ 	 * split_bio first to avoid the issue.
++ 	 */
++ 	if (io->split_bio) {
++ 		if (io->has_flush)
++ 			io->split_bio->bi_opf |= REQ_PREFLUSH;
++ 		if (io->has_fua)
++ 			io->split_bio->bi_opf |= REQ_FUA;
++ 		submit_bio(io->split_bio);
++ 	}
++ 
++ 	if (io->has_flush)
++ 		io->current_bio->bi_opf |= REQ_PREFLUSH;
++ 	if (io->has_fua)
++ 		io->current_bio->bi_opf |= REQ_FUA;
++ 	submit_bio(io->current_bio);
++ }
++ 
++ /* deferred io_unit will be dispatched here */
++ static void r5l_submit_io_async(struct work_struct *work)
++ {
++ 	struct r5l_log *log = container_of(work, struct r5l_log,
++ 					   deferred_io_work);
++ 	struct r5l_io_unit *io = NULL;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&log->io_list_lock, flags);
++ 	if (!list_empty(&log->running_ios)) {
++ 		io = list_first_entry(&log->running_ios, struct r5l_io_unit,
++ 				      log_sibling);
++ 		if (!io->io_deferred)
++ 			io = NULL;
++ 		else
++ 			io->io_deferred = 0;
++ 	}
++ 	spin_unlock_irqrestore(&log->io_list_lock, flags);
++ 	if (io)
++ 		r5l_do_submit_io(log, io);
+++>>>>>>> a9501d742127 (md/r5cache: fix io_unit handling in r5l_log_endio())
+  }
+  
+  static void r5c_disable_writeback_async(struct work_struct *work)
+@@@ -718,6 -866,46 +828,49 @@@ alloc_bio
+  	r5_reserve_log_entry(log, io);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void r5l_append_flush_payload(struct r5l_log *log, sector_t sect)
++ {
++ 	struct mddev *mddev = log->rdev->mddev;
++ 	struct r5conf *conf = mddev->private;
++ 	struct r5l_io_unit *io;
++ 	struct r5l_payload_flush *payload;
++ 	int meta_size;
++ 
++ 	/*
++ 	 * payload_flush requires extra writes to the journal.
++ 	 * To avoid handling the extra IO in quiesce, just skip
++ 	 * flush_payload
++ 	 */
++ 	if (conf->quiesce)
++ 		return;
++ 
++ 	mutex_lock(&log->io_mutex);
++ 	meta_size = sizeof(struct r5l_payload_flush) + sizeof(__le64);
++ 
++ 	if (r5l_get_meta(log, meta_size)) {
++ 		mutex_unlock(&log->io_mutex);
++ 		return;
++ 	}
++ 
++ 	/* current implementation is one stripe per flush payload */
++ 	io = log->current_io;
++ 	payload = page_address(io->meta_page) + io->meta_offset;
++ 	payload->header.type = cpu_to_le16(R5LOG_PAYLOAD_FLUSH);
++ 	payload->header.flags = cpu_to_le16(0);
++ 	payload->size = cpu_to_le32(sizeof(__le64));
++ 	payload->flush_stripes[0] = cpu_to_le64(sect);
++ 	io->meta_offset += meta_size;
++ 	/* multiple flush payloads count as one pending_stripe */
++ 	if (!io->has_flush_payload) {
++ 		io->has_flush_payload = 1;
++ 		atomic_inc(&io->pending_stripe);
++ 	}
++ 	mutex_unlock(&log->io_mutex);
++ }
++ 
+++>>>>>>> a9501d742127 (md/r5cache: fix io_unit handling in r5l_log_endio())
+  static int r5l_log_stripe(struct r5l_log *log, struct stripe_head *sh,
+  			   int data_pages, int parity_pages)
+  {
+* Unmerged path drivers/md/raid5-cache.c
