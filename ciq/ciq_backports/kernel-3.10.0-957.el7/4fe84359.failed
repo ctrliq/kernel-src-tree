@@ -1,0 +1,73 @@
+bpf: convert htab map to hlist_nulls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 4fe8435909fddc97b81472026aa954e06dd192a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4fe84359.failed
+
+when all map elements are pre-allocated one cpu can delete and reuse htab_elem
+while another cpu is still walking the hlist. In such case the lookup may
+miss the element. Convert hlist to hlist_nulls to avoid such scenario.
+When bucket lock is taken there is no need to take such precautions,
+so only convert map_lookup and map_get_next to nulls.
+The race window is extremely small and only reproducible with explicit
+udelay() inside lookup_nulls_elem_raw()
+
+Similar to hlist add hlist_nulls_for_each_entry_safe() and
+hlist_nulls_entry_safe() helpers.
+
+Fixes: 6c9059817432 ("bpf: pre-allocate hash map elements")
+	Reported-by: Jonathan Perry <jonperry@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4fe8435909fddc97b81472026aa954e06dd192a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/hashtab.c
+* Unmerged path kernel/bpf/hashtab.c
+diff --git a/include/linux/list_nulls.h b/include/linux/list_nulls.h
+index f266661d2666..a66b18ef42a3 100644
+--- a/include/linux/list_nulls.h
++++ b/include/linux/list_nulls.h
+@@ -29,6 +29,11 @@ struct hlist_nulls_node {
+ 	((ptr)->first = (struct hlist_nulls_node *) NULLS_MARKER(nulls))
+ 
+ #define hlist_nulls_entry(ptr, type, member) container_of(ptr,type,member)
++
++#define hlist_nulls_entry_safe(ptr, type, member) \
++	({ typeof(ptr) ____ptr = (ptr); \
++	   !is_a_nulls(____ptr) ? hlist_nulls_entry(____ptr, type, member) : NULL; \
++	})
+ /**
+  * ptr_is_a_nulls - Test if a ptr is a nulls
+  * @ptr: ptr to be tested
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 4ae95f7e8597..a23a33153180 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -156,5 +156,19 @@ static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+ 		pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)))
+ 
++/**
++ * hlist_nulls_for_each_entry_safe -
++ *   iterate over list of given type safe against removal of list entry
++ * @tpos:	the type * to use as a loop cursor.
++ * @pos:	the &struct hlist_nulls_node to use as a loop cursor.
++ * @head:	the head for your list.
++ * @member:	the name of the hlist_nulls_node within the struct.
++ */
++#define hlist_nulls_for_each_entry_safe(tpos, pos, head, member)		\
++	for (({barrier();}),							\
++	     pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
++		(!is_a_nulls(pos)) &&						\
++		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member);	\
++		   pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)); 1; });)
+ #endif
+ #endif
+* Unmerged path kernel/bpf/hashtab.c
