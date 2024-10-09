@@ -1,0 +1,114 @@
+locking/x86: Use LOCK ADD for smp_mb() instead of MFENCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 450cbdd0125cfa5d7bbf9e2a6b6961cc48d29730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/450cbdd0.failed
+
+MFENCE appears to be way slower than a locked instruction - let's use
+LOCK ADD unconditionally, as we always did on old 32-bit.
+
+Performance testing results:
+
+  perf stat -r 10 -- ./virtio_ring_0_9 --sleep --host-affinity 0 --guest-affinity 0
+  Before:
+         0.922565990 seconds time elapsed                                          ( +-  1.15% )
+  After:
+         0.578667024 seconds time elapsed                                          ( +-  1.21% )
+
+i.e. about ~60% faster.
+
+Just poking at SP would be the most natural, but if we then read the
+value from SP, we get a false dependency which will slow us down.
+
+This was noted in this article:
+
+  http://shipilev.net/blog/2014/on-the-fence-with-dependencies/
+
+And is easy to reproduce by sticking a barrier in a small non-inline
+function.
+
+So let's use a negative offset - which avoids this problem since we
+build with the red zone disabled.
+
+For userspace, use an address just below the redzone.
+
+The one difference between LOCK ADD and MFENCE is that LOCK ADD does
+not affect CLFLUSH, previous patches converted all uses of CLFLUSH to
+call mb(), such that changes to smp_mb() won't affect it.
+
+Update mb/rmb/wmb() on 32-bit to use the negative offset, too, for
+consistency.
+
+As a follow-up, it might be worth considering switching users
+of CLFLUSH to another API (e.g. clflush_mb()?) - we will
+then be able to convert mb() to smp_mb() again.
+
+Also arguably, GCC should switch to use LOCK ADD for __sync_synchronize().
+This might be worth pursuing separately.
+
+	Suggested-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: qemu-devel@nongnu.org
+	Cc: virtualization@lists.linux-foundation.org
+Link: http://lkml.kernel.org/r/1509118355-4890-1-git-send-email-mst@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 450cbdd0125cfa5d7bbf9e2a6b6961cc48d29730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/barrier.h
+#	tools/virtio/ringtest/main.h
+diff --cc arch/x86/include/asm/barrier.h
+index f9d27d30d9b4,7fb336210e1b..000000000000
+--- a/arch/x86/include/asm/barrier.h
++++ b/arch/x86/include/asm/barrier.h
+@@@ -57,20 -31,14 +57,31 @@@ static inline unsigned long array_index
+  #endif
+  #define dma_wmb()	barrier()
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+ +#define smp_mb()	mb()
+ +#define smp_rmb()	dma_rmb()
+ +#define smp_wmb()	barrier()
+ +#define set_mb(var, value) do { (void)xchg(&var, value); } while (0)
+ +#else /* !SMP */
+ +#define smp_mb()	barrier()
+ +#define smp_rmb()	barrier()
+ +#define smp_wmb()	barrier()
+ +#define set_mb(var, value) do { var = value; barrier(); } while (0)
+ +#endif /* SMP */
+ +
+ +#define read_barrier_depends()		do { } while (0)
+ +#define smp_read_barrier_depends()	do { } while (0)
+++=======
++ #ifdef CONFIG_X86_32
++ #define __smp_mb()	asm volatile("lock; addl $0,-4(%%esp)" ::: "memory", "cc")
++ #else
++ #define __smp_mb()	asm volatile("lock; addl $0,-4(%%rsp)" ::: "memory", "cc")
++ #endif
++ #define __smp_rmb()	dma_rmb()
++ #define __smp_wmb()	barrier()
++ #define __smp_store_mb(var, value) do { (void)xchg(&var, value); } while (0)
+++>>>>>>> 450cbdd0125c (locking/x86: Use LOCK ADD for smp_mb() instead of MFENCE)
+  
+  #if defined(CONFIG_X86_PPRO_FENCE)
+  
+* Unmerged path tools/virtio/ringtest/main.h
+* Unmerged path arch/x86/include/asm/barrier.h
+* Unmerged path tools/virtio/ringtest/main.h
