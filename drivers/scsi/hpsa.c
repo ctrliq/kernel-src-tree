@@ -8241,8 +8241,6 @@ static void hpsa_set_ioaccel_status(struct ctlr_info *h)
 
 		if (!device)
 			continue;
-		if (!device->scsi3addr)
-			continue;
 		if (!hpsa_vpd_page_supported(h, device->scsi3addr,
 						HPSA_VPD_LV_IOACCEL_STATUS))
 			continue;
