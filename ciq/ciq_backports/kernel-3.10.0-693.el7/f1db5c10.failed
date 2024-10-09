@@ -1,0 +1,162 @@
+alx: fix wrong condition to free descriptor memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tobias Regnery <tobias.regnery@gmail.com>
+commit f1db5c101cd48b5555ed9e061dcc49ed329812ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f1db5c10.failed
+
+The condition to free the descriptor memory is wrong, we want to free the
+memory if it is set and not if it is unset. Invert the test to fix this
+issue.
+
+Fixes: b0999223f224b ("alx: add ability to allocate and free alx_napi structures")
+	Signed-off-by: Tobias Regnery <tobias.regnery@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f1db5c101cd48b5555ed9e061dcc49ed329812ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/alx/main.c
+diff --cc drivers/net/ethernet/atheros/alx/main.c
+index b165b9e58ad3,765306bd78c2..000000000000
+--- a/drivers/net/ethernet/atheros/alx/main.c
++++ b/drivers/net/ethernet/atheros/alx/main.c
+@@@ -678,23 -692,121 +678,83 @@@ out_free
+  
+  static void alx_free_rings(struct alx_priv *alx)
+  {
+ -	int i;
+ -
+ +	netif_napi_del(&alx->napi);
+  	alx_free_buffers(alx);
+  
+ -	for (i = 0; i < alx->num_txq; i++)
+ -		if (alx->qnapi[i] && alx->qnapi[i]->txq)
+ -			kfree(alx->qnapi[i]->txq->bufs);
+ +	kfree(alx->txq.bufs);
+ +	kfree(alx->rxq.bufs);
+  
+++<<<<<<< HEAD
+ +	if (alx->rx_page) {
+ +		put_page(alx->rx_page);
+ +		alx->rx_page = NULL;
+++=======
++ 	if (alx->qnapi[0] && alx->qnapi[0]->rxq)
++ 		kfree(alx->qnapi[0]->rxq->bufs);
++ 
++ 	if (alx->descmem.virt)
++ 		dma_free_coherent(&alx->hw.pdev->dev,
++ 				  alx->descmem.size,
++ 				  alx->descmem.virt,
++ 				  alx->descmem.dma);
++ }
++ 
++ static void alx_free_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 	int i;
++ 
++ 	for (i = 0; i < alx->num_napi; i++) {
++ 		np = alx->qnapi[i];
++ 		if (!np)
++ 			continue;
++ 
++ 		netif_napi_del(&np->napi);
++ 		kfree(np->txq);
++ 		kfree(np->rxq);
++ 		kfree(np);
++ 		alx->qnapi[i] = NULL;
++ 	}
++ }
++ 
++ static const u16 tx_pidx_reg[] = {ALX_TPD_PRI0_PIDX, ALX_TPD_PRI1_PIDX,
++ 				  ALX_TPD_PRI2_PIDX, ALX_TPD_PRI3_PIDX};
++ static const u16 tx_cidx_reg[] = {ALX_TPD_PRI0_CIDX, ALX_TPD_PRI1_CIDX,
++ 				  ALX_TPD_PRI2_CIDX, ALX_TPD_PRI3_CIDX};
++ static const u32 tx_vect_mask[] = {ALX_ISR_TX_Q0, ALX_ISR_TX_Q1,
++ 				   ALX_ISR_TX_Q2, ALX_ISR_TX_Q3};
++ static const u32 rx_vect_mask[] = {ALX_ISR_RX_Q0, ALX_ISR_RX_Q1,
++ 				   ALX_ISR_RX_Q2, ALX_ISR_RX_Q3,
++ 				   ALX_ISR_RX_Q4, ALX_ISR_RX_Q5,
++ 				   ALX_ISR_RX_Q6, ALX_ISR_RX_Q7};
++ 
++ static int alx_alloc_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 	struct alx_rx_queue *rxq;
++ 	struct alx_tx_queue *txq;
++ 	int i;
++ 
++ 	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
++ 
++ 	/* allocate alx_napi structures */
++ 	for (i = 0; i < alx->num_napi; i++) {
++ 		np = kzalloc(sizeof(struct alx_napi), GFP_KERNEL);
++ 		if (!np)
++ 			goto err_out;
++ 
++ 		np->alx = alx;
++ 		netif_napi_add(alx->dev, &np->napi, alx_poll, 64);
++ 		alx->qnapi[i] = np;
+++>>>>>>> f1db5c101cd4 (alx: fix wrong condition to free descriptor memory)
+  	}
+  
+ -	/* allocate tx queues */
+ -	for (i = 0; i < alx->num_txq; i++) {
+ -		np = alx->qnapi[i];
+ -		txq = kzalloc(sizeof(*txq), GFP_KERNEL);
+ -		if (!txq)
+ -			goto err_out;
+ -
+ -		np->txq = txq;
+ -		txq->p_reg = tx_pidx_reg[i];
+ -		txq->c_reg = tx_cidx_reg[i];
+ -		txq->queue_idx = i;
+ -		txq->count = alx->tx_ringsz;
+ -		txq->netdev = alx->dev;
+ -		txq->dev = &alx->hw.pdev->dev;
+ -		np->vec_mask |= tx_vect_mask[i];
+ -		alx->int_mask |= tx_vect_mask[i];
+ -	}
+ -
+ -	/* allocate rx queues */
+ -	np = alx->qnapi[0];
+ -	rxq = kzalloc(sizeof(*rxq), GFP_KERNEL);
+ -	if (!rxq)
+ -		goto err_out;
+ -
+ -	np->rxq = rxq;
+ -	rxq->np = alx->qnapi[0];
+ -	rxq->queue_idx = 0;
+ -	rxq->count = alx->rx_ringsz;
+ -	rxq->netdev = alx->dev;
+ -	rxq->dev = &alx->hw.pdev->dev;
+ -	np->vec_mask |= rx_vect_mask[0];
+ -	alx->int_mask |= rx_vect_mask[0];
+ -
+ -	return 0;
+ -
+ -err_out:
+ -	netdev_err(alx->dev, "error allocating internal structures\n");
+ -	alx_free_napis(alx);
+ -	return -ENOMEM;
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+  }
+  
+ -static const int txq_vec_mapping_shift[] = {
+ -	0, ALX_MSI_MAP_TBL1_TXQ0_SHIFT,
+ -	0, ALX_MSI_MAP_TBL1_TXQ1_SHIFT,
+ -	1, ALX_MSI_MAP_TBL2_TXQ2_SHIFT,
+ -	1, ALX_MSI_MAP_TBL2_TXQ3_SHIFT,
+ -};
+ -
+  static void alx_config_vector_mapping(struct alx_priv *alx)
+  {
+  	struct alx_hw *hw = &alx->hw;
+* Unmerged path drivers/net/ethernet/atheros/alx/main.c
