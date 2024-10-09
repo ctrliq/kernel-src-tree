@@ -1,0 +1,82 @@
+IB/cm: Fix sleeping in atomic when RoCE is used
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Roland Dreier <roland@purestorage.com>
+commit c76161181193985087cd716fdf69b5cb6cf9ee85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c7616118.failed
+
+A couple of places in the CM do
+
+    spin_lock_irq(&cm_id_priv->lock);
+    ...
+    if (cm_alloc_response_msg(work->port, work->mad_recv_wc, &msg))
+
+However when the underlying transport is RoCE, this leads to a sleeping function
+being called with the lock held - the callchain is
+
+    cm_alloc_response_msg() ->
+      ib_create_ah_from_wc() ->
+        ib_init_ah_from_wc() ->
+          rdma_addr_find_l2_eth_by_grh() ->
+            rdma_resolve_ip()
+
+and rdma_resolve_ip() starts out by doing
+
+    req = kzalloc(sizeof *req, GFP_KERNEL);
+
+not to mention rdma_addr_find_l2_eth_by_grh() doing
+
+    wait_for_completion(&ctx.comp);
+
+to wait for the task that rdma_resolve_ip() queues up.
+
+Fix this by moving the AH creation out of the lock.
+
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+	Reviewed-by: Sean Hefty <sean.hefty@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c76161181193985087cd716fdf69b5cb6cf9ee85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cm.c
+diff --cc drivers/infiniband/core/cm.c
+index ea27dc1ae666,4c4b46586af2..000000000000
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@@ -385,22 -393,14 +393,31 @@@ static int cm_create_response_msg_ah(st
+  	if (IS_ERR(ah))
+  		return PTR_ERR(ah);
+  
+++<<<<<<< HEAD
+ +	m = ib_create_send_mad(port->mad_agent, 1, mad_recv_wc->wc->pkey_index,
+ +			       0, IB_MGMT_MAD_HDR, IB_MGMT_MAD_DATA,
+ +			       GFP_ATOMIC,
+ +			       IB_MGMT_BASE_VERSION);
+ +	if (IS_ERR(m)) {
+ +		ib_destroy_ah(ah);
+ +		return PTR_ERR(m);
+ +	}
+ +	m->ah = ah;
+ +	*msg = m;
+++=======
++ 	msg->ah = ah;
+++>>>>>>> c76161181193 (IB/cm: Fix sleeping in atomic when RoCE is used)
+  	return 0;
+  }
+  
+  static void cm_free_msg(struct ib_mad_send_buf *msg)
+  {
+++<<<<<<< HEAD
+ +	ib_destroy_ah(msg->ah);
+++=======
++ 	if (msg->ah)
++ 		rdma_destroy_ah(msg->ah);
+++>>>>>>> c76161181193 (IB/cm: Fix sleeping in atomic when RoCE is used)
+  	if (msg->context[0])
+  		cm_deref_id(msg->context[0]);
+  	ib_free_send_mad(msg);
+* Unmerged path drivers/infiniband/core/cm.c
