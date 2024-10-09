@@ -1,0 +1,158 @@
+bnxt_en: Reserve completion rings and MSIX for bnxt_re RDMA driver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Reserve completion rings and MSIX for bnxt_re RDMA driver (Jonathan Toppins) [1526120]
+Rebuild_FUZZ: 99.25%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit fbcfc8e4674156cb7eb3d8054bd4332142d2cc58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fbcfc8e4.failed
+
+Add additional logic to reserve completion rings for the bnxt_re driver
+when it requests MSIX vectors.  The function bnxt_cp_rings_in_use()
+will return the total number of completion rings used by both drivers
+that need to be reserved.  If the network interface in up, we will
+close and open the NIC to reserve the new set of completion rings and
+re-initialize the vectors.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fbcfc8e4674156cb7eb3d8054bd4332142d2cc58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index ce115696763b,6a1d18fc140f..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -4690,6 -4753,30 +4690,33 @@@ static int bnxt_cp_rings_in_use(struct 
+  	return cp;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool bnxt_need_reserve_rings(struct bnxt *bp)
++ {
++ 	struct bnxt_hw_resc *hw_resc = &bp->hw_resc;
++ 	int cp = bnxt_cp_rings_in_use(bp);
++ 	int rx = bp->rx_nr_rings;
++ 	int vnic = 1, grp = rx;
++ 
++ 	if (bp->hwrm_spec_code < 0x10601)
++ 		return false;
++ 
++ 	if (hw_resc->resv_tx_rings != bp->tx_nr_rings)
++ 		return true;
++ 
++ 	if (bp->flags & BNXT_FLAG_RFS)
++ 		vnic = rx + 1;
++ 	if (bp->flags & BNXT_FLAG_AGG_RINGS)
++ 		rx <<= 1;
++ 	if ((bp->flags & BNXT_FLAG_NEW_RM) &&
++ 	    (hw_resc->resv_rx_rings != rx || hw_resc->resv_cp_rings != cp ||
++ 	     hw_resc->resv_hw_ring_grps != grp || hw_resc->resv_vnics != vnic))
++ 		return true;
++ 	return false;
++ }
++ 
+++>>>>>>> fbcfc8e46741 (bnxt_en: Reserve completion rings and MSIX for bnxt_re RDMA driver.)
+  static int bnxt_trim_rings(struct bnxt *bp, int *rx, int *tx, int max,
+  			   bool shared);
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 46665d24f0df..a563b2e14cf7 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1427,7 +1427,10 @@ unsigned int bnxt_get_max_func_stat_ctxs(struct bnxt *bp);
+ void bnxt_set_max_func_stat_ctxs(struct bnxt *bp, unsigned int max);
+ unsigned int bnxt_get_max_func_cp_rings(struct bnxt *bp);
+ void bnxt_set_max_func_cp_rings(struct bnxt *bp, unsigned int max);
++unsigned int bnxt_get_max_func_irqs(struct bnxt *bp);
+ void bnxt_set_max_func_irqs(struct bnxt *bp, unsigned int max);
++int bnxt_get_avail_msix(struct bnxt *bp, int num);
++int bnxt_reserve_rings(struct bnxt *bp);
+ void bnxt_tx_disable(struct bnxt *bp);
+ void bnxt_tx_enable(struct bnxt *bp);
+ int bnxt_hwrm_set_pause(struct bnxt *);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
+index 62636cd44331..2583923df5a1 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
+@@ -108,6 +108,7 @@ static int bnxt_req_msix_vecs(struct bnxt_en_dev *edev, int ulp_id,
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	int max_idx, max_cp_rings;
+ 	int avail_msix, i, idx;
++	int rc = 0;
+ 
+ 	ASSERT_RTNL();
+ 	if (ulp_id != BNXT_ROCE_ULP)
+@@ -120,26 +121,46 @@ static int bnxt_req_msix_vecs(struct bnxt_en_dev *edev, int ulp_id,
+ 		return -EAGAIN;
+ 
+ 	max_cp_rings = bnxt_get_max_func_cp_rings(bp);
+-	max_idx = min_t(int, bp->total_irqs, max_cp_rings);
+-	avail_msix = max_idx - bp->cp_nr_rings;
++	avail_msix = bnxt_get_avail_msix(bp, num_msix);
+ 	if (!avail_msix)
+ 		return -ENOMEM;
+ 	if (avail_msix > num_msix)
+ 		avail_msix = num_msix;
+ 
+-	if (bp->flags & BNXT_FLAG_NEW_RM)
++	if (bp->flags & BNXT_FLAG_NEW_RM) {
+ 		idx = bp->cp_nr_rings;
+-	else
++	} else {
++		max_idx = min_t(int, bp->total_irqs, max_cp_rings);
+ 		idx = max_idx - avail_msix;
++	}
+ 	edev->ulp_tbl[ulp_id].msix_base = idx;
++	edev->ulp_tbl[ulp_id].msix_requested = avail_msix;
++	if (bp->total_irqs < (idx + avail_msix)) {
++		if (netif_running(dev)) {
++			bnxt_close_nic(bp, true, false);
++			rc = bnxt_open_nic(bp, true, false);
++		} else {
++			rc = bnxt_reserve_rings(bp);
++		}
++	}
++	if (rc) {
++		edev->ulp_tbl[ulp_id].msix_requested = 0;
++		return -EAGAIN;
++	}
++
++	if (bp->flags & BNXT_FLAG_NEW_RM) {
++		struct bnxt_hw_resc *hw_resc = &bp->hw_resc;
++
++		avail_msix = hw_resc->resv_cp_rings - bp->cp_nr_rings;
++		edev->ulp_tbl[ulp_id].msix_requested = avail_msix;
++	}
+ 	for (i = 0; i < avail_msix; i++) {
+ 		ent[i].vector = bp->irq_tbl[idx + i].vector;
+ 		ent[i].ring_idx = idx + i;
+ 		ent[i].db_offset = (idx + i) * 0x80;
+ 	}
+-	bnxt_set_max_func_irqs(bp, max_idx - avail_msix);
++	bnxt_set_max_func_irqs(bp, bnxt_get_max_func_irqs(bp) - avail_msix);
+ 	bnxt_set_max_func_cp_rings(bp, max_cp_rings - avail_msix);
+-	edev->ulp_tbl[ulp_id].msix_requested = avail_msix;
+ 	return avail_msix;
+ }
+ 
+@@ -157,7 +178,11 @@ static int bnxt_free_msix_vecs(struct bnxt_en_dev *edev, int ulp_id)
+ 	msix_requested = edev->ulp_tbl[ulp_id].msix_requested;
+ 	bnxt_set_max_func_cp_rings(bp, max_cp_rings + msix_requested);
+ 	edev->ulp_tbl[ulp_id].msix_requested = 0;
+-	bnxt_set_max_func_irqs(bp, bp->total_irqs);
++	bnxt_set_max_func_irqs(bp, bnxt_get_max_func_irqs(bp) + msix_requested);
++	if (netif_running(dev)) {
++		bnxt_close_nic(bp, true, false);
++		bnxt_open_nic(bp, true, false);
++	}
+ 	return 0;
+ }
+ 
