@@ -1,0 +1,252 @@
+net, sched: fix panic when updating miniq {b,q}stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: fix panic when updating miniq (b, q)stats (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 90.00%
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 81d947e2b8dd2394586c3eaffdd2357797d3bf59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/81d947e2.failed
+
+While working on fixing another bug, I ran into the following panic
+on arm64 by simply attaching clsact qdisc, adding a filter and running
+traffic on ingress to it:
+
+  [...]
+  [  178.188591] Unable to handle kernel read from unreadable memory at virtual address 810fb501f000
+  [  178.197314] Mem abort info:
+  [  178.200121]   ESR = 0x96000004
+  [  178.203168]   Exception class = DABT (current EL), IL = 32 bits
+  [  178.209095]   SET = 0, FnV = 0
+  [  178.212157]   EA = 0, S1PTW = 0
+  [  178.215288] Data abort info:
+  [  178.218175]   ISV = 0, ISS = 0x00000004
+  [  178.222019]   CM = 0, WnR = 0
+  [  178.224997] user pgtable: 4k pages, 48-bit VAs, pgd = 0000000023cb3f33
+  [  178.231531] [0000810fb501f000] *pgd=0000000000000000
+  [  178.236508] Internal error: Oops: 96000004 [#1] SMP
+  [...]
+  [  178.311855] CPU: 73 PID: 2497 Comm: ping Tainted: G        W        4.15.0-rc7+ #5
+  [  178.319413] Hardware name: FOXCONN R2-1221R-A4/C2U4N_MB, BIOS G31FB18A 03/31/2017
+  [  178.326887] pstate: 60400005 (nZCv daif +PAN -UAO)
+  [  178.331685] pc : __netif_receive_skb_core+0x49c/0xac8
+  [  178.336728] lr : __netif_receive_skb+0x28/0x78
+  [  178.341161] sp : ffff00002344b750
+  [  178.344465] x29: ffff00002344b750 x28: ffff810fbdfd0580
+  [  178.349769] x27: 0000000000000000 x26: ffff000009378000
+  [...]
+  [  178.418715] x1 : 0000000000000054 x0 : 0000000000000000
+  [  178.424020] Process ping (pid: 2497, stack limit = 0x000000009f0a3ff4)
+  [  178.430537] Call trace:
+  [  178.432976]  __netif_receive_skb_core+0x49c/0xac8
+  [  178.437670]  __netif_receive_skb+0x28/0x78
+  [  178.441757]  process_backlog+0x9c/0x160
+  [  178.445584]  net_rx_action+0x2f8/0x3f0
+  [...]
+
+Reason is that sch_ingress and sch_clsact are doing mini_qdisc_pair_init()
+which sets up miniq pointers to cpu_{b,q}stats from the underlying qdisc.
+Problem is that this cannot work since they are actually set up right after
+the qdisc ->init() callback in qdisc_create(), so first packet going into
+sch_handle_ingress() tries to call mini_qdisc_bstats_cpu_update() and we
+therefore panic.
+
+In order to fix this, allocation of {b,q}stats needs to happen before we
+call into ->init(). In net-next, there's already such option through commit
+d59f5ffa59d8 ("net: sched: a dflt qdisc may be used with per cpu stats").
+However, the bug needs to be fixed in net still for 4.15. Thus, include
+these bits to reduce any merge churn and reuse the static_flags field to
+set TCQ_F_CPUSTATS, and remove the allocation from qdisc_create() since
+there is no other user left. Prashant Bhole ran into the same issue but
+for net-next, thus adding him below as well as co-author. Same issue was
+also reported by Sandipan Das when using bcc.
+
+Fixes: 46209401f8f6 ("net: core: introduce mini_Qdisc and eliminate usage of tp->q for clsact fastpath")
+Reference: https://lists.iovisor.org/pipermail/iovisor-dev/2018-January/001190.html
+	Reported-by: Sandipan Das <sandipan@linux.vnet.ibm.com>
+Co-authored-by: Prashant Bhole <bhole_prashant_q7@lab.ntt.co.jp>
+Co-authored-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 81d947e2b8dd2394586c3eaffdd2357797d3bf59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_ingress.c
+diff --cc net/sched/sch_ingress.c
+index 790eb0f81e70,003e1b063447..000000000000
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@@ -57,16 -66,16 +57,27 @@@ static int ingress_init(struct Qdisc *s
+  {
+  	struct ingress_sched_data *q = qdisc_priv(sch);
+  	struct net_device *dev = qdisc_dev(sch);
+- 	int err;
+  
+++<<<<<<< HEAD
+ +	err = tcf_block_get(&q->block, &dev->ingress_cl_list);
+ +	if (err)
+ +		return err;
+ +
+ +	net_inc_ingress_queue();
+ +	sch->flags |= TCQ_F_CPUSTATS;
+ +
+ +	return 0;
+++=======
++ 	net_inc_ingress_queue();
++ 
++ 	mini_qdisc_pair_init(&q->miniqp, sch, &dev->miniq_ingress);
++ 
++ 	q->block_info.binder_type = TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS;
++ 	q->block_info.chain_head_change = clsact_chain_head_change;
++ 	q->block_info.chain_head_change_priv = &q->miniqp;
++ 
++ 	return tcf_block_get_ext(&q->block, sch, &q->block_info);
+++>>>>>>> 81d947e2b8dd (net, sched: fix panic when updating miniq {b,q}stats)
+  }
+  
+  static void ingress_destroy(struct Qdisc *sch)
+@@@ -164,9 -170,23 +176,29 @@@ static int clsact_init(struct Qdisc *sc
+  	net_inc_ingress_queue();
+  	net_inc_egress_queue();
+  
+++<<<<<<< HEAD
+ +	sch->flags |= TCQ_F_CPUSTATS;
+ +
+ +	return 0;
+++=======
++ 	mini_qdisc_pair_init(&q->miniqp_ingress, sch, &dev->miniq_ingress);
++ 
++ 	q->ingress_block_info.binder_type = TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS;
++ 	q->ingress_block_info.chain_head_change = clsact_chain_head_change;
++ 	q->ingress_block_info.chain_head_change_priv = &q->miniqp_ingress;
++ 
++ 	err = tcf_block_get_ext(&q->ingress_block, sch, &q->ingress_block_info);
++ 	if (err)
++ 		return err;
++ 
++ 	mini_qdisc_pair_init(&q->miniqp_egress, sch, &dev->miniq_egress);
++ 
++ 	q->egress_block_info.binder_type = TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS;
++ 	q->egress_block_info.chain_head_change = clsact_chain_head_change;
++ 	q->egress_block_info.chain_head_change_priv = &q->miniqp_egress;
++ 
++ 	return tcf_block_get_ext(&q->egress_block, sch, &q->egress_block_info);
+++>>>>>>> 81d947e2b8dd (net, sched: fix panic when updating miniq {b,q}stats)
+  }
+  
+  static void clsact_destroy(struct Qdisc *sch)
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 983518dc3688..5ac42b6131d9 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -191,6 +191,7 @@ struct Qdisc_ops {
+ 	const struct Qdisc_class_ops	*cl_ops;
+ 	char			id[IFNAMSIZ];
+ 	int			priv_size;
++	unsigned int		static_flags;
+ 
+ 	int 			(*enqueue)(struct sk_buff *skb,
+ 					   struct Qdisc *sch,
+@@ -442,6 +443,7 @@ void qdisc_tree_reduce_backlog(struct Qdisc *qdisc, unsigned int n,
+ 			       unsigned int len);
+ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 			  const struct Qdisc_ops *ops);
++void qdisc_free(struct Qdisc *qdisc);
+ struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
+ 				const struct Qdisc_ops *ops, u32 parentid);
+ void __qdisc_calculate_pkt_len(struct sk_buff *skb,
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index f449437b871b..1109d35f0786 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -1075,17 +1075,6 @@ static struct Qdisc *qdisc_create(struct net_device *dev,
+ 	}
+ 
+ 	if (!ops->init || (err = ops->init(sch, tca[TCA_OPTIONS])) == 0) {
+-		if (qdisc_is_percpu_stats(sch)) {
+-			sch->cpu_bstats =
+-				netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
+-			if (!sch->cpu_bstats)
+-				goto err_out4;
+-
+-			sch->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
+-			if (!sch->cpu_qstats)
+-				goto err_out4;
+-		}
+-
+ 		if (tca[TCA_STAB]) {
+ 			stab = qdisc_get_stab(tca[TCA_STAB]);
+ 			if (IS_ERR(stab)) {
+@@ -1127,7 +1116,7 @@ static struct Qdisc *qdisc_create(struct net_device *dev,
+ 		ops->destroy(sch);
+ err_out3:
+ 	dev_put(dev);
+-	kfree((char *) sch - sch->padded);
++	qdisc_free(sch);
+ err_out2:
+ 	module_put(ops->owner);
+ err_out:
+@@ -1135,8 +1124,6 @@ err_out:
+ 	return NULL;
+ 
+ err_out4:
+-	free_percpu(sch->cpu_bstats);
+-	free_percpu(sch->cpu_qstats);
+ 	/*
+ 	 * Any broken qdiscs that would require a ops->reset() here?
+ 	 * The qdisc was never in action so it shouldn't be necessary.
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 2a80b20f638c..c843fb14945f 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -665,6 +665,19 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 	qdisc_skb_head_init(&sch->q);
+ 	spin_lock_init(&sch->q.lock);
+ 
++	if (ops->static_flags & TCQ_F_CPUSTATS) {
++		sch->cpu_bstats =
++			netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
++		if (!sch->cpu_bstats)
++			goto errout1;
++
++		sch->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
++		if (!sch->cpu_qstats) {
++			free_percpu(sch->cpu_bstats);
++			goto errout1;
++		}
++	}
++
+ 	spin_lock_init(&sch->busylock);
+ 	lockdep_set_class(&sch->busylock,
+ 			  dev->qdisc_tx_busylock ?: &qdisc_tx_busylock);
+@@ -672,6 +685,7 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 	seqcount_init(&sch->running);
+ 
+ 	sch->ops = ops;
++	sch->flags = ops->static_flags;
+ 	sch->enqueue = ops->enqueue;
+ 	sch->dequeue = ops->dequeue;
+ 	sch->dev_queue = dev_queue;
+@@ -679,6 +693,8 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 	atomic_set(&sch->refcnt, 1);
+ 
+ 	return sch;
++errout1:
++	kfree(p);
+ errout:
+ 	return ERR_PTR(err);
+ }
+@@ -728,7 +744,7 @@ void qdisc_reset(struct Qdisc *qdisc)
+ }
+ EXPORT_SYMBOL(qdisc_reset);
+ 
+-static void qdisc_free(struct Qdisc *qdisc)
++void qdisc_free(struct Qdisc *qdisc)
+ {
+ 	if (qdisc_is_percpu_stats(qdisc)) {
+ 		free_percpu(qdisc->cpu_bstats);
+* Unmerged path net/sched/sch_ingress.c
