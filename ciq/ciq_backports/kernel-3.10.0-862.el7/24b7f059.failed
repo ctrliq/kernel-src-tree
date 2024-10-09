@@ -1,0 +1,148 @@
+nvme-fc: fix missing put reference on controller create failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] fc: fix missing put reference on controller create failure (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 95.87%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 24b7f0592f738a1127c72dbf5b72a83997dd6997
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/24b7f059.failed
+
+The failure case, of a create controller request, called
+nvme_uninit_ctrl() but didn't do a put to allow the nvme
+controller to be deleted.
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 24b7f0592f738a1127c72dbf5b72a83997dd6997)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index a2d701be7e74,92964cef0f4b..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -2317,60 -2759,70 +2317,92 @@@ __nvme_fc_create_ctrl(struct device *de
+  	ctrl->queues = kcalloc(ctrl->queue_count, sizeof(struct nvme_fc_queue),
+  				GFP_KERNEL);
+  	if (!ctrl->queues)
+ -		goto out_free_ida;
+ +		goto out_uninit_ctrl;
+  
+ -	memset(&ctrl->admin_tag_set, 0, sizeof(ctrl->admin_tag_set));
+ -	ctrl->admin_tag_set.ops = &nvme_fc_admin_mq_ops;
+ -	ctrl->admin_tag_set.queue_depth = NVME_FC_AQ_BLKMQ_DEPTH;
+ -	ctrl->admin_tag_set.reserved_tags = 2; /* fabric connect + Keep-Alive */
+ -	ctrl->admin_tag_set.numa_node = NUMA_NO_NODE;
+ -	ctrl->admin_tag_set.cmd_size = sizeof(struct nvme_fc_fcp_op) +
+ -					(SG_CHUNK_SIZE *
+ -						sizeof(struct scatterlist)) +
+ -					ctrl->lport->ops->fcprqst_priv_sz;
+ -	ctrl->admin_tag_set.driver_data = ctrl;
+ -	ctrl->admin_tag_set.nr_hw_queues = 1;
+ -	ctrl->admin_tag_set.timeout = ADMIN_TIMEOUT;
+ -
+ -	ret = blk_mq_alloc_tag_set(&ctrl->admin_tag_set);
+ +	ret = nvme_fc_configure_admin_queue(ctrl);
+  	if (ret)
+ -		goto out_free_queues;
+ +		goto out_uninit_ctrl;
+  
+ -	ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
+ -	if (IS_ERR(ctrl->ctrl.admin_q)) {
+ -		ret = PTR_ERR(ctrl->ctrl.admin_q);
+ -		goto out_free_admin_tag_set;
+ +	/* sanity checks */
+ +
+ +	/* FC-NVME supports 64-byte SQE only */
+ +	if (ctrl->ctrl.ioccsz != 4) {
+ +		dev_err(ctrl->ctrl.device, "ioccsz %d is not supported!\n",
+ +				ctrl->ctrl.ioccsz);
+ +		goto out_remove_admin_queue;
+ +	}
+ +	/* FC-NVME supports 16-byte CQE only */
+ +	if (ctrl->ctrl.iorcsz != 1) {
+ +		dev_err(ctrl->ctrl.device, "iorcsz %d is not supported!\n",
+ +				ctrl->ctrl.iorcsz);
+ +		goto out_remove_admin_queue;
+ +	}
+ +	/* FC-NVME does not have other data in the capsule */
+ +	if (ctrl->ctrl.icdoff) {
+ +		dev_err(ctrl->ctrl.device, "icdoff %d is not supported!\n",
+ +				ctrl->ctrl.icdoff);
+ +		goto out_remove_admin_queue;
+  	}
+  
+ -	/*
+ -	 * Would have been nice to init io queues tag set as well.
+ -	 * However, we require interaction from the controller
+ -	 * for max io queue count before we can do so.
+ -	 * Defer this to the connect path.
+ -	 */
+ +	/* FC-NVME supports normal SGL Data Block Descriptors */
+  
+++<<<<<<< HEAD
+ +	if (opts->queue_size > ctrl->ctrl.maxcmd) {
+ +		/* warn if maxcmd is lower than queue_size */
+ +		dev_warn(ctrl->ctrl.device,
+ +			"queue_size %zu > ctrl maxcmd %u, reducing "
+ +			"to queue_size\n",
+ +			opts->queue_size, ctrl->ctrl.maxcmd);
+ +		opts->queue_size = ctrl->ctrl.maxcmd;
+++=======
++ 	ret = nvme_init_ctrl(&ctrl->ctrl, dev, &nvme_fc_ctrl_ops, 0);
++ 	if (ret)
++ 		goto out_cleanup_admin_q;
++ 
++ 	/* at this point, teardown path changes to ref counting on nvme ctrl */
++ 
++ 	spin_lock_irqsave(&rport->lock, flags);
++ 	list_add_tail(&ctrl->ctrl_list, &rport->ctrl_list);
++ 	spin_unlock_irqrestore(&rport->lock, flags);
++ 
++ 	ret = nvme_fc_create_association(ctrl);
++ 	if (ret) {
++ 		ctrl->ctrl.opts = NULL;
++ 		/* initiate nvme ctrl ref counting teardown */
++ 		nvme_uninit_ctrl(&ctrl->ctrl);
++ 		nvme_put_ctrl(&ctrl->ctrl);
++ 
++ 		/* as we're past the point where we transition to the ref
++ 		 * counting teardown path, if we return a bad pointer here,
++ 		 * the calling routine, thinking it's prior to the
++ 		 * transition, will do an rport put. Since the teardown
++ 		 * path also does a rport put, we do an extra get here to
++ 		 * so proper order/teardown happens.
++ 		 */
++ 		nvme_fc_rport_get(rport);
++ 
++ 		if (ret > 0)
++ 			ret = -EIO;
++ 		return ERR_PTR(ret);
+++>>>>>>> 24b7f0592f73 (nvme-fc: fix missing put reference on controller create failure)
+  	}
+  
+ -	kref_get(&ctrl->ctrl.kref);
+ +	ret = nvme_fc_init_aen_ops(ctrl);
+ +	if (ret)
+ +		goto out_exit_aen_ops;
+ +
+ +	if (ctrl->queue_count > 1) {
+ +		ret = nvme_fc_create_io_queues(ctrl);
+ +		if (ret)
+ +			goto out_exit_aen_ops;
+ +	}
+ +
+ +	spin_lock_irqsave(&ctrl->lock, flags);
+ +	ctrl->state = FCCTRL_ACTIVE;
+ +	spin_unlock_irqrestore(&ctrl->lock, flags);
+ +
+ +	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
+ +	WARN_ON_ONCE(!changed);
+  
+  	dev_info(ctrl->ctrl.device,
+  		"NVME-FC{%d}: new ctrl: NQN \"%s\"\n",
+* Unmerged path drivers/nvme/host/fc.c
