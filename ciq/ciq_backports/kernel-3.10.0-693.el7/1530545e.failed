@@ -1,0 +1,187 @@
+GRO: Add support for TCP with fixed IPv4 ID field, limit tunnel IP ID values
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 1530545ed64b42e87acb43c0c16401bd1ebae6bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1530545e.failed
+
+This patch does two things.
+
+First it allows TCP to aggregate TCP frames with a fixed IPv4 ID field.  As
+a result we should now be able to aggregate flows that were converted from
+IPv6 to IPv4.  In addition this allows us more flexibility for future
+implementations of segmentation as we may be able to use a fixed IP ID when
+segmenting the flow.
+
+The second thing this does is that it places limitations on the outer IPv4
+ID header in the case of tunneled frames.  Specifically it forces the IP ID
+to be incrementing by 1 unless the DF bit is set in the outer IPv4 header.
+This way we can avoid creating overlapping series of IP IDs that could
+possibly be fragmented if the frame goes through GRO and is then
+resegmented via GSO.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1530545ed64b42e87acb43c0c16401bd1ebae6bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/ipv4/tcp_offload.c
+diff --cc include/linux/netdevice.h
+index 0c457a76a538,2d70c521d516..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2079,13 -2115,16 +2079,20 @@@ struct napi_gro_cb 
+  #define NAPI_GRO_FREE		  1
+  #define NAPI_GRO_FREE_STOLEN_HEAD 2
+  
+ -	/* Used in foo-over-udp, set in udp[46]_gro_receive */
+ -	u8	is_ipv6:1;
+ +	/* This is non-zero if the packet may be of the same flow. */
+ +	u8	same_flow:1;
+  
+ -	/* Used in GRE, set in fou/gue_gro_receive */
+ -	u8	is_fou:1;
+ +	/* Number of gro_receive callbacks this packet already went through */
+ +	u8 recursion_counter:4;
+  
+++<<<<<<< HEAD
+ +	/* 3 bit hole */
+++=======
++ 	/* Used to determine if flush_id can be ignored */
++ 	u8	is_atomic:1;
++ 
++ 	/* 5 bit hole */
+++>>>>>>> 1530545ed64b (GRO: Add support for TCP with fixed IPv4 ID field, limit tunnel IP ID values)
+  
+  	/* used to support CHECKSUM_COMPLETE for tunneling protocols */
+  	__wsum	csum;
+diff --cc net/core/dev.c
+index e2ceb23207bd,b78b586b1856..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4112,7 -4461,8 +4112,12 @@@ static enum gro_result dev_gro_receive(
+  		NAPI_GRO_CB(skb)->flush = 0;
+  		NAPI_GRO_CB(skb)->free = 0;
+  		NAPI_GRO_CB(skb)->encap_mark = 0;
+++<<<<<<< HEAD
+ +		NAPI_GRO_CB(skb)->recursion_counter = 0;
+++=======
++ 		NAPI_GRO_CB(skb)->is_fou = 0;
++ 		NAPI_GRO_CB(skb)->is_atomic = 1;
+++>>>>>>> 1530545ed64b (GRO: Add support for TCP with fixed IPv4 ID field, limit tunnel IP ID values)
+  		NAPI_GRO_CB(skb)->gro_remcsum_start = 0;
+  
+  		/* Setup for GRO checksum validation */
+diff --cc net/ipv4/tcp_offload.c
+index 64b23b193f30,d1ffd55289bd..000000000000
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@@ -211,7 -248,18 +211,22 @@@ found
+  		flush |= *(u32 *)((u8 *)th + i) ^
+  			 *(u32 *)((u8 *)th2 + i);
+  
+++<<<<<<< HEAD
+ +	mss = tcp_skb_mss(p);
+++=======
++ 	/* When we receive our second frame we can made a decision on if we
++ 	 * continue this flow as an atomic flow with a fixed ID or if we use
++ 	 * an incrementing ID.
++ 	 */
++ 	if (NAPI_GRO_CB(p)->flush_id != 1 ||
++ 	    NAPI_GRO_CB(p)->count != 1 ||
++ 	    !NAPI_GRO_CB(p)->is_atomic)
++ 		flush |= NAPI_GRO_CB(p)->flush_id;
++ 	else
++ 		NAPI_GRO_CB(p)->is_atomic = false;
++ 
++ 	mss = skb_shinfo(p)->gso_size;
+++>>>>>>> 1530545ed64b (GRO: Add support for TCP with fixed IPv4 ID field, limit tunnel IP ID values)
+  
+  	flush |= (len - 1) >= mss;
+  	flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 3068a0e54f0b..a5c45b0539d1 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1320,6 +1320,7 @@ static struct sk_buff **inet_gro_receive(struct sk_buff **head,
+ 
+ 	for (p = *head; p; p = p->next) {
+ 		struct iphdr *iph2;
++		u16 flush_id;
+ 
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+ 			continue;
+@@ -1343,16 +1344,36 @@ static struct sk_buff **inet_gro_receive(struct sk_buff **head,
+ 			(iph->tos ^ iph2->tos) |
+ 			(__force int)((iph->frag_off ^ iph2->frag_off) & htons(IP_DF));
+ 
+-		/* Save the IP ID check to be included later when we get to
+-		 * the transport layer so only the inner most IP ID is checked.
+-		 * This is because some GSO/TSO implementations do not
+-		 * correctly increment the IP ID for the outer hdrs.
+-		 */
+-		NAPI_GRO_CB(p)->flush_id =
+-			    ((u16)(ntohs(iph2->id) + NAPI_GRO_CB(p)->count) ^ id);
+ 		NAPI_GRO_CB(p)->flush |= flush;
++
++		/* We need to store of the IP ID check to be included later
++		 * when we can verify that this packet does in fact belong
++		 * to a given flow.
++		 */
++		flush_id = (u16)(id - ntohs(iph2->id));
++
++		/* This bit of code makes it much easier for us to identify
++		 * the cases where we are doing atomic vs non-atomic IP ID
++		 * checks.  Specifically an atomic check can return IP ID
++		 * values 0 - 0xFFFF, while a non-atomic check can only
++		 * return 0 or 0xFFFF.
++		 */
++		if (!NAPI_GRO_CB(p)->is_atomic ||
++		    !(iph->frag_off & htons(IP_DF))) {
++			flush_id ^= NAPI_GRO_CB(p)->count;
++			flush_id = flush_id ? 0xFFFF : 0;
++		}
++
++		/* If the previous IP ID value was based on an atomic
++		 * datagram we can overwrite the value and ignore it.
++		 */
++		if (NAPI_GRO_CB(skb)->is_atomic)
++			NAPI_GRO_CB(p)->flush_id = flush_id;
++		else
++			NAPI_GRO_CB(p)->flush_id |= flush_id;
+ 	}
+ 
++	NAPI_GRO_CB(skb)->is_atomic = !!(iph->frag_off & htons(IP_DF));
+ 	NAPI_GRO_CB(skb)->flush |= flush;
+ 	skb_set_network_header(skb, off);
+ 	/* The above will be needed by the transport layer if there is one
+* Unmerged path net/ipv4/tcp_offload.c
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index 3facfa14ba14..4cd1e85e3e3d 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -222,10 +222,14 @@ static struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
+ 		NAPI_GRO_CB(p)->flush |= !!(first_word & htonl(0x0FF00000));
+ 		NAPI_GRO_CB(p)->flush |= flush;
+ 
+-		/* Clear flush_id, there's really no concept of ID in IPv6. */
+-		NAPI_GRO_CB(p)->flush_id = 0;
++		/* If the previous IP ID value was based on an atomic
++		 * datagram we can overwrite the value and ignore it.
++		 */
++		if (NAPI_GRO_CB(skb)->is_atomic)
++			NAPI_GRO_CB(p)->flush_id = 0;
+ 	}
+ 
++	NAPI_GRO_CB(skb)->is_atomic = true;
+ 	NAPI_GRO_CB(skb)->flush |= flush;
+ 
+ 	skb_gro_postpull_rcsum(skb, iph, nlen);
