@@ -1,0 +1,550 @@
+efi: Replace runtime services spinlock with semaphore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Ard Biesheuvel <ard.biesheuvel@linaro.org>
+commit dce48e351c0d42014e5fb16ac3eb099e11b7e716
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dce48e35.failed
+
+The purpose of the efi_runtime_lock is to prevent concurrent calls into
+the firmware. There is no need to use spinlocks here, as long as we ensure
+that runtime service invocations from an atomic context (i.e., EFI pstore)
+cannot block.
+
+So use a semaphore instead, and use down_trylock() in the nonblocking case.
+We don't use a mutex here because the mutex_trylock() function must not
+be called from interrupt context, whereas the down_trylock() can.
+
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Leif Lindholm <leif.lindholm@linaro.org>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Sylvain Chouleur <sylvain.chouleur@gmail.com>
+	Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+(cherry picked from commit dce48e351c0d42014e5fb16ac3eb099e11b7e716)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/efi.c
+#	drivers/firmware/efi/runtime-wrappers.c
+diff --cc drivers/firmware/efi/efi.c
+index a7e5bf388aed,97d98e82f0f4..000000000000
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@@ -412,16 -670,152 +412,157 @@@ int __init efi_config_init(efi_config_t
+  	return 0;
+  }
+  
+ -int __init efi_get_fdt_params(struct efi_fdt_params *params)
+ +bool efi_is_table_address(unsigned long phys_addr)
+  {
+ -	struct param_info info;
+ -	int ret;
+ +	unsigned int i;
+  
+ -	pr_info("Getting EFI parameters from FDT:\n");
+ +	if (phys_addr == EFI_INVALID_TABLE_ADDR)
+ +		return false;
+  
+ -	info.found = 0;
+ -	info.params = params;
+ +	for (i = 0; i < ARRAY_SIZE(efi_tables); i++)
+ +		if (*(efi_tables[i]) == phys_addr)
+ +			return true;
+  
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	ret = of_scan_flat_dt(fdt_find_uefi_params, &info);
++ 	if (!info.found)
++ 		pr_info("UEFI not found.\n");
++ 	else if (!ret)
++ 		pr_err("Can't find '%s' in device tree!\n",
++ 		       info.missing);
++ 
++ 	return ret;
++ }
++ #endif /* CONFIG_EFI_PARAMS_FROM_FDT */
++ 
++ static __initdata char memory_type_name[][20] = {
++ 	"Reserved",
++ 	"Loader Code",
++ 	"Loader Data",
++ 	"Boot Code",
++ 	"Boot Data",
++ 	"Runtime Code",
++ 	"Runtime Data",
++ 	"Conventional Memory",
++ 	"Unusable Memory",
++ 	"ACPI Reclaim Memory",
++ 	"ACPI Memory NVS",
++ 	"Memory Mapped I/O",
++ 	"MMIO Port Space",
++ 	"PAL Code",
++ 	"Persistent Memory",
++ };
++ 
++ char * __init efi_md_typeattr_format(char *buf, size_t size,
++ 				     const efi_memory_desc_t *md)
++ {
++ 	char *pos;
++ 	int type_len;
++ 	u64 attr;
++ 
++ 	pos = buf;
++ 	if (md->type >= ARRAY_SIZE(memory_type_name))
++ 		type_len = snprintf(pos, size, "[type=%u", md->type);
++ 	else
++ 		type_len = snprintf(pos, size, "[%-*s",
++ 				    (int)(sizeof(memory_type_name[0]) - 1),
++ 				    memory_type_name[md->type]);
++ 	if (type_len >= size)
++ 		return buf;
++ 
++ 	pos += type_len;
++ 	size -= type_len;
++ 
++ 	attr = md->attribute;
++ 	if (attr & ~(EFI_MEMORY_UC | EFI_MEMORY_WC | EFI_MEMORY_WT |
++ 		     EFI_MEMORY_WB | EFI_MEMORY_UCE | EFI_MEMORY_RO |
++ 		     EFI_MEMORY_WP | EFI_MEMORY_RP | EFI_MEMORY_XP |
++ 		     EFI_MEMORY_NV |
++ 		     EFI_MEMORY_RUNTIME | EFI_MEMORY_MORE_RELIABLE))
++ 		snprintf(pos, size, "|attr=0x%016llx]",
++ 			 (unsigned long long)attr);
++ 	else
++ 		snprintf(pos, size,
++ 			 "|%3s|%2s|%2s|%2s|%2s|%2s|%2s|%3s|%2s|%2s|%2s|%2s]",
++ 			 attr & EFI_MEMORY_RUNTIME ? "RUN" : "",
++ 			 attr & EFI_MEMORY_MORE_RELIABLE ? "MR" : "",
++ 			 attr & EFI_MEMORY_NV      ? "NV"  : "",
++ 			 attr & EFI_MEMORY_XP      ? "XP"  : "",
++ 			 attr & EFI_MEMORY_RP      ? "RP"  : "",
++ 			 attr & EFI_MEMORY_WP      ? "WP"  : "",
++ 			 attr & EFI_MEMORY_RO      ? "RO"  : "",
++ 			 attr & EFI_MEMORY_UCE     ? "UCE" : "",
++ 			 attr & EFI_MEMORY_WB      ? "WB"  : "",
++ 			 attr & EFI_MEMORY_WT      ? "WT"  : "",
++ 			 attr & EFI_MEMORY_WC      ? "WC"  : "",
++ 			 attr & EFI_MEMORY_UC      ? "UC"  : "");
++ 	return buf;
++ }
++ 
++ /*
++  * efi_mem_attributes - lookup memmap attributes for physical address
++  * @phys_addr: the physical address to lookup
++  *
++  * Search in the EFI memory map for the region covering
++  * @phys_addr. Returns the EFI memory attributes if the region
++  * was found in the memory map, 0 otherwise.
++  *
++  * Despite being marked __weak, most architectures should *not*
++  * override this function. It is __weak solely for the benefit
++  * of ia64 which has a funky EFI memory map that doesn't work
++  * the same way as other architectures.
++  */
++ u64 __weak efi_mem_attributes(unsigned long phys_addr)
++ {
++ 	efi_memory_desc_t *md;
++ 
++ 	if (!efi_enabled(EFI_MEMMAP))
++ 		return 0;
++ 
++ 	for_each_efi_memory_desc(md) {
++ 		if ((md->phys_addr <= phys_addr) &&
++ 		    (phys_addr < (md->phys_addr +
++ 		    (md->num_pages << EFI_PAGE_SHIFT))))
++ 			return md->attribute;
++ 	}
++ 	return 0;
++ }
++ 
++ int efi_status_to_err(efi_status_t status)
++ {
++ 	int err;
++ 
++ 	switch (status) {
++ 	case EFI_SUCCESS:
++ 		err = 0;
++ 		break;
++ 	case EFI_INVALID_PARAMETER:
++ 		err = -EINVAL;
++ 		break;
++ 	case EFI_OUT_OF_RESOURCES:
++ 		err = -ENOSPC;
++ 		break;
++ 	case EFI_DEVICE_ERROR:
++ 		err = -EIO;
++ 		break;
++ 	case EFI_WRITE_PROTECTED:
++ 		err = -EROFS;
++ 		break;
++ 	case EFI_SECURITY_VIOLATION:
++ 		err = -EACCES;
++ 		break;
++ 	case EFI_NOT_FOUND:
++ 		err = -ENOENT;
++ 		break;
++ 	case EFI_ABORTED:
++ 		err = -EINTR;
++ 		break;
++ 	default:
++ 		err = -EINVAL;
++ 	}
++ 
++ 	return err;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+diff --cc drivers/firmware/efi/runtime-wrappers.c
+index dcc976822484,ae54870b2788..000000000000
+--- a/drivers/firmware/efi/runtime-wrappers.c
++++ b/drivers/firmware/efi/runtime-wrappers.c
+@@@ -14,8 -14,14 +14,19 @@@
+   * This file is released under the GPLv2.
+   */
+  
+++<<<<<<< HEAD
+ +#include <linux/efi.h>
+ +#include <linux/spinlock.h>             /* spinlock_t */
+++=======
++ #define pr_fmt(fmt)	"efi: " fmt
++ 
++ #include <linux/bug.h>
++ #include <linux/efi.h>
++ #include <linux/irqflags.h>
++ #include <linux/mutex.h>
++ #include <linux/semaphore.h>
++ #include <linux/stringify.h>
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  #include <asm/efi.h>
+  
+  /*
+@@@ -43,32 -49,66 +54,89 @@@ void efi_call_virt_check_flags(unsigne
+  	local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+ +/* As per commit ef68c8f87ed1 ("x86: Serialize EFI time accesses on rtc_lock"),
+ + * the EFI specification requires that callers of the time related runtime
+ + * functions serialize with other CMOS accesses in the kernel, as the EFI time
+ + * functions may choose to also use the legacy CMOS RTC.
+ + */
+ +__weak DEFINE_SPINLOCK(rtc_lock);
+++=======
++ /*
++  * According to section 7.1 of the UEFI spec, Runtime Services are not fully
++  * reentrant, and there are particular combinations of calls that need to be
++  * serialized. (source: UEFI Specification v2.4A)
++  *
++  * Table 31. Rules for Reentry Into Runtime Services
++  * +------------------------------------+-------------------------------+
++  * | If previous call is busy in	| Forbidden to call		|
++  * +------------------------------------+-------------------------------+
++  * | Any				| SetVirtualAddressMap()	|
++  * +------------------------------------+-------------------------------+
++  * | ConvertPointer()			| ConvertPointer()		|
++  * +------------------------------------+-------------------------------+
++  * | SetVariable()			| ResetSystem()			|
++  * | UpdateCapsule()			|				|
++  * | SetTime()				|				|
++  * | SetWakeupTime()			|				|
++  * | GetNextHighMonotonicCount()	|				|
++  * +------------------------------------+-------------------------------+
++  * | GetVariable()			| GetVariable()			|
++  * | GetNextVariableName()		| GetNextVariableName()		|
++  * | SetVariable()			| SetVariable()			|
++  * | QueryVariableInfo()		| QueryVariableInfo()		|
++  * | UpdateCapsule()			| UpdateCapsule()		|
++  * | QueryCapsuleCapabilities()		| QueryCapsuleCapabilities()	|
++  * | GetNextHighMonotonicCount()	| GetNextHighMonotonicCount()	|
++  * +------------------------------------+-------------------------------+
++  * | GetTime()				| GetTime()			|
++  * | SetTime()				| SetTime()			|
++  * | GetWakeupTime()			| GetWakeupTime()		|
++  * | SetWakeupTime()			| SetWakeupTime()		|
++  * +------------------------------------+-------------------------------+
++  *
++  * Due to the fact that the EFI pstore may write to the variable store in
++  * interrupt context, we need to use a lock for at least the groups that
++  * contain SetVariable() and QueryVariableInfo(). That leaves little else, as
++  * none of the remaining functions are actually ever called at runtime.
++  * So let's just use a single lock to serialize all Runtime Services calls.
++  */
++ static DEFINE_SEMAPHORE(efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  
+  static efi_status_t virt_efi_get_time(efi_time_t *tm, efi_time_cap_t *tc)
+  {
+ +	unsigned long flags;
+  	efi_status_t status;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&rtc_lock, flags);
+ +	status = efi_call_virt(get_time, tm, tc);
+ +	spin_unlock_irqrestore(&rtc_lock, flags);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(get_time, tm, tc);
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  	return status;
+  }
+  
+  static efi_status_t virt_efi_set_time(efi_time_t *tm)
+  {
+ +	unsigned long flags;
+  	efi_status_t status;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&rtc_lock, flags);
+ +	status = efi_call_virt(set_time, tm);
+ +	spin_unlock_irqrestore(&rtc_lock, flags);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(set_time, tm);
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  	return status;
+  }
+  
+@@@ -76,23 -116,23 +144,37 @@@ static efi_status_t virt_efi_get_wakeup
+  					     efi_bool_t *pending,
+  					     efi_time_t *tm)
+  {
+ +	unsigned long flags;
+  	efi_status_t status;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&rtc_lock, flags);
+ +	status = efi_call_virt(get_wakeup_time, enabled, pending, tm);
+ +	spin_unlock_irqrestore(&rtc_lock, flags);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(get_wakeup_time, enabled, pending, tm);
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  	return status;
+  }
+  
+  static efi_status_t virt_efi_set_wakeup_time(efi_bool_t enabled, efi_time_t *tm)
+  {
+ +	unsigned long flags;
+  	efi_status_t status;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&rtc_lock, flags);
+ +	status = efi_call_virt(set_wakeup_time, enabled, tm);
+ +	spin_unlock_irqrestore(&rtc_lock, flags);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(set_wakeup_time, enabled, tm);
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  	return status;
+  }
+  
+@@@ -102,14 -142,27 +184,35 @@@ static efi_status_t virt_efi_get_variab
+  					  unsigned long *data_size,
+  					  void *data)
+  {
+++<<<<<<< HEAD
+ +	return efi_call_virt(get_variable, name, vendor, attr, data_size, data);
+++=======
++ 	efi_status_t status;
++ 
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(get_variable, name, vendor, attr, data_size,
++ 			       data);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static efi_status_t virt_efi_get_next_variable(unsigned long *name_size,
+  					       efi_char16_t *name,
+  					       efi_guid_t *vendor)
+  {
+++<<<<<<< HEAD
+ +	return efi_call_virt(get_next_variable, name_size, name, vendor);
+++=======
++ 	efi_status_t status;
++ 
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(get_next_variable, name_size, name, vendor);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static efi_status_t virt_efi_set_variable(efi_char16_t *name,
+@@@ -118,7 -171,14 +221,18 @@@
+  					  unsigned long data_size,
+  					  void *data)
+  {
+++<<<<<<< HEAD
+ +	return efi_call_virt(set_variable, name, vendor, attr, data_size, data);
+++=======
++ 	efi_status_t status;
++ 
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(set_variable, name, vendor, attr, data_size,
++ 			       data);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static efi_status_t
+@@@ -126,15 -186,14 +240,23 @@@ virt_efi_set_variable_nonblocking(efi_c
+  				  u32 attr, unsigned long data_size,
+  				  void *data)
+  {
+ +	unsigned long flags;
+  	efi_status_t status;
+  
+++<<<<<<< HEAD
+ +	if (!spin_trylock_irqsave(&efi_runtime_lock, flags))
+++=======
++ 	if (down_trylock(&efi_runtime_lock))
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  		return EFI_NOT_READY;
+  
+  	status = efi_call_virt(set_variable, name, vendor, attr, data_size,
+  			       data);
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+++=======
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  	return status;
+  }
+  
+@@@ -147,8 -206,14 +269,17 @@@ static efi_status_t virt_efi_query_vari
+  	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
+  		return EFI_UNSUPPORTED;
+  
+++<<<<<<< HEAD
+ +	return efi_call_virt(query_variable_info, attr, storage_space,
+ +			     remaining_space, max_variable_size);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(query_variable_info, attr, storage_space,
++ 			       remaining_space, max_variable_size);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static efi_status_t
+@@@ -163,18 -227,24 +294,36 @@@ virt_efi_query_variable_info_nonblockin
+  	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
+  		return EFI_UNSUPPORTED;
+  
+++<<<<<<< HEAD
+ +	if (!spin_trylock_irqsave(&efi_runtime_lock, flags))
+++=======
++ 	if (down_trylock(&efi_runtime_lock))
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  		return EFI_NOT_READY;
+  
+  	status = efi_call_virt(query_variable_info, attr, storage_space,
+  			       remaining_space, max_variable_size);
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+++=======
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  	return status;
+  }
+  
+  static efi_status_t virt_efi_get_next_high_mono_count(u32 *count)
+  {
+++<<<<<<< HEAD
+ +	return efi_call_virt(get_next_high_mono_count, count);
+++=======
++ 	efi_status_t status;
++ 
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(get_next_high_mono_count, count);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static void virt_efi_reset_system(int reset_type,
+@@@ -182,7 -252,13 +331,17 @@@
+  				  unsigned long data_size,
+  				  efi_char16_t *data)
+  {
+++<<<<<<< HEAD
+ +	__efi_call_virt(reset_system, reset_type, status, data_size, data);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock)) {
++ 		pr_warn("failed to invoke the reset_system() runtime service:\n"
++ 			"could not get exclusive access to the firmware\n");
++ 		return;
++ 	}
++ 	__efi_call_virt(reset_system, reset_type, status, data_size, data);
++ 	up(&efi_runtime_lock);
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static efi_status_t virt_efi_update_capsule(efi_capsule_header_t **capsules,
+@@@ -192,7 -268,13 +351,15 @@@
+  	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
+  		return EFI_UNSUPPORTED;
+  
+++<<<<<<< HEAD
+ +	return efi_call_virt(update_capsule, capsules, count, sg_list);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(update_capsule, capsules, count, sg_list);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  static efi_status_t virt_efi_query_capsule_caps(efi_capsule_header_t **capsules,
+@@@ -203,8 -285,14 +370,17 @@@
+  	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
+  		return EFI_UNSUPPORTED;
+  
+++<<<<<<< HEAD
+ +	return efi_call_virt(query_capsule_caps, capsules, count, max_size,
+ +			     reset_type);
+++=======
++ 	if (down_interruptible(&efi_runtime_lock))
++ 		return EFI_ABORTED;
++ 	status = efi_call_virt(query_capsule_caps, capsules, count, max_size,
++ 			       reset_type);
++ 	up(&efi_runtime_lock);
++ 	return status;
+++>>>>>>> dce48e351c0d (efi: Replace runtime services spinlock with semaphore)
+  }
+  
+  void efi_native_runtime_setup(void)
+* Unmerged path drivers/firmware/efi/efi.c
+* Unmerged path drivers/firmware/efi/runtime-wrappers.c
+diff --git a/include/linux/efi.h b/include/linux/efi.h
+index ce99ad24fa74..0a6bdca01ab3 100644
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@ -35,6 +35,7 @@
+ #define EFI_WRITE_PROTECTED	( 8 | (1UL << (BITS_PER_LONG-1)))
+ #define EFI_OUT_OF_RESOURCES	( 9 | (1UL << (BITS_PER_LONG-1)))
+ #define EFI_NOT_FOUND		(14 | (1UL << (BITS_PER_LONG-1)))
++#define EFI_ABORTED		(21 | (1UL << (BITS_PER_LONG-1)))
+ #define EFI_SECURITY_VIOLATION	(26 | (1UL << (BITS_PER_LONG-1)))
+ 
+ typedef unsigned long efi_status_t;
