@@ -1,0 +1,167 @@
+tcm_qla2xxx: Perform configfs depend/undepend for base_tpg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 7474f52a82d51da2e6110e91bba8b000cb9cf803
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7474f52a.failed
+
+This patch performs configfs_depend_item() during TPG enable for
+base_tpg (eg: non-NPIV) ports, and configfs_undepend_item() during
+TPG disable for base_tpg.
+
+This is done to ensure that any attempt to configfs rmdir a base_tpg
+with active NPIV ports will fail with -EBUSY, until all associated
+NPIV ports have been explicitly shutdown and base_tpg disabled.
+
+Note that the actual configfs_[un]depend_item() is done from seperate
+process context, as these are not intended to be called directly
+from configfs callbacks.
+
+	Cc: Sawan Chandak <sawan.chandak@qlogic.com>
+	Cc: Quinn Tran <quinn.tran@qlogic.com>
+	Cc: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Cc: Giridhar Malavali <giridhar.malavali@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7474f52a82d51da2e6110e91bba8b000cb9cf803)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index e9c7bfd1510c,5bdc44035981..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -987,11 -976,6 +1017,14 @@@ static ssize_t tcm_qla2xxx_tpg_store_en
+  	const char *page,
+  	size_t count)
+  {
+++<<<<<<< HEAD
+ +	struct se_wwn *se_wwn = se_tpg->se_tpg_wwn;
+ +	struct tcm_qla2xxx_lport *lport = container_of(se_wwn,
+ +			struct tcm_qla2xxx_lport, lport_wwn);
+ +	struct scsi_qla_host *vha = lport->qla_vha;
+ +	struct qla_hw_data *ha = vha->hw;
+++=======
+++>>>>>>> 7474f52a82d5 (tcm_qla2xxx: Perform configfs depend/undepend for base_tpg)
+  	struct tcm_qla2xxx_tpg *tpg = container_of(se_tpg,
+  			struct tcm_qla2xxx_tpg, se_tpg);
+  	unsigned long op;
+@@@ -1006,19 -990,28 +1039,40 @@@
+  		pr_err("Illegal value for tpg_enable: %lu\n", op);
+  		return -EINVAL;
+  	}
++ 	if (op) {
++ 		if (atomic_read(&tpg->lport_tpg_enabled))
++ 			return -EEXIST;
++ 
++ 		INIT_WORK(&tpg->tpg_base_work, tcm_qla2xxx_depend_tpg);
++ 	} else {
++ 		if (!atomic_read(&tpg->lport_tpg_enabled))
++ 			return count;
++ 
++ 		INIT_WORK(&tpg->tpg_base_work, tcm_qla2xxx_undepend_tpg);
++ 	}
++ 	init_completion(&tpg->tpg_base_comp);
++ 	schedule_work(&tpg->tpg_base_work);
++ 	wait_for_completion(&tpg->tpg_base_comp);
+  
+  	if (op) {
+++<<<<<<< HEAD
+ +		atomic_set(&tpg->lport_tpg_enabled, 1);
+ +		qlt_enable_vha(vha);
+ +	} else {
+ +		if (!ha->tgt.qla_tgt) {
+ +			pr_err("truct qla_hw_data *ha->tgt.qla_tgt is NULL\n");
+ +			return -ENODEV;
+ +		}
+ +		atomic_set(&tpg->lport_tpg_enabled, 0);
+ +		qlt_stop_phase1(ha->tgt.qla_tgt);
+++=======
++ 		if (!atomic_read(&tpg->lport_tpg_enabled))
++ 			return -ENODEV;
++ 	} else {
++ 		if (atomic_read(&tpg->lport_tpg_enabled))
++ 			return -EPERM;
+++>>>>>>> 7474f52a82d5 (tcm_qla2xxx: Perform configfs depend/undepend for base_tpg)
+  	}
+- 
+  	return count;
+  }
+  
+@@@ -1676,6 -1729,55 +1730,58 @@@ static void tcm_qla2xxx_drop_lport(stru
+  	kfree(lport);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcm_qla2xxx_lport_register_npiv_cb(struct scsi_qla_host *base_vha,
++ 					      void *target_lport_ptr,
++ 					      u64 npiv_wwpn, u64 npiv_wwnn)
++ {
++ 	struct fc_vport *vport;
++ 	struct Scsi_Host *sh = base_vha->host;
++ 	struct scsi_qla_host *npiv_vha;
++ 	struct tcm_qla2xxx_lport *lport =
++ 			(struct tcm_qla2xxx_lport *)target_lport_ptr;
++ 	struct tcm_qla2xxx_lport *base_lport =
++ 			(struct tcm_qla2xxx_lport *)base_vha->vha_tgt.target_lport_ptr;
++ 	struct tcm_qla2xxx_tpg *base_tpg;
++ 	struct fc_vport_identifiers vport_id;
++ 
++ 	if (!qla_tgt_mode_enabled(base_vha)) {
++ 		pr_err("qla2xxx base_vha not enabled for target mode\n");
++ 		return -EPERM;
++ 	}
++ 
++ 	if (!base_lport || !base_lport->tpg_1 ||
++ 	    !atomic_read(&base_lport->tpg_1->lport_tpg_enabled)) {
++ 		pr_err("qla2xxx base_lport or tpg_1 not available\n");
++ 		return -EPERM;
++ 	}
++ 	base_tpg = base_lport->tpg_1;
++ 
++ 	memset(&vport_id, 0, sizeof(vport_id));
++ 	vport_id.port_name = npiv_wwpn;
++ 	vport_id.node_name = npiv_wwnn;
++ 	vport_id.roles = FC_PORT_ROLE_FCP_INITIATOR;
++ 	vport_id.vport_type = FC_PORTTYPE_NPIV;
++ 	vport_id.disable = false;
++ 
++ 	vport = fc_vport_create(sh, 0, &vport_id);
++ 	if (!vport) {
++ 		pr_err("fc_vport_create failed for qla2xxx_npiv\n");
++ 		return -ENODEV;
++ 	}
++ 	/*
++ 	 * Setup local pointer to NPIV vhba + target_lport_ptr
++ 	 */
++ 	npiv_vha = (struct scsi_qla_host *)vport->dd_data;
++ 	npiv_vha->vha_tgt.target_lport_ptr = target_lport_ptr;
++ 	lport->qla_vha = npiv_vha;
++ 	scsi_host_get(npiv_vha->host);
++ 	return 0;
++ }
++ 
++ 
+++>>>>>>> 7474f52a82d5 (tcm_qla2xxx: Perform configfs depend/undepend for base_tpg)
+  static struct se_wwn *tcm_qla2xxx_npiv_make_lport(
+  	struct target_fabric_configfs *tf,
+  	struct config_group *group,
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.h b/drivers/scsi/qla2xxx/tcm_qla2xxx.h
+index 771f7b816443..2d1e06ed1ba9 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.h
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.h
+@@ -43,6 +43,9 @@ struct tcm_qla2xxx_tpg {
+ 	struct tcm_qla2xxx_tpg_attrib tpg_attrib;
+ 	/* Returned by tcm_qla2xxx_make_tpg() */
+ 	struct se_portal_group se_tpg;
++	/* Items for dealing with configfs_depend_item */
++	struct completion tpg_base_comp;
++	struct work_struct tpg_base_work;
+ };
+ 
+ struct tcm_qla2xxx_fc_loopid {
