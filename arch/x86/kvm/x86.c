@@ -1960,7 +1960,7 @@ static void kvm_setup_pvclock_page(struct kvm_vcpu *v)
 
 static int kvm_guest_time_update(struct kvm_vcpu *v)
 {
-	unsigned long flags, this_tsc_khz, tgt_tsc_khz;
+	unsigned long flags, tgt_tsc_khz;
 	struct kvm_vcpu_arch *vcpu = &v->arch;
 	struct kvm_arch *ka = &v->kvm->arch;
 	s64 kernel_ns;
@@ -1985,8 +1985,8 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 
 	/* Keep irq disabled to prevent changes to the clock */
 	local_irq_save(flags);
-	this_tsc_khz = __this_cpu_read(cpu_tsc_khz);
-	if (unlikely(this_tsc_khz == 0)) {
+	tgt_tsc_khz = __this_cpu_read(cpu_tsc_khz);
+	if (unlikely(tgt_tsc_khz == 0)) {
 		local_irq_restore(flags);
 		kvm_make_request(KVM_REQ_CLOCK_UPDATE, v);
 		return 1;
@@ -2020,13 +2020,14 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 
 	/* With all the info we got, fill in the values */
 
-	if (unlikely(vcpu->hw_tsc_khz != this_tsc_khz)) {
-		tgt_tsc_khz = kvm_has_tsc_control ?
-			vcpu->virtual_tsc_khz : this_tsc_khz;
+	if (kvm_has_tsc_control)
+		tgt_tsc_khz = kvm_scale_tsc(v, tgt_tsc_khz);
+
+	if (unlikely(vcpu->hw_tsc_khz != tgt_tsc_khz)) {
 		kvm_get_time_scale(NSEC_PER_SEC / 1000, tgt_tsc_khz,
 				   &vcpu->hv_clock.tsc_shift,
 				   &vcpu->hv_clock.tsc_to_system_mul);
-		vcpu->hw_tsc_khz = this_tsc_khz;
+		vcpu->hw_tsc_khz = tgt_tsc_khz;
 	}
 
 	vcpu->hv_clock.tsc_timestamp = tsc_timestamp;
