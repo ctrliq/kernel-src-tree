@@ -259,8 +259,6 @@ struct tcf_proto {
 
 	/* All the rest */
 	u32			prio;
-	u32			classid;
-	struct Qdisc		*q;
 	void			*data;
 	const struct tcf_proto_ops	*ops;
 	struct tcf_chain	*chain;
