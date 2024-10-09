@@ -1,0 +1,126 @@
+mmc: mmc: Add functions to enable / disable the Command Queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] Add functions to enable / disable the Command Queue (Gopal Tiwari) [1549495]
+Rebuild_FUZZ: 91.07%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit b658af718465cd1e8011c8da281befdfc2debefd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b658af71.failed
+
+Add helper functions to enable or disable the Command Queue.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit b658af718465cd1e8011c8da281befdfc2debefd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/mmc_ops.h
+diff --cc drivers/mmc/core/mmc_ops.h
+index abd525ed74be,978bd2e60f8a..000000000000
+--- a/drivers/mmc/core/mmc_ops.h
++++ b/drivers/mmc/core/mmc_ops.h
+@@@ -32,6 -39,15 +32,18 @@@ int __mmc_switch_status(struct mmc_car
+  int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
+  		unsigned int timeout_ms, unsigned char timing,
+  		bool use_busy_signal, bool send_status,	bool retry_crc_err);
+++<<<<<<< HEAD
+++=======
++ int mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
++ 		unsigned int timeout_ms);
++ int mmc_stop_bkops(struct mmc_card *card);
++ int mmc_read_bkops_status(struct mmc_card *card);
++ void mmc_start_bkops(struct mmc_card *card, bool from_exception);
++ int mmc_can_reset(struct mmc_card *card);
++ int mmc_flush_cache(struct mmc_card *card);
++ int mmc_cmdq_enable(struct mmc_card *card);
++ int mmc_cmdq_disable(struct mmc_card *card);
+++>>>>>>> b658af718465 (mmc: mmc: Add functions to enable / disable the Command Queue)
+  
+  #endif
+  
+diff --git a/Documentation/mmc/mmc-dev-attrs.txt b/Documentation/mmc/mmc-dev-attrs.txt
+index 404a0e9e92b0..dcd1252877fb 100644
+--- a/Documentation/mmc/mmc-dev-attrs.txt
++++ b/Documentation/mmc/mmc-dev-attrs.txt
+@@ -30,6 +30,7 @@ All attributes are read-only.
+ 	rel_sectors		Reliable write sector count
+ 	ocr 			Operation Conditions Register
+ 	dsr			Driver Stage Register
++	cmdq_en			Command Queue enabled: 1 => enabled, 0 => not enabled
+ 
+ Note on Erase Size and Preferred Erase Size:
+ 
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index 3e6348da2f1e..16ef68e56504 100644
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -776,6 +776,7 @@ MMC_DEV_ATTR(enhanced_area_size, "%u\n", card->ext_csd.enhanced_area_size);
+ MMC_DEV_ATTR(raw_rpmb_size_mult, "%#x\n", card->ext_csd.raw_rpmb_size_mult);
+ MMC_DEV_ATTR(rel_sectors, "%#x\n", card->ext_csd.rel_sectors);
+ MMC_DEV_ATTR(ocr, "%08x\n", card->ocr);
++MMC_DEV_ATTR(cmdq_en, "%d\n", card->ext_csd.cmdq_en);
+ 
+ static ssize_t mmc_fwrev_show(struct device *dev,
+ 			      struct device_attribute *attr,
+@@ -831,6 +832,7 @@ static struct attribute *mmc_std_attrs[] = {
+ 	&dev_attr_rel_sectors.attr,
+ 	&dev_attr_ocr.attr,
+ 	&dev_attr_dsr.attr,
++	&dev_attr_cmdq_en.attr,
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(mmc_std);
+diff --git a/drivers/mmc/core/mmc_ops.c b/drivers/mmc/core/mmc_ops.c
+index fe80f26d6971..24c58d24c19a 100644
+--- a/drivers/mmc/core/mmc_ops.c
++++ b/drivers/mmc/core/mmc_ops.c
+@@ -838,3 +838,31 @@ int mmc_can_ext_csd(struct mmc_card *card)
+ {
+ 	return (card && card->csd.mmca_vsn > CSD_SPEC_VER_3);
+ }
++
++static int mmc_cmdq_switch(struct mmc_card *card, bool enable)
++{
++	u8 val = enable ? EXT_CSD_CMDQ_MODE_ENABLED : 0;
++	int err;
++
++	if (!card->ext_csd.cmdq_support)
++		return -EOPNOTSUPP;
++
++	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_CMDQ_MODE_EN,
++			 val, card->ext_csd.generic_cmd6_time);
++	if (!err)
++		card->ext_csd.cmdq_en = enable;
++
++	return err;
++}
++
++int mmc_cmdq_enable(struct mmc_card *card)
++{
++	return mmc_cmdq_switch(card, true);
++}
++EXPORT_SYMBOL_GPL(mmc_cmdq_enable);
++
++int mmc_cmdq_disable(struct mmc_card *card)
++{
++	return mmc_cmdq_switch(card, false);
++}
++EXPORT_SYMBOL_GPL(mmc_cmdq_disable);
+* Unmerged path drivers/mmc/core/mmc_ops.h
+diff --git a/include/linux/mmc/card.h b/include/linux/mmc/card.h
+index e3f1031064a7..f8dd809b3790 100644
+--- a/include/linux/mmc/card.h
++++ b/include/linux/mmc/card.h
+@@ -90,6 +90,7 @@ struct mmc_ext_csd {
+ 	unsigned int		boot_ro_lock;		/* ro lock support */
+ 	bool			boot_ro_lockable;
+ 	bool			ffu_capable;	/* Firmware upgrade support */
++	bool			cmdq_en;	/* Command Queue enabled */
+ 	bool			cmdq_support;	/* Command Queue supported */
+ 	unsigned int		cmdq_depth;	/* Command Queue depth */
+ #define MMC_FIRMWARE_LEN 8
