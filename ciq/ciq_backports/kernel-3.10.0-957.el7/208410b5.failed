@@ -1,0 +1,118 @@
+md/raid1/10: reset bio allocated from mempool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid1/10: reset bio allocated from mempool (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 96.55%
+commit-author Shaohua Li <shli@fb.com>
+commit 208410b546207cfc4c832635fa46419cfa86b4cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/208410b5.failed
+
+Data allocated from mempool doesn't always get initialized, this happens when
+the data is reused instead of fresh allocation. In the raid1/10 case, we must
+reinitialize the bios.
+
+	Reported-by: Jonathan G. Underwood <jonathan.underwood@gmail.com>
+Fixes: f0250618361d(md: raid10: don't use bio's vec table to manage resync pages)
+Fixes: 98d30c5812c3(md: raid1: don't use bio's vec table to manage resync pages)
+	Cc: stable@vger.kernel.org (4.12+)
+	Cc: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 208410b546207cfc4c832635fa46419cfa86b4cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+diff --cc drivers/md/raid1.c
+index e54d0416ed5a,79474f47eeef..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -2667,8 -2660,13 +2684,18 @@@ static sector_t raid1_sync_request(stru
+  	if (atomic_read(&conf->nr_waiting[idx]))
+  		schedule_timeout_uninterruptible(1);
+  
+++<<<<<<< HEAD
+ +	bitmap_cond_end_sync(mddev->bitmap, sector_nr);
+ +	r1_bio = mempool_alloc(conf->r1buf_pool, GFP_NOIO);
+++=======
++ 	/* we are incrementing sector_nr below. To be safe, we check against
++ 	 * sector_nr + two times RESYNC_SECTORS
++ 	 */
++ 
++ 	bitmap_cond_end_sync(mddev->bitmap, sector_nr,
++ 		mddev_is_clustered(mddev) && (sector_nr + 2 * RESYNC_SECTORS > conf->cluster_sync_high));
++ 	r1_bio = raid1_alloc_init_r1buf(conf);
+++>>>>>>> 208410b54620 (md/raid1/10: reset bio allocated from mempool)
+  
+  	raise_barrier(conf, sector_nr);
+  
+* Unmerged path drivers/md/raid1.c
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 17d84aee79e2..14bb55da13f8 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -2956,6 +2956,35 @@ static int init_resync(struct r10conf *conf)
+ 	return 0;
+ }
+ 
++static struct r10bio *raid10_alloc_init_r10buf(struct r10conf *conf)
++{
++	struct r10bio *r10bio = mempool_alloc(conf->r10buf_pool, GFP_NOIO);
++	struct rsync_pages *rp;
++	struct bio *bio;
++	int nalloc;
++	int i;
++
++	if (test_bit(MD_RECOVERY_SYNC, &conf->mddev->recovery) ||
++	    test_bit(MD_RECOVERY_RESHAPE, &conf->mddev->recovery))
++		nalloc = conf->copies; /* resync */
++	else
++		nalloc = 2; /* recovery */
++
++	for (i = 0; i < nalloc; i++) {
++		bio = r10bio->devs[i].bio;
++		rp = bio->bi_private;
++		bio_reset(bio);
++		bio->bi_private = rp;
++		bio = r10bio->devs[i].repl_bio;
++		if (bio) {
++			rp = bio->bi_private;
++			bio_reset(bio);
++			bio->bi_private = rp;
++		}
++	}
++	return r10bio;
++}
++
+ /*
+  * perform a "sync" on one "block"
+  *
+@@ -3184,7 +3213,7 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
+ 				atomic_inc(&mreplace->nr_pending);
+ 			rcu_read_unlock();
+ 
+-			r10_bio = mempool_alloc(conf->r10buf_pool, GFP_NOIO);
++			r10_bio = raid10_alloc_init_r10buf(conf);
+ 			r10_bio->state = 0;
+ 			raise_barrier(conf, rb2 != NULL);
+ 			atomic_set(&r10_bio->remaining, 0);
+@@ -3398,7 +3427,7 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
+ 		}
+ 		if (sync_blocks < max_sync)
+ 			max_sync = sync_blocks;
+-		r10_bio = mempool_alloc(conf->r10buf_pool, GFP_NOIO);
++		r10_bio = raid10_alloc_init_r10buf(conf);
+ 		r10_bio->state = 0;
+ 
+ 		r10_bio->mddev = mddev;
+@@ -4530,7 +4559,7 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
+ 
+ read_more:
+ 	/* Now schedule reads for blocks from sector_nr to last */
+-	r10_bio = mempool_alloc(conf->r10buf_pool, GFP_NOIO);
++	r10_bio = raid10_alloc_init_r10buf(conf);
+ 	r10_bio->state = 0;
+ 	raise_barrier(conf, sectors_done != 0);
+ 	atomic_set(&r10_bio->remaining, 0);
