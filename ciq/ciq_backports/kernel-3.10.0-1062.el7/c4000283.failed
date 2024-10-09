@@ -1,0 +1,110 @@
+net/mlx5e: RX, Use existing WQ local variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: RX, Use existing WQ local variable (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.35%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit c400028371e54d0b247c65809b97d7cf44c2999c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c4000283.failed
+
+Local variable 'wq' already points to &sq->wq, use it.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c400028371e54d0b247c65809b97d7cf44c2999c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 29331bf7aa1d,a2d91eaa99c4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -425,33 -443,62 +425,46 @@@ void mlx5e_free_rx_mpwqe(struct mlx5e_r
+  	}
+  }
+  
+ -static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+ +static void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq)
+  {
+ -	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ -	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ -	struct mlx5e_icosq *sq = &rq->channel->icosq;
+ -	struct mlx5_wq_cyc *wq = &sq->wq;
+ -	struct mlx5e_umr_wqe *umr_wqe;
+ -	u16 xlt_offset = ix << (MLX5E_LOG_ALIGNED_MPWQE_PPW - 1);
+ -	u16 pi, frag_pi;
+ -	int err;
+ -	int i;
+ +	struct mlx5_wq_ll *wq = &rq->wq;
+ +	struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+  
+ -	pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+ -	frag_pi = mlx5_wq_cyc_ctr2fragix(wq, sq->pc);
+ +	rq->mpwqe.umr_in_progress = false;
+  
+ -	if (unlikely(frag_pi + MLX5E_UMR_WQEBBS > mlx5_wq_cyc_get_frag_size(wq))) {
+ -		mlx5e_fill_icosq_frag_edge(sq, wq, pi, frag_pi);
+ -		pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+ -	}
+ +	mlx5_wq_ll_push(wq, be16_to_cpu(wqe->next.next_wqe_index));
+  
+ -	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+ -	if (unlikely(mlx5e_icosq_wrap_cnt(sq) < 2))
+ -		memcpy(umr_wqe, &rq->mpwqe.umr_wqe,
+ -		       offsetof(struct mlx5e_umr_wqe, inline_mtts));
+ +	/* ensure wqes are visible to device before updating doorbell record */
+ +	dma_wmb();
+  
+ -	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ -		err = mlx5e_page_alloc_mapped(rq, dma_info);
+ -		if (unlikely(err))
+ -			goto err_unmap;
+ -		umr_wqe->inline_mtts[i].ptag = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
+ -	}
+ +	mlx5_wq_ll_update_db_record(wq);
+ +}
+  
+ -	bitmap_zero(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
+ -	wi->consumed_strides = 0;
+ +static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+ +{
+ +	int err;
+  
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+ +	}
+  	rq->mpwqe.umr_in_progress = true;
+++<<<<<<< HEAD
+ +	mlx5e_post_umr_wqe(rq, ix);
+++=======
++ 
++ 	umr_wqe->ctrl.opmod_idx_opcode =
++ 		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
++ 			    MLX5_OPCODE_UMR);
++ 	umr_wqe->uctrl.xlt_offset = cpu_to_be16(xlt_offset);
++ 
++ 	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
++ 	sq->pc += MLX5E_UMR_WQEBBS;
++ 	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &umr_wqe->ctrl);
++ 
+++>>>>>>> c400028371e5 (net/mlx5e: RX, Use existing WQ local variable)
+  	return 0;
+ -
+ -err_unmap:
+ -	while (--i >= 0) {
+ -		dma_info--;
+ -		mlx5e_page_release(rq, dma_info, true);
+ -	}
+ -	rq->stats->buff_alloc_err++;
+ -
+ -	return err;
+  }
+  
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
