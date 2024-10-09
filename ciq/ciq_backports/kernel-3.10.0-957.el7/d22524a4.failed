@@ -1,0 +1,243 @@
+nvme: switch controller refcounting to use struct device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] switch controller refcounting to use struct device (David Milburn) [1519689]
+Rebuild_FUZZ: 94.34%
+commit-author Christoph Hellwig <hch@lst.de>
+commit d22524a4782a943bb02a9cf6885ac470210aabfc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d22524a4.failed
+
+Instead of allocating a separate struct device for the character device
+handle embedd it into struct nvme_ctrl and use it for the main controller
+refcounting.  This removes double refcounting and gets us an automatic
+reference for the character device operations.  We keep ctrl->device as a
+pointer for now to avoid chaning printks all over, but in the future we
+could look into message printing helpers that take a controller structure
+similar to what other subsystems do.
+
+Note the delete_ctrl operation always already has a reference (either
+through sysfs due this change, or because every open file on the
+/dev/nvme-fabrics node has a refernece) when it is entered now, so we
+don't need to do the unless_zero variant there.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+(cherry picked from commit d22524a4782a943bb02a9cf6885ac470210aabfc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index 6e7bb75ba7ba,aa9aec6923bb..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -2957,12 -2692,10 +2957,14 @@@ nvme_fc_del_nvme_ctrl(struct nvme_ctrl 
+  	struct nvme_fc_ctrl *ctrl = to_fc_ctrl(nctrl);
+  	int ret;
+  
+- 	if (!kref_get_unless_zero(&ctrl->ctrl.kref))
+- 		return -EBUSY;
+- 
++ 	nvme_get_ctrl(&ctrl->ctrl);
+  	ret = __nvme_fc_del_ctrl(ctrl);
+  	if (!ret)
+++<<<<<<< HEAD
+ +		flush_work(&ctrl->delete_work);
+++=======
++ 		flush_workqueue(nvme_wq);
+++>>>>>>> d22524a4782a (nvme: switch controller refcounting to use struct device)
+  	nvme_put_ctrl(&ctrl->ctrl);
+  
+  	return ret;
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 7c0569923504..d794fadc6b21 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1765,7 +1765,7 @@ static int nvme_dev_open(struct inode *inode, struct file *file)
+ 			ret = -EWOULDBLOCK;
+ 			break;
+ 		}
+-		if (!kref_get_unless_zero(&ctrl->kref))
++		if (!kobject_get_unless_zero(&ctrl->device->kobj))
+ 			break;
+ 		file->private_data = ctrl;
+ 		ret = 0;
+@@ -2191,7 +2191,7 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 	list_add_tail(&ns->list, &ctrl->namespaces);
+ 	mutex_unlock(&ctrl->namespaces_mutex);
+ 
+-	kref_get(&ctrl->kref);
++	nvme_get_ctrl(ctrl);
+ 
+ 	add_disk(ns->disk);
+ 	if (sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
+@@ -2513,7 +2513,7 @@ EXPORT_SYMBOL_GPL(nvme_start_ctrl);
+ 
+ void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
+ {
+-	device_destroy(nvme_class, MKDEV(nvme_char_major, ctrl->instance));
++	device_del(ctrl->device);
+ 
+ 	spin_lock(&dev_list_lock);
+ 	list_del(&ctrl->node);
+@@ -2521,23 +2521,17 @@ void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
+ }
+ EXPORT_SYMBOL_GPL(nvme_uninit_ctrl);
+ 
+-static void nvme_free_ctrl(struct kref *kref)
++static void nvme_free_ctrl(struct device *dev)
+ {
+-	struct nvme_ctrl *ctrl = container_of(kref, struct nvme_ctrl, kref);
++	struct nvme_ctrl *ctrl =
++		container_of(dev, struct nvme_ctrl, ctrl_device);
+ 
+-	put_device(ctrl->device);
+ 	ida_simple_remove(&nvme_instance_ida, ctrl->instance);
+ 	ida_destroy(&ctrl->ns_ida);
+ 
+ 	ctrl->ops->free_ctrl(ctrl);
+ }
+ 
+-void nvme_put_ctrl(struct nvme_ctrl *ctrl)
+-{
+-	kref_put(&ctrl->kref, nvme_free_ctrl);
+-}
+-EXPORT_SYMBOL_GPL(nvme_put_ctrl);
+-
+ /*
+  * Initialize a NVMe controller structures.  This needs to be called during
+  * earliest initialization so that we have the initialized structured around
+@@ -2552,7 +2546,6 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ 	spin_lock_init(&ctrl->lock);
+ 	INIT_LIST_HEAD(&ctrl->namespaces);
+ 	mutex_init(&ctrl->namespaces_mutex);
+-	kref_init(&ctrl->kref);
+ 	ctrl->dev = dev;
+ 	ctrl->ops = ops;
+ 	ctrl->quirks = quirks;
+@@ -2565,15 +2558,21 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ 		goto out;
+ 	ctrl->instance = ret;
+ 
+-	ctrl->device = device_create_with_groups(nvme_class, ctrl->dev,
+-				MKDEV(nvme_char_major, ctrl->instance),
+-				ctrl, nvme_dev_attr_groups,
+-				"nvme%d", ctrl->instance);
+-	if (IS_ERR(ctrl->device)) {
+-		ret = PTR_ERR(ctrl->device);
++	device_initialize(&ctrl->ctrl_device);
++	ctrl->device = &ctrl->ctrl_device;
++	ctrl->device->devt = MKDEV(nvme_char_major, ctrl->instance);
++	ctrl->device->class = nvme_class;
++	ctrl->device->parent = ctrl->dev;
++	ctrl->device->groups = nvme_dev_attr_groups;
++	ctrl->device->release = nvme_free_ctrl;
++	dev_set_drvdata(ctrl->device, ctrl);
++	ret = dev_set_name(ctrl->device, "nvme%d", ctrl->instance);
++	if (ret)
+ 		goto out_release_instance;
+-	}
+-	get_device(ctrl->device);
++	ret = device_add(ctrl->device);
++	if (ret)
++		goto out_free_name;
++
+ 	ida_init(&ctrl->ns_ida);
+ 
+ 	spin_lock(&dev_list_lock);
+@@ -2589,6 +2588,8 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ 		min(default_ps_max_latency_us, (unsigned long)S32_MAX));
+ 
+ 	return 0;
++out_free_name:
++	kfree_const(dev->kobj.name);
+ out_release_instance:
+ 	ida_simple_remove(&nvme_instance_ida, ctrl->instance);
+ out:
+* Unmerged path drivers/nvme/host/fc.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index df4c3bd4f65c..718e5dc8cf16 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -116,11 +116,11 @@ struct nvme_ctrl {
+ 	struct request_queue *admin_q;
+ 	struct request_queue *connect_q;
+ 	struct device *dev;
+-	struct kref kref;
+ 	int instance;
+ 	struct blk_mq_tag_set *tagset;
+ 	struct list_head namespaces;
+ 	struct mutex namespaces_mutex;
++	struct device ctrl_device;
+ 	struct device *device;	/* char device */
+ 	struct list_head node;
+ 	struct ida ns_ida;
+@@ -268,6 +268,16 @@ static inline void nvme_end_request(struct request *req, __le16 status,
+ 	blk_mq_complete_request(req, 0);
+ }
+ 
++static inline void nvme_get_ctrl(struct nvme_ctrl *ctrl)
++{
++	get_device(ctrl->device);
++}
++
++static inline void nvme_put_ctrl(struct nvme_ctrl *ctrl)
++{
++	put_device(ctrl->device);
++}
++
+ void nvme_complete_rq(struct request *req);
+ void nvme_cancel_request(struct request *req, void *data, bool reserved);
+ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 5c9aed0eea84..7ffa09a67fd5 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2031,7 +2031,7 @@ static void nvme_remove_dead_ctrl(struct nvme_dev *dev, int status)
+ {
+ 	dev_warn(dev->ctrl.device, "Removing after probe failure status: %d\n", status);
+ 
+-	kref_get(&dev->ctrl.kref);
++	nvme_get_ctrl(&dev->ctrl);
+ 	nvme_dev_disable(dev, false);
+ 	if (!queue_work(nvme_wq, &dev->remove_work))
+ 		nvme_put_ctrl(&dev->ctrl);
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index fa24ea16798b..e2ac224888a2 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1728,8 +1728,7 @@ static int nvme_rdma_del_ctrl(struct nvme_ctrl *nctrl)
+ 	 * Keep a reference until all work is flushed since
+ 	 * __nvme_rdma_del_ctrl can free the ctrl mem
+ 	 */
+-	if (!kref_get_unless_zero(&ctrl->ctrl.kref))
+-		return -EBUSY;
++	nvme_get_ctrl(&ctrl->ctrl);
+ 	ret = __nvme_rdma_del_ctrl(ctrl);
+ 	if (!ret)
+ 		flush_work(&ctrl->delete_work);
+@@ -2076,7 +2075,7 @@ static struct nvme_ctrl *nvme_rdma_create_ctrl(struct device *dev,
+ 	dev_info(ctrl->ctrl.device, "new ctrl: NQN \"%s\", addr %pISp\n",
+ 		ctrl->ctrl.opts->subsysnqn, &ctrl->addr);
+ 
+-	kref_get(&ctrl->ctrl.kref);
++	nvme_get_ctrl(&ctrl->ctrl);
+ 
+ 	mutex_lock(&nvme_rdma_ctrl_mutex);
+ 	list_add_tail(&ctrl->list, &nvme_rdma_ctrl_list);
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 21dcbdab74e4..b65b4fae039f 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -646,7 +646,7 @@ static struct nvme_ctrl *nvme_loop_create_ctrl(struct device *dev,
+ 	dev_info(ctrl->ctrl.device,
+ 		 "new ctrl: \"%s\"\n", ctrl->ctrl.opts->subsysnqn);
+ 
+-	kref_get(&ctrl->ctrl.kref);
++	nvme_get_ctrl(&ctrl->ctrl);
+ 
+ 	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
+ 	WARN_ON_ONCE(!changed);
