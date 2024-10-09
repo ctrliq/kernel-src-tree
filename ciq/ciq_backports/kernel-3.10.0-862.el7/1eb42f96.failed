@@ -1,0 +1,853 @@
+qla2xxx: Make trace flags more readable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 1eb42f965cedafb700e9c902ddafb1c51e3117f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1eb42f96.failed
+
+Trace flags are useful during debugging crash dumps
+using crash utility. These trace flags makes it easier
+to understand various states a command has successfully
+completed.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 1eb42f965cedafb700e9c902ddafb1c51e3117f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 7d14b62f83a6,5f31ae99fbe2..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2292,13 -3219,120 +2292,98 @@@ done
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qlt_init_term_exchange(struct scsi_qla_host *vha)
++ {
++ 	struct list_head free_list;
++ 	struct qla_tgt_cmd *cmd, *tcmd;
++ 
++ 	vha->hw->tgt.leak_exchg_thresh_hold =
++ 	    (vha->hw->cur_fw_xcb_count/100) * LEAK_EXCHG_THRESH_HOLD_PERCENT;
++ 
++ 	cmd = tcmd = NULL;
++ 	if (!list_empty(&vha->hw->tgt.q_full_list)) {
++ 		INIT_LIST_HEAD(&free_list);
++ 		list_splice_init(&vha->hw->tgt.q_full_list, &free_list);
++ 
++ 		list_for_each_entry_safe(cmd, tcmd, &free_list, cmd_list) {
++ 			list_del(&cmd->cmd_list);
++ 			/* This cmd was never sent to TCM.  There is no need
++ 			 * to schedule free or call free_cmd
++ 			 */
++ 			qlt_free_cmd(cmd);
++ 			vha->hw->tgt.num_qfull_cmds_alloc--;
++ 		}
++ 	}
++ 	vha->hw->tgt.num_qfull_cmds_dropped = 0;
++ }
++ 
++ static void qlt_chk_exch_leak_thresh_hold(struct scsi_qla_host *vha)
++ {
++ 	uint32_t total_leaked;
++ 
++ 	total_leaked = vha->hw->tgt.num_qfull_cmds_dropped;
++ 
++ 	if (vha->hw->tgt.leak_exchg_thresh_hold &&
++ 	    (total_leaked > vha->hw->tgt.leak_exchg_thresh_hold)) {
++ 
++ 		ql_dbg(ql_dbg_tgt, vha, 0xe079,
++ 		    "Chip reset due to exchange starvation: %d/%d.\n",
++ 		    total_leaked, vha->hw->cur_fw_xcb_count);
++ 
++ 		if (IS_P3P_TYPE(vha->hw))
++ 			set_bit(FCOE_CTX_RESET_NEEDED, &vha->dpc_flags);
++ 		else
++ 			set_bit(ISP_ABORT_NEEDED, &vha->dpc_flags);
++ 		qla2xxx_wake_dpc(vha);
++ 	}
++ 
++ }
++ 
++ int qlt_abort_cmd(struct qla_tgt_cmd *cmd)
++ {
++ 	struct qla_tgt *tgt = cmd->tgt;
++ 	struct scsi_qla_host *vha = tgt->vha;
++ 	struct se_cmd *se_cmd = &cmd->se_cmd;
++ 	unsigned long flags;
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf014,
++ 	    "qla_target(%d): terminating exchange for aborted cmd=%p "
++ 	    "(se_cmd=%p, tag=%llu)", vha->vp_idx, cmd, &cmd->se_cmd,
++ 	    se_cmd->tag);
++ 
++ 	spin_lock_irqsave(&cmd->cmd_lock, flags);
++ 	if (cmd->aborted) {
++ 		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 		/*
++ 		 * It's normal to see 2 calls in this path:
++ 		 *  1) XFER Rdy completion + CMD_T_ABORT
++ 		 *  2) TCM TMR - drain_state_list
++ 		 */
++ 	        ql_dbg(ql_dbg_tgt_mgt, vha, 0xffff,
++ 			"multiple abort. %p transport_state %x, t_state %x,"
++ 			" se_cmd_flags %x \n", cmd, cmd->se_cmd.transport_state,
++ 			cmd->se_cmd.t_state,cmd->se_cmd.se_cmd_flags);
++ 		return EIO;
++ 	}
++ 	cmd->aborted = 1;
++ 	cmd->trc_flags |= TRC_ABORT;
++ 	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 
++ 	qlt_send_term_exchange(vha, cmd, &cmd->atio, 0, 1);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(qlt_abort_cmd);
++ 
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  void qlt_free_cmd(struct qla_tgt_cmd *cmd)
+  {
+ -	struct qla_tgt_sess *sess = cmd->sess;
+ -
+ -	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe074,
+ -	    "%s: se_cmd[%p] ox_id %04x\n",
+ -	    __func__, &cmd->se_cmd,
+ -	    be16_to_cpu(cmd->atio.u.isp24.fcp_hdr.ox_id));
+ -
+ -	BUG_ON(cmd->cmd_in_wq);
+ -
+ -	if (cmd->sg_mapped)
+ -		qlt_unmap_sg(cmd->vha, cmd);
+ -
+ -	if (!cmd->q_full)
+ -		qlt_decr_num_pend_cmds(cmd->vha);
+ -
+  	BUG_ON(cmd->sg_mapped);
+ -	cmd->jiffies_at_free = get_jiffies_64();
+ +
+  	if (unlikely(cmd->free_sg))
+  		kfree(cmd->sg);
+ -
+ -	if (!sess || !sess->se_sess) {
+ -		WARN_ON(1);
+ -		return;
+ -	}
+ -	cmd->jiffies_at_free = get_jiffies_64();
+ -	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+  }
+  EXPORT_SYMBOL(qlt_free_cmd);
+  
+@@@ -2312,6 -3345,7 +2397,10 @@@ static int qlt_prepare_srr_ctio(struct 
+  	struct qla_tgt_srr_imm *imm;
+  
+  	tgt->ctio_srr_id++;
+++<<<<<<< HEAD
+++=======
++ 	cmd->trc_flags |= TRC_SRR_CTIO;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf019,
+  	    "qla_target(%d): CTIO with SRR status received\n", vha->vp_idx);
+@@@ -2464,6 -3496,78 +2553,81 @@@ static struct qla_tgt_cmd *qlt_ctio_to_
+  	return cmd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* hardware_lock should be held by caller. */
++ static void
++ qlt_abort_cmd_on_host_reset(struct scsi_qla_host *vha, struct qla_tgt_cmd *cmd)
++ {
++ 	struct qla_hw_data *ha = vha->hw;
++ 	uint32_t handle;
++ 
++ 	if (cmd->sg_mapped)
++ 		qlt_unmap_sg(vha, cmd);
++ 
++ 	handle = qlt_make_handle(vha);
++ 
++ 	/* TODO: fix debug message type and ids. */
++ 	if (cmd->state == QLA_TGT_STATE_PROCESSED) {
++ 		ql_dbg(ql_dbg_io, vha, 0xff00,
++ 		    "HOST-ABORT: handle=%d, state=PROCESSED.\n", handle);
++ 	} else if (cmd->state == QLA_TGT_STATE_NEED_DATA) {
++ 		cmd->write_data_transferred = 0;
++ 		cmd->state = QLA_TGT_STATE_DATA_IN;
++ 
++ 		ql_dbg(ql_dbg_io, vha, 0xff01,
++ 		    "HOST-ABORT: handle=%d, state=DATA_IN.\n", handle);
++ 
++ 		ha->tgt.tgt_ops->handle_data(cmd);
++ 		return;
++ 	} else {
++ 		ql_dbg(ql_dbg_io, vha, 0xff03,
++ 		    "HOST-ABORT: handle=%d, state=BAD(%d).\n", handle,
++ 		    cmd->state);
++ 		dump_stack();
++ 	}
++ 
++ 	cmd->trc_flags |= TRC_FLUSH;
++ 	ha->tgt.tgt_ops->free_cmd(cmd);
++ }
++ 
++ void
++ qlt_host_reset_handler(struct qla_hw_data *ha)
++ {
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
++ 	scsi_qla_host_t *vha = NULL;
++ 	struct qla_tgt *tgt = base_vha->vha_tgt.qla_tgt;
++ 	uint32_t i;
++ 
++ 	if (!base_vha->hw->tgt.tgt_ops)
++ 		return;
++ 
++ 	if (!tgt || qla_ini_mode_enabled(base_vha)) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf003,
++ 			"Target mode disabled\n");
++ 		return;
++ 	}
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xff10,
++ 	    "HOST-ABORT-HNDLR: base_vha->dpc_flags=%lx.\n",
++ 	    base_vha->dpc_flags);
++ 
++ 	spin_lock_irqsave(&ha->hardware_lock, flags);
++ 	for (i = 1; i < DEFAULT_OUTSTANDING_COMMANDS + 1; i++) {
++ 		cmd = qlt_get_cmd(base_vha, i);
++ 		if (!cmd)
++ 			continue;
++ 		/* ha->tgt.cmds entry is cleared by qlt_get_cmd. */
++ 		vha = cmd->vha;
++ 		qlt_abort_cmd_on_host_reset(vha, cmd);
++ 	}
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ }
++ 
++ 
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  /*
+   * ha->hardware_lock supposed to be held on entry. Might drop it, then reaquire
+   */
+@@@ -2551,14 -3693,16 +2715,23 @@@ static void qlt_do_ctio_completion(stru
+  		 * level.
+  		 */
+  		if ((cmd->state != QLA_TGT_STATE_NEED_DATA) &&
+++<<<<<<< HEAD
+ +			(cmd->state != QLA_TGT_STATE_ABORTED)) {
+++=======
++ 		    (!cmd->aborted)) {
++ 			cmd->trc_flags |= TRC_CTIO_ERR;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  			if (qlt_term_ctio_exchange(vha, ctio, cmd, status))
+  				return;
+  		}
+  	}
+ -skip_term:
+  
+  	if (cmd->state == QLA_TGT_STATE_PROCESSED) {
+++<<<<<<< HEAD
+ +		ql_dbg(ql_dbg_tgt, vha, 0xe01f, "Command %p finished\n", cmd);
+++=======
++ 		cmd->trc_flags |= TRC_CTIO_DONE;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	} else if (cmd->state == QLA_TGT_STATE_NEED_DATA) {
+  		cmd->state = QLA_TGT_STATE_DATA_IN;
+  
+@@@ -2567,10 -3711,12 +2740,19 @@@
+  
+  		ha->tgt.tgt_ops->handle_data(cmd);
+  		return;
+++<<<<<<< HEAD
+ +	} else if (cmd->state == QLA_TGT_STATE_ABORTED) {
+++=======
++ 	} else if (cmd->aborted) {
++ 		cmd->trc_flags |= TRC_CTIO_ABORTED;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf01e,
+ -		  "Aborted command %p (tag %lld) finished\n", cmd, se_cmd->tag);
+ +		    "Aborted command %p (tag %d) finished\n", cmd, cmd->tag);
+  	} else {
+++<<<<<<< HEAD
+++=======
++ 		cmd->trc_flags |= TRC_CTIO_STRANGE;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05c,
+  		    "qla_target(%d): A command in state (%d) should "
+  		    "not return a CTIO complete\n", vha->vp_idx, cmd->state);
+@@@ -2635,6 -3780,8 +2817,11 @@@ static void qlt_do_work(struct work_str
+  	uint32_t data_length;
+  	int ret, fcp_task_attr, data_dir, bidi = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	cmd->cmd_in_wq = 0;
++ 	cmd->trc_flags |= TRC_DO_WORK;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	if (tgt->tgt_stop)
+  		goto out_term;
+  
+@@@ -2715,12 -3833,134 +2902,140 @@@ out_term
+  	 * cmd has not sent to target yet, so pass NULL as the second
+  	 * argument to qlt_send_term_exchange() and free the memory here.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	cmd->trc_flags |= TRC_DO_WORK_ERR;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1, 0);
+ -
+ -	qlt_decr_num_pend_cmds(vha);
+ -	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
+ +	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1);
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+ +	if (sess)
+ +		ha->tgt.tgt_ops->put_sess(sess);
+++=======
++ 
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 	qlt_put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ }
++ 
++ static void qlt_do_work(struct work_struct *work)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
++ 	scsi_qla_host_t *vha = cmd->vha;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_del(&cmd->cmd_list);
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	__qlt_do_work(cmd);
++ }
++ 
++ static struct qla_tgt_cmd *qlt_get_tag(scsi_qla_host_t *vha,
++ 				       struct qla_tgt_sess *sess,
++ 				       struct atio_from_isp *atio)
++ {
++ 	struct se_session *se_sess = sess->se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 	cmd->state = QLA_TGT_STATE_NEW;
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	qlt_incr_num_pend_cmds(vha);
++ 	cmd->vha = vha;
++ 	cmd->se_cmd.map_tag = tag;
++ 	cmd->sess = sess;
++ 	cmd->loop_id = sess->loop_id;
++ 	cmd->conf_compl_supported = sess->conf_compl_supported;
++ 
++ 	cmd->trc_flags = 0;
++ 	cmd->jiffies_at_alloc = get_jiffies_64();
++ 
++ 	cmd->reset_count = vha->hw->chip_reset;
++ 
++ 	return cmd;
++ }
++ 
++ static void qlt_send_busy(struct scsi_qla_host *, struct atio_from_isp *,
++ 			  uint16_t);
++ 
++ static void qlt_create_sess_from_atio(struct work_struct *work)
++ {
++ 	struct qla_tgt_sess_op *op = container_of(work,
++ 					struct qla_tgt_sess_op, work);
++ 	scsi_qla_host_t *vha = op->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	uint8_t *s_id = op->atio.u.isp24.fcp_hdr.s_id;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_del(&op->cmd_list);
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	if (op->aborted) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf083,
++ 		    "sess_op with tag %u is aborted\n",
++ 		    op->atio.u.isp24.exchange_addr);
++ 		goto out_term;
++ 	}
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
++ 	    "qla_target(%d): Unable to find wwn login"
++ 	    " (s_id %x:%x:%x), trying to create it manually\n",
++ 	    vha->vp_idx, s_id[0], s_id[1], s_id[2]);
++ 
++ 	if (op->atio.u.raw.entry_count > 1) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
++ 		    "Dropping multy entry atio %p\n", &op->atio);
++ 		goto out_term;
++ 	}
++ 
++ 	sess = qlt_make_local_sess(vha, s_id);
++ 	/* sess has an extra creation ref. */
++ 
++ 	if (!sess)
++ 		goto out_term;
++ 	/*
++ 	 * Now obtain a pre-allocated session tag using the original op->atio
++ 	 * packet header, and dispatch into __qlt_do_work() using the existing
++ 	 * process context.
++ 	 */
++ 	cmd = qlt_get_tag(vha, sess, &op->atio);
++ 	if (!cmd) {
++ 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
++ 		qlt_put_sess(sess);
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		kfree(op);
++ 		return;
++ 	}
++ 	/*
++ 	 * __qlt_do_work() will call qlt_put_sess() to release
++ 	 * the extra reference taken above by qlt_make_local_sess()
++ 	 */
++ 	__qlt_do_work(cmd);
++ 	kfree(op);
++ 	return;
++ 
++ out_term:
++ 	spin_lock_irqsave(&ha->hardware_lock, flags);
++ 	qlt_send_term_exchange(vha, NULL, &op->atio, 1, 0);
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 	kfree(op);
++ 
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -2744,15 -4018,27 +3059,22 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&cmd->cmd_list);
+++=======
++ 	cmd->cmd_in_wq = 1;
++ 	cmd->trc_flags |= TRC_NEW_CMD;
++ 	cmd->se_cmd.cpuid = ha->msix_count ?
++ 		ha->tgt.rspq_vector_cpuid : WORK_CPU_UNBOUND;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  
+ -	spin_lock(&vha->cmd_list_lock);
+ -	list_add_tail(&cmd->cmd_list, &vha->qla_cmd_list);
+ -	spin_unlock(&vha->cmd_list_lock);
+ +	memcpy(&cmd->atio, atio, sizeof(*atio));
+ +	cmd->state = QLA_TGT_STATE_NEW;
+ +	cmd->tgt = ha->tgt.qla_tgt;
+ +	cmd->vha = vha;
+  
+  	INIT_WORK(&cmd->work, qlt_do_work);
+ -	if (ha->msix_count) {
+ -		if (cmd->atio.u.isp24.fcp_cmnd.rddata)
+ -			queue_work_on(smp_processor_id(), qla_tgt_wq,
+ -			    &cmd->work);
+ -		else
+ -			queue_work_on(cmd->se_cmd.cpuid, qla_tgt_wq,
+ -			    &cmd->work);
+ -	} else {
+ -		queue_work(qla_tgt_wq, &cmd->work);
+ -	}
+ +	queue_work(qla_tgt_wq, &cmd->work);
+  	return 0;
+  
+  }
+@@@ -3213,14 -4711,14 +3535,19 @@@ static void qlt_handle_srr(struct scsi_
+  			qlt_send_notify_ack(vha, ntfy,
+  			    0, 0, 0, NOTIFY_ACK_SRR_FLAGS_ACCEPT, 0, 0);
+  			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+ +			if (xmit_type & QLA_TGT_XMIT_DATA)
+++=======
++ 			if (xmit_type & QLA_TGT_XMIT_DATA) {
++ 				cmd->trc_flags |= TRC_SRR_XRDY;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  				qlt_rdy_to_xfer(cmd);
+ -			}
+  		} else {
+  			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf066,
+ -			    "qla_target(%d): SRR for out data for cmd without them (tag %lld, SCSI status %d), reject",
+ -			       vha->vp_idx, se_cmd->tag, cmd->se_cmd.scsi_status);
+ +			    "qla_target(%d): SRR for out data for cmd "
+ +			    "without them (tag %d, SCSI status %d), "
+ +			    "reject", vha->vp_idx, cmd->tag,
+ +			    cmd->se_cmd.scsi_status);
+  			goto out_reject;
+  		}
+  		break;
+@@@ -3232,8 -4730,10 +3559,13 @@@
+  	}
+  
+  	/* Transmit response in case of status and data-in cases */
+++<<<<<<< HEAD
+ +	if (resp)
+++=======
++ 	if (resp) {
++ 		cmd->trc_flags |= TRC_SRR_RSP;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  		qlt_xmit_response(cmd, xmit_type, se_cmd->scsi_status);
+ -	}
+  
+  	return;
+  
+@@@ -3246,8 -4746,10 +3578,15 @@@ out_reject
+  	if (cmd->state == QLA_TGT_STATE_NEED_DATA) {
+  		cmd->state = QLA_TGT_STATE_DATA_IN;
+  		dump_stack();
+++<<<<<<< HEAD
+ +	} else
+ +		qlt_send_term_exchange(vha, cmd, &cmd->atio, 1);
+++=======
++ 	} else {
++ 		cmd->trc_flags |= TRC_SRR_TERM;
++ 		qlt_send_term_exchange(vha, cmd, &cmd->atio, 1, 0);
++ 	}
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  }
+  
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,5d00529b68c4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -826,12 -961,37 +826,38 @@@ struct qla_tgt_sess 
+  
+  	uint8_t port_name[WWN_SIZE];
+  	struct work_struct free_work;
+ -
+ -	qlt_plogi_ack_t *plogi_link[QLT_PLOGI_LINK_MAX];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum trace_flags {
++ 	TRC_NEW_CMD = BIT_0,
++ 	TRC_DO_WORK = BIT_1,
++ 	TRC_DO_WORK_ERR = BIT_2,
++ 	TRC_XFR_RDY = BIT_3,
++ 	TRC_XMIT_DATA = BIT_4,
++ 	TRC_XMIT_STATUS = BIT_5,
++ 	TRC_SRR_RSP =  BIT_6,
++ 	TRC_SRR_XRDY = BIT_7,
++ 	TRC_SRR_TERM = BIT_8,
++ 	TRC_SRR_CTIO = BIT_9,
++ 	TRC_FLUSH = BIT_10,
++ 	TRC_CTIO_ERR = BIT_11,
++ 	TRC_CTIO_DONE = BIT_12,
++ 	TRC_CTIO_ABORTED =  BIT_13,
++ 	TRC_CTIO_STRANGE= BIT_14,
++ 	TRC_CMD_DONE = BIT_15,
++ 	TRC_CMD_CHK_STOP = BIT_16,
++ 	TRC_CMD_FREE = BIT_17,
++ 	TRC_DATA_IN = BIT_18,
++ 	TRC_ABORT = BIT_19,
++ };
++ 
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  struct qla_tgt_cmd {
+ -	struct se_cmd se_cmd;
+  	struct qla_tgt_sess *sess;
+  	int state;
+ +	struct se_cmd se_cmd;
+  	struct work_struct free_work;
+  	struct work_struct work;
+  	/* Sense buffer that will be mapped into outgoing status */
+@@@ -841,8 -1002,15 +867,19 @@@
+  	unsigned int conf_compl_supported:1;
+  	unsigned int sg_mapped:1;
+  	unsigned int free_sg:1;
+ +	unsigned int aborted:1; /* Needed in case of SRR */
+  	unsigned int write_data_transferred:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int ctx_dsd_alloced:1;
++ 	unsigned int q_full:1;
++ 	unsigned int term_exchg:1;
++ 	unsigned int cmd_sent_to_fw:1;
++ 	unsigned int cmd_in_wq:1;
++ 	unsigned int aborted:1;
++ 	unsigned int data_work:1;
++ 	unsigned int data_work_free:1;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  
+  	struct scatterlist *sg;	/* cmd data buffer SG vector */
+  	int sg_cnt;		/* SG segments count */
+@@@ -858,6 -1026,16 +895,19 @@@
+  	struct list_head cmd_list;
+  
+  	struct atio_from_isp atio;
+++<<<<<<< HEAD
+++=======
++ 	/* t10dif */
++ 	struct scatterlist *prot_sg;
++ 	uint32_t prot_sg_cnt;
++ 	uint32_t blk_sz;
++ 	struct crc_context *ctx;
++ 
++ 	uint64_t jiffies_at_alloc;
++ 	uint64_t jiffies_at_free;
++ 
++ 	enum trace_flags trc_flags;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  };
+  
+  struct qla_tgt_sess_work_param {
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 45ec37d3095c,af4a198e5537..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -403,6 -280,12 +403,15 @@@ static void tcm_qla2xxx_complete_free(s
+  {
+  	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
+  
+++<<<<<<< HEAD
+++=======
++ 	cmd->cmd_in_wq = 0;
++ 
++ 	WARN_ON(cmd->trc_flags & TRC_CMD_FREE);
++ 
++ 	cmd->vha->tgt_counters.qla_core_ret_sta_ctio++;
++ 	cmd->trc_flags |= TRC_CMD_FREE;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	transport_generic_free_cmd(&cmd->se_cmd, 0);
+  }
+  
+@@@ -413,8 -296,14 +422,17 @@@
+   */
+  static void tcm_qla2xxx_free_cmd(struct qla_tgt_cmd *cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	cmd->vha->tgt_counters.core_qla_free_cmd++;
++ 	cmd->cmd_in_wq = 1;
++ 
++ 	WARN_ON(cmd->trc_flags & TRC_CMD_DONE);
++ 	cmd->trc_flags |= TRC_CMD_DONE;
++ 
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	INIT_WORK(&cmd->work, tcm_qla2xxx_complete_free);
+ -	queue_work_on(smp_processor_id(), tcm_qla2xxx_free_wq, &cmd->work);
+ +	queue_work(tcm_qla2xxx_free_wq, &cmd->work);
+  }
+  
+  /*
+@@@ -422,6 -311,13 +440,16 @@@
+   */
+  static int tcm_qla2xxx_check_stop_free(struct se_cmd *se_cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct qla_tgt_cmd *cmd;
++ 
++ 	if ((se_cmd->se_cmd_flags & SCF_SCSI_TMR_CDB) == 0) {
++ 		cmd = container_of(se_cmd, struct qla_tgt_cmd, se_cmd);
++ 		cmd->trc_flags |= TRC_CMD_CHK_STOP;
++ 	}
++ 
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	return target_put_sess_cmd(se_cmd);
+  }
+  
+@@@ -508,8 -364,22 +536,25 @@@ static int tcm_qla2xxx_write_pending(st
+  	struct qla_tgt_cmd *cmd = container_of(se_cmd,
+  				struct qla_tgt_cmd, se_cmd);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (cmd->aborted) {
++ 		/* Cmd can loop during Q-full.  tcm_qla2xxx_aborted_task
++ 		 * can get ahead of this cmd. tcm_qla2xxx_aborted_task
++ 		 * already kick start the free.
++ 		 */
++ 		pr_debug("write_pending aborted cmd[%p] refcount %d "
++ 			"transport_state %x, t_state %x, se_cmd_flags %x\n",
++ 			cmd,cmd->se_cmd.cmd_kref.refcount.counter,
++ 			cmd->se_cmd.transport_state,
++ 			cmd->se_cmd.t_state,
++ 			cmd->se_cmd.se_cmd_flags);
++ 		return 0;
++ 	}
++ 	cmd->trc_flags |= TRC_XFR_RDY;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	cmd->bufflen = se_cmd->data_length;
+ -	cmd->dma_data_direction = target_reverse_dma_direction(se_cmd);
+ +	cmd->dma_data_direction = tcm_qla2xxx_mapping_dir(se_cmd);
+  
+  	cmd->sg_cnt = se_cmd->t_data_nents;
+  	cmd->sg = se_cmd->t_data_sg;
+@@@ -605,6 -490,20 +650,23 @@@ static void tcm_qla2xxx_handle_data_wor
+  	 * Ensure that the complete FCP WRITE payload has been received.
+  	 * Otherwise return an exception via CHECK_CONDITION status.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	cmd->cmd_in_wq = 0;
++ 
++ 	spin_lock_irqsave(&cmd->cmd_lock, flags);
++ 	cmd->data_work = 1;
++ 	if (cmd->aborted) {
++ 		cmd->data_work_free = 1;
++ 		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 
++ 		tcm_qla2xxx_free_cmd(cmd);
++ 		return;
++ 	}
++ 	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 
++ 	cmd->vha->tgt_counters.qla_core_ret_ctio++;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	if (!cmd->write_data_transferred) {
+  		/*
+  		 * Check if se_cmd has already been aborted via LUN_RESET, and
+@@@ -628,7 -532,30 +690,12 @@@
+   */
+  static void tcm_qla2xxx_handle_data(struct qla_tgt_cmd *cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	cmd->trc_flags |= TRC_DATA_IN;
++ 	cmd->cmd_in_wq = 1;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	INIT_WORK(&cmd->work, tcm_qla2xxx_handle_data_work);
+ -	queue_work_on(smp_processor_id(), tcm_qla2xxx_free_wq, &cmd->work);
+ -}
+ -
+ -static void tcm_qla2xxx_handle_dif_work(struct work_struct *work)
+ -{
+ -	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
+ -
+ -	/* take an extra kref to prevent cmd free too early.
+ -	 * need to wait for SCSI status/check condition to
+ -	 * finish responding generate by transport_generic_request_failure.
+ -	 */
+ -	kref_get(&cmd->se_cmd.cmd_kref);
+ -	transport_generic_request_failure(&cmd->se_cmd, cmd->se_cmd.pi_err);
+ -}
+ -
+ -/*
+ - * Called from qla_target.c:qlt_do_ctio_completion()
+ - */
+ -static void tcm_qla2xxx_handle_dif_err(struct qla_tgt_cmd *cmd)
+ -{
+ -	INIT_WORK(&cmd->work, tcm_qla2xxx_handle_dif_work);
+  	queue_work(tcm_qla2xxx_free_wq, &cmd->work);
+  }
+  
+@@@ -650,9 -613,23 +717,27 @@@ static int tcm_qla2xxx_queue_data_in(st
+  	struct qla_tgt_cmd *cmd = container_of(se_cmd,
+  				struct qla_tgt_cmd, se_cmd);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (cmd->aborted) {
++ 		/* Cmd can loop during Q-full.  tcm_qla2xxx_aborted_task
++ 		 * can get ahead of this cmd. tcm_qla2xxx_aborted_task
++ 		 * already kick start the free.
++ 		 */
++ 		pr_debug("queue_data_in aborted cmd[%p] refcount %d "
++ 			"transport_state %x, t_state %x, se_cmd_flags %x\n",
++ 			cmd,cmd->se_cmd.cmd_kref.refcount.counter,
++ 			cmd->se_cmd.transport_state,
++ 			cmd->se_cmd.t_state,
++ 			cmd->se_cmd.se_cmd_flags);
++ 		return 0;
++ 	}
++ 
++ 	cmd->trc_flags |= TRC_XMIT_DATA;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  	cmd->bufflen = se_cmd->data_length;
+ -	cmd->dma_data_direction = target_reverse_dma_direction(se_cmd);
+ +	cmd->dma_data_direction = tcm_qla2xxx_mapping_dir(se_cmd);
+ +	cmd->aborted = (se_cmd->transport_state & CMD_T_ABORTED);
+  
+  	cmd->sg_cnt = se_cmd->t_data_nents;
+  	cmd->sg = se_cmd->t_data_sg;
+@@@ -675,8 -657,12 +760,17 @@@ static int tcm_qla2xxx_queue_status(str
+  	cmd->sg = NULL;
+  	cmd->sg_cnt = 0;
+  	cmd->offset = 0;
+++<<<<<<< HEAD
+ +	cmd->dma_data_direction = tcm_qla2xxx_mapping_dir(se_cmd);
+ +	cmd->aborted = (se_cmd->transport_state & CMD_T_ABORTED);
+++=======
++ 	cmd->dma_data_direction = target_reverse_dma_direction(se_cmd);
++ 	if (cmd->trc_flags & TRC_XMIT_STATUS) {
++ 		pr_crit("Multiple calls for status = %p.\n", cmd);
++ 		dump_stack();
++ 	}
++ 	cmd->trc_flags |= TRC_XMIT_STATUS;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  
+  	if (se_cmd->data_direction == DMA_FROM_DEVICE) {
+  		/*
+@@@ -730,8 -716,33 +824,37 @@@ static int tcm_qla2xxx_queue_tm_rsp(str
+  	 * CTIO response packet.
+  	 */
+  	qlt_xmit_tm_rsp(mcmd);
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ #define DATA_WORK_NOT_FREE(_cmd) (_cmd->data_work && !_cmd->data_work_free)
++ static void tcm_qla2xxx_aborted_task(struct se_cmd *se_cmd)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(se_cmd,
++ 				struct qla_tgt_cmd, se_cmd);
++ 	unsigned long flags;
++ 
++ 	if (qlt_abort_cmd(cmd))
++ 		return;
++ 
++ 	spin_lock_irqsave(&cmd->cmd_lock, flags);
++ 	if ((cmd->state == QLA_TGT_STATE_NEW)||
++ 	    ((cmd->state == QLA_TGT_STATE_DATA_IN) &&
++ 		DATA_WORK_NOT_FREE(cmd))) {
++ 		cmd->data_work_free = 1;
++ 		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 		/*
++ 		 * cmd has not reached fw, Use this trigger to free it.
++ 		 */
++ 		tcm_qla2xxx_free_cmd(cmd);
++ 		return;
++ 	}
++ 	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 	return;
+++>>>>>>> 1eb42f965ced (qla2xxx: Make trace flags more readable)
+  
+ +	return 0;
+  }
+  
+  static void tcm_qla2xxx_clear_sess_lookup(struct tcm_qla2xxx_lport *,
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
