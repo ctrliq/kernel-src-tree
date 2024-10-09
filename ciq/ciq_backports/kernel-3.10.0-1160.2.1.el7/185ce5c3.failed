@@ -1,0 +1,147 @@
+net: test nouarg before dereferencing zerocopy pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.2.1.el7
+Rebuild_CHGLOG: - [net] test nouarg before dereferencing zerocopy pointers (Patrick Talbert) [1862273]
+Rebuild_FUZZ: 95.24%
+commit-author Willem de Bruijn <willemb@google.com>
+commit 185ce5c38ea76f29b6bd9c7c8c7a5e5408834920
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.2.1.el7/185ce5c3.failed
+
+Zerocopy skbs without completion notification were added for packet
+sockets with PACKET_TX_RING user buffers. Those signal completion
+through the TP_STATUS_USER bit in the ring. Zerocopy annotation was
+added only to avoid premature notification after clone or orphan, by
+triggering a copy on these paths for these packets.
+
+The mechanism had to define a special "no-uarg" mode because packet
+sockets already use skb_uarg(skb) == skb_shinfo(skb)->destructor_arg
+for a different pointer.
+
+Before deferencing skb_uarg(skb), verify that it is a real pointer.
+
+Fixes: 5cd8d46ea1562 ("packet: copy user buffers before orphan or clone")
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 185ce5c38ea76f29b6bd9c7c8c7a5e5408834920)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index 7b84e5e67acf,2ee5e63195c0..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -1277,6 -1392,83 +1277,86 @@@ static inline struct skb_shared_hwtstam
+  	return &skb_shinfo(skb)->hwtstamps;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct ubuf_info *skb_zcopy(struct sk_buff *skb)
++ {
++ 	bool is_zcopy = skb && skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY;
++ 
++ 	return is_zcopy ? skb_uarg(skb) : NULL;
++ }
++ 
++ static inline void skb_zcopy_set(struct sk_buff *skb, struct ubuf_info *uarg,
++ 				 bool *have_ref)
++ {
++ 	if (skb && uarg && !skb_zcopy(skb)) {
++ 		if (unlikely(have_ref && *have_ref))
++ 			*have_ref = false;
++ 		else
++ 			sock_zerocopy_get(uarg);
++ 		skb_shinfo(skb)->destructor_arg = uarg;
++ 		skb_shinfo(skb)->tx_flags |= SKBTX_ZEROCOPY_FRAG;
++ 	}
++ }
++ 
++ static inline void skb_zcopy_set_nouarg(struct sk_buff *skb, void *val)
++ {
++ 	skb_shinfo(skb)->destructor_arg = (void *)((uintptr_t) val | 0x1UL);
++ 	skb_shinfo(skb)->tx_flags |= SKBTX_ZEROCOPY_FRAG;
++ }
++ 
++ static inline bool skb_zcopy_is_nouarg(struct sk_buff *skb)
++ {
++ 	return (uintptr_t) skb_shinfo(skb)->destructor_arg & 0x1UL;
++ }
++ 
++ static inline void *skb_zcopy_get_nouarg(struct sk_buff *skb)
++ {
++ 	return (void *)((uintptr_t) skb_shinfo(skb)->destructor_arg & ~0x1UL);
++ }
++ 
++ /* Release a reference on a zerocopy structure */
++ static inline void skb_zcopy_clear(struct sk_buff *skb, bool zerocopy)
++ {
++ 	struct ubuf_info *uarg = skb_zcopy(skb);
++ 
++ 	if (uarg) {
++ 		if (skb_zcopy_is_nouarg(skb)) {
++ 			/* no notification callback */
++ 		} else if (uarg->callback == sock_zerocopy_callback) {
++ 			uarg->zerocopy = uarg->zerocopy && zerocopy;
++ 			sock_zerocopy_put(uarg);
++ 		} else {
++ 			uarg->callback(uarg, zerocopy);
++ 		}
++ 
++ 		skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
++ 	}
++ }
++ 
++ /* Abort a zerocopy operation and revert zckey on error in send syscall */
++ static inline void skb_zcopy_abort(struct sk_buff *skb)
++ {
++ 	struct ubuf_info *uarg = skb_zcopy(skb);
++ 
++ 	if (uarg) {
++ 		sock_zerocopy_put_abort(uarg, false);
++ 		skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
++ 	}
++ }
++ 
++ static inline void skb_mark_not_on_list(struct sk_buff *skb)
++ {
++ 	skb->next = NULL;
++ }
++ 
++ static inline void skb_list_del_init(struct sk_buff *skb)
++ {
++ 	__list_del_entry(&skb->list);
++ 	skb_mark_not_on_list(skb);
++ }
++ 
+++>>>>>>> 185ce5c38ea7 (net: test nouarg before dereferencing zerocopy pointers)
+  /**
+   *	skb_queue_empty - check if a queue is empty
+   *	@list: queue head
+@@@ -2480,7 -2691,18 +2560,22 @@@ static inline void skb_orphan(struct sk
+   */
+  static inline int skb_orphan_frags(struct sk_buff *skb, gfp_t gfp_mask)
+  {
+++<<<<<<< HEAD
+ +	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY)))
+++=======
++ 	if (likely(!skb_zcopy(skb)))
++ 		return 0;
++ 	if (!skb_zcopy_is_nouarg(skb) &&
++ 	    skb_uarg(skb)->callback == sock_zerocopy_callback)
++ 		return 0;
++ 	return skb_copy_ubufs(skb, gfp_mask);
++ }
++ 
++ /* Frags must be orphaned, even if refcounted, if skb might loop to rx path */
++ static inline int skb_orphan_frags_rx(struct sk_buff *skb, gfp_t gfp_mask)
++ {
++ 	if (likely(!skb_zcopy(skb)))
+++>>>>>>> 185ce5c38ea7 (net: test nouarg before dereferencing zerocopy pointers)
+  		return 0;
+  	return skb_copy_ubufs(skb, gfp_mask);
+  }
+* Unmerged path include/linux/skbuff.h
