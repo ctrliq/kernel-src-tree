@@ -133,6 +133,7 @@ struct snd_card {
 	struct device card_dev;		/* cardX object for sysfs */
 	const struct attribute_group *dev_groups[4]; /* assigned sysfs attr */
 	bool registered;		/* card_dev is registered? */
+	wait_queue_head_t remove_sleep;
 
 #ifdef CONFIG_PM
 	unsigned int power_state;	/* power state */
@@ -247,6 +248,7 @@ snd_card_create(int idx, const char *id, struct module *module, int extra_size,
 }
 
 int snd_card_disconnect(struct snd_card *card);
+void snd_card_disconnect_sync(struct snd_card *card);
 int snd_card_free(struct snd_card *card);
 int snd_card_free_when_closed(struct snd_card *card);
 void snd_card_set_id(struct snd_card *card, const char *id);
