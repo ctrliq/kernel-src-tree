@@ -1,0 +1,94 @@
+fuse: do not use iocb after it may have been freed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Robert Doebbelin <robert@quobyte.com>
+commit 7cabc61e01a0a8b663bd2b4c982aa53048218734
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7cabc61e.failed
+
+There's a race in fuse_direct_IO(), whereby is_sync_kiocb() is called on an
+iocb that could have been freed if async io has already completed.  The fix
+in this case is simple and obvious: cache the result before starting io.
+
+It was discovered by KASan:
+
+kernel: ==================================================================
+kernel: BUG: KASan: use after free in fuse_direct_IO+0xb1a/0xcc0 at addr ffff88036c414390
+
+	Signed-off-by: Robert Doebbelin <robert@quobyte.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Fixes: bcba24ccdc82 ("fuse: enable asynchronous processing direct IO")
+	Cc: <stable@vger.kernel.org> # 3.10+
+(cherry picked from commit 7cabc61e01a0a8b663bd2b4c982aa53048218734)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/file.c
+diff --cc fs/fuse/file.c
+index d613834754c6,34a23df361ca..000000000000
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@@ -2939,8 -2841,9 +2939,9 @@@ fuse_direct_IO(int rw, struct kiocb *io
+  	loff_t pos = 0;
+  	struct inode *inode;
+  	loff_t i_size;
+ -	size_t count = iov_iter_count(iter);
+ +	size_t count = iov_length(iov, nr_segs);
+  	struct fuse_io_priv *io;
++ 	bool is_sync = is_sync_kiocb(iocb);
+  
+  	pos = offset;
+  	inode = file->f_mapping->host;
+@@@ -2976,27 -2883,34 +2977,43 @@@
+  	 * to wait on real async I/O requests, so we must submit this request
+  	 * synchronously.
+  	 */
+++<<<<<<< HEAD
+ +	if (!is_sync_kiocb(iocb) && (offset + count > i_size) && rw == WRITE)
+ +		io->async = false;
+ +
+ +	if (rw == WRITE)
+ +		ret = __fuse_direct_write(io, iov, nr_segs, &pos);
+ +	else
+ +		ret = __fuse_direct_read(io, iov, nr_segs, &pos, count);
+++=======
++ 	if (!is_sync && (offset + count > i_size) &&
++ 	    iov_iter_rw(iter) == WRITE)
++ 		io->async = false;
++ 
++ 	if (io->async && is_sync)
++ 		io->done = &wait;
++ 
++ 	if (iov_iter_rw(iter) == WRITE) {
++ 		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
++ 		fuse_invalidate_attr(inode);
++ 	} else {
++ 		ret = __fuse_direct_read(io, iter, &pos);
++ 	}
+++>>>>>>> 7cabc61e01a0 (fuse: do not use iocb after it may have been freed)
+  
+  	if (io->async) {
+  		fuse_aio_complete(io, ret < 0 ? ret : 0, -1);
+  
+  		/* we have a non-extending, async request, so return */
+- 		if (!is_sync_kiocb(iocb))
++ 		if (!is_sync)
+  			return -EIOCBQUEUED;
+  
+ -		wait_for_completion(&wait);
+ -		ret = fuse_get_res_by_io(io);
+ +		ret = wait_on_sync_kiocb(iocb);
+ +	} else {
+ +		kfree(io);
+  	}
+  
+ -	kfree(io);
+ -
+ -	if (iov_iter_rw(iter) == WRITE) {
+ +	if (rw == WRITE) {
+  		if (ret > 0)
+  			fuse_write_update_size(inode, pos);
+  		else if (ret < 0 && offset + count > i_size)
+* Unmerged path fs/fuse/file.c
