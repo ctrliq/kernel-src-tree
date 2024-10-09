@@ -1,0 +1,590 @@
+locks: fix file locking on overlayfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit c568d68341be7030f5647def68851e469b21ca11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c568d683.failed
+
+This patch allows flock, posix locks, ofd locks and leases to work
+correctly on overlayfs.
+
+Instead of using the underlying inode for storing lock context use the
+overlay inode.  This allows locks to be persistent across copy-up.
+
+This is done by introducing locks_inode() helper and using it instead of
+file_inode() to get the inode in locking code.  For non-overlayfs the two
+are equivalent, except for an extra pointer dereference in locks_inode().
+
+Since lock operations are in "struct file_operations" we must also make
+sure not to call underlying filesystem's lock operations.  Introcude a
+super block flag MS_NOREMOTELOCK to this effect.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+	Acked-by: Jeff Layton <jlayton@poochiereds.net>
+	Cc: "J. Bruce Fields" <bfields@fieldses.org>
+(cherry picked from commit c568d68341be7030f5647def68851e469b21ca11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/locks.c
+#	include/linux/fs.h
+diff --cc fs/locks.c
+index 187a16e47afd,c1656cff53ee..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -138,7 -137,13 +138,12 @@@
+  #define IS_POSIX(fl)	(fl->fl_flags & FL_POSIX)
+  #define IS_FLOCK(fl)	(fl->fl_flags & FL_FLOCK)
+  #define IS_LEASE(fl)	(fl->fl_flags & (FL_LEASE|FL_DELEG|FL_LAYOUT))
+ -#define IS_OFDLCK(fl)	(fl->fl_flags & FL_OFDLCK)
+  
++ static inline bool is_remote_lock(struct file *filp)
++ {
++ 	return likely(!(filp->f_path.dentry->d_sb->s_flags & MS_NOREMOTELOCK));
++ }
++ 
+  static bool lease_breaking(struct file_lock *fl)
+  {
+  	return fl->fl_flags & (FL_UNLOCK_PENDING | FL_DOWNGRADE_PENDING);
+@@@ -746,22 -795,27 +751,27 @@@ voi
+  posix_test_lock(struct file *filp, struct file_lock *fl)
+  {
+  	struct file_lock *cfl;
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(filp);
+++=======
++ 	struct file_lock_context *ctx;
++ 	struct inode *inode = locks_inode(filp);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  
+ -	ctx = smp_load_acquire(&inode->i_flctx);
+ -	if (!ctx || list_empty_careful(&ctx->flc_posix)) {
+ -		fl->fl_type = F_UNLCK;
+ -		return;
+ -	}
+ -
+ -	spin_lock(&ctx->flc_lock);
+ -	list_for_each_entry(cfl, &ctx->flc_posix, fl_list) {
+ -		if (posix_locks_conflict(fl, cfl)) {
+ -			locks_copy_conflock(fl, cfl);
+ -			if (cfl->fl_nspid)
+ -				fl->fl_pid = pid_vnr(cfl->fl_nspid);
+ -			goto out;
+ -		}
+ +	spin_lock(&inode->i_lock);
+ +	for (cfl = file_inode(filp)->i_flock; cfl; cfl = cfl->fl_next) {
+ +		if (!IS_POSIX(cfl))
+ +			continue;
+ +		if (posix_locks_conflict(fl, cfl))
+ +			break;
+  	}
+ -	fl->fl_type = F_UNLCK;
+ -out:
+ -	spin_unlock(&ctx->flc_lock);
+ +	if (cfl) {
+ +		__locks_copy_lock(fl, cfl);
+ +		if (cfl->fl_nspid)
+ +			fl->fl_pid = pid_vnr(cfl->fl_nspid);
+ +	} else
+ +		fl->fl_type = F_UNLCK;
+ +	spin_unlock(&inode->i_lock);
+  	return;
+  }
+  EXPORT_SYMBOL(posix_test_lock);
+@@@ -1135,7 -1197,7 +1145,11 @@@ static int __posix_lock_file(struct ino
+  int posix_lock_file(struct file *filp, struct file_lock *fl,
+  			struct file_lock *conflock)
+  {
+++<<<<<<< HEAD
+ +	return __posix_lock_file(file_inode(filp), fl, conflock);
+++=======
++ 	return posix_lock_inode(locks_inode(filp), fl, conflock);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  }
+  EXPORT_SYMBOL(posix_lock_file);
+  
+@@@ -1175,10 -1236,15 +1189,16 @@@ EXPORT_SYMBOL(posix_lock_inode_wait)
+   */
+  int locks_mandatory_locked(struct file *file)
+  {
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(file);
+ +	fl_owner_t owner = current->files;
+++=======
++ 	int ret;
++ 	struct inode *inode = locks_inode(file);
++ 	struct file_lock_context *ctx;
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  	struct file_lock *fl;
+  
+ -	ctx = smp_load_acquire(&inode->i_flctx);
+ -	if (!ctx || list_empty_careful(&ctx->flc_posix))
+ -		return 0;
+ -
+  	/*
+  	 * Search the lock list for this inode for any POSIX locks.
+  	 */
+@@@ -1476,14 -1577,18 +1496,29 @@@ EXPORT_SYMBOL(lease_get_mtime)
+  int fcntl_getlease(struct file *filp)
+  {
+  	struct file_lock *fl;
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(filp);
+++=======
++ 	struct inode *inode = locks_inode(filp);
++ 	struct file_lock_context *ctx;
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  	int type = F_UNLCK;
+ -	LIST_HEAD(dispose);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&inode->i_lock);
+ +	time_out_leases(file_inode(filp));
+ +	for (fl = file_inode(filp)->i_flock; fl && IS_LEASE(fl);
+ +			fl = fl->fl_next) {
+ +		if (fl->fl_file == filp) {
+++=======
++ 	ctx = smp_load_acquire(&inode->i_flctx);
++ 	if (ctx && !list_empty_careful(&ctx->flc_lease)) {
++ 		spin_lock(&ctx->flc_lock);
++ 		time_out_leases(inode, &dispose);
++ 		list_for_each_entry(fl, &ctx->flc_lease, fl_list) {
++ 			if (fl->fl_file != filp)
++ 				continue;
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  			type = target_leasetype(fl);
+  			break;
+  		}
+@@@ -1524,11 -1631,13 +1559,16 @@@ check_conflicting_open(const struct den
+  static int
+  generic_add_lease(struct file *filp, long arg, struct file_lock **flp, void **priv)
+  {
+ -	struct file_lock *fl, *my_fl = NULL, *lease;
+ +	struct file_lock *fl, **before, **my_before = NULL, *lease;
+  	struct dentry *dentry = filp->f_path.dentry;
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(filp);
+++=======
++ 	struct inode *inode = dentry->d_inode;
++ 	struct file_lock_context *ctx;
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  	bool is_deleg = (*flp)->fl_flags & FL_DELEG;
+  	int error;
+ -	LIST_HEAD(dispose);
+  
+  	lease = *flp;
+  	trace_generic_add_lease(inode, lease);
+@@@ -1622,19 -1746,30 +1662,26 @@@ out_unlink
+  static int generic_delete_lease(struct file *filp, void *owner)
+  {
+  	int error = -EAGAIN;
+++<<<<<<< HEAD
+ +	struct file_lock *fl, **before;
+ +	struct inode *inode = file_inode(filp);
+++=======
++ 	struct file_lock *fl, *victim = NULL;
++ 	struct inode *inode = locks_inode(filp);
++ 	struct file_lock_context *ctx;
++ 	LIST_HEAD(dispose);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  
+ -	ctx = smp_load_acquire(&inode->i_flctx);
+ -	if (!ctx) {
+ -		trace_generic_delete_lease(inode, NULL);
+ -		return error;
+ -	}
+ -
+ -	spin_lock(&ctx->flc_lock);
+ -	list_for_each_entry(fl, &ctx->flc_lease, fl_list) {
+ -		if (fl->fl_file == filp &&
+ -		    fl->fl_owner == owner) {
+ -			victim = fl;
+ +	for (before = &inode->i_flock;
+ +			((fl = *before) != NULL) && IS_LEASE(fl);
+ +			before = &fl->fl_next) {
+ +		if (fl->fl_file == filp && 
+ +			fl->fl_owner == owner)
+  			break;
+ -		}
+  	}
+ -	trace_generic_delete_lease(inode, victim);
+ -	if (victim)
+ -		error = fl->fl_lmops->lm_change(victim, F_UNLCK, &dispose);
+ -	spin_unlock(&ctx->flc_lock);
+ -	locks_dispose_list(&dispose);
+ +	trace_generic_delete_lease(inode, fl);
+ +	if (fl && IS_LEASE(fl))
+ +		error = fl->fl_lmops->lm_change(before, F_UNLCK);
+  	return error;
+  }
+  
+@@@ -1708,14 -1835,10 +1755,21 @@@ __vfs_setlease(struct file *filp, long 
+  int
+  vfs_setlease(struct file *filp, long arg, struct file_lock **lease, void **priv)
+  {
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(filp);
+ +	int error;
+ +
+ +	spin_lock(&inode->i_lock);
+ +	error = __vfs_setlease(filp, arg, lease, priv);
+ +	spin_unlock(&inode->i_lock);
+ +
+ +	return error;
+++=======
++ 	if (filp->f_op->setlease && is_remote_lock(filp))
++ 		return filp->f_op->setlease(filp, arg, lease, priv);
++ 	else
++ 		return generic_setlease(filp, arg, lease, priv);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  }
+  EXPORT_SYMBOL_GPL(vfs_setlease);
+  
+@@@ -1855,7 -1984,7 +1909,11 @@@ SYSCALL_DEFINE2(flock, unsigned int, fd
+  	if (error)
+  		goto out_free;
+  
+++<<<<<<< HEAD
+ +	if (f.file->f_op && f.file->f_op->flock)
+++=======
++ 	if (f.file->f_op->flock && is_remote_lock(f.file))
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  		error = f.file->f_op->flock(f.file,
+  					  (can_sleep) ? F_SETLKW : F_SETLK,
+  					  lock);
+@@@ -1881,7 -2010,7 +1939,11 @@@
+   */
+  int vfs_test_lock(struct file *filp, struct file_lock *fl)
+  {
+++<<<<<<< HEAD
+ +	if (filp->f_op && filp->f_op->lock)
+++=======
++ 	if (filp->f_op->lock && is_remote_lock(filp))
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  		return filp->f_op->lock(filp, F_GETLK, fl);
+  	posix_test_lock(filp, fl);
+  	return 0;
+@@@ -1993,7 -2134,7 +2055,11 @@@ out
+   */
+  int vfs_lock_file(struct file *filp, unsigned int cmd, struct file_lock *fl, struct file_lock *conf)
+  {
+++<<<<<<< HEAD
+ +	if (filp->f_op && filp->f_op->lock)
+++=======
++ 	if (filp->f_op->lock && is_remote_lock(filp))
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  		return filp->f_op->lock(filp, cmd, fl);
+  	else
+  		return posix_lock_file(filp, fl, conf);
+@@@ -2039,6 -2196,8 +2105,11 @@@ int fcntl_setlk(unsigned int fd, struc
+  	if (file_lock == NULL)
+  		return -ENOLCK;
+  
+++<<<<<<< HEAD
+++=======
++ 	inode = locks_inode(filp);
++ 
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  	/*
+  	 * This might block, so we do it before checking the inode.
+  	 */
+@@@ -2226,14 -2430,18 +2297,24 @@@ out
+   */
+  void locks_remove_posix(struct file *filp, fl_owner_t owner)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int error;
++ 	struct inode *inode = locks_inode(filp);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  	struct file_lock lock;
+ -	struct file_lock_context *ctx;
+  
+  	/*
+  	 * If there are no locks held on this file, we don't need to call
+  	 * posix_lock_file().  Another process could be setting a lock on this
+  	 * file at the same time, but we wouldn't remove that lock anyway.
+  	 */
+++<<<<<<< HEAD
+ +	if (!file_inode(filp)->i_flock)
+++=======
++ 	ctx =  smp_load_acquire(&inode->i_flctx);
++ 	if (!ctx || list_empty(&ctx->flc_posix))
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  		return;
+  
+  	lock.fl_type = F_UNLCK;
+@@@ -2250,66 -2458,74 +2331,122 @@@
+  
+  	if (lock.fl_ops && lock.fl_ops->fl_release_private)
+  		lock.fl_ops->fl_release_private(&lock);
+++<<<<<<< HEAD
+++=======
++ 	trace_locks_remove_posix(inode, &lock, error);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  }
+  
+  EXPORT_SYMBOL(locks_remove_posix);
+  
+++<<<<<<< HEAD
+++=======
++ /* The i_flctx must be valid when calling into here */
++ static void
++ locks_remove_flock(struct file *filp, struct file_lock_context *flctx)
++ {
++ 	struct file_lock fl = {
++ 		.fl_owner = filp,
++ 		.fl_pid = current->tgid,
++ 		.fl_file = filp,
++ 		.fl_flags = FL_FLOCK,
++ 		.fl_type = F_UNLCK,
++ 		.fl_end = OFFSET_MAX,
++ 	};
++ 	struct inode *inode = locks_inode(filp);
++ 
++ 	if (list_empty(&flctx->flc_flock))
++ 		return;
++ 
++ 	if (filp->f_op->flock && is_remote_lock(filp))
++ 		filp->f_op->flock(filp, F_SETLKW, &fl);
++ 	else
++ 		flock_lock_inode(inode, &fl);
++ 
++ 	if (fl.fl_ops && fl.fl_ops->fl_release_private)
++ 		fl.fl_ops->fl_release_private(&fl);
++ }
++ 
++ /* The i_flctx must be valid when calling into here */
++ static void
++ locks_remove_lease(struct file *filp, struct file_lock_context *ctx)
++ {
++ 	struct file_lock *fl, *tmp;
++ 	LIST_HEAD(dispose);
++ 
++ 	if (list_empty(&ctx->flc_lease))
++ 		return;
++ 
++ 	spin_lock(&ctx->flc_lock);
++ 	list_for_each_entry_safe(fl, tmp, &ctx->flc_lease, fl_list)
++ 		if (filp == fl->fl_file)
++ 			lease_modify(fl, F_UNLCK, &dispose);
++ 	spin_unlock(&ctx->flc_lock);
++ 	locks_dispose_list(&dispose);
++ }
++ 
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  /*
+   * This function is called on the last close of an open file.
+   */
+ -void locks_remove_file(struct file *filp)
+ +void locks_remove_flock(struct file *filp)
+  {
+ -	struct file_lock_context *ctx;
+ +	struct inode * inode = file_inode(filp);
+ +	struct file_lock *fl;
+ +	struct file_lock **before;
+  
+++<<<<<<< HEAD
+ +	if (!inode->i_flock)
+++=======
++ 	ctx = smp_load_acquire(&locks_inode(filp)->i_flctx);
++ 	if (!ctx)
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  		return;
+  
+ -	/* remove any OFD locks */
+ -	locks_remove_posix(filp, filp);
+ +	if (filp->f_op && filp->f_op->flock) {
+ +		struct file_lock fl = {
+ +			.fl_pid = current->tgid,
+ +			.fl_file = filp,
+ +			.fl_flags = FL_FLOCK,
+ +			.fl_type = F_UNLCK,
+ +			.fl_end = OFFSET_MAX,
+ +		};
+ +		filp->f_op->flock(filp, F_SETLKW, &fl);
+ +		if (fl.fl_ops && fl.fl_ops->fl_release_private)
+ +			fl.fl_ops->fl_release_private(&fl);
+ +	}
+  
+ -	/* remove flock locks */
+ -	locks_remove_flock(filp, ctx);
+ +	spin_lock(&inode->i_lock);
+ +	before = &inode->i_flock;
+  
+ -	/* remove any leases */
+ -	locks_remove_lease(filp, ctx);
+ +	while ((fl = *before) != NULL) {
+ +		if (fl->fl_file == filp) {
+ +			if (IS_LEASE(fl)) {
+ +				lease_modify(before, F_UNLCK);
+ +				continue;
+ +			}
+ +
+ +			/*
+ +			 * There's a leftover lock on the list of a type that
+ +			 * we didn't expect to see. Most likely a classic
+ +			 * POSIX lock that ended up not getting released
+ +			 * properly, or that raced onto the list somehow. Log
+ +			 * some info about it and then just remove it from
+ +			 * the list.
+ +			 */
+ +			WARN(!IS_FLOCK(fl),
+ +				"leftover lock: dev=%u:%u ino=%lu type=%hhd flags=0x%x start=%lld end=%lld\n",
+ +				MAJOR(inode->i_sb->s_dev),
+ +				MINOR(inode->i_sb->s_dev), inode->i_ino,
+ +				fl->fl_type, fl->fl_flags,
+ +				fl->fl_start, fl->fl_end);
+ +
+ +			locks_delete_lock(before);
+ +			continue;
+ + 		}
+ +		before = &fl->fl_next;
+ +	}
+ +	spin_unlock(&inode->i_lock);
+  }
+  
+  /**
+@@@ -2342,7 -2558,7 +2479,11 @@@ EXPORT_SYMBOL(posix_unblock_lock)
+   */
+  int vfs_cancel_lock(struct file *filp, struct file_lock *fl)
+  {
+++<<<<<<< HEAD
+ +	if (filp->f_op && filp->f_op->lock)
+++=======
++ 	if (filp->f_op->lock && is_remote_lock(filp))
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  		return filp->f_op->lock(filp, F_CANCELLK, fl);
+  	return 0;
+  }
+@@@ -2444,16 -2665,13 +2585,21 @@@ static int locks_show(struct seq_file *
+  	return 0;
+  }
+  
+ -static void __show_fd_locks(struct seq_file *f,
+ -			struct list_head *head, int *id,
+ -			struct file *filp, struct files_struct *files)
+ +void show_fd_locks(struct seq_file *f,
+ +		  struct file *filp, struct files_struct *files)
+  {
+ -	struct file_lock *fl;
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(filp);
+ +	struct file_lock **before, *fl;
+++=======
+++	struct inode *inode = locks_inode(filp);
+++	struct file_lock_context *ctx;
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+ +	int id = 0;
+  
+ -	list_for_each_entry(fl, head, fl_list) {
+ +	spin_lock(&inode->i_lock);
+ +	for_each_lock(inode, before) {
+ +		fl = *before;
+  
+  		if (filp != fl->fl_file)
+  			continue;
+diff --cc include/linux/fs.h
+index 98b7caca3399,8ee0f011547f..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1078,8 -1065,20 +1078,20 @@@ struct file_lock 
+  
+  extern void send_sigio(struct fown_struct *fown, int fd, int band);
+  
++ /*
++  * Return the inode to use for locking
++  *
++  * For overlayfs this should be the overlay inode, not the real inode returned
++  * by file_inode().  For any other fs file_inode(filp) and locks_inode(filp) are
++  * equal.
++  */
++ static inline struct inode *locks_inode(const struct file *f)
++ {
++ 	return f->f_path.dentry->d_inode;
++ }
++ 
+  #ifdef CONFIG_FILE_LOCKING
+ -extern int fcntl_getlk(struct file *, unsigned int, struct flock __user *);
+ +extern int fcntl_getlk(struct file *, struct flock __user *);
+  extern int fcntl_setlk(unsigned int, struct file *, unsigned int,
+  			struct flock __user *);
+  
+@@@ -1271,14 -1257,14 +1283,18 @@@ static inline struct inode *file_inode(
+  	return f->f_inode;
+  }
+  
+ -static inline struct dentry *file_dentry(const struct file *file)
+ +static inline int posix_lock_file_wait(struct file *filp, struct file_lock *fl)
+  {
+ -	return d_real(file->f_path.dentry, file_inode(file), 0);
+ +	return posix_lock_inode_wait(file_inode(filp), fl);
+  }
+  
+ -static inline int locks_lock_file_wait(struct file *filp, struct file_lock *fl)
+ +static inline int flock_lock_file_wait(struct file *filp, struct file_lock *fl)
+  {
+++<<<<<<< HEAD
+ +	return flock_lock_inode_wait(file_inode(filp), fl);
+++=======
++ 	return locks_lock_inode_wait(locks_inode(filp), fl);
+++>>>>>>> c568d68341be (locks: fix file locking on overlayfs)
+  }
+  
+  struct fasync_struct {
+* Unmerged path fs/locks.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 9440b6a5a3d4..a222d0dc0cf1 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2399,7 +2399,7 @@ long do_mount(const char *dev_name, const char *dir_name,
+ 
+ 	flags &= ~(MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_ACTIVE | MS_BORN |
+ 		   MS_NOATIME | MS_NODIRATIME | MS_RELATIME| MS_KERNMOUNT |
+-		   MS_STRICTATIME);
++		   MS_STRICTATIME | MS_NOREMOTELOCK);
+ 
+ 	if (flags & MS_REMOUNT)
+ 		retval = do_remount(&path, flags & ~MS_REMOUNT, mnt_flags,
+diff --git a/fs/open.c b/fs/open.c
+index 7cf04f99b5f5..9b9e48e5ba2e 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -738,7 +738,7 @@ static int do_dentry_open(struct file *f,
+ 	if (error)
+ 		goto cleanup_all;
+ 
+-	error = break_lease(inode, f->f_flags);
++	error = break_lease(locks_inode(f), f->f_flags);
+ 	if (error)
+ 		goto cleanup_all;
+ 
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 618b25c3dfcd..b7113744be38 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -1321,7 +1321,7 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+ 	sb->s_xattr = ovl_xattr_handlers;
+ 	sb->s_root = root_dentry;
+ 	sb->s_fs_info = ufs;
+-	sb->s_flags |= MS_POSIXACL;
++	sb->s_flags |= MS_POSIXACL | MS_NOREMOTELOCK;
+ 
+ 	return 0;
+ 
+* Unmerged path include/linux/fs.h
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 83d19dfecb76..ac600ceb61b0 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -92,6 +92,7 @@ struct inodes_stat_t {
+ #define MS_STRICTATIME	(1<<24) /* Always perform atime updates */
+ 
+ /* These sb flags are internal to the kernel */
++#define MS_NOREMOTELOCK	(1<<27)
+ #define MS_NOSEC	(1<<28)
+ #define MS_BORN		(1<<29)
+ #define MS_ACTIVE	(1<<30)
