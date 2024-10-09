@@ -1,0 +1,109 @@
+mm/migrate.c: stabilise page count when migrating transparent hugepages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] migrate.c: stabilise page count when migrating transparent hugepages (Andrea Arcangeli) [1636066]
+Rebuild_FUZZ: 97.84%
+commit-author Will Deacon <will.deacon@arm.com>
+commit f4e177d12686bf98b5a047b5187121a71ee0dd8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f4e177d1.failed
+
+When migrating a transparent hugepage, migrate_misplaced_transhuge_page
+guards itself against a concurrent fastgup of the page by checking that
+the page count is equal to 2 before and after installing the new pmd.
+
+If the page count changes, then the pmd is reverted back to the original
+entry, however there is a small window where the new (possibly writable)
+pmd is installed and the underlying page could be written by userspace.
+Restoring the old pmd could therefore result in loss of data.
+
+This patch fixes the problem by freezing the page count whilst updating
+the page tables, which protects against a concurrent fastgup without the
+need to restore the old pmd in the failure case (since the page count
+can no longer change under our feet).
+
+Link: http://lkml.kernel.org/r/1497349722-6731-4-git-send-email-will.deacon@arm.com
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Steve Capper <steve.capper@arm.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f4e177d12686bf98b5a047b5187121a71ee0dd8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index dc35415df847,627671551873..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1852,20 -1980,7 +1850,24 @@@ int migrate_misplaced_transhuge_page(st
+  		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Traditional migration needs to prepare the memcg charge
+ +	 * transaction early to prevent the old page from being
+ +	 * uncharged when installing migration entries.  Here we can
+ +	 * save the potential rollback and start the charge transfer
+ +	 * only when migration is already known to end successfully.
+ +	 */
+ +	mem_cgroup_prepare_migration(page, new_page, &memcg);
+ +
+ +	init_trans_huge_mmu_gather_count(new_page);
+ +
+ +	orig_entry = *pmd;
+ +	entry = mk_pmd(new_page, vma->vm_page_prot);
+ +	entry = pmd_mkhuge(entry);
+++=======
++ 	entry = mk_huge_pmd(new_page, vma->vm_page_prot);
+++>>>>>>> f4e177d12686 (mm/migrate.c: stabilise page count when migrating transparent hugepages)
+  	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+  
+  	/*
+@@@ -1876,30 -1991,16 +1878,34 @@@
+  	 * guarantee the copy is visible before the pagetable update.
+  	 */
+  	flush_cache_range(vma, mmun_start, mmun_end);
+ -	page_add_anon_rmap(new_page, vma, mmun_start, true);
+ -	pmdp_huge_clear_flush_notify(vma, mmun_start, pmd);
+ +	page_add_new_anon_rmap(new_page, vma, mmun_start);
+ +	pmdp_clear_flush_notify(vma, mmun_start, pmd);
+  	set_pmd_at(mm, mmun_start, pmd, entry);
+ +	flush_tlb_range(vma, mmun_start, mmun_end);
+  	update_mmu_cache_pmd(vma, address, &entry);
+  
+++<<<<<<< HEAD
+ +	if (page_count(page) != 2) {
+ +		set_pmd_at(mm, mmun_start, pmd, orig_entry);
+ +		flush_tlb_range(vma, mmun_start, mmun_end);
+ +		mmu_notifier_invalidate_range(mm, mmun_start, mmun_end);
+ +		update_mmu_cache_pmd(vma, address, &entry);
+ +		page_remove_rmap(new_page);
+ +		goto fail_putback;
+ +	}
+ +
+++=======
++ 	page_ref_unfreeze(page, 2);
+++>>>>>>> f4e177d12686 (mm/migrate.c: stabilise page count when migrating transparent hugepages)
+  	mlock_migrate_page(new_page, page);
+ -	page_remove_rmap(page, true);
+ -	set_page_owner_migrate_reason(new_page, MR_NUMA_MISPLACED);
+ +	page_remove_rmap(page);
+  
+ +	/*
+ +	 * Finish the charge transaction under the page table lock to
+ +	 * prevent split_huge_page() from dividing up the charge
+ +	 * before it's fully transferred to the new page.
+ +	 */
+ +	mem_cgroup_end_migration(memcg, page, new_page, true);
+  	spin_unlock(ptl);
+  	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+  
+* Unmerged path mm/migrate.c
