@@ -1,0 +1,194 @@
+scsi: mpt3sas: Cache enclosure pages during enclosure add.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: Cache enclosure pages during enclosure add (Tomas Henzl) [1513855]
+Rebuild_FUZZ: 93.58%
+commit-author Chaitra P B <chaitra.basappa@broadcom.com>
+commit 22a923c315ba09a83ef88ff1d968413d9dd8fb75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/22a923c3.failed
+
+In function _scsih_add_device, for each device connected to an
+enclosure, driver reads the enclosure page(To get details like enclosure
+handle, enclosure logical ID, enclosure level etc.)
+
+With this patch, instead of reading enclosure page everytime, driver
+maintains a list for enclosure device(During enclosure add event,
+enclosure device is added to the list and removed from the list on
+delete events) and uses the enclosure page from the list.
+
+	Signed-off-by: Chaitra P B <chaitra.basappa@broadcom.com>
+	Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 22a923c315ba09a83ef88ff1d968413d9dd8fb75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_scsih.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index 56509c7a0096,27cc2e827472..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@@ -6292,12 -6092,12 +6284,21 @@@ _scsih_add_device(struct MPT3SAS_ADAPTE
+  	}
+  
+  	if (sas_device_pg0.EnclosureHandle) {
+++<<<<<<< HEAD
+ +		encl_pg0_rc = mpt3sas_config_get_enclosure_pg0(ioc, &mpi_reply,
+ +		    &enclosure_pg0, MPI2_SAS_ENCLOS_PGAD_FORM_HANDLE,
+ +		    sas_device_pg0.EnclosureHandle);
+ +		if (encl_pg0_rc)
+ +			pr_info(MPT3SAS_FMT
+ +			    "Enclosure Pg0 read failed for handle(0x%04x)\n",
+++=======
++ 		enclosure_dev =
++ 			mpt3sas_scsih_enclosure_find_by_handle(ioc,
++ 			    le16_to_cpu(sas_device_pg0.EnclosureHandle));
++ 		if (enclosure_dev == NULL)
++ 			pr_info(MPT3SAS_FMT "Enclosure handle(0x%04x)"
++ 			    "doesn't match with enclosure device!\n",
+++>>>>>>> 22a923c315ba (scsi: mpt3sas: Cache enclosure pages during enclosure add.)
+  			    ioc->name, sas_device_pg0.EnclosureHandle);
+  	}
+  
+@@@ -8581,12 -8433,23 +8631,22 @@@ Mpi2SasDevicePage0_t *sas_device_pg0
+  	struct MPT3SAS_TARGET *sas_target_priv_data = NULL;
+  	struct scsi_target *starget;
+  	struct _sas_device *sas_device = NULL;
++ 	struct _enclosure_node *enclosure_dev = NULL;
+  	unsigned long flags;
+  
++ 	if (sas_device_pg0->EnclosureHandle) {
++ 		enclosure_dev =
++ 			mpt3sas_scsih_enclosure_find_by_handle(ioc,
++ 				le16_to_cpu(sas_device_pg0->EnclosureHandle));
++ 		if (enclosure_dev == NULL)
++ 			pr_info(MPT3SAS_FMT "Enclosure handle(0x%04x)"
++ 			    "doesn't match with enclosure device!\n",
++ 			    ioc->name, sas_device_pg0->EnclosureHandle);
++ 	}
+  	spin_lock_irqsave(&ioc->sas_device_lock, flags);
+  	list_for_each_entry(sas_device, &ioc->sas_device_list, list) {
+ -		if ((sas_device->sas_address == le64_to_cpu(
+ -		    sas_device_pg0->SASAddress)) && (sas_device->slot ==
+ -		    le16_to_cpu(sas_device_pg0->Slot))) {
+ +		if ((sas_device->sas_address == sas_device_pg0->SASAddress) &&
+ +			(sas_device->slot == sas_device_pg0->Slot)) {
+  			sas_device->responding = 1;
+  			starget = sas_device->starget;
+  			if (starget && starget->hostdata) {
+@@@ -8621,10 -8484,22 +8681,21 @@@
+  				sas_device->connector_name[0] = '\0';
+  			}
+  
+- 			_scsih_get_enclosure_logicalid_chassis_slot(ioc,
+- 			    sas_device_pg0, sas_device);
++ 			sas_device->enclosure_handle =
++ 				le16_to_cpu(sas_device_pg0->EnclosureHandle);
++ 			sas_device->is_chassis_slot_valid = 0;
++ 			if (enclosure_dev) {
++ 				sas_device->enclosure_logical_id = le64_to_cpu(
++ 					enclosure_dev->pg0.EnclosureLogicalID);
++ 				if (le16_to_cpu(enclosure_dev->pg0.Flags) &
++ 				    MPI2_SAS_ENCLS0_FLAGS_CHASSIS_SLOT_VALID) {
++ 					sas_device->is_chassis_slot_valid = 1;
++ 					sas_device->chassis_slot =
++ 						enclosure_dev->pg0.ChassisSlot;
++ 				}
++ 			}
+  
+ -			if (sas_device->handle == le16_to_cpu(
+ -			    sas_device_pg0->DevHandle))
+ +			if (sas_device->handle == sas_device_pg0->DevHandle)
+  				goto out;
+  			pr_info("\thandle changed from(0x%04x)!!!\n",
+  			    sas_device->handle);
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index e6e6c83b1c99..3bfd4aa85228 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -3218,6 +3218,27 @@ _base_static_config_pages(struct MPT3SAS_ADAPTER *ioc)
+ 		ioc->temp_sensors_count = ioc->iounit_pg8.NumSensors;
+ }
+ 
++/**
++ * mpt3sas_free_enclosure_list - release memory
++ * @ioc: per adapter object
++ *
++ * Free memory allocated during encloure add.
++ *
++ * Return nothing.
++ */
++void
++mpt3sas_free_enclosure_list(struct MPT3SAS_ADAPTER *ioc)
++{
++	struct _enclosure_node *enclosure_dev, *enclosure_dev_next;
++
++	/* Free enclosure list */
++	list_for_each_entry_safe(enclosure_dev,
++			enclosure_dev_next, &ioc->enclosure_list, list) {
++		list_del(&enclosure_dev->list);
++		kfree(enclosure_dev);
++	}
++}
++
+ /**
+  * _base_release_memory_pools - release memory
+  * @ioc: per adapter object
+@@ -5698,6 +5719,7 @@ mpt3sas_base_detach(struct MPT3SAS_ADAPTER *ioc)
+ 	mpt3sas_base_stop_watchdog(ioc);
+ 	mpt3sas_base_free_resources(ioc);
+ 	_base_release_memory_pools(ioc);
++	mpt3sas_free_enclosure_list(ioc);
+ 	pci_set_drvdata(ioc->pdev, NULL);
+ 	kfree(ioc->cpu_msix_table);
+ 	if (ioc->is_warpdrive)
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index 36dd7b003641..d0036761d90b 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -726,6 +726,17 @@ struct _sas_node {
+ 	struct list_head sas_port_list;
+ };
+ 
++
++/**
++ * struct _enclosure_node - enclosure information
++ * @list: list of enclosures
++ * @pg0: enclosure pg0;
++ */
++struct _enclosure_node {
++	struct list_head list;
++	Mpi2SasEnclosurePage0_t pg0;
++};
++
+ /**
+  * enum reset_type - reset state
+  * @FORCE_BIG_HAMMER: issue diagnostic reset
+@@ -979,6 +990,7 @@ typedef void (*MPT3SAS_FLUSH_RUNNING_CMDS)(struct MPT3SAS_ADAPTER *ioc);
+  * @iounit_pg8: static iounit page 8
+  * @sas_hba: sas host object
+  * @sas_expander_list: expander object list
++ * @enclosure_list: enclosure object list
+  * @sas_node_lock:
+  * @sas_device_list: sas device object list
+  * @sas_device_init_list: sas device object list (used only at init time)
+@@ -1181,6 +1193,7 @@ struct MPT3SAS_ADAPTER {
+ 	/* sas hba, expander, and device list */
+ 	struct _sas_node sas_hba;
+ 	struct list_head sas_expander_list;
++	struct list_head enclosure_list;
+ 	spinlock_t	sas_node_lock;
+ 	struct list_head sas_device_list;
+ 	struct list_head sas_device_init_list;
+@@ -1349,6 +1362,7 @@ int mpt3sas_base_attach(struct MPT3SAS_ADAPTER *ioc);
+ void mpt3sas_base_detach(struct MPT3SAS_ADAPTER *ioc);
+ int mpt3sas_base_map_resources(struct MPT3SAS_ADAPTER *ioc);
+ void mpt3sas_base_free_resources(struct MPT3SAS_ADAPTER *ioc);
++void mpt3sas_free_enclosure_list(struct MPT3SAS_ADAPTER *ioc);
+ int mpt3sas_base_hard_reset_handler(struct MPT3SAS_ADAPTER *ioc,
+ 	enum reset_type type);
+ 
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_scsih.c
