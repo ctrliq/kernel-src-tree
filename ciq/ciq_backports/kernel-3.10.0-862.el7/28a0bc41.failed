@@ -1,0 +1,131 @@
+scsi: sd: Implement blacklist option for WRITE SAME w/ UNMAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] sd: Implement blacklist option for WRITE SAME w/ UNMAP (Ewan Milne) [1462594]
+Rebuild_FUZZ: 94.74%
+commit-author Martin K. Petersen <martin.petersen@oracle.com>
+commit 28a0bc4120d38a394499382ba21d6965a67a3703
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/28a0bc41.failed
+
+SBC-4 states:
+
+  "A MAXIMUM UNMAP LBA COUNT field set to a non-zero value indicates the
+   maximum number of LBAs that may be unmapped by an UNMAP command"
+
+  "A MAXIMUM WRITE SAME LENGTH field set to a non-zero value indicates
+   the maximum number of contiguous logical blocks that the device server
+   allows to be unmapped or written in a single WRITE SAME command."
+
+Despite the spec being clear on the topic, some devices incorrectly
+expect WRITE SAME commands with the UNMAP bit set to be limited to the
+value reported in MAXIMUM UNMAP LBA COUNT in the Block Limits VPD.
+
+Implement a blacklist option that can be used to accommodate devices
+with this behavior.
+
+	Cc: <stable@vger.kernel.org>
+	Reported-by: Bill Kuzeja <William.Kuzeja@stratus.com>
+	Reported-by: Ewan D. Milne <emilne@redhat.com>
+	Reviewed-by: Ewan D. Milne <emilne@redhat.com>
+	Tested-by: Laurence Oberman <loberman@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 28a0bc4120d38a394499382ba21d6965a67a3703)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.c
+#	include/scsi/scsi_device.h
+diff --cc drivers/scsi/sd.c
+index 7946b9cf724f,3d26a729825c..000000000000
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@@ -658,15 -715,21 +658,33 @@@ static void sd_config_discard(struct sc
+  		break;
+  
+  	case SD_LBP_WS16:
+++<<<<<<< HEAD
+ +		max_blocks = min_not_zero(sdkp->max_ws_blocks,
+ +					  (u32)SD_MAX_WS16_BLOCKS);
+ +		q->limits.discard_zeroes_data = sdkp->lbprz;
+ +		break;
+ +
+ +	case SD_LBP_WS10:
+ +		max_blocks = min_not_zero(sdkp->max_ws_blocks,
+ +					  (u32)SD_MAX_WS10_BLOCKS);
+ +		q->limits.discard_zeroes_data = sdkp->lbprz;
+++=======
++ 		if (sdkp->device->unmap_limit_for_ws)
++ 			max_blocks = sdkp->max_unmap_blocks;
++ 		else
++ 			max_blocks = sdkp->max_ws_blocks;
++ 
++ 		max_blocks = min_not_zero(max_blocks, (u32)SD_MAX_WS16_BLOCKS);
++ 		break;
++ 
++ 	case SD_LBP_WS10:
++ 		if (sdkp->device->unmap_limit_for_ws)
++ 			max_blocks = sdkp->max_unmap_blocks;
++ 		else
++ 			max_blocks = sdkp->max_ws_blocks;
++ 
++ 		max_blocks = min_not_zero(max_blocks, (u32)SD_MAX_WS10_BLOCKS);
+++>>>>>>> 28a0bc4120d3 (scsi: sd: Implement blacklist option for WRITE SAME w/ UNMAP)
+  		break;
+  
+  	case SD_LBP_ZERO:
+diff --cc include/scsi/scsi_device.h
+index 9080d387cc1d,67c5a9f223f7..000000000000
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@@ -179,16 -191,8 +179,21 @@@ struct scsi_device 
+  	unsigned wce_default_on:1;	/* Cache is ON by default */
+  	unsigned no_dif:1;	/* T10 PI (DIF) should be disabled */
+  	unsigned broken_fua:1;		/* Don't set FUA bit */
+++<<<<<<< HEAD
+ +
+ +	/* FOR RH USE ONLY
+ +	 *
+ +	 * The following padding has been inserted before ABI freeze to
+ +	 * allow extending the structure while preserving ABI.
+ +	 */
+ +	unsigned vpd_reserved:1;
+ +	unsigned xcopy_reserved:1;
+ +	RH_KABI_FILL_HOLE(unsigned lun_in_cdb:1) /* Store LUN bits in CDB[1] */
+ +	RH_KABI_FILL_HOLE(unsigned try_vpd_pages:1)	/* attempt to read VPD pages */
+++=======
++ 	unsigned lun_in_cdb:1;		/* Store LUN bits in CDB[1] */
++ 	unsigned unmap_limit_for_ws:1;	/* Use the UNMAP limit for WRITE SAME */
+++>>>>>>> 28a0bc4120d3 (scsi: sd: Implement blacklist option for WRITE SAME w/ UNMAP)
+  
+  	atomic_t disk_events_disable_depth; /* disable depth for disk events */
+  
+diff --git a/drivers/scsi/scsi_scan.c b/drivers/scsi/scsi_scan.c
+index 174fec83cdc5..657a543e10b7 100644
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@ -983,6 +983,9 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
+ 	if (*bflags & BLIST_NO_DIF)
+ 		sdev->no_dif = 1;
+ 
++	if (*bflags & BLIST_UNMAP_LIMIT_WS)
++		sdev->unmap_limit_for_ws = 1;
++
+ 	sdev->eh_timeout = SCSI_DEFAULT_EH_TIMEOUT;
+ 
+ 	if (*bflags & BLIST_TRY_VPD_PAGES)
+* Unmerged path drivers/scsi/sd.c
+* Unmerged path include/scsi/scsi_device.h
+diff --git a/include/scsi/scsi_devinfo.h b/include/scsi/scsi_devinfo.h
+index c67cd3ea5564..efe9e82c29e3 100644
+--- a/include/scsi/scsi_devinfo.h
++++ b/include/scsi/scsi_devinfo.h
+@@ -35,5 +35,6 @@
+ #define BLIST_TRY_VPD_PAGES	0x10000000 /* Attempt to read VPD pages */
+ #define BLIST_NO_RSOC		0x20000000 /* don't try to issue RSOC */
+ #define BLIST_MAX_1024		0x40000000 /* maximum 1024 sector cdb length */
++#define BLIST_UNMAP_LIMIT_WS	0x80000000 /* Use UNMAP limit for WRITE SAME */
+ 
+ #endif
