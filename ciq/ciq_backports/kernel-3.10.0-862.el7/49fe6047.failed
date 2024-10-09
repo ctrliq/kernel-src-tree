@@ -1,0 +1,210 @@
+sysfs: prepare open path for unified regular / bin file handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 49fe604781cbb03eb6ff12a7bc4ad8eef8b830c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/49fe6047.failed
+
+sysfs bin file handling will be merged into the regular file support.
+This patch prepares the open path.
+
+This patch updates sysfs_open_file() such that it can handle both
+regular and bin files.
+
+This is a preparation and the new bin file path isn't used yet.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 49fe604781cbb03eb6ff12a7bc4ad8eef8b830c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,417d005955d9..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -331,59 -609,71 +331,96 @@@ static int sysfs_open_file(struct inod
+  {
+  	struct sysfs_dirent *attr_sd = file->f_path.dentry->d_fsdata;
+  	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+++<<<<<<< HEAD
+ +	struct sysfs_buffer *buffer;
+ +	const struct sysfs_ops *ops;
+++=======
++ 	struct sysfs_open_file *of;
++ 	bool has_read, has_write;
+++>>>>>>> 49fe604781cb (sysfs: prepare open path for unified regular / bin file handling)
+  	int error = -EACCES;
+  
+  	/* need attr_sd for attr and ops, its parent for kobj */
+  	if (!sysfs_get_active(attr_sd))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	/* every kobject with an attribute needs a ktype assigned */
+ +	if (kobj->ktype && kobj->ktype->sysfs_ops)
+ +		ops = kobj->ktype->sysfs_ops;
+ +	else {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs attribute operations for kobject: %s\n",
+ +		     kobject_name(kobj));
+- 		goto err_out;
+- 	}
+++=======
++ 	if (sysfs_is_bin(attr_sd)) {
++ 		struct bin_attribute *battr = attr_sd->s_bin_attr.bin_attr;
+  
+- 	/* File needs write support.
+- 	 * The inode's perms must say it's ok,
+- 	 * and we must have a store method.
+- 	 */
+- 	if (file->f_mode & FMODE_WRITE) {
+- 		if (!(inode->i_mode & S_IWUGO) || !ops->store)
++ 		has_read = battr->read || battr->mmap;
++ 		has_write = battr->write || battr->mmap;
++ 	} else {
++ 		const struct sysfs_ops *ops = sysfs_file_ops(attr_sd);
++ 
++ 		/* every kobject with an attribute needs a ktype assigned */
++ 		if (WARN(!ops, KERN_ERR
++ 			 "missing sysfs attribute operations for kobject: %s\n",
++ 			 kobject_name(kobj)))
+  			goto err_out;
++ 
++ 		has_read = ops->show;
++ 		has_write = ops->store;
+  	}
+  
+- 	/* File needs read support.
+- 	 * The inode's perms must say it's ok, and we there
+- 	 * must be a show method for it.
+- 	 */
+- 	if (file->f_mode & FMODE_READ) {
+- 		if (!(inode->i_mode & S_IRUGO) || !ops->show)
+- 			goto err_out;
++ 	/* check perms and supported operations */
++ 	if ((file->f_mode & FMODE_WRITE) &&
++ 	    (!(inode->i_mode & S_IWUGO) || !has_write))
+++>>>>>>> 49fe604781cb (sysfs: prepare open path for unified regular / bin file handling)
++ 		goto err_out;
+ +	}
+  
++ 	if ((file->f_mode & FMODE_READ) &&
++ 	    (!(inode->i_mode & S_IRUGO) || !has_read))
++ 		goto err_out;
++ 
+ -	/* allocate a sysfs_open_file for the file */
+ +	/* No error? Great, allocate a buffer for the file, and store it
+ +	 * it in file->private_data for easy access.
+ +	 */
+  	error = -ENOMEM;
+ -	of = kzalloc(sizeof(struct sysfs_open_file), GFP_KERNEL);
+ -	if (!of)
+ +	buffer = kzalloc(sizeof(struct sysfs_buffer), GFP_KERNEL);
+ +	if (!buffer)
+  		goto err_out;
+  
+++<<<<<<< HEAD
+ +	mutex_init(&buffer->mutex);
+ +	buffer->needs_read_fill = 1;
+ +	buffer->ops = ops;
+ +	file->private_data = buffer;
+++=======
++ 	mutex_init(&of->mutex);
++ 	of->sd = attr_sd;
++ 	of->file = file;
++ 
++ 	/*
++ 	 * Always instantiate seq_file even if read access doesn't use
++ 	 * seq_file or is not requested.  This unifies private data access
++ 	 * and readable regular files are the vast majority anyway.
++ 	 */
++ 	if (sysfs_is_bin(attr_sd))
++ 		error = single_open(file, NULL, of);
++ 	else
++ 		error = single_open(file, sysfs_seq_show, of);
++ 	if (error)
++ 		goto err_free;
++ 
++ 	/* seq_file clears PWRITE unconditionally, restore it if WRITE */
++ 	if (file->f_mode & FMODE_WRITE)
++ 		file->f_mode |= FMODE_PWRITE;
+++>>>>>>> 49fe604781cb (sysfs: prepare open path for unified regular / bin file handling)
+  
+  	/* make sure we have open dirent struct */
+ -	error = sysfs_get_open_dirent(attr_sd, of);
+ +	error = sysfs_get_open_dirent(attr_sd, buffer);
+  	if (error)
+ -		goto err_close;
+ +		goto err_free;
+  
+  	/* open succeeded, put active references */
+  	sysfs_put_active(attr_sd);
+@@@ -492,47 -807,19 +529,59 @@@ const struct file_operations sysfs_file
+  	.poll		= sysfs_poll,
+  };
+  
+++<<<<<<< HEAD
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+ +{
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+++=======
++ const struct file_operations sysfs_bin_operations = {
++ 	.read		= sysfs_bin_read,
++ 	.write		= sysfs_write_file,
++ 	.llseek		= generic_file_llseek,
++ 	.mmap		= sysfs_bin_mmap,
++ 	.open		= sysfs_open_file,
++ 	.release	= sysfs_release,
++ 	.poll		= sysfs_poll,
++ };
+++>>>>>>> 49fe604781cb (sysfs: prepare open path for unified regular / bin file handling)
+ +
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+ +	}
+ +
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+  
+ -int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
+ -			   const struct attribute *attr, int type,
+ -			   umode_t amode, const void *ns)
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs namespace attribute operation for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +	}
+ +	*pns = ns;
+ +	return err;
+ +}
+ +
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+  {
+  	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+  	struct sysfs_addrm_cxt acxt;
+* Unmerged path fs/sysfs/file.c
