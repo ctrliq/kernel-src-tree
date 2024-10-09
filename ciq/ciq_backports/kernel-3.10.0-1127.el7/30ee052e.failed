@@ -1,0 +1,200 @@
+xfs: optimize inline symlinks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 30ee052e12b97c190b27fe6f20e3ac3047df7b5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/30ee052e.failed
+
+By overallocating the in-core inode fork data buffer and zero
+terminating the link target in xfs_init_local_fork we can avoid
+the memory allocation in ->follow_link.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 30ee052e12b97c190b27fe6f20e3ac3047df7b5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_inode_fork.c
+#	fs/xfs/xfs_iops.c
+#	fs/xfs/xfs_symlink.c
+diff --cc fs/xfs/libxfs/xfs_inode_fork.c
+index 79750475c1a7,4fbe2263c1fc..000000000000
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@@ -157,14 -239,32 +157,41 @@@ xfs_init_local_fork
+  	int			size)
+  {
+  	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
+- 	int			real_size = 0;
++ 	int			mem_size = size, real_size = 0;
++ 	bool			zero_terminate;
+  
++ 	/*
++ 	 * If we are using the local fork to store a symlink body we need to
++ 	 * zero-terminate it so that we can pass it back to the VFS directly.
++ 	 * Overallocate the in-memory fork by one for that and add a zero
++ 	 * to terminate it below.
++ 	 */
++ 	zero_terminate = S_ISLNK(VFS_I(ip)->i_mode);
++ 	if (zero_terminate)
++ 		mem_size++;
++ 
+++<<<<<<< HEAD
+ +	if (size) {
+ +		real_size = roundup(size, 4);
+ +		ifp->if_u1.if_data = kmem_alloc(real_size, KM_SLEEP | KM_NOFS);
+ +		memcpy(ifp->if_u1.if_data, data, size);
+ +	} else {
+ +		ifp->if_u1.if_data = NULL;
+++=======
++ 	if (size == 0)
++ 		ifp->if_u1.if_data = NULL;
++ 	else if (mem_size <= sizeof(ifp->if_u2.if_inline_data))
++ 		ifp->if_u1.if_data = ifp->if_u2.if_inline_data;
++ 	else {
++ 		real_size = roundup(mem_size, 4);
++ 		ifp->if_u1.if_data = kmem_alloc(real_size, KM_SLEEP | KM_NOFS);
++ 	}
++ 
++ 	if (size) {
++ 		memcpy(ifp->if_u1.if_data, data, size);
++ 		if (zero_terminate)
++ 			ifp->if_u1.if_data[size] = '\0';
+++>>>>>>> 30ee052e12b9 (xfs: optimize inline symlinks)
+  	}
+  
+  	ifp->if_bytes = size;
+diff --cc fs/xfs/xfs_iops.c
+index a15780121ecf,aee06d9a7b6c..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -475,22 -443,19 +475,32 @@@ xfs_vn_follow_link
+   out_kfree:
+  	kfree(link);
+   out_err:
+ -	return ERR_PTR(error);
+ +	nd_set_link(nd, ERR_PTR(error));
+ +	return NULL;
+ +}
+ +
+ +STATIC void
+ +xfs_vn_put_link(
+ +	struct dentry	*dentry,
+ +	struct nameidata *nd,
+ +	void		*p)
+ +{
+ +	char		*s = nd_get_link(nd);
+ +
+ +	if (!IS_ERR(s))
+ +		kfree(s);
+  }
+  
++ STATIC const char *
++ xfs_vn_get_link_inline(
++ 	struct dentry		*dentry,
++ 	struct inode		*inode,
++ 	struct delayed_call	*done)
++ {
++ 	ASSERT(XFS_I(inode)->i_df.if_flags & XFS_IFINLINE);
++ 	return XFS_I(inode)->i_df.if_u1.if_data;
++ }
++ 
+  STATIC int
+  xfs_vn_getattr(
+  	struct vfsmount		*mnt,
+@@@ -1185,28 -1181,17 +1195,42 @@@ static const struct inode_operations xf
+  	.update_time		= xfs_vn_update_time,
+  };
+  
+++<<<<<<< HEAD
+ +/* Figure out if this file actually supports DAX. */
+ +static bool
+ +xfs_inode_supports_dax(
+ +	struct xfs_inode	*ip)
+ +{
+ +	struct xfs_mount	*mp = ip->i_mount;
+ +
+ +	/* Only supported on regular files. */
+ +	if (!S_ISREG(VFS_I(ip)->i_mode))
+ +		return false;
+ +
+ +	/* DAX mount option must be set. */
+ +	if (!(mp->m_flags & XFS_MOUNT_DAX))
+ +		return false;
+ +
+ +	/* Block size must match page size */
+ +	if (mp->m_sb.sb_blocksize != PAGE_SIZE)
+ +		return false;
+ +
+ +	/* Device has to support DAX too. */
+ +	return xfs_find_daxdev_for_inode(VFS_I(ip)) != NULL;
+ +}
+++=======
++ static const struct inode_operations xfs_inline_symlink_inode_operations = {
++ 	.readlink		= generic_readlink,
++ 	.get_link		= xfs_vn_get_link_inline,
++ 	.getattr		= xfs_vn_getattr,
++ 	.setattr		= xfs_vn_setattr,
++ 	.setxattr		= generic_setxattr,
++ 	.getxattr		= generic_getxattr,
++ 	.removexattr		= generic_removexattr,
++ 	.listxattr		= xfs_vn_listxattr,
++ 	.update_time		= xfs_vn_update_time,
++ };
+++>>>>>>> 30ee052e12b9 (xfs: optimize inline symlinks)
+  
+  STATIC void
+  xfs_diflags_to_iflags(
+diff --cc fs/xfs/xfs_symlink.c
+index b146e1b434c2,5961c1e880c2..000000000000
+--- a/fs/xfs/xfs_symlink.c
++++ b/fs/xfs/xfs_symlink.c
+@@@ -153,12 -152,7 +155,16 @@@ xfs_readlink
+  	}
+  
+  
+++<<<<<<< HEAD
+ +	if (ip->i_df.if_flags & XFS_IFINLINE) {
+ +		memcpy(link, ip->i_df.if_u1.if_data, pathlen);
+ +		link[pathlen] = '\0';
+ +	} else {
+ +		error = xfs_readlink_bmap_ilocked(ip, link);
+ +	}
+++=======
++ 	error = xfs_readlink_bmap(ip, link);
+++>>>>>>> 30ee052e12b9 (xfs: optimize inline symlinks)
+  
+   out:
+  	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+* Unmerged path fs/xfs/libxfs/xfs_inode_fork.c
+diff --git a/fs/xfs/xfs_inode_item.c b/fs/xfs/xfs_inode_item.c
+index 84b7a18cb89b..ddae9bdf4e08 100644
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@ -206,7 +206,7 @@ xfs_inode_item_format_data_fork(
+ 			 */
+ 			data_bytes = roundup(ip->i_df.if_bytes, 4);
+ 			ASSERT(ip->i_df.if_real_bytes == 0 ||
+-			       ip->i_df.if_real_bytes == data_bytes);
++			       ip->i_df.if_real_bytes >= data_bytes);
+ 			ASSERT(ip->i_df.if_u1.if_data != NULL);
+ 			ASSERT(ip->i_d.di_size > 0);
+ 			xlog_copy_iovec(lv, vecp, XLOG_REG_TYPE_ILOCAL,
+@@ -292,7 +292,7 @@ xfs_inode_item_format_attr_fork(
+ 			 */
+ 			data_bytes = roundup(ip->i_afp->if_bytes, 4);
+ 			ASSERT(ip->i_afp->if_real_bytes == 0 ||
+-			       ip->i_afp->if_real_bytes == data_bytes);
++			       ip->i_afp->if_real_bytes >= data_bytes);
+ 			ASSERT(ip->i_afp->if_u1.if_data != NULL);
+ 			xlog_copy_iovec(lv, vecp, XLOG_REG_TYPE_IATTR_LOCAL,
+ 					ip->i_afp->if_u1.if_data,
+* Unmerged path fs/xfs/xfs_iops.c
+* Unmerged path fs/xfs/xfs_symlink.c
