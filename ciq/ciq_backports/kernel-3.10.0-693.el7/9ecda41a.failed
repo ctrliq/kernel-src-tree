@@ -1,0 +1,361 @@
+perf/core: Add ::write_backward attribute to perf event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 9ecda41acb971ebd07c8fb35faf24005c0baea12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9ecda41a.failed
+
+This patch introduces 'write_backward' bit to perf_event_attr, which
+controls the direction of a ring buffer. After set, the corresponding
+ring buffer is written from end to beginning. This feature is design to
+support reading from overwritable ring buffer.
+
+Ring buffer can be created by mapping a perf event fd. Kernel puts event
+records into ring buffer, user tooling like perf fetch them from
+address returned by mmap(). To prevent racing between kernel and tooling,
+they communicate to each other through 'head' and 'tail' pointers.
+Kernel maintains 'head' pointer, points it to the next free area (tail
+of the last record). Tooling maintains 'tail' pointer, points it to the
+tail of last consumed record (record has already been fetched). Kernel
+determines the available space in a ring buffer using these two
+pointers to avoid overwrite unfetched records.
+
+By mapping without 'PROT_WRITE', an overwritable ring buffer is created.
+Different from normal ring buffer, tooling is unable to maintain 'tail'
+pointer because writing is forbidden. Therefore, for this type of ring
+buffers, kernel overwrite old records unconditionally, works like flight
+recorder. This feature would be useful if reading from overwritable ring
+buffer were as easy as reading from normal ring buffer. However,
+there's an obscure problem.
+
+The following figure demonstrates a full overwritable ring buffer. In
+this figure, the 'head' pointer points to the end of last record, and a
+long record 'E' is pending. For a normal ring buffer, a 'tail' pointer
+would have pointed to position (X), so kernel knows there's no more
+space in the ring buffer. However, for an overwritable ring buffer,
+kernel ignore the 'tail' pointer.
+
+   (X)                              head
+    .                                |
+    .                                V
+    +------+-------+----------+------+---+
+    |A....A|B.....B|C........C|D....D|   |
+    +------+-------+----------+------+---+
+
+Record 'A' is overwritten by event 'E':
+
+      head
+       |
+       V
+    +--+---+-------+----------+------+---+
+    |.E|..A|B.....B|C........C|D....D|E..|
+    +--+---+-------+----------+------+---+
+
+Now tooling decides to read from this ring buffer. However, none of these
+two natural positions, 'head' and the start of this ring buffer, are
+pointing to the head of a record. Even the full ring buffer can be
+accessed by tooling, it is unable to find a position to start decoding.
+
+The first attempt tries to solve this problem AFAIK can be found from
+[1]. It makes kernel to maintain 'tail' pointer: updates it when ring
+buffer is half full. However, this approach introduces overhead to
+fast path. Test result shows a 1% overhead [2]. In addition, this method
+utilizes no more tham 50% records.
+
+Another attempt can be found from [3], which allows putting the size of
+an event at the end of each record. This approach allows tooling to find
+records in a backward manner from 'head' pointer by reading size of a
+record from its tail. However, because of alignment requirement, it
+needs 8 bytes to record the size of a record, which is a huge waste. Its
+performance is also not good, because more data need to be written.
+This approach also introduces some extra branch instructions to fast
+path.
+
+'write_backward' is a better solution to this problem.
+
+Following figure demonstrates the state of the overwritable ring buffer
+when 'write_backward' is set before overwriting:
+
+       head
+        |
+        V
+    +---+------+----------+-------+------+
+    |   |D....D|C........C|B.....B|A....A|
+    +---+------+----------+-------+------+
+
+and after overwriting:
+                                     head
+                                      |
+                                      V
+    +---+------+----------+-------+---+--+
+    |..E|D....D|C........C|B.....B|A..|E.|
+    +---+------+----------+-------+---+--+
+
+In each situation, 'head' points to the beginning of the newest record.
+From this record, tooling can iterate over the full ring buffer and fetch
+records one by one.
+
+The only limitation that needs to be considered is back-to-back reading.
+Due to the non-deterministic of user programs, it is impossible to ensure
+the ring buffer keeps stable during reading. Consider an extreme situation:
+tooling is scheduled out after reading record 'D', then a burst of events
+come, eat up the whole ring buffer (one or multiple rounds). When the
+tooling process comes back, reading after 'D' is incorrect now.
+
+To prevent this problem, we need to find a way to ensure the ring buffer
+is stable during reading. ioctl(PERF_EVENT_IOC_PAUSE_OUTPUT) is
+suggested because its overhead is lower than
+ioctl(PERF_EVENT_IOC_ENABLE).
+
+By carefully verifying 'header' pointer, reader can avoid pausing the
+ring-buffer. For example:
+
+    /* A union of all possible events */
+    union perf_event event;
+
+    p = head = perf_mmap__read_head();
+    while (true) {
+        /* copy header of next event */
+        fetch(&event.header, p, sizeof(event.header));
+
+        /* read 'head' pointer */
+        head = perf_mmap__read_head();
+
+        /* check overwritten: is the header good? */
+        if (!verify(sizeof(event.header), p, head))
+            break;
+
+        /* copy the whole event */
+        fetch(&event, p, event.header.size);
+
+        /* read 'head' pointer again */
+        head = perf_mmap__read_head();
+
+        /* is the whole event good? */
+        if (!verify(event.header.size, p, head))
+            break;
+        p += event.header.size;
+    }
+
+However, the overhead is high because:
+
+ a) In-place decoding is not safe.
+    Copying-verifying-decoding is required.
+ b) Fetching 'head' pointer requires additional synchronization.
+
+(From Alexei Starovoitov:
+
+Even when this trick works, pause is needed for more than stability of
+reading. When we collect the events into overwrite buffer we're waiting
+for some other trigger (like all cpu utilization spike or just one cpu
+running and all others are idle) and when it happens the buffer has
+valuable info from the past. At this point new events are no longer
+interesting and buffer should be paused, events read and unpaused until
+next trigger comes.)
+
+This patch utilizes event's default overflow_handler introduced
+previously. perf_event_output_backward() is created as the default
+overflow handler for backward ring buffers. To avoid extra overhead to
+fast path, original perf_event_output() becomes __perf_event_output()
+and marked '__always_inline'. In theory, there's no extra overhead
+introduced to fast path.
+
+Performance testing:
+
+Calling 3000000 times of 'close(-1)', use gettimeofday() to check
+duration.  Use 'perf record -o /dev/null -e raw_syscalls:*' to capture
+system calls. In ns.
+
+Testing environment:
+
+  CPU    : Intel(R) Core(TM) i7-4790 CPU @ 3.60GHz
+  Kernel : v4.5.0
+                    MEAN         STDVAR
+ BASE            800214.950    2853.083
+ PRE1           2253846.700    9997.014
+ PRE2           2257495.540    8516.293
+ POST           2250896.100    8933.921
+
+Where 'BASE' is pure performance without capturing. 'PRE1' is test
+result of pure 'v4.5.0' kernel. 'PRE2' is test result before this
+patch. 'POST' is test result after this patch. See [4] for the detailed
+experimental setup.
+
+Considering the stdvar, this patch doesn't introduce performance
+overhead to the fast path.
+
+ [1] http://lkml.iu.edu/hypermail/linux/kernel/1304.1/04584.html
+ [2] http://lkml.iu.edu/hypermail/linux/kernel/1307.1/00535.html
+ [3] http://lkml.iu.edu/hypermail/linux/kernel/1512.0/01265.html
+ [4] http://lkml.kernel.org/g/56F89DCD.1040202@huawei.com
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: <acme@kernel.org>
+	Cc: <pi3orama@163.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: Zefan Li <lizefan@huawei.com>
+Link: http://lkml.kernel.org/r/1459865478-53413-1-git-send-email-wangnan0@huawei.com
+[ Fixed the changelog some more. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 9ecda41acb971ebd07c8fb35faf24005c0baea12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/uapi/linux/perf_event.h
+index f2a1c58ccd91,43fc8d213472..000000000000
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@@ -336,14 -337,11 +336,19 @@@ struct perf_event_attr 
+  				exclude_callchain_kernel : 1, /* exclude kernel callchains */
+  				exclude_callchain_user   : 1, /* exclude user callchains */
+  				mmap2          :  1, /* include mmap with inode data     */
+ +
+ +#ifdef __GENKSYMS__
+ +				__reserved_1   : 40;
+ +#else
+  				comm_exec      :  1, /* flag comm events that are due to an exec */
+ -				use_clockid    :  1, /* use @clockid for time fields */
+  				context_switch :  1, /* context switch data */
+++<<<<<<< HEAD
+ +				__reserved_1   : 38;
+ +#endif
+++=======
++ 				write_backward :  1, /* Write ring buffer from end to beginning */
++ 				__reserved_1   : 36;
+++>>>>>>> 9ecda41acb97 (perf/core: Add ::write_backward attribute to perf event)
+  
+  	union {
+  		__u32		wakeup_events;	  /* wakeup every n events */
+diff --cc kernel/events/core.c
+index edfead66c0ba,eabeb2aec00f..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -8199,6 -8414,19 +8230,22 @@@ perf_event_set_output(struct perf_even
+  		goto out;
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * Mixing clocks in the same buffer is trouble you don't need.
++ 	 */
++ 	if (output_event->clock != event->clock)
++ 		goto out;
++ 
++ 	/*
++ 	 * Either writing ring buffer from beginning or from end.
++ 	 * Mixing is not allowed.
++ 	 */
++ 	if (is_write_backward(output_event) != is_write_backward(event))
++ 		goto out;
++ 
++ 	/*
+++>>>>>>> 9ecda41acb97 (perf/core: Add ::write_backward attribute to perf event)
+  	 * If both events generate aux data, they must be on the same PMU
+  	 */
+  	if (has_aux(event) && has_aux(output_event) &&
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 00260788372f..936f84a6dc9d 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -772,14 +772,24 @@ extern int perf_event_overflow(struct perf_event *event,
+ 				 struct perf_sample_data *data,
+ 				 struct pt_regs *regs);
+ 
++extern void perf_event_output_forward(struct perf_event *event,
++				     struct perf_sample_data *data,
++				     struct pt_regs *regs);
++extern void perf_event_output_backward(struct perf_event *event,
++				       struct perf_sample_data *data,
++				       struct pt_regs *regs);
+ extern void perf_event_output(struct perf_event *event,
+-				struct perf_sample_data *data,
+-				struct pt_regs *regs);
++			      struct perf_sample_data *data,
++			      struct pt_regs *regs);
+ 
+ static inline bool
+ is_default_overflow_handler(struct perf_event *event)
+ {
+-	return (event->overflow_handler == perf_event_output);
++	if (likely(event->overflow_handler == perf_event_output_forward))
++		return true;
++	if (unlikely(event->overflow_handler == perf_event_output_backward))
++		return true;
++	return false;
+ }
+ 
+ extern void
+@@ -958,8 +968,20 @@ static inline bool has_aux(struct perf_event *event)
+ 	return event->pmu->setup_aux;
+ }
+ 
++static inline bool is_write_backward(struct perf_event *event)
++{
++	return !!event->attr.write_backward;
++}
++
+ extern int perf_output_begin(struct perf_output_handle *handle,
+ 			     struct perf_event *event, unsigned int size);
++extern int perf_output_begin_forward(struct perf_output_handle *handle,
++				    struct perf_event *event,
++				    unsigned int size);
++extern int perf_output_begin_backward(struct perf_output_handle *handle,
++				      struct perf_event *event,
++				      unsigned int size);
++
+ extern void perf_output_end(struct perf_output_handle *handle);
+ extern unsigned int perf_output_copy(struct perf_output_handle *handle,
+ 			     const void *buf, unsigned int len);
+* Unmerged path include/uapi/linux/perf_event.h
+* Unmerged path kernel/events/core.c
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 242d68ed5175..34c145c51d7c 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -227,10 +227,24 @@ out:
+ 	return -ENOSPC;
+ }
+ 
++int perf_output_begin_forward(struct perf_output_handle *handle,
++			     struct perf_event *event, unsigned int size)
++{
++	return __perf_output_begin(handle, event, size, false);
++}
++
++int perf_output_begin_backward(struct perf_output_handle *handle,
++			       struct perf_event *event, unsigned int size)
++{
++	return __perf_output_begin(handle, event, size, true);
++}
++
+ int perf_output_begin(struct perf_output_handle *handle,
+ 		      struct perf_event *event, unsigned int size)
+ {
+-	return __perf_output_begin(handle, event, size, false);
++
++	return __perf_output_begin(handle, event, size,
++				   unlikely(is_write_backward(event)));
+ }
+ 
+ unsigned int perf_output_copy(struct perf_output_handle *handle,
