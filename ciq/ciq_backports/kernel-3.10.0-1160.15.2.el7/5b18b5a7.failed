@@ -1,0 +1,455 @@
+block: delete part_round_stats and switch to less precise counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.15.2.el7
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 5b18b5a737600fd20ba2045f320d5926ebbf341a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.15.2.el7/5b18b5a7.failed
+
+We want to convert to per-cpu in_flight counters.
+
+The function part_round_stats needs the in_flight counter every jiffy, it
+would be too costly to sum all the percpu variables every jiffy, so it
+must be deleted. part_round_stats is used to calculate two counters -
+time_in_queue and io_ticks.
+
+time_in_queue can be calculated without part_round_stats, by adding the
+duration of the I/O when the I/O ends (the value is almost as exact as the
+previously calculated value, except that time for in-progress I/Os is not
+counted).
+
+io_ticks can be approximated by increasing the value when I/O is started
+or ended and the jiffies value has changed. If the I/Os take less than a
+jiffy, the value is as exact as the previously calculated value. If the
+I/Os take more than a jiffy, io_ticks can drift behind the previously
+calculated value.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5b18b5a737600fd20ba2045f320d5926ebbf341a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bio.c
+#	block/blk-core.c
+#	block/blk-merge.c
+#	block/genhd.c
+#	block/partition-generic.c
+#	include/linux/genhd.h
+diff --cc block/blk-core.c
+index 036f097abd39,268d2b8e9843..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -1465,229 -584,9 +1465,232 @@@ struct request *blk_get_request(struct 
+  }
+  EXPORT_SYMBOL(blk_get_request);
+  
+++<<<<<<< HEAD
+ +/**
+ + * blk_make_request - given a bio, allocate a corresponding struct request.
+ + * @q: target request queue
+ + * @bio:  The bio describing the memory mappings that will be submitted for IO.
+ + *        It may be a chained-bio properly constructed by block/bio layer.
+ + * @gfp_mask: gfp flags to be used for memory allocation
+ + *
+ + * blk_make_request is the parallel of generic_make_request for BLOCK_PC
+ + * type commands. Where the struct request needs to be farther initialized by
+ + * the caller. It is passed a &struct bio, which describes the memory info of
+ + * the I/O transfer.
+ + *
+ + * The caller of blk_make_request must make sure that bi_io_vec
+ + * are set to describe the memory buffers. That bio_data_dir() will return
+ + * the needed direction of the request. (And all bio's in the passed bio-chain
+ + * are properly set accordingly)
+ + *
+ + * If called under none-sleepable conditions, mapped bio buffers must not
+ + * need bouncing, by calling the appropriate masked or flagged allocator,
+ + * suitable for the target device. Otherwise the call to blk_queue_bounce will
+ + * BUG.
+ + *
+ + * WARNING: When allocating/cloning a bio-chain, careful consideration should be
+ + * given to how you allocate bios. In particular, you cannot use __GFP_WAIT for
+ + * anything but the first bio in the chain. Otherwise you risk waiting for IO
+ + * completion of a bio that hasn't been submitted yet, thus resulting in a
+ + * deadlock. Alternatively bios should be allocated using bio_kmalloc() instead
+ + * of bio_alloc(), as that avoids the mempool deadlock.
+ + * If possible a big IO should be split into smaller parts when allocation
+ + * fails. Partial allocation should not be an error, or you risk a live-lock.
+ + */
+ +struct request *blk_make_request(struct request_queue *q, struct bio *bio,
+ +				 gfp_t gfp_mask)
+ +{
+ +	struct request *rq = blk_get_request(q, bio_data_dir(bio), gfp_mask);
+ +
+ +	if (IS_ERR(rq))
+ +		return rq;
+ +
+ +	blk_rq_set_block_pc(rq);
+ +
+ +	for_each_bio(bio) {
+ +		struct bio *bounce_bio = bio;
+ +		int ret;
+ +
+ +		blk_queue_bounce(q, &bounce_bio);
+ +		ret = blk_rq_append_bio(q, rq, bounce_bio);
+ +		if (unlikely(ret)) {
+ +			blk_put_request(rq);
+ +			return ERR_PTR(ret);
+ +		}
+ +	}
+ +
+ +	return rq;
+ +}
+ +EXPORT_SYMBOL(blk_make_request);
+ +
+ +/**
+ + * blk_rq_set_block_pc - initialize a requeest to type BLOCK_PC
+ + * @rq:		request to be initialized
+ + *
+ + */
+ +void blk_rq_set_block_pc(struct request *rq)
+ +{
+ +	rq->cmd_type = REQ_TYPE_BLOCK_PC;
+ +	rq->__data_len = 0;
+ +	rq->__sector = (sector_t) -1;
+ +	rq->bio = rq->biotail = NULL;
+ +	memset(rq->__cmd, 0, sizeof(rq->__cmd));
+ +}
+ +EXPORT_SYMBOL(blk_rq_set_block_pc);
+ +
+ +/**
+ + * blk_requeue_request - put a request back on queue
+ + * @q:		request queue where request should be inserted
+ + * @rq:		request to be inserted
+ + *
+ + * Description:
+ + *    Drivers often keep queueing requests until the hardware cannot accept
+ + *    more, when that condition happens we need to put the request back
+ + *    on the queue. Must be called with queue lock held.
+ + */
+ +void blk_requeue_request(struct request_queue *q, struct request *rq)
+ +{
+ +	blk_delete_timer(rq);
+ +	blk_clear_rq_complete(rq);
+ +	trace_block_rq_requeue(q, rq);
+ +
+ +	if (rq->cmd_flags & REQ_QUEUED)
+ +		blk_queue_end_tag(q, rq);
+ +
+ +	BUG_ON(blk_queued_rq(rq));
+ +
+ +	elv_requeue_request(q, rq);
+ +}
+ +EXPORT_SYMBOL(blk_requeue_request);
+ +
+ +static void add_acct_request(struct request_queue *q, struct request *rq,
+ +			     int where)
+ +{
+ +	blk_account_io_start(rq, true);
+ +	__elv_add_request(q, rq, where);
+ +}
+ +
+ +static void part_round_stats_single(struct request_queue *q, int cpu,
+ +				    struct hd_struct *part, unsigned long now,
+ +				    unsigned int inflight)
+ +{
+ +	if (inflight) {
+ +		__part_stat_add(cpu, part, time_in_queue,
+ +				inflight * (now - part->stamp));
+ +		__part_stat_add(cpu, part, io_ticks, (now - part->stamp));
+ +	}
+ +	part->stamp = now;
+ +}
+ +
+ +/**
+ + * part_round_stats() - Round off the performance stats on a struct disk_stats.
+ + * @q: target block queue
+ + * @cpu: cpu number for stats access
+ + * @part: target partition
+ + *
+ + * The average IO queue length and utilisation statistics are maintained
+ + * by observing the current state of the queue length and the amount of
+ + * time it has been in this state for.
+ + *
+ + * Normally, that accounting is done on IO completion, but that can result
+ + * in more than a second's worth of IO being accounted for within any one
+ + * second, leading to >100% utilisation.  To deal with that, we call this
+ + * function to do a round-off before returning the results when reading
+ + * /proc/diskstats.  This accounts immediately for all queue usage up to
+ + * the current jiffies and restarts the counters again.
+ + */
+ +void part_round_stats(struct request_queue *q, int cpu, struct hd_struct *part)
+ +{
+ +	struct hd_struct *part2 = NULL;
+ +	unsigned long now = jiffies;
+ +	unsigned int inflight[2];
+ +	int stats = 0;
+ +
+ +	if (part->stamp != now)
+ +		stats |= 1;
+ +
+ +	if (part->partno) {
+ +		part2 = &part_to_disk(part)->part0;
+ +		if (part2->stamp != now)
+ +			stats |= 2;
+ +	}
+ +
+ +	if (!stats)
+ +		return;
+ +
+ +	part_in_flight(q, part, inflight);
+ +
+ +	if (stats & 2)
+ +		part_round_stats_single(q, cpu, part2, now, inflight[1]);
+ +	if (stats & 1)
+ +		part_round_stats_single(q, cpu, part, now, inflight[0]);
+ +}
+ +EXPORT_SYMBOL_GPL(part_round_stats);
+ +
+ +#ifdef CONFIG_PM_RUNTIME
+ +static void blk_pm_put_request(struct request *rq)
+ +{
+ +	if (rq->q->dev && !(rq->cmd_flags & REQ_PM) && !--rq->q->nr_pending)
+ +		pm_runtime_mark_last_busy(rq->q->dev);
+ +}
+ +#else
+ +static inline void blk_pm_put_request(struct request *rq) {}
+ +#endif
+ +
+ +/*
+ + * queue lock must be held
+ + */
+ +void __blk_put_request(struct request_queue *q, struct request *req)
+ +{
+ +	if (unlikely(!q))
+ +		return;
+ +
+ +	if (q->mq_ops) {
+ +		blk_mq_free_request(req);
+ +		return;
+ +	}
+ +
+ +	blk_pm_put_request(req);
+ +
+ +	elv_completed_request(q, req);
+ +
+ +	/* this is a bio leak */
+ +	WARN_ON(req->bio != NULL);
+ +
+ +	/*
+ +	 * Request may not have originated from ll_rw_blk. if not,
+ +	 * it didn't come out of our reserved rq pools
+ +	 */
+ +	if (req->cmd_flags & REQ_ALLOCED) {
+ +		unsigned int flags = req->cmd_flags;
+ +		struct request_list *rl = blk_rq_rl(req);
+ +
+ +		BUG_ON(!list_empty(&req->queuelist));
+ +		BUG_ON(ELV_ON_HASH(req));
+ +
+ +		blk_free_request(rl, req);
+ +		freed_request(rl, flags);
+ +		blk_put_rl(rl);
+ +		blk_queue_exit(q);
+ +	}
+ +}
+ +EXPORT_SYMBOL_GPL(__blk_put_request);
+ +
+++=======
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  void blk_put_request(struct request *req)
+  {
+ -	blk_mq_free_request(req);
+ +	struct request_queue *q = req->q;
+ +
+ +	if (q->mq_ops)
+ +		blk_mq_free_request(req);
+ +	else {
+ +		unsigned long flags;
+ +
+ +		spin_lock_irqsave(q->queue_lock, flags);
+ +		__blk_put_request(q, req);
+ +		spin_unlock_irqrestore(q->queue_lock, flags);
+ +	}
+  }
+  EXPORT_SYMBOL(blk_put_request);
+  
+@@@ -2531,19 -1320,18 +2534,27 @@@ void blk_account_io_done(struct reques
+  	 * normal IO on queueing nor completion.  Accounting the
+  	 * containing request is enough.
+  	 */
+ -	if (blk_do_io_stat(req) && !(req->rq_flags & RQF_FLUSH_SEQ)) {
+ -		const int sgrp = op_stat_group(req_op(req));
+ +	if (blk_do_io_stat(req) && !(req->cmd_flags & REQ_FLUSH_SEQ)) {
+ +		unsigned long duration = jiffies - req->start_time;
+ +		const int rw = rq_data_dir(req);
+  		struct hd_struct *part;
+ +		int cpu;
+  
+ -		part_stat_lock();
+ +		cpu = part_stat_lock();
+  		part = req->part;
+  
+++<<<<<<< HEAD
+ +		part_stat_inc(cpu, part, ios[rw]);
+ +		part_stat_add(cpu, part, ticks[rw], duration);
+ +		part_round_stats(req->q, cpu, part);
+ +		part_dec_in_flight(req->q, part, rw);
+++=======
++ 		update_io_ticks(part, jiffies);
++ 		part_stat_inc(part, ios[sgrp]);
++ 		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
++ 		part_stat_add(part, time_in_queue, nsecs_to_jiffies64(now - req->start_time_ns));
++ 		part_dec_in_flight(req->q, part, rq_data_dir(req));
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  
+  		hd_struct_put(part);
+  		part_stat_unlock();
+@@@ -2600,7 -1365,6 +2611,10 @@@ void blk_account_io_start(struct reques
+  			part = &rq->rq_disk->part0;
+  			hd_struct_get(part);
+  		}
+++<<<<<<< HEAD
+ +		part_round_stats(rq->q, cpu, part);
+++=======
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  		part_inc_in_flight(rq->q, part, rw);
+  		rq->part = part;
+  	}
+diff --cc block/blk-merge.c
+index 1c03ec0b5aac,9da5629d0887..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -416,12 -685,10 +416,15 @@@ static void blk_account_io_merge(struc
+  {
+  	if (blk_do_io_stat(req)) {
+  		struct hd_struct *part;
+ +		int cpu;
+  
+ -		part_stat_lock();
+ +		cpu = part_stat_lock();
+  		part = req->part;
+  
+++<<<<<<< HEAD
+ +		part_round_stats(req->q, cpu, part);
+++=======
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  		part_dec_in_flight(req->q, part, rq_data_dir(req));
+  
+  		hd_struct_put(part);
+diff --cc block/genhd.c
+index dd907a3bc453,cdf174d7d329..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -1296,25 -1337,29 +1296,28 @@@ static int diskstats_show(struct seq_fi
+  
+  	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
+  	while ((hd = disk_part_iter_next(&piter))) {
+++<<<<<<< HEAD
+ +		cpu = part_stat_lock();
+ +		part_round_stats(gp->queue, cpu, hd);
+ +		part_stat_unlock();
+++=======
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  		part_in_flight(gp->queue, hd, inflight);
+ -		seq_printf(seqf, "%4d %7d %s "
+ -			   "%lu %lu %lu %u "
+ -			   "%lu %lu %lu %u "
+ -			   "%u %u %u "
+ -			   "%lu %lu %lu %u\n",
+ +		seq_printf(seqf, "%4d %7d %s %lu %lu %lu "
+ +			   "%u %lu %lu %lu %u %u %u %u\n",
+  			   MAJOR(part_devt(hd)), MINOR(part_devt(hd)),
+  			   disk_name(gp, hd->partno, buf),
+ -			   part_stat_read(hd, ios[STAT_READ]),
+ -			   part_stat_read(hd, merges[STAT_READ]),
+ -			   part_stat_read(hd, sectors[STAT_READ]),
+ -			   (unsigned int)part_stat_read_msecs(hd, STAT_READ),
+ -			   part_stat_read(hd, ios[STAT_WRITE]),
+ -			   part_stat_read(hd, merges[STAT_WRITE]),
+ -			   part_stat_read(hd, sectors[STAT_WRITE]),
+ -			   (unsigned int)part_stat_read_msecs(hd, STAT_WRITE),
+ +			   part_stat_read(hd, ios[READ]),
+ +			   part_stat_read(hd, merges[READ]),
+ +			   part_stat_read(hd, sectors[READ]),
+ +			   jiffies_to_msecs(part_stat_read(hd, ticks[READ])),
+ +			   part_stat_read(hd, ios[WRITE]),
+ +			   part_stat_read(hd, merges[WRITE]),
+ +			   part_stat_read(hd, sectors[WRITE]),
+ +			   jiffies_to_msecs(part_stat_read(hd, ticks[WRITE])),
+  			   inflight[0],
+  			   jiffies_to_msecs(part_stat_read(hd, io_ticks)),
+ -			   jiffies_to_msecs(part_stat_read(hd, time_in_queue)),
+ -			   part_stat_read(hd, ios[STAT_DISCARD]),
+ -			   part_stat_read(hd, merges[STAT_DISCARD]),
+ -			   part_stat_read(hd, sectors[STAT_DISCARD]),
+ -			   (unsigned int)part_stat_read_msecs(hd, STAT_DISCARD)
+ +			   jiffies_to_msecs(part_stat_read(hd, time_in_queue))
+  			);
+  	}
+  	disk_part_iter_exit(&piter);
+diff --cc block/partition-generic.c
+index 238bcfccca26,42d6138ac876..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -114,11 -121,7 +114,14 @@@ ssize_t part_stat_show(struct device *d
+  	struct hd_struct *p = dev_to_part(dev);
+  	struct request_queue *q = part_to_disk(p)->queue;
+  	unsigned int inflight[2];
+ -
+ +	int cpu;
+ +
+++<<<<<<< HEAD
+ +	cpu = part_stat_lock();
+ +	part_round_stats(q, cpu, p);
+ +	part_stat_unlock();
+++=======
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  	part_in_flight(q, p, inflight);
+  	return sprintf(buf,
+  		"%8lu %8lu %8llu %8u "
+diff --cc include/linux/genhd.h
+index 8c45e6e1f01f,838c2a7a40c5..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -404,14 -398,21 +404,18 @@@ static inline void free_part_info(struc
+  	kfree(part->info);
+  }
+  
+++<<<<<<< HEAD
+ +/* block/blk-core.c */
+ +extern void part_round_stats(struct request_queue *q, int cpu, struct hd_struct *part);
+++=======
++ void update_io_ticks(struct hd_struct *part, unsigned long now);
+++>>>>>>> 5b18b5a73760 (block: delete part_round_stats and switch to less precise counting)
+  
+  /* block/genhd.c */
+ -extern void device_add_disk(struct device *parent, struct gendisk *disk,
+ -			    const struct attribute_group **groups);
+ -static inline void add_disk(struct gendisk *disk)
+ -{
+ -	device_add_disk(NULL, disk, NULL);
+ -}
+ -extern void device_add_disk_no_queue_reg(struct device *parent, struct gendisk *disk);
+ -static inline void add_disk_no_queue_reg(struct gendisk *disk)
+ -{
+ -	device_add_disk_no_queue_reg(NULL, disk);
+ -}
+ -
+ +extern void add_disk(struct gendisk *disk);
+ +extern void add_disk_no_queue_reg(struct gendisk *disk);
+ +extern void add_disk_with_attributes(struct gendisk *disk,
+ +                const struct attribute_group **groups);
+  extern void del_gendisk(struct gendisk *gp);
+  extern struct gendisk *get_gendisk(dev_t dev, int *partno);
+  extern struct block_device *bdget_disk(struct gendisk *disk, int partno);
+* Unmerged path block/bio.c
+* Unmerged path block/bio.c
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-merge.c
+* Unmerged path block/genhd.c
+* Unmerged path block/partition-generic.c
+* Unmerged path include/linux/genhd.h
