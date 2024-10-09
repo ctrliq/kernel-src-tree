@@ -1,0 +1,200 @@
+ipv6: introduce idgen_delay and idgen_retries knobs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 1855b7c3e8537c2a4f5a53c797624713bb3becb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1855b7c3.failed
+
+This is specified by RFC 7217.
+
+	Cc: Erik Kline <ek@google.com>
+	Cc: Fernando Gont <fgont@si6networks.com>
+	Cc: Lorenzo Colitti <lorenzo@google.com>
+	Cc: YOSHIFUJI Hideaki/吉藤英明 <hideaki.yoshifuji@miraclelinux.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1855b7c3e8537c2a4f5a53c797624713bb3becb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/ipv6.h
+#	net/ipv6/addrconf.c
+#	net/ipv6/af_inet6.c
+#	net/ipv6/sysctl_net_ipv6.c
+diff --cc include/net/netns/ipv6.h
+index 005e2c2e39a9,d2527bf81142..000000000000
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@@ -27,7 -27,13 +27,14 @@@ struct netns_sysctl_ipv6 
+  	int ip6_rt_gc_elasticity;
+  	int ip6_rt_mtu_expires;
+  	int ip6_rt_min_advmss;
+ -	int flowlabel_consistency;
+ -	int auto_flowlabels;
+  	int icmpv6_time;
+++<<<<<<< HEAD
+++=======
++ 	int anycast_src_echo_reply;
++ 	int fwmark_reflect;
++ 	int idgen_retries;
++ 	int idgen_delay;
+++>>>>>>> 1855b7c3e853 (ipv6: introduce idgen_delay and idgen_retries knobs)
+  };
+  
+  struct netns_ipv6 {
+diff --cc net/ipv6/addrconf.c
+index 49e6c7d2081a,d2d238334a11..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -2790,12 -2878,97 +2789,93 @@@ static void addrconf_add_linklocal(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool ipv6_reserved_interfaceid(struct in6_addr address)
++ {
++ 	if ((address.s6_addr32[2] | address.s6_addr32[3]) == 0)
++ 		return true;
++ 
++ 	if (address.s6_addr32[2] == htonl(0x02005eff) &&
++ 	    ((address.s6_addr32[3] & htonl(0xfe000000)) == htonl(0xfe000000)))
++ 		return true;
++ 
++ 	if (address.s6_addr32[2] == htonl(0xfdffffff) &&
++ 	    ((address.s6_addr32[3] & htonl(0xffffff80)) == htonl(0xffffff80)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int ipv6_generate_stable_address(struct in6_addr *address,
++ 					u8 dad_count,
++ 					const struct inet6_dev *idev)
++ {
++ 	static DEFINE_SPINLOCK(lock);
++ 	static __u32 digest[SHA_DIGEST_WORDS];
++ 	static __u32 workspace[SHA_WORKSPACE_WORDS];
++ 
++ 	static union {
++ 		char __data[SHA_MESSAGE_BYTES];
++ 		struct {
++ 			struct in6_addr secret;
++ 			__be64 prefix;
++ 			unsigned char hwaddr[MAX_ADDR_LEN];
++ 			u8 dad_count;
++ 		} __packed;
++ 	} data;
++ 
++ 	struct in6_addr secret;
++ 	struct in6_addr temp;
++ 	struct net *net = dev_net(idev->dev);
++ 
++ 	BUILD_BUG_ON(sizeof(data.__data) != sizeof(data));
++ 
++ 	if (idev->cnf.stable_secret.initialized)
++ 		secret = idev->cnf.stable_secret.secret;
++ 	else if (net->ipv6.devconf_dflt->stable_secret.initialized)
++ 		secret = net->ipv6.devconf_dflt->stable_secret.secret;
++ 	else
++ 		return -1;
++ 
++ retry:
++ 	spin_lock_bh(&lock);
++ 
++ 	sha_init(digest);
++ 	memset(&data, 0, sizeof(data));
++ 	memset(workspace, 0, sizeof(workspace));
++ 	memcpy(data.hwaddr, idev->dev->perm_addr, idev->dev->addr_len);
++ 	data.prefix = ((__be64)address->s6_addr32[0] << 32) |
++ 		       (__be64)address->s6_addr32[1];
++ 	data.secret = secret;
++ 	data.dad_count = dad_count;
++ 
++ 	sha_transform(digest, data.__data, workspace);
++ 
++ 	temp = *address;
++ 	temp.s6_addr32[2] = digest[0];
++ 	temp.s6_addr32[3] = digest[1];
++ 
++ 	spin_unlock_bh(&lock);
++ 
++ 	if (ipv6_reserved_interfaceid(temp)) {
++ 		dad_count++;
++ 		if (dad_count > dev_net(idev->dev)->ipv6.sysctl.idgen_retries)
++ 			return -1;
++ 		goto retry;
++ 	}
++ 
++ 	*address = temp;
++ 	return 0;
++ }
++ 
+++>>>>>>> 1855b7c3e853 (ipv6: introduce idgen_delay and idgen_retries knobs)
+  static void addrconf_addr_gen(struct inet6_dev *idev, bool prefix_route)
+  {
+ -	struct in6_addr addr;
+ -
+ -	ipv6_addr_set(&addr, htonl(0xFE800000), 0, 0, 0);
+ +	if (idev->addr_gen_mode == IN6_ADDR_GEN_MODE_EUI64) {
+ +		struct in6_addr addr;
+  
+ -	if (idev->addr_gen_mode == IN6_ADDR_GEN_MODE_STABLE_PRIVACY) {
+ -		if (!ipv6_generate_stable_address(&addr, 0, idev))
+ -			addrconf_add_linklocal(idev, &addr,
+ -					       IFA_F_STABLE_PRIVACY);
+ -		else if (prefix_route)
+ -			addrconf_prefix_route(&addr, 64, idev->dev, 0, 0);
+ -	} else if (idev->addr_gen_mode == IN6_ADDR_GEN_MODE_EUI64) {
+ +		ipv6_addr_set(&addr,  htonl(0xFE800000), 0, 0, 0);
+  		/* addrconf_add_linklocal also adds a prefix_route and we
+  		 * only need to care about prefix routes if ipv6_generate_eui64
+  		 * couldn't generate one.
+diff --cc net/ipv6/af_inet6.c
+index 0476df8c5c76,d8dcc526339e..000000000000
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@@ -769,6 -764,11 +769,14 @@@ static int __net_init inet6_net_init(st
+  
+  	net->ipv6.sysctl.bindv6only = 0;
+  	net->ipv6.sysctl.icmpv6_time = 1*HZ;
+++<<<<<<< HEAD
+++=======
++ 	net->ipv6.sysctl.flowlabel_consistency = 1;
++ 	net->ipv6.sysctl.auto_flowlabels = 0;
++ 	net->ipv6.sysctl.idgen_retries = 3;
++ 	net->ipv6.sysctl.idgen_delay = 1 * HZ;
++ 	atomic_set(&net->ipv6.fib6_sernum, 1);
+++>>>>>>> 1855b7c3e853 (ipv6: introduce idgen_delay and idgen_retries knobs)
+  
+  	err = ipv6_init_mibs(net);
+  	if (err)
+diff --cc net/ipv6/sysctl_net_ipv6.c
+index 07857dff703a,30f5a4ad04eb..000000000000
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@@ -75,8 -103,12 +89,17 @@@ static int __net_init ipv6_sysctl_net_i
+  	if (!ipv6_table)
+  		goto out;
+  	ipv6_table[0].data = &net->ipv6.sysctl.bindv6only;
+++<<<<<<< HEAD
+ +	ipv6_table[1].data = &net->ipv6_sysctl_ip_nonlocal_bind;
+ +	ipv6_table[2].data = &net->ipv6_anycast_src_echo_reply;
+++=======
++ 	ipv6_table[1].data = &net->ipv6.sysctl.anycast_src_echo_reply;
++ 	ipv6_table[2].data = &net->ipv6.sysctl.flowlabel_consistency;
++ 	ipv6_table[3].data = &net->ipv6.sysctl.auto_flowlabels;
++ 	ipv6_table[4].data = &net->ipv6.sysctl.fwmark_reflect;
++ 	ipv6_table[5].data = &net->ipv6.sysctl.idgen_retries;
++ 	ipv6_table[6].data = &net->ipv6.sysctl.idgen_delay;
+++>>>>>>> 1855b7c3e853 (ipv6: introduce idgen_delay and idgen_retries knobs)
+  
+  	ipv6_route_table = ipv6_route_sysctl_init(net);
+  	if (!ipv6_route_table)
+* Unmerged path include/net/netns/ipv6.h
+* Unmerged path net/ipv6/addrconf.c
+* Unmerged path net/ipv6/af_inet6.c
+* Unmerged path net/ipv6/sysctl_net_ipv6.c
