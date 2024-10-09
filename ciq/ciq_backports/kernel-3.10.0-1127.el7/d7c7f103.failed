@@ -1,0 +1,166 @@
+cpuidle: don't call poll_idle_init() for every cpu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [cpuidle] cpuidle: dont call poll_idle_init() for every cpu (Marcelo Tosatti) [1734501]
+Rebuild_FUZZ: 98.99%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit d7c7f103262bc2248548ed0e113e916e843c4eeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/d7c7f103.failed
+
+poll_idle_init() just initializes drv->states[0] and so that is
+required to be done only once for each driver.  Currently, it is
+called from cpuidle_enable_device() which is called for every CPU
+that the driver supports.  That is not required, so move it to a
+better place and call it from __cpuidle_register_driver() so that
+the initialization is carried out only once.
+
+	Acked-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit d7c7f103262bc2248548ed0e113e916e843c4eeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpuidle/cpuidle.c
+diff --cc drivers/cpuidle/cpuidle.c
+index fc903b7bb9d3,2a991e468f78..000000000000
+--- a/drivers/cpuidle/cpuidle.c
++++ b/drivers/cpuidle/cpuidle.c
+@@@ -233,45 -226,6 +233,48 @@@ void cpuidle_resume(void
+  	mutex_unlock(&cpuidle_lock);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_ARCH_HAS_CPU_RELAX
+ +static int __cpuidle poll_idle(struct cpuidle_device *dev,
+ +			       struct cpuidle_driver *drv, int index)
+ +{
+ +	ktime_t	t1, t2;
+ +	s64 diff;
+ +
+ +	t1 = ktime_get();
+ +	local_irq_enable();
+ +	while (!need_resched())
+ +		cpu_relax();
+ +
+ +	t2 = ktime_get();
+ +	diff = ktime_to_us(ktime_sub(t2, t1));
+ +	if (diff > INT_MAX)
+ +		diff = INT_MAX;
+ +
+ +	dev->last_residency = (int) diff;
+ +
+ +	return index;
+ +}
+ +
+ +static void poll_idle_init(struct cpuidle_driver *drv)
+ +{
+ +	struct cpuidle_state *state = &drv->states[0];
+ +
+ +	snprintf(state->name, CPUIDLE_NAME_LEN, "POLL");
+ +	snprintf(state->desc, CPUIDLE_DESC_LEN, "CPUIDLE CORE POLL IDLE");
+ +	state->exit_latency = 0;
+ +	state->target_residency = 0;
+ +	state->power_usage = -1;
+ +	state->flags = 0;
+ +	state->enter = poll_idle;
+ +	state->disabled = false;
+ +}
+ +#else
+ +static void poll_idle_init(struct cpuidle_driver *drv) {}
+ +#endif /* CONFIG_ARCH_HAS_CPU_RELAX */
+ +
+++=======
+++>>>>>>> d7c7f103262b (cpuidle: don't call poll_idle_init() for every cpu)
+  /**
+   * cpuidle_enable_device - enables idle PM for a CPU
+   * @dev: the CPU
+@@@ -298,14 -252,9 +301,17 @@@ int cpuidle_enable_device(struct cpuidl
+  	if (!dev->state_count)
+  		dev->state_count = drv->state_count;
+  
+++<<<<<<< HEAD
+ +	if (dev->registered == 0) {
+ +		ret = __cpuidle_register_device(dev);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	poll_idle_init(drv);
+ +
+++=======
+++>>>>>>> d7c7f103262b (cpuidle: don't call poll_idle_init() for every cpu)
+  	ret = cpuidle_add_device_sysfs(dev);
+  	if (ret)
+  		return ret;
+* Unmerged path drivers/cpuidle/cpuidle.c
+diff --git a/drivers/cpuidle/driver.c b/drivers/cpuidle/driver.c
+index 3ac499d5a207..d76426ee3124 100644
+--- a/drivers/cpuidle/driver.c
++++ b/drivers/cpuidle/driver.c
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/mutex.h>
+ #include <linux/module.h>
++#include <linux/sched.h>
+ #include <linux/cpuidle.h>
+ #include <linux/cpumask.h>
+ #include <linux/clockchips.h>
+@@ -183,6 +184,45 @@ static int __cpuidle_driver_init(struct cpuidle_driver *drv)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_ARCH_HAS_CPU_RELAX
++static int poll_idle(struct cpuidle_device *dev,
++		struct cpuidle_driver *drv, int index)
++{
++	ktime_t	t1, t2;
++	s64 diff;
++
++	t1 = ktime_get();
++	local_irq_enable();
++	while (!need_resched())
++		cpu_relax();
++
++	t2 = ktime_get();
++	diff = ktime_to_us(ktime_sub(t2, t1));
++	if (diff > INT_MAX)
++		diff = INT_MAX;
++
++	dev->last_residency = (int) diff;
++
++	return index;
++}
++
++static void poll_idle_init(struct cpuidle_driver *drv)
++{
++	struct cpuidle_state *state = &drv->states[0];
++
++	snprintf(state->name, CPUIDLE_NAME_LEN, "POLL");
++	snprintf(state->desc, CPUIDLE_DESC_LEN, "CPUIDLE CORE POLL IDLE");
++	state->exit_latency = 0;
++	state->target_residency = 0;
++	state->power_usage = -1;
++	state->flags = 0;
++	state->enter = poll_idle;
++	state->disabled = false;
++}
++#else
++static void poll_idle_init(struct cpuidle_driver *drv) {}
++#endif /* !CONFIG_ARCH_HAS_CPU_RELAX */
++
+ /**
+  * __cpuidle_register_driver: register the driver
+  * @drv: a valid pointer to a struct cpuidle_driver
+@@ -218,6 +258,8 @@ static int __cpuidle_register_driver(struct cpuidle_driver *drv)
+ 		on_each_cpu_mask(drv->cpumask, cpuidle_setup_broadcast_timer,
+ 				 (void *)CLOCK_EVT_NOTIFY_BROADCAST_ON, 1);
+ 
++	poll_idle_init(drv);
++
+ 	return 0;
+ }
+ 
