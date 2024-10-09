@@ -1194,6 +1194,7 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
 	struct map_groups *kmaps = map__kmaps(map);
 	struct kcore_mapfn_data md;
 	struct map *old_map, *new_map, *replacement_map = NULL;
+	struct machine *machine;
 	bool is_64_bit;
 	int err, fd;
 	char kcore_filename[PATH_MAX];
@@ -1201,6 +1202,8 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
 
 	if (!kmaps)
 		return -EINVAL;
+
+	machine = kmaps->machine;
 
 	/* This function requires that the map is the kernel map */
 	if (!__map__is_kernel(map))
@@ -1246,6 +1249,7 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
 			map_groups__remove(kmaps, old_map);
 		old_map = next;
 	}
+	machine->trampolines_mapped = false;
 
 	/* Find the kernel map using the first symbol */
 	sym = __dso__first_symbol(dso, map->type);
@@ -1280,6 +1284,19 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
 		}
 
 		map__put(new_map);
+	}
+
+	if (machine__is(machine, "x86_64")) {
+		u64 addr;
+
+		/*
+		 * If one of the corresponding symbols is there, assume the
+		 * entry trampoline maps are too.
+		 */
+		if (!kallsyms__get_function_start(kallsyms_filename,
+						  ENTRY_TRAMPOLINE_NAME,
+						  &addr))
+			machine->trampolines_mapped = true;
 	}
 
 	/*
