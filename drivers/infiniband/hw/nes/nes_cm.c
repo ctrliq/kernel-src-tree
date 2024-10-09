@@ -563,7 +563,6 @@ static void build_mpa_v2(struct nes_cm_node *cm_node,
 			    IETF_NO_IRD_ORD : cm_node->ord_size;
 
 	ctrl_ird |= IETF_PEER_TO_PEER;
-	ctrl_ird |= IETF_FLPDU_ZERO_LEN;
 
 	switch (mpa_key) {
 	case MPA_KEY_REQUEST:
