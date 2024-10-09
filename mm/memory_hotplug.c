@@ -551,6 +551,7 @@ int __ref __add_pages(int nid, struct zone *zone, unsigned long phys_start_pfn,
 		if (err && (err != -EEXIST))
 			break;
 		err = 0;
+		cond_resched();
 	}
 
 	return err;
