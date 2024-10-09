@@ -1,0 +1,577 @@
+IB/hfi1: Fix locking scheme for affinity settings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tadeusz Struk <tadeusz.struk@intel.com>
+commit 584d9577ffecdb411f1fd0d160e76a1e141554c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/584d9577.failed
+
+Existing locking scheme in affinity.c file using the
+&node_affinity.lock spinlock is not very elegant.
+We acquire the lock to get hfi1_affinity_node entry,
+unlock, and then use the entry without the lock held.
+With more functions being added, which access and
+modify the entries, this can lead to race conditions.
+This patch makes this locking scheme more consistent.
+It changes the spinlock to mutex. Since all the code
+is executed in a user process context there is no need
+for a spinlock. This also allows to keep the lock
+not only while we look up for the node affinity entry,
+but over the whole section where the entry is being used.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Reviewed-by: Jianxin Xiong <jianxin.xiong@intel.com>
+	Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 584d9577ffecdb411f1fd0d160e76a1e141554c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/affinity.c
+#	drivers/infiniband/hw/hfi1/affinity.h
+diff --cc drivers/infiniband/hw/hfi1/affinity.c
+index 1ca2154de24c,17c805ab8b3b..000000000000
+--- a/drivers/infiniband/hw/hfi1/affinity.c
++++ b/drivers/infiniband/hw/hfi1/affinity.c
+@@@ -53,6 -53,11 +53,14 @@@
+  #include "sdma.h"
+  #include "trace.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct hfi1_affinity_node_list node_affinity = {
++ 	.list = LIST_HEAD_INIT(node_affinity.list),
++ 	.lock = __MUTEX_INITIALIZER(node_affinity.lock)
++ };
++ 
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  /* Name of IRQ types, indexed by enum irq_type */
+  static const char * const irq_type_names[] = {
+  	"SDMA",
+@@@ -110,6 -154,59 +118,62 @@@ int init_real_cpu_mask(struct hfi1_devd
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void node_affinity_destroy(void)
++ {
++ 	struct list_head *pos, *q;
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	mutex_lock(&node_affinity.lock);
++ 	list_for_each_safe(pos, q, &node_affinity.list) {
++ 		entry = list_entry(pos, struct hfi1_affinity_node,
++ 				   list);
++ 		list_del(pos);
++ 		kfree(entry);
++ 	}
++ 	mutex_unlock(&node_affinity.lock);
++ 	kfree(hfi1_per_node_cntr);
++ }
++ 
++ static struct hfi1_affinity_node *node_affinity_allocate(int node)
++ {
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		return NULL;
++ 	entry->node = node;
++ 	INIT_LIST_HEAD(&entry->list);
++ 
++ 	return entry;
++ }
++ 
++ /*
++  * It appends an entry to the list.
++  * It *must* be called with node_affinity.lock held.
++  */
++ static void node_affinity_add_tail(struct hfi1_affinity_node *entry)
++ {
++ 	list_add_tail(&entry->list, &node_affinity.list);
++ }
++ 
++ /* It must be called with node_affinity.lock held */
++ static struct hfi1_affinity_node *node_affinity_lookup(int node)
++ {
++ 	struct list_head *pos;
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	list_for_each(pos, &node_affinity.list) {
++ 		entry = list_entry(pos, struct hfi1_affinity_node, list);
++ 		if (entry->node == node)
++ 			return entry;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  /*
+   * Interrupt affinity.
+   *
+@@@ -141,43 -232,88 +205,124 @@@ void hfi1_dev_affinity_init(struct hfi1
+  	local_mask = cpumask_of_node(dd->node);
+  	if (cpumask_first(local_mask) >= nr_cpu_ids)
+  		local_mask = topology_core_cpumask(0);
+ +	/* Use the "real" cpu mask of this node as the default */
+ +	cpumask_and(&info->def_intr.mask, &info->real_cpu_mask, local_mask);
+ +
+++<<<<<<< HEAD
+ +	/*  fill in the receive list */
+ +	possible = cpumask_weight(&info->def_intr.mask);
+ +	curr_cpu = cpumask_first(&info->def_intr.mask);
+ +	if (possible == 1) {
+ +		/*  only one CPU, everyone will use it */
+ +		cpumask_set_cpu(curr_cpu, &info->rcv_intr.mask);
+ +	} else {
+ +		/*
+ +		 * Retain the first CPU in the default list for the control
+ +		 * context.
+ +		 */
+ +		curr_cpu = cpumask_next(curr_cpu, &info->def_intr.mask);
+ +		/*
+ +		 * Remove the remaining kernel receive queues from
+ +		 * the default list and add them to the receive list.
+ +		 */
+ +		for (i = 0; i < dd->n_krcv_queues - 1; i++) {
+ +			cpumask_clear_cpu(curr_cpu, &info->def_intr.mask);
+ +			cpumask_set_cpu(curr_cpu, &info->rcv_intr.mask);
+ +			curr_cpu = cpumask_next(curr_cpu, &info->def_intr.mask);
+ +			if (curr_cpu >= nr_cpu_ids)
+ +				break;
+ +		}
+ +	}
+ +
+ +	cpumask_copy(&info->proc.mask, cpu_online_mask);
+ +}
+  
+ +void hfi1_dev_affinity_free(struct hfi1_devdata *dd)
+ +{
+ +	kfree(dd->affinity);
+++=======
++ 	mutex_lock(&node_affinity.lock);
++ 	entry = node_affinity_lookup(dd->node);
++ 
++ 	/*
++ 	 * If this is the first time this NUMA node's affinity is used,
++ 	 * create an entry in the global affinity structure and initialize it.
++ 	 */
++ 	if (!entry) {
++ 		entry = node_affinity_allocate(node);
++ 		if (!entry) {
++ 			dd_dev_err(dd,
++ 				   "Unable to allocate global affinity node\n");
++ 			mutex_unlock(&node_affinity.lock);
++ 			return -ENOMEM;
++ 		}
++ 		init_cpu_mask_set(&entry->def_intr);
++ 		init_cpu_mask_set(&entry->rcv_intr);
++ 		cpumask_clear(&entry->general_intr_mask);
++ 		/* Use the "real" cpu mask of this node as the default */
++ 		cpumask_and(&entry->def_intr.mask, &node_affinity.real_cpu_mask,
++ 			    local_mask);
++ 
++ 		/* fill in the receive list */
++ 		possible = cpumask_weight(&entry->def_intr.mask);
++ 		curr_cpu = cpumask_first(&entry->def_intr.mask);
++ 
++ 		if (possible == 1) {
++ 			/* only one CPU, everyone will use it */
++ 			cpumask_set_cpu(curr_cpu, &entry->rcv_intr.mask);
++ 			cpumask_set_cpu(curr_cpu, &entry->general_intr_mask);
++ 		} else {
++ 			/*
++ 			 * The general/control context will be the first CPU in
++ 			 * the default list, so it is removed from the default
++ 			 * list and added to the general interrupt list.
++ 			 */
++ 			cpumask_clear_cpu(curr_cpu, &entry->def_intr.mask);
++ 			cpumask_set_cpu(curr_cpu, &entry->general_intr_mask);
++ 			curr_cpu = cpumask_next(curr_cpu,
++ 						&entry->def_intr.mask);
++ 
++ 			/*
++ 			 * Remove the remaining kernel receive queues from
++ 			 * the default list and add them to the receive list.
++ 			 */
++ 			for (i = 0;
++ 			     i < (dd->n_krcv_queues - 1) *
++ 				  hfi1_per_node_cntr[dd->node];
++ 			     i++) {
++ 				cpumask_clear_cpu(curr_cpu,
++ 						  &entry->def_intr.mask);
++ 				cpumask_set_cpu(curr_cpu,
++ 						&entry->rcv_intr.mask);
++ 				curr_cpu = cpumask_next(curr_cpu,
++ 							&entry->def_intr.mask);
++ 				if (curr_cpu >= nr_cpu_ids)
++ 					break;
++ 			}
++ 
++ 			/*
++ 			 * If there ends up being 0 CPU cores leftover for SDMA
++ 			 * engines, use the same CPU cores as general/control
++ 			 * context.
++ 			 */
++ 			if (cpumask_weight(&entry->def_intr.mask) == 0)
++ 				cpumask_copy(&entry->def_intr.mask,
++ 					     &entry->general_intr_mask);
++ 		}
++ 
++ 		node_affinity_add_tail(entry);
++ 	}
++ 	mutex_unlock(&node_affinity.lock);
++ 	return 0;
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  }
+  
+- int hfi1_get_irq_affinity(struct hfi1_devdata *dd, struct hfi1_msix_entry *msix)
++ /*
++  * Function sets the irq affinity for msix.
++  * It *must* be called with node_affinity.lock held.
++  */
++ static int get_irq_affinity(struct hfi1_devdata *dd,
++ 			    struct hfi1_msix_entry *msix)
+  {
+  	int ret;
+  	cpumask_var_t diff;
+@@@ -194,6 -331,8 +339,11 @@@
+  	if (!ret)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	entry = node_affinity_lookup(dd->node);
++ 
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  	switch (msix->type) {
+  	case IRQ_SDMA:
+  		sde = (struct sdma_engine *)msix->arg;
+@@@ -218,12 -356,11 +368,16 @@@
+  	}
+  
+  	/*
+ -	 * The general and control contexts are placed on a particular
+ -	 * CPU, which is set above. Skip accounting for it. Everything else
+ -	 * finds its CPU here.
+ +	 * The control receive context is placed on a particular CPU, which
+ +	 * is set above.  Skip accounting for it.  Everything else finds its
+ +	 * CPU here.
+  	 */
+++<<<<<<< HEAD
+ +	if (cpu == -1) {
+ +		spin_lock(&dd->affinity->lock);
+++=======
++ 	if (cpu == -1 && set) {
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  		if (cpumask_equal(&set->mask, &set->used)) {
+  			/*
+  			 * We've used up all the CPUs, bump up the generation
+@@@ -235,7 -372,6 +389,10 @@@
+  		cpumask_andnot(diff, &set->mask, &set->used);
+  		cpu = cpumask_first(diff);
+  		cpumask_set_cpu(cpu, &set->used);
+++<<<<<<< HEAD
+ +		spin_unlock(&dd->affinity->lock);
+++=======
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  	}
+  
+  	switch (msix->type) {
+@@@ -263,6 -409,10 +430,13 @@@ void hfi1_put_irq_affinity(struct hfi1_
+  {
+  	struct cpu_mask_set *set = NULL;
+  	struct hfi1_ctxtdata *rcd;
+++<<<<<<< HEAD
+++=======
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	mutex_lock(&node_affinity.lock);
++ 	entry = node_affinity_lookup(dd->node);
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  
+  	switch (msix->type) {
+  	case IRQ_SDMA:
+@@@ -271,35 -423,69 +445,43 @@@
+  		break;
+  	case IRQ_RCVCTXT:
+  		rcd = (struct hfi1_ctxtdata *)msix->arg;
+ -		/* Don't do accounting for control contexts */
+ +		/* only do accounting for non control contexts */
+  		if (rcd->ctxt != HFI1_CTRL_CTXT)
+ -			set = &entry->rcv_intr;
+ +			set = &dd->affinity->rcv_intr;
+  		break;
+  	default:
++ 		mutex_unlock(&node_affinity.lock);
+  		return;
+  	}
+  
+  	if (set) {
+++<<<<<<< HEAD
+ +		spin_lock(&dd->affinity->lock);
+++=======
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  		cpumask_andnot(&set->used, &set->used, &msix->mask);
+  		if (cpumask_empty(&set->used) && set->gen) {
+  			set->gen--;
+  			cpumask_copy(&set->used, &set->mask);
+  		}
+++<<<<<<< HEAD
+ +		spin_unlock(&dd->affinity->lock);
+++=======
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  	}
+  
+  	irq_set_affinity_hint(msix->msix.vector, NULL);
+  	cpumask_clear(&msix->mask);
++ 	mutex_unlock(&node_affinity.lock);
+  }
+  
+ -/* This should be called with node_affinity.lock held */
+ -static void find_hw_thread_mask(uint hw_thread_no, cpumask_var_t hw_thread_mask,
+ -				struct hfi1_affinity_node_list *affinity)
+ -{
+ -	int possible, curr_cpu, i;
+ -	uint num_cores_per_socket = node_affinity.num_online_cpus /
+ -					affinity->num_core_siblings /
+ -						node_affinity.num_online_nodes;
+ -
+ -	cpumask_copy(hw_thread_mask, &affinity->proc.mask);
+ -	if (affinity->num_core_siblings > 0) {
+ -		/* Removing other siblings not needed for now */
+ -		possible = cpumask_weight(hw_thread_mask);
+ -		curr_cpu = cpumask_first(hw_thread_mask);
+ -		for (i = 0;
+ -		     i < num_cores_per_socket * node_affinity.num_online_nodes;
+ -		     i++)
+ -			curr_cpu = cpumask_next(curr_cpu, hw_thread_mask);
+ -
+ -		for (; i < possible; i++) {
+ -			cpumask_clear_cpu(curr_cpu, hw_thread_mask);
+ -			curr_cpu = cpumask_next(curr_cpu, hw_thread_mask);
+ -		}
+ -
+ -		/* Identifying correct HW threads within physical cores */
+ -		cpumask_shift_left(hw_thread_mask, hw_thread_mask,
+ -				   num_cores_per_socket *
+ -				   node_affinity.num_online_nodes *
+ -				   hw_thread_no);
+ -	}
+ -}
+ -
+ -int hfi1_get_proc_affinity(int node)
+ +int hfi1_get_proc_affinity(struct hfi1_devdata *dd, int node)
+  {
+ -	int cpu = -1, ret, i;
+ -	struct hfi1_affinity_node *entry;
+ -	cpumask_var_t diff, hw_thread_mask, available_mask, intrs_mask;
+ +	int cpu = -1, ret;
+ +	cpumask_var_t diff, mask, intrs;
+  	const struct cpumask *node_mask,
+  		*proc_mask = tsk_cpus_allowed(current);
+ -	struct hfi1_affinity_node_list *affinity = &node_affinity;
+ -	struct cpu_mask_set *set = &affinity->proc;
+ +	struct cpu_mask_set *set = &dd->affinity->proc;
+  
+  	/*
+  	 * check whether process/context affinity has already
+@@@ -331,16 -533,19 +513,20 @@@
+  	ret = zalloc_cpumask_var(&diff, GFP_KERNEL);
+  	if (!ret)
+  		goto done;
+ -	ret = zalloc_cpumask_var(&hw_thread_mask, GFP_KERNEL);
+ +	ret = zalloc_cpumask_var(&mask, GFP_KERNEL);
+  	if (!ret)
+  		goto free_diff;
+ -	ret = zalloc_cpumask_var(&available_mask, GFP_KERNEL);
+ +	ret = zalloc_cpumask_var(&intrs, GFP_KERNEL);
+  	if (!ret)
+ -		goto free_hw_thread_mask;
+ -	ret = zalloc_cpumask_var(&intrs_mask, GFP_KERNEL);
+ -	if (!ret)
+ -		goto free_available_mask;
+ +		goto free_mask;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&dd->affinity->lock);
+++=======
++ 	mutex_lock(&affinity->lock);
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  	/*
+ -	 * If we've used all available HW threads, clear the mask and start
+ +	 * If we've used all available CPUs, clear the mask and start
+  	 * overloading.
+  	 */
+  	if (cpumask_equal(&set->mask, &set->used)) {
+@@@ -400,11 -651,15 +586,17 @@@
+  		cpu = -1;
+  	else
+  		cpumask_set_cpu(cpu, &set->used);
+++<<<<<<< HEAD
+ +	spin_unlock(&dd->affinity->lock);
+++=======
++ 
++ 	mutex_unlock(&affinity->lock);
++ 	hfi1_cdbg(PROC, "Process assigned to CPU %d", cpu);
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  
+ -	free_cpumask_var(intrs_mask);
+ -free_available_mask:
+ -	free_cpumask_var(available_mask);
+ -free_hw_thread_mask:
+ -	free_cpumask_var(hw_thread_mask);
+ +	free_cpumask_var(intrs);
+ +free_mask:
+ +	free_cpumask_var(mask);
+  free_diff:
+  	free_cpumask_var(diff);
+  done:
+@@@ -417,12 -673,85 +609,94 @@@ void hfi1_put_proc_affinity(struct hfi1
+  
+  	if (cpu < 0)
+  		return;
+++<<<<<<< HEAD
+ +	spin_lock(&dd->affinity->lock);
+++=======
++ 
++ 	mutex_lock(&affinity->lock);
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  	cpumask_clear_cpu(cpu, &set->used);
+ -	hfi1_cdbg(PROC, "Returning CPU %d for future process assignment", cpu);
+  	if (cpumask_empty(&set->used) && set->gen) {
+  		set->gen--;
+  		cpumask_copy(&set->used, &set->mask);
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&dd->affinity->lock);
+ +}
+ +
+++=======
++ 	mutex_unlock(&affinity->lock);
++ }
++ 
++ int hfi1_set_sdma_affinity(struct hfi1_devdata *dd, const char *buf,
++ 			   size_t count)
++ {
++ 	struct hfi1_affinity_node *entry;
++ 	cpumask_var_t mask;
++ 	int ret, i;
++ 
++ 	mutex_lock(&node_affinity.lock);
++ 	entry = node_affinity_lookup(dd->node);
++ 
++ 	if (!entry) {
++ 		ret = -EINVAL;
++ 		goto unlock;
++ 	}
++ 
++ 	ret = zalloc_cpumask_var(&mask, GFP_KERNEL);
++ 	if (!ret) {
++ 		ret = -ENOMEM;
++ 		goto unlock;
++ 	}
++ 
++ 	ret = cpulist_parse(buf, mask);
++ 	if (ret)
++ 		goto out;
++ 
++ 	if (!cpumask_subset(mask, cpu_online_mask) || cpumask_empty(mask)) {
++ 		dd_dev_warn(dd, "Invalid CPU mask\n");
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/* reset the SDMA interrupt affinity details */
++ 	init_cpu_mask_set(&entry->def_intr);
++ 	cpumask_copy(&entry->def_intr.mask, mask);
++ 
++ 	/* Reassign the affinity for each SDMA interrupt. */
++ 	for (i = 0; i < dd->num_msix_entries; i++) {
++ 		struct hfi1_msix_entry *msix;
++ 
++ 		msix = &dd->msix_entries[i];
++ 		if (msix->type != IRQ_SDMA)
++ 			continue;
++ 
++ 		ret = get_irq_affinity(dd, msix);
++ 
++ 		if (ret)
++ 			break;
++ 	}
++ out:
++ 	free_cpumask_var(mask);
++ unlock:
++ 	mutex_unlock(&node_affinity.lock);
++ 	return ret ? ret : strnlen(buf, PAGE_SIZE);
++ }
++ 
++ int hfi1_get_sdma_affinity(struct hfi1_devdata *dd, char *buf)
++ {
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	mutex_lock(&node_affinity.lock);
++ 	entry = node_affinity_lookup(dd->node);
++ 
++ 	if (!entry) {
++ 		mutex_unlock(&node_affinity.lock);
++ 		return -EINVAL;
++ 	}
++ 
++ 	cpumap_print_to_pagebuf(true, buf, &entry->def_intr.mask);
++ 	mutex_unlock(&node_affinity.lock);
++ 	return strnlen(buf, PAGE_SIZE);
++ }
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+diff --cc drivers/infiniband/hw/hfi1/affinity.h
+index 20f52fe74091,b89ea3c0ee1a..000000000000
+--- a/drivers/infiniband/hw/hfi1/affinity.h
++++ b/drivers/infiniband/hw/hfi1/affinity.h
+@@@ -101,8 -98,34 +101,38 @@@ void hfi1_put_irq_affinity(struct hfi1_
+   * Determine a CPU affinity for a user process, if the process does not
+   * have an affinity set yet.
+   */
+ -int hfi1_get_proc_affinity(int);
+ +int hfi1_get_proc_affinity(struct hfi1_devdata *, int);
+  /* Release a CPU used by a user process. */
+++<<<<<<< HEAD
+ +void hfi1_put_proc_affinity(struct hfi1_devdata *, int);
+++=======
++ void hfi1_put_proc_affinity(int);
++ 
++ int hfi1_get_sdma_affinity(struct hfi1_devdata *dd, char *buf);
++ int hfi1_set_sdma_affinity(struct hfi1_devdata *dd, const char *buf,
++ 			   size_t count);
++ 
++ struct hfi1_affinity_node {
++ 	int node;
++ 	struct cpu_mask_set def_intr;
++ 	struct cpu_mask_set rcv_intr;
++ 	struct cpumask general_intr_mask;
++ 	struct list_head list;
++ };
++ 
++ struct hfi1_affinity_node_list {
++ 	struct list_head list;
++ 	struct cpumask real_cpu_mask;
++ 	struct cpu_mask_set proc;
++ 	int num_core_siblings;
++ 	int num_online_nodes;
++ 	int num_online_cpus;
++ 	struct mutex lock; /* protects affinity nodes */
++ };
++ 
++ int node_affinity_init(void);
++ void node_affinity_destroy(void);
++ extern struct hfi1_affinity_node_list node_affinity;
+++>>>>>>> 584d9577ffec (IB/hfi1: Fix locking scheme for affinity settings)
+  
+  #endif /* _HFI1_AFFINITY_H */
+* Unmerged path drivers/infiniband/hw/hfi1/affinity.c
+* Unmerged path drivers/infiniband/hw/hfi1/affinity.h
