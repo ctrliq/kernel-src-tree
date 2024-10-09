@@ -1086,7 +1086,9 @@ void
 gf100_grctx_generate_r4060a8(struct gf100_gr *gr)
 {
 	struct nvkm_device *device = gr->base.engine.subdev.device;
-	u8  tpcnr[GPC_MAX], data[TPC_MAX];
+	const u8 gpcmax = nvkm_rd32(device, 0x022430);
+	const u8 tpcmax = nvkm_rd32(device, 0x022434) * gpcmax;
+	u8 tpcnr[GPC_MAX], data[TPC_MAX];
 	int gpc, tpc, i;
 
 	memcpy(tpcnr, gr->tpc_nr, sizeof(gr->tpc_nr));
@@ -1101,7 +1103,7 @@ gf100_grctx_generate_r4060a8(struct gf100_gr *gr)
 		data[tpc] = gpc;
 	}
 
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < DIV_ROUND_UP(tpcmax, 4); i++)
 		nvkm_wr32(device, 0x4060a8 + (i * 4), ((u32 *)data)[i]);
 }
 
@@ -1239,6 +1241,9 @@ gf100_grctx_generate_floorsweep(struct gf100_gr *gr)
 		nvkm_wr32(device, 0x406028 + (i * 4), data);
 		nvkm_wr32(device, 0x405870 + (i * 4), data);
 	}
+
+	if (func->r4060a8)
+		func->r4060a8(gr);
 }
 
 void
@@ -1270,7 +1275,6 @@ gf100_grctx_generate_main(struct gf100_gr *gr, struct gf100_grctx *info)
 	grctx->unkn(gr);
 
 	gf100_grctx_generate_floorsweep(gr);
-	gf100_grctx_generate_r4060a8(gr);
 	gf100_grctx_generate_r418bb8(gr);
 	gf100_grctx_generate_r406800(gr);
 
@@ -1416,4 +1420,5 @@ gf100_grctx = {
 	.attrib_nr = 0x218,
 	.sm_id = gf100_grctx_generate_sm_id,
 	.tpc_nr = gf100_grctx_generate_tpc_nr,
+	.r4060a8 = gf100_grctx_generate_r4060a8,
 };
