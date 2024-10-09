@@ -1,0 +1,209 @@
+netvsc: prefetch the first incoming ring element
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 43bf99ce009de710b68473480a611f3b5ddd11d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/43bf99ce.failed
+
+In interrupt handler, prefetch the first incoming ring element
+so that it is in cache by the time NAPI poll gets to it.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 43bf99ce009de710b68473480a611f3b5ddd11d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 3170ba757106,06f39a99da7c..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -29,6 -28,10 +29,13 @@@
+  #include <linux/slab.h>
+  #include <linux/netdevice.h>
+  #include <linux/if_ether.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/vmalloc.h>
++ #include <linux/rtnetlink.h>
++ #include <linux/prefetch.h>
++ 
+++>>>>>>> 43bf99ce009d (netvsc: prefetch the first incoming ring element)
+  #include <asm/sync_bitops.h>
+  
+  #include "hyperv_net.h"
+@@@ -1238,101 -1205,79 +1245,114 @@@ static void netvsc_process_raw_pkt(stru
+  
+  	default:
+  		netdev_err(ndev, "unhandled packet type %d, tid %llx\n",
+ -			   desc->type, desc->trans_id);
+ +			   desc->type, request_id);
+  		break;
+  	}
+ -
+ -	return 0;
+ -}
+ -
+ -static struct hv_device *netvsc_channel_to_device(struct vmbus_channel *channel)
+ -{
+ -	struct vmbus_channel *primary = channel->primary_channel;
+ -
+ -	return primary ? primary->device_obj : channel->device_obj;
+  }
+  
+ -/* Network processing softirq
+ - * Process data in incoming ring buffer from host
+ - * Stops when ring is empty or budget is met or exceeded.
+ - */
+ -int netvsc_poll(struct napi_struct *napi, int budget)
+ +void netvsc_channel_cb(void *context)
+  {
+ -	struct netvsc_channel *nvchan
+ -		= container_of(napi, struct netvsc_channel, napi);
+ -	struct netvsc_device *net_device = nvchan->net_device;
+ -	struct vmbus_channel *channel = nvchan->channel;
+ -	struct hv_device *device = netvsc_channel_to_device(channel);
+++<<<<<<< HEAD
+ +	int ret;
+ +	struct vmbus_channel *channel = (struct vmbus_channel *)context;
+  	u16 q_idx = channel->offermsg.offer.sub_channel_index;
+ -	struct net_device *ndev = hv_get_drvdata(device);
+ -	int work_done = 0;
+ -
+ -	/* If starting a new interval */
+ -	if (!nvchan->desc)
+ -		nvchan->desc = hv_pkt_iter_first(channel);
+ -
+ -	while (nvchan->desc && work_done < budget) {
+ -		work_done += netvsc_process_raw_pkt(device, channel, net_device,
+ -						    ndev, nvchan->desc, budget);
+ -		nvchan->desc = hv_pkt_iter_next(channel, nvchan->desc);
+ -	}
+ -
+ -	/* If receive ring was exhausted
+ -	 * and not doing busy poll
+ -	 * then re-enable host interrupts
+ -	 *  and reschedule if ring is not empty.
+ -	 */
+ -	if (work_done < budget &&
+ -	    napi_complete_done(napi, work_done) &&
+ -	    hv_end_read(&channel->inbound) != 0)
+ -		napi_reschedule(napi);
+ -
+ -	netvsc_chk_recv_comp(net_device, channel, q_idx);
+ -
+ -	/* Driver may overshoot since multiple packets per descriptor */
+ -	return min(work_done, budget);
+ -}
+ +	struct hv_device *device;
+ +	struct netvsc_device *net_device;
+ +	u32 bytes_recvd;
+ +	u64 request_id;
+ +	struct vmpacket_descriptor *desc;
+ +	unsigned char *buffer;
+ +	int bufferlen = NETVSC_PACKET_SIZE;
+ +	struct net_device *ndev;
+ +	bool need_to_commit = false;
+  
+ -/* Call back when data is available in host ring buffer.
+ - * Processing is deferred until network softirq (NAPI)
+ - */
+ -void netvsc_channel_cb(void *context)
+ -{
+ +	if (channel->primary_channel != NULL)
+ +		device = channel->primary_channel->device_obj;
+ +	else
+ +		device = channel->device_obj;
+++=======
++ 	struct netvsc_channel *nvchan = context;
++ 	struct vmbus_channel *channel = nvchan->channel;
++ 	struct hv_ring_buffer_info *rbi = &channel->inbound;
++ 
++ 	/* preload first vmpacket descriptor */
++ 	prefetch(hv_get_ring_buffer(rbi) + rbi->priv_read_index);
++ 
++ 	if (napi_schedule_prep(&nvchan->napi)) {
++ 		/* disable interupts from host */
++ 		hv_begin_read(rbi);
+++>>>>>>> 43bf99ce009d (netvsc: prefetch the first incoming ring element)
+  
+ -		__napi_schedule(&nvchan->napi);
+ -	}
+ +	net_device = get_inbound_net_device(device);
+ +	if (!net_device)
+ +		return;
+ +	ndev = hv_get_drvdata(device);
+ +	buffer = get_per_channel_state(channel);
+ +
+ +	/* commit_rd_index() -> hv_signal_on_read() needs this. */
+ +	init_cached_read_index(channel);
+ +
+ +	do {
+ +		desc = get_next_pkt_raw(channel);
+ +		if (desc != NULL) {
+ +			netvsc_process_raw_pkt(device,
+ +					       channel,
+ +					       net_device,
+ +					       ndev,
+ +					       desc->trans_id,
+ +					       desc);
+ +
+ +			put_pkt_raw(channel, desc);
+ +			need_to_commit = true;
+ +			continue;
+ +		}
+ +		if (need_to_commit) {
+ +			need_to_commit = false;
+ +			commit_rd_index(channel);
+ +		}
+ +
+ +		ret = vmbus_recvpacket_raw(channel, buffer, bufferlen,
+ +					   &bytes_recvd, &request_id);
+ +		if (ret == 0) {
+ +			if (bytes_recvd > 0) {
+ +				desc = (struct vmpacket_descriptor *)buffer;
+ +				netvsc_process_raw_pkt(device,
+ +						       channel,
+ +						       net_device,
+ +						       ndev,
+ +						       request_id,
+ +						       desc);
+ +			} else {
+ +				/*
+ +				 * We are done for this pass.
+ +				 */
+ +				break;
+ +			}
+ +
+ +		} else if (ret == -ENOBUFS) {
+ +			if (bufferlen > NETVSC_PACKET_SIZE)
+ +				kfree(buffer);
+ +			/* Handle large packet */
+ +			buffer = kmalloc(bytes_recvd, GFP_ATOMIC);
+ +			if (buffer == NULL) {
+ +				/* Try again next time around */
+ +				netdev_err(ndev,
+ +					   "unable to allocate buffer of size "
+ +					   "(%d)!!\n", bytes_recvd);
+ +				break;
+ +			}
+ +
+ +			bufferlen = bytes_recvd;
+ +		}
+ +
+ +		init_cached_read_index(channel);
+ +
+ +	} while (1);
+ +
+ +	if (bufferlen > NETVSC_PACKET_SIZE)
+ +		kfree(buffer);
+ +
+ +	netvsc_chk_recv_comp(net_device, channel, q_idx);
+  }
+  
+  /*
+* Unmerged path drivers/net/hyperv/netvsc.c
