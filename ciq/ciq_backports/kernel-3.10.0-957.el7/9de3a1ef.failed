@@ -1,0 +1,186 @@
+scsi: tcmu: simplify nl interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 9de3a1ef032a5ad5d7b642d625b6bd362b1989d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9de3a1ef.failed
+
+Just return EBUSY if a nl request comes in while processing one. The upper
+layers do not support sending multiple create/remove requests at the same
+time (you cannot have a create and remove at the same time or do multiple
+creates or removes at the same time) and doing a reconfig while a
+create/remove is still executing does not make sense.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Tested-by: Xiubo Li <xiubli@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9de3a1ef032a5ad5d7b642d625b6bd362b1989d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5534ef1b341c,9835ea3c4dcc..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -114,25 -146,29 +114,23 @@@ struct tcmu_dev 
+  	uint32_t max_blocks;
+  	size_t ring_size;
+  
+ -	struct mutex cmdr_lock;
+ -	struct list_head cmdr_queue;
+ -
+ -	uint32_t dbi_max;
+ -	uint32_t dbi_thresh;
+  	unsigned long *data_bitmap;
+ -	struct radix_tree_root data_blocks;
+ +
+ +	wait_queue_head_t wait_cmdr;
+ +	/* TODO should this be a mutex? */
+ +	spinlock_t cmdr_lock;
+  
+  	struct idr commands;
+ +	spinlock_t commands_lock;
+  
+ -	struct timer_list cmd_timer;
+ +	struct timer_list timeout;
+  	unsigned int cmd_time_out;
+ -
+ -	struct timer_list qfull_timer;
+  	int qfull_time_out;
+  
+ -	struct list_head timedout_entry;
+ -
+ +	spinlock_t nl_cmd_lock;
+  	struct tcmu_nl_cmd curr_nl_cmd;
+- 	/* wake up threads waiting on curr_nl_cmd */
+- 	wait_queue_head_t nl_cmd_wq;
+  
+  	char dev_config[TCMU_CONFIG_LEN];
+ -
+ -	int nl_reply_supported;
+  };
+  
+  #define TCMU_DEV(_se_dev) container_of(_se_dev, struct tcmu_dev, se_dev)
+@@@ -957,18 -1253,16 +955,22 @@@ static struct se_device *tcmu_alloc_dev
+  	udev->qfull_time_out = -1;
+  
+  	udev->max_blocks = DATA_BLOCK_BITS_DEF;
+ -	mutex_init(&udev->cmdr_lock);
+  
+ -	INIT_LIST_HEAD(&udev->timedout_entry);
+ -	INIT_LIST_HEAD(&udev->cmdr_queue);
+ +	init_waitqueue_head(&udev->wait_cmdr);
+ +	spin_lock_init(&udev->cmdr_lock);
+ +
+  	idr_init(&udev->commands);
+ +	spin_lock_init(&udev->commands_lock);
+  
+ -	timer_setup(&udev->qfull_timer, tcmu_qfull_timedout, 0);
+ -	timer_setup(&udev->cmd_timer, tcmu_cmd_timedout, 0);
+ +	setup_timer(&udev->timeout, tcmu_device_timedout,
+ +		(unsigned long)udev);
+  
+++<<<<<<< HEAD
+ +	init_waitqueue_head(&udev->nl_cmd_wq);
+ +	spin_lock_init(&udev->nl_cmd_lock);
+++=======
++ 	INIT_RADIX_TREE(&udev->data_blocks, GFP_KERNEL);
+++>>>>>>> 9de3a1ef032a (scsi: tcmu: simplify nl interface)
+  
+  	return &udev->se_dev;
+  }
+@@@ -1076,22 -1540,30 +1078,44 @@@ static int tcmu_init_genl_cmd_reply(str
+  	struct tcmu_nl_cmd *nl_cmd = &udev->curr_nl_cmd;
+  
+  	if (!tcmu_kern_cmd_reply_supported)
+++<<<<<<< HEAD
+ +		return;
+ +relock:
+ +	spin_lock(&udev->nl_cmd_lock);
+ +
+ +	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
+ +		spin_unlock(&udev->nl_cmd_lock);
+ +		pr_debug("sleeping for open nl cmd\n");
+ +		wait_event(udev->nl_cmd_wq, (nl_cmd->cmd == TCMU_CMD_UNSPEC));
+ +		goto relock;
+++=======
++ 		return 0;
++ 
++ 	if (udev->nl_reply_supported <= 0)
++ 		return 0;
++ 
++ 	mutex_lock(&tcmu_nl_cmd_mutex);
++ 
++ 	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
++ 		mutex_unlock(&tcmu_nl_cmd_mutex);
++ 		pr_warn("netlink cmd %d already executing on %s\n",
++ 			 nl_cmd->cmd, udev->name);
++ 		return -EBUSY;
+++>>>>>>> 9de3a1ef032a (scsi: tcmu: simplify nl interface)
+  	}
+  
+  	memset(nl_cmd, 0, sizeof(*nl_cmd));
+  	nl_cmd->cmd = cmd;
+ -	nl_cmd->udev = udev;
+  	init_completion(&nl_cmd->complete);
+ -	INIT_LIST_HEAD(&nl_cmd->nl_list);
+  
+++<<<<<<< HEAD
+ +	spin_unlock(&udev->nl_cmd_lock);
+++=======
++ 	list_add_tail(&nl_cmd->nl_list, &tcmu_nl_cmd_list);
++ 
++ 	mutex_unlock(&tcmu_nl_cmd_mutex);
++ 	return 0;
+++>>>>>>> 9de3a1ef032a (scsi: tcmu: simplify nl interface)
+  }
+  
+  static int tcmu_wait_genl_cmd_reply(struct tcmu_dev *udev)
+@@@ -1109,15 -1584,14 +1133,19 @@@
+  	nl_cmd->cmd = TCMU_CMD_UNSPEC;
+  	ret = nl_cmd->status;
+  	nl_cmd->status = 0;
+ -	mutex_unlock(&tcmu_nl_cmd_mutex);
+ +	spin_unlock(&udev->nl_cmd_lock);
+ +
+++<<<<<<< HEAD
+ +	wake_up_all(&udev->nl_cmd_wq);
+  
+ +       return ret;;
+++=======
++ 	return ret;
+++>>>>>>> 9de3a1ef032a (scsi: tcmu: simplify nl interface)
+  }
+  
+ -static int tcmu_netlink_event_init(struct tcmu_dev *udev,
+ -				   enum tcmu_genl_cmd cmd,
+ -				   struct sk_buff **buf, void **hdr)
+ +static int tcmu_netlink_event(struct tcmu_dev *udev, enum tcmu_genl_cmd cmd,
+ +			      int reconfig_attr, const void *reconfig_data)
+  {
+  	struct sk_buff *skb;
+  	void *msg_header;
+@@@ -1160,11 -1636,15 +1188,15 @@@
+  
+  	genlmsg_end(skb, msg_header);
+  
+- 	tcmu_init_genl_cmd_reply(udev, cmd);
++ 	ret = tcmu_init_genl_cmd_reply(udev, cmd);
++ 	if (ret) {
++ 		nlmsg_free(skb);
++ 		return ret;
++ 	}
+  
+  	ret = genlmsg_multicast_allns(&tcmu_genl_family, skb, 0,
+ -				      TCMU_MCGRP_CONFIG, GFP_KERNEL);
+ -       /* We don't care if no one is listening */
+ +				TCMU_MCGRP_CONFIG, GFP_KERNEL);
+ +	/* We don't care if no one is listening */
+  	if (ret == -ESRCH)
+  		ret = 0;
+  	if (!ret)
+* Unmerged path drivers/target/target_core_user.c
