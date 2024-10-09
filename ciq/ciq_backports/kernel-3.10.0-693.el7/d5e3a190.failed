@@ -1,0 +1,138 @@
+l2tp: fix racy socket lookup in l2tp_ip and l2tp_ip6 bind()
+
+jira LE-1907
+cve CVE-2016-10200
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Guillaume Nault <g.nault@alphalink.fr>
+commit d5e3a190937a1e386671266202c62565741f0f1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d5e3a190.failed
+
+It's not enough to check for sockets bound to same address at the
+beginning of l2tp_ip{,6}_bind(): even if no socket is found at that
+time, a socket with the same address could be bound before we take
+the l2tp lock again.
+
+This patch moves the lookup right before inserting the new socket, so
+that no change can ever happen to the list between address lookup and
+socket insertion.
+
+Care is taken to avoid side effects on the socket in case of failure.
+That is, modifications of the socket are done after the lookup, when
+binding is guaranteed to succeed, and before releasing the l2tp lock,
+so that concurrent lookups will always see fully initialised sockets.
+
+For l2tp_ip, 'ret' is set to -EINVAL before checking the SOCK_ZAPPED
+bit. Error code was mistakenly set to -EADDRINUSE on error by commit
+32c231164b76 ("l2tp: fix racy SOCK_ZAPPED flag check in l2tp_ip{,6}_bind()").
+Using -EINVAL restores original behaviour.
+
+For l2tp_ip6, the lookup is now always done with the correct bound
+device. Before this patch, when binding to a link-local address, the
+lookup was done with the original sk->sk_bound_dev_if, which was later
+overwritten with addr->l2tp_scope_id. Lookup is now performed with the
+final sk->sk_bound_dev_if value.
+
+Finally, the (addr_len >= sizeof(struct sockaddr_in6)) check has been
+dropped: addr is a sockaddr_l2tpip6 not sockaddr_in6 and addr_len has
+already been checked at this point (this part of the code seems to have
+been copy-pasted from net/ipv6/raw.c).
+
+	Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d5e3a190937a1e386671266202c62565741f0f1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/l2tp/l2tp_ip6.c
+diff --cc net/l2tp/l2tp_ip6.c
+index b296fd192ac0,5f2ae615c5f9..000000000000
+--- a/net/l2tp/l2tp_ip6.c
++++ b/net/l2tp/l2tp_ip6.c
+@@@ -261,7 -265,9 +261,8 @@@ static int l2tp_ip6_bind(struct sock *s
+  	struct inet_sock *inet = inet_sk(sk);
+  	struct ipv6_pinfo *np = inet6_sk(sk);
+  	struct sockaddr_l2tpip6 *addr = (struct sockaddr_l2tpip6 *) uaddr;
+ -	struct net *net = sock_net(sk);
+  	__be32 v4addr = 0;
++ 	int bound_dev_if;
+  	int addr_type;
+  	int err;
+  
+@@@ -280,13 -286,6 +281,16 @@@
+  	if (addr_type & IPV6_ADDR_MULTICAST)
+  		return -EADDRNOTAVAIL;
+  
+++<<<<<<< HEAD
+ +	err = -EADDRINUSE;
+ +	read_lock_bh(&l2tp_ip6_lock);
+ +	if (__l2tp_ip6_bind_lookup(&init_net, &addr->l2tp_addr,
+ +				   sk->sk_bound_dev_if, addr->l2tp_conn_id))
+ +		goto out_in_use;
+ +	read_unlock_bh(&l2tp_ip6_lock);
+ +
+++=======
+++>>>>>>> d5e3a190937a (l2tp: fix racy socket lookup in l2tp_ip and l2tp_ip6 bind())
+  	lock_sock(sk);
+  
+  	err = -EINVAL;
+diff --git a/net/l2tp/l2tp_ip.c b/net/l2tp/l2tp_ip.c
+index 3d97ef7ec584..35fe58a38383 100644
+--- a/net/l2tp/l2tp_ip.c
++++ b/net/l2tp/l2tp_ip.c
+@@ -255,15 +255,9 @@ static int l2tp_ip_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 	if (addr->l2tp_family != AF_INET)
+ 		return -EINVAL;
+ 
+-	ret = -EADDRINUSE;
+-	read_lock_bh(&l2tp_ip_lock);
+-	if (__l2tp_ip_bind_lookup(net, addr->l2tp_addr.s_addr,
+-				  sk->sk_bound_dev_if, addr->l2tp_conn_id))
+-		goto out_in_use;
+-
+-	read_unlock_bh(&l2tp_ip_lock);
+-
+ 	lock_sock(sk);
++
++	ret = -EINVAL;
+ 	if (!sock_flag(sk, SOCK_ZAPPED))
+ 		goto out;
+ 
+@@ -280,25 +274,28 @@ static int l2tp_ip_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 		inet->inet_rcv_saddr = inet->inet_saddr = addr->l2tp_addr.s_addr;
+ 	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
+ 		inet->inet_saddr = 0;  /* Use device */
+-	sk_dst_reset(sk);
+ 
++	write_lock_bh(&l2tp_ip_lock);
++	if (__l2tp_ip_bind_lookup(net, addr->l2tp_addr.s_addr,
++				  sk->sk_bound_dev_if, addr->l2tp_conn_id)) {
++		write_unlock_bh(&l2tp_ip_lock);
++		ret = -EADDRINUSE;
++		goto out;
++	}
++
++	sk_dst_reset(sk);
+ 	l2tp_ip_sk(sk)->conn_id = addr->l2tp_conn_id;
+ 
+-	write_lock_bh(&l2tp_ip_lock);
+ 	sk_add_bind_node(sk, &l2tp_ip_bind_table);
+ 	sk_del_node_init(sk);
+ 	write_unlock_bh(&l2tp_ip_lock);
++
+ 	ret = 0;
+ 	sock_reset_flag(sk, SOCK_ZAPPED);
+ 
+ out:
+ 	release_sock(sk);
+ 
+-	return ret;
+-
+-out_in_use:
+-	read_unlock_bh(&l2tp_ip_lock);
+-
+ 	return ret;
+ }
+ 
+* Unmerged path net/l2tp/l2tp_ip6.c
