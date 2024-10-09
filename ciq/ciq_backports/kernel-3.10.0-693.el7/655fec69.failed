@@ -1,0 +1,453 @@
+xprtrdma: Use gathered Send for large inline messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 655fec6987be05964e70c2e2efcbb253710e282f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/655fec69.failed
+
+An RPC Call message that is sent inline but that has a data payload
+(ie, one or more items in rq_snd_buf's page list) must be "pulled
+up:"
+
+- call_allocate has to reserve enough RPC Call buffer space to
+accommodate the data payload
+
+- call_transmit has to memcopy the rq_snd_buf's page list and tail
+into its head iovec before it is sent
+
+As the inline threshold is increased beyond its current 1KB default,
+however, this means data payloads of more than a few KB are copied
+by the host CPU. For example, if the inline threshold is increased
+just to 4KB, then NFS WRITE requests up to 4KB would involve a
+memcpy of the NFS WRITE's payload data into the RPC Call buffer.
+This is an undesirable amount of participation by the host CPU.
+
+The inline threshold may be much larger than 4KB in the future,
+after negotiation with a peer server.
+
+Instead of copying the components of rq_snd_buf into its head iovec,
+construct a gather list of these components, and send them all in
+place. The same approach is already used in the Linux server's
+RPC-over-RDMA reply path.
+
+This mechanism also eliminates the need for rpcrdma_tail_pullup,
+which is used to manage the XDR pad and trailing inline content when
+a Read list is present.
+
+This requires that the pages in rq_snd_buf's page list be DMA-mapped
+during marshaling, and unmapped when a data-bearing RPC is
+completed. This is slightly less efficient for very small I/O
+payloads, but significantly more efficient as data payload size and
+inline threshold increase past a kilobyte.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 655fec6987be05964e70c2e2efcbb253710e282f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/backchannel.c
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/transport.c
+#	net/sunrpc/xprtrdma/verbs.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/backchannel.c
+index 5b6f45443e47,2c472e1b4827..000000000000
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@@ -221,26 -217,9 +220,32 @@@ int rpcrdma_bc_marshal_reply(struct rpc
+  	headerp->rm_body.rm_chunks[1] = xdr_zero;
+  	headerp->rm_body.rm_chunks[2] = xdr_zero;
+  
+++<<<<<<< HEAD
+ +	rpclen = rqst->rq_svec[0].iov_len;
+ +
+ +#ifdef RPCRDMA_BACKCHANNEL_DEBUG
+ +	pr_info("RPC:       %s: rpclen %zd headerp 0x%p lkey 0x%x\n",
+ +		__func__, rpclen, headerp, rdmab_lkey(req->rl_rdmabuf));
+ +	pr_info("RPC:       %s: RPC/RDMA: %*ph\n",
+ +		__func__, (int)RPCRDMA_HDRLEN_MIN, headerp);
+ +	pr_info("RPC:       %s:      RPC: %*ph\n",
+ +		__func__, (int)rpclen, rqst->rq_svec[0].iov_base);
+ +#endif
+ +
+ +	req->rl_send_iov[0].addr = rdmab_addr(req->rl_rdmabuf);
+ +	req->rl_send_iov[0].length = RPCRDMA_HDRLEN_MIN;
+ +	req->rl_send_iov[0].lkey = rdmab_lkey(req->rl_rdmabuf);
+ +
+ +	req->rl_send_iov[1].addr = rdmab_addr(req->rl_sendbuf);
+ +	req->rl_send_iov[1].length = rpclen;
+ +	req->rl_send_iov[1].lkey = rdmab_lkey(req->rl_sendbuf);
+ +
+ +	req->rl_niovs = 2;
+++=======
++ 	if (!rpcrdma_prepare_send_sges(&r_xprt->rx_ia, req, RPCRDMA_HDRLEN_MIN,
++ 				       &rqst->rq_snd_buf, rpcrdma_noch))
++ 		return -EIO;
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  	return 0;
+  }
+  
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 83e624c2ef04,63bf0119f949..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -833,29 -755,13 +895,39 @@@ rpcrdma_marshal_req(struct rpc_rqst *rq
+  		transfertypes[rtype], transfertypes[wtype],
+  		hdrlen, rpclen);
+  
+++<<<<<<< HEAD
+ +	req->rl_send_iov[0].addr = rdmab_addr(req->rl_rdmabuf);
+ +	req->rl_send_iov[0].length = hdrlen;
+ +	req->rl_send_iov[0].lkey = rdmab_lkey(req->rl_rdmabuf);
+ +
+ +	req->rl_niovs = 1;
+ +	if (rtype == rpcrdma_areadch)
+ +		return 0;
+ +
+ +	req->rl_send_iov[1].addr = rdmab_addr(req->rl_sendbuf);
+ +	req->rl_send_iov[1].length = rpclen;
+ +	req->rl_send_iov[1].lkey = rdmab_lkey(req->rl_sendbuf);
+ +
+ +	req->rl_niovs = 2;
+ +	return 0;
+ +
+ +out_overflow:
+ +	pr_err("rpcrdma: send overflow: hdrlen %zd rpclen %zu %s/%s\n",
+ +		hdrlen, rpclen, transfertypes[rtype], transfertypes[wtype]);
+ +	/* Terminate this RPC. Chunks registered above will be
+ +	 * released by xprt_release -> xprt_rmda_free .
+ +	 */
+ +	return -EIO;
+ +
+++=======
++ 	if (!rpcrdma_prepare_send_sges(&r_xprt->rx_ia, req, hdrlen,
++ 				       &rqst->rq_snd_buf, rtype)) {
++ 		iptr = ERR_PTR(-EIO);
++ 		goto out_unmap;
++ 	}
++ 	return 0;
++ 
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  out_unmap:
+  	r_xprt->rx_ia.ri_ops->ro_unmap_safe(r_xprt, req, false);
+  	return PTR_ERR(iptr);
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,6a358ab6ce27..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -477,23 -477,99 +477,106 @@@ xprt_rdma_connect(struct rpc_xprt *xprt
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ /* Allocate a fixed-size buffer in which to construct and send the
++  * RPC-over-RDMA header for this request.
++  */
++ static bool
++ rpcrdma_get_rdmabuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    gfp_t flags)
++ {
++ 	size_t size = RPCRDMA_HDRBUF_SIZE;
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_rdmabuf)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(size, DMA_TO_DEVICE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_rdmabuf = rb;
++ 	return true;
++ }
++ 
++ static bool
++ rpcrdma_get_sendbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_sendbuf && rdmab_length(req->rl_sendbuf) >= size)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(size, DMA_TO_DEVICE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(req->rl_sendbuf);
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_sendbuf = rb;
++ 	return true;
++ }
++ 
++ /* The rq_rcv_buf is used only if a Reply chunk is necessary.
++  * The decision to use a Reply chunk is made later in
++  * rpcrdma_marshal_req. This buffer is registered at that time.
++  *
++  * Otherwise, the associated RPC Reply arrives in a separate
++  * Receive buffer, arbitrarily chosen by the HCA. The buffer
++  * allocated here for the RPC Reply is not utilized in that
++  * case. See rpcrdma_inline_fixup.
++  *
++  * A regbuf is used here to remember the buffer size.
++  */
++ static bool
++ rpcrdma_get_recvbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_recvbuf && rdmab_length(req->rl_recvbuf) >= size)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(size, DMA_NONE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(req->rl_recvbuf);
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_recvbuf = rb;
++ 	return true;
++ }
++ 
++ /**
++  * xprt_rdma_allocate - allocate transport resources for an RPC
++  * @task: RPC task
++  *
++  * Return values:
++  *        0:	Success; rq_buffer points to RPC buffer to use
++  *   ENOMEM:	Out of memory, call again later
++  *      EIO:	A permanent error occurred, do not retry
++  *
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+   * The RDMA allocate/free functions need the task structure as a place
+ - * to hide the struct rpcrdma_req, which is necessary for the actual
+ - * send/recv sequence.
+ + * to hide the struct rpcrdma_req, which is necessary for the actual send/recv
+ + * sequence.
+   *
+ - * xprt_rdma_allocate provides buffers that are already mapped for
+ - * DMA, and a local DMA lkey is provided for each.
+ + * The RPC layer allocates both send and receive buffers in the same call
+ + * (rq_send_buf and rq_rcv_buf are both part of a single contiguous buffer).
+ + * We may register rq_rcv_buf when using reply chunks.
+   */
+ -static int
+ -xprt_rdma_allocate(struct rpc_task *task)
+ +static void *
+ +xprt_rdma_allocate(struct rpc_task *task, size_t size)
+  {
+ -	struct rpc_rqst *rqst = task->tk_rqstp;
+ -	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
+ +	struct rpc_xprt *xprt = task->tk_rqstp->rq_xprt;
+ +	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
+ +	struct rpcrdma_regbuf *rb;
+  	struct rpcrdma_req *req;
+ +	size_t min_size;
+  	gfp_t flags;
+  
+  	req = rpcrdma_buffer_get(&r_xprt->rx_buf);
+@@@ -558,35 -599,30 +641,47 @@@ out_sendbuf
+  
+  out_fail:
+  	rpcrdma_buffer_put(req);
+ -	return -ENOMEM;
+ +	r_xprt->rx_stats.failed_marshal_count++;
+ +	return NULL;
+  }
+  
+ -/**
+ - * xprt_rdma_free - release resources allocated by xprt_rdma_allocate
+ - * @task: RPC task
+ - *
+ - * Caller guarantees rqst->rq_buffer is non-NULL.
+ +/*
+ + * This function returns all RDMA resources to the pool.
+   */
+  static void
+ -xprt_rdma_free(struct rpc_task *task)
+ +xprt_rdma_free(void *buffer)
+  {
+++<<<<<<< HEAD
+ +	struct rpcrdma_req *req;
+ +	struct rpcrdma_xprt *r_xprt;
+ +	struct rpcrdma_regbuf *rb;
+++=======
++ 	struct rpc_rqst *rqst = task->tk_rqstp;
++ 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
++ 	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
++ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+ +
+ +	if (buffer == NULL)
+ +		return;
+  
+ +	rb = container_of(buffer, struct rpcrdma_regbuf, rg_base[0]);
+ +	req = rb->rg_owner;
+  	if (req->rl_backchannel)
+  		return;
+  
+ +	r_xprt = container_of(req->rl_buffer, struct rpcrdma_xprt, rx_buf);
+ +
+  	dprintk("RPC:       %s: called on 0x%p\n", __func__, req->rl_reply);
+  
+++<<<<<<< HEAD
+ +	r_xprt->rx_ia.ri_ops->ro_unmap_safe(r_xprt, req,
+ +					    !RPC_IS_ASYNC(req->rl_task));
+ +
+++=======
++ 	ia->ri_ops->ro_unmap_safe(r_xprt, req, !RPC_IS_ASYNC(task));
++ 	rpcrdma_unmap_sges(ia, req);
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  	rpcrdma_buffer_put(req);
+  }
+  
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 0e2259140f79,eeaca9c83635..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -828,6 -888,11 +828,14 @@@ rpcrdma_create_req(struct rpcrdma_xprt 
+  	spin_unlock(&buffer->rb_reqslock);
+  	req->rl_cqe.done = rpcrdma_wc_send;
+  	req->rl_buffer = &r_xprt->rx_buf;
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&req->rl_registered);
++ 	req->rl_send_wr.next = NULL;
++ 	req->rl_send_wr.wr_cqe = &req->rl_cqe;
++ 	req->rl_send_wr.sg_list = req->rl_send_sge;
++ 	req->rl_send_wr.opcode = IB_WR_SEND;
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  	return req;
+  }
+  
+@@@ -1184,44 -1306,35 +1192,53 @@@ rpcrdma_ep_post(struct rpcrdma_ia *ia
+  		struct rpcrdma_ep *ep,
+  		struct rpcrdma_req *req)
+  {
+++<<<<<<< HEAD
+ +	struct ib_device *device = ia->ri_device;
+ +	struct ib_send_wr send_wr, *send_wr_fail;
+ +	struct rpcrdma_rep *rep = req->rl_reply;
+ +	struct ib_sge *iov = req->rl_send_iov;
+ +	int i, rc;
+++=======
++ 	struct ib_send_wr *send_wr = &req->rl_send_wr;
++ 	struct ib_send_wr *send_wr_fail;
++ 	int rc;
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  
+ -	if (req->rl_reply) {
+ -		rc = rpcrdma_ep_post_recv(ia, req->rl_reply);
+ +	if (rep) {
+ +		rc = rpcrdma_ep_post_recv(ia, rep);
+  		if (rc)
+ -			return rc;
+ +			goto out;
+  		req->rl_reply = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	send_wr.next = NULL;
+ +	send_wr.wr_cqe = &req->rl_cqe;
+ +	send_wr.sg_list = iov;
+ +	send_wr.num_sge = req->rl_niovs;
+ +	send_wr.opcode = IB_WR_SEND;
+ +
+ +	for (i = 0; i < send_wr.num_sge; i++)
+ +		ib_dma_sync_single_for_device(device, iov[i].addr,
+ +					      iov[i].length, DMA_TO_DEVICE);
+++=======
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  	dprintk("RPC:       %s: posting %d s/g entries\n",
+ -		__func__, send_wr->num_sge);
+ +		__func__, send_wr.num_sge);
+  
+  	if (DECR_CQCOUNT(ep) > 0)
+ -		send_wr->send_flags = 0;
+ +		send_wr.send_flags = 0;
+  	else { /* Provider must take a send completion every now and then */
+  		INIT_CQCOUNT(ep);
+ -		send_wr->send_flags = IB_SEND_SIGNALED;
+ +		send_wr.send_flags = IB_SEND_SIGNALED;
+  	}
+  
+ -	rc = ib_post_send(ia->ri_id->qp, send_wr, &send_wr_fail);
+ +	rc = ib_post_send(ia->ri_id->qp, &send_wr, &send_wr_fail);
+  	if (rc)
+ -		goto out_postsend_err;
+ -	return 0;
+ -
+ -out_postsend_err:
+ -	pr_err("rpcrdma: RDMA Send ib_post_send returned %i\n", rc);
+ -	return -ENOTCONN;
+ +		dprintk("RPC:       %s: ib_post_send returned %i\n", __func__,
+ +			rc);
+ +out:
+ +	return rc;
+  }
+  
+  int
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index ae3921a9fec6,b2823d9b79ae..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -285,21 -285,30 +285,44 @@@ struct rpcrdma_mr_seg {		/* chunk descr
+  	char		*mr_offset;	/* kva if no page, else offset */
+  };
+  
+- #define RPCRDMA_MAX_IOVS	(2)
++ /* Reserve enough Send SGEs to send a maximum size inline request:
++  * - RPC-over-RDMA header
++  * - xdr_buf head iovec
++  * - RPCRDMA_MAX_INLINE bytes, possibly unaligned, in pages
++  * - xdr_buf tail iovec
++  */
++ enum {
++ 	RPCRDMA_MAX_SEND_PAGES = PAGE_SIZE + RPCRDMA_MAX_INLINE - 1,
++ 	RPCRDMA_MAX_PAGE_SGES = (RPCRDMA_MAX_SEND_PAGES >> PAGE_SHIFT) + 1,
++ 	RPCRDMA_MAX_SEND_SGES = 1 + 1 + RPCRDMA_MAX_PAGE_SGES + 1,
++ };
+  
+ -struct rpcrdma_buffer;
+  struct rpcrdma_req {
+  	struct list_head	rl_free;
+++<<<<<<< HEAD
+ +	unsigned int		rl_niovs;
+ +	unsigned int		rl_nchunks;
+++=======
++ 	unsigned int		rl_mapped_sges;
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  	unsigned int		rl_connect_cookie;
+ +	struct rpc_task		*rl_task;
+  	struct rpcrdma_buffer	*rl_buffer;
+++<<<<<<< HEAD
+ +	struct rpcrdma_rep	*rl_reply;/* holder for reply buffer */
+ +	struct ib_sge		rl_send_iov[RPCRDMA_MAX_IOVS];
+ +	struct rpcrdma_regbuf	*rl_rdmabuf;
+ +	struct rpcrdma_regbuf	*rl_sendbuf;
+ +	struct rpcrdma_mr_seg	rl_segments[RPCRDMA_MAX_SEGS];
+ +	struct rpcrdma_mr_seg	*rl_nextseg;
+++=======
++ 	struct rpcrdma_rep	*rl_reply;
++ 	struct ib_send_wr	rl_send_wr;
++ 	struct ib_sge		rl_send_sge[RPCRDMA_MAX_SEND_SGES];
++ 	struct rpcrdma_regbuf	*rl_rdmabuf;	/* xprt header */
++ 	struct rpcrdma_regbuf	*rl_sendbuf;	/* rq_snd_buf */
++ 	struct rpcrdma_regbuf	*rl_recvbuf;	/* rq_rcv_buf */
+++>>>>>>> 655fec6987be (xprtrdma: Use gathered Send for large inline messages)
+  
+  	struct ib_cqe		rl_cqe;
+  	struct list_head	rl_all;
+* Unmerged path net/sunrpc/xprtrdma/backchannel.c
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
