@@ -1,0 +1,361 @@
+scsi: mpt3sas: Lockless access for chain buffers.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: Lockless access for chain buffers (Tomas Henzl) [1513855]
+Rebuild_FUZZ: 92.31%
+commit-author Chaitra P B <chaitra.basappa@broadcom.com>
+commit 93204b782a88f2067ff83cb732b66236644c4c56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/93204b78.failed
+
+Introduces Chain lookup table/tracker and implements accessing chain
+buffer using smid.  Removed link list based access of chain buffer which
+requires lock and allocated as many chains needed.
+
+	Signed-off-by: Chaitra P B <chaitra.basappa@broadcom.com>
+	Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 93204b782a88f2067ff83cb732b66236644c4c56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.c
+index 32e701bf73f2,147524cce8d7..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@@ -218,6 -283,216 +218,219 @@@ _base_get_buffer_phys_bar0(struct MPT3S
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * _base_get_chain_buffer_dma_to_chain_buffer - Iterates chain
++  *			lookup list and Provides chain_buffer
++  *			address for the matching dma address.
++  *			(Each smid can have 64K starts from 17024)
++  *
++  * @ioc: per adapter object
++  * @chain_buffer_dma: Chain buffer dma address.
++  *
++  * @Returns - Pointer to chain buffer. Or Null on Failure.
++  */
++ static void *
++ _base_get_chain_buffer_dma_to_chain_buffer(struct MPT3SAS_ADAPTER *ioc,
++ 		dma_addr_t chain_buffer_dma)
++ {
++ 	u16 index, j;
++ 	struct chain_tracker *ct;
++ 
++ 	for (index = 0; index < ioc->scsiio_depth; index++) {
++ 		for (j = 0; j < ioc->chains_needed_per_io; j++) {
++ 			ct = &ioc->chain_lookup[index].chains_per_smid[j];
++ 			if (ct && ct->chain_buffer_dma == chain_buffer_dma)
++ 				return ct->chain_buffer;
++ 		}
++ 	}
++ 	pr_info(MPT3SAS_FMT
++ 	    "Provided chain_buffer_dma address is not in the lookup list\n",
++ 	    ioc->name);
++ 	return NULL;
++ }
++ 
++ /**
++  * _clone_sg_entries -	MPI EP's scsiio and config requests
++  *			are handled here. Base function for
++  *			double buffering, before submitting
++  *			the requests.
++  *
++  * @ioc: per adapter object.
++  * @mpi_request: mf request pointer.
++  * @smid: system request message index.
++  *
++  * @Returns: Nothing.
++  */
++ static void _clone_sg_entries(struct MPT3SAS_ADAPTER *ioc,
++ 		void *mpi_request, u16 smid)
++ {
++ 	Mpi2SGESimple32_t *sgel, *sgel_next;
++ 	u32  sgl_flags, sge_chain_count = 0;
++ 	bool is_write = 0;
++ 	u16 i = 0;
++ 	void __iomem *buffer_iomem;
++ 	phys_addr_t buffer_iomem_phys;
++ 	void __iomem *buff_ptr;
++ 	phys_addr_t buff_ptr_phys;
++ 	void __iomem *dst_chain_addr[MCPU_MAX_CHAINS_PER_IO];
++ 	void *src_chain_addr[MCPU_MAX_CHAINS_PER_IO];
++ 	phys_addr_t dst_addr_phys;
++ 	MPI2RequestHeader_t *request_hdr;
++ 	struct scsi_cmnd *scmd;
++ 	struct scatterlist *sg_scmd = NULL;
++ 	int is_scsiio_req = 0;
++ 
++ 	request_hdr = (MPI2RequestHeader_t *) mpi_request;
++ 
++ 	if (request_hdr->Function == MPI2_FUNCTION_SCSI_IO_REQUEST) {
++ 		Mpi25SCSIIORequest_t *scsiio_request =
++ 			(Mpi25SCSIIORequest_t *)mpi_request;
++ 		sgel = (Mpi2SGESimple32_t *) &scsiio_request->SGL;
++ 		is_scsiio_req = 1;
++ 	} else if (request_hdr->Function == MPI2_FUNCTION_CONFIG) {
++ 		Mpi2ConfigRequest_t  *config_req =
++ 			(Mpi2ConfigRequest_t *)mpi_request;
++ 		sgel = (Mpi2SGESimple32_t *) &config_req->PageBufferSGE;
++ 	} else
++ 		return;
++ 
++ 	/* From smid we can get scsi_cmd, once we have sg_scmd,
++ 	 * we just need to get sg_virt and sg_next to get virual
++ 	 * address associated with sgel->Address.
++ 	 */
++ 
++ 	if (is_scsiio_req) {
++ 		/* Get scsi_cmd using smid */
++ 		scmd = mpt3sas_scsih_scsi_lookup_get(ioc, smid);
++ 		if (scmd == NULL) {
++ 			pr_err(MPT3SAS_FMT "scmd is NULL\n", ioc->name);
++ 			return;
++ 		}
++ 
++ 		/* Get sg_scmd from scmd provided */
++ 		sg_scmd = scsi_sglist(scmd);
++ 	}
++ 
++ 	/*
++ 	 * 0 - 255	System register
++ 	 * 256 - 4352	MPI Frame. (This is based on maxCredit 32)
++ 	 * 4352 - 4864	Reply_free pool (512 byte is reserved
++ 	 *		considering maxCredit 32. Reply need extra
++ 	 *		room, for mCPU case kept four times of
++ 	 *		maxCredit).
++ 	 * 4864 - 17152	SGE chain element. (32cmd * 3 chain of
++ 	 *		128 byte size = 12288)
++ 	 * 17152 - x	Host buffer mapped with smid.
++ 	 *		(Each smid can have 64K Max IO.)
++ 	 * BAR0+Last 1K MSIX Addr and Data
++ 	 * Total size in use 2113664 bytes of 4MB BAR0
++ 	 */
++ 
++ 	buffer_iomem = _base_get_buffer_bar0(ioc, smid);
++ 	buffer_iomem_phys = _base_get_buffer_phys_bar0(ioc, smid);
++ 
++ 	buff_ptr = buffer_iomem;
++ 	buff_ptr_phys = buffer_iomem_phys;
++ 	WARN_ON(buff_ptr_phys > U32_MAX);
++ 
++ 	if (le32_to_cpu(sgel->FlagsLength) &
++ 			(MPI2_SGE_FLAGS_HOST_TO_IOC << MPI2_SGE_FLAGS_SHIFT))
++ 		is_write = 1;
++ 
++ 	for (i = 0; i < MPT_MIN_PHYS_SEGMENTS + ioc->facts.MaxChainDepth; i++) {
++ 
++ 		sgl_flags =
++ 		    (le32_to_cpu(sgel->FlagsLength) >> MPI2_SGE_FLAGS_SHIFT);
++ 
++ 		switch (sgl_flags & MPI2_SGE_FLAGS_ELEMENT_MASK) {
++ 		case MPI2_SGE_FLAGS_CHAIN_ELEMENT:
++ 			/*
++ 			 * Helper function which on passing
++ 			 * chain_buffer_dma returns chain_buffer. Get
++ 			 * the virtual address for sgel->Address
++ 			 */
++ 			sgel_next =
++ 				_base_get_chain_buffer_dma_to_chain_buffer(ioc,
++ 						le32_to_cpu(sgel->Address));
++ 			if (sgel_next == NULL)
++ 				return;
++ 			/*
++ 			 * This is coping 128 byte chain
++ 			 * frame (not a host buffer)
++ 			 */
++ 			dst_chain_addr[sge_chain_count] =
++ 				_base_get_chain(ioc,
++ 					smid, sge_chain_count);
++ 			src_chain_addr[sge_chain_count] =
++ 						(void *) sgel_next;
++ 			dst_addr_phys = _base_get_chain_phys(ioc,
++ 						smid, sge_chain_count);
++ 			WARN_ON(dst_addr_phys > U32_MAX);
++ 			sgel->Address =
++ 				cpu_to_le32(lower_32_bits(dst_addr_phys));
++ 			sgel = sgel_next;
++ 			sge_chain_count++;
++ 			break;
++ 		case MPI2_SGE_FLAGS_SIMPLE_ELEMENT:
++ 			if (is_write) {
++ 				if (is_scsiio_req) {
++ 					_base_clone_to_sys_mem(buff_ptr,
++ 					    sg_virt(sg_scmd),
++ 					    (le32_to_cpu(sgel->FlagsLength) &
++ 					    0x00ffffff));
++ 					/*
++ 					 * FIXME: this relies on a a zero
++ 					 * PCI mem_offset.
++ 					 */
++ 					sgel->Address =
++ 					    cpu_to_le32((u32)buff_ptr_phys);
++ 				} else {
++ 					_base_clone_to_sys_mem(buff_ptr,
++ 					    ioc->config_vaddr,
++ 					    (le32_to_cpu(sgel->FlagsLength) &
++ 					    0x00ffffff));
++ 					sgel->Address =
++ 					    cpu_to_le32((u32)buff_ptr_phys);
++ 				}
++ 			}
++ 			buff_ptr += (le32_to_cpu(sgel->FlagsLength) &
++ 			    0x00ffffff);
++ 			buff_ptr_phys += (le32_to_cpu(sgel->FlagsLength) &
++ 			    0x00ffffff);
++ 			if ((le32_to_cpu(sgel->FlagsLength) &
++ 			    (MPI2_SGE_FLAGS_END_OF_BUFFER
++ 					<< MPI2_SGE_FLAGS_SHIFT)))
++ 				goto eob_clone_chain;
++ 			else {
++ 				/*
++ 				 * Every single element in MPT will have
++ 				 * associated sg_next. Better to sanity that
++ 				 * sg_next is not NULL, but it will be a bug
++ 				 * if it is null.
++ 				 */
++ 				if (is_scsiio_req) {
++ 					sg_scmd = sg_next(sg_scmd);
++ 					if (sg_scmd)
++ 						sgel++;
++ 					else
++ 						goto eob_clone_chain;
++ 				}
++ 			}
++ 			break;
++ 		}
++ 	}
++ 
++ eob_clone_chain:
++ 	for (i = 0; i < sge_chain_count; i++) {
++ 		if (is_scsiio_req)
++ 			_base_clone_to_sys_mem(dst_chain_addr[i],
++ 				src_chain_addr[i], ioc->request_sz);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 93204b782a88 (scsi: mpt3sas: Lockless access for chain buffers.)
+   *  mpt3sas_remove_dead_ioc_func - kthread context to remove dead ioc
+   * @arg: input argument, used to derive ioc
+   *
+@@@ -1387,31 -1680,26 +1600,41 @@@ _base_add_sg_single_64(void *paddr, u3
+  /**
+   * _base_get_chain_buffer_tracker - obtain chain tracker
+   * @ioc: per adapter object
+ - * @scmd: SCSI commands of the IO request
+ + * @smid: smid associated to an IO request
+   *
+-  * Returns chain tracker(from ioc->free_chain_list)
++  * Returns chain tracker from chain_lookup table using key as
++  * smid and smid's chain_offset.
+   */
+  static struct chain_tracker *
+ -_base_get_chain_buffer_tracker(struct MPT3SAS_ADAPTER *ioc,
+ -			       struct scsi_cmnd *scmd)
+ +_base_get_chain_buffer_tracker(struct MPT3SAS_ADAPTER *ioc, u16 smid)
+  {
+  	struct chain_tracker *chain_req;
+++<<<<<<< HEAD
+ +	struct scsiio_tracker *st;
+ +	unsigned long flags;
+- 
+- 	spin_lock_irqsave(&ioc->scsi_lookup_lock, flags);
+- 	if (list_empty(&ioc->free_chain_list)) {
+- 		spin_unlock_irqrestore(&ioc->scsi_lookup_lock, flags);
+- 		dfailprintk(ioc, pr_warn(MPT3SAS_FMT
+- 			"chain buffers not available\n", ioc->name));
+++=======
++ 	struct scsiio_tracker *st = scsi_cmd_priv(scmd);
++ 	u16 smid = st->smid;
++ 	u8 chain_offset =
++ 	   atomic_read(&ioc->chain_lookup[smid - 1].chain_offset);
+++>>>>>>> 93204b782a88 (scsi: mpt3sas: Lockless access for chain buffers.)
++ 
++ 	if (chain_offset == ioc->chains_needed_per_io)
+  		return NULL;
+++<<<<<<< HEAD
+ +	}
+ +	chain_req = list_entry(ioc->free_chain_list.next,
+ +	    struct chain_tracker, tracker_list);
+ +	list_del_init(&chain_req->tracker_list);
+ +	st = mpt3sas_get_st_from_smid(ioc, smid);
+ +	if (st)
+ +		list_add_tail(&chain_req->tracker_list, &st->chain_list);
+ +	spin_unlock_irqrestore(&ioc->scsi_lookup_lock, flags);
+++=======
++ 
++ 	chain_req = &ioc->chain_lookup[smid - 1].chains_per_smid[chain_offset];
++ 	atomic_inc(&ioc->chain_lookup[smid - 1].chain_offset);
+++>>>>>>> 93204b782a88 (scsi: mpt3sas: Lockless access for chain buffers.)
+  	return chain_req;
+  }
+  
+@@@ -2528,6 -3273,16 +2751,19 @@@ _base_recovery_check(struct MPT3SAS_ADA
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mpt3sas_base_clear_st(struct MPT3SAS_ADAPTER *ioc,
++ 			   struct scsiio_tracker *st)
++ {
++ 	if (WARN_ON(st->smid == 0))
++ 		return;
++ 	st->cb_idx = 0xFF;
++ 	st->direct_io = 0;
++ 	atomic_set(&ioc->chain_lookup[st->smid - 1].chain_offset, 0);
++ }
++ 
+++>>>>>>> 93204b782a88 (scsi: mpt3sas: Lockless access for chain buffers.)
+  /**
+   * mpt3sas_base_free_smid - put smid back on free_list
+   * @ioc: per adapter object
+@@@ -3337,10 -4220,11 +3579,11 @@@ _base_allocate_memory_pools(struct MPT3
+  	u16 chains_needed_per_io;
+  	u32 sz, total_sz, reply_post_free_sz, reply_post_free_array_sz;
+  	u32 retry_sz;
+ -	u16 max_request_credit, nvme_blocks_needed;
+ +	u16 max_request_credit;
+  	unsigned short sg_tablesize;
+  	u16 sge_size;
+- 	int i;
++ 	int i, j;
++ 	struct chain_tracker *ct;
+  
+  	dinitprintk(ioc, pr_info(MPT3SAS_FMT "%s\n", ioc->name,
+  	    __func__));
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.c
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index 36dd7b003641..50dad12173f6 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -745,7 +745,11 @@ enum reset_type {
+ struct chain_tracker {
+ 	void *chain_buffer;
+ 	dma_addr_t chain_buffer_dma;
+-	struct list_head tracker_list;
++};
++
++struct chain_lookup {
++	struct chain_tracker *chains_per_smid;
++	atomic_t	chain_offset;
+ };
+ 
+ /**
+@@ -1224,7 +1228,7 @@ struct MPT3SAS_ADAPTER {
+ 	wait_queue_head_t reset_wq;
+ 
+ 	/* chain */
+-	struct chain_tracker *chain_lookup;
++	struct chain_lookup *chain_lookup;
+ 	struct list_head free_chain_list;
+ 	struct dma_pool *chain_dma_pool;
+ 	ulong		chain_pages;
