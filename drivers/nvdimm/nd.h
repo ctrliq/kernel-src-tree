@@ -144,6 +144,7 @@ struct nd_btt {
 	struct nd_namespace_common *ndns;
 	struct btt *btt;
 	unsigned long lbasize;
+	u64 size;
 	u8 *uuid;
 	int id;
 };
