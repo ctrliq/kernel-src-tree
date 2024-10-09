@@ -2209,11 +2209,16 @@ static int trace__run(struct trace *trace, int argc, const char **argv)
 	if (err < 0)
 		goto out_error_mmap;
 
-	if (!target__none(&trace->opts.target))
+	if (!target__none(&trace->opts.target) && !trace->opts.initial_delay)
 		perf_evlist__enable(evlist);
 
 	if (forks)
 		perf_evlist__start_workload(evlist);
+
+	if (trace->opts.initial_delay) {
+		usleep(trace->opts.initial_delay * 1000);
+		perf_evlist__enable(evlist);
+	}
 
 	trace->multiple_threads = thread_map__pid(evlist->threads, 0) == -1 ||
 				  evlist->threads->nr > 1 ||
@@ -2699,6 +2704,9 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 	OPT_BOOLEAN('f', "force", &trace.force, "don't complain, do it"),
 	OPT_UINTEGER(0, "proc-map-timeout", &trace.opts.proc_map_timeout,
 			"per thread proc mmap processing timeout in ms"),
+	OPT_UINTEGER('D', "delay", &trace.opts.initial_delay,
+		     "ms to wait before starting measurement after program "
+		     "start"),
 	OPT_END()
 	};
 	const char * const trace_subcommands[] = { "record", NULL };
