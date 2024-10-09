@@ -1,0 +1,103 @@
+sctp: update dst pmtu with the correct daddr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit d7ab5cdce54da631f0c8c11e506c974536a3581e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d7ab5cdc.failed
+
+When processing pmtu update from an icmp packet, it calls .update_pmtu
+with sk instead of skb in sctp_transport_update_pmtu.
+
+However for sctp, the daddr in the transport might be different from
+inet_sock->inet_daddr or sk->sk_v6_daddr, which is used to update or
+create the route cache. The incorrect daddr will cause a different
+route cache created for the path.
+
+So before calling .update_pmtu, inet_sock->inet_daddr/sk->sk_v6_daddr
+should be updated with the daddr in the transport, and update it back
+after it's done.
+
+The issue has existed since route exceptions introduction.
+
+Fixes: 4895c771c7f0 ("ipv4: Add FIB nexthop exceptions.")
+	Reported-by: ian.periam@dialogic.com
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d7ab5cdce54da631f0c8c11e506c974536a3581e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/transport.c
+diff --cc net/sctp/transport.c
+index dab89c18c6ef,033696e6f74f..000000000000
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@@ -245,28 -257,45 +245,56 @@@ void sctp_transport_pmtu(struct sctp_tr
+  		transport->pathmtu = SCTP_DEFAULT_MAXSEGMENT;
+  }
+  
+ -bool sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu)
+ +void sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu)
+  {
+  	struct dst_entry *dst = sctp_transport_dst_check(t);
+++<<<<<<< HEAD
+++=======
++ 	struct sock *sk = t->asoc->base.sk;
++ 	bool change = true;
+++>>>>>>> d7ab5cdce54d (sctp: update dst pmtu with the correct daddr)
+  
+  	if (unlikely(pmtu < SCTP_DEFAULT_MINSEGMENT)) {
+ -		pr_warn_ratelimited("%s: Reported pmtu %d too low, using default minimum of %d\n",
+ -				    __func__, pmtu, SCTP_DEFAULT_MINSEGMENT);
+ -		/* Use default minimum segment instead */
+ -		pmtu = SCTP_DEFAULT_MINSEGMENT;
+ +		pr_warn("%s: Reported pmtu %d too low, using default minimum of %d\n",
+ +			__func__, pmtu, SCTP_DEFAULT_MINSEGMENT);
+ +		/* Use default minimum segment size and disable
+ +		 * pmtu discovery on this transport.
+ +		 */
+ +		t->pathmtu = SCTP_DEFAULT_MINSEGMENT;
+ +	} else {
+ +		t->pathmtu = pmtu;
+  	}
+ -	pmtu = SCTP_TRUNC4(pmtu);
+  
+  	if (dst) {
+- 		dst->ops->update_pmtu(dst, t->asoc->base.sk, NULL, pmtu);
++ 		struct sctp_pf *pf = sctp_get_pf_specific(dst->ops->family);
++ 		union sctp_addr addr;
++ 
++ 		pf->af->from_sk(&addr, sk);
++ 		pf->to_sk_daddr(&t->ipaddr, sk);
++ 		dst->ops->update_pmtu(dst, sk, NULL, pmtu);
++ 		pf->to_sk_daddr(&addr, sk);
++ 
+  		dst = sctp_transport_dst_check(t);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!dst)
+ +		t->af_specific->get_dst(t, &t->saddr, &t->fl, t->asoc->base.sk);
+++=======
++ 	if (!dst) {
++ 		t->af_specific->get_dst(t, &t->saddr, &t->fl, sk);
++ 		dst = t->dst;
++ 	}
++ 
++ 	if (dst) {
++ 		/* Re-fetch, as under layers may have a higher minimum size */
++ 		pmtu = sctp_dst_mtu(dst);
++ 		change = t->pathmtu != pmtu;
++ 	}
++ 	t->pathmtu = pmtu;
++ 
++ 	return change;
+++>>>>>>> d7ab5cdce54d (sctp: update dst pmtu with the correct daddr)
+  }
+  
+  /* Caches the dst entry and source address for a transport's destination
+* Unmerged path net/sctp/transport.c
