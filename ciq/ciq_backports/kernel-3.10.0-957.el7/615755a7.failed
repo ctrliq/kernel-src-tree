@@ -1,0 +1,224 @@
+bpf: extend stackmap to save binary_build_id+offset instead of address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Song Liu <songliubraving@fb.com>
+commit 615755a77b2461ed78dfafb8a6649456201949c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/615755a7.failed
+
+Currently, bpf stackmap store address for each entry in the call trace.
+To map these addresses to user space files, it is necessary to maintain
+the mapping from these virtual address to symbols in the binary. Usually,
+the user space profiler (such as perf) has to scan /proc/pid/maps at the
+beginning of profiling, and monitor mmap2() calls afterwards. Given the
+cost of maintaining the address map, this solution is not practical for
+system wide profiling that is always on.
+
+This patch tries to solve this problem with a variation of stackmap. This
+variation is enabled by flag BPF_F_STACK_BUILD_ID. Instead of storing
+addresses, the variation stores ELF file build_id + offset.
+
+Build ID is a 20-byte unique identifier for ELF files. The following
+command shows the Build ID of /bin/bash:
+
+  [user@]$ readelf -n /bin/bash
+  ...
+    Build ID: XXXXXXXXXX
+  ...
+
+With BPF_F_STACK_BUILD_ID, bpf_get_stackid() tries to parse Build ID
+for each entry in the call trace, and translate it into the following
+struct:
+
+  struct bpf_stack_build_id_offset {
+          __s32           status;
+          unsigned char   build_id[BPF_BUILD_ID_SIZE];
+          union {
+                  __u64   offset;
+                  __u64   ip;
+          };
+  };
+
+The search of build_id is limited to the first page of the file, and this
+page should be in page cache. Otherwise, we fallback to store ip for this
+entry (ip field in struct bpf_stack_build_id_offset). This requires the
+build_id to be stored in the first page. A quick survey of binary and
+dynamic library files in a few different systems shows that almost all
+binary and dynamic library files have build_id in the first page.
+
+Build_id is only meaningful for user stack. If a kernel stack is added to
+a stackmap with BPF_F_STACK_BUILD_ID, it will automatically fallback to
+only store ip (status == BPF_STACK_BUILD_ID_IP). Similarly, if build_id
+lookup failed for some reason, it will also fallback to store ip.
+
+User space can access struct bpf_stack_build_id_offset with bpf
+syscall BPF_MAP_LOOKUP_ELEM. It is necessary for user space to
+maintain mapping from build id to binary files. This mostly static
+mapping is much easier to maintain than per process address maps.
+
+Note: Stackmap with build_id only works in non-nmi context at this time.
+This is because we need to take mm->mmap_sem for find_vma(). If this
+changes, we would like to allow build_id lookup in nmi context.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 615755a77b2461ed78dfafb8a6649456201949c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/stackmap.c
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,1e15d1724d89..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -115,8 -118,141 +115,129 @@@ enum bpf_map_type 
+  
+  enum bpf_prog_type {
+  	BPF_PROG_TYPE_UNSPEC,
+ -	BPF_PROG_TYPE_SOCKET_FILTER,
+ -	BPF_PROG_TYPE_KPROBE,
+ -	BPF_PROG_TYPE_SCHED_CLS,
+ -	BPF_PROG_TYPE_SCHED_ACT,
+ -	BPF_PROG_TYPE_TRACEPOINT,
+ -	BPF_PROG_TYPE_XDP,
+ -	BPF_PROG_TYPE_PERF_EVENT,
+ -	BPF_PROG_TYPE_CGROUP_SKB,
+ -	BPF_PROG_TYPE_CGROUP_SOCK,
+ -	BPF_PROG_TYPE_LWT_IN,
+ -	BPF_PROG_TYPE_LWT_OUT,
+ -	BPF_PROG_TYPE_LWT_XMIT,
+ -	BPF_PROG_TYPE_SOCK_OPS,
+ -	BPF_PROG_TYPE_SK_SKB,
+ -	BPF_PROG_TYPE_CGROUP_DEVICE,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum bpf_attach_type {
++ 	BPF_CGROUP_INET_INGRESS,
++ 	BPF_CGROUP_INET_EGRESS,
++ 	BPF_CGROUP_INET_SOCK_CREATE,
++ 	BPF_CGROUP_SOCK_OPS,
++ 	BPF_SK_SKB_STREAM_PARSER,
++ 	BPF_SK_SKB_STREAM_VERDICT,
++ 	BPF_CGROUP_DEVICE,
++ 	__MAX_BPF_ATTACH_TYPE
++ };
++ 
++ #define MAX_BPF_ATTACH_TYPE __MAX_BPF_ATTACH_TYPE
++ 
++ /* cgroup-bpf attach flags used in BPF_PROG_ATTACH command
++  *
++  * NONE(default): No further bpf programs allowed in the subtree.
++  *
++  * BPF_F_ALLOW_OVERRIDE: If a sub-cgroup installs some bpf program,
++  * the program in this cgroup yields to sub-cgroup program.
++  *
++  * BPF_F_ALLOW_MULTI: If a sub-cgroup installs some bpf program,
++  * that cgroup program gets run in addition to the program in this cgroup.
++  *
++  * Only one program is allowed to be attached to a cgroup with
++  * NONE or BPF_F_ALLOW_OVERRIDE flag.
++  * Attaching another program on top of NONE or BPF_F_ALLOW_OVERRIDE will
++  * release old program and attach the new one. Attach flags has to match.
++  *
++  * Multiple programs are allowed to be attached to a cgroup with
++  * BPF_F_ALLOW_MULTI flag. They are executed in FIFO order
++  * (those that were attached first, run first)
++  * The programs of sub-cgroup are executed first, then programs of
++  * this cgroup and then programs of parent cgroup.
++  * When children program makes decision (like picking TCP CA or sock bind)
++  * parent program has a chance to override it.
++  *
++  * A cgroup with MULTI or OVERRIDE flag allows any attach flags in sub-cgroups.
++  * A cgroup with NONE doesn't allow any programs in sub-cgroups.
++  * Ex1:
++  * cgrp1 (MULTI progs A, B) ->
++  *    cgrp2 (OVERRIDE prog C) ->
++  *      cgrp3 (MULTI prog D) ->
++  *        cgrp4 (OVERRIDE prog E) ->
++  *          cgrp5 (NONE prog F)
++  * the event in cgrp5 triggers execution of F,D,A,B in that order.
++  * if prog F is detached, the execution is E,D,A,B
++  * if prog F and D are detached, the execution is E,A,B
++  * if prog F, E and D are detached, the execution is C,A,B
++  *
++  * All eligible programs are executed regardless of return code from
++  * earlier programs.
++  */
++ #define BPF_F_ALLOW_OVERRIDE	(1U << 0)
++ #define BPF_F_ALLOW_MULTI	(1U << 1)
++ 
++ /* If BPF_F_STRICT_ALIGNMENT is used in BPF_PROG_LOAD command, the
++  * verifier will perform strict alignment checking as if the kernel
++  * has been built with CONFIG_EFFICIENT_UNALIGNED_ACCESS not set,
++  * and NET_IP_ALIGN defined to 2.
++  */
++ #define BPF_F_STRICT_ALIGNMENT	(1U << 0)
++ 
++ /* when bpf_ldimm64->src_reg == BPF_PSEUDO_MAP_FD, bpf_ldimm64->imm == fd */
++ #define BPF_PSEUDO_MAP_FD	1
++ 
++ /* when bpf_call->src_reg == BPF_PSEUDO_CALL, bpf_call->imm == pc-relative
++  * offset to another bpf function
++  */
++ #define BPF_PSEUDO_CALL		1
++ 
++ /* flags for BPF_MAP_UPDATE_ELEM command */
++ #define BPF_ANY		0 /* create new element or update existing */
++ #define BPF_NOEXIST	1 /* create new element if it didn't exist */
++ #define BPF_EXIST	2 /* update existing element */
++ 
++ /* flags for BPF_MAP_CREATE command */
++ #define BPF_F_NO_PREALLOC	(1U << 0)
++ /* Instead of having one common LRU list in the
++  * BPF_MAP_TYPE_LRU_[PERCPU_]HASH map, use a percpu LRU list
++  * which can scale and perform better.
++  * Note, the LRU nodes (including free nodes) cannot be moved
++  * across different LRU lists.
++  */
++ #define BPF_F_NO_COMMON_LRU	(1U << 1)
++ /* Specify numa node during map creation */
++ #define BPF_F_NUMA_NODE		(1U << 2)
++ 
++ /* flags for BPF_PROG_QUERY */
++ #define BPF_F_QUERY_EFFECTIVE	(1U << 0)
++ 
++ #define BPF_OBJ_NAME_LEN 16U
++ 
++ /* Flags for accessing BPF object */
++ #define BPF_F_RDONLY		(1U << 3)
++ #define BPF_F_WRONLY		(1U << 4)
++ 
++ /* Flag for stack_map, store build_id+offset instead of pointer */
++ #define BPF_F_STACK_BUILD_ID	(1U << 5)
++ 
++ enum bpf_stack_build_id_status {
++ 	/* user space need an empty entry to identify end of a trace */
++ 	BPF_STACK_BUILD_ID_EMPTY = 0,
++ 	/* with valid build_id and offset */
++ 	BPF_STACK_BUILD_ID_VALID = 1,
++ 	/* couldn't get build_id, fallback to ip */
++ 	BPF_STACK_BUILD_ID_IP = 2,
++ };
++ 
++ #define BPF_BUILD_ID_SIZE 20
++ struct bpf_stack_build_id {
++ 	__s32		status;
++ 	unsigned char	build_id[BPF_BUILD_ID_SIZE];
++ 	union {
++ 		__u64	offset;
++ 		__u64	ip;
++ 	};
++ };
++ 
+++>>>>>>> 615755a77b24 (bpf: extend stackmap to save binary_build_id+offset instead of address)
+  union bpf_attr {
+  	struct { /* anonymous struct used by BPF_MAP_CREATE command */
+  		__u32	map_type;	/* one of enum bpf_map_type */
+* Unmerged path kernel/bpf/stackmap.c
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/stackmap.c
