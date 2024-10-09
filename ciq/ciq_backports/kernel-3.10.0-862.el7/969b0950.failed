@@ -1,0 +1,215 @@
+drm/i915: Add interface to reserve fence registers for vGPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [drm] i915: Add interface to reserve fence registers for vGPU (Paul Lai) [1449711]
+Rebuild_FUZZ: 96.49%
+commit-author Changbin Du <changbin.du@intel.com>
+commit 969b0950a188750bd6ad12693fa3b6e8d63036fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/969b0950.failed
+
+In the past, vGPU alloc fence registers by walking through mm.fence_list
+to find fence which pin_count = 0 and vma is empty. vGPU may not find
+enough fence registers this way. Because a fence can be bind to vma even
+though it is not in using. We have found such failure many times these
+days.
+
+An option to resolve this issue is that we can force-remove fence from
+vma in this case.
+
+This patch added two new api to the fence management code:
+ - i915_reserve_fence() will try to find a free fence from fence_list
+   and force-remove vma if need.
+ - i915_unreserve_fence() reclaim a reserved fence after vGPU has
+   finished.
+
+With this change, the fence management is more clear to work with vGPU.
+GVTg do not need remove fence from fence_list in private.
+
+v3: (Chris)
+  - Add struct_mutex lock assertion.
+  - Only count for unpinned fence.
+
+v2: (Chris)
+  - Rename the new api for symmetry.
+  - Add safeguard to ensure at least 1 fence remained for host display.
+
+	Signed-off-by: Changbin Du <changbin.du@intel.com>
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/1504512061-5892-1-git-send-email-changbin.du@intel.com
+	Acked-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 969b0950a188750bd6ad12693fa3b6e8d63036fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_fence_reg.c
+diff --cc drivers/gpu/drm/i915/i915_gem_fence_reg.c
+index 0efa3571afc3,2783d63bd1ad..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_fence_reg.c
++++ b/drivers/gpu/drm/i915/i915_gem_fence_reg.c
+@@@ -367,6 -360,81 +367,84 @@@ i915_vma_get_fence(struct i915_vma *vma
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * i915_reserve_fence - Reserve a fence for vGPU
++  * @dev_priv: i915 device private
++  *
++  * This function walks the fence regs looking for a free one and remove
++  * it from the fence_list. It is used to reserve fence for vGPU to use.
++  */
++ struct drm_i915_fence_reg *
++ i915_reserve_fence(struct drm_i915_private *dev_priv)
++ {
++ 	struct drm_i915_fence_reg *fence;
++ 	int count;
++ 	int ret;
++ 
++ 	lockdep_assert_held(&dev_priv->drm.struct_mutex);
++ 
++ 	/* Keep at least one fence available for the display engine. */
++ 	count = 0;
++ 	list_for_each_entry(fence, &dev_priv->mm.fence_list, link)
++ 		count += !fence->pin_count;
++ 	if (count <= 1)
++ 		return ERR_PTR(-ENOSPC);
++ 
++ 	fence = fence_find(dev_priv);
++ 	if (IS_ERR(fence))
++ 		return fence;
++ 
++ 	if (fence->vma) {
++ 		/* Force-remove fence from VMA */
++ 		ret = fence_update(fence, NULL);
++ 		if (ret)
++ 			return ERR_PTR(ret);
++ 	}
++ 
++ 	list_del(&fence->link);
++ 	return fence;
++ }
++ 
++ /**
++  * i915_unreserve_fence - Reclaim a reserved fence
++  * @fence: the fence reg
++  *
++  * This function add a reserved fence register from vGPU to the fence_list.
++  */
++ void i915_unreserve_fence(struct drm_i915_fence_reg *fence)
++ {
++ 	lockdep_assert_held(&fence->i915->drm.struct_mutex);
++ 
++ 	list_add(&fence->link, &fence->i915->mm.fence_list);
++ }
++ 
++ /**
++  * i915_gem_revoke_fences - revoke fence state
++  * @dev_priv: i915 device private
++  *
++  * Removes all GTT mmappings via the fence registers. This forces any user
++  * of the fence to reacquire that fence before continuing with their access.
++  * One use is during GPU reset where the fence register is lost and we need to
++  * revoke concurrent userspace access via GTT mmaps until the hardware has been
++  * reset and the fence registers have been restored.
++  */
++ void i915_gem_revoke_fences(struct drm_i915_private *dev_priv)
++ {
++ 	int i;
++ 
++ 	lockdep_assert_held(&dev_priv->drm.struct_mutex);
++ 
++ 	for (i = 0; i < dev_priv->num_fence_regs; i++) {
++ 		struct drm_i915_fence_reg *fence = &dev_priv->fence_regs[i];
++ 
++ 		if (fence->vma)
++ 			i915_gem_release_mmap(fence->vma->obj);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 969b0950a188 (drm/i915: Add interface to reserve fence registers for vGPU)
+   * i915_gem_restore_fences - restore fence state
+   * @dev_priv: i915 device private
+   *
+diff --git a/drivers/gpu/drm/i915/gvt/aperture_gm.c b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+index 0efc88731f6f..979fa7287d0a 100644
+--- a/drivers/gpu/drm/i915/gvt/aperture_gm.c
++++ b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+@@ -182,8 +182,8 @@ static void free_vgpu_fence(struct intel_vgpu *vgpu)
+ 	_clear_vgpu_fence(vgpu);
+ 	for (i = 0; i < vgpu_fence_sz(vgpu); i++) {
+ 		reg = vgpu->fence.regs[i];
+-		list_add_tail(&reg->link,
+-			      &dev_priv->mm.fence_list);
++		i915_unreserve_fence(reg);
++		vgpu->fence.regs[i] = NULL;
+ 	}
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 
+@@ -196,24 +196,19 @@ static int alloc_vgpu_fence(struct intel_vgpu *vgpu)
+ 	struct drm_i915_private *dev_priv = gvt->dev_priv;
+ 	struct drm_i915_fence_reg *reg;
+ 	int i;
+-	struct list_head *pos, *q;
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+ 	/* Request fences from host */
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+-	i = 0;
+-	list_for_each_safe(pos, q, &dev_priv->mm.fence_list) {
+-		reg = list_entry(pos, struct drm_i915_fence_reg, link);
+-		if (reg->pin_count || reg->vma)
+-			continue;
+-		list_del(pos);
++
++	for (i = 0; i < vgpu_fence_sz(vgpu); i++) {
++		reg = i915_reserve_fence(dev_priv);
++		if (IS_ERR(reg))
++			goto out_free_fence;
++
+ 		vgpu->fence.regs[i] = reg;
+-		if (++i == vgpu_fence_sz(vgpu))
+-			break;
+ 	}
+-	if (i != vgpu_fence_sz(vgpu))
+-		goto out_free_fence;
+ 
+ 	_clear_vgpu_fence(vgpu);
+ 
+@@ -221,13 +216,14 @@ static int alloc_vgpu_fence(struct intel_vgpu *vgpu)
+ 	intel_runtime_pm_put(dev_priv);
+ 	return 0;
+ out_free_fence:
++	gvt_vgpu_err("Failed to alloc fences\n");
+ 	/* Return fences to host, if fail */
+ 	for (i = 0; i < vgpu_fence_sz(vgpu); i++) {
+ 		reg = vgpu->fence.regs[i];
+ 		if (!reg)
+ 			continue;
+-		list_add_tail(&reg->link,
+-			      &dev_priv->mm.fence_list);
++		i915_unreserve_fence(reg);
++		vgpu->fence.regs[i] = NULL;
+ 	}
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 	intel_runtime_pm_put(dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c383dcb3961f..c23b45ae317b 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3171,6 +3171,9 @@ i915_gem_object_to_ggtt(struct drm_i915_gem_object *obj,
+ /* i915_gem_fence_reg.c */
+ int __must_check i915_vma_get_fence(struct i915_vma *vma);
+ int __must_check i915_vma_put_fence(struct i915_vma *vma);
++struct drm_i915_fence_reg *
++i915_reserve_fence(struct drm_i915_private *dev_priv);
++void i915_unreserve_fence(struct drm_i915_fence_reg *fence);
+ 
+ void i915_gem_restore_fences(struct drm_i915_private *dev_priv);
+ 
+* Unmerged path drivers/gpu/drm/i915/i915_gem_fence_reg.c
