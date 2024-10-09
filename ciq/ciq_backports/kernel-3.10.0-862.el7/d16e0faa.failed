@@ -1,0 +1,183 @@
+iommu: Allow selecting page sizes per domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] Allow selecting page sizes per domain (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 91.36%
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit d16e0faab911cc0e100a1e8e93635b432566608e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d16e0faa.failed
+
+Many IOMMUs support multiple page table formats, meaning that any given
+domain may only support a subset of the hardware page sizes presented in
+iommu_ops->pgsize_bitmap. There are also certain use-cases where the
+creator of a domain may want to control which page sizes are used, for
+example to force the use of hugepage mappings to reduce pagetable walk
+depth.
+
+To this end, add a per-domain pgsize_bitmap to represent the subset of
+page sizes actually in use, to make it possible for domains with
+different requirements to coexist.
+
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+[rm: hijacked and rebased original patch with new commit message]
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d16e0faab911cc0e100a1e8e93635b432566608e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/mtk_iommu.c
+#	include/linux/iommu.h
+diff --cc include/linux/iommu.h
+index 72d2a8efb34e,7811294bc0f7..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -77,7 -77,8 +77,12 @@@ struct iommu_domain_geometry 
+  
+  struct iommu_domain {
+  	unsigned type;
+++<<<<<<< HEAD
+ +	struct iommu_ops *ops;
+++=======
++ 	const struct iommu_ops *ops;
++ 	unsigned long pgsize_bitmap;	/* Bitmap of page sizes in use */
+++>>>>>>> d16e0faab911 (iommu: Allow selecting page sizes per domain)
+  	iommu_fault_handler_t handler;
+  	void *handler_token;
+  	struct iommu_domain_geometry geometry;
+@@@ -126,11 -146,17 +131,15 @@@ struct iommu_dm_region 
+   * @iova_to_phys: translate iova to physical address
+   * @add_device: add device to iommu grouping
+   * @remove_device: remove device from iommu grouping
+ - * @device_group: find iommu group for a particular device
+   * @domain_get_attr: Query domain attributes
+   * @domain_set_attr: Change domain attributes
+ - * @get_dm_regions: Request list of direct mapping requirements for a device
+ - * @put_dm_regions: Free list of direct mapping requirements for a device
+ - * @domain_window_enable: Configure and enable a particular window for a domain
+ - * @domain_window_disable: Disable a particular window for a domain
+ - * @domain_set_windows: Set the number of windows for a domain
+ - * @domain_get_windows: Return the number of windows for a domain
+   * @of_xlate: add OF master IDs to iommu grouping
+++<<<<<<< HEAD
+ + * @pgsize_bitmap: bitmap of supported page sizes
+ + * @priv: per-instance data private to the iommu driver
+++=======
++  * @pgsize_bitmap: bitmap of all possible supported page sizes
+++>>>>>>> d16e0faab911 (iommu: Allow selecting page sizes per domain)
+   */
+  struct iommu_ops {
+  	bool (*capable)(enum iommu_cap);
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/iommu/mtk_iommu.c
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index a0f2c2471b6a..3a7e7e580dc4 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -337,9 +337,9 @@ static int iommu_group_create_direct_mappings(struct iommu_group *group,
+ 	if (!domain || domain->type != IOMMU_DOMAIN_DMA)
+ 		return 0;
+ 
+-	BUG_ON(!domain->ops->pgsize_bitmap);
++	BUG_ON(!domain->pgsize_bitmap);
+ 
+-	pg_size = 1UL << __ffs(domain->ops->pgsize_bitmap);
++	pg_size = 1UL << __ffs(domain->pgsize_bitmap);
+ 	INIT_LIST_HEAD(&mappings);
+ 
+ 	iommu_get_dm_regions(dev, &mappings);
+@@ -1069,6 +1069,8 @@ static struct iommu_domain *__iommu_domain_alloc(struct bus_type *bus,
+ 
+ 	domain->ops  = bus->iommu_ops;
+ 	domain->type = type;
++	/* Assume all sizes by default; the driver may override this later */
++	domain->pgsize_bitmap  = bus->iommu_ops->pgsize_bitmap;
+ 
+ 	return domain;
+ }
+@@ -1293,7 +1295,7 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
+ 	pgsize = (1UL << (pgsize_idx + 1)) - 1;
+ 
+ 	/* throw away page sizes not supported by the hardware */
+-	pgsize &= domain->ops->pgsize_bitmap;
++	pgsize &= domain->pgsize_bitmap;
+ 
+ 	/* make sure we're still sane */
+ 	BUG_ON(!pgsize);
+@@ -1315,14 +1317,14 @@ int iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	int ret = 0;
+ 
+ 	if (unlikely(domain->ops->map == NULL ||
+-		     domain->ops->pgsize_bitmap == 0UL))
++		     domain->pgsize_bitmap == 0UL))
+ 		return -ENODEV;
+ 
+ 	if (unlikely(!(domain->type & __IOMMU_DOMAIN_PAGING)))
+ 		return -EINVAL;
+ 
+ 	/* find out the minimum page size supported */
+-	min_pagesz = 1 << __ffs(domain->ops->pgsize_bitmap);
++	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
+ 
+ 	/*
+ 	 * both the virtual address and the physical one, as well as
+@@ -1369,14 +1371,14 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
+ 	unsigned long orig_iova = iova;
+ 
+ 	if (unlikely(domain->ops->unmap == NULL ||
+-		     domain->ops->pgsize_bitmap == 0UL))
++		     domain->pgsize_bitmap == 0UL))
+ 		return -ENODEV;
+ 
+ 	if (unlikely(!(domain->type & __IOMMU_DOMAIN_PAGING)))
+ 		return -EINVAL;
+ 
+ 	/* find out the minimum page size supported */
+-	min_pagesz = 1 << __ffs(domain->ops->pgsize_bitmap);
++	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
+ 
+ 	/*
+ 	 * The virtual address, as well as the size of the mapping, must be
+@@ -1422,10 +1424,10 @@ size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
+ 	unsigned int i, min_pagesz;
+ 	int ret;
+ 
+-	if (unlikely(domain->ops->pgsize_bitmap == 0UL))
++	if (unlikely(domain->pgsize_bitmap == 0UL))
+ 		return 0;
+ 
+-	min_pagesz = 1 << __ffs(domain->ops->pgsize_bitmap);
++	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
+ 
+ 	for_each_sg(sg, s, nents, i) {
+ 		phys_addr_t phys = page_to_phys(sg_page(s)) + s->offset;
+@@ -1506,7 +1508,7 @@ int iommu_domain_get_attr(struct iommu_domain *domain,
+ 		break;
+ 	case DOMAIN_ATTR_PAGING:
+ 		paging  = data;
+-		*paging = (domain->ops->pgsize_bitmap != 0UL);
++		*paging = (domain->pgsize_bitmap != 0UL);
+ 		break;
+ 	case DOMAIN_ATTR_WINDOWS:
+ 		count = data;
+* Unmerged path drivers/iommu/mtk_iommu.c
+diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
+index 54fa9eeb9cc3..ff96c53dc8fd 100644
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@ -728,7 +728,7 @@ static unsigned long vfio_pgsize_bitmap(struct vfio_iommu *iommu)
+ 
+ 	mutex_lock(&iommu->lock);
+ 	list_for_each_entry(domain, &iommu->domain_list, next)
+-		bitmap &= domain->domain->ops->pgsize_bitmap;
++		bitmap &= domain->domain->pgsize_bitmap;
+ 	mutex_unlock(&iommu->lock);
+ 
+ 	return bitmap;
+* Unmerged path include/linux/iommu.h
