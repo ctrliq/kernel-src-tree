@@ -1,0 +1,129 @@
+usb: typec: tcpm: Support for Alternate Modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [usb] typec: tcpm: Support for Alternate Modes (Torez Smith) [1657401]
+Rebuild_FUZZ: 94.12%
+commit-author Heikki Krogerus <heikki.krogerus@linux.intel.com>
+commit e9576fe8e605c4413beb91b290b8a473985710de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e9576fe8.failed
+
+This adds more complete handling of VDMs and registration of
+partner alternate modes, and introduces callbacks for
+alternate mode operations.
+
+Only DFP role is supported for now.
+
+	Signed-off-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+	Tested-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit e9576fe8e605c4413beb91b290b8a473985710de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/typec/tcpm.c
+diff --cc drivers/usb/typec/tcpm.c
+index 886ffe125ddf,c732fd703961..000000000000
+--- a/drivers/usb/typec/tcpm.c
++++ b/drivers/usb/typec/tcpm.c
+@@@ -310,8 -311,8 +311,13 @@@ struct tcpm_port 
+  
+  	/* Alternate mode data */
+  	struct pd_mode_data mode_data;
+++<<<<<<< HEAD
+ +	struct typec_altmode *partner_altmode[SVID_DISCOVERY_MAX];
+ +	struct typec_altmode *port_altmode[SVID_DISCOVERY_MAX];
+++=======
++ 	struct typec_altmode *partner_altmode[ALTMODE_DISCOVERY_MAX];
++ 	struct typec_altmode *port_altmode[ALTMODE_DISCOVERY_MAX];
+++>>>>>>> e9576fe8e605 (usb: typec: tcpm: Support for Alternate Modes)
+  
+  	/* Deadline in jiffies to exit src_try_wait state */
+  	unsigned long max_wait;
+@@@ -1006,34 -1003,38 +1012,54 @@@ static void svdm_consume_modes(struct t
+  		return;
+  	}
+  
+ -	for (i = 1; i < cnt; i++) {
+ -		paltmode = &pmdata->altmode_desc[pmdata->altmodes];
+ -		memset(paltmode, 0, sizeof(*paltmode));
+ +	paltmode = &pmdata->altmode_desc[pmdata->altmodes];
+ +	memset(paltmode, 0, sizeof(*paltmode));
+  
+ -		paltmode->svid = pmdata->svids[pmdata->svid_index];
+ -		paltmode->mode = i;
+ -		paltmode->vdo = le32_to_cpu(payload[i]);
+ +	paltmode->svid = pmdata->svids[pmdata->svid_index];
+  
+ -		tcpm_log(port, " Alternate mode %d: SVID 0x%04x, VDO %d: 0x%08x",
+ -			 pmdata->altmodes, paltmode->svid,
+ -			 paltmode->mode, paltmode->vdo);
+ +	tcpm_log(port, " Alternate mode %d: SVID 0x%04x",
+ +		 pmdata->altmodes, paltmode->svid);
+  
+++<<<<<<< HEAD
+ +	for (i = 1; i < cnt && paltmode->n_modes < ALTMODE_MAX_MODES; i++) {
+ +		pmode = &paltmode->modes[paltmode->n_modes];
+ +		memset(pmode, 0, sizeof(*pmode));
+ +		pmode->vdo = le32_to_cpu(payload[i]);
+ +		pmode->index = i - 1;
+ +		paltmode->n_modes++;
+ +		tcpm_log(port, "  VDO %d: 0x%08x",
+ +			 pmode->index, pmode->vdo);
+++=======
++ 		pmdata->altmodes++;
+++>>>>>>> e9576fe8e605 (usb: typec: tcpm: Support for Alternate Modes)
+  	}
+ +	port->partner_altmode[pmdata->altmodes] =
+ +		typec_partner_register_altmode(port->partner, paltmode);
+ +	if (!port->partner_altmode[pmdata->altmodes]) {
+ +		tcpm_log(port,
+ +			 "Failed to register alternate modes for SVID 0x%04x",
+ +			 paltmode->svid);
+ +		return;
+ +	}
+ +	pmdata->altmodes++;
+  }
+  
++ static void tcpm_register_partner_altmodes(struct tcpm_port *port)
++ {
++ 	struct pd_mode_data *modep = &port->mode_data;
++ 	struct typec_altmode *altmode;
++ 	int i;
++ 
++ 	for (i = 0; i < modep->altmodes; i++) {
++ 		altmode = typec_partner_register_altmode(port->partner,
++ 						&modep->altmode_desc[i]);
++ 		if (!altmode)
++ 			tcpm_log(port, "Failed to register partner SVID 0x%04x",
++ 				 modep->altmode_desc[i].svid);
++ 		port->partner_altmode[i] = altmode;
++ 	}
++ }
++ 
+  #define supports_modal(port)	PD_IDH_MODAL_SUPP((port)->partner_ident.id_header)
+  
+  static int tcpm_pd_svdm(struct tcpm_port *port, const __le32 *payload, int cnt,
+* Unmerged path drivers/usb/typec/tcpm.c
+diff --git a/include/linux/usb/tcpm.h b/include/linux/usb/tcpm.h
+index fb007e874c9d..c376d1ba30c1 100644
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -97,15 +97,6 @@ struct tcpc_config {
+ #define TCPC_MUX_DP_ENABLED		BIT(1)	/* DP enabled */
+ #define TCPC_MUX_POLARITY_INVERTED	BIT(2)	/* Polarity inverted */
+ 
+-/* Mux modes, decoded to attributes */
+-enum tcpc_mux_mode {
+-	TYPEC_MUX_NONE	= 0,				/* Open switch */
+-	TYPEC_MUX_USB	= TCPC_MUX_USB_ENABLED,		/* USB only */
+-	TYPEC_MUX_DP	= TCPC_MUX_DP_ENABLED,		/* DP only */
+-	TYPEC_MUX_DOCK	= TCPC_MUX_USB_ENABLED |	/* Both USB and DP */
+-			  TCPC_MUX_DP_ENABLED,
+-};
+-
+ /**
+  * struct tcpc_dev - Port configuration and callback functions
+  * @config:	Pointer to port configuration
