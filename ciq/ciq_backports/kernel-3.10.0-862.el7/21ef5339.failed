@@ -1,0 +1,221 @@
+radix-tree: add support for multi-order iterating
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 21ef533931f73a8e963a6107aa5ec51b192f28be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/21ef5339.failed
+
+This enables the macros radix_tree_for_each_slot() and friends to be
+used with multi-order entries.
+
+The way that this works is that we treat all entries in a given slots[]
+array as a single chunk.  If the index given to radix_tree_next_chunk()
+happens to point us to a sibling entry, we will back up iter->index so
+that it points to the canonical entry, and that will be the place where
+we start our iteration.
+
+As we're processing a chunk in radix_tree_next_slot(), we process
+canonical entries, skip over sibling entries, and restart the chunk
+lookup if we find a non-sibling indirect pointer.  This drops back to
+the radix_tree_next_chunk() code, which will re-walk the tree and look
+for another chunk.
+
+This allows us to properly handle multi-order entries mixed with other
+entries that are at various heights in the radix tree.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Neil Brown <neilb@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 21ef533931f73a8e963a6107aa5ec51b192f28be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/radix-tree.c
+#	tools/testing/radix-tree/linux/kernel.h
+diff --cc lib/radix-tree.c
+index 495d05176840,a4da86e40def..000000000000
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@@ -73,10 -75,7 +73,14 @@@ static inline void *ptr_to_indirect(voi
+  	return (void *)((unsigned long)ptr | RADIX_TREE_INDIRECT_PTR);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void *indirect_to_ptr(void *ptr)
+ +{
+ +	return (void *)((unsigned long)ptr & ~RADIX_TREE_INDIRECT_PTR);
+ +}
+++=======
++ #define RADIX_TREE_RETRY	ptr_to_indirect(NULL)
+++>>>>>>> 21ef533931f7 (radix-tree: add support for multi-order iterating)
+  
+  #ifdef CONFIG_RADIX_TREE_MULTIORDER
+  /* Sibling slots point directly to another slot in the same node */
+diff --cc tools/testing/radix-tree/linux/kernel.h
+index ae013b0160ac,be98a47b4e1b..000000000000
+--- a/tools/testing/radix-tree/linux/kernel.h
++++ b/tools/testing/radix-tree/linux/kernel.h
+@@@ -7,6 -7,11 +7,14 @@@
+  #include <stddef.h>
+  #include <limits.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include "../../include/linux/compiler.h"
++ #include "../../../include/linux/kconfig.h"
++ 
++ #define RADIX_TREE_MAP_SHIFT	3
++ 
+++>>>>>>> 21ef533931f7 (radix-tree: add support for multi-order iterating)
+  #ifndef NULL
+  #define NULL	0
+  #endif
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index f94b73d0f147..b766e45e14f4 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -318,8 +318,9 @@ static inline void radix_tree_preload_end(void)
+  * struct radix_tree_iter - radix tree iterator state
+  *
+  * @index:	index of current slot
+- * @next_index:	next-to-last index for this chunk
++ * @next_index:	one beyond the last index for this chunk
+  * @tags:	bit-mask for tag-iterating
++ * @shift:	shift for the node that holds our slots
+  *
+  * This radix tree iterator works in terms of "chunks" of slots.  A chunk is a
+  * subinterval of slots contained within one radix tree leaf node.  It is
+@@ -332,8 +333,20 @@ struct radix_tree_iter {
+ 	unsigned long	index;
+ 	unsigned long	next_index;
+ 	unsigned long	tags;
++#ifdef CONFIG_RADIX_TREE_MULTIORDER
++	unsigned int	shift;
++#endif
+ };
+ 
++static inline unsigned int iter_shift(struct radix_tree_iter *iter)
++{
++#ifdef CONFIG_RADIX_TREE_MULTIORDER
++	return iter->shift;
++#else
++	return 0;
++#endif
++}
++
+ #define RADIX_TREE_ITER_TAG_MASK	0x00FF	/* tag index in lower byte */
+ #define RADIX_TREE_ITER_TAGGED		0x0100	/* lookup tagged slots */
+ #define RADIX_TREE_ITER_CONTIG		0x0200	/* stop at first hole */
+@@ -393,6 +406,12 @@ void **radix_tree_iter_retry(struct radix_tree_iter *iter)
+ 	return NULL;
+ }
+ 
++static inline unsigned long
++__radix_tree_iter_add(struct radix_tree_iter *iter, unsigned long slots)
++{
++	return iter->index + (slots << iter_shift(iter));
++}
++
+ /**
+  * radix_tree_iter_next - resume iterating when the chunk may be invalid
+  * @iter:	iterator state
+@@ -404,7 +423,7 @@ void **radix_tree_iter_retry(struct radix_tree_iter *iter)
+ static inline __must_check
+ void **radix_tree_iter_next(struct radix_tree_iter *iter)
+ {
+-	iter->next_index = iter->index + 1;
++	iter->next_index = __radix_tree_iter_add(iter, 1);
+ 	iter->tags = 0;
+ 	return NULL;
+ }
+@@ -418,7 +437,12 @@ void **radix_tree_iter_next(struct radix_tree_iter *iter)
+ static __always_inline long
+ radix_tree_chunk_size(struct radix_tree_iter *iter)
+ {
+-	return iter->next_index - iter->index;
++	return (iter->next_index - iter->index) >> iter_shift(iter);
++}
++
++static inline void *indirect_to_ptr(void *ptr)
++{
++	return (void *)((unsigned long)ptr & ~RADIX_TREE_INDIRECT_PTR);
+ }
+ 
+ /**
+@@ -444,24 +468,51 @@ static __always_inline void **
+ radix_tree_next_slot(void **slot, struct radix_tree_iter *iter, unsigned flags)
+ {
+ 	if (flags & RADIX_TREE_ITER_TAGGED) {
++		void *canon = slot;
++
+ 		iter->tags >>= 1;
++		if (unlikely(!iter->tags))
++			return NULL;
++		while (IS_ENABLED(CONFIG_RADIX_TREE_MULTIORDER) &&
++					radix_tree_is_indirect_ptr(slot[1])) {
++			if (indirect_to_ptr(slot[1]) == canon) {
++				iter->tags >>= 1;
++				iter->index = __radix_tree_iter_add(iter, 1);
++				slot++;
++				continue;
++			}
++			iter->next_index = __radix_tree_iter_add(iter, 1);
++			return NULL;
++		}
+ 		if (likely(iter->tags & 1ul)) {
+-			iter->index++;
++			iter->index = __radix_tree_iter_add(iter, 1);
+ 			return slot + 1;
+ 		}
+-		if (!(flags & RADIX_TREE_ITER_CONTIG) && likely(iter->tags)) {
++		if (!(flags & RADIX_TREE_ITER_CONTIG)) {
+ 			unsigned offset = __ffs(iter->tags);
+ 
+ 			iter->tags >>= offset;
+-			iter->index += offset + 1;
++			iter->index = __radix_tree_iter_add(iter, offset + 1);
+ 			return slot + offset + 1;
+ 		}
+ 	} else {
+-		long size = radix_tree_chunk_size(iter);
++		long count = radix_tree_chunk_size(iter);
++		void *canon = slot;
+ 
+-		while (--size > 0) {
++		while (--count > 0) {
+ 			slot++;
+-			iter->index++;
++			iter->index = __radix_tree_iter_add(iter, 1);
++
++			if (IS_ENABLED(CONFIG_RADIX_TREE_MULTIORDER) &&
++			    radix_tree_is_indirect_ptr(*slot)) {
++				if (indirect_to_ptr(*slot) == canon)
++					continue;
++				else {
++					iter->next_index = iter->index;
++					break;
++				}
++			}
++
+ 			if (likely(*slot))
+ 				return slot;
+ 			if (flags & RADIX_TREE_ITER_CONTIG) {
+* Unmerged path lib/radix-tree.c
+diff --git a/tools/testing/radix-tree/generated/autoconf.h b/tools/testing/radix-tree/generated/autoconf.h
+new file mode 100644
+index 000000000000..ad18cf5a2a3a
+--- /dev/null
++++ b/tools/testing/radix-tree/generated/autoconf.h
+@@ -0,0 +1,3 @@
++#define CONFIG_RADIX_TREE_MULTIORDER 1
++#define CONFIG_SHMEM 1
++#define CONFIG_SWAP 1
+* Unmerged path tools/testing/radix-tree/linux/kernel.h
