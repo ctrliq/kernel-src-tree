@@ -1,0 +1,163 @@
+vfs: Add vfs_copy_file_range() support for pagecache copies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Anna Schumaker <Anna.Schumaker@netapp.com>
+commit eac70053a141998c40907747d6cea1d53a9414be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/eac70053.failed
+
+This allows us to have an in-kernel copy mechanism that avoids frequent
+switches between kernel and user space.  This is especially useful so
+NFSD can support server-side copies.
+
+The default (flags=0) means to first attempt copy acceleration, but use
+the pagecache if that fails.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Padraig Brady <P@draigBrady.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit eac70053a141998c40907747d6cea1d53a9414be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/read_write.c
+diff --cc fs/read_write.c
+index b7e6d43449bd,c81ef394a3d4..000000000000
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@@ -1328,3 -1328,127 +1328,130 @@@ COMPAT_SYSCALL_DEFINE4(sendfile64, int
+  	return do_sendfile(out_fd, in_fd, NULL, count, 0);
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * copy_file_range() differs from regular file read and write in that it
++  * specifically allows return partial success.  When it does so is up to
++  * the copy_file_range method.
++  */
++ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
++ 			    struct file *file_out, loff_t pos_out,
++ 			    size_t len, unsigned int flags)
++ {
++ 	struct inode *inode_in = file_inode(file_in);
++ 	struct inode *inode_out = file_inode(file_out);
++ 	ssize_t ret;
++ 
++ 	if (flags != 0)
++ 		return -EINVAL;
++ 
++ 	/* copy_file_range allows full ssize_t len, ignoring MAX_RW_COUNT  */
++ 	ret = rw_verify_area(READ, file_in, &pos_in, len);
++ 	if (ret >= 0)
++ 		ret = rw_verify_area(WRITE, file_out, &pos_out, len);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (!(file_in->f_mode & FMODE_READ) ||
++ 	    !(file_out->f_mode & FMODE_WRITE) ||
++ 	    (file_out->f_flags & O_APPEND))
++ 		return -EBADF;
++ 
++ 	/* this could be relaxed once a method supports cross-fs copies */
++ 	if (inode_in->i_sb != inode_out->i_sb)
++ 		return -EXDEV;
++ 
++ 	if (len == 0)
++ 		return 0;
++ 
++ 	ret = mnt_want_write_file(file_out);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = -EOPNOTSUPP;
++ 	if (file_out->f_op->copy_file_range)
++ 		ret = file_out->f_op->copy_file_range(file_in, pos_in, file_out,
++ 						      pos_out, len, flags);
++ 	if (ret == -EOPNOTSUPP)
++ 		ret = do_splice_direct(file_in, &pos_in, file_out, &pos_out,
++ 				len > MAX_RW_COUNT ? MAX_RW_COUNT : len, 0);
++ 
++ 	if (ret > 0) {
++ 		fsnotify_access(file_in);
++ 		add_rchar(current, ret);
++ 		fsnotify_modify(file_out);
++ 		add_wchar(current, ret);
++ 	}
++ 	inc_syscr(current);
++ 	inc_syscw(current);
++ 
++ 	mnt_drop_write_file(file_out);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(vfs_copy_file_range);
++ 
++ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
++ 		int, fd_out, loff_t __user *, off_out,
++ 		size_t, len, unsigned int, flags)
++ {
++ 	loff_t pos_in;
++ 	loff_t pos_out;
++ 	struct fd f_in;
++ 	struct fd f_out;
++ 	ssize_t ret = -EBADF;
++ 
++ 	f_in = fdget(fd_in);
++ 	if (!f_in.file)
++ 		goto out2;
++ 
++ 	f_out = fdget(fd_out);
++ 	if (!f_out.file)
++ 		goto out1;
++ 
++ 	ret = -EFAULT;
++ 	if (off_in) {
++ 		if (copy_from_user(&pos_in, off_in, sizeof(loff_t)))
++ 			goto out;
++ 	} else {
++ 		pos_in = f_in.file->f_pos;
++ 	}
++ 
++ 	if (off_out) {
++ 		if (copy_from_user(&pos_out, off_out, sizeof(loff_t)))
++ 			goto out;
++ 	} else {
++ 		pos_out = f_out.file->f_pos;
++ 	}
++ 
++ 	ret = vfs_copy_file_range(f_in.file, pos_in, f_out.file, pos_out, len,
++ 				  flags);
++ 	if (ret > 0) {
++ 		pos_in += ret;
++ 		pos_out += ret;
++ 
++ 		if (off_in) {
++ 			if (copy_to_user(off_in, &pos_in, sizeof(loff_t)))
++ 				ret = -EFAULT;
++ 		} else {
++ 			f_in.file->f_pos = pos_in;
++ 		}
++ 
++ 		if (off_out) {
++ 			if (copy_to_user(off_out, &pos_out, sizeof(loff_t)))
++ 				ret = -EFAULT;
++ 		} else {
++ 			f_out.file->f_pos = pos_out;
++ 		}
++ 	}
++ 
++ out:
++ 	fdput(f_out);
++ out1:
++ 	fdput(f_in);
++ out2:
++ 	return ret;
++ }
+++>>>>>>> eac70053a141 (vfs: Add vfs_copy_file_range() support for pagecache copies)
+* Unmerged path fs/read_write.c
