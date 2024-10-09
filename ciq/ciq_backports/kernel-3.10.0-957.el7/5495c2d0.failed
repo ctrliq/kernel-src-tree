@@ -1,0 +1,206 @@
+ceph: avoid dereferencing invalid pointer during cached readdir
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 5495c2d04f85da09512f5f346ed24dc0261d905d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5495c2d0.failed
+
+Readdir cache keeps array of dentry pointers in page cache. If any
+dentry in readdir cache gets pruned, ceph_d_prune() disables readdir
+cache for later readdir syscall. The problem is that ceph_d_prune()
+ignores unhashed dentry. Ideally MDS should have already revoked
+CEPH_CAP_FILE_SHARED (which also disables readdir cache) when dentry
+gets unhashed. But if it is somehow MDS does not properly revoke
+CEPH_CAP_FILE_SHARED and the unhashed dentry gets pruned later,
+ceph_d_prune() will not disable readdir cache, later readdir may
+reference invalid dentry pointer.
+
+The fix is make ceph_d_prune() do extra check for unhashed dentry.
+Disable readdir cache if the unhashed dentry is still referenced
+by readdir cache.
+
+Another fix in this patch is handle d_splice_alias(). If a dentry
+gets spliced into new parent dentry, treat it as if it was pruned
+(call ceph_d_prune() for it).
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Acked-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 5495c2d04f85da09512f5f346ed24dc0261d905d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+#	fs/ceph/inode.c
+diff --cc fs/ceph/dir.c
+index 83040cdc8671,0c4346806e17..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -251,11 -231,17 +251,23 @@@ static int __dcache_readdir(struct fil
+  			goto out;
+  		}
+  
+- 		di = ceph_dentry(dentry);
+  		spin_lock(&dentry->d_lock);
+++<<<<<<< HEAD
+ +		if (di->lease_shared_gen == shared_gen &&
+ +		    dentry->d_inode &&
+ +		    fpos_cmp(filp->f_pos, di->offset) <= 0) {
+++=======
++ 		di = ceph_dentry(dentry);
++ 		if (d_unhashed(dentry) ||
++ 		    d_really_is_negative(dentry) ||
++ 		    di->lease_shared_gen != shared_gen) {
++ 			spin_unlock(&dentry->d_lock);
++ 			dput(dentry);
++ 			err = -EAGAIN;
++ 			goto out;
++ 		}
++ 		if (fpos_cmp(ctx->pos, di->offset) <= 0) {
+++>>>>>>> 5495c2d04f85 (ceph: avoid dereferencing invalid pointer during cached readdir)
+  			emit_dentry = true;
+  		}
+  		spin_unlock(&dentry->d_lock);
+@@@ -1363,15 -1339,28 +1378,36 @@@ static void ceph_d_prune(struct dentry 
+  	if (IS_ROOT(dentry))
+  		return;
+  
+- 	/* if we are not hashed, we don't affect dir's completeness */
+- 	if (d_unhashed(dentry))
++ 	/* we hold d_lock, so d_parent is stable */
++ 	dir_ci = ceph_inode(d_inode(dentry->d_parent));
++ 	if (dir_ci->i_vino.snap == CEPH_SNAPDIR)
+  		return;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * we hold d_lock, so d_parent is stable, and d_fsdata is never
+ +	 * cleared until d_release
+ +	 */
+ +	ceph_dir_clear_complete(dentry->d_parent->d_inode);
+++=======
++ 	/* who calls d_delete() should also disable dcache readdir */
++ 	if (d_really_is_negative(dentry))
++ 		return;
++ 
++ 	/* d_fsdata does not get cleared until d_release */
++ 	if (!d_unhashed(dentry)) {
++ 		__ceph_dir_clear_complete(dir_ci);
++ 		return;
++ 	}
++ 
++ 	/* Disable dcache readdir just in case that someone called d_drop()
++ 	 * or d_invalidate(), but MDS didn't revoke CEPH_CAP_FILE_SHARED
++ 	 * properly (dcache readdir is still enabled) */
++ 	di = ceph_dentry(dentry);
++ 	if (di->offset > 0 &&
++ 	    di->lease_shared_gen == atomic_read(&dir_ci->i_shared_gen))
++ 		__ceph_dir_clear_ordered(dir_ci);
+++>>>>>>> 5495c2d04f85 (ceph: avoid dereferencing invalid pointer during cached readdir)
+  }
+  
+  /*
+diff --cc fs/ceph/inode.c
+index 89fde4d86e99,c6ec5aa46100..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -1059,8 -1078,29 +1059,29 @@@ static struct dentry *splice_dentry(str
+  {
+  	struct dentry *realdn;
+  
+ -	BUG_ON(d_inode(dn));
+ +	BUG_ON(dn->d_inode);
+  
++ 	if (S_ISDIR(in->i_mode)) {
++ 		/* If inode is directory, d_splice_alias() below will remove
++ 		 * 'realdn' from its origin parent. We need to ensure that
++ 		 * origin parent's readdir cache will not reference 'realdn'
++ 		 */
++ 		realdn = d_find_any_alias(in);
++ 		if (realdn) {
++ 			struct ceph_dentry_info *di = ceph_dentry(realdn);
++ 			spin_lock(&realdn->d_lock);
++ 
++ 			realdn->d_op->d_prune(realdn);
++ 
++ 			di->time = jiffies;
++ 			di->lease_shared_gen = 0;
++ 			di->offset = 0;
++ 
++ 			spin_unlock(&realdn->d_lock);
++ 			dput(realdn);
++ 		}
++ 	}
++ 
+  	/* dn must be unhashed */
+  	if (!d_unhashed(dn))
+  		d_drop(dn);
+@@@ -1283,9 -1315,9 +1304,14 @@@ retry_lookup
+  		/* null dentry? */
+  		if (!rinfo->head->is_target) {
+  			dout("fill_trace null dentry\n");
+++<<<<<<< HEAD
+ +			if (dn->d_inode) {
+ +				ceph_dir_clear_ordered(dir);
+++=======
++ 			if (d_really_is_positive(dn)) {
+++>>>>>>> 5495c2d04f85 (ceph: avoid dereferencing invalid pointer during cached readdir)
+  				dout("d_delete %p\n", dn);
++ 				ceph_dir_clear_ordered(dir);
+  				d_delete(dn);
+  			} else if (have_lease) {
+  				if (d_unhashed(dn))
+@@@ -1555,17 -1590,22 +1581,36 @@@ retry_lookup
+  				err = -ENOMEM;
+  				goto out;
+  			}
+++<<<<<<< HEAD
+ +			ret = ceph_init_dentry(dn);
+ +			if (ret < 0) {
+ +				dput(dn);
+ +				err = ret;
+ +				goto out;
+ +			}
+ +		} else if (dn->d_inode &&
+ +			   (ceph_ino(dn->d_inode) != tvino.ino ||
+ +			    ceph_snap(dn->d_inode) != tvino.snap)) {
+ +			dout(" dn %p points to wrong inode %p\n",
+ +			     dn, dn->d_inode);
+++=======
++ 		} else if (d_really_is_positive(dn) &&
++ 			   (ceph_ino(d_inode(dn)) != tvino.ino ||
++ 			    ceph_snap(d_inode(dn)) != tvino.snap)) {
++ 			struct ceph_dentry_info *di = ceph_dentry(dn);
++ 			dout(" dn %p points to wrong inode %p\n",
++ 			     dn, d_inode(dn));
++ 
++ 			spin_lock(&dn->d_lock);
++ 			if (di->offset > 0 &&
++ 			    di->lease_shared_gen ==
++ 			    atomic_read(&ci->i_shared_gen)) {
++ 				__ceph_dir_clear_ordered(ci);
++ 				di->offset = 0;
++ 			}
++ 			spin_unlock(&dn->d_lock);
++ 
+++>>>>>>> 5495c2d04f85 (ceph: avoid dereferencing invalid pointer during cached readdir)
+  			d_delete(dn);
+  			dput(dn);
+  			goto retry_lookup;
+@@@ -1590,7 -1630,7 +1635,11 @@@
+  				 &req->r_caps_reservation);
+  		if (ret < 0) {
+  			pr_err("fill_inode badness on %p\n", in);
+++<<<<<<< HEAD
+ +			if (!dn->d_inode)
+++=======
++ 			if (d_really_is_negative(dn))
+++>>>>>>> 5495c2d04f85 (ceph: avoid dereferencing invalid pointer during cached readdir)
+  				iput(in);
+  			d_drop(dn);
+  			err = ret;
+* Unmerged path fs/ceph/dir.c
+* Unmerged path fs/ceph/inode.c
