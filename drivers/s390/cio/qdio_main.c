@@ -731,6 +731,15 @@ static void qdio_kick_handler(struct qdio_q *q)
 	q->qdio_error = 0;
 }
 
+static inline int qdio_tasklet_schedule(struct qdio_q *q)
+{
+	if (likely(q->irq_ptr->state == QDIO_IRQ_STATE_ACTIVE)) {
+		tasklet_schedule(&q->tasklet);
+		return 0;
+	}
+	return -EPERM;
+}
+
 static void __qdio_inbound_processing(struct qdio_q *q)
 {
 	qperf_inc(q, tasklet_inbound);
@@ -743,10 +752,8 @@ static void __qdio_inbound_processing(struct qdio_q *q)
 	if (!qdio_inbound_q_done(q)) {
 		/* means poll time is not yet over */
 		qperf_inc(q, tasklet_inbound_resched);
-		if (likely(q->irq_ptr->state != QDIO_IRQ_STATE_STOPPED)) {
-			tasklet_schedule(&q->tasklet);
+		if (!qdio_tasklet_schedule(q))
 			return;
-		}
 	}
 
 	qdio_stop_polling(q);
@@ -756,8 +763,7 @@ static void __qdio_inbound_processing(struct qdio_q *q)
 	 */
 	if (!qdio_inbound_q_done(q)) {
 		qperf_inc(q, tasklet_inbound_resched2);
-		if (likely(q->irq_ptr->state != QDIO_IRQ_STATE_STOPPED))
-			tasklet_schedule(&q->tasklet);
+		qdio_tasklet_schedule(q);
 	}
 }
 
@@ -914,16 +920,15 @@ static void __qdio_outbound_processing(struct qdio_q *q)
 	 * is noticed and outbound_handler is called after some time.
 	 */
 	if (qdio_outbound_q_done(q))
-		del_timer(&q->u.out.timer);
+		del_timer_sync(&q->u.out.timer);
 	else
-		if (!timer_pending(&q->u.out.timer))
+		if (!timer_pending(&q->u.out.timer) &&
+		    likely(q->irq_ptr->state == QDIO_IRQ_STATE_ACTIVE))
 			mod_timer(&q->u.out.timer, jiffies + 10 * HZ);
 	return;
 
 sched:
-	if (unlikely(q->irq_ptr->state == QDIO_IRQ_STATE_STOPPED))
-		return;
-	tasklet_schedule(&q->tasklet);
+	qdio_tasklet_schedule(q);
 }
 
 /* outbound tasklet */
@@ -937,9 +942,7 @@ void qdio_outbound_timer(unsigned long data)
 {
 	struct qdio_q *q = (struct qdio_q *)data;
 
-	if (unlikely(q->irq_ptr->state == QDIO_IRQ_STATE_STOPPED))
-		return;
-	tasklet_schedule(&q->tasklet);
+	qdio_tasklet_schedule(q);
 }
 
 static inline void qdio_check_outbound_after_thinint(struct qdio_q *q)
@@ -952,7 +955,7 @@ static inline void qdio_check_outbound_after_thinint(struct qdio_q *q)
 
 	for_each_output_queue(q->irq_ptr, out, i)
 		if (!qdio_outbound_q_done(out))
-			tasklet_schedule(&out->tasklet);
+			qdio_tasklet_schedule(out);
 }
 
 static void __tiqdio_inbound_processing(struct qdio_q *q)
@@ -974,10 +977,8 @@ static void __tiqdio_inbound_processing(struct qdio_q *q)
 
 	if (!qdio_inbound_q_done(q)) {
 		qperf_inc(q, tasklet_inbound_resched);
-		if (likely(q->irq_ptr->state != QDIO_IRQ_STATE_STOPPED)) {
-			tasklet_schedule(&q->tasklet);
+		if (!qdio_tasklet_schedule(q))
 			return;
-		}
 	}
 
 	qdio_stop_polling(q);
@@ -987,8 +988,7 @@ static void __tiqdio_inbound_processing(struct qdio_q *q)
 	 */
 	if (!qdio_inbound_q_done(q)) {
 		qperf_inc(q, tasklet_inbound_resched2);
-		if (likely(q->irq_ptr->state != QDIO_IRQ_STATE_STOPPED))
-			tasklet_schedule(&q->tasklet);
+		qdio_tasklet_schedule(q);
 	}
 }
 
@@ -1022,7 +1022,7 @@ static void qdio_int_handler_pci(struct qdio_irq *irq_ptr)
 	int i;
 	struct qdio_q *q;
 
-	if (unlikely(irq_ptr->state == QDIO_IRQ_STATE_STOPPED))
+	if (unlikely(irq_ptr->state != QDIO_IRQ_STATE_ACTIVE))
 		return;
 
 	for_each_input_queue(irq_ptr, q, i) {
@@ -1048,7 +1048,7 @@ static void qdio_int_handler_pci(struct qdio_irq *irq_ptr)
 			continue;
 		if (need_siga_sync(q) && need_siga_sync_out_after_pci(q))
 			qdio_siga_sync_q(q);
-		tasklet_schedule(&q->tasklet);
+		qdio_tasklet_schedule(q);
 	}
 }
 
@@ -1186,7 +1186,7 @@ static void qdio_shutdown_queues(struct ccw_device *cdev)
 		tasklet_kill(&q->tasklet);
 
 	for_each_output_queue(irq_ptr, q, i) {
-		del_timer(&q->u.out.timer);
+		del_timer_sync(&q->u.out.timer);
 		tasklet_kill(&q->tasklet);
 	}
 }
@@ -1631,10 +1631,11 @@ static int handle_outbound(struct qdio_q *q, unsigned int callflags,
 
 	/* in case of SIGA errors we must process the error immediately */
 	if (used >= q->u.out.scan_threshold || rc)
-		tasklet_schedule(&q->tasklet);
+		qdio_tasklet_schedule(q);
 	else
 		/* free the SBALs in case of no further traffic */
-		if (!timer_pending(&q->u.out.timer))
+		if (!timer_pending(&q->u.out.timer) &&
+		    likely(q->irq_ptr->state == QDIO_IRQ_STATE_ACTIVE))
 			mod_timer(&q->u.out.timer, jiffies + HZ);
 	return rc;
 }
