@@ -1,0 +1,315 @@
+blk: Ensure users for current->bio_list can see the full list.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [block] blk: Ensure users for current->bio_list can see the full list (Ming Lei) [1447313]
+Rebuild_FUZZ: 99.19%
+commit-author NeilBrown <neilb@suse.com>
+commit f5fe1b51905df7cfe4fdfd85c5fb7bc5b71a094f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f5fe1b51.failed
+
+Commit 79bd99596b73 ("blk: improve order of bio handling in generic_make_request()")
+changed current->bio_list so that it did not contain *all* of the
+queued bios, but only those submitted by the currently running
+make_request_fn.
+
+There are two places which walk the list and requeue selected bios,
+and others that check if the list is empty.  These are no longer
+correct.
+
+So redefine current->bio_list to point to an array of two lists, which
+contain all queued bios, and adjust various code to test or walk both
+lists.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+Fixes: 79bd99596b73 ("blk: improve order of bio handling in generic_make_request()")
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f5fe1b51905df7cfe4fdfd85c5fb7bc5b71a094f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	drivers/md/dm.c
+#	fs/bio.c
+diff --cc block/blk-core.c
+index 84a14bb6d377,d772c221cc17..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -1970,12 -1971,20 +1970,24 @@@ end_io
+   * a lower device by calling into generic_make_request recursively, which
+   * means the bio should NOT be touched after the call to ->make_request_fn.
+   */
+ -blk_qc_t generic_make_request(struct bio *bio)
+ +void generic_make_request(struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	struct bio_list bio_list_on_stack;
+++=======
++ 	/*
++ 	 * bio_list_on_stack[0] contains bios submitted by the current
++ 	 * make_request_fn.
++ 	 * bio_list_on_stack[1] contains bios that were submitted before
++ 	 * the current make_request_fn, but that haven't been processed
++ 	 * yet.
++ 	 */
++ 	struct bio_list bio_list_on_stack[2];
++ 	blk_qc_t ret = BLK_QC_T_NONE;
+++>>>>>>> f5fe1b51905d (blk: Ensure users for current->bio_list can see the full list.)
+  
+  	if (!generic_make_request_checks(bio))
+ -		goto out;
+ +		return;
+  
+  	/*
+  	 * We only want one ->make_request_fn to be active at a time, else
+@@@ -1988,8 -1997,8 +2000,13 @@@
+  	 * should be added at the tail
+  	 */
+  	if (current->bio_list) {
+++<<<<<<< HEAD
+ +		bio_list_add(current->bio_list, bio);
+ +		return;
+++=======
++ 		bio_list_add(&current->bio_list[0], bio);
++ 		goto out;
+++>>>>>>> f5fe1b51905d (blk: Ensure users for current->bio_list can see the full list.)
+  	}
+  
+  	/* following loop may be a bit non-obvious, and so deserves some
+@@@ -2012,21 -2021,39 +2029,52 @@@
+  	do {
+  		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+  
+++<<<<<<< HEAD
+ +		if (likely(blk_queue_enter(q, __GFP_WAIT) == 0)) {
+ +
+ +			q->make_request_fn(q, bio);
+ +
+ +			blk_queue_exit(q);
+ +
+ +			bio = bio_list_pop(current->bio_list);
+++=======
++ 		if (likely(blk_queue_enter(q, false) == 0)) {
++ 			struct bio_list lower, same;
++ 
++ 			/* Create a fresh bio_list for all subordinate requests */
++ 			bio_list_on_stack[1] = bio_list_on_stack[0];
++ 			bio_list_init(&bio_list_on_stack[0]);
++ 			ret = q->make_request_fn(q, bio);
++ 
++ 			blk_queue_exit(q);
++ 
++ 			/* sort new bios into those for a lower level
++ 			 * and those for the same level
++ 			 */
++ 			bio_list_init(&lower);
++ 			bio_list_init(&same);
++ 			while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
++ 				if (q == bdev_get_queue(bio->bi_bdev))
++ 					bio_list_add(&same, bio);
++ 				else
++ 					bio_list_add(&lower, bio);
++ 			/* now assemble so we handle the lowest level first */
++ 			bio_list_merge(&bio_list_on_stack[0], &lower);
++ 			bio_list_merge(&bio_list_on_stack[0], &same);
++ 			bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+++>>>>>>> f5fe1b51905d (blk: Ensure users for current->bio_list can see the full list.)
+  		} else {
+ +			struct bio *bio_next = bio_list_pop(current->bio_list);
+ +
+  			bio_io_error(bio);
+ +			bio = bio_next;
+  		}
+++<<<<<<< HEAD
+++=======
++ 		bio = bio_list_pop(&bio_list_on_stack[0]);
+++>>>>>>> f5fe1b51905d (blk: Ensure users for current->bio_list can see the full list.)
+  	} while (bio);
+  	current->bio_list = NULL; /* deactivate */
+ -
+ -out:
+ -	return ret;
+  }
+  EXPORT_SYMBOL(generic_make_request);
+  
+diff --cc drivers/md/dm.c
+index ec8896186c46,dfb75979e455..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -908,6 -908,126 +908,129 @@@ int dm_set_target_max_io_len(struct dm_
+  }
+  EXPORT_SYMBOL_GPL(dm_set_target_max_io_len);
+  
+++<<<<<<< HEAD
+++=======
++ static long dm_blk_direct_access(struct block_device *bdev, sector_t sector,
++ 				 void **kaddr, pfn_t *pfn, long size)
++ {
++ 	struct mapped_device *md = bdev->bd_disk->private_data;
++ 	struct dm_table *map;
++ 	struct dm_target *ti;
++ 	int srcu_idx;
++ 	long len, ret = -EIO;
++ 
++ 	map = dm_get_live_table(md, &srcu_idx);
++ 	if (!map)
++ 		goto out;
++ 
++ 	ti = dm_table_find_target(map, sector);
++ 	if (!dm_target_is_valid(ti))
++ 		goto out;
++ 
++ 	len = max_io_len(sector, ti) << SECTOR_SHIFT;
++ 	size = min(len, size);
++ 
++ 	if (ti->type->direct_access)
++ 		ret = ti->type->direct_access(ti, sector, kaddr, pfn, size);
++ out:
++ 	dm_put_live_table(md, srcu_idx);
++ 	return min(ret, size);
++ }
++ 
++ /*
++  * A target may call dm_accept_partial_bio only from the map routine.  It is
++  * allowed for all bio types except REQ_PREFLUSH.
++  *
++  * dm_accept_partial_bio informs the dm that the target only wants to process
++  * additional n_sectors sectors of the bio and the rest of the data should be
++  * sent in a next bio.
++  *
++  * A diagram that explains the arithmetics:
++  * +--------------------+---------------+-------+
++  * |         1          |       2       |   3   |
++  * +--------------------+---------------+-------+
++  *
++  * <-------------- *tio->len_ptr --------------->
++  *                      <------- bi_size ------->
++  *                      <-- n_sectors -->
++  *
++  * Region 1 was already iterated over with bio_advance or similar function.
++  *	(it may be empty if the target doesn't use bio_advance)
++  * Region 2 is the remaining bio size that the target wants to process.
++  *	(it may be empty if region 1 is non-empty, although there is no reason
++  *	 to make it empty)
++  * The target requires that region 3 is to be sent in the next bio.
++  *
++  * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
++  * the partially processed part (the sum of regions 1+2) must be the same for all
++  * copies of the bio.
++  */
++ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
++ {
++ 	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
++ 	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
++ 	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
++ 	BUG_ON(bi_size > *tio->len_ptr);
++ 	BUG_ON(n_sectors > bi_size);
++ 	*tio->len_ptr -= bi_size - n_sectors;
++ 	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
++ }
++ EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
++ 
++ /*
++  * Flush current->bio_list when the target map method blocks.
++  * This fixes deadlocks in snapshot and possibly in other targets.
++  */
++ struct dm_offload {
++ 	struct blk_plug plug;
++ 	struct blk_plug_cb cb;
++ };
++ 
++ static void flush_current_bio_list(struct blk_plug_cb *cb, bool from_schedule)
++ {
++ 	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
++ 	struct bio_list list;
++ 	struct bio *bio;
++ 	int i;
++ 
++ 	INIT_LIST_HEAD(&o->cb.list);
++ 
++ 	if (unlikely(!current->bio_list))
++ 		return;
++ 
++ 	for (i = 0; i < 2; i++) {
++ 		list = current->bio_list[i];
++ 		bio_list_init(&current->bio_list[i]);
++ 
++ 		while ((bio = bio_list_pop(&list))) {
++ 			struct bio_set *bs = bio->bi_pool;
++ 			if (unlikely(!bs) || bs == fs_bio_set) {
++ 				bio_list_add(&current->bio_list[i], bio);
++ 				continue;
++ 			}
++ 
++ 			spin_lock(&bs->rescue_lock);
++ 			bio_list_add(&bs->rescue_list, bio);
++ 			queue_work(bs->rescue_workqueue, &bs->rescue_work);
++ 			spin_unlock(&bs->rescue_lock);
++ 		}
++ 	}
++ }
++ 
++ static void dm_offload_start(struct dm_offload *o)
++ {
++ 	blk_start_plug(&o->plug);
++ 	o->cb.callback = flush_current_bio_list;
++ 	list_add(&o->cb.list, &current->plug->cb_list);
++ }
++ 
++ static void dm_offload_end(struct dm_offload *o)
++ {
++ 	list_del(&o->cb.list);
++ 	blk_finish_plug(&o->plug);
++ }
++ 
+++>>>>>>> f5fe1b51905d (blk: Ensure users for current->bio_list can see the full list.)
+  static void __map_bio(struct dm_target_io *tio)
+  {
+  	int r;
+diff --cc fs/bio.c
+index 009e9f2955d9,e75878f8b14a..000000000000
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@@ -456,13 -465,15 +460,20 @@@ struct bio *bio_alloc_bioset(gfp_t gfp_
+  		 * We solve this, and guarantee forward progress, with a rescuer
+  		 * workqueue per bio_set. If we go to allocate and there are
+  		 * bios on current->bio_list, we first try the allocation
+ -		 * without __GFP_DIRECT_RECLAIM; if that fails, we punt those
+ -		 * bios we would be blocking to the rescuer workqueue before
+ -		 * we retry with the original gfp_flags.
+ +		 * without __GFP_WAIT; if that fails, we punt those bios we
+ +		 * would be blocking to the rescuer workqueue before we retry
+ +		 * with the original gfp_flags.
+  		 */
+  
+++<<<<<<< HEAD:fs/bio.c
+ +		if (current->bio_list && !bio_list_empty(current->bio_list))
+ +			gfp_mask &= ~__GFP_WAIT;
+++=======
++ 		if (current->bio_list &&
++ 		    (!bio_list_empty(&current->bio_list[0]) ||
++ 		     !bio_list_empty(&current->bio_list[1])))
++ 			gfp_mask &= ~__GFP_DIRECT_RECLAIM;
+++>>>>>>> f5fe1b51905d (blk: Ensure users for current->bio_list can see the full list.):block/bio.c
+  
+  		p = mempool_alloc(bs->bio_pool, gfp_mask);
+  		if (!p && gfp_mask != saved_gfp) {
+* Unmerged path block/blk-core.c
+* Unmerged path drivers/md/dm.c
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 9848c5d0edf0..6f28603463cb 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1027,7 +1027,8 @@ static void wait_barrier(struct r10conf *conf)
+ 				    !conf->barrier ||
+ 				    (atomic_read(&conf->nr_pending) &&
+ 				     current->bio_list &&
+-				     !bio_list_empty(current->bio_list)),
++				     (!bio_list_empty(&current->bio_list[0]) ||
++				      !bio_list_empty(&current->bio_list[1]))),
+ 				    conf->resync_lock);
+ 		conf->nr_waiting--;
+ 		if (!conf->nr_waiting)
+* Unmerged path fs/bio.c
