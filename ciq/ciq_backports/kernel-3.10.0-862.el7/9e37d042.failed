@@ -1,0 +1,320 @@
+target: Drop se_lun->lun_active for existing percpu lun_ref
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Drop se_lun->lun_active for existing percpu lun_ref (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.73%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 9e37d042cfcb003b885bb4c531cd6f07f62647d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9e37d042.failed
+
+With se_port_t and t10_alua_tg_pt_gp_member being absored into se_lun,
+there is no need for an extra atomic_t based reference count for PR
+ALL_TG_PT=1 and ALUA access state transition.
+
+Go ahead and use the existing percpu se_lun->lun_ref instead, and
+convert the two special cases to percpu_ref_tryget_live() to avoid
+se_lun if transport_clear_lun_ref() has already been invoked to
+shutdown the se_lun.
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9e37d042cfcb003b885bb4c531cd6f07f62647d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_alua.c
+#	drivers/target/target_core_pr.c
+#	drivers/target/target_core_tpg.c
+#	include/target/target_core_base.h
+diff --cc drivers/target/target_core_alua.c
+index a73542598e96,02d8e1a8a6a5..000000000000
+--- a/drivers/target/target_core_alua.c
++++ b/drivers/target/target_core_alua.c
+@@@ -993,13 -969,14 +993,18 @@@ static void core_alua_do_transition_ua(
+  		 * every I_T nexus other than the I_T nexus on which the SET
+  		 * TARGET PORT GROUPS command
+  		 */
+++<<<<<<< HEAD
+ +		atomic_inc_mb(&mem->tg_pt_gp_mem_ref_cnt);
+++=======
++ 		if (!percpu_ref_tryget_live(&lun->lun_ref))
++ 			continue;
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  		spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+  
+ -		spin_lock_bh(&lun->lun_deve_lock);
+ -		list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link) {
+ -			lacl = rcu_dereference_check(se_deve->se_lun_acl,
+ -					lockdep_is_held(&lun->lun_deve_lock));
+ +		spin_lock_bh(&port->sep_alua_lock);
+ +		list_for_each_entry(se_deve, &port->sep_alua_list,
+ +					alua_port_list) {
+ +			lacl = se_deve->se_lun_acl;
+  			/*
+  			 * se_deve->se_lun_acl pointer may be NULL for a
+  			 * entry created without explicit Node+MappedLUN ACLs
+@@@ -1019,12 -996,47 +1024,16 @@@
+  				se_deve->mapped_lun, 0x2A,
+  				ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED);
+  		}
+ -		spin_unlock_bh(&lun->lun_deve_lock);
+ +		spin_unlock_bh(&port->sep_alua_lock);
+  
+  		spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+++<<<<<<< HEAD
+ +		atomic_dec_mb(&mem->tg_pt_gp_mem_ref_cnt);
+++=======
++ 		percpu_ref_put(&lun->lun_ref);
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  	}
+  	spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+ -	/*
+ -	 * Update the ALUA metadata buf that has been allocated in
+ -	 * core_alua_do_port_transition(), this metadata will be written
+ -	 * to struct file.
+ -	 *
+ -	 * Note that there is the case where we do not want to update the
+ -	 * metadata when the saved metadata is being parsed in userspace
+ -	 * when setting the existing port access state and access status.
+ -	 *
+ -	 * Also note that the failure to write out the ALUA metadata to
+ -	 * struct file does NOT affect the actual ALUA transition.
+ -	 */
+ -	if (tg_pt_gp->tg_pt_gp_write_metadata) {
+ -		mutex_lock(&tg_pt_gp->tg_pt_gp_md_mutex);
+ -		core_alua_update_tpg_primary_metadata(tg_pt_gp);
+ -		mutex_unlock(&tg_pt_gp->tg_pt_gp_md_mutex);
+ -	}
+ -	/*
+ -	 * Set the current primary ALUA access state to the requested new state
+ -	 */
+ -	atomic_set(&tg_pt_gp->tg_pt_gp_alua_access_state,
+ -		   tg_pt_gp->tg_pt_gp_alua_pending_state);
+ -
+ -	pr_debug("Successful %s ALUA transition TG PT Group: %s ID: %hu"
+ -		" from primary access state %s to %s\n", (explicit) ? "explicit" :
+ -		"implicit", config_item_name(&tg_pt_gp->tg_pt_gp_group.cg_item),
+ -		tg_pt_gp->tg_pt_gp_id,
+ -		core_alua_dump_state(tg_pt_gp->tg_pt_gp_alua_previous_state),
+ -		core_alua_dump_state(tg_pt_gp->tg_pt_gp_alua_pending_state));
+ -	spin_lock(&dev->t10_alua.tg_pt_gps_lock);
+ -	atomic_dec(&tg_pt_gp->tg_pt_gp_ref_cnt);
+ -	spin_unlock(&dev->t10_alua.tg_pt_gps_lock);
+ -
+ -	if (tg_pt_gp->tg_pt_gp_transition_complete)
+ -		complete(tg_pt_gp->tg_pt_gp_transition_complete);
+  }
+  
+  static int core_alua_do_transition_tg_pt(
+diff --cc drivers/target/target_core_pr.c
+index a255afc452a9,94935eaa7fa7..000000000000
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@@ -701,13 -703,13 +701,19 @@@ static struct t10_pr_registration *__co
+  	 * for ALL_TG_PT=1
+  	 */
+  	spin_lock(&dev->se_port_lock);
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(port, port_tmp, &dev->dev_sep_list, sep_list) {
+ +		atomic_inc_mb(&port->sep_tg_pt_ref_cnt);
+++=======
++ 	list_for_each_entry_safe(lun_tmp, next, &dev->dev_sep_list, lun_dev_link) {
++ 		if (!percpu_ref_tryget_live(&lun_tmp->lun_ref))
++ 			continue;
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  		spin_unlock(&dev->se_port_lock);
+  
+ -		spin_lock_bh(&lun_tmp->lun_deve_lock);
+ -		list_for_each_entry(deve_tmp, &lun_tmp->lun_deve_list, lun_link) {
+ +		spin_lock_bh(&port->sep_alua_lock);
+ +		list_for_each_entry(deve_tmp, &port->sep_alua_list,
+ +					alua_port_list) {
+  			/*
+  			 * This pointer will be NULL for demo mode MappedLUNs
+  			 * that have not been make explicit via a ConfigFS
+@@@ -748,8 -752,8 +754,13 @@@
+  			if (ret < 0) {
+  				pr_err("core_scsi3_lunacl_depend"
+  						"_item() failed\n");
+++<<<<<<< HEAD
+ +				atomic_dec_mb(&port->sep_tg_pt_ref_cnt);
+ +				atomic_dec_mb(&deve_tmp->pr_ref_count);
+++=======
++ 				percpu_ref_put(&lun_tmp->lun_ref);
++ 				kref_put(&deve_tmp->pr_kref, target_pr_kref_release);
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  				goto out;
+  			}
+  			/*
+@@@ -759,24 -763,27 +770,32 @@@
+  			 * the original *pr_reg is processed in
+  			 * __core_scsi3_add_registration()
+  			 */
+ -			dest_lun = rcu_dereference_check(deve_tmp->se_lun,
+ -				atomic_read(&deve_tmp->pr_kref.refcount) != 0);
+ -
+  			pr_reg_atp = __core_scsi3_do_alloc_registration(dev,
+ -						nacl_tmp, dest_lun, deve_tmp,
+ -						deve_tmp->mapped_lun, NULL,
+ +						nacl_tmp, deve_tmp, NULL,
+  						sa_res_key, all_tg_pt, aptpl);
+  			if (!pr_reg_atp) {
+++<<<<<<< HEAD
+ +				atomic_dec_mb(&port->sep_tg_pt_ref_cnt);
+ +				atomic_dec_mb(&deve_tmp->pr_ref_count);
+++=======
++ 				percpu_ref_put(&lun_tmp->lun_ref);
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  				core_scsi3_lunacl_undepend_item(deve_tmp);
+  				goto out;
+  			}
+  
+  			list_add_tail(&pr_reg_atp->pr_reg_atp_mem_list,
+  				      &pr_reg->pr_reg_atp_list);
+ -			spin_lock_bh(&lun_tmp->lun_deve_lock);
+ +			spin_lock_bh(&port->sep_alua_lock);
+  		}
+ -		spin_unlock_bh(&lun_tmp->lun_deve_lock);
+ +		spin_unlock_bh(&port->sep_alua_lock);
+  
+  		spin_lock(&dev->se_port_lock);
+++<<<<<<< HEAD
+ +		atomic_dec_mb(&port->sep_tg_pt_ref_cnt);
+++=======
++ 		percpu_ref_put(&lun_tmp->lun_ref);
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  	}
+  	spin_unlock(&dev->se_port_lock);
+  
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,b9fcf2c4898e..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -797,17 -591,23 +797,32 @@@ struct se_lun *core_tpg_alloc_lun
+  		return ERR_PTR(-EOVERFLOW);
+  	}
+  
+ -	lun = kzalloc(sizeof(*lun), GFP_KERNEL);
+ -	if (!lun) {
+ -		pr_err("Unable to allocate se_lun memory\n");
+ -		return ERR_PTR(-ENOMEM);
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	lun = tpg->tpg_lun_list[unpacked_lun];
+ +	if (lun->lun_status == TRANSPORT_LUN_STATUS_ACTIVE) {
+ +		pr_err("TPG Logical Unit Number: %u is already active"
+ +			" on %s Target Portal Group: %u, ignoring request.\n",
+ +			unpacked_lun, tpg->se_tpg_tfo->get_fabric_name(),
+ +			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ +		spin_unlock(&tpg->tpg_lun_lock);
+ +		return ERR_PTR(-EINVAL);
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&tpg->tpg_lun_lock);
+++=======
++ 	lun->unpacked_lun = unpacked_lun;
++ 	lun->lun_link_magic = SE_LUN_LINK_MAGIC;
++ 	atomic_set(&lun->lun_acl_count, 0);
++ 	init_completion(&lun->lun_ref_comp);
++ 	INIT_LIST_HEAD(&lun->lun_deve_list);
++ 	INIT_LIST_HEAD(&lun->lun_dev_link);
++ 	atomic_set(&lun->lun_tg_pt_secondary_offline, 0);
++ 	spin_lock_init(&lun->lun_deve_lock);
++ 	mutex_init(&lun->lun_tg_pt_md_mutex);
++ 	INIT_LIST_HEAD(&lun->lun_tg_pt_gp_link);
++ 	spin_lock_init(&lun->lun_tg_pt_gp_lock);
++ 	lun->lun_tpg = tpg;
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  
+  	return lun;
+  }
+@@@ -843,14 -659,34 +858,36 @@@ void core_tpg_remove_lun
+  	struct se_portal_group *tpg,
+  	struct se_lun *lun)
+  {
+ -	/*
+ -	 * rcu_dereference_raw protected by se_lun->lun_group symlink
+ -	 * reference to se_device->dev_group.
+ -	 */
+ -	struct se_device *dev = rcu_dereference_raw(lun->lun_se_dev);
+ -
+  	core_clear_lun_from_tpg(lun, tpg);
++ 	/*
++ 	 * Wait for any active I/O references to percpu se_lun->lun_ref to
++ 	 * be released.  Also, se_lun->lun_ref is now used by PR and ALUA
++ 	 * logic when referencing a remote target port during ALL_TGT_PT=1
++ 	 * and generating UNIT_ATTENTIONs for ALUA access state transition.
++ 	 */
+  	transport_clear_lun_ref(lun);
+  
+++<<<<<<< HEAD
+ +	core_dev_unexport(lun->lun_se_dev, tpg, lun);
+ +
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+ +	spin_unlock(&tpg->tpg_lun_lock);
+++=======
++ 	mutex_lock(&tpg->tpg_lun_mutex);
++ 	if (lun->lun_se_dev) {
++ 		target_detach_tg_pt_gp(lun);
++ 
++ 		spin_lock(&dev->se_port_lock);
++ 		list_del(&lun->lun_dev_link);
++ 		dev->export_count--;
++ 		rcu_assign_pointer(lun->lun_se_dev, NULL);
++ 		spin_unlock(&dev->se_port_lock);
++ 	}
++ 	if (!(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE))
++ 		hlist_del_rcu(&lun->link);
++ 	mutex_unlock(&tpg->tpg_lun_mutex);
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  
+  	percpu_ref_exit(&lun->lun_ref);
+  }
+diff --cc include/target/target_core_base.h
+index 7bcf92529421,eefc2b0cfaa3..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -719,13 -703,26 +719,34 @@@ struct se_lun 
+  	u32			lun_access;
+  	u32			lun_flags;
+  	u32			unpacked_lun;
+ -	u32			lun_index;
+  	atomic_t		lun_acl_count;
+++<<<<<<< HEAD
+ +	spinlock_t		lun_acl_lock;
+ +	spinlock_t		lun_sep_lock;
+ +	struct completion	lun_shutdown_comp;
+ +	struct list_head	lun_acl_list;
+ +	struct se_device	*lun_se_dev;
+ +	struct se_port		*lun_sep;
+++=======
++ 	struct se_device __rcu	*lun_se_dev;
++ 
++ 	struct list_head	lun_deve_list;
++ 	spinlock_t		lun_deve_lock;
++ 
++ 	/* ALUA state */
++ 	int			lun_tg_pt_secondary_stat;
++ 	int			lun_tg_pt_secondary_write_md;
++ 	atomic_t		lun_tg_pt_secondary_offline;
++ 	struct mutex		lun_tg_pt_md_mutex;
++ 
++ 	/* ALUA target port group linkage */
++ 	struct list_head	lun_tg_pt_gp_link;
++ 	struct t10_alua_tg_pt_gp *lun_tg_pt_gp;
++ 	spinlock_t		lun_tg_pt_gp_lock;
++ 
++ 	struct se_portal_group	*lun_tpg;
++ 	struct scsi_port_stats	lun_stats;
+++>>>>>>> 9e37d042cfcb (target: Drop se_lun->lun_active for existing percpu lun_ref)
+  	struct config_group	lun_group;
+  	struct se_port_stat_grps port_stat_grps;
+  	struct completion	lun_ref_comp;
+* Unmerged path drivers/target/target_core_alua.c
+* Unmerged path drivers/target/target_core_pr.c
+* Unmerged path drivers/target/target_core_tpg.c
+* Unmerged path include/target/target_core_base.h
