@@ -53,8 +53,6 @@ extern char buildid_dir[];
 #endif
 #endif
 
-#define PERF_GTK_DSO  "libperf-gtk.so"
-
 /* General helper functions */
 void usage(const char *err) NORETURN;
 void die(const char *err, ...) NORETURN __attribute__((format (printf, 1, 2)));
