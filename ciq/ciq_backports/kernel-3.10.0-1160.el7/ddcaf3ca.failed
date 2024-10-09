@@ -1,0 +1,142 @@
+Drivers: hv: vmus: Fix the check for return value from kmsg get dump buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+Rebuild_CHGLOG: - [hv] vmus: Fix the check for return value from kmsg get dump buffer (Mohammed Gamal) [1828450]
+Rebuild_FUZZ: 90.51%
+commit-author Sunil Muthuswamy <sunilmut@microsoft.com>
+commit ddcaf3ca4c3c87b955ad6f57952250030be77791
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/ddcaf3ca.failed
+
+The code to support panic control message was checking the return was
+checking the return value from kmsg_dump_get_buffer as error value, which
+is not what the routine returns. This fixes it.
+
+Fixes: 81b18bce48af ("Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic")
+
+	Signed-off-by: Sunil Muthuswamy <sunilmut@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ddcaf3ca4c3c87b955ad6f57952250030be77791)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 52302e715e84,a7f33c1f42c5..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -1149,48 -1020,71 +1149,68 @@@ static void vmbus_isr(void
+  	add_interrupt_randomness(HYPERVISOR_CALLBACK_VECTOR, 0);
+  }
+  
+ -/*
+ - * Boolean to control whether to report panic messages over Hyper-V.
+ - *
+ - * It can be set via /proc/sys/kernel/hyperv/record_panic_msg
+ - */
+ -static int sysctl_record_panic_msg = 1;
+ -
+ -/*
+ - * Callback from kmsg_dump. Grab as much as possible from the end of the kmsg
+ - * buffer and call into Hyper-V to transfer the data.
+ - */
+ -static void hv_kmsg_dump(struct kmsg_dumper *dumper,
+ -			 enum kmsg_dump_reason reason)
+ +static void hv_synic_init_oncpu(void *arg)
+  {
+++<<<<<<< HEAD
+ +	int cpu = get_cpu();
+ +	hv_synic_init(cpu);
+ +	put_cpu();
+++=======
++ 	size_t bytes_written;
++ 	phys_addr_t panic_pa;
++ 
++ 	/* We are only interested in panics. */
++ 	if ((reason != KMSG_DUMP_PANIC) || (!sysctl_record_panic_msg))
++ 		return;
++ 
++ 	panic_pa = virt_to_phys(hv_panic_page);
++ 
++ 	/*
++ 	 * Write dump contents to the page. No need to synchronize; panic should
++ 	 * be single-threaded.
++ 	 */
++ 	kmsg_dump_get_buffer(dumper, true, hv_panic_page, PAGE_SIZE,
++ 			     &bytes_written);
++ 	if (bytes_written)
++ 		hyperv_report_panic_msg(panic_pa, bytes_written);
+++>>>>>>> ddcaf3ca4c3c (Drivers: hv: vmus: Fix the check for return value from kmsg get dump buffer)
+  }
+  
+ -static struct kmsg_dumper hv_kmsg_dumper = {
+ -	.dump = hv_kmsg_dump,
+ -};
+ +static void hv_synic_cleanup_oncpu(void *arg)
+ +{
+ +	int cpu = get_cpu();
+ +	hv_synic_cleanup(cpu);
+ +	put_cpu();
+ +}
+  
+ -static struct ctl_table_header *hv_ctl_table_hdr;
+ -static int zero;
+ -static int one = 1;
+ +static int hv_cpuhp_callback(struct notifier_block *nfb,
+ +			     unsigned long action, void *hcpu)
+ +{
+ +	unsigned int cpu = (unsigned long) hcpu;
+  
+ -/*
+ - * sysctl option to allow the user to control whether kmsg data should be
+ - * reported to Hyper-V on panic.
+ - */
+ -static struct ctl_table hv_ctl_table[] = {
+ -	{
+ -		.procname       = "hyperv_record_panic_msg",
+ -		.data           = &sysctl_record_panic_msg,
+ -		.maxlen         = sizeof(int),
+ -		.mode           = 0644,
+ -		.proc_handler   = proc_dointvec_minmax,
+ -		.extra1		= &zero,
+ -		.extra2		= &one
+ -	},
+ -	{}
+ -};
+ +	switch (action & ~CPU_TASKS_FROZEN) {
+ +	case CPU_STARTING:
+ +		hv_synic_init(cpu);
+ +		break;
+ +	case CPU_DYING:
+ +		hv_synic_cleanup(cpu);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +		if (hv_synic_cpu_used(cpu))
+ +			return NOTIFY_BAD;
+ +		hv_clockevents_unbind(cpu);
+ +		break;
+ +	case CPU_DOWN_FAILED:
+ +		hv_clockevents_bind(cpu);
+ +		break;
+ +	}
+  
+ -static struct ctl_table hv_root_table[] = {
+ -	{
+ -		.procname	= "kernel",
+ -		.mode		= 0555,
+ -		.child		= hv_ctl_table
+ -	},
+ -	{}
+ +	return NOTIFY_OK;
+ +}
+ +
+ +static struct notifier_block hv_cpuhp_notifier __refdata = {
+ +       .notifier_call = hv_cpuhp_callback,
+ +       .priority = INT_MAX - 1, /* Run after hv_cpu_init() */
+  };
+  
+  /*
+* Unmerged path drivers/hv/vmbus_drv.c
