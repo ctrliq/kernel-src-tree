@@ -1,0 +1,1039 @@
+qla2xxx: Remove dependency on hardware_lock to reduce lock contention.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Remove dependency on hardware_lock to reduce lock contention (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 99.28%
+commit-author Quinn Tran <quinn.tran@qlogic.com>
+commit 7560151b6b3c1f4432c1c5b5b6496070d1f38484
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7560151b.failed
+
+Sessions management (add, deleted, modify) currently are serialized
+through the hardware_lock.  Hardware_lock is a high traffic lock.
+This lock is accessed by both the transmit & receive sides.
+
+Sessions management is now moved off to another lock call sess_lock.
+This is done to reduce lock contention and increase traffic throughput.
+
+	Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7560151b6b3c1f4432c1c5b5b6496070d1f38484)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_os.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 9cf0dee11112,216a944c1ca5..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -2967,9 -2922,23 +2967,20 @@@ struct qlt_hw_data 
+  	uint8_t saved_add_firmware_options[2];
+  
+  	uint8_t tgt_node_name[WWN_SIZE];
+++<<<<<<< HEAD
+ +	int rspq_vector_cpuid;
+++=======
++ 
++ 	struct list_head q_full_list;
++ 	uint32_t num_pend_cmds;
++ 	uint32_t num_qfull_cmds_alloc;
++ 	uint32_t num_qfull_cmds_dropped;
++ 	spinlock_t q_full_lock;
++ 	uint32_t leak_exchg_thresh_hold;
++ 	spinlock_t sess_lock;
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  };
+  
+ -#define MAX_QFULL_CMDS_ALLOC	8192
+ -#define Q_FULL_THRESH_HOLD_PERCENT 90
+ -#define Q_FULL_THRESH_HOLD(ha) \
+ -	((ha->cur_fw_xcb_count/100) * Q_FULL_THRESH_HOLD_PERCENT)
+ -
+ -#define LEAK_EXCHG_THRESH_HOLD_PERCENT 75	/* 75 percent */
+ -
+  /*
+   * Qlogic host adapter specific data structure.
+  */
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c679c5766696,0484acb3ff16..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -2653,6 -2334,9 +2653,12 @@@ qla2x00_probe_one(struct pci_dev *pdev
+  	    "Memory allocated for ha=%p.\n", ha);
+  	ha->pdev = pdev;
+  	ha->tgt.enable_class_2 = ql2xenableclass2;
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&ha->tgt.q_full_list);
++ 	spin_lock_init(&ha->tgt.q_full_lock);
++ 	spin_lock_init(&ha->tgt.sess_lock);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  
+  	/* Clear our data area */
+  	ha->bars = bars;
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,6136987df164..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -390,10 -666,12 +391,18 @@@ static int qlt_reset(struct scsi_qla_ho
+  
+  	loop_id = le16_to_cpu(n->u.isp24.nport_handle);
+  	if (loop_id == 0xFFFF) {
+ +#if 0 /* FIXME: Re-enable Global event handling.. */
+  		/* Global event */
+++<<<<<<< HEAD
+ +		atomic_inc(&ha->tgt.qla_tgt->tgt_global_resets_count);
+ +		qlt_clear_tgt_db(ha->tgt.qla_tgt, 1);
+++=======
++ 		atomic_inc(&vha->vha_tgt.qla_tgt->tgt_global_resets_count);
++ 		spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 		qlt_clear_tgt_db(vha->vha_tgt.qla_tgt);
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ #if 0 /* FIXME: do we need to choose a session here? */
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  		if (!list_empty(&ha->tgt.qla_tgt->sess_list)) {
+  			sess = list_entry(ha->tgt.qla_tgt->sess_list.next,
+  			    typeof(*sess), sess_list_entry);
+@@@ -462,20 -751,22 +473,25 @@@ static void qlt_schedule_sess_for_delet
+  	sess->expires = jiffies + dev_loss_tmo * HZ;
+  
+  	ql_dbg(ql_dbg_tgt, sess->vha, 0xe048,
+ -	    "qla_target(%d): session for port %8phC (loop ID %d s_id %02x:%02x:%02x)"
+ -	    " scheduled for deletion in %u secs (expires: %lu) immed: %d, logout: %d, gen: %#x\n",
+ -	    sess->vha->vp_idx, sess->port_name, sess->loop_id,
+ -	    sess->s_id.b.domain, sess->s_id.b.area, sess->s_id.b.al_pa,
+ -	    dev_loss_tmo, sess->expires, immediate, sess->logout_on_delete,
+ -	    sess->generation);
+ +	    "qla_target(%d): session for port %8phC (loop ID %d) scheduled for "
+ +	    "deletion in %u secs (expires: %lu) immed: %d\n",
+ +	    sess->vha->vp_idx, sess->port_name, sess->loop_id, dev_loss_tmo,
+ +	    sess->expires, immediate);
+  
+  	if (immediate)
+ -		mod_delayed_work(system_wq, &tgt->sess_del_work, 0);
+ +		schedule_delayed_work(&tgt->sess_del_work, 0);
+  	else
+  		schedule_delayed_work(&tgt->sess_del_work,
+ -		    sess->expires - jiffies);
+ +		    jiffies - sess->expires);
+  }
+  
+++<<<<<<< HEAD
+ +/* ha->hardware_lock supposed to be held on entry */
+ +static void qlt_clear_tgt_db(struct qla_tgt *tgt, bool local_only)
+++=======
++ /* ha->tgt.sess_lock supposed to be held on entry */
++ static void qlt_clear_tgt_db(struct qla_tgt *tgt)
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  {
+  	struct qla_tgt_sess *sess;
+  
+@@@ -534,108 -825,12 +550,112 @@@ out_free_id_list
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+ +static bool qlt_check_fcport_exist(struct scsi_qla_host *vha,
+ +	struct qla_tgt_sess *sess)
+ +{
+ +	struct qla_hw_data *ha = vha->hw;
+ +	struct qla_port_24xx_data *pmap24;
+ +	bool res, found = false;
+ +	int rc, i;
+ +	uint16_t loop_id = 0xFFFF; /* to eliminate compiler's warning */
+ +	uint16_t entries;
+ +	void *pmap;
+ +	int pmap_len;
+ +	fc_port_t *fcport;
+ +	int global_resets;
+ +	unsigned long flags;
+ +
+ +retry:
+ +	global_resets = atomic_read(&ha->tgt.qla_tgt->tgt_global_resets_count);
+ +
+ +	rc = qla2x00_get_node_name_list(vha, &pmap, &pmap_len);
+ +	if (rc != QLA_SUCCESS) {
+ +		res = false;
+ +		goto out;
+ +	}
+ +
+ +	pmap24 = pmap;
+ +	entries = pmap_len/sizeof(*pmap24);
+ +
+ +	for (i = 0; i < entries; ++i) {
+ +		if (!memcmp(sess->port_name, pmap24[i].port_name, WWN_SIZE)) {
+ +			loop_id = le16_to_cpu(pmap24[i].loop_id);
+ +			found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	kfree(pmap);
+ +
+ +	if (!found) {
+ +		res = false;
+ +		goto out;
+ +	}
+ +
+ +	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf046,
+ +	    "qlt_check_fcport_exist(): loop_id %d", loop_id);
+ +
+ +	fcport = kzalloc(sizeof(*fcport), GFP_KERNEL);
+ +	if (fcport == NULL) {
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf047,
+ +		    "qla_target(%d): Allocation of tmp FC port failed",
+ +		    vha->vp_idx);
+ +		res = false;
+ +		goto out;
+ +	}
+ +
+ +	fcport->loop_id = loop_id;
+ +
+ +	rc = qla2x00_get_port_database(vha, fcport, 0);
+ +	if (rc != QLA_SUCCESS) {
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf048,
+ +		    "qla_target(%d): Failed to retrieve fcport "
+ +		    "information -- get_port_database() returned %x "
+ +		    "(loop_id=0x%04x)", vha->vp_idx, rc, loop_id);
+ +		res = false;
+ +		goto out_free_fcport;
+ +	}
+ +
+ +	if (global_resets !=
+ +	    atomic_read(&ha->tgt.qla_tgt->tgt_global_resets_count)) {
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf002,
+ +		    "qla_target(%d): global reset during session discovery"
+ +		    " (counter was %d, new %d), retrying",
+ +		    vha->vp_idx, global_resets,
+ +		    atomic_read(&ha->tgt.qla_tgt->tgt_global_resets_count));
+ +		goto retry;
+ +	}
+ +
+ +	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf003,
+ +	    "Updating sess %p s_id %x:%x:%x, loop_id %d) to d_id %x:%x:%x, "
+ +	    "loop_id %d", sess, sess->s_id.b.domain, sess->s_id.b.al_pa,
+ +	    sess->s_id.b.area, sess->loop_id, fcport->d_id.b.domain,
+ +	    fcport->d_id.b.al_pa, fcport->d_id.b.area, fcport->loop_id);
+ +
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	ha->tgt.tgt_ops->update_sess(sess, fcport->d_id, fcport->loop_id,
+ +				(fcport->flags & FCF_CONF_COMP_SUPPORTED));
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +
+ +	res = true;
+ +
+ +out_free_fcport:
+ +	kfree(fcport);
+ +
+ +out:
+ +	return res;
+ +}
+ +
+ +/* ha->hardware_lock supposed to be held on entry */
+++=======
++ /* ha->tgt.sess_lock supposed to be held on entry */
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  static void qlt_undelete_sess(struct qla_tgt_sess *sess)
+  {
+ -	BUG_ON(sess->deleted != QLA_SESS_DELETION_PENDING);
+ +	BUG_ON(!sess->deleted);
+  
+ -	list_del_init(&sess->del_list_entry);
+ +	list_del(&sess->del_list_entry);
+  	sess->deleted = 0;
+  }
+  
+@@@ -646,9 -841,9 +666,9 @@@ static void qlt_del_sess_work_fn(struc
+  	struct scsi_qla_host *vha = tgt->vha;
+  	struct qla_hw_data *ha = vha->hw;
+  	struct qla_tgt_sess *sess;
+ -	unsigned long flags, elapsed;
+ +	unsigned long flags;
+  
+- 	spin_lock_irqsave(&ha->hardware_lock, flags);
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+  	while (!list_empty(&tgt->del_sess_list)) {
+  		sess = list_entry(tgt->del_sess_list.next, typeof(*sess),
+  		    del_list_entry);
+@@@ -714,8 -882,8 +734,13 @@@ static struct qla_tgt_sess *qlt_create_
+  	unsigned char be_sid[3];
+  
+  	/* Check to avoid double sessions */
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	list_for_each_entry(sess, &ha->tgt.qla_tgt->sess_list,
+++=======
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 	list_for_each_entry(sess, &vha->vha_tgt.qla_tgt->sess_list,
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  				sess_list_entry) {
+  		if (!memcmp(sess->port_name, fcport->port_name, WWN_SIZE)) {
+  			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf005,
+@@@ -727,6 -895,13 +752,16 @@@
+  			    fcport->d_id.b.al_pa, fcport->d_id.b.area,
+  			    fcport->loop_id);
+  
+++<<<<<<< HEAD
+++=======
++ 			/* Cannot undelete at this point */
++ 			if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
++ 				spin_unlock_irqrestore(&ha->tgt.sess_lock,
++ 				    flags);
++ 				return NULL;
++ 			}
++ 
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  			if (sess->deleted)
+  				qlt_undelete_sess(sess);
+  
+@@@ -736,7 -911,10 +771,14 @@@
+  
+  			if (sess->local && !local)
+  				sess->local = 0;
+++<<<<<<< HEAD
+ +			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 
++ 			qlt_do_generation_tick(vha, &sess->generation);
++ 
++ 			spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  
+  			return sess;
+  		}
+@@@ -786,10 -972,11 +828,18 @@@
+  	BUILD_BUG_ON(sizeof(sess->port_name) != sizeof(fcport->port_name));
+  	memcpy(sess->port_name, fcport->port_name, sizeof(sess->port_name));
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	list_add_tail(&sess->sess_list_entry, &ha->tgt.qla_tgt->sess_list);
+ +	ha->tgt.qla_tgt->sess_count++;
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 	list_add_tail(&sess->sess_list_entry, &vha->vha_tgt.qla_tgt->sess_list);
++ 	vha->vha_tgt.qla_tgt->sess_count++;
++ 	qlt_do_generation_tick(vha, &sess->generation);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf04b,
+  	    "qla_target(%d): %ssession for wwn %8phC (loop_id %d, "
+@@@ -817,20 -1004,27 +867,35 @@@ void qlt_fc_port_added(struct scsi_qla_
+  	if (!tgt || (fcport->port_type != FCT_INITIATOR))
+  		return;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+++=======
++ 	if (qla_ini_mode_enabled(vha))
++ 		return;
++ 
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  	if (tgt->tgt_stop) {
+- 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+  		return;
+  	}
+  	sess = qlt_find_sess_by_port_name(tgt, fcport->port_name);
+  	if (!sess) {
+- 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+  
+ -		mutex_lock(&vha->vha_tgt.tgt_mutex);
+ +		mutex_lock(&ha->tgt.tgt_mutex);
+  		sess = qlt_create_sess(vha, fcport, false);
+ -		mutex_unlock(&vha->vha_tgt.tgt_mutex);
+ +		mutex_unlock(&ha->tgt.tgt_mutex);
+  
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(&ha->hardware_lock, flags);
+++=======
++ 		spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 	} else if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
++ 		/* Point of no return */
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ 		return;
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  	} else {
+  		kref_get(&sess->se_sess->sess_kref);
+  
+@@@ -857,32 -1051,45 +922,57 @@@
+  		    fcport->port_name, sess->loop_id);
+  		sess->local = 0;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +
+ +	ha->tgt.tgt_ops->put_sess(sess);
+++=======
++ 	ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  }
+  
+ -/*
+ - * max_gen - specifies maximum session generation
+ - * at which this deletion requestion is still valid
+ - */
+ -void
+ -qlt_fc_port_deleted(struct scsi_qla_host *vha, fc_port_t *fcport, int max_gen)
+ +void qlt_fc_port_deleted(struct scsi_qla_host *vha, fc_port_t *fcport)
+  {
+ -	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+ +	struct qla_hw_data *ha = vha->hw;
+ +	struct qla_tgt *tgt = ha->tgt.qla_tgt;
+  	struct qla_tgt_sess *sess;
+  	unsigned long flags;
+  
+  	if (!vha->hw->tgt.tgt_ops)
+  		return;
+  
+ -	if (!tgt)
+ +	if (!tgt || (fcport->port_type != FCT_INITIATOR))
+  		return;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	if (tgt->tgt_stop) {
+ +		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++ 	if (tgt->tgt_stop) {
++ 		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  		return;
+  	}
+  	sess = qlt_find_sess_by_port_name(tgt, fcport->port_name);
+  	if (!sess) {
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 		return;
++ 	}
++ 
++ 	if (max_gen - sess->generation < 0) {
++ 		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf092,
++ 		    "Ignoring stale deletion request for se_sess %p / sess %p"
++ 		    " for port %8phC, req_gen %d, sess_gen %d\n",
++ 		    sess->se_sess, sess, sess->port_name, max_gen,
++ 		    sess->generation);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  		return;
+  	}
+  
+@@@ -890,7 -1097,7 +980,11 @@@
+  
+  	sess->local = 1;
+  	qlt_schedule_sess_for_deletion(sess, false);
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  }
+  
+  static inline int test_tgt_sess_count(struct qla_tgt *tgt)
+@@@ -932,12 -1154,13 +1026,22 @@@ void qlt_stop_phase1(struct qla_tgt *tg
+  	 * Mutex needed to sync with qla_tgt_fc_port_[added,deleted].
+  	 * Lock is needed, because we still can get an incoming packet.
+  	 */
+++<<<<<<< HEAD
+ +	mutex_lock(&ha->tgt.tgt_mutex);
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	tgt->tgt_stop = 1;
+ +	qlt_clear_tgt_db(tgt, true);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +	mutex_unlock(&ha->tgt.tgt_mutex);
+++=======
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 	tgt->tgt_stop = 1;
++ 	qlt_clear_tgt_db(tgt);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 	mutex_unlock(&qla_tgt_mutex);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  
+  	flush_delayed_work(&tgt->sess_del_work);
+  
+@@@ -1338,15 -1640,25 +1444,20 @@@ static void qlt_24xx_handle_abts(struc
+  		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf012,
+  		    "qla_target(%d): task abort for non-existant session\n",
+  		    vha->vp_idx);
+ -		rc = qlt_sched_sess_work(vha->vha_tgt.qla_tgt,
+ +		rc = qlt_sched_sess_work(ha->tgt.qla_tgt,
+  		    QLA_TGT_SESS_WORK_ABORT, abts, sizeof(*abts));
++ 
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ 
+  		if (rc != 0) {
+  			qlt_24xx_send_abts_resp(vha, abts, FCP_TMF_REJECTED,
+  			    false);
+  		}
+  		return;
+  	}
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ 
+  
+ -	if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
+ -		qlt_24xx_send_abts_resp(vha, abts, FCP_TMF_REJECTED, false);
+ -		return;
+ -	}
+ -
+  	rc = __qlt_24xx_handle_abts(vha, abts, sess);
+  	if (rc != 0) {
+  		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf054,
+@@@ -2706,7 -3783,9 +2817,13 @@@ static void qlt_do_work(struct work_str
+  	/*
+  	 * Drop extra session reference from qla_tgt_handle_cmd_for_atio*(
+  	 */
+++<<<<<<< HEAD
+++	ha->tgt.tgt_ops->put_sess(sess);
+++=======
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+  	ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  	return;
+  
+  out_term:
+@@@ -2715,12 -3794,134 +2832,121 @@@
+  	 * cmd has not sent to target yet, so pass NULL as the second
+  	 * argument to qlt_send_term_exchange() and free the memory here.
+  	 */
+ -	cmd->cmd_flags |= BIT_2;
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1);
+++<<<<<<< HEAD
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +	if (sess)
+++=======
++ 
++ 	qlt_decr_num_pend_cmds(vha);
++ 	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
++ 	ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ }
++ 
++ static void qlt_do_work(struct work_struct *work)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
++ 	scsi_qla_host_t *vha = cmd->vha;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_del(&cmd->cmd_list);
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	__qlt_do_work(cmd);
++ }
++ 
++ static struct qla_tgt_cmd *qlt_get_tag(scsi_qla_host_t *vha,
++ 				       struct qla_tgt_sess *sess,
++ 				       struct atio_from_isp *atio)
++ {
++ 	struct se_session *se_sess = sess->se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 	cmd->state = QLA_TGT_STATE_NEW;
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	qlt_incr_num_pend_cmds(vha);
++ 	cmd->vha = vha;
++ 	cmd->se_cmd.map_tag = tag;
++ 	cmd->sess = sess;
++ 	cmd->loop_id = sess->loop_id;
++ 	cmd->conf_compl_supported = sess->conf_compl_supported;
++ 
++ 	cmd->cmd_flags = 0;
++ 	cmd->jiffies_at_alloc = get_jiffies_64();
++ 
++ 	cmd->reset_count = vha->hw->chip_reset;
++ 
++ 	return cmd;
++ }
++ 
++ static void qlt_send_busy(struct scsi_qla_host *, struct atio_from_isp *,
++ 			  uint16_t);
++ 
++ static void qlt_create_sess_from_atio(struct work_struct *work)
++ {
++ 	struct qla_tgt_sess_op *op = container_of(work,
++ 					struct qla_tgt_sess_op, work);
++ 	scsi_qla_host_t *vha = op->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	uint8_t *s_id = op->atio.u.isp24.fcp_hdr.s_id;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_del(&op->cmd_list);
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	if (op->aborted) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf083,
++ 		    "sess_op with tag %u is aborted\n",
++ 		    op->atio.u.isp24.exchange_addr);
++ 		goto out_term;
++ 	}
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
++ 	    "qla_target(%d): Unable to find wwn login"
++ 	    " (s_id %x:%x:%x), trying to create it manually\n",
++ 	    vha->vp_idx, s_id[0], s_id[1], s_id[2]);
++ 
++ 	if (op->atio.u.raw.entry_count > 1) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
++ 		    "Dropping multy entry atio %p\n", &op->atio);
++ 		goto out_term;
++ 	}
++ 
++ 	sess = qlt_make_local_sess(vha, s_id);
++ 	/* sess has an extra creation ref. */
++ 
++ 	if (!sess)
++ 		goto out_term;
++ 	/*
++ 	 * Now obtain a pre-allocated session tag using the original op->atio
++ 	 * packet header, and dispatch into __qlt_do_work() using the existing
++ 	 * process context.
+ -	 */
+ -	cmd = qlt_get_tag(vha, sess, &op->atio);
+ -	if (!cmd) {
+ -		spin_lock_irqsave(&ha->hardware_lock, flags);
+ -		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
+ -		ha->tgt.tgt_ops->put_sess(sess);
+ -		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -		kfree(op);
+ -		return;
+ -	}
+ -	/*
+ -	 * __qlt_do_work() will call ha->tgt.tgt_ops->put_sess() to release
+ -	 * the extra reference taken above by qlt_make_local_sess()
+ -	 */
+ -	__qlt_do_work(cmd);
+ -	kfree(op);
+ -	return;
+ -
+ -out_term:
+ -	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -	qlt_send_term_exchange(vha, NULL, &op->atio, 1);
+ -	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -	kfree(op);
+ -
+++	 */
+++	cmd = qlt_get_tag(vha, sess, &op->atio);
+++	if (!cmd) {
+++		spin_lock_irqsave(&ha->hardware_lock, flags);
+++		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+ +		ha->tgt.tgt_ops->put_sess(sess);
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -2873,8 -4112,9 +3099,9 @@@ static int qlt_handle_task_mgmt(struct 
+  	struct qla_tgt_sess *sess;
+  	uint32_t lun, unpacked_lun;
+  	int fn;
++ 	unsigned long flags;
+  
+ -	tgt = vha->vha_tgt.qla_tgt;
+ +	tgt = ha->tgt.qla_tgt;
+  
+  	lun = a->u.isp24.fcp_cmnd.lun;
+  	fn = a->u.isp24.fcp_cmnd.task_mgmt_flags;
+@@@ -2961,17 -4332,156 +3196,155 @@@ static int qlt_abort_task(struct scsi_q
+  static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+  	struct imm_ntfy_from_isp *iocb)
+  {
+ -	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+  	struct qla_hw_data *ha = vha->hw;
+ -	struct qla_tgt_sess *sess = NULL, *conflict_sess = NULL;
+ -	uint64_t wwn;
+ -	port_id_t port_id;
+ -	uint16_t loop_id;
+ -	uint16_t wd3_lo;
+  	int res = 0;
+++<<<<<<< HEAD
+++=======
++ 	qlt_plogi_ack_t *pla;
++ 	unsigned long flags;
++ 
++ 	wwn = wwn_to_u64(iocb->u.isp24.port_name);
++ 
++ 	port_id.b.domain = iocb->u.isp24.port_id[2];
++ 	port_id.b.area   = iocb->u.isp24.port_id[1];
++ 	port_id.b.al_pa  = iocb->u.isp24.port_id[0];
++ 	port_id.b.rsvd_1 = 0;
++ 
++ 	loop_id = le16_to_cpu(iocb->u.isp24.nport_handle);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf026,
+  	    "qla_target(%d): Port ID: 0x%3phC ELS opcode: 0x%02x\n",
+  	    vha->vp_idx, iocb->u.isp24.port_id, iocb->u.isp24.status_subcode);
+  
+ -	/* res = 1 means ack at the end of thread
+ -	 * res = 0 means ack async/later.
+ -	 */
+  	switch (iocb->u.isp24.status_subcode) {
+  	case ELS_PLOGI:
+++<<<<<<< HEAD
+ +	case ELS_FLOGI:
+ +	case ELS_PRLI:
+++=======
++ 
++ 		/* Mark all stale commands in qla_tgt_wq for deletion */
++ 		abort_cmds_for_s_id(vha, &port_id);
++ 
++ 		if (wwn) {
++ 			spin_lock_irqsave(&tgt->ha->tgt.sess_lock, flags);
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn,
++ 			    port_id, loop_id, &conflict_sess);
++ 			spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock, flags);
++ 		}
++ 
++ 		if (IS_SW_RESV_ADDR(port_id) || (!sess && !conflict_sess)) {
++ 			res = 1;
++ 			break;
++ 		}
++ 
++ 		pla = qlt_plogi_ack_find_add(vha, &port_id, iocb);
++ 		if (!pla) {
++ 			qlt_send_term_imm_notif(vha, iocb, 1);
++ 
++ 			res = 0;
++ 			break;
++ 		}
++ 
++ 		res = 0;
++ 
++ 		if (conflict_sess)
++ 			qlt_plogi_ack_link(vha, pla, conflict_sess,
++ 			    QLT_PLOGI_LINK_CONFLICT);
++ 
++ 		if (!sess)
++ 			break;
++ 
++ 		qlt_plogi_ack_link(vha, pla, sess, QLT_PLOGI_LINK_SAME_WWN);
++ 		 /*
++ 		  * Under normal circumstances we want to release nport handle
++ 		  * during LOGO process to avoid nport handle leaks inside FW.
++ 		  * The exception is when LOGO is done while another PLOGI with
++ 		  * the same nport handle is waiting as might be the case here.
++ 		  * Note: there is always a possibily of a race where session
++ 		  * deletion has already started for other reasons (e.g. ACL
++ 		  * removal) and now PLOGI arrives:
++ 		  * 1. if PLOGI arrived in FW after nport handle has been freed,
++ 		  *    FW must have assigned this PLOGI a new/same handle and we
++ 		  *    can proceed ACK'ing it as usual when session deletion
++ 		  *    completes.
++ 		  * 2. if PLOGI arrived in FW before LOGO with LCF_FREE_NPORT
++ 		  *    bit reached it, the handle has now been released. We'll
++ 		  *    get an error when we ACK this PLOGI. Nothing will be sent
++ 		  *    back to initiator. Initiator should eventually retry
++ 		  *    PLOGI and situation will correct itself.
++ 		  */
++ 		sess->keep_nport_handle = ((sess->loop_id == loop_id) &&
++ 					   (sess->s_id.b24 == port_id.b24));
++ 		qlt_schedule_sess_for_deletion(sess, true);
++ 		break;
++ 
++ 	case ELS_PRLI:
++ 		wd3_lo = le16_to_cpu(iocb->u.isp24.u.prli.wd3_lo);
++ 
++ 		if (wwn) {
++ 			spin_lock_irqsave(&tgt->ha->tgt.sess_lock, flags);
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn, port_id,
++ 			    loop_id, &conflict_sess);
++ 			spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock, flags);
++ 		}
++ 
++ 		if (conflict_sess) {
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf09b,
++ 			    "PRLI with conflicting sess %p port %8phC\n",
++ 			    conflict_sess, conflict_sess->port_name);
++ 			qlt_send_term_imm_notif(vha, iocb, 1);
++ 			res = 0;
++ 			break;
++ 		}
++ 
++ 		if (sess != NULL) {
++ 			if (sess->deleted) {
++ 				/*
++ 				 * Impatient initiator sent PRLI before last
++ 				 * PLOGI could finish. Will force him to re-try,
++ 				 * while last one finishes.
++ 				 */
++ 				ql_log(ql_log_warn, sess->vha, 0xf095,
++ 				    "sess %p PRLI received, before plogi ack.\n",
++ 				    sess);
++ 				qlt_send_term_imm_notif(vha, iocb, 1);
++ 				res = 0;
++ 				break;
++ 			}
++ 
++ 			/*
++ 			 * This shouldn't happen under normal circumstances,
++ 			 * since we have deleted the old session during PLOGI
++ 			 */
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf096,
++ 			    "PRLI (loop_id %#04x) for existing sess %p (loop_id %#04x)\n",
++ 			    sess->loop_id, sess, iocb->u.isp24.nport_handle);
++ 
++ 			sess->local = 0;
++ 			sess->loop_id = loop_id;
++ 			sess->s_id = port_id;
++ 
++ 			if (wd3_lo & BIT_7)
++ 				sess->conf_compl_supported = 1;
++ 
++ 		}
++ 		res = 1; /* send notify ack */
++ 
++ 		/* Make session global (not used in fabric mode) */
++ 		if (ha->current_topology != ISP_CFG_F) {
++ 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
++ 			set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
++ 			qla2xxx_wake_dpc(vha);
++ 		} else {
++ 			/* todo: else - create sess here. */
++ 			res = 1; /* send notify ack */
++ 		}
++ 
++ 		break;
++ 
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  	case ELS_LOGO:
+  	case ELS_PRLO:
+  		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+@@@ -3593,12 -5105,15 +3966,15 @@@ static void qlt_send_busy(struct scsi_q
+  	struct qla_hw_data *ha = vha->hw;
+  	request_t *pkt;
+  	struct qla_tgt_sess *sess = NULL;
++ 	unsigned long flags;
+  
++ 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+  	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha,
+  	    atio->u.isp24.fcp_hdr.s_id);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+  	if (!sess) {
+  		qlt_send_term_exchange(vha, NULL, atio, 1);
+ -		return 0;
+ +		return;
+  	}
+  	/* Sending marker isn't necessary, since we called from ISR */
+  
+@@@ -4150,17 -5828,20 +4526,25 @@@ static void qlt_abort_work(struct qla_t
+  	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha,
+  	    (unsigned char *)&be_s_id);
+  	if (!sess) {
+- 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags2);
+  
+ +		mutex_lock(&ha->tgt.tgt_mutex);
+  		sess = qlt_make_local_sess(vha, s_id);
+  		/* sess has got an extra creation ref */
+ +		mutex_unlock(&ha->tgt.tgt_mutex);
+  
+- 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		spin_lock_irqsave(&ha->tgt.sess_lock, flags2);
+  		if (!sess)
+- 			goto out_term;
++ 			goto out_term2;
+  	} else {
+++<<<<<<< HEAD
+++=======
++ 		if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
++ 			sess = NULL;
++ 			goto out_term2;
++ 		}
++ 
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  		kref_get(&sess->se_sess->sess_kref);
+  	}
+  
+@@@ -4173,13 -5856,19 +4559,27 @@@
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  
+  	ha->tgt.tgt_ops->put_sess(sess);
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags2);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  	return;
+  
++ out_term2:
++ 	spin_lock_irqsave(&ha->hardware_lock, flags);
++ 
+  out_term:
+  	qlt_24xx_send_abts_resp(vha, &prm->abts, FCP_TMF_REJECTED, false);
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+++	if (sess)
+++		ha->tgt.tgt_ops->put_sess(sess);
+++=======
++ 
+  	if (sess)
+  		ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags2);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  }
+  
+  static void qlt_tmr_work(struct qla_tgt *tgt,
+@@@ -4204,14 -5893,12 +4604,14 @@@
+  	s_id = prm->tm_iocb2.u.isp24.fcp_hdr.s_id;
+  	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha, s_id);
+  	if (!sess) {
+- 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+  
+ +		mutex_lock(&ha->tgt.tgt_mutex);
+  		sess = qlt_make_local_sess(vha, s_id);
+  		/* sess has got an extra creation ref */
+ +		mutex_unlock(&ha->tgt.tgt_mutex);
+  
+- 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+  		if (!sess)
+  			goto out_term;
+  	} else {
+@@@ -4226,16 -5918,16 +4626,27 @@@
+  	rc = qlt_issue_task_mgmt(sess, unpacked_lun, fn, iocb, 0);
+  	if (rc != 0)
+  		goto out_term;
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  
+  	ha->tgt.tgt_ops->put_sess(sess);
+++<<<<<<< HEAD
+ +	return;
+ +
+ +out_term:
+ +	qlt_send_term_exchange(vha, NULL, &prm->tm_iocb2, 1);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +	if (sess)
+ +		ha->tgt.tgt_ops->put_sess(sess);
+++=======
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
++ 	return;
++ 
++ out_term:
++ 	qlt_send_term_exchange(vha, NULL, &prm->tm_iocb2, 0);
++ 	if (sess)
++ 		ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  }
+  
+  static void qlt_sess_work_fn(struct work_struct *work)
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 8e939971fec1,2881509072d9..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -777,60 -696,31 +777,73 @@@ static void tcm_qla2xxx_release_session
+  	qlt_unreg_sess(se_sess->fabric_sess_ptr);
+  }
+  
+ +static void tcm_qla2xxx_put_session(struct se_session *se_sess)
+ +{
+ +	struct qla_tgt_sess *sess = se_sess->fabric_sess_ptr;
+ +	struct qla_hw_data *ha = sess->vha->hw;
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	kref_put(&se_sess->sess_kref, tcm_qla2xxx_release_session);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +}
+ +
+  static void tcm_qla2xxx_put_sess(struct qla_tgt_sess *sess)
+  {
+++<<<<<<< HEAD
+ +	tcm_qla2xxx_put_session(sess->se_sess);
+++=======
++ 	if (!sess)
++ 		return;
++ 
++ 	assert_spin_locked(&sess->vha->hw->tgt.sess_lock);
++ 	kref_put(&sess->se_sess->sess_kref, tcm_qla2xxx_release_session);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  }
+  
+  static void tcm_qla2xxx_shutdown_sess(struct qla_tgt_sess *sess)
+  {
+++<<<<<<< HEAD
+ +	tcm_qla2xxx_shutdown_session(sess->se_sess);
+++=======
++ 	assert_spin_locked(&sess->vha->hw->tgt.sess_lock);
++ 	target_sess_cmd_list_set_waiting(sess->se_sess);
+++>>>>>>> 7560151b6b3c (qla2xxx: Remove dependency on hardware_lock to reduce lock contention.)
+  }
+  
+ -static int tcm_qla2xxx_init_nodeacl(struct se_node_acl *se_nacl,
+ -		const char *name)
+ +static struct se_node_acl *tcm_qla2xxx_make_nodeacl(
+ +	struct se_portal_group *se_tpg,
+ +	struct config_group *group,
+ +	const char *name)
+  {
+ -	struct tcm_qla2xxx_nacl *nacl =
+ -		container_of(se_nacl, struct tcm_qla2xxx_nacl, se_node_acl);
+ +	struct se_node_acl *se_nacl, *se_nacl_new;
+ +	struct tcm_qla2xxx_nacl *nacl;
+  	u64 wwnn;
+ +	u32 qla2xxx_nexus_depth;
+  
+  	if (tcm_qla2xxx_parse_wwn(name, &wwnn, 1) < 0)
+ -		return -EINVAL;
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	se_nacl_new = tcm_qla2xxx_alloc_fabric_acl(se_tpg);
+ +	if (!se_nacl_new)
+ +		return ERR_PTR(-ENOMEM);
+ +/* #warning FIXME: Hardcoded qla2xxx_nexus depth in tcm_qla2xxx_make_nodeacl */
+ +	qla2xxx_nexus_depth = 1;
+  
+ +	/*
+ +	 * se_nacl_new may be released by core_tpg_add_initiator_node_acl()
+ +	 * when converting a NodeACL from demo mode -> explict
+ +	 */
+ +	se_nacl = core_tpg_add_initiator_node_acl(se_tpg, se_nacl_new,
+ +				name, qla2xxx_nexus_depth);
+ +	if (IS_ERR(se_nacl)) {
+ +		tcm_qla2xxx_release_fabric_acl(se_tpg, se_nacl_new);
+ +		return se_nacl;
+ +	}
+ +	/*
+ +	 * Locate our struct tcm_qla2xxx_nacl and set the FC Nport WWPN
+ +	 */
+ +	nacl = container_of(se_nacl, struct tcm_qla2xxx_nacl, se_node_acl);
+  	nacl->nport_wwnn = wwnn;
+  	tcm_qla2xxx_format_wwn(&nacl->nport_name[0], TCM_QLA2XXX_NAMELEN, wwnn);
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
