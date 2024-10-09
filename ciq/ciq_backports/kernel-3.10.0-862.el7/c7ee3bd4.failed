@@ -1,0 +1,474 @@
+qla2xxx: fix sparse warnings introduced by previous target mode t10-dif patch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@qlogic.com>
+commit c7ee3bd4870ef1d96a1202f92ce858f849670a62
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c7ee3bd4.failed
+
+Fix sparse warnings introduce by "qla2xxx: T10-Dif: add T10-PI support".
+
+	Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c7ee3bd4870ef1d96a1202f92ce858f849670a62)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 456cb0f88a7e,2619ed45cbdc..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2005,6 -1952,327 +2005,330 @@@ skip_explict_conf
+  }
+  
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /* diff  */
++ static inline int
++ qlt_hba_err_chk_enabled(struct se_cmd *se_cmd)
++ {
++ 	/*
++ 	 * Uncomment when corresponding SCSI changes are done.
++ 	 *
++ 	 if (!sp->cmd->prot_chk)
++ 	 return 0;
++ 	 *
++ 	 */
++ 	switch (se_cmd->prot_op) {
++ 	case TARGET_PROT_DOUT_INSERT:
++ 	case TARGET_PROT_DIN_STRIP:
++ 		if (ql2xenablehba_err_chk >= 1)
++ 			return 1;
++ 		break;
++ 	case TARGET_PROT_DOUT_PASS:
++ 	case TARGET_PROT_DIN_PASS:
++ 		if (ql2xenablehba_err_chk >= 2)
++ 			return 1;
++ 		break;
++ 	case TARGET_PROT_DIN_INSERT:
++ 	case TARGET_PROT_DOUT_STRIP:
++ 		return 1;
++ 	default:
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * qla24xx_set_t10dif_tags_from_cmd - Extract Ref and App tags from SCSI command
++  *
++  */
++ static inline void
++ qlt_set_t10dif_tags(struct se_cmd *se_cmd, struct crc_context *ctx)
++ {
++ 	uint32_t lba = 0xffffffff & se_cmd->t_task_lba;
++ 
++ 	/* wait til Mode Sense/Select cmd, modepage Ah, subpage 2
++ 	 * have been immplemented by TCM, before AppTag is avail.
++ 	 * Look for modesense_handlers[]
++ 	 */
++ 	ctx->app_tag = 0;
++ 	ctx->app_tag_mask[0] = 0x0;
++ 	ctx->app_tag_mask[1] = 0x0;
++ 
++ 	switch (se_cmd->prot_type) {
++ 	case TARGET_DIF_TYPE0_PROT:
++ 		/*
++ 		 * No check for ql2xenablehba_err_chk, as it would be an
++ 		 * I/O error if hba tag generation is not done.
++ 		 */
++ 		ctx->ref_tag = cpu_to_le32(lba);
++ 
++ 		if (!qlt_hba_err_chk_enabled(se_cmd))
++ 			break;
++ 
++ 		/* enable ALL bytes of the ref tag */
++ 		ctx->ref_tag_mask[0] = 0xff;
++ 		ctx->ref_tag_mask[1] = 0xff;
++ 		ctx->ref_tag_mask[2] = 0xff;
++ 		ctx->ref_tag_mask[3] = 0xff;
++ 		break;
++ 	/*
++ 	 * For TYpe 1 protection: 16 bit GUARD tag, 32 bit REF tag, and
++ 	 * 16 bit app tag.
++ 	 */
++ 	case TARGET_DIF_TYPE1_PROT:
++ 		ctx->ref_tag = cpu_to_le32(lba);
++ 
++ 		if (!qlt_hba_err_chk_enabled(se_cmd))
++ 			break;
++ 
++ 		/* enable ALL bytes of the ref tag */
++ 		ctx->ref_tag_mask[0] = 0xff;
++ 		ctx->ref_tag_mask[1] = 0xff;
++ 		ctx->ref_tag_mask[2] = 0xff;
++ 		ctx->ref_tag_mask[3] = 0xff;
++ 		break;
++ 	/*
++ 	 * For TYPE 2 protection: 16 bit GUARD + 32 bit REF tag has to
++ 	 * match LBA in CDB + N
++ 	 */
++ 	case TARGET_DIF_TYPE2_PROT:
++ 		ctx->ref_tag = cpu_to_le32(lba);
++ 
++ 		if (!qlt_hba_err_chk_enabled(se_cmd))
++ 			break;
++ 
++ 		/* enable ALL bytes of the ref tag */
++ 		ctx->ref_tag_mask[0] = 0xff;
++ 		ctx->ref_tag_mask[1] = 0xff;
++ 		ctx->ref_tag_mask[2] = 0xff;
++ 		ctx->ref_tag_mask[3] = 0xff;
++ 		break;
++ 
++ 	/* For Type 3 protection: 16 bit GUARD only */
++ 	case TARGET_DIF_TYPE3_PROT:
++ 		ctx->ref_tag_mask[0] = ctx->ref_tag_mask[1] =
++ 			ctx->ref_tag_mask[2] = ctx->ref_tag_mask[3] = 0x00;
++ 		break;
++ 	}
++ }
++ 
++ 
++ static inline int
++ qlt_build_ctio_crc2_pkt(struct qla_tgt_prm *prm, scsi_qla_host_t *vha)
++ {
++ 	uint32_t		*cur_dsd;
++ 	int			sgc;
++ 	uint32_t		transfer_length = 0;
++ 	uint32_t		data_bytes;
++ 	uint32_t		dif_bytes;
++ 	uint8_t			bundling = 1;
++ 	uint8_t			*clr_ptr;
++ 	struct crc_context	*crc_ctx_pkt = NULL;
++ 	struct qla_hw_data	*ha;
++ 	struct ctio_crc2_to_fw	*pkt;
++ 	dma_addr_t		crc_ctx_dma;
++ 	uint16_t		fw_prot_opts = 0;
++ 	struct qla_tgt_cmd	*cmd = prm->cmd;
++ 	struct se_cmd		*se_cmd = &cmd->se_cmd;
++ 	uint32_t h;
++ 	struct atio_from_isp *atio = &prm->cmd->atio;
++ 	uint16_t t16;
++ 
++ 	sgc = 0;
++ 	ha = vha->hw;
++ 
++ 	pkt = (struct ctio_crc2_to_fw *)vha->req->ring_ptr;
++ 	prm->pkt = pkt;
++ 	memset(pkt, 0, sizeof(*pkt));
++ 
++ 	ql_dbg(ql_dbg_tgt, vha, 0xe071,
++ 		"qla_target(%d):%s: se_cmd[%p] CRC2 prot_op[0x%x] cmd prot sg:cnt[%p:%x] lba[%llu]\n",
++ 		vha->vp_idx, __func__, se_cmd, se_cmd->prot_op,
++ 		prm->prot_sg, prm->prot_seg_cnt, se_cmd->t_task_lba);
++ 
++ 	if ((se_cmd->prot_op == TARGET_PROT_DIN_INSERT) ||
++ 	    (se_cmd->prot_op == TARGET_PROT_DOUT_STRIP))
++ 		bundling = 0;
++ 
++ 	/* Compute dif len and adjust data len to incude protection */
++ 	data_bytes = cmd->bufflen;
++ 	dif_bytes  = (data_bytes / cmd->blk_sz) * 8;
++ 
++ 	switch (se_cmd->prot_op) {
++ 	case TARGET_PROT_DIN_INSERT:
++ 	case TARGET_PROT_DOUT_STRIP:
++ 		transfer_length = data_bytes;
++ 		data_bytes += dif_bytes;
++ 		break;
++ 
++ 	case TARGET_PROT_DIN_STRIP:
++ 	case TARGET_PROT_DOUT_INSERT:
++ 	case TARGET_PROT_DIN_PASS:
++ 	case TARGET_PROT_DOUT_PASS:
++ 		transfer_length = data_bytes + dif_bytes;
++ 		break;
++ 
++ 	default:
++ 		BUG();
++ 		break;
++ 	}
++ 
++ 	if (!qlt_hba_err_chk_enabled(se_cmd))
++ 		fw_prot_opts |= 0x10; /* Disable Guard tag checking */
++ 	/* HBA error checking enabled */
++ 	else if (IS_PI_UNINIT_CAPABLE(ha)) {
++ 		if ((se_cmd->prot_type == TARGET_DIF_TYPE1_PROT) ||
++ 		    (se_cmd->prot_type == TARGET_DIF_TYPE2_PROT))
++ 			fw_prot_opts |= PO_DIS_VALD_APP_ESC;
++ 		else if (se_cmd->prot_type == TARGET_DIF_TYPE3_PROT)
++ 			fw_prot_opts |= PO_DIS_VALD_APP_REF_ESC;
++ 	}
++ 
++ 	switch (se_cmd->prot_op) {
++ 	case TARGET_PROT_DIN_INSERT:
++ 	case TARGET_PROT_DOUT_INSERT:
++ 		fw_prot_opts |= PO_MODE_DIF_INSERT;
++ 		break;
++ 	case TARGET_PROT_DIN_STRIP:
++ 	case TARGET_PROT_DOUT_STRIP:
++ 		fw_prot_opts |= PO_MODE_DIF_REMOVE;
++ 		break;
++ 	case TARGET_PROT_DIN_PASS:
++ 	case TARGET_PROT_DOUT_PASS:
++ 		fw_prot_opts |= PO_MODE_DIF_PASS;
++ 		/* FUTURE: does tcm require T10CRC<->IPCKSUM conversion? */
++ 		break;
++ 	default:/* Normal Request */
++ 		fw_prot_opts |= PO_MODE_DIF_PASS;
++ 		break;
++ 	}
++ 
++ 
++ 	/* ---- PKT ---- */
++ 	/* Update entry type to indicate Command Type CRC_2 IOCB */
++ 	pkt->entry_type  = CTIO_CRC2;
++ 	pkt->entry_count = 1;
++ 	pkt->vp_index = vha->vp_idx;
++ 
++ 	h = qlt_make_handle(vha);
++ 	if (unlikely(h == QLA_TGT_NULL_HANDLE)) {
++ 		/*
++ 		 * CTIO type 7 from the firmware doesn't provide a way to
++ 		 * know the initiator's LOOP ID, hence we can't find
++ 		 * the session and, so, the command.
++ 		 */
++ 		return -EAGAIN;
++ 	} else
++ 		ha->tgt.cmds[h-1] = prm->cmd;
++ 
++ 
++ 	pkt->handle  = h | CTIO_COMPLETION_HANDLE_MARK;
++ 	pkt->nport_handle = prm->cmd->loop_id;
++ 	pkt->timeout = __constant_cpu_to_le16(QLA_TGT_TIMEOUT);
++ 	pkt->initiator_id[0] = atio->u.isp24.fcp_hdr.s_id[2];
++ 	pkt->initiator_id[1] = atio->u.isp24.fcp_hdr.s_id[1];
++ 	pkt->initiator_id[2] = atio->u.isp24.fcp_hdr.s_id[0];
++ 	pkt->exchange_addr   = atio->u.isp24.exchange_addr;
++ 
++ 	/* silence compile warning */
++ 	t16 = be16_to_cpu(atio->u.isp24.fcp_hdr.ox_id);
++ 	pkt->ox_id  = cpu_to_le16(t16);
++ 
++ 	t16 = (atio->u.isp24.attr << 9);
++ 	pkt->flags |= cpu_to_le16(t16);
++ 	pkt->relative_offset = cpu_to_le32(prm->cmd->offset);
++ 
++ 	/* Set transfer direction */
++ 	if (cmd->dma_data_direction == DMA_TO_DEVICE)
++ 		pkt->flags = __constant_cpu_to_le16(CTIO7_FLAGS_DATA_IN);
++ 	else if (cmd->dma_data_direction == DMA_FROM_DEVICE)
++ 		pkt->flags = __constant_cpu_to_le16(CTIO7_FLAGS_DATA_OUT);
++ 
++ 
++ 	pkt->dseg_count = prm->tot_dsds;
++ 	/* Fibre channel byte count */
++ 	pkt->transfer_length = cpu_to_le32(transfer_length);
++ 
++ 
++ 	/* ----- CRC context -------- */
++ 
++ 	/* Allocate CRC context from global pool */
++ 	crc_ctx_pkt = cmd->ctx =
++ 	    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC, &crc_ctx_dma);
++ 
++ 	if (!crc_ctx_pkt)
++ 		goto crc_queuing_error;
++ 
++ 	/* Zero out CTX area. */
++ 	clr_ptr = (uint8_t *)crc_ctx_pkt;
++ 	memset(clr_ptr, 0, sizeof(*crc_ctx_pkt));
++ 
++ 	crc_ctx_pkt->crc_ctx_dma = crc_ctx_dma;
++ 	INIT_LIST_HEAD(&crc_ctx_pkt->dsd_list);
++ 
++ 	/* Set handle */
++ 	crc_ctx_pkt->handle = pkt->handle;
++ 
++ 	qlt_set_t10dif_tags(se_cmd, crc_ctx_pkt);
++ 
++ 	pkt->crc_context_address[0] = cpu_to_le32(LSD(crc_ctx_dma));
++ 	pkt->crc_context_address[1] = cpu_to_le32(MSD(crc_ctx_dma));
++ 	pkt->crc_context_len = CRC_CONTEXT_LEN_FW;
++ 
++ 
++ 	if (!bundling) {
++ 		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.nobundling.data_address;
++ 	} else {
++ 		/*
++ 		 * Configure Bundling if we need to fetch interlaving
++ 		 * protection PCI accesses
++ 		 */
++ 		fw_prot_opts |= PO_ENABLE_DIF_BUNDLING;
++ 		crc_ctx_pkt->u.bundling.dif_byte_count = cpu_to_le32(dif_bytes);
++ 		crc_ctx_pkt->u.bundling.dseg_count =
++ 			cpu_to_le16(prm->tot_dsds - prm->prot_seg_cnt);
++ 		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.data_address;
++ 	}
++ 
++ 	/* Finish the common fields of CRC pkt */
++ 	crc_ctx_pkt->blk_size   = cpu_to_le16(cmd->blk_sz);
++ 	crc_ctx_pkt->prot_opts  = cpu_to_le16(fw_prot_opts);
++ 	crc_ctx_pkt->byte_count = cpu_to_le32(data_bytes);
++ 	crc_ctx_pkt->guard_seed = __constant_cpu_to_le16(0);
++ 
++ 
++ 	/* Walks data segments */
++ 	pkt->flags |= __constant_cpu_to_le16(CTIO7_FLAGS_DSD_PTR);
++ 
++ 	if (!bundling && prm->prot_seg_cnt) {
++ 		if (qla24xx_walk_and_build_sglist_no_difb(ha, NULL, cur_dsd,
++ 			prm->tot_dsds, cmd))
++ 			goto crc_queuing_error;
++ 	} else if (qla24xx_walk_and_build_sglist(ha, NULL, cur_dsd,
++ 		(prm->tot_dsds - prm->prot_seg_cnt), cmd))
++ 		goto crc_queuing_error;
++ 
++ 	if (bundling && prm->prot_seg_cnt) {
++ 		/* Walks dif segments */
++ 		pkt->add_flags |= CTIO_CRC2_AF_DIF_DSD_ENA;
++ 
++ 		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.dif_address;
++ 		if (qla24xx_walk_and_build_prot_sglist(ha, NULL, cur_dsd,
++ 			prm->prot_seg_cnt, cmd))
++ 			goto crc_queuing_error;
++ 	}
++ 	return QLA_SUCCESS;
++ 
++ crc_queuing_error:
++ 	/* Cleanup will be performed by the caller */
++ 
++ 	return QLA_FUNCTION_FAILED;
++ }
++ 
++ 
+++>>>>>>> c7ee3bd4870e (qla2xxx: fix sparse warnings introduced by previous target mode t10-dif patch)
+  /*
+   * Callback to setup response of xmit_type of QLA_TGT_XMIT_DATA and *
+   * QLA_TGT_XMIT_STATUS for >= 24xx silicon
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,fa5630b469f3..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -514,6 -516,68 +514,71 @@@ struct ctio7_from_24xx 
+  #define ELS_ADISC			0x52
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  *CTIO Type CRC_2 IOCB
++  */
++ struct ctio_crc2_to_fw {
++ 	uint8_t entry_type;		/* Entry type. */
++ #define CTIO_CRC2 0x7A
++ 	uint8_t entry_count;		/* Entry count. */
++ 	uint8_t sys_define;		/* System defined. */
++ 	uint8_t entry_status;		/* Entry Status. */
++ 
++ 	uint32_t handle;		/* System handle. */
++ 	uint16_t nport_handle;		/* N_PORT handle. */
++ 	__le16 timeout;		/* Command timeout. */
++ 
++ 	uint16_t dseg_count;		/* Data segment count. */
++ 	uint8_t  vp_index;
++ 	uint8_t  add_flags;		/* additional flags */
++ #define CTIO_CRC2_AF_DIF_DSD_ENA BIT_3
++ 
++ 	uint8_t  initiator_id[3];	/* initiator ID */
++ 	uint8_t  reserved1;
++ 	uint32_t exchange_addr;		/* rcv exchange address */
++ 	uint16_t reserved2;
++ 	__le16 flags;			/* refer to CTIO7 flags values */
++ 	uint32_t residual;
++ 	__le16 ox_id;
++ 	uint16_t scsi_status;
++ 	__le32 relative_offset;
++ 	uint32_t reserved5;
++ 	__le32 transfer_length;		/* total fc transfer length */
++ 	uint32_t reserved6;
++ 	__le32 crc_context_address[2];/* Data segment address. */
++ 	uint16_t crc_context_len;	/* Data segment length. */
++ 	uint16_t reserved_1;		/* MUST be set to 0. */
++ } __packed;
++ 
++ /* CTIO Type CRC_x Status IOCB */
++ struct ctio_crc_from_fw {
++ 	uint8_t entry_type;		/* Entry type. */
++ 	uint8_t entry_count;		/* Entry count. */
++ 	uint8_t sys_define;		/* System defined. */
++ 	uint8_t entry_status;		/* Entry Status. */
++ 
++ 	uint32_t handle;		/* System handle. */
++ 	uint16_t status;
++ 	uint16_t timeout;		/* Command timeout. */
++ 	uint16_t dseg_count;		/* Data segment count. */
++ 	uint32_t reserved1;
++ 	uint16_t state_flags;
++ #define CTIO_CRC_SF_DIF_CHOPPED BIT_4
++ 
++ 	uint32_t exchange_address;	/* rcv exchange address */
++ 	uint16_t reserved2;
++ 	uint16_t flags;
++ 	uint32_t resid_xfer_length;
++ 	uint16_t ox_id;
++ 	uint8_t  reserved3[12];
++ 	uint16_t runt_guard;		/* reported runt blk guard */
++ 	uint8_t  actual_dif[8];
++ 	uint8_t  expected_dif[8];
++ } __packed;
++ 
++ /*
+++>>>>>>> c7ee3bd4870e (qla2xxx: fix sparse warnings introduced by previous target mode t10-dif patch)
+   * ISP queue - ABTS received/response entries structure definition for 24xx.
+   */
+  #define ABTS_RECV_24XX		0x54 /* ABTS received (for 24xx) */
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index db7beb33e386..d189f8aa984b 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -1681,16 +1681,16 @@ typedef struct {
+  */
+ struct crc_context {
+ 	uint32_t handle;		/* System handle. */
+-	uint32_t ref_tag;
+-	uint16_t app_tag;
++	__le32 ref_tag;
++	__le16 app_tag;
+ 	uint8_t ref_tag_mask[4];	/* Validation/Replacement Mask*/
+ 	uint8_t app_tag_mask[2];	/* Validation/Replacement Mask*/
+-	uint16_t guard_seed;		/* Initial Guard Seed */
+-	uint16_t prot_opts;		/* Requested Data Protection Mode */
+-	uint16_t blk_size;		/* Data size in bytes */
++	__le16 guard_seed;		/* Initial Guard Seed */
++	__le16 prot_opts;		/* Requested Data Protection Mode */
++	__le16 blk_size;		/* Data size in bytes */
+ 	uint16_t runt_blk_guard;	/* Guard value for runt block (tape
+ 					 * only) */
+-	uint32_t byte_count;		/* Total byte count/ total data
++	__le32 byte_count;		/* Total byte count/ total data
+ 					 * transfer count */
+ 	union {
+ 		struct {
+@@ -1704,10 +1704,10 @@ struct crc_context {
+ 			uint32_t	reserved_6;
+ 		} nobundling;
+ 		struct {
+-			uint32_t	dif_byte_count;	/* Total DIF byte
++			__le32	dif_byte_count;	/* Total DIF byte
+ 							 * count */
+ 			uint16_t	reserved_1;
+-			uint16_t	dseg_count;	/* Data segment count */
++			__le16	dseg_count;	/* Data segment count */
+ 			uint32_t	reserved_2;
+ 			uint32_t	data_address[2];
+ 			uint32_t	data_length;
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
