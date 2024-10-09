@@ -1,0 +1,249 @@
+x86/mm, x86/mce: Add memcpy_mcsafe()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm, x86/mce: Add memcpy_mcsafe() (Jeff Moyer) [1437205]
+Rebuild_FUZZ: 94.12%
+commit-author Tony Luck <tony.luck@intel.com>
+commit 92b0729c34cab1f46d89aace3e66015f0bb4a682
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/92b0729c.failed
+
+Make use of the EXTABLE_FAULT exception table entries to write
+a kernel copy routine that doesn't crash the system if it
+encounters a machine check. Prime use case for this is to copy
+from large arrays of non-volatile memory used as storage.
+
+We have to use an unrolled copy loop for now because current
+hardware implementations treat a machine check in "rep mov"
+as fatal. When that is fixed we can simplify.
+
+Return type is a "bool". True means that we copied OK, false means
+that it didn't.
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@gmail.com>
+Link: http://lkml.kernel.org/r/a44e1055efc2d2a9473307b22c91caa437aa3f8b.1456439214.git.tony.luck@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 92b0729c34cab1f46d89aace3e66015f0bb4a682)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/string_64.h
+#	arch/x86/lib/memcpy_64.S
+diff --cc arch/x86/include/asm/string_64.h
+index 19e2c468fc2c,ca6ba3607705..000000000000
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@@ -63,6 -65,32 +63,35 @@@ char *strcpy(char *dest, const char *sr
+  char *strcat(char *dest, const char *src);
+  int strcmp(const char *cs, const char *ct);
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_KASAN) && !defined(__SANITIZE_ADDRESS__)
++ 
++ /*
++  * For files that not instrumented (e.g. mm/slub.c) we
++  * should use not instrumented version of mem* functions.
++  */
++ 
++ #undef memcpy
++ #define memcpy(dst, src, len) __memcpy(dst, src, len)
++ #define memmove(dst, src, len) __memmove(dst, src, len)
++ #define memset(s, c, n) __memset(s, c, n)
++ #endif
++ 
++ /**
++  * memcpy_mcsafe - copy memory with indication if a machine check happened
++  *
++  * @dst:	destination address
++  * @src:	source address
++  * @cnt:	number of bytes to copy
++  *
++  * Low level memory copy function that catches machine checks
++  *
++  * Return true for success, false for fail
++  */
++ bool memcpy_mcsafe(void *dst, const void *src, size_t cnt);
++ 
+++>>>>>>> 92b0729c34ca (x86/mm, x86/mce: Add memcpy_mcsafe())
+  #endif /* __KERNEL__ */
+  
+  #endif /* _ASM_X86_STRING_64_H */
+diff --cc arch/x86/lib/memcpy_64.S
+index 56313a326188,7d37641ada5b..000000000000
+--- a/arch/x86/lib/memcpy_64.S
++++ b/arch/x86/lib/memcpy_64.S
+@@@ -180,27 -176,121 +180,148 @@@ ENTRY(memcpy
+  
+  .Lend:
+  	retq
+++<<<<<<< HEAD
+ +	CFI_ENDPROC
+ +ENDPROC(memcpy)
+ +ENDPROC(__memcpy)
+ +
+ +	/*
+ +	 * Some CPUs are adding enhanced REP MOVSB/STOSB feature
+ +	 * If the feature is supported, memcpy_c_e() is the first choice.
+ +	 * If enhanced rep movsb copy is not available, use fast string copy
+ +	 * memcpy_c() when possible. This is faster and code is simpler than
+ +	 * original memcpy().
+ +	 * Otherwise, original memcpy() is used.
+ +	 * In .altinstructions section, ERMS feature is placed after REG_GOOD
+ +         * feature to implement the right patch order.
+ +	 *
+ +	 * Replace only beginning, memcpy is used to apply alternatives,
+ +	 * so it is silly to overwrite itself with nops - reboot is the
+ +	 * only outcome...
+ +	 */
+ +	.section .altinstructions, "a"
+ +	altinstruction_entry memcpy,.Lmemcpy_c,X86_FEATURE_REP_GOOD,\
+ +			     .Lmemcpy_e-.Lmemcpy_c,.Lmemcpy_e-.Lmemcpy_c
+ +	altinstruction_entry memcpy,.Lmemcpy_c_e,X86_FEATURE_ERMS, \
+ +			     .Lmemcpy_e_e-.Lmemcpy_c_e,.Lmemcpy_e_e-.Lmemcpy_c_e
+ +	.previous
+++=======
++ ENDPROC(memcpy_orig)
++ 
++ #ifndef CONFIG_UML
++ /*
++  * memcpy_mcsafe - memory copy with machine check exception handling
++  * Note that we only catch machine checks when reading the source addresses.
++  * Writes to target are posted and don't generate machine checks.
++  */
++ ENTRY(memcpy_mcsafe)
++ 	cmpl $8, %edx
++ 	/* Less than 8 bytes? Go to byte copy loop */
++ 	jb .L_no_whole_words
++ 
++ 	/* Check for bad alignment of source */
++ 	testl $7, %esi
++ 	/* Already aligned */
++ 	jz .L_8byte_aligned
++ 
++ 	/* Copy one byte at a time until source is 8-byte aligned */
++ 	movl %esi, %ecx
++ 	andl $7, %ecx
++ 	subl $8, %ecx
++ 	negl %ecx
++ 	subl %ecx, %edx
++ .L_copy_leading_bytes:
++ 	movb (%rsi), %al
++ 	movb %al, (%rdi)
++ 	incq %rsi
++ 	incq %rdi
++ 	decl %ecx
++ 	jnz .L_copy_leading_bytes
++ 
++ .L_8byte_aligned:
++ 	/* Figure out how many whole cache lines (64-bytes) to copy */
++ 	movl %edx, %ecx
++ 	andl $63, %edx
++ 	shrl $6, %ecx
++ 	jz .L_no_whole_cache_lines
++ 
++ 	/* Loop copying whole cache lines */
++ .L_cache_w0: movq (%rsi), %r8
++ .L_cache_w1: movq 1*8(%rsi), %r9
++ .L_cache_w2: movq 2*8(%rsi), %r10
++ .L_cache_w3: movq 3*8(%rsi), %r11
++ 	movq %r8, (%rdi)
++ 	movq %r9, 1*8(%rdi)
++ 	movq %r10, 2*8(%rdi)
++ 	movq %r11, 3*8(%rdi)
++ .L_cache_w4: movq 4*8(%rsi), %r8
++ .L_cache_w5: movq 5*8(%rsi), %r9
++ .L_cache_w6: movq 6*8(%rsi), %r10
++ .L_cache_w7: movq 7*8(%rsi), %r11
++ 	movq %r8, 4*8(%rdi)
++ 	movq %r9, 5*8(%rdi)
++ 	movq %r10, 6*8(%rdi)
++ 	movq %r11, 7*8(%rdi)
++ 	leaq 64(%rsi), %rsi
++ 	leaq 64(%rdi), %rdi
++ 	decl %ecx
++ 	jnz .L_cache_w0
++ 
++ 	/* Are there any trailing 8-byte words? */
++ .L_no_whole_cache_lines:
++ 	movl %edx, %ecx
++ 	andl $7, %edx
++ 	shrl $3, %ecx
++ 	jz .L_no_whole_words
++ 
++ 	/* Copy trailing words */
++ .L_copy_trailing_words:
++ 	movq (%rsi), %r8
++ 	mov %r8, (%rdi)
++ 	leaq 8(%rsi), %rsi
++ 	leaq 8(%rdi), %rdi
++ 	decl %ecx
++ 	jnz .L_copy_trailing_words
++ 
++ 	/* Any trailing bytes? */
++ .L_no_whole_words:
++ 	andl %edx, %edx
++ 	jz .L_done_memcpy_trap
++ 
++ 	/* Copy trailing bytes */
++ 	movl %edx, %ecx
++ .L_copy_trailing_bytes:
++ 	movb (%rsi), %al
++ 	movb %al, (%rdi)
++ 	incq %rsi
++ 	incq %rdi
++ 	decl %ecx
++ 	jnz .L_copy_trailing_bytes
++ 
++ 	/* Copy successful. Return true */
++ .L_done_memcpy_trap:
++ 	xorq %rax, %rax
++ 	ret
++ ENDPROC(memcpy_mcsafe)
++ 
++ 	.section .fixup, "ax"
++ 	/* Return false for any failure */
++ .L_memcpy_mcsafe_fail:
++ 	mov	$1, %rax
++ 	ret
++ 
++ 	.previous
++ 
++ 	_ASM_EXTABLE_FAULT(.L_copy_leading_bytes, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w0, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w1, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w3, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w3, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w4, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w5, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w6, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_cache_w7, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_copy_trailing_words, .L_memcpy_mcsafe_fail)
++ 	_ASM_EXTABLE_FAULT(.L_copy_trailing_bytes, .L_memcpy_mcsafe_fail)
++ #endif
+++>>>>>>> 92b0729c34ca (x86/mm, x86/mce: Add memcpy_mcsafe())
+* Unmerged path arch/x86/include/asm/string_64.h
+diff --git a/arch/x86/kernel/x8664_ksyms_64.c b/arch/x86/kernel/x8664_ksyms_64.c
+index 72606f19c287..2e913a32186a 100644
+--- a/arch/x86/kernel/x8664_ksyms_64.c
++++ b/arch/x86/kernel/x8664_ksyms_64.c
+@@ -37,6 +37,8 @@ EXPORT_SYMBOL(__copy_user_nocache);
+ EXPORT_SYMBOL(_copy_from_user);
+ EXPORT_SYMBOL(_copy_to_user);
+ 
++EXPORT_SYMBOL_GPL(memcpy_mcsafe);
++
+ EXPORT_SYMBOL(copy_page);
+ EXPORT_SYMBOL(clear_page);
+ 
+* Unmerged path arch/x86/lib/memcpy_64.S
