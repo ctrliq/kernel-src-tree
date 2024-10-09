@@ -1,0 +1,432 @@
+net: sched: don't release reference on action overwrite
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] sched: don't release reference on action overwrite (Davide Caratti) [1706791]
+Rebuild_FUZZ: 95.24%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 4e8ddd7f1758ca4ddd0c1f7cf3e66fce736241d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4e8ddd7f.failed
+
+Return from action init function with reference to action taken,
+even when overwriting existing action.
+
+Action init API initializes its fourth argument (pointer to pointer to tc
+action) to either existing action with same index or newly created action.
+In case of existing index(and bind argument is zero), init function returns
+without incrementing action reference counter. Caller of action init then
+proceeds working with action, without actually holding reference to it.
+This means that action could be deleted concurrently.
+
+Change action init behavior to always take reference to action before
+returning successfully, in order to protect from concurrent deletion.
+
+	Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4e8ddd7f1758ca4ddd0c1f7cf3e66fce736241d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+#	net/sched/act_bpf.c
+#	net/sched/act_csum.c
+#	net/sched/act_ife.c
+#	net/sched/act_pedit.c
+#	net/sched/act_tunnel_key.c
+#	net/sched/act_vlan.c
+diff --cc net/sched/act_api.c
+index 45c463a88ec4,f019f0464cec..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -754,8 -869,7 +754,12 @@@ int tcf_action_init(struct net *net, st
+  			goto err;
+  		}
+  		act->order = i;
+++<<<<<<< HEAD
+ +		if (ovr)
+ +			act->tcfa_refcnt++;
+++=======
++ 		sz += tcf_action_fill_size(act);
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  		list_add_tail(&act->list, actions);
+  	}
+  
+diff --cc net/sched/act_csum.c
+index a897ed04f30c,5dbee136b0a1..000000000000
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@@ -80,10 -83,20 +81,27 @@@ static int tcf_csum_init(struct net *ne
+  	}
+  
+  	p = to_tcf_csum(*a);
+++<<<<<<< HEAD
+ +	spin_lock_bh(&p->tcf_lock);
+ +	p->tcf_action = parm->action;
+ +	p->update_flags = parm->update_flags;
+ +	spin_unlock_bh(&p->tcf_lock);
+++=======
++ 	ASSERT_RTNL();
++ 
++ 	params_new = kzalloc(sizeof(*params_new), GFP_KERNEL);
++ 	if (unlikely(!params_new)) {
++ 		tcf_idr_release(*a, bind);
++ 		return -ENOMEM;
++ 	}
++ 	params_old = rtnl_dereference(p->params);
++ 
++ 	params_new->action = parm->action;
++ 	params_new->update_flags = parm->update_flags;
++ 	rcu_assign_pointer(p->params, params_new);
++ 	if (params_old)
++ 		kfree_rcu(params_old, rcu);
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  
+  	if (ret == ACT_P_CREATED)
+  		tcf_idr_insert(tn, *a);
+diff --cc net/sched/act_ife.c
+index a82819f43d59,acea3feae762..000000000000
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@@ -456,14 -491,17 +456,19 @@@ static int tcf_ife_init(struct net *net
+  
+  	if (!exists) {
+  		ret = tcf_idr_create(tn, parm->index, est, a, &act_ife_ops,
+ -				     bind, true);
+ -		if (ret) {
+ -			kfree(p);
+ +				     bind, false);
+ +		if (ret)
+  			return ret;
+ -		}
+  		ret = ACT_P_CREATED;
+- 	} else {
++ 	} else if (!ovr) {
+  		tcf_idr_release(*a, bind);
+++<<<<<<< HEAD
+ +		if (!ovr)
+ +			return -EEXIST;
+++=======
++ 		kfree(p);
++ 		return -EEXIST;
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  	}
+  
+  	ife = to_ife(*a);
+@@@ -511,6 -546,9 +516,12 @@@ metadata_parse_err
+  
+  			if (exists)
+  				spin_unlock_bh(&ife->tcf_lock);
+++<<<<<<< HEAD
+++=======
++ 			tcf_idr_release(*a, bind);
++ 
++ 			kfree(p);
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  			return err;
+  		}
+  
+diff --cc net/sched/act_pedit.c
+index 5a988cff963f,3a0e2f762f4e..000000000000
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@@ -183,10 -193,12 +183,19 @@@ static int tcf_pedit_init(struct net *n
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (bind)
+++<<<<<<< HEAD
+ +			return 0;
+ +		tcf_idr_release(*a, bind);
+ +		if (!ovr)
+ +			return -EEXIST;
+++=======
++ 			goto out_free;
++ 		if (!ovr) {
++ 			tcf_idr_release(*a, bind);
++ 			ret = -EEXIST;
++ 			goto out_free;
++ 		}
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  		p = to_pedit(*a);
+  		if (p->tcfp_nkeys && p->tcfp_nkeys != parm->nkeys) {
+  			keys = kmalloc(ksize, GFP_KERNEL);
+diff --cc net/sched/act_tunnel_key.c
+index 0680eb45c108,ab5bf5c13f87..000000000000
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@@ -321,14 -323,16 +321,19 @@@ static int tunnel_key_init(struct net *
+  	if (!exists) {
+  		ret = tcf_idr_create(tn, parm->index, est, a,
+  				     &act_tunnel_key_ops, bind, true);
+ -		if (ret) {
+ -			NL_SET_ERR_MSG(extack, "Cannot create TC IDR");
+ +		if (ret)
+  			return ret;
+ -		}
+  
+  		ret = ACT_P_CREATED;
+- 	} else {
++ 	} else if (!ovr) {
+  		tcf_idr_release(*a, bind);
+++<<<<<<< HEAD
+ +		if (!ovr)
+ +			return -EEXIST;
+++=======
++ 		NL_SET_ERR_MSG(extack, "TC IDR already exists");
++ 		return -EEXIST;
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  	}
+  
+  	t = to_tunnel_key(*a);
+@@@ -336,8 -340,8 +341,13 @@@
+  	ASSERT_RTNL();
+  	params_new = kzalloc(sizeof(*params_new), GFP_KERNEL);
+  	if (unlikely(!params_new)) {
+++<<<<<<< HEAD
+ +		if (ret == ACT_P_CREATED)
+ +			tcf_idr_release(*a, bind);
+++=======
++ 		tcf_idr_release(*a, bind);
++ 		NL_SET_ERR_MSG(extack, "Cannot allocate tunnel key parameters");
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  		return -ENOMEM;
+  	}
+  
+diff --cc net/sched/act_vlan.c
+index 778c1911fa89,9b600faaccbb..000000000000
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@@ -187,12 -194,12 +186,21 @@@ static int tcf_vlan_init(struct net *ne
+  
+  	v = to_vlan(*a);
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&v->tcf_lock);
+ +
+ +	v->tcfv_action = action;
+ +	v->tcfv_push_vid = push_vid;
+ +	v->tcfv_push_prio = push_prio;
+ +	v->tcfv_push_proto = push_proto;
+++=======
++ 	ASSERT_RTNL();
++ 	p = kzalloc(sizeof(*p), GFP_KERNEL);
++ 	if (!p) {
++ 		tcf_idr_release(*a, bind);
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> 4e8ddd7f1758 (net: sched: don't release reference on action overwrite)
+  
+  	v->tcf_action = parm->action;
+  
+* Unmerged path net/sched/act_bpf.c
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/act_bpf.c
+diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
+index 9855f26ef14e..0e3eb80def7f 100644
+--- a/net/sched/act_connmark.c
++++ b/net/sched/act_connmark.c
+@@ -133,9 +133,10 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 		ci = to_connmark(*a);
+ 		if (bind)
+ 			return 0;
+-		tcf_idr_release(*a, bind);
+-		if (!ovr)
++		if (!ovr) {
++			tcf_idr_release(*a, bind);
+ 			return -EEXIST;
++		}
+ 		/* replacing action and zone */
+ 		ci->tcf_action = parm->action;
+ 		ci->zone = parm->zone;
+* Unmerged path net/sched/act_csum.c
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index bbe5e1d20fab..a7e200d8301b 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -99,9 +99,10 @@ static int tcf_gact_init(struct net *net, struct nlattr *nla,
+ 	} else {
+ 		if (bind)/* dont override defaults */
+ 			return 0;
+-		tcf_idr_release(*a, bind);
+-		if (!ovr)
++		if (!ovr) {
++			tcf_idr_release(*a, bind);
+ 			return -EEXIST;
++		}
+ 	}
+ 
+ 	gact = to_gact(*a);
+* Unmerged path net/sched/act_ife.c
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 1da43300619a..7db84353f4e5 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -145,10 +145,11 @@ static int __tcf_ipt_init(struct net *net, unsigned int id, struct nlattr *nla,
+ 	} else {
+ 		if (bind)/* dont override defaults */
+ 			return 0;
+-		tcf_idr_release(*a, bind);
+ 
+-		if (!ovr)
++		if (!ovr) {
++			tcf_idr_release(*a, bind);
+ 			return -EEXIST;
++		}
+ 	}
+ 	hook = nla_get_u32(tb[TCA_IPT_HOOK]);
+ 
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 6dae7461a73c..6c9f75e92e9e 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -128,10 +128,9 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 		if (ret)
+ 			return ret;
+ 		ret = ACT_P_CREATED;
+-	} else {
++	} else if (!ovr) {
+ 		tcf_idr_release(*a, bind);
+-		if (!ovr)
+-			return -EEXIST;
++		return -EEXIST;
+ 	}
+ 	m = to_mirred(*a);
+ 
+diff --git a/net/sched/act_nat.c b/net/sched/act_nat.c
+index a3208bab21d3..0e406861990b 100644
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@ -65,9 +65,10 @@ static int tcf_nat_init(struct net *net, struct nlattr *nla, struct nlattr *est,
+ 	} else {
+ 		if (bind)
+ 			return 0;
+-		tcf_idr_release(*a, bind);
+-		if (!ovr)
++		if (!ovr) {
++			tcf_idr_release(*a, bind);
+ 			return -EEXIST;
++		}
+ 	}
+ 	p = to_tcf_nat(*a);
+ 
+* Unmerged path net/sched/act_pedit.c
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index ec3d370a8b58..d79498312c1b 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -109,10 +109,9 @@ static int tcf_act_police_init(struct net *net, struct nlattr *nla,
+ 		if (ret)
+ 			return ret;
+ 		ret = ACT_P_CREATED;
+-	} else {
++	} else if (!ovr) {
+ 		tcf_idr_release(*a, bind);
+-		if (!ovr)
+-			return -EEXIST;
++		return -EEXIST;
+ 	}
+ 
+ 	police = to_police(*a);
+@@ -193,8 +192,7 @@ static int tcf_act_police_init(struct net *net, struct nlattr *nla,
+ failure:
+ 	qdisc_put_rtab(P_tab);
+ 	qdisc_put_rtab(R_tab);
+-	if (ret == ACT_P_CREATED)
+-		tcf_idr_release(*a, bind);
++	tcf_idr_release(*a, bind);
+ 	return err;
+ }
+ 
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index ad9b454fa9e6..df2e92fbe0d7 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -68,10 +68,9 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
+ 		if (ret)
+ 			return ret;
+ 		ret = ACT_P_CREATED;
+-	} else {
++	} else if (!ovr) {
+ 		tcf_idr_release(*a, bind);
+-		if (!ovr)
+-			return -EEXIST;
++		return -EEXIST;
+ 	}
+ 	s = to_sample(*a);
+ 
+@@ -80,8 +79,7 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
+ 	s->psample_group_num = nla_get_u32(tb[TCA_SAMPLE_PSAMPLE_GROUP]);
+ 	psample_group = psample_group_get(net, s->psample_group_num);
+ 	if (!psample_group) {
+-		if (ret == ACT_P_CREATED)
+-			tcf_idr_release(*a, bind);
++		tcf_idr_release(*a, bind);
+ 		return -ENOMEM;
+ 	}
+ 	RCU_INIT_POINTER(s->psample_group, psample_group);
+diff --git a/net/sched/act_simple.c b/net/sched/act_simple.c
+index 4d744de9a416..c219ba32944e 100644
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@ -126,9 +126,10 @@ static int tcf_simp_init(struct net *net, struct nlattr *nla,
+ 	} else {
+ 		d = to_defact(*a);
+ 
+-		tcf_idr_release(*a, bind);
+-		if (!ovr)
++		if (!ovr) {
++			tcf_idr_release(*a, bind);
+ 			return -EEXIST;
++		}
+ 
+ 		reset_policy(d, tb[TCA_DEF_DATA], parm);
+ 	}
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index 930739e36c77..3b0cf65a071e 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -136,9 +136,10 @@ static int tcf_skbedit_init(struct net *net, struct nlattr *nla,
+ 		ret = ACT_P_CREATED;
+ 	} else {
+ 		d = to_skbedit(*a);
+-		tcf_idr_release(*a, bind);
+-		if (!ovr)
++		if (!ovr) {
++			tcf_idr_release(*a, bind);
+ 			return -EEXIST;
++		}
+ 	}
+ 
+ 	spin_lock_bh(&d->tcf_lock);
+diff --git a/net/sched/act_skbmod.c b/net/sched/act_skbmod.c
+index c95d4946eaa0..d17b93e9ef78 100644
+--- a/net/sched/act_skbmod.c
++++ b/net/sched/act_skbmod.c
+@@ -144,10 +144,9 @@ static int tcf_skbmod_init(struct net *net, struct nlattr *nla,
+ 			return ret;
+ 
+ 		ret = ACT_P_CREATED;
+-	} else {
++	} else if (!ovr) {
+ 		tcf_idr_release(*a, bind);
+-		if (!ovr)
+-			return -EEXIST;
++		return -EEXIST;
+ 	}
+ 
+ 	d = to_skbmod(*a);
+@@ -155,8 +154,7 @@ static int tcf_skbmod_init(struct net *net, struct nlattr *nla,
+ 	ASSERT_RTNL();
+ 	p = kzalloc(sizeof(struct tcf_skbmod_params), GFP_KERNEL);
+ 	if (unlikely(!p)) {
+-		if (ret == ACT_P_CREATED)
+-			tcf_idr_release(*a, bind);
++		tcf_idr_release(*a, bind);
+ 		return -ENOMEM;
+ 	}
+ 
+* Unmerged path net/sched/act_tunnel_key.c
+* Unmerged path net/sched/act_vlan.c
