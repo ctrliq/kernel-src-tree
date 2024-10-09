@@ -1,0 +1,183 @@
+net sched ife action: Introduce skb tcindex metadata encap decap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: ife action: Introduce skb tcindex metadata encap decap (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 96.00%
+commit-author Jamal Hadi Salim <jhs@mojatatu.com>
+commit 408fbc22ef1efb00dd896acd00e9f7d9b641e047
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/408fbc22.failed
+
+Sample use case of how this is encoded:
+user space via tuntap (or a connected VM/Machine/container)
+encodes the tcindex TLV.
+
+Sample use case of decoding:
+IFE action decodes it and the skb->tc_index is then used to classify.
+So something like this for encoded ICMP packets:
+
+.. first decode then reclassify... skb->tcindex will be set
+sudo $TC filter add dev $ETH parent ffff: prio 2 protocol 0xbeef \
+u32 match u32 0 0 flowid 1:1 \
+action ife decode reclassify
+
+...next match the decode icmp packet...
+sudo $TC filter add dev $ETH parent ffff: prio 4 protocol ip \
+u32 match ip protocol 1 0xff flowid 1:1 \
+action continue
+
+... last classify it using the tcindex classifier and do someaction..
+sudo $TC filter add dev $ETH parent ffff: prio 5 protocol ip \
+handle 0x11 tcindex classid 1:1 \
+action blah..
+
+	Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 408fbc22ef1efb00dd896acd00e9f7d9b641e047)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/tc_act/tc_ife.h
+#	net/sched/Kconfig
+#	net/sched/Makefile
+diff --cc net/sched/Kconfig
+index 18f24078aae0,87956a768d1b..000000000000
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@@ -729,6 -783,21 +729,24 @@@ config NET_ACT_TUNNEL_KE
+  	  To compile this code as a module, choose M here: the
+  	  module will be called act_tunnel_key.
+  
+++<<<<<<< HEAD
+++=======
++ config NET_IFE_SKBMARK
++         tristate "Support to encoding decoding skb mark on IFE action"
++         depends on NET_ACT_IFE
++         ---help---
++ 
++ config NET_IFE_SKBPRIO
++         tristate "Support to encoding decoding skb prio on IFE action"
++         depends on NET_ACT_IFE
++         ---help---
++ 
++ config NET_IFE_SKBTCINDEX
++         tristate "Support to encoding decoding skb tcindex on IFE action"
++         depends on NET_ACT_IFE
++         ---help---
++ 
+++>>>>>>> 408fbc22ef1e (net sched ife action: Introduce skb tcindex metadata encap decap)
+  config NET_CLS_IND
+  	bool "Incoming device classification"
+  	depends on NET_CLS_U32 || NET_CLS_FW
+diff --cc net/sched/Makefile
+index bde3e9082f42,4bdda3634e0b..000000000000
+--- a/net/sched/Makefile
++++ b/net/sched/Makefile
+@@@ -17,6 -17,13 +17,16 @@@ obj-$(CONFIG_NET_ACT_SIMP)	+= act_simpl
+  obj-$(CONFIG_NET_ACT_SKBEDIT)	+= act_skbedit.o
+  obj-$(CONFIG_NET_ACT_CSUM)	+= act_csum.o
+  obj-$(CONFIG_NET_ACT_VLAN)	+= act_vlan.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_NET_ACT_BPF)	+= act_bpf.o
++ obj-$(CONFIG_NET_ACT_CONNMARK)	+= act_connmark.o
++ obj-$(CONFIG_NET_ACT_SKBMOD)	+= act_skbmod.o
++ obj-$(CONFIG_NET_ACT_IFE)	+= act_ife.o
++ obj-$(CONFIG_NET_IFE_SKBMARK)	+= act_meta_mark.o
++ obj-$(CONFIG_NET_IFE_SKBPRIO)	+= act_meta_skbprio.o
++ obj-$(CONFIG_NET_IFE_SKBTCINDEX)	+= act_meta_skbtcindex.o
+++>>>>>>> 408fbc22ef1e (net sched ife action: Introduce skb tcindex metadata encap decap)
+  obj-$(CONFIG_NET_ACT_TUNNEL_KEY)+= act_tunnel_key.o
+  obj-$(CONFIG_NET_SCH_FIFO)	+= sch_fifo.o
+  obj-$(CONFIG_NET_SCH_CBQ)	+= sch_cbq.o
+* Unmerged path include/uapi/linux/tc_act/tc_ife.h
+* Unmerged path include/uapi/linux/tc_act/tc_ife.h
+* Unmerged path net/sched/Kconfig
+* Unmerged path net/sched/Makefile
+diff --git a/net/sched/act_meta_skbtcindex.c b/net/sched/act_meta_skbtcindex.c
+new file mode 100644
+index 000000000000..3b35774ce890
+--- /dev/null
++++ b/net/sched/act_meta_skbtcindex.c
+@@ -0,0 +1,79 @@
++/*
++ * net/sched/act_meta_tc_index.c IFE skb->tc_index metadata module
++ *
++ *		This program is free software; you can redistribute it and/or
++ *		modify it under the terms of the GNU General Public License
++ *		as published by the Free Software Foundation; either version
++ *		2 of the License, or (at your option) any later version.
++ *
++ * copyright Jamal Hadi Salim (2016)
++ *
++*/
++
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/skbuff.h>
++#include <linux/rtnetlink.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <net/netlink.h>
++#include <net/pkt_sched.h>
++#include <uapi/linux/tc_act/tc_ife.h>
++#include <net/tc_act/tc_ife.h>
++#include <linux/rtnetlink.h>
++
++static int skbtcindex_encode(struct sk_buff *skb, void *skbdata,
++			     struct tcf_meta_info *e)
++{
++	u32 ifetc_index = skb->tc_index;
++
++	return ife_encode_meta_u16(ifetc_index, skbdata, e);
++}
++
++static int skbtcindex_decode(struct sk_buff *skb, void *data, u16 len)
++{
++	u16 ifetc_index = *(u16 *)data;
++
++	skb->tc_index = ntohs(ifetc_index);
++	return 0;
++}
++
++static int skbtcindex_check(struct sk_buff *skb, struct tcf_meta_info *e)
++{
++	return ife_check_meta_u16(skb->tc_index, e);
++}
++
++static struct tcf_meta_ops ife_skbtcindex_ops = {
++	.metaid = IFE_META_TCINDEX,
++	.metatype = NLA_U16,
++	.name = "tc_index",
++	.synopsis = "skb tc_index 16 bit metadata",
++	.check_presence = skbtcindex_check,
++	.encode = skbtcindex_encode,
++	.decode = skbtcindex_decode,
++	.get = ife_get_meta_u16,
++	.alloc = ife_alloc_meta_u16,
++	.release = ife_release_meta_gen,
++	.validate = ife_validate_meta_u16,
++	.owner = THIS_MODULE,
++};
++
++static int __init ifetc_index_init_module(void)
++{
++	return register_ife_op(&ife_skbtcindex_ops);
++}
++
++static void __exit ifetc_index_cleanup_module(void)
++{
++	unregister_ife_op(&ife_skbtcindex_ops);
++}
++
++module_init(ifetc_index_init_module);
++module_exit(ifetc_index_cleanup_module);
++
++MODULE_AUTHOR("Jamal Hadi Salim(2016)");
++MODULE_DESCRIPTION("Inter-FE skb tc_index metadata module");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_IFE_META(IFE_META_SKBTCINDEX);
