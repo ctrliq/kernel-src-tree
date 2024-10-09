@@ -1,0 +1,340 @@
+ibmvnic: Non-fatal error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author John Allen <jallen@linux.vnet.ibm.com>
+commit 8cb31cfc9448e2ce0bda899eb15f74bc0a875d90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8cb31cfc.failed
+
+Handle non-fatal error conditions. The process to do this when
+resetting the driver is to just do __ibmvnic_close followed by
+__ibmvnic_open.
+
+	Signed-off-by: John Allen <jallen@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8cb31cfc9448e2ce0bda899eb15f74bc0a875d90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+#	drivers/net/ethernet/ibm/ibmvnic.h
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 0a15141d22b3,def867aaa422..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -944,15 -1202,184 +944,81 @@@ static int ibmvnic_set_mac(struct net_d
+  	return 0;
+  }
+  
+ -/**
+ - * do_reset returns zero if we are able to keep processing reset events, or
+ - * non-zero if we hit a fatal error and must halt.
+ - */
+ -static int do_reset(struct ibmvnic_adapter *adapter,
+ -		    struct ibmvnic_rwi *rwi, u32 reset_state)
+ +static int ibmvnic_change_mtu(struct net_device *netdev, int new_mtu)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	int i, rc;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  
+ -	netif_carrier_off(netdev);
+ -	adapter->reset_reason = rwi->reset_reason;
+ +	if (new_mtu > adapter->req_mtu || new_mtu < adapter->min_mtu)
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	netdev->mtu = new_mtu;
+++=======
++ 	if (rwi->reset_reason == VNIC_RESET_MOBILITY) {
++ 		rc = ibmvnic_reenable_crq_queue(adapter);
++ 		if (rc)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_close(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_NON_FATAL) {
++ 		/* remove the closed state so when we call open it appears
++ 		 * we are coming from the probed state.
++ 		 */
++ 		adapter->state = VNIC_PROBED;
++ 
++ 		release_resources(adapter);
++ 		release_sub_crqs(adapter);
++ 		release_crq_queue(adapter);
++ 
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return 0;
++ 
++ 		/* If the adapter was in PROBE state prior to the reset,
++ 		 * exit here.
++ 		 */
++ 		if (reset_state == VNIC_PROBED)
++ 			return 0;
++ 
++ 		rc = ibmvnic_login(netdev);
++ 		if (rc) {
++ 			adapter->state = VNIC_PROBED;
++ 			return 0;
++ 		}
++ 
++ 		rtnl_lock();
++ 		rc = init_resources(adapter);
++ 		rtnl_unlock();
++ 		if (rc)
++ 			return rc;
++ 
++ 		if (reset_state == VNIC_CLOSED)
++ 			return 0;
++ 	}
++ 
+ -	rc = __ibmvnic_open(netdev);
+ -	if (rc) {
+ -		if (list_empty(&adapter->rwi_list))
+ -			adapter->state = VNIC_CLOSED;
+ -		else
+ -			adapter->state = reset_state;
+ -
+ -		return 0;
+ -	}
+ -
+ -	netif_carrier_on(netdev);
+ -
+ -	/* kick napi */
+ -	for (i = 0; i < adapter->req_rx_queues; i++)
+ -		napi_schedule(&adapter->napi[i]);
+ -
+ -	netdev_notify_peers(netdev);
+ -	return 0;
+ -}
+ -
+ -static struct ibmvnic_rwi *get_next_rwi(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct ibmvnic_rwi *rwi;
+ -
+ -	mutex_lock(&adapter->rwi_lock);
+ -
+ -	if (!list_empty(&adapter->rwi_list)) {
+ -		rwi = list_first_entry(&adapter->rwi_list, struct ibmvnic_rwi,
+ -				       list);
+ -		list_del(&rwi->list);
+ -	} else {
+ -		rwi = NULL;
+ -	}
+ -
+ -	mutex_unlock(&adapter->rwi_lock);
+ -	return rwi;
+ -}
+ -
+ -static void free_all_rwi(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct ibmvnic_rwi *rwi;
+ -
+ -	rwi = get_next_rwi(adapter);
+ -	while (rwi) {
+ -		kfree(rwi);
+ -		rwi = get_next_rwi(adapter);
+ -	}
+ -}
+ -
+ -static void __ibmvnic_reset(struct work_struct *work)
+ -{
+ -	struct ibmvnic_rwi *rwi;
+ -	struct ibmvnic_adapter *adapter;
+ -	struct net_device *netdev;
+ -	u32 reset_state;
+ -	int rc;
+ -
+ -	adapter = container_of(work, struct ibmvnic_adapter, ibmvnic_reset);
+ -	netdev = adapter->netdev;
+ -
+ -	mutex_lock(&adapter->reset_lock);
+ -	adapter->resetting = true;
+ -	reset_state = adapter->state;
+ -
+ -	rwi = get_next_rwi(adapter);
+ -	while (rwi) {
+ -		rc = do_reset(adapter, rwi, reset_state);
+ -		kfree(rwi);
+ -		if (rc)
+ -			break;
+ -
+ -		rwi = get_next_rwi(adapter);
+ -	}
+ -
+++	rc = __ibmvnic_open(netdev);
++ 	if (rc) {
+ -		free_all_rwi(adapter);
+ -		mutex_unlock(&adapter->reset_lock);
+ -		return;
+ -	}
+ -
+ -	adapter->resetting = false;
+ -	mutex_unlock(&adapter->reset_lock);
+ -}
+ -
+ -static void ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ -			  enum ibmvnic_reset_reason reason)
+ -{
+ -	struct ibmvnic_rwi *rwi, *tmp;
+ -	struct net_device *netdev = adapter->netdev;
+ -	struct list_head *entry;
+++		if (list_empty(&adapter->rwi_list))
+++			adapter->state = VNIC_CLOSED;
+++		else
+++			adapter->state = reset_state;
++ 
+ -	if (adapter->state == VNIC_REMOVING ||
+ -	    adapter->state == VNIC_REMOVED) {
+ -		netdev_dbg(netdev, "Adapter removing, skipping reset\n");
+ -		return;
+++		return 0;
++ 	}
++ 
+ -	mutex_lock(&adapter->rwi_lock);
+ -
+ -	list_for_each(entry, &adapter->rwi_list) {
+ -		tmp = list_entry(entry, struct ibmvnic_rwi, list);
+ -		if (tmp->reset_reason == reason) {
+ -			netdev_err(netdev, "Matching reset found, skipping\n");
+ -			mutex_unlock(&adapter->rwi_lock);
+ -			return;
+ -		}
+ -	}
+++	netif_carrier_on(netdev);
++ 
+ -	rwi = kzalloc(sizeof(*rwi), GFP_KERNEL);
+ -	if (!rwi) {
+ -		mutex_unlock(&adapter->rwi_lock);
+ -		ibmvnic_close(netdev);
+ -		return;
+ -	}
+++	/* kick napi */
+++	for (i = 0; i < adapter->req_rx_queues; i++)
+++		napi_schedule(&adapter->napi[i]);
++ 
+ -	rwi->reset_reason = reason;
+ -	list_add_tail(&rwi->list, &adapter->rwi_list);
+ -	mutex_unlock(&adapter->rwi_lock);
+ -	schedule_work(&adapter->ibmvnic_reset);
+++	netdev_notify_peers(netdev);
+++>>>>>>> 8cb31cfc9448 (ibmvnic: Non-fatal error handling)
+ +	return 0;
+  }
+  
+  static void ibmvnic_tx_timeout(struct net_device *dev)
+@@@ -2397,20 -2722,53 +2463,52 @@@ static void handle_error_indication(uni
+  	list_add_tail(&error_buff->list, &adapter->errors);
+  	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
+  
+ -	memset(&crq, 0, sizeof(crq));
+ -	crq.request_error_info.first = IBMVNIC_CRQ_CMD;
+ -	crq.request_error_info.cmd = REQUEST_ERROR_INFO;
+ -	crq.request_error_info.ioba = cpu_to_be32(error_buff->dma);
+ -	crq.request_error_info.len = cpu_to_be32(detail_len);
+ -	crq.request_error_info.error_id = err_crq->error_indication.error_id;
+ +	memset(&new_crq, 0, sizeof(new_crq));
+ +	new_crq.request_error_info.first = IBMVNIC_CRQ_CMD;
+ +	new_crq.request_error_info.cmd = REQUEST_ERROR_INFO;
+ +	new_crq.request_error_info.ioba = cpu_to_be32(error_buff->dma);
+ +	new_crq.request_error_info.len = cpu_to_be32(detail_len);
+ +	new_crq.request_error_info.error_id = crq->error_indication.error_id;
+  
+ -	rc = ibmvnic_send_crq(adapter, &crq);
+ -	if (rc) {
+ -		netdev_err(netdev, "failed to request error information\n");
+ -		goto err_info_fail;
+ -	}
+ +	memcpy(&inflight_cmd->crq, &crq, sizeof(crq));
+  
+ -	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ -		netdev_err(netdev, "timeout waiting for error information\n");
+ -		goto err_info_fail;
+ -	}
+ +	spin_lock_irqsave(&adapter->inflight_lock, flags);
+ +	list_add_tail(&inflight_cmd->list, &adapter->inflight);
+ +	spin_unlock_irqrestore(&adapter->inflight_lock, flags);
+  
+++<<<<<<< HEAD
+ +	ibmvnic_send_crq(adapter, &new_crq);
+++=======
++ 	return;
++ 
++ err_info_fail:
++ 	spin_lock_irqsave(&adapter->error_list_lock, flags);
++ 	list_del(&error_buff->list);
++ 	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
++ 
++ 	kfree(error_buff->buff);
++ 	kfree(error_buff);
++ }
++ 
++ static void handle_error_indication(union ibmvnic_crq *crq,
++ 				    struct ibmvnic_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 
++ 	dev_err(dev, "Firmware reports %serror id %x, cause %d\n",
++ 		crq->error_indication.flags
++ 			& IBMVNIC_FATAL_ERROR ? "FATAL " : "",
++ 		be32_to_cpu(crq->error_indication.error_id),
++ 		be16_to_cpu(crq->error_indication.error_cause));
++ 
++ 	if (be32_to_cpu(crq->error_indication.error_id))
++ 		request_error_information(adapter, crq);
++ 
++ 	if (crq->error_indication.flags & IBMVNIC_FATAL_ERROR)
++ 		ibmvnic_reset(adapter, VNIC_RESET_FATAL);
++ 	else
++ 		ibmvnic_reset(adapter, VNIC_RESET_NON_FATAL);
+++>>>>>>> 8cb31cfc9448 (ibmvnic: Non-fatal error handling)
+  }
+  
+  static void handle_change_mac_rsp(union ibmvnic_crq *crq,
+diff --cc drivers/net/ethernet/ibm/ibmvnic.h
+index 91a20189cdae,7e2300e64a47..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@@ -926,15 -913,23 +926,26 @@@ struct ibmvnic_error_buff 
+  	__be32 error_id;
+  };
+  
+ -enum vnic_state {VNIC_PROBING = 1,
+ -		 VNIC_PROBED,
+ -		 VNIC_OPENING,
+ -		 VNIC_OPEN,
+ -		 VNIC_CLOSING,
+ -		 VNIC_CLOSED,
+ -		 VNIC_REMOVING,
+ -		 VNIC_REMOVED};
+ +struct ibmvnic_fw_comp_internal {
+ +	struct ibmvnic_adapter *adapter;
+ +	int num;
+ +	struct debugfs_blob_wrapper desc_blob;
+ +	int paused;
+ +};
+  
+++<<<<<<< HEAD
+ +struct ibmvnic_inflight_cmd {
+ +	union ibmvnic_crq crq;
+++=======
++ enum ibmvnic_reset_reason {VNIC_RESET_FAILOVER = 1,
++ 			   VNIC_RESET_MOBILITY,
++ 			   VNIC_RESET_FATAL,
++ 			   VNIC_RESET_NON_FATAL,
++ 			   VNIC_RESET_TIMEOUT};
++ 
++ struct ibmvnic_rwi {
++ 	enum ibmvnic_reset_reason reset_reason;
+++>>>>>>> 8cb31cfc9448 (ibmvnic: Non-fatal error handling)
+  	struct list_head list;
+  };
+  
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.h
