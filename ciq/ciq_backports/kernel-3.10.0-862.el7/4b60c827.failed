@@ -1,0 +1,209 @@
+scsi: qla2xxx: Add fw_started flags to qpair
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add fw_started flags to qpair (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 92.68%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 4b60c82736d0e2d7f863cba1a320e89bf74a884e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4b60c827.failed
+
+Add fw_started flag to qpair to reduce cache thrash.  This reduce access
+to qla_hw_data structure by each qpair.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4b60c82736d0e2d7f863cba1a320e89bf74a884e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_isr.c
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index b9189cae77e5,e097c3331113..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -2302,6 -3207,7 +2302,10 @@@ next_check
+  	} else {
+  		ql_dbg(ql_dbg_init, vha, 0x00d3,
+  		    "Init Firmware -- success.\n");
+++<<<<<<< HEAD
+++=======
++ 		QLA_FW_STARTED(ha);
+++>>>>>>> 4b60c82736d0 (scsi: qla2xxx: Add fw_started flags to qpair)
+  	}
+  
+  	return (rval);
+@@@ -5899,6 -6840,9 +5903,12 @@@ qla2x00_try_to_stop_firmware(scsi_qla_h
+  		    "Attempting retry of stop-firmware command.\n");
+  		ret = qla2x00_stop_firmware(vha);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	QLA_FW_STOPPED(ha);
++ 	ha->flags.fw_init_done = 0;
+++>>>>>>> 4b60c82736d0 (scsi: qla2xxx: Add fw_started flags to qpair)
+  }
+  
+  int
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index d71223f09c1c,40385bc1d1fa..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -675,6 -709,8 +675,11 @@@ skip_rio
+  		    "mbx7=%xh.\n", mb[1], mb[2], mb[3], mbx);
+  
+  		ha->isp_ops->fw_dump(vha, 1);
+++<<<<<<< HEAD
+++=======
++ 		ha->flags.fw_init_done = 0;
++ 		QLA_FW_STOPPED(ha);
+++>>>>>>> 4b60c82736d0 (scsi: qla2xxx: Add fw_started flags to qpair)
+  
+  		if (IS_FWI2_CAPABLE(ha)) {
+  			if (mb[1] == 0 && mb[2] == 0) {
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 7a27b61e2d53,0ce0d500982a..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2044,10 -3079,30 +2044,34 @@@ int qlt_xmit_response(struct qla_tgt_cm
+  		return res;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+++=======
++ 	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
++ 
++ 	if (xmit_type == QLA_TGT_XMIT_STATUS)
++ 		vha->tgt_counters.core_qla_snd_status++;
++ 	else
++ 		vha->tgt_counters.core_qla_que_buf++;
++ 
++ 	if (!qpair->fw_started || cmd->reset_count != vha->hw->chip_reset) {
++ 		/*
++ 		 * Either the port is not online or this request was from
++ 		 * previous life, just abort the processing.
++ 		 */
++ 		cmd->state = QLA_TGT_STATE_PROCESSED;
++ 		qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
++ 		ql_dbg(ql_dbg_async, vha, 0xe101,
++ 			"RESET-RSP online/active/old-count/new-count = %d/%d/%d/%d.\n",
++ 			vha->flags.online, qla2x00_reset_active(vha),
++ 			cmd->reset_count, vha->hw->chip_reset);
++ 		spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
++ 		return 0;
++ 	}
+++>>>>>>> 4b60c82736d0 (scsi: qla2xxx: Add fw_started flags to qpair)
+  
+  	/* Does F/W have an IOCBs for this request */
+ -	res = qlt_check_reserve_free_req(qpair, full_req_cnt);
+ +	res = qlt_check_reserve_free_req(vha, full_req_cnt);
+  	if (unlikely(res))
+  		goto out_unmap_unlock;
+  
+@@@ -2137,11 -3206,11 +2161,10 @@@ int qlt_rdy_to_xfer(struct qla_tgt_cmd 
+  {
+  	struct ctio7_to_24xx *pkt;
+  	struct scsi_qla_host *vha = cmd->vha;
+- 	struct qla_hw_data *ha = vha->hw;
+  	struct qla_tgt *tgt = cmd->tgt;
+  	struct qla_tgt_prm prm;
+ -	unsigned long flags = 0;
+ +	unsigned long flags;
+  	int res = 0;
+ -	struct qla_qpair *qpair = cmd->qpair;
+  
+  	memset(&prm, 0, sizeof(prm));
+  	prm.cmd = cmd;
+@@@ -2160,16 -3222,36 +2183,33 @@@
+  	if (qlt_pci_map_calc_cnt(&prm) != 0)
+  		return -EAGAIN;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+++=======
++ 	if (!qpair->fw_started || (cmd->reset_count != vha->hw->chip_reset) ||
++ 	    (cmd->sess && cmd->sess->deleted)) {
++ 		/*
++ 		 * Either the port is not online or this request was from
++ 		 * previous life, just abort the processing.
++ 		 */
++ 		cmd->state = QLA_TGT_STATE_NEED_DATA;
++ 		qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
++ 		ql_dbg(ql_dbg_async, vha, 0xe102,
++ 			"RESET-XFR online/active/old-count/new-count = %d/%d/%d/%d.\n",
++ 			vha->flags.online, qla2x00_reset_active(vha),
++ 			cmd->reset_count, vha->hw->chip_reset);
++ 		return 0;
++ 	}
+++>>>>>>> 4b60c82736d0 (scsi: qla2xxx: Add fw_started flags to qpair)
+  
+ -	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+  	/* Does F/W have an IOCBs for this request */
+ -	res = qlt_check_reserve_free_req(qpair, prm.req_cnt);
+ +	res = qlt_check_reserve_free_req(vha, prm.req_cnt);
+  	if (res != 0)
+  		goto out_unlock_free_unmap;
+ -	if (cmd->se_cmd.prot_op)
+ -		res = qlt_build_ctio_crc2_pkt(qpair, &prm);
+ -	else
+ -		res = qlt_24xx_build_ctio_pkt(qpair, &prm);
+  
+ -	if (unlikely(res != 0)) {
+ -		qpair->req->cnt += prm.req_cnt;
+ +	res = qlt_24xx_build_ctio_pkt(&prm, vha);
+ +	if (unlikely(res != 0))
+  		goto out_unlock_free_unmap;
+ -	}
+ -
+  	pkt = (struct ctio7_to_24xx *)prm.pkt;
+  	pkt->u.status0.flags |= cpu_to_le16(CTIO7_FLAGS_DATA_OUT |
+  	    CTIO7_FLAGS_STATUS_MODE_0);
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 3f28536dc812..bc33e25c0491 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2903,6 +2903,7 @@ struct qla_qpair {
+ 	/* move vha->flags.difdix_supported here */
+ 	uint32_t difdix_supported:1;
+ 	uint32_t delete_in_progress:1;
++	uint32_t fw_started:1;
+ 
+ 	uint16_t id;			/* qp number used with FW */
+ 	uint16_t num_active_cmd;	/* cmds down at firmware */
+@@ -3737,6 +3738,26 @@ struct qla2_sgx {
+ 	srb_t			*sp;
+ };
+ 
++#define QLA_FW_STARTED(_ha) {			\
++	int i;					\
++	_ha->flags.fw_started = 1;		\
++	_ha->base_qpair->fw_started = 1;	\
++	for (i = 0; i < _ha->max_qpairs; i++) {	\
++	if (_ha->queue_pair_map[i])	\
++	_ha->queue_pair_map[i]->fw_started = 1;	\
++	}					\
++}
++
++#define QLA_FW_STOPPED(_ha) {			\
++	int i;					\
++	_ha->flags.fw_started = 0;		\
++	_ha->base_qpair->fw_started = 0;	\
++	for (i = 0; i < _ha->max_qpairs; i++) {	\
++	if (_ha->queue_pair_map[i])	\
++	_ha->queue_pair_map[i]->fw_started = 0;	\
++	}					\
++}
++
+ /*
+  * Macros to help code, maintain, etc.
+  */
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
