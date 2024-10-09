@@ -1,0 +1,245 @@
+fsnotify: convert notification_mutex to a spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit c21dbe20f606219fe54faf555b7bc5565487c58f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c21dbe20.failed
+
+notification_mutex is used to protect the list of pending events.  As such
+there's no reason to use a sleeping lock for it.  Convert it to a
+spinlock.
+
+[jack@suse.cz: fixed version]
+  Link: http://lkml.kernel.org/r/1474031567-1831-1-git-send-email-jack@suse.cz
+Link: http://lkml.kernel.org/r/1473797711-14111-5-git-send-email-jack@suse.cz
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Lino Sanfilippo <LinoSanfilippo@gmx.de>
+	Tested-by: Guenter Roeck <linux@roeck-us.net>
+	Cc: Miklos Szeredi <mszeredi@redhat.com>
+	Cc: Eric Paris <eparis@redhat.com>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c21dbe20f606219fe54faf555b7bc5565487c58f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/group.c
+#	fs/notify/notification.c
+diff --cc fs/notify/group.c
+index d16b62cb2854,fbe3cbebec16..000000000000
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@@ -40,6 -40,17 +40,20 @@@ static void fsnotify_final_destroy_grou
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Stop queueing new events for this group. Once this function returns
++  * fsnotify_add_event() will not add any new events to the group's queue.
++  */
++ void fsnotify_group_stop_queueing(struct fsnotify_group *group)
++ {
++ 	spin_lock(&group->notification_lock);
++ 	group->shutdown = true;
++ 	spin_unlock(&group->notification_lock);
++ }
++ 
++ /*
+++>>>>>>> c21dbe20f606 (fsnotify: convert notification_mutex to a spinlock)
+   * Trying to get rid of a group. Remove all marks, flush all events and release
+   * the group reference.
+   * Note that another thread calling fsnotify_clear_marks_by_group() may still
+diff --cc fs/notify/notification.c
+index d93c66f3aac1,8a7a8cd041e8..000000000000
+--- a/fs/notify/notification.c
++++ b/fs/notify/notification.c
+@@@ -94,8 -96,13 +95,16 @@@ int fsnotify_add_event(struct fsnotify_
+  
+  	pr_debug("%s: group=%p event=%p\n", __func__, group, event);
+  
+- 	mutex_lock(&group->notification_mutex);
++ 	spin_lock(&group->notification_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (group->shutdown) {
++ 		spin_unlock(&group->notification_lock);
++ 		return 2;
++ 	}
++ 
+++>>>>>>> c21dbe20f606 (fsnotify: convert notification_mutex to a spinlock)
+  	if (group->q_len >= group->max_events) {
+  		ret = 2;
+  		/* Queue overflow event only if it isn't already queued */
+diff --git a/fs/notify/fanotify/fanotify_user.c b/fs/notify/fanotify/fanotify_user.c
+index 542be39911d4..b52f63e77712 100644
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@ -49,12 +49,13 @@ struct kmem_cache *fanotify_perm_event_cachep __read_mostly;
+  * enough to fit in "count". Return an error pointer if the count
+  * is not large enough.
+  *
+- * Called with the group->notification_mutex held.
++ * Called with the group->notification_lock held.
+  */
+ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 					    size_t count)
+ {
+-	BUG_ON(!mutex_is_locked(&group->notification_mutex));
++	BUG_ON(IS_ENABLED(CONFIG_SMP) &&
++	       !spin_is_locked(&group->notification_lock));
+ 
+ 	pr_debug("%s: group=%p count=%zd\n", __func__, group, count);
+ 
+@@ -64,7 +65,7 @@ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 	if (FAN_EVENT_METADATA_LEN > count)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/* held the notification_mutex the whole time, so this is the
++	/* held the notification_lock the whole time, so this is the
+ 	 * same event we peeked above */
+ 	return fsnotify_remove_first_event(group);
+ }
+@@ -244,10 +245,10 @@ static unsigned int fanotify_poll(struct file *file, poll_table *wait)
+ 	int ret = 0;
+ 
+ 	poll_wait(file, &group->notification_waitq, wait);
+-	mutex_lock(&group->notification_mutex);
++	spin_lock(&group->notification_lock);
+ 	if (!fsnotify_notify_queue_is_empty(group))
+ 		ret = POLLIN | POLLRDNORM;
+-	mutex_unlock(&group->notification_mutex);
++	spin_unlock(&group->notification_lock);
+ 
+ 	return ret;
+ }
+@@ -268,9 +269,9 @@ static ssize_t fanotify_read(struct file *file, char __user *buf,
+ 
+ 	add_wait_queue(&group->notification_waitq, &wait);
+ 	while (1) {
+-		mutex_lock(&group->notification_mutex);
++		spin_lock(&group->notification_lock);
+ 		kevent = get_one_event(group, count);
+-		mutex_unlock(&group->notification_mutex);
++		spin_unlock(&group->notification_lock);
+ 
+ 		if (IS_ERR(kevent)) {
+ 			ret = PTR_ERR(kevent);
+@@ -387,17 +388,17 @@ static int fanotify_release(struct inode *ignored, struct file *file)
+ 	 * dequeue them and set the response. They will be freed once the
+ 	 * response is consumed and fanotify_get_response() returns.
+ 	 */
+-	mutex_lock(&group->notification_mutex);
++	spin_lock(&group->notification_lock);
+ 	while (!fsnotify_notify_queue_is_empty(group)) {
+ 		fsn_event = fsnotify_remove_first_event(group);
+ 		if (!(fsn_event->mask & FAN_ALL_PERM_EVENTS)) {
+-			mutex_unlock(&group->notification_mutex);
++			spin_unlock(&group->notification_lock);
+ 			fsnotify_destroy_event(group, fsn_event);
+-			mutex_lock(&group->notification_mutex);
++			spin_lock(&group->notification_lock);
+ 		} else
+ 			FANOTIFY_PE(fsn_event)->response = FAN_ALLOW;
+ 	}
+-	mutex_unlock(&group->notification_mutex);
++	spin_unlock(&group->notification_lock);
+ 
+ 	/* Response for all permission events it set, wakeup waiters */
+ 	wake_up(&group->fanotify_data.access_waitq);
+@@ -423,10 +424,10 @@ static long fanotify_ioctl(struct file *file, unsigned int cmd, unsigned long ar
+ 
+ 	switch (cmd) {
+ 	case FIONREAD:
+-		mutex_lock(&group->notification_mutex);
++		spin_lock(&group->notification_lock);
+ 		list_for_each_entry(fsn_event, &group->notification_list, list)
+ 			send_len += FAN_EVENT_METADATA_LEN;
+-		mutex_unlock(&group->notification_mutex);
++		spin_unlock(&group->notification_lock);
+ 		ret = put_user(send_len, (int __user *) p);
+ 		break;
+ 	}
+* Unmerged path fs/notify/group.c
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 92f2963bdb0a..7678752144f6 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -115,10 +115,10 @@ static unsigned int inotify_poll(struct file *file, poll_table *wait)
+ 	int ret = 0;
+ 
+ 	poll_wait(file, &group->notification_waitq, wait);
+-	mutex_lock(&group->notification_mutex);
++	spin_lock(&group->notification_lock);
+ 	if (!fsnotify_notify_queue_is_empty(group))
+ 		ret = POLLIN | POLLRDNORM;
+-	mutex_unlock(&group->notification_mutex);
++	spin_unlock(&group->notification_lock);
+ 
+ 	return ret;
+ }
+@@ -138,7 +138,7 @@ static int round_event_name_len(struct fsnotify_event *fsn_event)
+  * enough to fit in "count". Return an error pointer if
+  * not large enough.
+  *
+- * Called with the group->notification_mutex held.
++ * Called with the group->notification_lock held.
+  */
+ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 					    size_t count)
+@@ -157,7 +157,7 @@ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
+ 	if (event_size > count)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/* held the notification_mutex the whole time, so this is the
++	/* held the notification_lock the whole time, so this is the
+ 	 * same event we peeked above */
+ 	fsnotify_remove_first_event(group);
+ 
+@@ -234,9 +234,9 @@ static ssize_t inotify_read(struct file *file, char __user *buf,
+ 
+ 	add_wait_queue(&group->notification_waitq, &wait);
+ 	while (1) {
+-		mutex_lock(&group->notification_mutex);
++		spin_lock(&group->notification_lock);
+ 		kevent = get_one_event(group, count);
+-		mutex_unlock(&group->notification_mutex);
++		spin_unlock(&group->notification_lock);
+ 
+ 		pr_debug("%s: group=%p kevent=%p\n", __func__, group, kevent);
+ 
+@@ -300,13 +300,13 @@ static long inotify_ioctl(struct file *file, unsigned int cmd,
+ 
+ 	switch (cmd) {
+ 	case FIONREAD:
+-		mutex_lock(&group->notification_mutex);
++		spin_lock(&group->notification_lock);
+ 		list_for_each_entry(fsn_event, &group->notification_list,
+ 				    list) {
+ 			send_len += sizeof(struct inotify_event);
+ 			send_len += round_event_name_len(fsn_event);
+ 		}
+-		mutex_unlock(&group->notification_mutex);
++		spin_unlock(&group->notification_lock);
+ 		ret = put_user(send_len, (int __user *) p);
+ 		break;
+ 	}
+* Unmerged path fs/notify/notification.c
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index 6b41e8a76df9..0a2cc82ba483 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -135,7 +135,7 @@ struct fsnotify_group {
+ 	const struct fsnotify_ops *ops;	/* how this group handles things */
+ 
+ 	/* needed to send notification to userspace */
+-	struct mutex notification_mutex;	/* protect the notification_list */
++	spinlock_t notification_lock;		/* protect the notification_list */
+ 	struct list_head notification_list;	/* list of event_holder this group needs to send to userspace */
+ 	wait_queue_head_t notification_waitq;	/* read() on the notification file blocks on this waitq */
+ 	unsigned int q_len;			/* events on the queue */
