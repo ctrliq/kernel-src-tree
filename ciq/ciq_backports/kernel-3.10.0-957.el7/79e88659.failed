@@ -1,0 +1,173 @@
+crypto: algif - add and use sock_kzfree_s() instead of memzero_explicit()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <dborkman@redhat.com>
+commit 79e886599e6416d0de26e8562e4464577d081c3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/79e88659.failed
+
+Commit e1bd95bf7c25 ("crypto: algif - zeroize IV buffer") and
+2a6af25befd0 ("crypto: algif - zeroize message digest buffer")
+added memzero_explicit() calls on buffers that are later on
+passed back to sock_kfree_s().
+
+This is a discussed follow-up that, instead, extends the sock
+API and adds sock_kzfree_s(), which internally uses kzfree()
+instead of kfree() for passing the buffers back to slab.
+
+Having sock_kzfree_s() allows to keep the changes more minimal
+by just having a drop-in replacement instead of adding
+memzero_explicit() calls everywhere before sock_kfree_s().
+
+In kzfree(), the compiler is not allowed to optimize the memset()
+away and thus there's no need for memzero_explicit(). Both,
+sock_kfree_s() and sock_kzfree_s() are wrappers for
+__sock_kfree_s() and call into kfree() resp. kzfree(); here,
+__sock_kfree_s() needs to be explicitly inlined as we want the
+compiler to optimize the call and condition away and thus it
+produces e.g. on x86_64 the _same_ assembler output for
+sock_kfree_s() before and after, and thus also allows for
+avoiding code duplication.
+
+	Cc: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 79e886599e6416d0de26e8562e4464577d081c3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/algif_skcipher.c
+#	include/net/sock.h
+diff --cc crypto/algif_skcipher.c
+index 5c6dcff232c4,34389964000d..000000000000
+--- a/crypto/algif_skcipher.c
++++ b/crypto/algif_skcipher.c
+@@@ -690,7 -566,7 +690,11 @@@ static void skcipher_sock_destruct(stru
+  	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(&ctx->req);
+  
+  	skcipher_free_sgl(sk);
+++<<<<<<< HEAD
+ +	sock_kfree_s(sk, ctx->iv, crypto_ablkcipher_ivsize(tfm));
+++=======
++ 	sock_kzfree_s(sk, ctx->iv, crypto_ablkcipher_ivsize(tfm));
+++>>>>>>> 79e886599e64 (crypto: algif - add and use sock_kzfree_s() instead of memzero_explicit())
+  	sock_kfree_s(sk, ctx, ctx->len);
+  	af_alg_release_parent(sk);
+  }
+diff --cc include/net/sock.h
+index 91144cd664b8,37d6cc5dcf33..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -1625,30 -1573,23 +1625,44 @@@ extern void			sock_efree(struct sk_buf
+  #ifdef CONFIG_INET
+  void sock_edemux(struct sk_buff *skb);
+  #else
+ -#define sock_edemux(skb) sock_efree(skb)
+ +#define sock_edemux sock_efree
+  #endif
+  
+ -int sock_setsockopt(struct socket *sock, int level, int op,
+ -		    char __user *optval, unsigned int optlen);
+ -
+ +extern int			sock_setsockopt(struct socket *sock, int level,
+ +						int op, char __user *optval,
+ +						unsigned int optlen);
+ +
+++<<<<<<< HEAD
+ +extern int			sock_getsockopt(struct socket *sock, int level,
+ +						int op, char __user *optval,
+ +						int __user *optlen);
+ +extern struct sk_buff		*sock_alloc_send_skb(struct sock *sk,
+ +						     unsigned long size,
+ +						     int noblock,
+ +						     int *errcode);
+ +extern struct sk_buff		*sock_alloc_send_pskb(struct sock *sk,
+ +						      unsigned long header_len,
+ +						      unsigned long data_len,
+ +						      int noblock,
+ +						      int *errcode,
+ +						      int max_page_order);
+ +extern void *sock_kmalloc(struct sock *sk, int size,
+ +			  gfp_t priority);
+ +extern void sock_kfree_s(struct sock *sk, void *mem, int size);
+ +extern void sk_send_sigurg(struct sock *sk);
+++=======
++ int sock_getsockopt(struct socket *sock, int level, int op,
++ 		    char __user *optval, int __user *optlen);
++ struct sk_buff *sock_alloc_send_skb(struct sock *sk, unsigned long size,
++ 				    int noblock, int *errcode);
++ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
++ 				     unsigned long data_len, int noblock,
++ 				     int *errcode, int max_page_order);
++ void *sock_kmalloc(struct sock *sk, int size, gfp_t priority);
++ void sock_kfree_s(struct sock *sk, void *mem, int size);
++ void sock_kzfree_s(struct sock *sk, void *mem, int size);
++ void sk_send_sigurg(struct sock *sk);
+++>>>>>>> 79e886599e64 (crypto: algif - add and use sock_kzfree_s() instead of memzero_explicit())
+  
+  /*
+   * Functions to fill in entries in struct proto_ops when a protocol
+diff --git a/crypto/algif_hash.c b/crypto/algif_hash.c
+index 7e8586938f53..6e0f444bd612 100644
+--- a/crypto/algif_hash.c
++++ b/crypto/algif_hash.c
+@@ -400,10 +400,8 @@ static void hash_sock_destruct(struct sock *sk)
+ 	struct alg_sock *ask = alg_sk(sk);
+ 	struct hash_ctx *ctx = ask->private;
+ 
+-	memzero_explicit(ctx->result,
+-		     crypto_ahash_digestsize(crypto_ahash_reqtfm(&ctx->req)));
+-	sock_kfree_s(sk, ctx->result,
+-		     crypto_ahash_digestsize(crypto_ahash_reqtfm(&ctx->req)));
++	sock_kzfree_s(sk, ctx->result,
++		      crypto_ahash_digestsize(crypto_ahash_reqtfm(&ctx->req)));
+ 	sock_kfree_s(sk, ctx, ctx->len);
+ 	af_alg_release_parent(sk);
+ }
+* Unmerged path crypto/algif_skcipher.c
+* Unmerged path include/net/sock.h
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 87b776a0fd23..acc3e4e99b9f 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1770,18 +1770,34 @@ void *sock_kmalloc(struct sock *sk, int size, gfp_t priority)
+ }
+ EXPORT_SYMBOL(sock_kmalloc);
+ 
+-/*
+- * Free an option memory block.
++/* Free an option memory block. Note, we actually want the inline
++ * here as this allows gcc to detect the nullify and fold away the
++ * condition entirely.
+  */
+-void sock_kfree_s(struct sock *sk, void *mem, int size)
++static inline void __sock_kfree_s(struct sock *sk, void *mem, int size,
++				  const bool nullify)
+ {
+ 	if (WARN_ON_ONCE(!mem))
+ 		return;
+-	kfree(mem);
++	if (nullify)
++		kzfree(mem);
++	else
++		kfree(mem);
+ 	atomic_sub(size, &sk->sk_omem_alloc);
+ }
++
++void sock_kfree_s(struct sock *sk, void *mem, int size)
++{
++	__sock_kfree_s(sk, mem, size, false);
++}
+ EXPORT_SYMBOL(sock_kfree_s);
+ 
++void sock_kzfree_s(struct sock *sk, void *mem, int size)
++{
++	__sock_kfree_s(sk, mem, size, true);
++}
++EXPORT_SYMBOL(sock_kzfree_s);
++
+ /* It is almost wait_for_tcp_memory minus release_sock/lock_sock.
+    I think, these locks should be removed for datagram sockets.
+  */
