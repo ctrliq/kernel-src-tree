@@ -1,0 +1,98 @@
+xfrm: move xfrm_garbage_collect out of xfrm_policy_flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit 138437f591dd9a42d53c6fed1a3c85e02678851c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/138437f5.failed
+
+Now we will force to do garbage collection if any policy removed in
+xfrm_policy_flush(). But during xfrm_net_exit(). We call flow_cache_fini()
+first and set set fc->percpu to NULL. Then after we call xfrm_policy_fini()
+-> frxm_policy_flush() -> flow_cache_flush(), we will get NULL pointer
+dereference when check percpu_empty. The code path looks like:
+
+flow_cache_fini()
+  - fc->percpu = NULL
+xfrm_policy_fini()
+  - xfrm_policy_flush()
+    - xfrm_garbage_collect()
+      - flow_cache_flush()
+        - flow_cache_percpu_empty()
+	  - fcp = per_cpu_ptr(fc->percpu, cpu)
+
+To reproduce, just add ipsec in netns and then remove the netns.
+
+v2:
+As Xin Long suggested, since only two other places need to call it. move
+xfrm_garbage_collect() outside xfrm_policy_flush().
+
+v3:
+Fix subject mismatch after v2 fix.
+
+Fixes: 35db06912189 ("xfrm: do the garbage collection after flushing policy")
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Reviewed-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 138437f591dd9a42d53c6fed1a3c85e02678851c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/key/af_key.c
+#	net/xfrm/xfrm_policy.c
+diff --cc net/key/af_key.c
+index 1a0fd71903fe,5103f92e2eb0..000000000000
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@@ -2722,13 -2752,11 +2722,19 @@@ static int pfkey_spdflush(struct sock *
+  {
+  	struct net *net = sock_net(sk);
+  	struct km_event c;
+ +	struct xfrm_audit audit_info;
+  	int err, err2;
+  
+++<<<<<<< HEAD
+ +	audit_info.loginuid = audit_get_loginuid(current);
+ +	audit_info.sessionid = audit_get_sessionid(current);
+ +	audit_info.secid = 0;
+ +	err = xfrm_policy_flush(net, XFRM_POLICY_TYPE_MAIN, &audit_info);
+++=======
++ 	err = xfrm_policy_flush(net, XFRM_POLICY_TYPE_MAIN, true);
++ 	if (!err)
++ 		xfrm_garbage_collect(net);
+++>>>>>>> 138437f591dd (xfrm: move xfrm_garbage_collect out of xfrm_policy_flush)
+  	err2 = unicast_flush_resp(sk, hdr);
+  	if (err || err2) {
+  		if (err == -ESRCH) /* empty table - old silent behavior */
+diff --cc net/xfrm/xfrm_policy.c
+index 4f5104bca031,643a18f72032..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -993,7 -1005,7 +993,11 @@@ int xfrm_policy_flush(struct net *net, 
+  	if (!cnt)
+  		err = -ESRCH;
+  out:
+++<<<<<<< HEAD
+ +	write_unlock_bh(&net->xfrm_policy_lock);
+++=======
++ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+++>>>>>>> 138437f591dd (xfrm: move xfrm_garbage_collect out of xfrm_policy_flush)
+  	return err;
+  }
+  EXPORT_SYMBOL(xfrm_policy_flush);
+* Unmerged path net/key/af_key.c
+* Unmerged path net/xfrm/xfrm_policy.c
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index 924f30187173..7eb2d9fb2f14 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -1970,6 +1970,7 @@ static int xfrm_flush_policy(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			return 0;
+ 		return err;
+ 	}
++	xfrm_garbage_collect(net);
+ 
+ 	c.data.type = type;
+ 	c.event = nlh->nlmsg_type;
