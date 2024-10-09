@@ -1,0 +1,246 @@
+sysfs, kernfs: add sysfs_dirent->s_attr.size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 471bd7b78bd56c580e91e00a0f656ca922ab3b3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/471bd7b7.failed
+
+sysfs sets the size of regular files unconditionally at PAGE_SIZE and
+takes the size of bin files from bin_attribute.  The latter is a
+pretty bad interface which forces bin_attribute users to create a
+separate copy of bin_attribute for each instance of the file -
+e.g. pci resource files.
+
+Add sysfs_dirent->s_attr.size so that the size can be specified
+separately.  This unifies inode init paths of ATTR and BIN_ATTR
+identical and allows for generic size handling for kernfs.
+
+Unfortunately, this grows the size of sysfs_dirent by sizeof(loff_t).
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 471bd7b78bd56c580e91e00a0f656ca922ab3b3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+#	fs/sysfs/inode.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,0b0cec8e9d8f..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -483,77 -875,114 +483,122 @@@ void sysfs_notify(struct kobject *k, co
+  }
+  EXPORT_SYMBOL_GPL(sysfs_notify);
+  
+ -const struct file_operations kernfs_file_operations = {
+ -	.read		= kernfs_file_read,
+ -	.write		= kernfs_file_write,
+ +const struct file_operations sysfs_file_operations = {
+ +	.read		= sysfs_read_file,
+ +	.write		= sysfs_write_file,
+  	.llseek		= generic_file_llseek,
+ -	.mmap		= kernfs_file_mmap,
+ -	.open		= kernfs_file_open,
+ -	.release	= kernfs_file_release,
+ -	.poll		= kernfs_file_poll,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_empty = {
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_ro = {
+ -	.seq_show	= sysfs_kf_seq_show,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_file_kfops_wo = {
+ -	.write		= sysfs_kf_write,
+ +	.open		= sysfs_open_file,
+ +	.release	= sysfs_release,
+ +	.poll		= sysfs_poll,
+  };
+  
+ -static const struct kernfs_ops sysfs_file_kfops_rw = {
+ -	.seq_show	= sysfs_kf_seq_show,
+ -	.write		= sysfs_kf_write,
+ -};
+ -
+ -static const struct kernfs_ops sysfs_bin_kfops_ro = {
+ -	.read		= sysfs_kf_bin_read,
+ -};
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+ +{
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+  
+ -static const struct kernfs_ops sysfs_bin_kfops_wo = {
+ -	.write		= sysfs_kf_bin_write,
+ -};
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+ +	}
+  
+ -static const struct kernfs_ops sysfs_bin_kfops_rw = {
+ -	.read		= sysfs_kf_bin_read,
+ -	.write		= sysfs_kf_bin_write,
+ -	.mmap		= sysfs_kf_bin_mmap,
+ -};
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+ +
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs namespace attribute operation for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +	}
+ +	*pns = ns;
+ +	return err;
+ +}
+  
+ -int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
+ -			   const struct attribute *attr, int type,
+ -			   umode_t amode, const void *ns)
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+  {
+  	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+ -	const struct kernfs_ops *ops;
+  	struct sysfs_addrm_cxt acxt;
+  	struct sysfs_dirent *sd;
+++<<<<<<< HEAD
+ +	const void *ns;
+ +	int rc;
+ +
+ +	rc = sysfs_attr_ns(dir_sd->s_dir.kobj, attr, &ns);
+ +	if (rc)
+ +		return rc;
+++=======
++ 	loff_t size;
++ 	int rc;
++ 
++ 	if (type == SYSFS_KOBJ_ATTR) {
++ 		struct kobject *kobj = dir_sd->priv;
++ 		const struct sysfs_ops *sysfs_ops = kobj->ktype->sysfs_ops;
++ 
++ 		/* every kobject with an attribute needs a ktype assigned */
++ 		if (WARN(!sysfs_ops, KERN_ERR
++ 			 "missing sysfs attribute operations for kobject: %s\n",
++ 			 kobject_name(kobj)))
++ 			return -EINVAL;
++ 
++ 		if (sysfs_ops->show && sysfs_ops->store)
++ 			ops = &sysfs_file_kfops_rw;
++ 		else if (sysfs_ops->show)
++ 			ops = &sysfs_file_kfops_ro;
++ 		else if (sysfs_ops->store)
++ 			ops = &sysfs_file_kfops_wo;
++ 		else
++ 			ops = &sysfs_file_kfops_empty;
++ 
++ 		size = PAGE_SIZE;
++ 	} else {
++ 		struct bin_attribute *battr = (void *)attr;
++ 
++ 		if ((battr->read && battr->write) || battr->mmap)
++ 			ops = &sysfs_bin_kfops_rw;
++ 		else if (battr->read)
++ 			ops = &sysfs_bin_kfops_ro;
++ 		else if (battr->write)
++ 			ops = &sysfs_bin_kfops_wo;
++ 		else
++ 			ops = &sysfs_file_kfops_empty;
++ 
++ 		size = battr->size;
++ 	}
+++>>>>>>> 471bd7b78bd5 (sysfs, kernfs: add sysfs_dirent->s_attr.size)
+  
+  	sd = sysfs_new_dirent(attr->name, mode, type);
+  	if (!sd)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	sd->s_attr.ops = ops;
++ 	sd->s_attr.size = size;
+++>>>>>>> 471bd7b78bd5 (sysfs, kernfs: add sysfs_dirent->s_attr.size)
+  	sd->s_ns = ns;
+ -	sd->priv = (void *)attr;
+ +	sd->s_attr.attr = (void *)attr;
+  	sysfs_dirent_init_lockdep(sd);
+  
+ -	/*
+ -	 * sd->s_attr.ops is accesible only while holding active ref.  We
+ -	 * need to know whether some ops are implemented outside active
+ -	 * ref.  Cache their existence in flags.
+ -	 */
+ -	if (ops->seq_show)
+ -		sd->s_flags |= SYSFS_FLAG_HAS_SEQ_SHOW;
+ -	if (ops->mmap)
+ -		sd->s_flags |= SYSFS_FLAG_HAS_MMAP;
+ -
+ -	sysfs_addrm_start(&acxt);
+ -	rc = sysfs_add_one(&acxt, sd, dir_sd);
+ +	sysfs_addrm_start(&acxt, dir_sd);
+ +	rc = sysfs_add_one(&acxt, sd);
+  	sysfs_addrm_finish(&acxt);
+  
+  	if (rc)
+diff --cc fs/sysfs/inode.c
+index 15a606d56f5d,037a8925f56e..000000000000
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@@ -252,13 -269,9 +250,19 @@@ static void sysfs_init_inode(struct sys
+  		inode->i_fop = &sysfs_dir_operations;
+  		break;
+  	case SYSFS_KOBJ_ATTR:
+++<<<<<<< HEAD
+ +		inode->i_size = PAGE_SIZE;
+ +		inode->i_fop = &sysfs_file_operations;
+ +		break;
+ +	case SYSFS_KOBJ_BIN_ATTR:
+ +		bin_attr = sd->s_bin_attr.bin_attr;
+ +		inode->i_size = bin_attr->size;
+ +		inode->i_fop = &bin_fops;
+++=======
++ 	case SYSFS_KOBJ_BIN_ATTR:
++ 		inode->i_size = sd->s_attr.size;
++ 		inode->i_fop = &kernfs_file_operations;
+++>>>>>>> 471bd7b78bd5 (sysfs, kernfs: add sysfs_dirent->s_attr.size)
+  		break;
+  	case SYSFS_KOBJ_LINK:
+  		inode->i_op = &sysfs_symlink_inode_operations;
+* Unmerged path fs/sysfs/file.c
+* Unmerged path fs/sysfs/inode.c
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index e18c3f38727c..0ac1dacc4ac9 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -31,6 +31,7 @@ struct sysfs_elem_symlink {
+ struct sysfs_elem_attr {
+ 	struct attribute	*attr;
+ 	struct sysfs_open_dirent *open;
++	loff_t			size;
+ };
+ 
+ struct sysfs_elem_bin_attr {
