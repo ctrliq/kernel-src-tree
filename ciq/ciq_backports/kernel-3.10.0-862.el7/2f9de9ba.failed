@@ -1,0 +1,193 @@
+ibmvnic: Only retrieve error info if present
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 2f9de9bac625ae08e9ea132e8dc08cfbe9fb67d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2f9de9ba.failed
+
+When handling a fatal error in the driver, there can be additional
+error information provided by the vios. This information is not
+always present, so only retrieve the additional error information
+when present.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f9de9bac625ae08e9ea132e8dc08cfbe9fb67d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index a82f95caef8d,cc34bf9be405..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -2281,72 -2361,16 +2281,75 @@@ static void handle_error_info_rsp(unio
+  	kfree(error_buff);
+  }
+  
+++<<<<<<< HEAD
+ +static void handle_dump_size_rsp(union ibmvnic_crq *crq,
+ +				 struct ibmvnic_adapter *adapter)
+ +{
+ +	int len = be32_to_cpu(crq->request_dump_size_rsp.len);
+ +	struct ibmvnic_inflight_cmd *inflight_cmd;
+ +	struct device *dev = &adapter->vdev->dev;
+ +	union ibmvnic_crq newcrq;
+ +	unsigned long flags;
+ +
+ +	/* allocate and map buffer */
+ +	adapter->dump_data = kmalloc(len, GFP_KERNEL);
+ +	if (!adapter->dump_data) {
+ +		complete(&adapter->fw_done);
+ +		return;
+ +	}
+ +
+ +	adapter->dump_data_token = dma_map_single(dev, adapter->dump_data, len,
+ +						  DMA_FROM_DEVICE);
+ +
+ +	if (dma_mapping_error(dev, adapter->dump_data_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(dev, "Couldn't map dump data\n");
+ +		kfree(adapter->dump_data);
+ +		complete(&adapter->fw_done);
+ +		return;
+ +	}
+ +
+ +	inflight_cmd = kmalloc(sizeof(*inflight_cmd), GFP_ATOMIC);
+ +	if (!inflight_cmd) {
+ +		dma_unmap_single(dev, adapter->dump_data_token, len,
+ +				 DMA_FROM_DEVICE);
+ +		kfree(adapter->dump_data);
+ +		complete(&adapter->fw_done);
+ +		return;
+ +	}
+ +
+ +	memset(&newcrq, 0, sizeof(newcrq));
+ +	newcrq.request_dump.first = IBMVNIC_CRQ_CMD;
+ +	newcrq.request_dump.cmd = REQUEST_DUMP;
+ +	newcrq.request_dump.ioba = cpu_to_be32(adapter->dump_data_token);
+ +	newcrq.request_dump.len = cpu_to_be32(adapter->dump_data_size);
+ +
+ +	memcpy(&inflight_cmd->crq, &newcrq, sizeof(newcrq));
+ +
+ +	spin_lock_irqsave(&adapter->inflight_lock, flags);
+ +	list_add_tail(&inflight_cmd->list, &adapter->inflight);
+ +	spin_unlock_irqrestore(&adapter->inflight_lock, flags);
+ +
+ +	ibmvnic_send_crq(adapter, &newcrq);
+ +}
+ +
+ +static void handle_error_indication(union ibmvnic_crq *crq,
+ +				    struct ibmvnic_adapter *adapter)
+ +{
+ +	int detail_len = be32_to_cpu(crq->error_indication.detail_error_sz);
+ +	struct ibmvnic_inflight_cmd *inflight_cmd;
+++=======
++ static void request_error_information(struct ibmvnic_adapter *adapter,
++ 				      union ibmvnic_crq *err_crq)
++ {
+++>>>>>>> 2f9de9bac625 (ibmvnic: Only retrieve error info if present)
+  	struct device *dev = &adapter->vdev->dev;
++ 	struct net_device *netdev = adapter->netdev;
+  	struct ibmvnic_error_buff *error_buff;
+- 	union ibmvnic_crq new_crq;
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	union ibmvnic_crq crq;
+  	unsigned long flags;
+- 
+- 	dev_err(dev, "Firmware reports %serror id %x, cause %d\n",
+- 		crq->error_indication.
+- 		    flags & IBMVNIC_FATAL_ERROR ? "FATAL " : "",
+- 		be32_to_cpu(crq->error_indication.error_id),
+- 		be16_to_cpu(crq->error_indication.error_cause));
++ 	int rc, detail_len;
+  
+  	error_buff = kmalloc(sizeof(*error_buff), GFP_ATOMIC);
+  	if (!error_buff)
+@@@ -2368,36 -2392,55 +2371,81 @@@
+  		return;
+  	}
+  
+ +	inflight_cmd = kmalloc(sizeof(*inflight_cmd), GFP_ATOMIC);
+ +	if (!inflight_cmd) {
+ +		dma_unmap_single(dev, error_buff->dma, detail_len,
+ +				 DMA_FROM_DEVICE);
+ +		kfree(error_buff->buff);
+ +		kfree(error_buff);
+ +		return;
+ +	}
+ +
+  	error_buff->len = detail_len;
+- 	error_buff->error_id = crq->error_indication.error_id;
++ 	error_buff->error_id = err_crq->error_indication.error_id;
+  
+  	spin_lock_irqsave(&adapter->error_list_lock, flags);
+  	list_add_tail(&error_buff->list, &adapter->errors);
+  	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
+  
+++<<<<<<< HEAD
+ +	memset(&new_crq, 0, sizeof(new_crq));
+ +	new_crq.request_error_info.first = IBMVNIC_CRQ_CMD;
+ +	new_crq.request_error_info.cmd = REQUEST_ERROR_INFO;
+ +	new_crq.request_error_info.ioba = cpu_to_be32(error_buff->dma);
+ +	new_crq.request_error_info.len = cpu_to_be32(detail_len);
+ +	new_crq.request_error_info.error_id = crq->error_indication.error_id;
+ +
+ +	memcpy(&inflight_cmd->crq, &crq, sizeof(crq));
+ +
+ +	spin_lock_irqsave(&adapter->inflight_lock, flags);
+ +	list_add_tail(&inflight_cmd->list, &adapter->inflight);
+ +	spin_unlock_irqrestore(&adapter->inflight_lock, flags);
+ +
+ +	ibmvnic_send_crq(adapter, &new_crq);
+++=======
++ 	memset(&crq, 0, sizeof(crq));
++ 	crq.request_error_info.first = IBMVNIC_CRQ_CMD;
++ 	crq.request_error_info.cmd = REQUEST_ERROR_INFO;
++ 	crq.request_error_info.ioba = cpu_to_be32(error_buff->dma);
++ 	crq.request_error_info.len = cpu_to_be32(detail_len);
++ 	crq.request_error_info.error_id = err_crq->error_indication.error_id;
++ 
++ 	rc = ibmvnic_send_crq(adapter, &crq);
++ 	if (rc) {
++ 		netdev_err(netdev, "failed to request error information\n");
++ 		goto err_info_fail;
++ 	}
++ 
++ 	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
++ 		netdev_err(netdev, "timeout waiting for error information\n");
++ 		goto err_info_fail;
++ 	}
++ 
++ 	return;
++ 
++ err_info_fail:
++ 	spin_lock_irqsave(&adapter->error_list_lock, flags);
++ 	list_del(&error_buff->list);
++ 	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
++ 
++ 	kfree(error_buff->buff);
++ 	kfree(error_buff);
++ }
++ 
++ static void handle_error_indication(union ibmvnic_crq *crq,
++ 				    struct ibmvnic_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 
++ 	dev_err(dev, "Firmware reports %serror id %x, cause %d\n",
++ 		crq->error_indication.flags
++ 			& IBMVNIC_FATAL_ERROR ? "FATAL " : "",
++ 		be32_to_cpu(crq->error_indication.error_id),
++ 		be16_to_cpu(crq->error_indication.error_cause));
++ 
++ 	if (be32_to_cpu(crq->error_indication.error_id))
++ 		request_error_information(adapter, crq);
+++>>>>>>> 2f9de9bac625 (ibmvnic: Only retrieve error info if present)
+  }
+  
+  static void handle_change_mac_rsp(union ibmvnic_crq *crq,
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
