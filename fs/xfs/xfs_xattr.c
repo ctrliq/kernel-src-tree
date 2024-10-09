@@ -91,10 +91,11 @@ xfs_xattr_set(struct dentry *dentry, const char *name, const void *value,
 	if (flags & XATTR_REPLACE)
 		xflags |= ATTR_REPLACE;
 
-	if (!value)
-		return xfs_attr_remove(ip, (unsigned char *)name, xflags);
-	error = xfs_attr_set(ip, (unsigned char *)name,
+	if (value)
+		error = xfs_attr_set(ip, (unsigned char *)name,
 				(void *)value, size, xflags);
+	else
+		error = xfs_attr_remove(ip, (unsigned char *)name, xflags);
 	if (!error)
 		xfs_forget_acl(dentry->d_inode, name, xflags);
 
