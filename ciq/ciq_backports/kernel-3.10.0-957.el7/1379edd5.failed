@@ -1,0 +1,191 @@
+x86/efi: Access EFI data as encrypted when SEV is active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] efi: Access EFI data as encrypted when SEV is active (Gary Hook) [1361286]
+Rebuild_FUZZ: 96.30%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 1379edd5967346a1fa79b8dc3e9ca261576c6bc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1379edd5.failed
+
+EFI data is encrypted when the kernel is run under SEV. Update the
+page table references to be sure the EFI memory areas are accessed
+encrypted.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Borislav Petkov <bp@suse.de>
+	Cc: linux-efi@vger.kernel.org
+	Cc: kvm@vger.kernel.org
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+Link: https://lkml.kernel.org/r/20171020143059.3291-8-brijesh.singh@amd.com
+
+(cherry picked from commit 1379edd5967346a1fa79b8dc3e9ca261576c6bc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/platform/efi/efi_64.c
+index b96ae8aa3c8e,9e4ee5b04b2d..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -28,11 -32,12 +28,16 @@@
+  #include <linux/io.h>
+  #include <linux/reboot.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/ucs2_string.h>
++ #include <linux/mem_encrypt.h>
+++>>>>>>> 1379edd59673 (x86/efi: Access EFI data as encrypted when SEV is active)
+  
+ +#include <asm/pgalloc.h>
+  #include <asm/setup.h>
+  #include <asm/page.h>
+ -#include <asm/e820/api.h>
+ +#include <asm/e820.h>
+  #include <asm/pgtable.h>
+  #include <asm/tlbflush.h>
+  #include <asm/proto.h>
+@@@ -272,6 -361,26 +277,29 @@@ int __init efi_setup_page_tables(unsign
+  	efi_scratch.use_pgd = true;
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * Certain firmware versions are way too sentimential and still believe
++ 	 * they are exclusive and unquestionable owners of the first physical page,
++ 	 * even though they explicitly mark it as EFI_CONVENTIONAL_MEMORY
++ 	 * (but then write-access it later during SetVirtualAddressMap()).
++ 	 *
++ 	 * Create a 1:1 mapping for this page, to avoid triple faults during early
++ 	 * boot with such firmware. We are free to hand this page to the BIOS,
++ 	 * as trim_bios_range() will reserve the first page and isolate it away
++ 	 * from memory allocators anyway.
++ 	 */
++ 	pf = _PAGE_RW;
++ 	if (sev_active())
++ 		pf |= _PAGE_ENC;
++ 
++ 	if (kernel_map_pages_in_pgd(pgd, 0x0, 0x0, 1, pf)) {
++ 		pr_err("Failed to create 1:1 mapping for the first page!\n");
++ 		return 1;
++ 	}
++ 
++ 	/*
+++>>>>>>> 1379edd59673 (x86/efi: Access EFI data as encrypted when SEV is active)
+  	 * When making calls to the firmware everything needs to be 1:1
+  	 * mapped and addressable with 32-bit pointers. Map the kernel
+  	 * text and allocate a new stack because we can't rely on the
+@@@ -406,6 -514,100 +437,103 @@@ void __init parse_efi_setup(u64 phys_ad
+  	efi_setup = phys_addr + sizeof(struct setup_data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __init efi_update_mappings(efi_memory_desc_t *md, unsigned long pf)
++ {
++ 	unsigned long pfn;
++ 	pgd_t *pgd = efi_pgd;
++ 	int err1, err2;
++ 
++ 	/* Update the 1:1 mapping */
++ 	pfn = md->phys_addr >> PAGE_SHIFT;
++ 	err1 = kernel_map_pages_in_pgd(pgd, pfn, md->phys_addr, md->num_pages, pf);
++ 	if (err1) {
++ 		pr_err("Error while updating 1:1 mapping PA 0x%llx -> VA 0x%llx!\n",
++ 			   md->phys_addr, md->virt_addr);
++ 	}
++ 
++ 	err2 = kernel_map_pages_in_pgd(pgd, pfn, md->virt_addr, md->num_pages, pf);
++ 	if (err2) {
++ 		pr_err("Error while updating VA mapping PA 0x%llx -> VA 0x%llx!\n",
++ 			   md->phys_addr, md->virt_addr);
++ 	}
++ 
++ 	return err1 || err2;
++ }
++ 
++ static int __init efi_update_mem_attr(struct mm_struct *mm, efi_memory_desc_t *md)
++ {
++ 	unsigned long pf = 0;
++ 
++ 	if (md->attribute & EFI_MEMORY_XP)
++ 		pf |= _PAGE_NX;
++ 
++ 	if (!(md->attribute & EFI_MEMORY_RO))
++ 		pf |= _PAGE_RW;
++ 
++ 	if (sev_active())
++ 		pf |= _PAGE_ENC;
++ 
++ 	return efi_update_mappings(md, pf);
++ }
++ 
++ void __init efi_runtime_update_mappings(void)
++ {
++ 	efi_memory_desc_t *md;
++ 
++ 	if (efi_enabled(EFI_OLD_MEMMAP)) {
++ 		if (__supported_pte_mask & _PAGE_NX)
++ 			runtime_code_page_mkexec();
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Use the EFI Memory Attribute Table for mapping permissions if it
++ 	 * exists, since it is intended to supersede EFI_PROPERTIES_TABLE.
++ 	 */
++ 	if (efi_enabled(EFI_MEM_ATTR)) {
++ 		efi_memattr_apply_permissions(NULL, efi_update_mem_attr);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * EFI_MEMORY_ATTRIBUTES_TABLE is intended to replace
++ 	 * EFI_PROPERTIES_TABLE. So, use EFI_PROPERTIES_TABLE to update
++ 	 * permissions only if EFI_MEMORY_ATTRIBUTES_TABLE is not
++ 	 * published by the firmware. Even if we find a buggy implementation of
++ 	 * EFI_MEMORY_ATTRIBUTES_TABLE, don't fall back to
++ 	 * EFI_PROPERTIES_TABLE, because of the same reason.
++ 	 */
++ 
++ 	if (!efi_enabled(EFI_NX_PE_DATA))
++ 		return;
++ 
++ 	for_each_efi_memory_desc(md) {
++ 		unsigned long pf = 0;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_RUNTIME))
++ 			continue;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_WB))
++ 			pf |= _PAGE_PCD;
++ 
++ 		if ((md->attribute & EFI_MEMORY_XP) ||
++ 			(md->type == EFI_RUNTIME_SERVICES_DATA))
++ 			pf |= _PAGE_NX;
++ 
++ 		if (!(md->attribute & EFI_MEMORY_RO) &&
++ 			(md->type != EFI_RUNTIME_SERVICES_CODE))
++ 			pf |= _PAGE_RW;
++ 
++ 		if (sev_active())
++ 			pf |= _PAGE_ENC;
++ 
++ 		efi_update_mappings(md, pf);
++ 	}
++ }
++ 
+++>>>>>>> 1379edd59673 (x86/efi: Access EFI data as encrypted when SEV is active)
+  void __init efi_dump_pagetable(void)
+  {
+  #ifdef CONFIG_EFI_PGT_DUMP
+* Unmerged path arch/x86/platform/efi/efi_64.c
