@@ -1,0 +1,196 @@
+x86/kvm/nVMX: introduce source data cache for kvm_init_shadow_ept_mmu()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] kvm/nvmx: introduce source data cache for kvm_init_shadow_ept_mmu() (Vitaly Kuznetsov) [1565739 1497611]
+Rebuild_FUZZ: 97.10%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit a336282d7753a92ced7b8e52ff959929f6e550ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a336282d.failed
+
+MMU re-initialization is expensive, in particular,
+update_permission_bitmask() and update_pkru_bitmask() are.
+
+Cache the data used to setup shadow EPT MMU and avoid full re-init when
+it is unchanged.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a336282d7753a92ced7b8e52ff959929f6e550ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a,bf541af7442d..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -246,6 -282,32 +246,35 @@@ union kvm_mmu_page_role 
+  	};
+  };
+  
+++<<<<<<< HEAD
+++=======
++ union kvm_mmu_extended_role {
++ /*
++  * This structure complements kvm_mmu_page_role caching everything needed for
++  * MMU configuration. If nothing in both these structures changed, MMU
++  * re-configuration can be skipped. @valid bit is set on first usage so we don't
++  * treat all-zero structure as valid data.
++  */
++ 	u32 word;
++ 	struct {
++ 		unsigned int valid:1;
++ 		unsigned int execonly:1;
++ 		unsigned int cr4_pse:1;
++ 		unsigned int cr4_pke:1;
++ 		unsigned int cr4_smap:1;
++ 		unsigned int cr4_smep:1;
++ 	};
++ };
++ 
++ union kvm_mmu_role {
++ 	u64 as_u64;
++ 	struct {
++ 		union kvm_mmu_page_role base;
++ 		union kvm_mmu_extended_role ext;
++ 	};
++ };
++ 
+++>>>>>>> a336282d7753 (x86/kvm/nVMX: introduce source data cache for kvm_init_shadow_ept_mmu())
+  struct kvm_rmap_head {
+  	unsigned long val;
+  };
+diff --cc arch/x86/kvm/mmu.c
+index e7052d2c946d,9d400a06c5f2..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4420,14 -4724,41 +4420,46 @@@ static void paging32E_init_context(stru
+  	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static union kvm_mmu_extended_role kvm_calc_mmu_role_ext(struct kvm_vcpu *vcpu)
++ {
++ 	union kvm_mmu_extended_role ext = {0};
++ 
++ 	ext.cr4_smep = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
++ 	ext.cr4_smap = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
++ 	ext.cr4_pse = !!is_pse(vcpu);
++ 	ext.cr4_pke = !!kvm_read_cr4_bits(vcpu, X86_CR4_PKE);
++ 
++ 	ext.valid = 1;
++ 
++ 	return ext;
++ }
++ 
++ static union kvm_mmu_page_role
++ kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu)
++ {
++ 	union kvm_mmu_page_role role = {0};
++ 
++ 	role.guest_mode = is_guest_mode(vcpu);
++ 	role.smm = is_smm(vcpu);
++ 	role.ad_disabled = (shadow_accessed_mask == 0);
++ 	role.level = kvm_x86_ops->get_tdp_level(vcpu);
++ 	role.direct = true;
++ 	role.access = ACC_ALL;
++ 
++ 	return role;
++ }
++ 
+++>>>>>>> a336282d7753 (x86/kvm/nVMX: introduce source data cache for kvm_init_shadow_ept_mmu())
+  static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
+  {
+ -	struct kvm_mmu *context = vcpu->arch.mmu;
+ +	struct kvm_mmu *context = &vcpu->arch.mmu;
+  
+ -	context->mmu_role.base.word = mmu_base_role_mask.word &
+ -				  kvm_calc_tdp_mmu_root_page_role(vcpu).word;
+ +	context->base_role.word = 0;
+ +	context->base_role.guest_mode = is_guest_mode(vcpu);
+ +	context->base_role.smm = is_smm(vcpu);
+ +	context->base_role.ad_disabled = (shadow_accessed_mask == 0);
+  	context->page_fault = tdp_page_fault;
+  	context->sync_page = nonpaging_sync_page;
+  	context->invlpg = nonpaging_invlpg;
+@@@ -4497,14 -4844,42 +4529,53 @@@ void kvm_init_shadow_mmu(struct kvm_vcp
+  }
+  EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+  
+++<<<<<<< HEAD
+++=======
++ static union kvm_mmu_role
++ kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty,
++ 				   bool execonly)
++ {
++ 	union kvm_mmu_role role;
++ 
++ 	/* Base role is inherited from root_mmu */
++ 	role.base.word = vcpu->arch.root_mmu.mmu_role.base.word;
++ 	role.ext = kvm_calc_mmu_role_ext(vcpu);
++ 
++ 	role.base.level = PT64_ROOT_4LEVEL;
++ 	role.base.direct = false;
++ 	role.base.ad_disabled = !accessed_dirty;
++ 	role.base.guest_mode = true;
++ 	role.base.access = ACC_ALL;
++ 
++ 	role.ext.execonly = execonly;
++ 
++ 	return role;
++ }
++ 
+++>>>>>>> a336282d7753 (x86/kvm/nVMX: introduce source data cache for kvm_init_shadow_ept_mmu())
+  void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
+ -			     bool accessed_dirty, gpa_t new_eptp)
+ +			     bool accessed_dirty)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_mmu *context = &vcpu->arch.mmu;
+ +
+ +	MMU_WARN_ON(VALID_PAGE(context->root_hpa));
+ +
+ +	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
+++=======
++ 	struct kvm_mmu *context = vcpu->arch.mmu;
++ 	union kvm_mmu_role new_role =
++ 		kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty,
++ 						   execonly);
++ 
++ 	__kvm_mmu_new_cr3(vcpu, new_eptp, new_role.base, false);
++ 
++ 	new_role.base.word &= mmu_base_role_mask.word;
++ 	if (new_role.as_u64 == context->mmu_role.as_u64)
++ 		return;
++ 
++ 	context->shadow_root_level = PT64_ROOT_4LEVEL;
+++>>>>>>> a336282d7753 (x86/kvm/nVMX: introduce source data cache for kvm_init_shadow_ept_mmu())
+  
+  	context->nx = true;
+  	context->ept_ad = accessed_dirty;
+@@@ -4513,11 -4888,10 +4584,16 @@@
+  	context->sync_page = ept_sync_page;
+  	context->invlpg = ept_invlpg;
+  	context->update_pte = ept_update_pte;
+ -	context->root_level = PT64_ROOT_4LEVEL;
+ +	context->root_level = context->shadow_root_level;
+ +	context->root_hpa = INVALID_PAGE;
+  	context->direct_map = false;
+++<<<<<<< HEAD
+ +	context->base_role.ad_disabled = !accessed_dirty;
+ +	context->base_role.guest_mode = 1;
+++=======
++ 	context->mmu_role.as_u64 = new_role.as_u64;
++ 
+++>>>>>>> a336282d7753 (x86/kvm/nVMX: introduce source data cache for kvm_init_shadow_ept_mmu())
+  	update_permission_bitmask(vcpu, context, true);
+  	update_pkru_bitmask(vcpu, context, true);
+  	update_last_nonleaf_level(vcpu, context);
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
