@@ -1,0 +1,157 @@
+KVM: vmx: fix missed cancellation of TSC deadline timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Wanpeng Li <kernellwp@gmail.com>
+commit 196f20ca52e8c7281932663c348fa54b82d03914
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/196f20ca.failed
+
+INFO: rcu_sched detected stalls on CPUs/tasks:
+ 1-...: (11800 GPs behind) idle=45d/140000000000000/0 softirq=0/0 fqs=21663
+ (detected by 0, t=65016 jiffies, g=11500, c=11499, q=719)
+Task dump for CPU 1:
+qemu-system-x86 R  running task        0  3529   3525 0x00080808
+ ffff8802021791a0 ffff880212895040 0000000000000001 00007f1c2c00db40
+ ffff8801dd20fcd3 ffffc90002b98000 ffff8801dd20fc88 ffff8801dd20fcf8
+ 0000000000000286 ffff8801dd2ac538 ffff8801dd20fcc0 ffffffffc06949c9
+Call Trace:
+? kvm_write_guest_cached+0xb9/0x160 [kvm]
+? __delay+0xf/0x20
+? wait_lapic_expire+0x14a/0x200 [kvm]
+? kvm_arch_vcpu_ioctl_run+0xcbe/0x1b00 [kvm]
+? kvm_arch_vcpu_ioctl_run+0xe34/0x1b00 [kvm]
+? kvm_vcpu_ioctl+0x2d3/0x7c0 [kvm]
+? __fget+0x5/0x210
+? do_vfs_ioctl+0x96/0x6a0
+? __fget_light+0x2a/0x90
+? SyS_ioctl+0x79/0x90
+? do_syscall_64+0x7c/0x1e0
+? entry_SYSCALL64_slow_path+0x25/0x25
+
+This can be reproduced readily by running a full dynticks guest(since hrtimer
+in guest is heavily used) w/ lapic_timer_advance disabled.
+
+If fail to program hardware preemption timer, we will fallback to hrtimer based
+method, however, a previous programmed preemption timer miss to cancel in this
+scenario which results in one hardware preemption timer and one hrtimer emulated
+tsc deadline timer run simultaneously. So sometimes the target guest deadline
+tsc is earlier than guest tsc, which leads to the computation in vmx_set_hv_timer
+can underflow and cause delta_tsc to be set a huge value, then host soft lockup
+as above.
+
+This patch fix it by cancelling the previous programmed preemption timer if there
+is once we failed to program the new preemption timer and fallback to hrtimer
+based method.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Yunhong Jiang <yunhong.jiang@intel.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 196f20ca52e8c7281932663c348fa54b82d03914)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index e191bcf72fce,22a6474af220..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1373,6 -1343,78 +1373,81 @@@ static void start_sw_tscdeadline(struc
+  	local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu)
++ {
++ 	return vcpu->arch.apic->lapic_timer.hv_timer_in_use;
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_hv_timer_in_use);
++ 
++ static void cancel_hv_tscdeadline(struct kvm_lapic *apic)
++ {
++ 	kvm_x86_ops->cancel_hv_timer(apic->vcpu);
++ 	apic->lapic_timer.hv_timer_in_use = false;
++ }
++ 
++ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	WARN_ON(!apic->lapic_timer.hv_timer_in_use);
++ 	WARN_ON(swait_active(&vcpu->wq));
++ 	cancel_hv_tscdeadline(apic);
++ 	apic_timer_expired(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_expired_hv_timer);
++ 
++ static bool start_hv_tscdeadline(struct kvm_lapic *apic)
++ {
++ 	u64 tscdeadline = apic->lapic_timer.tscdeadline;
++ 
++ 	if (atomic_read(&apic->lapic_timer.pending) ||
++ 		kvm_x86_ops->set_hv_timer(apic->vcpu, tscdeadline)) {
++ 		if (apic->lapic_timer.hv_timer_in_use)
++ 			cancel_hv_tscdeadline(apic);
++ 	} else {
++ 		apic->lapic_timer.hv_timer_in_use = true;
++ 		hrtimer_cancel(&apic->lapic_timer.timer);
++ 
++ 		/* In case the sw timer triggered in the window */
++ 		if (atomic_read(&apic->lapic_timer.pending))
++ 			cancel_hv_tscdeadline(apic);
++ 	}
++ 	trace_kvm_hv_timer_state(apic->vcpu->vcpu_id,
++ 			apic->lapic_timer.hv_timer_in_use);
++ 	return apic->lapic_timer.hv_timer_in_use;
++ }
++ 
++ void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	WARN_ON(apic->lapic_timer.hv_timer_in_use);
++ 
++ 	if (apic_lvtt_tscdeadline(apic))
++ 		start_hv_tscdeadline(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_hv_timer);
++ 
++ void kvm_lapic_switch_to_sw_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	/* Possibly the TSC deadline timer is not enabled yet */
++ 	if (!apic->lapic_timer.hv_timer_in_use)
++ 		return;
++ 
++ 	cancel_hv_tscdeadline(apic);
++ 
++ 	if (atomic_read(&apic->lapic_timer.pending))
++ 		return;
++ 
++ 	start_sw_tscdeadline(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_sw_timer);
++ 
+++>>>>>>> 196f20ca52e8 (KVM: vmx: fix missed cancellation of TSC deadline timer)
+  static void start_apic_timer(struct kvm_lapic *apic)
+  {
+  	ktime_t now;
+@@@ -1418,7 -1461,8 +1493,12 @@@
+  			   ktime_to_ns(ktime_add_ns(now,
+  					apic->lapic_timer.period)));
+  	} else if (apic_lvtt_tscdeadline(apic)) {
+++<<<<<<< HEAD
+ +		start_sw_tscdeadline(apic);
+++=======
++ 		if (!(kvm_x86_ops->set_hv_timer && start_hv_tscdeadline(apic)))
++ 			start_sw_tscdeadline(apic);
+++>>>>>>> 196f20ca52e8 (KVM: vmx: fix missed cancellation of TSC deadline timer)
+  	}
+  }
+  
+* Unmerged path arch/x86/kvm/lapic.c
