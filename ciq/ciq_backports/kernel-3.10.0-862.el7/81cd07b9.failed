@@ -1,0 +1,171 @@
+iommu/amd: Create a list of reserved iova addresses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Create a list of reserved iova addresses (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 93.75%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 81cd07b9c92ad446fcde18db7de961def0dbcfd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/81cd07b9.failed
+
+Put the MSI-range, the HT-range and the MMIO ranges of PCI
+devices into that range, so that these addresses are not
+allocated for DMA.
+
+Copy this address list into every created dma_ops_domain.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 81cd07b9c92ad446fcde18db7de961def0dbcfd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 052bec78c73d,1bb59ae2d586..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -52,6 -58,17 +52,20 @@@
+  
+  #define LOOP_TIMEOUT	100000
+  
+++<<<<<<< HEAD
+++=======
++ /* IO virtual address start page frame number */
++ #define IOVA_START_PFN		(1)
++ #define IOVA_PFN(addr)		((addr) >> PAGE_SHIFT)
++ #define DMA_32BIT_PFN		IOVA_PFN(DMA_BIT_MASK(32))
++ 
++ /* Reserved IOVA ranges */
++ #define MSI_RANGE_START		(0xfee00000)
++ #define MSI_RANGE_END		(0xfeefffff)
++ #define HT_RANGE_START		(0xfd00000000ULL)
++ #define HT_RANGE_END		(0xffffffffffULL)
++ 
+++>>>>>>> 81cd07b9c92a (iommu/amd: Create a list of reserved iova addresses)
+  /*
+   * This bitmap is used to advertise the page sizes our hardware support
+   * to the IOMMU core, which will then use this information to split
+@@@ -154,8 -170,14 +168,11 @@@ struct dma_ops_domain 
+  
+  	/* address space relevant data */
+  	struct aperture_range *aperture[APERTURE_MAX_RANGES];
+ -
+ -	/* IOVA RB-Tree */
+ -	struct iova_domain iovad;
+  };
+  
++ static struct iova_domain reserved_iova_ranges;
++ static struct lock_class_key reserved_rbtree_key;
++ 
+  /****************************************************************************
+   *
+   * Helper functions
+@@@ -1976,9 -2060,16 +1993,12 @@@ static struct dma_ops_domain *dma_ops_d
+  	 * a valid dma-address. So we can use 0 as error value
+  	 */
+  	dma_dom->aperture[0]->bitmap[0] = 1;
+ +	dma_dom->next_index = 0;
+  
+ -	for_each_possible_cpu(cpu)
+ -		*per_cpu_ptr(dma_dom->next_index, cpu) = 0;
+ -
+ -	init_iova_domain(&dma_dom->iovad, PAGE_SIZE,
+ -			 IOVA_START_PFN, DMA_32BIT_PFN);
+  
++ 	/* Initialize reserved ranges */
++ 	copy_reserved_iova(&reserved_iova_ranges, &dma_dom->iovad);
++ 
+  	return dma_dom;
+  
+  free_dma_dom:
+@@@ -2871,9 -2975,83 +2891,87 @@@ static struct dma_map_ops amd_iommu_dma
+  	.set_dma_mask	= set_dma_mask,
+  };
+  
++ static int init_reserved_iova_ranges(void)
++ {
++ 	struct pci_dev *pdev = NULL;
++ 	struct iova *val;
++ 
++ 	init_iova_domain(&reserved_iova_ranges, PAGE_SIZE,
++ 			 IOVA_START_PFN, DMA_32BIT_PFN);
++ 
++ 	lockdep_set_class(&reserved_iova_ranges.iova_rbtree_lock,
++ 			  &reserved_rbtree_key);
++ 
++ 	/* MSI memory range */
++ 	val = reserve_iova(&reserved_iova_ranges,
++ 			   IOVA_PFN(MSI_RANGE_START), IOVA_PFN(MSI_RANGE_END));
++ 	if (!val) {
++ 		pr_err("Reserving MSI range failed\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* HT memory range */
++ 	val = reserve_iova(&reserved_iova_ranges,
++ 			   IOVA_PFN(HT_RANGE_START), IOVA_PFN(HT_RANGE_END));
++ 	if (!val) {
++ 		pr_err("Reserving HT range failed\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/*
++ 	 * Memory used for PCI resources
++ 	 * FIXME: Check whether we can reserve the PCI-hole completly
++ 	 */
++ 	for_each_pci_dev(pdev) {
++ 		int i;
++ 
++ 		for (i = 0; i < PCI_NUM_RESOURCES; ++i) {
++ 			struct resource *r = &pdev->resource[i];
++ 
++ 			if (!(r->flags & IORESOURCE_MEM))
++ 				continue;
++ 
++ 			val = reserve_iova(&reserved_iova_ranges,
++ 					   IOVA_PFN(r->start),
++ 					   IOVA_PFN(r->end));
++ 			if (!val) {
++ 				pr_err("Reserve pci-resource range failed\n");
++ 				return -ENOMEM;
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+  int __init amd_iommu_init_api(void)
+  {
+++<<<<<<< HEAD
+ +	return bus_set_iommu(&pci_bus_type, &amd_iommu_ops);
+++=======
++ 	int ret, err = 0;
++ 
++ 	ret = iova_cache_get();
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = init_reserved_iova_ranges();
++ 	if (ret)
++ 		return ret;
++ 
++ 	err = bus_set_iommu(&pci_bus_type, &amd_iommu_ops);
++ 	if (err)
++ 		return err;
++ #ifdef CONFIG_ARM_AMBA
++ 	err = bus_set_iommu(&amba_bustype, &amd_iommu_ops);
++ 	if (err)
++ 		return err;
++ #endif
++ 	err = bus_set_iommu(&platform_bus_type, &amd_iommu_ops);
++ 	if (err)
++ 		return err;
++ 	return 0;
+++>>>>>>> 81cd07b9c92a (iommu/amd: Create a list of reserved iova addresses)
+  }
+  
+  int __init amd_iommu_init_dma_ops(void)
+* Unmerged path drivers/iommu/amd_iommu.c
