@@ -1,0 +1,101 @@
+dm thin: fix bug where bio that overwrites thin block ignores FUA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Nikos Tsironis <ntsironis@arrikto.com>
+commit 4ae280b4ee3463fa57bbe6eede26b97daff8a0f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4ae280b4.failed
+
+When provisioning a new data block for a virtual block, either because
+the block was previously unallocated or because we are breaking sharing,
+if the whole block of data is being overwritten the bio that triggered
+the provisioning is issued immediately, skipping copying or zeroing of
+the data block.
+
+When this bio completes the new mapping is inserted in to the pool's
+metadata by process_prepared_mapping(), where the bio completion is
+signaled to the upper layers.
+
+This completion is signaled without first committing the metadata.  If
+the bio in question has the REQ_FUA flag set and the system crashes
+right after its completion and before the next metadata commit, then the
+write is lost despite the REQ_FUA flag requiring that I/O completion for
+this request must only be signaled after the data has been committed to
+non-volatile storage.
+
+Fix this by deferring the completion of overwrite bios, with the REQ_FUA
+flag set, until after the metadata has been committed.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Nikos Tsironis <ntsironis@arrikto.com>
+	Acked-by: Joe Thornber <ejt@redhat.com>
+	Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 4ae280b4ee3463fa57bbe6eede26b97daff8a0f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index ebfd35310b13,e83b63608262..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -1019,9 -954,42 +1020,42 @@@ static void process_prepared_mapping_fa
+  {
+  	cell_error(m->tc->pool, m->cell);
+  	list_del(&m->list);
+ -	mempool_free(m, &m->tc->pool->mapping_pool);
+ +	mempool_free(m, m->tc->pool->mapping_pool);
+  }
+  
++ static void complete_overwrite_bio(struct thin_c *tc, struct bio *bio)
++ {
++ 	struct pool *pool = tc->pool;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * If the bio has the REQ_FUA flag set we must commit the metadata
++ 	 * before signaling its completion.
++ 	 */
++ 	if (!bio_triggers_commit(tc, bio)) {
++ 		bio_endio(bio);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Complete bio with an error if earlier I/O caused changes to the
++ 	 * metadata that can't be committed, e.g, due to I/O errors on the
++ 	 * metadata device.
++ 	 */
++ 	if (dm_thin_aborted_changes(tc->td)) {
++ 		bio_io_error(bio);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Batch together any bios that trigger commits and then issue a
++ 	 * single commit for them in process_deferred_bios().
++ 	 */
++ 	spin_lock_irqsave(&pool->lock, flags);
++ 	bio_list_add(&pool->deferred_flush_completions, bio);
++ 	spin_unlock_irqrestore(&pool->lock, flags);
++ }
++ 
+  static void process_prepared_mapping(struct dm_thin_new_mapping *m)
+  {
+  	struct thin_c *tc = m->tc;
+@@@ -1054,7 -1022,7 +1088,11 @@@
+  	 */
+  	if (bio) {
+  		inc_remap_and_issue_cell(tc, m->cell, m->data_block);
+++<<<<<<< HEAD
+ +		bio_endio(bio, 0);
+++=======
++ 		complete_overwrite_bio(tc, bio);
+++>>>>>>> 4ae280b4ee34 (dm thin: fix bug where bio that overwrites thin block ignores FUA)
+  	} else {
+  		inc_all_io_entry(tc->pool, m->cell->holder);
+  		remap_and_issue(tc, m->cell->holder, m->data_block);
+* Unmerged path drivers/md/dm-thin.c
