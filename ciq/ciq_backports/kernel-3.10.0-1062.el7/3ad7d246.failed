@@ -1,0 +1,235 @@
+Ipvlan should return an error when an address is already in use.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Krister Johansen <kjlx@templeofstupid.com>
+commit 3ad7d2468f79fc13215eb941f766a692d34b1381
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3ad7d246.failed
+
+The ipvlan code already knows how to detect when a duplicate address is
+about to be assigned to an ipvlan device.  However, that failure is not
+propogated outward and leads to a silent failure.
+
+Introduce a validation step at ip address creation time and allow device
+drivers to register to validate the incoming ip addresses.  The ipvlan
+code is the first consumer.  If it detects an address in use, we can
+return an error to the user before beginning to commit the new ifa in
+the networking code.
+
+This can be especially useful if it is necessary to provision many
+ipvlans in containers.  The provisioning software (or operator) can use
+this to detect situations where an ip address is unexpectedly in use.
+
+	Signed-off-by: Krister Johansen <kjlx@templeofstupid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3ad7d2468f79fc13215eb941f766a692d34b1381)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ipvlan/ipvlan_main.c
+#	include/net/addrconf.h
+diff --cc include/net/addrconf.h
+index 4afbe7546e5a,d0889cb50172..000000000000
+--- a/include/net/addrconf.h
++++ b/include/net/addrconf.h
+@@@ -272,8 -282,12 +276,17 @@@ int register_inet6addr_notifier(struct 
+  int unregister_inet6addr_notifier(struct notifier_block *nb);
+  int inet6addr_notifier_call_chain(unsigned long val, void *v);
+  
+++<<<<<<< HEAD
+ +void inet6_netconf_notify_devconf(struct net *net, int type, int ifindex,
+ +				  struct ipv6_devconf *devconf);
+++=======
++ int register_inet6addr_validator_notifier(struct notifier_block *nb);
++ int unregister_inet6addr_validator_notifier(struct notifier_block *nb);
++ int inet6addr_validator_notifier_call_chain(unsigned long val, void *v);
++ 
++ void inet6_netconf_notify_devconf(struct net *net, int event, int type,
++ 				  int ifindex, struct ipv6_devconf *devconf);
+++>>>>>>> 3ad7d2468f79 (Ipvlan should return an error when an address is already in use.)
+  
+  /**
+   * __in6_dev_get - get inet6_dev pointer from netdevice
+* Unmerged path drivers/net/ipvlan/ipvlan_main.c
+* Unmerged path drivers/net/ipvlan/ipvlan_main.c
+diff --git a/include/linux/inetdevice.h b/include/linux/inetdevice.h
+index 561f2f078b6b..8fb85f101524 100644
+--- a/include/linux/inetdevice.h
++++ b/include/linux/inetdevice.h
+@@ -176,8 +176,15 @@ struct in_ifaddr {
+ 	unsigned long		ifa_tstamp; /* updated timestamp */
+ };
+ 
++struct in_validator_info {
++	__be32			ivi_addr;
++	struct in_device	*ivi_dev;
++};
++
+ int register_inetaddr_notifier(struct notifier_block *nb);
+ int unregister_inetaddr_notifier(struct notifier_block *nb);
++int register_inetaddr_validator_notifier(struct notifier_block *nb);
++int unregister_inetaddr_validator_notifier(struct notifier_block *nb);
+ 
+ void inet_netconf_notify_devconf(struct net *net, int type, int ifindex,
+ 				 struct ipv4_devconf *devconf);
+* Unmerged path include/net/addrconf.h
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 0057188e3cdb..cd9dd5be15be 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -180,6 +180,7 @@ EXPORT_SYMBOL(__ip_dev_find);
+ static void rtmsg_ifa(int event, struct in_ifaddr *, struct nlmsghdr *, u32);
+ 
+ static BLOCKING_NOTIFIER_HEAD(inetaddr_chain);
++static BLOCKING_NOTIFIER_HEAD(inetaddr_validator_chain);
+ static void inet_del_ifa(struct in_device *in_dev, struct in_ifaddr **ifap,
+ 			 int destroy);
+ #ifdef CONFIG_SYSCTL
+@@ -444,6 +445,8 @@ static int __inet_insert_ifa(struct in_ifaddr *ifa, struct nlmsghdr *nlh,
+ {
+ 	struct in_device *in_dev = ifa->ifa_dev;
+ 	struct in_ifaddr *ifa1, **ifap, **last_primary;
++	struct in_validator_info ivi;
++	int ret;
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -474,6 +477,23 @@ static int __inet_insert_ifa(struct in_ifaddr *ifa, struct nlmsghdr *nlh,
+ 		}
+ 	}
+ 
++	/* Allow any devices that wish to register ifaddr validtors to weigh
++	 * in now, before changes are committed.  The rntl lock is serializing
++	 * access here, so the state should not change between a validator call
++	 * and a final notify on commit.  This isn't invoked on promotion under
++	 * the assumption that validators are checking the address itself, and
++	 * not the flags.
++	 */
++	ivi.ivi_addr = ifa->ifa_address;
++	ivi.ivi_dev = ifa->ifa_dev;
++	ret = blocking_notifier_call_chain(&inetaddr_validator_chain,
++					   NETDEV_UP, &ivi);
++	ret = notifier_to_errno(ret);
++	if (ret) {
++		inet_free_ifa(ifa);
++		return ret;
++	}
++
+ 	if (!(ifa->ifa_flags & IFA_F_SECONDARY)) {
+ 		prandom_seed((__force u32) ifa->ifa_local);
+ 		ifap = last_primary;
+@@ -1331,6 +1351,19 @@ int unregister_inetaddr_notifier(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL(unregister_inetaddr_notifier);
+ 
++int register_inetaddr_validator_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&inetaddr_validator_chain, nb);
++}
++EXPORT_SYMBOL(register_inetaddr_validator_notifier);
++
++int unregister_inetaddr_validator_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(&inetaddr_validator_chain,
++	    nb);
++}
++EXPORT_SYMBOL(unregister_inetaddr_validator_notifier);
++
+ /* Rename ifa_labels for a device name change. Make some effort to preserve
+  * existing alias numbering and to create unique labels if possible.
+ */
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index a8297bbf8643..f18a48324121 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -812,6 +812,7 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+ {
+ 	struct inet6_ifaddr *ifa = NULL;
+ 	struct rt6_info *rt;
++	struct in6_validator_info i6vi;
+ 	unsigned int hash;
+ 	int err = 0;
+ 	int addr_type = ipv6_addr_type(addr);
+@@ -823,6 +824,9 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+ 		return ERR_PTR(-EADDRNOTAVAIL);
+ 
+ 	rcu_read_lock_bh();
++
++	in6_dev_hold(idev);
++
+ 	if (idev->dead) {
+ 		err = -ENODEV;			/*XXX*/
+ 		goto out2;
+@@ -833,6 +837,17 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+ 		goto out2;
+ 	}
+ 
++	i6vi.i6vi_addr = *addr;
++	i6vi.i6vi_dev = idev;
++	rcu_read_unlock_bh();
++
++	err = inet6addr_validator_notifier_call_chain(NETDEV_UP, &i6vi);
++
++	rcu_read_lock_bh();
++	err = notifier_to_errno(err);
++	if (err)
++		goto out2;
++
+ 	spin_lock(&addrconf_hash_lock);
+ 
+ 	/* Ignore adding duplicate addresses on an interface */
+@@ -879,7 +894,6 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+ 	ifa->rt = rt;
+ 
+ 	ifa->idev = idev;
+-	in6_dev_hold(idev);
+ 	/* For caller */
+ 	in6_ifa_hold(ifa);
+ 
+@@ -907,6 +921,7 @@ out2:
+ 		inet6addr_notifier_call_chain(NETDEV_UP, ifa);
+ 	else {
+ 		kfree(ifa);
++		in6_dev_put(idev);
+ 		ifa = ERR_PTR(err);
+ 	}
+ 
+diff --git a/net/ipv6/addrconf_core.c b/net/ipv6/addrconf_core.c
+index a0ed0d8c036c..5b37537e298f 100644
+--- a/net/ipv6/addrconf_core.c
++++ b/net/ipv6/addrconf_core.c
+@@ -88,6 +88,7 @@ int __ipv6_addr_type(const struct in6_addr *addr)
+ EXPORT_SYMBOL(__ipv6_addr_type);
+ 
+ static ATOMIC_NOTIFIER_HEAD(inet6addr_chain);
++static ATOMIC_NOTIFIER_HEAD(inet6addr_validator_chain);
+ 
+ int register_inet6addr_notifier(struct notifier_block *nb)
+ {
+@@ -107,6 +108,24 @@ int inet6addr_notifier_call_chain(unsigned long val, void *v)
+ }
+ EXPORT_SYMBOL(inet6addr_notifier_call_chain);
+ 
++int register_inet6addr_validator_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&inet6addr_validator_chain, nb);
++}
++EXPORT_SYMBOL(register_inet6addr_validator_notifier);
++
++int unregister_inet6addr_validator_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&inet6addr_validator_chain, nb);
++}
++EXPORT_SYMBOL(unregister_inet6addr_validator_notifier);
++
++int inet6addr_validator_notifier_call_chain(unsigned long val, void *v)
++{
++	return atomic_notifier_call_chain(&inet6addr_validator_chain, val, v);
++}
++EXPORT_SYMBOL(inet6addr_validator_notifier_call_chain);
++
+ static int eafnosupport_ipv6_dst_lookup(struct net *net, struct sock *u1,
+ 					struct dst_entry **u2,
+ 					struct flowi6 *u3)
