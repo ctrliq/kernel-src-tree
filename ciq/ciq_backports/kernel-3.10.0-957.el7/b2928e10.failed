@@ -1,0 +1,172 @@
+mmc: block: refactor mmc_blk_rw_try_restart()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: refactor mmc_blk_rw_try_restart() (Gopal Tiwari) [1549495]
+Rebuild_FUZZ: 94.12%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit b2928e1049e1d96ac794293d18168c721dbfdb24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b2928e10.failed
+
+The mmc_blk_rw_start_new() was named after the label inside
+mmc_blk_issue_rw_rq() but is really a confusing name for this
+function: what it does is to try to restart the latest issued
+command on the host and card of the current MMC queue.
+
+So rename it mmc_blk_rw_try_restart() that reflects what it
+is doing and at this point also refactore the function to
+treat the removed card as an exception and just exit if this
+happens and run on in the function if that is not happening.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit b2928e1049e1d96ac794293d18168c721dbfdb24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index d7cc8dd6684d,1761ab238483..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1586,7 -1587,41 +1586,45 @@@ static int mmc_blk_cmd_err(struct mmc_b
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+++=======
++ static void mmc_blk_rw_cmd_abort(struct mmc_card *card, struct request *req)
++ {
++ 	int ret = 1;
++ 
++ 	if (mmc_card_removed(card))
++ 		req->rq_flags |= RQF_QUIET;
++ 	while (ret)
++ 		ret = blk_end_request(req, -EIO,
++ 				      blk_rq_cur_bytes(req));
++ }
++ 
++ /**
++  * mmc_blk_rw_try_restart() - tries to restart the current async request
++  * @mq: the queue with the card and host to restart
++  * @req: a new request that want to be started after the current one
++  */
++ static void mmc_blk_rw_try_restart(struct mmc_queue *mq, struct request *req)
++ {
++ 	if (!req)
++ 		return;
++ 
++ 	/*
++ 	 * If the card was removed, just cancel everything and return.
++ 	 */
++ 	if (mmc_card_removed(mq->card)) {
++ 		req->rq_flags |= RQF_QUIET;
++ 		blk_end_request_all(req, -EIO);
++ 		return;
++ 	}
++ 	/* Else proceed and try to restart the current async request */
++ 	mmc_blk_rw_rq_prep(mq->mqrq_cur, mq->card, 0, mq);
++ 	mmc_start_areq(mq->card->host, &mq->mqrq_cur->mmc_active, NULL);
++ }
++ 
++ static void mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *new_req)
+++>>>>>>> b2928e1049e1 (mmc: block: refactor mmc_blk_rw_try_restart())
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+@@@ -1667,11 -1702,16 +1705,24 @@@
+  			}
+  			break;
+  		case MMC_BLK_CMD_ERR:
+++<<<<<<< HEAD
+ +			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
+ +			if (mmc_blk_reset(md, card->host, type))
+ +				goto cmd_abort;
+ +			if (!ret)
+ +				goto start_new_req;
+++=======
++ 			ret = mmc_blk_cmd_err(md, card, brq, old_req, ret);
++ 			if (mmc_blk_reset(md, card->host, type)) {
++ 				mmc_blk_rw_cmd_abort(card, old_req);
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
++ 			if (!ret) {
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
+++>>>>>>> b2928e1049e1 (mmc: block: refactor mmc_blk_rw_try_restart())
+  			break;
+  		case MMC_BLK_RETRY:
+  			retune_retry_done = brq->retune_retry_done;
+@@@ -1681,15 -1721,20 +1732,29 @@@
+  		case MMC_BLK_ABORT:
+  			if (!mmc_blk_reset(md, card->host, type))
+  				break;
+++<<<<<<< HEAD
+ +			goto cmd_abort;
+++=======
++ 			mmc_blk_rw_cmd_abort(card, old_req);
++ 			mmc_blk_rw_try_restart(mq, new_req);
++ 			return;
+++>>>>>>> b2928e1049e1 (mmc: block: refactor mmc_blk_rw_try_restart())
+  		case MMC_BLK_DATA_ERR: {
+  			int err;
+  
+  			err = mmc_blk_reset(md, card->host, type);
+  			if (!err)
+  				break;
+++<<<<<<< HEAD
+ +			if (err == -ENODEV)
+ +				goto cmd_abort;
+++=======
++ 			if (err == -ENODEV) {
++ 				mmc_blk_rw_cmd_abort(card, old_req);
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
+++>>>>>>> b2928e1049e1 (mmc: block: refactor mmc_blk_rw_try_restart())
+  			/* Fall through */
+  		}
+  		case MMC_BLK_ECC_ERR:
+@@@ -1705,17 -1750,23 +1770,35 @@@
+  			 * time, so we only reach here after trying to
+  			 * read a single sector.
+  			 */
+ -			ret = blk_end_request(old_req, -EIO,
+ +			ret = blk_end_request(req, -EIO,
+  						brq->data.blksz);
+++<<<<<<< HEAD
+ +			if (!ret)
+ +				goto start_new_req;
+ +			break;
+ +		case MMC_BLK_NOMEDIUM:
+ +			goto cmd_abort;
+ +		default:
+ +			pr_err("%s: Unhandled return value (%d)",
+ +					req->rq_disk->disk_name, status);
+ +			goto cmd_abort;
+++=======
++ 			if (!ret) {
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
++ 			break;
++ 		case MMC_BLK_NOMEDIUM:
++ 			mmc_blk_rw_cmd_abort(card, old_req);
++ 			mmc_blk_rw_try_restart(mq, new_req);
++ 			return;
++ 		default:
++ 			pr_err("%s: Unhandled return value (%d)",
++ 					old_req->rq_disk->disk_name, status);
++ 			mmc_blk_rw_cmd_abort(card, old_req);
++ 			mmc_blk_rw_try_restart(mq, new_req);
++ 			return;
+++>>>>>>> b2928e1049e1 (mmc: block: refactor mmc_blk_rw_try_restart())
+  		}
+  
+  		if (ret) {
+* Unmerged path drivers/mmc/core/block.c
