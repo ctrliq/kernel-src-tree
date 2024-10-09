@@ -1,0 +1,187 @@
+KEYS: prevent creating a different user's keyrings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Biggers <ebiggers@google.com>
+commit 237bbd29f7a049d310d907f4b2716a7feef9abf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/237bbd29.failed
+
+It was possible for an unprivileged user to create the user and user
+session keyrings for another user.  For example:
+
+    sudo -u '#3000' sh -c 'keyctl add keyring _uid.4000 "" @u
+                           keyctl add keyring _uid_ses.4000 "" @u
+                           sleep 15' &
+    sleep 1
+    sudo -u '#4000' keyctl describe @u
+    sudo -u '#4000' keyctl describe @us
+
+This is problematic because these "fake" keyrings won't have the right
+permissions.  In particular, the user who created them first will own
+them and will have full access to them via the possessor permissions,
+which can be used to compromise the security of a user's keys:
+
+    -4: alswrv-----v------------  3000     0 keyring: _uid.4000
+    -5: alswrv-----v------------  3000     0 keyring: _uid_ses.4000
+
+Fix it by marking user and user session keyrings with a flag
+KEY_FLAG_UID_KEYRING.  Then, when searching for a user or user session
+keyring by name, skip all keyrings that don't have the flag set.
+
+Fixes: 69664cf16af4 ("keys: don't generate user and user session keyrings unless they're accessed")
+	Cc: <stable@vger.kernel.org>	[v2.6.26+]
+	Signed-off-by: Eric Biggers <ebiggers@google.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+(cherry picked from commit 237bbd29f7a049d310d907f4b2716a7feef9abf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/key.h
+#	security/keys/key.c
+#	security/keys/keyring.c
+#	security/keys/process_keys.c
+diff --cc include/linux/key.h
+index 1f08a8d33a01,e315e16b6ff8..000000000000
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@@ -167,10 -184,10 +167,17 @@@ struct key 
+  #define KEY_FLAG_NEGATIVE	5	/* set if key is negative */
+  #define KEY_FLAG_ROOT_CAN_CLEAR	6	/* set if key can be cleared by root without permission */
+  #define KEY_FLAG_INVALIDATED	7	/* set if key has been invalidated */
+++<<<<<<< HEAD
+ +#define KEY_FLAG_TRUSTED	8	/* set if key is trusted */
+ +#define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
+ +#define KEY_FLAG_BUILTIN	10	/* set if key is builtin */
+ +#define KEY_FLAG_ROOT_CAN_INVAL	11	/* set if key can be invalidated by root without permission */
+++=======
++ #define KEY_FLAG_BUILTIN	8	/* set if key is built in to the kernel */
++ #define KEY_FLAG_ROOT_CAN_INVAL	9	/* set if key can be invalidated by root without permission */
++ #define KEY_FLAG_KEEP		10	/* set if key should not be removed */
++ #define KEY_FLAG_UID_KEYRING	11	/* set if key is a user or user session keyring */
+++>>>>>>> 237bbd29f7a0 (KEYS: prevent creating a different user's keyrings)
+  
+  	/* the key type and key description string
+  	 * - the desc is used to match a key against search criteria
+@@@ -215,13 -235,16 +222,22 @@@ extern struct key *key_alloc(struct key
+  			     kuid_t uid, kgid_t gid,
+  			     const struct cred *cred,
+  			     key_perm_t perm,
+ -			     unsigned long flags,
+ -			     struct key_restriction *restrict_link);
+ +			     unsigned long flags);
+  
+  
+++<<<<<<< HEAD
+ +#define KEY_ALLOC_IN_QUOTA	0x0000	/* add to quota, reject if would overrun */
+ +#define KEY_ALLOC_QUOTA_OVERRUN	0x0001	/* add to quota, permit even if overrun */
+ +#define KEY_ALLOC_NOT_IN_QUOTA	0x0002	/* not in quota */
+ +#define KEY_ALLOC_TRUSTED	0x0004	/* Key should be flagged as trusted */
+++=======
++ #define KEY_ALLOC_IN_QUOTA		0x0000	/* add to quota, reject if would overrun */
++ #define KEY_ALLOC_QUOTA_OVERRUN		0x0001	/* add to quota, permit even if overrun */
++ #define KEY_ALLOC_NOT_IN_QUOTA		0x0002	/* not in quota */
++ #define KEY_ALLOC_BUILT_IN		0x0004	/* Key is built into kernel */
++ #define KEY_ALLOC_BYPASS_RESTRICTION	0x0008	/* Override the check on restricted keyrings */
++ #define KEY_ALLOC_UID_KEYRING		0x0010	/* allocating a user or user session keyring */
+++>>>>>>> 237bbd29f7a0 (KEYS: prevent creating a different user's keyrings)
+  
+  extern void key_revoke(struct key *key);
+  extern void key_invalidate(struct key *key);
+diff --cc security/keys/key.c
+index 9b4a0b3ff629,e5c0896c3a8f..000000000000
+--- a/security/keys/key.c
++++ b/security/keys/key.c
+@@@ -296,8 -299,11 +296,15 @@@ struct key *key_alloc(struct key_type *
+  
+  	if (!(flags & KEY_ALLOC_NOT_IN_QUOTA))
+  		key->flags |= 1 << KEY_FLAG_IN_QUOTA;
+++<<<<<<< HEAD
+ +	if (flags & KEY_ALLOC_TRUSTED)
+ +		key->flags |= 1 << KEY_FLAG_TRUSTED;
+++=======
++ 	if (flags & KEY_ALLOC_BUILT_IN)
++ 		key->flags |= 1 << KEY_FLAG_BUILTIN;
++ 	if (flags & KEY_ALLOC_UID_KEYRING)
++ 		key->flags |= 1 << KEY_FLAG_UID_KEYRING;
+++>>>>>>> 237bbd29f7a0 (KEYS: prevent creating a different user's keyrings)
+  
+  #ifdef KEY_DEBUGGING
+  	key->magic = KEY_DEBUG_MAGIC;
+diff --cc security/keys/keyring.c
+index 001cd5fa73ad,4fa82a8a9c0e..000000000000
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@@ -969,10 -1133,15 +969,22 @@@ struct key *find_keyring_by_name(const 
+  			if (strcmp(keyring->description, name) != 0)
+  				continue;
+  
+++<<<<<<< HEAD
+ +			if (!skip_perm_check &&
+ +			    key_permission(make_key_ref(keyring, 0),
+ +					   KEY_SEARCH) < 0)
+ +				continue;
+++=======
++ 			if (uid_keyring) {
++ 				if (!test_bit(KEY_FLAG_UID_KEYRING,
++ 					      &keyring->flags))
++ 					continue;
++ 			} else {
++ 				if (key_permission(make_key_ref(keyring, 0),
++ 						   KEY_NEED_SEARCH) < 0)
++ 					continue;
++ 			}
+++>>>>>>> 237bbd29f7a0 (KEYS: prevent creating a different user's keyrings)
+  
+  			/* we've got a match but we might end up racing with
+  			 * key_cleanup() if the keyring is currently 'dead'
+diff --cc security/keys/process_keys.c
+index 221b509138f9,293d3598153b..000000000000
+--- a/security/keys/process_keys.c
++++ b/security/keys/process_keys.c
+@@@ -76,7 -77,9 +76,13 @@@ int install_user_keyrings(void
+  		if (IS_ERR(uid_keyring)) {
+  			uid_keyring = keyring_alloc(buf, user->uid, INVALID_GID,
+  						    cred, user_keyring_perm,
+++<<<<<<< HEAD
+ +						    KEY_ALLOC_IN_QUOTA, NULL);
+++=======
++ 						    KEY_ALLOC_UID_KEYRING |
++ 							KEY_ALLOC_IN_QUOTA,
++ 						    NULL, NULL);
+++>>>>>>> 237bbd29f7a0 (KEYS: prevent creating a different user's keyrings)
+  			if (IS_ERR(uid_keyring)) {
+  				ret = PTR_ERR(uid_keyring);
+  				goto error;
+@@@ -92,7 -95,9 +98,13 @@@
+  			session_keyring =
+  				keyring_alloc(buf, user->uid, INVALID_GID,
+  					      cred, user_keyring_perm,
+++<<<<<<< HEAD
+ +					      KEY_ALLOC_IN_QUOTA, NULL);
+++=======
++ 					      KEY_ALLOC_UID_KEYRING |
++ 						  KEY_ALLOC_IN_QUOTA,
++ 					      NULL, NULL);
+++>>>>>>> 237bbd29f7a0 (KEYS: prevent creating a different user's keyrings)
+  			if (IS_ERR(session_keyring)) {
+  				ret = PTR_ERR(session_keyring);
+  				goto error_release;
+* Unmerged path include/linux/key.h
+diff --git a/security/keys/internal.h b/security/keys/internal.h
+index 6d5c72e6c717..8859fcff15bc 100644
+--- a/security/keys/internal.h
++++ b/security/keys/internal.h
+@@ -138,7 +138,7 @@ extern key_ref_t keyring_search_aux(key_ref_t keyring_ref,
+ extern key_ref_t search_my_process_keyrings(struct keyring_search_context *ctx);
+ extern key_ref_t search_process_keyrings(struct keyring_search_context *ctx);
+ 
+-extern struct key *find_keyring_by_name(const char *name, bool skip_perm_check);
++extern struct key *find_keyring_by_name(const char *name, bool uid_keyring);
+ 
+ extern int install_user_keyrings(void);
+ extern int install_thread_keyring_to_cred(struct cred *);
+* Unmerged path security/keys/key.c
+* Unmerged path security/keys/keyring.c
+* Unmerged path security/keys/process_keys.c
