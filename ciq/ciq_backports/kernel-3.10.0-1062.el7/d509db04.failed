@@ -1,0 +1,442 @@
+perf tools: Compile scriptlets to BPF objects when passing '.c' to --event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit d509db0473e40134286271b1d1adadccf42ac467
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d509db04.failed
+
+This patch provides infrastructure for passing source files to --event
+directly using:
+
+ # perf record --event bpf-file.c command
+
+This patch does following works:
+
+ 1) Allow passing '.c' file to '--event'. parse_events_load_bpf() is
+    expanded to allow caller tell it whether the passed file is source
+    file or object.
+
+ 2) llvm__compile_bpf() is called to compile the '.c' file, the result
+    is saved into memory. Use bpf_object__open_buffer() to load the
+    in-memory object.
+
+Introduces a bpf-script-example.c so we can manually test it:
+
+ # perf record --clang-opt "-DLINUX_VERSION_CODE=0x40200" --event ./bpf-script-example.c sleep 1
+
+Note that '--clang-opt' must put before '--event'.
+
+Futher patches will merge it into a testcase so can be tested automatically.
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Kaixu Xia <xiakaixu@huawei.com>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1444826502-49291-10-git-send-email-wangnan0@huawei.com
+	Signed-off-by: He Kuang <hekuang@huawei.com>
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit d509db0473e40134286271b1d1adadccf42ac467)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/bpf-loader.c
+#	tools/perf/util/parse-events.c
+#	tools/perf/util/parse-events.h
+#	tools/perf/util/parse-events.l
+#	tools/perf/util/parse-events.y
+diff --cc tools/perf/util/bpf-loader.c
+index ab56073c5d6e,ba6f7526b282..000000000000
+--- a/tools/perf/util/bpf-loader.c
++++ b/tools/perf/util/bpf-loader.c
+@@@ -10,6 -10,9 +10,12 @@@
+  #include "perf.h"
+  #include "debug.h"
+  #include "bpf-loader.h"
+++<<<<<<< HEAD
+++=======
++ #include "probe-event.h"
++ #include "probe-finder.h" // for MAX_PROBES
++ #include "llvm-utils.h"
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  
+  #define DEFINE_PRINT_FN(name, level) \
+  static int libbpf_##name(const char *fmt, ...)	\
+@@@ -27,7 -30,11 +33,15 @@@ DEFINE_PRINT_FN(warning, 0
+  DEFINE_PRINT_FN(info, 0)
+  DEFINE_PRINT_FN(debug, 1)
+  
+++<<<<<<< HEAD
+ +struct bpf_object *bpf__prepare_load(const char *filename)
+++=======
++ struct bpf_prog_priv {
++ 	struct perf_probe_event pev;
++ };
++ 
++ struct bpf_object *bpf__prepare_load(const char *filename, bool source)
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  {
+  	struct bpf_object *obj;
+  	static bool libbpf_initialized;
+diff --cc tools/perf/util/parse-events.c
+index 3a234b74d6ff,bee60583839a..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -590,6 -530,130 +590,133 @@@ static int add_tracepoint_multi_sys(str
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct __add_bpf_event_param {
++ 	struct parse_events_evlist *data;
++ 	struct list_head *list;
++ };
++ 
++ static int add_bpf_event(struct probe_trace_event *tev, int fd,
++ 			 void *_param)
++ {
++ 	LIST_HEAD(new_evsels);
++ 	struct __add_bpf_event_param *param = _param;
++ 	struct parse_events_evlist *evlist = param->data;
++ 	struct list_head *list = param->list;
++ 	struct perf_evsel *pos;
++ 	int err;
++ 
++ 	pr_debug("add bpf event %s:%s and attach bpf program %d\n",
++ 		 tev->group, tev->event, fd);
++ 
++ 	err = parse_events_add_tracepoint(&new_evsels, &evlist->idx, tev->group,
++ 					  tev->event, evlist->error, NULL);
++ 	if (err) {
++ 		struct perf_evsel *evsel, *tmp;
++ 
++ 		pr_debug("Failed to add BPF event %s:%s\n",
++ 			 tev->group, tev->event);
++ 		list_for_each_entry_safe(evsel, tmp, &new_evsels, node) {
++ 			list_del(&evsel->node);
++ 			perf_evsel__delete(evsel);
++ 		}
++ 		return err;
++ 	}
++ 	pr_debug("adding %s:%s\n", tev->group, tev->event);
++ 
++ 	list_for_each_entry(pos, &new_evsels, node) {
++ 		pr_debug("adding %s:%s to %p\n",
++ 			 tev->group, tev->event, pos);
++ 		pos->bpf_fd = fd;
++ 	}
++ 	list_splice(&new_evsels, list);
++ 	return 0;
++ }
++ 
++ int parse_events_load_bpf_obj(struct parse_events_evlist *data,
++ 			      struct list_head *list,
++ 			      struct bpf_object *obj)
++ {
++ 	int err;
++ 	char errbuf[BUFSIZ];
++ 	struct __add_bpf_event_param param = {data, list};
++ 	static bool registered_unprobe_atexit = false;
++ 
++ 	if (IS_ERR(obj) || !obj) {
++ 		snprintf(errbuf, sizeof(errbuf),
++ 			 "Internal error: load bpf obj with NULL");
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
++ 
++ 	/*
++ 	 * Register atexit handler before calling bpf__probe() so
++ 	 * bpf__probe() don't need to unprobe probe points its already
++ 	 * created when failure.
++ 	 */
++ 	if (!registered_unprobe_atexit) {
++ 		atexit(bpf__clear);
++ 		registered_unprobe_atexit = true;
++ 	}
++ 
++ 	err = bpf__probe(obj);
++ 	if (err) {
++ 		bpf__strerror_probe(obj, err, errbuf, sizeof(errbuf));
++ 		goto errout;
++ 	}
++ 
++ 	err = bpf__load(obj);
++ 	if (err) {
++ 		bpf__strerror_load(obj, err, errbuf, sizeof(errbuf));
++ 		goto errout;
++ 	}
++ 
++ 	err = bpf__foreach_tev(obj, add_bpf_event, &param);
++ 	if (err) {
++ 		snprintf(errbuf, sizeof(errbuf),
++ 			 "Attach events in BPF object failed");
++ 		goto errout;
++ 	}
++ 
++ 	return 0;
++ errout:
++ 	data->error->help = strdup("(add -v to see detail)");
++ 	data->error->str = strdup(errbuf);
++ 	return err;
++ }
++ 
++ int parse_events_load_bpf(struct parse_events_evlist *data,
++ 			  struct list_head *list,
++ 			  char *bpf_file_name,
++ 			  bool source)
++ {
++ 	struct bpf_object *obj;
++ 
++ 	obj = bpf__prepare_load(bpf_file_name, source);
++ 	if (IS_ERR(obj) || !obj) {
++ 		char errbuf[BUFSIZ];
++ 		int err;
++ 
++ 		err = obj ? PTR_ERR(obj) : -EINVAL;
++ 
++ 		if (err == -ENOTSUP)
++ 			snprintf(errbuf, sizeof(errbuf),
++ 				 "BPF support is not compiled");
++ 		else
++ 			snprintf(errbuf, sizeof(errbuf),
++ 				 "BPF object file '%s' is invalid",
++ 				 bpf_file_name);
++ 
++ 		data->error->help = strdup("(add -v to see detail)");
++ 		data->error->str = strdup(errbuf);
++ 		return err;
++ 	}
++ 
++ 	return parse_events_load_bpf_obj(data, list, obj);
++ }
++ 
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  static int
+  parse_breakpoint_type(const char *type, struct perf_event_attr *attr)
+  {
+diff --cc tools/perf/util/parse-events.h
+index 411808bd5db5,f1a6db107241..000000000000
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@@ -128,10 -120,19 +128,23 @@@ int parse_events__modifier_event(struc
+  int parse_events__modifier_group(struct list_head *list, char *event_mod);
+  int parse_events_name(struct list_head *list, char *name);
+  int parse_events_add_tracepoint(struct list_head *list, int *idx,
+ -				char *sys, char *event,
+ +				const char *sys, const char *event,
+  				struct parse_events_error *error,
+  				struct list_head *head_config);
+++<<<<<<< HEAD
+ +int parse_events_add_numeric(struct parse_events_state *parse_state,
+++=======
++ int parse_events_load_bpf(struct parse_events_evlist *data,
++ 			  struct list_head *list,
++ 			  char *bpf_file_name,
++ 			  bool source);
++ /* Provide this function for perf test */
++ struct bpf_object;
++ int parse_events_load_bpf_obj(struct parse_events_evlist *data,
++ 			      struct list_head *list,
++ 			      struct bpf_object *obj);
++ int parse_events_add_numeric(struct parse_events_evlist *data,
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  			     struct list_head *list,
+  			     u32 type, u64 config,
+  			     struct list_head *head_config);
+diff --cc tools/perf/util/parse-events.l
+index 32c8c241ab5c,58c5831ffd5c..000000000000
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@@ -135,6 -115,8 +135,11 @@@ do {							
+  group		[^,{}/]*[{][^}]*[}][^,{}/]*
+  event_pmu	[^,{}/]+[/][^/]*[/][^,{}/]*
+  event		[^,{}/]+
+++<<<<<<< HEAD
+++=======
++ bpf_object	.*\.(o|bpf)
++ bpf_source	.*\.c
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  
+  num_dec		[0-9]+
+  num_hex		0x[a-fA-F0-9]+
+@@@ -180,6 -161,8 +185,11 @@@ modifier_bp	[rwx]{1,3
+  		}
+  
+  {event_pmu}	|
+++<<<<<<< HEAD
+++=======
++ {bpf_object}	|
++ {bpf_source}	|
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  {event}		{
+  			BEGIN(INITIAL);
+  			REWIND(1);
+@@@ -291,6 -270,8 +301,11 @@@ r{num_raw_hex}		{ return raw(yyscanner)
+  {num_hex}		{ return value(yyscanner, 16); }
+  
+  {modifier_event}	{ return str(yyscanner, PE_MODIFIER_EVENT); }
+++<<<<<<< HEAD
+++=======
++ {bpf_object}		{ return str(yyscanner, PE_BPF_OBJECT); }
++ {bpf_source}		{ return str(yyscanner, PE_BPF_SOURCE); }
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  {name}			{ return pmu_str_check(yyscanner); }
+  "/"			{ BEGIN(config); return '/'; }
+  -			{ return '-'; }
+diff --cc tools/perf/util/parse-events.y
+index b7975dc972b1,ad379968d4c1..000000000000
+--- a/tools/perf/util/parse-events.y
++++ b/tools/perf/util/parse-events.y
+@@@ -46,6 -42,7 +46,10 @@@ static void inc_group_count(struct list
+  %token PE_VALUE PE_VALUE_SYM_HW PE_VALUE_SYM_SW PE_RAW PE_TERM
+  %token PE_EVENT_NAME
+  %token PE_NAME
+++<<<<<<< HEAD
+++=======
++ %token PE_BPF_OBJECT PE_BPF_SOURCE
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  %token PE_MODIFIER_EVENT PE_MODIFIER_BP
+  %token PE_NAME_CACHE_TYPE PE_NAME_CACHE_OP_RESULT
+  %token PE_PREFIX_MEM PE_PREFIX_RAW PE_PREFIX_GROUP
+@@@ -58,6 -54,8 +62,11 @@@
+  %type <num> PE_RAW
+  %type <num> PE_TERM
+  %type <str> PE_NAME
+++<<<<<<< HEAD
+++=======
++ %type <str> PE_BPF_OBJECT
++ %type <str> PE_BPF_SOURCE
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  %type <str> PE_NAME_CACHE_TYPE
+  %type <str> PE_NAME_CACHE_OP_RESULT
+  %type <str> PE_MODIFIER_EVENT
+@@@ -438,19 -454,26 +447,39 @@@ PE_RAW opt_event_confi
+  	$$ = list;
+  }
+  
+ -event_bpf_file:
+ -PE_BPF_OBJECT
+ +opt_event_config:
+ +'/' event_config '/'
+  {
+++<<<<<<< HEAD
+ +	$$ = $2;
+ +}
+ +|
+ +'/' '/'
+ +{
+ +	$$ = NULL;
+ +}
+ +|
+ +{
+ +	$$ = NULL;
+++=======
++ 	struct parse_events_evlist *data = _data;
++ 	struct parse_events_error *error = data->error;
++ 	struct list_head *list;
++ 
++ 	ALLOC_LIST(list);
++ 	ABORT_ON(parse_events_load_bpf(data, list, $1, false));
++ 	$$ = list;
++ }
++ |
++ PE_BPF_SOURCE
++ {
++ 	struct parse_events_evlist *data = _data;
++ 	struct list_head *list;
++ 
++ 	ALLOC_LIST(list);
++ 	ABORT_ON(parse_events_load_bpf(data, list, $1, true));
++ 	$$ = list;
+++>>>>>>> d509db0473e4 (perf tools: Compile scriptlets to BPF objects when passing '.c' to --event)
+  }
+  
+  start_terms: event_config
+diff --git a/tools/perf/tests/bpf-script-example.c b/tools/perf/tests/bpf-script-example.c
+new file mode 100644
+index 000000000000..410a70b93b93
+--- /dev/null
++++ b/tools/perf/tests/bpf-script-example.c
+@@ -0,0 +1,44 @@
++#ifndef LINUX_VERSION_CODE
++# error Need LINUX_VERSION_CODE
++# error Example: for 4.2 kernel, put 'clang-opt="-DLINUX_VERSION_CODE=0x40200" into llvm section of ~/.perfconfig'
++#endif
++#define BPF_ANY 0
++#define BPF_MAP_TYPE_ARRAY 2
++#define BPF_FUNC_map_lookup_elem 1
++#define BPF_FUNC_map_update_elem 2
++
++static void *(*bpf_map_lookup_elem)(void *map, void *key) =
++	(void *) BPF_FUNC_map_lookup_elem;
++static void *(*bpf_map_update_elem)(void *map, void *key, void *value, int flags) =
++	(void *) BPF_FUNC_map_update_elem;
++
++struct bpf_map_def {
++	unsigned int type;
++	unsigned int key_size;
++	unsigned int value_size;
++	unsigned int max_entries;
++};
++
++#define SEC(NAME) __attribute__((section(NAME), used))
++struct bpf_map_def SEC("maps") flip_table = {
++	.type = BPF_MAP_TYPE_ARRAY,
++	.key_size = sizeof(int),
++	.value_size = sizeof(int),
++	.max_entries = 1,
++};
++
++SEC("func=sys_epoll_pwait")
++int bpf_func__sys_epoll_pwait(void *ctx)
++{
++	int ind =0;
++	int *flag = bpf_map_lookup_elem(&flip_table, &ind);
++	int new_flag;
++	if (!flag)
++		return 0;
++	/* flip flag and store back */
++	new_flag = !*flag;
++	bpf_map_update_elem(&flip_table, &ind, &new_flag, BPF_ANY);
++	return new_flag;
++}
++char _license[] SEC("license") = "GPL";
++int _version SEC("version") = LINUX_VERSION_CODE;
+* Unmerged path tools/perf/util/bpf-loader.c
+diff --git a/tools/perf/util/bpf-loader.h b/tools/perf/util/bpf-loader.h
+index f402d7c8c288..e794a9a6eca5 100644
+--- a/tools/perf/util/bpf-loader.h
++++ b/tools/perf/util/bpf-loader.h
+@@ -13,12 +13,13 @@
+ struct bpf_object;
+ 
+ #ifdef HAVE_LIBBPF_SUPPORT
+-struct bpf_object *bpf__prepare_load(const char *filename);
++struct bpf_object *bpf__prepare_load(const char *filename, bool source);
+ 
+ void bpf__clear(void);
+ #else
+ static inline struct bpf_object *
+-bpf__prepare_load(const char *filename __maybe_unused)
++bpf__prepare_load(const char *filename __maybe_unused,
++		  bool source __maybe_unused)
+ {
+ 	pr_debug("ERROR: eBPF object loading is disabled during compiling.\n");
+ 	return ERR_PTR(-ENOTSUP);
+* Unmerged path tools/perf/util/parse-events.c
+* Unmerged path tools/perf/util/parse-events.h
+* Unmerged path tools/perf/util/parse-events.l
+* Unmerged path tools/perf/util/parse-events.y
