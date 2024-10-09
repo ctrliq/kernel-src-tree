@@ -1,0 +1,122 @@
+tcmu: Recalculate the tcmu_cmd size to save cmd area memories
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Xiubo Li <lixiubo@cmss.chinamobile.com>
+commit fe25cc347959b1efd18ee150165416aa6ed0ecdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fe25cc34.failed
+
+For the "struct tcmu_cmd_entry" in cmd area, the minimum size
+will be sizeof(struct tcmu_cmd_entry) == 112 Bytes. And it could
+fill about (sizeof(struct rsp) - sizeof(struct req)) /
+sizeof(struct iovec) == 68 / 16 ~= 4 data regions(iov[4]) by
+default.
+
+For most tcmu_cmds, the data block indexes allocated from the
+data area will be continuous. And for the continuous blocks they
+will be merged into the same region using only one iovec. For
+the current code, it will always allocates the same number of
+iovecs with blocks for each tcmu_cmd, and it will wastes much
+memories.
+
+For example, when the block size is 4K and the DATA_OUT buffer
+size is 64K, and the regions needed is less than 5(on my
+environment is almost 99.7%). The current code will allocate
+about 16 iovecs, and there will be (16 - 4) * sizeof(struct
+iovec) = 192 Bytes cmd area memories wasted.
+
+Here adds two helpers to calculate the base size and full size
+of the tcmu_cmd. And will recalculate them again when it make sure
+how many iovs is needed before insert it to cmd area.
+
+	Signed-off-by: Xiubo Li <lixiubo@cmss.chinamobile.com>
+	Acked-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit fe25cc347959b1efd18ee150165416aa6ed0ecdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 7dc2f05f8e5e,89b75ce563d8..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -544,19 -645,18 +565,32 @@@ tcmu_queue_cmd_ring(struct tcmu_cmd *tc
+  	 * Must be a certain minimum size for response sense info, but
+  	 * also may be larger if the iov array is large.
+  	 *
+++<<<<<<< HEAD
+ +	 * We prepare way too many iovs for potential uses here, because it's
+ +	 * expensive to tell how many regions are freed in the bitmap
+ +	*/
+ +	base_command_size = max(offsetof(struct tcmu_cmd_entry,
+ +				req.iov[se_cmd->t_bidi_data_nents +
+ +					se_cmd->t_data_nents]),
+ +				sizeof(struct tcmu_cmd_entry));
+ +	command_size = base_command_size
+ +		+ round_up(scsi_command_size(se_cmd->t_task_cdb), TCMU_OP_ALIGN_SIZE);
+ +
+ +	WARN_ON(command_size & (TCMU_OP_ALIGN_SIZE-1));
+++=======
++ 	 * We prepare as many iovs as possbile for potential uses here,
++ 	 * because it's expensive to tell how many regions are freed in
++ 	 * the bitmap & global data pool, as the size calculated here
++ 	 * will only be used to do the checks.
++ 	 *
++ 	 * The size will be recalculated later as actually needed to save
++ 	 * cmd area memories.
++ 	 */
++ 	base_command_size = tcmu_cmd_get_base_cmd_size(tcmu_cmd->dbi_cnt);
++ 	command_size = tcmu_cmd_get_cmd_size(tcmu_cmd, base_command_size);
+++>>>>>>> fe25cc347959 (tcmu: Recalculate the tcmu_cmd size to save cmd area memories)
+  
+ -	mutex_lock(&udev->cmdr_lock);
+ +	spin_lock_irq(&udev->cmdr_lock);
+  
+  	mb = udev->mb_addr;
+  	cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
+@@@ -638,15 -739,33 +671,25 @@@
+  	entry->req.iov_dif_cnt = 0;
+  
+  	/* Handle BIDI commands */
+ -	if (se_cmd->se_cmd_flags & SCF_BIDI) {
+ -		iov_cnt = 0;
+ -		iov++;
+ -		ret = scatter_data_area(udev, tcmu_cmd,
+ -					se_cmd->t_bidi_data_sg,
+ -					se_cmd->t_bidi_data_nents,
+ -					&iov, &iov_cnt, false);
+ -		if (ret) {
+ -			tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
+ -			mutex_unlock(&udev->cmdr_lock);
+ -
+ -			pr_err("tcmu: alloc and scatter bidi data failed\n");
+ -			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ -		}
+ -		entry->req.iov_bidi_cnt = iov_cnt;
+ -	}
+ +	iov_cnt = 0;
+ +	alloc_and_scatter_data_area(udev, se_cmd->t_bidi_data_sg,
+ +		se_cmd->t_bidi_data_nents, &iov, &iov_cnt, false);
+ +	entry->req.iov_bidi_cnt = iov_cnt;
+ +
+ +	/* cmd's data_bitmap is what changed in process */
+ +	bitmap_xor(tcmu_cmd->data_bitmap, old_bitmap, udev->data_bitmap,
+ +			DATA_BLOCK_BITS);
+  
++ 	/*
++ 	 * Recalaulate the command's base size and size according
++ 	 * to the actual needs
++ 	 */
++ 	base_command_size = tcmu_cmd_get_base_cmd_size(entry->req.iov_cnt +
++ 						       entry->req.iov_bidi_cnt);
++ 	command_size = tcmu_cmd_get_cmd_size(tcmu_cmd, base_command_size);
++ 
++ 	tcmu_hdr_set_len(&entry->hdr.len_op, command_size);
++ 
+  	/* All offsets relative to mb_addr, not start of entry! */
+  	cdb_off = CMDR_OFF + cmd_head + base_command_size;
+  	memcpy((void *) mb + cdb_off, se_cmd->t_task_cdb, scsi_command_size(se_cmd->t_task_cdb));
+* Unmerged path drivers/target/target_core_user.c
