@@ -1,0 +1,337 @@
+x86/intel_rdt/mbm: Add mbm counter initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mbm: Add mbm counter initialization (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 95.74%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit a4de1dfdd726537e2a78b55759fc646d9b0a0be8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a4de1dfd.failed
+
+MBM counters are monotonically increasing counts representing the total
+memory bytes at a particular time. In order to calculate total_bytes for
+an rdtgroup, we store the value of the counter when we create an
+rdtgroup or when a new domain comes online.
+
+When the total_bytes(all memory controller bytes) or local_bytes(local
+memory controller bytes) file in "mon_data" is read it shows the
+total bytes for that rdtgroup since its creation. User can snapshot this
+at different time intervals to obtain bytes/second.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+	Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-28-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit a4de1dfdd726537e2a78b55759fc646d9b0a0be8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt_monitor.c
+#	arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+#	arch/x86/kernel/cpu/intel_rdt_schemata.c
+diff --cc arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+index 1c3603d97e9d,05088e301ef8..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
++++ b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+@@@ -932,23 -1303,203 +932,206 @@@ static struct file_system_type rdt_fs_t
+  	.kill_sb = rdt_kill_sb,
+  };
+  
+ -static int mon_addfile(struct kernfs_node *parent_kn, const char *name,
+ -		       void *priv)
+ +static int rdtgroup_mkdir(struct kernfs_node *parent_kn, const char *name,
+ +			  umode_t mode)
+  {
+ +	struct rdtgroup *parent, *rdtgrp;
+  	struct kernfs_node *kn;
+ -	int ret = 0;
+ +	int ret, closid;
+  
+ -	kn = __kernfs_create_file(parent_kn, name, 0444, 0,
+ -				  &kf_mondata_ops, priv, NULL, NULL);
+ -	if (IS_ERR(kn))
+ -		return PTR_ERR(kn);
+ +	/* Only allow mkdir in the root directory */
+ +	if (parent_kn != rdtgroup_default.kn)
+ +		return -EPERM;
+  
+ -	ret = rdtgroup_kn_set_ugid(kn);
+ -	if (ret) {
+ -		kernfs_remove(kn);
+ -		return ret;
+ -	}
+ +	/* Do not accept '\n' to avoid unparsable situation. */
+ +	if (strchr(name, '\n'))
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	parent = rdtgroup_kn_lock_live(parent_kn);
+ +	if (!parent) {
+++=======
++ 	return ret;
++ }
++ 
++ /*
++  * Remove all subdirectories of mon_data of ctrl_mon groups
++  * and monitor groups with given domain id.
++  */
++ void rmdir_mondata_subdir_allrdtgrp(struct rdt_resource *r, unsigned int dom_id)
++ {
++ 	struct rdtgroup *prgrp, *crgrp;
++ 	char name[32];
++ 
++ 	if (!r->mon_enabled)
++ 		return;
++ 
++ 	list_for_each_entry(prgrp, &rdt_all_groups, rdtgroup_list) {
++ 		sprintf(name, "mon_%s_%02d", r->name, dom_id);
++ 		kernfs_remove_by_name(prgrp->mon.mon_data_kn, name);
++ 
++ 		list_for_each_entry(crgrp, &prgrp->mon.crdtgrp_list, mon.crdtgrp_list)
++ 			kernfs_remove_by_name(crgrp->mon.mon_data_kn, name);
++ 	}
++ }
++ 
++ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
++ 				struct rdt_domain *d,
++ 				struct rdt_resource *r, struct rdtgroup *prgrp)
++ {
++ 	union mon_data_bits priv;
++ 	struct kernfs_node *kn;
++ 	struct mon_evt *mevt;
++ 	struct rmid_read rr;
++ 	char name[32];
++ 	int ret;
++ 
++ 	sprintf(name, "mon_%s_%02d", r->name, d->id);
++ 	/* create the directory */
++ 	kn = kernfs_create_dir(parent_kn, name, parent_kn->mode, prgrp);
++ 	if (IS_ERR(kn))
++ 		return PTR_ERR(kn);
++ 
++ 	/*
++ 	 * This extra ref will be put in kernfs_remove() and guarantees
++ 	 * that kn is always accessible.
++ 	 */
++ 	kernfs_get(kn);
++ 	ret = rdtgroup_kn_set_ugid(kn);
++ 	if (ret)
++ 		goto out_destroy;
++ 
++ 	if (WARN_ON(list_empty(&r->evt_list))) {
++ 		ret = -EPERM;
++ 		goto out_destroy;
++ 	}
++ 
++ 	priv.u.rid = r->rid;
++ 	priv.u.domid = d->id;
++ 	list_for_each_entry(mevt, &r->evt_list, list) {
++ 		priv.u.evtid = mevt->evtid;
++ 		ret = mon_addfile(kn, mevt->name, priv.priv);
++ 		if (ret)
++ 			goto out_destroy;
++ 
++ 		if (is_mbm_event(mevt->evtid))
++ 			mon_event_read(&rr, d, prgrp, mevt->evtid, true);
++ 	}
++ 	kernfs_activate(kn);
++ 	return 0;
++ 
++ out_destroy:
++ 	kernfs_remove(kn);
++ 	return ret;
++ }
++ 
++ /*
++  * Add all subdirectories of mon_data for "ctrl_mon" groups
++  * and "monitor" groups with given domain id.
++  */
++ void mkdir_mondata_subdir_allrdtgrp(struct rdt_resource *r,
++ 				    struct rdt_domain *d)
++ {
++ 	struct kernfs_node *parent_kn;
++ 	struct rdtgroup *prgrp, *crgrp;
++ 	struct list_head *head;
++ 
++ 	if (!r->mon_enabled)
++ 		return;
++ 
++ 	list_for_each_entry(prgrp, &rdt_all_groups, rdtgroup_list) {
++ 		parent_kn = prgrp->mon.mon_data_kn;
++ 		mkdir_mondata_subdir(parent_kn, d, r, prgrp);
++ 
++ 		head = &prgrp->mon.crdtgrp_list;
++ 		list_for_each_entry(crgrp, head, mon.crdtgrp_list) {
++ 			parent_kn = crgrp->mon.mon_data_kn;
++ 			mkdir_mondata_subdir(parent_kn, d, r, crgrp);
++ 		}
++ 	}
++ }
++ 
++ static int mkdir_mondata_subdir_alldom(struct kernfs_node *parent_kn,
++ 				       struct rdt_resource *r,
++ 				       struct rdtgroup *prgrp)
++ {
++ 	struct rdt_domain *dom;
++ 	int ret;
++ 
++ 	list_for_each_entry(dom, &r->domains, list) {
++ 		ret = mkdir_mondata_subdir(parent_kn, dom, r, prgrp);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * This creates a directory mon_data which contains the monitored data.
++  *
++  * mon_data has one directory for each domain whic are named
++  * in the format mon_<domain_name>_<domain_id>. For ex: A mon_data
++  * with L3 domain looks as below:
++  * ./mon_data:
++  * mon_L3_00
++  * mon_L3_01
++  * mon_L3_02
++  * ...
++  *
++  * Each domain directory has one file per event:
++  * ./mon_L3_00/:
++  * llc_occupancy
++  *
++  */
++ static int mkdir_mondata_all(struct kernfs_node *parent_kn,
++ 			     struct rdtgroup *prgrp,
++ 			     struct kernfs_node **dest_kn)
++ {
++ 	struct rdt_resource *r;
++ 	struct kernfs_node *kn;
++ 	int ret;
++ 
++ 	/*
++ 	 * Create the mon_data directory first.
++ 	 */
++ 	ret = mongroup_create_dir(parent_kn, NULL, "mon_data", &kn);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (dest_kn)
++ 		*dest_kn = kn;
++ 
++ 	/*
++ 	 * Create the subdirectories for each domain. Note that all events
++ 	 * in a domain like L3 are grouped into a resource whose domain is L3
++ 	 */
++ 	for_each_mon_enabled_rdt_resource(r) {
++ 		ret = mkdir_mondata_subdir_alldom(kn, r, prgrp);
++ 		if (ret)
++ 			goto out_destroy;
++ 	}
++ 
++ 	return 0;
++ 
++ out_destroy:
++ 	kernfs_remove(kn);
++ 	return ret;
++ }
++ 
++ static int mkdir_rdt_prepare(struct kernfs_node *parent_kn,
++ 			     struct kernfs_node *prgrp_kn,
++ 			     const char *name, umode_t mode,
++ 			     enum rdt_group_type rtype, struct rdtgroup **r)
++ {
++ 	struct rdtgroup *prdtgrp, *rdtgrp;
++ 	struct kernfs_node *kn;
++ 	uint files = 0;
++ 	int ret;
++ 
++ 	prdtgrp = rdtgroup_kn_lock_live(prgrp_kn);
++ 	if (!prdtgrp) {
+++>>>>>>> a4de1dfdd726 (x86/intel_rdt/mbm: Add mbm counter initialization)
+  		ret = -ENODEV;
+  		goto out_unlock;
+  	}
+diff --cc arch/x86/kernel/cpu/intel_rdt_schemata.c
+index 6efa856bc635,f6ea94f8954a..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_schemata.c
++++ b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+@@@ -235,3 -285,57 +235,60 @@@ int rdtgroup_schemata_show(struct kernf
+  	rdtgroup_kn_unlock(of->kn);
+  	return ret;
+  }
+++<<<<<<< HEAD:arch/x86/kernel/cpu/intel_rdt_schemata.c
+++=======
++ 
++ void mon_event_read(struct rmid_read *rr, struct rdt_domain *d,
++ 		    struct rdtgroup *rdtgrp, int evtid, int first)
++ {
++ 	/*
++ 	 * setup the parameters to send to the IPI to read the data.
++ 	 */
++ 	rr->rgrp = rdtgrp;
++ 	rr->evtid = evtid;
++ 	rr->d = d;
++ 	rr->val = 0;
++ 	rr->first = first;
++ 
++ 	smp_call_function_any(&d->cpu_mask, mon_event_count, rr, 1);
++ }
++ 
++ int rdtgroup_mondata_show(struct seq_file *m, void *arg)
++ {
++ 	struct kernfs_open_file *of = m->private;
++ 	u32 resid, evtid, domid;
++ 	struct rdtgroup *rdtgrp;
++ 	struct rdt_resource *r;
++ 	union mon_data_bits md;
++ 	struct rdt_domain *d;
++ 	struct rmid_read rr;
++ 	int ret = 0;
++ 
++ 	rdtgrp = rdtgroup_kn_lock_live(of->kn);
++ 
++ 	md.priv = of->kn->priv;
++ 	resid = md.u.rid;
++ 	domid = md.u.domid;
++ 	evtid = md.u.evtid;
++ 
++ 	r = &rdt_resources_all[resid];
++ 	d = rdt_find_domain(r, domid, NULL);
++ 	if (!d) {
++ 		ret = -ENOENT;
++ 		goto out;
++ 	}
++ 
++ 	mon_event_read(&rr, d, rdtgrp, evtid, false);
++ 
++ 	if (rr.val & RMID_VAL_ERROR)
++ 		seq_puts(m, "Error\n");
++ 	else if (rr.val & RMID_VAL_UNAVAIL)
++ 		seq_puts(m, "Unavailable\n");
++ 	else
++ 		seq_printf(m, "%llu\n", rr.val * r->mon_scale);
++ 
++ out:
++ 	rdtgroup_kn_unlock(of->kn);
++ 	return ret;
++ }
+++>>>>>>> a4de1dfdd726 (x86/intel_rdt/mbm: Add mbm counter initialization):arch/x86/kernel/cpu/intel_rdt_ctrlmondata.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_schemata.c
