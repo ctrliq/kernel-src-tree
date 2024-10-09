@@ -1,0 +1,353 @@
+handle suicide on late failure exits in execve() in search_binary_handler()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 19d860a140beac48a1377f179e693abe86a9dac9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/19d860a1.failed
+
+... rather than doing that in the guts of ->load_binary().
+[updated to fix the bug spotted by Shentino - for SIGSEGV we really need
+something stronger than send_sig_info(); again, better do that in one place]
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 19d860a140beac48a1377f179e693abe86a9dac9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/binfmt_elf.c
+#	fs/exec.c
+diff --cc fs/binfmt_elf.c
+index f8d26910a534,d8fc0605b9d2..000000000000
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@@ -746,14 -736,10 +746,12 @@@ static int load_elf_binary(struct linux
+  
+  	/* Do this so that we can load the interpreter, if need be.  We will
+  	   change some of these later */
+ +	current->mm->free_area_cache = current->mm->mmap_base;
+ +	current->mm->cached_hole_size = 0;
+  	retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+  				 executable_stack);
+- 	if (retval < 0) {
+- 		send_sig(SIGKILL, current, 0);
++ 	if (retval < 0)
+  		goto out_free_dentry;
+- 	}
+  	
+  	current->mm->start_stack = bprm->p;
+  
+@@@ -775,12 -760,9 +773,16 @@@
+  			   before this one. Map anonymous pages, if needed,
+  			   and clear the area.  */
+  			retval = set_brk(elf_bss + load_bias,
+++<<<<<<< HEAD
+ +					 elf_brk + load_bias,
+ +					 bss_prot);
+ +			if (retval) {
+ +				send_sig(SIGKILL, current, 0);
+++=======
++ 					 elf_brk + load_bias);
++ 			if (retval)
+++>>>>>>> 19d860a140be (handle suicide on late failure exits in execve() in search_binary_handler())
+  				goto out_free_dentry;
+- 			}
+  			nbyte = ELF_PAGEOFFSET(elf_bss);
+  			if (nbyte) {
+  				nbyte = ELF_MIN_ALIGN - nbyte;
+@@@ -870,9 -814,8 +872,8 @@@
+  		}
+  
+  		error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
+ -				elf_prot, elf_flags, 0);
+ +				elf_prot, elf_flags, total_size);
+  		if (BAD_ADDR(error)) {
+- 			send_sig(SIGKILL, current, 0);
+  			retval = IS_ERR((void *)error) ?
+  				PTR_ERR((void*)error) : -EINVAL;
+  			goto out_free_dentry;
+@@@ -936,13 -876,10 +936,16 @@@
+  	 * mapping in the interpreter, to make sure it doesn't wind
+  	 * up getting placed where the bss needs to go.
+  	 */
+++<<<<<<< HEAD
+ +	retval = set_brk(elf_bss, elf_brk, bss_prot);
+ +	if (retval) {
+ +		send_sig(SIGKILL, current, 0);
+++=======
++ 	retval = set_brk(elf_bss, elf_brk);
++ 	if (retval)
+++>>>>>>> 19d860a140be (handle suicide on late failure exits in execve() in search_binary_handler())
+  		goto out_free_dentry;
+- 	}
+  	if (likely(elf_bss != elf_brk) && unlikely(padzero(elf_bss))) {
+- 		send_sig(SIGSEGV, current, 0);
+  		retval = -EFAULT; /* Nobody gets to see this, but.. */
+  		goto out_free_dentry;
+  	}
+diff --cc fs/exec.c
+index c4d5468e9129,7302b75a9820..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -1435,6 -1363,50 +1435,53 @@@ int search_binary_handler(struct linux_
+  	if (retval)
+  		return retval;
+  
+++<<<<<<< HEAD
+++=======
++ 	retval = -ENOENT;
++  retry:
++ 	read_lock(&binfmt_lock);
++ 	list_for_each_entry(fmt, &formats, lh) {
++ 		if (!try_module_get(fmt->module))
++ 			continue;
++ 		read_unlock(&binfmt_lock);
++ 		bprm->recursion_depth++;
++ 		retval = fmt->load_binary(bprm);
++ 		read_lock(&binfmt_lock);
++ 		put_binfmt(fmt);
++ 		bprm->recursion_depth--;
++ 		if (retval < 0 && !bprm->mm) {
++ 			/* we got to flush_old_exec() and failed after it */
++ 			read_unlock(&binfmt_lock);
++ 			force_sigsegv(SIGSEGV, current);
++ 			return retval;
++ 		}
++ 		if (retval != -ENOEXEC || !bprm->file) {
++ 			read_unlock(&binfmt_lock);
++ 			return retval;
++ 		}
++ 	}
++ 	read_unlock(&binfmt_lock);
++ 
++ 	if (need_retry) {
++ 		if (printable(bprm->buf[0]) && printable(bprm->buf[1]) &&
++ 		    printable(bprm->buf[2]) && printable(bprm->buf[3]))
++ 			return retval;
++ 		if (request_module("binfmt-%04x", *(ushort *)(bprm->buf + 2)) < 0)
++ 			return retval;
++ 		need_retry = false;
++ 		goto retry;
++ 	}
++ 
++ 	return retval;
++ }
++ EXPORT_SYMBOL(search_binary_handler);
++ 
++ static int exec_binprm(struct linux_binprm *bprm)
++ {
++ 	pid_t old_pid, old_vpid;
++ 	int ret;
++ 
+++>>>>>>> 19d860a140be (handle suicide on late failure exits in execve() in search_binary_handler())
+  	/* Need to fetch pid before load_binary changes it */
+  	old_pid = current->pid;
+  	rcu_read_lock();
+diff --git a/arch/x86/ia32/ia32_aout.c b/arch/x86/ia32/ia32_aout.c
+index 52ff81cce008..2e307fbc9c8c 100644
+--- a/arch/x86/ia32/ia32_aout.c
++++ b/arch/x86/ia32/ia32_aout.c
+@@ -312,11 +312,8 @@ static int load_aout_binary(struct linux_binprm *bprm)
+ 	current->mm->cached_hole_size = 0;
+ 
+ 	retval = setup_arg_pages(bprm, IA32_STACK_TOP, EXSTACK_DEFAULT);
+-	if (retval < 0) {
+-		/* Someone check-me: is this error path enough? */
+-		send_sig(SIGKILL, current, 0);
++	if (retval < 0)
+ 		return retval;
+-	}
+ 
+ 	install_exec_creds(bprm);
+ 
+@@ -328,17 +325,13 @@ static int load_aout_binary(struct linux_binprm *bprm)
+ 
+ 		error = vm_brk(text_addr & PAGE_MASK, map_size);
+ 
+-		if (error != (text_addr & PAGE_MASK)) {
+-			send_sig(SIGKILL, current, 0);
++		if (error != (text_addr & PAGE_MASK))
+ 			return error;
+-		}
+ 
+ 		error = read_code(bprm->file, text_addr, 32,
+ 				  ex.a_text + ex.a_data);
+-		if ((signed long)error < 0) {
+-			send_sig(SIGKILL, current, 0);
++		if ((signed long)error < 0)
+ 			return error;
+-		}
+ 	} else {
+ #ifdef WARN_OLD
+ 		static unsigned long error_time, error_time2;
+@@ -372,20 +365,16 @@ static int load_aout_binary(struct linux_binprm *bprm)
+ 				MAP_EXECUTABLE | MAP_32BIT,
+ 				fd_offset);
+ 
+-		if (error != N_TXTADDR(ex)) {
+-			send_sig(SIGKILL, current, 0);
++		if (error != N_TXTADDR(ex))
+ 			return error;
+-		}
+ 
+ 		error = vm_mmap(bprm->file, N_DATADDR(ex), ex.a_data,
+ 				PROT_READ | PROT_WRITE | PROT_EXEC,
+ 				MAP_FIXED | MAP_PRIVATE | MAP_DENYWRITE |
+ 				MAP_EXECUTABLE | MAP_32BIT,
+ 				fd_offset + ex.a_text);
+-		if (error != N_DATADDR(ex)) {
+-			send_sig(SIGKILL, current, 0);
++		if (error != N_DATADDR(ex))
+ 			return error;
+-		}
+ 	}
+ beyond_if:
+ 	set_binfmt(&aout_format);
+diff --git a/fs/binfmt_aout.c b/fs/binfmt_aout.c
+index bce87694f7b0..b8a3d5a5eff6 100644
+--- a/fs/binfmt_aout.c
++++ b/fs/binfmt_aout.c
+@@ -259,11 +259,8 @@ static int load_aout_binary(struct linux_binprm * bprm)
+ 	current->mm->cached_hole_size = 0;
+ 
+ 	retval = setup_arg_pages(bprm, STACK_TOP, EXSTACK_DEFAULT);
+-	if (retval < 0) {
+-		/* Someone check-me: is this error path enough? */
+-		send_sig(SIGKILL, current, 0);
++	if (retval < 0)
+ 		return retval;
+-	}
+ 
+ 	install_exec_creds(bprm);
+ 
+@@ -281,17 +278,13 @@ static int load_aout_binary(struct linux_binprm * bprm)
+ 		map_size = ex.a_text+ex.a_data;
+ #endif
+ 		error = vm_brk(text_addr & PAGE_MASK, map_size);
+-		if (error != (text_addr & PAGE_MASK)) {
+-			send_sig(SIGKILL, current, 0);
++		if (error != (text_addr & PAGE_MASK))
+ 			return error;
+-		}
+ 
+ 		error = read_code(bprm->file, text_addr, pos,
+ 				  ex.a_text+ex.a_data);
+-		if ((signed long)error < 0) {
+-			send_sig(SIGKILL, current, 0);
++		if ((signed long)error < 0)
+ 			return error;
+-		}
+ 	} else {
+ 		if ((ex.a_text & 0xfff || ex.a_data & 0xfff) &&
+ 		    (N_MAGIC(ex) != NMAGIC) && printk_ratelimit())
+@@ -318,28 +311,22 @@ static int load_aout_binary(struct linux_binprm * bprm)
+ 			MAP_FIXED | MAP_PRIVATE | MAP_DENYWRITE | MAP_EXECUTABLE,
+ 			fd_offset);
+ 
+-		if (error != N_TXTADDR(ex)) {
+-			send_sig(SIGKILL, current, 0);
++		if (error != N_TXTADDR(ex))
+ 			return error;
+-		}
+ 
+ 		error = vm_mmap(bprm->file, N_DATADDR(ex), ex.a_data,
+ 				PROT_READ | PROT_WRITE | PROT_EXEC,
+ 				MAP_FIXED | MAP_PRIVATE | MAP_DENYWRITE | MAP_EXECUTABLE,
+ 				fd_offset + ex.a_text);
+-		if (error != N_DATADDR(ex)) {
+-			send_sig(SIGKILL, current, 0);
++		if (error != N_DATADDR(ex))
+ 			return error;
+-		}
+ 	}
+ beyond_if:
+ 	set_binfmt(&aout_format);
+ 
+ 	retval = set_brk(current->mm->start_brk, current->mm->brk);
+-	if (retval < 0) {
+-		send_sig(SIGKILL, current, 0);
++	if (retval < 0)
+ 		return retval;
+-	}
+ 
+ 	current->mm->start_stack =
+ 		(unsigned long) create_aout_tables((char __user *) bprm->p, bprm);
+* Unmerged path fs/binfmt_elf.c
+diff --git a/fs/binfmt_elf_fdpic.c b/fs/binfmt_elf_fdpic.c
+index 730035e2eb0c..4ab2ad56aa0f 100644
+--- a/fs/binfmt_elf_fdpic.c
++++ b/fs/binfmt_elf_fdpic.c
+@@ -318,8 +318,8 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm)
+ 		goto error;
+ 
+ 	/* there's now no turning back... the old userspace image is dead,
+-	 * defunct, deceased, etc. after this point we have to exit via
+-	 * error_kill */
++	 * defunct, deceased, etc.
++	 */
+ 	set_personality(PER_LINUX_FDPIC);
+ 	if (elf_read_implies_exec(&exec_params.hdr, executable_stack))
+ 		current->personality |= READ_IMPLIES_EXEC;
+@@ -344,24 +344,22 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm)
+ 
+ 	retval = setup_arg_pages(bprm, current->mm->start_stack,
+ 				 executable_stack);
+-	if (retval < 0) {
+-		send_sig(SIGKILL, current, 0);
+-		goto error_kill;
+-	}
++	if (retval < 0)
++		goto error;
+ #endif
+ 
+ 	/* load the executable and interpreter into memory */
+ 	retval = elf_fdpic_map_file(&exec_params, bprm->file, current->mm,
+ 				    "executable");
+ 	if (retval < 0)
+-		goto error_kill;
++		goto error;
+ 
+ 	if (interpreter_name) {
+ 		retval = elf_fdpic_map_file(&interp_params, interpreter,
+ 					    current->mm, "interpreter");
+ 		if (retval < 0) {
+ 			printk(KERN_ERR "Unable to load interpreter\n");
+-			goto error_kill;
++			goto error;
+ 		}
+ 
+ 		allow_write_access(interpreter);
+@@ -398,7 +396,7 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm)
+ 	if (IS_ERR_VALUE(current->mm->start_brk)) {
+ 		retval = current->mm->start_brk;
+ 		current->mm->start_brk = 0;
+-		goto error_kill;
++		goto error;
+ 	}
+ 
+ 	current->mm->brk = current->mm->start_brk;
+@@ -411,7 +409,7 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm)
+ 	install_exec_creds(bprm);
+ 	if (create_elf_fdpic_tables(bprm, current->mm,
+ 				    &exec_params, &interp_params) < 0)
+-		goto error_kill;
++		goto error;
+ 
+ 	kdebug("- start_code  %lx", current->mm->start_code);
+ 	kdebug("- end_code    %lx", current->mm->end_code);
+@@ -450,12 +448,6 @@ error:
+ 	kfree(interp_params.phdrs);
+ 	kfree(interp_params.loadmap);
+ 	return retval;
+-
+-	/* unrecoverable error - kill the process */
+-error_kill:
+-	send_sig(SIGSEGV, current, 0);
+-	goto error;
+-
+ }
+ 
+ /*****************************************************************************/
+* Unmerged path fs/exec.c
