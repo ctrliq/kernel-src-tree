@@ -1,0 +1,281 @@
+sfc: limit ARFS workitems in flight per channel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit f993740ee05821307eca03d23d468895740450f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f993740e.failed
+
+A misconfigured system (e.g. with all interrupts affinitised to all CPUs)
+ may produce a storm of ARFS steering events.  With the existing sfc ARFS
+ implementation, that could create a backlog of workitems that grinds the
+ system to a halt.  To prevent this, limit the number of workitems that
+ may be in flight for a given SFC device to 8 (EFX_RPS_MAX_IN_FLIGHT), and
+ return EBUSY from our ndo_rx_flow_steer method if the limit is reached.
+Given this limit, also store the workitems in an array of slots within the
+ struct efx_nic, rather than dynamically allocating for each request.
+The limit should not negatively impact performance, because it is only
+ likely to be hit in cases where ARFS will be ineffective anyway.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f993740ee05821307eca03d23d468895740450f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/net_driver.h
+#	drivers/net/ethernet/sfc/rx.c
+diff --cc drivers/net/ethernet/sfc/net_driver.h
+index d3b503c79fbe,eea3808b3f25..000000000000
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@@ -821,12 -865,14 +842,21 @@@ struct efx_async_filter_insertion 
+   * @loopback_mode: Loopback status
+   * @loopback_modes: Supported loopback mode bitmask
+   * @loopback_selftest: Offline self-test private state
+ - * @filter_sem: Filter table rw_semaphore, protects existence of @filter_state
+ + * @filter_sem: Filter table rw_semaphore, for freeing the table
+ + * @filter_lock: Filter table lock, for mere content changes
+   * @filter_state: Architecture-dependent filter table state
+++<<<<<<< HEAD
+ + * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
+ + *	indexed by filter ID
+ + * @rps_expire_index: Next index to check for expiry in @rps_flow_id
+++=======
++  * @rps_mutex: Protects RPS state of all channels
++  * @rps_expire_channel: Next channel to check for expiry
++  * @rps_expire_index: Next index to check for expiry in
++  *	@rps_expire_channel's @rps_flow_id
++  * @rps_slot_map: bitmap of in-flight entries in @rps_slot
++  * @rps_slot: array of ARFS insertion requests for efx_filter_rfs_work()
+++>>>>>>> f993740ee058 (sfc: limit ARFS workitems in flight per channel)
+   * @active_queues: Count of RX and TX queues that haven't been flushed and drained.
+   * @rxq_flush_pending: Count of number of receive queues that need to be flushed.
+   *	Decremented when the efx_flush_rx_queue() is called.
+@@@ -974,11 -1022,13 +1004,13 @@@ struct efx_nic 
+  	void *loopback_selftest;
+  
+  	struct rw_semaphore filter_sem;
+ +	spinlock_t filter_lock;
+  	void *filter_state;
+  #ifdef CONFIG_RFS_ACCEL
+ -	struct mutex rps_mutex;
+ -	unsigned int rps_expire_channel;
+ +	u32 *rps_flow_id;
+  	unsigned int rps_expire_index;
++ 	unsigned long rps_slot_map;
++ 	struct efx_async_filter_insertion rps_slot[EFX_RPS_MAX_IN_FLIGHT];
+  #endif
+  
+  	atomic_t active_queues;
+diff --cc drivers/net/ethernet/sfc/rx.c
+index 90c85f16047f,9c593c661cbf..000000000000
+--- a/drivers/net/ethernet/sfc/rx.c
++++ b/drivers/net/ethernet/sfc/rx.c
+@@@ -827,99 -827,113 +827,189 @@@ MODULE_PARM_DESC(rx_refill_threshold
+  
+  #ifdef CONFIG_RFS_ACCEL
+  
+++<<<<<<< HEAD
+++=======
++ static void efx_filter_rfs_work(struct work_struct *data)
++ {
++ 	struct efx_async_filter_insertion *req = container_of(data, struct efx_async_filter_insertion,
++ 							      work);
++ 	struct efx_nic *efx = netdev_priv(req->net_dev);
++ 	struct efx_channel *channel = efx_get_channel(efx, req->rxq_index);
++ 	int slot_idx = req - efx->rps_slot;
++ 	int rc;
++ 
++ 	rc = efx->type->filter_insert(efx, &req->spec, true);
++ 	if (rc >= 0) {
++ 		/* Remember this so we can check whether to expire the filter
++ 		 * later.
++ 		 */
++ 		mutex_lock(&efx->rps_mutex);
++ 		channel->rps_flow_id[rc] = req->flow_id;
++ 		++channel->rfs_filters_added;
++ 		mutex_unlock(&efx->rps_mutex);
++ 
++ 		if (req->spec.ether_type == htons(ETH_P_IP))
++ 			netif_info(efx, rx_status, efx->net_dev,
++ 				   "steering %s %pI4:%u:%pI4:%u to queue %u [flow %u filter %d]\n",
++ 				   (req->spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
++ 				   req->spec.rem_host, ntohs(req->spec.rem_port),
++ 				   req->spec.loc_host, ntohs(req->spec.loc_port),
++ 				   req->rxq_index, req->flow_id, rc);
++ 		else
++ 			netif_info(efx, rx_status, efx->net_dev,
++ 				   "steering %s [%pI6]:%u:[%pI6]:%u to queue %u [flow %u filter %d]\n",
++ 				   (req->spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
++ 				   req->spec.rem_host, ntohs(req->spec.rem_port),
++ 				   req->spec.loc_host, ntohs(req->spec.loc_port),
++ 				   req->rxq_index, req->flow_id, rc);
++ 	}
++ 
++ 	/* Release references */
++ 	clear_bit(slot_idx, &efx->rps_slot_map);
++ 	dev_put(req->net_dev);
++ }
++ 
+++>>>>>>> f993740ee058 (sfc: limit ARFS workitems in flight per channel)
+  int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
+  		   u16 rxq_index, u32 flow_id)
+  {
+  	struct efx_nic *efx = netdev_priv(net_dev);
+++<<<<<<< HEAD
+ +	struct efx_channel *channel;
+ +	struct efx_filter_spec spec;
+ +	const __be16 *ports;
+ +	__be16 ether_type;
+ +	int nhoff;
+ +	int rc;
+ +
+ +	/* The core RPS/RFS code has already parsed and validated
+ +	 * VLAN, IP and transport headers.  We assume they are in the
+ +	 * header area.
+ +	 */
+ +
+ +	if (skb->protocol == htons(ETH_P_8021Q)) {
+ +		const struct vlan_hdr *vh =
+ +			(const struct vlan_hdr *)skb->data;
+ +
+ +		/* We can't filter on the IP 5-tuple and the vlan
+ +		 * together, so just strip the vlan header and filter
+ +		 * on the IP part.
+ +		 */
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < sizeof(*vh));
+ +		ether_type = vh->h_vlan_encapsulated_proto;
+ +		nhoff = sizeof(struct vlan_hdr);
+ +	} else {
+ +		ether_type = skb->protocol;
+ +		nhoff = 0;
+ +	}
+ +
+ +	if (ether_type != htons(ETH_P_IP) && ether_type != htons(ETH_P_IPV6))
+ +		return -EPROTONOSUPPORT;
+ +
+ +	efx_filter_init_rx(&spec, EFX_FILTER_PRI_HINT,
+++=======
++ 	struct efx_async_filter_insertion *req;
++ 	struct flow_keys fk;
++ 	int slot_idx;
++ 	int rc;
++ 
++ 	/* find a free slot */
++ 	for (slot_idx = 0; slot_idx < EFX_RPS_MAX_IN_FLIGHT; slot_idx++)
++ 		if (!test_and_set_bit(slot_idx, &efx->rps_slot_map))
++ 			break;
++ 	if (slot_idx >= EFX_RPS_MAX_IN_FLIGHT)
++ 		return -EBUSY;
++ 
++ 	if (flow_id == RPS_FLOW_ID_INVALID) {
++ 		rc = -EINVAL;
++ 		goto out_clear;
++ 	}
++ 
++ 	if (!skb_flow_dissect_flow_keys(skb, &fk, 0)) {
++ 		rc = -EPROTONOSUPPORT;
++ 		goto out_clear;
++ 	}
++ 
++ 	if (fk.basic.n_proto != htons(ETH_P_IP) && fk.basic.n_proto != htons(ETH_P_IPV6)) {
++ 		rc = -EPROTONOSUPPORT;
++ 		goto out_clear;
++ 	}
++ 	if (fk.control.flags & FLOW_DIS_IS_FRAGMENT) {
++ 		rc = -EPROTONOSUPPORT;
++ 		goto out_clear;
++ 	}
++ 
++ 	req = efx->rps_slot + slot_idx;
++ 	efx_filter_init_rx(&req->spec, EFX_FILTER_PRI_HINT,
+++>>>>>>> f993740ee058 (sfc: limit ARFS workitems in flight per channel)
+  			   efx->rx_scatter ? EFX_FILTER_FLAG_RX_SCATTER : 0,
+  			   rxq_index);
+ -	req->spec.match_flags =
+ +	spec.match_flags =
+  		EFX_FILTER_MATCH_ETHER_TYPE | EFX_FILTER_MATCH_IP_PROTO |
+  		EFX_FILTER_MATCH_LOC_HOST | EFX_FILTER_MATCH_LOC_PORT |
+  		EFX_FILTER_MATCH_REM_HOST | EFX_FILTER_MATCH_REM_PORT;
+ -	req->spec.ether_type = fk.basic.n_proto;
+ -	req->spec.ip_proto = fk.basic.ip_proto;
+ -
+ -	if (fk.basic.n_proto == htons(ETH_P_IP)) {
+ -		req->spec.rem_host[0] = fk.addrs.v4addrs.src;
+ -		req->spec.loc_host[0] = fk.addrs.v4addrs.dst;
+ +	spec.ether_type = ether_type;
+ +
+ +	if (ether_type == htons(ETH_P_IP)) {
+ +		const struct iphdr *ip =
+ +			(const struct iphdr *)(skb->data + nhoff);
+ +
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < nhoff + sizeof(*ip));
+ +		if (ip_is_fragment(ip))
+ +			return -EPROTONOSUPPORT;
+ +		spec.ip_proto = ip->protocol;
+ +		spec.rem_host[0] = ip->saddr;
+ +		spec.loc_host[0] = ip->daddr;
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < nhoff + 4 * ip->ihl + 4);
+ +		ports = (const __be16 *)(skb->data + nhoff + 4 * ip->ihl);
+  	} else {
+ -		memcpy(req->spec.rem_host, &fk.addrs.v6addrs.src,
+ -		       sizeof(struct in6_addr));
+ -		memcpy(req->spec.loc_host, &fk.addrs.v6addrs.dst,
+ -		       sizeof(struct in6_addr));
+ +		const struct ipv6hdr *ip6 =
+ +			(const struct ipv6hdr *)(skb->data + nhoff);
+ +
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) <
+ +					  nhoff + sizeof(*ip6) + 4);
+ +		spec.ip_proto = ip6->nexthdr;
+ +		memcpy(spec.rem_host, &ip6->saddr, sizeof(ip6->saddr));
+ +		memcpy(spec.loc_host, &ip6->daddr, sizeof(ip6->daddr));
+ +		ports = (const __be16 *)(ip6 + 1);
+  	}
+  
+ -	req->spec.rem_port = fk.ports.src;
+ -	req->spec.loc_port = fk.ports.dst;
+ +	spec.rem_port = ports[0];
+ +	spec.loc_port = ports[1];
+ +
+++<<<<<<< HEAD
+ +	rc = efx->type->filter_rfs_insert(efx, &spec);
+ +	if (rc < 0)
+ +		return rc;
+ +
+ +	/* Remember this so we can check whether to expire the filter later */
+ +	efx->rps_flow_id[rc] = flow_id;
+ +	channel = efx_get_channel(efx, skb_get_rx_queue(skb));
+ +	++channel->rfs_filters_added;
+ +
+ +	if (ether_type == htons(ETH_P_IP))
+ +		netif_info(efx, rx_status, efx->net_dev,
+ +			   "steering %s %pI4:%u:%pI4:%u to queue %u [flow %u filter %d]\n",
+ +			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+ +			   spec.rem_host, ntohs(ports[0]), spec.loc_host,
+ +			   ntohs(ports[1]), rxq_index, flow_id, rc);
+ +	else
+ +		netif_info(efx, rx_status, efx->net_dev,
+ +			   "steering %s [%pI6]:%u:[%pI6]:%u to queue %u [flow %u filter %d]\n",
+ +			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+ +			   spec.rem_host, ntohs(ports[0]), spec.loc_host,
+ +			   ntohs(ports[1]), rxq_index, flow_id, rc);
+  
+++=======
++ 	dev_hold(req->net_dev = net_dev);
++ 	INIT_WORK(&req->work, efx_filter_rfs_work);
++ 	req->rxq_index = rxq_index;
++ 	req->flow_id = flow_id;
++ 	schedule_work(&req->work);
++ 	return 0;
++ out_clear:
++ 	clear_bit(slot_idx, &efx->rps_slot_map);
+++>>>>>>> f993740ee058 (sfc: limit ARFS workitems in flight per channel)
+  	return rc;
+  }
+  
+* Unmerged path drivers/net/ethernet/sfc/net_driver.h
+* Unmerged path drivers/net/ethernet/sfc/rx.c
