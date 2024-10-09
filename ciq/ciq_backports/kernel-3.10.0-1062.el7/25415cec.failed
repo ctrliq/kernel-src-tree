@@ -1,0 +1,117 @@
+cls_bpf: don't decrement net's refcount when offload fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 25415cec502a1232b19fffc85465882b19a90415
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/25415cec.failed
+
+When cls_bpf offload was added it seemed like a good idea to
+call cls_bpf_delete_prog() instead of extending the error
+handling path, since the software state is fully initialized
+at that point.  This handling of errors without jumping to
+the end of the function is error prone, as proven by later
+commit missing that extra call to __cls_bpf_delete_prog().
+
+__cls_bpf_delete_prog() is now expected to be invoked with
+a reference on exts->net or the field zeroed out.  The call
+on the offload's error patch does not fullfil this requirement,
+leading to each error stealing a reference on net namespace.
+
+Create a function undoing what cls_bpf_set_parms() did and
+use it from __cls_bpf_delete_prog() and the error path.
+
+Fixes: aae2c35ec892 ("cls_bpf: use tcf_exts_get_net() before call_rcu()")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 25415cec502a1232b19fffc85465882b19a90415)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_bpf.c
+diff --cc net/sched/cls_bpf.c
+index c7a7c00a2b7c,6fe798c2df1a..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -106,14 -258,23 +106,31 @@@ static int cls_bpf_init(struct tcf_prot
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void cls_bpf_delete_prog(struct tcf_proto *tp, struct cls_bpf_prog *prog)
+ +{
+ +	tcf_exts_destroy(&prog->exts);
+ +	tcf_exts_put_net(&prog->exts);
+ +
+ +	sk_unattached_filter_destroy(prog->filter);
+++=======
++ static void cls_bpf_free_parms(struct cls_bpf_prog *prog)
++ {
++ 	if (cls_bpf_is_ebpf(prog))
++ 		bpf_prog_put(prog->filter);
++ 	else
++ 		bpf_prog_destroy(prog->filter);
+++>>>>>>> 25415cec502a (cls_bpf: don't decrement net's refcount when offload fails)
+  
+ -	kfree(prog->bpf_name);
+  	kfree(prog->bpf_ops);
++ }
++ 
++ static void __cls_bpf_delete_prog(struct cls_bpf_prog *prog)
++ {
++ 	tcf_exts_destroy(&prog->exts);
++ 	tcf_exts_put_net(&prog->exts);
++ 
++ 	cls_bpf_free_parms(prog);
+  	kfree(prog);
+  }
+  
+@@@ -297,14 -516,21 +314,23 @@@ static int cls_bpf_change(struct net *n
+  
+  	ret = cls_bpf_set_parms(net, tp, prog, base, tb, tca[TCA_RATE], ovr);
+  	if (ret < 0)
+ -		goto errout_idr;
+ +		goto errout;
+  
+++<<<<<<< HEAD
+ +	cls_bpf_offload(tp, prog, oldprog);
+++=======
++ 	ret = cls_bpf_offload(tp, prog, oldprog);
++ 	if (ret)
++ 		goto errout_parms;
++ 
++ 	if (!tc_in_hw(prog->gen_flags))
++ 		prog->gen_flags |= TCA_CLS_FLAGS_NOT_IN_HW;
+++>>>>>>> 25415cec502a (cls_bpf: don't decrement net's refcount when offload fails)
+  
+  	if (oldprog) {
+ -		idr_replace_ext(&head->handle_idr, prog, handle);
+  		list_replace_rcu(&oldprog->link, &prog->link);
+  		tcf_unbind_filter(tp, &oldprog->res);
+ -		tcf_exts_get_net(&oldprog->exts);
+ -		call_rcu(&oldprog->rcu, cls_bpf_delete_prog_rcu);
+ +		call_rcu(&oldprog->rcu, __cls_bpf_delete_prog);
+  	} else {
+  		list_add_rcu(&prog->link, &head->plist);
+  	}
+@@@ -312,6 -538,11 +338,14 @@@
+  	*arg = prog;
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ errout_parms:
++ 	cls_bpf_free_parms(prog);
++ errout_idr:
++ 	if (!oldprog)
++ 		idr_remove_ext(&head->handle_idr, prog->handle);
+++>>>>>>> 25415cec502a (cls_bpf: don't decrement net's refcount when offload fails)
+  errout:
+  	tcf_exts_destroy(&prog->exts);
+  	kfree(prog);
+* Unmerged path net/sched/cls_bpf.c
