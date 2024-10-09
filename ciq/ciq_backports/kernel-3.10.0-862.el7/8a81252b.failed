@@ -1,0 +1,258 @@
+fs/file.c: don't acquire files->file_lock in fd_install()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] file.c: don't acquire files->file_lock in fd_install() (Mateusz Guzik) [1462034]
+Rebuild_FUZZ: 97.30%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 8a81252b774b53e628a8a0fe18e2b8fc236d92cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8a81252b.failed
+
+Mateusz Guzik reported :
+
+ Currently obtaining a new file descriptor results in locking fdtable
+ twice - once in order to reserve a slot and second time to fill it.
+
+Holding the spinlock in __fd_install() is needed in case a resize is
+done, or to prevent a resize.
+
+Mateusz provided an RFC patch and a micro benchmark :
+  http://people.redhat.com/~mguzik/pipebench.c
+
+A resize is an unlikely operation in a process lifetime,
+as table size is at least doubled at every resize.
+
+We can use RCU instead of the spinlock.
+
+__fd_install() must wait if a resize is in progress.
+
+The resize must block new __fd_install() callers from starting,
+and wait that ongoing install are finished (synchronize_sched())
+
+resize should be attempted by a single thread to not waste resources.
+
+rcu_sched variant is used, as __fd_install() and expand_fdtable() run
+from process context.
+
+It gives us a ~30% speedup using pipebench on a dual Intel(R) Xeon(R)
+CPU E5-2696 v2 @ 2.50GHz
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Mateusz Guzik <mguzik@redhat.com>
+	Acked-by: Mateusz Guzik <mguzik@redhat.com>
+	Tested-by: Mateusz Guzik <mguzik@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 8a81252b774b53e628a8a0fe18e2b8fc236d92cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/porting
+diff --cc Documentation/filesystems/porting
+index d0bdfa78fe8c,ec5456113072..000000000000
+--- a/Documentation/filesystems/porting
++++ b/Documentation/filesystems/porting
+@@@ -445,3 -445,62 +445,65 @@@ object doesn't exist.  It's remote/dist
+  [mandatory]
+  	FS_REVAL_DOT is gone; if you used to have it, add ->d_weak_revalidate()
+  in your dentry operations instead.
+++<<<<<<< HEAD
+++=======
++ --
++ [mandatory]
++ 	vfs_readdir() is gone; switch to iterate_dir() instead
++ --
++ [mandatory]
++ 	->readdir() is gone now; switch to ->iterate()
++ [mandatory]
++ 	vfs_follow_link has been removed.  Filesystems must use nd_set_link
++ 	from ->follow_link for normal symlinks, or nd_jump_link for magic
++ 	/proc/<pid> style links.
++ --
++ [mandatory]
++ 	iget5_locked()/ilookup5()/ilookup5_nowait() test() callback used to be
++ 	called with both ->i_lock and inode_hash_lock held; the former is *not*
++ 	taken anymore, so verify that your callbacks do not rely on it (none
++ 	of the in-tree instances did).  inode_hash_lock is still held,
++ 	of course, so they are still serialized wrt removal from inode hash,
++ 	as well as wrt set() callback of iget5_locked().
++ --
++ [mandatory]
++ 	d_materialise_unique() is gone; d_splice_alias() does everything you
++ 	need now.  Remember that they have opposite orders of arguments ;-/
++ --
++ [mandatory]
++ 	f_dentry is gone; use f_path.dentry, or, better yet, see if you can avoid
++ 	it entirely.
++ --
++ [mandatory]
++ 	never call ->read() and ->write() directly; use __vfs_{read,write} or
++ 	wrappers; instead of checking for ->write or ->read being NULL, look for
++ 	FMODE_CAN_{WRITE,READ} in file->f_mode.
++ --
++ [mandatory]
++ 	do _not_ use new_sync_{read,write} for ->read/->write; leave it NULL
++ 	instead.
++ --
++ [mandatory]
++ 	->aio_read/->aio_write are gone.  Use ->read_iter/->write_iter.
++ ---
++ [recommended]
++ 	for embedded ("fast") symlinks just set inode->i_link to wherever the
++ 	symlink body is and use simple_follow_link() as ->follow_link().
++ --
++ [mandatory]
++ 	calling conventions for ->follow_link() have changed.  Instead of returning
++ 	cookie and using nd_set_link() to store the body to traverse, we return
++ 	the body to traverse and store the cookie using explicit void ** argument.
++ 	nameidata isn't passed at all - nd_jump_link() doesn't need it and
++ 	nd_[gs]et_link() is gone.
++ --
++ [mandatory]
++ 	calling conventions for ->put_link() have changed.  It gets inode instead of
++ 	dentry,  it does not get nameidata at all and it gets called only when cookie
++ 	is non-NULL.  Note that link body isn't available anymore, so if you need it,
++ 	store it as cookie.
++ --
++ [mandatory]
++ 	__fd_install() & fd_install() can now sleep. Callers should not
++ 	hold a spinlock	or other resources that do not allow a schedule.
+++>>>>>>> 8a81252b774b (fs/file.c: don't acquire files->file_lock in fd_install())
+* Unmerged path Documentation/filesystems/porting
+diff --git a/fs/file.c b/fs/file.c
+index c9002183073d..06caf33a4a65 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -152,6 +152,13 @@ static int expand_fdtable(struct files_struct *files, int nr)
+ 
+ 	spin_unlock(&files->file_lock);
+ 	new_fdt = alloc_fdtable(nr);
++
++	/* make sure all __fd_install() have seen resize_in_progress
++	 * or have finished their rcu_read_lock_sched() section.
++	 */
++	if (atomic_read(&files->count) > 1)
++		synchronize_sched();
++
+ 	spin_lock(&files->file_lock);
+ 	if (!new_fdt)
+ 		return -ENOMEM;
+@@ -163,21 +170,14 @@ static int expand_fdtable(struct files_struct *files, int nr)
+ 		__free_fdtable(new_fdt);
+ 		return -EMFILE;
+ 	}
+-	/*
+-	 * Check again since another task may have expanded the fd table while
+-	 * we dropped the lock
+-	 */
+ 	cur_fdt = files_fdtable(files);
+-	if (nr >= cur_fdt->max_fds) {
+-		/* Continue as planned */
+-		copy_fdtable(new_fdt, cur_fdt);
+-		rcu_assign_pointer(files->fdt, new_fdt);
+-		if (cur_fdt != &files->fdtab)
+-			call_rcu(&cur_fdt->rcu, free_fdtable_rcu);
+-	} else {
+-		/* Somebody else expanded, so undo our attempt */
+-		__free_fdtable(new_fdt);
+-	}
++	BUG_ON(nr < cur_fdt->max_fds);
++	copy_fdtable(new_fdt, cur_fdt);
++	rcu_assign_pointer(files->fdt, new_fdt);
++	if (cur_fdt != &files->fdtab)
++		call_rcu(&cur_fdt->rcu, free_fdtable_rcu);
++	/* coupled with smp_rmb() in __fd_install() */
++	smp_wmb();
+ 	return 1;
+ }
+ 
+@@ -190,21 +190,38 @@ static int expand_fdtable(struct files_struct *files, int nr)
+  * The files->file_lock should be held on entry, and will be held on exit.
+  */
+ static int expand_files(struct files_struct *files, int nr)
++	__releases(files->file_lock)
++	__acquires(files->file_lock)
+ {
+ 	struct fdtable *fdt;
++	int expanded = 0;
+ 
++repeat:
+ 	fdt = files_fdtable(files);
+ 
+ 	/* Do we need to expand? */
+ 	if (nr < fdt->max_fds)
+-		return 0;
++		return expanded;
+ 
+ 	/* Can we expand? */
+ 	if (nr >= sysctl_nr_open)
+ 		return -EMFILE;
+ 
++	if (unlikely(files->resize_in_progress)) {
++		spin_unlock(&files->file_lock);
++		expanded = 1;
++		wait_event(files->resize_wait, !files->resize_in_progress);
++		spin_lock(&files->file_lock);
++		goto repeat;
++	}
++
+ 	/* All good, so we try */
+-	return expand_fdtable(files, nr);
++	files->resize_in_progress = true;
++	expanded = expand_fdtable(files, nr);
++	files->resize_in_progress = false;
++
++	wake_up_all(&files->resize_wait);
++	return expanded;
+ }
+ 
+ static inline void __set_close_on_exec(int fd, struct fdtable *fdt)
+@@ -261,6 +278,8 @@ struct files_struct *dup_fd(struct files_struct *oldf, int *errorp)
+ 	atomic_set(&newf->count, 1);
+ 
+ 	spin_lock_init(&newf->file_lock);
++	newf->resize_in_progress = false;
++	init_waitqueue_head(&newf->resize_wait);
+ 	newf->next_fd = 0;
+ 	new_fdt = &newf->fdtab;
+ 	new_fdt->max_fds = NR_OPEN_DEFAULT;
+@@ -566,11 +585,21 @@ void __fd_install(struct files_struct *files, unsigned int fd,
+ 		struct file *file)
+ {
+ 	struct fdtable *fdt;
+-	spin_lock(&files->file_lock);
+-	fdt = files_fdtable(files);
++
++	might_sleep();
++	rcu_read_lock_sched();
++
++	while (unlikely(files->resize_in_progress)) {
++		rcu_read_unlock_sched();
++		wait_event(files->resize_wait, !files->resize_in_progress);
++		rcu_read_lock_sched();
++	}
++	/* coupled with smp_wmb() in expand_fdtable() */
++	smp_rmb();
++	fdt = rcu_dereference_sched(files->fdt);
+ 	BUG_ON(fdt->fd[fd] != NULL);
+ 	rcu_assign_pointer(fdt->fd[fd], file);
+-	spin_unlock(&files->file_lock);
++	rcu_read_unlock_sched();
+ }
+ 
+ void fd_install(unsigned int fd, struct file *file)
+diff --git a/include/linux/fdtable.h b/include/linux/fdtable.h
+index 7477eb9c84f4..be21575208b2 100644
+--- a/include/linux/fdtable.h
++++ b/include/linux/fdtable.h
+@@ -47,6 +47,9 @@ struct files_struct {
+    * read mostly part
+    */
+ 	atomic_t count;
++	bool resize_in_progress;
++	wait_queue_head_t resize_wait;
++
+ 	struct fdtable __rcu *fdt;
+ 	struct fdtable fdtab;
+   /*
