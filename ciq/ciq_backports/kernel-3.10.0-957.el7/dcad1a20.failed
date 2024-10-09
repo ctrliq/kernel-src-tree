@@ -1,0 +1,185 @@
+tracing/uprobes: Fetch args before reserving a ring buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Namhyung Kim <namhyung.kim@lge.com>
+commit dcad1a204f72624796ae83359403898d10393b9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dcad1a20.failed
+
+Fetching from user space should be done in a non-atomic context.  So
+use a per-cpu buffer and copy its content to the ring buffer
+atomically.  Note that we can migrate during accessing user memory
+thus use a per-cpu mutex to protect concurrent accesses.
+
+This is needed since we'll be able to fetch args from an user memory
+which can be swapped out.  Before that uprobes could fetch args from
+registers only which saved in a kernel space.
+
+While at it, use __get_data_size() and store_trace_args() to reduce
+code duplication.  And add struct uprobe_cpu_buffer and its helpers as
+suggested by Oleg.
+
+	Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Acked-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: zhangwei(Jovi) <jovi.zhangwei@huawei.com>
+	Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+(cherry picked from commit dcad1a204f72624796ae83359403898d10393b9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/trace/trace_uprobe.c
+index 84f228258d8e,794e8bc171f3..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -687,16 -744,26 +773,36 @@@ static void uprobe_trace_print(struct t
+  	struct uprobe_trace_entry_head *entry;
+  	struct ring_buffer_event *event;
+  	struct ring_buffer *buffer;
++ 	struct uprobe_cpu_buffer *ucb;
+  	void *data;
+++<<<<<<< HEAD
+ +	int size, i;
+ +	struct ftrace_event_call *call = &tu->call;
+ +
+ +	size = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+ +	event = trace_current_buffer_lock_reserve(&buffer, call->event.type,
+ +						  size + tu->size, 0, 0);
+ +	if (!event)
+++=======
++ 	int size, dsize, esize;
++ 	struct ftrace_event_call *call = &tu->tp.call;
++ 
++ 	dsize = __get_data_size(&tu->tp, regs);
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 
++ 	if (WARN_ON_ONCE(!uprobe_cpu_buffer || tu->tp.size + dsize > PAGE_SIZE))
+++>>>>>>> dcad1a204f72 (tracing/uprobes: Fetch args before reserving a ring buffer)
+  		return;
+  
++ 	ucb = uprobe_buffer_get();
++ 	store_trace_args(esize, &tu->tp, regs, ucb->buf, dsize);
++ 
++ 	size = esize + tu->tp.size + dsize;
++ 	event = trace_current_buffer_lock_reserve(&buffer, call->event.type,
++ 						  size, 0, 0);
++ 	if (!event)
++ 		goto out;
++ 
+  	entry = ring_buffer_event_data(event);
+  	if (is_ret_probe(tu)) {
+  		entry->vaddr[0] = func;
+@@@ -707,11 -774,13 +813,18 @@@
+  		data = DATAOF_TRACE_ENTRY(entry, false);
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < tu->nr_args; i++)
+ +		call_fetch(&tu->args[i].fetch, regs, data + tu->args[i].offset);
+++=======
++ 	memcpy(data, ucb->buf, tu->tp.size + dsize);
+++>>>>>>> dcad1a204f72 (tracing/uprobes: Fetch args before reserving a ring buffer)
+  
+ -	if (!call_filter_check_discard(call, entry, buffer, event))
+ +	if (!filter_current_check_discard(buffer, call, entry, event))
+  		trace_buffer_unlock_commit(buffer, event, 0, 0);
++ 
++ out:
++ 	uprobe_buffer_put(ucb);
+  }
+  
+  /* uprobe handler */
+@@@ -780,12 -845,16 +893,16 @@@ probe_event_enable(struct trace_uprobe 
+  {
+  	int ret = 0;
+  
+ -	if (trace_probe_is_enabled(&tu->tp))
+ +	if (is_trace_uprobe_enabled(tu))
+  		return -EINTR;
+  
++ 	ret = uprobe_buffer_enable();
++ 	if (ret < 0)
++ 		return ret;
++ 
+  	WARN_ON(!uprobe_filter_is_empty(&tu->filter));
+  
+ -	tu->tp.flags |= flag;
+ +	tu->flags |= flag;
+  	tu->consumer.filter = filter;
+  	ret = uprobe_register(tu->inode, tu->offset, &tu->consumer);
+  	if (ret)
+@@@ -802,7 -871,9 +919,13 @@@ static void probe_event_disable(struct 
+  	WARN_ON(!uprobe_filter_is_empty(&tu->filter));
+  
+  	uprobe_unregister(tu->inode, tu->offset, &tu->consumer);
+++<<<<<<< HEAD
+ +	tu->flags &= ~flag;
+++=======
++ 	tu->tp.flags &= ~flag;
++ 
++ 	uprobe_buffer_disable();
+++>>>>>>> dcad1a204f72 (tracing/uprobes: Fetch args before reserving a ring buffer)
+  }
+  
+  static int uprobe_event_define_fields(struct ftrace_event_call *event_call)
+@@@ -979,16 -997,27 +1102,34 @@@ static bool uprobe_perf_filter(struct u
+  static void uprobe_perf_print(struct trace_uprobe *tu,
+  				unsigned long func, struct pt_regs *regs)
+  {
+ -	struct ftrace_event_call *call = &tu->tp.call;
+ +	struct ftrace_event_call *call = &tu->call;
+  	struct uprobe_trace_entry_head *entry;
+  	struct hlist_head *head;
++ 	struct uprobe_cpu_buffer *ucb;
+  	void *data;
+- 	int size, rctx, i;
++ 	int size, dsize, esize;
++ 	int rctx;
+  
+++<<<<<<< HEAD
+ +	size = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+ +	size = ALIGN(size + tu->size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+ +	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE, "profile buffer not large enough"))
+ +		return;
+++=======
++ 	dsize = __get_data_size(&tu->tp, regs);
++ 	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
++ 
++ 	if (WARN_ON_ONCE(!uprobe_cpu_buffer))
++ 		return;
++ 
++ 	size = esize + tu->tp.size + dsize;
++ 	size = ALIGN(size + sizeof(u32), sizeof(u64)) - sizeof(u32);
++ 	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE, "profile buffer not large enough"))
++ 		return;
++ 
++ 	ucb = uprobe_buffer_get();
++ 	store_trace_args(esize, &tu->tp, regs, ucb->buf, dsize);
+++>>>>>>> dcad1a204f72 (tracing/uprobes: Fetch args before reserving a ring buffer)
+  
+  	preempt_disable();
+  	head = this_cpu_ptr(call->perf_events);
+@@@ -1008,8 -1037,13 +1149,18 @@@
+  		data = DATAOF_TRACE_ENTRY(entry, false);
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < tu->nr_args; i++)
+ +		call_fetch(&tu->args[i].fetch, regs, data + tu->args[i].offset);
+++=======
++ 	memcpy(data, ucb->buf, tu->tp.size + dsize);
++ 
++ 	if (size - esize > tu->tp.size + dsize) {
++ 		int len = tu->tp.size + dsize;
++ 
++ 		memset(data + len, 0, size - esize - len);
++ 	}
+++>>>>>>> dcad1a204f72 (tracing/uprobes: Fetch args before reserving a ring buffer)
+  
+  	perf_trace_buf_submit(entry, size, rctx, 0, 1, regs, head, NULL);
+   out:
+* Unmerged path kernel/trace/trace_uprobe.c
