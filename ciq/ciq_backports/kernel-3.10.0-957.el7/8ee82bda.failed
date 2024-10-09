@@ -1,0 +1,308 @@
+mmc: sdhci-pci: Add CQHCI support for Intel GLK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] sdhci-pci: Add CQHCI support for Intel GLK (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.38%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit 8ee82bda230fc972c7ee3bb15ce1260eefb4721c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8ee82bda.failed
+
+Add CQHCI initialization and implement CQHCI operations for Intel GLK.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 8ee82bda230fc972c7ee3bb15ce1260eefb4721c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-pci-core.c
+diff --cc drivers/mmc/host/sdhci-pci-core.c
+index 867048ff7a78,110c634cfb43..000000000000
+--- a/drivers/mmc/host/sdhci-pci-core.c
++++ b/drivers/mmc/host/sdhci-pci-core.c
+@@@ -29,16 -30,207 +29,215 @@@
+  #include <linux/mmc/sdhci-pci-data.h>
+  #include <linux/acpi.h>
+  
++ #include "cqhci.h"
++ 
+  #include "sdhci.h"
+  #include "sdhci-pci.h"
+ +#include "sdhci-pci-o2micro.h"
+  
+  static int sdhci_pci_enable_dma(struct sdhci_host *host);
+  static void sdhci_pci_hw_reset(struct sdhci_host *host);
+++<<<<<<< HEAD
+ +static int sdhci_pci_select_drive_strength(struct sdhci_host *host,
+ +					   struct mmc_card *card,
+ +					   unsigned int max_dtr, int host_drv,
+ +					   int card_drv, int *drv_type);
+++=======
++ 
++ #ifdef CONFIG_PM_SLEEP
++ static int __sdhci_pci_suspend_host(struct sdhci_pci_chip *chip)
++ {
++ 	int i, ret;
++ 
++ 	for (i = 0; i < chip->num_slots; i++) {
++ 		struct sdhci_pci_slot *slot = chip->slots[i];
++ 		struct sdhci_host *host;
++ 
++ 		if (!slot)
++ 			continue;
++ 
++ 		host = slot->host;
++ 
++ 		if (chip->pm_retune && host->tuning_mode != SDHCI_TUNING_MODE_3)
++ 			mmc_retune_needed(host->mmc);
++ 
++ 		ret = sdhci_suspend_host(host);
++ 		if (ret)
++ 			goto err_pci_suspend;
++ 
++ 		if (host->mmc->pm_flags & MMC_PM_WAKE_SDIO_IRQ)
++ 			sdhci_enable_irq_wakeups(host);
++ 	}
++ 
++ 	return 0;
++ 
++ err_pci_suspend:
++ 	while (--i >= 0)
++ 		sdhci_resume_host(chip->slots[i]->host);
++ 	return ret;
++ }
++ 
++ static int sdhci_pci_init_wakeup(struct sdhci_pci_chip *chip)
++ {
++ 	mmc_pm_flag_t pm_flags = 0;
++ 	int i;
++ 
++ 	for (i = 0; i < chip->num_slots; i++) {
++ 		struct sdhci_pci_slot *slot = chip->slots[i];
++ 
++ 		if (slot)
++ 			pm_flags |= slot->host->mmc->pm_flags;
++ 	}
++ 
++ 	return device_init_wakeup(&chip->pdev->dev,
++ 				  (pm_flags & MMC_PM_KEEP_POWER) &&
++ 				  (pm_flags & MMC_PM_WAKE_SDIO_IRQ));
++ }
++ 
++ static int sdhci_pci_suspend_host(struct sdhci_pci_chip *chip)
++ {
++ 	int ret;
++ 
++ 	ret = __sdhci_pci_suspend_host(chip);
++ 	if (ret)
++ 		return ret;
++ 
++ 	sdhci_pci_init_wakeup(chip);
++ 
++ 	return 0;
++ }
++ 
++ int sdhci_pci_resume_host(struct sdhci_pci_chip *chip)
++ {
++ 	struct sdhci_pci_slot *slot;
++ 	int i, ret;
++ 
++ 	for (i = 0; i < chip->num_slots; i++) {
++ 		slot = chip->slots[i];
++ 		if (!slot)
++ 			continue;
++ 
++ 		ret = sdhci_resume_host(slot->host);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int sdhci_cqhci_suspend(struct sdhci_pci_chip *chip)
++ {
++ 	int ret;
++ 
++ 	ret = cqhci_suspend(chip->slots[0]->host->mmc);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return sdhci_pci_suspend_host(chip);
++ }
++ 
++ static int sdhci_cqhci_resume(struct sdhci_pci_chip *chip)
++ {
++ 	int ret;
++ 
++ 	ret = sdhci_pci_resume_host(chip);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return cqhci_resume(chip->slots[0]->host->mmc);
++ }
++ #endif
++ 
++ #ifdef CONFIG_PM
++ static int sdhci_pci_runtime_suspend_host(struct sdhci_pci_chip *chip)
++ {
++ 	struct sdhci_pci_slot *slot;
++ 	struct sdhci_host *host;
++ 	int i, ret;
++ 
++ 	for (i = 0; i < chip->num_slots; i++) {
++ 		slot = chip->slots[i];
++ 		if (!slot)
++ 			continue;
++ 
++ 		host = slot->host;
++ 
++ 		ret = sdhci_runtime_suspend_host(host);
++ 		if (ret)
++ 			goto err_pci_runtime_suspend;
++ 
++ 		if (chip->rpm_retune &&
++ 		    host->tuning_mode != SDHCI_TUNING_MODE_3)
++ 			mmc_retune_needed(host->mmc);
++ 	}
++ 
++ 	return 0;
++ 
++ err_pci_runtime_suspend:
++ 	while (--i >= 0)
++ 		sdhci_runtime_resume_host(chip->slots[i]->host);
++ 	return ret;
++ }
++ 
++ static int sdhci_pci_runtime_resume_host(struct sdhci_pci_chip *chip)
++ {
++ 	struct sdhci_pci_slot *slot;
++ 	int i, ret;
++ 
++ 	for (i = 0; i < chip->num_slots; i++) {
++ 		slot = chip->slots[i];
++ 		if (!slot)
++ 			continue;
++ 
++ 		ret = sdhci_runtime_resume_host(slot->host);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int sdhci_cqhci_runtime_suspend(struct sdhci_pci_chip *chip)
++ {
++ 	int ret;
++ 
++ 	ret = cqhci_suspend(chip->slots[0]->host->mmc);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return sdhci_pci_runtime_suspend_host(chip);
++ }
++ 
++ static int sdhci_cqhci_runtime_resume(struct sdhci_pci_chip *chip)
++ {
++ 	int ret;
++ 
++ 	ret = sdhci_pci_runtime_resume_host(chip);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return cqhci_resume(chip->slots[0]->host->mmc);
++ }
++ #endif
+++>>>>>>> 8ee82bda230f (mmc: sdhci-pci: Add CQHCI support for Intel GLK)
++ 
++ static u32 sdhci_cqhci_irq(struct sdhci_host *host, u32 intmask)
++ {
++ 	int cmd_error = 0;
++ 	int data_error = 0;
++ 
++ 	if (!sdhci_cqe_irq(host, intmask, &cmd_error, &data_error))
++ 		return intmask;
++ 
++ 	cqhci_irq(host->mmc, intmask, cmd_error, data_error);
++ 
++ 	return 0;
++ }
++ 
++ static void sdhci_pci_dumpregs(struct mmc_host *mmc)
++ {
++ 	sdhci_dumpregs(mmc_priv(mmc));
++ }
+  
+  /*****************************************************************************\
+   *                                                                           *
+@@@ -414,11 -644,34 +613,36 @@@ static const struct sdhci_ops sdhci_int
+  	.reset			= sdhci_reset,
+  	.set_uhs_signaling	= sdhci_set_uhs_signaling,
+  	.hw_reset		= sdhci_pci_hw_reset,
+ -	.voltage_switch		= sdhci_intel_voltage_switch,
+ +	.select_drive_strength	= sdhci_pci_select_drive_strength,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct sdhci_ops sdhci_intel_glk_ops = {
++ 	.set_clock		= sdhci_set_clock,
++ 	.set_power		= sdhci_intel_set_power,
++ 	.enable_dma		= sdhci_pci_enable_dma,
++ 	.set_bus_width		= sdhci_set_bus_width,
++ 	.reset			= sdhci_reset,
++ 	.set_uhs_signaling	= sdhci_set_uhs_signaling,
++ 	.hw_reset		= sdhci_pci_hw_reset,
++ 	.voltage_switch		= sdhci_intel_voltage_switch,
++ 	.irq			= sdhci_cqhci_irq,
++ };
++ 
++ static void byt_read_dsm(struct sdhci_pci_slot *slot)
++ {
++ 	struct intel_host *intel_host = sdhci_pci_priv(slot);
++ 	struct device *dev = &slot->chip->pdev->dev;
++ 	struct mmc_host *mmc = slot->host->mmc;
++ 
++ 	intel_dsm_init(intel_host, dev, mmc);
++ 	slot->chip->rpm_retune = intel_host->d3_retune;
++ }
++ 
+++>>>>>>> 8ee82bda230f (mmc: sdhci-pci: Add CQHCI support for Intel GLK)
+  static int byt_emmc_probe_slot(struct sdhci_pci_slot *slot)
+  {
+ -	byt_read_dsm(slot);
+  	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
+  				 MMC_CAP_HW_RESET | MMC_CAP_1_8V_DDR |
+  				 MMC_CAP_CMD_DURING_TFR |
+@@@ -524,7 -856,8 +825,12 @@@ static const struct sdhci_pci_fixes sdh
+  	.quirks2		= SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
+  				  SDHCI_QUIRK2_CAPS_BIT63_FOR_HS400 |
+  				  SDHCI_QUIRK2_STOP_WITH_TC,
+++<<<<<<< HEAD
+ +	.ops			= &sdhci_intel_byt_ops,
+++=======
++ 	.ops			= &sdhci_intel_glk_ops,
++ 	.priv_size		= sizeof(struct intel_host),
+++>>>>>>> 8ee82bda230f (mmc: sdhci-pci: Add CQHCI support for Intel GLK)
+  };
+  
+  static const struct sdhci_pci_fixes sdhci_ni_byt_sdio = {
+diff --git a/drivers/mmc/host/Kconfig b/drivers/mmc/host/Kconfig
+index bb5021cf242b..a9d26d453875 100644
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -81,6 +81,7 @@ config MMC_SDHCI_BIG_ENDIAN_32BIT_BYTE_SWAPPER
+ config MMC_SDHCI_PCI
+ 	tristate "SDHCI support on PCI bus"
+ 	depends on MMC_SDHCI && PCI
++	select MMC_CQHCI
+ 	help
+ 	  This selects the PCI Secure Digital Host Controller Interface.
+ 	  Most controllers found today are PCI devices.
+* Unmerged path drivers/mmc/host/sdhci-pci-core.c
