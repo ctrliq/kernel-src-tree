@@ -1,0 +1,782 @@
+x86/dumpstack: Add get_stack_info() interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] dumpstack: Add get_stack_info() interface (Josh Poimboeuf) [1430637]
+Rebuild_FUZZ: 95.35%
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit cb76c93982404273d746f3ccd5085b47689099a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cb76c939.failed
+
+valid_stack_ptr() is buggy: it assumes that all stacks are of size
+THREAD_SIZE, which is not true for exception stacks.  So the
+walk_stack() callbacks will need to know the location of the beginning
+of the stack as well as the end.
+
+Another issue is that in general the various features of a stack (type,
+size, next stack pointer, description string) are scattered around in
+various places throughout the stack dump code.
+
+Encapsulate all that information in a single place with a new stack_info
+struct and a get_stack_info() interface.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Byungchul Park <byungchul.park@lge.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Nilay Vaish <nilayvaish@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/8164dd0db96b7e6a279fa17ae5e6dc375eecb4a9.1473905218.git.jpoimboe@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit cb76c93982404273d746f3ccd5085b47689099a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/dumpstack.c
+#	arch/x86/kernel/dumpstack_32.c
+#	arch/x86/kernel/dumpstack_64.c
+diff --cc arch/x86/kernel/dumpstack.c
+index 08594671b59f,aa208e565b03..000000000000
+--- a/arch/x86/kernel/dumpstack.c
++++ b/arch/x86/kernel/dumpstack.c
+@@@ -80,40 -63,50 +97,56 @@@ print_ftrace_graph_addr(unsigned long a
+   * severe exception (double fault, nmi, stack fault, debug, mce) hardware stack
+   */
+  
+++<<<<<<< HEAD
+ +static inline int valid_stack_ptr(struct thread_info *tinfo,
+ +			void *p, unsigned int size, void *end)
+ +{
+ +	void *t = tinfo;
+ +	if (end) {
+ +		if (p < end && p >= (end-THREAD_SIZE))
+ +			return 1;
+ +		else
+ +			return 0;
+ +	}
+ +	return p > t && p < t + THREAD_SIZE - size;
+ +}
+ +
+++=======
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  unsigned long
+ -print_context_stack(struct task_struct *task,
+ +print_context_stack(struct thread_info *tinfo,
+  		unsigned long *stack, unsigned long bp,
+  		const struct stacktrace_ops *ops, void *data,
+- 		unsigned long *end, int *graph)
++ 		struct stack_info *info, int *graph)
+  {
+  	struct stack_frame *frame = (struct stack_frame *)bp;
+  
+++<<<<<<< HEAD
+ +	while (valid_stack_ptr(tinfo, stack, sizeof(*stack), end)) {
+ +		unsigned long addr;
+++=======
++ 	/*
++ 	 * If we overflowed the stack into a guard page, jump back to the
++ 	 * bottom of the usable stack.
++ 	 */
++ 	if ((unsigned long)task_stack_page(task) - (unsigned long)stack <
++ 	    PAGE_SIZE)
++ 		stack = (unsigned long *)task_stack_page(task);
++ 
++ 	while (on_stack(info, stack, sizeof(*stack))) {
++ 		unsigned long addr = *stack;
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  
+ +		addr = *stack;
+  		if (__kernel_text_address(addr)) {
+ -			unsigned long real_addr;
+ -			int reliable = 0;
+ -
+  			if ((unsigned long) stack == bp + sizeof(long)) {
+ -				reliable = 1;
+ +				ops->address(data, addr, 1);
+  				frame = frame->next_frame;
+  				bp = (unsigned long) frame;
+ -			}
+ -
+ -			/*
+ -			 * When function graph tracing is enabled for a
+ -			 * function, its return address on the stack is
+ -			 * replaced with the address of an ftrace handler
+ -			 * (return_to_handler).  In that case, before printing
+ -			 * the "real" address, we want to print the handler
+ -			 * address as an "unreliable" hint that function graph
+ -			 * tracing was involved.
+ -			 */
+ -			real_addr = ftrace_graph_ret_addr(task, graph, addr,
+ -							  stack);
+ -			if (real_addr != addr)
+ +			} else {
+  				ops->address(data, addr, 0);
+ -
+ -			ops->address(data, real_addr, reliable);
+ +			}
+ +			print_ftrace_graph_addr(addr, data, ops, tinfo, graph);
+  		}
+  		stack++;
+  	}
+@@@ -122,16 -115,17 +155,22 @@@
+  EXPORT_SYMBOL_GPL(print_context_stack);
+  
+  unsigned long
+ -print_context_stack_bp(struct task_struct *task,
+ +print_context_stack_bp(struct thread_info *tinfo,
+  		       unsigned long *stack, unsigned long bp,
+  		       const struct stacktrace_ops *ops, void *data,
+- 		       unsigned long *end, int *graph)
++ 		       struct stack_info *info, int *graph)
+  {
+  	struct stack_frame *frame = (struct stack_frame *)bp;
+ -	unsigned long *retp = &frame->return_address;
+ +	unsigned long *ret_addr = &frame->return_address;
+  
+++<<<<<<< HEAD
+ +	while (valid_stack_ptr(tinfo, ret_addr, sizeof(*ret_addr), end)) {
+ +		unsigned long addr = *ret_addr;
+++=======
++ 	while (on_stack(info, stack, sizeof(*stack) * 2)) {
++ 		unsigned long addr = *retp;
++ 		unsigned long real_addr;
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  
+  		if (!__kernel_text_address(addr))
+  			break;
+diff --cc arch/x86/kernel/dumpstack_32.c
+index c90b53d2857e,c92da5a4d663..000000000000
+--- a/arch/x86/kernel/dumpstack_32.c
++++ b/arch/x86/kernel/dumpstack_32.c
+@@@ -16,39 -16,117 +16,143 @@@
+  
+  #include <asm/stacktrace.h>
+  
+++<<<<<<< HEAD
+++=======
++ void stack_type_str(enum stack_type type, const char **begin, const char **end)
++ {
++ 	switch (type) {
++ 	case STACK_TYPE_IRQ:
++ 	case STACK_TYPE_SOFTIRQ:
++ 		*begin = "IRQ";
++ 		*end   = "EOI";
++ 		break;
++ 	default:
++ 		*begin = NULL;
++ 		*end   = NULL;
++ 	}
++ }
++ 
++ static bool in_hardirq_stack(unsigned long *stack, struct stack_info *info)
++ {
++ 	unsigned long *begin = (unsigned long *)this_cpu_read(hardirq_stack);
++ 	unsigned long *end   = begin + (THREAD_SIZE / sizeof(long));
++ 
++ 	if (stack < begin || stack >= end)
++ 		return false;
++ 
++ 	info->type	= STACK_TYPE_IRQ;
++ 	info->begin	= begin;
++ 	info->end	= end;
++ 
++ 	/*
++ 	 * See irq_32.c -- the next stack pointer is stored at the beginning of
++ 	 * the stack.
++ 	 */
++ 	info->next_sp	= (unsigned long *)*begin;
++ 
++ 	return true;
++ }
++ 
++ static bool in_softirq_stack(unsigned long *stack, struct stack_info *info)
++ {
++ 	unsigned long *begin = (unsigned long *)this_cpu_read(softirq_stack);
++ 	unsigned long *end   = begin + (THREAD_SIZE / sizeof(long));
++ 
++ 	if (stack < begin || stack >= end)
++ 		return false;
++ 
++ 	info->type	= STACK_TYPE_SOFTIRQ;
++ 	info->begin	= begin;
++ 	info->end	= end;
++ 
++ 	/*
++ 	 * The next stack pointer is stored at the beginning of the stack.
++ 	 * See irq_32.c.
++ 	 */
++ 	info->next_sp	= (unsigned long *)*begin;
++ 
++ 	return true;
++ }
++ 
++ int get_stack_info(unsigned long *stack, struct task_struct *task,
++ 		   struct stack_info *info, unsigned long *visit_mask)
++ {
++ 	if (!stack)
++ 		goto unknown;
++ 
++ 	task = task ? : current;
++ 
++ 	if (in_task_stack(stack, task, info))
++ 		return 0;
++ 
++ 	if (task != current)
++ 		goto unknown;
++ 
++ 	if (in_hardirq_stack(stack, info))
++ 		return 0;
++ 
++ 	if (in_softirq_stack(stack, info))
++ 		return 0;
++ 
++ unknown:
++ 	info->type = STACK_TYPE_UNKNOWN;
++ 	return -EINVAL;
++ }
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  
+  void dump_trace(struct task_struct *task, struct pt_regs *regs,
+  		unsigned long *stack, unsigned long bp,
+  		const struct stacktrace_ops *ops, void *data)
+  {
++ 	unsigned long visit_mask = 0;
+  	int graph = 0;
+  
+ -	task = task ? : current;
+ -	stack = stack ? : get_stack_pointer(task, regs);
+ -	bp = bp ? : (unsigned long)get_frame_pointer(task, regs);
+ +	if (!task)
+ +		task = current;
+ +
+ +	if (!stack) {
+ +		unsigned long dummy;
+ +
+ +		stack = &dummy;
+ +		if (task && task != current)
+ +			stack = (unsigned long *)task->thread.sp;
+ +	}
+ +
+ +	if (!bp)
+ +		bp = stack_frame(task, regs);
+  
+  	for (;;) {
+++<<<<<<< HEAD
+ +		struct thread_info *context;
+ +
+ +		context = (struct thread_info *)
+ +			((unsigned long)stack & (~(THREAD_SIZE - 1)));
+ +		bp = ops->walk_stack(context, stack, bp, ops, data, NULL, &graph);
+ +
+ +		stack = (unsigned long *)context->previous_esp;
+ +		if (!stack)
+ +			break;
+ +		if (ops->stack(data, "IRQ") < 0)
+++=======
++ 		const char *begin_str, *end_str;
++ 		struct stack_info info;
++ 
++ 		if (get_stack_info(stack, task, &info, &visit_mask))
+  			break;
++ 
++ 		stack_type_str(info.type, &begin_str, &end_str);
++ 
++ 		if (begin_str && ops->stack(data, begin_str) < 0)
++ 			break;
++ 
++ 		bp = ops->walk_stack(task, stack, bp, ops, data, &info, &graph);
++ 
++ 		if (end_str && ops->stack(data, end_str) < 0)
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
++ 			break;
++ 
++ 		stack = info.next_sp;
++ 
+  		touch_nmi_watchdog();
+  	}
+  }
+diff --cc arch/x86/kernel/dumpstack_64.c
+index 101e30243d5b,41813abc7380..000000000000
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@@ -16,126 -16,121 +16,214 @@@
+  
+  #include <asm/stacktrace.h>
+  
+ -static char *exception_stack_names[N_EXCEPTION_STACKS] = {
+ -		[ DOUBLEFAULT_STACK-1	]	= "#DF",
+ -		[ NMI_STACK-1		]	= "NMI",
+ -		[ DEBUG_STACK-1		]	= "#DB",
+ -		[ MCE_STACK-1		]	= "#MC",
+ +
+ +#define N_EXCEPTION_STACKS_END \
+ +		(N_EXCEPTION_STACKS + DEBUG_STKSZ/EXCEPTION_STKSZ - 2)
+ +
+ +static char x86_stack_ids[][8] = {
+ +		[ DEBUG_STACK-1			]	= "#DB",
+ +		[ NMI_STACK-1			]	= "NMI",
+ +		[ DOUBLEFAULT_STACK-1		]	= "#DF",
+ +		[ MCE_STACK-1			]	= "#MC",
+ +#if DEBUG_STKSZ > EXCEPTION_STKSZ
+ +		[ N_EXCEPTION_STACKS ...
+ +		  N_EXCEPTION_STACKS_END	]	= "#DB[?]"
+ +#endif
+  };
+  
+++<<<<<<< HEAD
+ +static unsigned long *in_exception_stack(unsigned cpu, unsigned long stack,
+ +					 unsigned *usedp, char **idp)
+ +{
+++=======
++ static unsigned long exception_stack_sizes[N_EXCEPTION_STACKS] = {
++ 	[0 ... N_EXCEPTION_STACKS - 1]		= EXCEPTION_STKSZ,
++ 	[DEBUG_STACK - 1]			= DEBUG_STKSZ
++ };
++ 
++ void stack_type_str(enum stack_type type, const char **begin, const char **end)
++ {
++ 	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
++ 
++ 	switch (type) {
++ 	case STACK_TYPE_IRQ:
++ 		*begin = "IRQ";
++ 		*end   = "EOI";
++ 		break;
++ 	case STACK_TYPE_EXCEPTION ... STACK_TYPE_EXCEPTION_LAST:
++ 		*begin = exception_stack_names[type - STACK_TYPE_EXCEPTION];
++ 		*end   = "EOE";
++ 		break;
++ 	default:
++ 		*begin = NULL;
++ 		*end   = NULL;
++ 	}
++ }
++ 
++ static bool in_exception_stack(unsigned long *stack, struct stack_info *info,
++ 			       unsigned long *visit_mask)
++ {
++ 	unsigned long *begin, *end;
++ 	struct pt_regs *regs;
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  	unsigned k;
+  
+ -	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
+ -
+ +	/*
+ +	 * Iterate over all exception stacks, and figure out whether
+ +	 * 'stack' is in one of them:
+ +	 */
+  	for (k = 0; k < N_EXCEPTION_STACKS; k++) {
+++<<<<<<< HEAD
+ +		unsigned long end = per_cpu(orig_ist, cpu).ist[k];
+ +		/*
+ +		 * Is 'stack' above this exception frame's end?
+ +		 * If yes then skip to the next frame.
+ +		 */
+ +		if (stack >= end)
+ +			continue;
+ +		/*
+ +		 * Is 'stack' above this exception frame's start address?
+ +		 * If yes then we found the right frame.
+ +		 */
+ +		if (stack >= end - EXCEPTION_STKSZ) {
+ +			/*
+ +			 * Make sure we only iterate through an exception
+ +			 * stack once. If it comes up for the second time
+ +			 * then there's something wrong going on - just
+ +			 * break out and return NULL:
+ +			 */
+ +			if (*usedp & (1U << k))
+ +				break;
+ +			*usedp |= 1U << k;
+ +			*idp = x86_stack_ids[k];
+ +			return (unsigned long *)end;
+ +		}
+ +		/*
+ +		 * If this is a debug stack, and if it has a larger size than
+ +		 * the usual exception stacks, then 'stack' might still
+ +		 * be within the lower portion of the debug stack:
+ +		 */
+ +#if DEBUG_STKSZ > EXCEPTION_STKSZ
+ +		if (k == DEBUG_STACK - 1 && stack >= end - DEBUG_STKSZ) {
+ +			unsigned j = N_EXCEPTION_STACKS - 1;
+ +
+ +			/*
+ +			 * Black magic. A large debug stack is composed of
+ +			 * multiple exception stack entries, which we
+ +			 * iterate through now. Dont look:
+ +			 */
+ +			do {
+ +				++j;
+ +				end -= EXCEPTION_STKSZ;
+ +				x86_stack_ids[j][4] = '1' +
+ +						(j - N_EXCEPTION_STACKS);
+ +			} while (stack < end - EXCEPTION_STKSZ);
+ +			if (*usedp & (1U << j))
+ +				break;
+ +			*usedp |= 1U << j;
+ +			*idp = x86_stack_ids[j];
+ +			return (unsigned long *)end;
+ +		}
+ +#endif
+ +	}
+ +	return NULL;
+++=======
++ 		end   = (unsigned long *)raw_cpu_ptr(&orig_ist)->ist[k];
++ 		begin = end - (exception_stack_sizes[k] / sizeof(long));
++ 		regs  = (struct pt_regs *)end - 1;
++ 
++ 		if (stack < begin || stack >= end)
++ 			continue;
++ 
++ 		/*
++ 		 * Make sure we don't iterate through an exception stack more
++ 		 * than once.  If it comes up a second time then there's
++ 		 * something wrong going on - just break out and report an
++ 		 * unknown stack type.
++ 		 */
++ 		if (*visit_mask & (1U << k))
++ 			break;
++ 		*visit_mask |= 1U << k;
++ 
++ 		info->type	= STACK_TYPE_EXCEPTION + k;
++ 		info->begin	= begin;
++ 		info->end	= end;
++ 		info->next_sp	= (unsigned long *)regs->sp;
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  }
+  
+- static inline int
+- in_irq_stack(unsigned long *stack, unsigned long *irq_stack,
+- 	     unsigned long *irq_stack_end)
++ static bool in_irq_stack(unsigned long *stack, struct stack_info *info)
+  {
+- 	return (stack >= irq_stack && stack < irq_stack_end);
++ 	unsigned long *end   = (unsigned long *)this_cpu_read(irq_stack_ptr);
++ 	unsigned long *begin = end - (IRQ_STACK_SIZE / sizeof(long));
++ 
++ 	if (stack < begin || stack >= end)
++ 		return false;
++ 
++ 	info->type	= STACK_TYPE_IRQ;
++ 	info->begin	= begin;
++ 	info->end	= end;
++ 
++ 	/*
++ 	 * The next stack pointer is the first thing pushed by the entry code
++ 	 * after switching to the irq stack.
++ 	 */
++ 	info->next_sp = (unsigned long *)*(end - 1);
++ 
++ 	return true;
+  }
+  
+++<<<<<<< HEAD
+ +enum stack_type {
+ +	STACK_IS_UNKNOWN,
+ +	STACK_IS_NORMAL,
+ +	STACK_IS_EXCEPTION,
+ +	STACK_IS_IRQ,
+ +};
+ +
+ +static enum stack_type
+ +analyze_stack(int cpu, struct task_struct *task, unsigned long *stack,
+ +	      unsigned long **stack_end, unsigned long *irq_stack,
+ +	      unsigned *used, char **id)
+++=======
++ int get_stack_info(unsigned long *stack, struct task_struct *task,
++ 		   struct stack_info *info, unsigned long *visit_mask)
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  {
+- 	unsigned long addr;
++ 	if (!stack)
++ 		goto unknown;
+  
+- 	addr = ((unsigned long)stack & (~(THREAD_SIZE - 1)));
+- 	if ((unsigned long)task_stack_page(task) == addr)
+- 		return STACK_IS_NORMAL;
++ 	task = task ? : current;
+  
+++<<<<<<< HEAD
+ +	*stack_end = in_exception_stack(cpu, (unsigned long)stack,
+ +					used, id);
+ +	if (*stack_end)
+ +		return STACK_IS_EXCEPTION;
+++=======
++ 	if (in_task_stack(stack, task, info))
++ 		return 0;
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  
+- 	if (!irq_stack)
+- 		return STACK_IS_NORMAL;
++ 	if (task != current)
++ 		goto unknown;
+  
+- 	*stack_end = irq_stack;
+- 	irq_stack -= (IRQ_STACK_SIZE / sizeof(long));
++ 	if (in_exception_stack(stack, info, visit_mask))
++ 		return 0;
+  
+- 	if (in_irq_stack(stack, irq_stack, *stack_end))
+- 		return STACK_IS_IRQ;
++ 	if (in_irq_stack(stack, info))
++ 		return 0;
+  
+- 	return STACK_IS_UNKNOWN;
++ 	return 0;
++ 
++ unknown:
++ 	info->type = STACK_TYPE_UNKNOWN;
++ 	return -EINVAL;
+  }
+  
+  /*
+@@@ -149,11 -144,8 +237,16 @@@ void dump_trace(struct task_struct *tas
+  		unsigned long *stack, unsigned long bp,
+  		const struct stacktrace_ops *ops, void *data)
+  {
+++<<<<<<< HEAD
+ +	const unsigned cpu = get_cpu();
+ +	struct thread_info *tinfo;
+ +	unsigned long *irq_stack = (unsigned long *)per_cpu(irq_stack_ptr, cpu);
+ +	unsigned long dummy;
+ +	unsigned used = 0;
+++=======
++ 	unsigned long visit_mask = 0;
++ 	struct stack_info info;
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  	int graph = 0;
+  	int done = 0;
+  
+@@@ -176,59 -158,38 +269,77 @@@
+  	 * current stack address. If the stacks consist of nested
+  	 * exceptions
+  	 */
+ +	tinfo = task_thread_info(task);
+  	while (!done) {
+- 		unsigned long *stack_end;
+- 		enum stack_type stype;
+- 		char *id;
++ 		const char *begin_str, *end_str;
+  
+++<<<<<<< HEAD
+ +		stype = analyze_stack(cpu, task, stack, &stack_end,
+ +				      irq_stack, &used, &id);
+++=======
++ 		get_stack_info(stack, task, &info, &visit_mask);
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  
+  		/* Default finish unless specified to continue */
+  		done = 1;
+  
+- 		switch (stype) {
++ 		switch (info.type) {
+  
+  		/* Break out early if we are on the thread stack */
+- 		case STACK_IS_NORMAL:
++ 		case STACK_TYPE_TASK:
+  			break;
+  
+- 		case STACK_IS_EXCEPTION:
++ 		case STACK_TYPE_IRQ:
++ 		case STACK_TYPE_EXCEPTION ... STACK_TYPE_EXCEPTION_LAST:
++ 
++ 			stack_type_str(info.type, &begin_str, &end_str);
+  
+- 			if (ops->stack(data, id) < 0)
++ 			if (ops->stack(data, begin_str) < 0)
+  				break;
+  
+++<<<<<<< HEAD
+ +			bp = ops->walk_stack(tinfo, stack, bp, ops,
+ +					     data, stack_end, &graph);
+ +			ops->stack(data, "EOE");
+ +			/*
+ +			 * We link to the next stack via the
+ +			 * second-to-last pointer (index -2 to end) in the
+ +			 * exception stack:
+ +			 */
+ +			stack = (unsigned long *) stack_end[-2];
+ +			done = 0;
+ +			break;
+ +
+ +		case STACK_IS_IRQ:
+ +
+ +			if (ops->stack(data, "IRQ") < 0)
+ +				break;
+ +			bp = ops->walk_stack(tinfo, stack, bp,
+ +				     ops, data, stack_end, &graph);
+ +			/*
+ +			 * We link to the next stack (which would be
+ +			 * the process stack normally) the last
+ +			 * pointer (index -1 to end) in the IRQ stack:
+ +			 */
+ +			stack = (unsigned long *) (stack_end[-1]);
+ +			irq_stack = NULL;
+ +			ops->stack(data, "EOI");
+ +			done = 0;
+ +			break;
+ +
+ +		case STACK_IS_UNKNOWN:
+++=======
++ 			bp = ops->walk_stack(task, stack, bp, ops,
++ 					     data, &info, &graph);
++ 
++ 			ops->stack(data, end_str);
++ 
++ 			stack = info.next_sp;
++ 			done = 0;
++ 			break;
++ 
++ 		default:
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  			ops->stack(data, "UNK");
+  			break;
+  		}
+@@@ -237,8 -198,7 +348,12 @@@
+  	/*
+  	 * This handles the process stack:
+  	 */
+++<<<<<<< HEAD
+ +	bp = ops->walk_stack(tinfo, stack, bp, ops, data, NULL, &graph);
+ +	put_cpu();
+++=======
++ 	bp = ops->walk_stack(task, stack, bp, ops, data, &info, &graph);
+++>>>>>>> cb76c9398240 (x86/dumpstack: Add get_stack_info() interface)
+  }
+  EXPORT_SYMBOL(dump_trace);
+  
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 46ec501e4537..27ef5ac42769 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -2186,7 +2186,7 @@ void arch_perf_update_userpage(struct perf_event *event,
+  * callchain support
+  */
+ 
+-static int backtrace_stack(void *data, char *name)
++static int backtrace_stack(void *data, const char *name)
+ {
+ 	return 0;
+ }
+diff --git a/arch/x86/include/asm/stacktrace.h b/arch/x86/include/asm/stacktrace.h
+index 7c247e7404be..11516dac530a 100644
+--- a/arch/x86/include/asm/stacktrace.h
++++ b/arch/x86/include/asm/stacktrace.h
+@@ -9,6 +9,39 @@
+ #include <linux/uaccess.h>
+ #include <linux/ptrace.h>
+ 
++enum stack_type {
++	STACK_TYPE_UNKNOWN,
++	STACK_TYPE_TASK,
++	STACK_TYPE_IRQ,
++	STACK_TYPE_SOFTIRQ,
++	STACK_TYPE_EXCEPTION,
++	STACK_TYPE_EXCEPTION_LAST = STACK_TYPE_EXCEPTION + N_EXCEPTION_STACKS-1,
++};
++
++struct stack_info {
++	enum stack_type type;
++	unsigned long *begin, *end, *next_sp;
++};
++
++bool in_task_stack(unsigned long *stack, struct task_struct *task,
++		   struct stack_info *info);
++
++int get_stack_info(unsigned long *stack, struct task_struct *task,
++		   struct stack_info *info, unsigned long *visit_mask);
++
++void stack_type_str(enum stack_type type, const char **begin,
++		    const char **end);
++
++static inline bool on_stack(struct stack_info *info, void *addr, size_t len)
++{
++	void *begin = info->begin;
++	void *end   = info->end;
++
++	return (info->type != STACK_TYPE_UNKNOWN &&
++		addr >= begin && addr < end &&
++		addr + len > begin && addr + len <= end);
++}
++
+ extern int kstack_depth_to_print;
+ 
+ struct thread_info;
+@@ -19,27 +52,27 @@ typedef unsigned long (*walk_stack_t)(struct thread_info *tinfo,
+ 				      unsigned long bp,
+ 				      const struct stacktrace_ops *ops,
+ 				      void *data,
+-				      unsigned long *end,
++				      struct stack_info *info,
+ 				      int *graph);
+ 
+ extern unsigned long
+ print_context_stack(struct thread_info *tinfo,
+ 		    unsigned long *stack, unsigned long bp,
+ 		    const struct stacktrace_ops *ops, void *data,
+-		    unsigned long *end, int *graph);
++		    struct stack_info *info, int *graph);
+ 
+ extern unsigned long
+ print_context_stack_bp(struct thread_info *tinfo,
+ 		       unsigned long *stack, unsigned long bp,
+ 		       const struct stacktrace_ops *ops, void *data,
+-		       unsigned long *end, int *graph);
++		       struct stack_info *info, int *graph);
+ 
+ /* Generic stack tracer with callbacks */
+ 
+ struct stacktrace_ops {
+ 	int (*address)(void *data, unsigned long address, int reliable);
+ 	/* On negative return stop dumping */
+-	int (*stack)(void *data, char *name);
++	int (*stack)(void *data, const char *name);
+ 	walk_stack_t	walk_stack;
+ };
+ 
+* Unmerged path arch/x86/kernel/dumpstack.c
+* Unmerged path arch/x86/kernel/dumpstack_32.c
+* Unmerged path arch/x86/kernel/dumpstack_64.c
+diff --git a/arch/x86/kernel/stacktrace.c b/arch/x86/kernel/stacktrace.c
+index 9ee98eefc44d..8215fe3fdfd9 100644
+--- a/arch/x86/kernel/stacktrace.c
++++ b/arch/x86/kernel/stacktrace.c
+@@ -9,7 +9,7 @@
+ #include <linux/uaccess.h>
+ #include <asm/stacktrace.h>
+ 
+-static int save_stack_stack(void *data, char *name)
++static int save_stack_stack(void *data, const char *name)
+ {
+ 	return 0;
+ }
+diff --git a/arch/x86/oprofile/backtrace.c b/arch/x86/oprofile/backtrace.c
+index a9d65ab8f9cd..dc9b79feae5c 100644
+--- a/arch/x86/oprofile/backtrace.c
++++ b/arch/x86/oprofile/backtrace.c
+@@ -17,7 +17,7 @@
+ #include <asm/ptrace.h>
+ #include <asm/stacktrace.h>
+ 
+-static int backtrace_stack(void *data, char *name)
++static int backtrace_stack(void *data, const char *name)
+ {
+ 	/* Yes, we want all stacks */
+ 	return 0;
