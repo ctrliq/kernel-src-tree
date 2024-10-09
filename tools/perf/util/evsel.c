@@ -1030,16 +1030,13 @@ static int perf_evsel__alloc_fd(struct perf_evsel *evsel, int ncpus, int nthread
 	return evsel->fd != NULL ? 0 : -ENOMEM;
 }
 
-static int perf_evsel__run_ioctl(struct perf_evsel *evsel, int ncpus, int nthreads,
+static int perf_evsel__run_ioctl(struct perf_evsel *evsel,
 			  int ioc,  void *arg)
 {
 	int cpu, thread;
 
-	if (evsel->system_wide)
-		nthreads = 1;
-
-	for (cpu = 0; cpu < ncpus; cpu++) {
-		for (thread = 0; thread < nthreads; thread++) {
+	for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++) {
+		for (thread = 0; thread < xyarray__max_y(evsel->fd); thread++) {
 			int fd = FD(evsel, cpu, thread),
 			    err = ioctl(fd, ioc, arg);
 
@@ -1051,10 +1048,9 @@ static int perf_evsel__run_ioctl(struct perf_evsel *evsel, int ncpus, int nthrea
 	return 0;
 }
 
-int perf_evsel__apply_filter(struct perf_evsel *evsel, int ncpus, int nthreads,
-			     const char *filter)
+int perf_evsel__apply_filter(struct perf_evsel *evsel, const char *filter)
 {
-	return perf_evsel__run_ioctl(evsel, ncpus, nthreads,
+	return perf_evsel__run_ioctl(evsel,
 				     PERF_EVENT_IOC_SET_FILTER,
 				     (void *)filter);
 }
@@ -1101,20 +1097,14 @@ int perf_evsel__append_addr_filter(struct perf_evsel *evsel, const char *filter)
 
 int perf_evsel__enable(struct perf_evsel *evsel)
 {
-	int nthreads = thread_map__nr(evsel->threads);
-	int ncpus = cpu_map__nr(evsel->cpus);
-
-	return perf_evsel__run_ioctl(evsel, ncpus, nthreads,
+	return perf_evsel__run_ioctl(evsel,
 				     PERF_EVENT_IOC_ENABLE,
 				     0);
 }
 
 int perf_evsel__disable(struct perf_evsel *evsel)
 {
-	int nthreads = thread_map__nr(evsel->threads);
-	int ncpus = cpu_map__nr(evsel->cpus);
-
-	return perf_evsel__run_ioctl(evsel, ncpus, nthreads,
+	return perf_evsel__run_ioctl(evsel,
 				     PERF_EVENT_IOC_DISABLE,
 				     0);
 }
@@ -1164,15 +1154,12 @@ static void perf_evsel__free_config_terms(struct perf_evsel *evsel)
 	}
 }
 
-void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
+void perf_evsel__close_fd(struct perf_evsel *evsel)
 {
 	int cpu, thread;
 
-	if (evsel->system_wide)
-		nthreads = 1;
-
-	for (cpu = 0; cpu < ncpus; cpu++)
-		for (thread = 0; thread < nthreads; ++thread) {
+	for (cpu = 0; cpu < xyarray__max_x(evsel->fd); cpu++)
+		for (thread = 0; thread < xyarray__max_y(evsel->fd); ++thread) {
 			close(FD(evsel, cpu, thread));
 			FD(evsel, cpu, thread) = -1;
 		}
@@ -1817,12 +1804,12 @@ out_close:
 	return err;
 }
 
-void perf_evsel__close(struct perf_evsel *evsel, int ncpus, int nthreads)
+void perf_evsel__close(struct perf_evsel *evsel)
 {
 	if (evsel->fd == NULL)
 		return;
 
-	perf_evsel__close_fd(evsel, ncpus, nthreads);
+	perf_evsel__close_fd(evsel);
 	perf_evsel__free_fd(evsel);
 }
 

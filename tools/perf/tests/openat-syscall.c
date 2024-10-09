@@ -56,7 +56,7 @@ int test__openat_syscall_event(int subtest __maybe_unused)
 
 	err = 0;
 out_close_fd:
-	perf_evsel__close_fd(evsel, 1, threads->nr);
+	perf_evsel__close_fd(evsel);
 out_evsel_delete:
 	perf_evsel__delete(evsel);
 out_thread_map_delete:
