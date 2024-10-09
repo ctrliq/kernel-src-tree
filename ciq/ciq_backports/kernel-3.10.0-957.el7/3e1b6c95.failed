@@ -1,0 +1,726 @@
+iio: Move buffer registration to the core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] Move buffer registration to the core (Tony Camuso) [1559170]
+Rebuild_FUZZ: 93.51%
+commit-author Lars-Peter Clausen <lars@metafoo.de>
+commit 3e1b6c95b990c93f4aa3b17e9f66221e2fa44bee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3e1b6c95.failed
+
+Originally device and buffer registration were kept as separate operations
+in IIO to allow to register two distinct sets of channels for buffered and
+non-buffered operations. This has since already been further restricted and
+the channel set registered for the buffer needs to be a subset of the
+channel set registered for the device. Additionally the possibility to not
+have a raw (or processed) attribute for a channel which was registered for
+the device was added a while ago. This means it is possible to not register
+any device level attributes for a channel even if it is registered for the
+device. Also if a channel's scan_index is set to -1 and the channel is
+registered for the buffer it is ignored.
+
+So in summary it means it is possible to register the same channel array for
+both the device and the buffer yet still end up with distinctive sets of
+channels for both of them. This makes the argument for having to have to
+manually register the channels for both the device and the buffer invalid.
+Considering that the vast majority of all drivers want to register the same
+set of channels for both the buffer and the device it makes sense to move
+the buffer registration into the core to avoid some boiler-plate code in the
+device driver setup path.
+
+	Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 3e1b6c95b990c93f4aa3b17e9f66221e2fa44bee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/adc/ti_am335x_adc.c
+#	drivers/staging/iio/accel/lis3l02dq_core.c
+#	drivers/staging/iio/accel/sca3000_core.c
+#	drivers/staging/iio/iio_simple_dummy_buffer.c
+#	drivers/staging/iio/impedance-analyzer/ad5933.c
+#	include/linux/iio/buffer.h
+diff --cc drivers/iio/adc/ti_am335x_adc.c
+index 5f9a7e7d3135,d550ac7d2365..000000000000
+--- a/drivers/iio/adc/ti_am335x_adc.c
++++ b/drivers/iio/adc/ti_am335x_adc.c
+@@@ -58,23 -99,203 +58,199 @@@ static void tiadc_step_config(struct ti
+  	 */
+  
+  	steps = TOTAL_STEPS - adc_dev->channels;
+ -	if (iio_buffer_enabled(indio_dev))
+ -		stepconfig = STEPCONFIG_AVG_16 | STEPCONFIG_FIFO1
+ -					| STEPCONFIG_MODE_SWCNT;
+ -	else
+ -		stepconfig = STEPCONFIG_AVG_16 | STEPCONFIG_FIFO1;
+ -
+ -	for (i = 0; i < adc_dev->channels; i++) {
+ -		int chan;
+ -
+ -		chan = adc_dev->channel_line[i];
+ -		tiadc_writel(adc_dev, REG_STEPCONFIG(steps),
+ -				stepconfig | STEPCONFIG_INP(chan));
+ -		tiadc_writel(adc_dev, REG_STEPDELAY(steps),
+ +	channels = TOTAL_CHANNELS - adc_dev->channels;
+ +
+ +	stepconfig = STEPCONFIG_AVG_16 | STEPCONFIG_FIFO1;
+ +
+ +	for (i = (steps + 1); i <= TOTAL_STEPS; i++) {
+ +		tiadc_writel(adc_dev, REG_STEPCONFIG(i),
+ +				stepconfig | STEPCONFIG_INP(channels));
+ +		tiadc_writel(adc_dev, REG_STEPDELAY(i),
+  				STEPCONFIG_OPENDLY);
+ -		adc_dev->channel_step[i] = steps;
+ -		steps++;
+ +		channels++;
+  	}
+ +	tiadc_writel(adc_dev, REG_SE, STPENB_STEPENB);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static irqreturn_t tiadc_irq_h(int irq, void *private)
++ {
++ 	struct iio_dev *indio_dev = private;
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	unsigned int status, config;
++ 	status = tiadc_readl(adc_dev, REG_IRQSTATUS);
++ 
++ 	/*
++ 	 * ADC and touchscreen share the IRQ line.
++ 	 * FIFO0 interrupts are used by TSC. Handle FIFO1 IRQs here only
++ 	 */
++ 	if (status & IRQENB_FIFO1OVRRUN) {
++ 		/* FIFO Overrun. Clear flag. Disable/Enable ADC to recover */
++ 		config = tiadc_readl(adc_dev, REG_CTRL);
++ 		config &= ~(CNTRLREG_TSCSSENB);
++ 		tiadc_writel(adc_dev, REG_CTRL, config);
++ 		tiadc_writel(adc_dev, REG_IRQSTATUS, IRQENB_FIFO1OVRRUN
++ 				| IRQENB_FIFO1UNDRFLW | IRQENB_FIFO1THRES);
++ 		tiadc_writel(adc_dev, REG_CTRL, (config | CNTRLREG_TSCSSENB));
++ 		return IRQ_HANDLED;
++ 	} else if (status & IRQENB_FIFO1THRES) {
++ 		/* Disable irq and wake worker thread */
++ 		tiadc_writel(adc_dev, REG_IRQCLR, IRQENB_FIFO1THRES);
++ 		return IRQ_WAKE_THREAD;
++ 	}
++ 
++ 	return IRQ_NONE;
++ }
++ 
++ static irqreturn_t tiadc_worker_h(int irq, void *private)
++ {
++ 	struct iio_dev *indio_dev = private;
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	int i, k, fifo1count, read;
++ 	u16 *data = adc_dev->data;
++ 
++ 	fifo1count = tiadc_readl(adc_dev, REG_FIFO1CNT);
++ 	for (k = 0; k < fifo1count; k = k + i) {
++ 		for (i = 0; i < (indio_dev->scan_bytes)/2; i++) {
++ 			read = tiadc_readl(adc_dev, REG_FIFO1);
++ 			data[i] = read & FIFOREAD_DATA_MASK;
++ 		}
++ 		iio_push_to_buffers(indio_dev, (u8 *) data);
++ 	}
++ 
++ 	tiadc_writel(adc_dev, REG_IRQSTATUS, IRQENB_FIFO1THRES);
++ 	tiadc_writel(adc_dev, REG_IRQENABLE, IRQENB_FIFO1THRES);
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static int tiadc_buffer_preenable(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	int i, fifo1count, read;
++ 
++ 	tiadc_writel(adc_dev, REG_IRQCLR, (IRQENB_FIFO1THRES |
++ 				IRQENB_FIFO1OVRRUN |
++ 				IRQENB_FIFO1UNDRFLW));
++ 
++ 	/* Flush FIFO. Needed in corner cases in simultaneous tsc/adc use */
++ 	fifo1count = tiadc_readl(adc_dev, REG_FIFO1CNT);
++ 	for (i = 0; i < fifo1count; i++)
++ 		read = tiadc_readl(adc_dev, REG_FIFO1);
++ 
++ 	return 0;
++ }
++ 
++ static int tiadc_buffer_postenable(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	struct iio_buffer *buffer = indio_dev->buffer;
++ 	unsigned int enb = 0;
++ 	u8 bit;
++ 
++ 	tiadc_step_config(indio_dev);
++ 	for_each_set_bit(bit, buffer->scan_mask, adc_dev->channels)
++ 		enb |= (get_adc_step_bit(adc_dev, bit) << 1);
++ 	adc_dev->buffer_en_ch_steps = enb;
++ 
++ 	am335x_tsc_se_set_cache(adc_dev->mfd_tscadc, enb);
++ 
++ 	tiadc_writel(adc_dev,  REG_IRQSTATUS, IRQENB_FIFO1THRES
++ 				| IRQENB_FIFO1OVRRUN | IRQENB_FIFO1UNDRFLW);
++ 	tiadc_writel(adc_dev,  REG_IRQENABLE, IRQENB_FIFO1THRES
++ 				| IRQENB_FIFO1OVRRUN);
++ 
++ 	return 0;
++ }
++ 
++ static int tiadc_buffer_predisable(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 	int fifo1count, i, read;
++ 
++ 	tiadc_writel(adc_dev, REG_IRQCLR, (IRQENB_FIFO1THRES |
++ 				IRQENB_FIFO1OVRRUN | IRQENB_FIFO1UNDRFLW));
++ 	am335x_tsc_se_clr(adc_dev->mfd_tscadc, adc_dev->buffer_en_ch_steps);
++ 	adc_dev->buffer_en_ch_steps = 0;
++ 
++ 	/* Flush FIFO of leftover data in the time it takes to disable adc */
++ 	fifo1count = tiadc_readl(adc_dev, REG_FIFO1CNT);
++ 	for (i = 0; i < fifo1count; i++)
++ 		read = tiadc_readl(adc_dev, REG_FIFO1);
++ 
++ 	return 0;
++ }
++ 
++ static int tiadc_buffer_postdisable(struct iio_dev *indio_dev)
++ {
++ 	tiadc_step_config(indio_dev);
++ 
++ 	return 0;
++ }
++ 
++ static const struct iio_buffer_setup_ops tiadc_buffer_setup_ops = {
++ 	.preenable = &tiadc_buffer_preenable,
++ 	.postenable = &tiadc_buffer_postenable,
++ 	.predisable = &tiadc_buffer_predisable,
++ 	.postdisable = &tiadc_buffer_postdisable,
++ };
++ 
++ static int tiadc_iio_buffered_hardware_setup(struct iio_dev *indio_dev,
++ 	irqreturn_t (*pollfunc_bh)(int irq, void *p),
++ 	irqreturn_t (*pollfunc_th)(int irq, void *p),
++ 	int irq,
++ 	unsigned long flags,
++ 	const struct iio_buffer_setup_ops *setup_ops)
++ {
++ 	struct iio_buffer *buffer;
++ 	int ret;
++ 
++ 	buffer = iio_kfifo_allocate(indio_dev);
++ 	if (!buffer)
++ 		return -ENOMEM;
++ 
++ 	iio_device_attach_buffer(indio_dev, buffer);
++ 
++ 	ret = request_threaded_irq(irq,	pollfunc_th, pollfunc_bh,
++ 				flags, indio_dev->name, indio_dev);
++ 	if (ret)
++ 		goto error_kfifo_free;
++ 
++ 	indio_dev->setup_ops = setup_ops;
++ 	indio_dev->modes |= INDIO_BUFFER_HARDWARE;
++ 
++ 	return 0;
++ 
++ error_kfifo_free:
++ 	iio_kfifo_free(indio_dev->buffer);
++ 	return ret;
++ }
++ 
++ static void tiadc_iio_buffered_hardware_remove(struct iio_dev *indio_dev)
++ {
++ 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
++ 
++ 	free_irq(adc_dev->mfd_tscadc->irq, indio_dev);
++ 	iio_kfifo_free(indio_dev->buffer);
++ }
++ 
++ 
++ static const char * const chan_name_ain[] = {
++ 	"AIN0",
++ 	"AIN1",
++ 	"AIN2",
++ 	"AIN3",
++ 	"AIN4",
++ 	"AIN5",
++ 	"AIN6",
++ 	"AIN7",
++ };
++ 
+++>>>>>>> 3e1b6c95b990 (iio: Move buffer registration to the core)
+  static int tiadc_channel_init(struct iio_dev *indio_dev, int channels)
+  {
+ -	struct tiadc_device *adc_dev = iio_priv(indio_dev);
+  	struct iio_chan_spec *chan_array;
+ -	struct iio_chan_spec *chan;
+  	int i;
+  
+  	indio_dev->num_channels = channels;
+diff --cc drivers/staging/iio/accel/lis3l02dq_core.c
+index 1bfe5d81792b,b78c9c5d5588..000000000000
+--- a/drivers/staging/iio/accel/lis3l02dq_core.c
++++ b/drivers/staging/iio/accel/lis3l02dq_core.c
+@@@ -688,16 -714,8 +688,19 @@@ static int lis3l02dq_probe(struct spi_d
+  
+  	ret = lis3l02dq_configure_buffer(indio_dev);
+  	if (ret)
+ -		return ret;
+ +		goto error_free_dev;
+  
+++<<<<<<< HEAD
+ +	ret = iio_buffer_register(indio_dev,
+ +				  lis3l02dq_channels,
+ +				  ARRAY_SIZE(lis3l02dq_channels));
+ +	if (ret) {
+ +		printk(KERN_ERR "failed to initialize the buffer\n");
+ +		goto error_unreg_buffer_funcs;
+ +	}
+ +
+++=======
+++>>>>>>> 3e1b6c95b990 (iio: Move buffer registration to the core)
+  	if (spi->irq) {
+  		ret = request_threaded_irq(st->us->irq,
+  					   &lis3l02dq_th,
+@@@ -730,13 -748,8 +733,11 @@@ error_remove_trigger
+  error_free_interrupt:
+  	if (spi->irq)
+  		free_irq(st->us->irq, indio_dev);
+- error_uninitialize_buffer:
+- 	iio_buffer_unregister(indio_dev);
+  error_unreg_buffer_funcs:
+  	lis3l02dq_unconfigure_buffer(indio_dev);
+ +error_free_dev:
+ +	iio_device_free(indio_dev);
+ +error_ret:
+  	return ret;
+  }
+  
+@@@ -781,11 -794,8 +782,10 @@@ static int lis3l02dq_remove(struct spi_
+  		free_irq(st->us->irq, indio_dev);
+  
+  	lis3l02dq_remove_trigger(indio_dev);
+- 	iio_buffer_unregister(indio_dev);
+  	lis3l02dq_unconfigure_buffer(indio_dev);
+  
+ +	iio_device_free(indio_dev);
+ +
+  	return 0;
+  }
+  
+diff --cc drivers/staging/iio/accel/sca3000_core.c
+index 32950ad94857,9cd04c7147c8..000000000000
+--- a/drivers/staging/iio/accel/sca3000_core.c
++++ b/drivers/staging/iio/accel/sca3000_core.c
+@@@ -1162,19 -1154,8 +1162,22 @@@ static int sca3000_probe(struct spi_dev
+  	sca3000_configure_ring(indio_dev);
+  	ret = iio_device_register(indio_dev);
+  	if (ret < 0)
+ -		return ret;
+ +		goto error_free_dev;
+  
+++<<<<<<< HEAD
+ +	ret = iio_buffer_register(indio_dev,
+ +				  sca3000_channels,
+ +				  ARRAY_SIZE(sca3000_channels));
+ +	if (ret < 0)
+ +		goto error_unregister_dev;
+ +	if (indio_dev->buffer) {
+ +		iio_scan_mask_set(indio_dev, indio_dev->buffer, 0);
+ +		iio_scan_mask_set(indio_dev, indio_dev->buffer, 1);
+ +		iio_scan_mask_set(indio_dev, indio_dev->buffer, 2);
+ +	}
+ +
+++=======
+++>>>>>>> 3e1b6c95b990 (iio: Move buffer registration to the core)
+  	if (spi->irq) {
+  		ret = request_threaded_irq(spi->irq,
+  					   NULL,
+@@@ -1194,14 -1175,8 +1197,12 @@@
+  error_free_irq:
+  	if (spi->irq)
+  		free_irq(spi->irq, indio_dev);
+- error_unregister_ring:
+- 	iio_buffer_unregister(indio_dev);
+  error_unregister_dev:
+  	iio_device_unregister(indio_dev);
+ +error_free_dev:
+ +	iio_device_free(indio_dev);
+ +
+ +error_ret:
+  	return ret;
+  }
+  
+@@@ -1233,9 -1208,7 +1234,8 @@@ static int sca3000_remove(struct spi_de
+  	if (spi->irq)
+  		free_irq(spi->irq, indio_dev);
+  	iio_device_unregister(indio_dev);
+- 	iio_buffer_unregister(indio_dev);
+  	sca3000_unconfigure_ring(indio_dev);
+ +	iio_device_free(indio_dev);
+  
+  	return 0;
+  }
+diff --cc drivers/staging/iio/iio_simple_dummy_buffer.c
+index 72f400c3cbcb,a2d72c102119..000000000000
+--- a/drivers/staging/iio/iio_simple_dummy_buffer.c
++++ b/drivers/staging/iio/iio_simple_dummy_buffer.c
+@@@ -183,14 -172,8 +183,15 @@@ int iio_simple_dummy_configure_buffer(s
+  	 */
+  	indio_dev->modes |= INDIO_BUFFER_TRIGGERED;
+  
+++<<<<<<< HEAD
+ +	ret = iio_buffer_register(indio_dev, channels, num_channels);
+ +	if (ret)
+ +		goto error_dealloc_pollfunc;
+ +
+++=======
+++>>>>>>> 3e1b6c95b990 (iio: Move buffer registration to the core)
+  	return 0;
+  
+- error_dealloc_pollfunc:
+- 	iio_dealloc_pollfunc(indio_dev->pollfunc);
+  error_free_buffer:
+  	iio_kfifo_free(indio_dev->buffer);
+  error_ret:
+diff --cc drivers/staging/iio/impedance-analyzer/ad5933.c
+index 6330af656a0f,c50b1380b9aa..000000000000
+--- a/drivers/staging/iio/impedance-analyzer/ad5933.c
++++ b/drivers/staging/iio/impedance-analyzer/ad5933.c
+@@@ -752,22 -752,13 +752,29 @@@ static int ad5933_probe(struct i2c_clie
+  	if (ret)
+  		goto error_disable_reg;
+  
+++<<<<<<< HEAD
+ +	/* skip temp0_input, register in0_(real|imag)_raw */
+ +	ret = iio_buffer_register(indio_dev, &ad5933_channels[1], 2);
+ +	if (ret)
+ +		goto error_unreg_ring;
+ +
+ +	/* enable both REAL and IMAG channels by default */
+ +	iio_scan_mask_set(indio_dev, indio_dev->buffer, 0);
+ +	iio_scan_mask_set(indio_dev, indio_dev->buffer, 1);
+ +
+ +	ret = ad5933_setup(st);
+ +	if (ret)
+ +		goto error_uninitialize_ring;
+ +
+++=======
++ 	ret = ad5933_setup(st);
++ 	if (ret)
++ 		goto error_unreg_ring;
++ 
+++>>>>>>> 3e1b6c95b990 (iio: Move buffer registration to the core)
+  	ret = iio_device_register(indio_dev);
+  	if (ret)
+- 		goto error_uninitialize_ring;
++ 		goto error_unreg_ring;
+  
+  	return 0;
+  
+@@@ -793,13 -777,9 +798,12 @@@ static int ad5933_remove(struct i2c_cli
+  	struct ad5933_state *st = iio_priv(indio_dev);
+  
+  	iio_device_unregister(indio_dev);
+- 	iio_buffer_unregister(indio_dev);
+  	iio_kfifo_free(indio_dev->buffer);
+ -	if (!IS_ERR(st->reg))
+ +	if (!IS_ERR(st->reg)) {
+  		regulator_disable(st->reg);
+ +		regulator_put(st->reg);
+ +	}
+ +	iio_device_free(indio_dev);
+  
+  	return 0;
+  }
+diff --cc include/linux/iio/buffer.h
+index 26890e4a025c,b0e006c3db43..000000000000
+--- a/include/linux/iio/buffer.h
++++ b/include/linux/iio/buffer.h
+@@@ -196,17 -187,28 +180,22 @@@ ssize_t iio_buffer_show_enable(struct d
+  bool iio_validate_scan_mask_onehot(struct iio_dev *indio_dev,
+  	const unsigned long *mask);
+  
+ -struct iio_buffer *iio_buffer_get(struct iio_buffer *buffer);
+ -void iio_buffer_put(struct iio_buffer *buffer);
+ +#else /* CONFIG_IIO_BUFFER */
+  
+ -/**
+ - * iio_device_attach_buffer - Attach a buffer to a IIO device
+ - * @indio_dev: The device the buffer should be attached to
+ - * @buffer: The buffer to attach to the device
+ - *
+ - * This function attaches a buffer to a IIO device. The buffer stays attached to
+ - * the device until the device is freed. The function should only be called at
+ - * most once per device.
+ - */
+ -static inline void iio_device_attach_buffer(struct iio_dev *indio_dev,
+ -	struct iio_buffer *buffer)
+++<<<<<<< HEAD
+ +static inline int iio_buffer_register(struct iio_dev *indio_dev,
+ +					   const struct iio_chan_spec *channels,
+ +					   int num_channels)
+  {
+ -	indio_dev->buffer = iio_buffer_get(buffer);
+ +	return 0;
+  }
+  
+ -#else /* CONFIG_IIO_BUFFER */
+ -
+ +static inline void iio_buffer_unregister(struct iio_dev *indio_dev)
+ +{}
+++=======
++ static inline void iio_buffer_get(struct iio_buffer *buffer) {}
++ static inline void iio_buffer_put(struct iio_buffer *buffer) {}
+++>>>>>>> 3e1b6c95b990 (iio: Move buffer registration to the core)
+  
+  #endif /* CONFIG_IIO_BUFFER */
+  
+* Unmerged path drivers/iio/adc/ti_am335x_adc.c
+diff --git a/drivers/iio/iio_core.h b/drivers/iio/iio_core.h
+index 771aaa240126..3e4b9cfe27bd 100644
+--- a/drivers/iio/iio_core.h
++++ b/drivers/iio/iio_core.h
+@@ -48,6 +48,8 @@ unsigned int iio_buffer_poll(struct file *filp,
+ ssize_t iio_buffer_read_first_n_outer(struct file *filp, char __user *buf,
+ 				      size_t n, loff_t *f_ps);
+ 
++int iio_buffer_alloc_sysfs_and_mask(struct iio_dev *indio_dev);
++void iio_buffer_free_sysfs_and_mask(struct iio_dev *indio_dev);
+ 
+ #define iio_buffer_poll_addr (&iio_buffer_poll)
+ #define iio_buffer_read_first_n_outer_addr (&iio_buffer_read_first_n_outer)
+@@ -60,6 +62,13 @@ void iio_buffer_wakeup_poll(struct iio_dev *indio_dev);
+ #define iio_buffer_poll_addr NULL
+ #define iio_buffer_read_first_n_outer_addr NULL
+ 
++static inline int iio_buffer_alloc_sysfs_and_mask(struct iio_dev *indio_dev)
++{
++	return 0;
++}
++
++static inline void iio_buffer_free_sysfs_and_mask(struct iio_dev *indio_dev) {}
++
+ static inline void iio_disable_all_buffers(struct iio_dev *indio_dev) {}
+ static inline void iio_buffer_wakeup_poll(struct iio_dev *indio_dev) {}
+ 
+diff --git a/drivers/iio/industrialio-buffer.c b/drivers/iio/industrialio-buffer.c
+index 5ef822987c05..955319d61ec0 100644
+--- a/drivers/iio/industrialio-buffer.c
++++ b/drivers/iio/industrialio-buffer.c
+@@ -388,14 +388,16 @@ error_ret:
+ 
+ static const char * const iio_scan_elements_group_name = "scan_elements";
+ 
+-int iio_buffer_register(struct iio_dev *indio_dev,
+-			const struct iio_chan_spec *channels,
+-			int num_channels)
++int iio_buffer_alloc_sysfs_and_mask(struct iio_dev *indio_dev)
+ {
+ 	struct iio_dev_attr *p;
+ 	struct attribute **attr;
+ 	struct iio_buffer *buffer = indio_dev->buffer;
+ 	int ret, i, attrn, attrcount, attrcount_orig = 0;
++	const struct iio_chan_spec *channels;
++
++	if (!buffer)
++		return 0;
+ 
+ 	if (buffer->attrs)
+ 		indio_dev->groups[indio_dev->groupcounter++] = buffer->attrs;
+@@ -407,9 +409,10 @@ int iio_buffer_register(struct iio_dev *indio_dev,
+ 	}
+ 	attrcount = attrcount_orig;
+ 	INIT_LIST_HEAD(&buffer->scan_el_dev_attr_list);
++	channels = indio_dev->channels;
+ 	if (channels) {
+ 		/* new magic */
+-		for (i = 0; i < num_channels; i++) {
++		for (i = 0; i < indio_dev->num_channels; i++) {
+ 			if (channels[i].scan_index < 0)
+ 				continue;
+ 
+@@ -466,15 +469,16 @@ error_cleanup_dynamic:
+ 
+ 	return ret;
+ }
+-EXPORT_SYMBOL(iio_buffer_register);
+ 
+-void iio_buffer_unregister(struct iio_dev *indio_dev)
++void iio_buffer_free_sysfs_and_mask(struct iio_dev *indio_dev)
+ {
++	if (!indio_dev->buffer)
++		return;
++
+ 	kfree(indio_dev->buffer->scan_mask);
+ 	kfree(indio_dev->buffer->scan_el_group.attrs);
+ 	iio_free_chan_devattr_list(&indio_dev->buffer->scan_el_dev_attr_list);
+ }
+-EXPORT_SYMBOL(iio_buffer_unregister);
+ 
+ ssize_t iio_buffer_read_length(struct device *dev,
+ 			       struct device_attribute *attr,
+diff --git a/drivers/iio/industrialio-core.c b/drivers/iio/industrialio-core.c
+index e0f70c91f7cb..8f91c2f816cd 100644
+--- a/drivers/iio/industrialio-core.c
++++ b/drivers/iio/industrialio-core.c
+@@ -1061,11 +1061,19 @@ int iio_device_register(struct iio_dev *indio_dev)
+ 			"Failed to register debugfs interfaces\n");
+ 		goto error_ret;
+ 	}
++
++	ret = iio_buffer_alloc_sysfs_and_mask(indio_dev);
++	if (ret) {
++		dev_err(indio_dev->dev.parent,
++			"Failed to create buffer sysfs interfaces\n");
++		goto error_unreg_debugfs;
++	}
++
+ 	ret = iio_device_register_sysfs(indio_dev);
+ 	if (ret) {
+ 		dev_err(indio_dev->dev.parent,
+ 			"Failed to register sysfs interfaces\n");
+-		goto error_unreg_debugfs;
++		goto error_buffer_free_sysfs;
+ 	}
+ 	ret = iio_device_register_eventset(indio_dev);
+ 	if (ret) {
+@@ -1098,6 +1106,8 @@ error_unreg_eventset:
+ 	iio_device_unregister_eventset(indio_dev);
+ error_free_sysfs:
+ 	iio_device_unregister_sysfs(indio_dev);
++error_buffer_free_sysfs:
++	iio_buffer_free_sysfs_and_mask(indio_dev);
+ error_unreg_debugfs:
+ 	iio_device_unregister_debugfs(indio_dev);
+ error_ret:
+@@ -1123,6 +1133,8 @@ void iio_device_unregister(struct iio_dev *indio_dev)
+ 	iio_buffer_wakeup_poll(indio_dev);
+ 
+ 	mutex_unlock(&indio_dev->info_exist_lock);
++
++	iio_buffer_free_sysfs_and_mask(indio_dev);
+ }
+ EXPORT_SYMBOL(iio_device_unregister);
+ subsys_initcall(iio_init);
+diff --git a/drivers/iio/industrialio-triggered-buffer.c b/drivers/iio/industrialio-triggered-buffer.c
+index 19eaf7c3b7c0..ca6cade63a1e 100644
+--- a/drivers/iio/industrialio-triggered-buffer.c
++++ b/drivers/iio/industrialio-triggered-buffer.c
+@@ -32,7 +32,7 @@ static const struct iio_buffer_setup_ops iio_triggered_buffer_setup_ops = {
+  *
+  * This function combines some common tasks which will normally be performed
+  * when setting up a triggered buffer. It will allocate the buffer and the
+- * pollfunc, as well as register the buffer with the IIO core.
++ * pollfunc.
+  *
+  * Before calling this function the indio_dev structure should already be
+  * completely initialized, but not yet registered. In practice this means that
+@@ -75,16 +75,8 @@ int iio_triggered_buffer_setup(struct iio_dev *indio_dev,
+ 	/* Flag that polled ring buffering is possible */
+ 	indio_dev->modes |= INDIO_BUFFER_TRIGGERED;
+ 
+-	ret = iio_buffer_register(indio_dev,
+-				  indio_dev->channels,
+-				  indio_dev->num_channels);
+-	if (ret)
+-		goto error_dealloc_pollfunc;
+-
+ 	return 0;
+ 
+-error_dealloc_pollfunc:
+-	iio_dealloc_pollfunc(indio_dev->pollfunc);
+ error_kfifo_free:
+ 	iio_kfifo_free(indio_dev->buffer);
+ error_ret:
+@@ -98,7 +90,6 @@ EXPORT_SYMBOL(iio_triggered_buffer_setup);
+  */
+ void iio_triggered_buffer_cleanup(struct iio_dev *indio_dev)
+ {
+-	iio_buffer_unregister(indio_dev);
+ 	iio_dealloc_pollfunc(indio_dev->pollfunc);
+ 	iio_kfifo_free(indio_dev->buffer);
+ }
+* Unmerged path drivers/staging/iio/accel/lis3l02dq_core.c
+* Unmerged path drivers/staging/iio/accel/sca3000_core.c
+* Unmerged path drivers/staging/iio/iio_simple_dummy_buffer.c
+* Unmerged path drivers/staging/iio/impedance-analyzer/ad5933.c
+diff --git a/drivers/staging/iio/meter/ade7758.h b/drivers/staging/iio/meter/ade7758.h
+index 07318203a836..762d7dc0e6e2 100644
+--- a/drivers/staging/iio/meter/ade7758.h
++++ b/drivers/staging/iio/meter/ade7758.h
+@@ -146,7 +146,6 @@ ssize_t ade7758_read_data_from_ring(struct device *dev,
+ int ade7758_configure_ring(struct iio_dev *indio_dev);
+ void ade7758_unconfigure_ring(struct iio_dev *indio_dev);
+ 
+-void ade7758_uninitialize_ring(struct iio_dev *indio_dev);
+ int ade7758_set_irq(struct device *dev, bool enable);
+ 
+ int ade7758_spi_write_reg_8(struct device *dev,
+diff --git a/drivers/staging/iio/meter/ade7758_core.c b/drivers/staging/iio/meter/ade7758_core.c
+index 8f5bcfab3563..0c635e680e76 100644
+--- a/drivers/staging/iio/meter/ade7758_core.c
++++ b/drivers/staging/iio/meter/ade7758_core.c
+@@ -902,23 +902,15 @@ static int ade7758_probe(struct spi_device *spi)
+ 	if (ret)
+ 		goto error_free_tx;
+ 
+-	ret = iio_buffer_register(indio_dev,
+-				  &ade7758_channels[0],
+-				  ARRAY_SIZE(ade7758_channels));
+-	if (ret) {
+-		dev_err(&spi->dev, "failed to initialize the ring\n");
+-		goto error_unreg_ring_funcs;
+-	}
+-
+ 	/* Get the device into a sane initial state */
+ 	ret = ade7758_initial_setup(indio_dev);
+ 	if (ret)
+-		goto error_uninitialize_ring;
++		goto error_unreg_ring_funcs;
+ 
+ 	if (spi->irq) {
+ 		ret = ade7758_probe_trigger(indio_dev);
+ 		if (ret)
+-			goto error_uninitialize_ring;
++			goto error_unreg_ring_funcs;
+ 	}
+ 
+ 	ret = iio_device_register(indio_dev);
+@@ -930,8 +922,6 @@ static int ade7758_probe(struct spi_device *spi)
+ error_remove_trigger:
+ 	if (spi->irq)
+ 		ade7758_remove_trigger(indio_dev);
+-error_uninitialize_ring:
+-	ade7758_uninitialize_ring(indio_dev);
+ error_unreg_ring_funcs:
+ 	ade7758_unconfigure_ring(indio_dev);
+ error_free_tx:
+@@ -952,7 +942,6 @@ static int ade7758_remove(struct spi_device *spi)
+ 	iio_device_unregister(indio_dev);
+ 	ade7758_stop_device(&indio_dev->dev);
+ 	ade7758_remove_trigger(indio_dev);
+-	ade7758_uninitialize_ring(indio_dev);
+ 	ade7758_unconfigure_ring(indio_dev);
+ 	kfree(st->tx);
+ 	kfree(st->rx);
+diff --git a/drivers/staging/iio/meter/ade7758_ring.c b/drivers/staging/iio/meter/ade7758_ring.c
+index b29e2d5d9937..20b15317c5d1 100644
+--- a/drivers/staging/iio/meter/ade7758_ring.c
++++ b/drivers/staging/iio/meter/ade7758_ring.c
+@@ -187,8 +187,3 @@ error_iio_kfifo_free:
+ 	iio_kfifo_free(indio_dev->buffer);
+ 	return ret;
+ }
+-
+-void ade7758_uninitialize_ring(struct iio_dev *indio_dev)
+-{
+-	iio_buffer_unregister(indio_dev);
+-}
+* Unmerged path include/linux/iio/buffer.h
