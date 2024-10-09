@@ -2657,6 +2657,7 @@ int cmd_script(int argc, const char **argv)
 		err = perf_session__cpu_bitmap(session, cpu_list, cpu_bitmap);
 		if (err < 0)
 			goto out_delete;
+		itrace_synth_opts.cpu_bitmap = cpu_bitmap;
 	}
 
 	if (!no_callchain)
