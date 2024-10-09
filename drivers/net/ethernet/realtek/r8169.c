@@ -7061,7 +7061,6 @@ static void rtl8169_net_suspend(struct net_device *dev)
 		return;
 
 	netif_device_detach(dev);
-	netif_stop_queue(dev);
 
 	rtl_lock_work(tp);
 	napi_disable(&tp->napi);
