@@ -2425,7 +2425,7 @@ qla24xx_bsg_request(struct fc_bsg_job *bsg_job)
 		vha = shost_priv(host);
 	}
 
-	if (qla2x00_reset_active(vha)) {
+	if (qla2x00_chip_is_down(vha)) {
 		ql_dbg(ql_dbg_user, vha, 0x709f,
 		    "BSG: ISP abort active/needed -- cmd=%d.\n",
 		    bsg_job->request->msgcode);
