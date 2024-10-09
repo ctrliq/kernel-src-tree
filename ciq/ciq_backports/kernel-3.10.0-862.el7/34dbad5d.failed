@@ -1,0 +1,841 @@
+blk-stat: convert to callback-based statistics reporting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit 34dbad5d26e2f4b88e60f0e9ad03f99480802812
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/34dbad5d.failed
+
+Currently, statistics are gathered in ~0.13s windows, and users grab the
+statistics whenever they need them. This is not ideal for both in-tree
+users:
+
+1. Writeback throttling wants its own dynamically sized window of
+   statistics. Since the blk-stats statistics are reset after every
+   window and the wbt windows don't line up with the blk-stats windows,
+   wbt doesn't see every I/O.
+2. Polling currently grabs the statistics on every I/O. Again, depending
+   on how the window lines up, we may miss some I/Os. It's also
+   unnecessary overhead to get the statistics on every I/O; the hybrid
+   polling heuristic would be just as happy with the statistics from the
+   previous full window.
+
+This reworks the blk-stats infrastructure to be callback-based: users
+register a callback that they want called at a given time with all of
+the statistics from the window during which the callback was active.
+Users can dynamically bucketize the statistics. wbt and polling both
+currently use read vs. write, but polling can be extended to further
+subdivide based on request size.
+
+The callbacks are kept on an RCU list, and each callback has percpu
+stats buffers. There will only be a few users, so the overhead on the
+I/O completion side is low. The stats flushing is also simplified
+considerably: since the timer function is responsible for clearing the
+statistics, we don't have to worry about stale statistics.
+
+wbt is a trivial conversion. After the conversion, the windowing problem
+mentioned above is fixed.
+
+For polling, we register an extra callback that caches the previous
+window's statistics in the struct request_queue for the hybrid polling
+heuristic to use.
+
+Since we no longer have a single stats buffer for the request queue,
+this also removes the sysfs and debugfs stats entries. To replace those,
+we add a debugfs entry for the poll statistics.
+
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 34dbad5d26e2f4b88e60f0e9ad03f99480802812)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq-debugfs.c
+#	block/blk-mq.c
+#	block/blk-stat.c
+#	block/blk-stat.h
+#	block/blk-sysfs.c
+#	block/blk-wbt.c
+#	block/blk-wbt.h
+#	include/linux/blk_types.h
+#	include/linux/blkdev.h
+diff --cc block/blk-core.c
+index 844f81639307,78d04ddededc..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -804,30 -847,28 +804,40 @@@ blk_init_queue_node(request_fn_proc *rf
+  }
+  EXPORT_SYMBOL(blk_init_queue_node);
+  
+ -static blk_qc_t blk_queue_bio(struct request_queue *q, struct bio *bio);
+ -
+ -
+ -int blk_init_allocated_queue(struct request_queue *q)
+ +struct request_queue *
+ +blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
+ +			 spinlock_t *lock)
+  {
+++<<<<<<< HEAD
+ +	if (!q)
+ +		return NULL;
+++=======
++ 	q->stats = blk_alloc_queue_stats();
++ 	if (!q->stats)
++ 		return -ENOMEM;
++ 
++ 	q->fq = blk_alloc_flush_queue(q, NUMA_NO_NODE, q->cmd_size);
++ 	if (!q->fq)
++ 		return -ENOMEM;
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  
+ -	if (q->init_rq_fn && q->init_rq_fn(q, q->fq->flush_rq, GFP_KERNEL))
+ -		goto out_free_flush_queue;
+ +	q->fq = blk_alloc_flush_queue(q, NUMA_NO_NODE, 0);
+ +	if (!q->fq)
+ +		return NULL;
+  
+  	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
+ -		goto out_exit_flush_rq;
+ +		goto fail;
+  
+  	INIT_WORK(&q->timeout_work, blk_timeout_work);
+ +	q->request_fn		= rfn;
+ +	q->prep_rq_fn		= NULL;
+ +	q->unprep_rq_fn		= NULL;
+  	q->queue_flags		|= QUEUE_FLAG_DEFAULT;
+  
+ +	/* Override internal queue lock with supplied lock pointer */
+ +	if (lock)
+ +		q->queue_lock		= lock;
+ +
+  	/*
+  	 * This also sets hw/phys segments, boundary and size
+  	 */
+@@@ -2714,8 -2699,13 +2724,18 @@@ EXPORT_SYMBOL_GPL(blk_unprep_request)
+   */
+  void blk_finish_request(struct request *req, int error)
+  {
+++<<<<<<< HEAD
+ +	if (blk_rq_tagged(req))
+ +		blk_queue_end_tag(req->q, req);
+++=======
++ 	struct request_queue *q = req->q;
++ 
++ 	if (req->rq_flags & RQF_STATS)
++ 		blk_stat_add(req);
++ 
++ 	if (req->rq_flags & RQF_QUEUED)
++ 		blk_queue_end_tag(q, req);
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  
+  	BUG_ON(blk_queued_rq(req));
+  
+diff --cc block/blk-mq.c
+index 1b06c94aa73d,5ff66f203cd0..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -33,7 -39,8 +33,12 @@@
+  static DEFINE_MUTEX(all_q_mutex);
+  static LIST_HEAD(all_q_list);
+  
+++<<<<<<< HEAD
+ +static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx);
+++=======
++ static void blk_mq_poll_stats_start(struct request_queue *q);
++ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  
+  /*
+   * Check if any of the ctx's have pending work in this hardware queue
+@@@ -443,6 -432,14 +448,17 @@@ static void blk_mq_ipi_complete_request
+  	put_cpu();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void blk_mq_stat_add(struct request *rq)
++ {
++ 	if (rq->rq_flags & RQF_STATS) {
++ 		blk_mq_poll_stats_start(rq->q);
++ 		blk_stat_add(rq);
++ 	}
++ }
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  static void __blk_mq_complete_request(struct request *rq)
+  {
+  	struct request_queue *q = rq->q;
+@@@ -2563,6 -2743,193 +2588,196 @@@ void blk_mq_update_nr_hw_queues(struct 
+  }
+  EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
+  
+++<<<<<<< HEAD
+++=======
++ /* Enable polling stats and return whether they were already enabled. */
++ static bool blk_poll_stats_enable(struct request_queue *q)
++ {
++ 	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
++ 	    test_and_set_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags))
++ 		return true;
++ 	blk_stat_add_callback(q, q->poll_cb);
++ 	return false;
++ }
++ 
++ static void blk_mq_poll_stats_start(struct request_queue *q)
++ {
++ 	/*
++ 	 * We don't arm the callback if polling stats are not enabled or the
++ 	 * callback is already active.
++ 	 */
++ 	if (!test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags) ||
++ 	    blk_stat_is_active(q->poll_cb))
++ 		return;
++ 
++ 	blk_stat_activate_msecs(q->poll_cb, 100);
++ }
++ 
++ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb)
++ {
++ 	struct request_queue *q = cb->data;
++ 
++ 	if (cb->stat[READ].nr_samples)
++ 		q->poll_stat[READ] = cb->stat[READ];
++ 	if (cb->stat[WRITE].nr_samples)
++ 		q->poll_stat[WRITE] = cb->stat[WRITE];
++ }
++ 
++ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
++ 				       struct blk_mq_hw_ctx *hctx,
++ 				       struct request *rq)
++ {
++ 	unsigned long ret = 0;
++ 
++ 	/*
++ 	 * If stats collection isn't on, don't sleep but turn it on for
++ 	 * future users
++ 	 */
++ 	if (!blk_poll_stats_enable(q))
++ 		return 0;
++ 
++ 	/*
++ 	 * As an optimistic guess, use half of the mean service time
++ 	 * for this type of request. We can (and should) make this smarter.
++ 	 * For instance, if the completion latencies are tight, we can
++ 	 * get closer than just half the mean. This is especially
++ 	 * important on devices where the completion latencies are longer
++ 	 * than ~10 usec.
++ 	 */
++ 	if (req_op(rq) == REQ_OP_READ && q->poll_stat[READ].nr_samples)
++ 		ret = (q->poll_stat[READ].mean + 1) / 2;
++ 	else if (req_op(rq) == REQ_OP_WRITE && q->poll_stat[WRITE].nr_samples)
++ 		ret = (q->poll_stat[WRITE].mean + 1) / 2;
++ 
++ 	return ret;
++ }
++ 
++ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
++ 				     struct blk_mq_hw_ctx *hctx,
++ 				     struct request *rq)
++ {
++ 	struct hrtimer_sleeper hs;
++ 	enum hrtimer_mode mode;
++ 	unsigned int nsecs;
++ 	ktime_t kt;
++ 
++ 	if (test_bit(REQ_ATOM_POLL_SLEPT, &rq->atomic_flags))
++ 		return false;
++ 
++ 	/*
++ 	 * poll_nsec can be:
++ 	 *
++ 	 * -1:	don't ever hybrid sleep
++ 	 *  0:	use half of prev avg
++ 	 * >0:	use this specific value
++ 	 */
++ 	if (q->poll_nsec == -1)
++ 		return false;
++ 	else if (q->poll_nsec > 0)
++ 		nsecs = q->poll_nsec;
++ 	else
++ 		nsecs = blk_mq_poll_nsecs(q, hctx, rq);
++ 
++ 	if (!nsecs)
++ 		return false;
++ 
++ 	set_bit(REQ_ATOM_POLL_SLEPT, &rq->atomic_flags);
++ 
++ 	/*
++ 	 * This will be replaced with the stats tracking code, using
++ 	 * 'avg_completion_time / 2' as the pre-sleep target.
++ 	 */
++ 	kt = nsecs;
++ 
++ 	mode = HRTIMER_MODE_REL;
++ 	hrtimer_init_on_stack(&hs.timer, CLOCK_MONOTONIC, mode);
++ 	hrtimer_set_expires(&hs.timer, kt);
++ 
++ 	hrtimer_init_sleeper(&hs, current);
++ 	do {
++ 		if (test_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags))
++ 			break;
++ 		set_current_state(TASK_UNINTERRUPTIBLE);
++ 		hrtimer_start_expires(&hs.timer, mode);
++ 		if (hs.task)
++ 			io_schedule();
++ 		hrtimer_cancel(&hs.timer);
++ 		mode = HRTIMER_MODE_ABS;
++ 	} while (hs.task && !signal_pending(current));
++ 
++ 	__set_current_state(TASK_RUNNING);
++ 	destroy_hrtimer_on_stack(&hs.timer);
++ 	return true;
++ }
++ 
++ static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 	long state;
++ 
++ 	/*
++ 	 * If we sleep, have the caller restart the poll loop to reset
++ 	 * the state. Like for the other success return cases, the
++ 	 * caller is responsible for checking if the IO completed. If
++ 	 * the IO isn't complete, we'll get called again and will go
++ 	 * straight to the busy poll loop.
++ 	 */
++ 	if (blk_mq_poll_hybrid_sleep(q, hctx, rq))
++ 		return true;
++ 
++ 	hctx->poll_considered++;
++ 
++ 	state = current->state;
++ 	while (!need_resched()) {
++ 		int ret;
++ 
++ 		hctx->poll_invoked++;
++ 
++ 		ret = q->mq_ops->poll(hctx, rq->tag);
++ 		if (ret > 0) {
++ 			hctx->poll_success++;
++ 			set_current_state(TASK_RUNNING);
++ 			return true;
++ 		}
++ 
++ 		if (signal_pending_state(state, current))
++ 			set_current_state(TASK_RUNNING);
++ 
++ 		if (current->state == TASK_RUNNING)
++ 			return true;
++ 		if (ret < 0)
++ 			break;
++ 		cpu_relax();
++ 	}
++ 
++ 	return false;
++ }
++ 
++ bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	struct blk_plug *plug;
++ 	struct request *rq;
++ 
++ 	if (!q->mq_ops || !q->mq_ops->poll || !blk_qc_t_valid(cookie) ||
++ 	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ 		return false;
++ 
++ 	plug = current->plug;
++ 	if (plug)
++ 		blk_flush_plug_list(plug, false);
++ 
++ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++ 	if (!blk_qc_t_is_internal(cookie))
++ 		rq = blk_mq_tag_to_rq(hctx->tags, blk_qc_t_to_tag(cookie));
++ 	else
++ 		rq = blk_mq_tag_to_rq(hctx->sched_tags, blk_qc_t_to_tag(cookie));
++ 
++ 	return __blk_mq_poll(hctx, rq);
++ }
++ EXPORT_SYMBOL_GPL(blk_mq_poll);
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+diff --cc block/blk-sysfs.c
+index 91f42f273aad,fa831cb2fc30..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -317,6 -362,147 +317,150 @@@ queue_rq_affinity_store(struct request_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t queue_poll_delay_show(struct request_queue *q, char *page)
++ {
++ 	int val;
++ 
++ 	if (q->poll_nsec == -1)
++ 		val = -1;
++ 	else
++ 		val = q->poll_nsec / 1000;
++ 
++ 	return sprintf(page, "%d\n", val);
++ }
++ 
++ static ssize_t queue_poll_delay_store(struct request_queue *q, const char *page,
++ 				size_t count)
++ {
++ 	int err, val;
++ 
++ 	if (!q->mq_ops || !q->mq_ops->poll)
++ 		return -EINVAL;
++ 
++ 	err = kstrtoint(page, 10, &val);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (val == -1)
++ 		q->poll_nsec = -1;
++ 	else
++ 		q->poll_nsec = val * 1000;
++ 
++ 	return count;
++ }
++ 
++ static ssize_t queue_poll_show(struct request_queue *q, char *page)
++ {
++ 	return queue_var_show(test_bit(QUEUE_FLAG_POLL, &q->queue_flags), page);
++ }
++ 
++ static ssize_t queue_poll_store(struct request_queue *q, const char *page,
++ 				size_t count)
++ {
++ 	unsigned long poll_on;
++ 	ssize_t ret;
++ 
++ 	if (!q->mq_ops || !q->mq_ops->poll)
++ 		return -EINVAL;
++ 
++ 	ret = queue_var_store(&poll_on, page, count);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 	if (poll_on)
++ 		queue_flag_set(QUEUE_FLAG_POLL, q);
++ 	else
++ 		queue_flag_clear(QUEUE_FLAG_POLL, q);
++ 	spin_unlock_irq(q->queue_lock);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t queue_wb_lat_show(struct request_queue *q, char *page)
++ {
++ 	if (!q->rq_wb)
++ 		return -EINVAL;
++ 
++ 	return sprintf(page, "%llu\n", div_u64(q->rq_wb->min_lat_nsec, 1000));
++ }
++ 
++ static ssize_t queue_wb_lat_store(struct request_queue *q, const char *page,
++ 				  size_t count)
++ {
++ 	struct rq_wb *rwb;
++ 	ssize_t ret;
++ 	s64 val;
++ 
++ 	ret = queue_var_store64(&val, page);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (val < -1)
++ 		return -EINVAL;
++ 
++ 	rwb = q->rq_wb;
++ 	if (!rwb) {
++ 		ret = wbt_init(q);
++ 		if (ret)
++ 			return ret;
++ 
++ 		rwb = q->rq_wb;
++ 		if (!rwb)
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (val == -1)
++ 		rwb->min_lat_nsec = wbt_default_latency_nsec(q);
++ 	else if (val >= 0)
++ 		rwb->min_lat_nsec = val * 1000ULL;
++ 
++ 	if (rwb->enable_state == WBT_STATE_ON_DEFAULT)
++ 		rwb->enable_state = WBT_STATE_ON_MANUAL;
++ 
++ 	wbt_update_limits(rwb);
++ 	return count;
++ }
++ 
++ static ssize_t queue_wc_show(struct request_queue *q, char *page)
++ {
++ 	if (test_bit(QUEUE_FLAG_WC, &q->queue_flags))
++ 		return sprintf(page, "write back\n");
++ 
++ 	return sprintf(page, "write through\n");
++ }
++ 
++ static ssize_t queue_wc_store(struct request_queue *q, const char *page,
++ 			      size_t count)
++ {
++ 	int set = -1;
++ 
++ 	if (!strncmp(page, "write back", 10))
++ 		set = 1;
++ 	else if (!strncmp(page, "write through", 13) ||
++ 		 !strncmp(page, "none", 4))
++ 		set = 0;
++ 
++ 	if (set == -1)
++ 		return -EINVAL;
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 	if (set)
++ 		queue_flag_set(QUEUE_FLAG_WC, q);
++ 	else
++ 		queue_flag_clear(QUEUE_FLAG_WC, q);
++ 	spin_unlock_irq(q->queue_lock);
++ 
++ 	return count;
++ }
++ 
++ static ssize_t queue_dax_show(struct request_queue *q, char *page)
++ {
++ 	return queue_var_show(blk_queue_dax(q), page);
++ }
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  static struct queue_sysfs_entry queue_requests_entry = {
+  	.attr = {.name = "nr_requests", .mode = S_IRUGO | S_IWUSR },
+  	.show = queue_requests_show,
+@@@ -442,6 -648,35 +586,38 @@@ static struct queue_sysfs_entry queue_r
+  	.store = queue_store_random,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct queue_sysfs_entry queue_poll_entry = {
++ 	.attr = {.name = "io_poll", .mode = S_IRUGO | S_IWUSR },
++ 	.show = queue_poll_show,
++ 	.store = queue_poll_store,
++ };
++ 
++ static struct queue_sysfs_entry queue_poll_delay_entry = {
++ 	.attr = {.name = "io_poll_delay", .mode = S_IRUGO | S_IWUSR },
++ 	.show = queue_poll_delay_show,
++ 	.store = queue_poll_delay_store,
++ };
++ 
++ static struct queue_sysfs_entry queue_wc_entry = {
++ 	.attr = {.name = "write_cache", .mode = S_IRUGO | S_IWUSR },
++ 	.show = queue_wc_show,
++ 	.store = queue_wc_store,
++ };
++ 
++ static struct queue_sysfs_entry queue_dax_entry = {
++ 	.attr = {.name = "dax", .mode = S_IRUGO },
++ 	.show = queue_dax_show,
++ };
++ 
++ static struct queue_sysfs_entry queue_wb_lat_entry = {
++ 	.attr = {.name = "wbt_lat_usec", .mode = S_IRUGO | S_IWUSR },
++ 	.show = queue_wb_lat_show,
++ 	.store = queue_wb_lat_store,
++ };
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  static struct attribute *default_attrs[] = {
+  	&queue_requests_entry.attr,
+  	&queue_ra_entry.attr,
+@@@ -466,6 -705,11 +642,14 @@@
+  	&queue_rq_affinity_entry.attr,
+  	&queue_iostats_entry.attr,
+  	&queue_random_entry.attr,
+++<<<<<<< HEAD
+++=======
++ 	&queue_poll_entry.attr,
++ 	&queue_wc_entry.attr,
++ 	&queue_dax_entry.attr,
++ 	&queue_wb_lat_entry.attr,
++ 	&queue_poll_delay_entry.attr,
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  	NULL,
+  };
+  
+@@@ -540,6 -784,11 +724,14 @@@ static void blk_release_queue(struct ko
+  	struct request_queue *q =
+  		container_of(kobj, struct request_queue, kobj);
+  
+++<<<<<<< HEAD
+++=======
++ 	wbt_exit(q);
++ 	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags))
++ 		blk_stat_remove_callback(q, q->poll_cb);
++ 	blk_stat_free_callback(q->poll_cb);
++ 	bdi_put(q->backing_dev_info);
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  	blkcg_exit_queue(q);
+  
+  	if (q->elevator) {
+diff --cc include/linux/blk_types.h
+index 822005a81879,270119a501fb..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -226,66 -206,94 +226,77 @@@ enum rq_flag_bits 
+  
+  #define REQ_FAILFAST_MASK \
+  	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)
+ +#define REQ_COMMON_MASK \
+ +	(REQ_WRITE | REQ_FAILFAST_MASK | REQ_SYNC | REQ_META | REQ_PRIO | \
+ +	 REQ_DISCARD | REQ_WRITE_SAME | REQ_NOIDLE | REQ_FLUSH | REQ_FUA | \
+ +	 REQ_SECURE)
+ +#define REQ_CLONE_MASK		REQ_COMMON_MASK
+  
+ -#define REQ_NOMERGE_FLAGS \
+ -	(REQ_NOMERGE | REQ_PREFLUSH | REQ_FUA)
+ -
+ -#define bio_op(bio) \
+ -	((bio)->bi_opf & REQ_OP_MASK)
+ -#define req_op(req) \
+ -	((req)->cmd_flags & REQ_OP_MASK)
+ +#define BIO_NO_ADVANCE_ITER_MASK	(REQ_DISCARD|REQ_WRITE_SAME)
+  
+ -/* obsolete, don't use in new code */
+ -static inline void bio_set_op_attrs(struct bio *bio, unsigned op,
+ -		unsigned op_flags)
+ -{
+ -	bio->bi_opf = op | op_flags;
+ -}
+ +/* This mask is used for both bio and request merge checking */
+ +#define REQ_NOMERGE_FLAGS \
+ +	(REQ_NOMERGE | REQ_STARTED | REQ_SOFTBARRIER | REQ_FLUSH | REQ_FUA | REQ_FLUSH_SEQ)
+  
+ -static inline bool op_is_write(unsigned int op)
+ -{
+ -	return (op & 1);
+ -}
+ +#define REQ_RAHEAD		(1ULL << __REQ_RAHEAD)
+ +#define REQ_THROTTLED		(1ULL << __REQ_THROTTLED)
+  
+ -/*
+ - * Check if the bio or request is one that needs special treatment in the
+ - * flush state machine.
+ - */
+ -static inline bool op_is_flush(unsigned int op)
+ -{
+ -	return op & (REQ_FUA | REQ_PREFLUSH);
+ -}
+ +#define REQ_SORTED		(1ULL << __REQ_SORTED)
+ +#define REQ_SOFTBARRIER		(1ULL << __REQ_SOFTBARRIER)
+ +#define REQ_FUA			(1ULL << __REQ_FUA)
+ +#define REQ_NOMERGE		(1ULL << __REQ_NOMERGE)
+ +#define REQ_STARTED		(1ULL << __REQ_STARTED)
+ +#define REQ_DONTPREP		(1ULL << __REQ_DONTPREP)
+ +#define REQ_QUEUED		(1ULL << __REQ_QUEUED)
+ +#define REQ_ELVPRIV		(1ULL << __REQ_ELVPRIV)
+ +#define REQ_FAILED		(1ULL << __REQ_FAILED)
+ +#define REQ_QUIET		(1ULL << __REQ_QUIET)
+ +#define REQ_PREEMPT		(1ULL << __REQ_PREEMPT)
+ +#define REQ_ALLOCED		(1ULL << __REQ_ALLOCED)
+ +#define REQ_COPY_USER		(1ULL << __REQ_COPY_USER)
+ +#define REQ_FLUSH		(1ULL << __REQ_FLUSH)
+ +#define REQ_FLUSH_SEQ		(1ULL << __REQ_FLUSH_SEQ)
+ +#define REQ_IO_STAT		(1ULL << __REQ_IO_STAT)
+ +#define REQ_MIXED_MERGE		(1ULL << __REQ_MIXED_MERGE)
+ +#define REQ_SECURE		(1ULL << __REQ_SECURE)
+ +#define REQ_KERNEL		(1ULL << __REQ_KERNEL)
+ +#define REQ_PM			(1ULL << __REQ_PM)
+ +#define REQ_HASHED		(1ULL << __REQ_HASHED)
+ +#define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
+ +
+ +enum req_op {
+ +	REQ_OP_READ,
+ +	REQ_OP_WRITE		= REQ_WRITE,
+ +	REQ_OP_DISCARD		= REQ_DISCARD,
+ +	REQ_OP_WRITE_SAME	= REQ_WRITE_SAME,
+ +};
+  
+++<<<<<<< HEAD
+  /*
+ - * Reads are always treated as synchronous, as are requests with the FUA or
+ - * PREFLUSH flag.  Other operations may be marked as synchronous using the
+ - * REQ_SYNC flag.
+ + * tmp cpmpat. Users used to set the write bit for all non reads, but
+ + * we will be dropping the bitmap use for ops. Support both until
+ + * the end of the patchset.
+   */
+ -static inline bool op_is_sync(unsigned int op)
+ +static inline int op_from_rq_bits(u64 flags)
+  {
+ -	return (op & REQ_OP_MASK) == REQ_OP_READ ||
+ -		(op & (REQ_SYNC | REQ_FUA | REQ_PREFLUSH));
+ +	if (flags & REQ_OP_DISCARD)
+ +		return REQ_OP_DISCARD;
+ +	else if (flags & REQ_OP_WRITE_SAME)
+ +		return REQ_OP_WRITE_SAME;
+ +	else if (flags & REQ_OP_WRITE)
+ +		return REQ_OP_WRITE;
+ +	else
+ +		return REQ_OP_READ;
+  }
+ -
+ -typedef unsigned int blk_qc_t;
+ -#define BLK_QC_T_NONE		-1U
+ -#define BLK_QC_T_SHIFT		16
+ -#define BLK_QC_T_INTERNAL	(1U << 31)
+ -
+ -static inline bool blk_qc_t_valid(blk_qc_t cookie)
+ -{
+ -	return cookie != BLK_QC_T_NONE;
+ -}
+ -
+ -static inline blk_qc_t blk_tag_to_qc_t(unsigned int tag, unsigned int queue_num,
+ -				       bool internal)
+ -{
+ -	blk_qc_t ret = tag | (queue_num << BLK_QC_T_SHIFT);
+ -
+ -	if (internal)
+ -		ret |= BLK_QC_T_INTERNAL;
+ -
+ -	return ret;
+ -}
+ -
+ -static inline unsigned int blk_qc_t_to_queue_num(blk_qc_t cookie)
+ -{
+ -	return (cookie & ~BLK_QC_T_INTERNAL) >> BLK_QC_T_SHIFT;
+ -}
+ -
+ -static inline unsigned int blk_qc_t_to_tag(blk_qc_t cookie)
+ -{
+ -	return cookie & ((1u << BLK_QC_T_SHIFT) - 1);
+ -}
+ -
+ -static inline bool blk_qc_t_is_internal(blk_qc_t cookie)
+ -{
+ -	return (cookie & BLK_QC_T_INTERNAL) != 0;
+ -}
+ -
+ -struct blk_issue_stat {
+ -	u64 time;
+ -};
+ -
+++=======
++ struct blk_rq_stat {
++ 	s64 mean;
++ 	u64 min;
++ 	u64 max;
++ 	s32 nr_samples;
++ 	s32 nr_batch;
++ 	u64 batch;
++ };
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  
+  #endif /* __LINUX_BLK_TYPES_H */
+diff --cc include/linux/blkdev.h
+index ba3405333171,1a7dc42a8918..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -41,6 -39,9 +41,12 @@@ struct bsg_job
+  struct blkcg_gq;
+  struct blk_flush_queue;
+  struct pr_ops;
+++<<<<<<< HEAD
+++=======
++ struct rq_wb;
++ struct blk_queue_stats;
++ struct blk_stat_callback;
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  
+  #define BLKDEV_MIN_RQ	4
+  #define BLKDEV_MAX_RQ	128	/* Default maximum */
+@@@ -359,6 -390,9 +365,12 @@@ struct request_queue 
+  	int			nr_rqs[2];	/* # allocated [a]sync rqs */
+  	int			nr_rqs_elvpriv;	/* # allocated rqs w/ elvpriv */
+  
+++<<<<<<< HEAD
+++=======
++ 	struct blk_queue_stats	*stats;
++ 	struct rq_wb		*rq_wb;
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  	/*
+  	 * If blkcg is not used, @q->root_rl serves all requests.  If blkcg
+  	 * is used, root blkg allocates from @q->root_rl and all other
+@@@ -467,6 -507,7 +479,10 @@@
+  
+  	unsigned int		nr_sorted;
+  	unsigned int		in_flight[2];
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  	/*
+  	 * Number of active block driver functions for which blk_drain_queue()
+  	 * must wait. Must be incremented around functions that unlock the
+@@@ -475,7 -516,13 +491,15 @@@
+  	unsigned int		request_fn_active;
+  
+  	unsigned int		rq_timeout;
+++<<<<<<< HEAD
+++=======
++ 	int			poll_nsec;
++ 
++ 	struct blk_stat_callback	*poll_cb;
++ 	struct blk_rq_stat	poll_stat[2];
++ 
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  	struct timer_list	timeout;
+ -	struct work_struct	timeout_work;
+  	struct list_head	timeout_list;
+  
+  	struct list_head	icq_list;
+@@@ -567,10 -608,15 +591,22 @@@
+  #define QUEUE_FLAG_SAME_FORCE  18	/* force complete on same CPU */
+  #define QUEUE_FLAG_DEAD        19	/* queue tear-down finished */
+  #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
+++<<<<<<< HEAD
+ +#define QUEUE_FLAG_UNPRIV_SGIO 21	/* SG_IO free for unprivileged users */
+ +#define QUEUE_FLAG_NO_SG_MERGE 22	/* don't attempt to merge SG segments*/
+ +#define QUEUE_FLAG_SG_GAPS     23	/* queue doesn't support SG gaps */
+ +#define QUEUE_FLAG_DAX         24	/* device supports DAX */
+++=======
++ #define QUEUE_FLAG_NO_SG_MERGE 21	/* don't attempt to merge SG segments*/
++ #define QUEUE_FLAG_POLL	       22	/* IO polling enabled if set */
++ #define QUEUE_FLAG_WC	       23	/* Write back caching */
++ #define QUEUE_FLAG_FUA	       24	/* device supports FUA writes */
++ #define QUEUE_FLAG_FLUSH_NQ    25	/* flush not queueuable */
++ #define QUEUE_FLAG_DAX         26	/* device supports DAX */
++ #define QUEUE_FLAG_STATS       27	/* track rq completion times */
++ #define QUEUE_FLAG_RESTART     28	/* queue needs restart at completion */
++ #define QUEUE_FLAG_POLL_STATS  29	/* collecting stats for hybrid polling */
+++>>>>>>> 34dbad5d26e2 (blk-stat: convert to callback-based statistics reporting)
+  
+  #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+  				 (1 << QUEUE_FLAG_STACKABLE)	|	\
+* Unmerged path block/blk-mq-debugfs.c
+* Unmerged path block/blk-stat.c
+* Unmerged path block/blk-stat.h
+* Unmerged path block/blk-wbt.c
+* Unmerged path block/blk-wbt.h
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq-debugfs.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-stat.c
+* Unmerged path block/blk-stat.h
+* Unmerged path block/blk-sysfs.c
+* Unmerged path block/blk-wbt.c
+* Unmerged path block/blk-wbt.h
+* Unmerged path include/linux/blk_types.h
+* Unmerged path include/linux/blkdev.h
