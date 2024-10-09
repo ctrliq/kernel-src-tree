@@ -83,9 +83,8 @@ struct nvme_rdma_request {
 
 enum nvme_rdma_queue_flags {
 	NVME_RDMA_Q_CONNECTED		= 0,
-	NVME_RDMA_IB_QUEUE_ALLOCATED	= 1,
-	NVME_RDMA_Q_DELETING		= 2,
-	NVME_RDMA_Q_LIVE		= 3,
+	NVME_RDMA_Q_DELETING		= 1,
+	NVME_RDMA_Q_LIVE		= 2,
 };
 
 struct nvme_rdma_queue {
@@ -470,9 +469,6 @@ static void nvme_rdma_destroy_queue_ib(struct nvme_rdma_queue *queue)
 	struct nvme_rdma_device *dev;
 	struct ib_device *ibdev;
 
-	if (!test_and_clear_bit(NVME_RDMA_IB_QUEUE_ALLOCATED, &queue->flags))
-		return;
-
 	dev = queue->device;
 	ibdev = dev->dev;
 	rdma_destroy_qp(queue->cm_id);
@@ -529,7 +525,6 @@ static int nvme_rdma_create_queue_ib(struct nvme_rdma_queue *queue)
 		ret = -ENOMEM;
 		goto out_destroy_qp;
 	}
-	set_bit(NVME_RDMA_IB_QUEUE_ALLOCATED, &queue->flags);
 
 	return 0;
 
@@ -589,7 +584,6 @@ static int nvme_rdma_init_queue(struct nvme_rdma_ctrl *ctrl,
 	return 0;
 
 out_destroy_cm_id:
-	nvme_rdma_destroy_queue_ib(queue);
 	rdma_destroy_id(queue->cm_id);
 	return ret;
 }
@@ -1378,12 +1372,14 @@ static int nvme_rdma_cm_handler(struct rdma_cm_id *cm_id,
 		complete(&queue->cm_done);
 		return 0;
 	case RDMA_CM_EVENT_REJECTED:
+		nvme_rdma_destroy_queue_ib(queue);
 		cm_error = nvme_rdma_conn_rejected(queue, ev);
 		break;
-	case RDMA_CM_EVENT_ADDR_ERROR:
 	case RDMA_CM_EVENT_ROUTE_ERROR:
 	case RDMA_CM_EVENT_CONNECT_ERROR:
 	case RDMA_CM_EVENT_UNREACHABLE:
+		nvme_rdma_destroy_queue_ib(queue);
+	case RDMA_CM_EVENT_ADDR_ERROR:
 		dev_dbg(queue->ctrl->ctrl.device,
 			"CM error event %d\n", ev->event);
 		cm_error = -ECONNRESET;
