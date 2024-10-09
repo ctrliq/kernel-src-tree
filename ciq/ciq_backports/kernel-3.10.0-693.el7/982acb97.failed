@@ -1,0 +1,171 @@
+ipv4: fib: Notify about nexthop status changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 982acb97560c8118c2109504a22b0d78a580547d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/982acb97.failed
+
+When a multipath route is hit the kernel doesn't consider nexthops that
+are DEAD or LINKDOWN when IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN is set.
+Devices that offload multipath routes need to be made aware of nexthop
+status changes. Otherwise, the device will keep forwarding packets to
+non-functional nexthops.
+
+Add the FIB_EVENT_NH_{ADD,DEL} events to the fib notification chain,
+which notify capable devices when they should add or delete a nexthop
+from their tables.
+
+	Cc: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Cc: David Ahern <dsa@cumulusnetworks.com>
+	Cc: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Andy Gospodarek <gospo@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 982acb97560c8118c2109504a22b0d78a580547d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_fib.h
+#	net/ipv4/fib_semantics.c
+diff --cc include/net/ip_fib.h
+index 9927afab7c39,45a184eaff2b..000000000000
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@@ -184,6 -199,41 +184,44 @@@ __be32 fib_info_update_nh_saddr(struct 
+  #define FIB_RES_PREFSRC(net, res)	((res).fi->fib_prefsrc ? : \
+  					 FIB_RES_SADDR(net, res))
+  
+++<<<<<<< HEAD
+++=======
++ struct fib_notifier_info {
++ 	struct net *net;
++ };
++ 
++ struct fib_entry_notifier_info {
++ 	struct fib_notifier_info info; /* must be first */
++ 	u32 dst;
++ 	int dst_len;
++ 	struct fib_info *fi;
++ 	u8 tos;
++ 	u8 type;
++ 	u32 tb_id;
++ 	u32 nlflags;
++ };
++ 
++ struct fib_nh_notifier_info {
++ 	struct fib_notifier_info info; /* must be first */
++ 	struct fib_nh *fib_nh;
++ };
++ 
++ enum fib_event_type {
++ 	FIB_EVENT_ENTRY_ADD,
++ 	FIB_EVENT_ENTRY_DEL,
++ 	FIB_EVENT_RULE_ADD,
++ 	FIB_EVENT_RULE_DEL,
++ 	FIB_EVENT_NH_ADD,
++ 	FIB_EVENT_NH_DEL,
++ };
++ 
++ int register_fib_notifier(struct notifier_block *nb,
++ 			  void (*cb)(struct notifier_block *nb));
++ int unregister_fib_notifier(struct notifier_block *nb);
++ int call_fib_notifiers(struct net *net, enum fib_event_type event_type,
++ 		       struct fib_notifier_info *info);
++ 
+++>>>>>>> 982acb97560c (ipv4: fib: Notify about nexthop status changes)
+  struct fib_table {
+  	struct hlist_node	tb_hlist;
+  	u32			tb_id;
+diff --cc net/ipv4/fib_semantics.c
+index 80a45f8df6da,317026a39cfa..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -1271,7 -1355,43 +1271,47 @@@ int fib_sync_down_addr(struct net *net
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +int fib_sync_down_dev(struct net_device *dev, int force)
+++=======
++ static int call_fib_nh_notifiers(struct fib_nh *fib_nh,
++ 				 enum fib_event_type event_type)
++ {
++ 	struct in_device *in_dev = __in_dev_get_rtnl(fib_nh->nh_dev);
++ 	struct fib_nh_notifier_info info = {
++ 		.fib_nh = fib_nh,
++ 	};
++ 
++ 	switch (event_type) {
++ 	case FIB_EVENT_NH_ADD:
++ 		if (fib_nh->nh_flags & RTNH_F_DEAD)
++ 			break;
++ 		if (IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
++ 		    fib_nh->nh_flags & RTNH_F_LINKDOWN)
++ 			break;
++ 		return call_fib_notifiers(dev_net(fib_nh->nh_dev), event_type,
++ 					  &info.info);
++ 	case FIB_EVENT_NH_DEL:
++ 		if ((IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
++ 		     fib_nh->nh_flags & RTNH_F_LINKDOWN) ||
++ 		    (fib_nh->nh_flags & RTNH_F_DEAD))
++ 			return call_fib_notifiers(dev_net(fib_nh->nh_dev),
++ 						  event_type, &info.info);
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ /* Event              force Flags           Description
++  * NETDEV_CHANGE      0     LINKDOWN        Carrier OFF, not for scope host
++  * NETDEV_DOWN        0     LINKDOWN|DEAD   Link down, not for scope host
++  * NETDEV_DOWN        1     LINKDOWN|DEAD   Last address removed
++  * NETDEV_UNREGISTER  1     LINKDOWN|DEAD   Device removed
++  */
++ int fib_sync_down_dev(struct net_device *dev, unsigned long event, bool force)
+++>>>>>>> 982acb97560c (ipv4: fib: Notify about nexthop status changes)
+  {
+  	int ret = 0;
+  	int scope = RT_SCOPE_NOWHERE;
+@@@ -1297,7 -1417,17 +1337,21 @@@
+  				dead++;
+  			else if (nexthop_nh->nh_dev == dev &&
+  				 nexthop_nh->nh_scope != scope) {
+++<<<<<<< HEAD
+ +				nexthop_nh->nh_flags |= RTNH_F_DEAD;
+++=======
++ 				switch (event) {
++ 				case NETDEV_DOWN:
++ 				case NETDEV_UNREGISTER:
++ 					nexthop_nh->nh_flags |= RTNH_F_DEAD;
++ 					/* fall through */
++ 				case NETDEV_CHANGE:
++ 					nexthop_nh->nh_flags |= RTNH_F_LINKDOWN;
++ 					break;
++ 				}
++ 				call_fib_nh_notifiers(nexthop_nh,
++ 						      FIB_EVENT_NH_DEL);
+++>>>>>>> 982acb97560c (ipv4: fib: Notify about nexthop status changes)
+  				dead++;
+  			}
+  #ifdef CONFIG_IP_ROUTE_MULTIPATH
+@@@ -1418,7 -1581,8 +1472,12 @@@ int fib_sync_up(struct net_device *dev
+  			    !__in_dev_get_rtnl(dev))
+  				continue;
+  			alive++;
+++<<<<<<< HEAD
+ +			nexthop_nh->nh_flags &= ~RTNH_F_DEAD;
+++=======
++ 			nexthop_nh->nh_flags &= ~nh_flags;
++ 			call_fib_nh_notifiers(nexthop_nh, FIB_EVENT_NH_ADD);
+++>>>>>>> 982acb97560c (ipv4: fib: Notify about nexthop status changes)
+  		} endfor_nexthops(fi)
+  
+  		if (alive > 0) {
+* Unmerged path include/net/ip_fib.h
+* Unmerged path net/ipv4/fib_semantics.c
