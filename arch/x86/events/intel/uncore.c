@@ -443,7 +443,7 @@ static int uncore_assign_events(struct intel_uncore_box *box, int assign[], int 
 	return ret ? -EINVAL : 0;
 }
 
-static void uncore_pmu_event_start(struct perf_event *event, int flags)
+void uncore_pmu_event_start(struct perf_event *event, int flags)
 {
 	struct intel_uncore_box *box = uncore_event_to_box(event);
 	int idx = event->hw.idx;
@@ -483,7 +483,7 @@ static void uncore_pmu_event_start(struct perf_event *event, int flags)
 	}
 }
 
-static void uncore_pmu_event_stop(struct perf_event *event, int flags)
+void uncore_pmu_event_stop(struct perf_event *event, int flags)
 {
 	struct intel_uncore_box *box = uncore_event_to_box(event);
 	struct hw_perf_event *hwc = &event->hw;
@@ -520,7 +520,7 @@ static void uncore_pmu_event_stop(struct perf_event *event, int flags)
 	}
 }
 
-static int uncore_pmu_event_add(struct perf_event *event, int flags)
+int uncore_pmu_event_add(struct perf_event *event, int flags)
 {
 	struct intel_uncore_box *box = uncore_event_to_box(event);
 	struct hw_perf_event *hwc = &event->hw;
@@ -592,7 +592,7 @@ static int uncore_pmu_event_add(struct perf_event *event, int flags)
 	return 0;
 }
 
-static void uncore_pmu_event_del(struct perf_event *event, int flags)
+void uncore_pmu_event_del(struct perf_event *event, int flags)
 {
 	struct intel_uncore_box *box = uncore_event_to_box(event);
 	int i;
