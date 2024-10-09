@@ -1,0 +1,93 @@
+bpf: Track alignment of register values in the verifier.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [kernel] bpf: Track alignment of register values in the verifier (Jiri Olsa) [1311586]
+Rebuild_FUZZ: 99.10%
+commit-author David S. Miller <davem@davemloft.net>
+commit d1174416747d790d750742d0514915deeed93acf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d1174416.failed
+
+Currently if we add only constant values to pointers we can fully
+validate the alignment, and properly check if we need to reject the
+program on !CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS architectures.
+
+However, once an unknown value is introduced we only allow byte sized
+memory accesses which is too restrictive.
+
+Add logic to track the known minimum alignment of register values,
+and propagate this state into registers containing pointers.
+
+The most common paradigm that makes use of this new logic is computing
+the transport header using the IP header length field.  For example:
+
+	struct ethhdr *ep = skb->data;
+	struct iphdr *iph = (struct iphdr *) (ep + 1);
+	struct tcphdr *th;
+ ...
+	n = iph->ihl;
+	th = ((void *)iph + (n * 4));
+	port = th->dest;
+
+The existing code will reject the load of th->dest because it cannot
+validate that the alignment is at least 2 once "n * 4" is added the
+the packet pointer.
+
+In the new code, the register holding "n * 4" will have a reg->min_align
+value of 4, because any value multiplied by 4 will be at least 4 byte
+aligned.  (actually, the eBPF code emitted by the compiler in this case
+is most likely to use a shift left by 2, but the end result is identical)
+
+At the critical addition:
+
+	th = ((void *)iph + (n * 4));
+
+The register holding 'th' will start with reg->off value of 14.  The
+pointer addition will transform that reg into something that looks like:
+
+	reg->aux_off = 14
+	reg->aux_off_align = 4
+
+Next, the verifier will look at the th->dest load, and it will see
+a load offset of 2, and first check:
+
+	if (reg->aux_off_align % size)
+
+which will pass because aux_off_align is 4.  reg_off will be computed:
+
+	reg_off = reg->off;
+ ...
+		reg_off += reg->aux_off;
+
+plus we have off==2, and it will thus check:
+
+	if ((NET_IP_ALIGN + reg_off + off) % size != 0)
+
+which evaluates to:
+
+	if ((NET_IP_ALIGN + 14 + 2) % size != 0)
+
+On strict alignment architectures, NET_IP_ALIGN is 2, thus:
+
+	if ((2 + 14 + 2) % size != 0)
+
+which passes.
+
+These pointer transformations and checks work regardless of whether
+the constant offset or the variable with known alignment is added
+first to the pointer register.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit d1174416747d790d750742d0514915deeed93acf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf_verifier.h
+#	kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/verifier.c
