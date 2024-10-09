@@ -1,0 +1,415 @@
+qla2xxx: Add support for QFull throttling and Term Exchange retry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@qlogic.com>
+commit 33e7997755936ba92516c6ad69cd012c2e7d4dbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/33e79977.failed
+
+Through the qla target code, the qlt_send_term_exchange() routine
+is used in various different places to cleanup an exchange. For the
+case of IOCB request queue is full, the exchange is left unhandled/
+dangling. Existing code does not have re-try logic to cleanup the
+exchange. This patch add retry logic to cleanup the exchange before
+letting new commands through.
+
+For the case of FW running out of exchanges, driver need to reply
+SAM_STAT_BUSY to the initiators. This patch add a pending queue
+for the busy reply in case IOCB queue is unable to handle the cmd.
+
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 33e7997755936ba92516c6ad69cd012c2e7d4dbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 866e7a991a8e,d77fe43793b6..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -11,17 -11,15 +11,21 @@@
+   * ----------------------------------------------------------------------
+   * |             Level            |   Last Value Used  |     Holes	|
+   * ----------------------------------------------------------------------
+ - * | Module Init and Probe        |       0x017d       | 0x0144,0x0146	|
+ - * |                              |                    | 0x015b-0x0160	|
+ - * |                              |                    | 0x016e-0x0170	|
+ - * | Mailbox commands             |       0x118d       | 0x1115-0x1116	|
+ - * |                              |                    | 0x111a-0x111b  |
+ - * | Device Discovery             |       0x2016       | 0x2020-0x2022, |
+ + * | Module Init and Probe        |       0x0193       | 0x0146         |
+ + * | Mailbox commands             |       0x1199       | 0x111a-0x111b  |
+ + * |                              |                    | 0x1155-0x1158  |
+ + * |                              |                    | 0x1018-0x1019  |
+ + * |                              |                    | 0x1115-0x1116  |
+ + * |                              |                    | 0x10ca,0x1193  |
+ + * | Device Discovery             |       0x2095       | 0x2016         |
+ + * |                              |                    | 0x2020-0x2022, |
+   * |                              |                    | 0x2011-0x2012, |
+   * |                              |                    | 0x2099-0x20a4  |
+++<<<<<<< HEAD
+ + * | Queue Command and IO tracing |       0x3075       | 0x300b         |
+++=======
++  * | Queue Command and IO tracing |       0x3059       | 0x300b         |
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+   * |                              |                    | 0x3027-0x3028  |
+   * |                              |                    | 0x303d-0x3041  |
+   * |                              |                    | 0x302d,0x3033  |
+@@@ -68,9 -66,9 +72,15 @@@
+   * |                              |                    | 0xd02a,0xd02e	|
+   * |                              |                    | 0xd031-0xd0ff	|
+   * |                              |                    | 0xd101-0xd1fe	|
+++<<<<<<< HEAD
+ + * |                              |                    | 0xd213-0xd2fe	|
+ + * | Target Mode		  |	  0xe070       | 0xe021		|
+ + * | Target Mode Management	  |	  0xf072       | 0xf002-0xf003	|
+++=======
++  * |                              |                    | 0xd214-0xd2fe	|
++  * | Target Mode		  |	  0xe079       |		|
++  * | Target Mode Management	  |	  0xf072       | 0xf002		|
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+   * |                              |                    | 0xf046-0xf049  |
+   * | Target Mode Task Management  |	  0x1000b      |		|
+   * ----------------------------------------------------------------------
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index ce004b953a5f,5f6b2960cccb..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -2967,9 -2901,22 +2970,26 @@@ struct qlt_hw_data 
+  	uint8_t saved_add_firmware_options[2];
+  
+  	uint8_t tgt_node_name[WWN_SIZE];
+++<<<<<<< HEAD
+ +	int rspq_vector_cpuid;
+++=======
++ 
++ 	struct list_head q_full_list;
++ 	uint32_t num_pend_cmds;
++ 	uint32_t num_qfull_cmds_alloc;
++ 	uint32_t num_qfull_cmds_dropped;
++ 	spinlock_t q_full_lock;
++ 	uint32_t leak_exchg_thresh_hold;
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+  };
+  
++ #define MAX_QFULL_CMDS_ALLOC	8192
++ #define Q_FULL_THRESH_HOLD_PERCENT 90
++ #define Q_FULL_THRESH_HOLD(ha) \
++ 	((ha->fw_xcb_count/100) * Q_FULL_THRESH_HOLD_PERCENT)
++ 
++ #define LEAK_EXCHG_THRESH_HOLD_PERCENT 75	/* 75 percent */
++ 
+  /*
+   * Qlogic host adapter specific data structure.
+  */
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index ff935ead915f,9f248e7505ff..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -101,6 -108,10 +103,13 @@@ static void qlt_send_term_exchange(stru
+  	*cmd, struct atio_from_isp *atio, int ha_locked);
+  static void qlt_reject_free_srr_imm(struct scsi_qla_host *ha,
+  	struct qla_tgt_srr_imm *imm, int ha_lock);
+++<<<<<<< HEAD
+++=======
++ static void qlt_abort_cmd_on_host_reset(struct scsi_qla_host *vha,
++ 	struct qla_tgt_cmd *cmd);
++ static void qlt_alloc_qfull_cmd(struct scsi_qla_host *vha,
++ 	struct atio_from_isp *atio, uint16_t status, int qfull);
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+  /*
+   * Global Variables
+   */
+@@@ -2278,13 -2740,74 +2312,73 @@@ done
+  	return;
+  }
+  
++ static void qlt_init_term_exchange(struct scsi_qla_host *vha)
++ {
++ 	struct list_head free_list;
++ 	struct qla_tgt_cmd *cmd, *tcmd;
++ 
++ 	vha->hw->tgt.leak_exchg_thresh_hold =
++ 	    (vha->hw->fw_xcb_count/100) * LEAK_EXCHG_THRESH_HOLD_PERCENT;
++ 
++ 	cmd = tcmd = NULL;
++ 	if (!list_empty(&vha->hw->tgt.q_full_list)) {
++ 		INIT_LIST_HEAD(&free_list);
++ 		list_splice_init(&vha->hw->tgt.q_full_list, &free_list);
++ 
++ 		list_for_each_entry_safe(cmd, tcmd, &free_list, cmd_list) {
++ 			list_del(&cmd->cmd_list);
++ 			/* This cmd was never sent to TCM.  There is no need
++ 			 * to schedule free or call free_cmd
++ 			 */
++ 			qlt_free_cmd(cmd);
++ 			vha->hw->tgt.num_qfull_cmds_alloc--;
++ 		}
++ 	}
++ 	vha->hw->tgt.num_qfull_cmds_dropped = 0;
++ }
++ 
++ static void qlt_chk_exch_leak_thresh_hold(struct scsi_qla_host *vha)
++ {
++ 	uint32_t total_leaked;
++ 
++ 	total_leaked = vha->hw->tgt.num_qfull_cmds_dropped;
++ 
++ 	if (vha->hw->tgt.leak_exchg_thresh_hold &&
++ 	    (total_leaked > vha->hw->tgt.leak_exchg_thresh_hold)) {
++ 
++ 		ql_dbg(ql_dbg_tgt, vha, 0xe079,
++ 		    "Chip reset due to exchange starvation: %d/%d.\n",
++ 		    total_leaked, vha->hw->fw_xcb_count);
++ 
++ 		if (IS_P3P_TYPE(vha->hw))
++ 			set_bit(FCOE_CTX_RESET_NEEDED, &vha->dpc_flags);
++ 		else
++ 			set_bit(ISP_ABORT_NEEDED, &vha->dpc_flags);
++ 		qla2xxx_wake_dpc(vha);
++ 	}
++ 
++ }
++ 
+  void qlt_free_cmd(struct qla_tgt_cmd *cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct qla_tgt_sess *sess = cmd->sess;
++ 
++ 	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe074,
++ 	    "%s: se_cmd[%p] ox_id %04x\n",
++ 	    __func__, &cmd->se_cmd,
++ 	    be16_to_cpu(cmd->atio.u.isp24.fcp_hdr.ox_id));
++ 
++ 	if (!cmd->q_full)
++ 		qlt_decr_num_pend_cmds(cmd->vha);
++ 
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+  	BUG_ON(cmd->sg_mapped);
+ +
+  	if (unlikely(cmd->free_sg))
+  		kfree(cmd->sg);
+ -
+ -	if (!sess || !sess->se_sess) {
+ -		WARN_ON(1);
+ -		return;
+ -	}
+ -	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+  }
+  EXPORT_SYMBOL(qlt_free_cmd);
+  
+@@@ -2703,10 -3291,108 +2798,96 @@@ out_term
+  	 */
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1);
+++<<<<<<< HEAD
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +	if (sess)
+++=======
++ 
++ 	qlt_decr_num_pend_cmds(vha);
++ 	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
++ 	ha->tgt.tgt_ops->put_sess(sess);
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ }
++ 
++ static void qlt_do_work(struct work_struct *work)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
++ 
++ 	__qlt_do_work(cmd);
++ }
++ 
++ static struct qla_tgt_cmd *qlt_get_tag(scsi_qla_host_t *vha,
++ 				       struct qla_tgt_sess *sess,
++ 				       struct atio_from_isp *atio)
++ {
++ 	struct se_session *se_sess = sess->se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 	cmd->state = QLA_TGT_STATE_NEW;
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	qlt_incr_num_pend_cmds(vha);
++ 	cmd->vha = vha;
++ 	cmd->se_cmd.map_tag = tag;
++ 	cmd->sess = sess;
++ 	cmd->loop_id = sess->loop_id;
++ 	cmd->conf_compl_supported = sess->conf_compl_supported;
++ 
++ 	return cmd;
++ }
++ 
++ static void qlt_send_busy(struct scsi_qla_host *, struct atio_from_isp *,
++ 			  uint16_t);
++ 
++ static void qlt_create_sess_from_atio(struct work_struct *work)
++ {
++ 	struct qla_tgt_sess_op *op = container_of(work,
++ 					struct qla_tgt_sess_op, work);
++ 	scsi_qla_host_t *vha = op->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	uint8_t *s_id = op->atio.u.isp24.fcp_hdr.s_id;
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
++ 		"qla_target(%d): Unable to find wwn login"
++ 		" (s_id %x:%x:%x), trying to create it manually\n",
++ 		vha->vp_idx, s_id[0], s_id[1], s_id[2]);
++ 
++ 	if (op->atio.u.raw.entry_count > 1) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
++ 		        "Dropping multy entry atio %p\n", &op->atio);
++ 		goto out_term;
++ 	}
++ 
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 	sess = qlt_make_local_sess(vha, s_id);
++ 	/* sess has an extra creation ref. */
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	if (!sess)
++ 		goto out_term;
++ 	/*
++ 	 * Now obtain a pre-allocated session tag using the original op->atio
++ 	 * packet header, and dispatch into __qlt_do_work() using the existing
++ 	 * process context.
++ 	 */
++ 	cmd = qlt_get_tag(vha, sess, &op->atio);
++ 	if (!cmd) {
++ 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+  		ha->tgt.tgt_ops->put_sess(sess);
+ -		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -		kfree(op);
+ -		return;
+ -	}
+ -	/*
+ -	 * __qlt_do_work() will call ha->tgt.tgt_ops->put_sess() to release
+ -	 * the extra reference taken above by qlt_make_local_sess()
+ -	 */
+ -	__qlt_do_work(cmd);
+ -	kfree(op);
+ -	return;
+ -
+ -out_term:
+ -	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -	qlt_send_term_exchange(vha, NULL, &op->atio, 1);
+ -	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -	kfree(op);
+ -
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -3590,10 -4285,10 +3771,10 @@@ static int __qlt_send_busy(struct scsi_
+  
+  	pkt = (request_t *)qla2x00_alloc_iocbs(vha, NULL);
+  	if (!pkt) {
+ -		ql_dbg(ql_dbg_io, vha, 0x3063,
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf06e,
+  		    "qla_target(%d): %s failed: unable to allocate "
+  		    "request packet", vha->vp_idx, __func__);
+- 		return;
++ 		return -ENOMEM;
+  	}
+  
+  	pkt->entry_count = 1;
+@@@ -3789,11 -4643,13 +4162,17 @@@ static void qlt_response_pkt(struct scs
+  			    le16_to_cpu(atio->u.isp2x.status));
+  			break;
+  		}
+ +		ql_dbg(ql_dbg_tgt, vha, 0xe032,
+ +		    "FCP CDB: 0x%02x, sizeof(cdb): %lu",
+ +		    atio->u.isp2x.cdb[0], (unsigned long
+ +		    int)sizeof(atio->u.isp2x.cdb));
+  
++ 		rc = qlt_chk_qfull_thresh_hold(vha, atio);
++ 		if (rc != 0) {
++ 			tgt->irq_cmd_count--;
++ 			return;
++ 		}
++ 
+  		rc = qlt_handle_cmd_for_atio(vha, atio);
+  		if (unlikely(rc != 0)) {
+  			if (rc == -ESRCH) {
+@@@ -4335,11 -5180,19 +4714,22 @@@ int qlt_add_target(struct qla_hw_data *
+  /* Must be called under tgt_host_action_mutex */
+  int qlt_remove_target(struct qla_hw_data *ha, struct scsi_qla_host *vha)
+  {
+ -	if (!vha->vha_tgt.qla_tgt)
+ +	if (!ha->tgt.qla_tgt)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (vha->fc_vport) {
++ 		qlt_release(vha->vha_tgt.qla_tgt);
++ 		return 0;
++ 	}
++ 
++ 	/* free left over qfull cmds */
++ 	qlt_init_term_exchange(vha);
++ 
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+  	mutex_lock(&qla_tgt_mutex);
+ -	list_del(&vha->vha_tgt.qla_tgt->tgt_list_entry);
+ +	list_del(&ha->tgt.qla_tgt->tgt_list_entry);
+  	mutex_unlock(&qla_tgt_mutex);
+  
+  	ql_dbg(ql_dbg_tgt, vha, 0xe03c, "Unregistering target for host %ld(%p)",
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,0c768f5e885a..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -843,6 -914,9 +843,12 @@@ struct qla_tgt_cmd 
+  	unsigned int free_sg:1;
+  	unsigned int aborted:1; /* Needed in case of SRR */
+  	unsigned int write_data_transferred:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int ctx_dsd_alloced:1;
++ 	unsigned int q_full:1;
++ 	unsigned int term_exchg:1;
+++>>>>>>> 33e799775593 (qla2xxx: Add support for QFull throttling and Term Exchange retry)
+  
+  	struct scatterlist *sg;	/* cmd data buffer SG vector */
+  	int sg_cnt;		/* SG segments count */
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index abca26f89b80..c9d024dff206 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2653,6 +2653,8 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	    "Memory allocated for ha=%p.\n", ha);
+ 	ha->pdev = pdev;
+ 	ha->tgt.enable_class_2 = ql2xenableclass2;
++	INIT_LIST_HEAD(&ha->tgt.q_full_list);
++	spin_lock_init(&ha->tgt.q_full_lock);
+ 
+ 	/* Clear our data area */
+ 	ha->bars = bars;
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
