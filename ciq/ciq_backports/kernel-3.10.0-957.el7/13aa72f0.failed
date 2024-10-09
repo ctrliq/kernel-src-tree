@@ -1,0 +1,349 @@
+seccomp: Refactor the filter callback and the API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Andy Lutomirski <luto@amacapital.net>
+commit 13aa72f0fd0a9f98a41cefb662487269e2f1ad65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/13aa72f0.failed
+
+The reason I did this is to add a seccomp API that will be usable
+for an x86 fast path.  The x86 entry code needs to use a rather
+expensive slow path for a syscall that might be visible to things
+like ptrace.  By splitting seccomp into two phases, we can check
+whether we need the slow path and then use the fast path in if the
+filter allows the syscall or just returns some errno.
+
+As a side effect, I think the new code is much easier to understand
+than the old code.
+
+This has one user-visible effect: the audit record written for
+SECCOMP_RET_TRACE is now a simple indication that SECCOMP_RET_TRACE
+happened.  It used to depend in a complicated way on what the tracer
+did.  I couldn't make much sense of it.
+
+	Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 13aa72f0fd0a9f98a41cefb662487269e2f1ad65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/seccomp.h
+#	kernel/seccomp.c
+diff --cc include/linux/seccomp.h
+index 9687691799ff,38851085e481..000000000000
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@@ -35,11 -36,14 +35,22 @@@ static inline int secure_computing(int 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/* A wrapper for architectures supporting only SECCOMP_MODE_STRICT. */
+ +static inline void secure_computing_strict(int this_syscall)
+ +{
+ +	BUG_ON(secure_computing(this_syscall) != 0);
+ +}
+++=======
++ #define SECCOMP_PHASE1_OK	0
++ #define SECCOMP_PHASE1_SKIP	1
++ 
++ extern u32 seccomp_phase1(void);
++ int seccomp_phase2(u32 phase1_result);
++ #else
++ extern void secure_computing_strict(int this_syscall);
++ #endif
+++>>>>>>> 13aa72f0fd0a (seccomp: Refactor the filter callback and the API)
+  
+  extern long prctl_get_seccomp(void);
+  extern long prctl_set_seccomp(unsigned long, char __user *);
+diff --cc kernel/seccomp.c
+index 42e55449c1a5,6c8528ce9df9..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -21,10 -21,11 +21,16 @@@
+  #include <linux/slab.h>
+  #include <linux/syscalls.h>
+  
+++<<<<<<< HEAD
+ +/* #define SECCOMP_DEBUG 1 */
+++=======
++ #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
++ #include <asm/syscall.h>
++ #endif
+++>>>>>>> 13aa72f0fd0a (seccomp: Refactor the filter callback and the API)
+  
+  #ifdef CONFIG_SECCOMP_FILTER
+ +#include <asm/syscall.h>
+  #include <linux/filter.h>
+  #include <linux/pid.h>
+  #include <linux/ptrace.h>
+@@@ -558,11 -565,55 +564,61 @@@ static int mode1_syscalls_32[] = 
+  };
+  #endif
+  
+ -static void __secure_computing_strict(int this_syscall)
+ +int __secure_computing(int this_syscall)
+  {
+++<<<<<<< HEAD
+ +	int exit_sig = 0;
+ +	int *syscall;
+ +	u32 ret;
+++=======
++ 	int *syscall_whitelist = mode1_syscalls;
++ #ifdef CONFIG_COMPAT
++ 	if (is_compat_task())
++ 		syscall_whitelist = mode1_syscalls_32;
++ #endif
++ 	do {
++ 		if (*syscall_whitelist == this_syscall)
++ 			return;
++ 	} while (*++syscall_whitelist);
++ 
++ #ifdef SECCOMP_DEBUG
++ 	dump_stack();
++ #endif
++ 	audit_seccomp(this_syscall, SIGKILL, SECCOMP_RET_KILL);
++ 	do_exit(SIGKILL);
++ }
++ 
++ #ifndef CONFIG_HAVE_ARCH_SECCOMP_FILTER
++ void secure_computing_strict(int this_syscall)
++ {
++ 	int mode = current->seccomp.mode;
++ 
++ 	if (mode == 0)
++ 		return;
++ 	else if (mode == SECCOMP_MODE_STRICT)
++ 		__secure_computing_strict(this_syscall);
++ 	else
++ 		BUG();
++ }
++ #else
++ int __secure_computing(void)
++ {
++ 	u32 phase1_result = seccomp_phase1();
++ 
++ 	if (likely(phase1_result == SECCOMP_PHASE1_OK))
++ 		return 0;
++ 	else if (likely(phase1_result == SECCOMP_PHASE1_SKIP))
++ 		return -1;
++ 	else
++ 		return seccomp_phase2(phase1_result);
++ }
++ 
++ #ifdef CONFIG_SECCOMP_FILTER
++ static u32 __seccomp_phase1_filter(int this_syscall, struct pt_regs *regs)
++ {
++ 	u32 filter_ret, action;
++ 	int data;
+++>>>>>>> 13aa72f0fd0a (seccomp: Refactor the filter callback and the API)
+  
+  	/*
+  	 * Make sure that any changes to mode from another thread have
+@@@ -570,85 -621,124 +626,191 @@@
+  	 */
+  	rmb();
+  
+++<<<<<<< HEAD
+ +	switch (current->seccomp.mode) {
+ +	case SECCOMP_MODE_STRICT:
+ +		syscall = mode1_syscalls;
+ +#ifdef CONFIG_COMPAT
+ +		if (is_compat_task())
+ +			syscall = mode1_syscalls_32;
+ +#endif
+ +		do {
+ +			if (*syscall == this_syscall)
+ +				return 0;
+ +		} while (*++syscall);
+ +		exit_sig = SIGKILL;
+ +		ret = SECCOMP_RET_KILL;
+ +		break;
+ +#ifdef CONFIG_SECCOMP_FILTER
+ +	case SECCOMP_MODE_FILTER: {
+ +		int data;
+ +		struct pt_regs *regs = task_pt_regs(current);
+ +		ret = seccomp_run_filters(this_syscall);
+ +		data = ret & SECCOMP_RET_DATA;
+ +		ret &= SECCOMP_RET_ACTION;
+ +		switch (ret) {
+ +		case SECCOMP_RET_ERRNO:
+ +			/* Set the low-order 16-bits as a errno. */
+ +			syscall_set_return_value(current, regs,
+ +						 -data, 0);
+ +			goto skip;
+ +		case SECCOMP_RET_TRAP:
+ +			/* Show the handler the original registers. */
+ +			syscall_rollback(current, regs);
+ +			/* Let the filter pass back 16 bits of data. */
+ +			seccomp_send_sigsys(this_syscall, data);
+ +			goto skip;
+ +		case SECCOMP_RET_TRACE:
+ +			/* Skip these calls if there is no tracer. */
+ +			if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
+ +				syscall_set_return_value(current, regs,
+ +							 -ENOSYS, 0);
+ +				goto skip;
+ +			}
+ +			/* Allow the BPF to provide the event message */
+ +			ptrace_event(PTRACE_EVENT_SECCOMP, data);
+ +			/*
+ +			 * The delivery of a fatal signal during event
+ +			 * notification may silently skip tracer notification.
+ +			 * Terminating the task now avoids executing a system
+ +			 * call that may not be intended.
+ +			 */
+ +			if (fatal_signal_pending(current))
+ +				break;
+ +			if (syscall_get_nr(current, regs) < 0)
+ +				goto skip;  /* Explicit request to skip. */
+- 
+- 			return 0;
+- 		case SECCOMP_RET_ALLOW:
+- 			return 0;
+- 		case SECCOMP_RET_KILL:
+- 		default:
+- 			break;
+- 		}
+- 		exit_sig = SIGSYS;
+- 		break;
+++=======
++ 	filter_ret = seccomp_run_filters();
++ 	data = filter_ret & SECCOMP_RET_DATA;
++ 	action = filter_ret & SECCOMP_RET_ACTION;
+++>>>>>>> 13aa72f0fd0a (seccomp: Refactor the filter callback and the API)
++ 
++ 	switch (action) {
++ 	case SECCOMP_RET_ERRNO:
++ 		/* Set the low-order 16-bits as a errno. */
++ 		syscall_set_return_value(current, regs,
++ 					 -data, 0);
++ 		goto skip;
++ 
++ 	case SECCOMP_RET_TRAP:
++ 		/* Show the handler the original registers. */
++ 		syscall_rollback(current, regs);
++ 		/* Let the filter pass back 16 bits of data. */
++ 		seccomp_send_sigsys(this_syscall, data);
++ 		goto skip;
++ 
++ 	case SECCOMP_RET_TRACE:
++ 		return filter_ret;  /* Save the rest for phase 2. */
++ 
++ 	case SECCOMP_RET_ALLOW:
++ 		return SECCOMP_PHASE1_OK;
++ 
++ 	case SECCOMP_RET_KILL:
++ 	default:
++ 		audit_seccomp(this_syscall, SIGSYS, action);
++ 		do_exit(SIGSYS);
+  	}
++ 
++ 	unreachable();
++ 
++ skip:
++ 	audit_seccomp(this_syscall, 0, action);
++ 	return SECCOMP_PHASE1_SKIP;
++ }
++ #endif
++ 
++ /**
++  * seccomp_phase1() - run fast path seccomp checks on the current syscall
++  *
++  * This only reads pt_regs via the syscall_xyz helpers.  The only change
++  * it will make to pt_regs is via syscall_set_return_value, and it will
++  * only do that if it returns SECCOMP_PHASE1_SKIP.
++  *
++  * It may also call do_exit or force a signal; these actions must be
++  * safe.
++  *
++  * If it returns SECCOMP_PHASE1_OK, the syscall passes checks and should
++  * be processed normally.
++  *
++  * If it returns SECCOMP_PHASE1_SKIP, then the syscall should not be
++  * invoked.  In this case, seccomp_phase1 will have set the return value
++  * using syscall_set_return_value.
++  *
++  * If it returns anything else, then the return value should be passed
++  * to seccomp_phase2 from a context in which ptrace hooks are safe.
++  */
++ u32 seccomp_phase1(void)
++ {
++ 	int mode = current->seccomp.mode;
++ 	struct pt_regs *regs = task_pt_regs(current);
++ 	int this_syscall = syscall_get_nr(current, regs);
++ 
++ 	switch (mode) {
++ 	case SECCOMP_MODE_STRICT:
++ 		__secure_computing_strict(this_syscall);  /* may call do_exit */
++ 		return SECCOMP_PHASE1_OK;
++ #ifdef CONFIG_SECCOMP_FILTER
++ 	case SECCOMP_MODE_FILTER:
++ 		return __seccomp_phase1_filter(this_syscall, regs);
+  #endif
+  	default:
+  		BUG();
+  	}
++ }
+  
+++<<<<<<< HEAD
+ +#ifdef SECCOMP_DEBUG
+ +	dump_stack();
+ +#endif
+ +	audit_seccomp(this_syscall, exit_sig, ret);
+ +	do_exit(exit_sig);
+ +#ifdef CONFIG_SECCOMP_FILTER
+ +skip:
+ +	audit_seccomp(this_syscall, exit_sig, ret);
+ +#endif
+ +	return -1;
+++=======
++ /**
++  * seccomp_phase2() - finish slow path seccomp work for the current syscall
++  * @phase1_result: The return value from seccomp_phase1()
++  *
++  * This must be called from a context in which ptrace hooks can be used.
++  *
++  * Returns 0 if the syscall should be processed or -1 to skip the syscall.
++  */
++ int seccomp_phase2(u32 phase1_result)
++ {
++ 	struct pt_regs *regs = task_pt_regs(current);
++ 	u32 action = phase1_result & SECCOMP_RET_ACTION;
++ 	int data = phase1_result & SECCOMP_RET_DATA;
++ 
++ 	BUG_ON(action != SECCOMP_RET_TRACE);
++ 
++ 	audit_seccomp(syscall_get_nr(current, regs), 0, action);
++ 
++ 	/* Skip these calls if there is no tracer. */
++ 	if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
++ 		syscall_set_return_value(current, regs,
++ 					 -ENOSYS, 0);
++ 		return -1;
++ 	}
++ 
++ 	/* Allow the BPF to provide the event message */
++ 	ptrace_event(PTRACE_EVENT_SECCOMP, data);
++ 	/*
++ 	 * The delivery of a fatal signal during event
++ 	 * notification may silently skip tracer notification.
++ 	 * Terminating the task now avoids executing a system
++ 	 * call that may not be intended.
++ 	 */
++ 	if (fatal_signal_pending(current))
++ 		do_exit(SIGSYS);
++ 	if (syscall_get_nr(current, regs) < 0)
++ 		return -1;  /* Explicit request to skip. */
++ 
++ 	return 0;
+++>>>>>>> 13aa72f0fd0a (seccomp: Refactor the filter callback and the API)
+  }
+ -#endif /* CONFIG_HAVE_ARCH_SECCOMP_FILTER */
+  
+  long prctl_get_seccomp(void)
+  {
+* Unmerged path include/linux/seccomp.h
+* Unmerged path kernel/seccomp.c
