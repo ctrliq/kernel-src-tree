@@ -4916,7 +4916,8 @@ static int config_mgmt_dev(struct pci_dev *pdev)
 	int err;
 
 	snprintf(name, IFNAMSIZ, "mgmtpf%d%d", adap->adap_idx, adap->pf);
-	netdev = alloc_netdev(0, name, NET_NAME_UNKNOWN, dummy_setup);
+	netdev = alloc_netdev(sizeof(struct port_info), name, NET_NAME_UNKNOWN,
+			      dummy_setup);
 	if (!netdev)
 		return -ENOMEM;
 
@@ -5358,6 +5359,8 @@ sriov:
 		err = -ENOMEM;
 		goto free_adapter;
 	}
+	spin_lock_init(&adapter->mbox_lock);
+	INIT_LIST_HEAD(&adapter->mlist.list);
 	pci_set_drvdata(pdev, adapter);
 	return 0;
 
