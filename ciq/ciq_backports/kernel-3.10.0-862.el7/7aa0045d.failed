@@ -1,0 +1,629 @@
+net_sched: introduce a workqueue for RCU callbacks of tc filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 7aa0045dadb6ef37485ea9f2a7d28278ca588b51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7aa0045d.failed
+
+This patch introduces a dedicated workqueue for tc filters
+so that each tc filter's RCU callback could defer their
+action destroy work to this workqueue. The helper
+tcf_queue_work() is introduced for them to use.
+
+Because we hold RTNL lock when calling tcf_block_put(), we
+can not simply flush works inside it, therefore we have to
+defer it again to this workqueue and make sure all flying RCU
+callbacks have already queued their work before this one, in
+other words, to ensure this is the last one to execute to
+prevent any use-after-free.
+
+On the other hand, this makes tcf_block_put() ugly and
+harder to understand. Since David and Eric strongly dislike
+adding synchronize_rcu(), this is probably the only
+solution that could make everyone happy.
+
+Please also see the code comments below.
+
+	Reported-by: Chris Mi <chrism@mellanox.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Cc: John Fastabend <john.fastabend@gmail.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7aa0045dadb6ef37485ea9f2a7d28278ca588b51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+diff --cc include/net/pkt_cls.h
+index db4cec05920e,3009547f3c66..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -17,6 -18,37 +18,40 @@@ struct tcf_walker 
+  int register_tcf_proto_ops(struct tcf_proto_ops *ops);
+  int unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+  
+++<<<<<<< HEAD
+++=======
++ bool tcf_queue_work(struct work_struct *work);
++ 
++ #ifdef CONFIG_NET_CLS
++ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
++ 				bool create);
++ void tcf_chain_put(struct tcf_chain *chain);
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain);
++ void tcf_block_put(struct tcf_block *block);
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode);
++ 
++ #else
++ static inline
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	return 0;
++ }
++ 
++ static inline void tcf_block_put(struct tcf_block *block)
++ {
++ }
++ 
++ static inline int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 			       struct tcf_result *res, bool compat_mode)
++ {
++ 	return TC_ACT_UNSPEC;
++ }
++ #endif
++ 
+++>>>>>>> 7aa0045dadb6 (net_sched: introduce a workqueue for RCU callbacks of tc filter)
+  static inline unsigned long
+  __cls_set_class(unsigned long *clp, unsigned long cl)
+  {
+diff --cc include/net/sch_generic.h
+index 99cd1bbb69be,0dec8a23be57..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -8,6 -8,9 +8,12 @@@
+  #include <linux/pkt_cls.h>
+  #include <linux/percpu.h>
+  #include <linux/dynamic_queue_limits.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/list.h>
++ #include <linux/refcount.h>
++ #include <linux/workqueue.h>
+++>>>>>>> 7aa0045dadb6 (net_sched: introduce a workqueue for RCU callbacks of tc filter)
+  #include <net/gen_stats.h>
+  #include <net/rtnetlink.h>
+  
+@@@ -248,6 -261,20 +254,23 @@@ struct qdisc_skb_cb 
+  	unsigned char		data[QDISC_CB_PRIV_LEN];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct tcf_chain {
++ 	struct tcf_proto __rcu *filter_chain;
++ 	struct tcf_proto __rcu **p_filter_chain;
++ 	struct list_head list;
++ 	struct tcf_block *block;
++ 	u32 index; /* chain index */
++ 	unsigned int refcnt;
++ };
++ 
++ struct tcf_block {
++ 	struct list_head chain_list;
++ 	struct work_struct work;
++ };
++ 
+++>>>>>>> 7aa0045dadb6 (net_sched: introduce a workqueue for RCU callbacks of tc filter)
+  static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+  {
+  	struct qdisc_skb_cb *qcb;
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,045d13679ad6..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -99,21 -103,11 +102,29 @@@ int unregister_tcf_proto_ops(struct tcf
+  }
+  EXPORT_SYMBOL(unregister_tcf_proto_ops);
+  
+++<<<<<<< HEAD
+ +static int tfilter_notify(struct net *net, struct sk_buff *oskb,
+ +			  struct nlmsghdr *n, struct tcf_proto *tp,
+ +			  unsigned long fh, int event, bool unicast);
+ +
+ +static void tfilter_notify_chain(struct net *net, struct sk_buff *oskb,
+ +				 struct nlmsghdr *n,
+ +				 struct tcf_proto __rcu **chain, int event)
+ +{
+ +	struct tcf_proto __rcu **it_chain;
+ +	struct tcf_proto *tp;
+ +
+ +	for (it_chain = chain; (tp = rtnl_dereference(*it_chain)) != NULL;
+ +	     it_chain = &tp->next)
+ +		tfilter_notify(net, oskb, n, tp, 0, event, false);
+ +}
+++=======
++ bool tcf_queue_work(struct work_struct *work)
++ {
++ 	return queue_work(tc_filter_wq, work);
++ }
++ EXPORT_SYMBOL(tcf_queue_work);
+++>>>>>>> 7aa0045dadb6 (net_sched: introduce a workqueue for RCU callbacks of tc filter)
+  
+  /* Select new prio value from the range, managed by kernel. */
+  
+@@@ -124,7 -118,436 +135,440 @@@ static inline u32 tcf_auto_prio(struct 
+  	if (tp)
+  		first = tp->prio - 1;
+  
+++<<<<<<< HEAD
+ +	return first;
+++=======
++ 	return TC_H_MAJ(first);
++ }
++ 
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q,
++ 					  struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 	tp->chain = chain;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
++ 					  u32 chain_index)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
++ 	if (!chain)
++ 		return NULL;
++ 	list_add_tail(&chain->list, &block->chain_list);
++ 	chain->block = block;
++ 	chain->index = chain_index;
++ 	chain->refcnt = 1;
++ 	return chain;
++ }
++ 
++ static void tcf_chain_flush(struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	if (chain->p_filter_chain)
++ 		RCU_INIT_POINTER(*chain->p_filter_chain, NULL);
++ 	while ((tp = rtnl_dereference(chain->filter_chain)) != NULL) {
++ 		RCU_INIT_POINTER(chain->filter_chain, tp->next);
++ 		tcf_chain_put(chain);
++ 		tcf_proto_destroy(tp);
++ 	}
++ }
++ 
++ static void tcf_chain_destroy(struct tcf_chain *chain)
++ {
++ 	list_del(&chain->list);
++ 	kfree(chain);
++ }
++ 
++ static void tcf_chain_hold(struct tcf_chain *chain)
++ {
++ 	++chain->refcnt;
++ }
++ 
++ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
++ 				bool create)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	list_for_each_entry(chain, &block->chain_list, list) {
++ 		if (chain->index == chain_index) {
++ 			tcf_chain_hold(chain);
++ 			return chain;
++ 		}
++ 	}
++ 
++ 	return create ? tcf_chain_create(block, chain_index) : NULL;
++ }
++ EXPORT_SYMBOL(tcf_chain_get);
++ 
++ void tcf_chain_put(struct tcf_chain *chain)
++ {
++ 	if (--chain->refcnt == 0)
++ 		tcf_chain_destroy(chain);
++ }
++ EXPORT_SYMBOL(tcf_chain_put);
++ 
++ static void
++ tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
++ 			       struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	chain->p_filter_chain = p_filter_chain;
++ }
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	struct tcf_chain *chain;
++ 	int err;
++ 
++ 	if (!block)
++ 		return -ENOMEM;
++ 	INIT_LIST_HEAD(&block->chain_list);
++ 	/* Create chain 0 by default, it has to be always present. */
++ 	chain = tcf_chain_create(block, 0);
++ 	if (!chain) {
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	tcf_chain_filter_chain_ptr_set(chain, p_filter_chain);
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get);
++ 
++ static void tcf_block_put_final(struct work_struct *work)
++ {
++ 	struct tcf_block *block = container_of(work, struct tcf_block, work);
++ 	struct tcf_chain *chain, *tmp;
++ 
++ 	/* At this point, all the chains should have refcnt == 1. */
++ 	rtnl_lock();
++ 	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
++ 		tcf_chain_put(chain);
++ 	rtnl_unlock();
++ 	kfree(block);
++ }
++ 
++ /* XXX: Standalone actions are not allowed to jump to any chain, and bound
++  * actions should be all removed after flushing. However, filters are destroyed
++  * in RCU callbacks, we have to hold the chains first, otherwise we would
++  * always race with RCU callbacks on this list without proper locking.
++  */
++ static void tcf_block_put_deferred(struct work_struct *work)
++ {
++ 	struct tcf_block *block = container_of(work, struct tcf_block, work);
++ 	struct tcf_chain *chain;
++ 
++ 	rtnl_lock();
++ 	/* Hold a refcnt for all chains, except 0, in case they are gone. */
++ 	list_for_each_entry(chain, &block->chain_list, list)
++ 		if (chain->index)
++ 			tcf_chain_hold(chain);
++ 
++ 	/* No race on the list, because no chain could be destroyed. */
++ 	list_for_each_entry(chain, &block->chain_list, list)
++ 		tcf_chain_flush(chain);
++ 
++ 	INIT_WORK(&block->work, tcf_block_put_final);
++ 	/* Wait for RCU callbacks to release the reference count and make
++ 	 * sure their works have been queued before this.
++ 	 */
++ 	rcu_barrier();
++ 	tcf_queue_work(&block->work);
++ 	rtnl_unlock();
++ }
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	if (!block)
++ 		return;
++ 
++ 	INIT_WORK(&block->work, tcf_block_put_deferred);
++ 	/* Wait for existing RCU callbacks to cool down, make sure their works
++ 	 * have been queued before this. We can not flush pending works here
++ 	 * because we are holding the RTNL lock.
++ 	 */
++ 	rcu_barrier();
++ 	tcf_queue_work(&block->work);
++ }
++ EXPORT_SYMBOL(tcf_block_put);
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *orig_tp = tp;
++ 	const struct tcf_proto *first_tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode)) {
++ 			first_tp = orig_tp;
++ 			goto reset;
++ 		} else if (unlikely(TC_ACT_EXT_CMP(err, TC_ACT_GOTO_CHAIN))) {
++ 			first_tp = res->goto_tp;
++ 			goto reset;
++ 		}
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = first_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
++ struct tcf_chain_info {
++ 	struct tcf_proto __rcu **pprev;
++ 	struct tcf_proto __rcu *next;
++ };
++ 
++ static struct tcf_proto *tcf_chain_tp_prev(struct tcf_chain_info *chain_info)
++ {
++ 	return rtnl_dereference(*chain_info->pprev);
++ }
++ 
++ static void tcf_chain_tp_insert(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	if (chain->p_filter_chain &&
++ 	    *chain_info->pprev == chain->filter_chain)
++ 		rcu_assign_pointer(*chain->p_filter_chain, tp);
++ 	RCU_INIT_POINTER(tp->next, tcf_chain_tp_prev(chain_info));
++ 	rcu_assign_pointer(*chain_info->pprev, tp);
++ 	tcf_chain_hold(chain);
++ }
++ 
++ static void tcf_chain_tp_remove(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	struct tcf_proto *next = rtnl_dereference(chain_info->next);
++ 
++ 	if (chain->p_filter_chain && tp == chain->filter_chain)
++ 		RCU_INIT_POINTER(*chain->p_filter_chain, next);
++ 	RCU_INIT_POINTER(*chain_info->pprev, next);
++ 	tcf_chain_put(chain);
++ }
++ 
++ static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
++ 					   struct tcf_chain_info *chain_info,
++ 					   u32 protocol, u32 prio,
++ 					   bool prio_allocate)
++ {
++ 	struct tcf_proto **pprev;
++ 	struct tcf_proto *tp;
++ 
++ 	/* Check the chain for existence of proto-tcf with this priority */
++ 	for (pprev = &chain->filter_chain;
++ 	     (tp = rtnl_dereference(*pprev)); pprev = &tp->next) {
++ 		if (tp->prio >= prio) {
++ 			if (tp->prio == prio) {
++ 				if (prio_allocate ||
++ 				    (tp->protocol != protocol && protocol))
++ 					return ERR_PTR(-EINVAL);
++ 			} else {
++ 				tp = NULL;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	chain_info->pprev = pprev;
++ 	chain_info->next = tp ? tp->next : NULL;
++ 	return tp;
++ }
++ 
++ static int tcf_fill_node(struct net *net, struct sk_buff *skb,
++ 			 struct tcf_proto *tp, void *fh, u32 portid,
++ 			 u32 seq, u16 flags, int event)
++ {
++ 	struct tcmsg *tcm;
++ 	struct nlmsghdr  *nlh;
++ 	unsigned char *b = skb_tail_pointer(skb);
++ 
++ 	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*tcm), flags);
++ 	if (!nlh)
++ 		goto out_nlmsg_trim;
++ 	tcm = nlmsg_data(nlh);
++ 	tcm->tcm_family = AF_UNSPEC;
++ 	tcm->tcm__pad1 = 0;
++ 	tcm->tcm__pad2 = 0;
++ 	tcm->tcm_ifindex = qdisc_dev(tp->q)->ifindex;
++ 	tcm->tcm_parent = tp->classid;
++ 	tcm->tcm_info = TC_H_MAKE(tp->prio, tp->protocol);
++ 	if (nla_put_string(skb, TCA_KIND, tp->ops->kind))
++ 		goto nla_put_failure;
++ 	if (nla_put_u32(skb, TCA_CHAIN, tp->chain->index))
++ 		goto nla_put_failure;
++ 	if (!fh) {
++ 		tcm->tcm_handle = 0;
++ 	} else {
++ 		if (tp->ops->dump && tp->ops->dump(net, tp, fh, skb, tcm) < 0)
++ 			goto nla_put_failure;
++ 	}
++ 	nlh->nlmsg_len = skb_tail_pointer(skb) - b;
++ 	return skb->len;
++ 
++ out_nlmsg_trim:
++ nla_put_failure:
++ 	nlmsg_trim(skb, b);
++ 	return -1;
++ }
++ 
++ static int tfilter_notify(struct net *net, struct sk_buff *oskb,
++ 			  struct nlmsghdr *n, struct tcf_proto *tp,
++ 			  void *fh, int event, bool unicast)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tcf_fill_node(net, skb, tp, fh, portid, n->nlmsg_seq,
++ 			  n->nlmsg_flags, event) <= 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (unicast)
++ 		return netlink_unicast(net->rtnl, skb, portid, MSG_DONTWAIT);
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static int tfilter_del_notify(struct net *net, struct sk_buff *oskb,
++ 			      struct nlmsghdr *n, struct tcf_proto *tp,
++ 			      void *fh, bool unicast, bool *last)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 	int err;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tcf_fill_node(net, skb, tp, fh, portid, n->nlmsg_seq,
++ 			  n->nlmsg_flags, RTM_DELTFILTER) <= 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = tp->ops->delete(tp, fh, last);
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return err;
++ 	}
++ 
++ 	if (unicast)
++ 		return netlink_unicast(net->rtnl, skb, portid, MSG_DONTWAIT);
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static void tfilter_notify_chain(struct net *net, struct sk_buff *oskb,
++ 				 struct nlmsghdr *n,
++ 				 struct tcf_chain *chain, int event)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	for (tp = rtnl_dereference(chain->filter_chain);
++ 	     tp; tp = rtnl_dereference(tp->next))
++ 		tfilter_notify(net, oskb, n, tp, 0, event, false);
+++>>>>>>> 7aa0045dadb6 (net_sched: introduce a workqueue for RCU callbacks of tc filter)
+  }
+  
+  /* Add/change/delete/get a filter node */
+@@@ -683,10 -1060,14 +1127,19 @@@ EXPORT_SYMBOL(tcf_exts_get_dev)
+  
+  static int __init tc_filter_init(void)
+  {
+++<<<<<<< HEAD
+ +	rtnl_register(PF_UNSPEC, RTM_NEWTFILTER, tc_ctl_tfilter, NULL, NULL);
+ +	rtnl_register(PF_UNSPEC, RTM_DELTFILTER, tc_ctl_tfilter, NULL, NULL);
+++=======
++ 	tc_filter_wq = alloc_ordered_workqueue("tc_filter_workqueue", 0);
++ 	if (!tc_filter_wq)
++ 		return -ENOMEM;
++ 
++ 	rtnl_register(PF_UNSPEC, RTM_NEWTFILTER, tc_ctl_tfilter, NULL, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_DELTFILTER, tc_ctl_tfilter, NULL, 0);
+++>>>>>>> 7aa0045dadb6 (net_sched: introduce a workqueue for RCU callbacks of tc filter)
+  	rtnl_register(PF_UNSPEC, RTM_GETTFILTER, tc_ctl_tfilter,
+ -		      tc_dump_tfilter, 0);
+ +		      tc_dump_tfilter, NULL);
+  
+  	return 0;
+  }
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
