@@ -1,0 +1,651 @@
+dax: New fault locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit ac401cc782429cc8560ce4840b1405d603740917
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ac401cc7.failed
+
+Currently DAX page fault locking is racy.
+
+CPU0 (write fault)		CPU1 (read fault)
+
+__dax_fault()			__dax_fault()
+  get_block(inode, block, &bh, 0) -> not mapped
+				  get_block(inode, block, &bh, 0)
+				    -> not mapped
+  if (!buffer_mapped(&bh))
+    if (vmf->flags & FAULT_FLAG_WRITE)
+      get_block(inode, block, &bh, 1) -> allocates blocks
+  if (page) -> no
+				  if (!buffer_mapped(&bh))
+				    if (vmf->flags & FAULT_FLAG_WRITE) {
+				    } else {
+				      dax_load_hole();
+				    }
+  dax_insert_mapping()
+
+And we are in a situation where we fail in dax_radix_entry() with -EIO.
+
+Another problem with the current DAX page fault locking is that there is
+no race-free way to clear dirty tag in the radix tree. We can always
+end up with clean radix tree and dirty data in CPU cache.
+
+We fix the first problem by introducing locking of exceptional radix
+tree entries in DAX mappings acting very similarly to page lock and thus
+synchronizing properly faults against the same mapping index. The same
+lock can later be used to avoid races when clearing radix tree dirty
+tag.
+
+	Reviewed-by: NeilBrown <neilb@suse.com>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+(cherry picked from commit ac401cc782429cc8560ce4840b1405d603740917)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/dax.h
+#	mm/truncate.c
+diff --cc fs/dax.c
+index 3ad95e9ec809,f43c3d806fb6..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -33,6 -32,44 +33,47 @@@
+  #include <linux/pfn_t.h>
+  #include <linux/sizes.h>
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * We use lowest available bit in exceptional entry for locking, other two
++  * bits to determine entry type. In total 3 special bits.
++  */
++ #define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
++ #define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
++ #define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
++ #define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
++ #define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
++ #define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
++ #define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
++ 		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
++ 		RADIX_TREE_EXCEPTIONAL_ENTRY))
++ 
++ /* We choose 4096 entries - same as per-zone page wait tables */
++ #define DAX_WAIT_TABLE_BITS 12
++ #define DAX_WAIT_TABLE_ENTRIES (1 << DAX_WAIT_TABLE_BITS)
++ 
++ wait_queue_head_t wait_table[DAX_WAIT_TABLE_ENTRIES];
++ 
++ static int __init init_dax_wait_table(void)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < DAX_WAIT_TABLE_ENTRIES; i++)
++ 		init_waitqueue_head(wait_table + i);
++ 	return 0;
++ }
++ fs_initcall(init_dax_wait_table);
++ 
++ static wait_queue_head_t *dax_entry_waitqueue(struct address_space *mapping,
++ 					      pgoff_t index)
++ {
++ 	unsigned long hash = hash_long((unsigned long)mapping ^ index,
++ 				       DAX_WAIT_TABLE_BITS);
++ 	return wait_table + hash;
++ }
++ 
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  static long dax_map_atomic(struct block_device *bdev, struct blk_dax_ctl *dax)
+  {
+  	struct request_queue *q = bdev->bd_queue;
+@@@ -330,24 -556,24 +628,41 @@@ int dax_delete_mapping_entry(struct add
+   * otherwise it will simply fall out of the page cache under memory
+   * pressure without ever having been dirtied.
+   */
+- static int dax_load_hole(struct address_space *mapping, struct page *page,
+- 							struct vm_fault *vmf)
++ static int dax_load_hole(struct address_space *mapping, void *entry,
++ 			 struct vm_fault *vmf)
+  {
+++<<<<<<< HEAD
+ +	unsigned long size;
+ +	struct inode *inode = mapping->host;
+ +	if (!page)
+ +		page = find_or_create_page(mapping, vmf->pgoff,
+ +						GFP_KERNEL | __GFP_ZERO);
+ +	if (!page)
+ +		return VM_FAULT_OOM;
+ +	/* Recheck i_size under page lock to avoid truncate race */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (vmf->pgoff >= size) {
+ +		unlock_page(page);
+ +		page_cache_release(page);
+ +		return VM_FAULT_SIGBUS;
+ +	}
+++=======
++ 	struct page *page;
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  
++ 	/* Hole page already exists? Return it...  */
++ 	if (!radix_tree_exceptional_entry(entry)) {
++ 		vmf->page = entry;
++ 		return VM_FAULT_LOCKED;
++ 	}
++ 
++ 	/* This will replace locked radix tree entry with a hole page */
++ 	page = find_or_create_page(mapping, vmf->pgoff,
++ 				   vmf->gfp_mask | __GFP_ZERO);
++ 	if (!page) {
++ 		put_locked_mapping_entry(mapping, vmf->pgoff, entry);
++ 		return VM_FAULT_OOM;
++ 	}
+  	vmf->page = page;
+  	return VM_FAULT_LOCKED;
+  }
+@@@ -371,73 -597,57 +686,62 @@@ static int copy_user_bh(struct page *to
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +#define NO_SECTOR -1
+ +#define DAX_PMD_INDEX(page_index) (page_index & (PMD_MASK >> PAGE_CACHE_SHIFT))
+++=======
++ #define DAX_PMD_INDEX(page_index) (page_index & (PMD_MASK >> PAGE_SHIFT))
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  
+- static int dax_radix_entry(struct address_space *mapping, pgoff_t index,
+- 		sector_t sector, bool pmd_entry, bool dirty)
++ static void *dax_insert_mapping_entry(struct address_space *mapping,
++ 				      struct vm_fault *vmf,
++ 				      void *entry, sector_t sector)
+  {
+  	struct radix_tree_root *page_tree = &mapping->page_tree;
+- 	pgoff_t pmd_index = DAX_PMD_INDEX(index);
+- 	int type, error = 0;
+- 	void *entry;
++ 	int error = 0;
++ 	bool hole_fill = false;
++ 	void *new_entry;
++ 	pgoff_t index = vmf->pgoff;
+  
+- 	WARN_ON_ONCE(pmd_entry && !dirty);
+- 	if (dirty)
++ 	if (vmf->flags & FAULT_FLAG_WRITE)
+  		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+  
+- 	spin_lock_irq(&mapping->tree_lock);
+- 
+- 	entry = radix_tree_lookup(page_tree, pmd_index);
+- 	if (entry && RADIX_DAX_TYPE(entry) == RADIX_DAX_PMD) {
+- 		index = pmd_index;
+- 		goto dirty;
++ 	/* Replacing hole page with block mapping? */
++ 	if (!radix_tree_exceptional_entry(entry)) {
++ 		hole_fill = true;
++ 		/*
++ 		 * Unmap the page now before we remove it from page cache below.
++ 		 * The page is locked so it cannot be faulted in again.
++ 		 */
++ 		unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
++ 				    PAGE_SIZE, 0);
++ 		error = radix_tree_preload(vmf->gfp_mask & ~__GFP_HIGHMEM);
++ 		if (error)
++ 			return ERR_PTR(error);
+  	}
+  
+- 	entry = radix_tree_lookup(page_tree, index);
+- 	if (entry) {
+- 		type = RADIX_DAX_TYPE(entry);
+- 		if (WARN_ON_ONCE(type != RADIX_DAX_PTE &&
+- 					type != RADIX_DAX_PMD)) {
+- 			error = -EIO;
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	new_entry = (void *)((unsigned long)RADIX_DAX_ENTRY(sector, false) |
++ 		       RADIX_DAX_ENTRY_LOCK);
++ 	if (hole_fill) {
++ 		__delete_from_page_cache(entry, NULL);
++ 		/* Drop pagecache reference */
++ 		put_page(entry);
++ 		error = radix_tree_insert(page_tree, index, new_entry);
++ 		if (error) {
++ 			new_entry = ERR_PTR(error);
+  			goto unlock;
+  		}
++ 		mapping->nrexceptional++;
++ 	} else {
++ 		void **slot;
++ 		void *ret;
+  
+- 		if (!pmd_entry || type == RADIX_DAX_PMD)
+- 			goto dirty;
+- 
+- 		/*
+- 		 * We only insert dirty PMD entries into the radix tree.  This
+- 		 * means we don't need to worry about removing a dirty PTE
+- 		 * entry and inserting a clean PMD entry, thus reducing the
+- 		 * range we would flush with a follow-up fsync/msync call.
+- 		 */
+- 		radix_tree_delete(&mapping->page_tree, index);
+- 		mapping->nrexceptional--;
+- 	}
+- 
+- 	if (sector == NO_SECTOR) {
+- 		/*
+- 		 * This can happen during correct operation if our pfn_mkwrite
+- 		 * fault raced against a hole punch operation.  If this
+- 		 * happens the pte that was hole punched will have been
+- 		 * unmapped and the radix tree entry will have been removed by
+- 		 * the time we are called, but the call will still happen.  We
+- 		 * will return all the way up to wp_pfn_shared(), where the
+- 		 * pte_same() check will fail, eventually causing page fault
+- 		 * to be retried by the CPU.
+- 		 */
+- 		goto unlock;
++ 		ret = __radix_tree_lookup(page_tree, index, NULL, &slot);
++ 		WARN_ON_ONCE(ret != entry);
++ 		radix_tree_replace_slot(slot, new_entry);
+  	}
+- 
+- 	error = radix_tree_insert(page_tree, index,
+- 			RADIX_DAX_ENTRY(sector, pmd_entry));
+- 	if (error)
+- 		goto unlock;
+- 
+- 	mapping->nrexceptional++;
+-  dirty:
+- 	if (dirty)
++ 	if (vmf->flags & FAULT_FLAG_WRITE)
+  		radix_tree_tag_set(page_tree, index, PAGECACHE_TAG_DIRTY);
+   unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+@@@ -570,50 -793,33 +886,56 @@@ static int dax_insert_mapping(struct ad
+  			struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+  	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+- 	struct address_space *mapping = inode->i_mapping;
+  	struct block_device *bdev = bh->b_bdev;
+  	struct blk_dax_ctl dax = {
+- 		.sector = to_sector(bh, inode),
++ 		.sector = to_sector(bh, mapping->host),
+  		.size = bh->b_size,
+  	};
+ +	pgoff_t size;
+  	int error;
++ 	void *ret;
++ 	void *entry = *entryp;
+  
+ -	i_mmap_lock_read(mapping);
+ +	mutex_lock(&mapping->i_mmap_mutex);
+ +
+ +	/*
+ +	 * Check truncate didn't happen while we were allocating a block.
+ +	 * If it did, this block may or may not be still allocated to the
+ +	 * file.  We can't tell the filesystem to free it because we can't
+ +	 * take i_mutex here.  In the worst case, the file still has blocks
+ +	 * allocated past the end of the file.
+ +	 */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (unlikely(vmf->pgoff >= size)) {
+ +		error = -EIO;
+ +		goto out;
+ +	}
+  
+  	if (dax_map_atomic(bdev, &dax) < 0) {
+  		error = PTR_ERR(dax.addr);
+  		goto out;
+  	}
+ +
+ +	if (buffer_unwritten(bh) || buffer_new(bh)) {
+ +		clear_pmem(dax.addr, PAGE_SIZE);
+ +	}
+  	dax_unmap_atomic(bdev, &dax);
+  
+- 	error = dax_radix_entry(mapping, vmf->pgoff, dax.sector, false,
+- 			vmf->flags & FAULT_FLAG_WRITE);
+- 	if (error)
++ 	ret = dax_insert_mapping_entry(mapping, vmf, entry, dax.sector);
++ 	if (IS_ERR(ret)) {
++ 		error = PTR_ERR(ret);
+  		goto out;
++ 	}
++ 	*entryp = ret;
+  
+  	error = vm_insert_mixed(vma, vaddr, dax.pfn);
+- 
+   out:
+++<<<<<<< HEAD
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+ +
+++=======
++ 	i_mmap_unlock_read(mapping);
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  	return error;
+  }
+  
+@@@ -657,27 -862,10 +984,34 @@@ int __dax_fault(struct vm_area_struct *
+  	bh.b_bdev = inode->i_sb->s_bdev;
+  	bh.b_size = PAGE_SIZE;
+  
+++<<<<<<< HEAD
+ + repeat:
+ +	page = find_get_page(mapping, vmf->pgoff);
+ +	if (page) {
+ +		if (!lock_page_or_retry(page, vma->vm_mm, vmf->flags)) {
+ +			page_cache_release(page);
+ +			return VM_FAULT_RETRY;
+ +		}
+ +		if (unlikely(page->mapping != mapping)) {
+ +			unlock_page(page);
+ +			page_cache_release(page);
+ +			goto repeat;
+ +		}
+ +		size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +		if (unlikely(vmf->pgoff >= size)) {
+ +			/*
+ +			 * We have a struct page covering a hole in the file
+ +			 * from a read fault and we've raced with a truncate
+ +			 */
+ +			error = -EIO;
+ +			goto unlock_page;
+ +		}
+++=======
++ 	entry = grab_mapping_entry(mapping, vmf->pgoff);
++ 	if (IS_ERR(entry)) {
++ 		error = PTR_ERR(entry);
++ 		goto out;
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  	}
+  
+  	error = get_block(inode, block, &bh, 0);
+@@@ -708,53 -881,37 +1027,86 @@@
+  		else
+  			clear_user_highpage(new_page, vaddr);
+  		if (error)
+++<<<<<<< HEAD
+ +			goto unlock_page;
+ +		vmf->page = page;
+ +		if (!page) {
+ +			mutex_lock(&mapping->i_mmap_mutex);
+ +			/* Check we didn't race with truncate */
+ +			size = (i_size_read(inode) + PAGE_SIZE - 1) >>
+ +								PAGE_SHIFT;
+ +			if (vmf->pgoff >= size) {
+ +				mutex_unlock(&mapping->i_mmap_mutex);
+ +				error = -EIO;
+ +				goto out;
+ +			}
+++=======
++ 			goto unlock_entry;
++ 		if (!radix_tree_exceptional_entry(entry)) {
++ 			vmf->page = entry;
++ 		} else {
++ 			unlock_mapping_entry(mapping, vmf->pgoff);
++ 			i_mmap_lock_read(mapping);
++ 			vmf->page = NULL;
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  		}
+  		return VM_FAULT_LOCKED;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Check we didn't race with a read fault installing a new page */
+ +	if (!page && major)
+ +		page = find_lock_page(mapping, vmf->pgoff);
+ +
+ +	if (page) {
+ +		unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
+ +							PAGE_CACHE_SIZE, 0);
+ +		delete_from_page_cache(page);
+ +		unlock_page(page);
+ +		page_cache_release(page);
+ +		page = NULL;
+ +	}
+ +
+ +	/*
+ +	 * If we successfully insert the new mapping over an unwritten extent,
+ +	 * we need to ensure we convert the unwritten extent. If there is an
+ +	 * error inserting the mapping, the filesystem needs to leave it as
+ +	 * unwritten to prevent exposure of the stale underlying data to
+ +	 * userspace, but we still need to call the completion function so
+ +	 * the private resources on the mapping buffer can be released. We
+ +	 * indicate what the callback should do via the uptodate variable, same
+ +	 * as for normal BH based IO completions.
+ +	 */
+ +	error = dax_insert_mapping(inode, &bh, vma, vmf);
+ +	if (buffer_unwritten(&bh)) {
+ +		if (complete_unwritten)
+ +			complete_unwritten(&bh, !error);
+ +		else
+ +			WARN_ON_ONCE(!(vmf->flags & FAULT_FLAG_WRITE));
+ +	}
+ +
+++=======
++ 	if (!buffer_mapped(&bh)) {
++ 		if (vmf->flags & FAULT_FLAG_WRITE) {
++ 			error = get_block(inode, block, &bh, 1);
++ 			count_vm_event(PGMAJFAULT);
++ 			mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
++ 			major = VM_FAULT_MAJOR;
++ 			if (!error && (bh.b_size < PAGE_SIZE))
++ 				error = -EIO;
++ 			if (error)
++ 				goto unlock_entry;
++ 		} else {
++ 			return dax_load_hole(mapping, entry, vmf);
++ 		}
++ 	}
++ 
++ 	/* Filesystem should not return unwritten buffers to us! */
++ 	WARN_ON_ONCE(buffer_unwritten(&bh) || buffer_new(&bh));
++ 	error = dax_insert_mapping(mapping, &bh, &entry, vma, vmf);
++  unlock_entry:
++ 	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+   out:
+  	if (error == -ENOMEM)
+  		return VM_FAULT_OOM | major;
+@@@ -762,13 -919,6 +1114,16 @@@
+  	if ((error < 0) && (error != -EBUSY))
+  		return VM_FAULT_SIGBUS | major;
+  	return VM_FAULT_NOPAGE | major;
+++<<<<<<< HEAD
+ +
+ + unlock_page:
+ +	if (page) {
+ +		unlock_page(page);
+ +		page_cache_release(page);
+ +	}
+ +	goto out;
+++=======
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  }
+  EXPORT_SYMBOL(__dax_fault);
+  
+@@@ -820,10 -987,10 +1175,10 @@@ int __dax_pmd_fault(struct vm_area_stru
+  	struct block_device *bdev;
+  	pgoff_t size, pgoff;
+  	sector_t block;
+- 	int error, result = 0;
++ 	int result = 0;
+  	bool alloc = false;
+  
+ -	/* dax pmd mappings require pfn_t_devmap() */
+ +	/* dax pmd mappings are broken wrt gup and fork */
+  	if (!IS_ENABLED(CONFIG_FS_DAX_PMD))
+  		return VM_FAULT_FALLBACK;
+  
+@@@ -974,12 -1134,17 +1329,19 @@@
+  		 * the write to insert a dirty entry.
+  		 */
+  		if (write) {
+++<<<<<<< HEAD
+ +			error = dax_radix_entry(mapping, pgoff, dax.sector,
+ +					true, true);
+ +			if (error)
+ +				goto fallback;
+++=======
++ 			/*
++ 			 * We should insert radix-tree entry and dirty it here.
++ 			 * For now this is broken...
++ 			 */
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  		}
+  
+ -		dev_dbg(part_to_dev(bdev->bd_part),
+ -				"%s: %s addr: %lx pfn: %lx sect: %llx\n",
+ -				__func__, current->comm, address,
+ -				pfn_t_to_pfn(dax.pfn),
+ -				(unsigned long long) dax.sector);
+  		result |= vmf_insert_pfn_pmd(vma, address, pmd,
+  				dax.pfn, write);
+  	}
+diff --cc include/linux/dax.h
+index 7ccafd8f7b0c,756625c6d0dd..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,16 -6,18 +6,24 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+ -/* We use lowest available exceptional entry bit for locking */
+ -#define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -
+ -ssize_t dax_do_io(struct kiocb *, struct inode *, struct iov_iter *, loff_t,
+ -		  get_block_t, dio_iodone_t, int flags);
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_clear_sectors(struct block_device *bdev, sector_t _sector, long _size);
+  int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+  int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+++<<<<<<< HEAD
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+ +int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+++=======
++ int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
++ int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
++ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
++ void dax_wake_mapping_entry_waiter(struct address_space *mapping,
++ 				   pgoff_t index, bool wake_all);
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  
+  #ifdef CONFIG_FS_DAX
+  struct page *read_dax_sector(struct block_device *bdev, sector_t n);
+diff --cc mm/truncate.c
+index 8c90be16c1d6,4064f8f53daa..000000000000
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@@ -34,39 -34,38 +34,70 @@@ static void clear_exceptional_entry(str
+  	if (shmem_mapping(mapping))
+  		return;
+  
+- 	spin_lock_irq(&mapping->tree_lock);
+- 
+  	if (dax_mapping(mapping)) {
+++<<<<<<< HEAD
+ +		if (radix_tree_delete_item(&mapping->page_tree, index, entry))
+ +			mapping->nrexceptional--;
+ +	} else {
+ +		/*
+ +		 * Regular page slots are stabilized by the page lock even
+ +		 * without the tree itself locked.  These unlocked entries
+ +		 * need verification under the tree lock.
+ +		 */
+ +		if (!__radix_tree_lookup(&mapping->page_tree, index, &node,
+ +					&slot))
+ +			goto unlock;
+ +		if (*slot != entry)
+ +			goto unlock;
+ +		radix_tree_replace_slot(slot, NULL);
+ +		mapping->nrexceptional--;
+ +		if (!node)
+ +			goto unlock;
+ +		workingset_node_shadows_dec(node);
+ +		/*
+ +		 * Don't track node without shadow entries.
+ +		 *
+ +		 * Avoid acquiring the list_lru lock if already untracked.
+ +		 * The list_empty() test is safe as node->private_list is
+ +		 * protected by mapping->tree_lock.
+ +		 */
+ +		if (!workingset_node_shadows(node) &&
+ +		    !list_empty(&node->private_list))
+ +			workingset_forget_node(node);
+ +		__radix_tree_delete_node(&mapping->page_tree, node);
+++=======
++ 		dax_delete_mapping_entry(mapping, index);
++ 		return;
+++>>>>>>> ac401cc78242 (dax: New fault locking)
+  	}
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	/*
++ 	 * Regular page slots are stabilized by the page lock even
++ 	 * without the tree itself locked.  These unlocked entries
++ 	 * need verification under the tree lock.
++ 	 */
++ 	if (!__radix_tree_lookup(&mapping->page_tree, index, &node,
++ 				&slot))
++ 		goto unlock;
++ 	if (*slot != entry)
++ 		goto unlock;
++ 	radix_tree_replace_slot(slot, NULL);
++ 	mapping->nrexceptional--;
++ 	if (!node)
++ 		goto unlock;
++ 	workingset_node_shadows_dec(node);
++ 	/*
++ 	 * Don't track node without shadow entries.
++ 	 *
++ 	 * Avoid acquiring the list_lru lock if already untracked.
++ 	 * The list_empty() test is safe as node->private_list is
++ 	 * protected by mapping->tree_lock.
++ 	 */
++ 	if (!workingset_node_shadows(node) &&
++ 	    !list_empty(&node->private_list))
++ 		list_lru_del(&workingset_shadow_nodes,
++ 				&node->private_list);
++ 	__radix_tree_delete_node(&mapping->page_tree, node);
+  unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+  }
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 786c44f9a3cd..1c1c93f89af6 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -158,13 +158,15 @@ static void page_cache_tree_delete(struct address_space *mapping,
+ 			return;
+ 
+ 	/*
+-	 * Track node that only contains shadow entries.
++	 * Track node that only contains shadow entries. DAX mappings contain
++	 * no shadow entries and may contain other exceptional entries so skip
++	 * those.
+ 	 *
+ 	 * Avoid acquiring the list_lru lock if already tracked.  The
+ 	 * list_empty() test is safe as node->private_list is
+ 	 * protected by mapping->tree_lock.
+ 	 */
+-	if (!workingset_node_pages(node) &&
++	if (!dax_mapping(mapping) && !workingset_node_pages(node) &&
+ 	    list_empty(&node->private_list)) {
+ 		node->private_data = mapping;
+ 		workingset_remember_node(node);
+@@ -575,6 +577,9 @@ static int page_cache_tree_insert(struct address_space *mapping,
+ 			/* DAX accounts exceptional entries as normal pages */
+ 			if (node)
+ 				workingset_node_pages_dec(node);
++			/* Wakeup waiters for exceptional entry lock */
++			dax_wake_mapping_entry_waiter(mapping, page->index,
++						      false);
+ 		}
+ 	}
+ 	radix_tree_replace_slot(slot, page);
+* Unmerged path mm/truncate.c
