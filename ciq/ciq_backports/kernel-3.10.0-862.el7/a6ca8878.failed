@@ -1,0 +1,595 @@
+qla2xxx: delay plogi/prli ack until existing sessions are deleted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexei Potashnik <alexei@purestorage.com>
+commit a6ca88780dd66b0700d89419abd17b6b4bb49483
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a6ca8878.failed
+
+- keep qla_tgt_sess object on the session list until it's freed
+
+- modify use of sess->deleted flag to differentiate delayed
+  session deletion that can be cancelled from irreversible one:
+  QLA_SESS_DELETION_PENDING vs QLA_SESS_DELETION_IN_PROGRESS
+
+- during IN_PROGRESS deletion all newly arrived commands and TMRs will
+  be rejected, existing commands and TMRs will be terminated when
+  given by the core to the fabric or simply dropped if session logout
+  has already happened (logout terminates all existing exchanges)
+
+- new PLOGI will initiate deletion of the following sessions
+  (unless deletion is already IN_PROGRESS):
+  - with the same port_name (with logout)
+  - different port_name, different loop_id but the same port_id
+    (with logout)
+  - different port_name, different port_id, but the same loop_id
+    (without logout)
+
+- additionally each new PLOGI will store imm notify iocb in the
+  same port_name session being deleted. When deletion process
+  completes this iocb will be acked. Only the most recent PLOGI
+  iocb is stored. The older ones will be terminated when replaced.
+
+- new PRLI will initiate deletion of the following sessions
+  (unless deletion is already IN_PROGRESS):
+  - different port_name, different port_id, but the same loop_id
+   (without logout)
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Acked-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit a6ca88780dd66b0700d89419abd17b6b4bb49483)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 866e7a991a8e,05793b7199a4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -68,11 -66,11 +68,17 @@@
+   * |                              |                    | 0xd02a,0xd02e	|
+   * |                              |                    | 0xd031-0xd0ff	|
+   * |                              |                    | 0xd101-0xd1fe	|
+++<<<<<<< HEAD
+ + * |                              |                    | 0xd213-0xd2fe	|
+ + * | Target Mode		  |	  0xe070       | 0xe021		|
+ + * | Target Mode Management	  |	  0xf072       | 0xf002-0xf003	|
+++=======
++  * |                              |                    | 0xd214-0xd2fe	|
++  * | Target Mode		  |	  0xe080       |		|
++  * | Target Mode Management	  |	  0xf091       | 0xf002		|
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+   * |                              |                    | 0xf046-0xf049  |
+-  * | Target Mode Task Management  |	  0x1000b      |		|
++  * | Target Mode Task Management  |	  0x1000d      |		|
+   * ----------------------------------------------------------------------
+   */
+  
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,acb2a50d3c55..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -101,6 -108,16 +101,19 @@@ static void qlt_send_term_exchange(stru
+  	*cmd, struct atio_from_isp *atio, int ha_locked);
+  static void qlt_reject_free_srr_imm(struct scsi_qla_host *ha,
+  	struct qla_tgt_srr_imm *imm, int ha_lock);
+++<<<<<<< HEAD
+++=======
++ static void qlt_abort_cmd_on_host_reset(struct scsi_qla_host *vha,
++ 	struct qla_tgt_cmd *cmd);
++ static void qlt_alloc_qfull_cmd(struct scsi_qla_host *vha,
++ 	struct atio_from_isp *atio, uint16_t status, int qfull);
++ static void qlt_disable_vha(struct scsi_qla_host *vha);
++ static void qlt_clear_tgt_db(struct qla_tgt *tgt);
++ static void qlt_send_notify_ack(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *ntfy,
++ 	uint32_t add_flags, uint16_t resp_code, int resp_code_valid,
++ 	uint16_t srr_flags, uint16_t srr_reject_code, uint8_t srr_explan);
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+  /*
+   * Global Variables
+   */
+@@@ -463,15 -577,15 +544,15 @@@ static void qlt_schedule_sess_for_delet
+  
+  	ql_dbg(ql_dbg_tgt, sess->vha, 0xe048,
+  	    "qla_target(%d): session for port %8phC (loop ID %d) scheduled for "
+- 	    "deletion in %u secs (expires: %lu) immed: %d\n",
++ 	    "deletion in %u secs (expires: %lu) immed: %d, logout: %d\n",
+  	    sess->vha->vp_idx, sess->port_name, sess->loop_id, dev_loss_tmo,
+- 	    sess->expires, immediate);
++ 	    sess->expires, immediate, sess->logout_on_delete);
+  
+  	if (immediate)
+- 		schedule_delayed_work(&tgt->sess_del_work, 0);
++ 		mod_delayed_work(system_wq, &tgt->sess_del_work, 0);
+  	else
+  		schedule_delayed_work(&tgt->sess_del_work,
+ -		    sess->expires - jiffies);
+ +		    jiffies - sess->expires);
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -652,47 -670,20 +733,55 @@@ static void qlt_del_sess_work_fn(struc
+  	while (!list_empty(&tgt->del_sess_list)) {
+  		sess = list_entry(tgt->del_sess_list.next, typeof(*sess),
+  		    del_list_entry);
+++<<<<<<< HEAD
+ +		if (time_after_eq(jiffies, sess->expires)) {
+ +			bool cancel;
+ +
+ +			qlt_undelete_sess(sess);
+++=======
++ 		elapsed = jiffies;
++ 		if (time_after_eq(elapsed, sess->expires)) {
++ 			/* No turning back */
++ 			list_del_init(&sess->del_list_entry);
++ 			sess->deleted = QLA_SESS_DELETION_IN_PROGRESS;
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+ +
+ +			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +			cancel = qlt_check_fcport_exist(vha, sess);
+ +
+ +			if (cancel) {
+ +				if (sess->deleted) {
+ +					/*
+ +					 * sess was again deleted while we were
+ +					 * discovering it
+ +					 */
+ +					spin_lock_irqsave(&ha->hardware_lock,
+ +					    flags);
+ +					continue;
+ +				}
+ +
+ +				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf049,
+ +				    "qla_target(%d): cancel deletion of "
+ +				    "session for port %02x:%02x:%02x:%02x:%02x:"
+ +				    "%02x:%02x:%02x (loop ID %d), because "
+ +				    " it isn't deleted by firmware",
+ +				    vha->vp_idx, sess->port_name[0],
+ +				    sess->port_name[1], sess->port_name[2],
+ +				    sess->port_name[3], sess->port_name[4],
+ +				    sess->port_name[5], sess->port_name[6],
+ +				    sess->port_name[7], sess->loop_id);
+ +			} else {
+ +				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf004,
+ +				    "Timeout: sess %p about to be deleted\n",
+ +				    sess);
+ +				ha->tgt.tgt_ops->shutdown_sess(sess);
+ +				ha->tgt.tgt_ops->put_sess(sess);
+ +			}
+  
+ -			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf004,
+ -			    "Timeout: sess %p about to be deleted\n",
+ -			    sess);
+ -			ha->tgt.tgt_ops->shutdown_sess(sess);
+ -			ha->tgt.tgt_ops->put_sess(sess);
+ +			spin_lock_irqsave(&ha->hardware_lock, flags);
+  		} else {
+  			schedule_delayed_work(&tgt->sess_del_work,
+ -			    sess->expires - elapsed);
+ +			    jiffies - sess->expires);
+  			break;
+  		}
+  	}
+@@@ -826,11 -835,15 +930,15 @@@ void qlt_fc_port_added(struct scsi_qla_
+  	if (!sess) {
+  		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  
+ -		mutex_lock(&vha->vha_tgt.tgt_mutex);
+ +		mutex_lock(&ha->tgt.tgt_mutex);
+  		sess = qlt_create_sess(vha, fcport, false);
+ -		mutex_unlock(&vha->vha_tgt.tgt_mutex);
+ +		mutex_unlock(&ha->tgt.tgt_mutex);
+  
+  		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 	} else if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
++ 		/* Point of no return */
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		return;
+  	} else {
+  		kref_get(&sess->se_sess->sess_kref);
+  
+@@@ -2162,6 -2638,22 +2283,25 @@@ int qlt_rdy_to_xfer(struct qla_tgt_cmd 
+  
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (qla2x00_reset_active(vha) || (cmd->reset_count != ha->chip_reset) ||
++ 	    (cmd->sess && cmd->sess->deleted == QLA_SESS_DELETION_IN_PROGRESS)) {
++ 		/*
++ 		 * Either a chip reset is active or this request was from
++ 		 * previous life, just abort the processing.
++ 		 */
++ 		cmd->state = QLA_TGT_STATE_NEED_DATA;
++ 		qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
++ 		ql_dbg(ql_dbg_async, vha, 0xe102,
++ 			"RESET-XFR active/old-count/new-count = %d/%d/%d.\n",
++ 			qla2x00_reset_active(vha), cmd->reset_count,
++ 			ha->chip_reset);
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		return 0;
++ 	}
++ 
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+  	/* Does F/W have an IOCBs for this request */
+  	res = qlt_check_reserve_free_req(vha, prm.req_cnt);
+  	if (res != 0)
+@@@ -2194,6 -2694,225 +2334,89 @@@ out_unlock_free_unmap
+  EXPORT_SYMBOL(qlt_rdy_to_xfer);
+  
+  
+ -/*
+ - * Checks the guard or meta-data for the type of error
+ - * detected by the HBA.
+ - */
+ -static inline int
+ -qlt_handle_dif_error(struct scsi_qla_host *vha, struct qla_tgt_cmd *cmd,
+ -		struct ctio_crc_from_fw *sts)
+ -{
+ -	uint8_t		*ap = &sts->actual_dif[0];
+ -	uint8_t		*ep = &sts->expected_dif[0];
+ -	uint32_t	e_ref_tag, a_ref_tag;
+ -	uint16_t	e_app_tag, a_app_tag;
+ -	uint16_t	e_guard, a_guard;
+ -	uint64_t	lba = cmd->se_cmd.t_task_lba;
+ -
+ -	a_guard   = be16_to_cpu(*(uint16_t *)(ap + 0));
+ -	a_app_tag = be16_to_cpu(*(uint16_t *)(ap + 2));
+ -	a_ref_tag = be32_to_cpu(*(uint32_t *)(ap + 4));
+ -
+ -	e_guard   = be16_to_cpu(*(uint16_t *)(ep + 0));
+ -	e_app_tag = be16_to_cpu(*(uint16_t *)(ep + 2));
+ -	e_ref_tag = be32_to_cpu(*(uint32_t *)(ep + 4));
+ -
+ -	ql_dbg(ql_dbg_tgt, vha, 0xe075,
+ -	    "iocb(s) %p Returned STATUS.\n", sts);
+ -
+ -	ql_dbg(ql_dbg_tgt, vha, 0xf075,
+ -	    "dif check TGT cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x]\n",
+ -	    cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
+ -	    a_ref_tag, e_ref_tag, a_app_tag, e_app_tag, a_guard, e_guard);
+ -
+ -	/*
+ -	 * Ignore sector if:
+ -	 * For type     3: ref & app tag is all 'f's
+ -	 * For type 0,1,2: app tag is all 'f's
+ -	 */
+ -	if ((a_app_tag == 0xffff) &&
+ -	    ((cmd->se_cmd.prot_type != TARGET_DIF_TYPE3_PROT) ||
+ -	     (a_ref_tag == 0xffffffff))) {
+ -		uint32_t blocks_done;
+ -
+ -		/* 2TB boundary case covered automatically with this */
+ -		blocks_done = e_ref_tag - (uint32_t)lba + 1;
+ -		cmd->se_cmd.bad_sector = e_ref_tag;
+ -		cmd->se_cmd.pi_err = 0;
+ -		ql_dbg(ql_dbg_tgt, vha, 0xf074,
+ -			"need to return scsi good\n");
+ -
+ -		/* Update protection tag */
+ -		if (cmd->prot_sg_cnt) {
+ -			uint32_t i, j = 0, k = 0, num_ent;
+ -			struct scatterlist *sg, *sgl;
+ -
+ -
+ -			sgl = cmd->prot_sg;
+ -
+ -			/* Patch the corresponding protection tags */
+ -			for_each_sg(sgl, sg, cmd->prot_sg_cnt, i) {
+ -				num_ent = sg_dma_len(sg) / 8;
+ -				if (k + num_ent < blocks_done) {
+ -					k += num_ent;
+ -					continue;
+ -				}
+ -				j = blocks_done - k - 1;
+ -				k = blocks_done;
+ -				break;
+ -			}
+ -
+ -			if (k != blocks_done) {
+ -				ql_log(ql_log_warn, vha, 0xf076,
+ -				    "unexpected tag values tag:lba=%u:%llu)\n",
+ -				    e_ref_tag, (unsigned long long)lba);
+ -				goto out;
+ -			}
+ -
+ -#if 0
+ -			struct sd_dif_tuple *spt;
+ -			/* TODO:
+ -			 * This section came from initiator. Is it valid here?
+ -			 * should ulp be override with actual val???
+ -			 */
+ -			spt = page_address(sg_page(sg)) + sg->offset;
+ -			spt += j;
+ -
+ -			spt->app_tag = 0xffff;
+ -			if (cmd->se_cmd.prot_type == SCSI_PROT_DIF_TYPE3)
+ -				spt->ref_tag = 0xffffffff;
+ -#endif
+ -		}
+ -
+ -		return 0;
+ -	}
+ -
+ -	/* check guard */
+ -	if (e_guard != a_guard) {
+ -		cmd->se_cmd.pi_err = TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED;
+ -		cmd->se_cmd.bad_sector = cmd->se_cmd.t_task_lba;
+ -
+ -		ql_log(ql_log_warn, vha, 0xe076,
+ -		    "Guard ERR: cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x] cmd=%p\n",
+ -		    cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
+ -		    a_ref_tag, e_ref_tag, a_app_tag, e_app_tag,
+ -		    a_guard, e_guard, cmd);
+ -		goto out;
+ -	}
+ -
+ -	/* check ref tag */
+ -	if (e_ref_tag != a_ref_tag) {
+ -		cmd->se_cmd.pi_err = TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED;
+ -		cmd->se_cmd.bad_sector = e_ref_tag;
+ -
+ -		ql_log(ql_log_warn, vha, 0xe077,
+ -			"Ref Tag ERR: cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x] cmd=%p\n",
+ -			cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
+ -			a_ref_tag, e_ref_tag, a_app_tag, e_app_tag,
+ -			a_guard, e_guard, cmd);
+ -		goto out;
+ -	}
+ -
+ -	/* check appl tag */
+ -	if (e_app_tag != a_app_tag) {
+ -		cmd->se_cmd.pi_err = TCM_LOGICAL_BLOCK_APP_TAG_CHECK_FAILED;
+ -		cmd->se_cmd.bad_sector = cmd->se_cmd.t_task_lba;
+ -
+ -		ql_log(ql_log_warn, vha, 0xe078,
+ -			"App Tag ERR: cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x] cmd=%p\n",
+ -			cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
+ -			a_ref_tag, e_ref_tag, a_app_tag, e_app_tag,
+ -			a_guard, e_guard, cmd);
+ -		goto out;
+ -	}
+ -out:
+ -	return 1;
+ -}
+ -
+ -
++ /* If hardware_lock held on entry, might drop it, then reaquire */
++ /* This function sends the appropriate CTIO to ISP 2xxx or 24xx */
++ static int __qlt_send_term_imm_notif(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *ntfy)
++ {
++ 	struct nack_to_isp *nack;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	request_t *pkt;
++ 	int ret = 0;
++ 
++ 	ql_dbg(ql_dbg_tgt_tmr, vha, 0xe01c,
++ 	    "Sending TERM ELS CTIO (ha=%p)\n", ha);
++ 
++ 	pkt = (request_t *)qla2x00_alloc_iocbs_ready(vha, NULL);
++ 	if (pkt == NULL) {
++ 		ql_dbg(ql_dbg_tgt, vha, 0xe080,
++ 		    "qla_target(%d): %s failed: unable to allocate "
++ 		    "request packet\n", vha->vp_idx, __func__);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	pkt->entry_type = NOTIFY_ACK_TYPE;
++ 	pkt->entry_count = 1;
++ 	pkt->handle = QLA_TGT_SKIP_HANDLE | CTIO_COMPLETION_HANDLE_MARK;
++ 
++ 	nack = (struct nack_to_isp *)pkt;
++ 	nack->ox_id = ntfy->ox_id;
++ 
++ 	nack->u.isp24.nport_handle = ntfy->u.isp24.nport_handle;
++ 	if (le16_to_cpu(ntfy->u.isp24.status) == IMM_NTFY_ELS) {
++ 		nack->u.isp24.flags = ntfy->u.isp24.flags &
++ 			__constant_cpu_to_le32(NOTIFY24XX_FLAGS_PUREX_IOCB);
++ 	}
++ 
++ 	/* terminate */
++ 	nack->u.isp24.flags |=
++ 		__constant_cpu_to_le16(NOTIFY_ACK_FLAGS_TERMINATE);
++ 
++ 	nack->u.isp24.srr_rx_id = ntfy->u.isp24.srr_rx_id;
++ 	nack->u.isp24.status = ntfy->u.isp24.status;
++ 	nack->u.isp24.status_subcode = ntfy->u.isp24.status_subcode;
++ 	nack->u.isp24.fw_handle = ntfy->u.isp24.fw_handle;
++ 	nack->u.isp24.exchange_address = ntfy->u.isp24.exchange_address;
++ 	nack->u.isp24.srr_rel_offs = ntfy->u.isp24.srr_rel_offs;
++ 	nack->u.isp24.srr_ui = ntfy->u.isp24.srr_ui;
++ 	nack->u.isp24.vp_index = ntfy->u.isp24.vp_index;
++ 
++ 	qla2x00_start_iocbs(vha, vha->req);
++ 	return ret;
++ }
++ 
++ static void qlt_send_term_imm_notif(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *imm, int ha_locked)
++ {
++ 	unsigned long flags = 0;
++ 	int rc;
++ 
++ 	if (qlt_issue_marker(vha, ha_locked) < 0)
++ 		return;
++ 
++ 	if (ha_locked) {
++ 		rc = __qlt_send_term_imm_notif(vha, imm);
++ 
++ #if 0	/* Todo  */
++ 		if (rc == -ENOMEM)
++ 			qlt_alloc_qfull_cmd(vha, imm, 0, 0);
++ #endif
++ 		goto done;
++ 	}
++ 
++ 	spin_lock_irqsave(&vha->hw->hardware_lock, flags);
++ 	rc = __qlt_send_term_imm_notif(vha, imm);
++ 
++ #if 0	/* Todo */
++ 	if (rc == -ENOMEM)
++ 		qlt_alloc_qfull_cmd(vha, imm, 0, 0);
++ #endif
++ 
++ done:
++ 	if (!ha_locked)
++ 		spin_unlock_irqrestore(&vha->hw->hardware_lock, flags);
++ }
++ 
+  /* If hardware_lock held on entry, might drop it, then reaquire */
+  /* This function sends the appropriate CTIO to ISP 2xxx or 24xx */
+  static int __qlt_send_term_exchange(struct scsi_qla_host *vha,
+@@@ -2961,9 -4066,23 +3278,27 @@@ qlt_find_sess_invalidate_other(struct q
+  static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+  	struct imm_ntfy_from_isp *iocb)
+  {
+++<<<<<<< HEAD
+ +	struct qla_hw_data *ha = vha->hw;
+++=======
++ 	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
++ 	struct qla_tgt_sess *sess = NULL;
++ 	uint64_t wwn;
++ 	port_id_t port_id;
++ 	uint16_t loop_id;
++ 	uint16_t wd3_lo;
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+  	int res = 0;
+  
++ 	wwn = wwn_to_u64(iocb->u.isp24.port_name);
++ 
++ 	port_id.b.domain = iocb->u.isp24.port_id[2];
++ 	port_id.b.area   = iocb->u.isp24.port_id[1];
++ 	port_id.b.al_pa  = iocb->u.isp24.port_id[0];
++ 	port_id.b.rsvd_1 = 0;
++ 
++ 	loop_id = le16_to_cpu(iocb->u.isp24.nport_handle);
++ 
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf026,
+  	    "qla_target(%d): Port ID: 0x%3phC ELS opcode: 0x%02x\n",
+  	    vha->vp_idx, iocb->u.isp24.port_id, iocb->u.isp24.status_subcode);
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,165efb5cc6c1..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -805,6 -888,21 +823,24 @@@ struct qla_tgt 
+  	struct list_head tgt_list_entry;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct qla_tgt_sess_op {
++ 	struct scsi_qla_host *vha;
++ 	struct atio_from_isp atio;
++ 	struct work_struct work;
++ 	struct list_head cmd_list;
++ 	bool aborted;
++ };
++ 
++ enum qla_sess_deletion {
++ 	QLA_SESS_DELETION_NONE		= 0,
++ 	QLA_SESS_DELETION_PENDING	= 1, /* hopefully we can get rid of
++ 					      * this one */
++ 	QLA_SESS_DELETION_IN_PROGRESS	= 2,
++ };
++ 
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+  /*
+   * Equivilant to IT Nexus (Initiator-Target)
+   */
+@@@ -1006,5 -1161,7 +1055,10 @@@ extern void qlt_stop_phase1(struct qla_
+  extern void qlt_stop_phase2(struct qla_tgt *);
+  extern irqreturn_t qla83xx_msix_atio_q(int, void *);
+  extern void qlt_83xx_iospace_config(struct qla_hw_data *);
+++<<<<<<< HEAD
+++=======
++ extern int qlt_free_qfull_cmds(struct scsi_qla_host *);
++ extern void qlt_logo_completion_handler(fc_port_t *, int);
+++>>>>>>> a6ca88780dd6 (qla2xxx: delay plogi/prli ack until existing sessions are deleted)
+  
+  #endif /* __QLA_TARGET_H */
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 9cf0dee11112..3c0830cdd6af 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -274,6 +274,7 @@
+ #define RESPONSE_ENTRY_CNT_FX00		256     /* Number of response entries.*/
+ 
+ struct req_que;
++struct qla_tgt_sess;
+ 
+ /*
+  * (sd.h is not exported, hence local inclusion)
+@@ -2052,6 +2053,7 @@ typedef struct fc_port {
+ 	uint16_t port_id;
+ 
+ 	unsigned long retry_delay_timestamp;
++	struct qla_tgt_sess *tgt_session;
+ } fc_port_t;
+ 
+ #include "qla_mr.h"
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index ea8080a1a353..29847587d2ab 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -115,6 +115,8 @@ qla2x00_async_iocb_timeout(void *data)
+ 			QLA_LOGIO_LOGIN_RETRIED : 0;
+ 		qla2x00_post_async_login_done_work(fcport->vha, fcport,
+ 			lio->u.logio.data);
++	} else if (sp->type == SRB_LOGOUT_CMD) {
++		qlt_logo_completion_handler(fcport, QLA_FUNCTION_TIMEOUT);
+ 	}
+ }
+ 
+@@ -501,7 +503,10 @@ void
+ qla2x00_async_logout_done(struct scsi_qla_host *vha, fc_port_t *fcport,
+     uint16_t *data)
+ {
+-	qla2x00_mark_device_lost(vha, fcport, 1, 0);
++	/* Don't re-login in target mode */
++	if (!fcport->tgt_session)
++		qla2x00_mark_device_lost(vha, fcport, 1, 0);
++	qlt_logo_completion_handler(fcport, data[0]);
+ 	return;
+ }
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_iocb.c b/drivers/scsi/qla2xxx/qla_iocb.c
+index 2aea13d9d71e..f1972511b97d 100644
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@ -2213,6 +2213,9 @@ qla24xx_logout_iocb(srb_t *sp, struct logio_entry_24xx *logio)
+ 	logio->entry_type = LOGINOUT_PORT_IOCB_TYPE;
+ 	logio->control_flags =
+ 	    cpu_to_le16(LCF_COMMAND_LOGO|LCF_IMPL_LOGO);
++	if (!sp->fcport->tgt_session ||
++	    !sp->fcport->tgt_session->keep_nport_handle)
++		logio->control_flags |= cpu_to_le16(LCF_FREE_NPORT);
+ 	logio->nport_handle = cpu_to_le16(sp->fcport->loop_id);
+ 	logio->port_id[0] = sp->fcport->d_id.b.al_pa;
+ 	logio->port_id[1] = sp->fcport->d_id.b.area;
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 8e939971fec1..dd39e7533a7b 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -1527,6 +1527,10 @@ static void tcm_qla2xxx_update_sess(struct qla_tgt_sess *sess, port_id_t s_id,
+ 	}
+ 
+ 	sess->conf_compl_supported = conf_compl_supported;
++
++	/* Reset logout parameters to default */
++	sess->logout_on_delete = 1;
++	sess->keep_nport_handle = 0;
+ }
+ 
+ /*
