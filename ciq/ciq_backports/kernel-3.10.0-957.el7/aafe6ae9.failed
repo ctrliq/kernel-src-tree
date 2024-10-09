@@ -1,0 +1,777 @@
+bpf: dynamically allocate digest scratch buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit aafe6ae9cee32df85eb5e8bb6dd1d918e6807b09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/aafe6ae9.failed
+
+Geert rightfully complained that 7bd509e311f4 ("bpf: add prog_digest
+and expose it via fdinfo/netlink") added a too large allocation of
+variable 'raw' from bss section, and should instead be done dynamically:
+
+  # ./scripts/bloat-o-meter kernel/bpf/core.o.1 kernel/bpf/core.o.2
+  add/remove: 3/0 grow/shrink: 0/0 up/down: 33291/0 (33291)
+  function                                     old     new   delta
+  raw                                            -   32832  +32832
+  [...]
+
+Since this is only relevant during program creation path, which can be
+considered slow-path anyway, lets allocate that dynamically and be not
+implicitly dependent on verifier mutex. Move bpf_prog_calc_digest() at
+the beginning of replace_map_fd_with_map_ptr() and also error handling
+stays straight forward.
+
+	Reported-by: Geert Uytterhoeven <geert@linux-m68k.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit aafe6ae9cee32df85eb5e8bb6dd1d918e6807b09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/filter.h
+#	kernel/bpf/core.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,201eb483c46f..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -97,20 -172,173 +97,178 @@@ struct bpf_prog_type_list 
+  	enum bpf_prog_type type;
+  };
+  
+ +void bpf_register_prog_type(struct bpf_prog_type_list *tl);
+ +
+ +struct bpf_prog;
+ +
+  struct bpf_prog_aux {
+  	atomic_t refcnt;
+ -	u32 used_map_cnt;
+ -	u32 max_ctx_offset;
+ -	const struct bpf_verifier_ops *ops;
+ +	bool is_gpl_compatible;
+ +	enum bpf_prog_type prog_type;
+ +	struct bpf_verifier_ops *ops;
+ +	u32 id;
+  	struct bpf_map **used_maps;
+ +	u32 used_map_cnt;
+  	struct bpf_prog *prog;
+ -	struct user_struct *user;
+ -	union {
+ -		struct work_struct work;
+ -		struct rcu_head	rcu;
+ -	};
+ +	struct work_struct work;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_array {
++ 	struct bpf_map map;
++ 	u32 elem_size;
++ 	/* 'ownership' of prog_array is claimed by the first program that
++ 	 * is going to use this map or by the first program which FD is stored
++ 	 * in the map to make sure that all callers and callees have the same
++ 	 * prog_type and JITed flag
++ 	 */
++ 	enum bpf_prog_type owner_prog_type;
++ 	bool owner_jited;
++ 	union {
++ 		char value[0] __aligned(8);
++ 		void *ptrs[0] __aligned(8);
++ 		void __percpu *pptrs[0] __aligned(8);
++ 	};
++ };
++ 
++ #define MAX_TAIL_CALL_CNT 32
++ 
++ struct bpf_event_entry {
++ 	struct perf_event *event;
++ 	struct file *perf_file;
++ 	struct file *map_file;
++ 	struct rcu_head rcu;
++ };
++ 
++ u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5);
++ u64 bpf_get_stackid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ 
++ bool bpf_prog_array_compatible(struct bpf_array *array, const struct bpf_prog *fp);
++ int bpf_prog_calc_digest(struct bpf_prog *fp);
++ 
++ const struct bpf_func_proto *bpf_get_trace_printk_proto(void);
++ 
++ typedef unsigned long (*bpf_ctx_copy_t)(void *dst, const void *src,
++ 					unsigned long off, unsigned long len);
++ 
++ u64 bpf_event_output(struct bpf_map *map, u64 flags, void *meta, u64 meta_size,
++ 		     void *ctx, u64 ctx_size, bpf_ctx_copy_t ctx_copy);
++ 
++ #ifdef CONFIG_BPF_SYSCALL
++ DECLARE_PER_CPU(int, bpf_prog_active);
++ 
++ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
++ void bpf_register_map_type(struct bpf_map_type_list *tl);
++ 
++ struct bpf_prog *bpf_prog_get(u32 ufd);
++ struct bpf_prog *bpf_prog_get_type(u32 ufd, enum bpf_prog_type type);
++ struct bpf_prog * __must_check bpf_prog_add(struct bpf_prog *prog, int i);
++ void bpf_prog_sub(struct bpf_prog *prog, int i);
++ struct bpf_prog * __must_check bpf_prog_inc(struct bpf_prog *prog);
++ void bpf_prog_put(struct bpf_prog *prog);
++ 
++ struct bpf_map *bpf_map_get_with_uref(u32 ufd);
++ struct bpf_map *__bpf_map_get(struct fd f);
++ struct bpf_map * __must_check bpf_map_inc(struct bpf_map *map, bool uref);
++ void bpf_map_put_with_uref(struct bpf_map *map);
++ void bpf_map_put(struct bpf_map *map);
++ int bpf_map_precharge_memlock(u32 pages);
++ 
++ extern int sysctl_unprivileged_bpf_disabled;
++ 
++ int bpf_map_new_fd(struct bpf_map *map);
++ int bpf_prog_new_fd(struct bpf_prog *prog);
++ 
++ int bpf_obj_pin_user(u32 ufd, const char __user *pathname);
++ int bpf_obj_get_user(const char __user *pathname);
++ 
++ int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value);
++ int bpf_percpu_array_copy(struct bpf_map *map, void *key, void *value);
++ int bpf_percpu_hash_update(struct bpf_map *map, void *key, void *value,
++ 			   u64 flags);
++ int bpf_percpu_array_update(struct bpf_map *map, void *key, void *value,
++ 			    u64 flags);
++ 
++ int bpf_stackmap_copy(struct bpf_map *map, void *key, void *value);
++ 
++ int bpf_fd_array_map_update_elem(struct bpf_map *map, struct file *map_file,
++ 				 void *key, void *value, u64 map_flags);
++ void bpf_fd_array_map_clear(struct bpf_map *map);
++ 
++ /* memcpy that is used with 8-byte aligned pointers, power-of-8 size and
++  * forced to use 'long' read/writes to try to atomically copy long counters.
++  * Best-effort only.  No barriers here, since it _will_ race with concurrent
++  * updates from BPF programs. Called from bpf syscall and mostly used with
++  * size 8 or 16 bytes, so ask compiler to inline it.
++  */
++ static inline void bpf_long_memcpy(void *dst, const void *src, u32 size)
++ {
++ 	const long *lsrc = src;
++ 	long *ldst = dst;
++ 
++ 	size /= sizeof(long);
++ 	while (size--)
++ 		*ldst++ = *lsrc++;
++ }
++ 
++ /* verify correctness of eBPF program */
++ int bpf_check(struct bpf_prog **fp, union bpf_attr *attr);
++ #else
++ static inline void bpf_register_prog_type(struct bpf_prog_type_list *tl)
++ {
++ }
++ 
++ static inline struct bpf_prog *bpf_prog_get(u32 ufd)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static inline struct bpf_prog *bpf_prog_get_type(u32 ufd,
++ 						 enum bpf_prog_type type)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ static inline struct bpf_prog * __must_check bpf_prog_add(struct bpf_prog *prog,
++ 							  int i)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static inline void bpf_prog_sub(struct bpf_prog *prog, int i)
++ {
++ }
++ 
++ static inline void bpf_prog_put(struct bpf_prog *prog)
++ {
++ }
++ 
++ static inline struct bpf_prog * __must_check bpf_prog_inc(struct bpf_prog *prog)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ #endif /* CONFIG_BPF_SYSCALL */
++ 
++ /* verifier prototypes for helper functions called from eBPF programs */
++ extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
++ extern const struct bpf_func_proto bpf_map_update_elem_proto;
++ extern const struct bpf_func_proto bpf_map_delete_elem_proto;
++ 
++ extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
++ extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
++ extern const struct bpf_func_proto bpf_get_numa_node_id_proto;
++ extern const struct bpf_func_proto bpf_tail_call_proto;
++ extern const struct bpf_func_proto bpf_ktime_get_ns_proto;
++ extern const struct bpf_func_proto bpf_get_current_pid_tgid_proto;
++ extern const struct bpf_func_proto bpf_get_current_uid_gid_proto;
++ extern const struct bpf_func_proto bpf_get_current_comm_proto;
++ extern const struct bpf_func_proto bpf_skb_vlan_push_proto;
++ extern const struct bpf_func_proto bpf_skb_vlan_pop_proto;
++ extern const struct bpf_func_proto bpf_get_stackid_proto;
++ 
++ /* Shared helpers among cBPF and eBPF. */
++ void bpf_user_rnd_init_once(void);
++ u64 bpf_user_rnd_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ 
+++>>>>>>> aafe6ae9cee3 (bpf: dynamically allocate digest scratch buffer)
+  #endif /* _LINUX_BPF_H */
+diff --cc include/linux/filter.h
+index d322ed880333,702314253797..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -4,20 -4,386 +4,380 @@@
+  #ifndef __LINUX_FILTER_H__
+  #define __LINUX_FILTER_H__
+  
+ -#include <stdarg.h>
+ -
+  #include <linux/atomic.h>
+  #include <linux/compat.h>
+ -#include <linux/skbuff.h>
+ -#include <linux/linkage.h>
+ -#include <linux/printk.h>
+ -#include <linux/workqueue.h>
+ -#include <linux/sched.h>
+ -#include <linux/capability.h>
+ -#include <linux/cryptohash.h>
+ -
+ -#include <net/sch_generic.h>
+ -
+ -#include <asm/cacheflush.h>
+ -
+  #include <uapi/linux/filter.h>
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +#include <net/sch_generic.h>
+ +#endif
+++=======
++ #include <uapi/linux/bpf.h>
++ 
++ struct sk_buff;
++ struct sock;
++ struct seccomp_data;
++ struct bpf_prog_aux;
++ 
++ /* ArgX, context and stack frame pointer register positions. Note,
++  * Arg1, Arg2, Arg3, etc are used as argument mappings of function
++  * calls in BPF_CALL instruction.
++  */
++ #define BPF_REG_ARG1	BPF_REG_1
++ #define BPF_REG_ARG2	BPF_REG_2
++ #define BPF_REG_ARG3	BPF_REG_3
++ #define BPF_REG_ARG4	BPF_REG_4
++ #define BPF_REG_ARG5	BPF_REG_5
++ #define BPF_REG_CTX	BPF_REG_6
++ #define BPF_REG_FP	BPF_REG_10
++ 
++ /* Additional register mappings for converted user programs. */
++ #define BPF_REG_A	BPF_REG_0
++ #define BPF_REG_X	BPF_REG_7
++ #define BPF_REG_TMP	BPF_REG_8
++ 
++ /* Kernel hidden auxiliary/helper register for hardening step.
++  * Only used by eBPF JITs. It's nothing more than a temporary
++  * register that JITs use internally, only that here it's part
++  * of eBPF instructions that have been rewritten for blinding
++  * constants. See JIT pre-step in bpf_jit_blind_constants().
++  */
++ #define BPF_REG_AX		MAX_BPF_REG
++ #define MAX_BPF_JIT_REG		(MAX_BPF_REG + 1)
++ 
++ /* BPF program can access up to 512 bytes of stack space. */
++ #define MAX_BPF_STACK	512
++ 
++ /* Helper macros for filter block array initializers. */
++ 
++ /* ALU ops on registers, bpf_add|sub|...: dst_reg += src_reg */
++ 
++ #define BPF_ALU64_REG(OP, DST, SRC)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU64 | BPF_OP(OP) | BPF_X,	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = 0 })
++ 
++ #define BPF_ALU32_REG(OP, DST, SRC)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU | BPF_OP(OP) | BPF_X,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = 0 })
++ 
++ /* ALU ops on immediates, bpf_add|sub|...: dst_reg += imm32 */
++ 
++ #define BPF_ALU64_IMM(OP, DST, IMM)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU64 | BPF_OP(OP) | BPF_K,	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ #define BPF_ALU32_IMM(OP, DST, IMM)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU | BPF_OP(OP) | BPF_K,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ /* Endianess conversion, cpu_to_{l,b}e(), {l,b}e_to_cpu() */
++ 
++ #define BPF_ENDIAN(TYPE, DST, LEN)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU | BPF_END | BPF_SRC(TYPE),	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = LEN })
++ 
++ /* Short form of mov, dst_reg = src_reg */
++ 
++ #define BPF_MOV64_REG(DST, SRC)					\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU64 | BPF_MOV | BPF_X,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = 0 })
++ 
++ #define BPF_MOV32_REG(DST, SRC)					\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU | BPF_MOV | BPF_X,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = 0 })
++ 
++ /* Short form of mov, dst_reg = imm32 */
++ 
++ #define BPF_MOV64_IMM(DST, IMM)					\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU64 | BPF_MOV | BPF_K,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ #define BPF_MOV32_IMM(DST, IMM)					\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU | BPF_MOV | BPF_K,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ /* BPF_LD_IMM64 macro encodes single 'load 64-bit immediate' insn */
++ #define BPF_LD_IMM64(DST, IMM)					\
++ 	BPF_LD_IMM64_RAW(DST, 0, IMM)
++ 
++ #define BPF_LD_IMM64_RAW(DST, SRC, IMM)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_LD | BPF_DW | BPF_IMM,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = (__u32) (IMM) }),			\
++ 	((struct bpf_insn) {					\
++ 		.code  = 0, /* zero is reserved opcode */	\
++ 		.dst_reg = 0,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = ((__u64) (IMM)) >> 32 })
++ 
++ /* pseudo BPF_LD_IMM64 insn used to refer to process-local map_fd */
++ #define BPF_LD_MAP_FD(DST, MAP_FD)				\
++ 	BPF_LD_IMM64_RAW(DST, BPF_PSEUDO_MAP_FD, MAP_FD)
++ 
++ /* Short form of mov based on type, BPF_X: dst_reg = src_reg, BPF_K: dst_reg = imm32 */
++ 
++ #define BPF_MOV64_RAW(TYPE, DST, SRC, IMM)			\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU64 | BPF_MOV | BPF_SRC(TYPE),	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ #define BPF_MOV32_RAW(TYPE, DST, SRC, IMM)			\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ALU | BPF_MOV | BPF_SRC(TYPE),	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ /* Direct packet access, R0 = *(uint *) (skb->data + imm32) */
++ 
++ #define BPF_LD_ABS(SIZE, IMM)					\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_LD | BPF_SIZE(SIZE) | BPF_ABS,	\
++ 		.dst_reg = 0,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ /* Indirect packet access, R0 = *(uint *) (skb->data + src_reg + imm32) */
++ 
++ #define BPF_LD_IND(SIZE, SRC, IMM)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_LD | BPF_SIZE(SIZE) | BPF_IND,	\
++ 		.dst_reg = 0,					\
++ 		.src_reg = SRC,					\
++ 		.off   = 0,					\
++ 		.imm   = IMM })
++ 
++ /* Memory load, dst_reg = *(uint *) (src_reg + off16) */
++ 
++ #define BPF_LDX_MEM(SIZE, DST, SRC, OFF)			\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_LDX | BPF_SIZE(SIZE) | BPF_MEM,	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = OFF,					\
++ 		.imm   = 0 })
++ 
++ /* Memory store, *(uint *) (dst_reg + off16) = src_reg */
++ 
++ #define BPF_STX_MEM(SIZE, DST, SRC, OFF)			\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_STX | BPF_SIZE(SIZE) | BPF_MEM,	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = OFF,					\
++ 		.imm   = 0 })
++ 
++ /* Atomic memory add, *(uint *)(dst_reg + off16) += src_reg */
++ 
++ #define BPF_STX_XADD(SIZE, DST, SRC, OFF)			\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_STX | BPF_SIZE(SIZE) | BPF_XADD,	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = OFF,					\
++ 		.imm   = 0 })
++ 
++ /* Memory store, *(uint *) (dst_reg + off16) = imm32 */
++ 
++ #define BPF_ST_MEM(SIZE, DST, OFF, IMM)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_ST | BPF_SIZE(SIZE) | BPF_MEM,	\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = OFF,					\
++ 		.imm   = IMM })
++ 
++ /* Conditional jumps against registers, if (dst_reg 'op' src_reg) goto pc + off16 */
++ 
++ #define BPF_JMP_REG(OP, DST, SRC, OFF)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_JMP | BPF_OP(OP) | BPF_X,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = OFF,					\
++ 		.imm   = 0 })
++ 
++ /* Conditional jumps against immediates, if (dst_reg 'op' imm32) goto pc + off16 */
++ 
++ #define BPF_JMP_IMM(OP, DST, IMM, OFF)				\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_JMP | BPF_OP(OP) | BPF_K,		\
++ 		.dst_reg = DST,					\
++ 		.src_reg = 0,					\
++ 		.off   = OFF,					\
++ 		.imm   = IMM })
++ 
++ /* Function call */
++ 
++ #define BPF_EMIT_CALL(FUNC)					\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_JMP | BPF_CALL,			\
++ 		.dst_reg = 0,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = ((FUNC) - __bpf_call_base) })
++ 
++ /* Raw code statement block */
++ 
++ #define BPF_RAW_INSN(CODE, DST, SRC, OFF, IMM)			\
++ 	((struct bpf_insn) {					\
++ 		.code  = CODE,					\
++ 		.dst_reg = DST,					\
++ 		.src_reg = SRC,					\
++ 		.off   = OFF,					\
++ 		.imm   = IMM })
++ 
++ /* Program exit */
++ 
++ #define BPF_EXIT_INSN()						\
++ 	((struct bpf_insn) {					\
++ 		.code  = BPF_JMP | BPF_EXIT,			\
++ 		.dst_reg = 0,					\
++ 		.src_reg = 0,					\
++ 		.off   = 0,					\
++ 		.imm   = 0 })
++ 
++ /* Internal classic blocks for direct assignment */
++ 
++ #define __BPF_STMT(CODE, K)					\
++ 	((struct sock_filter) BPF_STMT(CODE, K))
++ 
++ #define __BPF_JUMP(CODE, K, JT, JF)				\
++ 	((struct sock_filter) BPF_JUMP(CODE, K, JT, JF))
++ 
++ #define bytes_to_bpf_size(bytes)				\
++ ({								\
++ 	int bpf_size = -EINVAL;					\
++ 								\
++ 	if (bytes == sizeof(u8))				\
++ 		bpf_size = BPF_B;				\
++ 	else if (bytes == sizeof(u16))				\
++ 		bpf_size = BPF_H;				\
++ 	else if (bytes == sizeof(u32))				\
++ 		bpf_size = BPF_W;				\
++ 	else if (bytes == sizeof(u64))				\
++ 		bpf_size = BPF_DW;				\
++ 								\
++ 	bpf_size;						\
++ })
++ 
++ #define BPF_SIZEOF(type)					\
++ 	({							\
++ 		const int __size = bytes_to_bpf_size(sizeof(type)); \
++ 		BUILD_BUG_ON(__size < 0);			\
++ 		__size;						\
++ 	})
++ 
++ #define BPF_FIELD_SIZEOF(type, field)				\
++ 	({							\
++ 		const int __size = bytes_to_bpf_size(FIELD_SIZEOF(type, field)); \
++ 		BUILD_BUG_ON(__size < 0);			\
++ 		__size;						\
++ 	})
++ 
++ #define __BPF_MAP_0(m, v, ...) v
++ #define __BPF_MAP_1(m, v, t, a, ...) m(t, a)
++ #define __BPF_MAP_2(m, v, t, a, ...) m(t, a), __BPF_MAP_1(m, v, __VA_ARGS__)
++ #define __BPF_MAP_3(m, v, t, a, ...) m(t, a), __BPF_MAP_2(m, v, __VA_ARGS__)
++ #define __BPF_MAP_4(m, v, t, a, ...) m(t, a), __BPF_MAP_3(m, v, __VA_ARGS__)
++ #define __BPF_MAP_5(m, v, t, a, ...) m(t, a), __BPF_MAP_4(m, v, __VA_ARGS__)
++ 
++ #define __BPF_REG_0(...) __BPF_PAD(5)
++ #define __BPF_REG_1(...) __BPF_MAP(1, __VA_ARGS__), __BPF_PAD(4)
++ #define __BPF_REG_2(...) __BPF_MAP(2, __VA_ARGS__), __BPF_PAD(3)
++ #define __BPF_REG_3(...) __BPF_MAP(3, __VA_ARGS__), __BPF_PAD(2)
++ #define __BPF_REG_4(...) __BPF_MAP(4, __VA_ARGS__), __BPF_PAD(1)
++ #define __BPF_REG_5(...) __BPF_MAP(5, __VA_ARGS__)
++ 
++ #define __BPF_MAP(n, ...) __BPF_MAP_##n(__VA_ARGS__)
++ #define __BPF_REG(n, ...) __BPF_REG_##n(__VA_ARGS__)
++ 
++ #define __BPF_CAST(t, a)						       \
++ 	(__force t)							       \
++ 	(__force							       \
++ 	 typeof(__builtin_choose_expr(sizeof(t) == sizeof(unsigned long),      \
++ 				      (unsigned long)0, (t)0))) a
++ #define __BPF_V void
++ #define __BPF_N
++ 
++ #define __BPF_DECL_ARGS(t, a) t   a
++ #define __BPF_DECL_REGS(t, a) u64 a
++ 
++ #define __BPF_PAD(n)							       \
++ 	__BPF_MAP(n, __BPF_DECL_ARGS, __BPF_N, u64, __ur_1, u64, __ur_2,       \
++ 		  u64, __ur_3, u64, __ur_4, u64, __ur_5)
++ 
++ #define BPF_CALL_x(x, name, ...)					       \
++ 	static __always_inline						       \
++ 	u64 ____##name(__BPF_MAP(x, __BPF_DECL_ARGS, __BPF_V, __VA_ARGS__));   \
++ 	u64 name(__BPF_REG(x, __BPF_DECL_REGS, __BPF_N, __VA_ARGS__));	       \
++ 	u64 name(__BPF_REG(x, __BPF_DECL_REGS, __BPF_N, __VA_ARGS__))	       \
++ 	{								       \
++ 		return ____##name(__BPF_MAP(x,__BPF_CAST,__BPF_N,__VA_ARGS__));\
++ 	}								       \
++ 	static __always_inline						       \
++ 	u64 ____##name(__BPF_MAP(x, __BPF_DECL_ARGS, __BPF_V, __VA_ARGS__))
++ 
++ #define BPF_CALL_0(name, ...)	BPF_CALL_x(0, name, __VA_ARGS__)
++ #define BPF_CALL_1(name, ...)	BPF_CALL_x(1, name, __VA_ARGS__)
++ #define BPF_CALL_2(name, ...)	BPF_CALL_x(2, name, __VA_ARGS__)
++ #define BPF_CALL_3(name, ...)	BPF_CALL_x(3, name, __VA_ARGS__)
++ #define BPF_CALL_4(name, ...)	BPF_CALL_x(4, name, __VA_ARGS__)
++ #define BPF_CALL_5(name, ...)	BPF_CALL_x(5, name, __VA_ARGS__)
+++>>>>>>> aafe6ae9cee3 (bpf: dynamically allocate digest scratch buffer)
+  
+  #ifdef CONFIG_COMPAT
+ -/* A struct sock_filter is architecture independent. */
+ +/*
+ + * A struct sock_filter is architecture independent.
+ + */
+  struct compat_sock_fprog {
+  	u16		len;
+ -	compat_uptr_t	filter;	/* struct sock_filter * */
+ +	compat_uptr_t	filter;		/* struct sock_filter * */
+  };
+  #endif
+  
+@@@ -47,18 -442,127 +407,132 @@@ struct xdp_buff 
+  };
+  
+  /* compute the linear packet data range [data, data_end) which
+ - * will be accessed by cls_bpf, act_bpf and lwt programs
+ + * will be accessed by cls_bpf and act_bpf programs
+   */
+ -static inline void bpf_compute_data_end(struct sk_buff *skb)
+ +static inline unsigned int sk_filter_len(const struct sk_filter *fp)
+  {
+ -	struct bpf_skb_data_end *cb = (struct bpf_skb_data_end *)skb->cb;
+ +	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
+ +}
+  
+ -	BUILD_BUG_ON(sizeof(*cb) > FIELD_SIZEOF(struct sk_buff, cb));
+ -	cb->data_end = skb->data + skb_headlen(skb);
+ +static inline void bpf_compute_data_end(struct sk_buff *skb)
+ +{
+ +	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u8 *bpf_skb_cb(struct sk_buff *skb)
++ {
++ 	/* eBPF programs may read/write skb->cb[] area to transfer meta
++ 	 * data between tail calls. Since this also needs to work with
++ 	 * tc, that scratch memory is mapped to qdisc_skb_cb's data area.
++ 	 *
++ 	 * In some socket filter cases, the cb unfortunately needs to be
++ 	 * saved/restored so that protocol specific skb->cb[] data won't
++ 	 * be lost. In any case, due to unpriviledged eBPF programs
++ 	 * attached to sockets, we need to clear the bpf_skb_cb() area
++ 	 * to not leak previous contents to user space.
++ 	 */
++ 	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) != BPF_SKB_CB_LEN);
++ 	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) !=
++ 		     FIELD_SIZEOF(struct qdisc_skb_cb, data));
++ 
++ 	return qdisc_skb_cb(skb)->data;
++ }
++ 
++ static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
++ 				       struct sk_buff *skb)
++ {
++ 	u8 *cb_data = bpf_skb_cb(skb);
++ 	u8 cb_saved[BPF_SKB_CB_LEN];
++ 	u32 res;
++ 
++ 	if (unlikely(prog->cb_access)) {
++ 		memcpy(cb_saved, cb_data, sizeof(cb_saved));
++ 		memset(cb_data, 0, sizeof(cb_saved));
++ 	}
++ 
++ 	res = BPF_PROG_RUN(prog, skb);
++ 
++ 	if (unlikely(prog->cb_access))
++ 		memcpy(cb_data, cb_saved, sizeof(cb_saved));
++ 
++ 	return res;
++ }
++ 
++ static inline u32 bpf_prog_run_clear_cb(const struct bpf_prog *prog,
++ 					struct sk_buff *skb)
++ {
++ 	u8 *cb_data = bpf_skb_cb(skb);
++ 
++ 	if (unlikely(prog->cb_access))
++ 		memset(cb_data, 0, BPF_SKB_CB_LEN);
++ 
++ 	return BPF_PROG_RUN(prog, skb);
++ }
++ 
++ static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
++ 					    struct xdp_buff *xdp)
++ {
++ 	/* Caller needs to hold rcu_read_lock() (!), otherwise program
++ 	 * can be released while still running, or map elements could be
++ 	 * freed early while still having concurrent users. XDP fastpath
++ 	 * already takes rcu_read_lock() when fetching the program, so
++ 	 * it's not necessary here anymore.
++ 	 */
++ 	return BPF_PROG_RUN(prog, xdp);
++ }
++ 
++ static inline u32 bpf_prog_insn_size(const struct bpf_prog *prog)
++ {
++ 	return prog->len * sizeof(struct bpf_insn);
++ }
++ 
++ static inline u32 bpf_prog_digest_scratch_size(const struct bpf_prog *prog)
++ {
++ 	return round_up(bpf_prog_insn_size(prog) +
++ 			sizeof(__be64) + 1, SHA_MESSAGE_BYTES);
++ }
++ 
++ static inline unsigned int bpf_prog_size(unsigned int proglen)
++ {
++ 	return max(sizeof(struct bpf_prog),
++ 		   offsetof(struct bpf_prog, insns[proglen]));
++ }
++ 
++ static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
++ {
++ 	/* When classic BPF programs have been loaded and the arch
++ 	 * does not have a classic BPF JIT (anymore), they have been
++ 	 * converted via bpf_migrate_filter() to eBPF and thus always
++ 	 * have an unspec program type.
++ 	 */
++ 	return prog->type == BPF_PROG_TYPE_UNSPEC;
++ }
++ 
++ #define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
++ 
++ #ifdef CONFIG_DEBUG_SET_MODULE_RONX
++ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
++ {
++ 	set_memory_ro((unsigned long)fp, fp->pages);
++ }
++ 
++ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
++ {
++ 	set_memory_rw((unsigned long)fp, fp->pages);
++ }
++ #else
++ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
++ {
++ }
++ 
++ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
++ {
++ }
++ #endif /* CONFIG_DEBUG_SET_MODULE_RONX */
++ 
+++>>>>>>> aafe6ae9cee3 (bpf: dynamically allocate digest scratch buffer)
+  int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
+  static inline int sk_filter(struct sock *sk, struct sk_buff *skb)
+  {
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
