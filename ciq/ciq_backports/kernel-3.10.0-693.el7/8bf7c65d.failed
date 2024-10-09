@@ -1,0 +1,276 @@
+scsi: megaraid_sas: raid 1 fast path code optimize
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: raid 1 fast path code optimize (Tomas Henzl) [1417038]
+Rebuild_FUZZ: 93.62%
+commit-author Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+commit 8bf7c65d379a6d923dfebb50eb04c2407e4762ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8bf7c65d.failed
+
+No functional change. Code refactor.
+
+Remove function megasas_fpio_to_ldio as we never require to convert fpio
+to ldio because of frame unavailability.  Grab extra frame of raid 1
+write fast path before it creates first frame as Fast Path.  Removed
+is_raid_1_fp_write flag as raid 1 write fast path command is decided
+using r1_alt_dev_handle only.  Move resetting megasas_cmd_fusion fields
+at common function megasas_return_cmd_fusion.
+
+	Signed-off-by: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8bf7c65d379a6d923dfebb50eb04c2407e4762ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_fp.c
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_fp.c
+index eb9ff444c099,24258afb207f..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fp.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fp.c
+@@@ -1138,13 -1338,8 +1138,16 @@@ MR_BuildRaidContext(struct megasas_inst
+  					ref_in_start_stripe, io_info,
+  					pRAID_Context, map);
+  		/* If IO on an invalid Pd, then FP is not possible.*/
+- 		if (io_info->devHandle == cpu_to_le16(MR_PD_INVALID))
++ 		if (io_info->devHandle == MR_DEVHANDLE_INVALID)
+  			io_info->fpOkForIo = FALSE;
+++<<<<<<< HEAD
+ +		/* set raid 1/10 fast path write capable bit in io_info */
+ +		if (io_info->fpOkForIo &&
+ +		    (io_info->r1_alt_dev_handle != MR_PD_INVALID) &&
+ +		    (raid->level == 1) && !isRead)
+ +			io_info->is_raid_1_fp_write = 1;
+++=======
+++>>>>>>> 8bf7c65d379a (scsi: megaraid_sas: raid 1 fast path code optimize)
+  		return retval;
+  	} else if (isRead) {
+  		uint stripIdx;
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 052f0ebb7f67,751658996e06..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -1911,8 -1986,9 +1913,14 @@@ megasas_build_ldio_fusion(struct megasa
+  	io_info.ldStartBlock = ((u64)start_lba_hi << 32) | start_lba_lo;
+  	io_info.numBlocks = datalength;
+  	io_info.ldTgtId = device_id;
+++<<<<<<< HEAD
+ +	io_info.r1_alt_dev_handle = MR_PD_INVALID;
+ +	io_request->DataLength = cpu_to_le32(scsi_bufflen(scp));
+++=======
++ 	io_info.r1_alt_dev_handle = MR_DEVHANDLE_INVALID;
++ 	scsi_buff_len = scsi_bufflen(scp);
++ 	io_request->DataLength = cpu_to_le32(scsi_buff_len);
+++>>>>>>> 8bf7c65d379a (scsi: megaraid_sas: raid 1 fast path code optimize)
+  
+  	if (scp->sc_data_direction == PCI_DMA_FROMDEVICE)
+  		io_info.isRead = 1;
+@@@ -1943,9 -2023,27 +1951,30 @@@
+  		/* In ventura if stream detected for a read and it is read ahead
+  		 *  capable make this IO as LDIO
+  		 */
+ -		if (praid_context->raid_context_g35.stream_detected &&
+ -		    io_info.isRead && io_info.ra_capable)
+ +		if (io_request->RaidContext.raid_context_g35.stream_detected &&
+ +				io_info.isRead && io_info.ra_capable)
+  			fp_possible = false;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (io_info.r1_alt_dev_handle != MR_DEVHANDLE_INVALID) {
++ 			mrdev_priv = scp->device->hostdata;
++ 
++ 			if (atomic_inc_return(&instance->fw_outstanding) >
++ 				(instance->host->can_queue)) {
++ 				fp_possible = false;
++ 				atomic_dec(&instance->fw_outstanding);
++ 			}
++ 		}
++ 
++ 		/* If raid is NULL, set CPU affinity to default CPU0 */
++ 		if (raid)
++ 			megasas_set_raidflag_cpu_affinity(praid_context,
++ 				raid, fp_possible, io_info.isRead);
++ 		else
++ 			praid_context->raid_context_g35.routing_flags.bits.cpu_sel =
++ 				MR_RAID_CTX_CPUSEL_0;
+++>>>>>>> 8bf7c65d379a (scsi: megaraid_sas: raid 1 fast path code optimize)
+  	}
+  
+  	if (fp_possible) {
+@@@ -2320,39 -2454,6 +2350,42 @@@ megasas_get_request_descriptor(struct m
+  	return (union MEGASAS_REQUEST_DESCRIPTOR_UNION *)p;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * megasas_fpio_to_ldio-
+ + * This function converts an fp io to ldio
+ + */
+ +
+ +void megasas_fpio_to_ldio(struct megasas_instance *instance,
+ +	struct megasas_cmd_fusion *cmd, struct scsi_cmnd *scmd)
+ +{
+ +	struct fusion_context *fusion;
+ +
+ +	fusion = instance->ctrl_context;
+ +	cmd->request_desc->SCSIIO.RequestFlags =
+ +		(MEGASAS_REQ_DESCRIPT_FLAGS_LD_IO
+ +		<< MEGASAS_REQ_DESCRIPT_FLAGS_TYPE_SHIFT);
+ +	cmd->io_request->Function = MEGASAS_MPI2_FUNCTION_LD_IO_REQUEST;
+ +	cmd->io_request->DevHandle = cpu_to_le16(MEGASAS_DEV_INDEX(scmd));
+ +
+ +	/*remove FAST PATH ENABLE bit in IoFlags */
+ +	cmd->io_request->IoFlags &=
+ +	cpu_to_le16(~MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH);
+ +
+ +	/* if the numSGE > max_sge_in_main_sge set the chain offset*/
+ +	if (cmd->io_request->RaidContext.raid_context_g35.num_sge >
+ +		fusion->max_sge_in_main_msg)
+ +		cmd->io_request->ChainOffset = fusion->chain_offset_io_request;
+ +	memcpy(cmd->io_request->CDB.CDB32, scmd->cmnd, scmd->cmd_len);
+ +	cmd->io_request->CDB.EEDP32.PrimaryReferenceTag = 0;
+ +	cmd->io_request->CDB.EEDP32.PrimaryApplicationTagMask = 0;
+ +	cmd->io_request->EEDPFlags = 0;
+ +	cmd->io_request->Control = 0;
+ +	cmd->io_request->EEDPBlockSize = 0;
+ +	cmd->is_raid_1_fp_write = 0;
+ +}
+++=======
+++>>>>>>> 8bf7c65d379a (scsi: megaraid_sas: raid 1 fast path code optimize)
+  
+  /* megasas_prepate_secondRaid1_IO
+   *  It prepares the raid 1 second IO
+@@@ -2605,77 -2713,25 +2646,67 @@@ complete_cmd_fusion(struct megasas_inst
+  			break;
+  		case MPI2_FUNCTION_SCSI_IO_REQUEST:  /*Fast Path IO.*/
+  			/* Update load balancing info */
+- 			device_id = MEGASAS_DEV_INDEX(scmd_local);
+- 			lbinfo = &fusion->load_balance_info[device_id];
+- 			/*
+- 			 * check for the raid 1/10 fast path writes
+- 			 */
+- 			if (!cmd_fusion->is_raid_1_fp_write &&
+- 				(cmd_fusion->scmd->SCp.Status &
+- 					MEGASAS_LOAD_BALANCE_FLAG)) {
++ 			if (fusion->load_balance_info &&
++ 			    (cmd_fusion->scmd->SCp.Status &
++ 			    MEGASAS_LOAD_BALANCE_FLAG)) {
++ 				device_id = MEGASAS_DEV_INDEX(scmd_local);
++ 				lbinfo = &fusion->load_balance_info[device_id];
+  				atomic_dec(&lbinfo->scsi_pending_cmds[cmd_fusion->pd_r1_lb]);
+- 				cmd_fusion->scmd->SCp.Status &=
+- 					~MEGASAS_LOAD_BALANCE_FLAG;
+- 			} else if (cmd_fusion->is_raid_1_fp_write) {
+- 				/* get peer command */
+- 				if (cmd_fusion->index < instance->max_fw_cmds)
+- 					r1_cmd = fusion->cmd_list[(cmd_fusion->index +
+- 					instance->max_fw_cmds)-1];
+- 				else {
+- 					r1_cmd =
+- 					fusion->cmd_list[(cmd_fusion->index -
+- 						 instance->max_fw_cmds)-1];
+- 				}
+- 				cmd_fusion->cmd_completed = true;
+- 			}
+- 
+- 			if (reply_descript_type ==
+- 			    MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS) {
+- 				if (megasas_dbg_lvl == 5)
+- 					dev_err(&instance->pdev->dev, "\nFAST Path "
+- 					       "IO Success\n");
++ 				cmd_fusion->scmd->SCp.Status &= ~MEGASAS_LOAD_BALANCE_FLAG;
+  			}
+- 			/* Fall thru and complete IO */
++ 			//Fall thru and complete IO
+  		case MEGASAS_MPI2_FUNCTION_LD_IO_REQUEST: /* LD-IO Path */
+++<<<<<<< HEAD
+ +			/* Map the FW Cmd Status */
+ +			/*
+ +			 * check for the raid 1/10 fast path writes
+ +			 */
+ +			if (r1_cmd &&  r1_cmd->is_raid_1_fp_write
+ +				&& r1_cmd->cmd_completed) {
+ +				/*
+ +				 * if the peer  Raid  1/10 fast path failed,
+ +				 * mark IO as failed to the scsi layer.
+ +				 * over write the current status by the failed
+ +				 * status makes sure that if any one of
+ +				 * command fails,return fail status to
+ +				 * scsi layer
+ +				 */
+ +				if (r1_cmd->io_request->RaidContext.raid_context.status !=
+ +								MFI_STAT_OK) {
+ +					status =
+ +					r1_cmd->io_request->RaidContext.raid_context.status;
+ +					extStatus =
+ +					r1_cmd->io_request->RaidContext.raid_context.exStatus;
+ +					data_length =
+ +						r1_cmd->io_request->DataLength;
+ +					sense = r1_cmd->sense;
+ +				}
+ +				r1_cmd->io_request->RaidContext.raid_context.status = 0;
+ +				r1_cmd->io_request->RaidContext.raid_context.exStatus = 0;
+ +				cmd_fusion->is_raid_1_fp_write = 0;
+ +				r1_cmd->is_raid_1_fp_write = 0;
+ +				r1_cmd->cmd_completed = false;
+ +				cmd_fusion->cmd_completed = false;
+ +				megasas_return_cmd_fusion(instance, r1_cmd);
+ +			}
+ +			if (!cmd_fusion->is_raid_1_fp_write) {
+ +				map_cmd_status(fusion, scmd_local, status,
+ +					extStatus, data_length, sense);
+ +				scsi_io_req->RaidContext.raid_context.status
+ +				= 0;
+ +				scsi_io_req->RaidContext.raid_context.exStatus
+ +				= 0;
+++=======
++ 			atomic_dec(&instance->fw_outstanding);
++ 			if (cmd_fusion->r1_alt_dev_handle == MR_DEVHANDLE_INVALID) {
++ 				map_cmd_status(fusion, scmd_local, status,
++ 					       extStatus, le32_to_cpu(data_length),
++ 					       sense);
++ 				if (instance->ldio_threshold &&
++ 				    (megasas_cmd_type(scmd_local) == READ_WRITE_LDIO))
++ 					atomic_dec(&instance->ldio_outstanding);
++ 				scmd_local->SCp.ptr = NULL;
+++>>>>>>> 8bf7c65d379a (scsi: megaraid_sas: raid 1 fast path code optimize)
+  				megasas_return_cmd_fusion(instance, cmd_fusion);
+  				scsi_dma_unmap(scmd_local);
+  				scmd_local->scsi_done(scmd_local);
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fp.c
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.h b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+index ef6bfe55344c..06e8a85b8ef2 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.h
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+@@ -666,6 +666,7 @@ struct MPI2_IOC_INIT_REQUEST {
+ 
+ /* mrpriv defines */
+ #define MR_PD_INVALID 0xFFFF
++#define MR_DEVHANDLE_INVALID 0xFFFF
+ #define MAX_SPAN_DEPTH 8
+ #define MAX_QUAD_DEPTH	MAX_SPAN_DEPTH
+ #define MAX_RAIDMAP_SPAN_DEPTH (MAX_SPAN_DEPTH)
+@@ -837,7 +838,6 @@ struct IO_REQUEST_INFO {
+ 	u8  span_arm;	/* span[7:5], arm[4:0] */
+ 	u8  pd_after_lb;
+ 	u16 r1_alt_dev_handle; /* raid 1/10 only */
+-	bool is_raid_1_fp_write;
+ 	bool ra_capable;
+ };
+ 
+@@ -891,7 +891,6 @@ struct megasas_cmd_fusion {
+ 	u32 index;
+ 	u8 pd_r1_lb;
+ 	struct completion done;
+-	bool is_raid_1_fp_write;
+ 	u16 r1_alt_dev_handle; /* raid 1/10 only*/
+ 	bool cmd_completed;  /* raid 1/10 fp writes status holder */
+ 
