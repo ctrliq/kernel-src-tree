@@ -1,0 +1,353 @@
+udp reuseport: fix packet of same flow hashed to different socket
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Su, Xuemin <suxm@chinanetcenter.com>
+commit d1e37288c9146dccff830e3253e403af8705b51f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d1e37288.failed
+
+There is a corner case in which udp packets belonging to a same
+flow are hashed to different socket when hslot->count changes from 10
+to 11:
+
+1) When hslot->count <= 10, __udp_lib_lookup() searches udp_table->hash,
+and always passes 'daddr' to udp_ehashfn().
+
+2) When hslot->count > 10, __udp_lib_lookup() searches udp_table->hash2,
+but may pass 'INADDR_ANY' to udp_ehashfn() if the sockets are bound to
+INADDR_ANY instead of some specific addr.
+
+That means when hslot->count changes from 10 to 11, the hash calculated by
+udp_ehashfn() is also changed, and the udp packets belonging to a same
+flow will be hashed to different socket.
+
+This is easily reproduced:
+1) Create 10 udp sockets and bind all of them to 0.0.0.0:40000.
+2) From the same host send udp packets to 127.0.0.1:40000, record the
+socket index which receives the packets.
+3) Create 1 more udp socket and bind it to 0.0.0.0:44096. The number 44096
+is 40000 + UDP_HASH_SIZE(4096), this makes the new socket put into the
+same hslot as the aformentioned 10 sockets, and makes the hslot->count
+change from 10 to 11.
+4) From the same host send udp packets to 127.0.0.1:40000, and the socket
+index which receives the packets will be different from the one received
+in step 2.
+This should not happen as the socket bound to 0.0.0.0:44096 should not
+change the behavior of the sockets bound to 0.0.0.0:40000.
+
+It's the same case for IPv6, and this patch also fixes that.
+
+	Signed-off-by: Su, Xuemin <suxm@chinanetcenter.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d1e37288c9146dccff830e3253e403af8705b51f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+#	net/ipv6/udp.c
+diff --cc net/ipv4/udp.c
+index c6e2b198be79,ca5e8ea29538..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -380,56 -429,14 +380,62 @@@ static int compute_score(struct sock *s
+  			return -1;
+  		score += 4;
+  	}
+ -	if (sk->sk_incoming_cpu == raw_smp_processor_id())
+ -		score++;
+ +
+ +	return score;
+ +}
+ +
+++<<<<<<< HEAD
+ +/*
+ + * In this second variant, we check (daddr, dport) matches (inet_rcv_sadd, inet_num)
+ + */
+ +static inline int compute_score2(struct sock *sk, struct net *net,
+ +				 __be32 saddr, __be16 sport,
+ +				 __be32 daddr, unsigned int hnum, int dif)
+ +{
+ +	int score;
+ +	struct inet_sock *inet;
+ +
+ +	if (!net_eq(sock_net(sk), net) ||
+ +	    ipv6_only_sock(sk))
+ +		return -1;
+ +
+ +	inet = inet_sk(sk);
+ +
+ +	if (inet->inet_rcv_saddr != daddr ||
+ +	    inet->inet_num != hnum)
+ +		return -1;
+ +
+ +	score = (sk->sk_family == PF_INET) ? 2 : 1;
+ +
+ +	if (inet->inet_daddr) {
+ +		if (inet->inet_daddr != saddr)
+ +			return -1;
+ +		score += 4;
+ +	}
+ +
+ +	if (inet->inet_dport) {
+ +		if (inet->inet_dport != sport)
+ +			return -1;
+ +		score += 4;
+ +	}
+ +
+ +	if (sk->sk_bound_dev_if) {
+ +		if (sk->sk_bound_dev_if != dif)
+ +			return -1;
+ +		score += 4;
+ +	}
+ +
+  	return score;
+  }
+  
+ +static unsigned int udp_ehashfn(struct net *net, const __be32 laddr,
+ +				 const __u16 lport, const __be32 faddr,
+ +				 const __be16 fport)
+++=======
++ static u32 udp_ehashfn(const struct net *net, const __be32 laddr,
++ 		       const __u16 lport, const __be32 faddr,
++ 		       const __be16 fport)
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  {
+  	static u32 udp_ehash_secret __read_mostly;
+  
+@@@ -439,27 -446,23 +445,41 @@@
+  			      udp_ehash_secret + net_hash_mix(net));
+  }
+  
+++<<<<<<< HEAD
+ +
+ +/* called with read_rcu_lock() */
+ +static struct sock *udp4_lib_lookup2(struct net *net,
+ +		__be32 saddr, __be16 sport,
+ +		__be32 daddr, unsigned int hnum, int dif,
+ +		struct udp_hslot *hslot2, unsigned int slot2)
+++=======
++ /* called with rcu_read_lock() */
++ static struct sock *udp4_lib_lookup2(struct net *net,
++ 		__be32 saddr, __be16 sport,
++ 		__be32 daddr, unsigned int hnum, int dif,
++ 		struct udp_hslot *hslot2,
++ 		struct sk_buff *skb)
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  {
+  	struct sock *sk, *result;
+ +	struct hlist_nulls_node *node;
+  	int score, badness, matches = 0, reuseport = 0;
+  	u32 hash = 0;
+  
+ +begin:
+  	result = NULL;
+  	badness = 0;
+++<<<<<<< HEAD
+ +	udp_portaddr_for_each_entry_rcu(sk, node, &hslot2->head) {
+ +		score = compute_score2(sk, net, saddr, sport,
+++=======
++ 	udp_portaddr_for_each_entry_rcu(sk, &hslot2->head) {
++ 		score = compute_score(sk, net, saddr, sport,
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  				      daddr, hnum, dif);
+  		if (score > badness) {
+ +			result = sk;
+ +			badness = score;
+  			reuseport = sk->sk_reuseport;
+  			if (reuseport) {
+  				hash = udp_ehashfn(net, daddr, hnum,
+@@@ -517,30 -508,32 +537,50 @@@ struct sock *__udp4_lib_lookup(struct n
+  
+  		result = udp4_lib_lookup2(net, saddr, sport,
+  					  daddr, hnum, dif,
+++<<<<<<< HEAD
+ +					  hslot2, slot2);
+++=======
++ 					  hslot2, skb);
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  		if (!result) {
++ 			unsigned int old_slot2 = slot2;
+  			hash2 = udp4_portaddr_hash(net, htonl(INADDR_ANY), hnum);
+  			slot2 = hash2 & udptable->mask;
++ 			/* avoid searching the same slot again. */
++ 			if (unlikely(slot2 == old_slot2))
++ 				return result;
++ 
+  			hslot2 = &udptable->hash2[slot2];
+  			if (hslot->count < hslot2->count)
+  				goto begin;
+  
+  			result = udp4_lib_lookup2(net, saddr, sport,
+++<<<<<<< HEAD
+ +						  htonl(INADDR_ANY), hnum, dif,
+ +						  hslot2, slot2);
+++=======
++ 						  daddr, hnum, dif,
++ 						  hslot2, skb);
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  		}
+ +		rcu_read_unlock();
+  		return result;
+  	}
+  begin:
+  	result = NULL;
+  	badness = 0;
+++<<<<<<< HEAD
+ +	sk_nulls_for_each_rcu(sk, node, &hslot->head) {
+ +		score = compute_score(sk, net, saddr, hnum, sport,
+ +				      daddr, dport, dif);
+++=======
++ 	sk_for_each_rcu(sk, &hslot->head) {
++ 		score = compute_score(sk, net, saddr, sport,
++ 				      daddr, hnum, dif);
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  		if (score > badness) {
+ +			result = sk;
+ +			badness = score;
+  			reuseport = sk->sk_reuseport;
+  			if (reuseport) {
+  				hash = udp_ehashfn(net, daddr, hnum,
+diff --cc net/ipv6/udp.c
+index f5a8a12b48a5,005dc82c2138..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -184,70 -155,29 +183,84 @@@ static int compute_score(struct sock *s
+  		score++;
+  	}
+  
+ -	if (sk->sk_incoming_cpu == raw_smp_processor_id())
+ +	return score;
+ +}
+ +
+++<<<<<<< HEAD
+ +#define SCORE2_MAX (1 + 1 + 1)
+ +static inline int compute_score2(struct sock *sk, struct net *net,
+ +				 const struct in6_addr *saddr, __be16 sport,
+ +				 const struct in6_addr *daddr,
+ +				 unsigned short hnum, int dif)
+ +{
+ +	int score;
+ +	struct inet_sock *inet;
+ +
+ +	if (!net_eq(sock_net(sk), net) ||
+ +	    udp_sk(sk)->udp_port_hash != hnum ||
+ +	    sk->sk_family != PF_INET6)
+ +		return -1;
+ +
+ +	if (!ipv6_addr_equal(&sk->sk_v6_rcv_saddr, daddr))
+ +		return -1;
+ +
+ +	score = 0;
+ +	inet = inet_sk(sk);
+ +
+ +	if (inet->inet_dport) {
+ +		if (inet->inet_dport != sport)
+ +			return -1;
+ +		score++;
+ +	}
+ +
+ +	if (!ipv6_addr_any(&sk->sk_v6_daddr)) {
+ +		if (!ipv6_addr_equal(&sk->sk_v6_daddr, saddr))
+ +			return -1;
+ +		score++;
+ +	}
+ +
+ +	if (sk->sk_bound_dev_if) {
+ +		if (sk->sk_bound_dev_if != dif)
+ +			return -1;
+  		score++;
+ +	}
+  
+  	return score;
+  }
+  
+ +/* called with read_rcu_lock() */
+ +static struct sock *udp6_lib_lookup2(struct net *net,
+ +		const struct in6_addr *saddr, __be16 sport,
+ +		const struct in6_addr *daddr, unsigned int hnum, int dif,
+ +		struct udp_hslot *hslot2, unsigned int slot2)
+++=======
++ /* called with rcu_read_lock() */
++ static struct sock *udp6_lib_lookup2(struct net *net,
++ 		const struct in6_addr *saddr, __be16 sport,
++ 		const struct in6_addr *daddr, unsigned int hnum, int dif,
++ 		struct udp_hslot *hslot2,
++ 		struct sk_buff *skb)
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  {
+  	struct sock *sk, *result;
+ +	struct hlist_nulls_node *node;
+  	int score, badness, matches = 0, reuseport = 0;
+  	u32 hash = 0;
+  
+ +begin:
+  	result = NULL;
+  	badness = -1;
+++<<<<<<< HEAD
+ +	udp_portaddr_for_each_entry_rcu(sk, node, &hslot2->head) {
+ +		score = compute_score2(sk, net, saddr, sport,
+++=======
++ 	udp_portaddr_for_each_entry_rcu(sk, &hslot2->head) {
++ 		score = compute_score(sk, net, saddr, sport,
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  				      daddr, hnum, dif);
+  		if (score > badness) {
+ +			result = sk;
+ +			badness = score;
+  			reuseport = sk->sk_reuseport;
+  			if (reuseport) {
+  				hash = udp6_ehashfn(net, daddr, hnum,
+@@@ -306,29 -224,31 +319,48 @@@ struct sock *__udp6_lib_lookup(struct n
+  
+  		result = udp6_lib_lookup2(net, saddr, sport,
+  					  daddr, hnum, dif,
+++<<<<<<< HEAD
+ +					  hslot2, slot2);
+++=======
++ 					  hslot2, skb);
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  		if (!result) {
++ 			unsigned int old_slot2 = slot2;
+  			hash2 = udp6_portaddr_hash(net, &in6addr_any, hnum);
+  			slot2 = hash2 & udptable->mask;
++ 			/* avoid searching the same slot again. */
++ 			if (unlikely(slot2 == old_slot2))
++ 				return result;
++ 
+  			hslot2 = &udptable->hash2[slot2];
+  			if (hslot->count < hslot2->count)
+  				goto begin;
+  
+  			result = udp6_lib_lookup2(net, saddr, sport,
+++<<<<<<< HEAD
+ +						  &in6addr_any, hnum, dif,
+ +						  hslot2, slot2);
+++=======
++ 						  daddr, hnum, dif,
++ 						  hslot2, skb);
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  		}
+ +		rcu_read_unlock();
+  		return result;
+  	}
+  begin:
+  	result = NULL;
+  	badness = -1;
+++<<<<<<< HEAD
+ +	sk_nulls_for_each_rcu(sk, node, &hslot->head) {
+ +		score = compute_score(sk, net, hnum, saddr, sport, daddr, dport, dif);
+++=======
++ 	sk_for_each_rcu(sk, &hslot->head) {
++ 		score = compute_score(sk, net, saddr, sport, daddr, hnum, dif);
+++>>>>>>> d1e37288c914 (udp reuseport: fix packet of same flow hashed to different socket)
+  		if (score > badness) {
+ +			result = sk;
+ +			badness = score;
+  			reuseport = sk->sk_reuseport;
+  			if (reuseport) {
+  				hash = udp6_ehashfn(net, daddr, hnum,
+* Unmerged path net/ipv4/udp.c
+* Unmerged path net/ipv6/udp.c
