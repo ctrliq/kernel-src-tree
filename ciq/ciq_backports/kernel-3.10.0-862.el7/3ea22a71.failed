@@ -1,0 +1,155 @@
+ovl: allow setting max size of redirect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 3ea22a71b65b6743a53e286ff4991a06b9d2597c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3ea22a71.failed
+
+Add a module option to allow tuning the max size of absolute redirects.
+Default is 256.
+
+Size of relative redirects is naturally limited by the the underlying
+filesystem's max filename length (usually 255).
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 3ea22a71b65b6743a53e286ff4991a06b9d2597c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/dir.c
+diff --cc fs/overlayfs/dir.c
+index c82fdefe6d3b,b84d61b353cd..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -15,8 -16,14 +16,13 @@@
+  #include <linux/posix_acl.h>
+  #include <linux/posix_acl_xattr.h>
+  #include <linux/atomic.h>
+ -#include <linux/ratelimit.h>
+  #include "overlayfs.h"
+  
++ static unsigned short ovl_redirect_max = 256;
++ module_param_named(redirect_max, ovl_redirect_max, ushort, 0644);
++ MODULE_PARM_DESC(ovl_redirect_max,
++ 		 "Maximum length of absolute redirect xattr value");
++ 
+  void ovl_cleanup(struct inode *wdir, struct dentry *wdentry)
+  {
+  	int err;
+@@@ -810,6 -770,109 +816,112 @@@ static int ovl_rmdir(struct inode *dir
+  	return ovl_do_remove(dentry, true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool ovl_type_merge_or_lower(struct dentry *dentry)
++ {
++ 	enum ovl_path_type type = ovl_path_type(dentry);
++ 
++ 	return OVL_TYPE_MERGE(type) || !OVL_TYPE_UPPER(type);
++ }
++ 
++ static bool ovl_can_move(struct dentry *dentry)
++ {
++ 	return ovl_redirect_dir(dentry->d_sb) ||
++ 		!d_is_dir(dentry) || !ovl_type_merge_or_lower(dentry);
++ }
++ 
++ static char *ovl_get_redirect(struct dentry *dentry, bool samedir)
++ {
++ 	char *buf, *ret;
++ 	struct dentry *d, *tmp;
++ 	int buflen = ovl_redirect_max + 1;
++ 
++ 	if (samedir) {
++ 		ret = kstrndup(dentry->d_name.name, dentry->d_name.len,
++ 			       GFP_KERNEL);
++ 		goto out;
++ 	}
++ 
++ 	buf = ret = kmalloc(buflen, GFP_TEMPORARY);
++ 	if (!buf)
++ 		goto out;
++ 
++ 	buflen--;
++ 	buf[buflen] = '\0';
++ 	for (d = dget(dentry); !IS_ROOT(d);) {
++ 		const char *name;
++ 		int thislen;
++ 
++ 		spin_lock(&d->d_lock);
++ 		name = ovl_dentry_get_redirect(d);
++ 		if (name) {
++ 			thislen = strlen(name);
++ 		} else {
++ 			name = d->d_name.name;
++ 			thislen = d->d_name.len;
++ 		}
++ 
++ 		/* If path is too long, fall back to userspace move */
++ 		if (thislen + (name[0] != '/') > buflen) {
++ 			ret = ERR_PTR(-EXDEV);
++ 			spin_unlock(&d->d_lock);
++ 			goto out_put;
++ 		}
++ 
++ 		buflen -= thislen;
++ 		memcpy(&buf[buflen], name, thislen);
++ 		tmp = dget_dlock(d->d_parent);
++ 		spin_unlock(&d->d_lock);
++ 
++ 		dput(d);
++ 		d = tmp;
++ 
++ 		/* Absolute redirect: finished */
++ 		if (buf[buflen] == '/')
++ 			break;
++ 		buflen--;
++ 		buf[buflen] = '/';
++ 	}
++ 	ret = kstrdup(&buf[buflen], GFP_KERNEL);
++ out_put:
++ 	dput(d);
++ 	kfree(buf);
++ out:
++ 	return ret ? ret : ERR_PTR(-ENOMEM);
++ }
++ 
++ static int ovl_set_redirect(struct dentry *dentry, bool samedir)
++ {
++ 	int err;
++ 	const char *redirect = ovl_dentry_get_redirect(dentry);
++ 
++ 	if (redirect && (samedir || redirect[0] == '/'))
++ 		return 0;
++ 
++ 	redirect = ovl_get_redirect(dentry, samedir);
++ 	if (IS_ERR(redirect))
++ 		return PTR_ERR(redirect);
++ 
++ 	err = ovl_do_setxattr(ovl_dentry_upper(dentry), OVL_XATTR_REDIRECT,
++ 			      redirect, strlen(redirect), 0);
++ 	if (!err) {
++ 		spin_lock(&dentry->d_lock);
++ 		ovl_dentry_set_redirect(dentry, redirect);
++ 		spin_unlock(&dentry->d_lock);
++ 	} else {
++ 		kfree(redirect);
++ 		if (err == -EOPNOTSUPP)
++ 			ovl_clear_redirect_dir(dentry->d_sb);
++ 		else
++ 			pr_warn_ratelimited("overlay: failed to set redirect (%i)\n", err);
++ 		/* Fall back to userspace copy-up */
++ 		err = -EXDEV;
++ 	}
++ 	return err;
++ }
++ 
+++>>>>>>> 3ea22a71b65b (ovl: allow setting max size of redirect)
+  static int ovl_rename(struct inode *olddir, struct dentry *old,
+  		      struct inode *newdir, struct dentry *new,
+  		      unsigned int flags)
+* Unmerged path fs/overlayfs/dir.c
