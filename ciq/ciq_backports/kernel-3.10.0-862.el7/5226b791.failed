@@ -1,0 +1,261 @@
+cxgb4: get rid of custom busy poll code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 5226b7919641f285bf0f8db84deeb3920b160ec7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5226b791.failed
+
+In linux-4.5, busy polling was implemented in core
+NAPI stack, meaning that all custom implementation can
+be removed from drivers.
+
+Not only we remove lot of code, we also remove one spin_lock()
+from driver fast path.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5226b7919641f285bf0f8db84deeb3920b160ec7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+#	drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 7eb2bfa69942,f4f569060689..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -2804,12 -2752,12 +2797,20 @@@ static const struct net_device_ops cxgb
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller  = cxgb_netpoll,
+  #endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_RX_BUSY_POLL
+ +	.ndo_busy_poll        = cxgb_busy_poll,
+ +#endif
+ +	.extended.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
+++=======
++ #ifdef CONFIG_CHELSIO_T4_FCOE
++ 	.ndo_fcoe_enable      = cxgb_fcoe_enable,
++ 	.ndo_fcoe_disable     = cxgb_fcoe_disable,
++ #endif /* CONFIG_CHELSIO_T4_FCOE */
++ 	.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
+++>>>>>>> 5226b7919641 (cxgb4: get rid of custom busy poll code)
+  	.ndo_setup_tc         = cxgb_setup_tc,
+ +	.ndo_fix_features     = cxgb_fix_features,
+  };
+  
+  #ifdef CONFIG_PCI_IOV
+diff --cc drivers/net/ethernet/chelsio/cxgb4/sge.c
+index 6176fd298010,f05f0d400324..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@@ -43,9 -43,10 +43,14 @@@
+  #include <linux/export.h>
+  #include <net/ipv6.h>
+  #include <net/tcp.h>
+- #ifdef CONFIG_NET_RX_BUSY_POLL
+  #include <net/busy_poll.h>
+++<<<<<<< HEAD
+ +#endif /* CONFIG_NET_RX_BUSY_POLL */
+++=======
++ #ifdef CONFIG_CHELSIO_T4_FCOE
++ #include <scsi/fc/fc_fcoe.h>
++ #endif /* CONFIG_CHELSIO_T4_FCOE */
+++>>>>>>> 5226b7919641 (cxgb4: get rid of custom busy poll code)
+  #include "cxgb4.h"
+  #include "t4_regs.h"
+  #include "t4_values.h"
+@@@ -2001,10 -2048,15 +2006,9 @@@ int t4_ethrx_handler(struct sge_rspq *q
+  		return handle_trace_pkt(q->adap, si);
+  
+  	pkt = (const struct cpl_rx_pkt *)rsp;
+ -	/* Compressed error vector is enabled for T6 only */
+ -	if (q->adap->params.tp.rx_pkt_encap)
+ -		err_vec = T6_COMPR_RXERR_VEC_G(be16_to_cpu(pkt->err_vec));
+ -	else
+ -		err_vec = be16_to_cpu(pkt->err_vec);
+ -
+ -	csum_ok = pkt->csum_calc && !err_vec &&
+ +	csum_ok = pkt->csum_calc && !pkt->err_vec &&
+  		  (q->netdev->features & NETIF_F_RXCSUM);
+  	if ((pkt->l2info & htonl(RXF_TCP_F)) &&
+- 	    !(cxgb_poll_busy_polling(q)) &&
+  	    (q->netdev->features & NETIF_F_GRO) && csum_ok && !pkt->ip_frag) {
+  		do_gro(rxq, si, pkt);
+  		return 0;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 340dd7351b2d..1972b8d2aa5f 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -590,22 +590,6 @@ struct sge_rspq {                   /* state for an SGE response queue */
+ 	rspq_handler_t handler;
+ 	rspq_flush_handler_t flush_handler;
+ 	struct t4_lro_mgr lro_mgr;
+-#ifdef CONFIG_NET_RX_BUSY_POLL
+-#define CXGB_POLL_STATE_IDLE		0
+-#define CXGB_POLL_STATE_NAPI		BIT(0) /* NAPI owns this poll */
+-#define CXGB_POLL_STATE_POLL		BIT(1) /* poll owns this poll */
+-#define CXGB_POLL_STATE_NAPI_YIELD	BIT(2) /* NAPI yielded this poll */
+-#define CXGB_POLL_STATE_POLL_YIELD	BIT(3) /* poll yielded this poll */
+-#define CXGB_POLL_YIELD			(CXGB_POLL_STATE_NAPI_YIELD |   \
+-					 CXGB_POLL_STATE_POLL_YIELD)
+-#define CXGB_POLL_LOCKED		(CXGB_POLL_STATE_NAPI |         \
+-					 CXGB_POLL_STATE_POLL)
+-#define CXGB_POLL_USER_PEND		(CXGB_POLL_STATE_POLL |         \
+-					 CXGB_POLL_STATE_POLL_YIELD)
+-	unsigned int bpoll_state;
+-	spinlock_t bpoll_lock;		/* lock for busy poll */
+-#endif /* CONFIG_NET_RX_BUSY_POLL */
+-
+ };
+ 
+ struct sge_eth_stats {              /* Ethernet queue statistics */
+@@ -1177,102 +1161,6 @@ static inline struct adapter *netdev2adap(const struct net_device *dev)
+ 	return netdev2pinfo(dev)->adapter;
+ }
+ 
+-#ifdef CONFIG_NET_RX_BUSY_POLL
+-static inline void cxgb_busy_poll_init_lock(struct sge_rspq *q)
+-{
+-	spin_lock_init(&q->bpoll_lock);
+-	q->bpoll_state = CXGB_POLL_STATE_IDLE;
+-}
+-
+-static inline bool cxgb_poll_lock_napi(struct sge_rspq *q)
+-{
+-	bool rc = true;
+-
+-	spin_lock(&q->bpoll_lock);
+-	if (q->bpoll_state & CXGB_POLL_LOCKED) {
+-		q->bpoll_state |= CXGB_POLL_STATE_NAPI_YIELD;
+-		rc = false;
+-	} else {
+-		q->bpoll_state = CXGB_POLL_STATE_NAPI;
+-	}
+-	spin_unlock(&q->bpoll_lock);
+-	return rc;
+-}
+-
+-static inline bool cxgb_poll_unlock_napi(struct sge_rspq *q)
+-{
+-	bool rc = false;
+-
+-	spin_lock(&q->bpoll_lock);
+-	if (q->bpoll_state & CXGB_POLL_STATE_POLL_YIELD)
+-		rc = true;
+-	q->bpoll_state = CXGB_POLL_STATE_IDLE;
+-	spin_unlock(&q->bpoll_lock);
+-	return rc;
+-}
+-
+-static inline bool cxgb_poll_lock_poll(struct sge_rspq *q)
+-{
+-	bool rc = true;
+-
+-	spin_lock_bh(&q->bpoll_lock);
+-	if (q->bpoll_state & CXGB_POLL_LOCKED) {
+-		q->bpoll_state |= CXGB_POLL_STATE_POLL_YIELD;
+-		rc = false;
+-	} else {
+-		q->bpoll_state |= CXGB_POLL_STATE_POLL;
+-	}
+-	spin_unlock_bh(&q->bpoll_lock);
+-	return rc;
+-}
+-
+-static inline bool cxgb_poll_unlock_poll(struct sge_rspq *q)
+-{
+-	bool rc = false;
+-
+-	spin_lock_bh(&q->bpoll_lock);
+-	if (q->bpoll_state & CXGB_POLL_STATE_POLL_YIELD)
+-		rc = true;
+-	q->bpoll_state = CXGB_POLL_STATE_IDLE;
+-	spin_unlock_bh(&q->bpoll_lock);
+-	return rc;
+-}
+-
+-static inline bool cxgb_poll_busy_polling(struct sge_rspq *q)
+-{
+-	return q->bpoll_state & CXGB_POLL_USER_PEND;
+-}
+-#else
+-static inline void cxgb_busy_poll_init_lock(struct sge_rspq *q)
+-{
+-}
+-
+-static inline bool cxgb_poll_lock_napi(struct sge_rspq *q)
+-{
+-	return true;
+-}
+-
+-static inline bool cxgb_poll_unlock_napi(struct sge_rspq *q)
+-{
+-	return false;
+-}
+-
+-static inline bool cxgb_poll_lock_poll(struct sge_rspq *q)
+-{
+-	return false;
+-}
+-
+-static inline bool cxgb_poll_unlock_poll(struct sge_rspq *q)
+-{
+-	return false;
+-}
+-
+-static inline bool cxgb_poll_busy_polling(struct sge_rspq *q)
+-{
+-	return false;
+-}
+-#endif /* CONFIG_NET_RX_BUSY_POLL */
+-
+ /* Return a version number to identify the type of adapter.  The scheme is:
+  * - bits 0..9: chip version
+  * - bits 10..15: chip revision
+@@ -1329,7 +1217,6 @@ irqreturn_t t4_sge_intr_msix(int irq, void *cookie);
+ int t4_sge_init(struct adapter *adap);
+ void t4_sge_start(struct adapter *adap);
+ void t4_sge_stop(struct adapter *adap);
+-int cxgb_busy_poll(struct napi_struct *napi);
+ void cxgb4_set_ethtool_ops(struct net_device *netdev);
+ int cxgb4_write_rss(const struct port_info *pi, const u16 *queues);
+ extern int dbfifo_int_thresh;
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+index 35d2b09db809..0fc41e4b750b 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+@@ -408,10 +408,9 @@ static void enable_rx(struct adapter *adap, struct sge_rspq *q)
+ 	if (!q)
+ 		return;
+ 
+-	if (q->handler) {
+-		cxgb_busy_poll_init_lock(q);
++	if (q->handler)
+ 		napi_enable(&q->napi);
+-	}
++
+ 	/* 0-increment GTS to start the timer and enable interrupts */
+ 	t4_write_reg(adap, MYPF_REG(SGE_PF_GTS_A),
+ 		     SEINTARM_V(q->intr_params) |
+@@ -420,13 +419,8 @@ static void enable_rx(struct adapter *adap, struct sge_rspq *q)
+ 
+ static void quiesce_rx(struct adapter *adap, struct sge_rspq *q)
+ {
+-	if (q && q->handler) {
++	if (q && q->handler)
+ 		napi_disable(&q->napi);
+-		local_bh_disable();
+-		while (!cxgb_poll_lock_napi(q))
+-			mdelay(1);
+-		local_bh_enable();
+-	}
+ }
+ 
+ static void enable_rx_uld(struct adapter *adap, unsigned int uld_type)
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sge.c
