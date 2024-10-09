@@ -226,6 +226,7 @@ ipv6:
 		return false;
 	}
 
+ip_proto_again:
 	switch (ip_proto) {
 	case IPPROTO_GRE: {
 		struct gre_hdr {
@@ -264,6 +265,22 @@ ipv6:
 			goto again;
 		}
 		break;
+	}
+	case NEXTHDR_HOP:
+	case NEXTHDR_ROUTING:
+	case NEXTHDR_DEST: {
+		u8 _opthdr[2], *opthdr;
+
+		if (proto != htons(ETH_P_IPV6))
+			break;
+
+		opthdr = __skb_header_pointer(skb, nhoff, sizeof(_opthdr),
+					      data, hlen, &_opthdr);
+
+		ip_proto = _opthdr[0];
+		nhoff += (_opthdr[1] + 1) << 3;
+
+		goto ip_proto_again;
 	}
 	case IPPROTO_IPIP:
 		proto = htons(ETH_P_IP);
