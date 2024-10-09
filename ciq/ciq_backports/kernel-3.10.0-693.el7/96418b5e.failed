@@ -1,0 +1,386 @@
+scsi: lpfc: Fix eh_deadline setting for sli3 adapters.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix eh_deadline setting for sli3 adapters (Ewan Milne) [1366564]
+Rebuild_FUZZ: 93.07%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 96418b5e2c8867da3279d877f5d1ffabfe460c3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/96418b5e.failed
+
+A previous change unilaterally removed the hba reset entry point
+from the sli3 host template. This was done to allow tape devices
+being used for back up from being removed. Why was this done ?
+When there was non-responding device on the fabric, the error
+escalation policy would escalate to the reset handler. When the
+reset handler was called, it would reset the adapter, dropping
+link, thus logging out and terminating all i/o's - on any target.
+If there was a tape device on the same adapter that wasn't in
+error, it would kill the tape i/o's, effectively killing the
+tape device state.  With the reset point removed, the adapter
+reset avoided the fabric logout, allowing the other devices to
+continue to operate unaffected. A hack - yes. Hint: we really
+need a transport I_T nexus reset callback added to the eh process
+(in between the SCSI target reset and hba reset points), so a
+fc logout could occur to the one bad target only and stop the error
+escalation process.
+
+This patch commonizes the approach so it can be used for sli3 and sli4
+adapters, but mandates the admin, via module parameter, specifically
+identify which adapters the resets are to be removed for. Additionally,
+bus_reset, which sends Target Reset TMFs to all targets, is also removed
+from the template as it too has the same effect as the adapter reset.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Laurence Oberman <loberman@redhat.com>
+	Tested-by:   Laurence Oberman <loberman@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 96418b5e2c8867da3279d877f5d1ffabfe460c3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_crtn.h
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_scsi.c
+diff --cc drivers/scsi/lpfc/lpfc_crtn.h
+index 5d7cb958427c,54e6ac42fbcd..000000000000
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@@ -355,7 -384,8 +355,12 @@@ void lpfc_free_sysfs_attr(struct lpfc_v
+  extern struct device_attribute *lpfc_hba_attrs[];
+  extern struct device_attribute *lpfc_vport_attrs[];
+  extern struct scsi_host_template lpfc_template;
+++<<<<<<< HEAD
+ +extern struct scsi_host_template lpfc_template_s3;
+++=======
++ extern struct scsi_host_template lpfc_template_no_hr;
++ extern struct scsi_host_template lpfc_template_nvme;
+++>>>>>>> 96418b5e2c88 (scsi: lpfc: Fix eh_deadline setting for sli3 adapters.)
+  extern struct scsi_host_template lpfc_vport_template;
+  extern struct fc_function_template lpfc_transport_functions;
+  extern struct fc_function_template lpfc_vport_transport_functions;
+@@@ -498,3 -531,28 +503,31 @@@ bool lpfc_find_next_oas_lun(struct lpfc
+  			    uint32_t *, uint32_t *);
+  int lpfc_sli4_dump_page_a0(struct lpfc_hba *phba, struct lpfcMboxq *mbox);
+  void lpfc_mbx_cmpl_rdp_page_a0(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb);
+++<<<<<<< HEAD
+++=======
++ 
++ /* NVME interfaces. */
++ void lpfc_nvme_unregister_port(struct lpfc_vport *vport,
++ 			struct lpfc_nodelist *ndlp);
++ int lpfc_nvme_register_port(struct lpfc_vport *vport,
++ 			struct lpfc_nodelist *ndlp);
++ int lpfc_nvme_create_localport(struct lpfc_vport *vport);
++ void lpfc_nvme_destroy_localport(struct lpfc_vport *vport);
++ void lpfc_nvme_update_localport(struct lpfc_vport *vport);
++ int lpfc_nvmet_create_targetport(struct lpfc_hba *phba);
++ int lpfc_nvmet_update_targetport(struct lpfc_hba *phba);
++ void lpfc_nvmet_destroy_targetport(struct lpfc_hba *phba);
++ void lpfc_nvmet_unsol_ls_event(struct lpfc_hba *phba,
++ 			struct lpfc_sli_ring *pring, struct lpfc_iocbq *piocb);
++ void lpfc_nvmet_unsol_fcp_event(struct lpfc_hba *phba,
++ 			struct lpfc_sli_ring *pring,
++ 			struct rqb_dmabuf *nvmebuf, uint64_t isr_ts);
++ void lpfc_nvme_mod_param_dep(struct lpfc_hba *phba);
++ void lpfc_nvme_abort_fcreq_cmpl(struct lpfc_hba *phba,
++ 				struct lpfc_iocbq *cmdiocb,
++ 				struct lpfc_wcqe_complete *abts_cmpl);
++ extern int lpfc_enable_nvmet_cnt;
++ extern unsigned long long lpfc_enable_nvmet[];
++ extern int lpfc_no_hba_reset_cnt;
++ extern unsigned long lpfc_no_hba_reset[];
+++>>>>>>> 96418b5e2c88 (scsi: lpfc: Fix eh_deadline setting for sli3 adapters.)
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index bbd4080d8122,4fa21a9fd883..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -3324,6 -3555,143 +3324,44 @@@ out_free_mem
+  	return rc;
+  }
+  
++ static uint64_t
++ lpfc_get_wwpn(struct lpfc_hba *phba)
++ {
++ 	uint64_t wwn;
++ 	int rc;
++ 	LPFC_MBOXQ_t *mboxq;
++ 	MAILBOX_t *mb;
++ 
++ 
++ 	mboxq = (LPFC_MBOXQ_t *) mempool_alloc(phba->mbox_mem_pool,
++ 						GFP_KERNEL);
++ 	if (!mboxq)
++ 		return (uint64_t)-1;
++ 
++ 	/* First get WWN of HBA instance */
++ 	lpfc_read_nv(phba, mboxq);
++ 	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
++ 	if (rc != MBX_SUCCESS) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 				"6019 Mailbox failed , mbxCmd x%x "
++ 				"READ_NV, mbxStatus x%x\n",
++ 				bf_get(lpfc_mqe_command, &mboxq->u.mqe),
++ 				bf_get(lpfc_mqe_status, &mboxq->u.mqe));
++ 		mempool_free(mboxq, phba->mbox_mem_pool);
++ 		return (uint64_t) -1;
++ 	}
++ 	mb = &mboxq->u.mb;
++ 	memcpy(&wwn, (char *)mb->un.varRDnvp.portname, sizeof(uint64_t));
++ 	/* wwn is WWPN of HBA instance */
++ 	mempool_free(mboxq, phba->mbox_mem_pool);
++ 	if (phba->sli_rev == LPFC_SLI_REV4)
++ 		return be64_to_cpu(wwn);
++ 	else
++ 		return (((wwn & 0xffffffff00000000) >> 32) |
++ 			((wwn & 0x00000000ffffffff) << 32));
++ 
++ }
++ 
+ -/**
+ - * lpfc_sli4_nvme_sgl_update - update xri-sgl sizing and mapping
+ - * @phba: pointer to lpfc hba data structure.
+ - *
+ - * This routine first calculates the sizes of the current els and allocated
+ - * scsi sgl lists, and then goes through all sgls to updates the physical
+ - * XRIs assigned due to port function reset. During port initialization, the
+ - * current els and allocated scsi sgl lists are 0s.
+ - *
+ - * Return codes
+ - *   0 - successful (for now, it always returns 0)
+ - **/
+ -int
+ -lpfc_sli4_nvme_sgl_update(struct lpfc_hba *phba)
+ -{
+ -	struct lpfc_nvme_buf *lpfc_ncmd = NULL, *lpfc_ncmd_next = NULL;
+ -	uint16_t i, lxri, els_xri_cnt;
+ -	uint16_t nvme_xri_cnt, nvme_xri_max;
+ -	LIST_HEAD(nvme_sgl_list);
+ -	int rc;
+ -
+ -	phba->total_nvme_bufs = 0;
+ -
+ -	if (!(phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME))
+ -		return 0;
+ -	/*
+ -	 * update on pci function's allocated nvme xri-sgl list
+ -	 */
+ -
+ -	/* maximum number of xris available for nvme buffers */
+ -	els_xri_cnt = lpfc_sli4_get_els_iocb_cnt(phba);
+ -	nvme_xri_max = phba->sli4_hba.max_cfg_param.max_xri - els_xri_cnt;
+ -	phba->sli4_hba.nvme_xri_max = nvme_xri_max;
+ -	phba->sli4_hba.nvme_xri_max -= phba->sli4_hba.scsi_xri_max;
+ -
+ -	lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
+ -			"6074 Current allocated NVME xri-sgl count:%d, "
+ -			"maximum  NVME xri count:%d\n",
+ -			phba->sli4_hba.nvme_xri_cnt,
+ -			phba->sli4_hba.nvme_xri_max);
+ -
+ -	spin_lock_irq(&phba->nvme_buf_list_get_lock);
+ -	spin_lock(&phba->nvme_buf_list_put_lock);
+ -	list_splice_init(&phba->lpfc_nvme_buf_list_get, &nvme_sgl_list);
+ -	list_splice(&phba->lpfc_nvme_buf_list_put, &nvme_sgl_list);
+ -	spin_unlock(&phba->nvme_buf_list_put_lock);
+ -	spin_unlock_irq(&phba->nvme_buf_list_get_lock);
+ -
+ -	if (phba->sli4_hba.nvme_xri_cnt > phba->sli4_hba.nvme_xri_max) {
+ -		/* max nvme xri shrunk below the allocated nvme buffers */
+ -		spin_lock_irq(&phba->nvme_buf_list_get_lock);
+ -		nvme_xri_cnt = phba->sli4_hba.nvme_xri_cnt -
+ -					phba->sli4_hba.nvme_xri_max;
+ -		spin_unlock_irq(&phba->nvme_buf_list_get_lock);
+ -		/* release the extra allocated nvme buffers */
+ -		for (i = 0; i < nvme_xri_cnt; i++) {
+ -			list_remove_head(&nvme_sgl_list, lpfc_ncmd,
+ -					 struct lpfc_nvme_buf, list);
+ -			if (lpfc_ncmd) {
+ -				pci_pool_free(phba->lpfc_sg_dma_buf_pool,
+ -					      lpfc_ncmd->data,
+ -					      lpfc_ncmd->dma_handle);
+ -				kfree(lpfc_ncmd);
+ -			}
+ -		}
+ -		spin_lock_irq(&phba->nvme_buf_list_get_lock);
+ -		phba->sli4_hba.nvme_xri_cnt -= nvme_xri_cnt;
+ -		spin_unlock_irq(&phba->nvme_buf_list_get_lock);
+ -	}
+ -
+ -	/* update xris associated to remaining allocated nvme buffers */
+ -	lpfc_ncmd = NULL;
+ -	lpfc_ncmd_next = NULL;
+ -	list_for_each_entry_safe(lpfc_ncmd, lpfc_ncmd_next,
+ -				 &nvme_sgl_list, list) {
+ -		lxri = lpfc_sli4_next_xritag(phba);
+ -		if (lxri == NO_XRI) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
+ -					"6075 Failed to allocate xri for "
+ -					"nvme buffer\n");
+ -			rc = -ENOMEM;
+ -			goto out_free_mem;
+ -		}
+ -		lpfc_ncmd->cur_iocbq.sli4_lxritag = lxri;
+ -		lpfc_ncmd->cur_iocbq.sli4_xritag = phba->sli4_hba.xri_ids[lxri];
+ -	}
+ -	spin_lock_irq(&phba->nvme_buf_list_get_lock);
+ -	spin_lock(&phba->nvme_buf_list_put_lock);
+ -	list_splice_init(&nvme_sgl_list, &phba->lpfc_nvme_buf_list_get);
+ -	INIT_LIST_HEAD(&phba->lpfc_nvme_buf_list_put);
+ -	spin_unlock(&phba->nvme_buf_list_put_lock);
+ -	spin_unlock_irq(&phba->nvme_buf_list_get_lock);
+ -	return 0;
+ -
+ -out_free_mem:
+ -	lpfc_nvme_free(phba);
+ -	return rc;
+ -}
+ -
+  /**
+   * lpfc_create_port - Create an FC port
+   * @phba: pointer to lpfc hba data structure.
+@@@ -3344,18 -3712,38 +3382,50 @@@ struct lpfc_vport 
+  lpfc_create_port(struct lpfc_hba *phba, int instance, struct device *dev)
+  {
+  	struct lpfc_vport *vport;
+ -	struct Scsi_Host  *shost = NULL;
+ +	struct Scsi_Host  *shost;
+  	int error = 0;
++ 	int i;
++ 	uint64_t wwn;
++ 	bool use_no_reset_hba = false;
++ 
++ 	wwn = lpfc_get_wwpn(phba);
++ 
++ 	for (i = 0; i < lpfc_no_hba_reset_cnt; i++) {
++ 		if (wwn == lpfc_no_hba_reset[i]) {
++ 			lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 					"6020 Setting use_no_reset port=%llx\n",
++ 					wwn);
++ 			use_no_reset_hba = true;
++ 			break;
++ 		}
++ 	}
+  
+++<<<<<<< HEAD
+ +	if (dev != &phba->pcidev->dev) {
+ +		shost = scsi_host_alloc(&lpfc_vport_template,
+ +					sizeof(struct lpfc_vport));
+ +	} else {
+ +		if (phba->sli_rev == LPFC_SLI_REV4)
+ +			shost = scsi_host_alloc(&lpfc_template,
+ +					sizeof(struct lpfc_vport));
+ +		else
+ +			shost = scsi_host_alloc(&lpfc_template_s3,
+++=======
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP) {
++ 		if (dev != &phba->pcidev->dev) {
++ 			shost = scsi_host_alloc(&lpfc_vport_template,
++ 						sizeof(struct lpfc_vport));
++ 		} else {
++ 			if (!use_no_reset_hba)
++ 				shost = scsi_host_alloc(&lpfc_template,
++ 						sizeof(struct lpfc_vport));
++ 			else
++ 				shost = scsi_host_alloc(&lpfc_template_no_hr,
++ 						sizeof(struct lpfc_vport));
++ 		}
++ 	} else if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++ 		shost = scsi_host_alloc(&lpfc_template_nvme,
+++>>>>>>> 96418b5e2c88 (scsi: lpfc: Fix eh_deadline setting for sli3 adapters.)
+  					sizeof(struct lpfc_vport));
+  	}
+  	if (!shost)
+diff --cc drivers/scsi/lpfc/lpfc_scsi.c
+index 91cc6b746952,bcfd6d6ab16d..000000000000
+--- a/drivers/scsi/lpfc/lpfc_scsi.c
++++ b/drivers/scsi/lpfc/lpfc_scsi.c
+@@@ -6030,7 -5911,49 +6030,53 @@@ lpfc_disable_oas_lun(struct lpfc_hba *p
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +struct scsi_host_template lpfc_template_s3 = {
+++=======
++ static int
++ lpfc_no_command(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
++ {
++ 	return SCSI_MLQUEUE_HOST_BUSY;
++ }
++ 
++ static int
++ lpfc_no_handler(struct scsi_cmnd *cmnd)
++ {
++ 	return FAILED;
++ }
++ 
++ static int
++ lpfc_no_slave(struct scsi_device *sdev)
++ {
++ 	return -ENODEV;
++ }
++ 
++ struct scsi_host_template lpfc_template_nvme = {
++ 	.module			= THIS_MODULE,
++ 	.name			= LPFC_DRIVER_NAME,
++ 	.proc_name		= LPFC_DRIVER_NAME,
++ 	.info			= lpfc_info,
++ 	.queuecommand		= lpfc_no_command,
++ 	.eh_abort_handler	= lpfc_no_handler,
++ 	.eh_device_reset_handler = lpfc_no_handler,
++ 	.eh_target_reset_handler = lpfc_no_handler,
++ 	.eh_bus_reset_handler	= lpfc_no_handler,
++ 	.eh_host_reset_handler  = lpfc_no_handler,
++ 	.slave_alloc		= lpfc_no_slave,
++ 	.slave_configure	= lpfc_no_slave,
++ 	.scan_finished		= lpfc_scan_finished,
++ 	.this_id		= -1,
++ 	.sg_tablesize		= 1,
++ 	.cmd_per_lun		= 1,
++ 	.use_clustering		= ENABLE_CLUSTERING,
++ 	.shost_attrs		= lpfc_hba_attrs,
++ 	.max_sectors		= 0xFFFF,
++ 	.vendor_id		= LPFC_NL_VENDOR_ID,
++ 	.track_queue_depth	= 0,
++ };
++ 
++ struct scsi_host_template lpfc_template_no_hr = {
+++>>>>>>> 96418b5e2c88 (scsi: lpfc: Fix eh_deadline setting for sli3 adapters.)
+  	.module			= THIS_MODULE,
+  	.name			= LPFC_DRIVER_NAME,
+  	.proc_name		= LPFC_DRIVER_NAME,
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 79f57d03022e..266a4ddd5ee7 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -95,6 +95,7 @@ struct lpfc_sli2_slim;
+ #define FC_MAX_ADPTMSG		64
+ 
+ #define MAX_HBAEVT	32
++#define MAX_HBAS_NO_RESET 16
+ 
+ /* Number of MSI-X vectors the driver uses */
+ #define LPFC_MSIX_VECTORS	2
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index c5f7d60f9dff..bd44bd80cbff 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -2841,6 +2841,12 @@ MODULE_PARM_DESC(lpfc_poll, "FCP ring polling mode control:"
+ static DEVICE_ATTR(lpfc_poll, S_IRUGO | S_IWUSR,
+ 		   lpfc_poll_show, lpfc_poll_store);
+ 
++int lpfc_no_hba_reset_cnt;
++unsigned long lpfc_no_hba_reset[MAX_HBAS_NO_RESET] = {
++	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
++module_param_array(lpfc_no_hba_reset, ulong, &lpfc_no_hba_reset_cnt, 0444);
++MODULE_PARM_DESC(lpfc_no_hba_reset, "WWPN of HBAs that should not be reset");
++
+ LPFC_ATTR(sli_mode, 0, 0, 3,
+ 	"SLI mode selector:"
+ 	" 0 - auto (SLI-3 if supported),"
+* Unmerged path drivers/scsi/lpfc/lpfc_crtn.h
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+* Unmerged path drivers/scsi/lpfc/lpfc_scsi.c
