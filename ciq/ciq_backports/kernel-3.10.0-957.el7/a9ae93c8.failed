@@ -1,0 +1,125 @@
+md/raid10: abort delayed writes when device fails.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid10: abort delayed writes when device fails (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 95.83%
+commit-author NeilBrown <neilb@suse.com>
+commit a9ae93c8cc0b63d8283f335604362f903d2244e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a9ae93c8.failed
+
+When writing to an array with a bitmap enabled, the writes are grouped
+in batches which are preceded by an update to the bitmap.
+
+It is quite likely if that a drive develops a problem which is not
+media related, that the bitmap write will be the first to report an
+error and cause the device to be marked faulty (as the bitmap write is
+at the start of a batch).
+
+In this case, there is point submiting the subsequent writes to the
+failed device - that just wastes times.
+
+So re-check the Faulty state of a device before submitting a
+delayed write.
+
+This requires that we keep the 'rdev', rather than the 'bdev' in the
+bio, then swap in the bdev just before final submission.
+
+	Reported-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit a9ae93c8cc0b63d8283f335604362f903d2244e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid10.c
+index 9a07a3527a9a,5290be3d5c26..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -971,11 -858,16 +971,21 @@@ static void flush_pending_writes(struc
+  
+  		while (bio) { /* submit pending writes */
+  			struct bio *next = bio->bi_next;
++ 			struct md_rdev *rdev = (void*)bio->bi_bdev;
+  			bio->bi_next = NULL;
+++<<<<<<< HEAD
+ +			if (unlikely((bio->bi_rw & REQ_DISCARD) &&
+ +			    !blk_queue_discard(bdev_get_queue(bio->bi_bdev))))
+++=======
++ 			bio->bi_bdev = rdev->bdev;
++ 			if (test_bit(Faulty, &rdev->flags)) {
++ 				bio->bi_error = -EIO;
++ 				bio_endio(bio);
++ 			} else if (unlikely((bio_op(bio) ==  REQ_OP_DISCARD) &&
++ 					    !blk_queue_discard(bdev_get_queue(bio->bi_bdev))))
+++>>>>>>> a9ae93c8cc0b (md/raid10: abort delayed writes when device fails.)
+  				/* Just ignore it */
+ -				bio_endio(bio);
+ +				bio_endio(bio, 0);
+  			else
+  				generic_make_request(bio);
+  			bio = next;
+@@@ -1150,11 -1041,16 +1160,21 @@@ static void raid10_unplug(struct blk_pl
+  
+  	while (bio) { /* submit pending writes */
+  		struct bio *next = bio->bi_next;
++ 		struct md_rdev *rdev = (void*)bio->bi_bdev;
+  		bio->bi_next = NULL;
+++<<<<<<< HEAD
+ +		if (unlikely((bio->bi_rw & REQ_DISCARD) &&
+ +		    !blk_queue_discard(bdev_get_queue(bio->bi_bdev))))
+++=======
++ 		bio->bi_bdev = rdev->bdev;
++ 		if (test_bit(Faulty, &rdev->flags)) {
++ 			bio->bi_error = -EIO;
++ 			bio_endio(bio);
++ 		} else if (unlikely((bio_op(bio) ==  REQ_OP_DISCARD) &&
++ 				    !blk_queue_discard(bdev_get_queue(bio->bi_bdev))))
+++>>>>>>> a9ae93c8cc0b (md/raid10: abort delayed writes when device fails.)
+  			/* Just ignore it */
+ -			bio_endio(bio);
+ +			bio_endio(bio, 0);
+  		else
+  			generic_make_request(bio);
+  		bio = next;
+@@@ -1518,16 -1364,12 +1538,16 @@@ retry_write
+  				 max_sectors);
+  			r10_bio->devs[i].bio = mbio;
+  
+ -			mbio->bi_iter.bi_sector	= (r10_bio->devs[i].addr+
+ +			mbio->bi_sector	= (r10_bio->devs[i].addr+
+  					   choose_data_offset(r10_bio,
+  							      rdev));
+- 			mbio->bi_bdev = rdev->bdev;
++ 			mbio->bi_bdev = (void*)rdev;
+  			mbio->bi_end_io	= raid10_end_write_request;
+ -			bio_set_op_attrs(mbio, op, do_sync | do_fua);
+ +			mbio->bi_rw =
+ +				WRITE | do_sync | do_fua | do_discard | do_same;
+ +			if (test_bit(FailFast, &conf->mirrors[d].rdev->flags) &&
+ +			    enough(conf, d))
+ +				mbio->bi_rw |= MD_FAILFAST;
+  			mbio->bi_private = r10_bio;
+  
+  			atomic_inc(&r10_bio->remaining);
+@@@ -1564,13 -1406,12 +1584,13 @@@
+  				 max_sectors);
+  			r10_bio->devs[i].repl_bio = mbio;
+  
+ -			mbio->bi_iter.bi_sector	= (r10_bio->devs[i].addr +
+ +			mbio->bi_sector	= (r10_bio->devs[i].addr +
+  					   choose_data_offset(
+  						   r10_bio, rdev));
+- 			mbio->bi_bdev = rdev->bdev;
++ 			mbio->bi_bdev = (void*)rdev;
+  			mbio->bi_end_io	= raid10_end_write_request;
+ -			bio_set_op_attrs(mbio, op, do_sync | do_fua);
+ +			mbio->bi_rw =
+ +				WRITE | do_sync | do_fua | do_discard | do_same;
+  			mbio->bi_private = r10_bio;
+  
+  			atomic_inc(&r10_bio->remaining);
+* Unmerged path drivers/md/raid10.c
