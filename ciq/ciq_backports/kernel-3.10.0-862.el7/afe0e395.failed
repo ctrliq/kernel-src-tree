@@ -1,0 +1,103 @@
+radix-tree: fix several shrinking bugs with multiorder entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matthew Wilcox <willy@linux.intel.com>
+commit afe0e395b6d1817fa5393f1ad6fcbf71406b016d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/afe0e395.failed
+
+Setting the indirect bit on the user data entry used to be unambiguous
+because the tree walking code knew not to expect internal nodes in the
+last level of the tree.  Multiorder entries can appear at any level of
+the tree, and a leaf with the indirect bit set is indistinguishable from
+a pointer to a node.
+
+Introduce a special entry (RADIX_TREE_RETRY) which is neither a valid
+user entry, nor a valid pointer to a node.  The radix_tree_deref_retry()
+function continues to work the same way, but tree walking code can
+distinguish it from a pointer to a node.
+
+Also fix the condition for setting slot->parent to NULL; it does not
+matter what height the tree is, it only matters whether slot is an
+indirect pointer.  Move this code above the comment which is referring
+to the assignment to root->rnode.
+
+Also fix the condition for preventing the tree from shrinking to a
+single entry if it's a multiorder entry.
+
+Add a test-case to the test suite that checks that the tree goes back
+down to its original height after an item is inserted & deleted from a
+higher index in the tree.
+
+	Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Neil Brown <neilb@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit afe0e395b6d1817fa5393f1ad6fcbf71406b016d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/radix-tree/multiorder.c
+* Unmerged path tools/testing/radix-tree/multiorder.c
+diff --git a/lib/radix-tree.c b/lib/radix-tree.c
+index 5fd60c1321cf..55764fa8298f 100644
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@ -78,6 +78,8 @@ static inline void *indirect_to_ptr(void *ptr)
+ 	return (void *)((unsigned long)ptr & ~RADIX_TREE_INDIRECT_PTR);
+ }
+ 
++#define RADIX_TREE_RETRY	ptr_to_indirect(NULL)
++
+ #ifdef CONFIG_RADIX_TREE_MULTIORDER
+ /* Sibling slots point directly to another slot in the same node */
+ static inline bool is_sibling_entry(struct radix_tree_node *parent, void *node)
+@@ -1418,6 +1420,14 @@ static inline void radix_tree_shrink(struct radix_tree_root *root)
+ 		slot = to_free->slots[0];
+ 		if (!slot)
+ 			break;
++		if (!radix_tree_is_indirect_ptr(slot) && (root->height > 1))
++			break;
++
++		if (radix_tree_is_indirect_ptr(slot)) {
++			slot = indirect_to_ptr(slot);
++			slot->parent = NULL;
++			slot = ptr_to_indirect(slot);
++		}
+ 
+ 		/*
+ 		 * We don't need rcu_assign_pointer(), since we are simply
+@@ -1426,14 +1436,6 @@ static inline void radix_tree_shrink(struct radix_tree_root *root)
+ 		 * (to_free->slots[0]), it will be safe to dereference the new
+ 		 * one (root->rnode) as far as dependent read barriers go.
+ 		 */
+-		if (root->height > 1) {
+-			if (!radix_tree_is_indirect_ptr(slot))
+-				break;
+-
+-			slot = indirect_to_ptr(slot);
+-			slot->parent = NULL;
+-			slot = ptr_to_indirect(slot);
+-		}
+ 		root->rnode = slot;
+ 		root->height--;
+ 
+@@ -1455,9 +1457,8 @@ static inline void radix_tree_shrink(struct radix_tree_root *root)
+ 		 * also results in a stale slot). So tag the slot as indirect
+ 		 * to force callers to retry.
+ 		 */
+-		if (root->height == 0)
+-			*((unsigned long *)&to_free->slots[0]) |=
+-						RADIX_TREE_INDIRECT_PTR;
++		if (!radix_tree_is_indirect_ptr(slot))
++			to_free->slots[0] = RADIX_TREE_RETRY;
+ 
+ 		radix_tree_node_free(to_free);
+ 	}
+* Unmerged path tools/testing/radix-tree/multiorder.c
