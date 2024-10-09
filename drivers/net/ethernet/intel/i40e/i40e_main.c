@@ -3285,6 +3285,7 @@ static void i40e_fdir_filter_restore(struct i40e_vsi *vsi)
 	/* Reset FDir counters as we're replaying all existing filters */
 	pf->fd_tcp4_filter_cnt = 0;
 	pf->fd_udp4_filter_cnt = 0;
+	pf->fd_sctp4_filter_cnt = 0;
 	pf->fd_ip4_filter_cnt = 0;
 
 	hlist_for_each_entry_safe(filter, node,
@@ -5775,6 +5776,7 @@ static void i40e_fdir_filter_exit(struct i40e_pf *pf)
 	pf->fdir_pf_active_filters = 0;
 	pf->fd_tcp4_filter_cnt = 0;
 	pf->fd_udp4_filter_cnt = 0;
+	pf->fd_sctp4_filter_cnt = 0;
 	pf->fd_ip4_filter_cnt = 0;
 
 	/* Reprogram the default input set for TCP/IPv4 */
