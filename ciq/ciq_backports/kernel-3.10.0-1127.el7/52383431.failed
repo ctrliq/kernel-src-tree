@@ -1,0 +1,686 @@
+mm: get rid of __GFP_KMEMCG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 52383431b37cdbec63944e953ffc2698a7ad9722
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/52383431.failed
+
+Currently to allocate a page that should be charged to kmemcg (e.g.
+threadinfo), we pass __GFP_KMEMCG flag to the page allocator.  The page
+allocated is then to be freed by free_memcg_kmem_pages.  Apart from
+looking asymmetrical, this also requires intrusion to the general
+allocation path.  So let's introduce separate functions that will
+alloc/free pages charged to kmemcg.
+
+The new functions are called alloc_kmem_pages and free_kmem_pages.  They
+should be used when the caller actually would like to use kmalloc, but
+has to fall back to the page allocator for the allocation is large.
+They only differ from alloc_pages and free_pages in that besides
+allocating or freeing pages they also charge them to the kmem resource
+counter of the current memory cgroup.
+
+[sfr@canb.auug.org.au: export kmalloc_order() to modules]
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Acked-by: Greg Thelen <gthelen@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.cz>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Cc: Christoph Lameter <cl@linux-foundation.org>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 52383431b37cdbec63944e953ffc2698a7ad9722)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/slab.h
+#	mm/memcontrol.c
+#	mm/page_alloc.c
+#	mm/slab_common.c
+#	mm/slub.c
+diff --cc include/linux/slab.h
+index 08eb6cb8d885,a6aab2c0dfc5..000000000000
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@@ -292,11 -311,154 +292,20 @@@ static __always_inline int kmalloc_inde
+  
+  #ifdef CONFIG_SLAB
+  #include <linux/slab_def.h>
+ -#endif
+ -
+ -#ifdef CONFIG_SLUB
+ +#elif defined(CONFIG_SLUB)
+  #include <linux/slub_def.h>
+++<<<<<<< HEAD
+++=======
++ #endif
++ 
++ extern void *kmalloc_order(size_t size, gfp_t flags, unsigned int order);
++ 
++ #ifdef CONFIG_TRACING
++ extern void *kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order);
+++>>>>>>> 52383431b37c (mm: get rid of __GFP_KMEMCG)
+  #else
+ -static __always_inline void *
+ -kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
+ -{
+ -	return kmalloc_order(size, flags, order);
+ -}
+ -#endif
+ -
+ -static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+ -{
+ -	unsigned int order = get_order(size);
+ -	return kmalloc_order_trace(size, flags, order);
+ -}
+ -
+ -/**
+ - * kmalloc - allocate memory
+ - * @size: how many bytes of memory are required.
+ - * @flags: the type of memory to allocate.
+ - *
+ - * kmalloc is the normal method of allocating memory
+ - * for objects smaller than page size in the kernel.
+ - *
+ - * The @flags argument may be one of:
+ - *
+ - * %GFP_USER - Allocate memory on behalf of user.  May sleep.
+ - *
+ - * %GFP_KERNEL - Allocate normal kernel ram.  May sleep.
+ - *
+ - * %GFP_ATOMIC - Allocation will not sleep.  May use emergency pools.
+ - *   For example, use this inside interrupt handlers.
+ - *
+ - * %GFP_HIGHUSER - Allocate pages from high memory.
+ - *
+ - * %GFP_NOIO - Do not do any I/O at all while trying to get memory.
+ - *
+ - * %GFP_NOFS - Do not make any fs calls while trying to get memory.
+ - *
+ - * %GFP_NOWAIT - Allocation will not sleep.
+ - *
+ - * %__GFP_THISNODE - Allocate node-local memory only.
+ - *
+ - * %GFP_DMA - Allocation suitable for DMA.
+ - *   Should only be used for kmalloc() caches. Otherwise, use a
+ - *   slab created with SLAB_DMA.
+ - *
+ - * Also it is possible to set different flags by OR'ing
+ - * in one or more of the following additional @flags:
+ - *
+ - * %__GFP_COLD - Request cache-cold pages instead of
+ - *   trying to return cache-warm pages.
+ - *
+ - * %__GFP_HIGH - This allocation has high priority and may use emergency pools.
+ - *
+ - * %__GFP_NOFAIL - Indicate that this allocation is in no way allowed to fail
+ - *   (think twice before using).
+ - *
+ - * %__GFP_NORETRY - If memory is not immediately available,
+ - *   then give up at once.
+ - *
+ - * %__GFP_NOWARN - If allocation fails, don't issue any warnings.
+ - *
+ - * %__GFP_REPEAT - If allocation fails initially, try once more before failing.
+ - *
+ - * There are other flags available as well, but these are not intended
+ - * for general use, and so are not documented here. For a full list of
+ - * potential flags, always refer to linux/gfp.h.
+ - */
+ -static __always_inline void *kmalloc(size_t size, gfp_t flags)
+ -{
+ -	if (__builtin_constant_p(size)) {
+ -		if (size > KMALLOC_MAX_CACHE_SIZE)
+ -			return kmalloc_large(size, flags);
+ -#ifndef CONFIG_SLOB
+ -		if (!(flags & GFP_DMA)) {
+ -			int index = kmalloc_index(size);
+ -
+ -			if (!index)
+ -				return ZERO_SIZE_PTR;
+ -
+ -			return kmem_cache_alloc_trace(kmalloc_caches[index],
+ -					flags, size);
+ -		}
+ +#error "Unknown slab allocator"
+  #endif
+ -	}
+ -	return __kmalloc(size, flags);
+ -}
+  
+  /*
+   * Determine size used for the nth kmalloc cache.
+diff --cc mm/memcontrol.c
+index 16fe5606ed59,7bab1de50f48..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3562,16 -3536,37 +3562,42 @@@ __memcg_kmem_newpage_charge(gfp_t gfp, 
+  	int ret;
+  
+  	*_memcg = NULL;
+ +	memcg = try_get_mem_cgroup_from_mm(current->mm);
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * very rare case described in mem_cgroup_from_task. Unfortunately there
+ +	 * isn't much we can do without complicating this too much, and it would
+ +	 * be gfp-dependent anyway. Just let it go
+++=======
++ 	 * Disabling accounting is only relevant for some specific memcg
++ 	 * internal allocations. Therefore we would initially not have such
++ 	 * check here, since direct calls to the page allocator that are
++ 	 * accounted to kmemcg (alloc_kmem_pages and friends) only happen
++ 	 * outside memcg core. We are mostly concerned with cache allocations,
++ 	 * and by having this test at memcg_kmem_get_cache, we are already able
++ 	 * to relay the allocation to the root cache and bypass the memcg cache
++ 	 * altogether.
++ 	 *
++ 	 * There is one exception, though: the SLUB allocator does not create
++ 	 * large order caches, but rather service large kmallocs directly from
++ 	 * the page allocator. Therefore, the following sequence when backed by
++ 	 * the SLUB allocator:
++ 	 *
++ 	 *	memcg_stop_kmem_account();
++ 	 *	kmalloc(<large_number>)
++ 	 *	memcg_resume_kmem_account();
++ 	 *
++ 	 * would effectively ignore the fact that we should skip accounting,
++ 	 * since it will drive us directly to this function without passing
++ 	 * through the cache selector memcg_kmem_get_cache. Such large
++ 	 * allocations are extremely rare but can happen, for instance, for the
++ 	 * cache arrays. We bring this test here.
+++>>>>>>> 52383431b37c (mm: get rid of __GFP_KMEMCG)
+  	 */
+ -	if (!current->mm || current->memcg_kmem_skip_account)
+ +	if (unlikely(!memcg))
+  		return true;
+  
+ -	memcg = get_mem_cgroup_from_mm(current->mm);
+ -
+  	if (!memcg_can_account_kmem(memcg)) {
+  		css_put(&memcg->css);
+  		return true;
+diff --cc mm/page_alloc.c
+index 10b3d04ee8fe,7cfdcd808f52..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -3386,10 -2694,9 +3386,9 @@@ __alloc_pages_nodemask(gfp_t gfp_mask, 
+  	enum zone_type high_zoneidx = gfp_zone(gfp_mask);
+  	struct zone *preferred_zone;
+  	struct page *page = NULL;
+ -	int migratetype = allocflags_to_migratetype(gfp_mask);
+ +	int migratetype = gfpflags_to_migratetype(gfp_mask);
+  	unsigned int cpuset_mems_cookie;
+  	int alloc_flags = ALLOC_WMARK_LOW|ALLOC_CPUSET|ALLOC_FAIR;
+- 	struct mem_cgroup *memcg = NULL;
+  
+  	gfp_mask &= gfp_allowed_mask;
+  
+@@@ -3474,216 -2774,94 +3466,243 @@@ out
+  	if (unlikely(!page && read_mems_allowed_retry(cpuset_mems_cookie)))
+  		goto retry_cpuset;
+  
+- 	memcg_kmem_commit_charge(page, memcg, order);
+- 
+  	return page;
+  }
+ -EXPORT_SYMBOL(__alloc_pages_nodemask);
+ +EXPORT_SYMBOL(__alloc_pages_nodemask);
+ +
+ +/*
+ + * Common helper functions.
+ + */
+ +unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)
+ +{
+ +	struct page *page;
+ +
+ +	/*
+ +	 * __get_free_pages() returns a 32-bit address, which cannot represent
+ +	 * a highmem page
+ +	 */
+ +	VM_BUG_ON((gfp_mask & __GFP_HIGHMEM) != 0);
+ +
+ +	page = alloc_pages(gfp_mask, order);
+ +	if (!page)
+ +		return 0;
+ +	return (unsigned long) page_address(page);
+ +}
+ +EXPORT_SYMBOL(__get_free_pages);
+ +
+ +unsigned long get_zeroed_page(gfp_t gfp_mask)
+ +{
+ +	return __get_free_pages(gfp_mask | __GFP_ZERO, 0);
+ +}
+ +EXPORT_SYMBOL(get_zeroed_page);
+ +
+ +void __free_pages(struct page *page, unsigned int order)
+ +{
+ +	if (put_page_testzero(page)) {
+ +		if (order == 0)
+ +			free_hot_cold_page(page, false);
+ +		else
+ +			__free_pages_ok(page, order);
+ +	}
+ +}
+ +
+ +EXPORT_SYMBOL(__free_pages);
+ +
+ +void free_pages(unsigned long addr, unsigned int order)
+ +{
+ +	if (addr != 0) {
+ +		VM_BUG_ON(!virt_addr_valid((void *)addr));
+ +		__free_pages(virt_to_page((void *)addr), order);
+ +	}
+ +}
+ +
+ +EXPORT_SYMBOL(free_pages);
+ +
+ +/*
+++<<<<<<< HEAD
+ + * Page Fragment:
+ + *  An arbitrary-length arbitrary-offset area of memory which resides
+ + *  within a 0 or higher order page.  Multiple fragments within that page
+ + *  are individually refcounted, in the page's reference counter.
+ + *
+ + * The page_frag functions below provide a simple allocation framework for
+ + * page fragments.  This is used by the network stack and network device
+ + * drivers to provide a backing region of memory for use as either an
+ + * sk_buff->head, or to be used in the "frags" portion of skb_shared_info.
+ + */
+ +static struct page *__page_frag_cache_refill(struct page_frag_cache *nc,
+ +					     gfp_t gfp_mask)
+ +{
+ +	struct page *page = NULL;
+ +	gfp_t gfp = gfp_mask;
+ +
+ +#if (PAGE_SIZE < PAGE_FRAG_CACHE_MAX_SIZE)
+ +	gfp_mask |= __GFP_COMP | __GFP_NOWARN | __GFP_NORETRY |
+ +		    __GFP_NOMEMALLOC;
+ +	page = alloc_pages_node(NUMA_NO_NODE, gfp_mask,
+ +				PAGE_FRAG_CACHE_MAX_ORDER);
+ +	nc->size = page ? PAGE_FRAG_CACHE_MAX_SIZE : PAGE_SIZE;
+ +#endif
+ +	if (unlikely(!page))
+ +		page = alloc_pages_node(NUMA_NO_NODE, gfp, 0);
+ +
+ +	nc->va = page ? page_address(page) : NULL;
+ +
+ +	return page;
+ +}
+ +
+ +void __page_frag_cache_drain(struct page *page, unsigned int count)
+ +{
+ +	VM_BUG_ON_PAGE(page_ref_count(page) == 0, page);
+ +
+ +	if (page_ref_sub_and_test(page, count)) {
+ +		unsigned int order = compound_order(page);
+ +
+ +		if (order == 0)
+ +			free_hot_cold_page(page, false);
+ +		else
+ +			__free_pages_ok(page, order);
+ +	}
+ +}
+ +EXPORT_SYMBOL(__page_frag_cache_drain);
+ +
+ +void *page_frag_alloc(struct page_frag_cache *nc,
+ +		      unsigned int fragsz, gfp_t gfp_mask)
+ +{
+ +	unsigned int size = PAGE_SIZE;
+ +	struct page *page;
+ +	int offset;
+ +
+ +	if (unlikely(!nc->va)) {
+ +refill:
+ +		page = __page_frag_cache_refill(nc, gfp_mask);
+ +		if (!page)
+ +			return NULL;
+ +
+ +#if (PAGE_SIZE < PAGE_FRAG_CACHE_MAX_SIZE)
+ +		/* if size can vary use size else just use PAGE_SIZE */
+ +		size = nc->size;
+ +#endif
+ +		/* Even if we own the page, we do not use atomic_set().
+ +		 * This would break get_page_unless_zero() users.
+ +		 */
+ +		page_ref_add(page, size - 1);
+ +
+ +		/* reset page count bias and offset to start of new frag */
+ +		nc->pfmemalloc = page_is_pfmemalloc(page);
+ +		nc->pagecnt_bias = size;
+ +		nc->offset = size;
+ +	}
+ +
+ +	offset = nc->offset - fragsz;
+ +	if (unlikely(offset < 0)) {
+ +		page = virt_to_page(nc->va);
+ +
+ +		if (!page_ref_sub_and_test(page, nc->pagecnt_bias))
+ +			goto refill;
+ +
+ +#if (PAGE_SIZE < PAGE_FRAG_CACHE_MAX_SIZE)
+ +		/* if size can vary use size else just use PAGE_SIZE */
+ +		size = nc->size;
+ +#endif
+ +		/* OK, page count is 0, we can safely set it */
+ +		set_page_count(page, size);
+ +
+ +		/* reset page count bias and offset to start of new frag */
+ +		nc->pagecnt_bias = size;
+ +		offset = size - fragsz;
+ +	}
+ +
+ +	nc->pagecnt_bias--;
+ +	nc->offset = offset;
+ +
+ +	return nc->va + offset;
+ +}
+ +EXPORT_SYMBOL(page_frag_alloc);
+  
+  /*
+ - * Common helper functions.
+ + * Frees a page fragment allocated out of either a compound or order 0 page.
+   */
+ -unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)
+ +void page_frag_free(void *addr)
+  {
+ -	struct page *page;
+ -
+ -	/*
+ -	 * __get_free_pages() returns a 32-bit address, which cannot represent
+ -	 * a highmem page
+ -	 */
+ -	VM_BUG_ON((gfp_mask & __GFP_HIGHMEM) != 0);
+ +	struct page *page = virt_to_head_page(addr);
+  
+ -	page = alloc_pages(gfp_mask, order);
+ -	if (!page)
+ -		return 0;
+ -	return (unsigned long) page_address(page);
+ +	if (unlikely(put_page_testzero(page)))
+ +		__free_pages_ok(page, compound_order(page));
+  }
+ -EXPORT_SYMBOL(__get_free_pages);
+ +EXPORT_SYMBOL(page_frag_free);
+  
+ -unsigned long get_zeroed_page(gfp_t gfp_mask)
+ +/*
+ + * alloc_kmem_pages charges newly allocated pages to the kmem resource counter
+ + * of the current memory cgroup.
+ + *
+ + * It should be used when the caller would like to use kmalloc, but since the
+ + * allocation is large, it has to fall back to the page allocator.
+ + */
+ +struct page *alloc_kmem_pages(gfp_t gfp_mask, unsigned int order)
+  {
+ -	return __get_free_pages(gfp_mask | __GFP_ZERO, 0);
+ -}
+ -EXPORT_SYMBOL(get_zeroed_page);
+ +	struct page *page;
+ +	struct mem_cgroup *memcg = NULL;
+  
+ -void __free_pages(struct page *page, unsigned int order)
+ -{
+ -	if (put_page_testzero(page)) {
+ -		if (order == 0)
+ -			free_hot_cold_page(page, 0);
+ -		else
+ -			__free_pages_ok(page, order);
+ -	}
+ +	if (!memcg_kmem_newpage_charge(gfp_mask, &memcg, order))
+ +		return NULL;
+ +	page = alloc_pages(gfp_mask, order);
+ +	memcg_kmem_commit_charge(page, memcg, order);
+ +	return page;
+  }
+  
+ -EXPORT_SYMBOL(__free_pages);
+ -
+ -void free_pages(unsigned long addr, unsigned int order)
+ +struct page *alloc_kmem_pages_node(int nid, gfp_t gfp_mask, unsigned int order)
+  {
+ -	if (addr != 0) {
+ -		VM_BUG_ON(!virt_addr_valid((void *)addr));
+ -		__free_pages(virt_to_page((void *)addr), order);
+ -	}
+ -}
+ +	struct page *page;
+ +	struct mem_cgroup *memcg = NULL;
+  
+ -EXPORT_SYMBOL(free_pages);
+ +	if (!memcg_kmem_newpage_charge(gfp_mask, &memcg, order))
+ +		return NULL;
+ +	page = alloc_pages_node(nid, gfp_mask, order);
+ +	memcg_kmem_commit_charge(page, memcg, order);
+ +	return page;
+ +}
+  
+  /*
+ + * __free_memcg_kmem_pages and free_memcg_kmem_pages will free
+ + * pages allocated with __GFP_KMEMCG.
+++=======
++  * alloc_kmem_pages charges newly allocated pages to the kmem resource counter
++  * of the current memory cgroup.
+++>>>>>>> 52383431b37c (mm: get rid of __GFP_KMEMCG)
+   *
+-  * Those pages are accounted to a particular memcg, embedded in the
+-  * corresponding page_cgroup. To avoid adding a hit in the allocator to search
+-  * for that information only to find out that it is NULL for users who have no
+-  * interest in that whatsoever, we provide these functions.
+-  *
+-  * The caller knows better which flags it relies on.
++  * It should be used when the caller would like to use kmalloc, but since the
++  * allocation is large, it has to fall back to the page allocator.
++  */
++ struct page *alloc_kmem_pages(gfp_t gfp_mask, unsigned int order)
++ {
++ 	struct page *page;
++ 	struct mem_cgroup *memcg = NULL;
++ 
++ 	if (!memcg_kmem_newpage_charge(gfp_mask, &memcg, order))
++ 		return NULL;
++ 	page = alloc_pages(gfp_mask, order);
++ 	memcg_kmem_commit_charge(page, memcg, order);
++ 	return page;
++ }
++ 
++ struct page *alloc_kmem_pages_node(int nid, gfp_t gfp_mask, unsigned int order)
++ {
++ 	struct page *page;
++ 	struct mem_cgroup *memcg = NULL;
++ 
++ 	if (!memcg_kmem_newpage_charge(gfp_mask, &memcg, order))
++ 		return NULL;
++ 	page = alloc_pages_node(nid, gfp_mask, order);
++ 	memcg_kmem_commit_charge(page, memcg, order);
++ 	return page;
++ }
++ 
++ /*
++  * __free_kmem_pages and free_kmem_pages will free pages allocated with
++  * alloc_kmem_pages.
+   */
+- void __free_memcg_kmem_pages(struct page *page, unsigned int order)
++ void __free_kmem_pages(struct page *page, unsigned int order)
+  {
+  	memcg_kmem_uncharge_pages(page, order);
+  	__free_pages(page, order);
+diff --cc mm/slab_common.c
+index 288b69b9b33e,1950c8f4d1a6..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -608,8 -582,37 +608,33 @@@ void __init create_kmalloc_caches(unsig
+  }
+  #endif /* !CONFIG_SLOB */
+  
+++<<<<<<< HEAD
+++=======
++ void *kmalloc_order(size_t size, gfp_t flags, unsigned int order)
++ {
++ 	void *ret;
++ 	struct page *page;
++ 
++ 	flags |= __GFP_COMP;
++ 	page = alloc_kmem_pages(flags, order);
++ 	ret = page ? page_address(page) : NULL;
++ 	kmemleak_alloc(ret, size, 1, flags);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(kmalloc_order);
++ 
++ #ifdef CONFIG_TRACING
++ void *kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
++ {
++ 	void *ret = kmalloc_order(size, flags, order);
++ 	trace_kmalloc(_RET_IP_, ret, size, PAGE_SIZE << order, flags);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(kmalloc_order_trace);
++ #endif
+++>>>>>>> 52383431b37c (mm: get rid of __GFP_KMEMCG)
+  
+  #ifdef CONFIG_SLABINFO
+ -
+ -#ifdef CONFIG_SLAB
+ -#define SLABINFO_RIGHTS (S_IWUSR | S_IRUSR)
+ -#else
+ -#define SLABINFO_RIGHTS S_IRUSR
+ -#endif
+ -
+  void print_slabinfo_header(struct seq_file *m)
+  {
+  	/*
+diff --cc mm/slub.c
+index cfd46f5b97ec,ddb60795f373..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -3750,11 -3380,11 +3750,16 @@@ void kfree(const void *x
+  	page = virt_to_head_page(x);
+  	if (unlikely(!PageSlab(page))) {
+  		BUG_ON(!PageCompound(page));
+++<<<<<<< HEAD
+ +		kmemleak_free(x);
+ +		__free_memcg_kmem_pages(page, compound_order(page));
+++=======
++ 		kfree_hook(x);
++ 		__free_kmem_pages(page, compound_order(page));
+++>>>>>>> 52383431b37c (mm: get rid of __GFP_KMEMCG)
+  		return;
+  	}
+ -	slab_free(page->slab_cache, page, object, _RET_IP_);
+ +	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+  }
+  EXPORT_SYMBOL(kfree);
+  
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index b4194f05bfaa..51de36185c6d 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -36,7 +36,6 @@ struct vm_area_struct;
+ #define ___GFP_HARDWALL		0x20000u
+ #define ___GFP_THISNODE		0x40000u
+ #define ___GFP_RECLAIMABLE	0x80000u
+-#define ___GFP_KMEMCG		0x100000u
+ #define ___GFP_NOTRACK		0x200000u
+ #define ___GFP_NO_KSWAPD	0x400000u
+ #define ___GFP_OTHER_NODE	0x800000u
+@@ -96,7 +95,6 @@ struct vm_area_struct;
+ 
+ #define __GFP_NO_KSWAPD	((__force gfp_t)___GFP_NO_KSWAPD)
+ #define __GFP_OTHER_NODE ((__force gfp_t)___GFP_OTHER_NODE) /* On behalf of other node */
+-#define __GFP_KMEMCG	((__force gfp_t)___GFP_KMEMCG) /* Allocation comes from a memcg-accounted resource */
+ #define __GFP_WRITE	((__force gfp_t)___GFP_WRITE)	/* Allocator intends to dirty page */
+ 
+ /*
+@@ -374,6 +372,10 @@ extern struct page *alloc_pages_vma(gfp_t gfp_mask, int order,
+ #define alloc_page_vma_node(gfp_mask, vma, addr, node)		\
+ 	alloc_pages_vma(gfp_mask, 0, vma, addr, node, false)
+ 
++extern struct page *alloc_kmem_pages(gfp_t gfp_mask, unsigned int order);
++extern struct page *alloc_kmem_pages_node(int nid, gfp_t gfp_mask,
++					  unsigned int order);
++
+ extern unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order);
+ extern unsigned long get_zeroed_page(gfp_t gfp_mask);
+ 
+@@ -399,8 +401,8 @@ extern void *page_frag_alloc(struct page_frag_cache *nc,
+ 			     unsigned int fragsz, gfp_t gfp_mask);
+ extern void page_frag_free(void *addr);
+ 
+-extern void __free_memcg_kmem_pages(struct page *page, unsigned int order);
+-extern void free_memcg_kmem_pages(unsigned long addr, unsigned int order);
++extern void __free_kmem_pages(struct page *page, unsigned int order);
++extern void free_kmem_pages(unsigned long addr, unsigned int order);
+ 
+ #define __free_page(page) __free_pages((page), 0)
+ #define free_page(addr) free_pages((addr), 0)
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 1494b9982667..11cda9538274 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -524,7 +524,7 @@ memcg_kmem_newpage_charge(gfp_t gfp, struct mem_cgroup **memcg, int order)
+ 	 * unaccounted. We could in theory charge it forcibly, but we hope
+ 	 * those allocations are rare, and won't be worth the trouble.
+ 	 */
+-	if (!(gfp & __GFP_KMEMCG) || (gfp & __GFP_NOFAIL))
++	if (gfp & __GFP_NOFAIL)
+ 		return true;
+ 	if (in_interrupt() || (!current->mm) || (current->flags & PF_KTHREAD))
+ 		return true;
+* Unmerged path include/linux/slab.h
+diff --git a/include/linux/thread_info.h b/include/linux/thread_info.h
+index 8f7d4e63b85b..1f09e10723fa 100644
+--- a/include/linux/thread_info.h
++++ b/include/linux/thread_info.h
+@@ -73,8 +73,6 @@ enum {
+ # define THREADINFO_GFP		(GFP_KERNEL | __GFP_NOTRACK)
+ #endif
+ 
+-#define THREADINFO_GFP_ACCOUNTED (THREADINFO_GFP | __GFP_KMEMCG)
+-
+ /*
+  * flag set/clear/test wrappers
+  * - pass TIF_xxxx constants to these functions
+diff --git a/include/trace/events/gfpflags.h b/include/trace/events/gfpflags.h
+index 1eddbf1557f2..d6fd8e5b14b7 100644
+--- a/include/trace/events/gfpflags.h
++++ b/include/trace/events/gfpflags.h
+@@ -34,7 +34,6 @@
+ 	{(unsigned long)__GFP_HARDWALL,		"GFP_HARDWALL"},	\
+ 	{(unsigned long)__GFP_THISNODE,		"GFP_THISNODE"},	\
+ 	{(unsigned long)__GFP_RECLAIMABLE,	"GFP_RECLAIMABLE"},	\
+-	{(unsigned long)__GFP_KMEMCG,		"GFP_KMEMCG"},		\
+ 	{(unsigned long)__GFP_MOVABLE,		"GFP_MOVABLE"},		\
+ 	{(unsigned long)__GFP_NOTRACK,		"GFP_NOTRACK"},		\
+ 	{(unsigned long)__GFP_NO_KSWAPD,	"GFP_NO_KSWAPD"},	\
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 350a3225b39e..dc889df738f4 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -183,15 +183,15 @@ void __weak arch_release_thread_info(struct thread_info *ti)
+ static struct thread_info *alloc_thread_info_node(struct task_struct *tsk,
+ 						  int node)
+ {
+-	struct page *page = alloc_pages_node(node, THREADINFO_GFP_ACCOUNTED,
+-					     THREAD_SIZE_ORDER);
++	struct page *page = alloc_kmem_pages_node(node, THREADINFO_GFP,
++						  THREAD_SIZE_ORDER);
+ 
+ 	return page ? page_address(page) : NULL;
+ }
+ 
+ static inline void free_thread_info(struct thread_info *ti)
+ {
+-	free_memcg_kmem_pages((unsigned long)ti, THREAD_SIZE_ORDER);
++	free_kmem_pages((unsigned long)ti, THREAD_SIZE_ORDER);
+ }
+ # else
+ static struct kmem_cache *thread_info_cache;
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/page_alloc.c
+* Unmerged path mm/slab_common.c
+* Unmerged path mm/slub.c
