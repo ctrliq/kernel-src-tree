@@ -1,0 +1,178 @@
+netfilter: nf_queue: make nf_queue_entry_release_refs static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.6.1.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit dd3cc111f2e3220ddc9c4ab17f13dc97759b5163
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.6.1.el7/dd3cc111.failed
+
+This is a preparation patch, no logical changes.
+Move free_entry into core and rename it to something more sensible.
+
+Will ease followup patches which will complicate the refcount handling.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit dd3cc111f2e3220ddc9c4ab17f13dc97759b5163)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_queue.h
+#	net/netfilter/nf_queue.c
+diff --cc include/net/netfilter/nf_queue.h
+index d81d584157e1,cdbd98730852..000000000000
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@@ -22,16 -25,17 +22,21 @@@ struct nf_queue_entry 
+  
+  /* Packet queuing */
+  struct nf_queue_handler {
+ -	int		(*outfn)(struct nf_queue_entry *entry,
+ -				 unsigned int queuenum);
+ -	void		(*nf_hook_drop)(struct net *net);
+ +	int			(*outfn)(struct nf_queue_entry *entry,
+ +					 unsigned int queuenum);
+  };
+  
+ -void nf_register_queue_handler(struct net *net, const struct nf_queue_handler *qh);
+ -void nf_unregister_queue_handler(struct net *net);
+ +void nf_register_queue_handler(const struct nf_queue_handler *qh);
+ +void nf_unregister_queue_handler(void);
+  void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict);
+  
+++<<<<<<< HEAD
+ +bool nf_queue_entry_get_refs(struct nf_queue_entry *entry);
+ +void nf_queue_entry_release_refs(struct nf_queue_entry *entry);
+++=======
++ void nf_queue_entry_get_refs(struct nf_queue_entry *entry);
++ void nf_queue_entry_free(struct nf_queue_entry *entry);
+++>>>>>>> dd3cc111f2e3 (netfilter: nf_queue: make nf_queue_entry_release_refs static)
+  
+  static inline void init_hashrandom(u32 *jhash_initval)
+  {
+diff --cc net/netfilter/nf_queue.c
+index 2e88032cd5ad,4da5776a9904..000000000000
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@@ -46,7 -46,25 +46,29 @@@ void nf_unregister_queue_handler(void
+  }
+  EXPORT_SYMBOL(nf_unregister_queue_handler);
+  
+++<<<<<<< HEAD
+ +void nf_queue_entry_release_refs(struct nf_queue_entry *entry)
+++=======
++ static void nf_queue_entry_release_br_nf_refs(struct sk_buff *skb)
++ {
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
++ 
++ 	if (nf_bridge) {
++ 		struct net_device *physdev;
++ 
++ 		physdev = nf_bridge_get_physindev(skb);
++ 		if (physdev)
++ 			dev_put(physdev);
++ 		physdev = nf_bridge_get_physoutdev(skb);
++ 		if (physdev)
++ 			dev_put(physdev);
++ 	}
++ #endif
++ }
++ 
++ static void nf_queue_entry_release_refs(struct nf_queue_entry *entry)
+++>>>>>>> dd3cc111f2e3 (netfilter: nf_queue: make nf_queue_entry_release_refs static)
+  {
+  	struct nf_hook_state *state = &entry->state;
+  
+@@@ -57,25 -75,37 +79,31 @@@
+  		dev_put(state->out);
+  	if (state->sk)
+  		sock_put(state->sk);
+ +#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +	if (entry->skb->nf_bridge) {
+ +		struct net_device *physdev;
+  
+ -	nf_queue_entry_release_br_nf_refs(entry->skb);
+ +		physdev = nf_bridge_get_physindev(entry->skb);
+ +		if (physdev)
+ +			dev_put(physdev);
+ +		physdev = nf_bridge_get_physoutdev(entry->skb);
+ +		if (physdev)
+ +			dev_put(physdev);
+ +	}
+ +#endif
+ +	/* Drop reference to owner of hook which queued us. */
+ +	module_put(entry->elem->owner);
+  }
+- EXPORT_SYMBOL_GPL(nf_queue_entry_release_refs);
++ 
++ void nf_queue_entry_free(struct nf_queue_entry *entry)
++ {
++ 	nf_queue_entry_release_refs(entry);
++ 	kfree(entry);
++ }
++ EXPORT_SYMBOL_GPL(nf_queue_entry_free);
+  
+ -static void nf_queue_entry_get_br_nf_refs(struct sk_buff *skb)
+ -{
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ -	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+ -
+ -	if (nf_bridge) {
+ -		struct net_device *physdev;
+ -
+ -		physdev = nf_bridge_get_physindev(skb);
+ -		if (physdev)
+ -			dev_hold(physdev);
+ -		physdev = nf_bridge_get_physoutdev(skb);
+ -		if (physdev)
+ -			dev_hold(physdev);
+ -	}
+ -#endif
+ -}
+ -
+  /* Bump dev refs so they don't vanish while packet is out */
+ -void nf_queue_entry_get_refs(struct nf_queue_entry *entry)
+ +bool nf_queue_entry_get_refs(struct nf_queue_entry *entry)
+  {
+  	struct nf_hook_state *state = &entry->state;
+  
+* Unmerged path include/net/netfilter/nf_queue.h
+* Unmerged path net/netfilter/nf_queue.c
+diff --git a/net/netfilter/nfnetlink_queue_core.c b/net/netfilter/nfnetlink_queue_core.c
+index a0eabe1d92fb..ff2d4b31b353 100644
+--- a/net/netfilter/nfnetlink_queue_core.c
++++ b/net/netfilter/nfnetlink_queue_core.c
+@@ -554,12 +554,6 @@ static void nf_bridge_adjust_segmented_data(struct sk_buff *skb)
+ #define nf_bridge_adjust_segmented_data(s) do {} while (0)
+ #endif
+ 
+-static void free_entry(struct nf_queue_entry *entry)
+-{
+-	nf_queue_entry_release_refs(entry);
+-	kfree(entry);
+-}
+-
+ static int
+ __nfqnl_enqueue_packet_gso(struct net *net, struct nfqnl_instance *queue,
+ 			   struct sk_buff *skb, struct nf_queue_entry *entry)
+@@ -585,7 +579,7 @@ __nfqnl_enqueue_packet_gso(struct net *net, struct nfqnl_instance *queue,
+ 		entry_seg->skb = skb;
+ 		ret = __nfqnl_enqueue_packet(net, queue, entry_seg);
+ 		if (ret)
+-			free_entry(entry_seg);
++			nf_queue_entry_free(entry_seg);
+ 	}
+ 	return ret;
+ }
+@@ -647,7 +641,7 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
+ 
+ 	if (queued) {
+ 		if (err) /* some segments are already queued */
+-			free_entry(entry);
++			nf_queue_entry_free(entry);
+ 		kfree_skb(skb);
+ 		return 0;
+ 	}
