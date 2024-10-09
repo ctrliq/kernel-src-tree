@@ -1,0 +1,248 @@
+md: introduce new personality funciton start()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] introduce new personality funciton start() (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 95.45%
+commit-author Song Liu <songliubraving@fb.com>
+commit d5d885fd514fcebc9da5503c88aa0112df7514ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d5d885fd.failed
+
+In do_md_run(), md threads should not wake up until the array is fully
+initialized in md_run(). However, in raid5_run(), raid5-cache may wake
+up mddev->thread to flush stripes that need to be written back. This
+design doesn't break badly right now. But it could lead to bad bug in
+the future.
+
+This patch tries to resolve this problem by splitting start up work
+into two personality functions, run() and start(). Tasks that do not
+require the md threads should go into run(), while task that require
+the md threads go into start().
+
+r5l_load_log() is moved to raid5_start(), so it is not called until
+the md threads are started in do_md_run().
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit d5d885fd514fcebc9da5503c88aa0112df7514ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/md.h
+#	drivers/md/raid5-cache.c
+#	drivers/md/raid5-log.h
+diff --cc drivers/md/md.c
+index 23c14e0358c0,a71adb3c34b9..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -5591,6 -5670,12 +5586,15 @@@ static int do_md_run(struct mddev *mdde
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mddev_is_clustered(mddev))
++ 		md_allow_write(mddev);
++ 
++ 	/* run start up tasks that require md_thread */
++ 	md_start(mddev);
++ 
+++>>>>>>> d5d885fd514f (md: introduce new personality funciton start())
+  	md_wakeup_thread(mddev->thread);
+  	md_wakeup_thread(mddev->sync_thread); /* possibly kick off a reshape */
+  
+@@@ -7943,9 -8179,11 +7962,10 @@@ void md_do_sync(struct md_thread *threa
+  	struct md_rdev *rdev;
+  	char *desc, *action = NULL;
+  	struct blk_plug plug;
+ -	int ret;
+  
+  	/* just incase thread restarts... */
+- 	if (test_bit(MD_RECOVERY_DONE, &mddev->recovery))
++ 	if (test_bit(MD_RECOVERY_DONE, &mddev->recovery) ||
++ 	    test_bit(MD_RECOVERY_WAIT, &mddev->recovery))
+  		return;
+  	if (mddev->ro) {/* never try to sync a read-only array */
+  		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+diff --cc drivers/md/md.h
+index 1fc509a98656,be8f72a9e30b..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -486,6 -466,26 +486,29 @@@ struct mddev 
+  	struct work_struct flush_work;
+  	struct work_struct event_work;	/* used by dm to report failure event */
+  	void (*sync_super)(struct mddev *mddev, struct md_rdev *rdev);
+++<<<<<<< HEAD
+++=======
++ 	struct md_cluster_info		*cluster_info;
++ 	unsigned int			good_device_nr;	/* good device num within cluster raid */
++ };
++ 
++ enum recovery_flags {
++ 	/*
++ 	 * If neither SYNC or RESHAPE are set, then it is a recovery.
++ 	 */
++ 	MD_RECOVERY_RUNNING,	/* a thread is running, or about to be started */
++ 	MD_RECOVERY_SYNC,	/* actually doing a resync, not a recovery */
++ 	MD_RECOVERY_RECOVER,	/* doing recovery, or need to try it. */
++ 	MD_RECOVERY_INTR,	/* resync needs to be aborted for some reason */
++ 	MD_RECOVERY_DONE,	/* thread is done and is waiting to be reaped */
++ 	MD_RECOVERY_NEEDED,	/* we might need to start a resync/recover */
++ 	MD_RECOVERY_REQUESTED,	/* user-space has requested a sync (used with SYNC) */
++ 	MD_RECOVERY_CHECK,	/* user-space request for check-only, no repair */
++ 	MD_RECOVERY_RESHAPE,	/* A reshape is happening */
++ 	MD_RECOVERY_FROZEN,	/* User request to abort, and not restart, any action */
++ 	MD_RECOVERY_ERROR,	/* sync-action interrupted because io-error */
++ 	MD_RECOVERY_WAIT,	/* waiting for pers->start() to finish */
+++>>>>>>> d5d885fd514f (md: introduce new personality funciton start())
+  };
+  
+  static inline int __must_check mddev_lock(struct mddev *mddev)
+diff --cc drivers/md/raid5-cache.c
+index 2c6c8b7c2873,f259a5fd3fbd..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -2575,7 -3035,24 +2574,28 @@@ ioerr
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void r5c_update_on_rdev_error(struct mddev *mddev)
+++=======
++ int r5l_start(struct r5l_log *log)
++ {
++ 	int ret;
++ 
++ 	if (!log)
++ 		return 0;
++ 
++ 	ret = r5l_load_log(log);
++ 	if (ret) {
++ 		struct mddev *mddev = log->rdev->mddev;
++ 		struct r5conf *conf = mddev->private;
++ 
++ 		r5l_exit_log(conf);
++ 	}
++ 	return ret;
++ }
++ 
++ void r5c_update_on_rdev_error(struct mddev *mddev, struct md_rdev *rdev)
+++>>>>>>> d5d885fd514f (md: introduce new personality funciton start())
+  {
+  	struct r5conf *conf = mddev->private;
+  	struct r5l_log *log = conf->log;
+diff --cc drivers/md/raid5-log.h
+index dccbe0ceaf4b,3860041e8b74..000000000000
+--- a/drivers/md/raid5-log.h
++++ b/drivers/md/raid5-log.h
+@@@ -8,8 -9,30 +8,33 @@@ extern void r5l_write_stripe_run(struc
+  extern void r5l_flush_stripe_to_raid(struct r5l_log *log);
+  extern void r5l_stripe_write_finished(struct stripe_head *sh);
+  extern int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio);
+ -extern void r5l_quiesce(struct r5l_log *log, int quiesce);
+ +extern void r5l_quiesce(struct r5l_log *log, int state);
+  extern bool r5l_log_disk_error(struct r5conf *conf);
+++<<<<<<< HEAD
+++=======
++ extern bool r5c_is_writeback(struct r5l_log *log);
++ extern int
++ r5c_try_caching_write(struct r5conf *conf, struct stripe_head *sh,
++ 		      struct stripe_head_state *s, int disks);
++ extern void
++ r5c_finish_stripe_write_out(struct r5conf *conf, struct stripe_head *sh,
++ 			    struct stripe_head_state *s);
++ extern void r5c_release_extra_page(struct stripe_head *sh);
++ extern void r5c_use_extra_page(struct stripe_head *sh);
++ extern void r5l_wake_reclaim(struct r5l_log *log, sector_t space);
++ extern void r5c_handle_cached_data_endio(struct r5conf *conf,
++ 	struct stripe_head *sh, int disks);
++ extern int r5c_cache_data(struct r5l_log *log, struct stripe_head *sh);
++ extern void r5c_make_stripe_write_out(struct stripe_head *sh);
++ extern void r5c_flush_cache(struct r5conf *conf, int num);
++ extern void r5c_check_stripe_cache_usage(struct r5conf *conf);
++ extern void r5c_check_cached_full_stripe(struct r5conf *conf);
++ extern struct md_sysfs_entry r5c_journal_mode;
++ extern void r5c_update_on_rdev_error(struct mddev *mddev,
++ 				     struct md_rdev *rdev);
++ extern bool r5c_big_stripe_cached(struct r5conf *conf, sector_t sect);
++ extern int r5l_start(struct r5l_log *log);
+++>>>>>>> d5d885fd514f (md: introduce new personality funciton start())
+  
+  extern struct dma_async_tx_descriptor *
+  ops_run_partial_parity(struct stripe_head *sh, struct raid5_percpu *percpu,
+diff --git a/drivers/md/dm-raid.c b/drivers/md/dm-raid.c
+index fede843e1124..4b416ea4f93f 100644
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@ -3241,6 +3241,14 @@ static int raid_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 		goto bad;
+ 	}
+ 
++	r = md_start(&rs->md);
++
++	if (r) {
++		ti->error = "Failed to start raid array";
++		mddev_unlock(&rs->md);
++		goto bad_md_start;
++	}
++
+ 	rs->callbacks.congested_fn = raid_is_congested;
+ 	dm_table_add_target_callbacks(ti->table, &rs->callbacks);
+ 
+@@ -3288,6 +3296,7 @@ static int raid_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 	mddev_unlock(&rs->md);
+ 	return 0;
+ 
++bad_md_start:
+ bad_journal_mode_set:
+ bad_stripe_cache:
+ bad_check_reshape:
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/md.h
+* Unmerged path drivers/md/raid5-cache.c
+* Unmerged path drivers/md/raid5-log.h
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 93fd006ab93b..4863893b94b5 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -8302,6 +8302,13 @@ static int raid5_change_consistency_policy(struct mddev *mddev, const char *buf)
+ 	return err;
+ }
+ 
++static int raid5_start(struct mddev *mddev)
++{
++	struct r5conf *conf = mddev->private;
++
++	return r5l_start(conf->log);
++}
++
+ static struct md_personality raid6_personality =
+ {
+ 	.name		= "raid6",
+@@ -8309,6 +8316,7 @@ static struct md_personality raid6_personality =
+ 	.owner		= THIS_MODULE,
+ 	.make_request	= raid5_make_request,
+ 	.run		= raid5_run,
++	.start		= raid5_start,
+ 	.free		= raid5_free,
+ 	.status		= raid5_status,
+ 	.error_handler	= raid5_error,
+@@ -8334,6 +8342,7 @@ static struct md_personality raid5_personality =
+ 	.owner		= THIS_MODULE,
+ 	.make_request	= raid5_make_request,
+ 	.run		= raid5_run,
++	.start		= raid5_start,
+ 	.free		= raid5_free,
+ 	.status		= raid5_status,
+ 	.error_handler	= raid5_error,
+@@ -8360,6 +8369,7 @@ static struct md_personality raid4_personality =
+ 	.owner		= THIS_MODULE,
+ 	.make_request	= raid5_make_request,
+ 	.run		= raid5_run,
++	.start		= raid5_start,
+ 	.free		= raid5_free,
+ 	.status		= raid5_status,
+ 	.error_handler	= raid5_error,
