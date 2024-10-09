@@ -2194,7 +2194,7 @@ static int process_stat_round_event(struct perf_tool *tool __maybe_unused,
 }
 
 static
-int process_stat_config_event(struct perf_tool *tool __maybe_unused,
+int process_stat_config_event(struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_session *session __maybe_unused)
 {
@@ -2237,7 +2237,7 @@ static int set_maps(struct perf_stat *st)
 }
 
 static
-int process_thread_map_event(struct perf_tool *tool __maybe_unused,
+int process_thread_map_event(struct perf_tool *tool,
 			     union perf_event *event,
 			     struct perf_session *session __maybe_unused)
 {
@@ -2256,7 +2256,7 @@ int process_thread_map_event(struct perf_tool *tool __maybe_unused,
 }
 
 static
-int process_cpu_map_event(struct perf_tool *tool __maybe_unused,
+int process_cpu_map_event(struct perf_tool *tool,
 			  union perf_event *event,
 			  struct perf_session *session __maybe_unused)
 {
