@@ -1,0 +1,590 @@
+scsi: use pci_zalloc_consistent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] csiostor: use pci_zalloc_consistent (Arjun Vynipadath) [1642433]
+Rebuild_FUZZ: 90.91%
+commit-author Joe Perches <joe@perches.com>
+commit 7c845eb5e184977d9c7135ae20d012b59f8cc729
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7c845eb5.failed
+
+Remove the now unnecessary memset too.
+
+	Signed-off-by: Joe Perches <joe@perches.com>
+	Cc: Adam Radford <linuxraid@lsi.com>
+	Cc: "James E.J. Bottomley" <JBottomley@parallels.com>
+	Cc: Jayamohan Kallickal <jayamohan.kallickal@emulex.com>
+	Cc: Dario Ballabio <ballabio_dario@emc.com>
+	Cc: Michael Neuffer <mike@i-Connect.Net>
+	Cc: "Stephen M. Cameron" <scameron@beardog.cce.hp.com>
+	Cc: Neela Syam Kolli <megaraidlinux@lsi.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7c845eb5e184977d9c7135ae20d012b59f8cc729)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+#	drivers/scsi/hpsa.c
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index fa9201c8b4b7,eb3e3e619155..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -4155,6 -4293,135 +4154,138 @@@ static void hwi_disable_intr(struct bei
+  			    "BM_%d : In hwi_disable_intr, Already Disabled\n");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * beiscsi_get_boot_info()- Get the boot session info
++  * @phba: The device priv structure instance
++  *
++  * Get the boot target info and store in driver priv structure
++  *
++  * return values
++  *	Success: 0
++  *	Failure: Non-Zero Value
++  **/
++ static int beiscsi_get_boot_info(struct beiscsi_hba *phba)
++ {
++ 	struct be_cmd_get_session_resp *session_resp;
++ 	struct be_dma_mem nonemb_cmd;
++ 	unsigned int tag;
++ 	unsigned int s_handle;
++ 	int ret = -ENOMEM;
++ 
++ 	/* Get the session handle of the boot target */
++ 	ret = be_mgmt_get_boot_shandle(phba, &s_handle);
++ 	if (ret) {
++ 		beiscsi_log(phba, KERN_ERR,
++ 			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
++ 			    "BM_%d : No boot session\n");
++ 		return ret;
++ 	}
++ 	nonemb_cmd.va = pci_zalloc_consistent(phba->ctrl.pdev,
++ 					      sizeof(*session_resp),
++ 					      &nonemb_cmd.dma);
++ 	if (nonemb_cmd.va == NULL) {
++ 		beiscsi_log(phba, KERN_ERR,
++ 			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
++ 			    "BM_%d : Failed to allocate memory for"
++ 			    "beiscsi_get_session_info\n");
++ 
++ 		return -ENOMEM;
++ 	}
++ 
++ 	tag = mgmt_get_session_info(phba, s_handle,
++ 				    &nonemb_cmd);
++ 	if (!tag) {
++ 		beiscsi_log(phba, KERN_ERR,
++ 			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
++ 			    "BM_%d : beiscsi_get_session_info"
++ 			    " Failed\n");
++ 
++ 		goto boot_freemem;
++ 	}
++ 
++ 	ret = beiscsi_mccq_compl(phba, tag, NULL, &nonemb_cmd);
++ 	if (ret) {
++ 		beiscsi_log(phba, KERN_ERR,
++ 			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
++ 			    "BM_%d : beiscsi_get_session_info Failed");
++ 
++ 		if (ret != -EBUSY)
++ 			goto boot_freemem;
++ 		else
++ 			return ret;
++ 	}
++ 
++ 	session_resp = nonemb_cmd.va ;
++ 
++ 	memcpy(&phba->boot_sess, &session_resp->session_info,
++ 	       sizeof(struct mgmt_session_info));
++ 	ret = 0;
++ 
++ boot_freemem:
++ 	pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
++ 		    nonemb_cmd.va, nonemb_cmd.dma);
++ 	return ret;
++ }
++ 
++ static void beiscsi_boot_release(void *data)
++ {
++ 	struct beiscsi_hba *phba = data;
++ 
++ 	scsi_host_put(phba->shost);
++ }
++ 
++ static int beiscsi_setup_boot_info(struct beiscsi_hba *phba)
++ {
++ 	struct iscsi_boot_kobj *boot_kobj;
++ 
++ 	/* get boot info using mgmt cmd */
++ 	if (beiscsi_get_boot_info(phba))
++ 		/* Try to see if we can carry on without this */
++ 		return 0;
++ 
++ 	phba->boot_kset = iscsi_boot_create_host_kset(phba->shost->host_no);
++ 	if (!phba->boot_kset)
++ 		return -ENOMEM;
++ 
++ 	/* get a ref because the show function will ref the phba */
++ 	if (!scsi_host_get(phba->shost))
++ 		goto free_kset;
++ 	boot_kobj = iscsi_boot_create_target(phba->boot_kset, 0, phba,
++ 					     beiscsi_show_boot_tgt_info,
++ 					     beiscsi_tgt_get_attr_visibility,
++ 					     beiscsi_boot_release);
++ 	if (!boot_kobj)
++ 		goto put_shost;
++ 
++ 	if (!scsi_host_get(phba->shost))
++ 		goto free_kset;
++ 	boot_kobj = iscsi_boot_create_initiator(phba->boot_kset, 0, phba,
++ 						beiscsi_show_boot_ini_info,
++ 						beiscsi_ini_get_attr_visibility,
++ 						beiscsi_boot_release);
++ 	if (!boot_kobj)
++ 		goto put_shost;
++ 
++ 	if (!scsi_host_get(phba->shost))
++ 		goto free_kset;
++ 	boot_kobj = iscsi_boot_create_ethernet(phba->boot_kset, 0, phba,
++ 					       beiscsi_show_boot_eth_info,
++ 					       beiscsi_eth_get_attr_visibility,
++ 					       beiscsi_boot_release);
++ 	if (!boot_kobj)
++ 		goto put_shost;
++ 	return 0;
++ 
++ put_shost:
++ 	scsi_host_put(phba->shost);
++ free_kset:
++ 	iscsi_boot_destroy_kset(phba->boot_kset);
++ 	return -ENOMEM;
++ }
++ 
+++>>>>>>> 7c845eb5e184 (scsi: use pci_zalloc_consistent)
+  static int beiscsi_init_port(struct beiscsi_hba *phba)
+  {
+  	int ret;
+diff --cc drivers/scsi/hpsa.c
+index 76507e2c820f,6b35d0dfe64c..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -6034,48 -4683,79 +6034,112 @@@ static void cmd_tagged_free(struct ctlr
+  static struct CommandList *cmd_alloc(struct ctlr_info *h)
+  {
+  	struct CommandList *c;
+ -	int i;
+ -	union u64bit temp64;
+ -	dma_addr_t cmd_dma_handle, err_dma_handle;
+ -	unsigned long flags;
+ +	int refcount, i;
+ +	int offset = 0;
+  
+ -	spin_lock_irqsave(&h->lock, flags);
+ -	do {
+ -		i = find_first_zero_bit(h->cmd_pool_bits, h->nr_cmds);
+ -		if (i == h->nr_cmds) {
+ -			spin_unlock_irqrestore(&h->lock, flags);
+ -			return NULL;
+ +	/*
+ +	 * There is some *extremely* small but non-zero chance that that
+ +	 * multiple threads could get in here, and one thread could
+ +	 * be scanning through the list of bits looking for a free
+ +	 * one, but the free ones are always behind him, and other
+ +	 * threads sneak in behind him and eat them before he can
+ +	 * get to them, so that while there is always a free one, a
+ +	 * very unlucky thread might be starved anyway, never able to
+ +	 * beat the other threads.  In reality, this happens so
+ +	 * infrequently as to be indistinguishable from never.
+ +	 *
+ +	 * Note that we start allocating commands before the SCSI host structure
+ +	 * is initialized.  Since the search starts at bit zero, this
+ +	 * all works, since we have at least one command structure available;
+ +	 * however, it means that the structures with the low indexes have to be
+ +	 * reserved for driver-initiated requests, while requests from the block
+ +	 * layer will use the higher indexes.
+ +	 */
+ +
+ +	for (;;) {
+ +		i = find_next_zero_bit(h->cmd_pool_bits,
+ +					HPSA_NRESERVED_CMDS,
+ +					offset);
+ +		if (unlikely(i >= HPSA_NRESERVED_CMDS)) {
+ +			offset = 0;
+ +			continue;
+ +		}
+++<<<<<<< HEAD
+ +		c = h->cmd_pool + i;
+ +		refcount = atomic_inc_return(&c->refcount);
+ +		if (unlikely(refcount > 1)) {
+ +			cmd_free(h, c); /* already in use */
+ +			offset = (i + 1) % HPSA_NRESERVED_CMDS;
+ +			continue;
+  		}
+ +		set_bit(i & (BITS_PER_LONG - 1),
+ +			h->cmd_pool_bits + (i / BITS_PER_LONG));
+ +		break; /* it's ours now. */
+ +	}
+ +	hpsa_cmd_partial_init(h, i, c);
+++=======
++ 	} while (test_and_set_bit
++ 		 (i & (BITS_PER_LONG - 1),
++ 		  h->cmd_pool_bits + (i / BITS_PER_LONG)) != 0);
++ 	spin_unlock_irqrestore(&h->lock, flags);
++ 
++ 	c = h->cmd_pool + i;
++ 	memset(c, 0, sizeof(*c));
++ 	cmd_dma_handle = h->cmd_pool_dhandle
++ 	    + i * sizeof(*c);
++ 	c->err_info = h->errinfo_pool + i;
++ 	memset(c->err_info, 0, sizeof(*c->err_info));
++ 	err_dma_handle = h->errinfo_pool_dhandle
++ 	    + i * sizeof(*c->err_info);
++ 
++ 	c->cmdindex = i;
++ 
++ 	INIT_LIST_HEAD(&c->list);
++ 	c->busaddr = (u32) cmd_dma_handle;
++ 	temp64.val = (u64) err_dma_handle;
++ 	c->ErrDesc.Addr.lower = temp64.val32.lower;
++ 	c->ErrDesc.Addr.upper = temp64.val32.upper;
++ 	c->ErrDesc.Len = sizeof(*c->err_info);
++ 
++ 	c->h = h;
++ 	return c;
++ }
++ 
++ /* For operations that can wait for kmalloc to possibly sleep,
++  * this routine can be called. Lock need not be held to call
++  * cmd_special_alloc. cmd_special_free() is the complement.
++  */
++ static struct CommandList *cmd_special_alloc(struct ctlr_info *h)
++ {
++ 	struct CommandList *c;
++ 	union u64bit temp64;
++ 	dma_addr_t cmd_dma_handle, err_dma_handle;
++ 
++ 	c = pci_zalloc_consistent(h->pdev, sizeof(*c), &cmd_dma_handle);
++ 	if (c == NULL)
++ 		return NULL;
++ 
++ 	c->cmd_type = CMD_SCSI;
++ 	c->cmdindex = -1;
++ 
++ 	c->err_info = pci_zalloc_consistent(h->pdev, sizeof(*c->err_info),
++ 					    &err_dma_handle);
++ 
++ 	if (c->err_info == NULL) {
++ 		pci_free_consistent(h->pdev,
++ 			sizeof(*c), c, cmd_dma_handle);
++ 		return NULL;
++ 	}
++ 
++ 	INIT_LIST_HEAD(&c->list);
++ 	c->busaddr = (u32) cmd_dma_handle;
++ 	temp64.val = (u64) err_dma_handle;
++ 	c->ErrDesc.Addr.lower = temp64.val32.lower;
++ 	c->ErrDesc.Addr.upper = temp64.val32.upper;
++ 	c->ErrDesc.Len = sizeof(*c->err_info);
++ 
++ 	c->h = h;
+++>>>>>>> 7c845eb5e184 (scsi: use pci_zalloc_consistent)
+  	return c;
+  }
+  
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index e049e7398119,22a04e37b70a..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -2522,13 -2038,13 +2522,19 @@@ int megasas_sriov_start_heartbeat(struc
+  
+  	if (initial) {
+  		instance->hb_host_mem =
+++<<<<<<< HEAD
+ +			dma_zalloc_coherent(&instance->pdev->dev,
+ +					      sizeof(struct MR_CTRL_HB_HOST_MEM),
+ +					      &instance->hb_host_mem_h, GFP_KERNEL);
+++=======
++ 			pci_zalloc_consistent(instance->pdev,
++ 					      sizeof(struct MR_CTRL_HB_HOST_MEM),
++ 					      &instance->hb_host_mem_h);
+++>>>>>>> 7c845eb5e184 (scsi: use pci_zalloc_consistent)
+  		if (!instance->hb_host_mem) {
+ -			printk(KERN_DEBUG "megasas: SR-IOV: Couldn't allocate"
+ -			       " memory for heartbeat host memory for "
+ -			       "scsi%d.\n", instance->host->host_no);
+ +			dev_printk(KERN_DEBUG, &instance->pdev->dev, "SR-IOV: Couldn't allocate"
+ +			       " memory for heartbeat host memory for scsi%d\n",
+ +			       instance->host->host_no);
+  			retval = -ENOMEM;
+  			goto out;
+  		}
+diff --git a/drivers/scsi/3w-sas.c b/drivers/scsi/3w-sas.c
+index 61702ac00d42..2ee2e543ab73 100644
+--- a/drivers/scsi/3w-sas.c
++++ b/drivers/scsi/3w-sas.c
+@@ -663,14 +663,13 @@ static int twl_allocate_memory(TW_Device_Extension *tw_dev, int size, int which)
+ 	unsigned long *cpu_addr;
+ 	int retval = 1;
+ 
+-	cpu_addr = pci_alloc_consistent(tw_dev->tw_pci_dev, size*TW_Q_LENGTH, &dma_handle);
++	cpu_addr = pci_zalloc_consistent(tw_dev->tw_pci_dev, size * TW_Q_LENGTH,
++					 &dma_handle);
+ 	if (!cpu_addr) {
+ 		TW_PRINTK(tw_dev->host, TW_DRIVER, 0x5, "Memory allocation failed");
+ 		goto out;
+ 	}
+ 
+-	memset(cpu_addr, 0, size*TW_Q_LENGTH);
+-
+ 	for (i = 0; i < TW_Q_LENGTH; i++) {
+ 		switch(which) {
+ 		case 0:
+diff --git a/drivers/scsi/a100u2w.c b/drivers/scsi/a100u2w.c
+index 0163457c12bb..d14746110d18 100644
+--- a/drivers/scsi/a100u2w.c
++++ b/drivers/scsi/a100u2w.c
+@@ -1125,23 +1125,19 @@ static int inia100_probe_one(struct pci_dev *pdev,
+ 
+ 	/* Get total memory needed for SCB */
+ 	sz = ORC_MAXQUEUE * sizeof(struct orc_scb);
+-	host->scb_virt = pci_alloc_consistent(pdev, sz,
+-			&host->scb_phys);
++	host->scb_virt = pci_zalloc_consistent(pdev, sz, &host->scb_phys);
+ 	if (!host->scb_virt) {
+ 		printk("inia100: SCB memory allocation error\n");
+ 		goto out_host_put;
+ 	}
+-	memset(host->scb_virt, 0, sz);
+ 
+ 	/* Get total memory needed for ESCB */
+ 	sz = ORC_MAXQUEUE * sizeof(struct orc_extended_scb);
+-	host->escb_virt = pci_alloc_consistent(pdev, sz,
+-			&host->escb_phys);
++	host->escb_virt = pci_zalloc_consistent(pdev, sz, &host->escb_phys);
+ 	if (!host->escb_virt) {
+ 		printk("inia100: ESCB memory allocation error\n");
+ 		goto out_free_scb_array;
+ 	}
+-	memset(host->escb_virt, 0, sz);
+ 
+ 	biosaddr = host->BIOScfg;
+ 	biosaddr = (biosaddr << 4);
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index 19956757020b..d318d2fe79f6 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -282,13 +282,12 @@ static int beiscsi_prep_nemb_cmd(struct beiscsi_hba *phba,
+ 				 struct be_dma_mem *cmd,
+ 				 u8 subsystem, u8 opcode, u32 size)
+ {
+-	cmd->va = pci_alloc_consistent(phba->ctrl.pdev, size, &cmd->dma);
++	cmd->va = pci_zalloc_consistent(phba->ctrl.pdev, size, &cmd->dma);
+ 	if (!cmd->va) {
+ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+ 			    "BG_%d : Failed to allocate memory for if info\n");
+ 		return -ENOMEM;
+ 	}
+-	memset(cmd->va, 0, size);
+ 	cmd->size = size;
+ 	be_cmd_hdr_prepare(cmd->va, subsystem, opcode, size);
+ 	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+diff --git a/drivers/scsi/csiostor/csio_wr.c b/drivers/scsi/csiostor/csio_wr.c
+index c44a1af23fd2..308e4330818a 100644
+--- a/drivers/scsi/csiostor/csio_wr.c
++++ b/drivers/scsi/csiostor/csio_wr.c
+@@ -233,7 +233,7 @@ csio_wr_alloc_q(struct csio_hw *hw, uint32_t qsize, uint32_t wrsize,
+ 
+ 	q = wrm->q_arr[free_idx];
+ 
+-	q->vstart = pci_alloc_consistent(hw->pdev, qsz, &q->pstart);
++	q->vstart = pci_zalloc_consistent(hw->pdev, qsz, &q->pstart);
+ 	if (!q->vstart) {
+ 		csio_err(hw,
+ 			 "Failed to allocate DMA memory for "
+@@ -241,12 +241,6 @@ csio_wr_alloc_q(struct csio_hw *hw, uint32_t qsize, uint32_t wrsize,
+ 		return -1;
+ 	}
+ 
+-	/*
+-	 * We need to zero out the contents, importantly for ingress,
+-	 * since we start with a generatiom bit of 1 for ingress.
+-	 */
+-	memset(q->vstart, 0, qsz);
+-
+ 	q->type		= type;
+ 	q->owner	= owner;
+ 	q->pidx		= q->cidx = q->inc_idx = 0;
+diff --git a/drivers/scsi/eata.c b/drivers/scsi/eata.c
+index 94de88955a99..a3e9f4761ff2 100644
+--- a/drivers/scsi/eata.c
++++ b/drivers/scsi/eata.c
+@@ -1238,8 +1238,8 @@ static int port_detect(unsigned long port_base, unsigned int j,
+ 		struct eata_config *cf;
+ 		dma_addr_t cf_dma_addr;
+ 
+-		cf = pci_alloc_consistent(pdev, sizeof(struct eata_config),
+-					  &cf_dma_addr);
++		cf = pci_zalloc_consistent(pdev, sizeof(struct eata_config),
++					   &cf_dma_addr);
+ 
+ 		if (!cf) {
+ 			printk
+@@ -1249,7 +1249,6 @@ static int port_detect(unsigned long port_base, unsigned int j,
+ 		}
+ 
+ 		/* Set board configuration */
+-		memset((char *)cf, 0, sizeof(struct eata_config));
+ 		cf->len = (ushort) H2DEV16((ushort) 510);
+ 		cf->ocena = 1;
+ 
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/megaraid/megaraid_mbox.c b/drivers/scsi/megaraid/megaraid_mbox.c
+index 3316d8031e82..2545fccf930b 100644
+--- a/drivers/scsi/megaraid/megaraid_mbox.c
++++ b/drivers/scsi/megaraid/megaraid_mbox.c
+@@ -1004,8 +1004,9 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
+ 	 * Allocate the common 16-byte aligned memory for the handshake
+ 	 * mailbox.
+ 	 */
+-	raid_dev->una_mbox64 = pci_alloc_consistent(adapter->pdev,
+-			sizeof(mbox64_t), &raid_dev->una_mbox64_dma);
++	raid_dev->una_mbox64 = pci_zalloc_consistent(adapter->pdev,
++						     sizeof(mbox64_t),
++						     &raid_dev->una_mbox64_dma);
+ 
+ 	if (!raid_dev->una_mbox64) {
+ 		con_log(CL_ANN, (KERN_WARNING
+@@ -1013,7 +1014,6 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
+ 			__LINE__));
+ 		return -1;
+ 	}
+-	memset(raid_dev->una_mbox64, 0, sizeof(mbox64_t));
+ 
+ 	/*
+ 	 * Align the mailbox at 16-byte boundary
+@@ -1032,8 +1032,8 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
+ 			align;
+ 
+ 	// Allocate memory for commands issued internally
+-	adapter->ibuf = pci_alloc_consistent(pdev, MBOX_IBUF_SIZE,
+-				&adapter->ibuf_dma_h);
++	adapter->ibuf = pci_zalloc_consistent(pdev, MBOX_IBUF_SIZE,
++					      &adapter->ibuf_dma_h);
+ 	if (!adapter->ibuf) {
+ 
+ 		con_log(CL_ANN, (KERN_WARNING
+@@ -1042,7 +1042,6 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
+ 
+ 		goto out_free_common_mbox;
+ 	}
+-	memset(adapter->ibuf, 0, MBOX_IBUF_SIZE);
+ 
+ 	// Allocate memory for our SCSI Command Blocks and their associated
+ 	// memory
+@@ -2978,8 +2977,8 @@ megaraid_mbox_product_info(adapter_t *adapter)
+ 	 * Issue an ENQUIRY3 command to find out certain adapter parameters,
+ 	 * e.g., max channels, max commands etc.
+ 	 */
+-	pinfo = pci_alloc_consistent(adapter->pdev, sizeof(mraid_pinfo_t),
+-			&pinfo_dma_h);
++	pinfo = pci_zalloc_consistent(adapter->pdev, sizeof(mraid_pinfo_t),
++				      &pinfo_dma_h);
+ 
+ 	if (pinfo == NULL) {
+ 		con_log(CL_ANN, (KERN_WARNING
+@@ -2988,7 +2987,6 @@ megaraid_mbox_product_info(adapter_t *adapter)
+ 
+ 		return -1;
+ 	}
+-	memset(pinfo, 0, sizeof(mraid_pinfo_t));
+ 
+ 	mbox->xferaddr = (uint32_t)adapter->ibuf_dma_h;
+ 	memset((void *)adapter->ibuf, 0, MBOX_IBUF_SIZE);
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
+diff --git a/drivers/scsi/mesh.c b/drivers/scsi/mesh.c
+index 275503e62554..4bb3f31c260b 100644
+--- a/drivers/scsi/mesh.c
++++ b/drivers/scsi/mesh.c
+@@ -1915,14 +1915,12 @@ static int mesh_probe(struct macio_dev *mdev, const struct of_device_id *match)
+ 	/* We use the PCI APIs for now until the generic one gets fixed
+ 	 * enough or until we get some macio-specific versions
+ 	 */
+-	dma_cmd_space = pci_alloc_consistent(macio_get_pci_dev(mdev),
+-					     ms->dma_cmd_size,
+-					     &dma_cmd_bus);
++	dma_cmd_space = pci_zalloc_consistent(macio_get_pci_dev(mdev),
++					      ms->dma_cmd_size, &dma_cmd_bus);
+ 	if (dma_cmd_space == NULL) {
+ 		printk(KERN_ERR "mesh: can't allocate DMA table\n");
+ 		goto out_unmap;
+ 	}
+-	memset(dma_cmd_space, 0, ms->dma_cmd_size);
+ 
+ 	ms->dma_cmds = (struct dbdma_cmd *) DBDMA_ALIGN(dma_cmd_space);
+        	ms->dma_cmd_space = dma_cmd_space;
+diff --git a/drivers/scsi/mvumi.c b/drivers/scsi/mvumi.c
+index bd9c13b61984..77ec1b14b230 100644
+--- a/drivers/scsi/mvumi.c
++++ b/drivers/scsi/mvumi.c
+@@ -142,8 +142,8 @@ static struct mvumi_res *mvumi_alloc_mem_resource(struct mvumi_hba *mhba,
+ 
+ 	case RESOURCE_UNCACHED_MEMORY:
+ 		size = round_up(size, 8);
+-		res->virt_addr = pci_alloc_consistent(mhba->pdev, size,
+-							&res->bus_addr);
++		res->virt_addr = pci_zalloc_consistent(mhba->pdev, size,
++						       &res->bus_addr);
+ 		if (!res->virt_addr) {
+ 			dev_err(&mhba->pdev->dev,
+ 					"unable to allocate consistent mem,"
+@@ -151,7 +151,6 @@ static struct mvumi_res *mvumi_alloc_mem_resource(struct mvumi_hba *mhba,
+ 			kfree(res);
+ 			return NULL;
+ 		}
+-		memset(res->virt_addr, 0, size);
+ 		break;
+ 
+ 	default:
+@@ -258,12 +257,10 @@ static int mvumi_internal_cmd_sgl(struct mvumi_hba *mhba, struct mvumi_cmd *cmd,
+ 	if (size == 0)
+ 		return 0;
+ 
+-	virt_addr = pci_alloc_consistent(mhba->pdev, size, &phy_addr);
++	virt_addr = pci_zalloc_consistent(mhba->pdev, size, &phy_addr);
+ 	if (!virt_addr)
+ 		return -1;
+ 
+-	memset(virt_addr, 0, size);
+-
+ 	m_sg = (struct mvumi_sgl *) &cmd->frame->payload[0];
+ 	cmd->frame->sg_counts = 1;
+ 	cmd->data_buf = virt_addr;
+diff --git a/drivers/scsi/pm8001/pm8001_sas.c b/drivers/scsi/pm8001/pm8001_sas.c
+index d6ff17b78a6f..b93f289b42b3 100644
+--- a/drivers/scsi/pm8001/pm8001_sas.c
++++ b/drivers/scsi/pm8001/pm8001_sas.c
+@@ -116,13 +116,12 @@ int pm8001_mem_alloc(struct pci_dev *pdev, void **virt_addr,
+ 	u64 align_offset = 0;
+ 	if (align)
+ 		align_offset = (dma_addr_t)align - 1;
+-	mem_virt_alloc =
+-		pci_alloc_consistent(pdev, mem_size + align, &mem_dma_handle);
++	mem_virt_alloc = pci_zalloc_consistent(pdev, mem_size + align,
++					       &mem_dma_handle);
+ 	if (!mem_virt_alloc) {
+ 		pm8001_printk("memory allocation error\n");
+ 		return -1;
+ 	}
+-	memset((void *)mem_virt_alloc, 0, mem_size+align);
+ 	*pphys_addr = mem_dma_handle;
+ 	phys_align = (*pphys_addr + align_offset) & ~align_offset;
+ 	*virt_addr = (void *)mem_virt_alloc + phys_align - *pphys_addr;
