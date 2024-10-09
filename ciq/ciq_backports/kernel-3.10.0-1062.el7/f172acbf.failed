@@ -1,0 +1,154 @@
+powerpc/mm: move warning from resize_hpt_for_hotplug()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] mm: move warning from resize_hpt_for_hotplug() (Laurent Vivier) [1693046]
+Rebuild_FUZZ: 92.00%
+commit-author Laurent Vivier <lvivier@redhat.com>
+commit f172acbfae1a78b1a3c775f78e8d0dcd15b9d768
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f172acbf.failed
+
+resize_hpt_for_hotplug() reports a warning when it cannot
+resize the hash page table ("Unable to resize hash page
+table to target order") but in some cases it's not a problem
+and can make user thinks something has not worked properly.
+
+This patch moves the warning to arch_remove_memory() to
+only report the problem when it is needed.
+
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Laurent Vivier <lvivier@redhat.com>
+	Reviewed-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit f172acbfae1a78b1a3c775f78e8d0dcd15b9d768)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/hash_utils_64.c
+diff --cc arch/powerpc/mm/hash_utils_64.c
+index e9d0ab47abc9,c4c9610ce6e3..000000000000
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@@ -629,8 -759,8 +629,13 @@@ int resize_hpt_for_hotplug(unsigned lon
+  {
+  	unsigned target_hpt_shift;
+  
+++<<<<<<< HEAD
+ +	if (!ppc_md.resize_hpt)
+ +		return;
+++=======
++ 	if (!mmu_hash_ops.resize_hpt)
++ 		return 0;
+++>>>>>>> f172acbfae1a (powerpc/mm: move warning from resize_hpt_for_hotplug())
+  
+  	target_hpt_shift = htab_shift_for_mem_size(new_mem_size);
+  
+@@@ -642,29 -772,33 +647,33 @@@
+  	 * reduce unless the target shift is at least 2 below the
+  	 * current shift
+  	 */
+- 	if ((target_hpt_shift > ppc64_pft_size)
+- 	    || (target_hpt_shift < (ppc64_pft_size - 1))) {
+- 		int rc;
++ 	if (target_hpt_shift > ppc64_pft_size ||
++ 	    target_hpt_shift < ppc64_pft_size - 1)
++ 		return mmu_hash_ops.resize_hpt(target_hpt_shift);
+  
+++<<<<<<< HEAD
+ +		rc = ppc_md.resize_hpt(target_hpt_shift);
+ +		if (rc)
+ +			printk(KERN_WARNING
+ +			       "Unable to resize hash page table to target order %d: %d\n",
+ +			       target_hpt_shift, rc);
+ +	}
+++=======
++ 	return 0;
+++>>>>>>> f172acbfae1a (powerpc/mm: move warning from resize_hpt_for_hotplug())
+  }
+  
+ -int hash__create_section_mapping(unsigned long start, unsigned long end, int nid)
+ +int create_section_mapping(unsigned long start, unsigned long end)
+  {
+ -	int rc = htab_bolt_mapping(start, end, __pa(start),
+ -				   pgprot_val(PAGE_KERNEL), mmu_linear_psize,
+ -				   mmu_kernel_ssize);
+ -
+ -	if (rc < 0) {
+ -		int rc2 = htab_remove_mapping(start, end, mmu_linear_psize,
+ -					      mmu_kernel_ssize);
+ -		BUG_ON(rc2 && (rc2 != -ENOENT));
+ -	}
+ -	return rc;
+ +	return htab_bolt_mapping(start, end, __pa(start),
+ +				 pgprot_val(PAGE_KERNEL), mmu_linear_psize,
+ +				 mmu_kernel_ssize);
+  }
+  
+ -int hash__remove_section_mapping(unsigned long start, unsigned long end)
+ +int remove_section_mapping(unsigned long start, unsigned long end)
+  {
+ -	int rc = htab_remove_mapping(start, end, mmu_linear_psize,
+ -				     mmu_kernel_ssize);
+ -	WARN_ON(rc < 0);
+ -	return rc;
+ +	return htab_remove_mapping(start, end, mmu_linear_psize,
+ +			mmu_kernel_ssize);
+  }
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+  
+diff --git a/arch/powerpc/include/asm/sparsemem.h b/arch/powerpc/include/asm/sparsemem.h
+index c88930c9db7f..9e2329273382 100644
+--- a/arch/powerpc/include/asm/sparsemem.h
++++ b/arch/powerpc/include/asm/sparsemem.h
+@@ -20,9 +20,9 @@ extern int create_section_mapping(unsigned long start, unsigned long end);
+ extern int remove_section_mapping(unsigned long start, unsigned long end);
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
+-extern void resize_hpt_for_hotplug(unsigned long new_mem_size);
++extern int resize_hpt_for_hotplug(unsigned long new_mem_size);
+ #else
+-static inline void resize_hpt_for_hotplug(unsigned long new_mem_size) { }
++static inline int resize_hpt_for_hotplug(unsigned long new_mem_size) { return 0; }
+ #endif
+ 
+ #ifdef CONFIG_NUMA
+* Unmerged path arch/powerpc/mm/hash_utils_64.c
+diff --git a/arch/powerpc/mm/mem.c b/arch/powerpc/mm/mem.c
+index 46165fd7ef30..3e24c694a8bd 100644
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -160,7 +160,8 @@ int arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+ 	 */
+ 	vm_unmap_aliases();
+ 
+-	resize_hpt_for_hotplug(memblock_phys_mem_size());
++	if (resize_hpt_for_hotplug(memblock_phys_mem_size()) == -ENOSPC)
++		pr_warn("Hash collision while resizing HPT\n");
+ 
+ 	return ret;
+ }
+diff --git a/arch/powerpc/platforms/pseries/lpar.c b/arch/powerpc/platforms/pseries/lpar.c
+index f51dcc1f46f9..b6a2bb3af922 100644
+--- a/arch/powerpc/platforms/pseries/lpar.c
++++ b/arch/powerpc/platforms/pseries/lpar.c
+@@ -692,8 +692,10 @@ static int pseries_lpar_resize_hpt(unsigned long shift)
+ 		break;
+ 
+ 	case H_PARAMETER:
++		pr_warn("Invalid argument from H_RESIZE_HPT_PREPARE\n");
+ 		return -EINVAL;
+ 	case H_RESOURCE:
++		pr_warn("Operation not permitted from H_RESIZE_HPT_PREPARE\n");
+ 		return -EPERM;
+ 	default:
+ 		pr_warn("Unexpected error %d from H_RESIZE_HPT_PREPARE\n", rc);
+@@ -709,7 +711,6 @@ static int pseries_lpar_resize_hpt(unsigned long shift)
+ 	if (rc != 0) {
+ 		switch (state.commit_rc) {
+ 		case H_PTEG_FULL:
+-			pr_warn("Hash collision while resizing HPT\n");
+ 			return -ENOSPC;
+ 
+ 		default:
