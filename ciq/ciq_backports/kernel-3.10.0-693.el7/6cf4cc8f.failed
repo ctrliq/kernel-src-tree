@@ -1,0 +1,291 @@
+dm cache policy smq: stop preemptively demoting blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit 6cf4cc8f8b3b7bc9e3c04a7eab44b985d50029fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6cf4cc8f.failed
+
+It causes a lot of churn if the working set's size is close to the fast
+device's size.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 6cf4cc8f8b3b7bc9e3c04a7eab44b985d50029fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-policy-smq.c
+diff --cc drivers/md/dm-cache-policy-smq.c
+index c33f4a6e1d7d,758480a1893d..000000000000
+--- a/drivers/md/dm-cache-policy-smq.c
++++ b/drivers/md/dm-cache-policy-smq.c
+@@@ -1095,34 -1101,145 +1095,128 @@@ static void end_cache_period(struct smq
+  	}
+  }
+  
+ -/*----------------------------------------------------------------*/
+ -
+ -/*
+ - * Targets are given as a percentage.
+ - */
+ -#define CLEAN_TARGET 25u
+ -#define FREE_TARGET 25u
+ -
+ -static unsigned percent_to_target(struct smq_policy *mq, unsigned p)
+ -{
+ -	return from_cblock(mq->cache_size) * p / 100u;
+ -}
+ -
+ -static bool clean_target_met(struct smq_policy *mq, bool idle)
+ +static int demote_cblock(struct smq_policy *mq,
+ +			 struct policy_locker *locker,
+ +			 dm_oblock_t *oblock)
+  {
+ -	/*
+ -	 * Cache entries may not be populated.  So we cannot rely on the
+ -	 * size of the clean queue.
+ -	 */
+ -	unsigned nr_clean;
+ -
+ -	if (idle) {
+ +	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false);
+ +	if (!demoted)
+  		/*
+ -		 * We'd like to clean everything.
+ +		 * We could get a block from mq->dirty, but that
+ +		 * would add extra latency to the triggering bio as it
+ +		 * waits for the writeback.  Better to not promote this
+ +		 * time and hope there's a clean block next time this block
+ +		 * is hit.
+  		 */
+ -		return q_size(&mq->dirty) == 0u;
+ -	}
+ +		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	if (locker->fn(locker, demoted->oblock))
+++=======
++ 	nr_clean = from_cblock(mq->cache_size) - q_size(&mq->dirty);
++ 	return (nr_clean + btracker_nr_writebacks_queued(mq->bg_work)) >=
++ 		percent_to_target(mq, CLEAN_TARGET);
++ }
++ 
++ static bool free_target_met(struct smq_policy *mq)
++ {
++ 	unsigned nr_free;
++ 
++ 	nr_free = from_cblock(mq->cache_size) - mq->cache_alloc.nr_allocated;
++ 	return (nr_free + btracker_nr_demotions_queued(mq->bg_work)) >=
++ 		percent_to_target(mq, FREE_TARGET);
++ }
++ 
++ /*----------------------------------------------------------------*/
++ 
++ static void mark_pending(struct smq_policy *mq, struct entry *e)
++ {
++ 	BUG_ON(e->sentinel);
++ 	BUG_ON(!e->allocated);
++ 	BUG_ON(e->pending_work);
++ 	e->pending_work = true;
++ }
++ 
++ static void clear_pending(struct smq_policy *mq, struct entry *e)
++ {
++ 	BUG_ON(!e->pending_work);
++ 	e->pending_work = false;
++ }
++ 
++ static void queue_writeback(struct smq_policy *mq)
++ {
++ 	int r;
++ 	struct policy_work work;
++ 	struct entry *e;
++ 
++ 	e = q_peek(&mq->dirty, mq->dirty.nr_levels, !mq->migrations_allowed);
++ 	if (e) {
++ 		mark_pending(mq, e);
++ 		q_del(&mq->dirty, e);
++ 
++ 		work.op = POLICY_WRITEBACK;
++ 		work.oblock = e->oblock;
++ 		work.cblock = infer_cblock(mq, e);
++ 
++ 		r = btracker_queue(mq->bg_work, &work, NULL);
++ 		WARN_ON_ONCE(r); // FIXME: finish, I think we have to get rid of this race.
++ 	}
++ }
++ 
++ static void queue_demotion(struct smq_policy *mq)
++ {
++ 	struct policy_work work;
++ 	struct entry *e;
++ 
++ 	if (unlikely(WARN_ON_ONCE(!mq->migrations_allowed)))
++ 		return;
++ 
++ 	e = q_peek(&mq->clean, mq->clean.nr_levels / 2, true);
++ 	if (!e) {
++ 		if (!clean_target_met(mq, true))
++ 			queue_writeback(mq);
++ 		return;
++ 	}
++ 
++ 	mark_pending(mq, e);
++ 	q_del(&mq->clean, e);
++ 
++ 	work.op = POLICY_DEMOTE;
++ 	work.oblock = e->oblock;
++ 	work.cblock = infer_cblock(mq, e);
++ 	btracker_queue(mq->bg_work, &work, NULL);
++ }
++ 
++ static void queue_promotion(struct smq_policy *mq, dm_oblock_t oblock,
++ 			    struct policy_work **workp)
++ {
++ 	struct entry *e;
++ 	struct policy_work work;
++ 
++ 	if (!mq->migrations_allowed)
++ 		return;
++ 
++ 	if (allocator_empty(&mq->cache_alloc)) {
+++>>>>>>> 6cf4cc8f8b3b (dm cache policy smq: stop preemptively demoting blocks)
+  		/*
+ -		 * We always claim to be 'idle' to ensure some demotions happen
+ -		 * with continuous loads.
+ +		 * We couldn't lock this block.
+  		 */
+++<<<<<<< HEAD
+ +		return -EBUSY;
+++=======
++ 		if (!free_target_met(mq))
++ 			queue_demotion(mq);
++ 		return;
++ 	}
+++>>>>>>> 6cf4cc8f8b3b (dm cache policy smq: stop preemptively demoting blocks)
+  
+ -	if (btracker_promotion_already_present(mq->bg_work, oblock))
+ -		return;
+ +	del(mq, demoted);
+ +	*oblock = demoted->oblock;
+ +	free_entry(&mq->cache_alloc, demoted);
+  
+ -	/*
+ -	 * We allocate the entry now to reserve the cblock.  If the
+ -	 * background work is aborted we must remember to free it.
+ -	 */
+ -	e = alloc_entry(&mq->cache_alloc);
+ -	BUG_ON(!e);
+ -	e->pending_work = true;
+ -	work.op = POLICY_PROMOTE;
+ -	work.oblock = oblock;
+ -	work.cblock = infer_cblock(mq, e);
+ -	btracker_queue(mq->bg_work, &work, workp);
+ +	return 0;
+  }
+  
+ -/*----------------------------------------------------------------*/
+ -
+  enum promote_result {
+  	PROMOTE_NOT,
+  	PROMOTE_TEMPORARY,
+@@@ -1327,19 -1408,79 +1421,95 @@@ static int smq_lookup(struct dm_cache_p
+  	return r;
+  }
+  
+ +static void __smq_set_clear_dirty(struct smq_policy *mq, dm_oblock_t oblock, bool set)
+ +{
+ +	struct entry *e;
+ +
+ +	e = h_lookup(&mq->table, oblock);
+ +	BUG_ON(!e);
+ +
+ +	del(mq, e);
+ +	e->dirty = set;
+ +	push(mq, e);
+ +}
+ +
+++<<<<<<< HEAD
+ +static void smq_set_dirty(struct dm_cache_policy *p, dm_oblock_t oblock)
+++=======
++ static int smq_get_background_work(struct dm_cache_policy *p, bool idle,
++ 				   struct policy_work **result)
++ {
++ 	int r;
++ 	unsigned long flags;
++ 	struct smq_policy *mq = to_smq_policy(p);
++ 
++ 	spin_lock_irqsave(&mq->lock, flags);
++ 	r = btracker_issue(mq->bg_work, result);
++ 	if (r == -ENODATA) {
++ 		if (!clean_target_met(mq, idle)) {
++ 			queue_writeback(mq);
++ 			r = btracker_issue(mq->bg_work, result);
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&mq->lock, flags);
++ 
++ 	return r;
++ }
++ 
++ /*
++  * We need to clear any pending work flags that have been set, and in the
++  * case of promotion free the entry for the destination cblock.
++  */
++ static void __complete_background_work(struct smq_policy *mq,
++ 				       struct policy_work *work,
++ 				       bool success)
++ {
++ 	struct entry *e = get_entry(&mq->cache_alloc,
++ 				    from_cblock(work->cblock));
++ 
++ 	switch (work->op) {
++ 	case POLICY_PROMOTE:
++ 		// !h, !q, a
++ 		clear_pending(mq, e);
++ 		if (success) {
++ 			e->oblock = work->oblock;
++ 			e->level = NR_CACHE_LEVELS - 1;
++ 			push(mq, e);
++ 			// h, q, a
++ 		} else {
++ 			free_entry(&mq->cache_alloc, e);
++ 			// !h, !q, !a
++ 		}
++ 		break;
++ 
++ 	case POLICY_DEMOTE:
++ 		// h, !q, a
++ 		if (success) {
++ 			h_remove(&mq->table, e);
++ 			free_entry(&mq->cache_alloc, e);
++ 			// !h, !q, !a
++ 		} else {
++ 			clear_pending(mq, e);
++ 			push_queue(mq, e);
++ 			// h, q, a
++ 		}
++ 		break;
++ 
++ 	case POLICY_WRITEBACK:
++ 		// h, !q, a
++ 		clear_pending(mq, e);
++ 		push_queue(mq, e);
++ 		// h, q, a
++ 		break;
++ 	}
++ 
++ 	btracker_complete(mq->bg_work, work);
++ }
++ 
++ static void smq_complete_background_work(struct dm_cache_policy *p,
++ 					 struct policy_work *work,
++ 					 bool success)
+++>>>>>>> 6cf4cc8f8b3b (dm cache policy smq: stop preemptively demoting blocks)
+  {
+  	unsigned long flags;
+  	struct smq_policy *mq = to_smq_policy(p);
+* Unmerged path drivers/md/dm-cache-policy-smq.c
