@@ -1,0 +1,122 @@
+ceph: fix -EOLDSNAPC handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit a5cd74ad388c1318554e24820b77ce335a27e0ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a5cd74ad.failed
+
+Need to drop cap reference before retry. Besides, it's better to
+redo file write checks for each retry because we re-lock inode.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit a5cd74ad388c1318554e24820b77ce335a27e0ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 65ab510e4506,1ce80f66e9e5..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -1338,16 -1309,13 +1338,21 @@@ static ssize_t ceph_aio_write(struct ki
+  	if (!prealloc_cf)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&inode->i_mutex);
+ +
+ +	err = generic_segment_checks(iov, &nr_segs, &count, VERIFY_READ);
+ +	if (err)
+ +		goto out;
+++=======
++ retry_snap:
++ 	inode_lock(inode);
+++>>>>>>> a5cd74ad388c (ceph: fix -EOLDSNAPC handling)
+  
+  	/* We can write back this queue in page reclaim */
+ -	current->backing_dev_info = inode_to_bdi(inode);
+ +	current->backing_dev_info = file->f_mapping->backing_dev_info;
+  
+ -	if (iocb->ki_flags & IOCB_APPEND) {
+ +	if (file->f_flags & O_APPEND) {
+  		err = ceph_do_getattr(inode, CEPH_STAT_CAP_SIZE, false);
+  		if (err < 0)
+  			goto out;
+@@@ -1374,7 -1341,7 +1379,11 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +retry_snap:
+++=======
++ 	/* FIXME: not complete since it doesn't account for being at quota */
+++>>>>>>> a5cd74ad388c (ceph: fix -EOLDSNAPC handling)
+  	if (ceph_osdmap_flag(osdc, CEPH_OSDMAP_FULL)) {
+  		err = -ENOSPC;
+  		goto out;
+@@@ -1412,24 -1380,17 +1421,30 @@@
+  			snapc = ceph_get_snap_context(ci->i_head_snapc);
+  		}
+  		spin_unlock(&ci->i_ceph_lock);
+ +		BUG_ON(!snapc);
+  
+ -		/* we might need to revert back to that point */
+ -		data = *from;
+ -		if (iocb->ki_flags & IOCB_DIRECT)
+ -			written = ceph_direct_read_write(iocb, &data, snapc,
+ +		iov_iter_init(&i, iov, nr_segs, count, 0);
+ +
+ +		if (file->f_flags & O_DIRECT)
+ +			written = ceph_direct_read_write(iocb, &i, snapc,
+  							 &prealloc_cf);
+  		else
+++<<<<<<< HEAD
+ +			written = ceph_sync_write(iocb, &i, snapc);
+ +
+ +		if (written == -EOLDSNAPC) {
+ +			dout("aio_write %p %llx.%llx %llu~%u"
+ +				"got EOLDSNAPC, retrying\n",
+ +				inode, ceph_vinop(inode),
+ +				pos, (unsigned)iov->iov_len);
+ +			mutex_lock(&inode->i_mutex);
+ +			goto retry_snap;
+ +		}
+++=======
++ 			written = ceph_sync_write(iocb, &data, pos, snapc);
++ 		if (written > 0)
++ 			iov_iter_advance(from, written);
+++>>>>>>> a5cd74ad388c (ceph: fix -EOLDSNAPC handling)
+  		ceph_put_snap_context(snapc);
+  	} else {
+  		/*
+@@@ -1461,12 -1422,16 +1476,25 @@@
+  	     ceph_cap_string(got));
+  	ceph_put_cap_refs(ci, got);
+  
+++<<<<<<< HEAD
+ +	if (written >= 0 &&
+ +	    ((file->f_flags & O_SYNC) || IS_SYNC(file->f_mapping->host) ||
+ +	     ceph_osdmap_flag(osdc, CEPH_OSDMAP_NEARFULL))) {
+ +		err = vfs_fsync_range(file, pos, pos + written - 1, 1);
+ +		if (err < 0)
+ +			written = err;
+++=======
++ 	if (written == -EOLDSNAPC) {
++ 		dout("aio_write %p %llx.%llx %llu~%u" "got EOLDSNAPC, retrying\n",
++ 		     inode, ceph_vinop(inode), pos, (unsigned)count);
++ 		goto retry_snap;
++ 	}
++ 
++ 	if (written >= 0) {
++ 		if (ceph_osdmap_flag(osdc, CEPH_OSDMAP_NEARFULL))
++ 			iocb->ki_flags |= IOCB_DSYNC;
++ 		written = generic_write_sync(iocb, written);
+++>>>>>>> a5cd74ad388c (ceph: fix -EOLDSNAPC handling)
+  	}
+  
+  	goto out_unlocked;
+* Unmerged path fs/ceph/file.c
