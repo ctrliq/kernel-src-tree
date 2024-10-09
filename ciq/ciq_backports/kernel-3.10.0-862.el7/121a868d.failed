@@ -1,0 +1,157 @@
+s390/zcrypt: Fix initialisation when zcrypt is built-in
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Fix initialisation when zcrypt is built-in (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 95.24%
+commit-author Sascha Silbe <silbe@linux.vnet.ibm.com>
+commit 121a868d05500b9d7e5108cc52474dafbf60e285
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/121a868d.failed
+
+ap_bus and zcrypt_api assumed module information to always be present
+and initialisation to be done in module loading order (symbol
+dependencies). These assumptions don't hold if zcrypt is built-in;
+THIS_MODULE will be NULL in this case and init call order is linker
+order, i.e. Makefile order.
+
+Fix initialisation order by ordering the object files in the Makefile
+according to their dependencies, like the module loader would do.
+
+Fix message type registration by using a dedicated "name" field rather
+than piggy-backing on the module ("owner") information. There's no
+change to the requirement that module name and msgtype name are
+identical. The existing name macros are used.
+
+We don't need any special code for dealing with the drivers being
+built-in; the generic module support code already does the right
+thing.
+
+Test results:
+1. CONFIG_MODULES=y, CONFIG_ZCRYPT=y
+
+   KVM: boots, no /sys/bus/ap (expected)
+   LPAR with CEX5: boots, /sys/bus/ap/devices/card*/type present
+
+2. CONFIG_MODULES=y, CONFIG_ZCRYPT=m=:
+
+   KVM: boots, loading zcrypt_cex4 (and ap) fails (expected)
+   LPAR with CEX5: boots, loading =zcrypt_cex4= succeeds,
+   /sys/bus/ap/devices/card*/type present after explicit module
+   loading
+
+3. CONFIG_MODULES unset, CONFIG_ZCRYPT=y:
+   KVM: boots, no /sys/bus/ap (expected)
+   LPAR with CEX5: boots, /sys/bus/ap/devices/card*/type present
+
+No further testing (user-space functionality) was done.
+
+Fixes: 3b6245fd303f ("s390/zcrypt: Separate msgtype implementation from card modules.")
+	Signed-off-by: Sascha Silbe <silbe@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 121a868d05500b9d7e5108cc52474dafbf60e285)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/Makefile
+diff --cc drivers/s390/crypto/Makefile
+index 771faf7094d6,b8ab18676e69..000000000000
+--- a/drivers/s390/crypto/Makefile
++++ b/drivers/s390/crypto/Makefile
+@@@ -3,6 -3,9 +3,14 @@@
+  #
+  
+  ap-objs := ap_bus.o
+++<<<<<<< HEAD
+ +obj-$(CONFIG_ZCRYPT) += ap.o zcrypt_api.o zcrypt_pcicc.o zcrypt_pcixcc.o
+ +obj-$(CONFIG_ZCRYPT) += zcrypt_pcica.o zcrypt_cex2a.o zcrypt_cex4.o
+++=======
++ # zcrypt_api depends on ap
++ obj-$(CONFIG_ZCRYPT) += ap.o zcrypt_api.o
++ # msgtype* depend on zcrypt_api
+++>>>>>>> 121a868d0550 (s390/zcrypt: Fix initialisation when zcrypt is built-in)
+  obj-$(CONFIG_ZCRYPT) += zcrypt_msgtype6.o zcrypt_msgtype50.o
++ # adapter drivers depend on ap, zcrypt_api and msgtype*
++ obj-$(CONFIG_ZCRYPT) += zcrypt_pcixcc.o zcrypt_cex2a.o zcrypt_cex4.o
+* Unmerged path drivers/s390/crypto/Makefile
+diff --git a/drivers/s390/crypto/zcrypt_api.c b/drivers/s390/crypto/zcrypt_api.c
+index aac1d13c55dd..60cad7c3b4e4 100644
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@ -313,11 +313,9 @@ EXPORT_SYMBOL(zcrypt_device_unregister);
+ 
+ void zcrypt_msgtype_register(struct zcrypt_ops *zops)
+ {
+-	if (zops->owner) {
+-		spin_lock_bh(&zcrypt_ops_list_lock);
+-		list_add_tail(&zops->list, &zcrypt_ops_list);
+-		spin_unlock_bh(&zcrypt_ops_list_lock);
+-	}
++	spin_lock_bh(&zcrypt_ops_list_lock);
++	list_add_tail(&zops->list, &zcrypt_ops_list);
++	spin_unlock_bh(&zcrypt_ops_list_lock);
+ }
+ EXPORT_SYMBOL(zcrypt_msgtype_register);
+ 
+@@ -338,7 +336,7 @@ struct zcrypt_ops *__ops_lookup(unsigned char *name, int variant)
+ 	spin_lock_bh(&zcrypt_ops_list_lock);
+ 	list_for_each_entry(zops, &zcrypt_ops_list, list) {
+ 		if ((zops->variant == variant) &&
+-		    (!strncmp(zops->owner->name, name, MODULE_NAME_LEN))) {
++		    (!strncmp(zops->name, name, sizeof(zops->name)))) {
+ 			found = 1;
+ 			break;
+ 		}
+diff --git a/drivers/s390/crypto/zcrypt_api.h b/drivers/s390/crypto/zcrypt_api.h
+index 01d02342c190..04b51a92098e 100644
+--- a/drivers/s390/crypto/zcrypt_api.h
++++ b/drivers/s390/crypto/zcrypt_api.h
+@@ -96,6 +96,7 @@ struct zcrypt_ops {
+ 	struct list_head list;		/* zcrypt ops list. */
+ 	struct module *owner;
+ 	int variant;
++	char name[128];
+ };
+ 
+ struct zcrypt_device {
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.c b/drivers/s390/crypto/zcrypt_msgtype50.c
+index 6c9af1332967..aaa58ede04c3 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.c
++++ b/drivers/s390/crypto/zcrypt_msgtype50.c
+@@ -511,6 +511,7 @@ static struct zcrypt_ops zcrypt_msgtype50_ops = {
+ 	.rsa_modexpo = zcrypt_cex2a_modexpo,
+ 	.rsa_modexpo_crt = zcrypt_cex2a_modexpo_crt,
+ 	.owner = THIS_MODULE,
++	.name = MSGTYPE50_NAME,
+ 	.variant = MSGTYPE50_VARIANT_DEFAULT,
+ };
+ 
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.c b/drivers/s390/crypto/zcrypt_msgtype6.c
+index cdba2fb45fdc..858bb8d841fb 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.c
++++ b/drivers/s390/crypto/zcrypt_msgtype6.c
+@@ -1110,6 +1110,7 @@ static long zcrypt_msgtype6_rng(struct zcrypt_device *zdev,
+  */
+ static struct zcrypt_ops zcrypt_msgtype6_norng_ops = {
+ 	.owner = THIS_MODULE,
++	.name = MSGTYPE06_NAME,
+ 	.variant = MSGTYPE06_VARIANT_NORNG,
+ 	.rsa_modexpo = zcrypt_msgtype6_modexpo,
+ 	.rsa_modexpo_crt = zcrypt_msgtype6_modexpo_crt,
+@@ -1118,6 +1119,7 @@ static struct zcrypt_ops zcrypt_msgtype6_norng_ops = {
+ 
+ static struct zcrypt_ops zcrypt_msgtype6_ops = {
+ 	.owner = THIS_MODULE,
++	.name = MSGTYPE06_NAME,
+ 	.variant = MSGTYPE06_VARIANT_DEFAULT,
+ 	.rsa_modexpo = zcrypt_msgtype6_modexpo,
+ 	.rsa_modexpo_crt = zcrypt_msgtype6_modexpo_crt,
+@@ -1127,6 +1129,7 @@ static struct zcrypt_ops zcrypt_msgtype6_ops = {
+ 
+ static struct zcrypt_ops zcrypt_msgtype6_ep11_ops = {
+ 	.owner = THIS_MODULE,
++	.name = MSGTYPE06_NAME,
+ 	.variant = MSGTYPE06_VARIANT_EP11,
+ 	.rsa_modexpo = NULL,
+ 	.rsa_modexpo_crt = NULL,
