@@ -1,0 +1,127 @@
+pNFS: Cleanup - don't open code pnfs_mark_layout_stateid_invalid()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 5f46be049b0dfdd36188058f044c165e1d4b8f56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5f46be04.failed
+
+Ensure nfs42_layoutstat_done() layoutget don't open code layout stateid
+invalidation.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 5f46be049b0dfdd36188058f044c165e1d4b8f56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs42proc.c
+#	fs/nfs/nfs4proc.c
+#	fs/nfs/pnfs.h
+diff --cc fs/nfs/nfs42proc.c
+index 0e396a18ce21,6ea5ad6f0d44..000000000000
+--- a/fs/nfs/nfs42proc.c
++++ b/fs/nfs/nfs42proc.c
+@@@ -230,8 -336,7 +230,12 @@@ nfs42_layoutstat_done(struct rpc_task *
+  			 * Mark the bad layout state as invalid, then retry
+  			 * with the current stateid.
+  			 */
+++<<<<<<< HEAD
+ +			set_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags);
+ +			pnfs_mark_matching_lsegs_invalid(lo, &head, NULL);
+++=======
++ 			pnfs_mark_layout_stateid_invalid(lo, &head);
+++>>>>>>> 5f46be049b0d (pNFS: Cleanup - don't open code pnfs_mark_layout_stateid_invalid())
+  			spin_unlock(&inode->i_lock);
+  			pnfs_free_lseg_list(&head);
+  		} else
+diff --cc fs/nfs/nfs4proc.c
+index 464f667c987d,8c453515d98c..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -8075,26 -7931,21 +8075,30 @@@ static void nfs4_layoutget_done(struct 
+  			 * Mark the bad layout state as invalid, then retry
+  			 * with the current stateid.
+  			 */
+++<<<<<<< HEAD
+ +			set_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags);
+ +			pnfs_mark_matching_lsegs_invalid(lo, &head, NULL);
+++=======
++ 			pnfs_mark_layout_stateid_invalid(lo, &head);
+++>>>>>>> 5f46be049b0d (pNFS: Cleanup - don't open code pnfs_mark_layout_stateid_invalid())
+  			spin_unlock(&inode->i_lock);
+  			pnfs_free_lseg_list(&head);
+ -			status = -EAGAIN;
+ -			goto out;
+  		} else
+  			spin_unlock(&inode->i_lock);
+ +		goto out_restart;
+  	}
+ -
+ -	status = nfs4_handle_exception(server, status, exception);
+ -	if (exception->retry)
+ -		status = -EAGAIN;
+ +	if (nfs4_async_handle_error(task, server, state, &lgp->timeout) == -EAGAIN)
+ +		goto out_restart;
+  out:
+  	dprintk("<-- %s\n", __func__);
+ -	return status;
+ +	return;
+ +out_restart:
+ +	task->tk_status = 0;
+ +	rpc_restart_call_prepare(task);
+ +	return;
+ +out_overflow:
+ +	task->tk_status = -EOVERFLOW;
+ +	goto out;
+  }
+  
+  static size_t max_response_pages(struct nfs_server *server)
+diff --cc fs/nfs/pnfs.h
+index 6a045d2d2293,d71c9493693a..000000000000
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@@ -259,16 -260,16 +259,23 @@@ void pnfs_put_layout_hdr(struct pnfs_la
+  void pnfs_set_layout_stateid(struct pnfs_layout_hdr *lo,
+  			     const nfs4_stateid *new,
+  			     bool update_barrier);
+ +int pnfs_choose_layoutget_stateid(nfs4_stateid *dst,
+ +				  struct pnfs_layout_hdr *lo,
+ +				  struct pnfs_layout_range *range,
+ +				  struct nfs4_state *open_state);
+  int pnfs_mark_matching_lsegs_invalid(struct pnfs_layout_hdr *lo,
+  				struct list_head *tmp_list,
+ -				const struct pnfs_layout_range *recall_range,
+ -				u32 seq);
+ -int pnfs_mark_matching_lsegs_return(struct pnfs_layout_hdr *lo,
+ +				struct pnfs_layout_range *recall_range);
+ +void pnfs_mark_matching_lsegs_return(struct pnfs_layout_hdr *lo,
+  				struct list_head *tmp_list,
+++<<<<<<< HEAD
+ +				struct pnfs_layout_range *recall_range);
+++=======
++ 				const struct pnfs_layout_range *recall_range,
++ 				u32 seq);
++ int pnfs_mark_layout_stateid_invalid(struct pnfs_layout_hdr *lo,
++ 		struct list_head *lseg_list);
+++>>>>>>> 5f46be049b0d (pNFS: Cleanup - don't open code pnfs_mark_layout_stateid_invalid())
+  bool pnfs_roc(struct inode *ino);
+  void pnfs_roc_release(struct inode *ino);
+  void pnfs_roc_set_barrier(struct inode *ino, u32 barrier);
+* Unmerged path fs/nfs/nfs42proc.c
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/pnfs.c b/fs/nfs/pnfs.c
+index 3653071b6302..c93ed73c3e9a 100644
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@ -259,7 +259,7 @@ pnfs_put_layout_hdr(struct pnfs_layout_hdr *lo)
+  * is required.
+  * Note that caller must hold inode->i_lock.
+  */
+-static int
++int
+ pnfs_mark_layout_stateid_invalid(struct pnfs_layout_hdr *lo,
+ 		struct list_head *lseg_list)
+ {
+* Unmerged path fs/nfs/pnfs.h
