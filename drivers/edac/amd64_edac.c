@@ -2597,7 +2597,6 @@ static void restore_ecc_error_reporting(struct ecc_settings *s, u16 nid,
 {
 	u32 value, mask = 0x3;		/* UECC/CECC enable */
 
-
 	if (!s->nbctl_valid)
 		return;
 
@@ -2894,7 +2893,11 @@ static int probe_one_instance(struct pci_dev *pdev,
 		if (!ecc_enable_override)
 			goto err_enable;
 
-		amd64_warn("Forcing ECC on!\n");
+		if (boot_cpu_data.x86 >= 0x17) {
+			amd64_warn("Forcing ECC on is not recommended on newer systems. Please enable ECC in BIOS.");
+			goto err_enable;
+		} else
+			amd64_warn("Forcing ECC on!\n");
 
 		if (!enable_ecc_error_reporting(s, nid, F3))
 			goto err_enable;
@@ -2903,7 +2906,9 @@ static int probe_one_instance(struct pci_dev *pdev,
 	ret = init_one_instance(pdev);
 	if (ret < 0) {
 		amd64_err("Error probing instance: %d\n", nid);
-		restore_ecc_error_reporting(s, nid, F3);
+
+		if (boot_cpu_data.x86 < 0x17)
+			restore_ecc_error_reporting(s, nid, F3);
 	}
 
 	return ret;
