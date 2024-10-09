@@ -1,0 +1,113 @@
+net/mlx5e: Don't recycle page if moved to far NUMA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Don't recycle page if moved to far NUMA (Kamal Heib) [1456694]
+Rebuild_FUZZ: 95.83%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 70871f1ec4a7e2d52683a53a5ee596790080a2c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/70871f1e.failed
+
+Avoid recycling an RX page if it moved to another NUMA node.
+Add an ethtool counter to count such events.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 70871f1ec4a7e2d52683a53a5ee596790080a2c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d6a4d3219a46,f1dd638384d3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -156,30 -159,13 +156,34 @@@ static inline u32 mlx5e_decompress_cqes
+  	return mlx5e_decompress_cqes_cont(rq, cq, 1, budget_rem) - 1;
+  }
+  
+ -#define RQ_PAGE_SIZE(rq) ((1 << rq->buff.page_order) << PAGE_SHIFT)
+ -
+ -static inline bool mlx5e_page_is_reserved(struct page *page)
+ +void mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool val)
+  {
+++<<<<<<< HEAD
+ +	bool was_opened;
+ +
+ +	if (!MLX5_CAP_GEN(priv->mdev, cqe_compression))
+ +		return;
+ +
+ +	if (MLX5E_GET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS) == val)
+ +		return;
+ +
+ +	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	if (was_opened)
+ +		mlx5e_close_locked(priv->netdev);
+ +
+ +	MLX5E_SET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS, val);
+ +	mlx5e_set_rq_type_params(priv, priv->params.rq_wq_type);
+ +
+ +	if (was_opened)
+ +		mlx5e_open_locked(priv->netdev);
+ +
+++=======
++ 	return page_is_pfmemalloc(page) || page_to_nid(page) != numa_mem_id();
+++>>>>>>> 70871f1ec4a7 (net/mlx5e: Don't recycle page if moved to far NUMA)
+  }
+  
+ +#define RQ_PAGE_SIZE(rq) ((1 << rq->buff.page_order) << PAGE_SHIFT)
+ +
+  static inline bool mlx5e_rx_cache_put(struct mlx5e_rq *rq,
+  				      struct mlx5e_dma_info *dma_info)
+  {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d8b64a5a33e7..cfd66d524ae0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -192,6 +192,7 @@ static void mlx5e_update_sw_counters(struct mlx5e_priv *priv)
+ 		s->rx_cache_full  += rq_stats->cache_full;
+ 		s->rx_cache_empty += rq_stats->cache_empty;
+ 		s->rx_cache_busy  += rq_stats->cache_busy;
++		s->rx_cache_waive += rq_stats->cache_waive;
+ 
+ 		for (j = 0; j < priv->params.num_tc; j++) {
+ 			sq_stats = &priv->channel[i]->sq[j].stats;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index eae13944f7a7..a28a4e2b58a9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -80,6 +80,7 @@ struct mlx5e_sw_stats {
+ 	u64 rx_cache_full;
+ 	u64 rx_cache_empty;
+ 	u64 rx_cache_busy;
++	u64 rx_cache_waive;
+ 
+ 	/* Special handling counters */
+ 	u64 link_down_events_phy;
+@@ -115,6 +116,7 @@ static const struct counter_desc sw_stats_desc[] = {
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_full) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_empty) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_busy) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_waive) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, link_down_events_phy) },
+ };
+ 
+@@ -332,6 +334,7 @@ struct mlx5e_rq_stats {
+ 	u64 cache_full;
+ 	u64 cache_empty;
+ 	u64 cache_busy;
++	u64 cache_waive;
+ };
+ 
+ static const struct counter_desc rq_stats_desc[] = {
+@@ -351,6 +354,7 @@ static const struct counter_desc rq_stats_desc[] = {
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_full) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_empty) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_busy) },
++	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_waive) },
+ };
+ 
+ struct mlx5e_sq_stats {
