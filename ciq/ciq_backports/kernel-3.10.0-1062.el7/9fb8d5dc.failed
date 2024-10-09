@@ -1,0 +1,107 @@
+stop_machine: Disable preemption when waking two stopper threads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Isaac J. Manjarres <isaacm@codeaurora.org>
+commit 9fb8d5dc4b649dd190e1af4ead670753e71bf907
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9fb8d5dc.failed
+
+When cpu_stop_queue_two_works() begins to wake the stopper threads, it does
+so without preemption disabled, which leads to the following race
+condition:
+
+The source CPU calls cpu_stop_queue_two_works(), with cpu1 as the source
+CPU, and cpu2 as the destination CPU. When adding the stopper threads to
+the wake queue used in this function, the source CPU stopper thread is
+added first, and the destination CPU stopper thread is added last.
+
+When wake_up_q() is invoked to wake the stopper threads, the threads are
+woken up in the order that they are queued in, so the source CPU's stopper
+thread is woken up first, and it preempts the thread running on the source
+CPU.
+
+The stopper thread will then execute on the source CPU, disable preemption,
+and begin executing multi_cpu_stop(), and wait for an ack from the
+destination CPU's stopper thread, with preemption still disabled. Since the
+worker thread that woke up the stopper thread on the source CPU is affine
+to the source CPU, and preemption is disabled on the source CPU, that
+thread will never run to dequeue the destination CPU's stopper thread from
+the wake queue, and thus, the destination CPU's stopper thread will never
+run, causing the source CPU's stopper thread to wait forever, and stall.
+
+Disable preemption when waking the stopper threads in
+cpu_stop_queue_two_works().
+
+Fixes: 0b26351b910f ("stop_machine, sched: Fix migrate_swap() vs. active_balance() deadlock")
+Co-Developed-by: Prasad Sodagudi <psodagud@codeaurora.org>
+	Signed-off-by: Prasad Sodagudi <psodagud@codeaurora.org>
+Co-Developed-by: Pavankumar Kondeti <pkondeti@codeaurora.org>
+	Signed-off-by: Pavankumar Kondeti <pkondeti@codeaurora.org>
+	Signed-off-by: Isaac J. Manjarres <isaacm@codeaurora.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: peterz@infradead.org
+	Cc: matt@codeblueprint.co.uk
+	Cc: bigeasy@linutronix.de
+	Cc: gregkh@linuxfoundation.org
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/1530655334-4601-1-git-send-email-isaacm@codeaurora.org
+
+(cherry picked from commit 9fb8d5dc4b649dd190e1af4ead670753e71bf907)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/stop_machine.c
+diff --cc kernel/stop_machine.c
+index bfd90d7f3d08,1ff523dae6e2..000000000000
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@@ -242,14 -243,38 +242,31 @@@ static int cpu_stop_queue_two_works(in
+  	err = -ENOENT;
+  	if (!stopper1->enabled || !stopper2->enabled)
+  		goto unlock;
+ -	/*
+ -	 * Ensure that if we race with __stop_cpus() the stoppers won't get
+ -	 * queued up in reverse order leading to system deadlock.
+ -	 *
+ -	 * We can't miss stop_cpus_in_progress if queue_stop_cpus_work() has
+ -	 * queued a work on cpu1 but not on cpu2, we hold both locks.
+ -	 *
+ -	 * It can be falsely true but it is safe to spin until it is cleared,
+ -	 * queue_stop_cpus_work() does everything under preempt_disable().
+ -	 */
+ -	err = -EDEADLK;
+ -	if (unlikely(stop_cpus_in_progress))
+ -			goto unlock;
+  
+  	err = 0;
+ -	__cpu_stop_queue_work(stopper1, work1, &wakeq);
+ -	__cpu_stop_queue_work(stopper2, work2, &wakeq);
+ +	__cpu_stop_queue_work(stopper1, work1);
+ +	__cpu_stop_queue_work(stopper2, work2);
+  unlock:
+++<<<<<<< HEAD
+ +	spin_unlock(&stopper2->lock);
+ +	spin_unlock_irq(&stopper1->lock);
+ +	lg_double_unlock(&stop_cpus_lock, cpu1, cpu2);
+++=======
++ 	raw_spin_unlock(&stopper2->lock);
++ 	raw_spin_unlock_irq(&stopper1->lock);
++ 
++ 	if (unlikely(err == -EDEADLK)) {
++ 		while (stop_cpus_in_progress)
++ 			cpu_relax();
++ 		goto retry;
++ 	}
++ 
++ 	if (!err) {
++ 		preempt_disable();
++ 		wake_up_q(&wakeq);
++ 		preempt_enable();
++ 	}
+++>>>>>>> 9fb8d5dc4b64 (stop_machine: Disable preemption when waking two stopper threads)
+  
+  	return err;
+  }
+* Unmerged path kernel/stop_machine.c
