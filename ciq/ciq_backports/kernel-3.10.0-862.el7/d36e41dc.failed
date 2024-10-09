@@ -1,0 +1,606 @@
+i40e: separate hw_features from runtime changing flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit d36e41dc78d31322f61952a558b817e15e60a855
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d36e41dc.failed
+
+The number of flags found in pf->flags has grown quite large, and there
+are a lot of different types of flags. Most of the flags are simply
+hardware features which are enabled on some firmware or some MAC types.
+Other flags are dynamic run-time flags which enable or disable certain
+features of the driver.
+
+Separate these two types of flags into pf->hw_features and pf->flags.
+The hw_features list will contain a set of features which are enabled at
+init time. This will not contain toggles or otherwise dynamically
+changing features. These flags should not need atomic protections, as
+they will be set once during init and then be essentially read only.
+
+Everything else will remain in the flags variable. These flags may be
+modified at any time during run time. A future patch may wish to convert
+these flags into set_bit/clear_bit/test_bit or similar approach to
+ensure atomic correctness.
+
+The I40E_FLAG_MFP_ENABLED flag may be a good fit for hw_features but
+currently is used by ethtool in the private flags settings, and thus has
+been left as part of flags.
+
+Additionally, I40E_FLAG_DCB_CAPABLE may be a good fit for the
+hw_features but this patch has not tried to untangle it yet.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit d36e41dc78d31322f61952a558b817e15e60a855)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index c56ad58d66b9,c76549e41705..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@@ -2016,12 -2005,10 +2016,12 @@@ static int i40e_set_phys_id(struct net_
+  
+  	switch (state) {
+  	case ETHTOOL_ID_ACTIVE:
+- 		if (!(pf->flags & I40E_FLAG_PHY_CONTROLS_LEDS)) {
++ 		if (!(pf->hw_features & I40E_HW_PHY_CONTROLS_LEDS)) {
+  			pf->led_status = i40e_led_get(hw);
+  		} else {
+ -			i40e_aq_set_phy_debug(hw, I40E_PHY_DEBUG_ALL, NULL);
+ +			if (!(hw->flags & I40E_HW_FLAG_AQ_PHY_ACCESS_CAPABLE))
+ +				i40e_aq_set_phy_debug(hw, I40E_PHY_DEBUG_ALL,
+ +						      NULL);
+  			ret = i40e_led_get_phy(hw, &temp_status,
+  					       &pf->phy_led_val);
+  			pf->led_status = temp_status;
+@@@ -4157,8 -4122,8 +4157,13 @@@ flags_complete
+  	}
+  
+  	/* Only allow ATR evict on hardware that is capable of handling it */
+++<<<<<<< HEAD
+ +	if (pf->hw_disabled_flags & I40E_FLAG_HW_ATR_EVICT_CAPABLE)
+ +		pf->flags &= ~I40E_FLAG_HW_ATR_EVICT_CAPABLE;
+++=======
++ 	if (!(pf->hw_features & I40E_HW_ATR_EVICT_CAPABLE))
++ 		pf->flags &= ~I40E_FLAG_HW_ATR_EVICT_ENABLED;
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  
+  	if (changed_flags & I40E_FLAG_TRUE_PROMISC_SUPPORT) {
+  		u16 sw_flags = 0, valid_flags = 0;
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 674b2da7ff41,d7248e5c5f01..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -7828,36 -7957,54 +7828,83 @@@ static int i40e_alloc_rings(struct i40e
+  	/* Set basic values in the rings to be used later during open() */
+  	for (i = 0; i < vsi->alloc_queue_pairs; i++) {
+  		/* allocate space for both Tx and Rx in one shot */
+ -		ring = kcalloc(qpv, sizeof(struct i40e_ring), GFP_KERNEL);
+ -		if (!ring)
+ +		tx_ring = kzalloc(sizeof(struct i40e_ring) * 2, GFP_KERNEL);
+ +		if (!tx_ring)
+  			goto err_out;
+  
+++<<<<<<< HEAD
+ +		tx_ring->queue_index = i;
+ +		tx_ring->reg_idx = vsi->base_queue + i;
+ +		tx_ring->ring_active = false;
+ +		tx_ring->vsi = vsi;
+ +		tx_ring->netdev = vsi->netdev;
+ +		tx_ring->dev = &pf->pdev->dev;
+ +		tx_ring->count = vsi->num_desc;
+ +		tx_ring->size = 0;
+ +		tx_ring->dcb_tc = 0;
+ +		if (vsi->back->flags & I40E_FLAG_WB_ON_ITR_CAPABLE)
+ +			tx_ring->flags = I40E_TXR_FLAGS_WB_ON_ITR;
+ +		tx_ring->tx_itr_setting = pf->tx_itr_default;
+ +		vsi->tx_rings[i] = tx_ring;
+ +
+ +		rx_ring = &tx_ring[1];
+ +		rx_ring->queue_index = i;
+ +		rx_ring->reg_idx = vsi->base_queue + i;
+ +		rx_ring->ring_active = false;
+ +		rx_ring->vsi = vsi;
+ +		rx_ring->netdev = vsi->netdev;
+ +		rx_ring->dev = &pf->pdev->dev;
+ +		rx_ring->count = vsi->num_desc;
+ +		rx_ring->size = 0;
+ +		rx_ring->dcb_tc = 0;
+ +		rx_ring->rx_itr_setting = pf->rx_itr_default;
+ +		vsi->rx_rings[i] = rx_ring;
+++=======
++ 		ring->queue_index = i;
++ 		ring->reg_idx = vsi->base_queue + i;
++ 		ring->ring_active = false;
++ 		ring->vsi = vsi;
++ 		ring->netdev = vsi->netdev;
++ 		ring->dev = &pf->pdev->dev;
++ 		ring->count = vsi->num_desc;
++ 		ring->size = 0;
++ 		ring->dcb_tc = 0;
++ 		if (vsi->back->hw_features & I40E_HW_WB_ON_ITR_CAPABLE)
++ 			ring->flags = I40E_TXR_FLAGS_WB_ON_ITR;
++ 		ring->tx_itr_setting = pf->tx_itr_default;
++ 		vsi->tx_rings[i] = ring++;
++ 
++ 		if (!i40e_enabled_xdp_vsi(vsi))
++ 			goto setup_rx;
++ 
++ 		ring->queue_index = vsi->alloc_queue_pairs + i;
++ 		ring->reg_idx = vsi->base_queue + ring->queue_index;
++ 		ring->ring_active = false;
++ 		ring->vsi = vsi;
++ 		ring->netdev = NULL;
++ 		ring->dev = &pf->pdev->dev;
++ 		ring->count = vsi->num_desc;
++ 		ring->size = 0;
++ 		ring->dcb_tc = 0;
++ 		if (vsi->back->hw_features & I40E_HW_WB_ON_ITR_CAPABLE)
++ 			ring->flags = I40E_TXR_FLAGS_WB_ON_ITR;
++ 		set_ring_xdp(ring);
++ 		ring->tx_itr_setting = pf->tx_itr_default;
++ 		vsi->xdp_rings[i] = ring++;
++ 
++ setup_rx:
++ 		ring->queue_index = i;
++ 		ring->reg_idx = vsi->base_queue + i;
++ 		ring->ring_active = false;
++ 		ring->vsi = vsi;
++ 		ring->netdev = vsi->netdev;
++ 		ring->dev = &pf->pdev->dev;
++ 		ring->count = vsi->num_desc;
++ 		ring->size = 0;
++ 		ring->dcb_tc = 0;
++ 		ring->rx_itr_setting = pf->rx_itr_default;
++ 		vsi->rx_rings[i] = ring;
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  	}
+  
+  	return 0;
+@@@ -8897,6 -9000,29 +8944,32 @@@ static int i40e_sw_init(struct i40e_pf 
+  				 pf->hw.func_caps.fd_filters_best_effort;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (pf->hw.mac.type == I40E_MAC_X722) {
++ 		pf->hw_features |= (I40E_HW_RSS_AQ_CAPABLE |
++ 				    I40E_HW_128_QP_RSS_CAPABLE |
++ 				    I40E_HW_ATR_EVICT_CAPABLE |
++ 				    I40E_HW_WB_ON_ITR_CAPABLE |
++ 				    I40E_HW_MULTIPLE_TCP_UDP_RSS_PCTYPE |
++ 				    I40E_HW_NO_PCI_LINK_CHECK |
++ 				    I40E_HW_USE_SET_LLDP_MIB |
++ 				    I40E_HW_GENEVE_OFFLOAD_CAPABLE |
++ 				    I40E_HW_PTP_L4_CAPABLE |
++ 				    I40E_HW_WOL_MC_MAGIC_PKT_WAKE |
++ 				    I40E_HW_OUTER_UDP_CSUM_CAPABLE);
++ 	} else if ((pf->hw.aq.api_maj_ver > 1) ||
++ 		   ((pf->hw.aq.api_maj_ver == 1) &&
++ 		    (pf->hw.aq.api_min_ver > 4))) {
++ 		/* Supported in FW API version higher than 1.4 */
++ 		pf->hw_features |= I40E_HW_GENEVE_OFFLOAD_CAPABLE;
++ 	}
++ 
++ 	/* Enable HW ATR eviction if possible */
++ 	if (pf->hw_features & I40E_HW_ATR_EVICT_CAPABLE)
++ 		pf->flags |= I40E_FLAG_HW_ATR_EVICT_ENABLED;
++ 
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  	if ((pf->hw.mac.type == I40E_MAC_XL710) &&
+  	    (((pf->hw.aq.fw_maj_ver == 4) && (pf->hw.aq.fw_min_ver < 33)) ||
+  	    (pf->hw.aq.fw_maj_ver < 4))) {
+@@@ -8915,13 -9041,8 +8988,13 @@@
+  	if ((pf->hw.mac.type == I40E_MAC_XL710) &&
+  	    (((pf->hw.aq.fw_maj_ver == 4) && (pf->hw.aq.fw_min_ver >= 40)) ||
+  	    (pf->hw.aq.fw_maj_ver >= 5)))
+- 		pf->flags |= I40E_FLAG_USE_SET_LLDP_MIB;
++ 		pf->hw_features |= I40E_HW_USE_SET_LLDP_MIB;
+  
+ +	/* Enable PTP L4 if FW > v6.0 */
+ +	if (pf->hw.mac.type == I40E_MAC_XL710 &&
+ +	    pf->hw.aq.fw_maj_ver >= 6)
+ +		pf->hw_features |= I40E_HW_PTP_L4_CAPABLE;
+ +
+  	if (pf->hw.func_caps.vmdq) {
+  		pf->num_vmdq_vsis = I40E_DEFAULT_NUM_VMDQ_VSI;
+  		pf->flags |= I40E_FLAG_VMDQ_ENABLED;
+@@@ -9506,27 -9671,25 +9579,27 @@@ static int i40e_config_netdev(struct i4
+  	np = netdev_priv(netdev);
+  	np->vsi = vsi;
+  
+ -	hw_enc_features = NETIF_F_SG			|
+ -			  NETIF_F_IP_CSUM		|
+ -			  NETIF_F_IPV6_CSUM		|
+ -			  NETIF_F_HIGHDMA		|
+ -			  NETIF_F_SOFT_FEATURES		|
+ -			  NETIF_F_TSO			|
+ -			  NETIF_F_TSO_ECN		|
+ -			  NETIF_F_TSO6			|
+ -			  NETIF_F_GSO_GRE		|
+ -			  NETIF_F_GSO_GRE_CSUM		|
+ -			  NETIF_F_GSO_PARTIAL		|
+ -			  NETIF_F_GSO_UDP_TUNNEL	|
+ -			  NETIF_F_GSO_UDP_TUNNEL_CSUM	|
+ -			  NETIF_F_SCTP_CRC		|
+ -			  NETIF_F_RXHASH		|
+ -			  NETIF_F_RXCSUM		|
+ -			  0;
+ +	netdev->hw_enc_features |= NETIF_F_SG			|
+ +				   NETIF_F_IP_CSUM		|
+ +				   NETIF_F_IPV6_CSUM		|
+ +				   NETIF_F_HIGHDMA		|
+ +				   NETIF_F_SOFT_FEATURES	|
+ +				   NETIF_F_TSO			|
+ +				   NETIF_F_TSO_ECN		|
+ +				   NETIF_F_TSO6			|
+ +				   NETIF_F_GSO_GRE		|
+ +				   NETIF_F_GSO_GRE_CSUM		|
+ +				   NETIF_F_GSO_IPIP		|
+ +				   NETIF_F_GSO_SIT		|
+ +				   NETIF_F_GSO_UDP_TUNNEL	|
+ +				   NETIF_F_GSO_UDP_TUNNEL_CSUM	|
+ +				   NETIF_F_GSO_PARTIAL		|
+ +				   NETIF_F_SCTP_CRC		|
+ +				   NETIF_F_RXHASH		|
+ +				   NETIF_F_RXCSUM		|
+ +				   0;
+  
+- 	if (!(pf->flags & I40E_FLAG_OUTER_UDP_CSUM_CAPABLE))
++ 	if (!(pf->hw_features & I40E_HW_OUTER_UDP_CSUM_CAPABLE))
+  		netdev->gso_partial_features |= NETIF_F_GSO_UDP_TUNNEL_CSUM;
+  
+  	netdev->gso_partial_features |= NETIF_F_GSO_GRE_CSUM;
+@@@ -11352,19 -11473,7 +11425,23 @@@ static int i40e_probe(struct pci_dev *p
+  	ether_addr_copy(hw->mac.perm_addr, hw->mac.addr);
+  	i40e_get_port_mac_addr(hw, hw->mac.port_addr);
+  	if (is_valid_ether_addr(hw->mac.port_addr))
+++<<<<<<< HEAD
+ +		pf->flags |= I40E_FLAG_PORT_ID_VALID;
+ +#ifdef I40E_FCOE
+ +	err = i40e_get_san_mac_addr(hw, hw->mac.san_addr);
+ +	if (err)
+ +		dev_info(&pdev->dev,
+ +			 "(non-fatal) SAN MAC retrieval failed: %d\n", err);
+ +	if (!is_valid_ether_addr(hw->mac.san_addr)) {
+ +		dev_warn(&pdev->dev, "invalid SAN MAC address %pM, falling back to LAN MAC\n",
+ +			 hw->mac.san_addr);
+ +		ether_addr_copy(hw->mac.san_addr, hw->mac.addr);
+ +	}
+ +	dev_info(&pf->pdev->dev, "SAN MAC: %pM\n", hw->mac.san_addr);
+ +#endif /* I40E_FCOE */
+++=======
++ 		pf->hw_features |= I40E_HW_PORT_ID_VALID;
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  
+  	pci_set_drvdata(pdev, pf);
+  	pci_save_state(pdev);
+@@@ -11984,12 -12061,10 +12061,12 @@@ static void i40e_shutdown(struct pci_de
+  	 */
+  	i40e_notify_client_of_netdev_close(pf->vsi[pf->lan_vsi], false);
+  
+- 	if (pf->wol_en && (pf->flags & I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE))
++ 	if (pf->wol_en && (pf->hw_features & I40E_HW_WOL_MC_MAGIC_PKT_WAKE))
+  		i40e_enable_mc_magic_wake(pf);
+  
+ -	i40e_prep_for_reset(pf, false);
+ +	rtnl_lock();
+ +	i40e_prep_for_reset(pf);
+ +	rtnl_unlock();
+  
+  	wr32(hw, I40E_PFPM_APM,
+  	     (pf->wol_en ? I40E_PFPM_APM_APME_MASK : 0));
+@@@ -12006,24 -12081,22 +12083,24 @@@
+  
+  #ifdef CONFIG_PM
+  /**
+ - * i40e_suspend - PCI callback for moving to D3
+ - * @pdev: PCI device information struct
+ + * i40e_suspend - PM callback for moving to D3
+ + * @dev: generic device information structure
+   **/
+ -static int i40e_suspend(struct pci_dev *pdev, pm_message_t state)
+ +static int i40e_suspend(struct device *dev)
+  {
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+  	struct i40e_pf *pf = pci_get_drvdata(pdev);
+  	struct i40e_hw *hw = &pf->hw;
+ -	int retval = 0;
+  
+ -	set_bit(__I40E_SUSPENDED, pf->state);
+ -	set_bit(__I40E_DOWN, pf->state);
+ +	set_bit(__I40E_SUSPENDED, &pf->state);
+ +	set_bit(__I40E_DOWN, &pf->state);
+  
+- 	if (pf->wol_en && (pf->flags & I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE))
++ 	if (pf->wol_en && (pf->hw_features & I40E_HW_WOL_MC_MAGIC_PKT_WAKE))
+  		i40e_enable_mc_magic_wake(pf);
+  
+ -	i40e_prep_for_reset(pf, false);
+ +	rtnl_lock();
+ +	i40e_prep_for_reset(pf);
+ +	rtnl_unlock();
+  
+  	wr32(hw, I40E_PFPM_APM, (pf->wol_en ? I40E_PFPM_APM_APME_MASK : 0));
+  	wr32(hw, I40E_PFPM_WUFC, (pf->wol_en ? I40E_PFPM_WUFC_MAG_MASK : 0));
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index f469a3d68beb,3ef67dc094fc..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@@ -1422,45 -1521,48 +1422,67 @@@ static int i40e_vc_get_vf_resources_msg
+  		len = 0;
+  		goto err;
+  	}
+ -	if (VF_IS_V11(&vf->vf_ver))
+ +	if (VF_IS_V11(vf))
+  		vf->driver_caps = *(u32 *)msg;
+  	else
+ -		vf->driver_caps = VIRTCHNL_VF_OFFLOAD_L2 |
+ -				  VIRTCHNL_VF_OFFLOAD_RSS_REG |
+ -				  VIRTCHNL_VF_OFFLOAD_VLAN;
+ +		vf->driver_caps = I40E_VIRTCHNL_VF_OFFLOAD_L2 |
+ +				  I40E_VIRTCHNL_VF_OFFLOAD_RSS_REG |
+ +				  I40E_VIRTCHNL_VF_OFFLOAD_VLAN;
+  
+ -	vfres->vf_offload_flags = VIRTCHNL_VF_OFFLOAD_L2;
+ +	vfres->vf_offload_flags = I40E_VIRTCHNL_VF_OFFLOAD_L2;
+  	vsi = pf->vsi[vf->lan_vsi_idx];
+  	if (!vsi->info.pvid)
+ -		vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_VLAN;
+ +		vfres->vf_offload_flags |= I40E_VIRTCHNL_VF_OFFLOAD_VLAN;
+  
+  	if (i40e_vf_client_capable(pf, vf->vf_id) &&
+ -	    (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_IWARP)) {
+ -		vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_IWARP;
+ +	    (vf->driver_caps & I40E_VIRTCHNL_VF_OFFLOAD_IWARP)) {
+ +		vfres->vf_offload_flags |= I40E_VIRTCHNL_VF_OFFLOAD_IWARP;
+  		set_bit(I40E_VF_STATE_IWARPENA, &vf->vf_states);
+ +	} else {
+ +		clear_bit(I40E_VF_STATE_IWARPENA, &vf->vf_states);
+  	}
+  
+ -	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PF) {
+ -		vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_RSS_PF;
+ +	if (vf->driver_caps & I40E_VIRTCHNL_VF_OFFLOAD_RSS_PF) {
+ +		vfres->vf_offload_flags |= I40E_VIRTCHNL_VF_OFFLOAD_RSS_PF;
+  	} else {
+++<<<<<<< HEAD
+ +		if ((pf->flags & I40E_FLAG_RSS_AQ_CAPABLE) &&
+ +		    (vf->driver_caps & I40E_VIRTCHNL_VF_OFFLOAD_RSS_AQ))
+ +			vfres->vf_offload_flags |=
+ +					I40E_VIRTCHNL_VF_OFFLOAD_RSS_AQ;
+++=======
++ 		if ((pf->hw_features & I40E_HW_RSS_AQ_CAPABLE) &&
++ 		    (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_AQ))
++ 			vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_RSS_AQ;
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  		else
+ -			vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_RSS_REG;
+ +			vfres->vf_offload_flags |=
+ +					I40E_VIRTCHNL_VF_OFFLOAD_RSS_REG;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (pf->flags & I40E_FLAG_MULTIPLE_TCP_UDP_RSS_PCTYPE) {
+ +		if (vf->driver_caps & I40E_VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2)
+++=======
++ 	if (pf->hw_features & I40E_HW_MULTIPLE_TCP_UDP_RSS_PCTYPE) {
++ 		if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2)
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  			vfres->vf_offload_flags |=
+ -				VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2;
+ +				I40E_VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vf->driver_caps & I40E_VIRTCHNL_VF_OFFLOAD_RX_POLLING) {
+++=======
++ 	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_ENCAP)
++ 		vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_ENCAP;
++ 
++ 	if ((pf->hw_features & I40E_HW_OUTER_UDP_CSUM_CAPABLE) &&
++ 	    (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_ENCAP_CSUM))
++ 		vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_ENCAP_CSUM;
++ 
++ 	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RX_POLLING) {
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  		if (pf->flags & I40E_FLAG_MFP_ENABLED) {
+  			dev_err(&pf->pdev->dev,
+  				"VF %d requested polling mode: this feature is supported only when the device is running in single function per port (SFP) mode\n",
+@@@ -1468,13 -1570,13 +1490,18 @@@
+  			aq_ret = I40E_ERR_PARAM;
+  			goto err;
+  		}
+ -		vfres->vf_offload_flags |= VIRTCHNL_VF_OFFLOAD_RX_POLLING;
+ +		vfres->vf_offload_flags |= I40E_VIRTCHNL_VF_OFFLOAD_RX_POLLING;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (pf->flags & I40E_FLAG_WB_ON_ITR_CAPABLE) {
+ +		if (vf->driver_caps & I40E_VIRTCHNL_VF_OFFLOAD_WB_ON_ITR)
+++=======
++ 	if (pf->hw_features & I40E_HW_WB_ON_ITR_CAPABLE) {
++ 		if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_WB_ON_ITR)
+++>>>>>>> d36e41dc78d3 (i40e: separate hw_features from runtime changing flags)
+  			vfres->vf_offload_flags |=
+ -					VIRTCHNL_VF_OFFLOAD_WB_ON_ITR;
+ +					I40E_VIRTCHNL_VF_OFFLOAD_WB_ON_ITR;
+  	}
+  
+  	vfres->num_vsis = num_vsis;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e.h b/drivers/net/ethernet/intel/i40e/i40e.h
+index ba3546c697e9..b97fdc07b4f3 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -78,11 +78,11 @@
+ #define I40E_MIN_VSI_ALLOC		83 /* LAN, ATR, FCOE, 64 VF */
+ /* max 16 qps */
+ #define i40e_default_queues_per_vmdq(pf) \
+-		(((pf)->flags & I40E_FLAG_RSS_AQ_CAPABLE) ? 4 : 1)
++		(((pf)->hw_features & I40E_HW_RSS_AQ_CAPABLE) ? 4 : 1)
+ #define I40E_DEFAULT_QUEUES_PER_VF	4
+ #define I40E_DEFAULT_QUEUES_PER_TC	1 /* should be a power of 2 */
+ #define i40e_pf_get_max_q_per_tc(pf) \
+-		(((pf)->flags & I40E_FLAG_128_QP_RSS_CAPABLE) ? 128 : 64)
++		(((pf)->hw_features & I40E_HW_128_QP_RSS_CAPABLE) ? 128 : 64)
+ #define I40E_FDIR_RING			0
+ #define I40E_FDIR_RING_COUNT		32
+ #ifdef I40E_FCOE
+@@ -394,6 +394,27 @@ struct i40e_pf {
+ 	struct timer_list service_timer;
+ 	struct work_struct service_task;
+ 
++	u64 hw_features;
++#define I40E_HW_RSS_AQ_CAPABLE			BIT_ULL(0)
++#define I40E_HW_128_QP_RSS_CAPABLE		BIT_ULL(1)
++#define I40E_HW_ATR_EVICT_CAPABLE		BIT_ULL(2)
++#define I40E_HW_WB_ON_ITR_CAPABLE		BIT_ULL(3)
++#define I40E_HW_MULTIPLE_TCP_UDP_RSS_PCTYPE	BIT_ULL(4)
++#define I40E_HW_NO_PCI_LINK_CHECK		BIT_ULL(5)
++#define I40E_HW_100M_SGMII_CAPABLE		BIT_ULL(6)
++#define I40E_HW_NO_DCB_SUPPORT			BIT_ULL(7)
++#define I40E_HW_USE_SET_LLDP_MIB		BIT_ULL(8)
++#define I40E_HW_GENEVE_OFFLOAD_CAPABLE		BIT_ULL(9)
++#define I40E_HW_PTP_L4_CAPABLE			BIT_ULL(10)
++#define I40E_HW_WOL_MC_MAGIC_PKT_WAKE		BIT_ULL(11)
++#define I40E_HW_MPLS_HDR_OFFLOAD_CAPABLE	BIT_ULL(12)
++#define I40E_HW_HAVE_CRT_RETIMER		BIT_ULL(13)
++#define I40E_HW_OUTER_UDP_CSUM_CAPABLE		BIT_ULL(14)
++#define I40E_HW_PHY_CONTROLS_LEDS		BIT_ULL(15)
++#define I40E_HW_STOP_FW_LLDP			BIT_ULL(16)
++#define I40E_HW_PORT_ID_VALID			BIT_ULL(17)
++#define I40E_HW_RESTART_AUTONEG			BIT_ULL(18)
++
+ 	u64 flags;
+ #define I40E_FLAG_RX_CSUM_ENABLED		BIT_ULL(1)
+ #define I40E_FLAG_MSI_ENABLED			BIT_ULL(2)
+@@ -416,33 +437,15 @@ struct i40e_pf {
+ #define I40E_FLAG_PTP				BIT_ULL(25)
+ #define I40E_FLAG_MFP_ENABLED			BIT_ULL(26)
+ #define I40E_FLAG_UDP_FILTER_SYNC		BIT_ULL(27)
+-#define I40E_FLAG_PORT_ID_VALID			BIT_ULL(28)
+ #define I40E_FLAG_DCB_CAPABLE			BIT_ULL(29)
+-#define I40E_FLAG_RSS_AQ_CAPABLE		BIT_ULL(31)
+-#define I40E_FLAG_HW_ATR_EVICT_CAPABLE		BIT_ULL(32)
+-#define I40E_FLAG_OUTER_UDP_CSUM_CAPABLE	BIT_ULL(33)
+-#define I40E_FLAG_128_QP_RSS_CAPABLE		BIT_ULL(34)
+-#define I40E_FLAG_WB_ON_ITR_CAPABLE		BIT_ULL(35)
+ #define I40E_FLAG_VEB_STATS_ENABLED		BIT_ULL(37)
+-#define I40E_FLAG_MULTIPLE_TCP_UDP_RSS_PCTYPE	BIT_ULL(38)
+ #define I40E_FLAG_LINK_POLLING_ENABLED		BIT_ULL(39)
+ #define I40E_FLAG_VEB_MODE_ENABLED		BIT_ULL(40)
+-#define I40E_FLAG_GENEVE_OFFLOAD_CAPABLE	BIT_ULL(41)
+-#define I40E_FLAG_NO_PCI_LINK_CHECK		BIT_ULL(42)
+-#define I40E_FLAG_100M_SGMII_CAPABLE		BIT_ULL(43)
+-#define I40E_FLAG_RESTART_AUTONEG		BIT_ULL(44)
+-#define I40E_FLAG_NO_DCB_SUPPORT		BIT_ULL(45)
+-#define I40E_FLAG_USE_SET_LLDP_MIB		BIT_ULL(46)
+-#define I40E_FLAG_STOP_FW_LLDP			BIT_ULL(47)
+-#define I40E_FLAG_PHY_CONTROLS_LEDS		BIT_ULL(48)
+ #define I40E_FLAG_PF_MAC			BIT_ULL(50)
+ #define I40E_FLAG_TRUE_PROMISC_SUPPORT		BIT_ULL(51)
+-#define I40E_FLAG_HAVE_CRT_RETIMER		BIT_ULL(52)
+-#define I40E_FLAG_PTP_L4_CAPABLE		BIT_ULL(53)
+ #define I40E_FLAG_CLIENT_RESET			BIT_ULL(54)
+ #define I40E_FLAG_TEMP_LINK_POLLING		BIT_ULL(55)
+ #define I40E_FLAG_CLIENT_L2_CHANGE		BIT_ULL(56)
+-#define I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE		BIT_ULL(57)
+ #define I40E_FLAG_LEGACY_RX			BIT_ULL(58)
+ 
+ 	/* Tracks features that are disabled due to hw limitations.
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_ptp.c b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+index db534713497b..cf5f3bbe22d9 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_ptp.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+@@ -561,7 +561,7 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
+-		if (!(pf->flags & I40E_FLAG_PTP_L4_CAPABLE))
++		if (!(pf->hw_features & I40E_HW_PTP_L4_CAPABLE))
+ 			return -ERANGE;
+ 		pf->ptp_rx = true;
+ 		tsyntype = I40E_PRTTSYN_CTL1_V1MESSTYPE0_MASK |
+@@ -575,7 +575,7 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
+ 	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+ 	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
+-		if (!(pf->flags & I40E_FLAG_PTP_L4_CAPABLE))
++		if (!(pf->hw_features & I40E_HW_PTP_L4_CAPABLE))
+ 			return -ERANGE;
+ 		/* fall through */
+ 	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:
+@@ -584,7 +584,7 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
+ 		pf->ptp_rx = true;
+ 		tsyntype = I40E_PRTTSYN_CTL1_V2MESSTYPE0_MASK |
+ 			   I40E_PRTTSYN_CTL1_TSYNTYPE_V2;
+-		if (pf->flags & I40E_FLAG_PTP_L4_CAPABLE) {
++		if (pf->hw_features & I40E_HW_PTP_L4_CAPABLE) {
+ 			tsyntype |= I40E_PRTTSYN_CTL1_UDP_ENA_MASK;
+ 			config->rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
+ 		} else {
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.h b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+index 94a734a0a3cf..c2070035c0b5 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@ -112,7 +112,7 @@ enum i40e_dyn_idx_t {
+ 	BIT_ULL(I40E_FILTER_PCTYPE_NONF_MULTICAST_IPV6_UDP))
+ 
+ #define i40e_pf_get_default_rss_hena(pf) \
+-	(((pf)->flags & I40E_FLAG_MULTIPLE_TCP_UDP_RSS_PCTYPE) ? \
++	(((pf)->hw_features & I40E_HW_MULTIPLE_TCP_UDP_RSS_PCTYPE) ? \
+ 	  I40E_DEFAULT_RSS_HENA_EXPANDED : I40E_DEFAULT_RSS_HENA)
+ 
+ /* Supported Rx Buffer Sizes (a multiple of 128) */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+diff --git a/drivers/net/ethernet/intel/i40evf/i40e_txrx.h b/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+index 8b6000110ab2..1d4b4a4d44ce 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+@@ -98,10 +98,6 @@ enum i40e_dyn_idx_t {
+ 	BIT_ULL(I40E_FILTER_PCTYPE_NONF_UNICAST_IPV6_UDP) | \
+ 	BIT_ULL(I40E_FILTER_PCTYPE_NONF_MULTICAST_IPV6_UDP))
+ 
+-#define i40e_pf_get_default_rss_hena(pf) \
+-	(((pf)->flags & I40E_FLAG_MULTIPLE_TCP_UDP_RSS_PCTYPE) ? \
+-	  I40E_DEFAULT_RSS_HENA_EXPANDED : I40E_DEFAULT_RSS_HENA)
+-
+ /* Supported Rx Buffer Sizes (a multiple of 128) */
+ #define I40E_RXBUFFER_256   256
+ #define I40E_RXBUFFER_2048  2048
+diff --git a/drivers/net/ethernet/intel/i40evf/i40evf.h b/drivers/net/ethernet/intel/i40evf/i40evf.h
+index c99706ccb12f..6c4e359929b9 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40evf.h
++++ b/drivers/net/ethernet/intel/i40evf/i40evf.h
+@@ -237,8 +237,6 @@ struct i40evf_adapter {
+ /* duplicates for common code */
+ #define I40E_FLAG_DCB_ENABLED			0
+ #define I40E_FLAG_RX_CSUM_ENABLED		I40EVF_FLAG_RX_CSUM_ENABLED
+-#define I40E_FLAG_WB_ON_ITR_CAPABLE		I40EVF_FLAG_WB_ON_ITR_CAPABLE
+-#define I40E_FLAG_OUTER_UDP_CSUM_CAPABLE	I40EVF_FLAG_OUTER_UDP_CSUM_CAPABLE
+ #define I40E_FLAG_LEGACY_RX			I40EVF_FLAG_LEGACY_RX
+ 	/* flags for admin queue service task */
+ 	u32 aq_required;
+diff --git a/drivers/net/ethernet/intel/i40evf/i40evf_main.c b/drivers/net/ethernet/intel/i40evf/i40evf_main.c
+index 0fb231bd75a9..a5feea572995 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40evf_main.c
++++ b/drivers/net/ethernet/intel/i40evf/i40evf_main.c
+@@ -1214,7 +1214,7 @@ static int i40evf_alloc_queues(struct i40evf_adapter *adapter)
+ 		tx_ring->dev = &adapter->pdev->dev;
+ 		tx_ring->count = adapter->tx_desc_count;
+ 		tx_ring->tx_itr_setting = (I40E_ITR_DYNAMIC | I40E_ITR_TX_DEF);
+-		if (adapter->flags & I40E_FLAG_WB_ON_ITR_CAPABLE)
++		if (adapter->flags & I40EVF_FLAG_WB_ON_ITR_CAPABLE)
+ 			tx_ring->flags |= I40E_TXR_FLAGS_WB_ON_ITR;
+ 
+ 		rx_ring = &adapter->rx_rings[i];
