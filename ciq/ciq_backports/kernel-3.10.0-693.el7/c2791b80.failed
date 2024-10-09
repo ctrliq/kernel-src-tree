@@ -1,0 +1,336 @@
+PCI/MSI: Rename "struct msi_chip" to "struct msi_controller"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Yijing Wang <wangyijing@huawei.com>
+commit c2791b806988100cc1c047e2b0b5c5d0914aa3b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c2791b80.failed
+
+"msi_chip" isn't very descriptive, so rename it to "msi_controller".  That
+tells a little more about what it does and is already used in device tree
+bindings.
+
+No functional change.
+
+[bhelgaas: changelog, change *only* the struct name so it's reviewable]
+	Suggested-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Yijing Wang <wangyijing@huawei.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit c2791b806988100cc1c047e2b0b5c5d0914aa3b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/irqchip/irq-armada-370-xp.c
+#	drivers/pci/host/pci-keystone-dw.c
+#	drivers/pci/host/pci-keystone.h
+#	drivers/pci/host/pci-mvebu.c
+#	drivers/pci/host/pci-tegra.c
+#	drivers/pci/host/pcie-designware.c
+#	drivers/pci/host/pcie-designware.h
+#	drivers/pci/host/pcie-rcar.c
+#	drivers/pci/host/pcie-xilinx.c
+#	include/linux/msi.h
+diff --cc drivers/irqchip/irq-armada-370-xp.c
+index bb328a366122,4e202375e027..000000000000
+--- a/drivers/irqchip/irq-armada-370-xp.c
++++ b/drivers/irqchip/irq-armada-370-xp.c
+@@@ -87,7 -102,152 +87,153 @@@ static void armada_370_xp_irq_unmask(st
+  				ARMADA_370_XP_INT_CLEAR_MASK_OFFS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PCI_MSI
++ 
++ static int armada_370_xp_alloc_msi(void)
++ {
++ 	int hwirq;
++ 
++ 	mutex_lock(&msi_used_lock);
++ 	hwirq = find_first_zero_bit(&msi_used, PCI_MSI_DOORBELL_NR);
++ 	if (hwirq >= PCI_MSI_DOORBELL_NR)
++ 		hwirq = -ENOSPC;
++ 	else
++ 		set_bit(hwirq, msi_used);
++ 	mutex_unlock(&msi_used_lock);
++ 
++ 	return hwirq;
++ }
++ 
++ static void armada_370_xp_free_msi(int hwirq)
++ {
++ 	mutex_lock(&msi_used_lock);
++ 	if (!test_bit(hwirq, msi_used))
++ 		pr_err("trying to free unused MSI#%d\n", hwirq);
++ 	else
++ 		clear_bit(hwirq, msi_used);
++ 	mutex_unlock(&msi_used_lock);
++ }
++ 
++ static int armada_370_xp_setup_msi_irq(struct msi_controller *chip,
++ 				       struct pci_dev *pdev,
++ 				       struct msi_desc *desc)
++ {
++ 	struct msi_msg msg;
++ 	int virq, hwirq;
++ 
++ 	/* We support MSI, but not MSI-X */
++ 	if (desc->msi_attrib.is_msix)
++ 		return -EINVAL;
++ 
++ 	hwirq = armada_370_xp_alloc_msi();
++ 	if (hwirq < 0)
++ 		return hwirq;
++ 
++ 	virq = irq_create_mapping(armada_370_xp_msi_domain, hwirq);
++ 	if (!virq) {
++ 		armada_370_xp_free_msi(hwirq);
++ 		return -EINVAL;
++ 	}
++ 
++ 	irq_set_msi_desc(virq, desc);
++ 
++ 	msg.address_lo = msi_doorbell_addr;
++ 	msg.address_hi = 0;
++ 	msg.data = 0xf00 | (hwirq + 16);
++ 
++ 	write_msi_msg(virq, &msg);
++ 	return 0;
++ }
++ 
++ static void armada_370_xp_teardown_msi_irq(struct msi_controller *chip,
++ 					   unsigned int irq)
++ {
++ 	struct irq_data *d = irq_get_irq_data(irq);
++ 	unsigned long hwirq = d->hwirq;
++ 
++ 	irq_dispose_mapping(irq);
++ 	armada_370_xp_free_msi(hwirq);
++ }
++ 
++ static struct irq_chip armada_370_xp_msi_irq_chip = {
++ 	.name = "armada_370_xp_msi_irq",
++ 	.irq_enable = unmask_msi_irq,
++ 	.irq_disable = mask_msi_irq,
++ 	.irq_mask = mask_msi_irq,
++ 	.irq_unmask = unmask_msi_irq,
++ };
++ 
++ static int armada_370_xp_msi_map(struct irq_domain *domain, unsigned int virq,
++ 				 irq_hw_number_t hw)
++ {
++ 	irq_set_chip_and_handler(virq, &armada_370_xp_msi_irq_chip,
++ 				 handle_simple_irq);
++ 	set_irq_flags(virq, IRQF_VALID);
++ 
++ 	return 0;
++ }
++ 
++ static const struct irq_domain_ops armada_370_xp_msi_irq_ops = {
++ 	.map = armada_370_xp_msi_map,
++ };
++ 
++ static int armada_370_xp_msi_init(struct device_node *node,
++ 				  phys_addr_t main_int_phys_base)
++ {
++ 	struct msi_controller *msi_chip;
++ 	u32 reg;
++ 	int ret;
++ 
++ 	msi_doorbell_addr = main_int_phys_base +
++ 		ARMADA_370_XP_SW_TRIG_INT_OFFS;
++ 
++ 	msi_chip = kzalloc(sizeof(*msi_chip), GFP_KERNEL);
++ 	if (!msi_chip)
++ 		return -ENOMEM;
++ 
++ 	msi_chip->setup_irq = armada_370_xp_setup_msi_irq;
++ 	msi_chip->teardown_irq = armada_370_xp_teardown_msi_irq;
++ 	msi_chip->of_node = node;
++ 
++ 	armada_370_xp_msi_domain =
++ 		irq_domain_add_linear(NULL, PCI_MSI_DOORBELL_NR,
++ 				      &armada_370_xp_msi_irq_ops,
++ 				      NULL);
++ 	if (!armada_370_xp_msi_domain) {
++ 		kfree(msi_chip);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	ret = of_pci_msi_chip_add(msi_chip);
++ 	if (ret < 0) {
++ 		irq_domain_remove(armada_370_xp_msi_domain);
++ 		kfree(msi_chip);
++ 		return ret;
++ 	}
++ 
++ 	reg = readl(per_cpu_int_base + ARMADA_370_XP_IN_DRBEL_MSK_OFFS)
++ 		| PCI_MSI_DOORBELL_MASK;
++ 
++ 	writel(reg, per_cpu_int_base +
++ 	       ARMADA_370_XP_IN_DRBEL_MSK_OFFS);
++ 
++ 	/* Unmask IPI interrupt */
++ 	writel(1, per_cpu_int_base + ARMADA_370_XP_INT_CLEAR_MASK_OFFS);
++ 
++ 	return 0;
++ }
++ #else
++ static inline int armada_370_xp_msi_init(struct device_node *node,
++ 					 phys_addr_t main_int_phys_base)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> c2791b806988 (PCI/MSI: Rename "struct msi_chip" to "struct msi_controller")
+  #ifdef CONFIG_SMP
+ -static DEFINE_RAW_SPINLOCK(irq_controller_lock);
+ -
+  static int armada_xp_set_affinity(struct irq_data *d,
+  				  const struct cpumask *mask_val, bool force)
+  {
+diff --cc include/linux/msi.h
+index 28c6f45315d6,6704991b0174..000000000000
+--- a/include/linux/msi.h
++++ b/include/linux/msi.h
+@@@ -67,20 -64,16 +67,24 @@@ void arch_restore_msi_irqs(struct pci_d
+  
+  void default_teardown_msi_irqs(struct pci_dev *dev);
+  void default_restore_msi_irqs(struct pci_dev *dev);
+ +u32 default_msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag);
+ +u32 default_msix_mask_irq(struct msi_desc *desc, u32 flag);
+  
+- struct msi_chip {
++ struct msi_controller {
+  	struct module *owner;
+  	struct device *dev;
+  	struct device_node *of_node;
+  	struct list_head list;
+  
+- 	int (*setup_irq)(struct msi_chip *chip, struct pci_dev *dev,
++ 	int (*setup_irq)(struct msi_controller *chip, struct pci_dev *dev,
+  			 struct msi_desc *desc);
+++<<<<<<< HEAD
+ +	void (*teardown_irq)(struct msi_chip *chip, unsigned int irq);
+ +	int (*check_device)(struct msi_chip *chip, struct pci_dev *dev,
+ +			    int nvec, int type);  /* Deprecated - do not use */
+++=======
++ 	void (*teardown_irq)(struct msi_controller *chip, unsigned int irq);
+++>>>>>>> c2791b806988 (PCI/MSI: Rename "struct msi_chip" to "struct msi_controller")
+  };
+  
+  #endif /* LINUX_MSI_H */
+* Unmerged path drivers/pci/host/pci-keystone-dw.c
+* Unmerged path drivers/pci/host/pci-keystone.h
+* Unmerged path drivers/pci/host/pci-mvebu.c
+* Unmerged path drivers/pci/host/pci-tegra.c
+* Unmerged path drivers/pci/host/pcie-designware.c
+* Unmerged path drivers/pci/host/pcie-designware.h
+* Unmerged path drivers/pci/host/pcie-rcar.c
+* Unmerged path drivers/pci/host/pcie-xilinx.c
+* Unmerged path drivers/irqchip/irq-armada-370-xp.c
+diff --git a/drivers/of/of_pci.c b/drivers/of/of_pci.c
+index 848199633798..46956375720a 100644
+--- a/drivers/of/of_pci.c
++++ b/drivers/of/of_pci.c
+@@ -94,7 +94,7 @@ EXPORT_SYMBOL_GPL(of_pci_parse_bus_range);
+ static LIST_HEAD(of_pci_msi_chip_list);
+ static DEFINE_MUTEX(of_pci_msi_chip_mutex);
+ 
+-int of_pci_msi_chip_add(struct msi_chip *chip)
++int of_pci_msi_chip_add(struct msi_controller *chip)
+ {
+ 	if (!of_property_read_bool(chip->of_node, "msi-controller"))
+ 		return -EINVAL;
+@@ -107,7 +107,7 @@ int of_pci_msi_chip_add(struct msi_chip *chip)
+ }
+ EXPORT_SYMBOL_GPL(of_pci_msi_chip_add);
+ 
+-void of_pci_msi_chip_remove(struct msi_chip *chip)
++void of_pci_msi_chip_remove(struct msi_controller *chip)
+ {
+ 	mutex_lock(&of_pci_msi_chip_mutex);
+ 	list_del(&chip->list);
+@@ -115,9 +115,9 @@ void of_pci_msi_chip_remove(struct msi_chip *chip)
+ }
+ EXPORT_SYMBOL_GPL(of_pci_msi_chip_remove);
+ 
+-struct msi_chip *of_pci_find_msi_chip_by_node(struct device_node *of_node)
++struct msi_controller *of_pci_find_msi_chip_by_node(struct device_node *of_node)
+ {
+-	struct msi_chip *c;
++	struct msi_controller *c;
+ 
+ 	mutex_lock(&of_pci_msi_chip_mutex);
+ 	list_for_each_entry(c, &of_pci_msi_chip_list, list) {
+* Unmerged path drivers/pci/host/pci-keystone-dw.c
+* Unmerged path drivers/pci/host/pci-keystone.h
+* Unmerged path drivers/pci/host/pci-mvebu.c
+* Unmerged path drivers/pci/host/pci-tegra.c
+* Unmerged path drivers/pci/host/pcie-designware.c
+* Unmerged path drivers/pci/host/pcie-designware.h
+* Unmerged path drivers/pci/host/pcie-rcar.c
+* Unmerged path drivers/pci/host/pcie-xilinx.c
+diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
+index 57a9fc44962d..8d73b8a02518 100644
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -32,7 +32,7 @@ static int pci_msi_enable = 1;
+ #if defined(CONFIG_GENERIC_HARDIRQS)
+ int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
+ {
+-	struct msi_chip *chip = dev->bus->msi;
++	struct msi_controller *chip = dev->bus->msi;
+ 	int err;
+ 
+ 	if (!chip || !chip->setup_irq)
+@@ -49,7 +49,7 @@ int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
+ 
+ void __weak arch_teardown_msi_irq(unsigned int irq)
+ {
+-	struct msi_chip *chip = irq_get_chip_data(irq);
++	struct msi_controller *chip = irq_get_chip_data(irq);
+ 
+ 	if (!chip || !chip->teardown_irq)
+ 		return;
+* Unmerged path include/linux/msi.h
+diff --git a/include/linux/of_pci.h b/include/linux/of_pci.h
+index fd9c408631a0..4fadc6763b05 100644
+--- a/include/linux/of_pci.h
++++ b/include/linux/of_pci.h
+@@ -15,13 +15,13 @@ int of_pci_get_devfn(struct device_node *np);
+ int of_pci_parse_bus_range(struct device_node *node, struct resource *res);
+ 
+ #if defined(CONFIG_OF) && defined(CONFIG_PCI_MSI)
+-int of_pci_msi_chip_add(struct msi_chip *chip);
+-void of_pci_msi_chip_remove(struct msi_chip *chip);
+-struct msi_chip *of_pci_find_msi_chip_by_node(struct device_node *of_node);
++int of_pci_msi_chip_add(struct msi_controller *chip);
++void of_pci_msi_chip_remove(struct msi_controller *chip);
++struct msi_controller *of_pci_find_msi_chip_by_node(struct device_node *of_node);
+ #else
+-static inline int of_pci_msi_chip_add(struct msi_chip *chip) { return -EINVAL; }
+-static inline void of_pci_msi_chip_remove(struct msi_chip *chip) { }
+-static inline struct msi_chip *
++static inline int of_pci_msi_chip_add(struct msi_controller *chip) { return -EINVAL; }
++static inline void of_pci_msi_chip_remove(struct msi_controller *chip) { }
++static inline struct msi_controller *
+ of_pci_find_msi_chip_by_node(struct device_node *of_node) { return NULL; }
+ #endif
+ 
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index f848372d5bb7..0e83396a04c4 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -480,7 +480,7 @@ struct pci_bus {
+ 	struct resource busn_res;	/* bus numbers routed to this bus */
+ 
+ 	struct pci_ops	*ops;		/* configuration access functions */
+-	struct msi_chip	*msi;		/* MSI controller */
++	struct msi_controller *msi;	/* MSI controller */
+ 	void		*sysdata;	/* hook for sys-specific extension */
+ 	struct proc_dir_entry *procdir;	/* directory entry in /proc/bus/pci */
+ 
