@@ -1,0 +1,217 @@
+netvsc: handle offline mtu and channel change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 163891d7d42935e7499daa0646a8eb3c44504300
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/163891d7.failed
+
+If device is not up, then changing MTU (or number of channels)
+should not re-enable the device.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 163891d7d42935e7499daa0646a8eb3c44504300)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 1f2fdf8f9b74,b3a7f508434b..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -743,83 -742,48 +743,114 @@@ static int netvsc_set_channels(struct n
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+  	struct hv_device *dev = net_device_ctx->device_ctx;
+  	struct netvsc_device *nvdev = net_device_ctx->nvdev;
+++<<<<<<< HEAD
+ +	struct netvsc_device_info device_info;
+ +	u32 num_chn;
+ +	u32 max_chn;
+ +	int ret = 0;
+ +	bool recovering = false;
+++=======
++ 	unsigned int count = channels->combined_count;
++ 	bool was_running;
++ 	int ret;
++ 
++ 	/* We do not support separate count for rx, tx, or other */
++ 	if (count == 0 ||
++ 	    channels->rx_count || channels->tx_count || channels->other_count)
++ 		return -EINVAL;
++ 
++ 	if (count > net->num_tx_queues || count > net->num_rx_queues)
++ 		return -EINVAL;
+++>>>>>>> 163891d7d429 (netvsc: handle offline mtu and channel change)
+  
+  	if (net_device_ctx->start_remove || !nvdev || nvdev->destroy)
+  		return -ENODEV;
+  
+ -	if (nvdev->nvsp_version < NVSP_PROTOCOL_VERSION_5)
+ +	num_chn = nvdev->num_chn;
+ +	max_chn = min_t(u32, nvdev->max_chn, num_online_cpus());
+ +
+ +	if (nvdev->nvsp_version < NVSP_PROTOCOL_VERSION_5) {
+ +		pr_info("vRSS unsupported before NVSP Version 5\n");
+  		return -EINVAL;
+ +	}
+  
+ -	if (count > nvdev->max_chn)
+ +	/* We do not support rx, tx, or other */
+ +	if (!channels ||
+ +	    channels->rx_count ||
+ +	    channels->tx_count ||
+ +	    channels->other_count ||
+ +	    (channels->combined_count < 1))
+  		return -EINVAL;
+  
+ +	if (channels->combined_count > max_chn) {
+ +		pr_info("combined channels too high, using %d\n", max_chn);
+ +		channels->combined_count = max_chn;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	ret = netvsc_close(net);
+ +	if (ret)
+ +		goto out;
+++=======
++ 	was_running = netif_running(net);
++ 	if (was_running) {
++ 		ret = netvsc_close(net);
++ 		if (ret)
++ 			return ret;
++ 	}
+++>>>>>>> 163891d7d429 (netvsc: handle offline mtu and channel change)
+  
+ + do_set:
+  	net_device_ctx->start_remove = true;
+ -	rndis_filter_device_remove(dev, nvdev);
+ +	rndis_filter_device_remove(dev);
+  
+ -	ret = netvsc_set_queues(net, dev, count);
+ -	if (ret == 0)
+ -		nvdev->num_chn = count;
+ -	else
+ -		netvsc_set_queues(net, dev, nvdev->num_chn);
+ +	nvdev->num_chn = channels->combined_count;
+ +
+++<<<<<<< HEAD
+ +	memset(&device_info, 0, sizeof(device_info));
+ +	device_info.num_chn = nvdev->num_chn; /* passed to RNDIS */
+ +	device_info.ring_size = ring_size;
+ +	device_info.max_num_vrss_chns = max_num_vrss_chns;
+ +
+ +	ret = rndis_filter_device_add(dev, &device_info);
+ +	if (ret) {
+ +		if (recovering) {
+ +			netdev_err(net, "unable to add netvsc device (ret %d)\n", ret);
+ +			return ret;
+ +		}
+ +		goto recover;
+ +	}
+ +
+ +	nvdev = net_device_ctx->nvdev;
+ +
+ +	ret = netif_set_real_num_tx_queues(net, nvdev->num_chn);
+ +	if (ret) {
+ +		if (recovering) {
+ +			netdev_err(net, "could not set tx queue count (ret %d)\n", ret);
+ +			return ret;
+ +		}
+ +		goto recover;
+ +	}
+ +
+ +	ret = netif_set_real_num_rx_queues(net, nvdev->num_chn);
+ +	if (ret) {
+ +		if (recovering) {
+ +			netdev_err(net, "could not set rx queue count (ret %d)\n", ret);
+ +			return ret;
+ +		}
+ +		goto recover;
+ +	}
+  
+ + out:
+ +	netvsc_open(net);
+ +	net_device_ctx->start_remove = false;
+++=======
++ 	net_device_ctx->start_remove = false;
++ 
++ 	if (was_running)
++ 		ret = netvsc_open(net);
++ 
+++>>>>>>> 163891d7d429 (netvsc: handle offline mtu and channel change)
+  	/* We may have missed link change notifications */
+  	schedule_delayed_work(&net_device_ctx->dwork, 0);
+  
+@@@ -896,40 -851,42 +927,55 @@@ static int netvsc_change_mtu(struct net
+  	struct netvsc_device *nvdev = ndevctx->nvdev;
+  	struct hv_device *hdev = ndevctx->device_ctx;
+  	struct netvsc_device_info device_info;
+++<<<<<<< HEAD
+ +	int limit = ETH_DATA_LEN;
+ +	u32 num_chn;
+ +	int ret = 0;
+++=======
++ 	bool was_running;
++ 	int ret;
+++>>>>>>> 163891d7d429 (netvsc: handle offline mtu and channel change)
+  
+  	if (ndevctx->start_remove || !nvdev || nvdev->destroy)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	if (nvdev->nvsp_version >= NVSP_PROTOCOL_VERSION_2)
+ +		limit = NETVSC_MTU - ETH_HLEN;
+ +
+ +	if (mtu < NETVSC_MTU_MIN || mtu > limit)
+ +		return -EINVAL;
+ +
+ +	ret = netvsc_close(ndev);
+ +	if (ret)
+ +		goto out;
+++=======
++ 	was_running = netif_running(ndev);
++ 	if (was_running) {
++ 		ret = netvsc_close(ndev);
++ 		if (ret)
++ 			return ret;
++ 	}
+++>>>>>>> 163891d7d429 (netvsc: handle offline mtu and channel change)
+  
+ -	memset(&device_info, 0, sizeof(device_info));
+ -	device_info.ring_size = ring_size;
+ -	device_info.num_chn = nvdev->num_chn;
+ -	device_info.max_num_vrss_chns = nvdev->num_chn;
+ +	num_chn = nvdev->num_chn;
+  
+  	ndevctx->start_remove = true;
+ -	rndis_filter_device_remove(hdev, nvdev);
+ -
+ -	/* 'nvdev' has been freed in rndis_filter_device_remove() ->
+ -	 * netvsc_device_remove () -> free_netvsc_device().
+ -	 * We mustn't access it before it's re-created in
+ -	 * rndis_filter_device_add() -> netvsc_device_add().
+ -	 */
+ +	rndis_filter_device_remove(hdev);
+  
+  	ndev->mtu = mtu;
+  
+ +	memset(&device_info, 0, sizeof(device_info));
+ +	device_info.ring_size = ring_size;
+ +	device_info.num_chn = num_chn;
+ +	device_info.max_num_vrss_chns = max_num_vrss_chns;
+  	rndis_filter_device_add(hdev, &device_info);
+  
+- out:
+- 	netvsc_open(ndev);
+  	ndevctx->start_remove = false;
+  
++ 	if (was_running)
++ 		ret = netvsc_open(ndev);
++ 
+  	/* We may have missed link change notifications */
+  	schedule_delayed_work(&ndevctx->dwork, 0);
+  
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
