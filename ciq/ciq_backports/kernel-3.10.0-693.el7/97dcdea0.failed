@@ -1,0 +1,146 @@
+Btrfs: Fix deadlock between direct IO and fast fsync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chandan Rajendra <chandan@linux.vnet.ibm.com>
+commit 97dcdea076ecef41ea4aaa23d4397c2f622e4265
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/97dcdea0.failed
+
+The following deadlock is seen when executing generic/113 test,
+
+ ---------------------------------------------------------+----------------------------------------------------
+  Direct I/O task                                           Fast fsync task
+ ---------------------------------------------------------+----------------------------------------------------
+  btrfs_direct_IO
+    __blockdev_direct_IO
+     do_blockdev_direct_IO
+      do_direct_IO
+       btrfs_get_blocks_direct
+        while (blocks needs to written)
+         get_more_blocks (first iteration)
+          btrfs_get_blocks_direct
+           btrfs_create_dio_extent
+             down_read(&BTRFS_I(inode) >dio_sem)
+             Create and add extent map and ordered extent
+             up_read(&BTRFS_I(inode) >dio_sem)
+                                                            btrfs_sync_file
+                                                              btrfs_log_dentry_safe
+                                                               btrfs_log_inode_parent
+                                                                btrfs_log_inode
+                                                                 btrfs_log_changed_extents
+                                                                  down_write(&BTRFS_I(inode) >dio_sem)
+                                                                   Collect new extent maps and ordered extents
+                                                                    wait for ordered extent completion
+         get_more_blocks (second iteration)
+          btrfs_get_blocks_direct
+           btrfs_create_dio_extent
+             down_read(&BTRFS_I(inode) >dio_sem)
+ --------------------------------------------------------------------------------------------------------------
+
+In the above description, Btrfs direct I/O code path has not yet started
+submitting bios for file range covered by the initial ordered
+extent. Meanwhile, The fast fsync task obtains the write semaphore and
+waits for I/O on the ordered extent to get completed. However, the
+Direct I/O task is now blocked on obtaining the read semaphore.
+
+To resolve the deadlock, this commit modifies the Direct I/O code path
+to obtain the read semaphore before invoking
+__blockdev_direct_IO(). The semaphore is then given up after
+__blockdev_direct_IO() returns. This allows the Direct I/O code to
+complete I/O on all the ordered extents it creates.
+
+	Signed-off-by: Chandan Rajendra <chandan@linux.vnet.ibm.com>
+	Reviewed-by: Filipe Manana <fdmanana@suse.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit 97dcdea076ecef41ea4aaa23d4397c2f622e4265)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/inode.c
+index 6294594562c2,bed6cf5f67a4..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -7172,6 -7202,41 +7172,44 @@@ out
+  	return em;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct extent_map *btrfs_create_dio_extent(struct inode *inode,
++ 						  const u64 start,
++ 						  const u64 len,
++ 						  const u64 orig_start,
++ 						  const u64 block_start,
++ 						  const u64 block_len,
++ 						  const u64 orig_block_len,
++ 						  const u64 ram_bytes,
++ 						  const int type)
++ {
++ 	struct extent_map *em = NULL;
++ 	int ret;
++ 
++ 	if (type != BTRFS_ORDERED_NOCOW) {
++ 		em = create_pinned_em(inode, start, len, orig_start,
++ 				      block_start, block_len, orig_block_len,
++ 				      ram_bytes, type);
++ 		if (IS_ERR(em))
++ 			goto out;
++ 	}
++ 	ret = btrfs_add_ordered_extent_dio(inode, start, block_start,
++ 					   len, block_len, type);
++ 	if (ret) {
++ 		if (em) {
++ 			free_extent_map(em);
++ 			btrfs_drop_extent_cache(inode, start,
++ 						start + len - 1, 0);
++ 		}
++ 		em = ERR_PTR(ret);
++ 	}
++  out:
++ 
++ 	return em;
++ }
++ 
+++>>>>>>> 97dcdea076ec (Btrfs: Fix deadlock between direct IO and fast fsync)
+  static struct extent_map *btrfs_new_extent_direct(struct inode *inode,
+  						  u64 start, u64 len)
+  {
+@@@ -8672,8 -8688,12 +8710,9 @@@ static ssize_t btrfs_direct_IO(int rw, 
+  		 * do the accounting properly if we go over the number we
+  		 * originally calculated.  Abuse current->journal_info for this.
+  		 */
+ -		dio_data.reserve = round_up(count,
+ -					    fs_info->sectorsize);
+ -		dio_data.unsubmitted_oe_range_start = (u64)offset;
+ -		dio_data.unsubmitted_oe_range_end = (u64)offset;
+ +		dio_data.reserve = round_up(count, root->sectorsize);
+  		current->journal_info = &dio_data;
++ 		down_read(&BTRFS_I(inode)->dio_sem);
+  	} else if (test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
+  				     &BTRFS_I(inode)->runtime_flags)) {
+  		inode_dio_end(inode);
+@@@ -8681,11 -8701,12 +8720,20 @@@
+  		wakeup = false;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = __blockdev_direct_IO(rw, iocb, inode,
+ +			BTRFS_I(inode)->root->fs_info->fs_devices->latest_bdev,
+ +			iov, offset, nr_segs, btrfs_get_blocks_direct, NULL,
+ +			btrfs_submit_direct, flags);
+ +	if (rw & WRITE) {
+++=======
++ 	ret = __blockdev_direct_IO(iocb, inode,
++ 				   fs_info->fs_devices->latest_bdev,
++ 				   iter, btrfs_get_blocks_direct, NULL,
++ 				   btrfs_submit_direct, flags);
++ 	if (iov_iter_rw(iter) == WRITE) {
++ 		up_read(&BTRFS_I(inode)->dio_sem);
+++>>>>>>> 97dcdea076ec (Btrfs: Fix deadlock between direct IO and fast fsync)
+  		current->journal_info = NULL;
+  		if (ret < 0 && ret != -EIOCBQUEUED) {
+  			if (dio_data.reserve)
+* Unmerged path fs/btrfs/inode.c
