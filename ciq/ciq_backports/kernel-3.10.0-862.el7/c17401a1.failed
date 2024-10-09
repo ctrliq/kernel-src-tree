@@ -1,0 +1,118 @@
+i40e: use separate state bit for miscellaneous IRQ setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit c17401a1dd210a5f22ab1ec7c7366037c158a14c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c17401a1.failed
+
+We currently (mis)use the __I40E_RECOVERY_PENDING bit to determine when
+we should actually request a new IRQ in i40e_setup_misc_vector().
+
+This led to a design mistake where we open-coded the re-setup of the
+miscellaneous vector in i40e_resume() instead of using the function
+provided. If we did not open-code this and instead tried to use the
+i40e_setup_misc_vector() function, it would lead to never reallocating
+the IRQ.
+
+This would lead to a second i40e_suspend() call failing to free the
+vector due to a NULL pointer dereference.
+
+A future patch is going to re-work how the i40e_suspend() and
+i40e_resume() flows work to clear all IRQ vectors, which would require
+us to use i40e_setup_misc_vector() directly. Since during this time the
+__I40E_RECOVERY_PENDING bit is set, we'll never re-allocate the vector.
+
+Rather than leaving the open-coded setup in i40e_resume() lets just fix
+the problem properly in i40e_setup_misc_vector().
+
+Introduce a new state bit which indicates when the IRQ has been
+assigned, which will be set when i40e_setup_misc_vector is first called.
+This ultimately resolves the issue of re-requesting the vector, without
+overloading the __I40E_RECOVERY_PENDING state. This ensures that the
+suspend/resume cycle can use the setup function instead of open-coding
+the re-request during resume.
+
+Additionally, since the only callers of i40e_stop_misc_vector also want
+to free it, move this code directly into the function to avoid
+duplication. Due to the new functionality, rename it to
+i40e_free_misc_vector().
+
+This lets us drop the extra calls to free and re-enable the vector
+during i40e_suspend() and i40e_resume(). We don't need to call
+i40e_setup_misc_Vector() in i40e_resume() because it gets called by the
+i40e_rebuild() call.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit c17401a1dd210a5f22ab1ec7c7366037c158a14c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 7e9dd715095f,3ea4f8b942c3..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -8296,10 -8367,8 +8298,15 @@@ static int i40e_setup_misc_vector(struc
+  	struct i40e_hw *hw = &pf->hw;
+  	int err = 0;
+  
+++<<<<<<< HEAD
+ +	/* Only request the irq if this is the first time through, and
+ +	 * not when we're rebuilding after a Reset
+ +	 */
+ +	if (!test_bit(__I40E_RESET_RECOVERY_PENDING, &pf->state)) {
+++=======
++ 	/* Only request the IRQ once, the first time through. */
++ 	if (!test_and_set_bit(__I40E_MISC_IRQ_REQUESTED, pf->state)) {
+++>>>>>>> c17401a1dd21 (i40e: use separate state bit for miscellaneous IRQ setup)
+  		err = request_irq(pf->msix_entries[0].vector,
+  				  i40e_intr, 0, pf->int_name, pf);
+  		if (err) {
+@@@ -11997,7 -12070,7 +12005,11 @@@ static int i40e_suspend(struct pci_dev 
+  	wr32(hw, I40E_PFPM_APM, (pf->wol_en ? I40E_PFPM_APM_APME_MASK : 0));
+  	wr32(hw, I40E_PFPM_WUFC, (pf->wol_en ? I40E_PFPM_WUFC_MAG_MASK : 0));
+  
+++<<<<<<< HEAD
+ +	i40e_stop_misc_vector(pf);
+++=======
++ 	i40e_free_misc_vector(pf);
+++>>>>>>> c17401a1dd21 (i40e: use separate state bit for miscellaneous IRQ setup)
+  
+  	retval = pci_save_state(pdev);
+  	if (retval)
+@@@ -12036,11 -12109,9 +12048,17 @@@ static int i40e_resume(struct pci_dev *
+  	pci_wake_from_d3(pdev, false);
+  
+  	/* handling the reset will rebuild the device state */
+++<<<<<<< HEAD
+ +	if (test_and_clear_bit(__I40E_SUSPENDED, &pf->state)) {
+ +		clear_bit(__I40E_DOWN, &pf->state);
+ +		rtnl_lock();
+ +		i40e_reset_and_rebuild(pf, false);
+ +		rtnl_unlock();
+++=======
++ 	if (test_and_clear_bit(__I40E_SUSPENDED, pf->state)) {
++ 		clear_bit(__I40E_DOWN, pf->state);
++ 		i40e_reset_and_rebuild(pf, false, false);
+++>>>>>>> c17401a1dd21 (i40e: use separate state bit for miscellaneous IRQ setup)
+  	}
+  
+  	return 0;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e.h b/drivers/net/ethernet/intel/i40e/i40e.h
+index 4852c04654f3..71e8c0fe20e9 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -138,6 +138,7 @@ enum i40e_state_t {
+ 	__I40E_MDD_EVENT_PENDING,
+ 	__I40E_VFLR_EVENT_PENDING,
+ 	__I40E_RESET_RECOVERY_PENDING,
++	__I40E_MISC_IRQ_REQUESTED,
+ 	__I40E_RESET_INTR_RECEIVED,
+ 	__I40E_REINIT_REQUESTED,
+ 	__I40E_PF_RESET_REQUESTED,
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
