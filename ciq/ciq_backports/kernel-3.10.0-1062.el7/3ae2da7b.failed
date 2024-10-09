@@ -1,0 +1,170 @@
+usb: host: xhci-plat: Fix clock resource by adding a register clock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [usb] host: xhci-plat: Fix clock resource by adding a register clock (Torez Smith) [1657401]
+Rebuild_FUZZ: 96.12%
+commit-author Gregory CLEMENT <gregory.clement@bootlin.com>
+commit 3ae2da7b28b393d4f6faef3d384cc725ef39716b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3ae2da7b.failed
+
+On Armada 7K/8K we need to explicitly enable the register clock. This
+clock is optional because not all the SoCs using this IP need it but at
+least for Armada 7K/8K it is actually mandatory.
+
+The change was done at xhci-plat level and not at a xhci-mvebu.c because,
+it is expected that other SoC would have this kind of constraint.
+
+The binding documentation is updating accordingly.
+
+	Signed-off-by: Gregory CLEMENT <gregory.clement@bootlin.com>
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3ae2da7b28b393d4f6faef3d384cc725ef39716b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/devicetree/bindings/usb/usb-xhci.txt
+#	drivers/usb/host/xhci-plat.c
+diff --cc Documentation/devicetree/bindings/usb/usb-xhci.txt
+index a603bca6d729,bd1dd316fb23..000000000000
+--- a/Documentation/devicetree/bindings/usb/usb-xhci.txt
++++ b/Documentation/devicetree/bindings/usb/usb-xhci.txt
+@@@ -9,8 -28,19 +9,16 @@@ Required properties
+    - interrupts: one XHCI interrupt should be described here.
+  
+  Optional properties:
+++<<<<<<< HEAD
+ +  - clocks: reference to a clock
+++=======
++   - clocks: reference to the clocks
++   - clock-names: mandatory if there is a second clock, in this case
++     the name must be "core" for the first clock and "reg" for the
++     second one
++   - usb2-lpm-disable: indicate if we don't want to enable USB2 HW LPM
+++>>>>>>> 3ae2da7b28b3 (usb: host: xhci-plat: Fix clock resource by adding a register clock)
+    - usb3-lpm-capable: determines if platform is USB3 LPM capable
+ -  - quirk-broken-port-ped: set if the controller has broken port disable mechanism
+ -  - imod-interval-ns: default interrupt moderation interval is 5000ns
+ -  - phys : see usb-hcd.txt in the current directory
+ -
+ -additionally the properties from usb-hcd.txt (in the current directory) are
+ -supported.
+ -
+  
+  Example:
+  	usb@f0931000 {
+diff --cc drivers/usb/host/xhci-plat.c
+index 6a4cb93efaf5,596e7a71b666..000000000000
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@@ -98,19 -244,28 +109,32 @@@ static int xhci_plat_probe(struct platf
+  	if (!IS_ERR(clk)) {
+  		ret = clk_prepare_enable(clk);
+  		if (ret)
+++<<<<<<< HEAD
+ +			goto put_hcd;
+++=======
++ 			goto disable_reg_clk;
++ 	} else if (PTR_ERR(clk) == -EPROBE_DEFER) {
++ 		ret = -EPROBE_DEFER;
++ 		goto disable_reg_clk;
+++>>>>>>> 3ae2da7b28b3 (usb: host: xhci-plat: Fix clock resource by adding a register clock)
+  	}
+  
+ -	xhci = hcd_to_xhci(hcd);
+ -	priv_match = of_device_get_match_data(&pdev->dev);
+ -	if (priv_match) {
+ -		struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
+ -
+ -		/* Just copy data for now */
+ -		if (priv_match)
+ -			*priv = *priv_match;
+ -	}
+ +	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+ +	if (ret)
+ +		goto disable_clk;
+  
+ -	device_wakeup_enable(hcd->self.controller);
+  
+ +	/* USB 2.0 roothub is stored in the platform_device now. */
+ +	hcd = dev_get_drvdata(&pdev->dev);
+ +	xhci = hcd_to_xhci(hcd);
+  	xhci->clk = clk;
+++<<<<<<< HEAD
+ +	xhci->shared_hcd = usb_create_shared_hcd(driver, &pdev->dev,
+++=======
++ 	xhci->reg_clk = reg_clk;
++ 	xhci->main_hcd = hcd;
++ 	xhci->shared_hcd = __usb_create_hcd(driver, sysdev, &pdev->dev,
+++>>>>>>> 3ae2da7b28b3 (usb: host: xhci-plat: Fix clock resource by adding a register clock)
+  			dev_name(&pdev->dev), hcd);
+  	if (!xhci->shared_hcd) {
+  		ret = -ENOMEM;
+@@@ -153,13 -331,12 +177,16 @@@ disable_usb_phy
+  put_usb3_hcd:
+  	usb_put_hcd(xhci->shared_hcd);
+  
+ +dealloc_usb2_hcd:
+ +	usb_remove_hcd(hcd);
+ +
+  disable_clk:
+ -	clk_disable_unprepare(clk);
+ +	if (!IS_ERR(clk))
+ +		clk_disable_unprepare(clk);
+  
++ disable_reg_clk:
++ 	clk_disable_unprepare(reg_clk);
++ 
+  put_hcd:
+  	usb_put_hcd(hcd);
+  
+@@@ -171,16 -352,22 +198,22 @@@ static int xhci_plat_remove(struct plat
+  	struct usb_hcd	*hcd = platform_get_drvdata(dev);
+  	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
+  	struct clk *clk = xhci->clk;
++ 	struct clk *reg_clk = xhci->reg_clk;
+  
+ -	xhci->xhc_state |= XHCI_STATE_REMOVING;
+ -
+  	usb_remove_hcd(xhci->shared_hcd);
+  	usb_phy_shutdown(hcd->usb_phy);
+ -
+ -	usb_remove_hcd(hcd);
+  	usb_put_hcd(xhci->shared_hcd);
+  
+++<<<<<<< HEAD
+ +	usb_remove_hcd(hcd);
+ +	if (!IS_ERR(clk))
+ +		clk_disable_unprepare(clk);
+++=======
++ 	clk_disable_unprepare(clk);
++ 	clk_disable_unprepare(reg_clk);
+++>>>>>>> 3ae2da7b28b3 (usb: host: xhci-plat: Fix clock resource by adding a register clock)
+  	usb_put_hcd(hcd);
+ -
+ -	pm_runtime_set_suspended(&dev->dev);
+ -	pm_runtime_disable(&dev->dev);
+ +	kfree(xhci);
+  
+  	return 0;
+  }
+* Unmerged path Documentation/devicetree/bindings/usb/usb-xhci.txt
+* Unmerged path drivers/usb/host/xhci-plat.c
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index eba665627224..b52cc015af0f 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1730,8 +1730,9 @@ struct xhci_hcd {
+ 	int		page_shift;
+ 	/* msi-x vectors */
+ 	int		msix_count;
+-	/* optional clock */
++	/* optional clocks */
+ 	struct clk		*clk;
++	struct clk		*reg_clk;
+ 	/* data structures */
+ 	struct xhci_device_context_array *dcbaa;
+ 	struct xhci_ring	*cmd_ring;
