@@ -1,0 +1,192 @@
+mlx5: Add ndo_poll_controller() implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Calvin Owens <calvinowens@fb.com>
+commit 803783849fed11e38a30f31932c02c815520da70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/80378384.failed
+
+This implements ndo_poll_controller in net_device_ops callbacks for mlx5,
+which is necessary to use netconsole with this driver.
+
+Acked-By: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Calvin Owens <calvinowens@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 803783849fed11e38a30f31932c02c815520da70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 98d2ea9b4528,7eaf38020a8f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2574,8 -3078,130 +2574,22 @@@ static netdev_features_t mlx5e_features
+  
+  	return features;
+  }
+ -
+ -static void mlx5e_tx_timeout(struct net_device *dev)
+ -{
+ -	struct mlx5e_priv *priv = netdev_priv(dev);
+ -	bool sched_work = false;
+ -	int i;
+ -
+ -	netdev_err(dev, "TX timeout detected\n");
+ -
+ -	for (i = 0; i < priv->params.num_channels * priv->params.num_tc; i++) {
+ -		struct mlx5e_sq *sq = priv->txq_to_sq_map[i];
+ -
+ -		if (!netif_xmit_stopped(netdev_get_tx_queue(dev, i)))
+ -			continue;
+ -		sched_work = true;
+ -		set_bit(MLX5E_SQ_STATE_FLUSH, &sq->state);
+ -		netdev_err(dev, "TX timeout on queue: %d, SQ: 0x%x, CQ: 0x%x, SQ Cons: 0x%x SQ Prod: 0x%x\n",
+ -			   i, sq->sqn, sq->cq.mcq.cqn, sq->cc, sq->pc);
+ -	}
+ -
+ -	if (sched_work && test_bit(MLX5E_STATE_OPENED, &priv->state))
+ -		schedule_work(&priv->tx_timeout_work);
+ -}
+ -
+ -static int mlx5e_xdp_set(struct net_device *netdev, struct bpf_prog *prog)
+ -{
+ -	struct mlx5e_priv *priv = netdev_priv(netdev);
+ -	struct bpf_prog *old_prog;
+ -	int err = 0;
+ -	bool reset, was_opened;
+ -	int i;
+ -
+ -	mutex_lock(&priv->state_lock);
+ -
+ -	if ((netdev->features & NETIF_F_LRO) && prog) {
+ -		netdev_warn(netdev, "can't set XDP while LRO is on, disable LRO first\n");
+ -		err = -EINVAL;
+ -		goto unlock;
+ -	}
+ -
+ -	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ -	/* no need for full reset when exchanging programs */
+ -	reset = (!priv->xdp_prog || !prog);
+ -
+ -	if (was_opened && reset)
+ -		mlx5e_close_locked(netdev);
+ -
+ -	/* exchange programs */
+ -	old_prog = xchg(&priv->xdp_prog, prog);
+ -	if (prog)
+ -		bpf_prog_add(prog, 1);
+ -	if (old_prog)
+ -		bpf_prog_put(old_prog);
+ -
+ -	if (reset) /* change RQ type according to priv->xdp_prog */
+ -		mlx5e_set_rq_priv_params(priv);
+ -
+ -	if (was_opened && reset)
+ -		mlx5e_open_locked(netdev);
+ -
+ -	if (!test_bit(MLX5E_STATE_OPENED, &priv->state) || reset)
+ -		goto unlock;
+ -
+ -	/* exchanging programs w/o reset, we update ref counts on behalf
+ -	 * of the channels RQs here.
+ -	 */
+ -	bpf_prog_add(prog, priv->params.num_channels);
+ -	for (i = 0; i < priv->params.num_channels; i++) {
+ -		struct mlx5e_channel *c = priv->channel[i];
+ -
+ -		set_bit(MLX5E_RQ_STATE_FLUSH, &c->rq.state);
+ -		napi_synchronize(&c->napi);
+ -		/* prevent mlx5e_poll_rx_cq from accessing rq->xdp_prog */
+ -
+ -		old_prog = xchg(&c->rq.xdp_prog, prog);
+ -
+ -		clear_bit(MLX5E_RQ_STATE_FLUSH, &c->rq.state);
+ -		/* napi_schedule in case we have missed anything */
+ -		set_bit(MLX5E_CHANNEL_NAPI_SCHED, &c->flags);
+ -		napi_schedule(&c->napi);
+ -
+ -		if (old_prog)
+ -			bpf_prog_put(old_prog);
+ -	}
+ -
+ -unlock:
+ -	mutex_unlock(&priv->state_lock);
+ -	return err;
+ -}
+ -
+ -static bool mlx5e_xdp_attached(struct net_device *dev)
+ -{
+ -	struct mlx5e_priv *priv = netdev_priv(dev);
+ -
+ -	return !!priv->xdp_prog;
+ -}
+ -
+ -static int mlx5e_xdp(struct net_device *dev, struct netdev_xdp *xdp)
+ -{
+ -	switch (xdp->command) {
+ -	case XDP_SETUP_PROG:
+ -		return mlx5e_xdp_set(dev, xdp->prog);
+ -	case XDP_QUERY_PROG:
+ -		xdp->prog_attached = mlx5e_xdp_attached(dev);
+ -		return 0;
+ -	default:
+ -		return -EINVAL;
+ -	}
+ -}
+ +#endif
+  
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ /* Fake "interrupt" called by netpoll (eg netconsole) to send skbs without
++  * reenabling interrupts.
++  */
++ static void mlx5e_netpoll(struct net_device *dev)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	int i;
++ 
++ 	for (i = 0; i < priv->params.num_channels; i++)
++ 		napi_schedule(&priv->channel[i]->napi);
++ }
++ #endif
++ 
+  static const struct net_device_ops mlx5e_netdev_ops_basic = {
+  	.ndo_open                = mlx5e_open,
+  	.ndo_stop                = mlx5e_close,
+@@@ -2590,6 -3216,15 +2604,18 @@@
+  	.ndo_set_features        = mlx5e_set_features,
+  	.ndo_change_mtu          = mlx5e_change_mtu,
+  	.ndo_do_ioctl            = mlx5e_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_set_tx_maxrate      = mlx5e_set_tx_maxrate,
++ #ifdef CONFIG_RFS_ACCEL
++ 	.ndo_rx_flow_steer	 = mlx5e_rx_flow_steer,
++ #endif
++ 	.ndo_tx_timeout          = mlx5e_tx_timeout,
++ 	.ndo_xdp		 = mlx5e_xdp,
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ 	.ndo_poll_controller     = mlx5e_netpoll,
++ #endif
+++>>>>>>> 803783849fed (mlx5: Add ndo_poll_controller() implementation)
+  };
+  
+  static const struct net_device_ops mlx5e_netdev_ops_sriov = {
+@@@ -2616,6 -3253,13 +2642,14 @@@
+  	.ndo_get_vf_config       = mlx5e_get_vf_config,
+  	.ndo_set_vf_link_state   = mlx5e_set_vf_link_state,
+  	.ndo_get_vf_stats        = mlx5e_get_vf_stats,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_tx_timeout          = mlx5e_tx_timeout,
++ 	.ndo_xdp		 = mlx5e_xdp,
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ 	.ndo_poll_controller     = mlx5e_netpoll,
++ #endif
+++>>>>>>> 803783849fed (mlx5: Add ndo_poll_controller() implementation)
+  };
+  
+  static int mlx5e_check_required_hca_cap(struct mlx5_core_dev *mdev)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
